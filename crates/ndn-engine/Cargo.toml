@@ -1,0 +1,21 @@
+[package]
+name = "ndn-engine"
+description = "NDN forwarding engine: ForwarderEngine, EngineBuilder, and task topology"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ndn-packet    = { workspace = true }
+ndn-transport = { workspace = true }
+ndn-store     = { workspace = true }
+ndn-pipeline  = { workspace = true }
+ndn-strategy  = { workspace = true }
+bytes         = { workspace = true }
+smallvec      = { workspace = true }
+dashmap       = { workspace = true }
+tokio         = { workspace = true, features = ["rt-multi-thread", "sync", "time", "macros"] }
+tokio-util    = { workspace = true, features = ["rt"] }
+tracing       = { workspace = true }
+thiserror     = { workspace = true }
+anyhow        = { workspace = true }

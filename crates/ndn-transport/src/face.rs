@@ -1,0 +1,59 @@
+use bytes::Bytes;
+use thiserror::Error;
+
+/// Opaque identifier for a face. Cheap to copy; safe to use across tasks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FaceId(pub u32);
+
+impl FaceId {
+    pub const INVALID: FaceId = FaceId(u32::MAX);
+}
+
+impl core::fmt::Display for FaceId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "face#{}", self.0)
+    }
+}
+
+/// Classifies a face by its transport type (informational; not used for routing).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FaceKind {
+    Udp,
+    Tcp,
+    Unix,
+    Ethernet,
+    App,
+    Serial,
+    Bluetooth,
+    Wfb,
+    Compute,
+    Internal,
+}
+
+#[derive(Debug, Error)]
+pub enum FaceError {
+    #[error("face closed")]
+    Closed,
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("send buffer full")]
+    Full,
+}
+
+/// The core face abstraction.
+///
+/// `recv` is called only from the face's own task (single consumer).
+/// `send` may be called concurrently from multiple pipeline tasks (must be `&self`
+/// and internally synchronised where the underlying transport requires it).
+pub trait Face: Send + Sync + 'static {
+    fn id(&self) -> FaceId;
+    fn kind(&self) -> FaceKind;
+
+    /// Receive the next packet. Blocks until a packet arrives or the face closes.
+    fn recv(&self) -> impl Future<Output = Result<Bytes, FaceError>> + Send;
+
+    /// Send a packet. Must not block the caller; use internal buffering.
+    fn send(&self, pkt: Bytes) -> impl Future<Output = Result<(), FaceError>> + Send;
+}
+
+use std::future::Future;

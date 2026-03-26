@@ -1,0 +1,9 @@
+[package]
+name = "ndn-tlv"
+description = "NDN TLV encoding and decoding primitives"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bytes = { workspace = true }

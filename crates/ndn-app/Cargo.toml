@@ -1,0 +1,18 @@
+[package]
+name = "ndn-app"
+description = "NDN application API: AppFace, express, produce, subscribe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ndn-packet   = { workspace = true }
+ndn-pipeline = { workspace = true }
+ndn-engine   = { workspace = true }
+ndn-security = { workspace = true }
+ndn-transport = { workspace = true }
+bytes        = { workspace = true }
+tokio        = { workspace = true, features = ["sync", "rt"] }
+tracing      = { workspace = true }
+thiserror    = { workspace = true }
+anyhow       = { workspace = true }

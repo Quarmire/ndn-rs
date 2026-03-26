@@ -1,0 +1,100 @@
+use std::collections::HashMap;
+use dashmap::DashMap;
+use ndn_packet::Name;
+use ndn_transport::FaceId;
+
+/// EWMA RTT measurement for a (prefix, face) pair.
+#[derive(Clone, Debug)]
+pub struct EwmaRtt {
+    /// Smoothed RTT in nanoseconds.
+    pub srtt_ns: f64,
+    /// RTT variance.
+    pub rttvar_ns: f64,
+    /// Number of samples.
+    pub samples: u32,
+}
+
+impl EwmaRtt {
+    pub fn update(&mut self, sample_ns: f64) {
+        const ALPHA: f64 = 0.125;
+        const BETA:  f64 = 0.25;
+        if self.samples == 0 {
+            self.srtt_ns   = sample_ns;
+            self.rttvar_ns = sample_ns / 2.0;
+        } else {
+            let diff = (sample_ns - self.srtt_ns).abs();
+            self.rttvar_ns = (1.0 - BETA) * self.rttvar_ns + BETA * diff;
+            self.srtt_ns   = (1.0 - ALPHA) * self.srtt_ns + ALPHA * sample_ns;
+        }
+        self.samples += 1;
+    }
+
+    /// RTO estimate: srtt + 4 * rttvar.
+    pub fn rto_ns(&self) -> f64 {
+        self.srtt_ns + 4.0 * self.rttvar_ns
+    }
+}
+
+impl Default for EwmaRtt {
+    fn default() -> Self {
+        Self { srtt_ns: 0.0, rttvar_ns: 0.0, samples: 0 }
+    }
+}
+
+/// Per-prefix measurements entry.
+#[derive(Clone, Debug, Default)]
+pub struct MeasurementsEntry {
+    /// Per-face RTT measurements.
+    pub rtt_per_face:      HashMap<FaceId, EwmaRtt>,
+    /// EWMA satisfaction rate over the last N Interests (0.0–1.0).
+    pub satisfaction_rate: f32,
+    /// Timestamp of last update (ns since Unix epoch).
+    pub last_updated:      u64,
+}
+
+/// Concurrent measurements table — one entry per name prefix, keyed by the
+/// longest-matching prefix used during the forwarding decision.
+///
+/// Updated on every Data arrival by the `MeasurementsUpdateStage`.
+/// Read by strategies via `StrategyContext`.
+pub struct MeasurementsTable {
+    entries: DashMap<std::sync::Arc<Name>, MeasurementsEntry>,
+}
+
+impl MeasurementsTable {
+    pub fn new() -> Self {
+        Self { entries: DashMap::new() }
+    }
+
+    pub fn get(&self, name: &std::sync::Arc<Name>)
+        -> Option<dashmap::mapref::one::Ref<'_, std::sync::Arc<Name>, MeasurementsEntry>>
+    {
+        self.entries.get(name)
+    }
+
+    pub fn update_rtt(&self, name: std::sync::Arc<Name>, face: FaceId, rtt_ns: f64) {
+        let mut entry = self.entries.entry(name).or_default();
+        entry.rtt_per_face.entry(face).or_default().update(rtt_ns);
+        entry.last_updated = now_ns();
+    }
+
+    pub fn update_satisfaction(&self, name: std::sync::Arc<Name>, satisfied: bool) {
+        const ALPHA: f32 = 0.1;
+        let mut entry = self.entries.entry(name).or_default();
+        let sample = if satisfied { 1.0f32 } else { 0.0 };
+        entry.satisfaction_rate = (1.0 - ALPHA) * entry.satisfaction_rate + ALPHA * sample;
+        entry.last_updated = now_ns();
+    }
+}
+
+impl Default for MeasurementsTable {
+    fn default() -> Self { Self::new() }
+}
+
+fn now_ns() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}

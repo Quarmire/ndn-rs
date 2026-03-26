@@ -1,0 +1,15 @@
+[package]
+name = "ndn-compute"
+description = "NDN in-network compute: ComputeFace, ComputeRegistry, ComputeHandler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ndn-packet    = { workspace = true }
+ndn-transport = { workspace = true }
+ndn-engine    = { workspace = true }
+ndn-store     = { workspace = true }
+bytes         = { workspace = true }
+tokio         = { workspace = true, features = ["sync", "rt"] }
+tracing       = { workspace = true }

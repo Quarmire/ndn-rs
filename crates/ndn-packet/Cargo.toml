@@ -1,0 +1,12 @@
+[package]
+name = "ndn-packet"
+description = "NDN packet types: Name, Interest, Data, Nack"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ndn-tlv  = { workspace = true }
+bytes    = { workspace = true }
+smallvec = { workspace = true }
+thiserror = { workspace = true }

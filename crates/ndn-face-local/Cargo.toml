@@ -1,0 +1,13 @@
+[package]
+name = "ndn-face-local"
+description = "NDN local faces: UnixFace for control-plane IPC"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ndn-packet    = { workspace = true }
+ndn-transport = { workspace = true }
+bytes         = { workspace = true }
+tokio         = { workspace = true, features = ["net", "sync", "io-util"] }
+thiserror     = { workspace = true }

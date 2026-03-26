@@ -1,0 +1,14 @@
+[package]
+name = "ndn-security"
+description = "NDN security: signing, verification, trust schema, and certificate management"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ndn-packet    = { workspace = true }
+bytes         = { workspace = true }
+dashmap       = { workspace = true }
+thiserror     = { workspace = true }
+ring          = { workspace = true }
+ed25519-dalek = { workspace = true }
