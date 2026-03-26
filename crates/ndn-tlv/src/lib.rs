@@ -71,3 +71,90 @@ pub fn varu64_size(value: u64) -> usize {
     else if value < 0x1_0000_0000 { 5 }
     else { 9 }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── varu64_size ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn varu64_size_boundaries() {
+        assert_eq!(varu64_size(0),              1);
+        assert_eq!(varu64_size(252),            1);
+        assert_eq!(varu64_size(253),            3);
+        assert_eq!(varu64_size(0xFFFF),         3);
+        assert_eq!(varu64_size(0x1_0000),       5);
+        assert_eq!(varu64_size(0xFFFF_FFFF),    5);
+        assert_eq!(varu64_size(0x1_0000_0000),  9);
+        assert_eq!(varu64_size(u64::MAX),       9);
+    }
+
+    // ── write_varu64 / read_varu64 round-trips ─────────────────────────────────
+
+    fn roundtrip(value: u64) {
+        let mut buf = [0u8; 9];
+        let written = write_varu64(&mut buf, value);
+        assert_eq!(written, varu64_size(value));
+        let (decoded, read) = read_varu64(&buf[..written]).unwrap();
+        assert_eq!(decoded, value);
+        assert_eq!(read, written);
+    }
+
+    #[test]
+    fn varu64_roundtrip_1byte() {
+        roundtrip(0);
+        roundtrip(1);
+        roundtrip(252);
+    }
+
+    #[test]
+    fn varu64_roundtrip_3byte() {
+        roundtrip(253);
+        roundtrip(254);
+        roundtrip(0xFFFF);
+    }
+
+    #[test]
+    fn varu64_roundtrip_5byte() {
+        roundtrip(0x1_0000);
+        roundtrip(0xFFFF_FFFF);
+    }
+
+    #[test]
+    fn varu64_roundtrip_9byte() {
+        roundtrip(0x1_0000_0000);
+        roundtrip(u64::MAX);
+    }
+
+    // ── read_varu64 error cases ────────────────────────────────────────────────
+
+    #[test]
+    fn read_varu64_eof_empty() {
+        assert_eq!(read_varu64(&[]), Err(TlvError::UnexpectedEof));
+    }
+
+    #[test]
+    fn read_varu64_eof_truncated_3byte() {
+        assert_eq!(read_varu64(&[0xFD, 0x01]), Err(TlvError::UnexpectedEof));
+    }
+
+    #[test]
+    fn read_varu64_eof_truncated_5byte() {
+        assert_eq!(read_varu64(&[0xFE, 0x00, 0x01, 0x00]), Err(TlvError::UnexpectedEof));
+    }
+
+    #[test]
+    fn read_varu64_eof_truncated_9byte() {
+        assert_eq!(read_varu64(&[0xFF, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00]),
+                   Err(TlvError::UnexpectedEof));
+    }
+
+    #[test]
+    fn read_varu64_ignores_trailing_bytes() {
+        // Extra bytes after the value are not consumed and not an error.
+        let (v, n) = read_varu64(&[0x2A, 0xFF, 0xFF]).unwrap();
+        assert_eq!(v, 0x2A);
+        assert_eq!(n, 1);
+    }
+}

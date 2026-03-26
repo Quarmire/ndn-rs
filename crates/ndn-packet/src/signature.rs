@@ -77,3 +77,84 @@ impl SignatureInfo {
         Ok(Self { sig_type, key_locator })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndn_tlv::TlvWriter;
+    use crate::name::build_name_value;
+
+    fn build_sig_info(sig_type_code: u8, key_name_components: Option<&[&[u8]]>) -> bytes::Bytes {
+        let mut w = TlvWriter::new();
+        w.write_tlv(crate::tlv_type::SIGNATURE_TYPE, &[sig_type_code]);
+        if let Some(comps) = key_name_components {
+            w.write_nested(crate::tlv_type::KEY_LOCATOR, |w| {
+                let name_val = build_name_value(comps);
+                w.write_tlv(crate::tlv_type::NAME, &name_val);
+            });
+        }
+        w.finish()
+    }
+
+    // ── SignatureType code round-trips ─────────────────────────────────────────
+
+    #[test]
+    fn sig_type_known_codes() {
+        let cases = [
+            (SignatureType::DigestSha256,             0u64),
+            (SignatureType::SignatureSha256WithRsa,   1),
+            (SignatureType::SignatureSha256WithEcdsa, 3),
+            (SignatureType::SignatureHmacWithSha256,  4),
+            (SignatureType::SignatureEd25519,         7),
+        ];
+        for (sig_type, code) in cases {
+            assert_eq!(sig_type.code(), code, "{sig_type:?}");
+            assert_eq!(SignatureType::from_code(code), sig_type);
+        }
+    }
+
+    #[test]
+    fn sig_type_other_code_roundtrip() {
+        let t = SignatureType::Other(99);
+        assert_eq!(t.code(), 99);
+        assert_eq!(SignatureType::from_code(99), SignatureType::Other(99));
+    }
+
+    // ── SignatureInfo::decode ─────────────────────────────────────────────────
+
+    #[test]
+    fn decode_sig_type_only() {
+        let raw = build_sig_info(7, None);
+        let si = SignatureInfo::decode(raw).unwrap();
+        assert_eq!(si.sig_type, SignatureType::SignatureEd25519);
+        assert!(si.key_locator.is_none());
+    }
+
+    #[test]
+    fn decode_all_known_sig_types() {
+        for code in [0u8, 1, 3, 4, 7] {
+            let raw = build_sig_info(code, None);
+            let si = SignatureInfo::decode(raw).unwrap();
+            assert_eq!(si.sig_type.code(), code as u64);
+        }
+    }
+
+    #[test]
+    fn decode_with_key_locator() {
+        let raw = build_sig_info(7, Some(&[b"sensor", b"node1", b"KEY", b"abc"]));
+        let si = SignatureInfo::decode(raw).unwrap();
+        assert_eq!(si.sig_type, SignatureType::SignatureEd25519);
+        let kl = si.key_locator.expect("key_locator present");
+        assert_eq!(kl.len(), 4);
+        assert_eq!(kl.components()[0].value.as_ref(), b"sensor");
+        assert_eq!(kl.components()[3].value.as_ref(), b"abc");
+    }
+
+    #[test]
+    fn decode_empty_is_other_zero() {
+        // No fields — sig_type defaults to Other(0).
+        let si = SignatureInfo::decode(bytes::Bytes::new()).unwrap();
+        assert_eq!(si.sig_type, SignatureType::Other(0));
+        assert!(si.key_locator.is_none());
+    }
+}

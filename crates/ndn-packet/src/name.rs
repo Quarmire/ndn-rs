@@ -76,6 +76,16 @@ impl Name {
     }
 }
 
+/// Build Name TLV value bytes (the content inside a `0x07` TLV) for testing.
+#[cfg(test)]
+pub(crate) fn build_name_value(components: &[&[u8]]) -> bytes::Bytes {
+    let mut w = ndn_tlv::TlvWriter::new();
+    for comp in components {
+        w.write_tlv(tlv_type::NAME_COMPONENT, comp);
+    }
+    w.finish()
+}
+
 impl core::fmt::Display for Name {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "/")?;
@@ -93,5 +103,163 @@ impl core::fmt::Display for Name {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    fn hash_of(name: &Name) -> u64 {
+        let mut h = DefaultHasher::new();
+        name.hash(&mut h);
+        h.finish()
+    }
+
+    fn comp(s: &[u8]) -> NameComponent {
+        NameComponent::generic(bytes::Bytes::copy_from_slice(s))
+    }
+
+    // ── constructors ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn root_is_empty() {
+        let n = Name::root();
+        assert!(n.is_empty());
+        assert_eq!(n.len(), 0);
+        assert_eq!(n.components().len(), 0);
+    }
+
+    #[test]
+    fn from_components_stores_all() {
+        let n = Name::from_components([comp(b"edu"), comp(b"ucla"), comp(b"news")]);
+        assert_eq!(n.len(), 3);
+        assert_eq!(n.components()[0].value.as_ref(), b"edu");
+        assert_eq!(n.components()[1].value.as_ref(), b"ucla");
+        assert_eq!(n.components()[2].value.as_ref(), b"news");
+    }
+
+    // ── has_prefix ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn has_prefix_true() {
+        let name   = Name::from_components([comp(b"edu"), comp(b"ucla"), comp(b"news")]);
+        let prefix = Name::from_components([comp(b"edu"), comp(b"ucla")]);
+        assert!(name.has_prefix(&prefix));
+    }
+
+    #[test]
+    fn has_prefix_equal_names() {
+        let name = Name::from_components([comp(b"edu"), comp(b"ucla")]);
+        assert!(name.has_prefix(&name.clone()));
+    }
+
+    #[test]
+    fn has_prefix_root_is_prefix_of_everything() {
+        let name = Name::from_components([comp(b"any"), comp(b"name")]);
+        assert!(name.has_prefix(&Name::root()));
+    }
+
+    #[test]
+    fn has_prefix_false_different_component() {
+        let name   = Name::from_components([comp(b"edu"), comp(b"ucla")]);
+        let prefix = Name::from_components([comp(b"edu"), comp(b"mit")]);
+        assert!(!name.has_prefix(&prefix));
+    }
+
+    #[test]
+    fn has_prefix_false_prefix_longer_than_name() {
+        let name   = Name::from_components([comp(b"edu")]);
+        let prefix = Name::from_components([comp(b"edu"), comp(b"ucla")]);
+        assert!(!name.has_prefix(&prefix));
+    }
+
+    // ── decode ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn decode_empty_name() {
+        let name = Name::decode(bytes::Bytes::new()).unwrap();
+        assert!(name.is_empty());
+    }
+
+    #[test]
+    fn decode_one_component() {
+        let value = build_name_value(&[b"hello"]);
+        let name = Name::decode(value).unwrap();
+        assert_eq!(name.len(), 1);
+        assert_eq!(name.components()[0].value.as_ref(), b"hello");
+        assert_eq!(name.components()[0].typ, tlv_type::NAME_COMPONENT);
+    }
+
+    #[test]
+    fn decode_multiple_components() {
+        let value = build_name_value(&[b"edu", b"ucla", b"data"]);
+        let name = Name::decode(value).unwrap();
+        assert_eq!(name.len(), 3);
+        assert_eq!(name.components()[2].value.as_ref(), b"data");
+    }
+
+    #[test]
+    fn decode_preserves_component_type() {
+        // Component with a non-generic type (e.g. ImplicitSha256 = 0x01).
+        let mut w = ndn_tlv::TlvWriter::new();
+        w.write_tlv(0x01, &[0xAA; 32]);
+        let value = w.finish();
+        let name = Name::decode(value).unwrap();
+        assert_eq!(name.components()[0].typ, 0x01);
+    }
+
+    // ── Display ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn display_root() {
+        assert_eq!(Name::root().to_string(), "/");
+    }
+
+    #[test]
+    fn display_single_component() {
+        let n = Name::from_components([comp(b"ndn")]);
+        assert_eq!(n.to_string(), "/ndn");
+    }
+
+    #[test]
+    fn display_multi_component() {
+        let n = Name::from_components([comp(b"edu"), comp(b"ucla"), comp(b"data")]);
+        assert_eq!(n.to_string(), "/edu/ucla/data");
+    }
+
+    #[test]
+    fn display_non_ascii_percent_encoded() {
+        let n = Name::from_components([NameComponent::generic(
+            bytes::Bytes::from(vec![0x00, 0xFF])
+        )]);
+        // 0x00 is not ascii_graphic, 0xFF is not ascii_graphic
+        assert_eq!(n.to_string(), "/%00%FF");
+    }
+
+    // ── Hash / Eq ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn equal_names_have_equal_hash() {
+        let a = Name::from_components([comp(b"foo"), comp(b"bar")]);
+        let b = Name::from_components([comp(b"foo"), comp(b"bar")]);
+        assert_eq!(a, b);
+        assert_eq!(hash_of(&a), hash_of(&b));
+    }
+
+    #[test]
+    fn different_names_are_not_equal() {
+        let a = Name::from_components([comp(b"foo")]);
+        let b = Name::from_components([comp(b"bar")]);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn component_type_affects_equality() {
+        let generic  = NameComponent::generic(bytes::Bytes::copy_from_slice(b"abc"));
+        let implicit = NameComponent { typ: 0x01, value: bytes::Bytes::copy_from_slice(b"abc") };
+        assert_ne!(generic, implicit);
     }
 }

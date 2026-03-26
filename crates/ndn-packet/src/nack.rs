@@ -1,7 +1,7 @@
 use bytes::Bytes;
 
 use crate::{Interest, PacketError};
-use ndn_tlv::TlvReader;
+use ndn_tlv::{TlvReader, TlvWriter};
 use crate::tlv_type;
 
 /// Reason codes carried in a Nack packet.
@@ -42,6 +42,7 @@ impl NackReason {
 }
 
 /// An NDN Nack — a negative acknowledgement wrapping the rejected Interest.
+#[derive(Debug)]
 pub struct Nack {
     pub reason:   NackReason,
     pub interest: Interest,
@@ -74,7 +75,11 @@ impl Nack {
                     reason = NackReason::from_code(code);
                 }
                 t if t == tlv_type::INTEREST => {
-                    interest_raw = Some(v);
+                    // Reconstruct full Interest wire bytes (type + length + value)
+                    // because Interest::decode expects the outer INTEREST TLV wrapper.
+                    let mut w = TlvWriter::new();
+                    w.write_tlv(tlv_type::INTEREST, &v);
+                    interest_raw = Some(w.finish());
                 }
                 _ => {}
             }
@@ -85,5 +90,106 @@ impl Nack {
         })?;
         let interest = Interest::decode(interest_bytes)?;
         Ok(Self { reason, interest })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndn_tlv::TlvWriter;
+    use crate::{Name, NameComponent};
+    use bytes::Bytes;
+
+    fn build_nack(reason_code: u8, name_components: &[&[u8]]) -> Bytes {
+        // Build the Interest inner content (Name TLV value).
+        let mut interest_inner = TlvWriter::new();
+        interest_inner.write_nested(tlv_type::NAME, |w| {
+            for comp in name_components {
+                w.write_tlv(tlv_type::NAME_COMPONENT, comp);
+            }
+        });
+
+        let mut w = TlvWriter::new();
+        w.write_nested(tlv_type::NACK, |w| {
+            w.write_tlv(tlv_type::NACK_REASON, &[reason_code]);
+            // Embed the Interest's inner content as a child TLV with INTEREST type.
+            // Nack::decode reconstructs the full Interest wire bytes from this.
+            w.write_tlv(tlv_type::INTEREST, &interest_inner.finish());
+        });
+        w.finish()
+    }
+
+    // ── NackReason round-trips ────────────────────────────────────────────────
+
+    #[test]
+    fn nack_reason_known_codes() {
+        let cases = [
+            (NackReason::Congestion, 50),
+            (NackReason::Duplicate,  100),
+            (NackReason::NoRoute,    150),
+            (NackReason::NotYet,     160),
+        ];
+        for (reason, code) in cases {
+            assert_eq!(reason.code(), code);
+            assert_eq!(NackReason::from_code(code), reason);
+        }
+    }
+
+    #[test]
+    fn nack_reason_unknown_code_roundtrip() {
+        let reason = NackReason::Other(42);
+        assert_eq!(reason.code(), 42);
+        assert_eq!(NackReason::from_code(42), NackReason::Other(42));
+    }
+
+    // ── Nack::new ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn nack_new_stores_fields() {
+        let name = Name::from_components([
+            NameComponent::generic(Bytes::from_static(b"test")),
+        ]);
+        let interest = Interest::new(name.clone());
+        let nack = Nack::new(interest, NackReason::NoRoute);
+        assert_eq!(nack.reason, NackReason::NoRoute);
+        assert_eq!(*nack.interest.name, name);
+    }
+
+    // ── Nack::decode ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn decode_nack_reason_and_name() {
+        let raw = build_nack(150, &[b"edu", b"ucla"]);  // NoRoute = 150
+        let nack = Nack::decode(raw).unwrap();
+        assert_eq!(nack.reason, NackReason::NoRoute);
+        assert_eq!(nack.interest.name.len(), 2);
+        assert_eq!(nack.interest.name.components()[0].value.as_ref(), b"edu");
+    }
+
+    #[test]
+    fn decode_nack_congestion() {
+        let raw = build_nack(50, &[b"test"]);
+        let nack = Nack::decode(raw).unwrap();
+        assert_eq!(nack.reason, NackReason::Congestion);
+    }
+
+    #[test]
+    fn decode_nack_wrong_outer_type_errors() {
+        let mut w = TlvWriter::new();
+        w.write_tlv(0x05, &[]);  // INTEREST type, not NACK
+        assert!(matches!(
+            Nack::decode(w.finish()).unwrap_err(),
+            crate::PacketError::UnknownPacketType(0x05)
+        ));
+    }
+
+    #[test]
+    fn decode_nack_missing_interest_errors() {
+        let mut w = TlvWriter::new();
+        w.write_nested(tlv_type::NACK, |w| {
+            w.write_tlv(tlv_type::NACK_REASON, &[50]);
+            // No Interest TLV embedded.
+        });
+        assert!(Nack::decode(w.finish()).is_err());
     }
 }
