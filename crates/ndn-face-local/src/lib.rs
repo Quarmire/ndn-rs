@@ -1,11 +1,15 @@
 pub mod app;
 
-pub use app::{AppFace, AppHandle};
-
-// Unix domain socket face — only available on Unix-family targets.
-// On Windows and WASM this module is not compiled at all.
 #[cfg(unix)]
 pub mod unix;
 
+#[cfg(any(feature = "spsc-shm", feature = "iceoryx2-shm"))]
+pub mod shm;
+
+pub use app::{AppFace, AppHandle};
+
 #[cfg(unix)]
 pub use unix::UnixFace;
+
+#[cfg(any(feature = "spsc-shm", feature = "iceoryx2-shm"))]
+pub use shm::{ShmError, ShmFace, ShmHandle};

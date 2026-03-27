@@ -1,0 +1,552 @@
+//! Custom SPSC shared-memory face (Unix only, `spsc-shm` feature).
+//!
+//! A named POSIX SHM region holds two lock-free single-producer/single-consumer
+//! ring buffers — one for each direction.  Wakeup notifications use a pair of
+//! Unix datagram sockets whose paths are derived from the face name.
+//!
+//! # SHM layout
+//!
+//! ```text
+//! Cache line 0 (off   0–63):  magic u64 | capacity u32 | slot_size u32 | pad
+//! Cache line 1 (off  64–127): a2e_tail AtomicU32  — app writes, engine reads
+//! Cache line 2 (off 128–191): a2e_head AtomicU32  — engine writes, app reads
+//! Cache line 3 (off 192–255): e2a_tail AtomicU32  — engine writes, app reads
+//! Cache line 4 (off 256–319): e2a_head AtomicU32  — app writes, engine reads
+//! Data block (off 320–N):     a2e ring (capacity × slot_stride bytes)
+//! Data block (off N–end):     e2a ring (capacity × slot_stride bytes)
+//!   slot_stride = 4 (length prefix) + slot_size (payload area)
+//! ```
+//!
+//! # Wakeup sockets
+//!
+//! Each side owns one bound `UnixDatagram` socket:
+//! - Engine: `/tmp/.ndn-{name}.e.sock` — receives one-byte wakeups from app
+//! - App:    `/tmp/.ndn-{name}.a.sock` — receives one-byte wakeups from engine
+use std::ffi::CString;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+use bytes::Bytes;
+use tokio::net::UnixDatagram;
+
+use ndn_transport::{Face, FaceError, FaceId, FaceKind};
+
+use crate::shm::ShmError;
+
+// ─── Constants ───────────────────────────────────────────────────────────────
+
+const MAGIC: u64 = 0x4E44_4E5F_5348_4D00; // b"NDN_SHM\0"
+
+/// Default number of slots per ring.
+pub const DEFAULT_CAPACITY: u32 = 64;
+/// Default slot payload size in bytes (~8.75 KiB, covers typical NDN packets).
+pub const DEFAULT_SLOT_SIZE: u32 = 8960;
+
+// Cache-line–aligned offsets for the four ring index atomics.
+const OFF_A2E_TAIL: usize = 64;   // app writes (producer)
+const OFF_A2E_HEAD: usize = 128;  // engine writes (consumer)
+const OFF_E2A_TAIL: usize = 192;  // engine writes (producer)
+const OFF_E2A_HEAD: usize = 256;  // app writes (consumer)
+const HEADER_SIZE:  usize = 320;  // 5 × 64-byte cache lines
+
+fn slot_stride(slot_size: u32) -> usize { 4 + slot_size as usize }
+
+fn shm_total_size(capacity: u32, slot_size: u32) -> usize {
+    HEADER_SIZE + 2 * capacity as usize * slot_stride(slot_size)
+}
+
+fn a2e_ring_offset() -> usize { HEADER_SIZE }
+fn e2a_ring_offset(capacity: u32, slot_size: u32) -> usize {
+    HEADER_SIZE + capacity as usize * slot_stride(slot_size)
+}
+
+// ─── Path helpers ─────────────────────────────────────────────────────────────
+
+fn posix_shm_name(name: &str) -> String { format!("/ndn-shm-{name}") }
+fn engine_sock_path(name: &str) -> PathBuf { PathBuf::from(format!("/tmp/.ndn-{name}.e.sock")) }
+fn app_sock_path(name: &str) -> PathBuf    { PathBuf::from(format!("/tmp/.ndn-{name}.a.sock")) }
+
+// ─── POSIX SHM region ────────────────────────────────────────────────────────
+
+/// Owns a POSIX SHM mapping. The creator unlinks the name on drop.
+struct ShmRegion {
+    ptr:      *mut u8,
+    size:     usize,
+    /// Present when this process created the region; drives shm_unlink on drop.
+    shm_name: Option<CString>,
+}
+
+unsafe impl Send for ShmRegion {}
+unsafe impl Sync for ShmRegion {}
+
+impl ShmRegion {
+    /// Create and zero-initialise a new named SHM region.
+    fn create(shm_name: &str, size: usize) -> Result<Self, ShmError> {
+        let cname = CString::new(shm_name).map_err(|_| ShmError::InvalidName)?;
+        let ptr = unsafe {
+            let fd = libc::shm_open(
+                cname.as_ptr(),
+                libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
+                (libc::S_IRUSR | libc::S_IWUSR) as libc::mode_t as libc::c_uint,
+            );
+            if fd == -1 { return Err(ShmError::Io(std::io::Error::last_os_error())); }
+
+            if libc::ftruncate(fd, size as libc::off_t) == -1 {
+                libc::close(fd);
+                return Err(ShmError::Io(std::io::Error::last_os_error()));
+            }
+
+            let p = libc::mmap(
+                std::ptr::null_mut(), size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED, fd, 0,
+            );
+            libc::close(fd);
+            if p == libc::MAP_FAILED {
+                return Err(ShmError::Io(std::io::Error::last_os_error()));
+            }
+            p as *mut u8
+        };
+        Ok(ShmRegion { ptr, size, shm_name: Some(cname) })
+    }
+
+    /// Open an existing named SHM region created by `ShmRegion::create`.
+    fn open(shm_name: &str, size: usize) -> Result<Self, ShmError> {
+        let cname = CString::new(shm_name).map_err(|_| ShmError::InvalidName)?;
+        let ptr = unsafe {
+            let fd = libc::shm_open(cname.as_ptr(), libc::O_RDWR, 0);
+            if fd == -1 { return Err(ShmError::Io(std::io::Error::last_os_error())); }
+
+            let p = libc::mmap(
+                std::ptr::null_mut(), size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED, fd, 0,
+            );
+            libc::close(fd);
+            if p == libc::MAP_FAILED {
+                return Err(ShmError::Io(std::io::Error::last_os_error()));
+            }
+            p as *mut u8
+        };
+        Ok(ShmRegion { ptr, size, shm_name: None })
+    }
+
+    fn as_ptr(&self) -> *mut u8 { self.ptr }
+
+    /// Write the header fields (magic, capacity, slot_size).
+    ///
+    /// # Safety
+    /// Must be called exactly once immediately after `create()`, before any
+    /// other process opens the region.
+    unsafe fn write_header(&self, capacity: u32, slot_size: u32) {
+        unsafe {
+            (self.ptr as *mut u64).write_unaligned(MAGIC);
+            (self.ptr.add(8) as *mut u32).write_unaligned(capacity);
+            (self.ptr.add(12) as *mut u32).write_unaligned(slot_size);
+        }
+        // Ring indices start at zero (mmap of new ftruncated fd is zero-initialised).
+    }
+
+    /// Read and validate the header. Returns `(capacity, slot_size)`.
+    ///
+    /// # Safety
+    /// The region must have been initialised by `write_header`.
+    unsafe fn read_header(&self) -> Result<(u32, u32), ShmError> {
+        unsafe {
+            let magic     = (self.ptr as *const u64).read_unaligned();
+            if magic != MAGIC { return Err(ShmError::InvalidMagic); }
+            let capacity  = (self.ptr.add(8)  as *const u32).read_unaligned();
+            let slot_size = (self.ptr.add(12) as *const u32).read_unaligned();
+            Ok((capacity, slot_size))
+        }
+    }
+}
+
+impl Drop for ShmRegion {
+    fn drop(&mut self) {
+        unsafe {
+            libc::munmap(self.ptr as *mut libc::c_void, self.size);
+            if let Some(ref n) = self.shm_name {
+                libc::shm_unlink(n.as_ptr());
+            }
+        }
+    }
+}
+
+// ─── SPSC ring operations ─────────────────────────────────────────────────────
+
+/// Push `data` into the ring at [`ring_off`] using the tail at [`tail_off`] and
+/// head at [`head_off`]. Returns `false` if the ring is full.
+///
+/// # Safety
+/// `base` must be a valid, exclusively-written SHM mapping of sufficient size.
+/// `data.len() <= slot_size` must hold.
+unsafe fn ring_push(
+    base: *mut u8, ring_off: usize,
+    tail_off: usize, head_off: usize,
+    capacity: u32, slot_size: u32,
+    data: &[u8],
+) -> bool {
+    debug_assert!(data.len() <= slot_size as usize);
+
+    let tail_a = unsafe { &*AtomicU32::from_ptr(base.add(tail_off) as *mut u32) };
+    let head_a = unsafe { &*AtomicU32::from_ptr(base.add(head_off) as *mut u32) };
+
+    let t = tail_a.load(Ordering::Relaxed);
+    let h = head_a.load(Ordering::Acquire);
+    if t.wrapping_sub(h) >= capacity { return false; }
+
+    let idx  = (t % capacity) as usize;
+    let slot = unsafe { base.add(ring_off + idx * slot_stride(slot_size)) };
+
+    unsafe {
+        (slot as *mut u32).write_unaligned(data.len() as u32);
+        std::ptr::copy_nonoverlapping(data.as_ptr(), slot.add(4), data.len());
+    }
+    tail_a.store(t.wrapping_add(1), Ordering::Release);
+    true
+}
+
+/// Pop one packet from the ring. Returns `None` if empty.
+///
+/// # Safety
+/// Same as [`ring_push`].
+unsafe fn ring_pop(
+    base: *mut u8, ring_off: usize,
+    tail_off: usize, head_off: usize,
+    capacity: u32, slot_size: u32,
+) -> Option<Bytes> {
+    let tail_a = unsafe { &*AtomicU32::from_ptr(base.add(tail_off) as *mut u32) };
+    let head_a = unsafe { &*AtomicU32::from_ptr(base.add(head_off) as *mut u32) };
+
+    let h = head_a.load(Ordering::Relaxed);
+    let t = tail_a.load(Ordering::Acquire);
+    if h == t { return None; }
+
+    let idx  = (h % capacity) as usize;
+    let slot = unsafe { base.add(ring_off + idx * slot_stride(slot_size)) };
+
+    let len = unsafe { (slot as *const u32).read_unaligned() as usize };
+    // Clamp to prevent out-of-bounds read if SHM is corrupted.
+    let len = len.min(slot_size as usize);
+    let data = unsafe {
+        Bytes::copy_from_slice(std::slice::from_raw_parts(slot.add(4), len))
+    };
+
+    head_a.store(h.wrapping_add(1), Ordering::Release);
+    Some(data)
+}
+
+// ─── SpscFace (engine side) ───────────────────────────────────────────────────
+
+/// Engine-side SPSC SHM face.
+///
+/// Create with [`SpscFace::create`]; register with the engine via
+/// `ForwarderEngine::add_face`. Give the `name` to the application so it can
+/// call [`SpscHandle::connect`].
+pub struct SpscFace {
+    id:        FaceId,
+    shm:       ShmRegion,
+    capacity:  u32,
+    slot_size: u32,
+    a2e_off:   usize,
+    e2a_off:   usize,
+    /// Bound engine wakeup socket; receives one-byte signals from the app.
+    sock:      UnixDatagram,
+    sock_path: PathBuf,
+    /// App wakeup socket path; engine sends one-byte signals here.
+    app_path:  PathBuf,
+}
+
+impl SpscFace {
+    /// Create the SHM region and bind the engine wakeup socket.
+    ///
+    /// `name` identifies this face (e.g. `"sensor-0"`); pass it to
+    /// [`SpscHandle::connect`] in the application process.
+    pub fn create(id: FaceId, name: &str) -> Result<Self, ShmError> {
+        Self::create_with(id, name, DEFAULT_CAPACITY, DEFAULT_SLOT_SIZE)
+    }
+
+    /// Create with explicit ring parameters.
+    pub fn create_with(
+        id: FaceId, name: &str, capacity: u32, slot_size: u32,
+    ) -> Result<Self, ShmError> {
+        let size    = shm_total_size(capacity, slot_size);
+        let shm     = ShmRegion::create(&posix_shm_name(name), size)?;
+        unsafe { shm.write_header(capacity, slot_size); }
+
+        let a2e_off  = a2e_ring_offset();
+        let e2a_off  = e2a_ring_offset(capacity, slot_size);
+        let sock_path = engine_sock_path(name);
+        let app_path  = app_sock_path(name);
+
+        // Remove any stale socket left by a previous run.
+        let _ = std::fs::remove_file(&sock_path);
+        let sock = UnixDatagram::bind(&sock_path).map_err(ShmError::Io)?;
+
+        Ok(SpscFace { id, shm, capacity, slot_size, a2e_off, e2a_off, sock, sock_path, app_path })
+    }
+
+    fn try_pop_a2e(&self) -> Option<Bytes> {
+        unsafe {
+            ring_pop(self.shm.as_ptr(), self.a2e_off,
+                     OFF_A2E_TAIL, OFF_A2E_HEAD, self.capacity, self.slot_size)
+        }
+    }
+
+    fn try_push_e2a(&self, data: &[u8]) -> bool {
+        unsafe {
+            ring_push(self.shm.as_ptr(), self.e2a_off,
+                      OFF_E2A_TAIL, OFF_E2A_HEAD, self.capacity, self.slot_size, data)
+        }
+    }
+}
+
+impl Drop for SpscFace {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.sock_path);
+    }
+}
+
+impl Face for SpscFace {
+    fn id(&self)   -> FaceId   { self.id }
+    fn kind(&self) -> FaceKind { FaceKind::Shm }
+
+    async fn recv(&self) -> Result<Bytes, FaceError> {
+        let mut buf = [0u8; 16];
+        loop {
+            if let Some(pkt) = self.try_pop_a2e() {
+                return Ok(pkt);
+            }
+            // Wait for the app to signal "data available".
+            self.sock.recv(&mut buf).await
+                .map_err(|_| FaceError::Closed)?;
+            // Drain extra wakeups that accumulated while we were processing.
+            while self.sock.try_recv(&mut buf).is_ok() {}
+        }
+    }
+
+    async fn send(&self, pkt: Bytes) -> Result<(), FaceError> {
+        if pkt.len() > self.slot_size as usize {
+            return Err(FaceError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "packet exceeds SHM slot size",
+            )));
+        }
+        // Yield until there is space in the e2a ring (backpressure).
+        loop {
+            if self.try_push_e2a(&pkt) { break; }
+            tokio::task::yield_now().await;
+        }
+        // Signal app — best-effort (no error if app socket not yet bound).
+        let _ = self.sock.send_to(b"\x01", &self.app_path).await;
+        Ok(())
+    }
+}
+
+// ─── SpscHandle (application side) ───────────────────────────────────────────
+
+/// Application-side SPSC SHM handle.
+///
+/// Connect with [`SpscHandle::connect`] using the same `name` passed to
+/// [`SpscFace::create`] in the engine process.
+pub struct SpscHandle {
+    shm:       ShmRegion,
+    capacity:  u32,
+    slot_size: u32,
+    a2e_off:   usize,
+    e2a_off:   usize,
+    /// Bound app wakeup socket; receives one-byte signals from the engine.
+    sock:      UnixDatagram,
+    sock_path: PathBuf,
+    /// Engine wakeup socket path; app sends one-byte signals here.
+    eng_path:  PathBuf,
+}
+
+impl SpscHandle {
+    /// Open the SHM region created by the engine and bind the app wakeup socket.
+    pub fn connect(name: &str) -> Result<Self, ShmError> {
+        // We don't know the size until we read the header.  Open with a
+        // minimum size to read the header, then remap at the full size.
+        // Easier: open with the max possible size and trust the header.
+        // Instead: read header first by opening at header size, validate, then reopen.
+        //
+        // Simplest correct approach: open at max conceivable size.
+        // We actually need to know the size first. Open the SHM at HEADER_SIZE
+        // to read (capacity, slot_size), then close and reopen at full size.
+        let shm_name_str = posix_shm_name(name);
+        let cname = CString::new(shm_name_str.as_str()).map_err(|_| ShmError::InvalidName)?;
+
+        // Phase 1: open just the header to read capacity and slot_size.
+        let (capacity, slot_size) = unsafe {
+            let fd = libc::shm_open(cname.as_ptr(), libc::O_RDONLY, 0);
+            if fd == -1 { return Err(ShmError::Io(std::io::Error::last_os_error())); }
+            let p = libc::mmap(
+                std::ptr::null_mut(), HEADER_SIZE,
+                libc::PROT_READ, libc::MAP_SHARED, fd, 0,
+            );
+            libc::close(fd);
+            if p == libc::MAP_FAILED {
+                return Err(ShmError::Io(std::io::Error::last_os_error()));
+            }
+            let base = p as *const u8;
+            let magic = (base as *const u64).read_unaligned();
+            if magic != MAGIC {
+                libc::munmap(p, HEADER_SIZE);
+                return Err(ShmError::InvalidMagic);
+            }
+            let cap  = (base.add(8)  as *const u32).read_unaligned();
+            let slen = (base.add(12) as *const u32).read_unaligned();
+            libc::munmap(p, HEADER_SIZE);
+            (cap, slen)
+        };
+
+        // Phase 2: open the full region read-write.
+        let size = shm_total_size(capacity, slot_size);
+        let shm  = ShmRegion::open(&shm_name_str, size)?;
+
+        // Validate magic again on the full mapping (sanity check).
+        unsafe { shm.read_header()? };
+
+        let a2e_off  = a2e_ring_offset();
+        let e2a_off  = e2a_ring_offset(capacity, slot_size);
+        let sock_path = app_sock_path(name);
+        let eng_path  = engine_sock_path(name);
+
+        let _ = std::fs::remove_file(&sock_path);
+        let sock = UnixDatagram::bind(&sock_path).map_err(ShmError::Io)?;
+
+        Ok(SpscHandle { shm, capacity, slot_size, a2e_off, e2a_off, sock, sock_path, eng_path })
+    }
+
+    fn try_push_a2e(&self, data: &[u8]) -> bool {
+        unsafe {
+            ring_push(self.shm.as_ptr(), self.a2e_off,
+                      OFF_A2E_TAIL, OFF_A2E_HEAD, self.capacity, self.slot_size, data)
+        }
+    }
+
+    fn try_pop_e2a(&self) -> Option<Bytes> {
+        unsafe {
+            ring_pop(self.shm.as_ptr(), self.e2a_off,
+                     OFF_E2A_TAIL, OFF_E2A_HEAD, self.capacity, self.slot_size)
+        }
+    }
+
+    /// Send a packet to the engine (enqueue in the a2e ring).
+    ///
+    /// Yields cooperatively if the ring is full (backpressure from the engine).
+    pub async fn send(&self, pkt: Bytes) -> Result<(), ShmError> {
+        if pkt.len() > self.slot_size as usize {
+            return Err(ShmError::PacketTooLarge);
+        }
+        loop {
+            if self.try_push_a2e(&pkt) { break; }
+            tokio::task::yield_now().await;
+        }
+        let _ = self.sock.send_to(b"\x01", &self.eng_path).await;
+        Ok(())
+    }
+
+    /// Receive a packet from the engine (dequeue from the e2a ring).
+    ///
+    /// Returns `None` when the engine face has been closed or dropped.
+    pub async fn recv(&self) -> Option<Bytes> {
+        let mut buf = [0u8; 16];
+        loop {
+            if let Some(pkt) = self.try_pop_e2a() {
+                return Some(pkt);
+            }
+            if self.sock.recv(&mut buf).await.is_err() {
+                return None;
+            }
+            while self.sock.try_recv(&mut buf).is_ok() {}
+        }
+    }
+}
+
+impl Drop for SpscHandle {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.sock_path);
+    }
+}
+
+// ─── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndn_transport::Face;
+
+    fn test_name() -> String {
+        // Use PID to avoid collisions when tests run concurrently.
+        format!("test-spsc-{}", std::process::id())
+    }
+
+    #[tokio::test]
+    async fn face_kind_and_id() {
+        let name = test_name();
+        let face = SpscFace::create(FaceId(7), &name).unwrap();
+        assert_eq!(face.id(), FaceId(7));
+        assert_eq!(face.kind(), FaceKind::Shm);
+    }
+
+    #[tokio::test]
+    async fn app_to_engine_roundtrip() {
+        let name   = format!("{}-ae", test_name());
+        let face   = SpscFace::create(FaceId(1), &name).unwrap();
+        let handle = SpscHandle::connect(&name).unwrap();
+
+        let pkt = Bytes::from_static(b"\x05\x03\x01\x02\x03");
+        handle.send(pkt.clone()).await.unwrap();
+
+        let received = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            face.recv(),
+        ).await.expect("timed out").unwrap();
+
+        assert_eq!(received, pkt);
+    }
+
+    #[tokio::test]
+    async fn engine_to_app_roundtrip() {
+        let name   = format!("{}-ea", test_name());
+        let face   = SpscFace::create(FaceId(2), &name).unwrap();
+        let handle = SpscHandle::connect(&name).unwrap();
+
+        let pkt = Bytes::from_static(b"\x06\x03\xAA\xBB\xCC");
+        face.send(pkt.clone()).await.unwrap();
+
+        let received = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            handle.recv(),
+        ).await.expect("timed out").unwrap();
+
+        assert_eq!(received, pkt);
+    }
+
+    #[tokio::test]
+    async fn multiple_packets_both_directions() {
+        let name   = format!("{}-bi", test_name());
+        let face   = SpscFace::create(FaceId(3), &name).unwrap();
+        let handle = SpscHandle::connect(&name).unwrap();
+
+        // App → Engine: 4 packets
+        for i in 0u8..4 {
+            handle.send(Bytes::from(vec![i; 64])).await.unwrap();
+        }
+        for i in 0u8..4 {
+            let pkt = face.recv().await.unwrap();
+            assert_eq!(&pkt[..], &vec![i; 64][..]);
+        }
+
+        // Engine → App: 4 packets
+        for i in 0u8..4 {
+            face.send(Bytes::from(vec![i + 10; 128])).await.unwrap();
+        }
+        for i in 0u8..4 {
+            let pkt = handle.recv().await.unwrap();
+            assert_eq!(&pkt[..], &vec![i + 10; 128][..]);
+        }
+    }
+}

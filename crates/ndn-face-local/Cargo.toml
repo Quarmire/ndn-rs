@@ -1,26 +1,31 @@
 [package]
 name = "ndn-face-local"
-description = "NDN local faces: AppFace (in-process mpsc) and UnixFace (TLV-framed Unix socket, Unix only)"
+description = "NDN local faces: AppFace (in-process mpsc), UnixFace (Unix socket), and ShmFace (shared memory)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [features]
-# Enabled by default on Unix. Pull it in explicitly on non-Unix hosts if
-# cross-compiling for a Unix target from a non-Unix build machine.
-# The UnixFace implementation is cfg-gated separately with #[cfg(unix)], so
-# on Windows/WASM the feature is a no-op and no compilation error occurs.
-default = []
+## Custom SPSC ring-buffer SHM face backed by POSIX shm_open + Unix datagram
+## wakeup sockets.  Unix only.  Enabled by default on Unix targets.
+spsc-shm = ["dep:libc"]
+
+## iceoryx2 publish-subscribe SHM face.  Cross-platform (Linux, macOS, Windows).
+## When both features are enabled, the iceoryx2 backend is selected for
+## ShmFace/ShmHandle; SpscFace/SpscHandle remain available directly.
+iceoryx2-shm = ["dep:iceoryx2"]
 
 [dependencies]
 ndn-packet    = { workspace = true }
 ndn-transport = { workspace = true }
 bytes         = { workspace = true }
-# "net" includes UnixStream/UnixListener, needed for UnixFace on Unix.
 tokio         = { workspace = true, features = ["sync", "io-util", "net"] }
 tokio-util    = { workspace = true, features = ["codec"] }
 futures       = { workspace = true }
 thiserror     = { workspace = true }
+tracing       = { workspace = true }
+libc          = { workspace = true, optional = true }
+iceoryx2      = { workspace = true, optional = true }
 
 [dev-dependencies]
 ndn-tlv = { workspace = true }

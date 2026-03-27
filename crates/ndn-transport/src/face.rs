@@ -23,6 +23,7 @@ pub enum FaceKind {
     Unix,
     Ethernet,
     App,
+    Shm,
     Serial,
     Bluetooth,
     Wfb,
