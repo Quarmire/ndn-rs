@@ -3,16 +3,19 @@ use std::sync::Arc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-use ndn_store::Pit;
+use ndn_store::{LruCs, Pit};
+use ndn_strategy::MeasurementsTable;
 use ndn_transport::FaceTable;
 
 use crate::Fib;
 
 /// Shared tables owned by the engine, accessible to all tasks via `Arc`.
 pub struct EngineInner {
-    pub fib:        Arc<Fib>,
-    pub pit:        Arc<Pit>,
-    pub face_table: Arc<FaceTable>,
+    pub fib:          Arc<Fib>,
+    pub pit:          Arc<Pit>,
+    pub cs:           Arc<LruCs>,
+    pub face_table:   Arc<FaceTable>,
+    pub measurements: Arc<MeasurementsTable>,
 }
 
 /// Handle to a running forwarding engine.
@@ -24,19 +27,20 @@ pub struct ForwarderEngine {
 }
 
 impl ForwarderEngine {
-    /// Access the FIB for prefix registration.
     pub fn fib(&self) -> Arc<Fib> {
         Arc::clone(&self.inner.fib)
     }
 
-    /// Access the face table.
     pub fn faces(&self) -> Arc<FaceTable> {
         Arc::clone(&self.inner.face_table)
     }
 
-    /// Access the PIT.
     pub fn pit(&self) -> Arc<Pit> {
         Arc::clone(&self.inner.pit)
+    }
+
+    pub fn cs(&self) -> Arc<LruCs> {
+        Arc::clone(&self.inner.cs)
     }
 }
 

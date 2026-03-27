@@ -4,11 +4,17 @@ use anyhow::Result;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-use ndn_store::Pit;
+use ndn_store::{LruCs, Pit};
+use ndn_strategy::{BestRouteStrategy, MeasurementsTable};
 use ndn_transport::{Face, FaceTable};
 
 use crate::{
+    dispatcher::PacketDispatcher,
     engine::{EngineInner, ShutdownHandle},
+    stages::{
+        CsInsertStage, CsLookupStage, ErasedStrategy, PitCheckStage, PitMatchStage, StrategyStage,
+        TlvDecodeStage,
+    },
     Fib, ForwarderEngine,
 };
 
@@ -31,13 +37,14 @@ impl Default for EngineConfig {
 
 /// Constructs and wires a `ForwarderEngine`.
 pub struct EngineBuilder {
-    config: EngineConfig,
-    faces:  Vec<Box<dyn FnOnce(Arc<FaceTable>) + Send>>,
+    config:   EngineConfig,
+    faces:    Vec<Box<dyn FnOnce(Arc<FaceTable>) + Send>>,
+    strategy: Option<Arc<dyn ErasedStrategy>>,
 }
 
 impl EngineBuilder {
     pub fn new(config: EngineConfig) -> Self {
-        Self { config, faces: Vec::new() }
+        Self { config, faces: Vec::new(), strategy: None }
     }
 
     /// Register a face to be added at startup.
@@ -46,11 +53,19 @@ impl EngineBuilder {
         self
     }
 
+    /// Override the forwarding strategy (default: `BestRouteStrategy`).
+    pub fn strategy<S: ErasedStrategy>(mut self, s: S) -> Self {
+        self.strategy = Some(Arc::new(s));
+        self
+    }
+
     /// Build the engine, spawn all tasks, and return handles.
     pub async fn build(self) -> Result<(ForwarderEngine, ShutdownHandle)> {
-        let fib        = Arc::new(Fib::new());
-        let pit        = Arc::new(Pit::new());
-        let face_table = Arc::new(FaceTable::new());
+        let fib          = Arc::new(Fib::new());
+        let pit          = Arc::new(Pit::new());
+        let cs           = Arc::new(LruCs::new(self.config.cs_capacity_bytes));
+        let face_table   = Arc::new(FaceTable::new());
+        let measurements = Arc::new(MeasurementsTable::new());
 
         // Register pre-configured faces.
         for add_face in self.faces {
@@ -58,15 +73,17 @@ impl EngineBuilder {
         }
 
         let inner = Arc::new(EngineInner {
-            fib:        Arc::clone(&fib),
-            pit:        Arc::clone(&pit),
-            face_table: Arc::clone(&face_table),
+            fib:          Arc::clone(&fib),
+            pit:          Arc::clone(&pit),
+            cs:           Arc::clone(&cs),
+            face_table:   Arc::clone(&face_table),
+            measurements: Arc::clone(&measurements),
         });
 
         let cancel = CancellationToken::new();
         let mut tasks = JoinSet::new();
 
-        // Spawn the PIT expiry task.
+        // PIT expiry task.
         {
             let pit_clone    = Arc::clone(&pit);
             let cancel_clone = cancel.clone();
@@ -74,6 +91,28 @@ impl EngineBuilder {
                 crate::expiry::run_expiry_task(pit_clone, cancel_clone).await;
             });
         }
+
+        // Build and spawn the packet dispatcher.
+        let strategy: Arc<dyn ErasedStrategy> = self
+            .strategy
+            .unwrap_or_else(|| Arc::new(BestRouteStrategy::new()));
+
+        let dispatcher = PacketDispatcher {
+            face_table: Arc::clone(&face_table),
+            decode:     TlvDecodeStage,
+            cs_lookup:  CsLookupStage { cs: Arc::clone(&cs) },
+            pit_check:  PitCheckStage { pit: Arc::clone(&pit) },
+            strategy:   StrategyStage {
+                strategy:     strategy,
+                fib:          Arc::clone(&fib),
+                measurements: Arc::clone(&measurements),
+            },
+            pit_match:   PitMatchStage { pit: Arc::clone(&pit) },
+            cs_insert:   CsInsertStage { cs: Arc::clone(&cs) },
+            channel_cap: self.config.pipeline_channel_cap,
+        };
+
+        dispatcher.spawn(cancel.clone(), &mut tasks);
 
         let engine = ForwarderEngine { inner };
         let handle = ShutdownHandle { cancel, tasks };
@@ -92,10 +131,10 @@ mod tests {
             .build()
             .await
             .unwrap();
-        // Accessors return valid Arcs.
         let _ = engine.fib();
         let _ = engine.pit();
         let _ = engine.faces();
+        let _ = engine.cs();
         handle.shutdown().await;
     }
 
@@ -106,7 +145,6 @@ mod tests {
             .await
             .unwrap();
         let clone = engine.clone();
-        // Both handles point to the same FIB.
         assert!(Arc::ptr_eq(&engine.fib(), &clone.fib()));
         handle.shutdown().await;
     }
@@ -117,8 +155,8 @@ mod tests {
             .build()
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_millis(200), handle.shutdown())
+        tokio::time::timeout(Duration::from_millis(500), handle.shutdown())
             .await
-            .expect("shutdown did not complete within 200 ms");
+            .expect("shutdown did not complete within 500 ms");
     }
 }

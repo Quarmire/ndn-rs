@@ -57,10 +57,189 @@ Dependency layers flow strictly downward: `ndn-tlv` and `ndn-packet` have no asy
 
 ## Quick Start
 
+### Build and test
+
 ```bash
 cargo build
 cargo test
+```
+
+### Run the standalone forwarder
+
+```bash
+# Default config (no faces, no routes — useful to verify the engine starts):
 cargo run --bin ndn-router
+
+# With a config file:
+cargo run --bin ndn-router -- -c ndn-router.toml
+
+# Custom management socket path:
+cargo run --bin ndn-router -- -c ndn-router.toml -m /run/ndn/mgmt.sock
+```
+
+The router logs to stderr in structured format. Set `RUST_LOG=debug` for
+verbose output or `RUST_LOG=ndn_engine=trace` to trace individual pipeline
+stages.
+
+### Send management commands at runtime
+
+The management server speaks newline-delimited JSON over a Unix socket.
+Use `nc` (netcat) or any socket client:
+
+```bash
+SOCK=/tmp/ndn-router.sock
+
+# Add a FIB route
+echo '{"cmd":"add_route","prefix":"/ndn","face":0,"cost":10}' | nc -U $SOCK
+
+# Remove a route
+echo '{"cmd":"remove_route","prefix":"/ndn","face":0}' | nc -U $SOCK
+
+# List registered face IDs
+echo '{"cmd":"list_faces"}' | nc -U $SOCK
+
+# Live engine stats (PIT size, etc.)
+echo '{"cmd":"get_stats"}' | nc -U $SOCK
+
+# Graceful shutdown
+echo '{"cmd":"shutdown"}' | nc -U $SOCK
+```
+
+---
+
+## Configuration
+
+`ndn-router` is configured via a TOML file (`-c <path>`). All sections are
+optional; omitting a section uses the defaults shown below.
+
+### Full schema
+
+```toml
+# ── Engine ────────────────────────────────────────────────────────────────────
+[engine]
+# Content store size in megabytes. Set to 0 to disable caching.
+cs_capacity_mb = 64          # default: 64
+
+# Backpressure bound on the face-to-pipeline channel.
+pipeline_channel_cap = 1024  # default: 1024
+
+
+# ── Faces ─────────────────────────────────────────────────────────────────────
+# Each [[face]] block defines one transport endpoint.
+# Faces are assigned sequential IDs (0, 1, 2 …) in declaration order.
+
+[[face]]
+# Unicast UDP face — connected to one remote peer.
+kind   = "udp"
+bind   = "0.0.0.0:6363"      # local address:port
+remote = "192.168.1.2:6363"  # peer address:port
+
+[[face]]
+# NDN multicast face — sends to and receives from all LAN neighbours.
+kind      = "multicast"
+group     = "224.0.23.170"   # NDN IPv4 multicast group (standard)
+port      = 56363            # multicast port
+interface = "eth0"           # outbound interface name
+
+[[face]]
+# TCP face — one connected stream.
+kind   = "tcp"
+bind   = "0.0.0.0:6363"
+remote = "10.0.0.1:6363"
+
+[[face]]
+# Unix domain socket face — for local inter-process communication.
+kind = "unix"
+path = "/run/ndn/local.sock"
+
+
+# ── Static FIB Routes ─────────────────────────────────────────────────────────
+# Each [[route]] entry adds one nexthop to the FIB at startup.
+# `face` is the zero-based index from the [[face]] list above.
+# Multiple [[route]] entries may share the same prefix to create multipath.
+
+[[route]]
+prefix = "/ndn"     # NDN name prefix (slash-separated components)
+face   = 0          # face index
+cost   = 10         # routing cost; lower is preferred (default: 10)
+
+[[route]]
+prefix = "/local"
+face   = 1
+
+
+# ── Security ──────────────────────────────────────────────────────────────────
+[security]
+# Path to the trust-anchor certificate file (PEM or NDN wire format).
+trust_anchor = "/etc/ndn/trust-anchor.cert"  # optional
+
+# Directory containing key files for this node.
+key_dir = "/etc/ndn/keys"                    # optional
+
+# When true, the engine drops any Data packet that cannot be verified against
+# the trust schema. Requires trust_anchor to be set.
+require_signed = false                       # default: false
+```
+
+### Example: two-node testbed
+
+```toml
+# Node A — ndn-router.toml
+[engine]
+cs_capacity_mb = 128
+
+[[face]]
+kind   = "udp"
+bind   = "0.0.0.0:6363"
+remote = "192.168.1.2:6363"   # Node B
+
+[[route]]
+prefix = "/ndn/nodeB"
+face   = 0
+cost   = 10
+
+[security]
+trust_anchor = "testbed-anchor.cert"
+```
+
+```toml
+# Node B — ndn-router.toml
+[engine]
+cs_capacity_mb = 128
+
+[[face]]
+kind   = "udp"
+bind   = "0.0.0.0:6363"
+remote = "192.168.1.1:6363"   # Node A
+
+[[route]]
+prefix = "/ndn/nodeA"
+face   = 0
+cost   = 10
+```
+
+### Example: LAN multicast + local app
+
+```toml
+[[face]]
+kind      = "multicast"
+group     = "224.0.23.170"
+port      = 56363
+interface = "eth0"
+
+[[face]]
+kind = "unix"
+path = "/run/ndn/app.sock"
+
+[[route]]
+prefix = "/"      # default route — forward everything to LAN neighbours
+face   = 0
+cost   = 100
+
+[[route]]
+prefix = "/local" # local prefix served by the application on face 1
+face   = 1
+cost   = 0
 ```
 
 ## Design Documentation
