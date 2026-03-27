@@ -28,5 +28,10 @@ libc          = { workspace = true, optional = true }
 iceoryx2      = { workspace = true, optional = true }
 
 [dev-dependencies]
-ndn-tlv = { workspace = true }
-tokio   = { workspace = true, features = ["rt", "macros", "net", "time"] }
+ndn-tlv   = { workspace = true }
+tokio     = { workspace = true, features = ["rt", "macros", "net", "time"] }
+criterion = { workspace = true }
+
+[[bench]]
+name    = "face_local"
+harness = false
