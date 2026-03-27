@@ -9,7 +9,7 @@ use tracing::{debug, warn};
 
 use ndn_pipeline::{Action, DecodedPacket, PacketContext};
 use ndn_store::CsEntry;
-use ndn_transport::{FaceError, FaceId, FaceTable};
+use ndn_transport::{FaceError, FaceId, FaceTable, FaceKind};
 
 use crate::stages::{
     CsInsertStage, CsLookupStage, PitCheckStage, PitMatchStage, StrategyStage, TlvDecodeStage,
@@ -54,10 +54,11 @@ impl PacketDispatcher {
         // Spawn a reader task for each registered face.
         for face_id in self.face_table.face_ids() {
             if let Some(face) = self.face_table.get(face_id) {
-                let tx2    = tx.clone();
-                let cancel = cancel.clone();
+                let tx2         = tx.clone();
+                let cancel      = cancel.clone();
+                let face_table  = Arc::clone(&self.face_table);
                 tasks.spawn(async move {
-                    run_face_reader(face_id, face, tx2, cancel).await;
+                    run_face_reader(face_id, face, tx2, cancel, face_table).await;
                 });
             }
         }
@@ -188,12 +189,19 @@ impl PacketDispatcher {
 ///
 /// Exposed as `pub(crate)` so `ForwarderEngine::add_face` can spawn readers for
 /// faces registered after the initial `build()`.
+///
+/// When the loop exits (face closed or cancelled) the face is removed from
+/// `face_table` so it no longer appears in management listings and its ID is
+/// recycled.  Internal faces (`FaceKind::App` / `FaceKind::Internal`) are
+/// long-lived engine objects and are not removed on reader exit.
 pub(crate) async fn run_face_reader(
-    face_id: FaceId,
-    face:    Arc<dyn ndn_transport::ErasedFace>,
-    tx:      mpsc::Sender<InboundPacket>,
-    cancel:  CancellationToken,
+    face_id:    FaceId,
+    face:       Arc<dyn ndn_transport::ErasedFace>,
+    tx:         mpsc::Sender<InboundPacket>,
+    cancel:     CancellationToken,
+    face_table: Arc<FaceTable>,
 ) {
+    let kind = face.kind();
     loop {
         let result = tokio::select! {
             _ = cancel.cancelled() => break,
@@ -216,6 +224,16 @@ pub(crate) async fn run_face_reader(
             Err(e) => {
                 warn!(face=%face_id, error=%e, "recv error, continuing");
             }
+        }
+    }
+
+    // Remove transient faces (those accepted dynamically from a listener) so
+    // they don't linger in the table after disconnection.
+    match kind {
+        FaceKind::App | FaceKind::Internal => {}
+        _ => {
+            face_table.remove(face_id);
+            debug!(face=%face_id, "face removed from table");
         }
     }
 }

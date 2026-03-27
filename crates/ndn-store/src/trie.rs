@@ -107,6 +107,13 @@ impl<V: Clone + Send + Sync + 'static> NameTrie<V> {
         node.entry = None;
     }
 
+    /// Walk the entire trie and return all `(Name, V)` pairs in depth-first order.
+    pub fn dump(&self) -> Vec<(Name, V)> {
+        let mut out = Vec::new();
+        dump_subtree(&self.root, &mut Vec::new(), &mut out);
+        out
+    }
+
     /// Returns the first value found at or below `prefix` in the trie.
     ///
     /// Used for `CanBePrefix` CS lookups: walk to the Interest name position,
@@ -131,6 +138,30 @@ impl<V: Clone + Send + Sync + 'static> NameTrie<V> {
 impl<V: Clone + Send + Sync + 'static> Default for NameTrie<V> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Depth-first collection of all (Name, V) entries at or below `node`.
+fn dump_subtree<V: Clone + Send + Sync + 'static>(
+    node:   &Arc<RwLock<TrieNode<V>>>,
+    path:   &mut Vec<NameComponent>,
+    out:    &mut Vec<(Name, V)>,
+) {
+    let guard = node.read().unwrap();
+    if let Some(v) = &guard.entry {
+        out.push((Name::from_components(path.iter().cloned()), v.clone()));
+    }
+    // Collect children first to release the lock before recursing.
+    let children: Vec<(NameComponent, Arc<RwLock<TrieNode<V>>>)> = guard
+        .children
+        .iter()
+        .map(|(k, v)| (k.clone(), Arc::clone(v)))
+        .collect();
+    drop(guard);
+    for (comp, child) in children {
+        path.push(comp);
+        dump_subtree(&child, path, out);
+        path.pop();
     }
 }
 

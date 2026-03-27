@@ -55,12 +55,13 @@ impl ForwarderEngine {
     /// The face participates in forwarding exactly like faces registered at
     /// build time.
     pub fn add_face<F: Face + 'static>(&self, face: F, cancel: CancellationToken) {
-        let face_id = face.id();
+        let face_id    = face.id();
         self.inner.face_table.insert(face);
-        let erased = self.inner.face_table.get(face_id)
+        let erased     = self.inner.face_table.get(face_id)
             .expect("face was just inserted");
-        let tx = self.inner.pipeline_tx.clone();
-        tokio::spawn(crate::dispatcher::run_face_reader(face_id, erased, tx, cancel));
+        let tx         = self.inner.pipeline_tx.clone();
+        let face_table = Arc::clone(&self.inner.face_table);
+        tokio::spawn(crate::dispatcher::run_face_reader(face_id, erased, tx, cancel, face_table));
     }
 }
 
