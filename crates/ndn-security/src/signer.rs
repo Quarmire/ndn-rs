@@ -41,6 +41,11 @@ impl Ed25519Signer {
         let signing_key = ed25519_dalek::SigningKey::from_bytes(seed);
         Self::new(signing_key, key_name, None)
     }
+
+    /// Return the 32-byte compressed Ed25519 public key (verifying key).
+    pub fn public_key_bytes(&self) -> [u8; 32] {
+        self.signing_key.verifying_key().to_bytes()
+    }
 }
 
 impl Signer for Ed25519Signer {

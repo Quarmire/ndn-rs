@@ -138,13 +138,23 @@ fn default_cost() -> u32 { 10 }
 /// Security settings.
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct SecurityConfig {
-    /// Path to the trust-anchor certificate file.
+    /// NDN identity name for this router (e.g., `/ndn/router1`).
+    ///
+    /// The corresponding key and certificate must exist in the PIB.
+    #[serde(default)]
+    pub identity: Option<String>,
+
+    /// Path to the PIB directory (default: `~/.ndn/pib`).
+    ///
+    /// Create with `ndn-sec keygen <identity>`.
+    #[serde(default)]
+    pub pib_path: Option<String>,
+
+    /// Path to a trust-anchor certificate file to load at startup.
+    ///
+    /// Takes precedence over anchors already stored in the PIB.
     #[serde(default)]
     pub trust_anchor: Option<String>,
-
-    /// Directory that holds key files.
-    #[serde(default)]
-    pub key_dir: Option<String>,
 
     /// Whether to require all Data packets to be signed and verified.
     #[serde(default)]
