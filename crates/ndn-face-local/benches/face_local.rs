@@ -1,22 +1,17 @@
 //! Benchmarks for in-process NDN faces.
 //!
-//! Four face implementations are compared across two metrics (latency and
-//! unidirectional throughput) at three packet sizes (64 B, 1 024 B, 8 192 B):
+//! Three face implementations are compared across latency and unidirectional
+//! throughput at packet sizes 64 B, 1 024 B, 8 192 B:
 //!
 //! | Face | Transport mechanism | Expected tier |
 //! |------|--------------------|----|
 //! | `AppFace`  | Tokio `mpsc`; zero syscalls | fastest |
-//! | `UnixFace` | Unix stream socket + TLV codec | ~2–5 µs |
-//! | `SpscFace` | POSIX SHM ring + Unix-datagram wakeup | ~2–5 µs |
-//! | `Iox2Face` | iceoryx2 pub-sub + 1 ms OS-thread poll | ~1–2 ms |
+//! | `UnixFace` | Unix stream socket + TLV codec | ~2 µs |
+//! | `SpscFace` | POSIX SHM ring + parked-flag wakeup | ~125 ns |
 //!
 //! Run all benchmarks:
 //! ```text
-//! cargo bench -p ndn-face-local --features spsc-shm,iceoryx2-shm
-//! ```
-//! Run without SHM faces:
-//! ```text
-//! cargo bench -p ndn-face-local
+//! cargo bench -p ndn-face-local --features spsc-shm
 //! ```
 
 use bytes::Bytes;
@@ -295,97 +290,9 @@ fn bench_spsc_throughput(c: &mut Criterion) {
     { let _ = c; }
 }
 
-// ─── Iox2Face ─────────────────────────────────────────────────────────────────
-
-/// Round-trip latency through the iceoryx2 bridge.
-///
-/// The bridge OS thread calls `node.wait(1 ms)` per cycle, so latency is
-/// dominated by up to two 1 ms poll intervals (one per direction).  This makes
-/// iceoryx2 the highest-latency option among the in-process faces; its advantage
-/// over network faces appears only when comparing *throughput* at large batch
-/// sizes, not single-packet latency.
-fn bench_iox2_latency(c: &mut Criterion) {
-    #[cfg(feature = "iceoryx2-shm")]
-    {
-        use ndn_face_local::shm::iox2::{Iox2Face, Iox2Handle};
-
-        let rt = current_thread_rt();
-        let mut group = c.benchmark_group("iox2/latency");
-        // iceoryx2 latency is in the millisecond range; fewer samples still
-        // give a tight measurement.
-        group.sample_size(20);
-
-        for (&size, name) in [64_usize, 1_024, 8_192].iter().zip(["ilt0", "ilt1", "ilt2"]) {
-            let pkt = make_pkt(size);
-            let face   = Iox2Face::create(FaceId(30), name).unwrap();
-            let handle = Iox2Handle::connect(name).unwrap();
-
-            group.bench_with_input(BenchmarkId::from_parameter(size), &pkt, |b, pkt| {
-                b.iter(|| {
-                    rt.block_on(async {
-                        // mpsc channels buffer the packet; bridge picks it up
-                        // on its next poll cycle (≤ 1 ms each direction).
-                        handle.send(pkt.clone()).await.unwrap();
-                        face.recv().await.unwrap();
-                        face.send(pkt.clone()).await.unwrap();
-                        handle.recv().await.unwrap();
-                    });
-                });
-            });
-        }
-        group.finish();
-    }
-
-    #[cfg(not(feature = "iceoryx2-shm"))]
-    { let _ = c; }
-}
-
-/// Unidirectional throughput through the iceoryx2 bridge.
-///
-/// All packets are queued into the bridge mpsc before the OS thread wakes up,
-/// so the bridge drains them in a single poll cycle.  Throughput = N / 1 ms ≈
-/// N Kpkt/s — purely a function of the poll interval, not packet size.
-fn bench_iox2_throughput(c: &mut Criterion) {
-    #[cfg(feature = "iceoryx2-shm")]
-    {
-        use ndn_face_local::shm::iox2::{Iox2Face, Iox2Handle};
-
-        // The mpsc channel holds 128 slots (set in Iox2Face::create).
-        const N: u64 = 100;
-        let rt = current_thread_rt();
-        let mut group = c.benchmark_group("iox2/throughput");
-        group.throughput(Throughput::Elements(N));
-        group.sample_size(20);
-
-        for (&size, name) in [64_usize, 1_024, 8_192].iter().zip(["ith0", "ith1", "ith2"]) {
-            let pkt = make_pkt(size);
-            let face   = Iox2Face::create(FaceId(31), name).unwrap();
-            let handle = Iox2Handle::connect(name).unwrap();
-
-            group.bench_with_input(BenchmarkId::from_parameter(size), &pkt, |b, pkt| {
-                b.iter(|| {
-                    rt.block_on(async {
-                        for _ in 0..N {
-                            handle.send(pkt.clone()).await.unwrap();
-                        }
-                        for _ in 0..N {
-                            face.recv().await.unwrap();
-                        }
-                    });
-                });
-            });
-        }
-        group.finish();
-    }
-
-    #[cfg(not(feature = "iceoryx2-shm"))]
-    { let _ = c; }
-}
-
 // ─── Criterion wiring ─────────────────────────────────────────────────────────
 
 criterion_group!(appface_benches, bench_appface_latency, bench_appface_throughput);
 criterion_group!(unix_benches,    bench_unix_latency,    bench_unix_throughput);
 criterion_group!(spsc_benches,    bench_spsc_latency,    bench_spsc_throughput);
-criterion_group!(iox2_benches,    bench_iox2_latency,    bench_iox2_throughput);
-criterion_main!(appface_benches, unix_benches, spsc_benches, iox2_benches);
+criterion_main!(appface_benches, unix_benches, spsc_benches);

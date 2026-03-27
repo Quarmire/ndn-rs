@@ -3,7 +3,7 @@ pub mod app;
 #[cfg(unix)]
 pub mod unix;
 
-#[cfg(any(feature = "spsc-shm", feature = "iceoryx2-shm"))]
+#[cfg(all(unix, feature = "spsc-shm"))]
 pub mod shm;
 
 pub use app::{AppFace, AppHandle};
@@ -11,5 +11,5 @@ pub use app::{AppFace, AppHandle};
 #[cfg(unix)]
 pub use unix::UnixFace;
 
-#[cfg(any(feature = "spsc-shm", feature = "iceoryx2-shm"))]
+#[cfg(all(unix, feature = "spsc-shm"))]
 pub use shm::{ShmError, ShmFace, ShmHandle};

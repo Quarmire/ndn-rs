@@ -10,22 +10,17 @@ license.workspace = true
 ## wakeup sockets.  Unix only.  Enabled by default on Unix targets.
 spsc-shm = ["dep:libc"]
 
-## iceoryx2 publish-subscribe SHM face.  Cross-platform (Linux, macOS, Windows).
-## When both features are enabled, the iceoryx2 backend is selected for
-## ShmFace/ShmHandle; SpscFace/SpscHandle remain available directly.
-iceoryx2-shm = ["dep:iceoryx2"]
 
 [dependencies]
 ndn-packet    = { workspace = true }
 ndn-transport = { workspace = true }
 bytes         = { workspace = true }
-tokio         = { workspace = true, features = ["sync", "io-util", "net"] }
+tokio         = { workspace = true, features = ["sync", "io-util", "net", "rt"] }
 tokio-util    = { workspace = true, features = ["codec"] }
 futures       = { workspace = true }
 thiserror     = { workspace = true }
 tracing       = { workspace = true }
 libc          = { workspace = true, optional = true }
-iceoryx2      = { workspace = true, optional = true }
 
 [dev-dependencies]
 ndn-tlv   = { workspace = true }

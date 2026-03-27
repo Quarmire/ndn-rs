@@ -12,9 +12,19 @@
 //! Cache line 2 (off 128–191): a2e_head AtomicU32  — engine writes, app reads
 //! Cache line 3 (off 192–255): e2a_tail AtomicU32  — engine writes, app reads
 //! Cache line 4 (off 256–319): e2a_head AtomicU32  — app writes, engine reads
-//! Data block (off 320–N):     a2e ring (capacity × slot_stride bytes)
+//! Cache line 5 (off 320–383): a2e_parked AtomicU32 — set by engine before sleeping on a2e ring
+//! Cache line 6 (off 384–447): e2a_parked AtomicU32 — set by app before sleeping on e2a ring
+//! Data block (off 448–N):     a2e ring (capacity × slot_stride bytes)
 //! Data block (off N–end):     e2a ring (capacity × slot_stride bytes)
 //!   slot_stride = 4 (length prefix) + slot_size (payload area)
+//!
+//! # Conditional wakeup protocol
+//!
+//! The wakeup datagram (one byte sent via `sendmsg`) is only sent when the
+//! consumer is genuinely sleeping.  The producer checks the parked flag with
+//! `SeqCst` ordering after writing to the ring; the consumer stores the parked
+//! flag with `SeqCst` before its second ring check.  This total-order guarantee
+//! prevents the producer from missing a sleeping consumer.
 //! ```
 //!
 //! # Wakeup sockets
@@ -43,11 +53,14 @@ pub const DEFAULT_CAPACITY: u32 = 64;
 pub const DEFAULT_SLOT_SIZE: u32 = 8960;
 
 // Cache-line–aligned offsets for the four ring index atomics.
-const OFF_A2E_TAIL: usize = 64;   // app writes (producer)
-const OFF_A2E_HEAD: usize = 128;  // engine writes (consumer)
-const OFF_E2A_TAIL: usize = 192;  // engine writes (producer)
-const OFF_E2A_HEAD: usize = 256;  // app writes (consumer)
-const HEADER_SIZE:  usize = 320;  // 5 × 64-byte cache lines
+const OFF_A2E_TAIL:   usize = 64;   // app writes (producer)
+const OFF_A2E_HEAD:   usize = 128;  // engine writes (consumer)
+const OFF_E2A_TAIL:   usize = 192;  // engine writes (producer)
+const OFF_E2A_HEAD:   usize = 256;  // app writes (consumer)
+// Parked flags: consumer sets to 1 before sleeping, clears on wake.
+const OFF_A2E_PARKED: usize = 320;  // engine (a2e consumer) parked flag
+const OFF_E2A_PARKED: usize = 384;  // app (e2a consumer) parked flag
+const HEADER_SIZE:    usize = 448;  // 7 × 64-byte cache lines
 
 fn slot_stride(slot_size: u32) -> usize { 4 + slot_size as usize }
 
@@ -314,13 +327,29 @@ impl Face for SpscFace {
 
     async fn recv(&self) -> Result<Bytes, FaceError> {
         let mut buf = [0u8; 16];
+        // SAFETY: parked flag is within the mapped SHM region (offset 320 < HEADER_SIZE).
+        let parked = unsafe {
+            &*AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_A2E_PARKED) as *mut u32)
+        };
         loop {
             if let Some(pkt) = self.try_pop_a2e() {
                 return Ok(pkt);
             }
-            // Wait for the app to signal "data available".
+            // Announce intent to sleep with SeqCst so the app's next SeqCst
+            // load on the parked flag observes this before or after it pushes
+            // to the ring — never concurrently missed.
+            parked.store(1, Ordering::SeqCst);
+            // Second ring check after marking parked: if the app already pushed
+            // between our first check and the flag store, we see it here and
+            // avoid sleeping unnecessarily.
+            if let Some(pkt) = self.try_pop_a2e() {
+                parked.store(0, Ordering::Relaxed);
+                return Ok(pkt);
+            }
+            // Sleep until the app sends a wakeup datagram.
             self.sock.recv(&mut buf).await
                 .map_err(|_| FaceError::Closed)?;
+            parked.store(0, Ordering::Relaxed);
             // Drain extra wakeups that accumulated while we were processing.
             while self.sock.try_recv(&mut buf).is_ok() {}
         }
@@ -333,13 +362,19 @@ impl Face for SpscFace {
                 "packet exceeds SHM slot size",
             )));
         }
+        // SAFETY: parked flag within mapped SHM region.
+        let parked = unsafe {
+            &*AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_E2A_PARKED) as *mut u32)
+        };
         // Yield until there is space in the e2a ring (backpressure).
         loop {
             if self.try_push_e2a(&pkt) { break; }
             tokio::task::yield_now().await;
         }
-        // Signal app — best-effort (no error if app socket not yet bound).
-        let _ = self.sock.send_to(b"\x01", &self.app_path).await;
+        // Only send a wakeup datagram if the app is actually sleeping.
+        if parked.load(Ordering::SeqCst) != 0 {
+            let _ = self.sock.send_to(b"\x01", &self.app_path).await;
+        }
         Ok(())
     }
 }
@@ -440,11 +475,18 @@ impl SpscHandle {
         if pkt.len() > self.slot_size as usize {
             return Err(ShmError::PacketTooLarge);
         }
+        // SAFETY: parked flag within mapped SHM region.
+        let parked = unsafe {
+            &*AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_A2E_PARKED) as *mut u32)
+        };
         loop {
             if self.try_push_a2e(&pkt) { break; }
             tokio::task::yield_now().await;
         }
-        let _ = self.sock.send_to(b"\x01", &self.eng_path).await;
+        // Only send a wakeup if the engine is sleeping on the a2e ring.
+        if parked.load(Ordering::SeqCst) != 0 {
+            let _ = self.sock.send_to(b"\x01", &self.eng_path).await;
+        }
         Ok(())
     }
 
@@ -453,13 +495,23 @@ impl SpscHandle {
     /// Returns `None` when the engine face has been closed or dropped.
     pub async fn recv(&self) -> Option<Bytes> {
         let mut buf = [0u8; 16];
+        // SAFETY: parked flag within mapped SHM region.
+        let parked = unsafe {
+            &*AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_E2A_PARKED) as *mut u32)
+        };
         loop {
             if let Some(pkt) = self.try_pop_e2a() {
+                return Some(pkt);
+            }
+            parked.store(1, Ordering::SeqCst);
+            if let Some(pkt) = self.try_pop_e2a() {
+                parked.store(0, Ordering::Relaxed);
                 return Some(pkt);
             }
             if self.sock.recv(&mut buf).await.is_err() {
                 return None;
             }
+            parked.store(0, Ordering::Relaxed);
             while self.sock.try_recv(&mut buf).is_ok() {}
         }
     }
