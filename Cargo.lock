@@ -487,9 +487,11 @@ name = "ndn-bench"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "ndn-app",
  "ndn-engine",
  "ndn-packet",
+ "ndn-transport",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -503,6 +505,7 @@ dependencies = [
  "ndn-engine",
  "ndn-packet",
  "ndn-store",
+ "ndn-tlv",
  "ndn-transport",
  "tokio",
  "tracing",
@@ -708,7 +711,9 @@ name = "ndn-tools"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "ndn-app",
+ "ndn-ipc",
  "ndn-packet",
  "tokio",
  "tracing",

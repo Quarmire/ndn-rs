@@ -1,17 +1,75 @@
-//! `ndn-put` — publish a file as named Data.
+//! `ndn-put` — publish a file as named Data, optionally chunked.
 //!
-//! Usage: ndn-put /name/of/data <file>
+//! Usage: ndn-put /name/of/data <file> [--chunk-size <bytes>]
 
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
+use bytes::Bytes;
+use ndn_ipc::chunked::{ChunkedProducer, NDN_DEFAULT_SEGMENT_SIZE};
+use ndn_packet::{Name, NameComponent};
+
+fn parse_name(s: &str) -> Name {
+    let components: Vec<NameComponent> = s
+        .split('/')
+        .filter(|c| !c.is_empty())
+        .map(|c| NameComponent::generic(Bytes::copy_from_slice(c.as_bytes())))
+        .collect();
+    if components.is_empty() {
+        Name::root()
+    } else {
+        Name::from_components(components)
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() < 3 {
-        eprintln!("usage: ndn-put <name> <file>");
-        std::process::exit(1);
+    let mut args = std::env::args().skip(1);
+    let name_str = match args.next() {
+        Some(s) => s,
+        None => {
+            eprintln!("usage: ndn-put <name> <file> [--chunk-size <bytes>]");
+            std::process::exit(1);
+        }
+    };
+    let file_path = match args.next() {
+        Some(s) => s,
+        None => {
+            eprintln!("usage: ndn-put <name> <file> [--chunk-size <bytes>]");
+            std::process::exit(1);
+        }
+    };
+
+    let mut chunk_size = NDN_DEFAULT_SEGMENT_SIZE;
+    while let Some(flag) = args.next() {
+        match flag.as_str() {
+            "--chunk-size" => {
+                let val = args.next().unwrap_or_default();
+                chunk_size = val.parse().unwrap_or(NDN_DEFAULT_SEGMENT_SIZE);
+            }
+            other => bail!("unknown flag: {other}"),
+        }
     }
-    println!("ndn-put: publishing {} from {}", args[1], args[2]);
-    // TODO: connect to local forwarder and register prefix handler
+
+    let payload = tokio::fs::read(&file_path)
+        .await
+        .with_context(|| format!("reading {file_path}"))?;
+
+    let name    = parse_name(&name_str);
+    let producer = ChunkedProducer::new(name, Bytes::from(payload), chunk_size);
+
+    println!(
+        "ndn-put: publishing {} from {} ({} segment(s), chunk size {} B)",
+        name_str,
+        file_path,
+        producer.segment_count(),
+        chunk_size,
+    );
+
+    for i in 0..producer.segment_count() {
+        let seg = producer.segment(i).unwrap();
+        println!("  segment {}/{}: {} bytes", i, producer.segment_count() - 1, seg.len());
+        // TODO: register prefix handler and serve each segment as Data via AppFace
+    }
+
+    println!("ndn-put: local forwarder connection not yet implemented");
     Ok(())
 }

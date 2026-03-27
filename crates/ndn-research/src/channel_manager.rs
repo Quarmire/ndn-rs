@@ -50,3 +50,22 @@ impl std::fmt::Display for SwitchError {
 }
 
 impl std::error::Error for SwitchError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn switch_returns_not_implemented() {
+        let mgr = ChannelManager::new();
+        let result = mgr.switch(FaceId(0), 6).await;
+        assert!(matches!(result, Err(SwitchError::NotImplemented)));
+    }
+
+    #[test]
+    fn switch_error_display() {
+        assert!(!SwitchError::NotImplemented.to_string().is_empty());
+        assert!(!SwitchError::NetlinkError("x".into()).to_string().is_empty());
+        assert!(!SwitchError::InterfaceNotFound.to_string().is_empty());
+    }
+}

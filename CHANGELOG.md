@@ -12,6 +12,53 @@ bootstrapping phase and all APIs should be considered unstable.
 
 ### Added
 
+#### `ndn-sync` — Dataset synchronisation protocols
+
+- **`SvsNode`** — State Vector Sync node. Maintains a `HashMap<String, u64>` state vector
+  (node key → highest seen sequence number). `advance()` increments the local seq;
+  `merge(received)` updates entries and returns `(node, gap_from, gap_to)` tuples for
+  missing data; `snapshot()` serialises the full vector.
+
+- **`PSyncNode` / `Ibf`** — Partial Sync via Invertible Bloom Filters. `Ibf` implements
+  insert, remove, subtract, and `decode()` with a per-cell `hash_sum` checksum (splitmix64
+  finalizer) to distinguish genuine pure cells from coincidental `xor_sum` collisions.
+  Cell selection uses the splitmix64 finalizer seeded with the element value XOR'd with the
+  hash-function index, giving good distribution even for structurally similar name hashes.
+  `PSyncNode::reconcile(peer_ibf)` returns the symmetric difference as two `HashSet<u64>`
+  values — hashes the local node has that the peer lacks, and vice versa.
+
+#### `ndn-compute` — In-network compute
+
+- **`ComputeRegistry`** — `NameTrie`-backed longest-prefix dispatch to
+  `Arc<dyn ErasedHandler>`. `register<H: ComputeHandler>(prefix, handler)` adds a handler;
+  `dispatch(interest)` does an LPM lookup and returns the handler's async result.
+- **`ComputeFace`** — `Face` implementation that forwards Interests to the `ComputeRegistry`.
+  `recv()` returns `pending()` (this face only injects Data, never receives from the network).
+
+#### `ndn-research` — Research extensions
+
+- **`FlowTable`** — `DashMap`-backed per-prefix flow entry (preferred face, EWMA throughput,
+  EWMA RTT). `flush_interface(face_id)` atomically removes all entries for a face (called on
+  radio channel switch).
+- **`FlowObserverStage`** — Non-blocking `PipelineStage` that emits `FlowEvent`s via
+  `try_send`. Optional `sampling_rate` (0.0–1.0) limits observer overhead on high-rate
+  testbeds. Never slows the forwarding path.
+- **`ChannelManager`** — nl80211 channel switch stub. `switch(face_id, channel)` returns
+  `Err(SwitchError::NotImplemented)` until netlink integration is added.
+
+#### Binaries
+
+- **`ndn-router`** — Standalone forwarder: initialises tracing, builds engine with
+  `EngineConfig::default()`, waits for Ctrl-C, then shuts down cleanly.
+- **`ndn-peek`** — Parses `<name>` and `--timeout-ms` arguments, constructs an `Interest`,
+  and prints the fetch plan. Forwarder connection not yet wired.
+- **`ndn-ping`** — Sends `count` probe Interests to `prefix/ping/<seq>` at `interval-ms`
+  spacing, measures RTT, and prints min/avg/max. Forwarder connection not yet wired.
+- **`ndn-put`** — Reads a file, segments it with `ChunkedProducer`, and logs per-segment
+  sizes. Accepts `--chunk-size`. Forwarder connection not yet wired.
+- **`ndn-bench`** — Embeds an engine, drives Interest/Data load via `AppFace` channel pairs
+  across `--concurrency` workers, and reports throughput and latency percentiles (p50/p95/p99).
+
 #### `ndn-engine` — Layer 1 forwarding engine
 
 - **`Fib` / `FibEntry` / `FibNexthop`** — engine-layer FIB wrapping `NameTrie<Arc<FibEntry>>`.
@@ -172,6 +219,12 @@ bootstrapping phase and all APIs should be considered unstable.
 
 | Crate | Module | Count |
 |-------|--------|------:|
+| `ndn-sync` | `svs` | 7 |
+| `ndn-sync` | `psync` | 7 |
+| `ndn-compute` | `registry` | 4 |
+| `ndn-research` | `flow_table` | 5 |
+| `ndn-research` | `observer` | 3 |
+| `ndn-research` | `channel_manager` | 2 |
 | `ndn-engine` | `fib` | 8 |
 | `ndn-engine` | `builder` | 3 |
 | `ndn-engine` | `expiry` | 2 |
@@ -204,9 +257,9 @@ bootstrapping phase and all APIs should be considered unstable.
 | `ndn-face-net` | `multicast` | 4 |
 | `ndn-face-local` | `unix` | 5 |
 | `ndn-face-local` | `app` | 7 |
-| **Total new** | | **192** |
+| **Total new** | | **220** |
 
-Running total across all crates: **287 tests** (94 layer 5 + 71 layer 4 + 26 layer 3 + 62 layer 2 + 34 layer 1), all passing.
+Running total across all crates: **315 tests** (94 layer 5 + 71 layer 4 + 26 layer 3 + 62 layer 2 + 34 layer 1 + 28 layer 0), all passing.
 
 ---
 
