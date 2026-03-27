@@ -12,3 +12,7 @@ dashmap    = { workspace = true }
 smallvec   = { workspace = true }
 lru        = { workspace = true }
 thiserror  = { workspace = true }
+
+[dev-dependencies]
+ndn-tlv = { workspace = true }
+tokio   = { workspace = true, features = ["rt", "macros"] }

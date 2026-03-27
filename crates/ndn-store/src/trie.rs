@@ -106,10 +106,178 @@ impl<V: Clone + Send + Sync + 'static> NameTrie<V> {
         let mut node = current.write().unwrap();
         node.entry = None;
     }
+
+    /// Returns the first value found at or below `prefix` in the trie.
+    ///
+    /// Used for `CanBePrefix` CS lookups: walk to the Interest name position,
+    /// then return any Data stored at or below that node. The traversal order
+    /// within a level is unspecified (HashMap iteration order).
+    pub fn first_descendant(&self, prefix: &Name) -> Option<V> {
+        let mut current = Arc::clone(&self.root);
+        for component in prefix.components() {
+            let child = {
+                let node = current.read().unwrap();
+                node.children.get(component).map(Arc::clone)
+            };
+            match child {
+                None => return None,
+                Some(c) => current = c,
+            }
+        }
+        first_in_subtree(&current)
+    }
 }
 
 impl<V: Clone + Send + Sync + 'static> Default for NameTrie<V> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Depth-first search for the first value at or below `node`.
+fn first_in_subtree<V: Clone>(node: &Arc<RwLock<TrieNode<V>>>) -> Option<V> {
+    let guard = node.read().unwrap();
+    if let Some(v) = &guard.entry {
+        return Some(v.clone());
+    }
+    for child in guard.children.values() {
+        if let Some(v) = first_in_subtree(child) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndn_packet::{Name, NameComponent};
+    use bytes::Bytes;
+
+    fn name(components: &[&str]) -> Name {
+        Name::from_components(
+            components.iter().map(|s| NameComponent::generic(Bytes::copy_from_slice(s.as_bytes())))
+        )
+    }
+
+    // ── lpm ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn lpm_empty_trie_returns_none() {
+        let trie: NameTrie<u32> = NameTrie::new();
+        assert!(trie.lpm(&name(&["a", "b"])).is_none());
+    }
+
+    #[test]
+    fn lpm_exact_match() {
+        let trie: NameTrie<u32> = NameTrie::new();
+        trie.insert(&name(&["a", "b"]), 42);
+        assert_eq!(trie.lpm(&name(&["a", "b"])), Some(42));
+    }
+
+    #[test]
+    fn lpm_prefix_wins() {
+        let trie: NameTrie<u32> = NameTrie::new();
+        trie.insert(&name(&["a"]), 1);
+        trie.insert(&name(&["a", "b"]), 2);
+        // Query /a/b/c — most specific match is /a/b.
+        assert_eq!(trie.lpm(&name(&["a", "b", "c"])), Some(2));
+    }
+
+    #[test]
+    fn lpm_shorter_prefix_fallback() {
+        let trie: NameTrie<u32> = NameTrie::new();
+        trie.insert(&name(&["a"]), 1);
+        // /a/b is not in the trie; fallback to /a.
+        assert_eq!(trie.lpm(&name(&["a", "b"])), Some(1));
+    }
+
+    #[test]
+    fn lpm_root_matches_everything() {
+        let trie: NameTrie<u32> = NameTrie::new();
+        trie.insert(&Name::root(), 99);
+        assert_eq!(trie.lpm(&name(&["x", "y", "z"])), Some(99));
+    }
+
+    // ── get (exact) ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn get_returns_none_for_missing_prefix() {
+        let trie: NameTrie<u32> = NameTrie::new();
+        trie.insert(&name(&["a", "b"]), 5);
+        assert!(trie.get(&name(&["a"])).is_none());
+        assert!(trie.get(&name(&["a", "b", "c"])).is_none());
+    }
+
+    #[test]
+    fn get_returns_exact_entry() {
+        let trie: NameTrie<u32> = NameTrie::new();
+        trie.insert(&name(&["a", "b"]), 7);
+        assert_eq!(trie.get(&name(&["a", "b"])), Some(7));
+    }
+
+    // ── insert / remove ───────────────────────────────────────────────────────
+
+    #[test]
+    fn insert_replaces_value() {
+        let trie: NameTrie<u32> = NameTrie::new();
+        trie.insert(&name(&["a"]), 1);
+        trie.insert(&name(&["a"]), 2);
+        assert_eq!(trie.get(&name(&["a"])), Some(2));
+    }
+
+    #[test]
+    fn remove_clears_entry() {
+        let trie: NameTrie<u32> = NameTrie::new();
+        trie.insert(&name(&["a", "b"]), 10);
+        trie.remove(&name(&["a", "b"]));
+        assert!(trie.get(&name(&["a", "b"])).is_none());
+    }
+
+    #[test]
+    fn remove_nonexistent_is_noop() {
+        let trie: NameTrie<u32> = NameTrie::new();
+        trie.remove(&name(&["x"])); // should not panic
+    }
+
+    // ── first_descendant ─────────────────────────────────────────────────────
+
+    #[test]
+    fn first_descendant_exact_node_has_value() {
+        let trie: NameTrie<u32> = NameTrie::new();
+        trie.insert(&name(&["a", "b"]), 5);
+        // first_descendant of /a/b finds the value at /a/b itself.
+        assert_eq!(trie.first_descendant(&name(&["a", "b"])), Some(5));
+    }
+
+    #[test]
+    fn first_descendant_finds_child() {
+        let trie: NameTrie<u32> = NameTrie::new();
+        trie.insert(&name(&["a", "b", "c"]), 42);
+        // first_descendant of /a/b finds /a/b/c.
+        assert_eq!(trie.first_descendant(&name(&["a", "b"])), Some(42));
+    }
+
+    #[test]
+    fn first_descendant_missing_prefix_returns_none() {
+        let trie: NameTrie<u32> = NameTrie::new();
+        trie.insert(&name(&["x"]), 1);
+        assert!(trie.first_descendant(&name(&["y"])).is_none());
+    }
+
+    #[test]
+    fn first_descendant_empty_prefix_returns_any() {
+        let trie: NameTrie<u32> = NameTrie::new();
+        trie.insert(&name(&["a"]), 10);
+        // first_descendant of root (empty prefix) returns some value.
+        assert!(trie.first_descendant(&Name::root()).is_some());
+    }
+
+    #[test]
+    fn first_descendant_no_children_no_value_returns_none() {
+        let trie: NameTrie<u32> = NameTrie::new();
+        trie.insert(&name(&["a"]), 1);
+        // /a/b exists in path as intermediate node but has no value or children.
+        assert!(trie.first_descendant(&name(&["a", "b"])).is_none());
     }
 }
