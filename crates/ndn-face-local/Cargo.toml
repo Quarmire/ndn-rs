@@ -1,6 +1,6 @@
 [package]
 name = "ndn-face-local"
-description = "NDN local faces: UnixFace for control-plane IPC"
+description = "NDN local faces: AppFace (in-process mpsc) and UnixFace (TLV-framed Unix socket)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,4 +10,10 @@ ndn-packet    = { workspace = true }
 ndn-transport = { workspace = true }
 bytes         = { workspace = true }
 tokio         = { workspace = true, features = ["net", "sync", "io-util"] }
+tokio-util    = { workspace = true, features = ["codec"] }
+futures       = { workspace = true }
 thiserror     = { workspace = true }
+
+[dev-dependencies]
+ndn-tlv = { workspace = true }
+tokio   = { workspace = true, features = ["rt", "macros", "net", "time"] }
