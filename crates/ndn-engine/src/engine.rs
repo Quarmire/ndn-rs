@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-use ndn_store::{ContentStore, Pit};
+use ndn_store::Pit;
 use ndn_transport::FaceTable;
 
 use crate::Fib;

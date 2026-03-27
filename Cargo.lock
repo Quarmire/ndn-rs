@@ -475,6 +475,7 @@ dependencies = [
  "ndn-packet",
  "ndn-pipeline",
  "ndn-security",
+ "ndn-tlv",
  "ndn-transport",
  "thiserror",
  "tokio",
@@ -586,6 +587,7 @@ dependencies = [
  "bytes",
  "ndn-app",
  "ndn-packet",
+ "ndn-transport",
  "thiserror",
  "tokio",
 ]

@@ -31,3 +31,34 @@ fn now_ns() -> u64 {
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn expiry_task_cancels_promptly() {
+        let pit    = Arc::new(Pit::new());
+        let cancel = CancellationToken::new();
+        let task   = tokio::spawn(run_expiry_task(pit, cancel.clone()));
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_millis(200), task)
+            .await
+            .expect("expiry task did not stop after cancellation")
+            .expect("task panicked");
+    }
+
+    #[tokio::test]
+    async fn expiry_task_runs_without_panic() {
+        let pit    = Arc::new(Pit::new());
+        let cancel = CancellationToken::new();
+        let task   = tokio::spawn(run_expiry_task(pit, cancel.clone()));
+        // Let a few ticks pass to ensure the loop body executes at least once.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_millis(200), task)
+            .await
+            .expect("expiry task did not stop after cancellation")
+            .expect("task panicked");
+    }
+}

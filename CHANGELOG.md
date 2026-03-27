@@ -12,6 +12,54 @@ bootstrapping phase and all APIs should be considered unstable.
 
 ### Added
 
+#### `ndn-engine` — Layer 1 forwarding engine
+
+- **`Fib` / `FibEntry` / `FibNexthop`** — engine-layer FIB wrapping `NameTrie<Arc<FibEntry>>`.
+  Uses `FaceId` (not `u32`) directly. `add_nexthop` upserts by face; `remove_nexthop` removes
+  the entry entirely when the last nexthop is removed.
+
+- **`ForwarderEngine`** — `Arc<EngineInner>` handle. Cheaply cloneable; clones share the same
+  FIB, PIT, and `FaceTable`. Exposes `fib()`, `pit()`, `faces()` accessors.
+
+- **`EngineBuilder` / `EngineConfig`** — constructs and wires the engine. `face<F: Face>` adds
+  pre-configured faces before startup. `build()` spawns the PIT expiry task and returns
+  `(ForwarderEngine, ShutdownHandle)`.
+
+- **`ShutdownHandle`** — `CancellationToken` + `JoinSet<()>`. `shutdown()` cancels all engine
+  tasks and joins them, logging any panics at `WARN` level.
+
+- **`run_expiry_task`** — background task that drains expired PIT entries every millisecond.
+  Exits cleanly on `CancellationToken` cancellation.
+
+#### `ndn-app` — Layer 1 application API
+
+- **`AppFace::new(face_id, capacity) -> (AppFace, Receiver<OutboundRequest>)`** — factory that
+  creates the application-side face and the engine-side request receiver as a linked pair.
+
+- **`OutboundRequest`** — `pub` enum (`Interest { interest, reply }` and
+  `RegisterPrefix { prefix, handler }`) that flows from `AppFace` to the engine runner over
+  `mpsc`. Made public so the engine can match on received requests.
+
+- **`AppError`** — `Timeout`, `Nacked { reason }`, `Engine(anyhow::Error)`.
+
+#### `ndn-ipc` — Layer 1 IPC utilities
+
+- **`ChunkedProducer`** — segments an arbitrary `Bytes` payload into fixed-size chunks
+  (`NDN_DEFAULT_SEGMENT_SIZE = 8192`). `segment(index)` returns individual chunks for
+  prefix-registered Data production; `segment_count()` supplies FinalBlockId.
+
+- **`ChunkedConsumer`** — reassembles out-of-order segments by index. `receive_segment(i, data)`
+  stores each chunk; `is_complete()` and `reassemble()` drive the consumer state machine.
+
+- **`IpcClient`** — wraps `Arc<AppFace>` with a namespace `Name` for ergonomic Interest
+  expression.
+
+- **`IpcServer`** — wraps `Arc<AppFace>` with a prefix `Name` for handler registration.
+
+- **`ServiceRegistry`** — in-memory service registry keyed by name string. `register`,
+  `lookup`, `unregister`, `service_count`. Mirrors the `/local/services/<name>/info` namespace
+  pattern for single-process deployments.
+
 #### `ndn-store` — Layer 4 data structures
 
 - **`NameTrie::first_descendant(prefix: &Name) -> Option<V>`** — depth-first
@@ -124,6 +172,14 @@ bootstrapping phase and all APIs should be considered unstable.
 
 | Crate | Module | Count |
 |-------|--------|------:|
+| `ndn-engine` | `fib` | 8 |
+| `ndn-engine` | `builder` | 3 |
+| `ndn-engine` | `expiry` | 2 |
+| `ndn-app` | `app_face` | 6 |
+| `ndn-ipc` | `chunked` | 7 |
+| `ndn-ipc` | `client` | 1 |
+| `ndn-ipc` | `server` | 1 |
+| `ndn-ipc` | `registry` | 5 |
 | `ndn-store` | `trie` | 14 |
 | `ndn-store` | `fib` | 8 |
 | `ndn-store` | `strategy_table` | 7 |
@@ -148,9 +204,9 @@ bootstrapping phase and all APIs should be considered unstable.
 | `ndn-face-net` | `multicast` | 4 |
 | `ndn-face-local` | `unix` | 5 |
 | `ndn-face-local` | `app` | 7 |
-| **Total new** | | **159** |
+| **Total new** | | **192** |
 
-Running total across all foundation crates: **253 tests** (94 layer 5 + 71 layer 4 + 26 layer 3 + 62 layer 2), all passing.
+Running total across all crates: **287 tests** (94 layer 5 + 71 layer 4 + 26 layer 3 + 62 layer 2 + 34 layer 1), all passing.
 
 ---
 

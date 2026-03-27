@@ -71,3 +71,107 @@ impl Fib {
 impl Default for Fib {
     fn default() -> Self { Self::new() }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use ndn_packet::NameComponent;
+
+    fn name1(s: &'static str) -> Name {
+        Name::from_components([NameComponent::generic(Bytes::from_static(s.as_bytes()))])
+    }
+
+    fn name2(a: &'static str, b: &'static str) -> Name {
+        Name::from_components([
+            NameComponent::generic(Bytes::from_static(a.as_bytes())),
+            NameComponent::generic(Bytes::from_static(b.as_bytes())),
+        ])
+    }
+
+    #[test]
+    fn lpm_empty_returns_none() {
+        let fib = Fib::new();
+        assert!(fib.lpm(&name1("a")).is_none());
+    }
+
+    #[test]
+    fn add_nexthop_and_lpm() {
+        let fib = Fib::new();
+        fib.add_nexthop(&name1("a"), FaceId(1), 10);
+        let entry = fib.lpm(&name1("a")).unwrap();
+        assert_eq!(entry.nexthops.len(), 1);
+        assert_eq!(entry.nexthops[0].face_id, FaceId(1));
+        assert_eq!(entry.nexthops[0].cost, 10);
+    }
+
+    #[test]
+    fn lpm_returns_longest_prefix() {
+        let fib = Fib::new();
+        fib.add_nexthop(&Name::root(), FaceId(1), 10);
+        fib.add_nexthop(&name1("a"), FaceId(2), 10);
+        // "a/b" should match "a" (longer than root)
+        let entry = fib.lpm(&name2("a", "b")).unwrap();
+        assert_eq!(entry.nexthops[0].face_id, FaceId(2));
+    }
+
+    #[test]
+    fn add_nexthop_updates_cost() {
+        let fib = Fib::new();
+        fib.add_nexthop(&name1("a"), FaceId(1), 10);
+        fib.add_nexthop(&name1("a"), FaceId(1), 20);
+        let entry = fib.lpm(&name1("a")).unwrap();
+        assert_eq!(entry.nexthops.len(), 1);
+        assert_eq!(entry.nexthops[0].cost, 20);
+    }
+
+    #[test]
+    fn add_multiple_nexthops() {
+        let fib = Fib::new();
+        fib.add_nexthop(&name1("a"), FaceId(1), 10);
+        fib.add_nexthop(&name1("a"), FaceId(2), 20);
+        let entry = fib.lpm(&name1("a")).unwrap();
+        assert_eq!(entry.nexthops.len(), 2);
+    }
+
+    #[test]
+    fn remove_nexthop_removes_face() {
+        let fib = Fib::new();
+        fib.add_nexthop(&name1("a"), FaceId(1), 10);
+        fib.add_nexthop(&name1("a"), FaceId(2), 20);
+        fib.remove_nexthop(&name1("a"), FaceId(1));
+        let entry = fib.lpm(&name1("a")).unwrap();
+        assert_eq!(entry.nexthops.len(), 1);
+        assert_eq!(entry.nexthops[0].face_id, FaceId(2));
+    }
+
+    #[test]
+    fn remove_last_nexthop_deletes_entry() {
+        let fib = Fib::new();
+        fib.add_nexthop(&name1("a"), FaceId(1), 10);
+        fib.remove_nexthop(&name1("a"), FaceId(1));
+        assert!(fib.lpm(&name1("a")).is_none());
+    }
+
+    #[test]
+    fn remove_nonexistent_is_noop() {
+        let fib = Fib::new();
+        fib.add_nexthop(&name1("a"), FaceId(1), 10);
+        fib.remove_nexthop(&name1("a"), FaceId(99));
+        let entry = fib.lpm(&name1("a")).unwrap();
+        assert_eq!(entry.nexthops.len(), 1);
+    }
+
+    #[test]
+    fn nexthops_excluding_filters_in_face() {
+        let entry = FibEntry {
+            nexthops: vec![
+                FibNexthop { face_id: FaceId(1), cost: 0 },
+                FibNexthop { face_id: FaceId(2), cost: 0 },
+            ],
+        };
+        let filtered = entry.nexthops_excluding(FaceId(1));
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].face_id, FaceId(2));
+    }
+}
