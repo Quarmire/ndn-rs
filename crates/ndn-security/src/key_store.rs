@@ -73,3 +73,49 @@ impl KeyStore for MemKeyStore {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use ndn_packet::NameComponent;
+    use crate::signer::Ed25519Signer;
+
+    fn key_name(s: &'static str) -> Arc<Name> {
+        Arc::new(Name::from_components([NameComponent::generic(Bytes::from_static(s.as_bytes()))]))
+    }
+
+    #[tokio::test]
+    async fn add_and_get_signer() {
+        let store = MemKeyStore::new();
+        let kn = key_name("mykey");
+        let signer = Ed25519Signer::from_seed(&[1u8; 32], (*kn).clone());
+        store.add(Arc::clone(&kn), signer);
+        let retrieved = store.get_signer(&kn).await.unwrap();
+        assert_eq!(retrieved.key_name(), &*kn);
+    }
+
+    #[tokio::test]
+    async fn get_missing_key_returns_err() {
+        let store = MemKeyStore::new();
+        let kn = key_name("missing");
+        assert!(matches!(store.get_signer(&kn).await, Err(TrustError::CertNotFound { .. })));
+    }
+
+    #[tokio::test]
+    async fn delete_key_removes_it() {
+        let store = MemKeyStore::new();
+        let kn = key_name("delkey");
+        let signer = Ed25519Signer::from_seed(&[2u8; 32], (*kn).clone());
+        store.add(Arc::clone(&kn), signer);
+        store.delete_key(&kn).await.unwrap();
+        assert!(matches!(store.get_signer(&kn).await, Err(TrustError::CertNotFound { .. })));
+    }
+
+    #[tokio::test]
+    async fn generate_key_returns_err() {
+        let store = MemKeyStore::new();
+        let result = store.generate_key((*key_name("k")).clone(), KeyAlgorithm::Ed25519).await;
+        assert!(result.is_err());
+    }
+}

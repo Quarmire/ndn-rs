@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use ndn_packet::Name;
-use ndn_store::{NameTrie, PitEntry, PitToken};
+use ndn_store::PitToken;
 use ndn_transport::FaceId;
 
 use crate::MeasurementsTable;

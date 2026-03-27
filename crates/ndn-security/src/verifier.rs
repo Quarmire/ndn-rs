@@ -52,3 +52,57 @@ impl Verifier for Ed25519Verifier {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::{Signer as _, SigningKey};
+
+    fn keypair(seed: &[u8; 32]) -> (SigningKey, [u8; 32]) {
+        let sk = SigningKey::from_bytes(seed);
+        let pk = sk.verifying_key().to_bytes();
+        (sk, pk)
+    }
+
+    #[tokio::test]
+    async fn valid_signature_returns_valid() {
+        let (sk, pk) = keypair(&[1u8; 32]);
+        let region = b"signed region";
+        let sig = sk.sign(region).to_bytes();
+        let outcome = Ed25519Verifier.verify(region, &sig, &pk).await.unwrap();
+        assert_eq!(outcome, VerifyOutcome::Valid);
+    }
+
+    #[tokio::test]
+    async fn wrong_signature_returns_invalid() {
+        let (_sk, pk) = keypair(&[1u8; 32]);
+        let region = b"signed region";
+        let bad_sig = [0u8; 64];
+        let outcome = Ed25519Verifier.verify(region, &bad_sig, &pk).await.unwrap();
+        assert_eq!(outcome, VerifyOutcome::Invalid);
+    }
+
+    #[tokio::test]
+    async fn wrong_key_returns_invalid() {
+        let (sk, _) = keypair(&[1u8; 32]);
+        let (_, pk2) = keypair(&[2u8; 32]); // different key
+        let region = b"signed region";
+        let sig = sk.sign(region).to_bytes();
+        let outcome = Ed25519Verifier.verify(region, &sig, &pk2).await.unwrap();
+        assert_eq!(outcome, VerifyOutcome::Invalid);
+    }
+
+    #[tokio::test]
+    async fn short_public_key_returns_err() {
+        let sig = [0u8; 64];
+        let result = Ed25519Verifier.verify(b"region", &sig, &[0u8; 16]).await;
+        assert!(matches!(result, Err(TrustError::InvalidKey)));
+    }
+
+    #[tokio::test]
+    async fn short_signature_returns_err() {
+        let (_, pk) = keypair(&[1u8; 32]);
+        let result = Ed25519Verifier.verify(b"region", &[0u8; 32], &pk).await;
+        assert!(matches!(result, Err(TrustError::InvalidSignature)));
+    }
+}
