@@ -651,8 +651,10 @@ dependencies = [
  "dashmap",
  "ed25519-dalek",
  "ndn-packet",
+ "ndn-tlv",
  "ring",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]
@@ -679,6 +681,7 @@ dependencies = [
  "ndn-store",
  "ndn-transport",
  "smallvec",
+ "tokio",
 ]
 
 [[package]]

@@ -62,6 +62,33 @@ bootstrapping phase and all APIs should be considered unstable.
   Face tasks emit `Closed` when `recv()` returns `FaceError::Closed`; the face
   manager uses this to clean up PIT `OutRecord` entries.
 
+#### `ndn-pipeline` — Layer 2 packet pipeline
+
+- **`PipelineStage` trait** — `async fn process(&self, ctx: PacketContext) -> Result<Action, DropReason>` with `BoxedStage` alias for dynamic dispatch.
+- **`PacketContext`** — per-packet value type carrying raw bytes, face ID, decoded name, decoded packet, PIT token, out-face list, cs_hit / verified flags, arrival timestamp, and a typed `AnyMap` escape hatch for inter-stage communication.
+- **`Action`** — ownership-based enum (`Continue`, `Send`, `Satisfy`, `Drop`, `Nack`). Returning `Continue` hands the context to the next stage; all other variants consume it — use-after-hand-off is a compile error.
+- **`ForwardingAction`** — strategy return type (`Forward`, `ForwardAfter`, `Nack`, `Suppress`). `ForwardAfter` carries a `Duration` for probe-and-fallback scheduling.
+- **`DropReason` / `NackReason`** — typed enums, not stringly-typed codes.
+
+#### `ndn-strategy` — Layer 2 forwarding strategies
+
+- **`Strategy` trait** — `after_receive_interest`, `after_receive_data`, `on_interest_timeout`, `on_nack` (last two default to `Suppress`). Returns `SmallVec<[ForwardingAction; 2]>` — two actions inline for probe-and-fallback without allocation.
+- **`StrategyContext`** — immutable view of engine state (`name`, `in_face`, `fib_entry`, `pit_token`, `measurements`). Strategies cannot mutate forwarding tables directly.
+- **`FibEntry` / `FibNexthop`** — local strategy-layer types using `FaceId` (not `u32`) to allow direct face dispatch without cross-layer dependency confusion.
+- **`BestRouteStrategy`** — lowest-cost nexthop, split-horizon (`nexthops_excluding(in_face)`). Falls back to `Nack(NoRoute)` when no nexthop exists.
+- **`MulticastStrategy`** — fans Interest to all nexthops except the incoming face. Returns all face IDs in a single `Forward` action.
+- **`MeasurementsTable`** — `DashMap`-backed EWMA RTT and satisfaction rate per (prefix, face). Updated before strategy call so strategies read fresh RTT. `EwmaRtt::rto_ns()` = srtt + 4×rttvar.
+
+#### `ndn-security` — Layer 2 security
+
+- **`Signer` / `Ed25519Signer`** — `BoxFuture`-based async signing (enables `Arc<dyn Signer>` storage). `Ed25519Signer::from_seed(&[u8; 32], key_name)` for deterministic construction.
+- **`Verifier` / `Ed25519Verifier` / `VerifyOutcome`** — `Invalid` is `Ok(VerifyOutcome::Invalid)` not `Err`, since a bad signature is an expected outcome, not an exception.
+- **`TrustSchema` / `NamePattern` / `PatternComponent`** — rule-based data-name / key-name pattern matching with named capture groups. `Capture` binds one component; `MultiCapture` consumes trailing components. Captured variables must be consistent between data and key patterns.
+- **`CertCache`** — `DashMap`-backed in-memory certificate cache. Certificates are named Data packets fetched via Interest.
+- **`KeyStore` trait / `MemKeyStore`** — async key store trait; `MemKeyStore` for testing.
+- **`SafeData`** — wraps `Data` + `TrustPath` + `verified_at`. `pub(crate)` constructors prevent application code from bypassing verification.
+- **`Validator`** — schema check → cert cache lookup → cryptographic verification. Returns `Valid(SafeData)`, `Invalid(TrustError)`, or `Pending` (cert not yet cached). Exposes `cert_cache()` accessor for pre-population in tests.
+
 #### `ndn-face-net` — Layer 3 network faces
 
 - **`UdpFace`** — unicast UDP face. The socket is `connect()`-ed to the peer at
@@ -83,7 +110,10 @@ bootstrapping phase and all APIs should be considered unstable.
 - **`UnixFace`** — Unix domain socket face with `TlvCodec` framing. Same
   `FramedRead`/`FramedWrite` + `Mutex` design as `TcpFace`. `connect` opens a
   new connection; `from_stream` wraps an accepted stream. Carries the socket path
-  for diagnostics.
+  for diagnostics. Tests use a `process::id() + AtomicU64` counter for socket
+  paths (replacing `subsec_nanos()`) to prevent path collisions between parallel
+  tests, and `loopback_pair` is guarded by a 5-second timeout so a mis-bound
+  listener never causes a silent hang.
 
 - **`AppFace` / `AppHandle`** — in-process face backed by a pair of
   `tokio::sync::mpsc` channels. `AppFace::new(id, buffer)` returns both halves.
@@ -102,14 +132,25 @@ bootstrapping phase and all APIs should be considered unstable.
 | `ndn-transport` | `tlv_codec` | 8 |
 | `ndn-transport` | `face_pair_table` | 6 |
 | `ndn-transport` | `face_event` | 2 |
+| `ndn-pipeline` | `action` | 8 |
+| `ndn-pipeline` | `context` | 6 |
+| `ndn-strategy` | `measurements` | 6 |
+| `ndn-strategy` | `best_route` | 5 |
+| `ndn-strategy` | `multicast` | 4 |
+| `ndn-security` | `trust_schema` | 8 |
+| `ndn-security` | `signer` | 6 |
+| `ndn-security` | `verifier` | 5 |
+| `ndn-security` | `key_store` | 4 |
+| `ndn-security` | `safe_data` | 3 |
+| `ndn-security` | `validator` | 5 |
 | `ndn-face-net` | `udp` | 4 |
 | `ndn-face-net` | `tcp` | 6 |
 | `ndn-face-net` | `multicast` | 4 |
 | `ndn-face-local` | `unix` | 5 |
 | `ndn-face-local` | `app` | 7 |
-| **Total new** | | **97** |
+| **Total new** | | **159** |
 
-Running total across all foundation crates: **191 tests** (94 layer 5 + 71 layer 4 + 26 layer 3), all passing.
+Running total across all foundation crates: **253 tests** (94 layer 5 + 71 layer 4 + 26 layer 3 + 62 layer 2), all passing.
 
 ---
 

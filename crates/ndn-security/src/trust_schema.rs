@@ -100,3 +100,96 @@ impl TrustSchema {
         self.rules.iter().any(|r| r.check(data_name, key_name))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use ndn_packet::NameComponent;
+
+    fn comp(s: &'static str) -> NameComponent {
+        NameComponent::generic(Bytes::from_static(s.as_bytes()))
+    }
+    fn name(components: &[&'static str]) -> Name {
+        Name::from_components(components.iter().map(|s| comp(s)))
+    }
+
+    #[test]
+    fn literal_matches_exact() {
+        let pat = NamePattern(vec![PatternComponent::Literal(comp("sensor"))]);
+        assert!(pat.matches(&name(&["sensor"]), &mut HashMap::new()));
+    }
+
+    #[test]
+    fn literal_rejects_wrong_component() {
+        let pat = NamePattern(vec![PatternComponent::Literal(comp("sensor"))]);
+        assert!(!pat.matches(&name(&["actuator"]), &mut HashMap::new()));
+    }
+
+    #[test]
+    fn literal_rejects_extra_components() {
+        let pat = NamePattern(vec![PatternComponent::Literal(comp("a"))]);
+        assert!(!pat.matches(&name(&["a", "b"]), &mut HashMap::new()));
+    }
+
+    #[test]
+    fn capture_binds_variable() {
+        let pat = NamePattern(vec![
+            PatternComponent::Literal(comp("sensor")),
+            PatternComponent::Capture(Arc::from("node")),
+        ]);
+        let mut bindings = HashMap::new();
+        assert!(pat.matches(&name(&["sensor", "node1"]), &mut bindings));
+        assert_eq!(bindings[&Arc::from("node")], comp("node1"));
+    }
+
+    #[test]
+    fn capture_enforces_consistency() {
+        let var: Arc<str> = Arc::from("node");
+        let data_pat = NamePattern(vec![PatternComponent::Capture(Arc::clone(&var))]);
+        let key_pat  = NamePattern(vec![PatternComponent::Capture(Arc::clone(&var))]);
+        let mut bindings = HashMap::new();
+        // Bind node = "n1" via data pattern
+        assert!(data_pat.matches(&name(&["n1"]), &mut bindings));
+        // Key pattern with same value succeeds
+        assert!(key_pat.matches(&name(&["n1"]), &mut bindings.clone()));
+        // Key pattern with different value fails
+        assert!(!key_pat.matches(&name(&["n2"]), &mut bindings));
+    }
+
+    #[test]
+    fn multi_capture_consumes_remaining() {
+        let pat = NamePattern(vec![
+            PatternComponent::Literal(comp("prefix")),
+            PatternComponent::MultiCapture(Arc::from("rest")),
+        ]);
+        assert!(pat.matches(&name(&["prefix", "a", "b", "c"]), &mut HashMap::new()));
+    }
+
+    #[test]
+    fn schema_rule_allows_matching_pair() {
+        let rule = SchemaRule {
+            data_pattern: NamePattern(vec![PatternComponent::Literal(comp("data"))]),
+            key_pattern:  NamePattern(vec![PatternComponent::Literal(comp("key"))]),
+        };
+        assert!(rule.check(&name(&["data"]), &name(&["key"])));
+        assert!(!rule.check(&name(&["data"]), &name(&["wrong"])));
+    }
+
+    #[test]
+    fn trust_schema_allows_via_any_rule() {
+        let mut schema = TrustSchema::new();
+        schema.add_rule(SchemaRule {
+            data_pattern: NamePattern(vec![PatternComponent::Literal(comp("data"))]),
+            key_pattern:  NamePattern(vec![PatternComponent::Literal(comp("key"))]),
+        });
+        assert!(schema.allows(&name(&["data"]), &name(&["key"])));
+        assert!(!schema.allows(&name(&["data"]), &name(&["wrong"])));
+    }
+
+    #[test]
+    fn empty_schema_rejects_everything() {
+        let schema = TrustSchema::new();
+        assert!(!schema.allows(&name(&["a"]), &name(&["b"])));
+    }
+}

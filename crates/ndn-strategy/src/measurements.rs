@@ -98,3 +98,82 @@ fn now_ns() -> u64 {
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use ndn_packet::Name;
+    use ndn_transport::FaceId;
+
+    #[test]
+    fn ewma_first_sample_initialises_srtt() {
+        let mut rtt = EwmaRtt::default();
+        rtt.update(1_000_000.0); // 1 ms
+        assert_eq!(rtt.srtt_ns, 1_000_000.0);
+        assert_eq!(rtt.rttvar_ns, 500_000.0); // sample / 2
+        assert_eq!(rtt.samples, 1);
+    }
+
+    #[test]
+    fn ewma_second_sample_converges() {
+        let mut rtt = EwmaRtt::default();
+        rtt.update(1_000_000.0);
+        rtt.update(1_000_000.0); // same RTT → SRTT unchanged
+        assert_eq!(rtt.samples, 2);
+        assert!((rtt.srtt_ns - 1_000_000.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn ewma_rto_is_srtt_plus_four_rttvar() {
+        let mut rtt = EwmaRtt::default();
+        rtt.update(1_000.0);
+        let expected = rtt.srtt_ns + 4.0 * rtt.rttvar_ns;
+        assert!((rtt.rto_ns() - expected).abs() < 1e-6);
+    }
+
+    #[test]
+    fn measurements_table_update_rtt_creates_entry() {
+        let table = MeasurementsTable::new();
+        let name = Arc::new(Name::root());
+        table.update_rtt(Arc::clone(&name), FaceId(1), 500_000.0);
+        let entry = table.get(&name).expect("entry created");
+        assert!(entry.rtt_per_face.contains_key(&FaceId(1)));
+        assert!(entry.last_updated > 0);
+    }
+
+    #[test]
+    fn measurements_table_update_satisfaction_converges() {
+        let table = MeasurementsTable::new();
+        let name = Arc::new(Name::root());
+        // Repeated satisfied updates should drive rate toward 1.0
+        for _ in 0..100 {
+            table.update_satisfaction(Arc::clone(&name), true);
+        }
+        let entry = table.get(&name).unwrap();
+        assert!(entry.satisfaction_rate > 0.9);
+    }
+
+    #[test]
+    fn measurements_table_unsatisfied_drives_rate_to_zero() {
+        let table = MeasurementsTable::new();
+        let name = Arc::new(Name::root());
+        // First push rate up...
+        for _ in 0..50 {
+            table.update_satisfaction(Arc::clone(&name), true);
+        }
+        // ...then push rate down
+        for _ in 0..100 {
+            table.update_satisfaction(Arc::clone(&name), false);
+        }
+        let entry = table.get(&name).unwrap();
+        assert!(entry.satisfaction_rate < 0.1);
+    }
+
+    #[test]
+    fn measurements_table_default_is_empty() {
+        let table = MeasurementsTable::default();
+        let name = Arc::new(Name::root());
+        assert!(table.get(&name).is_none());
+    }
+}

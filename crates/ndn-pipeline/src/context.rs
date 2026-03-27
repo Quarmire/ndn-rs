@@ -92,3 +92,65 @@ impl AnyMap {
 impl Default for AnyMap {
     fn default() -> Self { Self::new() }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use ndn_transport::FaceId;
+
+    #[test]
+    fn packet_context_new_defaults() {
+        let raw = Bytes::from_static(b"\x05\x01\x00");
+        let ctx = PacketContext::new(raw.clone(), FaceId(7), 12345);
+        assert_eq!(ctx.raw_bytes, raw);
+        assert_eq!(ctx.face_id, FaceId(7));
+        assert_eq!(ctx.arrival, 12345);
+        assert!(ctx.name.is_none());
+        assert!(ctx.pit_token.is_none());
+        assert!(ctx.out_faces.is_empty());
+        assert!(!ctx.cs_hit);
+        assert!(!ctx.verified);
+        assert!(matches!(ctx.packet, DecodedPacket::Raw));
+    }
+
+    #[test]
+    fn anymap_insert_get_roundtrip() {
+        let mut m = AnyMap::new();
+        m.insert(42u32);
+        assert_eq!(m.get::<u32>(), Some(&42u32));
+        assert!(m.get::<u64>().is_none()); // different type
+    }
+
+    #[test]
+    fn anymap_insert_overwrite() {
+        let mut m = AnyMap::new();
+        m.insert(1u32);
+        m.insert(2u32);
+        assert_eq!(m.get::<u32>(), Some(&2u32));
+    }
+
+    #[test]
+    fn anymap_remove_takes_value() {
+        let mut m = AnyMap::new();
+        m.insert(99u32);
+        let v = m.remove::<u32>();
+        assert_eq!(v, Some(99u32));
+        assert!(m.get::<u32>().is_none());
+    }
+
+    #[test]
+    fn anymap_different_types_coexist() {
+        let mut m = AnyMap::new();
+        m.insert(1u32);
+        m.insert("hello");
+        assert_eq!(m.get::<u32>(), Some(&1u32));
+        assert_eq!(m.get::<&str>(), Some(&"hello"));
+    }
+
+    #[test]
+    fn anymap_default_is_empty() {
+        let m = AnyMap::default();
+        assert!(m.get::<u32>().is_none());
+    }
+}
