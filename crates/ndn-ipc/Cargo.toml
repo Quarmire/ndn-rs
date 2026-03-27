@@ -11,3 +11,6 @@ ndn-packet = { workspace = true }
 bytes      = { workspace = true }
 tokio      = { workspace = true, features = ["sync"] }
 thiserror  = { workspace = true }
+
+[dev-dependencies]
+ndn-transport = { workspace = true }

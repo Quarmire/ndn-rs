@@ -4,7 +4,7 @@ use anyhow::Result;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-use ndn_store::{ContentStore, LruCs, Pit};
+use ndn_store::Pit;
 use ndn_transport::{Face, FaceTable};
 
 use crate::{
@@ -78,5 +78,47 @@ impl EngineBuilder {
         let engine = ForwarderEngine { inner };
         let handle = ShutdownHandle { cancel, tasks };
         Ok((engine, handle))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn build_returns_usable_engine() {
+        let (engine, handle) = EngineBuilder::new(EngineConfig::default())
+            .build()
+            .await
+            .unwrap();
+        // Accessors return valid Arcs.
+        let _ = engine.fib();
+        let _ = engine.pit();
+        let _ = engine.faces();
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn engine_clone_shares_same_tables() {
+        let (engine, handle) = EngineBuilder::new(EngineConfig::default())
+            .build()
+            .await
+            .unwrap();
+        let clone = engine.clone();
+        // Both handles point to the same FIB.
+        assert!(Arc::ptr_eq(&engine.fib(), &clone.fib()));
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_completes_promptly() {
+        let (_engine, handle) = EngineBuilder::new(EngineConfig::default())
+            .build()
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_millis(200), handle.shutdown())
+            .await
+            .expect("shutdown did not complete within 200 ms");
     }
 }

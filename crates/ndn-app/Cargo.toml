@@ -16,3 +16,7 @@ tokio        = { workspace = true, features = ["sync", "rt"] }
 tracing      = { workspace = true }
 thiserror    = { workspace = true }
 anyhow       = { workspace = true }
+
+[dev-dependencies]
+ndn-tlv = { workspace = true }
+tokio   = { workspace = true, features = ["rt", "macros"] }
