@@ -91,5 +91,8 @@ ed25519-dalek = "2"
 # Serial port support
 tokio-serial = "5"
 
+# Zero-copy cross-platform IPC (optional; used by ndn-router's iceoryx2-mgmt feature)
+iceoryx2 = "0.8.1"
+
 # Logging subscriber (binaries only)
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

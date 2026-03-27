@@ -1,0 +1,2 @@
+log pipeline config
+shm and iceoryx alt impl on ndn-ipc

@@ -9,6 +9,18 @@ license.workspace = true
 name = "ndn-router"
 path = "src/main.rs"
 
+[features]
+## Replace the Unix-socket management interface with an iceoryx2 shared-memory
+## RPC channel.  Works on Linux, macOS, and Windows without requiring a Unix
+## socket; use when deploying on non-Unix platforms or when you want the
+## zero-copy IPC characteristics of iceoryx2.
+##
+##   cargo build -p ndn-router --features iceoryx2-mgmt
+##
+## When this feature is NOT enabled, the management interface falls back to a
+## Unix socket (Unix targets only).
+iceoryx2-mgmt = ["dep:iceoryx2"]
+
 [dependencies]
 ndn-engine       = { workspace = true }
 ndn-app          = { workspace = true }
@@ -27,3 +39,4 @@ tokio-util       = { workspace = true, features = ["rt"] }
 tracing          = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow           = { workspace = true }
+iceoryx2         = { workspace = true, optional = true }

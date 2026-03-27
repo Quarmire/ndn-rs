@@ -366,6 +366,120 @@ Running total across all crates: **337 tests**, all passing.
 
 ---
 
+## [Unreleased — security tooling, PIB, iceoryx2 management]
+
+### Added
+
+#### `ndn-security` — persistent PIB backend
+
+- **`FilePib`** — file-based Public Info Base. Directory layout:
+  `<root>/keys/<sha256>/private.key` + `cert.ndnc` for identity keys/certs;
+  `<root>/anchors/<sha256>/cert.ndnc` for trust anchors.
+  SHA-256 of canonical name bytes used as directory name to avoid filesystem
+  special-character issues.
+  Operations:
+  - `new(root)` / `open(root)` — create or open a PIB directory.
+  - `generate_ed25519(name)` — creates a key pair with `ring::rand::SystemRandom`
+    (real CSPRNG) and persists the 32-byte seed.
+  - `get_signer(name)` / `delete_key(name)` / `list_keys()` — key CRUD.
+  - `store_cert(cert)` / `get_cert(name)` — certificate CRUD.
+  - `add_trust_anchor(cert)` / `remove_trust_anchor(name)` / `trust_anchors()` /
+    `list_anchors()` — trust anchor management.
+  - `name_to_uri(name)` / `name_from_uri(uri)` — percent-encoded NDN URI helpers
+    (public; reused by `ndn-sec` CLI).
+
+- **NDNC certificate binary format** — compact format used for on-disk storage:
+  `[4] magic "NDNC" | [1] version=1 | [8] valid_from (u64 BE ns) |
+  [8] valid_until (u64 BE ns) | [4] pk_len (u32 BE) | [pk_len] public key bytes`.
+
+- **`PibError`** — `Io`, `KeyNotFound`, `CertNotFound`, `Corrupt`, `InvalidName`
+  variants; `From<PibError> for TrustError` for ergonomic `?` propagation.
+
+- **`Ed25519Signer::public_key_bytes() -> [u8; 32]`** — exposes the verifying key
+  bytes needed to embed a public key in a self-signed certificate.
+
+#### `ndn-security` — `SecurityManager` updates
+
+- **`SecurityManager::generate_ed25519()`** now uses `ring::rand::SystemRandom`
+  for a real CSPRNG instead of the previous deterministic placeholder seed.
+
+- **`SecurityManager::from_pib(pib, identity)`** — constructs a `SecurityManager`
+  pre-loaded with the given identity's signer, its certificate (if present), and
+  all trust anchors from the PIB.
+
+#### `ndn-config` — `SecurityConfig` expanded
+
+- Added `identity: Option<String>` — NDN URI of the router's identity
+  (e.g. `"/ndn/router1"`); loaded from the PIB at startup.
+- Added `pib_path: Option<String>` — PIB directory path; defaults to
+  `~/.ndn/pib` when absent.
+
+#### `ndn-tools` — `ndn-sec` CLI binary
+
+- New binary `ndn-sec` for offline key and certificate management.
+  Global flag: `--pib <path>` (also reads `$NDN_PIB`; falls back to `~/.ndn/pib`).
+
+  Subcommands:
+  | Command | Description |
+  |---------|-------------|
+  | `keygen <name>` | Generate an Ed25519 key + self-signed cert. `--anchor` registers the cert as a trust anchor; `--days N` sets validity (default 365). |
+  | `certdump <name>` | Pretty-print the stored certificate (subject, issuer, public key hex, validity). |
+  | `list` | List all identity names stored in the PIB. |
+  | `delete <name>` | Remove a key and its certificate from the PIB. |
+  | `anchor add <name>` | Promote an existing cert to trust anchor. |
+  | `anchor remove <name>` | Remove a trust anchor. |
+  | `anchor list` | List all trust anchor names. |
+
+#### `ndn-router` — PIB loading at startup
+
+- `load_security(cfg)` — reads `[security].identity` and `[security].pib_path`
+  from the loaded `ForwarderConfig`, opens the PIB, and calls
+  `SecurityManager::from_pib()`. Failures are non-fatal (warning logged, router
+  starts without a security identity).
+
+#### `ndn-router` — `iceoryx2-mgmt` optional feature
+
+- New Cargo feature **`iceoryx2-mgmt`** replaces the Unix-socket management
+  transport with an iceoryx2 shared-memory RPC channel. Works on Linux, macOS,
+  and Windows without requiring a Unix socket.
+
+  Enable with: `cargo build -p ndn-router --features iceoryx2-mgmt`
+
+- **`MgmtReq` / `MgmtResp`** — `#[repr(C)] #[derive(ZeroCopySend)]` wire types
+  with a `data: [u8; 4096]` null-padded JSON payload. Zero heap allocation; data
+  lands directly in the iceoryx2 shared-memory slot.
+
+- **`mgmt_ipc::run_blocking(service_name, engine, cancel)`** — blocking iceoryx2
+  server loop intended for `tokio::task::spawn_blocking`. Uses
+  `node.wait(CYCLE_TIME)` (5 ms tick) to stay responsive to both iceoryx2
+  `TerminationRequest` signals and the Tokio `CancellationToken`.
+
+- Transport selection is compile-time:
+  1. `iceoryx2-mgmt` feature → iceoryx2 shared-memory RPC (all platforms)
+  2. Unix target without `iceoryx2-mgmt` → Unix socket (existing behaviour)
+  3. Non-Unix without `iceoryx2-mgmt` → management unavailable (warning logged)
+
+- Added `iceoryx2 = "0.8.1"` to workspace dependencies.
+
+### Fixed
+
+- **`data.rs` / `signature.rs`** — removed erroneous `core::sync::OnceLock`
+  references (does not exist in `core`); replaced with `std::sync::OnceLock` and
+  `std::sync::Arc`.
+- **`ndn-face-wireless`** — `pub mod neighbor` and `NeighborDiscovery` re-export
+  gated behind `#[cfg(target_os = "linux")]` because `NeighborEntry` holds
+  `MacAddr` which is only available on Linux.
+
+### Tests added
+
+| Crate | Module | Count |
+|-------|--------|------:|
+| `ndn-security` | `pib` | 16 |
+
+Running total across all crates: **353 tests**, all passing.
+
+---
+
 ## [0.0.2] — Layer 5 tests (89cb5e1)
 
 ### Added
