@@ -8,6 +8,7 @@ use tracing_subscriber::EnvFilter;
 use ndn_config::{ForwarderConfig, ManagementRequest, ManagementResponse, ManagementServer};
 use ndn_engine::{EngineBuilder, EngineConfig, ForwarderEngine};
 use ndn_packet::{Name, NameComponent};
+use ndn_security::{FilePib, SecurityManager};
 use bytes::Bytes;
 
 // Unix-socket management I/O is only available on Unix targets.
@@ -80,6 +81,9 @@ async fn main() -> Result<()> {
         tracing::info!(prefix = %route.prefix, face = route.face, cost = route.cost, "route added");
     }
 
+    // Load security identity from PIB if configured.
+    load_security(&fwd_config);
+
     tracing::info!("engine running");
 
     let cancel = CancellationToken::new();
@@ -109,6 +113,62 @@ async fn main() -> Result<()> {
 
     shutdown.shutdown().await;
     Ok(())
+}
+
+/// Load the router's security identity from the PIB specified in `[security]`.
+///
+/// On success the identity is logged.  Failures are non-fatal — the router
+/// starts without a security identity and logs a warning instead.
+fn load_security(cfg: &ForwarderConfig) {
+    let Some(identity_uri) = &cfg.security.identity else { return; };
+
+    let pib_path = cfg.security.pib_path
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(default_pib_path);
+
+    let identity = name_from_uri(identity_uri);
+
+    let pib = match FilePib::open(&pib_path) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                pib = %pib_path.display(),
+                "PIB not found; starting without security identity"
+            );
+            return;
+        }
+    };
+
+    match SecurityManager::from_pib(&pib, &identity) {
+        Ok(_mgr) => {
+            tracing::info!(
+                identity = %identity_uri,
+                pib = %pib_path.display(),
+                "loaded security identity from PIB"
+            );
+            // TODO: pass `_mgr` into the engine once the SecurityPolicy
+            // integration point exists on EngineBuilder.
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                identity = %identity_uri,
+                "failed to load security identity; starting without it"
+            );
+        }
+    }
+}
+
+/// Default PIB path: `$HOME/.ndn/pib`.
+fn default_pib_path() -> PathBuf {
+    let mut p = std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/tmp"));
+    p.push(".ndn");
+    p.push("pib");
+    p
 }
 
 /// Parse a URI-style NDN name like `/ndn/test` into `Name`.

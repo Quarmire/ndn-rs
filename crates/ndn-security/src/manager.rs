@@ -36,31 +36,20 @@ impl SecurityManager {
         }
     }
 
-    /// Generate a new Ed25519 key pair and store it.
+    /// Generate a new Ed25519 key pair using a cryptographically random seed
+    /// and store it in the in-memory key store.
     ///
     /// `key_name` should follow NDN key naming convention:
     /// `/<identity>/KEY/<key-id>`.
     ///
     /// Returns the key name on success.
     pub fn generate_ed25519(&self, key_name: Name) -> Result<Name, TrustError> {
-        let seed: [u8; 32] = std::array::from_fn(|i| {
-            // Deterministic seed from the key name bytes (for reproducibility
-            // in testing). A real implementation would use a CSPRNG.
-            let bytes: Vec<u8> = key_name
-                .components()
-                .iter()
-                .flat_map(|c| c.value.iter().copied())
-                .collect();
-            bytes.get(i).copied().unwrap_or(i as u8).wrapping_add(0x42)
-        });
-
-        // Use a real random seed via getrandom-equivalent (ring).
-        let mut random_seed = [0u8; 32];
-        for (i, b) in random_seed.iter_mut().enumerate() {
-            *b = seed[i]; // placeholder; real impl: ring::rand::SecureRandom
-        }
-
-        let signer = Ed25519Signer::from_seed(&random_seed, key_name.clone());
+        use ring::rand::{SecureRandom, SystemRandom};
+        let rng = SystemRandom::new();
+        let mut seed = [0u8; 32];
+        rng.fill(&mut seed)
+            .map_err(|_| TrustError::KeyStore("system RNG unavailable".into()))?;
+        let signer = Ed25519Signer::from_seed(&seed, key_name.clone());
         self.keys.add(Arc::new(key_name.clone()), signer);
         Ok(key_name)
     }
@@ -163,6 +152,37 @@ impl SecurityManager {
     /// Access the certificate cache (e.g., to pass to a `Validator`).
     pub fn cert_cache(&self) -> &CertCache {
         &self.cert_cache
+    }
+
+    /// Build a `SecurityManager` by loading an identity from a [`FilePib`].
+    ///
+    /// - Loads the signing key for `identity` from the PIB.
+    /// - If a certificate is present for that identity, inserts it into the
+    ///   cert cache.
+    /// - Loads all trust anchors stored in the PIB.
+    ///
+    /// [`FilePib`]: crate::pib::FilePib
+    pub fn from_pib(
+        pib: &crate::pib::FilePib,
+        identity: &Name,
+    ) -> Result<Self, TrustError> {
+        let mgr = SecurityManager::new();
+
+        // Load the signing key.
+        let signer = pib.get_signer(identity)?;
+        mgr.keys.add(Arc::new(identity.clone()), signer);
+
+        // Load the identity's certificate if present.
+        if let Ok(cert) = pib.get_cert(identity) {
+            mgr.cert_cache.insert(cert);
+        }
+
+        // Load all trust anchors.
+        for anchor in pib.trust_anchors()? {
+            mgr.add_trust_anchor(anchor);
+        }
+
+        Ok(mgr)
     }
 }
 

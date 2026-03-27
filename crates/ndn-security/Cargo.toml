@@ -14,5 +14,6 @@ ring          = { workspace = true }
 ed25519-dalek = { workspace = true }
 
 [dev-dependencies]
-ndn-tlv = { workspace = true }
-tokio   = { workspace = true, features = ["rt", "macros"] }
+ndn-tlv    = { workspace = true }
+tokio      = { workspace = true, features = ["rt", "macros"] }
+tempfile   = "3"
