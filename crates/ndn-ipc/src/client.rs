@@ -1,24 +1,27 @@
 use std::sync::Arc;
 
-use ndn_app::AppFace;
 use ndn_packet::Name;
 
 /// High-level NDN IPC client.
 ///
-/// Wraps `AppFace` with ergonomic request-response and subscription APIs.
+/// Generic over the face type `F` so it can work with any transport:
+/// - `AppFace` for in-process use (library embedding)
+/// - `UnixFace` for cross-process use over a Unix domain socket
+/// - A future `ShmFace` for zero-copy cross-process IPC
+///
 /// The namespace is the root name under which this client operates; it is
 /// prepended to all expressed Interests by convention (not enforced here).
-pub struct IpcClient {
-    face:      Arc<AppFace>,
+pub struct IpcClient<F> {
+    face:      Arc<F>,
     namespace: Name,
 }
 
-impl IpcClient {
-    pub fn new(face: Arc<AppFace>, namespace: Name) -> Self {
+impl<F> IpcClient<F> {
+    pub fn new(face: Arc<F>, namespace: Name) -> Self {
         Self { face, namespace }
     }
 
-    pub fn face(&self) -> &AppFace {
+    pub fn face(&self) -> &F {
         &self.face
     }
 
@@ -30,7 +33,8 @@ impl IpcClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndn_transport::FaceId;
+    use ndn_face_local::AppFace;
+    use ndn_transport::{Face, FaceId};
 
     #[test]
     fn new_and_accessors() {
@@ -38,6 +42,6 @@ mod tests {
         let ns = Name::root();
         let client = IpcClient::new(Arc::new(face), ns.clone());
         assert_eq!(client.namespace(), &ns);
-        assert_eq!(client.face().face_id(), FaceId(1));
+        assert_eq!(client.face().id(), FaceId(1));
     }
 }

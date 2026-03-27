@@ -72,14 +72,6 @@ impl EngineBuilder {
             add_face(Arc::clone(&face_table));
         }
 
-        let inner = Arc::new(EngineInner {
-            fib:          Arc::clone(&fib),
-            pit:          Arc::clone(&pit),
-            cs:           Arc::clone(&cs),
-            face_table:   Arc::clone(&face_table),
-            measurements: Arc::clone(&measurements),
-        });
-
         let cancel = CancellationToken::new();
         let mut tasks = JoinSet::new();
 
@@ -112,7 +104,16 @@ impl EngineBuilder {
             channel_cap: self.config.pipeline_channel_cap,
         };
 
-        dispatcher.spawn(cancel.clone(), &mut tasks);
+        let pipeline_tx = dispatcher.spawn(cancel.clone(), &mut tasks);
+
+        let inner = Arc::new(EngineInner {
+            fib:          Arc::clone(&fib),
+            pit:          Arc::clone(&pit),
+            cs:           Arc::clone(&cs),
+            face_table:   Arc::clone(&face_table),
+            measurements: Arc::clone(&measurements),
+            pipeline_tx,
+        });
 
         let engine = ForwarderEngine { inner };
         let handle = ShutdownHandle { cancel, tasks };

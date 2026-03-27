@@ -1,12 +1,14 @@
 use std::sync::Arc;
 
+use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use ndn_store::{LruCs, Pit};
 use ndn_strategy::MeasurementsTable;
-use ndn_transport::FaceTable;
+use ndn_transport::{Face, FaceTable};
 
+use crate::dispatcher::InboundPacket;
 use crate::Fib;
 
 /// Shared tables owned by the engine, accessible to all tasks via `Arc`.
@@ -16,6 +18,9 @@ pub struct EngineInner {
     pub cs:           Arc<LruCs>,
     pub face_table:   Arc<FaceTable>,
     pub measurements: Arc<MeasurementsTable>,
+    /// Pipeline inbound channel — used to spawn readers for dynamically-added
+    /// faces (those registered after `build()` completes).
+    pub(crate) pipeline_tx: mpsc::Sender<InboundPacket>,
 }
 
 /// Handle to a running forwarding engine.
@@ -41,6 +46,21 @@ impl ForwarderEngine {
 
     pub fn cs(&self) -> Arc<LruCs> {
         Arc::clone(&self.inner.cs)
+    }
+
+    /// Register a face and immediately start its packet-reader task.
+    ///
+    /// Use this for faces accepted from a listener after `build()` returns —
+    /// for example, a `UnixFace` connection accepted by the NDN face listener.
+    /// The face participates in forwarding exactly like faces registered at
+    /// build time.
+    pub fn add_face<F: Face + 'static>(&self, face: F, cancel: CancellationToken) {
+        let face_id = face.id();
+        self.inner.face_table.insert(face);
+        let erased = self.inner.face_table.get(face_id)
+            .expect("face was just inserted");
+        let tx = self.inner.pipeline_tx.clone();
+        tokio::spawn(crate::dispatcher::run_face_reader(face_id, erased, tx, cancel));
     }
 }
 

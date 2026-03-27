@@ -11,6 +11,7 @@ pub mod data;
 pub mod nack;
 pub mod meta_info;
 pub mod signature;
+pub mod encode;
 
 pub use error::PacketError;
 pub use name::{Name, NameComponent};

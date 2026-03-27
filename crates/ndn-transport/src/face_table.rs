@@ -65,6 +65,14 @@ impl FaceTable {
         id
     }
 
+    /// Register a pre-wrapped erased face (e.g. a face accepted from a listener
+    /// that is already stored in an `Arc`).  Returns the face's `FaceId`.
+    pub fn insert_arc(&self, face: Arc<dyn ErasedFace>) -> FaceId {
+        let id = face.id();
+        self.faces.insert(id, face);
+        id
+    }
+
     /// Look up a face handle. Returns `None` if the face has been removed.
     pub fn get(&self, id: FaceId) -> Option<Arc<dyn ErasedFace>> {
         self.faces.get(&id).map(|r| Arc::clone(&*r))

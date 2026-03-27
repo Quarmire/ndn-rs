@@ -36,17 +36,21 @@ pub struct Interest {
 
     /// Interest lifetime — decoded on first access.
     lifetime: OnceLock<Option<Duration>>,
+
+    /// ApplicationParameters (TLV 0x24) — decoded on first access.
+    app_params: OnceLock<Option<Bytes>>,
 }
 
 impl Interest {
     /// Construct a minimal Interest with only a name (for testing / app use).
     pub fn new(name: Name) -> Self {
         Self {
-            raw:      Bytes::new(),
-            name:     Arc::new(name),
-            selectors: OnceLock::new(),
-            nonce:    OnceLock::new(),
-            lifetime: OnceLock::new(),
+            raw:        Bytes::new(),
+            name:       Arc::new(name),
+            selectors:  OnceLock::new(),
+            nonce:      OnceLock::new(),
+            lifetime:   OnceLock::new(),
+            app_params: OnceLock::new(),
         }
     }
 
@@ -68,10 +72,11 @@ impl Interest {
 
         Ok(Self {
             raw,
-            name: Arc::new(name),
-            selectors: OnceLock::new(),
-            nonce:    OnceLock::new(),
-            lifetime: OnceLock::new(),
+            name:       Arc::new(name),
+            selectors:  OnceLock::new(),
+            nonce:      OnceLock::new(),
+            lifetime:   OnceLock::new(),
+            app_params: OnceLock::new(),
         })
     }
 
@@ -87,6 +92,16 @@ impl Interest {
 
     pub fn lifetime(&self) -> Option<Duration> {
         *self.lifetime.get_or_init(|| decode_lifetime(&self.raw).ok().flatten())
+    }
+
+    /// The `ApplicationParameters` TLV value (type 0x24), if present.
+    ///
+    /// Returns `None` when the Interest was constructed without parameters (e.g.
+    /// via `Interest::new`) or when the wire format contains no 0x24 TLV.
+    pub fn app_parameters(&self) -> Option<&Bytes> {
+        self.app_params
+            .get_or_init(|| decode_app_params(&self.raw).ok().flatten())
+            .as_ref()
     }
 
     pub fn raw(&self) -> &Bytes {
@@ -122,6 +137,20 @@ fn decode_nonce(raw: &Bytes) -> Result<Option<u32>, PacketError> {
             }
             let n = u32::from_be_bytes([val[0], val[1], val[2], val[3]]);
             return Ok(Some(n));
+        }
+    }
+    Ok(None)
+}
+
+fn decode_app_params(raw: &Bytes) -> Result<Option<Bytes>, PacketError> {
+    if raw.is_empty() { return Ok(None); }
+    let mut reader = TlvReader::new(raw.clone());
+    let (_, value) = reader.read_tlv()?;
+    let mut inner = TlvReader::new(value);
+    while !inner.is_empty() {
+        let (typ, val) = inner.read_tlv()?;
+        if typ == tlv_type::APP_PARAMETERS {
+            return Ok(Some(val));
         }
     }
     Ok(None)

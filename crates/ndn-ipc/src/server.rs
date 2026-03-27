@@ -1,23 +1,26 @@
 use std::sync::Arc;
 
-use ndn_app::AppFace;
 use ndn_packet::Name;
 
 /// High-level NDN IPC server.
 ///
-/// Registers a name prefix and dispatches incoming Interests to handlers.
-/// Handlers are registered asynchronously via `AppFace::register_prefix`.
-pub struct IpcServer {
-    face:   Arc<AppFace>,
+/// Generic over the face type `F` so it can work with any transport:
+/// - `AppFace` for in-process prefix handlers
+/// - `UnixFace` for cross-process server endpoints
+/// - A future `ShmFace` for zero-copy cross-process IPC
+///
+/// The prefix is the name under which this server handles incoming Interests.
+pub struct IpcServer<F> {
+    face:   Arc<F>,
     prefix: Name,
 }
 
-impl IpcServer {
-    pub fn new(face: Arc<AppFace>, prefix: Name) -> Self {
+impl<F> IpcServer<F> {
+    pub fn new(face: Arc<F>, prefix: Name) -> Self {
         Self { face, prefix }
     }
 
-    pub fn face(&self) -> &AppFace {
+    pub fn face(&self) -> &F {
         &self.face
     }
 
@@ -30,8 +33,9 @@ impl IpcServer {
 mod tests {
     use super::*;
     use bytes::Bytes;
+    use ndn_face_local::AppFace;
     use ndn_packet::NameComponent;
-    use ndn_transport::FaceId;
+    use ndn_transport::{Face, FaceId};
 
     #[test]
     fn new_and_accessors() {
@@ -41,6 +45,6 @@ mod tests {
         ]);
         let server = IpcServer::new(Arc::new(face), prefix.clone());
         assert_eq!(server.prefix(), &prefix);
-        assert_eq!(server.face().face_id(), FaceId(2));
+        assert_eq!(server.face().id(), FaceId(2));
     }
 }

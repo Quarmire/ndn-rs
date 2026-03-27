@@ -6,11 +6,11 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-ndn-app    = { workspace = true }
 ndn-packet = { workspace = true }
 bytes      = { workspace = true }
 tokio      = { workspace = true, features = ["sync"] }
 thiserror  = { workspace = true }
 
 [dev-dependencies]
-ndn-transport = { workspace = true }
+ndn-face-local = { workspace = true }
+ndn-transport  = { workspace = true }

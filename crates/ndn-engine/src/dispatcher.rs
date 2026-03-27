@@ -16,10 +16,10 @@ use crate::stages::{
 };
 
 /// A raw packet arriving from a face, bundled with the face it came from.
-struct InboundPacket {
-    raw:     Bytes,
-    face_id: FaceId,
-    arrival: u64,
+pub(crate) struct InboundPacket {
+    pub(crate) raw:     Bytes,
+    pub(crate) face_id: FaceId,
+    pub(crate) arrival: u64,
 }
 
 /// The packet dispatcher.
@@ -40,13 +40,15 @@ pub struct PacketDispatcher {
 
 impl PacketDispatcher {
     /// Spawn face-reader tasks for all currently registered faces, plus the
-    /// pipeline runner.  Returns the channel sender so callers can spawn
-    /// readers for faces added later.
+    /// pipeline runner.
+    ///
+    /// Returns the pipeline channel sender so the engine can spawn reader tasks
+    /// for faces added dynamically after `build()`.
     pub fn spawn(
         self,
         cancel: CancellationToken,
         tasks:  &mut JoinSet<()>,
-    ) {
+    ) -> mpsc::Sender<InboundPacket> {
         let (tx, rx) = mpsc::channel::<InboundPacket>(self.channel_cap);
 
         // Spawn a reader task for each registered face.
@@ -67,6 +69,7 @@ impl PacketDispatcher {
             dispatcher.run_pipeline(rx, cancel2).await;
         });
 
+        tx
     }
 
     async fn run_pipeline(
@@ -182,7 +185,10 @@ impl PacketDispatcher {
 }
 
 /// Reader loop for a single face.
-async fn run_face_reader(
+///
+/// Exposed as `pub(crate)` so `ForwarderEngine::add_face` can spawn readers for
+/// faces registered after the initial `build()`.
+pub(crate) async fn run_face_reader(
     face_id: FaceId,
     face:    Arc<dyn ndn_transport::ErasedFace>,
     tx:      mpsc::Sender<InboundPacket>,
