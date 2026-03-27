@@ -1,15 +1,23 @@
 [package]
 name = "ndn-face-local"
-description = "NDN local faces: AppFace (in-process mpsc) and UnixFace (TLV-framed Unix socket)"
+description = "NDN local faces: AppFace (in-process mpsc) and UnixFace (TLV-framed Unix socket, Unix only)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+
+[features]
+# Enabled by default on Unix. Pull it in explicitly on non-Unix hosts if
+# cross-compiling for a Unix target from a non-Unix build machine.
+# The UnixFace implementation is cfg-gated separately with #[cfg(unix)], so
+# on Windows/WASM the feature is a no-op and no compilation error occurs.
+default = []
 
 [dependencies]
 ndn-packet    = { workspace = true }
 ndn-transport = { workspace = true }
 bytes         = { workspace = true }
-tokio         = { workspace = true, features = ["net", "sync", "io-util"] }
+# "net" includes UnixStream/UnixListener, needed for UnixFace on Unix.
+tokio         = { workspace = true, features = ["sync", "io-util", "net"] }
 tokio-util    = { workspace = true, features = ["codec"] }
 futures       = { workspace = true }
 thiserror     = { workspace = true }

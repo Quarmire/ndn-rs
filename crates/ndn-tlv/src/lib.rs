@@ -1,3 +1,9 @@
+// Enable no_std when the `std` feature is disabled.
+// The crate still requires an allocator (for `BytesMut` / `Bytes`).
+#![cfg_attr(not(feature = "std"), no_std)]
+#[cfg(not(feature = "std"))]
+extern crate alloc;
+
 pub mod error;
 pub mod reader;
 pub mod writer;

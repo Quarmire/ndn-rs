@@ -5,8 +5,15 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+# `std` is enabled by default. Disable for bare-metal embedded targets
+# (requires an allocator; configure `bytes`/`smallvec` without std):
+#
+#   ndn-packet = { path = "...", default-features = false }
+[features]
+default = ["std"]
+std     = ["ndn-tlv/std"]
+
 [dependencies]
-ndn-tlv  = { workspace = true }
-bytes    = { workspace = true }
-smallvec = { workspace = true }
-thiserror = { workspace = true }
+ndn-tlv   = { workspace = true }
+bytes     = { workspace = true }
+smallvec  = { workspace = true }

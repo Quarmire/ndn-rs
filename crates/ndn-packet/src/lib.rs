@@ -1,3 +1,9 @@
+// Enable no_std when the `std` feature is disabled.
+// The crate requires an allocator (Name uses SmallVec, Bytes uses heap).
+#![cfg_attr(not(feature = "std"), no_std)]
+#[cfg(not(feature = "std"))]
+extern crate alloc;
+
 pub mod error;
 pub mod name;
 pub mod interest;

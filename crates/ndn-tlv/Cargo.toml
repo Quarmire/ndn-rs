@@ -5,5 +5,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+# `std` is enabled by default. Disable it to build for bare-metal targets
+# (requires an allocator; configure `bytes` without std in your workspace):
+#
+#   ndn-tlv = { path = "...", default-features = false }
+[features]
+default = ["std"]
+std     = []
+
 [dependencies]
 bytes = { workspace = true }
