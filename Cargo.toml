@@ -19,6 +19,7 @@ members = [
     "crates/ndn-engine",
     "crates/ndn-app",
     "crates/ndn-ipc",
+    "crates/ndn-config",
     # Layer 5 — research extensions
     "crates/ndn-research",
     "crates/ndn-compute",
@@ -47,6 +48,7 @@ ndn-security  = { path = "crates/ndn-security" }
 ndn-engine    = { path = "crates/ndn-engine" }
 ndn-app       = { path = "crates/ndn-app" }
 ndn-ipc       = { path = "crates/ndn-ipc" }
+ndn-config    = { path = "crates/ndn-config" }
 ndn-face-net      = { path = "crates/ndn-face-net" }
 ndn-face-local    = { path = "crates/ndn-face-local" }
 ndn-face-serial   = { path = "crates/ndn-face-serial" }
@@ -78,6 +80,9 @@ futures = "0.3"
 # Error handling
 anyhow    = "1"
 thiserror = "2"
+
+# JSON serialization (management interface)
+serde_json = "1"
 
 # Cryptography
 ring          = "0.17"

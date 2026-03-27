@@ -20,6 +20,9 @@ pub trait ErasedFace: Send + Sync + 'static {
         &self,
         pkt: bytes::Bytes,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), crate::face::FaceError>> + Send + '_>>;
+    fn recv_bytes(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bytes::Bytes, crate::face::FaceError>> + Send + '_>>;
 }
 
 impl<F: Face> ErasedFace for F {
@@ -32,6 +35,12 @@ impl<F: Face> ErasedFace for F {
         pkt: bytes::Bytes,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), crate::face::FaceError>> + Send + '_>> {
         Box::pin(Face::send(self, pkt))
+    }
+
+    fn recv_bytes(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bytes::Bytes, crate::face::FaceError>> + Send + '_>> {
+        Box::pin(Face::recv(self))
     }
 }
 

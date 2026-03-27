@@ -1,0 +1,16 @@
+[package]
+name = "ndn-config"
+description = "NDN forwarder TOML configuration and management interface"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ndn-packet    = { workspace = true }
+thiserror     = { workspace = true }
+serde         = { version = "1", features = ["derive"] }
+serde_json    = { workspace = true }
+toml          = "0.8"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }

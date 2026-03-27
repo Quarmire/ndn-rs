@@ -200,6 +200,105 @@ bootstrapping phase and all APIs should be considered unstable.
   multicast loopback roundtrip test is best-effort and skips gracefully in
   sandboxed CI environments.
 
+#### `ndn-engine` — Pipeline dispatcher (new)
+
+- **`TlvDecodeStage`** — decodes `ctx.raw_bytes` into `DecodedPacket::Interest`,
+  `Data`, or `Nack`; sets `ctx.packet` and `ctx.name`. Returns
+  `Action::Drop(MalformedPacket)` on any parse failure.
+
+- **`CsLookupStage`** — CS hit path: inserts `CsEntry` into `ctx.tags`, sets
+  `ctx.cs_hit`, appends `ctx.face_id` to `ctx.out_faces`, and returns
+  `Action::Satisfy` — bypassing PIT/FIB entirely. Miss path returns
+  `Action::Continue`.
+
+- **`CsInsertStage`** — stores received Data in the CS after PIT fan-back.
+  Derives `stale_at` from `MetaInfo::freshness_period`; defaults to immediately
+  stale when absent.
+
+- **`PitCheckStage`** — Interest path: detects loop (nonce already in
+  `nonces_seen` → `Drop(LoopDetected)`), aggregates (existing PIT entry, new
+  in-record → `Drop(Suppressed)`), or creates a new entry and continues to the
+  strategy stage.
+
+- **`PitMatchStage`** — Data path: removes PIT entry, populates `ctx.out_faces`
+  from `in_record_faces()`, returns `Drop(Other)` for unsolicited Data.
+
+- **`ErasedStrategy`** — object-safe wrapper over the `impl Future`-based
+  `Strategy` trait. Blanket impl boxes the strategy future so the stage can be
+  stored as `Arc<dyn ErasedStrategy>`.
+
+- **`StrategyStage`** — converts engine `FibEntry` → strategy `FibEntry`,
+  builds `StrategyContext`, calls `ErasedStrategy::after_receive_interest_erased`,
+  and translates `ForwardingAction` into `Action`. `ForwardAfter` forwards
+  immediately (delay scheduling not yet implemented).
+
+- **`PacketDispatcher`** — owns all stages and the face table. `spawn()` creates
+  a bounded `mpsc` channel, starts one reader task per registered face, and runs
+  the pipeline runner. The runner spawns a Tokio task per packet for parallel
+  processing. Interest path: decode → CS lookup → PIT check → strategy → send.
+  Data path: decode → PIT match → CS insert → satisfy.
+
+- **`run_face_reader`** — async loop calling `ErasedFace::recv_bytes()`,
+  wrapping results into `InboundPacket`, and forwarding to the pipeline channel.
+  Exits cleanly on `FaceError::Closed` or `CancellationToken`.
+
+- **`ErasedFace::recv_bytes()`** added to `ndn-transport::FaceTable` —
+  object-safe boxed future wrapping `Face::recv()`, allowing the dispatcher to
+  read from any face stored in the `FaceTable` without knowing its concrete type.
+
+- **`EngineInner`** extended with `cs: Arc<LruCs>` and
+  `measurements: Arc<MeasurementsTable>`; `ForwarderEngine` exposes `cs()` accessor.
+
+- **`EngineBuilder::build()`** now wires all stages, constructs `PacketDispatcher`,
+  and spawns it. `EngineBuilder::strategy<S: ErasedStrategy>` overrides the
+  default `BestRouteStrategy`.
+
+#### `ndn-security` — `SecurityManager` (new)
+
+- **`SecurityManager`** — high-level orchestrator over `MemKeyStore` and
+  `CertCache`. Operations:
+  - `generate_ed25519(key_name)` — generates an Ed25519 key pair and stores it.
+  - `generate_ed25519_from_seed(key_name, &[u8; 32])` — deterministic variant for testing.
+  - `issue_self_signed(key_name, public_key_bytes, validity_ms)` — creates a
+    `Certificate`, inserts it into both the cert cache and the trust-anchor set.
+  - `certify(subject_key_name, public_key, issuer_key_name, validity_ms)` —
+    issues a CA-signed certificate (full TLV cert encoding deferred).
+  - `add_trust_anchor(cert)` — registers a pre-existing cert as implicitly trusted.
+  - `trust_anchor(key_name)` / `trust_anchor_names()` — anchor lookup.
+  - `get_signer(key_name)` — delegates to the key store.
+  - `cert_cache()` — exposes the cache for passing to `Validator`.
+
+#### `ndn-config` — new crate (Layer 1)
+
+- **`ForwarderConfig`** — TOML-serialisable top-level config struct. Parsed with
+  `from_str(s)` or `from_file(path)`; round-tripped with `to_toml_string()`.
+
+  Fields:
+  - `[engine]` → `EngineConfig { cs_capacity_mb, pipeline_channel_cap }` (defaults: 64 MB, 1024).
+  - `[[face]]` → `FaceConfig { kind, bind?, remote?, group?, port?, interface?, path? }`.
+    `kind` is one of `"udp"`, `"tcp"`, `"multicast"`, `"unix"`.
+  - `[[route]]` → `RouteConfig { prefix, face, cost }` (`cost` defaults to 10).
+  - `[security]` → `SecurityConfig { trust_anchor?, key_dir?, require_signed }`.
+
+- **`ManagementRequest`** / **`ManagementResponse`** — JSON-tagged enums for the
+  Unix-socket management protocol. Commands: `add_route`, `remove_route`,
+  `list_routes`, `list_faces`, `get_stats`, `shutdown`. Responses: `Ok`,
+  `OkData { data }`, `Error { message }`.
+
+- **`ManagementServer`** — holds the socket path; `decode_request(line)` and
+  `encode_response(resp)` handle newline-delimited JSON serialisation.
+
+#### `ndn-router` — config and management wiring
+
+- Accepts `-c <path>` to load a `ForwarderConfig` TOML file; uses defaults when
+  omitted.
+- Applies `[[route]]` entries from the config to the live FIB at startup.
+- Spawns a Unix-socket management server (`-m <path>`, default
+  `/tmp/ndn-router.sock`) that handles `ManagementRequest` JSON commands: route
+  add/remove are reflected into the engine FIB immediately; `get_stats` returns
+  live PIT size; `list_faces` enumerates registered face IDs; `shutdown` fires the
+  `CancellationToken`.
+
 #### `ndn-face-local` — Layer 3 local faces
 
 - **`UnixFace`** — Unix domain socket face with `TlvCodec` framing. Same
@@ -257,9 +356,13 @@ bootstrapping phase and all APIs should be considered unstable.
 | `ndn-face-net` | `multicast` | 4 |
 | `ndn-face-local` | `unix` | 5 |
 | `ndn-face-local` | `app` | 7 |
-| **Total new** | | **220** |
+| `ndn-engine` | `stages` (decode, cs, pit, strategy) | — |
+| `ndn-security` | `manager` | 7 |
+| `ndn-config` | `config` | 6 |
+| `ndn-config` | `mgmt` | 10 |
+| **Total new** | | **243** |
 
-Running total across all crates: **315 tests** (94 layer 5 + 71 layer 4 + 26 layer 3 + 62 layer 2 + 34 layer 1 + 28 layer 0), all passing.
+Running total across all crates: **337 tests**, all passing.
 
 ---
 
