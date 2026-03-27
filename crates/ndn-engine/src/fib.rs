@@ -52,6 +52,11 @@ impl Fib {
         self.trie.insert(prefix, Arc::new(FibEntry { nexthops }));
     }
 
+    /// Return all FIB entries as `(prefix_uri, [(face_id, cost)])` tuples.
+    pub fn dump(&self) -> Vec<(Name, Arc<FibEntry>)> {
+        self.trie.dump()
+    }
+
     /// Remove the nexthop for `face_id` from `prefix`.
     pub fn remove_nexthop(&self, prefix: &Name, face_id: FaceId) {
         let Some(existing) = self.trie.get(prefix) else { return };

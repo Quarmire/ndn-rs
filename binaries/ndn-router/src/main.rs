@@ -227,19 +227,36 @@ pub(crate) fn handle_request(
             ManagementResponse::Ok
         }
         ManagementRequest::ListFaces => {
-            let face_ids: Vec<u32> = engine
+            let entries: Vec<serde_json::Value> = engine
                 .faces()
-                .face_ids()
-                .iter()
-                .map(|id| id.0)
+                .face_entries()
+                .into_iter()
+                .filter(|(_, kind)| !matches!(kind, ndn_transport::FaceKind::App | ndn_transport::FaceKind::Internal))
+                .map(|(id, kind)| serde_json::json!({
+                    "id":   id.0,
+                    "kind": format!("{kind:?}").to_lowercase(),
+                }))
                 .collect();
             ManagementResponse::OkData {
-                data: serde_json::json!({ "faces": face_ids }),
+                data: serde_json::json!({ "faces": entries }),
             }
         }
         ManagementRequest::ListRoutes => {
+            let routes: Vec<serde_json::Value> = engine
+                .fib()
+                .dump()
+                .into_iter()
+                .map(|(name, entry)| {
+                    let nexthops: Vec<serde_json::Value> = entry
+                        .nexthops
+                        .iter()
+                        .map(|n| serde_json::json!({ "face": n.face_id.0, "cost": n.cost }))
+                        .collect();
+                    serde_json::json!({ "prefix": name.to_string(), "nexthops": nexthops })
+                })
+                .collect();
             ManagementResponse::OkData {
-                data: serde_json::json!({ "note": "FIB dump not yet implemented" }),
+                data: serde_json::json!({ "routes": routes }),
             }
         }
         ManagementRequest::GetStats => {
