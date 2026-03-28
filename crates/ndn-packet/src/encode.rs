@@ -6,7 +6,7 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use bytes::Bytes;
-use ndn_tlv::TlvWriter;
+use ndn_tlv::{TlvReader, TlvWriter};
 
 use crate::{Name, tlv_type};
 
@@ -60,6 +60,37 @@ pub fn encode_data_unsigned(name: &Name, content: &[u8]) -> Bytes {
         });
         // 32-byte placeholder signature value
         w.write_tlv(tlv_type::SIGNATURE_VALUE, &[0u8; 32]);
+    });
+    w.finish()
+}
+
+/// Encode a Nack TLV wrapping the original Interest wire bytes.
+///
+/// The Nack outer TLV (`0x0320`) contains:
+/// - `NackReason` (`0x0321`) — the reason code
+/// - The original `Interest` TLV (embedded verbatim)
+///
+/// `interest_wire` must be a complete Interest TLV (type + length + value).
+pub fn encode_nack(reason: crate::NackReason, interest_wire: &[u8]) -> Bytes {
+    let mut w = TlvWriter::new();
+    w.write_nested(tlv_type::NACK, |w| {
+        let code = reason.code();
+        // Encode reason code as big-endian, minimum bytes.
+        let reason_bytes = if code == 0 {
+            vec![0u8]
+        } else {
+            let be = code.to_be_bytes();
+            let skip = be.iter().position(|&b| b != 0).unwrap_or(7);
+            be[skip..].to_vec()
+        };
+        w.write_tlv(tlv_type::NACK_REASON, &reason_bytes);
+
+        // Strip the outer Interest TLV wrapper — Nack embeds the inner value
+        // as a child with type INTEREST.
+        let mut reader = TlvReader::new(Bytes::copy_from_slice(interest_wire));
+        if let Ok((_typ, value)) = reader.read_tlv() {
+            w.write_tlv(tlv_type::INTEREST, &value);
+        }
     });
     w.finish()
 }
@@ -147,6 +178,27 @@ mod tests {
         let data = Data::decode(bytes).unwrap();
         let mi = data.meta_info().expect("meta_info present");
         assert_eq!(mi.freshness_period, Some(Duration::from_millis(0)));
+    }
+
+    #[test]
+    fn nack_roundtrip() {
+        use crate::{Nack, NackReason};
+        let n = name(&[b"test", b"nack"]);
+        let interest_wire = encode_interest(&n, None);
+        let nack_wire = encode_nack(NackReason::NoRoute, &interest_wire);
+        let nack = Nack::decode(nack_wire).unwrap();
+        assert_eq!(nack.reason, NackReason::NoRoute);
+        assert_eq!(*nack.interest.name, n);
+    }
+
+    #[test]
+    fn nack_congestion_roundtrip() {
+        use crate::{Nack, NackReason};
+        let n = name(&[b"hello"]);
+        let interest_wire = encode_interest(&n, None);
+        let nack_wire = encode_nack(NackReason::Congestion, &interest_wire);
+        let nack = Nack::decode(nack_wire).unwrap();
+        assert_eq!(nack.reason, NackReason::Congestion);
     }
 
     #[test]

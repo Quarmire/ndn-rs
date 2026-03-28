@@ -95,9 +95,11 @@ impl EngineBuilder {
             cs_lookup:  CsLookupStage { cs: Arc::clone(&cs) },
             pit_check:  PitCheckStage { pit: Arc::clone(&pit) },
             strategy:   StrategyStage {
-                strategy:     strategy,
+                strategy,
                 fib:          Arc::clone(&fib),
                 measurements: Arc::clone(&measurements),
+                pit:          Arc::clone(&pit),
+                face_table:   Arc::clone(&face_table),
             },
             pit_match:   PitMatchStage { pit: Arc::clone(&pit) },
             cs_insert:   CsInsertStage { cs: Arc::clone(&cs) },

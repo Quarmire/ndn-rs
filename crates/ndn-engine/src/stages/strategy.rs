@@ -5,6 +5,7 @@ use std::sync::Arc;
 use smallvec::SmallVec;
 
 use ndn_pipeline::{Action, DecodedPacket, DropReason, ForwardingAction, NackReason, PacketContext};
+use ndn_store::Pit;
 use ndn_strategy::{MeasurementsTable, Strategy, StrategyContext};
 use crate::Fib;
 
@@ -14,6 +15,12 @@ pub trait ErasedStrategy: Send + Sync + 'static {
         &'a self,
         ctx: &'a StrategyContext<'a>,
     ) -> Pin<Box<dyn Future<Output = SmallVec<[ForwardingAction; 2]>> + Send + 'a>>;
+
+    fn on_nack_erased<'a>(
+        &'a self,
+        ctx: &'a StrategyContext<'a>,
+        reason: NackReason,
+    ) -> Pin<Box<dyn Future<Output = ForwardingAction> + Send + 'a>>;
 }
 
 impl<S: Strategy> ErasedStrategy for S {
@@ -23,6 +30,20 @@ impl<S: Strategy> ErasedStrategy for S {
     ) -> Pin<Box<dyn Future<Output = SmallVec<[ForwardingAction; 2]>> + Send + 'a>> {
         Box::pin(self.after_receive_interest(ctx))
     }
+
+    fn on_nack_erased<'a>(
+        &'a self,
+        ctx: &'a StrategyContext<'a>,
+        reason: NackReason,
+    ) -> Pin<Box<dyn Future<Output = ForwardingAction> + Send + 'a>> {
+        let strategy_reason = match reason {
+            NackReason::NoRoute    => ndn_pipeline::NackReason::NoRoute,
+            NackReason::Duplicate  => ndn_pipeline::NackReason::Duplicate,
+            NackReason::Congestion => ndn_pipeline::NackReason::Congestion,
+            NackReason::NotYet     => ndn_pipeline::NackReason::NotYet,
+        };
+        Box::pin(self.on_nack(ctx, strategy_reason))
+    }
 }
 
 /// Calls the strategy to produce a forwarding decision for Interests.
@@ -30,6 +51,8 @@ pub struct StrategyStage {
     pub strategy:     Arc<dyn ErasedStrategy>,
     pub fib:          Arc<Fib>,
     pub measurements: Arc<MeasurementsTable>,
+    pub pit:          Arc<Pit>,
+    pub face_table:   Arc<ndn_transport::FaceTable>,
 }
 
 impl StrategyStage {
@@ -76,14 +99,37 @@ impl StrategyStage {
                     let out = ctx.out_faces.clone();
                     return Action::Send(ctx, out);
                 }
-                ForwardingAction::ForwardAfter { faces, delay: _ } => {
-                    // Forward immediately (delay scheduling not yet implemented).
-                    ctx.out_faces.extend_from_slice(&faces);
-                    let out = ctx.out_faces.clone();
-                    return Action::Send(ctx, out);
+                ForwardingAction::ForwardAfter { faces, delay } => {
+                    // Spawn a delayed send: sleep, re-check PIT, then forward.
+                    let pit = Arc::clone(&self.pit);
+                    let face_table = Arc::clone(&self.face_table);
+                    let raw_bytes = ctx.raw_bytes.clone();
+                    let pit_token = ctx.pit_token;
+                    tokio::spawn(async move {
+                        tokio::time::sleep(delay).await;
+                        // Re-check PIT — if the entry was already satisfied or
+                        // expired, do not send (the Interest is no longer pending).
+                        if let Some(token) = pit_token {
+                            if pit.get(&token).is_none() {
+                                return; // PIT entry gone — already satisfied/expired.
+                            }
+                        }
+                        for face_id in &faces {
+                            if let Some(face) = face_table.get(*face_id) {
+                                let _ = face.send_bytes(raw_bytes.clone()).await;
+                            }
+                        }
+                    });
+                    return Action::Drop(DropReason::Other); // consumed by delayed task
                 }
-                ForwardingAction::Nack(_reason) => {
-                    return Action::Nack(NackReason::NoRoute);
+                ForwardingAction::Nack(reason) => {
+                    let nr = match reason {
+                        NackReason::NoRoute    => NackReason::NoRoute,
+                        NackReason::Duplicate  => NackReason::Duplicate,
+                        NackReason::Congestion => NackReason::Congestion,
+                        NackReason::NotYet     => NackReason::NotYet,
+                    };
+                    return Action::Nack(ctx, nr);
                 }
                 ForwardingAction::Suppress => {
                     return Action::Drop(DropReason::Suppressed);
@@ -92,6 +138,6 @@ impl StrategyStage {
         }
 
         // No actionable forwarding decision → no route.
-        Action::Nack(NackReason::NoRoute)
+        Action::Nack(ctx, NackReason::NoRoute)
     }
 }

@@ -7,8 +7,9 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
-use ndn_pipeline::{Action, DecodedPacket, PacketContext};
-use ndn_store::CsEntry;
+use ndn_packet::encode::encode_nack;
+use ndn_pipeline::{Action, DecodedPacket, ForwardingAction, NackReason, PacketContext};
+use ndn_store::{CsEntry, PitToken};
 use ndn_transport::{FaceError, FaceId, FaceTable, FaceKind};
 
 use crate::stages::{
@@ -105,9 +106,7 @@ impl PacketDispatcher {
         match &ctx.packet {
             DecodedPacket::Interest(_) => self.interest_pipeline(ctx).await,
             DecodedPacket::Data(_)     => self.data_pipeline(ctx).await,
-            DecodedPacket::Nack(_)     => {
-                debug!(face=?ctx.face_id, "nack handling not yet implemented");
-            }
+            DecodedPacket::Nack(_)     => self.nack_pipeline(ctx).await,
             DecodedPacket::Raw         => {}
         }
     }
@@ -131,6 +130,94 @@ impl PacketDispatcher {
         // 4. Strategy.
         let action = self.strategy.process(ctx).await;
         self.dispatch_action(action).await;
+    }
+
+    /// Nack pipeline: look up PIT out-record, consult strategy, act on result.
+    ///
+    /// When a Nack arrives for an Interest we forwarded, the strategy gets to
+    /// decide: try an alternate nexthop (`Forward`), give up (`Nack` back to
+    /// all in-record consumers), or suppress.
+    async fn nack_pipeline(&self, ctx: PacketContext) {
+        let nack = match &ctx.packet {
+            DecodedPacket::Nack(n) => n,
+            _ => return,
+        };
+
+        let name = match &ctx.name {
+            Some(n) => n.clone(),
+            None => return,
+        };
+
+        // Look up PIT entry by the nacked Interest's name.
+        let token = PitToken::from_interest(&nack.interest.name, Some(nack.interest.selectors()));
+
+        let has_pit_entry = self.strategy.pit.get(&token).is_some();
+        if !has_pit_entry {
+            debug!(face=?ctx.face_id, "nack for unknown PIT entry, dropping");
+            return;
+        }
+
+        // Build strategy context and ask the strategy what to do.
+        let fib_entry_arc = self.strategy.fib.lpm(&name);
+        let fib_entry_ref = fib_entry_arc.as_deref();
+        let strategy_fib: Option<ndn_strategy::FibEntry> = fib_entry_ref.map(|e| {
+            ndn_strategy::FibEntry {
+                nexthops: e.nexthops.iter().map(|nh| ndn_strategy::FibNexthop {
+                    face_id: nh.face_id,
+                    cost:    nh.cost,
+                }).collect(),
+            }
+        });
+
+        let sctx = ndn_strategy::StrategyContext {
+            name:         &name,
+            in_face:      ctx.face_id,
+            fib_entry:    strategy_fib.as_ref(),
+            pit_token:    Some(token),
+            measurements: &self.strategy.measurements,
+        };
+
+        let nack_reason = match nack.reason {
+            ndn_packet::NackReason::NoRoute    => NackReason::NoRoute,
+            ndn_packet::NackReason::Duplicate  => NackReason::Duplicate,
+            ndn_packet::NackReason::Congestion => NackReason::Congestion,
+            ndn_packet::NackReason::NotYet     => NackReason::NotYet,
+            ndn_packet::NackReason::Other(_)   => NackReason::NoRoute,
+        };
+
+        let action = self.strategy.strategy.on_nack_erased(&sctx, nack_reason).await;
+        match action {
+            ForwardingAction::Forward(faces) => {
+                // Strategy chose alternate nexthops — forward the original Interest.
+                for face_id in &faces {
+                    if let Some(face) = self.face_table.get(*face_id) {
+                        // Re-send the original Interest (the one inside the Nack).
+                        if let Err(e) = face.send_bytes(nack.interest.raw().clone()).await {
+                            warn!(face=%face_id, error=%e, "nack retry forward failed");
+                        }
+                    }
+                }
+            }
+            ForwardingAction::Nack(_reason) => {
+                // Strategy gave up — propagate Nack back to all in-record consumers.
+                if let Some((_, entry)) = self.strategy.pit.remove(&token) {
+                    let interest_wire = nack.interest.raw().clone();
+                    let packet_reason = nack.reason;
+                    for face_id_raw in entry.in_record_faces() {
+                        let face_id = FaceId(face_id_raw);
+                        if let Some(face) = self.face_table.get(face_id) {
+                            let nack_bytes = encode_nack(packet_reason, &interest_wire);
+                            if let Err(e) = face.send_bytes(nack_bytes).await {
+                                warn!(face=%face_id, error=%e, "nack propagation failed");
+                            }
+                        }
+                    }
+                }
+            }
+            ForwardingAction::Suppress | ForwardingAction::ForwardAfter { .. } => {
+                debug!("nack suppressed by strategy");
+            }
+        }
     }
 
     async fn data_pipeline(&self, ctx: PacketContext) {
@@ -159,7 +246,22 @@ impl PacketDispatcher {
             }
             Action::Satisfy(ctx) => self.satisfy(ctx).await,
             Action::Drop(r)      => debug!(reason=?r, "packet dropped"),
-            Action::Nack(_)      => debug!("nack response not yet implemented"),
+            Action::Nack(ctx, reason) => {
+                // Encode a Nack wrapping the original Interest and send it
+                // back to the face that originated the Interest.
+                let packet_reason = match reason {
+                    NackReason::NoRoute    => ndn_packet::NackReason::NoRoute,
+                    NackReason::Duplicate  => ndn_packet::NackReason::Duplicate,
+                    NackReason::Congestion => ndn_packet::NackReason::Congestion,
+                    NackReason::NotYet     => ndn_packet::NackReason::NotYet,
+                };
+                let nack_bytes = encode_nack(packet_reason, &ctx.raw_bytes);
+                if let Some(face) = self.face_table.get(ctx.face_id) {
+                    if let Err(e) = face.send_bytes(nack_bytes).await {
+                        warn!(face=%ctx.face_id, error=%e, "nack send failed");
+                    }
+                }
+            }
             Action::Continue(_)  => {} // fell off end of pipeline
         }
     }
