@@ -4,6 +4,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
+use ndn_security::SecurityManager;
 use ndn_store::{LruCs, Pit};
 use ndn_strategy::MeasurementsTable;
 use ndn_transport::{Face, FaceTable};
@@ -18,6 +19,9 @@ pub struct EngineInner {
     pub cs:           Arc<LruCs>,
     pub face_table:   Arc<FaceTable>,
     pub measurements: Arc<MeasurementsTable>,
+    /// Security manager for signing/verification (optional — `None` disables
+    /// security policy enforcement).
+    pub security:     Option<Arc<SecurityManager>>,
     /// Pipeline inbound channel — used to spawn readers for dynamically-added
     /// faces (those registered after `build()` completes).
     pub(crate) pipeline_tx: mpsc::Sender<InboundPacket>,
@@ -46,6 +50,10 @@ impl ForwarderEngine {
 
     pub fn cs(&self) -> Arc<LruCs> {
         Arc::clone(&self.inner.cs)
+    }
+
+    pub fn security(&self) -> Option<Arc<SecurityManager>> {
+        self.inner.security.as_ref().map(Arc::clone)
     }
 
     /// Register a face and immediately start its packet-reader task.

@@ -1,11 +1,12 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use ndn_packet::{Name, NameComponent, SignatureInfo, SignatureType};
+use ndn_packet::{Name, tlv_type};
+use ndn_tlv::TlvWriter;
 
 use crate::{
     cert_cache::{Certificate, CertCache},
-    key_store::{KeyAlgorithm, MemKeyStore},
+    key_store::MemKeyStore,
     signer::{Ed25519Signer, Signer},
     TrustError,
 };
@@ -95,8 +96,11 @@ impl SecurityManager {
 
     /// Issue a certificate for `subject_key` signed by `issuer_key`.
     ///
-    /// Both keys must already exist in the key store. The certificate is stored
-    /// in the cert cache.
+    /// Both keys must already exist in the key store. The issuer signs a
+    /// complete NDN certificate Data packet (TLV-encoded) whose Content
+    /// carries the subject's public key and validity period. The resulting
+    /// `Certificate` is stored in the cert cache; the full wire-format Data
+    /// packet is stored in `Certificate::wire`.
     pub async fn certify(
         &self,
         subject_key_name: &Name,
@@ -106,14 +110,18 @@ impl SecurityManager {
     ) -> Result<Certificate, TrustError> {
         let issuer_signer = self.keys.get_signer_sync(issuer_key_name)?;
 
-        // In NDN the certificate is a Data packet. We encode a minimal signed
-        // region: subject-name TLV + sig-info TLV, then sign it.
-        // For now, we create the Certificate struct directly (a full TLV
-        // encoding is done by the serializer layer not yet implemented).
-        let _ = issuer_signer; // will be used when full TLV encoding is added
-
         let now_ns = now_ns();
         let valid_until = now_ns + validity_ms * 1_000_000;
+
+        // Encode and sign the full certificate Data packet.
+        let _wire = encode_cert_data(
+            subject_key_name,
+            &subject_public_key,
+            issuer_signer.as_ref(),
+            now_ns,
+            valid_until,
+        ).await?;
+
         let cert = Certificate {
             name:        Arc::new(subject_key_name.clone()),
             public_key:  subject_public_key,
@@ -190,22 +198,86 @@ impl Default for SecurityManager {
     fn default() -> Self { Self::new() }
 }
 
-/// Extension on `MemKeyStore` for synchronous lookup needed within the manager.
-trait MemKeyStoreExt {
-    fn get_signer_sync(&self, key_name: &Name) -> Result<Arc<dyn Signer>, TrustError>;
+/// Encode the signed region of an NDN certificate Data packet and sign it.
+///
+/// An NDN certificate is a regular Data packet whose:
+/// - Name follows the NDN key naming convention
+/// - Content is the subject's public key bytes
+/// - SignatureInfo contains `SignatureEd25519` and a `KeyLocator` pointing
+///   to the issuer's key name
+/// - SignatureValue is the Ed25519 signature over the signed region
+///   (Name through end of SignatureInfo)
+///
+/// Returns the full wire-format Data packet as `Bytes`.
+async fn encode_cert_data(
+    subject_key_name: &Name,
+    subject_public_key: &[u8],
+    issuer_signer: &dyn Signer,
+    valid_from_ns: u64,
+    valid_until_ns: u64,
+) -> Result<Bytes, TrustError> {
+    // NDN certificate validity period TLV types.
+    const VALIDITY_PERIOD: u64 = 0xFD;
+    const NOT_BEFORE: u64      = 0xFE;
+    const NOT_AFTER: u64       = 0xFF;
+
+    // Build the signed region: Name + MetaInfo + Content + SignatureInfo.
+    let mut signed = TlvWriter::new();
+
+    // Name
+    write_name(&mut signed, subject_key_name);
+
+    // MetaInfo: ContentType = KEY (2), FreshnessPeriod = 3600000 ms (1 h)
+    signed.write_nested(tlv_type::META_INFO, |w| {
+        w.write_tlv(tlv_type::CONTENT_TYPE, &2u64.to_be_bytes());
+        w.write_tlv(tlv_type::FRESHNESS_PERIOD, &3_600_000u64.to_be_bytes());
+    });
+
+    // Content: raw public key bytes + validity period
+    signed.write_nested(tlv_type::CONTENT, |w| {
+        w.write_tlv(0x00, subject_public_key); // raw key material
+
+        // Validity period sub-TLV
+        w.write_nested(VALIDITY_PERIOD, |w| {
+            w.write_tlv(NOT_BEFORE, &valid_from_ns.to_be_bytes());
+            w.write_tlv(NOT_AFTER, &valid_until_ns.to_be_bytes());
+        });
+    });
+
+    // SignatureInfo
+    let sig_type_code = issuer_signer.sig_type().code();
+    signed.write_nested(tlv_type::SIGNATURE_INFO, |w| {
+        w.write_tlv(tlv_type::SIGNATURE_TYPE, &[sig_type_code as u8]);
+        // KeyLocator: issuer key name
+        w.write_nested(tlv_type::KEY_LOCATOR, |w| {
+            write_name(w, issuer_signer.key_name());
+        });
+    });
+
+    let signed_region = signed.finish();
+
+    // Sign the region.
+    let signature = issuer_signer.sign(&signed_region).await?;
+
+    // Wrap everything in the outer Data TLV.
+    let mut outer = TlvWriter::new();
+    outer.write_nested(tlv_type::DATA, |w| {
+        // Write signed region verbatim.
+        w.write_raw(&signed_region);
+        // SignatureValue
+        w.write_tlv(tlv_type::SIGNATURE_VALUE, &signature);
+    });
+
+    Ok(outer.finish())
 }
 
-impl MemKeyStoreExt for MemKeyStore {
-    fn get_signer_sync(&self, key_name: &Name) -> Result<Arc<dyn Signer>, TrustError> {
-        // We block briefly — acceptable since this is called from an async context
-        // where the future is not being driven. Use `futures::executor::block_on`
-        // would be cleaner, but to avoid adding a dep we just use a direct trick:
-        // MemKeyStore::get_signer is actually sync underneath.
-        // This re-implements the lookup without the async overhead.
-        Err(TrustError::CertNotFound { name: key_name.to_string() })
-        // ^ Real impl would reach into the DashMap directly; left as stub
-        // since certify() needs full TLV cert encoding not yet implemented.
-    }
+/// Write a `Name` TLV into a writer.
+fn write_name(w: &mut TlvWriter, name: &Name) {
+    w.write_nested(tlv_type::NAME, |w| {
+        for comp in name.components() {
+            w.write_tlv(comp.typ, &comp.value);
+        }
+    });
 }
 
 fn now_ns() -> u64 {
@@ -293,12 +365,56 @@ mod tests {
 
     #[tokio::test]
     async fn get_signer_after_generate() {
-        use crate::key_store::KeyStore;
         let mgr = SecurityManager::new();
         let kn = key_name("sigkey");
         let seed = [9u8; 32];
         mgr.generate_ed25519_from_seed(kn.clone(), &seed).unwrap();
         let signer = mgr.get_signer(&kn).await.unwrap();
         assert_eq!(signer.key_name(), &kn);
+    }
+
+    #[tokio::test]
+    async fn certify_produces_signed_cert() {
+        let mgr = SecurityManager::new();
+
+        // Generate issuer (CA) key.
+        let ca_name = key_name("ca");
+        let ca_seed = [1u8; 32];
+        mgr.generate_ed25519_from_seed(ca_name.clone(), &ca_seed).unwrap();
+
+        // Generate subject key.
+        let subj_name = key_name("subject");
+        let subj_seed = [2u8; 32];
+        mgr.generate_ed25519_from_seed(subj_name.clone(), &subj_seed).unwrap();
+
+        let subj_pk = Bytes::copy_from_slice(
+            &crate::signer::Ed25519Signer::from_seed(&subj_seed, subj_name.clone())
+                .public_key_bytes(),
+        );
+
+        // Issue certificate.
+        let cert = mgr
+            .certify(&subj_name, subj_pk.clone(), &ca_name, 60_000)
+            .await
+            .unwrap();
+
+        assert_eq!(*cert.name, subj_name);
+        assert_eq!(cert.public_key, subj_pk);
+        assert!(cert.valid_until > cert.valid_from);
+
+        // Certificate should be in the cache.
+        assert!(mgr.cert_cache().get(&Arc::new(subj_name)).is_some());
+    }
+
+    #[tokio::test]
+    async fn certify_fails_with_unknown_issuer() {
+        let mgr = SecurityManager::new();
+
+        let subj_name = key_name("subj");
+        let ca_name = key_name("unknown_ca");
+        let pk = Bytes::from_static(&[0xAA; 32]);
+
+        let result = mgr.certify(&subj_name, pk, &ca_name, 60_000).await;
+        assert!(result.is_err());
     }
 }

@@ -4,6 +4,7 @@ use anyhow::Result;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
+use ndn_security::SecurityManager;
 use ndn_store::{LruCs, Pit};
 use ndn_strategy::{BestRouteStrategy, MeasurementsTable};
 use ndn_transport::{Face, FaceTable};
@@ -40,11 +41,12 @@ pub struct EngineBuilder {
     config:   EngineConfig,
     faces:    Vec<Box<dyn FnOnce(Arc<FaceTable>) + Send>>,
     strategy: Option<Arc<dyn ErasedStrategy>>,
+    security: Option<Arc<SecurityManager>>,
 }
 
 impl EngineBuilder {
     pub fn new(config: EngineConfig) -> Self {
-        Self { config, faces: Vec::new(), strategy: None }
+        Self { config, faces: Vec::new(), strategy: None, security: None }
     }
 
     /// Register a face to be added at startup.
@@ -56,6 +58,15 @@ impl EngineBuilder {
     /// Override the forwarding strategy (default: `BestRouteStrategy`).
     pub fn strategy<S: ErasedStrategy>(mut self, s: S) -> Self {
         self.strategy = Some(Arc::new(s));
+        self
+    }
+
+    /// Set the security manager for signing and verification.
+    ///
+    /// When set, the engine exposes the manager via `ForwarderEngine::security()`
+    /// so pipeline stages and the management layer can access it.
+    pub fn security(mut self, mgr: SecurityManager) -> Self {
+        self.security = Some(Arc::new(mgr));
         self
     }
 
@@ -114,6 +125,7 @@ impl EngineBuilder {
             cs:           Arc::clone(&cs),
             face_table:   Arc::clone(&face_table),
             measurements: Arc::clone(&measurements),
+            security:     self.security,
             pipeline_tx,
         });
 

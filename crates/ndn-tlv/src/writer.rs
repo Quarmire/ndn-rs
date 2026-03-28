@@ -55,6 +55,13 @@ impl TlvWriter {
         len_bytes[1..5].copy_from_slice(&(content_len as u32).to_be_bytes());
     }
 
+    /// Write raw bytes directly into the buffer (no TLV framing).
+    ///
+    /// Used when embedding a pre-encoded signed region into an outer TLV.
+    pub fn write_raw(&mut self, data: &[u8]) {
+        self.buf.put_slice(data);
+    }
+
     /// Freeze and return the encoded bytes.
     pub fn finish(self) -> bytes::Bytes {
         self.buf.freeze()

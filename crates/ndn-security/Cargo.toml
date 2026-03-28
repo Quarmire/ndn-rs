@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 ndn-packet    = { workspace = true }
+ndn-tlv       = { workspace = true }
 bytes         = { workspace = true }
 dashmap       = { workspace = true }
 thiserror     = { workspace = true }
@@ -14,6 +15,5 @@ ring          = { workspace = true }
 ed25519-dalek = { workspace = true }
 
 [dev-dependencies]
-ndn-tlv    = { workspace = true }
 tokio      = { workspace = true, features = ["rt", "macros"] }
 tempfile   = "3"

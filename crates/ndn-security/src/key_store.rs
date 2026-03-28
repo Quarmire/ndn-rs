@@ -40,6 +40,15 @@ impl MemKeyStore {
         Self { keys: DashMap::new() }
     }
 
+    /// Look up a signer synchronously (for crate-internal use).
+    pub(crate) fn get_signer_sync(&self, key_name: &Name) -> Result<Arc<dyn Signer>, TrustError> {
+        self.keys
+            .iter()
+            .find(|r| r.key().as_ref() == key_name)
+            .map(|r| Arc::clone(r.value()))
+            .ok_or_else(|| TrustError::CertNotFound { name: key_name.to_string() })
+    }
+
     pub fn add<S: Signer>(&self, key_name: Arc<Name>, signer: S) {
         self.keys.insert(key_name, Arc::new(signer));
     }
