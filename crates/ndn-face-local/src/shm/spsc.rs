@@ -1,8 +1,21 @@
 //! Custom SPSC shared-memory face (Unix only, `spsc-shm` feature).
 //!
 //! A named POSIX SHM region holds two lock-free single-producer/single-consumer
-//! ring buffers — one for each direction.  Wakeup notifications use a pair of
-//! Unix datagram sockets whose paths are derived from the face name.
+//! ring buffers — one for each direction.  Wakeup uses a platform-selected
+//! primitive:
+//!
+//! - **Linux**: futex via the `atomic-wait` crate.  The parked `AtomicU32` in
+//!   SHM IS the synchronisation primitive — no extra file descriptors needed.
+//!   `atomic_wait::wait(parked, 1)` blocks until `wake_one` is called by the
+//!   producer.  The futex syscall keys on the physical page offset, so it
+//!   works cross-process over POSIX SHM.
+//!
+//! - **Other Unix (macOS, etc.)**: named FIFO (pipe) pair.  The engine creates
+//!   two FIFOs (`/tmp/.ndn-{name}.a2e.pipe` and `.e2a.pipe`); both sides open
+//!   them `O_RDWR | O_NONBLOCK` (avoids the blocking-open problem).  The
+//!   consumer awaits readability via `tokio::io::unix::AsyncFd`; the producer
+//!   writes 1 non-blocking byte.  The parked flag is still used to avoid
+//!   unnecessary writes when the consumer is active.
 //!
 //! # SHM layout
 //!
@@ -17,27 +30,19 @@
 //! Data block (off 448–N):     a2e ring (capacity × slot_stride bytes)
 //! Data block (off N–end):     e2a ring (capacity × slot_stride bytes)
 //!   slot_stride = 4 (length prefix) + slot_size (payload area)
+//! ```
 //!
 //! # Conditional wakeup protocol
 //!
-//! The wakeup datagram (one byte sent via `sendmsg`) is only sent when the
-//! consumer is genuinely sleeping.  The producer checks the parked flag with
-//! `SeqCst` ordering after writing to the ring; the consumer stores the parked
-//! flag with `SeqCst` before its second ring check.  This total-order guarantee
-//! prevents the producer from missing a sleeping consumer.
-//! ```
-//!
-//! # Wakeup sockets
-//!
-//! Each side owns one bound `UnixDatagram` socket:
-//! - Engine: `/tmp/.ndn-{name}.e.sock` — receives one-byte wakeups from app
-//! - App:    `/tmp/.ndn-{name}.a.sock` — receives one-byte wakeups from engine
+//! The producer checks the parked flag with `SeqCst` after writing to the
+//! ring; the consumer stores the parked flag with `SeqCst` before its second
+//! ring check.  This total-order guarantee prevents the producer from missing
+//! a sleeping consumer.
 use std::ffi::CString;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use bytes::Bytes;
-use tokio::net::UnixDatagram;
 
 use ndn_transport::{Face, FaceError, FaceId, FaceKind};
 
@@ -76,8 +81,18 @@ fn e2a_ring_offset(capacity: u32, slot_size: u32) -> usize {
 // ─── Path helpers ─────────────────────────────────────────────────────────────
 
 fn posix_shm_name(name: &str) -> String { format!("/ndn-shm-{name}") }
-fn engine_sock_path(name: &str) -> PathBuf { PathBuf::from(format!("/tmp/.ndn-{name}.e.sock")) }
-fn app_sock_path(name: &str) -> PathBuf    { PathBuf::from(format!("/tmp/.ndn-{name}.a.sock")) }
+
+/// Path of the FIFO the *engine* reads from (app writes to wake engine).
+#[cfg(not(target_os = "linux"))]
+fn a2e_pipe_path(name: &str) -> PathBuf {
+    PathBuf::from(format!("/tmp/.ndn-{name}.a2e.pipe"))
+}
+
+/// Path of the FIFO the *app* reads from (engine writes to wake app).
+#[cfg(not(target_os = "linux"))]
+fn e2a_pipe_path(name: &str) -> PathBuf {
+    PathBuf::from(format!("/tmp/.ndn-{name}.e2a.pipe"))
+}
 
 // ─── POSIX SHM region ────────────────────────────────────────────────────────
 
@@ -250,6 +265,56 @@ unsafe fn ring_pop(
     Some(data)
 }
 
+// ─── Platform wakeup helpers ──────────────────────────────────────────────────
+
+/// Open a named FIFO (must already exist) with `O_RDWR | O_NONBLOCK`.
+///
+/// `O_RDWR` avoids the blocking-open problem: the open succeeds immediately
+/// even if the other end has not yet opened the FIFO.  Both sides only use
+/// the fd in the direction they own (reads or writes), so no cross-reading
+/// occurs.
+#[cfg(not(target_os = "linux"))]
+fn open_fifo_rdwr(path: &std::path::Path) -> Result<std::os::unix::io::OwnedFd, ShmError> {
+    use std::os::unix::io::{FromRawFd, OwnedFd};
+    let cpath = CString::new(path.to_str().unwrap_or(""))
+        .map_err(|_| ShmError::InvalidName)?;
+    let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDWR | libc::O_NONBLOCK) };
+    if fd == -1 { return Err(ShmError::Io(std::io::Error::last_os_error())); }
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Await readability on the pipe fd, then drain all buffered bytes.
+///
+/// Returns `Err` only if the `AsyncFd` reports an error (fd closed).
+#[cfg(not(target_os = "linux"))]
+async fn pipe_await(
+    rx: &tokio::io::unix::AsyncFd<std::os::unix::io::OwnedFd>,
+) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    loop {
+        let mut guard = rx.readable().await?;
+        let mut buf = [0u8; 64];
+        let fd = rx.get_ref().as_raw_fd();
+        let n = unsafe {
+            libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+        };
+        guard.clear_ready();
+        if n > 0 { return Ok(()); }
+        // n == -1 with EAGAIN means spurious readability — loop and re-wait.
+    }
+}
+
+/// Write one wakeup byte to a non-blocking pipe fd.
+///
+/// Silently ignores `EAGAIN` (pipe buffer full): if the buffer is full the
+/// consumer is already being woken by a previous byte.
+#[cfg(not(target_os = "linux"))]
+fn pipe_write(tx: &std::os::unix::io::OwnedFd) {
+    use std::os::unix::io::AsRawFd;
+    let b = [1u8];
+    unsafe { libc::write(tx.as_raw_fd(), b.as_ptr() as *const libc::c_void, 1); }
+}
+
 // ─── SpscFace (engine side) ───────────────────────────────────────────────────
 
 /// Engine-side SPSC SHM face.
@@ -264,15 +329,23 @@ pub struct SpscFace {
     slot_size: u32,
     a2e_off:   usize,
     e2a_off:   usize,
-    /// Bound engine wakeup socket; receives one-byte signals from the app.
-    sock:      UnixDatagram,
-    sock_path: PathBuf,
-    /// App wakeup socket path; engine sends one-byte signals here.
-    app_path:  PathBuf,
+    // Linux: futex on the parked AtomicU32 in SHM — no extra fields.
+    // Other Unix: named FIFO pair.
+    /// Pipe fd the engine awaits readability on (app writes here to wake engine).
+    #[cfg(not(target_os = "linux"))]
+    a2e_rx:        tokio::io::unix::AsyncFd<std::os::unix::io::OwnedFd>,
+    /// Pipe fd the engine writes to (to wake the app).
+    #[cfg(not(target_os = "linux"))]
+    e2a_tx:        std::os::unix::io::OwnedFd,
+    /// Paths of the FIFOs created by the engine — removed on drop.
+    #[cfg(not(target_os = "linux"))]
+    a2e_pipe_path: PathBuf,
+    #[cfg(not(target_os = "linux"))]
+    e2a_pipe_path: PathBuf,
 }
 
 impl SpscFace {
-    /// Create the SHM region and bind the engine wakeup socket.
+    /// Create the SHM region and set up the wakeup mechanism.
     ///
     /// `name` identifies this face (e.g. `"sensor-0"`); pass it to
     /// [`SpscHandle::connect`] in the application process.
@@ -288,16 +361,42 @@ impl SpscFace {
         let shm     = ShmRegion::create(&posix_shm_name(name), size)?;
         unsafe { shm.write_header(capacity, slot_size); }
 
-        let a2e_off  = a2e_ring_offset();
-        let e2a_off  = e2a_ring_offset(capacity, slot_size);
-        let sock_path = engine_sock_path(name);
-        let app_path  = app_sock_path(name);
+        let a2e_off = a2e_ring_offset();
+        let e2a_off = e2a_ring_offset(capacity, slot_size);
 
-        // Remove any stale socket left by a previous run.
-        let _ = std::fs::remove_file(&sock_path);
-        let sock = UnixDatagram::bind(&sock_path).map_err(ShmError::Io)?;
+        #[cfg(target_os = "linux")]
+        { Ok(SpscFace { id, shm, capacity, slot_size, a2e_off, e2a_off }) }
 
-        Ok(SpscFace { id, shm, capacity, slot_size, a2e_off, e2a_off, sock, sock_path, app_path })
+        #[cfg(not(target_os = "linux"))]
+        {
+            use tokio::io::unix::AsyncFd;
+
+            let a2e_path = a2e_pipe_path(name);
+            let e2a_path = e2a_pipe_path(name);
+
+            // Remove stale FIFOs from a previous run.
+            let _ = std::fs::remove_file(&a2e_path);
+            let _ = std::fs::remove_file(&e2a_path);
+
+            // Create the named FIFOs.
+            for p in [&a2e_path, &e2a_path] {
+                let cp = CString::new(p.to_str().unwrap_or(""))
+                    .map_err(|_| ShmError::InvalidName)?;
+                unsafe { libc::mkfifo(cp.as_ptr(), 0o600); }
+            }
+
+            // Engine reads from a2e (awaits wakeup from app).
+            let a2e_fd = open_fifo_rdwr(&a2e_path)?;
+            let a2e_rx = AsyncFd::new(a2e_fd).map_err(ShmError::Io)?;
+
+            // Engine writes to e2a (sends wakeup to app).
+            let e2a_tx = open_fifo_rdwr(&e2a_path)?;
+
+            Ok(SpscFace {
+                id, shm, capacity, slot_size, a2e_off, e2a_off,
+                a2e_rx, e2a_tx, a2e_pipe_path: a2e_path, e2a_pipe_path: e2a_path,
+            })
+        }
     }
 
     fn try_pop_a2e(&self) -> Option<Bytes> {
@@ -317,7 +416,11 @@ impl SpscFace {
 
 impl Drop for SpscFace {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.sock_path);
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = std::fs::remove_file(&self.a2e_pipe_path);
+            let _ = std::fs::remove_file(&self.e2a_pipe_path);
+        }
     }
 }
 
@@ -326,8 +429,7 @@ impl Face for SpscFace {
     fn kind(&self) -> FaceKind { FaceKind::Shm }
 
     async fn recv(&self) -> Result<Bytes, FaceError> {
-        let mut buf = [0u8; 16];
-        // SAFETY: parked flag is within the mapped SHM region (offset 320 < HEADER_SIZE).
+        // SAFETY: parked flag is within the mapped SHM region.
         let parked = unsafe {
             &*AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_A2E_PARKED) as *mut u32)
         };
@@ -339,19 +441,31 @@ impl Face for SpscFace {
             // load on the parked flag observes this before or after it pushes
             // to the ring — never concurrently missed.
             parked.store(1, Ordering::SeqCst);
-            // Second ring check after marking parked: if the app already pushed
-            // between our first check and the flag store, we see it here and
-            // avoid sleeping unnecessarily.
+            // Second ring check: if the app already pushed between our first
+            // check and the flag store, we see it here and avoid sleeping.
             if let Some(pkt) = self.try_pop_a2e() {
                 parked.store(0, Ordering::Relaxed);
                 return Ok(pkt);
             }
-            // Sleep until the app sends a wakeup datagram.
-            self.sock.recv(&mut buf).await
-                .map_err(|_| FaceError::Closed)?;
+
+            // Sleep until the app sends a wakeup.
+            #[cfg(target_os = "linux")]
+            {
+                // Futex: block this OS thread while parked == 1.
+                // spawn_blocking keeps the async executor responsive.
+                let ptr = parked as *const AtomicU32 as usize;
+                let _ = tokio::task::spawn_blocking(move || {
+                    let p = unsafe { &*(ptr as *const AtomicU32) };
+                    atomic_wait::wait(p, 1);
+                }).await;
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                pipe_await(&self.a2e_rx).await
+                    .map_err(|_| FaceError::Closed)?;
+            }
+
             parked.store(0, Ordering::Relaxed);
-            // Drain extra wakeups that accumulated while we were processing.
-            while self.sock.try_recv(&mut buf).is_ok() {}
         }
     }
 
@@ -371,9 +485,13 @@ impl Face for SpscFace {
             if self.try_push_e2a(&pkt) { break; }
             tokio::task::yield_now().await;
         }
-        // Only send a wakeup datagram if the app is actually sleeping.
+        // Only send a wakeup if the app is actually sleeping.
         if parked.load(Ordering::SeqCst) != 0 {
-            let _ = self.sock.send_to(b"\x01", &self.app_path).await;
+            #[cfg(target_os = "linux")]
+            atomic_wait::wake_one(parked);
+
+            #[cfg(not(target_os = "linux"))]
+            pipe_write(&self.e2a_tx);
         }
         Ok(())
     }
@@ -391,24 +509,19 @@ pub struct SpscHandle {
     slot_size: u32,
     a2e_off:   usize,
     e2a_off:   usize,
-    /// Bound app wakeup socket; receives one-byte signals from the engine.
-    sock:      UnixDatagram,
-    sock_path: PathBuf,
-    /// Engine wakeup socket path; app sends one-byte signals here.
-    eng_path:  PathBuf,
+    // Linux: futex on the parked AtomicU32 in SHM — no extra fields.
+    // Other Unix: named FIFO pair.
+    /// Pipe fd the app awaits readability on (engine writes here to wake app).
+    #[cfg(not(target_os = "linux"))]
+    e2a_rx: tokio::io::unix::AsyncFd<std::os::unix::io::OwnedFd>,
+    /// Pipe fd the app writes to (to wake the engine).
+    #[cfg(not(target_os = "linux"))]
+    a2e_tx: std::os::unix::io::OwnedFd,
 }
 
 impl SpscHandle {
-    /// Open the SHM region created by the engine and bind the app wakeup socket.
+    /// Open the SHM region created by the engine and set up the wakeup mechanism.
     pub fn connect(name: &str) -> Result<Self, ShmError> {
-        // We don't know the size until we read the header.  Open with a
-        // minimum size to read the header, then remap at the full size.
-        // Easier: open with the max possible size and trust the header.
-        // Instead: read header first by opening at header size, validate, then reopen.
-        //
-        // Simplest correct approach: open at max conceivable size.
-        // We actually need to know the size first. Open the SHM at HEADER_SIZE
-        // to read (capacity, slot_size), then close and reopen at full size.
         let shm_name_str = posix_shm_name(name);
         let cname = CString::new(shm_name_str.as_str()).map_err(|_| ShmError::InvalidName)?;
 
@@ -439,19 +552,30 @@ impl SpscHandle {
         // Phase 2: open the full region read-write.
         let size = shm_total_size(capacity, slot_size);
         let shm  = ShmRegion::open(&shm_name_str, size)?;
-
-        // Validate magic again on the full mapping (sanity check).
         unsafe { shm.read_header()? };
 
-        let a2e_off  = a2e_ring_offset();
-        let e2a_off  = e2a_ring_offset(capacity, slot_size);
-        let sock_path = app_sock_path(name);
-        let eng_path  = engine_sock_path(name);
+        let a2e_off = a2e_ring_offset();
+        let e2a_off = e2a_ring_offset(capacity, slot_size);
 
-        let _ = std::fs::remove_file(&sock_path);
-        let sock = UnixDatagram::bind(&sock_path).map_err(ShmError::Io)?;
+        #[cfg(target_os = "linux")]
+        { Ok(SpscHandle { shm, capacity, slot_size, a2e_off, e2a_off }) }
 
-        Ok(SpscHandle { shm, capacity, slot_size, a2e_off, e2a_off, sock, sock_path, eng_path })
+        #[cfg(not(target_os = "linux"))]
+        {
+            use tokio::io::unix::AsyncFd;
+
+            let a2e_path = a2e_pipe_path(name);  // app writes here to wake engine
+            let e2a_path = e2a_pipe_path(name);  // app reads here (engine wakes app)
+
+            // App writes to a2e FIFO (to wake engine).
+            let a2e_tx = open_fifo_rdwr(&a2e_path)?;
+
+            // App reads from e2a FIFO (awaits wakeup from engine).
+            let e2a_fd = open_fifo_rdwr(&e2a_path)?;
+            let e2a_rx = AsyncFd::new(e2a_fd).map_err(ShmError::Io)?;
+
+            Ok(SpscHandle { shm, capacity, slot_size, a2e_off, e2a_off, e2a_rx, a2e_tx })
+        }
     }
 
     fn try_push_a2e(&self, data: &[u8]) -> bool {
@@ -485,16 +609,19 @@ impl SpscHandle {
         }
         // Only send a wakeup if the engine is sleeping on the a2e ring.
         if parked.load(Ordering::SeqCst) != 0 {
-            let _ = self.sock.send_to(b"\x01", &self.eng_path).await;
+            #[cfg(target_os = "linux")]
+            atomic_wait::wake_one(parked);
+
+            #[cfg(not(target_os = "linux"))]
+            pipe_write(&self.a2e_tx);
         }
         Ok(())
     }
 
     /// Receive a packet from the engine (dequeue from the e2a ring).
     ///
-    /// Returns `None` when the engine face has been closed or dropped.
+    /// Returns `None` when the engine face has been dropped.
     pub async fn recv(&self) -> Option<Bytes> {
-        let mut buf = [0u8; 16];
         // SAFETY: parked flag within mapped SHM region.
         let parked = unsafe {
             &*AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_E2A_PARKED) as *mut u32)
@@ -508,18 +635,33 @@ impl SpscHandle {
                 parked.store(0, Ordering::Relaxed);
                 return Some(pkt);
             }
-            if self.sock.recv(&mut buf).await.is_err() {
-                return None;
+
+            #[cfg(target_os = "linux")]
+            {
+                let ptr = parked as *const AtomicU32 as usize;
+                let ok = tokio::task::spawn_blocking(move || {
+                    let p = unsafe { &*(ptr as *const AtomicU32) };
+                    atomic_wait::wait(p, 1);
+                }).await;
+                if ok.is_err() { return None; }
             }
+            #[cfg(not(target_os = "linux"))]
+            {
+                if pipe_await(&self.e2a_rx).await.is_err() {
+                    return None;
+                }
+            }
+
             parked.store(0, Ordering::Relaxed);
-            while self.sock.try_recv(&mut buf).is_ok() {}
         }
     }
 }
 
 impl Drop for SpscHandle {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.sock_path);
+        // ShmRegion handles munmap/shm_unlink.
+        // OwnedFd fields close pipe fds automatically.
+        // The FIFOs themselves are created and removed by SpscFace (engine side).
     }
 }
 
@@ -535,7 +677,9 @@ mod tests {
         format!("test-spsc-{}", std::process::id())
     }
 
-    #[tokio::test]
+    // Tests use multi_thread because SpscFace::recv uses spawn_blocking on
+    // Linux (futex) which requires a multi-threaded runtime.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn face_kind_and_id() {
         let name = test_name();
         let face = SpscFace::create(FaceId(7), &name).unwrap();
@@ -543,7 +687,7 @@ mod tests {
         assert_eq!(face.kind(), FaceKind::Shm);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn app_to_engine_roundtrip() {
         let name   = format!("{}-ae", test_name());
         let face   = SpscFace::create(FaceId(1), &name).unwrap();
@@ -560,7 +704,7 @@ mod tests {
         assert_eq!(received, pkt);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn engine_to_app_roundtrip() {
         let name   = format!("{}-ea", test_name());
         let face   = SpscFace::create(FaceId(2), &name).unwrap();
@@ -577,7 +721,7 @@ mod tests {
         assert_eq!(received, pkt);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn multiple_packets_both_directions() {
         let name   = format!("{}-bi", test_name());
         let face   = SpscFace::create(FaceId(3), &name).unwrap();
