@@ -300,7 +300,12 @@ async fn pipe_await(
         };
         guard.clear_ready();
         if n > 0 { return Ok(()); }
-        // n == -1 with EAGAIN means spurious readability — loop and re-wait.
+        if n == -1 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() != std::io::ErrorKind::WouldBlock {
+                return Err(err);
+            }
+        }
     }
 }
 
@@ -382,7 +387,9 @@ impl SpscFace {
             for p in [&a2e_path, &e2a_path] {
                 let cp = CString::new(p.to_str().unwrap_or(""))
                     .map_err(|_| ShmError::InvalidName)?;
-                unsafe { libc::mkfifo(cp.as_ptr(), 0o600); }
+                if unsafe { libc::mkfifo(cp.as_ptr(), 0o600) } == -1 {
+                    return Err(ShmError::Io(std::io::Error::last_os_error()));
+                }
             }
 
             // Engine reads from a2e (awaits wakeup from app).
@@ -657,13 +664,8 @@ impl SpscHandle {
     }
 }
 
-impl Drop for SpscHandle {
-    fn drop(&mut self) {
-        // ShmRegion handles munmap/shm_unlink.
-        // OwnedFd fields close pipe fds automatically.
-        // The FIFOs themselves are created and removed by SpscFace (engine side).
-    }
-}
+// SpscHandle has no Drop impl: ShmRegion handles munmap, OwnedFd closes pipe
+// fds, and the FIFOs are created/removed by SpscFace (engine side).
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
