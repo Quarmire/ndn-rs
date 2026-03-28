@@ -6,9 +6,10 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-## Custom SPSC ring-buffer SHM face backed by POSIX shm_open + Unix datagram
-## wakeup sockets.  Unix only.  Enabled by default on Unix targets.
-spsc-shm = ["dep:libc"]
+## Custom SPSC ring-buffer SHM face.
+## Wakeup: futex on Linux (atomic-wait), named FIFO pipe on other Unix.
+## Requires POSIX shm_open.  Unix only.
+spsc-shm = ["dep:libc", "dep:atomic-wait"]
 
 
 [dependencies]
@@ -21,10 +22,11 @@ futures       = { workspace = true }
 thiserror     = { workspace = true }
 tracing       = { workspace = true }
 libc          = { workspace = true, optional = true }
+atomic-wait   = { workspace = true, optional = true }
 
 [dev-dependencies]
 ndn-tlv   = { workspace = true }
-tokio     = { workspace = true, features = ["rt", "macros", "net", "time"] }
+tokio     = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "net", "time"] }
 criterion = { workspace = true }
 
 [[bench]]

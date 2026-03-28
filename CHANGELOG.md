@@ -366,6 +366,56 @@ Running total across all crates: **337 tests**, all passing.
 
 ---
 
+## [Unreleased — SPSC futex / pipe wakeup]
+
+### Changed
+
+#### `ndn-face-local` — platform-native wakeup replaces `UnixDatagram`
+
+The per-packet wakeup mechanism in `SpscFace` / `SpscHandle` now uses the
+fastest primitive available on each platform.  The parked-flag protocol
+(SeqCst store → second ring check → sleep) is unchanged; only the
+sleep/wake primitive changes.
+
+**Linux — futex via `atomic-wait`**
+
+`atomic_wait::wait(parked, 1)` blocks the OS thread while `parked == 1`;
+the producer calls `atomic_wait::wake_one(parked)` to unblock.  The futex
+syscall keys on the physical SHM page offset, so it works cross-process
+without any additional file descriptor.  The wait runs inside
+`tokio::task::spawn_blocking` to keep the async executor responsive.
+
+**macOS / other Unix — named FIFO pair**
+
+`SpscFace::create` creates two named FIFOs
+(`/tmp/.ndn-{name}.a2e.pipe`, `.e2a.pipe`) and opens them with
+`O_RDWR | O_NONBLOCK` (avoids the blocking-open problem: neither side
+needs to wait for the other to open).  The consumer awaits readability via
+`tokio::io::unix::AsyncFd` (backed by kqueue); the producer writes 1 byte
+via a direct non-blocking `libc::write`.  Silently ignores `EAGAIN` on the
+write — if the pipe buffer is full the consumer already has a pending
+wakeup.
+
+**Removed**: `tokio::net::UnixDatagram` fields (`sock`, `sock_path`,
+`app_path` / `eng_path`) from both `SpscFace` and `SpscHandle`.  On Linux
+those structs now carry **no extra fields** beyond the SHM region.
+
+#### Dependency
+
+- `atomic-wait = "1"` added to workspace dependencies and to the
+  `ndn-face-local` `spsc-shm` feature (`spsc-shm = ["dep:libc",
+  "dep:atomic-wait"]`).  The crate is compiled on all platforms but its
+  symbols are only referenced under `#[cfg(target_os = "linux")]`.
+
+#### Tests
+
+All four `shm::spsc` tests updated to
+`#[tokio::test(flavor = "multi_thread", worker_threads = 2)]` — required
+because `spawn_blocking` panics in a `current_thread` runtime.
+`rt-multi-thread` added to `ndn-face-local` dev-dependency tokio features.
+
+---
+
 ## [Unreleased — SPSC parked-flag optimization, iceoryx2 bridge redesign]
 
 ### Removed
