@@ -69,10 +69,11 @@ impl TlvReader {
 
     /// Skip an unknown TLV element, respecting the critical-bit rule.
     ///
-    /// Odd type numbers are critical — encountering one is an error.
-    /// Even type numbers are non-critical — skip silently.
+    /// Types 0–31 are always critical (grandfathered, NDN Packet Format v0.3
+    /// §1.3). For types >= 32, odd numbers are critical and even are
+    /// non-critical.
     pub fn skip_unknown(&mut self, typ: u64) -> Result<(), TlvError> {
-        if typ & 1 == 1 {
+        if typ <= 31 || typ & 1 == 1 {
             return Err(TlvError::UnknownCriticalType(typ));
         }
         let len = self.read_length()?;
@@ -189,17 +190,28 @@ mod tests {
     // ── skip_unknown (critical-bit rule) ──────────────────────────────────────
 
     #[test]
-    fn skip_unknown_even_type_succeeds() {
-        // Type 0x12 (18) is even → non-critical, must skip silently.
-        let raw = Bytes::from(vec![0x12, 0x02, 0xAA, 0xBB, 0x08, 0x01, 0x42]);
+    fn skip_unknown_even_type_above_31_succeeds() {
+        // Type 0x22 (34) is even and >= 32 → non-critical, must skip silently.
+        let raw = Bytes::from(vec![0x22, 0x02, 0xAA, 0xBB, 0x08, 0x01, 0x42]);
         let mut r = TlvReader::new(raw);
         let typ = r.read_type().unwrap();
-        assert_eq!(typ, 0x12);
+        assert_eq!(typ, 0x22);
         r.skip_unknown(typ).unwrap();
         // Should now be positioned at the 0x08 TLV.
         let (t, v) = r.read_tlv().unwrap();
         assert_eq!(t, 0x08);
         assert_eq!(v.as_ref(), &[0x42]);
+    }
+
+    #[test]
+    fn skip_unknown_even_type_0_to_31_is_critical() {
+        // Type 0x12 (18) is even but <= 31 → grandfathered as critical.
+        let raw = Bytes::from(vec![0x12, 0x02, 0xAA, 0xBB]);
+        let mut r = TlvReader::new(raw);
+        let typ = r.read_type().unwrap();
+        assert_eq!(typ, 0x12);
+        let err = r.skip_unknown(typ).unwrap_err();
+        assert_eq!(err, TlvError::UnknownCriticalType(0x12));
     }
 
     #[test]
