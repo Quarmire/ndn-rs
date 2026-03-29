@@ -64,35 +64,15 @@ pub fn encode_data_unsigned(name: &Name, content: &[u8]) -> Bytes {
     w.finish()
 }
 
-/// Encode a Nack TLV wrapping the original Interest wire bytes.
+/// Encode a Nack as an NDNLPv2 LpPacket wrapping the original Interest.
 ///
-/// The Nack outer TLV (`0x0320`) contains:
-/// - `NackReason` (`0x0321`) — the reason code
-/// - The original `Interest` TLV (embedded verbatim)
+/// The resulting packet is an LpPacket (0x64) containing:
+/// - Nack header (0x0320) with NackReason (0x0321)
+/// - Fragment (0x50) containing the original Interest wire bytes
 ///
 /// `interest_wire` must be a complete Interest TLV (type + length + value).
 pub fn encode_nack(reason: crate::NackReason, interest_wire: &[u8]) -> Bytes {
-    let mut w = TlvWriter::new();
-    w.write_nested(tlv_type::NACK, |w| {
-        let code = reason.code();
-        // Encode reason code as big-endian, minimum bytes.
-        let reason_bytes = if code == 0 {
-            vec![0u8]
-        } else {
-            let be = code.to_be_bytes();
-            let skip = be.iter().position(|&b| b != 0).unwrap_or(7);
-            be[skip..].to_vec()
-        };
-        w.write_tlv(tlv_type::NACK_REASON, &reason_bytes);
-
-        // Strip the outer Interest TLV wrapper — Nack embeds the inner value
-        // as a child with type INTEREST.
-        let mut reader = TlvReader::new(Bytes::copy_from_slice(interest_wire));
-        if let Ok((_typ, value)) = reader.read_tlv() {
-            w.write_tlv(tlv_type::INTEREST, &value);
-        }
-    });
-    w.finish()
+    crate::lp::encode_lp_nack(reason, interest_wire)
 }
 
 /// Ensure an Interest has a Nonce field.

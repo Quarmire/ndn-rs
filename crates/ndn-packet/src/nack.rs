@@ -53,7 +53,24 @@ impl Nack {
         Self { reason, interest }
     }
 
+    /// Decode a Nack from wire bytes.
+    ///
+    /// Accepts both NDNLPv2 format (LpPacket 0x64 with Nack header) and the
+    /// legacy bare Nack TLV (0x0320). Prefer LpPacket format for new code.
     pub fn decode(raw: Bytes) -> Result<Self, PacketError> {
+        let first = *raw.first().ok_or(PacketError::Tlv(ndn_tlv::TlvError::UnexpectedEof))?;
+
+        // NDNLPv2 LpPacket format.
+        if first as u64 == tlv_type::LP_PACKET {
+            let lp = crate::lp::LpPacket::decode(raw)?;
+            let reason = lp.nack.ok_or_else(|| {
+                PacketError::MalformedPacket("LpPacket has no Nack header".into())
+            })?;
+            let interest = Interest::decode(lp.fragment)?;
+            return Ok(Self { reason, interest });
+        }
+
+        // Legacy bare Nack TLV (0x0320).
         let mut reader = TlvReader::new(raw.clone());
         let (typ, value) = reader.read_tlv()?;
         if typ != tlv_type::NACK {
@@ -75,8 +92,6 @@ impl Nack {
                     reason = NackReason::from_code(code);
                 }
                 t if t == tlv_type::INTEREST => {
-                    // Reconstruct full Interest wire bytes (type + length + value)
-                    // because Interest::decode expects the outer INTEREST TLV wrapper.
                     let mut w = TlvWriter::new();
                     w.write_tlv(tlv_type::INTEREST, &v);
                     interest_raw = Some(w.finish());
