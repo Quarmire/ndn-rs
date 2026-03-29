@@ -74,6 +74,12 @@ impl Interest {
         }
         let name = Name::decode(name_val)?;
 
+        // NDN Packet Format v0.3 §2: Interest/Data must have at least one
+        // name component.
+        if name.is_empty() {
+            return Err(PacketError::MalformedPacket("Interest Name must have at least one component".into()));
+        }
+
         Ok(Self {
             raw,
             name:       Arc::new(name),
@@ -340,6 +346,17 @@ mod tests {
             Interest::decode(raw).unwrap_err(),
             crate::PacketError::UnknownPacketType(0x06)
         ));
+    }
+
+    #[test]
+    fn decode_empty_name_rejected() {
+        // Interest with zero name components should fail.
+        let mut w = TlvWriter::new();
+        w.write_nested(tlv_type::INTEREST, |w| {
+            w.write_tlv(tlv_type::NAME, &[]); // empty Name
+        });
+        let raw = w.finish();
+        assert!(Interest::decode(raw).is_err());
     }
 
     #[test]

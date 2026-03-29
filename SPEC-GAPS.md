@@ -14,7 +14,7 @@ Tracking deviations from official NDN specifications (RFC 8569, NDN Packet Forma
 - [ ] **6. No NDNLPv2 LpPacket framing** — no support for LpPacket (TLV 0x64) encapsulation for any link-layer features (fragmentation, Nack, CongestionMark, etc.). (NDNLPv2 spec)
 - [ ] **7. VarNumber shortest-encoding not validated** — TLV reader accepts any encoding; spec requires shortest form. (NDN Packet Format v0.3 §1.2)
 - [ ] **8. Types 0–31 grandfathered as always critical** — TLV type criticality check only looks at LSB; types 0–31 must be treated as critical regardless. (NDN Packet Format v0.3 §1.3)
-- [ ] **9. Zero-component Name not rejected** — empty Name (no components) should be rejected for Interest/Data. (NDN Packet Format v0.3 §2)
+- [x] **9. Zero-component Name not rejected** — empty Name (no components) should be rejected for Interest/Data. (NDN Packet Format v0.3 §2)
 - [ ] **10. ForwardingHint not decoded** — ForwardingHint (TLV 0x1E) is ignored during Interest parsing; forwarder cannot use delegation for multi-hop routing. (NDN Packet Format v0.3 §5.2)
 
 ## Important

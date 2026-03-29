@@ -4,6 +4,7 @@ use ndn_tlv::TlvError;
 pub enum PacketError {
     Tlv(TlvError),
     UnknownPacketType(u64),
+    MalformedPacket(String),
 }
 
 impl From<TlvError> for PacketError {
@@ -17,6 +18,7 @@ impl core::fmt::Display for PacketError {
         match self {
             PacketError::Tlv(e) => write!(f, "TLV error: {e}"),
             PacketError::UnknownPacketType(t) => write!(f, "unknown packet type {t:#x}"),
+            PacketError::MalformedPacket(msg) => write!(f, "malformed packet: {msg}"),
         }
     }
 }
