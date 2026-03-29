@@ -60,6 +60,10 @@ impl Data {
         }
         let name = Name::decode(name_val)?;
 
+        if name.is_empty() {
+            return Err(PacketError::MalformedPacket("Data Name must have at least one component".into()));
+        }
+
         // Scan for SignatureValue to determine the signed region end.
         let mut sig_value_start = 0;
         let mut sig_value_end   = 0;
