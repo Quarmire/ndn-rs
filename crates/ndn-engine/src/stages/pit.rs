@@ -36,7 +36,11 @@ impl PitCheckStage {
             .unwrap_or(4_000); // NDN default 4 s
 
         let nonce = interest.nonce().unwrap_or(0);
-        let token = PitToken::from_interest(&interest.name, Some(interest.selectors()));
+        let token = PitToken::from_interest_full(
+            &interest.name,
+            Some(interest.selectors()),
+            interest.forwarding_hint(),
+        );
         ctx.pit_token = Some(token);
 
         if let Some(mut entry) = self.pit.get_mut(&token) {

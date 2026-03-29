@@ -15,10 +15,28 @@ use ndn_packet::{Name, Selector};
 pub struct PitToken(pub u64);
 
 impl PitToken {
+    /// Build a PIT token from Interest fields.
+    ///
+    /// Per RFC 8569 §4.2, PIT aggregation uses (Name, Selectors,
+    /// ForwardingHint) as the key.
     pub fn from_interest(name: &Name, selector: Option<&Selector>) -> Self {
+        Self::from_interest_full(name, selector, None)
+    }
+
+    /// Build a PIT token including ForwardingHint for correct aggregation.
+    pub fn from_interest_full(
+        name: &Name,
+        selector: Option<&Selector>,
+        forwarding_hint: Option<&[Arc<Name>]>,
+    ) -> Self {
         let mut h = DefaultHasher::new();
         name.hash(&mut h);
         selector.hash(&mut h);
+        if let Some(hints) = forwarding_hint {
+            for hint in hints {
+                hint.hash(&mut h);
+            }
+        }
         PitToken(h.finish())
     }
 }
