@@ -218,7 +218,7 @@ mod tests {
 
     #[test]
     fn decode_name() {
-        let raw = build_data_packet(&[b"edu", b"ucla"], b"hello", None, 7, &[0xAB]);
+        let raw = build_data_packet(&[b"edu", b"ucla"], b"hello", None, 5, &[0xAB]);
         let d = Data::decode(raw).unwrap();
         assert_eq!(d.name.len(), 2);
         assert_eq!(d.name.components()[0].value.as_ref(), b"edu");
@@ -248,7 +248,7 @@ mod tests {
 
     #[test]
     fn decode_meta_info_freshness() {
-        let raw = build_data_packet(&[b"test"], b"", Some(5000), 7, &[0x00]);
+        let raw = build_data_packet(&[b"test"], b"", Some(5000), 5, &[0x00]);
         let d = Data::decode(raw).unwrap();
         let mi = d.meta_info().expect("meta_info present");
         assert_eq!(mi.freshness_period, Some(std::time::Duration::from_millis(5000)));
@@ -265,7 +265,7 @@ mod tests {
 
     #[test]
     fn decode_sig_info_type() {
-        let raw = build_data_packet(&[b"test"], b"", None, 7, &[0xAB]);
+        let raw = build_data_packet(&[b"test"], b"", None, 5, &[0xAB]);
         let d = Data::decode(raw).unwrap();
         let si = d.sig_info().expect("sig_info present");
         assert_eq!(si.sig_type, crate::SignatureType::SignatureEd25519);
@@ -276,7 +276,7 @@ mod tests {
     #[test]
     fn signed_region_excludes_sig_value() {
         let sig_bytes: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF];
-        let raw = build_data_packet(&[b"test"], b"content", None, 7, sig_bytes);
+        let raw = build_data_packet(&[b"test"], b"content", None, 5, sig_bytes);
         let d = Data::decode(raw.clone()).unwrap();
 
         let region = d.signed_region();
@@ -291,7 +291,7 @@ mod tests {
     #[test]
     fn sig_value_correct_bytes() {
         let sig_bytes: &[u8] = &[0x11, 0x22, 0x33, 0x44];
-        let raw = build_data_packet(&[b"test"], b"content", None, 7, sig_bytes);
+        let raw = build_data_packet(&[b"test"], b"content", None, 5, sig_bytes);
         let d = Data::decode(raw).unwrap();
         // sig_value() returns only the VALUE bytes inside the SignatureValue TLV.
         assert_eq!(d.sig_value(), sig_bytes);

@@ -22,7 +22,7 @@ impl SignatureType {
             SignatureType::SignatureSha256WithRsa  => 1,
             SignatureType::SignatureSha256WithEcdsa => 3,
             SignatureType::SignatureHmacWithSha256 => 4,
-            SignatureType::SignatureEd25519        => 7,
+            SignatureType::SignatureEd25519        => 5,
             SignatureType::Other(c)                => *c,
         }
     }
@@ -33,7 +33,7 @@ impl SignatureType {
             1 => SignatureType::SignatureSha256WithRsa,
             3 => SignatureType::SignatureSha256WithEcdsa,
             4 => SignatureType::SignatureHmacWithSha256,
-            7 => SignatureType::SignatureEd25519,
+            5 => SignatureType::SignatureEd25519,
             c => SignatureType::Other(c),
         }
     }
@@ -105,7 +105,7 @@ mod tests {
             (SignatureType::SignatureSha256WithRsa,   1),
             (SignatureType::SignatureSha256WithEcdsa, 3),
             (SignatureType::SignatureHmacWithSha256,  4),
-            (SignatureType::SignatureEd25519,         7),
+            (SignatureType::SignatureEd25519,         5),
         ];
         for (sig_type, code) in cases {
             assert_eq!(sig_type.code(), code, "{sig_type:?}");
@@ -124,7 +124,7 @@ mod tests {
 
     #[test]
     fn decode_sig_type_only() {
-        let raw = build_sig_info(7, None);
+        let raw = build_sig_info(5, None);
         let si = SignatureInfo::decode(raw).unwrap();
         assert_eq!(si.sig_type, SignatureType::SignatureEd25519);
         assert!(si.key_locator.is_none());
@@ -132,7 +132,7 @@ mod tests {
 
     #[test]
     fn decode_all_known_sig_types() {
-        for code in [0u8, 1, 3, 4, 7] {
+        for code in [0u8, 1, 3, 4, 5] {
             let raw = build_sig_info(code, None);
             let si = SignatureInfo::decode(raw).unwrap();
             assert_eq!(si.sig_type.code(), code as u64);
@@ -141,7 +141,7 @@ mod tests {
 
     #[test]
     fn decode_with_key_locator() {
-        let raw = build_sig_info(7, Some(&[b"sensor", b"node1", b"KEY", b"abc"]));
+        let raw = build_sig_info(5, Some(&[b"sensor", b"node1", b"KEY", b"abc"]));
         let si = SignatureInfo::decode(raw).unwrap();
         assert_eq!(si.sig_type, SignatureType::SignatureEd25519);
         let kl = si.key_locator.expect("key_locator present");
