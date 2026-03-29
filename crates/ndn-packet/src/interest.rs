@@ -42,19 +42,23 @@ pub struct Interest {
 
     /// HopLimit (TLV 0x22) — decoded on first access.
     hop_limit: OnceLock<Option<u8>>,
+
+    /// ForwardingHint (TLV 0x1E) — list of delegation Names, decoded on first access.
+    forwarding_hint: OnceLock<Option<Vec<Arc<Name>>>>,
 }
 
 impl Interest {
     /// Construct a minimal Interest with only a name (for testing / app use).
     pub fn new(name: Name) -> Self {
         Self {
-            raw:        Bytes::new(),
-            name:       Arc::new(name),
-            selectors:  OnceLock::new(),
-            nonce:      OnceLock::new(),
-            lifetime:   OnceLock::new(),
-            app_params: OnceLock::new(),
-            hop_limit:  OnceLock::new(),
+            raw:              Bytes::new(),
+            name:             Arc::new(name),
+            selectors:        OnceLock::new(),
+            nonce:            OnceLock::new(),
+            lifetime:         OnceLock::new(),
+            app_params:       OnceLock::new(),
+            hop_limit:        OnceLock::new(),
+            forwarding_hint:  OnceLock::new(),
         }
     }
 
@@ -82,12 +86,13 @@ impl Interest {
 
         Ok(Self {
             raw,
-            name:       Arc::new(name),
-            selectors:  OnceLock::new(),
-            nonce:      OnceLock::new(),
-            lifetime:   OnceLock::new(),
-            app_params: OnceLock::new(),
-            hop_limit:  OnceLock::new(),
+            name:             Arc::new(name),
+            selectors:        OnceLock::new(),
+            nonce:            OnceLock::new(),
+            lifetime:         OnceLock::new(),
+            app_params:       OnceLock::new(),
+            hop_limit:        OnceLock::new(),
+            forwarding_hint:  OnceLock::new(),
         })
     }
 
@@ -113,6 +118,17 @@ impl Interest {
         self.app_params
             .get_or_init(|| decode_app_params(&self.raw).ok().flatten())
             .as_ref()
+    }
+
+    /// ForwardingHint delegation names, if present.
+    ///
+    /// Per NDN Packet Format v0.3 §5.2, ForwardingHint (TLV 0x1E) contains
+    /// one or more Name TLVs representing delegation prefixes that a
+    /// forwarder can use to reach the Data producer.
+    pub fn forwarding_hint(&self) -> Option<&[Arc<Name>]> {
+        self.forwarding_hint
+            .get_or_init(|| decode_forwarding_hint(&self.raw).ok().flatten())
+            .as_deref()
     }
 
     /// HopLimit value (0–255), if present in the wire format.
@@ -170,6 +186,32 @@ fn decode_app_params(raw: &Bytes) -> Result<Option<Bytes>, PacketError> {
         let (typ, val) = inner.read_tlv()?;
         if typ == tlv_type::APP_PARAMETERS {
             return Ok(Some(val));
+        }
+    }
+    Ok(None)
+}
+
+fn decode_forwarding_hint(raw: &Bytes) -> Result<Option<Vec<Arc<Name>>>, PacketError> {
+    if raw.is_empty() { return Ok(None); }
+    let mut reader = TlvReader::new(raw.clone());
+    let (_, value) = reader.read_tlv()?;
+    let mut inner = TlvReader::new(value);
+    while !inner.is_empty() {
+        let (typ, val) = inner.read_tlv()?;
+        if typ == tlv_type::FORWARDING_HINT {
+            // ForwardingHint value contains one or more Name TLVs.
+            let mut hint_reader = TlvReader::new(val);
+            let mut names = Vec::new();
+            while !hint_reader.is_empty() {
+                let (t, v) = hint_reader.read_tlv()?;
+                if t == tlv_type::NAME {
+                    names.push(Arc::new(Name::decode(v)?));
+                }
+            }
+            if names.is_empty() {
+                return Ok(None);
+            }
+            return Ok(Some(names));
         }
     }
     Ok(None)
@@ -346,6 +388,35 @@ mod tests {
             Interest::decode(raw).unwrap_err(),
             crate::PacketError::UnknownPacketType(0x06)
         ));
+    }
+
+    #[test]
+    fn decode_with_forwarding_hint() {
+        let mut w = TlvWriter::new();
+        w.write_nested(tlv_type::INTEREST, |w| {
+            w.write_nested(tlv_type::NAME, |w| {
+                w.write_tlv(tlv_type::NAME_COMPONENT, b"test");
+            });
+            w.write_nested(tlv_type::FORWARDING_HINT, |w| {
+                w.write_nested(tlv_type::NAME, |w| {
+                    w.write_tlv(tlv_type::NAME_COMPONENT, b"ndn");
+                    w.write_tlv(tlv_type::NAME_COMPONENT, b"gateway");
+                });
+            });
+        });
+        let raw = w.finish();
+        let i = Interest::decode(raw).unwrap();
+        let hints = i.forwarding_hint().expect("forwarding_hint present");
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0].len(), 2);
+        assert_eq!(hints[0].components()[0].value.as_ref(), b"ndn");
+    }
+
+    #[test]
+    fn decode_without_forwarding_hint() {
+        let raw = build_interest(&[b"test"], None, None, false, false);
+        let i = Interest::decode(raw).unwrap();
+        assert!(i.forwarding_hint().is_none());
     }
 
     #[test]
