@@ -39,6 +39,9 @@ pub struct Interest {
 
     /// ApplicationParameters (TLV 0x24) — decoded on first access.
     app_params: OnceLock<Option<Bytes>>,
+
+    /// HopLimit (TLV 0x22) — decoded on first access.
+    hop_limit: OnceLock<Option<u8>>,
 }
 
 impl Interest {
@@ -51,6 +54,7 @@ impl Interest {
             nonce:      OnceLock::new(),
             lifetime:   OnceLock::new(),
             app_params: OnceLock::new(),
+            hop_limit:  OnceLock::new(),
         }
     }
 
@@ -77,6 +81,7 @@ impl Interest {
             nonce:      OnceLock::new(),
             lifetime:   OnceLock::new(),
             app_params: OnceLock::new(),
+            hop_limit:  OnceLock::new(),
         })
     }
 
@@ -102,6 +107,14 @@ impl Interest {
         self.app_params
             .get_or_init(|| decode_app_params(&self.raw).ok().flatten())
             .as_ref()
+    }
+
+    /// HopLimit value (0–255), if present in the wire format.
+    ///
+    /// Per NDN Packet Format v0.3 §5.2, this is a 1-byte field.
+    /// The forwarder must decrement before forwarding and drop if zero.
+    pub fn hop_limit(&self) -> Option<u8> {
+        *self.hop_limit.get_or_init(|| decode_hop_limit(&self.raw).ok().flatten())
     }
 
     pub fn raw(&self) -> &Bytes {
@@ -156,6 +169,23 @@ fn decode_app_params(raw: &Bytes) -> Result<Option<Bytes>, PacketError> {
     Ok(None)
 }
 
+fn decode_hop_limit(raw: &Bytes) -> Result<Option<u8>, PacketError> {
+    if raw.is_empty() { return Ok(None); }
+    let mut reader = TlvReader::new(raw.clone());
+    let (_, value) = reader.read_tlv()?;
+    let mut inner = TlvReader::new(value);
+    while !inner.is_empty() {
+        let (typ, val) = inner.read_tlv()?;
+        if typ == tlv_type::HOP_LIMIT {
+            if val.len() == 1 {
+                return Ok(Some(val[0]));
+            }
+            return Ok(None);
+        }
+    }
+    Ok(None)
+}
+
 fn decode_lifetime(raw: &Bytes) -> Result<Option<Duration>, PacketError> {
     let mut reader = TlvReader::new(raw.clone());
     let (_, value) = reader.read_tlv()?;
@@ -186,6 +216,17 @@ mod tests {
         can_be_prefix: bool,
         must_be_fresh: bool,
     ) -> Bytes {
+        build_interest_full(components, nonce, lifetime_ms, can_be_prefix, must_be_fresh, None)
+    }
+
+    fn build_interest_full(
+        components: &[&[u8]],
+        nonce: Option<u32>,
+        lifetime_ms: Option<u64>,
+        can_be_prefix: bool,
+        must_be_fresh: bool,
+        hop_limit: Option<u8>,
+    ) -> Bytes {
         let mut w = TlvWriter::new();
         w.write_nested(tlv_type::INTEREST, |w| {
             w.write_nested(tlv_type::NAME, |w| {
@@ -200,6 +241,9 @@ mod tests {
             }
             if let Some(ms) = lifetime_ms {
                 w.write_tlv(tlv_type::INTEREST_LIFETIME, &ms.to_be_bytes());
+            }
+            if let Some(h) = hop_limit {
+                w.write_tlv(tlv_type::HOP_LIMIT, &[h]);
             }
         });
         w.finish()
@@ -302,6 +346,27 @@ mod tests {
     fn decode_truncated_errors() {
         let raw = Bytes::from_static(&[0x05, 0x10, 0x07]); // length claims 16 bytes, only 1 follows
         assert!(Interest::decode(raw).is_err());
+    }
+
+    #[test]
+    fn decode_with_hop_limit() {
+        let raw = build_interest_full(&[b"test"], None, None, false, false, Some(64));
+        let i = Interest::decode(raw).unwrap();
+        assert_eq!(i.hop_limit(), Some(64));
+    }
+
+    #[test]
+    fn decode_without_hop_limit() {
+        let raw = build_interest(&[b"test"], None, None, false, false);
+        let i = Interest::decode(raw).unwrap();
+        assert_eq!(i.hop_limit(), None);
+    }
+
+    #[test]
+    fn decode_hop_limit_zero() {
+        let raw = build_interest_full(&[b"test"], None, None, false, false, Some(0));
+        let i = Interest::decode(raw).unwrap();
+        assert_eq!(i.hop_limit(), Some(0));
     }
 
     #[test]

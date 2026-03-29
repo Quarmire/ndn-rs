@@ -18,6 +18,11 @@ impl TlvDecodeStage {
             t if t == tlv_type::INTEREST => {
                 match Interest::decode(ctx.raw_bytes.clone()) {
                     Ok(interest) => {
+                        // HopLimit enforcement (NDN Packet Format v0.3 §5.2):
+                        // Drop if HopLimit is present and already zero.
+                        if interest.hop_limit() == Some(0) {
+                            return Action::Drop(DropReason::HopLimitExceeded);
+                        }
                         ctx.name   = Some(interest.name.clone());
                         ctx.packet = DecodedPacket::Interest(Box::new(interest));
                         Action::Continue(ctx)
