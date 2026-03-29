@@ -84,6 +84,34 @@ impl Interest {
             return Err(PacketError::MalformedPacket("Interest Name must have at least one component".into()));
         }
 
+        // Check if ApplicationParameters is present. If so, the Name must
+        // end with ParametersSha256DigestComponent (type 0x02).
+        // We do a quick scan for APP_PARAMETERS here.
+        let has_app_params = {
+            let mut scan = TlvReader::new(inner.as_bytes());
+            let mut found = false;
+            while !scan.is_empty() {
+                if let Ok((t, _)) = scan.read_tlv() {
+                    if t == tlv_type::APP_PARAMETERS {
+                        found = true;
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+            found
+        };
+
+        if has_app_params {
+            let last_comp = name.components().last().unwrap();
+            if last_comp.typ != tlv_type::PARAMETERS_SHA256 {
+                return Err(PacketError::MalformedPacket(
+                    "Interest with ApplicationParameters must have ParametersSha256DigestComponent as last name component".into()
+                ));
+            }
+        }
+
         Ok(Self {
             raw,
             name:             Arc::new(name),

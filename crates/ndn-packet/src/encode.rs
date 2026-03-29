@@ -26,11 +26,28 @@ use crate::{Name, tlv_type};
 pub fn encode_interest(name: &Name, app_params: Option<&[u8]>) -> Bytes {
     let mut w = TlvWriter::new();
     w.write_nested(tlv_type::INTEREST, |w| {
-        write_name(w, name);
-        w.write_tlv(tlv_type::NONCE, &next_nonce().to_be_bytes());
-        w.write_tlv(tlv_type::INTEREST_LIFETIME, &4000u64.to_be_bytes());
         if let Some(params) = app_params {
+            // Compute ParametersSha256DigestComponent: SHA-256 of the
+            // ApplicationParameters TLV (type + length + value).
+            let mut params_tlv = TlvWriter::new();
+            params_tlv.write_tlv(tlv_type::APP_PARAMETERS, params);
+            let params_wire = params_tlv.finish();
+            let digest = ring::digest::digest(&ring::digest::SHA256, &params_wire);
+
+            // Write Name with ParametersSha256DigestComponent appended.
+            w.write_nested(tlv_type::NAME, |w| {
+                for comp in name.components() {
+                    w.write_tlv(comp.typ, &comp.value);
+                }
+                w.write_tlv(tlv_type::PARAMETERS_SHA256, digest.as_ref());
+            });
+            w.write_tlv(tlv_type::NONCE, &next_nonce().to_be_bytes());
+            w.write_tlv(tlv_type::INTEREST_LIFETIME, &4000u64.to_be_bytes());
             w.write_tlv(tlv_type::APP_PARAMETERS, params);
+        } else {
+            write_name(w, name);
+            w.write_tlv(tlv_type::NONCE, &next_nonce().to_be_bytes());
+            w.write_tlv(tlv_type::INTEREST_LIFETIME, &4000u64.to_be_bytes());
         }
     });
     w.finish()
@@ -169,7 +186,15 @@ mod tests {
         let params = br#"{"cmd":"add_route","prefix":"/ndn","face":1,"cost":10}"#;
         let bytes = encode_interest(&n, Some(params));
         let interest = Interest::decode(bytes).unwrap();
-        assert_eq!(*interest.name, n);
+        // Name has the original components plus ParametersSha256DigestComponent.
+        assert_eq!(interest.name.len(), n.len() + 1);
+        for (i, comp) in n.components().iter().enumerate() {
+            assert_eq!(interest.name.components()[i], *comp);
+        }
+        // Last component is the digest (type 0x02, 32 bytes).
+        let last = &interest.name.components()[n.len()];
+        assert_eq!(last.typ, tlv_type::PARAMETERS_SHA256);
+        assert_eq!(last.value.len(), 32);
         assert_eq!(interest.app_parameters().map(|b| b.as_ref()), Some(params.as_ref()));
     }
 

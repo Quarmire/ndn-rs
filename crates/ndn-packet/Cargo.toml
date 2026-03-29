@@ -17,3 +17,4 @@ std     = ["ndn-tlv/std"]
 ndn-tlv   = { workspace = true }
 bytes     = { workspace = true }
 smallvec  = { workspace = true }
+ring      = { workspace = true }
