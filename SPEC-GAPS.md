@@ -27,7 +27,7 @@ Tracking deviations from official NDN specifications (RFC 8569, NDN Packet Forma
 - [ ] **16. PIT aggregation rules incomplete** — spec requires same (Name, Selectors, ForwardingHint) tuple; current PIT key may not include ForwardingHint. (RFC 8569 §4.2)
 - [ ] **17. CS admission policy** — no policy hooks for cache admission (e.g., respecting MustBeFresh, cache directives). (RFC 8569 §4.3)
 - [x] **18. InterestLifetime default** — already defaults to 4000ms in PIT check stage. (NDN Packet Format v0.3 §5.2)
-- [ ] **19. Data packet freshness tracking** — CS must track insertion time and compute staleness from FreshnessPeriod. (RFC 8569 §4.3)
+- [x] **19. Data packet freshness tracking** — CS must track insertion time and compute staleness from FreshnessPeriod. (RFC 8569 §4.3)
 - [ ] **20. Implicit SHA-256 digest component** — Name matching must support implicit digest as final component for exact Data retrieval. (NDN Packet Format v0.3 §2.2)
 
 ## Moderate
