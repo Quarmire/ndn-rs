@@ -27,6 +27,9 @@ pub fn read_varu64(buf: &[u8]) -> Result<(u64, usize), TlvError> {
                 return Err(TlvError::UnexpectedEof);
             }
             let v = u16::from_be_bytes([buf[1], buf[2]]);
+            if v < 253 {
+                return Err(TlvError::NonMinimalVarNumber);
+            }
             Ok((v as u64, 3))
         }
         254 => {
@@ -34,6 +37,9 @@ pub fn read_varu64(buf: &[u8]) -> Result<(u64, usize), TlvError> {
                 return Err(TlvError::UnexpectedEof);
             }
             let v = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]);
+            if v < 0x1_0000 {
+                return Err(TlvError::NonMinimalVarNumber);
+            }
             Ok((v as u64, 5))
         }
         255 => {
@@ -44,6 +50,9 @@ pub fn read_varu64(buf: &[u8]) -> Result<(u64, usize), TlvError> {
                 buf[1], buf[2], buf[3], buf[4],
                 buf[5], buf[6], buf[7], buf[8],
             ]);
+            if v < 0x1_0000_0000 {
+                return Err(TlvError::NonMinimalVarNumber);
+            }
             Ok((v, 9))
         }
     }
@@ -154,6 +163,27 @@ mod tests {
     fn read_varu64_eof_truncated_9byte() {
         assert_eq!(read_varu64(&[0xFF, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00]),
                    Err(TlvError::UnexpectedEof));
+    }
+
+    #[test]
+    fn read_varu64_rejects_non_minimal_3byte() {
+        // 0xFD marker but value 100 (< 253) — should use 1-byte form.
+        assert_eq!(read_varu64(&[0xFD, 0x00, 0x64]), Err(TlvError::NonMinimalVarNumber));
+    }
+
+    #[test]
+    fn read_varu64_rejects_non_minimal_5byte() {
+        // 0xFE marker but value 0x00FF (< 0x10000) — should use 3-byte form.
+        assert_eq!(read_varu64(&[0xFE, 0x00, 0x00, 0x00, 0xFF]), Err(TlvError::NonMinimalVarNumber));
+    }
+
+    #[test]
+    fn read_varu64_rejects_non_minimal_9byte() {
+        // 0xFF marker but value 0x0000_FFFF (< 0x1_0000_0000) — should use 5-byte form.
+        assert_eq!(
+            read_varu64(&[0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF]),
+            Err(TlvError::NonMinimalVarNumber)
+        );
     }
 
     #[test]
