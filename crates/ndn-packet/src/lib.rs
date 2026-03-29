@@ -12,6 +12,7 @@ pub mod nack;
 pub mod meta_info;
 pub mod signature;
 pub mod encode;
+pub mod lp;
 
 pub use error::PacketError;
 pub use name::{Name, NameComponent};
@@ -48,4 +49,12 @@ pub mod tlv_type {
     pub const KEY_DIGEST:       u64 = 0x1d;
     pub const NACK:             u64 = 0x0320;
     pub const NACK_REASON:      u64 = 0x0321;
+
+    // NDNLPv2 types
+    pub const LP_PACKET:        u64 = 0x64;
+    pub const LP_FRAGMENT:      u64 = 0x50;
+    pub const LP_SEQUENCE:      u64 = 0x51;
+    pub const LP_FRAG_INDEX:    u64 = 0x52;
+    pub const LP_FRAG_COUNT:    u64 = 0x53;
+    pub const LP_CONGESTION_MARK: u64 = 0x0340;
 }
