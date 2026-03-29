@@ -32,27 +32,19 @@ impl TlvWriter {
     /// Write a nested TLV element. The closure encodes the inner content;
     /// this method wraps it with the correct outer type and length.
     ///
-    /// Uses a 4-byte length placeholder then patches it after the inner content
-    /// is written. The length field is always encoded as 5 bytes (0xFE prefix)
-    /// to avoid having to shift the buffer.
+    /// Inner content is written to a temporary writer, then the type, minimal
+    /// length, and content are appended to the main buffer.
     pub fn write_nested<F>(&mut self, typ: u64, f: F)
     where
         F: FnOnce(&mut TlvWriter),
     {
+        let mut inner = TlvWriter::new();
+        f(&mut inner);
+        let inner_bytes = inner.buf;
+
         self.write_varu64_inner(typ);
-
-        // Reserve 5-byte length placeholder (0xFE + 4 bytes).
-        let len_pos = self.buf.len();
-        self.buf.put_bytes(0, 5);
-
-        let content_start = self.buf.len();
-        f(self);
-        let content_len = self.buf.len() - content_start;
-
-        // Patch the length in place.
-        let len_bytes = &mut self.buf[len_pos..len_pos + 5];
-        len_bytes[0] = 0xFE;
-        len_bytes[1..5].copy_from_slice(&(content_len as u32).to_be_bytes());
+        self.write_varu64_inner(inner_bytes.len() as u64);
+        self.buf.put_slice(&inner_bytes);
     }
 
     /// Write raw bytes directly into the buffer (no TLV framing).

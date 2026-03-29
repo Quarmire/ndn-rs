@@ -13,6 +13,8 @@ pub enum TlvError {
     MissingField(&'static str),
     /// The same TLV type appeared more than once where only one is allowed.
     DuplicateField(u64),
+    /// VarNumber is not in shortest encoding form.
+    NonMinimalVarNumber,
 }
 
 impl core::fmt::Display for TlvError {
@@ -31,6 +33,9 @@ impl core::fmt::Display for TlvError {
             TlvError::MissingField(name) => write!(f, "required field '{name}' missing"),
             TlvError::DuplicateField(t) => {
                 write!(f, "TLV type {t:#x} appeared more than once")
+            }
+            TlvError::NonMinimalVarNumber => {
+                write!(f, "VarNumber not in shortest encoding form")
             }
         }
     }
