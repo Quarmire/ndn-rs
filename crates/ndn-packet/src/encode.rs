@@ -95,6 +95,49 @@ pub fn encode_nack(reason: crate::NackReason, interest_wire: &[u8]) -> Bytes {
     w.finish()
 }
 
+/// Ensure an Interest has a Nonce field.
+///
+/// If the Interest wire bytes already contain a Nonce (TLV 0x0A), returns the
+/// bytes unchanged. Otherwise, re-encodes the Interest with a generated Nonce
+/// inserted after the Name.
+///
+/// Per RFC 8569 §4.2, a forwarder MUST add a Nonce before forwarding.
+pub fn ensure_nonce(interest_wire: &Bytes) -> Bytes {
+    // Quick scan: does a Nonce TLV already exist?
+    let mut reader = TlvReader::new(interest_wire.clone());
+    let Ok((typ, value)) = reader.read_tlv() else { return interest_wire.clone() };
+    if typ != tlv_type::INTEREST { return interest_wire.clone(); }
+
+    let mut inner = TlvReader::new(value.clone());
+    while !inner.is_empty() {
+        let Ok((t, _)) = inner.read_tlv() else { break };
+        if t == tlv_type::NONCE {
+            return interest_wire.clone(); // already has Nonce
+        }
+    }
+
+    // No Nonce found — re-encode with one inserted.
+    let mut w = TlvWriter::new();
+    w.write_nested(tlv_type::INTEREST, |w| {
+        let mut inner = TlvReader::new(value);
+        let mut name_written = false;
+        while !inner.is_empty() {
+            let Ok((t, v)) = inner.read_tlv() else { break };
+            w.write_tlv(t, &v);
+            // Insert Nonce right after Name (type 0x07).
+            if !name_written && t == tlv_type::NAME {
+                w.write_tlv(tlv_type::NONCE, &next_nonce().to_be_bytes());
+                name_written = true;
+            }
+        }
+        if !name_written {
+            // Name wasn't found (malformed), add Nonce at end as fallback.
+            w.write_tlv(tlv_type::NONCE, &next_nonce().to_be_bytes());
+        }
+    });
+    w.finish()
+}
+
 // ─── Private helpers ──────────────────────────────────────────────────────────
 
 /// Write a `Name` TLV into an in-progress writer, preserving each component's
@@ -199,6 +242,35 @@ mod tests {
         let nack_wire = encode_nack(NackReason::Congestion, &interest_wire);
         let nack = Nack::decode(nack_wire).unwrap();
         assert_eq!(nack.reason, NackReason::Congestion);
+    }
+
+    #[test]
+    fn ensure_nonce_adds_when_missing() {
+        // Build Interest without Nonce.
+        let n = name(&[b"test"]);
+        let mut w = TlvWriter::new();
+        w.write_nested(tlv_type::INTEREST, |w| {
+            write_name(w, &n);
+            w.write_tlv(tlv_type::INTEREST_LIFETIME, &4000u64.to_be_bytes());
+        });
+        let no_nonce = w.finish();
+        let interest = Interest::decode(no_nonce.clone()).unwrap();
+        assert!(interest.nonce().is_none());
+
+        let with_nonce = ensure_nonce(&no_nonce);
+        let interest2 = Interest::decode(with_nonce).unwrap();
+        assert!(interest2.nonce().is_some());
+    }
+
+    #[test]
+    fn ensure_nonce_preserves_existing() {
+        let n = name(&[b"test"]);
+        let bytes = encode_interest(&n, None);
+        let original_nonce = Interest::decode(bytes.clone()).unwrap().nonce();
+        let result = ensure_nonce(&bytes);
+        assert_eq!(result, bytes); // unchanged
+        let after = Interest::decode(result).unwrap().nonce();
+        assert_eq!(original_nonce, after);
     }
 
     #[test]

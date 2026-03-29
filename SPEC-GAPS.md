@@ -7,7 +7,7 @@ Tracking deviations from official NDN specifications (RFC 8569, NDN Packet Forma
 ## Critical
 
 - [x] **1. HopLimit not decoded or enforced** — `ndn-packet` does not parse HopLimit (TLV 0x22) from Interest packets; forwarder does not decrement or drop at zero. (NDN Packet Format v0.3 §5.2)
-- [ ] **2. Nonce not inserted by forwarder** — when forwarding an Interest upstream, forwarder must add a random Nonce if absent and detect loops via Nonce+Name. Currently no Nonce generation. (RFC 8569 §4.2)
+- [x] **2. Nonce not inserted by forwarder** — when forwarding an Interest upstream, forwarder must add a random Nonce if absent and detect loops via Nonce+Name. Currently no Nonce generation. (RFC 8569 §4.2)
 - [x] **3. Ed25519 signature type code wrong** — code is 7; NDN spec says 5. (NDN Packet Format v0.3 §10.3)
 - [ ] **4. InterestSignatureValue type code** — need to verify TLV type assignment for signed Interests. (NDN Packet Format v0.3 §5.4)
 - [ ] **5. Nack not NDNLPv2 framed** — Nack is encoded as bare TLV 0x0320; spec requires LpPacket (0x64) wrapper with Nack header field. (NDNLPv2 spec)
