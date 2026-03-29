@@ -3,6 +3,10 @@ use ndn_packet::encode::ensure_nonce;
 use ndn_packet::lp::{LpPacket, is_lp_packet};
 use ndn_pipeline::{Action, DropReason, PacketContext, DecodedPacket};
 
+/// NDNLPv2 congestion mark, stored as a tag in `PacketContext::tags`.
+#[derive(Clone, Copy, Debug)]
+pub struct CongestionMark(pub u64);
+
 /// Decodes the raw bytes in `ctx` into an `Interest`, `Data`, or `Nack`.
 ///
 /// Handles both bare Interest/Data packets and NDNLPv2 LpPacket-wrapped
@@ -62,6 +66,11 @@ impl TlvDecodeStage {
             Ok(lp) => lp,
             Err(_) => return Action::Drop(DropReason::MalformedPacket),
         };
+
+        // Propagate CongestionMark through the pipeline via tags.
+        if let Some(mark) = lp.congestion_mark {
+            ctx.tags.insert(CongestionMark(mark));
+        }
 
         if let Some(reason) = lp.nack {
             // LpPacket with Nack header: fragment is the nacked Interest.
