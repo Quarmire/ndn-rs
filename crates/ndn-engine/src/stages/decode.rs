@@ -1,4 +1,5 @@
 use ndn_packet::{Data, Interest, Nack, tlv_type};
+use ndn_packet::encode::ensure_nonce;
 use ndn_pipeline::{Action, DropReason, PacketContext, DecodedPacket};
 
 /// Decodes the raw bytes in `ctx` into an `Interest`, `Data`, or `Nack`.
@@ -23,6 +24,9 @@ impl TlvDecodeStage {
                         if interest.hop_limit() == Some(0) {
                             return Action::Drop(DropReason::HopLimitExceeded);
                         }
+                        // Nonce insertion (RFC 8569 §4.2): forwarder MUST add
+                        // a Nonce if the Interest doesn't already carry one.
+                        ctx.raw_bytes = ensure_nonce(&ctx.raw_bytes);
                         ctx.name   = Some(interest.name.clone());
                         ctx.packet = DecodedPacket::Interest(Box::new(interest));
                         Action::Continue(ctx)
