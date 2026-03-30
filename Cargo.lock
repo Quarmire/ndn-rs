@@ -873,6 +873,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "criterion",
  "dashmap",
  "ndn-packet",
  "ndn-pipeline",

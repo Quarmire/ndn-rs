@@ -20,3 +20,11 @@ tokio-util    = { workspace = true, features = ["rt"] }
 tracing       = { workspace = true }
 thiserror     = { workspace = true }
 anyhow        = { workspace = true }
+
+[dev-dependencies]
+criterion     = { workspace = true }
+ndn-strategy  = { workspace = true }
+
+[[bench]]
+name    = "pipeline"
+harness = false
