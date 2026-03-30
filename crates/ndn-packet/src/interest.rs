@@ -85,30 +85,39 @@ impl Interest {
         }
 
         // Check if ApplicationParameters is present. If so, the Name must
-        // end with ParametersSha256DigestComponent (type 0x02).
-        // We do a quick scan for APP_PARAMETERS here.
-        let has_app_params = {
+        // end with ParametersSha256DigestComponent (type 0x02) and the
+        // digest must match SHA-256 of the ApplicationParameters TLV.
+        {
             let mut scan = TlvReader::new(inner.as_bytes());
-            let mut found = false;
+            let mut app_params_tlv: Option<bytes::Bytes> = None;
             while !scan.is_empty() {
-                if let Ok((t, _)) = scan.read_tlv() {
+                let pos_before = scan.position();
+                if let Ok((t, _v)) = scan.read_tlv() {
                     if t == tlv_type::APP_PARAMETERS {
-                        found = true;
+                        // Capture the full TLV (type + length + value).
+                        let remaining = inner.as_bytes();
+                        app_params_tlv = Some(remaining.slice(pos_before..scan.position()));
                         break;
                     }
                 } else {
                     break;
                 }
             }
-            found
-        };
 
-        if has_app_params {
-            let last_comp = name.components().last().unwrap();
-            if last_comp.typ != tlv_type::PARAMETERS_SHA256 {
-                return Err(PacketError::MalformedPacket(
-                    "Interest with ApplicationParameters must have ParametersSha256DigestComponent as last name component".into()
-                ));
+            if let Some(params_tlv) = app_params_tlv {
+                let last_comp = name.components().last().unwrap();
+                if last_comp.typ != tlv_type::PARAMETERS_SHA256 {
+                    return Err(PacketError::MalformedPacket(
+                        "Interest with ApplicationParameters must have ParametersSha256DigestComponent as last name component".into()
+                    ));
+                }
+                // Verify digest matches SHA-256 of ApplicationParameters TLV.
+                let expected = ring::digest::digest(&ring::digest::SHA256, &params_tlv);
+                if last_comp.value.as_ref() != expected.as_ref() {
+                    return Err(PacketError::MalformedPacket(
+                        "ParametersSha256DigestComponent does not match ApplicationParameters".into()
+                    ));
+                }
             }
         }
 
@@ -445,6 +454,35 @@ mod tests {
         let raw = build_interest(&[b"test"], None, None, false, false);
         let i = Interest::decode(raw).unwrap();
         assert!(i.forwarding_hint().is_none());
+    }
+
+    #[test]
+    fn decode_app_params_wrong_digest_rejected() {
+        // Interest with ApplicationParameters but wrong ParametersSha256 digest.
+        let mut w = TlvWriter::new();
+        w.write_nested(tlv_type::INTEREST, |w| {
+            w.write_nested(tlv_type::NAME, |w| {
+                w.write_tlv(tlv_type::NAME_COMPONENT, b"test");
+                w.write_tlv(tlv_type::PARAMETERS_SHA256, &[0u8; 32]); // wrong digest
+            });
+            w.write_tlv(tlv_type::APP_PARAMETERS, b"hello");
+        });
+        let raw = w.finish();
+        assert!(Interest::decode(raw).is_err());
+    }
+
+    #[test]
+    fn decode_app_params_missing_digest_rejected() {
+        // Interest with ApplicationParameters but no ParametersSha256.
+        let mut w = TlvWriter::new();
+        w.write_nested(tlv_type::INTEREST, |w| {
+            w.write_nested(tlv_type::NAME, |w| {
+                w.write_tlv(tlv_type::NAME_COMPONENT, b"test");
+            });
+            w.write_tlv(tlv_type::APP_PARAMETERS, b"hello");
+        });
+        let raw = w.finish();
+        assert!(Interest::decode(raw).is_err());
     }
 
     #[test]

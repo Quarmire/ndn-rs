@@ -22,7 +22,7 @@ Tracking deviations from official NDN specifications (RFC 8569, NDN Packet Forma
 - [x] **11. ContentType values incomplete** — BLOB(0), LINK(1), KEY(2), NACK(3) all handled; PREFIX_ANN(5) and FLIC(1024) mapped to Other(n). (NDN Packet Format v0.3 §6.3)
 - [x] **12. FinalBlockId not decoded** — Data MetaInfo FinalBlockId (TLV 0x1A) is not parsed; consumers cannot detect last segment. (NDN Packet Format v0.3 §6.2)
 - [ ] **13. Signed Interests not supported** — no InterestSignatureInfo/InterestSignatureValue parsing or verification. (NDN Packet Format v0.3 §5.4)
-- [ ] **14. ParametersSha256DigestComponent not verified** — component type 0x02 parsed but digest not validated against ApplicationParameters. (NDN Packet Format v0.3 §2.3)
+- [x] **14. ParametersSha256DigestComponent not verified** — decoder validates SHA-256 digest against ApplicationParameters TLV. (NDN Packet Format v0.3 §2.3)
 - [x] **15. CanBePrefix / MustBeFresh semantics incomplete** — MustBeFresh is parsed but CS lookup may not filter on FreshnessPeriod expiry. CanBePrefix longest-match may be incomplete. (RFC 8569 §4.2)
 - [x] **16. PIT aggregation rules incomplete** — spec requires same (Name, Selectors, ForwardingHint) tuple; current PIT key may not include ForwardingHint. (RFC 8569 §4.2)
 - [ ] **17. CS admission policy** — no policy hooks for cache admission (e.g., respecting MustBeFresh, cache directives). (RFC 8569 §4.3)
