@@ -112,6 +112,13 @@ impl Data {
         &self.raw
     }
 
+    /// The implicit SHA-256 digest of this Data packet — the SHA-256 hash
+    /// of the full wire encoding. Used for exact Data retrieval via
+    /// ImplicitSha256DigestComponent (type 0x01) in Interest names.
+    pub fn implicit_digest(&self) -> ring::digest::Digest {
+        ring::digest::digest(&ring::digest::SHA256, &self.raw)
+    }
+
     pub fn content(&self) -> Option<&Bytes> {
         self.content.get_or_init(|| decode_content(&self.raw).ok().flatten()).as_ref()
     }
@@ -316,6 +323,16 @@ mod tests {
         let raw = build_data_packet(&[b"test"], b"hi", None, 0, &[0x00]);
         let d = Data::decode(raw.clone()).unwrap();
         assert_eq!(d.raw(), &raw);
+    }
+
+    // ── implicit_digest ────────────────────────────────────────────────────
+
+    #[test]
+    fn implicit_digest_is_sha256_of_raw() {
+        let raw = build_data_packet(&[b"test"], b"content", None, 5, &[0xAB]);
+        let d = Data::decode(raw.clone()).unwrap();
+        let expected = ring::digest::digest(&ring::digest::SHA256, &raw);
+        assert_eq!(d.implicit_digest().as_ref(), expected.as_ref());
     }
 
     // ── error cases ───────────────────────────────────────────────────────────

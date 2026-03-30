@@ -48,15 +48,34 @@ impl LruCs {
 impl ContentStore for LruCs {
     async fn get(&self, interest: &Interest) -> Option<CsEntry> {
         let mut inner = self.inner.lock().unwrap();
-        let entry = if interest.selectors().can_be_prefix {
-            // Walk the prefix trie to find a cached data whose name starts
-            // with the interest name, then look it up in the LRU cache
-            // (which promotes it to MRU).
+
+        // Check if the Interest carries an ImplicitSha256DigestComponent as
+        // its last name component. If so, strip it and look up by Data name,
+        // then verify the digest against the cached wire bytes.
+        let comps = interest.name.components();
+        let has_implicit_digest = !comps.is_empty()
+            && comps.last().unwrap().typ == ndn_packet::tlv_type::IMPLICIT_SHA256;
+
+        let entry = if has_implicit_digest {
+            // Build the Data name (Interest name minus the digest component).
+            let data_name = Name::from_components(
+                comps[..comps.len() - 1].iter().cloned()
+            );
+            let candidate = inner.cache.get(&data_name)?.clone();
+            // Verify the implicit digest matches.
+            let expected_digest = &comps.last().unwrap().value;
+            let actual = ring::digest::digest(&ring::digest::SHA256, &candidate.data);
+            if expected_digest.as_ref() != actual.as_ref() {
+                return None;
+            }
+            candidate
+        } else if interest.selectors().can_be_prefix {
             let data_name = inner.prefix_index.first_descendant(&interest.name)?;
             inner.cache.get(data_name.as_ref())?.clone()
         } else {
             inner.cache.get(interest.name.as_ref())?.clone()
         };
+
         if interest.selectors().must_be_fresh && !entry.is_fresh(now_ns()) {
             return None;
         }
@@ -85,7 +104,7 @@ impl ContentStore for LruCs {
             if let Some((evicted_name, evicted)) = inner.cache.pop_lru() {
                 inner.current_bytes =
                     inner.current_bytes.saturating_sub(evicted.data.len());
-                inner.prefix_index.remove(&*evicted_name);
+                inner.prefix_index.remove(&evicted_name);
             } else {
                 break;
             }
@@ -306,6 +325,43 @@ mod tests {
         assert!(cs.get(&interest(&["a"])).await.is_none());
         assert!(cs.get(&interest(&["b"])).await.is_some());
         assert!(cs.get(&interest(&["c"])).await.is_some());
+    }
+
+    // ── implicit SHA-256 digest ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn implicit_digest_lookup_matches() {
+        let cs = LruCs::new(65536);
+        let data_bytes = Bytes::from_static(b"wire-format-data");
+        let name = arc_name(&["a", "b"]);
+        cs.insert(data_bytes.clone(), name.clone(), meta_fresh()).await;
+
+        // Build an Interest whose name is /a/b/<implicit-digest>
+        let digest = ring::digest::digest(&ring::digest::SHA256, &data_bytes);
+        let mut comps: Vec<NameComponent> = name.components().to_vec();
+        comps.push(NameComponent {
+            typ: ndn_packet::tlv_type::IMPLICIT_SHA256,
+            value: Bytes::copy_from_slice(digest.as_ref()),
+        });
+        let interest_name = Name::from_components(comps);
+        let i = Interest::new(interest_name);
+        let entry = cs.get(&i).await.expect("implicit digest hit");
+        assert_eq!(entry.data.as_ref(), b"wire-format-data");
+    }
+
+    #[tokio::test]
+    async fn implicit_digest_wrong_hash_misses() {
+        let cs = LruCs::new(65536);
+        cs.insert(Bytes::from_static(b"data"), arc_name(&["a"]), meta_fresh()).await;
+
+        // Wrong digest
+        let mut comps: Vec<NameComponent> = arc_name(&["a"]).components().to_vec();
+        comps.push(NameComponent {
+            typ: ndn_packet::tlv_type::IMPLICIT_SHA256,
+            value: Bytes::from_static(&[0u8; 32]),
+        });
+        let i = Interest::new(Name::from_components(comps));
+        assert!(cs.get(&i).await.is_none());
     }
 
     #[tokio::test]
