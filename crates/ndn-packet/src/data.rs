@@ -67,7 +67,6 @@ impl Data {
         // Scan for SignatureValue to determine the signed region end.
         let mut sig_value_start = 0;
         let mut sig_value_end   = 0;
-        let scan = TlvReader::new(value.clone());
         let _ = scan_for_sig_value(&raw, outer_header_len, &mut sig_value_start, &mut sig_value_end);
         let signed_end = if sig_value_start > 0 { sig_value_start } else { raw.len() };
 

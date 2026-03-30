@@ -100,9 +100,9 @@ impl Nack {
             }
         }
 
-        let interest_bytes = interest_raw.ok_or_else(|| {
+        let interest_bytes = interest_raw.ok_or(
             PacketError::Tlv(ndn_tlv::TlvError::MissingField("Interest inside Nack"))
-        })?;
+        )?;
         let interest = Interest::decode(interest_bytes)?;
         Ok(Self { reason, interest })
     }
