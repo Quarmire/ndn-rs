@@ -40,10 +40,19 @@ impl SignatureType {
 }
 
 /// SignatureInfo TLV — algorithm and optional key locator.
+///
+/// Also decodes the anti-replay fields from InterestSignatureInfo:
+/// SignatureNonce (0x26), SignatureTime (0x28), SignatureSeqNum (0x2A).
 #[derive(Clone, Debug)]
 pub struct SignatureInfo {
-    pub sig_type:    SignatureType,
-    pub key_locator: Option<Arc<Name>>,
+    pub sig_type:       SignatureType,
+    pub key_locator:    Option<Arc<Name>>,
+    /// Random nonce for anti-replay (NDN Packet Format v0.3 §5.4).
+    pub sig_nonce:      Option<Bytes>,
+    /// Timestamp in milliseconds since Unix epoch (NDN Packet Format v0.3 §5.4).
+    pub sig_time:       Option<u64>,
+    /// Monotonically increasing sequence number (NDN Packet Format v0.3 §5.4).
+    pub sig_seq_num:    Option<u64>,
 }
 
 impl SignatureInfo {
@@ -51,6 +60,9 @@ impl SignatureInfo {
         let mut reader = TlvReader::new(value);
         let mut sig_type = SignatureType::Other(0);
         let mut key_locator = None;
+        let mut sig_nonce = None;
+        let mut sig_time = None;
+        let mut sig_seq_num = None;
 
         while !reader.is_empty() {
             let (typ, val) = reader.read_tlv()?;
@@ -61,7 +73,6 @@ impl SignatureInfo {
                     sig_type = SignatureType::from_code(code);
                 }
                 t if t == tlv_type::KEY_LOCATOR => {
-                    // KeyLocator contains a Name TLV.
                     let mut inner = TlvReader::new(val);
                     if !inner.is_empty() {
                         let (kt, kv) = inner.read_tlv()?;
@@ -71,10 +82,23 @@ impl SignatureInfo {
                         }
                     }
                 }
+                t if t == tlv_type::SIGNATURE_NONCE => {
+                    sig_nonce = Some(val);
+                }
+                t if t == tlv_type::SIGNATURE_TIME => {
+                    let mut ms = 0u64;
+                    for &b in val.iter() { ms = (ms << 8) | b as u64; }
+                    sig_time = Some(ms);
+                }
+                t if t == tlv_type::SIGNATURE_SEQ_NUM => {
+                    let mut n = 0u64;
+                    for &b in val.iter() { n = (n << 8) | b as u64; }
+                    sig_seq_num = Some(n);
+                }
                 _ => {}
             }
         }
-        Ok(Self { sig_type, key_locator })
+        Ok(Self { sig_type, key_locator, sig_nonce, sig_time, sig_seq_num })
     }
 }
 
@@ -156,5 +180,57 @@ mod tests {
         let si = SignatureInfo::decode(bytes::Bytes::new()).unwrap();
         assert_eq!(si.sig_type, SignatureType::Other(0));
         assert!(si.key_locator.is_none());
+    }
+
+    // ── Anti-replay fields ──────────────────────────────────────────────────
+
+    #[test]
+    fn decode_sig_nonce() {
+        let mut w = TlvWriter::new();
+        w.write_tlv(crate::tlv_type::SIGNATURE_TYPE, &[5]);
+        w.write_tlv(crate::tlv_type::SIGNATURE_NONCE, &[0xDE, 0xAD, 0xBE, 0xEF]);
+        let si = SignatureInfo::decode(w.finish()).unwrap();
+        assert_eq!(si.sig_nonce.as_deref(), Some(&[0xDE, 0xAD, 0xBE, 0xEF][..]));
+    }
+
+    #[test]
+    fn decode_sig_time() {
+        let mut w = TlvWriter::new();
+        w.write_tlv(crate::tlv_type::SIGNATURE_TYPE, &[5]);
+        let ts: u64 = 1700000000_000; // millis
+        w.write_tlv(crate::tlv_type::SIGNATURE_TIME, &ts.to_be_bytes());
+        let si = SignatureInfo::decode(w.finish()).unwrap();
+        assert_eq!(si.sig_time, Some(ts));
+    }
+
+    #[test]
+    fn decode_sig_seq_num() {
+        let mut w = TlvWriter::new();
+        w.write_tlv(crate::tlv_type::SIGNATURE_TYPE, &[5]);
+        w.write_tlv(crate::tlv_type::SIGNATURE_SEQ_NUM, &42u64.to_be_bytes());
+        let si = SignatureInfo::decode(w.finish()).unwrap();
+        assert_eq!(si.sig_seq_num, Some(42));
+    }
+
+    #[test]
+    fn decode_all_anti_replay_fields() {
+        let mut w = TlvWriter::new();
+        w.write_tlv(crate::tlv_type::SIGNATURE_TYPE, &[5]);
+        w.write_tlv(crate::tlv_type::SIGNATURE_NONCE, &[0x01, 0x02]);
+        w.write_tlv(crate::tlv_type::SIGNATURE_TIME, &500u64.to_be_bytes());
+        w.write_tlv(crate::tlv_type::SIGNATURE_SEQ_NUM, &7u64.to_be_bytes());
+        let si = SignatureInfo::decode(w.finish()).unwrap();
+        assert_eq!(si.sig_nonce.as_deref(), Some(&[0x01, 0x02][..]));
+        assert_eq!(si.sig_time, Some(500));
+        assert_eq!(si.sig_seq_num, Some(7));
+    }
+
+    #[test]
+    fn decode_no_anti_replay_fields() {
+        let raw = build_sig_info(5, None);
+        let si = SignatureInfo::decode(raw).unwrap();
+        assert!(si.sig_nonce.is_none());
+        assert!(si.sig_time.is_none());
+        assert!(si.sig_seq_num.is_none());
     }
 }
