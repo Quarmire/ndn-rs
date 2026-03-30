@@ -25,6 +25,12 @@ pub struct LpPacket {
     pub nack: Option<NackReason>,
     /// Hop-by-hop congestion mark (0 = no congestion).
     pub congestion_mark: Option<u64>,
+    /// Fragment sequence number (for reassembly ordering).
+    pub sequence: Option<u64>,
+    /// Zero-based index of this fragment within the original packet.
+    pub frag_index: Option<u64>,
+    /// Total number of fragments the original packet was split into.
+    pub frag_count: Option<u64>,
 }
 
 impl LpPacket {
@@ -42,6 +48,9 @@ impl LpPacket {
         let mut fragment = None;
         let mut nack = None;
         let mut congestion_mark = None;
+        let mut sequence = None;
+        let mut frag_index = None;
+        let mut frag_count = None;
 
         while !inner.is_empty() {
             let (t, v) = inner.read_tlv()?;
@@ -50,29 +59,26 @@ impl LpPacket {
                     fragment = Some(v);
                 }
                 tlv_type::NACK => {
-                    // Nack header field: may contain NackReason sub-TLV.
                     nack = Some(decode_nack_header(v)?);
                 }
                 tlv_type::LP_CONGESTION_MARK => {
-                    let mut mark = 0u64;
-                    for &b in v.iter() {
-                        mark = (mark << 8) | b as u64;
-                    }
-                    congestion_mark = Some(mark);
+                    congestion_mark = Some(decode_be_u64(&v));
                 }
-                // Interest or Data appearing directly (without Fragment wrapper)
-                // is also valid per spec — the "fragment" is the rest of the
-                // LpPacket value.
+                tlv_type::LP_SEQUENCE => {
+                    sequence = Some(decode_be_u64(&v));
+                }
+                tlv_type::LP_FRAG_INDEX => {
+                    frag_index = Some(decode_be_u64(&v));
+                }
+                tlv_type::LP_FRAG_COUNT => {
+                    frag_count = Some(decode_be_u64(&v));
+                }
                 tlv_type::INTEREST | tlv_type::DATA => {
-                    // Reconstruct the full TLV (type + length + value).
                     let mut w = TlvWriter::new();
                     w.write_tlv(t, &v);
                     fragment = Some(w.finish());
                 }
-                _ => {
-                    // Skip unknown fields (non-critical per NDNLPv2 rules:
-                    // LP header field types use even = non-critical).
-                }
+                _ => {}
             }
         }
 
@@ -84,8 +90,27 @@ impl LpPacket {
             fragment,
             nack,
             congestion_mark,
+            sequence,
+            frag_index,
+            frag_count,
         })
     }
+}
+
+impl LpPacket {
+    /// Returns `true` if this LpPacket is a fragment of a larger packet.
+    pub fn is_fragmented(&self) -> bool {
+        self.frag_count.is_some_and(|c| c > 1)
+    }
+}
+
+/// Decode a big-endian unsigned integer from variable-length bytes.
+fn decode_be_u64(bytes: &[u8]) -> u64 {
+    let mut val = 0u64;
+    for &b in bytes {
+        val = (val << 8) | b as u64;
+    }
+    val
 }
 
 /// Decode the Nack header field value to extract the NackReason.
@@ -236,6 +261,41 @@ mod tests {
             // No fragment.
         });
         assert!(LpPacket::decode(w.finish()).is_err());
+    }
+
+    #[test]
+    fn decode_fragmentation_fields() {
+        let n = name(&[b"test"]);
+        let interest_wire = encode_interest(&n, None);
+
+        let mut w = TlvWriter::new();
+        w.write_nested(tlv_type::LP_PACKET, |w| {
+            w.write_tlv(tlv_type::LP_SEQUENCE, &42u64.to_be_bytes());
+            w.write_tlv(tlv_type::LP_FRAG_INDEX, &[0]);
+            w.write_tlv(tlv_type::LP_FRAG_COUNT, &[3]);
+            w.write_tlv(tlv_type::LP_FRAGMENT, &interest_wire);
+        });
+        let lp = LpPacket::decode(w.finish()).unwrap();
+        assert_eq!(lp.sequence, Some(42));
+        assert_eq!(lp.frag_index, Some(0));
+        assert_eq!(lp.frag_count, Some(3));
+        assert!(lp.is_fragmented());
+    }
+
+    #[test]
+    fn unfragmented_packet_not_fragmented() {
+        let n = name(&[b"test"]);
+        let interest_wire = encode_interest(&n, None);
+
+        let mut w = TlvWriter::new();
+        w.write_nested(tlv_type::LP_PACKET, |w| {
+            w.write_tlv(tlv_type::LP_FRAGMENT, &interest_wire);
+        });
+        let lp = LpPacket::decode(w.finish()).unwrap();
+        assert!(!lp.is_fragmented());
+        assert!(lp.sequence.is_none());
+        assert!(lp.frag_index.is_none());
+        assert!(lp.frag_count.is_none());
     }
 
     #[test]
