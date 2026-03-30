@@ -10,6 +10,6 @@ pub use trie::NameTrie;
 pub use pit::{Pit, PitEntry, PitToken, InRecord, OutRecord};
 pub use fib::{Fib, FibEntry, FibNexthop};
 pub use strategy_table::StrategyTable;
-pub use content_store::{ContentStore, CsEntry, CsMeta, InsertResult, CsCapacity, NullCs};
+pub use content_store::{ContentStore, CsEntry, CsMeta, InsertResult, CsCapacity, NullCs, CsAdmissionPolicy, DefaultAdmissionPolicy, AdmitAllPolicy};
 pub use lru_cs::LruCs;
 pub use sharded_cs::ShardedCs;

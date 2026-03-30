@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ndn_pipeline::{Action, DecodedPacket, PacketContext};
-use ndn_store::{CsEntry, CsMeta, ContentStore, LruCs};
+use ndn_store::{CsEntry, CsAdmissionPolicy, CsMeta, ContentStore, LruCs};
 
 /// Look up the CS before hitting the PIT/FIB.
 ///
@@ -39,13 +39,20 @@ impl CsLookupStage {
 ///
 /// Reads `ctx.raw_bytes` (the wire-format Data) and the decoded name.
 /// Freshness defaults to 0 (immediately stale) if `FreshnessPeriod` is absent.
+/// The admission policy is consulted before inserting — Data that fails the
+/// policy check is not cached.
 pub struct CsInsertStage {
     pub cs: Arc<LruCs>,
+    pub admission: Arc<dyn CsAdmissionPolicy>,
 }
 
 impl CsInsertStage {
     pub async fn process(&self, ctx: PacketContext) -> Action {
         if let DecodedPacket::Data(ref data) = ctx.packet {
+            if !self.admission.should_admit(data) {
+                return Action::Satisfy(ctx);
+            }
+
             let now_ns = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()

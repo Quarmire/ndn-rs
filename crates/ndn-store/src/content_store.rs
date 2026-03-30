@@ -76,6 +76,40 @@ pub trait ContentStore: Send + Sync + 'static {
     fn capacity(&self) -> CsCapacity;
 }
 
+/// Policy that decides whether a Data packet should be admitted to the CS.
+///
+/// Implementations can inspect the decoded Data to make admission decisions
+/// based on FreshnessPeriod, ContentType, name prefix, etc.
+pub trait CsAdmissionPolicy: Send + Sync + 'static {
+    /// Returns `true` if the Data should be cached.
+    fn should_admit(&self, data: &ndn_packet::Data) -> bool;
+}
+
+/// Default policy: admit all Data packets that have a non-zero FreshnessPeriod,
+/// or that lack FreshnessPeriod (treated as "no freshness constraint" by the spec).
+///
+/// Data with FreshnessPeriod=0 is immediately stale and typically not worth caching.
+pub struct DefaultAdmissionPolicy;
+
+impl CsAdmissionPolicy for DefaultAdmissionPolicy {
+    fn should_admit(&self, data: &ndn_packet::Data) -> bool {
+        match data.meta_info().and_then(|m| m.freshness_period) {
+            Some(d) if d.is_zero() => false,
+            _ => true,
+        }
+    }
+}
+
+/// Admit everything unconditionally — useful when the application manages
+/// freshness externally or for testing.
+pub struct AdmitAllPolicy;
+
+impl CsAdmissionPolicy for AdmitAllPolicy {
+    fn should_admit(&self, _: &ndn_packet::Data) -> bool {
+        true
+    }
+}
+
 /// A no-op content store — disables caching entirely at zero pipeline cost.
 pub struct NullCs;
 

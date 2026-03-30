@@ -113,7 +113,10 @@ impl EngineBuilder {
                 face_table:   Arc::clone(&face_table),
             },
             pit_match:   PitMatchStage { pit: Arc::clone(&pit) },
-            cs_insert:   CsInsertStage { cs: Arc::clone(&cs) },
+            cs_insert:   CsInsertStage {
+                cs: Arc::clone(&cs),
+                admission: Arc::new(ndn_store::DefaultAdmissionPolicy),
+            },
             channel_cap: self.config.pipeline_channel_cap,
         };
 
