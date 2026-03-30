@@ -49,7 +49,7 @@ ndn-rs/
 │   └── ndn-research     # FlowObserverStage, RadioTable, nl80211
 └── binaries/
     ├── ndn-router       # Standalone forwarder
-    ├── ndn-tools        # ndn-peek, ndn-put, ndn-ping, ndn-ls
+    ├── ndn-tools        # ndn-peek, ndn-put, ndn-ping, ndn-traffic, ndn-iperf
     └── ndn-bench        # Throughput and latency benchmarking
 ```
 
@@ -104,6 +104,22 @@ echo '{"cmd":"get_stats"}' | nc -U $SOCK
 # Graceful shutdown
 echo '{"cmd":"shutdown"}' | nc -U $SOCK
 ```
+
+### Traffic generator and bandwidth measurement
+
+Two tools measure full-pipeline performance by embedding a forwarding engine
+with producer/consumer `AppFace` pairs:
+
+```bash
+# Traffic generator — configurable rate, concurrency, payload size:
+cargo run --release --bin ndn-traffic -- --mode echo --count 100000 --concurrency 4
+
+# Bandwidth measurement — sliding-window sustained throughput:
+cargo run --release --bin ndn-iperf -- --duration 5 --size 8192 --window 64
+```
+
+See [`binaries/ndn-tools/README.md`](binaries/ndn-tools/README.md) for all
+options and output format.
 
 ---
 
