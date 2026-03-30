@@ -130,6 +130,28 @@ impl Data {
     pub fn sig_info(&self) -> Option<&SignatureInfo> {
         self.sig_info.get_or_init(|| decode_sig_info(&self.raw).ok().flatten()).as_ref()
     }
+
+    /// Parse the delegation list from a Link object (ContentType=LINK).
+    ///
+    /// Per NDN Packet Format v0.3 §6.3.1, when ContentType is LINK the Content
+    /// field contains one or more Name TLVs. Returns `None` if this Data is not
+    /// a Link or has no content.
+    pub fn link_delegations(&self) -> Option<Vec<Arc<Name>>> {
+        let mi = self.meta_info()?;
+        if mi.content_type != crate::meta_info::ContentType::Link {
+            return None;
+        }
+        let content = self.content()?;
+        let mut reader = TlvReader::new(content.clone());
+        let mut names = Vec::new();
+        while !reader.is_empty() {
+            let (typ, val) = reader.read_tlv().ok()?;
+            if typ == tlv_type::NAME {
+                names.push(Arc::new(Name::decode(val).ok()?));
+            }
+        }
+        if names.is_empty() { None } else { Some(names) }
+    }
 }
 
 fn scan_for_sig_value(
@@ -323,6 +345,58 @@ mod tests {
         let raw = build_data_packet(&[b"test"], b"hi", None, 0, &[0x00]);
         let d = Data::decode(raw.clone()).unwrap();
         assert_eq!(d.raw(), &raw);
+    }
+
+    // ── link_delegations ───────────────────────────────────────────────────
+
+    fn build_link_data(name_comps: &[&[u8]], delegations: &[&[&[u8]]]) -> Bytes {
+        let mut content_w = ndn_tlv::TlvWriter::new();
+        for del in delegations {
+            content_w.write_nested(tlv_type::NAME, |w| {
+                for comp in *del {
+                    w.write_tlv(tlv_type::NAME_COMPONENT, comp);
+                }
+            });
+        }
+        let content_bytes = content_w.finish();
+
+        let mut w = ndn_tlv::TlvWriter::new();
+        w.write_nested(tlv_type::DATA, |w| {
+            w.write_nested(tlv_type::NAME, |w| {
+                for comp in name_comps {
+                    w.write_tlv(tlv_type::NAME_COMPONENT, comp);
+                }
+            });
+            w.write_nested(tlv_type::META_INFO, |w| {
+                w.write_tlv(tlv_type::CONTENT_TYPE, &[1]); // LINK = 1
+            });
+            w.write_tlv(tlv_type::CONTENT, &content_bytes);
+            w.write_nested(tlv_type::SIGNATURE_INFO, |w| {
+                w.write_tlv(tlv_type::SIGNATURE_TYPE, &[0]);
+            });
+            w.write_tlv(tlv_type::SIGNATURE_VALUE, &[0x00]);
+        });
+        w.finish()
+    }
+
+    #[test]
+    fn link_delegations_parsed() {
+        let raw = build_link_data(
+            &[b"link"],
+            &[&[b"ndn", b"gateway1"], &[b"ndn", b"gateway2"]],
+        );
+        let d = Data::decode(raw).unwrap();
+        let dels = d.link_delegations().expect("delegations present");
+        assert_eq!(dels.len(), 2);
+        assert_eq!(dels[0].components()[1].value.as_ref(), b"gateway1");
+        assert_eq!(dels[1].components()[1].value.as_ref(), b"gateway2");
+    }
+
+    #[test]
+    fn non_link_data_has_no_delegations() {
+        let raw = build_data_packet(&[b"test"], b"payload", None, 5, &[0x00]);
+        let d = Data::decode(raw).unwrap();
+        assert!(d.link_delegations().is_none());
     }
 
     // ── implicit_digest ────────────────────────────────────────────────────
