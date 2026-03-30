@@ -120,6 +120,10 @@ impl Pit {
         Self { entries: DashMap::new() }
     }
 
+    pub fn clear(&self) {
+        self.entries.clear();
+    }
+
     pub fn insert(&self, token: PitToken, entry: PitEntry) {
         self.entries.insert(token, entry);
     }
