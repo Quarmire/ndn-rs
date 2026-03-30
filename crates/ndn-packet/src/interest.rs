@@ -4,7 +4,7 @@ use core::time::Duration;
 
 use bytes::Bytes;
 
-use crate::{Name, PacketError};
+use crate::{Name, PacketError, SignatureInfo};
 use crate::tlv_type;
 use ndn_tlv::TlvReader;
 
@@ -45,6 +45,12 @@ pub struct Interest {
 
     /// ForwardingHint (TLV 0x1E) — list of delegation Names, decoded on first access.
     forwarding_hint: OnceLock<Option<Vec<Arc<Name>>>>,
+
+    /// InterestSignatureInfo (TLV 0x2C) — decoded on first access.
+    sig_info: OnceLock<Option<SignatureInfo>>,
+
+    /// InterestSignatureValue (TLV 0x2E) — raw signature bytes, decoded on first access.
+    sig_value: OnceLock<Option<Bytes>>,
 }
 
 impl Interest {
@@ -59,6 +65,8 @@ impl Interest {
             app_params:       OnceLock::new(),
             hop_limit:        OnceLock::new(),
             forwarding_hint:  OnceLock::new(),
+            sig_info:         OnceLock::new(),
+            sig_value:        OnceLock::new(),
         }
     }
 
@@ -130,6 +138,8 @@ impl Interest {
             app_params:       OnceLock::new(),
             hop_limit:        OnceLock::new(),
             forwarding_hint:  OnceLock::new(),
+            sig_info:         OnceLock::new(),
+            sig_value:        OnceLock::new(),
         })
     }
 
@@ -174,6 +184,28 @@ impl Interest {
     /// The forwarder must decrement before forwarding and drop if zero.
     pub fn hop_limit(&self) -> Option<u8> {
         *self.hop_limit.get_or_init(|| decode_hop_limit(&self.raw).ok().flatten())
+    }
+
+    /// InterestSignatureInfo, if present (Signed Interest per NDN Packet Format v0.3 §5.4).
+    pub fn sig_info(&self) -> Option<&SignatureInfo> {
+        self.sig_info
+            .get_or_init(|| decode_interest_sig_info(&self.raw).ok().flatten())
+            .as_ref()
+    }
+
+    /// InterestSignatureValue bytes, if present.
+    pub fn sig_value(&self) -> Option<&Bytes> {
+        self.sig_value
+            .get_or_init(|| decode_interest_sig_value(&self.raw).ok().flatten())
+            .as_ref()
+    }
+
+    /// The signed region of a Signed Interest — from the start of Name TLV
+    /// through the end of InterestSignatureInfo TLV (inclusive).
+    ///
+    /// Returns `None` if InterestSignatureInfo is not present.
+    pub fn signed_region(&self) -> Option<&[u8]> {
+        compute_interest_signed_region(&self.raw).ok().flatten()
     }
 
     pub fn raw(&self) -> &Bytes {
@@ -269,6 +301,60 @@ fn decode_hop_limit(raw: &Bytes) -> Result<Option<u8>, PacketError> {
         }
     }
     Ok(None)
+}
+
+fn decode_interest_sig_info(raw: &Bytes) -> Result<Option<SignatureInfo>, PacketError> {
+    if raw.is_empty() { return Ok(None); }
+    let mut reader = TlvReader::new(raw.clone());
+    let (_, value) = reader.read_tlv()?;
+    let mut inner = TlvReader::new(value);
+    while !inner.is_empty() {
+        let (typ, val) = inner.read_tlv()?;
+        if typ == tlv_type::INTEREST_SIGNATURE_INFO {
+            return Ok(Some(SignatureInfo::decode(val)?));
+        }
+    }
+    Ok(None)
+}
+
+fn decode_interest_sig_value(raw: &Bytes) -> Result<Option<Bytes>, PacketError> {
+    if raw.is_empty() { return Ok(None); }
+    let mut reader = TlvReader::new(raw.clone());
+    let (_, value) = reader.read_tlv()?;
+    let mut inner = TlvReader::new(value);
+    while !inner.is_empty() {
+        let (typ, val) = inner.read_tlv()?;
+        if typ == tlv_type::INTEREST_SIGNATURE_VALUE {
+            return Ok(Some(val));
+        }
+    }
+    Ok(None)
+}
+
+/// Compute the signed region for a Signed Interest.
+///
+/// Per NDN Packet Format v0.3 §5.4, the signed portion covers from the first
+/// byte of the Name TLV through the last byte of the InterestSignatureInfo TLV,
+/// all relative to the Interest's inner value (after the outer TLV header).
+fn compute_interest_signed_region(raw: &Bytes) -> Result<Option<&[u8]>, PacketError> {
+    if raw.is_empty() { return Ok(None); }
+    let mut reader = TlvReader::new(raw.clone());
+    let (_, value) = reader.read_tlv()?;
+    let outer_header_len = raw.len() - value.len();
+    let mut inner = TlvReader::new(value);
+    let mut sig_info_end = 0usize;
+    while !inner.is_empty() {
+        let (typ, _) = inner.read_tlv()?;
+        if typ == tlv_type::INTEREST_SIGNATURE_INFO {
+            sig_info_end = outer_header_len + inner.position();
+            break;
+        }
+    }
+    if sig_info_end == 0 {
+        return Ok(None);
+    }
+    // Signed region: from start of Name (first byte of inner value) to end of SigInfo.
+    Ok(Some(&raw[outer_header_len..sig_info_end]))
 }
 
 fn decode_lifetime(raw: &Bytes) -> Result<Option<Duration>, PacketError> {
@@ -521,6 +607,90 @@ mod tests {
         let raw = build_interest_full(&[b"test"], None, None, false, false, Some(0));
         let i = Interest::decode(raw).unwrap();
         assert_eq!(i.hop_limit(), Some(0));
+    }
+
+    // ── Signed Interest ────────────────────────────────────────────────────
+
+    fn build_signed_interest(
+        components: &[&[u8]],
+        sig_type_code: u8,
+        sig_value: &[u8],
+    ) -> Bytes {
+        let mut w = TlvWriter::new();
+        w.write_nested(tlv_type::INTEREST, |w| {
+            w.write_nested(tlv_type::NAME, |w| {
+                for comp in components {
+                    w.write_tlv(tlv_type::NAME_COMPONENT, comp);
+                }
+            });
+            w.write_nested(tlv_type::INTEREST_SIGNATURE_INFO, |w| {
+                w.write_tlv(tlv_type::SIGNATURE_TYPE, &[sig_type_code]);
+            });
+            w.write_tlv(tlv_type::INTEREST_SIGNATURE_VALUE, sig_value);
+        });
+        w.finish()
+    }
+
+    #[test]
+    fn decode_signed_interest_sig_info() {
+        let raw = build_signed_interest(&[b"test"], 5, &[0xAB, 0xCD]);
+        let i = Interest::decode(raw).unwrap();
+        let si = i.sig_info().expect("sig_info present");
+        assert_eq!(si.sig_type, crate::SignatureType::SignatureEd25519);
+    }
+
+    #[test]
+    fn decode_signed_interest_sig_value() {
+        let raw = build_signed_interest(&[b"test"], 5, &[0xDE, 0xAD]);
+        let i = Interest::decode(raw).unwrap();
+        let sv = i.sig_value().expect("sig_value present");
+        assert_eq!(sv.as_ref(), &[0xDE, 0xAD]);
+    }
+
+    #[test]
+    fn decode_signed_interest_signed_region() {
+        let raw = build_signed_interest(&[b"test"], 5, &[0xAB, 0xCD]);
+        let i = Interest::decode(raw.clone()).unwrap();
+        let region = i.signed_region().expect("signed region present");
+        // Region must not be empty.
+        assert!(!region.is_empty());
+        // Region must not contain the signature value bytes.
+        assert!(!region.ends_with(&[0xAB, 0xCD]));
+        // Region must start with the Name TLV type (0x07).
+        assert_eq!(region[0], tlv_type::NAME as u8);
+    }
+
+    #[test]
+    fn unsigned_interest_has_no_sig_fields() {
+        let raw = build_interest(&[b"test"], None, None, false, false);
+        let i = Interest::decode(raw).unwrap();
+        assert!(i.sig_info().is_none());
+        assert!(i.sig_value().is_none());
+        assert!(i.signed_region().is_none());
+    }
+
+    #[test]
+    fn signed_interest_with_key_locator() {
+        let mut w = TlvWriter::new();
+        w.write_nested(tlv_type::INTEREST, |w| {
+            w.write_nested(tlv_type::NAME, |w| {
+                w.write_tlv(tlv_type::NAME_COMPONENT, b"test");
+            });
+            w.write_nested(tlv_type::INTEREST_SIGNATURE_INFO, |w| {
+                w.write_tlv(tlv_type::SIGNATURE_TYPE, &[5]);
+                w.write_nested(tlv_type::KEY_LOCATOR, |w| {
+                    w.write_nested(tlv_type::NAME, |w| {
+                        w.write_tlv(tlv_type::NAME_COMPONENT, b"key1");
+                    });
+                });
+            });
+            w.write_tlv(tlv_type::INTEREST_SIGNATURE_VALUE, &[0xFF]);
+        });
+        let raw = w.finish();
+        let i = Interest::decode(raw).unwrap();
+        let si = i.sig_info().unwrap();
+        let kl = si.key_locator.as_ref().expect("key_locator present");
+        assert_eq!(kl.components()[0].value.as_ref(), b"key1");
     }
 
     #[test]

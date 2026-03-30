@@ -15,7 +15,7 @@ bootstrapping phase and all APIs should be considered unstable.
 #### NDN spec compliance — SPEC-GAPS.md tracker and fixes
 
 25-item spec compliance audit against RFC 8569, NDN Packet Format v0.3, and
-NDNLPv2. Created `SPEC-GAPS.md` checklist. 20 of 25 gaps resolved:
+NDNLPv2. Created `SPEC-GAPS.md` checklist. 22 of 25 gaps resolved:
 
 **ndn-tlv:**
 - **VarNumber shortest-encoding validation** — `read_varu64` rejects non-minimal
@@ -40,6 +40,11 @@ NDNLPv2. Created `SPEC-GAPS.md` checklist. 20 of 25 gaps resolved:
 - **ParametersSha256DigestComponent** — encoder computes SHA-256 digest; decoder
   validates both presence and correctness against ApplicationParameters.
 - **`PacketError::MalformedPacket`** variant added for semantic validation errors.
+- **Signed Interest support** — `Interest::sig_info()`, `sig_value()`, and
+  `signed_region()` decode InterestSignatureInfo (0x2C) and InterestSignatureValue
+  (0x2E) lazily; signed region covers Name through SigInfo for verification.
+- **Signed Interest TLV constants** — `INTEREST_SIGNATURE_INFO`, `INTEREST_SIGNATURE_VALUE`,
+  `SIGNATURE_NONCE`, `SIGNATURE_TIME`, `SIGNATURE_SEQ_NUM` added to `tlv_type`.
 
 **ndn-pipeline:**
 - **`DropReason::HopLimitExceeded`** variant for HopLimit=0 enforcement.

@@ -9,7 +9,7 @@ Tracking deviations from official NDN specifications (RFC 8569, NDN Packet Forma
 - [x] **1. HopLimit not decoded or enforced** — `ndn-packet` does not parse HopLimit (TLV 0x22) from Interest packets; forwarder does not decrement or drop at zero. (NDN Packet Format v0.3 §5.2)
 - [x] **2. Nonce not inserted by forwarder** — when forwarding an Interest upstream, forwarder must add a random Nonce if absent and detect loops via Nonce+Name. Currently no Nonce generation. (RFC 8569 §4.2)
 - [x] **3. Ed25519 signature type code wrong** — code is 7; NDN spec says 5. (NDN Packet Format v0.3 §10.3)
-- [ ] **4. Signed Interest support** — InterestSignatureInfo (0x2C) / InterestSignatureValue (0x2E) not yet implemented. Depends on gap #13. (NDN Packet Format v0.3 §5.4)
+- [x] **4. Signed Interest support** — Interest decodes InterestSignatureInfo (0x2C) and InterestSignatureValue (0x2E) lazily; `signed_region()` returns the Name-through-SigInfo byte range for verification. (NDN Packet Format v0.3 §5.4)
 - [x] **5. Nack not NDNLPv2 framed** — Nack is now encoded as LpPacket (0x64) with Nack header and Fragment. Decode accepts both formats. (NDNLPv2 spec)
 - [x] **6. No NDNLPv2 LpPacket framing** — `lp` module implements LpPacket decode/encode with Nack, CongestionMark, and Fragment support. Decode stage unwraps LpPackets. (NDNLPv2 spec)
 - [x] **7. VarNumber shortest-encoding not validated** — TLV reader accepts any encoding; spec requires shortest form. (NDN Packet Format v0.3 §1.2)
@@ -21,7 +21,7 @@ Tracking deviations from official NDN specifications (RFC 8569, NDN Packet Forma
 
 - [x] **11. ContentType values incomplete** — BLOB(0), LINK(1), KEY(2), NACK(3) all handled; PREFIX_ANN(5) and FLIC(1024) mapped to Other(n). (NDN Packet Format v0.3 §6.3)
 - [x] **12. FinalBlockId not decoded** — Data MetaInfo FinalBlockId (TLV 0x1A) is not parsed; consumers cannot detect last segment. (NDN Packet Format v0.3 §6.2)
-- [ ] **13. Signed Interests not supported** — no InterestSignatureInfo/InterestSignatureValue parsing or verification. (NDN Packet Format v0.3 §5.4)
+- [x] **13. Signed Interests not supported** — Interest now decodes InterestSignatureInfo/InterestSignatureValue and exposes `signed_region()` for verification. (NDN Packet Format v0.3 §5.4)
 - [x] **14. ParametersSha256DigestComponent not verified** — decoder validates SHA-256 digest against ApplicationParameters TLV. (NDN Packet Format v0.3 §2.3)
 - [x] **15. CanBePrefix / MustBeFresh semantics incomplete** — MustBeFresh is parsed but CS lookup may not filter on FreshnessPeriod expiry. CanBePrefix longest-match may be incomplete. (RFC 8569 §4.2)
 - [x] **16. PIT aggregation rules incomplete** — spec requires same (Name, Selectors, ForwardingHint) tuple; current PIT key may not include ForwardingHint. (RFC 8569 §4.2)
