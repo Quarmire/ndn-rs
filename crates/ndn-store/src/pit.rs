@@ -172,3 +172,96 @@ impl Default for Pit {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use ndn_packet::{Interest, Data, NameComponent, Selector};
+    use ndn_packet::encode::{encode_interest, encode_data_unsigned};
+
+    fn make_name(comps: &[&str]) -> Name {
+        Name::from_components(
+            comps.iter().map(|s| NameComponent::generic(Bytes::copy_from_slice(s.as_bytes())))
+        )
+    }
+
+    /// Verify PIT token matching for iperf-style Interest/Data flow.
+    ///
+    /// This reproduces the exact path used in the pipeline:
+    /// - PitCheckStage creates token with `from_interest_full(name, Some(selectors), fwd_hint)`
+    /// - PitMatchStage tries `from_interest(data.name, None)` then `from_interest(data.name, Some(default))`
+    #[test]
+    fn pit_token_iperf_interest_data_match() {
+        let name = make_name(&["iperf", "0"]);
+
+        // Encode Interest the same way iperf does.
+        let interest_wire = encode_interest(&name, None);
+        let interest = Interest::decode(interest_wire.clone()).unwrap();
+
+        // PitCheckStage creates token:
+        let check_token = PitToken::from_interest_full(
+            &interest.name,
+            Some(interest.selectors()),
+            interest.forwarding_hint(),
+        );
+
+        // Server responds with Data using the Interest's name.
+        let data_wire = encode_data_unsigned(&interest.name, &[0xAAu8; 100]);
+        let data = Data::decode(data_wire).unwrap();
+
+        // PitMatchStage first try:
+        let match_token1 = PitToken::from_interest(&data.name, None);
+        // PitMatchStage second try:
+        let default_sel = Selector::default();
+        let match_token2 = PitToken::from_interest(&data.name, Some(&default_sel));
+
+        // The second try MUST match the check token.
+        assert_ne!(check_token, match_token1, "first try should NOT match (None vs Some selector)");
+        assert_eq!(check_token, match_token2, "second try MUST match (Same default selector)");
+    }
+
+    /// Verify that source_face_id computation matches PitCheck for management Interests.
+    ///
+    /// This simulates the rib/register flow where source_face_id decodes
+    /// the Interest from raw bytes forwarded through the pipeline.
+    #[test]
+    fn pit_token_management_interest_source_face() {
+        // Build a rib/register command name (simplified).
+        let name = make_name(&["localhost", "nfd", "rib", "register", "params"]);
+        let interest_wire = encode_interest(&name, None);
+        let interest = Interest::decode(interest_wire.clone()).unwrap();
+
+        // PitCheckStage creates token from decoded Interest:
+        let check_token = PitToken::from_interest_full(
+            &interest.name,
+            Some(interest.selectors()),
+            interest.forwarding_hint(),
+        );
+
+        // After ensure_nonce (no-op since nonce already present), the same bytes
+        // are forwarded to the management face. Management handler decodes them:
+        let mgmt_interest = Interest::decode(interest_wire).unwrap();
+
+        // source_face_id computes:
+        let source_token = PitToken::from_interest_full(
+            &mgmt_interest.name,
+            Some(mgmt_interest.selectors()),
+            mgmt_interest.forwarding_hint(),
+        );
+
+        assert_eq!(check_token, source_token, "source_face_id must match PitCheck token");
+    }
+
+    #[test]
+    fn pit_insert_and_remove_basic() {
+        let pit = Pit::new();
+        let name = Arc::new(make_name(&["test"]));
+        let token = PitToken::from_interest(&name, None);
+        let entry = PitEntry::new(name, None, 0, 4000);
+        pit.insert(token, entry);
+        assert_eq!(pit.len(), 1);
+        assert!(pit.remove(&token).is_some());
+        assert!(pit.is_empty());
+    }
+}

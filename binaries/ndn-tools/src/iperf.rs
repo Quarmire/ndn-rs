@@ -104,12 +104,8 @@ fn parse_name(s: &str) -> Name {
 }
 
 fn build_name(prefix: &Name, seq: u64) -> Name {
-    let seq_comp = NameComponent::generic(Bytes::copy_from_slice(
-        format!("{seq}").as_bytes(),
-    ));
-    Name::from_components(
-        prefix.components().iter().cloned().chain([seq_comp]),
-    )
+    let seq_comp = NameComponent::generic(Bytes::copy_from_slice(format!("{seq}").as_bytes()));
+    Name::from_components(prefix.components().iter().cloned().chain([seq_comp]))
 }
 
 fn extract_seq(raw: &Bytes) -> Option<u64> {
@@ -134,29 +130,57 @@ async fn run_server(
     client.register_prefix(prefix).await?;
 
     let transport = if client.is_shm() { "SHM" } else { "Unix" };
-    println!("ndn-iperf server: prefix={} transport={transport} payload={payload_size}B",
-             format_name(prefix));
+    println!(
+        "ndn-iperf server: prefix={} transport={transport} payload={payload_size}B",
+        format_name(prefix)
+    );
     println!("  waiting for Interests... (Ctrl-C to stop)");
 
     let payload = vec![0xAAu8; payload_size];
+    let mut recv_count: u64 = 0;
+    let mut interest_count: u64 = 0;
+    let mut send_count: u64 = 0;
+    let mut non_interest_count: u64 = 0;
 
     loop {
         let raw = match client.recv().await {
             Some(b) => b,
-            None => break,
+            None => {
+                eprintln!(
+                    "  server: recv returned None (channel closed) after {recv_count} packets"
+                );
+                break;
+            }
         };
+        recv_count += 1;
 
-        let interest = match Interest::decode(raw) {
+        let interest = match Interest::decode(raw.clone()) {
             Ok(i) => i,
-            Err(_) => continue,
+            Err(_) => {
+                non_interest_count += 1;
+                if non_interest_count <= 5 {
+                    eprintln!(
+                        "  server: non-Interest packet #{non_interest_count} (first byte: 0x{:02X}, len={})",
+                        raw.first().copied().unwrap_or(0),
+                        raw.len()
+                    );
+                }
+                continue;
+            }
         };
+        interest_count += 1;
 
         let data = encode_data_unsigned(&interest.name, &payload);
         if let Err(e) = client.send(data).await {
             eprintln!("send error: {e}");
             break;
         }
+        send_count += 1;
     }
+
+    eprintln!(
+        "  server stats: recv={recv_count} interests={interest_count} non_interest={non_interest_count} sent={send_count}"
+    );
 
     Ok(())
 }
@@ -199,6 +223,10 @@ async fn run_client(
         next_seq += 1;
     }
 
+    eprintln!("  client: sent initial window of {window} Interests, waiting for Data...");
+
+    let mut timeouts: u64 = 0;
+    let mut recv_none: u64 = 0;
     let sent = loop {
         match tokio::time::timeout(Duration::from_secs(4), client.recv()).await {
             Ok(Some(data_bytes)) => {
@@ -221,14 +249,30 @@ async fn run_client(
                     break next_seq;
                 }
             }
-            Ok(None) => break next_seq,
+            Ok(None) => {
+                recv_none += 1;
+                eprintln!("  client: recv returned None (channel closed)");
+                break next_seq;
+            }
             Err(_) => {
+                timeouts += 1;
+                eprintln!(
+                    "  client: recv timeout #{timeouts} (4s), outstanding={}",
+                    timestamps.len()
+                );
                 if Instant::now() >= deadline {
                     break next_seq;
                 }
             }
         }
     };
+
+    if received == 0 {
+        eprintln!("  client: WARNING — received 0 packets! timeouts={timeouts} none={recv_none}");
+        eprintln!(
+            "  client: sent {next_seq} Interests total; check that server is running and prefix is registered"
+        );
+    }
 
     // ── Report ───────────────────────────────────────────────────────────────
 
@@ -265,11 +309,23 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Server { prefix, size, face_socket, no_shm } => {
+        Command::Server {
+            prefix,
+            size,
+            face_socket,
+            no_shm,
+        } => {
             let prefix = parse_name(&prefix);
             run_server(&face_socket, no_shm, &prefix, size).await
         }
-        Command::Client { prefix, duration, window, size, face_socket, no_shm } => {
+        Command::Client {
+            prefix,
+            duration,
+            window,
+            size,
+            face_socket,
+            no_shm,
+        } => {
             let prefix = parse_name(&prefix);
             run_client(&face_socket, no_shm, &prefix, duration, window, size).await
         }
@@ -290,6 +346,8 @@ fn format_name(name: &Name) -> String {
             }
         }
     }
-    if s.is_empty() { s.push('/'); }
+    if s.is_empty() {
+        s.push('/');
+    }
     s
 }

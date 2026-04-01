@@ -86,12 +86,37 @@ conventions (`/localhost/nfd/<module>/<verb>/<ControlParameters>`).
 
 ### Changed
 
+- **ndn-engine pipeline runner processes packets inline** — removed per-packet
+  `tokio::spawn` in `PacketDispatcher::run_pipeline`. Packets are now processed
+  directly in the pipeline runner loop, eliminating task creation, scheduling,
+  and `Arc` clone overhead per packet. Combined with SHM spin-before-park and
+  increased ring capacity, this brought SHM iperf throughput from ~800 Mbps to
+  ~10 Gbps.
 - **ndn-router management prefix** changed from custom to `/localhost/nfd` (NFD
   standard).
 - **ndn-engine `StrategyStage`** now uses `strategy_table` + `default_strategy`
   instead of a single global strategy.
 - **ndn-engine dispatcher nack pipeline** updated to use strategy table LPM for
   per-prefix strategy dispatch on Nack.
+
+### Fixed
+
+- **Stale FIB routes on face disconnect** — when a face is removed from the face
+  table, `Fib::remove_face` now purges all nexthops pointing to that face across
+  all prefixes. Previously, stale nexthops accumulated when applications
+  reconnected with new face IDs, causing `BestRouteStrategy` to forward Interests
+  to dead faces (0 Mbps throughput when switching between SHM and Unix modes).
+- **SHM face cleanup on app disconnect** — each accepted connection now gets a
+  per-connection `CancellationToken` (child of the global token). SHM faces
+  created via `faces/create` use a child of the control face's token. When the
+  control face disconnects, the token cascade cancels the SHM face reader,
+  triggering FIB and face table cleanup. Previously, SHM faces on macOS stayed
+  blocked forever on FIFOs that never signaled EOF.
+- **SHM spin-before-park** — added a 64-iteration spin loop in both `SpscFace`
+  and `SpscHandle` recv before falling through to the pipe/futex sleep. Avoids
+  expensive wakeup syscalls when packets arrive within microseconds of each other.
+- **SHM ring capacity** increased from 64 to 256 slots — reduces backpressure
+  during burst traffic and gives headroom for pipeline processing jitter.
 
 #### NDN spec compliance — SPEC-GAPS.md tracker and fixes
 

@@ -85,7 +85,10 @@ pub async fn run_face_listener(
         let face_id = engine.faces().alloc_id();
         let face    = ndn_face_local::UnixFace::from_stream(face_id, stream, path);
         tracing::debug!(face = %face_id, "face-listener: accepted connection");
-        engine.add_face(face, cancel.clone());
+        // Per-connection child token: cancelling it on disconnect only affects
+        // this connection and its child faces (e.g. SHM), not the whole router.
+        let conn_cancel = cancel.child_token();
+        engine.add_face(face, conn_cancel);
     }
 
     let _ = std::fs::remove_file(path);
@@ -119,6 +122,11 @@ pub async fn run_ndn_mgmt_handler(
         };
 
         let source_face = engine.source_face_id(&interest);
+        tracing::debug!(
+            source_face = ?source_face,
+            name = %format_name(&interest.name),
+            "nfd-mgmt: received command"
+        );
 
         let parsed = match parse_command_name(&interest.name) {
             Some(p) => p,
@@ -158,7 +166,7 @@ fn dispatch_command(
 ) -> ControlResponse {
     match module_name {
         m if m == module::RIB      => handle_rib(verb_name, params, source_face, engine),
-        m if m == module::FACES    => handle_faces(verb_name, params, engine),
+        m if m == module::FACES    => handle_faces(verb_name, params, source_face, engine),
         m if m == module::FIB      => handle_fib(verb_name, params, source_face, engine),
         m if m == module::STRATEGY => handle_strategy(verb_name, params, engine),
         m if m == module::CS       => handle_cs(verb_name, engine),
@@ -249,38 +257,53 @@ fn rib_list(engine: &ForwarderEngine) -> ControlResponse {
 // ─── Faces module ─────────────────────────────────────────────────────────────
 
 fn handle_faces(
-    verb_name: &[u8],
-    params:    ControlParameters,
-    engine:    &ForwarderEngine,
+    verb_name:   &[u8],
+    params:      ControlParameters,
+    source_face: Option<FaceId>,
+    engine:      &ForwarderEngine,
 ) -> ControlResponse {
     match verb_name {
-        v if v == verb::CREATE  => faces_create(params, engine),
+        v if v == verb::CREATE  => faces_create(params, source_face, engine),
         v if v == verb::DESTROY => faces_destroy(params, engine),
         v if v == verb::LIST    => faces_list(engine),
         _ => ControlResponse::error(status::NOT_FOUND, "unknown faces verb"),
     }
 }
 
-fn faces_create(params: ControlParameters, engine: &ForwarderEngine) -> ControlResponse {
+fn faces_create(
+    params:      ControlParameters,
+    source_face: Option<FaceId>,
+    engine:      &ForwarderEngine,
+) -> ControlResponse {
     let uri = match &params.uri {
         Some(u) => u.clone(),
         None => return ControlResponse::error(status::BAD_PARAMS, "Uri is required"),
     };
 
     if let Some(shm_name) = uri.strip_prefix("shm://") {
-        return faces_create_shm(shm_name, engine);
+        return faces_create_shm(shm_name, source_face, engine);
     }
 
     ControlResponse::error(status::BAD_PARAMS, format!("unsupported URI scheme: {uri}"))
 }
 
 #[cfg(all(unix, feature = "spsc-shm"))]
-fn faces_create_shm(shm_name: &str, engine: &ForwarderEngine) -> ControlResponse {
+fn faces_create_shm(
+    shm_name:    &str,
+    source_face: Option<FaceId>,
+    engine:      &ForwarderEngine,
+) -> ControlResponse {
     let face_id = engine.faces().alloc_id();
 
     match ndn_face_local::ShmFace::create(face_id, shm_name) {
         Ok(face) => {
-            let cancel = CancellationToken::new();
+            // Use a child of the control face's cancel token so that when the
+            // control face disconnects, this SHM face is also cancelled and
+            // cleaned up (FIB routes removed, face removed from table).
+            let cancel = source_face
+                .and_then(|sf| engine.face_token(sf))
+                .map(|t| t.child_token())
+                .unwrap_or_else(CancellationToken::new);
             engine.add_face(face, cancel);
             tracing::info!(face = face_id.0, shm = shm_name, "faces/create shm");
 
@@ -299,7 +322,11 @@ fn faces_create_shm(shm_name: &str, engine: &ForwarderEngine) -> ControlResponse
 }
 
 #[cfg(not(all(unix, feature = "spsc-shm")))]
-fn faces_create_shm(_shm_name: &str, _engine: &ForwarderEngine) -> ControlResponse {
+fn faces_create_shm(
+    _shm_name:    &str,
+    _source_face: Option<FaceId>,
+    _engine:      &ForwarderEngine,
+) -> ControlResponse {
     ControlResponse::error(status::SERVER_ERROR, "SHM faces not supported on this platform")
 }
 

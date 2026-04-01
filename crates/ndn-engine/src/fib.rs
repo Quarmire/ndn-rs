@@ -57,6 +57,18 @@ impl Fib {
         self.trie.dump()
     }
 
+    /// Remove all nexthops pointing to `face_id` across all prefixes.
+    ///
+    /// Called when a face is closed to prevent stale routes from accumulating.
+    pub fn remove_face(&self, face_id: FaceId) {
+        let entries = self.trie.dump();
+        for (prefix, entry) in entries {
+            if entry.nexthops.iter().any(|n| n.face_id == face_id) {
+                self.remove_nexthop(&prefix, face_id);
+            }
+        }
+    }
+
     /// Remove the nexthop for `face_id` from `prefix`.
     pub fn remove_nexthop(&self, prefix: &Name, face_id: FaceId) {
         let Some(existing) = self.trie.get(prefix) else { return };
@@ -165,6 +177,26 @@ mod tests {
         fib.remove_nexthop(&name1("a"), FaceId(99));
         let entry = fib.lpm(&name1("a")).unwrap();
         assert_eq!(entry.nexthops.len(), 1);
+    }
+
+    #[test]
+    fn remove_face_cleans_all_prefixes() {
+        let fib = Fib::new();
+        fib.add_nexthop(&name1("a"), FaceId(1), 10);
+        fib.add_nexthop(&name1("a"), FaceId(2), 20);
+        fib.add_nexthop(&name1("b"), FaceId(1), 5);
+        fib.add_nexthop(&name2("c", "d"), FaceId(1), 0);
+
+        fib.remove_face(FaceId(1));
+
+        // /a still has face 2
+        let entry = fib.lpm(&name1("a")).unwrap();
+        assert_eq!(entry.nexthops.len(), 1);
+        assert_eq!(entry.nexthops[0].face_id, FaceId(2));
+        // /b was the only nexthop for face 1 → entry removed
+        assert!(fib.lpm(&name1("b")).is_none());
+        // /c/d was the only nexthop for face 1 → entry removed
+        assert!(fib.lpm(&name2("c", "d")).is_none());
     }
 
     #[test]
