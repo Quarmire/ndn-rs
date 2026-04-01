@@ -1,6 +1,8 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use tracing::trace;
+
 use ndn_pipeline::{Action, DecodedPacket, PacketContext};
 use ndn_store::{CsEntry, CsAdmissionPolicy, CsMeta, ContentStore, LruCs};
 
@@ -25,11 +27,13 @@ impl CsLookupStage {
         };
 
         if let Some(entry) = self.cs.get(interest).await {
+            trace!(face=%ctx.face_id, name=?ctx.name, "cs-lookup: HIT");
             ctx.cs_hit = true;
             ctx.out_faces.push(ctx.face_id);
             ctx.tags.insert(entry);
             Action::Satisfy(ctx)
         } else {
+            trace!(face=%ctx.face_id, name=?ctx.name, "cs-lookup: MISS");
             Action::Continue(ctx)
         }
     }
@@ -50,6 +54,7 @@ impl CsInsertStage {
     pub async fn process(&self, ctx: PacketContext) -> Action {
         if let DecodedPacket::Data(ref data) = ctx.packet {
             if !self.admission.should_admit(data) {
+                trace!(name=%data.name, "cs-insert: rejected by admission policy");
                 return Action::Satisfy(ctx);
             }
 
@@ -67,6 +72,7 @@ impl CsInsertStage {
 
             let meta = CsMeta { stale_at };
             self.cs.insert(ctx.raw_bytes.clone(), data.name.clone(), meta).await;
+            trace!(name=%data.name, freshness_ms, "cs-insert: cached");
         }
         Action::Satisfy(ctx)
     }

@@ -1,3 +1,5 @@
+use tracing::trace;
+
 use ndn_packet::{Data, Interest, Nack, tlv_type};
 use ndn_packet::encode::ensure_nonce;
 use ndn_packet::lp::{LpPacket, is_lp_packet};
@@ -20,11 +22,15 @@ impl TlvDecodeStage {
     pub fn process(&self, mut ctx: PacketContext) -> Action {
         let first_byte = match ctx.raw_bytes.first() {
             Some(&b) => b as u64,
-            None => return Action::Drop(DropReason::MalformedPacket),
+            None => {
+                trace!(face=%ctx.face_id, "decode: empty packet");
+                return Action::Drop(DropReason::MalformedPacket);
+            }
         };
 
         // NDNLPv2: unwrap LpPacket if present.
         if is_lp_packet(&ctx.raw_bytes) {
+            trace!(face=%ctx.face_id, len=ctx.raw_bytes.len(), "decode: LpPacket");
             return self.process_lp(ctx);
         }
 
@@ -33,14 +39,21 @@ impl TlvDecodeStage {
             t if t == tlv_type::DATA => {
                 match Data::decode(ctx.raw_bytes.clone()) {
                     Ok(data) => {
+                        trace!(face=%ctx.face_id, name=%data.name, "decode: Data");
                         ctx.name   = Some(data.name.clone());
                         ctx.packet = DecodedPacket::Data(Box::new(data));
                         Action::Continue(ctx)
                     }
-                    Err(_) => Action::Drop(DropReason::MalformedPacket),
+                    Err(e) => {
+                        trace!(face=%ctx.face_id, error=%e, "decode: malformed Data");
+                        Action::Drop(DropReason::MalformedPacket)
+                    }
                 }
             }
-            _ => Action::Drop(DropReason::MalformedPacket),
+            _ => {
+                trace!(face=%ctx.face_id, tlv_type=first_byte, "decode: unknown TLV type");
+                Action::Drop(DropReason::MalformedPacket)
+            }
         }
     }
 
@@ -49,14 +62,19 @@ impl TlvDecodeStage {
         match Interest::decode(ctx.raw_bytes.clone()) {
             Ok(interest) => {
                 if interest.hop_limit() == Some(0) {
+                    trace!(face=%ctx.face_id, name=%interest.name, "decode: HopLimit=0, dropping");
                     return Action::Drop(DropReason::HopLimitExceeded);
                 }
+                trace!(face=%ctx.face_id, name=%interest.name, nonce=?interest.nonce(), "decode: Interest");
                 ctx.raw_bytes = ensure_nonce(&ctx.raw_bytes);
                 ctx.name   = Some(interest.name.clone());
                 ctx.packet = DecodedPacket::Interest(Box::new(interest));
                 Action::Continue(ctx)
             }
-            Err(_) => Action::Drop(DropReason::MalformedPacket),
+            Err(e) => {
+                trace!(face=%ctx.face_id, error=%e, "decode: malformed Interest");
+                Action::Drop(DropReason::MalformedPacket)
+            }
         }
     }
 
@@ -64,7 +82,10 @@ impl TlvDecodeStage {
     fn process_lp(&self, mut ctx: PacketContext) -> Action {
         let lp = match LpPacket::decode(ctx.raw_bytes.clone()) {
             Ok(lp) => lp,
-            Err(_) => return Action::Drop(DropReason::MalformedPacket),
+            Err(e) => {
+                trace!(face=%ctx.face_id, error=%e, "decode: malformed LpPacket");
+                return Action::Drop(DropReason::MalformedPacket);
+            }
         };
 
         // Propagate CongestionMark through the pipeline via tags.
@@ -76,12 +97,16 @@ impl TlvDecodeStage {
             // LpPacket with Nack header: fragment is the nacked Interest.
             match Interest::decode(lp.fragment) {
                 Ok(interest) => {
+                    trace!(face=%ctx.face_id, name=%interest.name, reason=?reason, "decode: Nack");
                     let nack = Nack::new(interest, reason);
                     ctx.name   = Some(nack.interest.name.clone());
                     ctx.packet = DecodedPacket::Nack(Box::new(nack));
                     Action::Continue(ctx)
                 }
-                Err(_) => Action::Drop(DropReason::MalformedPacket),
+                Err(e) => {
+                    trace!(face=%ctx.face_id, error=%e, "decode: malformed nacked Interest");
+                    Action::Drop(DropReason::MalformedPacket)
+                }
             }
         } else {
             // Plain LpPacket wrapping Interest or Data.

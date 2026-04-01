@@ -157,6 +157,26 @@ pub fn encode_lp_nack(reason: NackReason, interest_wire: &[u8]) -> Bytes {
     w.finish()
 }
 
+/// Wrap a bare Interest or Data in a minimal NDNLPv2 LpPacket.
+///
+/// If the packet is already an LpPacket (starts with 0x64), returns it unchanged.
+///
+/// ```text
+/// LpPacket (0x64)
+///   Fragment (0x50)
+///     <original packet wire bytes>
+/// ```
+pub fn encode_lp_packet(packet: &[u8]) -> Bytes {
+    if is_lp_packet(packet) {
+        return Bytes::copy_from_slice(packet);
+    }
+    let mut w = TlvWriter::new();
+    w.write_nested(tlv_type::LP_PACKET, |w| {
+        w.write_tlv(tlv_type::LP_FRAGMENT, packet);
+    });
+    w.finish()
+}
+
 /// Check if raw bytes start with an LpPacket TLV type (0x64).
 pub fn is_lp_packet(raw: &[u8]) -> bool {
     raw.first() == Some(&0x64)
@@ -296,5 +316,30 @@ mod tests {
         assert!(is_lp_packet(&[0x64, 0x00]));
         assert!(!is_lp_packet(&[0x05, 0x00]));
         assert!(!is_lp_packet(&[]));
+    }
+
+    #[test]
+    fn encode_lp_packet_wraps_bare_interest() {
+        let n = name(&[b"test"]);
+        let interest_wire = encode_interest(&n, None);
+
+        let lp_wire = encode_lp_packet(&interest_wire);
+        assert!(is_lp_packet(&lp_wire));
+
+        let lp = LpPacket::decode(lp_wire).unwrap();
+        assert!(lp.nack.is_none());
+        let interest = Interest::decode(lp.fragment).unwrap();
+        assert_eq!(*interest.name, n);
+    }
+
+    #[test]
+    fn encode_lp_packet_passthrough_existing_lp() {
+        let n = name(&[b"test"]);
+        let interest_wire = encode_interest(&n, None);
+        let lp_wire = encode_lp_nack(NackReason::NoRoute, &interest_wire);
+
+        // Wrapping an existing LpPacket should return it unchanged.
+        let rewrapped = encode_lp_packet(&lp_wire);
+        assert_eq!(rewrapped, lp_wire);
     }
 }

@@ -3,6 +3,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use smallvec::SmallVec;
+use tracing::trace;
 
 use ndn_packet::Name;
 use ndn_pipeline::{Action, DecodedPacket, DropReason, ForwardingAction, NackReason, PacketContext};
@@ -84,6 +85,12 @@ impl StrategyStage {
         let fib_entry_arc = self.fib.lpm(&name);
         let fib_entry_ref = fib_entry_arc.as_deref();
 
+        if let Some(ref e) = fib_entry_ref {
+            trace!(face=%ctx.face_id, name=%name, nexthops=?e.nexthops.iter().map(|nh| (nh.face_id, nh.cost)).collect::<Vec<_>>(), "strategy: FIB LPM hit");
+        } else {
+            trace!(face=%ctx.face_id, name=%name, "strategy: FIB LPM miss (no route)");
+        }
+
         // Convert engine FibEntry → strategy FibEntry.
         let strategy_fib: Option<ndn_strategy::FibEntry> = fib_entry_ref.map(|e| {
             ndn_strategy::FibEntry {
@@ -105,6 +112,7 @@ impl StrategyStage {
         // Per-prefix strategy lookup (LPM on strategy table).
         let strategy = self.strategy_table.lpm(&name)
             .unwrap_or_else(|| Arc::clone(&self.default_strategy));
+        trace!(face=%ctx.face_id, name=%name, strategy=%strategy.name(), "strategy: selected");
 
         let actions = strategy.after_receive_interest_erased(&sctx).await;
 
@@ -112,11 +120,13 @@ impl StrategyStage {
         for action in actions {
             match action {
                 ForwardingAction::Forward(faces) => {
+                    trace!(face=%ctx.face_id, name=%name, out_faces=?faces, "strategy: Forward");
                     ctx.out_faces.extend_from_slice(&faces);
                     let out = ctx.out_faces.clone();
                     return Action::Send(ctx, out);
                 }
                 ForwardingAction::ForwardAfter { faces, delay } => {
+                    trace!(face=%ctx.face_id, name=%name, out_faces=?faces, delay_ms=%delay.as_millis(), "strategy: ForwardAfter");
                     // Spawn a delayed send: sleep, re-check PIT, then forward.
                     let pit = Arc::clone(&self.pit);
                     let face_table = Arc::clone(&self.face_table);
@@ -140,6 +150,7 @@ impl StrategyStage {
                     return Action::Drop(DropReason::Other); // consumed by delayed task
                 }
                 ForwardingAction::Nack(reason) => {
+                    trace!(face=%ctx.face_id, name=%name, reason=?reason, "strategy: Nack");
                     let nr = match reason {
                         NackReason::NoRoute    => NackReason::NoRoute,
                         NackReason::Duplicate  => NackReason::Duplicate,
@@ -149,12 +160,14 @@ impl StrategyStage {
                     return Action::Nack(ctx, nr);
                 }
                 ForwardingAction::Suppress => {
+                    trace!(face=%ctx.face_id, name=%name, "strategy: Suppress");
                     return Action::Drop(DropReason::Suppressed);
                 }
             }
         }
 
         // No actionable forwarding decision → no route.
+        trace!(face=%ctx.face_id, name=%name, "strategy: no actionable decision, Nack NoRoute");
         Action::Nack(ctx, NackReason::NoRoute)
     }
 }

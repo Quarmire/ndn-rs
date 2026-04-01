@@ -5,7 +5,7 @@ use bytes::Bytes;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 
 use ndn_packet::encode::encode_nack;
 use ndn_pipeline::{Action, DecodedPacket, ForwardingAction, NackReason, PacketContext};
@@ -95,20 +95,30 @@ impl PacketDispatcher {
     }
 
     async fn process_packet(&self, pkt: InboundPacket) {
+        trace!(face=%pkt.face_id, len=pkt.raw.len(), "pipeline: packet arrived");
         let ctx = PacketContext::new(pkt.raw, pkt.face_id, pkt.arrival);
 
         // 1. Decode.
         let ctx = match self.decode.process(ctx) {
             Action::Continue(ctx) => ctx,
-            Action::Drop(r)       => { debug!(reason=?r, "drop at decode"); return; }
+            Action::Drop(r)       => { debug!(face=%pkt.face_id, reason=?r, "drop at decode"); return; }
             other                 => { self.dispatch_action(other).await; return; }
         };
 
         match &ctx.packet {
-            DecodedPacket::Interest(_) => self.interest_pipeline(ctx).await,
-            DecodedPacket::Data(_)     => self.data_pipeline(ctx).await,
-            DecodedPacket::Nack(_)     => self.nack_pipeline(ctx).await,
-            DecodedPacket::Raw         => {}
+            DecodedPacket::Interest(_) => {
+                trace!(face=%ctx.face_id, name=?ctx.name, "pipeline: Interest → interest_pipeline");
+                self.interest_pipeline(ctx).await;
+            }
+            DecodedPacket::Data(_) => {
+                trace!(face=%ctx.face_id, name=?ctx.name, "pipeline: Data → data_pipeline");
+                self.data_pipeline(ctx).await;
+            }
+            DecodedPacket::Nack(_) => {
+                trace!(face=%ctx.face_id, name=?ctx.name, "pipeline: Nack → nack_pipeline");
+                self.nack_pipeline(ctx).await;
+            }
+            DecodedPacket::Raw => {}
         }
     }
 
@@ -239,17 +249,26 @@ impl PacketDispatcher {
     async fn dispatch_action(&self, action: Action) {
         match action {
             Action::Send(ctx, faces) => {
+                trace!(face=%ctx.face_id, name=?ctx.name, out_faces=?faces, raw_len=ctx.raw_bytes.len(), "dispatch: Send");
                 for face_id in &faces {
                     if let Some(face) = self.face_table.get(*face_id) {
                         if let Err(e) = face.send_bytes(ctx.raw_bytes.clone()).await {
                             warn!(face=%face_id, error=%e, "forward send failed");
+                        } else {
+                            trace!(face=%face_id, len=ctx.raw_bytes.len(), "dispatch: sent ok");
                         }
+                    } else {
+                        warn!(face=%face_id, "dispatch: face not found in table");
                     }
                 }
             }
-            Action::Satisfy(ctx) => self.satisfy(ctx).await,
+            Action::Satisfy(ctx) => {
+                trace!(face=%ctx.face_id, name=?ctx.name, out_faces=?ctx.out_faces, cs_hit=ctx.cs_hit, "dispatch: Satisfy");
+                self.satisfy(ctx).await;
+            }
             Action::Drop(r)      => debug!(reason=?r, "packet dropped"),
             Action::Nack(ctx, reason) => {
+                trace!(face=%ctx.face_id, name=?ctx.name, reason=?reason, "dispatch: Nack");
                 // Encode a Nack wrapping the original Interest and send it
                 // back to the face that originated the Interest.
                 let packet_reason = match reason {
@@ -316,6 +335,7 @@ pub(crate) async fn run_face_reader(
         };
         match result {
             Ok(raw) => {
+                trace!(face=%face_id, len=raw.len(), "face-reader: recv");
                 let arrival = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()

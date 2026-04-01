@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use smallvec::SmallVec;
+use tracing::trace;
 
 use ndn_pipeline::{Action, DecodedPacket, DropReason, PacketContext};
 use ndn_store::{Pit, PitEntry, PitToken};
@@ -46,12 +47,13 @@ impl PitCheckStage {
         if let Some(mut entry) = self.pit.get_mut(&token) {
             // Loop detection.
             if entry.nonces_seen.contains(&nonce) {
+                trace!(face=%ctx.face_id, name=%interest.name, nonce, "pit-check: loop detected");
                 return Action::Drop(DropReason::LoopDetected);
             }
             // Aggregate: add in-record, suppress forwarding.
             let expires_at = now_ns + lifetime_ms * 1_000_000;
             entry.add_in_record(ctx.face_id.0, nonce, expires_at);
-            // Return Drop(Suppressed) — we already have an outstanding Interest.
+            trace!(face=%ctx.face_id, name=%interest.name, nonce, "pit-check: aggregated (suppressed)");
             return Action::Drop(DropReason::Suppressed);
         }
 
@@ -61,6 +63,7 @@ impl PitCheckStage {
         let mut entry = PitEntry::new(name, selector, now_ns, lifetime_ms);
         entry.add_in_record(ctx.face_id.0, nonce, now_ns + lifetime_ms * 1_000_000);
         self.pit.insert(token, entry);
+        trace!(face=%ctx.face_id, name=%interest.name, nonce, lifetime_ms, "pit-check: new entry");
 
         Action::Continue(ctx)
     }
@@ -94,6 +97,7 @@ impl PitMatchStage {
                 .in_record_faces()
                 .map(FaceId)
                 .collect();
+            trace!(face=%ctx.face_id, name=%data.name, out_faces=?faces, "pit-match: satisfied");
             ctx.out_faces = faces;
             Action::Continue(ctx)
         } else {
@@ -105,10 +109,11 @@ impl PitMatchStage {
                     .in_record_faces()
                     .map(FaceId)
                     .collect();
+                trace!(face=%ctx.face_id, name=%data.name, out_faces=?faces, "pit-match: satisfied (default selector)");
                 ctx.out_faces = faces;
                 Action::Continue(ctx)
             } else {
-                // Unsolicited Data — drop.
+                trace!(face=%ctx.face_id, name=%data.name, "pit-match: unsolicited Data");
                 Action::Drop(DropReason::Other)
             }
         }
