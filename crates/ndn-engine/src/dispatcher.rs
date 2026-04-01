@@ -185,7 +185,9 @@ impl PacketDispatcher {
             ndn_packet::NackReason::Other(_)   => NackReason::NoRoute,
         };
 
-        let action = self.strategy.strategy.on_nack_erased(&sctx, nack_reason).await;
+        let strategy = self.strategy.strategy_table.lpm(&name)
+            .unwrap_or_else(|| Arc::clone(&self.strategy.default_strategy));
+        let action = strategy.on_nack_erased(&sctx, nack_reason).await;
         match action {
             ForwardingAction::Forward(faces) => {
                 // Strategy chose alternate nexthops — forward the original Interest.

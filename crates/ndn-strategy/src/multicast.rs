@@ -1,6 +1,7 @@
+use bytes::Bytes;
 use smallvec::{SmallVec, smallvec};
 
-use ndn_packet::Name;
+use ndn_packet::{Name, NameComponent};
 use ndn_pipeline::{ForwardingAction, NackReason};
 use ndn_transport::FaceId;
 
@@ -12,8 +13,18 @@ pub struct MulticastStrategy {
 }
 
 impl MulticastStrategy {
+    /// NFD strategy name: `/localhost/nfd/strategy/multicast`
+    pub fn strategy_name() -> Name {
+        Name::from_components([
+            NameComponent::generic(Bytes::from_static(b"localhost")),
+            NameComponent::generic(Bytes::from_static(b"nfd")),
+            NameComponent::generic(Bytes::from_static(b"strategy")),
+            NameComponent::generic(Bytes::from_static(b"multicast")),
+        ])
+    }
+
     pub fn new() -> Self {
-        Self { name: Name::root() }
+        Self { name: Self::strategy_name() }
     }
 }
 

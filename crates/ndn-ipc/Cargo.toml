@@ -5,12 +5,16 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-[dependencies]
-ndn-packet = { workspace = true }
-bytes      = { workspace = true }
-tokio      = { workspace = true, features = ["sync"] }
-thiserror  = { workspace = true }
+[features]
+default = ["spsc-shm"]
+spsc-shm = ["ndn-face-local/spsc-shm"]
 
-[dev-dependencies]
+[dependencies]
+ndn-packet     = { workspace = true }
+ndn-config     = { workspace = true }
 ndn-face-local = { workspace = true }
 ndn-transport  = { workspace = true }
+bytes          = { workspace = true }
+tokio          = { workspace = true, features = ["sync"] }
+thiserror      = { workspace = true }
+tracing        = { workspace = true }

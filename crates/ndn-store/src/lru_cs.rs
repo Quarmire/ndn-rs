@@ -45,6 +45,23 @@ impl LruCs {
     }
 }
 
+impl LruCs {
+    /// Number of entries currently cached.
+    pub fn len(&self) -> usize {
+        self.inner.lock().unwrap().cache.len()
+    }
+
+    /// Whether the cache is empty.
+    pub fn is_empty(&self) -> bool {
+        self.inner.lock().unwrap().cache.is_empty()
+    }
+
+    /// Total bytes currently used.
+    pub fn current_bytes(&self) -> usize {
+        self.inner.lock().unwrap().current_bytes
+    }
+}
+
 impl ContentStore for LruCs {
     async fn get(&self, interest: &Interest) -> Option<CsEntry> {
         let mut inner = self.inner.lock().unwrap();

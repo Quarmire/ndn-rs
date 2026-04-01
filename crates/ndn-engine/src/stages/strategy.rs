@@ -4,13 +4,17 @@ use std::sync::Arc;
 
 use smallvec::SmallVec;
 
+use ndn_packet::Name;
 use ndn_pipeline::{Action, DecodedPacket, DropReason, ForwardingAction, NackReason, PacketContext};
-use ndn_store::Pit;
+use ndn_store::{Pit, StrategyTable};
 use ndn_strategy::{MeasurementsTable, Strategy, StrategyContext};
 use crate::Fib;
 
 /// Object-safe version of `Strategy` that boxes its futures.
 pub trait ErasedStrategy: Send + Sync + 'static {
+    /// Canonical name identifying this strategy (e.g. `/localhost/nfd/strategy/best-route`).
+    fn name(&self) -> &Name;
+
     fn after_receive_interest_erased<'a>(
         &'a self,
         ctx: &'a StrategyContext<'a>,
@@ -24,6 +28,10 @@ pub trait ErasedStrategy: Send + Sync + 'static {
 }
 
 impl<S: Strategy> ErasedStrategy for S {
+    fn name(&self) -> &Name {
+        Strategy::name(self)
+    }
+
     fn after_receive_interest_erased<'a>(
         &'a self,
         ctx: &'a StrategyContext<'a>,
@@ -47,12 +55,17 @@ impl<S: Strategy> ErasedStrategy for S {
 }
 
 /// Calls the strategy to produce a forwarding decision for Interests.
+///
+/// Performs LPM on the strategy table to find the per-prefix strategy.
+/// Falls back to `default_strategy` if no entry matches (should not happen
+/// if root is populated).
 pub struct StrategyStage {
-    pub strategy:     Arc<dyn ErasedStrategy>,
-    pub fib:          Arc<Fib>,
-    pub measurements: Arc<MeasurementsTable>,
-    pub pit:          Arc<Pit>,
-    pub face_table:   Arc<ndn_transport::FaceTable>,
+    pub strategy_table:   Arc<StrategyTable<dyn ErasedStrategy>>,
+    pub default_strategy: Arc<dyn ErasedStrategy>,
+    pub fib:              Arc<Fib>,
+    pub measurements:     Arc<MeasurementsTable>,
+    pub pit:              Arc<Pit>,
+    pub face_table:       Arc<ndn_transport::FaceTable>,
 }
 
 impl StrategyStage {
@@ -89,7 +102,11 @@ impl StrategyStage {
             measurements: &self.measurements,
         };
 
-        let actions = self.strategy.after_receive_interest_erased(&sctx).await;
+        // Per-prefix strategy lookup (LPM on strategy table).
+        let strategy = self.strategy_table.lpm(&name)
+            .unwrap_or_else(|| Arc::clone(&self.default_strategy));
+
+        let actions = strategy.after_receive_interest_erased(&sctx).await;
 
         // Use the first actionable ForwardingAction.
         for action in actions {
