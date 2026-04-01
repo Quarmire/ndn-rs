@@ -148,15 +148,8 @@ pub fn encode_lp_nack(reason: NackReason, interest_wire: &[u8]) -> Bytes {
     w.write_nested(tlv_type::LP_PACKET, |w| {
         // Nack header field.
         w.write_nested(tlv_type::NACK, |w| {
-            let code = reason.code();
-            let reason_bytes = if code == 0 {
-                vec![0u8]
-            } else {
-                let be = code.to_be_bytes();
-                let skip = be.iter().position(|&b| b != 0).unwrap_or(7);
-                be[skip..].to_vec()
-            };
-            w.write_tlv(tlv_type::NACK_REASON, &reason_bytes);
+            let (buf, len) = crate::encode::nni(reason.code());
+            w.write_tlv(tlv_type::NACK_REASON, &buf[..len]);
         });
         // Fragment: the original Interest.
         w.write_tlv(tlv_type::LP_FRAGMENT, interest_wire);
