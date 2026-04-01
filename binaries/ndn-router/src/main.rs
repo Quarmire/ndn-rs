@@ -5,7 +5,9 @@ use anyhow::Result;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
-use ndn_config::{ForwarderConfig, ManagementRequest, ManagementResponse, ManagementServer};
+use ndn_config::ForwarderConfig;
+#[cfg(unix)]
+use ndn_config::{ManagementRequest, ManagementResponse, ManagementServer};
 use ndn_engine::{EngineBuilder, EngineConfig, ForwarderEngine};
 use ndn_packet::{Name, NameComponent};
 use ndn_security::{FilePib, SecurityManager};
@@ -124,8 +126,8 @@ async fn main() -> Result<()> {
         let face_socket = PathBuf::from(&fwd_config.management.face_socket);
         tracing::info!(
             socket = %face_socket.display(),
-            prefix = "/localhost/ndn-ctl",
-            "NDN management active"
+            prefix = "/localhost/nfd",
+            "NFD management active"
         );
 
         let handler = tokio::spawn(mgmt_ndn::run_ndn_mgmt_handler(
@@ -178,13 +180,14 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-// ─── Management request dispatch ──────────────────────────────────────────────
+// ─── Legacy JSON management request dispatch (bypass only) ───────────────────
 
-/// Dispatch a management request against the live engine.
+/// Dispatch a legacy JSON management request against the live engine.
 ///
-/// This is intentionally a plain (non-async) function: none of its operations
-/// actually need to yield.
-pub(crate) fn handle_request(
+/// Used only by the bypass Unix socket transport. The primary management
+/// path uses NFD-compatible TLV protocol via `mgmt_ndn`.
+#[cfg(all(unix, not(feature = "iceoryx2-mgmt")))]
+fn handle_request(
     req: ManagementRequest,
     engine: &ForwarderEngine,
     cancel: &CancellationToken,

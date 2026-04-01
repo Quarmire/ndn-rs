@@ -6,7 +6,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+ndn-tlv       = { workspace = true }
 ndn-packet    = { workspace = true }
+bytes         = { workspace = true }
 thiserror     = { workspace = true }
 serde         = { version = "1", features = ["derive"] }
 serde_json    = { workspace = true }

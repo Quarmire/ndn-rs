@@ -9,6 +9,9 @@ license.workspace = true
 name = "ndn-router"
 path = "src/main.rs"
 
+[features]
+default = ["spsc-shm"]
+spsc-shm = ["ndn-face-local/spsc-shm"]
 
 [dependencies]
 ndn-engine       = { workspace = true }

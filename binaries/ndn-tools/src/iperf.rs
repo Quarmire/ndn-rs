@@ -1,48 +1,91 @@
-//! `ndn-iperf` — NDN bandwidth measurement tool.
+//! `ndn-iperf` — NDN bandwidth measurement tool (external mode).
 //!
-//! Embeds a forwarding engine with a producer and consumer `AppFace` pair,
-//! drives a sliding-window Interest/Data exchange, and reports sustained
-//! throughput and latency.
+//! Connects to a running `ndn-router` via Unix socket + optional SHM data plane.
 //!
-//! Usage:
+//! ## Server mode
+//!
+//! Registers a prefix and responds to Interests with Data packets containing
+//! a fixed-size payload.
+//!
 //! ```text
-//! ndn-iperf [--duration SECS] [--size BYTES] [--window N] [--prefix NAME]
+//! ndn-iperf server [--prefix /iperf] [--size 8192] [--face-socket /tmp/ndn-faces.sock]
+//! ```
+//!
+//! ## Client mode
+//!
+//! Sends Interests in a sliding window and measures throughput + RTT.
+//!
+//! ```text
+//! ndn-iperf client [--prefix /iperf] [--duration 10] [--window 64] [--size 8192]
+//!                   [--face-socket /tmp/ndn-faces.sock]
 //! ```
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use bytes::Bytes;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 
-use ndn_engine::{EngineBuilder, EngineConfig};
-use ndn_face_local::{AppFace, AppHandle};
+use ndn_ipc::RouterClient;
 use ndn_packet::encode::{encode_data_unsigned, encode_interest};
 use ndn_packet::{Data, Interest, Name, NameComponent};
-use ndn_transport::FaceId;
 
 // ─── CLI ─────────────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
 #[command(name = "ndn-iperf", about = "NDN bandwidth measurement tool")]
 struct Cli {
-    /// Test duration in seconds.
-    #[arg(long, default_value_t = 10)]
-    duration: u64,
+    #[command(subcommand)]
+    command: Command,
+}
 
-    /// Data payload size in bytes.
-    #[arg(long, default_value_t = 8192)]
-    size: usize,
+#[derive(Subcommand)]
+enum Command {
+    /// Run as server: register prefix and respond to Interests.
+    Server {
+        /// Name prefix to register.
+        #[arg(long, default_value = "/iperf")]
+        prefix: String,
 
-    /// Sliding window size (max outstanding Interests).
-    #[arg(long, default_value_t = 64)]
-    window: usize,
+        /// Data payload size in bytes.
+        #[arg(long, default_value_t = 8192)]
+        size: usize,
 
-    /// Name prefix.
-    #[arg(long, default_value = "/iperf")]
-    prefix: String,
+        /// Router face socket path.
+        #[arg(long, default_value = "/tmp/ndn-faces.sock")]
+        face_socket: String,
+
+        /// SHM face name (omit to use Unix socket for data).
+        #[arg(long)]
+        shm: Option<String>,
+    },
+    /// Run as client: send Interests and measure throughput.
+    Client {
+        /// Name prefix to query.
+        #[arg(long, default_value = "/iperf")]
+        prefix: String,
+
+        /// Test duration in seconds.
+        #[arg(long, default_value_t = 10)]
+        duration: u64,
+
+        /// Sliding window size (max outstanding Interests).
+        #[arg(long, default_value_t = 64)]
+        window: usize,
+
+        /// Expected Data payload size (for display only).
+        #[arg(long, default_value_t = 8192)]
+        size: usize,
+
+        /// Router face socket path.
+        #[arg(long, default_value = "/tmp/ndn-faces.sock")]
+        face_socket: String,
+
+        /// SHM face name (omit to use Unix socket for data).
+        #[arg(long)]
+        shm: Option<String>,
+    },
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -69,73 +112,70 @@ fn build_name(prefix: &Name, seq: u64) -> Name {
     )
 }
 
-/// Extract the sequence number from the last name component of a Data packet.
 fn extract_seq(raw: &Bytes) -> Option<u64> {
     let data = Data::decode(raw.clone()).ok()?;
     let last = data.name.components().last()?;
-    let s = std::str::from_utf8(&last.value).ok()?;
-    s.parse().ok()
+    std::str::from_utf8(&last.value).ok()?.parse().ok()
 }
 
-// ─── Producer ────────────────────────────────────────────────────────────────
+// ─── Server ──────────────────────────────────────────────────────────────────
 
-async fn run_producer(mut handle: AppHandle, payload: Arc<Vec<u8>>) {
+async fn run_server(
+    face_socket: &str,
+    shm_name: Option<&str>,
+    prefix: &Name,
+    payload_size: usize,
+) -> Result<()> {
+    let client = RouterClient::connect_with_name(face_socket, shm_name).await?;
+    client.register_prefix(prefix).await?;
+
+    let transport = if client.is_shm() { "SHM" } else { "Unix" };
+    println!("ndn-iperf server: prefix={} transport={transport} payload={payload_size}B",
+             format_name(prefix));
+    println!("  waiting for Interests... (Ctrl-C to stop)");
+
+    let payload = vec![0xAAu8; payload_size];
+
     loop {
-        let raw = match handle.recv().await {
+        let raw = match client.recv().await {
             Some(b) => b,
             None => break,
         };
+
         let interest = match Interest::decode(raw) {
             Ok(i) => i,
             Err(_) => continue,
         };
+
         let data = encode_data_unsigned(&interest.name, &payload);
-        if handle.send(data).await.is_err() {
+        if let Err(e) = client.send(data).await {
+            eprintln!("send error: {e}");
             break;
         }
     }
+
+    Ok(())
 }
 
-// ─── Main ────────────────────────────────────────────────────────────────────
+// ─── Client ──────────────────────────────────────────────────────────────────
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let cli = Cli::parse();
-    let prefix = parse_name(&cli.prefix);
+async fn run_client(
+    face_socket: &str,
+    shm_name: Option<&str>,
+    prefix: &Name,
+    duration_secs: u64,
+    window: usize,
+    _payload_size: usize,
+) -> Result<()> {
+    let client = RouterClient::connect_with_name(face_socket, shm_name).await?;
 
+    let transport = if client.is_shm() { "SHM" } else { "Unix" };
     println!(
-        "ndn-iperf: duration={}s payload={}B window={}",
-        cli.duration, cli.size, cli.window,
+        "ndn-iperf client: prefix={} transport={transport} duration={duration_secs}s window={window}",
+        format_name(prefix),
     );
 
-    // ── Build engine ─────────────────────────────────────────────────────────
-
-    let buf_size = cli.window * 4;
-    let consumer_id = FaceId(1);
-    let producer_id = FaceId(2);
-
-    let (consumer_face, mut consumer_handle) = AppFace::new(consumer_id, buf_size);
-    let (producer_face, producer_handle) = AppFace::new(producer_id, buf_size);
-
-    let (engine, shutdown) = EngineBuilder::new(EngineConfig {
-        pipeline_channel_cap: buf_size,
-        ..Default::default()
-    })
-    .face(consumer_face)
-    .face(producer_face)
-    .build()
-    .await?;
-
-    engine.fib().add_nexthop(&prefix, producer_id, 0);
-
-    // ── Spawn producer ───────────────────────────────────────────────────────
-
-    let payload = Arc::new(vec![0xAAu8; cli.size]);
-    let producer_task = tokio::spawn(run_producer(producer_handle, payload));
-
-    // ── Sliding-window consumer ──────────────────────────────────────────────
-
-    let deadline = Instant::now() + Duration::from_secs(cli.duration);
+    let deadline = Instant::now() + Duration::from_secs(duration_secs);
     let mut timestamps: HashMap<u64, Instant> = HashMap::new();
     let mut next_seq: u64 = 0;
     let mut total_bytes: u64 = 0;
@@ -143,17 +183,16 @@ async fn main() -> Result<()> {
     let mut rtts: Vec<u64> = Vec::new();
 
     // Fill the window.
-    let initial_window = cli.window as u64;
-    for _ in 0..initial_window {
-        let name = build_name(&prefix, next_seq);
+    for _ in 0..window {
+        let name = build_name(prefix, next_seq);
         let wire = encode_interest(&name, None);
         timestamps.insert(next_seq, Instant::now());
-        consumer_handle.send(wire).await?;
+        client.send(wire).await?;
         next_seq += 1;
     }
 
     let sent = loop {
-        match tokio::time::timeout(Duration::from_secs(4), consumer_handle.recv()).await {
+        match tokio::time::timeout(Duration::from_secs(4), client.recv()).await {
             Ok(Some(data_bytes)) => {
                 total_bytes += data_bytes.len() as u64;
                 received += 1;
@@ -164,20 +203,18 @@ async fn main() -> Result<()> {
                     }
                 }
 
-                // Send next Interest if within deadline.
                 if Instant::now() < deadline {
-                    let name = build_name(&prefix, next_seq);
+                    let name = build_name(prefix, next_seq);
                     let wire = encode_interest(&name, None);
                     timestamps.insert(next_seq, Instant::now());
-                    consumer_handle.send(wire).await?;
+                    client.send(wire).await?;
                     next_seq += 1;
                 } else if timestamps.is_empty() {
                     break next_seq;
                 }
             }
-            Ok(None) => break next_seq, // channel closed
+            Ok(None) => break next_seq,
             Err(_) => {
-                // Timeout — if past deadline, stop.
                 if Instant::now() >= deadline {
                     break next_seq;
                 }
@@ -185,10 +222,9 @@ async fn main() -> Result<()> {
         }
     };
 
-    let elapsed = Duration::from_secs(cli.duration);
-
     // ── Report ───────────────────────────────────────────────────────────────
 
+    let elapsed = Duration::from_secs(duration_secs);
     let total_mb = total_bytes as f64 / (1024.0 * 1024.0);
     let mbps = total_bytes as f64 * 8.0 / elapsed.as_secs_f64() / 1_000_000.0;
     let avg_rtt = if !rtts.is_empty() {
@@ -211,12 +247,41 @@ async fn main() -> Result<()> {
         println!("  RTT detail:  p50={p50}us p95={p95}us p99={p99}us");
     }
 
-    // ── Shutdown ─────────────────────────────────────────────────────────────
-
-    drop(consumer_handle);
-    producer_task.abort();
-    let _ = producer_task.await;
-    shutdown.shutdown().await;
-
     Ok(())
+}
+
+// ─── Main ────────────────────────────────────────────────────────────────────
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    match cli.command {
+        Command::Server { prefix, size, face_socket, shm } => {
+            let prefix = parse_name(&prefix);
+            run_server(&face_socket, shm.as_deref(), &prefix, size).await
+        }
+        Command::Client { prefix, duration, window, size, face_socket, shm } => {
+            let prefix = parse_name(&prefix);
+            run_client(&face_socket, shm.as_deref(), &prefix, duration, window, size).await
+        }
+    }
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+fn format_name(name: &Name) -> String {
+    let mut s = String::new();
+    for comp in name.components() {
+        s.push('/');
+        for &b in comp.value.iter() {
+            if b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.' {
+                s.push(b as char);
+            } else {
+                s.push_str(&format!("%{b:02X}"));
+            }
+        }
+    }
+    if s.is_empty() { s.push('/'); }
+    s
 }

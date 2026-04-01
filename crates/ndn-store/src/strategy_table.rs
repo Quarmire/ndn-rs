@@ -10,9 +10,9 @@ use crate::NameTrie;
 /// name prefixes to strategy objects of type `S` (typically `dyn Strategy`
 /// from `ndn-strategy`). Keeping the type parameter generic avoids a
 /// dependency on `ndn-strategy` from `ndn-store`.
-pub struct StrategyTable<S: Send + Sync + 'static>(NameTrie<Arc<S>>);
+pub struct StrategyTable<S: Send + Sync + 'static + ?Sized>(NameTrie<Arc<S>>);
 
-impl<S: Send + Sync + 'static> StrategyTable<S> {
+impl<S: Send + Sync + 'static + ?Sized> StrategyTable<S> {
     pub fn new() -> Self {
         Self(NameTrie::new())
     }
@@ -31,9 +31,14 @@ impl<S: Send + Sync + 'static> StrategyTable<S> {
     pub fn remove(&self, prefix: &Name) {
         self.0.remove(prefix);
     }
+
+    /// Return all (prefix, strategy) entries for status reporting.
+    pub fn dump(&self) -> Vec<(Name, Arc<S>)> {
+        self.0.dump()
+    }
 }
 
-impl<S: Send + Sync + 'static> Default for StrategyTable<S> {
+impl<S: Send + Sync + 'static + ?Sized> Default for StrategyTable<S> {
     fn default() -> Self {
         Self::new()
     }

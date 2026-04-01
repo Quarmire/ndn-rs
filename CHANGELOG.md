@@ -12,6 +12,87 @@ bootstrapping phase and all APIs should be considered unstable.
 
 ### Added
 
+#### NFD-compatible management protocol
+
+Full NFD management protocol implementation using binary TLV encoding
+(ControlParameters 0x68, ControlResponse 0x65) with standard NFD name
+conventions (`/localhost/nfd/<module>/<verb>/<ControlParameters>`).
+
+**ndn-config:**
+- **ControlParameters TLV codec** (`control_parameters.rs`) — encode/decode all
+  NFD ControlParameters fields: Name, FaceId, Uri, Origin, Cost, Flags, Mask,
+  ExpirationPeriod, FacePersistency, Strategy, Mtu.
+- **ControlResponse TLV codec** (`control_response.rs`) — encode/decode
+  StatusCode, StatusText, and optional ControlParameters body. Standard status
+  codes: 200 OK, 400 bad params, 403 unauthorized, 404 not found, 409 conflict.
+- **NFD command name builder/parser** (`nfd_command.rs`) — `command_name()`,
+  `dataset_name()`, and `parse_command_name()` for constructing and parsing
+  management Interest names. Module/verb constants for all NFD modules.
+
+**ndn-engine:**
+- **Per-prefix strategy table** — `StrategyTable<dyn ErasedStrategy>` wired into
+  `EngineInner`. `StrategyStage` performs LPM on the strategy table before
+  dispatching to the matched strategy. Default strategy seeded at root.
+- **`ErasedStrategy::name()`** — added to the object-safe strategy trait so
+  management handlers can report strategy names.
+- **`ForwarderEngine::strategy_table()`** — public accessor for the engine's
+  strategy table.
+- **`ForwarderEngine::source_face_id()`** — resolves the originating face of an
+  Interest via PIT in-record lookup, enabling "FaceId defaults to requesting
+  face" NFD behavior.
+
+**ndn-store:**
+- **`StrategyTable` `?Sized` support** — type parameter accepts trait objects
+  (`dyn ErasedStrategy`).
+- **`StrategyTable::dump()`** — returns all (prefix, strategy) entries for status
+  reporting.
+- **`LruCs::len()`, `is_empty()`, `current_bytes()`** — public accessors for CS
+  status reporting.
+
+**ndn-strategy:**
+- **NFD-style strategy names** — `BestRouteStrategy::strategy_name()` returns
+  `/localhost/nfd/strategy/best-route`; `MulticastStrategy::strategy_name()`
+  returns `/localhost/nfd/strategy/multicast`.
+
+**ndn-router (`mgmt_ndn.rs`):**
+- **RIB module** — `rib/register`, `rib/unregister`, `rib/list`. FaceId defaults
+  to requesting face when omitted. Routes use NFD origin/flags/cost semantics.
+- **Faces module** — `faces/create` (supports `shm://`, `unix://`, `tcp4://`,
+  `udp4://` URIs), `faces/destroy`, `faces/list` (reports face IDs and kinds).
+- **FIB module** — `fib/add-nexthop`, `fib/remove-nexthop`, `fib/list` (reports
+  prefix and nexthops).
+- **Strategy-choice module** — `strategy-choice/set` (creates strategy by name,
+  inserts into strategy table), `strategy-choice/unset` (blocks unsetting root),
+  `strategy-choice/list` (shows prefix→strategy mappings).
+- **CS module** — `cs/config` (reports capacity), `cs/info` (reports capacity,
+  entries, memory usage).
+- **Status module** — `status/general` (faces/fib/pit/cs counts),
+  `status/shutdown`.
+
+**ndn-ipc:**
+- **`RouterClient`** (`router_client.rs`) — app-side abstraction for connecting
+  to ndn-router. Connects via UnixFace, optionally creates SHM data plane face.
+  Provides `register_prefix()`, `unregister_prefix()`, `send()`, `recv()`.
+
+**ndn-tools (`ndn-ctl`):**
+- **NFD TLV transport** — primary transport sends ControlParameters-encoded
+  Interests over UnixFace. Legacy JSON bypass retained with `--bypass` flag.
+- **New commands** — `strategy-set`, `strategy-unset`, `strategy-list`, `cs-info`.
+
+**ndn-tools (`ndn-iperf`):**
+- **External mode** — rewritten as external server/client that connects to a
+  running ndn-router via `RouterClient`. SHM data plane preferred, Unix socket
+  fallback.
+
+### Changed
+
+- **ndn-router management prefix** changed from custom to `/localhost/nfd` (NFD
+  standard).
+- **ndn-engine `StrategyStage`** now uses `strategy_table` + `default_strategy`
+  instead of a single global strategy.
+- **ndn-engine dispatcher nack pipeline** updated to use strategy table LPM for
+  per-prefix strategy dispatch on Nack.
+
 #### NDN spec compliance — SPEC-GAPS.md tracker and fixes
 
 25-item spec compliance audit against RFC 8569, NDN Packet Format v0.3, and

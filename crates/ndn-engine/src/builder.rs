@@ -4,8 +4,9 @@ use anyhow::Result;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
+use ndn_packet::Name;
 use ndn_security::SecurityManager;
-use ndn_store::{LruCs, Pit};
+use ndn_store::{LruCs, Pit, StrategyTable};
 use ndn_strategy::{BestRouteStrategy, MeasurementsTable};
 use ndn_transport::{Face, FaceTable};
 
@@ -95,10 +96,12 @@ impl EngineBuilder {
             });
         }
 
-        // Build and spawn the packet dispatcher.
-        let strategy: Arc<dyn ErasedStrategy> = self
+        // Build strategy table with the default strategy at root.
+        let default_strategy: Arc<dyn ErasedStrategy> = self
             .strategy
             .unwrap_or_else(|| Arc::new(BestRouteStrategy::new()));
+        let strategy_table = Arc::new(StrategyTable::<dyn ErasedStrategy>::new());
+        strategy_table.insert(&Name::root(), Arc::clone(&default_strategy));
 
         let dispatcher = PacketDispatcher {
             face_table: Arc::clone(&face_table),
@@ -106,7 +109,8 @@ impl EngineBuilder {
             cs_lookup:  CsLookupStage { cs: Arc::clone(&cs) },
             pit_check:  PitCheckStage { pit: Arc::clone(&pit) },
             strategy:   StrategyStage {
-                strategy,
+                strategy_table: Arc::clone(&strategy_table),
+                default_strategy: Arc::clone(&default_strategy),
                 fib:          Arc::clone(&fib),
                 measurements: Arc::clone(&measurements),
                 pit:          Arc::clone(&pit),
@@ -123,12 +127,13 @@ impl EngineBuilder {
         let pipeline_tx = dispatcher.spawn(cancel.clone(), &mut tasks);
 
         let inner = Arc::new(EngineInner {
-            fib:          Arc::clone(&fib),
-            pit:          Arc::clone(&pit),
-            cs:           Arc::clone(&cs),
-            face_table:   Arc::clone(&face_table),
-            measurements: Arc::clone(&measurements),
-            security:     self.security,
+            fib:            Arc::clone(&fib),
+            pit:            Arc::clone(&pit),
+            cs:             Arc::clone(&cs),
+            face_table:     Arc::clone(&face_table),
+            measurements:   Arc::clone(&measurements),
+            strategy_table: Arc::clone(&strategy_table),
+            security:       self.security,
             pipeline_tx,
         });
 

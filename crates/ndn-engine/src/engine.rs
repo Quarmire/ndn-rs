@@ -4,24 +4,28 @@ use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
+use ndn_packet::Interest;
 use ndn_security::SecurityManager;
-use ndn_store::{LruCs, Pit};
+use ndn_store::{LruCs, Pit, PitToken, StrategyTable};
 use ndn_strategy::MeasurementsTable;
-use ndn_transport::{Face, FaceTable};
+use ndn_transport::{Face, FaceId, FaceTable};
+
+use crate::stages::ErasedStrategy;
 
 use crate::dispatcher::InboundPacket;
 use crate::Fib;
 
 /// Shared tables owned by the engine, accessible to all tasks via `Arc`.
 pub struct EngineInner {
-    pub fib:          Arc<Fib>,
-    pub pit:          Arc<Pit>,
-    pub cs:           Arc<LruCs>,
-    pub face_table:   Arc<FaceTable>,
-    pub measurements: Arc<MeasurementsTable>,
+    pub fib:            Arc<Fib>,
+    pub pit:            Arc<Pit>,
+    pub cs:             Arc<LruCs>,
+    pub face_table:     Arc<FaceTable>,
+    pub measurements:   Arc<MeasurementsTable>,
+    pub strategy_table: Arc<StrategyTable<dyn ErasedStrategy>>,
     /// Security manager for signing/verification (optional — `None` disables
     /// security policy enforcement).
-    pub security:     Option<Arc<SecurityManager>>,
+    pub security:       Option<Arc<SecurityManager>>,
     /// Pipeline inbound channel — used to spawn readers for dynamically-added
     /// faces (those registered after `build()` completes).
     pub(crate) pipeline_tx: mpsc::Sender<InboundPacket>,
@@ -54,6 +58,29 @@ impl ForwarderEngine {
 
     pub fn security(&self) -> Option<Arc<SecurityManager>> {
         self.inner.security.as_ref().map(Arc::clone)
+    }
+
+    pub fn strategy_table(&self) -> Arc<StrategyTable<dyn ErasedStrategy>> {
+        Arc::clone(&self.inner.strategy_table)
+    }
+
+    /// Look up the source face that originally sent an Interest.
+    ///
+    /// Computes the PIT token from the Interest's name, selectors, and
+    /// forwarding hint, then reads the first in-record to find the source
+    /// face ID.  Returns `None` if no PIT entry exists (e.g. the Interest
+    /// was already satisfied or expired).
+    ///
+    /// This is used by the management handler to implement NFD's "FaceId
+    /// defaults to the requesting face" behavior.
+    pub fn source_face_id(&self, interest: &Interest) -> Option<FaceId> {
+        let token = PitToken::from_interest_full(
+            &interest.name,
+            Some(interest.selectors()),
+            interest.forwarding_hint(),
+        );
+        self.inner.pit.get(&token)
+            .and_then(|entry| entry.in_records.first().map(|r| FaceId(r.face_id)))
     }
 
     /// Register a face and immediately start its packet-reader task.

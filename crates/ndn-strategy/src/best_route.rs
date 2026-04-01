@@ -1,6 +1,7 @@
+use bytes::Bytes;
 use smallvec::{SmallVec, smallvec};
 
-use ndn_packet::Name;
+use ndn_packet::{Name, NameComponent};
 use ndn_pipeline::{ForwardingAction, NackReason};
 
 use crate::{Strategy, StrategyContext};
@@ -12,8 +13,18 @@ pub struct BestRouteStrategy {
 }
 
 impl BestRouteStrategy {
+    /// NFD strategy name: `/localhost/nfd/strategy/best-route`
+    pub fn strategy_name() -> Name {
+        Name::from_components([
+            NameComponent::generic(Bytes::from_static(b"localhost")),
+            NameComponent::generic(Bytes::from_static(b"nfd")),
+            NameComponent::generic(Bytes::from_static(b"strategy")),
+            NameComponent::generic(Bytes::from_static(b"best-route")),
+        ])
+    }
+
     pub fn new() -> Self {
-        Self { name: Name::root() }
+        Self { name: Self::strategy_name() }
     }
 }
 
@@ -126,8 +137,10 @@ mod tests {
     }
 
     #[test]
-    fn strategy_name_is_root() {
+    fn strategy_name() {
         let s = BestRouteStrategy::new();
-        assert!(s.name().is_empty());
+        let comps = s.name().components();
+        assert_eq!(comps.len(), 4);
+        assert_eq!(comps[3].value.as_ref(), b"best-route");
     }
 }
