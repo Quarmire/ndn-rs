@@ -66,6 +66,14 @@ bootstrapping phase and all APIs should be considered unstable.
     RTT, timeout count.
   - Status output on stderr, final results on stdout (allows piping/parsing).
   - Shared `ConnectOpts` struct via `#[command(flatten)]`.
+- **`ndn-ping` rewritten** to use the application library API and real network I/O:
+  - Replaced simulated ping loop with actual `RouterClient` communication.
+  - Server mode: registers prefix, responds to ping Interests with `DataBuilder`,
+    optional Ed25519 signing (`--sign`), configurable freshness.
+  - Client mode: sends ping Interests with `InterestBuilder`, measures real RTT,
+    prints per-packet timing and statistical summary (min/avg/max/p50/p99/stddev).
+  - Uses clap for CLI parsing with `ConnectOpts` (`--face-socket`, `--no-shm`).
+  - Supports unlimited pings (`--count 0`), configurable interval and lifetime.
 - All tools (`ndn-iperf`, `ndn-traffic`, `ndn-ping`, `ndn-peek`, `ndn-put`,
   `ndn-ctl`, `ndn-sec`, `ndn-bench`, `ndn-router`) now use `Name::from_str()`
   instead of duplicated `parse_name()` functions, and `Name::Display` instead of
