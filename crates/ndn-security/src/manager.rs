@@ -157,6 +157,11 @@ impl SecurityManager {
         self.keys.get_signer(key_name).await
     }
 
+    /// Retrieve a signer synchronously (for use in non-async contexts).
+    pub fn get_signer_sync(&self, key_name: &Name) -> Result<Arc<dyn Signer>, TrustError> {
+        self.keys.get_signer_sync(key_name)
+    }
+
     /// Access the certificate cache (e.g., to pass to a `Validator`).
     pub fn cert_cache(&self) -> &CertCache {
         &self.cert_cache

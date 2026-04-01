@@ -16,6 +16,8 @@ pub trait Signer: Send + Sync + 'static {
     fn key_name(&self) -> &Name;
     /// The certificate name to embed as a key locator in SignatureInfo, if any.
     fn cert_name(&self) -> Option<&Name> { None }
+    /// Return the raw public key bytes, if available.
+    fn public_key(&self) -> Option<Bytes> { None }
 
     fn sign<'a>(&'a self, region: &'a [u8]) -> BoxFuture<'a, Result<Bytes, TrustError>>;
 }
@@ -59,6 +61,10 @@ impl Signer for Ed25519Signer {
 
     fn cert_name(&self) -> Option<&Name> {
         self.cert_name.as_ref()
+    }
+
+    fn public_key(&self) -> Option<Bytes> {
+        Some(Bytes::copy_from_slice(&self.public_key_bytes()))
     }
 
     fn sign<'a>(&'a self, region: &'a [u8]) -> BoxFuture<'a, Result<Bytes, TrustError>> {

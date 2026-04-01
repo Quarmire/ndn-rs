@@ -1,21 +1,27 @@
 [package]
 name = "ndn-app"
-description = "NDN application API: AppFace, express, produce, subscribe"
+description = "NDN application API: Consumer, Producer, KeyChain, AppFace"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+blocking = ["tokio/rt"]
+
 [dependencies]
-ndn-packet   = { workspace = true }
-ndn-pipeline = { workspace = true }
-ndn-engine   = { workspace = true }
-ndn-security = { workspace = true }
-ndn-transport = { workspace = true }
-bytes        = { workspace = true }
-tokio        = { workspace = true, features = ["sync", "rt"] }
-tracing      = { workspace = true }
-thiserror    = { workspace = true }
-anyhow       = { workspace = true }
+ndn-packet     = { workspace = true }
+ndn-pipeline   = { workspace = true }
+ndn-engine     = { workspace = true }
+ndn-security   = { workspace = true }
+ndn-transport  = { workspace = true }
+ndn-face-local = { workspace = true }
+ndn-ipc        = { workspace = true }
+bytes          = { workspace = true }
+tokio          = { workspace = true, features = ["sync", "rt", "time"] }
+tracing        = { workspace = true }
+thiserror      = { workspace = true }
+anyhow         = { workspace = true }
 
 [dev-dependencies]
 ndn-tlv = { workspace = true }
