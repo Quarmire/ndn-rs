@@ -78,9 +78,15 @@ pub struct RouterClient {
 impl RouterClient {
     /// Connect to the router's face socket.
     ///
-    /// Attempts SHM data plane first; falls back to Unix socket if SHM is
-    /// unavailable or fails.
+    /// Automatically attempts SHM data plane with an auto-generated name;
+    /// falls back to Unix socket if SHM is unavailable or fails.
     pub async fn connect(face_socket: impl AsRef<Path>) -> Result<Self, RouterError> {
+        let auto_name = format!("app-{}-{}", std::process::id(), next_shm_id());
+        Self::connect_with_name(face_socket, Some(&auto_name)).await
+    }
+
+    /// Connect using only the Unix socket for data (no SHM attempt).
+    pub async fn connect_unix_only(face_socket: impl AsRef<Path>) -> Result<Self, RouterError> {
         Self::connect_with_name(face_socket, None).await
     }
 
@@ -246,4 +252,10 @@ async fn send_command(
     }
 
     Ok(resp.body.unwrap_or_default())
+}
+
+/// Process-local counter for auto-generated SHM names.
+fn next_shm_id() -> u32 {
+    static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
