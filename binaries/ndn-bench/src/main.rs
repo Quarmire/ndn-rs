@@ -13,22 +13,8 @@ use tokio::task::JoinSet;
 
 use ndn_app::AppFace;
 use ndn_engine::{EngineBuilder, EngineConfig};
-use ndn_packet::{Name, NameComponent};
+use ndn_packet::Name;
 use ndn_transport::FaceId;
-use bytes::Bytes;
-
-fn parse_name(s: &str) -> Name {
-    let components: Vec<NameComponent> = s
-        .split('/')
-        .filter(|c| !c.is_empty())
-        .map(|c| NameComponent::generic(Bytes::copy_from_slice(c.as_bytes())))
-        .collect();
-    if components.is_empty() {
-        Name::root()
-    } else {
-        Name::from_components(components)
-    }
-}
 
 /// Latency statistics over a sample of round-trip measurements.
 struct LatencyStats {
@@ -79,7 +65,7 @@ async fn main() -> Result<()> {
         .build()
         .await?;
 
-    let prefix = parse_name(&prefix_str);
+    let prefix: Name = prefix_str.parse().unwrap_or_else(|_| Name::root());
     println!(
         "ndn-bench: {} interests, concurrency={}, prefix={}",
         total_interests, concurrency, prefix_str
@@ -100,13 +86,7 @@ async fn main() -> Result<()> {
             let (face, mut rx) = AppFace::new(FaceId(worker as u32), 128);
             let mut rtts = Vec::new();
             for seq in 0..batch {
-                let comp = NameComponent::generic({
-                    let s = format!("{seq}");
-                    Bytes::copy_from_slice(s.as_bytes())
-                });
-                let name = Name::from_components(
-                    pfx.components().iter().cloned().chain([comp])
-                );
+                let name = pfx.clone().append(format!("{seq}"));
                 use ndn_packet::Interest;
                 let interest = Interest::new(name);
 

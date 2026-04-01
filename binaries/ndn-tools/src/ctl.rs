@@ -30,7 +30,7 @@
 /// ```
 use bytes::Bytes;
 use clap::{Parser, Subcommand};
-use ndn_packet::{Name, NameComponent};
+use ndn_packet::Name;
 use ndn_packet::encode::encode_interest;
 
 use ndn_config::{
@@ -191,7 +191,7 @@ fn build_nfd_name(cmd: &Command) -> Name {
     match cmd {
         Command::AddRoute { prefix, face, cost } => {
             let params = ControlParameters {
-                name: Some(parse_name(prefix)),
+                name: Some(prefix.parse().unwrap()),
                 face_id: Some(*face as u64),
                 cost: Some(*cost as u64),
                 ..Default::default()
@@ -200,7 +200,7 @@ fn build_nfd_name(cmd: &Command) -> Name {
         }
         Command::RemoveRoute { prefix, face } => {
             let params = ControlParameters {
-                name: Some(parse_name(prefix)),
+                name: Some(prefix.parse().unwrap()),
                 face_id: Some(*face as u64),
                 ..Default::default()
             };
@@ -214,15 +214,15 @@ fn build_nfd_name(cmd: &Command) -> Name {
         }
         Command::StrategySet { prefix, strategy } => {
             let params = ControlParameters {
-                name: Some(parse_name(prefix)),
-                strategy: Some(parse_name(strategy)),
+                name: Some(prefix.parse().unwrap()),
+                strategy: Some(strategy.parse().unwrap()),
                 ..Default::default()
             };
             command_name(module::STRATEGY, verb::SET, &params)
         }
         Command::StrategyUnset { prefix } => {
             let params = ControlParameters {
-                name: Some(parse_name(prefix)),
+                name: Some(prefix.parse().unwrap()),
                 ..Default::default()
             };
             command_name(module::STRATEGY, verb::UNSET, &params)
@@ -239,19 +239,6 @@ fn build_nfd_name(cmd: &Command) -> Name {
         Command::Shutdown => {
             ndn_config::nfd_command::dataset_name(module::STATUS, b"shutdown")
         }
-    }
-}
-
-fn parse_name(s: &str) -> Name {
-    let components: Vec<NameComponent> = s
-        .split('/')
-        .filter(|c| !c.is_empty())
-        .map(|c| NameComponent::generic(Bytes::copy_from_slice(c.as_bytes())))
-        .collect();
-    if components.is_empty() {
-        Name::root()
-    } else {
-        Name::from_components(components)
     }
 }
 
@@ -327,7 +314,7 @@ fn print_control_response(resp: &ControlResponse) {
     println!("{} {}", resp.status_code, resp.status_text);
     if let Some(ref body) = resp.body {
         if let Some(ref name) = body.name {
-            println!("  Name:    {}", format_name(name));
+            println!("  Name:    {}", name);
         }
         if let Some(id) = body.face_id {
             println!("  FaceId:  {id}");
@@ -345,7 +332,7 @@ fn print_control_response(resp: &ControlResponse) {
             println!("  Flags:   {flags:#x}");
         }
         if let Some(ref strategy) = body.strategy {
-            println!("  Strategy: {}", format_name(strategy));
+            println!("  Strategy: {}", strategy);
         }
     }
 }
@@ -368,18 +355,3 @@ fn print_legacy_response(resp: ManagementResponse) {
     }
 }
 
-fn format_name(name: &Name) -> String {
-    let mut s = String::new();
-    for comp in name.components() {
-        s.push('/');
-        for &b in comp.value.iter() {
-            if b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.' {
-                s.push(b as char);
-            } else {
-                s.push_str(&format!("%{b:02X}"));
-            }
-        }
-    }
-    if s.is_empty() { s.push('/'); }
-    s
-}

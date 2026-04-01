@@ -7,19 +7,6 @@ use bytes::Bytes;
 use ndn_packet::{Interest, Name, NameComponent};
 use std::time::{Duration, Instant};
 
-fn parse_name(s: &str) -> Name {
-    let components: Vec<NameComponent> = s
-        .split('/')
-        .filter(|c| !c.is_empty())
-        .map(|c| NameComponent::generic(Bytes::copy_from_slice(c.as_bytes())))
-        .collect();
-    if components.is_empty() {
-        Name::root()
-    } else {
-        Name::from_components(components)
-    }
-}
-
 /// Simulated RTT entry — a real implementation would use AppFace.
 struct PingResult {
     seq:    u32,
@@ -54,21 +41,16 @@ async fn main() -> Result<()> {
         }
     }
 
-    let prefix = parse_name(&prefix_str);
-    println!("ndn-ping: pinging {} ({} packets, interval {}ms)", prefix_str, count, interval_ms);
+    let prefix: Name = prefix_str.parse().unwrap_or_else(|_| Name::root());
+    println!("ndn-ping: pinging {prefix} ({count} packets, interval {interval_ms}ms)");
 
     // TODO: wire to AppFace for real forwarder pings.
     // Simulate the ping loop structure without a live forwarder.
     let mut results: Vec<PingResult> = Vec::new();
     for seq in 0..count {
         // Build a ping Interest: prefix + /ping/<seq>
-        let ping_comp = NameComponent::generic(Bytes::from_static(b"ping"));
-        let seq_bytes = seq.to_be_bytes();
-        let seq_comp  = NameComponent::generic(Bytes::copy_from_slice(&seq_bytes));
-        let _interest = Interest::new(Name::from_components(
-            prefix.components().iter().cloned()
-                .chain([ping_comp, seq_comp])
-        ));
+        let name = prefix.clone().append("ping").append(seq.to_string());
+        let _interest = Interest::new(name);
 
         let t0 = Instant::now();
         // TODO: express Interest and await Data

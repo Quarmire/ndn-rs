@@ -21,7 +21,7 @@ use ndn_engine::{EngineBuilder, EngineConfig};
 use ndn_face_local::{AppFace, AppHandle};
 use ndn_packet::encode::{encode_data_unsigned, encode_interest};
 use ndn_packet::lp::is_lp_packet;
-use ndn_packet::{Interest, Name, NameComponent};
+use ndn_packet::{Interest, Name};
 use ndn_transport::FaceId;
 
 // ─── CLI ─────────────────────────────────────────────────────────────────────
@@ -56,33 +56,10 @@ struct Cli {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-fn parse_name(s: &str) -> Name {
-    let components: Vec<NameComponent> = s
-        .split('/')
-        .filter(|c| !c.is_empty())
-        .map(|c| NameComponent::generic(Bytes::copy_from_slice(c.as_bytes())))
-        .collect();
-    if components.is_empty() {
-        Name::root()
-    } else {
-        Name::from_components(components)
-    }
-}
-
 fn build_name(prefix: &Name, flow: u64, seq: u64) -> Name {
-    let flow_comp = NameComponent::generic(Bytes::copy_from_slice(
-        format!("flow-{flow}").as_bytes(),
-    ));
-    let seq_comp = NameComponent::generic(Bytes::copy_from_slice(
-        format!("{seq}").as_bytes(),
-    ));
-    Name::from_components(
-        prefix
-            .components()
-            .iter()
-            .cloned()
-            .chain([flow_comp, seq_comp]),
-    )
+    prefix.clone()
+        .append(format!("flow-{flow}"))
+        .append(format!("{seq}"))
 }
 
 struct FlowResult {
@@ -198,7 +175,7 @@ async fn run_consumer(
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let prefix = parse_name(&cli.prefix);
+    let prefix: Name = cli.prefix.parse().unwrap_or_else(|_| Name::root());
     let echo_mode = cli.mode == "echo";
 
     println!(

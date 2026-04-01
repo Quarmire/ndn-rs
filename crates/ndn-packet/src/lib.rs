@@ -30,6 +30,7 @@ pub mod tlv_type {
     pub const NAME_COMPONENT:   u64 = 0x08;
     pub const IMPLICIT_SHA256:  u64 = 0x01;
     pub const PARAMETERS_SHA256: u64 = 0x02;
+    pub const SEGMENT:          u64 = 0x32;
     pub const CAN_BE_PREFIX:    u64 = 0x21;
     pub const MUST_BE_FRESH:    u64 = 0x12;
     pub const FORWARDING_HINT:  u64 = 0x1e;

@@ -124,7 +124,7 @@ pub async fn run_ndn_mgmt_handler(
         let source_face = engine.source_face_id(&interest);
         tracing::debug!(
             source_face = ?source_face,
-            name = %format_name(&interest.name),
+            name = %interest.name,
             "nfd-mgmt: received command"
         );
 
@@ -209,7 +209,7 @@ fn rib_register(
 
     engine.fib().add_nexthop(&name, face_id, cost);
 
-    tracing::info!(prefix = %format_name(&name), face = face_id.0, cost, "rib/register");
+    tracing::info!(prefix = %name, face = face_id.0, cost, "rib/register");
 
     let echo = ControlParameters {
         name: Some(name),
@@ -238,7 +238,7 @@ fn rib_unregister(
     };
 
     engine.fib().remove_nexthop(&name, face_id);
-    tracing::info!(prefix = %format_name(&name), face = face_id.0, "rib/unregister");
+    tracing::info!(prefix = %name, face = face_id.0, "rib/unregister");
 
     let echo = ControlParameters {
         name: Some(name),
@@ -391,7 +391,7 @@ fn fib_add_nexthop(
     let cost = params.cost.unwrap_or(0) as u32;
 
     engine.fib().add_nexthop(&name, face_id, cost);
-    tracing::info!(prefix = %format_name(&name), face = face_id.0, cost, "fib/add-nexthop");
+    tracing::info!(prefix = %name, face = face_id.0, cost, "fib/add-nexthop");
 
     let echo = ControlParameters {
         name: Some(name),
@@ -418,7 +418,7 @@ fn fib_remove_nexthop(
     };
 
     engine.fib().remove_nexthop(&name, face_id);
-    tracing::info!(prefix = %format_name(&name), face = face_id.0, "fib/remove-nexthop");
+    tracing::info!(prefix = %name, face = face_id.0, "fib/remove-nexthop");
 
     let echo = ControlParameters {
         name: Some(name),
@@ -435,8 +435,8 @@ fn fib_list(engine: &ForwarderEngine) -> ControlResponse {
         let nexthops: Vec<String> = entry.nexthops.iter()
             .map(|nh| format!("faceid={} cost={}", nh.face_id.0, nh.cost))
             .collect();
-        text.push_str(&format!("  {} nexthops=[{}]\n",
-            format_name(name), nexthops.join(", ")));
+        text.push_str(&format!("  {name} nexthops=[{}]\n",
+            nexthops.join(", ")));
     }
     ControlResponse::ok_empty(text)
 }
@@ -499,15 +499,15 @@ fn strategy_set(params: ControlParameters, engine: &ForwarderEngine) -> ControlR
         Some(s) => s,
         None => return ControlResponse::error(
             status::NOT_FOUND,
-            format!("unknown strategy: {}", format_name(&strategy_name)),
+            format!("unknown strategy: {}", strategy_name),
         ),
     };
 
     engine.strategy_table().insert(&prefix, strategy);
 
     tracing::info!(
-        prefix = %format_name(&prefix),
-        strategy = %format_name(&strategy_name),
+        prefix = %prefix,
+        strategy = %strategy_name,
         "strategy-choice/set"
     );
 
@@ -535,7 +535,7 @@ fn strategy_unset(params: ControlParameters, engine: &ForwarderEngine) -> Contro
 
     engine.strategy_table().remove(&prefix);
 
-    tracing::info!(prefix = %format_name(&prefix), "strategy-choice/unset");
+    tracing::info!(prefix = %prefix, "strategy-choice/unset");
 
     let echo = ControlParameters {
         name: Some(prefix),
@@ -548,8 +548,8 @@ fn strategy_list(engine: &ForwarderEngine) -> ControlResponse {
     let entries = engine.strategy_table().dump();
     let mut text = format!("{} strategy entries\n", entries.len());
     for (prefix, strategy) in &entries {
-        text.push_str(&format!("  prefix={} strategy={}\n",
-            format_name(prefix), format_name(strategy.name())));
+        text.push_str(&format!("  prefix={prefix} strategy={}\n",
+            strategy.name()));
     }
     ControlResponse::ok_empty(text)
 }
@@ -645,18 +645,3 @@ async fn send_response(handle: &mut AppHandle, name: &Name, resp: &ControlRespon
     }
 }
 
-fn format_name(name: &Name) -> String {
-    let mut s = String::new();
-    for comp in name.components() {
-        s.push('/');
-        for &b in comp.value.iter() {
-            if b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.' {
-                s.push(b as char);
-            } else {
-                s.push_str(&format!("%{b:02X}"));
-            }
-        }
-    }
-    if s.is_empty() { s.push('/'); }
-    s
-}

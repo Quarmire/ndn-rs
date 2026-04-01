@@ -29,7 +29,7 @@ use clap::{Parser, Subcommand};
 
 use ndn_ipc::RouterClient;
 use ndn_packet::encode::{encode_data_unsigned, encode_interest};
-use ndn_packet::{Data, Interest, Name, NameComponent};
+use ndn_packet::{Data, Interest, Name};
 
 // ─── CLI ─────────────────────────────────────────────────────────────────────
 
@@ -90,22 +90,8 @@ enum Command {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-fn parse_name(s: &str) -> Name {
-    let components: Vec<NameComponent> = s
-        .split('/')
-        .filter(|c| !c.is_empty())
-        .map(|c| NameComponent::generic(Bytes::copy_from_slice(c.as_bytes())))
-        .collect();
-    if components.is_empty() {
-        Name::root()
-    } else {
-        Name::from_components(components)
-    }
-}
-
 fn build_name(prefix: &Name, seq: u64) -> Name {
-    let seq_comp = NameComponent::generic(Bytes::copy_from_slice(format!("{seq}").as_bytes()));
-    Name::from_components(prefix.components().iter().cloned().chain([seq_comp]))
+    prefix.clone().append(format!("{seq}"))
 }
 
 fn extract_seq(raw: &Bytes) -> Option<u64> {
@@ -131,8 +117,7 @@ async fn run_server(
 
     let transport = if client.is_shm() { "SHM" } else { "Unix" };
     println!(
-        "ndn-iperf server: prefix={} transport={transport} payload={payload_size}B",
-        format_name(prefix)
+        "ndn-iperf server: prefix={prefix} transport={transport} payload={payload_size}B",
     );
     println!("  waiting for Interests... (Ctrl-C to stop)");
 
@@ -203,8 +188,7 @@ async fn run_client(
 
     let transport = if client.is_shm() { "SHM" } else { "Unix" };
     println!(
-        "ndn-iperf client: prefix={} transport={transport} duration={duration_secs}s window={window}",
-        format_name(prefix),
+        "ndn-iperf client: prefix={prefix} transport={transport} duration={duration_secs}s window={window}",
     );
 
     let deadline = Instant::now() + Duration::from_secs(duration_secs);
@@ -315,7 +299,7 @@ async fn main() -> Result<()> {
             face_socket,
             no_shm,
         } => {
-            let prefix = parse_name(&prefix);
+            let prefix: Name = prefix.parse().unwrap_or_else(|_| Name::root());
             run_server(&face_socket, no_shm, &prefix, size).await
         }
         Command::Client {
@@ -326,28 +310,9 @@ async fn main() -> Result<()> {
             face_socket,
             no_shm,
         } => {
-            let prefix = parse_name(&prefix);
+            let prefix: Name = prefix.parse().unwrap_or_else(|_| Name::root());
             run_client(&face_socket, no_shm, &prefix, duration, window, size).await
         }
     }
 }
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-
-fn format_name(name: &Name) -> String {
-    let mut s = String::new();
-    for comp in name.components() {
-        s.push('/');
-        for &b in comp.value.iter() {
-            if b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.' {
-                s.push(b as char);
-            } else {
-                s.push_str(&format!("%{b:02X}"));
-            }
-        }
-    }
-    if s.is_empty() {
-        s.push('/');
-    }
-    s
-}

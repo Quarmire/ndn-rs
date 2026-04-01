@@ -5,20 +5,7 @@
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use ndn_ipc::chunked::{ChunkedProducer, NDN_DEFAULT_SEGMENT_SIZE};
-use ndn_packet::{Name, NameComponent};
-
-fn parse_name(s: &str) -> Name {
-    let components: Vec<NameComponent> = s
-        .split('/')
-        .filter(|c| !c.is_empty())
-        .map(|c| NameComponent::generic(Bytes::copy_from_slice(c.as_bytes())))
-        .collect();
-    if components.is_empty() {
-        Name::root()
-    } else {
-        Name::from_components(components)
-    }
-}
+use ndn_packet::Name;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -53,7 +40,7 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("reading {file_path}"))?;
 
-    let name    = parse_name(&name_str);
+    let name: Name = name_str.parse().unwrap_or_else(|_| Name::root());
     let producer = ChunkedProducer::new(name, Bytes::from(payload), chunk_size);
 
     println!(

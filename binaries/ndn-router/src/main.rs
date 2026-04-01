@@ -9,10 +9,9 @@ use ndn_config::ForwarderConfig;
 #[cfg(unix)]
 use ndn_config::{ManagementRequest, ManagementResponse, ManagementServer};
 use ndn_engine::{EngineBuilder, EngineConfig, ForwarderEngine};
-use ndn_packet::{Name, NameComponent};
+use ndn_packet::Name;
 use ndn_security::{FilePib, SecurityManager};
 use ndn_face_local::AppFace;
-use bytes::Bytes;
 
 // Unix-socket bypass management I/O.
 #[cfg(unix)]
@@ -90,7 +89,7 @@ async fn main() -> Result<()> {
 
     // Apply static FIB routes from config.
     for route in &fwd_config.routes {
-        let name = name_from_uri(&route.prefix);
+        let name = parse_name(&route.prefix);
         engine
             .fib()
             .add_nexthop(&name, ndn_transport::FaceId(route.face as u32), route.cost);
@@ -194,7 +193,7 @@ fn handle_request(
 ) -> ManagementResponse {
     match req {
         ManagementRequest::AddRoute { prefix, face, cost } => {
-            let name = name_from_uri(&prefix);
+            let name = parse_name(&prefix);
             engine.fib().add_nexthop(
                 &name,
                 ndn_transport::FaceId(face),
@@ -204,7 +203,7 @@ fn handle_request(
             ManagementResponse::Ok
         }
         ManagementRequest::RemoveRoute { prefix, face } => {
-            let name = name_from_uri(&prefix);
+            let name = parse_name(&prefix);
             engine.fib().remove_nexthop(&name, ndn_transport::FaceId(face));
             tracing::info!(%prefix, face, "management: route removed");
             ManagementResponse::Ok
@@ -328,7 +327,7 @@ fn load_security(cfg: &ForwarderConfig) -> Option<SecurityManager> {
         .map(PathBuf::from)
         .unwrap_or_else(default_pib_path);
 
-    let identity = name_from_uri(identity_uri);
+    let identity = parse_name(identity_uri);
 
     let pib = match FilePib::open(&pib_path) {
         Ok(p) => p,
@@ -373,11 +372,6 @@ fn default_pib_path() -> PathBuf {
 }
 
 /// Parse a URI-style NDN name like `/ndn/test` into a `Name`.
-fn name_from_uri(uri: &str) -> Name {
-    let comps: Vec<NameComponent> = uri
-        .split('/')
-        .filter(|s| !s.is_empty())
-        .map(|s| NameComponent::generic(Bytes::copy_from_slice(s.as_bytes())))
-        .collect();
-    Name::from_components(comps)
+fn parse_name(uri: &str) -> Name {
+    uri.parse().unwrap_or_else(|_| Name::root())
 }

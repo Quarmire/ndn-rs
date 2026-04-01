@@ -3,21 +3,7 @@
 //! Usage: ndn-peek /name/of/data [--timeout-ms <ms>]
 
 use anyhow::{bail, Result};
-use bytes::Bytes;
-use ndn_packet::{Interest, Name, NameComponent};
-
-fn parse_name(s: &str) -> Result<Name> {
-    let components: Vec<NameComponent> = s
-        .split('/')
-        .filter(|c| !c.is_empty())
-        .map(|c| NameComponent::generic(Bytes::copy_from_slice(c.as_bytes())))
-        .collect();
-    if components.is_empty() {
-        Ok(Name::root())
-    } else {
-        Ok(Name::from_components(components))
-    }
-}
+use ndn_packet::{Interest, Name};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -41,7 +27,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    let name = parse_name(&name_str)?;
+    let name: Name = name_str.parse().map_err(|e| anyhow::anyhow!("{e}"))?;
     let _interest = Interest::new(name.clone());
 
     println!("ndn-peek: fetching {}", name_str);

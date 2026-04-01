@@ -30,7 +30,7 @@ use clap::{Parser, Subcommand};
 use ndn_packet::Name;
 use ndn_security::{
     cert_cache::Certificate,
-    pib::{FilePib, name_to_uri, name_from_uri},
+    pib::{FilePib, name_to_uri},
 };
 
 // ─── CLI definition ───────────────────────────────────────────────────────────
@@ -278,7 +278,7 @@ fn open_pib(path: &PathBuf) -> anyhow::Result<FilePib> {
 
 /// Parse an NDN URI like `/ndn/router1` into a `Name`.
 fn parse_name(s: &str) -> anyhow::Result<Name> {
-    name_from_uri(s).map_err(|e| anyhow::anyhow!("Invalid NDN name '{s}': {e}"))
+    s.parse().map_err(|e| anyhow::anyhow!("Invalid NDN name '{s}': {e}"))
 }
 
 fn now_ns() -> u64 {
