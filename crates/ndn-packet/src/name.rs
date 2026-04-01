@@ -1,3 +1,5 @@
+use core::str::FromStr;
+
 use bytes::Bytes;
 use smallvec::SmallVec;
 
@@ -74,6 +76,121 @@ impl Name {
         }
         Ok(Self { components })
     }
+
+    // ── Builder methods ──────────────────────────────────────────────────────
+
+    /// Append a generic component from raw bytes.
+    pub fn append(mut self, value: impl AsRef<[u8]>) -> Self {
+        self.components.push(NameComponent::generic(
+            Bytes::copy_from_slice(value.as_ref()),
+        ));
+        self
+    }
+
+    /// Append an already-constructed component.
+    pub fn append_component(mut self, comp: NameComponent) -> Self {
+        self.components.push(comp);
+        self
+    }
+
+    /// Append a segment number component (type `0x32`, big-endian encoding with
+    /// leading zeros stripped per NDN naming conventions).
+    pub fn append_segment(self, seg: u64) -> Self {
+        let bytes = seg.to_be_bytes();
+        // Strip leading zeros but keep at least one byte.
+        let start = bytes.iter().position(|&b| b != 0).unwrap_or(7);
+        let value = Bytes::copy_from_slice(&bytes[start..]);
+        self.append_component(NameComponent::new(tlv_type::SEGMENT, value))
+    }
+}
+
+impl FromStr for Name {
+    type Err = PacketError;
+
+    /// Parse an NDN URI string into a `Name`.
+    ///
+    /// Handles percent-decoding to roundtrip with `Display`.
+    ///
+    /// ```
+    /// # use ndn_packet::Name;
+    /// let name: Name = "/edu/ucla/data".parse().unwrap();
+    /// assert_eq!(name.to_string(), "/edu/ucla/data");
+    /// ```
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let s = s.trim();
+        if s.is_empty() || s == "/" {
+            return Ok(Self::root());
+        }
+
+        // Must start with '/'.
+        if !s.starts_with('/') {
+            return Err(PacketError::MalformedPacket("name must start with '/'".into()));
+        }
+
+        let mut components = SmallVec::new();
+        for part in s[1..].split('/') {
+            if part.is_empty() {
+                continue; // tolerate trailing slash
+            }
+            let decoded = percent_decode(part)
+                .map_err(|_| PacketError::MalformedPacket("invalid percent-encoding in name".into()))?;
+            components.push(NameComponent::generic(Bytes::from(decoded)));
+        }
+
+        if components.is_empty() {
+            Ok(Self::root())
+        } else {
+            Ok(Self { components })
+        }
+    }
+}
+
+/// Decode percent-encoded bytes in a name component.
+fn percent_decode(s: &str) -> Result<Vec<u8>, ()> {
+    let mut out = Vec::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                return Err(());
+            }
+            let hi = hex_digit(bytes[i + 1])?;
+            let lo = hex_digit(bytes[i + 2])?;
+            out.push((hi << 4) | lo);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    Ok(out)
+}
+
+fn hex_digit(b: u8) -> Result<u8, ()> {
+    match b {
+        b'0'..=b'9' => Ok(b - b'0'),
+        b'A'..=b'F' => Ok(b - b'A' + 10),
+        b'a'..=b'f' => Ok(b - b'a' + 10),
+        _ => Err(()),
+    }
+}
+
+/// Construct a [`Name`] from an NDN URI string literal.
+///
+/// ```
+/// # use ndn_packet::name;
+/// let prefix = name!("/iperf");
+/// assert_eq!(prefix.to_string(), "/iperf");
+/// ```
+///
+/// Panics at runtime if the string is not a valid NDN name.
+#[macro_export]
+macro_rules! name {
+    ($s:expr) => {
+        <$crate::Name as ::core::str::FromStr>::from_str($s)
+            .expect(concat!("invalid NDN name: ", $s))
+    };
 }
 
 /// Build Name TLV value bytes (the content inside a `0x07` TLV) for testing.
@@ -261,5 +378,101 @@ mod tests {
         let generic  = NameComponent::generic(bytes::Bytes::copy_from_slice(b"abc"));
         let implicit = NameComponent { typ: 0x01, value: bytes::Bytes::copy_from_slice(b"abc") };
         assert_ne!(generic, implicit);
+    }
+
+    // ── FromStr ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn from_str_simple() {
+        let n: Name = "/edu/ucla/data".parse().unwrap();
+        assert_eq!(n.len(), 3);
+        assert_eq!(n.components()[0].value.as_ref(), b"edu");
+        assert_eq!(n.components()[2].value.as_ref(), b"data");
+    }
+
+    #[test]
+    fn from_str_root() {
+        let n: Name = "/".parse().unwrap();
+        assert!(n.is_empty());
+    }
+
+    #[test]
+    fn from_str_empty_string() {
+        let n: Name = "".parse().unwrap();
+        assert!(n.is_empty());
+    }
+
+    #[test]
+    fn from_str_trailing_slash() {
+        let n: Name = "/test/".parse().unwrap();
+        assert_eq!(n.len(), 1);
+        assert_eq!(n.components()[0].value.as_ref(), b"test");
+    }
+
+    #[test]
+    fn from_str_percent_decode() {
+        let n: Name = "/%00%FF".parse().unwrap();
+        assert_eq!(n.len(), 1);
+        assert_eq!(n.components()[0].value.as_ref(), &[0x00, 0xFF]);
+    }
+
+    #[test]
+    fn from_str_lowercase_hex() {
+        let n: Name = "/%0a%ff".parse().unwrap();
+        assert_eq!(n.components()[0].value.as_ref(), &[0x0A, 0xFF]);
+    }
+
+    #[test]
+    fn from_str_no_leading_slash_is_err() {
+        assert!("edu/ucla".parse::<Name>().is_err());
+    }
+
+    #[test]
+    fn from_str_bad_percent_is_err() {
+        assert!("/%ZZ".parse::<Name>().is_err());
+    }
+
+    #[test]
+    fn display_from_str_roundtrip() {
+        let original = Name::from_components([
+            comp(b"edu"),
+            comp(b"ucla"),
+            NameComponent::generic(bytes::Bytes::from(vec![0x00, 0xFF])),
+        ]);
+        let s = original.to_string();
+        let parsed: Name = s.parse().unwrap();
+        assert_eq!(original, parsed);
+    }
+
+    // ── append ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn append_builds_name() {
+        let n = Name::root().append("edu").append("ucla");
+        assert_eq!(n.len(), 2);
+        assert_eq!(n.to_string(), "/edu/ucla");
+    }
+
+    #[test]
+    fn append_segment() {
+        let n: Name = "/iperf".parse().unwrap();
+        let n = n.append_segment(42);
+        assert_eq!(n.len(), 2);
+        assert_eq!(n.components()[1].typ, tlv_type::SEGMENT);
+    }
+
+    #[test]
+    fn append_segment_zero() {
+        let n = Name::root().append_segment(0);
+        assert_eq!(n.components()[0].value.as_ref(), &[0u8]);
+    }
+
+    // ── name! macro ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn name_macro() {
+        let n = name!("/iperf/data");
+        assert_eq!(n.len(), 2);
+        assert_eq!(n.to_string(), "/iperf/data");
     }
 }
