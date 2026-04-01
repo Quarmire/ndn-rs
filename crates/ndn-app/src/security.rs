@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use ndn_packet::Name;
 use ndn_security::{
@@ -31,10 +32,20 @@ impl KeyChain {
         Ok(Self { mgr })
     }
 
+    /// Default certificate validity: 365 days (in milliseconds).
+    const DEFAULT_CERT_VALIDITY_MS: u64 = 365 * 24 * 3600 * 1000;
+
     /// Generate an Ed25519 key pair and self-signed certificate for an identity.
     ///
+    /// `validity` sets the certificate lifetime. Pass `None` for the default
+    /// of 365 days.
+    ///
     /// Returns a `Signer` handle suitable for use with `DataBuilder::sign()`.
-    pub fn create_identity(&self, identity: impl Into<Name>) -> Result<Arc<dyn Signer>, AppError> {
+    pub fn create_identity(
+        &self,
+        identity: impl Into<Name>,
+        validity: Option<Duration>,
+    ) -> Result<Arc<dyn Signer>, AppError> {
         let name = identity.into();
         self.mgr.generate_ed25519(name.clone())
             .map_err(|e| AppError::Engine(e.into()))?;
@@ -42,9 +53,12 @@ impl KeyChain {
         let signer = self.mgr.get_signer_sync(&name)
             .map_err(|e| AppError::Engine(e.into()))?;
 
-        // Issue a self-signed certificate with 1-year validity.
+        let validity_ms = validity
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(Self::DEFAULT_CERT_VALIDITY_MS);
+
         if let Some(pk) = signer.public_key() {
-            let _ = self.mgr.issue_self_signed(&name, pk, 365 * 24 * 3600 * 1000);
+            let _ = self.mgr.issue_self_signed(&name, pk, validity_ms);
         }
 
         Ok(signer)

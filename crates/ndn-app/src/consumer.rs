@@ -7,11 +7,21 @@ use ndn_face_local::AppHandle;
 use ndn_ipc::RouterClient;
 use ndn_packet::lp::{LpPacket, is_lp_packet};
 use ndn_packet::{Data, Name};
-use ndn_packet::encode::encode_interest;
+use ndn_packet::encode::InterestBuilder;
 use ndn_security::{SafeData, Validator, ValidationResult};
 
 use crate::AppError;
 use crate::connection::NdnConnection;
+
+/// Default Interest lifetime: 4 seconds.
+pub const DEFAULT_INTEREST_LIFETIME: Duration = Duration::from_millis(4000);
+
+/// Default local timeout for waiting on a response.
+///
+/// This is the local safety-net timeout independent of the Interest lifetime
+/// sent on the wire. Set slightly longer than the default Interest lifetime
+/// to account for forwarding and processing delays.
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_millis(4500);
 
 /// High-level NDN consumer — fetches Data by name.
 pub struct Consumer {
@@ -32,26 +42,36 @@ impl Consumer {
     }
 
     /// Express an Interest by name and return the decoded Data.
+    ///
+    /// Uses [`DEFAULT_INTEREST_LIFETIME`] for the wire Interest and
+    /// [`DEFAULT_TIMEOUT`] for the local wait. For control over these,
+    /// use [`fetch_wire`](Self::fetch_wire) with an [`InterestBuilder`].
     pub async fn fetch(&mut self, name: impl Into<Name>) -> Result<Data, AppError> {
-        let name = name.into();
-        let wire = encode_interest(&name, None);
-        self.fetch_wire(wire).await
+        let wire = InterestBuilder::new(name)
+            .lifetime(DEFAULT_INTEREST_LIFETIME)
+            .build();
+        self.fetch_wire(wire, DEFAULT_TIMEOUT).await
     }
 
     /// Express a pre-encoded Interest and return the decoded Data.
     ///
-    /// Returns `AppError::Nacked` if the forwarder responds with a Nack
+    /// `timeout` is the local wait duration — set this to at least the
+    /// Interest lifetime encoded in `wire` to avoid timing out before the
+    /// forwarder does.
+    ///
+    /// Returns [`AppError::Nacked`] if the forwarder responds with a Nack
     /// (e.g. no route to the name prefix).
-    pub async fn fetch_wire(&mut self, wire: Bytes) -> Result<Data, AppError> {
+    pub async fn fetch_wire(
+        &mut self,
+        wire: Bytes,
+        timeout: Duration,
+    ) -> Result<Data, AppError> {
         self.conn.send(wire).await?;
 
-        let reply = tokio::time::timeout(
-            Duration::from_secs(4),
-            self.conn.recv(),
-        )
-        .await
-        .map_err(|_| AppError::Timeout)?
-        .ok_or_else(|| AppError::Engine(anyhow::anyhow!("connection closed")))?;
+        let reply = tokio::time::timeout(timeout, self.conn.recv())
+            .await
+            .map_err(|_| AppError::Timeout)?
+            .ok_or_else(|| AppError::Engine(anyhow::anyhow!("connection closed")))?;
 
         // Check for Nack (LpPacket with Nack header).
         if is_lp_packet(&reply) {

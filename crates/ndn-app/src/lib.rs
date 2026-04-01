@@ -61,7 +61,7 @@ pub mod blocking;
 pub use app_face::{AppFace, OutboundRequest};
 pub use error::AppError;
 pub use connection::NdnConnection;
-pub use consumer::Consumer;
+pub use consumer::{Consumer, DEFAULT_INTEREST_LIFETIME, DEFAULT_TIMEOUT};
 pub use producer::Producer;
 pub use security::KeyChain;
 
