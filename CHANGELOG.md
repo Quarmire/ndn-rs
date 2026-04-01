@@ -73,6 +73,17 @@ bootstrapping phase and all APIs should be considered unstable.
 - Tool name-building code simplified with `Name::append()` (e.g.,
   `prefix.clone().append(format!("{seq}"))` replaces iterator chains).
 
+#### Embedded engine integration tests (Android/mobile readiness)
+
+- **`crates/ndn-app/tests/embedded.rs`** — end-to-end tests demonstrating the
+  embedded forwarding pattern: `ForwarderEngine` + `AppFace` + `Consumer`/`Producer`
+  running entirely in-process with no external router, Unix sockets, or SHM.
+- Three tests: single fetch, sequential multi-fetch, and `Consumer::get()`.
+- Module-level documentation on `ndn-app` with code examples for both connection
+  modes (external router and embedded engine).
+- Verified: all pure-Rust crates cross-check for `aarch64-linux-android`; crates
+  using `ring` require Android NDK (ring tier-1 target, no code changes needed).
+
 ### Fixed
 
 **Wire-format interoperability (ndnd/ndn-cxx compatibility):**
