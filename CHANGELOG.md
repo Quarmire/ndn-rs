@@ -50,6 +50,22 @@ bootstrapping phase and all APIs should be considered unstable.
 
 ### Changed
 
+- **`ndn-iperf` rewritten** to use the new application library API:
+  - Server uses `DataBuilder` (with optional `.sign()` via `KeyChain`) instead of
+    raw `encode_data_unsigned()`.
+  - Client uses `InterestBuilder` with configurable `.lifetime()` instead of
+    `encode_interest()`.
+  - New `--sign` flag on server: generates ephemeral Ed25519 identity and signs
+    every Data packet (for measuring signing overhead).
+  - New `--freshness` option on server for configurable Data freshness period.
+  - New `--lifetime` option on client for configurable Interest lifetime.
+  - New `--interval` option on both sides for reporting period (default 1s).
+  - New `--quiet` / `-q` flag to suppress periodic status reports.
+  - Live per-interval throughput/packet-rate/RTT reporting via lock-free atomics.
+  - Richer final summary: human-readable sizes, loss percentage, min/max/percentile
+    RTT, timeout count.
+  - Status output on stderr, final results on stdout (allows piping/parsing).
+  - Shared `ConnectOpts` struct via `#[command(flatten)]`.
 - All tools (`ndn-iperf`, `ndn-traffic`, `ndn-ping`, `ndn-peek`, `ndn-put`,
   `ndn-ctl`, `ndn-sec`, `ndn-bench`, `ndn-router`) now use `Name::from_str()`
   instead of duplicated `parse_name()` functions, and `Name::Display` instead of
