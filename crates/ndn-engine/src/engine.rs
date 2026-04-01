@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use dashmap::DashMap;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -29,6 +30,13 @@ pub struct EngineInner {
     /// Pipeline inbound channel — used to spawn readers for dynamically-added
     /// faces (those registered after `build()` completes).
     pub(crate) pipeline_tx: mpsc::Sender<InboundPacket>,
+    /// Per-face cancellation tokens for cascading cleanup.
+    ///
+    /// When a control face (e.g. UnixFace) creates child faces (e.g. SHM via
+    /// `faces/create`), the child uses a child token of the control face's
+    /// token.  When the control face disconnects, its token is cancelled,
+    /// which propagates to all child faces.
+    pub(crate) face_tokens: Arc<DashMap<FaceId, CancellationToken>>,
 }
 
 /// Handle to a running forwarding engine.
@@ -91,12 +99,25 @@ impl ForwarderEngine {
     /// build time.
     pub fn add_face<F: Face + 'static>(&self, face: F, cancel: CancellationToken) {
         let face_id    = face.id();
+        self.inner.face_tokens.insert(face_id, cancel.clone());
         self.inner.face_table.insert(face);
         let erased     = self.inner.face_table.get(face_id)
             .expect("face was just inserted");
         let tx         = self.inner.pipeline_tx.clone();
         let face_table = Arc::clone(&self.inner.face_table);
-        tokio::spawn(crate::dispatcher::run_face_reader(face_id, erased, tx, cancel, face_table));
+        let fib        = Arc::clone(&self.inner.fib);
+        let face_tokens = Arc::clone(&self.inner.face_tokens);
+        tokio::spawn(crate::dispatcher::run_face_reader(
+            face_id, erased, tx, cancel, face_table, fib, face_tokens,
+        ));
+    }
+
+    /// Get the cancellation token for a face, if one exists.
+    ///
+    /// Used by `faces/create` to create child tokens so that SHM faces are
+    /// cancelled when their control face disconnects.
+    pub fn face_token(&self, face_id: FaceId) -> Option<CancellationToken> {
+        self.inner.face_tokens.get(&face_id).map(|r| r.clone())
     }
 }
 

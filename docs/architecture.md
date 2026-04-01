@@ -69,17 +69,26 @@ Dependencies flow strictly downward. `ndn-packet` and `ndn-tlv` have no async de
 face_task (one per Face)
    │  RawPacket { bytes, face_id, arrival }
    ▼
-pipeline_runner_task
-   │  tokio::spawn per packet
-   ▼
-per-packet pipeline task → [ stage₁ → stage₂ → ... → dispatch ]
-                                                          │
-                                               face_table.get(id).send(bytes)
+pipeline_runner_task → [ stage₁ → stage₂ → ... → dispatch ]
+                                                      │
+                                           face_table.get(id).send(bytes)
 expiry_task
    └─ drains expired PIT entries every 1 ms
 ```
 
-Face tasks push onto a bounded `mpsc` channel (`pipeline_channel_cap` from `EngineConfig`). Backpressure on a slow pipeline yields the face task naturally.
+Face tasks push onto a bounded `mpsc` channel (`pipeline_channel_cap` from `EngineConfig`). The pipeline runner processes packets **inline** (no per-packet `tokio::spawn`) to minimize task creation and scheduling overhead. Backpressure on a slow pipeline yields the face task naturally.
+
+## Face Lifecycle & Cleanup
+
+Each dynamically-accepted face (e.g. `UnixFace` from the face listener) receives a per-connection `CancellationToken` (child of the global shutdown token). When a face creates child faces via management commands (e.g. `faces/create` for SHM), the child face uses a `child_token()` of the control face's token.
+
+When a face disconnects:
+1. `run_face_reader` exits the recv loop
+2. The face's cancel token is cancelled — cascading to any child faces (e.g. SHM)
+3. FIB nexthops pointing to the face are removed (`Fib::remove_face`)
+4. The face is removed from `FaceTable`
+
+This ensures no stale FIB routes accumulate and no orphaned SHM faces linger after an application disconnects.
 
 ## Phased Build Order
 

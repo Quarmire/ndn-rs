@@ -160,7 +160,12 @@ impl RouterClient {
             params.face_id = Some(*face_id);
         }
 
-        let _resp = send_command(&self.control, module::RIB, verb::REGISTER, &params).await?;
+        let resp = send_command(&self.control, module::RIB, verb::REGISTER, &params).await?;
+        tracing::debug!(
+            face_id = ?resp.face_id,
+            cost = ?resp.cost,
+            "rib/register succeeded"
+        );
         Ok(())
     }
 

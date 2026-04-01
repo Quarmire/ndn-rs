@@ -29,14 +29,15 @@ pub(crate) struct InboundPacket {
 /// them to a shared `mpsc` channel. A single pipeline runner drains the channel
 /// and processes each packet through the stage sequence.
 pub struct PacketDispatcher {
-    pub face_table:  Arc<FaceTable>,
-    pub decode:      TlvDecodeStage,
-    pub cs_lookup:   CsLookupStage,
-    pub pit_check:   PitCheckStage,
-    pub strategy:    StrategyStage,
-    pub pit_match:   PitMatchStage,
-    pub cs_insert:   CsInsertStage,
-    pub channel_cap: usize,
+    pub face_table:   Arc<FaceTable>,
+    pub face_tokens:  Arc<dashmap::DashMap<FaceId, CancellationToken>>,
+    pub decode:       TlvDecodeStage,
+    pub cs_lookup:    CsLookupStage,
+    pub pit_check:    PitCheckStage,
+    pub strategy:     StrategyStage,
+    pub pit_match:    PitMatchStage,
+    pub cs_insert:    CsInsertStage,
+    pub channel_cap:  usize,
 }
 
 impl PacketDispatcher {
@@ -55,27 +56,28 @@ impl PacketDispatcher {
         // Spawn a reader task for each registered face.
         for face_id in self.face_table.face_ids() {
             if let Some(face) = self.face_table.get(face_id) {
-                let tx2         = tx.clone();
-                let cancel      = cancel.clone();
-                let face_table  = Arc::clone(&self.face_table);
+                let tx2          = tx.clone();
+                let cancel       = cancel.clone();
+                let face_table   = Arc::clone(&self.face_table);
+                let fib          = Arc::clone(&self.strategy.fib);
+                let face_tokens  = Arc::clone(&self.face_tokens);
                 tasks.spawn(async move {
-                    run_face_reader(face_id, face, tx2, cancel, face_table).await;
+                    run_face_reader(face_id, face, tx2, cancel, face_table, fib, face_tokens).await;
                 });
             }
         }
 
         // Pipeline runner.
-        let dispatcher = Arc::new(self);
-        let cancel2    = cancel.clone();
+        let cancel2 = cancel.clone();
         tasks.spawn(async move {
-            dispatcher.run_pipeline(rx, cancel2).await;
+            self.run_pipeline(rx, cancel2).await;
         });
 
         tx
     }
 
     async fn run_pipeline(
-        self: Arc<Self>,
+        &self,
         mut rx: mpsc::Receiver<InboundPacket>,
         cancel: CancellationToken,
     ) {
@@ -88,12 +90,11 @@ impl PacketDispatcher {
                 },
             };
 
-            let d = Arc::clone(&self);
-            tokio::spawn(async move { d.process_packet(pkt).await });
+            self.process_packet(pkt).await;
         }
     }
 
-    async fn process_packet(self: Arc<Self>, pkt: InboundPacket) {
+    async fn process_packet(&self, pkt: InboundPacket) {
         let ctx = PacketContext::new(pkt.raw, pkt.face_id, pkt.arrival);
 
         // 1. Decode.
@@ -304,6 +305,8 @@ pub(crate) async fn run_face_reader(
     tx:         mpsc::Sender<InboundPacket>,
     cancel:     CancellationToken,
     face_table: Arc<FaceTable>,
+    fib:        Arc<crate::Fib>,
+    face_tokens: Arc<dashmap::DashMap<FaceId, CancellationToken>>,
 ) {
     let kind = face.kind();
     loop {
@@ -336,8 +339,14 @@ pub(crate) async fn run_face_reader(
     match kind {
         FaceKind::App | FaceKind::Internal => {}
         _ => {
+            // Cancel the face's token — this propagates to any child faces
+            // (e.g. SHM faces created via this control face's `faces/create`).
+            if let Some((_, token)) = face_tokens.remove(&face_id) {
+                token.cancel();
+            }
+            fib.remove_face(face_id);
             face_table.remove(face_id);
-            debug!(face=%face_id, "face removed from table");
+            debug!(face=%face_id, "face removed from table (FIB routes cleaned)");
         }
     }
 }

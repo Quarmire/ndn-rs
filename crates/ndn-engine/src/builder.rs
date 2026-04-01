@@ -103,12 +103,15 @@ impl EngineBuilder {
         let strategy_table = Arc::new(StrategyTable::<dyn ErasedStrategy>::new());
         strategy_table.insert(&Name::root(), Arc::clone(&default_strategy));
 
+        let face_tokens = Arc::new(dashmap::DashMap::new());
+
         let dispatcher = PacketDispatcher {
-            face_table: Arc::clone(&face_table),
-            decode:     TlvDecodeStage,
-            cs_lookup:  CsLookupStage { cs: Arc::clone(&cs) },
-            pit_check:  PitCheckStage { pit: Arc::clone(&pit) },
-            strategy:   StrategyStage {
+            face_table:  Arc::clone(&face_table),
+            face_tokens: Arc::clone(&face_tokens),
+            decode:      TlvDecodeStage,
+            cs_lookup:   CsLookupStage { cs: Arc::clone(&cs) },
+            pit_check:   PitCheckStage { pit: Arc::clone(&pit) },
+            strategy:    StrategyStage {
                 strategy_table: Arc::clone(&strategy_table),
                 default_strategy: Arc::clone(&default_strategy),
                 fib:          Arc::clone(&fib),
@@ -135,6 +138,7 @@ impl EngineBuilder {
             strategy_table: Arc::clone(&strategy_table),
             security:       self.security,
             pipeline_tx,
+            face_tokens,
         });
 
         let engine = ForwarderEngine { inner };

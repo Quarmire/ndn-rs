@@ -53,7 +53,7 @@ use crate::shm::ShmError;
 const MAGIC: u64 = 0x4E44_4E5F_5348_4D00; // b"NDN_SHM\0"
 
 /// Default number of slots per ring.
-pub const DEFAULT_CAPACITY: u32 = 64;
+pub const DEFAULT_CAPACITY: u32 = 256;
 /// Default slot payload size in bytes (~8.75 KiB, covers typical NDN packets).
 pub const DEFAULT_SLOT_SIZE: u32 = 8960;
 
@@ -444,6 +444,14 @@ impl Face for SpscFace {
             if let Some(pkt) = self.try_pop_a2e() {
                 return Ok(pkt);
             }
+            // Brief spin before parking — avoids expensive syscall (pipe/futex)
+            // when packets arrive within microseconds of each other.
+            for _ in 0..64 {
+                std::hint::spin_loop();
+                if let Some(pkt) = self.try_pop_a2e() {
+                    return Ok(pkt);
+                }
+            }
             // Announce intent to sleep with SeqCst so the app's next SeqCst
             // load on the parked flag observes this before or after it pushes
             // to the ring — never concurrently missed.
@@ -636,6 +644,14 @@ impl SpscHandle {
         loop {
             if let Some(pkt) = self.try_pop_e2a() {
                 return Some(pkt);
+            }
+            // Brief spin before parking — avoids expensive syscall (pipe/futex)
+            // when packets arrive within microseconds of each other.
+            for _ in 0..64 {
+                std::hint::spin_loop();
+                if let Some(pkt) = self.try_pop_e2a() {
+                    return Some(pkt);
+                }
             }
             parked.store(1, Ordering::SeqCst);
             if let Some(pkt) = self.try_pop_e2a() {
