@@ -5,6 +5,7 @@ use bytes::Bytes;
 
 use ndn_face_local::AppHandle;
 use ndn_ipc::RouterClient;
+use ndn_packet::lp::{LpPacket, is_lp_packet};
 use ndn_packet::{Data, Name};
 use ndn_packet::encode::encode_interest;
 use ndn_security::{SafeData, Validator, ValidationResult};
@@ -38,10 +39,13 @@ impl Consumer {
     }
 
     /// Express a pre-encoded Interest and return the decoded Data.
+    ///
+    /// Returns `AppError::Nacked` if the forwarder responds with a Nack
+    /// (e.g. no route to the name prefix).
     pub async fn fetch_wire(&mut self, wire: Bytes) -> Result<Data, AppError> {
         self.conn.send(wire).await?;
 
-        let data_bytes = tokio::time::timeout(
+        let reply = tokio::time::timeout(
             Duration::from_secs(4),
             self.conn.recv(),
         )
@@ -49,7 +53,19 @@ impl Consumer {
         .map_err(|_| AppError::Timeout)?
         .ok_or_else(|| AppError::Engine(anyhow::anyhow!("connection closed")))?;
 
-        Data::decode(data_bytes)
+        // Check for Nack (LpPacket with Nack header).
+        if is_lp_packet(&reply) {
+            if let Ok(lp) = LpPacket::decode(reply.clone()) {
+                if let Some(reason) = lp.nack {
+                    return Err(AppError::Nacked { reason });
+                }
+                // LpPacket without Nack — decode the fragment as Data.
+                return Data::decode(lp.fragment)
+                    .map_err(|e| AppError::Engine(e.into()));
+            }
+        }
+
+        Data::decode(reply)
             .map_err(|e| AppError::Engine(e.into()))
     }
 

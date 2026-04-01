@@ -125,7 +125,7 @@ mod tests {
 
     #[tokio::test]
     async fn express_propagates_nack() {
-        use ndn_pipeline::NackReason;
+        use ndn_packet::NackReason;
         let (face, mut rx) = AppFace::new(FaceId(1), 8);
         let task = tokio::spawn(async move {
             face.express(make_interest("x")).await
