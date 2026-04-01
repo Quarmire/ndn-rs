@@ -4,11 +4,12 @@
 /// Intended for applications and the management plane, not the forwarding
 /// pipeline (which operates on already-encoded `Bytes`).
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
 
 use bytes::Bytes;
 use ndn_tlv::{TlvReader, TlvWriter};
 
-use crate::{Name, tlv_type};
+use crate::{Name, SignatureType, tlv_type};
 
 // ─── Public API ───────────────────────────────────────────────────────────────
 
@@ -133,6 +134,216 @@ pub fn ensure_nonce(interest_wire: &Bytes) -> Bytes {
         }
     });
     w.finish()
+}
+
+// ─── Builders ────────────────────────────────────────────────────────────────
+
+/// Configurable Interest encoder.
+///
+/// ```
+/// # use ndn_packet::encode::InterestBuilder;
+/// # use std::time::Duration;
+/// let wire = InterestBuilder::new("/ndn/test")
+///     .lifetime(Duration::from_millis(2000))
+///     .must_be_fresh()
+///     .build();
+/// ```
+pub struct InterestBuilder {
+    name:            Name,
+    lifetime:        Option<Duration>,
+    can_be_prefix:   bool,
+    must_be_fresh:   bool,
+    hop_limit:       Option<u8>,
+    app_parameters:  Option<Vec<u8>>,
+}
+
+impl InterestBuilder {
+    pub fn new(name: impl Into<Name>) -> Self {
+        Self {
+            name:           name.into(),
+            lifetime:       None,
+            can_be_prefix:  false,
+            must_be_fresh:  false,
+            hop_limit:      None,
+            app_parameters: None,
+        }
+    }
+
+    pub fn lifetime(mut self, d: Duration) -> Self {
+        self.lifetime = Some(d); self
+    }
+
+    pub fn can_be_prefix(mut self) -> Self {
+        self.can_be_prefix = true; self
+    }
+
+    pub fn must_be_fresh(mut self) -> Self {
+        self.must_be_fresh = true; self
+    }
+
+    pub fn hop_limit(mut self, h: u8) -> Self {
+        self.hop_limit = Some(h); self
+    }
+
+    pub fn app_parameters(mut self, p: impl Into<Vec<u8>>) -> Self {
+        self.app_parameters = Some(p.into()); self
+    }
+
+    pub fn build(self) -> Bytes {
+        let lifetime_ms = self.lifetime
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(4000);
+
+        if let Some(params) = &self.app_parameters {
+            // With ApplicationParameters: same logic as encode_interest.
+            return encode_interest(&self.name, Some(params));
+        }
+
+        let mut w = TlvWriter::new();
+        w.write_nested(tlv_type::INTEREST, |w| {
+            write_name(w, &self.name);
+            if self.can_be_prefix {
+                w.write_tlv(tlv_type::CAN_BE_PREFIX, &[]);
+            }
+            if self.must_be_fresh {
+                w.write_tlv(tlv_type::MUST_BE_FRESH, &[]);
+            }
+            w.write_tlv(tlv_type::NONCE, &next_nonce().to_be_bytes());
+            w.write_tlv(tlv_type::INTEREST_LIFETIME, &lifetime_ms.to_be_bytes());
+            if let Some(h) = self.hop_limit {
+                w.write_tlv(tlv_type::HOP_LIMIT, &[h]);
+            }
+        });
+        w.finish()
+    }
+}
+
+/// Allow `&str` and `String` to convert into `Name` for builder ergonomics.
+impl From<&str> for Name {
+    fn from(s: &str) -> Self {
+        s.parse().unwrap_or_else(|_| Name::root())
+    }
+}
+
+impl From<String> for Name {
+    fn from(s: String) -> Self {
+        s.parse().unwrap_or_else(|_| Name::root())
+    }
+}
+
+/// Configurable Data encoder with optional signing.
+///
+/// ```
+/// # use ndn_packet::encode::DataBuilder;
+/// # use std::time::Duration;
+/// let wire = DataBuilder::new("/test", b"hello")
+///     .freshness(Duration::from_secs(10))
+///     .build();
+/// ```
+pub struct DataBuilder {
+    name:       Name,
+    content:    Vec<u8>,
+    freshness:  Option<Duration>,
+}
+
+impl DataBuilder {
+    pub fn new(name: impl Into<Name>, content: &[u8]) -> Self {
+        Self {
+            name:      name.into(),
+            content:   content.to_vec(),
+            freshness: None,
+        }
+    }
+
+    pub fn freshness(mut self, d: Duration) -> Self {
+        self.freshness = Some(d); self
+    }
+
+    /// Build unsigned Data with a DigestSha256 placeholder signature.
+    pub fn build(self) -> Bytes {
+        let freshness_ms = self.freshness
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        let mut w = TlvWriter::new();
+        w.write_nested(tlv_type::DATA, |w| {
+            write_name(w, &self.name);
+            w.write_nested(tlv_type::META_INFO, |w| {
+                w.write_tlv(tlv_type::FRESHNESS_PERIOD, &freshness_ms.to_be_bytes());
+            });
+            w.write_tlv(tlv_type::CONTENT, &self.content);
+            w.write_nested(tlv_type::SIGNATURE_INFO, |w| {
+                w.write_tlv(tlv_type::SIGNATURE_TYPE, &[0u8]);
+            });
+            w.write_tlv(tlv_type::SIGNATURE_VALUE, &[0u8; 32]);
+        });
+        w.finish()
+    }
+
+    /// Encode and sign the Data packet.
+    ///
+    /// `sig_type` and `key_locator` describe the signature algorithm and
+    /// optional KeyLocator name (for SignatureInfo). `sign_fn` receives the
+    /// signed region (Name + MetaInfo + Content + SignatureInfo) and returns
+    /// the raw signature value bytes.
+    pub async fn sign<F, Fut>(
+        self,
+        sig_type:    SignatureType,
+        key_locator: Option<&Name>,
+        sign_fn:     F,
+    ) -> Bytes
+    where
+        F: FnOnce(&[u8]) -> Fut,
+        Fut: std::future::Future<Output = Bytes>,
+    {
+        let freshness_ms = self.freshness
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        // Build Name + MetaInfo + Content.
+        let mut inner = TlvWriter::new();
+        write_name(&mut inner, &self.name);
+        inner.write_nested(tlv_type::META_INFO, |w| {
+            w.write_tlv(tlv_type::FRESHNESS_PERIOD, &freshness_ms.to_be_bytes());
+        });
+        inner.write_tlv(tlv_type::CONTENT, &self.content);
+        let inner_bytes = inner.finish();
+
+        // Build SignatureInfo.
+        let mut sig_info_writer = TlvWriter::new();
+        sig_info_writer.write_nested(tlv_type::SIGNATURE_INFO, |w| {
+            let code = sig_type.code();
+            if code == 0 {
+                w.write_tlv(tlv_type::SIGNATURE_TYPE, &[0u8]);
+            } else {
+                let be = code.to_be_bytes();
+                let start = be.iter().position(|&b| b != 0).unwrap_or(7);
+                w.write_tlv(tlv_type::SIGNATURE_TYPE, &be[start..]);
+            }
+            if let Some(kl_name) = key_locator {
+                w.write_nested(tlv_type::KEY_LOCATOR, |w| {
+                    write_name(w, kl_name);
+                });
+            }
+        });
+        let sig_info_bytes = sig_info_writer.finish();
+
+        // Signed region = Name + MetaInfo + Content + SignatureInfo.
+        let mut signed_region = Vec::with_capacity(inner_bytes.len() + sig_info_bytes.len());
+        signed_region.extend_from_slice(&inner_bytes);
+        signed_region.extend_from_slice(&sig_info_bytes);
+
+        // Sign the region.
+        let sig_value = sign_fn(&signed_region).await;
+
+        // Assemble the full Data packet.
+        let mut w = TlvWriter::new();
+        w.write_nested(tlv_type::DATA, |w| {
+            w.write_raw(&signed_region);
+            w.write_tlv(tlv_type::SIGNATURE_VALUE, &sig_value);
+        });
+        w.finish()
+    }
 }
 
 // ─── Private helpers ──────────────────────────────────────────────────────────
@@ -287,5 +498,91 @@ mod tests {
         let i2 = Interest::decode(b2).unwrap();
         // Sequential calls should produce different nonces.
         assert_ne!(i1.nonce(), i2.nonce());
+    }
+
+    // ── InterestBuilder ──────────────────────────────────────────────────────
+
+    #[test]
+    fn interest_builder_basic() {
+        let wire = InterestBuilder::new("/ndn/test").build();
+        let interest = Interest::decode(wire).unwrap();
+        assert_eq!(interest.name.to_string(), "/ndn/test");
+        assert!(interest.nonce().is_some());
+        assert_eq!(interest.lifetime(), Some(Duration::from_millis(4000)));
+    }
+
+    #[test]
+    fn interest_builder_custom_lifetime() {
+        let wire = InterestBuilder::new("/test")
+            .lifetime(Duration::from_millis(2000))
+            .build();
+        let interest = Interest::decode(wire).unwrap();
+        assert_eq!(interest.lifetime(), Some(Duration::from_millis(2000)));
+    }
+
+    #[test]
+    fn interest_builder_from_str() {
+        // Verify &str -> Name conversion works.
+        let wire = InterestBuilder::new("/a/b/c").build();
+        let interest = Interest::decode(wire).unwrap();
+        assert_eq!(interest.name.len(), 3);
+    }
+
+    // ── DataBuilder ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn data_builder_basic() {
+        let wire = DataBuilder::new("/test", b"hello").build();
+        let data = Data::decode(wire).unwrap();
+        assert_eq!(data.name.to_string(), "/test");
+        assert_eq!(data.content().map(|b| b.as_ref()), Some(b"hello".as_ref()));
+    }
+
+    #[test]
+    fn data_builder_freshness() {
+        let wire = DataBuilder::new("/test", b"x")
+            .freshness(Duration::from_secs(60))
+            .build();
+        let data = Data::decode(wire).unwrap();
+        let mi = data.meta_info().expect("meta_info present");
+        assert_eq!(mi.freshness_period, Some(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn data_builder_sign() {
+        use std::pin::pin;
+        use std::task::{Context, Wake, Waker};
+
+        // Minimal single-poll executor — our sign_fn completes immediately.
+        struct NoopWaker;
+        impl Wake for NoopWaker { fn wake(self: std::sync::Arc<Self>) {} }
+        let waker = Waker::from(std::sync::Arc::new(NoopWaker));
+        let mut cx = Context::from_waker(&waker);
+
+        let key_name: Name = "/key/test".parse().unwrap();
+        let fut = DataBuilder::new("/signed/data", b"payload")
+            .freshness(Duration::from_secs(10))
+            .sign(
+                SignatureType::SignatureEd25519,
+                Some(&key_name),
+                |region: &[u8]| {
+                    let digest = ring::digest::digest(&ring::digest::SHA256, region);
+                    std::future::ready(Bytes::copy_from_slice(digest.as_ref()))
+                },
+            );
+        let mut fut = pin!(fut);
+        let wire = match fut.as_mut().poll(&mut cx) {
+            std::task::Poll::Ready(b) => b,
+            std::task::Poll::Pending => panic!("sign future should complete immediately"),
+        };
+
+        let data = Data::decode(wire).unwrap();
+        assert_eq!(data.name.to_string(), "/signed/data");
+        assert_eq!(data.content().map(|b| b.as_ref()), Some(b"payload".as_ref()));
+
+        let si = data.sig_info().expect("sig info");
+        assert_eq!(si.sig_type, SignatureType::SignatureEd25519);
+        let kl = si.key_locator.clone().expect("key locator");
+        assert_eq!(kl.to_string(), "/key/test");
     }
 }
