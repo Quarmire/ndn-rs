@@ -94,8 +94,19 @@ enum Command {
     },
     /// List all FIB routes.
     ListRoutes,
-    /// List all registered face IDs.
+    /// List all registered faces.
     ListFaces,
+    /// Create a face.
+    FaceCreate {
+        /// Face URI (e.g. udp4://192.168.1.1:6363, tcp4://router.example.com:6363).
+        uri: String,
+    },
+    /// Destroy a face.
+    FaceDestroy {
+        /// Face ID to destroy.
+        #[arg(long)]
+        face: u32,
+    },
     /// Set the forwarding strategy for a name prefix.
     StrategySet {
         /// NDN name prefix (e.g. /ndn/test).
@@ -212,6 +223,20 @@ fn build_nfd_name(cmd: &Command) -> Name {
         Command::ListFaces => {
             ndn_config::nfd_command::dataset_name(module::FACES, verb::LIST)
         }
+        Command::FaceCreate { uri } => {
+            let params = ControlParameters {
+                uri: Some(uri.clone()),
+                ..Default::default()
+            };
+            command_name(module::FACES, verb::CREATE, &params)
+        }
+        Command::FaceDestroy { face } => {
+            let params = ControlParameters {
+                face_id: Some(*face as u64),
+                ..Default::default()
+            };
+            command_name(module::FACES, verb::DESTROY, &params)
+        }
         Command::StrategySet { prefix, strategy } => {
             let params = ControlParameters {
                 name: Some(prefix.parse().unwrap()),
@@ -304,7 +329,9 @@ fn build_legacy_request(cmd: &Command) -> ManagementRequest {
         Command::StrategySet { .. }
         | Command::StrategyUnset { .. }
         | Command::StrategyList
-        | Command::CsInfo => ManagementRequest::GetStats, // placeholder; bypass won't be used
+        | Command::CsInfo
+        | Command::FaceCreate { .. }
+        | Command::FaceDestroy { .. } => ManagementRequest::GetStats, // placeholder; bypass won't be used
     }
 }
 
@@ -321,6 +348,9 @@ fn print_control_response(resp: &ControlResponse) {
         }
         if let Some(ref uri) = body.uri {
             println!("  Uri:     {uri}");
+        }
+        if let Some(ref local_uri) = body.local_uri {
+            println!("  LocalUri: {local_uri}");
         }
         if let Some(cost) = body.cost {
             println!("  Cost:    {cost}");

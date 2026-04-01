@@ -22,17 +22,23 @@ use ndn_transport::{Face, FaceError, FaceId, FaceKind, TlvCodec};
 /// `TlvCodec` provides TLV length-prefix framing so the pipeline receives
 /// complete NDN packets regardless of TCP segmentation.
 pub struct TcpFace {
-    id:     FaceId,
-    reader: Mutex<FramedRead<OwnedReadHalf, TlvCodec>>,
-    writer: Mutex<FramedWrite<OwnedWriteHalf, TlvCodec>>,
+    id:          FaceId,
+    remote_addr: SocketAddr,
+    local_addr:  SocketAddr,
+    reader:      Mutex<FramedRead<OwnedReadHalf, TlvCodec>>,
+    writer:      Mutex<FramedWrite<OwnedWriteHalf, TlvCodec>>,
 }
 
 impl TcpFace {
     /// Wrap an accepted or connected `TcpStream`.
     pub fn from_stream(id: FaceId, stream: TcpStream) -> Self {
+        let remote_addr = stream.peer_addr().unwrap_or_else(|_| ([0, 0, 0, 0], 0).into());
+        let local_addr = stream.local_addr().unwrap_or_else(|_| ([0, 0, 0, 0], 0).into());
         let (r, w) = stream.into_split();
         Self {
             id,
+            remote_addr,
+            local_addr,
             reader: Mutex::new(FramedRead::new(r, TlvCodec)),
             writer: Mutex::new(FramedWrite::new(w, TlvCodec)),
         }
@@ -43,11 +49,22 @@ impl TcpFace {
         let stream = TcpStream::connect(addr).await?;
         Ok(Self::from_stream(id, stream))
     }
+
+    pub fn remote_addr(&self) -> SocketAddr { self.remote_addr }
+    pub fn local_addr(&self) -> SocketAddr { self.local_addr }
 }
 
 impl Face for TcpFace {
     fn id(&self) -> FaceId { self.id }
     fn kind(&self) -> FaceKind { FaceKind::Tcp }
+
+    fn remote_uri(&self) -> Option<String> {
+        Some(format!("tcp4://{}:{}", self.remote_addr.ip(), self.remote_addr.port()))
+    }
+
+    fn local_uri(&self) -> Option<String> {
+        Some(format!("tcp4://{}:{}", self.local_addr.ip(), self.local_addr.port()))
+    }
 
     async fn recv(&self) -> Result<Bytes, FaceError> {
         let mut reader = self.reader.lock().await;

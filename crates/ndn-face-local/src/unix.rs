@@ -54,6 +54,10 @@ impl Face for UnixFace {
     fn id(&self) -> FaceId { self.id }
     fn kind(&self) -> FaceKind { FaceKind::Unix }
 
+    fn local_uri(&self) -> Option<String> {
+        Some(format!("unix://{}", self.path.display()))
+    }
+
     async fn recv(&self) -> Result<Bytes, FaceError> {
         let mut reader = self.reader.lock().await;
         reader

@@ -50,6 +50,14 @@ pub trait Face: Send + Sync + 'static {
     fn id(&self) -> FaceId;
     fn kind(&self) -> FaceKind;
 
+    /// Remote URI (e.g. `udp4://192.168.1.1:6363`). Returns `None` for face
+    /// types that don't have a meaningful remote endpoint.
+    fn remote_uri(&self) -> Option<String> { None }
+
+    /// Local URI (e.g. `unix:///tmp/ndn-faces.sock`). Returns `None` for face
+    /// types that don't expose local binding info.
+    fn local_uri(&self) -> Option<String> { None }
+
     /// Receive the next packet. Blocks until a packet arrives or the face closes.
     fn recv(&self) -> impl Future<Output = Result<Bytes, FaceError>> + Send;
 

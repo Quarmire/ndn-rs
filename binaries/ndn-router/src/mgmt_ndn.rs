@@ -30,7 +30,7 @@ use ndn_engine::stages::ErasedStrategy;
 use ndn_packet::{Interest, Name, NameComponent, encode::encode_data_unsigned};
 use ndn_store::ContentStore;
 use ndn_strategy::{BestRouteStrategy, MulticastStrategy};
-use ndn_transport::FaceId;
+use ndn_transport::{Face, FaceId};
 use tokio_util::sync::CancellationToken;
 
 use ndn_config::{
@@ -146,7 +146,7 @@ pub async fn run_ndn_mgmt_handler(
             source_face,
             &engine,
             &cancel,
-        );
+        ).await;
 
         send_response(&mut handle, &interest.name, &resp).await;
     }
@@ -156,7 +156,7 @@ pub async fn run_ndn_mgmt_handler(
 
 // ─── Command dispatch ─────────────────────────────────────────────────────────
 
-fn dispatch_command(
+async fn dispatch_command(
     module_name: &[u8],
     verb_name:   &[u8],
     params:      ControlParameters,
@@ -166,7 +166,7 @@ fn dispatch_command(
 ) -> ControlResponse {
     match module_name {
         m if m == module::RIB      => handle_rib(verb_name, params, source_face, engine),
-        m if m == module::FACES    => handle_faces(verb_name, params, source_face, engine),
+        m if m == module::FACES    => handle_faces(verb_name, params, source_face, engine).await,
         m if m == module::FIB      => handle_fib(verb_name, params, source_face, engine),
         m if m == module::STRATEGY => handle_strategy(verb_name, params, engine),
         m if m == module::CS       => handle_cs(verb_name, engine),
@@ -256,21 +256,21 @@ fn rib_list(engine: &ForwarderEngine) -> ControlResponse {
 
 // ─── Faces module ─────────────────────────────────────────────────────────────
 
-fn handle_faces(
+async fn handle_faces(
     verb_name:   &[u8],
     params:      ControlParameters,
     source_face: Option<FaceId>,
     engine:      &ForwarderEngine,
 ) -> ControlResponse {
     match verb_name {
-        v if v == verb::CREATE  => faces_create(params, source_face, engine),
+        v if v == verb::CREATE  => faces_create(params, source_face, engine).await,
         v if v == verb::DESTROY => faces_destroy(params, engine),
         v if v == verb::LIST    => faces_list(engine),
         _ => ControlResponse::error(status::NOT_FOUND, "unknown faces verb"),
     }
 }
 
-fn faces_create(
+async fn faces_create(
     params:      ControlParameters,
     source_face: Option<FaceId>,
     engine:      &ForwarderEngine,
@@ -284,7 +284,86 @@ fn faces_create(
         return faces_create_shm(shm_name, source_face, engine);
     }
 
+    if let Some(addr_str) = uri.strip_prefix("udp4://") {
+        return faces_create_udp(addr_str, engine).await;
+    }
+
+    if let Some(addr_str) = uri.strip_prefix("tcp4://") {
+        return faces_create_tcp(addr_str, engine).await;
+    }
+
     ControlResponse::error(status::BAD_PARAMS, format!("unsupported URI scheme: {uri}"))
+}
+
+async fn faces_create_udp(addr_str: &str, engine: &ForwarderEngine) -> ControlResponse {
+    let peer: std::net::SocketAddr = match addr_str.parse() {
+        Ok(a) => a,
+        Err(e) => return ControlResponse::error(
+            status::BAD_PARAMS,
+            format!("invalid UDP address '{addr_str}': {e}"),
+        ),
+    };
+
+    let face_id = engine.faces().alloc_id();
+    let local: std::net::SocketAddr = if peer.is_ipv4() {
+        "0.0.0.0:0".parse().unwrap()
+    } else {
+        "[::]:0".parse().unwrap()
+    };
+
+    match ndn_face_net::UdpFace::bind(local, peer, face_id).await {
+        Ok(face) => {
+            let local_uri = face.local_uri().unwrap_or_default();
+            let cancel = CancellationToken::new();
+            engine.add_face(face, cancel);
+            tracing::info!(face = face_id.0, remote = %peer, "faces/create udp4");
+
+            let echo = ControlParameters {
+                face_id: Some(face_id.0 as u64),
+                uri: Some(format!("udp4://{peer}")),
+                local_uri: Some(local_uri),
+                ..Default::default()
+            };
+            ControlResponse::ok("OK", echo)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, remote = %peer, "faces/create udp4 failed");
+            ControlResponse::error(status::SERVER_ERROR, format!("UDP face creation failed: {e}"))
+        }
+    }
+}
+
+async fn faces_create_tcp(addr_str: &str, engine: &ForwarderEngine) -> ControlResponse {
+    let peer: std::net::SocketAddr = match addr_str.parse() {
+        Ok(a) => a,
+        Err(e) => return ControlResponse::error(
+            status::BAD_PARAMS,
+            format!("invalid TCP address '{addr_str}': {e}"),
+        ),
+    };
+
+    let face_id = engine.faces().alloc_id();
+
+    match ndn_face_net::TcpFace::connect(face_id, peer).await {
+        Ok(face) => {
+            let local_uri = face.local_uri().unwrap_or_default();
+            let cancel = CancellationToken::new();
+            engine.add_face(face, cancel);
+            tracing::info!(face = face_id.0, remote = %peer, "faces/create tcp4");
+
+            let echo = ControlParameters {
+                face_id: Some(face_id.0 as u64),
+                uri: Some(format!("tcp4://{peer}")),
+                local_uri: Some(local_uri),
+                ..Default::default()
+            };
+            ControlResponse::ok("OK", echo)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, remote = %peer, "faces/create tcp4 failed");
+            ControlResponse::error(status::SERVER_ERROR, format!("TCP face creation failed: {e}"))
+        }
+    }
 }
 
 #[cfg(all(unix, feature = "spsc-shm"))]
@@ -336,7 +415,22 @@ fn faces_destroy(params: ControlParameters, engine: &ForwarderEngine) -> Control
         None => return ControlResponse::error(status::BAD_PARAMS, "FaceId is required"),
     };
 
-    engine.faces().remove(face_id);
+    if engine.faces().get(face_id).is_none() {
+        return ControlResponse::error(status::NOT_FOUND, format!("face {} does not exist", face_id.0));
+    }
+
+    // Cancel the face's token — this triggers run_face_reader cleanup which:
+    // 1. Removes all FIB nexthops pointing to this face
+    // 2. Propagates cancellation to child faces (e.g. SHM)
+    // 3. Removes the face from the face table
+    if let Some(token) = engine.face_token(face_id) {
+        token.cancel();
+    } else {
+        // No token (shouldn't happen for dynamic faces) — fall back to manual cleanup.
+        engine.fib().remove_face(face_id);
+        engine.faces().remove(face_id);
+    }
+
     tracing::info!(face = face_id.0, "faces/destroy");
 
     let echo = ControlParameters {
@@ -347,13 +441,20 @@ fn faces_destroy(params: ControlParameters, engine: &ForwarderEngine) -> Control
 }
 
 fn faces_list(engine: &ForwarderEngine) -> ControlResponse {
-    let entries = engine.faces().face_entries();
-    // Encode face list as a multi-line status text (pragmatic approach).
-    // Full NFD dataset encoding (segmented Data with FaceStatus TLV) can be
-    // added later.
+    let entries = engine.faces().face_info();
     let mut text = format!("{} faces\n", entries.len());
-    for (id, kind) in &entries {
-        text.push_str(&format!("  faceid={} kind={:?}\n", id.0, kind));
+    for info in &entries {
+        let mut line = format!("  faceid={} remote={} local={}",
+            info.id.0,
+            info.remote_uri.as_deref().unwrap_or("N/A"),
+            info.local_uri.as_deref().unwrap_or("N/A"),
+        );
+        // Show kind if no URIs are available (e.g. App, Internal faces).
+        if info.remote_uri.is_none() && info.local_uri.is_none() {
+            line = format!("  faceid={} kind={:?}", info.id.0, info.kind);
+        }
+        text.push_str(&line);
+        text.push('\n');
     }
     ControlResponse::ok_empty(text)
 }

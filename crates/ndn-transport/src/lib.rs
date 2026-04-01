@@ -6,7 +6,7 @@ pub mod raw_packet;
 pub mod tlv_codec;
 
 pub use face::{Face, FaceError, FaceId, FaceKind};
-pub use face_table::{FaceTable, ErasedFace};
+pub use face_table::{FaceTable, ErasedFace, FaceInfo};
 pub use face_pair_table::FacePairTable;
 pub use face_event::FaceEvent;
 pub use raw_packet::RawPacket;

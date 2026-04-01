@@ -48,6 +48,14 @@ impl Face for UdpFace {
     fn id(&self) -> FaceId { self.id }
     fn kind(&self) -> FaceKind { FaceKind::Udp }
 
+    fn remote_uri(&self) -> Option<String> {
+        Some(format!("udp4://{}:{}", self.peer.ip(), self.peer.port()))
+    }
+
+    fn local_uri(&self) -> Option<String> {
+        self.socket.local_addr().ok().map(|a| format!("udp4://{}:{}", a.ip(), a.port()))
+    }
+
     /// Receive the next NDN packet from the peer.
     ///
     /// NDN Data can reach 8800 bytes. The 9000-byte buffer covers a single

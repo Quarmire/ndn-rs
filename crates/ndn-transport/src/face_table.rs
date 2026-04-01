@@ -23,6 +23,8 @@ pub struct FaceTable {
 pub trait ErasedFace: Send + Sync + 'static {
     fn id(&self) -> FaceId;
     fn kind(&self) -> crate::face::FaceKind;
+    fn remote_uri(&self) -> Option<String>;
+    fn local_uri(&self) -> Option<String>;
     fn send_bytes(
         &self,
         pkt: bytes::Bytes,
@@ -41,6 +43,14 @@ impl<F: Face> ErasedFace for F {
         Face::kind(self)
     }
 
+    fn remote_uri(&self) -> Option<String> {
+        Face::remote_uri(self)
+    }
+
+    fn local_uri(&self) -> Option<String> {
+        Face::local_uri(self)
+    }
+
     fn send_bytes(
         &self,
         pkt: bytes::Bytes,
@@ -53,6 +63,15 @@ impl<F: Face> ErasedFace for F {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bytes::Bytes, crate::face::FaceError>> + Send + '_>> {
         Box::pin(Face::recv(self))
     }
+}
+
+/// Snapshot of a face's metadata for reporting/display.
+#[derive(Debug, Clone)]
+pub struct FaceInfo {
+    pub id: FaceId,
+    pub kind: crate::face::FaceKind,
+    pub remote_uri: Option<String>,
+    pub local_uri: Option<String>,
 }
 
 /// Reserved face ID range used for internal engine faces (management AppFace, etc.).
@@ -142,6 +161,16 @@ impl FaceTable {
     /// Return all registered faces as `(FaceId, FaceKind)` pairs.
     pub fn face_entries(&self) -> Vec<(FaceId, crate::face::FaceKind)> {
         self.faces.iter().map(|r| (r.id(), r.kind())).collect()
+    }
+
+    /// Return detailed info for all registered faces.
+    pub fn face_info(&self) -> Vec<FaceInfo> {
+        self.faces.iter().map(|r| FaceInfo {
+            id: r.id(),
+            kind: r.kind(),
+            remote_uri: r.remote_uri(),
+            local_uri: r.local_uri(),
+        }).collect()
     }
 }
 
