@@ -73,6 +73,21 @@ bootstrapping phase and all APIs should be considered unstable.
 - Tool name-building code simplified with `Name::append()` (e.g.,
   `prefix.clone().append(format!("{seq}"))` replaces iterator chains).
 
+### Fixed
+
+**Wire-format interoperability (ndnd/ndn-cxx compatibility):**
+- **NonNegativeInteger encoding now uses minimal lengths** (1, 2, 4, or 8 bytes
+  per NDN Packet Format v0.3 §1.2). Previously always used 8 bytes for
+  InterestLifetime and FreshnessPeriod, wasting 6 bytes per packet.
+- **`DataBuilder::build()` omits MetaInfo** when no freshness is set, instead of
+  emitting `FreshnessPeriod=0` (which means "immediately stale" — semantically
+  different from absent MetaInfo).
+- **SignatureType and NackReason encoding** now uses valid NNI lengths. Previously
+  stripped leading zeros without rounding up to {1,2,4,8}, which could produce
+  invalid 3/5/6/7-byte encodings for values ≥256.
+- Added 14 wire-format interop tests verifying byte-exact encoding output and
+  successful decoding of hand-crafted packets matching ndnd/ndn-cxx wire format.
+
 ### Removed
 
 - 8 duplicated `parse_name()` functions across tool binaries.
