@@ -151,6 +151,7 @@ pub async fn run_udp_listener(
                     }
                 };
 
+                tracing::debug!(src=%src, len=n, "udp-listener: recv packet");
                 let raw = bytes::Bytes::copy_from_slice(&buf[..n]);
 
                 let face_id = if let Some(&id) = peers.get(&src) {

@@ -48,11 +48,14 @@ impl UdpFace {
         id:    FaceId,
     ) -> std::io::Result<Self> {
         let local = if local.ip().is_unspecified() {
-            resolve_local_addr(peer, local.port())?
+            let resolved = resolve_local_addr(peer, local.port())?;
+            trace!(peer=%peer, resolved=%resolved, "udp: resolved local addr for peer");
+            resolved
         } else {
             local
         };
         let socket = UdpSocket::bind(local).await?;
+        trace!(face=%id, local=%socket.local_addr().unwrap_or(local), peer=%peer, "udp: bound");
         Ok(Self { id, socket: Arc::new(socket), peer, mtu: DEFAULT_UDP_MTU, seq: AtomicU64::new(0) })
     }
 
