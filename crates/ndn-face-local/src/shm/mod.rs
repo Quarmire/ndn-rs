@@ -39,6 +39,8 @@ pub enum ShmError {
     InvalidMagic,
     #[error("packet exceeds the SHM slot size")]
     PacketTooLarge,
+    #[error("SHM face closed (peer died or cancelled)")]
+    Closed,
 }
 
 // ─── Type aliases ─────────────────────────────────────────────────────────────

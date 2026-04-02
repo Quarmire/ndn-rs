@@ -25,9 +25,11 @@
 /// ```
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::Bytes;
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
 use ndn_config::{
     ControlParameters, ControlResponse,
@@ -73,6 +75,11 @@ pub struct RouterClient {
     recv_lock: Mutex<()>,
     /// Data transport — SHM or reuse control face.
     transport: DataTransport,
+    /// Cancelled when the router control face disconnects.
+    /// Propagates to SHM handle so recv/send abort promptly.
+    cancel: CancellationToken,
+    /// Set when the control face health monitor detects disconnection.
+    dead: Arc<AtomicBool>,
 }
 
 impl RouterClient {
@@ -101,16 +108,20 @@ impl RouterClient {
         let control = Arc::new(
             UnixFace::connect(FaceId(0), face_socket.as_ref()).await?
         );
+        let cancel = CancellationToken::new();
+        let dead = Arc::new(AtomicBool::new(false));
 
         // Try SHM data plane if a name is provided.
         #[cfg(all(unix, feature = "spsc-shm"))]
         if let Some(name) = shm_name {
-            match Self::setup_shm(&control, name).await {
+            match Self::setup_shm(&control, name, cancel.child_token()).await {
                 Ok(transport) => {
                     return Ok(Self {
                         control,
                         recv_lock: Mutex::new(()),
                         transport,
+                        cancel,
+                        dead,
                     });
                 }
                 Err(e) => {
@@ -123,6 +134,8 @@ impl RouterClient {
             control,
             recv_lock: Mutex::new(()),
             transport: DataTransport::Unix,
+            cancel,
+            dead,
         })
     }
 
@@ -131,6 +144,7 @@ impl RouterClient {
     async fn setup_shm(
         control: &UnixFace,
         shm_name: &str,
+        cancel: CancellationToken,
     ) -> Result<DataTransport, RouterError> {
         let params = ControlParameters {
             uri: Some(format!("shm://{shm_name}")),
@@ -141,8 +155,9 @@ impl RouterClient {
         let face_id = resp.face_id
             .ok_or(RouterError::MalformedResponse)?;
 
-        // Connect the app-side SHM handle.
-        let handle = ndn_face_local::shm::spsc::SpscHandle::connect(shm_name)?;
+        // Connect the app-side SHM handle with cancellation from control face.
+        let mut handle = ndn_face_local::shm::spsc::SpscHandle::connect(shm_name)?;
+        handle.set_cancel(cancel);
 
         Ok(DataTransport::Shm { handle, face_id })
     }
@@ -221,6 +236,33 @@ impl RouterClient {
             return true;
         }
         false
+    }
+
+    /// Whether the router connection has been lost.
+    pub fn is_dead(&self) -> bool {
+        self.dead.load(Ordering::Relaxed)
+    }
+
+    /// Check if the control face is still connected by attempting a
+    /// non-blocking management probe.  Returns `true` if the router is alive.
+    ///
+    /// Called lazily by applications that detect SHM stalls.
+    pub async fn probe_alive(&self) -> bool {
+        if self.dead.load(Ordering::Relaxed) { return false; }
+        // Try sending a trivial Interest on the control face.
+        // If the socket is closed, send will fail immediately.
+        let probe = ndn_packet::encode::encode_interest(
+            &"/localhost/nfd/status/general".parse().expect("valid probe name"),
+            None,
+        );
+        match self.control.send(probe).await {
+            Ok(_) => true,
+            Err(_) => {
+                self.dead.store(true, Ordering::Relaxed);
+                self.cancel.cancel();
+                false
+            }
+        }
     }
 }
 

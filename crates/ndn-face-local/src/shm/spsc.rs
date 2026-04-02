@@ -295,7 +295,7 @@ fn open_fifo_rdwr(path: &std::path::Path) -> Result<std::os::unix::io::OwnedFd, 
 
 /// Await readability on the pipe fd, then drain all buffered bytes.
 ///
-/// Returns `Err` only if the `AsyncFd` reports an error (fd closed).
+/// Returns `Err` on EOF (peer died) or any I/O error.
 async fn pipe_await(
     rx: &tokio::io::unix::AsyncFd<std::os::unix::io::OwnedFd>,
 ) -> std::io::Result<()> {
@@ -309,6 +309,13 @@ async fn pipe_await(
         };
         guard.clear_ready();
         if n > 0 { return Ok(()); }
+        if n == 0 {
+            // EOF — peer closed their end.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "SHM wakeup pipe closed (peer died)",
+            ));
+        }
         if n == -1 {
             let err = std::io::Error::last_os_error();
             if err.kind() != std::io::ErrorKind::WouldBlock {
@@ -494,6 +501,10 @@ impl Face for SpscFace {
 ///
 /// Connect with [`SpscHandle::connect`] using the same `name` passed to
 /// [`SpscFace::create`] in the engine process.
+///
+/// Set a `CancellationToken` via [`set_cancel`] to abort `recv`/`send` when
+/// the router's control face disconnects (the O_RDWR FIFO trick means EOF
+/// detection alone is unreliable).
 pub struct SpscHandle {
     shm:       ShmRegion,
     capacity:  u32,
@@ -504,6 +515,8 @@ pub struct SpscHandle {
     e2a_rx: tokio::io::unix::AsyncFd<std::os::unix::io::OwnedFd>,
     /// FIFO the app writes to (to wake the engine).
     a2e_tx: std::os::unix::io::OwnedFd,
+    /// Cancelled when the router control face dies.
+    cancel: tokio_util::sync::CancellationToken,
 }
 
 impl SpscHandle {
@@ -556,7 +569,17 @@ impl SpscHandle {
         let e2a_fd = open_fifo_rdwr(&e2a_path)?;
         let e2a_rx = AsyncFd::new(e2a_fd).map_err(ShmError::Io)?;
 
-        Ok(SpscHandle { shm, capacity, slot_size, a2e_off, e2a_off, e2a_rx, a2e_tx })
+        Ok(SpscHandle {
+            shm, capacity, slot_size, a2e_off, e2a_off, e2a_rx, a2e_tx,
+            cancel: tokio_util::sync::CancellationToken::new(),
+        })
+    }
+
+    /// Attach a cancellation token (typically a child of the control face's
+    /// lifecycle token).  When cancelled, `recv()` returns `None` and `send()`
+    /// returns `Err`.
+    pub fn set_cancel(&mut self, cancel: tokio_util::sync::CancellationToken) {
+        self.cancel = cancel;
     }
 
     fn try_push_a2e(&self, data: &[u8]) -> bool {
@@ -576,7 +599,12 @@ impl SpscHandle {
     /// Send a packet to the engine (enqueue in the a2e ring).
     ///
     /// Yields cooperatively if the ring is full (backpressure from the engine).
+    /// Returns `Err` if the ring stays full for too long (engine likely dead)
+    /// or the cancellation token fires.
     pub async fn send(&self, pkt: Bytes) -> Result<(), ShmError> {
+        if self.cancel.is_cancelled() {
+            return Err(ShmError::Closed);
+        }
         if pkt.len() > self.slot_size as usize {
             return Err(ShmError::PacketTooLarge);
         }
@@ -584,8 +612,18 @@ impl SpscHandle {
         let parked = unsafe {
             &*AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_A2E_PARKED) as *mut u32)
         };
+        // Bounded yield: if ring stays full for ~1 second the engine is likely dead.
+        const MAX_YIELD_ITERS: u32 = 100_000;
+        let mut yields = 0u32;
         loop {
             if self.try_push_a2e(&pkt) { break; }
+            if self.cancel.is_cancelled() {
+                return Err(ShmError::Closed);
+            }
+            yields += 1;
+            if yields >= MAX_YIELD_ITERS {
+                return Err(ShmError::Closed);
+            }
             tokio::task::yield_now().await;
         }
         // Only send a wakeup if the engine is sleeping on the a2e ring.
@@ -597,12 +635,15 @@ impl SpscHandle {
 
     /// Receive a packet from the engine (dequeue from the e2a ring).
     ///
-    /// Returns `None` when the engine face has been dropped.
+    /// Returns `None` when the engine face has been dropped, the
+    /// cancellation token fires, or the pipe times out (router likely dead).
     pub async fn recv(&self) -> Option<Bytes> {
+        if self.cancel.is_cancelled() { return None; }
         // SAFETY: parked flag within mapped SHM region.
         let parked = unsafe {
             &*AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_E2A_PARKED) as *mut u32)
         };
+        let mut consecutive_timeouts = 0u32;
         loop {
             if let Some(pkt) = self.try_pop_e2a() {
                 return Some(pkt);
@@ -621,11 +662,33 @@ impl SpscHandle {
                 return Some(pkt);
             }
 
-            if pipe_await(&self.e2a_rx).await.is_err() {
-                return None;
+            // Race pipe wakeup against cancellation and a 5-second timeout.
+            // The timeout handles the O_RDWR FIFO problem: since both sides
+            // open the pipe read+write, EOF is never seen when the peer dies.
+            tokio::select! {
+                result = pipe_await(&self.e2a_rx) => {
+                    parked.store(0, Ordering::Relaxed);
+                    if result.is_err() { return None; }
+                    consecutive_timeouts = 0;
+                }
+                _ = self.cancel.cancelled() => {
+                    parked.store(0, Ordering::Relaxed);
+                    return None;
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                    parked.store(0, Ordering::Relaxed);
+                    // Timeout — check ring one more time (missed wakeup?).
+                    if let Some(pkt) = self.try_pop_e2a() {
+                        // Data was there, just a missed wakeup — not dead.
+                        return Some(pkt);
+                    }
+                    consecutive_timeouts += 1;
+                    if consecutive_timeouts >= 2 {
+                        // Two consecutive 5s timeouts with empty ring → peer is dead.
+                        return None;
+                    }
+                }
             }
-
-            parked.store(0, Ordering::Relaxed);
         }
     }
 }

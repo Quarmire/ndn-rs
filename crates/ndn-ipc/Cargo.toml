@@ -15,6 +15,7 @@ ndn-config     = { workspace = true }
 ndn-face-local = { workspace = true }
 ndn-transport  = { workspace = true }
 bytes          = { workspace = true }
-tokio          = { workspace = true, features = ["sync"] }
+tokio          = { workspace = true, features = ["sync", "rt", "macros"] }
+tokio-util     = { workspace = true }
 thiserror      = { workspace = true }
 tracing        = { workspace = true }
