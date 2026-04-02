@@ -124,6 +124,21 @@ enabling reliable transport of large NDN Data packets (~8800 bytes) over UDP.
 
 ### Fixed
 
+#### SHM wakeup: unified FIFO path, eliminated `spawn_blocking` on Linux
+
+The Linux futex + `spawn_blocking` wakeup path routed every park/unpark
+through Tokio's blocking thread pool.  At 100K+ packets/sec this caused
+Linux SHM throughput to be 2–4× lower than macOS (which used named FIFOs
+with `AsyncFd` integrated directly into the epoll loop).
+
+- **Unified wakeup mechanism** — both Linux and macOS now use named FIFO pipes
+  wrapped in `tokio::io::unix::AsyncFd`, integrating directly into Tokio's
+  epoll/kqueue loop with zero thread transitions.
+- **Removed all `#[cfg(target_os = "linux")]` branching** from `spsc.rs` —
+  the entire SPSC face implementation is now platform-agnostic.
+- **Removed futex syscall helpers** — `futex_wait()` and `futex_wake_one()`
+  no longer needed.
+
 #### Cross-process SHM futex on Linux
 
 The `atomic-wait` crate uses `FUTEX_PRIVATE_FLAG`, which keys on virtual
