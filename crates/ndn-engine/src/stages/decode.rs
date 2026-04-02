@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use bytes::Bytes;
 use dashmap::DashMap;
 use tracing::trace;
 
@@ -42,6 +43,41 @@ pub struct TlvDecodeStage {
 }
 
 impl TlvDecodeStage {
+    /// Fast-path fragment collection that bypasses `PacketContext` creation.
+    ///
+    /// If the raw bytes are a fragmented LpPacket, parses just the header fields
+    /// and feeds the fragment to the per-face `ReassemblyBuffer`.
+    ///
+    /// Returns:
+    /// - `Ok(Some(bytes))` — reassembly completed, `bytes` is the full packet
+    /// - `Ok(None)` — fragment buffered, waiting for more
+    /// - `Err(bytes)` — not a fragment (bare packet, unfragmented LpPacket, or
+    ///   Nack); caller should process through the full pipeline. The original
+    ///   bytes are returned back.
+    pub fn try_collect_fragment(&self, face_id: FaceId, raw: Bytes) -> Result<Option<Bytes>, Bytes> {
+        if !is_lp_packet(&raw) {
+            return Err(raw);
+        }
+        // Parse just enough to check fragmentation.
+        let lp = match LpPacket::decode(raw.clone()) {
+            Ok(lp) => lp,
+            Err(_) => return Err(raw),
+        };
+        if !lp.is_fragmented() {
+            return Err(raw);
+        }
+        // Feed to reassembly buffer.
+        let mut rb = self.reassembly
+            .entry(face_id)
+            .or_insert_with(ReassemblyBuffer::default);
+        Ok(rb.process(
+            lp.sequence.unwrap_or(0),
+            lp.frag_index.unwrap_or(0),
+            lp.frag_count.unwrap_or(1),
+            lp.fragment,
+        ))
+    }
+
     pub fn process(&self, mut ctx: PacketContext) -> Action {
         let first_byte = match ctx.raw_bytes.first() {
             Some(&b) => b as u64,
