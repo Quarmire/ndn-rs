@@ -124,6 +124,25 @@ enabling reliable transport of large NDN Data packets (~8800 bytes) over UDP.
 
 ### Fixed
 
+#### UDP listener faces reply from wrong source port
+
+Listener-created UDP faces used a dedicated ephemeral-port socket for sending.
+When the remote peer's face filters by source address (expecting replies from
+port 6363), replies from an ephemeral port were silently dropped — causing
+cross-machine ndn-ping to timeout even though Interests reached the server.
+
+This mirrors NFD's UdpChannel design: the listener owns a single socket and
+all per-peer faces share it for sending via `send_to`.  No recv loop is
+spawned for these faces — the listener demuxes inbound datagrams and injects
+them into the pipeline via `inject_packet`.
+
+- **`UdpFace::from_shared_socket()`** — new constructor accepting an
+  `Arc<UdpSocket>` so listener-created faces share the listener's socket.
+- **`ForwarderEngine::add_face_send_only()`** — registers a face without
+  spawning a recv loop (the listener handles inbound demux).
+- **UDP listener** uses both to create per-peer faces that reply from the
+  well-known listener port.
+
 #### SHM wakeup: unified FIFO path, eliminated `spawn_blocking` on Linux
 
 The Linux futex + `spawn_blocking` wakeup path routed every park/unpark

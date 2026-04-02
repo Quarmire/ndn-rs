@@ -157,26 +157,20 @@ pub async fn run_udp_listener(
                 let face_id = if let Some(&id) = peers.get(&src) {
                     id
                 } else {
-                    // New peer — create a UdpFace backed by a separate socket for sending.
+                    // New peer — create a send-only UdpFace sharing the listener socket.
+                    // Replies go out from the listener's port (6363), so the
+                    // remote peer's socket accepts them (it filters by source).
+                    // No recv loop is spawned — the listener handles inbound
+                    // packets and injects them via `inject_packet`.
                     let face_id = engine.faces().alloc_id();
-                    let send_local: std::net::SocketAddr = if src.is_ipv4() {
-                        "0.0.0.0:0".parse().unwrap()
-                    } else {
-                        "[::]:0".parse().unwrap()
-                    };
-                    match ndn_face_net::UdpFace::bind(send_local, src, face_id).await {
-                        Ok(face) => {
-                            let peer_cancel = cancel.child_token();
-                            engine.add_face(face, peer_cancel);
-                            peers.insert(src, face_id);
-                            tracing::info!(face=%face_id, peer=%src, "udp-listener: new face");
-                            face_id
-                        }
-                        Err(e) => {
-                            tracing::warn!(peer=%src, error=%e, "udp-listener: face creation failed");
-                            continue;
-                        }
-                    }
+                    let face = ndn_face_net::UdpFace::from_shared_socket(
+                        face_id, Arc::clone(&socket), src,
+                    );
+                    let peer_cancel = cancel.child_token();
+                    engine.add_face_send_only(face, peer_cancel);
+                    peers.insert(src, face_id);
+                    tracing::info!(face=%face_id, peer=%src, "udp-listener: new face");
+                    face_id
                 };
 
                 // Check if this is a fragmented LpPacket that needs reassembly.

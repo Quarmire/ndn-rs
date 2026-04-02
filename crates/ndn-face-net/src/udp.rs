@@ -64,6 +64,15 @@ impl UdpFace {
         Self { id, socket: Arc::new(socket), peer, mtu: DEFAULT_UDP_MTU, seq: AtomicU64::new(0) }
     }
 
+    /// Create a face that shares an existing socket (e.g. the UDP listener socket).
+    ///
+    /// Replies go out from the same port the listener is bound to, so the
+    /// remote peer's connected/filtered socket accepts them.  The `recv()`
+    /// loop filters datagrams by `peer` address.
+    pub fn from_shared_socket(id: FaceId, socket: Arc<UdpSocket>, peer: SocketAddr) -> Self {
+        Self { id, socket, peer, mtu: DEFAULT_UDP_MTU, seq: AtomicU64::new(0) }
+    }
+
     pub fn peer(&self) -> SocketAddr {
         self.peer
     }
