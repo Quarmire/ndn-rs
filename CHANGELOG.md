@@ -407,6 +407,29 @@ conventions (`/localhost/nfd/<module>/<verb>/<ControlParameters>`).
   strategies return a forwarding decision without `Box::pin` heap
   allocation.  `BestRouteStrategy` and `MulticastStrategy` implement
   this, avoiding one allocation per Interest on the hot path.
+- **Synchronous signing fast-path** — `Signer::sign_sync()` method
+  eliminates `Box::pin` + async state machine overhead for CPU-only
+  signers.  `Ed25519Signer` and `HmacSha256Signer` implement this
+  directly, removing one heap allocation per Data packet when signing.
+- **`DataBuilder::sign_sync()`** — synchronous single-buffer packet
+  encoding.  The async `sign()` path allocated 3–4 intermediate buffers
+  (two `TlvWriter`s, one concatenation `Vec`, one final `TlvWriter`)
+  and copied the entire signed region to satisfy lifetime constraints.
+  `sign_sync()` builds the signed region incrementally in one pre-sized
+  buffer, snapshots it for the signing closure, then writes the outer
+  Data TLV — eliminating ~1.2M allocations/sec at line rate.
+- **HMAC-SHA256 signer** — `HmacSha256Signer` in `ndn-security` for
+  symmetric (pre-shared key) authentication using `ring::hmac`.
+  Significantly faster than Ed25519 (~10×) for scenarios where
+  asymmetric key distribution is unnecessary.
+- **Parallel signing in ndn-iperf** — server `--sign` and `--hmac`
+  modes now use `tokio::spawn_blocking` + `sign_sync` to distribute
+  signing work across Tokio's blocking thread pool.  Ed25519 signing
+  (~50µs/packet) previously saturated one core at ~30K pkt/s; parallel
+  signing scales linearly with available cores.
+- **`ndn-iperf --hmac` flag** — server-side HMAC-SHA256 signing mode
+  for benchmarking signing overhead without the cost of elliptic curve
+  math.
 
 ### Fixed
 

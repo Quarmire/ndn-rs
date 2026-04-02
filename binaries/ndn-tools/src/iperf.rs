@@ -75,6 +75,10 @@ enum Command {
         #[arg(long)]
         sign: bool,
 
+        /// Sign Data packets with HMAC-SHA256 (faster than Ed25519).
+        #[arg(long)]
+        hmac: bool,
+
         /// Data freshness period in milliseconds (0 = omit).
         #[arg(long, default_value_t = 0)]
         freshness: u64,
@@ -210,6 +214,7 @@ async fn run_server(
     prefix: &Name,
     payload_size: usize,
     sign: bool,
+    hmac: bool,
     freshness_ms: u64,
     quiet: bool,
     interval_secs: u64,
@@ -221,6 +226,8 @@ async fn run_server(
     eprintln!("ndn-iperf server: prefix={prefix} transport={transport} payload={payload_size}B");
     if sign {
         eprintln!("  signing:  Ed25519");
+    } else if hmac {
+        eprintln!("  signing:  HMAC-SHA256");
     }
     if freshness_ms > 0 {
         eprintln!("  freshness: {freshness_ms}ms");
@@ -231,6 +238,14 @@ async fn run_server(
     let signer: Option<Arc<dyn Signer>> = if sign {
         let keychain = KeyChain::new();
         Some(keychain.create_identity(prefix.clone(), None)?)
+    } else if hmac {
+        use ndn_packet::{NameComponent, Name as NdnName};
+        let key_name = NdnName::from_components([
+            NameComponent::generic(Bytes::from_static(b"iperf")),
+            NameComponent::generic(Bytes::from_static(b"hmac-key")),
+        ]);
+        // Fixed test key — iperf is a benchmark tool, not production security.
+        Some(Arc::new(ndn_security::HmacSha256Signer::new(b"ndn-iperf-bench-key", key_name)))
     } else {
         None
     };
@@ -296,13 +311,13 @@ async fn run_server(
         let data = if let Some(ref signer) = signer {
             let sig_type = signer.sig_type();
             let key_name = signer.key_name().clone();
-            let s = signer.clone();
-            builder
-                .sign(sig_type, Some(&key_name), |region| {
-                    let owned = region.to_vec();
-                    async move { s.sign(&owned).await.expect("signing failed") }
+            let s = Arc::clone(signer);
+            // sign_sync on the blocking pool — scales across cores.
+            tokio::task::spawn_blocking(move || {
+                builder.sign_sync(sig_type, Some(&key_name), |region| {
+                    s.sign_sync(region).expect("signing failed")
                 })
-                .await
+            }).await?
         } else {
             builder.build()
         };
@@ -503,10 +518,10 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Server {
-            conn, prefix, size, sign, freshness, quiet, interval,
+            conn, prefix, size, sign, hmac, freshness, quiet, interval,
         } => {
             let prefix: Name = prefix.parse()?;
-            run_server(&conn, &prefix, size, sign, freshness, quiet, interval).await
+            run_server(&conn, &prefix, size, sign, hmac, freshness, quiet, interval).await
         }
         Command::Client {
             conn, prefix, duration, window, lifetime, quiet, interval,
