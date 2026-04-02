@@ -7,6 +7,9 @@ use ndn_packet::Name;
 use crate::AppError;
 
 /// Unified NDN connection — either an embedded engine face or an external router.
+///
+/// Both [`send`](Self::send) and [`recv`](Self::recv) take `&self`, so an
+/// `Arc<NdnConnection>` can be shared across tasks for concurrent send/recv.
 pub enum NdnConnection {
     /// In-process connection via AppHandle (embedded engine).
     Embedded(AppHandle),
@@ -26,7 +29,7 @@ impl NdnConnection {
     }
 
     /// Receive a packet. Returns `None` if the channel is closed.
-    pub async fn recv(&mut self) -> Option<Bytes> {
+    pub async fn recv(&self) -> Option<Bytes> {
         match self {
             NdnConnection::Embedded(h) => h.recv().await,
             NdnConnection::External(c) => c.recv().await,

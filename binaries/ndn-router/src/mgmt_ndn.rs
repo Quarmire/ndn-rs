@@ -262,7 +262,7 @@ pub async fn run_tcp_listener(
 /// Read Interests from the management `AppHandle`, dispatch NFD commands,
 /// and write Data responses back.
 pub async fn run_ndn_mgmt_handler(
-    mut handle: AppHandle,
+    handle: AppHandle,
     engine:     ForwarderEngine,
     cancel:     CancellationToken,
 ) {
@@ -294,7 +294,7 @@ pub async fn run_ndn_mgmt_handler(
             Some(p) => p,
             None => {
                 let resp = ControlResponse::error(status::BAD_PARAMS, "invalid command name");
-                send_response(&mut handle, &interest.name, &resp).await;
+                send_response(&handle, &interest.name, &resp).await;
                 continue;
             }
         };
@@ -310,7 +310,7 @@ pub async fn run_ndn_mgmt_handler(
             &cancel,
         ).await;
 
-        send_response(&mut handle, &interest.name, &resp).await;
+        send_response(&handle, &interest.name, &resp).await;
     }
 
     tracing::info!("NFD management handler stopped");
@@ -909,7 +909,7 @@ fn resolve_face_id(
     }
 }
 
-async fn send_response(handle: &mut AppHandle, name: &Name, resp: &ControlResponse) {
+async fn send_response(handle: &AppHandle, name: &Name, resp: &ControlResponse) {
     let content = resp.encode();
     let data = encode_data_unsigned(name, &content);
     if let Err(e) = handle.send(data).await {

@@ -30,9 +30,12 @@ pub struct AppFace {
 ///
 /// Send Interests with [`send`][AppHandle::send]; receive Data/Nacks with
 /// [`recv`][AppHandle::recv].
+///
+/// The receiver is wrapped in a `Mutex` so that `recv()` takes `&self`,
+/// enabling shared ownership (e.g. concurrent send/recv from different tasks).
 pub struct AppHandle {
     face_tx: mpsc::Sender<Bytes>,
-    app_rx:  mpsc::Receiver<Bytes>,
+    app_rx:  Mutex<mpsc::Receiver<Bytes>>,
 }
 
 impl AppFace {
@@ -41,7 +44,7 @@ impl AppFace {
         let (face_tx, face_rx) = mpsc::channel(buffer);
         let (app_tx,  app_rx)  = mpsc::channel(buffer);
         let face   = AppFace  { id, face_rx: Mutex::new(face_rx), app_tx };
-        let handle = AppHandle { face_tx, app_rx };
+        let handle = AppHandle { face_tx, app_rx: Mutex::new(app_rx) };
         (face, handle)
     }
 }
@@ -68,8 +71,8 @@ impl AppHandle {
     }
 
     /// Receive a packet from the forwarder (sent via `AppFace::send`).
-    pub async fn recv(&mut self) -> Option<Bytes> {
-        self.app_rx.recv().await
+    pub async fn recv(&self) -> Option<Bytes> {
+        self.app_rx.lock().await.recv().await
     }
 }
 
@@ -101,7 +104,7 @@ mod tests {
 
     #[tokio::test]
     async fn pipeline_to_app() {
-        let (face, mut handle) = AppFace::new(FaceId(0), 4);
+        let (face, handle) = AppFace::new(FaceId(0), 4);
         face.send(test_pkt(2)).await.unwrap();
         let received = handle.recv().await.unwrap();
         assert_eq!(received, test_pkt(2));
@@ -109,7 +112,7 @@ mod tests {
 
     #[tokio::test]
     async fn bidirectional() {
-        let (face, mut handle) = AppFace::new(FaceId(0), 4);
+        let (face, handle) = AppFace::new(FaceId(0), 4);
         handle.send(test_pkt(10)).await.unwrap();
         face.send(test_pkt(20)).await.unwrap();
         assert_eq!(face.recv().await.unwrap(), test_pkt(10));
@@ -125,7 +128,7 @@ mod tests {
 
     #[tokio::test]
     async fn closed_when_face_dropped() {
-        let (face, mut handle) = AppFace::new(FaceId(0), 4);
+        let (face, handle) = AppFace::new(FaceId(0), 4);
         drop(face);
         assert!(handle.recv().await.is_none());
     }

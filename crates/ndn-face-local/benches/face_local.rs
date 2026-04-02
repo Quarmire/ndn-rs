@@ -58,7 +58,7 @@ fn bench_appface_latency(c: &mut Criterion) {
     let mut group = c.benchmark_group("appface/latency");
     for &size in &[64_usize, 1_024, 8_192] {
         let pkt = make_pkt(size);
-        let (face, mut handle) = AppFace::new(FaceId(1), 128);
+        let (face, handle) = AppFace::new(FaceId(1), 128);
 
         group.bench_with_input(BenchmarkId::from_parameter(size), &pkt, |b, pkt| {
             b.iter(|| {

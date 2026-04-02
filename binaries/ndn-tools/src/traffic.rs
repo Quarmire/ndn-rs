@@ -106,7 +106,7 @@ fn print_stats(results: &[FlowResult], elapsed: Duration, size: usize) {
 
 // ─── Producer ────────────────────────────────────────────────────────────────
 
-async fn run_producer(mut handle: AppHandle, payload: Arc<Vec<u8>>) {
+async fn run_producer(handle: AppHandle, payload: Arc<Vec<u8>>) {
     loop {
         let raw = match handle.recv().await {
             Some(b) => b,
@@ -126,7 +126,7 @@ async fn run_producer(mut handle: AppHandle, payload: Arc<Vec<u8>>) {
 // ─── Consumer ────────────────────────────────────────────────────────────────
 
 async fn run_consumer(
-    mut handle: AppHandle,
+    handle: AppHandle,
     prefix: Name,
     flow_id: u64,
     count: u64,
