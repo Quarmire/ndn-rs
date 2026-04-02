@@ -48,6 +48,46 @@ use ndn_transport::{Face, FaceError, FaceId, FaceKind};
 
 use crate::shm::ShmError;
 
+// ─── Cross-process futex helpers (Linux) ─────────────────────────────────────
+//
+// `atomic_wait` uses `FUTEX_PRIVATE_FLAG` which only works within a single
+// process (keys on virtual address).  For POSIX SHM shared across processes
+// we need plain `FUTEX_WAIT` / `FUTEX_WAKE` which key on the physical page
+// offset.
+
+/// Block the calling thread while `*a == expected`, with a 100ms timeout.
+///
+/// Uses the non-private futex so the wait is visible across processes sharing
+/// the same POSIX SHM mapping.  The timeout ensures blocking threads don't
+/// hang indefinitely during shutdown (tokio waits for all `spawn_blocking`
+/// tasks before the runtime drops).
+#[cfg(target_os = "linux")]
+fn futex_wait(a: &AtomicU32, expected: u32) {
+    let timeout = libc::timespec { tv_sec: 0, tv_nsec: 100_000_000 }; // 100ms
+    unsafe {
+        libc::syscall(
+            libc::SYS_futex,
+            a as *const AtomicU32,
+            libc::FUTEX_WAIT,
+            expected,
+            &timeout as *const libc::timespec,
+        );
+    }
+}
+
+/// Wake one thread blocked in `futex_wait` on the same address.
+#[cfg(target_os = "linux")]
+fn futex_wake_one(a: &AtomicU32) {
+    unsafe {
+        libc::syscall(
+            libc::SYS_futex,
+            a as *const AtomicU32,
+            libc::FUTEX_WAKE,
+            1i32,
+        );
+    }
+}
+
 // ─── Constants ───────────────────────────────────────────────────────────────
 
 const MAGIC: u64 = 0x4E44_4E5F_5348_4D00; // b"NDN_SHM\0"
@@ -471,7 +511,7 @@ impl Face for SpscFace {
                 let ptr = parked as *const AtomicU32 as usize;
                 let _ = tokio::task::spawn_blocking(move || {
                     let p = unsafe { &*(ptr as *const AtomicU32) };
-                    atomic_wait::wait(p, 1);
+                    futex_wait(p, 1);
                 }).await;
             }
             #[cfg(not(target_os = "linux"))]
@@ -503,7 +543,7 @@ impl Face for SpscFace {
         // Only send a wakeup if the app is actually sleeping.
         if parked.load(Ordering::SeqCst) != 0 {
             #[cfg(target_os = "linux")]
-            atomic_wait::wake_one(parked);
+            futex_wake_one(parked);
 
             #[cfg(not(target_os = "linux"))]
             pipe_write(&self.e2a_tx);
@@ -625,7 +665,7 @@ impl SpscHandle {
         // Only send a wakeup if the engine is sleeping on the a2e ring.
         if parked.load(Ordering::SeqCst) != 0 {
             #[cfg(target_os = "linux")]
-            atomic_wait::wake_one(parked);
+            futex_wake_one(parked);
 
             #[cfg(not(target_os = "linux"))]
             pipe_write(&self.a2e_tx);
@@ -664,7 +704,7 @@ impl SpscHandle {
                 let ptr = parked as *const AtomicU32 as usize;
                 let ok = tokio::task::spawn_blocking(move || {
                     let p = unsafe { &*(ptr as *const AtomicU32) };
-                    atomic_wait::wait(p, 1);
+                    futex_wait(p, 1);
                 }).await;
                 if ok.is_err() { return None; }
             }

@@ -7,9 +7,9 @@ license.workspace = true
 
 [features]
 ## Custom SPSC ring-buffer SHM face.
-## Wakeup: futex on Linux (atomic-wait), named FIFO pipe on other Unix.
-## Requires POSIX shm_open.  Unix only.
-spsc-shm = ["dep:libc", "dep:atomic-wait"]
+## Wakeup: futex on Linux (direct syscall, no PRIVATE flag for cross-process SHM),
+## named FIFO pipe on other Unix.  Requires POSIX shm_open.  Unix only.
+spsc-shm = ["dep:libc"]
 
 
 [dependencies]
@@ -22,7 +22,7 @@ futures       = { workspace = true }
 thiserror     = { workspace = true }
 tracing       = { workspace = true }
 libc          = { workspace = true, optional = true }
-atomic-wait   = { workspace = true, optional = true }
+
 
 [dev-dependencies]
 ndn-tlv   = { workspace = true }
