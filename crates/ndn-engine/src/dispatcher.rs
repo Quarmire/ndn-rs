@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace, warn};
 
 use ndn_packet::encode::encode_nack;
-use ndn_pipeline::{Action, DecodedPacket, ForwardingAction, NackReason, PacketContext};
+use ndn_pipeline::{Action, DecodedPacket, DropReason, ForwardingAction, NackReason, PacketContext};
 use ndn_store::{CsEntry, PitToken};
 use ndn_packet::Name;
 use ndn_transport::{FaceError, FaceId, FacePersistency, FaceScope, FaceTable, FaceKind};
@@ -105,6 +105,7 @@ impl PacketDispatcher {
         // 1. Decode.
         let ctx = match self.decode.process(ctx) {
             Action::Continue(ctx) => ctx,
+            Action::Drop(DropReason::FragmentCollect) => { trace!(face=%pkt.face_id, "fragment collected, awaiting reassembly"); return; }
             Action::Drop(r)       => { debug!(face=%pkt.face_id, reason=?r, "drop at decode"); return; }
             other                 => { self.dispatch_action(other).await; return; }
         };

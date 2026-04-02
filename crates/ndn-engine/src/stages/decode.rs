@@ -160,7 +160,7 @@ impl TlvDecodeStage {
                 }
                 None => {
                     // Still waiting for more fragments — not an error.
-                    return Action::Drop(DropReason::MalformedPacket);
+                    return Action::Drop(DropReason::FragmentCollect);
                 }
             }
         }
