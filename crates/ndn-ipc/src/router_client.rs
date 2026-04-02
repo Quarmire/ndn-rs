@@ -31,12 +31,8 @@ use bytes::Bytes;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use ndn_config::{
-    ControlParameters, ControlResponse,
-    nfd_command::{module, verb, command_name},
-};
 use ndn_face_local::UnixFace;
-use ndn_packet::{Name, encode::encode_interest};
+use ndn_packet::Name;
 use ndn_transport::{Face, FaceId};
 
 /// Error type for `RouterClient` operations.
@@ -71,7 +67,9 @@ enum DataTransport {
 pub struct RouterClient {
     /// Control channel (always a UnixFace).
     control: Arc<UnixFace>,
-    /// Mutex for serialising recv on the control face.
+    /// Typed management API — shares the control face.
+    pub mgmt: crate::mgmt_client::MgmtClient,
+    /// Mutex for serialising recv on the control face (Unix data path).
     recv_lock: Mutex<()>,
     /// Data transport — SHM or reuse control face.
     transport: DataTransport,
@@ -116,8 +114,10 @@ impl RouterClient {
         if let Some(name) = shm_name {
             match Self::setup_shm(&control, name, cancel.child_token()).await {
                 Ok(transport) => {
+                    let mgmt = crate::mgmt_client::MgmtClient::from_face(Arc::clone(&control));
                     return Ok(Self {
                         control,
+                        mgmt,
                         recv_lock: Mutex::new(()),
                         transport,
                         cancel,
@@ -130,8 +130,10 @@ impl RouterClient {
             }
         }
 
+        let mgmt = crate::mgmt_client::MgmtClient::from_face(Arc::clone(&control));
         Ok(Self {
             control,
+            mgmt,
             recv_lock: Mutex::new(()),
             transport: DataTransport::Unix,
             cancel,
@@ -142,16 +144,12 @@ impl RouterClient {
     /// Set up SHM data plane by sending `faces/create` to the router.
     #[cfg(all(unix, feature = "spsc-shm"))]
     async fn setup_shm(
-        control: &UnixFace,
+        control: &Arc<UnixFace>,
         shm_name: &str,
         cancel: CancellationToken,
     ) -> Result<DataTransport, RouterError> {
-        let params = ControlParameters {
-            uri: Some(format!("shm://{shm_name}")),
-            ..Default::default()
-        };
-
-        let resp = send_command(control, module::FACES, verb::CREATE, &params).await?;
+        let mgmt = crate::mgmt_client::MgmtClient::from_face(Arc::clone(control));
+        let resp = mgmt.face_create(&format!("shm://{shm_name}")).await?;
         let face_id = resp.face_id
             .ok_or(RouterError::MalformedResponse)?;
 
@@ -164,18 +162,8 @@ impl RouterClient {
 
     /// Register a prefix with the router via `rib/register`.
     pub async fn register_prefix(&self, prefix: &Name) -> Result<(), RouterError> {
-        let mut params = ControlParameters {
-            name: Some(prefix.clone()),
-            ..Default::default()
-        };
-
-        // If using SHM, specify the SHM face ID so the route points to it.
-        #[cfg(all(unix, feature = "spsc-shm"))]
-        if let DataTransport::Shm { face_id, .. } = &self.transport {
-            params.face_id = Some(*face_id);
-        }
-
-        let resp = send_command(&self.control, module::RIB, verb::REGISTER, &params).await?;
+        let face_id = self.shm_face_id().unwrap_or(0);
+        let resp = self.mgmt.route_add(prefix, face_id, 0).await?;
         tracing::debug!(
             face_id = ?resp.face_id,
             cost = ?resp.cost,
@@ -186,18 +174,18 @@ impl RouterClient {
 
     /// Unregister a prefix from the router via `rib/unregister`.
     pub async fn unregister_prefix(&self, prefix: &Name) -> Result<(), RouterError> {
-        let mut params = ControlParameters {
-            name: Some(prefix.clone()),
-            ..Default::default()
-        };
+        let face_id = self.shm_face_id().unwrap_or(0);
+        self.mgmt.route_remove(prefix, face_id).await?;
+        Ok(())
+    }
 
+    /// Get the SHM face ID if using SHM transport.
+    fn shm_face_id(&self) -> Option<u64> {
         #[cfg(all(unix, feature = "spsc-shm"))]
         if let DataTransport::Shm { face_id, .. } = &self.transport {
-            params.face_id = Some(*face_id);
+            return Some(*face_id);
         }
-
-        let _resp = send_command(&self.control, module::RIB, verb::UNREGISTER, &params).await?;
-        Ok(())
+        None
     }
 
     /// Send a packet on the data plane.
@@ -264,41 +252,6 @@ impl RouterClient {
             }
         }
     }
-}
-
-// ─── Command helper ──────────────────────────────────────────────────────────
-
-/// Send a management command Interest and wait for the ControlResponse.
-async fn send_command(
-    face:   &UnixFace,
-    module_name: &[u8],
-    verb_name:   &[u8],
-    params: &ControlParameters,
-) -> Result<ControlParameters, RouterError> {
-    let name = command_name(module_name, verb_name, params);
-    let interest_wire = encode_interest(&name, None);
-
-    face.send(interest_wire).await?;
-
-    // Wait for the Data response.
-    let data_wire = face.recv().await?;
-    let data = ndn_packet::Data::decode(data_wire)
-        .map_err(|_| RouterError::MalformedResponse)?;
-
-    // Decode ControlResponse from Data content.
-    let content = data.content()
-        .ok_or(RouterError::MalformedResponse)?;
-    let resp = ControlResponse::decode(Bytes::copy_from_slice(content))
-        .map_err(|_| RouterError::MalformedResponse)?;
-
-    if !resp.is_ok() {
-        return Err(RouterError::Command {
-            code: resp.status_code,
-            text: resp.status_text,
-        });
-    }
-
-    Ok(resp.body.unwrap_or_default())
 }
 
 /// Process-local counter for auto-generated SHM names.
