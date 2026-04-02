@@ -165,6 +165,43 @@ impl Pit {
         }
         expired
     }
+
+    /// Remove PIT entries whose **only** in-record face is `face_id`.
+    ///
+    /// Entries that also have in-records from other faces are kept (with the
+    /// dead face's records removed). This prevents stale PIT entries from
+    /// suppressing Interests after a face disconnects.
+    pub fn remove_face(&self, face_id: u32) -> usize {
+        // First pass: identify entries to remove entirely (sole consumer was this face).
+        let mut to_remove = Vec::new();
+        let mut to_prune = Vec::new();
+
+        for entry in self.entries.iter() {
+            let all_on_face = entry.in_records.iter().all(|r| r.face_id == face_id);
+            let any_on_face = entry.in_records.iter().any(|r| r.face_id == face_id);
+
+            if all_on_face && !entry.in_records.is_empty() {
+                to_remove.push(*entry.key());
+            } else if any_on_face {
+                to_prune.push(*entry.key());
+            }
+        }
+
+        let removed = to_remove.len();
+
+        for token in &to_remove {
+            self.entries.remove(token);
+        }
+
+        // Second pass: prune in-records for the dead face from multi-consumer entries.
+        for token in &to_prune {
+            if let Some(mut entry) = self.entries.get_mut(token) {
+                entry.in_records.retain(|r| r.face_id != face_id);
+            }
+        }
+
+        removed
+    }
 }
 
 impl Default for Pit {
@@ -263,5 +300,47 @@ mod tests {
         assert_eq!(pit.len(), 1);
         assert!(pit.remove(&token).is_some());
         assert!(pit.is_empty());
+    }
+
+    #[test]
+    fn remove_face_drains_sole_consumer() {
+        let pit = Pit::new();
+
+        // Entry with sole consumer on face 1.
+        let name1 = Arc::new(make_name(&["a"]));
+        let token1 = PitToken::from_interest(&name1, None);
+        let mut entry1 = PitEntry::new(name1, None, 0, 4000);
+        entry1.add_in_record(1, 100, 999);
+        pit.insert(token1, entry1);
+
+        // Entry with consumers on face 1 AND face 2.
+        let name2 = Arc::new(make_name(&["b"]));
+        let token2 = PitToken::from_interest(&name2, None);
+        let mut entry2 = PitEntry::new(name2, None, 0, 4000);
+        entry2.add_in_record(1, 200, 999);
+        entry2.add_in_record(2, 201, 999);
+        pit.insert(token2, entry2);
+
+        // Entry with sole consumer on face 3 (unrelated).
+        let name3 = Arc::new(make_name(&["c"]));
+        let token3 = PitToken::from_interest(&name3, None);
+        let mut entry3 = PitEntry::new(name3, None, 0, 4000);
+        entry3.add_in_record(3, 300, 999);
+        pit.insert(token3, entry3);
+
+        assert_eq!(pit.len(), 3);
+
+        // Remove face 1: should remove entry1 entirely, prune face 1 from entry2.
+        let removed = pit.remove_face(1);
+        assert_eq!(removed, 1);
+        assert_eq!(pit.len(), 2); // entry2 and entry3 remain
+
+        // entry2 should still exist but only have face 2's in-record.
+        let entry2 = pit.get(&token2).unwrap();
+        assert_eq!(entry2.in_records.len(), 1);
+        assert_eq!(entry2.in_records[0].face_id, 2);
+
+        // entry3 is untouched.
+        assert!(pit.get(&token3).is_some());
     }
 }

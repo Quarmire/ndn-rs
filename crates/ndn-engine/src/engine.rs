@@ -209,9 +209,10 @@ impl ForwarderEngine {
         let tx         = self.inner.pipeline_tx.clone();
         let face_table = Arc::clone(&self.inner.face_table);
         let fib        = Arc::clone(&self.inner.fib);
+        let pit        = Arc::clone(&self.inner.pit);
         let face_states = Arc::clone(&self.inner.face_states);
         tokio::spawn(crate::dispatcher::run_face_reader(
-            face_id, erased, tx, cancel, face_table, fib, face_states,
+            face_id, erased, tx, cancel, face_table, fib, pit, face_states,
         ));
     }
 

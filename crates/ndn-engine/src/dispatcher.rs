@@ -99,9 +99,10 @@ impl PacketDispatcher {
                 let cancel       = cancel.clone();
                 let face_table   = Arc::clone(&dispatcher.face_table);
                 let fib          = Arc::clone(&dispatcher.strategy.fib);
+                let pit          = Arc::clone(&dispatcher.pit_check.pit);
                 let face_states  = Arc::clone(&dispatcher.face_states);
                 tasks.spawn(async move {
-                    run_face_reader(face_id, face, tx2, cancel, face_table, fib, face_states).await;
+                    run_face_reader(face_id, face, tx2, cancel, face_table, fib, pit, face_states).await;
                 });
             }
         }
@@ -438,6 +439,7 @@ pub(crate) async fn run_face_reader(
     cancel:      CancellationToken,
     face_table:  Arc<FaceTable>,
     fib:         Arc<crate::Fib>,
+    pit:         Arc<ndn_store::Pit>,
     face_states: Arc<dashmap::DashMap<FaceId, FaceState>>,
 ) {
     let kind = face.kind();
@@ -508,6 +510,12 @@ pub(crate) async fn run_face_reader(
                 }
             }
         }
+    }
+
+    // Drain PIT entries whose sole consumer was this face.
+    let pit_removed = pit.remove_face(face_id.0);
+    if pit_removed > 0 {
+        debug!(face=%face_id, count=pit_removed, "PIT entries drained for closed face");
     }
 
     // Cleanup depends on face kind and persistency.
