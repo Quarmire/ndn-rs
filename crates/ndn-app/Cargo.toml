@@ -17,8 +17,10 @@ ndn-security   = { workspace = true }
 ndn-transport  = { workspace = true }
 ndn-face-local = { workspace = true }
 ndn-ipc        = { workspace = true }
+ndn-sync       = { workspace = true }
 bytes          = { workspace = true }
 tokio          = { workspace = true, features = ["sync", "rt", "time"] }
+tokio-util     = { workspace = true }
 tracing        = { workspace = true }
 thiserror      = { workspace = true }
 anyhow         = { workspace = true }
