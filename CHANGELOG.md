@@ -75,6 +75,27 @@ Zenoh's pub/sub/queryable model but built on NDN's Interest/Data machinery.
   layer planned).
 - Added to `ndn-app` prelude: `Subscriber`, `Queryable`.
 
+#### Completed sync/query integration
+
+- **`AppHandle` now supports `&self` for `recv()`** — the receiver is wrapped
+  in a `Mutex`, enabling shared ownership and concurrent send/recv from
+  different tasks.  `NdnConnection::recv()` likewise takes `&self`.
+- **`Queryable::recv()`** — returns `Query` objects that carry the incoming
+  Interest plus an `Arc<NdnConnection>` sender, so the application can reply
+  from any task via `query.reply(data)`.
+- **Subscriber auto-fetch** — when `auto_fetch` is enabled (default), the
+  subscriber expresses Interests for each `SyncUpdate` and populates
+  `Sample.payload` with the fetched Data content.  Configurable
+  `fetch_timeout` (default 4s).
+- **Subscriber recv pump** — incoming packets from the network connection
+  are forwarded to the SVS task, closing the gap that previously required
+  the caller to manually feed sync packets.
+- **PSync network layer** (`ndn-sync::psync_sync`) — `join_psync_group()`
+  runs PSync as a background task: periodic Sync Interests carrying IBF
+  encoding, peer IBF subtraction and difference decoding, Data replies with
+  missing hash sets.  Configurable via `PSyncConfig` (interval, jitter,
+  IBF size).  `Ibf::from_cells()` / `Ibf::cells()` added for wire encoding.
+
 ### Fixed
 
 #### NDNLPv2 reliability lingering traffic after flow completion
