@@ -98,6 +98,18 @@ NFD-compatible face lifecycle management with three persistence levels.
   removing on-demand faces idle for >5 minutes.
 - **Management integration** — `faces/create` uses `Persistent` by default;
   listener-accepted faces use `OnDemand`; `faces/list` shows persistency level.
+- **Per-face outbound send queue** — each face now has a bounded `mpsc` channel
+  (128 slots) with a dedicated send task, matching NFD's `GenericLinkService`
+  output queue model.  The pipeline runner enqueues packets via non-blocking
+  `try_send` and is never blocked by face I/O.  Benefits:
+  - *TCP ordering preserved*: per-face sequential sends prevent interleaved TLV
+    framing corruption that `tokio::spawn`-per-send would cause.
+  - *Bounded backpressure*: full queues drop packets (congestion drop semantics —
+    consumers re-express Interests).
+  - *Pipeline decoupled from I/O*: fragmented UDP sends (~35 µs for 7 fragments)
+    no longer block all other packet processing.
+  - *Persistency-aware error handling*: `run_face_sender` retries on permanent
+    faces, cleans up on-demand faces on send error.
 
 #### NDNLPv2 fragmentation and reassembly
 
@@ -370,6 +382,10 @@ conventions (`/localhost/nfd/<module>/<verb>/<ControlParameters>`).
   instead of a single global strategy.
 - **ndn-engine dispatcher nack pipeline** updated to use strategy table LPM for
   per-prefix strategy dispatch on Nack.
+- **`dispatch_action()` and `satisfy()` are now synchronous** — no longer async;
+  use `enqueue_send()` (non-blocking `try_send` to per-face channel) instead of
+  awaiting `face.send_bytes()`.  The nack pipeline's retry-forward and
+  nack-propagation paths also use `enqueue_send`.
 
 ### Fixed
 

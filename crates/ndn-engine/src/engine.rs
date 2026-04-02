@@ -18,6 +18,14 @@ use crate::stages::ErasedStrategy;
 use crate::dispatcher::InboundPacket;
 use crate::Fib;
 
+/// Default outbound send queue capacity per face.
+///
+/// Sized to absorb a burst of Data packets waiting for fragmented UDP sends
+/// without stalling the pipeline.  When full, outbound packets are dropped
+/// (equivalent to a congestion drop at the output queue — consistent with
+/// NFD's `GenericLinkService` model).
+pub const DEFAULT_SEND_QUEUE_CAP: usize = 128;
+
 /// Per-face lifecycle state stored alongside the cancellation token.
 pub struct FaceState {
     pub cancel: CancellationToken,
@@ -25,10 +33,18 @@ pub struct FaceState {
     /// Last packet activity (nanoseconds since Unix epoch).
     /// Updated on recv and send; used for idle-timeout of on-demand faces.
     pub last_activity: AtomicU64,
+    /// Outbound send queue.
+    ///
+    /// The pipeline pushes packets here via `try_send` (non-blocking) and a
+    /// dedicated per-face send task drains the queue, calling `face.send()`
+    /// sequentially.  This decouples pipeline processing from I/O, preserves
+    /// per-face ordering (critical for TCP framing), and provides bounded
+    /// backpressure.
+    pub send_tx: mpsc::Sender<bytes::Bytes>,
 }
 
 impl FaceState {
-    pub fn new(cancel: CancellationToken, persistency: FacePersistency) -> Self {
+    pub fn new(cancel: CancellationToken, persistency: FacePersistency, send_tx: mpsc::Sender<bytes::Bytes>) -> Self {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -37,6 +53,7 @@ impl FaceState {
             cancel,
             persistency,
             last_activity: AtomicU64::new(now),
+            send_tx,
         }
     }
 
@@ -125,6 +142,10 @@ impl ForwarderEngine {
     }
 
     /// Register a face with an explicit persistence level.
+    ///
+    /// Spawns both a recv-reader task (pushes inbound packets to the pipeline
+    /// channel) and a send-writer task (drains the per-face outbound queue
+    /// and calls `face.send()`).
     pub fn add_face_with_persistency<F: Face + 'static>(
         &self,
         face: F,
@@ -132,10 +153,23 @@ impl ForwarderEngine {
         persistency: FacePersistency,
     ) {
         let face_id = face.id();
-        self.inner.face_states.insert(face_id, FaceState::new(cancel.clone(), persistency));
+        let (send_tx, send_rx) = mpsc::channel(DEFAULT_SEND_QUEUE_CAP);
+        self.inner.face_states.insert(face_id, FaceState::new(cancel.clone(), persistency, send_tx));
         self.inner.face_table.insert(face);
         let erased     = self.inner.face_table.get(face_id)
             .expect("face was just inserted");
+
+        // Spawn the outbound send task.
+        {
+            let face = Arc::clone(&erased);
+            let cancel = cancel.clone();
+            let face_states = Arc::clone(&self.inner.face_states);
+            let face_table = Arc::clone(&self.inner.face_table);
+            let fib = Arc::clone(&self.inner.fib);
+            tokio::spawn(run_face_sender(face_id, face, send_rx, cancel, persistency, face_states, face_table, fib));
+        }
+
+        // Spawn the inbound recv task.
         let tx         = self.inner.pipeline_tx.clone();
         let face_table = Arc::clone(&self.inner.face_table);
         let fib        = Arc::clone(&self.inner.fib);
@@ -150,15 +184,26 @@ impl ForwarderEngine {
     /// Use this for faces created by a listener that handles inbound packets
     /// itself via `inject_packet`.  The face is added to the face table so
     /// the dispatcher can send Data/Nack to it, but no `run_face_reader`
-    /// task is spawned.
+    /// task is spawned.  A send-writer task is spawned to drain the outbound
+    /// queue.
     pub fn add_face_send_only<F: Face + 'static>(
         &self,
         face: F,
         cancel: CancellationToken,
     ) {
         let face_id = face.id();
-        self.inner.face_states.insert(face_id, FaceState::new(cancel, FacePersistency::OnDemand));
+        let (send_tx, send_rx) = mpsc::channel(DEFAULT_SEND_QUEUE_CAP);
+        self.inner.face_states.insert(face_id, FaceState::new(cancel.clone(), FacePersistency::OnDemand, send_tx));
         self.inner.face_table.insert(face);
+
+        let erased = self.inner.face_table.get(face_id)
+            .expect("face was just inserted");
+        let face_states = Arc::clone(&self.inner.face_states);
+        let face_table = Arc::clone(&self.inner.face_table);
+        let fib = Arc::clone(&self.inner.fib);
+        tokio::spawn(run_face_sender(
+            face_id, erased, send_rx, cancel, FacePersistency::OnDemand, face_states, face_table, fib,
+        ));
     }
 
     /// Inject a raw packet into the pipeline as if it arrived from `face_id`.
@@ -200,6 +245,57 @@ impl ShutdownHandle {
         while let Some(result) = self.tasks.join_next().await {
             if let Err(e) = result {
                 tracing::warn!("engine task panicked during shutdown: {e}");
+            }
+        }
+    }
+}
+
+/// Per-face outbound send task.
+///
+/// Drains the face's outbound channel and calls `face.send_bytes()` for each
+/// packet, preserving per-face ordering (critical for TCP TLV framing).
+///
+/// On send error:
+/// - **Permanent**: log and continue (the face retries on the next packet).
+/// - **Persistent/OnDemand**: stop the send loop.
+///
+/// On cancellation or channel close: exits cleanly.
+pub(crate) async fn run_face_sender(
+    face_id:     FaceId,
+    face:        Arc<dyn ndn_transport::ErasedFace>,
+    mut rx:      mpsc::Receiver<bytes::Bytes>,
+    cancel:      CancellationToken,
+    persistency: FacePersistency,
+    face_states: Arc<DashMap<FaceId, FaceState>>,
+    face_table:  Arc<FaceTable>,
+    fib:         Arc<crate::Fib>,
+) {
+    loop {
+        let pkt = tokio::select! {
+            _ = cancel.cancelled() => break,
+            pkt = rx.recv() => match pkt {
+                Some(p) => p,
+                None => break, // FaceState dropped, face is being removed.
+            },
+        };
+
+        if let Err(e) = face.send_bytes(pkt).await {
+            match persistency {
+                FacePersistency::Permanent => {
+                    tracing::warn!(face=%face_id, error=%e, "send error on permanent face, continuing");
+                }
+                _ => {
+                    tracing::warn!(face=%face_id, error=%e, "send error, closing face");
+                    // Trigger cleanup for on-demand faces.
+                    if persistency == FacePersistency::OnDemand {
+                        if let Some((_, state)) = face_states.remove(&face_id) {
+                            state.cancel.cancel();
+                        }
+                        fib.remove_face(face_id);
+                        face_table.remove(face_id);
+                    }
+                    break;
+                }
             }
         }
     }
