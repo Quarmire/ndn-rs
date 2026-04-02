@@ -109,9 +109,10 @@ const HEADER_SIZE:    usize = 448;  // 7 × 64-byte cache lines
 fn slot_stride(slot_size: u32) -> usize { 4 + slot_size as usize }
 
 /// Number of spin-loop iterations before falling through to the expensive
-/// syscall path (futex on Linux, pipe on macOS).  256 iterations ≈ a few µs
-/// on modern hardware — long enough to catch back-to-back packets.
-const SPIN_ITERS: u32 = 256;
+/// syscall path (futex on Linux, pipe on macOS).  64 iterations ≈ sub-µs
+/// on modern hardware — enough to catch back-to-back packets without
+/// causing thermal throttling from sustained spinning across multiple faces.
+const SPIN_ITERS: u32 = 64;
 
 fn shm_total_size(capacity: u32, slot_size: u32) -> usize {
     HEADER_SIZE + 2 * capacity as usize * slot_stride(slot_size)
