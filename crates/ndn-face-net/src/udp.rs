@@ -37,11 +37,21 @@ impl UdpFace {
     ///
     /// The socket is **not** connected — `recv_from` is used and datagrams
     /// from other sources are silently discarded.
+    ///
+    /// If `local` is `0.0.0.0:0` (or `[::]:0`), the socket is bound to the
+    /// specific local interface that the OS routes to `peer`.  This avoids
+    /// `EHOSTUNREACH` on macOS when the peer is on a non-default-route
+    /// subnet (e.g. a VM bridge network).
     pub async fn bind(
         local: SocketAddr,
         peer:  SocketAddr,
         id:    FaceId,
     ) -> std::io::Result<Self> {
+        let local = if local.ip().is_unspecified() {
+            resolve_local_addr(peer, local.port())?
+        } else {
+            local
+        };
         let socket = UdpSocket::bind(local).await?;
         Ok(Self { id, socket: Arc::new(socket), peer, mtu: DEFAULT_UDP_MTU, seq: AtomicU64::new(0) })
     }
@@ -103,6 +113,24 @@ impl Face for UdpFace {
         }
         Ok(())
     }
+}
+
+/// Discover the local IP that routes to `peer` by briefly connecting a
+/// throwaway UDP socket.  `connect()` on UDP doesn't send anything — it just
+/// lets the kernel resolve the route and fill in `local_addr()`.
+///
+/// Returns a `SocketAddr` with the routable local IP and the requested `port`
+/// (0 = OS-chosen ephemeral).
+fn resolve_local_addr(peer: SocketAddr, port: u16) -> std::io::Result<SocketAddr> {
+    let probe = std::net::UdpSocket::bind(if peer.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    })?;
+    probe.connect(peer)?;
+    let mut local = probe.local_addr()?;
+    local.set_port(port);
+    Ok(local)
 }
 
 #[cfg(test)]
