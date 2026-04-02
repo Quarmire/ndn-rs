@@ -14,7 +14,7 @@ use ndn_store::{CsEntry, PitToken};
 use ndn_packet::Name;
 use ndn_transport::{FaceError, FaceId, FacePersistency, FaceScope, FaceTable, FaceKind};
 
-use crate::engine::FaceState;
+use crate::engine::{self, FaceState, DEFAULT_SEND_QUEUE_CAP};
 
 use crate::stages::{
     CsInsertStage, CsLookupStage, PitCheckStage, PitMatchStage, StrategyStage, TlvDecodeStage,
@@ -57,9 +57,29 @@ impl PacketDispatcher {
     ) -> mpsc::Sender<InboundPacket> {
         let (tx, rx) = mpsc::channel::<InboundPacket>(self.channel_cap);
 
-        // Spawn a reader task for each registered face.
+        // Spawn reader + sender tasks for each pre-registered face.
         for face_id in self.face_table.face_ids() {
             if let Some(face) = self.face_table.get(face_id) {
+                // Create FaceState with a send queue if not already present.
+                if !self.face_states.contains_key(&face_id) {
+                    let (send_tx, send_rx) = mpsc::channel(DEFAULT_SEND_QUEUE_CAP);
+                    let persistency = FacePersistency::Permanent;
+                    self.face_states.insert(
+                        face_id,
+                        FaceState::new(cancel.child_token(), persistency, send_tx),
+                    );
+                    // Spawn per-face send task.
+                    let send_face   = Arc::clone(&face);
+                    let send_cancel = cancel.clone();
+                    let fs          = Arc::clone(&self.face_states);
+                    let ft          = Arc::clone(&self.face_table);
+                    let fib         = Arc::clone(&self.strategy.fib);
+                    tasks.spawn(engine::run_face_sender(
+                        face_id, send_face, send_rx, send_cancel,
+                        persistency, fs, ft, fib,
+                    ));
+                }
+
                 let tx2          = tx.clone();
                 let cancel       = cancel.clone();
                 let face_table   = Arc::clone(&self.face_table);
@@ -144,7 +164,7 @@ impl PacketDispatcher {
             Action::Continue(ctx) => ctx,
             Action::Drop(DropReason::FragmentCollect) => { trace!(face=%pkt.face_id, "fragment collected, awaiting reassembly"); return; }
             Action::Drop(r)       => { debug!(face=%pkt.face_id, reason=?r, "drop at decode"); return; }
-            other                 => { self.dispatch_action(other).await; return; }
+            other                 => { self.dispatch_action(other); return; }
         };
 
         match &ctx.packet {
@@ -168,21 +188,21 @@ impl PacketDispatcher {
         // 2. CS lookup.
         let ctx = match self.cs_lookup.process(ctx).await {
             Action::Continue(ctx) => ctx,
-            Action::Satisfy(ctx)  => { self.satisfy(ctx).await; return; }
+            Action::Satisfy(ctx)  => { self.satisfy(ctx); return; }
             Action::Drop(r)       => { debug!(reason=?r, "drop at cs lookup"); return; }
-            other                 => { self.dispatch_action(other).await; return; }
+            other                 => { self.dispatch_action(other); return; }
         };
 
         // 3. PIT check.
         let ctx = match self.pit_check.process(ctx) {
             Action::Continue(ctx) => ctx,
             Action::Drop(r)       => { debug!(reason=?r, "drop at pit check"); return; }
-            other                 => { self.dispatch_action(other).await; return; }
+            other                 => { self.dispatch_action(other); return; }
         };
 
         // 4. Strategy.
         let action = self.strategy.process(ctx).await;
-        self.dispatch_action(action).await;
+        self.dispatch_action(action);
     }
 
     /// Nack pipeline: look up PIT out-record, consult strategy, act on result.
@@ -244,14 +264,9 @@ impl PacketDispatcher {
         match action {
             ForwardingAction::Forward(faces) => {
                 // Strategy chose alternate nexthops — forward the original Interest.
+                let interest_wire = nack.interest.raw().clone();
                 for face_id in &faces {
-                    if let Some(face) = self.face_table.get(*face_id) {
-                        // Re-send the original Interest (the one inside the Nack).
-                        if let Err(e) = face.send_bytes(nack.interest.raw().clone()).await {
-                            warn!(face=%face_id, error=%e, "nack retry forward failed");
-                            self.close_on_demand_face(*face_id);
-                        }
-                    }
+                    self.enqueue_send(*face_id, interest_wire.clone());
                 }
             }
             ForwardingAction::Nack(_reason) => {
@@ -261,13 +276,8 @@ impl PacketDispatcher {
                     let packet_reason = nack.reason;
                     for face_id_raw in entry.in_record_faces() {
                         let face_id = FaceId(face_id_raw);
-                        if let Some(face) = self.face_table.get(face_id) {
-                            let nack_bytes = encode_nack(packet_reason, &interest_wire);
-                            if let Err(e) = face.send_bytes(nack_bytes).await {
-                                warn!(face=%face_id, error=%e, "nack propagation failed");
-                                self.close_on_demand_face(face_id);
-                            }
-                        }
+                        let nack_bytes = encode_nack(packet_reason, &interest_wire);
+                        self.enqueue_send(face_id, nack_bytes);
                     }
                 }
             }
@@ -282,45 +292,58 @@ impl PacketDispatcher {
         let ctx = match self.pit_match.process(ctx) {
             Action::Continue(ctx) => ctx,
             Action::Drop(r)       => { debug!(reason=?r, "unsolicited data"); return; }
-            other                 => { self.dispatch_action(other).await; return; }
+            other                 => { self.dispatch_action(other); return; }
         };
 
         // 3. CS insert.
         let action = self.cs_insert.process(ctx).await;
-        self.dispatch_action(action).await;
+        self.dispatch_action(action);
     }
 
-    async fn dispatch_action(&self, action: Action) {
+    /// Push a packet to a face's outbound send queue.
+    ///
+    /// Uses `try_send` so the pipeline is never blocked by a slow face.
+    /// If the queue is full, the packet is dropped — this is equivalent to an
+    /// output-queue congestion drop and is the correct NDN behaviour (the
+    /// consumer will re-express the Interest).
+    fn enqueue_send(&self, face_id: FaceId, data: Bytes) {
+        if let Some(state) = self.face_states.get(&face_id) {
+            match state.send_tx.try_send(data) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    debug!(face=%face_id, "send queue full, dropping packet");
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    trace!(face=%face_id, "send queue closed");
+                }
+            }
+        }
+    }
+
+    fn dispatch_action(&self, action: Action) {
         match action {
             Action::Send(ctx, faces) => {
                 trace!(face=%ctx.face_id, name=?ctx.name, out_faces=?faces, raw_len=ctx.raw_bytes.len(), "dispatch: Send");
                 let is_localhost = ctx.name.as_ref().is_some_and(|n| is_localhost_name(n));
                 for face_id in &faces {
-                    if let Some(face) = self.face_table.get(*face_id) {
-                        if is_localhost && face.kind().scope() == FaceScope::NonLocal {
-                            trace!(face=%face_id, "dispatch: /localhost blocked on non-local face");
-                            continue;
+                    if is_localhost {
+                        if let Some(face) = self.face_table.get(*face_id) {
+                            if face.kind().scope() == FaceScope::NonLocal {
+                                trace!(face=%face_id, "dispatch: /localhost blocked on non-local face");
+                                continue;
+                            }
                         }
-                        if let Err(e) = face.send_bytes(ctx.raw_bytes.clone()).await {
-                            warn!(face=%face_id, error=%e, "forward send failed");
-                            self.close_on_demand_face(*face_id);
-                        } else {
-                            trace!(face=%face_id, len=ctx.raw_bytes.len(), "dispatch: sent ok");
-                        }
-                    } else {
-                        warn!(face=%face_id, "dispatch: face not found in table");
                     }
+                    self.enqueue_send(*face_id, ctx.raw_bytes.clone());
                 }
             }
             Action::Satisfy(ctx) => {
                 trace!(face=%ctx.face_id, name=?ctx.name, out_faces=?ctx.out_faces, cs_hit=ctx.cs_hit, "dispatch: Satisfy");
-                self.satisfy(ctx).await;
+                self.satisfy(ctx);
             }
             Action::Drop(r)      => debug!(reason=?r, "packet dropped"),
             Action::Nack(ctx, reason) => {
                 trace!(face=%ctx.face_id, name=?ctx.name, reason=?reason, "dispatch: Nack");
-                // Encode a Nack wrapping the original Interest and send it
-                // back to the face that originated the Interest.
                 let packet_reason = match reason {
                     NackReason::NoRoute    => ndn_packet::NackReason::NoRoute,
                     NackReason::Duplicate  => ndn_packet::NackReason::Duplicate,
@@ -328,33 +351,14 @@ impl PacketDispatcher {
                     NackReason::NotYet     => ndn_packet::NackReason::NotYet,
                 };
                 let nack_bytes = encode_nack(packet_reason, &ctx.raw_bytes);
-                if let Some(face) = self.face_table.get(ctx.face_id) {
-                    if let Err(e) = face.send_bytes(nack_bytes).await {
-                        warn!(face=%ctx.face_id, error=%e, "nack send failed");
-                        self.close_on_demand_face(ctx.face_id);
-                    }
-                }
+                self.enqueue_send(ctx.face_id, nack_bytes);
             }
             Action::Continue(_)  => {} // fell off end of pipeline
         }
     }
 
-    /// Cancel an on-demand face after a send error.
-    ///
-    /// Persistent and permanent faces are kept alive (NFD semantics).
-    /// Cancelling the face's token triggers `run_face_reader` cleanup which
-    /// removes FIB routes and the face table entry.
-    fn close_on_demand_face(&self, face_id: FaceId) {
-        if let Some(state) = self.face_states.get(&face_id) {
-            if state.persistency == FacePersistency::OnDemand {
-                debug!(face=%face_id, "closing on-demand face after send error");
-                state.cancel.cancel();
-            }
-        }
-    }
-
     /// Fan Data (or a cached CS entry) back to all in-record faces.
-    async fn satisfy(&self, ctx: PacketContext) {
+    fn satisfy(&self, ctx: PacketContext) {
         let data_bytes = if ctx.cs_hit {
             ctx.tags
                 .get::<CsEntry>()
@@ -366,16 +370,15 @@ impl PacketDispatcher {
 
         let is_localhost = ctx.name.as_ref().is_some_and(|n| is_localhost_name(n));
         for face_id in &ctx.out_faces {
-            if let Some(face) = self.face_table.get(*face_id) {
-                if is_localhost && face.kind().scope() == FaceScope::NonLocal {
-                    trace!(face=%face_id, "satisfy: /localhost blocked on non-local face");
-                    continue;
-                }
-                if let Err(e) = face.send_bytes(data_bytes.clone()).await {
-                    warn!(face=%face_id, error=%e, "satisfy send failed");
-                    self.close_on_demand_face(*face_id);
+            if is_localhost {
+                if let Some(face) = self.face_table.get(*face_id) {
+                    if face.kind().scope() == FaceScope::NonLocal {
+                        trace!(face=%face_id, "satisfy: /localhost blocked on non-local face");
+                        continue;
+                    }
                 }
             }
+            self.enqueue_send(*face_id, data_bytes.clone());
         }
     }
 }
