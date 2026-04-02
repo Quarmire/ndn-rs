@@ -85,18 +85,20 @@ pub trait CsAdmissionPolicy: Send + Sync + 'static {
     fn should_admit(&self, data: &ndn_packet::Data) -> bool;
 }
 
-/// Default policy: admit all Data packets that have a non-zero FreshnessPeriod,
-/// or that lack FreshnessPeriod (treated as "no freshness constraint" by the spec).
+/// Default policy: admit only Data packets that have a positive FreshnessPeriod.
 ///
-/// Data with FreshnessPeriod=0 is immediately stale and typically not worth caching.
+/// Data without FreshnessPeriod or with FreshnessPeriod=0 is immediately stale
+/// and not worth caching — it would fill the CS with entries that can never
+/// satisfy `MustBeFresh` Interests, causing eviction churn under high throughput.
+/// This matches NFD's default `admit` policy behavior.
 pub struct DefaultAdmissionPolicy;
 
 impl CsAdmissionPolicy for DefaultAdmissionPolicy {
     fn should_admit(&self, data: &ndn_packet::Data) -> bool {
-        match data.meta_info().and_then(|m| m.freshness_period) {
-            Some(d) if d.is_zero() => false,
-            _ => true,
-        }
+        matches!(
+            data.meta_info().and_then(|m| m.freshness_period),
+            Some(d) if !d.is_zero()
+        )
     }
 }
 
