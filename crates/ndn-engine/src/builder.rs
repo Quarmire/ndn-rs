@@ -26,6 +26,15 @@ pub struct EngineConfig {
     pub pipeline_channel_cap: usize,
     /// Content store byte capacity. Zero disables caching.
     pub cs_capacity_bytes: usize,
+    /// Number of parallel pipeline processing threads.
+    ///
+    /// - `0` (default): auto-detect from available CPU parallelism.
+    /// - `1`: single-threaded — all pipeline processing runs inline in the
+    ///   pipeline runner task (lowest latency, no task spawn overhead).
+    /// - `N > 1`: spawn per-packet tokio tasks so up to N pipeline passes
+    ///   run in parallel across cores (highest throughput with fragmented
+    ///   UDP traffic).
+    pub pipeline_threads: usize,
 }
 
 impl Default for EngineConfig {
@@ -33,6 +42,7 @@ impl Default for EngineConfig {
         Self {
             pipeline_channel_cap: 4096,
             cs_capacity_bytes:    64 * 1024 * 1024, // 64 MB
+            pipeline_threads:     0,
         }
     }
 }
@@ -124,7 +134,8 @@ impl EngineBuilder {
                 cs: Arc::clone(&cs),
                 admission: Arc::new(ndn_store::DefaultAdmissionPolicy),
             },
-            channel_cap: self.config.pipeline_channel_cap,
+            channel_cap:      self.config.pipeline_channel_cap,
+            pipeline_threads: resolve_pipeline_threads(self.config.pipeline_threads),
         };
 
         let pipeline_tx = dispatcher.spawn(cancel.clone(), &mut tasks);
@@ -160,6 +171,17 @@ impl EngineBuilder {
         let engine = ForwarderEngine { inner };
         let handle = ShutdownHandle { cancel, tasks };
         Ok((engine, handle))
+    }
+}
+
+/// Resolve `pipeline_threads` config: 0 → auto-detect, otherwise clamp to ≥ 1.
+fn resolve_pipeline_threads(configured: usize) -> usize {
+    if configured == 0 {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+    } else {
+        configured
     }
 }
 

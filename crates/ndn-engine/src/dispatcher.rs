@@ -30,18 +30,30 @@ pub(crate) struct InboundPacket {
 /// The packet dispatcher.
 ///
 /// Spawns one Tokio task per face that reads packets from that face and sends
-/// them to a shared `mpsc` channel. A single pipeline runner drains the channel
-/// and processes each packet through the stage sequence.
+/// them to a shared `mpsc` channel.  A single pipeline runner drains the
+/// channel, performs the fast-path fragment sieve, and spawns per-packet tasks
+/// for full pipeline processing across multiple cores.
+///
+/// The fragment sieve stays single-threaded (cheap DashMap entry, ~2 µs) while
+/// the expensive pipeline stages (decode, CS, PIT, strategy) run in parallel.
+/// All shared tables (PIT, FIB, CS, face table) are concurrent-safe, so
+/// parallel pipeline tasks are correct without additional synchronisation.
 pub struct PacketDispatcher {
-    pub face_table:   Arc<FaceTable>,
-    pub face_states:  Arc<dashmap::DashMap<FaceId, FaceState>>,
-    pub decode:       TlvDecodeStage,
-    pub cs_lookup:    CsLookupStage,
-    pub pit_check:    PitCheckStage,
-    pub strategy:     StrategyStage,
-    pub pit_match:    PitMatchStage,
-    pub cs_insert:    CsInsertStage,
-    pub channel_cap:  usize,
+    pub face_table:       Arc<FaceTable>,
+    pub face_states:      Arc<dashmap::DashMap<FaceId, FaceState>>,
+    pub decode:           TlvDecodeStage,
+    pub cs_lookup:        CsLookupStage,
+    pub pit_check:        PitCheckStage,
+    pub strategy:         StrategyStage,
+    pub pit_match:        PitMatchStage,
+    pub cs_insert:        CsInsertStage,
+    pub channel_cap:      usize,
+    /// Resolved pipeline thread count (always ≥ 1).
+    ///
+    /// - `1`: single-threaded — `process_packet` runs inline.
+    /// - `N > 1`: `process_packet` is spawned as a tokio task so up to N
+    ///   pipeline passes run in parallel.
+    pub pipeline_threads: usize,
 }
 
 impl PacketDispatcher {
@@ -56,24 +68,25 @@ impl PacketDispatcher {
         tasks:  &mut JoinSet<()>,
     ) -> mpsc::Sender<InboundPacket> {
         let (tx, rx) = mpsc::channel::<InboundPacket>(self.channel_cap);
+        let dispatcher = Arc::new(self);
 
         // Spawn reader + sender tasks for each pre-registered face.
-        for face_id in self.face_table.face_ids() {
-            if let Some(face) = self.face_table.get(face_id) {
+        for face_id in dispatcher.face_table.face_ids() {
+            if let Some(face) = dispatcher.face_table.get(face_id) {
                 // Create FaceState with a send queue if not already present.
-                if !self.face_states.contains_key(&face_id) {
+                if !dispatcher.face_states.contains_key(&face_id) {
                     let (send_tx, send_rx) = mpsc::channel(DEFAULT_SEND_QUEUE_CAP);
                     let persistency = FacePersistency::Permanent;
-                    self.face_states.insert(
+                    dispatcher.face_states.insert(
                         face_id,
                         FaceState::new(cancel.child_token(), persistency, send_tx),
                     );
                     // Spawn per-face send task.
                     let send_face   = Arc::clone(&face);
                     let send_cancel = cancel.clone();
-                    let fs          = Arc::clone(&self.face_states);
-                    let ft          = Arc::clone(&self.face_table);
-                    let fib         = Arc::clone(&self.strategy.fib);
+                    let fs          = Arc::clone(&dispatcher.face_states);
+                    let ft          = Arc::clone(&dispatcher.face_table);
+                    let fib         = Arc::clone(&dispatcher.strategy.fib);
                     tasks.spawn(engine::run_face_sender(
                         face_id, send_face, send_rx, send_cancel,
                         persistency, fs, ft, fib,
@@ -82,9 +95,9 @@ impl PacketDispatcher {
 
                 let tx2          = tx.clone();
                 let cancel       = cancel.clone();
-                let face_table   = Arc::clone(&self.face_table);
-                let fib          = Arc::clone(&self.strategy.fib);
-                let face_states  = Arc::clone(&self.face_states);
+                let face_table   = Arc::clone(&dispatcher.face_table);
+                let fib          = Arc::clone(&dispatcher.strategy.fib);
+                let face_states  = Arc::clone(&dispatcher.face_states);
                 tasks.spawn(async move {
                     run_face_reader(face_id, face, tx2, cancel, face_table, fib, face_states).await;
                 });
@@ -92,9 +105,10 @@ impl PacketDispatcher {
         }
 
         // Pipeline runner.
+        let d = Arc::clone(&dispatcher);
         let cancel2 = cancel.clone();
         tasks.spawn(async move {
-            self.run_pipeline(rx, cancel2).await;
+            d.run_pipeline(rx, cancel2).await;
         });
 
         tx
@@ -108,7 +122,7 @@ impl PacketDispatcher {
     const BATCH_SIZE: usize = 64;
 
     async fn run_pipeline(
-        &self,
+        self: &Arc<Self>,
         mut rx: mpsc::Receiver<InboundPacket>,
         cancel: CancellationToken,
     ) {
@@ -135,6 +149,11 @@ impl PacketDispatcher {
             // Fast-path fragment sieve: collect fragments without creating
             // a full PacketContext.  Only reassembled packets and non-fragment
             // packets proceed to the full pipeline.
+            //
+            // The sieve always runs inline (cheap, ~2 µs per fragment).
+            // Complete packets are either processed inline (single-threaded
+            // mode) or spawned as tokio tasks (parallel mode).
+            let parallel = self.pipeline_threads > 1;
             for pkt in batch.drain(..) {
                 let InboundPacket { raw, face_id, arrival } = pkt;
                 match self.decode.try_collect_fragment(face_id, raw) {
@@ -143,12 +162,22 @@ impl PacketDispatcher {
                         trace!(face=%face_id, "fragment collected, awaiting reassembly");
                     }
                     Ok(Some(reassembled)) => {
-                        // Reassembly complete — process the full packet.
-                        self.process_packet(InboundPacket { raw: reassembled, face_id, arrival }).await;
+                        let pkt = InboundPacket { raw: reassembled, face_id, arrival };
+                        if parallel {
+                            let d = Arc::clone(self);
+                            tokio::spawn(async move { d.process_packet(pkt).await });
+                        } else {
+                            self.process_packet(pkt).await;
+                        }
                     }
                     Err(raw) => {
-                        // Not a fragment — run through the full pipeline.
-                        self.process_packet(InboundPacket { raw, face_id, arrival }).await;
+                        let pkt = InboundPacket { raw, face_id, arrival };
+                        if parallel {
+                            let d = Arc::clone(self);
+                            tokio::spawn(async move { d.process_packet(pkt).await });
+                        } else {
+                            self.process_packet(pkt).await;
+                        }
                     }
                 }
             }

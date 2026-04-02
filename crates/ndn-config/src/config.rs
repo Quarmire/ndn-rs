@@ -73,6 +73,15 @@ pub struct EngineConfig {
     pub cs_capacity_mb: usize,
     /// Pipeline inter-task channel capacity (backpressure).
     pub pipeline_channel_cap: usize,
+    /// Number of parallel pipeline processing threads.
+    ///
+    /// - `0` (default): auto-detect from available CPU parallelism.
+    /// - `1`: single-threaded — all pipeline processing runs inline in the
+    ///   pipeline runner task (lowest latency, no task spawn overhead).
+    /// - `N`: spawn up to N concurrent tokio tasks per batch for pipeline
+    ///   processing (highest throughput on multi-core systems).
+    #[serde(default)]
+    pub pipeline_threads: usize,
 }
 
 impl Default for EngineConfig {
@@ -80,6 +89,7 @@ impl Default for EngineConfig {
         Self {
             cs_capacity_mb:       64,
             pipeline_channel_cap: 4096,
+            pipeline_threads:     0,
         }
     }
 }

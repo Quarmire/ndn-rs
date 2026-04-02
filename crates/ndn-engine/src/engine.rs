@@ -20,11 +20,11 @@ use crate::Fib;
 
 /// Default outbound send queue capacity per face.
 ///
-/// Sized to absorb a burst of Data packets waiting for fragmented UDP sends
-/// without stalling the pipeline.  When full, outbound packets are dropped
-/// (equivalent to a congestion drop at the output queue — consistent with
-/// NFD's `GenericLinkService` model).
-pub const DEFAULT_SEND_QUEUE_CAP: usize = 128;
+/// Must be large enough to absorb bursts from parallel pipeline tasks that
+/// all dispatch to the same face near-simultaneously.  When full, outbound
+/// packets are dropped (equivalent to a congestion drop at the output queue —
+/// consistent with NFD's `GenericLinkService` model).
+pub const DEFAULT_SEND_QUEUE_CAP: usize = 512;
 
 /// Per-face lifecycle state stored alongside the cancellation token.
 pub struct FaceState {
