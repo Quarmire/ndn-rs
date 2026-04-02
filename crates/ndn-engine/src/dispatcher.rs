@@ -210,6 +210,7 @@ impl PacketDispatcher {
                         // Re-send the original Interest (the one inside the Nack).
                         if let Err(e) = face.send_bytes(nack.interest.raw().clone()).await {
                             warn!(face=%face_id, error=%e, "nack retry forward failed");
+                            self.close_on_demand_face(*face_id);
                         }
                     }
                 }
@@ -225,6 +226,7 @@ impl PacketDispatcher {
                             let nack_bytes = encode_nack(packet_reason, &interest_wire);
                             if let Err(e) = face.send_bytes(nack_bytes).await {
                                 warn!(face=%face_id, error=%e, "nack propagation failed");
+                                self.close_on_demand_face(face_id);
                             }
                         }
                     }
@@ -262,6 +264,7 @@ impl PacketDispatcher {
                         }
                         if let Err(e) = face.send_bytes(ctx.raw_bytes.clone()).await {
                             warn!(face=%face_id, error=%e, "forward send failed");
+                            self.close_on_demand_face(*face_id);
                         } else {
                             trace!(face=%face_id, len=ctx.raw_bytes.len(), "dispatch: sent ok");
                         }
@@ -289,10 +292,25 @@ impl PacketDispatcher {
                 if let Some(face) = self.face_table.get(ctx.face_id) {
                     if let Err(e) = face.send_bytes(nack_bytes).await {
                         warn!(face=%ctx.face_id, error=%e, "nack send failed");
+                        self.close_on_demand_face(ctx.face_id);
                     }
                 }
             }
             Action::Continue(_)  => {} // fell off end of pipeline
+        }
+    }
+
+    /// Cancel an on-demand face after a send error.
+    ///
+    /// Persistent and permanent faces are kept alive (NFD semantics).
+    /// Cancelling the face's token triggers `run_face_reader` cleanup which
+    /// removes FIB routes and the face table entry.
+    fn close_on_demand_face(&self, face_id: FaceId) {
+        if let Some(state) = self.face_states.get(&face_id) {
+            if state.persistency == FacePersistency::OnDemand {
+                debug!(face=%face_id, "closing on-demand face after send error");
+                state.cancel.cancel();
+            }
         }
     }
 
@@ -316,6 +334,7 @@ impl PacketDispatcher {
                 }
                 if let Err(e) = face.send_bytes(data_bytes.clone()).await {
                     warn!(face=%face_id, error=%e, "satisfy send failed");
+                    self.close_on_demand_face(*face_id);
                 }
             }
         }
