@@ -12,6 +12,9 @@ pub enum DropReason {
     RateLimited,
     HopLimitExceeded,
     ScopeViolation,
+    /// Incomplete fragment reassembly — waiting for more fragments.
+    /// Not an error; suppresses noisy logging.
+    FragmentCollect,
     Other,
 }
 
@@ -60,6 +63,7 @@ mod tests {
             DropReason::RateLimited,
             DropReason::HopLimitExceeded,
             DropReason::ScopeViolation,
+            DropReason::FragmentCollect,
             DropReason::Other,
         ];
         for (i, a) in reasons.iter().enumerate() {
