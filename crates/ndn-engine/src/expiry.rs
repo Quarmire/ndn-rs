@@ -5,7 +5,7 @@ use dashmap::DashMap;
 use tokio_util::sync::CancellationToken;
 
 use ndn_store::Pit;
-use ndn_transport::{FaceId, FacePersistency, FaceTable};
+use ndn_transport::{FaceId, FaceKind, FacePersistency, FaceTable};
 
 use crate::engine::FaceState;
 use crate::Fib;
@@ -56,9 +56,18 @@ pub async fn run_idle_face_task(
                     if entry.persistency != FacePersistency::OnDemand {
                         continue;
                     }
+                    // Local faces (App, SHM, Internal) use cancel-token lifecycle,
+                    // not idle timeout.  Their last_activity is never updated in
+                    // run_face_reader, so they would be falsely reaped here.
+                    let face_id = *entry.key();
+                    if let Some(face) = face_table.get(face_id) {
+                        if matches!(face.kind(), FaceKind::App | FaceKind::Shm | FaceKind::Internal) {
+                            continue;
+                        }
+                    }
                     let last = entry.last_activity.load(std::sync::atomic::Ordering::Relaxed);
                     if now.saturating_sub(last) > IDLE_TIMEOUT_NS {
-                        expired.push(*entry.key());
+                        expired.push(face_id);
                     }
                 }
 
