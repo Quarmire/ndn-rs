@@ -79,7 +79,7 @@ impl Default for EngineConfig {
     fn default() -> Self {
         Self {
             cs_capacity_mb:       64,
-            pipeline_channel_cap: 1024,
+            pipeline_channel_cap: 4096,
         }
     }
 }

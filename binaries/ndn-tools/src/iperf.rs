@@ -395,9 +395,14 @@ async fn run_client(
     }
 
     let recv_timeout = Duration::from_millis(lifetime_ms + 1000);
+    // After the test deadline, use a short drain timeout to collect
+    // any Data already in flight without waiting for the full lifetime.
+    let drain_timeout = Duration::from_millis(500);
+    let mut past_deadline = false;
 
     let sent = loop {
-        match tokio::time::timeout(recv_timeout, client.recv()).await {
+        let timeout = if past_deadline { drain_timeout } else { recv_timeout };
+        match tokio::time::timeout(timeout, client.recv()).await {
             Ok(Some(data_bytes)) => {
                 let data_len = data_bytes.len() as u64;
                 total_bytes += data_len;
@@ -414,13 +419,18 @@ async fn run_client(
                 counters.record(data_len);
 
                 // Send next Interest if still within test duration.
-                if Instant::now() < deadline {
-                    let name = prefix.clone().append(format!("{next_seq}"));
-                    let wire = InterestBuilder::new(name).lifetime(lifetime).build();
-                    timestamps.insert(next_seq, Instant::now());
-                    client.send(wire).await?;
-                    next_seq += 1;
-                } else if timestamps.is_empty() {
+                if !past_deadline {
+                    if Instant::now() < deadline {
+                        let name = prefix.clone().append(format!("{next_seq}"));
+                        let wire = InterestBuilder::new(name).lifetime(lifetime).build();
+                        timestamps.insert(next_seq, Instant::now());
+                        client.send(wire).await?;
+                        next_seq += 1;
+                    } else {
+                        past_deadline = true;
+                    }
+                }
+                if past_deadline && timestamps.is_empty() {
                     break next_seq;
                 }
             }
@@ -429,15 +439,15 @@ async fn run_client(
                 break next_seq;
             }
             Err(_) => {
+                if past_deadline || Instant::now() >= deadline {
+                    break next_seq;
+                }
                 timeouts += 1;
                 // Expire stale timestamps.
                 let now = Instant::now();
                 timestamps.retain(|_, t0| {
                     now.duration_since(*t0) < recv_timeout
                 });
-                if now >= deadline {
-                    break next_seq;
-                }
             }
         }
     };

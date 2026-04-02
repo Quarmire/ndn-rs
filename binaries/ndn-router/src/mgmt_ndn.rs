@@ -40,6 +40,35 @@ use ndn_config::{
     nfd_command::{module, verb, parse_command_name},
 };
 
+// ─── Socket helpers ──────────────────────────────────────────────────────────
+
+/// Best-effort attempt to increase the socket receive buffer size.
+///
+/// Uses `SO_RCVBUF` via `libc::setsockopt`.  On Linux the effective maximum is
+/// `net.core.rmem_max` (doubled by the kernel); on macOS it is `kern.ipc.maxsockbuf`.
+/// Failure is logged but not fatal — the listener will still work, just with a
+/// smaller buffer that may drop fragments under heavy load.
+fn set_recv_buf_size(socket: &tokio::net::UdpSocket, size: usize) {
+    use std::os::fd::AsRawFd;
+    let fd = socket.as_raw_fd();
+    let size = size as libc::c_int;
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &size as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if ret != 0 {
+        tracing::warn!(
+            error=%std::io::Error::last_os_error(),
+            "udp-listener: failed to set SO_RCVBUF (continuing with default)"
+        );
+    }
+}
+
 // ─── Management prefix ────────────────────────────────────────────────────────
 
 /// Build the `/localhost/nfd` name prefix registered in the FIB.
@@ -115,7 +144,14 @@ pub async fn run_udp_listener(
     cancel:    CancellationToken,
 ) {
     let socket = match tokio::net::UdpSocket::bind(bind_addr).await {
-        Ok(s) => Arc::new(s),
+        Ok(s) => {
+            // Increase the receive buffer to handle fragment bursts.  At high
+            // window sizes a single peer can send hundreds of fragments (7 per
+            // Data) before the pipeline drains them.  The default OS buffer
+            // (~212 KB on Linux) is too small and causes silent drops.
+            set_recv_buf_size(&s, 4 * 1024 * 1024);
+            Arc::new(s)
+        }
         Err(e) => {
             tracing::error!(addr=%bind_addr, error=%e, "udp-listener: bind failed");
             return;
