@@ -7,7 +7,7 @@ use tracing::trace;
 use ndn_packet::{Data, Interest, Nack, Name, tlv_type};
 use ndn_packet::encode::ensure_nonce;
 use ndn_packet::fragment::ReassemblyBuffer;
-use ndn_packet::lp::{LpPacket, is_lp_packet};
+use ndn_packet::lp::{LpPacket, extract_fragment, is_lp_packet};
 use ndn_pipeline::{Action, DropReason, PacketContext, DecodedPacket};
 use ndn_transport::{FaceId, FaceScope, FaceTable};
 
@@ -55,27 +55,17 @@ impl TlvDecodeStage {
     ///   Nack); caller should process through the full pipeline. The original
     ///   bytes are returned back.
     pub fn try_collect_fragment(&self, face_id: FaceId, raw: Bytes) -> Result<Option<Bytes>, Bytes> {
-        if !is_lp_packet(&raw) {
-            return Err(raw);
-        }
-        // Parse just enough to check fragmentation.
-        let lp = match LpPacket::decode(raw.clone()) {
-            Ok(lp) => lp,
-            Err(_) => return Err(raw),
+        // Lightweight parse: only extract fragmentation fields, no Bytes
+        // allocation, no Nack/CongestionMark parsing.
+        let hdr = match extract_fragment(&raw) {
+            Some(h) => h,
+            None => return Err(raw), // Not a multi-fragment LpPacket.
         };
-        if !lp.is_fragmented() {
-            return Err(raw);
-        }
-        // Feed to reassembly buffer.
+        let fragment = raw.slice(hdr.frag_start..hdr.frag_end);
         let mut rb = self.reassembly
             .entry(face_id)
             .or_insert_with(ReassemblyBuffer::default);
-        Ok(rb.process(
-            lp.sequence.unwrap_or(0),
-            lp.frag_index.unwrap_or(0),
-            lp.frag_count.unwrap_or(1),
-            lp.fragment,
-        ))
+        Ok(rb.process(hdr.sequence, hdr.frag_index, hdr.frag_count, fragment))
     }
 
     pub fn process(&self, mut ctx: PacketContext) -> Action {
