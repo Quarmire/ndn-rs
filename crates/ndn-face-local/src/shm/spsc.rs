@@ -4,11 +4,10 @@
 //! ring buffers — one for each direction.  Wakeup uses a platform-selected
 //! primitive:
 //!
-//! - **Linux**: futex via the `atomic-wait` crate.  The parked `AtomicU32` in
-//!   SHM IS the synchronisation primitive — no extra file descriptors needed.
-//!   `atomic_wait::wait(parked, 1)` blocks until `wake_one` is called by the
-//!   producer.  The futex syscall keys on the physical page offset, so it
-//!   works cross-process over POSIX SHM.
+//! - **Linux**: direct futex syscall (without `FUTEX_PRIVATE_FLAG`).  The
+//!   parked `AtomicU32` in SHM IS the synchronisation primitive — no extra
+//!   file descriptors needed.  The non-private futex keys on the physical
+//!   page offset, so it works cross-process over POSIX SHM.
 //!
 //! - **Other Unix (macOS, etc.)**: named FIFO (pipe) pair.  The engine creates
 //!   two FIFOs (`/tmp/.ndn-{name}.a2e.pipe` and `.e2a.pipe`); both sides open
@@ -43,6 +42,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use bytes::Bytes;
+
+use tracing::trace;
 
 use ndn_transport::{Face, FaceError, FaceId, FaceKind};
 
@@ -155,7 +156,10 @@ impl ShmRegion {
             let fd = libc::shm_open(
                 cname.as_ptr(),
                 libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
-                (libc::S_IRUSR | libc::S_IWUSR) as libc::mode_t as libc::c_uint,
+                // 0o666: readable/writable by all users so an unprivileged app
+                // can connect to a router running as root.  The SHM name is
+                // unique per app instance, limiting exposure.
+                0o666 as libc::mode_t as libc::c_uint,
             );
             if fd == -1 { return Err(ShmError::Io(std::io::Error::last_os_error())); }
 
@@ -482,6 +486,7 @@ impl Face for SpscFace {
         };
         loop {
             if let Some(pkt) = self.try_pop_a2e() {
+                trace!(face=%self.id, len=pkt.len(), "shm: recv");
                 return Ok(pkt);
             }
             // Brief spin before parking — avoids expensive syscall (pipe/futex)
@@ -535,6 +540,7 @@ impl Face for SpscFace {
         let parked = unsafe {
             &*AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_E2A_PARKED) as *mut u32)
         };
+        trace!(face=%self.id, len=pkt.len(), "shm: send");
         // Yield until there is space in the e2a ring (backpressure).
         loop {
             if self.try_push_e2a(&pkt) { break; }
@@ -654,6 +660,7 @@ impl SpscHandle {
         if pkt.len() > self.slot_size as usize {
             return Err(ShmError::PacketTooLarge);
         }
+        trace!(len=pkt.len(), "shm-handle: send");
         // SAFETY: parked flag within mapped SHM region.
         let parked = unsafe {
             &*AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_A2E_PARKED) as *mut u32)
@@ -683,6 +690,7 @@ impl SpscHandle {
         };
         loop {
             if let Some(pkt) = self.try_pop_e2a() {
+                trace!(len=pkt.len(), "shm-handle: recv");
                 return Some(pkt);
             }
             // Brief spin before parking — avoids expensive syscall (pipe/futex)
