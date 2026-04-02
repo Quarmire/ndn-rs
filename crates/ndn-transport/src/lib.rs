@@ -4,6 +4,7 @@ pub mod face_pair_table;
 pub mod face_event;
 pub mod raw_packet;
 pub mod tlv_codec;
+pub mod congestion;
 
 pub use face::{Face, FaceError, FaceId, FaceKind, FacePersistency, FaceScope};
 pub use face_table::{FaceTable, ErasedFace, FaceInfo};
@@ -11,3 +12,4 @@ pub use face_pair_table::FacePairTable;
 pub use face_event::FaceEvent;
 pub use raw_packet::RawPacket;
 pub use tlv_codec::TlvCodec;
+pub use congestion::CongestionController;
