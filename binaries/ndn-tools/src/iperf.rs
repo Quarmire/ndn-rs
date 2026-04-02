@@ -395,6 +395,15 @@ async fn run_client(
     eprintln!("  duration={duration_secs}s  window={initial_window}  cc={cc_name}  lifetime={lifetime_ms}ms");
     eprintln!("  testing...");
 
+    // Unique flow ID per run to avoid PIT collisions with previous runs.
+    // Combines PID with sub-second timestamp for uniqueness across runs.
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
+    let flow_id = ((std::process::id() as u64) << 32) | ts as u64;
+    let flow_prefix = prefix.clone().append(format!("{flow_id:016x}"));
+
     let counters = Arc::new(IntervalCounters::new());
     let start = Instant::now();
     let deadline = start + Duration::from_secs(duration_secs);
@@ -438,7 +447,7 @@ async fn run_client(
     // Fill the initial window.
     let window = initial_window.min(cc.window().floor() as usize);
     for _ in 0..window {
-        let name = prefix.clone().append(format!("{next_seq}"));
+        let name = flow_prefix.clone().append(format!("{next_seq}"));
         let wire = InterestBuilder::new(name).lifetime(lifetime).build();
         timestamps.insert(next_seq, Instant::now());
         client.send(wire).await?;
@@ -486,7 +495,7 @@ async fn run_client(
                     if Instant::now() < deadline {
                         let allowed = cc.window().floor() as usize;
                         while in_flight < allowed {
-                            let name = prefix.clone().append(format!("{next_seq}"));
+                            let name = flow_prefix.clone().append(format!("{next_seq}"));
                             let wire = InterestBuilder::new(name).lifetime(lifetime).build();
                             timestamps.insert(next_seq, Instant::now());
                             client.send(wire).await?;
@@ -528,7 +537,7 @@ async fn run_client(
                     .collect();
                 for seq in stale {
                     cc.on_timeout();
-                    let name = prefix.clone().append(format!("{seq}"));
+                    let name = flow_prefix.clone().append(format!("{seq}"));
                     let wire = InterestBuilder::new(name).lifetime(lifetime).build();
                     timestamps.insert(seq, Instant::now());
                     client.send(wire).await?;

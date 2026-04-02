@@ -98,6 +98,20 @@ Zenoh's pub/sub/queryable model but built on NDN's Interest/Data machinery.
 
 ### Fixed
 
+#### Consecutive iperf runs fail with PIT suppression (0 throughput)
+
+Running `ndn-iperf client` a second time immediately after the first run
+produced 0 throughput because Interest names `/iperf/0`, `/iperf/1`, ...
+collided with stale PIT entries from the previous run.
+
+- **Per-run flow ID** — each iperf client run now uses a unique flow prefix
+  (`/iperf/<flow-id>/<seq>`) so names never collide between runs or
+  concurrent clients.
+- **PIT cleanup on face disconnect** — `Pit::remove_face()` drains PIT
+  entries whose sole in-record consumer is the closed face, preventing stale
+  entries from suppressing future Interests.  Called from `run_face_reader`
+  on face close, before FIB cleanup.
+
 #### NDNLPv2 reliability lingering traffic after flow completion
 
 High-throughput flows accumulated thousands of unacked entries that drained
