@@ -43,8 +43,6 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use bytes::Bytes;
 
-use tracing::trace;
-
 use ndn_transport::{Face, FaceError, FaceId, FaceKind};
 
 use crate::shm::ShmError;
@@ -109,6 +107,11 @@ const OFF_E2A_PARKED: usize = 384;  // app (e2a consumer) parked flag
 const HEADER_SIZE:    usize = 448;  // 7 × 64-byte cache lines
 
 fn slot_stride(slot_size: u32) -> usize { 4 + slot_size as usize }
+
+/// Number of spin-loop iterations before falling through to the expensive
+/// syscall path (futex on Linux, pipe on macOS).  256 iterations ≈ a few µs
+/// on modern hardware — long enough to catch back-to-back packets.
+const SPIN_ITERS: u32 = 256;
 
 fn shm_total_size(capacity: u32, slot_size: u32) -> usize {
     HEADER_SIZE + 2 * capacity as usize * slot_stride(slot_size)
@@ -486,12 +489,11 @@ impl Face for SpscFace {
         };
         loop {
             if let Some(pkt) = self.try_pop_a2e() {
-                trace!(face=%self.id, len=pkt.len(), "shm: recv");
                 return Ok(pkt);
             }
-            // Brief spin before parking — avoids expensive syscall (pipe/futex)
+            // Spin before parking — avoids expensive syscall (pipe/futex)
             // when packets arrive within microseconds of each other.
-            for _ in 0..64 {
+            for _ in 0..SPIN_ITERS {
                 std::hint::spin_loop();
                 if let Some(pkt) = self.try_pop_a2e() {
                     return Ok(pkt);
@@ -540,7 +542,6 @@ impl Face for SpscFace {
         let parked = unsafe {
             &*AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_E2A_PARKED) as *mut u32)
         };
-        trace!(face=%self.id, len=pkt.len(), "shm: send");
         // Yield until there is space in the e2a ring (backpressure).
         loop {
             if self.try_push_e2a(&pkt) { break; }
@@ -660,7 +661,6 @@ impl SpscHandle {
         if pkt.len() > self.slot_size as usize {
             return Err(ShmError::PacketTooLarge);
         }
-        trace!(len=pkt.len(), "shm-handle: send");
         // SAFETY: parked flag within mapped SHM region.
         let parked = unsafe {
             &*AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_A2E_PARKED) as *mut u32)
@@ -690,12 +690,11 @@ impl SpscHandle {
         };
         loop {
             if let Some(pkt) = self.try_pop_e2a() {
-                trace!(len=pkt.len(), "shm-handle: recv");
                 return Some(pkt);
             }
-            // Brief spin before parking — avoids expensive syscall (pipe/futex)
+            // Spin before parking — avoids expensive syscall (pipe/futex)
             // when packets arrive within microseconds of each other.
-            for _ in 0..64 {
+            for _ in 0..SPIN_ITERS {
                 std::hint::spin_loop();
                 if let Some(pkt) = self.try_pop_e2a() {
                     return Some(pkt);
