@@ -66,6 +66,7 @@ async fn main() -> Result<()> {
     let engine_config = EngineConfig {
         cs_capacity_bytes:    fwd_config.engine.cs_capacity_mb * 1024 * 1024,
         pipeline_channel_cap: fwd_config.engine.pipeline_channel_cap,
+        pipeline_threads:     fwd_config.engine.pipeline_threads,
     };
 
     // ── NDN management: pre-register management AppFace ───────────────────────

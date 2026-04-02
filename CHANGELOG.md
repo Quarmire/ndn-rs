@@ -370,12 +370,11 @@ conventions (`/localhost/nfd/<module>/<verb>/<ControlParameters>`).
 
 ### Changed
 
-- **ndn-engine pipeline runner processes packets inline** — removed per-packet
-  `tokio::spawn` in `PacketDispatcher::run_pipeline`. Packets are now processed
-  directly in the pipeline runner loop, eliminating task creation, scheduling,
-  and `Arc` clone overhead per packet. Combined with SHM spin-before-park and
-  increased ring capacity, this brought SHM iperf throughput from ~800 Mbps to
-  ~10 Gbps.
+- **ndn-engine pipeline architecture** — the pipeline runner performs fragment
+  sieve and channel drain inline (single-threaded), then spawns per-packet
+  tokio tasks for full pipeline processing across multiple cores.  This
+  replaced an earlier fully-inline design that saturated a single core at
+  ~850 Mbps on UDP workloads with fragmentation.
 - **ndn-router management prefix** changed from custom to `/localhost/nfd` (NFD
   standard).
 - **ndn-engine `StrategyStage`** now uses `strategy_table` + `default_strategy`
@@ -386,6 +385,20 @@ conventions (`/localhost/nfd/<module>/<verb>/<ControlParameters>`).
   use `enqueue_send()` (non-blocking `try_send` to per-face channel) instead of
   awaiting `face.send_bytes()`.  The nack pipeline's retry-forward and
   nack-propagation paths also use `enqueue_send`.
+- **Configurable parallel pipeline processing** — `pipeline_threads` setting
+  in `[engine]` config (default `0` = auto-detect).  `1` runs all processing
+  inline in the pipeline runner (lowest latency, deterministic ordering).
+  `N > 1` spawns per-packet tokio tasks so up to N pipeline passes run in
+  parallel across cores (highest throughput with fragmented UDP traffic).
+  The fragment sieve always runs single-threaded.  `PacketDispatcher` is
+  `Arc`-wrapped for shared access; all pipeline stages are concurrent-safe
+  (DashMap for PIT, Mutex for CS, Arc for shared tables).
+- **PIT match order swapped** — `PitMatchStage` now tries the default-selector
+  token first (common case for most Interests), then falls back to the
+  None-selector token.  Eliminates a wasted DashMap probe + hash computation
+  per Data packet.
+- **Send queue capacity** increased from 128 to 512 to absorb bursts from
+  parallel pipeline tasks dispatching to the same face near-simultaneously.
 
 ### Fixed
 
