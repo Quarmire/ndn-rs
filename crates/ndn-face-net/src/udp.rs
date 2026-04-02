@@ -98,19 +98,28 @@ impl Face for UdpFace {
     ///
     /// Datagrams from addresses other than `self.peer` are silently discarded.
     async fn recv(&self) -> Result<Bytes, FaceError> {
-        let mut buf = vec![0u8; 9000];
+        // Reuse a stack buffer; only allocate the exact received size via
+        // copy_from_slice.  Avoids a 9 KB heap allocation per packet.
+        let mut buf = [0u8; 9000];
         loop {
             let (n, src) = self.socket.recv_from(&mut buf).await?;
             if src == self.peer {
                 trace!(face=%self.id, peer=%self.peer, len=n, "udp: recv");
-                buf.truncate(n);
-                return Ok(Bytes::from(buf));
+                return Ok(Bytes::copy_from_slice(&buf[..n]));
             }
             trace!(face=%self.id, expected=%self.peer, actual=%src, len=n, "udp: recv ignored (wrong source)");
         }
     }
 
     async fn send(&self, pkt: Bytes) -> Result<(), FaceError> {
+        // If the packet is already an LpPacket (e.g. from the reliability layer),
+        // send it directly — it's already correctly framed and within MTU.
+        if ndn_packet::lp::is_lp_packet(&pkt) {
+            trace!(face=%self.id, peer=%self.peer, len=pkt.len(), "udp: send (passthrough)");
+            self.socket.send_to(&pkt, self.peer).await?;
+            return Ok(());
+        }
+
         // LpPacket envelope adds ~4 bytes overhead.  Check whether the packet
         // needs fragmentation *before* wrapping to avoid an 8 KB allocation
         // that would immediately be discarded.

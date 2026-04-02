@@ -12,6 +12,28 @@ bootstrapping phase and all APIs should be considered unstable.
 
 ### Added
 
+#### NDNLPv2 per-hop reliability for unicast UDP faces
+
+Unicast UDP faces now implement NDNLPv2 per-hop reliability, fixing throughput
+instability (400–850 Mbps variance) caused by unrecovered UDP packet loss.
+
+- **LpPacket Ack field** — decode/encode Ack TLVs (0x0344), `fragment` is now
+  `Option<Bytes>` to support bare Ack-only packets.
+- **Per-fragment unique sequence** — each fragment gets `Sequence = base_seq + i`;
+  reassembly key is `Sequence - FragIndex`.
+- **`LpReliability` struct** (`ndn-face-net/src/reliability.rs`) — pure
+  synchronous state machine: `on_send()` fragments + assigns TxSequences +
+  piggybacks Acks; `on_receive()` queues Acks + measures RTT; `check_retransmit()`
+  drives retransmits with adaptive RTO (RFC 6298, Karn's algorithm).
+- **Engine integration** — `FaceState` holds optional `LpReliability` for UDP
+  faces; `run_face_sender` has a 50ms retransmit tick; `run_face_reader` feeds
+  inbound packets to `on_receive()`.
+- **`FaceKind::Multicast`** — multicast UDP now has its own `FaceKind` variant
+  (no reliability, no single peer to Ack).
+- **UdpFace passthrough** — packets already wrapped as LpPackets (from the
+  reliability layer) are sent directly, bypassing the face's own LpPacket
+  wrapping and fragmentation.
+
 #### Network listeners — UDP and TCP on port 6363
 
 The router now listens for incoming network traffic at startup, matching NFD's

@@ -24,7 +24,12 @@ use crate::Fib;
 /// all dispatch to the same face near-simultaneously.  When full, outbound
 /// packets are dropped (equivalent to a congestion drop at the output queue —
 /// consistent with NFD's `GenericLinkService` model).
-pub const DEFAULT_SEND_QUEUE_CAP: usize = 512;
+///
+/// With NDNLPv2 fragmentation, a single Data packet may expand to ~6
+/// fragments, each occupying one queue slot.  2048 slots ≈ ~340 Data
+/// packets — enough headroom for sustained bursts over high-throughput
+/// links without silent drops.
+pub const DEFAULT_SEND_QUEUE_CAP: usize = 2048;
 
 /// Per-face lifecycle state stored alongside the cancellation token.
 pub struct FaceState {
@@ -41,6 +46,8 @@ pub struct FaceState {
     /// per-face ordering (critical for TCP framing), and provides bounded
     /// backpressure.
     pub send_tx: mpsc::Sender<bytes::Bytes>,
+    /// NDNLPv2 per-hop reliability state (unicast UDP faces only).
+    pub reliability: Option<std::sync::Mutex<ndn_face_net::reliability::LpReliability>>,
 }
 
 impl FaceState {
@@ -54,6 +61,29 @@ impl FaceState {
             persistency,
             last_activity: AtomicU64::new(now),
             send_tx,
+            reliability: None,
+        }
+    }
+
+    /// Create a FaceState with NDNLPv2 reliability enabled.
+    pub fn new_reliable(
+        cancel: CancellationToken,
+        persistency: FacePersistency,
+        send_tx: mpsc::Sender<bytes::Bytes>,
+        mtu: usize,
+    ) -> Self {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        Self {
+            cancel,
+            persistency,
+            last_activity: AtomicU64::new(now),
+            send_tx,
+            reliability: Some(std::sync::Mutex::new(
+                ndn_face_net::reliability::LpReliability::new(mtu),
+            )),
         }
     }
 
@@ -153,8 +183,14 @@ impl ForwarderEngine {
         persistency: FacePersistency,
     ) {
         let face_id = face.id();
+        let kind = face.kind();
         let (send_tx, send_rx) = mpsc::channel(DEFAULT_SEND_QUEUE_CAP);
-        self.inner.face_states.insert(face_id, FaceState::new(cancel.clone(), persistency, send_tx));
+        let state = if kind == ndn_transport::FaceKind::Udp {
+            FaceState::new_reliable(cancel.clone(), persistency, send_tx, ndn_face_net::DEFAULT_UDP_MTU)
+        } else {
+            FaceState::new(cancel.clone(), persistency, send_tx)
+        };
+        self.inner.face_states.insert(face_id, state);
         self.inner.face_table.insert(face);
         let erased     = self.inner.face_table.get(face_id)
             .expect("face was just inserted");
@@ -192,8 +228,14 @@ impl ForwarderEngine {
         cancel: CancellationToken,
     ) {
         let face_id = face.id();
+        let kind = face.kind();
         let (send_tx, send_rx) = mpsc::channel(DEFAULT_SEND_QUEUE_CAP);
-        self.inner.face_states.insert(face_id, FaceState::new(cancel.clone(), FacePersistency::OnDemand, send_tx));
+        let state = if kind == ndn_transport::FaceKind::Udp {
+            FaceState::new_reliable(cancel.clone(), FacePersistency::OnDemand, send_tx, ndn_face_net::DEFAULT_UDP_MTU)
+        } else {
+            FaceState::new(cancel.clone(), FacePersistency::OnDemand, send_tx)
+        };
+        self.inner.face_states.insert(face_id, state);
         self.inner.face_table.insert(face);
 
         let erased = self.inner.face_table.get(face_id)
@@ -255,6 +297,11 @@ impl ShutdownHandle {
 /// Drains the face's outbound channel and calls `face.send_bytes()` for each
 /// packet, preserving per-face ordering (critical for TCP TLV framing).
 ///
+/// For reliability-enabled faces (unicast UDP), outgoing packets are processed
+/// through `LpReliability::on_send()` which fragments, assigns TxSequences,
+/// piggybacks Acks, and buffers for retransmit. A 50ms tick drives the
+/// retransmit timer and flushes pending Acks.
+///
 /// On send error:
 /// - **Permanent**: log and continue (the face retries on the next packet).
 /// - **Persistent/OnDemand**: stop the send loop.
@@ -270,31 +317,85 @@ pub(crate) async fn run_face_sender(
     face_table:  Arc<FaceTable>,
     fib:         Arc<crate::Fib>,
 ) {
-    loop {
-        let pkt = tokio::select! {
-            _ = cancel.cancelled() => break,
-            pkt = rx.recv() => match pkt {
-                Some(p) => p,
-                None => break, // FaceState dropped, face is being removed.
-            },
-        };
+    // Check if reliability is enabled by looking at the face state.
+    let has_reliability = face_states.get(&face_id)
+        .map(|s| s.reliability.is_some())
+        .unwrap_or(false);
 
-        if let Err(e) = face.send_bytes(pkt).await {
-            match persistency {
-                FacePersistency::Permanent => {
-                    tracing::warn!(face=%face_id, error=%e, "send error on permanent face, continuing");
-                }
-                _ => {
-                    tracing::warn!(face=%face_id, error=%e, "send error, closing face");
-                    // Trigger cleanup for on-demand faces.
-                    if persistency == FacePersistency::OnDemand {
-                        if let Some((_, state)) = face_states.remove(&face_id) {
-                            state.cancel.cancel();
-                        }
-                        fib.remove_face(face_id);
-                        face_table.remove(face_id);
+    let mut retx_tick = tokio::time::interval(std::time::Duration::from_millis(50));
+    retx_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    // Helper closure for send errors.
+    let handle_send_error = |e: ndn_transport::FaceError| -> bool {
+        match persistency {
+            FacePersistency::Permanent => {
+                tracing::warn!(face=%face_id, error=%e, "send error on permanent face, continuing");
+                false // don't break
+            }
+            _ => {
+                tracing::warn!(face=%face_id, error=%e, "send error, closing face");
+                if persistency == FacePersistency::OnDemand {
+                    if let Some((_, state)) = face_states.remove(&face_id) {
+                        state.cancel.cancel();
                     }
-                    break;
+                    fib.remove_face(face_id);
+                    face_table.remove(face_id);
+                }
+                true // break
+            }
+        }
+    };
+
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            pkt = rx.recv() => {
+                let pkt = match pkt {
+                    Some(p) => p,
+                    None => break,
+                };
+
+                if has_reliability {
+                    // Reliability-enabled path: fragment + assign TxSeq + piggyback Acks.
+                    let wires = {
+                        let state = face_states.get(&face_id);
+                        match state.as_ref().and_then(|s| s.reliability.as_ref()) {
+                            Some(rel) => rel.lock().unwrap().on_send(&pkt),
+                            None => vec![pkt],
+                        }
+                    };
+                    for wire in wires {
+                        if let Err(e) = face.send_bytes(wire).await {
+                            if handle_send_error(e) { return; }
+                        }
+                    }
+                } else {
+                    // Non-reliability path: send directly.
+                    if let Err(e) = face.send_bytes(pkt).await {
+                        if handle_send_error(e) { return; }
+                    }
+                }
+            },
+            _ = retx_tick.tick(), if has_reliability => {
+                let (retx, ack_pkt) = {
+                    let state = face_states.get(&face_id);
+                    match state.as_ref().and_then(|s| s.reliability.as_ref()) {
+                        Some(rel) => {
+                            let mut rel = rel.lock().unwrap();
+                            let retx = rel.check_retransmit();
+                            let ack_pkt = rel.flush_acks();
+                            (retx, ack_pkt)
+                        }
+                        None => (vec![], None),
+                    }
+                };
+                for wire in retx {
+                    if let Err(e) = face.send_bytes(wire).await {
+                        if handle_send_error(e) { return; }
+                    }
+                }
+                if let Some(wire) = ack_pkt {
+                    let _ = face.send_bytes(wire).await;
                 }
             }
         }

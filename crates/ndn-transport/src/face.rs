@@ -29,6 +29,7 @@ pub enum FaceKind {
     Wfb,
     Compute,
     Internal,
+    Multicast,
 }
 
 impl FaceKind {
@@ -36,7 +37,8 @@ impl FaceKind {
     pub fn scope(&self) -> FaceScope {
         match self {
             FaceKind::Unix | FaceKind::App | FaceKind::Shm | FaceKind::Internal => FaceScope::Local,
-            _ => FaceScope::NonLocal,
+            FaceKind::Udp | FaceKind::Tcp | FaceKind::Ethernet | FaceKind::Serial
+            | FaceKind::Bluetooth | FaceKind::Wfb | FaceKind::Compute | FaceKind::Multicast => FaceScope::NonLocal,
         }
     }
 }

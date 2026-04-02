@@ -75,7 +75,7 @@ impl MulticastUdpFace {
 
 impl Face for MulticastUdpFace {
     fn id(&self) -> FaceId { self.id }
-    fn kind(&self) -> FaceKind { FaceKind::Udp }
+    fn kind(&self) -> FaceKind { FaceKind::Multicast }
 
     /// Receive the next NDN packet from any sender on the multicast group.
     async fn recv(&self) -> Result<Bytes, FaceError> {
@@ -128,7 +128,7 @@ mod tests {
         let dest: SocketAddr = "224.0.23.170:6363".parse().unwrap();
         let face = MulticastUdpFace::with_socket(FaceId(3), socket, dest);
         assert_eq!(face.id(), FaceId(3));
-        assert_eq!(face.kind(), FaceKind::Udp);
+        assert_eq!(face.kind(), FaceKind::Multicast);
         assert_eq!(face.dest(), dest);
     }
 

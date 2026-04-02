@@ -1,6 +1,7 @@
 pub mod udp;
 pub mod tcp;
 pub mod multicast;
+pub mod reliability;
 
 pub use udp::UdpFace;
 pub use tcp::TcpFace;

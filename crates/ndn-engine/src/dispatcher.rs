@@ -77,10 +77,12 @@ impl PacketDispatcher {
                 if !dispatcher.face_states.contains_key(&face_id) {
                     let (send_tx, send_rx) = mpsc::channel(DEFAULT_SEND_QUEUE_CAP);
                     let persistency = FacePersistency::Permanent;
-                    dispatcher.face_states.insert(
-                        face_id,
-                        FaceState::new(cancel.child_token(), persistency, send_tx),
-                    );
+                    let state = if face.kind() == FaceKind::Udp {
+                        FaceState::new_reliable(cancel.child_token(), persistency, send_tx, ndn_face_net::DEFAULT_UDP_MTU)
+                    } else {
+                        FaceState::new(cancel.child_token(), persistency, send_tx)
+                    };
+                    dispatcher.face_states.insert(face_id, state);
                     // Spawn per-face send task.
                     let send_face   = Arc::clone(&face);
                     let send_cancel = cancel.clone();
@@ -449,6 +451,11 @@ pub(crate) async fn run_face_reader(
     let track_activity = matches!(persistency, FacePersistency::OnDemand)
         && !matches!(kind, FaceKind::App | FaceKind::Shm | FaceKind::Internal);
 
+    // Cache whether this face has reliability enabled.
+    let has_reliability = face_states.get(&face_id)
+        .map(|s| s.reliability.is_some())
+        .unwrap_or(false);
+
     loop {
         let result = tokio::select! {
             _ = cancel.cancelled() => break,
@@ -457,6 +464,17 @@ pub(crate) async fn run_face_reader(
         match result {
             Ok(raw) => {
                 trace!(face=%face_id, len=raw.len(), "face-reader: recv");
+
+                // Feed inbound packet to reliability layer (extracts TxSeq for
+                // Ack, processes piggybacked Acks from remote).
+                if has_reliability {
+                    if let Some(state) = face_states.get(&face_id) {
+                        if let Some(ref rel) = state.reliability {
+                            rel.lock().unwrap().on_receive(&raw);
+                        }
+                    }
+                }
+
                 let arrival = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()

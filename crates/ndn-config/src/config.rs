@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use crate::ConfigError;
+use serde::{Deserialize, Serialize};
 
 /// Top-level forwarder configuration (loaded from TOML).
 ///
@@ -61,8 +61,7 @@ impl ForwarderConfig {
 
     /// Serialize to a TOML string.
     pub fn to_toml_string(&self) -> Result<String, ConfigError> {
-        toml::to_string_pretty(self)
-            .map_err(|e| ConfigError::Invalid(e.to_string()))
+        toml::to_string_pretty(self).map_err(|e| ConfigError::Invalid(e.to_string()))
     }
 }
 
@@ -87,9 +86,9 @@ pub struct EngineConfig {
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
-            cs_capacity_mb:       64,
+            cs_capacity_mb: 64,
             pipeline_channel_cap: 4096,
-            pipeline_threads:     0,
+            pipeline_threads: 0,
         }
     }
 }
@@ -146,7 +145,9 @@ pub struct RouteConfig {
     pub cost: u32,
 }
 
-fn default_cost() -> u32 { 10 }
+fn default_cost() -> u32 {
+    10
+}
 
 /// Management interface configuration.
 #[derive(Debug, Deserialize, Serialize)]
@@ -180,16 +181,22 @@ pub struct ManagementConfig {
 impl Default for ManagementConfig {
     fn default() -> Self {
         Self {
-            transport:    default_mgmt_transport(),
+            transport: default_mgmt_transport(),
             bypass_socket: default_bypass_socket(),
-            face_socket:  default_face_socket(),
+            face_socket: default_face_socket(),
         }
     }
 }
 
-fn default_mgmt_transport() -> String { "ndn".to_owned() }
-fn default_bypass_socket()   -> String { "/tmp/ndn-router.sock".to_owned() }
-fn default_face_socket()     -> String { "/tmp/ndn-faces.sock".to_owned() }
+fn default_mgmt_transport() -> String {
+    "ndn".to_owned()
+}
+fn default_bypass_socket() -> String {
+    "/tmp/ndn-router.sock".to_owned()
+}
+fn default_face_socket() -> String {
+    "/tmp/ndn-faces.sock".to_owned()
+}
 
 /// Security settings.
 #[derive(Debug, Default, Deserialize, Serialize)]

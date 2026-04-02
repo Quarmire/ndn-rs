@@ -162,7 +162,7 @@ pub async fn run_udp_listener(
     tracing::info!(addr=%local, "UDP listener ready");
 
     let mut peers = std::collections::HashMap::<std::net::SocketAddr, FaceId>::new();
-    let mut buf = vec![0u8; 9000];
+    let mut buf = [0u8; 9000];
 
     loop {
         tokio::select! {

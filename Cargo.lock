@@ -869,6 +869,7 @@ dependencies = [
  "bytes",
  "criterion",
  "dashmap",
+ "ndn-face-net",
  "ndn-packet",
  "ndn-pipeline",
  "ndn-security",

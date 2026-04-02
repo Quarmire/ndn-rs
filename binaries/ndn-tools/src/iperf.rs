@@ -394,8 +394,12 @@ async fn run_client(
     let mut next_seq: u64 = 0;
     let mut total_bytes: u64 = 0;
     let mut received: u64 = 0;
-    let mut timeouts: u64 = 0;
+    let mut retx_count: u64 = 0;
     let mut rtts: Vec<u64> = Vec::new();
+
+    // Smoothed RTT for adaptive retransmit timeout.
+    // Start conservative; converges within a few packets.
+    let mut srtt_us: f64 = 50_000.0; // 50ms initial estimate
 
     // Fill the initial window.
     for _ in 0..window {
@@ -406,14 +410,18 @@ async fn run_client(
         next_seq += 1;
     }
 
-    let recv_timeout = Duration::from_millis(lifetime_ms + 1000);
     // After the test deadline, use a short drain timeout to collect
     // any Data already in flight without waiting for the full lifetime.
     let drain_timeout = Duration::from_millis(500);
     let mut past_deadline = false;
 
+    // Short check interval for the recv loop.  Between Data arrivals we
+    // wake up to re-express stale Interests rather than waiting for the
+    // full lifetime to expire (which wastes window slots for seconds).
+    let check_interval = Duration::from_millis(100);
+
     let sent = loop {
-        let timeout = if past_deadline { drain_timeout } else { recv_timeout };
+        let timeout = if past_deadline { drain_timeout } else { check_interval };
         match tokio::time::timeout(timeout, client.recv()).await {
             Ok(Some(data_bytes)) => {
                 let data_len = data_bytes.len() as u64;
@@ -427,6 +435,8 @@ async fn run_client(
                 if let Some(rtt) = rtt_us {
                     rtts.push(rtt);
                     counters.record_rtt(rtt);
+                    // EWMA smoothed RTT (α = 1/8, same as TCP).
+                    srtt_us = srtt_us * 0.875 + rtt as f64 * 0.125;
                 }
                 counters.record(data_len);
 
@@ -451,15 +461,38 @@ async fn run_client(
                 break next_seq;
             }
             Err(_) => {
-                if past_deadline || Instant::now() >= deadline {
-                    break next_seq;
+                if past_deadline {
+                    if timestamps.is_empty() { break next_seq; }
+                    // Keep draining until all in-flight interests expire.
+                    let now = Instant::now();
+                    timestamps.retain(|_, t0| now.duration_since(*t0) < drain_timeout);
+                    if timestamps.is_empty() { break next_seq; }
+                    continue;
                 }
-                timeouts += 1;
-                // Expire stale timestamps.
+                if Instant::now() >= deadline {
+                    past_deadline = true;
+                    continue;
+                }
+
+                // ── Fast re-expression of stale Interests ────────────
+                // RTO = max(3 × SRTT, 200ms) — aggressive enough to
+                // recover quickly but not so tight that jitter triggers
+                // spurious retransmits.
+                let rto = Duration::from_micros((srtt_us * 3.0) as u64)
+                    .max(Duration::from_millis(200));
                 let now = Instant::now();
-                timestamps.retain(|_, t0| {
-                    now.duration_since(*t0) < recv_timeout
-                });
+                let stale: Vec<u64> = timestamps.iter()
+                    .filter(|(_, t0)| now.duration_since(**t0) >= rto)
+                    .map(|(seq, _)| *seq)
+                    .collect();
+                for seq in stale {
+                    // Re-express with a fresh timestamp.
+                    let name = prefix.clone().append(format!("{seq}"));
+                    let wire = InterestBuilder::new(name).lifetime(lifetime).build();
+                    timestamps.insert(seq, Instant::now());
+                    client.send(wire).await?;
+                    retx_count += 1;
+                }
             }
         }
     };
@@ -485,8 +518,8 @@ async fn run_client(
         format_throughput(total_bytes, actual_elapsed),
     );
     println!("  packets:     {sent} sent, {received} received ({loss_pct:.1}% loss)");
-    if timeouts > 0 {
-        println!("  timeouts:    {timeouts}");
+    if retx_count > 0 {
+        println!("  retransmits: {retx_count}");
     }
 
     if !rtts.is_empty() {

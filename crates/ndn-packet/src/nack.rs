@@ -66,7 +66,10 @@ impl Nack {
             let reason = lp.nack.ok_or_else(|| {
                 PacketError::MalformedPacket("LpPacket has no Nack header".into())
             })?;
-            let interest = Interest::decode(lp.fragment)?;
+            let fragment = lp.fragment.ok_or_else(|| {
+                PacketError::MalformedPacket("Nack LpPacket has no fragment".into())
+            })?;
+            let interest = Interest::decode(fragment)?;
             return Ok(Self { reason, interest });
         }
 
