@@ -80,21 +80,58 @@ impl PacketDispatcher {
         tx
     }
 
+    /// Maximum packets to drain from the channel per batch.
+    ///
+    /// After the first blocking `recv()`, we drain up to this many more with
+    /// non-blocking `try_recv()`.  This amortises the `tokio::select!`
+    /// overhead across a burst of packets (especially fragments).
+    const BATCH_SIZE: usize = 64;
+
     async fn run_pipeline(
         &self,
         mut rx: mpsc::Receiver<InboundPacket>,
         cancel: CancellationToken,
     ) {
+        let mut batch = Vec::with_capacity(Self::BATCH_SIZE);
         loop {
-            let pkt = tokio::select! {
+            // Block for the first packet.
+            let first = tokio::select! {
                 _ = cancel.cancelled() => break,
                 pkt = rx.recv() => match pkt {
                     Some(p) => p,
                     None    => break,
                 },
             };
+            batch.push(first);
 
-            self.process_packet(pkt).await;
+            // Drain more without blocking.
+            while batch.len() < Self::BATCH_SIZE {
+                match rx.try_recv() {
+                    Ok(p)  => batch.push(p),
+                    Err(_) => break,
+                }
+            }
+
+            // Fast-path fragment sieve: collect fragments without creating
+            // a full PacketContext.  Only reassembled packets and non-fragment
+            // packets proceed to the full pipeline.
+            for pkt in batch.drain(..) {
+                let InboundPacket { raw, face_id, arrival } = pkt;
+                match self.decode.try_collect_fragment(face_id, raw) {
+                    Ok(None) => {
+                        // Fragment buffered, waiting for more.
+                        trace!(face=%face_id, "fragment collected, awaiting reassembly");
+                    }
+                    Ok(Some(reassembled)) => {
+                        // Reassembly complete — process the full packet.
+                        self.process_packet(InboundPacket { raw: reassembled, face_id, arrival }).await;
+                    }
+                    Err(raw) => {
+                        // Not a fragment — run through the full pipeline.
+                        self.process_packet(InboundPacket { raw, face_id, arrival }).await;
+                    }
+                }
+            }
         }
     }
 
