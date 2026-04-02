@@ -31,7 +31,7 @@ pub struct EngineConfig {
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
-            pipeline_channel_cap: 1024,
+            pipeline_channel_cap: 4096,
             cs_capacity_bytes:    64 * 1024 * 1024, // 64 MB
         }
     }
