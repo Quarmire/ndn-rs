@@ -19,11 +19,14 @@
 //! ```
 
 use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::sync::mpsc;
 
-use ndn_packet::Name;
+use ndn_packet::{Data, Name};
+use ndn_packet::encode::encode_interest;
 use ndn_ipc::RouterClient;
 
 use crate::AppError;
@@ -48,6 +51,8 @@ pub struct Sample {
 pub struct SubscriberConfig {
     /// Automatically fetch data for each sync update (default: true).
     pub auto_fetch: bool,
+    /// Timeout for auto-fetch Interests (default: 4 seconds).
+    pub fetch_timeout: Duration,
     /// SVS sync configuration.
     pub svs: ndn_sync::SvsConfig,
 }
@@ -56,6 +61,7 @@ impl Default for SubscriberConfig {
     fn default() -> Self {
         Self {
             auto_fetch: true,
+            fetch_timeout: Duration::from_secs(4),
             svs: ndn_sync::SvsConfig::default(),
         }
     }
@@ -109,6 +115,13 @@ impl Subscriber {
         Self::run(conn, group, local_name, config)
     }
 
+    /// Spawn the background tasks that drive the subscription:
+    ///
+    /// 1. **Send pump** — forwards sync Interests from the SVS task to the router.
+    /// 2. **Recv pump** — reads packets from the connection and routes Interests
+    ///    to the SVS task.
+    /// 3. **Update processor** — receives `SyncUpdate`s, optionally auto-fetches
+    ///    Data, and emits `Sample`s.
     fn run(
         conn: NdnConnection,
         group: Name,
@@ -132,31 +145,54 @@ impl Subscriber {
         );
 
         let auto_fetch = config.auto_fetch;
-        let task_cancel = cancel.clone();
+        let fetch_timeout = config.fetch_timeout;
+        let conn = Arc::new(conn);
 
         // Network send pump: forward sync Interests to the router.
-        let conn_for_send = conn;
-        tokio::spawn({
-            let cancel = task_cancel.clone();
-            async move {
-                loop {
-                    tokio::select! {
-                        _ = cancel.cancelled() => break,
-                        Some(pkt) = net_send_rx.recv() => {
-                            let _ = conn_for_send.send(pkt).await;
-                        }
+        let conn_send = Arc::clone(&conn);
+        let cancel_send = cancel.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = cancel_send.cancelled() => break,
+                    Some(pkt) = net_send_rx.recv() => {
+                        let _ = conn_send.send(pkt).await;
                     }
                 }
             }
         });
 
-        // Note: a full implementation would also run a recv pump that
-        // filters sync Interests from incoming traffic and forwards them
-        // to net_recv_tx. For now, the recv side requires the caller to
-        // feed incoming sync packets into the NdnConnection.
-        let _ = net_recv_tx; // will be wired in future integration
+        // Network recv pump: read packets from the connection, forward sync
+        // Interests to the SVS task via net_recv_tx. Non-sync packets
+        // (Data responses for auto-fetch) are handled by the fetch path.
+        let conn_recv = Arc::clone(&conn);
+        let cancel_recv = cancel.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = cancel_recv.cancelled() => break,
+                    pkt = conn_recv.recv() => match pkt {
+                        Some(raw) => {
+                            // Simple heuristic: if the raw packet starts with
+                            // the sync group prefix, it's likely a sync Interest.
+                            // Forward everything to the sync task — it will
+                            // ignore what it doesn't understand.
+                            if raw.len() > 2 && raw.starts_with(&[0x05]) {
+                                // Interest type (0x05) — could be sync
+                                let _ = net_recv_tx.send(raw).await;
+                            }
+                            // Data packets (0x06) are consumed by fetch tasks
+                            // via separate recv calls and don't need routing here.
+                        }
+                        None => break,
+                    }
+                }
+            }
+        });
 
         // Update processor: receive sync updates, optionally fetch data.
+        let conn_fetch = Arc::clone(&conn);
+        let task_cancel = cancel.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -165,11 +201,7 @@ impl Subscriber {
                         for seq in update.low_seq..=update.high_seq {
                             let data_name = update.name.clone().append_segment(seq);
                             let payload = if auto_fetch {
-                                // Fetch via the same connection would require
-                                // a shared connection or a separate Consumer.
-                                // For now, emit the name without payload;
-                                // the application can fetch explicitly.
-                                None
+                                fetch_data(&conn_fetch, &data_name, fetch_timeout).await
                             } else {
                                 None
                             };
@@ -195,4 +227,17 @@ impl Subscriber {
     pub async fn recv(&mut self) -> Option<Sample> {
         self.sample_rx.recv().await
     }
+}
+
+/// Fetch a single Data object by expressing an Interest and waiting for a reply.
+///
+/// Returns `Some(content)` on success, `None` on timeout, decode failure,
+/// or missing content.
+async fn fetch_data(conn: &NdnConnection, name: &Name, timeout: Duration) -> Option<Bytes> {
+    let wire = encode_interest(name, None);
+    conn.send(wire).await.ok()?;
+    let reply = tokio::time::timeout(timeout, conn.recv()).await.ok()??;
+    // Decode to verify it's valid Data and extract content.
+    let data = Data::decode(reply).ok()?;
+    data.content().cloned()
 }

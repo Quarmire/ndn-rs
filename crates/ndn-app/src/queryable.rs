@@ -12,15 +12,16 @@
 //!
 //! let mut q = Queryable::connect("/tmp/ndn-faces.sock", "/sensors/temp").await?;
 //!
-//! q.serve(|interest| async move {
-//!     let data = DataBuilder::new((*interest.name).clone(), b"22.5").build();
-//!     Some(data)
-//! }).await?;
+//! while let Some(query) = q.recv().await {
+//!     let data = DataBuilder::new((*query.interest.name).clone(), b"22.5").build();
+//!     query.reply(data).await.ok();
+//! }
 //! # Ok(())
 //! # }
 //! ```
 
 use std::path::Path;
+use std::sync::Arc;
 
 use bytes::Bytes;
 
@@ -31,9 +32,24 @@ use ndn_packet::{Interest, Name};
 use crate::AppError;
 use crate::connection::NdnConnection;
 
+/// A query received by a [`Queryable`] — the application replies via [`Query::reply`].
+pub struct Query {
+    /// The incoming Interest.
+    pub interest: Interest,
+    /// Sender for the reply Data.
+    conn: Arc<NdnConnection>,
+}
+
+impl Query {
+    /// Send a Data reply for this query.
+    pub async fn reply(&self, data: Bytes) -> Result<(), AppError> {
+        self.conn.send(data).await
+    }
+}
+
 /// A queryable endpoint — receives Interests and lets the application reply.
 pub struct Queryable {
-    conn:   NdnConnection,
+    conn:   Arc<NdnConnection>,
     prefix: Name,
 }
 
@@ -48,12 +64,12 @@ impl Queryable {
             .map_err(|e| AppError::Engine(e.into()))?;
         client.register_prefix(&prefix).await
             .map_err(|e| AppError::Engine(e.into()))?;
-        Ok(Self { conn: NdnConnection::External(client), prefix })
+        Ok(Self { conn: Arc::new(NdnConnection::External(client)), prefix })
     }
 
     /// Create from an in-process AppHandle (embedded engine).
     pub fn from_handle(handle: AppHandle, prefix: Name) -> Self {
-        Self { conn: NdnConnection::Embedded(handle), prefix }
+        Self { conn: Arc::new(NdnConnection::Embedded(handle)), prefix }
     }
 
     /// The registered prefix.
@@ -61,11 +77,29 @@ impl Queryable {
         &self.prefix
     }
 
+    /// Receive the next query. Returns `None` when the connection closes.
+    ///
+    /// Each returned [`Query`] carries a sender so the application can reply
+    /// asynchronously — even from a different task.
+    pub async fn recv(&self) -> Option<Query> {
+        loop {
+            let raw = self.conn.recv().await?;
+            let interest = match Interest::decode(raw) {
+                Ok(i) => i,
+                Err(_) => continue,
+            };
+            return Some(Query {
+                interest,
+                conn: Arc::clone(&self.conn),
+            });
+        }
+    }
+
     /// Run a query handler loop.
     ///
     /// The handler receives each Interest and returns `Some(wire_data)` to
     /// respond or `None` to silently drop.
-    pub async fn serve<F, Fut>(&mut self, handler: F) -> Result<(), AppError>
+    pub async fn serve<F, Fut>(&self, handler: F) -> Result<(), AppError>
     where
         F: Fn(Interest) -> Fut + Send + Sync,
         Fut: std::future::Future<Output = Option<Bytes>> + Send,

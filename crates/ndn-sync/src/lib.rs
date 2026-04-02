@@ -26,5 +26,9 @@ pub mod svs_sync;
 /// Partial Sync (PSync) — IBF-based dataset synchronisation (pure data structure).
 pub mod psync;
 
+/// PSync network protocol — wires `PSyncNode` + `Ibf` to Interest/Data exchange.
+pub mod psync_sync;
+
 pub use protocol::{SyncHandle, SyncUpdate, SyncError};
 pub use svs_sync::{SvsConfig, join_svs_group};
+pub use psync_sync::{PSyncConfig, join_psync_group};

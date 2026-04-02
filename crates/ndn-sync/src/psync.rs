@@ -49,6 +49,25 @@ impl Ibf {
         }
     }
 
+    /// Create an IBF from raw cell data `(xor_sum, hash_sum, count)`.
+    ///
+    /// Uses `k = 3` hash functions (the PSync default). The number of cells
+    /// is inferred from the length of `cells`.
+    pub fn from_cells(cells: Vec<(u64, u64, i64)>) -> Self {
+        let k = 3; // default k
+        Self {
+            cells: cells.into_iter().map(|(x, h, c)| IbfCell {
+                xor_sum: x, hash_sum: h, count: c,
+            }).collect(),
+            k,
+        }
+    }
+
+    /// Export cells as `(xor_sum, hash_sum, count)` tuples for wire encoding.
+    pub fn cells(&self) -> Vec<(u64, u64, i64)> {
+        self.cells.iter().map(|c| (c.xor_sum, c.hash_sum, c.count)).collect()
+    }
+
     fn cell_indices(&self, value: u64) -> Vec<usize> {
         let n = self.cells.len();
         (0..self.k)
@@ -165,14 +184,17 @@ impl PSyncNode {
         self.local_set.remove(&hash)
     }
 
+    /// Returns `true` if the local set contains `hash`.
     pub fn contains(&self, hash: u64) -> bool {
         self.local_set.contains(&hash)
     }
 
+    /// Number of hashes in the local set.
     pub fn len(&self) -> usize {
         self.local_set.len()
     }
 
+    /// Returns `true` if the local set is empty.
     pub fn is_empty(&self) -> bool {
         self.local_set.is_empty()
     }
