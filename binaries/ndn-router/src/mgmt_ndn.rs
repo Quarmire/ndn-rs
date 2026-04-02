@@ -95,6 +95,133 @@ pub async fn run_face_listener(
     tracing::info!("NDN face listener stopped");
 }
 
+// ─── UDP listener ────────────────────────────────────────────────────────────
+
+/// Listen for incoming UDP datagrams on `bind_addr` and auto-create a `UdpFace`
+/// for each new source address seen.
+///
+/// NFD calls this the "UDP channel".  A single unconnected socket receives from
+/// all peers.  The first datagram from a new source creates a per-peer `UdpFace`
+/// (unconnected, using `send_to`).  Subsequent datagrams from that peer are
+/// forwarded into the pipeline via the existing face's channel.
+///
+/// The per-peer face shares the listener socket for sending (via `send_to`) but
+/// receives packets only through the listener's demux — the face's own `recv()`
+/// is never called (it would compete for the same socket).  Instead, the
+/// listener pushes received bytes directly into the pipeline channel.
+pub async fn run_udp_listener(
+    bind_addr: std::net::SocketAddr,
+    engine:    ForwarderEngine,
+    cancel:    CancellationToken,
+) {
+    let socket = match tokio::net::UdpSocket::bind(bind_addr).await {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            tracing::error!(addr=%bind_addr, error=%e, "udp-listener: bind failed");
+            return;
+        }
+    };
+
+    let local = socket.local_addr().unwrap_or(bind_addr);
+    tracing::info!(addr=%local, "UDP listener ready");
+
+    let mut peers = std::collections::HashMap::<std::net::SocketAddr, FaceId>::new();
+    let mut buf = vec![0u8; 9000];
+
+    loop {
+        let (n, src) = tokio::select! {
+            _ = cancel.cancelled() => break,
+            r = socket.recv_from(&mut buf) => match r {
+                Ok(pair) => pair,
+                Err(e) => {
+                    tracing::warn!(error=%e, "udp-listener: recv error");
+                    continue;
+                }
+            },
+        };
+
+        let raw = bytes::Bytes::copy_from_slice(&buf[..n]);
+
+        let face_id = if let Some(&id) = peers.get(&src) {
+            id
+        } else {
+            // New peer — create a UdpFace backed by a separate socket for sending.
+            let face_id = engine.faces().alloc_id();
+            let send_local: std::net::SocketAddr = if src.is_ipv4() {
+                "0.0.0.0:0".parse().unwrap()
+            } else {
+                "[::]:0".parse().unwrap()
+            };
+            match ndn_face_net::UdpFace::bind(send_local, src, face_id).await {
+                Ok(face) => {
+                    let peer_cancel = cancel.child_token();
+                    engine.add_face(face, peer_cancel);
+                    peers.insert(src, face_id);
+                    tracing::info!(face=%face_id, peer=%src, "udp-listener: new face");
+                    face_id
+                }
+                Err(e) => {
+                    tracing::warn!(peer=%src, error=%e, "udp-listener: face creation failed");
+                    continue;
+                }
+            }
+        };
+
+        // Inject the packet directly into the pipeline (bypasses the face's recv loop).
+        let arrival = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        if engine.inject_packet(raw, face_id, arrival).await.is_err() {
+            break; // Pipeline channel closed.
+        }
+    }
+
+    tracing::info!("UDP listener stopped");
+}
+
+// ─── TCP listener ────────────────────────────────────────────────────────────
+
+/// Accept incoming TCP connections on `bind_addr` and create a `TcpFace` for
+/// each.  TLV length-prefix framing is handled by `TcpFace` internally.
+pub async fn run_tcp_listener(
+    bind_addr: std::net::SocketAddr,
+    engine:    ForwarderEngine,
+    cancel:    CancellationToken,
+) {
+    let listener = match tokio::net::TcpListener::bind(bind_addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!(addr=%bind_addr, error=%e, "tcp-listener: bind failed");
+            return;
+        }
+    };
+
+    let local = listener.local_addr().unwrap_or(bind_addr);
+    tracing::info!(addr=%local, "TCP listener ready");
+
+    loop {
+        let (stream, peer) = tokio::select! {
+            _ = cancel.cancelled() => break,
+            r = listener.accept() => match r {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(error=%e, "tcp-listener: accept error");
+                    continue;
+                }
+            },
+        };
+
+        let face_id = engine.faces().alloc_id();
+        let face = ndn_face_net::TcpFace::from_stream(face_id, stream);
+        let conn_cancel = cancel.child_token();
+        engine.add_face(face, conn_cancel);
+        tracing::info!(face=%face_id, peer=%peer, "tcp-listener: accepted connection");
+    }
+
+    tracing::info!("TCP listener stopped");
+}
+
 // ─── Management handler ───────────────────────────────────────────────────────
 
 /// Read Interests from the management `AppHandle`, dispatch NFD commands,

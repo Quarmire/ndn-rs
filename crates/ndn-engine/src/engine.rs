@@ -112,6 +112,25 @@ impl ForwarderEngine {
         ));
     }
 
+    /// Inject a raw packet into the pipeline as if it arrived from `face_id`.
+    ///
+    /// Used by listener tasks (UDP/TCP) that manage their own recv loop and
+    /// need to feed packets into the pipeline without going through the face's
+    /// `run_face_reader` task.
+    ///
+    /// Returns `Err(())` if the pipeline channel is closed.
+    pub async fn inject_packet(
+        &self,
+        raw: bytes::Bytes,
+        face_id: FaceId,
+        arrival: u64,
+    ) -> Result<(), ()> {
+        self.inner.pipeline_tx
+            .send(InboundPacket { raw, face_id, arrival })
+            .await
+            .map_err(|_| ())
+    }
+
     /// Get the cancellation token for a face, if one exists.
     ///
     /// Used by `faces/create` to create child tokens so that SHM faces are

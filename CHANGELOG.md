@@ -12,6 +12,27 @@ bootstrapping phase and all APIs should be considered unstable.
 
 ### Added
 
+#### Network listeners — UDP and TCP on port 6363
+
+The router now listens for incoming network traffic at startup, matching NFD's
+default behavior.
+
+- **UDP listener** (`run_udp_listener`) — binds an unconnected socket on the
+  configured address (default `0.0.0.0:6363`). Auto-creates a per-peer `UdpFace`
+  on the first datagram from each new source address. Subsequent packets from
+  that peer are injected directly into the pipeline.
+- **TCP listener** (`run_tcp_listener`) — accepts incoming TCP connections and
+  creates a `TcpFace` per connection with TLV length-prefix framing.
+- **Default listeners** — when no `[[face]]` entries are present in the config
+  (or no config file is given), the router automatically starts both UDP and TCP
+  listeners on `0.0.0.0:6363`.
+- **Config-driven** — `[[face]]` entries with `kind = "udp"` or `kind = "tcp"`
+  and optional `bind` address are instantiated at startup.
+- **`ForwarderEngine::inject_packet()`** — public method to push raw packets
+  directly into the pipeline channel, used by listener tasks that manage their
+  own recv loop.
+- **`ndn_config::FaceKind`** re-exported from `ndn-config` crate root.
+
 #### Ergonomic application library API
 
 **ndn-packet (Name ergonomics):**

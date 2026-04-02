@@ -104,9 +104,75 @@ async fn main() -> Result<()> {
         0,
     );
 
-    tracing::info!("engine running");
+    // ── Startup face listeners from config ──────────────────────────────────
+    //
+    // If no [[face]] entries are configured, start default UDP and TCP
+    // listeners on 0.0.0.0:6363 (matches NFD default behavior).
 
     let cancel = CancellationToken::new();
+
+    let face_configs: std::borrow::Cow<'_, [ndn_config::FaceConfig]> = if fwd_config.faces.is_empty() {
+        tracing::info!("no [[face]] in config, using defaults: udp+tcp on 0.0.0.0:6363");
+        std::borrow::Cow::Owned(vec![
+            ndn_config::FaceConfig {
+                kind: ndn_config::FaceKind::Udp,
+                bind: Some("0.0.0.0:6363".into()),
+                remote: None, group: None, port: None, interface: None, path: None,
+            },
+            ndn_config::FaceConfig {
+                kind: ndn_config::FaceKind::Tcp,
+                bind: Some("0.0.0.0:6363".into()),
+                remote: None, group: None, port: None, interface: None, path: None,
+            },
+        ])
+    } else {
+        std::borrow::Cow::Borrowed(&fwd_config.faces)
+    };
+
+    for face_cfg in face_configs.iter() {
+        match face_cfg.kind {
+            ndn_config::FaceKind::Udp => {
+                let bind = face_cfg.bind.as_deref().unwrap_or("0.0.0.0:6363");
+                let addr: std::net::SocketAddr = match bind.parse() {
+                    Ok(a) => a,
+                    Err(e) => {
+                        tracing::error!(bind=%bind, error=%e, "invalid UDP bind address");
+                        continue;
+                    }
+                };
+                let eng = engine.clone();
+                let c = cancel.clone();
+                tokio::spawn(async move {
+                    mgmt_ndn::run_udp_listener(addr, eng, c).await;
+                });
+            }
+            ndn_config::FaceKind::Tcp => {
+                let bind = face_cfg.bind.as_deref().unwrap_or("0.0.0.0:6363");
+                let addr: std::net::SocketAddr = match bind.parse() {
+                    Ok(a) => a,
+                    Err(e) => {
+                        tracing::error!(bind=%bind, error=%e, "invalid TCP bind address");
+                        continue;
+                    }
+                };
+                let eng = engine.clone();
+                let c = cancel.clone();
+                tokio::spawn(async move {
+                    mgmt_ndn::run_tcp_listener(addr, eng, c).await;
+                });
+            }
+            ndn_config::FaceKind::Multicast => {
+                // TODO: multicast face from config
+                tracing::warn!("multicast face config not yet supported at startup");
+            }
+            ndn_config::FaceKind::Unix => {
+                // Unix faces are handled by the face listener below.
+                tracing::warn!("unix face config ignored (use [management] face_socket)");
+            }
+        }
+    }
+
+    tracing::info!("engine running");
 
     // ── Management transport selection ────────────────────────────────────────
     //
