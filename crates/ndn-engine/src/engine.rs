@@ -1,4 +1,6 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
 use tokio::sync::mpsc;
@@ -9,12 +11,43 @@ use ndn_packet::Interest;
 use ndn_security::SecurityManager;
 use ndn_store::{LruCs, Pit, PitToken, StrategyTable};
 use ndn_strategy::MeasurementsTable;
-use ndn_transport::{Face, FaceId, FaceTable};
+use ndn_transport::{Face, FaceId, FacePersistency, FaceTable};
 
 use crate::stages::ErasedStrategy;
 
 use crate::dispatcher::InboundPacket;
 use crate::Fib;
+
+/// Per-face lifecycle state stored alongside the cancellation token.
+pub struct FaceState {
+    pub cancel: CancellationToken,
+    pub persistency: FacePersistency,
+    /// Last packet activity (nanoseconds since Unix epoch).
+    /// Updated on recv and send; used for idle-timeout of on-demand faces.
+    pub last_activity: AtomicU64,
+}
+
+impl FaceState {
+    pub fn new(cancel: CancellationToken, persistency: FacePersistency) -> Self {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        Self {
+            cancel,
+            persistency,
+            last_activity: AtomicU64::new(now),
+        }
+    }
+
+    pub fn touch(&self) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        self.last_activity.store(now, Ordering::Relaxed);
+    }
+}
 
 /// Shared tables owned by the engine, accessible to all tasks via `Arc`.
 pub struct EngineInner {
@@ -30,13 +63,13 @@ pub struct EngineInner {
     /// Pipeline inbound channel — used to spawn readers for dynamically-added
     /// faces (those registered after `build()` completes).
     pub(crate) pipeline_tx: mpsc::Sender<InboundPacket>,
-    /// Per-face cancellation tokens for cascading cleanup.
+    /// Per-face state: cancellation token, persistency level, and last activity.
     ///
     /// When a control face (e.g. UnixFace) creates child faces (e.g. SHM via
     /// `faces/create`), the child uses a child token of the control face's
     /// token.  When the control face disconnects, its token is cancelled,
     /// which propagates to all child faces.
-    pub(crate) face_tokens: Arc<DashMap<FaceId, CancellationToken>>,
+    pub(crate) face_states: Arc<DashMap<FaceId, FaceState>>,
 }
 
 /// Handle to a running forwarding engine.
@@ -73,14 +106,6 @@ impl ForwarderEngine {
     }
 
     /// Look up the source face that originally sent an Interest.
-    ///
-    /// Computes the PIT token from the Interest's name, selectors, and
-    /// forwarding hint, then reads the first in-record to find the source
-    /// face ID.  Returns `None` if no PIT entry exists (e.g. the Interest
-    /// was already satisfied or expired).
-    ///
-    /// This is used by the management handler to implement NFD's "FaceId
-    /// defaults to the requesting face" behavior.
     pub fn source_face_id(&self, interest: &Interest) -> Option<FaceId> {
         let token = PitToken::from_interest_full(
             &interest.name,
@@ -93,30 +118,34 @@ impl ForwarderEngine {
 
     /// Register a face and immediately start its packet-reader task.
     ///
-    /// Use this for faces accepted from a listener after `build()` returns —
-    /// for example, a `UnixFace` connection accepted by the NDN face listener.
-    /// The face participates in forwarding exactly like faces registered at
-    /// build time.
+    /// Persistence defaults to `OnDemand`. Use `add_face_with_persistency` for
+    /// management-created or permanent faces.
     pub fn add_face<F: Face + 'static>(&self, face: F, cancel: CancellationToken) {
-        let face_id    = face.id();
-        self.inner.face_tokens.insert(face_id, cancel.clone());
+        self.add_face_with_persistency(face, cancel, FacePersistency::OnDemand);
+    }
+
+    /// Register a face with an explicit persistence level.
+    pub fn add_face_with_persistency<F: Face + 'static>(
+        &self,
+        face: F,
+        cancel: CancellationToken,
+        persistency: FacePersistency,
+    ) {
+        let face_id = face.id();
+        self.inner.face_states.insert(face_id, FaceState::new(cancel.clone(), persistency));
         self.inner.face_table.insert(face);
         let erased     = self.inner.face_table.get(face_id)
             .expect("face was just inserted");
         let tx         = self.inner.pipeline_tx.clone();
         let face_table = Arc::clone(&self.inner.face_table);
         let fib        = Arc::clone(&self.inner.fib);
-        let face_tokens = Arc::clone(&self.inner.face_tokens);
+        let face_states = Arc::clone(&self.inner.face_states);
         tokio::spawn(crate::dispatcher::run_face_reader(
-            face_id, erased, tx, cancel, face_table, fib, face_tokens,
+            face_id, erased, tx, cancel, face_table, fib, face_states,
         ));
     }
 
     /// Inject a raw packet into the pipeline as if it arrived from `face_id`.
-    ///
-    /// Used by listener tasks (UDP/TCP) that manage their own recv loop and
-    /// need to feed packets into the pipeline without going through the face's
-    /// `run_face_reader` task.
     ///
     /// Returns `Err(())` if the pipeline channel is closed.
     pub async fn inject_packet(
@@ -132,11 +161,13 @@ impl ForwarderEngine {
     }
 
     /// Get the cancellation token for a face, if one exists.
-    ///
-    /// Used by `faces/create` to create child tokens so that SHM faces are
-    /// cancelled when their control face disconnects.
     pub fn face_token(&self, face_id: FaceId) -> Option<CancellationToken> {
-        self.inner.face_tokens.get(&face_id).map(|r| r.clone())
+        self.inner.face_states.get(&face_id).map(|r| r.cancel.clone())
+    }
+
+    /// Access the face states map (for idle timeout sweeps).
+    pub fn face_states(&self) -> Arc<DashMap<FaceId, FaceState>> {
+        Arc::clone(&self.inner.face_states)
     }
 }
 

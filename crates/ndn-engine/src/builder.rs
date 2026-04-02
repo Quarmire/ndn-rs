@@ -103,12 +103,12 @@ impl EngineBuilder {
         let strategy_table = Arc::new(StrategyTable::<dyn ErasedStrategy>::new());
         strategy_table.insert(&Name::root(), Arc::clone(&default_strategy));
 
-        let face_tokens = Arc::new(dashmap::DashMap::new());
+        let face_states = Arc::new(dashmap::DashMap::new());
 
         let dispatcher = PacketDispatcher {
             face_table:  Arc::clone(&face_table),
-            face_tokens: Arc::clone(&face_tokens),
-            decode:      TlvDecodeStage,
+            face_states: Arc::clone(&face_states),
+            decode:      TlvDecodeStage { face_table: Arc::clone(&face_table) },
             cs_lookup:   CsLookupStage { cs: Arc::clone(&cs) },
             pit_check:   PitCheckStage { pit: Arc::clone(&pit) },
             strategy:    StrategyStage {
@@ -129,6 +129,22 @@ impl EngineBuilder {
 
         let pipeline_tx = dispatcher.spawn(cancel.clone(), &mut tasks);
 
+        // Idle face sweep task.
+        {
+            let face_states_clone = Arc::clone(&face_states);
+            let face_table_clone  = Arc::clone(&face_table);
+            let fib_clone         = Arc::clone(&fib);
+            let cancel_clone      = cancel.clone();
+            tasks.spawn(async move {
+                crate::expiry::run_idle_face_task(
+                    face_states_clone,
+                    face_table_clone,
+                    fib_clone,
+                    cancel_clone,
+                ).await;
+            });
+        }
+
         let inner = Arc::new(EngineInner {
             fib:            Arc::clone(&fib),
             pit:            Arc::clone(&pit),
@@ -138,7 +154,7 @@ impl EngineBuilder {
             strategy_table: Arc::clone(&strategy_table),
             security:       self.security,
             pipeline_tx,
-            face_tokens,
+            face_states,
         });
 
         let engine = ForwarderEngine { inner };

@@ -31,6 +31,50 @@ pub enum FaceKind {
     Internal,
 }
 
+impl FaceKind {
+    /// Whether this face is local (in-process / same-host IPC) or non-local (network).
+    pub fn scope(&self) -> FaceScope {
+        match self {
+            FaceKind::Unix | FaceKind::App | FaceKind::Shm | FaceKind::Internal => FaceScope::Local,
+            _ => FaceScope::NonLocal,
+        }
+    }
+}
+
+/// Whether a face is local (same-host IPC) or non-local (network).
+///
+/// NFD uses this to enforce that `/localhost` prefixes never cross non-local
+/// faces — a security boundary preventing management Interests from leaking
+/// onto the network.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FaceScope {
+    Local,
+    NonLocal,
+}
+
+/// Face persistence level (NFD semantics).
+///
+/// - `OnDemand` (0): created by a listener, destroyed on idle timeout or I/O error.
+/// - `Persistent` (1): created by management command, survives I/O errors.
+/// - `Permanent` (2): never destroyed, even on I/O errors (multicast, always-on links).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FacePersistency {
+    OnDemand   = 0,
+    Persistent = 1,
+    Permanent  = 2,
+}
+
+impl FacePersistency {
+    pub fn from_u64(v: u64) -> Option<Self> {
+        match v {
+            0 => Some(Self::OnDemand),
+            1 => Some(Self::Persistent),
+            2 => Some(Self::Permanent),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum FaceError {
     #[error("face closed")]
