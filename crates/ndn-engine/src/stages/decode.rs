@@ -62,10 +62,11 @@ impl TlvDecodeStage {
             None => return Err(raw), // Not a multi-fragment LpPacket.
         };
         let fragment = raw.slice(hdr.frag_start..hdr.frag_end);
+        let base_seq = hdr.sequence - hdr.frag_index;
         let mut rb = self.reassembly
             .entry(face_id)
             .or_insert_with(ReassemblyBuffer::default);
-        Ok(rb.process(hdr.sequence, hdr.frag_index, hdr.frag_count, fragment))
+        Ok(rb.process(base_seq, hdr.frag_index, hdr.frag_count, fragment))
     }
 
     pub fn process(&self, mut ctx: PacketContext) -> Action {
@@ -164,18 +165,37 @@ impl TlvDecodeStage {
             ctx.tags.insert(CongestionMark(mark));
         }
 
+        // Bare Ack-only packets have no payload to process.
+        if lp.is_ack_only() {
+            return Action::Drop(DropReason::FragmentCollect);
+        }
+
+        let is_fragmented = lp.is_fragmented();
+        let sequence = lp.sequence;
+        let frag_index = lp.frag_index;
+        let frag_count = lp.frag_count;
+        let nack = lp.nack;
+
+        let fragment = match lp.fragment {
+            Some(f) => f,
+            None => return Action::Drop(DropReason::MalformedPacket),
+        };
+
         // Fragment reassembly: buffer until all fragments arrive.
-        if lp.is_fragmented() {
+        if is_fragmented {
             let face_id = ctx.face_id;
             let complete = {
                 let mut rb = self.reassembly
                     .entry(face_id)
                     .or_insert_with(ReassemblyBuffer::default);
+                let seq = sequence.unwrap_or(0);
+                let idx = frag_index.unwrap_or(0);
+                let base_seq = seq - idx;
                 rb.process(
-                    lp.sequence.unwrap_or(0),
-                    lp.frag_index.unwrap_or(0),
-                    lp.frag_count.unwrap_or(1),
-                    lp.fragment,
+                    base_seq,
+                    idx,
+                    frag_count.unwrap_or(1),
+                    fragment,
                 )
             };
             match complete {
@@ -191,9 +211,9 @@ impl TlvDecodeStage {
             }
         }
 
-        if let Some(reason) = lp.nack {
+        if let Some(reason) = nack {
             // LpPacket with Nack header: fragment is the nacked Interest.
-            match Interest::decode(lp.fragment) {
+            match Interest::decode(fragment) {
                 Ok(interest) => {
                     trace!(face=%ctx.face_id, name=%interest.name, reason=?reason, "decode: Nack");
                     let nack = Nack::new(interest, reason);
@@ -209,7 +229,7 @@ impl TlvDecodeStage {
             }
         } else {
             // Plain LpPacket wrapping Interest or Data.
-            ctx.raw_bytes = lp.fragment;
+            ctx.raw_bytes = fragment;
             self.process(ctx)
         }
     }

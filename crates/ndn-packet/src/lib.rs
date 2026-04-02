@@ -59,6 +59,7 @@ pub mod tlv_type {
     pub const LP_FRAG_INDEX:    u64 = 0x52;
     pub const LP_FRAG_COUNT:    u64 = 0x53;
     pub const LP_CONGESTION_MARK: u64 = 0x0340;
+    pub const LP_ACK:             u64 = 0x0344;
 
     // Signed Interest (NDN Packet Format v0.3 §5.4)
     pub const INTEREST_SIGNATURE_INFO:  u64 = 0x2C;

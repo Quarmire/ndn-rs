@@ -20,7 +20,8 @@ use crate::tlv_type;
 #[derive(Debug)]
 pub struct LpPacket {
     /// The network-layer fragment (Interest or Data wire bytes).
-    pub fragment: Bytes,
+    /// `None` for bare Ack-only packets (no payload).
+    pub fragment: Option<Bytes>,
     /// Nack header — present when this LpPacket carries a Nack.
     pub nack: Option<NackReason>,
     /// Hop-by-hop congestion mark (0 = no congestion).
@@ -31,6 +32,8 @@ pub struct LpPacket {
     pub frag_index: Option<u64>,
     /// Total number of fragments the original packet was split into.
     pub frag_count: Option<u64>,
+    /// Piggybacked Ack TxSequences (NDNLPv2 reliability).
+    pub acks: Vec<u64>,
 }
 
 impl LpPacket {
@@ -51,6 +54,7 @@ impl LpPacket {
         let mut sequence = None;
         let mut frag_index = None;
         let mut frag_count = None;
+        let mut acks = Vec::new();
 
         while !inner.is_empty() {
             let (t, v) = inner.read_tlv()?;
@@ -73,6 +77,9 @@ impl LpPacket {
                 tlv_type::LP_FRAG_COUNT => {
                     frag_count = Some(decode_be_u64(&v));
                 }
+                tlv_type::LP_ACK => {
+                    acks.push(decode_be_u64(&v));
+                }
                 tlv_type::INTEREST | tlv_type::DATA => {
                     let mut w = TlvWriter::new();
                     w.write_tlv(t, &v);
@@ -82,9 +89,12 @@ impl LpPacket {
             }
         }
 
-        let fragment = fragment.ok_or_else(|| {
-            crate::PacketError::MalformedPacket("LpPacket missing fragment".into())
-        })?;
+        // A valid LpPacket must have either a fragment or at least one Ack.
+        if fragment.is_none() && acks.is_empty() {
+            return Err(crate::PacketError::MalformedPacket(
+                "LpPacket has neither fragment nor acks".into(),
+            ));
+        }
 
         Ok(Self {
             fragment,
@@ -93,6 +103,7 @@ impl LpPacket {
             sequence,
             frag_index,
             frag_count,
+            acks,
         })
     }
 }
@@ -101,6 +112,11 @@ impl LpPacket {
     /// Returns `true` if this LpPacket is a fragment of a larger packet.
     pub fn is_fragmented(&self) -> bool {
         self.frag_count.is_some_and(|c| c > 1)
+    }
+
+    /// Returns `true` if this LpPacket is a bare Ack (no payload fragment).
+    pub fn is_ack_only(&self) -> bool {
+        self.fragment.is_none() && !self.acks.is_empty()
     }
 }
 
@@ -175,6 +191,82 @@ pub fn encode_lp_packet(packet: &[u8]) -> Bytes {
         w.write_tlv(tlv_type::LP_FRAGMENT, packet);
     });
     w.finish()
+}
+
+/// Encode a reliability-enabled LpPacket with TxSequence, optional fragmentation,
+/// and piggybacked Acks.
+///
+/// `frag_info` is `Some((frag_index, frag_count))` for fragmented packets.
+/// `acks` contains TxSequences to acknowledge.
+pub fn encode_lp_reliable(
+    fragment: &[u8],
+    sequence: u64,
+    frag_info: Option<(u64, u64)>,
+    acks: &[u64],
+) -> Bytes {
+    let mut w = TlvWriter::new();
+    w.write_nested(tlv_type::LP_PACKET, |w| {
+        let (buf, len) = crate::encode::nni(sequence);
+        w.write_tlv(tlv_type::LP_SEQUENCE, &buf[..len]);
+        if let Some((idx, count)) = frag_info {
+            let (buf, len) = crate::encode::nni(idx);
+            w.write_tlv(tlv_type::LP_FRAG_INDEX, &buf[..len]);
+            let (buf, len) = crate::encode::nni(count);
+            w.write_tlv(tlv_type::LP_FRAG_COUNT, &buf[..len]);
+        }
+        for &ack in acks {
+            let (buf, len) = crate::encode::nni(ack);
+            w.write_tlv(tlv_type::LP_ACK, &buf[..len]);
+        }
+        w.write_tlv(tlv_type::LP_FRAGMENT, fragment);
+    });
+    w.finish()
+}
+
+/// Encode a bare Ack-only LpPacket (no fragment payload).
+pub fn encode_lp_acks(acks: &[u64]) -> Bytes {
+    let mut w = TlvWriter::new();
+    w.write_nested(tlv_type::LP_PACKET, |w| {
+        for &ack in acks {
+            let (buf, len) = crate::encode::nni(ack);
+            w.write_tlv(tlv_type::LP_ACK, &buf[..len]);
+        }
+    });
+    w.finish()
+}
+
+/// Fast-path extraction of Sequence and Ack fields from a raw LpPacket.
+///
+/// Scans for Sequence (0x51) and Ack (0x0344) TLVs without allocating `Bytes`.
+/// Returns `(tx_sequence, acks)`. Used only for reliability-enabled faces.
+pub fn extract_acks(raw: &[u8]) -> (Option<u64>, smallvec::SmallVec<[u64; 8]>) {
+    let mut tx_seq = None;
+    let mut acks = smallvec::SmallVec::new();
+
+    if raw.first() != Some(&0x64) {
+        return (tx_seq, acks);
+    }
+    let Some((_, type_len)) = ndn_tlv::read_varu64(raw).ok() else { return (tx_seq, acks) };
+    let Some((outer_len, len_len)) = ndn_tlv::read_varu64(&raw[type_len..]).ok() else { return (tx_seq, acks) };
+    let header_len = type_len + len_len;
+    let Some(inner) = raw.get(header_len..header_len + outer_len as usize) else { return (tx_seq, acks) };
+
+    let mut pos = 0;
+    while pos < inner.len() {
+        let Some((t, tn)) = ndn_tlv::read_varu64(&inner[pos..]).ok() else { break };
+        pos += tn;
+        let Some((l, ln)) = ndn_tlv::read_varu64(&inner[pos..]).ok() else { break };
+        pos += ln;
+        let l = l as usize;
+        if pos + l > inner.len() { break; }
+        match t {
+            0x51 => tx_seq = Some(decode_be_u64(&inner[pos..pos + l])),
+            0x0344 => acks.push(decode_be_u64(&inner[pos..pos + l])),
+            _ => {}
+        }
+        pos += l;
+    }
+    (tx_seq, acks)
 }
 
 /// Check if raw bytes start with an LpPacket TLV type (0x64).
@@ -285,7 +377,7 @@ mod tests {
         assert!(lp.congestion_mark.is_none());
 
         // Fragment should be the original Interest.
-        let interest = Interest::decode(lp.fragment).unwrap();
+        let interest = Interest::decode(lp.fragment.unwrap()).unwrap();
         assert_eq!(*interest.name, n);
     }
 
@@ -313,7 +405,7 @@ mod tests {
 
         let lp = LpPacket::decode(lp_wire).unwrap();
         assert!(lp.nack.is_none());
-        let interest = Interest::decode(lp.fragment).unwrap();
+        let interest = Interest::decode(lp.fragment.unwrap()).unwrap();
         assert_eq!(*interest.name, n);
     }
 
@@ -404,7 +496,7 @@ mod tests {
 
         let lp = LpPacket::decode(lp_wire).unwrap();
         assert!(lp.nack.is_none());
-        let interest = Interest::decode(lp.fragment).unwrap();
+        let interest = Interest::decode(lp.fragment.unwrap()).unwrap();
         assert_eq!(*interest.name, n);
     }
 
@@ -472,7 +564,81 @@ mod tests {
             assert_eq!(hdr.sequence, lp.sequence.unwrap());
             assert_eq!(hdr.frag_index, lp.frag_index.unwrap());
             assert_eq!(hdr.frag_count, lp.frag_count.unwrap());
-            assert_eq!(&frag_bytes[hdr.frag_start..hdr.frag_end], &lp.fragment[..]);
+            assert_eq!(&frag_bytes[hdr.frag_start..hdr.frag_end], &lp.fragment.unwrap()[..]);
         }
+    }
+
+    #[test]
+    fn encode_decode_lp_reliable_roundtrip() {
+        let n = name(&[b"test"]);
+        let interest_wire = encode_interest(&n, None);
+
+        let wire = encode_lp_reliable(&interest_wire, 42, None, &[10, 20]);
+        let lp = LpPacket::decode(wire).unwrap();
+        assert_eq!(lp.sequence, Some(42));
+        assert_eq!(lp.frag_index, None);
+        assert_eq!(lp.frag_count, None);
+        assert_eq!(lp.acks, vec![10, 20]);
+        let interest = Interest::decode(lp.fragment.unwrap()).unwrap();
+        assert_eq!(*interest.name, n);
+    }
+
+    #[test]
+    fn encode_decode_lp_reliable_with_frag_info() {
+        let wire = encode_lp_reliable(&[0x05, 0x00], 100, Some((1, 3)), &[]);
+        let lp = LpPacket::decode(wire).unwrap();
+        assert_eq!(lp.sequence, Some(100));
+        assert_eq!(lp.frag_index, Some(1));
+        assert_eq!(lp.frag_count, Some(3));
+        assert!(lp.acks.is_empty());
+    }
+
+    #[test]
+    fn encode_decode_lp_acks_roundtrip() {
+        let wire = encode_lp_acks(&[5, 6, 7]);
+        let lp = LpPacket::decode(wire).unwrap();
+        assert!(lp.fragment.is_none());
+        assert_eq!(lp.acks, vec![5, 6, 7]);
+        assert!(lp.is_ack_only());
+    }
+
+    #[test]
+    fn decode_bare_ack_no_fragment_ok() {
+        let wire = encode_lp_acks(&[99]);
+        assert!(LpPacket::decode(wire).is_ok());
+    }
+
+    #[test]
+    fn decode_empty_lp_packet_errors() {
+        // LpPacket with neither fragment nor acks.
+        let mut w = TlvWriter::new();
+        w.write_nested(tlv_type::LP_PACKET, |_| {});
+        assert!(LpPacket::decode(w.finish()).is_err());
+    }
+
+    #[test]
+    fn extract_acks_from_reliable_packet() {
+        let wire = encode_lp_reliable(&[0x05, 0x00], 42, None, &[10, 20, 30]);
+        let (seq, acks) = extract_acks(&wire);
+        assert_eq!(seq, Some(42));
+        assert_eq!(&acks[..], &[10, 20, 30]);
+    }
+
+    #[test]
+    fn extract_acks_from_ack_only() {
+        let wire = encode_lp_acks(&[7, 8]);
+        let (seq, acks) = extract_acks(&wire);
+        assert_eq!(seq, None);
+        assert_eq!(&acks[..], &[7, 8]);
+    }
+
+    #[test]
+    fn extract_acks_from_plain_lp() {
+        let n = name(&[b"test"]);
+        let interest_wire = encode_interest(&n, None);
+        let wire = encode_lp_packet(&interest_wire);
+        let (seq, acks) = extract_acks(&wire);
+        assert_eq!(seq, None);
+        assert!(acks.is_empty());
     }
 }

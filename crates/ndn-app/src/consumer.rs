@@ -80,8 +80,10 @@ impl Consumer {
                     return Err(AppError::Nacked { reason });
                 }
                 // LpPacket without Nack — decode the fragment as Data.
-                return Data::decode(lp.fragment)
-                    .map_err(|e| AppError::Engine(e.into()));
+                if let Some(fragment) = lp.fragment {
+                    return Data::decode(fragment)
+                        .map_err(|e| AppError::Engine(e.into()));
+                }
             }
         }
 
