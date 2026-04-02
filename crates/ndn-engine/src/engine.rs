@@ -145,6 +145,22 @@ impl ForwarderEngine {
         ));
     }
 
+    /// Register a send-only face (no recv loop spawned).
+    ///
+    /// Use this for faces created by a listener that handles inbound packets
+    /// itself via `inject_packet`.  The face is added to the face table so
+    /// the dispatcher can send Data/Nack to it, but no `run_face_reader`
+    /// task is spawned.
+    pub fn add_face_send_only<F: Face + 'static>(
+        &self,
+        face: F,
+        cancel: CancellationToken,
+    ) {
+        let face_id = face.id();
+        self.inner.face_states.insert(face_id, FaceState::new(cancel, FacePersistency::OnDemand));
+        self.inner.face_table.insert(face);
+    }
+
     /// Inject a raw packet into the pipeline as if it arrived from `face_id`.
     ///
     /// Returns `Err(())` if the pipeline channel is closed.
