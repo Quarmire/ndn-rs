@@ -37,18 +37,27 @@ impl Strategy for BestRouteStrategy {
         &self.name
     }
 
+    fn decide(
+        &self,
+        ctx: &StrategyContext<'_>,
+    ) -> Option<SmallVec<[ForwardingAction; 2]>> {
+        let Some(fib) = ctx.fib_entry else {
+            return Some(smallvec![ForwardingAction::Nack(NackReason::NoRoute)]);
+        };
+        let nexthops = fib.nexthops_excluding(ctx.in_face);
+        match nexthops.first() {
+            Some(nh) => Some(smallvec![ForwardingAction::Forward(smallvec![nh.face_id])]),
+            None     => Some(smallvec![ForwardingAction::Nack(NackReason::NoRoute)]),
+        }
+    }
+
     async fn after_receive_interest(
         &self,
         ctx: &StrategyContext<'_>,
     ) -> SmallVec<[ForwardingAction; 2]> {
-        let Some(fib) = ctx.fib_entry else {
-            return smallvec![ForwardingAction::Nack(NackReason::NoRoute)];
-        };
-        let nexthops = fib.nexthops_excluding(ctx.in_face);
-        match nexthops.first() {
-            Some(nh) => smallvec![ForwardingAction::Forward(smallvec![nh.face_id])],
-            None     => smallvec![ForwardingAction::Nack(NackReason::NoRoute)],
-        }
+        // Sync fast path handles all cases; this is unreachable when
+        // called through ErasedStrategy but kept for direct Strategy use.
+        self.decide(ctx).unwrap()
     }
 
     async fn after_receive_data(

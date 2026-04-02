@@ -37,12 +37,12 @@ impl Strategy for MulticastStrategy {
         &self.name
     }
 
-    async fn after_receive_interest(
+    fn decide(
         &self,
         ctx: &StrategyContext<'_>,
-    ) -> SmallVec<[ForwardingAction; 2]> {
+    ) -> Option<SmallVec<[ForwardingAction; 2]>> {
         let Some(fib) = ctx.fib_entry else {
-            return smallvec![ForwardingAction::Nack(NackReason::NoRoute)];
+            return Some(smallvec![ForwardingAction::Nack(NackReason::NoRoute)]);
         };
         let faces: SmallVec<[FaceId; 4]> = fib
             .nexthops_excluding(ctx.in_face)
@@ -50,9 +50,16 @@ impl Strategy for MulticastStrategy {
             .map(|n| n.face_id)
             .collect();
         if faces.is_empty() {
-            return smallvec![ForwardingAction::Nack(NackReason::NoRoute)];
+            return Some(smallvec![ForwardingAction::Nack(NackReason::NoRoute)]);
         }
-        smallvec![ForwardingAction::Forward(faces)]
+        Some(smallvec![ForwardingAction::Forward(faces)])
+    }
+
+    async fn after_receive_interest(
+        &self,
+        ctx: &StrategyContext<'_>,
+    ) -> SmallVec<[ForwardingAction; 2]> {
+        self.decide(ctx).unwrap()
     }
 
     async fn after_receive_data(

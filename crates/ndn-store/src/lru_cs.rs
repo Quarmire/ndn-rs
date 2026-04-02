@@ -1,4 +1,5 @@
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::Bytes;
 use lru::LruCache;
@@ -15,9 +16,15 @@ use crate::{CsCapacity, CsEntry, CsMeta, ContentStore, InsertResult, NameTrie};
 ///   enabling `CanBePrefix` lookups via `first_descendant`.
 ///
 /// All insertions and evictions update both indices atomically under the lock.
+///
+/// An atomic entry count (`entry_count`) allows `get()` to short-circuit
+/// without acquiring the Mutex when the CS is empty — eliminating lock
+/// contention on the hot path for workloads that don't cache (e.g. iperf).
 pub struct LruCs {
     inner: Mutex<LruInner>,
     capacity_bytes: usize,
+    /// Atomic entry count — updated under the lock but readable without it.
+    entry_count: AtomicUsize,
 }
 
 struct LruInner {
@@ -41,6 +48,7 @@ impl LruCs {
                 current_bytes: 0,
             }),
             capacity_bytes,
+            entry_count: AtomicUsize::new(0),
         }
     }
 }
@@ -64,6 +72,10 @@ impl LruCs {
 
 impl ContentStore for LruCs {
     async fn get(&self, interest: &Interest) -> Option<CsEntry> {
+        // Fast path: skip the Mutex entirely when the CS is empty.
+        if self.entry_count.load(Ordering::Relaxed) == 0 {
+            return None;
+        }
         let mut inner = self.inner.lock().unwrap();
 
         // Check if the Interest carries an ImplicitSha256DigestComponent as
@@ -122,6 +134,7 @@ impl ContentStore for LruCs {
                 inner.current_bytes =
                     inner.current_bytes.saturating_sub(evicted.data.len());
                 inner.prefix_index.remove(&evicted_name);
+                self.entry_count.fetch_sub(1, Ordering::Relaxed);
             } else {
                 break;
             }
@@ -136,6 +149,9 @@ impl ContentStore for LruCs {
             inner.prefix_index.insert(name.as_ref(), Arc::clone(&name));
         }
 
+        if !was_present {
+            self.entry_count.fetch_add(1, Ordering::Relaxed);
+        }
         if was_present { InsertResult::Replaced } else { InsertResult::Inserted }
     }
 
@@ -145,6 +161,7 @@ impl ContentStore for LruCs {
             inner.current_bytes =
                 inner.current_bytes.saturating_sub(evicted.data.len());
             inner.prefix_index.remove(name);
+            self.entry_count.fetch_sub(1, Ordering::Relaxed);
             return true;
         }
         false

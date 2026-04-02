@@ -16,6 +16,13 @@ pub trait ErasedStrategy: Send + Sync + 'static {
     /// Canonical name identifying this strategy (e.g. `/localhost/nfd/strategy/best-route`).
     fn name(&self) -> &Name;
 
+    /// Synchronous fast path — avoids the `Box::pin` heap allocation.
+    /// Returns `None` to fall through to the async path.
+    fn decide_sync(
+        &self,
+        ctx: &StrategyContext<'_>,
+    ) -> Option<SmallVec<[ForwardingAction; 2]>>;
+
     fn after_receive_interest_erased<'a>(
         &'a self,
         ctx: &'a StrategyContext<'a>,
@@ -31,6 +38,13 @@ pub trait ErasedStrategy: Send + Sync + 'static {
 impl<S: Strategy> ErasedStrategy for S {
     fn name(&self) -> &Name {
         Strategy::name(self)
+    }
+
+    fn decide_sync(
+        &self,
+        ctx: &StrategyContext<'_>,
+    ) -> Option<SmallVec<[ForwardingAction; 2]>> {
+        self.decide(ctx)
     }
 
     fn after_receive_interest_erased<'a>(
@@ -114,7 +128,13 @@ impl StrategyStage {
             .unwrap_or_else(|| Arc::clone(&self.default_strategy));
         trace!(face=%ctx.face_id, name=%name, strategy=%strategy.name(), "strategy: selected");
 
-        let actions = strategy.after_receive_interest_erased(&sctx).await;
+        // Sync fast path: avoids Box::pin heap allocation for strategies
+        // like BestRoute / Multicast whose decisions are fully synchronous.
+        let actions = if let Some(a) = strategy.decide_sync(&sctx) {
+            a
+        } else {
+            strategy.after_receive_interest_erased(&sctx).await
+        };
 
         // Use the first actionable ForwardingAction.
         for action in actions {

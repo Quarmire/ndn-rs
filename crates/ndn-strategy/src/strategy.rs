@@ -12,6 +12,20 @@ pub trait Strategy: Send + Sync + 'static {
     /// Canonical name identifying this strategy.
     fn name(&self) -> &Name;
 
+    /// Synchronous fast path for forwarding decisions.
+    ///
+    /// Strategies whose `after_receive_interest` is fully synchronous should
+    /// override this to return `Some(actions)`, avoiding the `Box::pin` heap
+    /// allocation in the `ErasedStrategy` wrapper.
+    ///
+    /// Returns `None` (default) to fall through to the async path.
+    fn decide(
+        &self,
+        _ctx: &StrategyContext,
+    ) -> Option<smallvec::SmallVec<[ForwardingAction; 2]>> {
+        None
+    }
+
     /// Called when an Interest arrives and needs a forwarding decision.
     fn after_receive_interest(
         &self,
