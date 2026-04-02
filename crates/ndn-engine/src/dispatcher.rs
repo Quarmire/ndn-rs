@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
@@ -372,6 +373,12 @@ pub(crate) async fn run_face_reader(
         .map(|s| s.persistency)
         .unwrap_or(FacePersistency::OnDemand);
 
+    // Cache whether this face needs idle-timeout tracking.  Local faces
+    // (App, Shm, Internal) don't idle-timeout, so skip the per-packet
+    // DashMap lookup + clock read for them.
+    let track_activity = matches!(persistency, FacePersistency::OnDemand)
+        && !matches!(kind, FaceKind::App | FaceKind::Shm | FaceKind::Internal);
+
     loop {
         let result = tokio::select! {
             _ = cancel.cancelled() => break,
@@ -380,14 +387,17 @@ pub(crate) async fn run_face_reader(
         match result {
             Ok(raw) => {
                 trace!(face=%face_id, len=raw.len(), "face-reader: recv");
-                // Update last-activity timestamp.
-                if let Some(state) = face_states.get(&face_id) {
-                    state.touch();
-                }
                 let arrival = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_nanos() as u64;
+                // Reuse the arrival timestamp for idle tracking (avoids
+                // a second clock read and DashMap lookup per packet).
+                if track_activity {
+                    if let Some(state) = face_states.get(&face_id) {
+                        state.last_activity.store(arrival, Ordering::Relaxed);
+                    }
+                }
                 if tx.send(InboundPacket { raw, face_id, arrival }).await.is_err() {
                     break; // Runner dropped.
                 }
