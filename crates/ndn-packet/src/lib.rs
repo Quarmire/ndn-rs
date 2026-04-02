@@ -13,6 +13,7 @@ pub mod meta_info;
 pub mod signature;
 pub mod encode;
 pub mod lp;
+pub mod fragment;
 
 pub use error::PacketError;
 pub use name::{Name, NameComponent};

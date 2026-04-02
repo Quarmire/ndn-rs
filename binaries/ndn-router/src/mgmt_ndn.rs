@@ -30,7 +30,7 @@ use ndn_engine::stages::ErasedStrategy;
 use ndn_packet::{Interest, Name, NameComponent, encode::encode_data_unsigned};
 use ndn_store::ContentStore;
 use ndn_strategy::{BestRouteStrategy, MulticastStrategy};
-use ndn_transport::{Face, FaceId};
+use ndn_transport::{Face, FaceId, FacePersistency};
 use tokio_util::sync::CancellationToken;
 
 use ndn_config::{
@@ -126,54 +126,89 @@ pub async fn run_udp_listener(
     tracing::info!(addr=%local, "UDP listener ready");
 
     let mut peers = std::collections::HashMap::<std::net::SocketAddr, FaceId>::new();
+    let mut reassembly = std::collections::HashMap::<
+        std::net::SocketAddr,
+        ndn_packet::fragment::ReassemblyBuffer,
+    >::new();
     let mut buf = vec![0u8; 9000];
+    let mut purge_interval = tokio::time::interval(std::time::Duration::from_secs(10));
 
     loop {
-        let (n, src) = tokio::select! {
+        tokio::select! {
             _ = cancel.cancelled() => break,
-            r = socket.recv_from(&mut buf) => match r {
-                Ok(pair) => pair,
-                Err(e) => {
-                    tracing::warn!(error=%e, "udp-listener: recv error");
-                    continue;
+            _ = purge_interval.tick() => {
+                for rb in reassembly.values_mut() {
+                    rb.purge_expired();
                 }
-            },
-        };
+                continue;
+            }
+            r = socket.recv_from(&mut buf) => {
+                let (n, src) = match r {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        tracing::warn!(error=%e, "udp-listener: recv error");
+                        continue;
+                    }
+                };
 
-        let raw = bytes::Bytes::copy_from_slice(&buf[..n]);
+                let raw = bytes::Bytes::copy_from_slice(&buf[..n]);
 
-        let face_id = if let Some(&id) = peers.get(&src) {
-            id
-        } else {
-            // New peer — create a UdpFace backed by a separate socket for sending.
-            let face_id = engine.faces().alloc_id();
-            let send_local: std::net::SocketAddr = if src.is_ipv4() {
-                "0.0.0.0:0".parse().unwrap()
-            } else {
-                "[::]:0".parse().unwrap()
-            };
-            match ndn_face_net::UdpFace::bind(send_local, src, face_id).await {
-                Ok(face) => {
-                    let peer_cancel = cancel.child_token();
-                    engine.add_face(face, peer_cancel);
-                    peers.insert(src, face_id);
-                    tracing::info!(face=%face_id, peer=%src, "udp-listener: new face");
-                    face_id
-                }
-                Err(e) => {
-                    tracing::warn!(peer=%src, error=%e, "udp-listener: face creation failed");
-                    continue;
+                let face_id = if let Some(&id) = peers.get(&src) {
+                    id
+                } else {
+                    // New peer — create a UdpFace backed by a separate socket for sending.
+                    let face_id = engine.faces().alloc_id();
+                    let send_local: std::net::SocketAddr = if src.is_ipv4() {
+                        "0.0.0.0:0".parse().unwrap()
+                    } else {
+                        "[::]:0".parse().unwrap()
+                    };
+                    match ndn_face_net::UdpFace::bind(send_local, src, face_id).await {
+                        Ok(face) => {
+                            let peer_cancel = cancel.child_token();
+                            engine.add_face(face, peer_cancel);
+                            peers.insert(src, face_id);
+                            tracing::info!(face=%face_id, peer=%src, "udp-listener: new face");
+                            face_id
+                        }
+                        Err(e) => {
+                            tracing::warn!(peer=%src, error=%e, "udp-listener: face creation failed");
+                            continue;
+                        }
+                    }
+                };
+
+                // Check if this is a fragmented LpPacket that needs reassembly.
+                let packet = if ndn_packet::lp::is_lp_packet(&raw) {
+                    match ndn_packet::lp::LpPacket::decode(raw.clone()) {
+                        Ok(lp) if lp.is_fragmented() => {
+                            let rb = reassembly.entry(src)
+                                .or_insert_with(ndn_packet::fragment::ReassemblyBuffer::default);
+                            match rb.process(
+                                lp.sequence.unwrap_or(0),
+                                lp.frag_index.unwrap_or(0),
+                                lp.frag_count.unwrap_or(1),
+                                lp.fragment,
+                            ) {
+                                Some(complete) => complete,
+                                None => continue, // Still waiting for more fragments.
+                            }
+                        }
+                        _ => raw, // Not fragmented or decode error — pass through.
+                    }
+                } else {
+                    raw
+                };
+
+                // Inject the packet directly into the pipeline (bypasses the face's recv loop).
+                let arrival = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as u64;
+                if engine.inject_packet(packet, face_id, arrival).await.is_err() {
+                    break; // Pipeline channel closed.
                 }
             }
-        };
-
-        // Inject the packet directly into the pipeline (bypasses the face's recv loop).
-        let arrival = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
-        if engine.inject_packet(raw, face_id, arrival).await.is_err() {
-            break; // Pipeline channel closed.
         }
     }
 
@@ -442,7 +477,7 @@ async fn faces_create_udp(addr_str: &str, engine: &ForwarderEngine) -> ControlRe
         Ok(face) => {
             let local_uri = face.local_uri().unwrap_or_default();
             let cancel = CancellationToken::new();
-            engine.add_face(face, cancel);
+            engine.add_face_with_persistency(face, cancel, FacePersistency::Persistent);
             tracing::info!(face = face_id.0, remote = %peer, "faces/create udp4");
 
             let echo = ControlParameters {
@@ -475,7 +510,7 @@ async fn faces_create_tcp(addr_str: &str, engine: &ForwarderEngine) -> ControlRe
         Ok(face) => {
             let local_uri = face.local_uri().unwrap_or_default();
             let cancel = CancellationToken::new();
-            engine.add_face(face, cancel);
+            engine.add_face_with_persistency(face, cancel, FacePersistency::Persistent);
             tracing::info!(face = face_id.0, remote = %peer, "faces/create tcp4");
 
             let echo = ControlParameters {
@@ -510,7 +545,7 @@ fn faces_create_shm(
                 .and_then(|sf| engine.face_token(sf))
                 .map(|t| t.child_token())
                 .unwrap_or_else(CancellationToken::new);
-            engine.add_face(face, cancel);
+            engine.add_face_with_persistency(face, cancel, FacePersistency::Persistent);
             tracing::info!(face = face_id.0, shm = shm_name, "faces/create shm");
 
             let echo = ControlParameters {
@@ -569,16 +604,22 @@ fn faces_destroy(params: ControlParameters, engine: &ForwarderEngine) -> Control
 
 fn faces_list(engine: &ForwarderEngine) -> ControlResponse {
     let entries = engine.faces().face_info();
+    let face_states = engine.face_states();
     let mut text = format!("{} faces\n", entries.len());
     for info in &entries {
-        let mut line = format!("  faceid={} remote={} local={}",
+        let persistency = face_states.get(&info.id)
+            .map(|s| s.persistency)
+            .unwrap_or(FacePersistency::OnDemand);
+        let mut line = format!("  faceid={} remote={} local={} persistency={:?}",
             info.id.0,
             info.remote_uri.as_deref().unwrap_or("N/A"),
             info.local_uri.as_deref().unwrap_or("N/A"),
+            persistency,
         );
         // Show kind if no URIs are available (e.g. App, Internal faces).
         if info.remote_uri.is_none() && info.local_uri.is_none() {
-            line = format!("  faceid={} kind={:?}", info.id.0, info.kind);
+            line = format!("  faceid={} kind={:?} persistency={:?}",
+                info.id.0, info.kind, persistency);
         }
         text.push_str(&line);
         text.push('\n');

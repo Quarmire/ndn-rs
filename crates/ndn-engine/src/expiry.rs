@@ -1,9 +1,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use dashmap::DashMap;
 use tokio_util::sync::CancellationToken;
 
 use ndn_store::Pit;
+use ndn_transport::{FaceId, FacePersistency, FaceTable};
+
+use crate::engine::FaceState;
+use crate::Fib;
 
 /// Background task that drains expired PIT entries every millisecond.
 ///
@@ -18,6 +23,52 @@ pub async fn run_expiry_task(pit: Arc<Pit>, cancel: CancellationToken) {
                 let expired = pit.drain_expired(now);
                 if !expired.is_empty() {
                     tracing::trace!(count = expired.len(), "PIT entries expired");
+                }
+            }
+        }
+    }
+}
+
+/// Default idle timeout for on-demand faces (5 minutes).
+const IDLE_TIMEOUT_NS: u64 = 5 * 60 * 1_000_000_000;
+
+/// Sweep interval for idle face detection.
+const IDLE_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Background task that removes on-demand faces that have been idle for too
+/// long (no packets sent or received within `IDLE_TIMEOUT_NS`).
+///
+/// Runs every 30 seconds until the cancellation token is cancelled.
+pub async fn run_idle_face_task(
+    face_states: Arc<DashMap<FaceId, FaceState>>,
+    face_table:  Arc<FaceTable>,
+    fib:         Arc<Fib>,
+    cancel:      CancellationToken,
+) {
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            _ = tokio::time::sleep(IDLE_SWEEP_INTERVAL) => {
+                let now = now_ns();
+                let mut expired = Vec::new();
+
+                for entry in face_states.iter() {
+                    if entry.persistency != FacePersistency::OnDemand {
+                        continue;
+                    }
+                    let last = entry.last_activity.load(std::sync::atomic::Ordering::Relaxed);
+                    if now.saturating_sub(last) > IDLE_TIMEOUT_NS {
+                        expired.push(*entry.key());
+                    }
+                }
+
+                for face_id in expired {
+                    if let Some((_, state)) = face_states.remove(&face_id) {
+                        state.cancel.cancel();
+                    }
+                    fib.remove_face(face_id);
+                    face_table.remove(face_id);
+                    tracing::debug!(face=%face_id, "idle on-demand face removed");
                 }
             }
         }

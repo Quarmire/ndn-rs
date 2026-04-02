@@ -69,6 +69,59 @@ default behavior.
   contexts.
 - **`MemKeyStore::get_signer_sync()`** — made public.
 
+#### Face scope enforcement
+
+`/localhost` prefix security boundary — packets with names starting with
+`/localhost` are confined to local faces only, matching NFD behavior.
+
+- **`FaceScope` enum** (`Local`, `NonLocal`) in `ndn-transport` — derived from
+  `FaceKind` (`Unix`/`App`/`Shm`/`Internal` → Local, all others → NonLocal).
+- **`FaceKind::scope()`** method for querying face locality.
+- **Inbound filtering** — `TlvDecodeStage` drops `/localhost` Interest, Data, and
+  Nack packets arriving on non-local faces (`DropReason::ScopeViolation`).
+- **Outbound filtering** — `PacketDispatcher` skips non-local faces when forwarding
+  or satisfying `/localhost`-prefixed packets.
+
+#### Face persistence (on-demand / persistent / permanent)
+
+NFD-compatible face lifecycle management with three persistence levels.
+
+- **`FacePersistency` enum** (`OnDemand`, `Persistent`, `Permanent`) in
+  `ndn-transport` — mirrors NFD semantics with `from_u64()` constructor.
+- **`FaceState`** replaces bare `CancellationToken` per face — tracks cancel token,
+  persistency level, and last-activity timestamp (`AtomicU64` nanoseconds).
+- **Persistency-aware cleanup** in `run_face_reader`:
+  - *Permanent*: retries on recv errors indefinitely (only cancellation stops it).
+  - *Persistent*: stops the recv loop on error but retains the face in table/FIB.
+  - *OnDemand*: fully removes face from table and cleans FIB routes (existing behavior).
+- **Idle face timeout** — background sweep task (`run_idle_face_task`) runs every 30s,
+  removing on-demand faces idle for >5 minutes.
+- **Management integration** — `faces/create` uses `Persistent` by default;
+  listener-accepted faces use `OnDemand`; `faces/list` shows persistency level.
+
+#### NDNLPv2 fragmentation and reassembly
+
+Automatic fragmentation/reassembly for packets exceeding the UDP MTU (~1400 bytes),
+enabling reliable transport of large NDN Data packets (~8800 bytes) over UDP.
+
+- **`ndn_packet::fragment` module** (new):
+  - `fragment_packet()` — splits a packet into MTU-sized NDNLPv2 LpPacket fragments
+    with `Sequence`, `FragIndex`, and `FragCount` fields.
+  - `ReassemblyBuffer` — per-peer stateful reassembly keyed by sequence number,
+    with configurable timeout and `purge_expired()` for cleanup.
+  - `DEFAULT_UDP_MTU` constant (1400 bytes).
+- **Outbound fragmentation** — `UdpFace` and `MulticastUdpFace` automatically
+  fragment packets larger than the MTU before sending. Each face maintains an
+  atomic sequence counter for fragment identification.
+- **Inbound reassembly** — UDP listener (`run_udp_listener`) maintains a per-peer
+  `ReassemblyBuffer`. Fragmented LpPackets are reassembled before injection into
+  the pipeline; a periodic purge (every 10s) cleans stale incomplete reassemblies.
+
+#### Multicast LpPacket wrapping
+
+- **`MulticastUdpFace::send()`** now wraps outgoing packets in NDNLPv2 LpPacket
+  framing, consistent with `UdpFace` and `TcpFace`.
+
 #### Pipeline stage tracing
 
 Per-packet `trace!`-level instrumentation across all forwarding pipeline stages,

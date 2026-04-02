@@ -1,11 +1,13 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use tokio::net::UdpSocket;
 
 use tracing::trace;
 
+use ndn_packet::fragment::{DEFAULT_UDP_MTU, fragment_packet};
 use ndn_transport::{Face, FaceError, FaceId, FaceKind};
 
 /// NDN face over unicast UDP.
@@ -19,10 +21,15 @@ use ndn_transport::{Face, FaceError, FaceId, FaceKind};
 ///
 /// `send_to` is `&self`-safe: `UdpSocket::send_to` takes `&self` and UDP
 /// sends are atomic at the kernel level, so no mutex is needed.
+///
+/// Packets larger than the configured MTU are automatically fragmented into
+/// NDNLPv2 LpPacket fragments before sending.
 pub struct UdpFace {
     id:     FaceId,
     socket: Arc<UdpSocket>,
     peer:   SocketAddr,
+    mtu:    usize,
+    seq:    AtomicU64,
 }
 
 impl UdpFace {
@@ -36,12 +43,12 @@ impl UdpFace {
         id:    FaceId,
     ) -> std::io::Result<Self> {
         let socket = UdpSocket::bind(local).await?;
-        Ok(Self { id, socket: Arc::new(socket), peer })
+        Ok(Self { id, socket: Arc::new(socket), peer, mtu: DEFAULT_UDP_MTU, seq: AtomicU64::new(0) })
     }
 
     /// Wrap an already-bound socket, targeting `peer` for all sends.
     pub fn from_socket(id: FaceId, socket: UdpSocket, peer: SocketAddr) -> Self {
-        Self { id, socket: Arc::new(socket), peer }
+        Self { id, socket: Arc::new(socket), peer, mtu: DEFAULT_UDP_MTU, seq: AtomicU64::new(0) }
     }
 
     pub fn peer(&self) -> SocketAddr {
@@ -82,8 +89,18 @@ impl Face for UdpFace {
 
     async fn send(&self, pkt: Bytes) -> Result<(), FaceError> {
         let wire = ndn_packet::lp::encode_lp_packet(&pkt);
-        trace!(face=%self.id, peer=%self.peer, len=wire.len(), "udp: send");
-        self.socket.send_to(&wire, self.peer).await?;
+        if wire.len() <= self.mtu {
+            trace!(face=%self.id, peer=%self.peer, len=wire.len(), "udp: send");
+            self.socket.send_to(&wire, self.peer).await?;
+        } else {
+            // Fragment the original packet (not the LpPacket wrapper).
+            let seq = self.seq.fetch_add(1, Ordering::Relaxed);
+            let fragments = fragment_packet(&pkt, self.mtu, seq);
+            trace!(face=%self.id, peer=%self.peer, frags=fragments.len(), seq, "udp: send fragmented");
+            for frag in &fragments {
+                self.socket.send_to(frag, self.peer).await?;
+            }
+        }
         Ok(())
     }
 }

@@ -10,7 +10,10 @@ use tracing::{debug, trace, warn};
 use ndn_packet::encode::encode_nack;
 use ndn_pipeline::{Action, DecodedPacket, ForwardingAction, NackReason, PacketContext};
 use ndn_store::{CsEntry, PitToken};
-use ndn_transport::{FaceError, FaceId, FaceTable, FaceKind};
+use ndn_packet::Name;
+use ndn_transport::{FaceError, FaceId, FacePersistency, FaceScope, FaceTable, FaceKind};
+
+use crate::engine::FaceState;
 
 use crate::stages::{
     CsInsertStage, CsLookupStage, PitCheckStage, PitMatchStage, StrategyStage, TlvDecodeStage,
@@ -30,7 +33,7 @@ pub(crate) struct InboundPacket {
 /// and processes each packet through the stage sequence.
 pub struct PacketDispatcher {
     pub face_table:   Arc<FaceTable>,
-    pub face_tokens:  Arc<dashmap::DashMap<FaceId, CancellationToken>>,
+    pub face_states:  Arc<dashmap::DashMap<FaceId, FaceState>>,
     pub decode:       TlvDecodeStage,
     pub cs_lookup:    CsLookupStage,
     pub pit_check:    PitCheckStage,
@@ -60,9 +63,9 @@ impl PacketDispatcher {
                 let cancel       = cancel.clone();
                 let face_table   = Arc::clone(&self.face_table);
                 let fib          = Arc::clone(&self.strategy.fib);
-                let face_tokens  = Arc::clone(&self.face_tokens);
+                let face_states  = Arc::clone(&self.face_states);
                 tasks.spawn(async move {
-                    run_face_reader(face_id, face, tx2, cancel, face_table, fib, face_tokens).await;
+                    run_face_reader(face_id, face, tx2, cancel, face_table, fib, face_states).await;
                 });
             }
         }
@@ -250,8 +253,13 @@ impl PacketDispatcher {
         match action {
             Action::Send(ctx, faces) => {
                 trace!(face=%ctx.face_id, name=?ctx.name, out_faces=?faces, raw_len=ctx.raw_bytes.len(), "dispatch: Send");
+                let is_localhost = ctx.name.as_ref().is_some_and(|n| is_localhost_name(n));
                 for face_id in &faces {
                     if let Some(face) = self.face_table.get(*face_id) {
+                        if is_localhost && face.kind().scope() == FaceScope::NonLocal {
+                            trace!(face=%face_id, "dispatch: /localhost blocked on non-local face");
+                            continue;
+                        }
                         if let Err(e) = face.send_bytes(ctx.raw_bytes.clone()).await {
                             warn!(face=%face_id, error=%e, "forward send failed");
                         } else {
@@ -299,8 +307,13 @@ impl PacketDispatcher {
             ctx.raw_bytes.clone()
         };
 
+        let is_localhost = ctx.name.as_ref().is_some_and(|n| is_localhost_name(n));
         for face_id in &ctx.out_faces {
             if let Some(face) = self.face_table.get(*face_id) {
+                if is_localhost && face.kind().scope() == FaceScope::NonLocal {
+                    trace!(face=%face_id, "satisfy: /localhost blocked on non-local face");
+                    continue;
+                }
                 if let Err(e) = face.send_bytes(data_bytes.clone()).await {
                     warn!(face=%face_id, error=%e, "satisfy send failed");
                 }
@@ -314,20 +327,32 @@ impl PacketDispatcher {
 /// Exposed as `pub(crate)` so `ForwarderEngine::add_face` can spawn readers for
 /// faces registered after the initial `build()`.
 ///
-/// When the loop exits (face closed or cancelled) the face is removed from
-/// `face_table` so it no longer appears in management listings and its ID is
-/// recycled.  Internal faces (`FaceKind::App` / `FaceKind::Internal`) are
-/// long-lived engine objects and are not removed on reader exit.
+/// Cleanup behaviour depends on the face's persistence level:
+///
+/// - **Permanent**: recv errors are logged but the loop retries indefinitely
+///   (only cancellation or pipeline closure breaks the loop).
+/// - **Persistent**: the recv loop exits on error/close, but the face is NOT
+///   removed from the table or FIB — it can be re-used later.
+/// - **OnDemand** (and any face without a FaceState): the face is fully removed
+///   from the table and all FIB routes are cleaned up.
+///
+/// Internal faces (`FaceKind::App` / `FaceKind::Internal`) are long-lived
+/// engine objects and are never removed on reader exit regardless of
+/// persistency.
 pub(crate) async fn run_face_reader(
-    face_id:    FaceId,
-    face:       Arc<dyn ndn_transport::ErasedFace>,
-    tx:         mpsc::Sender<InboundPacket>,
-    cancel:     CancellationToken,
-    face_table: Arc<FaceTable>,
-    fib:        Arc<crate::Fib>,
-    face_tokens: Arc<dashmap::DashMap<FaceId, CancellationToken>>,
+    face_id:     FaceId,
+    face:        Arc<dyn ndn_transport::ErasedFace>,
+    tx:          mpsc::Sender<InboundPacket>,
+    cancel:      CancellationToken,
+    face_table:  Arc<FaceTable>,
+    fib:         Arc<crate::Fib>,
+    face_states: Arc<dashmap::DashMap<FaceId, FaceState>>,
 ) {
     let kind = face.kind();
+    let persistency = face_states.get(&face_id)
+        .map(|s| s.persistency)
+        .unwrap_or(FacePersistency::OnDemand);
+
     loop {
         let result = tokio::select! {
             _ = cancel.cancelled() => break,
@@ -336,6 +361,10 @@ pub(crate) async fn run_face_reader(
         match result {
             Ok(raw) => {
                 trace!(face=%face_id, len=raw.len(), "face-reader: recv");
+                // Update last-activity timestamp.
+                if let Some(state) = face_states.get(&face_id) {
+                    state.touch();
+                }
                 let arrival = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
@@ -349,24 +378,46 @@ pub(crate) async fn run_face_reader(
                 break;
             }
             Err(e) => {
-                warn!(face=%face_id, error=%e, "recv error, continuing");
+                match persistency {
+                    FacePersistency::Permanent => {
+                        // Permanent faces retry on transient errors.
+                        warn!(face=%face_id, error=%e, "recv error on permanent face, retrying");
+                        continue;
+                    }
+                    _ => {
+                        warn!(face=%face_id, error=%e, "recv error, stopping");
+                        break;
+                    }
+                }
             }
         }
     }
 
-    // Remove transient faces (those accepted dynamically from a listener) so
-    // they don't linger in the table after disconnection.
+    // Cleanup depends on face kind and persistency.
     match kind {
         FaceKind::App | FaceKind::Internal => {}
-        _ => {
-            // Cancel the face's token — this propagates to any child faces
-            // (e.g. SHM faces created via this control face's `faces/create`).
-            if let Some((_, token)) = face_tokens.remove(&face_id) {
-                token.cancel();
+        _ => match persistency {
+            FacePersistency::Persistent | FacePersistency::Permanent => {
+                // Keep the face in the table and FIB — it may reconnect or be
+                // re-used.  Only cancel child tokens.
+                debug!(face=%face_id, ?persistency, "face reader stopped (face retained)");
             }
-            fib.remove_face(face_id);
-            face_table.remove(face_id);
-            debug!(face=%face_id, "face removed from table (FIB routes cleaned)");
-        }
+            FacePersistency::OnDemand => {
+                // Fully remove the face.
+                if let Some((_, state)) = face_states.remove(&face_id) {
+                    state.cancel.cancel();
+                }
+                fib.remove_face(face_id);
+                face_table.remove(face_id);
+                debug!(face=%face_id, "on-demand face removed from table (FIB routes cleaned)");
+            }
+        },
     }
+}
+
+/// Check if a name starts with `/localhost`.
+fn is_localhost_name(name: &Name) -> bool {
+    name.components()
+        .first()
+        .is_some_and(|c| c.value.as_ref() == b"localhost")
 }

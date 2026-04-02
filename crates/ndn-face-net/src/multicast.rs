@@ -1,9 +1,11 @@
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use tokio::net::UdpSocket;
 
+use ndn_packet::fragment::{DEFAULT_UDP_MTU, fragment_packet};
 use ndn_transport::{Face, FaceError, FaceId, FaceKind};
 
 /// IANA-assigned NDN IPv4 link-local multicast group.
@@ -30,6 +32,8 @@ pub struct MulticastUdpFace {
     id:     FaceId,
     socket: Arc<UdpSocket>,
     dest:   SocketAddr,
+    mtu:    usize,
+    seq:    AtomicU64,
 }
 
 impl MulticastUdpFace {
@@ -48,6 +52,8 @@ impl MulticastUdpFace {
             id,
             socket: Arc::new(socket),
             dest: SocketAddr::V4(SocketAddrV4::new(group, port)),
+            mtu: DEFAULT_UDP_MTU,
+            seq: AtomicU64::new(0),
         })
     }
 
@@ -59,7 +65,7 @@ impl MulticastUdpFace {
     /// Wrap a pre-configured socket. The caller is responsible for binding and
     /// joining the multicast group. Useful when `SO_REUSEADDR` is needed.
     pub fn with_socket(id: FaceId, socket: UdpSocket, dest: SocketAddr) -> Self {
-        Self { id, socket: Arc::new(socket), dest }
+        Self { id, socket: Arc::new(socket), dest, mtu: DEFAULT_UDP_MTU, seq: AtomicU64::new(0) }
     }
 
     pub fn dest(&self) -> SocketAddr {
@@ -81,7 +87,16 @@ impl Face for MulticastUdpFace {
 
     /// Broadcast an NDN packet to the multicast group.
     async fn send(&self, pkt: Bytes) -> Result<(), FaceError> {
-        self.socket.send_to(&pkt, self.dest).await?;
+        let wire = ndn_packet::lp::encode_lp_packet(&pkt);
+        if wire.len() <= self.mtu {
+            self.socket.send_to(&wire, self.dest).await?;
+        } else {
+            let seq = self.seq.fetch_add(1, Ordering::Relaxed);
+            let fragments = fragment_packet(&pkt, self.mtu, seq);
+            for frag in &fragments {
+                self.socket.send_to(frag, self.dest).await?;
+            }
+        }
         Ok(())
     }
 }
@@ -139,13 +154,15 @@ mod tests {
             return; // sending to multicast unsupported — skip
         }
 
+        let expected = ndn_packet::lp::encode_lp_packet(&pkt);
+
         // Wrap with a timeout — environments that route multicast away from loopback
         // will block recv() indefinitely without one.
         match tokio::time::timeout(
             std::time::Duration::from_secs(2),
             receiver.recv(),
         ).await {
-            Ok(Ok(received)) => assert_eq!(received, pkt),
+            Ok(Ok(received)) => assert_eq!(received, expected),
             _ => { /* packet didn't arrive — skip */ }
         }
     }

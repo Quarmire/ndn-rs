@@ -1,9 +1,19 @@
+use std::sync::Arc;
+
 use tracing::trace;
 
-use ndn_packet::{Data, Interest, Nack, tlv_type};
+use ndn_packet::{Data, Interest, Nack, Name, tlv_type};
 use ndn_packet::encode::ensure_nonce;
 use ndn_packet::lp::{LpPacket, is_lp_packet};
 use ndn_pipeline::{Action, DropReason, PacketContext, DecodedPacket};
+use ndn_transport::{FaceScope, FaceTable};
+
+/// Check if a name starts with `/localhost`.
+fn is_localhost_name(name: &Name) -> bool {
+    name.components()
+        .first()
+        .is_some_and(|c| c.value.as_ref() == b"localhost")
+}
 
 /// NDNLPv2 congestion mark, stored as a tag in `PacketContext::tags`.
 #[derive(Clone, Copy, Debug)]
@@ -16,7 +26,12 @@ pub struct CongestionMark(pub u64);
 ///
 /// On success sets `ctx.packet` and `ctx.name`. On any parse failure returns
 /// `Action::Drop(MalformedPacket)`.
-pub struct TlvDecodeStage;
+///
+/// Enforces `/localhost` scope: packets with names starting with `/localhost`
+/// arriving on non-local faces are dropped.
+pub struct TlvDecodeStage {
+    pub face_table: Arc<FaceTable>,
+}
 
 impl TlvDecodeStage {
     pub fn process(&self, mut ctx: PacketContext) -> Action {
@@ -42,6 +57,7 @@ impl TlvDecodeStage {
                         trace!(face=%ctx.face_id, name=%data.name, "decode: Data");
                         ctx.name   = Some(data.name.clone());
                         ctx.packet = DecodedPacket::Data(Box::new(data));
+                        if let Some(drop) = self.check_scope(&ctx) { return drop; }
                         Action::Continue(ctx)
                     }
                     Err(e) => {
@@ -69,6 +85,7 @@ impl TlvDecodeStage {
                 ctx.raw_bytes = ensure_nonce(&ctx.raw_bytes);
                 ctx.name   = Some(interest.name.clone());
                 ctx.packet = DecodedPacket::Interest(Box::new(interest));
+                if let Some(drop) = self.check_scope(&ctx) { return drop; }
                 Action::Continue(ctx)
             }
             Err(e) => {
@@ -76,6 +93,21 @@ impl TlvDecodeStage {
                 Action::Drop(DropReason::MalformedPacket)
             }
         }
+    }
+
+    /// Drop packets with `/localhost` names arriving on non-local faces.
+    fn check_scope(&self, ctx: &PacketContext) -> Option<Action> {
+        if let Some(ref name) = ctx.name {
+            if is_localhost_name(name) {
+                let is_non_local = self.face_table.get(ctx.face_id)
+                    .is_some_and(|f| f.kind().scope() == FaceScope::NonLocal);
+                if is_non_local {
+                    trace!(face=%ctx.face_id, name=%name, "decode: /localhost on non-local face, dropping");
+                    return Some(Action::Drop(DropReason::ScopeViolation));
+                }
+            }
+        }
+        None
     }
 
     /// Process an NDNLPv2 LpPacket.
@@ -101,6 +133,7 @@ impl TlvDecodeStage {
                     let nack = Nack::new(interest, reason);
                     ctx.name   = Some(nack.interest.name.clone());
                     ctx.packet = DecodedPacket::Nack(Box::new(nack));
+                    if let Some(drop) = self.check_scope(&ctx) { return drop; }
                     Action::Continue(ctx)
                 }
                 Err(e) => {
