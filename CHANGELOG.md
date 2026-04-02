@@ -448,13 +448,12 @@ conventions (`/localhost/nfd/<module>/<verb>/<ControlParameters>`).
   expensive wakeup syscalls when packets arrive within microseconds of each other.
 - **SHM ring capacity** increased from 64 to 256 slots — reduces backpressure
   during burst traffic and gives headroom for pipeline processing jitter.
-- **SHM liveness detection for dead router** — `SpscHandle::recv()` now uses a
-  `tokio::select!` with a 5-second timeout alongside the pipe wakeup. Two
-  consecutive timeouts with an empty ring signal the peer is dead, returning
-  `None`. `SpscHandle::send()` uses a bounded yield loop (100K iterations) that
-  returns `ShmError::Closed` if the ring stays full. Both methods check a
-  `CancellationToken` propagated from the control face. `pipe_await` now returns
-  `Err` on EOF (n==0) instead of looping forever.
+- **SHM liveness detection for dead router** — `SpscHandle::recv()` races the
+  pipe wakeup against a `CancellationToken` propagated from the control face.
+  When the router dies, the token fires and recv returns `None` promptly.
+  `SpscHandle::send()` uses a bounded yield loop (100K iterations) that returns
+  `ShmError::Closed` if the ring stays full or the token fires. `pipe_await`
+  now returns `Err` on EOF (n==0) instead of looping forever.
 - **`RouterClient` liveness tracking** — `RouterClient` now carries a
   `CancellationToken` and `dead` flag. SHM handles receive a child token from the
   control face. `probe_alive()` sends a probe Interest on the control face and

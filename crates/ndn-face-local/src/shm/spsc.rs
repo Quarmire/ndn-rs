@@ -635,15 +635,14 @@ impl SpscHandle {
 
     /// Receive a packet from the engine (dequeue from the e2a ring).
     ///
-    /// Returns `None` when the engine face has been dropped, the
-    /// cancellation token fires, or the pipe times out (router likely dead).
+    /// Returns `None` when the engine face has been dropped or the
+    /// cancellation token fires.
     pub async fn recv(&self) -> Option<Bytes> {
         if self.cancel.is_cancelled() { return None; }
         // SAFETY: parked flag within mapped SHM region.
         let parked = unsafe {
             &*AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_E2A_PARKED) as *mut u32)
         };
-        let mut consecutive_timeouts = 0u32;
         loop {
             if let Some(pkt) = self.try_pop_e2a() {
                 return Some(pkt);
@@ -662,31 +661,18 @@ impl SpscHandle {
                 return Some(pkt);
             }
 
-            // Race pipe wakeup against cancellation and a 5-second timeout.
-            // The timeout handles the O_RDWR FIFO problem: since both sides
-            // open the pipe read+write, EOF is never seen when the peer dies.
+            // Wait for pipe wakeup or cancellation.  We rely on the
+            // CancellationToken (propagated from the control face) rather
+            // than timeouts — idle waits are legitimate (e.g. iperf server
+            // waiting for a client).
             tokio::select! {
                 result = pipe_await(&self.e2a_rx) => {
                     parked.store(0, Ordering::Relaxed);
                     if result.is_err() { return None; }
-                    consecutive_timeouts = 0;
                 }
                 _ = self.cancel.cancelled() => {
                     parked.store(0, Ordering::Relaxed);
                     return None;
-                }
-                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
-                    parked.store(0, Ordering::Relaxed);
-                    // Timeout — check ring one more time (missed wakeup?).
-                    if let Some(pkt) = self.try_pop_e2a() {
-                        // Data was there, just a missed wakeup — not dead.
-                        return Some(pkt);
-                    }
-                    consecutive_timeouts += 1;
-                    if consecutive_timeouts >= 2 {
-                        // Two consecutive 5s timeouts with empty ring → peer is dead.
-                        return None;
-                    }
                 }
             }
         }
