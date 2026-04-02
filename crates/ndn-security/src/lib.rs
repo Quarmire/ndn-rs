@@ -10,7 +10,7 @@ pub mod manager;
 pub mod pib;
 
 pub use error::TrustError;
-pub use signer::{Signer, Ed25519Signer};
+pub use signer::{Signer, Ed25519Signer, HmacSha256Signer};
 pub use verifier::{Verifier, VerifyOutcome, Ed25519Verifier};
 pub use trust_schema::{TrustSchema, NamePattern, PatternComponent};
 pub use cert_cache::{CertCache, Certificate};

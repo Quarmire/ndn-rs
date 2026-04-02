@@ -333,6 +333,61 @@ impl DataBuilder {
         });
         w.finish()
     }
+
+    /// Synchronous encode-and-sign using a single pre-sized buffer.
+    ///
+    /// Avoids the three intermediate allocations of the async `sign()` path.
+    /// `sign_fn` receives the signed region (Name + MetaInfo + Content +
+    /// SignatureInfo) and must return the raw signature bytes.
+    pub fn sign_sync<F>(
+        self,
+        sig_type:    SignatureType,
+        key_locator: Option<&Name>,
+        sign_fn:     F,
+    ) -> Bytes
+    where
+        F: FnOnce(&[u8]) -> Bytes,
+    {
+        // Estimate total size: name + metainfo + content + siginfo + sigvalue + outer TLV.
+        // Over-estimate is fine — BytesMut won't reallocate.
+        let est = self.content.len() + 256;
+        let mut w = TlvWriter::with_capacity(est);
+
+        // Build the signed region (Name + MetaInfo + Content + SignatureInfo)
+        // into the writer, then snapshot it for signing.
+        let signed_start = w.len();
+        write_name(&mut w, &self.name);
+        if let Some(freshness) = self.freshness {
+            w.write_nested(tlv_type::META_INFO, |w| {
+                write_nni(w, tlv_type::FRESHNESS_PERIOD, freshness.as_millis() as u64);
+            });
+        }
+        w.write_tlv(tlv_type::CONTENT, &self.content);
+        w.write_nested(tlv_type::SIGNATURE_INFO, |w| {
+            write_nni(w, tlv_type::SIGNATURE_TYPE, sig_type.code());
+            if let Some(kl_name) = key_locator {
+                w.write_nested(tlv_type::KEY_LOCATOR, |w| {
+                    write_name(w, kl_name);
+                });
+            }
+        });
+        let signed_region = w.snapshot(signed_start);
+
+        // Sign the region.
+        let sig_value = sign_fn(&signed_region);
+
+        // Wrap everything in the outer Data TLV.
+        let inner_len = signed_region.len()
+            + ndn_tlv::varu64_size(tlv_type::SIGNATURE_VALUE)
+            + ndn_tlv::varu64_size(sig_value.len() as u64)
+            + sig_value.len();
+        let mut outer = TlvWriter::with_capacity(inner_len + 10);
+        outer.write_varu64(tlv_type::DATA);
+        outer.write_varu64(inner_len as u64);
+        outer.write_raw(&signed_region);
+        outer.write_tlv(tlv_type::SIGNATURE_VALUE, &sig_value);
+        outer.finish()
+    }
 }
 
 // ─── Private helpers ──────────────────────────────────────────────────────────
@@ -598,6 +653,70 @@ mod tests {
         assert_eq!(si.sig_type, SignatureType::SignatureEd25519);
         let kl = si.key_locator.clone().expect("key locator");
         assert_eq!(kl.to_string(), "/key/test");
+    }
+
+    #[test]
+    fn data_builder_sign_sync_matches_async() {
+        use std::pin::pin;
+        use std::task::{Context, Wake, Waker};
+
+        let key_name: Name = "/key/test".parse().unwrap();
+        let sign_fn = |region: &[u8]| -> Bytes {
+            let digest = ring::digest::digest(&ring::digest::SHA256, region);
+            Bytes::copy_from_slice(digest.as_ref())
+        };
+
+        // Async path
+        struct NoopWaker;
+        impl Wake for NoopWaker { fn wake(self: std::sync::Arc<Self>) {} }
+        let waker = Waker::from(std::sync::Arc::new(NoopWaker));
+        let mut cx = Context::from_waker(&waker);
+
+        let fut = DataBuilder::new("/signed/data", b"payload")
+            .freshness(Duration::from_secs(10))
+            .sign(
+                SignatureType::SignatureEd25519,
+                Some(&key_name),
+                |region: &[u8]| {
+                    let digest = ring::digest::digest(&ring::digest::SHA256, region);
+                    std::future::ready(Bytes::copy_from_slice(digest.as_ref()))
+                },
+            );
+        let mut fut = pin!(fut);
+        let async_wire = match fut.as_mut().poll(&mut cx) {
+            std::task::Poll::Ready(b) => b,
+            std::task::Poll::Pending => panic!("should complete immediately"),
+        };
+
+        // Sync path
+        let sync_wire = DataBuilder::new("/signed/data", b"payload")
+            .freshness(Duration::from_secs(10))
+            .sign_sync(
+                SignatureType::SignatureEd25519,
+                Some(&key_name),
+                sign_fn,
+            );
+
+        assert_eq!(async_wire, sync_wire, "sign_sync must produce identical wire format");
+    }
+
+    #[test]
+    fn data_builder_sign_sync_no_freshness() {
+        let wire = DataBuilder::new("/test", b"content")
+            .sign_sync(
+                SignatureType::SignatureEd25519,
+                None,
+                |region| {
+                    let digest = ring::digest::digest(&ring::digest::SHA256, region);
+                    Bytes::copy_from_slice(digest.as_ref())
+                },
+            );
+        let data = Data::decode(wire).unwrap();
+        assert_eq!(data.name.to_string(), "/test");
+        assert_eq!(data.content().map(|b| b.as_ref()), Some(b"content".as_ref()));
+        assert!(data.meta_info().is_none());
+        let si = data.sig_info().expect("sig info");
+        assert_eq!(si.sig_type, SignatureType::SignatureEd25519);
     }
 
     // ── NNI encoding ────────────────────────────────────────────────────────

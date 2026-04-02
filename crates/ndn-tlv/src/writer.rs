@@ -47,11 +47,23 @@ impl TlvWriter {
         self.buf.put_slice(&inner_bytes);
     }
 
+    /// Write a raw VarNumber (type or length field) without TLV framing.
+    pub fn write_varu64(&mut self, value: u64) {
+        self.write_varu64_inner(value);
+    }
+
     /// Write raw bytes directly into the buffer (no TLV framing).
     ///
     /// Used when embedding a pre-encoded signed region into an outer TLV.
     pub fn write_raw(&mut self, data: &[u8]) {
         self.buf.put_slice(data);
+    }
+
+    /// Return a copy of the bytes written since `start` offset.
+    ///
+    /// Used to capture a signed region after writing it incrementally.
+    pub fn snapshot(&self, start: usize) -> Vec<u8> {
+        self.buf[start..].to_vec()
     }
 
     /// Freeze and return the encoded bytes.

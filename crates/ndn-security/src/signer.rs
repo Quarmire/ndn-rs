@@ -20,6 +20,14 @@ pub trait Signer: Send + Sync + 'static {
     fn public_key(&self) -> Option<Bytes> { None }
 
     fn sign<'a>(&'a self, region: &'a [u8]) -> BoxFuture<'a, Result<Bytes, TrustError>>;
+
+    /// Synchronous signing — avoids `Box::pin` and async state machine overhead.
+    ///
+    /// Signers whose work is pure CPU (Ed25519, HMAC) should override this.
+    fn sign_sync(&self, region: &[u8]) -> Result<Bytes, TrustError> {
+        let _ = region;
+        unimplemented!("sign_sync not implemented for this signer — override if signing is CPU-only")
+    }
 }
 
 /// Ed25519 signer using `ed25519-dalek`.
@@ -68,11 +76,51 @@ impl Signer for Ed25519Signer {
     }
 
     fn sign<'a>(&'a self, region: &'a [u8]) -> BoxFuture<'a, Result<Bytes, TrustError>> {
-        Box::pin(async move {
-            use ed25519_dalek::Signer as _;
-            let sig = self.signing_key.sign(region);
-            Ok(Bytes::copy_from_slice(&sig.to_bytes()))
-        })
+        Box::pin(async move { self.sign_sync(region) })
+    }
+
+    fn sign_sync(&self, region: &[u8]) -> Result<Bytes, TrustError> {
+        use ed25519_dalek::Signer as _;
+        let sig = self.signing_key.sign(region);
+        Ok(Bytes::copy_from_slice(&sig.to_bytes()))
+    }
+}
+
+/// HMAC-SHA256 signer for symmetric (pre-shared key) authentication.
+///
+/// Significantly faster than Ed25519 (~10x) since it only computes a keyed
+/// hash rather than elliptic curve math.
+pub struct HmacSha256Signer {
+    key:      ring::hmac::Key,
+    key_name: Name,
+}
+
+impl HmacSha256Signer {
+    /// Create from raw key bytes (any length; 32+ bytes recommended).
+    pub fn new(key_bytes: &[u8], key_name: Name) -> Self {
+        Self {
+            key: ring::hmac::Key::new(ring::hmac::HMAC_SHA256, key_bytes),
+            key_name,
+        }
+    }
+}
+
+impl Signer for HmacSha256Signer {
+    fn sig_type(&self) -> SignatureType {
+        SignatureType::SignatureHmacWithSha256
+    }
+
+    fn key_name(&self) -> &Name {
+        &self.key_name
+    }
+
+    fn sign<'a>(&'a self, region: &'a [u8]) -> BoxFuture<'a, Result<Bytes, TrustError>> {
+        Box::pin(async move { self.sign_sync(region) })
+    }
+
+    fn sign_sync(&self, region: &[u8]) -> Result<Bytes, TrustError> {
+        let tag = ring::hmac::sign(&self.key, region);
+        Ok(Bytes::copy_from_slice(tag.as_ref()))
     }
 }
 
@@ -127,5 +175,59 @@ mod tests {
     fn cert_name_defaults_to_none() {
         let s = Ed25519Signer::from_seed(&[0u8; 32], test_key_name());
         assert!(s.cert_name().is_none());
+    }
+
+    // ── HMAC-SHA256 tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn hmac_sig_type() {
+        let s = HmacSha256Signer::new(b"secret", test_key_name());
+        assert_eq!(s.sig_type(), SignatureType::SignatureHmacWithSha256);
+    }
+
+    #[test]
+    fn hmac_sign_sync_produces_32_bytes() {
+        let s = HmacSha256Signer::new(b"secret", test_key_name());
+        let sig = s.sign_sync(b"hello ndn").unwrap();
+        assert_eq!(sig.len(), 32);
+    }
+
+    #[test]
+    fn hmac_deterministic() {
+        let s1 = HmacSha256Signer::new(b"key", test_key_name());
+        let s2 = HmacSha256Signer::new(b"key", test_key_name());
+        assert_eq!(s1.sign_sync(b"data").unwrap(), s2.sign_sync(b"data").unwrap());
+    }
+
+    #[test]
+    fn hmac_different_key_different_sig() {
+        let s1 = HmacSha256Signer::new(b"key-a", test_key_name());
+        let s2 = HmacSha256Signer::new(b"key-b", test_key_name());
+        assert_ne!(s1.sign_sync(b"data").unwrap(), s2.sign_sync(b"data").unwrap());
+    }
+
+    #[tokio::test]
+    async fn hmac_async_matches_sync() {
+        let s = HmacSha256Signer::new(b"key", test_key_name());
+        let async_sig = s.sign(b"data").await.unwrap();
+        let sync_sig = s.sign_sync(b"data").unwrap();
+        assert_eq!(async_sig, sync_sig);
+    }
+
+    // ── Ed25519 sign_sync tests ────────────────────────────────────────────
+
+    #[test]
+    fn ed25519_sign_sync_produces_64_bytes() {
+        let s = Ed25519Signer::from_seed(&[2u8; 32], test_key_name());
+        let sig = s.sign_sync(b"hello ndn").unwrap();
+        assert_eq!(sig.len(), 64);
+    }
+
+    #[tokio::test]
+    async fn ed25519_async_matches_sync() {
+        let s = Ed25519Signer::from_seed(&[5u8; 32], test_key_name());
+        let async_sig = s.sign(b"data").await.unwrap();
+        let sync_sig = s.sign_sync(b"data").unwrap();
+        assert_eq!(async_sig, sync_sig);
     }
 }
