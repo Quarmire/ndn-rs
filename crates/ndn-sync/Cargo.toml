@@ -6,10 +6,12 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-ndn-app    = { workspace = true }
 ndn-packet = { workspace = true }
 bytes      = { workspace = true }
-tokio      = { workspace = true, features = ["sync"] }
+tokio      = { workspace = true, features = ["sync", "time"] }
+tokio-util = { workspace = true }
+thiserror  = { workspace = true }
+fastrand   = "2"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }
