@@ -35,6 +35,7 @@ use ndn_ipc::RouterClient;
 use ndn_packet::encode::{DataBuilder, InterestBuilder};
 use ndn_packet::{Data, Interest, Name};
 use ndn_security::Signer;
+use ndn_transport::CongestionController;
 
 // ─── CLI ────────────────────────────────────────────────────────────────────
 
@@ -104,9 +105,36 @@ enum Command {
         #[arg(long, default_value_t = 10)]
         duration: u64,
 
-        /// Sliding window size (max outstanding Interests).
+        /// Initial/fixed window size (max outstanding Interests).
+        ///
+        /// With `--cc fixed`, this is the constant window.
+        /// With adaptive algorithms (aimd, cubic), this is the initial window.
         #[arg(long, default_value_t = 64)]
         window: usize,
+
+        /// Congestion control algorithm: aimd, cubic, or fixed.
+        #[arg(long, default_value = "aimd")]
+        cc: String,
+
+        /// Minimum window size (default: 2).
+        #[arg(long)]
+        min_window: Option<f64>,
+
+        /// Maximum window size (default: 65536).
+        #[arg(long)]
+        max_window: Option<f64>,
+
+        /// AIMD additive increase per RTT (default: 1.0).
+        #[arg(long)]
+        ai: Option<f64>,
+
+        /// Multiplicative decrease factor (default: 0.5 for aimd, 0.7 for cubic).
+        #[arg(long)]
+        md: Option<f64>,
+
+        /// CUBIC scaling constant C (default: 0.4).
+        #[arg(long)]
+        cubic_c: Option<f64>,
 
         /// Interest lifetime in milliseconds.
         #[arg(long, default_value_t = 4000)]
@@ -347,7 +375,8 @@ async fn run_client(
     conn: &ConnectOpts,
     prefix: &Name,
     duration_secs: u64,
-    window: usize,
+    initial_window: usize,
+    mut cc: CongestionController,
     lifetime_ms: u64,
     quiet: bool,
     interval_secs: u64,
@@ -356,9 +385,14 @@ async fn run_client(
 
     let transport = if client.is_shm() { "SHM" } else { "Unix" };
     let lifetime = Duration::from_millis(lifetime_ms);
+    let cc_name = match &cc {
+        CongestionController::Aimd { .. }  => "aimd",
+        CongestionController::Cubic { .. } => "cubic",
+        CongestionController::Fixed { .. } => "fixed",
+    };
 
     eprintln!("ndn-iperf client: prefix={prefix} transport={transport}");
-    eprintln!("  duration={duration_secs}s  window={window}  lifetime={lifetime_ms}ms");
+    eprintln!("  duration={duration_secs}s  window={initial_window}  cc={cc_name}  lifetime={lifetime_ms}ms");
     eprintln!("  testing...");
 
     let counters = Arc::new(IntervalCounters::new());
@@ -396,18 +430,20 @@ async fn run_client(
     let mut received: u64 = 0;
     let mut retx_count: u64 = 0;
     let mut rtts: Vec<u64> = Vec::new();
+    let mut in_flight: usize = 0;
 
     // Smoothed RTT for adaptive retransmit timeout.
-    // Start conservative; converges within a few packets.
     let mut srtt_us: f64 = 50_000.0; // 50ms initial estimate
 
     // Fill the initial window.
+    let window = initial_window.min(cc.window().floor() as usize);
     for _ in 0..window {
         let name = prefix.clone().append(format!("{next_seq}"));
         let wire = InterestBuilder::new(name).lifetime(lifetime).build();
         timestamps.insert(next_seq, Instant::now());
         client.send(wire).await?;
         next_seq += 1;
+        in_flight += 1;
     }
 
     // After the test deadline, use a short drain timeout to collect
@@ -429,25 +465,34 @@ async fn run_client(
                 received += 1;
 
                 let rtt_us = extract_seq(&data_bytes).and_then(|seq| {
-                    timestamps.remove(&seq).map(|t0| t0.elapsed().as_micros() as u64)
+                    timestamps.remove(&seq).map(|t0| {
+                        in_flight = in_flight.saturating_sub(1);
+                        t0.elapsed().as_micros() as u64
+                    })
                 });
+
+                // TODO: check CongestionMark tag on data and call cc.on_congestion_mark()
+                cc.on_data();
 
                 if let Some(rtt) = rtt_us {
                     rtts.push(rtt);
                     counters.record_rtt(rtt);
-                    // EWMA smoothed RTT (α = 1/8, same as TCP).
                     srtt_us = srtt_us * 0.875 + rtt as f64 * 0.125;
                 }
                 counters.record(data_len);
 
-                // Send next Interest if still within test duration.
+                // Fill up to current window if still within test duration.
                 if !past_deadline {
                     if Instant::now() < deadline {
-                        let name = prefix.clone().append(format!("{next_seq}"));
-                        let wire = InterestBuilder::new(name).lifetime(lifetime).build();
-                        timestamps.insert(next_seq, Instant::now());
-                        client.send(wire).await?;
-                        next_seq += 1;
+                        let allowed = cc.window().floor() as usize;
+                        while in_flight < allowed {
+                            let name = prefix.clone().append(format!("{next_seq}"));
+                            let wire = InterestBuilder::new(name).lifetime(lifetime).build();
+                            timestamps.insert(next_seq, Instant::now());
+                            client.send(wire).await?;
+                            next_seq += 1;
+                            in_flight += 1;
+                        }
                     } else {
                         past_deadline = true;
                     }
@@ -463,7 +508,6 @@ async fn run_client(
             Err(_) => {
                 if past_deadline {
                     if timestamps.is_empty() { break next_seq; }
-                    // Keep draining until all in-flight interests expire.
                     let now = Instant::now();
                     timestamps.retain(|_, t0| now.duration_since(*t0) < drain_timeout);
                     if timestamps.is_empty() { break next_seq; }
@@ -475,9 +519,6 @@ async fn run_client(
                 }
 
                 // ── Fast re-expression of stale Interests ────────────
-                // RTO = max(3 × SRTT, 200ms) — aggressive enough to
-                // recover quickly but not so tight that jitter triggers
-                // spurious retransmits.
                 let rto = Duration::from_micros((srtt_us * 3.0) as u64)
                     .max(Duration::from_millis(200));
                 let now = Instant::now();
@@ -486,7 +527,7 @@ async fn run_client(
                     .map(|(seq, _)| *seq)
                     .collect();
                 for seq in stale {
-                    // Re-express with a fresh timestamp.
+                    cc.on_timeout();
                     let name = prefix.clone().append(format!("{seq}"));
                     let wire = InterestBuilder::new(name).lifetime(lifetime).build();
                     timestamps.insert(seq, Instant::now());
@@ -554,10 +595,24 @@ async fn main() -> Result<()> {
             run_server(&conn, &prefix, size, sign, hmac, freshness, quiet, interval).await
         }
         Command::Client {
-            conn, prefix, duration, window, lifetime, quiet, interval,
+            conn, prefix, duration, window, cc,
+            min_window, max_window, ai, md, cubic_c,
+            lifetime, quiet, interval,
         } => {
             let prefix: Name = prefix.parse()?;
-            run_client(&conn, &prefix, duration, window, lifetime, quiet, interval).await
+            let mut controller = match cc.as_str() {
+                "aimd" => CongestionController::aimd(),
+                "cubic" => CongestionController::cubic(),
+                "fixed" => CongestionController::fixed(window as f64),
+                other => anyhow::bail!("unknown congestion control algorithm: {other} (expected: aimd, cubic, fixed)"),
+            };
+            // Apply optional tuning parameters.
+            if let Some(v) = min_window { controller = controller.with_min_window(v); }
+            if let Some(v) = max_window { controller = controller.with_max_window(v); }
+            if let Some(v) = ai         { controller = controller.with_additive_increase(v); }
+            if let Some(v) = md         { controller = controller.with_decrease_factor(v); }
+            if let Some(v) = cubic_c    { controller = controller.with_cubic_c(v); }
+            run_client(&conn, &prefix, duration, window, controller, lifetime, quiet, interval).await
         }
     }
 }

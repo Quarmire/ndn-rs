@@ -12,6 +12,59 @@ bootstrapping phase and all APIs should be considered unstable.
 
 ### Added
 
+#### Configurable per-face reliability (`ReliabilityConfig`, `RtoStrategy`)
+
+All NDNLPv2 reliability knobs are now runtime-tunable per face via a
+`ReliabilityConfig` struct with presets for common link types.
+
+- **`ReliabilityConfig`** — bundles `max_retries`, `max_unacked`,
+  `max_retx_per_tick`, and `rto_strategy` into a single config struct.
+  Presets: `default()` (RFC 6298), `local()`, `ethernet()`, `wifi()`.
+- **`RtoStrategy` enum** — switchable RTO algorithm per face:
+  - `Rfc6298` — EWMA with 200ms floor, 1s initial (default).
+  - `Quic` — RFC 9002-style, 333ms initial, no floor.
+  - `MinRtt` — minimum observed RTT + configurable margin.
+  - `Fixed` — constant RTO for known-latency links (Unix, SHM).
+- **`LpReliability::from_config(mtu, config)`** — construct from config.
+- **`LpReliability::apply_config(config)`** — reconfigure at runtime.
+
+#### Consumer-side congestion control (`CongestionController`)
+
+New `ndn_transport::CongestionController` enum with three algorithms for
+regulating how many Interests a consumer keeps in flight.
+
+- **AIMD** — additive-increase multiplicative-decrease, matches
+  `ndncatchunks` behavior.  Slow-start then linear growth, ×0.5 on loss.
+- **CUBIC** — RFC 8312 cubic function ramp-up, ×0.7 decrease.  Better
+  for high-bandwidth, long-RTT links.
+- **Fixed** — constant window, no adaptation (for benchmarks).
+- All algorithms support slow-start, min/max window bounds, and `reset()`.
+- Builder-style parameter tuning: `with_max_window()`,
+  `with_additive_increase()`, `with_decrease_factor()`, `with_cubic_c()`.
+
+#### ndn-iperf adaptive congestion control
+
+The iperf client now uses `CongestionController` instead of a fixed
+sliding window, with full CLI configurability.
+
+- **`--cc <algorithm>`** — select `aimd` (default), `cubic`, or `fixed`.
+- **`--ai`** — AIMD additive increase per RTT.
+- **`--md`** — multiplicative decrease factor.
+- **`--cubic-c`** — CUBIC scaling constant.
+- **`--min-window`** / **`--max-window`** — window bounds.
+- Window now grows on successful Data and shrinks on timeout/congestion.
+
+### Fixed
+
+#### NDNLPv2 reliability lingering traffic after flow completion
+
+High-throughput flows accumulated thousands of unacked entries that drained
+at ~160 pkt/sec for minutes after the flow ended, flooding the remote with
+retransmitted fragments ("unsolicited data").
+
+- **Unacked map cap** (`MAX_UNACKED = 256`) — oldest entries evicted when
+  the map is full.  Post-flow drain limited to ~1.6 seconds.
+
 #### NDNLPv2 per-hop reliability for unicast UDP faces
 
 Unicast UDP faces now implement NDNLPv2 per-hop reliability, fixing throughput
