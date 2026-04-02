@@ -546,7 +546,10 @@ fn faces_create_shm(
                 .and_then(|sf| engine.face_token(sf))
                 .map(|t| t.child_token())
                 .unwrap_or_else(CancellationToken::new);
-            engine.add_face_with_persistency(face, cancel, FacePersistency::Persistent);
+            // SHM faces are on-demand: when the control face disconnects
+            // (app exits), the child cancel token fires and the face is
+            // fully cleaned up (SHM region unlinked, FIB routes removed).
+            engine.add_face(face, cancel);
             tracing::info!(face = face_id.0, shm = shm_name, "faces/create shm");
 
             let echo = ControlParameters {
