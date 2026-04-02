@@ -1,12 +1,14 @@
 use std::sync::Arc;
 
+use dashmap::DashMap;
 use tracing::trace;
 
 use ndn_packet::{Data, Interest, Nack, Name, tlv_type};
 use ndn_packet::encode::ensure_nonce;
+use ndn_packet::fragment::ReassemblyBuffer;
 use ndn_packet::lp::{LpPacket, is_lp_packet};
 use ndn_pipeline::{Action, DropReason, PacketContext, DecodedPacket};
-use ndn_transport::{FaceScope, FaceTable};
+use ndn_transport::{FaceId, FaceScope, FaceTable};
 
 /// Check if a name starts with `/localhost`.
 fn is_localhost_name(name: &Name) -> bool {
@@ -31,6 +33,12 @@ pub struct CongestionMark(pub u64);
 /// arriving on non-local faces are dropped.
 pub struct TlvDecodeStage {
     pub face_table: Arc<FaceTable>,
+    /// Per-face NDNLPv2 fragment reassembly buffers.
+    ///
+    /// Keyed by FaceId so fragments from different faces are reassembled
+    /// independently.  Buffers are created on first fragmented packet and
+    /// cleaned up lazily via `purge_expired()`.
+    pub(crate) reassembly: DashMap<FaceId, ReassemblyBuffer>,
 }
 
 impl TlvDecodeStage {
@@ -111,6 +119,11 @@ impl TlvDecodeStage {
     }
 
     /// Process an NDNLPv2 LpPacket.
+    ///
+    /// Handles fragment reassembly: if the LpPacket is a fragment, it is
+    /// buffered per-face until all fragments arrive.  Returns `Action::Drop`
+    /// for incomplete reassemblies (waiting for more fragments) and
+    /// re-enters `process()` when the complete packet is available.
     fn process_lp(&self, mut ctx: PacketContext) -> Action {
         let lp = match LpPacket::decode(ctx.raw_bytes.clone()) {
             Ok(lp) => lp,
@@ -123,6 +136,33 @@ impl TlvDecodeStage {
         // Propagate CongestionMark through the pipeline via tags.
         if let Some(mark) = lp.congestion_mark {
             ctx.tags.insert(CongestionMark(mark));
+        }
+
+        // Fragment reassembly: buffer until all fragments arrive.
+        if lp.is_fragmented() {
+            let face_id = ctx.face_id;
+            let complete = {
+                let mut rb = self.reassembly
+                    .entry(face_id)
+                    .or_insert_with(ReassemblyBuffer::default);
+                rb.process(
+                    lp.sequence.unwrap_or(0),
+                    lp.frag_index.unwrap_or(0),
+                    lp.frag_count.unwrap_or(1),
+                    lp.fragment,
+                )
+            };
+            match complete {
+                Some(packet) => {
+                    trace!(face=%ctx.face_id, len=packet.len(), "decode: reassembled");
+                    ctx.raw_bytes = packet;
+                    return self.process(ctx);
+                }
+                None => {
+                    // Still waiting for more fragments — not an error.
+                    return Action::Drop(DropReason::MalformedPacket);
+                }
+            }
         }
 
         if let Some(reason) = lp.nack {

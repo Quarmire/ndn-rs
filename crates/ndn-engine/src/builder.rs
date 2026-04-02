@@ -108,7 +108,7 @@ impl EngineBuilder {
         let dispatcher = PacketDispatcher {
             face_table:  Arc::clone(&face_table),
             face_states: Arc::clone(&face_states),
-            decode:      TlvDecodeStage { face_table: Arc::clone(&face_table) },
+            decode:      TlvDecodeStage { face_table: Arc::clone(&face_table), reassembly: dashmap::DashMap::new() },
             cs_lookup:   CsLookupStage { cs: Arc::clone(&cs) },
             pit_check:   PitCheckStage { pit: Arc::clone(&pit) },
             strategy:    StrategyStage {
