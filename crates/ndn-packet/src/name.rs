@@ -27,6 +27,92 @@ impl NameComponent {
             value,
         }
     }
+
+    /// Create a Keyword component (type 0x20) with opaque bytes.
+    pub fn keyword(value: Bytes) -> Self {
+        Self::new(tlv_type::KEYWORD, value)
+    }
+
+    /// Create a ByteOffset component (type 0x34), big-endian with leading zeros stripped.
+    pub fn byte_offset(offset: u64) -> Self {
+        Self::new(tlv_type::BYTE_OFFSET, encode_nonnegtive_integer(offset))
+    }
+
+    /// Create a Version component (type 0x36), big-endian with leading zeros stripped.
+    pub fn version(v: u64) -> Self {
+        Self::new(tlv_type::VERSION, encode_nonnegtive_integer(v))
+    }
+
+    /// Create a Timestamp component (type 0x38), big-endian with leading zeros stripped.
+    pub fn timestamp(ts: u64) -> Self {
+        Self::new(tlv_type::TIMESTAMP, encode_nonnegtive_integer(ts))
+    }
+
+    /// Create a SequenceNum component (type 0x3A), big-endian with leading zeros stripped.
+    pub fn sequence_num(seq: u64) -> Self {
+        Self::new(tlv_type::SEQUENCE_NUM, encode_nonnegtive_integer(seq))
+    }
+
+    /// Decode a Segment component value as u64. Returns `None` if not type 0x32.
+    pub fn as_segment(&self) -> Option<u64> {
+        if self.typ == tlv_type::SEGMENT {
+            Some(decode_nonnegative_integer(&self.value))
+        } else {
+            None
+        }
+    }
+
+    /// Decode a ByteOffset component value as u64. Returns `None` if not type 0x34.
+    pub fn as_byte_offset(&self) -> Option<u64> {
+        if self.typ == tlv_type::BYTE_OFFSET {
+            Some(decode_nonnegative_integer(&self.value))
+        } else {
+            None
+        }
+    }
+
+    /// Decode a Version component value as u64. Returns `None` if not type 0x36.
+    pub fn as_version(&self) -> Option<u64> {
+        if self.typ == tlv_type::VERSION {
+            Some(decode_nonnegative_integer(&self.value))
+        } else {
+            None
+        }
+    }
+
+    /// Decode a Timestamp component value as u64. Returns `None` if not type 0x38.
+    pub fn as_timestamp(&self) -> Option<u64> {
+        if self.typ == tlv_type::TIMESTAMP {
+            Some(decode_nonnegative_integer(&self.value))
+        } else {
+            None
+        }
+    }
+
+    /// Decode a SequenceNum component value as u64. Returns `None` if not type 0x3A.
+    pub fn as_sequence_num(&self) -> Option<u64> {
+        if self.typ == tlv_type::SEQUENCE_NUM {
+            Some(decode_nonnegative_integer(&self.value))
+        } else {
+            None
+        }
+    }
+}
+
+/// Encode a u64 as big-endian bytes with leading zeros stripped (at least 1 byte).
+fn encode_nonnegtive_integer(v: u64) -> Bytes {
+    let bytes = v.to_be_bytes();
+    let start = bytes.iter().position(|&b| b != 0).unwrap_or(7);
+    Bytes::copy_from_slice(&bytes[start..])
+}
+
+/// Decode big-endian stripped bytes back to u64.
+fn decode_nonnegative_integer(bytes: &[u8]) -> u64 {
+    let mut val: u64 = 0;
+    for &b in bytes {
+        val = (val << 8) | u64::from(b);
+    }
+    val
 }
 
 /// An NDN name: an ordered sequence of name components.
@@ -107,11 +193,27 @@ impl Name {
     /// Append a segment number component (type `0x32`, big-endian encoding with
     /// leading zeros stripped per NDN naming conventions).
     pub fn append_segment(self, seg: u64) -> Self {
-        let bytes = seg.to_be_bytes();
-        // Strip leading zeros but keep at least one byte.
-        let start = bytes.iter().position(|&b| b != 0).unwrap_or(7);
-        let value = Bytes::copy_from_slice(&bytes[start..]);
-        self.append_component(NameComponent::new(tlv_type::SEGMENT, value))
+        self.append_component(NameComponent::new(tlv_type::SEGMENT, encode_nonnegtive_integer(seg)))
+    }
+
+    /// Append a Version component (type 0x36).
+    pub fn append_version(self, v: u64) -> Self {
+        self.append_component(NameComponent::version(v))
+    }
+
+    /// Append a Timestamp component (type 0x38).
+    pub fn append_timestamp(self, ts: u64) -> Self {
+        self.append_component(NameComponent::timestamp(ts))
+    }
+
+    /// Append a SequenceNum component (type 0x3A).
+    pub fn append_sequence_num(self, seq: u64) -> Self {
+        self.append_component(NameComponent::sequence_num(seq))
+    }
+
+    /// Append a ByteOffset component (type 0x34).
+    pub fn append_byte_offset(self, off: u64) -> Self {
+        self.append_component(NameComponent::byte_offset(off))
     }
 }
 
@@ -217,6 +319,18 @@ pub(crate) fn build_name_value(components: &[&[u8]]) -> bytes::Bytes {
     w.finish()
 }
 
+/// Percent-encode a byte slice for NDN URI display.
+fn percent_encode_component(f: &mut core::fmt::Formatter<'_>, value: &[u8]) -> core::fmt::Result {
+    for &b in value {
+        if b.is_ascii_graphic() && b != b'/' && b != b'%' {
+            write!(f, "{}", b as char)?;
+        } else {
+            write!(f, "%{b:02X}")?;
+        }
+    }
+    Ok(())
+}
+
 impl core::fmt::Display for Name {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "/")?;
@@ -224,12 +338,41 @@ impl core::fmt::Display for Name {
             if i > 0 {
                 write!(f, "/")?;
             }
-            // Print printable ASCII; percent-encode everything else.
-            for &b in c.value.iter() {
-                if b.is_ascii_graphic() && b != b'/' && b != b'%' {
-                    write!(f, "{}", b as char)?;
-                } else {
-                    write!(f, "%{b:02X}")?;
+            match c.typ {
+                tlv_type::IMPLICIT_SHA256 => {
+                    write!(f, "sha256digest=")?;
+                    for &b in c.value.iter() {
+                        write!(f, "{b:02x}")?;
+                    }
+                }
+                tlv_type::PARAMETERS_SHA256 => {
+                    write!(f, "params-sha256=")?;
+                    for &b in c.value.iter() {
+                        write!(f, "{b:02x}")?;
+                    }
+                }
+                tlv_type::KEYWORD => {
+                    write!(f, "keyword=")?;
+                    percent_encode_component(f, &c.value)?;
+                }
+                tlv_type::SEGMENT => {
+                    write!(f, "seg={}", decode_nonnegative_integer(&c.value))?;
+                }
+                tlv_type::BYTE_OFFSET => {
+                    write!(f, "off={}", decode_nonnegative_integer(&c.value))?;
+                }
+                tlv_type::VERSION => {
+                    write!(f, "v={}", decode_nonnegative_integer(&c.value))?;
+                }
+                tlv_type::TIMESTAMP => {
+                    write!(f, "t={}", decode_nonnegative_integer(&c.value))?;
+                }
+                tlv_type::SEQUENCE_NUM => {
+                    write!(f, "seq={}", decode_nonnegative_integer(&c.value))?;
+                }
+                _ => {
+                    // Generic component or unknown type: percent-encode.
+                    percent_encode_component(f, &c.value)?;
                 }
             }
         }
@@ -490,5 +633,164 @@ mod tests {
         let n = name!("/iperf/data");
         assert_eq!(n.len(), 2);
         assert_eq!(n.to_string(), "/iperf/data");
+    }
+
+    // ── Typed component constructors ─────────────────────────────────────────
+
+    #[test]
+    fn keyword_component_roundtrip() {
+        let c = NameComponent::keyword(Bytes::from_static(b"hello"));
+        assert_eq!(c.typ, tlv_type::KEYWORD);
+        assert_eq!(c.value.as_ref(), b"hello");
+    }
+
+    #[test]
+    fn byte_offset_roundtrip() {
+        let c = NameComponent::byte_offset(1024);
+        assert_eq!(c.typ, tlv_type::BYTE_OFFSET);
+        assert_eq!(c.as_byte_offset(), Some(1024));
+    }
+
+    #[test]
+    fn version_roundtrip() {
+        let c = NameComponent::version(7);
+        assert_eq!(c.typ, tlv_type::VERSION);
+        assert_eq!(c.as_version(), Some(7));
+    }
+
+    #[test]
+    fn timestamp_roundtrip() {
+        let c = NameComponent::timestamp(1_700_000_000);
+        assert_eq!(c.typ, tlv_type::TIMESTAMP);
+        assert_eq!(c.as_timestamp(), Some(1_700_000_000));
+    }
+
+    #[test]
+    fn sequence_num_roundtrip() {
+        let c = NameComponent::sequence_num(42);
+        assert_eq!(c.typ, tlv_type::SEQUENCE_NUM);
+        assert_eq!(c.as_sequence_num(), Some(42));
+    }
+
+    #[test]
+    fn zero_value_roundtrip() {
+        assert_eq!(NameComponent::version(0).as_version(), Some(0));
+        assert_eq!(NameComponent::sequence_num(0).as_sequence_num(), Some(0));
+        assert_eq!(NameComponent::byte_offset(0).as_byte_offset(), Some(0));
+        assert_eq!(NameComponent::timestamp(0).as_timestamp(), Some(0));
+    }
+
+    #[test]
+    fn accessor_wrong_type_returns_none() {
+        let c = NameComponent::version(5);
+        assert_eq!(c.as_segment(), None);
+        assert_eq!(c.as_byte_offset(), None);
+        assert_eq!(c.as_timestamp(), None);
+        assert_eq!(c.as_sequence_num(), None);
+    }
+
+    #[test]
+    fn as_segment_accessor() {
+        let n = Name::root().append_segment(99);
+        assert_eq!(n.components()[0].as_segment(), Some(99));
+    }
+
+    // ── Builder method chaining ──────────────────────────────────────────────
+
+    #[test]
+    fn builder_chaining_all_types() {
+        let n = Name::root()
+            .append("data")
+            .append_version(3)
+            .append_segment(0);
+        assert_eq!(n.len(), 3);
+        assert_eq!(n.components()[0].typ, tlv_type::NAME_COMPONENT);
+        assert_eq!(n.components()[1].typ, tlv_type::VERSION);
+        assert_eq!(n.components()[1].as_version(), Some(3));
+        assert_eq!(n.components()[2].typ, tlv_type::SEGMENT);
+        assert_eq!(n.components()[2].as_segment(), Some(0));
+    }
+
+    #[test]
+    fn builder_timestamp_and_sequence() {
+        let n = Name::root()
+            .append("sensor")
+            .append_timestamp(1_700_000)
+            .append_sequence_num(5)
+            .append_byte_offset(4096);
+        assert_eq!(n.len(), 4);
+        assert_eq!(n.components()[1].as_timestamp(), Some(1_700_000));
+        assert_eq!(n.components()[2].as_sequence_num(), Some(5));
+        assert_eq!(n.components()[3].as_byte_offset(), Some(4096));
+    }
+
+    // ── Display with typed components ────────────────────────────────────────
+
+    #[test]
+    fn display_segment() {
+        let n = Name::root().append("data").append_segment(42);
+        assert_eq!(n.to_string(), "/data/seg=42");
+    }
+
+    #[test]
+    fn display_version() {
+        let n = Name::root().append("data").append_version(3);
+        assert_eq!(n.to_string(), "/data/v=3");
+    }
+
+    #[test]
+    fn display_timestamp() {
+        let n = Name::root().append("data").append_timestamp(1000);
+        assert_eq!(n.to_string(), "/data/t=1000");
+    }
+
+    #[test]
+    fn display_sequence_num() {
+        let n = Name::root().append("data").append_sequence_num(7);
+        assert_eq!(n.to_string(), "/data/seq=7");
+    }
+
+    #[test]
+    fn display_byte_offset() {
+        let n = Name::root().append("data").append_byte_offset(512);
+        assert_eq!(n.to_string(), "/data/off=512");
+    }
+
+    #[test]
+    fn display_keyword() {
+        let n = Name::root().append_component(NameComponent::keyword(Bytes::from_static(b"test")));
+        assert_eq!(n.to_string(), "/keyword=test");
+    }
+
+    #[test]
+    fn display_sha256digest() {
+        let digest = [0xABu8; 32];
+        let n = Name::root().append_component(NameComponent::new(
+            tlv_type::IMPLICIT_SHA256,
+            Bytes::copy_from_slice(&digest),
+        ));
+        let expected_hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(n.to_string(), format!("/sha256digest={expected_hex}"));
+    }
+
+    #[test]
+    fn display_params_sha256() {
+        let digest = [0xCDu8; 32];
+        let n = Name::root().append_component(NameComponent::new(
+            tlv_type::PARAMETERS_SHA256,
+            Bytes::copy_from_slice(&digest),
+        ));
+        let expected_hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(n.to_string(), format!("/params-sha256={expected_hex}"));
+    }
+
+    #[test]
+    fn display_mixed_typed_and_generic() {
+        let n = Name::root()
+            .append("ndn")
+            .append("data")
+            .append_version(3)
+            .append_segment(0);
+        assert_eq!(n.to_string(), "/ndn/data/v=3/seg=0");
     }
 }
