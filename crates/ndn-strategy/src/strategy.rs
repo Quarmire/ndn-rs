@@ -1,6 +1,6 @@
+use crate::context::StrategyContext;
 use ndn_packet::Name;
 use ndn_pipeline::ForwardingAction;
-use crate::context::StrategyContext;
 
 /// The forwarding strategy trait.
 ///
@@ -19,10 +19,7 @@ pub trait Strategy: Send + Sync + 'static {
     /// allocation in the `ErasedStrategy` wrapper.
     ///
     /// Returns `None` (default) to fall through to the async path.
-    fn decide(
-        &self,
-        _ctx: &StrategyContext,
-    ) -> Option<smallvec::SmallVec<[ForwardingAction; 2]>> {
+    fn decide(&self, _ctx: &StrategyContext) -> Option<smallvec::SmallVec<[ForwardingAction; 2]>> {
         None
     }
 

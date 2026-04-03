@@ -5,11 +5,14 @@ use std::sync::Arc;
 use smallvec::SmallVec;
 use tracing::trace;
 
+use crate::Fib;
+use crate::enricher::ContextEnricher;
 use ndn_packet::Name;
-use ndn_pipeline::{Action, DecodedPacket, DropReason, ForwardingAction, NackReason, PacketContext};
+use ndn_pipeline::{
+    Action, AnyMap, DecodedPacket, DropReason, ForwardingAction, NackReason, PacketContext,
+};
 use ndn_store::{Pit, StrategyTable};
 use ndn_strategy::{MeasurementsTable, Strategy, StrategyContext};
-use crate::Fib;
 
 /// Object-safe version of `Strategy` that boxes its futures.
 pub trait ErasedStrategy: Send + Sync + 'static {
@@ -18,16 +21,15 @@ pub trait ErasedStrategy: Send + Sync + 'static {
 
     /// Synchronous fast path — avoids the `Box::pin` heap allocation.
     /// Returns `None` to fall through to the async path.
-    fn decide_sync(
-        &self,
-        ctx: &StrategyContext<'_>,
-    ) -> Option<SmallVec<[ForwardingAction; 2]>>;
+    fn decide_sync(&self, ctx: &StrategyContext<'_>) -> Option<SmallVec<[ForwardingAction; 2]>>;
 
+    /// Async path for Interest forwarding decisions (boxed future).
     fn after_receive_interest_erased<'a>(
         &'a self,
         ctx: &'a StrategyContext<'a>,
     ) -> Pin<Box<dyn Future<Output = SmallVec<[ForwardingAction; 2]>> + Send + 'a>>;
 
+    /// Handle an incoming Nack and decide whether to retry or propagate.
     fn on_nack_erased<'a>(
         &'a self,
         ctx: &'a StrategyContext<'a>,
@@ -40,10 +42,7 @@ impl<S: Strategy> ErasedStrategy for S {
         Strategy::name(self)
     }
 
-    fn decide_sync(
-        &self,
-        ctx: &StrategyContext<'_>,
-    ) -> Option<SmallVec<[ForwardingAction; 2]>> {
+    fn decide_sync(&self, ctx: &StrategyContext<'_>) -> Option<SmallVec<[ForwardingAction; 2]>> {
         self.decide(ctx)
     }
 
@@ -60,10 +59,10 @@ impl<S: Strategy> ErasedStrategy for S {
         reason: NackReason,
     ) -> Pin<Box<dyn Future<Output = ForwardingAction> + Send + 'a>> {
         let strategy_reason = match reason {
-            NackReason::NoRoute    => ndn_pipeline::NackReason::NoRoute,
-            NackReason::Duplicate  => ndn_pipeline::NackReason::Duplicate,
+            NackReason::NoRoute => ndn_pipeline::NackReason::NoRoute,
+            NackReason::Duplicate => ndn_pipeline::NackReason::Duplicate,
             NackReason::Congestion => ndn_pipeline::NackReason::Congestion,
-            NackReason::NotYet     => ndn_pipeline::NackReason::NotYet,
+            NackReason::NotYet => ndn_pipeline::NackReason::NotYet,
         };
         Box::pin(self.on_nack(ctx, strategy_reason))
     }
@@ -75,15 +74,18 @@ impl<S: Strategy> ErasedStrategy for S {
 /// Falls back to `default_strategy` if no entry matches (should not happen
 /// if root is populated).
 pub struct StrategyStage {
-    pub strategy_table:   Arc<StrategyTable<dyn ErasedStrategy>>,
+    pub strategy_table: Arc<StrategyTable<dyn ErasedStrategy>>,
     pub default_strategy: Arc<dyn ErasedStrategy>,
-    pub fib:              Arc<Fib>,
-    pub measurements:     Arc<MeasurementsTable>,
-    pub pit:              Arc<Pit>,
-    pub face_table:       Arc<ndn_transport::FaceTable>,
+    pub fib: Arc<Fib>,
+    pub measurements: Arc<MeasurementsTable>,
+    pub pit: Arc<Pit>,
+    pub face_table: Arc<ndn_transport::FaceTable>,
+    /// Cross-layer enrichers run before the strategy to populate `StrategyContext::extensions`.
+    pub enrichers: Vec<Arc<dyn ContextEnricher>>,
 }
 
 impl StrategyStage {
+    /// Run the per-prefix strategy for an Interest and return a pipeline action.
     pub async fn process(&self, mut ctx: PacketContext) -> Action {
         match &ctx.packet {
             DecodedPacket::Interest(_) => {}
@@ -93,7 +95,7 @@ impl StrategyStage {
 
         let name = match &ctx.name {
             Some(n) => n.clone(),
-            None    => return Action::Drop(DropReason::MalformedPacket),
+            None => return Action::Drop(DropReason::MalformedPacket),
         };
 
         let fib_entry_arc = self.fib.lpm(&name);
@@ -106,25 +108,37 @@ impl StrategyStage {
         }
 
         // Convert engine FibEntry → strategy FibEntry.
-        let strategy_fib: Option<ndn_strategy::FibEntry> = fib_entry_ref.map(|e| {
-            ndn_strategy::FibEntry {
-                nexthops: e.nexthops.iter().map(|nh| ndn_strategy::FibNexthop {
-                    face_id: nh.face_id,
-                    cost:    nh.cost,
-                }).collect(),
-            }
-        });
+        let strategy_fib: Option<ndn_strategy::FibEntry> =
+            fib_entry_ref.map(|e| ndn_strategy::FibEntry {
+                nexthops: e
+                    .nexthops
+                    .iter()
+                    .map(|nh| ndn_strategy::FibNexthop {
+                        face_id: nh.face_id,
+                        cost: nh.cost,
+                    })
+                    .collect(),
+            });
+
+        // Build cross-layer extensions via registered enrichers.
+        let mut extensions = AnyMap::new();
+        for enricher in &self.enrichers {
+            enricher.enrich(strategy_fib.as_ref(), &mut extensions);
+        }
 
         let sctx = StrategyContext {
-            name:         &name,
-            in_face:      ctx.face_id,
-            fib_entry:    strategy_fib.as_ref(),
-            pit_token:    ctx.pit_token,
+            name: &name,
+            in_face: ctx.face_id,
+            fib_entry: strategy_fib.as_ref(),
+            pit_token: ctx.pit_token,
             measurements: &self.measurements,
+            extensions: &extensions,
         };
 
         // Per-prefix strategy lookup (LPM on strategy table).
-        let strategy = self.strategy_table.lpm(&name)
+        let strategy = self
+            .strategy_table
+            .lpm(&name)
             .unwrap_or_else(|| Arc::clone(&self.default_strategy));
         trace!(face=%ctx.face_id, name=%name, strategy=%strategy.name(), "strategy: selected");
 
@@ -172,10 +186,10 @@ impl StrategyStage {
                 ForwardingAction::Nack(reason) => {
                     trace!(face=%ctx.face_id, name=%name, reason=?reason, "strategy: Nack");
                     let nr = match reason {
-                        NackReason::NoRoute    => NackReason::NoRoute,
-                        NackReason::Duplicate  => NackReason::Duplicate,
+                        NackReason::NoRoute => NackReason::NoRoute,
+                        NackReason::Duplicate => NackReason::Duplicate,
                         NackReason::Congestion => NackReason::Congestion,
-                        NackReason::NotYet     => NackReason::NotYet,
+                        NackReason::NotYet => NackReason::NotYet,
                     };
                     return Action::Nack(ctx, nr);
                 }

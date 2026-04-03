@@ -24,12 +24,16 @@ impl BestRouteStrategy {
     }
 
     pub fn new() -> Self {
-        Self { name: Self::strategy_name() }
+        Self {
+            name: Self::strategy_name(),
+        }
     }
 }
 
 impl Default for BestRouteStrategy {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Strategy for BestRouteStrategy {
@@ -37,17 +41,14 @@ impl Strategy for BestRouteStrategy {
         &self.name
     }
 
-    fn decide(
-        &self,
-        ctx: &StrategyContext<'_>,
-    ) -> Option<SmallVec<[ForwardingAction; 2]>> {
+    fn decide(&self, ctx: &StrategyContext<'_>) -> Option<SmallVec<[ForwardingAction; 2]>> {
         let Some(fib) = ctx.fib_entry else {
             return Some(smallvec![ForwardingAction::Nack(NackReason::NoRoute)]);
         };
         let nexthops = fib.nexthops_excluding(ctx.in_face);
         match nexthops.first() {
             Some(nh) => Some(smallvec![ForwardingAction::Forward(smallvec![nh.face_id])]),
-            None     => Some(smallvec![ForwardingAction::Nack(NackReason::NoRoute)]),
+            None => Some(smallvec![ForwardingAction::Nack(NackReason::NoRoute)]),
         }
     }
 
@@ -72,10 +73,10 @@ impl Strategy for BestRouteStrategy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-    use ndn_transport::FaceId;
-    use crate::{MeasurementsTable};
+    use crate::MeasurementsTable;
     use crate::context::{FibEntry, FibNexthop};
+    use ndn_transport::FaceId;
+    use std::sync::Arc;
 
     fn make_ctx<'a>(
         name: &'a Arc<Name>,
@@ -83,7 +84,16 @@ mod tests {
         fib_entry: Option<&'a FibEntry>,
         measurements: &'a MeasurementsTable,
     ) -> StrategyContext<'a> {
-        StrategyContext { name, in_face, fib_entry, pit_token: None, measurements }
+        static EMPTY: std::sync::LazyLock<ndn_transport::AnyMap> =
+            std::sync::LazyLock::new(ndn_transport::AnyMap::new);
+        StrategyContext {
+            name,
+            in_face,
+            fib_entry,
+            pit_token: None,
+            measurements,
+            extensions: &EMPTY,
+        }
     }
 
     #[tokio::test]
@@ -106,8 +116,14 @@ mod tests {
         let measurements = MeasurementsTable::new();
         let fib = FibEntry {
             nexthops: vec![
-                FibNexthop { face_id: FaceId(2), cost: 10 },
-                FibNexthop { face_id: FaceId(3), cost: 20 },
+                FibNexthop {
+                    face_id: FaceId(2),
+                    cost: 10,
+                },
+                FibNexthop {
+                    face_id: FaceId(3),
+                    cost: 20,
+                },
             ],
         };
         let ctx = make_ctx(&name, FaceId(1), Some(&fib), &measurements);
@@ -126,7 +142,12 @@ mod tests {
         let name = Arc::new(Name::root());
         let measurements = MeasurementsTable::new();
         // Only nexthop is the same as in_face → no route
-        let fib = FibEntry { nexthops: vec![FibNexthop { face_id: FaceId(1), cost: 0 }] };
+        let fib = FibEntry {
+            nexthops: vec![FibNexthop {
+                face_id: FaceId(1),
+                cost: 0,
+            }],
+        };
         let ctx = make_ctx(&name, FaceId(1), Some(&fib), &measurements);
         let actions = strategy.after_receive_interest(&ctx).await;
         assert!(matches!(
