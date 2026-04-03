@@ -300,6 +300,42 @@ the strategy extensibility tiers:
 - **`wasm-strategy`** — embedded WAT module loaded via
   `WasmStrategy::from_bytes()`.
 
+#### Pluggable, manageable, observable content store
+
+The content store is now a trait-based abstraction that researchers can
+extend with new implementations, manage at runtime via NFD-compatible
+commands, and instrument with observability hooks.
+
+- **Object-safe `ErasedContentStore` trait** — wraps the `ContentStore`
+  trait with boxed futures (same pattern as `ErasedStrategy`). The engine
+  holds `Arc<dyn ErasedContentStore>`, allowing runtime polymorphism.
+- **Extended `ContentStore` trait** — new methods with defaults:
+  `len()`, `current_bytes()`, `set_capacity()`, `variant_name()`,
+  `evict_prefix()`, `stats()`.
+- **`LruCs` runtime capacity** — `capacity_bytes` changed from `usize`
+  to `AtomicUsize` for lock-free runtime updates via `set_capacity()`.
+- **`NameTrie::descendants()`** — DFS collection of all values under a
+  prefix, needed for `evict_prefix`.
+- **`EngineBuilder` CS methods** — `.content_store()`,
+  `.admission_policy()`, `.cs_observer()` for plugging in custom
+  implementations at build time. Defaults to `LruCs` + `DefaultAdmissionPolicy`.
+- **TOML `[cs]` config section** — `variant` ("lru", "sharded-lru",
+  "null"), `capacity_mb`, `shards`, `admission_policy`. Backward
+  compatible with existing `engine.cs_capacity_mb`.
+- **NFD management commands** — `cs/config` (get/set capacity),
+  `cs/info` (entries, bytes, hit/miss counters, variant name),
+  `cs/erase` (prefix-based eviction with optional count limit).
+  `ControlParameters` extended with `capacity` (TLV 0x83) and `count`
+  (TLV 0x84) fields.
+- **`ndn-ctl` CLI** — `cs config --capacity <bytes>`, `cs erase <prefix>
+  --count N`, `cs info`.
+- **`MgmtClient`** — `cs_config()`, `cs_erase()` typed methods.
+- **`ObservableCs` wrapper** — wraps any `ErasedContentStore` with
+  atomic hit/miss/insert/eviction counters and an optional `CsObserver`
+  callback. Zero overhead when no observer is registered.
+- **`CsStats`** — snapshot struct for counter values, returned by
+  `stats()` on all CS implementations.
+
 ### Fixed
 
 #### Pipeline overload kills SHM applications via backpressure cascade
