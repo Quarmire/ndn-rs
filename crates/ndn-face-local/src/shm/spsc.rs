@@ -599,8 +599,12 @@ impl SpscHandle {
     /// Send a packet to the engine (enqueue in the a2e ring).
     ///
     /// Yields cooperatively if the ring is full (backpressure from the engine).
-    /// Returns `Err` if the ring stays full for too long (engine likely dead)
-    /// or the cancellation token fires.
+    /// Returns `Err(Closed)` if the cancellation token fires (engine dead).
+    ///
+    /// Uses a wall-clock deadline so backpressure tolerance is independent
+    /// of system scheduling speed (the old yield-counter approach returned
+    /// `Closed` after ~100k yields ≈ 1s on fast machines, but could be much
+    /// shorter under heavy Tokio contention — falsely killing the caller).
     pub async fn send(&self, pkt: Bytes) -> Result<(), ShmError> {
         if self.cancel.is_cancelled() {
             return Err(ShmError::Closed);
@@ -612,16 +616,13 @@ impl SpscHandle {
         let parked = unsafe {
             &*AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_A2E_PARKED) as *mut u32)
         };
-        // Bounded yield: if ring stays full for ~1 second the engine is likely dead.
-        const MAX_YIELD_ITERS: u32 = 100_000;
-        let mut yields = 0u32;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             if self.try_push_a2e(&pkt) { break; }
             if self.cancel.is_cancelled() {
                 return Err(ShmError::Closed);
             }
-            yields += 1;
-            if yields >= MAX_YIELD_ITERS {
+            if tokio::time::Instant::now() >= deadline {
                 return Err(ShmError::Closed);
             }
             tokio::task::yield_now().await;

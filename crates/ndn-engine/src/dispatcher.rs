@@ -488,8 +488,21 @@ pub(crate) async fn run_face_reader(
                         state.last_activity.store(arrival, Ordering::Relaxed);
                     }
                 }
-                if tx.send(InboundPacket { raw, face_id, arrival }).await.is_err() {
-                    break; // Runner dropped.
+                // Use try_send to avoid blocking the face reader when the
+                // pipeline channel is full.  Blocking here cascades back
+                // through the SHM ring — the face can't recv, its peer's
+                // send() spins and eventually times out, killing the peer
+                // application.  Dropping the packet is the correct NDN
+                // behaviour: consumers re-express, and the pipeline is
+                // protected from overload.
+                match tx.try_send(InboundPacket { raw, face_id, arrival }) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        debug!(face=%face_id, "pipeline full, dropping inbound packet");
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        break; // Runner dropped.
+                    }
                 }
             }
             Err(FaceError::Closed) => {
