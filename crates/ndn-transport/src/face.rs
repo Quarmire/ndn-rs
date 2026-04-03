@@ -16,12 +16,15 @@ impl core::fmt::Display for FaceId {
 }
 
 /// Classifies a face by its transport type (informational; not used for routing).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "kebab-case"))]
 pub enum FaceKind {
     Udp,
     Tcp,
     Unix,
     Ethernet,
+    EtherMulticast,
     App,
     Shm,
     Serial,
@@ -38,9 +41,54 @@ impl FaceKind {
     pub fn scope(&self) -> FaceScope {
         match self {
             FaceKind::Unix | FaceKind::App | FaceKind::Shm | FaceKind::Internal => FaceScope::Local,
-            FaceKind::Udp | FaceKind::Tcp | FaceKind::Ethernet | FaceKind::Serial
-            | FaceKind::Bluetooth | FaceKind::Wfb | FaceKind::Compute | FaceKind::Multicast
-            | FaceKind::WebSocket => FaceScope::NonLocal,
+            FaceKind::Udp | FaceKind::Tcp | FaceKind::Ethernet | FaceKind::EtherMulticast
+            | FaceKind::Serial | FaceKind::Bluetooth | FaceKind::Wfb | FaceKind::Compute
+            | FaceKind::Multicast | FaceKind::WebSocket => FaceScope::NonLocal,
+        }
+    }
+}
+
+impl core::fmt::Display for FaceKind {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Udp            => "udp",
+            Self::Tcp            => "tcp",
+            Self::Unix           => "unix",
+            Self::Ethernet       => "ethernet",
+            Self::EtherMulticast => "ether-multicast",
+            Self::App            => "app",
+            Self::Shm            => "shm",
+            Self::Serial         => "serial",
+            Self::Bluetooth      => "bluetooth",
+            Self::Wfb            => "wfb",
+            Self::Compute        => "compute",
+            Self::Internal       => "internal",
+            Self::Multicast      => "multicast",
+            Self::WebSocket      => "web-socket",
+        })
+    }
+}
+
+impl core::str::FromStr for FaceKind {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "udp"             => Ok(Self::Udp),
+            "tcp"             => Ok(Self::Tcp),
+            "unix"            => Ok(Self::Unix),
+            "ethernet"        => Ok(Self::Ethernet),
+            "ether-multicast" => Ok(Self::EtherMulticast),
+            "app"             => Ok(Self::App),
+            "shm"             => Ok(Self::Shm),
+            "serial"          => Ok(Self::Serial),
+            "bluetooth"       => Ok(Self::Bluetooth),
+            "wfb"             => Ok(Self::Wfb),
+            "compute"         => Ok(Self::Compute),
+            "internal"        => Ok(Self::Internal),
+            "multicast"       => Ok(Self::Multicast),
+            "web-socket"      => Ok(Self::WebSocket),
+            _                 => Err(()),
         }
     }
 }

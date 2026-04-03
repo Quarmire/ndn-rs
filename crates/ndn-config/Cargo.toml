@@ -8,9 +8,10 @@ license.workspace = true
 [dependencies]
 ndn-tlv       = { workspace = true }
 ndn-packet    = { workspace = true }
+ndn-transport = { workspace = true, features = ["serde"] }
 bytes         = { workspace = true }
 thiserror     = { workspace = true }
-serde         = { version = "1", features = ["derive"] }
+serde         = { workspace = true }
 serde_json    = { workspace = true }
 toml          = "0.8"
 

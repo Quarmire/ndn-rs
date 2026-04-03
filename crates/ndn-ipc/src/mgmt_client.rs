@@ -46,7 +46,7 @@ impl MgmtClient {
     /// Connect to the router's face socket.
     pub async fn connect(face_socket: impl AsRef<Path>) -> Result<Self, RouterError> {
         let face = Arc::new(
-            UnixFace::connect(FaceId(0), face_socket.as_ref()).await?
+            ndn_face_local::unix_face_connect(FaceId(0), face_socket.as_ref()).await?
         );
         Ok(Self { face, recv_lock: Mutex::new(()) })
     }

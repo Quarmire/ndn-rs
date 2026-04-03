@@ -112,7 +112,6 @@ fn bench_appface_throughput(c: &mut Criterion) {
 fn bench_unix_latency(c: &mut Criterion) {
     #[cfg(unix)]
     {
-        use ndn_face_local::UnixFace;
         use tokio::net::UnixStream;
 
         let rt = current_thread_rt();
@@ -124,8 +123,8 @@ fn bench_unix_latency(c: &mut Criterion) {
             // socketpair(2) — no socket file on disk.
             let (fa, fb) = rt.block_on(async {
                 let (s1, s2) = UnixStream::pair().unwrap();
-                let fa = UnixFace::from_stream(FaceId(20), s1, "pair-a");
-                let fb = UnixFace::from_stream(FaceId(21), s2, "pair-b");
+                let fa = ndn_face_local::unix_face_from_stream(FaceId(20), s1, "pair-a");
+                let fb = ndn_face_local::unix_face_from_stream(FaceId(21), s2, "pair-b");
                 (fa, fb)
             });
 
@@ -163,7 +162,6 @@ fn bench_unix_latency(c: &mut Criterion) {
 fn bench_unix_throughput(c: &mut Criterion) {
     #[cfg(unix)]
     {
-        use ndn_face_local::UnixFace;
         use tokio::net::UnixStream;
 
         const N: u64 = 200;
@@ -176,8 +174,8 @@ fn bench_unix_throughput(c: &mut Criterion) {
 
             let (fa, fb) = rt.block_on(async {
                 let (s1, s2) = UnixStream::pair().unwrap();
-                let fa = UnixFace::from_stream(FaceId(22), s1, "pair-c");
-                let fb = UnixFace::from_stream(FaceId(23), s2, "pair-d");
+                let fa = ndn_face_local::unix_face_from_stream(FaceId(22), s1, "pair-c");
+                let fb = ndn_face_local::unix_face_from_stream(FaceId(23), s2, "pair-d");
                 (fa, fb)
             });
 

@@ -94,56 +94,71 @@ impl Default for EngineConfig {
 }
 
 /// Configuration for a single face.
+///
+/// Each variant carries only the fields relevant to that transport type,
+/// making invalid combinations unrepresentable at parse time.
+///
+/// TOML syntax is unchanged — the `kind` field selects the variant:
+///
+/// ```toml
+/// [[face]]
+/// kind = "udp"
+/// bind = "0.0.0.0:6363"
+///
+/// [[face]]
+/// kind = "serial"
+/// path = "/dev/ttyUSB0"
+/// baud = 115200
+/// ```
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct FaceConfig {
-    /// Transport kind: `"udp"`, `"tcp"`, `"multicast"`, `"unix"`.
-    pub kind: FaceKind,
-
-    /// Local bind address (e.g., `"0.0.0.0:6363"`) for UDP/TCP faces.
-    #[serde(default)]
-    pub bind: Option<String>,
-
-    /// Remote peer address for unicast UDP/TCP faces.
-    #[serde(default)]
-    pub remote: Option<String>,
-
-    /// Multicast group address.
-    #[serde(default)]
-    pub group: Option<String>,
-
-    /// Multicast port.
-    #[serde(default)]
-    pub port: Option<u16>,
-
-    /// Network interface name for multicast faces.
-    #[serde(default)]
-    pub interface: Option<String>,
-
-    /// Unix socket path for local faces, or serial port path (e.g., `/dev/ttyUSB0`).
-    #[serde(default)]
-    pub path: Option<String>,
-
-    /// Serial baud rate (only for `kind = "serial"`).
-    #[serde(default)]
-    pub baud: Option<u32>,
-
-    /// WebSocket URL for client-mode connections (e.g., `ws://host:9696/ndn`).
-    /// For server-mode, use `bind` instead.
-    #[serde(default)]
-    pub url: Option<String>,
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum FaceConfig {
+    Udp {
+        #[serde(default)]
+        bind: Option<String>,
+        #[serde(default)]
+        remote: Option<String>,
+    },
+    Tcp {
+        #[serde(default)]
+        bind: Option<String>,
+        #[serde(default)]
+        remote: Option<String>,
+    },
+    Multicast {
+        group: String,
+        port: u16,
+        #[serde(default)]
+        interface: Option<String>,
+    },
+    Unix {
+        #[serde(default)]
+        path: Option<String>,
+    },
+    #[serde(rename = "web-socket")]
+    WebSocket {
+        #[serde(default)]
+        bind: Option<String>,
+        #[serde(default)]
+        url: Option<String>,
+    },
+    Serial {
+        path: String,
+        #[serde(default = "default_baud")]
+        baud: u32,
+    },
+    #[serde(rename = "ether-multicast")]
+    EtherMulticast {
+        interface: String,
+    },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum FaceKind {
-    Udp,
-    Tcp,
-    Multicast,
-    Unix,
-    WebSocket,
-    EtherMulticast,
-    Serial,
-}
+fn default_baud() -> u32 { 115200 }
+
+/// Re-export the canonical `FaceKind` from `ndn-transport` — single source of
+/// truth for all face type classification.  Serde support is enabled via the
+/// `serde` feature on `ndn-transport`.
+pub use ndn_transport::FaceKind;
 
 /// A static FIB route entry.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -275,8 +290,8 @@ require_signed = true
         assert_eq!(cfg.engine.cs_capacity_mb, 32);
         assert_eq!(cfg.engine.pipeline_channel_cap, 512);
         assert_eq!(cfg.faces.len(), 2);
-        assert_eq!(cfg.faces[0].kind, FaceKind::Udp);
-        assert_eq!(cfg.faces[1].kind, FaceKind::Multicast);
+        assert!(matches!(cfg.faces[0], FaceConfig::Udp { .. }));
+        assert!(matches!(cfg.faces[1], FaceConfig::Multicast { .. }));
         assert_eq!(cfg.routes.len(), 2);
         assert_eq!(cfg.routes[0].prefix, "/ndn");
         assert_eq!(cfg.routes[0].cost, 10);
