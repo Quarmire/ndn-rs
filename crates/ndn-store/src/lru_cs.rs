@@ -6,7 +6,7 @@ use lru::LruCache;
 
 use ndn_packet::{Interest, Name};
 
-use crate::{ContentStore, CsCapacity, CsEntry, CsMeta, InsertResult, NameTrie};
+use crate::{ContentStore, CsCapacity, CsEntry, CsMeta, CsStats, InsertResult, NameTrie};
 
 /// In-memory LRU content store, bounded by total byte capacity.
 ///
@@ -22,7 +22,8 @@ use crate::{ContentStore, CsCapacity, CsEntry, CsMeta, InsertResult, NameTrie};
 /// contention on the hot path for workloads that don't cache (e.g. iperf).
 pub struct LruCs {
     inner: Mutex<LruInner>,
-    capacity_bytes: usize,
+    /// Maximum byte capacity. Atomic for lock-free runtime updates via `set_capacity`.
+    capacity_bytes: AtomicUsize,
     /// Atomic entry count — updated under the lock but readable without it.
     entry_count: AtomicUsize,
 }
@@ -47,26 +48,14 @@ impl LruCs {
                 prefix_index: NameTrie::new(),
                 current_bytes: 0,
             }),
-            capacity_bytes,
+            capacity_bytes: AtomicUsize::new(capacity_bytes),
             entry_count: AtomicUsize::new(0),
         }
-    }
-}
-
-impl LruCs {
-    /// Number of entries currently cached.
-    pub fn len(&self) -> usize {
-        self.inner.lock().unwrap().cache.len()
     }
 
     /// Whether the cache is empty.
     pub fn is_empty(&self) -> bool {
-        self.inner.lock().unwrap().cache.is_empty()
-    }
-
-    /// Total bytes currently used.
-    pub fn current_bytes(&self) -> usize {
-        self.inner.lock().unwrap().current_bytes
+        self.entry_count.load(Ordering::Relaxed) == 0
     }
 }
 
@@ -111,6 +100,7 @@ impl ContentStore for LruCs {
 
     async fn insert(&self, data: Bytes, name: Arc<Name>, meta: CsMeta) -> InsertResult {
         let entry_bytes = data.len();
+        let capacity = self.capacity_bytes.load(Ordering::Relaxed);
         let mut inner = self.inner.lock().unwrap();
 
         // Track whether we are replacing an existing entry.
@@ -122,7 +112,7 @@ impl ContentStore for LruCs {
         };
 
         // Evict LRU entries until there is room, keeping prefix_index in sync.
-        while inner.current_bytes + entry_bytes > self.capacity_bytes {
+        while inner.current_bytes + entry_bytes > capacity {
             if let Some((evicted_name, evicted)) = inner.cache.pop_lru() {
                 inner.current_bytes = inner.current_bytes.saturating_sub(evicted.data.len());
                 inner.prefix_index.remove(&evicted_name);
@@ -167,7 +157,53 @@ impl ContentStore for LruCs {
     }
 
     fn capacity(&self) -> CsCapacity {
-        CsCapacity::bytes(self.capacity_bytes)
+        CsCapacity::bytes(self.capacity_bytes.load(Ordering::Relaxed))
+    }
+
+    fn len(&self) -> usize {
+        self.entry_count.load(Ordering::Relaxed)
+    }
+
+    fn current_bytes(&self) -> usize {
+        self.inner.lock().unwrap().current_bytes
+    }
+
+    fn set_capacity(&self, max_bytes: usize) {
+        self.capacity_bytes.store(max_bytes, Ordering::Relaxed);
+        // Evict entries that exceed the new capacity.
+        let mut inner = self.inner.lock().unwrap();
+        while inner.current_bytes > max_bytes {
+            if let Some((evicted_name, evicted)) = inner.cache.pop_lru() {
+                inner.current_bytes = inner.current_bytes.saturating_sub(evicted.data.len());
+                inner.prefix_index.remove(&evicted_name);
+                self.entry_count.fetch_sub(1, Ordering::Relaxed);
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn variant_name(&self) -> &str {
+        "lru"
+    }
+
+    async fn evict_prefix(&self, prefix: &Name, limit: Option<usize>) -> usize {
+        let mut inner = self.inner.lock().unwrap();
+        let names: Vec<Arc<Name>> = inner.prefix_index.descendants(prefix);
+        let max = limit.unwrap_or(usize::MAX);
+        let mut evicted = 0;
+        for name in names {
+            if evicted >= max {
+                break;
+            }
+            if let Some(entry) = inner.cache.pop(name.as_ref()) {
+                inner.current_bytes = inner.current_bytes.saturating_sub(entry.data.len());
+                inner.prefix_index.remove(name.as_ref());
+                self.entry_count.fetch_sub(1, Ordering::Relaxed);
+                evicted += 1;
+            }
+        }
+        evicted
     }
 }
 
@@ -451,5 +487,105 @@ mod tests {
         .await;
         // CanBePrefix for /a should now miss (evicted entry removed from index).
         assert!(cs.get(&interest_can_be_prefix(&["a"])).await.is_none());
+    }
+
+    // ── new trait methods ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn len_tracks_entries() {
+        let cs = LruCs::new(65536);
+        assert_eq!(cs.len(), 0);
+        cs.insert(Bytes::from_static(b"x"), arc_name(&["a"]), meta_fresh())
+            .await;
+        assert_eq!(cs.len(), 1);
+        cs.insert(Bytes::from_static(b"y"), arc_name(&["b"]), meta_fresh())
+            .await;
+        assert_eq!(cs.len(), 2);
+        cs.evict(&arc_name(&["a"])).await;
+        assert_eq!(cs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn set_capacity_evicts_excess() {
+        let cs = LruCs::new(100);
+        cs.insert(Bytes::from(vec![0u8; 40]), arc_name(&["a"]), meta_fresh())
+            .await;
+        cs.insert(Bytes::from(vec![0u8; 40]), arc_name(&["b"]), meta_fresh())
+            .await;
+        assert_eq!(cs.len(), 2);
+        // Shrink capacity below current usage — should evict LRU entries.
+        cs.set_capacity(50);
+        assert_eq!(cs.capacity().max_bytes, 50);
+        assert_eq!(cs.len(), 1);
+        // The more recently used entry (/b) survives.
+        assert!(cs.get(&interest(&["b"])).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn variant_name_is_lru() {
+        let cs = LruCs::new(1024);
+        assert_eq!(cs.variant_name(), "lru");
+    }
+
+    #[tokio::test]
+    async fn evict_prefix_removes_matching_entries() {
+        let cs = LruCs::new(65536);
+        cs.insert(
+            Bytes::from_static(b"1"),
+            arc_name(&["a", "b", "1"]),
+            meta_fresh(),
+        )
+        .await;
+        cs.insert(
+            Bytes::from_static(b"2"),
+            arc_name(&["a", "b", "2"]),
+            meta_fresh(),
+        )
+        .await;
+        cs.insert(
+            Bytes::from_static(b"3"),
+            arc_name(&["x", "y"]),
+            meta_fresh(),
+        )
+        .await;
+        let name_ab = Name::from_components(
+            ["a", "b"]
+                .iter()
+                .map(|s| NameComponent::generic(Bytes::copy_from_slice(s.as_bytes()))),
+        );
+        let evicted = cs.evict_prefix(&name_ab, None).await;
+        assert_eq!(evicted, 2);
+        assert_eq!(cs.len(), 1);
+        // /x/y should still be there.
+        assert!(cs.get(&interest(&["x", "y"])).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn evict_prefix_respects_limit() {
+        let cs = LruCs::new(65536);
+        cs.insert(
+            Bytes::from_static(b"1"),
+            arc_name(&["a", "1"]),
+            meta_fresh(),
+        )
+        .await;
+        cs.insert(
+            Bytes::from_static(b"2"),
+            arc_name(&["a", "2"]),
+            meta_fresh(),
+        )
+        .await;
+        cs.insert(
+            Bytes::from_static(b"3"),
+            arc_name(&["a", "3"]),
+            meta_fresh(),
+        )
+        .await;
+        let name_a = Name::from_components(std::iter::once(NameComponent::generic(
+            Bytes::copy_from_slice(b"a"),
+        )));
+        let evicted = cs.evict_prefix(&name_a, Some(1)).await;
+        assert_eq!(evicted, 1);
+        assert_eq!(cs.len(), 2);
     }
 }

@@ -6,7 +6,7 @@ use bytes::Bytes;
 
 use ndn_packet::{Interest, Name};
 
-use crate::{ContentStore, CsCapacity, CsEntry, CsMeta, InsertResult};
+use crate::{ContentStore, CsCapacity, CsEntry, CsMeta, CsStats, InsertResult};
 
 /// Shards a `ContentStore` across `N` instances to reduce lock contention.
 ///
@@ -72,6 +72,43 @@ impl<C: ContentStore> ContentStore for ShardedCs<C> {
     fn capacity(&self) -> CsCapacity {
         let total: usize = self.shards.iter().map(|s| s.capacity().max_bytes).sum();
         CsCapacity::bytes(total)
+    }
+
+    fn len(&self) -> usize {
+        self.shards.iter().map(|s| s.len()).sum()
+    }
+
+    fn current_bytes(&self) -> usize {
+        self.shards.iter().map(|s| s.current_bytes()).sum()
+    }
+
+    fn set_capacity(&self, max_bytes: usize) {
+        let per_shard = max_bytes / self.shard_count;
+        for shard in &self.shards {
+            shard.set_capacity(per_shard);
+        }
+    }
+
+    fn variant_name(&self) -> &str {
+        "sharded-lru"
+    }
+
+    async fn evict_prefix(&self, prefix: &Name, limit: Option<usize>) -> usize {
+        // Route to the correct shard based on first component.
+        let idx = self.shard_for(prefix);
+        self.shards[idx].evict_prefix(prefix, limit).await
+    }
+
+    fn stats(&self) -> CsStats {
+        let mut combined = CsStats::default();
+        for shard in &self.shards {
+            let s = shard.stats();
+            combined.hits += s.hits;
+            combined.misses += s.misses;
+            combined.inserts += s.inserts;
+            combined.evictions += s.evictions;
+        }
+        combined
     }
 }
 

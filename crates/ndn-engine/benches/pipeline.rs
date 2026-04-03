@@ -16,7 +16,7 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use ndn_packet::encode::{encode_data_unsigned, encode_interest};
 use ndn_packet::{Name, NameComponent};
 use ndn_pipeline::{Action, DecodedPacket, PacketContext};
-use ndn_store::{ContentStore, CsMeta, LruCs, Pit, PitToken};
+use ndn_store::{ContentStore, CsMeta, ErasedContentStore, LruCs, Pit, PitToken};
 use ndn_transport::FaceId;
 
 use ndn_engine::Fib;
@@ -119,7 +119,7 @@ fn bench_cs_lookup(c: &mut Criterion) {
     rt.block_on(cs.insert(wire.clone(), n.clone(), CsMeta { stale_at: u64::MAX }));
 
     let stage = CsLookupStage {
-        cs: Arc::clone(&cs),
+        cs: Arc::clone(&cs) as Arc<dyn ErasedContentStore>,
     };
 
     let mut group = c.benchmark_group("cs");
@@ -310,7 +310,7 @@ fn bench_cs_insert(c: &mut Criterion) {
     group.bench_function("insert", |b| {
         let cs = Arc::new(LruCs::new(64 * 1024 * 1024));
         let stage = CsInsertStage {
-            cs: Arc::clone(&cs),
+            cs: Arc::clone(&cs) as Arc<dyn ErasedContentStore>,
             admission: Arc::new(ndn_store::AdmitAllPolicy),
         };
         let wire = data_wire(4);
@@ -345,7 +345,7 @@ fn bench_interest_pipeline(c: &mut Criterion) {
 
             let decode = TlvDecodeStage;
             let cs_lookup = CsLookupStage {
-                cs: Arc::clone(&cs),
+                cs: Arc::clone(&cs) as Arc<dyn ErasedContentStore>,
             };
             let pit_check = PitCheckStage {
                 pit: Arc::clone(&pit),
@@ -399,7 +399,7 @@ fn bench_interest_cs_hit(c: &mut Criterion) {
 
     let decode = TlvDecodeStage;
     let cs_lookup = CsLookupStage {
-        cs: Arc::clone(&cs),
+        cs: Arc::clone(&cs) as Arc<dyn ErasedContentStore>,
     };
 
     let wire = interest_wire(4);
@@ -442,7 +442,7 @@ fn bench_data_pipeline(c: &mut Criterion) {
                     pit: Arc::clone(&pit),
                 };
                 let cs_insert = CsInsertStage {
-                    cs: Arc::clone(&cs),
+                    cs: Arc::clone(&cs) as Arc<dyn ErasedContentStore>,
                     admission: Arc::new(ndn_store::AdmitAllPolicy),
                 };
 

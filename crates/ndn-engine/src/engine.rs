@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 
 use ndn_packet::Interest;
 use ndn_security::SecurityManager;
-use ndn_store::{LruCs, Pit, PitToken, StrategyTable};
+use ndn_store::{ErasedContentStore, Pit, PitToken, StrategyTable};
 use ndn_strategy::MeasurementsTable;
 use ndn_transport::{Face, FaceId, FacePersistency, FaceTable};
 
@@ -104,7 +104,7 @@ impl FaceState {
 pub struct EngineInner {
     pub fib: Arc<Fib>,
     pub pit: Arc<Pit>,
-    pub cs: Arc<LruCs>,
+    pub cs: Arc<dyn ErasedContentStore>,
     pub face_table: Arc<FaceTable>,
     pub measurements: Arc<MeasurementsTable>,
     pub strategy_table: Arc<StrategyTable<dyn ErasedStrategy>>,
@@ -144,7 +144,7 @@ impl ForwarderEngine {
         Arc::clone(&self.inner.pit)
     }
 
-    pub fn cs(&self) -> Arc<LruCs> {
+    pub fn cs(&self) -> Arc<dyn ErasedContentStore> {
         Arc::clone(&self.inner.cs)
     }
 

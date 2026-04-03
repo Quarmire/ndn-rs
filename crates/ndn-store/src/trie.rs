@@ -119,6 +119,26 @@ impl<V: Clone + Send + Sync + 'static> NameTrie<V> {
         out
     }
 
+    /// Collect all values stored at or below `prefix` in the trie.
+    ///
+    /// Used for prefix-based eviction (e.g. `cs erase /prefix`).
+    pub fn descendants(&self, prefix: &Name) -> Vec<V> {
+        let mut current = Arc::clone(&self.root);
+        for component in prefix.components() {
+            let child = {
+                let node = current.read().unwrap();
+                node.children.get(component).map(Arc::clone)
+            };
+            match child {
+                None => return Vec::new(),
+                Some(c) => current = c,
+            }
+        }
+        let mut out = Vec::new();
+        collect_subtree(&current, &mut out);
+        out
+    }
+
     /// Returns the first value found at or below `prefix` in the trie.
     ///
     /// Used for `CanBePrefix` CS lookups: walk to the Interest name position,
@@ -167,6 +187,23 @@ fn dump_subtree<V: Clone + Send + Sync + 'static>(
         path.push(comp);
         dump_subtree(&child, path, out);
         path.pop();
+    }
+}
+
+/// Collect all values at or below `node` into `out`.
+fn collect_subtree<V: Clone + Send + Sync + 'static>(
+    node: &Arc<RwLock<TrieNode<V>>>,
+    out: &mut Vec<V>,
+) {
+    let guard = node.read().unwrap();
+    if let Some(v) = &guard.entry {
+        out.push(v.clone());
+    }
+    let children: Vec<Arc<RwLock<TrieNode<V>>>> =
+        guard.children.values().map(Arc::clone).collect();
+    drop(guard);
+    for child in children {
+        collect_subtree(&child, out);
     }
 }
 

@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::trace;
 
 use ndn_pipeline::{Action, DecodedPacket, PacketContext};
-use ndn_store::{ContentStore, CsAdmissionPolicy, CsEntry, CsMeta, LruCs};
+use ndn_store::{CsAdmissionPolicy, CsMeta, ErasedContentStore};
 
 /// Look up the CS before hitting the PIT/FIB.
 ///
@@ -15,7 +15,7 @@ use ndn_store::{ContentStore, CsAdmissionPolicy, CsEntry, CsMeta, LruCs};
 ///
 /// On a miss: `Action::Continue(ctx)` to proceed to `PitCheckStage`.
 pub struct CsLookupStage {
-    pub cs: Arc<LruCs>,
+    pub cs: Arc<dyn ErasedContentStore>,
 }
 
 impl CsLookupStage {
@@ -26,7 +26,7 @@ impl CsLookupStage {
             _ => return Action::Continue(ctx),
         };
 
-        if let Some(entry) = self.cs.get(interest).await {
+        if let Some(entry) = self.cs.get_erased(interest).await {
             trace!(face=%ctx.face_id, name=?ctx.name, "cs-lookup: HIT");
             ctx.cs_hit = true;
             ctx.out_faces.push(ctx.face_id);
@@ -46,7 +46,7 @@ impl CsLookupStage {
 /// The admission policy is consulted before inserting — Data that fails the
 /// policy check is not cached.
 pub struct CsInsertStage {
-    pub cs: Arc<LruCs>,
+    pub cs: Arc<dyn ErasedContentStore>,
     pub admission: Arc<dyn CsAdmissionPolicy>,
 }
 
@@ -72,7 +72,7 @@ impl CsInsertStage {
 
             let meta = CsMeta { stale_at };
             self.cs
-                .insert(ctx.raw_bytes.clone(), data.name.clone(), meta)
+                .insert_erased(ctx.raw_bytes.clone(), data.name.clone(), meta)
                 .await;
             trace!(name=%data.name, freshness_ms, "cs-insert: cached");
         }

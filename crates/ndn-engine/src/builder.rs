@@ -6,7 +6,7 @@ use tokio_util::sync::CancellationToken;
 
 use ndn_packet::Name;
 use ndn_security::SecurityManager;
-use ndn_store::{LruCs, Pit, StrategyTable};
+use ndn_store::{CsAdmissionPolicy, CsObserver, ErasedContentStore, LruCs, ObservableCs, Pit, StrategyTable};
 use ndn_strategy::{BestRouteStrategy, MeasurementsTable};
 use ndn_transport::{Face, FaceTable};
 
@@ -55,6 +55,9 @@ pub struct EngineBuilder {
     strategy: Option<Arc<dyn ErasedStrategy>>,
     security: Option<Arc<SecurityManager>>,
     enrichers: Vec<Arc<dyn ContextEnricher>>,
+    cs: Option<Arc<dyn ErasedContentStore>>,
+    admission: Option<Arc<dyn CsAdmissionPolicy>>,
+    cs_observer: Option<Arc<dyn CsObserver>>,
 }
 
 impl EngineBuilder {
@@ -65,6 +68,9 @@ impl EngineBuilder {
             strategy: None,
             security: None,
             enrichers: Vec::new(),
+            cs: None,
+            admission: None,
+            cs_observer: None,
         }
     }
 
@@ -91,6 +97,27 @@ impl EngineBuilder {
         self
     }
 
+    /// Override the content store implementation (default: `LruCs`).
+    pub fn content_store(mut self, cs: Arc<dyn ErasedContentStore>) -> Self {
+        self.cs = Some(cs);
+        self
+    }
+
+    /// Override the CS admission policy (default: `DefaultAdmissionPolicy`).
+    pub fn admission_policy(mut self, policy: Arc<dyn CsAdmissionPolicy>) -> Self {
+        self.admission = Some(policy);
+        self
+    }
+
+    /// Register a CS observer for hit/miss/insert/eviction events.
+    ///
+    /// When set, the CS is wrapped in [`ObservableCs`] which adds atomic
+    /// counters and calls the observer on every operation.
+    pub fn cs_observer(mut self, obs: Arc<dyn CsObserver>) -> Self {
+        self.cs_observer = Some(obs);
+        self
+    }
+
     /// Register a cross-layer context enricher.
     ///
     /// Enrichers are called before every strategy invocation to populate
@@ -105,7 +132,14 @@ impl EngineBuilder {
     pub async fn build(self) -> Result<(ForwarderEngine, ShutdownHandle)> {
         let fib = Arc::new(Fib::new());
         let pit = Arc::new(Pit::new());
-        let cs = Arc::new(LruCs::new(self.config.cs_capacity_bytes));
+        let base_cs: Arc<dyn ErasedContentStore> = self
+            .cs
+            .unwrap_or_else(|| Arc::new(LruCs::new(self.config.cs_capacity_bytes)));
+        let cs: Arc<dyn ErasedContentStore> = if let Some(obs) = self.cs_observer {
+            Arc::new(ObservableCs::new(base_cs, Some(obs)))
+        } else {
+            base_cs
+        };
         let face_table = Arc::new(FaceTable::new());
         let measurements = Arc::new(MeasurementsTable::new());
 
@@ -162,7 +196,9 @@ impl EngineBuilder {
             },
             cs_insert: CsInsertStage {
                 cs: Arc::clone(&cs),
-                admission: Arc::new(ndn_store::DefaultAdmissionPolicy),
+                admission: self
+                    .admission
+                    .unwrap_or_else(|| Arc::new(ndn_store::DefaultAdmissionPolicy)),
             },
             channel_cap: self.config.pipeline_channel_cap,
             pipeline_threads: resolve_pipeline_threads(self.config.pipeline_threads),

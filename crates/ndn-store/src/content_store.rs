@@ -1,5 +1,8 @@
-use bytes::Bytes;
 use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+
+use bytes::Bytes;
 
 use ndn_packet::{Interest, Name};
 
@@ -14,7 +17,7 @@ pub struct CsEntry {
     /// Expiry time (ns since Unix epoch). Derived from `FreshnessPeriod`.
     pub stale_at: u64,
     /// Name of the cached Data.
-    pub name: std::sync::Arc<Name>,
+    pub name: Arc<Name>,
 }
 
 impl CsEntry {
@@ -56,6 +59,15 @@ impl CsCapacity {
     }
 }
 
+/// Snapshot of content store hit/miss/insert/eviction counters.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CsStats {
+    pub hits: u64,
+    pub misses: u64,
+    pub inserts: u64,
+    pub evictions: u64,
+}
+
 /// The ContentStore trait.
 ///
 /// All methods are `async` to allow persistent (disk-backed) implementations.
@@ -70,15 +82,147 @@ pub trait ContentStore: Send + Sync + 'static {
     fn insert(
         &self,
         data: Bytes,
-        name: std::sync::Arc<Name>,
+        name: Arc<Name>,
         meta: CsMeta,
     ) -> impl Future<Output = InsertResult> + Send;
 
     /// Explicitly evict the entry for `name`.
     fn evict(&self, name: &Name) -> impl Future<Output = bool> + Send;
 
+    /// Current capacity configuration.
     fn capacity(&self) -> CsCapacity;
+
+    /// Number of entries currently cached.
+    fn len(&self) -> usize {
+        0
+    }
+
+    /// Total bytes currently used.
+    fn current_bytes(&self) -> usize {
+        0
+    }
+
+    /// Update the maximum byte capacity at runtime.
+    fn set_capacity(&self, _max_bytes: usize) {}
+
+    /// Human-readable name of this CS implementation (e.g. "lru", "sharded-lru").
+    fn variant_name(&self) -> &str {
+        "unknown"
+    }
+
+    /// Evict all entries matching `prefix`, up to `limit` entries (None = unlimited).
+    /// Returns the number of entries evicted.
+    fn evict_prefix(
+        &self,
+        _prefix: &Name,
+        _limit: Option<usize>,
+    ) -> impl Future<Output = usize> + Send {
+        async { 0 }
+    }
+
+    /// Snapshot of hit/miss/insert/eviction counters.
+    fn stats(&self) -> CsStats {
+        CsStats::default()
+    }
 }
+
+// ─── ErasedContentStore (object-safe) ───────────────────────────────────────
+
+/// Object-safe version of [`ContentStore`] that boxes its futures.
+///
+/// Follows the same pattern as `ErasedStrategy` — a blanket impl automatically
+/// wraps any `ContentStore` implementor, so custom CS implementations only need
+/// to implement `ContentStore`.
+pub trait ErasedContentStore: Send + Sync + 'static {
+    fn get_erased<'a>(
+        &'a self,
+        interest: &'a Interest,
+    ) -> Pin<Box<dyn Future<Output = Option<CsEntry>> + Send + 'a>>;
+
+    fn insert_erased(
+        &self,
+        data: Bytes,
+        name: Arc<Name>,
+        meta: CsMeta,
+    ) -> Pin<Box<dyn Future<Output = InsertResult> + Send + '_>>;
+
+    fn evict_erased<'a>(
+        &'a self,
+        name: &'a Name,
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
+
+    fn evict_prefix_erased<'a>(
+        &'a self,
+        prefix: &'a Name,
+        limit: Option<usize>,
+    ) -> Pin<Box<dyn Future<Output = usize> + Send + 'a>>;
+
+    fn capacity(&self) -> CsCapacity;
+    fn set_capacity(&self, max_bytes: usize);
+    fn len(&self) -> usize;
+    fn current_bytes(&self) -> usize;
+    fn variant_name(&self) -> &str;
+    fn stats(&self) -> CsStats;
+}
+
+impl<T: ContentStore> ErasedContentStore for T {
+    fn get_erased<'a>(
+        &'a self,
+        interest: &'a Interest,
+    ) -> Pin<Box<dyn Future<Output = Option<CsEntry>> + Send + 'a>> {
+        Box::pin(self.get(interest))
+    }
+
+    fn insert_erased(
+        &self,
+        data: Bytes,
+        name: Arc<Name>,
+        meta: CsMeta,
+    ) -> Pin<Box<dyn Future<Output = InsertResult> + Send + '_>> {
+        Box::pin(self.insert(data, name, meta))
+    }
+
+    fn evict_erased<'a>(
+        &'a self,
+        name: &'a Name,
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
+        Box::pin(self.evict(name))
+    }
+
+    fn evict_prefix_erased<'a>(
+        &'a self,
+        prefix: &'a Name,
+        limit: Option<usize>,
+    ) -> Pin<Box<dyn Future<Output = usize> + Send + 'a>> {
+        Box::pin(self.evict_prefix(prefix, limit))
+    }
+
+    fn capacity(&self) -> CsCapacity {
+        ContentStore::capacity(self)
+    }
+
+    fn set_capacity(&self, max_bytes: usize) {
+        ContentStore::set_capacity(self, max_bytes)
+    }
+
+    fn len(&self) -> usize {
+        ContentStore::len(self)
+    }
+
+    fn current_bytes(&self) -> usize {
+        ContentStore::current_bytes(self)
+    }
+
+    fn variant_name(&self) -> &str {
+        ContentStore::variant_name(self)
+    }
+
+    fn stats(&self) -> CsStats {
+        ContentStore::stats(self)
+    }
+}
+
+// ─── Admission policies ─────────────────────────────────────────────────────
 
 /// Policy that decides whether a Data packet should be admitted to the CS.
 ///
@@ -123,7 +267,7 @@ impl ContentStore for NullCs {
     async fn get(&self, _: &Interest) -> Option<CsEntry> {
         None
     }
-    async fn insert(&self, _: Bytes, _: std::sync::Arc<Name>, _: CsMeta) -> InsertResult {
+    async fn insert(&self, _: Bytes, _: Arc<Name>, _: CsMeta) -> InsertResult {
         InsertResult::Skipped
     }
     async fn evict(&self, _: &Name) -> bool {
@@ -131,5 +275,8 @@ impl ContentStore for NullCs {
     }
     fn capacity(&self) -> CsCapacity {
         CsCapacity::zero()
+    }
+    fn variant_name(&self) -> &str {
+        "null"
     }
 }
