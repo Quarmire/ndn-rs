@@ -160,6 +160,38 @@ impl MgmtClient {
         self.dataset(module::CS, verb::INFO).await
     }
 
+    /// Configure CS capacity: `cs/config`.
+    ///
+    /// If `capacity` is `Some`, sets the new max capacity in bytes.
+    /// Always returns the current capacity.
+    pub async fn cs_config(
+        &self,
+        capacity: Option<u64>,
+    ) -> Result<ControlParameters, RouterError> {
+        let params = ControlParameters {
+            capacity,
+            ..Default::default()
+        };
+        self.command(module::CS, verb::CONFIG, &params).await
+    }
+
+    /// Erase CS entries by prefix: `cs/erase`.
+    ///
+    /// Returns the number of entries erased (in the `count` field of the
+    /// response ControlParameters).
+    pub async fn cs_erase(
+        &self,
+        prefix: &ndn_packet::Name,
+        count: Option<u64>,
+    ) -> Result<ControlParameters, RouterError> {
+        let params = ControlParameters {
+            name: Some(prefix.clone()),
+            count,
+            ..Default::default()
+        };
+        self.command(module::CS, verb::ERASE, &params).await
+    }
+
     // ─── Status ─────────────────────────────────────────────────────────
 
     /// General forwarder status: `status/general`.
