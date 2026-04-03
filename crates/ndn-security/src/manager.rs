@@ -222,11 +222,6 @@ async fn encode_cert_data(
     valid_from_ns: u64,
     valid_until_ns: u64,
 ) -> Result<Bytes, TrustError> {
-    // NDN certificate validity period TLV types.
-    const VALIDITY_PERIOD: u64 = 0xFD;
-    const NOT_BEFORE: u64 = 0xFE;
-    const NOT_AFTER: u64 = 0xFF;
-
     // Build the signed region: Name + MetaInfo + Content + SignatureInfo.
     let mut signed = TlvWriter::new();
 
@@ -244,9 +239,9 @@ async fn encode_cert_data(
         w.write_tlv(0x00, subject_public_key); // raw key material
 
         // Validity period sub-TLV
-        w.write_nested(VALIDITY_PERIOD, |w| {
-            w.write_tlv(NOT_BEFORE, &valid_from_ns.to_be_bytes());
-            w.write_tlv(NOT_AFTER, &valid_until_ns.to_be_bytes());
+        w.write_nested(tlv_type::VALIDITY_PERIOD, |w| {
+            w.write_tlv(tlv_type::NOT_BEFORE, &valid_from_ns.to_be_bytes());
+            w.write_tlv(tlv_type::NOT_AFTER, &valid_until_ns.to_be_bytes());
         });
     });
 
