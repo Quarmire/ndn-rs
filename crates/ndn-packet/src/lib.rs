@@ -22,6 +22,7 @@ pub use meta_info::MetaInfo;
 pub use nack::{Nack, NackReason};
 pub use name::{Name, NameComponent};
 pub use signature::{SignatureInfo, SignatureType};
+pub use lp::{CachePolicyType, LpHeaders};
 
 /// Well-known NDN TLV type codes.
 pub mod tlv_type {
@@ -32,6 +33,11 @@ pub mod tlv_type {
     pub const IMPLICIT_SHA256: u64 = 0x01;
     pub const PARAMETERS_SHA256: u64 = 0x02;
     pub const SEGMENT: u64 = 0x32;
+    pub const KEYWORD: u64 = 0x20;
+    pub const BYTE_OFFSET: u64 = 0x34;
+    pub const VERSION: u64 = 0x36;
+    pub const TIMESTAMP: u64 = 0x38;
+    pub const SEQUENCE_NUM: u64 = 0x3A;
     pub const CAN_BE_PREFIX: u64 = 0x21;
     pub const MUST_BE_FRESH: u64 = 0x12;
     pub const FORWARDING_HINT: u64 = 0x1e;
@@ -58,8 +64,25 @@ pub mod tlv_type {
     pub const LP_SEQUENCE: u64 = 0x51;
     pub const LP_FRAG_INDEX: u64 = 0x52;
     pub const LP_FRAG_COUNT: u64 = 0x53;
+    pub const LP_PIT_TOKEN: u64 = 0x62;
     pub const LP_CONGESTION_MARK: u64 = 0x0340;
     pub const LP_ACK: u64 = 0x0344;
+    pub const LP_TX_SEQUENCE: u64 = 0x0348;
+    pub const LP_NON_DISCOVERY: u64 = 0x034C;
+    pub const LP_PREFIX_ANNOUNCEMENT: u64 = 0x0350;
+    pub const LP_INCOMING_FACE_ID: u64 = 0x032C;
+    pub const LP_NEXT_HOP_FACE_ID: u64 = 0x0330;
+    pub const LP_CACHE_POLICY: u64 = 0x0334;
+    pub const LP_CACHE_POLICY_TYPE: u64 = 0x0335;
+
+    // Certificate (NDN Packet Format v0.3 §10)
+    pub const VALIDITY_PERIOD: u64 = 0xFD;
+    pub const NOT_BEFORE: u64 = 0xFE;
+    pub const NOT_AFTER: u64 = 0xFF;
+    pub const ADDITIONAL_DESCRIPTION: u64 = 0x0102;
+    pub const DESCRIPTION_ENTRY: u64 = 0x0200;
+    pub const DESCRIPTION_KEY: u64 = 0x0201;
+    pub const DESCRIPTION_VALUE: u64 = 0x0202;
 
     // Signed Interest (NDN Packet Format v0.3 §5.4)
     pub const INTEREST_SIGNATURE_INFO: u64 = 0x2C;
