@@ -17,7 +17,7 @@ use ndn_packet::encode::{encode_data_unsigned, encode_interest};
 use ndn_packet::{Name, NameComponent};
 use ndn_pipeline::{Action, DecodedPacket, PacketContext};
 use ndn_store::{ContentStore, CsMeta, ErasedContentStore, LruCs, Pit, PitToken};
-use ndn_transport::FaceId;
+use ndn_transport::{FaceId, FaceTable};
 
 use ndn_engine::Fib;
 use ndn_engine::stages::{
@@ -81,7 +81,7 @@ fn bench_decode_interest(c: &mut Criterion) {
         let wire = interest_wire(n);
         group.throughput(Throughput::Bytes(wire.len() as u64));
         group.bench_with_input(BenchmarkId::from_parameter(n), &wire, |b, wire| {
-            let stage = TlvDecodeStage;
+            let stage = TlvDecodeStage::new(Arc::new(FaceTable::new()));
             b.iter(|| {
                 let action = stage.process(ctx(wire.clone()));
                 debug_assert!(matches!(action, Action::Continue(_)));
@@ -97,7 +97,7 @@ fn bench_decode_data(c: &mut Criterion) {
         let wire = data_wire(n);
         group.throughput(Throughput::Bytes(wire.len() as u64));
         group.bench_with_input(BenchmarkId::from_parameter(n), &wire, |b, wire| {
-            let stage = TlvDecodeStage;
+            let stage = TlvDecodeStage::new(Arc::new(FaceTable::new()));
             b.iter(|| {
                 let action = stage.process(ctx(wire.clone()));
                 debug_assert!(matches!(action, Action::Continue(_)));
@@ -343,7 +343,7 @@ fn bench_interest_pipeline(c: &mut Criterion) {
             let cs = Arc::new(LruCs::new(64 * 1024 * 1024));
             let pit = Arc::new(Pit::new());
 
-            let decode = TlvDecodeStage;
+            let decode = TlvDecodeStage::new(Arc::new(FaceTable::new()));
             let cs_lookup = CsLookupStage {
                 cs: Arc::clone(&cs) as Arc<dyn ErasedContentStore>,
             };
@@ -397,7 +397,7 @@ fn bench_interest_cs_hit(c: &mut Criterion) {
     let data = ndn_packet::Data::decode(data_bytes.clone()).unwrap();
     rt.block_on(cs.insert(data_bytes, data.name.clone(), CsMeta { stale_at: u64::MAX }));
 
-    let decode = TlvDecodeStage;
+    let decode = TlvDecodeStage::new(Arc::new(FaceTable::new()));
     let cs_lookup = CsLookupStage {
         cs: Arc::clone(&cs) as Arc<dyn ErasedContentStore>,
     };
@@ -437,7 +437,7 @@ fn bench_data_pipeline(c: &mut Criterion) {
             |b, data_bytes| {
                 let cs = Arc::new(LruCs::new(64 * 1024 * 1024));
                 let pit = Arc::new(Pit::new());
-                let decode = TlvDecodeStage;
+                let decode = TlvDecodeStage::new(Arc::new(FaceTable::new()));
                 let pit_match = PitMatchStage {
                     pit: Arc::clone(&pit),
                 };
@@ -500,7 +500,7 @@ fn bench_decode_throughput(c: &mut Criterion) {
         group.throughput(Throughput::Elements(N));
 
         group.bench_with_input(BenchmarkId::from_parameter(n_comp), &wire, |b, wire| {
-            let stage = TlvDecodeStage;
+            let stage = TlvDecodeStage::new(Arc::new(FaceTable::new()));
             b.iter(|| {
                 for _ in 0..N {
                     let action = stage.process(ctx(wire.clone()));

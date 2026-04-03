@@ -43,6 +43,14 @@ pub struct TlvDecodeStage {
 }
 
 impl TlvDecodeStage {
+    /// Create a new decode stage.
+    pub fn new(face_table: Arc<FaceTable>) -> Self {
+        Self {
+            face_table,
+            reassembly: DashMap::new(),
+        }
+    }
+
     /// Fast-path fragment collection that bypasses `PacketContext` creation.
     ///
     /// If the raw bytes are a fragmented LpPacket, parses just the header fields
