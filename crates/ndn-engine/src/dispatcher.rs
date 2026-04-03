@@ -8,13 +8,15 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace, warn};
 
-use ndn_packet::encode::encode_nack;
-use ndn_pipeline::{Action, DecodedPacket, DropReason, ForwardingAction, NackReason, PacketContext};
-use ndn_store::{CsEntry, PitToken};
 use ndn_packet::Name;
-use ndn_transport::{FaceError, FaceId, FacePersistency, FaceScope, FaceTable, FaceKind};
+use ndn_packet::encode::encode_nack;
+use ndn_pipeline::{
+    Action, DecodedPacket, DropReason, ForwardingAction, NackReason, PacketContext,
+};
+use ndn_store::{CsEntry, PitToken};
+use ndn_transport::{FaceError, FaceId, FaceKind, FacePersistency, FaceScope, FaceTable};
 
-use crate::engine::{self, FaceState, DEFAULT_SEND_QUEUE_CAP};
+use crate::engine::{self, DEFAULT_SEND_QUEUE_CAP, FaceState};
 
 use crate::stages::{
     CsInsertStage, CsLookupStage, PitCheckStage, PitMatchStage, StrategyStage, TlvDecodeStage,
@@ -22,7 +24,7 @@ use crate::stages::{
 
 /// A raw packet arriving from a face, bundled with the face it came from.
 pub(crate) struct InboundPacket {
-    pub(crate) raw:     Bytes,
+    pub(crate) raw: Bytes,
     pub(crate) face_id: FaceId,
     pub(crate) arrival: u64,
 }
@@ -39,15 +41,15 @@ pub(crate) struct InboundPacket {
 /// All shared tables (PIT, FIB, CS, face table) are concurrent-safe, so
 /// parallel pipeline tasks are correct without additional synchronisation.
 pub struct PacketDispatcher {
-    pub face_table:       Arc<FaceTable>,
-    pub face_states:      Arc<dashmap::DashMap<FaceId, FaceState>>,
-    pub decode:           TlvDecodeStage,
-    pub cs_lookup:        CsLookupStage,
-    pub pit_check:        PitCheckStage,
-    pub strategy:         StrategyStage,
-    pub pit_match:        PitMatchStage,
-    pub cs_insert:        CsInsertStage,
-    pub channel_cap:      usize,
+    pub face_table: Arc<FaceTable>,
+    pub face_states: Arc<dashmap::DashMap<FaceId, FaceState>>,
+    pub decode: TlvDecodeStage,
+    pub cs_lookup: CsLookupStage,
+    pub pit_check: PitCheckStage,
+    pub strategy: StrategyStage,
+    pub pit_match: PitMatchStage,
+    pub cs_insert: CsInsertStage,
+    pub channel_cap: usize,
     /// Resolved pipeline thread count (always ≥ 1).
     ///
     /// - `1`: single-threaded — `process_packet` runs inline.
@@ -65,7 +67,7 @@ impl PacketDispatcher {
     pub fn spawn(
         self,
         cancel: CancellationToken,
-        tasks:  &mut JoinSet<()>,
+        tasks: &mut JoinSet<()>,
     ) -> mpsc::Sender<InboundPacket> {
         let (tx, rx) = mpsc::channel::<InboundPacket>(self.channel_cap);
         let dispatcher = Arc::new(self);
@@ -78,31 +80,52 @@ impl PacketDispatcher {
                     let (send_tx, send_rx) = mpsc::channel(DEFAULT_SEND_QUEUE_CAP);
                     let persistency = FacePersistency::Permanent;
                     let state = if face.kind() == FaceKind::Udp {
-                        FaceState::new_reliable(cancel.child_token(), persistency, send_tx, ndn_face_net::DEFAULT_UDP_MTU)
+                        FaceState::new_reliable(
+                            cancel.child_token(),
+                            persistency,
+                            send_tx,
+                            ndn_face_net::DEFAULT_UDP_MTU,
+                        )
                     } else {
                         FaceState::new(cancel.child_token(), persistency, send_tx)
                     };
                     dispatcher.face_states.insert(face_id, state);
                     // Spawn per-face send task.
-                    let send_face   = Arc::clone(&face);
+                    let send_face = Arc::clone(&face);
                     let send_cancel = cancel.clone();
-                    let fs          = Arc::clone(&dispatcher.face_states);
-                    let ft          = Arc::clone(&dispatcher.face_table);
-                    let fib         = Arc::clone(&dispatcher.strategy.fib);
+                    let fs = Arc::clone(&dispatcher.face_states);
+                    let ft = Arc::clone(&dispatcher.face_table);
+                    let fib = Arc::clone(&dispatcher.strategy.fib);
                     tasks.spawn(engine::run_face_sender(
-                        face_id, send_face, send_rx, send_cancel,
-                        persistency, fs, ft, fib,
+                        face_id,
+                        send_face,
+                        send_rx,
+                        send_cancel,
+                        persistency,
+                        fs,
+                        ft,
+                        fib,
                     ));
                 }
 
-                let tx2          = tx.clone();
-                let cancel       = cancel.clone();
-                let face_table   = Arc::clone(&dispatcher.face_table);
-                let fib          = Arc::clone(&dispatcher.strategy.fib);
-                let pit          = Arc::clone(&dispatcher.pit_check.pit);
-                let face_states  = Arc::clone(&dispatcher.face_states);
+                let tx2 = tx.clone();
+                let cancel = cancel.clone();
+                let face_table = Arc::clone(&dispatcher.face_table);
+                let fib = Arc::clone(&dispatcher.strategy.fib);
+                let pit = Arc::clone(&dispatcher.pit_check.pit);
+                let face_states = Arc::clone(&dispatcher.face_states);
                 tasks.spawn(async move {
-                    run_face_reader(face_id, face, tx2, cancel, face_table, fib, pit, face_states).await;
+                    run_face_reader(
+                        face_id,
+                        face,
+                        tx2,
+                        cancel,
+                        face_table,
+                        fib,
+                        pit,
+                        face_states,
+                    )
+                    .await;
                 });
             }
         }
@@ -144,7 +167,7 @@ impl PacketDispatcher {
             // Drain more without blocking.
             while batch.len() < Self::BATCH_SIZE {
                 match rx.try_recv() {
-                    Ok(p)  => batch.push(p),
+                    Ok(p) => batch.push(p),
                     Err(_) => break,
                 }
             }
@@ -158,14 +181,22 @@ impl PacketDispatcher {
             // mode) or spawned as tokio tasks (parallel mode).
             let parallel = self.pipeline_threads > 1;
             for pkt in batch.drain(..) {
-                let InboundPacket { raw, face_id, arrival } = pkt;
+                let InboundPacket {
+                    raw,
+                    face_id,
+                    arrival,
+                } = pkt;
                 match self.decode.try_collect_fragment(face_id, raw) {
                     Ok(None) => {
                         // Fragment buffered, waiting for more.
                         trace!(face=%face_id, "fragment collected, awaiting reassembly");
                     }
                     Ok(Some(reassembled)) => {
-                        let pkt = InboundPacket { raw: reassembled, face_id, arrival };
+                        let pkt = InboundPacket {
+                            raw: reassembled,
+                            face_id,
+                            arrival,
+                        };
                         if parallel {
                             let d = Arc::clone(self);
                             tokio::spawn(async move { d.process_packet(pkt).await });
@@ -174,7 +205,11 @@ impl PacketDispatcher {
                         }
                     }
                     Err(raw) => {
-                        let pkt = InboundPacket { raw, face_id, arrival };
+                        let pkt = InboundPacket {
+                            raw,
+                            face_id,
+                            arrival,
+                        };
                         if parallel {
                             let d = Arc::clone(self);
                             tokio::spawn(async move { d.process_packet(pkt).await });
@@ -194,9 +229,18 @@ impl PacketDispatcher {
         // 1. Decode.
         let ctx = match self.decode.process(ctx) {
             Action::Continue(ctx) => ctx,
-            Action::Drop(DropReason::FragmentCollect) => { trace!(face=%pkt.face_id, "fragment collected, awaiting reassembly"); return; }
-            Action::Drop(r)       => { debug!(face=%pkt.face_id, reason=?r, "drop at decode"); return; }
-            other                 => { self.dispatch_action(other); return; }
+            Action::Drop(DropReason::FragmentCollect) => {
+                trace!(face=%pkt.face_id, "fragment collected, awaiting reassembly");
+                return;
+            }
+            Action::Drop(r) => {
+                debug!(face=%pkt.face_id, reason=?r, "drop at decode");
+                return;
+            }
+            other => {
+                self.dispatch_action(other);
+                return;
+            }
         };
 
         match &ctx.packet {
@@ -220,16 +264,31 @@ impl PacketDispatcher {
         // 2. CS lookup.
         let ctx = match self.cs_lookup.process(ctx).await {
             Action::Continue(ctx) => ctx,
-            Action::Satisfy(ctx)  => { self.satisfy(ctx); return; }
-            Action::Drop(r)       => { debug!(reason=?r, "drop at cs lookup"); return; }
-            other                 => { self.dispatch_action(other); return; }
+            Action::Satisfy(ctx) => {
+                self.satisfy(ctx);
+                return;
+            }
+            Action::Drop(r) => {
+                debug!(reason=?r, "drop at cs lookup");
+                return;
+            }
+            other => {
+                self.dispatch_action(other);
+                return;
+            }
         };
 
         // 3. PIT check.
         let ctx = match self.pit_check.process(ctx) {
             Action::Continue(ctx) => ctx,
-            Action::Drop(r)       => { debug!(reason=?r, "drop at pit check"); return; }
-            other                 => { self.dispatch_action(other); return; }
+            Action::Drop(r) => {
+                debug!(reason=?r, "drop at pit check");
+                return;
+            }
+            other => {
+                self.dispatch_action(other);
+                return;
+            }
         };
 
         // 4. Strategy.
@@ -265,32 +324,44 @@ impl PacketDispatcher {
         // Build strategy context and ask the strategy what to do.
         let fib_entry_arc = self.strategy.fib.lpm(&name);
         let fib_entry_ref = fib_entry_arc.as_deref();
-        let strategy_fib: Option<ndn_strategy::FibEntry> = fib_entry_ref.map(|e| {
-            ndn_strategy::FibEntry {
-                nexthops: e.nexthops.iter().map(|nh| ndn_strategy::FibNexthop {
-                    face_id: nh.face_id,
-                    cost:    nh.cost,
-                }).collect(),
-            }
-        });
+        let strategy_fib: Option<ndn_strategy::FibEntry> =
+            fib_entry_ref.map(|e| ndn_strategy::FibEntry {
+                nexthops: e
+                    .nexthops
+                    .iter()
+                    .map(|nh| ndn_strategy::FibNexthop {
+                        face_id: nh.face_id,
+                        cost: nh.cost,
+                    })
+                    .collect(),
+            });
+
+        let mut extensions = ndn_transport::AnyMap::new();
+        for enricher in &self.strategy.enrichers {
+            enricher.enrich(strategy_fib.as_ref(), &mut extensions);
+        }
 
         let sctx = ndn_strategy::StrategyContext {
-            name:         &name,
-            in_face:      ctx.face_id,
-            fib_entry:    strategy_fib.as_ref(),
-            pit_token:    Some(token),
+            name: &name,
+            in_face: ctx.face_id,
+            fib_entry: strategy_fib.as_ref(),
+            pit_token: Some(token),
             measurements: &self.strategy.measurements,
+            extensions: &extensions,
         };
 
         let nack_reason = match nack.reason {
-            ndn_packet::NackReason::NoRoute    => NackReason::NoRoute,
-            ndn_packet::NackReason::Duplicate  => NackReason::Duplicate,
+            ndn_packet::NackReason::NoRoute => NackReason::NoRoute,
+            ndn_packet::NackReason::Duplicate => NackReason::Duplicate,
             ndn_packet::NackReason::Congestion => NackReason::Congestion,
-            ndn_packet::NackReason::NotYet     => NackReason::NotYet,
-            ndn_packet::NackReason::Other(_)   => NackReason::NoRoute,
+            ndn_packet::NackReason::NotYet => NackReason::NotYet,
+            ndn_packet::NackReason::Other(_) => NackReason::NoRoute,
         };
 
-        let strategy = self.strategy.strategy_table.lpm(&name)
+        let strategy = self
+            .strategy
+            .strategy_table
+            .lpm(&name)
             .unwrap_or_else(|| Arc::clone(&self.strategy.default_strategy));
         let action = strategy.on_nack_erased(&sctx, nack_reason).await;
         match action {
@@ -323,8 +394,14 @@ impl PacketDispatcher {
         // 2. PIT match.
         let ctx = match self.pit_match.process(ctx) {
             Action::Continue(ctx) => ctx,
-            Action::Drop(r)       => { debug!(reason=?r, "unsolicited data"); return; }
-            other                 => { self.dispatch_action(other); return; }
+            Action::Drop(r) => {
+                debug!(reason=?r, "unsolicited data");
+                return;
+            }
+            other => {
+                self.dispatch_action(other);
+                return;
+            }
         };
 
         // 3. CS insert.
@@ -373,19 +450,19 @@ impl PacketDispatcher {
                 trace!(face=%ctx.face_id, name=?ctx.name, out_faces=?ctx.out_faces, cs_hit=ctx.cs_hit, "dispatch: Satisfy");
                 self.satisfy(ctx);
             }
-            Action::Drop(r)      => debug!(reason=?r, "packet dropped"),
+            Action::Drop(r) => debug!(reason=?r, "packet dropped"),
             Action::Nack(ctx, reason) => {
                 trace!(face=%ctx.face_id, name=?ctx.name, reason=?reason, "dispatch: Nack");
                 let packet_reason = match reason {
-                    NackReason::NoRoute    => ndn_packet::NackReason::NoRoute,
-                    NackReason::Duplicate  => ndn_packet::NackReason::Duplicate,
+                    NackReason::NoRoute => ndn_packet::NackReason::NoRoute,
+                    NackReason::Duplicate => ndn_packet::NackReason::Duplicate,
                     NackReason::Congestion => ndn_packet::NackReason::Congestion,
-                    NackReason::NotYet     => ndn_packet::NackReason::NotYet,
+                    NackReason::NotYet => ndn_packet::NackReason::NotYet,
                 };
                 let nack_bytes = encode_nack(packet_reason, &ctx.raw_bytes);
                 self.enqueue_send(ctx.face_id, nack_bytes);
             }
-            Action::Continue(_)  => {} // fell off end of pipeline
+            Action::Continue(_) => {} // fell off end of pipeline
         }
     }
 
@@ -433,17 +510,18 @@ impl PacketDispatcher {
 /// engine objects and are never removed on reader exit regardless of
 /// persistency.
 pub(crate) async fn run_face_reader(
-    face_id:     FaceId,
-    face:        Arc<dyn ndn_transport::ErasedFace>,
-    tx:          mpsc::Sender<InboundPacket>,
-    cancel:      CancellationToken,
-    face_table:  Arc<FaceTable>,
-    fib:         Arc<crate::Fib>,
-    pit:         Arc<ndn_store::Pit>,
+    face_id: FaceId,
+    face: Arc<dyn ndn_transport::ErasedFace>,
+    tx: mpsc::Sender<InboundPacket>,
+    cancel: CancellationToken,
+    face_table: Arc<FaceTable>,
+    fib: Arc<crate::Fib>,
+    pit: Arc<ndn_store::Pit>,
     face_states: Arc<dashmap::DashMap<FaceId, FaceState>>,
 ) {
     let kind = face.kind();
-    let persistency = face_states.get(&face_id)
+    let persistency = face_states
+        .get(&face_id)
         .map(|s| s.persistency)
         .unwrap_or(FacePersistency::OnDemand);
 
@@ -454,7 +532,8 @@ pub(crate) async fn run_face_reader(
         && !matches!(kind, FaceKind::App | FaceKind::Shm | FaceKind::Internal);
 
     // Cache whether this face has reliability enabled.
-    let has_reliability = face_states.get(&face_id)
+    let has_reliability = face_states
+        .get(&face_id)
         .map(|s| s.reliability.is_some())
         .unwrap_or(false);
 
@@ -495,7 +574,11 @@ pub(crate) async fn run_face_reader(
                 // application.  Dropping the packet is the correct NDN
                 // behaviour: consumers re-express, and the pipeline is
                 // protected from overload.
-                match tx.try_send(InboundPacket { raw, face_id, arrival }) {
+                match tx.try_send(InboundPacket {
+                    raw,
+                    face_id,
+                    arrival,
+                }) {
                     Ok(()) => {}
                     Err(mpsc::error::TrySendError::Full(_)) => {
                         debug!(face=%face_id, "pipeline full, dropping inbound packet");

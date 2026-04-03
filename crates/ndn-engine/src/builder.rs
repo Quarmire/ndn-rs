@@ -11,13 +11,14 @@ use ndn_strategy::{BestRouteStrategy, MeasurementsTable};
 use ndn_transport::{Face, FaceTable};
 
 use crate::{
+    Fib, ForwarderEngine,
     dispatcher::PacketDispatcher,
     engine::{EngineInner, ShutdownHandle},
+    enricher::ContextEnricher,
     stages::{
         CsInsertStage, CsLookupStage, ErasedStrategy, PitCheckStage, PitMatchStage, StrategyStage,
         TlvDecodeStage,
     },
-    Fib, ForwarderEngine,
 };
 
 /// Configuration for the forwarding engine.
@@ -41,28 +42,37 @@ impl Default for EngineConfig {
     fn default() -> Self {
         Self {
             pipeline_channel_cap: 4096,
-            cs_capacity_bytes:    64 * 1024 * 1024, // 64 MB
-            pipeline_threads:     0,
+            cs_capacity_bytes: 64 * 1024 * 1024, // 64 MB
+            pipeline_threads: 0,
         }
     }
 }
 
 /// Constructs and wires a `ForwarderEngine`.
 pub struct EngineBuilder {
-    config:   EngineConfig,
-    faces:    Vec<Box<dyn FnOnce(Arc<FaceTable>) + Send>>,
+    config: EngineConfig,
+    faces: Vec<Box<dyn FnOnce(Arc<FaceTable>) + Send>>,
     strategy: Option<Arc<dyn ErasedStrategy>>,
     security: Option<Arc<SecurityManager>>,
+    enrichers: Vec<Arc<dyn ContextEnricher>>,
 }
 
 impl EngineBuilder {
     pub fn new(config: EngineConfig) -> Self {
-        Self { config, faces: Vec::new(), strategy: None, security: None }
+        Self {
+            config,
+            faces: Vec::new(),
+            strategy: None,
+            security: None,
+            enrichers: Vec::new(),
+        }
     }
 
     /// Register a face to be added at startup.
     pub fn face<F: Face>(mut self, face: F) -> Self {
-        self.faces.push(Box::new(move |table| { table.insert(face); }));
+        self.faces.push(Box::new(move |table| {
+            table.insert(face);
+        }));
         self
     }
 
@@ -81,12 +91,22 @@ impl EngineBuilder {
         self
     }
 
+    /// Register a cross-layer context enricher.
+    ///
+    /// Enrichers are called before every strategy invocation to populate
+    /// `StrategyContext::extensions` with data from external sources
+    /// (radio metrics, flow stats, location, etc.).
+    pub fn context_enricher(mut self, e: Arc<dyn ContextEnricher>) -> Self {
+        self.enrichers.push(e);
+        self
+    }
+
     /// Build the engine, spawn all tasks, and return handles.
     pub async fn build(self) -> Result<(ForwarderEngine, ShutdownHandle)> {
-        let fib          = Arc::new(Fib::new());
-        let pit          = Arc::new(Pit::new());
-        let cs           = Arc::new(LruCs::new(self.config.cs_capacity_bytes));
-        let face_table   = Arc::new(FaceTable::new());
+        let fib = Arc::new(Fib::new());
+        let pit = Arc::new(Pit::new());
+        let cs = Arc::new(LruCs::new(self.config.cs_capacity_bytes));
+        let face_table = Arc::new(FaceTable::new());
         let measurements = Arc::new(MeasurementsTable::new());
 
         // Register pre-configured faces.
@@ -99,7 +119,7 @@ impl EngineBuilder {
 
         // PIT expiry task.
         {
-            let pit_clone    = Arc::clone(&pit);
+            let pit_clone = Arc::clone(&pit);
             let cancel_clone = cancel.clone();
             tasks.spawn(async move {
                 crate::expiry::run_expiry_task(pit_clone, cancel_clone).await;
@@ -116,25 +136,35 @@ impl EngineBuilder {
         let face_states = Arc::new(dashmap::DashMap::new());
 
         let dispatcher = PacketDispatcher {
-            face_table:  Arc::clone(&face_table),
+            face_table: Arc::clone(&face_table),
             face_states: Arc::clone(&face_states),
-            decode:      TlvDecodeStage { face_table: Arc::clone(&face_table), reassembly: dashmap::DashMap::new() },
-            cs_lookup:   CsLookupStage { cs: Arc::clone(&cs) },
-            pit_check:   PitCheckStage { pit: Arc::clone(&pit) },
-            strategy:    StrategyStage {
+            decode: TlvDecodeStage {
+                face_table: Arc::clone(&face_table),
+                reassembly: dashmap::DashMap::new(),
+            },
+            cs_lookup: CsLookupStage {
+                cs: Arc::clone(&cs),
+            },
+            pit_check: PitCheckStage {
+                pit: Arc::clone(&pit),
+            },
+            strategy: StrategyStage {
                 strategy_table: Arc::clone(&strategy_table),
                 default_strategy: Arc::clone(&default_strategy),
-                fib:          Arc::clone(&fib),
+                fib: Arc::clone(&fib),
                 measurements: Arc::clone(&measurements),
-                pit:          Arc::clone(&pit),
-                face_table:   Arc::clone(&face_table),
+                pit: Arc::clone(&pit),
+                face_table: Arc::clone(&face_table),
+                enrichers: self.enrichers,
             },
-            pit_match:   PitMatchStage { pit: Arc::clone(&pit) },
-            cs_insert:   CsInsertStage {
+            pit_match: PitMatchStage {
+                pit: Arc::clone(&pit),
+            },
+            cs_insert: CsInsertStage {
                 cs: Arc::clone(&cs),
                 admission: Arc::new(ndn_store::DefaultAdmissionPolicy),
             },
-            channel_cap:      self.config.pipeline_channel_cap,
+            channel_cap: self.config.pipeline_channel_cap,
             pipeline_threads: resolve_pipeline_threads(self.config.pipeline_threads),
         };
 
@@ -143,27 +173,28 @@ impl EngineBuilder {
         // Idle face sweep task.
         {
             let face_states_clone = Arc::clone(&face_states);
-            let face_table_clone  = Arc::clone(&face_table);
-            let fib_clone         = Arc::clone(&fib);
-            let cancel_clone      = cancel.clone();
+            let face_table_clone = Arc::clone(&face_table);
+            let fib_clone = Arc::clone(&fib);
+            let cancel_clone = cancel.clone();
             tasks.spawn(async move {
                 crate::expiry::run_idle_face_task(
                     face_states_clone,
                     face_table_clone,
                     fib_clone,
                     cancel_clone,
-                ).await;
+                )
+                .await;
             });
         }
 
         let inner = Arc::new(EngineInner {
-            fib:            Arc::clone(&fib),
-            pit:            Arc::clone(&pit),
-            cs:             Arc::clone(&cs),
-            face_table:     Arc::clone(&face_table),
-            measurements:   Arc::clone(&measurements),
+            fib: Arc::clone(&fib),
+            pit: Arc::clone(&pit),
+            cs: Arc::clone(&cs),
+            face_table: Arc::clone(&face_table),
+            measurements: Arc::clone(&measurements),
             strategy_table: Arc::clone(&strategy_table),
-            security:       self.security,
+            security: self.security,
             pipeline_tx,
             face_states,
         });

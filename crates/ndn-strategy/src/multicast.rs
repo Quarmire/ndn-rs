@@ -24,12 +24,16 @@ impl MulticastStrategy {
     }
 
     pub fn new() -> Self {
-        Self { name: Self::strategy_name() }
+        Self {
+            name: Self::strategy_name(),
+        }
     }
 }
 
 impl Default for MulticastStrategy {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Strategy for MulticastStrategy {
@@ -37,10 +41,7 @@ impl Strategy for MulticastStrategy {
         &self.name
     }
 
-    fn decide(
-        &self,
-        ctx: &StrategyContext<'_>,
-    ) -> Option<SmallVec<[ForwardingAction; 2]>> {
+    fn decide(&self, ctx: &StrategyContext<'_>) -> Option<SmallVec<[ForwardingAction; 2]>> {
         let Some(fib) = ctx.fib_entry else {
             return Some(smallvec![ForwardingAction::Nack(NackReason::NoRoute)]);
         };
@@ -73,10 +74,10 @@ impl Strategy for MulticastStrategy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-    use ndn_transport::FaceId;
     use crate::MeasurementsTable;
     use crate::context::{FibEntry, FibNexthop};
+    use ndn_transport::FaceId;
+    use std::sync::Arc;
 
     fn make_ctx<'a>(
         name: &'a Arc<Name>,
@@ -84,7 +85,16 @@ mod tests {
         fib_entry: Option<&'a FibEntry>,
         measurements: &'a MeasurementsTable,
     ) -> StrategyContext<'a> {
-        StrategyContext { name, in_face, fib_entry, pit_token: None, measurements }
+        static EMPTY: std::sync::LazyLock<ndn_transport::AnyMap> =
+            std::sync::LazyLock::new(ndn_transport::AnyMap::new);
+        StrategyContext {
+            name,
+            in_face,
+            fib_entry,
+            pit_token: None,
+            measurements,
+            extensions: &EMPTY,
+        }
     }
 
     #[tokio::test]
@@ -94,7 +104,10 @@ mod tests {
         let m = MeasurementsTable::new();
         let ctx = make_ctx(&name, FaceId(0), None, &m);
         let actions = s.after_receive_interest(&ctx).await;
-        assert!(matches!(actions.as_slice(), [ForwardingAction::Nack(NackReason::NoRoute)]));
+        assert!(matches!(
+            actions.as_slice(),
+            [ForwardingAction::Nack(NackReason::NoRoute)]
+        ));
     }
 
     #[tokio::test]
@@ -104,9 +117,18 @@ mod tests {
         let m = MeasurementsTable::new();
         let fib = FibEntry {
             nexthops: vec![
-                FibNexthop { face_id: FaceId(1), cost: 0 },
-                FibNexthop { face_id: FaceId(2), cost: 0 },
-                FibNexthop { face_id: FaceId(3), cost: 0 },
+                FibNexthop {
+                    face_id: FaceId(1),
+                    cost: 0,
+                },
+                FibNexthop {
+                    face_id: FaceId(2),
+                    cost: 0,
+                },
+                FibNexthop {
+                    face_id: FaceId(3),
+                    cost: 0,
+                },
             ],
         };
         let ctx = make_ctx(&name, FaceId(1), Some(&fib), &m);
@@ -126,10 +148,18 @@ mod tests {
         let s = MulticastStrategy::new();
         let name = Arc::new(Name::root());
         let m = MeasurementsTable::new();
-        let fib = FibEntry { nexthops: vec![FibNexthop { face_id: FaceId(1), cost: 0 }] };
+        let fib = FibEntry {
+            nexthops: vec![FibNexthop {
+                face_id: FaceId(1),
+                cost: 0,
+            }],
+        };
         let ctx = make_ctx(&name, FaceId(1), Some(&fib), &m);
         let actions = s.after_receive_interest(&ctx).await;
-        assert!(matches!(actions.as_slice(), [ForwardingAction::Nack(NackReason::NoRoute)]));
+        assert!(matches!(
+            actions.as_slice(),
+            [ForwardingAction::Nack(NackReason::NoRoute)]
+        ));
     }
 
     #[tokio::test]

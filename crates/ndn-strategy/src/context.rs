@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use ndn_packet::Name;
 use ndn_store::PitToken;
-use ndn_transport::FaceId;
+use ndn_transport::{AnyMap, FaceId};
 
 use crate::MeasurementsTable;
 
@@ -10,7 +10,7 @@ use crate::MeasurementsTable;
 #[derive(Clone, Copy, Debug)]
 pub struct FibNexthop {
     pub face_id: FaceId,
-    pub cost:    u32,
+    pub cost: u32,
 }
 
 /// FIB entry: one or more nexthops with associated costs.
@@ -20,8 +20,13 @@ pub struct FibEntry {
 }
 
 impl FibEntry {
+    /// Return nexthops filtered to exclude a specific face (split-horizon).
     pub fn nexthops_excluding(&self, exclude: FaceId) -> Vec<FibNexthop> {
-        self.nexthops.iter().copied().filter(|n| n.face_id != exclude).collect()
+        self.nexthops
+            .iter()
+            .copied()
+            .filter(|n| n.face_id != exclude)
+            .collect()
     }
 }
 
@@ -40,4 +45,10 @@ pub struct StrategyContext<'a> {
     pub pit_token: Option<PitToken>,
     /// Read-only access to EWMA measurements per (prefix, face).
     pub measurements: &'a MeasurementsTable,
+    /// Cross-layer enrichment data (radio metrics, flow stats, etc.).
+    ///
+    /// Populated by [`ContextEnricher`](ndn_engine::ContextEnricher) instances
+    /// before the strategy runs. Strategies access typed data via
+    /// `ctx.extensions.get::<T>()`.
+    pub extensions: &'a AnyMap,
 }

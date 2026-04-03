@@ -1,5 +1,3 @@
-use std::any::{Any, TypeId};
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -7,7 +5,7 @@ use smallvec::SmallVec;
 
 use ndn_packet::{Data, Interest, Nack, Name};
 use ndn_store::PitToken;
-use ndn_transport::FaceId;
+use ndn_transport::{AnyMap, FaceId};
 
 /// The packet as it progresses through decode stages.
 pub enum DecodedPacket {
@@ -53,44 +51,16 @@ impl PacketContext {
         Self {
             raw_bytes,
             face_id,
-            name:      None,
-            packet:    DecodedPacket::Raw,
+            name: None,
+            packet: DecodedPacket::Raw,
             pit_token: None,
             out_faces: SmallVec::new(),
-            cs_hit:    false,
-            verified:  false,
+            cs_hit: false,
+            verified: false,
             arrival,
-            tags:      AnyMap::new(),
+            tags: AnyMap::new(),
         }
     }
-}
-
-/// A type-erased map for optional inter-stage tags.
-///
-/// Implemented as a `HashMap<TypeId, Box<dyn Any + Send>>` so each type can
-/// only appear once (like a typed slot), accessed with zero string overhead.
-pub struct AnyMap(HashMap<TypeId, Box<dyn Any + Send>>);
-
-impl AnyMap {
-    pub fn new() -> Self { Self(HashMap::new()) }
-
-    pub fn insert<T: Any + Send>(&mut self, val: T) {
-        self.0.insert(TypeId::of::<T>(), Box::new(val));
-    }
-
-    pub fn get<T: Any + Send>(&self) -> Option<&T> {
-        self.0.get(&TypeId::of::<T>())?.downcast_ref()
-    }
-
-    pub fn remove<T: Any + Send>(&mut self) -> Option<T> {
-        self.0.remove(&TypeId::of::<T>())
-            .and_then(|b| b.downcast().ok())
-            .map(|b| *b)
-    }
-}
-
-impl Default for AnyMap {
-    fn default() -> Self { Self::new() }
 }
 
 #[cfg(test)]
@@ -112,45 +82,5 @@ mod tests {
         assert!(!ctx.cs_hit);
         assert!(!ctx.verified);
         assert!(matches!(ctx.packet, DecodedPacket::Raw));
-    }
-
-    #[test]
-    fn anymap_insert_get_roundtrip() {
-        let mut m = AnyMap::new();
-        m.insert(42u32);
-        assert_eq!(m.get::<u32>(), Some(&42u32));
-        assert!(m.get::<u64>().is_none()); // different type
-    }
-
-    #[test]
-    fn anymap_insert_overwrite() {
-        let mut m = AnyMap::new();
-        m.insert(1u32);
-        m.insert(2u32);
-        assert_eq!(m.get::<u32>(), Some(&2u32));
-    }
-
-    #[test]
-    fn anymap_remove_takes_value() {
-        let mut m = AnyMap::new();
-        m.insert(99u32);
-        let v = m.remove::<u32>();
-        assert_eq!(v, Some(99u32));
-        assert!(m.get::<u32>().is_none());
-    }
-
-    #[test]
-    fn anymap_different_types_coexist() {
-        let mut m = AnyMap::new();
-        m.insert(1u32);
-        m.insert("hello");
-        assert_eq!(m.get::<u32>(), Some(&1u32));
-        assert_eq!(m.get::<&str>(), Some(&"hello"));
-    }
-
-    #[test]
-    fn anymap_default_is_empty() {
-        let m = AnyMap::default();
-        assert!(m.get::<u32>().is_none());
     }
 }
