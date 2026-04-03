@@ -28,7 +28,6 @@ use ndn_engine::ForwarderEngine;
 use ndn_engine::stages::ErasedStrategy;
 use ndn_face_local::AppHandle;
 use ndn_packet::{Interest, Name, NameComponent, encode::encode_data_unsigned};
-use ndn_store::ContentStore;
 use ndn_strategy::{BestRouteStrategy, MulticastStrategy};
 use ndn_transport::{Face, FaceId, FacePersistency};
 use tokio_util::sync::CancellationToken;
@@ -328,7 +327,7 @@ async fn dispatch_command(
         m if m == module::FACES => handle_faces(verb_name, params, source_face, engine).await,
         m if m == module::FIB => handle_fib(verb_name, params, source_face, engine),
         m if m == module::STRATEGY => handle_strategy(verb_name, params, engine),
-        m if m == module::CS => handle_cs(verb_name, engine),
+        m if m == module::CS => handle_cs(verb_name, params, engine).await,
         m if m == module::STATUS => handle_status(verb_name, engine, cancel),
         _ => ControlResponse::error(status::NOT_FOUND, "unknown module"),
     }
@@ -844,21 +843,31 @@ fn strategy_list(engine: &ForwarderEngine) -> ControlResponse {
 
 // ─── CS module ───────────────────────────────────────────────────────────────
 
-fn handle_cs(verb_name: &[u8], engine: &ForwarderEngine) -> ControlResponse {
+async fn handle_cs(
+    verb_name: &[u8],
+    params: ControlParameters,
+    engine: &ForwarderEngine,
+) -> ControlResponse {
     match verb_name {
-        v if v == verb::CONFIG => cs_config(engine),
+        v if v == verb::CONFIG => cs_config(params, engine),
         v if v == verb::INFO => cs_info(engine),
+        v if v == verb::ERASE => cs_erase(params, engine).await,
         _ => ControlResponse::error(status::NOT_FOUND, "unknown cs verb"),
     }
 }
 
-fn cs_config(engine: &ForwarderEngine) -> ControlResponse {
+fn cs_config(params: ControlParameters, engine: &ForwarderEngine) -> ControlResponse {
     let cs = engine.cs();
+
+    // If capacity is provided, update it at runtime.
+    if let Some(new_cap) = params.capacity {
+        cs.set_capacity(new_cap as usize);
+        tracing::info!(capacity = new_cap, "cs capacity updated");
+    }
+
     let cap = cs.capacity();
     let echo = ControlParameters {
-        // Repurpose capacity field for CS max bytes.
-        // NFD uses a dedicated Capacity TLV (0x83) — we encode it here.
-        cost: Some(cap.max_bytes as u64),
+        capacity: Some(cap.max_bytes as u64),
         ..Default::default()
     };
     ControlResponse::ok("OK", echo)
@@ -869,12 +878,30 @@ fn cs_info(engine: &ForwarderEngine) -> ControlResponse {
     let cap = cs.capacity();
     let n_entries = cs.len();
     let current = cs.current_bytes();
+    let stats = cs.stats();
+    let variant = cs.variant_name();
 
     let text = format!(
-        "capacity={}B entries={} used={}B",
-        cap.max_bytes, n_entries, current,
+        "capacity={}B entries={} used={}B hits={} misses={} variant={}",
+        cap.max_bytes, n_entries, current, stats.hits, stats.misses, variant,
     );
     ControlResponse::ok_empty(text)
+}
+
+async fn cs_erase(params: ControlParameters, engine: &ForwarderEngine) -> ControlResponse {
+    let Some(ref name) = params.name else {
+        return ControlResponse::error(status::BAD_PARAMS, "missing Name parameter");
+    };
+    let cs = engine.cs();
+    let limit = params.count.map(|c| c as usize);
+    let erased = cs.evict_prefix_erased(name, limit).await;
+
+    let echo = ControlParameters {
+        name: params.name,
+        count: Some(erased as u64),
+        ..Default::default()
+    };
+    ControlResponse::ok("OK", echo)
 }
 
 // ─── Status module ────────────────────────────────────────────────────────────

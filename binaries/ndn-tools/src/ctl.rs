@@ -145,6 +145,20 @@ enum StrategyAction {
 enum CsAction {
     /// Display content store info (capacity, entries, memory).
     Info,
+    /// Get or set CS capacity.
+    Config {
+        /// Set max capacity in bytes. Omit to query current.
+        #[arg(long)]
+        capacity: Option<u64>,
+    },
+    /// Erase cached entries by name prefix.
+    Erase {
+        /// Name prefix to erase from CS (e.g. /ndn/video).
+        prefix: String,
+        /// Maximum number of entries to erase (default: all).
+        #[arg(long)]
+        count: Option<u64>,
+    },
 }
 
 // ─── Entry point ──────────────────────────────────────────────────────────────
@@ -269,6 +283,23 @@ async fn run_nfd(cli: &Cli) -> anyhow::Result<()> {
                 let resp = mgmt.cs_info().await.map_err(|e| anyhow::anyhow!("{e}"))?;
                 print_control_response(&resp);
             }
+            CsAction::Config { capacity } => {
+                let resp = mgmt
+                    .cs_config(*capacity)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                print_params(&resp);
+            }
+            CsAction::Erase { prefix, count } => {
+                let name: ndn_packet::Name = prefix
+                    .parse()
+                    .map_err(|e| anyhow::anyhow!("bad prefix: {e}"))?;
+                let resp = mgmt
+                    .cs_erase(&name, *count)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                print_params(&resp);
+            }
         },
         Command::Status => {
             let resp = mgmt.status().await.map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -387,6 +418,12 @@ fn print_params(params: &ndn_config::ControlParameters) {
     }
     if let Some(ref strategy) = params.strategy {
         println!("  Strategy: {}", strategy);
+    }
+    if let Some(capacity) = params.capacity {
+        println!("  Capacity: {capacity}");
+    }
+    if let Some(count) = params.count {
+        println!("  Count:   {count}");
     }
 }
 
