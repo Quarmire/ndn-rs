@@ -311,6 +311,7 @@ async fn run_server(
     let mut total_interests: u64 = 0;
     let mut total_sent: u64 = 0;
     let mut non_interest: u64 = 0;
+    let mut send_errors: u64 = 0;
 
     loop {
         let raw = match client.recv().await {
@@ -348,12 +349,23 @@ async fn run_server(
         };
 
         let data_len = data.len() as u64;
-        if let Err(e) = client.send(data).await {
-            eprintln!("  send error: {e}");
-            break;
+        match client.send(data).await {
+            Ok(()) => {
+                total_sent += 1;
+                counters.record(data_len);
+            }
+            Err(_e) => {
+                // SHM backpressure can cause transient send failures when the
+                // pipeline is overloaded.  Yield briefly and continue rather
+                // than exiting — the overload is temporary and the server
+                // should keep serving after the burst subsides.
+                send_errors += 1;
+                if send_errors == 1 {
+                    eprintln!("  send backpressure (pipeline overloaded, will retry)");
+                }
+                tokio::task::yield_now().await;
+            }
         }
-        total_sent += 1;
-        counters.record(data_len);
     }
 
     let elapsed = start.elapsed();
@@ -364,6 +376,9 @@ async fn run_server(
     eprintln!("  data sent:     {total_sent}");
     if non_interest > 0 {
         eprintln!("  non-interest:  {non_interest}");
+    }
+    if send_errors > 0 {
+        eprintln!("  send errors:   {send_errors} (backpressure)");
     }
 
     Ok(())
@@ -433,13 +448,18 @@ async fn run_client(
         });
     }
 
-    let mut timestamps: HashMap<u64, Instant> = HashMap::new();
+    // Per-Interest state: (send timestamp, retry count).
+    let mut timestamps: HashMap<u64, (Instant, u32)> = HashMap::new();
     let mut next_seq: u64 = 0;
     let mut total_bytes: u64 = 0;
     let mut received: u64 = 0;
     let mut retx_count: u64 = 0;
+    let mut timed_out: u64 = 0;
     let mut rtts: Vec<u64> = Vec::new();
     let mut in_flight: usize = 0;
+
+    // Max retransmits per Interest before giving up.
+    const MAX_RETRIES: u32 = 3;
 
     // Smoothed RTT for adaptive retransmit timeout.
     let mut srtt_us: f64 = 50_000.0; // 50ms initial estimate
@@ -449,7 +469,7 @@ async fn run_client(
     for _ in 0..window {
         let name = flow_prefix.clone().append(format!("{next_seq}"));
         let wire = InterestBuilder::new(name).lifetime(lifetime).build();
-        timestamps.insert(next_seq, Instant::now());
+        timestamps.insert(next_seq, (Instant::now(), 0));
         client.send(wire).await?;
         next_seq += 1;
         in_flight += 1;
@@ -474,7 +494,7 @@ async fn run_client(
                 received += 1;
 
                 let rtt_us = extract_seq(&data_bytes).and_then(|seq| {
-                    timestamps.remove(&seq).map(|t0| {
+                    timestamps.remove(&seq).map(|(t0, _retries)| {
                         in_flight = in_flight.saturating_sub(1);
                         t0.elapsed().as_micros() as u64
                     })
@@ -497,7 +517,7 @@ async fn run_client(
                         while in_flight < allowed {
                             let name = flow_prefix.clone().append(format!("{next_seq}"));
                             let wire = InterestBuilder::new(name).lifetime(lifetime).build();
-                            timestamps.insert(next_seq, Instant::now());
+                            timestamps.insert(next_seq, (Instant::now(), 0));
                             client.send(wire).await?;
                             next_seq += 1;
                             in_flight += 1;
@@ -518,7 +538,7 @@ async fn run_client(
                 if past_deadline {
                     if timestamps.is_empty() { break next_seq; }
                     let now = Instant::now();
-                    timestamps.retain(|_, t0| now.duration_since(*t0) < drain_timeout);
+                    timestamps.retain(|_, (t0, _)| now.duration_since(*t0) < drain_timeout);
                     if timestamps.is_empty() { break next_seq; }
                     continue;
                 }
@@ -531,20 +551,41 @@ async fn run_client(
                 // Collapse all stale Interests into a SINGLE loss event
                 // to avoid halving the window once per stale packet (which
                 // would crater then re-inflate in oscillation).
+                //
+                // Cap retransmits per check to half the current window to
+                // prevent retransmit floods from overwhelming the pipeline.
                 let rto = Duration::from_micros((srtt_us * 3.0) as u64)
                     .max(Duration::from_millis(200));
                 let now = Instant::now();
-                let stale: Vec<u64> = timestamps.iter()
-                    .filter(|(_, t0)| now.duration_since(**t0) >= rto)
-                    .map(|(seq, _)| *seq)
+                let max_retx_per_check = (cc.window() / 2.0).max(2.0) as usize;
+                let mut stale: Vec<(u64, u32)> = timestamps.iter()
+                    .filter(|(_, (t0, _))| now.duration_since(*t0) >= rto)
+                    .map(|(seq, (_, retries))| (*seq, *retries))
                     .collect();
+                // Give up on Interests that exceeded MAX_RETRIES.
+                let mut gave_up = Vec::new();
+                stale.retain(|&(seq, retries)| {
+                    if retries >= MAX_RETRIES {
+                        gave_up.push(seq);
+                        false
+                    } else {
+                        true
+                    }
+                });
+                for seq in gave_up {
+                    timestamps.remove(&seq);
+                    in_flight = in_flight.saturating_sub(1);
+                    timed_out += 1;
+                }
+                // Cap retransmits per check interval.
+                stale.truncate(max_retx_per_check);
                 if !stale.is_empty() {
                     // Single loss event for all stale Interests in this check.
                     cc.on_timeout();
-                    for seq in stale {
+                    for (seq, retries) in stale {
                         let name = flow_prefix.clone().append(format!("{seq}"));
                         let wire = InterestBuilder::new(name).lifetime(lifetime).build();
-                        timestamps.insert(seq, Instant::now());
+                        timestamps.insert(seq, (Instant::now(), retries + 1));
                         client.send(wire).await?;
                         retx_count += 1;
                     }
@@ -585,6 +626,9 @@ async fn run_client(
     }
     if retx_count > 0 {
         println!("  retransmits: {retx_count}");
+    }
+    if timed_out > 0 {
+        println!("  timed out:   {timed_out} (gave up after {MAX_RETRIES} retries)");
     }
 
     if !rtts.is_empty() {
