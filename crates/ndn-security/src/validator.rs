@@ -59,6 +59,13 @@ impl Validator {
             return ValidationResult::Pending;
         };
 
+        // Check certificate validity period.
+        if !cert.is_valid_at(now_ns()) {
+            return ValidationResult::Invalid(TrustError::CertNotFound {
+                name: format!("expired or not-yet-valid: {}", key_locator),
+            });
+        }
+
         // Verify signature.
         match self
             .verifier
@@ -272,6 +279,32 @@ mod tests {
         assert!(matches!(
             validator.validate(&data).await,
             ValidationResult::Valid(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn expired_cert_returns_invalid() {
+        let seed = [15u8; 32];
+        let key_name = name1("key");
+        let signer = Ed25519Signer::from_seed(&seed, key_name.clone());
+        let data_bytes = make_signed_data(&signer, "data", "key").await;
+        let data = Data::decode(data_bytes).unwrap();
+
+        let vk_bytes = ed25519_dalek::SigningKey::from_bytes(&seed)
+            .verifying_key()
+            .to_bytes();
+        let cert = Certificate {
+            name: Arc::new(key_name),
+            public_key: Bytes::copy_from_slice(&vk_bytes),
+            valid_from: 0,
+            valid_until: 1, // expired in 1970
+        };
+        let validator = Validator::new(open_schema("data", "key"));
+        validator.cert_cache().insert(cert);
+
+        assert!(matches!(
+            validator.validate(&data).await,
+            ValidationResult::Invalid(_)
         ));
     }
 
