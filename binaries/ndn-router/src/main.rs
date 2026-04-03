@@ -119,11 +119,13 @@ async fn main() -> Result<()> {
                 kind: ndn_config::FaceKind::Udp,
                 bind: Some("0.0.0.0:6363".into()),
                 remote: None, group: None, port: None, interface: None, path: None,
+                baud: None, url: None,
             },
             ndn_config::FaceConfig {
                 kind: ndn_config::FaceKind::Tcp,
                 bind: Some("0.0.0.0:6363".into()),
                 remote: None, group: None, port: None, interface: None, path: None,
+                baud: None, url: None,
             },
         ])
     } else {
@@ -163,12 +165,88 @@ async fn main() -> Result<()> {
                 });
             }
             ndn_config::FaceKind::Multicast => {
-                // TODO: multicast face from config
+                // TODO: multicast UDP face from config
                 tracing::warn!("multicast face config not yet supported at startup");
             }
             ndn_config::FaceKind::Unix => {
                 // Unix faces are handled by the face listener below.
                 tracing::warn!("unix face config ignored (use [management] face_socket)");
+            }
+            ndn_config::FaceKind::WebSocket => {
+                let bind = match face_cfg.bind.as_deref() {
+                    Some(b) => b,
+                    None => {
+                        tracing::error!("websocket face requires 'bind' address");
+                        continue;
+                    }
+                };
+                let addr: std::net::SocketAddr = match bind.parse() {
+                    Ok(a) => a,
+                    Err(e) => {
+                        tracing::error!(bind=%bind, error=%e, "invalid WebSocket bind address");
+                        continue;
+                    }
+                };
+                let eng = engine.clone();
+                let c = cancel.clone();
+                tokio::spawn(async move {
+                    run_ws_listener(addr, eng, c).await;
+                });
+            }
+            ndn_config::FaceKind::Serial => {
+                #[cfg(feature = "serial")]
+                {
+                    let port = match face_cfg.path.as_deref() {
+                        Some(p) => p,
+                        None => {
+                            tracing::error!("serial face requires 'path' (e.g., /dev/ttyUSB0)");
+                            continue;
+                        }
+                    };
+                    let baud = face_cfg.baud.unwrap_or(115200);
+                    let id = engine.faces().alloc_id();
+                    match ndn_face_serial::SerialFace::open(id, port, baud) {
+                        Ok(face) => {
+                            let c = cancel.child_token();
+                            engine.add_face(face, c);
+                            tracing::info!(port=%port, baud=%baud, face=%id, "serial face opened");
+                        }
+                        Err(e) => {
+                            tracing::error!(port=%port, error=%e, "failed to open serial face");
+                        }
+                    }
+                }
+                #[cfg(not(feature = "serial"))]
+                {
+                    tracing::warn!("serial face support not compiled in");
+                }
+            }
+            ndn_config::FaceKind::EtherMulticast => {
+                #[cfg(target_os = "linux")]
+                {
+                    let iface = match face_cfg.interface.as_deref() {
+                        Some(i) => i,
+                        None => {
+                            tracing::error!("ether-multicast face requires 'interface' name");
+                            continue;
+                        }
+                    };
+                    let id = engine.faces().alloc_id();
+                    match ndn_face_wireless::MulticastEtherFace::new(id, iface) {
+                        Ok(face) => {
+                            let c = cancel.child_token();
+                            engine.add_face_with_persistency(face, c, ndn_transport::FacePersistency::Permanent);
+                            tracing::info!(iface=%iface, face=%id, "multicast ethernet face opened");
+                        }
+                        Err(e) => {
+                            tracing::error!(iface=%iface, error=%e, "failed to open multicast ethernet face");
+                        }
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    tracing::warn!("ether-multicast face only supported on Linux");
+                }
             }
         }
     }
@@ -377,6 +455,60 @@ async fn run_unix_mgmt_server(
     }
 
     let _ = std::fs::remove_file(&path);
+}
+
+// ─── WebSocket listener ──────────────────────────────────────────────────────
+
+/// Accept WebSocket connections and create a `WebSocketFace` for each.
+#[cfg(feature = "websocket")]
+async fn run_ws_listener(
+    bind_addr: std::net::SocketAddr,
+    engine:    ForwarderEngine,
+    cancel:    CancellationToken,
+) {
+    let listener = match tokio::net::TcpListener::bind(bind_addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!(addr=%bind_addr, error=%e, "ws-listener: bind failed");
+            return;
+        }
+    };
+
+    let local = listener.local_addr().unwrap_or(bind_addr);
+    tracing::info!(addr=%local, "WebSocket listener ready");
+
+    loop {
+        let (stream, peer) = tokio::select! {
+            _ = cancel.cancelled() => break,
+            r = listener.accept() => match r {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(error=%e, "ws-listener: accept error");
+                    continue;
+                }
+            },
+        };
+
+        let ws = match tokio_tungstenite::accept_async(
+            tokio_tungstenite::MaybeTlsStream::Plain(stream),
+        ).await {
+            Ok(ws) => ws,
+            Err(e) => {
+                tracing::warn!(peer=%peer, error=%e, "ws-listener: handshake failed");
+                continue;
+            }
+        };
+
+        let face_id = engine.faces().alloc_id();
+        let face = ndn_face_net::WebSocketFace::from_stream(
+            face_id, ws, peer.to_string(), local.to_string(),
+        );
+        let conn_cancel = cancel.child_token();
+        engine.add_face(face, conn_cancel);
+        tracing::info!(face=%face_id, peer=%peer, "ws-listener: accepted connection");
+    }
+
+    tracing::info!("WebSocket listener stopped");
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────

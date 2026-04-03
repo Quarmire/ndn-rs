@@ -12,6 +12,64 @@ bootstrapping phase and all APIs should be considered unstable.
 
 ### Added
 
+#### SerialFace with COBS framing
+
+Full serial port face implementation replacing the previous stub.  COBS
+(Consistent Overhead Byte Stuffing) encodes packets so `0x00` never
+appears in the payload, making `0x00` a reliable frame delimiter for
+resync after line noise.
+
+- **`CobsCodec`** — `tokio_util::codec::{Encoder, Decoder}` for COBS
+  framing.  Max overhead ~0.4% (1 byte per 254 input bytes).
+- **`SerialFace::open(id, port, baud)`** — opens a serial port via
+  `tokio-serial`, splits into `FramedRead`/`FramedWrite` with `CobsCodec`.
+  Mirrors the `TcpFace` `Mutex<FramedRead>` + `Mutex<FramedWrite>` pattern.
+- Suitable for: UART sensor nodes, LoRa radio modems, RS-485 buses.
+- Gated behind the `serial` feature (default on) in `ndn-face-serial`.
+
+#### Multicast Ethernet face (`MulticastEtherFace`)
+
+L2 multicast neighbor discovery face, the Ethernet equivalent of
+`MulticastUdpFace`.  Joins the IANA NDN Ethernet multicast group
+(`01:00:5e:00:17:aa`) and uses the same TPACKET_V2 zero-copy ring
+buffers as `NamedEtherFace`.
+
+- **`MulticastEtherFace::new(id, iface)`** — opens AF_PACKET socket,
+  joins multicast group via `PACKET_ADD_MEMBERSHIP`, sets up mmap ring.
+- NDNLPv2 fragmentation for packets exceeding Ethernet MTU (1500 B).
+- **Refactored `af_packet` module** — extracted shared AF_PACKET
+  infrastructure (MacAddr, socket helpers, TPACKET_V2 PacketRing) from
+  `ether.rs` into `af_packet.rs` for reuse by both unicast and multicast
+  faces.
+- Linux only (`#[cfg(target_os = "linux")]`), requires `CAP_NET_RAW`.
+
+#### WebSocket face (`WebSocketFace`)
+
+NDN-over-WebSocket using binary frames, compatible with NFD's WebSocket
+transport.  WebSocket provides its own message framing so no `TlvCodec`
+is needed — each binary message carries one NDNLPv2 packet.
+
+- **`WebSocketFace::connect(id, url)`** — client-side via
+  `tokio-tungstenite::connect_async`.
+- **`WebSocketFace::from_stream(id, ws, remote, local)`** — server-side,
+  wraps an accepted WebSocket connection.
+- **`FaceKind::WebSocket`** added to transport layer (scope: `NonLocal`).
+- Gated behind the `websocket` feature (default on) in `ndn-face-net`.
+- Uses `tokio-tungstenite` with native-tls for wss:// support.
+
+#### Config and router integration for new face types
+
+- **`FaceKind` config variants** — `web-socket`, `ether-multicast`,
+  `serial` added to the TOML config enum (kebab-case).
+- **`FaceConfig` fields** — `baud` (serial baud rate), `url` (WebSocket
+  client URL).  Existing `path` field used for serial port path,
+  `interface` for ether-multicast, `bind` for WebSocket listener.
+- **Router match arms** — `ndn-router` creates faces from config for all
+  three new types.  WebSocket gets a `run_ws_listener` accept loop
+  mirroring the TCP listener.  Serial and ether-multicast create faces
+  directly.
+- Router features: `websocket` and `serial` (both default on).
+
 #### Configurable per-face reliability (`ReliabilityConfig`, `RtoStrategy`)
 
 All NDNLPv2 reliability knobs are now runtime-tunable per face via a

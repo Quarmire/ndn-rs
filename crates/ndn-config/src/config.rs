@@ -119,18 +119,30 @@ pub struct FaceConfig {
     #[serde(default)]
     pub interface: Option<String>,
 
-    /// Unix socket path for local faces.
+    /// Unix socket path for local faces, or serial port path (e.g., `/dev/ttyUSB0`).
     #[serde(default)]
     pub path: Option<String>,
+
+    /// Serial baud rate (only for `kind = "serial"`).
+    #[serde(default)]
+    pub baud: Option<u32>,
+
+    /// WebSocket URL for client-mode connections (e.g., `ws://host:9696/ndn`).
+    /// For server-mode, use `bind` instead.
+    #[serde(default)]
+    pub url: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "kebab-case")]
 pub enum FaceKind {
     Udp,
     Tcp,
     Multicast,
     Unix,
+    WebSocket,
+    EtherMulticast,
+    Serial,
 }
 
 /// A static FIB route entry.
