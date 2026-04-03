@@ -158,6 +158,17 @@ pub trait Face: Send + Sync + 'static {
     fn recv(&self) -> impl Future<Output = Result<Bytes, FaceError>> + Send;
 
     /// Send a packet. Must not block the caller; use internal buffering.
+    ///
+    /// # LP encoding convention
+    ///
+    /// Network-facing transports (UDP, TCP, Serial, Ethernet) wrap the raw NDN
+    /// packet in an NDNLPv2 `LpPacket` envelope before writing to the wire.
+    /// Local transports (Unix, App, SHM) send the raw packet as-is — the
+    /// pipeline already strips LP framing before forwarding.
+    ///
+    /// [`StreamFace`](crate::StreamFace) makes this explicit via the `lp_encode`
+    /// constructor parameter.  Custom face implementations should follow the
+    /// same convention based on [`FaceKind::scope()`].
     fn send(&self, pkt: Bytes) -> impl Future<Output = Result<(), FaceError>> + Send;
 }
 

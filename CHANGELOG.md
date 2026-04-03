@@ -10,6 +10,83 @@ bootstrapping phase and all APIs should be considered unstable.
 
 ## [Unreleased]
 
+### Changed
+
+#### Unified `FaceKind` enum with `Display`, `FromStr`, and serde support
+
+Eliminated the duplicate `FaceKind` enum that existed in both
+`ndn-transport` (14 variants) and `ndn-config` (7 variants).  The
+canonical enum now lives solely in `ndn-transport` with optional serde
+support behind a `serde` feature flag.
+
+- **`Display` + `FromStr`** for `FaceKind` — kebab-case string
+  representations (`"udp"`, `"tcp"`, `"ether-multicast"`, etc.).
+  Removes the `format!("{kind:?}").to_lowercase()` hack in the router.
+- **`EtherMulticast` variant** added — `MulticastEtherFace` now returns
+  its own distinct kind instead of sharing `Multicast` with UDP.
+- **Serde support** — `#[serde(rename_all = "kebab-case")]` with
+  `Serialize`/`Deserialize` behind `feature = "serde"`.
+- **Deleted** `ndn_config::FaceKind` — replaced with
+  `pub use ndn_transport::FaceKind`.
+
+#### `FaceConfig` converted to serde tagged enum
+
+Replaced the flat `FaceConfig` struct (9 `Option` fields, most
+irrelevant per face type) with a `#[serde(tag = "kind")]` enum.
+Invalid field combinations are now unrepresentable at parse time.
+TOML surface syntax is unchanged.
+
+```rust
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum FaceConfig {
+    Udp { bind: Option<String>, remote: Option<String> },
+    Tcp { bind: Option<String>, remote: Option<String> },
+    Multicast { group: String, port: u16, interface: Option<String> },
+    Unix { path: Option<String> },
+    WebSocket { bind: Option<String>, url: Option<String> },
+    Serial { path: String, baud: u32 },
+    EtherMulticast { interface: String },
+}
+```
+
+- Router match arms simplified — fields extracted directly from
+  variants, no more `unwrap_or` chains for required fields.
+
+#### `StreamFace<R, W, C>` generic eliminates stream face duplication
+
+Extracted the shared `Mutex<FramedRead>` + `Mutex<FramedWrite>` pattern
+into a single generic `StreamFace` in `ndn-transport`.  TCP, Unix, and
+Serial faces become type aliases with thin constructor functions.
+
+- **`StreamFace::new(id, kind, lp_encode, ...)`** — single constructor
+  taking read/write halves and a codec.  The `lp_encode` flag explicitly
+  controls whether `send()` wraps packets in NDNLPv2 framing.
+- **`TcpFace`** = `StreamFace<OwnedReadHalf, OwnedWriteHalf, TlvCodec>`
+- **`UnixFace`** = `StreamFace<OwnedReadHalf, OwnedWriteHalf, TlvCodec>`
+- **`SerialFace`** = `StreamFace<ReadHalf<SerialStream>, WriteHalf<SerialStream>, CobsCodec>`
+- Constructors: `tcp_face_from_stream()`, `tcp_face_connect()`,
+  `unix_face_from_stream()`, `unix_face_connect()`, `serial_face_open()`.
+- `TlvCodec` gains `Clone + Copy`, `CobsCodec` gains `Clone`.
+- Removed `futures` dependency from `ndn-face-local` and
+  `ndn-face-serial` (now only needed in `ndn-transport`).
+
+#### LP encoding convention documented on `Face::send()`
+
+Added doc comment to `Face::send()` explaining the convention: network
+transports LP-encode, local transports don't.  References
+`StreamFace::lp_encode` and `FaceKind::scope()`.
+
+#### Router face startup consolidated
+
+Extracted `parse_bind_addr()` helper for the repeated address parsing
+pattern across UDP, TCP, and WebSocket match arms.
+
+#### `BluetoothFace` stub cleaned up
+
+Removed the placeholder `Face` impl (always returned `FaceError::Closed`).
+Struct retained with TODO noting it should use `StreamFace<..., CobsCodec>`
+when a Tokio-compatible RFCOMM crate is available.
+
 ### Added
 
 #### SerialFace with COBS framing

@@ -1,28 +1,20 @@
-use bytes::Bytes;
-use ndn_transport::{Face, FaceError, FaceId, FaceKind};
+use ndn_transport::FaceId;
 
 /// NDN face over Bluetooth Classic (RFCOMM).
 ///
 /// On Linux, a paired RFCOMM channel appears as `/dev/rfcommN`.
-/// This face reuses the same COBS-framed stream model as `SerialFace`.
+/// This face should reuse [`StreamFace`](ndn_transport::StreamFace) with
+/// COBS framing, identical to `SerialFace`.
+///
 /// Throughput up to ~3 Mbps; latency 20–40 ms.
+///
+/// TODO: implement using `StreamFace<ReadHalf<RfcommStream>, WriteHalf<RfcommStream>, CobsCodec>`
+/// once a Tokio-compatible RFCOMM crate is available (e.g. `bluer` or `btleplug`).
 pub struct BluetoothFace {
     id: FaceId,
 }
 
 impl BluetoothFace {
     pub fn new(id: FaceId) -> Self { Self { id } }
-}
-
-impl Face for BluetoothFace {
-    fn id(&self) -> FaceId { self.id }
-    fn kind(&self) -> FaceKind { FaceKind::Bluetooth }
-
-    async fn recv(&self) -> Result<Bytes, FaceError> {
-        Err(FaceError::Closed) // placeholder
-    }
-
-    async fn send(&self, _pkt: Bytes) -> Result<(), FaceError> {
-        Err(FaceError::Closed) // placeholder
-    }
+    pub fn id(&self) -> FaceId { self.id }
 }
