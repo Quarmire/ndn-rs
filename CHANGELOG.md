@@ -98,22 +98,29 @@ Zenoh's pub/sub/queryable model but built on NDN's Interest/Data machinery.
 
 ### Fixed
 
-#### CUBIC congestion control kills iperf server via SHM backpressure
+#### Pipeline overload kills SHM applications via backpressure cascade
 
-CUBIC's aggressive retransmit behavior generated 160k+ retransmits per
-run, overwhelming the pipeline channel.  The server's SHM face reader
-blocked, the a2e ring filled up, and `SpscHandle::send()` hit its yield
-limit — causing the server to exit and all subsequent runs to get 0
-throughput until the router was restarted.
+Under heavy load (e.g. CUBIC retransmit floods), the pipeline channel
+(4096 slots) could fill up, causing face readers to block on
+`tx.send()`.  This cascaded through the SHM ring (256 slots) to the
+application, where `SpscHandle::send()` hit its yield limit and
+returned `Closed` — killing the app even though the connection was
+alive.  All subsequent runs got 0 throughput until the router restarted.
 
-- **Retransmit budget per check interval** — capped at `window/2` to
-  prevent retransmit floods from overwhelming the router pipeline.
-- **Per-Interest retry limit** (`MAX_RETRIES = 3`) — Interests that
-  fail 3 retransmits are marked as timed out and removed from the
+- **Face reader uses `try_send`** — inbound packets are dropped (not
+  blocked) when the pipeline channel is full, same as outbound
+  `enqueue_send`.  Prevents face readers from stalling, which broke
+  the SHM backpressure chain that killed applications.
+- **`SpscHandle::send()` uses wall-clock deadline** (5s) instead of a
+  yield counter (100k iterations).  The old yield counter was
+  system-speed-dependent and could falsely fire under Tokio contention,
+  killing the app on transient load spikes.
+- **iperf retransmit budget** — capped at `window/2` per check interval
+  to prevent retransmit floods from overwhelming the pipeline in the
+  first place.
+- **iperf per-Interest retry limit** (`MAX_RETRIES = 3`) — Interests
+  that fail 3 retransmits are marked as timed out and removed from the
   in-flight map, freeing window capacity for new Interests.
-- **Server survives send backpressure** — `send()` errors are now
-  logged and retried instead of exiting the server loop.  The server
-  stays alive through pipeline overload bursts.
 
 #### Consecutive iperf runs fail with PIT suppression (0 throughput)
 

@@ -311,7 +311,6 @@ async fn run_server(
     let mut total_interests: u64 = 0;
     let mut total_sent: u64 = 0;
     let mut non_interest: u64 = 0;
-    let mut send_errors: u64 = 0;
 
     loop {
         let raw = match client.recv().await {
@@ -349,23 +348,12 @@ async fn run_server(
         };
 
         let data_len = data.len() as u64;
-        match client.send(data).await {
-            Ok(()) => {
-                total_sent += 1;
-                counters.record(data_len);
-            }
-            Err(_e) => {
-                // SHM backpressure can cause transient send failures when the
-                // pipeline is overloaded.  Yield briefly and continue rather
-                // than exiting — the overload is temporary and the server
-                // should keep serving after the burst subsides.
-                send_errors += 1;
-                if send_errors == 1 {
-                    eprintln!("  send backpressure (pipeline overloaded, will retry)");
-                }
-                tokio::task::yield_now().await;
-            }
+        if let Err(e) = client.send(data).await {
+            eprintln!("  send error: {e}");
+            break;
         }
+        total_sent += 1;
+        counters.record(data_len);
     }
 
     let elapsed = start.elapsed();
@@ -376,9 +364,6 @@ async fn run_server(
     eprintln!("  data sent:     {total_sent}");
     if non_interest > 0 {
         eprintln!("  non-interest:  {non_interest}");
-    }
-    if send_errors > 0 {
-        eprintln!("  send errors:   {send_errors} (backpressure)");
     }
 
     Ok(())
