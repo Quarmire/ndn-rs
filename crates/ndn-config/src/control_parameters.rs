@@ -29,6 +29,7 @@ pub mod tlv {
     pub const URI: u64 = 0x72;
     pub const LOCAL_URI: u64 = 0x81;
     pub const CAPACITY: u64 = 0x83;
+    pub const COUNT: u64 = 0x84;
     pub const FACE_PERSISTENCY: u64 = 0x85;
     pub const BASE_CONG_INTERVAL: u64 = 0x87;
     pub const DEF_CONG_THRESHOLD: u64 = 0x88;
@@ -73,6 +74,8 @@ pub struct ControlParameters {
     pub face_persistency: Option<u64>,
     pub strategy: Option<Name>,
     pub mtu: Option<u64>,
+    pub capacity: Option<u64>,
+    pub count: Option<u64>,
 }
 
 impl ControlParameters {
@@ -135,6 +138,12 @@ impl ControlParameters {
         }
         if let Some(mtu) = self.mtu {
             write_non_neg_int(w, tlv::MTU, mtu);
+        }
+        if let Some(capacity) = self.capacity {
+            write_non_neg_int(w, tlv::CAPACITY, capacity);
+        }
+        if let Some(count) = self.count {
+            write_non_neg_int(w, tlv::COUNT, count);
         }
     }
 
@@ -210,6 +219,12 @@ impl ControlParameters {
                 }
                 tlv::MTU => {
                     params.mtu = Some(read_non_neg_int(&val)?);
+                }
+                tlv::CAPACITY => {
+                    params.capacity = Some(read_non_neg_int(&val)?);
+                }
+                tlv::COUNT => {
+                    params.count = Some(read_non_neg_int(&val)?);
                 }
                 // Unknown non-critical types are silently skipped.
                 _ => {}
@@ -401,6 +416,8 @@ mod tests {
             face_persistency: Some(1),
             strategy: Some(name(&[b"ndn", b"strategy", b"multicast"])),
             mtu: Some(8800),
+            capacity: Some(1024 * 1024),
+            count: Some(42),
         };
         let wire = params.encode();
         let decoded = ControlParameters::decode(wire).unwrap();

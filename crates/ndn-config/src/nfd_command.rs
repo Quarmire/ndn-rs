@@ -51,6 +51,7 @@ pub mod verb {
     // cs
     pub const CONFIG: &[u8] = b"config";
     pub const INFO: &[u8] = b"info";
+    pub const ERASE: &[u8] = b"erase";
 }
 
 // ─── Name builder ────────────────────────────────────────────────────────────
