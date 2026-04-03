@@ -21,6 +21,7 @@ members = [
     "crates/ndn-ipc",
     "crates/ndn-config",
     # Layer 5 — research extensions
+    "crates/ndn-strategy-wasm",
     "crates/ndn-research",
     "crates/ndn-compute",
     "crates/ndn-sync",
@@ -28,6 +29,11 @@ members = [
     "binaries/ndn-router",
     "binaries/ndn-tools",
     "binaries/ndn-bench",
+    # Examples
+    "examples/strategy-custom",
+    "examples/strategy-composed",
+    "examples/cross-layer-enricher",
+    "examples/wasm-strategy",
 ]
 
 [workspace.package]
@@ -53,6 +59,7 @@ ndn-face-net      = { path = "crates/ndn-face-net" }
 ndn-face-local    = { path = "crates/ndn-face-local" }
 ndn-face-serial   = { path = "crates/ndn-face-serial" }
 ndn-face-wireless = { path = "crates/ndn-face-wireless" }
+ndn-strategy-wasm = { path = "crates/ndn-strategy-wasm" }
 ndn-research  = { path = "crates/ndn-research" }
 ndn-compute   = { path = "crates/ndn-compute" }
 ndn-sync      = { path = "crates/ndn-sync" }
@@ -99,6 +106,12 @@ tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
 # Logging subscriber (binaries only)
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+
+# Synchronization
+parking_lot = "0.12"
+
+# WebAssembly text format (examples)
+wat = "1"
 
 # Benchmarking
 criterion = { version = "0.5", features = ["html_reports"] }

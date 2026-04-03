@@ -1,0 +1,20 @@
+[package]
+name = "ndn-strategy-wasm"
+description = "WASM-based hot-loadable NDN forwarding strategies via wasmtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ndn-packet    = { workspace = true }
+ndn-transport = { workspace = true }
+ndn-pipeline  = { workspace = true }
+ndn-strategy  = { workspace = true }
+ndn-engine    = { workspace = true }
+smallvec      = { workspace = true }
+tracing       = { workspace = true }
+anyhow        = { workspace = true }
+wasmtime      = { version = "31", default-features = false, features = ["cranelift", "runtime"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
