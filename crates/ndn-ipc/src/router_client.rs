@@ -104,7 +104,7 @@ impl RouterClient {
         shm_name: Option<&str>,
     ) -> Result<Self, RouterError> {
         let control = Arc::new(
-            UnixFace::connect(FaceId(0), face_socket.as_ref()).await?
+            ndn_face_local::unix_face_connect(FaceId(0), face_socket.as_ref()).await?
         );
         let cancel = CancellationToken::new();
         let dead = Arc::new(AtomicBool::new(false));

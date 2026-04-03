@@ -92,7 +92,7 @@ impl MulticastEtherFace {
 
 impl Face for MulticastEtherFace {
     fn id(&self)   -> FaceId   { self.id }
-    fn kind(&self) -> FaceKind { FaceKind::Multicast }
+    fn kind(&self) -> FaceKind { FaceKind::EtherMulticast }
 
     fn remote_uri(&self) -> Option<String> {
         Some(format!("ether://[{}]/{}", NDN_ETHER_MCAST_MAC, self.iface))

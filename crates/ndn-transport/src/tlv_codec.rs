@@ -20,6 +20,7 @@ use ndn_tlv::read_varu64;
 /// ```
 ///
 /// Both `TcpFace` and `SerialFace` (over COBS) use this codec for framing.
+#[derive(Clone, Copy)]
 pub struct TlvCodec;
 
 impl Decoder for TlvCodec {

@@ -115,17 +115,13 @@ async fn main() -> Result<()> {
     let face_configs: std::borrow::Cow<'_, [ndn_config::FaceConfig]> = if fwd_config.faces.is_empty() {
         tracing::info!("no [[face]] in config, using defaults: udp+tcp on 0.0.0.0:6363");
         std::borrow::Cow::Owned(vec![
-            ndn_config::FaceConfig {
-                kind: ndn_config::FaceKind::Udp,
+            ndn_config::FaceConfig::Udp {
                 bind: Some("0.0.0.0:6363".into()),
-                remote: None, group: None, port: None, interface: None, path: None,
-                baud: None, url: None,
+                remote: None,
             },
-            ndn_config::FaceConfig {
-                kind: ndn_config::FaceKind::Tcp,
+            ndn_config::FaceConfig::Tcp {
                 bind: Some("0.0.0.0:6363".into()),
-                remote: None, group: None, port: None, interface: None, path: None,
-                baud: None, url: None,
+                remote: None,
             },
         ])
     } else {
@@ -133,118 +129,79 @@ async fn main() -> Result<()> {
     };
 
     for face_cfg in face_configs.iter() {
-        match face_cfg.kind {
-            ndn_config::FaceKind::Udp => {
-                let bind = face_cfg.bind.as_deref().unwrap_or("0.0.0.0:6363");
-                let addr: std::net::SocketAddr = match bind.parse() {
-                    Ok(a) => a,
-                    Err(e) => {
-                        tracing::error!(bind=%bind, error=%e, "invalid UDP bind address");
-                        continue;
-                    }
-                };
-                let eng = engine.clone();
-                let c = cancel.clone();
-                tokio::spawn(async move {
-                    mgmt_ndn::run_udp_listener(addr, eng, c).await;
-                });
+        match face_cfg {
+            ndn_config::FaceConfig::Udp { bind, .. } => {
+                if let Some(addr) = parse_bind_addr(bind.as_deref().unwrap_or("0.0.0.0:6363"), "UDP") {
+                    let eng = engine.clone();
+                    let c = cancel.clone();
+                    tokio::spawn(async move { mgmt_ndn::run_udp_listener(addr, eng, c).await; });
+                }
             }
-            ndn_config::FaceKind::Tcp => {
-                let bind = face_cfg.bind.as_deref().unwrap_or("0.0.0.0:6363");
-                let addr: std::net::SocketAddr = match bind.parse() {
-                    Ok(a) => a,
-                    Err(e) => {
-                        tracing::error!(bind=%bind, error=%e, "invalid TCP bind address");
-                        continue;
-                    }
-                };
-                let eng = engine.clone();
-                let c = cancel.clone();
-                tokio::spawn(async move {
-                    mgmt_ndn::run_tcp_listener(addr, eng, c).await;
-                });
+            ndn_config::FaceConfig::Tcp { bind, .. } => {
+                if let Some(addr) = parse_bind_addr(bind.as_deref().unwrap_or("0.0.0.0:6363"), "TCP") {
+                    let eng = engine.clone();
+                    let c = cancel.clone();
+                    tokio::spawn(async move { mgmt_ndn::run_tcp_listener(addr, eng, c).await; });
+                }
             }
-            ndn_config::FaceKind::Multicast => {
+            ndn_config::FaceConfig::Multicast { .. } => {
                 // TODO: multicast UDP face from config
                 tracing::warn!("multicast face config not yet supported at startup");
             }
-            ndn_config::FaceKind::Unix => {
+            ndn_config::FaceConfig::Unix { .. } => {
                 // Unix faces are handled by the face listener below.
                 tracing::warn!("unix face config ignored (use [management] face_socket)");
             }
-            ndn_config::FaceKind::WebSocket => {
-                let bind = match face_cfg.bind.as_deref() {
-                    Some(b) => b,
-                    None => {
-                        tracing::error!("websocket face requires 'bind' address");
-                        continue;
-                    }
+            ndn_config::FaceConfig::WebSocket { bind, .. } => {
+                let Some(bind_str) = bind.as_deref() else {
+                    tracing::error!("websocket face requires 'bind' address");
+                    continue;
                 };
-                let addr: std::net::SocketAddr = match bind.parse() {
-                    Ok(a) => a,
-                    Err(e) => {
-                        tracing::error!(bind=%bind, error=%e, "invalid WebSocket bind address");
-                        continue;
-                    }
-                };
-                let eng = engine.clone();
-                let c = cancel.clone();
-                tokio::spawn(async move {
-                    run_ws_listener(addr, eng, c).await;
-                });
+                if let Some(addr) = parse_bind_addr(bind_str, "WebSocket") {
+                    let eng = engine.clone();
+                    let c = cancel.clone();
+                    tokio::spawn(async move { run_ws_listener(addr, eng, c).await; });
+                }
             }
-            ndn_config::FaceKind::Serial => {
+            ndn_config::FaceConfig::Serial { path, baud } => {
                 #[cfg(feature = "serial")]
                 {
-                    let port = match face_cfg.path.as_deref() {
-                        Some(p) => p,
-                        None => {
-                            tracing::error!("serial face requires 'path' (e.g., /dev/ttyUSB0)");
-                            continue;
-                        }
-                    };
-                    let baud = face_cfg.baud.unwrap_or(115200);
                     let id = engine.faces().alloc_id();
-                    match ndn_face_serial::SerialFace::open(id, port, baud) {
+                    match ndn_face_serial::serial_face_open(id, path, *baud) {
                         Ok(face) => {
                             let c = cancel.child_token();
                             engine.add_face(face, c);
-                            tracing::info!(port=%port, baud=%baud, face=%id, "serial face opened");
+                            tracing::info!(port=%path, baud=%baud, face=%id, "serial face opened");
                         }
                         Err(e) => {
-                            tracing::error!(port=%port, error=%e, "failed to open serial face");
+                            tracing::error!(port=%path, error=%e, "failed to open serial face");
                         }
                     }
                 }
                 #[cfg(not(feature = "serial"))]
                 {
+                    let _ = (path, baud);
                     tracing::warn!("serial face support not compiled in");
                 }
             }
-            ndn_config::FaceKind::EtherMulticast => {
+            ndn_config::FaceConfig::EtherMulticast { interface } => {
                 #[cfg(target_os = "linux")]
                 {
-                    let iface = match face_cfg.interface.as_deref() {
-                        Some(i) => i,
-                        None => {
-                            tracing::error!("ether-multicast face requires 'interface' name");
-                            continue;
-                        }
-                    };
                     let id = engine.faces().alloc_id();
-                    match ndn_face_wireless::MulticastEtherFace::new(id, iface) {
+                    match ndn_face_wireless::MulticastEtherFace::new(id, interface) {
                         Ok(face) => {
                             let c = cancel.child_token();
                             engine.add_face_with_persistency(face, c, ndn_transport::FacePersistency::Permanent);
-                            tracing::info!(iface=%iface, face=%id, "multicast ethernet face opened");
+                            tracing::info!(iface=%interface, face=%id, "multicast ethernet face opened");
                         }
                         Err(e) => {
-                            tracing::error!(iface=%iface, error=%e, "failed to open multicast ethernet face");
+                            tracing::error!(iface=%interface, error=%e, "failed to open multicast ethernet face");
                         }
                     }
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
+                    let _ = interface;
                     tracing::warn!("ether-multicast face only supported on Linux");
                 }
             }
@@ -361,7 +318,7 @@ fn handle_request(
                 .filter(|(_, kind)| !matches!(kind, ndn_transport::FaceKind::App | ndn_transport::FaceKind::Internal))
                 .map(|(id, kind)| serde_json::json!({
                     "id":   id.0,
-                    "kind": format!("{kind:?}").to_lowercase(),
+                    "kind": kind.to_string(),
                 }))
                 .collect();
             ManagementResponse::OkData {
@@ -568,6 +525,17 @@ fn default_pib_path() -> PathBuf {
     p.push(".ndn");
     p.push("pib");
     p
+}
+
+/// Parse a bind address string into a `SocketAddr`, logging errors on failure.
+fn parse_bind_addr(bind: &str, label: &str) -> Option<std::net::SocketAddr> {
+    match bind.parse() {
+        Ok(a) => Some(a),
+        Err(e) => {
+            tracing::error!(bind=%bind, error=%e, "invalid {label} bind address");
+            None
+        }
+    }
 }
 
 /// Parse a URI-style NDN name like `/ndn/test` into a `Name`.

@@ -7,7 +7,7 @@ pub mod reliability;
 pub mod websocket;
 
 pub use udp::UdpFace;
-pub use tcp::TcpFace;
+pub use tcp::{TcpFace, tcp_face_from_stream, tcp_face_connect};
 pub use multicast::MulticastUdpFace;
 pub use ndn_packet::fragment::DEFAULT_UDP_MTU;
 pub use reliability::{LpReliability, ReliabilityConfig, RtoStrategy};

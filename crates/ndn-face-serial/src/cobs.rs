@@ -20,6 +20,7 @@ use tokio_util::codec::{Decoder, Encoder};
 const DEFAULT_MAX_FRAME_LEN: usize = 8800;
 
 /// COBS frame codec for `tokio_util::codec::Framed`.
+#[derive(Clone)]
 pub struct CobsCodec {
     max_frame_len: usize,
 }

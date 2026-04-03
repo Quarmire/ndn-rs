@@ -20,6 +20,5 @@ bytes         = { workspace = true }
 tokio         = { workspace = true, features = ["sync", "io-util"] }
 tokio-serial  = { workspace = true, optional = true }
 tokio-util    = { workspace = true, features = ["codec"] }
-futures       = { workspace = true }
 tracing       = { workspace = true }
 thiserror     = { workspace = true }

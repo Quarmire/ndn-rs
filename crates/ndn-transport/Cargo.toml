@@ -5,11 +5,17 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+serde = ["dep:serde"]
+
 [dependencies]
 ndn-packet = { workspace = true }
 ndn-tlv    = { workspace = true }
 bytes      = { workspace = true }
+futures    = { workspace = true }
 tokio      = { workspace = true, features = ["sync"] }
 tokio-util = { workspace = true, features = ["codec"] }
 thiserror  = { workspace = true }
 dashmap    = { workspace = true }
+serde      = { workspace = true, optional = true }

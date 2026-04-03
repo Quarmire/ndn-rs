@@ -1,12 +1,6 @@
-use bytes::Bytes;
-use futures::{SinkExt, StreamExt};
-use tokio::io::{ReadHalf, WriteHalf};
-use tokio::sync::Mutex;
-use tokio_util::codec::{FramedRead, FramedWrite};
-use tracing::trace;
+use ndn_transport::{FaceId, FaceKind};
 
-use ndn_transport::{Face, FaceError, FaceId, FaceKind};
-
+#[cfg(feature = "serial")]
 use crate::cobs::CobsCodec;
 
 /// NDN face over a serial port with COBS framing.
@@ -17,71 +11,41 @@ use crate::cobs::CobsCodec;
 ///
 /// Suitable for: UART sensor nodes, LoRa radio modems, RS-485 industrial buses.
 ///
-/// The serial stream is split into independent read and write halves, each behind
-/// its own `Mutex` — mirroring the `TcpFace` pattern.
+/// Uses [`StreamFace`](ndn_transport::StreamFace) with serial read/write halves
+/// and [`CobsCodec`].  LP-encoding is enabled for network transport.
 #[cfg(feature = "serial")]
-pub struct SerialFace {
-    id:     FaceId,
-    port:   String,
-    baud:   u32,
-    reader: Mutex<FramedRead<ReadHalf<tokio_serial::SerialStream>, CobsCodec>>,
-    writer: Mutex<FramedWrite<WriteHalf<tokio_serial::SerialStream>, CobsCodec>>,
-}
+pub type SerialFace = ndn_transport::StreamFace<
+    tokio::io::ReadHalf<tokio_serial::SerialStream>,
+    tokio::io::WriteHalf<tokio_serial::SerialStream>,
+    CobsCodec,
+>;
 
+/// Open a serial port and wrap it as an NDN [`SerialFace`].
 #[cfg(feature = "serial")]
-impl SerialFace {
-    /// Open a serial port and wrap it as an NDN face.
-    pub fn open(id: FaceId, port: impl Into<String>, baud: u32) -> std::io::Result<Self> {
-        let port = port.into();
-        let builder = tokio_serial::new(&port, baud);
-        let stream = tokio_serial::SerialStream::open(&builder)?;
-        let (r, w) = tokio::io::split(stream);
-        Ok(Self {
-            id,
-            port,
-            baud,
-            reader: Mutex::new(FramedRead::new(r, CobsCodec::new())),
-            writer: Mutex::new(FramedWrite::new(w, CobsCodec::new())),
-        })
-    }
-
-    pub fn port(&self) -> &str { &self.port }
-    pub fn baud(&self) -> u32 { self.baud }
-}
-
-#[cfg(feature = "serial")]
-impl Face for SerialFace {
-    fn id(&self) -> FaceId { self.id }
-    fn kind(&self) -> FaceKind { FaceKind::Serial }
-
-    fn remote_uri(&self) -> Option<String> {
-        Some(format!("serial://{}", self.port))
-    }
-
-    fn local_uri(&self) -> Option<String> {
-        Some(format!("serial://{}", self.port))
-    }
-
-    async fn recv(&self) -> Result<Bytes, FaceError> {
-        let mut reader = self.reader.lock().await;
-        let data = reader
-            .next()
-            .await
-            .ok_or(FaceError::Closed)?
-            .map_err(FaceError::Io)?;
-        trace!(face=%self.id, port=%self.port, len=data.len(), "serial: recv");
-        Ok(data)
-    }
-
-    async fn send(&self, pkt: Bytes) -> Result<(), FaceError> {
-        let wire = ndn_packet::lp::encode_lp_packet(&pkt);
-        trace!(face=%self.id, port=%self.port, len=wire.len(), "serial: send");
-        let mut writer = self.writer.lock().await;
-        writer.send(wire).await.map_err(FaceError::Io)
-    }
+pub fn serial_face_open(id: FaceId, port: impl Into<String>, baud: u32) -> std::io::Result<SerialFace> {
+    let port = port.into();
+    let builder = tokio_serial::new(&port, baud);
+    let stream = tokio_serial::SerialStream::open(&builder)?;
+    let (r, w) = tokio::io::split(stream);
+    let uri = format!("serial://{}", port);
+    Ok(ndn_transport::StreamFace::new(
+        id,
+        FaceKind::Serial,
+        true,
+        Some(uri.clone()),
+        Some(uri),
+        r,
+        w,
+        CobsCodec::new(),
+    ))
 }
 
 // ─── Fallback when `serial` feature is disabled ────────────────────────────
+
+#[cfg(not(feature = "serial"))]
+use bytes::Bytes;
+#[cfg(not(feature = "serial"))]
+use ndn_transport::{Face, FaceError};
 
 #[cfg(not(feature = "serial"))]
 pub struct SerialFace {

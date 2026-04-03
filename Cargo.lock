@@ -922,6 +922,7 @@ dependencies = [
  "bytes",
  "ndn-packet",
  "ndn-tlv",
+ "ndn-transport",
  "serde",
  "serde_json",
  "thiserror",
@@ -957,7 +958,6 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "criterion",
- "futures",
  "libc",
  "ndn-packet",
  "ndn-tlv",
@@ -989,7 +989,6 @@ name = "ndn-face-serial"
 version = "0.1.0"
 dependencies = [
  "bytes",
- "futures",
  "ndn-packet",
  "ndn-transport",
  "thiserror",
@@ -1183,8 +1182,10 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "dashmap",
+ "futures",
  "ndn-packet",
  "ndn-tlv",
+ "serde",
  "thiserror",
  "tokio",
  "tokio-util",

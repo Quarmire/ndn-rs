@@ -112,7 +112,7 @@ pub async fn run_face_listener(
         };
 
         let face_id = engine.faces().alloc_id();
-        let face    = ndn_face_local::UnixFace::from_stream(face_id, stream, path);
+        let face    = ndn_face_local::unix_face_from_stream(face_id, stream, path);
         tracing::debug!(face = %face_id, "face-listener: accepted connection");
         // Per-connection child token: cancelling it on disconnect only affects
         // this connection and its child faces (e.g. SHM), not the whole router.
@@ -248,7 +248,7 @@ pub async fn run_tcp_listener(
         };
 
         let face_id = engine.faces().alloc_id();
-        let face = ndn_face_net::TcpFace::from_stream(face_id, stream);
+        let face = ndn_face_net::tcp_face_from_stream(face_id, stream);
         let conn_cancel = cancel.child_token();
         engine.add_face(face, conn_cancel);
         tracing::info!(face=%face_id, peer=%peer, "tcp-listener: accepted connection");
@@ -506,7 +506,7 @@ async fn faces_create_tcp(addr_str: &str, engine: &ForwarderEngine) -> ControlRe
 
     let face_id = engine.faces().alloc_id();
 
-    match ndn_face_net::TcpFace::connect(face_id, peer).await {
+    match ndn_face_net::tcp_face_connect(face_id, peer).await {
         Ok(face) => {
             let local_uri = face.local_uri().unwrap_or_default();
             let cancel = CancellationToken::new();
