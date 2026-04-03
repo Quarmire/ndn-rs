@@ -22,6 +22,14 @@ fn is_localhost_name(name: &Name) -> bool {
 #[derive(Clone, Copy, Debug)]
 pub struct CongestionMark(pub u64);
 
+/// NDNLPv2 NextHopFaceId (app→forwarder), stored as a tag.
+#[derive(Clone, Copy, Debug)]
+pub struct NextHopFaceId(pub u64);
+
+/// NDNLPv2 CachePolicy from LP header, stored as a tag.
+#[derive(Clone, Copy, Debug)]
+pub struct LpCachePolicy(pub ndn_packet::CachePolicyType);
+
 /// Decodes the raw bytes in `ctx` into an `Interest`, `Data`, or `Nack`.
 ///
 /// Handles both bare Interest/Data packets and NDNLPv2 LpPacket-wrapped
@@ -177,9 +185,18 @@ impl TlvDecodeStage {
             }
         };
 
-        // Propagate CongestionMark through the pipeline via tags.
+        // Propagate LP header fields through the pipeline via tags/context.
         if let Some(mark) = lp.congestion_mark {
             ctx.tags.insert(CongestionMark(mark));
+        }
+        if let Some(token) = lp.pit_token.clone() {
+            ctx.lp_pit_token = Some(token);
+        }
+        if let Some(face_id) = lp.next_hop_face_id {
+            ctx.tags.insert(NextHopFaceId(face_id));
+        }
+        if let Some(ref policy) = lp.cache_policy {
+            ctx.tags.insert(LpCachePolicy(*policy));
         }
 
         // Bare Ack-only packets have no payload to process.

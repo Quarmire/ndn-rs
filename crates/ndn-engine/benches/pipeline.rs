@@ -269,7 +269,7 @@ fn bench_pit_match(c: &mut Criterion) {
                 0,
                 4000,
             );
-            entry.add_in_record(1, interest.nonce().unwrap_or(0), u64::MAX);
+            entry.add_in_record(1, interest.nonce().unwrap_or(0), u64::MAX, None);
             pit.insert(token, entry);
 
             let stage = PitMatchStage { pit };
@@ -462,7 +462,7 @@ fn bench_data_pipeline(c: &mut Criterion) {
                             0,
                             4000,
                         );
-                        entry.add_in_record(1, interest.nonce().unwrap_or(0), u64::MAX);
+                        entry.add_in_record(1, interest.nonce().unwrap_or(0), u64::MAX, None);
                         pit.insert(token, entry);
 
                         // Decode Data

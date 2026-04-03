@@ -52,7 +52,7 @@ impl PitCheckStage {
             }
             // Aggregate: add in-record, suppress forwarding.
             let expires_at = now_ns + lifetime_ms * 1_000_000;
-            entry.add_in_record(ctx.face_id.0, nonce, expires_at);
+            entry.add_in_record(ctx.face_id.0, nonce, expires_at, ctx.lp_pit_token.clone());
             trace!(face=%ctx.face_id, name=%interest.name, nonce, "pit-check: aggregated (suppressed)");
             return Action::Drop(DropReason::Suppressed);
         }
@@ -61,7 +61,7 @@ impl PitCheckStage {
         let name = interest.name.clone();
         let selector = Some(interest.selectors().clone());
         let mut entry = PitEntry::new(name, selector, now_ns, lifetime_ms);
-        entry.add_in_record(ctx.face_id.0, nonce, now_ns + lifetime_ms * 1_000_000);
+        entry.add_in_record(ctx.face_id.0, nonce, now_ns + lifetime_ms * 1_000_000, ctx.lp_pit_token.clone());
         self.pit.insert(token, entry);
         trace!(face=%ctx.face_id, name=%interest.name, nonce, lifetime_ms, "pit-check: new entry");
 

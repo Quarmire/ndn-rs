@@ -48,6 +48,9 @@ pub struct InRecord {
     pub face_id: u32,
     pub nonce: u32,
     pub expires_at: u64,
+    /// NDNLPv2 PIT token from the LP header on this face.
+    /// Must be echoed back in the Data/Nack response.
+    pub lp_pit_token: Option<bytes::Bytes>,
 }
 
 /// Record of an outgoing Interest (producer-facing side of the PIT entry).
@@ -85,11 +88,18 @@ impl PitEntry {
         }
     }
 
-    pub fn add_in_record(&mut self, face_id: u32, nonce: u32, expires_at: u64) {
+    pub fn add_in_record(
+        &mut self,
+        face_id: u32,
+        nonce: u32,
+        expires_at: u64,
+        lp_pit_token: Option<bytes::Bytes>,
+    ) {
         self.in_records.push(InRecord {
             face_id,
             nonce,
             expires_at,
+            lp_pit_token,
         });
         if !self.nonces_seen.contains(&nonce) {
             self.nonces_seen.push(nonce);
@@ -329,22 +339,22 @@ mod tests {
         let name1 = Arc::new(make_name(&["a"]));
         let token1 = PitToken::from_interest(&name1, None);
         let mut entry1 = PitEntry::new(name1, None, 0, 4000);
-        entry1.add_in_record(1, 100, 999);
+        entry1.add_in_record(1, 100, 999, None);
         pit.insert(token1, entry1);
 
         // Entry with consumers on face 1 AND face 2.
         let name2 = Arc::new(make_name(&["b"]));
         let token2 = PitToken::from_interest(&name2, None);
         let mut entry2 = PitEntry::new(name2, None, 0, 4000);
-        entry2.add_in_record(1, 200, 999);
-        entry2.add_in_record(2, 201, 999);
+        entry2.add_in_record(1, 200, 999, None);
+        entry2.add_in_record(2, 201, 999, None);
         pit.insert(token2, entry2);
 
         // Entry with sole consumer on face 3 (unrelated).
         let name3 = Arc::new(make_name(&["c"]));
         let token3 = PitToken::from_interest(&name3, None);
         let mut entry3 = PitEntry::new(name3, None, 0, 4000);
-        entry3.add_in_record(3, 300, 999);
+        entry3.add_in_record(3, 300, 999, None);
         pit.insert(token3, entry3);
 
         assert_eq!(pit.len(), 3);

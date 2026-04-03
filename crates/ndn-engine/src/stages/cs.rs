@@ -4,7 +4,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::trace;
 
 use ndn_pipeline::{Action, DecodedPacket, PacketContext};
+use ndn_packet::CachePolicyType;
 use ndn_store::{CsAdmissionPolicy, CsMeta, ErasedContentStore};
+
+use crate::stages::decode::LpCachePolicy;
 
 /// Look up the CS before hitting the PIT/FIB.
 ///
@@ -53,6 +56,16 @@ pub struct CsInsertStage {
 impl CsInsertStage {
     pub async fn process(&self, ctx: PacketContext) -> Action {
         if let DecodedPacket::Data(ref data) = ctx.packet {
+            // NDNLPv2 CachePolicy::NoCache overrides admission.
+            if ctx
+                .tags
+                .get::<LpCachePolicy>()
+                .is_some_and(|p| matches!(p.0, CachePolicyType::NoCache))
+            {
+                trace!(name=%data.name, "cs-insert: NoCache LP policy, skipping");
+                return Action::Satisfy(ctx);
+            }
+
             if !self.admission.should_admit(data) {
                 trace!(name=%data.name, "cs-insert: rejected by admission policy");
                 return Action::Satisfy(ctx);
