@@ -18,12 +18,12 @@ pub enum SignatureType {
 impl SignatureType {
     pub fn code(&self) -> u64 {
         match self {
-            SignatureType::DigestSha256            => 0,
-            SignatureType::SignatureSha256WithRsa  => 1,
+            SignatureType::DigestSha256 => 0,
+            SignatureType::SignatureSha256WithRsa => 1,
             SignatureType::SignatureSha256WithEcdsa => 3,
             SignatureType::SignatureHmacWithSha256 => 4,
-            SignatureType::SignatureEd25519        => 5,
-            SignatureType::Other(c)                => *c,
+            SignatureType::SignatureEd25519 => 5,
+            SignatureType::Other(c) => *c,
         }
     }
 
@@ -45,14 +45,14 @@ impl SignatureType {
 /// SignatureNonce (0x26), SignatureTime (0x28), SignatureSeqNum (0x2A).
 #[derive(Clone, Debug)]
 pub struct SignatureInfo {
-    pub sig_type:       SignatureType,
-    pub key_locator:    Option<Arc<Name>>,
+    pub sig_type: SignatureType,
+    pub key_locator: Option<Arc<Name>>,
     /// Random nonce for anti-replay (NDN Packet Format v0.3 §5.4).
-    pub sig_nonce:      Option<Bytes>,
+    pub sig_nonce: Option<Bytes>,
     /// Timestamp in milliseconds since Unix epoch (NDN Packet Format v0.3 §5.4).
-    pub sig_time:       Option<u64>,
+    pub sig_time: Option<u64>,
     /// Monotonically increasing sequence number (NDN Packet Format v0.3 §5.4).
-    pub sig_seq_num:    Option<u64>,
+    pub sig_seq_num: Option<u64>,
 }
 
 impl SignatureInfo {
@@ -69,7 +69,9 @@ impl SignatureInfo {
             match typ {
                 t if t == tlv_type::SIGNATURE_TYPE => {
                     let mut code = 0u64;
-                    for &b in val.iter() { code = (code << 8) | b as u64; }
+                    for &b in val.iter() {
+                        code = (code << 8) | b as u64;
+                    }
                     sig_type = SignatureType::from_code(code);
                 }
                 t if t == tlv_type::KEY_LOCATOR => {
@@ -87,26 +89,36 @@ impl SignatureInfo {
                 }
                 t if t == tlv_type::SIGNATURE_TIME => {
                     let mut ms = 0u64;
-                    for &b in val.iter() { ms = (ms << 8) | b as u64; }
+                    for &b in val.iter() {
+                        ms = (ms << 8) | b as u64;
+                    }
                     sig_time = Some(ms);
                 }
                 t if t == tlv_type::SIGNATURE_SEQ_NUM => {
                     let mut n = 0u64;
-                    for &b in val.iter() { n = (n << 8) | b as u64; }
+                    for &b in val.iter() {
+                        n = (n << 8) | b as u64;
+                    }
                     sig_seq_num = Some(n);
                 }
                 _ => {}
             }
         }
-        Ok(Self { sig_type, key_locator, sig_nonce, sig_time, sig_seq_num })
+        Ok(Self {
+            sig_type,
+            key_locator,
+            sig_nonce,
+            sig_time,
+            sig_seq_num,
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndn_tlv::TlvWriter;
     use crate::name::build_name_value;
+    use ndn_tlv::TlvWriter;
 
     fn build_sig_info(sig_type_code: u8, key_name_components: Option<&[&[u8]]>) -> bytes::Bytes {
         let mut w = TlvWriter::new();
@@ -125,11 +137,11 @@ mod tests {
     #[test]
     fn sig_type_known_codes() {
         let cases = [
-            (SignatureType::DigestSha256,             0u64),
-            (SignatureType::SignatureSha256WithRsa,   1),
+            (SignatureType::DigestSha256, 0u64),
+            (SignatureType::SignatureSha256WithRsa, 1),
             (SignatureType::SignatureSha256WithEcdsa, 3),
-            (SignatureType::SignatureHmacWithSha256,  4),
-            (SignatureType::SignatureEd25519,         5),
+            (SignatureType::SignatureHmacWithSha256, 4),
+            (SignatureType::SignatureEd25519, 5),
         ];
         for (sig_type, code) in cases {
             assert_eq!(sig_type.code(), code, "{sig_type:?}");

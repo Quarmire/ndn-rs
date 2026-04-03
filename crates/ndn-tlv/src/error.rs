@@ -6,7 +6,11 @@ pub enum TlvError {
     /// Unknown TLV type with the critical bit set (odd type number) — must drop.
     UnknownCriticalType(u64),
     /// A field had the wrong encoded length.
-    InvalidLength { typ: u64, expected: usize, got: usize },
+    InvalidLength {
+        typ: u64,
+        expected: usize,
+        got: usize,
+    },
     /// A UTF-8 field contained invalid bytes.
     InvalidUtf8 { typ: u64 },
     /// A required field was absent.
@@ -25,7 +29,10 @@ impl core::fmt::Display for TlvError {
                 write!(f, "unknown critical TLV type {t:#x}")
             }
             TlvError::InvalidLength { typ, expected, got } => {
-                write!(f, "TLV type {typ:#x}: expected length {expected}, got {got}")
+                write!(
+                    f,
+                    "TLV type {typ:#x}: expected length {expected}, got {got}"
+                )
             }
             TlvError::InvalidUtf8 { typ } => {
                 write!(f, "TLV type {typ:#x} contains invalid UTF-8")

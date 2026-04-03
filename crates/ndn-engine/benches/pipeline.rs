@@ -13,10 +13,10 @@ use std::sync::Arc;
 use bytes::Bytes;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
-use ndn_packet::{Name, NameComponent};
 use ndn_packet::encode::{encode_data_unsigned, encode_interest};
+use ndn_packet::{Name, NameComponent};
 use ndn_pipeline::{Action, DecodedPacket, PacketContext};
-use ndn_store::{CsMeta, ContentStore, LruCs, Pit, PitToken};
+use ndn_store::{ContentStore, CsMeta, LruCs, Pit, PitToken};
 use ndn_transport::FaceId;
 
 use ndn_engine::Fib;
@@ -56,7 +56,10 @@ fn data_wire(n_components: usize) -> Bytes {
 
 /// Extract decoded name from wire Interest bytes.
 fn decoded_name(wire: &Bytes) -> Arc<Name> {
-    ndn_packet::Interest::decode(wire.clone()).unwrap().name.clone()
+    ndn_packet::Interest::decode(wire.clone())
+        .unwrap()
+        .name
+        .clone()
 }
 
 fn ctx(raw: Bytes) -> PacketContext {
@@ -113,13 +116,11 @@ fn bench_cs_lookup(c: &mut Criterion) {
     let n = decoded_name(&interest_wire(4));
 
     // Pre-populate for hit benchmark.
-    rt.block_on(cs.insert(
-        wire.clone(),
-        n.clone(),
-        CsMeta { stale_at: u64::MAX },
-    ));
+    rt.block_on(cs.insert(wire.clone(), n.clone(), CsMeta { stale_at: u64::MAX }));
 
-    let stage = CsLookupStage { cs: Arc::clone(&cs) };
+    let stage = CsLookupStage {
+        cs: Arc::clone(&cs),
+    };
 
     let mut group = c.benchmark_group("cs");
 
@@ -181,7 +182,9 @@ fn bench_pit_check(c: &mut Criterion) {
     // Aggregation — second Interest with different nonce hits existing entry.
     group.bench_function("aggregate", |b| {
         let pit = Arc::new(Pit::new());
-        let stage = PitCheckStage { pit: Arc::clone(&pit) };
+        let stage = PitCheckStage {
+            pit: Arc::clone(&pit),
+        };
 
         // Seed the PIT with one entry.
         let wire = interest_wire(4);
@@ -336,48 +339,48 @@ fn bench_interest_pipeline(c: &mut Criterion) {
         let wire = interest_wire(n);
         group.throughput(Throughput::Bytes(wire.len() as u64));
 
-        group.bench_with_input(
-            BenchmarkId::new("no_route", n),
-            &wire,
-            |b, wire| {
-                let cs = Arc::new(LruCs::new(64 * 1024 * 1024));
-                let pit = Arc::new(Pit::new());
+        group.bench_with_input(BenchmarkId::new("no_route", n), &wire, |b, wire| {
+            let cs = Arc::new(LruCs::new(64 * 1024 * 1024));
+            let pit = Arc::new(Pit::new());
 
-                let decode = TlvDecodeStage;
-                let cs_lookup = CsLookupStage { cs: Arc::clone(&cs) };
-                let pit_check = PitCheckStage { pit: Arc::clone(&pit) };
+            let decode = TlvDecodeStage;
+            let cs_lookup = CsLookupStage {
+                cs: Arc::clone(&cs),
+            };
+            let pit_check = PitCheckStage {
+                pit: Arc::clone(&pit),
+            };
 
-                b.iter(|| {
-                    rt.block_on(async {
-                        // Fresh PIT per iteration to always get new-entry path.
-                        pit.clear();
+            b.iter(|| {
+                rt.block_on(async {
+                    // Fresh PIT per iteration to always get new-entry path.
+                    pit.clear();
 
-                        let c = ctx(wire.clone());
+                    let c = ctx(wire.clone());
 
-                        // Decode
-                        let c = match decode.process(c) {
-                            Action::Continue(c) => c,
-                            _ => panic!("decode failed"),
-                        };
+                    // Decode
+                    let c = match decode.process(c) {
+                        Action::Continue(c) => c,
+                        _ => panic!("decode failed"),
+                    };
 
-                        // CS lookup (miss)
-                        let c = match cs_lookup.process(c).await {
-                            Action::Continue(c) => c,
-                            _ => panic!("unexpected CS hit"),
-                        };
+                    // CS lookup (miss)
+                    let c = match cs_lookup.process(c).await {
+                        Action::Continue(c) => c,
+                        _ => panic!("unexpected CS hit"),
+                    };
 
-                        // PIT check (new entry)
-                        let _c = match pit_check.process(c) {
-                            Action::Continue(c) => c,
-                            _ => panic!("unexpected PIT result"),
-                        };
+                    // PIT check (new entry)
+                    let _c = match pit_check.process(c) {
+                        Action::Continue(c) => c,
+                        _ => panic!("unexpected PIT result"),
+                    };
 
-                        // Strategy would run here but requires full wiring;
-                        // we stop at PIT to isolate pipeline overhead.
-                    });
+                    // Strategy would run here but requires full wiring;
+                    // we stop at PIT to isolate pipeline overhead.
                 });
-            },
-        );
+            });
+        });
     }
 
     group.finish();
@@ -392,14 +395,12 @@ fn bench_interest_cs_hit(c: &mut Criterion) {
     // Pre-populate CS with data matching the Interest.
     let data_bytes = data_wire(4);
     let data = ndn_packet::Data::decode(data_bytes.clone()).unwrap();
-    rt.block_on(cs.insert(
-        data_bytes,
-        data.name.clone(),
-        CsMeta { stale_at: u64::MAX },
-    ));
+    rt.block_on(cs.insert(data_bytes, data.name.clone(), CsMeta { stale_at: u64::MAX }));
 
     let decode = TlvDecodeStage;
-    let cs_lookup = CsLookupStage { cs: Arc::clone(&cs) };
+    let cs_lookup = CsLookupStage {
+        cs: Arc::clone(&cs),
+    };
 
     let wire = interest_wire(4);
 
@@ -437,7 +438,9 @@ fn bench_data_pipeline(c: &mut Criterion) {
                 let cs = Arc::new(LruCs::new(64 * 1024 * 1024));
                 let pit = Arc::new(Pit::new());
                 let decode = TlvDecodeStage;
-                let pit_match = PitMatchStage { pit: Arc::clone(&pit) };
+                let pit_match = PitMatchStage {
+                    pit: Arc::clone(&pit),
+                };
                 let cs_insert = CsInsertStage {
                     cs: Arc::clone(&cs),
                     admission: Arc::new(ndn_store::AdmitAllPolicy),
@@ -446,7 +449,8 @@ fn bench_data_pipeline(c: &mut Criterion) {
                 b.iter(|| {
                     rt.block_on(async {
                         // Seed PIT with matching Interest.
-                        let interest = ndn_packet::Interest::decode(interest_bytes.clone()).unwrap();
+                        let interest =
+                            ndn_packet::Interest::decode(interest_bytes.clone()).unwrap();
                         let token = PitToken::from_interest_full(
                             &interest.name,
                             Some(interest.selectors()),
@@ -495,19 +499,15 @@ fn bench_decode_throughput(c: &mut Criterion) {
         let wire = interest_wire(n_comp);
         group.throughput(Throughput::Elements(N));
 
-        group.bench_with_input(
-            BenchmarkId::from_parameter(n_comp),
-            &wire,
-            |b, wire| {
-                let stage = TlvDecodeStage;
-                b.iter(|| {
-                    for _ in 0..N {
-                        let action = stage.process(ctx(wire.clone()));
-                        debug_assert!(matches!(action, Action::Continue(_)));
-                    }
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::from_parameter(n_comp), &wire, |b, wire| {
+            let stage = TlvDecodeStage;
+            b.iter(|| {
+                for _ in 0..N {
+                    let action = stage.process(ctx(wire.clone()));
+                    debug_assert!(matches!(action, Action::Continue(_)));
+                }
+            });
+        });
     }
 
     group.finish();

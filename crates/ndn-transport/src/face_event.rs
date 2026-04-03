@@ -29,7 +29,7 @@ mod tests {
     #[test]
     fn face_id_accessor() {
         let opened = FaceEvent::Opened(FaceId(3));
-        let closed  = FaceEvent::Closed(FaceId(7));
+        let closed = FaceEvent::Closed(FaceId(7));
         assert_eq!(opened.face_id(), FaceId(3));
         assert_eq!(closed.face_id(), FaceId(7));
     }

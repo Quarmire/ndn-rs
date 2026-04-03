@@ -62,16 +62,18 @@ pub const DEFAULT_CAPACITY: u32 = 256;
 pub const DEFAULT_SLOT_SIZE: u32 = 8960;
 
 // Cache-line–aligned offsets for the four ring index atomics.
-const OFF_A2E_TAIL:   usize = 64;   // app writes (producer)
-const OFF_A2E_HEAD:   usize = 128;  // engine writes (consumer)
-const OFF_E2A_TAIL:   usize = 192;  // engine writes (producer)
-const OFF_E2A_HEAD:   usize = 256;  // app writes (consumer)
+const OFF_A2E_TAIL: usize = 64; // app writes (producer)
+const OFF_A2E_HEAD: usize = 128; // engine writes (consumer)
+const OFF_E2A_TAIL: usize = 192; // engine writes (producer)
+const OFF_E2A_HEAD: usize = 256; // app writes (consumer)
 // Parked flags: consumer sets to 1 before sleeping, clears on wake.
-const OFF_A2E_PARKED: usize = 320;  // engine (a2e consumer) parked flag
-const OFF_E2A_PARKED: usize = 384;  // app (e2a consumer) parked flag
-const HEADER_SIZE:    usize = 448;  // 7 × 64-byte cache lines
+const OFF_A2E_PARKED: usize = 320; // engine (a2e consumer) parked flag
+const OFF_E2A_PARKED: usize = 384; // app (e2a consumer) parked flag
+const HEADER_SIZE: usize = 448; // 7 × 64-byte cache lines
 
-fn slot_stride(slot_size: u32) -> usize { 4 + slot_size as usize }
+fn slot_stride(slot_size: u32) -> usize {
+    4 + slot_size as usize
+}
 
 /// Number of spin-loop iterations before falling through to the pipe
 /// wakeup path.  64 iterations ≈ sub-µs
@@ -83,14 +85,18 @@ fn shm_total_size(capacity: u32, slot_size: u32) -> usize {
     HEADER_SIZE + 2 * capacity as usize * slot_stride(slot_size)
 }
 
-fn a2e_ring_offset() -> usize { HEADER_SIZE }
+fn a2e_ring_offset() -> usize {
+    HEADER_SIZE
+}
 fn e2a_ring_offset(capacity: u32, slot_size: u32) -> usize {
     HEADER_SIZE + capacity as usize * slot_stride(slot_size)
 }
 
 // ─── Path helpers ─────────────────────────────────────────────────────────────
 
-fn posix_shm_name(name: &str) -> String { format!("/ndn-shm-{name}") }
+fn posix_shm_name(name: &str) -> String {
+    format!("/ndn-shm-{name}")
+}
 
 /// Path of the FIFO the *engine* reads from (app writes to wake engine).
 fn a2e_pipe_path(name: &str) -> PathBuf {
@@ -106,8 +112,8 @@ fn e2a_pipe_path(name: &str) -> PathBuf {
 
 /// Owns a POSIX SHM mapping. The creator unlinks the name on drop.
 struct ShmRegion {
-    ptr:      *mut u8,
-    size:     usize,
+    ptr: *mut u8,
+    size: usize,
     /// Present when this process created the region; drives shm_unlink on drop.
     shm_name: Option<CString>,
 }
@@ -128,7 +134,9 @@ impl ShmRegion {
                 // unique per app instance, limiting exposure.
                 0o666 as libc::mode_t as libc::c_uint,
             );
-            if fd == -1 { return Err(ShmError::Io(std::io::Error::last_os_error())); }
+            if fd == -1 {
+                return Err(ShmError::Io(std::io::Error::last_os_error()));
+            }
 
             if libc::ftruncate(fd, size as libc::off_t) == -1 {
                 libc::close(fd);
@@ -136,9 +144,12 @@ impl ShmRegion {
             }
 
             let p = libc::mmap(
-                std::ptr::null_mut(), size,
+                std::ptr::null_mut(),
+                size,
                 libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED, fd, 0,
+                libc::MAP_SHARED,
+                fd,
+                0,
             );
             libc::close(fd);
             if p == libc::MAP_FAILED {
@@ -146,7 +157,11 @@ impl ShmRegion {
             }
             p as *mut u8
         };
-        Ok(ShmRegion { ptr, size, shm_name: Some(cname) })
+        Ok(ShmRegion {
+            ptr,
+            size,
+            shm_name: Some(cname),
+        })
     }
 
     /// Open an existing named SHM region created by `ShmRegion::create`.
@@ -154,12 +169,17 @@ impl ShmRegion {
         let cname = CString::new(shm_name).map_err(|_| ShmError::InvalidName)?;
         let ptr = unsafe {
             let fd = libc::shm_open(cname.as_ptr(), libc::O_RDWR, 0);
-            if fd == -1 { return Err(ShmError::Io(std::io::Error::last_os_error())); }
+            if fd == -1 {
+                return Err(ShmError::Io(std::io::Error::last_os_error()));
+            }
 
             let p = libc::mmap(
-                std::ptr::null_mut(), size,
+                std::ptr::null_mut(),
+                size,
                 libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED, fd, 0,
+                libc::MAP_SHARED,
+                fd,
+                0,
             );
             libc::close(fd);
             if p == libc::MAP_FAILED {
@@ -167,10 +187,16 @@ impl ShmRegion {
             }
             p as *mut u8
         };
-        Ok(ShmRegion { ptr, size, shm_name: None })
+        Ok(ShmRegion {
+            ptr,
+            size,
+            shm_name: None,
+        })
     }
 
-    fn as_ptr(&self) -> *mut u8 { self.ptr }
+    fn as_ptr(&self) -> *mut u8 {
+        self.ptr
+    }
 
     /// Write the header fields (magic, capacity, slot_size).
     ///
@@ -192,9 +218,11 @@ impl ShmRegion {
     /// The region must have been initialised by `write_header`.
     unsafe fn read_header(&self) -> Result<(u32, u32), ShmError> {
         unsafe {
-            let magic     = (self.ptr as *const u64).read_unaligned();
-            if magic != MAGIC { return Err(ShmError::InvalidMagic); }
-            let capacity  = (self.ptr.add(8)  as *const u32).read_unaligned();
+            let magic = (self.ptr as *const u64).read_unaligned();
+            if magic != MAGIC {
+                return Err(ShmError::InvalidMagic);
+            }
+            let capacity = (self.ptr.add(8) as *const u32).read_unaligned();
             let slot_size = (self.ptr.add(12) as *const u32).read_unaligned();
             Ok((capacity, slot_size))
         }
@@ -221,9 +249,12 @@ impl Drop for ShmRegion {
 /// `base` must be a valid, exclusively-written SHM mapping of sufficient size.
 /// `data.len() <= slot_size` must hold.
 unsafe fn ring_push(
-    base: *mut u8, ring_off: usize,
-    tail_off: usize, head_off: usize,
-    capacity: u32, slot_size: u32,
+    base: *mut u8,
+    ring_off: usize,
+    tail_off: usize,
+    head_off: usize,
+    capacity: u32,
+    slot_size: u32,
     data: &[u8],
 ) -> bool {
     debug_assert!(data.len() <= slot_size as usize);
@@ -233,9 +264,11 @@ unsafe fn ring_push(
 
     let t = tail_a.load(Ordering::Relaxed);
     let h = head_a.load(Ordering::Acquire);
-    if t.wrapping_sub(h) >= capacity { return false; }
+    if t.wrapping_sub(h) >= capacity {
+        return false;
+    }
 
-    let idx  = (t % capacity) as usize;
+    let idx = (t % capacity) as usize;
     let slot = unsafe { base.add(ring_off + idx * slot_stride(slot_size)) };
 
     unsafe {
@@ -251,26 +284,29 @@ unsafe fn ring_push(
 /// # Safety
 /// Same as [`ring_push`].
 unsafe fn ring_pop(
-    base: *mut u8, ring_off: usize,
-    tail_off: usize, head_off: usize,
-    capacity: u32, slot_size: u32,
+    base: *mut u8,
+    ring_off: usize,
+    tail_off: usize,
+    head_off: usize,
+    capacity: u32,
+    slot_size: u32,
 ) -> Option<Bytes> {
     let tail_a = unsafe { &*AtomicU32::from_ptr(base.add(tail_off) as *mut u32) };
     let head_a = unsafe { &*AtomicU32::from_ptr(base.add(head_off) as *mut u32) };
 
     let h = head_a.load(Ordering::Relaxed);
     let t = tail_a.load(Ordering::Acquire);
-    if h == t { return None; }
+    if h == t {
+        return None;
+    }
 
-    let idx  = (h % capacity) as usize;
+    let idx = (h % capacity) as usize;
     let slot = unsafe { base.add(ring_off + idx * slot_stride(slot_size)) };
 
     let len = unsafe { (slot as *const u32).read_unaligned() as usize };
     // Clamp to prevent out-of-bounds read if SHM is corrupted.
     let len = len.min(slot_size as usize);
-    let data = unsafe {
-        Bytes::copy_from_slice(std::slice::from_raw_parts(slot.add(4), len))
-    };
+    let data = unsafe { Bytes::copy_from_slice(std::slice::from_raw_parts(slot.add(4), len)) };
 
     head_a.store(h.wrapping_add(1), Ordering::Release);
     Some(data)
@@ -286,10 +322,11 @@ unsafe fn ring_pop(
 /// occurs.
 fn open_fifo_rdwr(path: &std::path::Path) -> Result<std::os::unix::io::OwnedFd, ShmError> {
     use std::os::unix::io::{FromRawFd, OwnedFd};
-    let cpath = CString::new(path.to_str().unwrap_or(""))
-        .map_err(|_| ShmError::InvalidName)?;
+    let cpath = CString::new(path.to_str().unwrap_or("")).map_err(|_| ShmError::InvalidName)?;
     let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDWR | libc::O_NONBLOCK) };
-    if fd == -1 { return Err(ShmError::Io(std::io::Error::last_os_error())); }
+    if fd == -1 {
+        return Err(ShmError::Io(std::io::Error::last_os_error()));
+    }
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
@@ -304,11 +341,11 @@ async fn pipe_await(
         let mut guard = rx.readable().await?;
         let mut buf = [0u8; 64];
         let fd = rx.get_ref().as_raw_fd();
-        let n = unsafe {
-            libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
-        };
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
         guard.clear_ready();
-        if n > 0 { return Ok(()); }
+        if n > 0 {
+            return Ok(());
+        }
         if n == 0 {
             // EOF — peer closed their end.
             return Err(std::io::Error::new(
@@ -332,7 +369,9 @@ async fn pipe_await(
 fn pipe_write(tx: &std::os::unix::io::OwnedFd) {
     use std::os::unix::io::AsRawFd;
     let b = [1u8];
-    unsafe { libc::write(tx.as_raw_fd(), b.as_ptr() as *const libc::c_void, 1); }
+    unsafe {
+        libc::write(tx.as_raw_fd(), b.as_ptr() as *const libc::c_void, 1);
+    }
 }
 
 // ─── SpscFace (engine side) ───────────────────────────────────────────────────
@@ -343,16 +382,16 @@ fn pipe_write(tx: &std::os::unix::io::OwnedFd) {
 /// `ForwarderEngine::add_face`. Give the `name` to the application so it can
 /// call [`SpscHandle::connect`].
 pub struct SpscFace {
-    id:        FaceId,
-    shm:       ShmRegion,
-    capacity:  u32,
+    id: FaceId,
+    shm: ShmRegion,
+    capacity: u32,
     slot_size: u32,
-    a2e_off:   usize,
-    e2a_off:   usize,
+    a2e_off: usize,
+    e2a_off: usize,
     /// FIFO the engine awaits readability on (app writes here to wake engine).
-    a2e_rx:        tokio::io::unix::AsyncFd<std::os::unix::io::OwnedFd>,
+    a2e_rx: tokio::io::unix::AsyncFd<std::os::unix::io::OwnedFd>,
     /// FIFO the engine writes to (to wake the app).
-    e2a_tx:        std::os::unix::io::OwnedFd,
+    e2a_tx: std::os::unix::io::OwnedFd,
     /// Paths of the FIFOs created by the engine — removed on drop.
     a2e_pipe_path: PathBuf,
     e2a_pipe_path: PathBuf,
@@ -369,11 +408,16 @@ impl SpscFace {
 
     /// Create with explicit ring parameters.
     pub fn create_with(
-        id: FaceId, name: &str, capacity: u32, slot_size: u32,
+        id: FaceId,
+        name: &str,
+        capacity: u32,
+        slot_size: u32,
     ) -> Result<Self, ShmError> {
-        let size    = shm_total_size(capacity, slot_size);
-        let shm     = ShmRegion::create(&posix_shm_name(name), size)?;
-        unsafe { shm.write_header(capacity, slot_size); }
+        let size = shm_total_size(capacity, slot_size);
+        let shm = ShmRegion::create(&posix_shm_name(name), size)?;
+        unsafe {
+            shm.write_header(capacity, slot_size);
+        }
 
         let a2e_off = a2e_ring_offset();
         let e2a_off = e2a_ring_offset(capacity, slot_size);
@@ -389,8 +433,7 @@ impl SpscFace {
 
         // Create the named FIFOs.
         for p in [&a2e_path, &e2a_path] {
-            let cp = CString::new(p.to_str().unwrap_or(""))
-                .map_err(|_| ShmError::InvalidName)?;
+            let cp = CString::new(p.to_str().unwrap_or("")).map_err(|_| ShmError::InvalidName)?;
             if unsafe { libc::mkfifo(cp.as_ptr(), 0o600) } == -1 {
                 return Err(ShmError::Io(std::io::Error::last_os_error()));
             }
@@ -404,22 +447,43 @@ impl SpscFace {
         let e2a_tx = open_fifo_rdwr(&e2a_path)?;
 
         Ok(SpscFace {
-            id, shm, capacity, slot_size, a2e_off, e2a_off,
-            a2e_rx, e2a_tx, a2e_pipe_path: a2e_path, e2a_pipe_path: e2a_path,
+            id,
+            shm,
+            capacity,
+            slot_size,
+            a2e_off,
+            e2a_off,
+            a2e_rx,
+            e2a_tx,
+            a2e_pipe_path: a2e_path,
+            e2a_pipe_path: e2a_path,
         })
     }
 
     fn try_pop_a2e(&self) -> Option<Bytes> {
         unsafe {
-            ring_pop(self.shm.as_ptr(), self.a2e_off,
-                     OFF_A2E_TAIL, OFF_A2E_HEAD, self.capacity, self.slot_size)
+            ring_pop(
+                self.shm.as_ptr(),
+                self.a2e_off,
+                OFF_A2E_TAIL,
+                OFF_A2E_HEAD,
+                self.capacity,
+                self.slot_size,
+            )
         }
     }
 
     fn try_push_e2a(&self, data: &[u8]) -> bool {
         unsafe {
-            ring_push(self.shm.as_ptr(), self.e2a_off,
-                      OFF_E2A_TAIL, OFF_E2A_HEAD, self.capacity, self.slot_size, data)
+            ring_push(
+                self.shm.as_ptr(),
+                self.e2a_off,
+                OFF_E2A_TAIL,
+                OFF_E2A_HEAD,
+                self.capacity,
+                self.slot_size,
+                data,
+            )
         }
     }
 }
@@ -432,14 +496,17 @@ impl Drop for SpscFace {
 }
 
 impl Face for SpscFace {
-    fn id(&self)   -> FaceId   { self.id }
-    fn kind(&self) -> FaceKind { FaceKind::Shm }
+    fn id(&self) -> FaceId {
+        self.id
+    }
+    fn kind(&self) -> FaceKind {
+        FaceKind::Shm
+    }
 
     async fn recv(&self) -> Result<Bytes, FaceError> {
         // SAFETY: parked flag is within the mapped SHM region.
-        let parked = unsafe {
-            &*AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_A2E_PARKED) as *mut u32)
-        };
+        let parked =
+            unsafe { &*AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_A2E_PARKED) as *mut u32) };
         loop {
             if let Some(pkt) = self.try_pop_a2e() {
                 return Ok(pkt);
@@ -464,7 +531,8 @@ impl Face for SpscFace {
             }
 
             // Sleep until the app sends a wakeup via the FIFO.
-            pipe_await(&self.a2e_rx).await
+            pipe_await(&self.a2e_rx)
+                .await
                 .map_err(|_| FaceError::Closed)?;
 
             parked.store(0, Ordering::Relaxed);
@@ -479,12 +547,13 @@ impl Face for SpscFace {
             )));
         }
         // SAFETY: parked flag within mapped SHM region.
-        let parked = unsafe {
-            &*AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_E2A_PARKED) as *mut u32)
-        };
+        let parked =
+            unsafe { &*AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_E2A_PARKED) as *mut u32) };
         // Yield until there is space in the e2a ring (backpressure).
         loop {
-            if self.try_push_e2a(&pkt) { break; }
+            if self.try_push_e2a(&pkt) {
+                break;
+            }
             tokio::task::yield_now().await;
         }
         // Only send a wakeup if the app is actually sleeping.
@@ -506,11 +575,11 @@ impl Face for SpscFace {
 /// the router's control face disconnects (the O_RDWR FIFO trick means EOF
 /// detection alone is unreliable).
 pub struct SpscHandle {
-    shm:       ShmRegion,
-    capacity:  u32,
+    shm: ShmRegion,
+    capacity: u32,
     slot_size: u32,
-    a2e_off:   usize,
-    e2a_off:   usize,
+    a2e_off: usize,
+    e2a_off: usize,
     /// FIFO the app awaits readability on (engine writes here to wake app).
     e2a_rx: tokio::io::unix::AsyncFd<std::os::unix::io::OwnedFd>,
     /// FIFO the app writes to (to wake the engine).
@@ -528,10 +597,16 @@ impl SpscHandle {
         // Phase 1: open just the header to read capacity and slot_size.
         let (capacity, slot_size) = unsafe {
             let fd = libc::shm_open(cname.as_ptr(), libc::O_RDONLY, 0);
-            if fd == -1 { return Err(ShmError::Io(std::io::Error::last_os_error())); }
+            if fd == -1 {
+                return Err(ShmError::Io(std::io::Error::last_os_error()));
+            }
             let p = libc::mmap(
-                std::ptr::null_mut(), HEADER_SIZE,
-                libc::PROT_READ, libc::MAP_SHARED, fd, 0,
+                std::ptr::null_mut(),
+                HEADER_SIZE,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                fd,
+                0,
             );
             libc::close(fd);
             if p == libc::MAP_FAILED {
@@ -543,7 +618,7 @@ impl SpscHandle {
                 libc::munmap(p, HEADER_SIZE);
                 return Err(ShmError::InvalidMagic);
             }
-            let cap  = (base.add(8)  as *const u32).read_unaligned();
+            let cap = (base.add(8) as *const u32).read_unaligned();
             let slen = (base.add(12) as *const u32).read_unaligned();
             libc::munmap(p, HEADER_SIZE);
             (cap, slen)
@@ -551,7 +626,7 @@ impl SpscHandle {
 
         // Phase 2: open the full region read-write.
         let size = shm_total_size(capacity, slot_size);
-        let shm  = ShmRegion::open(&shm_name_str, size)?;
+        let shm = ShmRegion::open(&shm_name_str, size)?;
         unsafe { shm.read_header()? };
 
         let a2e_off = a2e_ring_offset();
@@ -559,8 +634,8 @@ impl SpscHandle {
 
         use tokio::io::unix::AsyncFd;
 
-        let a2e_path = a2e_pipe_path(name);  // app writes here to wake engine
-        let e2a_path = e2a_pipe_path(name);  // app reads here (engine wakes app)
+        let a2e_path = a2e_pipe_path(name); // app writes here to wake engine
+        let e2a_path = e2a_pipe_path(name); // app reads here (engine wakes app)
 
         // App writes to a2e FIFO (to wake engine).
         let a2e_tx = open_fifo_rdwr(&a2e_path)?;
@@ -570,7 +645,13 @@ impl SpscHandle {
         let e2a_rx = AsyncFd::new(e2a_fd).map_err(ShmError::Io)?;
 
         Ok(SpscHandle {
-            shm, capacity, slot_size, a2e_off, e2a_off, e2a_rx, a2e_tx,
+            shm,
+            capacity,
+            slot_size,
+            a2e_off,
+            e2a_off,
+            e2a_rx,
+            a2e_tx,
             cancel: tokio_util::sync::CancellationToken::new(),
         })
     }
@@ -584,15 +665,28 @@ impl SpscHandle {
 
     fn try_push_a2e(&self, data: &[u8]) -> bool {
         unsafe {
-            ring_push(self.shm.as_ptr(), self.a2e_off,
-                      OFF_A2E_TAIL, OFF_A2E_HEAD, self.capacity, self.slot_size, data)
+            ring_push(
+                self.shm.as_ptr(),
+                self.a2e_off,
+                OFF_A2E_TAIL,
+                OFF_A2E_HEAD,
+                self.capacity,
+                self.slot_size,
+                data,
+            )
         }
     }
 
     fn try_pop_e2a(&self) -> Option<Bytes> {
         unsafe {
-            ring_pop(self.shm.as_ptr(), self.e2a_off,
-                     OFF_E2A_TAIL, OFF_E2A_HEAD, self.capacity, self.slot_size)
+            ring_pop(
+                self.shm.as_ptr(),
+                self.e2a_off,
+                OFF_E2A_TAIL,
+                OFF_E2A_HEAD,
+                self.capacity,
+                self.slot_size,
+            )
         }
     }
 
@@ -613,12 +707,13 @@ impl SpscHandle {
             return Err(ShmError::PacketTooLarge);
         }
         // SAFETY: parked flag within mapped SHM region.
-        let parked = unsafe {
-            &*AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_A2E_PARKED) as *mut u32)
-        };
+        let parked =
+            unsafe { &*AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_A2E_PARKED) as *mut u32) };
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            if self.try_push_a2e(&pkt) { break; }
+            if self.try_push_a2e(&pkt) {
+                break;
+            }
             if self.cancel.is_cancelled() {
                 return Err(ShmError::Closed);
             }
@@ -639,11 +734,12 @@ impl SpscHandle {
     /// Returns `None` when the engine face has been dropped or the
     /// cancellation token fires.
     pub async fn recv(&self) -> Option<Bytes> {
-        if self.cancel.is_cancelled() { return None; }
+        if self.cancel.is_cancelled() {
+            return None;
+        }
         // SAFETY: parked flag within mapped SHM region.
-        let parked = unsafe {
-            &*AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_E2A_PARKED) as *mut u32)
-        };
+        let parked =
+            unsafe { &*AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_E2A_PARKED) as *mut u32) };
         loop {
             if let Some(pkt) = self.try_pop_e2a() {
                 return Some(pkt);
@@ -706,42 +802,42 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn app_to_engine_roundtrip() {
-        let name   = format!("{}-ae", test_name());
-        let face   = SpscFace::create(FaceId(1), &name).unwrap();
+        let name = format!("{}-ae", test_name());
+        let face = SpscFace::create(FaceId(1), &name).unwrap();
         let handle = SpscHandle::connect(&name).unwrap();
 
         let pkt = Bytes::from_static(b"\x05\x03\x01\x02\x03");
         handle.send(pkt.clone()).await.unwrap();
 
-        let received = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            face.recv(),
-        ).await.expect("timed out").unwrap();
+        let received = tokio::time::timeout(std::time::Duration::from_secs(2), face.recv())
+            .await
+            .expect("timed out")
+            .unwrap();
 
         assert_eq!(received, pkt);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn engine_to_app_roundtrip() {
-        let name   = format!("{}-ea", test_name());
-        let face   = SpscFace::create(FaceId(2), &name).unwrap();
+        let name = format!("{}-ea", test_name());
+        let face = SpscFace::create(FaceId(2), &name).unwrap();
         let handle = SpscHandle::connect(&name).unwrap();
 
         let pkt = Bytes::from_static(b"\x06\x03\xAA\xBB\xCC");
         face.send(pkt.clone()).await.unwrap();
 
-        let received = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            handle.recv(),
-        ).await.expect("timed out").unwrap();
+        let received = tokio::time::timeout(std::time::Duration::from_secs(2), handle.recv())
+            .await
+            .expect("timed out")
+            .unwrap();
 
         assert_eq!(received, pkt);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn multiple_packets_both_directions() {
-        let name   = format!("{}-bi", test_name());
-        let face   = SpscFace::create(FaceId(3), &name).unwrap();
+        let name = format!("{}-bi", test_name());
+        let face = SpscFace::create(FaceId(3), &name).unwrap();
         let handle = SpscHandle::connect(&name).unwrap();
 
         // App → Engine: 4 packets

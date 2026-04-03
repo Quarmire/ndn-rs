@@ -47,12 +47,14 @@ impl<S: Send + Sync + 'static + ?Sized> Default for StrategyTable<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndn_packet::NameComponent;
     use bytes::Bytes;
+    use ndn_packet::NameComponent;
 
     fn name(components: &[&str]) -> Name {
         Name::from_components(
-            components.iter().map(|s| NameComponent::generic(Bytes::copy_from_slice(s.as_bytes())))
+            components
+                .iter()
+                .map(|s| NameComponent::generic(Bytes::copy_from_slice(s.as_bytes()))),
         )
     }
 
@@ -76,7 +78,7 @@ mod tests {
     #[test]
     fn lpm_most_specific_wins() {
         let table: StrategyTable<MockStrategy> = StrategyTable::new();
-        table.insert(&name(&["a"]),      Arc::new(MockStrategy(10)));
+        table.insert(&name(&["a"]), Arc::new(MockStrategy(10)));
         table.insert(&name(&["a", "b"]), Arc::new(MockStrategy(20)));
         let s = table.lpm(&name(&["a", "b", "c"])).unwrap();
         assert_eq!(s.0, 20);

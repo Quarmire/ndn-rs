@@ -10,7 +10,7 @@ pub const NDN_DEFAULT_SEGMENT_SIZE: usize = 8192;
 /// Each segment is identified by its zero-based index; the total segment count
 /// is available via `segment_count()` for FinalBlockId encoding.
 pub struct ChunkedProducer {
-    prefix:   Name,
+    prefix: Name,
     segments: Vec<Bytes>,
 }
 
@@ -44,9 +44,9 @@ impl ChunkedProducer {
 /// Segments may arrive out of order; `receive_segment` inserts each one by
 /// index. `reassemble` returns `Some(Bytes)` once all segments are present.
 pub struct ChunkedConsumer {
-    prefix:        Name,
+    prefix: Name,
     segment_count: usize,
-    received:      Vec<Option<Bytes>>,
+    received: Vec<Option<Bytes>>,
 }
 
 impl ChunkedConsumer {
@@ -84,7 +84,9 @@ impl ChunkedConsumer {
         if !self.is_complete() {
             return None;
         }
-        let total: usize = self.received.iter()
+        let total: usize = self
+            .received
+            .iter()
             .filter_map(Option::as_ref)
             .map(Bytes::len)
             .sum();
@@ -100,7 +102,9 @@ impl ChunkedConsumer {
 mod tests {
     use super::*;
 
-    fn prefix() -> Name { Name::root() }
+    fn prefix() -> Name {
+        Name::root()
+    }
 
     #[test]
     fn producer_single_segment() {

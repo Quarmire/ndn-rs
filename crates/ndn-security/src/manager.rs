@@ -5,10 +5,10 @@ use ndn_packet::{Name, tlv_type};
 use ndn_tlv::TlvWriter;
 
 use crate::{
-    cert_cache::{Certificate, CertCache},
+    TrustError,
+    cert_cache::{CertCache, Certificate},
     key_store::MemKeyStore,
     signer::{Ed25519Signer, Signer},
-    TrustError,
 };
 
 /// High-level NDN security manager.
@@ -22,18 +22,18 @@ use crate::{
 ///
 /// For production use, replace `MemKeyStore` with a file-backed store.
 pub struct SecurityManager {
-    keys:       MemKeyStore,
+    keys: MemKeyStore,
     cert_cache: CertCache,
     /// Trust anchors — self-signed certs that are implicitly trusted.
-    anchors:    dashmap::DashMap<Arc<Name>, Certificate>,
+    anchors: dashmap::DashMap<Arc<Name>, Certificate>,
 }
 
 impl SecurityManager {
     pub fn new() -> Self {
         Self {
-            keys:       MemKeyStore::new(),
+            keys: MemKeyStore::new(),
             cert_cache: CertCache::new(),
-            anchors:    dashmap::DashMap::new(),
+            anchors: dashmap::DashMap::new(),
         }
     }
 
@@ -84,13 +84,14 @@ impl SecurityManager {
             now_ns + validity_ms * 1_000_000
         };
         let cert = Certificate {
-            name:        Arc::new(key_name.clone()),
-            public_key:  public_key_bytes,
-            valid_from:  now_ns,
+            name: Arc::new(key_name.clone()),
+            public_key: public_key_bytes,
+            valid_from: now_ns,
             valid_until,
         };
         self.cert_cache.insert(cert.clone());
-        self.anchors.insert(Arc::new(key_name.clone()), cert.clone());
+        self.anchors
+            .insert(Arc::new(key_name.clone()), cert.clone());
         Ok(cert)
     }
 
@@ -120,12 +121,13 @@ impl SecurityManager {
             issuer_signer.as_ref(),
             now_ns,
             valid_until,
-        ).await?;
+        )
+        .await?;
 
         let cert = Certificate {
-            name:        Arc::new(subject_key_name.clone()),
-            public_key:  subject_public_key,
-            valid_from:  now_ns,
+            name: Arc::new(subject_key_name.clone()),
+            public_key: subject_public_key,
+            valid_from: now_ns,
             valid_until,
         };
         self.cert_cache.insert(cert.clone());
@@ -175,10 +177,7 @@ impl SecurityManager {
     /// - Loads all trust anchors stored in the PIB.
     ///
     /// [`FilePib`]: crate::pib::FilePib
-    pub fn from_pib(
-        pib: &crate::pib::FilePib,
-        identity: &Name,
-    ) -> Result<Self, TrustError> {
+    pub fn from_pib(pib: &crate::pib::FilePib, identity: &Name) -> Result<Self, TrustError> {
         let mgr = SecurityManager::new();
 
         // Load the signing key.
@@ -200,7 +199,9 @@ impl SecurityManager {
 }
 
 impl Default for SecurityManager {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Encode the signed region of an NDN certificate Data packet and sign it.
@@ -223,8 +224,8 @@ async fn encode_cert_data(
 ) -> Result<Bytes, TrustError> {
     // NDN certificate validity period TLV types.
     const VALIDITY_PERIOD: u64 = 0xFD;
-    const NOT_BEFORE: u64      = 0xFE;
-    const NOT_AFTER: u64       = 0xFF;
+    const NOT_BEFORE: u64 = 0xFE;
+    const NOT_AFTER: u64 = 0xFF;
 
     // Build the signed region: Name + MetaInfo + Content + SignatureInfo.
     let mut signed = TlvWriter::new();
@@ -331,9 +332,9 @@ mod tests {
         let mgr = SecurityManager::new();
         let kn = key_name("ta");
         let cert = Certificate {
-            name:        Arc::new(kn.clone()),
-            public_key:  Bytes::from_static(&[1u8; 32]),
-            valid_from:  0,
+            name: Arc::new(kn.clone()),
+            public_key: Bytes::from_static(&[1u8; 32]),
+            valid_from: 0,
             valid_until: u64::MAX,
         };
         mgr.add_trust_anchor(cert.clone());
@@ -348,9 +349,9 @@ mod tests {
         let kn2 = key_name("b");
         for kn in [&kn1, &kn2] {
             mgr.add_trust_anchor(Certificate {
-                name:        Arc::new(kn.clone()),
-                public_key:  Bytes::from_static(&[0; 32]),
-                valid_from:  0,
+                name: Arc::new(kn.clone()),
+                public_key: Bytes::from_static(&[0; 32]),
+                valid_from: 0,
                 valid_until: u64::MAX,
             });
         }
@@ -385,12 +386,14 @@ mod tests {
         // Generate issuer (CA) key.
         let ca_name = key_name("ca");
         let ca_seed = [1u8; 32];
-        mgr.generate_ed25519_from_seed(ca_name.clone(), &ca_seed).unwrap();
+        mgr.generate_ed25519_from_seed(ca_name.clone(), &ca_seed)
+            .unwrap();
 
         // Generate subject key.
         let subj_name = key_name("subject");
         let subj_seed = [2u8; 32];
-        mgr.generate_ed25519_from_seed(subj_name.clone(), &subj_seed).unwrap();
+        mgr.generate_ed25519_from_seed(subj_name.clone(), &subj_seed)
+            .unwrap();
 
         let subj_pk = Bytes::copy_from_slice(
             &crate::signer::Ed25519Signer::from_seed(&subj_seed, subj_name.clone())

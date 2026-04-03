@@ -1,12 +1,12 @@
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use lru::LruCache;
 
 use ndn_packet::{Interest, Name};
 
-use crate::{CsCapacity, CsEntry, CsMeta, ContentStore, InsertResult, NameTrie};
+use crate::{ContentStore, CsCapacity, CsEntry, CsMeta, InsertResult, NameTrie};
 
 /// In-memory LRU content store, bounded by total byte capacity.
 ///
@@ -28,8 +28,8 @@ pub struct LruCs {
 }
 
 struct LruInner {
-    cache:         LruCache<Arc<Name>, CsEntry>,
-    prefix_index:  NameTrie<Arc<Name>>,
+    cache: LruCache<Arc<Name>, CsEntry>,
+    prefix_index: NameTrie<Arc<Name>>,
     current_bytes: usize,
 }
 
@@ -43,8 +43,8 @@ impl LruCs {
         let max_entries = NonZeroUsize::new(capacity_bytes.max(1)).unwrap();
         Self {
             inner: Mutex::new(LruInner {
-                cache:         LruCache::new(max_entries),
-                prefix_index:  NameTrie::new(),
+                cache: LruCache::new(max_entries),
+                prefix_index: NameTrie::new(),
                 current_bytes: 0,
             }),
             capacity_bytes,
@@ -82,14 +82,12 @@ impl ContentStore for LruCs {
         // its last name component. If so, strip it and look up by Data name,
         // then verify the digest against the cached wire bytes.
         let comps = interest.name.components();
-        let has_implicit_digest = !comps.is_empty()
-            && comps.last().unwrap().typ == ndn_packet::tlv_type::IMPLICIT_SHA256;
+        let has_implicit_digest =
+            !comps.is_empty() && comps.last().unwrap().typ == ndn_packet::tlv_type::IMPLICIT_SHA256;
 
         let entry = if has_implicit_digest {
             // Build the Data name (Interest name minus the digest component).
-            let data_name = Name::from_components(
-                comps[..comps.len() - 1].iter().cloned()
-            );
+            let data_name = Name::from_components(comps[..comps.len() - 1].iter().cloned());
             let candidate = inner.cache.get(&data_name)?.clone();
             // Verify the implicit digest matches.
             let expected_digest = &comps.last().unwrap().value;
@@ -111,12 +109,7 @@ impl ContentStore for LruCs {
         Some(entry)
     }
 
-    async fn insert(
-        &self,
-        data: Bytes,
-        name: Arc<Name>,
-        meta: CsMeta,
-    ) -> InsertResult {
+    async fn insert(&self, data: Bytes, name: Arc<Name>, meta: CsMeta) -> InsertResult {
         let entry_bytes = data.len();
         let mut inner = self.inner.lock().unwrap();
 
@@ -131,8 +124,7 @@ impl ContentStore for LruCs {
         // Evict LRU entries until there is room, keeping prefix_index in sync.
         while inner.current_bytes + entry_bytes > self.capacity_bytes {
             if let Some((evicted_name, evicted)) = inner.cache.pop_lru() {
-                inner.current_bytes =
-                    inner.current_bytes.saturating_sub(evicted.data.len());
+                inner.current_bytes = inner.current_bytes.saturating_sub(evicted.data.len());
                 inner.prefix_index.remove(&evicted_name);
                 self.entry_count.fetch_sub(1, Ordering::Relaxed);
             } else {
@@ -140,7 +132,11 @@ impl ContentStore for LruCs {
             }
         }
 
-        let entry = CsEntry { data, stale_at: meta.stale_at, name: name.clone() };
+        let entry = CsEntry {
+            data,
+            stale_at: meta.stale_at,
+            name: name.clone(),
+        };
         inner.cache.put(name.clone(), entry);
         inner.current_bytes += entry_bytes;
 
@@ -152,14 +148,17 @@ impl ContentStore for LruCs {
         if !was_present {
             self.entry_count.fetch_add(1, Ordering::Relaxed);
         }
-        if was_present { InsertResult::Replaced } else { InsertResult::Inserted }
+        if was_present {
+            InsertResult::Replaced
+        } else {
+            InsertResult::Inserted
+        }
     }
 
     async fn evict(&self, name: &Name) -> bool {
         let mut inner = self.inner.lock().unwrap();
         if let Some(evicted) = inner.cache.pop(name) {
-            inner.current_bytes =
-                inner.current_bytes.saturating_sub(evicted.data.len());
+            inner.current_bytes = inner.current_bytes.saturating_sub(evicted.data.len());
             inner.prefix_index.remove(name);
             self.entry_count.fetch_sub(1, Ordering::Relaxed);
             return true;
@@ -186,9 +185,9 @@ mod tests {
     use ndn_packet::{Interest, Name, NameComponent};
 
     fn arc_name(components: &[&str]) -> Arc<Name> {
-        Arc::new(Name::from_components(
-            components.iter().map(|s| NameComponent::generic(Bytes::copy_from_slice(s.as_bytes())))
-        ))
+        Arc::new(Name::from_components(components.iter().map(|s| {
+            NameComponent::generic(Bytes::copy_from_slice(s.as_bytes()))
+        })))
     }
 
     fn meta_fresh() -> CsMeta {
@@ -196,7 +195,7 @@ mod tests {
     }
 
     fn meta_stale() -> CsMeta {
-        CsMeta { stale_at: 0 }  // already stale
+        CsMeta { stale_at: 0 } // already stale
     }
 
     fn interest(components: &[&str]) -> Interest {
@@ -249,7 +248,8 @@ mod tests {
     async fn insert_then_get_returns_entry() {
         let cs = LruCs::new(65536);
         let name = arc_name(&["a", "b"]);
-        cs.insert(Bytes::from_static(b"data"), name.clone(), meta_fresh()).await;
+        cs.insert(Bytes::from_static(b"data"), name.clone(), meta_fresh())
+            .await;
         let entry = cs.get(&interest(&["a", "b"])).await.unwrap();
         assert_eq!(entry.data.as_ref(), b"data");
     }
@@ -257,7 +257,9 @@ mod tests {
     #[tokio::test]
     async fn insert_returns_inserted() {
         let cs = LruCs::new(65536);
-        let r = cs.insert(Bytes::from_static(b"x"), arc_name(&["a"]), meta_fresh()).await;
+        let r = cs
+            .insert(Bytes::from_static(b"x"), arc_name(&["a"]), meta_fresh())
+            .await;
         assert_eq!(r, InsertResult::Inserted);
     }
 
@@ -265,8 +267,11 @@ mod tests {
     async fn insert_replaces_existing() {
         let cs = LruCs::new(65536);
         let name = arc_name(&["a"]);
-        cs.insert(Bytes::from_static(b"old"), name.clone(), meta_fresh()).await;
-        let r = cs.insert(Bytes::from_static(b"new"), name.clone(), meta_fresh()).await;
+        cs.insert(Bytes::from_static(b"old"), name.clone(), meta_fresh())
+            .await;
+        let r = cs
+            .insert(Bytes::from_static(b"new"), name.clone(), meta_fresh())
+            .await;
         assert_eq!(r, InsertResult::Replaced);
         let entry = cs.get(&interest(&["a"])).await.unwrap();
         assert_eq!(entry.data.as_ref(), b"new");
@@ -277,21 +282,24 @@ mod tests {
     #[tokio::test]
     async fn must_be_fresh_rejects_stale_entry() {
         let cs = LruCs::new(65536);
-        cs.insert(Bytes::from_static(b"x"), arc_name(&["a"]), meta_stale()).await;
+        cs.insert(Bytes::from_static(b"x"), arc_name(&["a"]), meta_stale())
+            .await;
         assert!(cs.get(&interest_fresh(&["a"])).await.is_none());
     }
 
     #[tokio::test]
     async fn must_be_fresh_accepts_fresh_entry() {
         let cs = LruCs::new(65536);
-        cs.insert(Bytes::from_static(b"x"), arc_name(&["a"]), meta_fresh()).await;
+        cs.insert(Bytes::from_static(b"x"), arc_name(&["a"]), meta_fresh())
+            .await;
         assert!(cs.get(&interest_fresh(&["a"])).await.is_some());
     }
 
     #[tokio::test]
     async fn no_must_be_fresh_returns_stale_entry() {
         let cs = LruCs::new(65536);
-        cs.insert(Bytes::from_static(b"x"), arc_name(&["a"]), meta_stale()).await;
+        cs.insert(Bytes::from_static(b"x"), arc_name(&["a"]), meta_stale())
+            .await;
         // Without MustBeFresh the stale entry is still returned.
         assert!(cs.get(&interest(&["a"])).await.is_some());
     }
@@ -301,7 +309,12 @@ mod tests {
     #[tokio::test]
     async fn can_be_prefix_finds_longer_name() {
         let cs = LruCs::new(65536);
-        cs.insert(Bytes::from_static(b"v"), arc_name(&["a", "b", "1"]), meta_fresh()).await;
+        cs.insert(
+            Bytes::from_static(b"v"),
+            arc_name(&["a", "b", "1"]),
+            meta_fresh(),
+        )
+        .await;
         let entry = cs.get(&interest_can_be_prefix(&["a", "b"])).await;
         assert!(entry.is_some());
     }
@@ -309,7 +322,12 @@ mod tests {
     #[tokio::test]
     async fn can_be_prefix_miss_for_unrelated_name() {
         let cs = LruCs::new(65536);
-        cs.insert(Bytes::from_static(b"v"), arc_name(&["x", "y"]), meta_fresh()).await;
+        cs.insert(
+            Bytes::from_static(b"v"),
+            arc_name(&["x", "y"]),
+            meta_fresh(),
+        )
+        .await;
         assert!(cs.get(&interest_can_be_prefix(&["a", "b"])).await.is_none());
     }
 
@@ -319,7 +337,8 @@ mod tests {
     async fn evict_removes_entry() {
         let cs = LruCs::new(65536);
         let name = arc_name(&["a"]);
-        cs.insert(Bytes::from_static(b"x"), name.clone(), meta_fresh()).await;
+        cs.insert(Bytes::from_static(b"x"), name.clone(), meta_fresh())
+            .await;
         let removed = cs.evict(&name).await;
         assert!(removed);
         assert!(cs.get(&interest(&["a"])).await.is_none());
@@ -334,7 +353,12 @@ mod tests {
     #[tokio::test]
     async fn evict_removes_from_prefix_index() {
         let cs = LruCs::new(65536);
-        cs.insert(Bytes::from_static(b"x"), arc_name(&["a", "b"]), meta_fresh()).await;
+        cs.insert(
+            Bytes::from_static(b"x"),
+            arc_name(&["a", "b"]),
+            meta_fresh(),
+        )
+        .await;
         cs.evict(&arc_name(&["a", "b"])).await;
         // CanBePrefix should also miss now.
         assert!(cs.get(&interest_can_be_prefix(&["a"])).await.is_none());
@@ -352,10 +376,13 @@ mod tests {
     async fn lru_eviction_keeps_byte_count_bounded() {
         // Capacity = 20 bytes; each entry is 10 bytes → room for 2.
         let cs = LruCs::new(20);
-        cs.insert(Bytes::from(vec![0u8; 10]), arc_name(&["a"]), meta_fresh()).await;
-        cs.insert(Bytes::from(vec![0u8; 10]), arc_name(&["b"]), meta_fresh()).await;
+        cs.insert(Bytes::from(vec![0u8; 10]), arc_name(&["a"]), meta_fresh())
+            .await;
+        cs.insert(Bytes::from(vec![0u8; 10]), arc_name(&["b"]), meta_fresh())
+            .await;
         // Third insert evicts /a (LRU).
-        cs.insert(Bytes::from(vec![0u8; 10]), arc_name(&["c"]), meta_fresh()).await;
+        cs.insert(Bytes::from(vec![0u8; 10]), arc_name(&["c"]), meta_fresh())
+            .await;
         assert!(cs.get(&interest(&["a"])).await.is_none());
         assert!(cs.get(&interest(&["b"])).await.is_some());
         assert!(cs.get(&interest(&["c"])).await.is_some());
@@ -368,7 +395,8 @@ mod tests {
         let cs = LruCs::new(65536);
         let data_bytes = Bytes::from_static(b"wire-format-data");
         let name = arc_name(&["a", "b"]);
-        cs.insert(data_bytes.clone(), name.clone(), meta_fresh()).await;
+        cs.insert(data_bytes.clone(), name.clone(), meta_fresh())
+            .await;
 
         // Build an Interest whose name is /a/b/<implicit-digest>
         let digest = ring::digest::digest(&ring::digest::SHA256, &data_bytes);
@@ -386,7 +414,8 @@ mod tests {
     #[tokio::test]
     async fn implicit_digest_wrong_hash_misses() {
         let cs = LruCs::new(65536);
-        cs.insert(Bytes::from_static(b"data"), arc_name(&["a"]), meta_fresh()).await;
+        cs.insert(Bytes::from_static(b"data"), arc_name(&["a"]), meta_fresh())
+            .await;
 
         // Wrong digest
         let mut comps: Vec<NameComponent> = arc_name(&["a"]).components().to_vec();
@@ -401,10 +430,25 @@ mod tests {
     #[tokio::test]
     async fn lru_eviction_removes_from_prefix_index() {
         let cs = LruCs::new(20);
-        cs.insert(Bytes::from(vec![0u8; 10]), arc_name(&["a", "b"]), meta_fresh()).await;
-        cs.insert(Bytes::from(vec![0u8; 10]), arc_name(&["b", "c"]), meta_fresh()).await;
+        cs.insert(
+            Bytes::from(vec![0u8; 10]),
+            arc_name(&["a", "b"]),
+            meta_fresh(),
+        )
+        .await;
+        cs.insert(
+            Bytes::from(vec![0u8; 10]),
+            arc_name(&["b", "c"]),
+            meta_fresh(),
+        )
+        .await;
         // Third insert evicts /a/b.
-        cs.insert(Bytes::from(vec![0u8; 10]), arc_name(&["c", "d"]), meta_fresh()).await;
+        cs.insert(
+            Bytes::from(vec![0u8; 10]),
+            arc_name(&["c", "d"]),
+            meta_fresh(),
+        )
+        .await;
         // CanBePrefix for /a should now miss (evicted entry removed from index).
         assert!(cs.get(&interest_can_be_prefix(&["a"])).await.is_none());
     }

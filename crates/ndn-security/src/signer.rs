@@ -1,9 +1,9 @@
-use std::pin::Pin;
 use std::future::Future;
+use std::pin::Pin;
 
+use crate::TrustError;
 use bytes::Bytes;
 use ndn_packet::{Name, SignatureType};
-use crate::TrustError;
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -15,9 +15,13 @@ pub trait Signer: Send + Sync + 'static {
     fn sig_type(&self) -> SignatureType;
     fn key_name(&self) -> &Name;
     /// The certificate name to embed as a key locator in SignatureInfo, if any.
-    fn cert_name(&self) -> Option<&Name> { None }
+    fn cert_name(&self) -> Option<&Name> {
+        None
+    }
     /// Return the raw public key bytes, if available.
-    fn public_key(&self) -> Option<Bytes> { None }
+    fn public_key(&self) -> Option<Bytes> {
+        None
+    }
 
     fn sign<'a>(&'a self, region: &'a [u8]) -> BoxFuture<'a, Result<Bytes, TrustError>>;
 
@@ -26,15 +30,17 @@ pub trait Signer: Send + Sync + 'static {
     /// Signers whose work is pure CPU (Ed25519, HMAC) should override this.
     fn sign_sync(&self, region: &[u8]) -> Result<Bytes, TrustError> {
         let _ = region;
-        unimplemented!("sign_sync not implemented for this signer — override if signing is CPU-only")
+        unimplemented!(
+            "sign_sync not implemented for this signer — override if signing is CPU-only"
+        )
     }
 }
 
 /// Ed25519 signer using `ed25519-dalek`.
 pub struct Ed25519Signer {
     signing_key: ed25519_dalek::SigningKey,
-    key_name:    Name,
-    cert_name:   Option<Name>,
+    key_name: Name,
+    cert_name: Option<Name>,
 }
 
 impl Ed25519Signer {
@@ -43,7 +49,11 @@ impl Ed25519Signer {
         key_name: Name,
         cert_name: Option<Name>,
     ) -> Self {
-        Self { signing_key, key_name, cert_name }
+        Self {
+            signing_key,
+            key_name,
+            cert_name,
+        }
     }
 
     /// Construct from raw 32-byte seed bytes.
@@ -91,7 +101,7 @@ impl Signer for Ed25519Signer {
 /// Significantly faster than Ed25519 (~10x) since it only computes a keyed
 /// hash rather than elliptic curve math.
 pub struct HmacSha256Signer {
-    key:      ring::hmac::Key,
+    key: ring::hmac::Key,
     key_name: Name,
 }
 
@@ -130,7 +140,9 @@ mod tests {
     use ndn_packet::NameComponent;
 
     fn test_key_name() -> Name {
-        Name::from_components([NameComponent::generic(bytes::Bytes::from_static(b"testkey"))])
+        Name::from_components([NameComponent::generic(bytes::Bytes::from_static(
+            b"testkey",
+        ))])
     }
 
     #[tokio::test]
@@ -196,14 +208,20 @@ mod tests {
     fn hmac_deterministic() {
         let s1 = HmacSha256Signer::new(b"key", test_key_name());
         let s2 = HmacSha256Signer::new(b"key", test_key_name());
-        assert_eq!(s1.sign_sync(b"data").unwrap(), s2.sign_sync(b"data").unwrap());
+        assert_eq!(
+            s1.sign_sync(b"data").unwrap(),
+            s2.sign_sync(b"data").unwrap()
+        );
     }
 
     #[test]
     fn hmac_different_key_different_sig() {
         let s1 = HmacSha256Signer::new(b"key-a", test_key_name());
         let s2 = HmacSha256Signer::new(b"key-b", test_key_name());
-        assert_ne!(s1.sign_sync(b"data").unwrap(), s2.sign_sync(b"data").unwrap());
+        assert_ne!(
+            s1.sign_sync(b"data").unwrap(),
+            s2.sign_sync(b"data").unwrap()
+        );
     }
 
     #[tokio::test]

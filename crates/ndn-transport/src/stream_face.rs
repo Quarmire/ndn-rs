@@ -21,26 +21,26 @@ use crate::{Face, FaceError, FaceId, FaceKind};
 /// NDNLPv2 `LpPacket` framing before writing.  Network-facing transports (TCP,
 /// Serial) set this to `true`; local transports (Unix) set it to `false`.
 pub struct StreamFace<R, W, C: Clone> {
-    id:         FaceId,
-    kind:       FaceKind,
-    lp_encode:  bool,
+    id: FaceId,
+    kind: FaceKind,
+    lp_encode: bool,
     remote_uri: Option<String>,
-    local_uri:  Option<String>,
-    reader:     Mutex<FramedRead<R, C>>,
-    writer:     Mutex<FramedWrite<W, C>>,
+    local_uri: Option<String>,
+    reader: Mutex<FramedRead<R, C>>,
+    writer: Mutex<FramedWrite<W, C>>,
 }
 
 impl<R, W, C: Clone> StreamFace<R, W, C> {
     /// Create a new `StreamFace` from pre-split read/write halves.
     pub fn new(
-        id:         FaceId,
-        kind:       FaceKind,
-        lp_encode:  bool,
+        id: FaceId,
+        kind: FaceKind,
+        lp_encode: bool,
         remote_uri: Option<String>,
-        local_uri:  Option<String>,
-        reader:     R,
-        writer:     W,
-        codec:      C,
+        local_uri: Option<String>,
+        reader: R,
+        writer: W,
+        codec: C,
     ) -> Self {
         Self {
             id,
@@ -60,13 +60,24 @@ where
     W: AsyncWrite + Unpin + Send + Sync + 'static,
     C: Decoder<Item = Bytes, Error = std::io::Error>
         + Encoder<Bytes, Error = std::io::Error>
-        + Clone + Send + Sync + 'static,
+        + Clone
+        + Send
+        + Sync
+        + 'static,
 {
-    fn id(&self) -> FaceId { self.id }
-    fn kind(&self) -> FaceKind { self.kind }
+    fn id(&self) -> FaceId {
+        self.id
+    }
+    fn kind(&self) -> FaceKind {
+        self.kind
+    }
 
-    fn remote_uri(&self) -> Option<String> { self.remote_uri.clone() }
-    fn local_uri(&self) -> Option<String> { self.local_uri.clone() }
+    fn remote_uri(&self) -> Option<String> {
+        self.remote_uri.clone()
+    }
+    fn local_uri(&self) -> Option<String> {
+        self.local_uri.clone()
+    }
 
     async fn recv(&self) -> Result<Bytes, FaceError> {
         let mut reader = self.reader.lock().await;

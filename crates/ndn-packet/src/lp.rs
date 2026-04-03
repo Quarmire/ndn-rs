@@ -246,19 +246,31 @@ pub fn extract_acks(raw: &[u8]) -> (Option<u64>, smallvec::SmallVec<[u64; 8]>) {
     if raw.first() != Some(&0x64) {
         return (tx_seq, acks);
     }
-    let Some((_, type_len)) = ndn_tlv::read_varu64(raw).ok() else { return (tx_seq, acks) };
-    let Some((outer_len, len_len)) = ndn_tlv::read_varu64(&raw[type_len..]).ok() else { return (tx_seq, acks) };
+    let Some((_, type_len)) = ndn_tlv::read_varu64(raw).ok() else {
+        return (tx_seq, acks);
+    };
+    let Some((outer_len, len_len)) = ndn_tlv::read_varu64(&raw[type_len..]).ok() else {
+        return (tx_seq, acks);
+    };
     let header_len = type_len + len_len;
-    let Some(inner) = raw.get(header_len..header_len + outer_len as usize) else { return (tx_seq, acks) };
+    let Some(inner) = raw.get(header_len..header_len + outer_len as usize) else {
+        return (tx_seq, acks);
+    };
 
     let mut pos = 0;
     while pos < inner.len() {
-        let Some((t, tn)) = ndn_tlv::read_varu64(&inner[pos..]).ok() else { break };
+        let Some((t, tn)) = ndn_tlv::read_varu64(&inner[pos..]).ok() else {
+            break;
+        };
         pos += tn;
-        let Some((l, ln)) = ndn_tlv::read_varu64(&inner[pos..]).ok() else { break };
+        let Some((l, ln)) = ndn_tlv::read_varu64(&inner[pos..]).ok() else {
+            break;
+        };
         pos += ln;
         let l = l as usize;
-        if pos + l > inner.len() { break; }
+        if pos + l > inner.len() {
+            break;
+        }
         match t {
             0x51 => tx_seq = Some(decode_be_u64(&inner[pos..pos + l])),
             0x0344 => acks.push(decode_be_u64(&inner[pos..pos + l])),
@@ -280,12 +292,12 @@ pub fn is_lp_packet(raw: &[u8]) -> bool {
 /// (`FragCount > 1`).  Holds the minimum information needed for reassembly
 /// without parsing Nack, CongestionMark, or other LpPacket headers.
 pub struct FragmentHeader {
-    pub sequence:   u64,
+    pub sequence: u64,
     pub frag_index: u64,
     pub frag_count: u64,
     /// Byte range of the Fragment TLV value within the original raw buffer.
     pub frag_start: usize,
-    pub frag_end:   usize,
+    pub frag_end: usize,
 }
 
 /// Lightweight fragment extraction from an LpPacket.
@@ -323,18 +335,20 @@ pub fn extract_fragment(raw: &[u8]) -> Option<FragmentHeader> {
             return None;
         }
         match t {
-            0x51 => sequence   = Some(decode_be_u64(&inner[pos..pos + l])),
+            0x51 => sequence = Some(decode_be_u64(&inner[pos..pos + l])),
             0x52 => frag_index = Some(decode_be_u64(&inner[pos..pos + l])),
             0x53 => {
                 let c = decode_be_u64(&inner[pos..pos + l]);
-                if c <= 1 { return None; } // Not fragmented — let full decode handle it.
+                if c <= 1 {
+                    return None;
+                } // Not fragmented — let full decode handle it.
                 frag_count = Some(c);
             }
             0x50 => {
                 frag_start = header_len + (pos - 0) + 0;
                 // Adjust: frag_start relative to raw, not inner.
                 frag_start = header_len + pos;
-                frag_end   = frag_start + l;
+                frag_end = frag_start + l;
             }
             _ => {}
         }
@@ -342,7 +356,7 @@ pub fn extract_fragment(raw: &[u8]) -> Option<FragmentHeader> {
     }
 
     Some(FragmentHeader {
-        sequence:   sequence?,
+        sequence: sequence?,
         frag_index: frag_index?,
         frag_count: frag_count?,
         frag_start,
@@ -564,7 +578,10 @@ mod tests {
             assert_eq!(hdr.sequence, lp.sequence.unwrap());
             assert_eq!(hdr.frag_index, lp.frag_index.unwrap());
             assert_eq!(hdr.frag_count, lp.frag_count.unwrap());
-            assert_eq!(&frag_bytes[hdr.frag_start..hdr.frag_end], &lp.fragment.unwrap()[..]);
+            assert_eq!(
+                &frag_bytes[hdr.frag_start..hdr.frag_end],
+                &lp.fragment.unwrap()[..]
+            );
         }
     }
 

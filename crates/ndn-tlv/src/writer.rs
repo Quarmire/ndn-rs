@@ -9,11 +9,15 @@ pub struct TlvWriter {
 
 impl TlvWriter {
     pub fn new() -> Self {
-        Self { buf: BytesMut::new() }
+        Self {
+            buf: BytesMut::new(),
+        }
     }
 
     pub fn with_capacity(cap: usize) -> Self {
-        Self { buf: BytesMut::with_capacity(cap) }
+        Self {
+            buf: BytesMut::with_capacity(cap),
+        }
     }
 
     fn write_varu64_inner(&mut self, value: u64) {
@@ -148,8 +152,10 @@ mod tests {
         let mut r = TlvReader::new(bytes);
         let (t1, v1) = r.read_tlv().unwrap();
         let (t2, v2) = r.read_tlv().unwrap();
-        assert_eq!(t1, 0x07); assert_eq!(v1.as_ref(), b"name");
-        assert_eq!(t2, 0x15); assert_eq!(v2.as_ref(), b"content");
+        assert_eq!(t1, 0x07);
+        assert_eq!(v1.as_ref(), b"name");
+        assert_eq!(t2, 0x15);
+        assert_eq!(v2.as_ref(), b"content");
         assert!(r.is_empty());
     }
 
@@ -184,8 +190,10 @@ mod tests {
         let mut inner = TlvReader::new(val);
         let (t1, v1) = inner.read_tlv().unwrap();
         let (t2, v2) = inner.read_tlv().unwrap();
-        assert_eq!(t1, 0x08); assert_eq!(v1.as_ref(), b"foo");
-        assert_eq!(t2, 0x08); assert_eq!(v2.as_ref(), b"bar");
+        assert_eq!(t1, 0x08);
+        assert_eq!(v1.as_ref(), b"foo");
+        assert_eq!(t2, 0x08);
+        assert_eq!(v2.as_ref(), b"bar");
         assert!(inner.is_empty());
     }
 
@@ -200,11 +208,14 @@ mod tests {
         let bytes = w.finish();
 
         let mut r = TlvReader::new(bytes);
-        let (t0, v0) = r.read_tlv().unwrap(); assert_eq!(t0, 0x05);
+        let (t0, v0) = r.read_tlv().unwrap();
+        assert_eq!(t0, 0x05);
         let mut r1 = TlvReader::new(v0);
-        let (t1, v1) = r1.read_tlv().unwrap(); assert_eq!(t1, 0x07);
+        let (t1, v1) = r1.read_tlv().unwrap();
+        assert_eq!(t1, 0x07);
         let mut r2 = TlvReader::new(v1);
-        let (t2, v2) = r2.read_tlv().unwrap(); assert_eq!(t2, 0x08);
+        let (t2, v2) = r2.read_tlv().unwrap();
+        assert_eq!(t2, 0x08);
         assert_eq!(v2.as_ref(), b"test");
     }
 
@@ -212,16 +223,17 @@ mod tests {
 
     #[test]
     fn tlv_size_matches_write_tlv_output() {
-        let cases: &[(u64, &[u8])] = &[
-            (0x08, b"hello"),
-            (0x0320, &[0xAB, 0xCD]),
-            (0x21, &[]),
-        ];
+        let cases: &[(u64, &[u8])] = &[(0x08, b"hello"), (0x0320, &[0xAB, 0xCD]), (0x21, &[])];
         for &(typ, value) in cases {
             let mut w = TlvWriter::new();
             w.write_tlv(typ, value);
             let expected_size = tlv_size(typ, value.len());
-            assert_eq!(w.len(), expected_size, "typ={typ:#x} value_len={}", value.len());
+            assert_eq!(
+                w.len(),
+                expected_size,
+                "typ={typ:#x} value_len={}",
+                value.len()
+            );
         }
     }
 

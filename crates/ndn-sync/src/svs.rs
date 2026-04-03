@@ -9,7 +9,7 @@ use ndn_packet::Name;
 pub struct StateVectorEntry {
     /// Canonical string key for the node (typically its NDN name rendered as a URI).
     pub node: String,
-    pub seq:  u64,
+    pub seq: u64,
 }
 
 /// State Vector Sync (SVS).
@@ -23,7 +23,7 @@ pub struct StateVectorEntry {
 /// across the network without re-encoding `Name` objects on every merge.
 pub struct SvsNode {
     local_key: String,
-    vector:    RwLock<HashMap<String, u64>>,
+    vector: RwLock<HashMap<String, u64>>,
 }
 
 impl SvsNode {
@@ -33,7 +33,7 @@ impl SvsNode {
         map.insert(key.clone(), 0u64);
         Self {
             local_key: key,
-            vector:    RwLock::new(map),
+            vector: RwLock::new(map),
         }
     }
 
@@ -79,7 +79,10 @@ impl SvsNode {
             .read()
             .await
             .iter()
-            .map(|(k, &seq)| StateVectorEntry { node: k.clone(), seq })
+            .map(|(k, &seq)| StateVectorEntry {
+                node: k.clone(),
+                seq,
+            })
             .collect()
     }
 
@@ -153,10 +156,9 @@ mod tests {
     #[tokio::test]
     async fn merge_multiple_peers() {
         let node = SvsNode::new(&name("a"));
-        let gaps = node.merge(&[
-            ("b".to_string(), 2),
-            ("c".to_string(), 4),
-        ]).await;
+        let gaps = node
+            .merge(&[("b".to_string(), 2), ("c".to_string(), 4)])
+            .await;
         assert_eq!(gaps.len(), 2);
         assert_eq!(node.seq_for("b").await, 2);
         assert_eq!(node.seq_for("c").await, 4);

@@ -1,12 +1,12 @@
-use std::sync::Arc;
+use crate::TrustError;
 use dashmap::DashMap;
 use ndn_packet::{Data, Name};
-use crate::TrustError;
+use std::sync::Arc;
 
 /// A decoded NDN certificate (a signed Data packet with a public key payload).
 #[derive(Clone, Debug)]
 pub struct Certificate {
-    pub name:       Arc<Name>,
+    pub name: Arc<Name>,
     pub public_key: bytes::Bytes,
     pub valid_from: u64,
     pub valid_until: u64,
@@ -29,7 +29,9 @@ pub struct CertCache {
 
 impl CertCache {
     pub fn new() -> Self {
-        Self { local: DashMap::new() }
+        Self {
+            local: DashMap::new(),
+        }
     }
 
     pub fn get(&self, key_name: &Arc<Name>) -> Option<Certificate> {
@@ -42,5 +44,7 @@ impl CertCache {
 }
 
 impl Default for CertCache {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }

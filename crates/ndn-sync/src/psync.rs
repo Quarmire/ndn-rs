@@ -18,15 +18,14 @@ fn cell_hash(v: u64) -> u64 {
 /// produce the same xor_sum as a legitimate element.
 #[derive(Clone, Debug, Default)]
 struct IbfCell {
-    xor_sum:  u64,
+    xor_sum: u64,
     hash_sum: u64,
-    count:    i64,
+    count: i64,
 }
 
 impl IbfCell {
     fn is_pure(&self) -> bool {
-        (self.count == 1 || self.count == -1)
-            && cell_hash(self.xor_sum) == self.hash_sum
+        (self.count == 1 || self.count == -1) && cell_hash(self.xor_sum) == self.hash_sum
     }
 }
 
@@ -37,7 +36,7 @@ impl IbfCell {
 #[derive(Clone, Debug)]
 pub struct Ibf {
     cells: Vec<IbfCell>,
-    k:     usize,
+    k: usize,
 }
 
 impl Ibf {
@@ -45,7 +44,7 @@ impl Ibf {
     pub fn new(size: usize, k: usize) -> Self {
         Self {
             cells: vec![IbfCell::default(); size.max(1)],
-            k:     k.max(1),
+            k: k.max(1),
         }
     }
 
@@ -56,16 +55,24 @@ impl Ibf {
     pub fn from_cells(cells: Vec<(u64, u64, i64)>) -> Self {
         let k = 3; // default k
         Self {
-            cells: cells.into_iter().map(|(x, h, c)| IbfCell {
-                xor_sum: x, hash_sum: h, count: c,
-            }).collect(),
+            cells: cells
+                .into_iter()
+                .map(|(x, h, c)| IbfCell {
+                    xor_sum: x,
+                    hash_sum: h,
+                    count: c,
+                })
+                .collect(),
             k,
         }
     }
 
     /// Export cells as `(xor_sum, hash_sum, count)` tuples for wire encoding.
     pub fn cells(&self) -> Vec<(u64, u64, i64)> {
-        self.cells.iter().map(|c| (c.xor_sum, c.hash_sum, c.count)).collect()
+        self.cells
+            .iter()
+            .map(|c| (c.xor_sum, c.hash_sum, c.count))
+            .collect()
     }
 
     fn cell_indices(&self, value: u64) -> Vec<usize> {
@@ -86,9 +93,9 @@ impl Ibf {
     pub fn insert(&mut self, value: u64) {
         let ch = cell_hash(value);
         for idx in self.cell_indices(value) {
-            self.cells[idx].xor_sum  ^= value;
+            self.cells[idx].xor_sum ^= value;
             self.cells[idx].hash_sum ^= ch;
-            self.cells[idx].count    += 1;
+            self.cells[idx].count += 1;
         }
     }
 
@@ -96,9 +103,9 @@ impl Ibf {
     pub fn remove(&mut self, value: u64) {
         let ch = cell_hash(value);
         for idx in self.cell_indices(value) {
-            self.cells[idx].xor_sum  ^= value;
+            self.cells[idx].xor_sum ^= value;
             self.cells[idx].hash_sum ^= ch;
-            self.cells[idx].count    -= 1;
+            self.cells[idx].count -= 1;
         }
     }
 
@@ -108,9 +115,9 @@ impl Ibf {
     pub fn subtract(&self, other: &Ibf) -> Ibf {
         let mut result = self.clone();
         for (a, b) in result.cells.iter_mut().zip(&other.cells) {
-            a.xor_sum  ^= b.xor_sum;
+            a.xor_sum ^= b.xor_sum;
             a.hash_sum ^= b.hash_sum;
-            a.count    -= b.count;
+            a.count -= b.count;
         }
         result
     }
@@ -120,7 +127,7 @@ impl Ibf {
     /// Returns `Some((in_self_not_other, in_other_not_self))` on success, or
     /// `None` if the difference is too large for the IBF to decode.
     pub fn decode(&self) -> Option<(HashSet<u64>, HashSet<u64>)> {
-        let mut ibf  = self.clone();
+        let mut ibf = self.clone();
         let mut in_a = HashSet::new();
         let mut in_b = HashSet::new();
 
@@ -129,7 +136,7 @@ impl Ibf {
             let pure_idx = ibf.cells.iter().position(|c| c.is_pure());
             let Some(idx) = pure_idx else { break };
 
-            let val      = ibf.cells[idx].xor_sum;
+            let val = ibf.cells[idx].xor_sum;
             let positive = ibf.cells[idx].count == 1;
 
             if positive {
@@ -142,7 +149,11 @@ impl Ibf {
         }
 
         // Successful decode: all cells must be empty.
-        if ibf.cells.iter().all(|c| c.count == 0 && c.xor_sum == 0 && c.hash_sum == 0) {
+        if ibf
+            .cells
+            .iter()
+            .all(|c| c.count == 0 && c.xor_sum == 0 && c.hash_sum == 0)
+        {
             Some((in_a, in_b))
         } else {
             None
@@ -157,8 +168,8 @@ impl Ibf {
 /// call `decode()` to find which hashes each side is missing.
 pub struct PSyncNode {
     local_set: HashSet<u64>,
-    ibf_size:  usize,
-    ibf_k:     usize,
+    ibf_size: usize,
+    ibf_k: usize,
 }
 
 impl PSyncNode {
@@ -169,8 +180,8 @@ impl PSyncNode {
     pub fn new(ibf_size: usize) -> Self {
         Self {
             local_set: HashSet::new(),
-            ibf_size:  ibf_size.max(4),
-            ibf_k:     3,
+            ibf_size: ibf_size.max(4),
+            ibf_k: 3,
         }
     }
 
@@ -226,7 +237,11 @@ mod tests {
         let mut ibf = Ibf::new(16, 3);
         ibf.insert(42);
         ibf.remove(42);
-        assert!(ibf.cells.iter().all(|c| c.count == 0 && c.xor_sum == 0 && c.hash_sum == 0));
+        assert!(
+            ibf.cells
+                .iter()
+                .all(|c| c.count == 0 && c.xor_sum == 0 && c.hash_sum == 0)
+        );
     }
 
     #[test]
@@ -261,7 +276,7 @@ mod tests {
     #[test]
     fn reconcile_one_sided_difference() {
         let mut a = PSyncNode::new(64);
-        let b     = PSyncNode::new(64);
+        let b = PSyncNode::new(64);
         a.insert(999);
 
         let (a_has, b_has) = a.reconcile(&b.build_ibf()).unwrap();

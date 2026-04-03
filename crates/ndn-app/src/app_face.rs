@@ -23,10 +23,10 @@ pub struct AppFace {
 pub enum OutboundRequest {
     Interest {
         interest: Interest,
-        reply:    oneshot::Sender<Result<Data, AppError>>,
+        reply: oneshot::Sender<Result<Data, AppError>>,
     },
     RegisterPrefix {
-        prefix:  Arc<Name>,
+        prefix: Arc<Name>,
         handler: Box<dyn Fn(Interest) + Send + Sync + 'static>,
     },
 }
@@ -49,7 +49,10 @@ impl AppFace {
     pub async fn express(&self, interest: Interest) -> Result<Data, AppError> {
         let (tx, rx) = oneshot::channel();
         self.tx
-            .send(OutboundRequest::Interest { interest, reply: tx })
+            .send(OutboundRequest::Interest {
+                interest,
+                reply: tx,
+            })
             .await
             .map_err(|_| AppError::Engine(anyhow::anyhow!("engine shut down")))?;
         rx.await
@@ -63,7 +66,7 @@ impl AppFace {
     {
         self.tx
             .send(OutboundRequest::RegisterPrefix {
-                prefix:  Arc::new(prefix),
+                prefix: Arc::new(prefix),
                 handler: Box::new(handler),
             })
             .await
@@ -79,17 +82,28 @@ mod tests {
     use ndn_packet::NameComponent;
 
     fn make_interest(comp: &'static str) -> Interest {
-        let name = Name::from_components([
-            NameComponent::generic(Bytes::from_static(comp.as_bytes()))
-        ]);
+        let name =
+            Name::from_components([NameComponent::generic(Bytes::from_static(comp.as_bytes()))]);
         Interest::new(name)
     }
 
     fn make_data() -> Data {
         use ndn_tlv::TlvWriter;
-        let nc   = { let mut w = TlvWriter::new(); w.write_tlv(0x08, b"test"); w.finish() };
-        let name = { let mut w = TlvWriter::new(); w.write_tlv(0x07, &nc); w.finish() };
-        let pkt  = { let mut w = TlvWriter::new(); w.write_tlv(0x06, &name); w.finish() };
+        let nc = {
+            let mut w = TlvWriter::new();
+            w.write_tlv(0x08, b"test");
+            w.finish()
+        };
+        let name = {
+            let mut w = TlvWriter::new();
+            w.write_tlv(0x07, &nc);
+            w.finish()
+        };
+        let pkt = {
+            let mut w = TlvWriter::new();
+            w.write_tlv(0x06, &name);
+            w.finish()
+        };
         Data::decode(pkt).unwrap()
     }
 
@@ -103,9 +117,7 @@ mod tests {
     async fn express_sends_interest_to_receiver() {
         let (face, mut rx) = AppFace::new(FaceId(1), 8);
         let interest = make_interest("hello");
-        let task = tokio::spawn(async move {
-            face.express(interest).await
-        });
+        let task = tokio::spawn(async move { face.express(interest).await });
         // Engine side: receive the request and reply.
         if let Some(OutboundRequest::Interest { reply, .. }) = rx.recv().await {
             reply.send(Ok(make_data())).unwrap();
@@ -127,22 +139,28 @@ mod tests {
     async fn express_propagates_nack() {
         use ndn_packet::NackReason;
         let (face, mut rx) = AppFace::new(FaceId(1), 8);
-        let task = tokio::spawn(async move {
-            face.express(make_interest("x")).await
-        });
+        let task = tokio::spawn(async move { face.express(make_interest("x")).await });
         if let Some(OutboundRequest::Interest { reply, .. }) = rx.recv().await {
-            reply.send(Err(AppError::Nacked { reason: NackReason::NoRoute })).unwrap();
+            reply
+                .send(Err(AppError::Nacked {
+                    reason: NackReason::NoRoute,
+                }))
+                .unwrap();
         }
         let result = task.await.unwrap();
-        assert!(matches!(result, Err(AppError::Nacked { reason: NackReason::NoRoute })));
+        assert!(matches!(
+            result,
+            Err(AppError::Nacked {
+                reason: NackReason::NoRoute
+            })
+        ));
     }
 
     #[tokio::test]
     async fn register_prefix_sends_request() {
         let (face, mut rx) = AppFace::new(FaceId(1), 8);
-        let prefix = Name::from_components([
-            NameComponent::generic(Bytes::from_static(b"myprefix"))
-        ]);
+        let prefix =
+            Name::from_components([NameComponent::generic(Bytes::from_static(b"myprefix"))]);
         face.register_prefix(prefix.clone(), |_| {}).await.unwrap();
         if let Some(OutboundRequest::RegisterPrefix { prefix: p, .. }) = rx.recv().await {
             assert_eq!(*p, prefix);

@@ -5,10 +5,10 @@ use bytes::Bytes;
 
 use ndn_face_local::AppHandle;
 use ndn_ipc::RouterClient;
+use ndn_packet::encode::InterestBuilder;
 use ndn_packet::lp::{LpPacket, is_lp_packet};
 use ndn_packet::{Data, Name};
-use ndn_packet::encode::InterestBuilder;
-use ndn_security::{SafeData, Validator, ValidationResult};
+use ndn_security::{SafeData, ValidationResult, Validator};
 
 use crate::AppError;
 use crate::connection::NdnConnection;
@@ -31,14 +31,19 @@ pub struct Consumer {
 impl Consumer {
     /// Connect to an external router via its face socket.
     pub async fn connect(socket: impl AsRef<Path>) -> Result<Self, AppError> {
-        let client = RouterClient::connect(socket).await
+        let client = RouterClient::connect(socket)
+            .await
             .map_err(|e| AppError::Engine(e.into()))?;
-        Ok(Self { conn: NdnConnection::External(client) })
+        Ok(Self {
+            conn: NdnConnection::External(client),
+        })
     }
 
     /// Create from an in-process AppHandle (embedded engine).
     pub fn from_handle(handle: AppHandle) -> Self {
-        Self { conn: NdnConnection::Embedded(handle) }
+        Self {
+            conn: NdnConnection::Embedded(handle),
+        }
     }
 
     /// Express an Interest by name and return the decoded Data.
@@ -61,11 +66,7 @@ impl Consumer {
     ///
     /// Returns [`AppError::Nacked`] if the forwarder responds with a Nack
     /// (e.g. no route to the name prefix).
-    pub async fn fetch_wire(
-        &mut self,
-        wire: Bytes,
-        timeout: Duration,
-    ) -> Result<Data, AppError> {
+    pub async fn fetch_wire(&mut self, wire: Bytes, timeout: Duration) -> Result<Data, AppError> {
         self.conn.send(wire).await?;
 
         let reply = tokio::time::timeout(timeout, self.conn.recv())
@@ -81,14 +82,12 @@ impl Consumer {
                 }
                 // LpPacket without Nack — decode the fragment as Data.
                 if let Some(fragment) = lp.fragment {
-                    return Data::decode(fragment)
-                        .map_err(|e| AppError::Engine(e.into()));
+                    return Data::decode(fragment).map_err(|e| AppError::Engine(e.into()));
                 }
             }
         }
 
-        Data::decode(reply)
-            .map_err(|e| AppError::Engine(e.into()))
+        Data::decode(reply).map_err(|e| AppError::Engine(e.into()))
     }
 
     /// Fetch and verify against a `Validator`. Returns `SafeData` on success.
@@ -101,9 +100,9 @@ impl Consumer {
         match validator.validate(&data).await {
             ValidationResult::Valid(safe) => Ok(safe),
             ValidationResult::Invalid(e) => Err(AppError::Engine(e.into())),
-            ValidationResult::Pending => Err(AppError::Engine(
-                anyhow::anyhow!("certificate chain not resolved"),
-            )),
+            ValidationResult::Pending => Err(AppError::Engine(anyhow::anyhow!(
+                "certificate chain not resolved"
+            ))),
         }
     }
 

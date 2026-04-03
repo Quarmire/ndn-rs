@@ -36,7 +36,7 @@ fn make_tlv_pkt(size: usize) -> Bytes {
     use ndn_tlv::TlvWriter;
     // 1 byte type (0x05) + up to 3 bytes length for sizes ≤ 65535.
     let overhead = if size <= 130 { 2 } else { 3 };
-    let payload  = vec![0xAA_u8; size.saturating_sub(overhead)];
+    let payload = vec![0xAA_u8; size.saturating_sub(overhead)];
     let mut w = TlvWriter::new();
     w.write_tlv(0x05, &payload);
     w.finish()
@@ -152,7 +152,9 @@ fn bench_unix_latency(c: &mut Criterion) {
     }
 
     #[cfg(not(unix))]
-    { let _ = c; }
+    {
+        let _ = c;
+    }
 }
 
 /// Unidirectional throughput over a `UnixStream` socketpair.
@@ -203,7 +205,9 @@ fn bench_unix_throughput(c: &mut Criterion) {
     }
 
     #[cfg(not(unix))]
-    { let _ = c; }
+    {
+        let _ = c;
+    }
 }
 
 // ─── SpscFace ─────────────────────────────────────────────────────────────────
@@ -220,10 +224,13 @@ fn bench_spsc_latency(c: &mut Criterion) {
         let rt = current_thread_rt();
         let mut group = c.benchmark_group("spsc/latency");
 
-        for (&size, name) in [64_usize, 1_024, 8_192].iter().zip(["blt0", "blt1", "blt2"]) {
+        for (&size, name) in [64_usize, 1_024, 8_192]
+            .iter()
+            .zip(["blt0", "blt1", "blt2"])
+        {
             let pkt = make_pkt(size);
             let (face, handle) = rt.block_on(async {
-                let face   = SpscFace::create(FaceId(10), name).unwrap();
+                let face = SpscFace::create(FaceId(10), name).unwrap();
                 let handle = SpscHandle::connect(name).unwrap();
                 (face, handle)
             });
@@ -243,7 +250,9 @@ fn bench_spsc_latency(c: &mut Criterion) {
     }
 
     #[cfg(not(all(unix, feature = "spsc-shm")))]
-    { let _ = c; }
+    {
+        let _ = c;
+    }
 }
 
 /// Unidirectional throughput over the SPSC SHM ring.
@@ -260,10 +269,13 @@ fn bench_spsc_throughput(c: &mut Criterion) {
         let mut group = c.benchmark_group("spsc/throughput");
         group.throughput(Throughput::Elements(batch));
 
-        for (&size, name) in [64_usize, 1_024, 8_192].iter().zip(["bth0", "bth1", "bth2"]) {
+        for (&size, name) in [64_usize, 1_024, 8_192]
+            .iter()
+            .zip(["bth0", "bth1", "bth2"])
+        {
             let pkt = make_pkt(size);
             let (face, handle) = rt.block_on(async {
-                let face   = SpscFace::create(FaceId(11), name).unwrap();
+                let face = SpscFace::create(FaceId(11), name).unwrap();
                 let handle = SpscHandle::connect(name).unwrap();
                 (face, handle)
             });
@@ -285,12 +297,18 @@ fn bench_spsc_throughput(c: &mut Criterion) {
     }
 
     #[cfg(not(all(unix, feature = "spsc-shm")))]
-    { let _ = c; }
+    {
+        let _ = c;
+    }
 }
 
 // ─── Criterion wiring ─────────────────────────────────────────────────────────
 
-criterion_group!(appface_benches, bench_appface_latency, bench_appface_throughput);
-criterion_group!(unix_benches,    bench_unix_latency,    bench_unix_throughput);
-criterion_group!(spsc_benches,    bench_spsc_latency,    bench_spsc_throughput);
+criterion_group!(
+    appface_benches,
+    bench_appface_latency,
+    bench_appface_throughput
+);
+criterion_group!(unix_benches, bench_unix_latency, bench_unix_throughput);
+criterion_group!(spsc_benches, bench_spsc_latency, bench_spsc_throughput);
 criterion_main!(appface_benches, unix_benches, spsc_benches);

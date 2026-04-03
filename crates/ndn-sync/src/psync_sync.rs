@@ -77,7 +77,16 @@ pub fn join_psync_group(
 
     let task_cancel = cancel.clone();
     tokio::spawn(async move {
-        psync_task(group, send, recv, publish_rx, update_tx, config, task_cancel).await;
+        psync_task(
+            group,
+            send,
+            recv,
+            publish_rx,
+            update_tx,
+            config,
+            task_cancel,
+        )
+        .await;
     });
 
     SyncHandle::new(update_rx, publish_tx, cancel)
@@ -211,15 +220,21 @@ fn parse_sync_interest(group: &Name, raw: &[u8]) -> Option<Ibf> {
     let components = interest.name.components();
 
     let group_len = group.components().len();
-    if components.len() < group_len + 2 { return None; }
+    if components.len() < group_len + 2 {
+        return None;
+    }
 
     let psync_comp = &components[group_len];
-    if psync_comp.value.as_ref() != b"psync" { return None; }
+    if psync_comp.value.as_ref() != b"psync" {
+        return None;
+    }
 
     let ibf_comp = &components[group_len + 1];
     // Infer IBF size from the component length.
     let ibf_size = ibf_comp.value.len() / 24;
-    if ibf_size == 0 { return None; }
+    if ibf_size == 0 {
+        return None;
+    }
 
     decode_ibf(&ibf_comp.value, ibf_size)
 }

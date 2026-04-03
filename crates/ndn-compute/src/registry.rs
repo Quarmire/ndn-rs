@@ -1,6 +1,6 @@
-use std::sync::Arc;
 use ndn_packet::{Data, Interest, Name};
 use ndn_store::NameTrie;
+use std::sync::Arc;
 
 /// A handler function registered for a name prefix.
 ///
@@ -22,7 +22,7 @@ pub enum ComputeError {
 impl std::fmt::Display for ComputeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ComputeError::NotFound       => write!(f, "no compute handler for this name"),
+            ComputeError::NotFound => write!(f, "no compute handler for this name"),
             ComputeError::ComputeFailed(e) => write!(f, "compute failed: {e}"),
         }
     }
@@ -46,14 +46,17 @@ impl<H: ComputeHandler> ErasedHandler for H {
     fn compute_erased<'a>(
         &'a self,
         interest: &'a Interest,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Data, ComputeError>> + Send + 'a>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Data, ComputeError>> + Send + 'a>>
+    {
         Box::pin(self.compute(interest))
     }
 }
 
 impl ComputeRegistry {
     pub fn new() -> Self {
-        Self { handlers: NameTrie::new() }
+        Self {
+            handlers: NameTrie::new(),
+        }
     }
 
     pub fn register<H: ComputeHandler>(&self, prefix: &Name, handler: H) {
@@ -67,7 +70,9 @@ impl ComputeRegistry {
 }
 
 impl Default for ComputeRegistry {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]
@@ -79,9 +84,21 @@ mod tests {
 
     fn minimal_data() -> Data {
         // DATA > NAME > NAMECOMP("test")
-        let nc   = { let mut w = TlvWriter::new(); w.write_tlv(0x08, b"test"); w.finish() };
-        let name = { let mut w = TlvWriter::new(); w.write_tlv(0x07, &nc);    w.finish() };
-        let pkt  = { let mut w = TlvWriter::new(); w.write_tlv(0x06, &name); w.finish() };
+        let nc = {
+            let mut w = TlvWriter::new();
+            w.write_tlv(0x08, b"test");
+            w.finish()
+        };
+        let name = {
+            let mut w = TlvWriter::new();
+            w.write_tlv(0x07, &nc);
+            w.finish()
+        };
+        let pkt = {
+            let mut w = TlvWriter::new();
+            w.write_tlv(0x06, &name);
+            w.finish()
+        };
         Data::decode(pkt).unwrap()
     }
 
@@ -102,18 +119,16 @@ mod tests {
     }
 
     fn make_interest(comp: &'static str) -> Interest {
-        let name = Name::from_components([
-            NameComponent::generic(Bytes::from_static(comp.as_bytes()))
-        ]);
+        let name =
+            Name::from_components([NameComponent::generic(Bytes::from_static(comp.as_bytes()))]);
         Interest::new(name)
     }
 
     #[tokio::test]
     async fn dispatch_to_registered_handler() {
         let registry = ComputeRegistry::new();
-        let prefix = Name::from_components([
-            NameComponent::generic(Bytes::from_static(b"compute"))
-        ]);
+        let prefix =
+            Name::from_components([NameComponent::generic(Bytes::from_static(b"compute"))]);
         registry.register(&prefix, EchoHandler);
         let interest = make_interest("compute");
         let result = registry.dispatch(&interest).await;
@@ -131,9 +146,7 @@ mod tests {
     #[tokio::test]
     async fn dispatch_handler_error_propagates() {
         let registry = ComputeRegistry::new();
-        let prefix = Name::from_components([
-            NameComponent::generic(Bytes::from_static(b"fail"))
-        ]);
+        let prefix = Name::from_components([NameComponent::generic(Bytes::from_static(b"fail"))]);
         registry.register(&prefix, FailHandler);
         let interest = make_interest("fail");
         let result = registry.dispatch(&interest).await.unwrap();
@@ -143,6 +156,10 @@ mod tests {
     #[test]
     fn compute_error_display() {
         assert!(!ComputeError::NotFound.to_string().is_empty());
-        assert!(!ComputeError::ComputeFailed("x".into()).to_string().is_empty());
+        assert!(
+            !ComputeError::ComputeFailed("x".into())
+                .to_string()
+                .is_empty()
+        );
     }
 }

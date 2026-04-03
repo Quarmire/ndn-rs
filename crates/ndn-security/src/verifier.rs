@@ -1,5 +1,5 @@
-use std::pin::Pin;
 use std::future::Future;
+use std::pin::Pin;
 
 use crate::TrustError;
 
@@ -17,8 +17,8 @@ pub enum VerifyOutcome {
 pub trait Verifier: Send + Sync + 'static {
     fn verify<'a>(
         &'a self,
-        region:     &'a [u8],
-        sig_value:  &'a [u8],
+        region: &'a [u8],
+        sig_value: &'a [u8],
         public_key: &'a [u8],
     ) -> BoxFuture<'a, Result<VerifyOutcome, TrustError>>;
 }
@@ -29,16 +29,17 @@ pub struct Ed25519Verifier;
 impl Verifier for Ed25519Verifier {
     fn verify<'a>(
         &'a self,
-        region:     &'a [u8],
-        sig_value:  &'a [u8],
+        region: &'a [u8],
+        sig_value: &'a [u8],
         public_key: &'a [u8],
     ) -> BoxFuture<'a, Result<VerifyOutcome, TrustError>> {
         Box::pin(async move {
-            use ed25519_dalek::{Signature, VerifyingKey, Verifier as _};
+            use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
 
             let vk = VerifyingKey::from_bytes(
                 public_key.try_into().map_err(|_| TrustError::InvalidKey)?,
-            ).map_err(|_| TrustError::InvalidKey)?;
+            )
+            .map_err(|_| TrustError::InvalidKey)?;
 
             let sig_bytes: &[u8; 64] = sig_value
                 .try_into()
@@ -46,8 +47,8 @@ impl Verifier for Ed25519Verifier {
             let sig = Signature::from_bytes(sig_bytes);
 
             match vk.verify(region, &sig) {
-                Ok(())  => Ok(VerifyOutcome::Valid),
-                Err(_)  => Ok(VerifyOutcome::Invalid),
+                Ok(()) => Ok(VerifyOutcome::Valid),
+                Err(_) => Ok(VerifyOutcome::Invalid),
             }
         })
     }

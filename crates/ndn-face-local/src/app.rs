@@ -21,9 +21,9 @@ use ndn_transport::{Face, FaceError, FaceId, FaceKind};
 /// `Face` trait; the pipeline's single-consumer contract means it never
 /// actually contends.
 pub struct AppFace {
-    id:      FaceId,
+    id: FaceId,
     face_rx: Mutex<mpsc::Receiver<Bytes>>,
-    app_tx:  mpsc::Sender<Bytes>,
+    app_tx: mpsc::Sender<Bytes>,
 }
 
 /// Application-side handle to an `AppFace`.
@@ -35,27 +35,43 @@ pub struct AppFace {
 /// enabling shared ownership (e.g. concurrent send/recv from different tasks).
 pub struct AppHandle {
     face_tx: mpsc::Sender<Bytes>,
-    app_rx:  Mutex<mpsc::Receiver<Bytes>>,
+    app_rx: Mutex<mpsc::Receiver<Bytes>>,
 }
 
 impl AppFace {
     /// Create a linked (`AppFace`, `AppHandle`) pair with `buffer` slots each.
     pub fn new(id: FaceId, buffer: usize) -> (Self, AppHandle) {
         let (face_tx, face_rx) = mpsc::channel(buffer);
-        let (app_tx,  app_rx)  = mpsc::channel(buffer);
-        let face   = AppFace  { id, face_rx: Mutex::new(face_rx), app_tx };
-        let handle = AppHandle { face_tx, app_rx: Mutex::new(app_rx) };
+        let (app_tx, app_rx) = mpsc::channel(buffer);
+        let face = AppFace {
+            id,
+            face_rx: Mutex::new(face_rx),
+            app_tx,
+        };
+        let handle = AppHandle {
+            face_tx,
+            app_rx: Mutex::new(app_rx),
+        };
         (face, handle)
     }
 }
 
 impl Face for AppFace {
-    fn id(&self) -> FaceId { self.id }
-    fn kind(&self) -> FaceKind { FaceKind::App }
+    fn id(&self) -> FaceId {
+        self.id
+    }
+    fn kind(&self) -> FaceKind {
+        FaceKind::App
+    }
 
     /// Receive a packet sent by the application via `AppHandle::send`.
     async fn recv(&self) -> Result<Bytes, FaceError> {
-        self.face_rx.lock().await.recv().await.ok_or(FaceError::Closed)
+        self.face_rx
+            .lock()
+            .await
+            .recv()
+            .await
+            .ok_or(FaceError::Closed)
     }
 
     /// Forward a packet to the application (readable via `AppHandle::recv`).

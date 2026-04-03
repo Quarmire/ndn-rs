@@ -48,8 +48,12 @@ pub struct CsCapacity {
 }
 
 impl CsCapacity {
-    pub fn zero() -> Self { Self { max_bytes: 0 } }
-    pub fn bytes(n: usize) -> Self { Self { max_bytes: n } }
+    pub fn zero() -> Self {
+        Self { max_bytes: 0 }
+    }
+    pub fn bytes(n: usize) -> Self {
+        Self { max_bytes: n }
+    }
 }
 
 /// The ContentStore trait.
@@ -116,10 +120,16 @@ impl CsAdmissionPolicy for AdmitAllPolicy {
 pub struct NullCs;
 
 impl ContentStore for NullCs {
-    async fn get(&self, _: &Interest) -> Option<CsEntry> { None }
+    async fn get(&self, _: &Interest) -> Option<CsEntry> {
+        None
+    }
     async fn insert(&self, _: Bytes, _: std::sync::Arc<Name>, _: CsMeta) -> InsertResult {
         InsertResult::Skipped
     }
-    async fn evict(&self, _: &Name) -> bool { false }
-    fn capacity(&self) -> CsCapacity { CsCapacity::zero() }
+    async fn evict(&self, _: &Name) -> bool {
+        false
+    }
+    fn capacity(&self) -> CsCapacity {
+        CsCapacity::zero()
+    }
 }

@@ -56,7 +56,7 @@ enum DataTransport {
     /// High-performance shared-memory data plane.
     #[cfg(all(unix, feature = "spsc-shm"))]
     Shm {
-        handle:  ndn_face_local::shm::spsc::SpscHandle,
+        handle: ndn_face_local::shm::spsc::SpscHandle,
         face_id: u64,
     },
     /// Fallback: reuse the control UnixFace for data.
@@ -103,9 +103,8 @@ impl RouterClient {
         face_socket: impl AsRef<Path>,
         shm_name: Option<&str>,
     ) -> Result<Self, RouterError> {
-        let control = Arc::new(
-            ndn_face_local::unix_face_connect(FaceId(0), face_socket.as_ref()).await?
-        );
+        let control =
+            Arc::new(ndn_face_local::unix_face_connect(FaceId(0), face_socket.as_ref()).await?);
         let cancel = CancellationToken::new();
         let dead = Arc::new(AtomicBool::new(false));
 
@@ -150,8 +149,7 @@ impl RouterClient {
     ) -> Result<DataTransport, RouterError> {
         let mgmt = crate::mgmt_client::MgmtClient::from_face(Arc::clone(control));
         let resp = mgmt.face_create(&format!("shm://{shm_name}")).await?;
-        let face_id = resp.face_id
-            .ok_or(RouterError::MalformedResponse)?;
+        let face_id = resp.face_id.ok_or(RouterError::MalformedResponse)?;
 
         // Connect the app-side SHM handle with cancellation from control face.
         let mut handle = ndn_face_local::shm::spsc::SpscHandle::connect(shm_name)?;
@@ -192,12 +190,8 @@ impl RouterClient {
     pub async fn send(&self, pkt: Bytes) -> Result<(), RouterError> {
         match &self.transport {
             #[cfg(all(unix, feature = "spsc-shm"))]
-            DataTransport::Shm { handle, .. } => {
-                handle.send(pkt).await.map_err(RouterError::Shm)
-            }
-            DataTransport::Unix => {
-                self.control.send(pkt).await.map_err(RouterError::Face)
-            }
+            DataTransport::Shm { handle, .. } => handle.send(pkt).await.map_err(RouterError::Shm),
+            DataTransport::Unix => self.control.send(pkt).await.map_err(RouterError::Face),
         }
     }
 
@@ -207,9 +201,7 @@ impl RouterClient {
     pub async fn recv(&self) -> Option<Bytes> {
         match &self.transport {
             #[cfg(all(unix, feature = "spsc-shm"))]
-            DataTransport::Shm { handle, .. } => {
-                handle.recv().await
-            }
+            DataTransport::Shm { handle, .. } => handle.recv().await,
             DataTransport::Unix => {
                 let _guard = self.recv_lock.lock().await;
                 self.control.recv().await.ok()
@@ -236,11 +228,15 @@ impl RouterClient {
     ///
     /// Called lazily by applications that detect SHM stalls.
     pub async fn probe_alive(&self) -> bool {
-        if self.dead.load(Ordering::Relaxed) { return false; }
+        if self.dead.load(Ordering::Relaxed) {
+            return false;
+        }
         // Try sending a trivial Interest on the control face.
         // If the socket is closed, send will fail immediately.
         let probe = ndn_packet::encode::encode_interest(
-            &"/localhost/nfd/status/general".parse().expect("valid probe name"),
+            &"/localhost/nfd/status/general"
+                .parse()
+                .expect("valid probe name"),
             None,
         );
         match self.control.send(probe).await {

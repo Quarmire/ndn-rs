@@ -7,8 +7,8 @@ use tokio_util::sync::CancellationToken;
 use ndn_store::Pit;
 use ndn_transport::{FaceId, FaceKind, FacePersistency, FaceTable};
 
-use crate::engine::FaceState;
 use crate::Fib;
+use crate::engine::FaceState;
 
 /// Background task that drains expired PIT entries every millisecond.
 ///
@@ -41,9 +41,9 @@ const IDLE_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 /// Runs every 30 seconds until the cancellation token is cancelled.
 pub async fn run_idle_face_task(
     face_states: Arc<DashMap<FaceId, FaceState>>,
-    face_table:  Arc<FaceTable>,
-    fib:         Arc<Fib>,
-    cancel:      CancellationToken,
+    face_table: Arc<FaceTable>,
+    fib: Arc<Fib>,
+    cancel: CancellationToken,
 ) {
     loop {
         tokio::select! {
@@ -98,9 +98,9 @@ mod tests {
 
     #[tokio::test]
     async fn expiry_task_cancels_promptly() {
-        let pit    = Arc::new(Pit::new());
+        let pit = Arc::new(Pit::new());
         let cancel = CancellationToken::new();
-        let task   = tokio::spawn(run_expiry_task(pit, cancel.clone()));
+        let task = tokio::spawn(run_expiry_task(pit, cancel.clone()));
         cancel.cancel();
         tokio::time::timeout(Duration::from_millis(200), task)
             .await
@@ -110,9 +110,9 @@ mod tests {
 
     #[tokio::test]
     async fn expiry_task_runs_without_panic() {
-        let pit    = Arc::new(Pit::new());
+        let pit = Arc::new(Pit::new());
         let cancel = CancellationToken::new();
-        let task   = tokio::spawn(run_expiry_task(pit, cancel.clone()));
+        let task = tokio::spawn(run_expiry_task(pit, cancel.clone()));
         // Let a few ticks pass to ensure the loop body executes at least once.
         tokio::time::sleep(Duration::from_millis(5)).await;
         cancel.cancel();

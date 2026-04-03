@@ -9,15 +9,12 @@ pub enum ManagementRequest {
     /// Add a FIB route: `{"cmd":"add_route","prefix":"/ndn","face":1,"cost":10}`
     AddRoute {
         prefix: String,
-        face:   u32,
+        face: u32,
         #[serde(default = "default_cost")]
-        cost:   u32,
+        cost: u32,
     },
     /// Remove a FIB route: `{"cmd":"remove_route","prefix":"/ndn","face":1}`
-    RemoveRoute {
-        prefix: String,
-        face:   u32,
-    },
+    RemoveRoute { prefix: String, face: u32 },
     /// List all FIB routes.
     ListRoutes,
     /// List all registered faces.
@@ -37,7 +34,9 @@ pub enum ManagementResponse {
     Error { message: String },
 }
 
-fn default_cost() -> u32 { 10 }
+fn default_cost() -> u32 {
+    10
+}
 
 /// Unix-socket management server.
 ///
@@ -51,7 +50,9 @@ pub struct ManagementServer {
 impl ManagementServer {
     /// Create a new management server bound to `socket_path`.
     pub fn new(socket_path: impl Into<std::path::PathBuf>) -> Self {
-        Self { socket_path: socket_path.into() }
+        Self {
+            socket_path: socket_path.into(),
+        }
     }
 
     pub fn socket_path(&self) -> &std::path::Path {
@@ -65,9 +66,8 @@ impl ManagementServer {
 
     /// Encode a management response to a JSON string.
     pub fn encode_response(resp: &ManagementResponse) -> String {
-        serde_json::to_string(resp).unwrap_or_else(|_| {
-            r#"{"status":"error","message":"serialization failed"}"#.to_owned()
-        })
+        serde_json::to_string(resp)
+            .unwrap_or_else(|_| r#"{"status":"error","message":"serialization failed"}"#.to_owned())
     }
 }
 
@@ -79,7 +79,9 @@ mod tests {
     fn decode_add_route() {
         let json = r#"{"cmd":"add_route","prefix":"/ndn","face":1,"cost":20}"#;
         let req = ManagementServer::decode_request(json).unwrap();
-        assert!(matches!(req, ManagementRequest::AddRoute { prefix, face: 1, cost: 20 } if prefix == "/ndn"));
+        assert!(
+            matches!(req, ManagementRequest::AddRoute { prefix, face: 1, cost: 20 } if prefix == "/ndn")
+        );
     }
 
     #[test]
@@ -93,7 +95,10 @@ mod tests {
     fn decode_remove_route() {
         let json = r#"{"cmd":"remove_route","prefix":"/ndn","face":2}"#;
         let req = ManagementServer::decode_request(json).unwrap();
-        assert!(matches!(req, ManagementRequest::RemoveRoute { face: 2, .. }));
+        assert!(matches!(
+            req,
+            ManagementRequest::RemoveRoute { face: 2, .. }
+        ));
     }
 
     #[test]
@@ -137,6 +142,9 @@ mod tests {
     #[test]
     fn management_server_stores_path() {
         let srv = ManagementServer::new("/tmp/ndn-mgmt.sock");
-        assert_eq!(srv.socket_path(), std::path::Path::new("/tmp/ndn-mgmt.sock"));
+        assert_eq!(
+            srv.socket_path(),
+            std::path::Path::new("/tmp/ndn-mgmt.sock")
+        );
     }
 }

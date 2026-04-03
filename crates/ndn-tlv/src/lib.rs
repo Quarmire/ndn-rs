@@ -47,8 +47,7 @@ pub fn read_varu64(buf: &[u8]) -> Result<(u64, usize), TlvError> {
                 return Err(TlvError::UnexpectedEof);
             }
             let v = u64::from_be_bytes([
-                buf[1], buf[2], buf[3], buf[4],
-                buf[5], buf[6], buf[7], buf[8],
+                buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8],
             ]);
             if v < 0x1_0000_0000 {
                 return Err(TlvError::NonMinimalVarNumber);
@@ -81,10 +80,15 @@ pub fn write_varu64(buf: &mut [u8], value: u64) -> usize {
 
 /// Returns the number of bytes needed to encode `value` as a varint.
 pub fn varu64_size(value: u64) -> usize {
-    if value < 253 { 1 }
-    else if value < 0x1_0000 { 3 }
-    else if value < 0x1_0000_0000 { 5 }
-    else { 9 }
+    if value < 253 {
+        1
+    } else if value < 0x1_0000 {
+        3
+    } else if value < 0x1_0000_0000 {
+        5
+    } else {
+        9
+    }
 }
 
 #[cfg(test)]
@@ -95,14 +99,14 @@ mod tests {
 
     #[test]
     fn varu64_size_boundaries() {
-        assert_eq!(varu64_size(0),              1);
-        assert_eq!(varu64_size(252),            1);
-        assert_eq!(varu64_size(253),            3);
-        assert_eq!(varu64_size(0xFFFF),         3);
-        assert_eq!(varu64_size(0x1_0000),       5);
-        assert_eq!(varu64_size(0xFFFF_FFFF),    5);
-        assert_eq!(varu64_size(0x1_0000_0000),  9);
-        assert_eq!(varu64_size(u64::MAX),       9);
+        assert_eq!(varu64_size(0), 1);
+        assert_eq!(varu64_size(252), 1);
+        assert_eq!(varu64_size(253), 3);
+        assert_eq!(varu64_size(0xFFFF), 3);
+        assert_eq!(varu64_size(0x1_0000), 5);
+        assert_eq!(varu64_size(0xFFFF_FFFF), 5);
+        assert_eq!(varu64_size(0x1_0000_0000), 9);
+        assert_eq!(varu64_size(u64::MAX), 9);
     }
 
     // ── write_varu64 / read_varu64 round-trips ─────────────────────────────────
@@ -156,25 +160,36 @@ mod tests {
 
     #[test]
     fn read_varu64_eof_truncated_5byte() {
-        assert_eq!(read_varu64(&[0xFE, 0x00, 0x01, 0x00]), Err(TlvError::UnexpectedEof));
+        assert_eq!(
+            read_varu64(&[0xFE, 0x00, 0x01, 0x00]),
+            Err(TlvError::UnexpectedEof)
+        );
     }
 
     #[test]
     fn read_varu64_eof_truncated_9byte() {
-        assert_eq!(read_varu64(&[0xFF, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00]),
-                   Err(TlvError::UnexpectedEof));
+        assert_eq!(
+            read_varu64(&[0xFF, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00]),
+            Err(TlvError::UnexpectedEof)
+        );
     }
 
     #[test]
     fn read_varu64_rejects_non_minimal_3byte() {
         // 0xFD marker but value 100 (< 253) — should use 1-byte form.
-        assert_eq!(read_varu64(&[0xFD, 0x00, 0x64]), Err(TlvError::NonMinimalVarNumber));
+        assert_eq!(
+            read_varu64(&[0xFD, 0x00, 0x64]),
+            Err(TlvError::NonMinimalVarNumber)
+        );
     }
 
     #[test]
     fn read_varu64_rejects_non_minimal_5byte() {
         // 0xFE marker but value 0x00FF (< 0x10000) — should use 3-byte form.
-        assert_eq!(read_varu64(&[0xFE, 0x00, 0x00, 0x00, 0xFF]), Err(TlvError::NonMinimalVarNumber));
+        assert_eq!(
+            read_varu64(&[0xFE, 0x00, 0x00, 0x00, 0xFF]),
+            Err(TlvError::NonMinimalVarNumber)
+        );
     }
 
     #[test]

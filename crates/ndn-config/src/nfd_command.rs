@@ -21,9 +21,9 @@ pub const NFD_PREFIX: &[&[u8]] = &[b"localhost", b"nfd"];
 /// Management module names.
 pub mod module {
     pub const FACES: &[u8] = b"faces";
-    pub const FIB:   &[u8] = b"fib";
-    pub const RIB:   &[u8] = b"rib";
-    pub const CS:    &[u8] = b"cs";
+    pub const FIB: &[u8] = b"fib";
+    pub const RIB: &[u8] = b"rib";
+    pub const CS: &[u8] = b"cs";
     pub const STRATEGY: &[u8] = b"strategy-choice";
     pub const STATUS: &[u8] = b"status";
 }
@@ -31,26 +31,26 @@ pub mod module {
 /// Command verbs per module.
 pub mod verb {
     // faces
-    pub const CREATE:  &[u8] = b"create";
-    pub const UPDATE:  &[u8] = b"update";
+    pub const CREATE: &[u8] = b"create";
+    pub const UPDATE: &[u8] = b"update";
     pub const DESTROY: &[u8] = b"destroy";
-    pub const LIST:    &[u8] = b"list";
+    pub const LIST: &[u8] = b"list";
 
     // fib
-    pub const ADD_NEXTHOP:    &[u8] = b"add-nexthop";
+    pub const ADD_NEXTHOP: &[u8] = b"add-nexthop";
     pub const REMOVE_NEXTHOP: &[u8] = b"remove-nexthop";
 
     // rib
-    pub const REGISTER:   &[u8] = b"register";
+    pub const REGISTER: &[u8] = b"register";
     pub const UNREGISTER: &[u8] = b"unregister";
 
     // strategy-choice
-    pub const SET:   &[u8] = b"set";
+    pub const SET: &[u8] = b"set";
     pub const UNSET: &[u8] = b"unset";
 
     // cs
     pub const CONFIG: &[u8] = b"config";
-    pub const INFO:   &[u8] = b"info";
+    pub const INFO: &[u8] = b"info";
 }
 
 // ─── Name builder ────────────────────────────────────────────────────────────
@@ -87,7 +87,7 @@ pub fn dataset_name(module: &[u8], verb: &[u8]) -> Name {
 #[derive(Debug)]
 pub struct ParsedCommand {
     pub module: Bytes,
-    pub verb:   Bytes,
+    pub verb: Bytes,
     pub params: Option<ControlParameters>,
 }
 
@@ -118,7 +118,11 @@ pub fn parse_command_name(name: &Name) -> Option<ParsedCommand> {
         None
     };
 
-    Some(ParsedCommand { module, verb, params })
+    Some(ParsedCommand {
+        module,
+        verb,
+        params,
+    })
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -130,9 +134,9 @@ mod tests {
     #[test]
     fn command_name_structure() {
         let params = ControlParameters {
-            name: Some(Name::from_components([
-                NameComponent::generic(Bytes::from_static(b"test")),
-            ])),
+            name: Some(Name::from_components([NameComponent::generic(
+                Bytes::from_static(b"test"),
+            )])),
             cost: Some(10),
             ..Default::default()
         };

@@ -1,7 +1,7 @@
-use std::sync::Arc;
+use crate::{Signer, TrustError};
 use dashmap::DashMap;
 use ndn_packet::Name;
-use crate::{Signer, TrustError};
+use std::sync::Arc;
 
 /// Supported key algorithms.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,7 +37,9 @@ pub struct MemKeyStore {
 
 impl MemKeyStore {
     pub fn new() -> Self {
-        Self { keys: DashMap::new() }
+        Self {
+            keys: DashMap::new(),
+        }
     }
 
     /// Look up a signer synchronously.
@@ -46,7 +48,9 @@ impl MemKeyStore {
             .iter()
             .find(|r| r.key().as_ref() == key_name)
             .map(|r| Arc::clone(r.value()))
-            .ok_or_else(|| TrustError::CertNotFound { name: key_name.to_string() })
+            .ok_or_else(|| TrustError::CertNotFound {
+                name: key_name.to_string(),
+            })
     }
 
     pub fn add<S: Signer>(&self, key_name: Arc<Name>, signer: S) {
@@ -55,7 +59,9 @@ impl MemKeyStore {
 }
 
 impl Default for MemKeyStore {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl KeyStore for MemKeyStore {
@@ -64,15 +70,20 @@ impl KeyStore for MemKeyStore {
             .iter()
             .find(|r| r.key().as_ref() == key_name)
             .map(|r| Arc::clone(r.value()))
-            .ok_or_else(|| TrustError::CertNotFound { name: key_name.to_string() })
+            .ok_or_else(|| TrustError::CertNotFound {
+                name: key_name.to_string(),
+            })
     }
 
     async fn generate_key(&self, _name: Name, _algo: KeyAlgorithm) -> Result<Name, TrustError> {
-        Err(TrustError::KeyStore("MemKeyStore does not support key generation".into()))
+        Err(TrustError::KeyStore(
+            "MemKeyStore does not support key generation".into(),
+        ))
     }
 
     async fn delete_key(&self, key_name: &Name) -> Result<(), TrustError> {
-        let key = self.keys
+        let key = self
+            .keys
             .iter()
             .find(|r| r.key().as_ref() == key_name)
             .map(|r| Arc::clone(r.key()));
@@ -86,12 +97,14 @@ impl KeyStore for MemKeyStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::signer::Ed25519Signer;
     use bytes::Bytes;
     use ndn_packet::NameComponent;
-    use crate::signer::Ed25519Signer;
 
     fn key_name(s: &'static str) -> Arc<Name> {
-        Arc::new(Name::from_components([NameComponent::generic(Bytes::from_static(s.as_bytes()))]))
+        Arc::new(Name::from_components([NameComponent::generic(
+            Bytes::from_static(s.as_bytes()),
+        )]))
     }
 
     #[tokio::test]
@@ -108,7 +121,10 @@ mod tests {
     async fn get_missing_key_returns_err() {
         let store = MemKeyStore::new();
         let kn = key_name("missing");
-        assert!(matches!(store.get_signer(&kn).await, Err(TrustError::CertNotFound { .. })));
+        assert!(matches!(
+            store.get_signer(&kn).await,
+            Err(TrustError::CertNotFound { .. })
+        ));
     }
 
     #[tokio::test]
@@ -118,13 +134,18 @@ mod tests {
         let signer = Ed25519Signer::from_seed(&[2u8; 32], (*kn).clone());
         store.add(Arc::clone(&kn), signer);
         store.delete_key(&kn).await.unwrap();
-        assert!(matches!(store.get_signer(&kn).await, Err(TrustError::CertNotFound { .. })));
+        assert!(matches!(
+            store.get_signer(&kn).await,
+            Err(TrustError::CertNotFound { .. })
+        ));
     }
 
     #[tokio::test]
     async fn generate_key_returns_err() {
         let store = MemKeyStore::new();
-        let result = store.generate_key((*key_name("k")).clone(), KeyAlgorithm::Ed25519).await;
+        let result = store
+            .generate_key((*key_name("k")).clone(), KeyAlgorithm::Ed25519)
+            .await;
         assert!(result.is_err());
     }
 }

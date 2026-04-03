@@ -103,8 +103,12 @@ pub fn encode_nack(reason: crate::NackReason, interest_wire: &[u8]) -> Bytes {
 pub fn ensure_nonce(interest_wire: &Bytes) -> Bytes {
     // Quick scan: does a Nonce TLV already exist?
     let mut reader = TlvReader::new(interest_wire.clone());
-    let Ok((typ, value)) = reader.read_tlv() else { return interest_wire.clone() };
-    if typ != tlv_type::INTEREST { return interest_wire.clone(); }
+    let Ok((typ, value)) = reader.read_tlv() else {
+        return interest_wire.clone();
+    };
+    if typ != tlv_type::INTEREST {
+        return interest_wire.clone();
+    }
 
     let mut inner = TlvReader::new(value.clone());
     while !inner.is_empty() {
@@ -149,50 +153,53 @@ pub fn ensure_nonce(interest_wire: &Bytes) -> Bytes {
 ///     .build();
 /// ```
 pub struct InterestBuilder {
-    name:            Name,
-    lifetime:        Option<Duration>,
-    can_be_prefix:   bool,
-    must_be_fresh:   bool,
-    hop_limit:       Option<u8>,
-    app_parameters:  Option<Vec<u8>>,
+    name: Name,
+    lifetime: Option<Duration>,
+    can_be_prefix: bool,
+    must_be_fresh: bool,
+    hop_limit: Option<u8>,
+    app_parameters: Option<Vec<u8>>,
 }
 
 impl InterestBuilder {
     pub fn new(name: impl Into<Name>) -> Self {
         Self {
-            name:           name.into(),
-            lifetime:       None,
-            can_be_prefix:  false,
-            must_be_fresh:  false,
-            hop_limit:      None,
+            name: name.into(),
+            lifetime: None,
+            can_be_prefix: false,
+            must_be_fresh: false,
+            hop_limit: None,
             app_parameters: None,
         }
     }
 
     pub fn lifetime(mut self, d: Duration) -> Self {
-        self.lifetime = Some(d); self
+        self.lifetime = Some(d);
+        self
     }
 
     pub fn can_be_prefix(mut self) -> Self {
-        self.can_be_prefix = true; self
+        self.can_be_prefix = true;
+        self
     }
 
     pub fn must_be_fresh(mut self) -> Self {
-        self.must_be_fresh = true; self
+        self.must_be_fresh = true;
+        self
     }
 
     pub fn hop_limit(mut self, h: u8) -> Self {
-        self.hop_limit = Some(h); self
+        self.hop_limit = Some(h);
+        self
     }
 
     pub fn app_parameters(mut self, p: impl Into<Vec<u8>>) -> Self {
-        self.app_parameters = Some(p.into()); self
+        self.app_parameters = Some(p.into());
+        self
     }
 
     pub fn build(self) -> Bytes {
-        let lifetime_ms = self.lifetime
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(4000);
+        let lifetime_ms = self.lifetime.map(|d| d.as_millis() as u64).unwrap_or(4000);
 
         if let Some(params) = &self.app_parameters {
             // With ApplicationParameters: same logic as encode_interest.
@@ -241,22 +248,23 @@ impl From<String> for Name {
 ///     .build();
 /// ```
 pub struct DataBuilder {
-    name:       Name,
-    content:    Vec<u8>,
-    freshness:  Option<Duration>,
+    name: Name,
+    content: Vec<u8>,
+    freshness: Option<Duration>,
 }
 
 impl DataBuilder {
     pub fn new(name: impl Into<Name>, content: &[u8]) -> Self {
         Self {
-            name:      name.into(),
-            content:   content.to_vec(),
+            name: name.into(),
+            content: content.to_vec(),
             freshness: None,
         }
     }
 
     pub fn freshness(mut self, d: Duration) -> Self {
-        self.freshness = Some(d); self
+        self.freshness = Some(d);
+        self
     }
 
     /// Build unsigned Data with a DigestSha256 placeholder signature.
@@ -286,9 +294,9 @@ impl DataBuilder {
     /// the raw signature value bytes.
     pub async fn sign<F, Fut>(
         self,
-        sig_type:    SignatureType,
+        sig_type: SignatureType,
         key_locator: Option<&Name>,
-        sign_fn:     F,
+        sign_fn: F,
     ) -> Bytes
     where
         F: FnOnce(&[u8]) -> Fut,
@@ -341,9 +349,9 @@ impl DataBuilder {
     /// SignatureInfo) and must return the raw signature bytes.
     pub fn sign_sync<F>(
         self,
-        sig_type:    SignatureType,
+        sig_type: SignatureType,
         key_locator: Option<&Name>,
-        sign_fn:     F,
+        sign_fn: F,
     ) -> Bytes
     where
         F: FnOnce(&[u8]) -> Bytes,
@@ -443,12 +451,14 @@ fn next_nonce() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
     use crate::{Data, Interest, NameComponent};
+    use bytes::Bytes;
 
     fn name(components: &[&[u8]]) -> Name {
         Name::from_components(
-            components.iter().map(|c| NameComponent::generic(Bytes::copy_from_slice(c)))
+            components
+                .iter()
+                .map(|c| NameComponent::generic(Bytes::copy_from_slice(c))),
         )
     }
 
@@ -475,7 +485,10 @@ mod tests {
         let last = &interest.name.components()[n.len()];
         assert_eq!(last.typ, tlv_type::PARAMETERS_SHA256);
         assert_eq!(last.value.len(), 32);
-        assert_eq!(interest.app_parameters().map(|b| b.as_ref()), Some(params.as_ref()));
+        assert_eq!(
+            interest.app_parameters().map(|b| b.as_ref()),
+            Some(params.as_ref())
+        );
     }
 
     #[test]
@@ -624,7 +637,9 @@ mod tests {
 
         // Minimal single-poll executor — our sign_fn completes immediately.
         struct NoopWaker;
-        impl Wake for NoopWaker { fn wake(self: std::sync::Arc<Self>) {} }
+        impl Wake for NoopWaker {
+            fn wake(self: std::sync::Arc<Self>) {}
+        }
         let waker = Waker::from(std::sync::Arc::new(NoopWaker));
         let mut cx = Context::from_waker(&waker);
 
@@ -647,7 +662,10 @@ mod tests {
 
         let data = Data::decode(wire).unwrap();
         assert_eq!(data.name.to_string(), "/signed/data");
-        assert_eq!(data.content().map(|b| b.as_ref()), Some(b"payload".as_ref()));
+        assert_eq!(
+            data.content().map(|b| b.as_ref()),
+            Some(b"payload".as_ref())
+        );
 
         let si = data.sig_info().expect("sig info");
         assert_eq!(si.sig_type, SignatureType::SignatureEd25519);
@@ -668,7 +686,9 @@ mod tests {
 
         // Async path
         struct NoopWaker;
-        impl Wake for NoopWaker { fn wake(self: std::sync::Arc<Self>) {} }
+        impl Wake for NoopWaker {
+            fn wake(self: std::sync::Arc<Self>) {}
+        }
         let waker = Waker::from(std::sync::Arc::new(NoopWaker));
         let mut cx = Context::from_waker(&waker);
 
@@ -691,29 +711,30 @@ mod tests {
         // Sync path
         let sync_wire = DataBuilder::new("/signed/data", b"payload")
             .freshness(Duration::from_secs(10))
-            .sign_sync(
-                SignatureType::SignatureEd25519,
-                Some(&key_name),
-                sign_fn,
-            );
+            .sign_sync(SignatureType::SignatureEd25519, Some(&key_name), sign_fn);
 
-        assert_eq!(async_wire, sync_wire, "sign_sync must produce identical wire format");
+        assert_eq!(
+            async_wire, sync_wire,
+            "sign_sync must produce identical wire format"
+        );
     }
 
     #[test]
     fn data_builder_sign_sync_no_freshness() {
-        let wire = DataBuilder::new("/test", b"content")
-            .sign_sync(
-                SignatureType::SignatureEd25519,
-                None,
-                |region| {
-                    let digest = ring::digest::digest(&ring::digest::SHA256, region);
-                    Bytes::copy_from_slice(digest.as_ref())
-                },
-            );
+        let wire = DataBuilder::new("/test", b"content").sign_sync(
+            SignatureType::SignatureEd25519,
+            None,
+            |region| {
+                let digest = ring::digest::digest(&ring::digest::SHA256, region);
+                Bytes::copy_from_slice(digest.as_ref())
+            },
+        );
         let data = Data::decode(wire).unwrap();
         assert_eq!(data.name.to_string(), "/test");
-        assert_eq!(data.content().map(|b| b.as_ref()), Some(b"content".as_ref()));
+        assert_eq!(
+            data.content().map(|b| b.as_ref()),
+            Some(b"content".as_ref())
+        );
         assert!(data.meta_info().is_none());
         let si = data.sig_info().expect("sig info");
         assert_eq!(si.sig_type, SignatureType::SignatureEd25519);
@@ -761,7 +782,11 @@ mod tests {
     }
 
     fn hex(bytes: &[u8]) -> String {
-        bytes.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ")
+        bytes
+            .iter()
+            .map(|b| format!("{b:02X}"))
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     #[test]
@@ -771,7 +796,9 @@ mod tests {
         let wire = encode_interest(&name(&[b"ndn", b"edu"]), None);
 
         // Find InterestLifetime TLV (type 0x0C).
-        let pos = wire.windows(2).position(|w| w == [0x0C, 0x02])
+        let pos = wire
+            .windows(2)
+            .position(|w| w == [0x0C, 0x02])
             .expect("InterestLifetime should be type=0x0C len=0x02 (2 bytes)");
         assert_bytes_eq(
             &wire[pos..pos + 4],
@@ -826,7 +853,10 @@ mod tests {
         // SignatureValue: 17 20 (32 zero bytes)
         assert_eq!(wire[20], 0x17);
         assert_eq!(wire[21], 0x20);
-        assert!(wire[22..54].iter().all(|&b| b == 0), "SigValue should be zeros");
+        assert!(
+            wire[22..54].iter().all(|&b| b == 0),
+            "SigValue should be zeros"
+        );
 
         assert_eq!(wire.len(), 54, "total Data length");
     }
@@ -840,7 +870,10 @@ mod tests {
         assert_eq!(wire[0], 0x06);
 
         // After Name (07 03 08 01 41), next should be Content (15), not MetaInfo (14).
-        assert_eq!(wire[7], 0x15, "Content should follow Name directly (no MetaInfo)");
+        assert_eq!(
+            wire[7], 0x15,
+            "Content should follow Name directly (no MetaInfo)"
+        );
     }
 
     #[test]
@@ -872,14 +905,26 @@ mod tests {
         // After Name (07 03 08 01 41 at offset 2):
         let after_name = 7;
         // CanBePrefix: 21 00
-        assert_bytes_eq(&wire[after_name..after_name + 2], &[0x21, 0x00], "CanBePrefix");
+        assert_bytes_eq(
+            &wire[after_name..after_name + 2],
+            &[0x21, 0x00],
+            "CanBePrefix",
+        );
         // MustBeFresh: 12 00
-        assert_bytes_eq(&wire[after_name + 2..after_name + 4], &[0x12, 0x00], "MustBeFresh");
+        assert_bytes_eq(
+            &wire[after_name + 2..after_name + 4],
+            &[0x12, 0x00],
+            "MustBeFresh",
+        );
         // Nonce: 0A 04 ...
         assert_eq!(wire[after_name + 4], 0x0A, "Nonce type");
         // Lifetime: 0C 02 03 E8 (1000ms)
         let lt_pos = after_name + 4 + 6; // after nonce TLV
-        assert_bytes_eq(&wire[lt_pos..lt_pos + 4], &[0x0C, 0x02, 0x03, 0xE8], "Lifetime 1000ms");
+        assert_bytes_eq(
+            &wire[lt_pos..lt_pos + 4],
+            &[0x0C, 0x02, 0x03, 0xE8],
+            "Lifetime 1000ms",
+        );
     }
 
     #[test]
@@ -909,12 +954,12 @@ mod tests {
         // /ndn/edu with nonce=0x01020304 and lifetime=4000ms.
         // Inner: Name(12) + Nonce(6) + Lifetime(4) = 22 bytes.
         let ndnd_wire: &[u8] = &[
-            0x05, 0x16,                         // Interest, length=22
-            0x07, 0x0A,                         // Name, length=10
-              0x08, 0x03, 0x6E, 0x64, 0x6E,    //   "ndn"
-              0x08, 0x03, 0x65, 0x64, 0x75,    //   "edu"
+            0x05, 0x16, // Interest, length=22
+            0x07, 0x0A, // Name, length=10
+            0x08, 0x03, 0x6E, 0x64, 0x6E, //   "ndn"
+            0x08, 0x03, 0x65, 0x64, 0x75, //   "edu"
             0x0A, 0x04, 0x01, 0x02, 0x03, 0x04, // Nonce
-            0x0C, 0x02, 0x0F, 0xA0,            // InterestLifetime=4000
+            0x0C, 0x02, 0x0F, 0xA0, // InterestLifetime=4000
         ];
         let interest = Interest::decode(Bytes::from_static(ndnd_wire)).unwrap();
         assert_eq!(interest.name.to_string(), "/ndn/edu");
@@ -927,14 +972,14 @@ mod tests {
         // Hand-crafted Data matching what ndnd (Go) would produce for
         // /test with content "hi", FreshnessPeriod=10000ms, DigestSha256.
         let ndnd_wire: &[u8] = &[
-            0x06, 0x1D,                         // Data, length=29
-            0x07, 0x06,                         // Name, length=6
-              0x08, 0x04, 0x74, 0x65, 0x73, 0x74, // "test"
-            0x14, 0x04,                         // MetaInfo, length=4
-              0x19, 0x02, 0x27, 0x10,           //   FreshnessPeriod=10000
-            0x15, 0x02, 0x68, 0x69,             // Content "hi"
-            0x16, 0x03,                         // SignatureInfo, length=3
-              0x1B, 0x01, 0x00,                 //   SignatureType=0 (DigestSha256)
+            0x06, 0x1D, // Data, length=29
+            0x07, 0x06, // Name, length=6
+            0x08, 0x04, 0x74, 0x65, 0x73, 0x74, // "test"
+            0x14, 0x04, // MetaInfo, length=4
+            0x19, 0x02, 0x27, 0x10, //   FreshnessPeriod=10000
+            0x15, 0x02, 0x68, 0x69, // Content "hi"
+            0x16, 0x03, // SignatureInfo, length=3
+            0x1B, 0x01, 0x00, //   SignatureType=0 (DigestSha256)
             0x17, 0x04, 0xAA, 0xBB, 0xCC, 0xDD, // SignatureValue (4 bytes)
         ];
         let data = Data::decode(Bytes::from_static(ndnd_wire)).unwrap();
@@ -948,12 +993,12 @@ mod tests {
     fn wire_ndnd_data_no_metainfo_decode() {
         // Data without MetaInfo — valid per spec, ndnd can produce this.
         let ndnd_wire: &[u8] = &[
-            0x06, 0x15,                         // Data, length=21
-            0x07, 0x06,                         // Name
-              0x08, 0x04, 0x74, 0x65, 0x73, 0x74, // "test"
-            0x15, 0x02, 0x68, 0x69,             // Content "hi"
-            0x16, 0x03,                         // SignatureInfo
-              0x1B, 0x01, 0x00,                 //   DigestSha256
+            0x06, 0x15, // Data, length=21
+            0x07, 0x06, // Name
+            0x08, 0x04, 0x74, 0x65, 0x73, 0x74, // "test"
+            0x15, 0x02, 0x68, 0x69, // Content "hi"
+            0x16, 0x03, // SignatureInfo
+            0x1B, 0x01, 0x00, //   DigestSha256
             0x17, 0x04, 0x00, 0x00, 0x00, 0x00, // SignatureValue
         ];
         let data = Data::decode(Bytes::from_static(ndnd_wire)).unwrap();
@@ -966,12 +1011,12 @@ mod tests {
         // Interest with 1-byte InterestLifetime (100ms) — minimal NNI.
         // Inner: Name(12) + Nonce(6) + Lifetime(3) = 21 bytes.
         let ndnd_wire: &[u8] = &[
-            0x05, 0x15,                         // Interest, length=21
-            0x07, 0x0A,                         // Name
-              0x08, 0x03, 0x6E, 0x64, 0x6E,    //   "ndn"
-              0x08, 0x03, 0x65, 0x64, 0x75,    //   "edu"
+            0x05, 0x15, // Interest, length=21
+            0x07, 0x0A, // Name
+            0x08, 0x03, 0x6E, 0x64, 0x6E, //   "ndn"
+            0x08, 0x03, 0x65, 0x64, 0x75, //   "edu"
             0x0A, 0x04, 0x00, 0x00, 0x00, 0x01, // Nonce
-            0x0C, 0x01, 0x64,                   // InterestLifetime=100ms (1 byte)
+            0x0C, 0x01, 0x64, // InterestLifetime=100ms (1 byte)
         ];
         let interest = Interest::decode(Bytes::from_static(ndnd_wire)).unwrap();
         assert_eq!(interest.lifetime(), Some(Duration::from_millis(100)));
@@ -982,12 +1027,12 @@ mod tests {
         // Interest with 4-byte InterestLifetime (100000ms) — minimal NNI for large values.
         // Inner: Name(12) + Nonce(6) + Lifetime(6) = 24 bytes.
         let ndnd_wire: &[u8] = &[
-            0x05, 0x18,                             // Interest, length=24
-            0x07, 0x0A,                             // Name
-              0x08, 0x03, 0x6E, 0x64, 0x6E,        //   "ndn"
-              0x08, 0x03, 0x65, 0x64, 0x75,        //   "edu"
-            0x0A, 0x04, 0x00, 0x00, 0x00, 0x01,    // Nonce
-            0x0C, 0x04, 0x00, 0x01, 0x86, 0xA0,    // InterestLifetime=100000ms (4 bytes)
+            0x05, 0x18, // Interest, length=24
+            0x07, 0x0A, // Name
+            0x08, 0x03, 0x6E, 0x64, 0x6E, //   "ndn"
+            0x08, 0x03, 0x65, 0x64, 0x75, //   "edu"
+            0x0A, 0x04, 0x00, 0x00, 0x00, 0x01, // Nonce
+            0x0C, 0x04, 0x00, 0x01, 0x86, 0xA0, // InterestLifetime=100000ms (4 bytes)
         ];
         let interest = Interest::decode(Bytes::from_static(ndnd_wire)).unwrap();
         assert_eq!(interest.lifetime(), Some(Duration::from_millis(100000)));
@@ -1000,16 +1045,17 @@ mod tests {
         use std::task::{Context, Wake, Waker};
 
         struct NoopWaker;
-        impl Wake for NoopWaker { fn wake(self: std::sync::Arc<Self>) {} }
+        impl Wake for NoopWaker {
+            fn wake(self: std::sync::Arc<Self>) {}
+        }
         let waker = Waker::from(std::sync::Arc::new(NoopWaker));
         let mut cx = Context::from_waker(&waker);
 
-        let fut = DataBuilder::new("/A", b"X")
-            .sign(
-                SignatureType::SignatureEd25519,
-                None,
-                |_: &[u8]| std::future::ready(Bytes::from_static(&[0xFF; 64])),
-            );
+        let fut = DataBuilder::new("/A", b"X").sign(
+            SignatureType::SignatureEd25519,
+            None,
+            |_: &[u8]| std::future::ready(Bytes::from_static(&[0xFF; 64])),
+        );
         let mut fut = pin!(fut);
         let wire = match fut.as_mut().poll(&mut cx) {
             std::task::Poll::Ready(b) => b,

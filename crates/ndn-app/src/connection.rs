@@ -21,10 +21,8 @@ impl NdnConnection {
     /// Send a packet.
     pub async fn send(&self, pkt: Bytes) -> Result<(), AppError> {
         match self {
-            NdnConnection::Embedded(h) => h.send(pkt).await
-                .map_err(|e| AppError::Engine(e.into())),
-            NdnConnection::External(c) => c.send(pkt).await
-                .map_err(|e| AppError::Engine(e.into())),
+            NdnConnection::Embedded(h) => h.send(pkt).await.map_err(|e| AppError::Engine(e.into())),
+            NdnConnection::External(c) => c.send(pkt).await.map_err(|e| AppError::Engine(e.into())),
         }
     }
 
@@ -41,7 +39,9 @@ impl NdnConnection {
     pub async fn register_prefix(&self, prefix: &Name) -> Result<(), AppError> {
         match self {
             NdnConnection::Embedded(_) => Ok(()), // no-op for embedded
-            NdnConnection::External(c) => c.register_prefix(prefix).await
+            NdnConnection::External(c) => c
+                .register_prefix(prefix)
+                .await
                 .map_err(|e| AppError::Engine(e.into())),
         }
     }

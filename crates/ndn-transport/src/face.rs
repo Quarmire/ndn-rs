@@ -41,9 +41,16 @@ impl FaceKind {
     pub fn scope(&self) -> FaceScope {
         match self {
             FaceKind::Unix | FaceKind::App | FaceKind::Shm | FaceKind::Internal => FaceScope::Local,
-            FaceKind::Udp | FaceKind::Tcp | FaceKind::Ethernet | FaceKind::EtherMulticast
-            | FaceKind::Serial | FaceKind::Bluetooth | FaceKind::Wfb | FaceKind::Compute
-            | FaceKind::Multicast | FaceKind::WebSocket => FaceScope::NonLocal,
+            FaceKind::Udp
+            | FaceKind::Tcp
+            | FaceKind::Ethernet
+            | FaceKind::EtherMulticast
+            | FaceKind::Serial
+            | FaceKind::Bluetooth
+            | FaceKind::Wfb
+            | FaceKind::Compute
+            | FaceKind::Multicast
+            | FaceKind::WebSocket => FaceScope::NonLocal,
         }
     }
 }
@@ -51,20 +58,20 @@ impl FaceKind {
 impl core::fmt::Display for FaceKind {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(match self {
-            Self::Udp            => "udp",
-            Self::Tcp            => "tcp",
-            Self::Unix           => "unix",
-            Self::Ethernet       => "ethernet",
+            Self::Udp => "udp",
+            Self::Tcp => "tcp",
+            Self::Unix => "unix",
+            Self::Ethernet => "ethernet",
             Self::EtherMulticast => "ether-multicast",
-            Self::App            => "app",
-            Self::Shm            => "shm",
-            Self::Serial         => "serial",
-            Self::Bluetooth      => "bluetooth",
-            Self::Wfb            => "wfb",
-            Self::Compute        => "compute",
-            Self::Internal       => "internal",
-            Self::Multicast      => "multicast",
-            Self::WebSocket      => "web-socket",
+            Self::App => "app",
+            Self::Shm => "shm",
+            Self::Serial => "serial",
+            Self::Bluetooth => "bluetooth",
+            Self::Wfb => "wfb",
+            Self::Compute => "compute",
+            Self::Internal => "internal",
+            Self::Multicast => "multicast",
+            Self::WebSocket => "web-socket",
         })
     }
 }
@@ -74,21 +81,21 @@ impl core::str::FromStr for FaceKind {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "udp"             => Ok(Self::Udp),
-            "tcp"             => Ok(Self::Tcp),
-            "unix"            => Ok(Self::Unix),
-            "ethernet"        => Ok(Self::Ethernet),
+            "udp" => Ok(Self::Udp),
+            "tcp" => Ok(Self::Tcp),
+            "unix" => Ok(Self::Unix),
+            "ethernet" => Ok(Self::Ethernet),
             "ether-multicast" => Ok(Self::EtherMulticast),
-            "app"             => Ok(Self::App),
-            "shm"             => Ok(Self::Shm),
-            "serial"          => Ok(Self::Serial),
-            "bluetooth"       => Ok(Self::Bluetooth),
-            "wfb"             => Ok(Self::Wfb),
-            "compute"         => Ok(Self::Compute),
-            "internal"        => Ok(Self::Internal),
-            "multicast"       => Ok(Self::Multicast),
-            "web-socket"      => Ok(Self::WebSocket),
-            _                 => Err(()),
+            "app" => Ok(Self::App),
+            "shm" => Ok(Self::Shm),
+            "serial" => Ok(Self::Serial),
+            "bluetooth" => Ok(Self::Bluetooth),
+            "wfb" => Ok(Self::Wfb),
+            "compute" => Ok(Self::Compute),
+            "internal" => Ok(Self::Internal),
+            "multicast" => Ok(Self::Multicast),
+            "web-socket" => Ok(Self::WebSocket),
+            _ => Err(()),
         }
     }
 }
@@ -111,9 +118,9 @@ pub enum FaceScope {
 /// - `Permanent` (2): never destroyed, even on I/O errors (multicast, always-on links).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FacePersistency {
-    OnDemand   = 0,
+    OnDemand = 0,
     Persistent = 1,
-    Permanent  = 2,
+    Permanent = 2,
 }
 
 impl FacePersistency {
@@ -148,11 +155,15 @@ pub trait Face: Send + Sync + 'static {
 
     /// Remote URI (e.g. `udp4://192.168.1.1:6363`). Returns `None` for face
     /// types that don't have a meaningful remote endpoint.
-    fn remote_uri(&self) -> Option<String> { None }
+    fn remote_uri(&self) -> Option<String> {
+        None
+    }
 
     /// Local URI (e.g. `unix:///tmp/ndn-faces.sock`). Returns `None` for face
     /// types that don't expose local binding info.
-    fn local_uri(&self) -> Option<String> { None }
+    fn local_uri(&self) -> Option<String> {
+        None
+    }
 
     /// Receive the next packet. Blocks until a packet arrives or the face closes.
     fn recv(&self) -> impl Future<Output = Result<Bytes, FaceError>> + Send;

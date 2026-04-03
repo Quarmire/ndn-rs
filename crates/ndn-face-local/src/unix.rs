@@ -15,16 +15,7 @@ pub type UnixFace = StreamFace<OwnedReadHalf, OwnedWriteHalf, TlvCodec>;
 pub fn unix_face_from_stream(id: FaceId, stream: UnixStream, path: impl AsRef<Path>) -> UnixFace {
     let uri = format!("unix://{}", path.as_ref().display());
     let (r, w) = stream.into_split();
-    StreamFace::new(
-        id,
-        FaceKind::Unix,
-        false,
-        None,
-        Some(uri),
-        r,
-        w,
-        TlvCodec,
-    )
+    StreamFace::new(id, FaceKind::Unix, false, None, Some(uri), r, w, TlvCodec)
 }
 
 /// Connect to a Unix socket at `path` and return a [`UnixFace`].
@@ -38,8 +29,8 @@ pub async fn unix_face_connect(id: FaceId, path: impl AsRef<Path>) -> std::io::R
 mod tests {
     use super::*;
     use bytes::Bytes;
-    use std::path::PathBuf;
     use ndn_transport::{Face, FaceError};
+    use std::path::PathBuf;
     use tokio::net::UnixListener;
 
     fn make_tlv(tag: u8, value: &[u8]) -> Bytes {
@@ -63,12 +54,13 @@ mod tests {
         let listener = UnixListener::bind(path).unwrap();
         let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let connect_fut = unix_face_connect(FaceId(0), path);
-            let accept_fut  = listener.accept();
+            let accept_fut = listener.accept();
             let (client, accepted) = tokio::join!(connect_fut, accept_fut);
             let (accepted_stream, _) = accepted.unwrap();
             let server = unix_face_from_stream(FaceId(1), accepted_stream, path);
             (client.unwrap(), server)
-        }).await;
+        })
+        .await;
         result.expect("loopback_pair timed out")
     }
 
@@ -112,7 +104,7 @@ mod tests {
         let path = temp_socket_path();
         let listener = UnixListener::bind(&path).unwrap();
         let connect_fut = UnixStream::connect(&path);
-        let accept_fut  = listener.accept();
+        let accept_fut = listener.accept();
         let (stream, accepted) = tokio::join!(connect_fut, accept_fut);
         let (accepted_stream, _) = accepted.unwrap();
         let server = unix_face_from_stream(FaceId(1), accepted_stream, &path);

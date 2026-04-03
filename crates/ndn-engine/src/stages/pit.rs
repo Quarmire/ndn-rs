@@ -96,10 +96,7 @@ impl PitMatchStage {
         let token = PitToken::from_interest(&data.name, Some(&default_sel));
 
         if let Some((_, entry)) = self.pit.remove(&token) {
-            let faces: SmallVec<[FaceId; 4]> = entry
-                .in_record_faces()
-                .map(FaceId)
-                .collect();
+            let faces: SmallVec<[FaceId; 4]> = entry.in_record_faces().map(FaceId).collect();
             trace!(face=%ctx.face_id, name=%data.name, out_faces=?faces, "pit-match: satisfied");
             ctx.out_faces = faces;
             Action::Continue(ctx)
@@ -107,10 +104,7 @@ impl PitMatchStage {
             // Fall back to None selector.
             let token2 = PitToken::from_interest(&data.name, None);
             if let Some((_, entry)) = self.pit.remove(&token2) {
-                let faces: SmallVec<[FaceId; 4]> = entry
-                    .in_record_faces()
-                    .map(FaceId)
-                    .collect();
+                let faces: SmallVec<[FaceId; 4]> = entry.in_record_faces().map(FaceId).collect();
                 trace!(face=%ctx.face_id, name=%data.name, out_faces=?faces, "pit-match: satisfied (no selector)");
                 ctx.out_faces = faces;
                 Action::Continue(ctx)

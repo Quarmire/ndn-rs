@@ -1,8 +1,8 @@
 use bytes::Bytes;
 
+use crate::tlv_type;
 use crate::{Interest, PacketError};
 use ndn_tlv::{TlvReader, TlvWriter};
-use crate::tlv_type;
 
 /// Reason codes carried in a Nack packet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -23,20 +23,20 @@ impl NackReason {
     pub fn code(&self) -> u64 {
         match self {
             NackReason::Congestion => 50,
-            NackReason::Duplicate  => 100,
-            NackReason::NoRoute    => 150,
-            NackReason::NotYet     => 160,
-            NackReason::Other(c)   => *c,
+            NackReason::Duplicate => 100,
+            NackReason::NoRoute => 150,
+            NackReason::NotYet => 160,
+            NackReason::Other(c) => *c,
         }
     }
 
     pub fn from_code(code: u64) -> Self {
         match code {
-            50  => NackReason::Congestion,
+            50 => NackReason::Congestion,
             100 => NackReason::Duplicate,
             150 => NackReason::NoRoute,
             160 => NackReason::NotYet,
-            c   => NackReason::Other(c),
+            c => NackReason::Other(c),
         }
     }
 }
@@ -44,7 +44,7 @@ impl NackReason {
 /// An NDN Nack — a negative acknowledgement wrapping the rejected Interest.
 #[derive(Debug)]
 pub struct Nack {
-    pub reason:   NackReason,
+    pub reason: NackReason,
     pub interest: Interest,
 }
 
@@ -58,7 +58,9 @@ impl Nack {
     /// Accepts both NDNLPv2 format (LpPacket 0x64 with Nack header) and the
     /// legacy bare Nack TLV (0x0320). Prefer LpPacket format for new code.
     pub fn decode(raw: Bytes) -> Result<Self, PacketError> {
-        let first = *raw.first().ok_or(PacketError::Tlv(ndn_tlv::TlvError::UnexpectedEof))?;
+        let first = *raw
+            .first()
+            .ok_or(PacketError::Tlv(ndn_tlv::TlvError::UnexpectedEof))?;
 
         // NDNLPv2 LpPacket format.
         if first as u64 == tlv_type::LP_PACKET {
@@ -103,9 +105,9 @@ impl Nack {
             }
         }
 
-        let interest_bytes = interest_raw.ok_or(
-            PacketError::Tlv(ndn_tlv::TlvError::MissingField("Interest inside Nack"))
-        )?;
+        let interest_bytes = interest_raw.ok_or(PacketError::Tlv(
+            ndn_tlv::TlvError::MissingField("Interest inside Nack"),
+        ))?;
         let interest = Interest::decode(interest_bytes)?;
         Ok(Self { reason, interest })
     }
@@ -114,9 +116,9 @@ impl Nack {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndn_tlv::TlvWriter;
     use crate::{Name, NameComponent};
     use bytes::Bytes;
+    use ndn_tlv::TlvWriter;
 
     fn build_nack(reason_code: u8, name_components: &[&[u8]]) -> Bytes {
         // Build the Interest inner content (Name TLV value).
@@ -143,9 +145,9 @@ mod tests {
     fn nack_reason_known_codes() {
         let cases = [
             (NackReason::Congestion, 50),
-            (NackReason::Duplicate,  100),
-            (NackReason::NoRoute,    150),
-            (NackReason::NotYet,     160),
+            (NackReason::Duplicate, 100),
+            (NackReason::NoRoute, 150),
+            (NackReason::NotYet, 160),
         ];
         for (reason, code) in cases {
             assert_eq!(reason.code(), code);
@@ -164,9 +166,7 @@ mod tests {
 
     #[test]
     fn nack_new_stores_fields() {
-        let name = Name::from_components([
-            NameComponent::generic(Bytes::from_static(b"test")),
-        ]);
+        let name = Name::from_components([NameComponent::generic(Bytes::from_static(b"test"))]);
         let interest = Interest::new(name.clone());
         let nack = Nack::new(interest, NackReason::NoRoute);
         assert_eq!(nack.reason, NackReason::NoRoute);
@@ -177,7 +177,7 @@ mod tests {
 
     #[test]
     fn decode_nack_reason_and_name() {
-        let raw = build_nack(150, &[b"edu", b"ucla"]);  // NoRoute = 150
+        let raw = build_nack(150, &[b"edu", b"ucla"]); // NoRoute = 150
         let nack = Nack::decode(raw).unwrap();
         assert_eq!(nack.reason, NackReason::NoRoute);
         assert_eq!(nack.interest.name.len(), 2);
@@ -194,7 +194,7 @@ mod tests {
     #[test]
     fn decode_nack_wrong_outer_type_errors() {
         let mut w = TlvWriter::new();
-        w.write_tlv(0x05, &[]);  // INTEREST type, not NACK
+        w.write_tlv(0x05, &[]); // INTEREST type, not NACK
         assert!(matches!(
             Nack::decode(w.finish()).unwrap_err(),
             crate::PacketError::UnknownPacketType(0x05)

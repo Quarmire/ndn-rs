@@ -49,7 +49,7 @@ impl Query {
 
 /// A queryable endpoint — receives Interests and lets the application reply.
 pub struct Queryable {
-    conn:   Arc<NdnConnection>,
+    conn: Arc<NdnConnection>,
     prefix: Name,
 }
 
@@ -60,16 +60,25 @@ impl Queryable {
         prefix: impl Into<Name>,
     ) -> Result<Self, AppError> {
         let prefix = prefix.into();
-        let client = RouterClient::connect(socket).await
+        let client = RouterClient::connect(socket)
+            .await
             .map_err(|e| AppError::Engine(e.into()))?;
-        client.register_prefix(&prefix).await
+        client
+            .register_prefix(&prefix)
+            .await
             .map_err(|e| AppError::Engine(e.into()))?;
-        Ok(Self { conn: Arc::new(NdnConnection::External(client)), prefix })
+        Ok(Self {
+            conn: Arc::new(NdnConnection::External(client)),
+            prefix,
+        })
     }
 
     /// Create from an in-process AppHandle (embedded engine).
     pub fn from_handle(handle: AppHandle, prefix: Name) -> Self {
-        Self { conn: Arc::new(NdnConnection::Embedded(handle)), prefix }
+        Self {
+            conn: Arc::new(NdnConnection::Embedded(handle)),
+            prefix,
+        }
     }
 
     /// The registered prefix.

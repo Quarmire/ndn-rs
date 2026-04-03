@@ -23,7 +23,9 @@ pub struct FacePairTable {
 
 impl FacePairTable {
     pub fn new() -> Self {
-        Self { pairs: DashMap::new() }
+        Self {
+            pairs: DashMap::new(),
+        }
     }
 
     /// Register an asymmetric link pair: Interests arrive on `rx`, Data is
@@ -62,7 +64,9 @@ impl Default for FacePairTable {
 mod tests {
     use super::*;
 
-    fn id(n: u32) -> FaceId { FaceId(n) }
+    fn id(n: u32) -> FaceId {
+        FaceId(n)
+    }
 
     #[test]
     fn get_tx_for_unknown_rx_returns_none() {

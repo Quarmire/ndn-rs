@@ -3,9 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ndn_packet::Name;
-use ndn_security::{
-    SecurityManager, Signer, TrustSchema, Validator, pib::FilePib,
-};
+use ndn_security::{SecurityManager, Signer, TrustSchema, Validator, pib::FilePib};
 
 use crate::AppError;
 
@@ -20,15 +18,16 @@ pub struct KeyChain {
 impl KeyChain {
     /// Create an in-memory keychain (testing/ephemeral).
     pub fn new() -> Self {
-        Self { mgr: SecurityManager::new() }
+        Self {
+            mgr: SecurityManager::new(),
+        }
     }
 
     /// Open a persistent keychain from a PIB directory for the given identity.
     pub fn open(path: impl AsRef<Path>, identity: &Name) -> Result<Self, AppError> {
-        let pib = FilePib::open(path.as_ref())
-            .map_err(|e| AppError::Engine(e.into()))?;
-        let mgr = SecurityManager::from_pib(&pib, identity)
-            .map_err(|e| AppError::Engine(e.into()))?;
+        let pib = FilePib::open(path.as_ref()).map_err(|e| AppError::Engine(e.into()))?;
+        let mgr =
+            SecurityManager::from_pib(&pib, identity).map_err(|e| AppError::Engine(e.into()))?;
         Ok(Self { mgr })
     }
 
@@ -47,10 +46,13 @@ impl KeyChain {
         validity: Option<Duration>,
     ) -> Result<Arc<dyn Signer>, AppError> {
         let name = identity.into();
-        self.mgr.generate_ed25519(name.clone())
+        self.mgr
+            .generate_ed25519(name.clone())
             .map_err(|e| AppError::Engine(e.into()))?;
 
-        let signer = self.mgr.get_signer_sync(&name)
+        let signer = self
+            .mgr
+            .get_signer_sync(&name)
             .map_err(|e| AppError::Engine(e.into()))?;
 
         let validity_ms = validity
@@ -67,7 +69,9 @@ impl KeyChain {
     /// Get the signer for an existing identity.
     pub async fn signer(&self, identity: impl Into<Name>) -> Result<Arc<dyn Signer>, AppError> {
         let name = identity.into();
-        self.mgr.get_signer(&name).await
+        self.mgr
+            .get_signer(&name)
+            .await
             .map_err(|e| AppError::Engine(e.into()))
     }
 
@@ -95,5 +99,7 @@ impl KeyChain {
 }
 
 impl Default for KeyChain {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }

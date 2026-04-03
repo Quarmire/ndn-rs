@@ -76,9 +76,7 @@ pub enum CongestionController {
         ssthresh: f64,
     },
     /// Fixed window — no adaptation.
-    Fixed {
-        window: f64,
-    },
+    Fixed { window: f64 },
 }
 
 // ─── Defaults ────────────────────────────────────────────────────────────────
@@ -140,9 +138,9 @@ impl CongestionController {
     /// Set the initial and current window size.
     pub fn with_window(mut self, w: f64) -> Self {
         match &mut self {
-            Self::Aimd { window, .. }
-            | Self::Cubic { window, .. }
-            | Self::Fixed { window } => *window = w,
+            Self::Aimd { window, .. } | Self::Cubic { window, .. } | Self::Fixed { window } => {
+                *window = w
+            }
         }
         self
     }
@@ -150,8 +148,7 @@ impl CongestionController {
     /// Set the minimum window (floor after decrease). Ignored by Fixed.
     pub fn with_min_window(mut self, w: f64) -> Self {
         match &mut self {
-            Self::Aimd { min_window, .. }
-            | Self::Cubic { min_window, .. } => *min_window = w,
+            Self::Aimd { min_window, .. } | Self::Cubic { min_window, .. } => *min_window = w,
             Self::Fixed { .. } => {}
         }
         self
@@ -160,8 +157,7 @@ impl CongestionController {
     /// Set the maximum window (ceiling). Ignored by Fixed.
     pub fn with_max_window(mut self, w: f64) -> Self {
         match &mut self {
-            Self::Aimd { max_window, .. }
-            | Self::Cubic { max_window, .. } => *max_window = w,
+            Self::Aimd { max_window, .. } | Self::Cubic { max_window, .. } => *max_window = w,
             Self::Fixed { .. } => {}
         }
         self
@@ -169,7 +165,10 @@ impl CongestionController {
 
     /// Set AIMD additive increase per RTT (default: 1.0). Only affects AIMD.
     pub fn with_additive_increase(mut self, ai: f64) -> Self {
-        if let Self::Aimd { additive_increase, .. } = &mut self {
+        if let Self::Aimd {
+            additive_increase, ..
+        } = &mut self
+        {
             *additive_increase = ai;
         }
         self
@@ -178,7 +177,10 @@ impl CongestionController {
     /// Set AIMD/CUBIC multiplicative decrease factor (default: 0.5 for AIMD, 0.7 for CUBIC).
     pub fn with_decrease_factor(mut self, md: f64) -> Self {
         match &mut self {
-            Self::Aimd { multiplicative_decrease, .. } => *multiplicative_decrease = md,
+            Self::Aimd {
+                multiplicative_decrease,
+                ..
+            } => *multiplicative_decrease = md,
             Self::Cubic { beta, .. } => *beta = md,
             Self::Fixed { .. } => {}
         }
@@ -200,8 +202,7 @@ impl CongestionController {
     /// overshooting the link capacity on the first flow.
     pub fn with_ssthresh(mut self, ss: f64) -> Self {
         match &mut self {
-            Self::Aimd { ssthresh, .. }
-            | Self::Cubic { ssthresh, .. } => *ssthresh = ss,
+            Self::Aimd { ssthresh, .. } | Self::Cubic { ssthresh, .. } => *ssthresh = ss,
             Self::Fixed { .. } => {}
         }
         self
@@ -212,16 +213,22 @@ impl CongestionController {
     /// Callers should use `window().floor() as usize` for the actual limit.
     pub fn window(&self) -> f64 {
         match self {
-            Self::Aimd { window, .. }
-            | Self::Cubic { window, .. }
-            | Self::Fixed { window }  => *window,
+            Self::Aimd { window, .. } | Self::Cubic { window, .. } | Self::Fixed { window } => {
+                *window
+            }
         }
     }
 
     /// A Data packet was received successfully (no congestion mark).
     pub fn on_data(&mut self) {
         match self {
-            Self::Aimd { window, additive_increase, ssthresh, max_window, .. } => {
+            Self::Aimd {
+                window,
+                additive_increase,
+                ssthresh,
+                max_window,
+                ..
+            } => {
                 if *window < *ssthresh {
                     // Slow start: exponential growth.
                     *window += 1.0;
@@ -232,7 +239,14 @@ impl CongestionController {
                 *window = window.min(*max_window);
             }
             Self::Cubic {
-                window, w_max, acks_since_loss, c, beta, ssthresh, max_window, ..
+                window,
+                w_max,
+                acks_since_loss,
+                c,
+                beta,
+                ssthresh,
+                max_window,
+                ..
             } => {
                 *acks_since_loss += 1;
                 if *window < *ssthresh {
@@ -245,8 +259,9 @@ impl CongestionController {
                     let k = ((*w_max * (1.0 - *beta)) / *c).cbrt();
                     let w_cubic = *c * (t - k).powi(3) + *w_max;
                     // TCP-friendly region: at least as aggressive as AIMD.
-                    let w_tcp = *w_max * *beta + (3.0 * (1.0 - *beta) / (1.0 + *beta))
-                        * (*acks_since_loss as f64 / *window);
+                    let w_tcp = *w_max * *beta
+                        + (3.0 * (1.0 - *beta) / (1.0 + *beta))
+                            * (*acks_since_loss as f64 / *window);
                     *window = w_cubic.max(w_tcp);
                 }
                 *window = window.min(*max_window);
@@ -274,13 +289,23 @@ impl CongestionController {
     fn decrease(&mut self, _reason: &str) {
         match self {
             Self::Aimd {
-                window, multiplicative_decrease, min_window, ssthresh, ..
+                window,
+                multiplicative_decrease,
+                min_window,
+                ssthresh,
+                ..
             } => {
                 *ssthresh = (*window * *multiplicative_decrease).max(*min_window);
                 *window = *ssthresh;
             }
             Self::Cubic {
-                window, w_max, acks_since_loss, beta, min_window, ssthresh, ..
+                window,
+                w_max,
+                acks_since_loss,
+                beta,
+                min_window,
+                ssthresh,
+                ..
             } => {
                 *w_max = *window;
                 *ssthresh = (*window * *beta).max(*min_window);
@@ -294,11 +319,19 @@ impl CongestionController {
     /// Reset to initial state (e.g. on route change or new flow).
     pub fn reset(&mut self) {
         match self {
-            Self::Aimd { window, ssthresh, .. } => {
+            Self::Aimd {
+                window, ssthresh, ..
+            } => {
                 *window = DEFAULT_INITIAL_WINDOW;
                 *ssthresh = DEFAULT_SSTHRESH;
             }
-            Self::Cubic { window, w_max, acks_since_loss, ssthresh, .. } => {
+            Self::Cubic {
+                window,
+                w_max,
+                acks_since_loss,
+                ssthresh,
+                ..
+            } => {
                 *window = DEFAULT_INITIAL_WINDOW;
                 *w_max = DEFAULT_INITIAL_WINDOW;
                 *acks_since_loss = 0;

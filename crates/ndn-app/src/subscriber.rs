@@ -25,9 +25,9 @@ use std::time::Duration;
 use bytes::Bytes;
 use tokio::sync::mpsc;
 
-use ndn_packet::{Data, Name};
-use ndn_packet::encode::encode_interest;
 use ndn_ipc::RouterClient;
+use ndn_packet::encode::encode_interest;
+use ndn_packet::{Data, Name};
 
 use crate::AppError;
 use crate::connection::NdnConnection;
@@ -94,9 +94,12 @@ impl Subscriber {
         config: SubscriberConfig,
     ) -> Result<Self, AppError> {
         let group = group_prefix.into();
-        let client = RouterClient::connect(socket).await
+        let client = RouterClient::connect(socket)
+            .await
             .map_err(|e| AppError::Engine(e.into()))?;
-        client.register_prefix(&group).await
+        client
+            .register_prefix(&group)
+            .await
             .map_err(|e| AppError::Engine(e.into()))?;
 
         // Generate a local node name from PID.
@@ -220,7 +223,10 @@ impl Subscriber {
             }
         });
 
-        Ok(Self { sample_rx, _cancel: cancel })
+        Ok(Self {
+            sample_rx,
+            _cancel: cancel,
+        })
     }
 
     /// Receive the next sample. Returns `None` when the subscription ends.

@@ -15,19 +15,19 @@ use crate::control_parameters::ControlParameters;
 
 pub mod tlv {
     pub const CONTROL_RESPONSE: u64 = 0x65;
-    pub const STATUS_CODE:      u64 = 0x66;
-    pub const STATUS_TEXT:       u64 = 0x67;
+    pub const STATUS_CODE: u64 = 0x66;
+    pub const STATUS_TEXT: u64 = 0x67;
 }
 
 // ─── Status codes ────────────────────────────────────────────────────────────
 
 pub mod status {
-    pub const OK:            u64 = 200;
-    pub const BAD_PARAMS:    u64 = 400;
-    pub const UNAUTHORIZED:  u64 = 403;
-    pub const NOT_FOUND:     u64 = 404;
-    pub const CONFLICT:      u64 = 409;
-    pub const SERVER_ERROR:  u64 = 500;
+    pub const OK: u64 = 200;
+    pub const BAD_PARAMS: u64 = 400;
+    pub const UNAUTHORIZED: u64 = 403;
+    pub const NOT_FOUND: u64 = 404;
+    pub const CONFLICT: u64 = 409;
+    pub const SERVER_ERROR: u64 = 500;
 }
 
 // ─── ControlResponse ─────────────────────────────────────────────────────────
@@ -92,7 +92,8 @@ impl ControlResponse {
     /// Decode from a complete ControlResponse TLV (type 0x65).
     pub fn decode(wire: Bytes) -> Result<Self, ControlResponseError> {
         let mut r = TlvReader::new(wire);
-        let (typ, value) = r.read_tlv()
+        let (typ, value) = r
+            .read_tlv()
             .map_err(|_| ControlResponseError::MalformedTlv)?;
         if typ != tlv::CONTROL_RESPONSE {
             return Err(ControlResponseError::WrongType(typ));
@@ -108,7 +109,8 @@ impl ControlResponse {
         let mut body = None;
 
         while !r.is_empty() {
-            let (typ, val) = r.read_tlv()
+            let (typ, val) = r
+                .read_tlv()
                 .map_err(|_| ControlResponseError::MalformedTlv)?;
             match typ {
                 tlv::STATUS_CODE => {
@@ -179,8 +181,7 @@ fn read_non_neg_int(buf: &[u8]) -> Result<u64, ControlResponseError> {
         2 => Ok(u16::from_be_bytes([buf[0], buf[1]]) as u64),
         4 => Ok(u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as u64),
         8 => Ok(u64::from_be_bytes([
-            buf[0], buf[1], buf[2], buf[3],
-            buf[4], buf[5], buf[6], buf[7],
+            buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
         ])),
         _ => Err(ControlResponseError::InvalidNonNegInt),
     }
@@ -196,7 +197,9 @@ mod tests {
 
     fn name(components: &[&[u8]]) -> Name {
         Name::from_components(
-            components.iter().map(|c| NameComponent::generic(Bytes::copy_from_slice(c)))
+            components
+                .iter()
+                .map(|c| NameComponent::generic(Bytes::copy_from_slice(c))),
         )
     }
 
@@ -252,7 +255,10 @@ mod tests {
             w.write_tlv(tlv::STATUS_TEXT, b"oops");
         });
         let result = ControlResponse::decode(w.finish());
-        assert!(matches!(result, Err(ControlResponseError::MissingField("StatusCode"))));
+        assert!(matches!(
+            result,
+            Err(ControlResponseError::MissingField("StatusCode"))
+        ));
     }
 
     #[test]

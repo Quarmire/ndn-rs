@@ -12,7 +12,7 @@ use crate::NameTrie;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FibNexthop {
     pub face_id: u32,
-    pub cost:    u32,
+    pub cost: u32,
 }
 
 /// A FIB entry — the set of nexthops for one name prefix.
@@ -82,12 +82,14 @@ impl Default for Fib {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndn_packet::NameComponent;
     use bytes::Bytes;
+    use ndn_packet::NameComponent;
 
     fn name(components: &[&str]) -> Name {
         Name::from_components(
-            components.iter().map(|s| NameComponent::generic(Bytes::copy_from_slice(s.as_bytes())))
+            components
+                .iter()
+                .map(|s| NameComponent::generic(Bytes::copy_from_slice(s.as_bytes()))),
         )
     }
 
@@ -114,7 +116,7 @@ mod tests {
     #[test]
     fn lpm_most_specific_wins() {
         let fib = Fib::new();
-        fib.insert(&name(&["edu"]),         FibEntry::new(vec![nexthop(1, 10)]));
+        fib.insert(&name(&["edu"]), FibEntry::new(vec![nexthop(1, 10)]));
         fib.insert(&name(&["edu", "ucla"]), FibEntry::new(vec![nexthop(2, 0)]));
         let entry = fib.lpm(&name(&["edu", "ucla", "data"])).unwrap();
         assert_eq!(entry.nexthops[0].face_id, 2);
@@ -163,7 +165,7 @@ mod tests {
     #[test]
     fn remove_does_not_affect_parent() {
         let fib = Fib::new();
-        fib.insert(&name(&["a"]),      FibEntry::new(vec![nexthop(1, 0)]));
+        fib.insert(&name(&["a"]), FibEntry::new(vec![nexthop(1, 0)]));
         fib.insert(&name(&["a", "b"]), FibEntry::new(vec![nexthop(2, 0)]));
         fib.remove(&name(&["a", "b"]));
         assert!(fib.get(&name(&["a"])).is_some());

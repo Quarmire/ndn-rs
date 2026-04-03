@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use ndn_tlv::TlvWriter;
 
-use crate::tlv_type;
 use crate::encode::nni;
+use crate::tlv_type;
 
 /// Default MTU for UDP faces (conservative for Ethernet + IP + UDP headers).
 pub const DEFAULT_UDP_MTU: usize = 1400;
@@ -44,7 +44,8 @@ pub const FRAG_OVERHEAD: usize = 50;
 ///
 /// Panics if `mtu` is too small to fit even the fragmentation overhead.
 pub fn fragment_packet(packet: &[u8], mtu: usize, base_seq: u64) -> Vec<Bytes> {
-    let payload_cap = mtu.checked_sub(FRAG_OVERHEAD)
+    let payload_cap = mtu
+        .checked_sub(FRAG_OVERHEAD)
         .expect("MTU too small for fragmentation overhead");
     assert!(payload_cap > 0, "MTU too small");
 
@@ -74,10 +75,10 @@ pub fn fragment_packet(packet: &[u8], mtu: usize, base_seq: u64) -> Vec<Bytes> {
 
 /// State for one in-progress reassembly.
 struct Pending {
-    fragments:  Vec<Option<Bytes>>,
+    fragments: Vec<Option<Bytes>>,
     frag_count: usize,
-    received:   usize,
-    created:    Instant,
+    received: usize,
+    created: Instant,
 }
 
 /// Per-peer reassembly buffer for NDNLPv2 fragments.
@@ -91,7 +92,10 @@ pub struct ReassemblyBuffer {
 
 impl ReassemblyBuffer {
     pub fn new(timeout: Duration) -> Self {
-        Self { pending: HashMap::new(), timeout }
+        Self {
+            pending: HashMap::new(),
+            timeout,
+        }
     }
 
     /// Feed a decoded LpPacket fragment.
@@ -99,7 +103,13 @@ impl ReassemblyBuffer {
     /// Returns `Some(complete_packet)` when all fragments of the original
     /// packet have been received.  Returns `None` if fragments are still
     /// missing or if the packet has no fragmentation fields.
-    pub fn process(&mut self, seq: u64, frag_index: u64, frag_count: u64, fragment: Bytes) -> Option<Bytes> {
+    pub fn process(
+        &mut self,
+        seq: u64,
+        frag_index: u64,
+        frag_count: u64,
+        fragment: Bytes,
+    ) -> Option<Bytes> {
         let count = frag_count as usize;
         let idx = frag_index as usize;
 
@@ -127,7 +137,9 @@ impl ReassemblyBuffer {
 
         if entry.received == entry.frag_count {
             let entry = self.pending.remove(&seq).unwrap();
-            let total_len: usize = entry.fragments.iter()
+            let total_len: usize = entry
+                .fragments
+                .iter()
                 .map(|f| f.as_ref().unwrap().len())
                 .sum();
             let mut buf = Vec::with_capacity(total_len);
@@ -181,7 +193,11 @@ mod tests {
         // Create a packet larger than the MTU.
         let data: Vec<u8> = (0..3000).map(|i| (i % 256) as u8).collect();
         let frags = fragment_packet(&data, 200, 42);
-        assert!(frags.len() > 1, "expected multiple fragments, got {}", frags.len());
+        assert!(
+            frags.len() > 1,
+            "expected multiple fragments, got {}",
+            frags.len()
+        );
 
         // Reassemble using base_seq = sequence - frag_index.
         let mut buf = ReassemblyBuffer::default();
@@ -243,17 +259,32 @@ mod tests {
         // Feed all fragments, then re-feed the first one.
         for frag_bytes in &frags[..frags.len() - 1] {
             let lp = crate::lp::LpPacket::decode(frag_bytes.clone()).unwrap();
-            let r = buf.process(base_seq(&lp), lp.frag_index.unwrap(), lp.frag_count.unwrap(), lp.fragment.unwrap());
+            let r = buf.process(
+                base_seq(&lp),
+                lp.frag_index.unwrap(),
+                lp.frag_count.unwrap(),
+                lp.fragment.unwrap(),
+            );
             assert!(r.is_none());
         }
         // Duplicate of first fragment.
         let lp0 = crate::lp::LpPacket::decode(frags[0].clone()).unwrap();
-        let r = buf.process(base_seq(&lp0), lp0.frag_index.unwrap(), lp0.frag_count.unwrap(), lp0.fragment.unwrap());
+        let r = buf.process(
+            base_seq(&lp0),
+            lp0.frag_index.unwrap(),
+            lp0.frag_count.unwrap(),
+            lp0.fragment.unwrap(),
+        );
         assert!(r.is_none());
 
         // Now feed the last fragment to complete.
         let lp_last = crate::lp::LpPacket::decode(frags.last().unwrap().clone()).unwrap();
-        let r = buf.process(base_seq(&lp_last), lp_last.frag_index.unwrap(), lp_last.frag_count.unwrap(), lp_last.fragment.unwrap());
+        let r = buf.process(
+            base_seq(&lp_last),
+            lp_last.frag_index.unwrap(),
+            lp_last.frag_count.unwrap(),
+            lp_last.fragment.unwrap(),
+        );
         assert!(r.is_some());
     }
 
@@ -265,7 +296,12 @@ mod tests {
         let mut buf = ReassemblyBuffer::new(Duration::from_millis(0));
         // Feed only the first fragment.
         let lp = crate::lp::LpPacket::decode(frags[0].clone()).unwrap();
-        buf.process(base_seq(&lp), lp.frag_index.unwrap(), lp.frag_count.unwrap(), lp.fragment.unwrap());
+        buf.process(
+            base_seq(&lp),
+            lp.frag_index.unwrap(),
+            lp.frag_count.unwrap(),
+            lp.fragment.unwrap(),
+        );
         assert_eq!(buf.pending_count(), 1);
 
         // Purge — timeout is 0ms so everything is expired.
@@ -279,7 +315,11 @@ mod tests {
         let mtu = 500;
         let frags = fragment_packet(&data, mtu, 0);
         for (i, frag) in frags.iter().enumerate() {
-            assert!(frag.len() <= mtu, "fragment {i} is {} bytes, exceeds MTU {mtu}", frag.len());
+            assert!(
+                frag.len() <= mtu,
+                "fragment {i} is {} bytes, exceeds MTU {mtu}",
+                frag.len()
+            );
         }
     }
 }

@@ -3,8 +3,8 @@ use std::sync::OnceLock;
 
 use bytes::Bytes;
 
-use crate::{MetaInfo, Name, PacketError, SignatureInfo};
 use crate::tlv_type;
+use crate::{MetaInfo, Name, PacketError, SignatureInfo};
 use ndn_tlv::TlvReader;
 
 /// An NDN Data packet.
@@ -19,11 +19,11 @@ pub struct Data {
 
     /// Byte range of the signed region within `raw`.
     signed_start: usize,
-    signed_end:   usize,
+    signed_end: usize,
 
     /// Byte range of the SignatureValue within `raw`.
     sig_value_start: usize,
-    sig_value_end:   usize,
+    sig_value_end: usize,
 
     /// Name — always decoded eagerly.
     pub name: Arc<Name>,
@@ -61,14 +61,25 @@ impl Data {
         let name = Name::decode(name_val)?;
 
         if name.is_empty() {
-            return Err(PacketError::MalformedPacket("Data Name must have at least one component".into()));
+            return Err(PacketError::MalformedPacket(
+                "Data Name must have at least one component".into(),
+            ));
         }
 
         // Scan for SignatureValue to determine the signed region end.
         let mut sig_value_start = 0;
-        let mut sig_value_end   = 0;
-        let _ = scan_for_sig_value(&raw, outer_header_len, &mut sig_value_start, &mut sig_value_end);
-        let signed_end = if sig_value_start > 0 { sig_value_start } else { raw.len() };
+        let mut sig_value_end = 0;
+        let _ = scan_for_sig_value(
+            &raw,
+            outer_header_len,
+            &mut sig_value_start,
+            &mut sig_value_end,
+        );
+        let signed_end = if sig_value_start > 0 {
+            sig_value_start
+        } else {
+            raw.len()
+        };
 
         Ok(Self {
             raw,
@@ -78,8 +89,8 @@ impl Data {
             sig_value_end,
             name: Arc::new(name),
             meta_info: OnceLock::new(),
-            content:   OnceLock::new(),
-            sig_info:  OnceLock::new(),
+            content: OnceLock::new(),
+            sig_info: OnceLock::new(),
         })
     }
 
@@ -120,15 +131,21 @@ impl Data {
     }
 
     pub fn content(&self) -> Option<&Bytes> {
-        self.content.get_or_init(|| decode_content(&self.raw).ok().flatten()).as_ref()
+        self.content
+            .get_or_init(|| decode_content(&self.raw).ok().flatten())
+            .as_ref()
     }
 
     pub fn meta_info(&self) -> Option<&MetaInfo> {
-        self.meta_info.get_or_init(|| decode_meta_info(&self.raw).ok().flatten()).as_ref()
+        self.meta_info
+            .get_or_init(|| decode_meta_info(&self.raw).ok().flatten())
+            .as_ref()
     }
 
     pub fn sig_info(&self) -> Option<&SignatureInfo> {
-        self.sig_info.get_or_init(|| decode_sig_info(&self.raw).ok().flatten()).as_ref()
+        self.sig_info
+            .get_or_init(|| decode_sig_info(&self.raw).ok().flatten())
+            .as_ref()
     }
 
     /// Parse the delegation list from a Link object (ContentType=LINK).
@@ -166,7 +183,7 @@ fn scan_for_sig_value(
         let (typ, val) = reader.read_tlv()?;
         if typ == tlv_type::SIGNATURE_VALUE {
             *sig_start = pos;
-            *sig_end   = start + reader.position();
+            *sig_end = start + reader.position();
             return Ok(());
         }
         let _ = val;
@@ -283,7 +300,10 @@ mod tests {
         let raw = build_data_packet(&[b"test"], b"", Some(5000), 5, &[0x00]);
         let d = Data::decode(raw).unwrap();
         let mi = d.meta_info().expect("meta_info present");
-        assert_eq!(mi.freshness_period, Some(std::time::Duration::from_millis(5000)));
+        assert_eq!(
+            mi.freshness_period,
+            Some(std::time::Duration::from_millis(5000))
+        );
     }
 
     #[test]
@@ -414,7 +434,8 @@ mod tests {
     #[test]
     fn decode_wrong_type_errors() {
         let mut w = ndn_tlv::TlvWriter::new();
-        w.write_nested(0x05, |w| {  // INTEREST type, not DATA
+        w.write_nested(0x05, |w| {
+            // INTEREST type, not DATA
             w.write_nested(crate::tlv_type::NAME, |w| {
                 w.write_tlv(crate::tlv_type::NAME_COMPONENT, b"test");
             });

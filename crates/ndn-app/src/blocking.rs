@@ -18,7 +18,7 @@ use crate::AppError;
 
 /// Blocking NDN consumer.
 pub struct BlockingConsumer {
-    rt:    Runtime,
+    rt: Runtime,
     inner: super::Consumer,
 }
 
@@ -52,16 +52,13 @@ impl BlockingConsumer {
 
 /// Blocking NDN producer.
 pub struct BlockingProducer {
-    rt:    Runtime,
+    rt: Runtime,
     inner: super::Producer,
 }
 
 impl BlockingProducer {
     /// Connect to an external router and register a prefix (blocking).
-    pub fn connect(
-        socket: impl AsRef<Path>,
-        prefix: impl Into<Name>,
-    ) -> Result<Self, AppError> {
+    pub fn connect(socket: impl AsRef<Path>, prefix: impl Into<Name>) -> Result<Self, AppError> {
         let rt = Runtime::new().map_err(|e| AppError::Engine(e.into()))?;
         let inner = rt.block_on(super::Producer::connect(socket, prefix))?;
         Ok(Self { rt, inner })

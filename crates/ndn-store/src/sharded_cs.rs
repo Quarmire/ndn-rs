@@ -6,7 +6,7 @@ use bytes::Bytes;
 
 use ndn_packet::{Interest, Name};
 
-use crate::{CsCapacity, CsEntry, CsMeta, ContentStore, InsertResult};
+use crate::{ContentStore, CsCapacity, CsEntry, CsMeta, InsertResult};
 
 /// Shards a `ContentStore` across `N` instances to reduce lock contention.
 ///
@@ -17,7 +17,7 @@ use crate::{CsCapacity, CsEntry, CsMeta, ContentStore, InsertResult};
 /// The shard count is the length of the `shards` `Vec` and is fixed at
 /// construction time.
 pub struct ShardedCs<C: ContentStore> {
-    shards:      Vec<C>,
+    shards: Vec<C>,
     shard_count: usize,
 }
 
@@ -30,7 +30,10 @@ impl<C: ContentStore> ShardedCs<C> {
     pub fn new(shards: Vec<C>) -> Self {
         let shard_count = shards.len();
         assert!(shard_count > 0, "ShardedCs requires at least one shard");
-        Self { shards, shard_count }
+        Self {
+            shards,
+            shard_count,
+        }
     }
 
     /// Number of shards.
@@ -45,7 +48,7 @@ impl<C: ContentStore> ShardedCs<C> {
                 first.hash(&mut h);
                 (h.finish() as usize) % self.shard_count
             }
-            None => 0,  // root name → shard 0
+            None => 0, // root name → shard 0
         }
     }
 }
@@ -56,12 +59,7 @@ impl<C: ContentStore> ContentStore for ShardedCs<C> {
         self.shards[idx].get(interest).await
     }
 
-    async fn insert(
-        &self,
-        data: Bytes,
-        name: Arc<Name>,
-        meta: CsMeta,
-    ) -> InsertResult {
+    async fn insert(&self, data: Bytes, name: Arc<Name>, meta: CsMeta) -> InsertResult {
         let idx = self.shard_for(&name);
         self.shards[idx].insert(data, name, meta).await
     }
@@ -80,13 +78,13 @@ impl<C: ContentStore> ContentStore for ShardedCs<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndn_packet::NameComponent;
     use crate::LruCs;
+    use ndn_packet::NameComponent;
 
     fn arc_name(components: &[&str]) -> Arc<Name> {
-        Arc::new(Name::from_components(
-            components.iter().map(|s| NameComponent::generic(Bytes::copy_from_slice(s.as_bytes())))
-        ))
+        Arc::new(Name::from_components(components.iter().map(|s| {
+            NameComponent::generic(Bytes::copy_from_slice(s.as_bytes()))
+        })))
     }
 
     fn meta_fresh() -> CsMeta {
@@ -127,7 +125,8 @@ mod tests {
     async fn insert_then_get_roundtrip() {
         let cs = make_sharded(4, 65536);
         let name = arc_name(&["edu", "ucla", "data"]);
-        cs.insert(Bytes::from_static(b"payload"), name.clone(), meta_fresh()).await;
+        cs.insert(Bytes::from_static(b"payload"), name.clone(), meta_fresh())
+            .await;
         let entry = cs.get(&interest(&["edu", "ucla", "data"])).await.unwrap();
         assert_eq!(entry.data.as_ref(), b"payload");
     }
@@ -142,8 +141,18 @@ mod tests {
     async fn names_with_same_first_component_land_in_same_shard() {
         // /a/1 and /a/2 share first component → same shard → both accessible.
         let cs = make_sharded(4, 65536);
-        cs.insert(Bytes::from_static(b"v1"), arc_name(&["a", "1"]), meta_fresh()).await;
-        cs.insert(Bytes::from_static(b"v2"), arc_name(&["a", "2"]), meta_fresh()).await;
+        cs.insert(
+            Bytes::from_static(b"v1"),
+            arc_name(&["a", "1"]),
+            meta_fresh(),
+        )
+        .await;
+        cs.insert(
+            Bytes::from_static(b"v2"),
+            arc_name(&["a", "2"]),
+            meta_fresh(),
+        )
+        .await;
         assert!(cs.get(&interest(&["a", "1"])).await.is_some());
         assert!(cs.get(&interest(&["a", "2"])).await.is_some());
     }
@@ -154,7 +163,8 @@ mod tests {
     async fn evict_removes_entry() {
         let cs = make_sharded(2, 65536);
         let name = arc_name(&["b", "1"]);
-        cs.insert(Bytes::from_static(b"v"), name.clone(), meta_fresh()).await;
+        cs.insert(Bytes::from_static(b"v"), name.clone(), meta_fresh())
+            .await;
         assert!(cs.evict(&name).await);
         assert!(cs.get(&interest(&["b", "1"])).await.is_none());
     }
@@ -170,7 +180,8 @@ mod tests {
     #[tokio::test]
     async fn single_shard_works() {
         let cs = make_sharded(1, 65536);
-        cs.insert(Bytes::from_static(b"data"), arc_name(&["a"]), meta_fresh()).await;
+        cs.insert(Bytes::from_static(b"data"), arc_name(&["a"]), meta_fresh())
+            .await;
         assert!(cs.get(&interest(&["a"])).await.is_some());
     }
 }

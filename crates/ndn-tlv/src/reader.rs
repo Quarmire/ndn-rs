@@ -156,8 +156,10 @@ mod tests {
         let mut r = TlvReader::new(Bytes::from(raw));
         let (t1, v1) = r.read_tlv().unwrap();
         let (t2, v2) = r.read_tlv().unwrap();
-        assert_eq!(t1, 0x07); assert_eq!(v1.as_ref(), b"foo");
-        assert_eq!(t2, 0x08); assert_eq!(v2.as_ref(), b"bar");
+        assert_eq!(t1, 0x07);
+        assert_eq!(v1.as_ref(), b"foo");
+        assert_eq!(t2, 0x08);
+        assert_eq!(v2.as_ref(), b"bar");
         assert!(r.is_empty());
     }
 
@@ -242,7 +244,9 @@ mod tests {
         let inner2: Vec<u8> = vec![0x08, 0x01, b'A', 0x08, 0x01, b'B'];
         let mut raw2 = vec![0x07, inner2.len() as u8];
         raw2.extend_from_slice(&inner2);
-        raw2.push(0x15); raw2.push(0x01); raw2.push(0x99);
+        raw2.push(0x15);
+        raw2.push(0x01);
+        raw2.push(0x99);
         let mut r2 = TlvReader::new(Bytes::from(raw2));
         let _outer_type = r2.read_type().unwrap();
         let outer_len = r2.read_length().unwrap();
@@ -250,8 +254,10 @@ mod tests {
 
         let (t1, v1) = inner_r.read_tlv().unwrap();
         let (t2, v2) = inner_r.read_tlv().unwrap();
-        assert_eq!(t1, 0x08); assert_eq!(v1.as_ref(), b"A");
-        assert_eq!(t2, 0x08); assert_eq!(v2.as_ref(), b"B");
+        assert_eq!(t1, 0x08);
+        assert_eq!(v1.as_ref(), b"A");
+        assert_eq!(t2, 0x08);
+        assert_eq!(v2.as_ref(), b"B");
         assert!(inner_r.is_empty());
 
         // The outer reader should now be at the 0x15 TLV.

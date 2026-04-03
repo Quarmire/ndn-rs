@@ -1,5 +1,5 @@
-use std::sync::{Arc, Mutex};
 use dashmap::DashMap;
+use std::sync::{Arc, Mutex};
 
 use crate::{Face, FaceId};
 
@@ -14,9 +14,9 @@ use crate::{Face, FaceId};
 /// (`>= 0xFFFF_0000`) are never allocated by `alloc_id()` and are used for
 /// internal engine faces (e.g. the management `AppFace`).
 pub struct FaceTable {
-    faces:   DashMap<FaceId, Arc<dyn ErasedFace>>,
+    faces: DashMap<FaceId, Arc<dyn ErasedFace>>,
     next_id: std::sync::atomic::AtomicU32,
-    free:    Mutex<Vec<u32>>,
+    free: Mutex<Vec<u32>>,
 }
 
 /// Object-safe wrapper around the `Face` trait so it can be stored in a `DashMap`.
@@ -28,10 +28,18 @@ pub trait ErasedFace: Send + Sync + 'static {
     fn send_bytes(
         &self,
         pkt: bytes::Bytes,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), crate::face::FaceError>> + Send + '_>>;
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), crate::face::FaceError>> + Send + '_>,
+    >;
     fn recv_bytes(
         &self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bytes::Bytes, crate::face::FaceError>> + Send + '_>>;
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<bytes::Bytes, crate::face::FaceError>>
+                + Send
+                + '_,
+        >,
+    >;
 }
 
 impl<F: Face> ErasedFace for F {
@@ -54,13 +62,21 @@ impl<F: Face> ErasedFace for F {
     fn send_bytes(
         &self,
         pkt: bytes::Bytes,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), crate::face::FaceError>> + Send + '_>> {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), crate::face::FaceError>> + Send + '_>,
+    > {
         Box::pin(Face::send(self, pkt))
     }
 
     fn recv_bytes(
         &self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bytes::Bytes, crate::face::FaceError>> + Send + '_>> {
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<bytes::Bytes, crate::face::FaceError>>
+                + Send
+                + '_,
+        >,
+    > {
         Box::pin(Face::recv(self))
     }
 }
@@ -81,9 +97,9 @@ pub const RESERVED_FACE_ID_MIN: u32 = 0xFFFF_0000;
 impl FaceTable {
     pub fn new() -> Self {
         Self {
-            faces:   DashMap::new(),
+            faces: DashMap::new(),
             next_id: std::sync::atomic::AtomicU32::new(1),
-            free:    Mutex::new(Vec::new()),
+            free: Mutex::new(Vec::new()),
         }
     }
 
@@ -99,7 +115,9 @@ impl FaceTable {
         }
         // Otherwise allocate a fresh one, skipping over the reserved range.
         loop {
-            let id = self.next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let id = self
+                .next_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if id < RESERVED_FACE_ID_MIN {
                 return FaceId(id);
             }
@@ -165,15 +183,20 @@ impl FaceTable {
 
     /// Return detailed info for all registered faces.
     pub fn face_info(&self) -> Vec<FaceInfo> {
-        self.faces.iter().map(|r| FaceInfo {
-            id: r.id(),
-            kind: r.kind(),
-            remote_uri: r.remote_uri(),
-            local_uri: r.local_uri(),
-        }).collect()
+        self.faces
+            .iter()
+            .map(|r| FaceInfo {
+                id: r.id(),
+                kind: r.kind(),
+                remote_uri: r.remote_uri(),
+                local_uri: r.local_uri(),
+            })
+            .collect()
     }
 }
 
 impl Default for FaceTable {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }

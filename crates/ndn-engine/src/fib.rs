@@ -1,13 +1,13 @@
-use std::sync::Arc;
 use ndn_packet::Name;
 use ndn_store::NameTrie;
 use ndn_transport::FaceId;
+use std::sync::Arc;
 
 /// A single FIB nexthop: a face with an associated routing cost.
 #[derive(Clone, Debug)]
 pub struct FibNexthop {
     pub face_id: FaceId,
-    pub cost:    u32,
+    pub cost: u32,
 }
 
 /// A FIB entry at a name prefix: one or more nexthops.
@@ -18,7 +18,11 @@ pub struct FibEntry {
 
 impl FibEntry {
     pub fn nexthops_excluding(&self, exclude: FaceId) -> Vec<FibNexthop> {
-        self.nexthops.iter().filter(|n| n.face_id != exclude).cloned().collect()
+        self.nexthops
+            .iter()
+            .filter(|n| n.face_id != exclude)
+            .cloned()
+            .collect()
     }
 }
 
@@ -32,7 +36,9 @@ pub struct Fib {
 
 impl Fib {
     pub fn new() -> Self {
-        Self { trie: NameTrie::new() }
+        Self {
+            trie: NameTrie::new(),
+        }
     }
 
     /// Longest-prefix match lookup.
@@ -43,9 +49,7 @@ impl Fib {
     /// Register a nexthop for `prefix`. Replaces any existing entry.
     pub fn add_nexthop(&self, prefix: &Name, face_id: FaceId, cost: u32) {
         let existing = self.trie.get(prefix);
-        let mut nexthops = existing
-            .map(|e| e.nexthops.clone())
-            .unwrap_or_default();
+        let mut nexthops = existing.map(|e| e.nexthops.clone()).unwrap_or_default();
         // Remove any existing entry for this face, then add the new one.
         nexthops.retain(|n| n.face_id != face_id);
         nexthops.push(FibNexthop { face_id, cost });
@@ -71,8 +75,11 @@ impl Fib {
 
     /// Remove the nexthop for `face_id` from `prefix`.
     pub fn remove_nexthop(&self, prefix: &Name, face_id: FaceId) {
-        let Some(existing) = self.trie.get(prefix) else { return };
-        let nexthops: Vec<_> = existing.nexthops
+        let Some(existing) = self.trie.get(prefix) else {
+            return;
+        };
+        let nexthops: Vec<_> = existing
+            .nexthops
             .iter()
             .filter(|n| n.face_id != face_id)
             .cloned()
@@ -86,7 +93,9 @@ impl Fib {
 }
 
 impl Default for Fib {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]
@@ -203,8 +212,14 @@ mod tests {
     fn nexthops_excluding_filters_in_face() {
         let entry = FibEntry {
             nexthops: vec![
-                FibNexthop { face_id: FaceId(1), cost: 0 },
-                FibNexthop { face_id: FaceId(2), cost: 0 },
+                FibNexthop {
+                    face_id: FaceId(1),
+                    cost: 0,
+                },
+                FibNexthop {
+                    face_id: FaceId(2),
+                    cost: 0,
+                },
             ],
         };
         let filtered = entry.nexthops_excluding(FaceId(1));

@@ -1,5 +1,5 @@
-use bytes::Bytes;
 use crate::FaceId;
+use bytes::Bytes;
 
 /// A raw, undecoded packet as it enters the engine from a face task.
 ///
@@ -18,6 +18,10 @@ pub struct RawPacket {
 
 impl RawPacket {
     pub fn new(bytes: Bytes, face_id: FaceId, arrival: u64) -> Self {
-        Self { bytes, face_id, arrival }
+        Self {
+            bytes,
+            face_id,
+            arrival,
+        }
     }
 }

@@ -12,7 +12,7 @@ use ndn_tlv::TlvReader;
 /// The value is a zero-copy slice of the original packet buffer.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct NameComponent {
-    pub typ:   u64,
+    pub typ: u64,
     pub value: Bytes,
 }
 
@@ -22,7 +22,10 @@ impl NameComponent {
     }
 
     pub fn generic(value: Bytes) -> Self {
-        Self { typ: tlv_type::NAME_COMPONENT, value }
+        Self {
+            typ: tlv_type::NAME_COMPONENT,
+            value,
+        }
     }
 }
 
@@ -38,11 +41,15 @@ pub struct Name {
 impl Name {
     /// The root (empty) name `/`.
     pub fn root() -> Self {
-        Self { components: SmallVec::new() }
+        Self {
+            components: SmallVec::new(),
+        }
     }
 
     pub fn from_components(components: impl IntoIterator<Item = NameComponent>) -> Self {
-        Self { components: components.into_iter().collect() }
+        Self {
+            components: components.into_iter().collect(),
+        }
     }
 
     pub fn components(&self) -> &[NameComponent] {
@@ -62,7 +69,10 @@ impl Name {
         if prefix.len() > self.len() {
             return false;
         }
-        self.components.iter().zip(prefix.components.iter()).all(|(a, b)| a == b)
+        self.components
+            .iter()
+            .zip(prefix.components.iter())
+            .all(|(a, b)| a == b)
     }
 
     /// Decode a `Name` TLV from `reader`. The reader must be positioned at the
@@ -81,9 +91,10 @@ impl Name {
 
     /// Append a generic component from raw bytes.
     pub fn append(mut self, value: impl AsRef<[u8]>) -> Self {
-        self.components.push(NameComponent::generic(
-            Bytes::copy_from_slice(value.as_ref()),
-        ));
+        self.components
+            .push(NameComponent::generic(Bytes::copy_from_slice(
+                value.as_ref(),
+            )));
         self
     }
 
@@ -124,7 +135,9 @@ impl FromStr for Name {
 
         // Must start with '/'.
         if !s.starts_with('/') {
-            return Err(PacketError::MalformedPacket("name must start with '/'".into()));
+            return Err(PacketError::MalformedPacket(
+                "name must start with '/'".into(),
+            ));
         }
 
         let mut components = SmallVec::new();
@@ -132,8 +145,9 @@ impl FromStr for Name {
             if part.is_empty() {
                 continue; // tolerate trailing slash
             }
-            let decoded = percent_decode(part)
-                .map_err(|_| PacketError::MalformedPacket("invalid percent-encoding in name".into()))?;
+            let decoded = percent_decode(part).map_err(|_| {
+                PacketError::MalformedPacket("invalid percent-encoding in name".into())
+            })?;
             components.push(NameComponent::generic(Bytes::from(decoded)));
         }
 
@@ -262,7 +276,7 @@ mod tests {
 
     #[test]
     fn has_prefix_true() {
-        let name   = Name::from_components([comp(b"edu"), comp(b"ucla"), comp(b"news")]);
+        let name = Name::from_components([comp(b"edu"), comp(b"ucla"), comp(b"news")]);
         let prefix = Name::from_components([comp(b"edu"), comp(b"ucla")]);
         assert!(name.has_prefix(&prefix));
     }
@@ -281,14 +295,14 @@ mod tests {
 
     #[test]
     fn has_prefix_false_different_component() {
-        let name   = Name::from_components([comp(b"edu"), comp(b"ucla")]);
+        let name = Name::from_components([comp(b"edu"), comp(b"ucla")]);
         let prefix = Name::from_components([comp(b"edu"), comp(b"mit")]);
         assert!(!name.has_prefix(&prefix));
     }
 
     #[test]
     fn has_prefix_false_prefix_longer_than_name() {
-        let name   = Name::from_components([comp(b"edu")]);
+        let name = Name::from_components([comp(b"edu")]);
         let prefix = Name::from_components([comp(b"edu"), comp(b"ucla")]);
         assert!(!name.has_prefix(&prefix));
     }
@@ -349,9 +363,8 @@ mod tests {
 
     #[test]
     fn display_non_ascii_percent_encoded() {
-        let n = Name::from_components([NameComponent::generic(
-            bytes::Bytes::from(vec![0x00, 0xFF])
-        )]);
+        let n =
+            Name::from_components([NameComponent::generic(bytes::Bytes::from(vec![0x00, 0xFF]))]);
         // 0x00 is not ascii_graphic, 0xFF is not ascii_graphic
         assert_eq!(n.to_string(), "/%00%FF");
     }
@@ -375,8 +388,11 @@ mod tests {
 
     #[test]
     fn component_type_affects_equality() {
-        let generic  = NameComponent::generic(bytes::Bytes::copy_from_slice(b"abc"));
-        let implicit = NameComponent { typ: 0x01, value: bytes::Bytes::copy_from_slice(b"abc") };
+        let generic = NameComponent::generic(bytes::Bytes::copy_from_slice(b"abc"));
+        let implicit = NameComponent {
+            typ: 0x01,
+            value: bytes::Bytes::copy_from_slice(b"abc"),
+        };
         assert_ne!(generic, implicit);
     }
 

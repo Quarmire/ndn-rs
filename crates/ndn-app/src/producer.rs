@@ -12,7 +12,7 @@ use crate::connection::NdnConnection;
 
 /// High-level NDN producer — serves Data in response to Interests.
 pub struct Producer {
-    conn:   NdnConnection,
+    conn: NdnConnection,
     prefix: Name,
 }
 
@@ -23,16 +23,25 @@ impl Producer {
         prefix: impl Into<Name>,
     ) -> Result<Self, AppError> {
         let prefix = prefix.into();
-        let client = RouterClient::connect(socket).await
+        let client = RouterClient::connect(socket)
+            .await
             .map_err(|e| AppError::Engine(e.into()))?;
-        client.register_prefix(&prefix).await
+        client
+            .register_prefix(&prefix)
+            .await
             .map_err(|e| AppError::Engine(e.into()))?;
-        Ok(Self { conn: NdnConnection::External(client), prefix })
+        Ok(Self {
+            conn: NdnConnection::External(client),
+            prefix,
+        })
     }
 
     /// Create from an in-process AppHandle (embedded engine).
     pub fn from_handle(handle: AppHandle, prefix: Name) -> Self {
-        Self { conn: NdnConnection::Embedded(handle), prefix }
+        Self {
+            conn: NdnConnection::Embedded(handle),
+            prefix,
+        }
     }
 
     /// Run the producer loop with an async handler.

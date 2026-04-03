@@ -18,8 +18,8 @@ pub enum TrustPath {
 /// Application callbacks receive `SafeData`, not `Data` — the compiler enforces
 /// that unverified data cannot be passed where verified data is required.
 pub struct SafeData {
-    pub(crate) inner:       Data,
-    pub(crate) trust_path:  TrustPath,
+    pub(crate) inner: Data,
+    pub(crate) trust_path: TrustPath,
     pub(crate) verified_at: u64,
 }
 
@@ -29,8 +29,8 @@ impl SafeData {
     #[allow(dead_code)]
     pub(crate) fn from_local_trusted(data: Data, uid: u32) -> Self {
         Self {
-            inner:       data,
-            trust_path:  TrustPath::LocalFace { uid },
+            inner: data,
+            trust_path: TrustPath::LocalFace { uid },
             verified_at: now_ns(),
         }
     }
@@ -63,9 +63,21 @@ mod tests {
 
     fn minimal_data() -> Data {
         use ndn_tlv::TlvWriter;
-        let nc = { let mut w = TlvWriter::new(); w.write_tlv(0x08, b"test"); w.finish() };
-        let name_tlv = { let mut w = TlvWriter::new(); w.write_tlv(0x07, &nc); w.finish() };
-        let data_bytes = { let mut w = TlvWriter::new(); w.write_tlv(0x06, &name_tlv); w.finish() };
+        let nc = {
+            let mut w = TlvWriter::new();
+            w.write_tlv(0x08, b"test");
+            w.finish()
+        };
+        let name_tlv = {
+            let mut w = TlvWriter::new();
+            w.write_tlv(0x07, &nc);
+            w.finish()
+        };
+        let data_bytes = {
+            let mut w = TlvWriter::new();
+            w.write_tlv(0x06, &name_tlv);
+            w.finish()
+        };
         Data::decode(data_bytes).unwrap()
     }
 
@@ -73,7 +85,10 @@ mod tests {
     fn from_local_trusted_sets_uid() {
         let data = minimal_data();
         let safe = SafeData::from_local_trusted(data, 1000);
-        assert!(matches!(safe.trust_path(), TrustPath::LocalFace { uid: 1000 }));
+        assert!(matches!(
+            safe.trust_path(),
+            TrustPath::LocalFace { uid: 1000 }
+        ));
     }
 
     #[test]

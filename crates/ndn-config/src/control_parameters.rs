@@ -19,41 +19,41 @@ use ndn_tlv::{TlvReader, TlvWriter};
 
 pub mod tlv {
     pub const CONTROL_PARAMETERS: u64 = 0x68;
-    pub const FACE_ID:            u64 = 0x69;
-    pub const COST:               u64 = 0x6A;
-    pub const STRATEGY:           u64 = 0x6B;
-    pub const FLAGS:              u64 = 0x6C;
-    pub const EXPIRATION_PERIOD:  u64 = 0x6D;
-    pub const ORIGIN:             u64 = 0x6F;
-    pub const MASK:               u64 = 0x70;
-    pub const URI:                u64 = 0x72;
-    pub const LOCAL_URI:          u64 = 0x81;
-    pub const CAPACITY:           u64 = 0x83;
-    pub const FACE_PERSISTENCY:   u64 = 0x85;
+    pub const FACE_ID: u64 = 0x69;
+    pub const COST: u64 = 0x6A;
+    pub const STRATEGY: u64 = 0x6B;
+    pub const FLAGS: u64 = 0x6C;
+    pub const EXPIRATION_PERIOD: u64 = 0x6D;
+    pub const ORIGIN: u64 = 0x6F;
+    pub const MASK: u64 = 0x70;
+    pub const URI: u64 = 0x72;
+    pub const LOCAL_URI: u64 = 0x81;
+    pub const CAPACITY: u64 = 0x83;
+    pub const FACE_PERSISTENCY: u64 = 0x85;
     pub const BASE_CONG_INTERVAL: u64 = 0x87;
     pub const DEF_CONG_THRESHOLD: u64 = 0x88;
-    pub const MTU:                u64 = 0x89;
+    pub const MTU: u64 = 0x89;
 
     // Standard NDN Name type.
-    pub const NAME:               u64 = 0x07;
-    pub const NAME_COMPONENT:     u64 = 0x08;
+    pub const NAME: u64 = 0x07;
+    pub const NAME_COMPONENT: u64 = 0x08;
 }
 
 /// Route origin values (NFD RIB management).
 pub mod origin {
-    pub const APP:        u64 = 0;
-    pub const AUTOREG:    u64 = 64;
-    pub const CLIENT:     u64 = 65;
-    pub const AUTOCONF:   u64 = 66;
-    pub const NLSR:       u64 = 128;
+    pub const APP: u64 = 0;
+    pub const AUTOREG: u64 = 64;
+    pub const CLIENT: u64 = 65;
+    pub const AUTOCONF: u64 = 66;
+    pub const NLSR: u64 = 128;
     pub const PREFIX_ANN: u64 = 129;
-    pub const STATIC:     u64 = 255;
+    pub const STATIC: u64 = 255;
 }
 
 /// Route flags (NFD RIB management).
 pub mod route_flags {
     pub const CHILD_INHERIT: u64 = 1;
-    pub const CAPTURE:       u64 = 2;
+    pub const CAPTURE: u64 = 2;
 }
 
 // ─── ControlParameters ───────────────────────────────────────────────────────
@@ -61,18 +61,18 @@ pub mod route_flags {
 /// NFD ControlParameters — all fields optional.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ControlParameters {
-    pub name:               Option<Name>,
-    pub face_id:            Option<u64>,
-    pub uri:                Option<String>,
-    pub local_uri:          Option<String>,
-    pub origin:             Option<u64>,
-    pub cost:               Option<u64>,
-    pub flags:              Option<u64>,
-    pub mask:               Option<u64>,
-    pub expiration_period:  Option<u64>,
-    pub face_persistency:   Option<u64>,
-    pub strategy:           Option<Name>,
-    pub mtu:                Option<u64>,
+    pub name: Option<Name>,
+    pub face_id: Option<u64>,
+    pub uri: Option<String>,
+    pub local_uri: Option<String>,
+    pub origin: Option<u64>,
+    pub cost: Option<u64>,
+    pub flags: Option<u64>,
+    pub mask: Option<u64>,
+    pub expiration_period: Option<u64>,
+    pub face_persistency: Option<u64>,
+    pub strategy: Option<Name>,
+    pub mtu: Option<u64>,
 }
 
 impl ControlParameters {
@@ -141,7 +141,8 @@ impl ControlParameters {
     /// Decode from a complete ControlParameters TLV (type 0x68).
     pub fn decode(wire: Bytes) -> Result<Self, ControlParametersError> {
         let mut r = TlvReader::new(wire);
-        let (typ, value) = r.read_tlv()
+        let (typ, value) = r
+            .read_tlv()
             .map_err(|_| ControlParametersError::MalformedTlv)?;
         if typ != tlv::CONTROL_PARAMETERS {
             return Err(ControlParametersError::WrongType(typ));
@@ -155,7 +156,8 @@ impl ControlParameters {
         let mut params = ControlParameters::default();
 
         while !r.is_empty() {
-            let (typ, val) = r.read_tlv()
+            let (typ, val) = r
+                .read_tlv()
                 .map_err(|_| ControlParametersError::MalformedTlv)?;
             match typ {
                 tlv::NAME => {
@@ -192,7 +194,8 @@ impl ControlParameters {
                 }
                 tlv::STRATEGY => {
                     let mut inner = TlvReader::new(val);
-                    let (t, v) = inner.read_tlv()
+                    let (t, v) = inner
+                        .read_tlv()
                         .map_err(|_| ControlParametersError::MalformedTlv)?;
                     if t != tlv::NAME {
                         return Err(ControlParametersError::WrongType(t));
@@ -258,8 +261,7 @@ fn read_non_neg_int(buf: &[u8]) -> Result<u64, ControlParametersError> {
         2 => Ok(u16::from_be_bytes([buf[0], buf[1]]) as u64),
         4 => Ok(u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as u64),
         8 => Ok(u64::from_be_bytes([
-            buf[0], buf[1], buf[2], buf[3],
-            buf[4], buf[5], buf[6], buf[7],
+            buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
         ])),
         _ => Err(ControlParametersError::InvalidNonNegInt),
     }
@@ -279,7 +281,8 @@ fn decode_name(value: Bytes) -> Result<Name, ControlParametersError> {
     let mut r = TlvReader::new(value);
     let mut components = Vec::new();
     while !r.is_empty() {
-        let (typ, val) = r.read_tlv()
+        let (typ, val) = r
+            .read_tlv()
             .map_err(|_| ControlParametersError::MalformedTlv)?;
         components.push(NameComponent { typ, value: val });
     }
@@ -298,7 +301,9 @@ mod tests {
 
     fn name(components: &[&[u8]]) -> Name {
         Name::from_components(
-            components.iter().map(|c| NameComponent::generic(Bytes::copy_from_slice(c)))
+            components
+                .iter()
+                .map(|c| NameComponent::generic(Bytes::copy_from_slice(c))),
         )
     }
 
@@ -309,12 +314,25 @@ mod tests {
         assert_eq!(encode_non_neg_int(256), vec![1, 0]);
         assert_eq!(encode_non_neg_int(0xFFFF), vec![0xFF, 0xFF]);
         assert_eq!(encode_non_neg_int(0x10000), vec![0, 1, 0, 0]);
-        assert_eq!(encode_non_neg_int(0x1_0000_0000), vec![0, 0, 0, 1, 0, 0, 0, 0]);
+        assert_eq!(
+            encode_non_neg_int(0x1_0000_0000),
+            vec![0, 0, 0, 1, 0, 0, 0, 0]
+        );
     }
 
     #[test]
     fn non_neg_int_roundtrip() {
-        for v in [0u64, 1, 255, 256, 0xFFFF, 0x10000, 0xFFFF_FFFF, 0x1_0000_0000, u64::MAX] {
+        for v in [
+            0u64,
+            1,
+            255,
+            256,
+            0xFFFF,
+            0x10000,
+            0xFFFF_FFFF,
+            0x1_0000_0000,
+            u64::MAX,
+        ] {
             let encoded = encode_non_neg_int(v);
             let decoded = read_non_neg_int(&encoded).unwrap();
             assert_eq!(decoded, v, "roundtrip failed for {v}");
@@ -407,7 +425,10 @@ mod tests {
         let mut w = TlvWriter::new();
         w.write_nested(0x05, |_| {});
         let result = ControlParameters::decode(w.finish());
-        assert!(matches!(result, Err(ControlParametersError::WrongType(0x05))));
+        assert!(matches!(
+            result,
+            Err(ControlParametersError::WrongType(0x05))
+        ));
     }
 
     #[test]

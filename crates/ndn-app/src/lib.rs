@@ -49,32 +49,32 @@
 //! ```
 
 pub mod app_face;
-pub mod error;
 pub mod connection;
 pub mod consumer;
+pub mod error;
 pub mod producer;
-pub mod subscriber;
 pub mod queryable;
 pub mod security;
+pub mod subscriber;
 
 #[cfg(feature = "blocking")]
 pub mod blocking;
 
 pub use app_face::{AppFace, OutboundRequest};
-pub use error::AppError;
 pub use connection::NdnConnection;
 pub use consumer::{Consumer, DEFAULT_INTEREST_LIFETIME, DEFAULT_TIMEOUT};
+pub use error::AppError;
 pub use producer::Producer;
-pub use subscriber::{Subscriber, Sample, SubscriberConfig};
-pub use queryable::{Queryable, Query};
+pub use queryable::{Query, Queryable};
 pub use security::KeyChain;
+pub use subscriber::{Sample, Subscriber, SubscriberConfig};
 
 /// Re-export the engine builder for convenience.
 pub use ndn_engine::{EngineBuilder, ForwarderEngine, ShutdownHandle};
 
 /// Prelude for ergonomic imports.
 pub mod prelude {
-    pub use ndn_packet::{Name, Interest, Data, name};
-    pub use ndn_packet::encode::{InterestBuilder, DataBuilder};
-    pub use crate::{Consumer, Producer, Subscriber, Queryable, Query, KeyChain, AppError};
+    pub use crate::{AppError, Consumer, KeyChain, Producer, Query, Queryable, Subscriber};
+    pub use ndn_packet::encode::{DataBuilder, InterestBuilder};
+    pub use ndn_packet::{Data, Interest, Name, name};
 }

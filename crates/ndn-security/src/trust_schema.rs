@@ -1,6 +1,6 @@
+use ndn_packet::{Name, NameComponent};
 use std::collections::HashMap;
 use std::sync::Arc;
-use ndn_packet::{Name, NameComponent};
 
 /// A single component in a name pattern.
 #[derive(Clone, Debug)]
@@ -24,11 +24,7 @@ pub struct NamePattern(pub Vec<PatternComponent>);
 impl NamePattern {
     /// Attempt to match `name` against this pattern, extending `bindings`.
     /// Returns `true` if the match succeeds.
-    pub fn matches(
-        &self,
-        name: &Name,
-        bindings: &mut HashMap<Arc<str>, NameComponent>,
-    ) -> bool {
+    pub fn matches(&self, name: &Name, bindings: &mut HashMap<Arc<str>, NameComponent>) -> bool {
         let components = name.components();
         let mut name_idx = 0;
 
@@ -70,7 +66,7 @@ impl NamePattern {
 #[derive(Clone, Debug)]
 pub struct SchemaRule {
     pub data_pattern: NamePattern,
-    pub key_pattern:  NamePattern,
+    pub key_pattern: NamePattern,
 }
 
 impl SchemaRule {
@@ -89,7 +85,9 @@ pub struct TrustSchema {
 }
 
 impl TrustSchema {
-    pub fn new() -> Self { Self { rules: Vec::new() } }
+    pub fn new() -> Self {
+        Self { rules: Vec::new() }
+    }
 
     pub fn add_rule(&mut self, rule: SchemaRule) {
         self.rules.push(rule);
@@ -147,7 +145,7 @@ mod tests {
     fn capture_enforces_consistency() {
         let var: Arc<str> = Arc::from("node");
         let data_pat = NamePattern(vec![PatternComponent::Capture(Arc::clone(&var))]);
-        let key_pat  = NamePattern(vec![PatternComponent::Capture(Arc::clone(&var))]);
+        let key_pat = NamePattern(vec![PatternComponent::Capture(Arc::clone(&var))]);
         let mut bindings = HashMap::new();
         // Bind node = "n1" via data pattern
         assert!(data_pat.matches(&name(&["n1"]), &mut bindings));
@@ -170,7 +168,7 @@ mod tests {
     fn schema_rule_allows_matching_pair() {
         let rule = SchemaRule {
             data_pattern: NamePattern(vec![PatternComponent::Literal(comp("data"))]),
-            key_pattern:  NamePattern(vec![PatternComponent::Literal(comp("key"))]),
+            key_pattern: NamePattern(vec![PatternComponent::Literal(comp("key"))]),
         };
         assert!(rule.check(&name(&["data"]), &name(&["key"])));
         assert!(!rule.check(&name(&["data"]), &name(&["wrong"])));
@@ -181,7 +179,7 @@ mod tests {
         let mut schema = TrustSchema::new();
         schema.add_rule(SchemaRule {
             data_pattern: NamePattern(vec![PatternComponent::Literal(comp("data"))]),
-            key_pattern:  NamePattern(vec![PatternComponent::Literal(comp("key"))]),
+            key_pattern: NamePattern(vec![PatternComponent::Literal(comp("key"))]),
         });
         assert!(schema.allows(&name(&["data"]), &name(&["key"])));
         assert!(!schema.allows(&name(&["data"]), &name(&["wrong"])));

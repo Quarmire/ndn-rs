@@ -69,7 +69,10 @@ impl SyncHandle {
 
     /// Announce that we published new data under `name`.
     pub async fn publish(&self, name: Name) -> Result<(), SyncError> {
-        self.tx.send(name).await.map_err(|_| SyncError::Disconnected)
+        self.tx
+            .send(name)
+            .await
+            .map_err(|_| SyncError::Disconnected)
     }
 
     /// Leave the sync group.

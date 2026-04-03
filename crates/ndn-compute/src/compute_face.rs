@@ -1,7 +1,7 @@
-use std::sync::Arc;
+use crate::ComputeRegistry;
 use bytes::Bytes;
 use ndn_transport::{Face, FaceError, FaceId, FaceKind};
-use crate::ComputeRegistry;
+use std::sync::Arc;
 
 /// A synthetic face that routes Interests to registered compute handlers.
 ///
@@ -10,7 +10,7 @@ use crate::ComputeRegistry;
 /// and the resulting Data is injected back into the pipeline as if it
 /// arrived from a remote face. The CS caches the result automatically.
 pub struct ComputeFace {
-    id:       FaceId,
+    id: FaceId,
     registry: Arc<ComputeRegistry>,
     // Sender to inject computed Data back into the pipeline.
     // TODO: wire to pipeline mpsc channel
@@ -23,8 +23,12 @@ impl ComputeFace {
 }
 
 impl Face for ComputeFace {
-    fn id(&self) -> FaceId { self.id }
-    fn kind(&self) -> FaceKind { FaceKind::Compute }
+    fn id(&self) -> FaceId {
+        self.id
+    }
+    fn kind(&self) -> FaceKind {
+        FaceKind::Compute
+    }
 
     async fn recv(&self) -> Result<Bytes, FaceError> {
         // ComputeFace never receives packets from the network —

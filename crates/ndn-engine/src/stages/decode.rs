@@ -4,11 +4,11 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use tracing::trace;
 
-use ndn_packet::{Data, Interest, Nack, Name, tlv_type};
 use ndn_packet::encode::ensure_nonce;
 use ndn_packet::fragment::ReassemblyBuffer;
 use ndn_packet::lp::{LpPacket, extract_fragment, is_lp_packet};
-use ndn_pipeline::{Action, DropReason, PacketContext, DecodedPacket};
+use ndn_packet::{Data, Interest, Nack, Name, tlv_type};
+use ndn_pipeline::{Action, DecodedPacket, DropReason, PacketContext};
 use ndn_transport::{FaceId, FaceScope, FaceTable};
 
 /// Check if a name starts with `/localhost`.
@@ -54,7 +54,11 @@ impl TlvDecodeStage {
     /// - `Err(bytes)` — not a fragment (bare packet, unfragmented LpPacket, or
     ///   Nack); caller should process through the full pipeline. The original
     ///   bytes are returned back.
-    pub fn try_collect_fragment(&self, face_id: FaceId, raw: Bytes) -> Result<Option<Bytes>, Bytes> {
+    pub fn try_collect_fragment(
+        &self,
+        face_id: FaceId,
+        raw: Bytes,
+    ) -> Result<Option<Bytes>, Bytes> {
         // Lightweight parse: only extract fragmentation fields, no Bytes
         // allocation, no Nack/CongestionMark parsing.
         let hdr = match extract_fragment(&raw) {
@@ -63,7 +67,8 @@ impl TlvDecodeStage {
         };
         let fragment = raw.slice(hdr.frag_start..hdr.frag_end);
         let base_seq = hdr.sequence - hdr.frag_index;
-        let mut rb = self.reassembly
+        let mut rb = self
+            .reassembly
             .entry(face_id)
             .or_insert_with(ReassemblyBuffer::default);
         Ok(rb.process(base_seq, hdr.frag_index, hdr.frag_count, fragment))
@@ -86,21 +91,21 @@ impl TlvDecodeStage {
 
         match first_byte {
             t if t == tlv_type::INTEREST => self.decode_interest(ctx),
-            t if t == tlv_type::DATA => {
-                match Data::decode(ctx.raw_bytes.clone()) {
-                    Ok(data) => {
-                        trace!(face=%ctx.face_id, name=%data.name, "decode: Data");
-                        ctx.name   = Some(data.name.clone());
-                        ctx.packet = DecodedPacket::Data(Box::new(data));
-                        if let Some(drop) = self.check_scope(&ctx) { return drop; }
-                        Action::Continue(ctx)
+            t if t == tlv_type::DATA => match Data::decode(ctx.raw_bytes.clone()) {
+                Ok(data) => {
+                    trace!(face=%ctx.face_id, name=%data.name, "decode: Data");
+                    ctx.name = Some(data.name.clone());
+                    ctx.packet = DecodedPacket::Data(Box::new(data));
+                    if let Some(drop) = self.check_scope(&ctx) {
+                        return drop;
                     }
-                    Err(e) => {
-                        trace!(face=%ctx.face_id, error=%e, "decode: malformed Data");
-                        Action::Drop(DropReason::MalformedPacket)
-                    }
+                    Action::Continue(ctx)
                 }
-            }
+                Err(e) => {
+                    trace!(face=%ctx.face_id, error=%e, "decode: malformed Data");
+                    Action::Drop(DropReason::MalformedPacket)
+                }
+            },
             _ => {
                 trace!(face=%ctx.face_id, tlv_type=first_byte, "decode: unknown TLV type");
                 Action::Drop(DropReason::MalformedPacket)
@@ -118,9 +123,11 @@ impl TlvDecodeStage {
                 }
                 trace!(face=%ctx.face_id, name=%interest.name, nonce=?interest.nonce(), "decode: Interest");
                 ctx.raw_bytes = ensure_nonce(&ctx.raw_bytes);
-                ctx.name   = Some(interest.name.clone());
+                ctx.name = Some(interest.name.clone());
                 ctx.packet = DecodedPacket::Interest(Box::new(interest));
-                if let Some(drop) = self.check_scope(&ctx) { return drop; }
+                if let Some(drop) = self.check_scope(&ctx) {
+                    return drop;
+                }
                 Action::Continue(ctx)
             }
             Err(e) => {
@@ -134,7 +141,9 @@ impl TlvDecodeStage {
     fn check_scope(&self, ctx: &PacketContext) -> Option<Action> {
         if let Some(ref name) = ctx.name {
             if is_localhost_name(name) {
-                let is_non_local = self.face_table.get(ctx.face_id)
+                let is_non_local = self
+                    .face_table
+                    .get(ctx.face_id)
                     .is_some_and(|f| f.kind().scope() == FaceScope::NonLocal);
                 if is_non_local {
                     trace!(face=%ctx.face_id, name=%name, "decode: /localhost on non-local face, dropping");
@@ -185,18 +194,14 @@ impl TlvDecodeStage {
         if is_fragmented {
             let face_id = ctx.face_id;
             let complete = {
-                let mut rb = self.reassembly
+                let mut rb = self
+                    .reassembly
                     .entry(face_id)
                     .or_insert_with(ReassemblyBuffer::default);
                 let seq = sequence.unwrap_or(0);
                 let idx = frag_index.unwrap_or(0);
                 let base_seq = seq - idx;
-                rb.process(
-                    base_seq,
-                    idx,
-                    frag_count.unwrap_or(1),
-                    fragment,
-                )
+                rb.process(base_seq, idx, frag_count.unwrap_or(1), fragment)
             };
             match complete {
                 Some(packet) => {
@@ -217,9 +222,11 @@ impl TlvDecodeStage {
                 Ok(interest) => {
                     trace!(face=%ctx.face_id, name=%interest.name, reason=?reason, "decode: Nack");
                     let nack = Nack::new(interest, reason);
-                    ctx.name   = Some(nack.interest.name.clone());
+                    ctx.name = Some(nack.interest.name.clone());
                     ctx.packet = DecodedPacket::Nack(Box::new(nack));
-                    if let Some(drop) = self.check_scope(&ctx) { return drop; }
+                    if let Some(drop) = self.check_scope(&ctx) {
+                        return drop;
+                    }
                     Action::Continue(ctx)
                 }
                 Err(e) => {

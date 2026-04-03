@@ -13,19 +13,24 @@ pub struct NameTrie<V: Clone + Send + Sync + 'static> {
 }
 
 struct TrieNode<V> {
-    entry:    Option<V>,
+    entry: Option<V>,
     children: HashMap<NameComponent, Arc<RwLock<TrieNode<V>>>>,
 }
 
 impl<V> TrieNode<V> {
     fn new() -> Self {
-        Self { entry: None, children: HashMap::new() }
+        Self {
+            entry: None,
+            children: HashMap::new(),
+        }
     }
 }
 
 impl<V: Clone + Send + Sync + 'static> NameTrie<V> {
     pub fn new() -> Self {
-        Self { root: Arc::new(RwLock::new(TrieNode::new())) }
+        Self {
+            root: Arc::new(RwLock::new(TrieNode::new())),
+        }
     }
 
     /// Longest-prefix match — returns the value at the deepest matching node.
@@ -143,9 +148,9 @@ impl<V: Clone + Send + Sync + 'static> Default for NameTrie<V> {
 
 /// Depth-first collection of all (Name, V) entries at or below `node`.
 fn dump_subtree<V: Clone + Send + Sync + 'static>(
-    node:   &Arc<RwLock<TrieNode<V>>>,
-    path:   &mut Vec<NameComponent>,
-    out:    &mut Vec<(Name, V)>,
+    node: &Arc<RwLock<TrieNode<V>>>,
+    path: &mut Vec<NameComponent>,
+    out: &mut Vec<(Name, V)>,
 ) {
     let guard = node.read().unwrap();
     if let Some(v) = &guard.entry {
@@ -182,12 +187,14 @@ fn first_in_subtree<V: Clone>(node: &Arc<RwLock<TrieNode<V>>>) -> Option<V> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndn_packet::{Name, NameComponent};
     use bytes::Bytes;
+    use ndn_packet::{Name, NameComponent};
 
     fn name(components: &[&str]) -> Name {
         Name::from_components(
-            components.iter().map(|s| NameComponent::generic(Bytes::copy_from_slice(s.as_bytes())))
+            components
+                .iter()
+                .map(|s| NameComponent::generic(Bytes::copy_from_slice(s.as_bytes()))),
         )
     }
 

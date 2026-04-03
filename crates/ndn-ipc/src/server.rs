@@ -11,7 +11,7 @@ use ndn_packet::Name;
 ///
 /// The prefix is the name under which this server handles incoming Interests.
 pub struct IpcServer<F> {
-    face:   Arc<F>,
+    face: Arc<F>,
     prefix: Name,
 }
 
@@ -40,9 +40,7 @@ mod tests {
     #[test]
     fn new_and_accessors() {
         let (face, _rx) = AppFace::new(FaceId(2), 8);
-        let prefix = Name::from_components([
-            NameComponent::generic(Bytes::from_static(b"svc"))
-        ]);
+        let prefix = Name::from_components([NameComponent::generic(Bytes::from_static(b"svc"))]);
         let server = IpcServer::new(Arc::new(face), prefix.clone());
         assert_eq!(server.prefix(), &prefix);
         assert_eq!(server.face().id(), FaceId(2));

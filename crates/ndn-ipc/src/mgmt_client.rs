@@ -25,7 +25,7 @@ use tokio::sync::Mutex;
 
 use ndn_config::{
     ControlParameters, ControlResponse,
-    nfd_command::{module, verb, command_name, dataset_name},
+    nfd_command::{command_name, dataset_name, module, verb},
 };
 use ndn_face_local::UnixFace;
 use ndn_packet::{Name, encode::encode_interest};
@@ -45,15 +45,20 @@ pub struct MgmtClient {
 impl MgmtClient {
     /// Connect to the router's face socket.
     pub async fn connect(face_socket: impl AsRef<Path>) -> Result<Self, RouterError> {
-        let face = Arc::new(
-            ndn_face_local::unix_face_connect(FaceId(0), face_socket.as_ref()).await?
-        );
-        Ok(Self { face, recv_lock: Mutex::new(()) })
+        let face =
+            Arc::new(ndn_face_local::unix_face_connect(FaceId(0), face_socket.as_ref()).await?);
+        Ok(Self {
+            face,
+            recv_lock: Mutex::new(()),
+        })
     }
 
     /// Wrap an existing UnixFace (e.g. from a `RouterClient`).
     pub fn from_face(face: Arc<UnixFace>) -> Self {
-        Self { face, recv_lock: Mutex::new(()) }
+        Self {
+            face,
+            recv_lock: Mutex::new(()),
+        }
     }
 
     // ─── Route management ───────────────────────────────────────────────
@@ -135,10 +140,7 @@ impl MgmtClient {
     }
 
     /// Unset forwarding strategy for a prefix: `strategy-choice/unset`.
-    pub async fn strategy_unset(
-        &self,
-        prefix: &Name,
-    ) -> Result<ControlParameters, RouterError> {
+    pub async fn strategy_unset(&self, prefix: &Name) -> Result<ControlParameters, RouterError> {
         let params = ControlParameters {
             name: Some(prefix.clone()),
             ..Default::default()
@@ -212,11 +214,10 @@ impl MgmtClient {
         self.face.send(interest_wire).await?;
 
         let data_wire = self.face.recv().await?;
-        let data = ndn_packet::Data::decode(data_wire)
-            .map_err(|_| RouterError::MalformedResponse)?;
+        let data =
+            ndn_packet::Data::decode(data_wire).map_err(|_| RouterError::MalformedResponse)?;
 
-        let content = data.content()
-            .ok_or(RouterError::MalformedResponse)?;
+        let content = data.content().ok_or(RouterError::MalformedResponse)?;
 
         ControlResponse::decode(Bytes::copy_from_slice(content))
             .map_err(|_| RouterError::MalformedResponse)

@@ -14,7 +14,7 @@
 
 use std::time::Duration;
 
-use bytes::{Bytes, BytesMut, BufMut, Buf};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -75,7 +75,17 @@ pub fn join_svs_group(
 
     let task_cancel = cancel.clone();
     tokio::spawn(async move {
-        svs_task(group, local_name, send, recv, publish_rx, update_tx, config, task_cancel).await;
+        svs_task(
+            group,
+            local_name,
+            send,
+            recv,
+            publish_rx,
+            update_tx,
+            config,
+            task_cancel,
+        )
+        .await;
     });
 
     SyncHandle::new(update_rx, publish_tx, cancel)
@@ -96,9 +106,7 @@ async fn svs_task(
 
     loop {
         // Jittered sync interval.
-        let jitter = Duration::from_millis(
-            fastrand::u64(0..=config.jitter_ms)
-        );
+        let jitter = Duration::from_millis(fastrand::u64(0..=config.jitter_ms));
         let interval = config.sync_interval + jitter;
 
         tokio::select! {
@@ -189,19 +197,26 @@ fn parse_sync_interest(group: &Name, raw: &[u8]) -> Option<Vec<(String, u64)>> {
 
     // Verify the interest is under our group prefix + "svs".
     let group_len = group.components().len();
-    if components.len() < group_len + 2 { return None; }
+    if components.len() < group_len + 2 {
+        return None;
+    }
 
     // Check "svs" component.
     let svs_comp = &components[group_len];
-    if svs_comp.value.as_ref() != b"svs" { return None; }
+    if svs_comp.value.as_ref() != b"svs" {
+        return None;
+    }
 
     // The next component is the encoded state vector.
     let sv_comp = &components[group_len + 1];
     let pairs = decode_state_vector(&sv_comp.value);
 
-    Some(pairs.into_iter().map(|(hash, seq)| {
-        (format!("{hash:016x}"), seq)
-    }).collect())
+    Some(
+        pairs
+            .into_iter()
+            .map(|(hash, seq)| (format!("{hash:016x}"), seq))
+            .collect(),
+    )
 }
 
 /// Hash a node key string to a 64-bit value for compact wire encoding.
@@ -222,8 +237,14 @@ mod tests {
     #[test]
     fn state_vector_roundtrip() {
         let entries = vec![
-            StateVectorEntry { node: "alice".into(), seq: 5 },
-            StateVectorEntry { node: "bob".into(), seq: 12 },
+            StateVectorEntry {
+                node: "alice".into(),
+                seq: 5,
+            },
+            StateVectorEntry {
+                node: "bob".into(),
+                seq: 12,
+            },
         ];
         let encoded = encode_state_vector(&entries);
         let decoded = decode_state_vector(&encoded);

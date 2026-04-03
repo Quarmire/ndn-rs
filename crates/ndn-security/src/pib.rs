@@ -6,7 +6,7 @@ use thiserror::Error;
 
 use ndn_packet::{Name, NameComponent};
 
-use crate::{cert_cache::Certificate, signer::Ed25519Signer, TrustError};
+use crate::{TrustError, cert_cache::Certificate, signer::Ed25519Signer};
 
 // ─── Error ────────────────────────────────────────────────────────────────────
 
@@ -79,7 +79,10 @@ impl FilePib {
         if !root.join("keys").exists() {
             return Err(PibError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                format!("PIB not found at {} (run `ndn-sec keygen` to create one)", root.display()),
+                format!(
+                    "PIB not found at {} (run `ndn-sec keygen` to create one)",
+                    root.display()
+                ),
             )));
         }
         Ok(Self { root })
@@ -106,11 +109,14 @@ impl FilePib {
 
     /// Load the signer for `key_name` from the PIB.
     pub fn get_signer(&self, key_name: &Name) -> Result<Ed25519Signer, PibError> {
-        let dir = self.existing_key_dir(key_name)
+        let dir = self
+            .existing_key_dir(key_name)
             .ok_or_else(|| PibError::KeyNotFound(name_to_uri(key_name)))?;
         let seed_bytes = std::fs::read(dir.join("private.key"))?;
         if seed_bytes.len() != 32 {
-            return Err(PibError::Corrupt("private.key must be exactly 32 bytes".into()));
+            return Err(PibError::Corrupt(
+                "private.key must be exactly 32 bytes".into(),
+            ));
         }
         let mut seed = [0u8; 32];
         seed.copy_from_slice(&seed_bytes);
@@ -141,7 +147,8 @@ impl FilePib {
 
     /// Load the certificate for `key_name`.
     pub fn get_cert(&self, key_name: &Name) -> Result<Certificate, PibError> {
-        let dir = self.existing_key_dir(key_name)
+        let dir = self
+            .existing_key_dir(key_name)
             .ok_or_else(|| PibError::CertNotFound(name_to_uri(key_name)))?;
         let data = std::fs::read(dir.join("cert.ndnc"))
             .map_err(|_| PibError::CertNotFound(name_to_uri(key_name)))?;
@@ -170,16 +177,18 @@ impl FilePib {
     /// Load all trust anchor certificates from the PIB.
     pub fn trust_anchors(&self) -> Result<Vec<Certificate>, PibError> {
         let anchors_root = self.root.join("anchors");
-        if !anchors_root.exists() { return Ok(vec![]); }
+        if !anchors_root.exists() {
+            return Ok(vec![]);
+        }
         let mut certs = Vec::new();
         for entry in std::fs::read_dir(&anchors_root)? {
             let entry = entry?;
             let path = entry.path();
-            if !path.is_dir() { continue; }
-            let name_uri = std::fs::read_to_string(path.join("name.uri"))
-                .unwrap_or_default();
-            let name = name_from_uri(name_uri.trim())
-                .unwrap_or_else(|_| Name::root());
+            if !path.is_dir() {
+                continue;
+            }
+            let name_uri = std::fs::read_to_string(path.join("name.uri")).unwrap_or_default();
+            let name = name_from_uri(name_uri.trim()).unwrap_or_else(|_| Name::root());
             if let Ok(data) = std::fs::read(path.join("cert.ndnc")) {
                 if let Ok(cert) = decode_cert(Arc::new(name), &data) {
                     certs.push(cert);
@@ -242,14 +251,19 @@ fn decode_cert(name: Arc<Name>, data: &[u8]) -> Result<Certificate, PibError> {
         return Err(PibError::Corrupt("invalid magic bytes".into()));
     }
     // data[4] = version (reserved for future format changes)
-    let valid_from  = u64::from_be_bytes(data[5..13].try_into().unwrap());
+    let valid_from = u64::from_be_bytes(data[5..13].try_into().unwrap());
     let valid_until = u64::from_be_bytes(data[13..21].try_into().unwrap());
-    let pk_len      = u32::from_be_bytes(data[21..25].try_into().unwrap()) as usize;
+    let pk_len = u32::from_be_bytes(data[21..25].try_into().unwrap()) as usize;
     if data.len() < 25 + pk_len {
         return Err(PibError::Corrupt("cert data truncated".into()));
     }
     let pk = Bytes::copy_from_slice(&data[25..25 + pk_len]);
-    Ok(Certificate { name, public_key: pk, valid_from, valid_until })
+    Ok(Certificate {
+        name,
+        public_key: pk,
+        valid_from,
+        valid_until,
+    })
 }
 
 // ─── Name helpers ─────────────────────────────────────────────────────────────
@@ -277,18 +291,23 @@ fn hex_encode(bytes: &[u8]) -> String {
 /// Component bytes that are not URI-safe (alphanumeric, `-`, `.`, `_`, `~`)
 /// are percent-encoded as `%XX`.
 pub fn name_to_uri(name: &Name) -> String {
-    if name.components().is_empty() { return "/".to_string(); }
-    name.components().iter().map(|c| {
-        let mut s = String::from("/");
-        for &b in c.value.iter() {
-            if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
-                s.push(b as char);
-            } else {
-                s.push_str(&format!("%{:02X}", b));
+    if name.components().is_empty() {
+        return "/".to_string();
+    }
+    name.components()
+        .iter()
+        .map(|c| {
+            let mut s = String::from("/");
+            for &b in c.value.iter() {
+                if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+                    s.push(b as char);
+                } else {
+                    s.push_str(&format!("%{:02X}", b));
+                }
             }
-        }
-        s
-    }).collect()
+            s
+        })
+        .collect()
 }
 
 /// Parse an NDN URI such as `/ndn/router1` or `/ndn/KEY/%08abc` into a `Name`.
@@ -330,12 +349,16 @@ fn hex_digit(b: u8) -> Option<u8> {
 }
 
 fn list_names_in(dir: &Path) -> Result<Vec<Name>, PibError> {
-    if !dir.exists() { return Ok(vec![]); }
+    if !dir.exists() {
+        return Ok(vec![]);
+    }
     let mut names = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        if !path.is_dir() { continue; }
+        if !path.is_dir() {
+            continue;
+        }
         let uri_path = path.join("name.uri");
         if uri_path.exists() {
             let uri = std::fs::read_to_string(&uri_path)?;
@@ -362,10 +385,10 @@ fn random_seed() -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Signer;
     use bytes::Bytes;
     use ndn_packet::NameComponent;
     use std::time::{SystemTime, UNIX_EPOCH};
-    use crate::Signer;
 
     fn key_name(s: &str) -> Name {
         Name::from_components([NameComponent::generic(Bytes::copy_from_slice(s.as_bytes()))])
@@ -411,7 +434,10 @@ mod tests {
     fn get_signer_missing_key_errors() {
         let (_dir, pib) = tmp_pib();
         let name = key_name("missing");
-        assert!(matches!(pib.get_signer(&name), Err(PibError::KeyNotFound(_))));
+        assert!(matches!(
+            pib.get_signer(&name),
+            Err(PibError::KeyNotFound(_))
+        ));
     }
 
     #[test]
@@ -420,7 +446,10 @@ mod tests {
         let name = key_name("delkey");
         pib.generate_ed25519(&name).unwrap();
         pib.delete_key(&name).unwrap();
-        assert!(matches!(pib.get_signer(&name), Err(PibError::KeyNotFound(_))));
+        assert!(matches!(
+            pib.get_signer(&name),
+            Err(PibError::KeyNotFound(_))
+        ));
     }
 
     #[test]
@@ -443,9 +472,9 @@ mod tests {
         let pk = Bytes::copy_from_slice(&signer.public_key_bytes());
         let now = now_ns();
         let cert = Certificate {
-            name:        Arc::new(name.clone()),
-            public_key:  pk.clone(),
-            valid_from:  now,
+            name: Arc::new(name.clone()),
+            public_key: pk.clone(),
+            valid_from: now,
             valid_until: now + 365 * 24 * 3600 * 1_000_000_000u64,
         };
         pib.store_cert(&name, &cert).unwrap();
@@ -459,7 +488,10 @@ mod tests {
         let (_dir, pib) = tmp_pib();
         let name = key_name("nocert");
         pib.generate_ed25519(&name).unwrap();
-        assert!(matches!(pib.get_cert(&name), Err(PibError::CertNotFound(_))));
+        assert!(matches!(
+            pib.get_cert(&name),
+            Err(PibError::CertNotFound(_))
+        ));
     }
 
     #[test]
@@ -467,9 +499,9 @@ mod tests {
         let (_dir, pib) = tmp_pib();
         let name = key_name("anchor");
         let cert = Certificate {
-            name:        Arc::new(name.clone()),
-            public_key:  Bytes::from_static(&[0xAB; 32]),
-            valid_from:  0,
+            name: Arc::new(name.clone()),
+            public_key: Bytes::from_static(&[0xAB; 32]),
+            valid_from: 0,
             valid_until: u64::MAX,
         };
         pib.add_trust_anchor(&name, &cert).unwrap();
@@ -483,9 +515,9 @@ mod tests {
         let (_dir, pib) = tmp_pib();
         let name = key_name("ta");
         let cert = Certificate {
-            name:        Arc::new(name.clone()),
-            public_key:  Bytes::from_static(&[1u8; 32]),
-            valid_from:  0,
+            name: Arc::new(name.clone()),
+            public_key: Bytes::from_static(&[1u8; 32]),
+            valid_from: 0,
             valid_until: u64::MAX,
         };
         pib.add_trust_anchor(&name, &cert).unwrap();
@@ -528,9 +560,9 @@ mod tests {
     fn cert_encode_decode_roundtrip() {
         let name = Arc::new(key_name("enc"));
         let cert = Certificate {
-            name:        Arc::clone(&name),
-            public_key:  Bytes::from_static(&[0x55; 32]),
-            valid_from:  1_000_000,
+            name: Arc::clone(&name),
+            public_key: Bytes::from_static(&[0x55; 32]),
+            valid_from: 1_000_000,
             valid_until: 9_999_999,
         };
         let encoded = encode_cert(&cert);

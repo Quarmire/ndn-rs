@@ -148,12 +148,12 @@ pub enum FaceConfig {
         baud: u32,
     },
     #[serde(rename = "ether-multicast")]
-    EtherMulticast {
-        interface: String,
-    },
+    EtherMulticast { interface: String },
 }
 
-fn default_baud() -> u32 { 115200 }
+fn default_baud() -> u32 {
+    115200
+}
 
 /// Re-export the canonical `FaceKind` from `ndn-transport` — single source of
 /// truth for all face type classification.  Serde support is enabled via the

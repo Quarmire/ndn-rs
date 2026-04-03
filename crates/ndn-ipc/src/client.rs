@@ -12,7 +12,7 @@ use ndn_packet::Name;
 /// The namespace is the root name under which this client operates; it is
 /// prepended to all expressed Interests by convention (not enforced here).
 pub struct IpcClient<F> {
-    face:      Arc<F>,
+    face: Arc<F>,
     namespace: Name,
 }
 

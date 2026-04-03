@@ -9,8 +9,8 @@ use std::sync::Arc;
 use bytes::Bytes;
 
 use ndn_face_local::AppFace;
-use ndn_packet::encode::DataBuilder;
 use ndn_packet::Name;
+use ndn_packet::encode::DataBuilder;
 use ndn_transport::FaceId;
 
 use ndn_app::{Consumer, EngineBuilder, Producer};
@@ -142,9 +142,7 @@ async fn embedded_consumer_get() {
         producer
             .serve(|interest| {
                 let name = (*interest.name).clone();
-                async move {
-                    Some(DataBuilder::new(name, b"raw bytes").build())
-                }
+                async move { Some(DataBuilder::new(name, b"raw bytes").build()) }
             })
             .await
     });

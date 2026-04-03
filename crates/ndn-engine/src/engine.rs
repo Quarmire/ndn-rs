@@ -15,8 +15,8 @@ use ndn_transport::{Face, FaceId, FacePersistency, FaceTable};
 
 use crate::stages::ErasedStrategy;
 
-use crate::dispatcher::InboundPacket;
 use crate::Fib;
+use crate::dispatcher::InboundPacket;
 
 /// Default outbound send queue capacity per face.
 ///
@@ -51,7 +51,11 @@ pub struct FaceState {
 }
 
 impl FaceState {
-    pub fn new(cancel: CancellationToken, persistency: FacePersistency, send_tx: mpsc::Sender<bytes::Bytes>) -> Self {
+    pub fn new(
+        cancel: CancellationToken,
+        persistency: FacePersistency,
+        send_tx: mpsc::Sender<bytes::Bytes>,
+    ) -> Self {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -98,15 +102,15 @@ impl FaceState {
 
 /// Shared tables owned by the engine, accessible to all tasks via `Arc`.
 pub struct EngineInner {
-    pub fib:            Arc<Fib>,
-    pub pit:            Arc<Pit>,
-    pub cs:             Arc<LruCs>,
-    pub face_table:     Arc<FaceTable>,
-    pub measurements:   Arc<MeasurementsTable>,
+    pub fib: Arc<Fib>,
+    pub pit: Arc<Pit>,
+    pub cs: Arc<LruCs>,
+    pub face_table: Arc<FaceTable>,
+    pub measurements: Arc<MeasurementsTable>,
     pub strategy_table: Arc<StrategyTable<dyn ErasedStrategy>>,
     /// Security manager for signing/verification (optional — `None` disables
     /// security policy enforcement).
-    pub security:       Option<Arc<SecurityManager>>,
+    pub security: Option<Arc<SecurityManager>>,
     /// Pipeline inbound channel — used to spawn readers for dynamically-added
     /// faces (those registered after `build()` completes).
     pub(crate) pipeline_tx: mpsc::Sender<InboundPacket>,
@@ -159,7 +163,9 @@ impl ForwarderEngine {
             Some(interest.selectors()),
             interest.forwarding_hint(),
         );
-        self.inner.pit.get(&token)
+        self.inner
+            .pit
+            .get(&token)
             .and_then(|entry| entry.in_records.first().map(|r| FaceId(r.face_id)))
     }
 
@@ -186,13 +192,21 @@ impl ForwarderEngine {
         let kind = face.kind();
         let (send_tx, send_rx) = mpsc::channel(DEFAULT_SEND_QUEUE_CAP);
         let state = if kind == ndn_transport::FaceKind::Udp {
-            FaceState::new_reliable(cancel.clone(), persistency, send_tx, ndn_face_net::DEFAULT_UDP_MTU)
+            FaceState::new_reliable(
+                cancel.clone(),
+                persistency,
+                send_tx,
+                ndn_face_net::DEFAULT_UDP_MTU,
+            )
         } else {
             FaceState::new(cancel.clone(), persistency, send_tx)
         };
         self.inner.face_states.insert(face_id, state);
         self.inner.face_table.insert(face);
-        let erased     = self.inner.face_table.get(face_id)
+        let erased = self
+            .inner
+            .face_table
+            .get(face_id)
             .expect("face was just inserted");
 
         // Spawn the outbound send task.
@@ -202,17 +216,33 @@ impl ForwarderEngine {
             let face_states = Arc::clone(&self.inner.face_states);
             let face_table = Arc::clone(&self.inner.face_table);
             let fib = Arc::clone(&self.inner.fib);
-            tokio::spawn(run_face_sender(face_id, face, send_rx, cancel, persistency, face_states, face_table, fib));
+            tokio::spawn(run_face_sender(
+                face_id,
+                face,
+                send_rx,
+                cancel,
+                persistency,
+                face_states,
+                face_table,
+                fib,
+            ));
         }
 
         // Spawn the inbound recv task.
-        let tx         = self.inner.pipeline_tx.clone();
+        let tx = self.inner.pipeline_tx.clone();
         let face_table = Arc::clone(&self.inner.face_table);
-        let fib        = Arc::clone(&self.inner.fib);
-        let pit        = Arc::clone(&self.inner.pit);
+        let fib = Arc::clone(&self.inner.fib);
+        let pit = Arc::clone(&self.inner.pit);
         let face_states = Arc::clone(&self.inner.face_states);
         tokio::spawn(crate::dispatcher::run_face_reader(
-            face_id, erased, tx, cancel, face_table, fib, pit, face_states,
+            face_id,
+            erased,
+            tx,
+            cancel,
+            face_table,
+            fib,
+            pit,
+            face_states,
         ));
     }
 
@@ -223,29 +253,40 @@ impl ForwarderEngine {
     /// the dispatcher can send Data/Nack to it, but no `run_face_reader`
     /// task is spawned.  A send-writer task is spawned to drain the outbound
     /// queue.
-    pub fn add_face_send_only<F: Face + 'static>(
-        &self,
-        face: F,
-        cancel: CancellationToken,
-    ) {
+    pub fn add_face_send_only<F: Face + 'static>(&self, face: F, cancel: CancellationToken) {
         let face_id = face.id();
         let kind = face.kind();
         let (send_tx, send_rx) = mpsc::channel(DEFAULT_SEND_QUEUE_CAP);
         let state = if kind == ndn_transport::FaceKind::Udp {
-            FaceState::new_reliable(cancel.clone(), FacePersistency::OnDemand, send_tx, ndn_face_net::DEFAULT_UDP_MTU)
+            FaceState::new_reliable(
+                cancel.clone(),
+                FacePersistency::OnDemand,
+                send_tx,
+                ndn_face_net::DEFAULT_UDP_MTU,
+            )
         } else {
             FaceState::new(cancel.clone(), FacePersistency::OnDemand, send_tx)
         };
         self.inner.face_states.insert(face_id, state);
         self.inner.face_table.insert(face);
 
-        let erased = self.inner.face_table.get(face_id)
+        let erased = self
+            .inner
+            .face_table
+            .get(face_id)
             .expect("face was just inserted");
         let face_states = Arc::clone(&self.inner.face_states);
         let face_table = Arc::clone(&self.inner.face_table);
         let fib = Arc::clone(&self.inner.fib);
         tokio::spawn(run_face_sender(
-            face_id, erased, send_rx, cancel, FacePersistency::OnDemand, face_states, face_table, fib,
+            face_id,
+            erased,
+            send_rx,
+            cancel,
+            FacePersistency::OnDemand,
+            face_states,
+            face_table,
+            fib,
         ));
     }
 
@@ -258,15 +299,23 @@ impl ForwarderEngine {
         face_id: FaceId,
         arrival: u64,
     ) -> Result<(), ()> {
-        self.inner.pipeline_tx
-            .send(InboundPacket { raw, face_id, arrival })
+        self.inner
+            .pipeline_tx
+            .send(InboundPacket {
+                raw,
+                face_id,
+                arrival,
+            })
             .await
             .map_err(|_| ())
     }
 
     /// Get the cancellation token for a face, if one exists.
     pub fn face_token(&self, face_id: FaceId) -> Option<CancellationToken> {
-        self.inner.face_states.get(&face_id).map(|r| r.cancel.clone())
+        self.inner
+            .face_states
+            .get(&face_id)
+            .map(|r| r.cancel.clone())
     }
 
     /// Access the face states map (for idle timeout sweeps).
@@ -278,7 +327,7 @@ impl ForwarderEngine {
 /// Handle to gracefully shut down the engine.
 pub struct ShutdownHandle {
     pub(crate) cancel: CancellationToken,
-    pub(crate) tasks:  JoinSet<()>,
+    pub(crate) tasks: JoinSet<()>,
 }
 
 impl ShutdownHandle {
@@ -309,17 +358,18 @@ impl ShutdownHandle {
 ///
 /// On cancellation or channel close: exits cleanly.
 pub(crate) async fn run_face_sender(
-    face_id:     FaceId,
-    face:        Arc<dyn ndn_transport::ErasedFace>,
-    mut rx:      mpsc::Receiver<bytes::Bytes>,
-    cancel:      CancellationToken,
+    face_id: FaceId,
+    face: Arc<dyn ndn_transport::ErasedFace>,
+    mut rx: mpsc::Receiver<bytes::Bytes>,
+    cancel: CancellationToken,
     persistency: FacePersistency,
     face_states: Arc<DashMap<FaceId, FaceState>>,
-    face_table:  Arc<FaceTable>,
-    fib:         Arc<crate::Fib>,
+    face_table: Arc<FaceTable>,
+    fib: Arc<crate::Fib>,
 ) {
     // Check if reliability is enabled by looking at the face state.
-    let has_reliability = face_states.get(&face_id)
+    let has_reliability = face_states
+        .get(&face_id)
         .map(|s| s.reliability.is_some())
         .unwrap_or(false);
 

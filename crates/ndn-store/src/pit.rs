@@ -1,5 +1,5 @@
-use std::hash::{Hash, Hasher};
 use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use dashmap::DashMap;
@@ -45,60 +45,63 @@ impl PitToken {
 #[derive(Clone, Debug)]
 pub struct InRecord {
     /// Face the Interest arrived on (raw u32; mapped to FaceId by the engine).
-    pub face_id:    u32,
-    pub nonce:      u32,
+    pub face_id: u32,
+    pub nonce: u32,
     pub expires_at: u64,
 }
 
 /// Record of an outgoing Interest (producer-facing side of the PIT entry).
 #[derive(Clone, Debug)]
 pub struct OutRecord {
-    pub face_id:    u32,
+    pub face_id: u32,
     pub last_nonce: u32,
-    pub sent_at:    u64,
+    pub sent_at: u64,
 }
 
 /// A single PIT entry — one per pending (Name, Option<Selector>) pair.
 pub struct PitEntry {
-    pub name:         Arc<Name>,
-    pub selector:     Option<Selector>,
-    pub in_records:   Vec<InRecord>,
-    pub out_records:  Vec<OutRecord>,
+    pub name: Arc<Name>,
+    pub selector: Option<Selector>,
+    pub in_records: Vec<InRecord>,
+    pub out_records: Vec<OutRecord>,
     /// Nonces seen so far — inline for the common case of ≤4 nonces.
-    pub nonces_seen:  SmallVec<[u32; 4]>,
+    pub nonces_seen: SmallVec<[u32; 4]>,
     pub is_satisfied: bool,
-    pub created_at:   u64,
-    pub expires_at:   u64,
+    pub created_at: u64,
+    pub expires_at: u64,
 }
 
 impl PitEntry {
-    pub fn new(
-        name: Arc<Name>,
-        selector: Option<Selector>,
-        now: u64,
-        lifetime_ms: u64,
-    ) -> Self {
+    pub fn new(name: Arc<Name>, selector: Option<Selector>, now: u64, lifetime_ms: u64) -> Self {
         Self {
             name,
             selector,
-            in_records:   Vec::new(),
-            out_records:  Vec::new(),
-            nonces_seen:  SmallVec::new(),
+            in_records: Vec::new(),
+            out_records: Vec::new(),
+            nonces_seen: SmallVec::new(),
             is_satisfied: false,
-            created_at:   now,
-            expires_at:   now + lifetime_ms * 1_000_000,
+            created_at: now,
+            expires_at: now + lifetime_ms * 1_000_000,
         }
     }
 
     pub fn add_in_record(&mut self, face_id: u32, nonce: u32, expires_at: u64) {
-        self.in_records.push(InRecord { face_id, nonce, expires_at });
+        self.in_records.push(InRecord {
+            face_id,
+            nonce,
+            expires_at,
+        });
         if !self.nonces_seen.contains(&nonce) {
             self.nonces_seen.push(nonce);
         }
     }
 
     pub fn add_out_record(&mut self, face_id: u32, nonce: u32, sent_at: u64) {
-        self.out_records.push(OutRecord { face_id, last_nonce: nonce, sent_at });
+        self.out_records.push(OutRecord {
+            face_id,
+            last_nonce: nonce,
+            sent_at,
+        });
     }
 
     /// Returns the face IDs of all in-records (for Data fan-back).
@@ -117,7 +120,9 @@ pub struct Pit {
 
 impl Pit {
     pub fn new() -> Self {
-        Self { entries: DashMap::new() }
+        Self {
+            entries: DashMap::new(),
+        }
     }
 
     pub fn clear(&self) {
@@ -128,15 +133,17 @@ impl Pit {
         self.entries.insert(token, entry);
     }
 
-    pub fn get(&self, token: &PitToken)
-        -> Option<dashmap::mapref::one::Ref<'_, PitToken, PitEntry>>
-    {
+    pub fn get(
+        &self,
+        token: &PitToken,
+    ) -> Option<dashmap::mapref::one::Ref<'_, PitToken, PitEntry>> {
         self.entries.get(token)
     }
 
-    pub fn get_mut(&self, token: &PitToken)
-        -> Option<dashmap::mapref::one::RefMut<'_, PitToken, PitEntry>>
-    {
+    pub fn get_mut(
+        &self,
+        token: &PitToken,
+    ) -> Option<dashmap::mapref::one::RefMut<'_, PitToken, PitEntry>> {
         self.entries.get_mut(token)
     }
 
@@ -155,7 +162,8 @@ impl Pit {
     /// Remove all entries whose `expires_at` ≤ `now_ns`.
     /// Returns the tokens of expired entries.
     pub fn drain_expired(&self, now_ns: u64) -> Vec<PitToken> {
-        let expired: Vec<PitToken> = self.entries
+        let expired: Vec<PitToken> = self
+            .entries
             .iter()
             .filter(|r| r.expires_at <= now_ns)
             .map(|r| *r.key())
@@ -214,12 +222,14 @@ impl Default for Pit {
 mod tests {
     use super::*;
     use bytes::Bytes;
-    use ndn_packet::{Interest, Data, NameComponent, Selector};
-    use ndn_packet::encode::{encode_interest, encode_data_unsigned};
+    use ndn_packet::encode::{encode_data_unsigned, encode_interest};
+    use ndn_packet::{Data, Interest, NameComponent, Selector};
 
     fn make_name(comps: &[&str]) -> Name {
         Name::from_components(
-            comps.iter().map(|s| NameComponent::generic(Bytes::copy_from_slice(s.as_bytes())))
+            comps
+                .iter()
+                .map(|s| NameComponent::generic(Bytes::copy_from_slice(s.as_bytes()))),
         )
     }
 
@@ -254,8 +264,14 @@ mod tests {
         let match_token2 = PitToken::from_interest(&data.name, Some(&default_sel));
 
         // The second try MUST match the check token.
-        assert_ne!(check_token, match_token1, "first try should NOT match (None vs Some selector)");
-        assert_eq!(check_token, match_token2, "second try MUST match (Same default selector)");
+        assert_ne!(
+            check_token, match_token1,
+            "first try should NOT match (None vs Some selector)"
+        );
+        assert_eq!(
+            check_token, match_token2,
+            "second try MUST match (Same default selector)"
+        );
     }
 
     /// Verify that source_face_id computation matches PitCheck for management Interests.
@@ -287,7 +303,10 @@ mod tests {
             mgmt_interest.forwarding_hint(),
         );
 
-        assert_eq!(check_token, source_token, "source_face_id must match PitCheck token");
+        assert_eq!(
+            check_token, source_token,
+            "source_face_id must match PitCheck token"
+        );
     }
 
     #[test]

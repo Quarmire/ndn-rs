@@ -22,12 +22,15 @@ pub struct ServiceRegistry {
 
 impl ServiceRegistry {
     pub fn new() -> Self {
-        Self { services: HashMap::new() }
+        Self {
+            services: HashMap::new(),
+        }
     }
 
     /// Advertise `name` with the given `capabilities` blob.
     pub fn register(&mut self, name: impl Into<String>, capabilities: Bytes) {
-        self.services.insert(name.into(), ServiceEntry { capabilities });
+        self.services
+            .insert(name.into(), ServiceEntry { capabilities });
     }
 
     /// Look up a registered service by name.
@@ -46,7 +49,9 @@ impl ServiceRegistry {
 }
 
 impl Default for ServiceRegistry {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]

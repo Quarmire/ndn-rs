@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::trace;
 
 use ndn_pipeline::{Action, DecodedPacket, PacketContext};
-use ndn_store::{CsEntry, CsAdmissionPolicy, CsMeta, ContentStore, LruCs};
+use ndn_store::{ContentStore, CsAdmissionPolicy, CsEntry, CsMeta, LruCs};
 
 /// Look up the CS before hitting the PIT/FIB.
 ///
@@ -71,7 +71,9 @@ impl CsInsertStage {
             let stale_at = now_ns + freshness_ms * 1_000_000;
 
             let meta = CsMeta { stale_at };
-            self.cs.insert(ctx.raw_bytes.clone(), data.name.clone(), meta).await;
+            self.cs
+                .insert(ctx.raw_bytes.clone(), data.name.clone(), meta)
+                .await;
             trace!(name=%data.name, freshness_ms, "cs-insert: cached");
         }
         Action::Satisfy(ctx)

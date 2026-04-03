@@ -1,18 +1,18 @@
+use core::time::Duration;
 use std::sync::Arc;
 use std::sync::OnceLock;
-use core::time::Duration;
 
 use bytes::Bytes;
 
-use crate::{Name, PacketError, SignatureInfo};
 use crate::tlv_type;
+use crate::{Name, PacketError, SignatureInfo};
 use ndn_tlv::TlvReader;
 
 /// Selectors that control Interest-Data matching.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Selector {
-    pub can_be_prefix:  bool,
-    pub must_be_fresh:  bool,
+    pub can_be_prefix: bool,
+    pub must_be_fresh: bool,
 }
 
 /// An NDN Interest packet.
@@ -57,16 +57,16 @@ impl Interest {
     /// Construct a minimal Interest with only a name (for testing / app use).
     pub fn new(name: Name) -> Self {
         Self {
-            raw:              Bytes::new(),
-            name:             Arc::new(name),
-            selectors:        OnceLock::new(),
-            nonce:            OnceLock::new(),
-            lifetime:         OnceLock::new(),
-            app_params:       OnceLock::new(),
-            hop_limit:        OnceLock::new(),
-            forwarding_hint:  OnceLock::new(),
-            sig_info:         OnceLock::new(),
-            sig_value:        OnceLock::new(),
+            raw: Bytes::new(),
+            name: Arc::new(name),
+            selectors: OnceLock::new(),
+            nonce: OnceLock::new(),
+            lifetime: OnceLock::new(),
+            app_params: OnceLock::new(),
+            hop_limit: OnceLock::new(),
+            forwarding_hint: OnceLock::new(),
+            sig_info: OnceLock::new(),
+            sig_value: OnceLock::new(),
         }
     }
 
@@ -89,7 +89,9 @@ impl Interest {
         // NDN Packet Format v0.3 §2: Interest/Data must have at least one
         // name component.
         if name.is_empty() {
-            return Err(PacketError::MalformedPacket("Interest Name must have at least one component".into()));
+            return Err(PacketError::MalformedPacket(
+                "Interest Name must have at least one component".into(),
+            ));
         }
 
         // Check if ApplicationParameters is present. If so, the Name must
@@ -123,7 +125,8 @@ impl Interest {
                 let expected = ring::digest::digest(&ring::digest::SHA256, &params_tlv);
                 if last_comp.value.as_ref() != expected.as_ref() {
                     return Err(PacketError::MalformedPacket(
-                        "ParametersSha256DigestComponent does not match ApplicationParameters".into()
+                        "ParametersSha256DigestComponent does not match ApplicationParameters"
+                            .into(),
                     ));
                 }
             }
@@ -131,30 +134,33 @@ impl Interest {
 
         Ok(Self {
             raw,
-            name:             Arc::new(name),
-            selectors:        OnceLock::new(),
-            nonce:            OnceLock::new(),
-            lifetime:         OnceLock::new(),
-            app_params:       OnceLock::new(),
-            hop_limit:        OnceLock::new(),
-            forwarding_hint:  OnceLock::new(),
-            sig_info:         OnceLock::new(),
-            sig_value:        OnceLock::new(),
+            name: Arc::new(name),
+            selectors: OnceLock::new(),
+            nonce: OnceLock::new(),
+            lifetime: OnceLock::new(),
+            app_params: OnceLock::new(),
+            hop_limit: OnceLock::new(),
+            forwarding_hint: OnceLock::new(),
+            sig_info: OnceLock::new(),
+            sig_value: OnceLock::new(),
         })
     }
 
     pub fn selectors(&self) -> &Selector {
-        self.selectors.get_or_init(|| {
-            decode_selectors(&self.raw).unwrap_or_default()
-        })
+        self.selectors
+            .get_or_init(|| decode_selectors(&self.raw).unwrap_or_default())
     }
 
     pub fn nonce(&self) -> Option<u32> {
-        *self.nonce.get_or_init(|| decode_nonce(&self.raw).ok().flatten())
+        *self
+            .nonce
+            .get_or_init(|| decode_nonce(&self.raw).ok().flatten())
     }
 
     pub fn lifetime(&self) -> Option<Duration> {
-        *self.lifetime.get_or_init(|| decode_lifetime(&self.raw).ok().flatten())
+        *self
+            .lifetime
+            .get_or_init(|| decode_lifetime(&self.raw).ok().flatten())
     }
 
     /// The `ApplicationParameters` TLV value (type 0x24), if present.
@@ -183,7 +189,9 @@ impl Interest {
     /// Per NDN Packet Format v0.3 §5.2, this is a 1-byte field.
     /// The forwarder must decrement before forwarding and drop if zero.
     pub fn hop_limit(&self) -> Option<u8> {
-        *self.hop_limit.get_or_init(|| decode_hop_limit(&self.raw).ok().flatten())
+        *self
+            .hop_limit
+            .get_or_init(|| decode_hop_limit(&self.raw).ok().flatten())
     }
 
     /// InterestSignatureInfo, if present (Signed Interest per NDN Packet Format v0.3 §5.4).
@@ -221,8 +229,8 @@ fn decode_selectors(raw: &Bytes) -> Result<Selector, PacketError> {
     while !inner.is_empty() {
         let (typ, _) = inner.read_tlv()?;
         match typ {
-            t if t == tlv_type::CAN_BE_PREFIX  => sel.can_be_prefix  = true,
-            t if t == tlv_type::MUST_BE_FRESH  => sel.must_be_fresh  = true,
+            t if t == tlv_type::CAN_BE_PREFIX => sel.can_be_prefix = true,
+            t if t == tlv_type::MUST_BE_FRESH => sel.must_be_fresh = true,
             _ => {}
         }
     }
@@ -247,7 +255,9 @@ fn decode_nonce(raw: &Bytes) -> Result<Option<u32>, PacketError> {
 }
 
 fn decode_app_params(raw: &Bytes) -> Result<Option<Bytes>, PacketError> {
-    if raw.is_empty() { return Ok(None); }
+    if raw.is_empty() {
+        return Ok(None);
+    }
     let mut reader = TlvReader::new(raw.clone());
     let (_, value) = reader.read_tlv()?;
     let mut inner = TlvReader::new(value);
@@ -261,7 +271,9 @@ fn decode_app_params(raw: &Bytes) -> Result<Option<Bytes>, PacketError> {
 }
 
 fn decode_forwarding_hint(raw: &Bytes) -> Result<Option<Vec<Arc<Name>>>, PacketError> {
-    if raw.is_empty() { return Ok(None); }
+    if raw.is_empty() {
+        return Ok(None);
+    }
     let mut reader = TlvReader::new(raw.clone());
     let (_, value) = reader.read_tlv()?;
     let mut inner = TlvReader::new(value);
@@ -287,7 +299,9 @@ fn decode_forwarding_hint(raw: &Bytes) -> Result<Option<Vec<Arc<Name>>>, PacketE
 }
 
 fn decode_hop_limit(raw: &Bytes) -> Result<Option<u8>, PacketError> {
-    if raw.is_empty() { return Ok(None); }
+    if raw.is_empty() {
+        return Ok(None);
+    }
     let mut reader = TlvReader::new(raw.clone());
     let (_, value) = reader.read_tlv()?;
     let mut inner = TlvReader::new(value);
@@ -304,7 +318,9 @@ fn decode_hop_limit(raw: &Bytes) -> Result<Option<u8>, PacketError> {
 }
 
 fn decode_interest_sig_info(raw: &Bytes) -> Result<Option<SignatureInfo>, PacketError> {
-    if raw.is_empty() { return Ok(None); }
+    if raw.is_empty() {
+        return Ok(None);
+    }
     let mut reader = TlvReader::new(raw.clone());
     let (_, value) = reader.read_tlv()?;
     let mut inner = TlvReader::new(value);
@@ -318,7 +334,9 @@ fn decode_interest_sig_info(raw: &Bytes) -> Result<Option<SignatureInfo>, Packet
 }
 
 fn decode_interest_sig_value(raw: &Bytes) -> Result<Option<Bytes>, PacketError> {
-    if raw.is_empty() { return Ok(None); }
+    if raw.is_empty() {
+        return Ok(None);
+    }
     let mut reader = TlvReader::new(raw.clone());
     let (_, value) = reader.read_tlv()?;
     let mut inner = TlvReader::new(value);
@@ -337,7 +355,9 @@ fn decode_interest_sig_value(raw: &Bytes) -> Result<Option<Bytes>, PacketError> 
 /// byte of the Name TLV through the last byte of the InterestSignatureInfo TLV,
 /// all relative to the Interest's inner value (after the outer TLV header).
 fn compute_interest_signed_region(raw: &Bytes) -> Result<Option<&[u8]>, PacketError> {
-    if raw.is_empty() { return Ok(None); }
+    if raw.is_empty() {
+        return Ok(None);
+    }
     let mut reader = TlvReader::new(raw.clone());
     let (_, value) = reader.read_tlv()?;
     let outer_header_len = raw.len() - value.len();
@@ -387,7 +407,14 @@ mod tests {
         can_be_prefix: bool,
         must_be_fresh: bool,
     ) -> Bytes {
-        build_interest_full(components, nonce, lifetime_ms, can_be_prefix, must_be_fresh, None)
+        build_interest_full(
+            components,
+            nonce,
+            lifetime_ms,
+            can_be_prefix,
+            must_be_fresh,
+            None,
+        )
     }
 
     fn build_interest_full(
@@ -405,8 +432,12 @@ mod tests {
                     w.write_tlv(tlv_type::NAME_COMPONENT, comp);
                 }
             });
-            if can_be_prefix { w.write_tlv(tlv_type::CAN_BE_PREFIX, &[]); }
-            if must_be_fresh { w.write_tlv(tlv_type::MUST_BE_FRESH, &[]); }
+            if can_be_prefix {
+                w.write_tlv(tlv_type::CAN_BE_PREFIX, &[]);
+            }
+            if must_be_fresh {
+                w.write_tlv(tlv_type::MUST_BE_FRESH, &[]);
+            }
             if let Some(n) = nonce {
                 w.write_tlv(tlv_type::NONCE, &n.to_be_bytes());
             }
@@ -424,9 +455,8 @@ mod tests {
 
     #[test]
     fn new_stores_name() {
-        let name = Name::from_components([
-            crate::NameComponent::generic(Bytes::from_static(b"test")),
-        ]);
+        let name =
+            Name::from_components([crate::NameComponent::generic(Bytes::from_static(b"test"))]);
         let i = Interest::new(name.clone());
         assert_eq!(*i.name, name);
     }
@@ -481,7 +511,13 @@ mod tests {
 
     #[test]
     fn decode_with_all_fields() {
-        let raw = build_interest(&[b"edu", b"ucla", b"data"], Some(0x1234_5678), Some(8000), true, true);
+        let raw = build_interest(
+            &[b"edu", b"ucla", b"data"],
+            Some(0x1234_5678),
+            Some(8000),
+            true,
+            true,
+        );
         let i = Interest::decode(raw).unwrap();
         assert_eq!(i.name.len(), 3);
         assert_eq!(i.nonce(), Some(0x1234_5678));
@@ -611,11 +647,7 @@ mod tests {
 
     // ── Signed Interest ────────────────────────────────────────────────────
 
-    fn build_signed_interest(
-        components: &[&[u8]],
-        sig_type_code: u8,
-        sig_value: &[u8],
-    ) -> Bytes {
+    fn build_signed_interest(components: &[&[u8]], sig_type_code: u8, sig_value: &[u8]) -> Bytes {
         let mut w = TlvWriter::new();
         w.write_nested(tlv_type::INTEREST, |w| {
             w.write_nested(tlv_type::NAME, |w| {
