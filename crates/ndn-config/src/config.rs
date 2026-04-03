@@ -45,6 +45,9 @@ pub struct ForwarderConfig {
 
     #[serde(default)]
     pub security: SecurityConfig,
+
+    #[serde(default)]
+    pub cs: CsConfig,
 }
 
 impl ForwarderConfig {
@@ -65,10 +68,57 @@ impl ForwarderConfig {
     }
 }
 
+/// Content store configuration.
+///
+/// ```toml
+/// [cs]
+/// variant = "lru"           # "lru" (default), "sharded-lru", "null"
+/// capacity_mb = 64
+/// shards = 4                # only for "sharded-lru"
+/// admission_policy = "default"  # "default" or "admit-all"
+/// ```
+#[derive(Debug, Deserialize, Serialize)]
+pub struct CsConfig {
+    /// CS implementation variant.
+    #[serde(default = "default_cs_variant")]
+    pub variant: String,
+    /// Capacity in megabytes (0 = disable).
+    #[serde(default = "default_cs_capacity_mb")]
+    pub capacity_mb: usize,
+    /// Number of shards (only for "sharded-lru").
+    #[serde(default)]
+    pub shards: Option<usize>,
+    /// Admission policy: "default" or "admit-all".
+    #[serde(default = "default_admission_policy")]
+    pub admission_policy: String,
+}
+
+fn default_cs_variant() -> String {
+    "lru".to_string()
+}
+fn default_cs_capacity_mb() -> usize {
+    64
+}
+fn default_admission_policy() -> String {
+    "default".to_string()
+}
+
+impl Default for CsConfig {
+    fn default() -> Self {
+        Self {
+            variant: default_cs_variant(),
+            capacity_mb: default_cs_capacity_mb(),
+            shards: None,
+            admission_policy: default_admission_policy(),
+        }
+    }
+}
+
 /// Engine tuning parameters.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct EngineConfig {
     /// Content store capacity in megabytes (0 = disable).
+    /// Deprecated: use `[cs] capacity_mb` instead. Kept for backward compatibility.
     pub cs_capacity_mb: usize,
     /// Pipeline inter-task channel capacity (backpressure).
     pub pipeline_channel_cap: usize,

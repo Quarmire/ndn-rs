@@ -6,7 +6,7 @@ pub mod mgmt;
 pub mod nfd_command;
 
 pub use config::{
-    EngineConfig, FaceConfig, FaceKind, ForwarderConfig, ManagementConfig, RouteConfig,
+    CsConfig, EngineConfig, FaceConfig, FaceKind, ForwarderConfig, ManagementConfig, RouteConfig,
     SecurityConfig,
 };
 pub use control_parameters::ControlParameters;

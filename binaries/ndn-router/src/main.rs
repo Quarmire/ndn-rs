@@ -5,13 +5,14 @@ use anyhow::Result;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
-use ndn_config::ForwarderConfig;
+use ndn_config::{CsConfig, ForwarderConfig};
 #[cfg(unix)]
 use ndn_config::{ManagementRequest, ManagementResponse, ManagementServer};
 use ndn_engine::{EngineBuilder, EngineConfig, ForwarderEngine};
 use ndn_face_local::AppFace;
 use ndn_packet::Name;
 use ndn_security::{FilePib, SecurityManager};
+use ndn_store::{ErasedContentStore, LruCs, NullCs, ShardedCs};
 
 // Unix-socket bypass management I/O.
 #[cfg(unix)]
@@ -63,8 +64,15 @@ async fn main() -> Result<()> {
         ForwarderConfig::default()
     };
 
+    // Resolve CS capacity: prefer [cs] section, fall back to engine.cs_capacity_mb.
+    let cs_cap_mb = if fwd_config.cs.capacity_mb != 0 {
+        fwd_config.cs.capacity_mb
+    } else {
+        fwd_config.engine.cs_capacity_mb
+    };
+
     let engine_config = EngineConfig {
-        cs_capacity_bytes: fwd_config.engine.cs_capacity_mb * 1024 * 1024,
+        cs_capacity_bytes: cs_cap_mb * 1024 * 1024,
         pipeline_channel_cap: fwd_config.engine.pipeline_channel_cap,
         pipeline_threads: fwd_config.engine.pipeline_threads,
     };
@@ -80,7 +88,17 @@ async fn main() -> Result<()> {
 
     let security_mgr = load_security(&fwd_config);
 
-    let mut builder = EngineBuilder::new(engine_config).face(mgmt_app_face);
+    let cs = build_cs(&fwd_config.cs);
+    let admission: Arc<dyn ndn_store::CsAdmissionPolicy> =
+        match fwd_config.cs.admission_policy.as_str() {
+            "admit-all" => Arc::new(ndn_store::AdmitAllPolicy),
+            _ => Arc::new(ndn_store::DefaultAdmissionPolicy),
+        };
+
+    let mut builder = EngineBuilder::new(engine_config)
+        .face(mgmt_app_face)
+        .content_store(cs)
+        .admission_policy(admission);
     if let Some(mgr) = security_mgr {
         builder = builder.security(mgr);
     }
@@ -576,4 +594,26 @@ fn parse_bind_addr(bind: &str, label: &str) -> Option<std::net::SocketAddr> {
 /// Parse a URI-style NDN name like `/ndn/test` into a `Name`.
 fn parse_name(uri: &str) -> Name {
     uri.parse().unwrap_or_else(|_| Name::root())
+}
+
+/// Build a content store from config.
+fn build_cs(cfg: &CsConfig) -> Arc<dyn ErasedContentStore> {
+    let cap = cfg.capacity_mb * 1024 * 1024;
+    match cfg.variant.as_str() {
+        "null" => {
+            tracing::info!("content store disabled (variant=null)");
+            Arc::new(NullCs)
+        }
+        "sharded-lru" => {
+            let n = cfg.shards.unwrap_or(4);
+            tracing::info!(variant = "sharded-lru", shards = n, capacity_mb = cfg.capacity_mb, "content store");
+            Arc::new(ShardedCs::new(
+                (0..n).map(|_| LruCs::new(cap / n)).collect(),
+            ))
+        }
+        _ => {
+            tracing::info!(variant = "lru", capacity_mb = cfg.capacity_mb, "content store");
+            Arc::new(LruCs::new(cap))
+        }
+    }
 }
