@@ -16,6 +16,21 @@ use ndn_tlv::{TlvReader, TlvWriter};
 use crate::nack::NackReason;
 use crate::tlv_type;
 
+/// Cache policy type for NDNLPv2 CachePolicy header field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CachePolicyType {
+    NoCache,
+    Other(u64),
+}
+
+/// Optional LP header fields for encoding.
+pub struct LpHeaders {
+    pub pit_token: Option<Bytes>,
+    pub congestion_mark: Option<u64>,
+    pub incoming_face_id: Option<u64>,
+    pub cache_policy: Option<CachePolicyType>,
+}
+
 /// A decoded NDNLPv2 LpPacket.
 #[derive(Debug)]
 pub struct LpPacket {
@@ -34,6 +49,20 @@ pub struct LpPacket {
     pub frag_count: Option<u64>,
     /// Piggybacked Ack TxSequences (NDNLPv2 reliability).
     pub acks: Vec<u64>,
+    /// PIT token (opaque, 1-32 bytes).
+    pub pit_token: Option<Bytes>,
+    /// Incoming face ID (local control header).
+    pub incoming_face_id: Option<u64>,
+    /// Next-hop face ID (local control header).
+    pub next_hop_face_id: Option<u64>,
+    /// Cache policy.
+    pub cache_policy: Option<CachePolicyType>,
+    /// Reliability TxSequence (0x0348) — distinct from fragmentation Sequence (0x51).
+    pub tx_sequence: Option<u64>,
+    /// NonDiscovery flag (presence = true).
+    pub non_discovery: bool,
+    /// Prefix announcement (raw Data bytes).
+    pub prefix_announcement: Option<Bytes>,
 }
 
 impl LpPacket {
@@ -55,6 +84,13 @@ impl LpPacket {
         let mut frag_index = None;
         let mut frag_count = None;
         let mut acks = Vec::new();
+        let mut pit_token = None;
+        let mut incoming_face_id = None;
+        let mut next_hop_face_id = None;
+        let mut cache_policy = None;
+        let mut tx_sequence = None;
+        let mut non_discovery = false;
+        let mut prefix_announcement = None;
 
         while !inner.is_empty() {
             let (t, v) = inner.read_tlv()?;
@@ -80,6 +116,43 @@ impl LpPacket {
                 tlv_type::LP_ACK => {
                     acks.push(decode_be_u64(&v));
                 }
+                tlv_type::LP_PIT_TOKEN => {
+                    if v.is_empty() || v.len() > 32 {
+                        return Err(crate::PacketError::MalformedPacket(
+                            "PitToken length must be 1-32".into(),
+                        ));
+                    }
+                    pit_token = Some(v);
+                }
+                tlv_type::LP_INCOMING_FACE_ID => {
+                    incoming_face_id = Some(decode_be_u64(&v));
+                }
+                tlv_type::LP_NEXT_HOP_FACE_ID => {
+                    next_hop_face_id = Some(decode_be_u64(&v));
+                }
+                tlv_type::LP_CACHE_POLICY => {
+                    let mut cp_reader = TlvReader::new(v);
+                    while !cp_reader.is_empty() {
+                        let (ct, cv) = cp_reader.read_tlv()?;
+                        if ct == tlv_type::LP_CACHE_POLICY_TYPE {
+                            let code = decode_be_u64(&cv);
+                            cache_policy = Some(if code == 1 {
+                                CachePolicyType::NoCache
+                            } else {
+                                CachePolicyType::Other(code)
+                            });
+                        }
+                    }
+                }
+                tlv_type::LP_TX_SEQUENCE => {
+                    tx_sequence = Some(decode_be_u64(&v));
+                }
+                tlv_type::LP_NON_DISCOVERY => {
+                    non_discovery = true;
+                }
+                tlv_type::LP_PREFIX_ANNOUNCEMENT => {
+                    prefix_announcement = Some(v);
+                }
                 tlv_type::INTEREST | tlv_type::DATA => {
                     let mut w = TlvWriter::new();
                     w.write_tlv(t, &v);
@@ -104,6 +177,13 @@ impl LpPacket {
             frag_index,
             frag_count,
             acks,
+            pit_token,
+            incoming_face_id,
+            next_hop_face_id,
+            cache_policy,
+            tx_sequence,
+            non_discovery,
+            prefix_announcement,
         })
     }
 }
@@ -231,6 +311,44 @@ pub fn encode_lp_acks(acks: &[u64]) -> Bytes {
             let (buf, len) = crate::encode::nni(ack);
             w.write_tlv(tlv_type::LP_ACK, &buf[..len]);
         }
+    });
+    w.finish()
+}
+
+/// Encode an LpPacket with optional header fields.
+///
+/// LP header fields are written in increasing TLV-TYPE order as required by the spec.
+pub fn encode_lp_with_headers(fragment: &[u8], headers: &LpHeaders) -> Bytes {
+    let mut w = TlvWriter::new();
+    w.write_nested(tlv_type::LP_PACKET, |w| {
+        // Fields must appear in increasing TLV-TYPE order.
+        // 0x62 PitToken
+        if let Some(ref token) = headers.pit_token {
+            w.write_tlv(tlv_type::LP_PIT_TOKEN, token);
+        }
+        // 0x032C IncomingFaceId
+        if let Some(id) = headers.incoming_face_id {
+            let (buf, len) = crate::encode::nni(id);
+            w.write_tlv(tlv_type::LP_INCOMING_FACE_ID, &buf[..len]);
+        }
+        // 0x0334 CachePolicy
+        if let Some(ref cp) = headers.cache_policy {
+            w.write_nested(tlv_type::LP_CACHE_POLICY, |w| {
+                let code = match cp {
+                    CachePolicyType::NoCache => 1u64,
+                    CachePolicyType::Other(c) => *c,
+                };
+                let (buf, len) = crate::encode::nni(code);
+                w.write_tlv(tlv_type::LP_CACHE_POLICY_TYPE, &buf[..len]);
+            });
+        }
+        // 0x0340 CongestionMark
+        if let Some(mark) = headers.congestion_mark {
+            let (buf, len) = crate::encode::nni(mark);
+            w.write_tlv(tlv_type::LP_CONGESTION_MARK, &buf[..len]);
+        }
+        // 0x50 Fragment (last)
+        w.write_tlv(tlv_type::LP_FRAGMENT, fragment);
     });
     w.finish()
 }
@@ -657,5 +775,172 @@ mod tests {
         let (seq, acks) = extract_acks(&wire);
         assert_eq!(seq, None);
         assert!(acks.is_empty());
+    }
+
+    // ─── NDNLPv2 header field tests ──────────────────────────────────────────
+
+    #[test]
+    fn decode_pit_token_valid() {
+        let n = name(&[b"test"]);
+        let interest_wire = encode_interest(&n, None);
+
+        let mut w = TlvWriter::new();
+        w.write_nested(tlv_type::LP_PACKET, |w| {
+            w.write_tlv(tlv_type::LP_PIT_TOKEN, &[0xAB, 0xCD, 0xEF, 0x01]);
+            w.write_tlv(tlv_type::LP_FRAGMENT, &interest_wire);
+        });
+        let lp = LpPacket::decode(w.finish()).unwrap();
+        assert_eq!(lp.pit_token.as_deref(), Some(&[0xAB, 0xCD, 0xEF, 0x01][..]));
+    }
+
+    #[test]
+    fn decode_pit_token_too_long_rejected() {
+        let n = name(&[b"test"]);
+        let interest_wire = encode_interest(&n, None);
+
+        let mut w = TlvWriter::new();
+        w.write_nested(tlv_type::LP_PACKET, |w| {
+            // 33 bytes — exceeds 32-byte limit
+            w.write_tlv(tlv_type::LP_PIT_TOKEN, &[0u8; 33]);
+            w.write_tlv(tlv_type::LP_FRAGMENT, &interest_wire);
+        });
+        assert!(LpPacket::decode(w.finish()).is_err());
+    }
+
+    #[test]
+    fn decode_pit_token_empty_rejected() {
+        let n = name(&[b"test"]);
+        let interest_wire = encode_interest(&n, None);
+
+        let mut w = TlvWriter::new();
+        w.write_nested(tlv_type::LP_PACKET, |w| {
+            w.write_tlv(tlv_type::LP_PIT_TOKEN, &[]);
+            w.write_tlv(tlv_type::LP_FRAGMENT, &interest_wire);
+        });
+        assert!(LpPacket::decode(w.finish()).is_err());
+    }
+
+    #[test]
+    fn decode_cache_policy_no_cache() {
+        let n = name(&[b"test"]);
+        let interest_wire = encode_interest(&n, None);
+
+        let mut w = TlvWriter::new();
+        w.write_nested(tlv_type::LP_PACKET, |w| {
+            w.write_nested(tlv_type::LP_CACHE_POLICY, |w| {
+                w.write_tlv(tlv_type::LP_CACHE_POLICY_TYPE, &[1]); // NoCache = 1
+            });
+            w.write_tlv(tlv_type::LP_FRAGMENT, &interest_wire);
+        });
+        let lp = LpPacket::decode(w.finish()).unwrap();
+        assert_eq!(lp.cache_policy, Some(CachePolicyType::NoCache));
+    }
+
+    #[test]
+    fn decode_incoming_and_next_hop_face_id() {
+        let n = name(&[b"test"]);
+        let interest_wire = encode_interest(&n, None);
+
+        let mut w = TlvWriter::new();
+        w.write_nested(tlv_type::LP_PACKET, |w| {
+            let (buf, len) = crate::encode::nni(42);
+            w.write_tlv(tlv_type::LP_INCOMING_FACE_ID, &buf[..len]);
+            let (buf, len) = crate::encode::nni(99);
+            w.write_tlv(tlv_type::LP_NEXT_HOP_FACE_ID, &buf[..len]);
+            w.write_tlv(tlv_type::LP_FRAGMENT, &interest_wire);
+        });
+        let lp = LpPacket::decode(w.finish()).unwrap();
+        assert_eq!(lp.incoming_face_id, Some(42));
+        assert_eq!(lp.next_hop_face_id, Some(99));
+    }
+
+    #[test]
+    fn decode_non_discovery_flag() {
+        let n = name(&[b"test"]);
+        let interest_wire = encode_interest(&n, None);
+
+        let mut w = TlvWriter::new();
+        w.write_nested(tlv_type::LP_PACKET, |w| {
+            w.write_tlv(tlv_type::LP_NON_DISCOVERY, &[]);
+            w.write_tlv(tlv_type::LP_FRAGMENT, &interest_wire);
+        });
+        let lp = LpPacket::decode(w.finish()).unwrap();
+        assert!(lp.non_discovery);
+    }
+
+    #[test]
+    fn decode_tx_sequence() {
+        let n = name(&[b"test"]);
+        let interest_wire = encode_interest(&n, None);
+
+        let mut w = TlvWriter::new();
+        w.write_nested(tlv_type::LP_PACKET, |w| {
+            let (buf, len) = crate::encode::nni(12345);
+            w.write_tlv(tlv_type::LP_TX_SEQUENCE, &buf[..len]);
+            w.write_tlv(tlv_type::LP_FRAGMENT, &interest_wire);
+        });
+        let lp = LpPacket::decode(w.finish()).unwrap();
+        assert_eq!(lp.tx_sequence, Some(12345));
+    }
+
+    #[test]
+    fn decode_without_new_fields_still_works() {
+        // Existing packets without new fields should decode with defaults.
+        let n = name(&[b"test"]);
+        let interest_wire = encode_interest(&n, None);
+        let lp_wire = encode_lp_packet(&interest_wire);
+
+        let lp = LpPacket::decode(lp_wire).unwrap();
+        assert!(lp.pit_token.is_none());
+        assert!(lp.incoming_face_id.is_none());
+        assert!(lp.next_hop_face_id.is_none());
+        assert!(lp.cache_policy.is_none());
+        assert!(lp.tx_sequence.is_none());
+        assert!(!lp.non_discovery);
+        assert!(lp.prefix_announcement.is_none());
+    }
+
+    #[test]
+    fn encode_lp_with_headers_roundtrip() {
+        let n = name(&[b"test"]);
+        let interest_wire = encode_interest(&n, None);
+
+        let headers = LpHeaders {
+            pit_token: Some(Bytes::from_static(&[0x01, 0x02, 0x03])),
+            congestion_mark: Some(5),
+            incoming_face_id: Some(42),
+            cache_policy: Some(CachePolicyType::NoCache),
+        };
+        let wire = encode_lp_with_headers(&interest_wire, &headers);
+        let lp = LpPacket::decode(wire).unwrap();
+
+        assert_eq!(lp.pit_token.as_deref(), Some(&[0x01, 0x02, 0x03][..]));
+        assert_eq!(lp.congestion_mark, Some(5));
+        assert_eq!(lp.incoming_face_id, Some(42));
+        assert_eq!(lp.cache_policy, Some(CachePolicyType::NoCache));
+        let interest = Interest::decode(lp.fragment.unwrap()).unwrap();
+        assert_eq!(*interest.name, n);
+    }
+
+    #[test]
+    fn encode_lp_with_headers_empty_headers() {
+        let n = name(&[b"test"]);
+        let interest_wire = encode_interest(&n, None);
+
+        let headers = LpHeaders {
+            pit_token: None,
+            congestion_mark: None,
+            incoming_face_id: None,
+            cache_policy: None,
+        };
+        let wire = encode_lp_with_headers(&interest_wire, &headers);
+        let lp = LpPacket::decode(wire).unwrap();
+
+        assert!(lp.pit_token.is_none());
+        assert!(lp.congestion_mark.is_none());
+        assert!(lp.incoming_face_id.is_none());
+        assert!(lp.cache_policy.is_none());
+        let interest = Interest::decode(lp.fragment.unwrap()).unwrap();
+        assert_eq!(*interest.name, n);
     }
 }
