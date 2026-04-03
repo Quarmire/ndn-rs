@@ -1,0 +1,19 @@
+[package]
+name = "example-cross-layer-enricher"
+version = "0.0.0"
+edition.workspace = true
+publish = false
+
+[dependencies]
+ndn-packet    = { workspace = true }
+ndn-transport = { workspace = true }
+ndn-pipeline  = { workspace = true }
+ndn-strategy  = { workspace = true }
+ndn-engine    = { workspace = true }
+smallvec      = { workspace = true }
+dashmap       = { workspace = true }
+parking_lot   = { workspace = true }
+tokio         = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tracing       = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow        = { workspace = true }

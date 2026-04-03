@@ -111,35 +111,155 @@ Kept in a separate `DashMap<Name, MeasurementsEntry>` so RTT updates don't conte
 
 A second instance of `NameTrie<Arc<dyn Strategy>>`. Uses `Arc<dyn Strategy>` so multiple name prefixes can share the same strategy instance without copying. Combined FIB + strategy lookup does two trie walks but shares the same `Name` component iteration.
 
-## `MultiRadioStrategy` (Research Extension)
+## Strategy Extensibility Tiers
 
-For wireless research, augment the strategy with `Arc<DashMap<FaceId, LinkMetrics>>` populated by a nl80211 task:
+ndn-rs provides three tiers of strategy extensibility, each with different tradeoffs:
+
+| Tier | Mechanism | Use Case | Hot Path Cost |
+|------|-----------|----------|---------------|
+| Built-in | `impl Strategy` in Rust | Production strategies | ~100ns (sync fast path) |
+| Composed | `ComposedStrategy` with `StrategyFilter` chain | Cross-layer filtering without forking base strategies | +~50ns per filter |
+| Scripted | WASM module via `WasmStrategy` (`ndn-strategy-wasm`) | Research prototyping, field hot-patching | ~1-5us |
+
+### Which approach should I use?
+
+- **Modifying forwarding logic** (new algorithm, new heuristic) → Built-in Rust strategy or WASM strategy
+- **Filtering/reordering existing decisions** (prefer faces with good RSSI, avoid congested faces) → `ComposedStrategy` + `StrategyFilter`
+- **Rapid prototyping without recompiling** → WASM strategy
+- **Routing protocol / topology discovery** → External app via AppFace/ShmFace (see below)
+
+## Cross-Layer Context Enrichment
+
+Strategies receive cross-layer data through `StrategyContext::extensions`, a type-keyed `AnyMap`. Data sources register as `ContextEnricher` implementations via `EngineBuilder::context_enricher()`.
 
 ```rust
-pub struct MultiRadioStrategy {
-    radio_table:  Arc<DashMap<FaceId, LinkMetrics>>,
-    flow_table:   Arc<DashMap<Name, FlowEntry>>,
-}
-
-pub struct FlowEntry {
-    prefix:         Name,
-    preferred_face: FaceId,
-    observed_tput:  f32,    // EWMA bytes/sec
-    observed_rtt:   f32,    // EWMA ms
-    last_updated:   u64,
+// In a strategy:
+fn decide(&self, ctx: &StrategyContext) -> Option<SmallVec<[ForwardingAction; 2]>> {
+    if let Some(snapshot) = ctx.extensions.get::<LinkQualitySnapshot>() {
+        for lq in &snapshot.per_face {
+            // lq.rssi_dbm, lq.retransmit_rate, lq.observed_rtt_ms, lq.observed_tput
+        }
+    }
+    // ...
 }
 ```
 
-The strategy populates `FlowEntry` on every Data arrival. Established flows for `/video/stream` are sent directly to the preferred face without consulting the FIB. The FIB is the fallback for names with no flow history.
+### Adding a new data source
 
-A `Probe` channel — `mpsc::Sender<Interest>` — allows strategies to initiate autonomous Interests (for probing, measurement) that feed back into the pipeline as if arriving on a synthetic internal face. The strategy remains a pure decision function; the channel is the controlled escape hatch.
+1. Define a DTO struct in `ndn-strategy::cross_layer` (e.g. `LocationSnapshot`).
+2. Implement `ContextEnricher` — read your data source, build the DTO, insert it into the `AnyMap`.
+3. Register via `EngineBuilder::context_enricher(Arc::new(YourEnricher { ... }))`.
+
+No changes to `StrategyContext`, `StrategyStage`, or existing enrichers are needed.
+
+## Strategy Composition
+
+`ComposedStrategy` wraps an inner strategy (via `ErasedStrategy`) and applies a chain of `StrategyFilter` implementations to its output.
+
+```rust
+let composed = ComposedStrategy::new(
+    Name::from("/localhost/nfd/strategy/best-route-rssi"),
+    Arc::new(BestRouteStrategy::new()) as Arc<dyn ErasedStrategy>,
+    vec![Arc::new(RssiFilter::new(-60))],
+);
+```
+
+The `RssiFilter` removes faces with RSSI below -60 dBm from `Forward` actions. If all faces are filtered out, the filter drops the `Forward` action entirely and the strategy falls through to the next action (e.g. `Nack`).
+
+### Writing a `StrategyFilter`
+
+```rust
+impl StrategyFilter for MyFilter {
+    fn name(&self) -> &str { "my-filter" }
+
+    fn filter(
+        &self,
+        ctx: &StrategyContext,
+        actions: SmallVec<[ForwardingAction; 2]>,
+    ) -> SmallVec<[ForwardingAction; 2]> {
+        // Inspect ctx.extensions, reorder/remove faces, return modified actions
+    }
+}
+```
+
+## WASM Strategies (`ndn-strategy-wasm`)
+
+Hot-load strategy logic from compiled WASM modules without recompiling the router.
+
+### Host-Guest ABI
+
+WASM modules import functions from the `"ndn"` namespace:
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `get_in_face` | `() -> u32` | Face the Interest arrived on |
+| `get_nexthop_count` | `() -> u32` | Number of FIB nexthops |
+| `get_nexthop` | `(index, out_face_id, out_cost) -> u32` | Read nexthop into guest memory |
+| `get_rtt_ns` | `(face_id) -> f64` | RTT in ns (-1.0 if unavailable) |
+| `get_rssi` | `(face_id) -> i32` | RSSI in dBm (-128 if unavailable) |
+| `get_satisfaction` | `(face_id) -> f32` | Satisfaction rate (-1.0 if unavailable) |
+| `forward` | `(face_ids_ptr, count)` | Forward to specified faces |
+| `nack` | `(reason)` | Send Nack (0=NoRoute, 1=Duplicate, 2=Congestion, 3=NotYet) |
+| `suppress` | `()` | Suppress the Interest |
+
+WASM modules must export `on_interest()` (and optionally `on_nack()`).
+
+### Performance safeguards
+
+- **Fuel limit**: 10,000 instructions per invocation (~50us worst case)
+- **Memory limit**: configurable, default 1 MB per module
+- **No I/O**: modules cannot access filesystem, network, or clock
+
+### Example (Rust compiled to WASM)
+
+```rust
+// strategy.rs — compile with `cargo build --target wasm32-unknown-unknown`
+extern "C" {
+    fn get_nexthop_count() -> u32;
+    fn get_nexthop(index: u32, out_face_id: *mut u32, out_cost: *mut u32) -> u32;
+    fn forward(face_ids_ptr: *const u32, count: u32);
+    fn nack(reason: u32);
+}
+
+#[no_mangle]
+pub extern "C" fn on_interest() {
+    unsafe {
+        let count = get_nexthop_count();
+        if count == 0 { nack(0); return; }
+        let mut best_face: u32 = 0;
+        let mut best_cost: u32 = u32::MAX;
+        for i in 0..count {
+            let (mut fid, mut cost) = (0u32, 0u32);
+            get_nexthop(i, &mut fid, &mut cost);
+            if cost < best_cost { best_face = fid; best_cost = cost; }
+        }
+        forward(&best_face, 1);
+    }
+}
+```
+
+## External Strategy Apps — When NOT to Embed
+
+Not everything belongs in the forwarder. Some routing logic is better as an external app connected via AppFace/ShmFace:
+
+| Embed in Forwarder (Strategy) | External App (AppFace/ShmFace) |
+|-------------------------------|-------------------------------|
+| Per-packet forwarding decisions | Routing protocol convergence (NLSR) |
+| Sub-millisecond latency required | Periodic route computation (seconds) |
+| Reads FIB/PIT/measurements | Writes FIB routes via management |
+| Stateless or small per-prefix state | Large state (routing tables, LSDBs) |
+| Cross-layer filtering (RSSI, RTT) | Topology discovery, name mapping |
+
+**Key principle:** Strategies answer "which face for THIS Interest?" Routing apps answer "what should the FIB look like?" The FIB is the interface between them.
 
 ## Autonomous Research Control
 
 The recommended architecture for wireless NDN research:
 
 ```
-nl80211 task ──→ Arc<DashMap<FaceId, LinkMetrics>> ──→ WirelessStrategy (Point A)
+nl80211 task ──→ ContextEnricher ──→ StrategyContext::extensions
+                                         ↓
+                                    Strategy / ComposedStrategy + Filters
 
 pipeline ──→ FlowObserverStage ──→ mpsc ──→ analysis task
                                               ↓

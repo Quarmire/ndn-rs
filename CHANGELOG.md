@@ -231,6 +231,75 @@ Zenoh's pub/sub/queryable model but built on NDN's Interest/Data machinery.
   missing hash sets.  Configurable via `PSyncConfig` (interval, jitter,
   IBF size).  `Ibf::from_cells()` / `Ibf::cells()` added for wire encoding.
 
+#### Strategy dynamics: cross-layer context enrichment
+
+Strategies can now access radio, link quality, location, and arbitrary
+cross-layer data without coupling `ndn-strategy` to wireless-specific
+crates.
+
+- **`AnyMap` moved to `ndn-transport`** — the type-keyed extension map
+  (`HashMap<TypeId, Box<dyn Any + Send + Sync>>`) now lives in
+  `ndn-transport` so both `ndn-pipeline` and `ndn-strategy` can use it
+  without a dependency cycle.  `ndn-pipeline` re-exports it for
+  backward compatibility.
+- **`StrategyContext::extensions: &AnyMap`** — new field gives strategies
+  read-only access to cross-layer data inserted by enrichers.
+- **`ContextEnricher` trait** (`ndn-engine`) — generic enrichment
+  interface.  Implementations read from any data source (RadioTable,
+  GPS, battery, etc.) and insert typed DTOs into the extensions map.
+  Register via `EngineBuilder::context_enricher()`.
+- **`LinkQualitySnapshot` / `FaceLinkQuality`** (`ndn-strategy`) —
+  cross-layer DTOs with per-face RSSI, retransmit rate, RTT, and
+  throughput.  All fields are `Option` for backward compatibility.
+
+#### Strategy composition with filters
+
+Strategies can now be composed with reusable filters that post-process
+forwarding actions, without modifying the base strategy code.
+
+- **`StrategyFilter` trait** (`ndn-strategy`) — post-processes
+  `SmallVec<[ForwardingAction; 2]>` from an inner strategy.  Filters
+  can remove faces, reorder, or inject actions.
+- **`ComposedStrategy`** (`ndn-engine`) — wraps an inner
+  `Arc<dyn ErasedStrategy>` plus a filter chain.  Implements
+  `ErasedStrategy` directly; registered like any other strategy via
+  `EngineBuilder::strategy()`.
+- **`RssiFilter`** (`ndn-strategy`) — example filter that removes
+  faces below a configurable RSSI threshold from `Forward` actions.
+  If all faces are filtered out, the action is dropped (falls through
+  to Nack).
+
+#### WASM scripted strategies (`ndn-strategy-wasm`)
+
+New crate enabling hot-loadable forwarding strategies compiled to
+WebAssembly, for research prototyping and field hot-patching without
+recompiling the router.
+
+- **`WasmStrategy`** — loads a WASM module via `wasmtime`, runs on the
+  sync fast path (`decide()`) with fuel-limited execution (~1–5µs).
+- **Host-guest ABI** — `"ndn"` namespace imports: `get_in_face`,
+  `get_nexthop_count`, `get_nexthop`, `get_rtt_ns`, `get_rssi`,
+  `get_satisfaction`, `forward`, `nack`, `suppress`.
+- **`WasmStrategy::from_bytes()` / `from_file()`** — load from
+  in-memory bytes or a `.wasm` file on disk.
+- **Fuel limit** — configurable instruction budget per invocation;
+  fuel exhaustion returns `Suppress` (safety).
+- **Memory limit** — 1 page (64 KiB) default, configurable.
+
+#### Strategy examples
+
+New `examples/` directory with four runnable examples demonstrating
+the strategy extensibility tiers:
+
+- **`strategy-custom`** — custom `RandomStrategy` implementing the
+  `Strategy` trait with sync fast path and engine registration.
+- **`strategy-composed`** — `ComposedStrategy` wrapping `BestRoute`
+  with `RssiFilter` and a custom `LatencyFilter`.
+- **`cross-layer-enricher`** — GPS-based `ContextEnricher` feeding
+  location data into strategies via extensions.
+- **`wasm-strategy`** — embedded WAT module loaded via
+  `WasmStrategy::from_bytes()`.
+
 ### Fixed
 
 #### Pipeline overload kills SHM applications via backpressure cascade
