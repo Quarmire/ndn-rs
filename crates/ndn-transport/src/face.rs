@@ -30,6 +30,7 @@ pub enum FaceKind {
     Compute,
     Internal,
     Multicast,
+    WebSocket,
 }
 
 impl FaceKind {
@@ -38,7 +39,8 @@ impl FaceKind {
         match self {
             FaceKind::Unix | FaceKind::App | FaceKind::Shm | FaceKind::Internal => FaceScope::Local,
             FaceKind::Udp | FaceKind::Tcp | FaceKind::Ethernet | FaceKind::Serial
-            | FaceKind::Bluetooth | FaceKind::Wfb | FaceKind::Compute | FaceKind::Multicast => FaceScope::NonLocal,
+            | FaceKind::Bluetooth | FaceKind::Wfb | FaceKind::Compute | FaceKind::Multicast
+            | FaceKind::WebSocket => FaceScope::NonLocal,
         }
     }
 }
