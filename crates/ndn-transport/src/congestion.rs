@@ -193,6 +193,20 @@ impl CongestionController {
         self
     }
 
+    /// Set the slow-start threshold.
+    ///
+    /// By default ssthresh is `f64::MAX` (unbounded slow start).  Setting
+    /// this to the initial window size prevents the exponential ramp from
+    /// overshooting the link capacity on the first flow.
+    pub fn with_ssthresh(mut self, ss: f64) -> Self {
+        match &mut self {
+            Self::Aimd { ssthresh, .. }
+            | Self::Cubic { ssthresh, .. } => *ssthresh = ss,
+            Self::Fixed { .. } => {}
+        }
+        self
+    }
+
     /// Current window size (number of Interests allowed in flight).
     ///
     /// Callers should use `window().floor() as usize` for the actual limit.
