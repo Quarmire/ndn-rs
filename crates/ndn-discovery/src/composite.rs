@@ -12,7 +12,7 @@ use bytes::Bytes;
 use ndn_packet::Name;
 use ndn_transport::FaceId;
 
-use crate::{DiscoveryContext, DiscoveryProtocol, ProtocolId};
+use crate::{DiscoveryContext, DiscoveryProtocol, InboundMeta, ProtocolId};
 
 /// Wrapper that runs multiple [`DiscoveryProtocol`] implementations in parallel.
 ///
@@ -98,13 +98,19 @@ impl DiscoveryProtocol for CompositeDiscovery {
         }
     }
 
-    fn on_inbound(&self, raw: &Bytes, incoming_face: FaceId, ctx: &dyn DiscoveryContext) -> bool {
+    fn on_inbound(
+        &self,
+        raw: &Bytes,
+        incoming_face: FaceId,
+        meta: &InboundMeta,
+        ctx: &dyn DiscoveryContext,
+    ) -> bool {
         // Try to parse the packet name for prefix-based routing.
         if let Some(name) = parse_first_name(raw) {
             for proto in &self.protocols {
                 for prefix in proto.claimed_prefixes() {
                     if name.has_prefix(prefix) {
-                        return proto.on_inbound(raw, incoming_face, ctx);
+                        return proto.on_inbound(raw, incoming_face, meta, ctx);
                     }
                 }
             }
@@ -114,7 +120,7 @@ impl DiscoveryProtocol for CompositeDiscovery {
 
         // Name parse failed — try all protocols in order (fallback).
         for proto in &self.protocols {
-            if proto.on_inbound(raw, incoming_face, ctx) {
+            if proto.on_inbound(raw, incoming_face, meta, ctx) {
                 return true;
             }
         }
@@ -199,39 +205,84 @@ fn read_varu(buf: &[u8]) -> Option<(usize, usize)> {
 mod tests {
     use super::*;
     use std::str::FromStr;
-    use crate::{NoDiscovery, ProtocolId};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use crate::{DiscoveryContext, InboundMeta, NeighborTableView, NeighborUpdate, NoDiscovery, ProtocolId};
 
-    fn make_proto_with_prefix(id: &'static str, prefix: &str) -> Arc<dyn DiscoveryProtocol> {
-        struct MockProto {
-            id: ProtocolId,
-            prefixes: Vec<Name>,
-        }
-        impl DiscoveryProtocol for MockProto {
-            fn protocol_id(&self) -> ProtocolId { self.id }
-            fn claimed_prefixes(&self) -> &[Name] { &self.prefixes }
-            fn on_face_up(&self, _: FaceId, _: &dyn DiscoveryContext) {}
-            fn on_face_down(&self, _: FaceId, _: &dyn DiscoveryContext) {}
-            fn on_inbound(&self, _: &Bytes, _: FaceId, _: &dyn DiscoveryContext) -> bool { false }
-            fn on_tick(&self, _: Instant, _: &dyn DiscoveryContext) {}
-        }
-        Arc::new(MockProto {
-            id: ProtocolId(id),
-            prefixes: vec![Name::from_str(prefix).unwrap()],
-        })
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    /// Build a minimal, parseable Interest TLV for `name`.
+    ///
+    /// Wire: `0x05 <len> 0x07 <name_len> <components...>`
+    fn minimal_interest(name: &Name) -> Bytes {
+        use ndn_tlv::TlvWriter;
+        let mut w = TlvWriter::new();
+        w.write_nested(0x05u64, |w: &mut TlvWriter| {
+            w.write_nested(0x07u64, |w: &mut TlvWriter| {
+                for comp in name.components() {
+                    w.write_tlv(comp.typ, &comp.value);
+                }
+            });
+        });
+        w.finish()
     }
+
+    struct MockProto {
+        id: ProtocolId,
+        prefixes: Vec<Name>,
+        called: AtomicBool,
+    }
+
+    impl MockProto {
+        fn new(id: &'static str, prefix: &str) -> Arc<Self> {
+            Arc::new(Self {
+                id: ProtocolId(id),
+                prefixes: vec![Name::from_str(prefix).unwrap()],
+                called: AtomicBool::new(false),
+            })
+        }
+    }
+
+    impl DiscoveryProtocol for MockProto {
+        fn protocol_id(&self) -> ProtocolId { self.id }
+        fn claimed_prefixes(&self) -> &[Name] { &self.prefixes }
+        fn on_face_up(&self, _: FaceId, _: &dyn DiscoveryContext) {}
+        fn on_face_down(&self, _: FaceId, _: &dyn DiscoveryContext) {}
+        fn on_inbound(&self, _: &Bytes, _: FaceId, _: &InboundMeta, _: &dyn DiscoveryContext) -> bool {
+            self.called.store(true, Ordering::SeqCst);
+            true
+        }
+        fn on_tick(&self, _: Instant, _: &dyn DiscoveryContext) {}
+    }
+
+    struct NullCtx;
+
+    impl DiscoveryContext for NullCtx {
+        fn alloc_face_id(&self) -> FaceId { FaceId(0) }
+        fn add_face(&self, _: Arc<dyn ndn_transport::ErasedFace>) -> FaceId { FaceId(0) }
+        fn remove_face(&self, _: FaceId) {}
+        fn add_fib_entry(&self, _: &Name, _: FaceId, _: u32, _: ProtocolId) {}
+        fn remove_fib_entry(&self, _: &Name, _: FaceId, _: ProtocolId) {}
+        fn remove_fib_entries_by_owner(&self, _: ProtocolId) {}
+        fn neighbors(&self) -> &dyn NeighborTableView { unimplemented!() }
+        fn update_neighbor(&self, _: NeighborUpdate) {}
+        fn send_on(&self, _: FaceId, _: Bytes) {}
+        fn now(&self) -> Instant { Instant::now() }
+    }
+
+    // ── Construction tests ────────────────────────────────────────────────────
 
     #[test]
     fn no_overlap_is_ok() {
-        let p1 = make_proto_with_prefix("nd", "/ndn/local/nd");
-        let p2 = make_proto_with_prefix("sd", "/ndn/local/sd");
+        let p1 = MockProto::new("nd", "/ndn/local/nd");
+        let p2 = MockProto::new("sd", "/ndn/local/sd");
         assert!(CompositeDiscovery::new(vec![p1, p2]).is_ok());
     }
 
     #[test]
     fn overlap_is_rejected() {
-        let p1 = make_proto_with_prefix("nd", "/ndn/local/nd");
+        let p1 = MockProto::new("nd", "/ndn/local/nd");
         // /ndn/local/nd/hello is a sub-prefix of /ndn/local/nd → overlap
-        let p2 = make_proto_with_prefix("nd2", "/ndn/local/nd/hello");
+        let p2 = MockProto::new("nd2", "/ndn/local/nd/hello");
         assert!(CompositeDiscovery::new(vec![p1, p2]).is_err());
     }
 
@@ -247,5 +298,113 @@ mod tests {
         let nd2 = Arc::new(NoDiscovery) as Arc<dyn DiscoveryProtocol>;
         // Both claim no prefixes → no conflict.
         assert!(CompositeDiscovery::new(vec![nd, nd2]).is_ok());
+    }
+
+    // ── on_inbound routing tests ──────────────────────────────────────────────
+
+    #[test]
+    fn routes_to_matching_protocol() {
+        let p1 = MockProto::new("nd", "/ndn/local/nd");
+        let p2 = MockProto::new("sd", "/ndn/local/sd");
+        let p1_ref = Arc::clone(&p1);
+        let p2_ref = Arc::clone(&p2);
+        let composite = CompositeDiscovery::new(vec![p1, p2]).unwrap();
+
+        // Build an Interest with name /ndn/local/nd/hello — matches p1's prefix.
+        let name = Name::from_str("/ndn/local/nd/hello").unwrap();
+        let pkt = minimal_interest(&name);
+
+        let consumed = composite.on_inbound(&pkt, FaceId(0), &InboundMeta::none(), &NullCtx);
+        assert!(consumed, "composite should consume packet matching p1");
+        assert!(p1_ref.called.load(Ordering::SeqCst), "p1 should have been called");
+        assert!(!p2_ref.called.load(Ordering::SeqCst), "p2 should NOT have been called");
+    }
+
+    #[test]
+    fn routes_to_second_protocol() {
+        let p1 = MockProto::new("nd", "/ndn/local/nd");
+        let p2 = MockProto::new("sd", "/ndn/local/sd");
+        let p1_ref = Arc::clone(&p1);
+        let p2_ref = Arc::clone(&p2);
+        let composite = CompositeDiscovery::new(vec![p1, p2]).unwrap();
+
+        // Build an Interest with name /ndn/local/sd/hello — matches p2's prefix.
+        let name = Name::from_str("/ndn/local/sd/hello").unwrap();
+        let pkt = minimal_interest(&name);
+
+        let consumed = composite.on_inbound(&pkt, FaceId(0), &InboundMeta::none(), &NullCtx);
+        assert!(consumed, "composite should consume packet matching p2");
+        assert!(!p1_ref.called.load(Ordering::SeqCst), "p1 should NOT have been called");
+        assert!(p2_ref.called.load(Ordering::SeqCst), "p2 should have been called");
+    }
+
+    #[test]
+    fn no_match_returns_false() {
+        let p1 = MockProto::new("nd", "/ndn/local/nd");
+        let p2 = MockProto::new("sd", "/ndn/local/sd");
+        let composite = CompositeDiscovery::new(vec![p1, p2]).unwrap();
+
+        // Build an Interest with name /ndn/local/other — matches neither.
+        let name = Name::from_str("/ndn/local/other/hello").unwrap();
+        let pkt = minimal_interest(&name);
+
+        let consumed = composite.on_inbound(&pkt, FaceId(0), &InboundMeta::none(), &NullCtx);
+        assert!(!consumed, "composite should NOT consume unmatched packet");
+    }
+
+    #[test]
+    fn garbage_bytes_not_consumed_when_no_protocol_claims_them() {
+        // A protocol that never claims any packet (returns false from on_inbound).
+        struct NullProto;
+        impl DiscoveryProtocol for NullProto {
+            fn protocol_id(&self) -> ProtocolId { ProtocolId("null") }
+            fn claimed_prefixes(&self) -> &[Name] { &[] }
+            fn on_face_up(&self, _: FaceId, _: &dyn DiscoveryContext) {}
+            fn on_face_down(&self, _: FaceId, _: &dyn DiscoveryContext) {}
+            fn on_inbound(&self, _: &Bytes, _: FaceId, _: &InboundMeta, _: &dyn DiscoveryContext) -> bool { false }
+            fn on_tick(&self, _: Instant, _: &dyn DiscoveryContext) {}
+        }
+        let composite = CompositeDiscovery::new(vec![Arc::new(NullProto) as Arc<dyn DiscoveryProtocol>]).unwrap();
+
+        let junk = Bytes::from_static(b"\xFF\xFF\xFF");
+        let consumed = composite.on_inbound(&junk, FaceId(0), &InboundMeta::none(), &NullCtx);
+        assert!(!consumed, "garbage packet should not be consumed when no protocol claims it");
+    }
+
+    #[test]
+    fn face_lifecycle_delivered_to_all() {
+        let p1 = MockProto::new("nd", "/ndn/local/nd");
+        let p2 = MockProto::new("sd", "/ndn/local/sd");
+        let p1_ref = Arc::clone(&p1);
+        let p2_ref = Arc::clone(&p2);
+
+        // Wrap in a tracking impl for on_face_up.
+        struct TrackFaceUp {
+            inner: Arc<MockProto>,
+            up_called: AtomicBool,
+        }
+        impl DiscoveryProtocol for TrackFaceUp {
+            fn protocol_id(&self) -> ProtocolId { self.inner.id }
+            fn claimed_prefixes(&self) -> &[Name] { &self.inner.prefixes }
+            fn on_face_up(&self, _: FaceId, _: &dyn DiscoveryContext) {
+                self.up_called.store(true, Ordering::SeqCst);
+            }
+            fn on_face_down(&self, _: FaceId, _: &dyn DiscoveryContext) {}
+            fn on_inbound(&self, _: &Bytes, _: FaceId, _: &InboundMeta, _: &dyn DiscoveryContext) -> bool { false }
+            fn on_tick(&self, _: Instant, _: &dyn DiscoveryContext) {}
+        }
+
+        let t1 = Arc::new(TrackFaceUp { inner: Arc::clone(&p1_ref), up_called: AtomicBool::new(false) });
+        let t2 = Arc::new(TrackFaceUp { inner: Arc::clone(&p2_ref), up_called: AtomicBool::new(false) });
+        let t1_ref = Arc::clone(&t1);
+        let t2_ref = Arc::clone(&t2);
+
+        let composite = CompositeDiscovery::new(
+            vec![t1 as Arc<dyn DiscoveryProtocol>, t2 as Arc<dyn DiscoveryProtocol>]
+        ).unwrap();
+        composite.on_face_up(FaceId(3), &NullCtx);
+
+        assert!(t1_ref.up_called.load(Ordering::SeqCst), "p1 should have received on_face_up");
+        assert!(t2_ref.up_called.load(Ordering::SeqCst), "p2 should have received on_face_up");
     }
 }

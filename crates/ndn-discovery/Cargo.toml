@@ -7,9 +7,11 @@ license.workspace = true
 description = "Pluggable neighbor and service discovery for ndn-rs"
 
 [dependencies]
+ndn-tlv       = { workspace = true }
 ndn-packet   = { workspace = true }
 ndn-transport = { workspace = true }
+ndn-face-net  = { workspace = true }
 bytes  = { workspace = true, features = ["std"] }
-tokio  = { workspace = true, features = ["sync", "time"] }
+tokio  = { workspace = true, features = ["sync", "time", "net"] }
 tracing = { workspace = true }
 dashmap = { workspace = true }

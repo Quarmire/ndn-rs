@@ -31,10 +31,13 @@
 pub mod backoff;
 pub mod composite;
 pub mod context;
+pub mod hello;
 pub mod mac_addr;
 pub mod neighbor;
 pub mod no_discovery;
 pub mod protocol;
+pub mod udp_nd;
+pub mod wire;
 
 pub use backoff::{BackoffConfig, BackoffState};
 pub use composite::CompositeDiscovery;
@@ -42,4 +45,10 @@ pub use context::{DiscoveryContext, NeighborTableView};
 pub use mac_addr::MacAddr;
 pub use neighbor::{NeighborEntry, NeighborState, NeighborTable, NeighborUpdate};
 pub use no_discovery::NoDiscovery;
-pub use protocol::{DiscoveryProtocol, ProtocolId};
+pub use hello::{
+    CAP_CONTENT_STORE, CAP_FRAGMENTATION, CAP_SVS, CAP_VALIDATION,
+    DiffEntry, HelloPayload, NeighborDiff,
+    T_ADD_ENTRY, T_CAPABILITIES, T_NEIGHBOR_DIFF, T_NODE_NAME, T_REMOVE_ENTRY, T_SERVED_PREFIX,
+};
+pub use protocol::{DiscoveryProtocol, InboundMeta, LinkAddr, ProtocolId};
+pub use udp_nd::UdpNeighborDiscovery;

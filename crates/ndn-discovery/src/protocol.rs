@@ -1,12 +1,54 @@
-//! `DiscoveryProtocol` trait and `ProtocolId` type.
+//! `DiscoveryProtocol` trait, `ProtocolId`, and `InboundMeta` types.
 
+use std::net::SocketAddr;
 use std::time::Instant;
 
 use bytes::Bytes;
 use ndn_packet::Name;
 use ndn_transport::FaceId;
 
-use crate::DiscoveryContext;
+use crate::{DiscoveryContext, MacAddr};
+
+/// Link-layer source address of an inbound packet.
+///
+/// Populated by the engine when the face layer can provide a sender address
+/// (multicast faces via `recv_with_source`). `None` for unicast faces where
+/// the sender identity is already implicit in the face itself.
+#[derive(Clone, Debug)]
+pub enum LinkAddr {
+    /// Source MAC extracted from the Ethernet frame header.
+    Ether(MacAddr),
+    /// Source IP:port extracted from the UDP socket (`recvfrom`).
+    Udp(SocketAddr),
+}
+
+/// Per-packet metadata passed to [`DiscoveryProtocol::on_inbound`].
+///
+/// Carries side-channel information that does not appear in the NDN wire
+/// bytes — primarily the link-layer source address needed to create a
+/// unicast reply face without embedding addresses in the Interest payload.
+#[derive(Clone, Debug, Default)]
+pub struct InboundMeta {
+    /// Source address of the sender, if the face layer exposed it.
+    pub source: Option<LinkAddr>,
+}
+
+impl InboundMeta {
+    /// Metadata with no source address (unicast face or unknown sender).
+    pub const fn none() -> Self {
+        Self { source: None }
+    }
+
+    /// Metadata carrying an Ethernet source MAC.
+    pub fn ether(mac: MacAddr) -> Self {
+        Self { source: Some(LinkAddr::Ether(mac)) }
+    }
+
+    /// Metadata carrying a UDP source address.
+    pub fn udp(addr: SocketAddr) -> Self {
+        Self { source: Some(LinkAddr::Udp(addr)) }
+    }
+}
 
 /// Stable identifier for a discovery protocol instance.
 ///
@@ -63,9 +105,17 @@ pub trait DiscoveryProtocol: Send + Sync + 'static {
     /// **not** be forwarded through the NDN pipeline.  Return `false` to let
     /// the packet continue normally.
     ///
-    /// Discovery protocols intercept packets addressed to their claimed
-    /// prefixes (e.g. hello Interests sent to `/ndn/local/nd/hello`).
-    fn on_inbound(&self, raw: &Bytes, incoming_face: FaceId, ctx: &dyn DiscoveryContext) -> bool;
+    /// `meta` carries the link-layer source address when the face layer
+    /// exposes it (multicast faces). Discovery protocols use `meta.source`
+    /// to create unicast reply faces without embedding addresses in the
+    /// Interest payload.
+    fn on_inbound(
+        &self,
+        raw: &Bytes,
+        incoming_face: FaceId,
+        meta: &InboundMeta,
+        ctx: &dyn DiscoveryContext,
+    ) -> bool;
 
     /// Periodic tick, called every ~100 ms by the engine's tick task.
     ///

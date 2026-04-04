@@ -79,6 +79,20 @@ impl MulticastUdpFace {
     }
 }
 
+impl MulticastUdpFace {
+    /// Receive the next NDN packet along with the UDP source address.
+    ///
+    /// Used by the discovery layer to learn the sender's address and create a
+    /// unicast reply face — without requiring the sender to embed their address
+    /// in the Interest payload.
+    pub async fn recv_with_source(&self) -> Result<(Bytes, std::net::SocketAddr), FaceError> {
+        let mut buf = vec![0u8; 9000];
+        let (n, src) = self.socket.recv_from(&mut buf).await?;
+        buf.truncate(n);
+        Ok((Bytes::from(buf), src))
+    }
+}
+
 impl Face for MulticastUdpFace {
     fn id(&self) -> FaceId {
         self.id
@@ -89,10 +103,8 @@ impl Face for MulticastUdpFace {
 
     /// Receive the next NDN packet from any sender on the multicast group.
     async fn recv(&self) -> Result<Bytes, FaceError> {
-        let mut buf = vec![0u8; 9000];
-        let (n, _src) = self.socket.recv_from(&mut buf).await?;
-        buf.truncate(n);
-        Ok(Bytes::from(buf))
+        let (pkt, _src) = self.recv_with_source().await?;
+        Ok(pkt)
     }
 
     /// Broadcast an NDN packet to the multicast group.

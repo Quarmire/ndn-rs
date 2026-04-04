@@ -10,7 +10,7 @@ use bytes::Bytes;
 use ndn_packet::Name;
 use ndn_transport::FaceId;
 
-use crate::{DiscoveryContext, DiscoveryProtocol, ProtocolId};
+use crate::{DiscoveryContext, DiscoveryProtocol, InboundMeta, ProtocolId};
 
 /// No-op discovery protocol.
 ///
@@ -44,6 +44,7 @@ impl DiscoveryProtocol for NoDiscovery {
         &self,
         _raw: &Bytes,
         _incoming_face: FaceId,
+        _meta: &InboundMeta,
         _ctx: &dyn DiscoveryContext,
     ) -> bool {
         false
@@ -66,6 +67,9 @@ mod tests {
     fn no_discovery_never_consumes() {
         struct StubCtx;
         impl crate::DiscoveryContext for StubCtx {
+            fn alloc_face_id(&self) -> FaceId {
+                FaceId(0)
+            }
             fn add_face(&self, _: std::sync::Arc<dyn ndn_transport::ErasedFace>) -> FaceId {
                 FaceId(0)
             }
@@ -85,6 +89,6 @@ mod tests {
 
         let ctx = StubCtx;
         let pkt = Bytes::from_static(b"\x05\x10hello");
-        assert!(!NoDiscovery.on_inbound(&pkt, FaceId(1), &ctx));
+        assert!(!NoDiscovery.on_inbound(&pkt, FaceId(1), &InboundMeta::none(), &ctx));
     }
 }
