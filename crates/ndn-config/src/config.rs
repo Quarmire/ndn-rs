@@ -239,8 +239,7 @@ pub struct ManagementConfig {
     ///
     /// - `"ndn"` (default): NDN Interest/Data packets over the face socket.
     ///   Inherits NDN security and routing.  `ndn-ctl` connects via `UnixFace`.
-    /// - `"bypass"`: raw JSON over a Unix socket (or iceoryx2 if the
-    ///   `iceoryx2-mgmt` feature is enabled).  Useful when the forwarding
+    /// - `"bypass"`: raw JSON over a Unix socket.  Useful when the forwarding
     ///   pipeline is unreachable.
     #[serde(default = "default_mgmt_transport")]
     pub transport: String,
