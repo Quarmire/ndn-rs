@@ -189,10 +189,10 @@ impl FilePib {
             }
             let name_uri = std::fs::read_to_string(path.join("name.uri")).unwrap_or_default();
             let name = name_from_uri(name_uri.trim()).unwrap_or_else(|_| Name::root());
-            if let Ok(data) = std::fs::read(path.join("cert.ndnc")) {
-                if let Ok(cert) = decode_cert(Arc::new(name), &data) {
-                    certs.push(cert);
-                }
+            if let Ok(data) = std::fs::read(path.join("cert.ndnc"))
+                && let Ok(cert) = decode_cert(Arc::new(name), &data)
+            {
+                certs.push(cert);
             }
         }
         Ok(certs)
@@ -243,7 +243,8 @@ fn encode_cert(cert: &Certificate) -> Vec<u8> {
     buf
 }
 
-fn decode_cert(name: Arc<Name>, data: &[u8]) -> Result<Certificate, PibError> {
+/// Decode an NDNC-format certificate from raw bytes.
+pub fn decode_cert(name: Arc<Name>, data: &[u8]) -> Result<Certificate, PibError> {
     if data.len() < 25 {
         return Err(PibError::Corrupt("cert too short".into()));
     }
@@ -263,6 +264,9 @@ fn decode_cert(name: Arc<Name>, data: &[u8]) -> Result<Certificate, PibError> {
         public_key: pk,
         valid_from,
         valid_until,
+        issuer: None,
+        signed_region: None,
+        sig_value: None,
     })
 }
 
@@ -476,6 +480,9 @@ mod tests {
             public_key: pk.clone(),
             valid_from: now,
             valid_until: now + 365 * 24 * 3600 * 1_000_000_000u64,
+            issuer: None,
+            signed_region: None,
+            sig_value: None,
         };
         pib.store_cert(&name, &cert).unwrap();
         let loaded = pib.get_cert(&name).unwrap();
@@ -503,6 +510,9 @@ mod tests {
             public_key: Bytes::from_static(&[0xAB; 32]),
             valid_from: 0,
             valid_until: u64::MAX,
+            issuer: None,
+            signed_region: None,
+            sig_value: None,
         };
         pib.add_trust_anchor(&name, &cert).unwrap();
         let anchors = pib.trust_anchors().unwrap();
@@ -519,6 +529,9 @@ mod tests {
             public_key: Bytes::from_static(&[1u8; 32]),
             valid_from: 0,
             valid_until: u64::MAX,
+            issuer: None,
+            signed_region: None,
+            sig_value: None,
         };
         pib.add_trust_anchor(&name, &cert).unwrap();
         let names = pib.list_anchors().unwrap();
@@ -564,6 +577,9 @@ mod tests {
             public_key: Bytes::from_static(&[0x55; 32]),
             valid_from: 1_000_000,
             valid_until: 9_999_999,
+            issuer: None,
+            signed_region: None,
+            sig_value: None,
         };
         let encoded = encode_cert(&cert);
         let decoded = decode_cert(Arc::clone(&name), &encoded).unwrap();

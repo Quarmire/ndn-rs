@@ -13,6 +13,14 @@ pub struct Certificate {
     pub public_key: Bytes,
     pub valid_from: u64,
     pub valid_until: u64,
+    /// The issuer's key name (from SignatureInfo.KeyLocator).
+    /// Populated by `Certificate::decode()`; `None` for manually constructed certs.
+    pub issuer: Option<Arc<Name>>,
+    /// The signed region of the certificate Data (Name through end of SigInfo).
+    /// Needed for chain-walking verification of this cert's own signature.
+    pub signed_region: Option<Bytes>,
+    /// The signature value of the certificate Data.
+    pub sig_value: Option<Bytes>,
 }
 
 impl Certificate {
@@ -61,11 +69,24 @@ impl Certificate {
             return Err(TrustError::InvalidKey);
         }
 
+        // Extract issuer name from SignatureInfo.KeyLocator for chain walking.
+        let issuer = data
+            .sig_info()
+            .and_then(|si| si.key_locator.as_ref())
+            .map(Arc::clone);
+
+        // Preserve signed region and signature value for chain verification.
+        let signed_region = Some(Bytes::copy_from_slice(data.signed_region()));
+        let sig_value = Some(Bytes::copy_from_slice(data.sig_value()));
+
         Ok(Certificate {
             name: Arc::clone(&data.name),
             public_key,
             valid_from,
             valid_until,
+            issuer,
+            signed_region,
+            sig_value,
         })
     }
 
@@ -215,6 +236,9 @@ mod tests {
             public_key: Bytes::from_static(&[1; 32]),
             valid_from: 1000,
             valid_until: 2000,
+            issuer: None,
+            signed_region: None,
+            sig_value: None,
         };
         assert!(!cert.is_valid_at(999));
         assert!(cert.is_valid_at(1000));

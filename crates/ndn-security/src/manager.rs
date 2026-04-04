@@ -88,6 +88,9 @@ impl SecurityManager {
             public_key: public_key_bytes,
             valid_from: now_ns,
             valid_until,
+            issuer: None,
+            signed_region: None,
+            sig_value: None,
         };
         self.cert_cache.insert(cert.clone());
         self.anchors
@@ -129,6 +132,9 @@ impl SecurityManager {
             public_key: subject_public_key,
             valid_from: now_ns,
             valid_until,
+            issuer: None,
+            signed_region: None,
+            sig_value: None,
         };
         self.cert_cache.insert(cert.clone());
         Ok(cert)
@@ -196,6 +202,68 @@ impl SecurityManager {
 
         Ok(mgr)
     }
+
+    /// Auto-initialize security state from a PIB directory.
+    ///
+    /// If the PIB has no keys, generates a new Ed25519 identity with a
+    /// self-signed certificate and stores it. If keys already exist,
+    /// loads the first identity found.
+    ///
+    /// Returns `(SecurityManager, bool)` where the bool is `true` if a
+    /// new identity was generated (useful for logging).
+    pub fn auto_init(
+        identity: &Name,
+        pib_path: &std::path::Path,
+    ) -> Result<(Self, bool), TrustError> {
+        use crate::pib::FilePib;
+
+        // Open or create the PIB.
+        let pib = if pib_path.exists() {
+            FilePib::open(pib_path)?
+        } else {
+            FilePib::new(pib_path)?
+        };
+
+        let existing_keys = pib.list_keys()?;
+        if !existing_keys.is_empty() {
+            // Load the first existing identity.
+            let key_name = &existing_keys[0];
+            let mgr = SecurityManager::from_pib(&pib, key_name)?;
+            return Ok((mgr, false));
+        }
+
+        // No keys — generate a new identity.
+        let key_name = append_key_component(identity);
+        let signer = pib.generate_ed25519(&key_name)?;
+
+        // Self-signed certificate: 1 year validity.
+        let pk = Bytes::copy_from_slice(&signer.public_key_bytes());
+        let now_ns = now_ns();
+        let one_year_ns = 365 * 24 * 3600 * 1_000_000_000u64;
+        let cert = Certificate {
+            name: Arc::new(key_name.clone()),
+            public_key: pk,
+            valid_from: now_ns,
+            valid_until: now_ns.saturating_add(one_year_ns),
+            issuer: Some(Arc::new(key_name.clone())), // self-signed
+            signed_region: None,
+            sig_value: None,
+        };
+        pib.store_cert(&key_name, &cert)?;
+        pib.add_trust_anchor(&key_name, &cert)?;
+
+        let mgr = SecurityManager::from_pib(&pib, &key_name)?;
+        Ok((mgr, true))
+    }
+}
+
+/// Append `/KEY/self` components to an identity name.
+fn append_key_component(identity: &Name) -> Name {
+    use ndn_packet::NameComponent;
+    let mut components: Vec<NameComponent> = identity.components().to_vec();
+    components.push(NameComponent::generic(Bytes::from_static(b"KEY")));
+    components.push(NameComponent::generic(Bytes::from_static(b"self")));
+    Name::from_components(components)
 }
 
 impl Default for SecurityManager {
@@ -331,6 +399,9 @@ mod tests {
             public_key: Bytes::from_static(&[1u8; 32]),
             valid_from: 0,
             valid_until: u64::MAX,
+            issuer: None,
+            signed_region: None,
+            sig_value: None,
         };
         mgr.add_trust_anchor(cert.clone());
         assert!(mgr.trust_anchor(&kn).is_some());
@@ -348,6 +419,9 @@ mod tests {
                 public_key: Bytes::from_static(&[0; 32]),
                 valid_from: 0,
                 valid_until: u64::MAX,
+                issuer: None,
+                signed_region: None,
+                sig_value: None,
             });
         }
         let names = mgr.trust_anchor_names();
@@ -419,5 +493,20 @@ mod tests {
 
         let result = mgr.certify(&subj_name, pk, &ca_name, 60_000).await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn auto_init_generates_on_empty_pib() {
+        let dir = tempfile::tempdir().unwrap();
+        let pib_path = dir.path().join("pib");
+        let identity = key_name("router1");
+
+        let (mgr, generated) = SecurityManager::auto_init(&identity, &pib_path).unwrap();
+        assert!(generated);
+        assert!(!mgr.trust_anchor_names().is_empty());
+
+        // Second call should load existing, not regenerate.
+        let (_mgr2, generated2) = SecurityManager::auto_init(&identity, &pib_path).unwrap();
+        assert!(!generated2);
     }
 }

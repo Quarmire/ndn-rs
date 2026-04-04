@@ -10,6 +10,8 @@ pub enum TrustError {
     CertNotFound { name: String },
     #[error("certificate chain too deep (limit: {limit})")]
     ChainTooDeep { limit: usize },
+    #[error("certificate chain cycle detected at: {name}")]
+    ChainCycle { name: String },
     #[error("name does not match trust schema")]
     SchemaMismatch,
     #[error("key store error: {0}")]

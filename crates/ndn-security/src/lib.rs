@@ -1,8 +1,10 @@
 pub mod cert_cache;
+pub mod cert_fetcher;
 pub mod error;
 pub mod key_store;
 pub mod manager;
 pub mod pib;
+pub mod profile;
 pub mod safe_data;
 pub mod signer;
 pub mod trust_schema;
@@ -10,6 +12,8 @@ pub mod validator;
 pub mod verifier;
 
 pub use cert_cache::{CertCache, Certificate};
+pub use cert_fetcher::{CertFetcher, FetchFn};
+pub use profile::SecurityProfile;
 pub use error::TrustError;
 pub use key_store::{KeyAlgorithm, KeyStore, MemKeyStore};
 pub use manager::SecurityManager;

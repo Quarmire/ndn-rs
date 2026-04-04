@@ -17,6 +17,7 @@ pub enum TrustPath {
 ///
 /// Application callbacks receive `SafeData`, not `Data` — the compiler enforces
 /// that unverified data cannot be passed where verified data is required.
+#[derive(Debug)]
 pub struct SafeData {
     pub(crate) inner: Data,
     pub(crate) trust_path: TrustPath,

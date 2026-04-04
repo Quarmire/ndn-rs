@@ -97,6 +97,39 @@ impl TrustSchema {
     pub fn allows(&self, data_name: &Name, key_name: &Name) -> bool {
         self.rules.iter().any(|r| r.check(data_name, key_name))
     }
+
+    /// Accept any signed packet regardless of name relationship.
+    ///
+    /// Useful for the `AcceptSigned` security profile and for tests.
+    pub fn accept_all() -> Self {
+        let mut schema = Self::new();
+        schema.add_rule(SchemaRule {
+            data_pattern: NamePattern(vec![PatternComponent::MultiCapture("_".into())]),
+            key_pattern: NamePattern(vec![PatternComponent::MultiCapture("_".into())]),
+        });
+        schema
+    }
+
+    /// Hierarchical trust: data and key must share a common first component.
+    ///
+    /// Rule: `/<org>/**` must be signed by `/<org>/**`. The actual hierarchy
+    /// is enforced by the certificate chain walk — a key can only be trusted
+    /// if its cert was issued by a parent key, all the way up to a trust anchor.
+    /// The schema just ensures the top-level namespace matches.
+    pub fn hierarchical() -> Self {
+        let mut schema = Self::new();
+        schema.add_rule(SchemaRule {
+            data_pattern: NamePattern(vec![
+                PatternComponent::Capture("org".into()),
+                PatternComponent::MultiCapture("_data".into()),
+            ]),
+            key_pattern: NamePattern(vec![
+                PatternComponent::Capture("org".into()),
+                PatternComponent::MultiCapture("_key".into()),
+            ]),
+        });
+        schema
+    }
 }
 
 #[cfg(test)]
@@ -189,5 +222,26 @@ mod tests {
     fn empty_schema_rejects_everything() {
         let schema = TrustSchema::new();
         assert!(!schema.allows(&name(&["a"]), &name(&["b"])));
+    }
+
+    #[test]
+    fn accept_all_allows_any_pair() {
+        let schema = TrustSchema::accept_all();
+        assert!(schema.allows(&name(&["a", "b"]), &name(&["x", "y", "z"])));
+        assert!(schema.allows(&name(&["data"]), &name(&["key"])));
+    }
+
+    #[test]
+    fn hierarchical_requires_matching_first_component() {
+        let schema = TrustSchema::hierarchical();
+        // Same org: allowed
+        assert!(schema.allows(&name(&["org", "data"]), &name(&["org", "KEY", "k1"])));
+        // Different org: rejected
+        assert!(!schema.allows(&name(&["orgA", "data"]), &name(&["orgB", "KEY", "k1"])));
+        // Same org, deeper hierarchy: allowed
+        assert!(schema.allows(
+            &name(&["org", "dept", "sensor", "temp"]),
+            &name(&["org", "dept", "KEY", "k1"])
+        ));
     }
 }
