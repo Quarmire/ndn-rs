@@ -89,6 +89,61 @@ when a Tokio-compatible RFCOMM crate is available.
 
 ### Added
 
+#### Security pipeline: certificate fetching, chain validation, engine integration
+
+Full NDN trust chain validation pipeline, from certificate fetching through
+chain walking to engine-level Data packet verification.
+
+- **`CertFetcher`** (`ndn-security`) — async certificate fetcher with
+  deduplication via `DashMap` + `broadcast` channels. Concurrent requests
+  for the same cert share a single Interest. Configurable timeout.
+- **`Certificate` enhanced** — `decode()` now extracts `issuer` (from
+  KeyLocator), `signed_region`, and `sig_value` from the Data packet,
+  enabling chain-walking verification without re-parsing.
+- **`Validator::validate_chain()`** — walks the certificate chain from
+  Data → cert → ... → trust anchor. Cycle detection via `HashSet`,
+  configurable depth limit (`max_chain`). Fetches missing certs via
+  `CertFetcher` when configured.
+- **`Validator::with_chain()`** constructor — accepts shared `CertCache`,
+  trust anchors (`DashMap`), optional `CertFetcher`, and chain depth limit.
+- **`Validator::add_trust_anchor()`** / `is_trust_anchor()` — manage
+  trust anchors at runtime.
+- **`ValidationStage`** (`ndn-engine`) — sits between PitMatch and
+  CsInsert in the data pipeline. Drops Data packets that fail validation
+  (`DropReason::ValidationFailed`). No-op when no validator is configured.
+- **`EngineBuilder::validator()`** — opt-in: pass an `Arc<Validator>` to
+  enable data pipeline validation.
+- **`TrustError::ChainCycle`** variant for cycle detection.
+- **`ValidationResult` is now `Debug`**, `SafeData` is now `Debug`.
+
+#### Default-on security with opt-out model
+
+Security is now enabled by default with sensible defaults and quality-of-life
+bootstrapping. The design follows NDN's security-by-default philosophy.
+
+- **`SecurityProfile`** enum (`ndn-security`) — configures engine validation:
+  `Default` (full chain validation with hierarchical trust), `AcceptSigned`
+  (verify signatures, skip chain walking), `Disabled` (benchmarking only),
+  `Custom(Arc<Validator>)`. Engine auto-wires validator + cert fetcher from
+  `SecurityManager` when profile is `Default`.
+- **`TrustSchema::hierarchical()`** — default trust schema requiring data
+  and key to share the first name component. `TrustSchema::accept_all()` for
+  testing.
+- **Pending validation queue** (`ValidationStage`) — bounded queue (256
+  entries, 4 MB) for Data packets awaiting certificate fetching. Background
+  drain task re-validates at 100 ms intervals. Packets that time out (4 s)
+  are dropped with `DropReason::ValidationTimeout`.
+- **`SecurityManager::auto_init()`** — first-run bootstrapping: generates
+  Ed25519 identity + self-signed certificate in the PIB if no keys exist.
+  Returns `(SecurityManager, bool)` indicating whether generation occurred.
+- **`[security]` config** — new `auto_init` (bool) and `profile` (string)
+  fields. `auto_init = true` generates identity on first startup.
+  `profile = "default" | "accept-signed" | "disabled"`.
+- **`ndn-ctl security`** subcommands — local PIB management without a
+  running router: `init` (generate identity), `trust` (add trust anchor
+  from .ndnc file), `export` (export certificate), `info` (list keys and
+  anchors).
+
 #### SerialFace with COBS framing
 
 Full serial port face implementation replacing the previous stub.  COBS
