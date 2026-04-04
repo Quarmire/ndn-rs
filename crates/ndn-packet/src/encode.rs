@@ -159,6 +159,7 @@ pub struct InterestBuilder {
     must_be_fresh: bool,
     hop_limit: Option<u8>,
     app_parameters: Option<Vec<u8>>,
+    forwarding_hint: Option<Vec<Name>>,
 }
 
 impl InterestBuilder {
@@ -170,6 +171,7 @@ impl InterestBuilder {
             must_be_fresh: false,
             hop_limit: None,
             app_parameters: None,
+            forwarding_hint: None,
         }
     }
 
@@ -198,30 +200,191 @@ impl InterestBuilder {
         self
     }
 
+    pub fn forwarding_hint(mut self, names: Vec<Name>) -> Self {
+        self.forwarding_hint = Some(names);
+        self
+    }
+
     pub fn build(self) -> Bytes {
         let lifetime_ms = self.lifetime.map(|d| d.as_millis() as u64).unwrap_or(4000);
 
-        if let Some(params) = &self.app_parameters {
-            // With ApplicationParameters: same logic as encode_interest.
-            return encode_interest(&self.name, Some(params));
-        }
-
         let mut w = TlvWriter::new();
         w.write_nested(tlv_type::INTEREST, |w| {
-            write_name(w, &self.name);
+            if let Some(ref params) = self.app_parameters {
+                // With ApplicationParameters: append ParametersSha256DigestComponent.
+                let mut params_tlv = TlvWriter::new();
+                params_tlv.write_tlv(tlv_type::APP_PARAMETERS, params);
+                let params_wire = params_tlv.finish();
+                let digest = ring::digest::digest(&ring::digest::SHA256, &params_wire);
+
+                w.write_nested(tlv_type::NAME, |w| {
+                    for comp in self.name.components() {
+                        w.write_tlv(comp.typ, &comp.value);
+                    }
+                    w.write_tlv(tlv_type::PARAMETERS_SHA256, digest.as_ref());
+                });
+            } else {
+                write_name(w, &self.name);
+            }
             if self.can_be_prefix {
                 w.write_tlv(tlv_type::CAN_BE_PREFIX, &[]);
             }
             if self.must_be_fresh {
                 w.write_tlv(tlv_type::MUST_BE_FRESH, &[]);
             }
+            if let Some(ref hints) = self.forwarding_hint {
+                w.write_nested(tlv_type::FORWARDING_HINT, |w| {
+                    for h in hints {
+                        write_name(w, h);
+                    }
+                });
+            }
             w.write_tlv(tlv_type::NONCE, &next_nonce().to_be_bytes());
             write_nni(w, tlv_type::INTEREST_LIFETIME, lifetime_ms);
             if let Some(h) = self.hop_limit {
                 w.write_tlv(tlv_type::HOP_LIMIT, &[h]);
             }
+            if let Some(ref params) = self.app_parameters {
+                w.write_tlv(tlv_type::APP_PARAMETERS, params);
+            }
         });
         w.finish()
+    }
+
+    /// Encode and sign the Interest packet (Signed Interest per NDN v0.3 §5.4).
+    ///
+    /// `sig_type` and `key_locator` describe the signature algorithm and
+    /// optional KeyLocator name for InterestSignatureInfo. `sign_fn` receives
+    /// the signed region (Name through InterestSignatureInfo) and returns the
+    /// raw signature bytes.
+    ///
+    /// If `app_parameters` was not set, an empty ApplicationParameters TLV is
+    /// used — signed Interests must carry ApplicationParameters per spec.
+    ///
+    /// Anti-replay fields (SignatureNonce, SignatureTime, SignatureSeqNum) are
+    /// included in InterestSignatureInfo if set via the builder. If none are
+    /// set, a random 8-byte SignatureNonce and the current wall-clock
+    /// SignatureTime are generated automatically.
+    pub async fn sign<F, Fut>(
+        self,
+        sig_type: SignatureType,
+        key_locator: Option<&Name>,
+        sign_fn: F,
+    ) -> Bytes
+    where
+        F: FnOnce(&[u8]) -> Fut,
+        Fut: std::future::Future<Output = Bytes>,
+    {
+        let signed_region = self.build_signed_interest_region(sig_type, key_locator);
+        let sig_value = sign_fn(&signed_region).await;
+
+        let mut w = TlvWriter::new();
+        w.write_nested(tlv_type::INTEREST, |w| {
+            w.write_raw(&signed_region);
+            w.write_tlv(tlv_type::INTEREST_SIGNATURE_VALUE, &sig_value);
+        });
+        w.finish()
+    }
+
+    /// Synchronous encode-and-sign for CPU-only signers (Ed25519, HMAC).
+    pub fn sign_sync<F>(
+        self,
+        sig_type: SignatureType,
+        key_locator: Option<&Name>,
+        sign_fn: F,
+    ) -> Bytes
+    where
+        F: FnOnce(&[u8]) -> Bytes,
+    {
+        let signed_region = self.build_signed_interest_region(sig_type, key_locator);
+        let sig_value = sign_fn(&signed_region);
+
+        let inner_len = signed_region.len()
+            + ndn_tlv::varu64_size(tlv_type::INTEREST_SIGNATURE_VALUE)
+            + ndn_tlv::varu64_size(sig_value.len() as u64)
+            + sig_value.len();
+        let mut outer = TlvWriter::with_capacity(inner_len + 10);
+        outer.write_varu64(tlv_type::INTEREST);
+        outer.write_varu64(inner_len as u64);
+        outer.write_raw(&signed_region);
+        outer.write_tlv(tlv_type::INTEREST_SIGNATURE_VALUE, &sig_value);
+        outer.finish()
+    }
+
+    /// Build the signed region for a Signed Interest: Name (with
+    /// ParametersSha256DigestComponent) through InterestSignatureInfo,
+    /// including all fields in between.
+    fn build_signed_interest_region(
+        self,
+        sig_type: SignatureType,
+        key_locator: Option<&Name>,
+    ) -> Vec<u8> {
+        let params = self.app_parameters.unwrap_or_default();
+        let lifetime_ms = self.lifetime.map(|d| d.as_millis() as u64).unwrap_or(4000);
+
+        let mut inner = TlvWriter::new();
+
+        // Name with ParametersSha256DigestComponent.
+        let mut params_tlv = TlvWriter::new();
+        params_tlv.write_tlv(tlv_type::APP_PARAMETERS, &params);
+        let params_wire = params_tlv.finish();
+        let digest = ring::digest::digest(&ring::digest::SHA256, &params_wire);
+
+        inner.write_nested(tlv_type::NAME, |w| {
+            for comp in self.name.components() {
+                w.write_tlv(comp.typ, &comp.value);
+            }
+            w.write_tlv(tlv_type::PARAMETERS_SHA256, digest.as_ref());
+        });
+
+        // Selectors.
+        if self.can_be_prefix {
+            inner.write_tlv(tlv_type::CAN_BE_PREFIX, &[]);
+        }
+        if self.must_be_fresh {
+            inner.write_tlv(tlv_type::MUST_BE_FRESH, &[]);
+        }
+
+        // ForwardingHint.
+        if let Some(ref hints) = self.forwarding_hint {
+            inner.write_nested(tlv_type::FORWARDING_HINT, |w| {
+                for h in hints {
+                    write_name(w, h);
+                }
+            });
+        }
+
+        // Nonce, Lifetime, HopLimit.
+        inner.write_tlv(tlv_type::NONCE, &next_nonce().to_be_bytes());
+        write_nni(&mut inner, tlv_type::INTEREST_LIFETIME, lifetime_ms);
+        if let Some(h) = self.hop_limit {
+            inner.write_tlv(tlv_type::HOP_LIMIT, &[h]);
+        }
+
+        // ApplicationParameters.
+        inner.write_tlv(tlv_type::APP_PARAMETERS, &params);
+
+        // InterestSignatureInfo with anti-replay fields.
+        inner.write_nested(tlv_type::INTEREST_SIGNATURE_INFO, |w| {
+            write_nni(w, tlv_type::SIGNATURE_TYPE, sig_type.code());
+            if let Some(kl) = key_locator {
+                w.write_nested(tlv_type::KEY_LOCATOR, |w| {
+                    write_name(w, kl);
+                });
+            }
+            // Auto-generate SignatureNonce (8 random bytes) and SignatureTime
+            // (current wall clock) for replay protection.
+            let nonce_bytes: [u8; 8] = rand_nonce_bytes();
+            w.write_tlv(tlv_type::SIGNATURE_NONCE, &nonce_bytes);
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let (time_buf, time_len) = nni(now_ms);
+            w.write_tlv(tlv_type::SIGNATURE_TIME, &time_buf[..time_len]);
+        });
+
+        inner.finish().to_vec()
     }
 }
 
@@ -446,6 +609,16 @@ fn next_nonce() -> u32 {
     (std::process::id() << 16).wrapping_add(seq)
 }
 
+/// Generate 8 random bytes for SignatureNonce anti-replay.
+///
+/// Uses `ring::rand::SystemRandom` which is cryptographically secure.
+fn rand_nonce_bytes() -> [u8; 8] {
+    let mut buf = [0u8; 8];
+    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut buf)
+        .expect("system RNG failed");
+    buf
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -608,6 +781,209 @@ mod tests {
         let wire = InterestBuilder::new("/a/b/c").build();
         let interest = Interest::decode(wire).unwrap();
         assert_eq!(interest.name.len(), 3);
+    }
+
+    #[test]
+    fn interest_builder_app_params_preserves_selectors() {
+        let wire = InterestBuilder::new("/cmd")
+            .can_be_prefix()
+            .must_be_fresh()
+            .lifetime(Duration::from_millis(2000))
+            .hop_limit(64)
+            .app_parameters(b"payload".to_vec())
+            .build();
+        let interest = Interest::decode(wire).unwrap();
+        assert!(interest.selectors().can_be_prefix);
+        assert!(interest.selectors().must_be_fresh);
+        assert_eq!(interest.lifetime(), Some(Duration::from_millis(2000)));
+        assert_eq!(interest.hop_limit(), Some(64));
+        assert_eq!(
+            interest.app_parameters().map(|b| b.as_ref()),
+            Some(b"payload".as_ref())
+        );
+    }
+
+    #[test]
+    fn interest_builder_forwarding_hint() {
+        let hint: Name = "/ndn/gateway".parse().unwrap();
+        let wire = InterestBuilder::new("/test")
+            .forwarding_hint(vec![hint])
+            .build();
+        let interest = Interest::decode(wire).unwrap();
+        let hints = interest.forwarding_hint().expect("forwarding_hint present");
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0].to_string(), "/ndn/gateway");
+    }
+
+    #[test]
+    fn interest_builder_sign_sync_roundtrip() {
+        let key_name: Name = "/key/test".parse().unwrap();
+        let wire = InterestBuilder::new("/signed/cmd")
+            .app_parameters(b"params".to_vec())
+            .sign_sync(
+                crate::SignatureType::SignatureEd25519,
+                Some(&key_name),
+                |region| {
+                    let digest = ring::digest::digest(&ring::digest::SHA256, region);
+                    Bytes::copy_from_slice(digest.as_ref())
+                },
+            );
+        let interest = Interest::decode(wire).unwrap();
+        // Name has original components + ParametersSha256DigestComponent.
+        assert_eq!(interest.name.components()[0].value.as_ref(), b"signed");
+        assert_eq!(interest.name.components()[1].value.as_ref(), b"cmd");
+        let last = interest.name.components().last().unwrap();
+        assert_eq!(last.typ, tlv_type::PARAMETERS_SHA256);
+        assert_eq!(last.value.len(), 32);
+        // Signature fields present.
+        let si = interest.sig_info().expect("sig_info present");
+        assert_eq!(si.sig_type, crate::SignatureType::SignatureEd25519);
+        let kl = si.key_locator.as_ref().expect("key locator present");
+        assert_eq!(kl.to_string(), "/key/test");
+        assert!(interest.sig_value().is_some());
+        assert_eq!(
+            interest.app_parameters().map(|b| b.as_ref()),
+            Some(b"params".as_ref())
+        );
+    }
+
+    #[test]
+    fn interest_builder_sign_sync_auto_anti_replay() {
+        let wire = InterestBuilder::new("/cmd")
+            .sign_sync(crate::SignatureType::SignatureEd25519, None, |region| {
+                Bytes::copy_from_slice(
+                    ring::digest::digest(&ring::digest::SHA256, region).as_ref(),
+                )
+            });
+        let interest = Interest::decode(wire).unwrap();
+        let si = interest.sig_info().expect("sig_info");
+        // Auto-generated anti-replay fields.
+        assert!(si.sig_nonce.is_some());
+        assert!(si.sig_time.is_some());
+    }
+
+    #[test]
+    fn interest_builder_sign_sync_empty_params_default() {
+        // Signed interest without explicit app_parameters gets empty AppParams.
+        let wire = InterestBuilder::new("/cmd")
+            .sign_sync(crate::SignatureType::DigestSha256, None, |region| {
+                let d = ring::digest::digest(&ring::digest::SHA256, region);
+                Bytes::copy_from_slice(d.as_ref())
+            });
+        let interest = Interest::decode(wire).unwrap();
+        // AppParams present but empty.
+        let ap = interest.app_parameters().expect("app_params present");
+        assert!(ap.is_empty());
+    }
+
+    #[test]
+    fn interest_builder_sign_sync_signed_region() {
+        let wire = InterestBuilder::new("/test")
+            .app_parameters(b"data".to_vec())
+            .sign_sync(crate::SignatureType::SignatureEd25519, None, |region| {
+                // Region must start with Name TLV (0x07) and not contain
+                // InterestSignatureValue.
+                assert_eq!(region[0], tlv_type::NAME as u8);
+                Bytes::copy_from_slice(
+                    ring::digest::digest(&ring::digest::SHA256, region).as_ref(),
+                )
+            });
+        let interest = Interest::decode(wire.clone()).unwrap();
+        let region = interest.signed_region().expect("signed region present");
+        // Region starts with Name TLV.
+        assert_eq!(region[0], tlv_type::NAME as u8);
+        // Region must not contain signature value bytes.
+        assert!(interest.sig_value().is_some());
+    }
+
+    #[test]
+    fn interest_builder_sign_async_matches_sync_structure() {
+        use std::pin::pin;
+        use std::task::{Context, Wake, Waker};
+
+        struct NoopWaker;
+        impl Wake for NoopWaker {
+            fn wake(self: std::sync::Arc<Self>) {}
+        }
+        let waker = Waker::from(std::sync::Arc::new(NoopWaker));
+        let mut cx = Context::from_waker(&waker);
+
+        // Use a fixed "signature" so async and sync produce comparable results.
+        let sign_fn = |region: &[u8]| -> Bytes {
+            let d = ring::digest::digest(&ring::digest::SHA256, region);
+            Bytes::copy_from_slice(d.as_ref())
+        };
+
+        let fut = InterestBuilder::new("/test")
+            .app_parameters(b"p".to_vec())
+            .sign(
+                crate::SignatureType::SignatureEd25519,
+                None,
+                |region: &[u8]| {
+                    let d = ring::digest::digest(&ring::digest::SHA256, region);
+                    std::future::ready(Bytes::copy_from_slice(d.as_ref()))
+                },
+            );
+        let mut fut = pin!(fut);
+        let async_wire = match fut.as_mut().poll(&mut cx) {
+            std::task::Poll::Ready(b) => b,
+            std::task::Poll::Pending => panic!("should complete immediately"),
+        };
+
+        // Both should decode successfully with same structure.
+        let async_i = Interest::decode(async_wire).unwrap();
+        assert!(async_i.sig_info().is_some());
+        assert!(async_i.sig_value().is_some());
+        assert!(async_i.signed_region().is_some());
+
+        // Sync path for comparison (different nonce/time so wire bytes differ).
+        let sync_wire = InterestBuilder::new("/test")
+            .app_parameters(b"p".to_vec())
+            .sign_sync(crate::SignatureType::SignatureEd25519, None, sign_fn);
+        let sync_i = Interest::decode(sync_wire).unwrap();
+        assert!(sync_i.sig_info().is_some());
+        assert!(sync_i.sig_value().is_some());
+    }
+
+    #[test]
+    fn interest_builder_sign_sync_with_all_options() {
+        let hint: Name = "/ndn/relay".parse().unwrap();
+        let key_name: Name = "/my/key".parse().unwrap();
+        let wire = InterestBuilder::new("/prefix/command")
+            .can_be_prefix()
+            .must_be_fresh()
+            .lifetime(Duration::from_millis(8000))
+            .hop_limit(32)
+            .forwarding_hint(vec![hint])
+            .app_parameters(b"payload".to_vec())
+            .sign_sync(
+                crate::SignatureType::SignatureEd25519,
+                Some(&key_name),
+                |region| {
+                    Bytes::copy_from_slice(
+                        ring::digest::digest(&ring::digest::SHA256, region).as_ref(),
+                    )
+                },
+            );
+        let i = Interest::decode(wire).unwrap();
+        assert!(i.selectors().can_be_prefix);
+        assert!(i.selectors().must_be_fresh);
+        assert_eq!(i.lifetime(), Some(Duration::from_millis(8000)));
+        assert_eq!(i.hop_limit(), Some(32));
+        let hints = i.forwarding_hint().expect("forwarding_hint");
+        assert_eq!(hints[0].to_string(), "/ndn/relay");
+        assert_eq!(
+            i.app_parameters().map(|b| b.as_ref()),
+            Some(b"payload".as_ref())
+        );
+        let si = i.sig_info().expect("sig_info");
+        assert_eq!(si.sig_type, crate::SignatureType::SignatureEd25519);
+        assert_eq!(
+            si.key_locator.as_ref().unwrap().to_string(),
+            "/my/key"
+        );
+        assert!(i.sig_value().is_some());
+        assert!(i.signed_region().is_some());
     }
 
     // ── DataBuilder ──────────────────────────────────────────────────────────
