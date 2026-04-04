@@ -1,0 +1,33 @@
+[package]
+name = "ndn-embedded"
+description = "Minimal NDN forwarder for bare-metal embedded targets (no_std)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# This crate is always #![no_std]. It never gains a `std` feature.
+# Target: ARM Cortex-M, RISC-V, ESP32, and similar bare-metal MCUs.
+#
+# Basic usage (no heap allocator required):
+#   ndn-embedded = { path = "...", features = [] }
+#
+# With heap allocator (ESP32, Cortex-M with allocator):
+#   ndn-embedded = { path = "...", features = ["alloc"] }
+[features]
+default  = []
+alloc    = ["dep:hashbrown"]  # heap allocator present
+cs       = []                                      # enable content store
+ipc      = []                                      # app-to-forwarder SPSC queues
+
+[dependencies]
+ndn-tlv    = { workspace = true }
+ndn-packet = { workspace = true }
+heapless   = { workspace = true }
+nb         = { workspace = true }
+bytes      = { workspace = true }
+hashbrown  = { version = "0.15", optional = true, default-features = false }
+
+[dev-dependencies]
+# Host-side tests have full std available via cfg(test)
+ndn-tlv    = { workspace = true, features = ["std"] }
+ndn-packet = { workspace = true, features = ["std"] }

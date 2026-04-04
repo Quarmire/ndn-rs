@@ -12,6 +12,73 @@ bootstrapping phase and all APIs should be considered unstable.
 
 ### Added
 
+#### `ndn-embedded` — bare-metal NDN forwarder crate (`no_std`)
+
+Added `crates/ndn-embedded`, a `#![no_std]` NDN forwarder for ARM Cortex-M,
+RISC-V, ESP32, and similar bare-metal MCUs. Inspired by zenoh-pico: a minimal
+embedded implementation that shares only the TLV codec with the full std stack.
+No heap allocator is required for the core forwarder.
+
+**Architecture** — all state is const-generic and stack-allocated:
+- `Pit<const N: usize>` — pending Interest table using `heapless::Vec`,
+  keyed by FNV-1a name hash; supports nonce loop detection and per-entry
+  lifetime expiry driven by a caller-supplied `Clock`.
+- `Fib<const N: usize>` — forwarding information base with longest-prefix
+  match over FNV-1a prefix hashes; O(N) lookup, zero alloc.
+- `Forwarder<P, F, C: Clock>` — single-threaded packet dispatcher:
+  `process_packet()` handles Interest (FIB lookup, PIT insert, split-horizon),
+  Data (PIT satisfaction), and unwrapped NDNLPv2 fragments; `run_one_tick()`
+  purges expired PIT entries.
+- `ContentStore<N, MAX_LEN>` — round-robin eviction cache, behind `cs` feature.
+- COBS framing (`cobs.rs`) — encode/decode over `&[u8]` slices; 0x00 = frame
+  delimiter, algorithm-compatible with `ndn-face-serial`.
+- Slice-based TLV encoder (`wire.rs`) — `encode_interest()` / `encode_data()`
+  write into caller-supplied `&mut [u8]` with no heap; correct minimal NDN
+  varint encoding throughout.
+- `Face` / `ErasedFace` traits using `nb::Result` (non-blocking, sync);
+  integrates with `embedded-hal` and Embassy adapter pattern.
+- SPSC app↔forwarder channel (`ipc.rs`) via `heapless::spsc::Queue`, behind
+  `ipc` feature.
+
+**Feature flags:**
+```toml
+ndn-embedded = { path = "...", features = [] }       # heapless only, no alloc
+ndn-embedded = { path = "...", features = ["alloc"] } # hashbrown available
+ndn-embedded = { path = "...", features = ["cs"] }    # content store enabled
+ndn-embedded = { path = "...", features = ["ipc"] }   # app queues enabled
+```
+
+**CI:** `.github/workflows/embedded.yml` cross-compiles to
+`thumbv7em-none-eabihf` for all three no-std check variants, plus runs the
+29-test host suite and the 32-test `--features cs` suite on every push/PR.
+
+#### `ndn-tlv` / `ndn-packet` no-std support
+
+Fixed lingering `std`-only leakage in the two foundation crates so that
+`ndn-embedded` can use them without a heap allocator:
+
+- **`ndn-tlv`**: `std` feature now activates `bytes/std`; `writer.rs` imports
+  `alloc::vec::Vec` under `#[cfg(not(feature = "std"))]`.
+- **`ndn-packet`**: `encode` and `fragment` modules gated behind
+  `#[cfg(feature = "std")]`; `Arc` / `OnceLock` imports conditionalized to
+  `alloc::sync::Arc` / `core::cell::OnceCell` in no-std mode; `ring` digest
+  verification gated behind `std` (crypto primitives require `std`); `lp.rs`
+  carries a local `nni()` helper so it no longer depends on `encode`.
+- **Workspace**: `bytes` and `ndn-tlv` workspace dependencies now declare
+  `default-features = false`; all std crates opt-in with
+  `features = ["std"]` at their declaration site.
+
+### Removed
+
+#### iceoryx2 references
+
+Removed all references to the `iceoryx2-mgmt` feature and iceoryx shared-memory
+transport from non-documentation source files. The feature was never implemented;
+`ndn-router/src/main.rs` cfg guards and `ndn-config` doc comments have been
+updated accordingly.
+
+### Added
+
 #### Criterion benchmarks for security, name operations, content store, and pipeline
 
 Added four new Criterion benchmark suites covering previously un-benchmarked hot

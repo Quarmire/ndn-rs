@@ -1,0 +1,49 @@
+name: embedded
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  no-std-check:
+    name: no_std cross-compile check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv7em-none-eabihf
+
+      - name: Check ndn-tlv (no_std, Cortex-M4F)
+        run: cargo check -p ndn-tlv --no-default-features --target thumbv7em-none-eabihf
+
+      - name: Check ndn-packet (no_std, Cortex-M4F)
+        run: cargo check -p ndn-packet --no-default-features --target thumbv7em-none-eabihf
+
+      - name: Check ndn-embedded (no_std, Cortex-M4F)
+        run: cargo check -p ndn-embedded --target thumbv7em-none-eabihf
+
+      - name: Check ndn-embedded with alloc feature (Cortex-M4F)
+        run: cargo check -p ndn-embedded --features alloc --target thumbv7em-none-eabihf
+
+      - name: Check ndn-embedded with cs feature (Cortex-M4F)
+        run: cargo check -p ndn-embedded --features cs --target thumbv7em-none-eabihf
+
+  embedded-tests:
+    name: ndn-embedded host tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run ndn-embedded tests
+        run: cargo test -p ndn-embedded
+
+      - name: Run ndn-embedded tests (with cs feature)
+        run: cargo test -p ndn-embedded --features cs
