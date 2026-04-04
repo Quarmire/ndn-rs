@@ -18,3 +18,11 @@ ndn-tlv   = { workspace = true }
 bytes     = { workspace = true }
 smallvec  = { workspace = true }
 ring      = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+ndn-tlv   = { workspace = true }
+
+[[bench]]
+name    = "name"
+harness = false

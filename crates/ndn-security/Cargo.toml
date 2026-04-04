@@ -19,3 +19,9 @@ tokio         = { workspace = true, features = ["sync", "time"] }
 [dev-dependencies]
 tokio      = { workspace = true, features = ["rt", "macros", "sync", "time"] }
 tempfile   = "3"
+criterion  = { workspace = true }
+ndn-tlv    = { workspace = true }
+
+[[bench]]
+name    = "security"
+harness = false
