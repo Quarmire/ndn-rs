@@ -95,10 +95,17 @@ async fn main() -> Result<()> {
             _ => Arc::new(ndn_store::DefaultAdmissionPolicy),
         };
 
+    let security_profile = match fwd_config.security.profile.as_str() {
+        "disabled" => ndn_security::SecurityProfile::Disabled,
+        "accept-signed" => ndn_security::SecurityProfile::AcceptSigned,
+        _ => ndn_security::SecurityProfile::Default,
+    };
+
     let mut builder = EngineBuilder::new(engine_config)
         .face(mgmt_app_face)
         .content_store(cs)
-        .admission_policy(admission);
+        .admission_policy(admission)
+        .security_profile(security_profile);
     if let Some(mgr) = security_mgr {
         builder = builder.security(mgr);
     }
@@ -523,9 +530,11 @@ async fn run_ws_listener(
 
 /// Load the router's security identity from the PIB specified in `[security]`.
 ///
-/// Returns `Some(SecurityManager)` on success; `None` on failure or when no
-/// identity is configured.  Failures are non-fatal: the router starts without a
-/// security identity and logs a warning instead.
+/// When `auto_init` is enabled and no keys exist, generates a new identity
+/// with a self-signed certificate.  Returns `Some(SecurityManager)` on
+/// success; `None` on failure or when no identity is configured.  Failures
+/// are non-fatal: the router starts without a security identity and logs a
+/// warning instead.
 fn load_security(cfg: &ForwarderConfig) -> Option<SecurityManager> {
     let identity_uri = cfg.security.identity.as_ref()?;
 
@@ -537,6 +546,35 @@ fn load_security(cfg: &ForwarderConfig) -> Option<SecurityManager> {
         .unwrap_or_else(default_pib_path);
 
     let identity = parse_name(identity_uri);
+
+    if cfg.security.auto_init {
+        match SecurityManager::auto_init(&identity, &pib_path) {
+            Ok((mgr, generated)) => {
+                if generated {
+                    tracing::info!(
+                        identity = %identity_uri,
+                        pib = %pib_path.display(),
+                        "auto-initialized new security identity"
+                    );
+                } else {
+                    tracing::info!(
+                        identity = %identity_uri,
+                        pib = %pib_path.display(),
+                        "loaded existing security identity from PIB"
+                    );
+                }
+                return Some(mgr);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    identity = %identity_uri,
+                    "auto-init failed; starting without security identity"
+                );
+                return None;
+            }
+        }
+    }
 
     let pib = match FilePib::open(&pib_path) {
         Ok(p) => p,

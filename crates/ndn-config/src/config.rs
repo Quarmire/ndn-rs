@@ -280,13 +280,14 @@ fn default_face_socket() -> String {
 pub struct SecurityConfig {
     /// NDN identity name for this router (e.g., `/ndn/router1`).
     ///
-    /// The corresponding key and certificate must exist in the PIB.
+    /// The corresponding key and certificate must exist in the PIB
+    /// (unless `auto_init` is enabled).
     #[serde(default)]
     pub identity: Option<String>,
 
     /// Path to the PIB directory (default: `~/.ndn/pib`).
     ///
-    /// Create with `ndn-sec keygen <identity>`.
+    /// Create with `ndn-ctl security init` or enable `auto_init`.
     #[serde(default)]
     pub pib_path: Option<String>,
 
@@ -299,6 +300,27 @@ pub struct SecurityConfig {
     /// Whether to require all Data packets to be signed and verified.
     #[serde(default)]
     pub require_signed: bool,
+
+    /// Automatically generate an identity and self-signed certificate
+    /// on first startup if no keys exist in the PIB.
+    ///
+    /// Requires `identity` to be set. Default: `false`.
+    #[serde(default)]
+    pub auto_init: bool,
+
+    /// Security profile: `"default"`, `"accept-signed"`, or `"disabled"`.
+    ///
+    /// - `"default"` — full chain validation with hierarchical trust schema
+    /// - `"accept-signed"` — verify signatures but skip chain walking
+    /// - `"disabled"` — no validation (benchmarking/lab only)
+    ///
+    /// Default: `"default"`.
+    #[serde(default = "default_security_profile")]
+    pub profile: String,
+}
+
+fn default_security_profile() -> String {
+    "default".to_owned()
 }
 
 #[cfg(test)]
