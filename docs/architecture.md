@@ -49,7 +49,7 @@ Layer 2 (pipeline, strategy, security)
   ndn-pipeline   ndn-strategy   ndn-security
 
 Layer 3 (faces)
-  ndn-face-net   ndn-face-local   ndn-face-serial   ndn-face-wireless
+  ndn-face-net   ndn-face-local   ndn-face-serial   ndn-face-l2
 
 Layer 4 (data structures & transport)
   ndn-store    ndn-transport

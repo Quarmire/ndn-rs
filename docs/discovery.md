@@ -1062,7 +1062,7 @@ engine.discovery.on_tick(Instant::now(), &ctx);
 
 ## Relation to Other Components
 
-- **`ndn-face-wireless`**: provides `NamedEtherFace`, `MulticastEtherFace`,
+- **`ndn-face-l2`**: provides `NamedEtherFace`, `MulticastEtherFace`,
   and the `recv_with_source()` MAC extraction method. Discovery uses these
   face types but does not own them.
 - **`ndn-sync`**: SVS is the gossip substrate for service record push
@@ -1086,7 +1086,7 @@ engine.discovery.on_tick(Instant::now(), &ctx);
 ## Implementation Order
 
 1. **Source MAC extraction** — `MulticastEtherFace::recv_with_source()` in
-   `ndn-face-wireless`. Prerequisite for everything.
+   `ndn-face-l2`. Prerequisite for everything.
 2. **`ndn-discovery` crate scaffold** — `DiscoveryProtocol` trait,
    `DiscoveryContext` trait, `ProtocolId`, `NoDiscovery`. Engine integration
    hooks and `neighbor_table.rs` owned by engine.

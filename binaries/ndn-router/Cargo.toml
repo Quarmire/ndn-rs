@@ -21,7 +21,7 @@ ndn-app          = { workspace = true }
 ndn-face-net     = { workspace = true }
 ndn-face-local   = { workspace = true }
 ndn-face-serial  = { workspace = true }
-ndn-face-wireless = { workspace = true }
+ndn-face-l2 = { workspace = true }
 ndn-strategy     = { workspace = true }
 ndn-store        = { workspace = true }
 ndn-security     = { workspace = true }

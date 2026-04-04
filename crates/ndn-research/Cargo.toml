@@ -9,7 +9,7 @@ license.workspace = true
 ndn-packet        = { workspace = true }
 ndn-pipeline      = { workspace = true }
 ndn-transport     = { workspace = true }
-ndn-face-wireless = { workspace = true }
+ndn-face-l2 = { workspace = true }
 bytes         = { workspace = true, features = ["std"] }
 tokio             = { workspace = true, features = ["sync"] }
 dashmap           = { workspace = true }

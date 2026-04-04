@@ -2352,7 +2352,7 @@ These are thin. `ndn-router` is essentially `EngineBuilder` configuration read f
 
 **Layer 3 — faces**
 
-Splitting faces into four crates reflects real dependency differences. `ndn-face-net` pulls in tokio's net features. `ndn-face-local` pulls in `iceoryx2` or platform Unix socket APIs. `ndn-face-serial` pulls in `tokio-serial` and `cobs`. `ndn-face-wireless` pulls in `neli` for nl80211 Netlink, the wfb-ng FFI, and `bluer` for Bluetooth. None of these dependencies belong in the engine itself — a router that only uses UDP faces should not compile iceoryx2 or tokio-serial.
+Splitting faces into four crates reflects real dependency differences. `ndn-face-net` pulls in tokio's net features. `ndn-face-local` pulls in `iceoryx2` or platform Unix socket APIs. `ndn-face-serial` pulls in `tokio-serial` and `cobs`. `ndn-face-l2` pulls in `neli` for nl80211 Netlink, the wfb-ng FFI, and `bluer` for Bluetooth. None of these dependencies belong in the engine itself — a router that only uses UDP faces should not compile iceoryx2 or tokio-serial.
 
 All four depend on `ndn-transport`, which defines the `Face` trait, `FaceId`, `FaceTable`, and `RawPacket`. This is the only thing the engine needs to know about faces.
 
@@ -2368,7 +2368,7 @@ All four depend on `ndn-transport`, which defines the `Face` trait, `FaceId`, `F
 
 **Layer 5 — research extensions**
 
-`ndn-research` contains `FlowObserverStage`, the `RadioTable`, nl80211 integration via `neli`, and any measurement infrastructure specific to research. It depends on `ndn-pipeline` and `ndn-face-wireless` but is not depended on by anything in the core stack. A production deployment compiles without it.
+`ndn-research` contains `FlowObserverStage`, the `RadioTable`, nl80211 integration via `neli`, and any measurement infrastructure specific to research. It depends on `ndn-pipeline` and `ndn-face-l2` but is not depended on by anything in the core stack. A production deployment compiles without it.
 
 `ndn-compute` contains `ComputeFace`, `ComputeRegistry`, and `ChunkedProducer` for compute result segmentation.
 
@@ -2421,7 +2421,7 @@ ndn-rs/
 │   ├── ndn-face-net/
 │   ├── ndn-face-local/
 │   ├── ndn-face-serial/
-│   ├── ndn-face-wireless/
+│   ├── ndn-face-l2/
 │   ├── ndn-compute/
 │   ├── ndn-sync/
 │   └── ndn-research/
@@ -2508,7 +2508,7 @@ Then implement to pass the tests."
 
 **One specific recommendation for the wireless and research components**
 
-For `ndn-face-wireless` and `ndn-research` — the nl80211 integration, ChannelManager, and MultiRadioStrategy — prototype these separately from the main workspace first as a small standalone binary that just reads nl80211 survey data and prints it. The Netlink interface is complex and platform-specific and you do not want debugging it to block progress on the core stack. Once you have a working nl80211 reader, integrating it into `ndn-face-wireless` is straightforward.
+For `ndn-face-l2` and `ndn-research` — the nl80211 integration, ChannelManager, and MultiRadioStrategy — prototype these separately from the main workspace first as a small standalone binary that just reads nl80211 survey data and prints it. The Netlink interface is complex and platform-specific and you do not want debugging it to block progress on the core stack. Once you have a working nl80211 reader, integrating it into `ndn-face-l2` is straightforward.
 
 **The practical starting point**
 

@@ -32,6 +32,12 @@ pub trait NeighborTableView: Send + Sync {
 pub trait DiscoveryContext: Send + Sync {
     // ── Face management ──────────────────────────────────────────────────────
 
+    /// Allocate a unique `FaceId` from the engine's face table.
+    ///
+    /// Discovery protocols call this before constructing a face object (e.g.
+    /// [`NamedEtherFace::new`]) that requires an ID at construction time.
+    fn alloc_face_id(&self) -> FaceId;
+
     /// Add a dynamically created face to the engine.
     ///
     /// Returns the `FaceId` assigned by the face table.  The engine spawns

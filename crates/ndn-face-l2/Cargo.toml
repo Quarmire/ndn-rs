@@ -1,6 +1,6 @@
 [package]
-name = "ndn-face-wireless"
-description = "NDN wireless faces: NamedEtherFace and WfbFace (Linux only), BluetoothFace (Linux only), NeighborDiscovery, RadioTable"
+name = "ndn-face-l2"
+description = "NDN link-layer faces: NamedEtherFace and WfbFace (Linux only), BluetoothFace (Linux only), EtherNeighborDiscovery, RadioTable"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,14 +12,20 @@ license.workspace = true
 default = []
 
 [dependencies]
+ndn-tlv       = { workspace = true }
 ndn-packet    = { workspace = true }
 ndn-transport = { workspace = true }
 ndn-face-net  = { workspace = true }
+ndn-discovery = { workspace = true }
 bytes         = { workspace = true, features = ["std"] }
 tokio         = { workspace = true, features = ["sync", "io-util", "net"] }
 dashmap       = { workspace = true }
 thiserror     = { workspace = true }
 libc          = { workspace = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+pcap = { workspace = true }
+windows-sys = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }

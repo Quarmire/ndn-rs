@@ -316,7 +316,7 @@ async fn main() -> Result<()> {
                 #[cfg(target_os = "linux")]
                 {
                     let id = engine.faces().alloc_id();
-                    match ndn_face_wireless::MulticastEtherFace::new(id, interface) {
+                    match ndn_face_l2::MulticastEtherFace::new(id, interface) {
                         Ok(face) => {
                             let c = cancel.child_token();
                             engine.add_face_with_persistency(

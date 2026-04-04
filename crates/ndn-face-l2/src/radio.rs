@@ -1,5 +1,4 @@
 use ndn_transport::FaceId;
-use std::collections::HashMap;
 
 /// Metadata attached to a wireless face for multi-radio strategy decisions.
 #[derive(Clone, Debug, Default)]

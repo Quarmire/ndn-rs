@@ -63,6 +63,17 @@ impl EngineDiscoveryContext {
 impl DiscoveryContext for EngineDiscoveryContext {
     // ── Face management ──────────────────────────────────────────────────────
 
+    fn alloc_face_id(&self) -> FaceId {
+        let inner = match self.inner.upgrade() {
+            Some(i) => i,
+            None => {
+                warn!("DiscoveryContext::alloc_face_id called after engine shutdown");
+                return FaceId(0);
+            }
+        };
+        inner.face_table.alloc_id()
+    }
+
     fn add_face(&self, face: Arc<dyn ErasedFace>) -> FaceId {
         let inner = match self.inner.upgrade() {
             Some(i) => i,

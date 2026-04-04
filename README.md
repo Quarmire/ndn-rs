@@ -43,7 +43,7 @@ ndn-rs/
 │   ├── ndn-face-net     # UdpFace, TcpFace, MulticastUdpFace
 │   ├── ndn-face-local   # AppFace (iceoryx2 / Unix socket)
 │   ├── ndn-face-serial  # SerialFace (COBS), BluetoothFace
-│   ├── ndn-face-wireless # NamedEtherFace (AF_PACKET), WfbFace
+│   ├── ndn-face-l2 # NamedEtherFace (AF_PACKET), WfbFace
 │   ├── ndn-compute      # ComputeFace, ComputeRegistry
 │   ├── ndn-sync         # SVS, PSync dataset synchronisation
 │   └── ndn-research     # FlowObserverStage, RadioTable, nl80211

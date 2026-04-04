@@ -10,7 +10,7 @@ members = [
     "crates/ndn-face-net",
     "crates/ndn-face-local",
     "crates/ndn-face-serial",
-    "crates/ndn-face-wireless",
+    "crates/ndn-face-l2",
     # Layer 2 — pipeline, strategy, security
     "crates/ndn-pipeline",
     "crates/ndn-strategy",
@@ -67,7 +67,7 @@ ndn-discovery = { path = "crates/ndn-discovery" }
 ndn-face-net      = { path = "crates/ndn-face-net" }
 ndn-face-local    = { path = "crates/ndn-face-local" }
 ndn-face-serial   = { path = "crates/ndn-face-serial" }
-ndn-face-wireless = { path = "crates/ndn-face-wireless" }
+ndn-face-l2 = { path = "crates/ndn-face-l2" }
 ndn-strategy-wasm = { path = "crates/ndn-strategy-wasm" }
 ndn-research  = { path = "crates/ndn-research" }
 ndn-compute   = { path = "crates/ndn-compute" }
@@ -132,3 +132,13 @@ fjall = "3"
 
 # Benchmarking
 criterion = { version = "0.5", features = ["html_reports"] }
+
+# Raw packet capture (Windows Npcap / libpcap)
+pcap = "2"
+
+# Windows system APIs
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinSock",
+] }
