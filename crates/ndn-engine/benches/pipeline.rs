@@ -9,19 +9,21 @@
 //! ```
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
-use ndn_packet::encode::{encode_data_unsigned, encode_interest};
-use ndn_packet::{Name, NameComponent};
+use ndn_packet::encode::{DataBuilder, encode_data_unsigned, encode_interest};
+use ndn_packet::{Name, NameComponent, SignatureType};
 use ndn_pipeline::{Action, DecodedPacket, PacketContext};
+use ndn_security::{Certificate, Ed25519Signer, Signer, TrustSchema, Validator};
 use ndn_store::{ContentStore, CsMeta, ErasedContentStore, LruCs, Pit, PitToken};
 use ndn_transport::{FaceId, FaceTable};
 
 use ndn_engine::Fib;
 use ndn_engine::stages::{
-    CsInsertStage, CsLookupStage, PitCheckStage, PitMatchStage, TlvDecodeStage,
+    CsInsertStage, CsLookupStage, PitCheckStage, PitMatchStage, TlvDecodeStage, ValidationStage,
 };
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -307,13 +309,22 @@ fn bench_cs_insert(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("cs_insert");
 
-    group.bench_function("insert", |b| {
+    // insert_replace — same name every iteration, measures steady-state replacement cost.
+    group.bench_function("insert_replace", |b| {
         let cs = Arc::new(LruCs::new(64 * 1024 * 1024));
         let stage = CsInsertStage {
             cs: Arc::clone(&cs) as Arc<dyn ErasedContentStore>,
             admission: Arc::new(ndn_store::AdmitAllPolicy),
         };
         let wire = data_wire(4);
+        // Pre-insert once so every bench call is a Replaced (not Inserted) operation.
+        rt.block_on(async {
+            let mut c = ctx(wire.clone());
+            let data = ndn_packet::Data::decode(wire.clone()).unwrap();
+            c.name = Some(data.name.clone());
+            c.packet = DecodedPacket::Data(Box::new(data));
+            stage.process(c).await;
+        });
 
         b.iter(|| {
             rt.block_on(async {
@@ -325,6 +336,106 @@ fn bench_cs_insert(c: &mut Criterion) {
             });
         });
     });
+
+    // insert_new — unique name per iteration; measures fresh insert + NameTrie update.
+    group.bench_function("insert_new", |b| {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let cs = Arc::new(LruCs::new(64 * 1024 * 1024));
+        let stage = CsInsertStage {
+            cs: Arc::clone(&cs) as Arc<dyn ErasedContentStore>,
+            admission: Arc::new(ndn_store::AdmitAllPolicy),
+        };
+
+        b.iter(|| {
+            rt.block_on(async {
+                let i = COUNTER.fetch_add(1, Ordering::Relaxed);
+                let n = name(&[
+                    format!("comp-{:04}", i / 1000).as_bytes(),
+                    format!("sub-{i}").as_bytes(),
+                ]);
+                let wire = encode_data_unsigned(&n, &[0xBB; 100]);
+                let mut c = ctx(wire.clone());
+                let data = ndn_packet::Data::decode(wire.clone()).unwrap();
+                c.name = Some(data.name.clone());
+                c.packet = DecodedPacket::Data(Box::new(data));
+                stage.process(c).await;
+            });
+        });
+    });
+
+    group.finish();
+}
+
+// ─── Validation Stage ─────────────────────────────────────────────────────────
+
+fn bench_validation_stage(c: &mut Criterion) {
+    let rt = current_thread_rt();
+
+    // Build a signed Data wire bytes for use in both bench variants.
+    // Key: seed [0x42; 32], key name /bench/KEY
+    let seed = [0x42u8; 32];
+    let key_name: Name = "/bench/KEY".parse().unwrap();
+    let signer = Ed25519Signer::from_seed(&seed, key_name.clone());
+    let pub_key_bytes = signer.public_key_bytes();
+    let data_wire_signed = DataBuilder::new("/bench/data", b"payload").sign_sync(
+        SignatureType::SignatureEd25519,
+        Some(&key_name),
+        |region| signer.sign_sync(region).unwrap(),
+    );
+
+    let mut group = c.benchmark_group("validation_stage");
+
+    // ── disabled: validator is None, packet passes immediately ───────────────
+    {
+        let stage = ValidationStage::disabled();
+        let wire = data_wire_signed.clone();
+        group.bench_function("disabled", |b| {
+            b.iter(|| {
+                rt.block_on(async {
+                    let mut c = ctx(wire.clone());
+                    let data = ndn_packet::Data::decode(wire.clone()).unwrap();
+                    c.name = Some(data.name.clone());
+                    c.packet = DecodedPacket::Data(Box::new(data));
+                    let action = stage.process(c).await;
+                    debug_assert!(matches!(action, Action::Satisfy(_)));
+                    action
+                })
+            });
+        });
+    }
+
+    // ── cert_via_anchor: schema pass + trust anchor lookup + Ed25519 verify ──
+    {
+        let validator = {
+            let v = Validator::new(TrustSchema::accept_all());
+            v.add_trust_anchor(Certificate {
+                name: Arc::new(key_name.clone()),
+                public_key: Bytes::copy_from_slice(&pub_key_bytes),
+                valid_from: 0,
+                valid_until: u64::MAX,
+                issuer: None,
+                signed_region: None,
+                sig_value: None,
+            });
+            Arc::new(v)
+        };
+        use ndn_engine::stages::validation::PendingQueueConfig;
+        let stage = ValidationStage::new(Some(validator), None, PendingQueueConfig::default());
+        let wire = data_wire_signed.clone();
+        group.bench_function("cert_via_anchor", |b| {
+            b.iter(|| {
+                rt.block_on(async {
+                    let mut c = ctx(wire.clone());
+                    let data = ndn_packet::Data::decode(wire.clone()).unwrap();
+                    c.name = Some(data.name.clone());
+                    c.packet = DecodedPacket::Data(Box::new(data));
+                    let action = stage.process(c).await;
+                    debug_assert!(matches!(action, Action::Satisfy(_)));
+                    action
+                })
+            });
+        });
+    }
 
     group.finish();
 }
@@ -524,6 +635,7 @@ criterion_group!(
     bench_fib_lpm,
     bench_pit_match,
     bench_cs_insert,
+    bench_validation_stage,
     bench_interest_pipeline,
     bench_interest_cs_hit,
     bench_data_pipeline,

@@ -12,6 +12,69 @@ bootstrapping phase and all APIs should be considered unstable.
 
 ### Added
 
+#### Criterion benchmarks for security, name operations, content store, and pipeline
+
+Added four new Criterion benchmark suites covering previously un-benchmarked hot
+paths, plus correctness fixes and new variants for the existing pipeline bench.
+
+**`crates/ndn-security/benches/security.rs`**
+- `signing/ed25519` and `signing/hmac` — `sign_sync()` at 100 B and 500 B
+  regions with `Throughput::Bytes`; isolates pure crypto cost and shows
+  ~10× HMAC-over-Ed25519 throughput advantage.
+- `verification/ed25519` — region pre-signed outside `b.iter()`; benchmarks
+  only the verify call, revealing the asymmetry between sign and verify.
+- `validation/schema_mismatch` — empty schema rejects packet before any
+  crypto; fast path baseline.
+- `validation/cert_missing` — `accept_all` schema passes but cert absent
+  from cache; returns `Pending` without crypto.
+- `validation/single_hop` — full path: schema check + cert cache lookup +
+  Ed25519 verify via `Validator::validate`.
+
+**`crates/ndn-packet/benches/name.rs`**
+- `name/parse` — `Name::from_str` at 4, 8, 12 components with `Throughput::Elements(1)`.
+- `name/tlv_decode` — `Name::decode(wire)` from pre-encoded TLV bytes.
+- `name/hash` — `DefaultHasher::hash(&name)` at 4 and 8 components; critical
+  for DashMap shard selection in the PIT.
+- `name/eq` — three variants: `eq_match`, `eq_miss_first` (short-circuits
+  immediately), `eq_miss_last` (scans all components).
+- `name/has_prefix` — prefix lengths 1, 4, 8 on an 8-component name;
+  shows per-depth cost for FIB trie descent.
+- `name/display` — `name.to_string()` at 4 and 8 components; tracing span
+  overhead measurement.
+
+**`crates/ndn-store/benches/content_store.rs`** (requires `--features fjall`)
+- `lru/get_hit`, `lru/get_miss_empty` (atomic fast path), `lru/get_miss_populated`,
+  `lru/get_can_be_prefix` (NameTrie path), `lru/insert_replace`,
+  `lru/insert_new` (unique names via counter), `lru/evict`, `lru/evict_prefix`
+  (100 entries, NameTrie descendants walk).
+- `sharded/get_hit` and `sharded/insert` at shard counts 1, 4, 8, 16 —
+  shows lock contention reduction vs. sharding overhead.
+- `fjall/get_hit`, `fjall/get_miss`, `fjall/insert` — absolute cost
+  reference for the persistent CS against in-memory alternatives.
+
+**`crates/ndn-engine/benches/pipeline.rs`** (updated)
+- **Fixed `cs_insert` correctness** — split the single `insert` bench into
+  two named variants:
+  - `insert_replace` — same name every iteration (what the original bench
+    always measured — `Replaced` after warm-up, not `Inserted`).
+  - `insert_new` — unique names via `AtomicU64` counter; measures fresh
+    insert + NameTrie update + potential LRU eviction.
+- **Added `validation_stage` group** — two new variants:
+  - `disabled` — `ValidationStage::disabled()`; packet passes immediately,
+    establishes baseline overhead.
+  - `cert_via_anchor` — validator with `accept_all` schema and a trust anchor
+    registered; exercises schema check + trust anchor lookup + Ed25519 verify
+    via `validate_chain`.
+- Added `ndn-security` to `ndn-engine` dev-dependencies.
+
+Run benchmarks:
+```bash
+cargo bench -p ndn-security
+cargo bench -p ndn-packet
+cargo bench -p ndn-store --features fjall
+cargo bench -p ndn-engine
+```
+
 #### `FjallCs` — persistent content store backed by fjall LSM-tree
 
 Added `FjallCs` in `ndn-store` as the first disk-backed `ContentStore`
