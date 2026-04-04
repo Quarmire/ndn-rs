@@ -98,7 +98,7 @@ impl Consumer {
     ) -> Result<SafeData, AppError> {
         let data = self.fetch(name).await?;
         match validator.validate(&data).await {
-            ValidationResult::Valid(safe) => Ok(safe),
+            ValidationResult::Valid(safe) => Ok(*safe),
             ValidationResult::Invalid(e) => Err(AppError::Engine(e.into())),
             ValidationResult::Pending => Err(AppError::Engine(anyhow::anyhow!(
                 "certificate chain not resolved"

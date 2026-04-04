@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use tokio::sync::mpsc;
@@ -20,6 +20,7 @@ use crate::engine::{self, DEFAULT_SEND_QUEUE_CAP, FaceState};
 
 use crate::stages::{
     CsInsertStage, CsLookupStage, PitCheckStage, PitMatchStage, StrategyStage, TlvDecodeStage,
+    ValidationStage,
 };
 
 /// A raw packet arriving from a face, bundled with the face it came from.
@@ -48,6 +49,7 @@ pub struct PacketDispatcher {
     pub pit_check: PitCheckStage,
     pub strategy: StrategyStage,
     pub pit_match: PitMatchStage,
+    pub validation: ValidationStage,
     pub cs_insert: CsInsertStage,
     pub channel_cap: usize,
     /// Resolved pipeline thread count (always ≥ 1).
@@ -136,6 +138,15 @@ impl PacketDispatcher {
         tasks.spawn(async move {
             d.run_pipeline(rx, cancel2).await;
         });
+
+        // Validation pending queue drain task.
+        if dispatcher.validation.validator.is_some() {
+            let d = Arc::clone(&dispatcher);
+            let cancel3 = cancel.clone();
+            tasks.spawn(async move {
+                d.run_validation_drain(cancel3).await;
+            });
+        }
 
         tx
     }
@@ -404,7 +415,20 @@ impl PacketDispatcher {
             }
         };
 
-        // 3. CS insert.
+        // 3. Signature / chain validation (optional).
+        let ctx = match self.validation.process(ctx).await {
+            Action::Satisfy(ctx) => ctx,
+            Action::Drop(r) => {
+                debug!(reason=?r, "data validation failed");
+                return;
+            }
+            other => {
+                self.dispatch_action(other);
+                return;
+            }
+        };
+
+        // 4. CS insert.
         let action = self.cs_insert.process(ctx).await;
         self.dispatch_action(action);
     }
@@ -463,6 +487,32 @@ impl PacketDispatcher {
                 self.enqueue_send(ctx.face_id, nack_bytes);
             }
             Action::Continue(_) => {} // fell off end of pipeline
+        }
+    }
+
+    /// Periodically drain the validation pending queue and dispatch
+    /// re-validated packets through the remainder of the data pipeline.
+    async fn run_validation_drain(&self, cancel: CancellationToken) {
+        let mut interval = tokio::time::interval(Duration::from_millis(100));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = interval.tick() => {
+                    let actions = self.validation.drain_pending().await;
+                    for action in actions {
+                        match action {
+                            Action::Satisfy(ctx) => {
+                                // Resume from CsInsert stage.
+                                let action = self.cs_insert.process(ctx).await;
+                                self.dispatch_action(action);
+                            }
+                            other => self.dispatch_action(other),
+                        }
+                    }
+                }
+            }
         }
     }
 

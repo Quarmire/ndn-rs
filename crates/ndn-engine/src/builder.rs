@@ -5,7 +5,9 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use ndn_packet::Name;
-use ndn_security::SecurityManager;
+use ndn_security::{
+    CertCache, CertFetcher, SecurityManager, SecurityProfile, TrustSchema, Validator,
+};
 use ndn_store::{CsAdmissionPolicy, CsObserver, ErasedContentStore, LruCs, ObservableCs, Pit, StrategyTable};
 use ndn_strategy::{BestRouteStrategy, MeasurementsTable};
 use ndn_transport::{Face, FaceTable};
@@ -17,7 +19,7 @@ use crate::{
     enricher::ContextEnricher,
     stages::{
         CsInsertStage, CsLookupStage, ErasedStrategy, PitCheckStage, PitMatchStage, StrategyStage,
-        TlvDecodeStage,
+        TlvDecodeStage, ValidationStage,
     },
 };
 
@@ -58,6 +60,7 @@ pub struct EngineBuilder {
     cs: Option<Arc<dyn ErasedContentStore>>,
     admission: Option<Arc<dyn CsAdmissionPolicy>>,
     cs_observer: Option<Arc<dyn CsObserver>>,
+    security_profile: SecurityProfile,
 }
 
 impl EngineBuilder {
@@ -71,6 +74,7 @@ impl EngineBuilder {
             cs: None,
             admission: None,
             cs_observer: None,
+            security_profile: SecurityProfile::Default,
         }
     }
 
@@ -115,6 +119,23 @@ impl EngineBuilder {
     /// counters and calls the observer on every operation.
     pub fn cs_observer(mut self, obs: Arc<dyn CsObserver>) -> Self {
         self.cs_observer = Some(obs);
+        self
+    }
+
+    /// Set the security profile (default: `SecurityProfile::Default`).
+    ///
+    /// - `Default`: auto-wires validator + cert fetcher from SecurityManager
+    /// - `AcceptSigned`: verify signatures but skip chain walking
+    /// - `Disabled`: no validation (benchmarking only)
+    /// - `Custom(v)`: use a caller-provided validator
+    pub fn security_profile(mut self, p: SecurityProfile) -> Self {
+        self.security_profile = p;
+        self
+    }
+
+    /// Convenience: set a custom validator directly.
+    pub fn validator(mut self, v: Arc<Validator>) -> Self {
+        self.security_profile = SecurityProfile::Custom(v);
         self
     }
 
@@ -169,6 +190,12 @@ impl EngineBuilder {
 
         let face_states = Arc::new(dashmap::DashMap::new());
 
+        // Resolve security profile into validator + cert fetcher.
+        let (validator, cert_fetcher) = resolve_security_profile(
+            self.security_profile,
+            &self.security,
+        );
+
         let dispatcher = PacketDispatcher {
             face_table: Arc::clone(&face_table),
             face_states: Arc::clone(&face_states),
@@ -194,6 +221,11 @@ impl EngineBuilder {
             pit_match: PitMatchStage {
                 pit: Arc::clone(&pit),
             },
+            validation: ValidationStage::new(
+                validator,
+                cert_fetcher,
+                crate::stages::validation::PendingQueueConfig::default(),
+            ),
             cs_insert: CsInsertStage {
                 cs: Arc::clone(&cs),
                 admission: self
@@ -238,6 +270,83 @@ impl EngineBuilder {
         let engine = ForwarderEngine { inner };
         let handle = ShutdownHandle { cancel, tasks };
         Ok((engine, handle))
+    }
+}
+
+/// Resolve a `SecurityProfile` into a concrete validator and optional cert fetcher.
+fn resolve_security_profile(
+    profile: SecurityProfile,
+    security: &Option<Arc<SecurityManager>>,
+) -> (Option<Arc<Validator>>, Option<Arc<CertFetcher>>) {
+    use std::time::Duration;
+
+    match profile {
+        SecurityProfile::Disabled => (None, None),
+
+        SecurityProfile::Custom(v) => (Some(v), None),
+
+        SecurityProfile::AcceptSigned => {
+            let schema = TrustSchema::accept_all();
+            let validator = if let Some(mgr) = security {
+                let cert_cache = Arc::new(CertCache::new());
+                // Pre-populate from manager's cache.
+                // Trust anchors make AcceptSigned succeed for cached certs.
+                let anchors = Arc::new(dashmap::DashMap::new());
+                for name in mgr.trust_anchor_names() {
+                    if let Some(cert) = mgr.trust_anchor(&name) {
+                        cert_cache.insert(cert.clone());
+                        anchors.insert(name, cert);
+                    }
+                }
+                Arc::new(Validator::with_chain(schema, cert_cache, anchors, None, 1))
+            } else {
+                // No manager — accept_all schema with empty cache.
+                Arc::new(Validator::new(schema))
+            };
+            (Some(validator), None)
+        }
+
+        SecurityProfile::Default => {
+            let Some(mgr) = security else {
+                tracing::warn!(
+                    "SecurityProfile::Default requires a SecurityManager; \
+                     falling back to Disabled"
+                );
+                return (None, None);
+            };
+
+            let schema = TrustSchema::hierarchical();
+            let cert_cache = Arc::new(CertCache::new());
+            let anchors = Arc::new(dashmap::DashMap::new());
+
+            // Load trust anchors from the manager.
+            for name in mgr.trust_anchor_names() {
+                if let Some(cert) = mgr.trust_anchor(&name) {
+                    cert_cache.insert(cert.clone());
+                    anchors.insert(name, cert);
+                }
+            }
+
+            // Build a CertFetcher. The FetchFn is a no-op placeholder for now;
+            // the router wires a real one via AppFace after engine construction.
+            // Certs pre-loaded from trust anchors will satisfy most chain walks
+            // without fetching.
+            let fetcher = Arc::new(CertFetcher::new(
+                Arc::clone(&cert_cache),
+                Arc::new(|_name| Box::pin(async { None })),
+                Duration::from_secs(4),
+            ));
+
+            let validator = Arc::new(Validator::with_chain(
+                schema,
+                Arc::clone(&cert_cache),
+                anchors,
+                Some(Arc::clone(&fetcher)),
+                5,
+            ));
+
+            (Some(validator), Some(fetcher))
+        }
     }
 }
 
