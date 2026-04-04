@@ -5,6 +5,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+fjall = ["dep:fjall"]
+
 [dependencies]
 ndn-packet = { workspace = true }
 bytes      = { workspace = true }
@@ -13,7 +17,10 @@ smallvec   = { workspace = true }
 lru        = { workspace = true }
 ring       = { workspace = true }
 thiserror  = { workspace = true }
+fjall      = { workspace = true, optional = true }
 
 [dev-dependencies]
 ndn-tlv = { workspace = true }
 tokio   = { workspace = true, features = ["rt", "macros"] }
+fjall   = { workspace = true }
+tempfile = "3"
