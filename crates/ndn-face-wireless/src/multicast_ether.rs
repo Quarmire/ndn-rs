@@ -107,6 +107,22 @@ impl MulticastEtherFace {
     pub fn iface(&self) -> &str {
         &self.iface
     }
+
+    /// Receive the next NDN packet along with the sender's MAC address.
+    ///
+    /// This is the discovery-layer variant of [`Face::recv`].  The source MAC
+    /// is extracted from the TPACKET_V2 `sockaddr_ll` embedded in each ring
+    /// frame — no extra syscall is needed.  Discovery protocols use this to
+    /// identify which peer sent a Hello packet and create a unicast face for it.
+    pub async fn recv_with_source(&self) -> Result<(Bytes, MacAddr), ndn_transport::FaceError> {
+        loop {
+            if let Some(result) = self.ring.try_pop_rx_with_source() {
+                return Ok(result);
+            }
+            let mut guard = self.socket.readable().await?;
+            guard.clear_ready();
+        }
+    }
 }
 
 impl Face for MulticastEtherFace {
