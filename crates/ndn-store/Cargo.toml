@@ -28,6 +28,14 @@ criterion = { workspace = true }
 ndn-packet = { workspace = true }
 
 [[bench]]
-name              = "content_store"
+name    = "lru"
+harness = false
+
+[[bench]]
+name    = "sharded"
+harness = false
+
+[[bench]]
+name              = "fjall"
 harness           = false
 required-features = ["fjall"]
