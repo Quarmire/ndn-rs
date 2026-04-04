@@ -157,6 +157,9 @@ fn cmd_keygen(
         public_key: pk.clone(),
         valid_from: now,
         valid_until: now.saturating_add(validity_ns),
+        issuer: None,
+        signed_region: None,
+        sig_value: None,
     };
     pib.store_cert(&key_name, &cert)?;
 

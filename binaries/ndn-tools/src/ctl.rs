@@ -75,6 +75,11 @@ enum Command {
         #[command(subcommand)]
         action: CsAction,
     },
+    /// Manage security identities and trust anchors (local, no router needed).
+    Security {
+        #[command(subcommand)]
+        action: SecurityAction,
+    },
     /// Display forwarder status.
     Status,
     /// Request graceful shutdown of the router.
@@ -161,11 +166,55 @@ enum CsAction {
     },
 }
 
+#[derive(Subcommand)]
+enum SecurityAction {
+    /// Initialize a new identity (generate key + self-signed cert).
+    Init {
+        /// NDN name for the identity (e.g. /ndn/router1).
+        #[arg(long)]
+        name: String,
+        /// PIB directory path.
+        #[arg(long, default_value = "~/.ndn/pib")]
+        pib: String,
+    },
+    /// Add a trust anchor from a certificate file.
+    Trust {
+        /// Path to a certificate file (.ndnc).
+        cert_file: String,
+        /// PIB directory path.
+        #[arg(long, default_value = "~/.ndn/pib")]
+        pib: String,
+    },
+    /// Export the identity's certificate.
+    Export {
+        /// Identity name (default: first identity in PIB).
+        #[arg(long)]
+        name: Option<String>,
+        /// Output file (default: stdout as hex).
+        #[arg(long, short)]
+        output: Option<String>,
+        /// PIB directory path.
+        #[arg(long, default_value = "~/.ndn/pib")]
+        pib: String,
+    },
+    /// Display security info (identities, trust anchors).
+    Info {
+        /// PIB directory path.
+        #[arg(long, default_value = "~/.ndn/pib")]
+        pib: String,
+    },
+}
+
 // ─── Entry point ──────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+
+    // Security commands operate on the local PIB — no router connection needed.
+    if let Command::Security { ref action } = cli.command {
+        return run_security(action);
+    }
 
     if cli.bypass {
         run_bypass(&cli).await
@@ -309,6 +358,8 @@ async fn run_nfd(cli: &Cli) -> anyhow::Result<()> {
             let resp = mgmt.shutdown().await.map_err(|e| anyhow::anyhow!("{e}"))?;
             print_control_response(&resp);
         }
+        // Security is handled before run_nfd is called.
+        Command::Security { .. } => unreachable!(),
     }
 
     Ok(())
@@ -389,6 +440,135 @@ fn build_legacy_request(cmd: &Command) -> ManagementRequest {
         // Commands with no legacy equivalent.
         _ => ManagementRequest::GetStats,
     }
+}
+
+// ─── Security subcommands (local PIB, no router) ────────────────────────────
+
+fn run_security(action: &SecurityAction) -> anyhow::Result<()> {
+    use ndn_security::{FilePib, SecurityManager};
+
+    match action {
+        SecurityAction::Init { name, pib } => {
+            let pib_path = expand_tilde(pib);
+            let identity: ndn_packet::Name = name
+                .parse()
+                .map_err(|e| anyhow::anyhow!("bad identity name: {e}"))?;
+            let (mgr, generated) = SecurityManager::auto_init(&identity, &pib_path)?;
+            if generated {
+                println!("Generated new identity: {name}");
+                println!("  PIB: {}", pib_path.display());
+                println!(
+                    "  Trust anchors: {}",
+                    mgr.trust_anchor_names().len()
+                );
+            } else {
+                println!("Identity already exists, loaded from PIB");
+                println!("  PIB: {}", pib_path.display());
+            }
+        }
+
+        SecurityAction::Trust { cert_file, pib } => {
+            let pib_path = expand_tilde(pib);
+            let pib = FilePib::open(&pib_path).map_err(|e| {
+                anyhow::anyhow!("Cannot open PIB at '{}': {e}", pib_path.display())
+            })?;
+            let data = std::fs::read(cert_file)
+                .map_err(|e| anyhow::anyhow!("Cannot read '{cert_file}': {e}"))?;
+            // The NDNC file contains the cert; we need a name to associate it.
+            // Read the name.uri sidecar if present, otherwise derive from filename.
+            let uri_path = std::path::Path::new(cert_file).with_extension("uri");
+            let cert_name: ndn_packet::Name = if uri_path.exists() {
+                let uri = std::fs::read_to_string(&uri_path)?;
+                uri.trim()
+                    .parse()
+                    .map_err(|e| anyhow::anyhow!("bad name in .uri file: {e}"))?
+            } else {
+                // Fall back: use the file stem as a single-component name.
+                let stem = std::path::Path::new(cert_file)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("unknown");
+                stem.parse()
+                    .map_err(|e| anyhow::anyhow!("bad name from filename: {e}"))?
+            };
+            let cert = ndn_security::pib::decode_cert(
+                std::sync::Arc::new(cert_name.clone()),
+                &data,
+            )
+            .map_err(|e| anyhow::anyhow!("Invalid certificate file: {e}"))?;
+            pib.add_trust_anchor(&cert_name, &cert)?;
+            println!("Added trust anchor from '{cert_file}'");
+        }
+
+        SecurityAction::Export { name, output, pib } => {
+            let pib_path = expand_tilde(pib);
+            let pib = FilePib::open(&pib_path).map_err(|e| {
+                anyhow::anyhow!("Cannot open PIB at '{}': {e}", pib_path.display())
+            })?;
+            let key_name = if let Some(n) = name {
+                n.parse()
+                    .map_err(|e| anyhow::anyhow!("bad key name: {e}"))?
+            } else {
+                let keys = pib.list_keys()?;
+                keys.into_iter()
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("No keys in PIB"))?
+            };
+            let cert = pib.get_cert(&key_name)?;
+            let hex = cert
+                .public_key
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>();
+            if let Some(path) = output {
+                std::fs::write(path, &hex)?;
+                println!("Certificate exported to '{path}'");
+            } else {
+                println!("{hex}");
+            }
+        }
+
+        SecurityAction::Info { pib } => {
+            let pib_path = expand_tilde(pib);
+            let pib = FilePib::open(&pib_path).map_err(|e| {
+                anyhow::anyhow!("Cannot open PIB at '{}': {e}", pib_path.display())
+            })?;
+            let keys = pib.list_keys()?;
+            let anchors = pib.list_anchors()?;
+
+            println!("PIB: {}", pib_path.display());
+            println!();
+            println!("Keys ({}):", keys.len());
+            for k in &keys {
+                println!("  {k}");
+                if let Ok(cert) = pib.get_cert(k) {
+                    let valid = if cert.valid_until == u64::MAX {
+                        "never".to_string()
+                    } else {
+                        format!("{}", cert.valid_until)
+                    };
+                    println!("    cert: valid_until={valid}");
+                }
+            }
+            println!();
+            println!("Trust anchors ({}):", anchors.len());
+            for a in &anchors {
+                println!("  {a}");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Expand a leading `~` to the user's home directory.
+fn expand_tilde(path: &str) -> std::path::PathBuf {
+    if let Some(rest) = path.strip_prefix("~/")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return std::path::PathBuf::from(home).join(rest);
+    }
+    std::path::PathBuf::from(path)
 }
 
 // ─── Output ──────────────────────────────────────────────────────────────────
