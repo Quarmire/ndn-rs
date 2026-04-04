@@ -5,8 +5,10 @@
 extern crate alloc;
 
 pub mod data;
+#[cfg(feature = "std")]
 pub mod encode;
 pub mod error;
+#[cfg(feature = "std")]
 pub mod fragment;
 pub mod interest;
 pub mod lp;

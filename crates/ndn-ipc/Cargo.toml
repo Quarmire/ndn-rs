@@ -14,7 +14,7 @@ ndn-packet     = { workspace = true }
 ndn-config     = { workspace = true }
 ndn-face-local = { workspace = true }
 ndn-transport  = { workspace = true }
-bytes          = { workspace = true }
+bytes         = { workspace = true, features = ["std"] }
 tokio          = { workspace = true, features = ["sync", "rt", "macros"] }
 tokio-util     = { workspace = true }
 thiserror      = { workspace = true }

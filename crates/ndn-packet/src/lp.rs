@@ -10,11 +10,29 @@
 //! Bare Interest/Data packets (not wrapped in LpPacket) are still valid on the
 //! wire — LpPacket framing is only required when link-layer fields are present.
 
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
 use bytes::Bytes;
 use ndn_tlv::{TlvReader, TlvWriter};
 
 use crate::nack::NackReason;
 use crate::tlv_type;
+
+/// Encode a u64 as a NonNegativeInteger (minimal big-endian, 1/2/4/8 bytes).
+/// Returns the buffer and the number of bytes written.
+fn nni(val: u64) -> ([u8; 8], usize) {
+    let be = val.to_be_bytes();
+    if val <= 0xFF {
+        ([be[7], 0, 0, 0, 0, 0, 0, 0], 1)
+    } else if val <= 0xFFFF {
+        ([be[6], be[7], 0, 0, 0, 0, 0, 0], 2)
+    } else if val <= 0xFFFF_FFFF {
+        ([be[4], be[5], be[6], be[7], 0, 0, 0, 0], 4)
+    } else {
+        (be, 8)
+    }
+}
 
 /// Cache policy type for NDNLPv2 CachePolicy header field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -244,7 +262,7 @@ pub fn encode_lp_nack(reason: NackReason, interest_wire: &[u8]) -> Bytes {
     w.write_nested(tlv_type::LP_PACKET, |w| {
         // Nack header field.
         w.write_nested(tlv_type::NACK, |w| {
-            let (buf, len) = crate::encode::nni(reason.code());
+            let (buf, len) = nni(reason.code());
             w.write_tlv(tlv_type::NACK_REASON, &buf[..len]);
         });
         // Fragment: the original Interest.
@@ -286,16 +304,16 @@ pub fn encode_lp_reliable(
 ) -> Bytes {
     let mut w = TlvWriter::new();
     w.write_nested(tlv_type::LP_PACKET, |w| {
-        let (buf, len) = crate::encode::nni(sequence);
+        let (buf, len) = nni(sequence);
         w.write_tlv(tlv_type::LP_SEQUENCE, &buf[..len]);
         if let Some((idx, count)) = frag_info {
-            let (buf, len) = crate::encode::nni(idx);
+            let (buf, len) = nni(idx);
             w.write_tlv(tlv_type::LP_FRAG_INDEX, &buf[..len]);
-            let (buf, len) = crate::encode::nni(count);
+            let (buf, len) = nni(count);
             w.write_tlv(tlv_type::LP_FRAG_COUNT, &buf[..len]);
         }
         for &ack in acks {
-            let (buf, len) = crate::encode::nni(ack);
+            let (buf, len) = nni(ack);
             w.write_tlv(tlv_type::LP_ACK, &buf[..len]);
         }
         w.write_tlv(tlv_type::LP_FRAGMENT, fragment);
@@ -308,7 +326,7 @@ pub fn encode_lp_acks(acks: &[u64]) -> Bytes {
     let mut w = TlvWriter::new();
     w.write_nested(tlv_type::LP_PACKET, |w| {
         for &ack in acks {
-            let (buf, len) = crate::encode::nni(ack);
+            let (buf, len) = nni(ack);
             w.write_tlv(tlv_type::LP_ACK, &buf[..len]);
         }
     });
@@ -328,7 +346,7 @@ pub fn encode_lp_with_headers(fragment: &[u8], headers: &LpHeaders) -> Bytes {
         }
         // 0x032C IncomingFaceId
         if let Some(id) = headers.incoming_face_id {
-            let (buf, len) = crate::encode::nni(id);
+            let (buf, len) = nni(id);
             w.write_tlv(tlv_type::LP_INCOMING_FACE_ID, &buf[..len]);
         }
         // 0x0334 CachePolicy
@@ -338,13 +356,13 @@ pub fn encode_lp_with_headers(fragment: &[u8], headers: &LpHeaders) -> Bytes {
                     CachePolicyType::NoCache => 1u64,
                     CachePolicyType::Other(c) => *c,
                 };
-                let (buf, len) = crate::encode::nni(code);
+                let (buf, len) = nni(code);
                 w.write_tlv(tlv_type::LP_CACHE_POLICY_TYPE, &buf[..len]);
             });
         }
         // 0x0340 CongestionMark
         if let Some(mark) = headers.congestion_mark {
-            let (buf, len) = crate::encode::nni(mark);
+            let (buf, len) = nni(mark);
             w.write_tlv(tlv_type::LP_CONGESTION_MARK, &buf[..len]);
         }
         // 0x50 Fragment (last)
@@ -843,9 +861,9 @@ mod tests {
 
         let mut w = TlvWriter::new();
         w.write_nested(tlv_type::LP_PACKET, |w| {
-            let (buf, len) = crate::encode::nni(42);
+            let (buf, len) = nni(42);
             w.write_tlv(tlv_type::LP_INCOMING_FACE_ID, &buf[..len]);
-            let (buf, len) = crate::encode::nni(99);
+            let (buf, len) = nni(99);
             w.write_tlv(tlv_type::LP_NEXT_HOP_FACE_ID, &buf[..len]);
             w.write_tlv(tlv_type::LP_FRAGMENT, &interest_wire);
         });
@@ -875,7 +893,7 @@ mod tests {
 
         let mut w = TlvWriter::new();
         w.write_nested(tlv_type::LP_PACKET, |w| {
-            let (buf, len) = crate::encode::nni(12345);
+            let (buf, len) = nni(12345);
             w.write_tlv(tlv_type::LP_TX_SEQUENCE, &buf[..len]);
             w.write_tlv(tlv_type::LP_FRAGMENT, &interest_wire);
         });

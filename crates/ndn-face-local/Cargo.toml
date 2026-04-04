@@ -15,7 +15,7 @@ spsc-shm = ["dep:libc"]
 [dependencies]
 ndn-packet    = { workspace = true }
 ndn-transport = { workspace = true }
-bytes         = { workspace = true }
+bytes         = { workspace = true, features = ["std"] }
 tokio         = { workspace = true, features = ["sync", "io-util", "net", "rt", "macros", "time"] }
 tokio-util    = { workspace = true, features = ["codec"] }
 thiserror     = { workspace = true }
@@ -24,7 +24,7 @@ libc          = { workspace = true, optional = true }
 
 
 [dev-dependencies]
-ndn-tlv   = { workspace = true }
+ndn-tlv       = { workspace = true, features = ["std"] }
 tokio     = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "net", "time"] }
 criterion = { workspace = true }
 

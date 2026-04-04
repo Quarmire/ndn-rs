@@ -11,7 +11,7 @@ license.workspace = true
 #   ndn-tlv = { path = "...", default-features = false }
 [features]
 default = ["std"]
-std     = []
+std     = ["bytes/std"]
 
 [dependencies]
 bytes = { workspace = true }

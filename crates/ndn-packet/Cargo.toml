@@ -11,17 +11,17 @@ license.workspace = true
 #   ndn-packet = { path = "...", default-features = false }
 [features]
 default = ["std"]
-std     = ["ndn-tlv/std"]
+std     = ["ndn-tlv/std", "bytes/std", "dep:ring"]
 
 [dependencies]
-ndn-tlv   = { workspace = true }
-bytes     = { workspace = true }
-smallvec  = { workspace = true }
-ring      = { workspace = true }
+ndn-tlv  = { workspace = true, default-features = false }
+bytes    = { workspace = true }
+smallvec = { workspace = true }
+ring     = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
-ndn-tlv   = { workspace = true }
+ndn-tlv       = { workspace = true, features = ["std"] }
 
 [[bench]]
 name    = "name"

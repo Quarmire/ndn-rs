@@ -10,7 +10,7 @@ ndn-packet    = { workspace = true }
 ndn-pipeline  = { workspace = true }
 ndn-store     = { workspace = true }
 ndn-transport = { workspace = true }
-bytes         = { workspace = true }
+bytes         = { workspace = true, features = ["std"] }
 smallvec      = { workspace = true }
 dashmap       = { workspace = true }
 

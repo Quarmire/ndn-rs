@@ -1,5 +1,13 @@
 use core::time::Duration;
+
+#[cfg(not(feature = "std"))]
+use alloc::{sync::Arc, vec::Vec};
+#[cfg(feature = "std")]
 use std::sync::Arc;
+
+#[cfg(not(feature = "std"))]
+use core::cell::OnceCell as OnceLock;
+#[cfg(feature = "std")]
 use std::sync::OnceLock;
 
 use bytes::Bytes;
@@ -122,13 +130,18 @@ impl Interest {
                     ));
                 }
                 // Verify digest matches SHA-256 of ApplicationParameters TLV.
-                let expected = ring::digest::digest(&ring::digest::SHA256, &params_tlv);
-                if last_comp.value.as_ref() != expected.as_ref() {
-                    return Err(PacketError::MalformedPacket(
-                        "ParametersSha256DigestComponent does not match ApplicationParameters"
-                            .into(),
-                    ));
+                // Skipped on no-std targets where ring is unavailable.
+                #[cfg(feature = "std")]
+                {
+                    let expected = ring::digest::digest(&ring::digest::SHA256, &params_tlv);
+                    if last_comp.value.as_ref() != expected.as_ref() {
+                        return Err(PacketError::MalformedPacket(
+                            "ParametersSha256DigestComponent does not match ApplicationParameters"
+                                .into(),
+                        ));
+                    }
                 }
+                let _ = params_tlv;
             }
         }
 

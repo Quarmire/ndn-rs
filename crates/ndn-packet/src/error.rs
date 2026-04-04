@@ -1,3 +1,6 @@
+#[cfg(not(feature = "std"))]
+use alloc::string::String;
+
 use ndn_tlv::TlvError;
 
 #[derive(Debug)]

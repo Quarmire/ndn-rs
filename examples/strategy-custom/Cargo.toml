@@ -12,7 +12,7 @@ ndn-strategy  = { workspace = true }
 ndn-engine    = { workspace = true }
 ndn-app       = { workspace = true }
 ndn-face-local = { workspace = true }
-bytes         = { workspace = true }
+bytes         = { workspace = true, features = ["std"] }
 smallvec      = { workspace = true }
 tokio         = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tracing       = { workspace = true }

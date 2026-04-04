@@ -10,10 +10,10 @@ ndn-packet    = { workspace = true }
 ndn-transport = { workspace = true }
 ndn-engine    = { workspace = true }
 ndn-store     = { workspace = true }
-bytes         = { workspace = true }
+bytes         = { workspace = true, features = ["std"] }
 tokio         = { workspace = true, features = ["sync", "rt"] }
 tracing       = { workspace = true }
 
 [dev-dependencies]
-ndn-tlv = { workspace = true }
+ndn-tlv       = { workspace = true, features = ["std"] }
 tokio   = { workspace = true, features = ["rt", "macros"] }

@@ -1,4 +1,11 @@
+#[cfg(not(feature = "std"))]
+use alloc::sync::Arc;
+#[cfg(feature = "std")]
 use std::sync::Arc;
+
+#[cfg(not(feature = "std"))]
+use core::cell::OnceCell as OnceLock;
+#[cfg(feature = "std")]
 use std::sync::OnceLock;
 
 use bytes::Bytes;
@@ -126,6 +133,7 @@ impl Data {
     /// The implicit SHA-256 digest of this Data packet — the SHA-256 hash
     /// of the full wire encoding. Used for exact Data retrieval via
     /// ImplicitSha256DigestComponent (type 0x01) in Interest names.
+    #[cfg(feature = "std")]
     pub fn implicit_digest(&self) -> ring::digest::Digest {
         ring::digest::digest(&ring::digest::SHA256, &self.raw)
     }
@@ -153,6 +161,7 @@ impl Data {
     /// Per NDN Packet Format v0.3 §6.3.1, when ContentType is LINK the Content
     /// field contains one or more Name TLVs. Returns `None` if this Data is not
     /// a Link or has no content.
+    #[cfg(feature = "std")]
     pub fn link_delegations(&self) -> Option<Vec<Arc<Name>>> {
         let mi = self.meta_info()?;
         if mi.content_type != crate::meta_info::ContentType::Link {

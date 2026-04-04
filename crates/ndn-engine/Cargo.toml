@@ -13,7 +13,7 @@ ndn-store     = { workspace = true }
 ndn-pipeline  = { workspace = true }
 ndn-strategy  = { workspace = true }
 ndn-security  = { workspace = true }
-bytes         = { workspace = true }
+bytes         = { workspace = true, features = ["std"] }
 smallvec      = { workspace = true }
 dashmap       = { workspace = true }
 tokio         = { workspace = true, features = ["rt-multi-thread", "sync", "time", "macros"] }

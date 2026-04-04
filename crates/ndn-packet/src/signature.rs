@@ -1,8 +1,12 @@
+#[cfg(not(feature = "std"))]
+use alloc::sync::Arc;
+#[cfg(feature = "std")]
+use std::sync::Arc;
+
 use bytes::Bytes;
 
 use crate::{Name, PacketError, tlv_type};
 use ndn_tlv::TlvReader;
-use std::sync::Arc;
 
 /// NDN signature algorithm identifiers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

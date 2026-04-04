@@ -18,7 +18,7 @@ ndn-transport  = { workspace = true }
 ndn-face-local = { workspace = true }
 ndn-ipc        = { workspace = true }
 ndn-sync       = { workspace = true }
-bytes          = { workspace = true }
+bytes         = { workspace = true, features = ["std"] }
 tokio          = { workspace = true, features = ["sync", "rt", "time"] }
 tokio-util     = { workspace = true }
 tracing        = { workspace = true }
@@ -26,5 +26,5 @@ thiserror      = { workspace = true }
 anyhow         = { workspace = true }
 
 [dev-dependencies]
-ndn-tlv = { workspace = true }
+ndn-tlv       = { workspace = true, features = ["std"] }
 tokio   = { workspace = true, features = ["rt", "macros"] }

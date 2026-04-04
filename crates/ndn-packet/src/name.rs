@@ -1,5 +1,8 @@
 use core::str::FromStr;
 
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
 use bytes::Bytes;
 use smallvec::SmallVec;
 

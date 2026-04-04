@@ -11,8 +11,8 @@ serde = ["dep:serde"]
 
 [dependencies]
 ndn-packet = { workspace = true }
-ndn-tlv    = { workspace = true }
-bytes      = { workspace = true }
+ndn-tlv       = { workspace = true, features = ["std"] }
+bytes         = { workspace = true, features = ["std"] }
 futures    = { workspace = true }
 tokio      = { workspace = true, features = ["sync"] }
 tokio-util = { workspace = true, features = ["codec"] }
