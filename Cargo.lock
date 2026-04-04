@@ -1456,6 +1456,7 @@ name = "ndn-packet"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "criterion",
  "ndn-tlv",
  "ring",
  "smallvec",
@@ -1521,6 +1522,7 @@ name = "ndn-security"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "criterion",
  "dashmap",
  "ed25519-dalek",
  "ndn-packet",
@@ -1536,6 +1538,7 @@ name = "ndn-store"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "criterion",
  "dashmap",
  "fjall",
  "lru",

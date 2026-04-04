@@ -20,7 +20,14 @@ thiserror  = { workspace = true }
 fjall      = { workspace = true, optional = true }
 
 [dev-dependencies]
-ndn-tlv = { workspace = true }
-tokio   = { workspace = true, features = ["rt", "macros"] }
-fjall   = { workspace = true }
+ndn-tlv  = { workspace = true }
+tokio    = { workspace = true, features = ["rt", "macros"] }
+fjall    = { workspace = true }
 tempfile = "3"
+criterion = { workspace = true }
+ndn-packet = { workspace = true }
+
+[[bench]]
+name              = "content_store"
+harness           = false
+required-features = ["fjall"]
