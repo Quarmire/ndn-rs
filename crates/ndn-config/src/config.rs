@@ -27,7 +27,10 @@ use serde::{Deserialize, Serialize};
 ///
 /// [security]
 /// trust_anchor = "/etc/ndn/trust-anchor.cert"
-/// key_dir = "/etc/ndn/keys"
+///
+/// [logging]
+/// level = "info"
+/// file = "/var/log/ndn/router.log"
 /// ```
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct ForwarderConfig {
@@ -48,6 +51,9 @@ pub struct ForwarderConfig {
 
     #[serde(default)]
     pub cs: CsConfig,
+
+    #[serde(default)]
+    pub logging: LoggingConfig,
 }
 
 impl ForwarderConfig {
@@ -323,6 +329,51 @@ fn default_security_profile() -> String {
     "default".to_owned()
 }
 
+/// Logging configuration.
+///
+/// ```toml
+/// [logging]
+/// level = "info"                          # default tracing filter
+/// file = "/var/log/ndn/router.log"        # optional log file
+/// ```
+///
+/// **Precedence** (highest to lowest):
+/// 1. `RUST_LOG` environment variable
+/// 2. `--log-level` CLI flag
+/// 3. `level` field in this section
+///
+/// When `file` is set, logs are written to *both* stderr and the file so
+/// interactive use always shows output while the file captures a persistent
+/// record.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct LoggingConfig {
+    /// Default tracing filter string (e.g. `"info"`, `"ndn_engine=debug,warn"`).
+    ///
+    /// Overridden by `--log-level` CLI flag or `RUST_LOG` env var.
+    #[serde(default = "default_log_level")]
+    pub level: String,
+
+    /// Optional file path for persistent log output.
+    ///
+    /// Parent directories are created automatically. When set, logs are
+    /// written to both stderr and this file.
+    #[serde(default)]
+    pub file: Option<String>,
+}
+
+fn default_log_level() -> String {
+    "info".to_owned()
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            level: default_log_level(),
+            file: None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,6 +405,10 @@ face = 1
 [security]
 trust_anchor = "/etc/ndn/ta.cert"
 require_signed = true
+
+[logging]
+level = "debug"
+file = "/var/log/ndn/router.log"
 "#;
 
     #[test]
@@ -371,6 +426,11 @@ require_signed = true
         assert_eq!(cfg.routes[1].cost, 10); // default
         assert!(cfg.security.trust_anchor.is_some());
         assert!(cfg.security.require_signed);
+        assert_eq!(cfg.logging.level, "debug");
+        assert_eq!(
+            cfg.logging.file.as_deref(),
+            Some("/var/log/ndn/router.log")
+        );
     }
 
     #[test]
@@ -395,6 +455,8 @@ require_signed = true
         let cfg = ForwarderConfig::from_str("").unwrap();
         assert_eq!(cfg.engine.cs_capacity_mb, 64);
         assert!(cfg.faces.is_empty());
+        assert_eq!(cfg.logging.level, "info");
+        assert!(cfg.logging.file.is_none());
     }
 
     #[test]
