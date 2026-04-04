@@ -10,6 +10,89 @@ bootstrapping phase and all APIs should be considered unstable.
 
 ## [Unreleased]
 
+### Added
+
+#### `FjallCs` — persistent content store backed by fjall LSM-tree
+
+Added `FjallCs` in `ndn-store` as the first disk-backed `ContentStore`
+implementation. Data survives process restarts; entries are recovered on
+reopen by a single forward scan.
+
+- **Key layout:** concatenated NDN TLV-encoded name components — no outer
+  `0x07` Name wrapper — preserving lexicographic order so that `CanBePrefix`
+  lookups become native fjall range/prefix scans.
+- **Value layout:** `[stale_at: 8 B big-endian u64][wire Data bytes]` — zero
+  extra allocation on insert, direct slice on read.
+- **Capacity eviction:** evicts the lexicographically smallest entries when
+  the configured byte budget is exceeded (key-order scan, not LRU — disk
+  stores have no meaningful access-order signal).
+- Fully implements `ContentStore`: exact match, `CanBePrefix` prefix scan,
+  `MustBeFresh` freshness filter, implicit SHA-256 digest verification,
+  `evict`, `evict_prefix` with optional limit, `set_capacity` with
+  immediate excess eviction, `len`, `current_bytes`, `variant_name`.
+- **Feature-gated** — `ndn-store/fjall` Cargo feature; zero extra
+  dependencies unless opted in.  Tests always enable it via `dev-dependencies`.
+- Added `fjall = "3"` to the workspace dependency table.
+- 22 new tests covering all operations including a `data_survives_reopen`
+  round-trip test.
+
+#### `InterestBuilder` forwarding hint and signed Interest support
+
+Extended `InterestBuilder` in `ndn-packet` with two new capabilities:
+
+- **Forwarding hint** — `InterestBuilder::forwarding_hint(names: Vec<Name>)`
+  writes a `ForwardingHint` TLV containing one or more Name delegates.
+- **`build()` rewrite** — inlines the `ParametersSha256DigestComponent`
+  computation directly into the Interest TLV so the full packet (including
+  forwarding hint, hop limit, and application parameters) is written in one
+  pass.  Previously `build()` delegated to `encode_interest()` when app
+  parameters were present, losing forwarding hint and other fields.
+- **Signed Interest (NDN v0.3 §5.4)** — two new methods on `InterestBuilder`:
+  - `sign_sync(sig_type, key_locator, sign_fn) -> Bytes` — synchronous path
+    for CPU-only signers (Ed25519, HMAC).
+  - `sign(sig_type, key_locator, sign_fn) -> impl Future<Output = Bytes>` —
+    async path for HSM or remote signers.
+  Both methods build the signed region (Name through
+  `InterestSignatureInfo`), call the caller-supplied signer, then append
+  `InterestSignatureValue`.  Anti-replay fields (`SignatureNonce`,
+  `SignatureTime`) are auto-generated if none were set on the builder.
+- 8 new tests: forwarding hint roundtrip, signed Interest roundtrip,
+  auto-anti-replay, empty-params default, signed-region bounds, async/sync
+  structural equivalence, and full combined options test.
+
+#### `LoggingConfig` section in `ForwarderConfig`
+
+Added `[logging]` to `ndn-config`'s `ForwarderConfig`:
+
+```toml
+[logging]
+level = "info"                    # default; overridden by --log-level or RUST_LOG
+file  = "/var/log/ndn/router.log" # optional; enables dual stderr+file output
+```
+
+- `LoggingConfig` struct with `level: String` (default `"info"`) and
+  `file: Option<String>`.
+- `LoggingConfig` is re-exported from `ndn-config`.
+
+#### Structured CLI arguments and configurable tracing in `ndn-router`
+
+Replaced the router's ad-hoc argument parsing with a `CliArgs` struct and a
+dedicated `init_tracing()` function:
+
+- **`CliArgs` struct** — `config_path: Option<PathBuf>` and
+  `log_level: Option<String>`.  New `--log-level` flag sets the tracing
+  filter without modifying `RUST_LOG`.
+- **Precedence** (highest wins): `RUST_LOG` env var → `--log-level` flag →
+  `[logging] level` in config file.
+- **Dual output** — when `[logging] file` is set, logs are written to both
+  stderr and the file.  The file appender is non-blocking
+  (`tracing-appender`) so log writes never stall the forwarding pipeline.
+  `init_tracing()` returns an `Option<WorkerGuard>` that must be held until
+  shutdown.
+- Config is now loaded *before* tracing initialisation so the `[logging]`
+  section is available when setting up the subscriber.
+- Added `tracing-appender = "0.2"` to `ndn-router` dependencies.
+
 ### Changed
 
 #### Unified `FaceKind` enum with `Display`, `FromStr`, and serde support
