@@ -1,0 +1,21 @@
+[build-system]
+requires = ["maturin>=1.4,<2"]
+build-backend = "maturin"
+
+[project]
+name = "ndn-rs"
+description = "Python bindings for ndn-rs: Named Data Networking in Rust"
+license = { text = "MIT OR Apache-2.0" }
+requires-python = ">=3.9"
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: System :: Networking",
+]
+
+[tool.maturin]
+# Activate extension-module feature for maturin builds only.
+features = ["extension-module"]
+# The Python module name must match [lib] name in Cargo.toml.
+module-name = "ndn_rs"
+strip = true

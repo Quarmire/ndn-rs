@@ -12,6 +12,84 @@ bootstrapping phase and all APIs should be considered unstable.
 
 ### Added
 
+#### `ndn-python` — PyO3 Python bindings (`bindings/ndn-python`)
+
+Added `bindings/ndn-python`, a PyO3-based Python extension module exposing
+the NDN application API to Python. Built with `maturin`; no async runtime or
+`asyncio` required on the Python side.
+
+**`Consumer(socket: str)`** — connects to a running `ndn-router` over its Unix
+socket and exposes two fetch methods:
+- `get(name) -> bytes` — fetch content bytes (most common use case)
+- `fetch(name) -> Data` — fetch the full `Data` object with `.name` and
+  `.content` attributes
+
+**`Producer(socket: str, prefix: str)`** — registers a prefix and serves
+Interests via a Python callback:
+- `serve(handler: (str) -> bytes | None)` — blocks until the connection
+  closes; the GIL is released between Interest arrivals so other Python
+  threads can run; re-acquired only during the callback invocation
+
+**`Data`** — returned by `Consumer.fetch()`; `.name: str` and `.content: bytes`
+
+Errors are raised as `RuntimeError`. Python 3.9+ required.
+
+```bash
+# Build and install (requires maturin):
+cd bindings/ndn-python
+maturin develop          # editable install
+maturin build --release  # produce a wheel
+```
+
+```python
+from ndn_rs import Consumer, Producer
+
+c = Consumer("/tmp/ndn-faces.sock")
+raw = c.get("/ndn/sensor/temperature")   # bytes
+
+p = Producer("/tmp/ndn-faces.sock", "/ndn/sensor")
+p.serve(lambda name: b"23.5" if "temperature" in name else None)
+```
+
+**Implementation notes:**
+- Wraps `ndn-app`'s `blocking` feature (internal Tokio runtime, no `async`
+  leaks through the Python boundary).
+- `Producer::serve` wraps the Python handler in `Arc<Mutex<PyObject>>` to
+  satisfy `BlockingProducer::serve`'s `F: Fn(..) + Send + Sync + 'static`
+  bound; `py.allow_threads` releases the GIL for the wait loop.
+- The `extension-module` feature is not in `default` so `cargo check -p
+  ndn-python` works without Python installed.
+
+#### `ndn-embedded` ergonomic API improvements
+
+Added string-based convenience helpers to eliminate the boilerplate of manual
+FNV-1a hash computation and component splitting:
+
+**`Fib::add_route(prefix: &str, nexthop: FaceId)`** — parses a slash-delimited
+NDN name string (e.g. `"/ndn/sensor"`) and calls through to `Fib::add`. Uses a
+stack-allocated `heapless::Vec<&[u8], 16>` — no heap allocation.
+
+**`wire::encode_interest_name(buf, name, nonce, lifetime_ms, ...)`** and
+**`wire::encode_data_name(buf, name, content)`** — accept a `&str` name and
+delegate to the existing component-slice encoders.
+
+**`FnClock`** is now re-exported at the crate root alongside `NoOpClock`.
+
+Before:
+```rust
+use ndn_embedded::fib::prefix_hash;
+fib.add(FibEntry { prefix_hash: prefix_hash(&[b"ndn"]), prefix_len: 1, nexthop: 1, cost: 0 });
+encode_interest(&mut buf, &[b"ndn", b"sensor", b"temp"], 42, 4000, false, false);
+```
+
+After:
+```rust
+fib.add_route("/ndn/sensor", 1);
+wire::encode_interest_name(&mut buf, "/ndn/sensor/temp", 42, 4000, false, false);
+```
+
+### Added
+
 #### `ndn-embedded` — bare-metal NDN forwarder crate (`no_std`)
 
 Added `crates/ndn-embedded`, a `#![no_std]` NDN forwarder for ARM Cortex-M,

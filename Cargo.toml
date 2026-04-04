@@ -31,6 +31,8 @@ members = [
     "binaries/ndn-bench",
     # Embedded
     "crates/ndn-embedded",
+    # Python bindings
+    "bindings/ndn-python",
     # Examples
     "examples/strategy-custom",
     "examples/strategy-composed",

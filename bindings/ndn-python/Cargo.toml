@@ -1,0 +1,24 @@
+[package]
+name = "ndn-python"
+description = "PyO3 Python bindings for ndn-rs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "ndn_rs"
+# cdylib  = Python extension module (.so / .pyd)
+# rlib    = allows `cargo test` without a Python install (no extension-module linking)
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+# Activate only when maturin/pip builds the wheel; NOT in default so
+# `cargo test -p ndn-python` works without Python installed.
+extension-module = ["pyo3/extension-module"]
+
+[dependencies]
+ndn-app    = { workspace = true, features = ["blocking"] }
+ndn-packet = { workspace = true }
+bytes      = { workspace = true, features = ["std"] }
+pyo3       = { version = "0.22", features = ["macros"] }
