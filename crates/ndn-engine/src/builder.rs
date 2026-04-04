@@ -1,7 +1,9 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::Result;
+use ndn_discovery::{DiscoveryProtocol, NeighborTable, NoDiscovery};
 use tokio::task::JoinSet;
+use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use ndn_packet::Name;
@@ -14,6 +16,7 @@ use ndn_transport::{Face, FaceTable};
 
 use crate::{
     Fib, ForwarderEngine,
+    discovery_context::EngineDiscoveryContext,
     dispatcher::PacketDispatcher,
     engine::{EngineInner, ShutdownHandle},
     enricher::ContextEnricher,
@@ -61,6 +64,7 @@ pub struct EngineBuilder {
     admission: Option<Arc<dyn CsAdmissionPolicy>>,
     cs_observer: Option<Arc<dyn CsObserver>>,
     security_profile: SecurityProfile,
+    discovery: Option<Arc<dyn DiscoveryProtocol>>,
 }
 
 impl EngineBuilder {
@@ -75,6 +79,7 @@ impl EngineBuilder {
             admission: None,
             cs_observer: None,
             security_profile: SecurityProfile::Default,
+            discovery: None,
         }
     }
 
@@ -139,6 +144,22 @@ impl EngineBuilder {
         self
     }
 
+    /// Set the discovery protocol (default: [`NoDiscovery`]).
+    ///
+    /// Use [`CompositeDiscovery`] to run multiple protocols simultaneously.
+    ///
+    /// [`CompositeDiscovery`]: ndn_discovery::CompositeDiscovery
+    pub fn discovery<D: DiscoveryProtocol>(mut self, d: D) -> Self {
+        self.discovery = Some(Arc::new(d));
+        self
+    }
+
+    /// Set a pre-boxed discovery protocol.
+    pub fn discovery_arc(mut self, d: Arc<dyn DiscoveryProtocol>) -> Self {
+        self.discovery = Some(d);
+        self
+    }
+
     /// Register a cross-layer context enricher.
     ///
     /// Enrichers are called before every strategy invocation to populate
@@ -196,6 +217,40 @@ impl EngineBuilder {
             &self.security,
         );
 
+        // Discovery protocol (default: no-op).
+        let discovery: Arc<dyn DiscoveryProtocol> = self
+            .discovery
+            .unwrap_or_else(|| Arc::new(NoDiscovery));
+        let neighbors = NeighborTable::new();
+
+        // Build EngineInner first. `pipeline_tx` is a `OnceLock` so we can
+        // set it after `PacketDispatcher::spawn()` returns the sender, after
+        // the Arc<EngineInner> is already created (needed for the discovery
+        // context Weak back-reference).
+        let inner = Arc::new(EngineInner {
+            fib: Arc::clone(&fib),
+            pit: Arc::clone(&pit),
+            cs: Arc::clone(&cs),
+            face_table: Arc::clone(&face_table),
+            measurements: Arc::clone(&measurements),
+            strategy_table: Arc::clone(&strategy_table),
+            security: self.security,
+            pipeline_tx: OnceLock::new(),
+            face_states: Arc::clone(&face_states),
+            discovery: Arc::clone(&discovery),
+            neighbors: Arc::clone(&neighbors),
+            discovery_ctx: OnceLock::new(),
+        });
+
+        // Create the discovery context with a Weak back-reference to break
+        // the reference cycle (EngineInner → Arc<ctx> → Weak<EngineInner>).
+        let discovery_ctx = EngineDiscoveryContext::new(
+            Arc::downgrade(&inner),
+            Arc::clone(&neighbors),
+            cancel.child_token(),
+        );
+        let _ = inner.discovery_ctx.set(Arc::clone(&discovery_ctx));
+
         let dispatcher = PacketDispatcher {
             face_table: Arc::clone(&face_table),
             face_states: Arc::clone(&face_states),
@@ -234,9 +289,14 @@ impl EngineBuilder {
             },
             channel_cap: self.config.pipeline_channel_cap,
             pipeline_threads: resolve_pipeline_threads(self.config.pipeline_threads),
+            discovery: Arc::clone(&discovery),
+            discovery_ctx: Arc::clone(&discovery_ctx),
         };
 
         let pipeline_tx = dispatcher.spawn(cancel.clone(), &mut tasks);
+
+        // Now that we have the pipeline sender, store it in EngineInner.
+        let _ = inner.pipeline_tx.set(pipeline_tx);
 
         // Idle face sweep task.
         {
@@ -244,28 +304,44 @@ impl EngineBuilder {
             let face_table_clone = Arc::clone(&face_table);
             let fib_clone = Arc::clone(&fib);
             let cancel_clone = cancel.clone();
+            let d = Arc::clone(&discovery);
+            let ctx = Arc::clone(&discovery_ctx);
             tasks.spawn(async move {
                 crate::expiry::run_idle_face_task(
                     face_states_clone,
                     face_table_clone,
                     fib_clone,
                     cancel_clone,
+                    d,
+                    ctx,
                 )
                 .await;
             });
         }
 
-        let inner = Arc::new(EngineInner {
-            fib: Arc::clone(&fib),
-            pit: Arc::clone(&pit),
-            cs: Arc::clone(&cs),
-            face_table: Arc::clone(&face_table),
-            measurements: Arc::clone(&measurements),
-            strategy_table: Arc::clone(&strategy_table),
-            security: self.security,
-            pipeline_tx,
-            face_states,
-        });
+        // Discovery tick task — calls on_tick every 100 ms.
+        {
+            let d = Arc::clone(&discovery);
+            let ctx = Arc::clone(&discovery_ctx);
+            let cancel_clone = cancel.clone();
+            tasks.spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_millis(100));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tokio::select! {
+                        _ = cancel_clone.cancelled() => break,
+                        _ = interval.tick() => {
+                            d.on_tick(std::time::Instant::now(), &*ctx);
+                        }
+                    }
+                }
+            });
+        }
+
+        // Notify discovery about faces registered before build().
+        for face_id in face_table.face_ids() {
+            discovery.on_face_up(face_id, &*discovery_ctx);
+        }
 
         let engine = ForwarderEngine { inner };
         let handle = ShutdownHandle { cancel, tasks };

@@ -16,6 +16,9 @@ use ndn_pipeline::{
 use ndn_store::{CsEntry, PitToken};
 use ndn_transport::{FaceError, FaceId, FaceKind, FacePersistency, FaceScope, FaceTable};
 
+use ndn_discovery::DiscoveryProtocol;
+
+use crate::discovery_context::EngineDiscoveryContext;
 use crate::engine::{self, DEFAULT_SEND_QUEUE_CAP, FaceState};
 
 use crate::stages::{
@@ -53,11 +56,12 @@ pub struct PacketDispatcher {
     pub cs_insert: CsInsertStage,
     pub channel_cap: usize,
     /// Resolved pipeline thread count (always ≥ 1).
-    ///
-    /// - `1`: single-threaded — `process_packet` runs inline.
-    /// - `N > 1`: `process_packet` is spawned as a tokio task so up to N
-    ///   pipeline passes run in parallel.
     pub pipeline_threads: usize,
+    /// Active discovery protocol — receives `on_inbound` calls before packets
+    /// enter the NDN forwarding pipeline.
+    pub discovery: Arc<dyn DiscoveryProtocol>,
+    /// Engine discovery context — passed to protocol hooks.
+    pub discovery_ctx: Arc<EngineDiscoveryContext>,
 }
 
 impl PacketDispatcher {
@@ -107,6 +111,8 @@ impl PacketDispatcher {
                         fs,
                         ft,
                         fib,
+                        Arc::clone(&dispatcher.discovery),
+                        Arc::clone(&dispatcher.discovery_ctx),
                     ));
                 }
 
@@ -116,6 +122,8 @@ impl PacketDispatcher {
                 let fib = Arc::clone(&dispatcher.strategy.fib);
                 let pit = Arc::clone(&dispatcher.pit_check.pit);
                 let face_states = Arc::clone(&dispatcher.face_states);
+                let d = Arc::clone(&dispatcher.discovery);
+                let ctx = Arc::clone(&dispatcher.discovery_ctx);
                 tasks.spawn(async move {
                     run_face_reader(
                         face_id,
@@ -126,6 +134,8 @@ impl PacketDispatcher {
                         fib,
                         pit,
                         face_states,
+                        d,
+                        ctx,
                     )
                     .await;
                 });
@@ -568,6 +578,8 @@ pub(crate) async fn run_face_reader(
     fib: Arc<crate::Fib>,
     pit: Arc<ndn_store::Pit>,
     face_states: Arc<dashmap::DashMap<FaceId, FaceState>>,
+    discovery: Arc<dyn DiscoveryProtocol>,
+    discovery_ctx: Arc<EngineDiscoveryContext>,
 ) {
     let kind = face.kind();
     let persistency = face_states
@@ -617,6 +629,13 @@ pub(crate) async fn run_face_reader(
                         state.last_activity.store(arrival, Ordering::Relaxed);
                     }
                 }
+                // Let the discovery protocol inspect the packet first.
+                // If it returns true the packet is consumed (e.g. a hello
+                // Interest) and must not enter the NDN forwarding pipeline.
+                if discovery.on_inbound(&raw, face_id, &*discovery_ctx) {
+                    continue;
+                }
+
                 // Use try_send to avoid blocking the face reader when the
                 // pipeline channel is full.  Blocking here cascades back
                 // through the SHM ring — the face can't recv, its peer's
@@ -674,6 +693,8 @@ pub(crate) async fn run_face_reader(
                 debug!(face=%face_id, ?persistency, "face reader stopped (face retained)");
             }
             FacePersistency::OnDemand => {
+                // Notify discovery before removing from tables.
+                discovery.on_face_down(face_id, &*discovery_ctx);
                 // Fully remove the face.
                 if let Some((_, state)) = face_states.remove(&face_id) {
                     state.cancel.cancel();

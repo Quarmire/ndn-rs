@@ -9,6 +9,7 @@ license.workspace = true
 ndn-packet    = { workspace = true }
 ndn-transport = { workspace = true }
 ndn-face-net  = { workspace = true }
+ndn-discovery = { workspace = true }
 ndn-store     = { workspace = true }
 ndn-pipeline  = { workspace = true }
 ndn-strategy  = { workspace = true }

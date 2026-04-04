@@ -2,12 +2,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use dashmap::DashMap;
+use ndn_discovery::DiscoveryProtocol;
 use tokio_util::sync::CancellationToken;
 
 use ndn_store::Pit;
 use ndn_transport::{FaceId, FaceKind, FacePersistency, FaceTable};
 
 use crate::Fib;
+use crate::discovery_context::EngineDiscoveryContext;
 use crate::engine::FaceState;
 
 /// Background task that drains expired PIT entries every millisecond.
@@ -44,6 +46,8 @@ pub async fn run_idle_face_task(
     face_table: Arc<FaceTable>,
     fib: Arc<Fib>,
     cancel: CancellationToken,
+    discovery: Arc<dyn DiscoveryProtocol>,
+    discovery_ctx: Arc<EngineDiscoveryContext>,
 ) {
     loop {
         tokio::select! {
@@ -72,6 +76,7 @@ pub async fn run_idle_face_task(
                 }
 
                 for face_id in expired {
+                    discovery.on_face_down(face_id, &*discovery_ctx);
                     if let Some((_, state)) = face_states.remove(&face_id) {
                         state.cancel.cancel();
                     }

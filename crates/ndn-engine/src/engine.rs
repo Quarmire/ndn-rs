@@ -1,8 +1,9 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
+use ndn_discovery::{DiscoveryProtocol, NeighborTable};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -12,6 +13,8 @@ use ndn_security::SecurityManager;
 use ndn_store::{ErasedContentStore, Pit, PitToken, StrategyTable};
 use ndn_strategy::MeasurementsTable;
 use ndn_transport::{Face, FaceId, FacePersistency, FaceTable};
+
+use crate::discovery_context::EngineDiscoveryContext;
 
 use crate::stages::ErasedStrategy;
 
@@ -113,14 +116,20 @@ pub struct EngineInner {
     pub security: Option<Arc<SecurityManager>>,
     /// Pipeline inbound channel — used to spawn readers for dynamically-added
     /// faces (those registered after `build()` completes).
-    pub(crate) pipeline_tx: mpsc::Sender<InboundPacket>,
-    /// Per-face state: cancellation token, persistency level, and last activity.
     ///
-    /// When a control face (e.g. UnixFace) creates child faces (e.g. SHM via
-    /// `faces/create`), the child uses a child token of the control face's
-    /// token.  When the control face disconnects, its token is cancelled,
-    /// which propagates to all child faces.
+    /// Stored in `OnceLock` because the sender is obtained from
+    /// `PacketDispatcher::spawn()` which runs after `Arc<EngineInner>` is
+    /// created (needed for the discovery context back-reference).
+    pub(crate) pipeline_tx: OnceLock<mpsc::Sender<InboundPacket>>,
+    /// Per-face state: cancellation token, persistency level, and last activity.
     pub(crate) face_states: Arc<DashMap<FaceId, FaceState>>,
+    /// Active discovery protocol (default: `NoDiscovery`).
+    pub discovery: Arc<dyn DiscoveryProtocol>,
+    /// Engine-owned neighbor table shared with discovery protocols.
+    pub neighbors: Arc<NeighborTable>,
+    /// Discovery context.  Set once after `Arc<EngineInner>` is created to
+    /// break the reference cycle (EngineInner → Arc<ctx> → Weak<EngineInner>).
+    pub(crate) discovery_ctx: OnceLock<Arc<EngineDiscoveryContext>>,
 }
 
 /// Handle to a running forwarding engine.
@@ -154,6 +163,25 @@ impl ForwarderEngine {
 
     pub fn strategy_table(&self) -> Arc<StrategyTable<dyn ErasedStrategy>> {
         Arc::clone(&self.inner.strategy_table)
+    }
+
+    pub fn neighbors(&self) -> Arc<NeighborTable> {
+        Arc::clone(&self.inner.neighbors)
+    }
+
+    pub fn discovery(&self) -> Arc<dyn DiscoveryProtocol> {
+        Arc::clone(&self.inner.discovery)
+    }
+
+    /// The discovery context for this engine.
+    ///
+    /// Panics if called before `build()` completes (OnceLock not yet set).
+    pub fn discovery_ctx(&self) -> Arc<EngineDiscoveryContext> {
+        self.inner
+            .discovery_ctx
+            .get()
+            .expect("discovery_ctx not initialized")
+            .clone()
     }
 
     /// Look up the source face that originally sent an Interest.
@@ -209,41 +237,44 @@ impl ForwarderEngine {
             .get(face_id)
             .expect("face was just inserted");
 
+        let discovery = Arc::clone(&self.inner.discovery);
+        let discovery_ctx = self.discovery_ctx();
+
         // Spawn the outbound send task.
         {
-            let face = Arc::clone(&erased);
-            let cancel = cancel.clone();
-            let face_states = Arc::clone(&self.inner.face_states);
-            let face_table = Arc::clone(&self.inner.face_table);
-            let fib = Arc::clone(&self.inner.fib);
+            let d = Arc::clone(&discovery);
+            let ctx = Arc::clone(&discovery_ctx);
             tokio::spawn(run_face_sender(
                 face_id,
-                face,
+                Arc::clone(&erased),
                 send_rx,
-                cancel,
+                cancel.clone(),
                 persistency,
-                face_states,
-                face_table,
-                fib,
+                Arc::clone(&self.inner.face_states),
+                Arc::clone(&self.inner.face_table),
+                Arc::clone(&self.inner.fib),
+                d,
+                ctx,
             ));
         }
 
         // Spawn the inbound recv task.
-        let tx = self.inner.pipeline_tx.clone();
-        let face_table = Arc::clone(&self.inner.face_table);
-        let fib = Arc::clone(&self.inner.fib);
-        let pit = Arc::clone(&self.inner.pit);
-        let face_states = Arc::clone(&self.inner.face_states);
         tokio::spawn(crate::dispatcher::run_face_reader(
             face_id,
             erased,
-            tx,
+            self.inner.pipeline_tx.get().expect("pipeline_tx initialized").clone(),
             cancel,
-            face_table,
-            fib,
-            pit,
-            face_states,
+            Arc::clone(&self.inner.face_table),
+            Arc::clone(&self.inner.fib),
+            Arc::clone(&self.inner.pit),
+            Arc::clone(&self.inner.face_states),
+            Arc::clone(&discovery),
+            discovery_ctx,
         ));
+
+        // Notify discovery that a new face is up.
+        let ctx = self.discovery_ctx();
+        discovery.on_face_up(face_id, &*ctx);
     }
 
     /// Register a send-only face (no recv loop spawned).
@@ -275,19 +306,23 @@ impl ForwarderEngine {
             .face_table
             .get(face_id)
             .expect("face was just inserted");
-        let face_states = Arc::clone(&self.inner.face_states);
-        let face_table = Arc::clone(&self.inner.face_table);
-        let fib = Arc::clone(&self.inner.fib);
+        let discovery = Arc::clone(&self.inner.discovery);
+        let discovery_ctx = self.discovery_ctx();
         tokio::spawn(run_face_sender(
             face_id,
             erased,
             send_rx,
             cancel,
             FacePersistency::OnDemand,
-            face_states,
-            face_table,
-            fib,
+            Arc::clone(&self.inner.face_states),
+            Arc::clone(&self.inner.face_table),
+            Arc::clone(&self.inner.fib),
+            Arc::clone(&discovery),
+            Arc::clone(&discovery_ctx),
         ));
+
+        // Notify discovery (send-only faces are still reachable peers).
+        discovery.on_face_up(face_id, &*discovery_ctx);
     }
 
     /// Inject a raw packet into the pipeline as if it arrived from `face_id`.
@@ -299,9 +334,11 @@ impl ForwarderEngine {
         face_id: FaceId,
         arrival: u64,
     ) -> Result<(), ()> {
-        self.inner
-            .pipeline_tx
-            .send(InboundPacket {
+        let tx = match self.inner.pipeline_tx.get() {
+            Some(tx) => tx,
+            None => return Err(()),
+        };
+        tx.send(InboundPacket {
                 raw,
                 face_id,
                 arrival,
@@ -366,6 +403,8 @@ pub(crate) async fn run_face_sender(
     face_states: Arc<DashMap<FaceId, FaceState>>,
     face_table: Arc<FaceTable>,
     fib: Arc<crate::Fib>,
+    discovery: Arc<dyn ndn_discovery::DiscoveryProtocol>,
+    discovery_ctx: Arc<EngineDiscoveryContext>,
 ) {
     // Check if reliability is enabled by looking at the face state.
     let has_reliability = face_states
@@ -386,6 +425,7 @@ pub(crate) async fn run_face_sender(
             _ => {
                 tracing::warn!(face=%face_id, error=%e, "send error, closing face");
                 if persistency == FacePersistency::OnDemand {
+                    discovery.on_face_down(face_id, &*discovery_ctx);
                     if let Some((_, state)) = face_states.remove(&face_id) {
                         state.cancel.cancel();
                     }
