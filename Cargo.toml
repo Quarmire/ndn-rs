@@ -42,6 +42,9 @@ edition = "2024"
 authors = ["ndn-rs contributors"]
 license = "MIT OR Apache-2.0"
 
+[workspace.metadata.crane]
+name = "ndn-rs"
+
 [workspace.dependencies]
 # NDN workspace crates
 ndn-tlv       = { path = "crates/ndn-tlv" }
@@ -112,6 +115,9 @@ parking_lot = "0.12"
 
 # WebAssembly text format (examples)
 wat = "1"
+
+# Persistent storage
+fjall = "3"
 
 # Benchmarking
 criterion = { version = "0.5", features = ["html_reports"] }
