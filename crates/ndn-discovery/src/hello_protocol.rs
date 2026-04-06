@@ -69,7 +69,7 @@ impl<T: LinkMedium> HelloProtocol<T> {
 
     // ── Shared packet builders ───────────────────────────────────────────────
 
-    pub(crate) fn build_hello_interest(&self, nonce: u32) -> Bytes {
+    pub fn build_hello_interest(&self, nonce: u32) -> Bytes {
         let mut w = TlvWriter::new();
         w.write_nested(tlv_type::INTEREST, |w: &mut TlvWriter| {
             w.write_nested(tlv_type::NAME, |w: &mut TlvWriter| {

@@ -403,7 +403,7 @@ mod tests {
 
         unsafe {
             (*hdr).tp_status = libc::TP_STATUS_USER;
-            (*hdr).tp_mac = payload_offset as u32;
+            (*hdr).tp_mac = payload_offset as _;
             (*hdr).tp_snaplen = payload.len() as u32;
         }
 

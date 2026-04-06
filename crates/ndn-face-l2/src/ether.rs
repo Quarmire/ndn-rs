@@ -167,6 +167,7 @@ impl Face for NamedEtherFace {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
 
     /// Opening an AF_PACKET socket without CAP_NET_RAW should fail with EPERM.
     #[tokio::test]
