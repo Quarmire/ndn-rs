@@ -1,38 +1,18 @@
 //! Shared AF_PACKET infrastructure for raw Ethernet faces.
 //!
-//! Contains MAC address type, socket helpers, and the TPACKET_V2 mmap'd ring
-//! buffer used by both `NamedEtherFace` (unicast) and `MulticastEtherFace`.
+//! Contains socket helpers and the TPACKET_V2 mmap'd ring buffer used by both
+//! `NamedEtherFace` (unicast) and `MulticastEtherFace`.
+//!
+//! `MacAddr` is re-exported from `ndn-discovery` — it is the shared canonical
+//! type used across the whole stack.  Defining a second copy here caused a
+//! type-mismatch on Linux when passing MACs to `NeighborUpdate::AddFace`.
 
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use bytes::Bytes;
 
-/// MAC address (6 bytes).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct MacAddr(pub(crate) [u8; 6]);
-
-impl MacAddr {
-    pub const BROADCAST: MacAddr = MacAddr([0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
-
-    pub const fn new(bytes: [u8; 6]) -> Self {
-        Self(bytes)
-    }
-    pub fn as_bytes(&self) -> &[u8; 6] {
-        &self.0
-    }
-}
-
-impl std::fmt::Display for MacAddr {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let b = &self.0;
-        write!(
-            f,
-            "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            b[0], b[1], b[2], b[3], b[4], b[5]
-        )
-    }
-}
+pub use ndn_discovery::MacAddr;
 
 // ─── AF_PACKET helpers ───────────────────────────────────────────────────────
 

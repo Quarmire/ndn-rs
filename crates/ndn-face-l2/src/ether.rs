@@ -11,8 +11,6 @@ use crate::af_packet::{
 };
 use crate::radio::RadioFaceMetadata;
 
-// Re-export MacAddr so existing users of `ether::MacAddr` still work.
-pub use crate::af_packet::MacAddr;
 
 // ─── NamedEtherFace ──────────────────────────────────────────────────────────
 

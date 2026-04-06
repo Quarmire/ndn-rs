@@ -33,9 +33,8 @@ pub mod wfb;
 #[cfg(target_os = "linux")]
 pub mod bluetooth;
 
-// NeighborDiscovery depends on MacAddr from the Linux-specific ether module,
-// so it is also Linux-only.  RadioTable is a pure data structure with no
-// platform dependencies and compiles everywhere.
+// NeighborDiscovery uses AF_PACKET raw sockets, so it is Linux-only.
+// RadioTable is a pure data structure and compiles everywhere.
 #[cfg(target_os = "linux")]
 pub mod neighbor;
 pub mod radio;
