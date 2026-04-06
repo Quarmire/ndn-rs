@@ -55,7 +55,7 @@ impl MulticastEtherFace {
             libc::socket(
                 libc::AF_PACKET,
                 libc::SOCK_DGRAM | libc::SOCK_CLOEXEC,
-                (NDN_ETHERTYPE as u16).to_be() as i32,
+                NDN_ETHERTYPE.to_be() as i32,
             )
         };
         if probe_fd == -1 {

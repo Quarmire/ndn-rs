@@ -68,7 +68,8 @@ pub struct EtherMedium {
     multicast_face_id: FaceId,
     /// Network interface name (e.g. "wlan0").
     iface: String,
-    /// Our Ethernet MAC address (needed when creating unicast faces).
+    /// Our Ethernet MAC address (stored for future use, e.g. source filtering).
+    #[allow(dead_code)]
     local_mac: MacAddr,
 }
 

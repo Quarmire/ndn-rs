@@ -57,7 +57,7 @@ pub fn open_packet_socket(ifindex: i32, protocol: u16) -> std::io::Result<OwnedF
         libc::socket(
             libc::AF_PACKET,
             libc::SOCK_DGRAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
-            (protocol as u16).to_be() as i32,
+            protocol.to_be() as i32,
         )
     };
     if fd == -1 {
