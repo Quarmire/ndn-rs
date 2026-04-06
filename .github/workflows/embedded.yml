@@ -9,6 +9,7 @@ on:
       - "crates/ndn-packet/**"
       - "Cargo.lock"
       - ".github/workflows/embedded.yml"
+  workflow_dispatch:
   pull_request:
     branches: [main]
     paths:
