@@ -41,8 +41,8 @@ use crate::{
 /// pub type EtherNeighborDiscovery = HelloProtocol<EtherMedium>;
 /// ```
 pub struct HelloProtocol<T: LinkMedium> {
-    pub(crate) core: HelloCore,
-    pub(crate) medium: T,
+    pub core: HelloCore,
+    pub medium: T,
 }
 
 impl<T: LinkMedium> HelloProtocol<T> {

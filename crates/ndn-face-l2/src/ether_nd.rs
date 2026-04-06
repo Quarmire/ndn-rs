@@ -37,14 +37,15 @@
 //! 5. Installs FIB routes for `served_prefixes` (if `InHello` mode).
 //! 6. Applies any piggybacked `NEIGHBOR-DIFF` entries.
 
-use std::time::Duration;
+use std::ops::{Deref, DerefMut};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use ndn_discovery::link_medium::{HELLO_PREFIX_DEPTH, HelloCore, HelloState, LinkMedium};
-use ndn_discovery::wire::{parse_raw_data, parse_raw_interest, write_name_tlv, write_nni};
+use ndn_discovery::wire::{parse_raw_interest, write_name_tlv, write_nni};
 use ndn_discovery::{
-    DiscoveryConfig, DiscoveryContext, DiscoveryProfile, HelloPayload, HelloProtocol, InboundMeta,
-    LinkAddr, NeighborEntry, NeighborUpdate, ProtocolId,
+    DiscoveryConfig, DiscoveryContext, DiscoveryProfile, DiscoveryProtocol, HelloPayload,
+    HelloProtocol, InboundMeta, LinkAddr, NeighborEntry, NeighborUpdate, ProtocolId,
 };
 use ndn_packet::{Name, tlv_type};
 use ndn_tlv::TlvWriter;
@@ -71,8 +72,51 @@ pub struct EtherMedium {
     local_mac: MacAddr,
 }
 
-/// Ethernet neighbor discovery — type alias for `HelloProtocol<EtherMedium>`.
-pub type EtherNeighborDiscovery = HelloProtocol<EtherMedium>;
+/// Ethernet neighbor discovery — newtype wrapper around `HelloProtocol<EtherMedium>`.
+pub struct EtherNeighborDiscovery(HelloProtocol<EtherMedium>);
+
+impl Deref for EtherNeighborDiscovery {
+    type Target = HelloProtocol<EtherMedium>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for EtherNeighborDiscovery {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl DiscoveryProtocol for EtherNeighborDiscovery {
+    fn protocol_id(&self) -> ProtocolId {
+        self.0.protocol_id()
+    }
+    fn claimed_prefixes(&self) -> &[Name] {
+        self.0.claimed_prefixes()
+    }
+    fn tick_interval(&self) -> Duration {
+        self.0.tick_interval()
+    }
+    fn on_face_up(&self, face_id: FaceId, ctx: &dyn DiscoveryContext) {
+        self.0.on_face_up(face_id, ctx)
+    }
+    fn on_face_down(&self, face_id: FaceId, ctx: &dyn DiscoveryContext) {
+        self.0.on_face_down(face_id, ctx)
+    }
+    fn on_inbound(
+        &self,
+        raw: &Bytes,
+        incoming_face: FaceId,
+        meta: &InboundMeta,
+        ctx: &dyn DiscoveryContext,
+    ) -> bool {
+        self.0.on_inbound(raw, incoming_face, meta, ctx)
+    }
+    fn on_tick(&self, now: Instant, ctx: &dyn DiscoveryContext) {
+        self.0.on_tick(now, ctx)
+    }
+}
 
 impl EtherNeighborDiscovery {
     /// Create a new instance with the default LAN profile.
@@ -104,7 +148,7 @@ impl EtherNeighborDiscovery {
             iface: iface.into(),
             local_mac,
         };
-        HelloProtocol::create(medium, node_name, config)
+        Self(HelloProtocol::create(medium, node_name, config))
     }
 
     /// Create with a named deployment profile.

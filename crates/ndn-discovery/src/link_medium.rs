@@ -22,8 +22,8 @@ use crate::{DiffEntry, DiscoveryContext, HelloPayload, InboundMeta, NeighborEntr
 
 // ─── Shared constants ────────────────────────────────────────────────────────
 
-pub(crate) const HELLO_PREFIX_STR: &str = "/ndn/local/nd/hello";
-pub(crate) const HELLO_PREFIX_DEPTH: usize = 4;
+pub const HELLO_PREFIX_STR: &str = "/ndn/local/nd/hello";
+pub const HELLO_PREFIX_DEPTH: usize = 4;
 pub(crate) const MAX_DIFF_ENTRIES: usize = 16;
 
 // ─── HelloState ──────────────────────────────────────────────────────────────
