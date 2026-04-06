@@ -223,6 +223,54 @@ impl RouterClient {
         self.dead.load(Ordering::Relaxed)
     }
 
+    /// Spawn a background task that detects router disconnection.
+    ///
+    /// When the router process dies, the control socket closes.  In SHM mode
+    /// `recv()` reads from shared memory and does not observe the socket
+    /// closure — it would block forever.  This monitor detects the closure by
+    /// sending a lightweight probe on the control face every `interval`.  When
+    /// send fails (broken pipe / connection reset), it fires the internal
+    /// CancellationToken, which causes [`SpscHandle::recv`] to return `None`
+    /// promptly.
+    ///
+    /// In Unix-only mode the data `recv()` already returns `None` on closure,
+    /// so the monitor is not strictly necessary; calling it is still harmless.
+    ///
+    /// **Call this once, after all setup management commands are complete.**
+    /// The monitor also sends on the control face; starting it before
+    /// `register_prefix` / `service_announce` avoids any ordering issues with
+    /// management responses.
+    pub fn spawn_disconnect_monitor(&self, interval: std::time::Duration) {
+        let control = Arc::clone(&self.control);
+        let cancel = self.cancel.clone();
+        let dead = Arc::clone(&self.dead);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.tick().await; // skip first immediate tick (connect just succeeded)
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = ticker.tick() => {
+                        // Probe via send — fails immediately when the socket is closed.
+                        // Sends a minimal status Interest; the router may Nack or
+                        // silently drop it — we only care whether send() succeeds.
+                        let probe = ndn_packet::encode::encode_interest(
+                            &"/localhost/nfd/status/general"
+                                .parse()
+                                .expect("valid probe name"),
+                            None,
+                        );
+                        if control.send(probe).await.is_err() {
+                            dead.store(true, Ordering::Relaxed);
+                            cancel.cancel();
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     /// Check if the control face is still connected by attempting a
     /// non-blocking management probe.  Returns `true` if the router is alive.
     ///
