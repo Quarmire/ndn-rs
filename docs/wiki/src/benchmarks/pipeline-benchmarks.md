@@ -149,3 +149,9 @@ Criterion reports **median** latency by default. Look for:
 - **Throughput numbers**: useful for capacity planning. If `decode_throughput` shows 2M Interest/sec, that is the ceiling before other stages are considered.
 
 The HTML report at `target/criterion/report/index.html` includes violin plots, PDFs, and regression analysis for each benchmark.
+
+## Latest CI Results
+
+<!-- BENCH_RESULTS_START -->
+*No CI results yet. Results appear here after the first successful benchmark run on `main`.*
+<!-- BENCH_RESULTS_END -->
