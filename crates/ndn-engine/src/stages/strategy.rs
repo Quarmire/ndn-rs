@@ -7,12 +7,14 @@ use tracing::trace;
 
 use crate::Fib;
 use crate::enricher::ContextEnricher;
+use ndn_discovery::scope::is_link_local;
 use ndn_packet::Name;
 use ndn_pipeline::{
     Action, AnyMap, DecodedPacket, DropReason, ForwardingAction, NackReason, PacketContext,
 };
 use ndn_store::{Pit, StrategyTable};
 use ndn_strategy::{MeasurementsTable, Strategy, StrategyContext};
+use ndn_transport::face::FaceScope;
 
 /// Object-safe version of `Strategy` that boxes its futures.
 pub trait ErasedStrategy: Send + Sync + 'static {
@@ -155,7 +157,27 @@ impl StrategyStage {
             match action {
                 ForwardingAction::Forward(faces) => {
                     trace!(face=%ctx.face_id, name=%name, out_faces=?faces, "strategy: Forward");
-                    ctx.out_faces.extend_from_slice(&faces);
+                    // Link-local scope enforcement: /ndn/local/ packets must
+                    // not be forwarded to non-local (network) faces, mirroring
+                    // IPv6 fe80::/10 link-local semantics.
+                    let effective_faces: SmallVec<[ndn_transport::FaceId; 4]> = if is_link_local(&name) {
+                        faces.iter().copied().filter(|fid| {
+                            let keep = self.face_table.get(*fid)
+                                .map(|f| f.kind().scope() == FaceScope::Local)
+                                .unwrap_or(false);
+                            if !keep {
+                                trace!(face=%ctx.face_id, name=%name, out_face=%fid, "strategy: dropping link-local packet on non-local face");
+                            }
+                            keep
+                        }).collect()
+                    } else {
+                        faces.iter().copied().collect()
+                    };
+                    if effective_faces.is_empty() {
+                        // All nexthops filtered out — Nack.
+                        return Action::Nack(ctx, NackReason::NoRoute);
+                    }
+                    ctx.out_faces.extend_from_slice(&effective_faces);
                     let out = ctx.out_faces.clone();
                     return Action::Send(ctx, out);
                 }
@@ -203,5 +225,19 @@ impl StrategyStage {
         // No actionable forwarding decision → no route.
         trace!(face=%ctx.face_id, name=%name, "strategy: no actionable decision, Nack NoRoute");
         Action::Nack(ctx, NackReason::NoRoute)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn link_local_scope_check_is_accurate() {
+        use std::str::FromStr;
+        let link_local = ndn_packet::Name::from_str("/ndn/local/nd/hello/1").unwrap();
+        let global = ndn_packet::Name::from_str("/ndn/edu/test").unwrap();
+        assert!(is_link_local(&link_local), "/ndn/local/ must be link-local");
+        assert!(!is_link_local(&global), "/ndn/edu/ must not be link-local");
     }
 }
