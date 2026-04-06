@@ -66,7 +66,8 @@ impl FaceKind {
             | FaceKind::App
             | FaceKind::Shm
             | FaceKind::Internal
-            | FaceKind::Management => FaceScope::Local,
+            | FaceKind::Management
+            | FaceKind::WebSocket => FaceScope::Local,
             FaceKind::Udp
             | FaceKind::Tcp
             | FaceKind::Ethernet
@@ -75,8 +76,7 @@ impl FaceKind {
             | FaceKind::Bluetooth
             | FaceKind::Wfb
             | FaceKind::Compute
-            | FaceKind::Multicast
-            | FaceKind::WebSocket => FaceScope::NonLocal,
+            | FaceKind::Multicast => FaceScope::NonLocal,
         }
     }
 

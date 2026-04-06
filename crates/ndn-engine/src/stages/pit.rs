@@ -4,6 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use smallvec::SmallVec;
 use tracing::trace;
 
+use ndn_packet::Selector;
 use ndn_pipeline::{Action, DecodedPacket, DropReason, PacketContext};
 use ndn_store::{Pit, PitEntry, PitToken};
 use ndn_transport::FaceId;
@@ -86,33 +87,33 @@ impl PitMatchStage {
             _ => return Action::Continue(ctx),
         };
 
-        // Compute token to find the PIT entry.
+        // Try all selector combinations to find the PIT entry.
         //
         // PitCheck inserts with `from_interest_full(name, Some(selectors()), hint)`.
-        // Since `selectors()` returns the default Selector for most Interests,
-        // try the default-selector token FIRST (common-case hit on first probe),
-        // then fall back to the None-selector token for edge cases.
-        let default_sel = ndn_packet::Selector::default();
-        let token = PitToken::from_interest(&data.name, Some(&default_sel));
+        // Since Data packets don't carry selector information, we must probe
+        // all possible (can_be_prefix, must_be_fresh) combinations used at
+        // insertion time.  The default (false, false) is tried first as the
+        // common-case fast path.
+        let selector_probes: &[Option<Selector>] = &[
+            Some(Selector { can_be_prefix: false, must_be_fresh: false }),
+            Some(Selector { can_be_prefix: true, must_be_fresh: false }),
+            Some(Selector { can_be_prefix: false, must_be_fresh: true }),
+            Some(Selector { can_be_prefix: true, must_be_fresh: true }),
+            None,
+        ];
 
-        if let Some((_, entry)) = self.pit.remove(&token) {
-            let faces: SmallVec<[FaceId; 4]> = entry.in_record_faces().map(FaceId).collect();
-            trace!(face=%ctx.face_id, name=%data.name, out_faces=?faces, "pit-match: satisfied");
-            ctx.out_faces = faces;
-            Action::Continue(ctx)
-        } else {
-            // Fall back to None selector.
-            let token2 = PitToken::from_interest(&data.name, None);
-            if let Some((_, entry)) = self.pit.remove(&token2) {
+        for sel in selector_probes {
+            let token = PitToken::from_interest(&data.name, sel.as_ref());
+            if let Some((_, entry)) = self.pit.remove(&token) {
                 let faces: SmallVec<[FaceId; 4]> = entry.in_record_faces().map(FaceId).collect();
-                trace!(face=%ctx.face_id, name=%data.name, out_faces=?faces, "pit-match: satisfied (no selector)");
+                trace!(face=%ctx.face_id, name=%data.name, out_faces=?faces, "pit-match: satisfied");
                 ctx.out_faces = faces;
-                Action::Continue(ctx)
-            } else {
-                trace!(face=%ctx.face_id, name=%data.name, "pit-match: unsolicited Data");
-                Action::Drop(DropReason::Other)
+                return Action::Continue(ctx);
             }
         }
+
+        trace!(face=%ctx.face_id, name=%data.name, "pit-match: unsolicited Data");
+        Action::Drop(DropReason::Other)
     }
 }
 
