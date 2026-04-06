@@ -1,0 +1,12 @@
+{
+  "name": "ndn-mcp",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "server.js",
+  "bin": {
+    "ndn-mcp": "./server.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  }
+}
