@@ -13,7 +13,7 @@ spsc-shm = ["dep:libc"]
 
 
 [dependencies]
-ndn-packet    = { workspace = true }
+ndn-packet    = { workspace = true, features = ["std"] }
 ndn-transport = { workspace = true }
 bytes         = { workspace = true, features = ["std"] }
 tokio         = { workspace = true, features = ["sync", "io-util", "net", "rt", "macros", "time"] }

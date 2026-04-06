@@ -10,7 +10,7 @@ default = []
 blocking = ["tokio/rt"]
 
 [dependencies]
-ndn-packet     = { workspace = true }
+ndn-packet     = { workspace = true, features = ["std"] }
 ndn-pipeline   = { workspace = true }
 ndn-engine     = { workspace = true }
 ndn-security   = { workspace = true }

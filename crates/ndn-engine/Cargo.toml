@@ -6,7 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-ndn-packet    = { workspace = true }
+ndn-packet    = { workspace = true, features = ["std"] }
 ndn-transport = { workspace = true }
 ndn-face-net  = { workspace = true }
 ndn-discovery = { workspace = true }

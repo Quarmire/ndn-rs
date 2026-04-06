@@ -10,7 +10,7 @@ default = []
 fjall = ["dep:fjall"]
 
 [dependencies]
-ndn-packet = { workspace = true }
+ndn-packet = { workspace = true, features = ["std"] }
 bytes         = { workspace = true, features = ["std"] }
 dashmap    = { workspace = true }
 smallvec   = { workspace = true }
@@ -25,7 +25,7 @@ tokio    = { workspace = true, features = ["rt", "macros"] }
 fjall    = { workspace = true }
 tempfile = "3"
 criterion = { workspace = true }
-ndn-packet = { workspace = true }
+ndn-packet = { workspace = true, features = ["std"] }
 
 [[bench]]
 name    = "lru"

@@ -10,7 +10,7 @@ default = []
 serde = ["dep:serde"]
 
 [dependencies]
-ndn-packet = { workspace = true }
+ndn-packet = { workspace = true, features = ["std"] }
 ndn-tlv       = { workspace = true, features = ["std"] }
 bytes         = { workspace = true, features = ["std"] }
 futures    = { workspace = true }

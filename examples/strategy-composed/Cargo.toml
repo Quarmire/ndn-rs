@@ -5,7 +5,7 @@ edition.workspace = true
 publish = false
 
 [dependencies]
-ndn-packet    = { workspace = true }
+ndn-packet    = { workspace = true, features = ["std"] }
 ndn-transport = { workspace = true }
 ndn-pipeline  = { workspace = true }
 ndn-strategy  = { workspace = true }

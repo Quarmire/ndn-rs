@@ -10,7 +10,7 @@ default = ["spsc-shm"]
 spsc-shm = ["ndn-face-local/spsc-shm"]
 
 [dependencies]
-ndn-packet     = { workspace = true }
+ndn-packet     = { workspace = true, features = ["std"] }
 ndn-config     = { workspace = true }
 ndn-face-local = { workspace = true }
 ndn-transport  = { workspace = true }
