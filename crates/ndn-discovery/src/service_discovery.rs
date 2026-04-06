@@ -60,6 +60,9 @@ struct AutoFibEntry {
     prefix: Name,
     face_id: FaceId,
     expires_at: Instant,
+    /// NDN name of the peer that published this record; used to evict
+    /// `peer_records` and reset `browsed_neighbors` on expiry or face-down.
+    node_name: Name,
 }
 
 /// Rate-limit tracker per producer name.
@@ -347,6 +350,7 @@ impl ServiceDiscoveryProtocol {
                     prefix: record.announced_prefix.clone(),
                     face_id: fib_face,
                     expires_at,
+                    node_name: record.node_name.clone(),
                 });
             }
             debug!(
@@ -602,12 +606,54 @@ impl DiscoveryProtocol for ServiceDiscoveryProtocol {
         // request/response serialisation at the client.
     }
 
-    fn on_face_down(&self, _face_id: FaceId, _ctx: &dyn DiscoveryContext) {
-        // Remove all auto-populated FIB entries for the face that went down.
-        // We can't easily know which entries belong to the downed face without
-        // iterating, so we rely on the engine's face-removal housekeeping.
-        // The `remove_fib_entries_by_owner` is too broad here (removes all SD
-        // routes, not just the downed face).
+    fn on_face_down(&self, face_id: FaceId, ctx: &dyn DiscoveryContext) {
+        // Find which neighbors were reachable via this face.
+        let affected: Vec<Name> = ctx.neighbors().all()
+            .into_iter()
+            .filter(|e| e.faces.iter().any(|(fid, _, _)| *fid == face_id))
+            .map(|e| e.node_name.clone())
+            .collect();
+
+        // Evict peer records received from those nodes.
+        if !affected.is_empty() {
+            let mut peer_recs = self.peer_records.lock().unwrap();
+            peer_recs.retain(|r| !affected.contains(&r.node_name));
+            debug!(
+                nodes = ?affected.iter().map(|n| n.to_string()).collect::<Vec<_>>(),
+                "ServiceDiscovery: evicted peer records for face-down nodes",
+            );
+        }
+
+        // Remove auto-FIB entries that route via the downed face, and
+        // immediately remove the FIB entries from the engine.
+        let mut fib_removals: Vec<(Name, FaceId)> = Vec::new();
+        {
+            let mut auto_fib = self.auto_fib.lock().unwrap();
+            auto_fib.retain(|e| {
+                if e.face_id == face_id {
+                    fib_removals.push((e.prefix.clone(), e.face_id));
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        for (prefix, fid) in &fib_removals {
+            ctx.remove_fib_entry(prefix, *fid, PROTOCOL);
+        }
+        if !fib_removals.is_empty() {
+            debug!(count = fib_removals.len(), face = ?face_id, "ServiceDiscovery: removed auto-FIB entries for downed face");
+        }
+
+        // Reset browsed state for affected nodes so they receive a fresh
+        // initial browse when they reconnect (rather than waiting for the
+        // periodic interval).
+        if !affected.is_empty() {
+            let mut seen = self.browsed_neighbors.lock().unwrap();
+            for name in &affected {
+                seen.remove(name);
+            }
+        }
     }
 
     fn on_inbound(
@@ -636,21 +682,61 @@ impl DiscoveryProtocol for ServiceDiscoveryProtocol {
 
     fn on_tick(&self, now: Instant, ctx: &dyn DiscoveryContext) {
         // Expire auto-populated FIB entries past their TTL.
-        let mut expired: Vec<(Name, FaceId)> = Vec::new();
+        //
+        // On expiry we also evict the peer_record for the same
+        // (prefix, node_name) pair and clear the node from
+        // `browsed_neighbors`.  This causes the next `browse_neighbors` call
+        // to treat the peer as "new" and issue an immediate re-browse —
+        // critical for the role-switch case where the same peer registers a
+        // different prefix after the previous record's TTL expires.
+        struct Expired { prefix: Name, face_id: FaceId, node_name: Name }
+        let mut expired: Vec<Expired> = Vec::new();
         {
             let mut auto_fib = self.auto_fib.lock().unwrap();
             auto_fib.retain(|e| {
                 if now >= e.expires_at {
-                    expired.push((e.prefix.clone(), e.face_id));
+                    expired.push(Expired {
+                        prefix: e.prefix.clone(),
+                        face_id: e.face_id,
+                        node_name: e.node_name.clone(),
+                    });
                     false
                 } else {
                     true
                 }
             });
         }
-        for (prefix, face_id) in expired {
-            ctx.remove_fib_entry(&prefix, face_id, PROTOCOL);
-            debug!("ServiceDiscovery: expired auto-FIB {:?} via {face_id:?}", prefix);
+        if !expired.is_empty() {
+            // Evict peer records whose announced prefix just expired so stale
+            // records from old-role peers are removed from `all_records()`.
+            {
+                let mut peer_recs = self.peer_records.lock().unwrap();
+                for e in &expired {
+                    peer_recs.retain(|r| {
+                        !(r.announced_prefix == e.prefix && r.node_name == e.node_name)
+                    });
+                }
+            }
+
+            // Reset browsed state for affected nodes so they receive an
+            // immediate re-browse on the next tick (catches role-switch: same
+            // peer, different prefix, same face still up).
+            {
+                let mut seen = self.browsed_neighbors.lock().unwrap();
+                for e in &expired {
+                    seen.remove(&e.node_name);
+                }
+            }
+
+            for e in &expired {
+                ctx.remove_fib_entry(&e.prefix, e.face_id, PROTOCOL);
+                debug!(
+                    prefix = %e.prefix,
+                    node   = %e.node_name,
+                    face   = ?e.face_id,
+                    "ServiceDiscovery: expired auto-FIB entry",
+                );
+            }
         }
 
         // Browse neighbor faces to exchange service records.
@@ -858,6 +944,7 @@ mod tests {
                 prefix: name("/ndn/sensor/temp"),
                 face_id: FaceId(7),
                 expires_at: now - Duration::from_millis(1),
+                node_name: name("/ndn/test/peer"),
             });
         }
 
