@@ -168,6 +168,18 @@ pub trait Face: Send + Sync + 'static {
     /// Receive the next packet. Blocks until a packet arrives or the face closes.
     fn recv(&self) -> impl Future<Output = Result<Bytes, FaceError>> + Send;
 
+    /// Receive the next packet together with the link-layer sender address.
+    ///
+    /// The default implementation returns `None` for the source address.
+    /// Multicast and broadcast faces (e.g. [`MulticastUdpFace`]) override this
+    /// to return the UDP source `SocketAddr`, enabling the discovery layer to
+    /// create unicast reply faces without embedding addresses in NDN payloads.
+    ///
+    /// [`MulticastUdpFace`]: ndn_face_net::MulticastUdpFace
+    fn recv_with_addr(&self) -> impl Future<Output = Result<(Bytes, Option<std::net::SocketAddr>), FaceError>> + Send {
+        async { self.recv().await.map(|b| (b, None)) }
+    }
+
     /// Send a packet. Must not block the caller; use internal buffering.
     ///
     /// # LP encoding convention

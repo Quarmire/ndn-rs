@@ -107,6 +107,12 @@ impl Face for MulticastUdpFace {
         Ok(pkt)
     }
 
+    /// Receive packet and expose the UDP source address to the discovery layer.
+    async fn recv_with_addr(&self) -> Result<(Bytes, Option<std::net::SocketAddr>), FaceError> {
+        let (pkt, src) = self.recv_with_source().await?;
+        Ok((pkt, Some(src)))
+    }
+
     /// Broadcast an NDN packet to the multicast group.
     async fn send(&self, pkt: Bytes) -> Result<(), FaceError> {
         if pkt.len() + 4 <= self.mtu {

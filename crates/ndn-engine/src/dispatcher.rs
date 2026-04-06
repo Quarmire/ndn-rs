@@ -602,10 +602,10 @@ pub(crate) async fn run_face_reader(
     loop {
         let result = tokio::select! {
             _ = cancel.cancelled() => break,
-            r = face.recv_bytes()  => r,
+            r = face.recv_bytes_with_addr()  => r,
         };
         match result {
-            Ok(raw) => {
+            Ok((raw, src_addr)) => {
                 trace!(face=%face_id, len=raw.len(), "face-reader: recv");
 
                 // Feed inbound packet to reliability layer (extracts TxSeq for
@@ -629,10 +629,18 @@ pub(crate) async fn run_face_reader(
                         state.last_activity.store(arrival, Ordering::Relaxed);
                     }
                 }
+                // Build InboundMeta with the link-layer source address when
+                // the face exposed it (e.g. MulticastUdpFace).  Discovery
+                // protocols use this to create unicast reply faces without
+                // embedding addresses in NDN payloads.
+                let meta = match src_addr {
+                    Some(addr) => ndn_discovery::InboundMeta::udp(addr),
+                    None => ndn_discovery::InboundMeta::none(),
+                };
                 // Let the discovery protocol inspect the packet first.
                 // If it returns true the packet is consumed (e.g. a hello
                 // Interest) and must not enter the NDN forwarding pipeline.
-                if discovery.on_inbound(&raw, face_id, &*discovery_ctx) {
+                if discovery.on_inbound(&raw, face_id, &meta, &*discovery_ctx) {
                     continue;
                 }
 
