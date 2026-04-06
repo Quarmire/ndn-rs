@@ -147,6 +147,16 @@ impl ServiceDiscoveryProtocol {
         records.retain(|e| &e.record.announced_prefix != announced_prefix);
     }
 
+    /// Return a snapshot of locally published service records.
+    pub fn local_records(&self) -> Vec<ServiceRecord> {
+        self.local_records
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|e| e.record.clone())
+            .collect()
+    }
+
     // ── Inbound handlers ──────────────────────────────────────────────────────
 
     fn handle_sd_interest(
@@ -661,7 +671,7 @@ mod tests {
                 self.removed.lock().unwrap().push(prefix.clone());
             }
             fn remove_fib_entries_by_owner(&self, _: ProtocolId) {}
-            fn neighbors(&self) -> &dyn NeighborTableView { unimplemented!() }
+            fn neighbors(&self) -> Arc<dyn NeighborTableView> { NeighborTable::new() }
             fn update_neighbor(&self, _: NeighborUpdate) {}
             fn send_on(&self, _: FaceId, _: Bytes) {}
             fn now(&self) -> Instant { self.now }
@@ -708,7 +718,7 @@ mod tests {
             fn add_fib_entry(&self, _: &Name, _: FaceId, _: u32, _: ProtocolId) {}
             fn remove_fib_entry(&self, _: &Name, _: FaceId, _: ProtocolId) {}
             fn remove_fib_entries_by_owner(&self, _: ProtocolId) {}
-            fn neighbors(&self) -> &dyn NeighborTableView { &*self.neighbors }
+            fn neighbors(&self) -> Arc<dyn NeighborTableView> { Arc::clone(&self.neighbors) as Arc<dyn NeighborTableView> }
             fn update_neighbor(&self, u: NeighborUpdate) { self.neighbors.apply(u); }
             fn send_on(&self, face_id: FaceId, pkt: Bytes) {
                 self.sent.lock().unwrap().push((face_id, pkt));

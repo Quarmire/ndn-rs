@@ -72,6 +72,19 @@ impl CompositeDiscovery {
     pub fn is_empty(&self) -> bool {
         self.protocols.is_empty()
     }
+
+    /// Collect all prefixes claimed by any child protocol.
+    ///
+    /// Unlike `claimed_prefixes()` (which returns the composite's own
+    /// top-level claims), this method flattens the claims of all children.
+    /// Use this to enumerate the full set of prefixes owned by the discovery
+    /// stack (e.g. for management security enforcement).
+    pub fn all_claimed_prefixes(&self) -> Vec<Name> {
+        self.protocols
+            .iter()
+            .flat_map(|p| p.claimed_prefixes().iter().cloned())
+            .collect()
+    }
 }
 
 impl DiscoveryProtocol for CompositeDiscovery {
@@ -206,7 +219,7 @@ mod tests {
     use super::*;
     use std::str::FromStr;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use crate::{DiscoveryContext, InboundMeta, NeighborTableView, NeighborUpdate, NoDiscovery, ProtocolId};
+    use crate::{DiscoveryContext, InboundMeta, NeighborTable, NeighborTableView, NeighborUpdate, NoDiscovery, ProtocolId};
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -263,7 +276,7 @@ mod tests {
         fn add_fib_entry(&self, _: &Name, _: FaceId, _: u32, _: ProtocolId) {}
         fn remove_fib_entry(&self, _: &Name, _: FaceId, _: ProtocolId) {}
         fn remove_fib_entries_by_owner(&self, _: ProtocolId) {}
-        fn neighbors(&self) -> &dyn NeighborTableView { unimplemented!() }
+        fn neighbors(&self) -> Arc<dyn NeighborTableView> { NeighborTable::new() }
         fn update_neighbor(&self, _: NeighborUpdate) {}
         fn send_on(&self, _: FaceId, _: Bytes) {}
         fn now(&self) -> Instant { Instant::now() }
