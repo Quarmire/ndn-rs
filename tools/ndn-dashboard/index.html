@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>NDN Router Dashboard</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <nav class="sidebar">
+    <div class="logo">ndn-router</div>
+    <div class="conn-status">
+      <span class="conn-dot"></span>
+      <span id="conn-label">Disconnected</span>
+    </div>
+    <div style="padding:0 0.75rem;margin-bottom:0.75rem">
+      <input class="form-input" id="ws-url" value="ws://localhost:9696" style="width:100%;font-size:0.75rem;margin-bottom:0.3rem">
+      <button class="btn btn-primary" id="connect-btn" style="width:100%;font-size:0.75rem">Connect</button>
+    </div>
+    <button class="nav-btn active" data-view="overview">Overview</button>
+    <button class="nav-btn" data-view="faces">Faces</button>
+    <button class="nav-btn" data-view="routes">Routes</button>
+    <button class="nav-btn" data-view="cs">Content Store</button>
+    <button class="nav-btn" data-view="strategy">Strategy</button>
+    <button class="nav-btn" data-view="discovery">Discovery</button>
+  </nav>
+  <main class="main">
+    <div id="overview" class="view active"></div>
+    <div id="faces" class="view"></div>
+    <div id="routes" class="view"></div>
+    <div id="cs" class="view"></div>
+    <div id="strategy" class="view"></div>
+    <div id="discovery" class="view"></div>
+  </main>
+  <div class="toast-container"></div>
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>
