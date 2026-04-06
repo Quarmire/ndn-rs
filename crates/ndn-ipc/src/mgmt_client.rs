@@ -192,6 +192,38 @@ impl MgmtClient {
         self.command(module::CS, verb::ERASE, &params).await
     }
 
+    // ─── Neighbors ──────────────────────────────────────────────────────
+
+    /// List discovered neighbors: `neighbors/list`.
+    pub async fn neighbors_list(&self) -> Result<ControlResponse, RouterError> {
+        self.dataset(module::NEIGHBORS, verb::LIST).await
+    }
+
+    // ─── Service discovery ──────────────────────────────────────────────
+
+    /// List locally announced services: `service/list`.
+    pub async fn service_list(&self) -> Result<ControlResponse, RouterError> {
+        self.dataset(module::SERVICE, verb::LIST).await
+    }
+
+    /// Announce a service prefix at runtime: `service/announce`.
+    pub async fn service_announce(&self, prefix: &Name) -> Result<ControlParameters, RouterError> {
+        let params = ControlParameters {
+            name: Some(prefix.clone()),
+            ..Default::default()
+        };
+        self.command(module::SERVICE, verb::ANNOUNCE, &params).await
+    }
+
+    /// Withdraw a previously announced service prefix: `service/withdraw`.
+    pub async fn service_withdraw(&self, prefix: &Name) -> Result<ControlParameters, RouterError> {
+        let params = ControlParameters {
+            name: Some(prefix.clone()),
+            ..Default::default()
+        };
+        self.command(module::SERVICE, verb::WITHDRAW, &params).await
+    }
+
     // ─── Status ─────────────────────────────────────────────────────────
 
     /// General forwarder status: `status/general`.
