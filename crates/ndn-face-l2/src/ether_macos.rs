@@ -66,7 +66,13 @@ impl NamedEtherFace {
         radio: RadioFaceMetadata,
     ) -> std::io::Result<Self> {
         let socket = NdrvSocket::new(iface)?;
-        Ok(Self { id, node_name, peer_mac, radio, socket })
+        Ok(Self {
+            id,
+            node_name,
+            peer_mac,
+            radio,
+            socket,
+        })
     }
 
     /// Update the peer MAC address (e.g. after a mobility event).
@@ -86,8 +92,12 @@ impl NamedEtherFace {
 }
 
 impl Face for NamedEtherFace {
-    fn id(&self) -> FaceId { self.id }
-    fn kind(&self) -> FaceKind { FaceKind::Ethernet }
+    fn id(&self) -> FaceId {
+        self.id
+    }
+    fn kind(&self) -> FaceKind {
+        FaceKind::Ethernet
+    }
 
     async fn recv(&self) -> Result<Bytes, FaceError> {
         loop {
@@ -152,8 +162,12 @@ impl MulticastEtherFace {
 }
 
 impl Face for MulticastEtherFace {
-    fn id(&self) -> FaceId { self.id }
-    fn kind(&self) -> FaceKind { FaceKind::EtherMulticast }
+    fn id(&self) -> FaceId {
+        self.id
+    }
+    fn kind(&self) -> FaceKind {
+        FaceKind::EtherMulticast
+    }
 
     fn remote_uri(&self) -> Option<String> {
         Some(format!("ether://[{}]/{}", NDN_ETHER_MCAST_MAC, self.iface))
@@ -195,8 +209,8 @@ impl Face for MulticastEtherFace {
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
     use super::*;
+    use std::str::FromStr;
 
     #[test]
     fn mcast_mac_is_multicast() {
@@ -207,13 +221,8 @@ mod tests {
     fn new_without_root_fails() {
         let name = ndn_packet::Name::from_str("/test/node").unwrap();
         let peer = MacAddr([0u8; 6]);
-        let result = NamedEtherFace::new(
-            FaceId(1),
-            name,
-            peer,
-            "en0",
-            RadioFaceMetadata::default(),
-        );
+        let result =
+            NamedEtherFace::new(FaceId(1), name, peer, "en0", RadioFaceMetadata::default());
         if let Err(e) = result {
             let raw = e.raw_os_error().unwrap_or(0);
             assert!(

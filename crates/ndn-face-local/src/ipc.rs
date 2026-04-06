@@ -35,7 +35,7 @@ use ndn_transport::{FaceId, FaceKind, StreamFace, TlvCodec};
 
 // ─── Type alias ──────────────────────────────────────────────────────────────
 
-type DynRead  = Box<dyn AsyncRead  + Send + Sync + Unpin>;
+type DynRead = Box<dyn AsyncRead + Send + Sync + Unpin>;
 type DynWrite = Box<dyn AsyncWrite + Send + Sync + Unpin>;
 
 /// Platform-agnostic NDN face over the management IPC socket.
@@ -68,7 +68,9 @@ pub struct IpcListener {
 impl IpcListener {
     /// Bind to `path` and start listening.
     pub fn bind(path: &str) -> io::Result<Self> {
-        Ok(Self { inner: PlatformListener::bind(path)? })
+        Ok(Self {
+            inner: PlatformListener::bind(path)?,
+        })
     }
 
     /// Accept the next connection.
@@ -114,7 +116,10 @@ impl PlatformListener {
     fn bind(path: &str) -> io::Result<Self> {
         let _ = std::fs::remove_file(path);
         let listener = tokio::net::UnixListener::bind(path)?;
-        Ok(Self { listener, path: path.to_owned() })
+        Ok(Self {
+            listener,
+            path: path.to_owned(),
+        })
     }
 
     async fn accept(&self) -> io::Result<(DynRead, DynWrite, String)> {

@@ -43,7 +43,9 @@ fn bench_sharded(c: &mut Criterion) {
         rt.block_on(cs.insert(
             data_wire(&hit_name),
             Arc::clone(&hit_name),
-            CsMeta { stale_at: far_future() },
+            CsMeta {
+                stale_at: far_future(),
+            },
         ));
         let hit_interest = interest_for("/ndn/sharded/hit");
 
@@ -71,7 +73,13 @@ fn bench_sharded(c: &mut Criterion) {
                     let name: Arc<Name> =
                         Arc::new(format!("/ndn/sharded/new/{i}").parse().unwrap());
                     let wire = data_wire(&name);
-                    rt.block_on(cs.insert(wire, name, CsMeta { stale_at: far_future() }))
+                    rt.block_on(cs.insert(
+                        wire,
+                        name,
+                        CsMeta {
+                            stale_at: far_future(),
+                        },
+                    ))
                 });
             },
         );

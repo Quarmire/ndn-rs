@@ -33,11 +33,11 @@ pub mod verifier;
 
 pub use cert_cache::{CertCache, Certificate};
 pub use cert_fetcher::{CertFetcher, FetchFn};
-pub use profile::SecurityProfile;
 pub use error::TrustError;
 pub use key_store::{KeyAlgorithm, KeyStore, MemKeyStore};
 pub use manager::SecurityManager;
 pub use pib::{FilePib, PibError};
+pub use profile::SecurityProfile;
 pub use safe_data::SafeData;
 pub use signer::{Ed25519Signer, HmacSha256Signer, Signer};
 pub use trust_schema::{NamePattern, PatternComponent, TrustSchema};

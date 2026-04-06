@@ -1,5 +1,7 @@
 use bytes::Bytes;
-use criterion::{BatchSize, BenchmarkGroup, Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{
+    BatchSize, BenchmarkGroup, Criterion, Throughput, criterion_group, criterion_main,
+};
 use ndn_packet::{Name, NameComponent};
 use ndn_store::{ContentStore, CsMeta, InsertResult, LruCs};
 use std::sync::Arc;
@@ -55,7 +57,13 @@ fn bench_get_miss_populated(g: &mut BenchmarkGroup<criterion::measurement::WallT
     for i in 0..200u64 {
         let name: Arc<Name> = Arc::new(format!("/a/populate/{i}").parse().unwrap());
         let wire = data_wire(&name);
-        rt.block_on(cs.insert(wire, name, CsMeta { stale_at: far_future() }));
+        rt.block_on(cs.insert(
+            wire,
+            name,
+            CsMeta {
+                stale_at: far_future(),
+            },
+        ));
     }
     let interest = interest_for("/ndn/not/cached");
     g.throughput(Throughput::Elements(1));
@@ -74,7 +82,13 @@ fn bench_get_hit(g: &mut BenchmarkGroup<criterion::measurement::WallTime>) {
     let rt = rt();
     let cs = LruCs::new(1 << 20);
     let name: Arc<Name> = Arc::new("/ndn/hit".parse().unwrap());
-    rt.block_on(cs.insert(data_wire(&name), Arc::clone(&name), CsMeta { stale_at: far_future() }));
+    rt.block_on(cs.insert(
+        data_wire(&name),
+        Arc::clone(&name),
+        CsMeta {
+            stale_at: far_future(),
+        },
+    ));
     let interest = interest_for("/ndn/hit");
     g.throughput(Throughput::Elements(1));
     g.bench_function("get_hit", |b| {
@@ -93,7 +107,13 @@ fn bench_get_can_be_prefix(g: &mut BenchmarkGroup<criterion::measurement::WallTi
     let rt = rt();
     let cs = LruCs::new(1 << 20);
     let name: Arc<Name> = Arc::new("/ndn/prefix/data".parse().unwrap());
-    rt.block_on(cs.insert(data_wire(&name), Arc::clone(&name), CsMeta { stale_at: far_future() }));
+    rt.block_on(cs.insert(
+        data_wire(&name),
+        Arc::clone(&name),
+        CsMeta {
+            stale_at: far_future(),
+        },
+    ));
     use ndn_packet::encode::InterestBuilder;
     let wire = InterestBuilder::new("/ndn/prefix").can_be_prefix().build();
     let interest = ndn_packet::Interest::decode(wire).unwrap();
@@ -114,7 +134,13 @@ fn bench_insert_replace(g: &mut BenchmarkGroup<criterion::measurement::WallTime>
     let rt = rt();
     let cs = LruCs::new(1 << 20);
     let name: Arc<Name> = Arc::new("/ndn/replace".parse().unwrap());
-    rt.block_on(cs.insert(data_wire(&name), Arc::clone(&name), CsMeta { stale_at: far_future() }));
+    rt.block_on(cs.insert(
+        data_wire(&name),
+        Arc::clone(&name),
+        CsMeta {
+            stale_at: far_future(),
+        },
+    ));
     g.throughput(Throughput::Elements(1));
     g.bench_function("insert_replace", |b| {
         b.iter(|| {
@@ -122,7 +148,9 @@ fn bench_insert_replace(g: &mut BenchmarkGroup<criterion::measurement::WallTime>
             let result = rt.block_on(cs.insert(
                 wire,
                 Arc::clone(&name),
-                CsMeta { stale_at: far_future() },
+                CsMeta {
+                    stale_at: far_future(),
+                },
             ));
             debug_assert_eq!(result, InsertResult::Replaced);
             result
@@ -143,7 +171,13 @@ fn bench_insert_new(g: &mut BenchmarkGroup<criterion::measurement::WallTime>) {
             let i = COUNTER.fetch_add(1, Ordering::Relaxed);
             let name: Arc<Name> = Arc::new(format!("/ndn/new/{i}").parse().unwrap());
             let wire = data_wire(&name);
-            let result = rt.block_on(cs.insert(wire, name, CsMeta { stale_at: far_future() }));
+            let result = rt.block_on(cs.insert(
+                wire,
+                name,
+                CsMeta {
+                    stale_at: far_future(),
+                },
+            ));
             debug_assert_eq!(result, InsertResult::Inserted);
             result
         });
@@ -160,7 +194,13 @@ fn bench_evict(g: &mut BenchmarkGroup<criterion::measurement::WallTime>) {
         b.iter_batched(
             || {
                 let name: Arc<Name> = Arc::new("/ndn/evict".parse().unwrap());
-                rt.block_on(cs.insert(data_wire(&name), name, CsMeta { stale_at: far_future() }));
+                rt.block_on(cs.insert(
+                    data_wire(&name),
+                    name,
+                    CsMeta {
+                        stale_at: far_future(),
+                    },
+                ));
                 let evict_name: Name = "/ndn/evict".parse().unwrap();
                 evict_name
             },
@@ -187,7 +227,13 @@ fn bench_evict_prefix(g: &mut BenchmarkGroup<criterion::measurement::WallTime>) 
             || {
                 for i in 0..100u64 {
                     let name: Arc<Name> = Arc::new(format!("/a/b/{i}").parse().unwrap());
-                    rt.block_on(cs.insert(data_wire(&name), name, CsMeta { stale_at: far_future() }));
+                    rt.block_on(cs.insert(
+                        data_wire(&name),
+                        name,
+                        CsMeta {
+                            stale_at: far_future(),
+                        },
+                    ));
                 }
             },
             |_| rt.block_on(cs.evict_prefix(&prefix, None)),

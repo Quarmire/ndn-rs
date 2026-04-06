@@ -80,7 +80,10 @@ pub fn parse_raw_interest(raw: &Bytes) -> Option<RawInterest> {
             _ => {}
         }
     }
-    Some(RawInterest { name: name?, app_params })
+    Some(RawInterest {
+        name: name?,
+        app_params,
+    })
 }
 
 /// Parse Data name and Content from raw wire bytes.
@@ -110,7 +113,10 @@ pub fn parse_raw_data(raw: &Bytes) -> Option<RawData> {
             _ => {}
         }
     }
-    Some(RawData { name: name?, content })
+    Some(RawData {
+        name: name?,
+        content,
+    })
 }
 
 /// If `raw` is an LP-framed packet (`0x64`), extract and return the inner

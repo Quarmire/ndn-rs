@@ -36,8 +36,8 @@ use std::collections::HashMap;
 use std::str::FromStr;
 
 use anyhow::{Result, bail};
-use ndn_engine::builder::{EngineBuilder, EngineConfig};
 use ndn_engine::ForwarderEngine;
+use ndn_engine::builder::{EngineBuilder, EngineConfig};
 use ndn_engine::engine::ShutdownHandle;
 use ndn_packet::Name;
 use ndn_transport::FaceId;
@@ -176,7 +176,9 @@ impl Simulation {
         for route in &self.routes {
             let face_id = face_map.get(&(route.node, route.nexthop_node));
             if let Some(&fid) = face_id {
-                engines[route.node.0].fib().add_nexthop(&route.prefix, fid, 10);
+                engines[route.node.0]
+                    .fib()
+                    .add_nexthop(&route.prefix, fid, 10);
                 info!(
                     node = route.node.0, prefix = %route.prefix, face = %fid,
                     "Simulation: route installed"
@@ -184,7 +186,9 @@ impl Simulation {
             } else {
                 bail!(
                     "no link between {} and {} for route {}",
-                    route.node, route.nexthop_node, route.prefix
+                    route.node,
+                    route.nexthop_node,
+                    route.prefix
                 );
             }
         }

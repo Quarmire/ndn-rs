@@ -196,7 +196,10 @@ impl Name {
     /// Append a segment number component (type `0x32`, big-endian encoding with
     /// leading zeros stripped per NDN naming conventions).
     pub fn append_segment(self, seg: u64) -> Self {
-        self.append_component(NameComponent::new(tlv_type::SEGMENT, encode_nonnegtive_integer(seg)))
+        self.append_component(NameComponent::new(
+            tlv_type::SEGMENT,
+            encode_nonnegtive_integer(seg),
+        ))
     }
 
     /// Append a Version component (type 0x36).

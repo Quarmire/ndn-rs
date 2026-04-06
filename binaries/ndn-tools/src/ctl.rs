@@ -529,7 +529,9 @@ fn build_legacy_request(cmd: &Command) -> ManagementRequest {
             },
             RouteAction::List => ManagementRequest::ListRoutes,
         },
-        Command::Face { action: FaceAction::List } => ManagementRequest::ListFaces,
+        Command::Face {
+            action: FaceAction::List,
+        } => ManagementRequest::ListFaces,
         // These commands have no legacy equivalent — fall back to stats.
         Command::Face { .. } => ManagementRequest::GetStats,
         Command::Status => ManagementRequest::GetStats,
@@ -554,10 +556,7 @@ fn run_security(action: &SecurityAction) -> anyhow::Result<()> {
             if generated {
                 println!("Generated new identity: {name}");
                 println!("  PIB: {}", pib_path.display());
-                println!(
-                    "  Trust anchors: {}",
-                    mgr.trust_anchor_names().len()
-                );
+                println!("  Trust anchors: {}", mgr.trust_anchor_names().len());
             } else {
                 println!("Identity already exists, loaded from PIB");
                 println!("  PIB: {}", pib_path.display());
@@ -566,9 +565,8 @@ fn run_security(action: &SecurityAction) -> anyhow::Result<()> {
 
         SecurityAction::Trust { cert_file, pib } => {
             let pib_path = expand_tilde(pib);
-            let pib = FilePib::open(&pib_path).map_err(|e| {
-                anyhow::anyhow!("Cannot open PIB at '{}': {e}", pib_path.display())
-            })?;
+            let pib = FilePib::open(&pib_path)
+                .map_err(|e| anyhow::anyhow!("Cannot open PIB at '{}': {e}", pib_path.display()))?;
             let data = std::fs::read(cert_file)
                 .map_err(|e| anyhow::anyhow!("Cannot read '{cert_file}': {e}"))?;
             // The NDNC file contains the cert; we need a name to associate it.
@@ -588,20 +586,17 @@ fn run_security(action: &SecurityAction) -> anyhow::Result<()> {
                 stem.parse()
                     .map_err(|e| anyhow::anyhow!("bad name from filename: {e}"))?
             };
-            let cert = ndn_security::pib::decode_cert(
-                std::sync::Arc::new(cert_name.clone()),
-                &data,
-            )
-            .map_err(|e| anyhow::anyhow!("Invalid certificate file: {e}"))?;
+            let cert =
+                ndn_security::pib::decode_cert(std::sync::Arc::new(cert_name.clone()), &data)
+                    .map_err(|e| anyhow::anyhow!("Invalid certificate file: {e}"))?;
             pib.add_trust_anchor(&cert_name, &cert)?;
             println!("Added trust anchor from '{cert_file}'");
         }
 
         SecurityAction::Export { name, output, pib } => {
             let pib_path = expand_tilde(pib);
-            let pib = FilePib::open(&pib_path).map_err(|e| {
-                anyhow::anyhow!("Cannot open PIB at '{}': {e}", pib_path.display())
-            })?;
+            let pib = FilePib::open(&pib_path)
+                .map_err(|e| anyhow::anyhow!("Cannot open PIB at '{}': {e}", pib_path.display()))?;
             let key_name = if let Some(n) = name {
                 n.parse()
                     .map_err(|e| anyhow::anyhow!("bad key name: {e}"))?
@@ -627,9 +622,8 @@ fn run_security(action: &SecurityAction) -> anyhow::Result<()> {
 
         SecurityAction::Info { pib } => {
             let pib_path = expand_tilde(pib);
-            let pib = FilePib::open(&pib_path).map_err(|e| {
-                anyhow::anyhow!("Cannot open PIB at '{}': {e}", pib_path.display())
-            })?;
+            let pib = FilePib::open(&pib_path)
+                .map_err(|e| anyhow::anyhow!("Cannot open PIB at '{}': {e}", pib_path.display()))?;
             let keys = pib.list_keys()?;
             let anchors = pib.list_anchors()?;
 

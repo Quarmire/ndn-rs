@@ -41,12 +41,16 @@ impl InboundMeta {
 
     /// Metadata carrying an Ethernet source MAC.
     pub fn ether(mac: MacAddr) -> Self {
-        Self { source: Some(LinkAddr::Ether(mac)) }
+        Self {
+            source: Some(LinkAddr::Ether(mac)),
+        }
     }
 
     /// Metadata carrying a UDP source address.
     pub fn udp(addr: SocketAddr) -> Self {
-        Self { source: Some(LinkAddr::Udp(addr)) }
+        Self {
+            source: Some(LinkAddr::Udp(addr)),
+        }
     }
 }
 

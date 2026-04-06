@@ -123,8 +123,8 @@ pub fn get_iface_mac(iface: &str) -> std::io::Result<MacAddr> {
             ""
         };
 
-        let matched = adapter_name.eq_ignore_ascii_case(target_guid)
-            || wide_eq(a.FriendlyName, iface);
+        let matched =
+            adapter_name.eq_ignore_ascii_case(target_guid) || wide_eq(a.FriendlyName, iface);
 
         if matched && a.PhysicalAddressLength >= 6 {
             let p = &a.PhysicalAddress;
@@ -287,8 +287,7 @@ fn recv_loop(mut cap: Capture<pcap::Active>, tx: mpsc::Sender<(Bytes, MacAddr)>)
                 if data.len() < ETHER_HEADER_LEN {
                     continue;
                 }
-                let src_mac =
-                    MacAddr([data[6], data[7], data[8], data[9], data[10], data[11]]);
+                let src_mac = MacAddr([data[6], data[7], data[8], data[9], data[10], data[11]]);
                 let payload = Bytes::copy_from_slice(&data[ETHER_HEADER_LEN..]);
                 if tx.blocking_send((payload, src_mac)).is_err() {
                     break;

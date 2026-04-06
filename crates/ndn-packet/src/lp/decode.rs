@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 use bytes::Bytes;
 use ndn_tlv::TlvReader;
 
-use super::{decode_be_u64, CachePolicyType};
+use super::{CachePolicyType, decode_be_u64};
 use crate::nack::NackReason;
 use crate::tlv_type;
 
@@ -202,8 +202,8 @@ mod tests {
     use super::*;
     use crate::encode::encode_interest;
     use crate::lp::{
-        encode_lp_acks, encode_lp_nack, encode_lp_packet, encode_lp_reliable,
-        encode_lp_with_headers, is_lp_packet, nni, LpHeaders,
+        LpHeaders, encode_lp_acks, encode_lp_nack, encode_lp_packet, encode_lp_reliable,
+        encode_lp_with_headers, is_lp_packet, nni,
     };
     use crate::{Interest, Name, NameComponent};
     use bytes::Bytes;

@@ -16,19 +16,19 @@ use ndn_tlv::TlvWriter;
 use ndn_transport::FaceId;
 use tracing::{debug, info, trace};
 
-use crate::{
-    DiffEntry, DiscoveryContext, DiscoveryProtocol, HelloPayload, InboundMeta,
-    NeighborDiff, NeighborEntry, NeighborState, NeighborUpdate, ProtocolId,
-};
 use crate::config::PrefixAnnouncementMode;
-use crate::link_medium::{HelloCore, LinkMedium, HELLO_PREFIX_DEPTH, MAX_DIFF_ENTRIES};
+use crate::link_medium::{HELLO_PREFIX_DEPTH, HelloCore, LinkMedium, MAX_DIFF_ENTRIES};
 use crate::probe::{
-    build_direct_probe, build_indirect_probe, build_probe_ack,
-    is_probe_ack, parse_direct_probe, parse_indirect_probe,
+    build_direct_probe, build_indirect_probe, build_probe_ack, is_probe_ack, parse_direct_probe,
+    parse_indirect_probe,
 };
 use crate::scope::{probe_direct, probe_via};
 use crate::strategy::{ProbeRequest, TriggerEvent};
 use crate::wire::{parse_raw_data, parse_raw_interest, write_nni};
+use crate::{
+    DiffEntry, DiscoveryContext, DiscoveryProtocol, HelloPayload, InboundMeta, NeighborDiff,
+    NeighborEntry, NeighborState, NeighborUpdate, ProtocolId,
+};
 
 /// Generic neighbor discovery protocol over any [`LinkMedium`].
 ///
@@ -53,10 +53,14 @@ impl<T: LinkMedium> HelloProtocol<T> {
     }
 
     /// Access the shared core state.
-    pub fn core(&self) -> &HelloCore { &self.core }
+    pub fn core(&self) -> &HelloCore {
+        &self.core
+    }
 
     /// Access the link medium.
-    pub fn medium(&self) -> &T { &self.medium }
+    pub fn medium(&self) -> &T {
+        &self.medium
+    }
 
     /// Set the prefixes this node serves (announced in Hello Data when InHello mode).
     pub fn set_served_prefixes(&self, prefixes: Vec<Name>) {
@@ -75,8 +79,13 @@ impl<T: LinkMedium> HelloProtocol<T> {
                 w.write_tlv(tlv_type::NAME_COMPONENT, &nonce.to_be_bytes());
             });
             w.write_tlv(tlv_type::NONCE, &nonce.to_be_bytes());
-            let lifetime_ms =
-                self.core.config.hello_interval_base.as_millis().min(u32::MAX as u128) as u64 * 2;
+            let lifetime_ms = self
+                .core
+                .config
+                .hello_interval_base
+                .as_millis()
+                .min(u32::MAX as u128) as u64
+                * 2;
             write_nni(w, tlv_type::INTEREST_LIFETIME, lifetime_ms);
         });
         w.finish()
@@ -149,11 +158,13 @@ impl<T: LinkMedium> HelloProtocol<T> {
         };
 
         // Link-specific: verify signature, extract address, create face.
-        let (responder_name, peer_face_id) =
-            match self.medium.verify_and_ensure_peer(raw, &payload, meta, &self.core, ctx) {
-                Some(result) => result,
-                None => return true,
-            };
+        let (responder_name, peer_face_id) = match self
+            .medium
+            .verify_and_ensure_peer(raw, &payload, meta, &self.core, ctx)
+        {
+            Some(result) => result,
+            None => return true,
+        };
 
         // Update neighbor to Established.
         ctx.update_neighbor(NeighborUpdate::SetState {
@@ -180,7 +191,10 @@ impl<T: LinkMedium> HelloProtocol<T> {
         {
             for prefix in &payload.served_prefixes {
                 ctx.add_fib_entry(prefix, face_id, 10, self.medium.protocol_id());
-                debug!("{}: auto-FIB {prefix:?} via {face_id:?}", self.medium.protocol_id());
+                debug!(
+                    "{}: auto-FIB {prefix:?} via {face_id:?}",
+                    self.medium.protocol_id()
+                );
             }
         }
 
@@ -420,7 +434,9 @@ impl<T: LinkMedium> DiscoveryProtocol for HelloProtocol<T> {
             }
             Some(&0x06) => {
                 if self.core.config.swim_indirect_fanout > 0 && is_probe_ack(raw) {
-                    return self.handle_probe_ack(raw, incoming_face, ctx).unwrap_or(false);
+                    return self
+                        .handle_probe_ack(raw, incoming_face, ctx)
+                        .unwrap_or(false);
                 }
                 self.handle_hello_data(raw, incoming_face, meta, ctx)
             }
@@ -503,8 +519,7 @@ impl<T: LinkMedium> DiscoveryProtocol for HelloProtocol<T> {
                                 .take(gossip_k)
                                 .collect();
                             for face_id in peers {
-                                let nonce =
-                                    self.core.nonce_counter.fetch_add(1, Ordering::Relaxed);
+                                let nonce = self.core.nonce_counter.fetch_add(1, Ordering::Relaxed);
                                 ctx.send_on(face_id, self.build_hello_interest(nonce));
                                 self.core
                                     .state

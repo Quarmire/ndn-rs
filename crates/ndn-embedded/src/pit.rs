@@ -42,7 +42,9 @@ pub struct Pit<const N: usize> {
 impl<const N: usize> Pit<N> {
     /// Creates an empty PIT.
     pub const fn new() -> Self {
-        Self { entries: Vec::new() }
+        Self {
+            entries: Vec::new(),
+        }
     }
 
     /// Inserts a new PIT entry.
@@ -133,7 +135,13 @@ mod tests {
     use super::*;
 
     fn entry(hash: u64, nonce: u32, incoming: FaceId) -> PitEntry {
-        PitEntry { name_hash: hash, incoming_face: incoming, nonce, created_ms: 0, lifetime_ms: 4000 }
+        PitEntry {
+            name_hash: hash,
+            incoming_face: incoming,
+            nonce,
+            created_ms: 0,
+            lifetime_ms: 4000,
+        }
     }
 
     #[test]

@@ -64,12 +64,7 @@ impl Face for SimFace {
     }
 
     async fn recv(&self) -> Result<Bytes, FaceError> {
-        self.rx
-            .lock()
-            .await
-            .recv()
-            .await
-            .ok_or(FaceError::Closed)
+        self.rx.lock().await.recv().await.ok_or(FaceError::Closed)
     }
 
     async fn send(&self, pkt: Bytes) -> Result<(), FaceError> {

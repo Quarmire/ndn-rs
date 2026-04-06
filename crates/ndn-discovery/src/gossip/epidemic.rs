@@ -93,7 +93,11 @@ impl EpidemicGossip {
             last_subscribe: None,
             last_publish: None,
         };
-        Self { config, claimed, state: Mutex::new(state) }
+        Self {
+            config,
+            claimed,
+            state: Mutex::new(state),
+        }
     }
 
     // ─── helpers ──────────────────────────────────────────────────────────────
@@ -137,7 +141,8 @@ impl EpidemicGossip {
         while !r.is_empty() {
             if let Ok((typ, val)) = r.read_tlv() {
                 if typ == ndn_packet::tlv_type::NAME
-                    && let Ok(name) = Name::decode(val) {
+                    && let Ok(name) = Name::decode(val)
+                {
                     names.push(name);
                 }
             } else {
@@ -175,11 +180,7 @@ impl EpidemicGossip {
     }
 
     /// Handle an incoming gossip Interest and respond with local snapshot.
-    fn handle_gossip_interest(
-        &self,
-        incoming_face: FaceId,
-        ctx: &dyn DiscoveryContext,
-    ) {
+    fn handle_gossip_interest(&self, incoming_face: FaceId, ctx: &dyn DiscoveryContext) {
         let wire = {
             let st = self.state.lock().unwrap();
             st.local_gossip_data.clone()
@@ -216,7 +217,10 @@ impl EpidemicGossip {
                 trace!(peer=%name, "epidemic-gossip: inserting Probing entry from gossip");
                 ctx.update_neighbor(NeighborUpdate::Upsert(NeighborEntry {
                     node_name: name,
-                    state: NeighborState::Probing { attempts: 0, last_probe: Instant::now() },
+                    state: NeighborState::Probing {
+                        attempts: 0,
+                        last_probe: Instant::now(),
+                    },
                     faces: Vec::new(),
                     rtt_us: None,
                     pending_nonce: None,
@@ -227,9 +231,13 @@ impl EpidemicGossip {
 }
 
 impl DiscoveryProtocol for EpidemicGossip {
-    fn protocol_id(&self) -> ProtocolId { PROTOCOL }
+    fn protocol_id(&self) -> ProtocolId {
+        PROTOCOL
+    }
 
-    fn claimed_prefixes(&self) -> &[Name] { &self.claimed }
+    fn claimed_prefixes(&self) -> &[Name] {
+        &self.claimed
+    }
 
     fn on_face_up(&self, _face_id: FaceId, _ctx: &dyn DiscoveryContext) {}
 

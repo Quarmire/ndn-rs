@@ -96,9 +96,9 @@ mod tests {
     use crate::config::{DiscoveryConfig, DiscoveryProfile};
 
     fn mobile_sched() -> ReactiveScheduler {
-        ReactiveScheduler::from_discovery_config(
-            &DiscoveryConfig::for_profile(&DiscoveryProfile::Mobile),
-        )
+        ReactiveScheduler::from_discovery_config(&DiscoveryConfig::for_profile(
+            &DiscoveryProfile::Mobile,
+        ))
     }
 
     #[test]

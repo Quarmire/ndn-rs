@@ -126,7 +126,12 @@ mod tests {
         let enc_len = encode(input, &mut encoded).expect("encode");
         let mut decoded = [0u8; 512];
         let dec_len = decode(&encoded[..enc_len], &mut decoded).expect("decode");
-        assert_eq!(&decoded[..dec_len], input, "roundtrip mismatch for {:?}", input);
+        assert_eq!(
+            &decoded[..dec_len],
+            input,
+            "roundtrip mismatch for {:?}",
+            input
+        );
     }
 
     #[test]

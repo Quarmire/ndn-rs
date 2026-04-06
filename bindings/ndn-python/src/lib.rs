@@ -153,10 +153,7 @@ impl Consumer {
     /// RuntimeError
     ///     On timeout, Nack, or connection error.
     fn get(&mut self, name: &str) -> PyResult<Vec<u8>> {
-        self.inner
-            .get(name)
-            .map(|b| b.to_vec())
-            .map_err(to_py_err)
+        self.inner.get(name).map(|b| b.to_vec()).map_err(to_py_err)
     }
 
     /// Fetch a full :class:`Data` packet for a name.

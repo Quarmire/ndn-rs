@@ -240,7 +240,9 @@ impl DiscoveryConfig {
 }
 
 impl Default for DiscoveryConfig {
-    fn default() -> Self { Self::lan() }
+    fn default() -> Self {
+        Self::lan()
+    }
 }
 
 // ─── DiscoveryProfile ─────────────────────────────────────────────────────────
@@ -264,7 +266,6 @@ pub enum DiscoveryProfile {
     /// Fully custom parameters.
     Custom(DiscoveryConfig),
 }
-
 
 // ─── ServiceDiscoveryConfig ───────────────────────────────────────────────────
 

@@ -35,7 +35,9 @@ pub struct Fib<const N: usize> {
 impl<const N: usize> Fib<N> {
     /// Creates an empty FIB.
     pub const fn new() -> Self {
-        Self { entries: Vec::new() }
+        Self {
+            entries: Vec::new(),
+        }
     }
 
     /// Adds a route.
@@ -89,7 +91,8 @@ impl<const N: usize> Fib<N> {
 
     /// Removes a route by prefix hash and length.
     pub fn remove(&mut self, prefix_hash: u64, prefix_len: u8) {
-        self.entries.retain(|e| !(e.prefix_hash == prefix_hash && e.prefix_len == prefix_len));
+        self.entries
+            .retain(|e| !(e.prefix_hash == prefix_hash && e.prefix_len == prefix_len));
     }
 
     /// Longest-prefix match against the name components supplied as raw TLV slices.
@@ -202,7 +205,12 @@ mod tests {
     fn default_route() {
         let mut fib = Fib::<4>::new();
         // A zero-length prefix acts as a default route.
-        fib.add(FibEntry { prefix_hash: prefix_hash(&[]), prefix_len: 0, nexthop: 3, cost: 0 });
+        fib.add(FibEntry {
+            prefix_hash: prefix_hash(&[]),
+            prefix_len: 0,
+            nexthop: 3,
+            cost: 0,
+        });
 
         let result = fib.lookup(&[b"anything"]);
         assert_eq!(result, Some(3));

@@ -361,7 +361,12 @@ async fn dispatch_command(
     source_face: Option<FaceId>,
     ctx: DispatchCtx<'_>,
 ) -> ControlResponse {
-    let DispatchCtx { engine, cancel, discovery_sd, discovery_claimed } = ctx;
+    let DispatchCtx {
+        engine,
+        cancel,
+        discovery_sd,
+        discovery_claimed,
+    } = ctx;
     match module_name {
         m if m == module::RIB => handle_rib(verb_name, params, source_face, engine),
         m if m == module::FACES => handle_faces(verb_name, params, source_face, engine).await,
@@ -369,9 +374,14 @@ async fn dispatch_command(
         m if m == module::STRATEGY => handle_strategy(verb_name, params, engine),
         m if m == module::CS => handle_cs(verb_name, params, engine).await,
         m if m == module::NEIGHBORS => handle_neighbors(verb_name, engine),
-        m if m == module::SERVICE => {
-            handle_service(verb_name, params, engine, source_face, discovery_sd, discovery_claimed)
-        }
+        m if m == module::SERVICE => handle_service(
+            verb_name,
+            params,
+            engine,
+            source_face,
+            discovery_sd,
+            discovery_claimed,
+        ),
         m if m == module::STATUS => handle_status(verb_name, engine, cancel),
         _ => ControlResponse::error(status::NOT_FOUND, "unknown module"),
     }
@@ -1024,7 +1034,10 @@ fn neighbors_list(engine: &ForwarderEngine) -> ControlResponse {
                 let age_s = last_seen.elapsed().as_secs_f64();
                 format!("state=Established  last_seen={:.1}s ago", age_s)
             }
-            NeighborState::Stale { miss_count, last_seen } => {
+            NeighborState::Stale {
+                miss_count,
+                last_seen,
+            } => {
                 let age_s = last_seen.elapsed().as_secs_f64();
                 format!(
                     "state=Stale  miss={}  last_seen={:.1}s ago",
@@ -1064,15 +1077,12 @@ fn handle_service(
     let sd = match discovery_sd {
         Some(s) => s,
         None => {
-            return ControlResponse::error(
-                status::NOT_FOUND,
-                "service discovery is not enabled",
-            );
+            return ControlResponse::error(status::NOT_FOUND, "service discovery is not enabled");
         }
     };
     match verb_name {
-        v if v == verb::LIST    => service_list(sd),
-        v if v == verb::BROWSE  => service_browse(params, sd),
+        v if v == verb::LIST => service_list(sd),
+        v if v == verb::BROWSE => service_browse(params, sd),
         v if v == verb::ANNOUNCE => {
             service_announce(params, sd, engine, source_face, discovery_claimed)
         }
@@ -1166,14 +1176,13 @@ fn service_announce(
     // If no FIB route exists for the prefix yet, publish permanently and let
     // the operator call service/withdraw manually.
     let record = ServiceRecord::new(prefix.clone(), node_name);
-    let owner_face = engine.fib().lpm(&prefix)
-        .and_then(|e| {
-            // Prefer a non-management nexthop (the app's data face).
-            e.nexthops_excluding(source_face.unwrap_or(FaceId(u32::MAX)))
-                .into_iter()
-                .next()
-                .map(|nh| nh.face_id)
-        });
+    let owner_face = engine.fib().lpm(&prefix).and_then(|e| {
+        // Prefer a non-management nexthop (the app's data face).
+        e.nexthops_excluding(source_face.unwrap_or(FaceId(u32::MAX)))
+            .into_iter()
+            .next()
+            .map(|nh| nh.face_id)
+    });
 
     if let Some(face) = owner_face {
         sd.publish_with_owner(record, face);
@@ -1247,8 +1256,12 @@ fn resolve_face_id(
 ) -> Result<FaceId, Box<ControlResponse>> {
     match params.face_id {
         Some(id) => Ok(FaceId(id as u32)),
-        None => source_face
-            .ok_or_else(|| Box::new(ControlResponse::error(status::BAD_PARAMS, "cannot determine FaceId"))),
+        None => source_face.ok_or_else(|| {
+            Box::new(ControlResponse::error(
+                status::BAD_PARAMS,
+                "cannot determine FaceId",
+            ))
+        }),
     }
 }
 

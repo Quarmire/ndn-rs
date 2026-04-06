@@ -102,10 +102,7 @@ impl ServiceDiscoveryProtocol {
         // Claimed prefixes: sd/services for service records, nd/peers for the
         // demand-driven neighbor list.  The nd/peers prefix is under nd_root,
         // not hello_prefix, so it doesn't conflict with hello traffic.
-        let claimed = vec![
-            sd_services().clone(),
-            peers_prefix().clone(),
-        ];
+        let claimed = vec![sd_services().clone(), peers_prefix().clone()];
         Self {
             node_name,
             config,
@@ -128,9 +125,13 @@ impl ServiceDiscoveryProtocol {
 // ── DiscoveryProtocol impl ────────────────────────────────────────────────────
 
 impl DiscoveryProtocol for ServiceDiscoveryProtocol {
-    fn protocol_id(&self) -> ProtocolId { PROTOCOL }
+    fn protocol_id(&self) -> ProtocolId {
+        PROTOCOL
+    }
 
-    fn claimed_prefixes(&self) -> &[Name] { &self.claimed }
+    fn claimed_prefixes(&self) -> &[Name] {
+        &self.claimed
+    }
 
     fn on_face_up(&self, _face_id: FaceId, _ctx: &dyn DiscoveryContext) {
         // Browse is driven by on_tick() against the neighbor table, not here.
@@ -154,7 +155,9 @@ impl DiscoveryProtocol for ServiceDiscoveryProtocol {
         }
 
         // Find which neighbors were reachable via this face.
-        let affected: Vec<Name> = ctx.neighbors().all()
+        let affected: Vec<Name> = ctx
+            .neighbors()
+            .all()
             .into_iter()
             .filter(|e| e.faces.iter().any(|(fid, _, _)| *fid == face_id))
             .map(|e| e.node_name.clone())
@@ -252,11 +255,13 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::wire::write_name_tlv;
     use crate::{MacAddr, NeighborTable};
     use ndn_tlv::TlvWriter;
-    use crate::wire::write_name_tlv;
 
-    fn name(s: &str) -> Name { Name::from_str(s).unwrap() }
+    fn name(s: &str) -> Name {
+        Name::from_str(s).unwrap()
+    }
 
     fn make_sd() -> ServiceDiscoveryProtocol {
         ServiceDiscoveryProtocol::with_defaults(name("/ndn/test/node"))
@@ -309,8 +314,12 @@ mod tests {
         let mut w = TlvWriter::new();
         let n1 = name("/ndn/test/peer1");
         let n2 = name("/ndn/test/peer2");
-        w.write_nested(0xE0, |w: &mut TlvWriter| { write_name_tlv(w, &n1); });
-        w.write_nested(0xE0, |w: &mut TlvWriter| { write_name_tlv(w, &n2); });
+        w.write_nested(0xE0, |w: &mut TlvWriter| {
+            write_name_tlv(w, &n1);
+        });
+        w.write_nested(0xE0, |w: &mut TlvWriter| {
+            write_name_tlv(w, &n2);
+        });
         let content = w.finish();
         let decoded = decode_peer_list(&content);
         assert_eq!(decoded.len(), 2);
@@ -327,18 +336,26 @@ mod tests {
             removed: StdMutex<Vec<Name>>,
         }
         impl DiscoveryContext for TrackCtx {
-            fn alloc_face_id(&self) -> FaceId { FaceId(0) }
-            fn add_face(&self, _: Arc<dyn ndn_transport::ErasedFace>) -> FaceId { FaceId(0) }
+            fn alloc_face_id(&self) -> FaceId {
+                FaceId(0)
+            }
+            fn add_face(&self, _: Arc<dyn ndn_transport::ErasedFace>) -> FaceId {
+                FaceId(0)
+            }
             fn remove_face(&self, _: FaceId) {}
             fn add_fib_entry(&self, _: &Name, _: FaceId, _: u32, _: ProtocolId) {}
             fn remove_fib_entry(&self, prefix: &Name, _: FaceId, _: ProtocolId) {
                 self.removed.lock().unwrap().push(prefix.clone());
             }
             fn remove_fib_entries_by_owner(&self, _: ProtocolId) {}
-            fn neighbors(&self) -> Arc<dyn NeighborTableView> { NeighborTable::new() }
+            fn neighbors(&self) -> Arc<dyn NeighborTableView> {
+                NeighborTable::new()
+            }
             fn update_neighbor(&self, _: NeighborUpdate) {}
             fn send_on(&self, _: FaceId, _: Bytes) {}
-            fn now(&self) -> Instant { self.now }
+            fn now(&self) -> Instant {
+                self.now
+            }
         }
 
         let sd = make_sd();
@@ -369,7 +386,9 @@ mod tests {
     #[test]
     fn relay_records_sends_to_other_peers() {
         use crate::context::DiscoveryContext;
-        use crate::{NeighborTableView, NeighborUpdate, NeighborEntry, NeighborState, NeighborTable};
+        use crate::{
+            NeighborEntry, NeighborState, NeighborTable, NeighborTableView, NeighborUpdate,
+        };
         use std::sync::{Arc, Mutex as StdMutex};
 
         struct RelayCtx {
@@ -377,18 +396,28 @@ mod tests {
             sent: StdMutex<Vec<(FaceId, Bytes)>>,
         }
         impl DiscoveryContext for RelayCtx {
-            fn alloc_face_id(&self) -> FaceId { FaceId(99) }
-            fn add_face(&self, _: Arc<dyn ndn_transport::ErasedFace>) -> FaceId { FaceId(99) }
+            fn alloc_face_id(&self) -> FaceId {
+                FaceId(99)
+            }
+            fn add_face(&self, _: Arc<dyn ndn_transport::ErasedFace>) -> FaceId {
+                FaceId(99)
+            }
             fn remove_face(&self, _: FaceId) {}
             fn add_fib_entry(&self, _: &Name, _: FaceId, _: u32, _: ProtocolId) {}
             fn remove_fib_entry(&self, _: &Name, _: FaceId, _: ProtocolId) {}
             fn remove_fib_entries_by_owner(&self, _: ProtocolId) {}
-            fn neighbors(&self) -> Arc<dyn NeighborTableView> { Arc::clone(&self.neighbors) as Arc<dyn NeighborTableView> }
-            fn update_neighbor(&self, u: NeighborUpdate) { self.neighbors.apply(u); }
+            fn neighbors(&self) -> Arc<dyn NeighborTableView> {
+                Arc::clone(&self.neighbors) as Arc<dyn NeighborTableView>
+            }
+            fn update_neighbor(&self, u: NeighborUpdate) {
+                self.neighbors.apply(u);
+            }
             fn send_on(&self, face_id: FaceId, pkt: Bytes) {
                 self.sent.lock().unwrap().push((face_id, pkt));
             }
-            fn now(&self) -> Instant { Instant::now() }
+            fn now(&self) -> Instant {
+                Instant::now()
+            }
         }
 
         let mut cfg = ServiceDiscoveryConfig::default();
@@ -399,25 +428,43 @@ mod tests {
         let neighbors = NeighborTable::new();
         // Add two reachable neighbors with different faces.
         let mut e1 = NeighborEntry::new(name("/ndn/peer/a"));
-        e1.state = NeighborState::Established { last_seen: Instant::now() };
-        e1.faces = vec![(FaceId(10), MacAddr([0u8;6]), "eth0".into())];
+        e1.state = NeighborState::Established {
+            last_seen: Instant::now(),
+        };
+        e1.faces = vec![(FaceId(10), MacAddr([0u8; 6]), "eth0".into())];
         let mut e2 = NeighborEntry::new(name("/ndn/peer/b"));
-        e2.state = NeighborState::Established { last_seen: Instant::now() };
-        e2.faces = vec![(FaceId(20), MacAddr([0u8;6]), "eth0".into())];
+        e2.state = NeighborState::Established {
+            last_seen: Instant::now(),
+        };
+        e2.faces = vec![(FaceId(20), MacAddr([0u8; 6]), "eth0".into())];
         neighbors.apply(NeighborUpdate::Upsert(e1));
         neighbors.apply(NeighborUpdate::Upsert(e2));
 
-        let ctx = RelayCtx { neighbors, sent: StdMutex::new(Vec::new()) };
+        let ctx = RelayCtx {
+            neighbors,
+            sent: StdMutex::new(Vec::new()),
+        };
 
         // Build a valid service record Data packet arriving on face 10.
-        let rec = ServiceRecord { announced_prefix: name("/ndn/sensor/temp"), node_name: name("/ndn/peer/a"), freshness_ms: 10_000, capabilities: 0 };
+        let rec = ServiceRecord {
+            announced_prefix: name("/ndn/sensor/temp"),
+            node_name: name("/ndn/peer/a"),
+            freshness_ms: 10_000,
+            capabilities: 0,
+        };
         let pkt = rec.build_data(1000);
 
         sd.on_inbound(&pkt, FaceId(10), &crate::InboundMeta::none(), &ctx);
 
         let sent = ctx.sent.lock().unwrap();
         // Should relay to face 20 (peer/b), not back to face 10 (source).
-        assert!(sent.iter().any(|(fid, _)| *fid == FaceId(20)), "should relay to peer/b");
-        assert!(!sent.iter().any(|(fid, _)| *fid == FaceId(10)), "must not relay back to source face");
+        assert!(
+            sent.iter().any(|(fid, _)| *fid == FaceId(20)),
+            "should relay to peer/b"
+        );
+        assert!(
+            !sent.iter().any(|(fid, _)| *fid == FaceId(10)),
+            "must not relay back to source face"
+        );
     }
 }

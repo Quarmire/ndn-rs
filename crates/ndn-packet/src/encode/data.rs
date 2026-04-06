@@ -3,8 +3,8 @@ use std::time::Duration;
 use bytes::Bytes;
 use ndn_tlv::TlvWriter;
 
-use crate::{Name, SignatureType, tlv_type};
 use super::{write_name, write_nni};
+use crate::{Name, SignatureType, tlv_type};
 
 // ─── DataBuilder ─────────────────────────────────────────────────────────────
 
@@ -172,8 +172,8 @@ impl DataBuilder {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::tests::{assert_bytes_eq, hex, name};
+    use super::*;
     use crate::Data;
     use bytes::Bytes;
     use std::time::Duration;

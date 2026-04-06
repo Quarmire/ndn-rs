@@ -53,17 +53,15 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args: Vec<String> = std::env::args().collect();
-    let node_name_str = parse_arg(&args, "--name")
-        .unwrap_or_else(|| "/ndn/lan/example-node".to_owned());
-    let prefix_str = parse_arg(&args, "--prefix")
-        .unwrap_or_else(|| "/ndn/app/example".to_owned());
-    let iface_str = parse_arg(&args, "--iface")
-        .unwrap_or_else(|| "0.0.0.0".to_owned());
+    let node_name_str =
+        parse_arg(&args, "--name").unwrap_or_else(|| "/ndn/lan/example-node".to_owned());
+    let prefix_str = parse_arg(&args, "--prefix").unwrap_or_else(|| "/ndn/app/example".to_owned());
+    let iface_str = parse_arg(&args, "--iface").unwrap_or_else(|| "0.0.0.0".to_owned());
 
     let node_name = Name::from_str(&node_name_str)
         .with_context(|| format!("invalid node name: {node_name_str}"))?;
-    let prefix = Name::from_str(&prefix_str)
-        .with_context(|| format!("invalid prefix: {prefix_str}"))?;
+    let prefix =
+        Name::from_str(&prefix_str).with_context(|| format!("invalid prefix: {prefix_str}"))?;
     let iface: Ipv4Addr = iface_str
         .parse()
         .with_context(|| format!("invalid interface address: {iface_str}"))?;
@@ -80,11 +78,7 @@ async fn main() -> anyhow::Result<()> {
     // ── Step 2: build neighbor discovery ─────────────────────────────────────
 
     let disc_config = DiscoveryConfig::for_profile(&DiscoveryProfile::Lan);
-    let nd = UdpNeighborDiscovery::new_multi(
-        vec![mcast_face_id],
-        node_name.clone(),
-        disc_config,
-    );
+    let nd = UdpNeighborDiscovery::new_multi(vec![mcast_face_id], node_name.clone(), disc_config);
 
     // ── Step 3: build service discovery + publish a record ───────────────────
 
@@ -138,7 +132,10 @@ async fn main() -> anyhow::Result<()> {
     let services = sd.local_records();
     info!("{} local service(s):", services.len());
     for s in &services {
-        info!("  prefix={} node={} freshness={}ms", s.announced_prefix, s.node_name, s.freshness_ms);
+        info!(
+            "  prefix={} node={} freshness={}ms",
+            s.announced_prefix, s.node_name, s.freshness_ms
+        );
     }
 
     cancel.cancel();
@@ -146,7 +143,5 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn parse_arg(args: &[String], flag: &str) -> Option<String> {
-    args.windows(2)
-        .find(|w| w[0] == flag)
-        .map(|w| w[1].clone())
+    args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone())
 }

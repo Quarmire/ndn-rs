@@ -11,7 +11,6 @@ use crate::af_packet::{
 };
 use crate::radio::RadioFaceMetadata;
 
-
 // ─── NamedEtherFace ──────────────────────────────────────────────────────────
 
 /// NDN face over raw Ethernet (`AF_PACKET` / Ethertype 0x8624).

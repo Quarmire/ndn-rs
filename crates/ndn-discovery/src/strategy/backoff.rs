@@ -55,8 +55,7 @@ impl BackoffScheduler {
 
 impl NeighborProbeStrategy for BackoffScheduler {
     fn on_tick(&mut self, now: Instant) -> Vec<ProbeRequest> {
-        let fire = self.pending_immediate
-            || self.next_probe_at.map(|t| now >= t).unwrap_or(true);
+        let fire = self.pending_immediate || self.next_probe_at.map(|t| now >= t).unwrap_or(true);
 
         if !fire {
             return Vec::new();
@@ -106,9 +105,9 @@ mod tests {
     use crate::config::{DiscoveryConfig, DiscoveryProfile};
 
     fn lan_sched() -> BackoffScheduler {
-        BackoffScheduler::from_discovery_config(
-            &DiscoveryConfig::for_profile(&DiscoveryProfile::Lan),
-        )
+        BackoffScheduler::from_discovery_config(&DiscoveryConfig::for_profile(
+            &DiscoveryProfile::Lan,
+        ))
     }
 
     #[test]

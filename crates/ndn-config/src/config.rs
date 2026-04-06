@@ -426,7 +426,6 @@ pub struct DiscoveryTomlConfig {
     pub served_prefixes: Vec<String>,
 
     // ── Per-field overrides (supplement the profile defaults) ─────────────
-
     /// Override `hello_interval_base` in milliseconds.
     #[serde(default)]
     pub hello_interval_base_ms: Option<u64>,
@@ -572,10 +571,7 @@ file = "/var/log/ndn/router.log"
         assert!(cfg.security.trust_anchor.is_some());
         assert!(cfg.security.require_signed);
         assert_eq!(cfg.logging.level, "debug");
-        assert_eq!(
-            cfg.logging.file.as_deref(),
-            Some("/var/log/ndn/router.log")
-        );
+        assert_eq!(cfg.logging.file.as_deref(), Some("/var/log/ndn/router.log"));
     }
 
     #[test]

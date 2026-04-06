@@ -40,21 +40,20 @@
 use std::time::Duration;
 
 use bytes::Bytes;
-use ndn_discovery::{
-    DiscoveryConfig, DiscoveryContext, DiscoveryProfile, HelloPayload,
-    HelloProtocol, InboundMeta, LinkAddr, NeighborEntry, NeighborUpdate,
-    ProtocolId,
-};
-use ndn_discovery::link_medium::{HelloCore, HelloState, LinkMedium, HELLO_PREFIX_DEPTH};
+use ndn_discovery::link_medium::{HELLO_PREFIX_DEPTH, HelloCore, HelloState, LinkMedium};
 use ndn_discovery::wire::{parse_raw_data, parse_raw_interest, write_name_tlv, write_nni};
+use ndn_discovery::{
+    DiscoveryConfig, DiscoveryContext, DiscoveryProfile, HelloPayload, HelloProtocol, InboundMeta,
+    LinkAddr, NeighborEntry, NeighborUpdate, ProtocolId,
+};
 use ndn_packet::{Name, tlv_type};
 use ndn_tlv::TlvWriter;
 use ndn_transport::FaceId;
 use tracing::{debug, warn};
 
 use crate::af_packet::MacAddr;
-use crate::radio::RadioFaceMetadata;
 use crate::ether::NamedEtherFace;
+use crate::radio::RadioFaceMetadata;
 
 const PROTOCOL: ProtocolId = ProtocolId("ether-nd");
 
@@ -159,7 +158,9 @@ impl EtherMedium {
         };
 
         if ctx.neighbors().get(peer_name).is_none() {
-            ctx.update_neighbor(NeighborUpdate::Upsert(NeighborEntry::new(peer_name.clone())));
+            ctx.update_neighbor(NeighborUpdate::Upsert(NeighborEntry::new(
+                peer_name.clone(),
+            )));
         }
 
         ctx.update_neighbor(NeighborUpdate::AddFace {
@@ -197,8 +198,12 @@ impl LinkMedium for EtherMedium {
         }
 
         let content = payload.encode();
-        let freshness_ms =
-            core.config.hello_interval_base.as_millis().min(u32::MAX as u128) as u64 * 2;
+        let freshness_ms = core
+            .config
+            .hello_interval_base
+            .as_millis()
+            .min(u32::MAX as u128) as u64
+            * 2;
 
         let mut w = TlvWriter::new();
         w.write_nested(tlv_type::DATA, |w: &mut TlvWriter| {
@@ -246,7 +251,10 @@ impl LinkMedium for EtherMedium {
         };
 
         // Trigger PassiveDetection when a previously-unknown MAC sends a hello.
-        let is_new = ctx.neighbors().face_for_peer(&sender_mac, &self.iface).is_none();
+        let is_new = ctx
+            .neighbors()
+            .face_for_peer(&sender_mac, &self.iface)
+            .is_none();
         if is_new {
             core.strategy
                 .lock()
@@ -257,7 +265,10 @@ impl LinkMedium for EtherMedium {
         let reply = self.build_hello_data(core, name);
         ctx.send_on(self.multicast_face_id, reply);
 
-        debug!("EtherND: received hello Interest from {:?}, sent Data reply", sender_mac);
+        debug!(
+            "EtherND: received hello Interest from {:?}, sent Data reply",
+            sender_mac
+        );
         true
     }
 
@@ -291,12 +302,7 @@ impl LinkMedium for EtherMedium {
         face_id == self.multicast_face_id
     }
 
-    fn on_face_down(
-        &self,
-        _face_id: FaceId,
-        _state: &mut HelloState,
-        _ctx: &dyn DiscoveryContext,
-    ) {
+    fn on_face_down(&self, _face_id: FaceId, _state: &mut HelloState, _ctx: &dyn DiscoveryContext) {
         // Ethernet has no link-specific state to clean up on face down.
     }
 
@@ -310,8 +316,8 @@ impl LinkMedium for EtherMedium {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::str::FromStr;
     use ndn_discovery::wire::parse_raw_data;
+    use std::str::FromStr;
 
     fn make_nd() -> EtherNeighborDiscovery {
         EtherNeighborDiscovery::new(
@@ -342,7 +348,10 @@ mod tests {
         let decoded_nonce = u32::from_be_bytes(last.value[..4].try_into().unwrap());
         assert_eq!(decoded_nonce, nonce);
 
-        assert!(parsed.app_params.is_none(), "Interest must have no AppParams");
+        assert!(
+            parsed.app_params.is_none(),
+            "Interest must have no AppParams"
+        );
     }
 
     #[test]

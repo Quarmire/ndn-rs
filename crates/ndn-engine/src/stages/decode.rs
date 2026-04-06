@@ -83,10 +83,7 @@ impl TlvDecodeStage {
         };
         let fragment = raw.slice(hdr.frag_start..hdr.frag_end);
         let base_seq = hdr.sequence - hdr.frag_index;
-        let mut rb = self
-            .reassembly
-            .entry(face_id)
-            .or_default();
+        let mut rb = self.reassembly.entry(face_id).or_default();
         Ok(rb.process(base_seq, hdr.frag_index, hdr.frag_count, fragment))
     }
 
@@ -219,10 +216,7 @@ impl TlvDecodeStage {
         if is_fragmented {
             let face_id = ctx.face_id;
             let complete = {
-                let mut rb = self
-                    .reassembly
-                    .entry(face_id)
-                    .or_default();
+                let mut rb = self.reassembly.entry(face_id).or_default();
                 let seq = sequence.unwrap_or(0);
                 let idx = frag_index.unwrap_or(0);
                 let base_seq = seq - idx;

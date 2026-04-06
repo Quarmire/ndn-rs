@@ -152,8 +152,14 @@ mod tests {
     async fn bidirectional_delivery() {
         let (face_a, face_b) = SimLink::pair(FaceId(1), FaceId(2), LinkConfig::direct(), 16);
 
-        face_a.send(bytes::Bytes::from_static(b"ping")).await.unwrap();
-        face_b.send(bytes::Bytes::from_static(b"pong")).await.unwrap();
+        face_a
+            .send(bytes::Bytes::from_static(b"ping"))
+            .await
+            .unwrap();
+        face_b
+            .send(bytes::Bytes::from_static(b"pong"))
+            .await
+            .unwrap();
 
         let at_b = face_b.recv().await.unwrap();
         let at_a = face_a.recv().await.unwrap();

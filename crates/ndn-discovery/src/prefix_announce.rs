@@ -164,7 +164,11 @@ impl ServiceRecord {
     pub fn build_data(&self, timestamp_ms: u64) -> Bytes {
         let name = self.make_name(timestamp_ms);
         let content = self.encode();
-        let freshness_period = if self.freshness_ms > 0 { self.freshness_ms } else { 30_000 };
+        let freshness_period = if self.freshness_ms > 0 {
+            self.freshness_ms
+        } else {
+            30_000
+        };
 
         let mut w = TlvWriter::new();
         w.write_nested(tlv_type::DATA, |w: &mut TlvWriter| {
@@ -254,7 +258,8 @@ fn fnv1a_hash_name(name: &Name) -> u64 {
     const OFFSET: u64 = 14695981039346656037;
     const PRIME: u64 = 1099511628211;
     let s = name.to_string();
-    s.bytes().fold(OFFSET, |h, b| (h ^ b as u64).wrapping_mul(PRIME))
+    s.bytes()
+        .fold(OFFSET, |h, b| (h ^ b as u64).wrapping_mul(PRIME))
 }
 
 // ─── TLV encoding helpers ─────────────────────────────────────────────────────
@@ -380,7 +385,9 @@ mod tests {
 
     use super::*;
 
-    fn n(s: &str) -> Name { Name::from_str(s).unwrap() }
+    fn n(s: &str) -> Name {
+        Name::from_str(s).unwrap()
+    }
 
     #[test]
     fn record_encode_decode_roundtrip() {
@@ -402,7 +409,10 @@ mod tests {
     fn make_name_under_sd_services() {
         let rec = ServiceRecord::new(n("/ndn/sensor/temp"), n("/ndn/site/router1"));
         let name = rec.make_name(1_700_000_000_000);
-        assert!(name.has_prefix(sd_services()), "name should be under sd/services");
+        assert!(
+            name.has_prefix(sd_services()),
+            "name should be under sd/services"
+        );
     }
 
     #[test]

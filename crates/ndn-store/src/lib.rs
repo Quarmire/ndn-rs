@@ -42,8 +42,8 @@ pub use content_store::{
 pub use fib::{Fib, FibEntry, FibNexthop};
 #[cfg(any(feature = "fjall", test))]
 pub use fjall_cs::FjallCs;
-pub use observable_cs::{CsEvent, CsObserver, ObservableCs};
 pub use lru_cs::LruCs;
+pub use observable_cs::{CsEvent, CsObserver, ObservableCs};
 pub use pit::{InRecord, OutRecord, Pit, PitEntry, PitToken};
 pub use sharded_cs::ShardedCs;
 pub use strategy_table::StrategyTable;

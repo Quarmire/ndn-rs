@@ -16,7 +16,6 @@
 //!   Disable for `no_std` environments (an allocator is still required).
 
 #![allow(missing_docs)]
-
 // Enable no_std when the `std` feature is disabled.
 // The crate still requires an allocator (for `BytesMut` / `Bytes`).
 #![cfg_attr(not(feature = "std"), no_std)]

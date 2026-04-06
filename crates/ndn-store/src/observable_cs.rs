@@ -1,7 +1,7 @@
 //! Observable content store wrapper with event hooks and atomic counters.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 
@@ -66,10 +66,7 @@ pub struct ObservableCs {
 }
 
 impl ObservableCs {
-    pub fn new(
-        inner: Arc<dyn ErasedContentStore>,
-        observer: Option<Arc<dyn CsObserver>>,
-    ) -> Self {
+    pub fn new(inner: Arc<dyn ErasedContentStore>, observer: Option<Arc<dyn CsObserver>>) -> Self {
         Self {
             inner,
             observer,

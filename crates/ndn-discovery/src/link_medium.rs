@@ -16,12 +16,9 @@ use bytes::Bytes;
 use ndn_packet::Name;
 use ndn_transport::FaceId;
 
-use crate::{
-    DiffEntry, DiscoveryContext, HelloPayload, InboundMeta,
-    NeighborEntry, ProtocolId,
-};
 use crate::config::DiscoveryConfig;
 use crate::strategy::{NeighborProbeStrategy, build_strategy};
+use crate::{DiffEntry, DiscoveryContext, HelloPayload, InboundMeta, NeighborEntry, ProtocolId};
 
 // ─── Shared constants ────────────────────────────────────────────────────────
 
@@ -151,12 +148,7 @@ pub trait LinkMedium: Send + Sync + 'static {
     fn is_multicast_face(&self, face_id: FaceId) -> bool;
 
     /// Handle face-down event (clean up link-specific state).
-    fn on_face_down(
-        &self,
-        face_id: FaceId,
-        state: &mut HelloState,
-        ctx: &dyn DiscoveryContext,
-    );
+    fn on_face_down(&self, face_id: FaceId, state: &mut HelloState, ctx: &dyn DiscoveryContext);
 
     /// Clean up link-specific state when a peer is being removed
     /// (reached miss_limit in the liveness state machine).

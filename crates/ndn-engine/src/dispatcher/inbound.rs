@@ -32,7 +32,15 @@ pub(crate) async fn run_face_reader(
     pit: Arc<ndn_store::Pit>,
     ctx: FaceRunnerCtx,
 ) {
-    let FaceRunnerCtx { face_id, cancel, face_table, fib, face_states, discovery, discovery_ctx } = ctx;
+    let FaceRunnerCtx {
+        face_id,
+        cancel,
+        face_table,
+        fib,
+        face_states,
+        discovery,
+        discovery_ctx,
+    } = ctx;
     let kind = face.kind();
     let persistency = face_states
         .get(&face_id)
@@ -75,9 +83,7 @@ pub(crate) async fn run_face_reader(
                     .as_nanos() as u64;
                 // Reuse the arrival timestamp for idle tracking (avoids
                 // a second clock read and DashMap lookup per packet).
-                if track_activity
-                    && let Some(state) = face_states.get(&face_id)
-                {
+                if track_activity && let Some(state) = face_states.get(&face_id) {
                     state.last_activity.store(arrival, Ordering::Relaxed);
                 }
                 // Build InboundMeta from the link-layer source address when

@@ -106,7 +106,9 @@ fn init_tracing(
 
         let file_appender = tracing_appender::rolling::never(
             log_path.parent().unwrap_or(std::path::Path::new(".")),
-            log_path.file_name().unwrap_or(std::ffi::OsStr::new("ndn-router.log")),
+            log_path
+                .file_name()
+                .unwrap_or(std::ffi::OsStr::new("ndn-router.log")),
         );
         let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
@@ -219,13 +221,18 @@ async fn main() -> Result<()> {
     let pre_allocated_ether_mc: Vec<(ndn_transport::FaceId, usize)>;
 
     if fwd_config.discovery.enabled() {
-        let node_name_str = fwd_config.discovery.resolved_node_name()
+        let node_name_str = fwd_config
+            .discovery
+            .resolved_node_name()
             .expect("node_name required when discovery is enabled");
-        let node_name: ndn_packet::Name = node_name_str.parse()
+        let node_name: ndn_packet::Name = node_name_str
+            .parse()
             .map_err(|e| anyhow::anyhow!("invalid discovery node_name: {e}"))?;
 
         // Determine which transports to run discovery on.
-        let disc_transport = fwd_config.discovery.discovery_transport
+        let disc_transport = fwd_config
+            .discovery
+            .discovery_transport
             .as_deref()
             .unwrap_or("udp");
         let use_udp = disc_transport == "udp" || disc_transport == "both";
@@ -260,12 +267,12 @@ async fn main() -> Result<()> {
         // Build DiscoveryConfig from profile + overrides.
         let profile_name = fwd_config.discovery.profile.as_deref().unwrap_or("lan");
         let profile = match profile_name {
-            "static"        => ndn_discovery::DiscoveryProfile::Static,
-            "campus"        => ndn_discovery::DiscoveryProfile::Campus,
-            "mobile"        => ndn_discovery::DiscoveryProfile::Mobile,
+            "static" => ndn_discovery::DiscoveryProfile::Static,
+            "campus" => ndn_discovery::DiscoveryProfile::Campus,
+            "mobile" => ndn_discovery::DiscoveryProfile::Mobile,
             "high-mobility" => ndn_discovery::DiscoveryProfile::HighMobility,
-            "asymmetric"    => ndn_discovery::DiscoveryProfile::Asymmetric,
-            _               => ndn_discovery::DiscoveryProfile::Lan,
+            "asymmetric" => ndn_discovery::DiscoveryProfile::Asymmetric,
+            _ => ndn_discovery::DiscoveryProfile::Lan,
         };
         let mut disc_cfg = ndn_discovery::DiscoveryConfig::for_profile(&profile);
         if let Some(ms) = fwd_config.discovery.hello_interval_base_ms {
@@ -292,13 +299,16 @@ async fn main() -> Result<()> {
             // hellos.  Peers use this port to create a true unicast face instead
             // of pointing at the multicast source port (which would send data as
             // multicast).  Default to 6363 (the IANA-assigned NDN port).
-            let unicast_port: u16 = fwd_config.faces.iter()
+            let unicast_port: u16 = fwd_config
+                .faces
+                .iter()
                 .find_map(|f| match f {
-                    ndn_config::FaceConfig::Udp { bind, remote: None } => {
-                        bind.as_deref().unwrap_or("0.0.0.0:6363")
-                            .parse::<std::net::SocketAddr>().ok()
-                            .map(|a| a.port())
-                    }
+                    ndn_config::FaceConfig::Udp { bind, remote: None } => bind
+                        .as_deref()
+                        .unwrap_or("0.0.0.0:6363")
+                        .parse::<std::net::SocketAddr>()
+                        .ok()
+                        .map(|a| a.port()),
                     _ => None,
                 })
                 .unwrap_or(6363);
@@ -307,7 +317,8 @@ async fn main() -> Result<()> {
                 multicast_ids,
                 node_name.clone(),
                 disc_cfg.clone(),
-            ).with_unicast_port(unicast_port);
+            )
+            .with_unicast_port(unicast_port);
             protocols.push(std::sync::Arc::new(nd));
             tracing::info!(node=%node_name, "UDP neighbor discovery enabled");
         }
@@ -340,7 +351,9 @@ async fn main() -> Result<()> {
         }
         #[cfg(not(target_os = "linux"))]
         if use_ether {
-            tracing::warn!("Ethernet neighbor discovery is only supported on Linux; ignoring discovery_transport=ether/both");
+            tracing::warn!(
+                "Ethernet neighbor discovery is only supported on Linux; ignoring discovery_transport=ether/both"
+            );
         }
 
         let mut svc_cfg = ndn_discovery::ServiceDiscoveryConfig::default();
@@ -355,7 +368,8 @@ async fn main() -> Result<()> {
         }
 
         let sd = std::sync::Arc::new(ndn_discovery::ServiceDiscoveryProtocol::new(
-            node_name.clone(), svc_cfg,
+            node_name.clone(),
+            svc_cfg,
         ));
         // Register served_prefixes from config via the existing publish() API.
         for prefix_str in &fwd_config.discovery.served_prefixes {
@@ -369,7 +383,9 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        protocols.push(std::sync::Arc::clone(&sd) as std::sync::Arc<dyn ndn_discovery::DiscoveryProtocol>);
+        protocols.push(
+            std::sync::Arc::clone(&sd) as std::sync::Arc<dyn ndn_discovery::DiscoveryProtocol>
+        );
 
         let composite = ndn_discovery::CompositeDiscovery::new(protocols)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -461,7 +477,11 @@ async fn main() -> Result<()> {
                     });
                 }
             }
-            ndn_config::FaceConfig::Multicast { group, port, interface } => {
+            ndn_config::FaceConfig::Multicast {
+                group,
+                port,
+                interface,
+            } => {
                 let iface: std::net::Ipv4Addr = interface
                     .as_deref()
                     .unwrap_or("0.0.0.0")
@@ -966,13 +986,22 @@ fn build_cs(cfg: &CsConfig) -> Arc<dyn ErasedContentStore> {
         }
         "sharded-lru" => {
             let n = cfg.shards.unwrap_or(4);
-            tracing::info!(variant = "sharded-lru", shards = n, capacity_mb = cfg.capacity_mb, "content store");
+            tracing::info!(
+                variant = "sharded-lru",
+                shards = n,
+                capacity_mb = cfg.capacity_mb,
+                "content store"
+            );
             Arc::new(ShardedCs::new(
                 (0..n).map(|_| LruCs::new(cap / n)).collect(),
             ))
         }
         _ => {
-            tracing::info!(variant = "lru", capacity_mb = cfg.capacity_mb, "content store");
+            tracing::info!(
+                variant = "lru",
+                capacity_mb = cfg.capacity_mb,
+                "content store"
+            );
             Arc::new(LruCs::new(cap))
         }
     }

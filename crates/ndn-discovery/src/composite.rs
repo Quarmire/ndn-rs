@@ -220,9 +220,12 @@ fn read_varu(buf: &[u8]) -> Option<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        DiscoveryContext, InboundMeta, NeighborTable, NeighborTableView, NeighborUpdate,
+        NoDiscovery, ProtocolId,
+    };
     use std::str::FromStr;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use crate::{DiscoveryContext, InboundMeta, NeighborTable, NeighborTableView, NeighborUpdate, NoDiscovery, ProtocolId};
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -259,11 +262,21 @@ mod tests {
     }
 
     impl DiscoveryProtocol for MockProto {
-        fn protocol_id(&self) -> ProtocolId { self.id }
-        fn claimed_prefixes(&self) -> &[Name] { &self.prefixes }
+        fn protocol_id(&self) -> ProtocolId {
+            self.id
+        }
+        fn claimed_prefixes(&self) -> &[Name] {
+            &self.prefixes
+        }
         fn on_face_up(&self, _: FaceId, _: &dyn DiscoveryContext) {}
         fn on_face_down(&self, _: FaceId, _: &dyn DiscoveryContext) {}
-        fn on_inbound(&self, _: &Bytes, _: FaceId, _: &InboundMeta, _: &dyn DiscoveryContext) -> bool {
+        fn on_inbound(
+            &self,
+            _: &Bytes,
+            _: FaceId,
+            _: &InboundMeta,
+            _: &dyn DiscoveryContext,
+        ) -> bool {
             self.called.store(true, Ordering::SeqCst);
             true
         }
@@ -273,16 +286,24 @@ mod tests {
     struct NullCtx;
 
     impl DiscoveryContext for NullCtx {
-        fn alloc_face_id(&self) -> FaceId { FaceId(0) }
-        fn add_face(&self, _: Arc<dyn ndn_transport::ErasedFace>) -> FaceId { FaceId(0) }
+        fn alloc_face_id(&self) -> FaceId {
+            FaceId(0)
+        }
+        fn add_face(&self, _: Arc<dyn ndn_transport::ErasedFace>) -> FaceId {
+            FaceId(0)
+        }
         fn remove_face(&self, _: FaceId) {}
         fn add_fib_entry(&self, _: &Name, _: FaceId, _: u32, _: ProtocolId) {}
         fn remove_fib_entry(&self, _: &Name, _: FaceId, _: ProtocolId) {}
         fn remove_fib_entries_by_owner(&self, _: ProtocolId) {}
-        fn neighbors(&self) -> Arc<dyn NeighborTableView> { NeighborTable::new() }
+        fn neighbors(&self) -> Arc<dyn NeighborTableView> {
+            NeighborTable::new()
+        }
         fn update_neighbor(&self, _: NeighborUpdate) {}
         fn send_on(&self, _: FaceId, _: Bytes) {}
-        fn now(&self) -> Instant { Instant::now() }
+        fn now(&self) -> Instant {
+            Instant::now()
+        }
     }
 
     // ── Construction tests ────────────────────────────────────────────────────
@@ -332,8 +353,14 @@ mod tests {
 
         let consumed = composite.on_inbound(&pkt, FaceId(0), &InboundMeta::none(), &NullCtx);
         assert!(consumed, "composite should consume packet matching p1");
-        assert!(p1_ref.called.load(Ordering::SeqCst), "p1 should have been called");
-        assert!(!p2_ref.called.load(Ordering::SeqCst), "p2 should NOT have been called");
+        assert!(
+            p1_ref.called.load(Ordering::SeqCst),
+            "p1 should have been called"
+        );
+        assert!(
+            !p2_ref.called.load(Ordering::SeqCst),
+            "p2 should NOT have been called"
+        );
     }
 
     #[test]
@@ -350,8 +377,14 @@ mod tests {
 
         let consumed = composite.on_inbound(&pkt, FaceId(0), &InboundMeta::none(), &NullCtx);
         assert!(consumed, "composite should consume packet matching p2");
-        assert!(!p1_ref.called.load(Ordering::SeqCst), "p1 should NOT have been called");
-        assert!(p2_ref.called.load(Ordering::SeqCst), "p2 should have been called");
+        assert!(
+            !p1_ref.called.load(Ordering::SeqCst),
+            "p1 should NOT have been called"
+        );
+        assert!(
+            p2_ref.called.load(Ordering::SeqCst),
+            "p2 should have been called"
+        );
     }
 
     #[test]
@@ -373,18 +406,35 @@ mod tests {
         // A protocol that never claims any packet (returns false from on_inbound).
         struct NullProto;
         impl DiscoveryProtocol for NullProto {
-            fn protocol_id(&self) -> ProtocolId { ProtocolId("null") }
-            fn claimed_prefixes(&self) -> &[Name] { &[] }
+            fn protocol_id(&self) -> ProtocolId {
+                ProtocolId("null")
+            }
+            fn claimed_prefixes(&self) -> &[Name] {
+                &[]
+            }
             fn on_face_up(&self, _: FaceId, _: &dyn DiscoveryContext) {}
             fn on_face_down(&self, _: FaceId, _: &dyn DiscoveryContext) {}
-            fn on_inbound(&self, _: &Bytes, _: FaceId, _: &InboundMeta, _: &dyn DiscoveryContext) -> bool { false }
+            fn on_inbound(
+                &self,
+                _: &Bytes,
+                _: FaceId,
+                _: &InboundMeta,
+                _: &dyn DiscoveryContext,
+            ) -> bool {
+                false
+            }
             fn on_tick(&self, _: Instant, _: &dyn DiscoveryContext) {}
         }
-        let composite = CompositeDiscovery::new(vec![Arc::new(NullProto) as Arc<dyn DiscoveryProtocol>]).unwrap();
+        let composite =
+            CompositeDiscovery::new(vec![Arc::new(NullProto) as Arc<dyn DiscoveryProtocol>])
+                .unwrap();
 
         let junk = Bytes::from_static(b"\xFF\xFF\xFF");
         let consumed = composite.on_inbound(&junk, FaceId(0), &InboundMeta::none(), &NullCtx);
-        assert!(!consumed, "garbage packet should not be consumed when no protocol claims it");
+        assert!(
+            !consumed,
+            "garbage packet should not be consumed when no protocol claims it"
+        );
     }
 
     #[test]
@@ -400,27 +450,53 @@ mod tests {
             up_called: AtomicBool,
         }
         impl DiscoveryProtocol for TrackFaceUp {
-            fn protocol_id(&self) -> ProtocolId { self.inner.id }
-            fn claimed_prefixes(&self) -> &[Name] { &self.inner.prefixes }
+            fn protocol_id(&self) -> ProtocolId {
+                self.inner.id
+            }
+            fn claimed_prefixes(&self) -> &[Name] {
+                &self.inner.prefixes
+            }
             fn on_face_up(&self, _: FaceId, _: &dyn DiscoveryContext) {
                 self.up_called.store(true, Ordering::SeqCst);
             }
             fn on_face_down(&self, _: FaceId, _: &dyn DiscoveryContext) {}
-            fn on_inbound(&self, _: &Bytes, _: FaceId, _: &InboundMeta, _: &dyn DiscoveryContext) -> bool { false }
+            fn on_inbound(
+                &self,
+                _: &Bytes,
+                _: FaceId,
+                _: &InboundMeta,
+                _: &dyn DiscoveryContext,
+            ) -> bool {
+                false
+            }
             fn on_tick(&self, _: Instant, _: &dyn DiscoveryContext) {}
         }
 
-        let t1 = Arc::new(TrackFaceUp { inner: Arc::clone(&p1_ref), up_called: AtomicBool::new(false) });
-        let t2 = Arc::new(TrackFaceUp { inner: Arc::clone(&p2_ref), up_called: AtomicBool::new(false) });
+        let t1 = Arc::new(TrackFaceUp {
+            inner: Arc::clone(&p1_ref),
+            up_called: AtomicBool::new(false),
+        });
+        let t2 = Arc::new(TrackFaceUp {
+            inner: Arc::clone(&p2_ref),
+            up_called: AtomicBool::new(false),
+        });
         let t1_ref = Arc::clone(&t1);
         let t2_ref = Arc::clone(&t2);
 
-        let composite = CompositeDiscovery::new(
-            vec![t1 as Arc<dyn DiscoveryProtocol>, t2 as Arc<dyn DiscoveryProtocol>]
-        ).unwrap();
+        let composite = CompositeDiscovery::new(vec![
+            t1 as Arc<dyn DiscoveryProtocol>,
+            t2 as Arc<dyn DiscoveryProtocol>,
+        ])
+        .unwrap();
         composite.on_face_up(FaceId(3), &NullCtx);
 
-        assert!(t1_ref.up_called.load(Ordering::SeqCst), "p1 should have received on_face_up");
-        assert!(t2_ref.up_called.load(Ordering::SeqCst), "p2 should have received on_face_up");
+        assert!(
+            t1_ref.up_called.load(Ordering::SeqCst),
+            "p1 should have received on_face_up"
+        );
+        assert!(
+            t2_ref.up_called.load(Ordering::SeqCst),
+            "p2 should have received on_face_up"
+        );
     }
 }

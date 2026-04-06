@@ -76,7 +76,11 @@ impl<const P: usize, const F: usize, C: Clock> Forwarder<P, F, C> {
     /// `fib` should be pre-populated with static routes for the node's
     /// expected network topology.
     pub fn new(fib: Fib<F>, clock: C) -> Self {
-        Self { pit: Pit::new(), fib, clock }
+        Self {
+            pit: Pit::new(),
+            fib,
+            clock,
+        }
     }
 
     /// Process a single raw packet.
@@ -204,19 +208,17 @@ impl<const P: usize, const F: usize, C: Clock> Forwarder<P, F, C> {
         };
 
         // Satisfy the pending Interest: send Data back on the incoming face.
-        if let Some(face) = faces.iter_mut().find(|f| f.face_id() == pit_entry.incoming_face) {
+        if let Some(face) = faces
+            .iter_mut()
+            .find(|f| f.face_id() == pit_entry.incoming_face)
+        {
             let _ = face.send(raw);
         }
     }
 
     // ── LpPacket processing ───────────────────────────────────────────────────
 
-    fn process_lp(
-        &mut self,
-        raw: &[u8],
-        incoming_face: FaceId,
-        faces: &mut [&mut dyn ErasedFace],
-    ) {
+    fn process_lp(&mut self, raw: &[u8], incoming_face: FaceId, faces: &mut [&mut dyn ErasedFace]) {
         let Ok(lp) = LpPacket::decode(Bytes::copy_from_slice(raw)) else {
             return;
         };
@@ -273,7 +275,10 @@ mod tests {
 
     impl MockFace {
         fn new(id: FaceId) -> Self {
-            Self { id, sent: heapless::Vec::new() }
+            Self {
+                id,
+                sent: heapless::Vec::new(),
+            }
         }
     }
 
@@ -315,8 +320,15 @@ mod tests {
         let mut face1 = MockFace::new(1); // nexthop
 
         let mut interest_buf = [0u8; 256];
-        let n = encode_interest(&mut interest_buf, &[b"ndn", b"sensor"], 42, 4000, false, false)
-            .unwrap();
+        let n = encode_interest(
+            &mut interest_buf,
+            &[b"ndn", b"sensor"],
+            42,
+            4000,
+            false,
+            false,
+        )
+        .unwrap();
 
         {
             let mut faces: [&mut dyn ErasedFace; 2] = [&mut face0, &mut face1];

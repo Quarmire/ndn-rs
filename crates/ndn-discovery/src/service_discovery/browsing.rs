@@ -48,7 +48,10 @@ impl ServiceDiscoveryProtocol {
             responded = true;
         }
         if responded {
-            debug!("ServiceDiscovery: answered browse Interest with {} records", records.len());
+            debug!(
+                "ServiceDiscovery: answered browse Interest with {} records",
+                records.len()
+            );
         }
         true
     }
@@ -86,7 +89,10 @@ impl ServiceDiscoveryProtocol {
             ServiceValidationPolicy::Skip => {}
             ServiceValidationPolicy::WarnOnly => {
                 // In a real implementation, check the signature.  For now, log.
-                debug!("ServiceDiscovery: received unvalidated record for {:?}", record.announced_prefix);
+                debug!(
+                    "ServiceDiscovery: received unvalidated record for {:?}",
+                    record.announced_prefix
+                );
             }
             ServiceValidationPolicy::Required => {
                 // Drop unsigned records (signature check not yet wired).
@@ -97,13 +103,19 @@ impl ServiceDiscoveryProtocol {
 
         // Scope filter.
         if !self.is_in_scope(&record.announced_prefix) {
-            debug!("ServiceDiscovery: record {:?} outside configured scope", record.announced_prefix);
+            debug!(
+                "ServiceDiscovery: record {:?} outside configured scope",
+                record.announced_prefix
+            );
             return true;
         }
 
         // Prefix filter.
         if !self.config.auto_populate_prefix_filter.is_empty() {
-            let allowed = self.config.auto_populate_prefix_filter.iter()
+            let allowed = self
+                .config
+                .auto_populate_prefix_filter
+                .iter()
                 .any(|f| record.announced_prefix.has_prefix(f));
             if !allowed {
                 return true;
@@ -112,7 +124,10 @@ impl ServiceDiscoveryProtocol {
 
         // Rate limit check.
         if !self.check_rate_limit(&record.node_name, ctx.now()) {
-            debug!("ServiceDiscovery: rate-limiting producer {:?}", record.node_name);
+            debug!(
+                "ServiceDiscovery: rate-limiting producer {:?}",
+                record.node_name
+            );
             return true;
         }
 
@@ -142,7 +157,10 @@ impl ServiceDiscoveryProtocol {
         // Relay service record to established neighbors when enabled.
         // Exclude the face the record arrived on to prevent loops.
         if self.config.relay_records {
-            let relay_faces: Vec<FaceId> = ctx.neighbors().all().into_iter()
+            let relay_faces: Vec<FaceId> = ctx
+                .neighbors()
+                .all()
+                .into_iter()
                 .filter(|e| e.is_reachable())
                 .flat_map(|e| e.faces.iter().map(|(fid, _, _)| *fid).collect::<Vec<_>>())
                 .filter(|fid| *fid != incoming_face)
@@ -152,7 +170,10 @@ impl ServiceDiscoveryProtocol {
                 ctx.send_on(face_id, raw.clone());
             }
             if relay_count > 0 {
-                debug!("ServiceDiscovery: relayed record {:?} to {relay_count} peers", record.announced_prefix);
+                debug!(
+                    "ServiceDiscovery: relayed record {:?} to {relay_count} peers",
+                    record.announced_prefix
+                );
             }
         }
 
@@ -194,7 +215,9 @@ impl ServiceDiscoveryProtocol {
                     }
                 }
             }
-            if uri.is_empty() { uri.push('/'); }
+            if uri.is_empty() {
+                uri.push('/');
+            }
             let target = match std::str::FromStr::from_str(&uri) {
                 Ok(n) => n,
                 Err(_) => return true,
@@ -209,7 +232,10 @@ impl ServiceDiscoveryProtocol {
                 });
             }
             let content = w.finish();
-            debug!("ServiceDiscovery: answered single-peer query for {:?}", target);
+            debug!(
+                "ServiceDiscovery: answered single-peer query for {:?}",
+                target
+            );
             content
         } else {
             // `/ndn/local/nd/peers` — full peer list.
@@ -222,7 +248,10 @@ impl ServiceDiscoveryProtocol {
                     });
                 }
             }
-            debug!("ServiceDiscovery: answered peers query with {} neighbors", neighbors.len());
+            debug!(
+                "ServiceDiscovery: answered peers query with {} neighbors",
+                neighbors.len()
+            );
             w.finish()
         };
 
@@ -267,10 +296,18 @@ impl ServiceDiscoveryProtocol {
     ///
     /// Using the neighbor table (not raw face IDs) ensures that management
     /// and app faces are never sent unsolicited browse Interests.
-    pub(super) fn browse_neighbors(&self, now: Instant, browse_interval: Duration, ctx: &dyn DiscoveryContext) {
+    pub(super) fn browse_neighbors(
+        &self,
+        now: Instant,
+        browse_interval: Duration,
+        ctx: &dyn DiscoveryContext,
+    ) {
         let neighbors = ctx.neighbors().all();
         let mut seen = self.browsed_neighbors.lock().unwrap();
-        let periodic_due = self.last_browse.lock().unwrap()
+        let periodic_due = self
+            .last_browse
+            .lock()
+            .unwrap()
             .is_none_or(|t| now.duration_since(t) >= browse_interval);
 
         let mut new_count = 0usize;
@@ -300,15 +337,22 @@ impl ServiceDiscoveryProtocol {
             *self.last_browse.lock().unwrap() = Some(now);
         }
         if new_count > 0 {
-            debug!(peers = new_count, "ServiceDiscovery: initial browse sent to new neighbors");
+            debug!(
+                peers = new_count,
+                "ServiceDiscovery: initial browse sent to new neighbors"
+            );
         }
         if refresh_count > 0 {
-            debug!(peers = refresh_count, "ServiceDiscovery: periodic browse refresh sent");
+            debug!(
+                peers = refresh_count,
+                "ServiceDiscovery: periodic browse refresh sent"
+            );
         }
 
         // Prune departed neighbors from the seen set so they get a fresh
         // initial browse if they reconnect later.
-        let active: HashSet<Name> = neighbors.iter()
+        let active: HashSet<Name> = neighbors
+            .iter()
             .filter(|e| e.is_reachable())
             .map(|e| e.node_name.clone())
             .collect();
@@ -325,7 +369,9 @@ pub fn decode_peer_list(content: &[u8]) -> Vec<Name> {
     let mut peers = Vec::new();
     let mut pos = 0;
     while pos < content.len() {
-        let Some((typ, len, hl)) = read_tlv_header(content, pos) else { break };
+        let Some((typ, len, hl)) = read_tlv_header(content, pos) else {
+            break;
+        };
         let val = &content[pos + hl..pos + hl + len];
         if typ == T_PEER_ENTRY as u32
             && let Some(name) = decode_name_tlv(val)
@@ -379,7 +425,10 @@ fn decode_name_tlv(b: &[u8]) -> Option<Name> {
     while pos < comps_bytes.len() {
         let (typ, clen, chl) = read_tlv_header(comps_bytes, pos)?;
         let val = comps_bytes[pos + chl..pos + chl + clen].to_vec();
-        comps.push(NameComponent { typ: typ as u64, value: val.into() });
+        comps.push(NameComponent {
+            typ: typ as u64,
+            value: val.into(),
+        });
         pos += chl + clen;
     }
     if comps.is_empty() {
@@ -397,7 +446,9 @@ fn decode_name_tlv(b: &[u8]) -> Option<Name> {
             }
         }
     }
-    if uri.is_empty() { uri.push('/'); }
+    if uri.is_empty() {
+        uri.push('/');
+    }
     use std::str::FromStr;
     Name::from_str(&uri).ok()
 }

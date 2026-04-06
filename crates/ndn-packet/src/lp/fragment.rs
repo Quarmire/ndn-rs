@@ -127,7 +127,7 @@ pub fn extract_acks(raw: &[u8]) -> (Option<u64>, smallvec::SmallVec<[u64; 8]>) {
 mod tests {
     use super::*;
     use crate::encode::encode_interest;
-    use crate::lp::{encode_lp_acks, encode_lp_packet, encode_lp_reliable, LpPacket};
+    use crate::lp::{LpPacket, encode_lp_acks, encode_lp_packet, encode_lp_reliable};
     use crate::{Name, NameComponent};
     use bytes::Bytes;
     use ndn_tlv::TlvWriter;

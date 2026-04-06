@@ -104,7 +104,7 @@ struct NdrvProtocolDesc {
 #[repr(C)]
 struct SockaddrDl {
     sdl_len: u8,
-    sdl_family: u8,   // AF_LINK = 18
+    sdl_family: u8, // AF_LINK = 18
     sdl_index: u16,
     sdl_type: u8,
     sdl_nlen: u8,
@@ -160,9 +160,7 @@ pub fn get_iface_mac(iface: &str) -> std::io::Result<MacAddr> {
                     let nlen = sdl.sdl_nlen as usize;
                     let alen = sdl.sdl_alen as usize;
                     if alen >= 6 && nlen + 6 <= sdl.sdl_data.len() {
-                        let mac_bytes: [u8; 6] = sdl.sdl_data[nlen..nlen + 6]
-                            .try_into()
-                            .unwrap();
+                        let mac_bytes: [u8; 6] = sdl.sdl_data[nlen..nlen + 6].try_into().unwrap();
                         result = Some(MacAddr::new(mac_bytes));
                         break;
                     }
@@ -172,10 +170,12 @@ pub fn get_iface_mac(iface: &str) -> std::io::Result<MacAddr> {
         }
         libc::freeifaddrs(ifap);
 
-        result.ok_or_else(|| std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("no MAC address found for interface {iface}"),
-        ))
+        result.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("no MAC address found for interface {iface}"),
+            )
+        })
     }
 }
 
@@ -202,9 +202,7 @@ impl NdrvSocket {
         let local_mac = get_iface_mac(&iface)?;
 
         // socket(PF_NDRV, SOCK_RAW, 0)
-        let fd = unsafe {
-            libc::socket(PF_NDRV, libc::SOCK_RAW, 0)
-        };
+        let fd = unsafe { libc::socket(PF_NDRV, libc::SOCK_RAW, 0) };
         if fd == -1 {
             return Err(std::io::Error::last_os_error());
         }
@@ -269,7 +267,12 @@ impl NdrvSocket {
         unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) };
 
         let socket = AsyncFd::new(fd)?;
-        Ok(Self { socket, iface, local_mac, sa })
+        Ok(Self {
+            socket,
+            iface,
+            local_mac,
+            sa,
+        })
     }
 
     pub fn iface(&self) -> &str {

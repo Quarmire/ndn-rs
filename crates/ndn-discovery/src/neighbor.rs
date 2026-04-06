@@ -76,8 +76,7 @@ impl NeighborEntry {
 
     /// Return whether this neighbor has any live unicast faces.
     pub fn is_reachable(&self) -> bool {
-        matches!(self.state, NeighborState::Established { .. })
-            && !self.faces.is_empty()
+        matches!(self.state, NeighborState::Established { .. }) && !self.faces.is_empty()
     }
 
     /// Find the face for the given MAC + interface, if one already exists.
@@ -112,10 +111,10 @@ pub enum NeighborUpdate {
 
 fn state_label(s: &NeighborState) -> &'static str {
     match s {
-        NeighborState::Probing { .. }    => "Probing",
+        NeighborState::Probing { .. } => "Probing",
         NeighborState::Established { .. } => "Established",
-        NeighborState::Stale { .. }      => "Stale",
-        NeighborState::Absent            => "Absent",
+        NeighborState::Stale { .. } => "Stale",
+        NeighborState::Absent => "Absent",
     }
 }
 

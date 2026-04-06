@@ -126,17 +126,9 @@ pub trait NeighborProbeStrategy: Send + 'static {
 /// | `Swim` | [`BackoffScheduler`] (SWIM strategy not yet implemented) |
 pub fn build_strategy(cfg: &DiscoveryConfig) -> Box<dyn NeighborProbeStrategy> {
     match cfg.hello_strategy {
-        HelloStrategyKind::Backoff => {
-            Box::new(BackoffScheduler::from_discovery_config(cfg))
-        }
-        HelloStrategyKind::Swim => {
-            Box::new(SwimScheduler::from_discovery_config(cfg))
-        }
-        HelloStrategyKind::Reactive => {
-            Box::new(ReactiveScheduler::from_discovery_config(cfg))
-        }
-        HelloStrategyKind::Passive => {
-            Box::new(PassiveScheduler::from_discovery_config(cfg))
-        }
+        HelloStrategyKind::Backoff => Box::new(BackoffScheduler::from_discovery_config(cfg)),
+        HelloStrategyKind::Swim => Box::new(SwimScheduler::from_discovery_config(cfg)),
+        HelloStrategyKind::Reactive => Box::new(ReactiveScheduler::from_discovery_config(cfg)),
+        HelloStrategyKind::Passive => Box::new(PassiveScheduler::from_discovery_config(cfg)),
     }
 }

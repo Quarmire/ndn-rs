@@ -92,10 +92,7 @@ impl NeighborProbeStrategy for PassiveScheduler {
 
         // Fallback backoff path: only when passive detection is idle.
         if !self.is_passive_active(now) {
-            let fire_fallback = self
-                .next_fallback_at
-                .map(|t| now >= t)
-                .unwrap_or(true);
+            let fire_fallback = self.next_fallback_at.map(|t| now >= t).unwrap_or(true);
             if fire_fallback {
                 let interval = self.backoff_state.next_failure(&self.backoff_cfg);
                 self.next_fallback_at = Some(now + interval);
@@ -168,9 +165,9 @@ mod tests {
     use crate::config::{DiscoveryConfig, DiscoveryProfile};
 
     fn high_mob_sched() -> PassiveScheduler {
-        PassiveScheduler::from_discovery_config(
-            &DiscoveryConfig::for_profile(&DiscoveryProfile::HighMobility),
-        )
+        PassiveScheduler::from_discovery_config(&DiscoveryConfig::for_profile(
+            &DiscoveryProfile::HighMobility,
+        ))
     }
 
     #[test]
@@ -220,7 +217,10 @@ mod tests {
             .iter()
             .filter(|r| **r == ProbeRequest::Broadcast)
             .collect();
-        assert!(broadcasts.is_empty(), "fallback should be suppressed: {reqs:?}");
+        assert!(
+            broadcasts.is_empty(),
+            "fallback should be suppressed: {reqs:?}"
+        );
     }
 
     #[test]

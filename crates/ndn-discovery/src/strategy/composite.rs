@@ -35,7 +35,9 @@ impl CompositeStrategy {
     /// Create an empty composite.  At least one strategy must be added before
     /// the first tick, or `on_tick` will return an empty list.
     pub fn new() -> Self {
-        Self { members: Vec::new() }
+        Self {
+            members: Vec::new(),
+        }
     }
 
     /// Add a strategy to the composite (builder).
@@ -76,10 +78,8 @@ impl NeighborProbeStrategy for CompositeStrategy {
             }
         }
 
-        let mut result: Vec<ProbeRequest> = unicasts
-            .into_iter()
-            .map(ProbeRequest::Unicast)
-            .collect();
+        let mut result: Vec<ProbeRequest> =
+            unicasts.into_iter().map(ProbeRequest::Unicast).collect();
         if broadcast {
             result.push(ProbeRequest::Broadcast);
         }
@@ -127,7 +127,10 @@ mod tests {
             )));
 
         let reqs = composite.on_tick(Instant::now());
-        let broadcasts = reqs.iter().filter(|r| **r == ProbeRequest::Broadcast).count();
+        let broadcasts = reqs
+            .iter()
+            .filter(|r| **r == ProbeRequest::Broadcast)
+            .count();
         assert_eq!(broadcasts, 1, "broadcasts should be deduplicated: {reqs:?}");
     }
 
@@ -160,7 +163,10 @@ mod tests {
 
         composite.trigger(TriggerEvent::FaceUp);
         let reqs = composite.on_tick(now + Duration::from_secs(1));
-        let broadcasts = reqs.iter().filter(|r| **r == ProbeRequest::Broadcast).count();
+        let broadcasts = reqs
+            .iter()
+            .filter(|r| **r == ProbeRequest::Broadcast)
+            .count();
         // At least one broadcast expected (from the trigger).
         assert!(broadcasts >= 1);
     }

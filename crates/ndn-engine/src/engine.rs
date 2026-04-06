@@ -259,7 +259,11 @@ impl ForwarderEngine {
         // Spawn the inbound recv task.
         tokio::spawn(crate::dispatcher::run_face_reader(
             erased,
-            self.inner.pipeline_tx.get().expect("pipeline_tx initialized").clone(),
+            self.inner
+                .pipeline_tx
+                .get()
+                .expect("pipeline_tx initialized")
+                .clone(),
             Arc::clone(&self.inner.pit),
             crate::dispatcher::FaceRunnerCtx {
                 face_id,
@@ -360,13 +364,13 @@ impl ForwarderEngine {
             None => return Err(()),
         };
         tx.send(InboundPacket {
-                raw,
-                face_id,
-                arrival,
-                meta,
-            })
-            .await
-            .map_err(|_| ())
+            raw,
+            face_id,
+            arrival,
+            meta,
+        })
+        .await
+        .map_err(|_| ())
     }
 
     /// Get the cancellation token for a face, if one exists.
@@ -427,7 +431,15 @@ pub(crate) async fn run_face_sender(
     persistency: FacePersistency,
     ctx: crate::dispatcher::FaceRunnerCtx,
 ) {
-    let crate::dispatcher::FaceRunnerCtx { face_id, cancel, face_table, fib, face_states, discovery, discovery_ctx } = ctx;
+    let crate::dispatcher::FaceRunnerCtx {
+        face_id,
+        cancel,
+        face_table,
+        fib,
+        face_states,
+        discovery,
+        discovery_ctx,
+    } = ctx;
     // Check if reliability is enabled by looking at the face state.
     let has_reliability = face_states
         .get(&face_id)

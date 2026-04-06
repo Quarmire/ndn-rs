@@ -9,7 +9,9 @@ use ndn_packet::Name;
 use ndn_security::{
     CertCache, CertFetcher, SecurityManager, SecurityProfile, TrustSchema, Validator,
 };
-use ndn_store::{CsAdmissionPolicy, CsObserver, ErasedContentStore, LruCs, ObservableCs, Pit, StrategyTable};
+use ndn_store::{
+    CsAdmissionPolicy, CsObserver, ErasedContentStore, LruCs, ObservableCs, Pit, StrategyTable,
+};
 use ndn_strategy::{BestRouteStrategy, MeasurementsTable};
 use ndn_transport::{Face, FaceTable};
 
@@ -224,15 +226,12 @@ impl EngineBuilder {
         let face_states = Arc::new(dashmap::DashMap::new());
 
         // Resolve security profile into validator + cert fetcher.
-        let (validator, cert_fetcher) = resolve_security_profile(
-            self.security_profile,
-            &self.security,
-        );
+        let (validator, cert_fetcher) =
+            resolve_security_profile(self.security_profile, &self.security);
 
         // Discovery protocol (default: no-op).
-        let discovery: Arc<dyn DiscoveryProtocol> = self
-            .discovery
-            .unwrap_or_else(|| Arc::new(NoDiscovery));
+        let discovery: Arc<dyn DiscoveryProtocol> =
+            self.discovery.unwrap_or_else(|| Arc::new(NoDiscovery));
         let neighbors = NeighborTable::new();
 
         // Build EngineInner first. `pipeline_tx` is a `OnceLock` so we can

@@ -74,7 +74,6 @@ pub enum RtoStrategy {
     },
 }
 
-
 /// Per-face reliability configuration.
 ///
 /// Bundles all tunable knobs into a single struct that can be stored in

@@ -312,13 +312,7 @@ pub fn setup_packet_ring(fd: RawFd) -> std::io::Result<PacketRing> {
 /// Returns an error if the interface does not exist or if the process lacks
 /// the necessary permissions to open a raw socket for the ioctl.
 pub fn get_interface_mac(iface: &str) -> std::io::Result<MacAddr> {
-    let fd = unsafe {
-        libc::socket(
-            libc::AF_PACKET,
-            libc::SOCK_DGRAM | libc::SOCK_CLOEXEC,
-            0,
-        )
-    };
+    let fd = unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
     if fd == -1 {
         return Err(std::io::Error::last_os_error());
     }
@@ -331,9 +325,7 @@ pub fn get_interface_mac(iface: &str) -> std::io::Result<MacAddr> {
     let name_ptr = ifr.ifr_name.as_mut_ptr() as *mut u8;
     unsafe { std::ptr::copy_nonoverlapping(name_bytes.as_ptr(), name_ptr, copy_len) };
 
-    let ret = unsafe {
-        libc::ioctl(fd.as_raw_fd(), libc::SIOCGIFHWADDR, &mut ifr as *mut _)
-    };
+    let ret = unsafe { libc::ioctl(fd.as_raw_fd(), libc::SIOCGIFHWADDR, &mut ifr as *mut _) };
     if ret == -1 {
         return Err(std::io::Error::last_os_error());
     }
@@ -417,9 +409,8 @@ mod tests {
 
         // Fill in the embedded sockaddr_ll with a known source MAC.
         let expected_mac = MacAddr::new([0xde, 0xad, 0xbe, 0xef, 0x00, 0x01]);
-        let sll = unsafe {
-            &mut *(buf.as_mut_ptr().add(aligned_hdr_size) as *mut libc::sockaddr_ll)
-        };
+        let sll =
+            unsafe { &mut *(buf.as_mut_ptr().add(aligned_hdr_size) as *mut libc::sockaddr_ll) };
         sll.sll_halen = 6;
         sll.sll_addr[..6].copy_from_slice(expected_mac.as_bytes());
 
@@ -427,9 +418,8 @@ mod tests {
         buf[payload_offset..payload_offset + payload.len()].copy_from_slice(payload);
 
         // Read back MAC via the same logic used in try_pop_rx_with_source.
-        let sll_read = unsafe {
-            &*(buf.as_ptr().add(aligned_hdr_size) as *const libc::sockaddr_ll)
-        };
+        let sll_read =
+            unsafe { &*(buf.as_ptr().add(aligned_hdr_size) as *const libc::sockaddr_ll) };
         let got_mac = MacAddr({
             let mut b = [0u8; 6];
             b.copy_from_slice(&sll_read.sll_addr[..6]);

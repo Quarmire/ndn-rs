@@ -148,7 +148,9 @@ impl ValidationStage {
         Self {
             validator: None,
             cert_fetcher: None,
-            pending: Arc::new(Mutex::new(PendingQueue::new(&PendingQueueConfig::default()))),
+            pending: Arc::new(Mutex::new(
+                PendingQueue::new(&PendingQueueConfig::default()),
+            )),
         }
     }
 

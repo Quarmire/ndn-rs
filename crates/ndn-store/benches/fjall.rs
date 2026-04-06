@@ -45,7 +45,9 @@ fn bench_fjall(c: &mut Criterion) {
     rt.block_on(cs_rw.insert(
         data_wire(&hit_name),
         Arc::clone(&hit_name),
-        CsMeta { stale_at: far_future() },
+        CsMeta {
+            stale_at: far_future(),
+        },
     ));
     let hit_interest = interest_for("/fjall/hit");
     let miss_interest = interest_for("/fjall/miss/not/cached");
@@ -84,7 +86,13 @@ fn bench_fjall(c: &mut Criterion) {
     for i in 0..1_000u64 {
         let name: Arc<Name> = Arc::new(format!("/fjall/seed/{i}").parse().unwrap());
         let wire = data_wire(&name);
-        rt.block_on(cs_ins.insert(wire, name, CsMeta { stale_at: far_future() }));
+        rt.block_on(cs_ins.insert(
+            wire,
+            name,
+            CsMeta {
+                stale_at: far_future(),
+            },
+        ));
     }
 
     static CTR: AtomicU64 = AtomicU64::new(0);
@@ -94,7 +102,13 @@ fn bench_fjall(c: &mut Criterion) {
             // Names outside the seed range → always new entries, always evict.
             let name: Arc<Name> = Arc::new(format!("/fjall/new/{i}").parse().unwrap());
             let wire = data_wire(&name);
-            rt.block_on(cs_ins.insert(wire, name, CsMeta { stale_at: far_future() }))
+            rt.block_on(cs_ins.insert(
+                wire,
+                name,
+                CsMeta {
+                    stale_at: far_future(),
+                },
+            ))
         });
     });
 

@@ -45,7 +45,7 @@ use crate::protocol::{DiscoveryProtocol, InboundMeta, ProtocolId};
 use crate::scope::sd_updates;
 use crate::wire::parse_raw_interest;
 
-use ndn_sync::{SyncHandle, SyncUpdate, SvsConfig, join_svs_group};
+use ndn_sync::{SvsConfig, SyncHandle, SyncUpdate, join_svs_group};
 
 const PROTOCOL: ProtocolId = ProtocolId("svs-service-discovery");
 
@@ -190,7 +190,9 @@ impl SvsServiceDiscovery {
 }
 
 impl DiscoveryProtocol for SvsServiceDiscovery {
-    fn protocol_id(&self) -> ProtocolId { PROTOCOL }
+    fn protocol_id(&self) -> ProtocolId {
+        PROTOCOL
+    }
 
     fn claimed_prefixes(&self) -> &[Name] {
         &self.claimed

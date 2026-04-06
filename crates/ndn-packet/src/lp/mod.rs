@@ -18,7 +18,7 @@ pub use decode::LpPacket;
 pub use encode::{
     encode_lp_acks, encode_lp_nack, encode_lp_packet, encode_lp_reliable, encode_lp_with_headers,
 };
-pub use fragment::{extract_acks, extract_fragment, FragmentHeader};
+pub use fragment::{FragmentHeader, extract_acks, extract_fragment};
 
 /// Cache policy type for NDNLPv2 CachePolicy header field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

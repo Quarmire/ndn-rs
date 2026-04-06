@@ -54,7 +54,12 @@ impl ServiceDiscoveryProtocol {
             freshness_ms = record.freshness_ms,
             "service record published",
         );
-        let entry = RecordEntry { record, published_at_ms: ts, expires_at: None, owner_face: None };
+        let entry = RecordEntry {
+            record,
+            published_at_ms: ts,
+            expires_at: None,
+            owner_face: None,
+        };
         if let Some(idx) = existing {
             records[idx] = entry;
         } else {
@@ -121,7 +126,12 @@ impl ServiceDiscoveryProtocol {
             owner_face   = ?owner_face,
             "service record published (owned by face)",
         );
-        let entry = RecordEntry { record, published_at_ms: ts, expires_at: None, owner_face: Some(owner_face) };
+        let entry = RecordEntry {
+            record,
+            published_at_ms: ts,
+            expires_at: None,
+            owner_face: Some(owner_face),
+        };
         if let Some(idx) = existing {
             records[idx] = entry;
         } else {
@@ -162,9 +172,9 @@ impl ServiceDiscoveryProtocol {
 
         let mut out: Vec<ServiceRecord> = local.iter().map(|e| e.record.clone()).collect();
         for pr in peers.iter() {
-            let already = out.iter().any(|r| {
-                r.announced_prefix == pr.announced_prefix && r.node_name == pr.node_name
-            });
+            let already = out
+                .iter()
+                .any(|r| r.announced_prefix == pr.announced_prefix && r.node_name == pr.node_name);
             if !already {
                 out.push(pr.clone());
             }

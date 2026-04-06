@@ -77,12 +77,12 @@ pub use ether_macos::NamedEtherFace;
 #[cfg(target_os = "windows")]
 pub use ether_windows::NamedEtherFace;
 
-#[cfg(target_os = "linux")]
-pub use multicast_ether::MulticastEtherFace;
 #[cfg(target_os = "macos")]
 pub use ether_macos::MulticastEtherFace;
 #[cfg(target_os = "windows")]
 pub use ether_windows::MulticastEtherFace;
+#[cfg(target_os = "linux")]
+pub use multicast_ether::MulticastEtherFace;
 
 #[cfg(target_os = "linux")]
 pub use wfb::WfbFace;

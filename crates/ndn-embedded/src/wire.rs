@@ -138,7 +138,14 @@ pub fn encode_interest_name(
         }
         components.push(part.as_bytes()).ok()?;
     }
-    encode_interest(buf, &components, nonce, lifetime_ms, can_be_prefix, must_be_fresh)
+    encode_interest(
+        buf,
+        &components,
+        nonce,
+        lifetime_ms,
+        can_be_prefix,
+        must_be_fresh,
+    )
 }
 
 /// Encode a Data packet from a slash-delimited NDN name string.
@@ -177,11 +184,20 @@ impl NniBytes {
 fn encode_nni(val: u64) -> NniBytes {
     let be = val.to_be_bytes();
     if val <= 0xFF {
-        NniBytes { data: [be[7], 0, 0, 0, 0, 0, 0, 0], len: 1 }
+        NniBytes {
+            data: [be[7], 0, 0, 0, 0, 0, 0, 0],
+            len: 1,
+        }
     } else if val <= 0xFFFF {
-        NniBytes { data: [be[6], be[7], 0, 0, 0, 0, 0, 0], len: 2 }
+        NniBytes {
+            data: [be[6], be[7], 0, 0, 0, 0, 0, 0],
+            len: 2,
+        }
     } else if val <= 0xFFFF_FFFF {
-        NniBytes { data: [be[4], be[5], be[6], be[7], 0, 0, 0, 0], len: 4 }
+        NniBytes {
+            data: [be[4], be[5], be[6], be[7], 0, 0, 0, 0],
+            len: 4,
+        }
     } else {
         NniBytes { data: be, len: 8 }
     }
@@ -242,14 +258,21 @@ impl<'a> Cursor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndn_packet::{Data, Interest};
     use bytes::Bytes;
+    use ndn_packet::{Data, Interest};
 
     #[test]
     fn encode_decode_interest_roundtrip() {
         let mut buf = [0u8; 256];
-        let n = encode_interest(&mut buf, &[b"ndn", b"test"], 0xDEAD_BEEF, 4000, false, false)
-            .expect("encode succeeded");
+        let n = encode_interest(
+            &mut buf,
+            &[b"ndn", b"test"],
+            0xDEAD_BEEF,
+            4000,
+            false,
+            false,
+        )
+        .expect("encode succeeded");
         let raw = Bytes::copy_from_slice(&buf[..n]);
         let interest = Interest::decode(raw).expect("decode succeeded");
         assert_eq!(interest.name.len(), 2);
@@ -266,7 +289,10 @@ mod tests {
         let raw = Bytes::copy_from_slice(&buf[..n]);
         let data = Data::decode(raw).expect("decode succeeded");
         assert_eq!(data.name.len(), 2);
-        assert_eq!(data.content().map(|b| b.as_ref()), Some(b"temperature=23" as &[u8]));
+        assert_eq!(
+            data.content().map(|b| b.as_ref()),
+            Some(b"temperature=23" as &[u8])
+        );
     }
 
     #[test]
@@ -292,6 +318,10 @@ mod tests {
         let mut buf = [0u8; 64];
         let _n = encode_interest(&mut buf, &[b"x"], 1, 0, false, false).unwrap();
         // The outer Interest TLV length (byte index 1) should be < 0xFD for a short name.
-        assert!(buf[1] < 0xFD, "expected minimal 1-byte length, got 0x{:02X}", buf[1]);
+        assert!(
+            buf[1] < 0xFD,
+            "expected minimal 1-byte length, got 0x{:02X}",
+            buf[1]
+        );
     }
 }

@@ -50,14 +50,14 @@ use ndn_security::{Ed25519Signer, Ed25519Verifier, Signer, VerifyOutcome};
 use ndn_transport::FaceId;
 use tracing::{debug, error, warn};
 
-use crate::{
-    DiscoveryContext, HelloPayload, InboundMeta,
-    LinkAddr, MacAddr, NeighborEntry, NeighborUpdate, ProtocolId,
-};
 use crate::config::{DiscoveryConfig, DiscoveryProfile};
 use crate::hello_protocol::HelloProtocol;
 use crate::link_medium::{HelloCore, HelloState, LinkMedium};
 use crate::wire::parse_raw_interest;
+use crate::{
+    DiscoveryContext, HelloPayload, InboundMeta, LinkAddr, MacAddr, NeighborEntry, NeighborUpdate,
+    ProtocolId,
+};
 
 const PROTOCOL: ProtocolId = ProtocolId("udp-nd");
 
@@ -155,11 +155,7 @@ impl UdpMedium {
         Arc::new(Ed25519Signer::from_seed(seed, key_name))
     }
 
-    fn create_udp_face(
-        &self,
-        ctx: &dyn DiscoveryContext,
-        peer_addr: SocketAddr,
-    ) -> Option<FaceId> {
+    fn create_udp_face(&self, ctx: &dyn DiscoveryContext, peer_addr: SocketAddr) -> Option<FaceId> {
         let bind_addr: SocketAddr = if peer_addr.is_ipv4() {
             "0.0.0.0:0".parse().unwrap()
         } else {
@@ -186,7 +182,10 @@ impl UdpMedium {
         let face_id = ctx.alloc_face_id();
         let face = UdpFace::from_socket(face_id, async_sock, peer_addr);
         let registered = ctx.add_face(std::sync::Arc::new(face));
-        self.peer_faces.lock().unwrap().insert(peer_addr, registered);
+        self.peer_faces
+            .lock()
+            .unwrap()
+            .insert(peer_addr, registered);
         debug!("UdpND: created unicast face {registered:?} -> {peer_addr}");
         Some(registered)
     }
@@ -198,16 +197,16 @@ impl UdpMedium {
         peer_name: &Name,
         peer_addr: SocketAddr,
     ) -> Option<FaceId> {
-        let existing = {
-            self.peer_faces.lock().unwrap().get(&peer_addr).copied()
-        };
+        let existing = { self.peer_faces.lock().unwrap().get(&peer_addr).copied() };
         let face_id = if let Some(fid) = existing {
             fid
         } else {
             self.create_udp_face(ctx, peer_addr)?
         };
         if ctx.neighbors().get(peer_name).is_none() {
-            ctx.update_neighbor(NeighborUpdate::Upsert(NeighborEntry::new(peer_name.clone())));
+            ctx.update_neighbor(NeighborUpdate::Upsert(NeighborEntry::new(
+                peer_name.clone(),
+            )));
         }
         ctx.update_neighbor(NeighborUpdate::AddFace {
             name: peer_name.clone(),
@@ -245,17 +244,19 @@ impl LinkMedium for UdpMedium {
         payload.unicast_port = self.unicast_port;
         let content = payload.encode();
 
-        let freshness_ms =
-            core.config.hello_interval_base.as_millis().min(u32::MAX as u128) as u64 * 2;
+        let freshness_ms = core
+            .config
+            .hello_interval_base
+            .as_millis()
+            .min(u32::MAX as u128) as u64
+            * 2;
 
         let signer = &self.signer;
         DataBuilder::new(interest_name.clone(), &content)
             .freshness(Duration::from_millis(freshness_ms))
-            .sign_sync(
-                signer.sig_type(),
-                signer.cert_name(),
-                |region| signer.sign_sync(region).unwrap_or_default(),
-            )
+            .sign_sync(signer.sig_type(), signer.cert_name(), |region| {
+                signer.sign_sync(region).unwrap_or_default()
+            })
     }
 
     fn handle_hello_interest(
@@ -416,8 +417,11 @@ mod tests {
         let parsed = parse_raw_interest(&pkt).unwrap();
         let comps = parsed.name.components();
         assert_eq!(comps.len(), crate::link_medium::HELLO_PREFIX_DEPTH + 1);
-        let decoded_nonce =
-            u32::from_be_bytes(comps[crate::link_medium::HELLO_PREFIX_DEPTH].value[..4].try_into().unwrap());
+        let decoded_nonce = u32::from_be_bytes(
+            comps[crate::link_medium::HELLO_PREFIX_DEPTH].value[..4]
+                .try_into()
+                .unwrap(),
+        );
         assert_eq!(decoded_nonce, nonce);
         assert!(parsed.app_params.is_none());
     }
@@ -480,8 +484,9 @@ mod tests {
         let nd = make_nd();
         {
             let mut st = nd.core.state.lock().unwrap();
-            st.recent_diffs
-                .push_back(crate::DiffEntry::Add(Name::from_str("/ndn/peer/alpha").unwrap()));
+            st.recent_diffs.push_back(crate::DiffEntry::Add(
+                Name::from_str("/ndn/peer/alpha").unwrap(),
+            ));
         }
         let interest_name = Name::from_str("/ndn/local/nd/hello/1").unwrap();
         let pkt = nd.medium.build_hello_data(&nd.core, &interest_name);
@@ -531,11 +536,12 @@ mod tests {
     fn protocol_id_and_prefix() {
         let nd = make_nd();
         assert_eq!(nd.medium.protocol_id(), PROTOCOL);
-        assert!(nd
-            .core
-            .claimed
-            .iter()
-            .any(|p| p == &Name::from_str(crate::link_medium::HELLO_PREFIX_STR).unwrap()));
+        assert!(
+            nd.core
+                .claimed
+                .iter()
+                .any(|p| p == &Name::from_str(crate::link_medium::HELLO_PREFIX_STR).unwrap())
+        );
     }
 
     #[test]

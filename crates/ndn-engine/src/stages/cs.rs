@@ -3,8 +3,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use tracing::trace;
 
-use ndn_pipeline::{Action, DecodedPacket, PacketContext};
 use ndn_packet::CachePolicyType;
+use ndn_pipeline::{Action, DecodedPacket, PacketContext};
 use ndn_store::{CsAdmissionPolicy, CsMeta, ErasedContentStore};
 
 use crate::stages::decode::LpCachePolicy;

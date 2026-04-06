@@ -31,7 +31,16 @@ pub fn unix_management_face_from_stream(
 ) -> UnixFace {
     let uri = format!("unix://{}", path.as_ref().display());
     let (r, w) = stream.into_split();
-    StreamFace::new(id, FaceKind::Management, false, None, Some(uri), r, w, TlvCodec)
+    StreamFace::new(
+        id,
+        FaceKind::Management,
+        false,
+        None,
+        Some(uri),
+        r,
+        w,
+        TlvCodec,
+    )
 }
 
 /// Connect to a Unix socket at `path` and return a [`UnixFace`].

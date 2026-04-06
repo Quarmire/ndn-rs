@@ -102,10 +102,11 @@ impl Face for WebSocketFace {
     async fn recv(&self) -> Result<Bytes, FaceError> {
         let mut reader = self.reader.lock().await;
         loop {
-            let msg =
-                reader.next().await.ok_or(FaceError::Closed)?.map_err(|e| {
-                    FaceError::Io(std::io::Error::other(e))
-                })?;
+            let msg = reader
+                .next()
+                .await
+                .ok_or(FaceError::Closed)?
+                .map_err(|e| FaceError::Io(std::io::Error::other(e)))?;
 
             match msg {
                 Message::Binary(data) => {

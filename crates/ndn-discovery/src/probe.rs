@@ -201,7 +201,11 @@ pub fn parse_indirect_probe(raw: &Bytes) -> Option<IndirectProbe> {
     let intermediary = Name::from_components(comps[inter_start..inter_end].iter().cloned());
     let target = Name::from_components(comps[inter_end..target_end].iter().cloned());
 
-    Some(IndirectProbe { intermediary, target, nonce })
+    Some(IndirectProbe {
+        intermediary,
+        target,
+        nonce,
+    })
 }
 
 /// Build an indirect probe with the length-prefix encoding.
@@ -250,7 +254,9 @@ pub struct IndirectProbe {
 
 /// Check whether the raw packet is a probe ACK Data (empty-content reply).
 pub fn is_probe_ack(raw: &Bytes) -> bool {
-    let Some(parsed) = parse_raw_data(raw) else { return false };
+    let Some(parsed) = parse_raw_data(raw) else {
+        return false;
+    };
     let name = &parsed.name;
     name.has_prefix(probe_direct()) || name.has_prefix(probe_via())
 }
@@ -263,7 +269,9 @@ mod tests {
 
     use super::*;
 
-    fn n(s: &str) -> Name { Name::from_str(s).unwrap() }
+    fn n(s: &str) -> Name {
+        Name::from_str(s).unwrap()
+    }
 
     #[test]
     fn direct_probe_roundtrip() {
