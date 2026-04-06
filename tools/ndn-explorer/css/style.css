@@ -74,8 +74,20 @@ nav {
 .nav-btn:hover { color: var(--text); background: var(--surface2); }
 .nav-btn.active { color: var(--accent); border-color: var(--accent); }
 
-#search-box {
+.nav-wiki-link {
   margin-left: auto;
+  font-size: 0.82rem;
+  color: var(--text2);
+  border: 1px solid var(--border);
+  padding: 0.35rem 0.7rem;
+  border-radius: 6px;
+  transition: all 0.15s;
+  white-space: nowrap;
+  text-decoration: none;
+}
+.nav-wiki-link:hover { color: var(--text); background: var(--surface2); text-decoration: none; }
+
+#search-box {
   background: var(--surface2);
   border: 1px solid var(--border);
   color: var(--text);
@@ -178,7 +190,10 @@ main {
   white-space: nowrap;
 }
 .badge-green { color: var(--green); border-color: var(--green); }
-.badge-accent { color: var(--accent); border-color: var(--accent); }
+.badge-accent { color: var(--accent); border-color: var(--accent); text-decoration: none; }
+.badge-accent:hover { text-decoration: underline; }
+.badge-wiki { color: var(--purple); border-color: var(--purple); text-decoration: none; }
+.badge-wiki:hover { text-decoration: underline; }
 
 /* ── Crate Detail ─────────────────────────────────────────────────────────── */
 
@@ -227,11 +242,22 @@ main {
   list-style: none;
 }
 .type-list li {
-  padding: 0.2rem 0;
+  padding: 0.15rem 0;
   font-family: 'SFMono-Regular', Consolas, monospace;
   font-size: 0.82rem;
-  color: var(--purple);
 }
+
+.type-link {
+  background: none;
+  border: none;
+  font-family: inherit;
+  font-size: inherit;
+  color: var(--purple);
+  cursor: pointer;
+  padding: 0;
+  text-align: left;
+}
+.type-link:hover { text-decoration: underline; color: #e0b4ff; }
 
 .dep-list { list-style: none; }
 .dep-list li {

@@ -1,5 +1,6 @@
 import { LayerMap } from './views/layer-map.js';
 import { CrateDetail } from './views/crate-detail.js';
+import { TypeDetail } from './views/type-detail.js';
 import { DepGraph } from './views/dep-graph.js';
 import { PipelineTrace } from './views/pipeline-trace.js';
 import { Search } from './views/search.js';
@@ -31,23 +32,21 @@ class App {
     const resp = await fetch('data/crates.json');
     this.data = await resp.json();
 
-    // Grab DOM containers
     const containers = {};
     document.querySelectorAll('.view').forEach(el => {
       containers[el.id] = el;
     });
 
-    // Instantiate views
     this.views = {
       'layer-map':      new LayerMap(containers['layer-map'], this),
       'crate-detail':   new CrateDetail(containers['crate-detail'], this),
+      'type-detail':    new TypeDetail(containers['type-detail'], this),
       'dep-graph':      new DepGraph(containers['dep-graph'], this),
       'pipeline-trace': new PipelineTrace(containers['pipeline-trace'], this),
       'search':         new Search(containers['search'], this),
       'tour':           new Tour(containers['tour'], this),
     };
 
-    // Render initial content for views that pre-render
     this.views['layer-map'].render();
     this.views['pipeline-trace'].render();
     this.views['tour'].render();
@@ -101,17 +100,14 @@ class App {
   show(viewId, params) {
     this.currentView = viewId;
 
-    // Toggle active class on view containers
     document.querySelectorAll('.view').forEach(el => {
       el.classList.toggle('active', el.id === viewId);
     });
 
-    // Toggle active class on nav buttons
     document.querySelectorAll('.nav-btn').forEach(btn => {
       btn.classList.toggle('active', btn.dataset.view === viewId);
     });
 
-    // Notify the view
     const view = this.views[viewId];
     if (view && view.onShow) view.onShow(params);
   }
@@ -127,6 +123,10 @@ class App {
 
   showCrate(name) {
     this.navigate('crate-detail', { name });
+  }
+
+  showType(typeName, crateName) {
+    this.navigate('type-detail', { typeName, crateName });
   }
 
   getCrate(name) {

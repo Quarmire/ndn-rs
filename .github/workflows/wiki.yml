@@ -1,10 +1,11 @@
-name: Wiki
+name: Wiki + Explorer
 
 on:
   push:
     branches: [main]
     paths:
       - 'docs/wiki/**'
+      - 'tools/ndn-explorer/**'
       - '.github/workflows/wiki.yml'
   workflow_dispatch:
 
@@ -40,10 +41,84 @@ jobs:
       - name: Build wiki
         run: mdbook build docs/wiki
 
+      # Assemble the site:
+      #   /             → landing page
+      #   /wiki/        → mdBook output
+      #   /explorer/    → static explorer app
+      - name: Assemble site
+        run: |
+          mkdir -p target/site
+          cp -r target/wiki target/site/wiki
+          cp -r tools/ndn-explorer target/site/explorer
+          cat > target/site/index.html << 'HTML'
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <title>ndn-rs</title>
+            <style>
+              :root { color-scheme: dark; }
+              * { margin: 0; padding: 0; box-sizing: border-box; }
+              body {
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+                background: #0d1117; color: #e6edf3;
+                display: flex; flex-direction: column;
+                align-items: center; justify-content: center;
+                min-height: 100vh; gap: 2rem; padding: 2rem;
+              }
+              h1 { font-size: 2rem; color: #58a6ff; }
+              p { color: #8b949e; max-width: 480px; text-align: center; line-height: 1.6; }
+              .cards {
+                display: flex; gap: 1.5rem; flex-wrap: wrap; justify-content: center;
+              }
+              .card {
+                background: #161b22; border: 1px solid #30363d; border-radius: 10px;
+                padding: 1.5rem 2rem; text-decoration: none; color: inherit;
+                transition: border-color 0.15s, transform 0.1s;
+                min-width: 200px; text-align: center;
+              }
+              .card:hover { border-color: #58a6ff; transform: translateY(-2px); }
+              .card-icon { font-size: 2.5rem; margin-bottom: 0.5rem; }
+              .card h2 { font-size: 1.05rem; color: #58a6ff; margin-bottom: 0.3rem; }
+              .card p { font-size: 0.82rem; color: #8b949e; margin: 0; }
+              footer { font-size: 0.78rem; color: #8b949e; }
+              footer a { color: #58a6ff; text-decoration: none; }
+            </style>
+          </head>
+          <body>
+            <div>
+              <h1>ndn-rs</h1>
+              <p style="margin-top:0.5rem">Named Data Networking forwarder stack in Rust</p>
+            </div>
+            <div class="cards">
+              <a class="card" href="explorer/">
+                <div class="card-icon">🗺️</div>
+                <h2>Explorer</h2>
+                <p>Interactive crate map, dependency graph, and pipeline trace</p>
+              </a>
+              <a class="card" href="wiki/">
+                <div class="card-icon">📖</div>
+                <h2>Wiki</h2>
+                <p>Architecture deep-dives, design decisions, and guides</p>
+              </a>
+              <a class="card" href="https://github.com/Quarmire/ndn-rs" target="_blank" rel="noopener">
+                <div class="card-icon">⚙️</div>
+                <h2>Source</h2>
+                <p>Browse the repository on GitHub</p>
+              </a>
+            </div>
+            <footer>
+              <a href="https://github.com/Quarmire/ndn-rs">github.com/Quarmire/ndn-rs</a>
+            </footer>
+          </body>
+          </html>
+          HTML
+
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: target/wiki
+          path: target/site
 
   deploy:
     needs: build
