@@ -8,7 +8,7 @@ This stack takes a Rust-idiomatic approach: composable async pipelines with trai
 
 ## Status
 
-Early development. The workspace skeleton and core data structures compile. Active design and implementation in progress.
+Active development. The forwarder engine, pipeline stages, all face types, security, discovery, IPC, and simulation infrastructure are implemented. See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the full crate map.
 
 ## Features
 
@@ -30,27 +30,39 @@ Early development. The workspace skeleton and core data structures compile. Acti
 ```
 ndn-rs/
 ├── crates/
-│   ├── ndn-tlv          # varu64, TlvReader/Writer, COBS framing
-│   ├── ndn-packet       # Name, Interest, Data, Nack — no async, embeddable
-│   ├── ndn-transport    # Face trait, FaceId, FaceTable
-│   ├── ndn-store        # NameTrie, Pit, ContentStore + LruCs/ShardedCs
-│   ├── ndn-pipeline     # PipelineStage, PacketContext, Action
-│   ├── ndn-strategy     # BestRoute, Multicast, ASF, MultiRadio strategies
-│   ├── ndn-security     # Signer, Verifier, TrustSchema, Validator, SafeData
-│   ├── ndn-engine       # ForwarderEngine, EngineBuilder, task topology
-│   ├── ndn-app          # AppFace, express(), produce(), subscribe()
-│   ├── ndn-ipc          # IpcServer/Client, ChunkedTransfer, ServiceRegistry
-│   ├── ndn-face-net     # UdpFace, TcpFace, MulticastUdpFace
-│   ├── ndn-face-local   # AppFace (iceoryx2 / Unix socket)
-│   ├── ndn-face-serial  # SerialFace (COBS), BluetoothFace
-│   ├── ndn-face-l2 # NamedEtherFace (AF_PACKET), WfbFace
-│   ├── ndn-compute      # ComputeFace, ComputeRegistry
-│   ├── ndn-sync         # SVS, PSync dataset synchronisation
-│   └── ndn-research     # FlowObserverStage, RadioTable, nl80211
-└── binaries/
-    ├── ndn-router       # Standalone forwarder
-    ├── ndn-tools        # ndn-peek, ndn-put, ndn-ping, ndn-traffic, ndn-iperf
-    └── ndn-bench        # Throughput and latency benchmarking
+│   ├── ndn-tlv            # varu64, TlvReader/Writer — no_std
+│   ├── ndn-packet         # Name, Interest, Data, Nack — no_std, lazy decode
+│   ├── ndn-transport      # Face trait, FaceId, FaceTable, StreamFace
+│   ├── ndn-store          # NameTrie, Fib, Pit, ContentStore (LruCs/ShardedCs/FjallCs)
+│   ├── ndn-pipeline       # PipelineStage, PacketContext, Action
+│   ├── ndn-strategy       # BestRoute, Multicast, ASF, composed strategies
+│   ├── ndn-security       # Signer, Verifier, TrustSchema, Validator, SafeData
+│   ├── ndn-engine         # ForwarderEngine, EngineBuilder, task topology
+│   ├── ndn-app            # Application API: express(), produce(), subscribe()
+│   ├── ndn-ipc            # IpcClient/Server, ChunkedTransfer, ServiceRegistry
+│   ├── ndn-config         # TOML config parsing, NFD management protocol
+│   ├── ndn-discovery      # SWIM neighbor discovery, service discovery
+│   ├── ndn-face-net       # UdpFace, TcpFace, MulticastUdpFace, WebSocketFace
+│   ├── ndn-face-local     # AppFace, UnixFace, ShmFace
+│   ├── ndn-face-serial    # SerialFace (COBS framing)
+│   ├── ndn-face-l2        # NamedEtherFace, WfbFace, BluetoothFace
+│   ├── ndn-sim            # SimFace, SimLink, topology builder, event tracer
+│   ├── ndn-compute        # ComputeFace, ComputeRegistry
+│   ├── ndn-sync           # SVS, PSync dataset synchronisation
+│   ├── ndn-research       # FlowObserverStage, FlowTable, ChannelManager
+│   ├── ndn-strategy-wasm  # Hot-loadable WASM strategies
+│   └── ndn-embedded       # Minimal no_std forwarder for bare-metal
+├── binaries/
+│   ├── ndn-router         # Standalone forwarder
+│   ├── ndn-tools          # ndn-peek, ndn-put, ndn-ping, ndn-traffic, ndn-iperf
+│   └── ndn-bench          # Throughput and latency benchmarking
+├── bindings/
+│   └── ndn-python         # PyO3 Python bindings
+└── tools/
+    ├── ndn-dashboard      # NDN-native management dashboard (WebSocket)
+    ├── ndn-explorer       # Interactive codebase explorer
+    ├── ndn-mcp            # MCP server for AI assistants
+    └── bench-charts       # Benchmark chart generator
 ```
 
 Dependency layers flow strictly downward: `ndn-tlv` and `ndn-packet` have no async dependency and can compile `no_std` for embedded sensor nodes.
@@ -258,11 +270,22 @@ face   = 1
 cost   = 0
 ```
 
+## Tools
+
+| Tool | Description |
+|------|-------------|
+| [`tools/ndn-dashboard/`](tools/ndn-dashboard/) | NDN-native management dashboard — connects to ndn-router via WebSocket and communicates using NDN Interest/Data |
+| [`tools/ndn-explorer/`](tools/ndn-explorer/) | Interactive codebase explorer — browse crate architecture, types, and pipeline stages |
+| [`tools/ndn-mcp/`](tools/ndn-mcp/) | MCP server for AI assistants — crate lookup, type search, spec gaps, pipeline stage info |
+| [`tools/bench-charts/`](tools/bench-charts/) | Benchmark chart generator — parses criterion output and produces SVG comparison charts |
+| [`docs/wiki/`](docs/wiki/) | mdBook wiki — design decisions, deep dives, guides, and comparisons with NFD/ndnd |
+
 ## Design Documentation
 
 | Document | Contents |
 |----------|----------|
-| [`docs/architecture.md`](docs/architecture.md) | Design philosophy, key decisions, crate layer graph, task topology, phased build order |
+| [`ARCHITECTURE.md`](ARCHITECTURE.md) | Crate map, key abstractions, pipeline flow, data structures |
+| [`docs/architecture.md`](docs/architecture.md) | Design philosophy, key decisions, crate layer graph, task topology |
 | [`docs/tlv-encoding.md`](docs/tlv-encoding.md) | varu64, TlvReader zero-copy design, OnceLock partial decode, critical-bit rule, TlvWriter, COBS |
 | [`docs/packet-types.md`](docs/packet-types.md) | Name, Interest, Data signed region, PacketContext fields with rationale, AnyMap |
 | [`docs/pipeline.md`](docs/pipeline.md) | PipelineStage trait, Action enum, Interest/Data stage sequences, StrategyStage integration, ForwardAfter scheduling |
@@ -273,9 +296,11 @@ cost   = 0
 | [`docs/security.md`](docs/security.md) | Signed region, Signer/Verifier traits, trust schema pattern matching, cert cache, SafeData, KeyStore |
 | [`docs/ipc.md`](docs/ipc.md) | Transport tiers, iceoryx2, chunked transfer, push notification approaches, service registry, local trust |
 | [`docs/wireless.md`](docs/wireless.md) | Reverse path constraint, discovery approaches, multi-radio architecture, ChannelManager, tc eBPF, named MAC |
+| [`docs/discovery.md`](docs/discovery.md) | SWIM neighbor discovery, service discovery protocol |
 | [`docs/compute.md`](docs/compute.md) | Levels 1–4 in-network compute, ComputeFace, aggregation PIT |
-
-The full design conversation that produced this architecture is preserved in [`docs/design-session.md`](docs/design-session.md).
+| [`docs/spsc-shm-spec.md`](docs/spsc-shm-spec.md) | Shared memory ring buffer specification |
+| [`docs/spec-gaps.md`](docs/spec-gaps.md) | NDN spec compliance gaps and deviations |
+| [`docs/unimplemented.md`](docs/unimplemented.md) | Planned but not yet implemented features |
 
 ## Architecture at a Glance
 
@@ -308,6 +333,12 @@ The `ndn-research` crate provides extension points for wireless and networking r
 - **`ChannelManager`** — reads nl80211 survey data, publishes as named NDN content, subscribes to neighbor state; handles channel switching with FIB/PIT consistency
 
 The engine exposes `Arc` handles to all internal tables, so a research controller is just another Tokio task — no IPC boundary, microsecond observation-to-action latency.
+
+## Acknowledgments
+
+This project builds on the [Named Data Networking](https://named-data.net/) architecture developed by the NDN research team led by Lixia Zhang at UCLA, with contributions from teams at NIST, University of Memphis, University of Arizona, and others. See the [NDN publications](https://named-data.net/publications/) for the foundational research.
+
+The protocol specifications, packet format, and forwarding semantics are defined by the NDN team's RFCs and technical reports. This implementation aims for compatibility with the [NFD](https://github.com/named-data/NFD) reference forwarder and [ndn-cxx](https://github.com/named-data/ndn-cxx) client library where applicable.
 
 ## License
 
