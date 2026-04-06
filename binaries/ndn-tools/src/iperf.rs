@@ -41,8 +41,14 @@ use ndn_transport::CongestionController;
 
 #[derive(Args, Clone)]
 struct ConnectOpts {
-    /// Router face socket path.
-    #[arg(long, default_value = "/tmp/ndn-faces.sock")]
+    /// Router IPC socket path.
+    ///
+    /// Unix: path to a Unix domain socket (e.g. `/tmp/ndn-faces.sock`).
+    /// Windows: a Named Pipe path (e.g. `\\.\pipe\ndn-faces`).
+    #[arg(
+        long,
+        default_value_t = ndn_config::ManagementConfig::default().face_socket,
+    )]
     face_socket: String,
 
     /// Disable SHM and use Unix socket for data plane.
@@ -249,6 +255,14 @@ async fn run_server(
 ) -> Result<()> {
     let client = connect(conn).await?;
     client.register_prefix(prefix).await?;
+
+    // Announce the prefix to service discovery so other nodes can find this
+    // server via `ndn-ctl service list` or NDN service browsing.
+    // Gracefully skip if the router does not have discovery enabled.
+    match client.mgmt.service_announce(prefix).await {
+        Ok(_) => eprintln!("  service discovery: announced {prefix}"),
+        Err(e) => eprintln!("  service discovery: not available ({e}), skipping"),
+    }
 
     let transport = if client.is_shm() { "SHM" } else { "Unix" };
     eprintln!("ndn-iperf server: prefix={prefix} transport={transport} payload={payload_size}B");
