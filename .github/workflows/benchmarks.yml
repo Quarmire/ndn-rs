@@ -1,10 +1,8 @@
 name: benchmarks
 
 on:
-  # Run on pushes to main for trend tracking
   push:
     branches: [main]
-  # Allow manual triggering
   workflow_dispatch:
 
 permissions:
@@ -44,29 +42,79 @@ jobs:
       - name: Run ndn-security benchmarks
         run: cargo bench -p ndn-security --bench security -- --output-format bencher 2>/dev/null | tee bench-security.txt
 
-      - name: Combine results
-        run: cat bench-*.txt > bench-all.txt
-
-      - name: Create gh-pages branch if missing
+      - name: Update wiki benchmark page
         run: |
-          if ! git ls-remote --exit-code origin gh-pages >/dev/null 2>&1; then
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git switch --orphan gh-pages
-            git commit --allow-empty -m "Initialize gh-pages for benchmark data"
-            git push origin gh-pages
-            git checkout "$GITHUB_SHA"
-          fi
+          python3 - <<'PYEOF'
+          import re, datetime, pathlib
 
-      - name: Store benchmark result
-        uses: benchmark-action/github-action-benchmark@v1
-        with:
-          name: NDN-RS Benchmarks
-          tool: cargo
-          output-file-path: bench-all.txt
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          auto-push: true
-          benchmark-data-dir-path: bench
-          alert-threshold: "110%"
-          comment-on-alert: true
-          fail-on-alert: false
+          # Parse bencher format: "test <name> ... bench: <n> ns/iter (+/- <v>)"
+          results = []
+          for f in sorted(pathlib.Path('.').glob('bench-*.txt')):
+              for line in f.read_text().splitlines():
+                  m = re.match(
+                      r'test\s+(\S+)\s+\.\.\.\s+bench:\s+([\d,]+)\s+ns/iter\s+\(\+/-\s+([\d,]+)\)',
+                      line.strip()
+                  )
+                  if m:
+                      name = m.group(1)
+                      ns   = int(m.group(2).replace(',', ''))
+                      var  = int(m.group(3).replace(',', ''))
+                      results.append((name, ns, var))
+
+          if not results:
+              print("No benchmark results found — skipping wiki update")
+              exit(0)
+
+          # Build markdown table, grouping by prefix (first path component)
+          def fmt_ns(n):
+              if n >= 1_000_000:
+                  return f"{n/1_000_000:.2f} ms"
+              if n >= 1_000:
+                  return f"{n/1_000:.2f} µs"
+              return f"{n} ns"
+
+          def group_key(name):
+              return name.split('/')[0] if '/' in name else 'other'
+
+          from itertools import groupby
+          results.sort(key=lambda r: (group_key(r[0]), r[0]))
+
+          lines = []
+          lines.append(f"*Last updated by CI on {datetime.date.today().isoformat()} (ubuntu-latest, stable Rust)*\n")
+
+          prev_group = None
+          lines.append("| Benchmark | Median | ± Variance |")
+          lines.append("|-----------|--------|------------|")
+          for name, ns, var in results:
+              g = group_key(name)
+              if g != prev_group:
+                  if prev_group is not None:
+                      lines.append(f"| | | |")
+                  prev_group = g
+              lines.append(f"| `{name}` | {fmt_ns(ns)} | ±{fmt_ns(var)} |")
+
+          table = '\n'.join(lines)
+
+          wiki_path = pathlib.Path('docs/wiki/src/benchmarks/pipeline-benchmarks.md')
+          content = wiki_path.read_text()
+          new_content = re.sub(
+              r'<!-- BENCH_RESULTS_START -->.*?<!-- BENCH_RESULTS_END -->',
+              f'<!-- BENCH_RESULTS_START -->\n{table}\n<!-- BENCH_RESULTS_END -->',
+              content,
+              flags=re.DOTALL
+          )
+          wiki_path.write_text(new_content)
+          print(f"Updated {wiki_path} with {len(results)} benchmark results")
+          PYEOF
+
+      - name: Commit updated wiki page
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/wiki/src/benchmarks/pipeline-benchmarks.md
+          if git diff --cached --quiet; then
+            echo "No changes to benchmark results"
+          else
+            git commit -m "chore: update benchmark results [skip ci]"
+            git push origin main
+          fi
