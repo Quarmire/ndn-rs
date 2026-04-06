@@ -1,0 +1,22 @@
+[book]
+title = "ndn-rs Wiki"
+authors = ["ndn-rs contributors"]
+language = "en"
+multilingual = false
+src = "src"
+
+[build]
+build-dir = "../../target/wiki"
+
+[output.html]
+default-theme = "navy"
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/user/ndn-rs"
+edit-url-template = "https://github.com/user/ndn-rs/edit/main/docs/wiki/src/{path}"
+
+[preprocessor.mermaid]
+command = "mdbook-mermaid"
+
+[output.html.fold]
+enable = true
+level = 1
