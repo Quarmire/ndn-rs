@@ -1,0 +1,303 @@
+# ndn-router.example.toml
+#
+# Complete reference configuration for ndn-router.
+# Every option is listed with its default value shown in a comment.
+# Copy this file, uncomment and adjust what you need.
+#
+# Load with:  ndn-router --config ndn-router.toml
+# Or set:     NDN_CONFIG=/path/to/ndn-router.toml
+
+# ─── Engine ──────────────────────────────────────────────────────────────────
+# Core forwarding-engine tuning.
+
+[engine]
+# Content store capacity in megabytes.
+# 0 disables the CS entirely (benchmark/lab use).
+# Deprecated in favour of [cs] capacity_mb; both are honoured for
+# backward compatibility — [cs] takes precedence when present.
+cs_capacity_mb = 64
+
+# Depth of the inter-task channel that feeds the pipeline runner.
+# Increase when you see "channel full, packet dropped" warnings under load.
+# Default: 4096
+pipeline_channel_cap = 4096
+
+# Number of parallel pipeline tasks.
+#   0  — auto-detect from CPU parallelism (default)
+#   1  — single-threaded inline execution (lowest latency)
+#   N  — up to N concurrent tasks per batch (highest throughput)
+# Default: 0
+pipeline_threads = 0
+
+
+# ─── Content Store ────────────────────────────────────────────────────────────
+
+[cs]
+# CS backend variant.
+#   "lru"         — simple LRU eviction (default)
+#   "sharded-lru" — N independent LRU shards; less lock contention under load
+#   "null"        — discard all content immediately (benchmarking only)
+# Default: "lru"
+variant = "lru"
+
+# Maximum cached data in megabytes.
+# Default: 64
+capacity_mb = 64
+
+# Number of shards.  Only relevant for "sharded-lru".
+# Good values: 4–16 (power-of-two recommended).
+# Default: (absent — engine picks a sensible default)
+# shards = 4
+
+# Cache admission policy.
+#   "default"   — admit Data only when it satisfies a PIT entry (NDN spec)
+#   "admit-all" — cache everything regardless of outstanding Interests
+# Default: "default"
+admission_policy = "default"
+
+
+# ─── Faces ────────────────────────────────────────────────────────────────────
+# Zero or more [[face]] entries.  The order determines the zero-based face
+# index used in [[route]] entries.
+#
+# Face indices are assigned sequentially at startup:
+#   [[face]] index 0 → face 0
+#   [[face]] index 1 → face 1  … etc.
+
+# UDP unicast face — listen for incoming NDN packets.
+[[face]]
+kind = "udp"
+# Local bind address and port.  Omit to let the OS pick an ephemeral port.
+# Default: (none — OS assigns)
+bind = "0.0.0.0:6363"
+# Remote endpoint for a point-to-point UDP tunnel.
+# When set, the face only sends/receives from this address.
+# Default: (none — accept from any source)
+# remote = "10.0.0.1:6363"
+
+# TCP unicast face — outbound connection to a remote router.
+# [[face]]
+# kind = "tcp"
+# bind = "0.0.0.0:6363"     # optional local bind
+# remote = "192.168.1.1:6363"
+
+# IPv4 multicast face — link-local neighbourhood discovery.
+[[face]]
+kind = "multicast"
+# Multicast group address.
+# NDN well-known group: 224.0.23.170 (IANA assigned)
+group = "224.0.23.170"
+# UDP port.  NDN default: 56363
+port = 56363
+# Network interface to join on.
+# Default: (absent — OS picks the default interface)
+# interface = "eth0"
+
+# Raw Ethernet multicast face (requires CAP_NET_RAW / sudo on Linux).
+# Uses EtherType 0x8624 (NDN assigned).
+# [[face]]
+# kind = "ether-multicast"
+# interface = "eth0"    # required
+
+# Unix domain socket face — local app connectivity (Linux/macOS).
+# [[face]]
+# kind = "unix"
+# path = "/tmp/ndn-app.sock"   # default: OS-assigned abstract socket
+
+# WebSocket face — browser or remote NDN-WS client.
+# [[face]]
+# kind = "web-socket"
+# bind = "0.0.0.0:9696"   # listen mode
+# url  = "ws://remote:9696"  # connect mode (mutually exclusive with bind)
+
+# Serial face — point-to-point over RS-232 / USB-serial.
+# [[face]]
+# kind = "serial"
+# path = "/dev/ttyUSB0"   # required
+# baud = 115200           # default: 115200
+
+
+# ─── Static Routes ────────────────────────────────────────────────────────────
+# Zero or more [[route]] entries pre-load the FIB at startup.
+# Runtime routes can be added via `ndn-ctl route add`.
+
+[[route]]
+# NDN name prefix (longest-prefix match).
+prefix = "/ndn"
+# Zero-based index into the [[face]] list above.
+face = 0
+# Forwarding cost — lower wins when multiple nexthops exist.
+# Default: 10
+cost = 10
+
+# [[route]]
+# prefix = "/localhop"
+# face = 1
+# cost = 5
+
+
+# ─── Management ───────────────────────────────────────────────────────────────
+
+[management]
+# Primary management transport.
+#   "ndn"    — NFD Interest/Data protocol over the face socket (default)
+#   "bypass" — raw JSON over a Unix socket; use when the NDN pipeline is
+#               not yet initialised or for debugging
+# Default: "ndn"
+transport = "ndn"
+
+# Socket path for NDN face connections.
+# Apps and ndn-ctl connect here to exchange Interest/Data packets.
+# Unix: path to Unix domain socket.
+# Windows: Named Pipe path.
+# Default (Unix):   /tmp/ndn-faces.sock
+# Default (Windows): \\.\pipe\ndn-faces
+face_socket = "/tmp/ndn-faces.sock"
+
+# Socket path for the legacy bypass JSON transport.
+# Only used when transport = "bypass".
+# Default (Unix):   /tmp/ndn-router.sock
+# Default (Windows): \\.\pipe\ndn-router
+bypass_socket = "/tmp/ndn-router.sock"
+
+
+# ─── Security ────────────────────────────────────────────────────────────────
+
+[security]
+# NDN identity name for this router.
+# The corresponding key must exist in the PIB, or auto_init must be true.
+# Default: (none — security layer is not activated)
+# identity = "/ndn/site/router1"
+
+# Path to the PIB directory holding keys and certificates.
+# Default: ~/.ndn/pib
+# pib_path = "/var/lib/ndn/pib"
+
+# Path to an additional trust-anchor certificate file loaded at startup.
+# Supplements any anchors already stored in the PIB.
+# Default: (none)
+# trust_anchor = "/etc/ndn/trust-anchor.ndnc"
+
+# Require all forwarded Data packets to carry a valid signature.
+# Set to true only after trust anchors and keys are fully provisioned.
+# Default: false
+require_signed = false
+
+# Automatically generate an identity and self-signed cert on first startup
+# if the PIB has no keys for `identity`.  Requires identity to be set.
+# Default: false
+auto_init = false
+
+# Security profile.
+#   "default"        — full chain validation with hierarchical trust schema
+#   "accept-signed"  — verify signatures but skip chain walking (faster)
+#   "disabled"       — no validation (lab / benchmarking only)
+# Default: "default"
+profile = "default"
+
+
+# ─── Logging ─────────────────────────────────────────────────────────────────
+
+[logging]
+# Tracing filter string.
+#
+# Simple examples:
+#   "error"                   — errors only
+#   "warn"                    — warnings and errors
+#   "info"                    — lifecycle events (default)
+#   "debug"                   — per-packet detail
+#   "trace"                   — extremely verbose
+#
+# Per-crate overrides (EnvFilter syntax):
+#   "info,ndn_engine=debug"        — engine at debug, everything else at info
+#   "warn,ndn_discovery=trace"     — discovery trace, silence everything else
+#   "ndn_engine=debug,ndn_discovery=debug,warn"
+#
+# Overridden at runtime by $RUST_LOG or --log-level flag.
+# Default: "info"
+level = "info"
+
+# Write logs to this file in addition to stderr.
+# Parent directories are created automatically.
+# Default: (none — stderr only)
+# file = "/var/log/ndn/router.log"
+
+
+# ─── Discovery ────────────────────────────────────────────────────────────────
+# Neighbour discovery and service record distribution.
+# Disabled unless node_name is set.
+
+[discovery]
+# This router's NDN name — required to enable discovery.
+#
+# Trailing slash auto-appends the system hostname:
+#   "/ndn/site/"  →  "/ndn/site/router1"   (hostname = "router1")
+#
+# Default: (none — discovery disabled)
+node_name = "/ndn/site/router1"
+
+# Deployment profile — selects a tuned parameter set.
+#   "static"        — no hello traffic; FIB configured manually
+#   "lan"           — link-local LAN; 5 s base hello, 60 s max  (default)
+#   "campus"        — enterprise; 30 s base hello, 300 s max, SWIM + gossip
+#   "mobile"        — vehicular / pedestrian; 200 ms base hello, reactive
+#   "high-mobility" — drones / V2X; 50 ms base hello, passive overhearing
+#   "asymmetric"    — unidirectional link (Wifibroadcast, satellite)
+# Default: "lan"
+profile = "lan"
+
+# Service prefixes published into the network at startup via service records.
+# Runtime additions: ndn-ctl service announce /prefix
+# Default: []
+served_prefixes = ["/ndn/site/sensors", "/ndn/site/video"]
+
+# ── Per-field overrides (all optional; take precedence over profile defaults) ─
+
+# Initial hello interval in milliseconds.
+# Profile defaults: static=3600000, lan=5000, campus=30000, mobile=200,
+#                   high-mobility=50, asymmetric=5000
+# hello_interval_base_ms = 5000
+
+# Maximum hello interval after full exponential backoff.
+# Profile defaults: static=3600000, lan=60000, campus=300000, mobile=2000,
+#                   high-mobility=500, asymmetric=30000
+# hello_interval_max_ms = 60000
+
+# Consecutive missed hellos before a peer is removed (Stale → Absent).
+# Profile defaults: static=4294967295, lan=3, campus=3, mobile=5,
+#                   high-mobility=3, asymmetric=3
+# liveness_miss_count = 3
+
+# SWIM indirect-probe fanout K.
+# 0 disables SWIM; peers go directly from Stale → Absent on miss.
+# Profile defaults: static=0, lan=0, campus=3, mobile=3, high-mobility=5,
+#                   asymmetric=0
+# swim_indirect_fanout = 0
+
+# Emergency gossip-broadcast fanout when a peer goes Stale.
+# 0 disables gossip.
+# Profile defaults: static=0, lan=0, campus=3, mobile=5, high-mobility=5,
+#                   asymmetric=0
+# gossip_fanout = 0
+
+# Automatically add FIB routes when service records arrive from peers.
+# Routes are added at auto_fib_cost and expire after
+#   freshness_period × auto_fib_ttl_multiplier milliseconds.
+# (Controlled by the service-discovery layer; not directly in profile.)
+# auto_fib_cost = 100
+# auto_fib_ttl_multiplier = 2.0
+
+# Relay incoming service records to other established neighbours.
+# Enables multi-hop service discovery across router boundaries.
+# Default: false
+# relay_records = false
+
+# PIB path for persistent hello-signing keys.
+# Default: ~/.ndn/pib.db
+# pib_path = "/var/lib/ndn/pib.db"
+
+# Key name for signing hello Data packets.
+# If absent, an ephemeral Ed25519 key is generated deterministically
+# from the node name (good for bootstrapping; use a persistent key in
+# production so signature verification survives restarts).
+# key_name = "/ndn/site/router1/KEY/ed25519-default"
