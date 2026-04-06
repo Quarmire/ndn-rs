@@ -230,6 +230,27 @@ impl MgmtClient {
         self.command(module::SERVICE, verb::WITHDRAW, &params).await
     }
 
+    /// Browse all known service records (local + received from peers): `service/browse`.
+    ///
+    /// When `prefix` is `Some`, the router returns only records whose
+    /// `announced_prefix` has `prefix` as a prefix (server-side filter).
+    pub async fn service_browse(
+        &self,
+        prefix: Option<&Name>,
+    ) -> Result<ControlResponse, RouterError> {
+        let name = match prefix {
+            None => dataset_name(module::SERVICE, verb::BROWSE),
+            Some(p) => {
+                let params = ControlParameters {
+                    name: Some(p.clone()),
+                    ..Default::default()
+                };
+                command_name(module::SERVICE, verb::BROWSE, &params)
+            }
+        };
+        self.send_interest(name).await
+    }
+
     // ─── Status ─────────────────────────────────────────────────────────
 
     /// General forwarder status: `status/general`.
