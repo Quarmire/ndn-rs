@@ -28,17 +28,10 @@ pub struct Ed25519Verifier;
 
 impl Ed25519Verifier {
     /// Synchronous Ed25519 verification — avoids boxing a Future for CPU-only work.
-    pub fn verify_sync(
-        &self,
-        region: &[u8],
-        sig_value: &[u8],
-        public_key: &[u8],
-    ) -> VerifyOutcome {
+    pub fn verify_sync(&self, region: &[u8], sig_value: &[u8], public_key: &[u8]) -> VerifyOutcome {
         use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
 
-        let Ok(vk) = VerifyingKey::from_bytes(
-            public_key.try_into().unwrap_or(&[0u8; 32]),
-        ) else {
+        let Ok(vk) = VerifyingKey::from_bytes(public_key.try_into().unwrap_or(&[0u8; 32])) else {
             return VerifyOutcome::Invalid;
         };
 

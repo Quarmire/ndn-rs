@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use ndn_tlv::TlvWriter;
 
-use super::{is_lp_packet, nni, CachePolicyType, LpHeaders};
+use super::{CachePolicyType, LpHeaders, is_lp_packet, nni};
 use crate::tlv_type;
 
 /// Encode a Nack as an NDNLPv2 LpPacket.
@@ -132,7 +132,7 @@ pub fn encode_lp_with_headers(fragment: &[u8], headers: &LpHeaders) -> Bytes {
 mod tests {
     use super::*;
     use crate::encode::encode_interest;
-    use crate::lp::{is_lp_packet, LpPacket};
+    use crate::lp::{LpPacket, is_lp_packet};
     use crate::nack::NackReason;
     use crate::{Interest, Name, NameComponent};
     use bytes::Bytes;

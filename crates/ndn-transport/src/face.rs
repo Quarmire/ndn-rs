@@ -207,7 +207,9 @@ pub trait Face: Send + Sync + 'static {
     /// Multicast and broadcast faces override this to return the link-layer
     /// source, enabling discovery to create unicast reply faces without
     /// embedding addresses in NDN payloads.
-    fn recv_with_addr(&self) -> impl Future<Output = Result<(Bytes, Option<FaceAddr>), FaceError>> + Send {
+    fn recv_with_addr(
+        &self,
+    ) -> impl Future<Output = Result<(Bytes, Option<FaceAddr>), FaceError>> + Send {
         async { self.recv().await.map(|b| (b, None)) }
     }
 

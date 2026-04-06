@@ -18,7 +18,6 @@
 //!   Disable for `no_std` environments (an allocator is still required).
 
 #![allow(missing_docs)]
-
 // Enable no_std when the `std` feature is disabled.
 // The crate requires an allocator (Name uses SmallVec, Bytes uses heap).
 #![cfg_attr(not(feature = "std"), no_std)]
@@ -41,11 +40,11 @@ pub mod signature;
 pub use data::Data;
 pub use error::PacketError;
 pub use interest::{Interest, Selector};
+pub use lp::{CachePolicyType, LpHeaders};
 pub use meta_info::MetaInfo;
 pub use nack::{Nack, NackReason};
 pub use name::{Name, NameComponent};
 pub use signature::{SignatureInfo, SignatureType};
-pub use lp::{CachePolicyType, LpHeaders};
 
 /// Well-known NDN TLV type codes.
 pub mod tlv_type {

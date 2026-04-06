@@ -199,8 +199,7 @@ fn collect_subtree<V: Clone + Send + Sync + 'static>(
     if let Some(v) = &guard.entry {
         out.push(v.clone());
     }
-    let children: Vec<Arc<RwLock<TrieNode<V>>>> =
-        guard.children.values().map(Arc::clone).collect();
+    let children: Vec<Arc<RwLock<TrieNode<V>>>> = guard.children.values().map(Arc::clone).collect();
     drop(guard);
     for child in children {
         collect_subtree(&child, out);

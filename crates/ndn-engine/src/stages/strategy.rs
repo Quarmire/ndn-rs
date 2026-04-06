@@ -160,7 +160,9 @@ impl StrategyStage {
                     // Link-local scope enforcement: /ndn/local/ packets must
                     // not be forwarded to non-local (network) faces, mirroring
                     // IPv6 fe80::/10 link-local semantics.
-                    let effective_faces: SmallVec<[ndn_transport::FaceId; 4]> = if is_link_local(&name) {
+                    let effective_faces: SmallVec<[ndn_transport::FaceId; 4]> = if is_link_local(
+                        &name,
+                    ) {
                         faces.iter().copied().filter(|fid| {
                             let keep = self.face_table.get(*fid)
                                 .map(|f| f.kind().scope() == FaceScope::Local)

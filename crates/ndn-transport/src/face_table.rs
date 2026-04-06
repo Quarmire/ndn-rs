@@ -4,7 +4,8 @@ use std::sync::{Arc, Mutex};
 use crate::{Face, FaceId};
 
 /// Result type for [`ErasedFace::recv_bytes_with_addr`].
-type RecvWithAddrResult = Result<(bytes::Bytes, Option<crate::face::FaceAddr>), crate::face::FaceError>;
+type RecvWithAddrResult =
+    Result<(bytes::Bytes, Option<crate::face::FaceAddr>), crate::face::FaceError>;
 
 /// Concurrent map from `FaceId` to a type-erased face handle.
 ///
@@ -51,9 +52,7 @@ pub trait ErasedFace: Send + Sync + 'static {
     /// for faces that receive from a single known peer.
     fn recv_bytes_with_addr(
         &self,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = RecvWithAddrResult> + Send + '_>,
-    >;
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = RecvWithAddrResult> + Send + '_>>;
 }
 
 impl<F: Face> ErasedFace for F {
@@ -99,7 +98,10 @@ impl<F: Face> ErasedFace for F {
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
-                    Output = Result<(bytes::Bytes, Option<crate::face::FaceAddr>), crate::face::FaceError>,
+                    Output = Result<
+                        (bytes::Bytes, Option<crate::face::FaceAddr>),
+                        crate::face::FaceError,
+                    >,
                 > + Send
                 + '_,
         >,

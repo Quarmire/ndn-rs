@@ -62,7 +62,12 @@ impl PitCheckStage {
         let name = interest.name.clone();
         let selector = Some(interest.selectors().clone());
         let mut entry = PitEntry::new(name, selector, now_ns, lifetime_ms);
-        entry.add_in_record(ctx.face_id.0, nonce, now_ns + lifetime_ms * 1_000_000, ctx.lp_pit_token.clone());
+        entry.add_in_record(
+            ctx.face_id.0,
+            nonce,
+            now_ns + lifetime_ms * 1_000_000,
+            ctx.lp_pit_token.clone(),
+        );
         self.pit.insert(token, entry);
         trace!(face=%ctx.face_id, name=%interest.name, nonce, lifetime_ms, "pit-check: new entry");
 
@@ -95,10 +100,22 @@ impl PitMatchStage {
         // insertion time.  The default (false, false) is tried first as the
         // common-case fast path.
         let selector_probes: &[Option<Selector>] = &[
-            Some(Selector { can_be_prefix: false, must_be_fresh: false }),
-            Some(Selector { can_be_prefix: true, must_be_fresh: false }),
-            Some(Selector { can_be_prefix: false, must_be_fresh: true }),
-            Some(Selector { can_be_prefix: true, must_be_fresh: true }),
+            Some(Selector {
+                can_be_prefix: false,
+                must_be_fresh: false,
+            }),
+            Some(Selector {
+                can_be_prefix: true,
+                must_be_fresh: false,
+            }),
+            Some(Selector {
+                can_be_prefix: false,
+                must_be_fresh: true,
+            }),
+            Some(Selector {
+                can_be_prefix: true,
+                must_be_fresh: true,
+            }),
             None,
         ];
 

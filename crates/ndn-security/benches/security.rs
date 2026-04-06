@@ -64,7 +64,11 @@ fn build_signed_data(signer: &Ed25519Signer, data_comp: &str, key_comp: &str) ->
         w.write_tlv(0x17, &sig);
         w.finish()
     };
-    let inner: Vec<u8> = signed_region.iter().chain(sval_tlv.iter()).copied().collect();
+    let inner: Vec<u8> = signed_region
+        .iter()
+        .chain(sval_tlv.iter())
+        .copied()
+        .collect();
     let mut w = TlvWriter::new();
     w.write_tlv(0x06, &inner);
     w.finish()
@@ -135,13 +139,17 @@ fn bench_verification(c: &mut Criterion) {
         ("500B", region_500.as_slice(), sig_500.as_ref()),
     ] {
         group.throughput(Throughput::Bytes(region.len() as u64));
-        group.bench_with_input(BenchmarkId::new("verify", label), &(region, sig), |b, &(r, s)| {
-            b.iter(|| {
-                let outcome = rt.block_on(verifier.verify(r, s, &public_key)).unwrap();
-                debug_assert_eq!(outcome, ndn_security::VerifyOutcome::Valid);
-                outcome
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::new("verify", label),
+            &(region, sig),
+            |b, &(r, s)| {
+                b.iter(|| {
+                    let outcome = rt.block_on(verifier.verify(r, s, &public_key)).unwrap();
+                    debug_assert_eq!(outcome, ndn_security::VerifyOutcome::Valid);
+                    outcome
+                });
+            },
+        );
     }
     group.finish();
 }

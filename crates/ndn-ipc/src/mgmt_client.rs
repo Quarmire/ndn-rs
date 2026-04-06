@@ -170,10 +170,7 @@ impl MgmtClient {
     ///
     /// If `capacity` is `Some`, sets the new max capacity in bytes.
     /// Always returns the current capacity.
-    pub async fn cs_config(
-        &self,
-        capacity: Option<u64>,
-    ) -> Result<ControlParameters, RouterError> {
+    pub async fn cs_config(&self, capacity: Option<u64>) -> Result<ControlParameters, RouterError> {
         let params = ControlParameters {
             capacity,
             ..Default::default()

@@ -132,7 +132,10 @@ impl PacketDispatcher {
         //    for on_inbound; neither run_face_reader nor inject_packet call it.
         //    Returns true if the packet was consumed (e.g. hello Interest/Data
         //    or service-record browse).
-        if self.discovery.on_inbound(&ctx.raw_bytes, ctx.face_id, &meta, &*self.discovery_ctx) {
+        if self
+            .discovery
+            .on_inbound(&ctx.raw_bytes, ctx.face_id, &meta, &*self.discovery_ctx)
+        {
             return;
         }
 

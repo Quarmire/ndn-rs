@@ -17,8 +17,8 @@
 //!
 //! Available when the `fjall` feature is enabled on `ndn-store`.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::Bytes;
 
@@ -45,10 +45,7 @@ impl FjallCs {
     /// Open (or create) a persistent CS at the given directory path.
     ///
     /// `max_bytes` limits the total logical Data bytes stored (not on-disk size).
-    pub fn open(
-        path: impl AsRef<std::path::Path>,
-        max_bytes: usize,
-    ) -> fjall::Result<Self> {
+    pub fn open(path: impl AsRef<std::path::Path>, max_bytes: usize) -> fjall::Result<Self> {
         let db = fjall::Database::builder(path).open()?;
         let keyspace = db.keyspace("cs", fjall::KeyspaceCreateOptions::default)?;
 
@@ -296,7 +293,8 @@ impl ContentStore for FjallCs {
         // Check for existing entry.
         let was_present = if let Ok(Some(old_val)) = self.keyspace.get(&key) {
             let old_data_len = old_val.len().saturating_sub(STALE_AT_LEN);
-            self.current_bytes.fetch_sub(old_data_len, Ordering::Relaxed);
+            self.current_bytes
+                .fetch_sub(old_data_len, Ordering::Relaxed);
             true
         } else {
             false
@@ -327,7 +325,8 @@ impl ContentStore for FjallCs {
         if let Ok(Some(old_val)) = self.keyspace.get(&key) {
             let old_data_len = old_val.len().saturating_sub(STALE_AT_LEN);
             let _ = self.keyspace.remove(&key);
-            self.current_bytes.fetch_sub(old_data_len, Ordering::Relaxed);
+            self.current_bytes
+                .fetch_sub(old_data_len, Ordering::Relaxed);
             self.entry_count.fetch_sub(1, Ordering::Relaxed);
             return true;
         }
@@ -734,8 +733,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let cs = FjallCs::open(dir.path(), 65536).unwrap();
-            cs.insert(Bytes::from_static(b"persistent"), arc_name(&["a"]), meta_fresh())
-                .await;
+            cs.insert(
+                Bytes::from_static(b"persistent"),
+                arc_name(&["a"]),
+                meta_fresh(),
+            )
+            .await;
             assert_eq!(cs.len(), 1);
         }
         // Reopen from the same path.

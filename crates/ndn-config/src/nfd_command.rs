@@ -58,7 +58,7 @@ pub mod verb {
     // service
     pub const ANNOUNCE: &[u8] = b"announce";
     pub const WITHDRAW: &[u8] = b"withdraw";
-    pub const BROWSE:   &[u8] = b"browse";
+    pub const BROWSE: &[u8] = b"browse";
 }
 
 // ─── Name builder ────────────────────────────────────────────────────────────

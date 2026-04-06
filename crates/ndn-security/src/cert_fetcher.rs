@@ -13,8 +13,8 @@ use dashmap::DashMap;
 use ndn_packet::{Data, Name};
 use tokio::sync::broadcast;
 
-use crate::cert_cache::{CertCache, Certificate};
 use crate::TrustError;
+use crate::cert_cache::{CertCache, Certificate};
 
 /// Type alias for the async fetch callback.
 ///

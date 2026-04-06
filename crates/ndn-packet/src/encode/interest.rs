@@ -3,8 +3,8 @@ use std::time::Duration;
 use bytes::Bytes;
 use ndn_tlv::{TlvReader, TlvWriter};
 
+use super::{next_nonce, nni, rand_nonce_bytes, write_name, write_nni};
 use crate::{Name, SignatureType, tlv_type};
-use super::{next_nonce, rand_nonce_bytes, write_name, write_nni, nni};
 
 // ──��� Public API ───────────────────────────────────────────────────────────────
 
@@ -361,8 +361,8 @@ impl From<String> for Name {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::tests::{assert_bytes_eq, hex, name};
+    use super::*;
     use crate::{Interest, NameComponent};
     use bytes::Bytes;
     use std::time::Duration;
@@ -534,12 +534,13 @@ mod tests {
 
     #[test]
     fn interest_builder_sign_sync_auto_anti_replay() {
-        let wire = InterestBuilder::new("/cmd")
-            .sign_sync(crate::SignatureType::SignatureEd25519, None, |region| {
-                Bytes::copy_from_slice(
-                    ring::digest::digest(&ring::digest::SHA256, region).as_ref(),
-                )
-            });
+        let wire = InterestBuilder::new("/cmd").sign_sync(
+            crate::SignatureType::SignatureEd25519,
+            None,
+            |region| {
+                Bytes::copy_from_slice(ring::digest::digest(&ring::digest::SHA256, region).as_ref())
+            },
+        );
         let interest = Interest::decode(wire).unwrap();
         let si = interest.sig_info().expect("sig_info");
         assert!(si.sig_nonce.is_some());
@@ -548,11 +549,14 @@ mod tests {
 
     #[test]
     fn interest_builder_sign_sync_empty_params_default() {
-        let wire = InterestBuilder::new("/cmd")
-            .sign_sync(crate::SignatureType::DigestSha256, None, |region| {
+        let wire = InterestBuilder::new("/cmd").sign_sync(
+            crate::SignatureType::DigestSha256,
+            None,
+            |region| {
                 let d = ring::digest::digest(&ring::digest::SHA256, region);
                 Bytes::copy_from_slice(d.as_ref())
-            });
+            },
+        );
         let interest = Interest::decode(wire).unwrap();
         let ap = interest.app_parameters().expect("app_params present");
         assert!(ap.is_empty());
@@ -564,9 +568,7 @@ mod tests {
             .app_parameters(b"data".to_vec())
             .sign_sync(crate::SignatureType::SignatureEd25519, None, |region| {
                 assert_eq!(region[0], tlv_type::NAME as u8);
-                Bytes::copy_from_slice(
-                    ring::digest::digest(&ring::digest::SHA256, region).as_ref(),
-                )
+                Bytes::copy_from_slice(ring::digest::digest(&ring::digest::SHA256, region).as_ref())
             });
         let interest = Interest::decode(wire.clone()).unwrap();
         let region = interest.signed_region().expect("signed region present");
@@ -610,9 +612,7 @@ mod tests {
         let sync_wire = InterestBuilder::new("/test")
             .app_parameters(b"p".to_vec())
             .sign_sync(crate::SignatureType::SignatureEd25519, None, |region| {
-                Bytes::copy_from_slice(
-                    ring::digest::digest(&ring::digest::SHA256, region).as_ref(),
-                )
+                Bytes::copy_from_slice(ring::digest::digest(&ring::digest::SHA256, region).as_ref())
             });
         let sync_i = Interest::decode(sync_wire).unwrap();
         assert!(sync_i.sig_info().is_some());
@@ -652,10 +652,7 @@ mod tests {
         );
         let si = i.sig_info().expect("sig_info");
         assert_eq!(si.sig_type, crate::SignatureType::SignatureEd25519);
-        assert_eq!(
-            si.key_locator.as_ref().unwrap().to_string(),
-            "/my/key"
-        );
+        assert_eq!(si.key_locator.as_ref().unwrap().to_string(), "/my/key");
         assert!(i.sig_value().is_some());
         assert!(i.signed_region().is_some());
     }
@@ -725,12 +722,8 @@ mod tests {
     #[test]
     fn wire_ndnd_interest_decode() {
         let ndnd_wire: &[u8] = &[
-            0x05, 0x16,
-            0x07, 0x0A,
-            0x08, 0x03, 0x6E, 0x64, 0x6E,
-            0x08, 0x03, 0x65, 0x64, 0x75,
-            0x0A, 0x04, 0x01, 0x02, 0x03, 0x04,
-            0x0C, 0x02, 0x0F, 0xA0,
+            0x05, 0x16, 0x07, 0x0A, 0x08, 0x03, 0x6E, 0x64, 0x6E, 0x08, 0x03, 0x65, 0x64, 0x75,
+            0x0A, 0x04, 0x01, 0x02, 0x03, 0x04, 0x0C, 0x02, 0x0F, 0xA0,
         ];
         let interest = Interest::decode(Bytes::from_static(ndnd_wire)).unwrap();
         assert_eq!(interest.name.to_string(), "/ndn/edu");
@@ -741,12 +734,8 @@ mod tests {
     #[test]
     fn wire_ndnd_interest_1byte_lifetime_decode() {
         let ndnd_wire: &[u8] = &[
-            0x05, 0x15,
-            0x07, 0x0A,
-            0x08, 0x03, 0x6E, 0x64, 0x6E,
-            0x08, 0x03, 0x65, 0x64, 0x75,
-            0x0A, 0x04, 0x00, 0x00, 0x00, 0x01,
-            0x0C, 0x01, 0x64,
+            0x05, 0x15, 0x07, 0x0A, 0x08, 0x03, 0x6E, 0x64, 0x6E, 0x08, 0x03, 0x65, 0x64, 0x75,
+            0x0A, 0x04, 0x00, 0x00, 0x00, 0x01, 0x0C, 0x01, 0x64,
         ];
         let interest = Interest::decode(Bytes::from_static(ndnd_wire)).unwrap();
         assert_eq!(interest.lifetime(), Some(Duration::from_millis(100)));
@@ -755,12 +744,8 @@ mod tests {
     #[test]
     fn wire_ndnd_interest_4byte_lifetime_decode() {
         let ndnd_wire: &[u8] = &[
-            0x05, 0x18,
-            0x07, 0x0A,
-            0x08, 0x03, 0x6E, 0x64, 0x6E,
-            0x08, 0x03, 0x65, 0x64, 0x75,
-            0x0A, 0x04, 0x00, 0x00, 0x00, 0x01,
-            0x0C, 0x04, 0x00, 0x01, 0x86, 0xA0,
+            0x05, 0x18, 0x07, 0x0A, 0x08, 0x03, 0x6E, 0x64, 0x6E, 0x08, 0x03, 0x65, 0x64, 0x75,
+            0x0A, 0x04, 0x00, 0x00, 0x00, 0x01, 0x0C, 0x04, 0x00, 0x01, 0x86, 0xA0,
         ];
         let interest = Interest::decode(Bytes::from_static(ndnd_wire)).unwrap();
         assert_eq!(interest.lifetime(), Some(Duration::from_millis(100000)));

@@ -1,8 +1,8 @@
 use crate::TrustError;
 use bytes::Bytes;
 use dashmap::DashMap;
-use ndn_packet::{Data, Name};
 use ndn_packet::tlv_type;
+use ndn_packet::{Data, Name};
 use ndn_tlv::TlvReader;
 use std::sync::Arc;
 
@@ -47,8 +47,7 @@ impl Certificate {
                 tlv_type::VALIDITY_PERIOD => {
                     let mut vr = TlvReader::new(value);
                     while !vr.is_empty() {
-                        let (vtyp, vval) =
-                            vr.read_tlv().map_err(|_| TrustError::InvalidKey)?;
+                        let (vtyp, vval) = vr.read_tlv().map_err(|_| TrustError::InvalidKey)?;
                         match vtyp {
                             tlv_type::NOT_BEFORE => {
                                 valid_from = decode_be_u64(&vval);

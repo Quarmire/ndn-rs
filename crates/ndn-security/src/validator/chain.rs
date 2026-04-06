@@ -7,7 +7,7 @@ use crate::cert_cache::Certificate;
 use crate::verifier::Verifier;
 use crate::{SafeData, TrustError, VerifyOutcome};
 
-use super::{now_ns, ValidationResult, Validator};
+use super::{ValidationResult, Validator, now_ns};
 
 impl Validator {
     /// Validate a Data packet by walking the full certificate chain.
@@ -148,10 +148,10 @@ impl Validator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TrustSchema;
     use crate::cert_cache::Certificate;
     use crate::signer::{Ed25519Signer, Signer};
     use crate::trust_schema::{NamePattern, PatternComponent};
-    use crate::TrustSchema;
     use bytes::Bytes;
     use ndn_packet::{Name, NameComponent};
     use std::sync::Arc;
