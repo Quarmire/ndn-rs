@@ -26,6 +26,7 @@ Named Data Networking is a network architecture where communication is driven by
 | [Guides](./guides/implementing-face.md) | How to extend ndn-rs |
 | [Benchmarks](./benchmarks/pipeline-benchmarks.md) | Performance data and methodology |
 | [Reference](./reference/spec-compliance.md) | Spec compliance, external links |
+| [Explorer](../explorer/) | Interactive crate map and pipeline visualizer |
 
 ## Crate Map
 

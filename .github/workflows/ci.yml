@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
     paths:
+      - ".github/workflows/ci.yml"
       - "crates/ndn-tlv/**"
       - "crates/ndn-packet/**"
       - "crates/ndn-transport/**"
@@ -26,6 +27,7 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/ci.yml"
+  workflow_dispatch:
   pull_request:
     branches: [main]
     paths:
