@@ -40,6 +40,22 @@ pub trait ErasedFace: Send + Sync + 'static {
                 + '_,
         >,
     >;
+
+    /// Object-safe version of [`Face::recv_with_addr`].
+    ///
+    /// Returns the raw packet together with the link-layer sender address
+    /// when the face type exposes it (e.g. multicast UDP). Returns `None`
+    /// for faces that receive from a single known peer.
+    fn recv_bytes_with_addr(
+        &self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<(bytes::Bytes, Option<std::net::SocketAddr>), crate::face::FaceError>,
+                > + Send
+                + '_,
+        >,
+    >;
 }
 
 impl<F: Face> ErasedFace for F {
@@ -78,6 +94,19 @@ impl<F: Face> ErasedFace for F {
         >,
     > {
         Box::pin(Face::recv(self))
+    }
+
+    fn recv_bytes_with_addr(
+        &self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<(bytes::Bytes, Option<std::net::SocketAddr>), crate::face::FaceError>,
+                > + Send
+                + '_,
+        >,
+    > {
+        Box::pin(Face::recv_with_addr(self))
     }
 }
 
