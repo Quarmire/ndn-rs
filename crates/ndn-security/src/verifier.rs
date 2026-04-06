@@ -26,6 +26,34 @@ pub trait Verifier: Send + Sync + 'static {
 /// Ed25519 verifier.
 pub struct Ed25519Verifier;
 
+impl Ed25519Verifier {
+    /// Synchronous Ed25519 verification — avoids boxing a Future for CPU-only work.
+    pub fn verify_sync(
+        &self,
+        region: &[u8],
+        sig_value: &[u8],
+        public_key: &[u8],
+    ) -> VerifyOutcome {
+        use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
+
+        let Ok(vk) = VerifyingKey::from_bytes(
+            public_key.try_into().unwrap_or(&[0u8; 32]),
+        ) else {
+            return VerifyOutcome::Invalid;
+        };
+
+        let Ok(sig_bytes): Result<&[u8; 64], _> = sig_value.try_into() else {
+            return VerifyOutcome::Invalid;
+        };
+        let sig = Signature::from_bytes(sig_bytes);
+
+        match vk.verify(region, &sig) {
+            Ok(()) => VerifyOutcome::Valid,
+            Err(_) => VerifyOutcome::Invalid,
+        }
+    }
+}
+
 impl Verifier for Ed25519Verifier {
     fn verify<'a>(
         &'a self,
