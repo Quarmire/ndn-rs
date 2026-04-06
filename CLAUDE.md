@@ -12,6 +12,14 @@ cargo clippy -- -D warnings    # lint
 cargo fmt                      # format
 ```
 
+## Testing policy
+
+**Do not run `cargo test` automatically** after making changes. The workspace is large (~50K lines) and a full test run takes 2–3 minutes. Instead:
+
+- Use `cargo build` or `cargo clippy` to verify changes compile and are lint-clean.
+- Only run tests when explicitly asked, or when fixing a bug where a specific test is needed to confirm the fix.
+- When tests are needed, run them scoped to the affected crate: `cargo test -p <crate-name>` rather than `cargo test --workspace`.
+
 ## Project Overview
 
 **ndn-rs** is a Named Data Networking (NDN) forwarder stack written in Rust (edition 2024). NDN is a content-centric networking architecture where packets are named data objects rather than addressed to endpoints.
