@@ -45,6 +45,36 @@ The `LinkMedium` trait provides:
 
 ### Hello Exchange
 
+```mermaid
+sequenceDiagram
+    participant A as Node A
+    participant B as Node B
+
+    Note over A,B: Initial Discovery
+    A->>B: Hello Interest\n/ndn/local/nd/hello/<nonce1>
+    B->>A: Hello Data\n(node name, prefixes, neighbor diffs)
+    Note over A: Measure RTT, update EWMA\nState: Probing → Established
+
+    Note over A,B: Periodic Probing
+    loop Every tick interval
+        A->>B: Probe Interest\n/ndn/local/nd/probe/direct/<B>/<nonce>
+        B->>A: Probe Data (ACK)
+        Note over A: Update last_seen, RTT
+    end
+
+    Note over A,B: Liveness Timeout
+    A->>B: Probe Interest (no reply)
+    Note over A: timeout exceeded\nState: Established → Stale
+    A->>B: Unicast Hello (retry)
+    B->>A: Hello Data
+    Note over A: State: Stale → Established
+
+    Note over A,B: Peer Failure
+    A--xB: Probe Interest (no reply)
+    Note over A: miss_count >= threshold\nState: Stale → Absent
+    Note over A: Remove faces, withdraw FIB entries\nGossip removal to other peers
+```
+
 The protocol sends periodic hello Interests to `/ndn/local/nd/hello/<nonce>`. Peers respond with hello Data containing a `HelloPayload`:
 
 - **Node name** -- the responder's NDN identity
@@ -60,6 +90,31 @@ When `swim_indirect_fanout > 0`, the protocol augments hello-based liveness with
 1. **Direct probes** -- sent to each established neighbor on every tick via `/ndn/local/nd/probe/direct/<target>/<nonce>`
 2. **Indirect probes** -- if a direct probe times out, K indirect probes are dispatched via other established neighbors: `/ndn/local/nd/probe/via/<intermediary>/<target>/<nonce>`
 3. **Gossip piggyback** -- recent neighbor additions/removals are piggybacked onto hello Data payloads (bounded to 16 entries)
+
+```mermaid
+sequenceDiagram
+    participant A as Node A
+    participant C as Node C (intermediary)
+    participant B as Node B (suspect)
+
+    Note over A,B: Direct probe fails
+    A->>B: Probe /ndn/local/nd/probe/direct/<B>/<nonce>
+    Note over A: Timeout — no reply from B
+
+    Note over A,C: SWIM indirect probe
+    A->>C: Indirect Probe\n/ndn/local/nd/probe/via/<C>/<B>/<nonce>
+    C->>B: Probe /ndn/local/nd/probe/direct/<B>/<nonce2>
+
+    alt B is alive
+        B->>C: Probe Data (ACK)
+        C->>A: Indirect Probe Data (alive)
+        Note over A: B is reachable via C\nKeep Established state
+    else B is truly dead
+        Note over C: Timeout — no reply from B
+        C->>A: Indirect Probe Nack (unreachable)
+        Note over A: Confirmed failure\nState → Stale / Absent
+    end
+```
 
 ### Probe Strategy
 
@@ -138,6 +193,32 @@ Mutations go through `NeighborUpdate` variants (`Upsert`, `SetState`, `AddFace`,
 ## Layer 2: Service Discovery
 
 The `ServiceDiscoveryProtocol` handles service record publication, browsing, and demand-driven peer queries. It runs alongside the neighbor discovery protocol inside a `CompositeDiscovery`.
+
+```mermaid
+sequenceDiagram
+    participant P as Producer
+    participant R as Router
+    participant C as Consumer
+
+    Note over P,R: Service Announcement
+    P->>P: publish ServiceRecord\nprefix=/app/video, owner=face3
+
+    Note over R,P: Browse Phase
+    R->>P: Browse Interest\n/ndn/local/sd/services/ (CanBePrefix)
+    P->>R: Browse Data\n(ServiceRecord: /app/video)
+    Note over R: Auto-populate FIB:\n/app/video → face to P
+
+    Note over C,R: Consumer discovers via Router
+    C->>R: Browse Interest\n/ndn/local/sd/services/ (CanBePrefix)
+    R->>C: Browse Data\n(relayed ServiceRecord: /app/video)
+    Note over C: Auto-populate FIB:\n/app/video → face to R
+
+    Note over C,P: Normal forwarding now works
+    C->>R: Interest /app/video/frame/1
+    R->>P: Interest /app/video/frame/1
+    P->>R: Data /app/video/frame/1
+    R->>C: Data /app/video/frame/1
+```
 
 ### Announce / Browse / Withdraw
 

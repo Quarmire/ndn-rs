@@ -136,6 +136,62 @@ flowchart TD
 
 7. **Dispatch** -- Sends the Data packet to every face listed in the PIT entry's in-records. The PIT entry is then consumed (removed).
 
+## PIT Aggregation
+
+When multiple consumers request the same data, the PIT aggregates their Interests so that only a single Interest is forwarded upstream. When the Data returns, it fans out to all consumers:
+
+```mermaid
+flowchart LR
+    c1["Consumer 1"] -->|"Interest\n/app/data/1"| router["Router"]
+    c2["Consumer 2"] -->|"Interest\n/app/data/1"| router
+    c3["Consumer 3"] -->|"Interest\n/app/data/1"| router
+
+    router -->|"Single Interest\n/app/data/1"| producer["Producer"]
+
+    producer -->|"Data\n/app/data/1"| router2["Router"]
+
+    router2 -->|"Data"| c1b["Consumer 1"]
+    router2 -->|"Data"| c2b["Consumer 2"]
+    router2 -->|"Data"| c3b["Consumer 3"]
+
+    subgraph PIT Entry
+        direction TB
+        pit_name["Name: /app/data/1"]
+        in1["InRecord: face 1 (Consumer 1)"]
+        in2["InRecord: face 2 (Consumer 2)"]
+        in3["InRecord: face 3 (Consumer 3)"]
+        out1["OutRecord: face 4 (upstream)"]
+    end
+```
+
+## PacketContext Population Through Pipeline Stages
+
+As a packet moves through the pipeline, `PacketContext` fields are progressively populated by each stage:
+
+```mermaid
+flowchart TD
+    arrive["Packet Arrives"] --> fc["FaceCheck"]
+    fc --> decode["TlvDecode"]
+    decode --> cs["CsLookup"]
+    cs --> pit["PitCheck"]
+    pit --> strat["Strategy"]
+    strat --> dispatch["Dispatch"]
+
+    fc -.- fc_fields["face_id: set\nraw_bytes: set\narrival: set"]
+    decode -.- decode_fields["name: populated\npacket: Interest/Data decoded"]
+    cs -.- cs_fields["cs_hit: true/false"]
+    pit -.- pit_fields["pit_token: assigned\nnonces checked"]
+    strat -.- strat_fields["out_faces: populated\nFIB match result applied"]
+    dispatch -.- dispatch_fields["Packet sent to out_faces"]
+
+    style fc_fields fill:#e8f4f8,stroke:#888
+    style decode_fields fill:#e8f4f8,stroke:#888
+    style cs_fields fill:#e8f4f8,stroke:#888
+    style pit_fields fill:#e8f4f8,stroke:#888
+    style strat_fields fill:#e8f4f8,stroke:#888
+    style dispatch_fields fill:#e8f4f8,stroke:#888
+```
+
 ## Nack Pipeline
 
 NDN also supports Network Nacks (negative acknowledgements). When a router cannot forward an Interest (no route, congestion, etc.), it sends a Nack back to the downstream face. In ndn-rs, Nacks are produced by returning `Action::Nack(ctx, reason)` from any pipeline stage or `ForwardingAction::Nack(reason)` from a strategy.

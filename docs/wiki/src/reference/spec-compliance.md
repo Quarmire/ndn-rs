@@ -110,4 +110,13 @@ These must be fixed for basic interoperability with other NDN implementations:
 
 **25 total gaps identified.** 9 critical (must fix for basic interop), 10 important (full compliance), 6 moderate (completeness). The critical gaps primarily relate to NDNLPv2 framing and HopLimit handling -- both are prerequisites for wire-compatible operation with NFD and other NDN forwarders.
 
+```mermaid
+%%{init: {'theme': 'default'}}%%
+pie title Spec Implementation Coverage (approximate)
+    "Implemented" : 75
+    "Critical gaps" : 9
+    "Important gaps" : 10
+    "Moderate gaps" : 6
+```
+
 See [`docs/spec-gaps.md`](https://github.com/user/ndn-rs/blob/main/docs/spec-gaps.md) for the full analysis with exact file locations and code references.

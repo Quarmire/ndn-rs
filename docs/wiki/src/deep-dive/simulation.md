@@ -24,6 +24,53 @@ impl Face for SimFace {
 }
 ```
 
+```mermaid
+flowchart LR
+    subgraph "SimLink"
+        subgraph "SimFace A (FaceId 10)"
+            A_send["send()"]
+            A_recv["recv()"]
+        end
+
+        subgraph "Link Pipeline A→B"
+            L1["Loss filter\n(random drop)"]
+            BW1["Bandwidth shaper\n(serialization delay)"]
+            D1["Delay + jitter\n(propagation)"]
+        end
+
+        subgraph "Async Channel A→B"
+            CH1[/"mpsc channel\n(buffered)"/]
+        end
+
+        subgraph "Link Pipeline B→A"
+            L2["Loss filter\n(random drop)"]
+            BW2["Bandwidth shaper\n(serialization delay)"]
+            D2["Delay + jitter\n(propagation)"]
+        end
+
+        subgraph "Async Channel B→A"
+            CH2[/"mpsc channel\n(buffered)"/]
+        end
+
+        subgraph "SimFace B (FaceId 11)"
+            B_send["send()"]
+            B_recv["recv()"]
+        end
+
+        A_send --> L1 --> BW1 --> D1 --> CH1 --> B_recv
+        B_send --> L2 --> BW2 --> D2 --> CH2 --> A_recv
+    end
+
+    style L1 fill:#c44,color:#fff
+    style L2 fill:#c44,color:#fff
+    style BW1 fill:#c90,color:#000
+    style BW2 fill:#c90,color:#000
+    style D1 fill:#2d5a8c,color:#fff
+    style D2 fill:#2d5a8c,color:#fff
+    style CH1 fill:#555,color:#fff
+    style CH2 fill:#555,color:#fff
+```
+
 The send path applies link properties in order:
 
 1. **Loss** -- random roll against `loss_rate`; packet silently dropped if hit
@@ -98,7 +145,9 @@ sim.add_route(router, "/ndn/data", producer);
 let mut running = sim.start().await?;
 ```
 
-### Example Topology
+### Example Topologies
+
+#### Linear Topology
 
 ```mermaid
 graph LR
@@ -109,6 +158,23 @@ graph LR
     style R fill:#5a2d8c,color:#fff
     style P fill:#2d7a3a,color:#fff
 ```
+
+#### Diamond Topology (4-node, multi-path)
+
+```mermaid
+graph TD
+    C["Consumer\n(node 0)"] -->|"LAN\n1ms, 1Gbps"| R1["Router 1\n(node 1)"]
+    C -->|"WiFi\n5ms, 54Mbps\n1% loss"| R2["Router 2\n(node 2)"]
+    R1 -->|"LAN\n1ms, 1Gbps"| P["Producer\n(node 3)"]
+    R2 -->|"WAN\n50ms, 100Mbps"| P
+
+    style C fill:#2d5a8c,color:#fff
+    style R1 fill:#5a2d8c,color:#fff
+    style R2 fill:#5a2d8c,color:#fff
+    style P fill:#2d7a3a,color:#fff
+```
+
+This topology enables testing strategy selection between a fast reliable path (Consumer -> Router 1 -> Producer) and a slower/lossier path (Consumer -> Router 2 -> Producer). Strategies like `BestRoute` or `AsfStrategy` can probe both paths and adapt.
 
 When `start()` is called, the builder:
 

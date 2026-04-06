@@ -29,6 +29,17 @@ Key points:
 
 There is also an optional `recv_with_addr()` method for multicast/broadcast faces that need to return the link-layer sender address alongside the packet.
 
+```mermaid
+stateDiagram-v2
+    [*] --> Created: FaceTable.alloc_id()
+    Created --> Registered: face_table.insert(face)
+    Registered --> Running: tokio::spawn(recv task)
+    Running --> Running: recv() / send() loop
+    Running --> Closing: error or shutdown signal
+    Closing --> Removed: face_table.remove(id)
+    Removed --> [*]: FaceId recycled
+```
+
 ## Adding a FaceKind Variant
 
 If your transport does not fit an existing `FaceKind`, add a new variant:
@@ -171,6 +182,25 @@ Use bounded `mpsc::channel(capacity)` for both the inbound and outbound paths. T
 A capacity of 128--256 packets is a reasonable starting point. Too small and you starve throughput; too large and you add latency during congestion.
 
 ### LP encoding convention
+
+```mermaid
+graph TD
+    subgraph "Network Face (NonLocal scope)"
+        direction LR
+        I1["Interest / Data<br/>(bare TLV)"] --> LP["LpPacket wrapper<br/>(type 0x50)"]
+        LP --> FRAG{"MTU exceeded?"}
+        FRAG -->|"No"| W1["Wire: single LpPacket"]
+        FRAG -->|"Yes"| W2["Wire: LpPacket fragments"]
+    end
+
+    subgraph "Local Face (Local scope)"
+        direction LR
+        I2["Interest / Data<br/>(bare TLV)"] --> W3["Passed as-is<br/>(no LP wrapping)"]
+    end
+
+    style LP fill:#fff3e0,stroke:#FF9800
+    style W3 fill:#c8e6c9,stroke:#4CAF50
+```
 
 Network-facing transports (UDP, TCP, Ethernet, serial) should wrap packets in an NDNLPv2 `LpPacket` envelope before writing to the wire. Local transports (Unix, App, SHM) send the raw packet as-is. The existing `StreamFace` makes this explicit via an `lp_encode` constructor parameter -- follow the same convention based on `FaceKind::scope()`.
 

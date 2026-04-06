@@ -40,6 +40,29 @@ struct TrieNode<V> {
 
 The `Arc` wrapper on each child node is key: it allows a thread performing LPM to grab a reference to a child node and then release the parent's read lock. This means concurrent lookups never hold locks on ancestor nodes while traversing deeper into the trie.
 
+The following diagram shows how a FIB trie branches for example name prefixes:
+
+```mermaid
+flowchart TD
+    root["/ (root)"] --> ndn["/ndn"]
+    ndn --> edu["/ndn/edu"]
+    ndn --> com["/ndn/com"]
+    edu --> ucla["/ndn/edu/ucla\n&#9745; nexthop: face 3, cost 10"]
+    edu --> memphis["/ndn/edu/memphis\n&#9745; nexthop: face 5, cost 20"]
+    edu --> mit["/ndn/edu/mit\n&#9745; nexthop: face 7, cost 15"]
+    com --> google["/ndn/com/google\n&#9745; nexthop: face 2, cost 5"]
+    ucla --> papers["/ndn/edu/ucla/papers"]
+    ucla --> cs_dept["/ndn/edu/ucla/cs\n&#9745; nexthop: face 4, cost 8"]
+
+    style ucla fill:#d4edda,stroke:#28a745
+    style memphis fill:#d4edda,stroke:#28a745
+    style mit fill:#d4edda,stroke:#28a745
+    style google fill:#d4edda,stroke:#28a745
+    style cs_dept fill:#d4edda,stroke:#28a745
+```
+
+Nodes with a checkmark hold a `FibEntry` with nexthops. Intermediate nodes (like `/ndn/edu`) exist only for trie structure and have no entry. A lookup for `/ndn/edu/ucla/papers/2024` walks the trie and returns the deepest match at `/ndn/edu/ucla`.
+
 ### Longest-Prefix Match
 
 LPM walks the trie component by component, tracking the deepest node that has an `entry`. For example, looking up `/a/b/c/d`:
@@ -93,6 +116,24 @@ The PIT key is a `PitToken` derived from the Interest name and selectors. Two In
 
 Each Interest carries a random 32-bit nonce. When an Interest arrives, the PIT entry's `nonces_seen` list is checked. If the nonce is already present, a forwarding loop is detected and the Interest is Nacked. `SmallVec<[u32; 4]>` keeps the common case (1-4 nonces) on the stack.
 
+The following diagram shows the lifecycle of a PIT entry from creation to removal:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Created: Interest arrives,\nCS miss, no existing entry
+    Created --> Pending: In-record added\nfor incoming face
+    Pending --> Aggregated: Duplicate Interest\nfrom different face\n(add in-record)
+    Aggregated --> Aggregated: More duplicates
+    Pending --> Satisfied: Matching Data arrives
+    Aggregated --> Satisfied: Matching Data arrives
+    Satisfied --> [*]: Data sent to all\nin-record faces,\nentry removed
+    Pending --> Expired: Interest lifetime\nelapsed, no Data
+    Aggregated --> Expired: Interest lifetime\nelapsed, no Data
+    Expired --> [*]: Entry cleaned up\nby timing wheel
+    Pending --> Nacked: Upstream returns Nack,\nno alternative nexthops
+    Nacked --> [*]: Nack propagated\ndownstream, entry removed
+```
+
 ### Expiry
 
 PIT entries have an `expires_at` timestamp derived from the Interest's lifetime. Expired entries are cleaned up by a background timer. ndn-rs does not scan the entire PIT for expired entries -- instead, a hierarchical timing wheel provides O(1) insertion and expiry notification.
@@ -130,6 +171,28 @@ A byte-bounded LRU cache. Entries are evicted when total cached bytes exceed the
 ### PersistentCs
 
 Backed by an on-disk key-value store (RocksDB or redb). Used when the CS should survive restarts or when the dataset exceeds available memory.
+
+The following diagram shows how LRU eviction works in the Content Store. When a new entry is inserted and the cache exceeds its byte limit, the least recently used entry is evicted:
+
+```mermaid
+flowchart LR
+    subgraph "LRU Content Store (byte-bounded)"
+        direction LR
+        MRU["Most Recently Used"]
+        e1["/app/video/frame3\n512 bytes"]
+        e2["/app/data/item7\n1024 bytes"]
+        e3["/ndn/edu/paper\n2048 bytes"]
+        e4["/app/video/frame1\n768 bytes"]
+        LRU["Least Recently Used"]
+        MRU ~~~ e1 --- e2 --- e3 --- e4 ~~~ LRU
+    end
+
+    new["New insert:\n/app/news/article\n1500 bytes"] -->|"Insert at head\n(MRU end)"| MRU
+    LRU -->|"Evict from tail\nif over byte limit"| evicted["Evicted:\n/app/video/frame1"]
+
+    style new fill:#d4edda,stroke:#28a745
+    style evicted fill:#f8d7da,stroke:#dc3545
+```
 
 ### Zero-Copy Cache Hits
 

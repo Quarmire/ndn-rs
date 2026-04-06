@@ -46,3 +46,89 @@ Research        ndn-sim  ndn-compute  ndn-sync  ndn-research  ndn-strategy-wasm
 ```
 
 Dependencies flow strictly downward. `ndn-tlv` and `ndn-packet` compile `no_std`.
+
+```mermaid
+flowchart TD
+    subgraph Binaries
+        router["ndn-router"]
+        tools["ndn-tools"]
+        bench["ndn-bench"]
+    end
+
+    subgraph "Engine & App"
+        engine["ndn-engine"]
+        app["ndn-app"]
+        ipc["ndn-ipc"]
+        config["ndn-config"]
+        discovery["ndn-discovery"]
+    end
+
+    subgraph "Pipeline & Strategy"
+        pipeline["ndn-pipeline"]
+        strategy["ndn-strategy"]
+        security["ndn-security"]
+    end
+
+    subgraph Faces
+        face_net["ndn-face-net"]
+        face_local["ndn-face-local"]
+        face_serial["ndn-face-serial"]
+        face_l2["ndn-face-l2"]
+    end
+
+    subgraph Foundation
+        store["ndn-store"]
+        transport["ndn-transport"]
+        packet["ndn-packet"]
+        tlv["ndn-tlv"]
+    end
+
+    subgraph Embedded
+        embedded["ndn-embedded"]
+    end
+
+    subgraph Research
+        sim["ndn-sim"]
+        compute["ndn-compute"]
+        sync_crate["ndn-sync"]
+        research["ndn-research"]
+        strat_wasm["ndn-strategy-wasm"]
+    end
+
+    router --> engine
+    tools --> engine
+    bench --> engine
+    router --> config
+    tools --> app
+    bench --> app
+
+    engine --> pipeline
+    engine --> strategy
+    app --> ipc
+    ipc --> pipeline
+    discovery --> pipeline
+
+    pipeline --> face_net
+    pipeline --> face_local
+    pipeline --> face_serial
+    pipeline --> face_l2
+    strategy --> pipeline
+    security --> pipeline
+
+    face_net --> transport
+    face_local --> transport
+    face_serial --> transport
+    face_l2 --> transport
+
+    store --> packet
+    transport --> packet
+    pipeline --> store
+    packet --> tlv
+    tlv --> embedded
+
+    sim --> engine
+    compute --> engine
+    sync_crate --> app
+    research --> engine
+    strat_wasm --> strategy
+```

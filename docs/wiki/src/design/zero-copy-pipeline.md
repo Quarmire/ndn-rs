@@ -8,6 +8,26 @@ When a face receives a packet from the network, it arrives as a `bytes::Bytes` b
 
 This is possible because `Bytes` is a reference-counted, immutable byte buffer. `Bytes::clone()` increments an atomic counter and returns a new handle to the same data. `Bytes::slice(start..end)` creates a sub-view into the same allocation. Neither operation copies any packet data.
 
+```mermaid
+graph TD
+    subgraph "Underlying Allocation"
+        BUF["Memory buffer<br/>[TLV type | name TLV | nonce | lifetime | content ... ]"]
+    end
+
+    H1["Bytes handle: raw_bytes<br/>(full packet)"] -->|"refcount +1"| BUF
+    H2["Bytes handle: name_bytes<br/>slice(4..38)"] -->|"refcount +1"| BUF
+    H3["Bytes handle: content_bytes<br/>slice(52..152)"] -->|"refcount +1"| BUF
+    H4["Bytes handle: CS entry<br/>clone() of raw_bytes"] -->|"refcount +1"| BUF
+
+    style BUF fill:#e8f4fd,stroke:#2196F3
+    style H1 fill:#fff3e0,stroke:#FF9800
+    style H2 fill:#fff3e0,stroke:#FF9800
+    style H3 fill:#fff3e0,stroke:#FF9800
+    style H4 fill:#fff3e0,stroke:#FF9800
+```
+
+Each `Bytes` handle (whether a full clone or a sub-slice) points into the same allocation. The buffer is freed only when the last handle is dropped.
+
 ## Bytes Through the Pipeline
 
 ```mermaid
@@ -90,6 +110,26 @@ Names are the most frequently shared data in an NDN forwarder. A single name may
 
 Copying a name with 6 components means copying 6 `NameComponent` values (each containing a `Bytes` slice and a TLV type). `Arc<Name>` eliminates all of these copies: cloning the `Arc` is a single atomic increment, and all holders share the same `Name` allocation.
 
+```mermaid
+graph TD
+    NAME["Arc&lt;Name&gt;<br/>/ndn/app/video/frame/1<br/>(single heap allocation)"]
+
+    PC["PacketContext<br/>.name"] -->|"Arc::clone()"| NAME
+    PIT["PIT entry<br/>.name"] -->|"Arc::clone()"| NAME
+    FIB["FIB lookup result<br/>.prefix"] -->|"Arc::clone()"| NAME
+    CS["CS entry<br/>.key"] -->|"Arc::clone()"| NAME
+    SC["StrategyContext<br/>.name"] -->|"&Arc (borrow)"| NAME
+    MT["MeasurementsTable<br/>.key"] -->|"Arc::clone()"| NAME
+
+    style NAME fill:#c8e6c9,stroke:#4CAF50
+    style PC fill:#e8f4fd,stroke:#2196F3
+    style PIT fill:#fff3e0,stroke:#FF9800
+    style FIB fill:#f3e5f5,stroke:#9C27B0
+    style CS fill:#fff3e0,stroke:#FF9800
+    style SC fill:#fce4ec,stroke:#E91E63
+    style MT fill:#e8f4fd,stroke:#2196F3
+```
+
 ```rust
 // In PacketContext:
 pub name: Option<Arc<Name>>,
@@ -107,6 +147,30 @@ Not all packet fields are needed on every code path. A Content Store hit, for ex
 ```rust
 // Conceptual: field is decoded on first access, never before
 let nonce: &u32 = interest.nonce(); // decodes from raw_bytes on first call, cached thereafter
+```
+
+```mermaid
+graph LR
+    subgraph "Interest (OnceLock lazy decode)"
+        direction TB
+        N["name: Arc&lt;Name&gt;<br/>--- DECODED ---"]
+        NO["nonce: OnceLock&lt;u32&gt;<br/>--- not yet accessed ---"]
+        LT["lifetime: OnceLock&lt;Duration&gt;<br/>--- not yet accessed ---"]
+        CBP["can_be_prefix: OnceLock&lt;bool&gt;<br/>--- DECODED ---"]
+        MBF["must_be_fresh: OnceLock&lt;bool&gt;<br/>--- not yet accessed ---"]
+        FH["forwarding_hint: OnceLock&lt;...&gt;<br/>--- not yet accessed ---"]
+    end
+
+    RAW["raw_bytes: Bytes<br/>(wire format)"] -->|"decode on<br/>first access"| N
+    RAW -->|"decode on<br/>first access"| CBP
+
+    style N fill:#c8e6c9,stroke:#4CAF50
+    style CBP fill:#c8e6c9,stroke:#4CAF50
+    style NO fill:#eeeeee,stroke:#9E9E9E
+    style LT fill:#eeeeee,stroke:#9E9E9E
+    style MBF fill:#eeeeee,stroke:#9E9E9E
+    style FH fill:#eeeeee,stroke:#9E9E9E
+    style RAW fill:#e8f4fd,stroke:#2196F3
 ```
 
 This means the pipeline pays only for what it uses. On the fast path (CS hit), the decode cost is minimal: parse the type byte, extract the name (a `Bytes::slice()`), look up the CS, and send.

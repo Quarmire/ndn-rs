@@ -64,6 +64,96 @@ sequenceDiagram
     FaceA->>App: Data
 ```
 
+## Tokio Task Topology
+
+```mermaid
+flowchart LR
+    subgraph Face Reader Tasks
+        F1["UdpFace\nrecv loop"]
+        F2["TcpFace\nrecv loop"]
+        F3["EtherFace\nrecv loop"]
+        Fn["..."]
+    end
+
+    CH[/"mpsc channel\n(InboundPacket queue)"/]
+
+    F1 --> CH
+    F2 --> CH
+    F3 --> CH
+    Fn --> CH
+
+    subgraph Pipeline Runner
+        PR["run_pipeline\n(batch drain up to 64)"]
+    end
+
+    CH --> PR
+
+    subgraph Per-Packet Processing
+        PP1["spawn: process_packet"]
+        PP2["spawn: process_packet"]
+        PP3["spawn: process_packet"]
+    end
+
+    PR --> PP1
+    PR --> PP2
+    PR --> PP3
+
+    subgraph Face Send Tasks
+        S1["FaceA.send()"]
+        S2["FaceB.send()"]
+        S3["FaceC.send()"]
+    end
+
+    PP1 --> S1
+    PP2 --> S2
+    PP3 --> S3
+
+    style CH fill:#c90,color:#000
+    style PR fill:#2d5a8c,color:#fff
+    style PP1 fill:#5a2d8c,color:#fff
+    style PP2 fill:#5a2d8c,color:#fff
+    style PP3 fill:#5a2d8c,color:#fff
+```
+
+## Packet Lifecycle
+
+```mermaid
+stateDiagram-v2
+    [*] --> Received: Raw bytes arrive on face
+    Received --> Decoded: TlvDecodeStage\n(LP unwrap + TLV parse)
+    Decoded --> Discovery: Discovery hook check
+
+    Discovery --> Consumed: Discovery packet\n(hello/probe/service)
+    Consumed --> [*]
+
+    Discovery --> Checked: Forwarding packet
+
+    state Checked {
+        [*] --> CSLookup
+        CSLookup --> CacheHit: Name match found
+        CSLookup --> PITCheck: Cache miss
+        PITCheck --> Duplicate: Same nonce detected
+        PITCheck --> Aggregated: Existing PIT out-record
+        PITCheck --> StrategyStage: New Interest
+        StrategyStage --> Forwarded: Forward to nexthop(s)
+        StrategyStage --> Nacked: No route / suppressed
+    }
+
+    CacheHit --> Satisfied: Data sent to in-face
+    Forwarded --> WaitingForData: PIT entry active
+    Duplicate --> Dropped
+    Nacked --> Dropped
+
+    WaitingForData --> Cached: Data arrives, CS insert
+    Cached --> Satisfied: Fan-out to in-record faces
+    WaitingForData --> Expired: PIT timeout
+
+    Satisfied --> [*]
+    Dropped --> [*]
+    Expired --> [*]
+    Aggregated --> [*]
+```
+
 ## Step 1: Bytes Arrive on UdpFace
 
 Raw UDP datagrams arrive on a `UdpFace`. Each face runs its own Tokio task that calls `face.recv()` in a loop and pushes `InboundPacket` structs into a shared `mpsc` channel:

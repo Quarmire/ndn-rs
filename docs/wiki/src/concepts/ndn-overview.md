@@ -16,6 +16,25 @@ NDN inverts this model:
 | Routing tables map address prefixes to next hops | FIB maps name prefixes to next hops |
 | No built-in multicast or aggregation | Duplicate Interests are aggregated automatically (PIT) |
 
+```mermaid
+flowchart LR
+    subgraph IP["IP Model: Where do I send it?"]
+        direction LR
+        srcA["Host A\n10.0.0.1"] -->|"src: 10.0.0.1\ndst: 10.0.0.5"| routerIP["Router\n(stateless forward)"]
+        routerIP -->|"src: 10.0.0.1\ndst: 10.0.0.5"| dstB["Host B\n10.0.0.5"]
+        dstB -->|"response\nsrc: 10.0.0.5\ndst: 10.0.0.1"| routerIP
+        routerIP --> srcA
+    end
+
+    subgraph NDN["NDN Model: What data do I need?"]
+        direction LR
+        consumer["Consumer"] -->|"Interest\n/app/video/frame1"| routerNDN["Router\n(PIT + CS + FIB)"]
+        routerNDN -->|"Interest\n/app/video/frame1"| producer["Producer"]
+        producer -->|"Data\n/app/video/frame1\n+ signature"| routerNDN
+        routerNDN -->|"Data\n/app/video/frame1\n(cached for next request)"| consumer
+    end
+```
+
 ## Key Concepts
 
 ### Named Data
@@ -79,6 +98,25 @@ sequenceDiagram
     Note over R: CS lookup: hit!
     R->>C: Data /app/data/1 [from cache]
     Note over R: No PIT entry needed, no upstream forwarding
+```
+
+The following diagram shows how the three data structures -- PIT, FIB, and CS -- work together at a single forwarder node:
+
+```mermaid
+flowchart TD
+    interest["Incoming Interest\n/app/video/frame1"] --> cs_check{"Content Store\n(CS)"}
+    cs_check -->|"HIT: cached Data found"| reply["Return cached Data\nto incoming face"]
+    cs_check -->|"MISS"| pit_check{"Pending Interest\nTable (PIT)"}
+    pit_check -->|"Existing entry:\naggregate Interest\n(add in-record)"| suppress["Suppress\n(do not forward again)"]
+    pit_check -->|"New entry:\ncreate PIT entry"| fib_lookup{"Forwarding Information\nBase (FIB)"}
+    fib_lookup -->|"Longest-prefix match\n/app -> face 3, cost 10\n/app/video -> face 5, cost 5"| strategy["Strategy selects\nnexthop(s)"]
+    strategy --> forward["Forward Interest\nupstream"]
+
+    data["Incoming Data\n/app/video/frame1"] --> pit_match{"PIT Lookup"}
+    pit_match -->|"No match"| drop["Drop\n(unsolicited)"]
+    pit_match -->|"Match found"| cs_insert["Insert into CS"]
+    cs_insert --> fan_out["Send Data to all\nPIT in-record faces"]
+    fan_out --> consume["Remove PIT entry"]
 ```
 
 ## How ndn-rs Maps These Concepts to Rust

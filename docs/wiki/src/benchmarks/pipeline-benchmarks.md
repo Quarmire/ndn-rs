@@ -19,6 +19,48 @@ open target/criterion/report/index.html
 
 Criterion generates HTML reports with statistical analysis, throughput charts, and comparison against previous runs in `target/criterion/`.
 
+## Approximate Relative Cost of Pipeline Stages
+
+```mermaid
+%%{init: {'theme': 'default'}}%%
+pie title Pipeline Stage Cost Breakdown (approximate)
+    "TLV Decode" : 30
+    "CS Lookup (miss)" : 10
+    "PIT Check" : 15
+    "FIB LPM" : 20
+    "Strategy" : 10
+    "Dispatch" : 15
+```
+
+The chart above shows approximate relative costs for a typical Interest pipeline traversal (CS miss path). TLV decode and FIB longest-prefix match dominate because they involve parsing variable-length names and traversing trie nodes. CS lookup on a miss and strategy execution are comparatively cheap. Actual proportions depend on name length, table sizes, and cache state -- run the benchmarks to get precise numbers for your workload.
+
+## Benchmark Harness Architecture
+
+```mermaid
+graph LR
+    subgraph "Setup (per iteration)"
+        PB["Pre-built wire packets<br/>(realistic names, ~100 B content)"]
+    end
+
+    subgraph "Benchmark Loop (Criterion)"
+        PB --> S1["Stage under test<br/>(e.g. TlvDecodeStage)"]
+        S1 --> M["Measure:<br/>latency (ns/op)<br/>throughput (ops/sec, bytes/sec)"]
+    end
+
+    subgraph "Full Pipeline Benchmarks"
+        PB --> FP["All stages in sequence<br/>(decode -> CS -> PIT -> FIB -> strategy -> dispatch)"]
+        FP --> M2["End-to-end latency"]
+    end
+
+    RT["Tokio current-thread runtime<br/>(no I/O, no scheduling jitter)"] -.->|"runs"| S1
+    RT -.->|"runs"| FP
+
+    style PB fill:#e8f4fd,stroke:#2196F3
+    style M fill:#c8e6c9,stroke:#4CAF50
+    style M2 fill:#c8e6c9,stroke:#4CAF50
+    style RT fill:#fff3e0,stroke:#FF9800
+```
+
 ## What Is Benchmarked
 
 ### TLV Decode

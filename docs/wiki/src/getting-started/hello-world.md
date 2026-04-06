@@ -20,6 +20,31 @@ sequenceDiagram
     E->>C: Data /ndn/hello "hello, NDN!"
 ```
 
+```mermaid
+graph LR
+    subgraph "Application Process"
+        APP["Application code<br/>(Consumer / Producer)"]
+    end
+
+    subgraph "AppFace Channel Pair"
+        direction TB
+        TX1["app_handle.send()"] -->|"mpsc"| RX1["engine face.recv()"]
+        TX2["engine face.send()"] -->|"mpsc"| RX2["app_handle.recv()"]
+    end
+
+    subgraph "ForwarderEngine"
+        PIPE["Pipeline<br/>(FIB + PIT + CS + Strategy)"]
+    end
+
+    APP -->|"Interest"| TX1
+    RX1 -->|"Interest"| PIPE
+    PIPE -->|"Data"| TX2
+    RX2 -->|"Data"| APP
+
+    style APP fill:#e8f4fd,stroke:#2196F3
+    style PIPE fill:#fff3e0,stroke:#FF9800
+```
+
 ## Dependencies
 
 Add these to your `Cargo.toml`:
@@ -110,6 +135,33 @@ async fn main() -> anyhow::Result<()> {
 ### 2. Build the engine
 
 `EngineBuilder` wires the PIT, FIB, content store, pipeline stages, and strategy table. Calling `.face(f)` registers a face with the engine. `.build().await` returns the running `ForwarderEngine` and a `ShutdownHandle`.
+
+```mermaid
+graph TD
+    EB["EngineBuilder::new(config)"]
+    EB -->|".face(consumer_face)"| F1["Face: Consumer"]
+    EB -->|".face(producer_face)"| F2["Face: Producer"]
+    EB -->|"default"| CS["ContentStore (LruCs)"]
+    EB -->|"default"| PIT["PIT (DashMap)"]
+    EB -->|"default"| FIB["FIB (NameTrie)"]
+    EB -->|"default"| ST["StrategyTable"]
+    EB -->|"default"| PIPE["Pipeline Stages"]
+
+    EB ==>|".build().await"| ENGINE["ForwarderEngine"]
+    EB ==>|".build().await"| SH["ShutdownHandle"]
+
+    ENGINE --- F1
+    ENGINE --- F2
+    ENGINE --- CS
+    ENGINE --- PIT
+    ENGINE --- FIB
+    ENGINE --- ST
+    ENGINE --- PIPE
+
+    style EB fill:#e8f4fd,stroke:#2196F3
+    style ENGINE fill:#c8e6c9,stroke:#4CAF50
+    style SH fill:#fce4ec,stroke:#E91E63
+```
 
 ### 3. Add a FIB route
 

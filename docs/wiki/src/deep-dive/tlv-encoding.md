@@ -13,6 +13,35 @@ NDN uses a variable-width unsigned integer encoding called VarNumber for both th
 | 65536 -- 2^32 - 1   | 5          | `0xFE` + 4-byte big-endian       |
 | 2^32 -- 2^64 - 1    | 9          | `0xFF` + 8-byte big-endian       |
 
+```mermaid
+block-beta
+    columns 8
+
+    block:one["1-byte (value 0–252)"]:8
+        v1["value (1 byte)"]
+    end
+
+    block:three["3-byte (value 253–65535)"]:8
+        m3["0xFD"]:2 v3["value (2 bytes, big-endian)"]:6
+    end
+
+    block:five["5-byte (value 65536–2³²−1)"]:8
+        m5["0xFE"]:1 v5["value (4 bytes, big-endian)"]:7
+    end
+
+    block:nine["9-byte (value 2³²–2⁶⁴−1)"]:8
+        m9["0xFF"]:1 v9["value (8 bytes, big-endian)"]:7
+    end
+
+    style m3 fill:#c44,color:#fff
+    style m5 fill:#c44,color:#fff
+    style m9 fill:#c44,color:#fff
+    style v1 fill:#2d5a8c,color:#fff
+    style v3 fill:#2d5a8c,color:#fff
+    style v5 fill:#2d5a8c,color:#fff
+    style v9 fill:#2d5a8c,color:#fff
+```
+
 The three core functions in `ndn-tlv`:
 
 ```rust
@@ -47,6 +76,31 @@ let next_type = reader.peek_type()?;
 
 // Scoped sub-reader for nested TLV parsing
 let mut inner = reader.scoped(value.len())?;
+```
+
+```mermaid
+graph LR
+    subgraph "Original Bytes buffer (single allocation, ref-counted)"
+        B0["T"] ~~~ B1["L"] ~~~ B2["V₁ V₂ V₃ V₄ V₅ V₆ ..."]
+    end
+
+    subgraph "After read_tlv()"
+        S1["typ = T"]
+        S2["value: Bytes slice → V₁ V₂ V₃ ..."]
+    end
+
+    subgraph "After scoped()"
+        S3["inner TlvReader → V₁ V₂ ..."]
+    end
+
+    B2 -. "zero-copy slice\n(same Arc'd allocation)" .-> S2
+    B2 -. "bounded sub-reader\n(no copy)" .-> S3
+
+    style B0 fill:#c44,color:#fff
+    style B1 fill:#c90,color:#fff
+    style B2 fill:#2d5a8c,color:#fff
+    style S2 fill:#2d5a8c,color:#fff
+    style S3 fill:#3a7ca5,color:#fff
 ```
 
 Key methods:
@@ -125,6 +179,44 @@ In ndn-rs, the `Interest` struct uses `OnceLock<T>` for lazy decoding. The Name 
 ## Data Wire Format
 
 A Data packet (type `0x06`) contains the Name, MetaInfo, Content, SignatureInfo, and SignatureValue. The signed region spans from Name through SignatureInfo (inclusive), and the SignatureValue covers that region:
+
+```mermaid
+graph TD
+    D["Data (0x06)"] --> N["Name (0x07)"]
+    D --> MI["MetaInfo (0x14)"]
+    D --> CO["Content (0x15)"]
+    D --> SI["SignatureInfo (0x16)"]
+    D --> SV["SignatureValue (0x17)"]
+
+    N --> N1["GenericNameComponent (0x08)\n'ndn'"]
+    N --> N2["GenericNameComponent (0x08)\n'test'"]
+    N --> N3["GenericNameComponent (0x08)\n'data'"]
+
+    MI --> CT["ContentType (0x18)"]
+    MI --> FP["FreshnessPeriod (0x19)"]
+
+    CO --> PL["&lt;application payload&gt;"]
+
+    SI --> ST["SignatureType (0x1B)"]
+    SI --> KL["KeyLocator (0x1C)"]
+
+    SV --> SB["&lt;signature bytes&gt;"]
+
+    style D fill:#2d5a8c,color:#fff
+    style N fill:#3a7ca5,color:#fff
+    style N1 fill:#5ba3c9,color:#fff
+    style N2 fill:#5ba3c9,color:#fff
+    style N3 fill:#5ba3c9,color:#fff
+    style MI fill:#3a7ca5,color:#fff
+    style CO fill:#3a7ca5,color:#fff
+    style SI fill:#8c5a2d,color:#fff
+    style ST fill:#a5793a,color:#fff
+    style KL fill:#a5793a,color:#fff
+    style SV fill:#8c2d2d,color:#fff
+    style SB fill:#a53a3a,color:#fff
+```
+
+The signed region spans from Name through SignatureInfo (inclusive), and the SignatureValue covers that region:
 
 ```text
 Data (0x06)

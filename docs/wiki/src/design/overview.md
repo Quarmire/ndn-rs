@@ -6,6 +6,36 @@ The central insight behind ndn-rs: Rust's ownership model and trait system map n
 
 In ndn-rs, a packet enters the system as a `Bytes` buffer from a face, flows through a sequence of `PipelineStage` trait objects by value, and exits as a `Bytes` buffer sent to one or more faces. Each stage receives ownership of the `PacketContext`, processes it, and either passes it forward or consumes it (short-circuiting). The compiler enforces that no stage can accidentally use a packet after handing it off -- a guarantee that NFD achieves only through runtime checks and careful documentation.
 
+```mermaid
+graph LR
+    subgraph Interest Pipeline
+        A["FaceCheck"] -->|"Continue"| B["TlvDecode"]
+        B -->|"Continue"| C["CsLookup"]
+        C -->|"Continue (miss)"| D["PitCheck"]
+        C -->|"Send (hit)"| OUT["Dispatch"]
+        D -->|"Continue"| E["Strategy"]
+        E -->|"Continue"| OUT
+    end
+
+    subgraph Action Enum
+        direction TB
+        R1["Continue -- pass to next stage"]
+        R2["Send -- short-circuit to dispatch"]
+        R3["Drop -- discard packet"]
+        R4["Nack -- send Nack upstream"]
+        R5["Satisfy -- Data satisfies PIT"]
+    end
+
+    style A fill:#e8f4fd,stroke:#2196F3
+    style B fill:#e8f4fd,stroke:#2196F3
+    style C fill:#fff3e0,stroke:#FF9800
+    style D fill:#e8f4fd,stroke:#2196F3
+    style E fill:#f3e5f5,stroke:#9C27B0
+    style OUT fill:#e8f5e9,stroke:#4CAF50
+```
+
+Each stage receives `PacketContext` **by value** and returns an `Action` enum. The dispatcher inspects the action and either passes `PacketContext` to the next stage or terminates the pipeline.
+
 ## Library, Not Daemon
 
 ndn-rs is a library. There is no daemon/client split. The forwarding engine (`ndn-engine`) is a Rust library that any application can embed directly. The standalone router (`ndn-router`) is just one binary that links against this library; applications can equally embed the engine in-process and get a thin `AppFace` backed by a shared memory ring buffer.
@@ -40,8 +70,67 @@ Every extension point in ndn-rs is a trait:
 
 This trait-based approach means new transports, strategies, and cache backends can be added without modifying the core pipeline. The built-in pipeline is monomorphised at compile time for zero-cost dispatch; only plugin stages use dynamic dispatch via `ErasedPipelineStage`.
 
+```mermaid
+graph TB
+    subgraph "NFD / ndn-cxx: Class Hierarchy"
+        direction TB
+        SBase["class Strategy (virtual)"]
+        SBase --> BR["class BestRouteStrategy"]
+        SBase --> MC["class MulticastStrategy"]
+        SBase --> ASF["class AsfStrategy"]
+        SBase -.->|"Extend via<br/>virtual override"| NEW1["class MyStrategy"]
+    end
+
+    subgraph "ndn-rs: Trait Composition"
+        direction TB
+        STrait["trait Strategy"]
+        STrait -->|"impl"| BR2["BestRouteStrategy"]
+        STrait -->|"impl"| MC2["MulticastStrategy"]
+        STrait -->|"impl"| ASF2["AsfStrategy"]
+        STrait -.->|"impl for any type"| NEW2["MyStrategy"]
+        FTrait["trait Filter"] -->|"compose"| BR2
+        FTrait -->|"compose"| MC2
+    end
+
+    style SBase fill:#ffcdd2,stroke:#F44336
+    style STrait fill:#c8e6c9,stroke:#4CAF50
+    style FTrait fill:#c8e6c9,stroke:#4CAF50
+```
+
 ## Concurrency Model
 
 ndn-rs is built on Tokio. Each face runs its own async task, pushing `RawPacket` values into a shared `mpsc` channel. A single pipeline runner drains the channel and processes packets inline through the stage sequence. A separate expiry task drains expired PIT entries on a 1 ms tick using a hierarchical timing wheel.
+
+```mermaid
+graph TD
+    subgraph Faces
+        F1["UdpFace task"]
+        F2["TcpFace task"]
+        F3["AppFace task"]
+        F4["EtherFace task"]
+    end
+
+    F1 -->|"RawPacket"| CH["mpsc channel"]
+    F2 -->|"RawPacket"| CH
+    F3 -->|"RawPacket"| CH
+    F4 -->|"RawPacket"| CH
+
+    CH --> PR["Pipeline Runner<br/>(drains channel)"]
+
+    PR -->|"spawn"| T1["per-packet task"]
+    PR -->|"spawn"| T2["per-packet task"]
+    PR -->|"spawn"| T3["per-packet task"]
+
+    T1 --> D["Dispatch<br/>(send to outgoing faces)"]
+    T2 --> D
+    T3 --> D
+
+    EX["Expiry task<br/>(1 ms tick, timing wheel)"] -.->|"evict expired<br/>PIT entries"| PIT["PIT"]
+
+    style CH fill:#fff3e0,stroke:#FF9800
+    style PR fill:#e8f4fd,stroke:#2196F3
+    style D fill:#e8f5e9,stroke:#4CAF50
+    style EX fill:#fce4ec,stroke:#E91E63
+```
 
 Tracing uses the `tracing` crate with structured spans per packet. The library never initializes a tracing subscriber -- that is the binary's responsibility, following the principle that libraries should not make policy decisions about logging output.
