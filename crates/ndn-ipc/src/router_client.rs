@@ -31,7 +31,7 @@ use bytes::Bytes;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use ndn_face_local::UnixFace;
+use ndn_face_local::IpcFace;
 use ndn_packet::Name;
 use ndn_transport::{Face, FaceId};
 
@@ -65,8 +65,8 @@ enum DataTransport {
 
 /// Client for connecting to and communicating with a running ndn-router.
 pub struct RouterClient {
-    /// Control channel (always a UnixFace).
-    control: Arc<UnixFace>,
+    /// Control channel (Unix domain socket on Unix, Named Pipe on Windows).
+    control: Arc<IpcFace>,
     /// Typed management API — shares the control face.
     pub mgmt: crate::mgmt_client::MgmtClient,
     /// Mutex for serialising recv on the control face (Unix data path).
@@ -103,8 +103,8 @@ impl RouterClient {
         face_socket: impl AsRef<Path>,
         shm_name: Option<&str>,
     ) -> Result<Self, RouterError> {
-        let control =
-            Arc::new(ndn_face_local::unix_face_connect(FaceId(0), face_socket.as_ref()).await?);
+        let path = face_socket.as_ref().to_str().unwrap_or_default().to_owned();
+        let control = Arc::new(ndn_face_local::ipc_face_connect(FaceId(0), &path).await?);
         let cancel = CancellationToken::new();
         let dead = Arc::new(AtomicBool::new(false));
 
@@ -143,7 +143,7 @@ impl RouterClient {
     /// Set up SHM data plane by sending `faces/create` to the router.
     #[cfg(all(unix, feature = "spsc-shm"))]
     async fn setup_shm(
-        control: &Arc<UnixFace>,
+        control: &Arc<IpcFace>,
         shm_name: &str,
         cancel: CancellationToken,
     ) -> Result<DataTransport, RouterError> {

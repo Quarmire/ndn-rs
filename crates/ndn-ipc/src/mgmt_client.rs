@@ -17,7 +17,6 @@
 /// # Ok(())
 /// # }
 /// ```
-use std::path::Path;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -27,7 +26,7 @@ use ndn_config::{
     ControlParameters, ControlResponse,
     nfd_command::{command_name, dataset_name, module, verb},
 };
-use ndn_face_local::UnixFace;
+use ndn_face_local::IpcFace;
 use ndn_packet::{Name, encode::encode_interest};
 use ndn_transport::{Face, FaceId};
 
@@ -35,26 +34,33 @@ use crate::router_client::RouterError;
 
 /// Management client for a running ndn-router.
 ///
-/// Sends NFD management Interests over a UnixFace and decodes the
-/// ControlResponse from the returned Data packet.
+/// Sends NFD management Interests over an [`IpcFace`] and decodes the
+/// `ControlResponse` from the returned Data packet.
+///
+/// On Unix the transport is a Unix domain socket; on Windows it is a
+/// Named Pipe.  Both are accessed through the same `MgmtClient` API.
 pub struct MgmtClient {
-    face: Arc<UnixFace>,
+    face: Arc<IpcFace>,
     recv_lock: Mutex<()>,
 }
 
 impl MgmtClient {
-    /// Connect to the router's face socket.
-    pub async fn connect(face_socket: impl AsRef<Path>) -> Result<Self, RouterError> {
+    /// Connect to the router's IPC socket.
+    ///
+    /// `face_socket` is a Unix domain socket path on Unix (e.g.
+    /// `/tmp/ndn-faces.sock`) or a Named Pipe path on Windows (e.g.
+    /// `\\.\pipe\ndn-faces`).
+    pub async fn connect(face_socket: impl AsRef<str>) -> Result<Self, RouterError> {
         let face =
-            Arc::new(ndn_face_local::unix_face_connect(FaceId(0), face_socket.as_ref()).await?);
+            Arc::new(ndn_face_local::ipc_face_connect(FaceId(0), face_socket.as_ref()).await?);
         Ok(Self {
             face,
             recv_lock: Mutex::new(()),
         })
     }
 
-    /// Wrap an existing UnixFace (e.g. from a `RouterClient`).
-    pub fn from_face(face: Arc<UnixFace>) -> Self {
+    /// Wrap an existing [`IpcFace`] (e.g. from a `RouterClient`).
+    pub fn from_face(face: Arc<IpcFace>) -> Self {
         Self {
             face,
             recv_lock: Mutex::new(()),
