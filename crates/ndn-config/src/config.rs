@@ -54,6 +54,9 @@ pub struct ForwarderConfig {
 
     #[serde(default)]
     pub logging: LoggingConfig,
+
+    #[serde(default)]
+    pub discovery: DiscoveryTomlConfig,
 }
 
 impl ForwarderConfig {
@@ -370,6 +373,118 @@ impl Default for LoggingConfig {
             level: default_log_level(),
             file: None,
         }
+    }
+}
+
+// ─── Discovery TOML config ────────────────────────────────────────────────────
+
+/// `[discovery]` section — neighbor and service discovery configuration.
+///
+/// Discovery is disabled unless `node_name` is set.
+///
+/// ```toml
+/// [discovery]
+/// profile = "lan"
+/// node_name = "/ndn/site/myrouter"
+/// served_prefixes = ["/ndn/site/sensors"]
+/// # optional per-field overrides:
+/// hello_interval_base_ms = 5000
+/// hello_interval_max_ms  = 60000
+/// liveness_miss_count    = 3
+/// gossip_fanout          = 3
+/// relay_records          = false
+/// auto_fib_cost          = 100
+/// auto_fib_ttl_multiplier = 2.0
+/// ```
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct DiscoveryTomlConfig {
+    /// Deployment profile name: `static`, `lan`, `campus`, `mobile`,
+    /// `high-mobility`, or `asymmetric`.  Defaults to `lan`.
+    #[serde(default)]
+    pub profile: Option<String>,
+
+    /// This node's NDN name.  **Required** to enable discovery.
+    ///
+    /// If the value ends with `/`, the system hostname is appended
+    /// automatically (e.g. `"/ndn/site/"` → `"/ndn/site/router1"`).
+    #[serde(default)]
+    pub node_name: Option<String>,
+
+    /// Prefixes published as service records at startup via
+    /// `ServiceDiscoveryProtocol::publish()`.
+    #[serde(default)]
+    pub served_prefixes: Vec<String>,
+
+    // ── Per-field overrides (supplement the profile defaults) ─────────────
+
+    /// Override `hello_interval_base` in milliseconds.
+    #[serde(default)]
+    pub hello_interval_base_ms: Option<u64>,
+
+    /// Override `hello_interval_max` in milliseconds.
+    #[serde(default)]
+    pub hello_interval_max_ms: Option<u64>,
+
+    /// Override `liveness_miss_count`.
+    #[serde(default)]
+    pub liveness_miss_count: Option<u32>,
+
+    /// Override SWIM indirect-probe fanout K.
+    #[serde(default)]
+    pub swim_indirect_fanout: Option<u32>,
+
+    /// Override gossip broadcast fanout.
+    #[serde(default)]
+    pub gossip_fanout: Option<u32>,
+
+    /// Override `relay_records` in `ServiceDiscoveryConfig`.
+    #[serde(default)]
+    pub relay_records: Option<bool>,
+
+    /// Override auto-FIB route cost.
+    #[serde(default)]
+    pub auto_fib_cost: Option<u32>,
+
+    /// Override auto-FIB TTL multiplier.
+    #[serde(default)]
+    pub auto_fib_ttl_multiplier: Option<f32>,
+
+    /// Optional PIB (public information base) path for persistent key storage.
+    /// Defaults to `~/.ndn/pib.db`.
+    #[serde(default)]
+    pub pib_path: Option<String>,
+
+    /// Key name for signing hello packets.  If absent, a deterministic
+    /// ephemeral Ed25519 key is auto-generated from the node name.
+    #[serde(default)]
+    pub key_name: Option<String>,
+}
+
+impl DiscoveryTomlConfig {
+    /// Returns `true` if discovery is enabled (i.e. `node_name` is set).
+    pub fn enabled(&self) -> bool {
+        self.node_name.is_some()
+    }
+
+    /// Resolve the effective node name, appending the system hostname if
+    /// `node_name` ends with `/`.
+    pub fn resolved_node_name(&self) -> Option<String> {
+        let raw = self.node_name.as_deref()?;
+        if raw.ends_with('/') {
+            let host = Self::hostname();
+            Some(format!("{}{}", raw.trim_end_matches('/'), host))
+        } else {
+            Some(raw.to_owned())
+        }
+    }
+
+    fn hostname() -> String {
+        std::env::var("HOSTNAME").unwrap_or_else(|_| {
+            // Fallback: read from /etc/hostname or use "localhost".
+            std::fs::read_to_string("/etc/hostname")
+                .map(|s| s.trim().to_owned())
+                .unwrap_or_else(|_| "localhost".to_owned())
+        })
     }
 }
 

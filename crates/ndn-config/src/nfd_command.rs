@@ -26,6 +26,8 @@ pub mod module {
     pub const CS: &[u8] = b"cs";
     pub const STRATEGY: &[u8] = b"strategy-choice";
     pub const STATUS: &[u8] = b"status";
+    pub const NEIGHBORS: &[u8] = b"neighbors";
+    pub const SERVICE: &[u8] = b"service";
 }
 
 /// Command verbs per module.
@@ -52,6 +54,10 @@ pub mod verb {
     pub const CONFIG: &[u8] = b"config";
     pub const INFO: &[u8] = b"info";
     pub const ERASE: &[u8] = b"erase";
+
+    // service
+    pub const ANNOUNCE: &[u8] = b"announce";
+    pub const WITHDRAW: &[u8] = b"withdraw";
 }
 
 // ─── Name builder ────────────────────────────────────────────────────────────
