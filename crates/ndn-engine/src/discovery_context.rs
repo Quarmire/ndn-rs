@@ -201,12 +201,8 @@ impl DiscoveryContext for EngineDiscoveryContext {
 
     // ── Neighbor table ───────────────────────────────────────────────────────
 
-    fn neighbors(&self) -> &dyn NeighborTableView {
-        // `self.neighbors` is `Arc<NeighborTable>`.  The coercion from
-        // `&NeighborTable` to `&dyn NeighborTableView` is valid because
-        // NeighborTable implements NeighborTableView.  The reference is
-        // valid for the lifetime of `&self`.
-        &*self.neighbors
+    fn neighbors(&self) -> Arc<dyn NeighborTableView> {
+        Arc::clone(&self.neighbors) as Arc<dyn NeighborTableView>
     }
 
     fn update_neighbor(&self, update: NeighborUpdate) {
