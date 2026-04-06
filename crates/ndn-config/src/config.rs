@@ -277,10 +277,16 @@ fn default_mgmt_transport() -> String {
     "ndn".to_owned()
 }
 fn default_bypass_socket() -> String {
-    "/tmp/ndn-router.sock".to_owned()
+    #[cfg(unix)]
+    return "/tmp/ndn-router.sock".to_owned();
+    #[cfg(windows)]
+    return r"\\.\pipe\ndn-router".to_owned();
 }
 fn default_face_socket() -> String {
-    "/tmp/ndn-faces.sock".to_owned()
+    #[cfg(unix)]
+    return "/tmp/ndn-faces.sock".to_owned();
+    #[cfg(windows)]
+    return r"\\.\pipe\ndn-faces".to_owned();
 }
 
 /// Security settings.
