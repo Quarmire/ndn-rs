@@ -31,10 +31,10 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use ndn_packet::{Name, tlv_type};
+use ndn_packet::{Name, encode::encode_interest, tlv_type};
 use ndn_tlv::TlvWriter;
 use ndn_transport::FaceId;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::config::{DiscoveryScope, ServiceDiscoveryConfig, ServiceValidationPolicy};
 use crate::context::DiscoveryContext;
@@ -96,6 +96,12 @@ pub struct ServiceDiscoveryProtocol {
     rate_limits: Mutex<HashMap<String, ProducerRateLimit>>,
     /// Auto-populated FIB entries pending TTL expiry.
     auto_fib: Mutex<Vec<AutoFibEntry>>,
+    /// Timestamp of the last proactive browse broadcast to established neighbors.
+    ///
+    /// Used by `on_tick()` to throttle periodic re-browse so that runtime
+    /// service announcements (e.g. ndn-iperf starting after neighbor
+    /// establishment) propagate to peers within one browse interval.
+    last_browse: Mutex<Option<Instant>>,
 }
 
 impl ServiceDiscoveryProtocol {
@@ -119,6 +125,7 @@ impl ServiceDiscoveryProtocol {
             peer_records: Mutex::new(Vec::new()),
             rate_limits: Mutex::new(HashMap::new()),
             auto_fib: Mutex::new(Vec::new()),
+            last_browse: Mutex::new(None),
         }
     }
 
@@ -436,6 +443,38 @@ impl ServiceDiscoveryProtocol {
         true
     }
 
+    // ── Browse helpers ────────────────────────────────────────────────────────
+
+    /// Send a browse Interest on `face_id` to solicit service records from
+    /// the peer on that face.  When the peer's SD protocol receives this
+    /// Interest it will respond with its local records as Data packets;
+    /// those are handled by [`handle_sd_data`] which auto-populates the FIB.
+    fn send_browse_interest(&self, face_id: FaceId, ctx: &dyn DiscoveryContext) {
+        let interest = encode_interest(sd_services(), None);
+        ctx.send_on(face_id, interest);
+        trace!(face = ?face_id, "ServiceDiscovery: sent browse Interest");
+    }
+
+    /// Send browse Interests to every face of every established neighbor.
+    /// Records `now` as the last-browse timestamp to throttle calls from
+    /// `on_tick()`.
+    fn browse_all_neighbors(&self, now: Instant, ctx: &dyn DiscoveryContext) {
+        let neighbors = ctx.neighbors().all();
+        let mut count = 0usize;
+        for entry in &neighbors {
+            if entry.is_reachable() {
+                for (face_id, _, _) in &entry.faces {
+                    self.send_browse_interest(*face_id, ctx);
+                    count += 1;
+                }
+            }
+        }
+        *self.last_browse.lock().unwrap() = Some(now);
+        if count > 0 {
+            debug!(peers = count, "ServiceDiscovery: browse refresh sent to established neighbors");
+        }
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     fn is_in_scope(&self, _prefix: &Name) -> bool {
@@ -500,7 +539,12 @@ impl DiscoveryProtocol for ServiceDiscoveryProtocol {
 
     fn claimed_prefixes(&self) -> &[Name] { &self.claimed }
 
-    fn on_face_up(&self, _face_id: FaceId, _ctx: &dyn DiscoveryContext) {}
+    fn on_face_up(&self, face_id: FaceId, ctx: &dyn DiscoveryContext) {
+        // Immediately probe the peer for its service records.  The peer's SD
+        // protocol will respond with its local records as Data packets, which
+        // handle_sd_data() will pick up to auto-populate our FIB.
+        self.send_browse_interest(face_id, ctx);
+    }
 
     fn on_face_down(&self, _face_id: FaceId, _ctx: &dyn DiscoveryContext) {
         // Remove all auto-populated FIB entries for the face that went down.
@@ -553,6 +597,29 @@ impl DiscoveryProtocol for ServiceDiscoveryProtocol {
         for (prefix, face_id) in expired {
             ctx.remove_fib_entry(&prefix, face_id, PROTOCOL);
             debug!("ServiceDiscovery: expired auto-FIB {:?} via {face_id:?}", prefix);
+        }
+
+        // Periodically re-browse all established neighbors so that runtime
+        // service announcements (e.g. ndn-iperf starting after neighbor
+        // establishment) are discovered without waiting for a face event.
+        // The interval is derived from the auto-FIB TTL: half the minimum
+        // freshness period guarantees records are refreshed before they expire.
+        // Floor: 10 s (avoid hammering on fast-tick profiles).
+        const BROWSE_FLOOR: Duration = Duration::from_secs(10);
+        let browse_interval = {
+            let auto_fib = self.auto_fib.lock().unwrap();
+            auto_fib.iter()
+                .map(|e| e.expires_at.saturating_duration_since(now) / 2)
+                .min()
+                .unwrap_or(Duration::from_secs(30))
+                .max(BROWSE_FLOOR)
+        };
+
+        let due = self.last_browse.lock().unwrap()
+            .map_or(true, |t| now.duration_since(t) >= browse_interval);
+
+        if due {
+            self.browse_all_neighbors(now, ctx);
         }
     }
 }
