@@ -1,5 +1,7 @@
 # vs. ndnd (Go)
 
+> **📝 Note:** ndnd and ndn-rs share a goal of being simpler and more modern than NFD, but they make fundamentally different language-level tradeoffs. This comparison focuses on how Go's garbage collector and goroutine model differ from Rust's ownership and async model for the specific workload of NDN packet forwarding.
+
 This page compares ndn-rs with [ndnd](https://github.com/named-data/ndnd), an NDN forwarder written in Go. ndnd was created as a simpler, more modern alternative to NFD, leveraging Go's concurrency primitives and garbage collector. Understanding the differences clarifies what ndn-rs gains from Rust's ownership model and what tradeoffs that entails.
 
 ## Comparison Table

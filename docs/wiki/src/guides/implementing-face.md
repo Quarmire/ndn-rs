@@ -156,9 +156,13 @@ The `FaceTable` uses `DashMap<FaceId, Arc<dyn ErasedFace>>` internally. Pipeline
 
 ### recv: one task, one consumer
 
+> **💡 Key insight:** `recv()` is called from exactly **one** dedicated task per face. The engine spawns this task automatically. You never need to make `recv()` safe for concurrent callers -- it is inherently single-consumer. This simplifies implementation: you can use a `tokio::sync::Mutex<Receiver>` without worrying about contention.
+
 `recv()` is only ever called from the face's own reader task. The engine spawns one task per face that loops on `recv()` and pushes decoded packets into the shared pipeline channel. You do not need to make `recv()` safe for concurrent callers.
 
 ### send: must be `&self` and synchronized
+
+> **⚠️ Important:** `send()` takes `&self`, not `&mut self`. Multiple pipeline tasks may call `send()` concurrently on the same face. You **must** provide internal synchronization. The idiomatic pattern is to hold an `mpsc::Sender` (which is `Clone + Send`) and delegate actual I/O to a dedicated writer task. Do not use a `Mutex<Socket>` directly -- it would serialize all outgoing traffic through a single lock.
 
 `send()` is called from arbitrary pipeline tasks -- potentially many at once. Since the signature is `&self` (not `&mut self`), you must synchronize internally. The standard pattern is an `mpsc::Sender` that buffers outgoing packets for a dedicated writer task:
 
@@ -203,6 +207,8 @@ graph TD
 ```
 
 Network-facing transports (UDP, TCP, Ethernet, serial) should wrap packets in an NDNLPv2 `LpPacket` envelope before writing to the wire. Local transports (Unix, App, SHM) send the raw packet as-is. The existing `StreamFace` makes this explicit via an `lp_encode` constructor parameter -- follow the same convention based on `FaceKind::scope()`.
+
+> **🎯 Tip:** When in doubt about whether your face needs LP wrapping, check `FaceKind::scope()`. If it returns `NonLocal`, you almost certainly need LP encoding. Study `UdpFace` (simplest network face) or `AppFace` (simplest local face) as reference implementations for your transport category.
 
 ### Error handling
 

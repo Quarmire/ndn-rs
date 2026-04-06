@@ -8,6 +8,8 @@ When a face receives a packet from the network, it arrives as a `bytes::Bytes` b
 
 This is possible because `Bytes` is a reference-counted, immutable byte buffer. `Bytes::clone()` increments an atomic counter and returns a new handle to the same data. `Bytes::slice(start..end)` creates a sub-view into the same allocation. Neither operation copies any packet data.
 
+> **💡 Key insight:** `Bytes` is the foundational type that makes zero-copy possible. Every "copy" in the pipeline is actually a reference count increment (a single atomic operation). The underlying memory is freed only when the last handle is dropped. This is why the Content Store can hold a cached packet for days while simultaneously serving it to multiple consumers -- they all share the same allocation.
+
 ```mermaid
 graph TD
     subgraph "Underlying Allocation"
@@ -110,6 +112,8 @@ Names are the most frequently shared data in an NDN forwarder. A single name may
 
 Copying a name with 6 components means copying 6 `NameComponent` values (each containing a `Bytes` slice and a TLV type). `Arc<Name>` eliminates all of these copies: cloning the `Arc` is a single atomic increment, and all holders share the same `Name` allocation.
 
+> **📊 Performance:** Without `Arc<Name>`, every PIT insert, FIB lookup, CS insert, and strategy invocation would copy the full name (6 components = 6 `Bytes` slices + 6 TLV type tags). With `Arc`, all of these operations are a single atomic increment. On a forwarder processing 1M packets/second, this eliminates millions of allocations per second.
+
 ```mermaid
 graph TD
     NAME["Arc&lt;Name&gt;<br/>/ndn/app/video/frame/1<br/>(single heap allocation)"]
@@ -183,5 +187,7 @@ Zero-copy is not absolute. Copies occur in specific, deliberate places:
 - **Signature computation**: Computing a signature requires reading the signed portion of the packet, which may involve a copy into the signing buffer depending on the crypto library.
 - **Logging/tracing**: Debug-level logging that formats packet contents creates string copies, but this is behind a log-level gate and never runs in production hot paths.
 - **Cross-face-type adaptation**: When a packet moves between face types with different framing (e.g., UDP to Ethernet), the link-layer header is different. The NDN packet bytes themselves are not copied, but a new buffer may be allocated for the new framing around them.
+
+> **⚠️ Important:** These are the *only* places where data is copied. If you are implementing a new face or pipeline stage, avoid introducing additional copies. Use `Bytes::slice()` for sub-views and `Bytes::clone()` for sharing -- never `Vec::from()` or `to_vec()` on the hot path.
 
 The important invariant: **the NDN packet data itself is never copied on the forwarding fast path.** Framing and metadata may be allocated, but the TLV content -- which is the bulk of the bytes -- flows through untouched.

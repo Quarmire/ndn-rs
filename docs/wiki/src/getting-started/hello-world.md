@@ -6,6 +6,8 @@ This tutorial shows how to run a complete Interest/Data exchange using the ndn-r
 
 In NDN, communication follows a pull-based model: a **consumer** sends an Interest packet naming the data it wants, and a **producer** responds with a matching Data packet. The forwarding engine sits between them, matching Interests to Data via the PIT (Pending Interest Table) and FIB (Forwarding Information Base).
 
+> **💡 Key insight:** No external router is needed for this example. The `AppFace` creates an in-process channel pair -- one side for the application, one side for the engine. Packets flow through the full forwarding pipeline (PIT, FIB, CS, strategy) but never touch the network. This is the same mechanism used for production in-process applications.
+
 ```mermaid
 sequenceDiagram
     participant C as Consumer
@@ -69,6 +71,7 @@ use ndn_engine::EngineConfig;
 use ndn_face_local::AppFace;
 use ndn_packet::Name;
 use ndn_packet::encode::DataBuilder;
+use ndn_store::FibNexthop;
 use ndn_transport::FaceId;
 
 #[tokio::main]
@@ -88,7 +91,7 @@ async fn main() -> anyhow::Result<()> {
 
     // 3. Install a FIB route: Interests for /ndn/hello -> producer face.
     let prefix: Name = "/ndn/hello".parse()?;
-    engine.fib().add_nexthop(&prefix, FaceId(2), 0);
+    engine.fib().add_nexthop(&prefix, FibNexthop { face_id: 2, cost: 0 });
 
     // 4. Create Consumer and Producer from their handles.
     let mut consumer = Consumer::from_handle(consumer_handle);
@@ -136,6 +139,8 @@ async fn main() -> anyhow::Result<()> {
 
 `EngineBuilder` wires the PIT, FIB, content store, pipeline stages, and strategy table. Calling `.face(f)` registers a face with the engine. `.build().await` returns the running `ForwarderEngine` and a `ShutdownHandle`.
 
+> **🔧 Implementation note:** `EngineBuilder` uses sensible defaults for everything: `LruCs` for caching, `BestRouteStrategy` at the root prefix, and the standard Interest/Data pipeline stages. You only need to configure what you want to customize. The builder pattern ensures the engine is fully wired before it starts processing packets.
+
 ```mermaid
 graph TD
     EB["EngineBuilder::new(config)"]
@@ -165,7 +170,7 @@ graph TD
 
 ### 3. Add a FIB route
 
-The FIB maps name prefixes to outgoing faces. `add_nexthop(&prefix, face_id, cost)` tells the engine: "forward Interests matching this prefix to this face." Cost is used when multiple nexthops exist (lower wins).
+The FIB maps name prefixes to outgoing faces. `add_nexthop(&prefix, FibNexthop { face_id, cost })` tells the engine: "forward Interests matching this prefix to this face." Cost is used when multiple nexthops exist (lower wins).
 
 ### 4. Consumer and Producer
 

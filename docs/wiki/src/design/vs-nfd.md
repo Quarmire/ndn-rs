@@ -1,5 +1,7 @@
 # vs. NFD (C++)
 
+> **📝 Note:** This is not a "ndn-rs is better" page. NFD is the reference implementation with over a decade of production deployment, a large research community, and de facto spec authority. This comparison explains the *architectural differences* and the tradeoffs each design makes, so you can choose the right tool for your deployment.
+
 This page compares ndn-rs with [NFD](https://named-data.net/doc/NFD/) (NDN Forwarding Daemon) and its companion library [ndn-cxx](https://named-data.net/doc/ndn-cxx/). NFD is the reference implementation of an NDN forwarder, written in C++ and developed by the NDN project team since 2014. Understanding the differences explains why ndn-rs exists and the tradeoffs it makes.
 
 ## Comparison Table

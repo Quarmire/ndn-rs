@@ -6,6 +6,8 @@ The central insight behind ndn-rs: Rust's ownership model and trait system map n
 
 In ndn-rs, a packet enters the system as a `Bytes` buffer from a face, flows through a sequence of `PipelineStage` trait objects by value, and exits as a `Bytes` buffer sent to one or more faces. Each stage receives ownership of the `PacketContext`, processes it, and either passes it forward or consumes it (short-circuiting). The compiler enforces that no stage can accidentally use a packet after handing it off -- a guarantee that NFD achieves only through runtime checks and careful documentation.
 
+> **💡 Key insight:** The central design principle is **trait composition over class hierarchy**. NFD and ndn-cxx model NDN with deep inheritance trees (Strategy, Face, Transport, LinkService). ndn-rs replaces each hierarchy with a flat trait and composes behaviors by wrapping types (e.g., `StrategyFilter` wraps a `Strategy`, `ShardedCs` wraps a `ContentStore`). This makes the extension points orthogonal -- you can combine any strategy with any filter without writing a new subclass.
+
 ```mermaid
 graph LR
     subgraph Interest Pipeline
@@ -42,6 +44,8 @@ ndn-rs is a library. There is no daemon/client split. The forwarding engine (`nd
 
 This means the same codebase runs as a full router, an embedded forwarder on a microcontroller (via `ndn-embedded` with `no_std`), or an in-process forwarder inside an application. No rewrite required.
 
+> **⚠️ Important:** ndn-rs is a **library, not a daemon**. There is no daemon/client split. Applications embed the forwarding engine directly and communicate via in-process `AppFace` channels -- no IPC serialization, no Unix socket round-trips. The standalone `ndn-router` binary is just one consumer of this library, not a privileged component. This is a fundamental departure from NFD's architecture.
+
 ## Key Design Decisions
 
 | Decision | What | Why |
@@ -69,6 +73,8 @@ Every extension point in ndn-rs is a trait:
 - **`DiscoveryProtocol`** -- neighbor and service discovery (SWIM, mDNS, etc.)
 
 This trait-based approach means new transports, strategies, and cache backends can be added without modifying the core pipeline. The built-in pipeline is monomorphised at compile time for zero-cost dispatch; only plugin stages use dynamic dispatch via `ErasedPipelineStage`.
+
+> **🔧 Implementation note:** The built-in pipeline stages are monomorphised (generic, not `dyn`) so the compiler can inline and optimize the hot path. Only user-provided plugin stages go through `dyn PipelineStage` (via `ErasedPipelineStage`). This means the common case pays zero dynamic dispatch cost while still allowing runtime extensibility.
 
 ```mermaid
 graph TB

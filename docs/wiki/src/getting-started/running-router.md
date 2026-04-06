@@ -63,6 +63,8 @@ The file is loaded via `--config` (or `-c`) or the `NDN_CONFIG` environment vari
 
 ### Minimal configuration
 
+> **🎯 Tip:** The three most impactful config options are `cs_capacity_mb` (how much RAM to dedicate to caching), the `[[face]]` entries (which transports to enable), and the `[[route]]` entries (where to forward Interests). Start with the minimal config below and add complexity as needed.
+
 A minimal config to get started with UDP and multicast:
 
 ```toml
@@ -220,6 +222,8 @@ served_prefixes = ["/ndn/site/sensors"]
 ```
 
 ## Starting the router
+
+> **⚠️ Important:** `sudo` is required when the router uses raw sockets (Ethernet faces), privileged ports (UDP/TCP on port 6363 < 1024 on some systems), or multicast group membership. If you only use Unix socket faces and high-numbered ports, `sudo` is not needed. On Linux, you can alternatively grant `CAP_NET_RAW` and `CAP_NET_BIND_SERVICE` capabilities instead of running as root.
 
 ```bash
 # Build in release mode for production

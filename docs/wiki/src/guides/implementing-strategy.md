@@ -53,6 +53,8 @@ Most strategies make decisions synchronously -- they just look at the FIB entry 
 
 Only use the async `after_receive_interest()` path if you genuinely need to `await` something (e.g., a remote lookup or a timer for delayed probing).
 
+> **⚠️ Important:** Strategies are **immutable** -- `StrategyContext` provides only shared (`&`) references to engine state. A strategy cannot modify the FIB, PIT, or CS. If your strategy needs mutable state (e.g., a packet counter or a round-robin index), use `AtomicU64` or other atomic types within the strategy struct itself. Do not use `Mutex` unless you must protect complex state -- atomics avoid lock contention on the hot path.
+
 ## StrategyContext
 
 The context provides a read-only view of engine state:
@@ -114,6 +116,8 @@ if let Some(entry) = ctx.measurements.get(ctx.name) {
 ```
 
 The table is updated automatically by the `MeasurementsUpdateStage` in the Data pipeline. Strategies only read from it.
+
+> **🔧 Implementation note:** The `MeasurementsTable` is the primary mechanism for strategies to maintain state *without* being stateful themselves. Instead of tracking RTT in the strategy struct, read it from the measurements table -- it is updated automatically on every satisfied Interest. This keeps strategies pure and composable: swapping a strategy at a prefix preserves the accumulated measurements.
 
 ## Example: Round-Robin Load Balancer
 
@@ -216,6 +220,8 @@ table.insert(&Name::root(), Arc::new(BestRouteStrategy::new()));
 The `StrategyTable` is a `NameTrie` that performs longest-prefix match, just like the FIB. The most specific matching strategy wins. If no strategy matches, the engine uses the strategy registered at the root prefix.
 
 ## Design Guidelines
+
+> **📝 Note:** Following these guidelines ensures your strategy works correctly with hot-swap, WASM loading, and strategy composition via `StrategyFilter`. Violating them (e.g., holding `Arc` references to engine internals) may cause subtle bugs when strategies are replaced at runtime.
 
 1. **Keep strategies pure.** A strategy should not mutate global state. It reads from `StrategyContext` and returns actions. Side effects belong in pipeline stages.
 
