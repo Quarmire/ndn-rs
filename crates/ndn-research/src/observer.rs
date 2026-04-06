@@ -67,8 +67,11 @@ impl PipelineStage for FlowObserverStage {
             cs_hit: ctx.cs_hit,
         };
 
-        // try_send is non-blocking — drops the event if the receiver is behind.
-        let _ = self.tx.try_send(event);
+        // Apply sampling: skip the event when the random draw exceeds the rate.
+        if self.should_sample() {
+            // try_send is non-blocking — drops the event if the receiver is behind.
+            let _ = self.tx.try_send(event);
+        }
 
         Ok(Action::Continue(ctx))
     }

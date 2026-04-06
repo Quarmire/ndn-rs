@@ -11,6 +11,7 @@ use std::sync::Arc;
 /// arrived from a remote face. The CS caches the result automatically.
 pub struct ComputeFace {
     id: FaceId,
+    #[expect(dead_code)]
     registry: Arc<ComputeRegistry>,
     // Sender to inject computed Data back into the pipeline.
     // TODO: wire to pipeline mpsc channel

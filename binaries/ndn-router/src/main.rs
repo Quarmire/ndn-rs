@@ -389,6 +389,10 @@ async fn main() -> Result<()> {
     // Keep discovery_sd alive for management handler use.
     let mgmt_discovery_sd = discovery_sd;
     let mgmt_discovery_claimed = discovery_claimed;
+    // Silence unused-variable lint on non-Linux where cfg-guarded code that
+    // reads pre_allocated_ether_mc is compiled out.
+    #[cfg(not(target_os = "linux"))]
+    let _ = &pre_allocated_ether_mc;
 
     let (engine, shutdown) = builder.build().await?;
 

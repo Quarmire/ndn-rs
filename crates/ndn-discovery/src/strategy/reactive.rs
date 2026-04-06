@@ -52,10 +52,10 @@ impl NeighborProbeStrategy for ReactiveScheduler {
         }
 
         // Enforce minimum interval.
-        if let Some(last) = self.last_sent {
-            if now.duration_since(last) < self.min_interval {
-                return Vec::new(); // still rate-limited; keep pending
-            }
+        if let Some(last) = self.last_sent
+            && now.duration_since(last) < self.min_interval
+        {
+            return Vec::new(); // still rate-limited; keep pending
         }
 
         self.pending = false;

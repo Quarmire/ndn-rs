@@ -3,7 +3,6 @@ use std::sync::{Arc, OnceLock};
 use anyhow::Result;
 use ndn_discovery::{DiscoveryProtocol, NeighborTable, NoDiscovery};
 use tokio::task::JoinSet;
-use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use ndn_packet::Name;

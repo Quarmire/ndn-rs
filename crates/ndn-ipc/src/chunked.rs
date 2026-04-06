@@ -20,7 +20,7 @@ impl ChunkedProducer {
         let seg_size = segment_size.max(1);
         let segments = payload
             .chunks(seg_size)
-            .map(|c| Bytes::copy_from_slice(c))
+            .map(Bytes::copy_from_slice)
             .collect();
         Self { prefix, segments }
     }

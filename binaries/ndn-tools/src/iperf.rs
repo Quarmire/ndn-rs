@@ -243,16 +243,17 @@ impl IntervalCounters {
 
 // ─── Server ─────────────────────────────────────────────────────────────────
 
-async fn run_server(
-    conn: &ConnectOpts,
-    prefix: &Name,
+struct ServerOpts {
     payload_size: usize,
     sign: bool,
     hmac: bool,
     freshness_ms: u64,
     quiet: bool,
     interval_secs: u64,
-) -> Result<()> {
+}
+
+async fn run_server(conn: &ConnectOpts, prefix: &Name, opts: ServerOpts) -> Result<()> {
+    let ServerOpts { payload_size, sign, hmac, freshness_ms, quiet, interval_secs } = opts;
     let client = connect(conn).await?;
     client.register_prefix(prefix).await?;
 
@@ -388,16 +389,17 @@ async fn run_server(
 
 // ─── Client ─────────────────────────────────────────────────────────────────
 
-async fn run_client(
-    conn: &ConnectOpts,
-    prefix: &Name,
+struct ClientOpts {
     duration_secs: u64,
     initial_window: usize,
-    mut cc: CongestionController,
+    cc: CongestionController,
     lifetime_ms: u64,
     quiet: bool,
     interval_secs: u64,
-) -> Result<()> {
+}
+
+async fn run_client(conn: &ConnectOpts, prefix: &Name, opts: ClientOpts) -> Result<()> {
+    let ClientOpts { duration_secs, initial_window, mut cc, lifetime_ms, quiet, interval_secs } = opts;
     let client = connect(conn).await?;
 
     let transport = if client.is_shm() { "SHM" } else { "Unix" };
@@ -680,7 +682,14 @@ async fn main() -> Result<()> {
             interval,
         } => {
             let prefix: Name = prefix.parse()?;
-            run_server(&conn, &prefix, size, sign, hmac, freshness, quiet, interval).await
+            run_server(&conn, &prefix, ServerOpts {
+                payload_size: size,
+                sign,
+                hmac,
+                freshness_ms: freshness,
+                quiet,
+                interval_secs: interval,
+            }).await
         }
         Command::Client {
             conn,
@@ -728,9 +737,14 @@ async fn main() -> Result<()> {
             if let Some(v) = cubic_c {
                 controller = controller.with_cubic_c(v);
             }
-            run_client(
-                &conn, &prefix, duration, window, controller, lifetime, quiet, interval,
-            )
+            run_client(&conn, &prefix, ClientOpts {
+                duration_secs: duration,
+                initial_window: window,
+                cc: controller,
+                lifetime_ms: lifetime,
+                quiet,
+                interval_secs: interval,
+            })
             .await
         }
     }

@@ -246,11 +246,12 @@ impl Default for DiscoveryConfig {
 // ─── DiscoveryProfile ─────────────────────────────────────────────────────────
 
 /// High-level deployment profiles mapping to tuned [`DiscoveryConfig`] sets.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub enum DiscoveryProfile {
     /// No discovery.  FIB and faces configured statically.
     Static,
     /// Link-local LAN (home, small office).
+    #[default]
     Lan,
     /// Campus or enterprise network.
     Campus,
@@ -264,11 +265,6 @@ pub enum DiscoveryProfile {
     Custom(DiscoveryConfig),
 }
 
-impl Default for DiscoveryProfile {
-    fn default() -> Self {
-        Self::Lan
-    }
-}
 
 // ─── ServiceDiscoveryConfig ───────────────────────────────────────────────────
 

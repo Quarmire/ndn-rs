@@ -6,7 +6,7 @@
 //!
 //! Usage: ndn-bench [--interests <n>] [--concurrency <c>] [--name <prefix>]
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use anyhow::{Result, bail};
 use tokio::task::JoinSet;

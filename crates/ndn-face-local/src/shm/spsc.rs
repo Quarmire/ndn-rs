@@ -259,8 +259,8 @@ unsafe fn ring_push(
 ) -> bool {
     debug_assert!(data.len() <= slot_size as usize);
 
-    let tail_a = unsafe { &*AtomicU32::from_ptr(base.add(tail_off) as *mut u32) };
-    let head_a = unsafe { &*AtomicU32::from_ptr(base.add(head_off) as *mut u32) };
+    let tail_a = unsafe { AtomicU32::from_ptr(base.add(tail_off) as *mut u32) };
+    let head_a = unsafe { AtomicU32::from_ptr(base.add(head_off) as *mut u32) };
 
     let t = tail_a.load(Ordering::Relaxed);
     let h = head_a.load(Ordering::Acquire);
@@ -291,8 +291,8 @@ unsafe fn ring_pop(
     capacity: u32,
     slot_size: u32,
 ) -> Option<Bytes> {
-    let tail_a = unsafe { &*AtomicU32::from_ptr(base.add(tail_off) as *mut u32) };
-    let head_a = unsafe { &*AtomicU32::from_ptr(base.add(head_off) as *mut u32) };
+    let tail_a = unsafe { AtomicU32::from_ptr(base.add(tail_off) as *mut u32) };
+    let head_a = unsafe { AtomicU32::from_ptr(base.add(head_off) as *mut u32) };
 
     let h = head_a.load(Ordering::Relaxed);
     let t = tail_a.load(Ordering::Acquire);
@@ -506,7 +506,7 @@ impl Face for SpscFace {
     async fn recv(&self) -> Result<Bytes, FaceError> {
         // SAFETY: parked flag is within the mapped SHM region.
         let parked =
-            unsafe { &*AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_A2E_PARKED) as *mut u32) };
+            unsafe { AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_A2E_PARKED) as *mut u32) };
         loop {
             if let Some(pkt) = self.try_pop_a2e() {
                 return Ok(pkt);
@@ -548,7 +548,7 @@ impl Face for SpscFace {
         }
         // SAFETY: parked flag within mapped SHM region.
         let parked =
-            unsafe { &*AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_E2A_PARKED) as *mut u32) };
+            unsafe { AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_E2A_PARKED) as *mut u32) };
         // Yield until there is space in the e2a ring (backpressure).
         loop {
             if self.try_push_e2a(&pkt) {
@@ -708,7 +708,7 @@ impl SpscHandle {
         }
         // SAFETY: parked flag within mapped SHM region.
         let parked =
-            unsafe { &*AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_A2E_PARKED) as *mut u32) };
+            unsafe { AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_A2E_PARKED) as *mut u32) };
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             if self.try_push_a2e(&pkt) {
@@ -739,7 +739,7 @@ impl SpscHandle {
         }
         // SAFETY: parked flag within mapped SHM region.
         let parked =
-            unsafe { &*AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_E2A_PARKED) as *mut u32) };
+            unsafe { AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_E2A_PARKED) as *mut u32) };
         loop {
             if let Some(pkt) = self.try_pop_e2a() {
                 return Some(pkt);

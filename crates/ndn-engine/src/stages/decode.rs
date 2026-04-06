@@ -86,7 +86,7 @@ impl TlvDecodeStage {
         let mut rb = self
             .reassembly
             .entry(face_id)
-            .or_insert_with(ReassemblyBuffer::default);
+            .or_default();
         Ok(rb.process(base_seq, hdr.frag_index, hdr.frag_count, fragment))
     }
 
@@ -155,16 +155,16 @@ impl TlvDecodeStage {
 
     /// Drop packets with `/localhost` names arriving on non-local faces.
     fn check_scope(&self, ctx: &PacketContext) -> Option<Action> {
-        if let Some(ref name) = ctx.name {
-            if is_localhost_name(name) {
-                let is_non_local = self
-                    .face_table
-                    .get(ctx.face_id)
-                    .is_some_and(|f| f.kind().scope() == FaceScope::NonLocal);
-                if is_non_local {
-                    trace!(face=%ctx.face_id, name=%name, "decode: /localhost on non-local face, dropping");
-                    return Some(Action::Drop(DropReason::ScopeViolation));
-                }
+        if let Some(ref name) = ctx.name
+            && is_localhost_name(name)
+        {
+            let is_non_local = self
+                .face_table
+                .get(ctx.face_id)
+                .is_some_and(|f| f.kind().scope() == FaceScope::NonLocal);
+            if is_non_local {
+                trace!(face=%ctx.face_id, name=%name, "decode: /localhost on non-local face, dropping");
+                return Some(Action::Drop(DropReason::ScopeViolation));
             }
         }
         None
@@ -222,7 +222,7 @@ impl TlvDecodeStage {
                 let mut rb = self
                     .reassembly
                     .entry(face_id)
-                    .or_insert_with(ReassemblyBuffer::default);
+                    .or_default();
                 let seq = sequence.unwrap_or(0);
                 let idx = frag_index.unwrap_or(0);
                 let base_seq = seq - idx;

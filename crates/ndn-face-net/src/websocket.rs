@@ -104,13 +104,13 @@ impl Face for WebSocketFace {
         loop {
             let msg =
                 reader.next().await.ok_or(FaceError::Closed)?.map_err(|e| {
-                    FaceError::Io(std::io::Error::new(std::io::ErrorKind::Other, e))
+                    FaceError::Io(std::io::Error::other(e))
                 })?;
 
             match msg {
                 Message::Binary(data) => {
                     trace!(face=%self.id, len=data.len(), "ws: recv binary");
-                    return Ok(Bytes::from(data));
+                    return Ok(data);
                 }
                 Message::Close(_) => return Err(FaceError::Closed),
                 // Skip text, ping, pong frames.
@@ -126,7 +126,7 @@ impl Face for WebSocketFace {
         writer
             .send(Message::Binary(wire.to_vec().into()))
             .await
-            .map_err(|e| FaceError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))
+            .map_err(|e| FaceError::Io(std::io::Error::other(e)))
     }
 }
 

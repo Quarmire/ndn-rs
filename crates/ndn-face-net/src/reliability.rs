@@ -55,9 +55,10 @@ const QUIC_GRANULARITY_US: u64 = 1_000; // 1 ms (kGranularity)
 ///   low-jitter links (dedicated point-to-point Ethernet).
 /// - `Fixed`: Constant timeout, no adaptation — ideal for local faces (Unix, SHM)
 ///   where RTT is known and stable.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum RtoStrategy {
     /// RFC 6298 EWMA with Karn's algorithm. Default.
+    #[default]
     Rfc6298,
     /// QUIC (RFC 9002): lower initial RTO, tighter granularity.
     Quic,
@@ -73,11 +74,6 @@ pub enum RtoStrategy {
     },
 }
 
-impl Default for RtoStrategy {
-    fn default() -> Self {
-        Self::Rfc6298
-    }
-}
 
 /// Per-face reliability configuration.
 ///
@@ -258,7 +254,7 @@ impl LpReliability {
             return vec![];
         }
 
-        let frag_count = (pkt.len() + payload_cap - 1) / payload_cap;
+        let frag_count = pkt.len().div_ceil(payload_cap);
         let base_seq = self.next_seq;
         self.next_seq += frag_count as u64;
 

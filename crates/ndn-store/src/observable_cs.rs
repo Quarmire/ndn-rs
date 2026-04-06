@@ -162,6 +162,10 @@ impl ErasedContentStore for ObservableCs {
         self.inner.len()
     }
 
+    fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
     fn current_bytes(&self) -> usize {
         self.inner.current_bytes()
     }

@@ -75,15 +75,15 @@ impl Consumer {
             .ok_or_else(|| AppError::Engine(anyhow::anyhow!("connection closed")))?;
 
         // Check for Nack (LpPacket with Nack header).
-        if is_lp_packet(&reply) {
-            if let Ok(lp) = LpPacket::decode(reply.clone()) {
-                if let Some(reason) = lp.nack {
-                    return Err(AppError::Nacked { reason });
-                }
-                // LpPacket without Nack — decode the fragment as Data.
-                if let Some(fragment) = lp.fragment {
-                    return Data::decode(fragment).map_err(|e| AppError::Engine(e.into()));
-                }
+        if is_lp_packet(&reply)
+            && let Ok(lp) = LpPacket::decode(reply.clone())
+        {
+            if let Some(reason) = lp.nack {
+                return Err(AppError::Nacked { reason });
+            }
+            // LpPacket without Nack — decode the fragment as Data.
+            if let Some(fragment) = lp.fragment {
+                return Data::decode(fragment).map_err(|e| AppError::Engine(e.into()));
             }
         }
 

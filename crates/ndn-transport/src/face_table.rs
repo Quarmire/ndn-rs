@@ -3,6 +3,9 @@ use std::sync::{Arc, Mutex};
 
 use crate::{Face, FaceId};
 
+/// Result type for [`ErasedFace::recv_bytes_with_addr`].
+type RecvWithAddrResult = Result<(bytes::Bytes, Option<crate::face::FaceAddr>), crate::face::FaceError>;
+
 /// Concurrent map from `FaceId` to a type-erased face handle.
 ///
 /// Pipeline stages clone the `Arc<dyn ErasedFace>` out of the table and
@@ -49,12 +52,7 @@ pub trait ErasedFace: Send + Sync + 'static {
     fn recv_bytes_with_addr(
         &self,
     ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<(bytes::Bytes, Option<crate::face::FaceAddr>), crate::face::FaceError>,
-                > + Send
-                + '_,
-        >,
+        Box<dyn std::future::Future<Output = RecvWithAddrResult> + Send + '_>,
     >;
 }
 
@@ -137,10 +135,10 @@ impl FaceTable {
     /// Never returns an ID in the reserved range (`>= RESERVED_FACE_ID_MIN`).
     pub fn alloc_id(&self) -> FaceId {
         // Prefer a recycled ID.
-        if let Ok(mut free) = self.free.lock() {
-            if let Some(id) = free.pop() {
-                return FaceId(id);
-            }
+        if let Ok(mut free) = self.free.lock()
+            && let Some(id) = free.pop()
+        {
+            return FaceId(id);
         }
         // Otherwise allocate a fresh one, skipping over the reserved range.
         loop {
@@ -184,10 +182,10 @@ impl FaceTable {
     pub fn remove(&self, id: FaceId) {
         self.faces.remove(&id);
         // Return dynamic IDs to the free list for reuse.
-        if id.0 < RESERVED_FACE_ID_MIN {
-            if let Ok(mut free) = self.free.lock() {
-                free.push(id.0);
-            }
+        if id.0 < RESERVED_FACE_ID_MIN
+            && let Ok(mut free) = self.free.lock()
+        {
+            free.push(id.0);
         }
     }
 

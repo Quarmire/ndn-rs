@@ -136,10 +136,9 @@ impl EpidemicGossip {
         let mut r = TlvReader::new(content.clone());
         while !r.is_empty() {
             if let Ok((typ, val)) = r.read_tlv() {
-                if typ == ndn_packet::tlv_type::NAME {
-                    if let Ok(name) = Name::decode(val) {
-                        names.push(name);
-                    }
+                if typ == ndn_packet::tlv_type::NAME
+                    && let Ok(name) = Name::decode(val) {
+                    names.push(name);
                 }
             } else {
                 break;
@@ -250,23 +249,21 @@ impl DiscoveryProtocol for EpidemicGossip {
         let first = raw[0];
 
         // Interest TLV type 0x05.
-        if first == ndn_packet::tlv_type::INTEREST as u8 {
-            if let Some(interest) = parse_raw_interest(raw) {
-                if interest.name.has_prefix(gossip_prefix()) {
-                    self.handle_gossip_interest(incoming_face, ctx);
-                    return true;
-                }
-            }
+        if first == ndn_packet::tlv_type::INTEREST as u8
+            && let Some(interest) = parse_raw_interest(raw)
+            && interest.name.has_prefix(gossip_prefix())
+        {
+            self.handle_gossip_interest(incoming_face, ctx);
+            return true;
         }
 
         // Data TLV type 0x06.
-        if first == ndn_packet::tlv_type::DATA as u8 {
-            if let Some(parsed) = parse_raw_data(raw) {
-                if parsed.name.has_prefix(gossip_prefix()) {
-                    self.handle_gossip_data(raw, ctx);
-                    return true;
-                }
-            }
+        if first == ndn_packet::tlv_type::DATA as u8
+            && let Some(parsed) = parse_raw_data(raw)
+            && parsed.name.has_prefix(gossip_prefix())
+        {
+            self.handle_gossip_data(raw, ctx);
+            return true;
         }
 
         false

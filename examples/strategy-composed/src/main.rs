@@ -67,7 +67,7 @@ impl StrategyFilter for LatencyFilter {
                             snapshot
                                 .for_face(*fid)
                                 .and_then(|lq| lq.observed_rtt_ms)
-                                .map_or(true, |rtt| rtt <= self.max_rtt_ms)
+                                .is_none_or(|rtt| rtt <= self.max_rtt_ms)
                         })
                         .collect();
                     if filtered.is_empty() {

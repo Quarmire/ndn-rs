@@ -26,7 +26,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use ndn_discovery::{InboundMeta, NeighborState, ServiceDiscoveryProtocol, ServiceRecord};
+use ndn_discovery::{NeighborState, ServiceDiscoveryProtocol, ServiceRecord};
 use ndn_engine::ForwarderEngine;
 use ndn_engine::stages::ErasedStrategy;
 use ndn_face_local::AppHandle;
@@ -330,10 +330,12 @@ pub async fn run_ndn_mgmt_handler(
             parsed.verb.as_ref(),
             params,
             source_face,
-            &engine,
-            &cancel,
-            discovery_sd.as_deref(),
-            &discovery_claimed,
+            DispatchCtx {
+                engine: &engine,
+                cancel: &cancel,
+                discovery_sd: discovery_sd.as_deref(),
+                discovery_claimed: &discovery_claimed,
+            },
         )
         .await;
 
@@ -345,16 +347,21 @@ pub async fn run_ndn_mgmt_handler(
 
 // ─── Command dispatch ─────────────────────────────────────────────────────────
 
+struct DispatchCtx<'a> {
+    engine: &'a ForwarderEngine,
+    cancel: &'a CancellationToken,
+    discovery_sd: Option<&'a ServiceDiscoveryProtocol>,
+    discovery_claimed: &'a [Name],
+}
+
 async fn dispatch_command(
     module_name: &[u8],
     verb_name: &[u8],
     params: ControlParameters,
     source_face: Option<FaceId>,
-    engine: &ForwarderEngine,
-    cancel: &CancellationToken,
-    discovery_sd: Option<&ServiceDiscoveryProtocol>,
-    discovery_claimed: &[Name],
+    ctx: DispatchCtx<'_>,
 ) -> ControlResponse {
+    let DispatchCtx { engine, cancel, discovery_sd, discovery_claimed } = ctx;
     match module_name {
         m if m == module::RIB => handle_rib(verb_name, params, source_face, engine),
         m if m == module::FACES => handle_faces(verb_name, params, source_face, engine).await,
@@ -406,7 +413,7 @@ fn rib_register(
 
     let face_id = match resolve_face_id(&params, source_face) {
         Ok(id) => id,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     let cost = params.cost.unwrap_or(0) as u32;
 
@@ -437,7 +444,7 @@ fn rib_unregister(
 
     let face_id = match resolve_face_id(&params, source_face) {
         Ok(id) => id,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
     engine.fib().remove_nexthop(&name, face_id);
@@ -595,7 +602,7 @@ fn faces_create_shm(
             let cancel = source_face
                 .and_then(|sf| engine.face_token(sf))
                 .map(|t| t.child_token())
-                .unwrap_or_else(CancellationToken::new);
+                .unwrap_or_default();
             // SHM faces are on-demand: when the control face disconnects
             // (app exits), the child cancel token fires and the face is
             // fully cleaned up (SHM region unlinked, FIB routes removed).
@@ -742,7 +749,7 @@ fn fib_add_nexthop(
 
     let face_id = match resolve_face_id(&params, source_face) {
         Ok(id) => id,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     let cost = params.cost.unwrap_or(0) as u32;
 
@@ -770,7 +777,7 @@ fn fib_remove_nexthop(
 
     let face_id = match resolve_face_id(&params, source_face) {
         Ok(id) => id,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
     engine.fib().remove_nexthop(&name, face_id);
@@ -1094,7 +1101,7 @@ fn service_browse(params: ControlParameters, sd: &ServiceDiscoveryProtocol) -> C
         .filter(|r| {
             filter
                 .as_ref()
-                .map_or(true, |p| r.announced_prefix.has_prefix(p))
+                .is_none_or(|p| r.announced_prefix.has_prefix(p))
         })
         .collect();
     let mut text = format!("{} services\n", filtered.len());
@@ -1237,11 +1244,11 @@ fn is_management_face(source_face: Option<FaceId>, engine: &ForwarderEngine) -> 
 fn resolve_face_id(
     params: &ControlParameters,
     source_face: Option<FaceId>,
-) -> Result<FaceId, ControlResponse> {
+) -> Result<FaceId, Box<ControlResponse>> {
     match params.face_id {
         Some(id) => Ok(FaceId(id as u32)),
         None => source_face
-            .ok_or_else(|| ControlResponse::error(status::BAD_PARAMS, "cannot determine FaceId")),
+            .ok_or_else(|| Box::new(ControlResponse::error(status::BAD_PARAMS, "cannot determine FaceId"))),
     }
 }
 

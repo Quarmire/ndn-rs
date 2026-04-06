@@ -38,8 +38,8 @@ impl CompositeStrategy {
         Self { members: Vec::new() }
     }
 
-    /// Add a strategy to the composite.
-    pub fn add(mut self, strategy: Box<dyn NeighborProbeStrategy>) -> Self {
+    /// Add a strategy to the composite (builder).
+    pub fn with(mut self, strategy: Box<dyn NeighborProbeStrategy>) -> Self {
         self.members.push(strategy);
         self
     }
@@ -119,10 +119,10 @@ mod tests {
     fn deduplicates_broadcast() {
         // Both backoff and reactive want to broadcast on the first tick.
         let mut composite = CompositeStrategy::new()
-            .add(Box::new(BackoffScheduler::from_discovery_config(
+            .with(Box::new(BackoffScheduler::from_discovery_config(
                 &DiscoveryConfig::for_profile(&DiscoveryProfile::Lan),
             )))
-            .add(Box::new(ReactiveScheduler::from_discovery_config(
+            .with(Box::new(ReactiveScheduler::from_discovery_config(
                 &DiscoveryConfig::for_profile(&DiscoveryProfile::Mobile),
             )));
 
@@ -134,10 +134,10 @@ mod tests {
     #[test]
     fn forwards_success_to_all() {
         let mut composite = CompositeStrategy::new()
-            .add(Box::new(BackoffScheduler::from_discovery_config(
+            .with(Box::new(BackoffScheduler::from_discovery_config(
                 &DiscoveryConfig::for_profile(&DiscoveryProfile::Lan),
             )))
-            .add(Box::new(ReactiveScheduler::from_discovery_config(
+            .with(Box::new(ReactiveScheduler::from_discovery_config(
                 &DiscoveryConfig::for_profile(&DiscoveryProfile::Mobile),
             )));
         let now = Instant::now();
@@ -149,10 +149,10 @@ mod tests {
     #[test]
     fn trigger_forwarded_to_all() {
         let mut composite = CompositeStrategy::new()
-            .add(Box::new(BackoffScheduler::from_discovery_config(
+            .with(Box::new(BackoffScheduler::from_discovery_config(
                 &DiscoveryConfig::for_profile(&DiscoveryProfile::Lan),
             )))
-            .add(Box::new(ReactiveScheduler::from_discovery_config(
+            .with(Box::new(ReactiveScheduler::from_discovery_config(
                 &DiscoveryConfig::for_profile(&DiscoveryProfile::Mobile),
             )));
         let now = Instant::now();

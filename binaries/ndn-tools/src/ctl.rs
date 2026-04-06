@@ -529,11 +529,9 @@ fn build_legacy_request(cmd: &Command) -> ManagementRequest {
             },
             RouteAction::List => ManagementRequest::ListRoutes,
         },
-        Command::Face { action } => match action {
-            FaceAction::List => ManagementRequest::ListFaces,
-            // These commands have no legacy equivalent — fall back to stats.
-            _ => ManagementRequest::GetStats,
-        },
+        Command::Face { action: FaceAction::List } => ManagementRequest::ListFaces,
+        // These commands have no legacy equivalent — fall back to stats.
+        Command::Face { .. } => ManagementRequest::GetStats,
         Command::Status => ManagementRequest::GetStats,
         Command::Shutdown => ManagementRequest::Shutdown,
         // Commands with no legacy equivalent (neighbors, service, strategy, cs, security).

@@ -113,16 +113,18 @@ impl DiscoveryContext for EngineDiscoveryContext {
             let d = Arc::clone(&discovery);
             let ctx = Arc::clone(&discovery_ctx);
             tokio::spawn(crate::engine::run_face_sender(
-                face_id,
                 Arc::clone(&face),
                 send_rx,
-                cancel.clone(),
                 FacePersistency::OnDemand,
-                Arc::clone(&inner.face_states),
-                Arc::clone(&inner.face_table),
-                Arc::clone(&inner.fib),
-                d,
-                ctx,
+                crate::dispatcher::FaceRunnerCtx {
+                    face_id,
+                    cancel: cancel.clone(),
+                    face_table: Arc::clone(&inner.face_table),
+                    fib: Arc::clone(&inner.fib),
+                    face_states: Arc::clone(&inner.face_states),
+                    discovery: d,
+                    discovery_ctx: ctx,
+                },
             ));
         }
 
@@ -135,16 +137,18 @@ impl DiscoveryContext for EngineDiscoveryContext {
             }
         };
         tokio::spawn(crate::dispatcher::run_face_reader(
-            face_id,
             face,
             pipeline_tx,
-            cancel,
-            Arc::clone(&inner.face_table),
-            Arc::clone(&inner.fib),
             Arc::clone(&inner.pit),
-            Arc::clone(&inner.face_states),
-            discovery,
-            discovery_ctx,
+            crate::dispatcher::FaceRunnerCtx {
+                face_id,
+                cancel,
+                face_table: Arc::clone(&inner.face_table),
+                fib: Arc::clone(&inner.fib),
+                face_states: Arc::clone(&inner.face_states),
+                discovery,
+                discovery_ctx,
+            },
         ));
 
         face_id

@@ -134,11 +134,11 @@ impl<const P: usize, const F: usize, C: Clock> Forwarder<P, F, C> {
         }
 
         // ── Hop limit ────────────────────────────────────────────────────────
-        if let Some(hop_limit) = interest.hop_limit() {
-            if hop_limit == 0 {
-                // Hop limit exhausted — drop without forwarding.
-                return;
-            }
+        if let Some(hop_limit) = interest.hop_limit()
+            && hop_limit == 0
+        {
+            // Hop limit exhausted — drop without forwarding.
+            return;
             // Note: when re-encoding to forward, the hop limit should be
             // decremented. For now we forward the raw bytes unchanged
             // (embedded nodes typically have very small network diameters).
@@ -223,11 +223,11 @@ impl<const P: usize, const F: usize, C: Clock> Forwarder<P, F, C> {
 
         if lp.nack.is_some() {
             // Nack — for now, just remove the PIT entry if present.
-            if let Some(fragment) = lp.fragment {
-                if let Ok(interest) = Interest::decode(fragment) {
-                    let name_hash = name_hash_from_components(interest.name.components());
-                    self.pit.remove(name_hash);
-                }
+            if let Some(fragment) = lp.fragment
+                && let Ok(interest) = Interest::decode(fragment)
+            {
+                let name_hash = name_hash_from_components(interest.name.components());
+                self.pit.remove(name_hash);
             }
             return;
         }

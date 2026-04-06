@@ -224,7 +224,7 @@ impl NdrvSocket {
         }
 
         // Register EtherType 0x8624
-        let ethertype_be = (NDN_ETHERTYPE as u16).to_be_bytes();
+        let ethertype_be = NDN_ETHERTYPE.to_be_bytes();
         let demux = NdrvDemuxDesc {
             desc_type: NDRV_DEMUXTYPE_ETHERTYPE,
             desc_len: 2,
@@ -326,7 +326,7 @@ impl NdrvSocket {
         let mut frame = Vec::with_capacity(ETHER_HEADER_LEN + payload.len());
         frame.extend_from_slice(dst_mac.as_bytes());
         frame.extend_from_slice(self.local_mac.as_bytes());
-        let et = (NDN_ETHERTYPE as u16).to_be_bytes();
+        let et = NDN_ETHERTYPE.to_be_bytes();
         frame.extend_from_slice(&et);
         frame.extend_from_slice(payload);
 

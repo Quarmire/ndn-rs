@@ -6,7 +6,7 @@ use lru::LruCache;
 
 use ndn_packet::{Interest, Name};
 
-use crate::{ContentStore, CsCapacity, CsEntry, CsMeta, CsStats, InsertResult, NameTrie};
+use crate::{ContentStore, CsCapacity, CsEntry, CsMeta, InsertResult, NameTrie};
 
 /// In-memory LRU content store, bounded by total byte capacity.
 ///

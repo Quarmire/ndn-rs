@@ -13,7 +13,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use bytes::Bytes;
 use clap::Parser;
 use tokio::task::JoinSet;
 
@@ -160,17 +159,14 @@ async fn run_consumer(
         }
         result.sent += 1;
 
-        match tokio::time::timeout(Duration::from_secs(4), handle.recv()).await {
-            Ok(Some(data)) => {
-                if !is_lp_packet(&data) {
-                    // Got Data (0x06), not a Nack.
-                    result.received += 1;
-                    result.rtts.push(t0.elapsed().as_micros() as u64);
-                }
-                // else: Nack — counts as loss
-            }
-            _ => {} // timeout — counts as loss
+        if let Ok(Some(data)) = tokio::time::timeout(Duration::from_secs(4), handle.recv()).await
+            && !is_lp_packet(&data)
+        {
+            // Got Data (0x06), not a Nack.
+            result.received += 1;
+            result.rtts.push(t0.elapsed().as_micros() as u64);
         }
+        // else: Nack or timeout — counts as loss
     }
 
     result
