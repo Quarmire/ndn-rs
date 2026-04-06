@@ -22,7 +22,6 @@
 ///
 /// When a command omits `FaceId`, the handler resolves the requesting face from
 /// the PIT in-records via [`ForwarderEngine::source_face_id`].
-use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -51,6 +50,10 @@ use ndn_config::{
 /// `net.core.rmem_max` (doubled by the kernel); on macOS it is `kern.ipc.maxsockbuf`.
 /// Failure is logged but not fatal — the listener will still work, just with a
 /// smaller buffer that may drop fragments under heavy load.
+///
+/// On Windows, tuning `SO_RCVBUF` via the `libc` crate is not supported; the
+/// default OS buffer is used instead.
+#[cfg(unix)]
 fn set_recv_buf_size(socket: &tokio::net::UdpSocket, size: usize) {
     use std::os::fd::AsRawFd;
     let fd = socket.as_raw_fd();
@@ -72,6 +75,11 @@ fn set_recv_buf_size(socket: &tokio::net::UdpSocket, size: usize) {
     }
 }
 
+#[cfg(not(unix))]
+fn set_recv_buf_size(_socket: &tokio::net::UdpSocket, _size: usize) {
+    // No-op on non-Unix platforms. The OS default receive buffer is used.
+}
+
 // ─── Management prefix ────────────────────────────────────────────────────────
 
 /// Build the `/localhost/nfd` name prefix registered in the FIB.
@@ -85,24 +93,26 @@ pub fn mgmt_prefix() -> Name {
 // ─── Face listener ────────────────────────────────────────────────────────────
 
 /// Accept NDN face connections on `path` and register each as a dynamic face.
-pub async fn run_face_listener(path: &Path, engine: ForwarderEngine, cancel: CancellationToken) {
-    let _ = std::fs::remove_file(path);
-
-    let listener = match tokio::net::UnixListener::bind(path) {
+///
+/// `path` is a Unix domain socket path on Unix (e.g. `/tmp/ndn-faces.sock`)
+/// or a Named Pipe path on Windows (e.g. `\\.\pipe\ndn-faces`).
+pub async fn run_face_listener(path: &str, engine: ForwarderEngine, cancel: CancellationToken) {
+    let listener = match ndn_face_local::IpcListener::bind(path) {
         Ok(l) => l,
         Err(e) => {
-            tracing::error!(path = %path.display(), error = %e, "face-listener: bind failed");
+            tracing::error!(path = %path, error = %e, "face-listener: bind failed");
             return;
         }
     };
 
-    tracing::info!(path = %path.display(), "NDN face listener ready");
+    tracing::info!(path = %listener.uri(), "NDN face listener ready");
 
     loop {
-        let (stream, _addr) = tokio::select! {
+        let face_id = engine.faces().alloc_id();
+        let face = tokio::select! {
             _ = cancel.cancelled() => break,
-            r = listener.accept() => match r {
-                Ok(s)  => s,
+            r = listener.accept(face_id) => match r {
+                Ok(f)  => f,
                 Err(e) => {
                     tracing::warn!(error = %e, "face-listener: accept error");
                     continue;
@@ -110,16 +120,14 @@ pub async fn run_face_listener(path: &Path, engine: ForwarderEngine, cancel: Can
             },
         };
 
-        let face_id = engine.faces().alloc_id();
-        let face = ndn_face_local::unix_management_face_from_stream(face_id, stream, path);
         tracing::debug!(face = %face_id, "face-listener: accepted management connection");
-        // Per-connection child token: cancelling it on disconnect only affects
-        // this connection and its child faces (e.g. SHM), not the whole router.
+        // Per-connection child token so that closing one connection only
+        // cancels that connection's tasks, not the whole listener.
         let conn_cancel = cancel.child_token();
         engine.add_face(face, conn_cancel);
     }
 
-    let _ = std::fs::remove_file(path);
+    listener.cleanup();
     tracing::info!("NDN face listener stopped");
 }
 

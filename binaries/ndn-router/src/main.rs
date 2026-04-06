@@ -16,7 +16,7 @@ use ndn_packet::Name;
 use ndn_security::{FilePib, SecurityManager};
 use ndn_store::{ErasedContentStore, LruCs, NullCs, ShardedCs};
 
-// Unix-socket bypass management I/O.
+// Bypass management I/O (Unix only — legacy emergency path).
 #[cfg(unix)]
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 #[cfg(unix)]
@@ -500,11 +500,10 @@ async fn main() -> Result<()> {
     let use_ndn_mgmt = fwd_config.management.transport == "ndn";
 
     // ── NDN management ────────────────────────────────────────────────────────
-    #[cfg(unix)]
     let (ndn_handler_task, ndn_listener_task) = if use_ndn_mgmt {
-        let face_socket = PathBuf::from(&fwd_config.management.face_socket);
+        let face_socket = fwd_config.management.face_socket.clone();
         tracing::info!(
-            socket = %face_socket.display(),
+            socket = %face_socket,
             prefix = "/localhost/nfd",
             "NFD management active"
         );
@@ -554,14 +553,11 @@ async fn main() -> Result<()> {
     tracing::info!("shutting down");
     cancel.cancel();
 
-    #[cfg(unix)]
-    {
-        if let Some(t) = ndn_handler_task {
-            let _ = t.await;
-        }
-        if let Some(t) = ndn_listener_task {
-            let _ = t.await;
-        }
+    if let Some(t) = ndn_handler_task {
+        let _ = t.await;
+    }
+    if let Some(t) = ndn_listener_task {
+        let _ = t.await;
     }
 
     #[cfg(unix)]
