@@ -33,10 +33,9 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Lint
-        run: cargo clippy --workspace --exclude ndn-python -- -D warnings
+        run: cargo clippy --workspace -- -D warnings
 
       - name: Test
-        run: cargo test --workspace --exclude ndn-python
-
+        run: cargo test --workspace 
       - name: Doc build
-        run: cargo doc --workspace --exclude ndn-python --no-deps
+        run: cargo doc --workspace --no-deps
