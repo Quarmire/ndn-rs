@@ -32,6 +32,8 @@ pub trait Strategy: Send + Sync + 'static {
 
 Key design points:
 
+> **⚠️ Important:** Strategies are **immutable decision functions**. They receive a read-only `StrategyContext` and return `ForwardingAction` values -- they cannot modify the FIB, PIT, or any global state. This is enforced by the borrow checker: `StrategyContext` contains only shared references (`&`). If your strategy needs persistent state (e.g., a round-robin counter), use atomic types or interior mutability within the strategy struct itself.
+
 - **Pure decision function.** A strategy reads state through `StrategyContext` but cannot modify forwarding tables directly. It returns `ForwardingAction` values and the pipeline runner acts on them. This prevents strategies from introducing subtle side effects.
 - **Sync fast path.** The `decide()` method allows synchronous strategies (like BestRoute) to skip the async machinery entirely, avoiding a `Box::pin` allocation on every Interest.
 - **`SmallVec<[ForwardingAction; 2]>`** return type. Most strategies produce 1-2 actions (forward to best face, optionally probe an alternative). SmallVec keeps these on the stack.
@@ -92,6 +94,8 @@ Operations:
 
 - **`lpm(name)`** -- longest-prefix match, returns the strategy for the deepest matching prefix.
 - **`insert(prefix, strategy)`** -- register or replace a strategy at a prefix. This is how hot-swap works: insert a new `Arc<dyn Strategy>` and all subsequent Interests under that prefix use the new strategy immediately.
+
+> **🔧 Implementation note:** Strategy hot-swap is lock-free for readers. The `StrategyTable` stores `Arc<dyn Strategy>`, and `insert()` atomically replaces the `Arc`. In-flight packets that already cloned the old `Arc` continue using the old strategy; new packets pick up the new one. There is no "strategy update" lock that blocks forwarding.
 - **`remove(prefix)`** -- remove a strategy, causing Interests to fall back to a shorter prefix match (ultimately the root, where the default strategy lives).
 
 ## Measurements Table
@@ -146,6 +150,8 @@ The `ndn-strategy-wasm` crate enables loading forwarding strategies as WebAssemb
 5. To update: load a new WASM module and `insert()` it at the same prefix. The `Arc` swap is atomic -- in-flight packets continue with the old strategy; new packets pick up the new one.
 
 This enables deploying experimental forwarding logic to production routers without recompilation, restart, or downtime.
+
+> **🎯 Tip:** WASM strategies are sandboxed -- a buggy WASM module cannot crash the router or corrupt memory. Combined with hot-swap, this makes WASM strategies ideal for A/B testing forwarding logic in production: deploy version B at a sub-prefix, compare measurements, and roll back instantly if performance degrades.
 
 ## Decision Flow
 

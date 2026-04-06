@@ -2,6 +2,8 @@
 
 This guide covers the key tuning knobs in ndn-rs and when to adjust them.
 
+> **🎯 Tip:** The three highest-impact tuning knobs are, in order: (1) **ShardedCs** on multi-threaded runtimes (eliminates CS lock contention), (2) **pipeline channel capacity** (prevents face reader stalls), and (3) **Tokio worker threads** (scales forwarding across cores). Start with these before touching anything else.
+
 ## Pipeline Channel Capacity
 
 The engine uses a shared `mpsc` channel to funnel packets from all face reader tasks into the pipeline runner. The channel capacity determines how many packets can be buffered before face readers block.
@@ -53,6 +55,8 @@ Use `ShardedCs` when:
 - Pipeline throughput plateaus despite available CPU
 
 For single-threaded runtimes or low-throughput scenarios, plain `LruCs` is sufficient.
+
+> **📊 Performance:** In benchmarks, `ShardedCs` with 16 shards on an 8-core machine shows 3-5x throughput improvement over plain `LruCs` when the CS hit rate is high. The tradeoff is slightly less optimal LRU ordering (each shard maintains its own LRU list), which can marginally reduce hit rates. For most workloads, the concurrency gain far outweighs the eviction accuracy loss.
 
 ## FIB Lookup Optimization
 
@@ -161,6 +165,8 @@ Key benchmarks to watch:
 See [Pipeline Benchmarks](../benchmarks/pipeline-benchmarks.md) for detailed results and [Methodology](../benchmarks/methodology.md) for how measurements are collected.
 
 ## Quick Checklist
+
+> **⚠️ Important:** Always profile before tuning. The most common mistake is optimizing the wrong thing. Run `cargo flamegraph` or `perf record` on a realistic workload first -- the actual bottleneck is often not where you expect. The Criterion benchmark suite measures individual components in isolation, but production bottlenecks emerge from the interaction between components under load.
 
 1. **Profile first.** Use `cargo flamegraph` or `perf` before tuning. Bottlenecks are often not where you expect.
 2. **Size the CS in bytes.** Do not count entries -- a 1 KiB Data and a 100 B Data have very different footprints.

@@ -6,6 +6,8 @@ This page traces the full lifecycle of Interest and Data packets through the ndn
 
 The pipeline is a fixed sequence of stages, determined at build time so the compiler can monomorphize the hot path. Each stage receives a `PacketContext` by value and returns an `Action`:
 
+> **💡 Key insight:** `PacketContext` is passed **by value** (moved) through each stage. This means ownership transfers at every step -- a stage that short-circuits the pipeline *consumes* the context, and the compiler prevents any subsequent stage from accidentally using it. In C++, this invariant would require runtime checks; in Rust, it is a compile-time guarantee.
+
 ```rust
 pub trait PipelineStage: Send + Sync + 'static {
     fn process(
@@ -41,6 +43,7 @@ pub struct PacketContext {
     pub packet:    DecodedPacket,      // Raw -> Interest/Data after decode
     pub pit_token: Option<PitToken>,   // set by PitCheckStage
     pub out_faces: SmallVec<[FaceId; 4]>,  // populated by StrategyStage
+    pub lp_pit_token: Option<Bytes>,  // LP PIT token echoed in responses
     pub cs_hit:    bool,
     pub verified:  bool,
     pub arrival:   u64,                // ns since Unix epoch
@@ -80,6 +83,8 @@ flowchart TD
 2. **TlvDecode** -- Parses the raw `Bytes` into a typed `Interest` struct. Populates `ctx.name` with an `Arc<Name>`. Malformed packets are dropped. Fields like nonce and lifetime are decoded lazily via `OnceLock<T>` -- they are only accessed if later stages need them.
 
 3. **CsLookup** -- Checks the Content Store for a matching Data packet. On a hit, the cached Data (stored as wire-format `Bytes` for zero-copy) is sent directly back to the incoming face. The pipeline short-circuits here -- no PIT entry is created, no upstream forwarding happens.
+
+> **📊 Performance:** The CS short-circuit is the single most important optimization in the pipeline. A cache hit skips PIT insertion, FIB lookup, strategy invocation, and upstream forwarding -- reducing a multi-stage pipeline to a hash lookup and a reference-count increment. With lazy `OnceLock` decoding, even the Interest's nonce and lifetime fields are never parsed on this path.
 
 4. **PitCheck** -- Looks up the PIT by `(Name, Option<Selector>)`. Three outcomes:
    - **New entry**: Creates a PIT entry with an in-record for the incoming face. Continues to Strategy.
@@ -139,6 +144,8 @@ flowchart TD
 ## PIT Aggregation
 
 When multiple consumers request the same data, the PIT aggregates their Interests so that only a single Interest is forwarded upstream. When the Data returns, it fans out to all consumers:
+
+> **💡 Key insight:** PIT aggregation is what makes NDN inherently multicast-friendly. Three consumers requesting the same video segment generate only *one* upstream Interest and *one* Data packet over the bottleneck link. The router's PIT entry fans the Data out locally. This is fundamentally different from IP, where each consumer opens a separate connection and the same data traverses the network three times.
 
 ```mermaid
 flowchart LR

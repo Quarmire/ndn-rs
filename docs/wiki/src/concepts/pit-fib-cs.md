@@ -18,7 +18,7 @@ pub struct FibEntry {
 }
 
 pub struct FibNexthop {
-    pub face_id: FaceId,
+    pub face_id: u32,
     pub cost: u32,
 }
 ```
@@ -39,6 +39,8 @@ struct TrieNode<V> {
 ```
 
 The `Arc` wrapper on each child node is key: it allows a thread performing LPM to grab a reference to a child node and then release the parent's read lock. This means concurrent lookups never hold locks on ancestor nodes while traversing deeper into the trie.
+
+> **🔧 Implementation note:** The `Arc<RwLock<TrieNode>>` per child is what makes the FIB a *concurrent* trie, not just a trie behind a lock. A lookup for `/a/b/c` grabs the `Arc` for node `a`, releases the root lock, then grabs the `Arc` for `b`, releases `a`'s lock, and so on. Two concurrent lookups on different branches (e.g., `/a/b` and `/x/y`) never contend after the root level.
 
 The following diagram shows how a FIB trie branches for example name prefixes:
 
@@ -95,13 +97,15 @@ pub struct PitEntry {
     pub expires_at:  u64,
 }
 
-pub struct InRecord  { pub face_id: FaceId, pub nonce: u32, pub expiry: u64 }
-pub struct OutRecord { pub face_id: FaceId, pub last_nonce: u32, pub expiry: u64 }
+pub struct InRecord  { pub face_id: FaceId, pub nonce: u32, pub expiry: u64, pub lp_pit_token: Option<Bytes>, }
+pub struct OutRecord { pub face_id: u32, pub last_nonce: u32, pub sent_at: u64 }
 ```
 
 ### DashMap for Concurrency
 
 `DashMap` provides sharded concurrent access -- internally it is a fixed number of `RwLock<HashMap>` shards. Different PIT entries hash to different shards, so operations on unrelated Interests never contend. There is no single global lock on the hot path.
+
+> **📊 Performance:** The PIT is the hottest data structure in the forwarder -- every Interest and every Data packet touches it. A global mutex (as NFD uses) serializes all packet processing onto one core. `DashMap`'s sharded design means N cores can process N unrelated packets in parallel with zero contention. This is the single biggest architectural difference enabling multi-core scaling.
 
 ### PIT Token Hashing
 
@@ -197,6 +201,8 @@ flowchart LR
 ### Zero-Copy Cache Hits
 
 The CS stores Data in wire-format `Bytes`. On a cache hit, the Interest pipeline short-circuits and the stored `Bytes` are sent directly to the incoming face via `face.send()`. There is no TLV re-encoding, no allocation, and no copy -- `Bytes` uses reference-counted shared memory internally.
+
+> **💡 Key insight:** Storing wire-format bytes instead of decoded structs is a deliberate tradeoff. It means the CS cannot patch fields (e.g., decrementing a hop count) on cache hits. But NDN Data packets are immutable and cryptographically signed -- modifying them would invalidate the signature anyway. So wire-format storage is both the fastest and the most correct approach.
 
 ## How They Work Together
 
