@@ -1,19 +1,61 @@
-name: CI
+name: CI — core
 
 on:
   push:
     branches: [main]
+    paths:
+      - "crates/ndn-tlv/**"
+      - "crates/ndn-packet/**"
+      - "crates/ndn-transport/**"
+      - "crates/ndn-store/**"
+      - "crates/ndn-face-net/**"
+      - "crates/ndn-face-local/**"
+      - "crates/ndn-face-serial/**"
+      - "crates/ndn-pipeline/**"
+      - "crates/ndn-strategy/**"
+      - "crates/ndn-security/**"
+      - "crates/ndn-engine/**"
+      - "crates/ndn-app/**"
+      - "crates/ndn-ipc/**"
+      - "crates/ndn-config/**"
+      - "crates/ndn-discovery/**"
+      - "crates/ndn-sync/**"
+      - "crates/ndn-sim/**"
+      - "binaries/**"
+      - "examples/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/ci.yml"
   pull_request:
     branches: [main]
+    paths:
+      - "crates/ndn-tlv/**"
+      - "crates/ndn-packet/**"
+      - "crates/ndn-transport/**"
+      - "crates/ndn-store/**"
+      - "crates/ndn-face-net/**"
+      - "crates/ndn-face-local/**"
+      - "crates/ndn-face-serial/**"
+      - "crates/ndn-pipeline/**"
+      - "crates/ndn-strategy/**"
+      - "crates/ndn-security/**"
+      - "crates/ndn-engine/**"
+      - "crates/ndn-app/**"
+      - "crates/ndn-ipc/**"
+      - "crates/ndn-config/**"
+      - "crates/ndn-discovery/**"
+      - "crates/ndn-sync/**"
+      - "crates/ndn-sim/**"
+      - "binaries/**"
+      - "examples/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/ci.yml"
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # ── Core library ─────────────────────────────────────────────────────────────
-  # Always runs. Covers the publishable crate stack: tlv → packet → transport →
-  # store → pipeline → strategy → security → engine → app → ipc → config →
-  # discovery → face-net → face-local → face-serial → sync → sim → embedded.
   core:
     name: Core (fmt / clippy / test / doc)
     runs-on: ubuntu-latest
@@ -36,7 +78,7 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Lint (core)
+      - name: Lint
         run: >
           cargo clippy
           --workspace
@@ -47,7 +89,7 @@ jobs:
           --exclude ndn-python
           -- -D warnings
 
-      - name: Test (core)
+      - name: Test
         run: >
           cargo test
           --workspace
@@ -57,7 +99,7 @@ jobs:
           --exclude ndn-compute
           --exclude ndn-python
 
-      - name: Doc build (core)
+      - name: Doc build
         run: >
           cargo doc
           --workspace
@@ -67,118 +109,3 @@ jobs:
           --exclude ndn-compute
           --exclude ndn-python
           --no-deps
-
-  # ── ndn-face-l2 (Linux-only: AF_PACKET, pcap, Bluetooth) ────────────────────
-  face-l2:
-    name: face-l2 (Linux only)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-l2-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-l2-
-
-      - name: Install libpcap
-        run: sudo apt-get update && sudo apt-get install -y libpcap-dev
-
-      - name: Lint (face-l2)
-        run: cargo clippy -p ndn-face-l2 -- -D warnings
-
-      - name: Test (face-l2)
-        run: cargo test -p ndn-face-l2
-
-      - name: Doc build (face-l2)
-        run: cargo doc -p ndn-face-l2 --no-deps
-
-  # ── Research extensions (WASM strategy, compute, research) ──────────────────
-  research:
-    name: Research extensions
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-          targets: wasm32-unknown-unknown
-
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-research-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-research-
-
-      - name: Install Wasmtime CLI (for WASM strategy tests)
-        run: curl https://wasmtime.dev/install.sh -sSf | bash || true
-
-      - name: Lint (research)
-        run: >
-          cargo clippy
-          -p ndn-strategy-wasm
-          -p ndn-research
-          -p ndn-compute
-          -- -D warnings
-
-      - name: Test (research)
-        run: >
-          cargo test
-          -p ndn-strategy-wasm
-          -p ndn-research
-          -p ndn-compute
-
-      - name: Doc build (research)
-        run: >
-          cargo doc
-          -p ndn-strategy-wasm
-          -p ndn-research
-          -p ndn-compute
-          --no-deps
-
-  # ── Python bindings ──────────────────────────────────────────────────────────
-  python:
-    name: Python bindings
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-python-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-python-
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install maturin
-        run: pip install maturin
-
-      - name: Lint (ndn-python)
-        run: cargo clippy -p ndn-python -- -D warnings
-
-      - name: Build wheel (ndn-python)
-        run: maturin build -m bindings/ndn-python/Cargo.toml
-
-      - name: Doc build (ndn-python)
-        run: cargo doc -p ndn-python --no-deps
