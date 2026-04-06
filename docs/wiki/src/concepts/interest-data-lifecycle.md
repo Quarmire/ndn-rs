@@ -1,12 +1,14 @@
 # Interest and Data Lifecycle
 
-This page traces the full lifecycle of Interest and Data packets through the ndn-rs forwarding pipeline. Both packet types flow through a sequence of `PipelineStage` trait objects, each returning an `Action` enum that drives the next step.
+Every NDN packet that enters ndn-rs follows a carefully choreographed journey. Let's trace an Interest from the moment it arrives as raw bytes to the moment matching Data flows back to the consumer.
 
-## Pipeline Architecture
+## The Pipeline Machine
 
-The pipeline is a fixed sequence of stages, determined at build time so the compiler can monomorphize the hot path. Each stage receives a `PacketContext` by value and returns an `Action`:
+At the core of this journey is a pipeline -- a fixed sequence of `PipelineStage` trait objects determined at build time so the compiler can monomorphize the hot path. A runner loop drains a shared `mpsc` channel fed by all face tasks, picks up each packet, and drives it through the appropriate pipeline. There are no hidden callbacks or middleware chains; the runner simply matches on the `Action` returned by each stage and decides what happens next.
 
 > **💡 Key insight:** `PacketContext` is passed **by value** (moved) through each stage. This means ownership transfers at every step -- a stage that short-circuits the pipeline *consumes* the context, and the compiler prevents any subsequent stage from accidentally using it. In C++, this invariant would require runtime checks; in Rust, it is a compile-time guarantee.
+
+The stage contract is minimal:
 
 ```rust
 pub trait PipelineStage: Send + Sync + 'static {
@@ -17,7 +19,7 @@ pub trait PipelineStage: Send + Sync + 'static {
 }
 ```
 
-The `Action` enum controls dispatch:
+And the `Action` enum gives each stage explicit control over what comes next:
 
 ```rust
 pub enum Action {
@@ -29,11 +31,9 @@ pub enum Action {
 }
 ```
 
-A runner loop drains a shared `mpsc` channel (fed by all face tasks) and dispatches each packet through the appropriate pipeline. There is no `next` closure threading -- the runner simply matches on the `Action` returned by each stage.
+## The Traveling Context
 
-## PacketContext
-
-`PacketContext` is the unit of state that flows through the pipeline. It starts with raw bytes and accumulates decoded information as stages execute:
+Before we follow a packet through the pipeline, it helps to understand what it carries. A `PacketContext` is born the moment bytes arrive on a face, and it accumulates information as each stage does its work:
 
 ```rust
 pub struct PacketContext {
@@ -51,11 +51,37 @@ pub struct PacketContext {
 }
 ```
 
-Fields are populated progressively. For example, `name` is `None` until the TLV decode stage runs. This design means a Content Store hit can short-circuit the pipeline before expensive fields like nonce or lifetime are ever accessed.
+Notice that `name` starts as `None` -- it won't be populated until the TLV decode stage runs. This progressive population is deliberate: a Content Store hit can short-circuit the pipeline before expensive fields like nonce or lifetime are ever accessed.
 
-## Interest Pipeline
+```mermaid
+flowchart TD
+    arrive["Packet Arrives"] --> fc["FaceCheck"]
+    fc --> decode["TlvDecode"]
+    decode --> cs["CsLookup"]
+    cs --> pit["PitCheck"]
+    pit --> strat["Strategy"]
+    strat --> dispatch["Dispatch"]
 
-When an Interest packet arrives on a face, it flows through these stages:
+    fc -.- fc_fields["face_id: set\nraw_bytes: set\narrival: set"]
+    decode -.- decode_fields["name: populated\npacket: Interest/Data decoded"]
+    cs -.- cs_fields["cs_hit: true/false"]
+    pit -.- pit_fields["pit_token: assigned\nnonces checked"]
+    strat -.- strat_fields["out_faces: populated\nFIB match result applied"]
+    dispatch -.- dispatch_fields["Packet sent to out_faces"]
+
+    style fc_fields fill:#e8f4f8,stroke:#888
+    style decode_fields fill:#e8f4f8,stroke:#888
+    style cs_fields fill:#e8f4f8,stroke:#888
+    style pit_fields fill:#e8f4f8,stroke:#888
+    style strat_fields fill:#e8f4f8,stroke:#888
+    style dispatch_fields fill:#e8f4f8,stroke:#888
+```
+
+Now let's follow an Interest through the full journey.
+
+## The Interest's Journey
+
+An Interest packet materializes on a face -- perhaps a UDP datagram from a downstream consumer, or bytes pushed through an in-process `AppFace`. Its journey begins.
 
 ```mermaid
 flowchart TD
@@ -76,39 +102,50 @@ flowchart TD
     G -->|"Suppress"| X6["Drop\n(policy decision)"]
 ```
 
-### Stage-by-Stage Detail
+### First contact: FaceCheck
 
-1. **FaceCheck** -- Validates that the incoming face is still active. If the face has been removed or is shutting down, the packet is dropped immediately.
+The very first thing the forwarder does is verify that the face the packet arrived on is still alive. If the face has been torn down or is in the process of shutting down, there's no point proceeding -- the packet is dropped immediately. This is a cheap guard that prevents stale packets from wasting pipeline resources.
 
-2. **TlvDecode** -- Parses the raw `Bytes` into a typed `Interest` struct. Populates `ctx.name` with an `Arc<Name>`. Malformed packets are dropped. Fields like nonce and lifetime are decoded lazily via `OnceLock<T>` -- they are only accessed if later stages need them.
+### Making sense of the bytes: TlvDecode
 
-3. **CsLookup** -- Checks the Content Store for a matching Data packet. On a hit, the cached Data (stored as wire-format `Bytes` for zero-copy) is sent directly back to the incoming face. The pipeline short-circuits here -- no PIT entry is created, no upstream forwarding happens.
+With the face confirmed, the raw `Bytes` are parsed into a typed `Interest` struct. The context's `name` field is populated with an `Arc<Name>`, giving subsequent stages a shared, zero-copy reference to the packet's identity. Malformed TLV drops the packet here.
+
+> **🔧 Implementation note:** Fields like nonce and lifetime are decoded lazily via `OnceLock<T>`. They sit dormant inside the Interest struct, only computed when a later stage actually reads them. If the pipeline short-circuits before that happens, the CPU cycles are never spent.
+
+### The fast path: CsLookup
+
+Now comes the moment that can make the entire rest of the pipeline irrelevant. The forwarder checks its Content Store for a cached Data packet matching this Interest's name. If one is found, the cached wire-format `Bytes` are sent directly back to the incoming face. The pipeline short-circuits -- no PIT entry is created, no FIB lookup occurs, no upstream forwarding happens.
 
 > **📊 Performance:** The CS short-circuit is the single most important optimization in the pipeline. A cache hit skips PIT insertion, FIB lookup, strategy invocation, and upstream forwarding -- reducing a multi-stage pipeline to a hash lookup and a reference-count increment. With lazy `OnceLock` decoding, even the Interest's nonce and lifetime fields are never parsed on this path.
 
-4. **PitCheck** -- Looks up the PIT by `(Name, Option<Selector>)`. Three outcomes:
-   - **New entry**: Creates a PIT entry with an in-record for the incoming face. Continues to Strategy.
-   - **Existing entry, new face**: Adds an in-record (Interest aggregation). The Interest is not forwarded again.
-   - **Duplicate nonce**: Loop detected. Returns `Nack(Duplicate)`.
+### Tracking the request: PitCheck
 
-5. **Strategy** -- Performs a FIB longest-prefix match to find nexthops, then invokes the strategy assigned to that prefix. The strategy receives an immutable `StrategyContext` (it cannot mutate global state) and returns one or more `ForwardingAction` values:
+On a cache miss, the Interest reaches the Pending Interest Table. Here the forwarder must answer three questions at once. Has this exact Interest been seen before with the same nonce? If so, there's a forwarding loop -- the packet is Nacked with `Duplicate`. Is there already an outstanding PIT entry for this name from a different consumer? If so, the Interest is *aggregated*: its face is added as an in-record to the existing entry, but no new upstream Interest is sent. This is the mechanism behind NDN's built-in multicast efficiency. Only if the entry is genuinely new does the Interest proceed to the next stage.
 
-   ```rust
-   pub enum ForwardingAction {
-       Forward(SmallVec<[FaceId; 4]>),
-       ForwardAfter { faces: SmallVec<[FaceId; 4]>, delay: Duration },
-       Nack(NackReason),
-       Suppress,
-   }
-   ```
+### Deciding where to go: Strategy
 
-   `ForwardAfter` enables probe-and-fallback without the strategy spawning its own timers.
+For a fresh Interest that needs forwarding, the forwarder performs a longest-prefix match against the FIB to discover nexthop faces, then invokes the strategy assigned to that prefix. The strategy receives an immutable `StrategyContext` -- it can observe the forwarder's state but cannot mutate it -- and returns a forwarding decision:
 
-6. **Dispatch** -- Sends the Interest out on the selected face(s). Creates out-records in the PIT entry.
+```rust
+pub enum ForwardingAction {
+    Forward(SmallVec<[FaceId; 4]>),
+    ForwardAfter { faces: SmallVec<[FaceId; 4]>, delay: Duration },
+    Nack(NackReason),
+    Suppress,
+}
+```
 
-## Data Pipeline
+`Forward` sends the Interest immediately. `ForwardAfter` enables probe-and-fallback patterns without the strategy needing to spawn its own timers -- the forwarder handles the scheduling. `Nack` and `Suppress` end the journey here.
 
-When a Data packet arrives (typically from an upstream router or producer), it flows through a different set of stages:
+> **⚠️ Strategy isolation:** Strategies cannot mutate global state. They receive a read-only snapshot and return a decision. This makes strategies safe to swap at runtime and prevents a buggy strategy from corrupting the FIB or PIT.
+
+### The final hop: Dispatch
+
+The Interest is sent out on the selected nexthop face(s), and out-records are created in the PIT entry to track when each was sent. The Interest is now in flight, and the forwarder waits for a response.
+
+## The Satisfying Return: Data Pipeline
+
+Somewhere upstream -- perhaps one hop away, perhaps many -- a producer or another router's cache generates a Data packet matching the Interest. That Data now makes its way back through the network to our router.
 
 ```mermaid
 flowchart TD
@@ -125,25 +162,29 @@ flowchart TD
     H --> I["Remove PIT entry"]
 ```
 
-### Stage-by-Stage Detail
+The Data's journey begins with the same FaceCheck and TlvDecode stages that every packet passes through. But after decoding, the paths diverge.
 
-1. **FaceCheck** -- Same as the Interest pipeline.
+### Finding who asked: PitMatch
 
-2. **TlvDecode** -- Parses raw bytes into a typed `Data` struct. Populates `ctx.name`.
+The forwarder looks up the PIT for an entry matching this Data's name. If no entry exists, the Data is *unsolicited* -- nobody asked for it, so it is dropped. This is a fundamental NDN security property: routers only accept Data that was explicitly requested. When a match is found, the PIT entry reveals which downstream faces are waiting for this content.
 
-3. **PitMatch** -- Looks up the PIT for a matching entry. If no entry exists, the Data is unsolicited (nobody asked for it) and is dropped. If a match is found, the PIT entry's in-records tell us which faces to send the Data back on.
+### Learning from success: Strategy and Measurements
 
-4. **Strategy** (`after_receive_data`) -- Notifies the strategy that Data was received. This allows strategies to update internal state (e.g., mark a path as working, cancel retransmission timers).
+The strategy is notified that Data arrived via `after_receive_data`. This allows it to update its internal state -- mark a path as working, cancel retransmission timers, adjust preferences. Then the `MeasurementsUpdate` stage computes per-face, per-prefix statistics: EWMA RTT (derived from the gap between the out-record's send timestamp and this Data's arrival) and satisfaction rate. These measurements feed back into future strategy decisions, letting the forwarder learn which paths perform best.
 
-5. **MeasurementsUpdate** -- Updates the `MeasurementsTable` with per-face/per-prefix statistics: EWMA RTT (computed from PIT out-record timestamp to Data arrival) and satisfaction rate. These measurements inform future strategy decisions.
+> **📊 Performance:** Measurements are stored in a `DashMap`-backed `MeasurementsTable`, so updating statistics for one prefix never blocks lookups for another. The EWMA computation is a single multiply-and-add -- negligible cost for valuable routing intelligence.
 
-6. **CsInsert** -- Inserts the Data into the Content Store. The wire-format `Bytes` are stored directly (no re-encoding) so that future CS hits can be served with zero-copy. `FreshnessPeriod` is decoded once at insert time to compute `stale_at`.
+### Caching for the future: CsInsert
 
-7. **Dispatch** -- Sends the Data packet to every face listed in the PIT entry's in-records. The PIT entry is then consumed (removed).
+Before the Data reaches its final recipients, it is inserted into the Content Store. The wire-format `Bytes` are stored directly -- no re-encoding -- so future cache hits can be served as zero-copy sends. The `FreshnessPeriod` is decoded once at insert time to compute a `stale_at` timestamp.
 
-## PIT Aggregation
+### Delivering the payload: Dispatch
 
-When multiple consumers request the same data, the PIT aggregates their Interests so that only a single Interest is forwarded upstream. When the Data returns, it fans out to all consumers:
+Finally, the Data is sent to every face listed in the PIT entry's in-records. If three consumers requested the same content, all three receive it now. The PIT entry is consumed -- removed from the table -- and the lifecycle is complete.
+
+## The Power of Aggregation
+
+The interplay between the Interest and Data pipelines reveals one of NDN's most powerful properties. When multiple consumers request the same data, the PIT aggregates their Interests so that only a single Interest is forwarded upstream. When the Data returns, it fans out to all of them:
 
 > **💡 Key insight:** PIT aggregation is what makes NDN inherently multicast-friendly. Three consumers requesting the same video segment generate only *one* upstream Interest and *one* Data packet over the bottleneck link. The router's PIT entry fans the Data out locally. This is fundamentally different from IP, where each consumer opens a separate connection and the same data traverses the network three times.
 
@@ -171,40 +212,20 @@ flowchart LR
     end
 ```
 
-## PacketContext Population Through Pipeline Stages
+Consumer 1's Interest arrives first and creates a new PIT entry. Consumer 2's Interest for the same name finds the existing entry and is aggregated -- an in-record is added, but no second Interest goes upstream. Consumer 3 is aggregated the same way. When the Data returns, the forwarder reads all three in-records and delivers the Data to each consumer. One upstream packet, three downstream deliveries.
 
-As a packet moves through the pipeline, `PacketContext` fields are progressively populated by each stage:
+## When Things Go Wrong: The Nack Pipeline
 
-```mermaid
-flowchart TD
-    arrive["Packet Arrives"] --> fc["FaceCheck"]
-    fc --> decode["TlvDecode"]
-    decode --> cs["CsLookup"]
-    cs --> pit["PitCheck"]
-    pit --> strat["Strategy"]
-    strat --> dispatch["Dispatch"]
+Not every Interest finds its Data. Sometimes there is no route in the FIB. Sometimes the upstream path is congested. Sometimes the producer is unreachable. NDN handles these failures with Network Nacks -- negative acknowledgements that flow back toward the consumer.
 
-    fc -.- fc_fields["face_id: set\nraw_bytes: set\narrival: set"]
-    decode -.- decode_fields["name: populated\npacket: Interest/Data decoded"]
-    cs -.- cs_fields["cs_hit: true/false"]
-    pit -.- pit_fields["pit_token: assigned\nnonces checked"]
-    strat -.- strat_fields["out_faces: populated\nFIB match result applied"]
-    dispatch -.- dispatch_fields["Packet sent to out_faces"]
+Nacks can be generated at two points in the Interest pipeline. A strategy that finds no viable nexthop returns `ForwardingAction::Nack(reason)`, and any pipeline stage can return `Action::Nack(ctx, reason)` to signal a problem. The `PitCheck` stage does this when it detects a loop via duplicate nonce.
 
-    style fc_fields fill:#e8f4f8,stroke:#888
-    style decode_fields fill:#e8f4f8,stroke:#888
-    style cs_fields fill:#e8f4f8,stroke:#888
-    style pit_fields fill:#e8f4f8,stroke:#888
-    style strat_fields fill:#e8f4f8,stroke:#888
-    style dispatch_fields fill:#e8f4f8,stroke:#888
-```
+When a Nack arrives *from* upstream, it follows a shortened pipeline: decode, PIT match, and strategy notification. The strategy then faces a choice -- try an alternative nexthop if one exists, or propagate the Nack downstream to the consumer. If no alternatives remain, the Nack flows back to every face in the PIT entry's in-records, and the entry is removed.
 
-## Nack Pipeline
+> **⚠️ Nack propagation is conservative:** A strategy will exhaust all available nexthops before propagating a Nack downstream. Only when every path has failed does the consumer learn that its Interest cannot be satisfied. This gives the network maximum opportunity to find the data through alternative routes.
 
-NDN also supports Network Nacks (negative acknowledgements). When a router cannot forward an Interest (no route, congestion, etc.), it sends a Nack back to the downstream face. In ndn-rs, Nacks are produced by returning `Action::Nack(ctx, reason)` from any pipeline stage or `ForwardingAction::Nack(reason)` from a strategy.
+## The Full Picture
 
-When a Nack arrives from upstream, it follows a shortened pipeline: decode, PIT match, and strategy notification. The strategy decides whether to try alternative nexthops or propagate the Nack downstream.
+The two pipelines are symmetric and complementary. Interests flow upstream from consumer toward producer, driven by the FIB. Data flows downstream from producer toward consumer, guided by the PIT entries that Interests left behind. The Content Store sits at the junction, short-circuiting the loop when it can. And the strategy system ties it all together, learning from every Data arrival and every Nack to make better forwarding decisions over time.
 
-## Summary
-
-The two pipelines are symmetric: Interests flow upstream (consumer toward producer), Data flows downstream (producer toward consumer), and the PIT is the bridge that connects them. Each stage is a small, composable unit with a single responsibility, and the `Action` enum provides explicit control flow without hidden callbacks or middleware chains.
+This is the packet lifecycle in ndn-rs: a pipeline that is small enough to reason about stage by stage, yet powerful enough to express multicast aggregation, in-network caching, and adaptive forwarding -- all without a single IP address in sight.
