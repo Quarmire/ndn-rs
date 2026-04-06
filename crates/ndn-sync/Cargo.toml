@@ -8,7 +8,7 @@ license.workspace = true
 [dependencies]
 ndn-packet = { workspace = true }
 bytes         = { workspace = true, features = ["std"] }
-tokio      = { workspace = true, features = ["sync", "time"] }
+tokio      = { workspace = true, features = ["sync", "time", "rt", "macros"] }
 tokio-util = { workspace = true }
 thiserror  = { workspace = true }
 fastrand   = "2"
