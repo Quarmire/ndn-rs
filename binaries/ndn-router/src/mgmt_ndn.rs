@@ -26,7 +26,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use ndn_discovery::{NeighborState, ServiceDiscoveryProtocol, ServiceRecord};
+use ndn_discovery::{InboundMeta, NeighborState, ServiceDiscoveryProtocol, ServiceRecord};
 use ndn_engine::ForwarderEngine;
 use ndn_engine::stages::ErasedStrategy;
 use ndn_face_local::AppHandle;
@@ -212,7 +212,8 @@ pub async fn run_udp_listener(
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_nanos() as u64;
-                if engine.inject_packet(raw, face_id, arrival).await.is_err() {
+                let meta = ndn_discovery::InboundMeta::udp(src);
+                if engine.inject_packet(raw, face_id, arrival, meta).await.is_err() {
                     break; // Pipeline channel closed.
                 }
             }

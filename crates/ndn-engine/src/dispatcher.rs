@@ -16,7 +16,7 @@ use ndn_pipeline::{
 use ndn_store::{CsEntry, PitToken};
 use ndn_transport::{FaceError, FaceId, FaceKind, FacePersistency, FaceScope, FaceTable};
 
-use ndn_discovery::DiscoveryProtocol;
+use ndn_discovery::{DiscoveryProtocol, InboundMeta};
 
 use crate::discovery_context::EngineDiscoveryContext;
 use crate::engine::{self, DEFAULT_SEND_QUEUE_CAP, FaceState};
@@ -31,6 +31,10 @@ pub(crate) struct InboundPacket {
     pub(crate) raw: Bytes,
     pub(crate) face_id: FaceId,
     pub(crate) arrival: u64,
+    /// Link-layer source metadata (source IP:port for UDP, source MAC for Ethernet).
+    /// Used by discovery protocols to create unicast reply faces.
+    /// `None` when the injection path does not have source information.
+    pub(crate) meta: InboundMeta,
 }
 
 /// The packet dispatcher.
@@ -206,6 +210,7 @@ impl PacketDispatcher {
                     raw,
                     face_id,
                     arrival,
+                    meta,
                 } = pkt;
                 match self.decode.try_collect_fragment(face_id, raw) {
                     Ok(None) => {
@@ -213,10 +218,14 @@ impl PacketDispatcher {
                         trace!(face=%face_id, "fragment collected, awaiting reassembly");
                     }
                     Ok(Some(reassembled)) => {
+                        // Reassembled bytes are LP-unwrapped; meta is from the
+                        // first fragment (good enough for discovery — hellos are
+                        // never fragmented in practice).
                         let pkt = InboundPacket {
                             raw: reassembled,
                             face_id,
                             arrival,
+                            meta,
                         };
                         if parallel {
                             let d = Arc::clone(self);
@@ -230,6 +239,7 @@ impl PacketDispatcher {
                             raw,
                             face_id,
                             arrival,
+                            meta,
                         };
                         if parallel {
                             let d = Arc::clone(self);
@@ -245,9 +255,12 @@ impl PacketDispatcher {
 
     async fn process_packet(&self, pkt: InboundPacket) {
         trace!(face=%pkt.face_id, len=pkt.raw.len(), "pipeline: packet arrived");
+        let meta = pkt.meta;
         let ctx = PacketContext::new(pkt.raw, pkt.face_id, pkt.arrival);
 
-        // 1. Decode.
+        // 1. Decode (LP-unwrap + TLV parse).
+        //    After this, `ctx.raw_bytes` holds the bare NDN Interest/Data bytes
+        //    (LP header stripped, fragment reassembly already done).
         let ctx = match self.decode.process(ctx) {
             Action::Continue(ctx) => ctx,
             Action::Drop(DropReason::FragmentCollect) => {
@@ -263,6 +276,15 @@ impl PacketDispatcher {
                 return;
             }
         };
+
+        // 2. Discovery hook — called after decode so protocols receive
+        //    LP-unwrapped, reassembled bytes.  This is the single call site
+        //    for on_inbound; neither run_face_reader nor inject_packet call it.
+        //    Returns true if the packet was consumed (e.g. hello Interest/Data
+        //    or service-record browse).
+        if self.discovery.on_inbound(&ctx.raw_bytes, ctx.face_id, &meta, &*self.discovery_ctx) {
+            return;
+        }
 
         match &ctx.packet {
             DecodedPacket::Interest(_) => {
@@ -629,20 +651,14 @@ pub(crate) async fn run_face_reader(
                         state.last_activity.store(arrival, Ordering::Relaxed);
                     }
                 }
-                // Build InboundMeta with the link-layer source address when
-                // the face exposed it (e.g. MulticastUdpFace).  Discovery
-                // protocols use this to create unicast reply faces without
-                // embedding addresses in NDN payloads.
+                // Build InboundMeta from the link-layer source address when
+                // the face exposed it (e.g. MulticastUdpFace).  Flows through
+                // InboundPacket into process_packet where discovery.on_inbound
+                // is called after LP-unwrap and decode.
                 let meta = match src_addr {
                     Some(addr) => ndn_discovery::InboundMeta::udp(addr),
                     None => ndn_discovery::InboundMeta::none(),
                 };
-                // Let the discovery protocol inspect the packet first.
-                // If it returns true the packet is consumed (e.g. a hello
-                // Interest) and must not enter the NDN forwarding pipeline.
-                if discovery.on_inbound(&raw, face_id, &meta, &*discovery_ctx) {
-                    continue;
-                }
 
                 // Use try_send to avoid blocking the face reader when the
                 // pipeline channel is full.  Blocking here cascades back
@@ -655,6 +671,7 @@ pub(crate) async fn run_face_reader(
                     raw,
                     face_id,
                     arrival,
+                    meta,
                 }) {
                     Ok(()) => {}
                     Err(mpsc::error::TrySendError::Full(_)) => {

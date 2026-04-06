@@ -327,9 +327,14 @@ impl ForwarderEngine {
 
     /// Inject a raw packet into the pipeline as if it arrived from `face_id`.
     ///
-    /// Calls `discovery.on_inbound()` first, matching the same path as
-    /// `run_face_reader`.  If discovery consumes the packet (e.g. a browse
-    /// Interest or a service record Data), it is not forwarded to the pipeline.
+    /// Processes the reliability layer (Ack extraction / piggybacked Ack
+    /// processing) before enqueuing, matching the same path as `run_face_reader`.
+    /// `meta` carries the link-layer source address when available (use
+    /// `InboundMeta::udp(src)` for UDP listeners, `InboundMeta::none()` when
+    /// the source is implicit in the face).
+    ///
+    /// `discovery.on_inbound()` is called later inside `process_packet`, after
+    /// LP-unwrap and fragment reassembly, at the single call site in the pipeline.
     ///
     /// Returns `Err(())` if the pipeline channel is closed.
     pub async fn inject_packet(
@@ -337,14 +342,14 @@ impl ForwarderEngine {
         raw: bytes::Bytes,
         face_id: FaceId,
         arrival: u64,
+        meta: ndn_discovery::InboundMeta,
     ) -> Result<(), ()> {
-        // Give discovery a chance to consume the packet before the pipeline
-        // sees it.  No source-address metadata is available for listener-
-        // injected packets, so we pass InboundMeta::none().
-        if let Some(ctx) = self.inner.discovery_ctx.get() {
-            let meta = ndn_discovery::InboundMeta::none();
-            if self.inner.discovery.on_inbound(&raw, face_id, &meta, &**ctx) {
-                return Ok(());
+        // Feed inbound packet to the reliability layer (same as run_face_reader).
+        // This extracts TxSeq for Ack and processes piggybacked Acks from the
+        // remote end.  Only applies when the face has reliability enabled.
+        if let Some(states) = self.inner.face_states.get(&face_id) {
+            if let Some(ref rel) = states.reliability {
+                rel.lock().unwrap().on_receive(&raw);
             }
         }
 
@@ -356,6 +361,7 @@ impl ForwarderEngine {
                 raw,
                 face_id,
                 arrival,
+                meta,
             })
             .await
             .map_err(|_| ())
