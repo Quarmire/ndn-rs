@@ -1,3 +1,22 @@
+//! # ndn-tlv -- TLV encoding foundation for NDN
+//!
+//! Implements the NDN Type-Length-Value wire format used by all other crates
+//! in the ndn-rs workspace. Parsing is zero-copy over `bytes::Bytes` buffers.
+//!
+//! ## Key types
+//!
+//! - [`TlvReader`] -- zero-copy, streaming TLV parser over byte slices.
+//! - [`TlvWriter`] -- growable encoder that produces wire-format `BytesMut`.
+//! - [`read_varu64`] / [`write_varu64`] -- NDN variable-width integer codec.
+//! - [`TlvError`] -- error type for malformed or truncated input.
+//!
+//! ## Feature flags
+//!
+//! - **`std`** (default) -- enables `std` support in `bytes`.
+//!   Disable for `no_std` environments (an allocator is still required).
+
+#![allow(missing_docs)]
+
 // Enable no_std when the `std` feature is disabled.
 // The crate still requires an allocator (for `BytesMut` / `Bytes`).
 #![cfg_attr(not(feature = "std"), no_std)]

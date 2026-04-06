@@ -1,3 +1,24 @@
+//! # ndn-transport -- Face abstraction and transport layer
+//!
+//! Provides the async face abstraction over which NDN packets are sent and
+//! received, plus supporting types for face management and framing.
+//!
+//! ## Key types
+//!
+//! - [`Face`] trait -- async `send`/`recv` interface implemented by all transports.
+//! - [`FaceId`] / [`FaceKind`] -- face identity and classification (UDP, TCP, etc.).
+//! - [`FaceTable`] / [`ErasedFace`] -- runtime registry of type-erased faces.
+//! - [`StreamFace`] -- generic `AsyncRead`+`AsyncWrite` face (TCP, Unix, etc.).
+//! - [`TlvCodec`] -- `tokio_util::codec` framing for TLV streams.
+//! - [`RawPacket`] -- thin wrapper pairing raw `Bytes` with a source [`FaceId`].
+//! - [`CongestionController`] -- per-face congestion window management.
+//!
+//! ## Feature flags
+//!
+//! - **`serde`** -- derives `Serialize`/`Deserialize` on select types.
+
+#![allow(missing_docs)]
+
 pub mod any_map;
 pub mod congestion;
 pub mod face;

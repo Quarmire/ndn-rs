@@ -1,3 +1,23 @@
+//! # ndn-ipc -- Inter-process communication transport
+//!
+//! Connects application processes to the NDN router over Unix sockets and
+//! (optionally) shared-memory ring buffers. Handles chunked transfer for
+//! large objects and service discovery via a local registry.
+//!
+//! ## Key types
+//!
+//! - [`IpcClient`] / [`IpcServer`] -- Unix-socket connection endpoints
+//! - [`RouterClient`] -- ergonomic client for app-to-router communication
+//! - [`MgmtClient`] -- management/control-plane client
+//! - [`ChunkedProducer`] / [`ChunkedConsumer`] -- segmented object transfer
+//! - [`ServiceRegistry`] -- local service advertisement and lookup
+//!
+//! ## Feature flags
+//!
+//! - **`spsc-shm`** (default) -- enables SPSC shared-memory ring-buffer transport
+
+#![allow(missing_docs)]
+
 pub mod chunked;
 pub mod client;
 pub mod mgmt_client;

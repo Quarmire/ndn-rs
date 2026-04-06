@@ -48,6 +48,8 @@
 //! # }
 //! ```
 
+#![allow(missing_docs)]
+
 pub mod app_face;
 pub mod connection;
 pub mod consumer;

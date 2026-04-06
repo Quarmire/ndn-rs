@@ -11,6 +11,8 @@
 //! - Cross-layer DTOs ([`FaceLinkQuality`], [`LinkQualitySnapshot`]) allow
 //!   transport-layer metrics to flow into strategy decisions.
 
+#![allow(missing_docs)]
+
 pub mod best_route;
 pub mod context;
 pub mod cross_layer;

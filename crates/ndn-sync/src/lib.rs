@@ -13,6 +13,8 @@
 //!               └── SvsNode / PSyncNode (pure data structure)
 //! ```
 
+#![allow(missing_docs)]
+
 /// Sync protocol abstraction — [`SyncHandle`](protocol::SyncHandle),
 /// [`SyncUpdate`](protocol::SyncUpdate), [`SyncError`](protocol::SyncError).
 pub mod protocol;
