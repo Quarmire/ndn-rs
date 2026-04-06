@@ -1,0 +1,63 @@
+name: benchmarks
+
+on:
+  # Run on pushes to main for trend tracking
+  push:
+    branches: [main]
+  # Allow manual triggering
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  bench:
+    name: Run benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: bench-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Run ndn-packet benchmarks
+        run: cargo bench -p ndn-packet --bench name -- --output-format bencher 2>/dev/null | tee bench-packet.txt
+
+      - name: Run ndn-store benchmarks (LRU + Sharded)
+        run: cargo bench -p ndn-store --bench lru --bench sharded -- --output-format bencher 2>/dev/null | tee bench-store.txt
+
+      - name: Run ndn-engine benchmarks
+        run: cargo bench -p ndn-engine --bench pipeline -- --output-format bencher 2>/dev/null | tee bench-engine.txt
+
+      - name: Run ndn-face-local benchmarks
+        run: cargo bench -p ndn-face-local --bench face_local -- --output-format bencher 2>/dev/null | tee bench-face.txt
+
+      - name: Run ndn-security benchmarks
+        run: cargo bench -p ndn-security --bench security -- --output-format bencher 2>/dev/null | tee bench-security.txt
+
+      - name: Combine results
+        run: cat bench-*.txt > bench-all.txt
+
+      - name: Store benchmark result
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: NDN-RS Benchmarks
+          tool: cargo
+          output-file-path: bench-all.txt
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          # Publish trend charts to gh-pages
+          auto-push: true
+          benchmark-data-dir-path: bench
+          # Alert if performance regresses by >10%
+          alert-threshold: "110%"
+          comment-on-alert: true
+          fail-on-alert: false
