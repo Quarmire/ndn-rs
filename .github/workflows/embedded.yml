@@ -3,8 +3,20 @@ name: embedded
 on:
   push:
     branches: [main]
+    paths:
+      - "crates/ndn-embedded/**"
+      - "crates/ndn-tlv/**"
+      - "crates/ndn-packet/**"
+      - "Cargo.lock"
+      - ".github/workflows/embedded.yml"
   pull_request:
     branches: [main]
+    paths:
+      - "crates/ndn-embedded/**"
+      - "crates/ndn-tlv/**"
+      - "crates/ndn-packet/**"
+      - "Cargo.lock"
+      - ".github/workflows/embedded.yml"
 
 jobs:
   no-std-check:

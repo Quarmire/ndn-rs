@@ -1,0 +1,50 @@
+name: CI — face-l2
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/ndn-face-l2/**"
+      - "Cargo.lock"
+      - ".github/workflows/ci-face-l2.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "crates/ndn-face-l2/**"
+      - "Cargo.lock"
+      - ".github/workflows/ci-face-l2.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  face-l2:
+    name: face-l2 (Linux only)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-l2-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-l2-
+
+      - name: Install libpcap
+        run: sudo apt-get update && sudo apt-get install -y libpcap-dev
+
+      - name: Lint
+        run: cargo clippy -p ndn-face-l2 -- -D warnings
+
+      - name: Test
+        run: cargo test -p ndn-face-l2
+
+      - name: Doc build
+        run: cargo doc -p ndn-face-l2 --no-deps
