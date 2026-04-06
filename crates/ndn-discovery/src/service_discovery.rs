@@ -53,6 +53,9 @@ struct RecordEntry {
     record: ServiceRecord,
     /// Timestamp used for the Data version component.
     published_at_ms: u64,
+    /// When this record expires (auto-withdrawn).  `None` = permanent
+    /// (config-based or explicitly pinned).
+    expires_at: Option<std::time::Instant>,
 }
 
 /// An auto-populated FIB entry that must be expired after its TTL.
@@ -163,7 +166,39 @@ impl ServiceDiscoveryProtocol {
             freshness_ms = record.freshness_ms,
             "service record published",
         );
-        let entry = RecordEntry { record, published_at_ms: ts };
+        let entry = RecordEntry { record, published_at_ms: ts, expires_at: None };
+        if let Some(idx) = existing {
+            records[idx] = entry;
+        } else {
+            records.push(entry);
+        }
+    }
+
+    /// Publish a service record with a finite TTL.
+    ///
+    /// The record is automatically withdrawn after `ttl_ms` milliseconds if
+    /// not re-published.  Use this for runtime announcements (e.g. via
+    /// `ndn-ctl service announce`) where the registering app may exit without
+    /// explicitly withdrawing the record.
+    ///
+    /// Config-based records (from `served_prefixes`) should use the permanent
+    /// [`publish`](Self::publish) instead.
+    pub fn publish_with_ttl(&self, record: ServiceRecord, ttl_ms: u64) {
+        let ts = current_timestamp_ms();
+        let expires_at = std::time::Instant::now() + Duration::from_millis(ttl_ms);
+        let mut records = self.local_records.lock().unwrap();
+        let existing = records.iter().position(|e| {
+            e.record.announced_prefix == record.announced_prefix
+                && e.record.node_name == record.node_name
+        });
+        info!(
+            prefix = %record.announced_prefix,
+            node   = %record.node_name,
+            freshness_ms = record.freshness_ms,
+            ttl_ms,
+            "service record published (TTL)",
+        );
+        let entry = RecordEntry { record, published_at_ms: ts, expires_at: Some(expires_at) };
         if let Some(idx) = existing {
             records[idx] = entry;
         } else {
@@ -736,6 +771,20 @@ impl DiscoveryProtocol for ServiceDiscoveryProtocol {
                     face   = ?e.face_id,
                     "ServiceDiscovery: expired auto-FIB entry",
                 );
+            }
+        }
+
+        // Expire local service records that have a finite TTL (published via
+        // `publish_with_ttl`).  Config-based records (`publish`) are permanent.
+        {
+            let mut local = self.local_records.lock().unwrap();
+            let before = local.len();
+            local.retain(|e| {
+                e.expires_at.map_or(true, |exp| now < exp)
+            });
+            let removed = before - local.len();
+            if removed > 0 {
+                debug!(count = removed, "ServiceDiscovery: expired {} local record(s)", removed);
             }
         }
 
