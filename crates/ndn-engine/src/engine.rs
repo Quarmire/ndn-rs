@@ -327,6 +327,10 @@ impl ForwarderEngine {
 
     /// Inject a raw packet into the pipeline as if it arrived from `face_id`.
     ///
+    /// Calls `discovery.on_inbound()` first, matching the same path as
+    /// `run_face_reader`.  If discovery consumes the packet (e.g. a browse
+    /// Interest or a service record Data), it is not forwarded to the pipeline.
+    ///
     /// Returns `Err(())` if the pipeline channel is closed.
     pub async fn inject_packet(
         &self,
@@ -334,6 +338,16 @@ impl ForwarderEngine {
         face_id: FaceId,
         arrival: u64,
     ) -> Result<(), ()> {
+        // Give discovery a chance to consume the packet before the pipeline
+        // sees it.  No source-address metadata is available for listener-
+        // injected packets, so we pass InboundMeta::none().
+        if let Some(ctx) = self.inner.discovery_ctx.get() {
+            let meta = ndn_discovery::InboundMeta::none();
+            if self.inner.discovery.on_inbound(&raw, face_id, &meta, &**ctx) {
+                return Ok(());
+            }
+        }
+
         let tx = match self.inner.pipeline_tx.get() {
             Some(tx) => tx,
             None => return Err(()),
