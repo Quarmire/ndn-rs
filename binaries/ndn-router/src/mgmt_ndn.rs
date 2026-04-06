@@ -168,8 +168,18 @@ pub async fn run_udp_listener(
     let local = socket.local_addr().unwrap_or(bind_addr);
     tracing::info!(addr=%local, "UDP listener ready");
 
-    let mut peers = std::collections::HashMap::<std::net::SocketAddr, FaceId>::new();
+    // Deduplicate faces by remote IP address only (ignoring ephemeral source
+    // port).  Peers often send from a different ephemeral port on each socket
+    // creation (e.g. when the discovery protocol creates a new unicast face),
+    // which would otherwise produce one listener face per port per peer.
+    //
+    // All replies go TO the peer's well-known NDN port (6363).  Any valid NDN
+    // router listens on that port; apps that use a non-standard port connect
+    // outbound rather than waiting for inbound, so they are unaffected.
+    let mut peers = std::collections::HashMap::<std::net::IpAddr, FaceId>::new();
     let mut buf = [0u8; 9000];
+    // The NDN well-known port (IANA assigned).
+    const NDN_PORT: u16 = 6363;
 
     loop {
         tokio::select! {
@@ -186,22 +196,26 @@ pub async fn run_udp_listener(
                 tracing::debug!(src=%src, len=n, "udp-listener: recv packet");
                 let raw = bytes::Bytes::copy_from_slice(&buf[..n]);
 
-                let face_id = if let Some(&id) = peers.get(&src) {
+                let src_ip = src.ip();
+                let face_id = if let Some(&id) = peers.get(&src_ip) {
                     id
                 } else {
-                    // New peer — create a send-only UdpFace sharing the listener socket.
-                    // Replies go out from the listener's port (6363), so the
-                    // remote peer's socket accepts them (it filters by source).
+                    // New peer (by IP) — create a send-only UdpFace sharing the
+                    // listener socket.  Target the peer's well-known NDN port so
+                    // reply traffic does not go to the ephemeral source port.
+                    // Replies go out from the listener's bound port, so the remote
+                    // peer's server socket (also on NDN_PORT) accepts them.
                     // No recv loop is spawned — the listener handles inbound
                     // packets and injects them via `inject_packet`.
+                    let canonical_peer = std::net::SocketAddr::new(src_ip, NDN_PORT);
                     let face_id = engine.faces().alloc_id();
                     let face = ndn_face_net::UdpFace::from_shared_socket(
-                        face_id, Arc::clone(&socket), src,
+                        face_id, Arc::clone(&socket), canonical_peer,
                     );
                     let peer_cancel = cancel.child_token();
                     engine.add_face_send_only(face, peer_cancel);
-                    peers.insert(src, face_id);
-                    tracing::info!(face=%face_id, peer=%src, "udp-listener: new face");
+                    peers.insert(src_ip, face_id);
+                    tracing::info!(face=%face_id, peer=%canonical_peer, src=%src, "udp-listener: new face");
                     face_id
                 };
 
@@ -1137,8 +1151,15 @@ fn service_announce(
         .map(|r| r.node_name)
         .unwrap_or_else(|| prefix.clone());
 
-    sd.publish(ServiceRecord::new(prefix.clone(), node_name));
-    tracing::info!(prefix = %prefix, "service/announce");
+    // Use publish_with_ttl so that records registered at runtime via ndn-ctl
+    // auto-expire if the app exits without calling service/withdraw.
+    // TTL = 10 × freshness_ms (default 30 s × 10 = 5 min).
+    // Apps that want a durable registration should re-announce before expiry
+    // or add the prefix to served_prefixes in the router config instead.
+    let record = ServiceRecord::new(prefix.clone(), node_name);
+    let ttl_ms = record.freshness_ms * 10;
+    sd.publish_with_ttl(record, ttl_ms);
+    tracing::info!(prefix = %prefix, ttl_ms, "service/announce");
 
     let echo = ControlParameters {
         name: Some(prefix),
