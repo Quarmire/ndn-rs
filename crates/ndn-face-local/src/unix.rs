@@ -18,6 +18,22 @@ pub fn unix_face_from_stream(id: FaceId, stream: UnixStream, path: impl AsRef<Pa
     StreamFace::new(id, FaceKind::Unix, false, None, Some(uri), r, w, TlvCodec)
 }
 
+/// Wrap an accepted `UnixStream` into a management [`UnixFace`].
+///
+/// Identical to [`unix_face_from_stream`] except the face is tagged
+/// `FaceKind::Management`, granting it operator-level implicit trust in
+/// the management handler.  Use this for connections accepted on the router's
+/// NFD management socket.
+pub fn unix_management_face_from_stream(
+    id: FaceId,
+    stream: UnixStream,
+    path: impl AsRef<Path>,
+) -> UnixFace {
+    let uri = format!("unix://{}", path.as_ref().display());
+    let (r, w) = stream.into_split();
+    StreamFace::new(id, FaceKind::Management, false, None, Some(uri), r, w, TlvCodec)
+}
+
 /// Connect to a Unix socket at `path` and return a [`UnixFace`].
 pub async fn unix_face_connect(id: FaceId, path: impl AsRef<Path>) -> std::io::Result<UnixFace> {
     let path = path.as_ref();

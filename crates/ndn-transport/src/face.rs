@@ -34,13 +34,25 @@ pub enum FaceKind {
     Internal,
     Multicast,
     WebSocket,
+    /// Management socket face (Unix domain, operator-level trust).
+    ///
+    /// Faces of this kind are created by the router's NFD face listener for
+    /// connections to the management socket.  The Unix socket's filesystem
+    /// permissions (`0600`, owned by the router user) serve as the
+    /// authentication boundary — commands from `Management` faces are granted
+    /// operator-level access without requiring signed Interests.
+    Management,
 }
 
 impl FaceKind {
     /// Whether this face is local (in-process / same-host IPC) or non-local (network).
     pub fn scope(&self) -> FaceScope {
         match self {
-            FaceKind::Unix | FaceKind::App | FaceKind::Shm | FaceKind::Internal => FaceScope::Local,
+            FaceKind::Unix
+            | FaceKind::App
+            | FaceKind::Shm
+            | FaceKind::Internal
+            | FaceKind::Management => FaceScope::Local,
             FaceKind::Udp
             | FaceKind::Tcp
             | FaceKind::Ethernet
@@ -52,6 +64,11 @@ impl FaceKind {
             | FaceKind::Multicast
             | FaceKind::WebSocket => FaceScope::NonLocal,
         }
+    }
+
+    /// Whether this face has operator-level implicit trust (management socket).
+    pub fn is_management(&self) -> bool {
+        matches!(self, FaceKind::Management)
     }
 }
 
@@ -72,6 +89,7 @@ impl core::fmt::Display for FaceKind {
             Self::Internal => "internal",
             Self::Multicast => "multicast",
             Self::WebSocket => "web-socket",
+            Self::Management => "management",
         })
     }
 }
@@ -95,6 +113,7 @@ impl core::str::FromStr for FaceKind {
             "internal" => Ok(Self::Internal),
             "multicast" => Ok(Self::Multicast),
             "web-socket" => Ok(Self::WebSocket),
+            "management" => Ok(Self::Management),
             _ => Err(()),
         }
     }
