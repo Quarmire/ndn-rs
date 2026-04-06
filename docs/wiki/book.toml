@@ -12,10 +12,11 @@ default-theme = "navy"
 preferred-dark-theme = "navy"
 git-repository-url = "https://github.com/Quarmire/ndn-rs"
 edit-url-template = "https://github.com/Quarmire/ndn-rs/edit/main/docs/wiki/src/{path}"
-
-[preprocessor.mermaid]
-command = "mdbook-mermaid"
+additional-js = ["mermaid-init.js"]
 
 [output.html.fold]
 enable = true
 level = 1
+
+[preprocessor.mermaid]
+command = "mdbook-mermaid"
