@@ -2,7 +2,6 @@
 title = "ndn-rs Wiki"
 authors = ["ndn-rs contributors"]
 language = "en"
-multilingual = false
 src = "src"
 
 [build]
