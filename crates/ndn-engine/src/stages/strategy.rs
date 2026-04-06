@@ -103,7 +103,7 @@ impl StrategyStage {
         let fib_entry_arc = self.fib.lpm(&name);
         let fib_entry_ref = fib_entry_arc.as_deref();
 
-        if let Some(ref e) = fib_entry_ref {
+        if let Some(e) = fib_entry_ref {
             trace!(face=%ctx.face_id, name=%name, nexthops=?e.nexthops.iter().map(|nh| (nh.face_id, nh.cost)).collect::<Vec<_>>(), "strategy: FIB LPM hit");
         } else {
             trace!(face=%ctx.face_id, name=%name, "strategy: FIB LPM miss (no route)");
@@ -153,7 +153,7 @@ impl StrategyStage {
         };
 
         // Use the first actionable ForwardingAction.
-        for action in actions {
+        if let Some(action) = actions.into_iter().next() {
             match action {
                 ForwardingAction::Forward(faces) => {
                     trace!(face=%ctx.face_id, name=%name, out_faces=?faces, "strategy: Forward");
@@ -192,10 +192,10 @@ impl StrategyStage {
                         tokio::time::sleep(delay).await;
                         // Re-check PIT — if the entry was already satisfied or
                         // expired, do not send (the Interest is no longer pending).
-                        if let Some(token) = pit_token {
-                            if pit.get(&token).is_none() {
-                                return; // PIT entry gone — already satisfied/expired.
-                            }
+                        if let Some(token) = pit_token
+                            && pit.get(&token).is_none()
+                        {
+                            return; // PIT entry gone — already satisfied/expired.
                         }
                         for face_id in &faces {
                             if let Some(face) = face_table.get(*face_id) {
@@ -207,13 +207,7 @@ impl StrategyStage {
                 }
                 ForwardingAction::Nack(reason) => {
                     trace!(face=%ctx.face_id, name=%name, reason=?reason, "strategy: Nack");
-                    let nr = match reason {
-                        NackReason::NoRoute => NackReason::NoRoute,
-                        NackReason::Duplicate => NackReason::Duplicate,
-                        NackReason::Congestion => NackReason::Congestion,
-                        NackReason::NotYet => NackReason::NotYet,
-                    };
-                    return Action::Nack(ctx, nr);
+                    return Action::Nack(ctx, reason);
                 }
                 ForwardingAction::Suppress => {
                     trace!(face=%ctx.face_id, name=%name, "strategy: Suppress");

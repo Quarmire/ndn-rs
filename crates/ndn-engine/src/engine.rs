@@ -241,35 +241,35 @@ impl ForwarderEngine {
         let discovery_ctx = self.discovery_ctx();
 
         // Spawn the outbound send task.
-        {
-            let d = Arc::clone(&discovery);
-            let ctx = Arc::clone(&discovery_ctx);
-            tokio::spawn(run_face_sender(
+        tokio::spawn(run_face_sender(
+            Arc::clone(&erased),
+            send_rx,
+            persistency,
+            crate::dispatcher::FaceRunnerCtx {
                 face_id,
-                Arc::clone(&erased),
-                send_rx,
-                cancel.clone(),
-                persistency,
-                Arc::clone(&self.inner.face_states),
-                Arc::clone(&self.inner.face_table),
-                Arc::clone(&self.inner.fib),
-                d,
-                ctx,
-            ));
-        }
+                cancel: cancel.clone(),
+                face_table: Arc::clone(&self.inner.face_table),
+                fib: Arc::clone(&self.inner.fib),
+                face_states: Arc::clone(&self.inner.face_states),
+                discovery: Arc::clone(&discovery),
+                discovery_ctx: Arc::clone(&discovery_ctx),
+            },
+        ));
 
         // Spawn the inbound recv task.
         tokio::spawn(crate::dispatcher::run_face_reader(
-            face_id,
             erased,
             self.inner.pipeline_tx.get().expect("pipeline_tx initialized").clone(),
-            cancel,
-            Arc::clone(&self.inner.face_table),
-            Arc::clone(&self.inner.fib),
             Arc::clone(&self.inner.pit),
-            Arc::clone(&self.inner.face_states),
-            Arc::clone(&discovery),
-            discovery_ctx,
+            crate::dispatcher::FaceRunnerCtx {
+                face_id,
+                cancel,
+                face_table: Arc::clone(&self.inner.face_table),
+                fib: Arc::clone(&self.inner.fib),
+                face_states: Arc::clone(&self.inner.face_states),
+                discovery: Arc::clone(&discovery),
+                discovery_ctx,
+            },
         ));
 
         // Notify discovery that a new face is up.
@@ -309,16 +309,18 @@ impl ForwarderEngine {
         let discovery = Arc::clone(&self.inner.discovery);
         let discovery_ctx = self.discovery_ctx();
         tokio::spawn(run_face_sender(
-            face_id,
             erased,
             send_rx,
-            cancel,
             FacePersistency::OnDemand,
-            Arc::clone(&self.inner.face_states),
-            Arc::clone(&self.inner.face_table),
-            Arc::clone(&self.inner.fib),
-            Arc::clone(&discovery),
-            Arc::clone(&discovery_ctx),
+            crate::dispatcher::FaceRunnerCtx {
+                face_id,
+                cancel,
+                face_table: Arc::clone(&self.inner.face_table),
+                fib: Arc::clone(&self.inner.fib),
+                face_states: Arc::clone(&self.inner.face_states),
+                discovery: Arc::clone(&discovery),
+                discovery_ctx: Arc::clone(&discovery_ctx),
+            },
         ));
 
         // Notify discovery (send-only faces are still reachable peers).
@@ -347,10 +349,10 @@ impl ForwarderEngine {
         // Feed inbound packet to the reliability layer (same as run_face_reader).
         // This extracts TxSeq for Ack and processes piggybacked Acks from the
         // remote end.  Only applies when the face has reliability enabled.
-        if let Some(states) = self.inner.face_states.get(&face_id) {
-            if let Some(ref rel) = states.reliability {
-                rel.lock().unwrap().on_receive(&raw);
-            }
+        if let Some(states) = self.inner.face_states.get(&face_id)
+            && let Some(rel) = states.reliability.as_ref()
+        {
+            rel.lock().unwrap().on_receive(&raw);
         }
 
         let tx = match self.inner.pipeline_tx.get() {
@@ -388,6 +390,11 @@ pub struct ShutdownHandle {
 }
 
 impl ShutdownHandle {
+    /// Get a clone of the cancellation token for this engine.
+    pub fn cancel_token(&self) -> CancellationToken {
+        self.cancel.clone()
+    }
+
     /// Cancel all engine tasks and wait for them to finish.
     pub async fn shutdown(mut self) {
         self.cancel.cancel();
@@ -415,17 +422,12 @@ impl ShutdownHandle {
 ///
 /// On cancellation or channel close: exits cleanly.
 pub(crate) async fn run_face_sender(
-    face_id: FaceId,
     face: Arc<dyn ndn_transport::ErasedFace>,
     mut rx: mpsc::Receiver<bytes::Bytes>,
-    cancel: CancellationToken,
     persistency: FacePersistency,
-    face_states: Arc<DashMap<FaceId, FaceState>>,
-    face_table: Arc<FaceTable>,
-    fib: Arc<crate::Fib>,
-    discovery: Arc<dyn ndn_discovery::DiscoveryProtocol>,
-    discovery_ctx: Arc<EngineDiscoveryContext>,
+    ctx: crate::dispatcher::FaceRunnerCtx,
 ) {
+    let crate::dispatcher::FaceRunnerCtx { face_id, cancel, face_table, fib, face_states, discovery, discovery_ctx } = ctx;
     // Check if reliability is enabled by looking at the face state.
     let has_reliability = face_states
         .get(&face_id)
@@ -476,14 +478,18 @@ pub(crate) async fn run_face_sender(
                         }
                     };
                     for wire in wires {
-                        if let Err(e) = face.send_bytes(wire).await {
-                            if handle_send_error(e) { return; }
+                        if let Err(e) = face.send_bytes(wire).await
+                            && handle_send_error(e)
+                        {
+                            return;
                         }
                     }
                 } else {
                     // Non-reliability path: send directly.
-                    if let Err(e) = face.send_bytes(pkt).await {
-                        if handle_send_error(e) { return; }
+                    if let Err(e) = face.send_bytes(pkt).await
+                        && handle_send_error(e)
+                    {
+                        return;
                     }
                 }
             },
@@ -501,8 +507,10 @@ pub(crate) async fn run_face_sender(
                     }
                 };
                 for wire in retx {
-                    if let Err(e) = face.send_bytes(wire).await {
-                        if handle_send_error(e) { return; }
+                    if let Err(e) = face.send_bytes(wire).await
+                        && handle_send_error(e)
+                    {
+                        return;
                     }
                 }
                 if let Some(wire) = ack_pkt {

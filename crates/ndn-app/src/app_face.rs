@@ -22,7 +22,7 @@ pub struct AppFace {
 
 pub enum OutboundRequest {
     Interest {
-        interest: Interest,
+        interest: Box<Interest>,
         reply: oneshot::Sender<Result<Data, AppError>>,
     },
     RegisterPrefix {
@@ -50,7 +50,7 @@ impl AppFace {
         let (tx, rx) = oneshot::channel();
         self.tx
             .send(OutboundRequest::Interest {
-                interest,
+                interest: Box::new(interest),
                 reply: tx,
             })
             .await

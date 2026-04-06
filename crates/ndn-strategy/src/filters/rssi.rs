@@ -49,7 +49,7 @@ impl StrategyFilter for RssiFilter {
                                 snapshot
                                     .for_face(*face_id)
                                     .and_then(|lq| lq.rssi_dbm)
-                                    .map_or(true, |rssi| rssi >= self.min_rssi_dbm)
+                                    .is_none_or(|rssi| rssi >= self.min_rssi_dbm)
                             })
                             .collect();
                         if filtered.is_empty() {

@@ -91,6 +91,7 @@ pub fn join_svs_group(
     SyncHandle::new(update_rx, publish_tx, cancel)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn svs_task(
     group: Name,
     local_name: Name,

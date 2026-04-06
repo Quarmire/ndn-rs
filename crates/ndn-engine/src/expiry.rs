@@ -64,10 +64,10 @@ pub async fn run_idle_face_task(
                     // not idle timeout.  Their last_activity is never updated in
                     // run_face_reader, so they would be falsely reaped here.
                     let face_id = *entry.key();
-                    if let Some(face) = face_table.get(face_id) {
-                        if matches!(face.kind(), FaceKind::App | FaceKind::Shm | FaceKind::Internal) {
-                            continue;
-                        }
+                    if let Some(face) = face_table.get(face_id)
+                        && matches!(face.kind(), FaceKind::App | FaceKind::Shm | FaceKind::Internal)
+                    {
+                        continue;
                     }
                     let last = entry.last_activity.load(std::sync::atomic::Ordering::Relaxed);
                     if now.saturating_sub(last) > IDLE_TIMEOUT_NS {

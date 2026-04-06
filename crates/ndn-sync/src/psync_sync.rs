@@ -145,13 +145,12 @@ async fn psync_task(
                     }
                 } else if raw.len() > 2 && raw[0] == 0x05 {
                     // Interest — peer's IBF. Subtract, decode, reply with diff.
-                    if let Some(peer_ibf) = parse_sync_interest(&group, &raw) {
-                        if let Some((we_have, _they_have)) = node.reconcile(&peer_ibf) {
-                            if !we_have.is_empty() {
-                                let data_bytes = encode_hash_set(&we_have);
-                                let _ = send.send(data_bytes).await;
-                            }
-                        }
+                    if let Some(peer_ibf) = parse_sync_interest(&group, &raw)
+                        && let Some((we_have, _they_have)) = node.reconcile(&peer_ibf)
+                        && !we_have.is_empty()
+                    {
+                        let data_bytes = encode_hash_set(&we_have);
+                        let _ = send.send(data_bytes).await;
                     }
                 }
             }

@@ -32,6 +32,7 @@ pub struct StreamFace<R, W, C: Clone> {
 
 impl<R, W, C: Clone> StreamFace<R, W, C> {
     /// Create a new `StreamFace` from pre-split read/write halves.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: FaceId,
         kind: FaceKind,

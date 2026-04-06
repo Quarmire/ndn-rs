@@ -97,6 +97,11 @@ pub trait ContentStore: Send + Sync + 'static {
         0
     }
 
+    /// Returns `true` if the content store contains no entries.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Total bytes currently used.
     fn current_bytes(&self) -> usize {
         0
@@ -160,6 +165,7 @@ pub trait ErasedContentStore: Send + Sync + 'static {
     fn capacity(&self) -> CsCapacity;
     fn set_capacity(&self, max_bytes: usize);
     fn len(&self) -> usize;
+    fn is_empty(&self) -> bool;
     fn current_bytes(&self) -> usize;
     fn variant_name(&self) -> &str;
     fn stats(&self) -> CsStats;
@@ -207,6 +213,10 @@ impl<T: ContentStore> ErasedContentStore for T {
 
     fn len(&self) -> usize {
         ContentStore::len(self)
+    }
+
+    fn is_empty(&self) -> bool {
+        ContentStore::is_empty(self)
     }
 
     fn current_bytes(&self) -> usize {

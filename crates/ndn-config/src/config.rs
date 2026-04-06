@@ -59,16 +59,20 @@ pub struct ForwarderConfig {
     pub discovery: DiscoveryTomlConfig,
 }
 
-impl ForwarderConfig {
+impl std::str::FromStr for ForwarderConfig {
+    type Err = ConfigError;
+
     /// Parse a `ForwarderConfig` from a TOML string.
-    pub fn from_str(s: &str) -> Result<Self, ConfigError> {
+    fn from_str(s: &str) -> Result<Self, ConfigError> {
         Ok(toml::from_str(s)?)
     }
+}
 
+impl ForwarderConfig {
     /// Load a `ForwarderConfig` from a TOML file.
     pub fn from_file(path: &std::path::Path) -> Result<Self, ConfigError> {
         let s = std::fs::read_to_string(path)?;
-        Self::from_str(&s)
+        s.parse()
     }
 
     /// Serialize to a TOML string.
@@ -517,6 +521,7 @@ impl DiscoveryTomlConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
 
     const SAMPLE_TOML: &str = r#"
 [engine]
