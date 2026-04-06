@@ -1,7 +1,7 @@
 //! `DiscoveryProtocol` trait, `ProtocolId`, and `InboundMeta` types.
 
 use std::net::SocketAddr;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use ndn_packet::Name;
@@ -117,9 +117,17 @@ pub trait DiscoveryProtocol: Send + Sync + 'static {
         ctx: &dyn DiscoveryContext,
     ) -> bool;
 
-    /// Periodic tick, called every ~100 ms by the engine's tick task.
+    /// Periodic tick, called by the engine's tick task at `tick_interval`.
     ///
     /// Use this to send hellos, check timeouts, rotate probes, and update
     /// SWIM gossip state.
     fn on_tick(&self, now: Instant, ctx: &dyn DiscoveryContext);
+
+    /// How often the engine should call `on_tick`.
+    ///
+    /// The default (100 ms) works for most deployments.  High-mobility
+    /// profiles may use 20–50 ms; static deployments may use 1 s.
+    fn tick_interval(&self) -> Duration {
+        Duration::from_millis(100)
+    }
 }

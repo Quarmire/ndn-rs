@@ -25,19 +25,19 @@ pub enum NeighborState {
         last_probe: Instant,
     },
     /// Link confirmed reachable.
-    Reachable {
+    Established {
         /// Timestamp of last successful exchange.
         last_seen: Instant,
     },
     /// Missed several hellos; link may be degrading.
-    Failing {
+    Stale {
         /// Number of consecutive missed hellos.
         miss_count: u8,
         /// Timestamp of last successful exchange before failures began.
         last_seen: Instant,
     },
     /// Peer is considered unreachable; entry pending removal.
-    Dead,
+    Absent,
 }
 
 /// A discovered neighbor and its per-link face bindings.
@@ -75,7 +75,7 @@ impl NeighborEntry {
 
     /// Return whether this neighbor has any live unicast faces.
     pub fn is_reachable(&self) -> bool {
-        matches!(self.state, NeighborState::Reachable { .. })
+        matches!(self.state, NeighborState::Established { .. })
             && !self.faces.is_empty()
     }
 
