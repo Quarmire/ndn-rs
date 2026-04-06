@@ -203,6 +203,118 @@ async fn main() -> Result<()> {
         builder = builder.security(mgr);
     }
 
+    // ── Discovery wiring ─────────────────────────────────────────────────────
+    //
+    // If [discovery] node_name is set, build CompositeDiscovery(ND + SD) and
+    // attach it to the engine.  Multicast face IDs are pre-allocated here so
+    // they can be handed to UdpNeighborDiscovery before build(); the actual
+    // face sockets are created after build() in the face loop below.
+    //
+    // `discovery_sd` is kept alive alongside the engine so the management
+    // handler can call publish()/withdraw() at runtime (Task 6).
+    let discovery_sd: Option<std::sync::Arc<ndn_discovery::ServiceDiscoveryProtocol>>;
+    let discovery_claimed: Vec<ndn_packet::Name>;
+    let pre_allocated_multicast: Vec<(ndn_transport::FaceId, usize)>; // (face_id, config_index)
+
+    if fwd_config.discovery.enabled() {
+        let node_name_str = fwd_config.discovery.resolved_node_name()
+            .expect("node_name required when discovery is enabled");
+        let node_name: ndn_packet::Name = node_name_str.parse()
+            .map_err(|e| anyhow::anyhow!("invalid discovery node_name: {e}"))?;
+
+        // Pre-allocate a FaceId for each multicast face in config.
+        let mut multicast_ids: Vec<ndn_transport::FaceId> = Vec::new();
+        let mut mc_map: Vec<(ndn_transport::FaceId, usize)> = Vec::new();
+        for (idx, face_cfg) in fwd_config.faces.iter().enumerate() {
+            if matches!(face_cfg, ndn_config::FaceConfig::Multicast { .. }) {
+                let id = builder.alloc_face_id();
+                multicast_ids.push(id);
+                mc_map.push((id, idx));
+            }
+        }
+        pre_allocated_multicast = mc_map;
+
+        // Build DiscoveryConfig from profile + overrides.
+        let profile_name = fwd_config.discovery.profile.as_deref().unwrap_or("lan");
+        let profile = match profile_name {
+            "static"        => ndn_discovery::DiscoveryProfile::Static,
+            "campus"        => ndn_discovery::DiscoveryProfile::Campus,
+            "mobile"        => ndn_discovery::DiscoveryProfile::Mobile,
+            "high-mobility" => ndn_discovery::DiscoveryProfile::HighMobility,
+            "asymmetric"    => ndn_discovery::DiscoveryProfile::Asymmetric,
+            _               => ndn_discovery::DiscoveryProfile::Lan,
+        };
+        let mut disc_cfg = ndn_discovery::DiscoveryConfig::for_profile(&profile);
+        if let Some(ms) = fwd_config.discovery.hello_interval_base_ms {
+            disc_cfg.hello_interval_base = std::time::Duration::from_millis(ms);
+        }
+        if let Some(ms) = fwd_config.discovery.hello_interval_max_ms {
+            disc_cfg.hello_interval_max = std::time::Duration::from_millis(ms);
+        }
+        if let Some(v) = fwd_config.discovery.liveness_miss_count {
+            disc_cfg.liveness_miss_count = v;
+        }
+        if let Some(v) = fwd_config.discovery.swim_indirect_fanout {
+            disc_cfg.swim_indirect_fanout = v;
+        }
+        if let Some(v) = fwd_config.discovery.gossip_fanout {
+            disc_cfg.gossip_fanout = v;
+        }
+
+        let nd = ndn_discovery::UdpNeighborDiscovery::new_multi(
+            multicast_ids,
+            node_name.clone(),
+            disc_cfg,
+        );
+
+        let mut svc_cfg = ndn_discovery::ServiceDiscoveryConfig::default();
+        if let Some(v) = fwd_config.discovery.relay_records {
+            svc_cfg.relay_records = v;
+        }
+        if let Some(v) = fwd_config.discovery.auto_fib_cost {
+            svc_cfg.auto_fib_cost = v;
+        }
+        if let Some(v) = fwd_config.discovery.auto_fib_ttl_multiplier {
+            svc_cfg.auto_fib_ttl_multiplier = v;
+        }
+
+        let sd = std::sync::Arc::new(ndn_discovery::ServiceDiscoveryProtocol::new(
+            node_name.clone(), svc_cfg,
+        ));
+        // Register served_prefixes from config via the existing publish() API.
+        for prefix_str in &fwd_config.discovery.served_prefixes {
+            match prefix_str.parse::<ndn_packet::Name>() {
+                Ok(prefix) => {
+                    sd.publish(ndn_discovery::ServiceRecord::new(prefix, node_name.clone()));
+                    tracing::info!(prefix=%prefix_str, "discovery: registered served prefix");
+                }
+                Err(e) => {
+                    tracing::warn!(prefix=%prefix_str, error=%e, "discovery: invalid served_prefix, skipping");
+                }
+            }
+        }
+
+        let composite = ndn_discovery::CompositeDiscovery::new(vec![
+            std::sync::Arc::new(nd) as std::sync::Arc<dyn ndn_discovery::DiscoveryProtocol>,
+            std::sync::Arc::clone(&sd) as std::sync::Arc<dyn ndn_discovery::DiscoveryProtocol>,
+        ])
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        // Collect all claimed prefixes from child protocols before the composite
+        // is consumed by the builder (needed for management security enforcement).
+        let claimed: Vec<ndn_packet::Name> = composite.all_claimed_prefixes();
+        builder = builder.discovery(composite);
+        discovery_sd = Some(sd);
+        discovery_claimed = claimed;
+        tracing::info!(node=%node_name, "discovery enabled");
+    } else {
+        pre_allocated_multicast = Vec::new();
+        discovery_sd = None;
+        discovery_claimed = Vec::new();
+    }
+    // Keep discovery_sd alive for management handler use.
+    let mgmt_discovery_sd = discovery_sd;
+    let mgmt_discovery_claimed = discovery_claimed;
+
     let (engine, shutdown) = builder.build().await?;
 
     // Apply static FIB routes from config.
@@ -246,7 +358,7 @@ async fn main() -> Result<()> {
             std::borrow::Cow::Borrowed(&fwd_config.faces)
         };
 
-    for face_cfg in face_configs.iter() {
+    for (face_idx, face_cfg) in face_configs.iter().enumerate() {
         match face_cfg {
             ndn_config::FaceConfig::Udp { bind, .. } => {
                 if let Some(addr) =
@@ -270,9 +382,43 @@ async fn main() -> Result<()> {
                     });
                 }
             }
-            ndn_config::FaceConfig::Multicast { .. } => {
-                // TODO: multicast UDP face from config
-                tracing::warn!("multicast face config not yet supported at startup");
+            ndn_config::FaceConfig::Multicast { group, port, interface } => {
+                let iface: std::net::Ipv4Addr = interface
+                    .as_deref()
+                    .unwrap_or("0.0.0.0")
+                    .parse()
+                    .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
+                let group_addr: std::net::Ipv4Addr = match group.parse() {
+                    Ok(a) => a,
+                    Err(e) => {
+                        tracing::error!(group=%group, error=%e, "invalid multicast group address");
+                        continue;
+                    }
+                };
+                // Use the pre-allocated ID if discovery reserved one for this face.
+                let id = pre_allocated_multicast
+                    .iter()
+                    .find(|(_, idx)| *idx == face_idx)
+                    .map(|(fid, _)| *fid)
+                    .unwrap_or_else(|| engine.faces().alloc_id());
+                let port = *port;
+                let eng = engine.clone();
+                let c = cancel.child_token();
+                tokio::spawn(async move {
+                    match ndn_face_net::MulticastUdpFace::new(iface, port, group_addr, id).await {
+                        Ok(face) => {
+                            eng.add_face_with_persistency(
+                                face,
+                                c,
+                                ndn_transport::FacePersistency::Permanent,
+                            );
+                            tracing::info!(group=%group_addr, port=%port, iface=%iface, face=%id, "multicast UDP face created");
+                        }
+                        Err(e) => {
+                            tracing::error!(group=%group_addr, port=%port, error=%e, "failed to create multicast UDP face");
+                        }
+                    }
+                });
             }
             ndn_config::FaceConfig::Unix { .. } => {
                 // Unix faces are handled by the face listener below.
@@ -367,6 +513,8 @@ async fn main() -> Result<()> {
             mgmt_handle,
             engine.clone(),
             cancel.clone(),
+            mgmt_discovery_sd.clone(),
+            mgmt_discovery_claimed.clone(),
         ));
         let listener_engine = engine.clone();
         let listener_cancel = cancel.clone();

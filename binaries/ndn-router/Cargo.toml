@@ -17,6 +17,7 @@ serial    = ["ndn-face-serial/serial"]
 
 [dependencies]
 ndn-engine       = { workspace = true }
+ndn-discovery    = { workspace = true }
 ndn-app          = { workspace = true }
 ndn-face-net     = { workspace = true }
 ndn-face-local   = { workspace = true }

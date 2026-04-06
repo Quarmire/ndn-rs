@@ -14,6 +14,8 @@
 /// - **fib**: `add-nexthop`, `remove-nexthop`, `list`
 /// - **strategy-choice**: `set`, `unset`, `list`
 /// - **cs**: `config`, `info`
+/// - **neighbors**: `list`
+/// - **service**: `list`, `announce`, `withdraw`
 /// - **status**: `general`, `shutdown`
 ///
 /// # Source face propagation
@@ -21,9 +23,11 @@
 /// When a command omits `FaceId`, the handler resolves the requesting face from
 /// the PIT in-records via [`ForwarderEngine::source_face_id`].
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use ndn_discovery::{NeighborState, ServiceDiscoveryProtocol, ServiceRecord};
 use ndn_engine::ForwarderEngine;
 use ndn_engine::stages::ErasedStrategy;
 use ndn_face_local::AppHandle;
@@ -107,8 +111,8 @@ pub async fn run_face_listener(path: &Path, engine: ForwarderEngine, cancel: Can
         };
 
         let face_id = engine.faces().alloc_id();
-        let face = ndn_face_local::unix_face_from_stream(face_id, stream, path);
-        tracing::debug!(face = %face_id, "face-listener: accepted connection");
+        let face = ndn_face_local::unix_management_face_from_stream(face_id, stream, path);
+        tracing::debug!(face = %face_id, "face-listener: accepted management connection");
         // Per-connection child token: cancelling it on disconnect only affects
         // this connection and its child faces (e.g. SHM), not the whole router.
         let conn_cancel = cancel.child_token();
@@ -260,6 +264,8 @@ pub async fn run_ndn_mgmt_handler(
     handle: AppHandle,
     engine: ForwarderEngine,
     cancel: CancellationToken,
+    discovery_sd: Option<Arc<ServiceDiscoveryProtocol>>,
+    discovery_claimed: Vec<Name>,
 ) {
     loop {
         let raw = tokio::select! {
@@ -303,6 +309,8 @@ pub async fn run_ndn_mgmt_handler(
             source_face,
             &engine,
             &cancel,
+            discovery_sd.as_deref(),
+            &discovery_claimed,
         )
         .await;
 
@@ -321,6 +329,8 @@ async fn dispatch_command(
     source_face: Option<FaceId>,
     engine: &ForwarderEngine,
     cancel: &CancellationToken,
+    discovery_sd: Option<&ServiceDiscoveryProtocol>,
+    discovery_claimed: &[Name],
 ) -> ControlResponse {
     match module_name {
         m if m == module::RIB => handle_rib(verb_name, params, source_face, engine),
@@ -328,6 +338,10 @@ async fn dispatch_command(
         m if m == module::FIB => handle_fib(verb_name, params, source_face, engine),
         m if m == module::STRATEGY => handle_strategy(verb_name, params, engine),
         m if m == module::CS => handle_cs(verb_name, params, engine).await,
+        m if m == module::NEIGHBORS => handle_neighbors(verb_name, engine),
+        m if m == module::SERVICE => {
+            handle_service(verb_name, params, engine, source_face, discovery_sd, discovery_claimed)
+        }
         m if m == module::STATUS => handle_status(verb_name, engine, cancel),
         _ => ControlResponse::error(status::NOT_FOUND, "unknown module"),
     }
@@ -358,6 +372,14 @@ fn rib_register(
         Some(n) => n.clone(),
         None => return ControlResponse::error(status::BAD_PARAMS, "Name is required"),
     };
+
+    // Block non-management faces from registering reserved prefixes.
+    if is_reserved_name(&name) && !is_management_face(source_face, engine) {
+        return ControlResponse::error(
+            status::UNAUTHORIZED,
+            format!("prefix {name} is reserved for operator use"),
+        );
+    }
 
     let face_id = match resolve_face_id(&params, source_face) {
         Ok(id) => id,
@@ -422,7 +444,7 @@ async fn handle_faces(
 ) -> ControlResponse {
     match verb_name {
         v if v == verb::CREATE => faces_create(params, source_face, engine).await,
-        v if v == verb::DESTROY => faces_destroy(params, engine),
+        v if v == verb::DESTROY => faces_destroy(params, source_face, engine),
         v if v == verb::LIST => faces_list(engine),
         _ => ControlResponse::error(status::NOT_FOUND, "unknown faces verb"),
     }
@@ -583,16 +605,31 @@ fn faces_create_shm(
     )
 }
 
-fn faces_destroy(params: ControlParameters, engine: &ForwarderEngine) -> ControlResponse {
+fn faces_destroy(
+    params: ControlParameters,
+    source_face: Option<FaceId>,
+    engine: &ForwarderEngine,
+) -> ControlResponse {
     let face_id = match params.face_id {
         Some(id) => FaceId(id as u32),
         None => return ControlResponse::error(status::BAD_PARAMS, "FaceId is required"),
     };
 
-    if engine.faces().get(face_id).is_none() {
+    let target = match engine.faces().get(face_id) {
+        Some(f) => f,
+        None => {
+            return ControlResponse::error(
+                status::NOT_FOUND,
+                format!("face {} does not exist", face_id.0),
+            );
+        }
+    };
+
+    // Non-management faces cannot destroy management faces.
+    if target.kind().is_management() && !is_management_face(source_face, engine) {
         return ControlResponse::error(
-            status::NOT_FOUND,
-            format!("face {} does not exist", face_id.0),
+            status::UNAUTHORIZED,
+            "cannot destroy a management face from a non-management face",
         );
     }
 
@@ -671,6 +708,14 @@ fn fib_add_nexthop(
         Some(n) => n.clone(),
         None => return ControlResponse::error(status::BAD_PARAMS, "Name is required"),
     };
+
+    // Block non-management faces from injecting nexthops into reserved prefixes.
+    if is_reserved_name(&name) && !is_management_face(source_face, engine) {
+        return ControlResponse::error(
+            status::UNAUTHORIZED,
+            format!("prefix {name} is reserved for operator use"),
+        );
+    }
 
     let face_id = match resolve_face_id(&params, source_face) {
         Ok(id) => id,
@@ -927,6 +972,193 @@ fn handle_status(
             ControlResponse::ok_empty("OK")
         }
         _ => ControlResponse::error(status::NOT_FOUND, "unknown status verb"),
+    }
+}
+
+// ─── Neighbors module ─────────────────────────────────────────────────────────
+
+fn handle_neighbors(verb_name: &[u8], engine: &ForwarderEngine) -> ControlResponse {
+    match verb_name {
+        v if v == verb::LIST => neighbors_list(engine),
+        _ => ControlResponse::error(status::NOT_FOUND, "unknown neighbors verb"),
+    }
+}
+
+fn neighbors_list(engine: &ForwarderEngine) -> ControlResponse {
+    let entries = engine.neighbors().all();
+    let mut text = format!("{} neighbors\n", entries.len());
+    for e in &entries {
+        let face_ids: Vec<String> = e.faces.iter().map(|(id, _, _)| id.0.to_string()).collect();
+        let state_str = match &e.state {
+            NeighborState::Established { last_seen } => {
+                let age_s = last_seen.elapsed().as_secs_f64();
+                format!("state=Established  last_seen={:.1}s ago", age_s)
+            }
+            NeighborState::Stale { miss_count, last_seen } => {
+                let age_s = last_seen.elapsed().as_secs_f64();
+                format!(
+                    "state=Stale  miss={}  last_seen={:.1}s ago",
+                    miss_count, age_s
+                )
+            }
+            NeighborState::Probing { attempts, .. } => {
+                format!("state=Probing  attempts={}", attempts)
+            }
+            NeighborState::Absent => "state=Absent".to_string(),
+        };
+        let rtt_str = match e.rtt_us {
+            Some(us) => format!("  rtt={}us", us),
+            None => "  rtt=None".to_string(),
+        };
+        text.push_str(&format!(
+            "  {}  {}{}  faces=[{}]\n",
+            e.node_name,
+            state_str,
+            rtt_str,
+            face_ids.join(","),
+        ));
+    }
+    ControlResponse::ok_empty(text)
+}
+
+// ─── Service module ───────────────────────────────────────────────────────────
+
+fn handle_service(
+    verb_name: &[u8],
+    params: ControlParameters,
+    engine: &ForwarderEngine,
+    source_face: Option<FaceId>,
+    discovery_sd: Option<&ServiceDiscoveryProtocol>,
+    discovery_claimed: &[Name],
+) -> ControlResponse {
+    let sd = match discovery_sd {
+        Some(s) => s,
+        None => {
+            return ControlResponse::error(
+                status::NOT_FOUND,
+                "service discovery is not enabled",
+            );
+        }
+    };
+    match verb_name {
+        v if v == verb::LIST => service_list(sd),
+        v if v == verb::ANNOUNCE => {
+            service_announce(params, sd, engine, source_face, discovery_claimed)
+        }
+        v if v == verb::WITHDRAW => service_withdraw(params, sd),
+        _ => ControlResponse::error(status::NOT_FOUND, "unknown service verb"),
+    }
+}
+
+fn service_list(sd: &ServiceDiscoveryProtocol) -> ControlResponse {
+    let records = sd.local_records();
+    let mut text = format!("{} services\n", records.len());
+    for r in &records {
+        text.push_str(&format!(
+            "  {}  node={}  freshness={}ms\n",
+            r.announced_prefix, r.node_name, r.freshness_ms,
+        ));
+    }
+    ControlResponse::ok_empty(text)
+}
+
+fn service_announce(
+    params: ControlParameters,
+    sd: &ServiceDiscoveryProtocol,
+    engine: &ForwarderEngine,
+    source_face: Option<FaceId>,
+    discovery_claimed: &[Name],
+) -> ControlResponse {
+    let prefix = match params.name {
+        Some(n) => n,
+        None => return ControlResponse::error(status::BAD_PARAMS, "Name is required"),
+    };
+
+    // Block announcements that would shadow a discovery-owned prefix.
+    // Non-management faces in particular cannot claim prefixes already owned by
+    // the discovery layer (e.g. /ndn/local/nd/, /ndn/local/sd/services/).
+    if !is_management_face(source_face, engine) {
+        let shadows_discovery = discovery_claimed
+            .iter()
+            .any(|cp| prefix.has_prefix(cp) || cp.has_prefix(&prefix));
+        if shadows_discovery {
+            return ControlResponse::error(
+                status::UNAUTHORIZED,
+                format!("prefix {prefix} overlaps with a discovery-owned namespace"),
+            );
+        }
+    }
+
+    // Also block reserved namespaces from non-management faces.
+    if is_reserved_name(&prefix) && !is_management_face(source_face, engine) {
+        return ControlResponse::error(
+            status::UNAUTHORIZED,
+            format!("prefix {prefix} is reserved for operator use"),
+        );
+    }
+
+    // Derive node name from any existing service record (first one available).
+    // If no records exist yet, use the prefix itself as a placeholder node name.
+    let node_name = sd
+        .local_records()
+        .into_iter()
+        .next()
+        .map(|r| r.node_name)
+        .unwrap_or_else(|| prefix.clone());
+
+    sd.publish(ServiceRecord::new(prefix.clone(), node_name));
+    tracing::info!(prefix = %prefix, "service/announce");
+
+    let echo = ControlParameters {
+        name: Some(prefix),
+        ..Default::default()
+    };
+    ControlResponse::ok("OK", echo)
+}
+
+fn service_withdraw(params: ControlParameters, sd: &ServiceDiscoveryProtocol) -> ControlResponse {
+    let prefix = match params.name {
+        Some(n) => n,
+        None => return ControlResponse::error(status::BAD_PARAMS, "Name is required"),
+    };
+
+    sd.withdraw(&prefix);
+    tracing::info!(prefix = %prefix, "service/withdraw");
+
+    let echo = ControlParameters {
+        name: Some(prefix),
+        ..Default::default()
+    };
+    ControlResponse::ok("OK", echo)
+}
+
+// ─── Security helpers ─────────────────────────────────────────────────────────
+
+/// Reserved name prefixes that only management (operator) faces may register.
+const RESERVED_PREFIXES: &[&str] = &["/ndn/local", "/localhost/nfd"];
+
+/// Return `true` if `name` has a prefix that is reserved for the router.
+fn is_reserved_name(name: &Name) -> bool {
+    RESERVED_PREFIXES.iter().any(|r| {
+        Name::from_str(r)
+            .map(|p| name.has_prefix(&p) || *name == p)
+            .unwrap_or(false)
+    })
+}
+
+/// Return `true` if the source face has operator-level management trust.
+///
+/// A face is trusted if:
+/// - It is `FaceKind::Management` (connected through the management socket), OR
+/// - No source face is known (internally generated command).
+fn is_management_face(source_face: Option<FaceId>, engine: &ForwarderEngine) -> bool {
+    match source_face {
+        None => true, // internal / no source
+        Some(fid) => engine
+            .faces()
+            .get(fid)
+            .map(|f| f.kind().is_management())
+            .unwrap_or(false),
     }
 }
 
