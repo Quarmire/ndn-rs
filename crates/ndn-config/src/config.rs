@@ -591,4 +591,10 @@ file = "/var/log/ndn/router.log"
         let cfg = ForwarderConfig::from_str(toml).unwrap();
         assert_eq!(cfg.routes[0].cost, 10);
     }
+
+    #[test]
+    fn example_file_parses() {
+        let s = include_str!("../../../ndn-router.example.toml");
+        ForwarderConfig::from_str(s).expect("example config should parse");
+    }
 }
