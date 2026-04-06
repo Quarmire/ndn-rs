@@ -56,6 +56,7 @@ impl Default for EngineConfig {
 /// Constructs and wires a `ForwarderEngine`.
 pub struct EngineBuilder {
     config: EngineConfig,
+    face_table: Arc<FaceTable>,
     faces: Vec<Box<dyn FnOnce(Arc<FaceTable>) + Send>>,
     strategy: Option<Arc<dyn ErasedStrategy>>,
     security: Option<Arc<SecurityManager>>,
@@ -71,6 +72,7 @@ impl EngineBuilder {
     pub fn new(config: EngineConfig) -> Self {
         Self {
             config,
+            face_table: Arc::new(FaceTable::new()),
             faces: Vec::new(),
             strategy: None,
             security: None,
@@ -81,6 +83,17 @@ impl EngineBuilder {
             security_profile: SecurityProfile::Default,
             discovery: None,
         }
+    }
+
+    /// Pre-allocate a `FaceId` from the engine's face table.
+    ///
+    /// This allows callers to know the ID that will be assigned to a face
+    /// *before* calling `build()`, so the ID can be passed to discovery
+    /// protocols or other components at construction time.  The actual face
+    /// object should be added via `builder.face(…)` or
+    /// `engine.add_face_with_persistency(…)` after `build()`.
+    pub fn alloc_face_id(&self) -> ndn_transport::FaceId {
+        self.face_table.alloc_id()
     }
 
     /// Register a face to be added at startup.
@@ -182,7 +195,7 @@ impl EngineBuilder {
         } else {
             base_cs
         };
-        let face_table = Arc::new(FaceTable::new());
+        let face_table = self.face_table;
         let measurements = Arc::new(MeasurementsTable::new());
 
         // Register pre-configured faces.
