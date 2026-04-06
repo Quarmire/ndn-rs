@@ -49,7 +49,7 @@ pub fn fragment_packet(packet: &[u8], mtu: usize, base_seq: u64) -> Vec<Bytes> {
         .expect("MTU too small for fragmentation overhead");
     assert!(payload_cap > 0, "MTU too small");
 
-    let frag_count = (packet.len() + payload_cap - 1) / payload_cap;
+    let frag_count = packet.len().div_ceil(payload_cap);
 
     let mut fragments = Vec::with_capacity(frag_count);
     for i in 0..frag_count {

@@ -1,3 +1,24 @@
+//! # ndn-packet -- NDN packet types and wire-format codec
+//!
+//! Defines the core NDN packet structures and their TLV serialization.
+//! Fields are decoded lazily via `OnceLock` so that fast-path operations
+//! (e.g. Content Store hits) avoid parsing unused fields.
+//!
+//! ## Key types
+//!
+//! - [`Name`] / [`NameComponent`] -- NDN hierarchical names (`SmallVec`-backed).
+//! - [`Interest`] -- Interest packet with lazy decode and optional [`Selector`].
+//! - [`Data`] -- Data packet carrying content, [`MetaInfo`], and [`SignatureInfo`].
+//! - [`Nack`] / [`NackReason`] -- Network-layer negative acknowledgement.
+//! - [`LpHeaders`] -- NDNLPv2 link-protocol header fields.
+//!
+//! ## Feature flags
+//!
+//! - **`std`** (default) -- enables `ring` signatures and fragment reassembly.
+//!   Disable for `no_std` environments (an allocator is still required).
+
+#![allow(missing_docs)]
+
 // Enable no_std when the `std` feature is disabled.
 // The crate requires an allocator (Name uses SmallVec, Bytes uses heap).
 #![cfg_attr(not(feature = "std"), no_std)]

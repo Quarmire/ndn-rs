@@ -11,6 +11,8 @@
 //!   strategy implementations with cross-layer enrichment.
 //! - [`ShutdownHandle`] — cooperative shutdown of all engine tasks.
 
+#![allow(missing_docs)]
+
 pub mod builder;
 pub mod compose;
 pub mod discovery_context;
