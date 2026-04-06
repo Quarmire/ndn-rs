@@ -51,7 +51,7 @@ pub trait ErasedFace: Send + Sync + 'static {
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
-                    Output = Result<(bytes::Bytes, Option<std::net::SocketAddr>), crate::face::FaceError>,
+                    Output = Result<(bytes::Bytes, Option<crate::face::FaceAddr>), crate::face::FaceError>,
                 > + Send
                 + '_,
         >,
@@ -101,7 +101,7 @@ impl<F: Face> ErasedFace for F {
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
-                    Output = Result<(bytes::Bytes, Option<std::net::SocketAddr>), crate::face::FaceError>,
+                    Output = Result<(bytes::Bytes, Option<crate::face::FaceAddr>), crate::face::FaceError>,
                 > + Send
                 + '_,
         >,

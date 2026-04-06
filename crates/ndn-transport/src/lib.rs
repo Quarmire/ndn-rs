@@ -10,7 +10,7 @@ pub mod tlv_codec;
 
 pub use any_map::AnyMap;
 pub use congestion::CongestionController;
-pub use face::{Face, FaceError, FaceId, FaceKind, FacePersistency, FaceScope};
+pub use face::{Face, FaceAddr, FaceError, FaceId, FaceKind, FacePersistency, FaceScope};
 pub use face_event::FaceEvent;
 pub use face_pair_table::FacePairTable;
 pub use face_table::{ErasedFace, FaceInfo, FaceTable};

@@ -14,7 +14,7 @@ use ndn_pipeline::{
     Action, DecodedPacket, DropReason, ForwardingAction, NackReason, PacketContext,
 };
 use ndn_store::{CsEntry, PitToken};
-use ndn_transport::{FaceError, FaceId, FaceKind, FacePersistency, FaceScope, FaceTable};
+use ndn_transport::{FaceAddr, FaceError, FaceId, FaceKind, FacePersistency, FaceScope, FaceTable};
 
 use ndn_discovery::{DiscoveryProtocol, InboundMeta};
 
@@ -652,11 +652,14 @@ pub(crate) async fn run_face_reader(
                     }
                 }
                 // Build InboundMeta from the link-layer source address when
-                // the face exposed it (e.g. MulticastUdpFace).  Flows through
-                // InboundPacket into process_packet where discovery.on_inbound
-                // is called after LP-unwrap and decode.
+                // the face exposed it (e.g. MulticastUdpFace, NamedEtherFace).
+                // Flows through InboundPacket into process_packet where
+                // discovery.on_inbound is called after LP-unwrap and decode.
                 let meta = match src_addr {
-                    Some(addr) => ndn_discovery::InboundMeta::udp(addr),
+                    Some(FaceAddr::Udp(addr)) => ndn_discovery::InboundMeta::udp(addr),
+                    Some(FaceAddr::Ether(mac)) => {
+                        ndn_discovery::InboundMeta::ether(ndn_discovery::MacAddr::new(mac))
+                    }
                     None => ndn_discovery::InboundMeta::none(),
                 };
 

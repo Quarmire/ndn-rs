@@ -1,6 +1,20 @@
 use bytes::Bytes;
 use thiserror::Error;
 
+/// Link-layer source address returned by multicast/broadcast faces.
+///
+/// Using a dedicated enum (rather than re-exporting the `ndn-discovery`
+/// `LinkAddr`) keeps `ndn-transport` free of a dependency on `ndn-discovery`.
+/// The engine converts `FaceAddr` into `ndn_discovery::InboundMeta` in the
+/// face reader, which *does* depend on `ndn-discovery`.
+#[derive(Clone, Debug)]
+pub enum FaceAddr {
+    /// Source UDP `SocketAddr` from `recvfrom` on a multicast socket.
+    Udp(std::net::SocketAddr),
+    /// Source MAC address extracted from the Ethernet frame header.
+    Ether([u8; 6]),
+}
+
 /// Opaque identifier for a face. Cheap to copy; safe to use across tasks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FaceId(pub u32);
@@ -190,12 +204,10 @@ pub trait Face: Send + Sync + 'static {
     /// Receive the next packet together with the link-layer sender address.
     ///
     /// The default implementation returns `None` for the source address.
-    /// Multicast and broadcast faces (e.g. [`MulticastUdpFace`]) override this
-    /// to return the UDP source `SocketAddr`, enabling the discovery layer to
-    /// create unicast reply faces without embedding addresses in NDN payloads.
-    ///
-    /// [`MulticastUdpFace`]: ndn_face_net::MulticastUdpFace
-    fn recv_with_addr(&self) -> impl Future<Output = Result<(Bytes, Option<std::net::SocketAddr>), FaceError>> + Send {
+    /// Multicast and broadcast faces override this to return the link-layer
+    /// source, enabling discovery to create unicast reply faces without
+    /// embedding addresses in NDN payloads.
+    fn recv_with_addr(&self) -> impl Future<Output = Result<(Bytes, Option<FaceAddr>), FaceError>> + Send {
         async { self.recv().await.map(|b| (b, None)) }
     }
 
