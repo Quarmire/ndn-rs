@@ -464,6 +464,26 @@ pub struct DiscoveryTomlConfig {
     /// ephemeral Ed25519 key is auto-generated from the node name.
     #[serde(default)]
     pub key_name: Option<String>,
+
+    /// Which link-layer transports to run discovery on.
+    ///
+    /// Accepted values:
+    /// - `"udp"` (default): UDP multicast only (`224.0.23.170:6363`).
+    /// - `"ether"`: raw Ethernet multicast only (EtherType 0x8624).
+    /// - `"both"`: UDP and Ethernet simultaneously.
+    ///
+    /// Ethernet discovery requires `CAP_NET_RAW` / root on Linux, or root on
+    /// macOS (PF_NDRV).  The `ether` and `both` options also require at least
+    /// one `[[face]]` entry with `kind = "ether-multicast"` (providing the
+    /// `FaceId` and interface name).
+    #[serde(default)]
+    pub discovery_transport: Option<String>,
+
+    /// Network interface name for Ethernet discovery (e.g. `"eth0"`, `"en0"`).
+    ///
+    /// Required when `discovery_transport` is `"ether"` or `"both"`.
+    #[serde(default)]
+    pub ether_iface: Option<String>,
 }
 
 impl DiscoveryTomlConfig {
