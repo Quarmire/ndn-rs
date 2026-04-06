@@ -99,6 +99,10 @@ pub struct UdpNeighborDiscovery {
     /// Ed25519 signer for hello Data packets.  Also provides the public key
     /// embedded in `HelloPayload::public_key` for self-attesting verification.
     signer: Arc<dyn Signer>,
+    /// This node's UDP unicast listen port, advertised in hello payloads so
+    /// peers create their unicast face on the right port instead of the
+    /// multicast source port (which would misroute data traffic).
+    unicast_port: Option<u16>,
 }
 
 impl UdpNeighborDiscovery {
@@ -157,7 +161,19 @@ impl UdpNeighborDiscovery {
                 relay_probes: HashMap::new(),
             }),
             signer,
+            unicast_port: None,
         }
+    }
+
+    /// Set the UDP unicast port this node listens on for forwarding traffic.
+    ///
+    /// When set, this port is advertised in every hello Data so that peers
+    /// create their unicast face to `<peer-ip>:<unicast_port>` rather than
+    /// to the multicast source port.  Call this after construction, before
+    /// passing to `EngineBuilder::discovery()`.
+    pub fn with_unicast_port(mut self, port: u16) -> Self {
+        self.unicast_port = Some(port);
+        self
     }
 
     /// Derive a deterministic transient Ed25519 key from the node name.
@@ -219,6 +235,8 @@ impl UdpNeighborDiscovery {
         }
         // Include the public key for self-attesting signature verification.
         payload.public_key = self.signer.public_key();
+        // Advertise our unicast port so peers don't use the multicast port.
+        payload.unicast_port = self.unicast_port;
         let content = payload.encode();
         // FreshnessPeriod = hello_interval_base * 2 (doc §Hello Packet Format)
         let freshness_ms = self.config.hello_interval_base.as_millis().min(u32::MAX as u128) as u64 * 2;
@@ -307,7 +325,15 @@ impl UdpNeighborDiscovery {
             Some(LinkAddr::Udp(addr)) => *addr,
             _ => { debug!("UdpND: hello Data no source addr"); return true; }
         };
-        let peer_face_id = self.ensure_peer(ctx, &responder_name, responder_addr);
+        // If the hello payload advertises a unicast port, use that instead of
+        // the source port (which is the multicast port when hellos are sent via
+        // the multicast socket).  This ensures data traffic uses a true unicast
+        // path rather than going through the multicast group.
+        let unicast_addr = match payload.unicast_port {
+            Some(port) => std::net::SocketAddr::new(responder_addr.ip(), port),
+            None => responder_addr,
+        };
+        let peer_face_id = self.ensure_peer(ctx, &responder_name, unicast_addr);
         ctx.update_neighbor(NeighborUpdate::SetState {
             name: responder_name.clone(),
             state: NeighborState::Established { last_seen: Instant::now() },

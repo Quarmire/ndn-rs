@@ -261,11 +261,26 @@ async fn main() -> Result<()> {
             disc_cfg.gossip_fanout = v;
         }
 
+        // Determine the UDP unicast listen port so it can be advertised in
+        // hellos.  Peers use this port to create a true unicast face instead
+        // of pointing at the multicast source port (which would send data as
+        // multicast).  Default to 6363 (the IANA-assigned NDN port).
+        let unicast_port: u16 = fwd_config.faces.iter()
+            .find_map(|f| match f {
+                ndn_config::FaceConfig::Udp { bind, remote: None } => {
+                    bind.as_deref().unwrap_or("0.0.0.0:6363")
+                        .parse::<std::net::SocketAddr>().ok()
+                        .map(|a| a.port())
+                }
+                _ => None,
+            })
+            .unwrap_or(6363);
+
         let nd = ndn_discovery::UdpNeighborDiscovery::new_multi(
             multicast_ids,
             node_name.clone(),
             disc_cfg,
-        );
+        ).with_unicast_port(unicast_port);
 
         let mut svc_cfg = ndn_discovery::ServiceDiscoveryConfig::default();
         if let Some(v) = fwd_config.discovery.relay_records {

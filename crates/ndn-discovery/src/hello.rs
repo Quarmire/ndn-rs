@@ -56,6 +56,12 @@ pub const T_ADD_ENTRY: u64 = 0xC5;
 pub const T_REMOVE_ENTRY: u64 = 0xC6;
 /// `PUBLIC-KEY` TLV type: raw 32-byte Ed25519 public key for self-attesting signed hellos.
 pub const T_PUBLIC_KEY: u64 = 0xC8;
+/// `UNICAST-PORT` TLV type: the sender's UDP unicast listen port.
+///
+/// Included in hello Data so that receivers create unicast faces on the
+/// correct port rather than the multicast source port.  Encoded as a
+/// big-endian `u16` (2 bytes).
+pub const T_UNICAST_PORT: u64 = 0xC9;
 
 // ─── Capability flags ─────────────────────────────────────────────────────────
 
@@ -105,6 +111,10 @@ pub struct HelloPayload {
     /// When present, the hello Data is signed by the corresponding private key
     /// and receivers can verify without any certificate infrastructure.
     pub public_key: Option<Bytes>,
+    /// UDP unicast listen port.  When present, receivers should create their
+    /// unicast face to `<sender-ip>:<unicast_port>` rather than to the
+    /// source port of the hello packet (which may be the multicast port).
+    pub unicast_port: Option<u16>,
 }
 
 impl HelloPayload {
@@ -116,6 +126,7 @@ impl HelloPayload {
             capabilities: 0,
             neighbor_diffs: Vec::new(),
             public_key: None,
+            unicast_port: None,
         }
     }
 
@@ -161,6 +172,10 @@ impl HelloPayload {
         if let Some(ref pk) = self.public_key {
             w.write_tlv(T_PUBLIC_KEY, pk);
         }
+        // UNICAST-PORT (omit if not present)
+        if let Some(port) = self.unicast_port {
+            w.write_tlv(T_UNICAST_PORT, &port.to_be_bytes());
+        }
         w.finish()
     }
 
@@ -177,6 +192,7 @@ impl HelloPayload {
         let mut capabilities: u8 = 0;
         let mut neighbor_diffs = Vec::new();
         let mut public_key: Option<Bytes> = None;
+        let mut unicast_port: Option<u16> = None;
 
         while !r.is_empty() {
             let (t, v) = r.read_tlv().ok()?;
@@ -202,6 +218,11 @@ impl HelloPayload {
                         public_key = Some(v);
                     }
                 }
+                T_UNICAST_PORT => {
+                    if v.len() == 2 {
+                        unicast_port = Some(u16::from_be_bytes([v[0], v[1]]));
+                    }
+                }
                 _ => {} // forward-compatible: skip unknown types
             }
         }
@@ -212,6 +233,7 @@ impl HelloPayload {
             capabilities,
             neighbor_diffs,
             public_key,
+            unicast_port,
         })
     }
 }
