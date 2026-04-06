@@ -1,4 +1,5 @@
 pub mod app;
+pub mod ipc;
 
 #[cfg(unix)]
 pub mod unix;
@@ -7,6 +8,7 @@ pub mod unix;
 pub mod shm;
 
 pub use app::{AppFace, AppHandle};
+pub use ipc::{IpcFace, IpcListener, ipc_face_connect};
 
 #[cfg(unix)]
 pub use unix::{UnixFace, unix_face_connect, unix_face_from_stream, unix_management_face_from_stream};
