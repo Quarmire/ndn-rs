@@ -1,95 +1,58 @@
 # Security Model
 
-NDN security is fundamentally data-centric: every Data packet is signed by its producer, and the signature travels with the data regardless of how it was retrieved (from a cache, a neighbor, or the original producer). ndn-rs implements this model across the `ndn-security` crate with trait-based signing/verification, trust schemas, certificate chain validation, and a typestate pattern that makes it impossible to forward unverified data where verified data is required.
+## The Problem: Bolted-On vs. Built-In Security
 
-## Core Principles
+In IP networking, security is an afterthought. TLS secures the *channel* between two endpoints, but the data itself has no inherent protection. Once a TLS session terminates at a CDN or cache, the original security guarantee evaporates. You trust the server, not the data.
 
-1. **Every Data is signed** -- producers attach a signature (Ed25519 or HMAC-SHA256) covering the signed region (Name through SignatureInfo)
-2. **Verification is receiver-side** -- consumers and forwarders validate signatures before accepting data
-3. **Certificates are Data packets** -- key certificates are fetched via normal Interest/Data exchange, cached in the Content Store like any other data
-4. **Trust schemas constrain relationships** -- name-based rules define which keys may sign which data
+NDN flips this entirely. Every Data packet is signed at birth, and the signature travels with the data forever. A cached copy served by a router three hops away is exactly as trustworthy as one delivered directly by the producer -- the signature is over the content, not the channel. This is a profound architectural advantage, but it creates challenges that don't exist in IP security:
 
-## Signer and Verifier Traits
+- **Key discovery is a networking problem.** A Data packet says "I was signed by key `/sensor/node1/KEY/k1`" -- but that key's certificate is itself an NDN Data packet that must be fetched over the network.
+- **Trust is not transitive by default.** Just because a signature is cryptographically valid doesn't mean you should trust it. Which keys are authorized to sign which data? The answer requires *policy*, not just cryptography.
+- **Verification has a cost.** Ed25519 verification is fast, but doing it for every packet on a high-throughput forwarder adds up. Local applications on the same machine shouldn't pay that cost.
 
-Both traits use `BoxFuture` for dyn-compatibility, allowing them to be stored as `Arc<dyn Signer>` in the key store:
+ndn-rs addresses all three challenges through a layered design: trust schemas define policy, certificate chain validation handles key discovery, and the `SafeData` typestate makes the compiler enforce that unverified data never reaches code that expects verified data.
 
-```rust
-type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+```mermaid
+flowchart LR
+    subgraph Producer
+        App["Application"] --> Sign["Sign with<br/>Ed25519 / HMAC"]
+        Sign --> Data["Signed Data Packet<br/>(signature is part of the wire format)"]
+    end
 
-pub trait Signer: Send + Sync + 'static {
-    fn sig_type(&self) -> SignatureType;
-    fn key_name(&self) -> &Name;
-    fn cert_name(&self) -> Option<&Name> { None }
-    fn public_key(&self) -> Option<Bytes> { None }
+    Data --> Network
 
-    fn sign<'a>(&'a self, region: &'a [u8])
-        -> BoxFuture<'a, Result<Bytes, TrustError>>;
+    subgraph Network["Network (routers, caches)"]
+        R1["Router"] -->|"forward + cache"| R2["Router"]
+    end
 
-    /// CPU-only signers (Ed25519, HMAC) override this to
-    /// avoid async overhead.
-    fn sign_sync(&self, region: &[u8]) -> Result<Bytes, TrustError>;
-}
+    Network --> Validate
 
-pub trait Verifier: Send + Sync + 'static {
-    fn verify<'a>(&'a self, region: &'a [u8], sig_value: &'a [u8],
-                   public_key: &'a [u8])
-        -> BoxFuture<'a, Result<VerifyOutcome, TrustError>>;
-}
+    subgraph Consumer["Consumer / Forwarder"]
+        Validate["Validate signature"] --> Schema["Check trust schema"]
+        Schema --> Chain["Walk certificate chain"]
+        Chain --> Safe["SafeData"]
+    end
+
+    style Safe fill:#2d7a3a,color:#fff
 ```
 
-### Supported Algorithms
+The signature is embedded in the packet's wire format. Routers can cache and forward the packet without breaking it. Any consumer, anywhere in the network, can independently verify the signature without contacting the original producer.
 
-| Algorithm | Signer | Signature Size | Use Case |
-|-----------|--------|---------------|----------|
-| Ed25519 | `Ed25519Signer` | 64 bytes | Default for all Data packets |
-| HMAC-SHA256 | `HmacSha256Signer` | 32 bytes | Pre-shared key authentication (~10x faster) |
+## The Journey of a Data Packet
 
-Both signers implement `sign_sync` for CPU-only fast paths. The async `sign` method delegates to `sign_sync` wrapped in `Box::pin`.
+To understand how these pieces fit together, follow a Data packet arriving at a forwarder that has validation enabled.
 
-## Trust Schemas
+**A temperature reading arrives.** The packet's name is `/sensor/node1/temp/1712400000`, and its SignatureInfo field says it was signed by key `/sensor/node1/KEY/k1`. The raw bytes are sitting in a buffer. At this point, it's just a `Data` -- an unverified blob.
 
-Trust schemas express name-based rules constraining which keys may sign which data. Rules use `NamePattern` with three component types:
+**First question: does the policy allow this?** Before touching any cryptography, the forwarder consults its trust schema. The schema has a rule saying data under `/sensor/<node>/<type>` must be signed by `/sensor/<node>/KEY/<id>`. The forwarder pattern-matches: `<node>` captures `node1` in both the data name and the key name. The captures are consistent, so the schema allows this combination. If the key name had been `/other-org/KEY/k1`, the schema would reject immediately -- no crypto needed.
 
-```rust
-pub enum PatternComponent {
-    /// Must match this exact component.
-    Literal(NameComponent),
-    /// Binds one component to a named variable.
-    Capture(Arc<str>),
-    /// Binds one or more trailing components.
-    MultiCapture(Arc<str>),
-}
-```
+**Next: find the certificate.** The key name `/sensor/node1/KEY/k1` points to a certificate, which in NDN is just another Data packet containing the signer's public key. The forwarder checks its `CertCache` first. On a cache hit, it already has the public key bytes and can proceed. On a miss, it sends a normal Interest for `/sensor/node1/KEY/k1` -- the certificate flows through the same Interest/Data machinery as any other content, and gets cached in the Content Store for future lookups.
 
-A `SchemaRule` pairs a data pattern with a key pattern. Captured variables must be consistent across both patterns:
+**Verify the signature.** With the public key in hand, the forwarder runs Ed25519 verification over the packet's signed region (everything from the Name through the SignatureInfo). If the signature doesn't check out, the packet is rejected.
 
-```rust
-// Rule: Data under /sensor/<node>/<type> must be signed
-// by /sensor/<node>/KEY/<id>
-SchemaRule {
-    data_pattern: NamePattern(vec![
-        Literal(comp("sensor")),
-        Capture("node"),
-        Capture("type"),
-    ]),
-    key_pattern: NamePattern(vec![
-        Literal(comp("sensor")),
-        Capture("node"),    // must match same value!
-        Literal(comp("KEY")),
-        Capture("id"),
-    ]),
-}
-```
+**But who signed the certificate?** The certificate for `/sensor/node1/KEY/k1` is itself a signed Data packet. Maybe it was signed by `/sensor/KEY/root`. The forwarder walks up the chain: fetch that certificate, verify its signature, check *its* issuer, and so on -- until it reaches a trust anchor (a self-signed certificate the forwarder was configured to trust at startup). If the chain exceeds a configurable maximum depth, or if a cycle is detected, validation fails.
 
-Built-in schemas:
-
-- **`TrustSchema::new()`** -- empty, rejects everything (use for strict configurations)
-- **`TrustSchema::accept_all()`** -- wildcard, accepts any signed packet
-- **`TrustSchema::hierarchical()`** -- data and key must share the same first name component; actual hierarchy enforced by certificate chain walk
-
-## Certificate Chain Validation
-
-The `Validator` performs full certificate chain validation, walking from the Data packet up through intermediate certificates to a trust anchor:
+**The packet becomes `SafeData`.** If the entire chain checks out, the `Data` is wrapped in a `SafeData` struct. From this point forward, the type system guarantees that this data has been verified. Code that expects `SafeData` literally cannot receive unverified data -- it won't compile.
 
 ```mermaid
 flowchart TB
@@ -127,9 +90,7 @@ flowchart TB
     style Pending fill:#8c6d2d,color:#fff
 ```
 
-The chain walk detects cycles (a certificate that directly or indirectly signs itself) and enforces a configurable maximum chain depth.
-
-### ValidationResult
+The result of validation is one of three outcomes:
 
 ```rust
 pub enum ValidationResult {
@@ -142,14 +103,124 @@ pub enum ValidationResult {
 }
 ```
 
-## SafeData Typestate
+The `Pending` state is important: because certificates are fetched over the network, validation can be asynchronous. A forwarder may need to pause validation, send an Interest for a missing certificate, and resume when the certificate arrives.
 
-`SafeData` is a Data packet whose signature has been verified. It can only be constructed by:
+## How Producers Sign Data
 
-1. `Validator::validate_chain()` -- full certificate chain validation
-2. `SafeData::from_local_trusted()` -- local face trust (bypasses crypto)
+On the other side of the equation, a producer needs to create a cryptographic identity and attach signatures to outgoing Data packets.
 
-The constructor is `pub(crate)`, preventing application code from creating a `SafeData` without going through validation. Application callbacks receive `SafeData`, not `Data` -- the compiler enforces that unverified data cannot be passed where verified data is required:
+The `KeyChain` facade in `ndn-app` makes this straightforward:
+
+```rust
+// Create an ephemeral keychain (or open a persistent one from disk)
+let keychain = KeyChain::new();
+
+// Generate an Ed25519 key pair and self-signed certificate
+let signer = keychain.create_identity("/sensor/node1", None)?;
+
+// The signer is now ready to sign Data packets
+// DataBuilder will call signer.sign() to produce the signature
+```
+
+For persistent deployments, `KeyChain::open` loads keys from a PIB (Public Information Base) directory backed by `FilePib`, so keys survive application restarts:
+
+```rust
+let keychain = KeyChain::open("/var/lib/ndn/pib", &"/sensor/node1".into())?;
+```
+
+Under the hood, signing is handled by the `Signer` trait. Both traits in the security layer (`Signer` and `Verifier`) use `BoxFuture` for dyn-compatibility, so they can be stored as `Arc<dyn Signer>` in the key store and swapped at runtime:
+
+```rust
+pub trait Signer: Send + Sync + 'static {
+    fn sig_type(&self) -> SignatureType;
+    fn key_name(&self) -> &Name;
+    fn cert_name(&self) -> Option<&Name> { None }
+    fn public_key(&self) -> Option<Bytes> { None }
+
+    fn sign<'a>(&'a self, region: &'a [u8])
+        -> BoxFuture<'a, Result<Bytes, TrustError>>;
+
+    /// CPU-only signers (Ed25519, HMAC) override this to
+    /// avoid async overhead.
+    fn sign_sync(&self, region: &[u8]) -> Result<Bytes, TrustError>;
+}
+```
+
+ndn-rs ships two signer implementations:
+
+| Algorithm | Signer | Signature Size | Use Case |
+|-----------|--------|---------------|----------|
+| Ed25519 | `Ed25519Signer` | 64 bytes | Default for all Data packets |
+| HMAC-SHA256 | `HmacSh256Signer` | 32 bytes | Pre-shared key authentication (~10x faster) |
+
+Both implement `sign_sync` for a CPU-only fast path -- no async state machine overhead when the operation is pure computation.
+
+## Trust Schemas in Depth
+
+Trust schemas are the *policy layer* that sits between raw cryptographic verification and actual trust. A valid signature from a stranger is meaningless; what matters is whether the signer was *authorized* to sign that particular data.
+
+A schema is a collection of rules, each pairing a data name pattern with a key name pattern. Patterns use three component types:
+
+```rust
+pub enum PatternComponent {
+    Literal(NameComponent),   // must match exactly
+    Capture(Arc<str>),        // binds one component to a named variable
+    MultiCapture(Arc<str>),   // binds one or more trailing components
+}
+```
+
+The key insight is that **capture variables must be consistent across both patterns**. Consider a sensor network where temperature readings under `/sensor/<node>/temp` must be signed by that node's own key:
+
+```rust
+SchemaRule {
+    data_pattern: NamePattern(vec![
+        Literal(comp("sensor")),
+        Capture("node"),
+        Capture("type"),
+    ]),
+    key_pattern: NamePattern(vec![
+        Literal(comp("sensor")),
+        Capture("node"),    // must match the same value as above
+        Literal(comp("KEY")),
+        Capture("id"),
+    ]),
+}
+```
+
+When a Data packet named `/sensor/node1/temp` arrives signed by `/sensor/node1/KEY/k1`, the schema matches: `node` captures `node1` in both patterns. But if `node2` tried to sign data for `node1`, the captures would conflict and the schema would reject the packet before any cryptographic verification occurs.
+
+This is a lightweight but powerful mechanism. A few well-chosen rules can express policies like:
+
+- **Hierarchical trust**: data and key must share the same organizational prefix
+- **Scope restriction**: a department key can only sign data within its department
+- **Role-based signing**: only keys under `/admin/KEY/` can sign configuration updates
+
+ndn-rs provides three built-in schemas for common cases:
+
+- `TrustSchema::new()` -- empty, rejects everything (for strict configurations where you add rules explicitly)
+- `TrustSchema::accept_all()` -- wildcard, accepts any signed packet (for testing or trusted environments)
+- `TrustSchema::hierarchical()` -- data and key must share the same first name component; the actual hierarchy is enforced by the certificate chain walk
+
+## The Local Trust Escape Hatch
+
+Not every Data packet needs cryptographic verification. Applications running on the same machine as the forwarder -- connected via shared memory (SHM) or Unix sockets -- are already authenticated by the operating system.
+
+On Unix systems, `SO_PEERCRED` on a Unix socket provides the connecting process's UID. If the forwarder trusts that UID, Data from that face skips the entire certificate chain walk:
+
+```rust
+SafeData::from_local_trusted(data, uid)
+```
+
+The resulting `SafeData` carries a `TrustPath::LocalFace { uid }` instead of `TrustPath::CertChain(...)`, recording *how* trust was established. This matters for two reasons:
+
+1. **Performance.** Ed25519 verification, while fast, is not free. On a forwarder handling millions of local application packets per second, skipping crypto for trusted local faces is significant.
+2. **Bootstrapping.** A newly started application doesn't have certificates yet. Local trust lets it communicate with the forwarder immediately, even before setting up its cryptographic identity.
+
+The critical point is that the `SafeData` type is the same in both paths. Downstream code doesn't need to know (or care) whether trust was established cryptographically or locally -- it just receives a `SafeData` and knows the data has been through a trust check.
+
+## SafeData: The Compiler as Security Auditor
+
+All of the mechanisms above converge on a single type: `SafeData`. This is a Data packet whose signature has been verified -- either through the full certificate chain or via local trust.
 
 ```rust
 pub struct SafeData {
@@ -166,40 +237,8 @@ pub enum TrustPath {
 }
 ```
 
-## CertCache
+The `pub(crate)` fields are the key detail. Application code cannot construct a `SafeData` -- only `Validator::validate_chain()` and `SafeData::from_local_trusted()` (both inside the `ndn-security` crate) can create one. This is the typestate pattern: the type itself encodes a security invariant.
 
-Certificates are just Data packets with specific content (the subject's public key). The `CertCache` stores resolved `Certificate` structs, each containing:
+Any API that accepts `SafeData` instead of `Data` is making a compile-time assertion: "this function only operates on verified data." If a developer accidentally tries to pass an unverified `Data` packet to such a function, the code won't compile. There's no runtime check to forget, no boolean flag to misread, no error to swallow. The compiler is the security auditor, and it never takes a day off.
 
-- Certificate name and public key bytes
-- Validity period (`valid_from` / `valid_until` in nanoseconds)
-- Issuer name (for chain walking)
-- Signed region and signature value (for verifying the cert itself)
-
-When a certificate is not in the cache, the `CertFetcher` sends a normal Interest for the certificate name. The fetched Data is parsed, validated, and cached for future use.
-
-## Local Trust for AppFace
-
-Applications connected via shared memory (SHM) or Unix sockets are locally trusted based on process credentials. On Unix systems, `SO_PEERCRED` provides the connecting process's UID. Data from locally trusted faces skips cryptographic verification and receives a `TrustPath::LocalFace { uid }` path:
-
-```rust
-SafeData::from_local_trusted(data, uid)
-```
-
-This avoids the overhead of Ed25519 verification for in-process communication while preserving the typestate guarantee that all forwarded Data has been through a trust check.
-
-## KeyChain Facade
-
-The `KeyChain` type in `ndn-app` provides an ergonomic interface for application-level security:
-
-```rust
-let keychain = KeyChain::new();  // In-memory (ephemeral)
-// Or: let keychain = KeyChain::open("/path/to/pib", &identity)?;
-
-// Generate identity with Ed25519 key + self-signed certificate
-let signer = keychain.create_identity("/ndn/app/sensor", None)?;
-
-// Build a validator with the keychain's trust anchors
-let validator = keychain.validator();
-```
-
-`KeyChain::open` loads keys from a persistent PIB (Public Information Base) directory backed by `FilePib`, enabling key reuse across application restarts.
+This is especially powerful in the forwarding pipeline. The Content Store insertion stage, for example, can require `SafeData` -- guaranteeing that the cache will never serve unverified content, even if a bug elsewhere in the pipeline skips validation. The guarantee is structural, not procedural.

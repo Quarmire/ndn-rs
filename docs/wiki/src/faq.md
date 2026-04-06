@@ -4,57 +4,86 @@
 
 ### Is ndn-rs production-ready?
 
-ndn-rs is a research and development platform. The core forwarding pipeline, face implementations, and management protocol are functional. It is suitable for research deployments, prototyping, and embedded NDN applications. Production use should evaluate stability and feature completeness for the specific use case.
+ndn-rs is a research and development platform. The core forwarding pipeline, face implementations, and management protocol are all functional, and the stack is suitable for research deployments, prototyping, and embedded NDN applications. If you are considering production use, evaluate stability and feature completeness against your specific requirements -- the codebase is moving quickly and APIs may still shift.
 
-### How does ndn-rs relate to NFD?
+### How does ndn-rs relate to NFD and ndn-cxx?
 
-NFD (NDN Forwarding Daemon) is the reference C++ implementation maintained by the NDN project. ndn-rs is an independent Rust implementation that follows the same NDN specifications (RFC 8569, RFC 8609) but takes different architectural approaches -- most notably being a library rather than a daemon, and using Rust's ownership model for pipeline safety.
+The mapping is straightforward once you see the two layers:
+
+- **ndn-rs** (the library) is analogous to **ndn-cxx** (the C++ library). Both provide the core data structures, TLV codec, forwarding engine, and face abstractions that applications link against.
+- **ndn-router** (the standalone binary) is analogous to **NFD** (the daemon). Both are thin executables that instantiate the library, open network faces, and run a forwarding loop.
+
+The key difference is architectural philosophy. ndn-cxx and NFD are written in C++ with class hierarchies and virtual dispatch. ndn-rs models the same concepts as composable data pipelines with Rust traits, `Arc`-based shared ownership, and zero-copy `Bytes` throughout. Both follow the same NDN specifications (RFC 8569, RFC 8609), so they interoperate on the wire.
+
+### What's the difference between ndn-rs and ndn-router?
+
+ndn-rs is the library crate -- it contains the forwarding engine, PIT, FIB, Content Store, face abstractions, strategies, and the management protocol. You can embed it directly in your application.
+
+ndn-router is a standalone binary that depends on ndn-rs. It reads a configuration file, opens network faces (UDP, TCP, Ethernet, etc.), starts the management listener, and runs the forwarding pipeline. If you just want a forwarder running on a machine, ndn-router is what you install. If you want to build NDN into your own application, you depend on ndn-rs as a library.
+
+### Can I use ndn-rs in my application without running ndn-router?
+
+Absolutely -- this is one of the main design goals. Your application can instantiate the forwarding engine directly, create in-process `AppFace` channels, and exchange Interests and Data without any IPC overhead. The latency for an in-process `AppFace` round-trip is on the order of ~20 ns via `mpsc` channels, compared to ~2 us for Unix socket IPC to a separate daemon.
+
+That said, if your application needs to talk to remote NDN nodes or other local applications, you will want either ndn-router running as a forwarder, or your application opening its own network faces through the library.
 
 ### Can ndn-rs interoperate with NFD?
 
-Yes. ndn-rs uses the standard NDN TLV wire format and NDNLPv2 link protocol. UDP, TCP, and WebSocket faces can connect to NFD nodes. The management protocol follows NFD's command format for compatibility.
+Yes. ndn-rs uses the standard NDN TLV wire format and NDNLPv2 link protocol, so UDP, TCP, and WebSocket faces can connect to NFD nodes without any translation layer. The management protocol follows NFD's command format for compatibility, meaning tools written for NFD (like nfdc) can also manage ndn-router.
+
+### How does ndn-rs handle security differently from ndn-cxx?
+
+NDN's security model is baked into the data itself -- every Data packet carries a signature, and consumers validate signatures against a trust schema. ndn-rs implements the same signing and validation algorithms (ECDSA, RSA, HMAC-SHA256) but leans on Rust's type system to enforce correctness at compile time.
+
+The `SafeData` vs `Data` distinction is a good example: the type system ensures that only signature-verified data can be inserted into the Content Store or forwarded to faces. In ndn-cxx, this invariant is enforced by convention and runtime checks. In ndn-rs, passing unverified `Data` where `SafeData` is expected is a compile error.
+
+The `ndn-security` crate also provides the trust schema engine and keychain, but unlike ndn-cxx it avoids C library dependencies (no OpenSSL) in favor of pure-Rust cryptography crates (`ring`, `p256`, `rsa`).
 
 ### Does ndn-rs support no_std / embedded?
 
-The `ndn-tlv` and `ndn-packet` crates compile with `no_std` (with `alloc`). The `ndn-embedded` crate provides a minimal forwarding engine for Cortex-M and similar targets. See the [embedded CI workflow](https://github.com/user/ndn-rs/actions) for tested targets.
+The `ndn-tlv` and `ndn-packet` crates compile with `no_std` (with `alloc`). The `ndn-embedded` crate provides a minimal forwarding engine for Cortex-M and similar targets. See the [embedded CI workflow](https://github.com/Quarmire/ndn-rs/actions) for tested targets.
 
 ## Architecture
 
 ### Why is ndn-rs a library instead of a daemon?
 
-The library approach means the forwarding engine can be embedded directly in applications. In-process `AppFace` communication via `mpsc` channels has ~20 ns latency vs ~2 us for Unix socket IPC. For standalone use, `ndn-router` is a thin binary that instantiates the library.
+The analogy to draw is with ndn-cxx, not NFD. ndn-cxx is the C++ library that applications link against; NFD is one particular binary built on top of it. ndn-rs takes the same approach: the forwarding engine is a library, and ndn-router is one binary that uses it.
+
+This means applications can embed the full forwarding engine directly, which unlocks several things. In-process communication through `AppFace` channels avoids IPC serialization entirely. The compiler can see through the entire pipeline and optimize accordingly. And applications that need custom forwarding behavior (novel strategies, application-layer caching, compute-on-fetch) can extend the engine in-process rather than through an external plugin API.
+
+For users who just want a standalone forwarder, ndn-router provides exactly that -- a thin binary that reads a config file and runs the engine.
 
 ### Why DashMap for the PIT instead of a single Mutex?
 
-The PIT is on the hot path of every packet. A single `Mutex` serializes all pipeline tasks. `DashMap` provides sharded concurrent access -- multiple pipeline tasks can insert/lookup PIT entries in parallel as long as they hash to different shards.
+The PIT sits on the hot path of every single packet. A single `Mutex` would serialize all pipeline tasks behind one lock, turning your multi-core machine into a single-threaded forwarder under load. `DashMap` provides sharded concurrent access -- multiple pipeline tasks can insert and look up PIT entries in parallel as long as they hash to different shards. In practice, NDN traffic has enough name diversity that shard contention is rare.
 
 ### Why does the CS store wire-format Bytes?
 
-A Content Store hit sends the cached Data directly to the requesting face. Storing wire-format `Bytes` means a CS hit is a `face.send(cached_bytes.clone())` -- one atomic reference count increment. No re-encoding from a decoded `Data` struct back to wire format.
+When you get a Content Store hit, the goal is to send the cached Data packet back to the requesting face as fast as possible. Storing wire-format `Bytes` means a CS hit boils down to `face.send(cached_bytes.clone())` -- one atomic reference count increment and you are done. There is no re-encoding step from a decoded `Data` struct back to TLV wire format. For a forwarder where CS hit rate directly determines throughput, this matters.
 
 ### Why Arc\<Name\> everywhere?
 
-A single Interest creates references to its name in the PIT entry, FIB lookup, CS lookup, and pipeline context. `Arc<Name>` shares one allocation across all of these without copying the name's component bytes.
+A single Interest creates references to its name in the PIT entry, the FIB lookup, the CS lookup, and the pipeline context -- four places that all need the same name simultaneously. `Arc<Name>` shares one heap allocation across all of them without copying the name's component bytes. Combined with `SmallVec<[NameComponent; 8]>` for stack-allocating typical short names, this keeps per-packet allocation pressure low.
 
 ## Performance
 
 ### What throughput can ndn-rs achieve?
 
-Run `cargo bench -p ndn-engine` for pipeline throughput numbers on your hardware. Key factors: TLV decode cost scales with name length, CS lookup depends on backend and hit rate, PIT operations are O(1) via DashMap hash lookup.
+Run `cargo bench -p ndn-engine` for pipeline throughput numbers on your hardware. The main cost centers are TLV decode (scales with name length), CS lookup (depends on backend and hit rate), and PIT operations (O(1) via DashMap hash lookup). The pipeline is designed so that a CS hit short-circuits before most of the Interest pipeline runs, which is where the zero-copy `Bytes` storage pays off the most.
 
 ### How do I profile ndn-rs?
 
-The library uses `tracing` for structured logging. Enable `RUST_LOG=ndn_engine=trace` for per-packet traces. For CPU profiling, use `cargo flamegraph` or `perf record` on the router binary.
+The library uses the `tracing` crate for structured logging with per-packet spans. Set `RUST_LOG=ndn_engine=trace` for detailed per-packet traces, or `RUST_LOG=ndn_engine=debug` for a less verbose view of forwarding decisions. For CPU profiling, `cargo flamegraph` or `perf record` on the ndn-router binary will show you where time is spent.
 
 ## Development
 
 ### How do I add a new face type?
 
-See the [Implementing a Face](./guides/implementing-face.md) guide. Implement the `Face` trait, add a `FaceKind` variant, and register with the `FaceTable`.
+See the [Implementing a Face](./guides/implementing-face.md) guide. The short version: implement the `Face` trait (`recv` and `send`), add a `FaceKind` variant, and register with the `FaceTable`.
 
 ### How do I add a custom forwarding strategy?
 
-See the [Implementing a Strategy](./guides/implementing-strategy.md) guide. Implement the `Strategy` trait and register via the `StrategyTable`.
+See the [Implementing a Strategy](./guides/implementing-strategy.md) guide. Implement the `Strategy` trait, which receives an immutable `StrategyContext` and returns a `ForwardingAction`, then register via the `StrategyTable`.
 
 ### How do I run the benchmarks?
 
