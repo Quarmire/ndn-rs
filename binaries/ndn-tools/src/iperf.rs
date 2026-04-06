@@ -264,11 +264,6 @@ async fn run_server(
         Err(e) => eprintln!("  service discovery: not available ({e}), skipping"),
     }
 
-    // Monitor the router control socket for disconnection.  When the router
-    // exits, this fires the internal CancellationToken, causing recv() to
-    // return None on both SHM and Unix transports.
-    client.spawn_disconnect_monitor(Duration::from_secs(5));
-
     let transport = if client.is_shm() { "SHM" } else { "Unix" };
     eprintln!("ndn-iperf server: prefix={prefix} transport={transport} payload={payload_size}B");
     if sign {

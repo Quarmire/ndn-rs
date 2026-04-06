@@ -25,7 +25,7 @@
 /// ```
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use bytes::Bytes;
 use tokio::sync::Mutex;
@@ -78,6 +78,8 @@ pub struct RouterClient {
     cancel: CancellationToken,
     /// Set when the control face health monitor detects disconnection.
     dead: Arc<AtomicBool>,
+    /// Guards single-start of the disconnect monitor (0 = not started, 1 = started).
+    monitor_started: AtomicU8,
 }
 
 impl RouterClient {
@@ -121,6 +123,7 @@ impl RouterClient {
                         transport,
                         cancel,
                         dead,
+                        monitor_started: AtomicU8::new(0),
                     });
                 }
                 Err(e) => {
@@ -137,6 +140,7 @@ impl RouterClient {
             transport: DataTransport::Unix,
             cancel,
             dead,
+            monitor_started: AtomicU8::new(0),
         })
     }
 
@@ -197,8 +201,12 @@ impl RouterClient {
 
     /// Receive a packet from the data plane.
     ///
-    /// Returns `None` if the data channel is closed.
+    /// Returns `None` if the data channel is closed or the router has
+    /// disconnected.  On the first call, automatically starts the disconnect
+    /// monitor (see [`RouterClient::spawn_disconnect_monitor`]) so that callers
+    /// do not need to start it explicitly.
     pub async fn recv(&self) -> Option<Bytes> {
+        self.start_monitor_once();
         match &self.transport {
             #[cfg(all(unix, feature = "spsc-shm"))]
             DataTransport::Shm { handle, .. } => handle.recv().await,
@@ -206,6 +214,58 @@ impl RouterClient {
                 let _guard = self.recv_lock.lock().await;
                 self.control.recv().await.ok()
             }
+        }
+    }
+
+    /// Start the disconnect monitor the first time it is needed.
+    ///
+    /// In **SHM mode** the data plane reads from shared memory and does not
+    /// observe socket closure directly.  This starts a background task that
+    /// drains the control socket (which is otherwise idle after setup) and
+    /// fires the internal [`CancellationToken`] when the socket closes.
+    ///
+    /// In **Unix mode** the data `recv()` already returns `None` on socket
+    /// closure, so no additional monitor is needed.
+    ///
+    /// Safe to call multiple times — only one monitor is ever started.
+    fn start_monitor_once(&self) {
+        if self
+            .monitor_started
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return; // already started
+        }
+
+        #[cfg(all(unix, feature = "spsc-shm"))]
+        if matches!(&self.transport, DataTransport::Shm { .. }) {
+            let control = Arc::clone(&self.control);
+            let cancel = self.cancel.clone();
+            let dead = Arc::clone(&self.dead);
+            tokio::spawn(async move {
+                // In SHM mode the control socket is used only for management
+                // commands.  After setup, no traffic is expected on it.  Any
+                // recv error means the socket was closed (router died).
+                // Stray successful reads (e.g. unsolicited router messages) are
+                // drained harmlessly; only errors trigger cancellation.
+                loop {
+                    tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        result = control.recv() => {
+                            match result {
+                                Ok(_) => {
+                                    // Stray data on control socket — drain it.
+                                }
+                                Err(_) => {
+                                    dead.store(true, Ordering::Relaxed);
+                                    cancel.cancel();
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            });
         }
     }
 
@@ -223,52 +283,19 @@ impl RouterClient {
         self.dead.load(Ordering::Relaxed)
     }
 
-    /// Spawn a background task that detects router disconnection.
+    /// Explicitly start the disconnect monitor.
     ///
-    /// When the router process dies, the control socket closes.  In SHM mode
-    /// `recv()` reads from shared memory and does not observe the socket
-    /// closure — it would block forever.  This monitor detects the closure by
-    /// sending a lightweight probe on the control face every `interval`.  When
-    /// send fails (broken pipe / connection reset), it fires the internal
-    /// CancellationToken, which causes [`SpscHandle::recv`] to return `None`
-    /// promptly.
+    /// This is called automatically on the first [`RouterClient::recv`] call,
+    /// so most applications do not need to call this directly.
     ///
-    /// In Unix-only mode the data `recv()` already returns `None` on closure,
-    /// so the monitor is not strictly necessary; calling it is still harmless.
+    /// In **SHM mode** the monitor watches the control socket for closure
+    /// (no probes are sent; the control socket is idle after setup).  In
+    /// **Unix mode** the data `recv()` already returns `None` on closure, so
+    /// this is a no-op.
     ///
-    /// **Call this once, after all setup management commands are complete.**
-    /// The monitor also sends on the control face; starting it before
-    /// `register_prefix` / `service_announce` avoids any ordering issues with
-    /// management responses.
-    pub fn spawn_disconnect_monitor(&self, interval: std::time::Duration) {
-        let control = Arc::clone(&self.control);
-        let cancel = self.cancel.clone();
-        let dead = Arc::clone(&self.dead);
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(interval);
-            ticker.tick().await; // skip first immediate tick (connect just succeeded)
-            loop {
-                tokio::select! {
-                    _ = cancel.cancelled() => break,
-                    _ = ticker.tick() => {
-                        // Probe via send — fails immediately when the socket is closed.
-                        // Sends a minimal status Interest; the router may Nack or
-                        // silently drop it — we only care whether send() succeeds.
-                        let probe = ndn_packet::encode::encode_interest(
-                            &"/localhost/nfd/status/general"
-                                .parse()
-                                .expect("valid probe name"),
-                            None,
-                        );
-                        if control.send(probe).await.is_err() {
-                            dead.store(true, Ordering::Relaxed);
-                            cancel.cancel();
-                            break;
-                        }
-                    }
-                }
-            }
-        });
+    /// Safe to call multiple times — only one monitor is ever started.
+    pub fn spawn_disconnect_monitor(&self) {
+        self.start_monitor_once();
     }
 
     /// Check if the control face is still connected by attempting a
