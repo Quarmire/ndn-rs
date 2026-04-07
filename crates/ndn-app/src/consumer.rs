@@ -49,13 +49,48 @@ impl Consumer {
     /// Express an Interest by name and return the decoded Data.
     ///
     /// Uses [`DEFAULT_INTEREST_LIFETIME`] for the wire Interest and
-    /// [`DEFAULT_TIMEOUT`] for the local wait. For control over these,
-    /// use [`fetch_wire`](Self::fetch_wire) with an [`InterestBuilder`].
+    /// [`DEFAULT_TIMEOUT`] for the local wait. To set hop limit,
+    /// application parameters, or forwarding hints, use
+    /// [`fetch_with`](Self::fetch_with).
     pub async fn fetch(&mut self, name: impl Into<Name>) -> Result<Data, AppError> {
         let wire = InterestBuilder::new(name)
             .lifetime(DEFAULT_INTEREST_LIFETIME)
             .build();
         self.fetch_wire(wire, DEFAULT_TIMEOUT).await
+    }
+
+    /// Express an Interest built with [`InterestBuilder`] and return the decoded Data.
+    ///
+    /// The local wait timeout is derived from the builder's Interest lifetime
+    /// (+ 500 ms forwarding buffer). This is the right method when you need
+    /// hop limit, forwarding hints, or application parameters:
+    ///
+    /// ```no_run
+    /// # async fn example(mut consumer: ndn_app::Consumer) -> anyhow::Result<()> {
+    /// use ndn_packet::encode::InterestBuilder;
+    ///
+    /// // Hop limit: limit forwarding to 4 hops.
+    /// let data = consumer.fetch_with(
+    ///     InterestBuilder::new("/ndn/remote/data").hop_limit(4)
+    /// ).await?;
+    ///
+    /// // Forwarding hint: reach a producer via a delegation prefix.
+    /// let data = consumer.fetch_with(
+    ///     InterestBuilder::new("/alice/files/photo.jpg")
+    ///         .forwarding_hint(vec!["/campus/ndn-hub".parse()?])
+    /// ).await?;
+    ///
+    /// // Application parameters: parameterised fetch (e.g. RPC / query).
+    /// let data = consumer.fetch_with(
+    ///     InterestBuilder::new("/service/query")
+    ///         .app_parameters(b"filter=recent&limit=10")
+    /// ).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn fetch_with(&mut self, builder: InterestBuilder) -> Result<Data, AppError> {
+        let (wire, timeout) = builder.build_with_timeout();
+        self.fetch_wire(wire, timeout).await
     }
 
     /// Express a pre-encoded Interest and return the decoded Data.
