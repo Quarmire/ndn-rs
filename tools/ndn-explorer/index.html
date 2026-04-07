@@ -13,9 +13,14 @@
       <button class="nav-btn active" data-view="layer-map">Layers</button>
       <button class="nav-btn" data-view="dep-graph">Graph</button>
       <button class="nav-btn" data-view="pipeline-trace">Pipeline</button>
+      <button class="nav-btn" data-view="packet-explorer">Packets</button>
+      <button class="nav-btn" data-view="topology">Topology</button>
+      <button class="nav-btn" data-view="security">Security</button>
       <button class="nav-btn" data-view="tour">Tour</button>
     </div>
     <a class="nav-wiki-link" href="../wiki/" target="_blank" rel="noopener" title="Open the ndn-rs wiki">Wiki ↗</a>
+    <span id="wasm-badge" class="wasm-badge" title="WASM status">WASM —</span>
+    <button id="theme-toggle" class="theme-toggle-btn" title="Toggle dark / light mode" aria-label="Toggle theme">☀</button>
     <input type="text" id="search-box" placeholder="Search crates, types...  ( / )">
   </nav>
   <main>
@@ -24,6 +29,9 @@
     <div id="type-detail" class="view"></div>
     <div id="dep-graph" class="view"></div>
     <div id="pipeline-trace" class="view"></div>
+    <div id="packet-explorer" class="view"></div>
+    <div id="topology" class="view"></div>
+    <div id="security" class="view"></div>
     <div id="search" class="view"></div>
     <div id="tour" class="view"></div>
   </main>

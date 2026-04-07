@@ -1,8 +1,12 @@
 import { LayerMap } from './views/layer-map.js';
+import { initWasm } from './wasm-types.js';
 import { CrateDetail } from './views/crate-detail.js';
 import { TypeDetail } from './views/type-detail.js';
 import { DepGraph } from './views/dep-graph.js';
 import { PipelineTrace } from './views/pipeline-trace.js';
+import { PacketExplorer } from './views/packet-explorer.js';
+import { TopologyView } from './views/topology.js';
+import { SecurityAnim } from './views/security-anim.js';
 import { Search } from './views/search.js';
 import { Tour } from './views/tour.js';
 
@@ -42,8 +46,11 @@ class App {
       'crate-detail':   new CrateDetail(containers['crate-detail'], this),
       'type-detail':    new TypeDetail(containers['type-detail'], this),
       'dep-graph':      new DepGraph(containers['dep-graph'], this),
-      'pipeline-trace': new PipelineTrace(containers['pipeline-trace'], this),
-      'search':         new Search(containers['search'], this),
+      'pipeline-trace':  new PipelineTrace(containers['pipeline-trace'], this),
+      'packet-explorer': new PacketExplorer(containers['packet-explorer'], this),
+      'topology':        new TopologyView(containers['topology'], this),
+      'security':        new SecurityAnim(containers['security'], this),
+      'search':          new Search(containers['search'], this),
       'tour':           new Tour(containers['tour'], this),
     };
 
@@ -87,6 +94,22 @@ class App {
     });
 
     this.navigate('layer-map');
+
+    // Attempt WASM load in the background — views fall back to pure-JS if absent.
+    this._initWasm();
+  }
+
+  async _initWasm() {
+    const badge = /** @type {HTMLElement|null} */ (document.getElementById('wasm-badge'));
+    const loaded = await initWasm();
+    if (badge) {
+      badge.textContent = loaded ? 'WASM ✓' : 'WASM —';
+      badge.classList.toggle('wasm-badge-on', loaded);
+      badge.title = loaded
+        ? 'Rust WASM simulation loaded — real NDN packet processing active'
+        : 'WASM not built — using pure-JS simulation fallback.\n' +
+          'Run: wasm-pack build crates/ndn-wasm --target web --out-dir tools/ndn-explorer/wasm';
+    }
   }
 
   navigate(viewId, params) {
@@ -144,3 +167,22 @@ class App {
 
 const app = new App();
 app.init();
+
+// ── Theme toggle ──────────────────────────────────────────────────────────────
+
+(function initTheme() {
+  const STORAGE_KEY = 'ndn-explorer-theme';
+  const btn = /** @type {HTMLButtonElement|null} */ (document.getElementById('theme-toggle'));
+  const root = document.documentElement;
+
+  const saved = localStorage.getItem(STORAGE_KEY) ?? 'dark';
+  root.setAttribute('data-theme', saved);
+  if (btn) btn.textContent = saved === 'light' ? '☾' : '☀';
+
+  btn?.addEventListener('click', () => {
+    const next = root.getAttribute('data-theme') === 'light' ? 'dark' : 'light';
+    root.setAttribute('data-theme', next);
+    localStorage.setItem(STORAGE_KEY, next);
+    btn.textContent = next === 'light' ? '☾' : '☀';
+  });
+})();
