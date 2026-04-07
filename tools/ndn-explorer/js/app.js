@@ -15,6 +15,7 @@ export const LAYER_COLORS = {
   foundation:  '#79c0ff',
   faces:       '#3fb950',
   pipeline:    '#d2a8ff',
+  identity:    '#d29922',
   engine:      '#58a6ff',
   binaries:    '#f0883e',
   simulation:  '#ff7b72',

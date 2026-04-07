@@ -1,16 +1,17 @@
 {
-  "generated": "2026-04-06",
+  "generated": "2026-04-07",
   "layers": [
-    { "num": 4, "id": "foundation", "label": "Foundation" },
-    { "num": 3, "id": "faces", "label": "Face Implementations" },
-    { "num": 2, "id": "pipeline", "label": "Pipeline, Strategy, Security" },
-    { "num": 1, "id": "engine", "label": "Engine & Application" },
-    { "num": 0, "id": "binaries", "label": "Binaries" },
-    { "num": -1, "id": "simulation", "label": "Simulation" },
-    { "num": -2, "id": "research", "label": "Research Extensions" },
-    { "num": -3, "id": "embedded", "label": "Embedded" },
-    { "num": -4, "id": "bindings", "label": "Language Bindings" },
-    { "num": -5, "id": "examples", "label": "Examples" }
+    { "num": 4,   "id": "foundation", "label": "Foundation" },
+    { "num": 3,   "id": "faces",      "label": "Face Implementations" },
+    { "num": 2,   "id": "pipeline",   "label": "Pipeline, Strategy, Security" },
+    { "num": 1.5, "id": "identity",   "label": "Identity & PKI" },
+    { "num": 1,   "id": "engine",     "label": "Engine & Application" },
+    { "num": 0,   "id": "binaries",   "label": "Binaries" },
+    { "num": -1,  "id": "simulation", "label": "Simulation" },
+    { "num": -2,  "id": "research",   "label": "Research Extensions" },
+    { "num": -3,  "id": "embedded",   "label": "Embedded" },
+    { "num": -4,  "id": "bindings",   "label": "Language Bindings" },
+    { "num": -5,  "id": "examples",   "label": "Examples" }
   ],
   "crates": [
     {
@@ -394,6 +395,74 @@
       "features": {},
       "no_std": false,
       "path": "examples/discovery-lan"
+    },
+    {
+      "name": "ndn-did",
+      "layer": "identity",
+      "layer_num": 1.5,
+      "description": "NDN DID method (did:ndn): encode NDN names as W3C Decentralized Identifiers and resolve DID Documents over the NDN network",
+      "key_types": ["DidDocument", "VerificationMethod", "Service", "ServiceEndpoint", "VerificationRef", "DidError", "DidResolver", "NdnDidResolver", "KeyDidResolver", "UniversalResolver", "NdnFetchFn", "name_to_did", "did_to_name", "cert_to_did_document", "did_document_to_trust_anchor"],
+      "workspace_deps": ["ndn-packet", "ndn-security"],
+      "features": {},
+      "no_std": false,
+      "path": "crates/ndn-did"
+    },
+    {
+      "name": "ndn-cert",
+      "layer": "identity",
+      "layer_num": 1.5,
+      "description": "NDNCERT: NDN certificate management protocol — issuance, challenge handling (email, token, possession), CA logic, and enrollment sessions",
+      "key_types": ["CertRequest", "EnrollmentSession", "CaConfig", "CaProfile", "CaState", "ChallengeRequest", "ChallengeResponse", "ChallengeState", "ChallengeOutcome", "ChallengeStatus", "PolicyDecision", "DelegationPolicy", "HierarchicalPolicy", "NamespacePolicy", "ChallengeHandler", "TokenChallenge", "PossessionChallenge", "TokenStore", "NewResponse", "CertError"],
+      "workspace_deps": ["ndn-packet", "ndn-security", "ndn-did"],
+      "features": {},
+      "no_std": false,
+      "path": "crates/ndn-cert"
+    },
+    {
+      "name": "ndn-identity",
+      "layer": "engine",
+      "layer_num": 1,
+      "description": "NDN identity management: NdnIdentity lifecycle, NDNCERT enrollment, certificate renewal, and fleet zero-touch provisioning",
+      "key_types": ["NdnIdentity", "NdncertCa", "NdncertCaBuilder", "NdncertClient", "RenewalHandle", "RenewalPolicy", "DeviceConfig", "EnrollConfig", "IdentityError", "FactoryCredential", "ChallengeParams", "start_renewal"],
+      "workspace_deps": ["ndn-packet", "ndn-security", "ndn-cert", "ndn-did", "ndn-app"],
+      "features": {},
+      "no_std": false,
+      "path": "crates/ndn-identity"
+    },
+    {
+      "name": "ndn-mobile",
+      "layer": "engine",
+      "layer_num": 1,
+      "description": "Embedded NDN forwarder for Android and iOS/iPadOS — MobileEngine wraps ForwarderEngine with platform-appropriate faces and a Bluetooth COBS transport",
+      "key_types": ["MobileEngine", "MobileEngineBuilder", "BluetoothFace", "bluetooth_face_from_parts"],
+      "workspace_deps": ["ndn-engine", "ndn-app", "ndn-discovery", "ndn-face-net", "ndn-face-local", "ndn-face-serial", "ndn-packet", "ndn-security", "ndn-store", "ndn-transport"],
+      "features": {
+        "fjall": ["ndn-store/fjall"]
+      },
+      "no_std": false,
+      "path": "crates/ndn-mobile"
+    },
+    {
+      "name": "ndn-wasm",
+      "layer": "simulation",
+      "layer_num": -1,
+      "description": "WebAssembly simulation bindings for ndn-rs: synchronous in-browser NDN pipeline, topology sandbox, TLV inspector, and stage trace events",
+      "key_types": ["PipelineConfig", "PipelineTrace", "NodeSnapshot", "MeasurementsSnapshot", "CsEntry", "PitEntry", "FibEntry", "FibNexthop", "PitInRecord", "EwmaRtt", "SimCs", "NodeKind", "StrategyType"],
+      "workspace_deps": ["ndn-tlv", "ndn-packet"],
+      "features": {},
+      "no_std": false,
+      "path": "crates/ndn-wasm"
+    },
+    {
+      "name": "did-ndn-driver",
+      "layer": "binaries",
+      "layer_num": 0,
+      "description": "DIF Universal Resolver HTTP driver for the did:ndn DID method — exposes an Axum REST endpoint at /.well-known/did-configuration and /1.0/identifiers/{did}",
+      "key_types": [],
+      "workspace_deps": ["ndn-did"],
+      "features": {},
+      "no_std": false,
+      "path": "binaries/did-ndn-driver"
     }
   ]
 }
