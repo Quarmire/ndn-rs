@@ -90,6 +90,14 @@ Two higher-level discovery protocols layer on top: `EpidemicGossip` for pull-gos
 
 **PSync (Partial Sync via IBF)** — nodes exchange Invertible Bloom Filters representing their local data sets. Subtracting two IBFs yields the symmetric difference: what each side has that the other lacks. Useful for larger data sets where exchanging full state vectors would be expensive.
 
+### Mobile Support (Android / iOS)
+
+`ndn-mobile` packages the forwarder for Android and iOS. It runs in-process inside the app binary — no system daemon — using `AppFace` channels (zero IPC overhead) for app traffic and standard UDP faces for LAN/WAN connectivity.
+
+Key features: `MobileEngine::builder()` with mobile-tuned defaults (8 MB CS, single pipeline thread, full security validation); `with_udp_multicast` + `with_discovery` for LAN neighbor discovery; `suspend_network_faces` / `resume_network_faces` for battery-efficient app lifecycle; `bluetooth_face_from_parts` for wrapping a platform-supplied async stream with COBS framing; optional persistent CS via the `fjall` feature.
+
+See the [Mobile Apps guide](../guides/mobile-apps.md).
+
 ### The Embedded Forwarder
 
 `ndn-embedded` is a `#![no_std]` NDN forwarder for ARM Cortex-M, RISC-V, and ESP32. It shares only the TLV codec with the full stack; everything else is const-generic and stack-allocated. `Pit<N>` and `Fib<N>` size is fixed at compile time. The `Forwarder` is single-threaded; `run_one_tick()` purges expired PIT entries. No heap allocator required for the core.
@@ -127,5 +135,5 @@ The major gaps between this release and a stable 1.0:
 - **ASF (Adaptive Smoothed RTT-based Forwarding) strategy** — the production-grade adaptive forwarding strategy is not yet implemented. BestRoute and Multicast are stable; ASF requires the measurements table, which exists, but the adaptation logic is not wired.
 - **PSync network layer** — the IBF data structure is implemented; the Interest/Data exchange protocol that runs it over NDN faces is not.
 - **Real engine in the browser** — `ndn-wasm` is a standalone simulation. Compiling the real `ndn-engine` to WASM requires replacing `DashMap` (thread-local state), removing `rt-multi-thread` from Tokio, and substituting `wasm_bindgen_futures::spawn_local` for `tokio::spawn`. None of these are fundamental; they're a few days of careful refactoring.
-- **`BluetoothFace`** — struct exists, `Face` impl returns `Closed`. Needs a Tokio-compatible RFCOMM crate.
+- **Bluetooth RFCOMM crate** — `BluetoothFace` (`ndn-mobile`) accepts any `AsyncRead + AsyncWrite` pair and works correctly with a platform-supplied stream. What's missing is a pure-Rust async crate for opening RFCOMM connections natively (without going through Android/iOS native APIs). Once such a crate exists, `ndn-mobile` can open Bluetooth connections directly from Rust rather than requiring a native bridge.
 - **API stabilization** — essentially every public API has at least one rough edge. The 0.2.0 cycle will focus on stabilizing `ndn-app`, `ndn-packet`, and `ndn-transport` as the crates most likely to be used by downstream code.

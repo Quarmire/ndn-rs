@@ -177,8 +177,10 @@ async fn main() -> anyhow::Result<()> {
 The embedded mode is useful for:
 
 - **Integration tests** — spin up a full forwarding engine in `#[tokio::test]` without any external process
-- **Mobile / Android** — ship the engine as part of your app binary; no system daemon required
+- **Mobile / Android / iOS** — ship the engine as part of your app binary; no system daemon required
 - **CLI tools** — tools like `ndn-peek` and `ndn-ping` embed the engine so they work on machines that don't have `ndn-router` running
+
+> **Mobile shortcut:** If you are targeting Android or iOS, use `ndn-mobile` instead of assembling `EngineBuilder` by hand. It pre-configures the engine with mobile-tuned defaults (8 MB CS, single pipeline thread, security enabled), exposes background suspend/resume lifecycle hooks, and provides Bluetooth face support. See the [Mobile Apps guide](./mobile-apps.md).
 
 ## Synchronous Applications
 

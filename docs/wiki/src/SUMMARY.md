@@ -43,6 +43,7 @@
 - [Implementing a Face](./guides/implementing-face.md)
 - [Implementing a Strategy](./guides/implementing-strategy.md)
 - [WASM Strategies](./guides/wasm-strategies.md)
+- [Mobile Apps (Android / iOS)](./guides/mobile-apps.md)
 - [Embedded Targets](./guides/embedded-targets.md)
 - [CLI Tools](./guides/cli-tools.md)
 - [Performance Tuning](./guides/performance-tuning.md)

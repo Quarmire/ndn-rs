@@ -111,17 +111,30 @@ let safe_data = consumer
 
 Run the full NDN forwarding engine inside your binary. No system daemon required.
 
-**API:** `ndn_app::EngineBuilder` + `AppFace` + `Consumer::from_handle`
-
-Refer to the [Embedded Engine section](../guides/building-ndn-apps.md#mode-2-embedded-engine) of the app guide.
+**For Android / iOS:** use `ndn_mobile::MobileEngine` — a pre-configured wrapper with mobile-tuned defaults, lifecycle suspend/resume, and Bluetooth face support. See the [Mobile Apps guide](../guides/mobile-apps.md).
 
 ```rust
-let (face, handle) = AppFace::new(FaceId(1), 64);
-let (engine, _shutdown) = EngineBuilder::new(EngineConfig::default())
-    .face(face)
-    .build()
-    .await?;
+// ndn-mobile: one-liner setup, mobile-tuned defaults
+use ndn_mobile::{Consumer, MobileEngine};
+
+let (engine, handle) = MobileEngine::builder().build().await?;
 let mut consumer = Consumer::from_handle(handle);
+let mut producer = engine.register_producer("/my/prefix");
+```
+
+**For desktop / testing:** use `ndn_app::EngineBuilder` directly. See the [Embedded Engine section](../guides/building-ndn-apps.md#mode-2-embedded-engine).
+
+```rust
+use ndn_app::EngineBuilder;
+use ndn_engine::EngineConfig;
+use ndn_face_local::AppFace;
+use ndn_transport::FaceId;
+
+let mut builder = EngineBuilder::new(EngineConfig::default());
+let app_face_id = builder.alloc_face_id();
+let (face, handle) = AppFace::new(app_face_id, 64);
+let (engine, _shutdown) = builder.face(face).build().await?;
+let mut consumer = ndn_app::Consumer::from_handle(handle);
 ```
 
 ---
