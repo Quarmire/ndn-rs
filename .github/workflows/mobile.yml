@@ -1,0 +1,202 @@
+name: mobile — cross-compile check
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/ndn-tlv/**"
+      - "crates/ndn-packet/**"
+      - "crates/ndn-transport/**"
+      - "crates/ndn-face-net/**"
+      - "crates/ndn-face-local/**"
+      - "crates/ndn-pipeline/**"
+      - "crates/ndn-strategy/**"
+      - "crates/ndn-security/**"
+      - "crates/ndn-engine/**"
+      - "crates/ndn-app/**"
+      - "crates/ndn-ipc/**"
+      - "crates/ndn-config/**"
+      - "crates/ndn-store/**"
+      - "crates/ndn-mobile/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/mobile.yml"
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - "crates/ndn-tlv/**"
+      - "crates/ndn-packet/**"
+      - "crates/ndn-transport/**"
+      - "crates/ndn-face-net/**"
+      - "crates/ndn-face-local/**"
+      - "crates/ndn-pipeline/**"
+      - "crates/ndn-strategy/**"
+      - "crates/ndn-security/**"
+      - "crates/ndn-engine/**"
+      - "crates/ndn-app/**"
+      - "crates/ndn-ipc/**"
+      - "crates/ndn-config/**"
+      - "crates/ndn-store/**"
+      - "crates/ndn-mobile/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/mobile.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── iOS / iPadOS (aarch64-apple-ios) ─────────────────────────────────────────
+  ios:
+    name: iOS — aarch64-apple-ios
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-ios-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-ios-
+
+      # Foundation layer — pure Rust, no platform C
+      - name: Check foundation (ndn-tlv, ndn-packet, ndn-transport)
+        run: |
+          cargo check --target aarch64-apple-ios \
+            -p ndn-tlv -p ndn-packet -p ndn-transport
+
+      # Face layer — UDP/TCP faces (Tokio net) and local faces (AppFace, IpcFace)
+      # ndn-face-local: default features only (no spsc-shm — uses /tmp/ paths)
+      # ndn-face-serial: --no-default-features to skip tokio-serial (no serial ports on iOS)
+      - name: Check face layer
+        run: |
+          cargo check --target aarch64-apple-ios \
+            -p ndn-face-net \
+            -p ndn-face-local \
+            -p ndn-face-serial --no-default-features
+
+      # Pipeline and strategy
+      - name: Check pipeline / strategy
+        run: |
+          cargo check --target aarch64-apple-ios \
+            -p ndn-pipeline -p ndn-strategy
+
+      # Security (uses ring — has iOS asm, needs Xcode)
+      - name: Check security
+        run: |
+          cargo check --target aarch64-apple-ios \
+            -p ndn-security
+
+      # Store — without fjall (fjall links C++; use the default LRU/sharded backends)
+      - name: Check store (no fjall)
+        run: |
+          cargo check --target aarch64-apple-ios \
+            -p ndn-store
+
+      # Engine, app API, and the mobile crate itself
+      - name: Check engine, app API, and ndn-mobile
+        run: |
+          cargo check --target aarch64-apple-ios \
+            -p ndn-engine -p ndn-app -p ndn-ipc -p ndn-config -p ndn-mobile
+
+  # ── fjall feature (desktop — fjall links C++, easier than cross-compiling) ────
+  fjall:
+    name: ndn-mobile (fjall feature, x86_64-linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-fjall-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-fjall-
+
+      - name: Check ndn-mobile --features fjall
+        run: cargo check -p ndn-mobile --features fjall
+
+      - name: Test ndn-mobile --features fjall
+        run: cargo test -p ndn-mobile --features fjall
+
+  # ── Android (aarch64-linux-android) ──────────────────────────────────────────
+  android:
+    name: Android — aarch64-linux-android
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Set up Android NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27c
+          add-to-path: true
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-android-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-android-
+
+      # Foundation layer
+      - name: Check foundation
+        run: |
+          cargo ndk -t arm64-v8a check \
+            -p ndn-tlv -p ndn-packet -p ndn-transport
+
+      # Face layer
+      - name: Check face layer
+        run: |
+          cargo ndk -t arm64-v8a check \
+            -p ndn-face-net \
+            -p ndn-face-local \
+            -p ndn-face-serial --no-default-features
+
+      # Pipeline and strategy
+      - name: Check pipeline / strategy
+        run: |
+          cargo ndk -t arm64-v8a check \
+            -p ndn-pipeline -p ndn-strategy
+
+      # Security (ring has Android NDK asm support)
+      - name: Check security
+        run: |
+          cargo ndk -t arm64-v8a check \
+            -p ndn-security
+
+      # Store (no fjall)
+      - name: Check store (no fjall)
+        run: |
+          cargo ndk -t arm64-v8a check \
+            -p ndn-store
+
+      # Engine, app API, and the mobile crate itself
+      - name: Check engine, app API, and ndn-mobile
+        run: |
+          cargo ndk -t arm64-v8a check \
+            -p ndn-engine -p ndn-app -p ndn-ipc -p ndn-config -p ndn-mobile
