@@ -1,0 +1,19 @@
+[package]
+name = "ndn-did"
+description = "NDN DID method (did:ndn): encode NDN names as W3C Decentralized Identifiers and resolve DID Documents over the NDN network"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ndn-packet   = { workspace = true, features = ["std"] }
+ndn-security = { workspace = true }
+bytes        = { workspace = true, features = ["std"] }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+thiserror    = { workspace = true }
+base64       = { workspace = true }
+futures      = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }

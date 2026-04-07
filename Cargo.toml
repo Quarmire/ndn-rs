@@ -15,6 +15,9 @@ members = [
     "crates/ndn-pipeline",
     "crates/ndn-strategy",
     "crates/ndn-security",
+    "crates/ndn-did",
+    "crates/ndn-cert",
+    "crates/ndn-identity",
     # Layer 1 — engine and application API
     "crates/ndn-engine",
     "crates/ndn-app",
@@ -31,6 +34,7 @@ members = [
     "crates/ndn-compute",
     "crates/ndn-sync",
     # Binaries
+    "binaries/did-ndn-driver",
     "binaries/ndn-router",
     "binaries/ndn-tools",
     "binaries/ndn-bench",
@@ -83,6 +87,9 @@ ndn-embedded  = { path = "crates/ndn-embedded" }
 ndn-mobile    = { path = "crates/ndn-mobile" }
 ndn-wasm      = { path = "crates/ndn-wasm" }
 ndn-sim       = { path = "crates/ndn-sim" }
+ndn-did      = { path = "crates/ndn-did" }
+ndn-cert     = { path = "crates/ndn-cert" }
+ndn-identity = { path = "crates/ndn-identity" }
 
 # Core async runtime — individual crates enable only the features they need
 tokio      = { version = "1", default-features = false }
@@ -116,6 +123,7 @@ libc = "0.2"
 # Serialization
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 
 # Cryptography
 ring          = "0.17"
