@@ -242,3 +242,33 @@ The `pub(crate)` fields are the key detail. Application code cannot construct a 
 Any API that accepts `SafeData` instead of `Data` is making a compile-time assertion: "this function only operates on verified data." If a developer accidentally tries to pass an unverified `Data` packet to such a function, the code won't compile. There's no runtime check to forget, no boolean flag to misread, no error to swallow. The compiler is the security auditor, and it never takes a day off.
 
 This is especially powerful in the forwarding pipeline. The Content Store insertion stage, for example, can require `SafeData` -- guaranteeing that the cache will never serve unverified content, even if a bug elsewhere in the pipeline skips validation. The guarantee is structural, not procedural.
+
+## Identity and DID Integration
+
+The security primitives described above — certificates, trust schemas, `SafeData` — are the foundation. But they answer *how* to verify data, not *who* to trust in the first place. Two higher-level layers sit above `ndn-security` to close that gap.
+
+### From Certificate to DID Document
+
+`ndn-security`'s `Certificate` type is an NDN Data packet containing a public key, an identity name, a validity period, and an issuer signature. This maps directly onto a W3C DID Document: the identity name becomes the DID URI, the public key becomes a `JsonWebKey2020` verification method, and the issuer signature establishes the chain of trust.
+
+The `ndn-did` crate provides `cert_to_did_document` to perform this conversion explicitly, and `name_to_did` / `did_to_name` to translate between NDN name and DID URI forms. A `Certificate` issued by NDNCERT is simultaneously a valid DID Document with no additional encoding step. This means that any system in the W3C DID ecosystem — a DIF Universal Resolver driver, a Verifiable Credential verifier, a DIDComm messaging layer — can interoperate with NDN identities directly.
+
+See [Identity and Decentralized Identifiers](./identity-and-did.md) for the full treatment: how `did:ndn` names are encoded, how resolution works over NDN transports, how to cross-anchor with `did:web` for web interoperability, and how `did:key` enables offline bootstrapping for factory-provisioned devices.
+
+### NdnIdentity: Identity Management Above SecurityManager
+
+`ndn-security` provides the low-level building blocks (`Signer`, `Verifier`, `CertCache`, `Validator`). `ndn-identity` wraps these in a higher-level `NdnIdentity` type that applications and devices actually interact with.
+
+`NdnIdentity` owns a `SecurityManager` (which it exposes via `identity.security_manager()` for callers that need full control), and adds:
+
+- **Persistent storage** — keys and certificates survive reboots via `NdnIdentity::open_or_create`
+- **Ephemeral identities** — `NdnIdentity::ephemeral` creates a throw-away in-memory identity for tests
+- **Automated NDNCERT enrollment** — `NdnIdentity::provision` runs the full NDNCERT client exchange, handling token and possession challenges
+- **Background renewal** — configurable `RenewalPolicy` automatically renews certificates before they expire
+- **DID access** — `identity.did()` returns the `did:ndn` URI for the identity's name without any conversion boilerplate
+
+The `identity.signer()` method returns an `Arc<dyn Signer>` that can be passed directly to `DataBuilder` or a `Producer` — the same `Signer` trait used throughout `ndn-security`, so `NdnIdentity`-based signing integrates seamlessly with the rest of the pipeline.
+
+For most applications, `NdnIdentity` is the only security API they need. Direct use of `SecurityManager`, `Validator`, or `CertCache` is reserved for advanced scenarios like custom trust schema configuration or building a CA.
+
+See [NDNCERT: Automated Certificate Issuance](./ndncert.md) for how certificate issuance works end-to-end, including the CA hierarchy, challenge types, and short-lived certificate renewal.

@@ -364,6 +364,114 @@ async fn main() -> Result<(), AppError> {
 fn read_temperature() -> f32 { 23.5 }
 ```
 
+## Identity Management with NdnIdentity
+
+`ndn-identity` provides a higher-level identity API that sits above the raw `KeyChain`. It manages certificate lifecycle, handles NDNCERT enrollment, and exposes a `did()` method that returns the W3C DID URI for the identity — all in a single type that persists across restarts.
+
+### Ephemeral Identities for Tests
+
+`NdnIdentity::ephemeral` creates a throw-away identity entirely in memory. The key pair is generated fresh each time and is gone when the process exits. This is ideal for unit tests and integration tests where you want real signing behavior without touching the filesystem:
+
+```rust
+use ndn_identity::NdnIdentity;
+use ndn_packet::encode::DataBuilder;
+
+#[tokio::test]
+async fn test_signed_producer() -> anyhow::Result<()> {
+    // A fresh Ed25519 identity for this test run
+    let identity = NdnIdentity::ephemeral("/test/sensor").await?;
+
+    println!("test DID: {}", identity.did());
+    // → did:ndn:test:sensor
+
+    // Get a signer and sign a packet
+    let signer = identity.signer()?;
+    let wire = DataBuilder::new("/test/sensor/reading".parse()?, b"23.5°C")
+        .sign(&*signer)
+        .await?;
+
+    // wire is now a signed Data packet whose key traces back to this identity
+    Ok(())
+}
+```
+
+### Persistent Identities for Applications
+
+`NdnIdentity::open_or_create` creates the identity (and persists it to disk) on first run, then loads it on subsequent runs without re-generating keys:
+
+```rust
+use std::path::PathBuf;
+use ndn_identity::NdnIdentity;
+use ndn_app::Producer;
+use ndn_packet::{Interest, encode::DataBuilder};
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // First run: generates key, creates self-signed cert, saves to /var/lib/ndn/sensor-id
+    // Subsequent runs: loads existing key and cert from disk
+    let identity = NdnIdentity::open_or_create(
+        &PathBuf::from("/var/lib/ndn/sensor-id"),
+        "/ndn/sensor/node42",
+    ).await?;
+
+    println!("Running as: {}", identity.name());
+    println!("DID:        {}", identity.did());
+
+    let signer = identity.signer()?;
+
+    let mut producer = Producer::connect("/tmp/ndn-faces.sock", "/ndn/sensor/node42").await?;
+
+    producer.serve(move |interest: Interest| {
+        // Clone the signer Arc for each handler invocation
+        let signer = signer.clone();
+        async move {
+            let reading = format!("{:.1}", read_sensor());
+            // Sign with the identity's key
+            let wire = DataBuilder::new((*interest.name).clone(), reading.as_bytes())
+                .sign(&*signer)
+                .await
+                .ok()?;
+            Some(wire)
+        }
+    }).await?;
+
+    Ok(())
+}
+
+fn read_sensor() -> f32 { 23.5 }
+```
+
+### Using the SecurityManager Directly
+
+`identity.security_manager()` gives access to the full `SecurityManager` for advanced scenarios: adding additional trust anchors, configuring custom trust schemas, or inspecting the certificate chain.
+
+```rust
+use ndn_identity::NdnIdentity;
+use ndn_security::{Validator, TrustSchema};
+use std::path::PathBuf;
+
+let identity = NdnIdentity::open_or_create(
+    &PathBuf::from("/var/lib/ndn/app-id"),
+    "/example/app",
+).await?;
+
+// Get the underlying SecurityManager for full control
+let mgr = identity.security_manager();
+
+// Build a custom validator with a specific trust schema
+let my_cert = mgr.get_certificate()?;
+let validator = Validator::builder()
+    .trust_anchor(my_cert)
+    .schema(TrustSchema::hierarchical())
+    .build();
+
+// ... use validator to verify incoming SafeData
+```
+
+For most applications you will not need `security_manager()` — `identity.signer()` covers the signing case, and `Consumer::fetch_verified` covers the verification case. Direct access is useful when you need to build a `Validator` with non-default configuration, set up a custom trust schema, or inspect the raw certificate.
+
+For factory provisioning with NDNCERT, see [`NdnIdentity::provision`](../deep-dive/ndncert.md) and the [Fleet and Swarm Security](./fleet-security.md) guide.
+
 ## Cargo Features
 
 | Feature | What it enables |

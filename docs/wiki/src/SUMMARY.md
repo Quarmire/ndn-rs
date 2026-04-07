@@ -30,6 +30,8 @@
 - [Discovery Protocols](./deep-dive/discovery-protocols.md)
 - [Sync Protocols](./deep-dive/sync-protocols.md)
 - [Security Model](./deep-dive/security-model.md)
+- [Identity and Decentralized Identifiers](./deep-dive/identity-and-did.md)
+- [NDNCERT: Automated Certificate Issuance](./deep-dive/ndncert.md)
 - [Link-Layer and Wireless Faces](./deep-dive/link-layer-faces.md)
 - [IPC and App Communication](./deep-dive/ipc-transport.md)
 - [In-Network Compute](./deep-dive/in-network-compute.md)
@@ -45,6 +47,8 @@
 - [WASM Strategies](./guides/wasm-strategies.md)
 - [Mobile Apps (Android / iOS)](./guides/mobile-apps.md)
 - [Embedded Targets](./guides/embedded-targets.md)
+- [Setting Up an NDNCERT CA](./guides/ndncert-setup.md)
+- [Fleet and Swarm Security](./guides/fleet-security.md)
 - [CLI Tools](./guides/cli-tools.md)
 - [Performance Tuning](./guides/performance-tuning.md)
 
