@@ -6,7 +6,16 @@ on:
     paths:
       - 'docs/wiki/**'
       - 'tools/ndn-explorer/**'
+      - 'crates/ndn-wasm/**'
+      - 'crates/ndn-tlv/**'
+      - 'crates/ndn-packet/**'
       - '.github/workflows/wiki.yml'
+  # Re-deploy after the benchmark workflow commits updated results to docs/wiki/.
+  # GITHUB_TOKEN commits do not trigger push events, so we chain via workflow_run.
+  workflow_run:
+    workflows: ["benchmarks"]
+    types: [completed]
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -20,9 +29,53 @@ concurrency:
 
 jobs:
   build:
+    # When triggered by workflow_run, only proceed if benchmarks succeeded.
+    if: >
+      github.event_name != 'workflow_run' ||
+      github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      # ── Rust / WASM setup ─────────────────────────────────────────────────────
+      - name: Install Rust toolchain (stable + wasm32 target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Cargo registry and build output
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/wasm32-unknown-unknown
+          key: ${{ runner.os }}-wasm-${{ hashFiles('crates/ndn-wasm/**', 'crates/ndn-tlv/**', 'crates/ndn-packet/**', 'Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-wasm-
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: Build ndn-wasm
+        id: wasm_build
+        continue-on-error: true   # site still deploys with JS fallback if this fails
+        run: |
+          wasm-pack build crates/ndn-wasm \
+            --target web \
+            --out-dir "$PWD/tools/ndn-explorer/wasm" \
+            --out-name ndn_wasm \
+            --no-typescript \
+            --release
+          echo "built=true" >> "$GITHUB_OUTPUT"
+
+      - name: Report WASM build status
+        run: |
+          if [ "${{ steps.wasm_build.outputs.built }}" = "true" ]; then
+            echo "✓ ndn-wasm built — WASM simulation will be active in the Explorer"
+            ls -lh tools/ndn-explorer/wasm/
+          else
+            echo "⚠ ndn-wasm build failed — Explorer will use JS fallback simulation"
+          fi
 
       - name: Install mdBook
         env:
