@@ -48,88 +48,68 @@ Research        ndn-sim  ndn-compute  ndn-sync  ndn-research  ndn-strategy-wasm
 
 Dependencies flow strictly downward. `ndn-tlv` and `ndn-packet` compile `no_std`.
 
-```mermaid
-flowchart TD
-    subgraph Binaries
-        router["ndn-router"]
-        tools["ndn-tools"]
-        bench["ndn-bench"]
-    end
-
-    subgraph "Engine & App"
-        engine["ndn-engine"]
-        app["ndn-app"]
-        ipc["ndn-ipc"]
-        config["ndn-config"]
-        discovery["ndn-discovery"]
-    end
-
-    subgraph "Pipeline & Strategy"
-        pipeline["ndn-pipeline"]
-        strategy["ndn-strategy"]
-        security["ndn-security"]
-    end
-
-    subgraph Faces
-        face_net["ndn-face-net"]
-        face_local["ndn-face-local"]
-        face_serial["ndn-face-serial"]
-        face_l2["ndn-face-l2"]
-    end
-
-    subgraph Foundation
-        store["ndn-store"]
-        transport["ndn-transport"]
-        packet["ndn-packet"]
-        tlv["ndn-tlv"]
-    end
-
-    subgraph Embedded
-        embedded["ndn-embedded"]
-    end
-
-    subgraph Research
-        sim["ndn-sim"]
-        compute["ndn-compute"]
-        sync_crate["ndn-sync"]
-        research["ndn-research"]
-        strat_wasm["ndn-strategy-wasm"]
-    end
-
-    router --> engine
-    tools --> engine
-    bench --> engine
-    router --> config
-    tools --> app
-    bench --> app
-
-    engine --> pipeline
-    engine --> strategy
-    app --> ipc
-    ipc --> pipeline
-    discovery --> pipeline
-
-    pipeline --> face_net
-    pipeline --> face_local
-    pipeline --> face_serial
-    pipeline --> face_l2
-    strategy --> pipeline
-    security --> pipeline
-
-    face_net --> transport
-    face_local --> transport
-    face_serial --> transport
-    face_l2 --> transport
-
-    store --> packet
-    transport --> packet
-    pipeline --> store
-    packet --> tlv
-    tlv --> embedded
-
-    sim --> engine
-    compute --> engine
-    sync_crate --> app
-    research --> engine
-    strat_wasm --> strategy
+```d3graph
+{
+  "columns": [
+    { "label": "Foundation", "nodes": [
+        {"id": "ndn-tlv"}, {"id": "ndn-packet"}, {"id": "ndn-store"},
+        {"id": "ndn-transport"}, {"id": "ndn-embedded"}
+    ]},
+    { "label": "Faces", "nodes": [
+        {"id": "ndn-face-net"}, {"id": "ndn-face-local"},
+        {"id": "ndn-face-serial"}, {"id": "ndn-face-l2"}
+    ]},
+    { "label": "Pipeline & Strategy", "nodes": [
+        {"id": "ndn-pipeline"}, {"id": "ndn-strategy"}, {"id": "ndn-security"}
+    ]},
+    { "label": "Engine & App", "nodes": [
+        {"id": "ndn-engine"}, {"id": "ndn-app"}, {"id": "ndn-ipc"},
+        {"id": "ndn-config"}, {"id": "ndn-discovery"}
+    ]},
+    { "label": "Binaries", "nodes": [
+        {"id": "ndn-router"}, {"id": "ndn-tools"}, {"id": "ndn-bench"}
+    ]}
+  ],
+  "satellites": {
+    "label": "Research  (depend on engine / app / strategy)",
+    "nodes": [
+        {"id": "ndn-sim"}, {"id": "ndn-compute"},
+        {"id": "ndn-sync"}, {"id": "ndn-strategy-wasm"}
+    ]
+  },
+  "edges": [
+    ["ndn-tlv",       "ndn-packet"],
+    ["ndn-tlv",       "ndn-embedded"],
+    ["ndn-packet",    "ndn-store"],
+    ["ndn-packet",    "ndn-transport"],
+    ["ndn-transport", "ndn-face-net"],
+    ["ndn-transport", "ndn-face-local"],
+    ["ndn-transport", "ndn-face-serial"],
+    ["ndn-transport", "ndn-face-l2"],
+    ["ndn-face-net",    "ndn-pipeline"],
+    ["ndn-face-local",  "ndn-pipeline"],
+    ["ndn-face-serial", "ndn-pipeline"],
+    ["ndn-face-l2",     "ndn-pipeline"],
+    ["ndn-store",       "ndn-pipeline"],
+    ["ndn-pipeline",    "ndn-strategy"],
+    ["ndn-pipeline",    "ndn-security"],
+    ["ndn-strategy",    "ndn-engine"],
+    ["ndn-security",    "ndn-engine"],
+    ["ndn-pipeline",    "ndn-ipc"],
+    ["ndn-pipeline",    "ndn-discovery"],
+    ["ndn-engine",      "ndn-router"],
+    ["ndn-engine",      "ndn-tools"],
+    ["ndn-engine",      "ndn-bench"],
+    ["ndn-app",         "ndn-ipc"],
+    ["ndn-app",         "ndn-tools"],
+    ["ndn-app",         "ndn-bench"],
+    ["ndn-config",      "ndn-router"]
+  ],
+  "satellite_edges": [
+    ["ndn-sim",           "ndn-engine"],
+    ["ndn-compute",       "ndn-engine"],
+    ["ndn-sync",          "ndn-app"],
+    ["ndn-strategy-wasm", "ndn-strategy"]
+  ]
+}
 ```
