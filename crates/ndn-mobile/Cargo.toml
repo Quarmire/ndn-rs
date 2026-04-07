@@ -1,0 +1,36 @@
+[package]
+name = "ndn-mobile"
+description = "Embedded NDN forwarder for Android and iOS/iPadOS"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Mobile platforms (Android / iOS) always use the embedded engine pattern:
+# the forwarder runs in-process via AppFace.  Raw Ethernet faces (ndn-face-l2)
+# and serial faces are not included.  UDP multicast and unicast UDP/TCP faces
+# are available for LAN/WAN connectivity.  Bluetooth uses a platform-supplied
+# async stream wrapped with CobsCodec from ndn-face-serial.
+
+[features]
+## Enable the persistent on-disk content store (FjallCs).
+## Required for `MobileEngineBuilder::with_persistent_cs()`.
+## Enables iOS App Group content-store sharing when the native code supplies
+## the App Group container path.
+fjall = ["ndn-store/fjall"]
+
+[dependencies]
+ndn-engine      = { workspace = true }
+ndn-app         = { workspace = true }
+ndn-discovery   = { workspace = true }
+ndn-face-net    = { workspace = true }
+ndn-face-local  = { workspace = true }
+ndn-face-serial = { workspace = true }
+ndn-packet      = { workspace = true, features = ["std"] }
+ndn-security    = { workspace = true }
+ndn-store       = { workspace = true }
+ndn-transport   = { workspace = true }
+tokio           = { workspace = true, features = ["sync", "time", "rt", "macros"] }
+tokio-util      = { workspace = true, features = ["codec"] }
+tracing         = { workspace = true }
+anyhow          = { workspace = true }
+thiserror       = { workspace = true }
