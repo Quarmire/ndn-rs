@@ -142,6 +142,7 @@ async fn main() -> anyhow::Result<()> {
 > **🔧 Implementation note:** `EngineBuilder` uses sensible defaults for everything: `LruCs` for caching, `BestRouteStrategy` at the root prefix, and the standard Interest/Data pipeline stages. You only need to configure what you want to customize. The builder pattern ensures the engine is fully wired before it starts processing packets.
 
 ```mermaid
+%%{init: {"layout": "elk"}}%%
 graph TD
     EB["EngineBuilder::new(config)"]
     EB -->|".face(consumer_face)"| F1["Face: Consumer"]

@@ -197,6 +197,7 @@ The `Arc` wrapper on each child node is the key to concurrency. When a thread pe
 Here's how a FIB trie looks in practice, with green nodes holding actual nexthop entries:
 
 ```mermaid
+%%{init: {"layout": "elk"}}%%
 flowchart TD
     root["/ (root)"] --> ndn["/ndn"]
     ndn --> edu["/ndn/edu"]

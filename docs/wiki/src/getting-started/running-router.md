@@ -7,6 +7,7 @@ This page explains how to configure and run `ndn-router` as a standalone NDN for
 The router is the central forwarding engine. Applications, remote peers, and management tools connect to it through various face types:
 
 ```mermaid
+%%{init: {"layout": "elk"}}%%
 graph TB
     subgraph "ndn-router"
         E[Forwarding Engine]

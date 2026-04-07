@@ -119,6 +119,7 @@ while batch.len() < BATCH_SIZE {
 Here's the task topology. Every face feeds into one shared channel, and the pipeline runner fans out to per-packet processing:
 
 ```mermaid
+%%{init: {"layout": "elk"}}%%
 flowchart LR
     subgraph Face Reader Tasks
         F1["UdpFace\nrecv loop"]

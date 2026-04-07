@@ -231,6 +231,7 @@ The FIB contains separate nexthop entries per radio for the same name prefix. Fo
 ## Face Type Comparison
 
 ```mermaid
+%%{init: {"layout": "elk"}}%%
 graph TD
     subgraph "Face Type Hierarchy"
         Face["trait Face<br/>recv() + send()"]

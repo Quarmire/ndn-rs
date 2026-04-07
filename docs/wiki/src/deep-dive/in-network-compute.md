@@ -15,6 +15,7 @@ This is not a bolt-on RPC system. It falls out naturally from how NDN already wo
 ndn-rs approaches in-network compute as an escalating series of capabilities. Each level builds on the previous one, and each requires progressively deeper integration with the forwarder.
 
 ```mermaid
+%%{init: {"layout": "elk"}}%%
 graph TD
     L1["Level 1: Named Results<br/><i>Application produces named data</i>"]
     L2["Level 2: Router-Side Handler<br/><i>ComputeHandler trait + ComputeRegistry</i>"]
