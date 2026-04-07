@@ -25,34 +25,41 @@ NDN's solution is a compact variable-width encoding. If the value fits in one by
 | 65536 -- 2^32 - 1   | 5          | `0xFE` + 4-byte big-endian       |
 | 2^32 -- 2^64 - 1    | 9          | `0xFF` + 8-byte big-endian       |
 
-```mermaid
-block-beta
-    columns 8
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 196"
+     style="width:100%;max-width:680px;height:auto;display:block;margin:1em 0;font-family:monospace;">
+  <!-- legend -->
+  <rect x="0" y="0" width="680" height="196" rx="6" fill="#1a2332"/>
+  <rect x="14" y="8" width="12" height="12" rx="2" fill="#c44"/>
+  <text x="30" y="19" font-size="10" fill="#94a3b8">marker byte</text>
+  <rect x="100" y="8" width="12" height="12" rx="2" fill="#2d5a8c"/>
+  <text x="116" y="19" font-size="10" fill="#94a3b8">value bytes</text>
 
-    block:one["1-byte (value 0–252)"]:8
-        v1["value (1 byte)"]
-    end
+  <!-- row 1: 1-byte  (value = 1/1 of 520 px) -->
+  <text x="150" y="54" text-anchor="end" font-size="11" fill="#94a3b8">1-byte  (0–252)</text>
+  <rect x="156" y="36" width="510" height="34" rx="4" fill="#2d5a8c"/>
+  <text x="411" y="57" text-anchor="middle" font-size="11" fill="#bfdbfe">value  (1 byte)</text>
 
-    block:three["3-byte (value 253–65535)"]:8
-        m3["0xFD"]:2 v3["value (2 bytes, big-endian)"]:6
-    end
+  <!-- row 2: 3-byte  (marker=1/3=170 px, value=2/3=340 px) -->
+  <text x="150" y="102" text-anchor="end" font-size="11" fill="#94a3b8">3-byte  (253–65 535)</text>
+  <rect x="156" y="84" width="168" height="34" rx="4" fill="#c44"/>
+  <text x="240" y="105" text-anchor="middle" font-size="11" fill="#fff">0xFD</text>
+  <rect x="328" y="84" width="338" height="34" rx="4" fill="#2d5a8c"/>
+  <text x="497" y="105" text-anchor="middle" font-size="11" fill="#bfdbfe">value  (2 bytes, big-endian)</text>
 
-    block:five["5-byte (value 65536–2³²−1)"]:8
-        m5["0xFE"]:1 v5["value (4 bytes, big-endian)"]:7
-    end
+  <!-- row 3: 5-byte  (marker=1/5=102 px, value=4/5=408 px) -->
+  <text x="150" y="150" text-anchor="end" font-size="11" fill="#94a3b8">5-byte  (65 536–4 G)</text>
+  <rect x="156" y="132" width="100" height="34" rx="4" fill="#c44"/>
+  <text x="206" y="153" text-anchor="middle" font-size="11" fill="#fff">0xFE</text>
+  <rect x="260" y="132" width="406" height="34" rx="4" fill="#2d5a8c"/>
+  <text x="463" y="153" text-anchor="middle" font-size="11" fill="#bfdbfe">value  (4 bytes, big-endian)</text>
 
-    block:nine["9-byte (value 2³²–2⁶⁴−1)"]:8
-        m9["0xFF"]:1 v9["value (8 bytes, big-endian)"]:7
-    end
-
-    style m3 fill:#c44,color:#fff
-    style m5 fill:#c44,color:#fff
-    style m9 fill:#c44,color:#fff
-    style v1 fill:#2d5a8c,color:#fff
-    style v3 fill:#2d5a8c,color:#fff
-    style v5 fill:#2d5a8c,color:#fff
-    style v9 fill:#2d5a8c,color:#fff
-```
+  <!-- row 4: 9-byte  (marker=1/9=57 px, value=8/9=453 px) -->
+  <text x="150" y="198" text-anchor="end" font-size="11" fill="#94a3b8">9-byte  (4 G–2⁶⁴)</text>
+  <rect x="156" y="180" width="56" height="34" rx="4" fill="#c44"/>
+  <text x="184" y="200" text-anchor="middle" font-size="10" fill="#fff">0xFF</text>
+  <rect x="216" y="180" width="454" height="34" rx="4" fill="#2d5a8c"/>
+  <text x="443" y="200" text-anchor="middle" font-size="11" fill="#bfdbfe">value  (8 bytes, big-endian)</text>
+</svg>
 
 In practice, the vast majority of TLV elements use the 1-byte form. A name component of type `0x08` with a 4-byte value costs just 6 bytes of overhead (1 for type, 1 for length, 4 for value). The multi-byte forms exist for the rare cases where a packet carries a large payload or an application uses a high-numbered type.
 
