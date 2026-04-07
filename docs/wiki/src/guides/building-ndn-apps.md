@@ -1,0 +1,341 @@
+# Building NDN Applications
+
+`ndn-app` provides two ways to connect an application to NDN: through an external router process, or with the forwarder engine embedded directly in your binary. The high-level API — `Consumer`, `Producer`, `Subscriber`, `Queryable` — is the same either way.
+
+This guide walks through both modes with complete, runnable examples.
+
+## The Two Connection Modes
+
+```mermaid
+graph LR
+    subgraph "External router mode"
+        App1["your app"] -->|"Unix socket\n/tmp/ndn-faces.sock"| R["ndn-router process"]
+        R -->|"UDP / Ethernet"| Net["network"]
+    end
+
+    subgraph "Embedded engine mode"
+        App2["your app"] -->|"in-process\nAppFace"| E["ForwarderEngine\n(same process)"]
+        E -->|"UDP / Ethernet"| Net2["network"]
+    end
+```
+
+**External router** — `ndn-router` runs as a separate process. Your app connects to its Unix socket. This is the standard deployment: one router per host, many apps sharing it. Requires a running router.
+
+**Embedded engine** — the `ForwarderEngine` lives inside your binary. There is no router process. The engine owns all faces and FIB state. This is the right choice for mobile apps, CLI tools, test harnesses, and any scenario where a separate process is inconvenient.
+
+The `Consumer` and `Producer` types accept both connection variants behind an `NdnConnection` enum. The API surface is identical — switching between modes is a one-line change.
+
+## Mode 1: External Router
+
+Add `ndn-app` to your `Cargo.toml`:
+
+```toml
+[dependencies]
+ndn-app = { path = "crates/ndn-app" }
+tokio = { version = "1", features = ["full"] }
+```
+
+### Consumer
+
+```rust
+use ndn_app::{Consumer, AppError};
+
+#[tokio::main]
+async fn main() -> Result<(), AppError> {
+    let mut consumer = Consumer::connect("/tmp/ndn-faces.sock").await?;
+
+    // Fetch raw content bytes — the simplest call.
+    let bytes = consumer.get("/example/hello").await?;
+    println!("{}", String::from_utf8_lossy(&bytes));
+
+    // Fetch the full Data packet (includes name, content, metadata).
+    let data = consumer.fetch("/example/hello").await?;
+    println!("name: {}", data.name());
+    if let Some(content) = data.content() {
+        println!("content: {} bytes", content.len());
+    }
+
+    Ok(())
+}
+```
+
+`fetch` uses a 4-second Interest lifetime and a 4.5-second local timeout. For custom lifetimes, build the Interest wire yourself:
+
+```rust
+use std::time::Duration;
+use ndn_packet::encode::InterestBuilder;
+
+let wire = InterestBuilder::new("/example/sensor/temperature")
+    .lifetime(Duration::from_millis(500))
+    .must_be_fresh(true)
+    .build();
+
+let data = consumer.fetch_wire(wire, Duration::from_millis(600)).await?;
+```
+
+### Producer
+
+```rust
+use bytes::Bytes;
+use ndn_app::{Producer, AppError};
+use ndn_packet::{Interest, encode::DataBuilder};
+
+#[tokio::main]
+async fn main() -> Result<(), AppError> {
+    // Register the prefix and start the serve loop.
+    let mut producer = Producer::connect("/tmp/ndn-faces.sock", "/example").await?;
+
+    producer.serve(|interest: Interest| async move {
+        let name = interest.name().to_string();
+        println!("Interest for: {name}");
+
+        // Return Some(wire_bytes) to respond, None to silently drop.
+        let wire = DataBuilder::new(interest.name().clone())
+            .content(b"hello, NDN")
+            .build_unsigned();
+
+        Some(wire)
+    }).await
+}
+```
+
+The handler is `async`, so you can await database queries, file reads, or any other async work before returning the Data. Return `None` to drop the Interest without a response (the forwarder will Nack with `NoRoute` when the Interest times out).
+
+### Error handling
+
+`AppError` has three variants:
+
+```rust
+match consumer.fetch("/example/data").await {
+    Ok(data) => { /* use data */ }
+    Err(AppError::Timeout) => {
+        // No response within the timeout window.
+        // The Interest either had no route or the producer didn't respond.
+    }
+    Err(AppError::Nacked { reason }) => {
+        // The forwarder sent an explicit Nack (e.g. NoRoute).
+        eprintln!("nacked: {:?}", reason);
+    }
+    Err(AppError::Engine(e)) => {
+        // Connection error or protocol violation.
+        eprintln!("engine error: {e}");
+    }
+}
+```
+
+## Mode 2: Embedded Engine
+
+The embedded mode builds a `ForwarderEngine` inside your process and connects `Consumer`/`Producer` to it via in-process `AppFace` channel pairs. No Unix sockets, no separate process.
+
+```rust
+use ndn_app::{Consumer, Producer, EngineBuilder};
+use ndn_engine::EngineConfig;
+use ndn_face_local::AppFace;
+use ndn_packet::{Name, encode::DataBuilder};
+use ndn_transport::FaceId;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // Create one AppFace for the consumer and one for the producer.
+    // Each AppFace::new returns the face (engine side) and its handle (app side).
+    let (consumer_face, consumer_handle) = AppFace::new(FaceId(1), 64);
+    let (producer_face, producer_handle) = AppFace::new(FaceId(2), 64);
+
+    // Build the engine, registering both faces.
+    let (engine, _shutdown) = EngineBuilder::new(EngineConfig::default())
+        .face(consumer_face)
+        .face(producer_face)
+        .build()
+        .await?;
+
+    // Install a FIB route: Interests for /example go to the producer face.
+    let prefix: Name = "/example".parse()?;
+    engine.fib().add_nexthop(&prefix, FaceId(2), 0);
+
+    // Build Consumer and Producer from their handles.
+    let mut consumer = Consumer::from_handle(consumer_handle);
+    let mut producer = Producer::from_handle(producer_handle, prefix);
+
+    // Run the producer in a background task.
+    tokio::spawn(async move {
+        producer.serve(|interest| async move {
+            let wire = DataBuilder::new(interest.name().clone())
+                .content(b"hello from embedded engine")
+                .build_unsigned();
+            Some(wire)
+        }).await.ok();
+    });
+
+    // Fetch from the consumer — goes through the in-process engine.
+    let bytes = consumer.get("/example/greeting").await?;
+    println!("{}", String::from_utf8_lossy(&bytes));
+
+    Ok(())
+}
+```
+
+The embedded mode is useful for:
+
+- **Integration tests** — spin up a full forwarding engine in `#[tokio::test]` without any external process
+- **Mobile / Android** — ship the engine as part of your app binary; no system daemon required
+- **CLI tools** — tools like `ndn-peek` and `ndn-ping` embed the engine so they work on machines that don't have `ndn-router` running
+
+## Synchronous Applications
+
+The `blocking` feature wraps `Consumer` and `Producer` in synchronous types that manage an internal Tokio runtime, following the same pattern as `reqwest::blocking`:
+
+```toml
+[dependencies]
+ndn-app = { path = "crates/ndn-app", features = ["blocking"] }
+```
+
+```rust
+use ndn_app::blocking::{BlockingConsumer, BlockingProducer};
+
+// No async, no #[tokio::main].
+fn main() -> Result<(), ndn_app::AppError> {
+    let mut consumer = BlockingConsumer::connect("/tmp/ndn-faces.sock")?;
+    let bytes = consumer.get("/example/hello")?;
+    println!("{}", String::from_utf8_lossy(&bytes));
+    Ok(())
+}
+```
+
+`BlockingProducer::serve` takes a plain `Fn(Interest) -> Option<Bytes>` with no async:
+
+```rust
+let mut producer = BlockingProducer::connect("/tmp/ndn-faces.sock", "/sensor")?;
+
+producer.serve(|interest| {
+    // Synchronous handler — called on the runtime thread.
+    let reading = read_sensor();  // blocking I/O is fine here
+    let wire = DataBuilder::new(interest.name().clone())
+        .content(reading.as_bytes())
+        .build_unsigned();
+    Some(wire)
+})?;
+```
+
+The blocking API is a good fit for Python extensions (`ndn-python` uses it internally), command-line tools, and any codebase that doesn't use async.
+
+## Fetching with Security Verification
+
+`Consumer::fetch_verified` validates the Data's signature against a trust schema before returning it. The result is `SafeData` — a newtype that the compiler uses to enforce that only verified data reaches security-sensitive code.
+
+```rust
+use ndn_app::{Consumer, KeyChain};
+
+let keychain = KeyChain::load_or_init("/etc/ndn/keys").await?;
+let validator = keychain.validator().await?;
+
+let mut consumer = Consumer::connect("/tmp/ndn-faces.sock").await?;
+let safe_data = consumer.fetch_verified("/example/data", &validator).await?;
+
+// safe_data is SafeData — the compiler knows it's been verified.
+println!("verified: {}", safe_data.data().name());
+```
+
+If the certificate needed to verify the Data is not yet in the local cache, the validator expresses a side-channel Interest to fetch it. This happens transparently; `fetch_verified` waits for the certificate before returning.
+
+## Subscribe / Queryable
+
+For datasets that change over time, `Subscriber` joins an SVS sync group and delivers new samples as they arrive. `Queryable` registers a prefix and handles request-response patterns more explicitly than `Producer`.
+
+### Subscriber
+
+```rust
+use ndn_app::{Subscriber, SubscriberConfig};
+
+let mut sub = Subscriber::connect(
+    "/tmp/ndn-faces.sock",
+    "/chat/room1",
+    SubscriberConfig::default(),
+).await?;
+
+while let Some(sample) = sub.recv().await {
+    println!(
+        "[{}] seq {}: {:?}",
+        sample.publisher,
+        sample.seq,
+        sample.payload,
+    );
+}
+```
+
+`SubscriberConfig::auto_fetch` (default `true`) automatically expresses an Interest for each sync update and populates `sample.payload` with the fetched bytes. Set it to `false` if you only need the name/seq and will fetch content selectively.
+
+### Queryable
+
+```rust
+use ndn_app::{Queryable, AppError};
+
+let mut queryable = Queryable::connect("/tmp/ndn-faces.sock", "/compute").await?;
+
+while let Some(query) = queryable.recv().await {
+    let name = query.interest().name().to_string();
+    let result = compute_something(&name);
+
+    let wire = DataBuilder::new(query.interest().name().clone())
+        .content(result.as_bytes())
+        .build_unsigned();
+
+    query.reply(wire).await?;
+}
+```
+
+`Queryable` differs from `Producer` in that the reply goes directly to the querying consumer via the engine's PIT, without re-entering the producer's serve loop. It is better suited to stateless request handlers that want explicit control over the response.
+
+## Putting It Together: A Complete Sensor App
+
+This example shows a sensor producer and a monitor consumer running side-by-side against an external router.
+
+```rust
+use std::time::Duration;
+use bytes::Bytes;
+use ndn_app::{Consumer, Producer, AppError};
+use ndn_packet::{Interest, encode::DataBuilder};
+use tokio::time::sleep;
+
+#[tokio::main]
+async fn main() -> Result<(), AppError> {
+    const SOCKET: &str = "/tmp/ndn-faces.sock";
+    const PREFIX: &str = "/ndn/sensor/temperature";
+
+    // Spawn the producer in a background task.
+    tokio::spawn(async move {
+        let mut producer = Producer::connect(SOCKET, PREFIX).await?;
+        producer.serve(|interest: Interest| async move {
+            // Read a sensor value and build a Data response.
+            let reading = format!("{:.1}", read_temperature());
+            let wire = DataBuilder::new(interest.name().clone())
+                .content(reading.as_bytes())
+                .freshness(Duration::from_secs(5))
+                .build_unsigned();
+            Some(wire)
+        }).await
+    });
+
+    // Give the producer a moment to register its prefix.
+    sleep(Duration::from_millis(100)).await;
+
+    // Poll the sensor every second from the consumer.
+    let mut consumer = Consumer::connect(SOCKET).await?;
+    loop {
+        match consumer.get(PREFIX).await {
+            Ok(bytes) => println!("temperature: {}°C", String::from_utf8_lossy(&bytes)),
+            Err(AppError::Timeout) => eprintln!("no response"),
+            Err(e) => return Err(e),
+        }
+        sleep(Duration::from_secs(1)).await;
+    }
+}
+
+fn read_temperature() -> f32 { 23.5 }
+```
+
+## Cargo Features
+
+| Feature | What it enables |
+|---------|----------------|
+| *(default)* | `Consumer`, `Producer`, `Subscriber`, `Queryable`, `KeyChain` |
+| `blocking` | `BlockingConsumer`, `BlockingProducer` via an internal Tokio runtime |

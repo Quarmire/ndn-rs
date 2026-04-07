@@ -34,9 +34,12 @@
 - [IPC and App Communication](./deep-dive/ipc-transport.md)
 - [In-Network Compute](./deep-dive/in-network-compute.md)
 - [Simulation](./deep-dive/simulation.md)
+- [Browser Simulation (ndn-wasm)](./deep-dive/wasm-browser-simulation.md)
 
 # Guides
 
+- [Building NDN Applications](./guides/building-ndn-apps.md)
+- [Implementing a Discovery Protocol](./guides/implementing-discovery.md)
 - [Implementing a Face](./guides/implementing-face.md)
 - [Implementing a Strategy](./guides/implementing-strategy.md)
 - [WASM Strategies](./guides/wasm-strategies.md)
@@ -49,10 +52,23 @@
 - [Pipeline Benchmarks](./benchmarks/pipeline-benchmarks.md)
 - [Methodology](./benchmarks/methodology.md)
 
+# App Notes
+
+- [App Ideas](./app-notes/ideas.md)
+
 # Reference
 
 - [Spec Compliance](./reference/spec-compliance.md)
 - [External Links](./reference/external-links.md)
+
+# API Reference
+
+- [API Overview](./api/overview.md)
+- [Application Patterns](./api/patterns.md)
+
+# Releases
+
+- [0.1.0-alpha](./releases/v0-1-0-alpha.md)
 
 ---
 
