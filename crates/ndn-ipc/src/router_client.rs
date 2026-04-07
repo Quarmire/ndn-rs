@@ -6,6 +6,12 @@
 /// - Registering/unregistering prefixes via NFD `rib/register`/`rib/unregister`
 /// - Sending and receiving NDN packets on the data plane
 ///
+/// # Mobile (Android / iOS)
+///
+/// On mobile the forwarder runs in-process; there is no separate router daemon
+/// to connect to.  Use [`ndn_engine::ForwarderEngine`] in embedded mode with
+/// an [`ndn_face_local::AppFace`] instead of `RouterClient`.
+///
 /// # Connection flow (SHM preferred)
 ///
 /// ```text

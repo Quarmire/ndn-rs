@@ -36,6 +36,8 @@ members = [
     "binaries/ndn-bench",
     # Embedded
     "crates/ndn-embedded",
+    # Mobile (Android / iOS)
+    "crates/ndn-mobile",
     # Python bindings
     "bindings/ndn-python",
     # Examples
@@ -71,13 +73,14 @@ ndn-config    = { path = "crates/ndn-config" }
 ndn-discovery = { path = "crates/ndn-discovery" }
 ndn-face-net      = { path = "crates/ndn-face-net" }
 ndn-face-local    = { path = "crates/ndn-face-local" }
-ndn-face-serial   = { path = "crates/ndn-face-serial" }
+ndn-face-serial   = { path = "crates/ndn-face-serial", default-features = false }
 ndn-face-l2 = { path = "crates/ndn-face-l2" }
 ndn-strategy-wasm = { path = "crates/ndn-strategy-wasm" }
 ndn-research  = { path = "crates/ndn-research" }
 ndn-compute   = { path = "crates/ndn-compute" }
 ndn-sync      = { path = "crates/ndn-sync" }
 ndn-embedded  = { path = "crates/ndn-embedded" }
+ndn-mobile    = { path = "crates/ndn-mobile" }
 ndn-wasm      = { path = "crates/ndn-wasm" }
 ndn-sim       = { path = "crates/ndn-sim" }
 

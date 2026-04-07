@@ -7,8 +7,9 @@ license.workspace = true
 
 [features]
 ## Custom SPSC ring-buffer SHM face.
-## Wakeup: futex on Linux (direct syscall, no PRIVATE flag for cross-process SHM),
-## named FIFO pipe on other Unix.  Requires POSIX shm_open.  Unix only.
+## Wakeup: named FIFO pipe pairs; wakes Tokio's reactor via AsyncFd with no
+## thread-pool round-trips.  Requires POSIX shm_open and mkfifo.
+## Unix only, excluding Android and iOS (use AppFace for mobile in-process IPC).
 spsc-shm = ["dep:libc"]
 
 

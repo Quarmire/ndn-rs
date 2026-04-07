@@ -16,6 +16,9 @@
 //! - **Linux** — `AF_PACKET` raw sockets (full feature set)
 //! - **macOS** — `PF_NDRV` for Ethernet faces
 //! - **Windows** — Npcap/WinPcap for Ethernet faces
+//! - **Android / iOS** — raw Ethernet faces are unavailable; only [`RadioTable`]
+//!   and [`NDN_ETHERTYPE`] are exported. Use `UdpFace`/`TcpFace` and `AppFace`
+//!   from `ndn-face-net`/`ndn-face-local` for mobile deployments.
 
 #![allow(missing_docs)]
 

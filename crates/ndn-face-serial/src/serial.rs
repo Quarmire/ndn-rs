@@ -54,7 +54,9 @@ use ndn_transport::{Face, FaceError};
 #[cfg(not(feature = "serial"))]
 pub struct SerialFace {
     id: FaceId,
+    #[allow(dead_code)]
     port: String,
+    #[allow(dead_code)]
     baud: u32,
 }
 

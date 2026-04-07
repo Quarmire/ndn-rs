@@ -1616,6 +1616,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "ndn-mobile"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ndn-app",
+ "ndn-discovery",
+ "ndn-engine",
+ "ndn-face-local",
+ "ndn-face-net",
+ "ndn-face-serial",
+ "ndn-packet",
+ "ndn-security",
+ "ndn-store",
+ "ndn-transport",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "ndn-packet"
 version = "0.1.0"
 dependencies = [
