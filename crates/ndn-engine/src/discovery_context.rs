@@ -88,6 +88,7 @@ impl DiscoveryContext for EngineDiscoveryContext {
         let (send_tx, send_rx) = mpsc::channel(DEFAULT_SEND_QUEUE_CAP);
         let cancel = self.cancel.child_token();
 
+        #[cfg(feature = "face-net")]
         let state = if kind == ndn_transport::FaceKind::Udp {
             FaceState::new_reliable(
                 cancel.clone(),
@@ -98,6 +99,8 @@ impl DiscoveryContext for EngineDiscoveryContext {
         } else {
             FaceState::new(cancel.clone(), FacePersistency::OnDemand, send_tx)
         };
+        #[cfg(not(feature = "face-net"))]
+        let state = FaceState::new(cancel.clone(), FacePersistency::OnDemand, send_tx);
         inner.face_states.insert(face_id, state);
         inner.face_table.insert_arc(Arc::clone(&face));
 

@@ -2,6 +2,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
+#[cfg(not(target_arch = "wasm32"))]
 use dashmap::DashMap;
 use smallvec::SmallVec;
 
@@ -122,27 +123,76 @@ impl PitEntry {
 
 /// The Pending Interest Table.
 ///
-/// `DashMap` provides sharded concurrent access with no global lock on the
-/// forwarding hot path.
+/// On native targets uses `DashMap` for sharded concurrent access with no
+/// global lock on the forwarding hot path. On `wasm32` uses a
+/// `Mutex<HashMap>` (single-threaded WASM has no contention).
 pub struct Pit {
+    #[cfg(not(target_arch = "wasm32"))]
     entries: DashMap<PitToken, PitEntry>,
+    #[cfg(target_arch = "wasm32")]
+    entries: std::sync::Mutex<std::collections::HashMap<PitToken, PitEntry>>,
 }
 
 impl Pit {
     pub fn new() -> Self {
         Self {
+            #[cfg(not(target_arch = "wasm32"))]
             entries: DashMap::new(),
+            #[cfg(target_arch = "wasm32")]
+            entries: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
     pub fn clear(&self) {
+        #[cfg(not(target_arch = "wasm32"))]
         self.entries.clear();
+        #[cfg(target_arch = "wasm32")]
+        self.entries.lock().unwrap().clear();
     }
 
     pub fn insert(&self, token: PitToken, entry: PitEntry) {
-        self.entries.insert(token, entry);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.entries.insert(token, entry);
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.entries.lock().unwrap().insert(token, entry);
+        }
     }
 
+    /// Returns `true` if the PIT contains an entry for `token`.
+    pub fn contains(&self, token: &PitToken) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        return self.entries.contains_key(token);
+        #[cfg(target_arch = "wasm32")]
+        return self.entries.lock().unwrap().contains_key(token);
+    }
+
+    /// Apply `f` to the entry for `token`, returning the closure's result.
+    /// Returns `None` if no entry exists.
+    pub fn with_entry<R, F: FnOnce(&PitEntry) -> R>(&self, token: &PitToken, f: F) -> Option<R> {
+        #[cfg(not(target_arch = "wasm32"))]
+        return self.entries.get(token).map(|e| f(&e));
+        #[cfg(target_arch = "wasm32")]
+        return self.entries.lock().unwrap().get(token).map(f);
+    }
+
+    /// Apply `f` to the mutable entry for `token`, returning the closure's result.
+    /// Returns `None` if no entry exists.
+    pub fn with_entry_mut<R, F: FnOnce(&mut PitEntry) -> R>(
+        &self,
+        token: &PitToken,
+        f: F,
+    ) -> Option<R> {
+        #[cfg(not(target_arch = "wasm32"))]
+        return self.entries.get_mut(token).map(|mut e| f(&mut e));
+        #[cfg(target_arch = "wasm32")]
+        return self.entries.lock().unwrap().get_mut(token).map(f);
+    }
+
+    /// Look up an entry by reference. Prefer `contains()` or `with_entry()` for new code.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn get(
         &self,
         token: &PitToken,
@@ -150,6 +200,8 @@ impl Pit {
         self.entries.get(token)
     }
 
+    /// Look up a mutable entry. Prefer `with_entry_mut()` for new code.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn get_mut(
         &self,
         token: &PitToken,
@@ -158,30 +210,55 @@ impl Pit {
     }
 
     pub fn remove(&self, token: &PitToken) -> Option<(PitToken, PitEntry)> {
-        self.entries.remove(token)
+        #[cfg(not(target_arch = "wasm32"))]
+        return self.entries.remove(token);
+        #[cfg(target_arch = "wasm32")]
+        return self.entries.lock().unwrap().remove(token).map(|v| (*token, v));
     }
 
     pub fn len(&self) -> usize {
-        self.entries.len()
+        #[cfg(not(target_arch = "wasm32"))]
+        return self.entries.len();
+        #[cfg(target_arch = "wasm32")]
+        return self.entries.lock().unwrap().len();
     }
 
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        #[cfg(not(target_arch = "wasm32"))]
+        return self.entries.is_empty();
+        #[cfg(target_arch = "wasm32")]
+        return self.entries.lock().unwrap().is_empty();
     }
 
     /// Remove all entries whose `expires_at` ≤ `now_ns`.
     /// Returns the tokens of expired entries.
     pub fn drain_expired(&self, now_ns: u64) -> Vec<PitToken> {
-        let expired: Vec<PitToken> = self
-            .entries
-            .iter()
-            .filter(|r| r.expires_at <= now_ns)
-            .map(|r| *r.key())
-            .collect();
-        for token in &expired {
-            self.entries.remove(token);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let expired: Vec<PitToken> = self
+                .entries
+                .iter()
+                .filter(|r| r.expires_at <= now_ns)
+                .map(|r| *r.key())
+                .collect();
+            for token in &expired {
+                self.entries.remove(token);
+            }
+            expired
         }
-        expired
+        #[cfg(target_arch = "wasm32")]
+        {
+            let mut entries = self.entries.lock().unwrap();
+            let expired: Vec<PitToken> = entries
+                .iter()
+                .filter(|(_, e)| e.expires_at <= now_ns)
+                .map(|(k, _)| *k)
+                .collect();
+            for token in &expired {
+                entries.remove(token);
+            }
+            expired
+        }
     }
 
     /// Remove PIT entries whose **only** in-record face is `face_id`.
@@ -190,35 +267,69 @@ impl Pit {
     /// dead face's records removed). This prevents stale PIT entries from
     /// suppressing Interests after a face disconnects.
     pub fn remove_face(&self, face_id: u32) -> usize {
-        // First pass: identify entries to remove entirely (sole consumer was this face).
-        let mut to_remove = Vec::new();
-        let mut to_prune = Vec::new();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            // First pass: identify entries to remove entirely (sole consumer was this face).
+            let mut to_remove = Vec::new();
+            let mut to_prune = Vec::new();
 
-        for entry in self.entries.iter() {
-            let all_on_face = entry.in_records.iter().all(|r| r.face_id == face_id);
-            let any_on_face = entry.in_records.iter().any(|r| r.face_id == face_id);
+            for entry in self.entries.iter() {
+                let all_on_face = entry.in_records.iter().all(|r| r.face_id == face_id);
+                let any_on_face = entry.in_records.iter().any(|r| r.face_id == face_id);
 
-            if all_on_face && !entry.in_records.is_empty() {
-                to_remove.push(*entry.key());
-            } else if any_on_face {
-                to_prune.push(*entry.key());
+                if all_on_face && !entry.in_records.is_empty() {
+                    to_remove.push(*entry.key());
+                } else if any_on_face {
+                    to_prune.push(*entry.key());
+                }
             }
-        }
 
-        let removed = to_remove.len();
+            let removed = to_remove.len();
 
-        for token in &to_remove {
-            self.entries.remove(token);
-        }
-
-        // Second pass: prune in-records for the dead face from multi-consumer entries.
-        for token in &to_prune {
-            if let Some(mut entry) = self.entries.get_mut(token) {
-                entry.in_records.retain(|r| r.face_id != face_id);
+            for token in &to_remove {
+                self.entries.remove(token);
             }
-        }
 
-        removed
+            // Second pass: prune in-records for the dead face from multi-consumer entries.
+            for token in &to_prune {
+                if let Some(mut entry) = self.entries.get_mut(token) {
+                    entry.in_records.retain(|r| r.face_id != face_id);
+                }
+            }
+
+            removed
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let mut entries = self.entries.lock().unwrap();
+            let mut to_remove = Vec::new();
+            let mut to_prune = Vec::new();
+
+            for (token, entry) in entries.iter() {
+                let all_on_face = entry.in_records.iter().all(|r| r.face_id == face_id);
+                let any_on_face = entry.in_records.iter().any(|r| r.face_id == face_id);
+
+                if all_on_face && !entry.in_records.is_empty() {
+                    to_remove.push(*token);
+                } else if any_on_face {
+                    to_prune.push(*token);
+                }
+            }
+
+            let removed = to_remove.len();
+
+            for token in &to_remove {
+                entries.remove(token);
+            }
+
+            for token in &to_prune {
+                if let Some(entry) = entries.get_mut(token) {
+                    entry.in_records.retain(|r| r.face_id != face_id);
+                }
+            }
+
+            removed
+        }
     }
 }
 
@@ -365,11 +476,13 @@ mod tests {
         assert_eq!(pit.len(), 2); // entry2 and entry3 remain
 
         // entry2 should still exist but only have face 2's in-record.
-        let entry2 = pit.get(&token2).unwrap();
-        assert_eq!(entry2.in_records.len(), 1);
-        assert_eq!(entry2.in_records[0].face_id, 2);
+        pit.with_entry(&token2, |entry2| {
+            assert_eq!(entry2.in_records.len(), 1);
+            assert_eq!(entry2.in_records[0].face_id, 2);
+        })
+        .expect("entry2 should exist");
 
         // entry3 is untouched.
-        assert!(pit.get(&token3).is_some());
+        assert!(pit.contains(&token3));
     }
 }

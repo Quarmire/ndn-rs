@@ -97,6 +97,7 @@ impl PacketDispatcher {
                 if !dispatcher.face_states.contains_key(&face_id) {
                     let (send_tx, send_rx) = mpsc::channel(DEFAULT_SEND_QUEUE_CAP);
                     let persistency = FacePersistency::Permanent;
+                    #[cfg(feature = "face-net")]
                     let state = if face.kind() == FaceKind::Udp {
                         FaceState::new_reliable(
                             cancel.child_token(),
@@ -107,6 +108,8 @@ impl PacketDispatcher {
                     } else {
                         FaceState::new(cancel.child_token(), persistency, send_tx)
                     };
+                    #[cfg(not(feature = "face-net"))]
+                    let state = FaceState::new(cancel.child_token(), persistency, send_tx);
                     dispatcher.face_states.insert(face_id, state);
                     // Spawn per-face send task.
                     let send_face = Arc::clone(&face);

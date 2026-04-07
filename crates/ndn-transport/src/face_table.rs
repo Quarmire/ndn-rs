@@ -1,3 +1,4 @@
+#[cfg(not(target_arch = "wasm32"))]
 use dashmap::DashMap;
 use std::sync::{Arc, Mutex};
 
@@ -18,12 +19,15 @@ type RecvWithAddrResult =
 /// (`>= 0xFFFF_0000`) are never allocated by `alloc_id()` and are used for
 /// internal engine faces (e.g. the management `AppFace`).
 pub struct FaceTable {
+    #[cfg(not(target_arch = "wasm32"))]
     faces: DashMap<FaceId, Arc<dyn ErasedFace>>,
+    #[cfg(target_arch = "wasm32")]
+    faces: Mutex<std::collections::HashMap<FaceId, Arc<dyn ErasedFace>>>,
     next_id: std::sync::atomic::AtomicU32,
     free: Mutex<Vec<u32>>,
 }
 
-/// Object-safe wrapper around the `Face` trait so it can be stored in a `DashMap`.
+/// Object-safe wrapper around the `Face` trait so it can be stored in the face table.
 pub trait ErasedFace: Send + Sync + 'static {
     fn id(&self) -> FaceId;
     fn kind(&self) -> crate::face::FaceKind;
@@ -126,7 +130,10 @@ pub const RESERVED_FACE_ID_MIN: u32 = 0xFFFF_0000;
 impl FaceTable {
     pub fn new() -> Self {
         Self {
+            #[cfg(not(target_arch = "wasm32"))]
             faces: DashMap::new(),
+            #[cfg(target_arch = "wasm32")]
+            faces: Mutex::new(std::collections::HashMap::new()),
             next_id: std::sync::atomic::AtomicU32::new(1),
             free: Mutex::new(Vec::new()),
         }
@@ -163,7 +170,11 @@ impl FaceTable {
     /// Register a face. Returns the assigned `FaceId`.
     pub fn insert<F: Face>(&self, face: F) -> FaceId {
         let id = face.id();
-        self.faces.insert(id, Arc::new(face));
+        let arc: Arc<dyn ErasedFace> = Arc::new(face);
+        #[cfg(not(target_arch = "wasm32"))]
+        self.faces.insert(id, arc);
+        #[cfg(target_arch = "wasm32")]
+        self.faces.lock().unwrap().insert(id, arc);
         id
     }
 
@@ -171,18 +182,27 @@ impl FaceTable {
     /// that is already stored in an `Arc`).  Returns the face's `FaceId`.
     pub fn insert_arc(&self, face: Arc<dyn ErasedFace>) -> FaceId {
         let id = face.id();
+        #[cfg(not(target_arch = "wasm32"))]
         self.faces.insert(id, face);
+        #[cfg(target_arch = "wasm32")]
+        self.faces.lock().unwrap().insert(id, face);
         id
     }
 
     /// Look up a face handle. Returns `None` if the face has been removed.
     pub fn get(&self, id: FaceId) -> Option<Arc<dyn ErasedFace>> {
-        self.faces.get(&id).map(|r| Arc::clone(&*r))
+        #[cfg(not(target_arch = "wasm32"))]
+        return self.faces.get(&id).map(|r| Arc::clone(&*r));
+        #[cfg(target_arch = "wasm32")]
+        return self.faces.lock().unwrap().get(&id).map(Arc::clone);
     }
 
     /// Remove a face from the table, recycling its ID for future `alloc_id()` calls.
     pub fn remove(&self, id: FaceId) {
+        #[cfg(not(target_arch = "wasm32"))]
         self.faces.remove(&id);
+        #[cfg(target_arch = "wasm32")]
+        self.faces.lock().unwrap().remove(&id);
         // Return dynamic IDs to the free list for reuse.
         if id.0 < RESERVED_FACE_ID_MIN
             && let Ok(mut free) = self.free.lock()
@@ -193,26 +213,46 @@ impl FaceTable {
 
     /// Number of registered faces.
     pub fn len(&self) -> usize {
-        self.faces.len()
+        #[cfg(not(target_arch = "wasm32"))]
+        return self.faces.len();
+        #[cfg(target_arch = "wasm32")]
+        return self.faces.lock().unwrap().len();
     }
 
     pub fn is_empty(&self) -> bool {
-        self.faces.is_empty()
+        #[cfg(not(target_arch = "wasm32"))]
+        return self.faces.is_empty();
+        #[cfg(target_arch = "wasm32")]
+        return self.faces.lock().unwrap().is_empty();
     }
 
     /// Iterate over all registered face IDs.
     pub fn face_ids(&self) -> Vec<FaceId> {
-        self.faces.iter().map(|r| *r.key()).collect()
+        #[cfg(not(target_arch = "wasm32"))]
+        return self.faces.iter().map(|r| *r.key()).collect();
+        #[cfg(target_arch = "wasm32")]
+        return self.faces.lock().unwrap().keys().copied().collect();
     }
 
     /// Return all registered faces as `(FaceId, FaceKind)` pairs.
     pub fn face_entries(&self) -> Vec<(FaceId, crate::face::FaceKind)> {
-        self.faces.iter().map(|r| (r.id(), r.kind())).collect()
+        #[cfg(not(target_arch = "wasm32"))]
+        return self.faces.iter().map(|r| (r.id(), r.kind())).collect();
+        #[cfg(target_arch = "wasm32")]
+        return self
+            .faces
+            .lock()
+            .unwrap()
+            .values()
+            .map(|f| (f.id(), f.kind()))
+            .collect();
     }
 
     /// Return detailed info for all registered faces.
     pub fn face_info(&self) -> Vec<FaceInfo> {
-        self.faces
+        #[cfg(not(target_arch = "wasm32"))]
+        return self
+            .faces
             .iter()
             .map(|r| FaceInfo {
                 id: r.id(),
@@ -220,7 +260,20 @@ impl FaceTable {
                 remote_uri: r.remote_uri(),
                 local_uri: r.local_uri(),
             })
-            .collect()
+            .collect();
+        #[cfg(target_arch = "wasm32")]
+        return self
+            .faces
+            .lock()
+            .unwrap()
+            .values()
+            .map(|f| FaceInfo {
+                id: f.id(),
+                kind: f.kind(),
+                remote_uri: f.remote_uri(),
+                local_uri: f.local_uri(),
+            })
+            .collect();
     }
 }
 

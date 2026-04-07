@@ -5,10 +5,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["face-net"]
+face-net = ["dep:ndn-face-net"]
+
 [dependencies]
 ndn-packet    = { workspace = true, features = ["std"] }
 ndn-transport = { workspace = true }
-ndn-face-net  = { workspace = true }
+ndn-face-net  = { workspace = true, optional = true }
 ndn-discovery = { workspace = true }
 ndn-store     = { workspace = true }
 ndn-pipeline  = { workspace = true }

@@ -50,6 +50,7 @@ pub struct FaceState {
     /// backpressure.
     pub send_tx: mpsc::Sender<bytes::Bytes>,
     /// NDNLPv2 per-hop reliability state (unicast UDP faces only).
+    #[cfg(feature = "face-net")]
     pub reliability: Option<std::sync::Mutex<ndn_face_net::reliability::LpReliability>>,
 }
 
@@ -68,11 +69,13 @@ impl FaceState {
             persistency,
             last_activity: AtomicU64::new(now),
             send_tx,
+            #[cfg(feature = "face-net")]
             reliability: None,
         }
     }
 
     /// Create a FaceState with NDNLPv2 reliability enabled.
+    #[cfg(feature = "face-net")]
     pub fn new_reliable(
         cancel: CancellationToken,
         persistency: FacePersistency,
@@ -193,8 +196,8 @@ impl ForwarderEngine {
         );
         self.inner
             .pit
-            .get(&token)
-            .and_then(|entry| entry.in_records.first().map(|r| FaceId(r.face_id)))
+            .with_entry(&token, |entry| entry.in_records.first().map(|r| FaceId(r.face_id)))
+            .flatten()
     }
 
     /// Register a face and immediately start its packet-reader task.
@@ -219,6 +222,7 @@ impl ForwarderEngine {
         let face_id = face.id();
         let kind = face.kind();
         let (send_tx, send_rx) = mpsc::channel(DEFAULT_SEND_QUEUE_CAP);
+        #[cfg(feature = "face-net")]
         let state = if kind == ndn_transport::FaceKind::Udp {
             FaceState::new_reliable(
                 cancel.clone(),
@@ -229,6 +233,8 @@ impl ForwarderEngine {
         } else {
             FaceState::new(cancel.clone(), persistency, send_tx)
         };
+        #[cfg(not(feature = "face-net"))]
+        let state = FaceState::new(cancel.clone(), persistency, send_tx);
         self.inner.face_states.insert(face_id, state);
         self.inner.face_table.insert(face);
         let erased = self
@@ -292,6 +298,7 @@ impl ForwarderEngine {
         let face_id = face.id();
         let kind = face.kind();
         let (send_tx, send_rx) = mpsc::channel(DEFAULT_SEND_QUEUE_CAP);
+        #[cfg(feature = "face-net")]
         let state = if kind == ndn_transport::FaceKind::Udp {
             FaceState::new_reliable(
                 cancel.clone(),
@@ -302,6 +309,8 @@ impl ForwarderEngine {
         } else {
             FaceState::new(cancel.clone(), FacePersistency::OnDemand, send_tx)
         };
+        #[cfg(not(feature = "face-net"))]
+        let state = FaceState::new(cancel.clone(), FacePersistency::OnDemand, send_tx);
         self.inner.face_states.insert(face_id, state);
         self.inner.face_table.insert(face);
 

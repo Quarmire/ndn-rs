@@ -23,6 +23,8 @@ members = [
     "crates/ndn-discovery",
     # Simulation
     "crates/ndn-sim",
+    # WebAssembly bindings for browser simulation
+    "crates/ndn-wasm",
     # Layer 5 — research extensions
     "crates/ndn-strategy-wasm",
     "crates/ndn-research",
@@ -76,6 +78,7 @@ ndn-research  = { path = "crates/ndn-research" }
 ndn-compute   = { path = "crates/ndn-compute" }
 ndn-sync      = { path = "crates/ndn-sync" }
 ndn-embedded  = { path = "crates/ndn-embedded" }
+ndn-wasm      = { path = "crates/ndn-wasm" }
 ndn-sim       = { path = "crates/ndn-sim" }
 
 # Core async runtime — individual crates enable only the features they need

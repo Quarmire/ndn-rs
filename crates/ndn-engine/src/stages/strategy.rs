@@ -195,7 +195,7 @@ impl StrategyStage {
                         // Re-check PIT — if the entry was already satisfied or
                         // expired, do not send (the Interest is no longer pending).
                         if let Some(token) = pit_token
-                            && pit.get(&token).is_none()
+                            && !pit.contains(&token)
                         {
                             return; // PIT entry gone — already satisfied/expired.
                         }
