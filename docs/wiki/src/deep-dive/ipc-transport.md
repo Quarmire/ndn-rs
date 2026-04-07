@@ -51,24 +51,26 @@ The performance tier for cross-process communication. Instead of pushing packets
 The SHM region layout is carefully designed around cache-line alignment to avoid false sharing between the producer and consumer cores:
 
 ```mermaid
-block-beta
-    columns 1
-    block:header["Header (7 cache lines, 448 bytes)"]
-        columns 7
-        A["Magic\n+ Capacity\n+ Slot Size"] B["a2e Tail\n(app writes)"] C["a2e Head\n(engine reads)"] D["e2a Tail\n(engine writes)"] E["e2a Head\n(app reads)"] F["a2e Parked\n(engine flag)"] G["e2a Parked\n(app flag)"]
+flowchart TB
+    subgraph HDR["Header — 7 cache lines · 448 bytes"]
+        direction LR
+        h0["Magic\nCapacity\nSlot Size"] ~~~ h1["a2e Tail\napp writes →"] ~~~ h2["a2e Head\n← engine reads"] ~~~ h3["e2a Tail\nengine writes →"] ~~~ h4["e2a Head\n← app reads"] ~~~ h5["a2e Parked\nengine flag"] ~~~ h6["e2a Parked\napp flag"]
     end
-    block:a2e["App-to-Engine Ring (capacity x slot_stride)"]
-        columns 4
-        S0["Slot 0\n[len | payload]"] S1["Slot 1\n[len | payload]"] S2["..."] SN["Slot N-1\n[len | payload]"]
+    subgraph A2E["App → Engine Ring  (capacity × slot_stride)"]
+        direction LR
+        a0["Slot 0\nlen · payload"] ~~~ a1["Slot 1\nlen · payload"] ~~~ a2["  ···  "] ~~~ aN["Slot N-1\nlen · payload"]
     end
-    block:e2a["Engine-to-App Ring (capacity x slot_stride)"]
-        columns 4
-        T0["Slot 0\n[len | payload]"] T1["Slot 1\n[len | payload]"] T2["..."] TN["Slot N-1\n[len | payload]"]
+    subgraph E2A["Engine → App Ring  (capacity × slot_stride)"]
+        direction LR
+        e0["Slot 0\nlen · payload"] ~~~ e1["Slot 1\nlen · payload"] ~~~ e2["  ···  "] ~~~ eN["Slot N-1\nlen · payload"]
     end
 
-    style header fill:#f0f4ff,stroke:#4a74c9
-    style a2e fill:#fff0f0,stroke:#c94a4a
-    style e2a fill:#f0fff0,stroke:#4ac94a
+    HDR ~~~ A2E
+    HDR ~~~ E2A
+
+    style HDR fill:#f0f4ff,stroke:#4a74c9
+    style A2E fill:#fff0f0,stroke:#c94a4a
+    style E2A fill:#f0fff0,stroke:#4ac94a
 ```
 
 Each ring has 256 slots by default, each holding up to 8960 bytes (enough for any standard NDN packet). The producer writes a 4-byte length prefix followed by the packet payload into the next slot, then advances the tail index with a `Release` store. The consumer reads the slot when head != tail, using an `Acquire` load to ensure it sees the complete write. No locks, no CAS loops -- just atomic loads and stores on cache-line-separated indices.

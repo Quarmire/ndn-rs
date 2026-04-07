@@ -55,32 +55,32 @@ To understand how these pieces fit together, follow a Data packet arriving at a 
 **The packet becomes `SafeData`.** If the entire chain checks out, the `Data` is wrapped in a `SafeData` struct. From this point forward, the type system guarantees that this data has been verified. Code that expects `SafeData` literally cannot receive unverified data -- it won't compile.
 
 ```mermaid
-flowchart TB
-    Data["Data Packet<br/>/sensor/node1/temp<br/>SignedBy: /sensor/node1/KEY/k1"]
-    --> SchemaCheck{"Trust schema<br/>allows<br/>(data_name, key_name)?"}
+flowchart LR
+    Data["Data Packet\n/sensor/node1/temp\nSigned by /sensor/node1/KEY/k1"]
+    --> SchemaCheck{"Trust schema\nallows\n(data, key)?"}
 
-    SchemaCheck -->|No| Reject["REJECT<br/>SchemaMismatch"]
-    SchemaCheck -->|Yes| FetchCert["Resolve certificate<br/>/sensor/node1/KEY/k1"]
+    SchemaCheck -->|No| Reject["REJECT\nSchemaMismatch"]
+    SchemaCheck -->|Yes| CacheHit{"In\nCertCache?"}
 
-    FetchCert --> CacheHit{"In CertCache?"}
-    CacheHit -->|Yes| VerifySig1["Verify Data signature<br/>with cert's public key"]
-    CacheHit -->|No| Fetch["CertFetcher:<br/>send Interest for cert"]
-    Fetch -->|Not found| Pending["PENDING<br/>(retry later)"]
+    CacheHit -->|Yes| VerifySig1["Verify signature\nwith cert pubkey"]
+    CacheHit -->|No| Fetch["Fetch cert\nvia Interest"]
+    Fetch -->|"Not found"| Pending["PENDING\n(retry later)"]
     Fetch -->|Found| VerifySig1
 
-    VerifySig1 -->|Invalid| RejectSig["REJECT<br/>InvalidSignature"]
-    VerifySig1 -->|Valid| CheckIssuer["Check cert's issuer"]
+    VerifySig1 -->|Invalid| RejectSig["REJECT\nBadSignature"]
+    VerifySig1 -->|Valid| IsAnchor{"Issuer is\ntrust anchor?"}
 
-    CheckIssuer --> IsAnchor{"Is issuer a<br/>trust anchor?"}
-    IsAnchor -->|Yes| VerifyAnchor["Verify cert signature<br/>with anchor's public key"]
-    IsAnchor -->|No| WalkUp["Fetch issuer cert,<br/>continue chain walk"]
+    IsAnchor -->|Yes| VerifyAnchor["Verify cert\nwith anchor key"]
+    IsAnchor -->|No| DepthCheck{"depth <\nmax_chain?"}
 
-    WalkUp --> DepthCheck{"depth < max_chain?"}
-    DepthCheck -->|No| RejectDeep["REJECT<br/>ChainTooDeep"]
-    DepthCheck -->|Yes| CheckIssuer
+    DepthCheck -->|No| RejectDeep["REJECT\nChainTooDeep"]
+    DepthCheck -->|Yes| CacheHit2{"Fetch issuer\ncert (cached?)"}
+    CacheHit2 -->|Yes| VerifySig1
+    CacheHit2 -->|No| FetchIssuer["Fetch issuer\nvia Interest"]
+    FetchIssuer --> VerifySig1
 
-    VerifyAnchor -->|Valid| Accept["ACCEPT<br/>Return SafeData"]
-    VerifyAnchor -->|Invalid| RejectAnchor["REJECT<br/>InvalidSignature"]
+    VerifyAnchor -->|Valid| Accept["ACCEPT\nSafeData ✓"]
+    VerifyAnchor -->|Invalid| RejectAnchor["REJECT\nBadSignature"]
 
     style Accept fill:#2d7a3a,color:#fff
     style Reject fill:#8c2d2d,color:#fff

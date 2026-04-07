@@ -9,23 +9,14 @@ In ndn-rs, a packet enters the system as a `Bytes` buffer from a face, flows thr
 > **💡 Key insight:** The central design principle is **trait composition over class hierarchy**. NFD and ndn-cxx model NDN with deep inheritance trees (Strategy, Face, Transport, LinkService). ndn-rs replaces each hierarchy with a flat trait and composes behaviors by wrapping types (e.g., `StrategyFilter` wraps a `Strategy`, `ShardedCs` wraps a `ContentStore`). This makes the extension points orthogonal -- you can combine any strategy with any filter without writing a new subclass.
 
 ```mermaid
-graph LR
-    subgraph Interest Pipeline
+flowchart LR
+    subgraph "Interest Pipeline"
         A["FaceCheck"] -->|"Continue"| B["TlvDecode"]
         B -->|"Continue"| C["CsLookup"]
-        C -->|"Continue (miss)"| D["PitCheck"]
-        C -->|"Send (hit)"| OUT["Dispatch"]
+        C -->|"Continue\n(miss)"| D["PitCheck"]
+        C -->|"Send\n(hit)"| OUT["Dispatch"]
         D -->|"Continue"| E["Strategy"]
-        E -->|"Continue"| OUT
-    end
-
-    subgraph Action Enum
-        direction TB
-        R1["Continue -- pass to next stage"]
-        R2["Send -- short-circuit to dispatch"]
-        R3["Drop -- discard packet"]
-        R4["Nack -- send Nack upstream"]
-        R5["Satisfy -- Data satisfies PIT"]
+        E -->|"Forward / Nack\n/ Suppress"| OUT
     end
 
     style A fill:#e8f4fd,stroke:#2196F3
@@ -108,6 +99,7 @@ graph TB
 ndn-rs is built on Tokio. Each face runs its own async task, pushing `RawPacket` values into a shared `mpsc` channel. A single pipeline runner drains the channel and processes packets inline through the stage sequence. A separate expiry task drains expired PIT entries on a 1 ms tick using a hierarchical timing wheel.
 
 ```mermaid
+%%{init: {"layout": "elk"}}%%
 graph TD
     subgraph Faces
         F1["UdpFace task"]

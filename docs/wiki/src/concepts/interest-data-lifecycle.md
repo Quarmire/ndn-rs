@@ -54,27 +54,20 @@ pub struct PacketContext {
 Notice that `name` starts as `None` -- it won't be populated until the TLV decode stage runs. This progressive population is deliberate: a Content Store hit can short-circuit the pipeline before expensive fields like nonce or lifetime are ever accessed.
 
 ```mermaid
-flowchart TD
-    arrive["Packet Arrives"] --> fc["FaceCheck"]
-    fc --> decode["TlvDecode"]
-    decode --> cs["CsLookup"]
-    cs --> pit["PitCheck"]
-    pit --> strat["Strategy"]
-    strat --> dispatch["Dispatch"]
+flowchart LR
+    FC["FaceCheck\n──────────\nface_id\nraw_bytes\narrival"]
+    -->|"Continue"| DEC["TlvDecode\n──────────\nname\npacket"]
+    -->|"Continue"| CS["CsLookup\n──────────\ncs_hit"]
+    -->|"Continue"| PIT["PitCheck\n──────────\npit_token\nnonce check"]
+    -->|"Continue"| STR["Strategy\n──────────\nout_faces\nFIB match"]
+    -->|"Forward"| DSP["Dispatch\n──────────\nsend to\nout_faces"]
 
-    fc -.- fc_fields["face_id: set\nraw_bytes: set\narrival: set"]
-    decode -.- decode_fields["name: populated\npacket: Interest/Data decoded"]
-    cs -.- cs_fields["cs_hit: true/false"]
-    pit -.- pit_fields["pit_token: assigned\nnonces checked"]
-    strat -.- strat_fields["out_faces: populated\nFIB match result applied"]
-    dispatch -.- dispatch_fields["Packet sent to out_faces"]
-
-    style fc_fields fill:#e8f4f8,stroke:#888
-    style decode_fields fill:#e8f4f8,stroke:#888
-    style cs_fields fill:#e8f4f8,stroke:#888
-    style pit_fields fill:#e8f4f8,stroke:#888
-    style strat_fields fill:#e8f4f8,stroke:#888
-    style dispatch_fields fill:#e8f4f8,stroke:#888
+    style FC  fill:#e8f4fd,stroke:#2196F3
+    style DEC fill:#e8f4fd,stroke:#2196F3
+    style CS  fill:#fff3e0,stroke:#FF9800
+    style PIT fill:#e8f4fd,stroke:#2196F3
+    style STR fill:#f3e5f5,stroke:#9C27B0
+    style DSP fill:#e8f5e9,stroke:#4CAF50
 ```
 
 Now let's follow an Interest through the full journey.

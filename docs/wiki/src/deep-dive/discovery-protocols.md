@@ -150,35 +150,12 @@ As hello and probe traffic flows, each neighbor transitions through a well-defin
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Probing: First hello received
-    Probing --> Established: Hello Data reply received
-    Established --> Stale: Liveness timeout exceeded
-    Stale --> Established: Hello Data reply received
-    Stale --> Absent: miss_count >= liveness_miss_count
-    Absent --> [*]: Entry removed, faces torn down
-
-    note right of Probing
-        Waiting for initial hello response.
-        Attempts counter tracks consecutive misses.
-    end note
-
-    note right of Established
-        Link confirmed reachable.
-        last_seen updated on every successful exchange.
-        RTT measured via EWMA (alpha = 0.125).
-    end note
-
-    note right of Stale
-        Missed hellos. miss_count increments each
-        liveness_timeout interval. Unicast hello +
-        emergency gossip to K peers dispatched.
-    end note
-
-    note right of Absent
-        Peer unreachable. Faces removed,
-        FIB entries withdrawn, neighbor
-        diffs broadcast to propagate removal.
-    end note
+    [*] --> Probing : First hello sent
+    Probing --> Established : Hello Data reply received\n(RTT measured, FIB populated)
+    Established --> Stale : Liveness timeout exceeded\n(unicast hello + gossip sent)
+    Stale --> Established : Hello Data reply received
+    Stale --> Absent : miss_count ≥ liveness_miss_count\n(faces removed, FIB withdrawn)
+    Absent --> [*] : Entry removed
 ```
 
 Each transition tells a story:
