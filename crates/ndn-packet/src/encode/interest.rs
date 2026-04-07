@@ -161,6 +161,27 @@ impl InterestBuilder {
         self
     }
 
+    /// Build the Interest wire and return a suitable local receive timeout.
+    ///
+    /// The timeout is the Interest lifetime plus a 500 ms forwarding buffer.
+    /// Use this with `Consumer::fetch_with` so you don't have to compute the
+    /// timeout manually:
+    ///
+    /// ```rust,ignore
+    /// use ndn_packet::encode::InterestBuilder;
+    /// let data = consumer.fetch_with(
+    ///     InterestBuilder::new("/ndn/test")
+    ///         .hop_limit(4)
+    ///         .forwarding_hint(vec!["/hint/hub".parse()?])
+    ///         .app_parameters(b"q=hello"),
+    /// ).await?;
+    /// ```
+    pub fn build_with_timeout(self) -> (Bytes, std::time::Duration) {
+        let lifetime = self.lifetime.unwrap_or(std::time::Duration::from_millis(4000));
+        let timeout = lifetime + std::time::Duration::from_millis(500);
+        (self.build(), timeout)
+    }
+
     pub fn build(self) -> Bytes {
         let lifetime_ms = self.lifetime.map(|d| d.as_millis() as u64).unwrap_or(4000);
 
