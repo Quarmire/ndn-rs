@@ -15,6 +15,32 @@ let mut consumer = Consumer::connect("/tmp/ndn-faces.sock").await?;
 let bytes = consumer.get("/example/data").await?;
 ```
 
+To set a **hop limit**, **forwarding hint**, or **application parameters**, use `Consumer::fetch_with` with an `InterestBuilder`:
+
+```rust
+use ndn_packet::encode::InterestBuilder;
+
+// Limit to 4 forwarding hops
+let data = consumer.fetch_with(
+    InterestBuilder::new("/ndn/remote/data").hop_limit(4)
+).await?;
+
+// Reach a producer via a delegation prefix (forwarding hint)
+let data = consumer.fetch_with(
+    InterestBuilder::new("/alice/files/photo.jpg")
+        .forwarding_hint(vec!["/campus/ndn-hub".parse()?])
+).await?;
+
+// Parameterised fetch — ApplicationParameters triggers
+// ParametersSha256DigestComponent auto-appended to the name
+let data = consumer.fetch_with(
+    InterestBuilder::new("/service/query")
+        .app_parameters(b"filter=recent&limit=10")
+).await?;
+```
+
+The local receive timeout is derived automatically from the Interest lifetime (+ 500 ms buffer). Call `fetch_wire` directly if you need a non-standard timeout.
+
 ---
 
 ## Serve Content on Demand
@@ -26,7 +52,7 @@ Register a prefix and respond to Interests with dynamically generated Data.
 ```rust
 let mut producer = Producer::connect("/tmp/ndn-faces.sock", "/sensor").await?;
 producer.serve(|interest| async move {
-    Some(DataBuilder::new(interest.name().clone()).content(b"42").build_unsigned())
+    Some(DataBuilder::new((*interest.name).clone(), b"42").build())
 }).await
 ```
 

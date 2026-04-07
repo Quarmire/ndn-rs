@@ -73,6 +73,42 @@ let wire = InterestBuilder::new("/example/sensor/temperature")
 let data = consumer.fetch_wire(wire, Duration::from_millis(600)).await?;
 ```
 
+To set a **hop limit**, **forwarding hint**, or **application parameters**, use `fetch_with`. The local timeout is derived automatically from the Interest lifetime:
+
+```rust
+use ndn_packet::encode::InterestBuilder;
+
+// Limit the Interest to 4 forwarding hops
+let data = consumer.fetch_with(
+    InterestBuilder::new("/ndn/remote/data").hop_limit(4)
+).await?;
+
+// Steer via a delegation prefix (forwarding hint)
+let data = consumer.fetch_with(
+    InterestBuilder::new("/alice/files/photo.jpg")
+        .forwarding_hint(vec!["/campus/ndn-hub".parse()?])
+).await?;
+
+// ApplicationParameters — the ParametersSha256DigestComponent is
+// computed and appended to the Name automatically
+let data = consumer.fetch_with(
+    InterestBuilder::new("/service/query")
+        .app_parameters(b"filter=recent&limit=10")
+).await?;
+```
+
+On the producer side these fields are accessible via the `Interest` argument:
+
+```rust
+producer.serve(|interest| async move {
+    println!("hop limit: {:?}", interest.hop_limit());
+    println!("params: {:?}", interest.app_parameters());
+    println!("hints: {:?}", interest.forwarding_hint());
+    // ...
+    Some(response_wire)
+}).await
+```
+
 ### Producer
 
 ```rust
@@ -86,13 +122,11 @@ async fn main() -> Result<(), AppError> {
     let mut producer = Producer::connect("/tmp/ndn-faces.sock", "/example").await?;
 
     producer.serve(|interest: Interest| async move {
-        let name = interest.name().to_string();
+        let name = interest.name.to_string();
         println!("Interest for: {name}");
 
         // Return Some(wire_bytes) to respond, None to silently drop.
-        let wire = DataBuilder::new(interest.name().clone())
-            .content(b"hello, NDN")
-            .build_unsigned();
+        let wire = DataBuilder::new((*interest.name).clone(), b"hello, NDN").build();
 
         Some(wire)
     }).await
@@ -159,9 +193,7 @@ async fn main() -> anyhow::Result<()> {
     // Run the producer in a background task.
     tokio::spawn(async move {
         producer.serve(|interest| async move {
-            let wire = DataBuilder::new(interest.name().clone())
-                .content(b"hello from embedded engine")
-                .build_unsigned();
+            let wire = DataBuilder::new((*interest.name).clone(), b"hello from embedded engine").build();
             Some(wire)
         }).await.ok();
     });
@@ -211,9 +243,7 @@ let mut producer = BlockingProducer::connect("/tmp/ndn-faces.sock", "/sensor")?;
 producer.serve(|interest| {
     // Synchronous handler — called on the runtime thread.
     let reading = read_sensor();  // blocking I/O is fine here
-    let wire = DataBuilder::new(interest.name().clone())
-        .content(reading.as_bytes())
-        .build_unsigned();
+    let wire = DataBuilder::new((*interest.name).clone(), reading.as_bytes()).build();
     Some(wire)
 })?;
 ```
@@ -309,10 +339,9 @@ async fn main() -> Result<(), AppError> {
         producer.serve(|interest: Interest| async move {
             // Read a sensor value and build a Data response.
             let reading = format!("{:.1}", read_temperature());
-            let wire = DataBuilder::new(interest.name().clone())
-                .content(reading.as_bytes())
+            let wire = DataBuilder::new((*interest.name).clone(), reading.as_bytes())
                 .freshness(Duration::from_secs(5))
-                .build_unsigned();
+                .build();
             Some(wire)
         }).await
     });
