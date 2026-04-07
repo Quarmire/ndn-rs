@@ -1,0 +1,24 @@
+[package]
+name = "ndn-identity"
+description = "NDN identity management: NdnIdentity lifecycle, NDNCERT enrollment, fleet zero-touch provisioning"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ndn-packet   = { workspace = true, features = ["std"] }
+ndn-security = { workspace = true }
+ndn-cert     = { workspace = true }
+ndn-did      = { workspace = true }
+ndn-app      = { workspace = true }
+bytes        = { workspace = true, features = ["std"] }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+thiserror    = { workspace = true }
+base64       = { workspace = true }
+futures      = { workspace = true }
+tokio        = { workspace = true, features = ["sync", "time", "rt"] }
+tracing      = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
