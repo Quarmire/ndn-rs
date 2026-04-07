@@ -211,7 +211,7 @@ impl PacketDispatcher {
         // Look up PIT entry by the nacked Interest's name.
         let token = PitToken::from_interest(&nack.interest.name, Some(nack.interest.selectors()));
 
-        let has_pit_entry = self.strategy.pit.get(&token).is_some();
+        let has_pit_entry = self.strategy.pit.contains(&token);
         if !has_pit_entry {
             debug!(face=?ctx.face_id, "nack for unknown PIT entry, dropping");
             return;

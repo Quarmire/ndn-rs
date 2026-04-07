@@ -1,3 +1,4 @@
+#[cfg(not(target_arch = "wasm32"))]
 use dashmap::DashMap;
 
 use crate::FaceId;
@@ -18,39 +19,60 @@ use crate::FaceId;
 /// Normal faces have no entry in this table (`get_tx_for_rx` returns `None`),
 /// so `unwrap_or(in_face_id)` falls through to the standard symmetric path.
 pub struct FacePairTable {
+    #[cfg(not(target_arch = "wasm32"))]
     pairs: DashMap<FaceId, FaceId>,
+    #[cfg(target_arch = "wasm32")]
+    pairs: std::sync::Mutex<std::collections::HashMap<FaceId, FaceId>>,
 }
 
 impl FacePairTable {
     pub fn new() -> Self {
         Self {
+            #[cfg(not(target_arch = "wasm32"))]
             pairs: DashMap::new(),
+            #[cfg(target_arch = "wasm32")]
+            pairs: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
     /// Register an asymmetric link pair: Interests arrive on `rx`, Data is
     /// sent on `tx`.
     pub fn insert(&self, rx: FaceId, tx: FaceId) {
+        #[cfg(not(target_arch = "wasm32"))]
         self.pairs.insert(rx, tx);
+        #[cfg(target_arch = "wasm32")]
+        self.pairs.lock().unwrap().insert(rx, tx);
     }
 
     /// Returns the tx face to use when Data should go back on `rx_face`.
     /// Returns `None` for symmetric faces.
     pub fn get_tx_for_rx(&self, rx: FaceId) -> Option<FaceId> {
-        self.pairs.get(&rx).map(|r| *r)
+        #[cfg(not(target_arch = "wasm32"))]
+        return self.pairs.get(&rx).map(|r| *r);
+        #[cfg(target_arch = "wasm32")]
+        return self.pairs.lock().unwrap().get(&rx).copied();
     }
 
     /// Remove the pair for `rx`.
     pub fn remove(&self, rx: FaceId) {
+        #[cfg(not(target_arch = "wasm32"))]
         self.pairs.remove(&rx);
+        #[cfg(target_arch = "wasm32")]
+        self.pairs.lock().unwrap().remove(&rx);
     }
 
     pub fn len(&self) -> usize {
-        self.pairs.len()
+        #[cfg(not(target_arch = "wasm32"))]
+        return self.pairs.len();
+        #[cfg(target_arch = "wasm32")]
+        return self.pairs.lock().unwrap().len();
     }
 
     pub fn is_empty(&self) -> bool {
-        self.pairs.is_empty()
+        #[cfg(not(target_arch = "wasm32"))]
+        return self.pairs.is_empty();
+        #[cfg(target_arch = "wasm32")]
+        return self.pairs.lock().unwrap().is_empty();
     }
 }
 

@@ -12,7 +12,8 @@ ndn-store     = { workspace = true }
 ndn-transport = { workspace = true }
 bytes         = { workspace = true, features = ["std"] }
 smallvec      = { workspace = true }
-dashmap       = { workspace = true }
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+dashmap = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }

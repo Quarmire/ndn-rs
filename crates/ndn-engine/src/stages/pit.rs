@@ -45,17 +45,30 @@ impl PitCheckStage {
         );
         ctx.pit_token = Some(token);
 
-        if let Some(mut entry) = self.pit.get_mut(&token) {
+        enum ExistingResult {
+            Loop,
+            Aggregated,
+        }
+        if let Some(result) = self.pit.with_entry_mut(&token, |entry| {
             // Loop detection.
             if entry.nonces_seen.contains(&nonce) {
-                trace!(face=%ctx.face_id, name=%interest.name, nonce, "pit-check: loop detected");
-                return Action::Drop(DropReason::LoopDetected);
+                return ExistingResult::Loop;
             }
             // Aggregate: add in-record, suppress forwarding.
             let expires_at = now_ns + lifetime_ms * 1_000_000;
             entry.add_in_record(ctx.face_id.0, nonce, expires_at, ctx.lp_pit_token.clone());
-            trace!(face=%ctx.face_id, name=%interest.name, nonce, "pit-check: aggregated (suppressed)");
-            return Action::Drop(DropReason::Suppressed);
+            ExistingResult::Aggregated
+        }) {
+            match result {
+                ExistingResult::Loop => {
+                    trace!(face=%ctx.face_id, name=%interest.name, nonce, "pit-check: loop detected");
+                    return Action::Drop(DropReason::LoopDetected);
+                }
+                ExistingResult::Aggregated => {
+                    trace!(face=%ctx.face_id, name=%interest.name, nonce, "pit-check: aggregated (suppressed)");
+                    return Action::Drop(DropReason::Suppressed);
+                }
+            }
         }
 
         // New PIT entry.

@@ -1,7 +1,9 @@
+#[cfg(not(target_arch = "wasm32"))]
 use dashmap::DashMap;
 use ndn_packet::Name;
 use ndn_transport::FaceId;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// EWMA RTT measurement for a (prefix, face) pair.
 #[derive(Clone, Debug)]
@@ -62,40 +64,70 @@ pub struct MeasurementsEntry {
 ///
 /// Updated on every Data arrival by the `MeasurementsUpdateStage`.
 /// Read by strategies via `StrategyContext`.
+///
+/// On native targets uses `DashMap` for sharded concurrent access.
+/// On `wasm32` uses a `Mutex<HashMap>` (single-threaded WASM has no contention).
 pub struct MeasurementsTable {
-    entries: DashMap<std::sync::Arc<Name>, MeasurementsEntry>,
+    #[cfg(not(target_arch = "wasm32"))]
+    entries: DashMap<Arc<Name>, MeasurementsEntry>,
+    #[cfg(target_arch = "wasm32")]
+    entries: std::sync::Mutex<HashMap<Arc<Name>, MeasurementsEntry>>,
 }
 
 impl MeasurementsTable {
     /// Create an empty measurements table.
     pub fn new() -> Self {
         Self {
+            #[cfg(not(target_arch = "wasm32"))]
             entries: DashMap::new(),
+            #[cfg(target_arch = "wasm32")]
+            entries: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
-    /// Look up the measurements entry for a name prefix.
-    pub fn get(
-        &self,
-        name: &std::sync::Arc<Name>,
-    ) -> Option<dashmap::mapref::one::Ref<'_, std::sync::Arc<Name>, MeasurementsEntry>> {
-        self.entries.get(name)
+    /// Look up the measurements entry for a name prefix, returning a clone.
+    pub fn get(&self, name: &Arc<Name>) -> Option<MeasurementsEntry> {
+        #[cfg(not(target_arch = "wasm32"))]
+        return self.entries.get(name).map(|r| r.clone());
+        #[cfg(target_arch = "wasm32")]
+        return self.entries.lock().unwrap().get(name).cloned();
     }
 
     /// Record an RTT sample for a (prefix, face) pair, creating the entry if needed.
-    pub fn update_rtt(&self, name: std::sync::Arc<Name>, face: FaceId, rtt_ns: f64) {
-        let mut entry = self.entries.entry(name).or_default();
-        entry.rtt_per_face.entry(face).or_default().update(rtt_ns);
-        entry.last_updated = now_ns();
+    pub fn update_rtt(&self, name: Arc<Name>, face: FaceId, rtt_ns: f64) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let mut entry = self.entries.entry(name).or_default();
+            entry.rtt_per_face.entry(face).or_default().update(rtt_ns);
+            entry.last_updated = now_ns();
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let mut entries = self.entries.lock().unwrap();
+            let entry = entries.entry(name).or_default();
+            entry.rtt_per_face.entry(face).or_default().update(rtt_ns);
+            entry.last_updated = now_ns();
+        }
     }
 
     /// Record an Interest satisfaction outcome, updating the EWMA satisfaction rate.
-    pub fn update_satisfaction(&self, name: std::sync::Arc<Name>, satisfied: bool) {
+    pub fn update_satisfaction(&self, name: Arc<Name>, satisfied: bool) {
         const ALPHA: f32 = 0.1;
-        let mut entry = self.entries.entry(name).or_default();
-        let sample = if satisfied { 1.0f32 } else { 0.0 };
-        entry.satisfaction_rate = (1.0 - ALPHA) * entry.satisfaction_rate + ALPHA * sample;
-        entry.last_updated = now_ns();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let mut entry = self.entries.entry(name).or_default();
+            let sample = if satisfied { 1.0f32 } else { 0.0 };
+            entry.satisfaction_rate = (1.0 - ALPHA) * entry.satisfaction_rate + ALPHA * sample;
+            entry.last_updated = now_ns();
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let mut entries = self.entries.lock().unwrap();
+            let entry = entries.entry(name).or_default();
+            let sample = if satisfied { 1.0f32 } else { 0.0 };
+            entry.satisfaction_rate = (1.0 - ALPHA) * entry.satisfaction_rate + ALPHA * sample;
+            entry.last_updated = now_ns();
+        }
     }
 }
 

@@ -12,8 +12,10 @@ fjall = ["dep:fjall"]
 [dependencies]
 ndn-packet = { workspace = true, features = ["std"] }
 bytes         = { workspace = true, features = ["std"] }
-dashmap    = { workspace = true }
 smallvec   = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+dashmap = { workspace = true }
 lru        = { workspace = true }
 ring       = { workspace = true }
 thiserror  = { workspace = true }

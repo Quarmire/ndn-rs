@@ -17,5 +17,7 @@ futures    = { workspace = true }
 tokio      = { workspace = true, features = ["sync"] }
 tokio-util = { workspace = true, features = ["codec"] }
 thiserror  = { workspace = true }
-dashmap    = { workspace = true }
 serde      = { workspace = true, optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+dashmap = { workspace = true }

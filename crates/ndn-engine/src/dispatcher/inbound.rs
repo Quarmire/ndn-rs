@@ -54,10 +54,13 @@ pub(crate) async fn run_face_reader(
         && !matches!(kind, FaceKind::App | FaceKind::Shm | FaceKind::Internal);
 
     // Cache whether this face has reliability enabled.
+    #[cfg(feature = "face-net")]
     let has_reliability = face_states
         .get(&face_id)
         .map(|s| s.reliability.is_some())
         .unwrap_or(false);
+    #[cfg(not(feature = "face-net"))]
+    let has_reliability = false;
 
     loop {
         let result = tokio::select! {
@@ -70,6 +73,7 @@ pub(crate) async fn run_face_reader(
 
                 // Feed inbound packet to reliability layer (extracts TxSeq for
                 // Ack, processes piggybacked Acks from remote).
+                #[cfg(feature = "face-net")]
                 if has_reliability
                     && let Some(state) = face_states.get(&face_id)
                     && let Some(rel) = state.reliability.as_ref()
