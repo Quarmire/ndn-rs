@@ -260,6 +260,173 @@ impl MgmtClient {
         self.dataset(module::STATUS, b"shutdown").await
     }
 
+    // ─── Config ──────────────────────────────────────────────────────────────
+
+    /// Retrieve the running router configuration as TOML: `config/get`.
+    pub async fn config_get(&self) -> Result<ControlResponse, RouterError> {
+        self.dataset(module::CONFIG, verb::GET).await
+    }
+
+    // ─── Faces counters ─────────────────────────────────────────────────
+
+    /// Per-face packet/byte counters: `faces/counters`.
+    pub async fn face_counters(&self) -> Result<ControlResponse, RouterError> {
+        self.dataset(module::FACES, verb::COUNTERS).await
+    }
+
+    // ─── Measurements ───────────────────────────────────────────────────
+
+    /// Per-prefix measurements (satisfaction rate, RTTs): `measurements/list`.
+    pub async fn measurements_list(&self) -> Result<ControlResponse, RouterError> {
+        self.dataset(module::MEASUREMENTS, verb::LIST).await
+    }
+
+    // ─── Security ────────────────────────────────────────────────────────
+
+    /// List all identity keys in the PIB: `security/identity-list`.
+    pub async fn security_identity_list(&self) -> Result<ControlResponse, RouterError> {
+        self.dataset(module::SECURITY, verb::IDENTITY_LIST).await
+    }
+
+    /// Generate a new Ed25519 identity key: `security/identity-generate`.
+    pub async fn security_identity_generate(&self, name: &Name) -> Result<ControlParameters, RouterError> {
+        let params = ControlParameters {
+            name: Some(name.clone()),
+            ..Default::default()
+        };
+        self.command(module::SECURITY, verb::IDENTITY_GENERATE, &params).await
+    }
+
+    /// List all trust anchors in the PIB: `security/anchor-list`.
+    pub async fn security_anchor_list(&self) -> Result<ControlResponse, RouterError> {
+        self.dataset(module::SECURITY, verb::ANCHOR_LIST).await
+    }
+
+    /// Delete a key from the PIB: `security/key-delete`.
+    pub async fn security_key_delete(&self, name: &Name) -> Result<ControlParameters, RouterError> {
+        let params = ControlParameters {
+            name: Some(name.clone()),
+            ..Default::default()
+        };
+        self.command(module::SECURITY, verb::KEY_DELETE, &params).await
+    }
+
+    /// Get the `did:ndn:` DID for a named identity: `security/identity-did`.
+    ///
+    /// The response `status_text` contains the DID string.
+    pub async fn security_identity_did(&self, name: &Name) -> Result<ControlResponse, RouterError> {
+        let params = ControlParameters {
+            name: Some(name.clone()),
+            ..Default::default()
+        };
+        let name = command_name(module::SECURITY, verb::IDENTITY_DID, &params);
+        self.send_interest(name).await
+    }
+
+    /// Retrieve the router's NDNCERT CA profile: `security/ca-info`.
+    ///
+    /// Returns `NOT_FOUND` if no `ca_prefix` is configured.
+    pub async fn security_ca_info(&self) -> Result<ControlResponse, RouterError> {
+        self.dataset(module::SECURITY, verb::CA_INFO).await
+    }
+
+    /// Initiate NDNCERT enrollment with a CA: `security/ca-enroll`.
+    ///
+    /// Parameters:
+    /// - `ca_prefix` — NDN name of the CA (e.g. `/ndn/edu/example/CA`)
+    /// - `challenge_type` — `"token"`, `"pin"`, `"possession"`, or `"yubikey-hotp"`
+    /// - `challenge_param` — the challenge secret/code
+    ///
+    /// The router starts a background enrollment session and returns immediately
+    /// with `status_text = "started"`.  Poll `security/identity-list` to detect
+    /// when the certificate has been installed.
+    pub async fn security_ca_enroll(
+        &self,
+        ca_prefix: &Name,
+        challenge_type: &str,
+        challenge_param: &str,
+    ) -> Result<ControlParameters, RouterError> {
+        let params = ControlParameters {
+            name: Some(ca_prefix.clone()),
+            uri: Some(format!("{challenge_type}:{challenge_param}")),
+            ..Default::default()
+        };
+        self.command(module::SECURITY, verb::CA_ENROLL, &params).await
+    }
+
+    /// Add a Zero-Touch-Provisioning token to the CA: `security/ca-token-add`.
+    ///
+    /// Returns the generated token in `ControlParameters::uri`.
+    pub async fn security_ca_token_add(&self, description: &str) -> Result<ControlParameters, RouterError> {
+        let params = ControlParameters {
+            uri: Some(description.to_owned()),
+            ..Default::default()
+        };
+        self.command(module::SECURITY, verb::CA_TOKEN_ADD, &params).await
+    }
+
+    /// List pending NDNCERT CA enrollment requests: `security/ca-requests`.
+    pub async fn security_ca_requests(&self) -> Result<ControlResponse, RouterError> {
+        self.dataset(module::SECURITY, verb::CA_REQUESTS).await
+    }
+
+    /// Detect whether a YubiKey is connected: `security/yubikey-detect`.
+    ///
+    /// Returns `Ok` with `status_text = "present"` if a YubiKey is found,
+    /// or an error if not present or the `yubikey-piv` feature is not compiled in.
+    pub async fn security_yubikey_detect(&self) -> Result<ControlResponse, RouterError> {
+        self.dataset(module::SECURITY, verb::YUBIKEY_DETECT).await
+    }
+
+    /// Generate a P-256 key in YubiKey PIV slot 9a: `security/yubikey-generate`.
+    ///
+    /// On success the response `body.uri` contains the base64url-encoded 65-byte
+    /// uncompressed public key.
+    pub async fn security_yubikey_generate(&self, name: &Name) -> Result<ControlParameters, RouterError> {
+        let params = ControlParameters {
+            name: Some(name.clone()),
+            ..Default::default()
+        };
+        self.command(module::SECURITY, verb::YUBIKEY_GENERATE, &params).await
+    }
+
+    // ─── Log filter ─────────────────────────────────────────────────────
+
+    /// Get the current runtime log filter string: `log/get-filter`.
+    pub async fn log_get_filter(&self) -> Result<ControlResponse, RouterError> {
+        self.dataset(module::LOG, verb::GET_FILTER).await
+    }
+
+    /// Get new log lines from the router's in-memory ring buffer: `log/get-recent`.
+    ///
+    /// Pass the last sequence number received (0 on first call) in `after_seq`.
+    /// The router returns only entries with a higher sequence number, so repeated
+    /// polls never replay old lines.
+    ///
+    /// Response format: first line is the new max sequence number, followed by
+    /// zero or more log lines.
+    pub async fn log_get_recent(&self, after_seq: u64) -> Result<ControlResponse, RouterError> {
+        let params = ControlParameters {
+            count: Some(after_seq),
+            ..Default::default()
+        };
+        let name = command_name(module::LOG, verb::GET_RECENT, &params);
+        self.send_interest(name).await
+    }
+
+    /// Set the runtime log filter: `log/set-filter`.
+    ///
+    /// The `filter` string is an `EnvFilter`-compatible directive
+    /// (e.g. `"info"`, `"debug,ndn_engine=trace"`).
+    pub async fn log_set_filter(&self, filter: &str) -> Result<ControlResponse, RouterError> {
+        let params = ControlParameters {
+            uri: Some(filter.to_owned()),
+            ..Default::default()
+        };
+        let name = command_name(module::LOG, verb::SET_FILTER, &params);
+        self.send_interest(name).await
+    }
+
     // ─── Core transport ─────────────────────────────────────────────────
 
     /// Send a command Interest with ControlParameters and decode the response.
