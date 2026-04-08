@@ -1704,13 +1704,16 @@ fn resolve_face_id(
     source_face: Option<FaceId>,
 ) -> Result<FaceId, Box<ControlResponse>> {
     match params.face_id {
-        Some(id) => Ok(FaceId(id as u32)),
-        None => source_face.ok_or_else(|| {
+        // Face ID 0 is never valid (IDs are allocated from 1 upwards).
+        // Treat it the same as omitted — fall back to the requesting face.
+        // This matches NFD convention and fixes Unix-mode clients that pass 0.
+        Some(0) | None => source_face.ok_or_else(|| {
             Box::new(ControlResponse::error(
                 status::BAD_PARAMS,
                 "cannot determine FaceId",
             ))
         }),
+        Some(id) => Ok(FaceId(id as u32)),
     }
 }
 

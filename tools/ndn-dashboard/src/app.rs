@@ -826,14 +826,14 @@ async fn run_cmd(
         }
         DashCmd::RouteAdd { prefix, face_id, cost } => {
             match prefix.parse::<ndn_packet::Name>() {
-                Ok(n) => client.route_add(&n, face_id, cost).await
+                Ok(n) => client.route_add(&n, Some(face_id), cost).await
                     .map(|_| ()).map_err(|e| e.to_string()),
                 Err(e) => Err(e.to_string()),
             }
         }
         DashCmd::RouteRemove { prefix, face_id } => {
             match prefix.parse::<ndn_packet::Name>() {
-                Ok(n) => client.route_remove(&n, face_id).await
+                Ok(n) => client.route_remove(&n, Some(face_id)).await
                     .map(|_| ()).map_err(|e| e.to_string()),
                 Err(e) => Err(e.to_string()),
             }

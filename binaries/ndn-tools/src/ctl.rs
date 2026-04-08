@@ -298,7 +298,7 @@ async fn run_nfd(cli: &Cli) -> anyhow::Result<()> {
                         &prefix
                             .parse()
                             .map_err(|e| anyhow::anyhow!("bad prefix: {e}"))?,
-                        *face as u64,
+                        Some(*face as u64),
                         *cost as u64,
                     )
                     .await
@@ -311,7 +311,7 @@ async fn run_nfd(cli: &Cli) -> anyhow::Result<()> {
                         &prefix
                             .parse()
                             .map_err(|e| anyhow::anyhow!("bad prefix: {e}"))?,
-                        *face as u64,
+                        Some(*face as u64),
                     )
                     .await
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
