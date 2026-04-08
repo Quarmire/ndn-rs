@@ -90,7 +90,22 @@ jobs:
         id: docs_build
         continue-on-error: true   # site still deploys without docs if this fails
         run: |
-          cargo doc --workspace --no-deps 2>&1 | tail -10
+          # Document library crates only.  Exclude binaries and tools that
+          # have no public API worth documenting, and ndn-dashboard which
+          # requires WebKitGTK2 (not installed on the CI runner).
+          cargo doc --workspace --no-deps \
+            --exclude ndn-dashboard \
+            --exclude ndn-router \
+            --exclude ndn-tools \
+            --exclude ndn-bench \
+            --exclude did-ndn-driver \
+            --exclude ndn-python \
+            --exclude example-strategy-custom \
+            --exclude example-strategy-composed \
+            --exclude example-cross-layer-enricher \
+            --exclude example-wasm-strategy \
+            --exclude example-discovery-lan \
+            2>&1 | tail -20
           # Create a root index that lists all documented crates
           cat > target/doc/index.html << 'HTML'
           <!DOCTYPE html>
