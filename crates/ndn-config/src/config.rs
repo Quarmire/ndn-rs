@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 /// level = "info"
 /// file = "/var/log/ndn/router.log"
 /// ```
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ForwarderConfig {
     #[serde(default)]
     pub engine: EngineConfig,
@@ -90,7 +90,7 @@ impl ForwarderConfig {
 /// shards = 4                # only for "sharded-lru"
 /// admission_policy = "default"  # "default" or "admit-all"
 /// ```
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CsConfig {
     /// CS implementation variant.
     #[serde(default = "default_cs_variant")]
@@ -128,7 +128,7 @@ impl Default for CsConfig {
 }
 
 /// Engine tuning parameters.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct EngineConfig {
     /// Content store capacity in megabytes (0 = disable).
     /// Deprecated: use `[cs] capacity_mb` instead. Kept for backward compatibility.
@@ -240,7 +240,7 @@ fn default_cost() -> u32 {
 }
 
 /// Management interface configuration.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ManagementConfig {
     /// Transport for the management interface.
     ///
@@ -294,7 +294,7 @@ fn default_face_socket() -> String {
 }
 
 /// Security settings.
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct SecurityConfig {
     /// NDN identity name for this router (e.g., `/ndn/router1`).
     ///
@@ -335,10 +335,49 @@ pub struct SecurityConfig {
     /// Default: `"default"`.
     #[serde(default = "default_security_profile")]
     pub profile: String,
+
+    // ── NDNCERT CA (optional) ─────────────────────────────────────────────────
+
+    /// NDN name prefix for the built-in NDNCERT CA, e.g. `/ndn/edu/example/CA`.
+    ///
+    /// When set, the router registers handlers under `<ca_prefix>/CA/INFO`,
+    /// `<ca_prefix>/CA/PROBE`, `<ca_prefix>/CA/NEW`, and `<ca_prefix>/CA/CHALLENGE`.
+    ///
+    /// Leave unset to run in client-only mode (no CA hosted).
+    #[serde(default)]
+    pub ca_prefix: Option<String>,
+
+    /// Human-readable description of this CA, returned in CA INFO responses.
+    ///
+    /// Example: `"NDN Test Network CA"`.
+    #[serde(default)]
+    pub ca_info: String,
+
+    /// Maximum certificate lifetime (days) the CA will issue.
+    ///
+    /// Requests for longer validity are silently capped to this value.
+    /// Default: `365`.
+    #[serde(default = "default_ca_max_validity_days")]
+    pub ca_max_validity_days: u32,
+
+    /// Supported NDNCERT challenge types offered by the CA.
+    ///
+    /// Recognised values: `"token"`, `"pin"`, `"possession"`, `"email"`,
+    /// `"yubikey-hotp"`.  Default: `["token"]`.
+    #[serde(default = "default_ca_challenges")]
+    pub ca_challenges: Vec<String>,
 }
 
 fn default_security_profile() -> String {
     "default".to_owned()
+}
+
+fn default_ca_max_validity_days() -> u32 {
+    365
+}
+
+fn default_ca_challenges() -> Vec<String> {
+    vec!["token".to_owned()]
 }
 
 /// Logging configuration.
@@ -357,7 +396,7 @@ fn default_security_profile() -> String {
 /// When `file` is set, logs are written to *both* stderr and the file so
 /// interactive use always shows output while the file captures a persistent
 /// record.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LoggingConfig {
     /// Default tracing filter string (e.g. `"info"`, `"ndn_engine=debug,warn"`).
     ///
