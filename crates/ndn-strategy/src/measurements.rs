@@ -110,6 +110,16 @@ impl MeasurementsTable {
         }
     }
 
+    /// Snapshot all entries, returning a `Vec` of `(prefix, entry)` pairs.
+    ///
+    /// Intended for management dataset queries (`measurements/list`).
+    pub fn dump(&self) -> Vec<(Arc<Name>, MeasurementsEntry)> {
+        #[cfg(not(target_arch = "wasm32"))]
+        return self.entries.iter().map(|r| (Arc::clone(r.key()), r.value().clone())).collect();
+        #[cfg(target_arch = "wasm32")]
+        return self.entries.lock().unwrap().iter().map(|(k, v)| (Arc::clone(k), v.clone())).collect();
+    }
+
     /// Record an Interest satisfaction outcome, updating the EWMA satisfaction rate.
     pub fn update_satisfaction(&self, name: Arc<Name>, satisfied: bool) {
         const ALPHA: f32 = 0.1;

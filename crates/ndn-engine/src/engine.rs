@@ -34,6 +34,18 @@ use crate::dispatcher::InboundPacket;
 /// links without silent drops.
 pub const DEFAULT_SEND_QUEUE_CAP: usize = 2048;
 
+/// Per-face packet and byte counters.  All fields are `AtomicU64`, updated by
+/// the pipeline without holding any lock.
+#[derive(Default)]
+pub struct FaceCounters {
+    pub in_interests:  AtomicU64,
+    pub in_data:       AtomicU64,
+    pub out_interests: AtomicU64,
+    pub out_data:      AtomicU64,
+    pub in_bytes:      AtomicU64,
+    pub out_bytes:     AtomicU64,
+}
+
 /// Per-face lifecycle state stored alongside the cancellation token.
 pub struct FaceState {
     pub cancel: CancellationToken,
@@ -41,6 +53,8 @@ pub struct FaceState {
     /// Last packet activity (nanoseconds since Unix epoch).
     /// Updated on recv and send; used for idle-timeout of on-demand faces.
     pub last_activity: AtomicU64,
+    /// Per-face traffic counters (incremented by pipeline stages).
+    pub counters: FaceCounters,
     /// Outbound send queue.
     ///
     /// The pipeline pushes packets here via `try_send` (non-blocking) and a
@@ -68,6 +82,7 @@ impl FaceState {
             cancel,
             persistency,
             last_activity: AtomicU64::new(now),
+            counters: FaceCounters::default(),
             send_tx,
             #[cfg(feature = "face-net")]
             reliability: None,
@@ -90,6 +105,7 @@ impl FaceState {
             cancel,
             persistency,
             last_activity: AtomicU64::new(now),
+            counters: FaceCounters::default(),
             send_tx,
             reliability: Some(std::sync::Mutex::new(
                 ndn_face_net::reliability::LpReliability::new(mtu),
@@ -170,6 +186,10 @@ impl ForwarderEngine {
 
     pub fn neighbors(&self) -> Arc<NeighborTable> {
         Arc::clone(&self.inner.neighbors)
+    }
+
+    pub fn measurements(&self) -> Arc<MeasurementsTable> {
+        Arc::clone(&self.inner.measurements)
     }
 
     pub fn discovery(&self) -> Arc<dyn DiscoveryProtocol> {

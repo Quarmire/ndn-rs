@@ -1,3 +1,5 @@
+use std::sync::atomic::Ordering;
+
 use bytes::Bytes;
 use tokio::sync::mpsc;
 use tracing::{debug, trace};
@@ -36,6 +38,7 @@ impl PacketDispatcher {
             Action::Send(ctx, faces) => {
                 trace!(face=%ctx.face_id, name=?ctx.name, out_faces=?faces, raw_len=ctx.raw_bytes.len(), "dispatch: Send");
                 let is_localhost = ctx.name.as_ref().is_some_and(|n| is_localhost_name(n));
+                let raw_len = ctx.raw_bytes.len() as u64;
                 for face_id in &faces {
                     if is_localhost
                         && let Some(face) = self.face_table.get(*face_id)
@@ -43,6 +46,10 @@ impl PacketDispatcher {
                     {
                         trace!(face=%face_id, "dispatch: /localhost blocked on non-local face");
                         continue;
+                    }
+                    if let Some(state) = self.face_states.get(face_id) {
+                        state.counters.out_interests.fetch_add(1, Ordering::Relaxed);
+                        state.counters.out_bytes.fetch_add(raw_len, Ordering::Relaxed);
                     }
                     self.enqueue_send(*face_id, ctx.raw_bytes.clone());
                 }
@@ -79,6 +86,7 @@ impl PacketDispatcher {
         };
 
         let is_localhost = ctx.name.as_ref().is_some_and(|n| is_localhost_name(n));
+        let data_len = data_bytes.len() as u64;
         for face_id in &ctx.out_faces {
             if is_localhost
                 && let Some(face) = self.face_table.get(*face_id)
@@ -86,6 +94,10 @@ impl PacketDispatcher {
             {
                 trace!(face=%face_id, "satisfy: /localhost blocked on non-local face");
                 continue;
+            }
+            if let Some(state) = self.face_states.get(face_id) {
+                state.counters.out_data.fetch_add(1, Ordering::Relaxed);
+                state.counters.out_bytes.fetch_add(data_len, Ordering::Relaxed);
             }
             self.enqueue_send(*face_id, data_bytes.clone());
         }

@@ -26,6 +26,6 @@ pub mod stages;
 pub use builder::{EngineBuilder, EngineConfig};
 pub use compose::ComposedStrategy;
 pub use discovery_context::EngineDiscoveryContext;
-pub use engine::{ForwarderEngine, ShutdownHandle};
+pub use engine::{FaceCounters, FaceState, ForwarderEngine, ShutdownHandle};
 pub use enricher::ContextEnricher;
 pub use fib::{Fib, FibEntry, FibNexthop};

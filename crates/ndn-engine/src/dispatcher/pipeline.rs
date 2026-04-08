@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -141,10 +142,18 @@ impl PacketDispatcher {
 
         match &ctx.packet {
             DecodedPacket::Interest(_) => {
+                if let Some(state) = self.face_states.get(&ctx.face_id) {
+                    state.counters.in_interests.fetch_add(1, Ordering::Relaxed);
+                    state.counters.in_bytes.fetch_add(ctx.raw_bytes.len() as u64, Ordering::Relaxed);
+                }
                 trace!(face=%ctx.face_id, name=?ctx.name, "pipeline: Interest → interest_pipeline");
                 self.interest_pipeline(ctx).await;
             }
             DecodedPacket::Data(_) => {
+                if let Some(state) = self.face_states.get(&ctx.face_id) {
+                    state.counters.in_data.fetch_add(1, Ordering::Relaxed);
+                    state.counters.in_bytes.fetch_add(ctx.raw_bytes.len() as u64, Ordering::Relaxed);
+                }
                 trace!(face=%ctx.face_id, name=?ctx.name, "pipeline: Data → data_pipeline");
                 self.data_pipeline(ctx).await;
             }
@@ -264,7 +273,12 @@ impl PacketDispatcher {
             ForwardingAction::Forward(faces) => {
                 // Strategy chose alternate nexthops — forward the original Interest.
                 let interest_wire = nack.interest.raw().clone();
+                let wire_len = interest_wire.len() as u64;
                 for face_id in &faces {
+                    if let Some(state) = self.face_states.get(face_id) {
+                        state.counters.out_interests.fetch_add(1, Ordering::Relaxed);
+                        state.counters.out_bytes.fetch_add(wire_len, Ordering::Relaxed);
+                    }
                     self.enqueue_send(*face_id, interest_wire.clone());
                 }
             }
