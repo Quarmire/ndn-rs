@@ -80,9 +80,12 @@ export class TypeDetail {
           <p style="font-size:0.82rem;color:var(--text2);line-height:1.65">
             This view shows which crates export <code>${this._esc(typeName)}</code> as a public type
             and which workspace crates depend on those crates (potential consumers). For full
-            doc comments, trait impls, and method signatures, follow the
+            doc comments, trait impls, and method signatures, see the
             <a href="${ghSearch(typeName)}" target="_blank" rel="noopener">GitHub source search</a>
-            link above.
+            or the
+            ${exporters.length > 0
+              ? `<a href="../api/${exporters[0].name.replace(/-/g, '_')}/" target="_blank" rel="noopener">API docs for ${exporters[0].name}</a>`
+              : 'hosted API docs'}.
           </p>
         </div>
 

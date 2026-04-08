@@ -35,6 +35,11 @@ function wikiUrl(crateName) {
   return `../wiki/${page}`;
 }
 
+function apiUrl(crateName) {
+  // cargo doc replaces hyphens with underscores; hosted at /api/ alongside /explorer/
+  return `../api/${crateName.replace(/-/g, '_')}/index.html`;
+}
+
 export class CrateDetail {
   constructor(container, app) {
     this.container = container;
@@ -58,6 +63,7 @@ export class CrateDetail {
     const rdeps = this.app.getReverseDeps(c.name);
     const featureEntries = Object.entries(c.features);
     const wiki = wikiUrl(c.name);
+    const api = apiUrl(c.name);
     const sourceUrl = `${GH_BASE}/${c.path}`;
 
     this.container.innerHTML = `
@@ -72,6 +78,7 @@ export class CrateDetail {
           <span class="badge">${this._esc(c.path)}</span>
           <a class="badge badge-accent" href="${sourceUrl}" target="_blank" rel="noopener" title="View source on GitHub">GitHub ↗</a>
           ${wiki ? `<a class="badge badge-wiki" href="${wiki}" target="_blank" rel="noopener" title="Read in wiki">Wiki ↗</a>` : ''}
+          <a class="badge badge-api" href="${api}" target="_blank" rel="noopener" title="Browse API documentation">API ↗</a>
         </div>
       </div>
 

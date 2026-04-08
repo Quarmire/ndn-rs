@@ -249,6 +249,8 @@ main {
 .badge-accent:hover { text-decoration: underline; }
 .badge-wiki { color: var(--purple); border-color: var(--purple); text-decoration: none; }
 .badge-wiki:hover { text-decoration: underline; }
+.badge-api { color: var(--orange); border-color: var(--orange); text-decoration: none; }
+.badge-api:hover { text-decoration: underline; }
 
 /* ── Crate Detail ─────────────────────────────────────────────────────────── */
 
