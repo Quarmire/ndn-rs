@@ -170,7 +170,10 @@ impl RouterClient {
 
     /// Register a prefix with the router via `rib/register`.
     pub async fn register_prefix(&self, prefix: &Name) -> Result<(), RouterError> {
-        let face_id = self.shm_face_id().unwrap_or(0);
+        // In SHM mode, route traffic to the SHM face.  In Unix mode pass None
+        // so the router uses the requesting face — passing 0 would create a
+        // FIB entry for a non-existent face, silently dropping all packets.
+        let face_id = self.shm_face_id();
         let resp = self.mgmt.route_add(prefix, face_id, 0).await?;
         tracing::debug!(
             face_id = ?resp.face_id,
@@ -182,7 +185,7 @@ impl RouterClient {
 
     /// Unregister a prefix from the router via `rib/unregister`.
     pub async fn unregister_prefix(&self, prefix: &Name) -> Result<(), RouterError> {
-        let face_id = self.shm_face_id().unwrap_or(0);
+        let face_id = self.shm_face_id();
         self.mgmt.route_remove(prefix, face_id).await?;
         Ok(())
     }

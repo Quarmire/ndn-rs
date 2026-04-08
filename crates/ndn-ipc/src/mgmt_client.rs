@@ -70,15 +70,20 @@ impl MgmtClient {
     // ─── Route management ───────────────────────────────────────────────
 
     /// Add (or update) a route: `rib/register`.
+    ///
+    /// Pass `face_id: None` to let the router use the requesting face (the
+    /// default NFD behaviour when no FaceId is supplied).  This is the correct
+    /// value to use when connecting over a Unix socket without SHM, because
+    /// there is no separate SHM face ID to reference.
     pub async fn route_add(
         &self,
         prefix: &Name,
-        face_id: u64,
+        face_id: Option<u64>,
         cost: u64,
     ) -> Result<ControlParameters, RouterError> {
         let params = ControlParameters {
             name: Some(prefix.clone()),
-            face_id: Some(face_id),
+            face_id,
             cost: Some(cost),
             ..Default::default()
         };
@@ -86,14 +91,16 @@ impl MgmtClient {
     }
 
     /// Remove a route: `rib/unregister`.
+    ///
+    /// Pass `face_id: None` to remove the route on the requesting face.
     pub async fn route_remove(
         &self,
         prefix: &Name,
-        face_id: u64,
+        face_id: Option<u64>,
     ) -> Result<ControlParameters, RouterError> {
         let params = ControlParameters {
             name: Some(prefix.clone()),
-            face_id: Some(face_id),
+            face_id,
             ..Default::default()
         };
         self.command(module::RIB, verb::UNREGISTER, &params).await
