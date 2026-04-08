@@ -83,7 +83,7 @@ pub async fn run_enrollment(config: EnrollConfig) -> Result<NdnIdentity, Identit
         .ok_or_else(|| IdentityError::Enrollment("signer has no public key".to_string()))?;
 
     // Build the enrollment session.
-    let session =
+    let mut session =
         EnrollmentSession::new(config.name.clone(), pubkey.to_vec(), config.validity_secs);
 
     let new_body = session.new_request_body()?;
