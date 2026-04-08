@@ -28,10 +28,17 @@ pub mod module {
     pub const STATUS: &[u8] = b"status";
     pub const NEIGHBORS: &[u8] = b"neighbors";
     pub const SERVICE: &[u8] = b"service";
+    pub const MEASUREMENTS: &[u8] = b"measurements";
+    pub const CONFIG: &[u8] = b"config";
+    pub const SECURITY: &[u8] = b"security";
+    pub const LOG: &[u8] = b"log";
 }
 
 /// Command verbs per module.
 pub mod verb {
+    // config
+    pub const GET: &[u8] = b"get";
+
     // faces
     pub const CREATE: &[u8] = b"create";
     pub const UPDATE: &[u8] = b"update";
@@ -59,6 +66,31 @@ pub mod verb {
     pub const ANNOUNCE: &[u8] = b"announce";
     pub const WITHDRAW: &[u8] = b"withdraw";
     pub const BROWSE: &[u8] = b"browse";
+
+    // faces extension
+    pub const COUNTERS: &[u8] = b"counters";
+
+    // security — identity
+    pub const IDENTITY_LIST:     &[u8] = b"identity-list";
+    pub const IDENTITY_GENERATE: &[u8] = b"identity-generate";
+    pub const IDENTITY_DID:      &[u8] = b"identity-did";
+    pub const ANCHOR_LIST:       &[u8] = b"anchor-list";
+    pub const KEY_DELETE:        &[u8] = b"key-delete";
+
+    // security — NDNCERT CA
+    pub const CA_INFO:      &[u8] = b"ca-info";
+    pub const CA_ENROLL:    &[u8] = b"ca-enroll";
+    pub const CA_TOKEN_ADD: &[u8] = b"ca-token-add";
+    pub const CA_REQUESTS:  &[u8] = b"ca-requests";
+
+    // security — YubiKey PIV
+    pub const YUBIKEY_DETECT:   &[u8] = b"yubikey-detect";
+    pub const YUBIKEY_GENERATE: &[u8] = b"yubikey-generate";
+
+    // log
+    pub const GET_FILTER:  &[u8] = b"get-filter";
+    pub const SET_FILTER:  &[u8] = b"set-filter";
+    pub const GET_RECENT:  &[u8] = b"get-recent";
 }
 
 // ─── Name builder ────────────────────────────────────────────────────────────
