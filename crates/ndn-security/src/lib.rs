@@ -30,11 +30,15 @@ pub mod signer;
 pub mod trust_schema;
 pub mod validator;
 pub mod verifier;
+#[cfg(feature = "yubikey-piv")]
+pub mod yubikey;
 
 pub use cert_cache::{CertCache, Certificate};
 pub use cert_fetcher::{CertFetcher, FetchFn};
 pub use error::TrustError;
 pub use key_store::{KeyAlgorithm, KeyStore, MemKeyStore};
+#[cfg(feature = "yubikey-piv")]
+pub use yubikey::{YubikeyKeyStore, YubikeySlot};
 pub use manager::SecurityManager;
 pub use pib::{FilePib, PibError};
 pub use profile::SecurityProfile;
