@@ -14,7 +14,14 @@ thiserror     = { workspace = true }
 ring          = { workspace = true }
 ed25519-dalek = { workspace = true }
 
-tokio         = { workspace = true, features = ["sync", "time"] }
+tokio         = { workspace = true, features = ["sync", "time", "rt"] }
+
+# Optional hardware key storage via YubiKey PIV (feature: yubikey-piv).
+# Requires pcscd and a connected YubiKey.
+yubikey = { version = "0.8", optional = true }
+
+[features]
+yubikey-piv = ["dep:yubikey"]
 
 [dev-dependencies]
 tokio      = { workspace = true, features = ["rt", "macros", "sync", "time"] }
