@@ -6,6 +6,8 @@ pub enum CertError {
     RequestNotFound(String),
     #[error("challenge failed: {0}")]
     ChallengeFailed(String),
+    #[error("challenge pending: {0}")]
+    ChallengePending(String),
     #[error("policy denied: {0}")]
     PolicyDenied(String),
     #[error("invalid request: {0}")]

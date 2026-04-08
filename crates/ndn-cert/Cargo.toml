@@ -6,6 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+ndn-tlv      = { workspace = true, features = ["std"] }
 ndn-packet   = { workspace = true, features = ["std"] }
 ndn-security = { workspace = true }
 ndn-did      = { workspace = true }
@@ -18,6 +19,12 @@ ring         = { workspace = true }
 futures      = { workspace = true }
 tokio        = { workspace = true, features = ["sync", "time"] }
 base64       = { workspace = true }
+tracing      = { workspace = true }
+# NDNCERT 0.3 Phase 1C: ECDH + HKDF + AES-GCM
+p256         = { workspace = true }
+aes-gcm      = { workspace = true }
+hkdf         = { workspace = true }
+sha2         = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }
