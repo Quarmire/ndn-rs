@@ -21,6 +21,10 @@ pub struct DataBuilder {
     name: Name,
     content: Vec<u8>,
     freshness: Option<Duration>,
+    /// Raw bytes of a NameComponent TLV to write as the FinalBlockId value.
+    ///
+    /// Use [`DataBuilder::final_block_id_seg`] to set this from a segment index.
+    final_block_id: Option<Bytes>,
 }
 
 impl DataBuilder {
@@ -29,6 +33,7 @@ impl DataBuilder {
             name: name.into(),
             content: content.to_vec(),
             freshness: None,
+            final_block_id: None,
         }
     }
 
@@ -37,14 +42,63 @@ impl DataBuilder {
         self
     }
 
+    /// Set the FinalBlockId from a raw NameComponent TLV value.
+    pub fn final_block_id(mut self, component_bytes: Bytes) -> Self {
+        self.final_block_id = Some(component_bytes);
+        self
+    }
+
+    /// Encode the last segment index as a GenericNameComponent and set as FinalBlockId.
+    ///
+    /// This matches the ASCII-string segment encoding used by `ndn-put` and `ndn-peek`.
+    ///
+    /// ```
+    /// # use ndn_packet::encode::DataBuilder;
+    /// let wire = DataBuilder::new("/test/0", b"hello")
+    ///     .final_block_id_seg(5)   // segments 0..=5
+    ///     .build();
+    /// ```
+    pub fn final_block_id_seg(self, last_seg: usize) -> Self {
+        let s = last_seg.to_string();
+        let bytes = s.as_bytes();
+        // GenericNameComponent: type=0x08, length, value
+        let mut buf = Vec::with_capacity(2 + bytes.len());
+        buf.push(0x08u8); // GenericNameComponent type
+        // Length as minimal variable-length (segments fit in < 128 bytes of digits)
+        buf.push(bytes.len() as u8);
+        buf.extend_from_slice(bytes);
+        self.final_block_id(Bytes::from(buf))
+    }
+
+    /// Encode the last segment index as a SegmentNameComponent (TLV type 0x32, big-endian
+    /// non-negative integer encoding) and set as FinalBlockId.
+    ///
+    /// This matches the segment encoding used by `ndn-cxx`'s `ndnputchunks`.
+    /// Use [`DataBuilder::final_block_id_seg`] for ASCII-decimal encoding instead.
+    pub fn final_block_id_typed_seg(self, last_seg: u64) -> Self {
+        let encoded = encode_nni_be(last_seg);
+        let mut buf = Vec::with_capacity(2 + encoded.len());
+        buf.push(0x32u8); // SegmentNameComponent TLV type
+        buf.push(encoded.len() as u8);
+        buf.extend_from_slice(&encoded);
+        self.final_block_id(Bytes::from(buf))
+    }
+
     /// Build unsigned Data with a DigestSha256 placeholder signature.
     pub fn build(self) -> Bytes {
         let mut w = TlvWriter::new();
         w.write_nested(tlv_type::DATA, |w| {
             write_name(w, &self.name);
-            if let Some(freshness) = self.freshness {
+            if self.freshness.is_some() || self.final_block_id.is_some() {
+                let freshness = self.freshness;
+                let fbi = self.final_block_id.as_deref();
                 w.write_nested(tlv_type::META_INFO, |w| {
-                    write_nni(w, tlv_type::FRESHNESS_PERIOD, freshness.as_millis() as u64);
+                    if let Some(f) = freshness {
+                        write_nni(w, tlv_type::FRESHNESS_PERIOD, f.as_millis() as u64);
+                    }
+                    if let Some(fb) = fbi {
+                        w.write_tlv(tlv_type::FINAL_BLOCK_ID, fb);
+                    }
                 });
             }
             w.write_tlv(tlv_type::CONTENT, &self.content);
@@ -75,9 +129,16 @@ impl DataBuilder {
         // Build Name + MetaInfo (if needed) + Content.
         let mut inner = TlvWriter::new();
         write_name(&mut inner, &self.name);
-        if let Some(freshness) = self.freshness {
+        if self.freshness.is_some() || self.final_block_id.is_some() {
+            let freshness = self.freshness;
+            let fbi = self.final_block_id.as_deref();
             inner.write_nested(tlv_type::META_INFO, |w| {
-                write_nni(w, tlv_type::FRESHNESS_PERIOD, freshness.as_millis() as u64);
+                if let Some(f) = freshness {
+                    write_nni(w, tlv_type::FRESHNESS_PERIOD, f.as_millis() as u64);
+                }
+                if let Some(fb) = fbi {
+                    w.write_tlv(tlv_type::FINAL_BLOCK_ID, fb);
+                }
             });
         }
         inner.write_tlv(tlv_type::CONTENT, &self.content);
@@ -135,9 +196,16 @@ impl DataBuilder {
         // into the writer, then snapshot it for signing.
         let signed_start = w.len();
         write_name(&mut w, &self.name);
-        if let Some(freshness) = self.freshness {
+        if self.freshness.is_some() || self.final_block_id.is_some() {
+            let freshness = self.freshness;
+            let fbi = self.final_block_id.as_deref();
             w.write_nested(tlv_type::META_INFO, |w| {
-                write_nni(w, tlv_type::FRESHNESS_PERIOD, freshness.as_millis() as u64);
+                if let Some(f) = freshness {
+                    write_nni(w, tlv_type::FRESHNESS_PERIOD, f.as_millis() as u64);
+                }
+                if let Some(fb) = fbi {
+                    w.write_tlv(tlv_type::FINAL_BLOCK_ID, fb);
+                }
             });
         }
         w.write_tlv(tlv_type::CONTENT, &self.content);
@@ -166,6 +234,19 @@ impl DataBuilder {
         outer.write_tlv(tlv_type::SIGNATURE_VALUE, &sig_value);
         outer.finish()
     }
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/// Encode a non-negative integer as a minimal big-endian byte string (no leading zeros,
+/// except that 0 encodes as a single 0x00 byte). Used for typed name components.
+fn encode_nni_be(v: u64) -> Vec<u8> {
+    if v == 0 {
+        return vec![0x00];
+    }
+    let bytes = v.to_be_bytes();
+    let first_nonzero = bytes.iter().position(|&b| b != 0).unwrap_or(7);
+    bytes[first_nonzero..].to_vec()
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
