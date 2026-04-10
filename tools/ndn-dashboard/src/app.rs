@@ -332,12 +332,18 @@ pub fn App() -> Element {
     // ── Tray polling coroutine ───────────────────────────────────────────────
     // Updates the tray icon colour and forwards menu events.
     use_coroutine(move |_: UnboundedReceiver<()>| async move {
-        let mut interval = tokio::time::interval(Duration::from_millis(200));
+        let mut interval = tokio::time::interval(Duration::from_millis(500));
         loop {
             interval.tick().await;
 
-            // Prune old toasts (older than 5 seconds).
-            { let now = std::time::Instant::now(); TOASTS.write().retain(|t| now.duration_since(t.created).as_secs() < 5); }
+            // Prune old toasts (older than 5 seconds) — only write if there is
+            // actually something to remove, to avoid spurious reactive updates.
+            {
+                let now = std::time::Instant::now();
+                if TOASTS.read().iter().any(|t| now.duration_since(t.created).as_secs() >= 5) {
+                    TOASTS.write().retain(|t| now.duration_since(t.created).as_secs() < 5);
+                }
+            }
 
             // Sync icon/tooltip with current state.
             let connected = matches!(*conn_state.read(), ConnState::Connected);
