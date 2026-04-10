@@ -1,38 +1,93 @@
-//! `ndn-peek` — fetch a single named Data packet and print its content.
+//! `ndn-peek` — fetch a named Data packet and print its content.
 //!
-//! Usage: ndn-peek /name/of/data [--timeout-ms <ms>]
+//! Always uses ndn-cxx compatible naming for segmented fetch.
+//! The `--ndn-cxx` flag is no longer needed (and is removed).
+//!
+//! ## Single-packet fetch (default)
+//!
+//! ```text
+//! ndn-peek /example/data
+//! ndn-peek /example/data --output /tmp/data.bin
+//! ndn-peek --can-be-prefix /example
+//! ```
+//!
+//! ## Segmented fetch
+//!
+//! ```text
+//! ndn-peek --pipeline 16 /example/data --output /tmp/data.bin
+//! ```
+//!
+//! Sends the initial Interest with CanBePrefix, discovers the versioned prefix
+//! from the first response, then fetches remaining segments with
+//! SegmentNameComponent (TLV 0x32). Compatible with `ndnputchunks` producers.
 
-use anyhow::{Result, bail};
-use ndn_packet::{Interest, Name};
+use anyhow::Result;
+use clap::Parser;
+use tokio::sync::mpsc;
+
+use ndn_tools_core::common::{EventLevel, ToolEvent};
+use ndn_tools_core::common::ConnectConfig;
+use ndn_tools_core::peek::{PeekParams, run_peek};
+
+#[derive(Parser)]
+#[command(name = "ndn-peek", about = "Fetch a named Data packet from the NDN network")]
+struct Cli {
+    name: String,
+
+    #[arg(long, default_value_t = 4000)]
+    lifetime: u64,
+
+    #[arg(long, short = 'o')]
+    output: Option<String>,
+
+    /// Segmented fetch pipeline depth.
+    #[arg(long, short = 'p')]
+    pipeline: Option<usize>,
+
+    #[arg(long)]
+    hex: bool,
+
+    #[arg(long, short = 'm')]
+    meta: bool,
+
+    #[arg(long, short = 'v')]
+    verbose: bool,
+
+    #[arg(long)]
+    can_be_prefix: bool,
+
+    #[arg(long, default_value_t = ndn_config::ManagementConfig::default().face_socket)]
+    face_socket: String,
+
+    #[arg(long)]
+    no_shm: bool,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let mut args = std::env::args().skip(1);
-    let name_str = match args.next() {
-        Some(s) => s,
-        None => {
-            eprintln!("usage: ndn-peek <name> [--timeout-ms <ms>]");
-            std::process::exit(1);
-        }
-    };
+    let cli = Cli::parse();
 
-    let mut timeout_ms: u64 = 4000;
-    while let Some(flag) = args.next() {
-        match flag.as_str() {
-            "--timeout-ms" => {
-                let val = args.next().unwrap_or_default();
-                timeout_ms = val.parse().unwrap_or(4000);
+    let (tx, mut rx) = mpsc::channel::<ToolEvent>(256);
+    tokio::spawn(async move {
+        while let Some(ev) = rx.recv().await {
+            match ev.level {
+                EventLevel::Error | EventLevel::Warn => eprintln!("{}", ev.text),
+                _ => {
+                    if !ev.text.is_empty() { println!("{}", ev.text); }
+                }
             }
-            other => bail!("unknown flag: {other}"),
         }
-    }
+    });
 
-    let name: Name = name_str.parse().map_err(|e| anyhow::anyhow!("{e}"))?;
-    let _interest = Interest::new(name.clone());
-
-    println!("ndn-peek: fetching {}", name_str);
-    println!("ndn-peek: timeout {}ms", timeout_ms);
-    // TODO: connect to local forwarder via AppFace and express Interest
-    println!("ndn-peek: local forwarder connection not yet implemented");
-    Ok(())
+    run_peek(PeekParams {
+        conn: ConnectConfig { face_socket: cli.face_socket, use_shm: !cli.no_shm },
+        name: cli.name,
+        lifetime_ms: cli.lifetime,
+        output: cli.output,
+        pipeline: cli.pipeline,
+        hex: cli.hex,
+        meta_only: cli.meta,
+        verbose: cli.verbose,
+        can_be_prefix: cli.can_be_prefix,
+    }, tx).await
 }

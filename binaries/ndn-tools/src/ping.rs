@@ -20,28 +20,30 @@
 //!                  [--lifetime 4000]
 //! ```
 
-use std::time::{Duration, Instant};
-
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
+use tokio::sync::mpsc;
 
-use ndn_app::{AppError, Consumer, KeyChain};
-use ndn_ipc::RouterClient;
-use ndn_packet::encode::{DataBuilder, InterestBuilder};
-use ndn_packet::{Interest, Name};
-use ndn_security::Signer;
+use ndn_tools_core::common::{ConnectConfig, EventLevel, ToolEvent};
+use ndn_tools_core::ping::{PingClientParams, PingServerParams};
 
 // ─── CLI ────────────────────────────────────────────────────────────────────
 
 #[derive(Args, Clone)]
 struct ConnectOpts {
     /// Router face socket path.
-    #[arg(long, default_value = "/tmp/ndn-faces.sock")]
+    #[arg(long, default_value = "/tmp/ndn.sock")]
     face_socket: String,
 
     /// Disable SHM and use Unix socket for data plane.
     #[arg(long)]
     no_shm: bool,
+}
+
+impl From<ConnectOpts> for ConnectConfig {
+    fn from(o: ConnectOpts) -> Self {
+        Self { face_socket: o.face_socket, use_shm: !o.no_shm }
+    }
 }
 
 #[derive(Parser)]
@@ -93,240 +95,41 @@ enum Command {
     },
 }
 
-// ─── Helpers ────────────────────────────────────────────────────────────────
-
-async fn connect(opts: &ConnectOpts) -> Result<RouterClient> {
-    if opts.no_shm {
-        Ok(RouterClient::connect_unix_only(&opts.face_socket).await?)
-    } else {
-        Ok(RouterClient::connect(&opts.face_socket).await?)
-    }
-}
-
-// ─── Server ─────────────────────────────────────────────────────────────────
-
-async fn run_server(conn: ConnectOpts, prefix: String, freshness: u64, sign: bool) -> Result<()> {
-    let prefix: Name = prefix.parse()?;
-    let client = connect(&conn).await?;
-    client.register_prefix(&prefix).await?;
-
-    let freshness = if freshness > 0 {
-        Some(Duration::from_millis(freshness))
-    } else {
-        None
-    };
-
-    let signer: Option<Arc<dyn Signer>> = if sign {
-        let keychain = KeyChain::new();
-        let signer = keychain.create_identity(prefix.clone(), None)?;
-        eprintln!(
-            "Signing with {} ({:?})",
-            signer.key_name(),
-            signer.sig_type(),
-        );
-        Some(signer)
-    } else {
-        None
-    };
-
-    eprintln!("PING SERVER {prefix} (listening)");
-
-    let mut served: u64 = 0;
-    loop {
-        let raw = match client.recv().await {
-            Some(b) => b,
-            None => break,
-        };
-        let interest = match Interest::decode(raw) {
-            Ok(i) => i,
-            Err(_) => continue,
-        };
-
-        // Respond with an empty Data packet (payload is the timestamp).
-        let payload = served.to_be_bytes();
-        let mut builder = DataBuilder::new((*interest.name).clone(), &payload);
-        if let Some(f) = freshness {
-            builder = builder.freshness(f);
-        }
-
-        let data = if let Some(ref signer) = signer {
-            let sig_type = signer.sig_type();
-            let key_name = signer.key_name().clone();
-            let s = signer.clone();
-            builder
-                .sign(sig_type, Some(&key_name), |region| {
-                    let owned = region.to_vec();
-                    async move { s.sign(&owned).await.expect("signing failed") }
-                })
-                .await
-        } else {
-            builder.build()
-        };
-
-        client.send(data).await?;
-        served += 1;
-        eprintln!("  reply #{served}: {}", interest.name);
-    }
-
-    Ok(())
-}
-
-// ─── Client ─────────────────────────────────────────────────────────────────
-
-struct PingResult {
-    rtt_us: u64,
-}
-
-async fn run_client(
-    conn: ConnectOpts,
-    prefix: String,
-    count: u64,
-    interval: u64,
-    lifetime: u64,
-) -> Result<()> {
-    let prefix: Name = prefix.parse()?;
-    let mut consumer = Consumer::connect(&conn.face_socket).await?;
-    let lifetime_dur = Duration::from_millis(lifetime);
-    let interval_dur = Duration::from_millis(interval);
-
-    let unlimited = count == 0;
-    let display_count = if unlimited {
-        "∞".to_string()
-    } else {
-        count.to_string()
-    };
-    eprintln!(
-        "PING {prefix} — {display_count} packets, interval {interval}ms, lifetime {lifetime}ms"
-    );
-
-    let mut results: Vec<PingResult> = Vec::new();
-    let mut timeouts: u64 = 0;
-    let mut nacks: u64 = 0;
-    let mut seq: u64 = 0;
-    let start = Instant::now();
-
-    loop {
-        if !unlimited && seq >= count {
-            break;
-        }
-
-        let name = prefix.clone().append("ping").append(seq.to_string());
-        let wire = InterestBuilder::new(name.clone())
-            .lifetime(lifetime_dur)
-            .build();
-
-        let t0 = Instant::now();
-        match consumer.fetch_wire(wire, lifetime_dur).await {
-            Ok(data) => {
-                let rtt_us = t0.elapsed().as_micros() as u64;
-                results.push(PingResult { rtt_us });
-                eprintln!("  {}: seq={seq} rtt={}", data.name, format_rtt(rtt_us));
-            }
-            Err(AppError::Nacked { reason }) => {
-                let rtt_us = t0.elapsed().as_micros() as u64;
-                nacks += 1;
-                eprintln!("  seq={seq}: nack ({reason:?}), rtt={}", format_rtt(rtt_us));
-            }
-            Err(AppError::Timeout) => {
-                timeouts += 1;
-                eprintln!("  seq={seq}: timeout");
-            }
-            Err(e) => {
-                eprintln!("  seq={seq}: error ({e})");
-                break;
-            }
-        }
-
-        seq += 1;
-        if unlimited || seq < count {
-            tokio::time::sleep(interval_dur).await;
-        }
-    }
-
-    let elapsed = start.elapsed();
-
-    // ─── Summary ────────────────────────────────────────────────────────
-    let sent = seq;
-    let received = results.len() as u64;
-    let loss_pct = if sent > 0 {
-        (sent - received) as f64 / sent as f64 * 100.0
-    } else {
-        0.0
-    };
-
-    println!();
-    println!("--- {prefix} ping statistics ---");
-    println!(
-        "{sent} transmitted, {received} received, {nacks} nacked, {loss_pct:.1}% loss, time {:.1}s",
-        elapsed.as_secs_f64(),
-    );
-
-    if !results.is_empty() {
-        let mut rtts: Vec<u64> = results.iter().map(|r| r.rtt_us).collect();
-        rtts.sort_unstable();
-        let min = rtts[0];
-        let max = *rtts.last().unwrap();
-        let avg = rtts.iter().sum::<u64>() / rtts.len() as u64;
-        let p50 = rtts[rtts.len() / 2];
-        let p99 = rtts[(rtts.len() as f64 * 0.99) as usize];
-
-        // Standard deviation.
-        let avg_f = avg as f64;
-        let var = rtts
-            .iter()
-            .map(|&r| (r as f64 - avg_f).powi(2))
-            .sum::<f64>()
-            / rtts.len() as f64;
-        let stddev = var.sqrt();
-
-        println!(
-            "rtt min/avg/max/p50/p99/stddev = {}/{}/{}/{}/{}/{:.0} µs",
-            format_rtt(min),
-            format_rtt(avg),
-            format_rtt(max),
-            format_rtt(p50),
-            format_rtt(p99),
-            stddev,
-        );
-    }
-
-    if timeouts > 0 {
-        println!("{timeouts} timeouts");
-    }
-
-    Ok(())
-}
-
-fn format_rtt(us: u64) -> String {
-    if us >= 1_000_000 {
-        format!("{:.1}s", us as f64 / 1_000_000.0)
-    } else if us >= 1_000 {
-        format!("{:.2}ms", us as f64 / 1_000.0)
-    } else {
-        format!("{us}µs")
-    }
-}
-
-// ─── Main ───────────────────────────────────────────────────────────────────
-
-use std::sync::Arc;
+// ─── Main ────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    tracing_subscriber::fmt::init();
     let cli = Cli::parse();
+
+    let (tx, mut rx) = mpsc::channel::<ToolEvent>(256);
+
+    // Print events to stderr/stdout as they arrive.
+    tokio::spawn(async move {
+        while let Some(ev) = rx.recv().await {
+            match ev.level {
+                EventLevel::Error | EventLevel::Warn => eprintln!("{}", ev.text),
+                _ => println!("{}", ev.text),
+            }
+        }
+    });
+
     match cli.command {
-        Command::Server {
-            conn,
-            prefix,
-            freshness,
-            sign,
-        } => run_server(conn, prefix, freshness, sign).await,
-        Command::Client {
-            conn,
-            prefix,
-            count,
-            interval,
-            lifetime,
-        } => run_client(conn, prefix, count, interval, lifetime).await,
+        Command::Server { conn, prefix, freshness, sign } =>
+            ndn_tools_core::ping::run_server(
+                PingServerParams { conn: conn.into(), prefix, freshness_ms: freshness, sign },
+                tx,
+            ).await,
+        Command::Client { conn, prefix, count, interval, lifetime } =>
+            ndn_tools_core::ping::run_client(
+                PingClientParams {
+                    conn: conn.into(),
+                    prefix,
+                    count,
+                    interval_ms: interval,
+                    lifetime_ms: lifetime,
+                },
+                tx,
+            ).await,
     }
 }
