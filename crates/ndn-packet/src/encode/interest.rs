@@ -252,15 +252,50 @@ impl InterestBuilder {
         F: FnOnce(&[u8]) -> Fut,
         Fut: std::future::Future<Output = Bytes>,
     {
-        let signed_region = self.build_signed_interest_region(sig_type, key_locator);
+        let (mut signed_region, digest_value_offset, app_params_offset) =
+            self.build_signed_interest_region(sig_type, key_locator);
         let sig_value = sign_fn(&signed_region).await;
 
-        let mut w = TlvWriter::new();
-        w.write_nested(tlv_type::INTEREST, |w| {
-            w.write_raw(&signed_region);
-            w.write_tlv(tlv_type::INTEREST_SIGNATURE_VALUE, &sig_value);
-        });
-        w.finish()
+        // Build the InterestSignatureValue TLV.
+        let mut sigval_w = TlvWriter::new();
+        sigval_w.write_tlv(tlv_type::INTEREST_SIGNATURE_VALUE, &sig_value);
+        let sigval_bytes = sigval_w.finish();
+
+        // Compute the actual ParametersSha256DigestComponent value.
+        let mut digest_input = Vec::with_capacity(
+            (signed_region.len() - app_params_offset) + sigval_bytes.len(),
+        );
+        digest_input.extend_from_slice(&signed_region[app_params_offset..]);
+        digest_input.extend_from_slice(&sigval_bytes);
+        let actual_digest = ring::digest::digest(&ring::digest::SHA256, &digest_input);
+
+        // Patch the placeholder with the actual digest.
+        signed_region[digest_value_offset..digest_value_offset + 32]
+            .copy_from_slice(actual_digest.as_ref());
+
+        let inner_len = signed_region.len() + sigval_bytes.len();
+        let mut outer = TlvWriter::with_capacity(inner_len + 10);
+        outer.write_varu64(tlv_type::INTEREST);
+        outer.write_varu64(inner_len as u64);
+        outer.write_raw(&signed_region);
+        outer.write_raw(&sigval_bytes);
+        outer.finish()
+    }
+
+    /// Sign with `DigestSha256` — SHA-256 of the signed region.
+    ///
+    /// This is the minimum signature type accepted by NFD for management
+    /// Interests on the loopback face.  No key material is required; NFD
+    /// verifies the signature by recomputing the SHA-256 itself.
+    ///
+    /// Use this when sending management commands (`rib/register`, etc.) to
+    /// NFD or ndnd so they do not silently drop the Interest.
+    #[cfg(feature = "std")]
+    pub fn sign_digest_sha256(self) -> Bytes {
+        self.sign_sync(SignatureType::DigestSha256, None, |region| {
+            let digest = ring::digest::digest(&ring::digest::SHA256, region);
+            Bytes::copy_from_slice(digest.as_ref())
+        })
     }
 
     /// Synchronous encode-and-sign for CPU-only signers (Ed25519, HMAC).
@@ -273,46 +308,74 @@ impl InterestBuilder {
     where
         F: FnOnce(&[u8]) -> Bytes,
     {
-        let signed_region = self.build_signed_interest_region(sig_type, key_locator);
+        let (mut signed_region, digest_value_offset, app_params_offset) =
+            self.build_signed_interest_region(sig_type, key_locator);
         let sig_value = sign_fn(&signed_region);
 
-        let inner_len = signed_region.len()
-            + ndn_tlv::varu64_size(tlv_type::INTEREST_SIGNATURE_VALUE)
-            + ndn_tlv::varu64_size(sig_value.len() as u64)
-            + sig_value.len();
+        // Build the InterestSignatureValue TLV.
+        let mut sigval_w = TlvWriter::new();
+        sigval_w.write_tlv(tlv_type::INTEREST_SIGNATURE_VALUE, &sig_value);
+        let sigval_bytes = sigval_w.finish();
+
+        // Compute the actual ParametersSha256DigestComponent value:
+        // SHA-256 over ApplicationParameters + InterestSignatureInfo +
+        // InterestSignatureValue TLVs (NDN Packet Format v0.3 §5.4).
+        let mut digest_input = Vec::with_capacity(
+            (signed_region.len() - app_params_offset) + sigval_bytes.len(),
+        );
+        digest_input.extend_from_slice(&signed_region[app_params_offset..]);
+        digest_input.extend_from_slice(&sigval_bytes);
+        let actual_digest = ring::digest::digest(&ring::digest::SHA256, &digest_input);
+
+        // Patch the 32-byte placeholder in the Name with the actual digest.
+        signed_region[digest_value_offset..digest_value_offset + 32]
+            .copy_from_slice(actual_digest.as_ref());
+
+        let inner_len = signed_region.len() + sigval_bytes.len();
         let mut outer = TlvWriter::with_capacity(inner_len + 10);
         outer.write_varu64(tlv_type::INTEREST);
         outer.write_varu64(inner_len as u64);
         outer.write_raw(&signed_region);
-        outer.write_tlv(tlv_type::INTEREST_SIGNATURE_VALUE, &sig_value);
+        outer.write_raw(&sigval_bytes);
         outer.finish()
     }
 
-    /// Build the signed region for a Signed Interest: Name (with
-    /// ParametersSha256DigestComponent) through InterestSignatureInfo,
-    /// including all fields in between.
+    /// Build the signed region for a Signed Interest: Name (with a 32-byte
+    /// placeholder for ParametersSha256DigestComponent) through
+    /// InterestSignatureInfo, including all fields in between.
+    ///
+    /// Returns `(bytes, digest_value_offset, app_params_offset)`:
+    /// - `bytes`: the full signed region
+    /// - `digest_value_offset`: byte offset of the 32-byte placeholder that
+    ///   must be replaced with the actual SHA-256 digest after signing
+    /// - `app_params_offset`: byte offset where ApplicationParameters TLV
+    ///   starts — used as the beginning of the digest-coverage region
+    ///
+    /// The caller computes the actual ParametersSha256DigestComponent value as
+    /// SHA-256 of `bytes[app_params_offset..]` (ApplicationParameters +
+    /// InterestSignatureInfo) concatenated with the InterestSignatureValue TLV,
+    /// then patches `bytes[digest_value_offset..digest_value_offset+32]`.
     fn build_signed_interest_region(
         self,
         sig_type: SignatureType,
         key_locator: Option<&Name>,
-    ) -> Vec<u8> {
+    ) -> (Vec<u8>, usize, usize) {
         let params = self.app_parameters.unwrap_or_default();
         let lifetime_ms = self.lifetime.map(|d| d.as_millis() as u64).unwrap_or(4000);
 
         let mut inner = TlvWriter::new();
 
-        // Name with ParametersSha256DigestComponent.
-        let mut params_tlv = TlvWriter::new();
-        params_tlv.write_tlv(tlv_type::APP_PARAMETERS, &params);
-        let params_wire = params_tlv.finish();
-        let digest = ring::digest::digest(&ring::digest::SHA256, &params_wire);
-
+        // Name with a 32-byte placeholder for ParametersSha256DigestComponent.
+        // The actual digest is computed after the signature is known and patched
+        // in by the caller.
         inner.write_nested(tlv_type::NAME, |w| {
             for comp in self.name.components() {
                 w.write_tlv(comp.typ, &comp.value);
             }
-            w.write_tlv(tlv_type::PARAMETERS_SHA256, digest.as_ref());
+            w.write_tlv(tlv_type::PARAMETERS_SHA256, &[0u8; 32]);
         });
+        // The placeholder is the last 32 bytes of the Name TLV.
+        let digest_value_offset = inner.len() - 32;
 
         // Selectors.
         if self.can_be_prefix {
@@ -338,6 +401,9 @@ impl InterestBuilder {
             inner.write_tlv(tlv_type::HOP_LIMIT, &[h]);
         }
 
+        // Track start of ApplicationParameters TLV for digest-coverage.
+        let app_params_offset = inner.len();
+
         // ApplicationParameters.
         inner.write_tlv(tlv_type::APP_PARAMETERS, &params);
 
@@ -361,7 +427,7 @@ impl InterestBuilder {
             w.write_tlv(tlv_type::SIGNATURE_TIME, &time_buf[..time_len]);
         });
 
-        inner.finish().to_vec()
+        (inner.finish().to_vec(), digest_value_offset, app_params_offset)
     }
 }
 

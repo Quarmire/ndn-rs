@@ -104,36 +104,54 @@ impl Interest {
 
         // Check if ApplicationParameters is present. If so, the Name must
         // end with ParametersSha256DigestComponent (type 0x02) and the
-        // digest must match SHA-256 of the ApplicationParameters TLV.
+        // digest must match SHA-256 of the parameters digest-coverage region:
+        // ApplicationParameters TLV through the end of InterestSignatureValue
+        // TLV (whichever of InterestSignatureInfo / InterestSignatureValue are
+        // present), per NDN Packet Format v0.3 §5.4.
         {
-            let mut scan = TlvReader::new(inner.as_bytes());
-            let mut app_params_tlv: Option<bytes::Bytes> = None;
+            let inner_bytes = inner.as_bytes();
+            let mut scan = TlvReader::new(inner_bytes.clone());
+            let mut params_region_start: Option<usize> = None;
+            let mut params_region_end: usize = 0;
+
             while !scan.is_empty() {
                 let pos_before = scan.position();
                 if let Ok((t, _v)) = scan.read_tlv() {
-                    if t == tlv_type::APP_PARAMETERS {
-                        // Capture the full TLV (type + length + value).
-                        let remaining = inner.as_bytes();
-                        app_params_tlv = Some(remaining.slice(pos_before..scan.position()));
-                        break;
+                    match t {
+                        t if t == tlv_type::APP_PARAMETERS => {
+                            if params_region_start.is_none() {
+                                params_region_start = Some(pos_before);
+                            }
+                            params_region_end = scan.position();
+                        }
+                        t if t == tlv_type::INTEREST_SIGNATURE_INFO
+                            || t == tlv_type::INTEREST_SIGNATURE_VALUE =>
+                        {
+                            if params_region_start.is_some() {
+                                params_region_end = scan.position();
+                            }
+                        }
+                        _ => {}
                     }
                 } else {
                     break;
                 }
             }
 
-            if let Some(params_tlv) = app_params_tlv {
+            if let Some(start) = params_region_start {
                 let last_comp = name.components().last().unwrap();
                 if last_comp.typ != tlv_type::PARAMETERS_SHA256 {
                     return Err(PacketError::MalformedPacket(
                         "Interest with ApplicationParameters must have ParametersSha256DigestComponent as last name component".into()
                     ));
                 }
-                // Verify digest matches SHA-256 of ApplicationParameters TLV.
+                // Verify digest matches SHA-256 of the parameters region.
                 // Skipped on no-std targets where ring is unavailable.
                 #[cfg(feature = "std")]
                 {
-                    let expected = ring::digest::digest(&ring::digest::SHA256, &params_tlv);
+                    let params_region = inner_bytes.slice(start..params_region_end);
+                    let expected =
+                        ring::digest::digest(&ring::digest::SHA256, &params_region);
                     if last_comp.value.as_ref() != expected.as_ref() {
                         return Err(PacketError::MalformedPacket(
                             "ParametersSha256DigestComponent does not match ApplicationParameters"
@@ -141,7 +159,6 @@ impl Interest {
                         ));
                     }
                 }
-                let _ = params_tlv;
             }
         }
 
