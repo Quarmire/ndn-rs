@@ -15,7 +15,7 @@
 /// # Connection flow (SHM preferred)
 ///
 /// ```text
-/// 1. Connect to /tmp/ndn-faces.sock → UnixFace (control channel)
+/// 1. Connect to /tmp/ndn.sock → UnixFace (control channel)
 /// 2. Send faces/create {Uri:"shm://myapp"} → get FaceId
 /// 3. ShmHandle::connect("myapp") → data plane ready
 /// 4. Send rib/register {Name:"/prefix", FaceId} → route installed
@@ -25,7 +25,7 @@
 /// # Connection flow (Unix fallback)
 ///
 /// ```text
-/// 1. Connect to /tmp/ndn-faces.sock → UnixFace (control + data)
+/// 1. Connect to /tmp/ndn.sock → UnixFace (control + data)
 /// 2. Send rib/register {Name:"/prefix"} → FaceId defaults to requesting face
 /// 3. Send/recv packets over same UnixFace
 /// ```
@@ -190,6 +190,20 @@ impl RouterClient {
         Ok(())
     }
 
+    /// Gracefully tear down this client: cancel ongoing ops, destroy the SHM
+    /// face (if any) via `faces/destroy`, then close the control socket.
+    ///
+    /// Call this before dropping the client to ensure the router removes the
+    /// SHM face immediately rather than waiting for GC.
+    pub async fn close(self) {
+        self.cancel.cancel();
+        #[cfg(all(unix, feature = "spsc-shm"))]
+        if let DataTransport::Shm { face_id, .. } = &self.transport {
+            let _ = self.mgmt.face_destroy(*face_id).await;
+        }
+        // Dropping self here closes the control socket.
+    }
+
     /// Get the SHM face ID if using SHM transport.
     fn shm_face_id(&self) -> Option<u64> {
         #[cfg(all(unix, feature = "spsc-shm"))]
@@ -221,7 +235,7 @@ impl RouterClient {
             DataTransport::Shm { handle, .. } => handle.recv().await,
             DataTransport::Unix => {
                 let _guard = self.recv_lock.lock().await;
-                self.control.recv().await.ok()
+                self.control.recv().await.ok().map(strip_lp)
             }
         }
     }
@@ -317,12 +331,8 @@ impl RouterClient {
         }
         // Try sending a trivial Interest on the control face.
         // If the socket is closed, send will fail immediately.
-        let probe = ndn_packet::encode::encode_interest(
-            &"/localhost/nfd/status/general"
-                .parse()
-                .expect("valid probe name"),
-            None,
-        );
+        let probe = ndn_packet::encode::InterestBuilder::new("/localhost/nfd/status/general")
+            .sign_digest_sha256();
         match self.control.send(probe).await {
             Ok(_) => true,
             Err(_) => {
@@ -334,8 +344,36 @@ impl RouterClient {
     }
 }
 
+impl Drop for RouterClient {
+    fn drop(&mut self) {
+        // Cancel the cancel token so the disconnect-monitor task (which holds
+        // a clone of Arc<IpcFace>) exits promptly.  Once the task drops its
+        // clone, the Arc refcount reaches zero, the Unix socket is closed, and
+        // the router detects the disconnect → cleans up the SHM face.
+        self.cancel.cancel();
+    }
+}
+
 /// Process-local counter for auto-generated SHM names.
 fn next_shm_id() -> u32 {
     static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Strip NDNLPv2 wrapper (type 0x64) if present.
+///
+/// External forwarders (yanfd, NFD) always wrap packets in LP framing on Unix
+/// socket faces.  Unwrap the `Fragment` field and discard LP headers (PIT
+/// tokens, face IDs, congestion marks, etc.).
+///
+/// Returns the original bytes unchanged if the packet is not LP-wrapped.
+pub(crate) fn strip_lp(raw: Bytes) -> Bytes {
+    use ndn_packet::lp::{is_lp_packet, LpPacket};
+    if is_lp_packet(&raw)
+        && let Ok(lp) = LpPacket::decode(raw.clone())
+        && let Some(fragment) = lp.fragment
+    {
+        return fragment;
+    }
+    raw
 }

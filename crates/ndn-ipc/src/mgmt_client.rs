@@ -10,8 +10,8 @@
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 /// use ndn_ipc::MgmtClient;
 ///
-/// let mgmt = MgmtClient::connect("/tmp/ndn-faces.sock").await?;
-/// mgmt.route_add(&"/ndn".parse()?, 1, 10).await?;
+/// let mgmt = MgmtClient::connect("/tmp/ndn.sock").await?;
+/// mgmt.route_add(&"/ndn".parse()?, Some(1), 10).await?;
 /// let status = mgmt.status().await?;
 /// println!("{} {}", status.status_code, status.status_text);
 /// # Ok(())
@@ -27,7 +27,7 @@ use ndn_config::{
     nfd_command::{command_name, dataset_name, module, verb},
 };
 use ndn_face_local::IpcFace;
-use ndn_packet::{Name, encode::encode_interest};
+use ndn_packet::{Name, encode::InterestBuilder};
 use ndn_transport::{Face, FaceId};
 
 use crate::router_client::RouterError;
@@ -48,8 +48,8 @@ impl MgmtClient {
     /// Connect to the router's IPC socket.
     ///
     /// `face_socket` is a Unix domain socket path on Unix (e.g.
-    /// `/tmp/ndn-faces.sock`) or a Named Pipe path on Windows (e.g.
-    /// `\\.\pipe\ndn-faces`).
+    /// `/tmp/ndn.sock`) or a Named Pipe path on Windows (e.g.
+    /// `\\.\pipe\ndn`).
     pub async fn connect(face_socket: impl AsRef<str>) -> Result<Self, RouterError> {
         let face =
             Arc::new(ndn_face_local::ipc_face_connect(FaceId(0), face_socket.as_ref()).await?);
@@ -467,15 +467,19 @@ impl MgmtClient {
     }
 
     /// Send an Interest and decode the ControlResponse from the Data reply.
+    ///
+    /// Management Interests are signed with `DigestSha256` (SHA-256 of the
+    /// signed region) so that NFD and ndnd accept them. Without a signature
+    /// NFD silently drops the Interest and the client would hang forever.
     async fn send_interest(&self, name: Name) -> Result<ControlResponse, RouterError> {
-        let interest_wire = encode_interest(&name, None);
+        let interest_wire = InterestBuilder::new(name).sign_digest_sha256();
 
         // Serialise send+recv so concurrent callers don't interleave.
         let _guard = self.recv_lock.lock().await;
 
         self.face.send(interest_wire).await?;
 
-        let data_wire = self.face.recv().await?;
+        let data_wire = self.face.recv().await.map(crate::router_client::strip_lp)?;
         let data =
             ndn_packet::Data::decode(data_wire).map_err(|_| RouterError::MalformedResponse)?;
 
