@@ -4,7 +4,8 @@ use ndn_config::{
     LoggingConfig, ManagementConfig, RouteConfig, SecurityConfig,
 };
 
-use crate::app::{AppCtx, DashCmd};
+use crate::app::{AppCtx, DashCmd, RouterCmd, push_toast, ToastLevel, ROUTER_RUNNING};
+use crate::router_proc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConfigSection {
@@ -37,6 +38,14 @@ pub fn Config() -> Element {
     let mut editing: Signal<Option<ConfigSection>> = use_signal(|| None);
     let mut edu_dismissed = use_signal(|| false);
 
+    // Local editable faces/routes — initialized from loaded config, editable until restart
+    let local_faces: Signal<Vec<FaceConfig>> = use_signal(|| {
+        parsed.as_ref().map(|c| c.faces.clone()).unwrap_or_default()
+    });
+    let local_routes: Signal<Vec<RouteConfig>> = use_signal(|| {
+        parsed.as_ref().map(|c| c.routes.clone()).unwrap_or_default()
+    });
+
     rsx! {
         // ── Education snippet (B7): identity IS address ──────────────────────
         if !*edu_dismissed.read() {
@@ -47,20 +56,20 @@ pub fn Config() -> Element {
                     }
                     div { style: "flex:1;",
                         div { style: "display:flex;justify-content:space-between;align-items:flex-start;",
-                            div { style: "font-size:13px;font-weight:600;color:#a371f7;margin-bottom:4px;",
+                            div { style: "font-size:13px;font-weight:600;color:var(--purple);margin-bottom:4px;",
                                 "Your identity IS your address"
                             }
                             button {
-                                style: "background:none;border:none;color:#8b949e;cursor:pointer;font-size:13px;padding:0;",
+                                style: "background:none;border:none;color:var(--text-muted);cursor:pointer;font-size:13px;padding:0;",
                                 onclick: move |_| edu_dismissed.set(true),
                                 "✕"
                             }
                         }
-                        div { style: "font-size:12px;color:#8b949e;line-height:1.6;",
+                        div { style: "font-size:12px;color:var(--text-muted);line-height:1.6;",
                             "In NDN, "
-                            strong { style: "color:#c9d1d9;", "packets are addressed by name, not IP." }
+                            strong { style: "color:var(--text);", "packets are addressed by name, not IP." }
                             " Your router's NDN name (configured below under "
-                            span { style: "color:#a371f7;", "Security → router_name" }
+                            span { style: "color:var(--purple);", "Security → router_name" }
                             ") becomes your DID — a globally unique, portable identity "
                             "that moves with you across networks."
                         }
@@ -82,10 +91,10 @@ pub fn Config() -> Element {
             }
         } else if parsed.is_none() {
             div { class: "section",
-                div { class: "empty", style: "color:#f85149;",
+                div { class: "empty", style: "color:var(--red);",
                     "Failed to parse config TOML. Raw:"
                 }
-                pre { style: "font-size:11px;color:#8b949e;overflow:auto;max-height:200px;", "{config_toml}" }
+                pre { style: "font-size:11px;color:var(--text-muted);overflow:auto;max-height:200px;", "{config_toml}" }
             }
         } else {
             {
@@ -93,7 +102,7 @@ pub fn Config() -> Element {
 
                 // ── Toolbar ───────────────────────────────────────────────
                 rsx! {
-                    div { style: "display:flex;gap:8px;margin-bottom:16px;align-items:center;",
+                    div { style: "display:flex;gap:8px;margin-bottom:16px;align-items:center;flex-wrap:wrap;",
                         button {
                             class: "btn btn-secondary",
                             onclick: move |_| ctx.cmd.send(DashCmd::RefreshConfig),
@@ -119,8 +128,40 @@ pub fn Config() -> Element {
                             },
                             "Import TOML"
                         }
-                        span { style: "font-size:11px;color:#8b949e;margin-left:auto;",
-                            "Changes require router restart. Export the TOML and restart with --config."
+                        // Restart with current config (managed router only)
+                        button {
+                            class: "btn btn-secondary",
+                            title: "Rebuild config TOML from current settings + edited faces/routes, write to temp file and restart the managed router",
+                            onclick: {
+                                let base_toml = config_toml.clone();
+                                move |_| {
+                                    // Merge local face/route edits into the base config
+                                    let toml = if let Ok(mut c) = base_toml.parse::<ForwarderConfig>() {
+                                        c.faces = local_faces.read().clone();
+                                        c.routes = local_routes.read().clone();
+                                        c.to_toml_string().unwrap_or_else(|_| base_toml.clone())
+                                    } else {
+                                        base_toml.clone()
+                                    };
+                                    match router_proc::write_temp_config(&toml) {
+                                        Ok(path) => {
+                                            let path_str = path.to_string_lossy().to_string();
+                                            ctx.router_cmd.send(RouterCmd::Stop);
+                                            ctx.router_cmd.send(RouterCmd::Start(Some(path_str)));
+                                            push_toast("Router restart queued with updated config", ToastLevel::Info);
+                                        }
+                                        Err(e) => push_toast(format!("Failed to write config: {e}"), ToastLevel::Error),
+                                    }
+                                }
+                            },
+                            "↺ Restart with Config"
+                        }
+                        span { style: "font-size:11px;color:var(--text-muted);margin-left:auto;",
+                            if *ROUTER_RUNNING.read() {
+                                "Managed router is running."
+                            } else {
+                                "Changes require router restart."
+                            }
                         }
                     }
 
@@ -130,8 +171,8 @@ pub fn Config() -> Element {
                             span { style: "font-size:14px;", "⚠" }
                             span {
                                 "Settings are being edited. "
-                                strong { "Export the TOML and restart the router" }
-                                " to apply changes — live editing is not supported."
+                                strong { "Export TOML or use ↺ Restart with Config" }
+                                " to apply — live config editing is not supported."
                             }
                             button {
                                 class: "btn btn-secondary btn-sm",
@@ -154,13 +195,13 @@ pub fn Config() -> Element {
                                 }
                             }
                             textarea {
-                                style: "width:100%;height:300px;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;font-family:'SF Mono',monospace;font-size:12px;padding:10px;border-radius:4px;resize:vertical;",
+                                style: "width:100%;height:300px;font-family:'SF Mono',monospace;font-size:12px;padding:10px;border-radius:4px;resize:vertical;",
                                 readonly: true,
                                 value: "{export_text}",
                             }
-                            div { style: "margin-top:8px;font-size:12px;color:#8b949e;",
+                            div { style: "margin-top:8px;font-size:12px;color:var(--text-muted);",
                                 "Save this TOML to a file and launch ndn-router with: "
-                                code { style: "color:#58a6ff;", "ndn-router --config /path/to/config.toml" }
+                                code { style: "color:var(--accent);", "ndn-router --config /path/to/config.toml" }
                             }
                         }
                     }
@@ -170,7 +211,7 @@ pub fn Config() -> Element {
                         div { class: "section",
                             div { class: "section-title", "Import Config" }
                             textarea {
-                                style: "width:100%;height:200px;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;font-family:'SF Mono',monospace;font-size:12px;padding:10px;border-radius:4px;resize:vertical;",
+                                style: "width:100%;height:200px;font-family:'SF Mono',monospace;font-size:12px;padding:10px;border-radius:4px;resize:vertical;",
                                 placeholder: "Paste TOML config here to preview and validate…",
                                 value: "{import_text}",
                                 oninput: move |e| {
@@ -181,12 +222,12 @@ pub fn Config() -> Element {
                                 },
                             }
                             if let Some(ref err) = *import_error.read() {
-                                div { style: "color:#f85149;font-size:12px;margin-top:6px;",
+                                div { style: "color:var(--red);font-size:12px;margin-top:6px;",
                                     "Parse error: {err}"
                                 }
                             } else if !import_text.read().is_empty() {
-                                div { style: "color:#3fb950;font-size:12px;margin-top:6px;",
-                                    "✓ Valid TOML config"
+                                div { style: "color:var(--green);font-size:12px;margin-top:6px;",
+                                    "✓ Valid TOML config — use ↺ Restart with Config or save to file."
                                 }
                             }
                         }
@@ -210,11 +251,11 @@ pub fn Config() -> Element {
                     // ── Logging section ───────────────────────────────────
                     {render_logging_section(cfg.logging.clone(), ctx, editing)}
 
-                    // ── Faces section ─────────────────────────────────────
-                    {render_faces_section(&cfg.faces)}
+                    // ── Faces section (editable) ──────────────────────────
+                    FacesSection { faces: local_faces }
 
-                    // ── Static Routes section ─────────────────────────────
-                    {render_routes_section(&cfg.routes)}
+                    // ── Static Routes section (editable) ──────────────────
+                    RoutesSection { routes: local_routes, n_faces: local_faces.read().len() }
                 }
             }
         }
@@ -255,7 +296,7 @@ fn kv_row(key: &str, val: impl std::fmt::Display, badge: Element) -> Element {
     let val = val.to_string();
     rsx! {
         tr {
-            td { style: "color:#8b949e;font-size:12px;padding:5px 12px;width:220px;", "{key}" }
+            td { style: "color:var(--text-muted);font-size:12px;padding:5px 12px;width:220px;", "{key}" }
             td { class: "mono", style: "padding:5px 12px;", "{val}" }
             td { style: "padding:5px 12px;", {badge} }
         }
@@ -300,7 +341,7 @@ fn render_engine_section(engine: EngineConfig, editing: Signal<Option<ConfigSect
                         }
                     }
                     div { style: "display:flex;align-items:flex-end;",
-                        span { style: "font-size:12px;color:#8b949e;",
+                        span { style: "font-size:12px;color:var(--text-muted);",
                             "Changes take effect after router restart."
                         }
                     }
@@ -355,7 +396,7 @@ fn render_cs_section(cs: CsConfig, editing: Signal<Option<ConfigSection>>) -> El
                         }
                     }
                     div { style: "display:flex;align-items:flex-end;",
-                        span { style: "font-size:12px;color:#8b949e;", "Requires restart." }
+                        span { style: "font-size:12px;color:var(--text-muted);", "Requires restart." }
                     }
                 }
             }
@@ -374,31 +415,15 @@ fn render_management_section(mgmt: ManagementConfig, editing: Signal<Option<Conf
 
             table { style: "width:100%;",
                 tbody {
-                    {kv_row("Transport", &mgmt.transport, restart_badge())}
-                    {kv_row("Face socket", &mgmt.face_socket, restart_badge())}
-                    {kv_row("Bypass socket", &mgmt.bypass_socket, restart_badge())}
+                    {kv_row("Socket", &mgmt.face_socket, restart_badge())}
                 }
             }
 
             if is_open {
                 div { class: "form-row", style: "margin-top:14px;",
-                    div { class: "form-group",
-                        label { "Transport" }
-                        select {
-                            option { value: "ndn",    selected: mgmt.transport == "ndn",    "NDN (recommended)" }
-                            option { value: "bypass", selected: mgmt.transport == "bypass", "Bypass JSON" }
-                        }
-                    }
                     div { class: "form-group", style: "flex:1;",
-                        label { "Face socket path" }
+                        label { "Router socket path" }
                         input { r#type: "text", value: "{mgmt.face_socket}", }
-                    }
-                    div { class: "form-group", style: "flex:1;",
-                        label { "Bypass socket path" }
-                        input {
-                            r#type: "text", value: "{mgmt.bypass_socket}",
-                            disabled: mgmt.transport != "bypass",
-                        }
                     }
                 }
             }
@@ -481,7 +506,7 @@ fn render_discovery_section(disc: DiscoveryTomlConfig, editing: Signal<Option<Co
             {section_header("Discovery", ConfigSection::Discovery, editing)}
 
             if !enabled {
-                div { style: "color:#8b949e;font-size:13px;margin-bottom:8px;",
+                div { style: "color:var(--text-muted);font-size:13px;margin-bottom:8px;",
                     "Discovery is disabled. Set "
                     code { "node_name" }
                     " to enable."
@@ -619,7 +644,7 @@ fn render_logging_section(log: LoggingConfig, _ctx: AppCtx, editing: Signal<Opti
                         }
                     }
                     div { style: "display:flex;align-items:flex-end;gap:8px;",
-                        div { style: "font-size:12px;color:#8b949e;",
+                        div { style: "font-size:12px;color:var(--text-muted);",
                             "Log level applies live. File path requires restart."
                         }
                     }
@@ -629,36 +654,37 @@ fn render_logging_section(log: LoggingConfig, _ctx: AppCtx, editing: Signal<Opti
     }
 }
 
-// ── Faces (read-only display) ─────────────────────────────────────────────────
+// ── Editable Faces section ────────────────────────────────────────────────────
 
-fn render_faces_section(faces: &[FaceConfig]) -> Element {
-    rsx! {
-        div { class: "section",
-            div { class: "section-title",
-                "Startup Faces "
-                {restart_badge()}
-            }
-            if faces.is_empty() {
-                div { class: "empty", "No startup faces configured. Faces can be created at runtime via the Faces tab." }
-            } else {
-                div { style: "display:flex;flex-direction:column;gap:8px;",
-                    for (i, face) in faces.iter().enumerate() {
-                        {render_face_card(i, face)}
-                    }
-                }
-            }
-            div { style: "margin-top:8px;font-size:12px;color:#8b949e;",
-                "Startup faces are configured in the TOML config file and created automatically when the router starts."
-            }
+#[derive(Clone, Debug, PartialEq)]
+enum AddFaceKind {
+    Udp,
+    Tcp,
+    Multicast,
+    Unix,
+    WebSocket,
+    EtherMulticast,
+}
+
+impl AddFaceKind {
+    #[allow(dead_code)]
+    fn label(&self) -> &'static str {
+        match self {
+            AddFaceKind::Udp          => "UDP",
+            AddFaceKind::Tcp          => "TCP",
+            AddFaceKind::Multicast    => "UDP Multicast",
+            AddFaceKind::Unix         => "Unix Socket",
+            AddFaceKind::WebSocket    => "WebSocket",
+            AddFaceKind::EtherMulticast => "Ether Multicast",
         }
     }
 }
 
-fn render_face_card(i: usize, face: &FaceConfig) -> Element {
-    let (kind_label, details) = match face {
+fn face_config_label(face: &FaceConfig) -> (&'static str, String) {
+    match face {
         FaceConfig::Udp { bind, remote } => (
             "UDP",
-            format!("bind={} remote={}", bind.as_deref().unwrap_or("any"), remote.as_deref().unwrap_or("(unicast)"))
+            format!("bind={} remote={}", bind.as_deref().unwrap_or("any"), remote.as_deref().unwrap_or("(listen)"))
         ),
         FaceConfig::Tcp { bind, remote } => (
             "TCP",
@@ -666,62 +692,416 @@ fn render_face_card(i: usize, face: &FaceConfig) -> Element {
         ),
         FaceConfig::Multicast { group, port, interface } => (
             "Multicast",
-            format!("group={group}:{port} iface={}", interface.as_deref().unwrap_or("any"))
+            format!("group={}:{} iface={}", group, port, interface.as_deref().unwrap_or("any"))
         ),
         FaceConfig::Unix { path } => (
             "Unix",
-            format!("path={}", path.as_deref().unwrap_or("(default)"))
+            format!("path={}", path.as_deref().unwrap_or("/tmp/ndn.sock"))
         ),
         FaceConfig::WebSocket { bind, url } => (
-            "WebSocket",
-            format!("bind={} url={}", bind.as_deref().unwrap_or("(none)"), url.as_deref().unwrap_or("(none)"))
+            "WS",
+            format!("bind={} url={}", bind.as_deref().unwrap_or("any"), url.as_deref().unwrap_or(""))
         ),
         FaceConfig::Serial { path, baud } => (
             "Serial",
             format!("path={path} baud={baud}")
         ),
         FaceConfig::EtherMulticast { interface } => (
-            "Ether-Multicast",
+            "EtherMC",
             format!("iface={interface}")
         ),
-    };
+    }
+}
+
+#[component]
+fn FacesSection(faces: Signal<Vec<FaceConfig>>) -> Element {
+    let mut show_add = use_signal(|| false);
+    let mut add_kind = use_signal(|| AddFaceKind::Udp);
+    let mut add_bind = use_signal(String::new);
+    let mut add_remote = use_signal(String::new);
+    let mut add_group = use_signal(|| "224.0.23.170".to_string());
+    let mut add_port = use_signal(|| "56363".to_string());
+    let mut add_iface = use_signal(String::new);
+    let mut add_path = use_signal(|| "/tmp/ndn.sock".to_string());
+    let mut add_ws_url = use_signal(String::new);
+
+    let n_faces = faces.read().len();
+    let show_face_form = *show_add.read();
 
     rsx! {
-        div { style: "background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:10px 14px;display:flex;align-items:center;gap:12px;",
-            span { class: "badge badge-blue", "{kind_label}" }
-            span { style: "font-size:12px;color:#8b949e;", "face[{i}]" }
-            span { class: "mono", style: "font-size:12px;", "{details}" }
+        div { class: "section",
+            div { style: "display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;",
+                div {
+                    div { class: "section-title", style: "display:inline;",
+                        "Startup Faces "
+                    }
+                    {restart_badge()}
+                }
+                div { style: "display:flex;gap:6px;",
+                    button {
+                        class: "btn btn-primary btn-sm",
+                        onclick: move |_| show_add.set(!show_face_form),
+                        if show_face_form { "▲ Cancel" } else { "+ Add Face" }
+                    }
+                }
+            }
+
+            if faces.read().is_empty() {
+                div { class: "empty", style: "padding:12px 0;",
+                    "No startup faces configured."
+                }
+            } else {
+                div { style: "display:flex;flex-direction:column;gap:6px;margin-bottom:10px;",
+                    for (i, face) in faces.read().iter().enumerate() {
+                        {
+                            let (kind_label, details) = face_config_label(face);
+                            rsx! {
+                                div { style: "display:flex;align-items:center;gap:8px;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px 12px;",
+                                    span { class: "badge badge-blue", style: "font-size:10px;", "face[{i}]" }
+                                    span { class: "badge badge-gray", style: "font-size:10px;", "{kind_label}" }
+                                    span { class: "mono", style: "flex:1;font-size:11px;color:var(--text-muted);", "{details}" }
+                                    button {
+                                        class: "btn btn-danger btn-sm",
+                                        onclick: move |_| { faces.write().remove(i); },
+                                        "✕"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Add face form
+            if show_face_form {
+                div { style: "background:var(--bg);border:1px solid var(--border-subtle);border-radius:6px;padding:12px;margin-top:6px;",
+                    div { style: "font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.4px;margin-bottom:10px;font-weight:600;",
+                        "New Face"
+                    }
+                    div { style: "display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;",
+                        div { class: "form-group",
+                            label { "Face Kind" }
+                            select {
+                                onchange: move |e| {
+                                    add_kind.set(match e.value().as_str() {
+                                        "tcp"   => AddFaceKind::Tcp,
+                                        "mcast" => AddFaceKind::Multicast,
+                                        "unix"  => AddFaceKind::Unix,
+                                        "ws"    => AddFaceKind::WebSocket,
+                                        "ether" => AddFaceKind::EtherMulticast,
+                                        _       => AddFaceKind::Udp,
+                                    });
+                                },
+                                option { value: "udp",   "UDP" }
+                                option { value: "tcp",   "TCP" }
+                                option { value: "mcast", "UDP Multicast" }
+                                option { value: "unix",  "Unix Socket" }
+                                option { value: "ws",    "WebSocket" }
+                                option { value: "ether", "Ether Multicast" }
+                            }
+                        }
+
+                        // UDP / TCP fields
+                        if *add_kind.read() == AddFaceKind::Udp || *add_kind.read() == AddFaceKind::Tcp {
+                            div { class: "form-group", style: "flex:1;min-width:160px;",
+                                label { "Remote (host:port, empty = listen)" }
+                                input {
+                                    r#type: "text",
+                                    placeholder: "192.168.1.1:6363",
+                                    value: "{add_remote}",
+                                    oninput: move |e| add_remote.set(e.value()),
+                                }
+                            }
+                            div { class: "form-group", style: "flex:1;min-width:140px;",
+                                label { "Bind (optional)" }
+                                input {
+                                    r#type: "text",
+                                    placeholder: "0.0.0.0:6363",
+                                    value: "{add_bind}",
+                                    oninput: move |e| add_bind.set(e.value()),
+                                }
+                            }
+                        }
+
+                        // Multicast fields
+                        if *add_kind.read() == AddFaceKind::Multicast {
+                            div { class: "form-group",
+                                label { "Multicast Group" }
+                                input {
+                                    r#type: "text",
+                                    value: "{add_group}",
+                                    style: "width:150px;",
+                                    oninput: move |e| add_group.set(e.value()),
+                                }
+                            }
+                            div { class: "form-group",
+                                label { "Port" }
+                                input {
+                                    r#type: "number",
+                                    value: "{add_port}",
+                                    style: "width:90px;",
+                                    oninput: move |e| add_port.set(e.value()),
+                                }
+                            }
+                            div { class: "form-group", style: "flex:1;",
+                                label { "Interface (optional)" }
+                                input {
+                                    r#type: "text",
+                                    placeholder: "eth0",
+                                    value: "{add_iface}",
+                                    oninput: move |e| add_iface.set(e.value()),
+                                }
+                            }
+                        }
+
+                        // Unix fields
+                        if *add_kind.read() == AddFaceKind::Unix {
+                            div { class: "form-group", style: "flex:1;",
+                                label { "Socket Path" }
+                                input {
+                                    r#type: "text",
+                                    value: "{add_path}",
+                                    oninput: move |e| add_path.set(e.value()),
+                                }
+                            }
+                        }
+
+                        // WebSocket fields
+                        if *add_kind.read() == AddFaceKind::WebSocket {
+                            div { class: "form-group", style: "flex:1;",
+                                label { "Bind (optional)" }
+                                input {
+                                    r#type: "text",
+                                    placeholder: "0.0.0.0:9696",
+                                    value: "{add_bind}",
+                                    oninput: move |e| add_bind.set(e.value()),
+                                }
+                            }
+                            div { class: "form-group", style: "flex:1;",
+                                label { "URL (optional)" }
+                                input {
+                                    r#type: "text",
+                                    placeholder: "ws://0.0.0.0:9696/",
+                                    value: "{add_ws_url}",
+                                    oninput: move |e| add_ws_url.set(e.value()),
+                                }
+                            }
+                        }
+
+                        // EtherMulticast fields
+                        if *add_kind.read() == AddFaceKind::EtherMulticast {
+                            div { class: "form-group", style: "flex:1;",
+                                label { "Interface" }
+                                input {
+                                    r#type: "text",
+                                    placeholder: "eth0",
+                                    value: "{add_iface}",
+                                    oninput: move |e| add_iface.set(e.value()),
+                                }
+                            }
+                        }
+                    }
+                    div { style: "display:flex;justify-content:flex-end;gap:6px;",
+                        button {
+                            class: "btn btn-primary btn-sm",
+                            onclick: move |_| {
+                                let opt = |s: &str| -> Option<String> {
+                                    let s = s.trim();
+                                    if s.is_empty() { None } else { Some(s.to_string()) }
+                                };
+                                let new_face = match *add_kind.read() {
+                                    AddFaceKind::Udp => FaceConfig::Udp {
+                                        bind: opt(&add_bind.read()),
+                                        remote: opt(&add_remote.read()),
+                                    },
+                                    AddFaceKind::Tcp => FaceConfig::Tcp {
+                                        bind: opt(&add_bind.read()),
+                                        remote: opt(&add_remote.read()),
+                                    },
+                                    AddFaceKind::Multicast => FaceConfig::Multicast {
+                                        group: add_group.read().trim().to_string(),
+                                        port: add_port.read().trim().parse().unwrap_or(56363),
+                                        interface: opt(&add_iface.read()),
+                                    },
+                                    AddFaceKind::Unix => FaceConfig::Unix {
+                                        path: opt(&add_path.read()),
+                                    },
+                                    AddFaceKind::WebSocket => FaceConfig::WebSocket {
+                                        bind: opt(&add_bind.read()),
+                                        url: opt(&add_ws_url.read()),
+                                    },
+                                    AddFaceKind::EtherMulticast => FaceConfig::EtherMulticast {
+                                        interface: add_iface.read().trim().to_string(),
+                                    },
+                                };
+                                faces.write().push(new_face);
+                                // Reset form
+                                add_bind.set(String::new());
+                                add_remote.set(String::new());
+                                add_group.set("224.0.23.170".to_string());
+                                add_port.set("56363".to_string());
+                                add_iface.set(String::new());
+                                add_ws_url.set(String::new());
+                                show_add.set(false);
+                            },
+                            "+ Add face[{n_faces}]"
+                        }
+                    }
+                }
+            }
+
+            div { style: "margin-top:8px;font-size:12px;color:var(--text-muted);",
+                "Startup faces are created in order (face[0], face[1], …) when the router starts. Routes reference faces by this index."
+            }
         }
     }
 }
 
-// ── Static Routes (read-only display) ────────────────────────────────────────
+// ── Editable Routes section ───────────────────────────────────────────────────
 
-fn render_routes_section(routes: &[RouteConfig]) -> Element {
+#[component]
+fn RoutesSection(routes: Signal<Vec<RouteConfig>>, n_faces: usize) -> Element {
+    let mut show_add = use_signal(|| false);
+    let mut add_prefix = use_signal(String::new);
+    let mut add_face = use_signal(|| 0u32);
+    let mut add_cost = use_signal(|| 10u32);
+    let mut add_err: Signal<Option<String>> = use_signal(|| None);
+
+    let show_route_form = *show_add.read();
+
     rsx! {
         div { class: "section",
-            div { class: "section-title",
-                "Startup Routes "
-                {restart_badge()}
+            div { style: "display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;",
+                div {
+                    div { class: "section-title", style: "display:inline;",
+                        "Startup Routes "
+                    }
+                    {restart_badge()}
+                }
+                button {
+                    class: "btn btn-primary btn-sm",
+                    onclick: move |_| show_add.set(!show_route_form),
+                    if show_route_form { "▲ Cancel" } else { "+ Add Route" }
+                }
             }
-            if routes.is_empty() {
-                div { class: "empty", "No startup routes configured. Routes can be added at runtime via the Routes tab." }
+
+            if routes.read().is_empty() {
+                div { class: "empty", style: "padding:12px 0;",
+                    "No startup routes configured."
+                }
             } else {
-                table {
+                table { style: "width:100%;margin-bottom:10px;",
                     thead {
                         tr {
                             th { "Prefix" }
                             th { "Face Index" }
                             th { "Cost" }
+                            th { style: "width:50px;" }
                         }
                     }
                     tbody {
-                        for route in routes.iter() {
+                        for (i, route) in routes.read().iter().enumerate() {
                             tr {
                                 td { class: "mono", "{route.prefix}" }
-                                td { class: "mono", "{route.face}" }
+                                td { class: "mono",
+                                    "face[{route.face}]"
+                                    if route.face >= n_faces && n_faces > 0 {
+                                        span { class: "badge badge-red", style: "font-size:9px;margin-left:4px;", "out of range" }
+                                    }
+                                }
                                 td { class: "mono", "{route.cost}" }
+                                td {
+                                    button {
+                                        class: "btn btn-danger btn-sm",
+                                        onclick: move |_| { routes.write().remove(i); },
+                                        "✕"
+                                    }
+                                }
                             }
+                        }
+                    }
+                }
+            }
+
+            if show_route_form {
+                div { style: "background:var(--bg);border:1px solid var(--border-subtle);border-radius:6px;padding:12px;",
+                    div { style: "font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.4px;margin-bottom:10px;font-weight:600;",
+                        "New Route"
+                    }
+                    div { style: "display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px;",
+                        div { class: "form-group", style: "flex:2;min-width:180px;",
+                            label { "Name Prefix" }
+                            input {
+                                r#type: "text",
+                                placeholder: "/ndn",
+                                value: "{add_prefix}",
+                                oninput: move |e| {
+                                    let mut v = e.value();
+                                    if !v.is_empty() && !v.starts_with('/') { v = format!("/{v}"); }
+                                    add_prefix.set(v);
+                                    add_err.set(None);
+                                },
+                            }
+                        }
+                        div { class: "form-group",
+                            label {
+                                "Face Index"
+                                if n_faces > 0 {
+                                    span { style: "color:var(--text-faint);margin-left:4px;", "(0–{n_faces-1})" }
+                                } else {
+                                    span { style: "color:var(--text-faint);margin-left:4px;", "(add faces above)" }
+                                }
+                            }
+                            input {
+                                r#type: "number",
+                                min: "0",
+                                max: if n_faces > 0 { (n_faces - 1).to_string() } else { "99".to_string() },
+                                value: "{add_face}",
+                                style: "width:90px;",
+                                oninput: move |e| {
+                                    if let Ok(v) = e.value().parse::<u32>() { add_face.set(v); }
+                                    add_err.set(None);
+                                },
+                            }
+                        }
+                        div { class: "form-group",
+                            div { style: "display:flex;justify-content:space-between;",
+                                label { "Cost" }
+                                span { style: "font-size:11px;color:var(--accent);", "{add_cost}" }
+                            }
+                            input {
+                                r#type: "range", min: "0", max: "255",
+                                value: "{add_cost}",
+                                style: "width:120px;margin-top:6px;",
+                                oninput: move |e| {
+                                    if let Ok(v) = e.value().parse::<u32>() { add_cost.set(v); }
+                                },
+                            }
+                        }
+                    }
+                    if let Some(ref err) = *add_err.read() {
+                        div { style: "color:var(--red);font-size:12px;margin-bottom:6px;", "{err}" }
+                    }
+                    div { style: "display:flex;justify-content:flex-end;",
+                        button {
+                            class: "btn btn-primary btn-sm",
+                            onclick: move |_| {
+                                let p = add_prefix.read().trim().to_string();
+                                if p.is_empty() {
+                                    add_err.set(Some("Prefix is required".into()));
+                                    return;
+                                }
+                                routes.write().push(RouteConfig {
+                                    prefix: p,
+                                    face: *add_face.read() as usize,
+                                    cost: *add_cost.read(),
+                                });
+                                add_prefix.set(String::new());
+                                add_face.set(0);
+                                add_cost.set(10);
+                                show_add.set(false);
+                            },
+                            "+ Add Route"
                         }
                     }
                 }

@@ -90,7 +90,7 @@ pub fn ContentStore() -> Element {
                     "Erase"
                 }
             }
-            div { style: "margin-top:8px;font-size:12px;color:#8b949e;",
+            div { style: "margin-top:8px;font-size:12px;color:var(--text-muted);",
                 "Erases all cached Data packets whose name starts with the given prefix."
             }
         }

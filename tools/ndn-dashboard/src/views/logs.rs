@@ -122,37 +122,37 @@ impl SplitMode {
 
 const LOG_WINDOW_CSS: &str = "
 *{box-sizing:border-box;margin:0;padding:0}
-html,body{height:100%;overflow:hidden;background:#0d1117;color:#c9d1d9;font-family:system-ui,-apple-system,sans-serif}
+html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,sans-serif}
 body>div{height:100%;width:100%;overflow:hidden;display:flex;flex-direction:column}
-input,select{background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:5px 9px;border-radius:4px;font-size:12px;font-family:inherit}
-input:focus,select:focus{outline:none;border-color:#58a6ff}
+input,select{background:var(--bg);border:1px solid var(--border);color:var(--text);padding:5px 9px;border-radius:4px;font-size:12px;font-family:inherit}
+input:focus,select:focus{outline:none;border-color:var(--accent)}
 .btn{padding:5px 12px;border-radius:6px;border:none;cursor:pointer;font-size:12px;font-weight:500;font-family:inherit;transition:background .15s}
-.btn-primary{background:#238636;color:#fff}.btn-primary:hover{background:#2ea043}
-.btn-secondary{background:#21262d;color:#c9d1d9;border:1px solid #30363d}.btn-secondary:hover{background:#30363d}
-.btn-danger{background:#da3633;color:#fff}.btn-danger:hover{background:#f85149}
+.btn-primary{background:var(--btn-p);color:#fff}.btn-primary:hover{background:var(--btn-p-h)}
+.btn-secondary{background:var(--border-subtle);color:var(--text);border:1px solid var(--border)}.btn-secondary:hover{background:var(--border)}
+.btn-danger{background:var(--btn-d);color:#fff}.btn-danger:hover{background:var(--red)}
 .btn-sm{padding:3px 9px;font-size:11px}
 .mono{font-family:'SF Mono',Consolas,monospace;font-size:11px}
-.empty{color:#8b949e;font-size:12px;padding:16px 0;text-align:center}
+.empty{color:var(--text-muted);font-size:12px;padding:16px 0;text-align:center}
 table{width:100%;border-collapse:collapse;font-size:12px}
-th{text-align:left;padding:4px 8px;font-size:10px;color:#8b949e;text-transform:uppercase;border-bottom:1px solid #30363d}
-td{padding:6px 8px;border-bottom:1px solid #21262d;color:#c9d1d9;vertical-align:middle}
+th{text-align:left;padding:4px 8px;font-size:10px;color:var(--text-muted);text-transform:uppercase;border-bottom:1px solid var(--border)}
+td{padding:6px 8px;border-bottom:1px solid var(--border-subtle);color:var(--text);vertical-align:middle}
 tr:last-child td{border-bottom:none}
-.log-entry{display:flex;align-items:flex-start;gap:6px;padding:2px 4px;border-bottom:1px solid #1c2128;font-size:11px;font-family:'SF Mono',monospace;min-width:0}
+.log-entry{display:flex;align-items:flex-start;gap:6px;padding:2px 4px;border-bottom:1px solid var(--surface2);font-size:11px;font-family:'SF Mono',monospace;min-width:0}
 .log-entry:last-child{border-bottom:none}
-.log-ts{color:#484f58;font-size:10px;white-space:nowrap;flex-shrink:0}
-.log-tid{color:#6e7681;font-size:10px;white-space:nowrap;flex-shrink:0}
+.log-ts{color:var(--text-faint);font-size:10px;white-space:nowrap;flex-shrink:0}
+.log-tid{color:var(--text-faint);font-size:10px;white-space:nowrap;flex-shrink:0}
 .log-lvl{padding:1px 4px;border-radius:3px;font-size:10px;font-weight:700;min-width:40px;text-align:center;flex-shrink:0;white-space:nowrap}
-.log-target{color:#8b949e;flex-shrink:0;white-space:nowrap;max-width:200px;overflow:hidden;text-overflow:ellipsis}
-.log-msg{color:#c9d1d9;flex:1;min-width:0;white-space:pre-wrap;word-break:break-word}
+.log-target{color:var(--text-muted);flex-shrink:0;white-space:nowrap;max-width:200px;overflow:hidden;text-overflow:ellipsis}
+.log-msg{color:var(--text);flex:1;min-width:0;white-space:pre-wrap;word-break:break-word}
 .log-list{display:flex;flex-direction:column;overflow-y:auto;overflow-x:hidden;flex:1;min-height:0;scroll-behavior:smooth}
 .log-toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px}
-.filter-panel{background:#0d1117;border:1px solid #21262d;border-radius:6px;padding:10px;margin-bottom:8px;flex-shrink:0}
-.col-toggle{padding:2px 7px;border-radius:4px;border:1px solid #30363d;background:#0d1117;color:#8b949e;font-size:10px;cursor:pointer;font-family:inherit;transition:all .15s}
-.col-toggle.on{background:#1f6feb22;border-color:#58a6ff;color:#58a6ff}
+.filter-panel{background:var(--bg);border:1px solid var(--border-subtle);border-radius:6px;padding:10px;margin-bottom:8px;flex-shrink:0}
+.col-toggle{padding:2px 7px;border-radius:4px;border:1px solid var(--border);background:var(--bg);color:var(--text-muted);font-size:10px;cursor:pointer;font-family:inherit;transition:all .15s}
+.col-toggle.on{background:var(--accent-dim);border-color:var(--accent);color:var(--accent)}
 .log-pane{display:flex;flex-direction:column;flex:1;min-width:0;min-height:0;overflow:hidden;padding:10px}
 .modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.8);z-index:500;display:flex;align-items:center;justify-content:center}
-.modal-box{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:20px;display:flex;flex-direction:column;gap:12px;max-height:85vh}
-.hint{font-size:11px;color:#6e7681}
+.modal-box{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:20px;display:flex;flex-direction:column;gap:12px;max-height:85vh}
+.hint{font-size:11px;color:var(--text-faint)}
 ";
 
 // ── LogPane ───────────────────────────────────────────────────────────────────
@@ -267,13 +267,13 @@ pub fn LogPane(pane_id: usize) -> Element {
             div { style: "display:flex;align-items:center;gap:6px;margin-bottom:6px;flex-shrink:0;flex-wrap:wrap;",
                 if running {
                     span {
-                        style: "font-size:10px;background:#1a4731;color:#3fb950;border-radius:4px;padding:1px 7px;flex-shrink:0;",
+                        style: "font-size:10px;background:var(--green-bg);color:var(--green);border-radius:4px;padding:1px 7px;flex-shrink:0;",
                         title: "Logs captured from in-process router (live pipe)",
                         "● live"
                     }
                 } else {
                     span {
-                        style: "font-size:10px;background:#21262d;color:#8b949e;border-radius:4px;padding:1px 7px;flex-shrink:0;",
+                        style: "font-size:10px;background:var(--border-subtle);color:var(--text-muted);border-radius:4px;padding:1px 7px;flex-shrink:0;",
                         title: "Polling router's in-memory ring buffer every 3 s via log/get-recent",
                         "● buffered"
                     }
@@ -281,7 +281,7 @@ pub fn LogPane(pane_id: usize) -> Element {
                 if !cur_filt.is_empty() {
                     span {
                         class: "mono",
-                        style: "background:#0d1117;border:1px solid #30363d;border-radius:4px;padding:1px 7px;font-size:10px;color:#8b949e;",
+                        style: "background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:1px 7px;font-size:10px;color:var(--text-muted);",
                         title: "Active runtime filter on the router",
                         "router filter: {cur_filt}"
                     }
@@ -424,7 +424,7 @@ pub fn LogPane(pane_id: usize) -> Element {
             if *show_overrides.read() {
                 div { class: "filter-panel",
                     div { style: "display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;",
-                        span { style: "font-size:11px;font-weight:600;color:#58a6ff;", "Router Runtime Filter" }
+                        span { style: "font-size:11px;font-weight:600;color:var(--accent);", "Router Runtime Filter" }
                         span { class: "hint", "Changes what the router outputs — not just the display." }
                     }
                     div { class: "hint", style: "margin-bottom:8px;",
@@ -447,7 +447,7 @@ pub fn LogPane(pane_id: usize) -> Element {
                                                 let pfx2 = pfx.clone();
                                                 let cur = module_overrides.read().get(&pfx).cloned().unwrap_or_default();
                                                 rsx! {
-                                                    tr { style: "background:#0d1117;",
+                                                    tr { style: "background:var(--bg);",
                                                         td { class: "mono", style: "font-size:10px;font-weight:600;", "{pfx}" }
                                                         td {
                                                             select {
@@ -470,7 +470,7 @@ pub fn LogPane(pane_id: usize) -> Element {
                                                             let cur_s = module_overrides.read().get(&sub).cloned().unwrap_or_default();
                                                             rsx! {
                                                                 tr {
-                                                                    td { class: "mono", style: "font-size:10px;padding-left:18px;color:#8b949e;", "↳ {short}" }
+                                                                    td { class: "mono", style: "font-size:10px;padding-left:18px;color:var(--text-muted);", "↳ {short}" }
                                                                     td {
                                                                         select {
                                                                             style: "font-size:11px;",
@@ -512,7 +512,7 @@ pub fn LogPane(pane_id: usize) -> Element {
             }
 
             // ── Log list (chronological, newest at bottom) ────────────────────
-            div { style: "display:flex;flex-direction:column;flex:1;min-height:0;background:#161b22;border:1px solid #30363d;border-radius:6px;padding:4px 6px;overflow:hidden;",
+            div { style: "display:flex;flex-direction:column;flex:1;min-height:0;background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:4px 6px;overflow:hidden;",
                 if entries.is_empty() {
                     div { class: "empty",
                         if total == 0 {
@@ -560,15 +560,15 @@ pub fn LogPane(pane_id: usize) -> Element {
                 rsx! {
                     div { class: "modal-backdrop",
                         div { class: "modal-box", style: "width:420px;",
-                            div { style: "font-size:14px;font-weight:600;color:#c9d1d9;", "Apply runtime filter?" }
+                            div { style: "font-size:14px;font-weight:600;color:var(--text);", "Apply runtime filter?" }
                             div { class: "hint",
                                 "This will change what the router "
                                 strong { "outputs" }
                                 " globally. All clients connected to this router will be affected."
                             }
                             div {
-                                style: "background:#0d1117;border:1px solid #30363d;border-radius:4px;padding:8px 10px;",
-                                span { class: "mono", style: "font-size:12px;color:#58a6ff;", "{filter_preview}" }
+                                style: "background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:8px 10px;",
+                                span { class: "mono", style: "font-size:12px;color:var(--accent);", "{filter_preview}" }
                             }
                             div { style: "display:flex;gap:8px;justify-content:flex-end;",
                                 button {
@@ -603,7 +603,7 @@ pub fn LogPane(pane_id: usize) -> Element {
                         div { class: "modal-box", style: "width:700px;max-width:92vw;",
                             // Header
                             div { style: "display:flex;justify-content:space-between;align-items:center;",
-                                span { style: "font-size:14px;font-weight:600;color:#c9d1d9;",
+                                span { style: "font-size:14px;font-weight:600;color:var(--text);",
                                     "Export Logs  "
                                     span { class: "hint", "({export_entries.len()} entries)" }
                                 }
@@ -671,7 +671,7 @@ pub fn LogPane(pane_id: usize) -> Element {
 
                             // Preview
                             textarea {
-                                style: "flex:1;min-height:260px;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;font-family:'SF Mono',monospace;font-size:11px;padding:8px;border-radius:4px;resize:vertical;",
+                                style: "flex:1;min-height:260px;background:var(--bg);border:1px solid var(--border);color:var(--text);font-family:'SF Mono',monospace;font-size:11px;padding:8px;border-radius:4px;resize:vertical;",
                                 readonly: true,
                                 value: "{content}",
                             }
@@ -750,8 +750,8 @@ pub fn Logs() -> Element {
 
         // ── Top toolbar ───────────────────────────────────────────────────────
         div {
-            style: "display:flex;align-items:center;gap:8px;padding:8px 12px;background:#161b22;border-bottom:1px solid #30363d;flex-shrink:0;flex-wrap:wrap;",
-            span { style: "font-size:13px;font-weight:600;color:#c9d1d9;", "Router Logs" }
+            style: "display:flex;align-items:center;gap:8px;padding:8px 12px;background:var(--surface);border-bottom:1px solid var(--border);flex-shrink:0;flex-wrap:wrap;",
+            span { style: "font-size:13px;font-weight:600;color:var(--text);", "Router Logs" }
 
             // Split mode buttons
             div { style: "display:flex;gap:4px;margin-left:8px;",
@@ -817,7 +817,7 @@ pub fn Logs() -> Element {
                             LogPane { pane_id: 0 }
                         }
                         div {
-                            style: "width:4px;background:#30363d;cursor:col-resize;flex-shrink:0;",
+                            style: "width:4px;background:var(--border);cursor:col-resize;flex-shrink:0;",
                             onmousedown: move |_| div_drag.set(true),
                         }
                         div { style: "width:{b};min-width:0;display:flex;flex-direction:column;",
@@ -831,7 +831,7 @@ pub fn Logs() -> Element {
                             LogPane { pane_id: 0 }
                         }
                         div {
-                            style: "height:4px;background:#30363d;cursor:row-resize;flex-shrink:0;",
+                            style: "height:4px;background:var(--border);cursor:row-resize;flex-shrink:0;",
                             onmousedown: move |_| div_drag.set(true),
                         }
                         div { style: "height:{b};min-height:0;display:flex;flex-direction:column;",

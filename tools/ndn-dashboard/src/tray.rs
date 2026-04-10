@@ -19,10 +19,12 @@ thread_local! {
 // ── Stored menu-item IDs (MenuId is Clone + Send + Sync) ─────────────────────
 
 struct MenuIds {
-    open:  tray_icon::menu::MenuId,
-    start: tray_icon::menu::MenuId,
-    stop:  tray_icon::menu::MenuId,
-    quit:  tray_icon::menu::MenuId,
+    open:       tray_icon::menu::MenuId,
+    start:      tray_icon::menu::MenuId,
+    stop:       tray_icon::menu::MenuId,
+    tools:      tray_icon::menu::MenuId,
+    send_file:  tray_icon::menu::MenuId,
+    quit:       tray_icon::menu::MenuId,
 }
 
 static MENU_IDS: OnceLock<MenuIds> = OnceLock::new();
@@ -38,16 +40,20 @@ pub fn setup() {
         return; // already initialised
     }
 
-    let open_item  = MenuItem::new("Open Dashboard", true, None);
-    let start_item = MenuItem::new("Start Router",   true, None);
-    let stop_item  = MenuItem::new("Stop Router",    true, None);
-    let quit_item  = MenuItem::new("Quit",           true, None);
+    let open_item      = MenuItem::new("Open Dashboard",    true, None);
+    let start_item     = MenuItem::new("Start Router",      true, None);
+    let stop_item      = MenuItem::new("Stop Router",       true, None);
+    let tools_item     = MenuItem::new("File Transfer…",    true, None);
+    let send_file_item = MenuItem::new("Send File…",        true, None);
+    let quit_item      = MenuItem::new("Quit",              true, None);
 
     let _ = MENU_IDS.set(MenuIds {
-        open:  open_item.id().clone(),
-        start: start_item.id().clone(),
-        stop:  stop_item.id().clone(),
-        quit:  quit_item.id().clone(),
+        open:      open_item.id().clone(),
+        start:     start_item.id().clone(),
+        stop:      stop_item.id().clone(),
+        tools:     tools_item.id().clone(),
+        send_file: send_file_item.id().clone(),
+        quit:      quit_item.id().clone(),
     });
 
     let menu = Menu::new();
@@ -56,6 +62,9 @@ pub fn setup() {
         &PredefinedMenuItem::separator(),
         &start_item,
         &stop_item,
+        &PredefinedMenuItem::separator(),
+        &tools_item,
+        &send_file_item,
         &PredefinedMenuItem::separator(),
         &quit_item,
     ]);
@@ -76,6 +85,10 @@ pub enum TrayCmd {
     OpenDashboard,
     StartRouter,
     StopRouter,
+    /// Navigate dashboard to the Tools → File Transfer tab.
+    OpenTools,
+    /// Navigate to File Transfer tab with the send panel focused.
+    SendFile,
     Quit,
 }
 
@@ -85,10 +98,12 @@ pub enum TrayCmd {
 pub fn poll_menu_event() -> Option<TrayCmd> {
     let ids = MENU_IDS.get()?;
     let ev = MenuEvent::receiver().try_recv().ok()?;
-    if ev.id == ids.open  { return Some(TrayCmd::OpenDashboard); }
-    if ev.id == ids.start { return Some(TrayCmd::StartRouter);   }
-    if ev.id == ids.stop  { return Some(TrayCmd::StopRouter);    }
-    if ev.id == ids.quit  { return Some(TrayCmd::Quit);          }
+    if ev.id == ids.open      { return Some(TrayCmd::OpenDashboard); }
+    if ev.id == ids.start     { return Some(TrayCmd::StartRouter);   }
+    if ev.id == ids.stop      { return Some(TrayCmd::StopRouter);    }
+    if ev.id == ids.tools     { return Some(TrayCmd::OpenTools);     }
+    if ev.id == ids.send_file { return Some(TrayCmd::SendFile);      }
+    if ev.id == ids.quit      { return Some(TrayCmd::Quit);          }
     None
 }
 

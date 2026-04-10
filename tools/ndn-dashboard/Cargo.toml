@@ -10,8 +10,10 @@ name = "ndn-dashboard"
 path = "src/main.rs"
 
 [dependencies]
+ndn-tools-core = { workspace = true, features = ["ping", "iperf", "peek", "put"] }
 ndn-ipc    = { workspace = true }
 ndn-config = { workspace = true }
+bytes      = { workspace = true, features = ["std"] }
 ndn-packet = { workspace = true, features = ["std"] }
 tokio      = { workspace = true, features = ["rt-multi-thread", "macros", "time", "process", "io-util"] }
 tray-icon  = "0.21"
@@ -21,3 +23,7 @@ tracing-subscriber = { workspace = true }
 anyhow     = { workspace = true }
 dioxus     = { version = "0.7", features = ["desktop"] }
 getrandom  = "0.2"
+serde      = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+dirs-next  = "2"
+which      = "6"

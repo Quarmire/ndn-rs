@@ -95,7 +95,7 @@ pub fn Faces() -> Element {
                     "Create Face"
                 }
             }
-            div { style: "margin-top:8px;font-size:12px;color:#8b949e;",
+            div { style: "margin-top:8px;font-size:12px;color:var(--text-muted);",
                 "Supported: udp4://<ip>:6363  tcp4://<ip>:6363  ws://<ip>:9696  unix:///path  shm://name  ether://<iface>"
             }
         }

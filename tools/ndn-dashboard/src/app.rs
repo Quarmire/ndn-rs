@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
 use dioxus::prelude::*;
@@ -7,23 +7,30 @@ use ndn_ipc::MgmtClient;
 
 use crate::{
     router_proc,
+    settings::DASH_SETTINGS,
+    styles::CSS,
+    tool_runner::{
+        ToolCmd, ToolParams, ToolResultEntry, ToolInstanceState,
+        TOOL_RESULTS, TOOL_INSTANCES,
+        next_result_id,
+        build_result_entry, chrono_now,
+    },
     tray,
     types::*,
     views::{
         View,
         config::Config,
-        cs::ContentStore,
-        faces::Faces,
+        dashboard_config::DashboardConfig,
         fleet::Fleet,
         logs::Logs,
+        modals::StartRouterModal,
         onboarding::{is_onboarded, Onboarding},
         overview::Overview,
         radio::Radio,
-        routes::Routes,
         security::Security,
         session::Session,
         strategy::Strategy,
-        traffic::Traffic,
+        tools::Tools,
     },
 };
 
@@ -43,148 +50,57 @@ pub static LAST_LOG_SEQ:       GlobalSignal<u64>                = Signal::global
 pub static LOG_SPLIT_MODE:     GlobalSignal<u8>                 = Signal::global(|| 0u8);
 /// Logs tab split ratio (percent for the first pane, 20–80).
 pub static LOG_SPLIT_RATIO:    GlobalSignal<u32>                = Signal::global(|| 50u32);
+/// Saved config presets: (name, toml_string).
+pub static CONFIG_PRESETS:     GlobalSignal<Vec<(String, String)>> = Signal::global(Vec::new);
 
-// ── Stylesheet ───────────────────────────────────────────────────────────────
+/// Currently active view — writable from anywhere (tray, tool shortcuts, etc.).
+pub static ACTIVE_VIEW: GlobalSignal<crate::views::View> = Signal::global(|| crate::views::View::Overview);
 
-const CSS: &str = "
-*{box-sizing:border-box;margin:0;padding:0}
-html{height:100%}
-body{font-family:system-ui,-apple-system,sans-serif;background:#0d1117;color:#c9d1d9;display:flex;height:100%;overflow:hidden}
-/* Dioxus desktop mounts into a bare <div> inside body with no size — override it. */
-body>div{height:100%;width:100%;overflow:hidden}
-.layout{display:flex;width:100%;height:100%}
-.sidebar{width:200px;min-width:200px;background:#161b22;border-right:1px solid #30363d;display:flex;flex-direction:column}
-.sidebar-logo{padding:16px;font-size:15px;font-weight:600;color:#58a6ff;border-bottom:1px solid #30363d;letter-spacing:.5px}
-.nav-item{padding:10px 16px;cursor:pointer;color:#8b949e;font-size:13px;border-left:3px solid transparent;transition:all .15s}
-.nav-item:hover{background:#21262d;color:#c9d1d9}
-.nav-item.active{background:#1f6feb22;color:#58a6ff;border-left-color:#58a6ff}
-.main{flex:1;display:flex;flex-direction:column;overflow:hidden;min-height:0}
-.conn-bar{display:flex;align-items:center;gap:10px;background:#161b22;border-bottom:1px solid #30363d;padding:10px 20px;font-size:13px;flex-shrink:0}
-.conn-bar input{background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:5px 10px;border-radius:4px;font-size:13px;font-family:monospace;flex:1;max-width:280px;min-width:120px}
-.conn-bar input:focus{outline:none;border-color:#58a6ff}
-.content{flex:1;overflow-y:auto;padding:24px;min-height:0}
-.badge{display:inline-block;padding:2px 9px;border-radius:10px;font-size:11px;font-weight:600}
-.badge-green{background:#1a4731;color:#3fb950}
-.badge-red{background:#4e1717;color:#f85149}
-.badge-yellow{background:#3d3000;color:#d29922}
-.badge-blue{background:#0c2d6b;color:#58a6ff}
-.badge-gray{background:#21262d;color:#8b949e}
-.badge-purple{background:#2a1a4e;color:#a371f7}
-.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:14px;margin-bottom:24px}
-.card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px}
-.card-label{font-size:11px;color:#8b949e;text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px}
-.card-value{font-size:30px;font-weight:600;color:#c9d1d9;line-height:1}
-.card-sub{font-size:12px;color:#8b949e;margin-top:6px}
-.section{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px;margin-bottom:16px}
-.section-title{font-size:13px;font-weight:600;color:#8b949e;text-transform:uppercase;letter-spacing:.5px;margin-bottom:14px}
-table{width:100%;border-collapse:collapse;font-size:13px}
-th{text-align:left;padding:6px 12px;font-size:11px;color:#8b949e;text-transform:uppercase;letter-spacing:.4px;border-bottom:1px solid #30363d}
-td{padding:8px 12px;border-bottom:1px solid #21262d;color:#c9d1d9;vertical-align:middle}
-tr:last-child td{border-bottom:none}
-tr:hover td{background:#1c2128}
-.form-row{display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;margin-top:14px;padding-top:14px;border-top:1px solid #21262d}
-.form-group{display:flex;flex-direction:column;gap:4px}
-label{font-size:11px;color:#8b949e}
-input,select{background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:6px 10px;border-radius:4px;font-size:13px;font-family:inherit}
-input:focus,select:focus{outline:none;border-color:#58a6ff}
-.btn{padding:7px 14px;border-radius:6px;border:none;cursor:pointer;font-size:13px;font-weight:500;font-family:inherit;transition:background .15s}
-.btn-primary{background:#238636;color:#fff}
-.btn-primary:hover{background:#2ea043}
-.btn-danger{background:#da3633;color:#fff}
-.btn-danger:hover{background:#f85149}
-.btn-secondary{background:#21262d;color:#c9d1d9;border:1px solid #30363d}
-.btn-secondary:hover{background:#30363d}
-.btn-sm{padding:4px 10px;font-size:12px}
-.error-banner{background:#4e1717;border:1px solid #f85149;border-radius:6px;padding:10px 16px;margin-bottom:16px;color:#f85149;font-size:13px;display:flex;justify-content:space-between;align-items:center}
-.mono{font-family:'SF Mono',Consolas,monospace;font-size:12px}
-.empty{color:#8b949e;font-size:13px;padding:20px 0;text-align:center}
-[data-tooltip]{position:relative;cursor:help}
-[data-tooltip]::after{content:attr(data-tooltip);position:absolute;bottom:calc(100% + 6px);left:50%;transform:translateX(-50%);background:#1c2128;border:1px solid #30363d;border-radius:4px;padding:5px 10px;font-size:11px;color:#c9d1d9;white-space:pre-wrap;max-width:280px;pointer-events:none;opacity:0;transition:opacity .15s;z-index:200;line-height:1.5;text-align:left}
-[data-tooltip]:hover::after{opacity:1}
-.restart-banner{background:#3d3000;border:1px solid #d29922;border-radius:6px;padding:8px 14px;margin-bottom:14px;color:#d29922;font-size:12px;display:flex;align-items:center;gap:8px}
-/* ── Onboarding overlay ─────────────────────────────────────────── */
-.onboarding-overlay{position:fixed;inset:0;background:rgba(0,0,0,.88);z-index:1000;display:flex;align-items:center;justify-content:center;animation:fade-in .25s ease}
-.onboarding-card{background:#161b22;border:1px solid #30363d;border-radius:14px;padding:40px 44px;width:580px;max-width:92vw;position:relative;animation:slide-up .3s ease}
-@keyframes slide-up{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:translateY(0)}}
-@keyframes fade-in{from{opacity:0}to{opacity:1}}
-.onboarding-step{animation:step-in .25s ease}
-@keyframes step-in{from{opacity:0;transform:translateX(18px)}to{opacity:1;transform:translateX(0)}}
-.step-dots{display:flex;gap:8px;margin-top:28px;justify-content:center}
-.step-dot{width:8px;height:8px;border-radius:50%;background:#30363d;transition:background .25s,transform .25s}
-.step-dot.active{background:#58a6ff;transform:scale(1.3)}
-.step-dot.done{background:#3fb950}
-/* ── Packet flow animation ─────────────────────────────────────── */
-@keyframes packet-fly{0%{left:-60px;opacity:0}15%{opacity:1}85%{opacity:1}100%{left:calc(100% + 20px);opacity:0}}
-.packet-lane{position:relative;height:28px;overflow:hidden;background:#0d1117;border-radius:4px;margin:6px 0}
-.packet-bubble{position:absolute;top:4px;background:#1f6feb;color:#fff;border-radius:3px;padding:2px 8px;font-size:10px;font-family:monospace;white-space:nowrap;animation:packet-fly 2.8s ease-in-out infinite}
-.packet-bubble.data{background:#1a4731;animation-delay:.9s}
-.packet-bubble.nack{background:#4e1717;animation-delay:1.8s}
-/* ── Trust chain ────────────────────────────────────────────────── */
-.trust-chain{display:flex;align-items:center;gap:0;margin:16px 0;flex-wrap:wrap}
-.chain-node{background:#1c2128;border:1px solid #30363d;border-radius:8px;padding:10px 14px;text-align:center;min-width:110px;transition:border-color .2s}
-.chain-node.ok{border-color:#3fb950}
-.chain-node.warn{border-color:#d29922}
-.chain-node.missing{border-color:#30363d;opacity:.5}
-.chain-arrow{font-size:18px;color:#30363d;padding:0 4px;flex-shrink:0}
-/* ── Education snippets ────────────────────────────────────────── */
-.edu-card{background:linear-gradient(135deg,#0c2d6b1a,#1a472a1a);border:1px solid #1f4f8a44;border-radius:8px;padding:14px 16px;margin-bottom:16px;position:relative;overflow:hidden}
-.edu-dismiss{position:absolute;top:8px;right:10px;background:none;border:none;color:#8b949e;cursor:pointer;font-size:16px;padding:0;line-height:1}
-.edu-dismiss:hover{color:#c9d1d9}
-@keyframes sig-glow{0%,100%{box-shadow:0 0 0 0 transparent}50%{box-shadow:0 0 8px 3px #3fb95044}}
-.signed-packet{display:inline-flex;align-items:center;gap:5px;background:#0f2a16;border:1px solid #3fb950;border-radius:4px;padding:3px 9px;font-size:11px;font-family:monospace;animation:sig-glow 2.4s ease infinite}
-@keyframes trust-pulse{0%,100%{opacity:.4}50%{opacity:1}}
-.trust-link{display:inline-block;width:28px;height:2px;background:#58a6ff;border-radius:1px;animation:trust-pulse 1.8s ease infinite;margin:0 4px;vertical-align:middle}
-/* ── Progress steps ────────────────────────────────────────────── */
-.enroll-steps{display:flex;align-items:center;gap:0;margin:14px 0;font-size:11px;flex-wrap:wrap}
-.enroll-step{display:flex;flex-direction:column;align-items:center;gap:4px;min-width:64px;text-align:center}
-.enroll-step-dot{width:11px;height:11px;border-radius:50%;background:#30363d;flex-shrink:0;transition:background .3s}
-.enroll-step-dot.done{background:#3fb950}
-.enroll-step-dot.active{background:#58a6ff;box-shadow:0 0 0 3px #1f6feb44;animation:ping .9s ease infinite}
-@keyframes ping{0%,100%{box-shadow:0 0 0 3px #1f6feb44}50%{box-shadow:0 0 0 6px #1f6feb22}}
-.enroll-step-line{flex:1;height:2px;background:#30363d;min-width:24px}
-.enroll-step-line.done{background:#3fb950}
-/* ── YubiKey ───────────────────────────────────────────────────── */
-.yk-seed{background:#0d1117;border:1px solid #30363d;border-radius:4px;padding:10px 12px;font-family:'SF Mono',monospace;font-size:11px;color:#3fb950;word-break:break-all;margin:8px 0;line-height:1.7}
-.yk-cmd{background:#0d1117;border:1px solid #30363d;border-radius:4px;padding:8px 12px;font-family:'SF Mono',monospace;font-size:11px;color:#58a6ff;word-break:break-all;margin:6px 0;user-select:all}
-/* ── DID ───────────────────────────────────────────────────────── */
-.did-value{background:#0d1117;border:1px solid #30363d;border-radius:4px;padding:8px 12px;font-family:'SF Mono',monospace;font-size:12px;color:#a371f7;word-break:break-all;margin:6px 0}
-.did-copy-btn{background:none;border:1px solid #30363d;color:#8b949e;border-radius:4px;padding:3px 8px;font-size:11px;cursor:pointer}
-.did-copy-btn:hover{border-color:#58a6ff;color:#58a6ff}
-/* ── Fleet edu animation ───────────────────────────────────────── */
-.edu-flow-row{display:flex;align-items:center;justify-content:center;gap:6px;margin:4px 0}
-.edu-flow-label{font-size:8px;color:#8b949e;text-align:center;letter-spacing:.5px}
-.edu-router{width:24px;height:20px;background:#1c2128;border:1px solid #30363d;border-radius:3px;display:flex;align-items:center;justify-content:center;font-size:8px;font-weight:600;color:#c9d1d9}
-.edu-router-ca{border-color:#1f6feb;color:#58a6ff}
-.edu-cert-glow{border-color:#3fb950;color:#3fb950}
-@keyframes arrow-pulse{0%,100%{opacity:.3}50%{opacity:1}}
-.edu-arrow{font-size:10px;color:#8b949e;animation:arrow-pulse 1.6s ease infinite}
-.edu-arrow-right{color:#1f6feb}
-.edu-anim-delay1{animation-delay:.4s}
-/* ── Overview edu animation ────────────────────────────────────── */
-@keyframes drop-packet{0%{transform:translateY(-10px);opacity:0}30%{opacity:1}60%{transform:translateY(0);opacity:1}80%{opacity:0;filter:blur(2px)}100%{opacity:0}}
-.drop-packet{font-size:11px;background:#4e1717;border:1px solid #f8514966;border-radius:3px;padding:2px 7px;display:inline-block;animation:drop-packet 2.2s ease infinite;font-family:monospace}
-/* ── Log view ──────────────────────────────────────────────────── */
-.log-entry{display:flex;align-items:flex-start;gap:8px;padding:3px 4px;border-bottom:1px solid #1c2128;font-size:12px;font-family:'SF Mono',monospace;min-width:0}
-.log-entry:last-child{border-bottom:none}
-.log-ts{color:#484f58;font-size:10px;white-space:nowrap;flex-shrink:0}
-.log-lvl{padding:1px 5px;border-radius:3px;font-size:10px;font-weight:700;min-width:44px;text-align:center;flex-shrink:0;white-space:nowrap}
-.log-target{color:#8b949e;flex-shrink:0;white-space:nowrap;max-width:220px;overflow:hidden;text-overflow:ellipsis}
-.log-msg{color:#c9d1d9;flex:1;min-width:0;white-space:pre-wrap;word-break:break-word}
-.log-list{display:flex;flex-direction:column;overflow-y:auto;overflow-x:hidden;flex:1;min-height:0}
-.log-toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px}
-.filter-controls-section{background:#0d1117;border:1px solid #21262d;border-radius:6px;padding:12px;margin-bottom:12px}
-.col-toggle{padding:2px 7px;border-radius:4px;border:1px solid #30363d;background:#0d1117;color:#8b949e;font-size:10px;cursor:pointer;font-family:inherit;transition:all .15s}
-.col-toggle.on{background:#1f6feb22;border-color:#58a6ff;color:#58a6ff}
-/* ── Split / floating panes ────────────────────────────────────── */
-.split-divider{background:#21262d;flex-shrink:0;transition:background .15s}
-.split-divider:hover{background:#58a6ff}
-.split-divider-h{width:4px;cursor:col-resize}
-.split-divider-v{height:4px;cursor:row-resize}
-.log-pane{display:flex;flex-direction:column;flex:1;min-width:0;min-height:0;overflow:hidden;padding:12px}
-.floating-pane{position:fixed;z-index:200;background:#161b22;border:1px solid #30363d;border-radius:8px;box-shadow:0 12px 40px rgba(0,0,0,.8);display:flex;flex-direction:column;resize:both;overflow:hidden;min-width:420px;min-height:280px}
-.floating-title{background:#21262d;border-bottom:1px solid #30363d;padding:6px 10px;display:flex;align-items:center;justify-content:space-between;cursor:move;user-select:none;flex-shrink:0;font-size:12px;color:#c9d1d9}
-.floating-body{flex:1;min-height:0;overflow:hidden;display:flex;flex-direction:column}
-";
+/// Dark mode toggle — `true` = dark (default), `false` = light.
+pub static DARK_MODE: GlobalSignal<bool> = Signal::global(|| true);
+
+// ── Toast notifications ───────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(dead_code)]
+pub enum ToastLevel { Info, Success, Warning, Error }
+
+impl ToastLevel {
+    pub fn css_class(self) -> &'static str {
+        match self {
+            ToastLevel::Info    => "toast-info",
+            ToastLevel::Success => "toast-success",
+            ToastLevel::Warning => "toast-warning",
+            ToastLevel::Error   => "toast-error",
+        }
+    }
+    pub fn icon(self) -> &'static str {
+        match self {
+            ToastLevel::Info    => "ℹ",
+            ToastLevel::Success => "✓",
+            ToastLevel::Warning => "⚠",
+            ToastLevel::Error   => "✕",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Toast {
+    pub id:      u64,
+    pub message: String,
+    pub level:   ToastLevel,
+    pub created: std::time::Instant,
+}
+
+pub static TOASTS:  GlobalSignal<std::collections::VecDeque<Toast>> = Signal::global(std::collections::VecDeque::new);
+static TOAST_ID:    GlobalSignal<u64>                               = Signal::global(|| 0u64);
+
+pub fn push_toast(msg: impl Into<String>, level: ToastLevel) {
+    let mut id = TOAST_ID.write();
+    *id += 1;
+    TOASTS.write().push_back(Toast { id: *id, message: msg.into(), level, created: std::time::Instant::now() });
+}
+
 
 // ── Commands ─────────────────────────────────────────────────────────────────
 
@@ -217,9 +133,11 @@ pub enum DashCmd {
 /// Commands sent to the router-management coroutine.
 #[derive(Debug)]
 pub enum RouterCmd {
-    Start,
+    /// Start the router. `None` = use built-in defaults; `Some(path)` = pass `--config <path>`.
+    Start(Option<String>),
     Stop,
 }
+
 
 // ── Connection state ─────────────────────────────────────────────────────────
 
@@ -255,6 +173,7 @@ impl ConnState {
 /// All reactive state exposed to child view components via `use_context`.
 #[derive(Clone, Copy)]
 pub struct AppCtx {
+    #[allow(dead_code)]
     pub conn:              Signal<ConnState>,
     pub status:            Signal<Option<ForwarderStatus>>,
     pub faces:             Signal<Vec<FaceInfo>>,
@@ -274,8 +193,12 @@ pub struct AppCtx {
     pub security_anchors:  Signal<Vec<AnchorInfo>>,
     pub ca_info:           Signal<Option<CaInfo>>,
     pub yubikey_status:    Signal<Option<String>>,
+    pub cs_hit_history:    Signal<VecDeque<f64>>,
+    /// Per-face throughput rate history (60 samples × 3 s = 3 min window).
+    pub face_throughput:   Signal<HashMap<u64, VecDeque<ThroughputSample>>>,
     pub router_cmd:        Coroutine<RouterCmd>,
     pub cmd:               Coroutine<DashCmd>,
+    pub tool_cmd:          Coroutine<ToolCmd>,
 }
 
 // ── Root component ───────────────────────────────────────────────────────────
@@ -305,13 +228,39 @@ pub fn App() -> Element {
     let security_anchors: Signal<Vec<AnchorInfo>>             = use_signal(Vec::new);
     let ca_info:         Signal<Option<CaInfo>>               = use_signal(|| None);
     let yubikey_status:  Signal<Option<String>>               = use_signal(|| None);
+    let cs_hit_history:  Signal<VecDeque<f64>>               = use_signal(VecDeque::new);
+    let face_throughput: Signal<HashMap<u64, VecDeque<ThroughputSample>>> = use_signal(HashMap::new);
+    let face_prev_ctr:   Signal<HashMap<u64, ThroughputSample>>           = use_signal(HashMap::new);
     let mut error_msg: Signal<Option<String>> = use_signal(|| None);
-    let mut current_view:   Signal<View>                      = use_signal(|| View::Overview);
     let mut show_onboarding: Signal<bool>                     = use_signal(|| !is_onboarded());
+    let mut show_start_modal: Signal<bool>                    = use_signal(|| false);
+    let mut show_gear_menu:   Signal<bool>                    = use_signal(|| false);
+
+    // Apply initial theme on mount and reactively on change.
+    use_effect(move || {
+        let dark = *DARK_MODE.read();
+        if dark {
+            let _ = document::eval("document.documentElement.classList.remove('light-mode')");
+        } else {
+            let _ = document::eval("document.documentElement.classList.add('light-mode')");
+        }
+    });
+
+    // Shared channel: router_cmd → tool_cmd server lifecycle commands.
+    // Defined before both coroutines so each can capture its end.
+    let (srv_cmd_tx, srv_cmd_rx) =
+        tokio::sync::mpsc::unbounded_channel::<ToolCmd>();
+    // Wrap both ends in Arc so closures (FnMut) can clone the Arc each invocation.
+    // The actual sender/receiver is taken from the Option on first (and only) call.
+    let srv_cmd_tx_arc = std::sync::Arc::new(srv_cmd_tx);
+    let srv_cmd_rx_cell = std::sync::Arc::new(std::sync::Mutex::new(Some(srv_cmd_rx)));
 
     // ── Router management coroutine ──────────────────────────────────────────
     // Owns the RouterProc, watches for process exit, drains log lines.
-    let router_cmd = use_coroutine(move |mut rx: UnboundedReceiver<RouterCmd>| async move {
+    let srv_cmd_tx_arc_r = srv_cmd_tx_arc.clone();
+    let router_cmd = use_coroutine(move |mut rx: UnboundedReceiver<RouterCmd>| {
+        let srv_cmd_tx = srv_cmd_tx_arc_r.clone();
+        async move {
         let mut proc: Option<router_proc::RouterProc> = None;
         let mut check = tokio::time::interval(Duration::from_millis(500));
 
@@ -322,6 +271,9 @@ pub fn App() -> Element {
                         if !p.is_running() {
                             proc = None;
                             *ROUTER_RUNNING.write() = false;
+                            // Stop in-process tool servers when router dies.
+                            let _ = srv_cmd_tx.send(ToolCmd::StopPingServer);
+                            let _ = srv_cmd_tx.send(ToolCmd::StopIperfServer);
                         } else {
                             let lines = p.drain_logs();
                             if !lines.is_empty() {
@@ -336,14 +288,22 @@ pub fn App() -> Element {
                 }
                 Some(cmd) = rx.next() => {
                     match cmd {
-                        RouterCmd::Start => {
+                        RouterCmd::Start(config_path) => {
                             if proc.is_none() {
                                 match router_proc::find_binary() {
                                     Some(bin) => {
-                                        match router_proc::RouterProc::start(&bin).await {
+                                        match router_proc::RouterProc::start(&bin, config_path.as_deref()).await {
                                             Ok(p) => {
                                                 *ROUTER_RUNNING.write() = true;
                                                 proc = Some(p);
+
+                                                // Give the router a moment to bind its socket.
+                                                tokio::time::sleep(Duration::from_millis(800)).await;
+
+                                                // Auto-start in-process servers if configured.
+                                                let s = DASH_SETTINGS.peek().clone();
+                                                if s.ping_server_auto  { let _ = srv_cmd_tx.send(ToolCmd::StartPingServer);  }
+                                                if s.iperf_server_auto { let _ = srv_cmd_tx.send(ToolCmd::StartIperfServer); }
                                             }
                                             Err(e) => tracing::error!("start router: {e}"),
                                         }
@@ -353,6 +313,9 @@ pub fn App() -> Element {
                             }
                         }
                         RouterCmd::Stop => {
+                            // Stop in-process tool servers first.
+                            let _ = srv_cmd_tx.send(ToolCmd::StopPingServer);
+                            let _ = srv_cmd_tx.send(ToolCmd::StopIperfServer);
                             if let Some(ref mut p) = proc {
                                 p.kill().await;
                             }
@@ -363,7 +326,8 @@ pub fn App() -> Element {
                 }
             }
         }
-    });
+        } // close async move
+    }); // close FnMut closure + use_coroutine
 
     // ── Tray polling coroutine ───────────────────────────────────────────────
     // Updates the tray icon colour and forwards menu events.
@@ -371,6 +335,9 @@ pub fn App() -> Element {
         let mut interval = tokio::time::interval(Duration::from_millis(200));
         loop {
             interval.tick().await;
+
+            // Prune old toasts (older than 5 seconds).
+            { let now = std::time::Instant::now(); TOASTS.write().retain(|t| now.duration_since(t.created).as_secs() < 5); }
 
             // Sync icon/tooltip with current state.
             let connected = matches!(*conn_state.read(), ConnState::Connected);
@@ -380,9 +347,11 @@ pub fn App() -> Element {
             // Forward tray-menu events.
             while let Some(tc) = tray::poll_menu_event() {
                 match tc {
-                    tray::TrayCmd::StartRouter   => router_cmd.send(RouterCmd::Start),
+                    tray::TrayCmd::StartRouter   => router_cmd.send(RouterCmd::Start(None)),
                     tray::TrayCmd::StopRouter    => router_cmd.send(RouterCmd::Stop),
                     tray::TrayCmd::OpenDashboard => { /* window is always open */ }
+                    tray::TrayCmd::OpenTools     => { *ACTIVE_VIEW.write() = View::Tools; }
+                    tray::TrayCmd::SendFile      => { *ACTIVE_VIEW.write() = View::Tools; }
                     tray::TrayCmd::Quit => {
                         // Kill managed router process before exiting.
                         router_cmd.send(RouterCmd::Stop);
@@ -424,7 +393,7 @@ pub fn App() -> Element {
             // Reset the log cursor so the first poll fetches all buffered lines.
             *LAST_LOG_SEQ.write() = 0;
 
-            if let Err(e) = poll_all(&client, status, faces, routes, cs, strategies, counters, measurements, config_toml, throughput, prev_counters, neighbors, security_keys, security_anchors, ca_info).await {
+            if let Err(e) = poll_all(&client, status, faces, routes, cs, strategies, counters, measurements, config_toml, throughput, prev_counters, neighbors, security_keys, security_anchors, ca_info, cs_hit_history, face_throughput, face_prev_ctr).await {
                 conn_state.set(ConnState::Disconnected);
                 error_msg.set(Some(e));
                 continue;
@@ -437,7 +406,7 @@ pub fn App() -> Element {
             'session: loop {
                 tokio::select! {
                     _ = interval.tick() => {
-                        if let Err(e) = poll_all(&client, status, faces, routes, cs, strategies, counters, measurements, config_toml, throughput, prev_counters, neighbors, security_keys, security_anchors, ca_info).await {
+                        if let Err(e) = poll_all(&client, status, faces, routes, cs, strategies, counters, measurements, config_toml, throughput, prev_counters, neighbors, security_keys, security_anchors, ca_info, cs_hit_history, face_throughput, face_prev_ctr).await {
                             conn_state.set(ConnState::Disconnected);
                             error_msg.set(Some(e));
                             break 'session;
@@ -447,12 +416,417 @@ pub fn App() -> Element {
                         if matches!(cmd_msg, DashCmd::Reconnect) {
                             break 'session;
                         }
-                        run_cmd(cmd_msg, &client, status, faces, routes, cs, strategies, counters, measurements, error_msg, config_toml, throughput, prev_counters, session_log, recording, neighbors, security_keys, security_anchors, ca_info, yubikey_status).await;
+                        run_cmd(cmd_msg, &client, status, faces, routes, cs, strategies, counters, measurements, error_msg, config_toml, throughput, prev_counters, session_log, recording, neighbors, security_keys, security_anchors, ca_info, yubikey_status, cs_hit_history, face_throughput, face_prev_ctr).await;
                     }
                 }
             }
         }
     });
+
+    // ── Embedded tool coroutine ──────────────────────────────────────────────
+    // Manages multiple simultaneous tool instances. Each Run creates a new task
+    // tracked by its instance ID; Stop cancels a specific instance immediately.
+    // All GlobalSignal writes happen here — inside the Dioxus runtime.
+    //
+    // Reserved IDs: SRV_PING_ID / SRV_IPERF_ID for in-process servers.
+    const SRV_PING_ID:  u32 = u32::MAX - 1;
+    const SRV_IPERF_ID: u32 = u32::MAX;
+
+    let srv_cmd_rx_cell2 = srv_cmd_rx_cell.clone();
+    let tool_cmd = use_coroutine(move |mut rx: UnboundedReceiver<ToolCmd>| {
+        let srv_cmd_rx_cell = srv_cmd_rx_cell2.clone();
+        async move {
+        use ndn_tools_core::common::{ConnectConfig, ToolData};
+
+        // Take srv_cmd_rx out of the Mutex (only happens once on coroutine init).
+        let mut srv_rx = srv_cmd_rx_cell
+            .lock().unwrap()
+            .take()
+            .expect("srv_cmd_rx already taken");
+
+        // Channel: (instance_id, Option<ToolEvent>). None = tool completed.
+        let (ev_tx, mut ev_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(u32, Option<ndn_tools_core::common::ToolEvent>)>();
+
+        // Map of instance_id → abort handle for currently running tools.
+        let mut handles: std::collections::HashMap<u32, tokio::task::AbortHandle> =
+            std::collections::HashMap::new();
+
+        loop {
+            // Merge UI commands and server lifecycle commands into a single Option<ToolCmd>.
+            let maybe_cmd: Option<ToolCmd> = tokio::select! {
+                Some(cmd) = rx.next() => Some(cmd),
+                Some(cmd) = srv_rx.recv() => Some(cmd),
+                Some((inst_id, ev_opt)) = ev_rx.recv() => {
+                    // ── Tool output / completion events ────────────────────
+                    match ev_opt {
+                        None => {
+                            // Tool completed naturally.
+                            handles.remove(&inst_id);
+                            // Server IDs don't produce result entries.
+                            if inst_id != SRV_PING_ID && inst_id != SRV_IPERF_ID {
+                                let ts = chrono_now();
+                                let max_results = DASH_SETTINGS.peek().results_max_entries
+                                    .max(1); // guard against 0 (corrupt settings)
+                                let mut insts = TOOL_INSTANCES.write();
+                                if let Some(inst) = insts.get_mut(&inst_id) {
+                                    inst.running = false;
+                                    // Only save a result if there is meaningful data.
+                                    let has_data = inst.iperf_summary.is_some()
+                                        || inst.ping_summary.is_some()
+                                        || !inst.tp_history.is_empty();
+                                    if has_data {
+                                        let entry = build_result_entry(inst, &ts);
+                                        let mut results = TOOL_RESULTS.write();
+                                        results.push_front(entry);
+                                        while results.len() > max_results { results.pop_back(); }
+                                    }
+                                }
+                            }
+                        }
+                        Some(ev) => {
+                            if inst_id == SRV_IPERF_ID {
+                                // Server connection notification → create result entry.
+                                if let Some(ToolData::IperfClientConnected {
+                                    flow_id, duration_secs, sign_mode, payload_size, reverse,
+                                }) = &ev.structured {
+                                    let ts = chrono_now();
+                                    let mode = if *reverse { "reverse" } else { "forward" };
+                                    let entry = ToolResultEntry {
+                                        id:             next_result_id(),
+                                        ts,
+                                        tool:           "iperf-server",
+                                        label:          format!("session {flow_id}"),
+                                        run_summary:    format!("{mode}  ·  sign={sign_mode}  ·  size={payload_size}B"),
+                                        throughput_bps: None,
+                                        bytes:          None,
+                                        duration_secs:  Some(*duration_secs as f64),
+                                        loss_pct:       None,
+                                        rtt_avg_us:     None,
+                                        summary_lines:  vec![
+                                            format!("mode={mode}"),
+                                            format!("sign={sign_mode}"),
+                                            format!("size={payload_size}B"),
+                                        ],
+                                        intervals:  vec![],
+                                        ping_rtts:  vec![],
+                                    };
+                                    let max_results = DASH_SETTINGS.peek().results_max_entries;
+                                    let mut results = TOOL_RESULTS.write();
+                                    results.push_front(entry);
+                                    while results.len() > max_results { results.pop_back(); }
+                                }
+                            } else if inst_id != SRV_PING_ID {
+                                let mut insts = TOOL_INSTANCES.write();
+                                if let Some(inst) = insts.get_mut(&inst_id) {
+                                    match &ev.structured {
+                                        Some(ToolData::IperfInterval { throughput_bps, .. }) => {
+                                            inst.tp_history.push(*throughput_bps);
+                                            inst.elapsed_secs = inst.start_time.elapsed().as_secs_f64();
+                                            if inst.tp_history.len() > 480 { inst.tp_history.remove(0); }
+                                        }
+                                        Some(ToolData::IperfSummary { .. }) => {
+                                            inst.iperf_summary = ev.structured.clone();
+                                        }
+                                        Some(ToolData::PingResult { rtt_us, .. }) => {
+                                            inst.current_rtt_us = Some(*rtt_us);
+                                            inst.ping_rtts.push(*rtt_us);
+                                            if inst.ping_rtts.len() > 500 { inst.ping_rtts.remove(0); }
+                                        }
+                                        Some(ToolData::PingSummary { .. }) => {
+                                            inst.ping_summary = ev.structured.clone();
+                                        }
+                                        _ => {}
+                                    }
+                                    inst.output.push_back(ev);
+                                    if inst.output.len() > 200 { inst.output.pop_front(); }
+                                }
+                            }
+                        }
+                    }
+                    None // no command to process
+                }
+            };
+
+            let Some(cmd) = maybe_cmd else { continue };
+
+            // ── Dispatch tool command ──────────────────────────────────────
+            match cmd {
+                ToolCmd::Stop { id } => {
+                    if let Some(inst) = TOOL_INSTANCES.write().get_mut(&id) {
+                        inst.running = false;
+                    }
+                    if let Some(h) = handles.remove(&id) { h.abort(); }
+                }
+
+                ToolCmd::Run { id, params } => {
+                    // Cancel any previous run for this instance slot.
+                    if let Some(h) = handles.remove(&id) { h.abort(); }
+
+                    let settings = DASH_SETTINGS.peek().clone();
+                    let node_pfx = if settings.node_prefix.is_empty() {
+                        None
+                    } else {
+                        Some(settings.node_prefix.clone())
+                    };
+
+                    match &params {
+                        ToolParams::PingClient { prefix, count, interval_ms, lifetime_ms } => {
+                            TOOL_INSTANCES.write().insert(id, ToolInstanceState {
+                                id, kind: "ping", running: true,
+                                tp_history: Vec::new(), current_rtt_us: None,
+                                output: VecDeque::new(),
+                                iperf_summary: None, ping_summary: None,
+                                ping_rtts: Vec::new(),
+                                label: prefix.clone(), elapsed_secs: 0.0,
+                                start_time: std::time::Instant::now(),
+                                run_params: vec![
+                                    format!("count={count}"),
+                                    format!("interval={interval_ms}ms"),
+                                    format!("lifetime={lifetime_ms}ms"),
+                                ],
+                            });
+                        }
+                        ToolParams::IperfClient { prefix, duration_secs, window, cc, reverse, sign_mode, face_type } => {
+                            let mut rp = vec![
+                                format!("duration={duration_secs}s"),
+                                format!("window={window}"),
+                                format!("cc={cc}"),
+                                format!("sign={sign_mode}"),
+                                format!("face={face_type}"),
+                            ];
+                            if *reverse { rp.push("reverse".to_string()); }
+                            TOOL_INSTANCES.write().insert(id, ToolInstanceState {
+                                id, kind: "iperf", running: true,
+                                tp_history: Vec::new(), current_rtt_us: None,
+                                output: VecDeque::new(),
+                                iperf_summary: None, ping_summary: None,
+                                ping_rtts: Vec::new(),
+                                label: prefix.clone(), elapsed_secs: 0.0,
+                                start_time: std::time::Instant::now(),
+                                run_params: rp,
+                            });
+                        }
+                        ToolParams::PeekClient { name, pipeline, .. } => {
+                            TOOL_INSTANCES.write().insert(id, ToolInstanceState {
+                                id, kind: "peek", running: true,
+                                tp_history: Vec::new(), current_rtt_us: None,
+                                output: VecDeque::new(),
+                                iperf_summary: None, ping_summary: None,
+                                ping_rtts: Vec::new(),
+                                label: name.clone(), elapsed_secs: 0.0,
+                                start_time: std::time::Instant::now(),
+                                run_params: match pipeline {
+                                    Some(p) => vec![format!("pipeline={p}")],
+                                    None    => vec![],
+                                },
+                            });
+                        }
+                        ToolParams::PutClient { name, sign, freshness_ms, data } => {
+                            TOOL_INSTANCES.write().insert(id, ToolInstanceState {
+                                id, kind: "put", running: true,
+                                tp_history: Vec::new(), current_rtt_us: None,
+                                output: VecDeque::new(),
+                                iperf_summary: None, ping_summary: None,
+                                ping_rtts: Vec::new(),
+                                label: name.clone(), elapsed_secs: 0.0,
+                                start_time: std::time::Instant::now(),
+                                run_params: {
+                                    let mut rp = vec![format!("{}B", data.len())];
+                                    if *sign { rp.push("signed".to_string()); }
+                                    if *freshness_ms > 0 { rp.push(format!("freshness={freshness_ms}ms")); }
+                                    rp
+                                },
+                            });
+                        }
+                    }
+
+                    // Spawn a single task that joins run_fut + bridge_fut, then
+                    // sends the completion signal — no race between bridge and done.
+                    // If the tool returns an error (e.g. node_prefix missing for
+                    // reverse mode), forward it as an error event so it's visible.
+                    let done_tx = ev_tx.clone();
+                    let fwd_tx  = ev_tx.clone();
+                    let face_socket = socket_path.peek().clone();
+
+                    let h = match params {
+                        ToolParams::PingClient { prefix, count, interval_ms, lifetime_ms } => {
+                            tokio::spawn(async move {
+                                let (ttx, mut trx) = tokio::sync::mpsc::channel(256);
+                                let run_fut = ndn_tools_core::ping::run_client(
+                                    ndn_tools_core::ping::PingClientParams {
+                                        conn: ConnectConfig { face_socket, use_shm: true },
+                                        prefix, count, interval_ms, lifetime_ms,
+                                    }, ttx);
+                                let bridge_fut = async {
+                                    while let Some(ev) = trx.recv().await {
+                                        let _ = fwd_tx.send((id, Some(ev)));
+                                    }
+                                };
+                                let (res, _) = tokio::join!(run_fut, bridge_fut);
+                                if let Err(e) = res {
+                                    let _ = fwd_tx.send((id, Some(ndn_tools_core::common::ToolEvent::error(format!("Error: {e}")))));
+                                }
+                                let _ = done_tx.send((id, None));
+                            })
+                        }
+                        ToolParams::IperfClient { prefix, duration_secs, window, cc, reverse, sign_mode, face_type } => {
+                            tokio::spawn(async move {
+                                let (ttx, mut trx) = tokio::sync::mpsc::channel(256);
+                                let conn = ConnectConfig {
+                                    face_socket,
+                                    use_shm: face_type == "shm",
+                                };
+                                let run_fut = ndn_tools_core::iperf::run_client(
+                                    ndn_tools_core::iperf::IperfClientParams {
+                                        conn,
+                                        prefix, duration_secs, initial_window: window, cc,
+                                        min_window: None, max_window: None,
+                                        ai: None, md: None, cubic_c: None,
+                                        lifetime_ms: 4000, quiet: false,
+                                        interval_ms: 250, reverse,
+                                        node_prefix: node_pfx, sign_mode,
+                                    }, ttx);
+                                let bridge_fut = async {
+                                    while let Some(ev) = trx.recv().await {
+                                        let _ = fwd_tx.send((id, Some(ev)));
+                                    }
+                                };
+                                let (res, _) = tokio::join!(run_fut, bridge_fut);
+                                if let Err(e) = res {
+                                    let _ = fwd_tx.send((id, Some(ndn_tools_core::common::ToolEvent::error(format!("Error: {e}")))));
+                                }
+                                let _ = done_tx.send((id, None));
+                            })
+                        }
+                        ToolParams::PeekClient { name, output_file, pipeline } => {
+                            tokio::spawn(async move {
+                                let (ttx, mut trx) = tokio::sync::mpsc::channel(256);
+                                let run_fut = ndn_tools_core::peek::run_peek(
+                                    ndn_tools_core::peek::PeekParams {
+                                        conn: ConnectConfig { face_socket, use_shm: true },
+                                        name, lifetime_ms: 4000,
+                                        output: output_file, pipeline,
+                                        hex: false, meta_only: false,
+                                        verbose: false, can_be_prefix: false,
+                                    }, ttx);
+                                let bridge_fut = async {
+                                    while let Some(ev) = trx.recv().await {
+                                        let _ = fwd_tx.send((id, Some(ev)));
+                                    }
+                                };
+                                let (res, _) = tokio::join!(run_fut, bridge_fut);
+                                if let Err(e) = res {
+                                    let _ = fwd_tx.send((id, Some(ndn_tools_core::common::ToolEvent::error(format!("Error: {e}")))));
+                                }
+                                let _ = done_tx.send((id, None));
+                            })
+                        }
+                        ToolParams::PutClient { name, data, sign, freshness_ms } => {
+                            let data_bytes = bytes::Bytes::from(data);
+                            tokio::spawn(async move {
+                                let (ttx, mut trx) = tokio::sync::mpsc::channel(256);
+                                let run_fut = ndn_tools_core::put::run_producer(
+                                    ndn_tools_core::put::PutParams {
+                                        conn: ConnectConfig { face_socket, use_shm: true },
+                                        name, data: data_bytes,
+                                        chunk_size: 0, sign, hmac: false,
+                                        freshness_ms, timeout_secs: 0, quiet: false,
+                                    }, ttx);
+                                let bridge_fut = async {
+                                    while let Some(ev) = trx.recv().await {
+                                        let _ = fwd_tx.send((id, Some(ev)));
+                                    }
+                                };
+                                let (res, _) = tokio::join!(run_fut, bridge_fut);
+                                if let Err(e) = res {
+                                    let _ = fwd_tx.send((id, Some(ndn_tools_core::common::ToolEvent::error(format!("Error: {e}")))));
+                                }
+                                let _ = done_tx.send((id, None));
+                            })
+                        }
+                    };
+                    handles.insert(id, h.abort_handle());
+                }
+
+                ToolCmd::StartIperfServer => {
+                    if handles.contains_key(&SRV_IPERF_ID) { continue; }
+                    let settings = DASH_SETTINGS.peek().clone();
+                    let iperf_prefix = if settings.iperf_use_custom_name && !settings.iperf_custom_name.is_empty() {
+                        settings.iperf_custom_name.clone()
+                    } else if !settings.node_prefix.is_empty() {
+                        format!("{}{}", settings.node_prefix.trim_end_matches('/'), settings.iperf_prefix)
+                    } else {
+                        settings.iperf_prefix.clone()
+                    };
+                    let payload_size = settings.iperf_size as usize;
+                    let face_socket = socket_path.peek().clone();
+                    let fwd_tx = ev_tx.clone();
+                    let done_tx = ev_tx.clone();
+                    let h = tokio::spawn(async move {
+                        let (ttx, mut trx) = tokio::sync::mpsc::channel(256);
+                        let run_fut = ndn_tools_core::iperf::run_server(
+                            ndn_tools_core::iperf::IperfServerParams {
+                                conn: ConnectConfig { face_socket, use_shm: true },
+                                prefix: iperf_prefix,
+                                payload_size,
+                                freshness_ms: 0,
+                                quiet: true,
+                                interval_ms: 1000,
+                            }, ttx);
+                        let bridge_fut = async {
+                            while let Some(ev) = trx.recv().await {
+                                let _ = fwd_tx.send((SRV_IPERF_ID, Some(ev)));
+                            }
+                        };
+                        let _ = tokio::join!(run_fut, bridge_fut);
+                        let _ = done_tx.send((SRV_IPERF_ID, None));
+                    });
+                    handles.insert(SRV_IPERF_ID, h.abort_handle());
+                }
+
+                ToolCmd::StopIperfServer => {
+                    if let Some(h) = handles.remove(&SRV_IPERF_ID) { h.abort(); }
+                }
+
+                ToolCmd::StartPingServer => {
+                    if handles.contains_key(&SRV_PING_ID) { continue; }
+                    let settings = DASH_SETTINGS.peek().clone();
+                    let ping_prefix = if !settings.node_prefix.is_empty() {
+                        format!("{}{}", settings.node_prefix.trim_end_matches('/'), settings.ping_prefix)
+                    } else {
+                        settings.ping_prefix.clone()
+                    };
+                    let face_socket = socket_path.peek().clone();
+                    let fwd_tx = ev_tx.clone();
+                    let done_tx = ev_tx.clone();
+                    let h = tokio::spawn(async move {
+                        let (ttx, mut trx) = tokio::sync::mpsc::channel(256);
+                        let run_fut = ndn_tools_core::ping::run_server(
+                            ndn_tools_core::ping::PingServerParams {
+                                conn: ConnectConfig { face_socket, use_shm: true },
+                                prefix: ping_prefix,
+                                freshness_ms: 0,
+                                sign: false,
+                            }, ttx);
+                        let bridge_fut = async {
+                            while let Some(ev) = trx.recv().await {
+                                let _ = fwd_tx.send((SRV_PING_ID, Some(ev)));
+                            }
+                        };
+                        let _ = tokio::join!(run_fut, bridge_fut);
+                        let _ = done_tx.send((SRV_PING_ID, None));
+                    });
+                    handles.insert(SRV_PING_ID, h.abort_handle());
+                }
+
+                ToolCmd::StopPingServer => {
+                    if let Some(h) = handles.remove(&SRV_PING_ID) { h.abort(); }
+                }
+            }
+        }
+        } // close async move
+    }); // close FnMut closure + use_coroutine
 
     let ctx = AppCtx {
         conn: conn_state,
@@ -473,10 +847,43 @@ pub fn App() -> Element {
         security_anchors,
         ca_info,
         yubikey_status,
+        cs_hit_history,
+        face_throughput,
         router_cmd,
         cmd,
+        tool_cmd,
     };
     use_context_provider(move || ctx);
+
+    // Derive security health from keys for the sidebar dot
+    let sec_dot_class = {
+        let keys = security_keys.read();
+        if keys.is_empty() {
+            "sec-dot sec-dot-gray"
+        } else {
+            let (cls, _) = keys[0].expiry_badge();
+            match cls {
+                "badge badge-green"  => "sec-dot sec-dot-green",
+                "badge badge-yellow" => "sec-dot sec-dot-yellow",
+                "badge badge-red"    => "sec-dot sec-dot-red",
+                _                    => "sec-dot sec-dot-gray",
+            }
+        }
+    };
+    let sec_dot_tooltip = {
+        let keys = security_keys.read();
+        if keys.is_empty() {
+            "No identity configured — go to Security tab".to_string()
+        } else {
+            let k = &keys[0];
+            let (_, _expiry_label) = k.expiry_badge();
+            let cert_status = if k.has_cert { "issued" } else { "none" };
+            let days = k.days_to_expiry()
+                .map(|d| if d < 0 { "EXPIRED".to_string() } else if d == 0 { "expires today".to_string() } else { format!("{d}d remaining") })
+                .unwrap_or_else(|| "permanent".to_string());
+            format!("{}\nCert: {}\nExpiry: {}", k.name, cert_status, days)
+        }
+    };
 
     rsx! {
         document::Style { "{CSS}" }
@@ -488,21 +895,71 @@ pub fn App() -> Element {
             }
         }
 
+        // StartRouterModal — rendered as a fixed overlay outside the layout
+        if *show_start_modal.read() {
+            StartRouterModal {
+                on_close: move |_| show_start_modal.set(false),
+                config_toml,
+            }
+        }
+
+        ToastOverlay {}
+
         div { class: "layout",
             // ── Sidebar navigation ─────────────────────────────────────────
             nav { class: "sidebar",
-                div { class: "sidebar-logo", "NDN Dashboard" }
-                for view in View::ALL {
+                div { class: "sidebar-logo",
+                    style: "display:flex;align-items:center;justify-content:space-between;",
+                    span { "NDN Dashboard" }
+                    span {
+                        class: "{sec_dot_class}",
+                        "data-tooltip": "{sec_dot_tooltip}",
+                    }
+                }
+                for view in View::NAV {
                     {
                         let view = *view;
-                        let is_active = *current_view.read() == view;
+                        let is_active = *ACTIVE_VIEW.read() == view;
                         rsx! {
                             div {
                                 class: if is_active { "nav-item active" } else { "nav-item" },
-                                onclick: move |_| current_view.set(view),
+                                onclick: move |_| { *ACTIVE_VIEW.write() = view; },
                                 "{view.label()}"
                             }
                         }
+                    }
+                }
+
+                // Sidebar spacer pushes gear to the bottom
+                div { class: "sidebar-spacer" }
+
+                // Gear menu at bottom
+                div { class: "sidebar-bottom",
+                    if *show_gear_menu.read() {
+                        div { class: "gear-menu",
+                            div {
+                                class: "gear-menu-item",
+                                onclick: move |_| {
+                                    *ACTIVE_VIEW.write() = View::DashboardConfig;
+                                    show_gear_menu.set(false);
+                                },
+                                "Dashboard Config"
+                            }
+                            div {
+                                class: "gear-menu-item",
+                                onclick: move |_| {
+                                    *ACTIVE_VIEW.write() = View::RouterConfig;
+                                    show_gear_menu.set(false);
+                                },
+                                "Router Config"
+                            }
+                        }
+                    }
+                    button {
+                        class: "icon-btn",
+                        style: "width:100%;text-align:left;",
+                        onclick: move |_| { let v = *show_gear_menu.read(); show_gear_menu.set(!v); },
+                        "⚙ Settings"
                     }
                 }
             }
@@ -526,11 +983,68 @@ pub fn App() -> Element {
                         onclick: move |_| cmd.send(DashCmd::Reconnect),
                         "Connect"
                     }
+                    // Icon buttons
+                    button {
+                        class: "icon-btn",
+                        title: "Refresh",
+                        onclick: move |_| cmd.send(DashCmd::Reconnect),
+                        "⟳"
+                    }
+                    // Spacer
+                    div { style: "flex:1;" }
+                    // Theme toggle
+                    button {
+                        class: "theme-toggle",
+                        title: if *DARK_MODE.read() { "Switch to Light Mode" } else { "Switch to Dark Mode" },
+                        onclick: move |_| {
+                            let next = !*DARK_MODE.read();
+                            *DARK_MODE.write() = next;
+                            if next {
+                                let _ = document::eval("document.documentElement.classList.remove('light-mode')");
+                            } else {
+                                let _ = document::eval("document.documentElement.classList.add('light-mode')");
+                            }
+                        },
+                        if *DARK_MODE.read() { "☀" } else { "🌙" }
+                    }
+                    // Vertical separator
+                    div { style: "width:1px;height:20px;background:var(--border);flex-shrink:0;" }
+                    // Router process controls (right side)
+                    {
+                        let running = *ROUTER_RUNNING.read();
+                        rsx! {
+                            span {
+                                class: if running { "badge badge-green" } else { "badge badge-gray" },
+                                style: "flex-shrink:0;",
+                                if running { "Router Running" } else { "Router Stopped" }
+                            }
+                            if !running {
+                                button {
+                                    class: "btn btn-primary btn-sm",
+                                    onclick: move |_| show_start_modal.set(true),
+                                    "▶ Start"
+                                }
+                                if *conn_state.read() == ConnState::Connected {
+                                    button {
+                                        class: "btn btn-danger btn-sm",
+                                        onclick: move |_| cmd.send(DashCmd::Shutdown),
+                                        "■ Shutdown"
+                                    }
+                                }
+                            } else {
+                                button {
+                                    class: "btn btn-danger btn-sm",
+                                    onclick: move |_| router_cmd.send(RouterCmd::Stop),
+                                    "■ Stop"
+                                }
+                            }
+                        }
+                    }
                 }
 
                 // Content — Logs gets a full-height flex container; other views
                 // use the padded scrollable .content div.
-                if *current_view.read() == View::Logs {
+                if *ACTIVE_VIEW.read() == View::Logs {
                     div { style: "flex:1;min-height:0;overflow:hidden;display:flex;flex-direction:column;",
                         if let Some(ref err) = *error_msg.read() {
                             div { class: "error-banner", style: "margin:8px 12px 0;",
@@ -556,7 +1070,38 @@ pub fn App() -> Element {
                                 }
                             }
                         }
-                        {render_view(*current_view.read())}
+                        {render_view(*ACTIVE_VIEW.read())}
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn ToastOverlay() -> Element {
+    let toasts = TOASTS.read();
+    if toasts.is_empty() { return rsx! {}; }
+    rsx! {
+        div { class: "toast-container",
+            for toast in toasts.iter() {
+                {
+                    let id = toast.id;
+                    let icon = toast.level.icon();
+                    let msg = toast.message.clone();
+                    let cls = toast.level.css_class();
+                    rsx! {
+                        div { class: "toast {cls}",
+                            div { class: "toast-body",
+                                span { class: "toast-icon", "{icon}" }
+                                span { class: "toast-msg", "{msg}" }
+                            }
+                            button {
+                                class: "toast-close",
+                                onclick: move |_| { TOASTS.write().retain(|t| t.id != id); },
+                                "✕"
+                            }
+                        }
                     }
                 }
             }
@@ -566,26 +1111,25 @@ pub fn App() -> Element {
 
 fn render_view(view: View) -> Element {
     match view {
-        View::Overview     => rsx! { Overview {} },
-        View::Faces        => rsx! { Faces {} },
-        View::Routes       => rsx! { Routes {} },
-        View::ContentStore => rsx! { ContentStore {} },
-        View::Strategy     => rsx! { Strategy {} },
-        View::Traffic      => rsx! { Traffic {} },
-        View::Logs         => rsx! { },  // rendered via full-height branch in App
-        View::Config       => rsx! { Config {} },
-        View::Session      => rsx! { Session {} },
-        View::Security     => rsx! { Security {} },
-        View::Fleet        => rsx! { Fleet {} },
-        View::Radio        => rsx! { Radio {} },
+        View::Overview        => rsx! { Overview {} },
+        View::Strategy        => rsx! { Strategy {} },
+        View::Logs            => rsx! { },  // rendered via full-height branch in App
+        View::Session         => rsx! { Session {} },
+        View::Security        => rsx! { Security {} },
+        View::Fleet           => rsx! { Fleet {} },
+        View::Radio           => rsx! { Radio {} },
+        View::Tools           => rsx! { Tools {} },
+        View::DashboardConfig => rsx! { DashboardConfig {} },
+        View::RouterConfig    => rsx! { Config {} },
     }
 }
 
+
 fn default_socket_path() -> String {
     #[cfg(windows)]
-    return r"\\.\pipe\ndn-faces".to_string();
+    return r"\\.\pipe\ndn".to_string();
     #[cfg(not(windows))]
-    "/tmp/ndn-faces.sock".to_string()
+    "/tmp/ndn.sock".to_string()
 }
 
 // ── Polling ───────────────────────────────────────────────────────────────────
@@ -607,6 +1151,9 @@ async fn poll_all(
     mut security_keys:       Signal<Vec<SecurityKeyInfo>>,
     mut security_anchors:    Signal<Vec<AnchorInfo>>,
     mut ca_info:             Signal<Option<CaInfo>>,
+    mut cs_hit_history:      Signal<VecDeque<f64>>,
+    mut face_throughput:     Signal<HashMap<u64, VecDeque<ThroughputSample>>>,
+    mut face_prev_ctr:       Signal<HashMap<u64, ThroughputSample>>,
 ) -> Result<(), String> {
     match client.status().await {
         Ok(r)  => status.set(Some(ForwarderStatus::parse(&r.status_text))),
@@ -641,7 +1188,26 @@ async fn poll_all(
     {
         config_toml.set(r.status_text);
     }
-    // Throughput history — compute per-second rates from counter deltas.
+    // Per-face throughput history — compute per-second rates per face.
+    {
+        let curr_counters = counters.read();
+        let active: HashSet<u64> = curr_counters.iter().map(|c| c.face_id).collect();
+        let mut fp = face_prev_ctr.write();
+        let mut fh = face_throughput.write();
+        for c in curr_counters.iter() {
+            let fid = c.face_id;
+            let curr_snap = ThroughputSample::from_face_counter(c);
+            let prev_snap = fp.get(&fid).cloned().unwrap_or_default();
+            let rate = ThroughputSample::rate_from_delta(&prev_snap, &curr_snap, 3.0);
+            fp.insert(fid, curr_snap);
+            let hist = fh.entry(fid).or_insert_with(VecDeque::new);
+            hist.push_back(rate);
+            if hist.len() > 60 { hist.pop_front(); }
+        }
+        fh.retain(|k, _| active.contains(k));
+        fp.retain(|k, _| active.contains(k));
+    }
+    // Throughput history — aggregate across all faces.
     {
         let curr = ThroughputSample::from_counters(&counters.read());
         let rate = ThroughputSample::rate_from_delta(&prev_counters.read(), &curr, 3.0);
@@ -709,6 +1275,13 @@ async fn poll_all(
         if current != fetched {
             *LOG_FILTER.write() = fetched;
         }
+    }
+    // CS hit rate sparkline history.
+    if let Some(ref info) = *cs.read() {
+        let rate = info.hit_rate_pct();
+        let mut h = cs_hit_history.write();
+        h.push_back(rate);
+        if h.len() > 60 { h.pop_front(); }
     }
     Ok(())
 }
@@ -809,6 +1382,9 @@ async fn run_cmd(
     security_anchors:     Signal<Vec<AnchorInfo>>,
     ca_info:              Signal<Option<CaInfo>>,
     mut yubikey_status:   Signal<Option<String>>,
+    cs_hit_history:       Signal<VecDeque<f64>>,
+    face_throughput:      Signal<HashMap<u64, VecDeque<ThroughputSample>>>,
+    face_prev_ctr:        Signal<HashMap<u64, ThroughputSample>>,
 ) {
     // Session recording: log before dispatch.
     if *recording.read()
@@ -816,6 +1392,19 @@ async fn run_cmd(
     {
         session_log.write().push(entry);
     }
+
+    let op_label: Option<&'static str> = match &cmd {
+        DashCmd::FaceCreate(_)      => Some("Face created"),
+        DashCmd::FaceDestroy(_)     => Some("Face destroyed"),
+        DashCmd::RouteAdd { .. }    => Some("Route added"),
+        DashCmd::RouteRemove { .. } => Some("Route removed"),
+        DashCmd::CsCapacity(_)      => Some("CS capacity updated"),
+        DashCmd::CsErase(_)         => Some("CS entries erased"),
+        DashCmd::Shutdown            => Some("Router shutdown initiated"),
+        DashCmd::StrategySet { .. }  => Some("Strategy updated"),
+        DashCmd::StrategyUnset(_)    => Some("Strategy cleared"),
+        _ => None,
+    };
 
     let result: Result<(), String> = match cmd {
         DashCmd::FaceCreate(uri) => {
@@ -891,7 +1480,7 @@ async fn run_cmd(
                     // Skip recording the replayed commands to avoid infinite loops.
                     let was_recording = *recording.read();
                     recording.set(false);
-                    Box::pin(run_cmd(replay_cmd, client, status, faces, routes, cs, strategies, counters, measurements, error_msg, config_toml, throughput, prev_counters, session_log, recording, neighbors, security_keys, security_anchors, ca_info, yubikey_status)).await;
+                    Box::pin(run_cmd(replay_cmd, client, status, faces, routes, cs, strategies, counters, measurements, error_msg, config_toml, throughput, prev_counters, session_log, recording, neighbors, security_keys, security_anchors, ca_info, yubikey_status, cs_hit_history, face_throughput, face_prev_ctr)).await;
                     recording.set(was_recording);
                     tokio::time::sleep(Duration::from_millis(150)).await;
                 }
@@ -959,8 +1548,11 @@ async fn run_cmd(
     match result {
         Ok(()) => {
             error_msg.set(None);
-            let _ = poll_all(client, status, faces, routes, cs, strategies, counters, measurements, config_toml, throughput, prev_counters, neighbors, security_keys, security_anchors, ca_info).await;
+            if let Some(label) = op_label { push_toast(label, ToastLevel::Success); }
+            let _ = poll_all(client, status, faces, routes, cs, strategies, counters, measurements, config_toml, throughput, prev_counters, neighbors, security_keys, security_anchors, ca_info, cs_hit_history, face_throughput, face_prev_ctr).await;
         }
-        Err(e) => error_msg.set(Some(e)),
+        Err(e) => {
+            push_toast(format!("Command failed: {e}"), ToastLevel::Error);
+        }
     }
 }

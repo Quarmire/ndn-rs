@@ -245,7 +245,8 @@ impl FaceInfo {
         if let Some(k) = &self.kind {
             return k.as_str();
         }
-        match self.remote_uri.as_deref().unwrap_or("") {
+        let uri = self.remote_uri.as_deref().or(self.local_uri.as_deref()).unwrap_or("");
+        match uri {
             u if u.starts_with("udp4://") || u.starts_with("udp://") => "UDP",
             u if u.starts_with("tcp4://") || u.starts_with("tcp://") => "TCP",
             u if u.starts_with("ws://")   || u.starts_with("wss://") => "WS",
@@ -543,6 +544,16 @@ impl ThroughputSample {
             out_bytes:     counters.iter().map(|c| c.out_bytes).sum(),
             in_interests:  counters.iter().map(|c| c.in_interests).sum(),
             out_interests: counters.iter().map(|c| c.out_interests).sum(),
+        }
+    }
+
+    /// Cumulative snapshot from a single face counter (raw values, not rates).
+    pub fn from_face_counter(c: &FaceCounter) -> ThroughputSample {
+        ThroughputSample {
+            in_bytes:      c.in_bytes,
+            out_bytes:     c.out_bytes,
+            in_interests:  c.in_interests,
+            out_interests: c.out_interests,
         }
     }
 }

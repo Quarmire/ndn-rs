@@ -65,7 +65,7 @@ pub fn Onboarding(mut on_complete: EventHandler<()>) -> Element {
             div { class: "onboarding-card",
                 // Skip button
                 button {
-                    style: "position:absolute;top:16px;right:18px;background:none;border:none;color:#8b949e;cursor:pointer;font-size:13px;",
+                    style: "position:absolute;top:16px;right:18px;background:none;border:none;color:var(--text-muted);cursor:pointer;font-size:13px;",
                     onclick: skip,
                     "Skip ›"
                 }
@@ -113,12 +113,12 @@ fn render_welcome(advance: impl FnMut(MouseEvent) + 'static) -> Element {
     rsx! {
         div { style: "text-align:center;",
             // NDN logo / wordmark
-            div { style: "font-size:42px;font-weight:700;color:#58a6ff;letter-spacing:-1px;margin-bottom:6px;", "NDN" }
-            div { style: "font-size:14px;color:#8b949e;margin-bottom:24px;", "Named Data Networking" }
+            div { style: "font-size:42px;font-weight:700;color:var(--accent);letter-spacing:-1px;margin-bottom:6px;", "NDN" }
+            div { style: "font-size:14px;color:var(--text-muted);margin-bottom:24px;", "Named Data Networking" }
 
             // Animated packet flow
-            div { style: "background:#0d1117;border:1px solid #21262d;border-radius:8px;padding:16px;margin-bottom:20px;",
-                div { style: "font-size:11px;color:#8b949e;text-align:left;margin-bottom:8px;font-family:monospace;",
+            div { style: "background:var(--bg);border:1px solid var(--border-subtle);border-radius:8px;padding:16px;margin-bottom:20px;",
+                div { style: "font-size:11px;color:var(--text-muted);text-align:left;margin-bottom:8px;font-family:monospace;",
                     "Interest /ndn/edu/ucla/video → → →"
                 }
                 div { class: "packet-lane",
@@ -126,14 +126,14 @@ fn render_welcome(advance: impl FnMut(MouseEvent) + 'static) -> Element {
                     div { class: "packet-bubble data", "Data /ndn/… ✓" }
                     div { class: "packet-bubble nack", "Nack (No Route)" }
                 }
-                div { style: "font-size:11px;color:#8b949e;text-align:left;margin-top:8px;font-family:monospace;",
+                div { style: "font-size:11px;color:var(--text-muted);text-align:left;margin-top:8px;font-family:monospace;",
                     "← ← ← Data /ndn/edu/ucla/video (signed)"
                 }
             }
 
-            p { style: "color:#8b949e;font-size:14px;line-height:1.7;margin-bottom:24px;",
+            p { style: "color:var(--text-muted);font-size:14px;line-height:1.7;margin-bottom:24px;",
                 "Welcome to the NDN Dashboard. In Named Data Networking, "
-                strong { style: "color:#c9d1d9;", "packets are identified by name, not address." }
+                strong { style: "color:var(--text);", "packets are identified by name, not address." }
                 " Every piece of data is signed and every router verifies content authenticity."
             }
 
@@ -157,30 +157,30 @@ fn render_identity(
     let identity_name = identity_name.to_string();
     rsx! {
         div {
-            div { style: "font-size:22px;font-weight:600;color:#c9d1d9;margin-bottom:8px;", "Your Identity" }
-            div { style: "color:#8b949e;font-size:13px;margin-bottom:20px;line-height:1.6;",
+            div { style: "font-size:22px;font-weight:600;color:var(--text);margin-bottom:8px;", "Your Identity" }
+            div { style: "color:var(--text-muted);font-size:13px;margin-bottom:20px;line-height:1.6;",
                 "In NDN, your "
-                strong { style: "color:#c9d1d9;", "identity IS your address." }
+                strong { style: "color:var(--text);", "identity IS your address." }
                 " An Ed25519 key pair is your cryptographic identity — packets you send are signed with it, and others verify your signature before forwarding."
             }
 
             if has_identity {
-                div { style: "background:#1a4731;border:1px solid #3fb950;border-radius:8px;padding:14px;margin-bottom:16px;",
-                    div { style: "font-size:11px;color:#3fb950;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;",
+                div { style: "background:var(--green-bg);border:1px solid var(--green);border-radius:8px;padding:14px;margin-bottom:16px;",
+                    div { style: "font-size:11px;color:var(--green);text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;",
                         "Active Identity"
                     }
-                    div { class: "mono", style: "color:#c9d1d9;font-size:13px;", "{identity_name}" }
-                    div { style: "font-size:11px;color:#8b949e;margin-top:6px;",
+                    div { class: "mono", style: "color:var(--text);font-size:13px;", "{identity_name}" }
+                    div { style: "font-size:11px;color:var(--text-muted);margin-top:6px;",
                         "Your DID: "
-                        span { style: "color:#a371f7;", "did:ndn:{encode_did_ndn(&identity_name)}" }
+                        span { style: "color:var(--purple);", "did:ndn:{encode_did_ndn(&identity_name)}" }
                     }
                 }
             } else {
-                div { style: "background:#3d3000;border:1px solid #d29922;border-radius:8px;padding:14px;margin-bottom:16px;",
-                    div { style: "font-size:11px;color:#d29922;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;",
+                div { style: "background:var(--yellow-bg);border:1px solid var(--yellow);border-radius:8px;padding:14px;margin-bottom:16px;",
+                    div { style: "font-size:11px;color:var(--yellow);text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;",
                         "No Identity Found"
                     }
-                    div { style: "font-size:13px;color:#c9d1d9;",
+                    div { style: "font-size:13px;color:var(--text);",
                         "You don't have an identity key yet. Go to "
                         strong { "Security → Identities" }
                         " to generate your first Ed25519 key pair."
@@ -189,11 +189,11 @@ fn render_identity(
             }
 
             // DID explanation
-            div { style: "background:#2a1a4e33;border:1px solid #a371f733;border-radius:8px;padding:12px;margin-bottom:20px;font-size:12px;color:#8b949e;line-height:1.6;",
+            div { style: "background:var(--purple-bg)33;border:1px solid var(--purple)33;border-radius:8px;padding:12px;margin-bottom:20px;font-size:12px;color:var(--text-muted);line-height:1.6;",
                 "💡 "
-                strong { style: "color:#a371f7;", "What is a DID?" }
+                strong { style: "color:var(--purple);", "What is a DID?" }
                 " A Decentralized Identifier (W3C DID) is a portable, self-sovereign identity. NDN names map directly to DIDs: "
-                span { style: "color:#a371f7;font-family:monospace;", "did:ndn:/your/name" }
+                span { style: "color:var(--purple);font-family:monospace;", "did:ndn:/your/name" }
                 " — no central registry required."
             }
 
@@ -212,10 +212,10 @@ fn render_identity(
 fn render_trust(advance: impl FnMut(MouseEvent) + 'static) -> Element {
     rsx! {
         div {
-            div { style: "font-size:22px;font-weight:600;color:#c9d1d9;margin-bottom:8px;", "Chain of Trust" }
-            div { style: "color:#8b949e;font-size:13px;margin-bottom:20px;line-height:1.6;",
+            div { style: "font-size:22px;font-weight:600;color:var(--text);margin-bottom:8px;", "Chain of Trust" }
+            div { style: "color:var(--text-muted);font-size:13px;margin-bottom:20px;line-height:1.6;",
                 "NDN builds trust from a "
-                strong { style: "color:#c9d1d9;", "root trust anchor" }
+                strong { style: "color:var(--text);", "root trust anchor" }
                 " — a certificate you explicitly trust. Every certificate is verified back to this anchor before forwarding."
             }
 
@@ -225,36 +225,36 @@ fn render_trust(advance: impl FnMut(MouseEvent) + 'static) -> Element {
                     // Root anchor
                     div { class: "chain-node ok",
                         div { style: "font-size:18px;margin-bottom:4px;", "🔑" }
-                        div { style: "font-size:11px;color:#3fb950;font-weight:600;", "Trust Anchor" }
-                        div { style: "font-size:10px;color:#8b949e;margin-top:2px;", "/ndn" }
+                        div { style: "font-size:11px;color:var(--green);font-weight:600;", "Trust Anchor" }
+                        div { style: "font-size:10px;color:var(--text-muted);margin-top:2px;", "/ndn" }
                     }
                     div { class: "chain-arrow", "→" }
                     // CA cert
                     div { class: "chain-node ok",
                         div { style: "font-size:18px;margin-bottom:4px;", "📜" }
-                        div { style: "font-size:11px;color:#3fb950;font-weight:600;", "CA Certificate" }
-                        div { style: "font-size:10px;color:#8b949e;margin-top:2px;", "/ndn/site" }
+                        div { style: "font-size:11px;color:var(--green);font-weight:600;", "CA Certificate" }
+                        div { style: "font-size:10px;color:var(--text-muted);margin-top:2px;", "/ndn/site" }
                     }
                     div { class: "chain-arrow", "→" }
                     // Identity cert
                     div { class: "chain-node ok",
                         div { style: "font-size:18px;margin-bottom:4px;", "🪪" }
-                        div { style: "font-size:11px;color:#3fb950;font-weight:600;", "Your Identity" }
-                        div { style: "font-size:10px;color:#8b949e;margin-top:2px;", "/ndn/site/router" }
+                        div { style: "font-size:11px;color:var(--green);font-weight:600;", "Your Identity" }
+                        div { style: "font-size:10px;color:var(--text-muted);margin-top:2px;", "/ndn/site/router" }
                     }
                 }
 
                 // Verification arrow
-                div { style: "text-align:center;font-size:11px;color:#8b949e;margin-top:6px;",
+                div { style: "text-align:center;font-size:11px;color:var(--text-muted);margin-top:6px;",
                     "Each certificate is signed by the one above it"
                     span { class: "trust-link" }
                     "all the way back to the anchor"
                 }
             }
 
-            div { style: "background:#0c2d6b22;border:1px solid #1f4f8a44;border-radius:8px;padding:12px;margin-bottom:20px;font-size:12px;color:#8b949e;line-height:1.6;",
+            div { style: "background:var(--accent-bg)22;border:1px solid var(--accent-solid)44;border-radius:8px;padding:12px;margin-bottom:20px;font-size:12px;color:var(--text-muted);line-height:1.6;",
                 "💡 "
-                strong { style: "color:#58a6ff;", "Zero Trust by Default." }
+                strong { style: "color:var(--accent);", "Zero Trust by Default." }
                 " Every forwarded packet is verified against the trust chain. A packet with a broken or missing chain is dropped — not forwarded. Use the "
                 strong { "Security" }
                 " tab to manage your anchors and enroll with a CA."
@@ -276,8 +276,8 @@ fn render_done(advance: impl FnMut(MouseEvent) + 'static) -> Element {
     rsx! {
         div { style: "text-align:center;",
             div { style: "font-size:48px;margin-bottom:12px;", "🚀" }
-            div { style: "font-size:22px;font-weight:600;color:#c9d1d9;margin-bottom:10px;", "You're all set!" }
-            div { style: "color:#8b949e;font-size:13px;margin-bottom:24px;line-height:1.7;",
+            div { style: "font-size:22px;font-weight:600;color:var(--text);margin-bottom:10px;", "You're all set!" }
+            div { style: "color:var(--text-muted);font-size:13px;margin-bottom:24px;line-height:1.7;",
                 "The dashboard is your window into the NDN forwarder. Here's where to start:"
             }
 
@@ -318,10 +318,10 @@ fn render_done(advance: impl FnMut(MouseEvent) + 'static) -> Element {
 #[component]
 fn QuickCard(icon: &'static str, title: &'static str, desc: &'static str) -> Element {
     rsx! {
-        div { style: "background:#1c2128;border:1px solid #30363d;border-radius:8px;padding:12px;",
+        div { style: "background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:12px;",
             div { style: "font-size:20px;margin-bottom:6px;", "{icon}" }
-            div { style: "font-size:13px;font-weight:600;color:#c9d1d9;margin-bottom:4px;", "{title}" }
-            div { style: "font-size:11px;color:#8b949e;line-height:1.5;", "{desc}" }
+            div { style: "font-size:13px;font-weight:600;color:var(--text);margin-bottom:4px;", "{title}" }
+            div { style: "font-size:11px;color:var(--text-muted);line-height:1.5;", "{desc}" }
         }
     }
 }

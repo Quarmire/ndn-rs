@@ -2,6 +2,9 @@
 
 mod app;
 mod router_proc;
+pub mod settings;
+mod styles;
+pub mod tool_runner;
 mod tray;
 mod types;
 mod views;

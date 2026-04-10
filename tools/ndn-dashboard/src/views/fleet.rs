@@ -54,18 +54,18 @@ pub fn Fleet() -> Element {
                     }
                     div { style: "flex:1;",
                         div { style: "display:flex;justify-content:space-between;align-items:flex-start;",
-                            div { style: "font-size:13px;font-weight:600;color:#3fb950;margin-bottom:4px;",
+                            div { style: "font-size:13px;font-weight:600;color:var(--green);margin-bottom:4px;",
                                 "Bootstrap trust before routing"
                             }
                             button {
-                                style: "background:none;border:none;color:#8b949e;cursor:pointer;font-size:13px;padding:0;",
+                                style: "background:none;border:none;color:var(--text-muted);cursor:pointer;font-size:13px;padding:0;",
                                 onclick: move |_| edu_dismissed.set(true),
                                 "✕"
                             }
                         }
-                        div { style: "font-size:12px;color:#8b949e;line-height:1.6;",
+                        div { style: "font-size:12px;color:var(--text-muted);line-height:1.6;",
                             "Before NDN packets can flow, both routers must "
-                            strong { style: "color:#c9d1d9;", "verify each other's identity." }
+                            strong { style: "color:var(--text);", "verify each other's identity." }
                             " Use NDNCERT to enroll your router with a CA — the CA issues a certificate "
                             "that proves your router belongs to the network. Only then will signed packets be accepted."
                         }
@@ -185,7 +185,7 @@ pub fn Fleet() -> Element {
                 }
             } else {
                 // Enrollment form
-                div { style: "color:#8b949e;font-size:13px;margin-bottom:14px;",
+                div { style: "color:var(--text-muted);font-size:13px;margin-bottom:14px;",
                     "Request an identity certificate from an NDNCERT CA. The CA will challenge you to prove "
                     "ownership before issuing the certificate."
                 }
@@ -211,7 +211,7 @@ pub fn Fleet() -> Element {
 
                 // Challenge type selector
                 div { style: "margin-bottom:14px;",
-                    div { style: "font-size:12px;color:#8b949e;margin-bottom:8px;",
+                    div { style: "font-size:12px;color:var(--text-muted);margin-bottom:8px;",
                         span {
                             "data-tooltip": "How the CA will verify your identity:\n• Token — pre-shared token the CA gives you out-of-band\n• PIN — numeric code (works with YubiKey HOTP)\n• Possession — prove you own an existing key\n• YubiKey HOTP — one-press OTP from a YubiKey slot 2",
                             "Challenge Type"
@@ -278,7 +278,7 @@ pub fn Fleet() -> Element {
                                             style: "width:220px;font-family:monospace;",
                                         }
                                         if ctype == CHALLENGE_YUBIKEY {
-                                            div { style: "font-size:11px;color:#8b949e;margin-top:4px;",
+                                            div { style: "font-size:11px;color:var(--text-muted);margin-top:4px;",
                                                 "Plug in YubiKey and long-press to emit the OTP. The OTP is entered above automatically if stdin is a YubiKey HID device."
                                             }
                                         }
@@ -322,7 +322,7 @@ pub fn Fleet() -> Element {
                         },
                         "Enroll →"
                     }
-                    div { style: "font-size:11px;color:#8b949e;",
+                    div { style: "font-size:11px;color:var(--text-muted);",
                         "Sends PROBE → NEW → CHALLENGE to the CA prefix via the NDN router."
                     }
                 }
@@ -332,7 +332,7 @@ pub fn Fleet() -> Element {
         // ── Bootstrap New Device ─────────────────────────────────────────────
         div { class: "section",
             div { class: "section-title", "Bootstrap New Device" }
-            div { style: "color:#8b949e;font-size:13px;margin-bottom:14px;",
+            div { style: "color:var(--text-muted);font-size:13px;margin-bottom:14px;",
                 "Create a face to a peer and register a route — bootstraps a new router into the network."
             }
             div { class: "form-row",
@@ -384,7 +384,7 @@ pub fn Fleet() -> Element {
                     "Bootstrap"
                 }
             }
-            div { style: "color:#8b949e;font-size:11px;margin-top:10px;",
+            div { style: "color:var(--text-muted);font-size:11px;margin-top:10px;",
                 "Note: Creates the face first, then registers the route. Face ID is resolved automatically from the management connection."
             }
         }
@@ -403,7 +403,7 @@ fn EnrollProgress(
     let is_error = step == 254;
 
     rsx! {
-        div { style: "background:#0d1117;border:1px solid #21262d;border-radius:8px;padding:16px;",
+        div { style: "background:var(--bg);border:1px solid var(--border-subtle);border-radius:8px;padding:16px;",
             // Protocol steps
             div { style: "display:flex;gap:0;margin-bottom:16px;",
                 EnrollStepDot { i: 0, current: step, is_done, is_error, label: "PROBE",     desc: "Discover CA capabilities" }
@@ -415,15 +415,15 @@ fn EnrollProgress(
             if is_done {
                 div { style: "text-align:center;padding:16px 0;",
                     div { style: "font-size:28px;margin-bottom:8px;", "✅" }
-                    div { style: "font-size:14px;font-weight:600;color:#3fb950;margin-bottom:6px;",
+                    div { style: "font-size:14px;font-weight:600;color:var(--green);margin-bottom:6px;",
                         "Certificate Issued!"
                     }
                     if let Some(ref did) = result_did {
-                        div { style: "font-size:11px;color:#a371f7;font-family:monospace;margin-bottom:12px;",
+                        div { style: "font-size:11px;color:var(--purple);font-family:monospace;margin-bottom:12px;",
                             "{did}"
                         }
                     }
-                    div { style: "font-size:12px;color:#8b949e;margin-bottom:14px;",
+                    div { style: "font-size:12px;color:var(--text-muted);margin-bottom:14px;",
                         "Your identity certificate has been installed in the PIB. "
                         "Other routers can now verify your signed packets."
                     }
@@ -436,7 +436,7 @@ fn EnrollProgress(
             } else if is_error {
                 div { style: "text-align:center;padding:12px 0;",
                     div { style: "font-size:28px;margin-bottom:8px;", "❌" }
-                    div { style: "font-size:13px;color:#f85149;margin-bottom:10px;",
+                    div { style: "font-size:13px;color:var(--red);margin-bottom:10px;",
                         "Enrollment failed. Check the CA prefix and challenge parameters."
                     }
                     button {
@@ -451,12 +451,12 @@ fn EnrollProgress(
                         let step_label = ["PROBE", "NEW", "CHALLENGE", "DONE"]
                             .get(step as usize).copied().unwrap_or("");
                         rsx! {
-                            div { style: "font-size:12px;color:#8b949e;",
+                            div { style: "font-size:12px;color:var(--text-muted);",
                                 "Step {step + 1} of 4 — {step_label} in progress…"
                             }
                         }
                     }
-                    div { style: "font-size:11px;color:#8b949e;margin-top:4px;",
+                    div { style: "font-size:11px;color:var(--text-muted);margin-top:4px;",
                         "Note: enrollment IPC is pending — this UI preview shows the protocol flow."
                     }
                     button {
@@ -480,8 +480,8 @@ fn EnrollStepDot(
     label: &'static str,
     desc: &'static str,
 ) -> Element {
-    let done_color  = "#3fb950";
-    let idle_color  = "#30363d";
+    let done_color  = "var(--green)";
+    let idle_color  = "var(--border)";
 
     let left_color  = if i > 0 && (i <= current || is_done) { done_color } else { idle_color };
     let right_color = if i < 3 && (i < current || is_done)  { done_color } else { idle_color };
@@ -507,8 +507,8 @@ fn EnrollStepDot(
                     div { style: "flex:1;height:1px;background:{right_color};" }
                 }
             }
-            div { style: "font-size:10px;font-weight:600;color:#c9d1d9;margin-top:4px;", "{label}" }
-            div { style: "font-size:9px;color:#8b949e;margin-top:2px;max-width:80px;margin-left:auto;margin-right:auto;", "{desc}" }
+            div { style: "font-size:10px;font-weight:600;color:var(--text);margin-top:4px;", "{label}" }
+            div { style: "font-size:9px;color:var(--text-muted);margin-top:2px;max-width:80px;margin-left:auto;margin-right:auto;", "{desc}" }
         }
     }
 }

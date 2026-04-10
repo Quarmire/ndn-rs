@@ -93,7 +93,7 @@ pub fn Radio() -> Element {
                         }
                     }
                 }
-                div { style: "font-size:11px;color:#8b949e;margin-top:8px;",
+                div { style: "font-size:11px;color:var(--text-muted);margin-top:8px;",
                     "Quality estimate = Data satisfied / Interests received (from face counters). "
                     "Full RSSI and SNR data requires "
                     span { class: "mono", "faces/link-quality" }
@@ -116,15 +116,15 @@ pub fn Radio() -> Element {
                             let total_in = c.in_interests + c.in_data;
                             let total_out = c.out_interests + c.out_data;
                             rsx! {
-                                div { style: "background:#1c2128;border:1px solid #30363d;border-radius:6px;padding:12px;min-width:160px;",
-                                    div { style: "font-size:11px;color:#8b949e;margin-bottom:6px;",
+                                div { style: "background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:12px;min-width:160px;",
+                                    div { style: "font-size:11px;color:var(--text-muted);margin-bottom:6px;",
                                         "Face "
                                         span { class: "mono", "{c.face_id}" }
                                         " · "
                                         span { class: "badge badge-gray", "{kind}" }
                                     }
-                                    div { style: "font-size:12px;color:#58a6ff;", "↓ {total_in} pkts" }
-                                    div { style: "font-size:12px;color:#3fb950;", "↑ {total_out} pkts" }
+                                    div { style: "font-size:12px;color:var(--accent);", "↓ {total_in} pkts" }
+                                    div { style: "font-size:12px;color:var(--green);", "↑ {total_out} pkts" }
                                 }
                             }
                         }

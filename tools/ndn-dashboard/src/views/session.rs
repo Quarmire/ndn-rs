@@ -41,7 +41,7 @@ pub fn Session() -> Element {
             }
 
             if *ctx.recording.read() {
-                div { style: "background:#1a3000;border:1px solid #3fb950;border-radius:4px;padding:8px 12px;margin-bottom:12px;font-size:12px;color:#3fb950;",
+                div { style: "background:var(--green-bg);border:1px solid var(--green);border-radius:4px;padding:8px 12px;margin-bottom:12px;font-size:12px;color:var(--green);",
                     "● Recording — management commands are being logged"
                 }
             }
@@ -60,9 +60,9 @@ pub fn Session() -> Element {
                     tbody {
                         for (i, entry) in log.iter().enumerate() {
                             tr {
-                                td { class: "mono", style: "color:#8b949e;", "{i + 1}" }
+                                td { class: "mono", style: "color:var(--text-muted);", "{i + 1}" }
                                 td { class: "mono", "{entry.kind}" }
-                                td { class: "mono", style: "color:#8b949e;", "{entry.params}" }
+                                td { class: "mono", style: "color:var(--text-muted);", "{entry.params}" }
                             }
                         }
                     }
@@ -71,9 +71,9 @@ pub fn Session() -> Element {
                 // Export JSON
                 div { style: "margin-top:12px;",
                     details {
-                        summary { style: "cursor:pointer;font-size:12px;color:#8b949e;", "Export as JSON" }
+                        summary { style: "cursor:pointer;font-size:12px;color:var(--text-muted);", "Export as JSON" }
                         textarea {
-                            style: "width:100%;height:200px;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;font-family:'SF Mono',monospace;font-size:11px;padding:8px;border-radius:4px;margin-top:8px;",
+                            style: "width:100%;height:200px;background:var(--bg);border:1px solid var(--border);color:var(--text);font-family:'SF Mono',monospace;font-size:11px;padding:8px;border-radius:4px;margin-top:8px;",
                             readonly: true,
                             value: "{session_to_json(&log)}",
                         }
@@ -81,7 +81,7 @@ pub fn Session() -> Element {
                 }
             }
 
-            div { style: "margin-top:12px;font-size:12px;color:#8b949e;",
+            div { style: "margin-top:12px;font-size:12px;color:var(--text-muted);",
                 "Recorded sessions can be replayed to restore router configuration after a restart."
             }
         }

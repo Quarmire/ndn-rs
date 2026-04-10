@@ -184,7 +184,7 @@ fn AnchorsTab(anchors: Vec<crate::types::AnchorInfo>) -> Element {
             }
         }
 
-        div { style: "margin-top:14px;padding-top:14px;border-top:1px solid #21262d;color:#8b949e;font-size:12px;",
+        div { style: "margin-top:14px;padding-top:14px;border-top:1px solid var(--border-subtle);color:var(--text-muted);font-size:12px;",
             "Trust anchors are loaded from the PIB at startup. Use "
             span { class: "mono", "ndn-sec add-anchor" }
             " to add new trust anchors, or enroll with a CA via the "
@@ -213,7 +213,7 @@ fn ChainTab(
 
     rsx! {
         div { class: "section-title", "Certificate Chain" }
-        div { style: "color:#8b949e;font-size:12px;margin-bottom:16px;",
+        div { style: "color:var(--text-muted);font-size:12px;margin-bottom:16px;",
             "Shows the chain from your trust anchor down to your identity certificate. "
             "Every link must be valid for your packets to be accepted by the network."
         }
@@ -223,11 +223,11 @@ fn ChainTab(
             div { class: "trust-chain",
                 // Trust Anchor node
                 {chain_node("🔑", "Trust Anchor", &anchor_name, if has_anchor { "ok" } else { "missing" }, "Root of trust — the certificate everyone in your network must trust.\nConfigure in router TOML: security.trust_anchor")}
-                div { class: "chain-arrow", style: "color:#30363d;", "→" }
+                div { class: "chain-arrow", style: "color:var(--border);", "→" }
 
                 // CA Certificate node
                 {chain_node("📜", "CA Certificate", "Signed by anchor", if has_anchor { "ok" } else { "missing" }, "The Certificate Authority that signs identity certificates.\nEnroll via CA / NDNCERT tab to get one.")}
-                div { class: "chain-arrow", style: "color:#30363d;", "→" }
+                div { class: "chain-arrow", style: "color:var(--border);", "→" }
 
                 // Identity cert node
                 {chain_node("🪪", "Your Identity", &identity_name, if has_cert { "ok" } else if has_identity { "warn" } else { "missing" }, "Your router's identity certificate.\nMust be signed by a CA that chains back to the trust anchor.")}
@@ -236,16 +236,16 @@ fn ChainTab(
 
         // Status summary
         div { style: "display:flex;gap:10px;flex-wrap:wrap;margin-top:16px;",
-            div { style: "flex:1;min-width:160px;background:#1c2128;border:1px solid #30363d;border-radius:6px;padding:12px;",
-                div { style: "font-size:11px;color:#8b949e;margin-bottom:6px;", "IDENTITY" }
+            div { style: "flex:1;min-width:160px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:12px;",
+                div { style: "font-size:11px;color:var(--text-muted);margin-bottom:6px;", "IDENTITY" }
                 div { class: "mono", style: "font-size:12px;word-break:break-all;", "{identity_name}" }
             }
-            div { style: "flex:1;min-width:140px;background:#1c2128;border:1px solid #30363d;border-radius:6px;padding:12px;",
-                div { style: "font-size:11px;color:#8b949e;margin-bottom:6px;", "CERT EXPIRY" }
+            div { style: "flex:1;min-width:140px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:12px;",
+                div { style: "font-size:11px;color:var(--text-muted);margin-bottom:6px;", "CERT EXPIRY" }
                 span { class: "{expiry_cls}", "{expiry_lbl}" }
             }
-            div { style: "flex:1;min-width:140px;background:#1c2128;border:1px solid #30363d;border-radius:6px;padding:12px;",
-                div { style: "font-size:11px;color:#8b949e;margin-bottom:6px;", "TRUST ANCHOR" }
+            div { style: "flex:1;min-width:140px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:12px;",
+                div { style: "font-size:11px;color:var(--text-muted);margin-bottom:6px;", "TRUST ANCHOR" }
                 if has_anchor {
                     span { class: "badge badge-green", "configured" }
                 } else {
@@ -256,7 +256,7 @@ fn ChainTab(
 
         // Actions
         if !has_cert && has_identity {
-            div { style: "margin-top:14px;padding:12px;background:#3d300022;border:1px solid #d2992244;border-radius:6px;font-size:12px;color:#d29922;",
+            div { style: "margin-top:14px;padding:12px;background:var(--yellow-bg)22;border:1px solid var(--yellow)44;border-radius:6px;font-size:12px;color:var(--yellow);",
                 "⚠ Your identity key has no certificate. Go to the "
                 strong { "CA / NDNCERT" }
                 " tab to enroll and get a certificate signed by your trust anchor."
@@ -267,19 +267,19 @@ fn ChainTab(
 
 fn chain_node(icon: &str, label: &str, name: &str, status: &str, tooltip: &str) -> Element {
     let border_color = match status {
-        "ok"      => "#3fb950",
-        "warn"    => "#d29922",
-        "missing" => "#30363d",
-        _         => "#30363d",
+        "ok"      => "var(--green)",
+        "warn"    => "var(--yellow)",
+        "missing" => "var(--border)",
+        _         => "var(--border)",
     };
     let opacity = if status == "missing" { "0.45" } else { "1" };
     rsx! {
         div {
             "data-tooltip": "{tooltip}",
-            style: "background:#1c2128;border:1px solid {border_color};border-radius:8px;padding:12px 16px;text-align:center;min-width:120px;cursor:help;opacity:{opacity};",
+            style: "background:var(--surface2);border:1px solid {border_color};border-radius:8px;padding:12px 16px;text-align:center;min-width:120px;cursor:help;opacity:{opacity};",
             div { style: "font-size:22px;margin-bottom:4px;", "{icon}" }
-            div { style: "font-size:11px;font-weight:600;color:#c9d1d9;margin-bottom:2px;", "{label}" }
-            div { style: "font-size:10px;color:#8b949e;word-break:break-all;max-width:130px;", "{name}" }
+            div { style: "font-size:11px;font-weight:600;color:var(--text);margin-bottom:2px;", "{label}" }
+            div { style: "font-size:10px;color:var(--text-muted);word-break:break-all;max-width:130px;", "{name}" }
         }
     }
 }
@@ -313,10 +313,10 @@ fn DidTab(keys: Vec<crate::types::SecurityKeyInfo>) -> Element {
             div { style: "display:flex;gap:12px;align-items:flex-start;",
                 div { style: "font-size:28px;flex-shrink:0;", "🔗" }
                 div {
-                    div { style: "font-size:13px;font-weight:600;color:#a371f7;margin-bottom:4px;",
+                    div { style: "font-size:13px;font-weight:600;color:var(--purple);margin-bottom:4px;",
                         "Decentralized Identifiers (W3C DIDs)"
                     }
-                    div { style: "font-size:12px;color:#8b949e;line-height:1.6;",
+                    div { style: "font-size:12px;color:var(--text-muted);line-height:1.6;",
                         "A DID is a self-sovereign, cryptographically verifiable identifier — no central authority needed. "
                         "NDN names map directly to DIDs: your NDN name "
                         span { class: "signed-packet", "{identity_name}" }
@@ -334,9 +334,9 @@ fn DidTab(keys: Vec<crate::types::SecurityKeyInfo>) -> Element {
             // did:ndn
             div { style: "margin-bottom:18px;",
                 div { style: "display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;",
-                    div { style: "font-size:12px;font-weight:600;color:#c9d1d9;",
-                        span { style: "color:#a371f7;", "did:ndn" }
-                        span { style: "color:#8b949e;", " — NDN name encoded as a W3C DID" }
+                    div { style: "font-size:12px;font-weight:600;color:var(--text);",
+                        span { style: "color:var(--purple);", "did:ndn" }
+                        span { style: "color:var(--text-muted);", " — NDN name encoded as a W3C DID" }
                     }
                     button {
                         class: "did-copy-btn",
@@ -348,25 +348,25 @@ fn DidTab(keys: Vec<crate::types::SecurityKeyInfo>) -> Element {
                     }
                 }
                 div { class: "did-value", "{did_ndn}" }
-                div { style: "font-size:11px;color:#8b949e;",
+                div { style: "font-size:11px;color:var(--text-muted);",
                     "DID document resolves to the NDN certificate at the signed certificate name."
                 }
             }
 
             // did:key placeholder
             div { style: "margin-bottom:18px;",
-                div { style: "font-size:12px;font-weight:600;color:#c9d1d9;margin-bottom:6px;",
-                    span { style: "color:#a371f7;", "did:key" }
-                    span { style: "color:#8b949e;", " — public key multibase encoding" }
+                div { style: "font-size:12px;font-weight:600;color:var(--text);margin-bottom:6px;",
+                    span { style: "color:var(--purple);", "did:key" }
+                    span { style: "color:var(--text-muted);", " — public key multibase encoding" }
                 }
-                div { style: "background:#1c2128;border:1px solid #30363d;border-radius:4px;padding:10px;font-size:11px;color:#8b949e;font-style:italic;",
+                div { style: "background:var(--surface2);border:1px solid var(--border);border-radius:4px;padding:10px;font-size:11px;color:var(--text-muted);font-style:italic;",
                     "{did_key_note}"
                 }
             }
 
             // DID document preview
             div {
-                div { style: "font-size:12px;font-weight:600;color:#c9d1d9;margin-bottom:6px;", "DID Document (preview)" }
+                div { style: "font-size:12px;font-weight:600;color:var(--text);margin-bottom:6px;", "DID Document (preview)" }
                 div { class: "yk-cmd", "{did_doc_preview}" }
             }
 
@@ -396,9 +396,9 @@ fn DidTab(keys: Vec<crate::types::SecurityKeyInfo>) -> Element {
 #[component]
 fn DidExplainCard(title: &'static str, body: &'static str) -> Element {
     rsx! {
-        div { style: "background:#1c2128;border:1px solid #30363d;border-radius:6px;padding:12px;",
-            div { style: "font-size:12px;font-weight:600;color:#a371f7;margin-bottom:4px;", "{title}" }
-            div { style: "font-size:11px;color:#8b949e;line-height:1.5;", "{body}" }
+        div { style: "background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:12px;",
+            div { style: "font-size:12px;font-weight:600;color:var(--purple);margin-bottom:4px;", "{title}" }
+            div { style: "font-size:11px;color:var(--text-muted);line-height:1.5;", "{body}" }
         }
     }
 }
@@ -418,19 +418,19 @@ fn CaTab() -> Element {
 
         // Live CA status or "not configured" notice
         if let Some(ref info) = ca {
-            div { style: "background:#0f2a16;border:1px solid #3fb95044;border-radius:6px;padding:14px;margin-bottom:14px;",
-                div { style: "font-size:12px;font-weight:600;color:#3fb950;margin-bottom:8px;",
+            div { style: "background:var(--green-dark);border:1px solid var(--green)44;border-radius:6px;padding:14px;margin-bottom:14px;",
+                div { style: "font-size:12px;font-weight:600;color:var(--green);margin-bottom:8px;",
                     "CA Active on this router"
                 }
                 div { style: "display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:12px;",
-                    div { style: "color:#8b949e;", "CA Prefix" }
-                    div { style: "font-family:monospace;color:#c9d1d9;", "{info.ca_prefix}" }
-                    div { style: "color:#8b949e;", "Description" }
+                    div { style: "color:var(--text-muted);", "CA Prefix" }
+                    div { style: "font-family:monospace;color:var(--text);", "{info.ca_prefix}" }
+                    div { style: "color:var(--text-muted);", "Description" }
                     { let ca_desc = if info.ca_info.is_empty() { "—".to_string() } else { info.ca_info.clone() };
-                      rsx! { div { style: "color:#c9d1d9;", "{ca_desc}" } } }
-                    div { style: "color:#8b949e;", "Max Validity" }
-                    div { style: "color:#c9d1d9;", "{info.max_validity_days} days" }
-                    div { style: "color:#8b949e;", "Challenges" }
+                      rsx! { div { style: "color:var(--text);", "{ca_desc}" } } }
+                    div { style: "color:var(--text-muted);", "Max Validity" }
+                    div { style: "color:var(--text);", "{info.max_validity_days} days" }
+                    div { style: "color:var(--text-muted);", "Challenges" }
                     div { style: "display:flex;gap:4px;flex-wrap:wrap;",
                         for ch in &info.challenges {
                             span { class: "badge badge-blue", "{ch}" }
@@ -439,8 +439,8 @@ fn CaTab() -> Element {
                 }
             }
         } else {
-            div { style: "background:#1c2128;border:1px solid #30363d;border-radius:6px;padding:14px;margin-bottom:14px;",
-                div { style: "font-size:12px;color:#8b949e;", "This router is not acting as a CA. To enable, add to router TOML:" }
+            div { style: "background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:14px;margin-bottom:14px;",
+                div { style: "font-size:12px;color:var(--text-muted);", "This router is not acting as a CA. To enable, add to router TOML:" }
                 div { class: "yk-cmd", style: "margin-top:8px;",
                     "[security]\n"
                     "ca_prefix = \"/ndn/site\"\n"
@@ -456,10 +456,10 @@ fn CaTab() -> Element {
             div { style: "display:flex;gap:12px;align-items:flex-start;",
                 div { style: "font-size:28px;flex-shrink:0;", "🏛" }
                 div {
-                    div { style: "font-size:13px;font-weight:600;color:#58a6ff;margin-bottom:4px;",
+                    div { style: "font-size:13px;font-weight:600;color:var(--accent);margin-bottom:4px;",
                         "NDNCERT — Automated Certificate Management"
                     }
-                    div { style: "font-size:12px;color:#8b949e;line-height:1.6;",
+                    div { style: "font-size:12px;color:var(--text-muted);line-height:1.6;",
                         "NDNCERT (Named Data Networking Certificate Management Protocol) automates certificate issuance. "
                         "A CA verifies your identity via challenges (PIN, email, possession, or YubiKey OTP) "
                         "and issues a signed certificate bound to your identity key."
@@ -470,7 +470,7 @@ fn CaTab() -> Element {
 
         // Enrollment flow diagram
         div { style: "margin:16px 0;",
-            div { style: "font-size:12px;font-weight:600;color:#c9d1d9;margin-bottom:10px;", "Enrollment Protocol Flow" }
+            div { style: "font-size:12px;font-weight:600;color:var(--text);margin-bottom:10px;", "Enrollment Protocol Flow" }
             div { class: "enroll-steps",
                 EnrollStep { label: "PROBE", desc: "Check namespace", status: "done" }
                 div { class: "enroll-step-line done" }
@@ -491,9 +491,9 @@ fn CaTab() -> Element {
         }
 
         // Token management — enabled only when CA is active
-        div { style: "border:1px solid #30363d;border-radius:6px;overflow:hidden;",
-            div { style: "display:flex;justify-content:space-between;align-items:center;padding:12px 14px;background:#1c2128;",
-                div { style: "font-size:12px;font-weight:600;color:#c9d1d9;", "Zero-Touch Provisioning Tokens" }
+        div { style: "border:1px solid var(--border);border-radius:6px;overflow:hidden;",
+            div { style: "display:flex;justify-content:space-between;align-items:center;padding:12px 14px;background:var(--surface2);",
+                div { style: "font-size:12px;font-weight:600;color:var(--text);", "Zero-Touch Provisioning Tokens" }
                 if ca.is_some() {
                     button {
                         class: "btn btn-secondary btn-sm",
@@ -503,7 +503,7 @@ fn CaTab() -> Element {
                 }
             }
             if *show_token_form.read() {
-                div { style: "padding:14px;border-top:1px solid #30363d;",
+                div { style: "padding:14px;border-top:1px solid var(--border);",
                     div { class: "form-row",
                         div { class: "form-group",
                             label { "Token description (label for this token)" }
@@ -533,11 +533,11 @@ fn CaTab() -> Element {
                 }
             }
             if ca.is_none() {
-                div { style: "padding:16px;text-align:center;color:#8b949e;font-size:13px;",
+                div { style: "padding:16px;text-align:center;color:var(--text-muted);font-size:13px;",
                     "Enable this router as a CA (add ca_prefix to TOML) to manage ZTP tokens."
                 }
             } else {
-                div { style: "padding:12px 14px;color:#8b949e;font-size:12px;",
+                div { style: "padding:12px 14px;color:var(--text-muted);font-size:12px;",
                     "Generated tokens are logged by the router at INFO level. Future versions will list active tokens here."
                 }
             }
@@ -555,8 +555,8 @@ fn EnrollStep(label: &'static str, desc: &'static str, status: &'static str) -> 
     rsx! {
         div { class: "enroll-step",
             div { class: "{dot_class}" }
-            div { style: "font-size:11px;font-weight:600;color:#c9d1d9;", "{label}" }
-            div { style: "font-size:10px;color:#8b949e;", "{desc}" }
+            div { style: "font-size:11px;font-weight:600;color:var(--text);", "{label}" }
+            div { style: "font-size:10px;color:var(--text-muted);", "{desc}" }
         }
     }
 }
@@ -564,9 +564,9 @@ fn EnrollStep(label: &'static str, desc: &'static str, status: &'static str) -> 
 #[component]
 fn InfoKv(label: &'static str, val: &'static str) -> Element {
     rsx! {
-        div { style: "background:#0d1117;border:1px solid #21262d;border-radius:4px;padding:8px 10px;",
-            div { style: "font-size:10px;color:#8b949e;text-transform:uppercase;letter-spacing:.4px;", "{label}" }
-            div { style: "font-size:12px;color:#c9d1d9;margin-top:2px;font-weight:500;", "{val}" }
+        div { style: "background:var(--bg);border:1px solid var(--border-subtle);border-radius:4px;padding:8px 10px;",
+            div { style: "font-size:10px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.4px;", "{label}" }
+            div { style: "font-size:12px;color:var(--text);margin-top:2px;font-weight:500;", "{val}" }
         }
     }
 }
@@ -591,15 +591,15 @@ fn YubikeyTab() -> Element {
             div { style: "display:flex;gap:12px;align-items:flex-start;",
                 div { style: "font-size:28px;flex-shrink:0;", "🔐" }
                 div {
-                    div { style: "font-size:13px;font-weight:600;color:#3fb950;margin-bottom:4px;",
+                    div { style: "font-size:13px;font-weight:600;color:var(--green);margin-bottom:4px;",
                         "Hardware-Backed Security"
                     }
-                    div { style: "font-size:12px;color:#8b949e;line-height:1.6;",
+                    div { style: "font-size:12px;color:var(--text-muted);line-height:1.6;",
                         "A YubiKey stores cryptographic keys in tamper-resistant hardware — private keys never leave the device. "
                         "Two modes are supported: "
-                        strong { style: "color:#c9d1d9;", "PIV (slot 9a)" }
+                        strong { style: "color:var(--text);", "PIV (slot 9a)" }
                         " for hardware-backed signing, and "
-                        strong { style: "color:#c9d1d9;", "HOTP slot 2" }
+                        strong { style: "color:var(--text);", "HOTP slot 2" }
                         " for one-press headless device bootstrapping."
                     }
                 }
@@ -609,10 +609,10 @@ fn YubikeyTab() -> Element {
         // Mode cards
         div { style: "display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:20px;",
             // PIV Signing Key card — now interactive
-            div { style: "background:#1c2128;border:1px solid #30363d;border-radius:8px;padding:16px;",
+            div { style: "background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:16px;",
                 div { style: "font-size:16px;margin-bottom:8px;", "🔑" }
-                div { style: "font-size:13px;font-weight:600;color:#c9d1d9;margin-bottom:4px;", "PIV Signing Key" }
-                div { style: "font-size:11px;color:#8b949e;line-height:1.5;margin-bottom:10px;",
+                div { style: "font-size:13px;font-weight:600;color:var(--text);margin-bottom:4px;", "PIV Signing Key" }
+                div { style: "font-size:11px;color:var(--text-muted);line-height:1.5;margin-bottom:10px;",
                     "Store your NDN identity private key in YubiKey PIV slot 9a. All packet signing happens on-device — even a compromised OS cannot steal your key."
                 }
                 // Detect button
@@ -662,7 +662,7 @@ fn YubikeyTab() -> Element {
                 if let Some(ref st) = yk_status {
                     if st.starts_with("Generated.") {
                         div { style: "margin-top:8px;",
-                            div { style: "font-size:11px;color:#8b949e;margin-bottom:4px;",
+                            div { style: "font-size:11px;color:var(--text-muted);margin-bottom:4px;",
                                 "P-256 public key (base64url, 65 bytes uncompressed):"
                             }
                             div { class: "yk-seed", style: "word-break:break-all;",
@@ -672,10 +672,10 @@ fn YubikeyTab() -> Element {
                     }
                 }
             }
-            div { style: "background:#1c2128;border:1px solid #30363d;border-radius:8px;padding:16px;",
+            div { style: "background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:16px;",
                 div { style: "font-size:16px;margin-bottom:8px;", "🖱" }
-                div { style: "font-size:13px;font-weight:600;color:#c9d1d9;margin-bottom:4px;", "HOTP Bootstrapping" }
-                div { style: "font-size:11px;color:#8b949e;line-height:1.5;margin-bottom:10px;",
+                div { style: "font-size:13px;font-weight:600;color:var(--text);margin-bottom:4px;", "HOTP Bootstrapping" }
+                div { style: "font-size:11px;color:var(--text-muted);line-height:1.5;margin-bottom:10px;",
                     "Program slot 2 with an HMAC-SHA1 seed. Pressing the button emits a 6-digit one-time code — enough to authenticate a headless router during NDNCERT enrollment."
                 }
                 span { class: "badge badge-green", "Available now" }
@@ -683,9 +683,9 @@ fn YubikeyTab() -> Element {
         }
 
         // HOTP seed generator
-        div { style: "background:#1c2128;border:1px solid #30363d;border-radius:8px;padding:16px;margin-bottom:16px;",
+        div { style: "background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:16px;margin-bottom:16px;",
             div { style: "display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;",
-                div { style: "font-size:13px;font-weight:600;color:#c9d1d9;", "Generate HOTP Seed" }
+                div { style: "font-size:13px;font-weight:600;color:var(--text);", "Generate HOTP Seed" }
                 button {
                     class: "btn btn-primary btn-sm",
                     onclick: move |_| {
@@ -700,7 +700,7 @@ fn YubikeyTab() -> Element {
             }
 
             if let Some(ref seed) = *hotp_seed.read() {
-                div { style: "font-size:11px;color:#8b949e;margin-bottom:4px;", "HMAC-SHA1 seed (hex, 20 bytes):" }
+                div { style: "font-size:11px;color:var(--text-muted);margin-bottom:4px;", "HMAC-SHA1 seed (hex, 20 bytes):" }
                 div { class: "yk-seed", "{seed}" }
 
                 div { class: "form-row",
@@ -731,13 +731,13 @@ fn YubikeyTab() -> Element {
                         let c = *hotp_counter.read();
                         rsx! {
                             div { style: "margin-top:10px;",
-                                div { style: "font-size:11px;color:#8b949e;margin-bottom:4px;",
+                                div { style: "font-size:11px;color:var(--text-muted);margin-bottom:4px;",
                                     "Run on the provisioning machine (YubiKey connected via USB):"
                                 }
                                 div { class: "yk-cmd",
                                     "ykpersonalize -2 -o oath-hotp -o append-cr -a {s}"
                                 }
-                                div { style: "font-size:11px;color:#8b949e;margin-top:8px;",
+                                div { style: "font-size:11px;color:var(--text-muted);margin-top:8px;",
                                     "Then configure the CA with this seed + counter via the CA / NDNCERT tab or router TOML:"
                                 }
                                 div { class: "yk-cmd",
@@ -751,15 +751,15 @@ fn YubikeyTab() -> Element {
                     }
                 }
             } else {
-                div { style: "text-align:center;padding:20px;color:#8b949e;font-size:13px;",
+                div { style: "text-align:center;padding:20px;color:var(--text-muted);font-size:13px;",
                     "Click \"Generate New Seed\" to create a fresh HMAC-SHA1 seed for a YubiKey slot 2."
                 }
             }
         }
 
         // Headless bootstrapping flow
-        div { style: "background:#1c2128;border:1px solid #30363d;border-radius:8px;padding:16px;",
-            div { style: "font-size:13px;font-weight:600;color:#c9d1d9;margin-bottom:10px;", "Headless Bootstrap Flow" }
+        div { style: "background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:16px;",
+            div { style: "font-size:13px;font-weight:600;color:var(--text);margin-bottom:10px;", "Headless Bootstrap Flow" }
             BootstrapStep { n: 1, step: "Admin provisions",   desc: "Generate seed here → run ykpersonalize on the YubiKey", first: true }
             BootstrapStep { n: 2, step: "Ship device",        desc: "YubiKey is plugged into the headless router", first: false }
             BootstrapStep { n: 3, step: "Router enrolls",     desc: "Router starts NDNCERT enrollment automatically on boot", first: false }
@@ -778,15 +778,15 @@ fn generate_hotp_seed() -> String {
 
 #[component]
 fn BootstrapStep(n: u8, step: &'static str, desc: &'static str, first: bool) -> Element {
-    let border = if first { "" } else { "border-top:1px solid #21262d;" };
+    let border = if first { "" } else { "border-top:1px solid var(--border-subtle);" };
     rsx! {
         div { style: "display:flex;gap:10px;padding:8px 0;{border}",
-            div { style: "width:24px;height:24px;border-radius:50%;background:#1f6feb22;border:1px solid #1f6feb44;display:flex;align-items:center;justify-content:center;font-size:11px;color:#58a6ff;flex-shrink:0;",
+            div { style: "width:24px;height:24px;border-radius:50%;background:var(--accent-dim);border:1px solid var(--accent-solid)44;display:flex;align-items:center;justify-content:center;font-size:11px;color:var(--accent);flex-shrink:0;",
                 "{n}"
             }
             div {
-                div { style: "font-size:12px;font-weight:600;color:#c9d1d9;", "{step}" }
-                div { style: "font-size:11px;color:#8b949e;", "{desc}" }
+                div { style: "font-size:12px;font-weight:600;color:var(--text);", "{step}" }
+                div { style: "font-size:11px;color:var(--text-muted);", "{desc}" }
             }
         }
     }

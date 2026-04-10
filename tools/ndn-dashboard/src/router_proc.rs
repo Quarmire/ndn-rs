@@ -24,10 +24,15 @@ const LOG_BUF_CAP: usize = 2000;
 
 impl RouterProc {
     /// Spawn `ndn-router` at `binary`, wiring stdout/stderr to the log buffer.
-    pub async fn start(binary: &PathBuf) -> anyhow::Result<Self> {
+    /// If `config_path` is `Some`, passes `--config <path>` to the process.
+    pub async fn start(binary: &PathBuf, config_path: Option<&str>) -> anyhow::Result<Self> {
         let log_buf = Arc::new(Mutex::new(VecDeque::with_capacity(LOG_BUF_CAP)));
 
-        let mut child = Command::new(binary)
+        let mut cmd = Command::new(binary);
+        if let Some(path) = config_path {
+            cmd.args(["--config", path]);
+        }
+        let mut child = cmd
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()?;
@@ -78,6 +83,17 @@ impl RouterProc {
     pub fn drain_logs(&self) -> Vec<LogEntry> {
         self.log_buf.lock().unwrap().drain(..).collect()
     }
+}
+
+// ── Temp config writer ────────────────────────────────────────────────────────
+
+/// Write `toml` to a temporary file and return its path.
+/// Used by StartRouterModal "Start with Config" to pass the current config
+/// to the router without requiring the user to save it manually.
+pub fn write_temp_config(toml: &str) -> std::io::Result<std::path::PathBuf> {
+    let path = std::env::temp_dir().join("ndn-dashboard-config.toml");
+    std::fs::write(&path, toml)?;
+    Ok(path)
 }
 
 // ── Binary discovery ──────────────────────────────────────────────────────────
