@@ -192,7 +192,7 @@ pub trait Face: Send + Sync + 'static {
         None
     }
 
-    /// Local URI (e.g. `unix:///tmp/ndn-faces.sock`). Returns `None` for face
+    /// Local URI (e.g. `unix:///tmp/ndn.sock`). Returns `None` for face
     /// types that don't expose local binding info.
     fn local_uri(&self) -> Option<String> {
         None

@@ -10,7 +10,7 @@
 //! ```rust,no_run
 //! # use ndn_app::Consumer;
 //! # async fn example() -> Result<(), ndn_app::AppError> {
-//! let mut consumer = Consumer::connect("/tmp/ndn-faces.sock").await?;
+//! let mut consumer = Consumer::connect("/tmp/ndn.sock").await?;
 //! let data = consumer.fetch("/example/data").await?;
 //! # Ok(())
 //! # }

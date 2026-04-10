@@ -242,27 +242,14 @@ fn default_cost() -> u32 {
 /// Management interface configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ManagementConfig {
-    /// Transport for the management interface.
-    ///
-    /// - `"ndn"` (default): NDN Interest/Data packets over the face socket.
-    ///   Inherits NDN security and routing.  `ndn-ctl` connects via `UnixFace`.
-    /// - `"bypass"`: raw JSON over a Unix socket.  Useful when the forwarding
-    ///   pipeline is unreachable.
-    #[serde(default = "default_mgmt_transport")]
-    pub transport: String,
-
-    /// Unix socket path for the **bypass** JSON management interface.
-    ///
-    /// Only used when `transport = "bypass"`.
-    /// Default: `/tmp/ndn-router.sock`.
-    #[serde(default = "default_bypass_socket")]
-    pub bypass_socket: String,
-
-    /// Unix socket path that accepts **NDN face connections** from apps and tools.
+    /// Unix domain socket (or Named Pipe on Windows) that accepts NDN face
+    /// connections from apps and tools.
     ///
     /// `ndn-ctl` and application processes connect here to exchange NDN packets
-    /// with the forwarder.  Only used when `transport = "ndn"`.
-    /// Default: `/tmp/ndn-faces.sock`.
+    /// with the forwarder.
+    ///
+    /// Default (Unix): `/tmp/ndn.sock`
+    /// Default (Windows): `\\.\pipe\ndn`
     #[serde(default = "default_face_socket")]
     pub face_socket: String,
 }
@@ -270,27 +257,16 @@ pub struct ManagementConfig {
 impl Default for ManagementConfig {
     fn default() -> Self {
         Self {
-            transport: default_mgmt_transport(),
-            bypass_socket: default_bypass_socket(),
             face_socket: default_face_socket(),
         }
     }
 }
 
-fn default_mgmt_transport() -> String {
-    "ndn".to_owned()
-}
-fn default_bypass_socket() -> String {
-    #[cfg(unix)]
-    return "/tmp/ndn-router.sock".to_owned();
-    #[cfg(windows)]
-    return r"\\.\pipe\ndn-router".to_owned();
-}
 fn default_face_socket() -> String {
     #[cfg(unix)]
-    return "/tmp/ndn-faces.sock".to_owned();
+    return "/tmp/ndn.sock".to_owned();
     #[cfg(windows)]
-    return r"\\.\pipe\ndn-faces".to_owned();
+    return r"\\.\pipe\ndn".to_owned();
 }
 
 /// Security settings.

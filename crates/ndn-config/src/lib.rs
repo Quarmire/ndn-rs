@@ -6,8 +6,6 @@
 //! ## Key types
 //!
 //! - [`ForwarderConfig`] -- top-level TOML configuration (faces, routes, CS, logging)
-//! - [`ManagementServer`] -- serves management commands over a control channel
-//! - [`ManagementRequest`] / [`ManagementResponse`] -- management protocol messages
 //! - [`ControlParameters`] -- structured parameters for NFD management commands
 //! - [`ParsedCommand`] -- result of parsing an NFD command name
 
@@ -27,5 +25,4 @@ pub use config::{
 pub use control_parameters::ControlParameters;
 pub use control_response::ControlResponse;
 pub use error::ConfigError;
-pub use mgmt::{ManagementRequest, ManagementResponse, ManagementServer};
 pub use nfd_command::{ParsedCommand, command_name, dataset_name, parse_command_name};

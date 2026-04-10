@@ -24,8 +24,8 @@
 //!
 //! | Platform | Default path |
 //! |----------|-------------|
-//! | Unix     | `/run/ndn/mgmt.sock` (or `/tmp/ndn-faces.sock` in dev) |
-//! | Windows  | `\\.\pipe\ndn-faces` |
+//! | Unix     | `/run/ndn/mgmt.sock` (or `/tmp/ndn.sock` in dev) |
+//! | Windows  | `\\.\pipe\ndn` |
 
 use std::io;
 
@@ -59,7 +59,7 @@ fn make_face(id: FaceId, kind: FaceKind, uri: String, r: DynRead, w: DynWrite) -
 /// Call [`IpcListener::cleanup`] on shutdown to remove the socket file.
 ///
 /// # Windows
-/// `path` must be a named pipe path such as `\\.\pipe\ndn-faces`.
+/// `path` must be a named pipe path such as `\\.\pipe\ndn`.
 /// Named pipes are cleaned up automatically when all handles close.
 pub struct IpcListener {
     inner: PlatformListener,
@@ -86,7 +86,7 @@ impl IpcListener {
         self.inner.cleanup();
     }
 
-    /// Human-readable URI for logging (e.g. `unix:///tmp/ndn-faces.sock`).
+    /// Human-readable URI for logging (e.g. `unix:///tmp/ndn.sock`).
     pub fn uri(&self) -> &str {
         self.inner.uri()
     }
@@ -97,7 +97,7 @@ impl IpcListener {
 /// Connect to the IPC socket at `path` and return an [`IpcFace`].
 ///
 /// On Unix, `path` is a filesystem path to a Unix domain socket.
-/// On Windows, `path` is a named pipe path such as `\\.\pipe\ndn-faces`.
+/// On Windows, `path` is a named pipe path such as `\\.\pipe\ndn`.
 pub async fn ipc_face_connect(id: FaceId, path: &str) -> io::Result<IpcFace> {
     let (r, w, uri) = platform_connect(path).await?;
     Ok(make_face(id, FaceKind::Unix, uri, r, w))
@@ -164,7 +164,7 @@ impl PlatformListener {
                 io::ErrorKind::InvalidInput,
                 format!(
                     "Windows IPC path must start with \\\\.\\pipe\\ (got {path:?}). \
-                     Use e.g. \\\\.\\pipe\\ndn-faces"
+                     Use e.g. \\\\.\\pipe\ndn"
                 ),
             ));
         }
