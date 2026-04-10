@@ -47,11 +47,21 @@ pub(crate) async fn run_face_reader(
         .map(|s| s.persistency)
         .unwrap_or(FacePersistency::OnDemand);
 
-    // Cache whether this face needs idle-timeout tracking.  Local faces
-    // (App, Shm, Internal) don't idle-timeout, so skip the per-packet
-    // DashMap lookup + clock read for them.
+    // Cache whether this face needs idle-timeout tracking.  Only UDP-style
+    // (connectionless) OnDemand faces are idle-reaped.  Connection-oriented
+    // faces (Unix, Tcp, WebSocket, Management) clean up when their socket
+    // closes, so they don't need — and must not receive — idle tracking.
     let track_activity = matches!(persistency, FacePersistency::OnDemand)
-        && !matches!(kind, FaceKind::App | FaceKind::Shm | FaceKind::Internal);
+        && !matches!(
+            kind,
+            FaceKind::App
+                | FaceKind::Shm
+                | FaceKind::Internal
+                | FaceKind::Unix
+                | FaceKind::Tcp
+                | FaceKind::WebSocket
+                | FaceKind::Management,
+        );
 
     // Cache whether this face has reliability enabled.
     #[cfg(feature = "face-net")]

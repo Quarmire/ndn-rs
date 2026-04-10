@@ -63,9 +63,24 @@ pub async fn run_idle_face_task(
                     // Local faces (App, SHM, Internal) use cancel-token lifecycle,
                     // not idle timeout.  Their last_activity is never updated in
                     // run_face_reader, so they would be falsely reaped here.
+                    //
+                    // Connection-oriented faces (Unix, Tcp, WebSocket, Management)
+                    // are also excluded: when the remote end closes the socket the
+                    // face reader exits and the OnDemand cleanup path in inbound.rs
+                    // removes the face immediately.  Idle timeout is only meaningful
+                    // for connectionless (UDP) faces where no disconnect signal exists.
                     let face_id = *entry.key();
                     if let Some(face) = face_table.get(face_id)
-                        && matches!(face.kind(), FaceKind::App | FaceKind::Shm | FaceKind::Internal)
+                        && matches!(
+                            face.kind(),
+                            FaceKind::App
+                                | FaceKind::Shm
+                                | FaceKind::Internal
+                                | FaceKind::Unix
+                                | FaceKind::Tcp
+                                | FaceKind::WebSocket
+                                | FaceKind::Management,
+                        )
                     {
                         continue;
                     }
