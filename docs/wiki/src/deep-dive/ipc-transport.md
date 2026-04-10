@@ -36,7 +36,7 @@ flowchart LR
 
 ### Tier 1: Unix Socket (~2 us per packet)
 
-The baseline. An application connects to the router's IPC socket (`/tmp/ndn-faces.sock` on Unix, `\\.\pipe\ndn-faces` on Windows) and sends TLV-encoded NDN packets over a stream. The `IpcFace` type abstracts over the platform differences -- Unix domain sockets on Linux and macOS, Named Pipes on Windows -- so application code is identical everywhere.
+The baseline. An application connects to the router's IPC socket (`/tmp/ndn.sock` on Unix, `\\.\pipe\ndn` on Windows) and sends TLV-encoded NDN packets over a stream. The `IpcFace` type abstracts over the platform differences -- Unix domain sockets on Linux and macOS, Named Pipes on Windows -- so application code is identical everywhere.
 
 The control channel is always a socket, even when the data plane uses a faster transport. Management commands (create face, register prefix, query status) flow over this socket using the NFD management protocol: the application sends an Interest for a name like `/localhost/nfd/rib/register/<parameters>` and receives a Data packet containing a `ControlResponse`.
 
@@ -111,7 +111,7 @@ sequenceDiagram
     participant Sock as Unix Socket
     participant Router as ndn-router
 
-    App->>RC: RouterClient::connect("/tmp/ndn-faces.sock")
+    App->>RC: RouterClient::connect("/tmp/ndn.sock")
     RC->>Sock: Connect to face socket
     Sock->>Router: New IPC connection
 
@@ -142,10 +142,10 @@ The connection flow works like this:
 
 ```rust
 // Automatic SHM negotiation (preferred)
-let client = RouterClient::connect("/tmp/ndn-faces.sock").await?;
+let client = RouterClient::connect("/tmp/ndn.sock").await?;
 
 // Explicit Unix-only mode (skip SHM attempt)
-let client = RouterClient::connect_unix_only("/tmp/ndn-faces.sock").await?;
+let client = RouterClient::connect_unix_only("/tmp/ndn.sock").await?;
 
 // Check which transport was negotiated
 if client.is_shm() {
@@ -222,7 +222,7 @@ The elegance of this design is in what happens when a service exits. The engine 
 The `MgmtClient` also provides programmatic access to the router's service discovery subsystem through the NFD management protocol:
 
 ```rust
-let mgmt = MgmtClient::connect("/tmp/ndn-faces.sock").await?;
+let mgmt = MgmtClient::connect("/tmp/ndn.sock").await?;
 
 // Announce a service prefix
 mgmt.service_announce(&"/myapp/service".parse()?).await?;
@@ -240,6 +240,6 @@ mgmt.service_withdraw(&"/myapp/service".parse()?).await?;
 
 The IPC stack forms a clean layered architecture. At the bottom, transport faces (`IpcFace`, `ShmFace`, `AppFace`) move bytes. In the middle, `RouterClient` and `NdnConnection` handle transport negotiation and provide a unified send/recv interface. At the top, `Consumer`, `Producer`, `ChunkedProducer`/`ChunkedConsumer`, and `ServiceRegistry` provide application-level abstractions.
 
-An application that starts with `Consumer::connect("/tmp/ndn-faces.sock")` gets SHM-accelerated data transfer, automatic prefix registration, and transparent chunked reassembly -- without knowing or caring about any of the machinery described in this page. And if that application later moves into the same process as the forwarder (say, for a mobile deployment), only the connection setup changes. The rest of the code stays identical.
+An application that starts with `Consumer::connect("/tmp/ndn.sock")` gets SHM-accelerated data transfer, automatic prefix registration, and transparent chunked reassembly -- without knowing or caring about any of the machinery described in this page. And if that application later moves into the same process as the forwarder (say, for a mobile deployment), only the connection setup changes. The rest of the code stays identical.
 
 That is the goal: NDN's name-based decoupling applied all the way down to the transport layer itself.

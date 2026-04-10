@@ -116,4 +116,4 @@ After the router starts, you should see log output indicating that faces are cre
 ndn-ctl status
 ```
 
-This connects to the router's management socket (default `/tmp/ndn-faces.sock`) and prints forwarding engine state.
+This connects to the router's management socket (default `/tmp/ndn.sock`) and prints forwarding engine state.

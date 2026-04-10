@@ -192,7 +192,7 @@ use ndn_app::Consumer;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Connect to the router's management socket.
-    let mut consumer = Consumer::connect("/tmp/ndn-faces.sock").await?;
+    let mut consumer = Consumer::connect("/tmp/ndn.sock").await?;
     let data = consumer.fetch("/ndn/hello").await?;
     println!("Got: {:?}", data.content());
     Ok(())

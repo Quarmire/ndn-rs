@@ -2,7 +2,7 @@
 
 You've got ndn-router running. Now what? The ndn-tools suite gives you the equivalent of ping, curl, and iperf for NDN networks.
 
-Every tool in the suite communicates with the local router over the same IPC path: a Unix domain socket (default `/tmp/ndn-faces.sock`) with an optional shared-memory data plane for high throughput. The management commands use the NFD-compatible control protocol; the data-plane tools use an `AppFace` channel that plugs directly into the forwarding pipeline.
+Every tool in the suite communicates with the local router over the same IPC path: a Unix domain socket (default `/tmp/ndn.sock`) with an optional shared-memory data plane for high throughput. The management commands use the NFD-compatible control protocol; the data-plane tools use an `AppFace` channel that plugs directly into the forwarding pipeline.
 
 ```mermaid
 flowchart LR

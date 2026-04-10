@@ -91,7 +91,7 @@ cost = 10
 
 [management]
 transport = "ndn"
-face_socket = "/tmp/ndn-faces.sock"
+face_socket = "/tmp/ndn.sock"
 
 [logging]
 level = "info"
@@ -324,16 +324,31 @@ ndn-iperf client --prefix /iperf --duration 10
 
 ## Monitoring with ndn-dashboard
 
-The `ndn-dashboard` is a browser-based management UI located at `tools/ndn-dashboard/`. It connects to the router via WebSocket or NDN management protocol and provides real-time views of:
+`ndn-dashboard` is a native desktop application (built with Dioxus) for managing and monitoring NDN routers. It communicates with the router via the NDN management protocol over the face socket.
 
-- **Overview** -- engine status, uptime, packet counters
+```bash
+cargo build -p ndn-dashboard --release
+./target/release/ndn-dashboard
+```
+
+The dashboard provides:
+
+- **Start Router** -- launch `ndn-router` as a managed subprocess with one of:
+  - *Quick Start* (built-in defaults)
+  - *Build Config* -- interactive config builder with startup faces, startup routes, CS settings, and log level
+  - *Load Config File* -- point to an existing TOML file
+  - *Saved Presets* -- one-click relaunch of saved configurations
+- **Overview** -- engine status, packet counters, throughput graphs
 - **Faces** -- active faces with per-face traffic statistics
 - **Routes** -- FIB entries and nexthop costs
 - **Content Store** -- cache occupancy and hit/miss rates
-- **Strategy** -- per-prefix strategy assignments
-- **Discovery** -- neighbor table and service records
+- **Strategy** -- per-prefix forwarding strategy assignments
+- **Config** -- view and edit router configuration; edit startup faces and routes; restart the managed router with an updated config via **↺ Restart with Config**
+- **Logs** -- real-time log viewer with filter and split-pane modes
+- **Tools** -- embedded `ndn-ping`, `ndn-iperf`, `ndn-peek`, and `ndn-put`
+- **Light/Dark mode** -- toggle via the ☀/🌙 button in the toolbar
 
-To use the dashboard, open `tools/ndn-dashboard/index.html` in a browser. Ensure the router has a WebSocket face configured (see the WebSocket face configuration above) or that the dashboard can reach the router's face socket.
+The dashboard connects to the router's face socket (default `/tmp/ndn.sock`). If the router is started through the dashboard, log output is captured in the Logs view automatically.
 
 ## Typical deployment
 

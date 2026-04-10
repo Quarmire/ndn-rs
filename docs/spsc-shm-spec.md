@@ -296,7 +296,7 @@ protocol over a Unix domain socket control channel:
 ```
 App                                  Router
 ───                                  ──────
-connect(/tmp/ndn-faces.sock)    →
+connect(/tmp/ndn.sock)    →
                                      accept → UnixFace (control)
 faces/create {Uri:"shm://{name}"}→
                                      SpscFace::create(id, name)

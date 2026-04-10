@@ -9,7 +9,7 @@ This guide walks through both modes with complete, runnable examples.
 ```mermaid
 graph LR
     subgraph "External router mode"
-        App1["your app"] -->|"Unix socket\n/tmp/ndn-faces.sock"| R["ndn-router process"]
+        App1["your app"] -->|"Unix socket\n/tmp/ndn.sock"| R["ndn-router process"]
         R -->|"UDP / Ethernet"| Net["network"]
     end
 
@@ -42,7 +42,7 @@ use ndn_app::{Consumer, AppError};
 
 #[tokio::main]
 async fn main() -> Result<(), AppError> {
-    let mut consumer = Consumer::connect("/tmp/ndn-faces.sock").await?;
+    let mut consumer = Consumer::connect("/tmp/ndn.sock").await?;
 
     // Fetch raw content bytes — the simplest call.
     let bytes = consumer.get("/example/hello").await?;
@@ -119,7 +119,7 @@ use ndn_packet::{Interest, encode::DataBuilder};
 #[tokio::main]
 async fn main() -> Result<(), AppError> {
     // Register the prefix and start the serve loop.
-    let mut producer = Producer::connect("/tmp/ndn-faces.sock", "/example").await?;
+    let mut producer = Producer::connect("/tmp/ndn.sock", "/example").await?;
 
     producer.serve(|interest: Interest| async move {
         let name = interest.name.to_string();
@@ -228,7 +228,7 @@ use ndn_app::blocking::{BlockingConsumer, BlockingProducer};
 
 // No async, no #[tokio::main].
 fn main() -> Result<(), ndn_app::AppError> {
-    let mut consumer = BlockingConsumer::connect("/tmp/ndn-faces.sock")?;
+    let mut consumer = BlockingConsumer::connect("/tmp/ndn.sock")?;
     let bytes = consumer.get("/example/hello")?;
     println!("{}", String::from_utf8_lossy(&bytes));
     Ok(())
@@ -238,7 +238,7 @@ fn main() -> Result<(), ndn_app::AppError> {
 `BlockingProducer::serve` takes a plain `Fn(Interest) -> Option<Bytes>` with no async:
 
 ```rust
-let mut producer = BlockingProducer::connect("/tmp/ndn-faces.sock", "/sensor")?;
+let mut producer = BlockingProducer::connect("/tmp/ndn.sock", "/sensor")?;
 
 producer.serve(|interest| {
     // Synchronous handler — called on the runtime thread.
@@ -260,7 +260,7 @@ use ndn_app::{Consumer, KeyChain};
 let keychain = KeyChain::load_or_init("/etc/ndn/keys").await?;
 let validator = keychain.validator().await?;
 
-let mut consumer = Consumer::connect("/tmp/ndn-faces.sock").await?;
+let mut consumer = Consumer::connect("/tmp/ndn.sock").await?;
 let safe_data = consumer.fetch_verified("/example/data", &validator).await?;
 
 // safe_data is SafeData — the compiler knows it's been verified.
@@ -279,7 +279,7 @@ For datasets that change over time, `Subscriber` joins an SVS sync group and del
 use ndn_app::{Subscriber, SubscriberConfig};
 
 let mut sub = Subscriber::connect(
-    "/tmp/ndn-faces.sock",
+    "/tmp/ndn.sock",
     "/chat/room1",
     SubscriberConfig::default(),
 ).await?;
@@ -301,7 +301,7 @@ while let Some(sample) = sub.recv().await {
 ```rust
 use ndn_app::{Queryable, AppError};
 
-let mut queryable = Queryable::connect("/tmp/ndn-faces.sock", "/compute").await?;
+let mut queryable = Queryable::connect("/tmp/ndn.sock", "/compute").await?;
 
 while let Some(query) = queryable.recv().await {
     let name = query.interest().name().to_string();
@@ -330,7 +330,7 @@ use tokio::time::sleep;
 
 #[tokio::main]
 async fn main() -> Result<(), AppError> {
-    const SOCKET: &str = "/tmp/ndn-faces.sock";
+    const SOCKET: &str = "/tmp/ndn.sock";
     const PREFIX: &str = "/ndn/sensor/temperature";
 
     // Spawn the producer in a background task.
@@ -419,7 +419,7 @@ async fn main() -> anyhow::Result<()> {
 
     let signer = identity.signer()?;
 
-    let mut producer = Producer::connect("/tmp/ndn-faces.sock", "/ndn/sensor/node42").await?;
+    let mut producer = Producer::connect("/tmp/ndn.sock", "/ndn/sensor/node42").await?;
 
     producer.serve(move |interest: Interest| {
         // Clone the signer Arc for each handler invocation
