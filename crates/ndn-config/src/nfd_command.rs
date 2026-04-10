@@ -98,14 +98,18 @@ pub mod verb {
 /// Build a management command name with embedded ControlParameters.
 ///
 /// Result: `/localhost/nfd/<module>/<verb>/<params-component>`
+///
+/// The ControlParameters name component contains the **full** TLV block
+/// (type 0x68 + length + fields), matching the NFD management protocol spec
+/// and what NFD/ndnd expect.
 pub fn command_name(module: &[u8], verb: &[u8], params: &ControlParameters) -> Name {
-    let params_value = params.encode_value();
+    let params_tlv = params.encode();
     Name::from_components([
         NameComponent::generic(Bytes::from_static(b"localhost")),
         NameComponent::generic(Bytes::from_static(b"nfd")),
         NameComponent::generic(Bytes::copy_from_slice(module)),
         NameComponent::generic(Bytes::copy_from_slice(verb)),
-        NameComponent::generic(params_value),
+        NameComponent::generic(params_tlv),
     ])
 }
 
@@ -151,9 +155,12 @@ pub fn parse_command_name(name: &Name) -> Option<ParsedCommand> {
     let module = comps[2].value.clone();
     let verb = comps[3].value.clone();
 
-    // The 5th component (index 4), if present, is the ControlParameters.
+    // The 5th component (index 4), if present, is the ControlParameters TLV
+    // (full block including the 0x68 type byte, per NFD management spec).
+    // Components beyond index 4 (e.g. ParametersSha256DigestComponent from a
+    // signed Interest) are ignored — the router does not validate signatures.
     let params = if comps.len() >= 5 {
-        ControlParameters::decode_value(comps[4].value.clone()).ok()
+        ControlParameters::decode(comps[4].value.clone()).ok()
     } else {
         None
     };
@@ -187,8 +194,8 @@ mod tests {
         assert_eq!(comps[1].value.as_ref(), b"nfd");
         assert_eq!(comps[2].value.as_ref(), b"rib");
         assert_eq!(comps[3].value.as_ref(), b"register");
-        // 5th component is the encoded ControlParameters value.
-        let decoded = ControlParameters::decode_value(comps[4].value.clone()).unwrap();
+        // 5th component is the full ControlParameters TLV (type 0x68 + length + fields).
+        let decoded = ControlParameters::decode(comps[4].value.clone()).unwrap();
         assert_eq!(decoded.cost, Some(10));
     }
 
