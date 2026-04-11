@@ -96,16 +96,46 @@ impl Subscriber {
         let group = group_prefix.into();
         let client = ForwarderClient::connect(socket)
             .await
-            .map_err(|e| AppError::Engine(e.into()))?;
+            .map_err(AppError::Connection)?;
         client
             .register_prefix(&group)
             .await
-            .map_err(|e| AppError::Engine(e.into()))?;
+            .map_err(AppError::Connection)?;
 
         // Generate a local node name from PID.
         let local_name = group.clone().append(format!("node-{}", std::process::id()));
 
         Self::run(NdnConnection::External(client), group, local_name, config)
+    }
+
+    /// Connect to a router and subscribe to a sync group using **PSync**.
+    ///
+    /// Identical to [`connect`](Self::connect) but uses PSync instead of SVS.
+    /// Use this when peers in the group also use PSync.
+    pub async fn connect_psync(
+        socket: impl AsRef<Path>,
+        group_prefix: impl Into<Name>,
+    ) -> Result<Self, AppError> {
+        Self::connect_psync_with_config(socket, group_prefix, ndn_sync::PSyncConfig::default()).await
+    }
+
+    /// Connect with PSync and explicit configuration.
+    pub async fn connect_psync_with_config(
+        socket: impl AsRef<Path>,
+        group_prefix: impl Into<Name>,
+        psync_config: ndn_sync::PSyncConfig,
+    ) -> Result<Self, AppError> {
+        let group = group_prefix.into();
+        let client = ForwarderClient::connect(socket)
+            .await
+            .map_err(AppError::Connection)?;
+        client
+            .register_prefix(&group)
+            .await
+            .map_err(AppError::Connection)?;
+
+        let local_name = group.clone().append(format!("node-{}", std::process::id()));
+        Self::run_psync(NdnConnection::External(client), group, local_name, psync_config)
     }
 
     /// Create from an in-process connection (embedded engine).
@@ -116,6 +146,81 @@ impl Subscriber {
         config: SubscriberConfig,
     ) -> Result<Self, AppError> {
         Self::run(conn, group, local_name, config)
+    }
+
+    /// Internal: run with PSync protocol.
+    fn run_psync(
+        conn: NdnConnection,
+        group: Name,
+        local_name: Name,
+        psync_config: ndn_sync::PSyncConfig,
+    ) -> Result<Self, AppError> {
+        let _ = local_name; // PSync uses group name, not per-node name
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let capacity = psync_config.channel_capacity;
+        let (sample_tx, sample_rx) = mpsc::channel(capacity);
+
+        let (net_send_tx, mut net_send_rx) = mpsc::channel::<Bytes>(64);
+        let (net_recv_tx, net_recv_rx) = mpsc::channel::<Bytes>(64);
+
+        let mut sync_handle = ndn_sync::join_psync_group(
+            group.clone(),
+            net_send_tx,
+            net_recv_rx,
+            psync_config,
+        );
+
+        let conn = Arc::new(conn);
+
+        let conn_send = Arc::clone(&conn);
+        let cancel_send = cancel.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = cancel_send.cancelled() => break,
+                    Some(pkt) = net_send_rx.recv() => { let _ = conn_send.send(pkt).await; }
+                }
+            }
+        });
+
+        let conn_recv = Arc::clone(&conn);
+        let cancel_recv = cancel.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = cancel_recv.cancelled() => break,
+                    pkt = conn_recv.recv() => match pkt {
+                        Some(raw) => { if raw.first() == Some(&0x05) { let _ = net_recv_tx.send(raw).await; } }
+                        None => break,
+                    }
+                }
+            }
+        });
+
+        let conn_fetch = Arc::clone(&conn);
+        let task_cancel = cancel.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = task_cancel.cancelled() => break,
+                    Some(update) = sync_handle.recv() => {
+                        for seq in update.low_seq..=update.high_seq {
+                            let data_name = update.name.clone().append_segment(seq);
+                            let payload = fetch_data(&conn_fetch, &data_name, Duration::from_secs(4)).await;
+                            let sample = Sample {
+                                name: data_name,
+                                publisher: update.publisher.clone(),
+                                seq,
+                                payload,
+                            };
+                            if sample_tx.send(sample).await.is_err() { return; }
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(Self { sample_rx, _cancel: cancel })
     }
 
     /// Spawn the background tasks that drive the subscription:

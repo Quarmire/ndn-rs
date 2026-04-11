@@ -63,8 +63,15 @@ impl std::str::FromStr for ForwarderConfig {
     type Err = ConfigError;
 
     /// Parse a `ForwarderConfig` from a TOML string.
+    ///
+    /// Expands `${VAR}` environment variable references in string values before
+    /// deserializing. Unknown variables are replaced with an empty string and
+    /// a `tracing::warn!` is emitted.
     fn from_str(s: &str) -> Result<Self, ConfigError> {
-        Ok(toml::from_str(s)?)
+        let expanded = expand_env_vars(s);
+        let cfg: ForwarderConfig = toml::from_str(&expanded)?;
+        cfg.validate()?;
+        Ok(cfg)
     }
 }
 
@@ -75,10 +82,117 @@ impl ForwarderConfig {
         s.parse()
     }
 
+    /// Validate the parsed config for obvious errors.
+    ///
+    /// Called automatically from [`from_str`]. Returns [`ConfigError::Invalid`]
+    /// describing the first problem found.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        // Validate face URIs and addresses.
+        for face in &self.faces {
+            validate_face_config(face)?;
+        }
+
+        // Validate route costs.
+        for route in &self.routes {
+            if route.prefix.is_empty() {
+                return Err(ConfigError::Invalid("route prefix must not be empty".into()));
+            }
+        }
+
+        // Validate CS capacity sanity (> 0 MB when not disabled).
+        if self.engine.cs_capacity_mb > 0 && self.engine.cs_capacity_mb > 65536 {
+            return Err(ConfigError::Invalid(format!(
+                "engine.cs_capacity_mb ({}) is unreasonably large (max 65536 MB)",
+                self.engine.cs_capacity_mb
+            )));
+        }
+
+        Ok(())
+    }
+
     /// Serialize to a TOML string.
     pub fn to_toml_string(&self) -> Result<String, ConfigError> {
         toml::to_string_pretty(self).map_err(|e| ConfigError::Invalid(e.to_string()))
     }
+}
+
+/// Expand `${VAR}` environment variable references in a TOML string.
+///
+/// Each `${VAR}` is replaced with `std::env::var(VAR)`. If the variable is
+/// not set, it is replaced with an empty string and a warning is logged.
+fn expand_env_vars(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '$' && chars.peek() == Some(&'{') {
+            chars.next(); // consume '{'
+            let var_name: String = chars.by_ref().take_while(|&c| c != '}').collect();
+            match std::env::var(&var_name) {
+                Ok(val) => result.push_str(&val),
+                Err(_) => {
+                    // Unknown variable — replace with empty string and warn on stderr.
+                    eprintln!("ndn-config: unknown env var ${{{var_name}}}, replacing with empty string");
+                }
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+    result
+}
+
+/// Validate a single `FaceConfig` for obviously invalid fields.
+fn validate_face_config(face: &FaceConfig) -> Result<(), ConfigError> {
+    match face {
+        FaceConfig::Udp { bind, remote } | FaceConfig::Tcp { bind, remote } => {
+            if let Some(addr) = bind {
+                addr.parse::<std::net::SocketAddr>().map_err(|_| {
+                    ConfigError::Invalid(format!("invalid bind address: {addr}"))
+                })?;
+            }
+            if let Some(addr) = remote {
+                addr.parse::<std::net::SocketAddr>().map_err(|_| {
+                    ConfigError::Invalid(format!("invalid remote address: {addr}"))
+                })?;
+            }
+        }
+        FaceConfig::Multicast { group, port: _, interface: _ } => {
+            let ip: std::net::IpAddr = group.parse().map_err(|_| {
+                ConfigError::Invalid(format!("invalid multicast group address: {group}"))
+            })?;
+            if !ip.is_multicast() {
+                return Err(ConfigError::Invalid(format!(
+                    "multicast group address is not a multicast address: {group}"
+                )));
+            }
+        }
+        FaceConfig::WebSocket { bind, url } => {
+            if let Some(addr) = bind {
+                addr.parse::<std::net::SocketAddr>().map_err(|_| {
+                    ConfigError::Invalid(format!("invalid WebSocket bind address: {addr}"))
+                })?;
+            }
+            if let Some(u) = url {
+                if !u.starts_with("ws://") && !u.starts_with("wss://") {
+                    return Err(ConfigError::Invalid(format!(
+                        "WebSocket URL must start with ws:// or wss://: {u}"
+                    )));
+                }
+            }
+        }
+        FaceConfig::Serial { path, baud } => {
+            if path.is_empty() {
+                return Err(ConfigError::Invalid("serial face path must not be empty".into()));
+            }
+            if *baud == 0 {
+                return Err(ConfigError::Invalid("serial face baud rate must be > 0".into()));
+            }
+        }
+        FaceConfig::Unix { .. } | FaceConfig::EtherMulticast { .. } => {
+            // No additional validation needed for these face types.
+        }
+    }
+    Ok(())
 }
 
 /// Content store configuration.

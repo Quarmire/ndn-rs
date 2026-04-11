@@ -5,6 +5,9 @@ use std::sync::Arc;
 
 use ndn_packet::Name;
 
+use ndn_packet::SignatureType;
+use ndn_packet::encode::{DataBuilder, InterestBuilder};
+
 use crate::{
     CertCache, Certificate, SecurityManager, Signer, TrustError, TrustSchema, Validator,
 };
@@ -165,6 +168,90 @@ impl KeyChain {
     /// before validation.
     pub fn cert_cache(&self) -> &CertCache {
         self.mgr.cert_cache()
+    }
+
+    /// Build a [`Validator`] that trusts only certificates issued under `anchor_prefix`.
+    ///
+    /// Shorthand for creating a consumer-side validator when you know the
+    /// trust-anchor prefix and don't need a full KeyChain. For example, to
+    /// accept Data signed by any certificate under `/ndn/testbed`:
+    ///
+    /// ```rust
+    /// use ndn_security::KeyChain;
+    ///
+    /// let validator = KeyChain::trust_only("/ndn/testbed").unwrap();
+    /// ```
+    ///
+    /// Uses [`TrustSchema::hierarchical`] so the Data name must be a sub-name
+    /// of the signing certificate prefix.
+    pub fn trust_only(anchor_prefix: impl AsRef<str>) -> Result<Validator, TrustError> {
+        let prefix: Name = anchor_prefix
+            .as_ref()
+            .parse()
+            .map_err(|_| TrustError::KeyStore(format!("invalid prefix: {}", anchor_prefix.as_ref())))?;
+        let kc = Self::ephemeral(anchor_prefix.as_ref())?;
+        let v = Validator::new(TrustSchema::hierarchical());
+        // Register the self-signed certificate as the trust anchor.
+        for anchor_name in kc.mgr.trust_anchor_names() {
+            if anchor_name.to_string().starts_with(&prefix.to_string()) {
+                if let Some(cert) = kc.mgr.trust_anchor(&anchor_name) {
+                    v.cert_cache().insert(cert);
+                }
+            }
+        }
+        Ok(v)
+    }
+
+    /// Sign a Data packet using this KeyChain's signing key.
+    ///
+    /// Returns the encoded, signed Data wire bytes. Uses Ed25519 with the
+    /// key locator set to this identity's key name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustError`] if the signing key is not available.
+    pub fn sign_data(&self, builder: DataBuilder) -> Result<bytes::Bytes, TrustError> {
+        let signer = self.signer()?;
+        let key_name = self.key_name.clone();
+        Ok(builder.sign_sync(
+            SignatureType::SignatureEd25519,
+            Some(&key_name),
+            |region| {
+                signer
+                    .sign_sync(region)
+                    .unwrap_or_default()
+            },
+        ))
+    }
+
+    /// Sign an Interest using this KeyChain's signing key.
+    ///
+    /// Returns the encoded, signed Interest wire bytes. Uses Ed25519 with the
+    /// key locator set to this identity's key name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustError`] if the signing key is not available.
+    pub fn sign_interest(&self, builder: InterestBuilder) -> Result<bytes::Bytes, TrustError> {
+        let signer = self.signer()?;
+        let key_name = self.key_name.clone();
+        Ok(builder.sign_sync(
+            SignatureType::SignatureEd25519,
+            Some(&key_name),
+            |region| {
+                signer
+                    .sign_sync(region)
+                    .unwrap_or_default()
+            },
+        ))
+    }
+
+    /// Build a [`Validator`] pre-configured with this identity's trust anchors.
+    ///
+    /// Alias for [`validator`](Self::validator). Provided for API symmetry with
+    /// the `trust_only` constructor.
+    pub fn build_validator(&self) -> Validator {
+        self.validator()
     }
 
     // ── Escape hatch ─────────────────────────────────────────────────────────

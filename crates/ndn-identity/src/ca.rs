@@ -126,15 +126,19 @@ impl NdncertCa {
     /// Serve NDNCERT requests using the provided Producer.
     ///
     /// This method runs indefinitely (until the Producer is dropped or errors).
-    pub async fn serve(self, mut producer: ndn_app::Producer) -> Result<(), IdentityError> {
+    pub async fn serve(self, producer: ndn_app::Producer) -> Result<(), IdentityError> {
         let state = self.state.clone();
         let ca_prefix = self.prefix.clone();
 
         producer
-            .serve(move |interest| {
+            .serve(move |interest, responder| {
                 let state = state.clone();
                 let ca_prefix = ca_prefix.clone();
-                async move { handle_interest(&state, &ca_prefix, interest).await }
+                async move {
+                    if let Some(wire) = handle_interest(&state, &ca_prefix, interest).await {
+                        responder.respond_bytes(wire).await.ok();
+                    }
+                }
             })
             .await?;
 

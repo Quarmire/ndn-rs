@@ -25,7 +25,7 @@ pub struct BlockingConsumer {
 impl BlockingConsumer {
     /// Connect to an external router (blocking).
     pub fn connect(socket: impl AsRef<Path>) -> Result<Self, AppError> {
-        let rt = Runtime::new().map_err(|e| AppError::Engine(e.into()))?;
+        let rt = Runtime::new().map_err(|e| AppError::Protocol(e.to_string()))?;
         let inner = rt.block_on(super::Consumer::connect(socket))?;
         Ok(Self { rt, inner })
     }
@@ -59,19 +59,27 @@ pub struct BlockingProducer {
 impl BlockingProducer {
     /// Connect to an external router and register a prefix (blocking).
     pub fn connect(socket: impl AsRef<Path>, prefix: impl Into<Name>) -> Result<Self, AppError> {
-        let rt = Runtime::new().map_err(|e| AppError::Engine(e.into()))?;
+        let rt = Runtime::new().map_err(|e| AppError::Protocol(e.to_string()))?;
         let inner = rt.block_on(super::Producer::connect(socket, prefix))?;
         Ok(Self { rt, inner })
     }
 
     /// Run the producer loop with a sync handler (blocking).
+    ///
+    /// The handler receives each Interest and returns `Some(wire_data)` to
+    /// respond or `None` to silently drop. For Nack replies, use
+    /// [`Producer::serve`](crate::Producer::serve) with the async `Responder` API.
     pub fn serve<F>(&mut self, handler: F) -> Result<(), AppError>
     where
         F: Fn(ndn_packet::Interest) -> Option<Bytes> + Send + Sync + 'static,
     {
-        self.rt.block_on(self.inner.serve(move |interest| {
+        self.rt.block_on(self.inner.serve(move |interest, responder| {
             let result = handler(interest);
-            async move { result }
+            async move {
+                if let Some(wire) = result {
+                    responder.respond_bytes(wire).await.ok();
+                }
+            }
         }))
     }
 }

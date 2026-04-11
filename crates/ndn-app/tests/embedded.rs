@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
-use ndn_faces::local::AppFace;
+use ndn_faces::local::InProcFace;
 use ndn_packet::Name;
 use ndn_packet::encode::DataBuilder;
 use ndn_transport::FaceId;
@@ -20,8 +20,8 @@ use ndn_engine::EngineConfig;
 #[tokio::test]
 async fn embedded_consumer_producer() {
     // 1. Create two AppFace pairs: one for the consumer, one for the producer.
-    let (consumer_face, consumer_handle) = AppFace::new(FaceId(1), 64);
-    let (producer_face, producer_handle) = AppFace::new(FaceId(2), 64);
+    let (consumer_face, consumer_handle) = InProcFace::new(FaceId(1), 64);
+    let (producer_face, producer_handle) = InProcFace::new(FaceId(2), 64);
 
     // 2. Build the forwarding engine with both faces.
     let (engine, shutdown) = EngineBuilder::new(EngineConfig::default())
@@ -42,11 +42,11 @@ async fn embedded_consumer_producer() {
     // 5. Run producer in a background task.
     let producer_task = tokio::spawn(async move {
         producer
-            .serve(|interest| {
+            .serve(|interest, responder| {
                 let name = (*interest.name).clone();
                 async move {
                     let wire = DataBuilder::new(name, b"hello from producer").build();
-                    Some(wire)
+                    responder.respond_bytes(wire).await.ok();
                 }
             })
             .await
@@ -71,8 +71,8 @@ async fn embedded_consumer_producer() {
 /// Test fetching multiple packets sequentially.
 #[tokio::test]
 async fn embedded_multiple_fetches() {
-    let (consumer_face, consumer_handle) = AppFace::new(FaceId(1), 64);
-    let (producer_face, producer_handle) = AppFace::new(FaceId(2), 64);
+    let (consumer_face, consumer_handle) = InProcFace::new(FaceId(1), 64);
+    let (producer_face, producer_handle) = InProcFace::new(FaceId(2), 64);
 
     let (engine, shutdown) = EngineBuilder::new(EngineConfig::default())
         .face(consumer_face)
@@ -92,13 +92,13 @@ async fn embedded_multiple_fetches() {
 
     let producer_task = tokio::spawn(async move {
         producer
-            .serve(move |interest| {
+            .serve(move |interest, responder| {
                 let name = (*interest.name).clone();
                 let n = counter_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 async move {
                     let payload = n.to_be_bytes();
                     let wire = DataBuilder::new(name, &payload).build();
-                    Some(wire)
+                    responder.respond_bytes(wire).await.ok();
                 }
             })
             .await
@@ -122,8 +122,8 @@ async fn embedded_multiple_fetches() {
 /// Test the raw `get()` convenience method.
 #[tokio::test]
 async fn embedded_consumer_get() {
-    let (consumer_face, consumer_handle) = AppFace::new(FaceId(1), 64);
-    let (producer_face, producer_handle) = AppFace::new(FaceId(2), 64);
+    let (consumer_face, consumer_handle) = InProcFace::new(FaceId(1), 64);
+    let (producer_face, producer_handle) = InProcFace::new(FaceId(2), 64);
 
     let (engine, shutdown) = EngineBuilder::new(EngineConfig::default())
         .face(consumer_face)
@@ -140,9 +140,12 @@ async fn embedded_consumer_get() {
 
     tokio::spawn(async move {
         producer
-            .serve(|interest| {
+            .serve(|interest, responder| {
                 let name = (*interest.name).clone();
-                async move { Some(DataBuilder::new(name, b"raw bytes").build()) }
+                async move {
+                    let wire = DataBuilder::new(name, b"raw bytes").build();
+                    responder.respond_bytes(wire).await.ok();
+                }
             })
             .await
     });

@@ -62,11 +62,11 @@ impl Queryable {
         let prefix = prefix.into();
         let client = ForwarderClient::connect(socket)
             .await
-            .map_err(|e| AppError::Engine(e.into()))?;
+            .map_err(AppError::Connection)?;
         client
             .register_prefix(&prefix)
             .await
-            .map_err(|e| AppError::Engine(e.into()))?;
+            .map_err(AppError::Connection)?;
         Ok(Self {
             conn: Arc::new(NdnConnection::External(client)),
             prefix,
