@@ -46,6 +46,7 @@ pub mod origin {
     pub const AUTOREG: u64 = 64;
     pub const CLIENT: u64 = 65;
     pub const AUTOCONF: u64 = 66;
+    pub const DVR: u64 = 127;
     pub const NLSR: u64 = 128;
     pub const PREFIX_ANN: u64 = 129;
     pub const STATIC: u64 = 255;
