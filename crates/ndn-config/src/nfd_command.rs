@@ -23,6 +23,7 @@ pub mod module {
     pub const FACES: &[u8] = b"faces";
     pub const FIB: &[u8] = b"fib";
     pub const RIB: &[u8] = b"rib";
+    pub const ROUTING: &[u8] = b"routing";
     pub const CS: &[u8] = b"cs";
     pub const STRATEGY: &[u8] = b"strategy-choice";
     pub const STATUS: &[u8] = b"status";
