@@ -142,6 +142,28 @@ The RIB stores `RibRoute { face_id, origin, cost, flags, expires_at }` per `(pre
 - **Face teardown**: `rib.handle_face_down(face_id, fib)` is called automatically when a face goes down, flushing routes via that face and recomputing affected FIB entries.
 - **FIB derivation**: for each unique `face_id`, the lowest-cost route across all origins wins. Equal-cost ties break by lowest origin value.
 
+## Runtime Configuration
+
+`DvrProtocol` exposes two parameters that can be changed while the router is running without a restart:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `update_interval` | 30 s | How often DVR broadcasts its distance vector |
+| `route_ttl` | 90 s | Expiry time for DVR-learned routes if not refreshed |
+
+Both are stored in an `Arc<RwLock<DvrConfig>>` shared between the running protocol and the management handler. The management socket exposes them via:
+
+```
+# Read current values
+/localhost/nfd/routing/dvr-status   (status dataset)
+
+# Apply new values (URL query string in ControlParameters.Uri)
+/localhost/nfd/routing/dvr-config   (command)
+# e.g. Uri = "update_interval_ms=15000&route_ttl_ms=45000"
+```
+
+The ndn-dashboard **Routing** panel provides a GUI for these controls.
+
 ## See Also
 
 - [Implementing a Routing Protocol](../guides/implementing-routing-protocol.md) — developer guide

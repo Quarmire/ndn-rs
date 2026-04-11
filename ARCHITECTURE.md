@@ -16,6 +16,7 @@ Layer 1 — Engine & Application
   ndn-ipc             IPC client/server, chunked transfer, service registry
   ndn-config          TOML config parsing, NFD management protocol
   ndn-discovery       Pluggable neighbor (SWIM) and service discovery
+  ndn-routing         Pluggable routing protocols: StaticProtocol, DvrProtocol (DVR)
 
 Layer 2 — Pipeline, Strategy, Security
   ndn-pipeline        PipelineStage trait, PacketContext, Action enum
@@ -59,6 +60,7 @@ Dependencies flow strictly downward. `ndn-tlv` and `ndn-packet` compile `no_std`
 | `ContentStore` | ndn-store | Pluggable cache backend |
 | `Signer` / `Verifier` | ndn-security | Cryptographic operations |
 | `DiscoveryProtocol` | ndn-discovery | Neighbor/service discovery |
+| `RoutingProtocol` | ndn-routing | RIB population from routing algorithms |
 | `ComputeHandler` | ndn-compute | Named function execution |
 
 ## Pipeline Flow
@@ -104,6 +106,7 @@ expiry_task → drains expired PIT entries (1 ms tick)
 | [`docs/security.md`](docs/security.md) | Signing, trust schema, SafeData |
 | [`docs/ipc.md`](docs/ipc.md) | Transport tiers, chunked transfer, service registry |
 | [`docs/discovery.md`](docs/discovery.md) | SWIM protocol, service discovery |
+| [`docs/protocols/routing.md`](docs/protocols/routing.md) | DVR algorithm, static routes, RIB lifecycle |
 | [`docs/wireless.md`](docs/wireless.md) | Multi-radio, nl80211, wfb-ng |
 | [`docs/compute.md`](docs/compute.md) | In-network compute levels |
 | [`docs/spsc-shm-spec.md`](docs/spsc-shm-spec.md) | Shared memory ring buffer spec |

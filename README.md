@@ -84,6 +84,7 @@ The [`ARCHITECTURE.md`](ARCHITECTURE.md) file has a crate map and dependency lay
 | `ndn-ipc` | RouterClient, ChunkedTransfer, ServiceRegistry |
 | `ndn-config` | TOML config, NFD management protocol |
 | `ndn-discovery` | SWIM neighbor discovery, epidemic gossip, SVS service discovery |
+| `ndn-routing` | Pluggable routing protocols: `StaticProtocol`, `DvrProtocol` (Bellman-Ford DVR) |
 | `ndn-sync` | SVS and PSync dataset synchronisation |
 | `ndn-face-net` | UDP, TCP, Multicast, WebSocket |
 | `ndn-face-local` | AppFace, UnixFace, SHM (SpscFace) |

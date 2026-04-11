@@ -272,3 +272,35 @@ When Node B eventually disappears (its face goes down, or its neighbor entry tra
 The current discovery layers provide link-local neighbor detection and one-hop (or relayed) service discovery. This is sufficient for many deployments -- a local mesh of ndn-routers can fully self-organize using just these two layers.
 
 Network-wide routing will build on this foundation, using the neighbor table as the link-state database input. The gossip infrastructure (SVS gossip, epidemic gossip) in `ndn-discovery` provides the dissemination substrate. The vision is a system where discovery scales seamlessly from a two-node setup to a continent-spanning network, with the same protocols operating at every level.
+
+
+## Runtime Configuration
+
+The `HelloProtocol` parameters can be tuned while the router is running without a restart. All fields are stored in an `Arc<RwLock<DiscoveryConfig>>` shared between the running protocol and the management handler.
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `hello_interval_base` | 5 s | Minimum hello period (backoff starts here) |
+| `hello_interval_max` | 20 s | Maximum hello period after full back-off |
+| `liveness_miss_count` | 3 | Missed hellos before a neighbor turns Stale |
+| `gossip_fanout` | 2 | Neighbors contacted per gossip tick |
+| `swim_indirect_fanout` | 2 | SWIM indirect probe targets (0 = disable probing) |
+
+The management socket exposes these via:
+
+```
+# Read current values
+/localhost/nfd/discovery/status    (status dataset)
+
+# Apply new values (URL query string in ControlParameters.Uri)
+/localhost/nfd/discovery/config    (command)
+# e.g. Uri = "hello_interval_base_ms=3000&gossip_fanout=3"
+```
+
+The ndn-dashboard **Fleet** panel provides a GUI for these controls, including preset profiles (Static, LAN, Campus, Mobile, HighMobility).
+
+## See Also
+
+- [Routing Protocols](./routing-protocols.md) — how discovery feeds the RIB via DVR
+- [Implementing a Discovery Protocol](../guides/implementing-discovery.md) — developer guide
+- [Fleet and Swarm Security](../guides/fleet-security.md) — trust bootstrap for discovered neighbors
