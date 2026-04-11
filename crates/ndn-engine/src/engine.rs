@@ -18,6 +18,8 @@ use crate::discovery_context::EngineDiscoveryContext;
 
 use crate::stages::ErasedStrategy;
 
+use crate::rib::Rib;
+use crate::routing::RoutingManager;
 use crate::Fib;
 use crate::dispatcher::InboundPacket;
 
@@ -125,6 +127,8 @@ impl FaceState {
 /// Shared tables owned by the engine, accessible to all tasks via `Arc`.
 pub struct EngineInner {
     pub fib: Arc<Fib>,
+    pub rib: Arc<Rib>,
+    pub routing: Arc<RoutingManager>,
     pub pit: Arc<Pit>,
     pub cs: Arc<dyn ErasedContentStore>,
     pub face_table: Arc<FaceTable>,
@@ -162,6 +166,14 @@ pub struct ForwarderEngine {
 impl ForwarderEngine {
     pub fn fib(&self) -> Arc<Fib> {
         Arc::clone(&self.inner.fib)
+    }
+
+    pub fn rib(&self) -> Arc<Rib> {
+        Arc::clone(&self.inner.rib)
+    }
+
+    pub fn routing(&self) -> Arc<RoutingManager> {
+        Arc::clone(&self.inner.routing)
     }
 
     pub fn faces(&self) -> Arc<FaceTable> {
@@ -276,6 +288,7 @@ impl ForwarderEngine {
                 cancel: cancel.clone(),
                 face_table: Arc::clone(&self.inner.face_table),
                 fib: Arc::clone(&self.inner.fib),
+                rib: Arc::clone(&self.inner.rib),
                 face_states: Arc::clone(&self.inner.face_states),
                 discovery: Arc::clone(&discovery),
                 discovery_ctx: Arc::clone(&discovery_ctx),
@@ -296,6 +309,7 @@ impl ForwarderEngine {
                 cancel,
                 face_table: Arc::clone(&self.inner.face_table),
                 fib: Arc::clone(&self.inner.fib),
+                rib: Arc::clone(&self.inner.rib),
                 face_states: Arc::clone(&self.inner.face_states),
                 discovery: Arc::clone(&discovery),
                 discovery_ctx,
@@ -350,6 +364,7 @@ impl ForwarderEngine {
                 cancel,
                 face_table: Arc::clone(&self.inner.face_table),
                 fib: Arc::clone(&self.inner.fib),
+                rib: Arc::clone(&self.inner.rib),
                 face_states: Arc::clone(&self.inner.face_states),
                 discovery: Arc::clone(&discovery),
                 discovery_ctx: Arc::clone(&discovery_ctx),
@@ -465,6 +480,7 @@ pub(crate) async fn run_face_sender(
         cancel,
         face_table,
         fib,
+        rib,
         face_states,
         discovery,
         discovery_ctx,
@@ -492,6 +508,7 @@ pub(crate) async fn run_face_sender(
                     if let Some((_, state)) = face_states.remove(&face_id) {
                         state.cancel.cancel();
                     }
+                    rib.handle_face_down(face_id, &fib);
                     fib.remove_face(face_id);
                     face_table.remove(face_id);
                 }

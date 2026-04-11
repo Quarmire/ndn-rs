@@ -21,6 +21,8 @@ use crate::{
     dispatcher::PacketDispatcher,
     engine::{EngineInner, ShutdownHandle},
     enricher::ContextEnricher,
+    rib::Rib,
+    routing::{RoutingManager, RoutingProtocol},
     stages::{
         CsInsertStage, CsLookupStage, ErasedStrategy, PitCheckStage, PitMatchStage, StrategyStage,
         TlvDecodeStage, ValidationStage,
@@ -67,6 +69,7 @@ pub struct EngineBuilder {
     cs_observer: Option<Arc<dyn CsObserver>>,
     security_profile: SecurityProfile,
     discovery: Option<Arc<dyn DiscoveryProtocol>>,
+    routing_protocols: Vec<Arc<dyn RoutingProtocol>>,
 }
 
 impl EngineBuilder {
@@ -83,6 +86,7 @@ impl EngineBuilder {
             cs_observer: None,
             security_profile: SecurityProfile::Default,
             discovery: None,
+            routing_protocols: Vec::new(),
         }
     }
 
@@ -174,6 +178,17 @@ impl EngineBuilder {
         self
     }
 
+    /// Register a routing protocol to start when the engine is built.
+    ///
+    /// Multiple protocols can be registered; each must use a distinct `origin`
+    /// value. They run as independent Tokio tasks and all write routes into the
+    /// shared RIB. Use [`ForwarderEngine::routing`] after `build()` to enable
+    /// or disable protocols dynamically at runtime.
+    pub fn routing_protocol<P: RoutingProtocol>(mut self, proto: P) -> Self {
+        self.routing_protocols.push(Arc::new(proto));
+        self
+    }
+
     /// Register a cross-layer context enricher.
     ///
     /// Enrichers are called before every strategy invocation to populate
@@ -187,6 +202,7 @@ impl EngineBuilder {
     /// Build the engine, spawn all tasks, and return handles.
     pub async fn build(self) -> Result<(ForwarderEngine, ShutdownHandle)> {
         let fib = Arc::new(Fib::new());
+        let rib = Arc::new(Rib::new());
         let pit = Arc::new(Pit::new());
         let base_cs: Arc<dyn ErasedContentStore> = self
             .cs
@@ -216,6 +232,16 @@ impl EngineBuilder {
             });
         }
 
+        // RIB expiry task — drains expired routes and recomputes affected FIB entries.
+        {
+            let rib_clone = Arc::clone(&rib);
+            let fib_clone = Arc::clone(&fib);
+            let cancel_clone = cancel.clone();
+            tasks.spawn(async move {
+                crate::expiry::run_rib_expiry_task(rib_clone, fib_clone, cancel_clone).await;
+            });
+        }
+
         // Build strategy table with the default strategy at root.
         let default_strategy: Arc<dyn ErasedStrategy> = self
             .strategy
@@ -234,12 +260,23 @@ impl EngineBuilder {
             self.discovery.unwrap_or_else(|| Arc::new(NoDiscovery));
         let neighbors = NeighborTable::new();
 
+        // Routing manager — owns the RIB→FIB pipeline and running protocols.
+        let routing = Arc::new(RoutingManager::new(
+            Arc::clone(&rib),
+            Arc::clone(&fib),
+            Arc::clone(&face_table),
+            Arc::clone(&neighbors),
+            cancel.clone(),
+        ));
+
         // Build EngineInner first. `pipeline_tx` is a `OnceLock` so we can
         // set it after `PacketDispatcher::spawn()` returns the sender, after
         // the Arc<EngineInner> is already created (needed for the discovery
         // context Weak back-reference).
         let inner = Arc::new(EngineInner {
             fib: Arc::clone(&fib),
+            rib: Arc::clone(&rib),
+            routing: Arc::clone(&routing),
             pit: Arc::clone(&pit),
             cs: Arc::clone(&cs),
             face_table: Arc::clone(&face_table),
@@ -265,6 +302,7 @@ impl EngineBuilder {
         let dispatcher = PacketDispatcher {
             face_table: Arc::clone(&face_table),
             face_states: Arc::clone(&face_states),
+            rib: Arc::clone(&rib),
             decode: TlvDecodeStage {
                 face_table: Arc::clone(&face_table),
                 reassembly: dashmap::DashMap::new(),
@@ -314,6 +352,7 @@ impl EngineBuilder {
             let face_states_clone = Arc::clone(&face_states);
             let face_table_clone = Arc::clone(&face_table);
             let fib_clone = Arc::clone(&fib);
+            let rib_clone = Arc::clone(&rib);
             let cancel_clone = cancel.clone();
             let d = Arc::clone(&discovery);
             let ctx = Arc::clone(&discovery_ctx);
@@ -322,6 +361,7 @@ impl EngineBuilder {
                     face_states_clone,
                     face_table_clone,
                     fib_clone,
+                    rib_clone,
                     cancel_clone,
                     d,
                     ctx,
@@ -353,6 +393,11 @@ impl EngineBuilder {
         // Notify discovery about faces registered before build().
         for face_id in face_table.face_ids() {
             discovery.on_face_up(face_id, &*discovery_ctx);
+        }
+
+        // Start any routing protocols registered before build().
+        for proto in self.routing_protocols {
+            routing.enable(proto);
         }
 
         let engine = ForwarderEngine { inner };

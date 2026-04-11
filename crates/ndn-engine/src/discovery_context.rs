@@ -124,6 +124,7 @@ impl DiscoveryContext for EngineDiscoveryContext {
                     cancel: cancel.clone(),
                     face_table: Arc::clone(&inner.face_table),
                     fib: Arc::clone(&inner.fib),
+                    rib: Arc::clone(&inner.rib),
                     face_states: Arc::clone(&inner.face_states),
                     discovery: d,
                     discovery_ctx: ctx,
@@ -148,6 +149,7 @@ impl DiscoveryContext for EngineDiscoveryContext {
                 cancel,
                 face_table: Arc::clone(&inner.face_table),
                 fib: Arc::clone(&inner.fib),
+                rib: Arc::clone(&inner.rib),
                 face_states: Arc::clone(&inner.face_states),
                 discovery,
                 discovery_ctx,
@@ -165,6 +167,7 @@ impl DiscoveryContext for EngineDiscoveryContext {
         if let Some((_, state)) = inner.face_states.remove(&face_id) {
             state.cancel.cancel();
         }
+        inner.rib.handle_face_down(face_id, &inner.fib);
         inner.fib.remove_face(face_id);
         inner.face_table.remove(face_id);
     }

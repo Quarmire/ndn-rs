@@ -9,6 +9,7 @@ use ndn_store::Pit;
 use ndn_transport::{FaceId, FaceKind, FacePersistency, FaceTable};
 
 use crate::Fib;
+use crate::rib::Rib;
 use crate::discovery_context::EngineDiscoveryContext;
 use crate::engine::FaceState;
 
@@ -31,6 +32,30 @@ pub async fn run_expiry_task(pit: Arc<Pit>, cancel: CancellationToken) {
     }
 }
 
+/// Background task that drains expired RIB entries and recomputes affected FIB
+/// entries.
+///
+/// Runs every second. Route lifetimes are registered by routing protocols and
+/// apps via `expiration_period` in RIB register commands; this task purges them
+/// when they lapse and keeps the FIB converged.
+pub async fn run_rib_expiry_task(rib: Arc<Rib>, fib: Arc<Fib>, cancel: CancellationToken) {
+    let interval = Duration::from_secs(1);
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            _ = tokio::time::sleep(interval) => {
+                let affected = rib.drain_expired();
+                if !affected.is_empty() {
+                    tracing::debug!(count = affected.len(), "RIB entries expired");
+                    for prefix in &affected {
+                        rib.apply_to_fib(prefix, &fib);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Default idle timeout for on-demand faces (5 minutes).
 const IDLE_TIMEOUT_NS: u64 = 5 * 60 * 1_000_000_000;
 
@@ -45,6 +70,7 @@ pub async fn run_idle_face_task(
     face_states: Arc<DashMap<FaceId, FaceState>>,
     face_table: Arc<FaceTable>,
     fib: Arc<Fib>,
+    rib: Arc<Rib>,
     cancel: CancellationToken,
     discovery: Arc<dyn DiscoveryProtocol>,
     discovery_ctx: Arc<EngineDiscoveryContext>,
@@ -95,6 +121,9 @@ pub async fn run_idle_face_task(
                     if let Some((_, state)) = face_states.remove(&face_id) {
                         state.cancel.cancel();
                     }
+                    // Flush RIB routes before FIB so apply_to_fib can recompute
+                    // from remaining routes. fib.remove_face handles discovery routes.
+                    rib.handle_face_down(face_id, &fib);
                     fib.remove_face(face_id);
                     face_table.remove(face_id);
                     tracing::debug!(face=%face_id, "idle on-demand face removed");

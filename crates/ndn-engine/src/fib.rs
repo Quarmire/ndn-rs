@@ -61,6 +61,23 @@ impl Fib {
         self.trie.dump()
     }
 
+    /// Remove the entry for `prefix` entirely, regardless of nexthops.
+    pub fn remove_prefix(&self, prefix: &Name) {
+        self.trie.remove(prefix);
+    }
+
+    /// Atomically replace all nexthops for `prefix`.
+    ///
+    /// Used by the RIB to apply computed nexthops. If `nexthops` is empty the
+    /// entry is removed.
+    pub fn set_nexthops(&self, prefix: &Name, nexthops: Vec<FibNexthop>) {
+        if nexthops.is_empty() {
+            self.trie.remove(prefix);
+        } else {
+            self.trie.insert(prefix, Arc::new(FibEntry { nexthops }));
+        }
+    }
+
     /// Remove all nexthops pointing to `face_id` across all prefixes.
     ///
     /// Called when a face is closed to prevent stale routes from accumulating.

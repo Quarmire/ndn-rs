@@ -14,6 +14,7 @@ use ndn_transport::{FaceId, FaceKind, FacePersistency, FaceTable};
 
 use crate::discovery_context::EngineDiscoveryContext;
 use crate::engine::{self, DEFAULT_SEND_QUEUE_CAP, FaceState};
+use crate::rib::Rib;
 
 use crate::stages::{
     CsInsertStage, CsLookupStage, PitCheckStage, PitMatchStage, StrategyStage, TlvDecodeStage,
@@ -29,6 +30,7 @@ pub(crate) struct FaceRunnerCtx {
     pub(crate) cancel: CancellationToken,
     pub(crate) face_table: Arc<FaceTable>,
     pub(crate) fib: Arc<crate::Fib>,
+    pub(crate) rib: Arc<Rib>,
     pub(crate) face_states: Arc<dashmap::DashMap<FaceId, FaceState>>,
     pub(crate) discovery: Arc<dyn DiscoveryProtocol>,
     pub(crate) discovery_ctx: Arc<EngineDiscoveryContext>,
@@ -59,6 +61,7 @@ pub(crate) struct InboundPacket {
 pub struct PacketDispatcher {
     pub face_table: Arc<FaceTable>,
     pub face_states: Arc<dashmap::DashMap<FaceId, FaceState>>,
+    pub rib: Arc<Rib>,
     pub decode: TlvDecodeStage,
     pub cs_lookup: CsLookupStage,
     pub pit_check: PitCheckStage,
@@ -117,6 +120,7 @@ impl PacketDispatcher {
                     let fs = Arc::clone(&dispatcher.face_states);
                     let ft = Arc::clone(&dispatcher.face_table);
                     let fib = Arc::clone(&dispatcher.strategy.fib);
+                    let rib = Arc::clone(&dispatcher.rib);
                     tasks.spawn(engine::run_face_sender(
                         send_face,
                         send_rx,
@@ -126,6 +130,7 @@ impl PacketDispatcher {
                             cancel: send_cancel,
                             face_table: ft,
                             fib,
+                            rib,
                             face_states: fs,
                             discovery: Arc::clone(&dispatcher.discovery),
                             discovery_ctx: Arc::clone(&dispatcher.discovery_ctx),
@@ -140,6 +145,7 @@ impl PacketDispatcher {
                     cancel: cancel.clone(),
                     face_table: Arc::clone(&dispatcher.face_table),
                     fib: Arc::clone(&dispatcher.strategy.fib),
+                    rib: Arc::clone(&dispatcher.rib),
                     face_states: Arc::clone(&dispatcher.face_states),
                     discovery: Arc::clone(&dispatcher.discovery),
                     discovery_ctx: Arc::clone(&dispatcher.discovery_ctx),

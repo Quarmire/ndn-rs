@@ -37,6 +37,7 @@ pub(crate) async fn run_face_reader(
         cancel,
         face_table,
         fib,
+        rib,
         face_states,
         discovery,
         discovery_ctx,
@@ -176,6 +177,8 @@ pub(crate) async fn run_face_reader(
                 if let Some((_, state)) = face_states.remove(&face_id) {
                     state.cancel.cancel();
                 }
+                // Flush RIB-managed routes, then remove discovery-managed routes.
+                rib.handle_face_down(face_id, &fib);
                 fib.remove_face(face_id);
                 face_table.remove(face_id);
                 debug!(face=%face_id, "on-demand face removed from table (FIB routes cleaned)");
