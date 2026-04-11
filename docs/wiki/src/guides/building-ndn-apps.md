@@ -255,10 +255,14 @@ The blocking API is a good fit for Python extensions (`ndn-python` uses it inter
 `Consumer::fetch_verified` validates the Data's signature against a trust schema before returning it. The result is `SafeData` — a newtype that the compiler uses to enforce that only verified data reaches security-sensitive code.
 
 ```rust
-use ndn_app::{Consumer, KeyChain};
+use ndn_app::Consumer;
+use ndn_security::KeyChain;
 
-let keychain = KeyChain::load_or_init("/etc/ndn/keys").await?;
-let validator = keychain.validator().await?;
+let keychain = KeyChain::open_or_create(
+    std::path::Path::new("/etc/ndn/keys"),
+    "/com/example/app",
+)?;
+let validator = keychain.validator();
 
 let mut consumer = Consumer::connect("/tmp/ndn.sock").await?;
 let safe_data = consumer.fetch_verified("/example/data", &validator).await?;
@@ -441,9 +445,9 @@ async fn main() -> anyhow::Result<()> {
 fn read_sensor() -> f32 { 23.5 }
 ```
 
-### Using the SecurityManager Directly
+### Advanced: Custom Validator
 
-`identity.security_manager()` gives access to the full `SecurityManager` for advanced scenarios: adding additional trust anchors, configuring custom trust schemas, or inspecting the certificate chain.
+`NdnIdentity` implements `Deref<Target = KeyChain>`, so all `KeyChain` methods are available directly. For advanced scenarios — custom trust schemas, adding external trust anchors — use `manager_arc()` to access the underlying `SecurityManager`:
 
 ```rust
 use ndn_identity::NdnIdentity;
@@ -455,20 +459,19 @@ let identity = NdnIdentity::open_or_create(
     "/example/app",
 ).await?;
 
-// Get the underlying SecurityManager for full control
-let mgr = identity.security_manager();
+// NdnIdentity Derefs to KeyChain — signer() and validator() are available directly
+let signer = identity.signer()?;
 
-// Build a custom validator with a specific trust schema
+// For advanced access, use manager_arc()
+let mgr = identity.manager_arc();
 let my_cert = mgr.get_certificate()?;
-let validator = Validator::builder()
-    .trust_anchor(my_cert)
-    .schema(TrustSchema::hierarchical())
-    .build();
+let validator = Validator::new(TrustSchema::hierarchical());
+validator.cert_cache().insert(my_cert);
 
 // ... use validator to verify incoming SafeData
 ```
 
-For most applications you will not need `security_manager()` — `identity.signer()` covers the signing case, and `Consumer::fetch_verified` covers the verification case. Direct access is useful when you need to build a `Validator` with non-default configuration, set up a custom trust schema, or inspect the raw certificate.
+For most applications `identity.signer()` covers the signing case and `Consumer::fetch_verified` covers the verification case. `manager_arc()` is the escape hatch for framework code that needs to share the manager across async tasks.
 
 For factory provisioning with NDNCERT, see [`NdnIdentity::provision`](../deep-dive/ndncert.md) and the [Fleet and Swarm Security](./fleet-security.md) guide.
 
@@ -476,5 +479,7 @@ For factory provisioning with NDNCERT, see [`NdnIdentity::provision`](../deep-di
 
 | Feature | What it enables |
 |---------|----------------|
-| *(default)* | `Consumer`, `Producer`, `Subscriber`, `Queryable`, `KeyChain` |
+| *(default)* | `Consumer`, `Producer`, `Subscriber`, `Queryable` |
 | `blocking` | `BlockingConsumer`, `BlockingProducer` via an internal Tokio runtime |
+
+`KeyChain` lives in `ndn-security` and is re-exported by `ndn-app` for convenience.

@@ -109,23 +109,33 @@ The `Pending` state is important: because certificates are fetched over the netw
 
 On the other side of the equation, a producer needs to create a cryptographic identity and attach signatures to outgoing Data packets.
 
-The `KeyChain` facade in `ndn-app` makes this straightforward:
+`KeyChain` in `ndn-security` is the single entry point for NDN security in both applications and the forwarder:
 
 ```rust
-// Create an ephemeral keychain (or open a persistent one from disk)
-let keychain = KeyChain::new();
+use ndn_security::KeyChain;
 
-// Generate an Ed25519 key pair and self-signed certificate
-let signer = keychain.create_identity("/sensor/node1", None)?;
+// Ephemeral identity (tests, short-lived producers) — in-memory only
+let keychain = KeyChain::ephemeral("/sensor/node1")?;
+let signer = keychain.signer()?;
 
-// The signer is now ready to sign Data packets
-// DataBuilder will call signer.sign() to produce the signature
+// Persistent identity — generates on first run, reloads on subsequent runs
+let keychain = KeyChain::open_or_create(
+    std::path::Path::new("/var/lib/ndn/sensor-id"),
+    "/sensor/node1",
+)?;
+let signer = keychain.signer()?;
 ```
 
-For persistent deployments, `KeyChain::open` loads keys from a PIB (Public Information Base) directory backed by `FilePib`, so keys survive application restarts:
+`ndn-app` re-exports `KeyChain` from `ndn-security`, so `use ndn_app::KeyChain` works too.
+
+The `SignWith` extension trait provides a synchronous one-liner for signing a packet builder without spawning an async task — useful in closures and non-async contexts:
 
 ```rust
-let keychain = KeyChain::open("/var/lib/ndn/pib", &"/sensor/node1".into())?;
+use ndn_security::SignWith;
+use ndn_packet::encode::DataBuilder;
+
+let wire = DataBuilder::new("/sensor/node1/temp".parse()?, b"23.5°C")
+    .sign_with_sync(&*signer)?;  // returns Bytes directly
 ```
 
 Under the hood, signing is handled by the `Signer` trait. Both traits in the security layer (`Signer` and `Verifier`) use `BoxFuture` for dyn-compatibility, so they can be stored as `Arc<dyn Signer>` in the key store and swapped at runtime:
@@ -255,11 +265,23 @@ The `ndn-did` crate provides `cert_to_did_document` to perform this conversion e
 
 See [Identity and Decentralized Identifiers](./identity-and-did.md) for the full treatment: how `did:ndn` names are encoded, how resolution works over NDN transports, how to cross-anchor with `did:web` for web interoperability, and how `did:key` enables offline bootstrapping for factory-provisioned devices.
 
-### NdnIdentity: Identity Management Above SecurityManager
+### NdnIdentity: Identity Lifecycle Above KeyChain
 
-`ndn-security` provides the low-level building blocks (`Signer`, `Verifier`, `CertCache`, `Validator`). `ndn-identity` wraps these in a higher-level `NdnIdentity` type that applications and devices actually interact with.
+`ndn-security` provides the low-level building blocks (`KeyChain`, `Signer`, `Validator`, `CertCache`). `ndn-identity` wraps `KeyChain` in an `NdnIdentity` type that adds certificate lifecycle management on top.
 
-`NdnIdentity` owns a `SecurityManager` (which it exposes via `identity.security_manager()` for callers that need full control), and adds:
+`NdnIdentity` implements `Deref<Target = KeyChain>`, so every `KeyChain` method (`signer()`, `validator()`, `add_trust_anchor()`, `manager_arc()`) is available directly on `NdnIdentity` without any bridging:
+
+```rust
+let identity = NdnIdentity::open_or_create(path, "/sensor/node1").await?;
+
+// These call KeyChain methods via Deref — no indirection required
+let signer  = identity.signer()?;
+let anchor  = Certificate::decode(anchor_bytes)?;
+identity.add_trust_anchor(anchor);
+let validator = identity.validator();
+```
+
+Beyond `KeyChain`, `NdnIdentity` adds:
 
 - **Persistent storage** — keys and certificates survive reboots via `NdnIdentity::open_or_create`
 - **Ephemeral identities** — `NdnIdentity::ephemeral` creates a throw-away in-memory identity for tests
@@ -267,8 +289,6 @@ See [Identity and Decentralized Identifiers](./identity-and-did.md) for the full
 - **Background renewal** — configurable `RenewalPolicy` automatically renews certificates before they expire
 - **DID access** — `identity.did()` returns the `did:ndn` URI for the identity's name without any conversion boilerplate
 
-The `identity.signer()` method returns an `Arc<dyn Signer>` that can be passed directly to `DataBuilder` or a `Producer` — the same `Signer` trait used throughout `ndn-security`, so `NdnIdentity`-based signing integrates seamlessly with the rest of the pipeline.
-
-For most applications, `NdnIdentity` is the only security API they need. Direct use of `SecurityManager`, `Validator`, or `CertCache` is reserved for advanced scenarios like custom trust schema configuration or building a CA.
+For most applications, `NdnIdentity` is the only security API they need. Direct use of `Validator` or `CertCache` is reserved for advanced scenarios like custom trust schema configuration or building a CA. When framework code needs the underlying `Arc<SecurityManager>`, call `identity.manager_arc()`.
 
 See [NDNCERT: Automated Certificate Issuance](./ndncert.md) for how certificate issuance works end-to-end, including the CA hierarchy, challenge types, and short-lived certificate renewal.

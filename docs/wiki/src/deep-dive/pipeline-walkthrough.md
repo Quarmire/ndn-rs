@@ -356,15 +356,27 @@ On no match, the Data is *unsolicited* -- nobody asked for it. Unsolicited Data 
 
 ### Validation: Trust but Verify
 
-If signature validation is enabled, the Data's signature is verified against the trust schema and certificate chain. This stage may produce three outcomes:
+`ValidationStage` always runs. **Security is on by default**: if no `SecurityManager` is configured, the stage still verifies cryptographic signatures (`AcceptSigned` behaviour) — it just skips the certificate chain walk and namespace hierarchy check. To turn off all validation, you must explicitly set `SecurityProfile::Disabled`.
 
-- **`Action::Satisfy`** (valid) -- the signature checks out, the Data is promoted to `SafeData`
-- **`Action::Drop`** (invalid signature) -- cryptographic verification failed, discard
-- **`Action::Pending`** (certificate needed) -- the certificate for the signing key isn't available yet and must be fetched over the network
+The `SecurityProfile` enum controls what the stage does:
+
+| Profile | Behaviour |
+|---------|-----------|
+| `Default` (no `SecurityManager`) | Crypto-verify the signature; accept if valid. No chain walk. |
+| `Default` (with `SecurityManager`) | Full chain validation: trust schema + cert fetching + trust anchor check. |
+| `AcceptSigned` | Crypto-verify only; no chain walk. Explicit equivalent of the fallback above. |
+| `Disabled` | Skip all validation — every Data passes through unchecked. Must be set explicitly. |
+| `Custom(validator)` | Caller-supplied `Validator` with full control. |
+
+The stage may produce three outcomes for each Data packet:
+
+- **`Action::Satisfy`** (valid) -- the signature checks out; the Data is promoted to `SafeData`
+- **`Action::Drop`** (invalid signature) -- cryptographic verification failed; discard
+- **`Action::Pending`** (certificate needed) -- the certificate for the signing key isn't in the cache yet; a side-channel Interest is issued to fetch it
 
 Pending packets are queued and re-validated by a periodic drain task once the missing certificate arrives. See the [Security Model](security-model.md) deep dive for the full certificate chain walk.
 
-> **🔧 Implementation note:** Validation is optional and configured per-deployment. A forwarder running on a trusted local network might skip it entirely. An edge forwarder facing the open internet should always enable it. The `SafeData` typestate ensures that code expecting verified data cannot accidentally receive unverified data -- the compiler enforces the boundary.
+> **🔧 Implementation note:** The `SafeData` typestate ensures that code expecting verified data cannot accidentally receive unverified data -- the compiler enforces the boundary regardless of which `SecurityProfile` was chosen.
 
 ### CS Insert: Caching for the Future
 

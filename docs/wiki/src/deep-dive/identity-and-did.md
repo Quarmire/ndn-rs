@@ -75,10 +75,10 @@ The `v1:` form is lossless and handles any valid NDN name. The simple colon form
 
 ### Converting Between Forms
 
-`ndn-did` provides the conversion utilities:
+The DID conversion utilities live in `ndn_security::did` (the `ndn-did` crate is a thin re-export shim for backwards compatibility):
 
 ```rust
-use ndn_did::{name_to_did, did_to_name};
+use ndn_security::did::{name_to_did, did_to_name};
 
 let name: Name = "/com/acme/alice".parse()?;
 
@@ -104,7 +104,7 @@ Resolving `did:ndn:com:acme:alice` means fetching the certificate at `/com/acme/
 The certificate is then converted to a DID Document:
 
 ```rust
-use ndn_did::{UniversalResolver, cert_to_did_document};
+use ndn_security::did::{UniversalResolver, cert_to_did_document};
 use ndn_security::Certificate;
 
 // High-level: resolve a did:ndn directly
@@ -169,6 +169,8 @@ This is ideal for factory-provisioned devices that need a stable identity before
 `ndn-did` can resolve `did:key` identifiers locally without any network call:
 
 ```rust
+use ndn_security::did::UniversalResolver;
+
 let resolver = UniversalResolver::new();
 
 // Resolves instantly — the key is encoded in the DID itself
@@ -190,10 +192,14 @@ Once a `did:key` device enrolls with an NDNCERT CA and gets a proper namespace c
 `cert_to_did_document` performs this conversion:
 
 ```rust
-use ndn_did::cert_to_did_document;
-use ndn_security::Certificate;
+use ndn_security::did::{cert_to_did_document, name_to_did};
+use ndn_identity::NdnIdentity;
 
-let cert: Certificate = identity.security_manager().get_certificate()?;
+let identity = NdnIdentity::open_or_create(path, "/com/acme/alice").await?;
+
+// NdnIdentity implements Deref<Target = KeyChain>, so manager_arc() is available directly
+let mgr = identity.manager_arc();
+let cert: Certificate = mgr.get_certificate()?;
 let doc = cert_to_did_document(&cert);
 
 // The DID in the document matches what name_to_did() would produce
@@ -205,7 +211,7 @@ The `UniversalResolver`, when resolving a `did:ndn`, uses `ndn-security`'s `Cert
 The bridge between DID resolution and the `Validator` is equally clean. A resolved `DidDocument` can supply the trust anchor for a `Validator`:
 
 ```rust
-use ndn_did::UniversalResolver;
+use ndn_security::did::UniversalResolver;
 use ndn_security::Validator;
 
 let resolver = UniversalResolver::new();

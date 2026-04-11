@@ -23,9 +23,7 @@ The recommended entry point for application developers. Wraps the engine, IPC, a
 | `Subscriber::recv()` | Await the next `Sample` from the sync group |
 | `Queryable::connect(socket, prefix)` | Register a prefix for request-response handling |
 | `Queryable::recv()` | Await the next `Query`; call `query.reply(wire)` to respond |
-| `KeyChain::load_or_init(path)` | Load or generate a node identity and trust anchors |
-| `KeyChain::signer()` | Obtain a `Signer` for the local identity |
-| `KeyChain::validator()` | Obtain a `Validator` configured from the trust schema |
+| `KeyChain` | Re-exported from `ndn-security` — see that crate for the full API |
 | `NdnConnection` | Enum unifying external (`RouterClient`) and embedded (`AppFace`) connections |
 | `blocking::BlockingConsumer` | Synchronous wrapper — no async required |
 | `blocking::BlockingProducer` | Synchronous serve loop — plain `Fn(Interest) → Option<Bytes>` |
@@ -96,22 +94,35 @@ The core forwarding engine. Used directly when embedding the engine in a binary 
 
 ## `ndn-security` — Signing and Validation
 
-Cryptographic signing and trust-chain validation. The `SafeData` newtype is the compiler-enforced proof that a `Data` packet has been verified.
+Cryptographic signing, trust-chain validation, and identity management. The `SafeData` newtype is the compiler-enforced proof that a `Data` packet has been verified. `KeyChain` is the single entry point for NDN security in both applications and the forwarder.
 
 | Type / Function | Description |
 |---|---|
+| `KeyChain::ephemeral(name)` | Create an in-memory, self-signed identity (tests / short-lived producers) |
+| `KeyChain::open_or_create(path, name)` | Load from a file-backed PIB, generating on first run |
+| `KeyChain::from_parts(mgr, name, key_name)` | Construct from a pre-built `SecurityManager` (framework use) |
+| `KeyChain::signer()` | Obtain an `Arc<dyn Signer>` for the local identity |
+| `KeyChain::validator()` | Build a `Validator` pre-configured with this identity's trust anchors |
+| `KeyChain::add_trust_anchor(cert)` | Add an external trust anchor certificate |
+| `KeyChain::manager_arc()` | Escape hatch to the underlying `Arc<SecurityManager>` |
+| `SignWith` trait | `.sign_with_sync(&signer)` — synchronous signing extension for `DataBuilder` / `InterestBuilder` |
 | `Validator::new(schema)` | Create a validator from a `TrustSchema` |
 | `Validator::validate(data)` | Async validate; returns `Valid(SafeData)` / `Invalid` / `Pending` |
 | `Validator::validate_chain(data)` | Walk and verify the full certificate chain to a trust anchor |
-| `Signer` trait | `sign(&mut self, data: &mut DataBuilder)` |
+| `Signer` trait | `sign(&self, region)` — async; `sign_sync` for CPU-only signers |
 | `Ed25519Signer` | Ed25519 signing (default identity type) |
 | `HmacSha256Signer` | Symmetric HMAC-SHA-256 (~10× faster than Ed25519) |
-| `TrustSchema::hierarchical()` | Default hierarchical trust schema |
-| `TrustSchema::accept_all()` | Accept any signed packet (for testing) |
+| `TrustSchema::new()` | Empty schema — rejects everything (explicit strict configuration) |
+| `TrustSchema::hierarchical()` | Data and key must share the same first name component |
+| `TrustSchema::accept_all()` | Accept any correctly-signed packet (no namespace check) |
 | `SafeData` | Newtype wrapping a verified `Data` — compiler-enforced proof of validation |
 | `SecurityManager::auto_init()` | First-run identity generation; driven by `auto_init = true` in TOML |
 | `CertFetcher` | Async cert fetching with deduplication (concurrent requests for the same cert share one Interest) |
-| `SecurityProfile` | `Default` / `AcceptSigned` / `Disabled` / `Custom` — engine auto-wires from `SecurityManager` |
+| `SecurityProfile` | `Default` / `AcceptSigned` / `Disabled` / `Custom` — engine auto-wires the validation stage |
+| `did::name_to_did(name)` | Encode an NDN `Name` as a `did:ndn:` URI string |
+| `did::did_to_name(did)` | Decode a `did:ndn:` URI back to a `Name` |
+| `did::cert_to_did_document(cert)` | Convert an NDN `Certificate` to a W3C `DidDocument` |
+| `did::UniversalResolver` | Multi-method DID resolver: `did:ndn`, `did:key`, `did:web` |
 
 ---
 
