@@ -9,7 +9,7 @@ use crate::Fib;
 use crate::enricher::ContextEnricher;
 use ndn_discovery::scope::is_link_local;
 use ndn_packet::Name;
-use ndn_pipeline::{
+use crate::pipeline::{
     Action, AnyMap, DecodedPacket, DropReason, ForwardingAction, NackReason, PacketContext,
 };
 use ndn_store::{Pit, StrategyTable};
@@ -60,13 +60,7 @@ impl<S: Strategy> ErasedStrategy for S {
         ctx: &'a StrategyContext<'a>,
         reason: NackReason,
     ) -> Pin<Box<dyn Future<Output = ForwardingAction> + Send + 'a>> {
-        let strategy_reason = match reason {
-            NackReason::NoRoute => ndn_pipeline::NackReason::NoRoute,
-            NackReason::Duplicate => ndn_pipeline::NackReason::Duplicate,
-            NackReason::Congestion => ndn_pipeline::NackReason::Congestion,
-            NackReason::NotYet => ndn_pipeline::NackReason::NotYet,
-        };
-        Box::pin(self.on_nack(ctx, strategy_reason))
+        Box::pin(self.on_nack(ctx, reason))
     }
 }
 

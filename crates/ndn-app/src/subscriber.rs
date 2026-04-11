@@ -25,7 +25,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use tokio::sync::mpsc;
 
-use ndn_ipc::RouterClient;
+use ndn_ipc::ForwarderClient;
 use ndn_packet::encode::encode_interest;
 use ndn_packet::{Data, Name};
 
@@ -94,7 +94,7 @@ impl Subscriber {
         config: SubscriberConfig,
     ) -> Result<Self, AppError> {
         let group = group_prefix.into();
-        let client = RouterClient::connect(socket)
+        let client = ForwarderClient::connect(socket)
             .await
             .map_err(|e| AppError::Engine(e.into()))?;
         client

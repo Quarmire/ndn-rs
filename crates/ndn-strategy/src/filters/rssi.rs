@@ -1,7 +1,7 @@
 use crate::context::StrategyContext;
 use crate::cross_layer::LinkQualitySnapshot;
 use crate::filter::StrategyFilter;
-use ndn_pipeline::ForwardingAction;
+use ndn_transport::ForwardingAction;
 use smallvec::SmallVec;
 
 /// Removes faces with RSSI below a configurable threshold from `Forward` actions.
@@ -175,7 +175,7 @@ mod tests {
         let filter = RssiFilter::new(-60);
         let actions = smallvec![
             ForwardingAction::Forward(smallvec![FaceId(1)]),
-            ForwardingAction::Nack(ndn_pipeline::NackReason::NoRoute),
+            ForwardingAction::Nack(ndn_transport::NackReason::NoRoute),
         ];
         let result = filter.filter(&ctx, actions);
         // Forward removed, Nack passes through

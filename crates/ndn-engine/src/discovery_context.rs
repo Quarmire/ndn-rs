@@ -94,7 +94,7 @@ impl DiscoveryContext for EngineDiscoveryContext {
                 cancel.clone(),
                 FacePersistency::OnDemand,
                 send_tx,
-                ndn_face_net::DEFAULT_UDP_MTU,
+                ndn_faces::net::DEFAULT_UDP_MTU,
             )
         } else {
             FaceState::new(cancel.clone(), FacePersistency::OnDemand, send_tx)

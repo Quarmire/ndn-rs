@@ -7,7 +7,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace};
 
 use ndn_packet::encode::encode_nack;
-use ndn_pipeline::{
+use crate::pipeline::{
     Action, DecodedPacket, DropReason, ForwardingAction, NackReason, PacketContext,
 };
 use ndn_store::PitToken;

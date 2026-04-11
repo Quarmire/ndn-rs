@@ -1,5 +1,5 @@
 use crate::context::StrategyContext;
-use ndn_pipeline::ForwardingAction;
+use ndn_transport::ForwardingAction;
 use smallvec::SmallVec;
 
 /// Post-processes forwarding actions from an inner strategy.

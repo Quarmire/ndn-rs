@@ -67,7 +67,7 @@ pub struct FaceState {
     pub send_tx: mpsc::Sender<bytes::Bytes>,
     /// NDNLPv2 per-hop reliability state (unicast UDP faces only).
     #[cfg(feature = "face-net")]
-    pub reliability: Option<std::sync::Mutex<ndn_face_net::reliability::LpReliability>>,
+    pub reliability: Option<std::sync::Mutex<ndn_faces::net::reliability::LpReliability>>,
 }
 
 impl FaceState {
@@ -110,7 +110,7 @@ impl FaceState {
             counters: FaceCounters::default(),
             send_tx,
             reliability: Some(std::sync::Mutex::new(
-                ndn_face_net::reliability::LpReliability::new(mtu),
+                ndn_faces::net::reliability::LpReliability::new(mtu),
             )),
         }
     }
@@ -260,7 +260,7 @@ impl ForwarderEngine {
                 cancel.clone(),
                 persistency,
                 send_tx,
-                ndn_face_net::DEFAULT_UDP_MTU,
+                ndn_faces::net::DEFAULT_UDP_MTU,
             )
         } else {
             FaceState::new(cancel.clone(), persistency, send_tx)
@@ -338,7 +338,7 @@ impl ForwarderEngine {
                 cancel.clone(),
                 FacePersistency::OnDemand,
                 send_tx,
-                ndn_face_net::DEFAULT_UDP_MTU,
+                ndn_faces::net::DEFAULT_UDP_MTU,
             )
         } else {
             FaceState::new(cancel.clone(), FacePersistency::OnDemand, send_tx)

@@ -14,7 +14,7 @@ use crate::AppError;
 ///
 /// Internally uses `tokio::sync::mpsc` channels — zero-copy `Arc<>` passing
 /// for same-process use.
-pub struct AppFace {
+pub struct AppSink {
     face_id: FaceId,
     /// Channel to send outbound Interests to the pipeline runner.
     tx: mpsc::Sender<OutboundRequest>,
@@ -31,14 +31,14 @@ pub enum OutboundRequest {
     },
 }
 
-impl AppFace {
-    /// Create a new `AppFace` and the matching request receiver.
+impl AppSink {
+    /// Create a new `AppSink` and the matching request receiver.
     ///
     /// The caller (typically the engine) holds the `Receiver` and dispatches
     /// `OutboundRequest` messages as they arrive.
-    pub fn new(face_id: FaceId, capacity: usize) -> (AppFace, mpsc::Receiver<OutboundRequest>) {
+    pub fn new(face_id: FaceId, capacity: usize) -> (AppSink, mpsc::Receiver<OutboundRequest>) {
         let (tx, rx) = mpsc::channel(capacity);
-        (AppFace { face_id, tx }, rx)
+        (AppSink { face_id, tx }, rx)
     }
 
     pub fn face_id(&self) -> FaceId {
@@ -109,13 +109,13 @@ mod tests {
 
     #[test]
     fn face_id_accessor() {
-        let (face, _rx) = AppFace::new(FaceId(42), 8);
+        let (face, _rx) = AppSink::new(FaceId(42), 8);
         assert_eq!(face.face_id(), FaceId(42));
     }
 
     #[tokio::test]
     async fn express_sends_interest_to_receiver() {
-        let (face, mut rx) = AppFace::new(FaceId(1), 8);
+        let (face, mut rx) = AppSink::new(FaceId(1), 8);
         let interest = make_interest("hello");
         let task = tokio::spawn(async move { face.express(interest).await });
         // Engine side: receive the request and reply.
@@ -129,7 +129,7 @@ mod tests {
 
     #[tokio::test]
     async fn express_returns_error_when_channel_closed() {
-        let (face, rx) = AppFace::new(FaceId(1), 8);
+        let (face, rx) = AppSink::new(FaceId(1), 8);
         drop(rx); // engine side dropped
         let result = face.express(make_interest("x")).await;
         assert!(matches!(result, Err(AppError::Engine(_))));
@@ -138,7 +138,7 @@ mod tests {
     #[tokio::test]
     async fn express_propagates_nack() {
         use ndn_packet::NackReason;
-        let (face, mut rx) = AppFace::new(FaceId(1), 8);
+        let (face, mut rx) = AppSink::new(FaceId(1), 8);
         let task = tokio::spawn(async move { face.express(make_interest("x")).await });
         if let Some(OutboundRequest::Interest { reply, .. }) = rx.recv().await {
             reply
@@ -158,7 +158,7 @@ mod tests {
 
     #[tokio::test]
     async fn register_prefix_sends_request() {
-        let (face, mut rx) = AppFace::new(FaceId(1), 8);
+        let (face, mut rx) = AppSink::new(FaceId(1), 8);
         let prefix =
             Name::from_components([NameComponent::generic(Bytes::from_static(b"myprefix"))]);
         face.register_prefix(prefix.clone(), |_| {}).await.unwrap();
@@ -171,7 +171,7 @@ mod tests {
 
     #[tokio::test]
     async fn register_prefix_returns_error_when_channel_closed() {
-        let (face, rx) = AppFace::new(FaceId(1), 8);
+        let (face, rx) = AppSink::new(FaceId(1), 8);
         drop(rx);
         let result = face.register_prefix(Name::root(), |_| {}).await;
         assert!(result.is_err());

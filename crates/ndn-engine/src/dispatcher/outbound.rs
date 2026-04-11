@@ -6,7 +6,7 @@ use tracing::{debug, trace};
 
 use ndn_packet::Name;
 use ndn_packet::encode::encode_nack;
-use ndn_pipeline::{Action, NackReason, PacketContext};
+use crate::pipeline::{Action, NackReason, PacketContext};
 use ndn_store::CsEntry;
 use ndn_transport::{FaceId, FaceScope};
 

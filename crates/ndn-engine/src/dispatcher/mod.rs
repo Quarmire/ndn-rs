@@ -106,7 +106,7 @@ impl PacketDispatcher {
                             cancel.child_token(),
                             persistency,
                             send_tx,
-                            ndn_face_net::DEFAULT_UDP_MTU,
+                            ndn_faces::net::DEFAULT_UDP_MTU,
                         )
                     } else {
                         FaceState::new(cancel.child_token(), persistency, send_tx)

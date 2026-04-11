@@ -25,8 +25,8 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
-use ndn_face_local::AppHandle;
-use ndn_ipc::RouterClient;
+use ndn_faces::local::InProcHandle;
+use ndn_ipc::ForwarderClient;
 use ndn_packet::{Interest, Name};
 
 use crate::AppError;
@@ -60,7 +60,7 @@ impl Queryable {
         prefix: impl Into<Name>,
     ) -> Result<Self, AppError> {
         let prefix = prefix.into();
-        let client = RouterClient::connect(socket)
+        let client = ForwarderClient::connect(socket)
             .await
             .map_err(|e| AppError::Engine(e.into()))?;
         client
@@ -73,8 +73,8 @@ impl Queryable {
         })
     }
 
-    /// Create from an in-process AppHandle (embedded engine).
-    pub fn from_handle(handle: AppHandle, prefix: Name) -> Self {
+    /// Create from an in-process InProcHandle (embedded engine).
+    pub fn from_handle(handle: InProcHandle, prefix: Name) -> Self {
         Self {
             conn: Arc::new(NdnConnection::Embedded(handle)),
             prefix,

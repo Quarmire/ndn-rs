@@ -7,7 +7,6 @@ license.workspace = true
 
 [dependencies]
 ndn-packet    = { workspace = true, features = ["std"] }
-ndn-pipeline  = { workspace = true }
 ndn-store     = { workspace = true }
 ndn-transport = { workspace = true }
 bytes         = { workspace = true, features = ["std"] }

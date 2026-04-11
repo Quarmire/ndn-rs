@@ -21,6 +21,7 @@ pub mod engine;
 pub mod enricher;
 pub mod expiry;
 pub mod fib;
+pub mod pipeline;
 pub mod rib;
 pub mod routing;
 pub mod stages;
@@ -33,3 +34,6 @@ pub use enricher::ContextEnricher;
 pub use fib::{Fib, FibEntry, FibNexthop};
 pub use rib::{Rib, RibRoute};
 pub use routing::{RoutingHandle, RoutingManager, RoutingProtocol};
+
+// Re-export pipeline types at crate root for ergonomic access
+pub use pipeline::{Action, AnyMap, DecodedPacket, DropReason, ForwardingAction, NackReason, PacketContext, PipelineStage};

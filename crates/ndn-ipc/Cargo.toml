@@ -7,13 +7,13 @@ license.workspace = true
 
 [features]
 default = ["spsc-shm"]
-spsc-shm = ["ndn-face-local/spsc-shm"]
+spsc-shm = ["ndn-faces/spsc-shm"]
 
 [dependencies]
 ndn-packet     = { workspace = true, features = ["std"] }
 ndn-config     = { workspace = true }
-ndn-face-local = { workspace = true }
 ndn-transport  = { workspace = true }
+ndn-faces     = { workspace = true }
 bytes         = { workspace = true, features = ["std"] }
 tokio          = { workspace = true, features = ["sync", "rt", "macros"] }
 tokio-util     = { workspace = true }

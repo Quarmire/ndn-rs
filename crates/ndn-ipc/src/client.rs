@@ -33,12 +33,12 @@ impl<F> IpcClient<F> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndn_face_local::AppFace;
+    use ndn_faces::local::InProcFace;
     use ndn_transport::{Face, FaceId};
 
     #[test]
     fn new_and_accessors() {
-        let (face, _rx) = AppFace::new(FaceId(1), 8);
+        let (face, _rx) = InProcFace::new(FaceId(1), 8);
         let ns = Name::root();
         let client = IpcClient::new(Arc::new(face), ns.clone());
         assert_eq!(client.namespace(), &ns);

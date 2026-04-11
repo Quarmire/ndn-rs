@@ -7,7 +7,6 @@ publish = false
 [dependencies]
 ndn-packet    = { workspace = true, features = ["std"] }
 ndn-transport = { workspace = true }
-ndn-pipeline  = { workspace = true }
 ndn-strategy  = { workspace = true }
 ndn-engine    = { workspace = true }
 smallvec      = { workspace = true }

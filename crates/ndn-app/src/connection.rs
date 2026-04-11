@@ -1,20 +1,20 @@
 use bytes::Bytes;
 
-use ndn_face_local::AppHandle;
-use ndn_ipc::RouterClient;
+use ndn_faces::local::InProcHandle;
+use ndn_ipc::ForwarderClient;
 use ndn_packet::Name;
 
 use crate::AppError;
 
-/// Unified NDN connection — either an embedded engine face or an external router.
+/// Unified NDN connection — either an embedded engine face or an external forwarder.
 ///
 /// Both [`send`](Self::send) and [`recv`](Self::recv) take `&self`, so an
 /// `Arc<NdnConnection>` can be shared across tasks for concurrent send/recv.
 pub enum NdnConnection {
-    /// In-process connection via AppHandle (embedded engine).
-    Embedded(AppHandle),
-    /// External connection via RouterClient (Unix socket + optional SHM).
-    External(RouterClient),
+    /// In-process connection via [`InProcHandle`] (embedded engine).
+    Embedded(InProcHandle),
+    /// External connection via [`ForwarderClient`] (Unix socket + optional SHM).
+    External(ForwarderClient),
 }
 
 impl NdnConnection {

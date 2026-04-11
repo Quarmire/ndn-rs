@@ -5,7 +5,7 @@ use smallvec::SmallVec;
 use tracing::trace;
 
 use ndn_packet::Selector;
-use ndn_pipeline::{Action, DecodedPacket, DropReason, PacketContext};
+use crate::pipeline::{Action, DecodedPacket, DropReason, PacketContext};
 use ndn_store::{Pit, PitEntry, PitToken};
 use ndn_transport::FaceId;
 

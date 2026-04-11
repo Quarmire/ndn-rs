@@ -1,6 +1,6 @@
 /// App-side client for connecting to a running ndn-router.
 ///
-/// `RouterClient` handles:
+/// `ForwarderClient` handles:
 /// - Connecting to the router's face socket (UnixFace)
 /// - Optionally creating an SHM face for high-performance data plane
 /// - Registering/unregistering prefixes via NFD `rib/register`/`rib/unregister`
@@ -10,7 +10,7 @@
 ///
 /// On mobile the forwarder runs in-process; there is no separate router daemon
 /// to connect to.  Use [`ndn_engine::ForwarderEngine`] in embedded mode with
-/// an [`ndn_face_local::AppFace`] instead of `RouterClient`.
+/// an [`ndn_faces::local::AppFace`] instead of `ForwarderClient`.
 ///
 /// # Connection flow (SHM preferred)
 ///
@@ -37,13 +37,13 @@ use bytes::Bytes;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use ndn_face_local::IpcFace;
+use ndn_faces::local::IpcFace;
 use ndn_packet::Name;
 use ndn_transport::{Face, FaceId};
 
-/// Error type for `RouterClient` operations.
+/// Error type for `ForwarderClient` operations.
 #[derive(Debug, thiserror::Error)]
-pub enum RouterError {
+pub enum ForwarderError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("face error: {0}")]
@@ -54,7 +54,7 @@ pub enum RouterError {
     MalformedResponse,
     #[cfg(all(unix, feature = "spsc-shm"))]
     #[error("SHM error: {0}")]
-    Shm(#[from] ndn_face_local::ShmError),
+    Shm(#[from] ndn_faces::local::ShmError),
 }
 
 /// Data plane transport — either SHM (preferred) or reuse the control UnixFace.
@@ -62,7 +62,7 @@ enum DataTransport {
     /// High-performance shared-memory data plane.
     #[cfg(all(unix, feature = "spsc-shm"))]
     Shm {
-        handle: ndn_face_local::shm::spsc::SpscHandle,
+        handle: ndn_faces::local::shm::spsc::SpscHandle,
         face_id: u64,
     },
     /// Fallback: reuse the control UnixFace for data.
@@ -70,7 +70,7 @@ enum DataTransport {
 }
 
 /// Client for connecting to and communicating with a running ndn-router.
-pub struct RouterClient {
+pub struct ForwarderClient {
     /// Control channel (Unix domain socket on Unix, Named Pipe on Windows).
     control: Arc<IpcFace>,
     /// Typed management API — shares the control face.
@@ -88,18 +88,18 @@ pub struct RouterClient {
     monitor_started: AtomicU8,
 }
 
-impl RouterClient {
+impl ForwarderClient {
     /// Connect to the router's face socket.
     ///
     /// Automatically attempts SHM data plane with an auto-generated name;
     /// falls back to Unix socket if SHM is unavailable or fails.
-    pub async fn connect(face_socket: impl AsRef<Path>) -> Result<Self, RouterError> {
+    pub async fn connect(face_socket: impl AsRef<Path>) -> Result<Self, ForwarderError> {
         let auto_name = format!("app-{}-{}", std::process::id(), next_shm_id());
         Self::connect_with_name(face_socket, Some(&auto_name)).await
     }
 
     /// Connect using only the Unix socket for data (no SHM attempt).
-    pub async fn connect_unix_only(face_socket: impl AsRef<Path>) -> Result<Self, RouterError> {
+    pub async fn connect_unix_only(face_socket: impl AsRef<Path>) -> Result<Self, ForwarderError> {
         Self::connect_with_name(face_socket, None).await
     }
 
@@ -110,9 +110,9 @@ impl RouterClient {
     pub async fn connect_with_name(
         face_socket: impl AsRef<Path>,
         shm_name: Option<&str>,
-    ) -> Result<Self, RouterError> {
+    ) -> Result<Self, ForwarderError> {
         let path = face_socket.as_ref().to_str().unwrap_or_default().to_owned();
-        let control = Arc::new(ndn_face_local::ipc_face_connect(FaceId(0), &path).await?);
+        let control = Arc::new(ndn_faces::local::ipc_face_connect(FaceId(0), &path).await?);
         let cancel = CancellationToken::new();
         let dead = Arc::new(AtomicBool::new(false));
 
@@ -156,20 +156,20 @@ impl RouterClient {
         control: &Arc<IpcFace>,
         shm_name: &str,
         cancel: CancellationToken,
-    ) -> Result<DataTransport, RouterError> {
+    ) -> Result<DataTransport, ForwarderError> {
         let mgmt = crate::mgmt_client::MgmtClient::from_face(Arc::clone(control));
         let resp = mgmt.face_create(&format!("shm://{shm_name}")).await?;
-        let face_id = resp.face_id.ok_or(RouterError::MalformedResponse)?;
+        let face_id = resp.face_id.ok_or(ForwarderError::MalformedResponse)?;
 
         // Connect the app-side SHM handle with cancellation from control face.
-        let mut handle = ndn_face_local::shm::spsc::SpscHandle::connect(shm_name)?;
+        let mut handle = ndn_faces::local::shm::spsc::SpscHandle::connect(shm_name)?;
         handle.set_cancel(cancel);
 
         Ok(DataTransport::Shm { handle, face_id })
     }
 
     /// Register a prefix with the router via `rib/register`.
-    pub async fn register_prefix(&self, prefix: &Name) -> Result<(), RouterError> {
+    pub async fn register_prefix(&self, prefix: &Name) -> Result<(), ForwarderError> {
         // In SHM mode, route traffic to the SHM face.  In Unix mode pass None
         // so the router uses the requesting face — passing 0 would create a
         // FIB entry for a non-existent face, silently dropping all packets.
@@ -184,7 +184,7 @@ impl RouterClient {
     }
 
     /// Unregister a prefix from the router via `rib/unregister`.
-    pub async fn unregister_prefix(&self, prefix: &Name) -> Result<(), RouterError> {
+    pub async fn unregister_prefix(&self, prefix: &Name) -> Result<(), ForwarderError> {
         let face_id = self.shm_face_id();
         self.mgmt.route_remove(prefix, face_id).await?;
         Ok(())
@@ -214,11 +214,11 @@ impl RouterClient {
     }
 
     /// Send a packet on the data plane.
-    pub async fn send(&self, pkt: Bytes) -> Result<(), RouterError> {
+    pub async fn send(&self, pkt: Bytes) -> Result<(), ForwarderError> {
         match &self.transport {
             #[cfg(all(unix, feature = "spsc-shm"))]
-            DataTransport::Shm { handle, .. } => handle.send(pkt).await.map_err(RouterError::Shm),
-            DataTransport::Unix => self.control.send(pkt).await.map_err(RouterError::Face),
+            DataTransport::Shm { handle, .. } => handle.send(pkt).await.map_err(ForwarderError::Shm),
+            DataTransport::Unix => self.control.send(pkt).await.map_err(ForwarderError::Face),
         }
     }
 
@@ -226,7 +226,7 @@ impl RouterClient {
     ///
     /// Returns `None` if the data channel is closed or the router has
     /// disconnected.  On the first call, automatically starts the disconnect
-    /// monitor (see [`RouterClient::spawn_disconnect_monitor`]) so that callers
+    /// monitor (see [`ForwarderClient::spawn_disconnect_monitor`]) so that callers
     /// do not need to start it explicitly.
     pub async fn recv(&self) -> Option<Bytes> {
         self.start_monitor_once();
@@ -308,7 +308,7 @@ impl RouterClient {
 
     /// Explicitly start the disconnect monitor.
     ///
-    /// This is called automatically on the first [`RouterClient::recv`] call,
+    /// This is called automatically on the first [`ForwarderClient::recv`] call,
     /// so most applications do not need to call this directly.
     ///
     /// In **SHM mode** the monitor watches the control socket for closure
@@ -344,7 +344,7 @@ impl RouterClient {
     }
 }
 
-impl Drop for RouterClient {
+impl Drop for ForwarderClient {
     fn drop(&mut self) {
         // Cancel the cancel token so the disconnect-monitor task (which holds
         // a clone of Arc<IpcFace>) exits promptly.  Once the task drops its

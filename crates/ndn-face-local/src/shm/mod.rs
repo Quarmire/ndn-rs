@@ -12,7 +12,7 @@
 //! # Quick start
 //!
 //! ```no_run
-//! # use ndn_face_local::shm::{ShmFace, ShmHandle};
+//! # use ndn_faces::local::shm::{ShmFace, ShmHandle};
 //! # use ndn_transport::FaceId;
 //! // ── Engine process ────────────────────────────────────────────────────────
 //! let face = ShmFace::create(FaceId(5), "myapp").unwrap();

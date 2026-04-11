@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 
-use ndn_face_local::AppHandle;
-use ndn_ipc::RouterClient;
+use ndn_faces::local::InProcHandle;
+use ndn_ipc::ForwarderClient;
 use ndn_packet::encode::InterestBuilder;
 use ndn_packet::lp::{LpPacket, is_lp_packet};
 use ndn_packet::{Data, Name};
@@ -31,7 +31,7 @@ pub struct Consumer {
 impl Consumer {
     /// Connect to an external router via its face socket.
     pub async fn connect(socket: impl AsRef<Path>) -> Result<Self, AppError> {
-        let client = RouterClient::connect(socket)
+        let client = ForwarderClient::connect(socket)
             .await
             .map_err(|e| AppError::Engine(e.into()))?;
         Ok(Self {
@@ -39,8 +39,8 @@ impl Consumer {
         })
     }
 
-    /// Create from an in-process AppHandle (embedded engine).
-    pub fn from_handle(handle: AppHandle) -> Self {
+    /// Create from an in-process InProcHandle (embedded engine).
+    pub fn from_handle(handle: InProcHandle) -> Self {
         Self {
             conn: NdnConnection::Embedded(handle),
         }

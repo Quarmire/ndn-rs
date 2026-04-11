@@ -5,7 +5,7 @@
 //!
 //! ## Connection modes
 //!
-//! **External router** — connect to a running `ndn-router` via Unix socket:
+//! **External forwarder** — connect to a running `ndn-fwd` via Unix socket:
 //!
 //! ```rust,no_run
 //! # use ndn_app::Consumer;
@@ -21,14 +21,14 @@
 //! ```rust,no_run
 //! # use ndn_app::{Consumer, Producer, EngineBuilder};
 //! # use ndn_engine::EngineConfig;
-//! # use ndn_face_local::AppFace;
+//! # use ndn_faces::local::InProcFace;
 //! # use ndn_packet::Name;
 //! # use ndn_packet::encode::DataBuilder;
 //! # use ndn_transport::FaceId;
 //! # async fn example() -> anyhow::Result<()> {
 //! // Create in-process face pairs
-//! let (consumer_face, consumer_handle) = AppFace::new(FaceId(1), 64);
-//! let (producer_face, producer_handle) = AppFace::new(FaceId(2), 64);
+//! let (consumer_face, consumer_handle) = InProcFace::new(FaceId(1), 64);
+//! let (producer_face, producer_handle) = InProcFace::new(FaceId(2), 64);
 //!
 //! // Build engine with both faces
 //! let (engine, shutdown) = EngineBuilder::new(EngineConfig::default())
@@ -62,7 +62,7 @@ pub mod subscriber;
 #[cfg(feature = "blocking")]
 pub mod blocking;
 
-pub use app_face::{AppFace, OutboundRequest};
+pub use app_face::OutboundRequest;
 pub use connection::NdnConnection;
 pub use consumer::{Consumer, DEFAULT_INTEREST_LIFETIME, DEFAULT_TIMEOUT};
 pub use error::AppError;

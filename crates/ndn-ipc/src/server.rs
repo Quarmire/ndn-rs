@@ -33,13 +33,13 @@ impl<F> IpcServer<F> {
 mod tests {
     use super::*;
     use bytes::Bytes;
-    use ndn_face_local::AppFace;
+    use ndn_faces::local::InProcFace;
     use ndn_packet::NameComponent;
     use ndn_transport::{Face, FaceId};
 
     #[test]
     fn new_and_accessors() {
-        let (face, _rx) = AppFace::new(FaceId(2), 8);
+        let (face, _rx) = InProcFace::new(FaceId(2), 8);
         let prefix = Name::from_components([NameComponent::generic(Bytes::from_static(b"svc"))]);
         let server = IpcServer::new(Arc::new(face), prefix.clone());
         assert_eq!(server.prefix(), &prefix);

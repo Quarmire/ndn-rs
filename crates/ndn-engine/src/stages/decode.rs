@@ -8,7 +8,7 @@ use ndn_packet::encode::ensure_nonce;
 use ndn_packet::fragment::ReassemblyBuffer;
 use ndn_packet::lp::{LpPacket, extract_fragment, is_lp_packet};
 use ndn_packet::{Data, Interest, Nack, Name, tlv_type};
-use ndn_pipeline::{Action, DecodedPacket, DropReason, PacketContext};
+use crate::pipeline::{Action, DecodedPacket, DropReason, PacketContext};
 use ndn_transport::{FaceId, FaceScope, FaceTable};
 
 /// Check if a name starts with `/localhost`.

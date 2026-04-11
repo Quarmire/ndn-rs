@@ -2,7 +2,7 @@ use bytes::Bytes;
 use smallvec::{SmallVec, smallvec};
 
 use ndn_packet::{Name, NameComponent};
-use ndn_pipeline::{ForwardingAction, NackReason};
+use ndn_transport::{ForwardingAction, NackReason};
 
 use crate::{Strategy, StrategyContext};
 

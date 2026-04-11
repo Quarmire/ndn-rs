@@ -7,11 +7,10 @@ publish = false
 [dependencies]
 ndn-packet    = { workspace = true, features = ["std"] }
 ndn-transport = { workspace = true }
-ndn-pipeline  = { workspace = true }
+ndn-faces     = { workspace = true }
 ndn-strategy  = { workspace = true }
 ndn-engine    = { workspace = true }
 ndn-app       = { workspace = true }
-ndn-face-local = { workspace = true }
 bytes         = { workspace = true, features = ["std"] }
 smallvec      = { workspace = true }
 tokio         = { workspace = true, features = ["rt-multi-thread", "macros"] }

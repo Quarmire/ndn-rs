@@ -26,11 +26,11 @@ use ndn_config::{
     ControlParameters, ControlResponse,
     nfd_command::{command_name, dataset_name, module, verb},
 };
-use ndn_face_local::IpcFace;
+use ndn_faces::local::IpcFace;
 use ndn_packet::{Name, encode::InterestBuilder};
 use ndn_transport::{Face, FaceId};
 
-use crate::router_client::RouterError;
+use crate::forwarder_client::ForwarderError;
 
 /// Management client for a running ndn-router.
 ///
@@ -50,16 +50,16 @@ impl MgmtClient {
     /// `face_socket` is a Unix domain socket path on Unix (e.g.
     /// `/tmp/ndn.sock`) or a Named Pipe path on Windows (e.g.
     /// `\\.\pipe\ndn`).
-    pub async fn connect(face_socket: impl AsRef<str>) -> Result<Self, RouterError> {
+    pub async fn connect(face_socket: impl AsRef<str>) -> Result<Self, ForwarderError> {
         let face =
-            Arc::new(ndn_face_local::ipc_face_connect(FaceId(0), face_socket.as_ref()).await?);
+            Arc::new(ndn_faces::local::ipc_face_connect(FaceId(0), face_socket.as_ref()).await?);
         Ok(Self {
             face,
             recv_lock: Mutex::new(()),
         })
     }
 
-    /// Wrap an existing [`IpcFace`] (e.g. from a `RouterClient`).
+    /// Wrap an existing [`IpcFace`] (e.g. from a `ForwarderClient`).
     pub fn from_face(face: Arc<IpcFace>) -> Self {
         Self {
             face,
@@ -80,7 +80,7 @@ impl MgmtClient {
         prefix: &Name,
         face_id: Option<u64>,
         cost: u64,
-    ) -> Result<ControlParameters, RouterError> {
+    ) -> Result<ControlParameters, ForwarderError> {
         let params = ControlParameters {
             name: Some(prefix.clone()),
             face_id,
@@ -97,7 +97,7 @@ impl MgmtClient {
         &self,
         prefix: &Name,
         face_id: Option<u64>,
-    ) -> Result<ControlParameters, RouterError> {
+    ) -> Result<ControlParameters, ForwarderError> {
         let params = ControlParameters {
             name: Some(prefix.clone()),
             face_id,
@@ -107,14 +107,14 @@ impl MgmtClient {
     }
 
     /// List all FIB routes: `fib/list`.
-    pub async fn route_list(&self) -> Result<ControlResponse, RouterError> {
+    pub async fn route_list(&self) -> Result<ControlResponse, ForwarderError> {
         self.dataset(module::FIB, verb::LIST).await
     }
 
     // ─── Face management ────────────────────────────────────────────────
 
     /// Create a face: `faces/create`.
-    pub async fn face_create(&self, uri: &str) -> Result<ControlParameters, RouterError> {
+    pub async fn face_create(&self, uri: &str) -> Result<ControlParameters, ForwarderError> {
         let params = ControlParameters {
             uri: Some(uri.to_owned()),
             ..Default::default()
@@ -123,7 +123,7 @@ impl MgmtClient {
     }
 
     /// Destroy a face: `faces/destroy`.
-    pub async fn face_destroy(&self, face_id: u64) -> Result<ControlParameters, RouterError> {
+    pub async fn face_destroy(&self, face_id: u64) -> Result<ControlParameters, ForwarderError> {
         let params = ControlParameters {
             face_id: Some(face_id),
             ..Default::default()
@@ -132,7 +132,7 @@ impl MgmtClient {
     }
 
     /// List all faces: `faces/list`.
-    pub async fn face_list(&self) -> Result<ControlResponse, RouterError> {
+    pub async fn face_list(&self) -> Result<ControlResponse, ForwarderError> {
         self.dataset(module::FACES, verb::LIST).await
     }
 
@@ -143,7 +143,7 @@ impl MgmtClient {
         &self,
         prefix: &Name,
         strategy: &Name,
-    ) -> Result<ControlParameters, RouterError> {
+    ) -> Result<ControlParameters, ForwarderError> {
         let params = ControlParameters {
             name: Some(prefix.clone()),
             strategy: Some(strategy.clone()),
@@ -153,7 +153,7 @@ impl MgmtClient {
     }
 
     /// Unset forwarding strategy for a prefix: `strategy-choice/unset`.
-    pub async fn strategy_unset(&self, prefix: &Name) -> Result<ControlParameters, RouterError> {
+    pub async fn strategy_unset(&self, prefix: &Name) -> Result<ControlParameters, ForwarderError> {
         let params = ControlParameters {
             name: Some(prefix.clone()),
             ..Default::default()
@@ -162,14 +162,14 @@ impl MgmtClient {
     }
 
     /// List all strategy choices: `strategy-choice/list`.
-    pub async fn strategy_list(&self) -> Result<ControlResponse, RouterError> {
+    pub async fn strategy_list(&self) -> Result<ControlResponse, ForwarderError> {
         self.dataset(module::STRATEGY, verb::LIST).await
     }
 
     // ─── Content store ──────────────────────────────────────────────────
 
     /// Content store info: `cs/info`.
-    pub async fn cs_info(&self) -> Result<ControlResponse, RouterError> {
+    pub async fn cs_info(&self) -> Result<ControlResponse, ForwarderError> {
         self.dataset(module::CS, verb::INFO).await
     }
 
@@ -177,7 +177,7 @@ impl MgmtClient {
     ///
     /// If `capacity` is `Some`, sets the new max capacity in bytes.
     /// Always returns the current capacity.
-    pub async fn cs_config(&self, capacity: Option<u64>) -> Result<ControlParameters, RouterError> {
+    pub async fn cs_config(&self, capacity: Option<u64>) -> Result<ControlParameters, ForwarderError> {
         let params = ControlParameters {
             capacity,
             ..Default::default()
@@ -193,7 +193,7 @@ impl MgmtClient {
         &self,
         prefix: &ndn_packet::Name,
         count: Option<u64>,
-    ) -> Result<ControlParameters, RouterError> {
+    ) -> Result<ControlParameters, ForwarderError> {
         let params = ControlParameters {
             name: Some(prefix.clone()),
             count,
@@ -205,19 +205,19 @@ impl MgmtClient {
     // ─── Neighbors ──────────────────────────────────────────────────────
 
     /// List discovered neighbors: `neighbors/list`.
-    pub async fn neighbors_list(&self) -> Result<ControlResponse, RouterError> {
+    pub async fn neighbors_list(&self) -> Result<ControlResponse, ForwarderError> {
         self.dataset(module::NEIGHBORS, verb::LIST).await
     }
 
     // ─── Service discovery ──────────────────────────────────────────────
 
     /// List locally announced services: `service/list`.
-    pub async fn service_list(&self) -> Result<ControlResponse, RouterError> {
+    pub async fn service_list(&self) -> Result<ControlResponse, ForwarderError> {
         self.dataset(module::SERVICE, verb::LIST).await
     }
 
     /// Announce a service prefix at runtime: `service/announce`.
-    pub async fn service_announce(&self, prefix: &Name) -> Result<ControlParameters, RouterError> {
+    pub async fn service_announce(&self, prefix: &Name) -> Result<ControlParameters, ForwarderError> {
         let params = ControlParameters {
             name: Some(prefix.clone()),
             ..Default::default()
@@ -226,7 +226,7 @@ impl MgmtClient {
     }
 
     /// Withdraw a previously announced service prefix: `service/withdraw`.
-    pub async fn service_withdraw(&self, prefix: &Name) -> Result<ControlParameters, RouterError> {
+    pub async fn service_withdraw(&self, prefix: &Name) -> Result<ControlParameters, ForwarderError> {
         let params = ControlParameters {
             name: Some(prefix.clone()),
             ..Default::default()
@@ -241,7 +241,7 @@ impl MgmtClient {
     pub async fn service_browse(
         &self,
         prefix: Option<&Name>,
-    ) -> Result<ControlResponse, RouterError> {
+    ) -> Result<ControlResponse, ForwarderError> {
         let name = match prefix {
             None => dataset_name(module::SERVICE, verb::BROWSE),
             Some(p) => {
@@ -258,45 +258,45 @@ impl MgmtClient {
     // ─── Status ─────────────────────────────────────────────────────────
 
     /// General forwarder status: `status/general`.
-    pub async fn status(&self) -> Result<ControlResponse, RouterError> {
+    pub async fn status(&self) -> Result<ControlResponse, ForwarderError> {
         self.dataset(module::STATUS, b"general").await
     }
 
     /// Request graceful shutdown: `status/shutdown`.
-    pub async fn shutdown(&self) -> Result<ControlResponse, RouterError> {
+    pub async fn shutdown(&self) -> Result<ControlResponse, ForwarderError> {
         self.dataset(module::STATUS, b"shutdown").await
     }
 
     // ─── Config ──────────────────────────────────────────────────────────────
 
     /// Retrieve the running router configuration as TOML: `config/get`.
-    pub async fn config_get(&self) -> Result<ControlResponse, RouterError> {
+    pub async fn config_get(&self) -> Result<ControlResponse, ForwarderError> {
         self.dataset(module::CONFIG, verb::GET).await
     }
 
     // ─── Faces counters ─────────────────────────────────────────────────
 
     /// Per-face packet/byte counters: `faces/counters`.
-    pub async fn face_counters(&self) -> Result<ControlResponse, RouterError> {
+    pub async fn face_counters(&self) -> Result<ControlResponse, ForwarderError> {
         self.dataset(module::FACES, verb::COUNTERS).await
     }
 
     // ─── Measurements ───────────────────────────────────────────────────
 
     /// Per-prefix measurements (satisfaction rate, RTTs): `measurements/list`.
-    pub async fn measurements_list(&self) -> Result<ControlResponse, RouterError> {
+    pub async fn measurements_list(&self) -> Result<ControlResponse, ForwarderError> {
         self.dataset(module::MEASUREMENTS, verb::LIST).await
     }
 
     // ─── Security ────────────────────────────────────────────────────────
 
     /// List all identity keys in the PIB: `security/identity-list`.
-    pub async fn security_identity_list(&self) -> Result<ControlResponse, RouterError> {
+    pub async fn security_identity_list(&self) -> Result<ControlResponse, ForwarderError> {
         self.dataset(module::SECURITY, verb::IDENTITY_LIST).await
     }
 
     /// Generate a new Ed25519 identity key: `security/identity-generate`.
-    pub async fn security_identity_generate(&self, name: &Name) -> Result<ControlParameters, RouterError> {
+    pub async fn security_identity_generate(&self, name: &Name) -> Result<ControlParameters, ForwarderError> {
         let params = ControlParameters {
             name: Some(name.clone()),
             ..Default::default()
@@ -305,12 +305,12 @@ impl MgmtClient {
     }
 
     /// List all trust anchors in the PIB: `security/anchor-list`.
-    pub async fn security_anchor_list(&self) -> Result<ControlResponse, RouterError> {
+    pub async fn security_anchor_list(&self) -> Result<ControlResponse, ForwarderError> {
         self.dataset(module::SECURITY, verb::ANCHOR_LIST).await
     }
 
     /// Delete a key from the PIB: `security/key-delete`.
-    pub async fn security_key_delete(&self, name: &Name) -> Result<ControlParameters, RouterError> {
+    pub async fn security_key_delete(&self, name: &Name) -> Result<ControlParameters, ForwarderError> {
         let params = ControlParameters {
             name: Some(name.clone()),
             ..Default::default()
@@ -321,7 +321,7 @@ impl MgmtClient {
     /// Get the `did:ndn:` DID for a named identity: `security/identity-did`.
     ///
     /// The response `status_text` contains the DID string.
-    pub async fn security_identity_did(&self, name: &Name) -> Result<ControlResponse, RouterError> {
+    pub async fn security_identity_did(&self, name: &Name) -> Result<ControlResponse, ForwarderError> {
         let params = ControlParameters {
             name: Some(name.clone()),
             ..Default::default()
@@ -333,7 +333,7 @@ impl MgmtClient {
     /// Retrieve the router's NDNCERT CA profile: `security/ca-info`.
     ///
     /// Returns `NOT_FOUND` if no `ca_prefix` is configured.
-    pub async fn security_ca_info(&self) -> Result<ControlResponse, RouterError> {
+    pub async fn security_ca_info(&self) -> Result<ControlResponse, ForwarderError> {
         self.dataset(module::SECURITY, verb::CA_INFO).await
     }
 
@@ -352,7 +352,7 @@ impl MgmtClient {
         ca_prefix: &Name,
         challenge_type: &str,
         challenge_param: &str,
-    ) -> Result<ControlParameters, RouterError> {
+    ) -> Result<ControlParameters, ForwarderError> {
         let params = ControlParameters {
             name: Some(ca_prefix.clone()),
             uri: Some(format!("{challenge_type}:{challenge_param}")),
@@ -364,7 +364,7 @@ impl MgmtClient {
     /// Add a Zero-Touch-Provisioning token to the CA: `security/ca-token-add`.
     ///
     /// Returns the generated token in `ControlParameters::uri`.
-    pub async fn security_ca_token_add(&self, description: &str) -> Result<ControlParameters, RouterError> {
+    pub async fn security_ca_token_add(&self, description: &str) -> Result<ControlParameters, ForwarderError> {
         let params = ControlParameters {
             uri: Some(description.to_owned()),
             ..Default::default()
@@ -373,7 +373,7 @@ impl MgmtClient {
     }
 
     /// List pending NDNCERT CA enrollment requests: `security/ca-requests`.
-    pub async fn security_ca_requests(&self) -> Result<ControlResponse, RouterError> {
+    pub async fn security_ca_requests(&self) -> Result<ControlResponse, ForwarderError> {
         self.dataset(module::SECURITY, verb::CA_REQUESTS).await
     }
 
@@ -381,7 +381,7 @@ impl MgmtClient {
     ///
     /// Returns `Ok` with `status_text = "present"` if a YubiKey is found,
     /// or an error if not present or the `yubikey-piv` feature is not compiled in.
-    pub async fn security_yubikey_detect(&self) -> Result<ControlResponse, RouterError> {
+    pub async fn security_yubikey_detect(&self) -> Result<ControlResponse, ForwarderError> {
         self.dataset(module::SECURITY, verb::YUBIKEY_DETECT).await
     }
 
@@ -389,7 +389,7 @@ impl MgmtClient {
     ///
     /// On success the response `body.uri` contains the base64url-encoded 65-byte
     /// uncompressed public key.
-    pub async fn security_yubikey_generate(&self, name: &Name) -> Result<ControlParameters, RouterError> {
+    pub async fn security_yubikey_generate(&self, name: &Name) -> Result<ControlParameters, ForwarderError> {
         let params = ControlParameters {
             name: Some(name.clone()),
             ..Default::default()
@@ -400,7 +400,7 @@ impl MgmtClient {
     // ─── Discovery ──────────────────────────────────────────────────────────
 
     /// Get discovery protocol status and current config: `discovery/status`.
-    pub async fn discovery_status(&self) -> Result<ControlResponse, RouterError> {
+    pub async fn discovery_status(&self) -> Result<ControlResponse, ForwarderError> {
         self.dataset(module::DISCOVERY, b"status").await
     }
 
@@ -413,7 +413,7 @@ impl MgmtClient {
     /// `hello_jitter`, `liveness_timeout_ms`, `liveness_miss_count`,
     /// `probe_timeout_ms`, `swim_indirect_fanout`, `gossip_fanout`,
     /// `auto_create_faces`.
-    pub async fn discovery_config_set(&self, params: &str) -> Result<ControlResponse, RouterError> {
+    pub async fn discovery_config_set(&self, params: &str) -> Result<ControlResponse, ForwarderError> {
         let cp = ControlParameters {
             uri: Some(params.to_owned()),
             ..Default::default()
@@ -423,7 +423,7 @@ impl MgmtClient {
     }
 
     /// Get DVR routing protocol status: `routing/dvr-status`.
-    pub async fn routing_dvr_status(&self) -> Result<ControlResponse, RouterError> {
+    pub async fn routing_dvr_status(&self) -> Result<ControlResponse, ForwarderError> {
         self.dataset(module::ROUTING, verb::DVR_STATUS).await
     }
 
@@ -431,7 +431,7 @@ impl MgmtClient {
     ///
     /// Pass parameters as a URL query string:
     /// `"update_interval_ms=30000&route_ttl_ms=90000"`.
-    pub async fn routing_dvr_config_set(&self, params: &str) -> Result<ControlResponse, RouterError> {
+    pub async fn routing_dvr_config_set(&self, params: &str) -> Result<ControlResponse, ForwarderError> {
         let cp = ControlParameters {
             uri: Some(params.to_owned()),
             ..Default::default()
@@ -443,7 +443,7 @@ impl MgmtClient {
     // ─── Log filter ─────────────────────────────────────────────────────
 
     /// Get the current runtime log filter string: `log/get-filter`.
-    pub async fn log_get_filter(&self) -> Result<ControlResponse, RouterError> {
+    pub async fn log_get_filter(&self) -> Result<ControlResponse, ForwarderError> {
         self.dataset(module::LOG, verb::GET_FILTER).await
     }
 
@@ -455,7 +455,7 @@ impl MgmtClient {
     ///
     /// Response format: first line is the new max sequence number, followed by
     /// zero or more log lines.
-    pub async fn log_get_recent(&self, after_seq: u64) -> Result<ControlResponse, RouterError> {
+    pub async fn log_get_recent(&self, after_seq: u64) -> Result<ControlResponse, ForwarderError> {
         let params = ControlParameters {
             count: Some(after_seq),
             ..Default::default()
@@ -468,7 +468,7 @@ impl MgmtClient {
     ///
     /// The `filter` string is an `EnvFilter`-compatible directive
     /// (e.g. `"info"`, `"debug,ndn_engine=trace"`).
-    pub async fn log_set_filter(&self, filter: &str) -> Result<ControlResponse, RouterError> {
+    pub async fn log_set_filter(&self, filter: &str) -> Result<ControlResponse, ForwarderError> {
         let params = ControlParameters {
             uri: Some(filter.to_owned()),
             ..Default::default()
@@ -485,12 +485,12 @@ impl MgmtClient {
         module_name: &[u8],
         verb_name: &[u8],
         params: &ControlParameters,
-    ) -> Result<ControlParameters, RouterError> {
+    ) -> Result<ControlParameters, ForwarderError> {
         let name = command_name(module_name, verb_name, params);
         let resp = self.send_interest(name).await?;
 
         if !resp.is_ok() {
-            return Err(RouterError::Command {
+            return Err(ForwarderError::Command {
                 code: resp.status_code,
                 text: resp.status_text,
             });
@@ -504,7 +504,7 @@ impl MgmtClient {
         &self,
         module_name: &[u8],
         verb_name: &[u8],
-    ) -> Result<ControlResponse, RouterError> {
+    ) -> Result<ControlResponse, ForwarderError> {
         let name = dataset_name(module_name, verb_name);
         self.send_interest(name).await
     }
@@ -514,7 +514,7 @@ impl MgmtClient {
     /// Management Interests are signed with `DigestSha256` (SHA-256 of the
     /// signed region) so that NFD and ndnd accept them. Without a signature
     /// NFD silently drops the Interest and the client would hang forever.
-    async fn send_interest(&self, name: Name) -> Result<ControlResponse, RouterError> {
+    async fn send_interest(&self, name: Name) -> Result<ControlResponse, ForwarderError> {
         let interest_wire = InterestBuilder::new(name).sign_digest_sha256();
 
         // Serialise send+recv so concurrent callers don't interleave.
@@ -522,13 +522,13 @@ impl MgmtClient {
 
         self.face.send(interest_wire).await?;
 
-        let data_wire = self.face.recv().await.map(crate::router_client::strip_lp)?;
+        let data_wire = self.face.recv().await.map(crate::forwarder_client::strip_lp)?;
         let data =
-            ndn_packet::Data::decode(data_wire).map_err(|_| RouterError::MalformedResponse)?;
+            ndn_packet::Data::decode(data_wire).map_err(|_| ForwarderError::MalformedResponse)?;
 
-        let content = data.content().ok_or(RouterError::MalformedResponse)?;
+        let content = data.content().ok_or(ForwarderError::MalformedResponse)?;
 
         ControlResponse::decode(Bytes::copy_from_slice(content))
-            .map_err(|_| RouterError::MalformedResponse)
+            .map_err(|_| ForwarderError::MalformedResponse)
     }
 }

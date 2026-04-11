@@ -11,11 +11,10 @@ blocking = ["tokio/rt"]
 
 [dependencies]
 ndn-packet     = { workspace = true, features = ["std"] }
-ndn-pipeline   = { workspace = true }
 ndn-engine     = { workspace = true }
 ndn-security   = { workspace = true }
 ndn-transport  = { workspace = true }
-ndn-face-local = { workspace = true }
+ndn-faces     = { workspace = true }
 ndn-ipc        = { workspace = true }
 ndn-sync       = { workspace = true }
 bytes         = { workspace = true, features = ["std"] }

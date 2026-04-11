@@ -1,6 +1,6 @@
 use crate::context::StrategyContext;
 use ndn_packet::Name;
-use ndn_pipeline::ForwardingAction;
+use ndn_transport::ForwardingAction;
 
 /// The forwarding strategy trait.
 ///
@@ -47,7 +47,7 @@ pub trait Strategy: Send + Sync + 'static {
     fn on_nack(
         &self,
         _ctx: &StrategyContext,
-        _reason: ndn_pipeline::NackReason,
+        _reason: ndn_transport::NackReason,
     ) -> impl std::future::Future<Output = ForwardingAction> + Send {
         async { ForwardingAction::Suppress }
     }
