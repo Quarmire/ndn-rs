@@ -28,6 +28,7 @@
 - [TLV Encoding](./deep-dive/tlv-encoding.md)
 - [Pipeline Walkthrough](./deep-dive/pipeline-walkthrough.md)
 - [Discovery Protocols](./deep-dive/discovery-protocols.md)
+- [Routing Protocols](./deep-dive/routing-protocols.md)
 - [Sync Protocols](./deep-dive/sync-protocols.md)
 - [Security Model](./deep-dive/security-model.md)
 - [Identity and Decentralized Identifiers](./deep-dive/identity-and-did.md)
@@ -42,6 +43,7 @@
 
 - [Building NDN Applications](./guides/building-ndn-apps.md)
 - [Implementing a Discovery Protocol](./guides/implementing-discovery.md)
+- [Implementing a Routing Protocol](./guides/implementing-routing-protocol.md)
 - [Implementing a Face](./guides/implementing-face.md)
 - [Implementing a Strategy](./guides/implementing-strategy.md)
 - [WASM Strategies](./guides/wasm-strategies.md)
