@@ -27,6 +27,7 @@ use crate::{
         onboarding::{is_onboarded, Onboarding},
         overview::Overview,
         radio::Radio,
+        routing::Routing,
         security::Security,
         session::Session,
         strategy::Strategy,
@@ -128,6 +129,12 @@ pub enum DashCmd {
     SecurityTokenAdd(String),
     YubikeyDetect,
     YubikeyGeneratePiv(String),
+    /// Apply runtime discovery config — `params` is a URL query string
+    /// (`"hello_interval_base_ms=5000&liveness_miss_count=3"`).
+    DiscoveryConfigSet(String),
+    /// Apply runtime DVR config — `params` is a URL query string
+    /// (`"update_interval_ms=30000&route_ttl_ms=90000"`).
+    DvrConfigSet(String),
 }
 
 /// Commands sent to the router-management coroutine.
@@ -196,6 +203,10 @@ pub struct AppCtx {
     pub cs_hit_history:    Signal<VecDeque<f64>>,
     /// Per-face throughput rate history (60 samples × 3 s = 3 min window).
     pub face_throughput:   Signal<HashMap<u64, VecDeque<ThroughputSample>>>,
+    /// Live discovery protocol status (best-effort; `None` if router does not support).
+    pub discovery_status:  Signal<Option<DiscoveryStatus>>,
+    /// Live DVR routing status (best-effort; `None` if DVR is not active).
+    pub dvr_status:        Signal<Option<DvrStatus>>,
     pub router_cmd:        Coroutine<RouterCmd>,
     pub cmd:               Coroutine<DashCmd>,
     pub tool_cmd:          Coroutine<ToolCmd>,
@@ -231,6 +242,8 @@ pub fn App() -> Element {
     let cs_hit_history:  Signal<VecDeque<f64>>               = use_signal(VecDeque::new);
     let face_throughput: Signal<HashMap<u64, VecDeque<ThroughputSample>>> = use_signal(HashMap::new);
     let face_prev_ctr:   Signal<HashMap<u64, ThroughputSample>>           = use_signal(HashMap::new);
+    let discovery_status: Signal<Option<DiscoveryStatus>>                 = use_signal(|| None);
+    let dvr_status:       Signal<Option<DvrStatus>>                       = use_signal(|| None);
     let mut error_msg: Signal<Option<String>> = use_signal(|| None);
     let mut show_onboarding: Signal<bool>                     = use_signal(|| !is_onboarded());
     let mut show_start_modal: Signal<bool>                    = use_signal(|| false);
@@ -399,7 +412,7 @@ pub fn App() -> Element {
             // Reset the log cursor so the first poll fetches all buffered lines.
             *LAST_LOG_SEQ.write() = 0;
 
-            if let Err(e) = poll_all(&client, status, faces, routes, cs, strategies, counters, measurements, config_toml, throughput, prev_counters, neighbors, security_keys, security_anchors, ca_info, cs_hit_history, face_throughput, face_prev_ctr).await {
+            if let Err(e) = poll_all(&client, status, faces, routes, cs, strategies, counters, measurements, config_toml, throughput, prev_counters, neighbors, security_keys, security_anchors, ca_info, cs_hit_history, face_throughput, face_prev_ctr, discovery_status, dvr_status).await {
                 conn_state.set(ConnState::Disconnected);
                 error_msg.set(Some(e));
                 continue;
@@ -412,7 +425,7 @@ pub fn App() -> Element {
             'session: loop {
                 tokio::select! {
                     _ = interval.tick() => {
-                        if let Err(e) = poll_all(&client, status, faces, routes, cs, strategies, counters, measurements, config_toml, throughput, prev_counters, neighbors, security_keys, security_anchors, ca_info, cs_hit_history, face_throughput, face_prev_ctr).await {
+                        if let Err(e) = poll_all(&client, status, faces, routes, cs, strategies, counters, measurements, config_toml, throughput, prev_counters, neighbors, security_keys, security_anchors, ca_info, cs_hit_history, face_throughput, face_prev_ctr, discovery_status, dvr_status).await {
                             conn_state.set(ConnState::Disconnected);
                             error_msg.set(Some(e));
                             break 'session;
@@ -422,7 +435,7 @@ pub fn App() -> Element {
                         if matches!(cmd_msg, DashCmd::Reconnect) {
                             break 'session;
                         }
-                        run_cmd(cmd_msg, &client, status, faces, routes, cs, strategies, counters, measurements, error_msg, config_toml, throughput, prev_counters, session_log, recording, neighbors, security_keys, security_anchors, ca_info, yubikey_status, cs_hit_history, face_throughput, face_prev_ctr).await;
+                        run_cmd(cmd_msg, &client, status, faces, routes, cs, strategies, counters, measurements, error_msg, config_toml, throughput, prev_counters, session_log, recording, neighbors, security_keys, security_anchors, ca_info, yubikey_status, cs_hit_history, face_throughput, face_prev_ctr, discovery_status, dvr_status).await;
                     }
                 }
             }
@@ -855,6 +868,8 @@ pub fn App() -> Element {
         yubikey_status,
         cs_hit_history,
         face_throughput,
+        discovery_status,
+        dvr_status,
         router_cmd,
         cmd,
         tool_cmd,
@@ -1025,10 +1040,22 @@ pub fn App() -> Element {
                                 if running { "Router Running" } else { "Router Stopped" }
                             }
                             if !running {
-                                button {
-                                    class: "btn btn-primary btn-sm",
-                                    onclick: move |_| show_start_modal.set(true),
-                                    "▶ Start"
+                                {
+                                    // Disable "Start" when already connected to an external forwarder.
+                                    let external = matches!(*conn_state.read(), ConnState::Connected);
+                                    rsx! {
+                                        button {
+                                            class: "btn btn-primary btn-sm",
+                                            disabled: external,
+                                            title: if external {
+                                                "Connected to an external forwarder — disconnect or shut it down first"
+                                            } else {
+                                                "Start a local ndn-router process"
+                                            },
+                                            onclick: move |_| { if !external { show_start_modal.set(true); } },
+                                            "▶ Start"
+                                        }
+                                    }
                                 }
                                 if *conn_state.read() == ConnState::Connected {
                                     button {
@@ -1123,6 +1150,7 @@ fn render_view(view: View) -> Element {
         View::Session         => rsx! { Session {} },
         View::Security        => rsx! { Security {} },
         View::Fleet           => rsx! { Fleet {} },
+        View::Routing         => rsx! { Routing {} },
         View::Radio           => rsx! { Radio {} },
         View::Tools           => rsx! { Tools {} },
         View::DashboardConfig => rsx! { DashboardConfig {} },
@@ -1160,6 +1188,8 @@ async fn poll_all(
     mut cs_hit_history:      Signal<VecDeque<f64>>,
     mut face_throughput:     Signal<HashMap<u64, VecDeque<ThroughputSample>>>,
     mut face_prev_ctr:       Signal<HashMap<u64, ThroughputSample>>,
+    mut discovery_status:    Signal<Option<DiscoveryStatus>>,
+    mut dvr_status:          Signal<Option<DvrStatus>>,
 ) -> Result<(), String> {
     match client.status().await {
         Ok(r)  => status.set(Some(ForwarderStatus::parse(&r.status_text))),
@@ -1234,6 +1264,13 @@ async fn poll_all(
     }
     if let Ok(r) = client.security_ca_info().await {
         ca_info.set(CaInfo::parse(&r.status_text));
+    }
+    // Discovery / routing status — best-effort (older routers won't have these).
+    if let Ok(r) = client.discovery_status().await {
+        discovery_status.set(DiscoveryStatus::parse(&r.status_text));
+    }
+    if let Ok(r) = client.routing_dvr_status().await {
+        dvr_status.set(DvrStatus::parse(&r.status_text));
     }
     // For external routers (not managed by dashboard), poll the ring buffer.
     // Extract signal values as plain integers before any await — guards must not
@@ -1391,6 +1428,8 @@ async fn run_cmd(
     cs_hit_history:       Signal<VecDeque<f64>>,
     face_throughput:      Signal<HashMap<u64, VecDeque<ThroughputSample>>>,
     face_prev_ctr:        Signal<HashMap<u64, ThroughputSample>>,
+    discovery_status:     Signal<Option<DiscoveryStatus>>,
+    dvr_status:           Signal<Option<DvrStatus>>,
 ) {
     // Session recording: log before dispatch.
     if *recording.read()
@@ -1406,9 +1445,11 @@ async fn run_cmd(
         DashCmd::RouteRemove { .. } => Some("Route removed"),
         DashCmd::CsCapacity(_)      => Some("CS capacity updated"),
         DashCmd::CsErase(_)         => Some("CS entries erased"),
-        DashCmd::Shutdown            => Some("Router shutdown initiated"),
-        DashCmd::StrategySet { .. }  => Some("Strategy updated"),
-        DashCmd::StrategyUnset(_)    => Some("Strategy cleared"),
+        DashCmd::Shutdown              => Some("Router shutdown initiated"),
+        DashCmd::StrategySet { .. }    => Some("Strategy updated"),
+        DashCmd::StrategyUnset(_)      => Some("Strategy cleared"),
+        DashCmd::DiscoveryConfigSet(_) => Some("Discovery config applied"),
+        DashCmd::DvrConfigSet(_)       => Some("DVR config applied"),
         _ => None,
     };
 
@@ -1486,7 +1527,7 @@ async fn run_cmd(
                     // Skip recording the replayed commands to avoid infinite loops.
                     let was_recording = *recording.read();
                     recording.set(false);
-                    Box::pin(run_cmd(replay_cmd, client, status, faces, routes, cs, strategies, counters, measurements, error_msg, config_toml, throughput, prev_counters, session_log, recording, neighbors, security_keys, security_anchors, ca_info, yubikey_status, cs_hit_history, face_throughput, face_prev_ctr)).await;
+                    Box::pin(run_cmd(replay_cmd, client, status, faces, routes, cs, strategies, counters, measurements, error_msg, config_toml, throughput, prev_counters, session_log, recording, neighbors, security_keys, security_anchors, ca_info, yubikey_status, cs_hit_history, face_throughput, face_prev_ctr, discovery_status, dvr_status)).await;
                     recording.set(was_recording);
                     tokio::time::sleep(Duration::from_millis(150)).await;
                 }
@@ -1549,13 +1590,21 @@ async fn run_cmd(
                 }
             }
         }
+        DashCmd::DiscoveryConfigSet(params) => {
+            client.discovery_config_set(&params).await
+                .map(|_| ()).map_err(|e| e.to_string())
+        }
+        DashCmd::DvrConfigSet(params) => {
+            client.routing_dvr_config_set(&params).await
+                .map(|_| ()).map_err(|e| e.to_string())
+        }
     };
 
     match result {
         Ok(()) => {
             error_msg.set(None);
             if let Some(label) = op_label { push_toast(label, ToastLevel::Success); }
-            let _ = poll_all(client, status, faces, routes, cs, strategies, counters, measurements, config_toml, throughput, prev_counters, neighbors, security_keys, security_anchors, ca_info, cs_hit_history, face_throughput, face_prev_ctr).await;
+            let _ = poll_all(client, status, faces, routes, cs, strategies, counters, measurements, config_toml, throughput, prev_counters, neighbors, security_keys, security_anchors, ca_info, cs_hit_history, face_throughput, face_prev_ctr, discovery_status, dvr_status).await;
         }
         Err(e) => {
             push_toast(format!("Command failed: {e}"), ToastLevel::Error);

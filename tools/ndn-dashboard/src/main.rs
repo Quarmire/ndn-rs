@@ -1,3 +1,18 @@
+//! NDN Dashboard — Dioxus desktop application for managing and monitoring
+//! an ndn-router instance.
+//!
+//! The dashboard communicates with the router exclusively via the NDN
+//! management protocol (TLV Interest/Data on `/localhost/nfd/`), using the
+//! same [`ndn_ipc::MgmtClient`] library as `ndn-ctl`. All UI state is driven
+//! by reactive Dioxus signals polled every 3 seconds.
+//!
+//! Features:
+//! - **Overview** — forwarder status, throughput sparklines, CS stats
+//! - **Fleet** — discovered neighbors, NDNCERT enrollment, discovery config
+//! - **Routing** — DVR protocol status and runtime config
+//! - **Routes / Strategy / Security / Logs / Tools** — full management suite
+//! - **System tray** — background presence with start/stop controls
+
 #![allow(non_snake_case)]
 
 mod app;

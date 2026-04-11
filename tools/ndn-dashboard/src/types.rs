@@ -798,6 +798,86 @@ impl StrategyEntry {
     }
 }
 
+// ── Discovery status ──────────────────────────────────────────────────────────
+
+/// Parsed from `discovery/status` response.
+#[derive(Debug, Clone, Default)]
+pub struct DiscoveryStatus {
+    pub enabled: bool,
+    pub strategy: String,
+    pub hello_interval_base_ms: u64,
+    pub hello_interval_max_ms: u64,
+    pub tick_interval_ms: u64,
+    pub liveness_timeout_s: u64,
+    pub liveness_miss_count: u32,
+    pub gossip_fanout: u32,
+    pub swim_indirect_fanout: u32,
+    pub probe_timeout_ms: u64,
+    pub prefix_announcement: bool,
+}
+
+impl DiscoveryStatus {
+    /// Parse from `discovery/status` text (one `key: value` per line).
+    pub fn parse(text: &str) -> Option<Self> {
+        let mut s = Self::default();
+        let mut found = false;
+        for line in text.lines() {
+            let line = line.trim();
+            if let Some((k, v)) = line.split_once(':') {
+                found = true;
+                let v = v.trim();
+                match k.trim() {
+                    "discovery"                => s.enabled               = v == "enabled",
+                    "hello_strategy"           => s.strategy              = v.to_string(),
+                    "hello_interval_base_ms"   => s.hello_interval_base_ms  = v.parse().unwrap_or(0),
+                    "hello_interval_max_ms"    => s.hello_interval_max_ms   = v.parse().unwrap_or(0),
+                    "tick_interval_ms"         => s.tick_interval_ms        = v.parse().unwrap_or(0),
+                    "liveness_timeout_s"       => s.liveness_timeout_s      = v.parse().unwrap_or(0),
+                    "liveness_miss_count"      => s.liveness_miss_count     = v.parse().unwrap_or(0),
+                    "gossip_fanout"            => s.gossip_fanout           = v.parse().unwrap_or(0),
+                    "swim_indirect_fanout"     => s.swim_indirect_fanout    = v.parse().unwrap_or(0),
+                    "probe_timeout_ms"         => s.probe_timeout_ms        = v.parse().unwrap_or(0),
+                    "prefix_announcement"      => s.prefix_announcement     = v == "true",
+                    _ => {}
+                }
+            }
+        }
+        found.then_some(s)
+    }
+}
+
+// ── DVR routing status ────────────────────────────────────────────────────────
+
+/// Parsed from `routing/dvr-status` response.
+#[derive(Debug, Clone, Default)]
+pub struct DvrStatus {
+    pub update_interval_ms: u64,
+    pub route_ttl_ms: u64,
+    pub route_count: u32,
+}
+
+impl DvrStatus {
+    /// Parse from `routing/dvr-status` text (one `key: value` per line).
+    pub fn parse(text: &str) -> Option<Self> {
+        let mut s = Self::default();
+        let mut found = false;
+        for line in text.lines() {
+            let line = line.trim();
+            if let Some((k, v)) = line.split_once(':') {
+                found = true;
+                let v = v.trim();
+                match k.trim() {
+                    "update_interval_ms" => s.update_interval_ms = v.parse().unwrap_or(0),
+                    "route_ttl_ms"       => s.route_ttl_ms       = v.parse().unwrap_or(0),
+                    "route_count"        => s.route_count         = v.parse().unwrap_or(0),
+                    _ => {}
+                }
+            }
+        }
+        found.then_some(s)
+    }
+}
+
 // ── CA / NDNCERT info ────────────────────────────────────────────────────────
 
 /// Parsed from `security/ca-info` response text.

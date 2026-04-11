@@ -7,6 +7,7 @@ pub mod logs;
 pub mod overview;
 pub mod radio;
 pub mod routes;
+pub mod routing;
 pub mod security;
 pub mod session;
 pub mod strategy;
@@ -24,6 +25,7 @@ pub enum View {
     Session,
     Security,
     Fleet,
+    Routing,
     Radio,
     Tools,
     DashboardConfig,
@@ -39,6 +41,7 @@ impl View {
             View::Session         => "Session",
             View::Security        => "Security",
             View::Fleet           => "Fleet",
+            View::Routing         => "Routing",
             View::Radio           => "Radio",
             View::Tools           => "Tools",
             View::DashboardConfig => "Dashboard Config",
@@ -53,6 +56,7 @@ impl View {
         View::Session,
         View::Security,
         View::Fleet,
+        View::Routing,
         View::Radio,
         View::Tools,
     ];

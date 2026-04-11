@@ -32,6 +32,26 @@ pub fn Fleet() -> Element {
     // Education card dismissed?
     let mut edu_dismissed: Signal<bool> = use_signal(|| false);
 
+    // Discovery config form state (initialised from live status when available)
+    let disc = ctx.discovery_status.read();
+    let mut disc_hello_base: Signal<String> = use_signal(|| {
+        disc.as_ref().map(|d| d.hello_interval_base_ms.to_string()).unwrap_or_default()
+    });
+    let mut disc_hello_max: Signal<String> = use_signal(|| {
+        disc.as_ref().map(|d| d.hello_interval_max_ms.to_string()).unwrap_or_default()
+    });
+    let mut disc_gossip: Signal<String> = use_signal(|| {
+        disc.as_ref().map(|d| d.gossip_fanout.to_string()).unwrap_or_default()
+    });
+    let mut disc_swim: Signal<String> = use_signal(|| {
+        disc.as_ref().map(|d| d.swim_indirect_fanout.to_string()).unwrap_or_default()
+    });
+    let mut disc_miss: Signal<String> = use_signal(|| {
+        disc.as_ref().map(|d| d.liveness_miss_count.to_string()).unwrap_or_default()
+    });
+    let mut disc_error: Signal<Option<String>> = use_signal(|| None);
+    drop(disc);
+
     rsx! {
         // ── Education snippet (B7) ───────────────────────────────────────────
         if !*edu_dismissed.read() {
@@ -71,6 +91,136 @@ pub fn Fleet() -> Element {
                         }
                     }
                 }
+            }
+        }
+
+        // ── Discovery Protocol Config ────────────────────────────────────────
+        {
+            let disc = ctx.discovery_status.read();
+            if disc.is_some() {
+                let disc = disc.as_ref().unwrap();
+                rsx! {
+                    div { class: "section",
+                        div { class: "section-title", "Discovery Protocol Config" }
+                        // Status badges
+                        div { style: "display:flex;gap:8px;align-items:center;margin-bottom:12px;",
+                            span {
+                                class: if disc.enabled { "badge badge-green" } else { "badge badge-gray" },
+                                if disc.enabled { "enabled" } else { "disabled" }
+                            }
+                            span { class: "badge badge-blue", "strategy: {disc.strategy}" }
+                            if disc.prefix_announcement {
+                                span { class: "badge badge-green", "prefix-announcement" }
+                            }
+                        }
+                        // Config form
+                        div { style: "display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px;",
+                            div { class: "form-row",
+                                label { class: "form-label",
+                                    "Hello interval base (ms)"
+                                    span { class: "form-hint", " — min hello period" }
+                                }
+                                input {
+                                    r#type: "number",
+                                    class: "form-input",
+                                    min: "100",
+                                    step: "100",
+                                    value: "{disc_hello_base}",
+                                    oninput: move |e| disc_hello_base.set(e.value()),
+                                }
+                            }
+                            div { class: "form-row",
+                                label { class: "form-label",
+                                    "Hello interval max (ms)"
+                                    span { class: "form-hint", " — max back-off period" }
+                                }
+                                input {
+                                    r#type: "number",
+                                    class: "form-input",
+                                    min: "100",
+                                    step: "100",
+                                    value: "{disc_hello_max}",
+                                    oninput: move |e| disc_hello_max.set(e.value()),
+                                }
+                            }
+                            div { class: "form-row",
+                                label { class: "form-label",
+                                    "Gossip fanout"
+                                    span { class: "form-hint", " — neighbors to gossip per tick" }
+                                }
+                                input {
+                                    r#type: "number",
+                                    class: "form-input",
+                                    min: "0",
+                                    max: "20",
+                                    value: "{disc_gossip}",
+                                    oninput: move |e| disc_gossip.set(e.value()),
+                                }
+                            }
+                            div { class: "form-row",
+                                label { class: "form-label",
+                                    "SWIM indirect fanout"
+                                    span { class: "form-hint", " — 0 disables SWIM probing" }
+                                }
+                                input {
+                                    r#type: "number",
+                                    class: "form-input",
+                                    min: "0",
+                                    max: "10",
+                                    value: "{disc_swim}",
+                                    oninput: move |e| disc_swim.set(e.value()),
+                                }
+                            }
+                            div { class: "form-row",
+                                label { class: "form-label",
+                                    "Liveness miss count"
+                                    span { class: "form-hint", " — missed hellos before neighbor is Stale" }
+                                }
+                                input {
+                                    r#type: "number",
+                                    class: "form-input",
+                                    min: "1",
+                                    max: "20",
+                                    value: "{disc_miss}",
+                                    oninput: move |e| disc_miss.set(e.value()),
+                                }
+                            }
+                        }
+                        if let Some(ref err) = *disc_error.read() {
+                            div { class: "error-banner", style: "margin-bottom:8px;", "{err}" }
+                        }
+                        button {
+                            class: "btn btn-primary btn-sm",
+                            onclick: move |_| {
+                                let base = disc_hello_base.read().trim().to_string();
+                                let max  = disc_hello_max.read().trim().to_string();
+                                let gsp  = disc_gossip.read().trim().to_string();
+                                let swim = disc_swim.read().trim().to_string();
+                                let miss = disc_miss.read().trim().to_string();
+                                match (base.parse::<u64>(), max.parse::<u64>(),
+                                       gsp.parse::<u32>(), swim.parse::<u32>(),
+                                       miss.parse::<u32>()) {
+                                    (Ok(b), Ok(m), Ok(g), Ok(s), Ok(lm))
+                                        if b >= 100 && m >= b =>
+                                    {
+                                        disc_error.set(None);
+                                        ctx.cmd.send(DashCmd::DiscoveryConfigSet(format!(
+                                            "hello_interval_base_ms={b}&hello_interval_max_ms={m}&\
+                                             gossip_fanout={g}&swim_indirect_fanout={s}&\
+                                             liveness_miss_count={lm}"
+                                        )));
+                                    }
+                                    _ => disc_error.set(Some(
+                                        "Invalid values: base ≥ 100 ms, max ≥ base, counts ≥ 0".into()
+                                    )),
+                                }
+                            },
+                            "Apply Discovery Config"
+                        }
+                    }
+                }
+            } else {
+                rsx! {}
             }
         }
 
