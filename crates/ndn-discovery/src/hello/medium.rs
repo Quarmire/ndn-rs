@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::str::FromStr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, RwLock};
 use std::sync::atomic::AtomicU32;
 use std::time::Instant;
 
@@ -58,12 +58,20 @@ impl HelloState {
 /// Exposed to `LinkMedium` implementations so they can access the node name,
 /// config, strategy, and mutable state when building packets or handling
 /// inbound messages.
+///
+/// The `config` field is held behind an `Arc<RwLock<>>` so that the management
+/// handler can update Tier 2 parameters (hello intervals, timeouts, fanouts)
+/// at runtime without restarting the protocol.
 pub struct HelloCore {
     pub node_name: Name,
     pub hello_prefix: Name,
     pub claimed: Vec<Name>,
     pub nonce_counter: AtomicU32,
-    pub config: DiscoveryConfig,
+    /// Live-mutable discovery configuration.
+    ///
+    /// Clone the `Arc` via [`HelloCore::config_handle`] to share the same
+    /// config instance with the management handler.
+    pub config: Arc<RwLock<DiscoveryConfig>>,
     pub strategy: Mutex<Box<dyn NeighborProbeStrategy>>,
     pub served_prefixes: Mutex<Vec<Name>>,
     pub state: Mutex<HelloState>,
@@ -71,13 +79,26 @@ pub struct HelloCore {
 
 impl HelloCore {
     pub fn new(node_name: Name, config: DiscoveryConfig) -> Self {
+        Self::new_shared(node_name, Arc::new(RwLock::new(config)))
+    }
+
+    /// Create with a pre-existing shared config handle.
+    ///
+    /// Use this when the management handler needs to mutate the same config
+    /// instance that the protocol reads from.
+    pub fn new_shared(node_name: Name, config: Arc<RwLock<DiscoveryConfig>>) -> Self {
         let hello_prefix = Name::from_str(HELLO_PREFIX_STR).expect("static prefix is valid");
         let mut claimed = vec![hello_prefix.clone()];
-        if config.swim_indirect_fanout > 0 {
+        let (swim_fanout, strategy) = {
+            let cfg = config.read().unwrap();
+            let fanout = cfg.swim_indirect_fanout;
+            let strategy = build_strategy(&cfg);
+            (fanout, strategy)
+        };
+        if swim_fanout > 0 {
             claimed.push(crate::scope::probe_direct().clone());
             claimed.push(crate::scope::probe_via().clone());
         }
-        let strategy = build_strategy(&config);
         Self {
             node_name,
             hello_prefix,
@@ -88,6 +109,11 @@ impl HelloCore {
             config,
             state: Mutex::new(HelloState::new()),
         }
+    }
+
+    /// Return a cloneable handle to the shared config for use by the management handler.
+    pub fn config_handle(&self) -> Arc<RwLock<DiscoveryConfig>> {
+        Arc::clone(&self.config)
     }
 }
 

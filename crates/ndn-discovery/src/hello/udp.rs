@@ -228,8 +228,12 @@ impl LinkMedium for UdpMedium {
         // Use the HelloProtocol helper indirectly — we need the full proto
         // to call build_hello_payload. Since we only have core here, replicate
         // the payload build inline.
+        let (prefix_announcement, hello_interval_base) = {
+            let cfg = core.config.read().unwrap();
+            (cfg.prefix_announcement.clone(), cfg.hello_interval_base)
+        };
         let mut payload = crate::HelloPayload::new(core.node_name.clone());
-        if core.config.prefix_announcement == crate::config::PrefixAnnouncementMode::InHello {
+        if prefix_announcement == crate::config::PrefixAnnouncementMode::InHello {
             payload.served_prefixes = core.served_prefixes.lock().unwrap().clone();
         }
         {
@@ -244,12 +248,7 @@ impl LinkMedium for UdpMedium {
         payload.unicast_port = self.unicast_port;
         let content = payload.encode();
 
-        let freshness_ms = core
-            .config
-            .hello_interval_base
-            .as_millis()
-            .min(u32::MAX as u128) as u64
-            * 2;
+        let freshness_ms = hello_interval_base.as_millis().min(u32::MAX as u128) as u64 * 2;
 
         let signer = &self.signer;
         DataBuilder::new(interest_name.clone(), &content)
@@ -547,7 +546,7 @@ mod tests {
     #[test]
     fn tick_interval_from_config() {
         let nd = make_nd();
-        assert_eq!(nd.core.config.tick_interval, Duration::from_millis(500));
+        assert_eq!(nd.core.config.read().unwrap().tick_interval, Duration::from_millis(500));
     }
 
     #[test]
@@ -592,7 +591,7 @@ mod tests {
             Name::from_str("/ndn/test/node").unwrap(),
             &DiscoveryProfile::Mobile,
         );
-        assert!(nd.core.config.hello_interval_base < Duration::from_secs(1));
+        assert!(nd.core.config.read().unwrap().hello_interval_base < Duration::from_secs(1));
     }
 
     #[test]

@@ -70,6 +70,7 @@ impl<T: LinkMedium> HelloProtocol<T> {
     // ── Shared packet builders ───────────────────────────────────────────────
 
     pub fn build_hello_interest(&self, nonce: u32) -> Bytes {
+        let hello_interval_base = self.core.config.read().unwrap().hello_interval_base;
         let mut w = TlvWriter::new();
         w.write_nested(tlv_type::INTEREST, |w: &mut TlvWriter| {
             w.write_nested(tlv_type::NAME, |w: &mut TlvWriter| {
@@ -79,13 +80,7 @@ impl<T: LinkMedium> HelloProtocol<T> {
                 w.write_tlv(tlv_type::NAME_COMPONENT, &nonce.to_be_bytes());
             });
             w.write_tlv(tlv_type::NONCE, &nonce.to_be_bytes());
-            let lifetime_ms = self
-                .core
-                .config
-                .hello_interval_base
-                .as_millis()
-                .min(u32::MAX as u128) as u64
-                * 2;
+            let lifetime_ms = hello_interval_base.as_millis().min(u32::MAX as u128) as u64 * 2;
             write_nni(w, tlv_type::INTEREST_LIFETIME, lifetime_ms);
         });
         w.finish()
@@ -97,7 +92,7 @@ impl<T: LinkMedium> HelloProtocol<T> {
     /// before applying link-specific signing.
     pub fn build_hello_payload(&self) -> HelloPayload {
         let mut payload = HelloPayload::new(self.core.node_name.clone());
-        if self.core.config.prefix_announcement == PrefixAnnouncementMode::InHello {
+        if self.core.config.read().unwrap().prefix_announcement == PrefixAnnouncementMode::InHello {
             payload.served_prefixes = self.core.served_prefixes.lock().unwrap().clone();
         }
         {
@@ -186,7 +181,7 @@ impl<T: LinkMedium> HelloProtocol<T> {
         }
 
         // Auto-populate FIB with served prefixes (InHello mode).
-        if self.core.config.prefix_announcement == PrefixAnnouncementMode::InHello
+        if self.core.config.read().unwrap().prefix_announcement == PrefixAnnouncementMode::InHello
             && let Some(face_id) = peer_face_id
         {
             for prefix in &payload.served_prefixes {
@@ -381,7 +376,7 @@ impl<T: LinkMedium> DiscoveryProtocol for HelloProtocol<T> {
     }
 
     fn tick_interval(&self) -> Duration {
-        self.core.config.tick_interval
+        self.core.config.read().unwrap().tick_interval
     }
 
     fn on_face_up(&self, face_id: FaceId, ctx: &dyn DiscoveryContext) {
@@ -417,9 +412,10 @@ impl<T: LinkMedium> DiscoveryProtocol for HelloProtocol<T> {
         meta: &InboundMeta,
         ctx: &dyn DiscoveryContext,
     ) -> bool {
+        let swim_fanout = self.core.config.read().unwrap().swim_indirect_fanout;
         match raw.first() {
             Some(&0x05) => {
-                if self.core.config.swim_indirect_fanout > 0
+                if swim_fanout > 0
                     && let Some(parsed) = parse_raw_interest(raw)
                 {
                     if parsed.name.has_prefix(probe_via()) {
@@ -433,7 +429,7 @@ impl<T: LinkMedium> DiscoveryProtocol for HelloProtocol<T> {
                     .handle_hello_interest(raw, incoming_face, meta, &self.core, ctx)
             }
             Some(&0x06) => {
-                if self.core.config.swim_indirect_fanout > 0 && is_probe_ack(raw) {
+                if swim_fanout > 0 && is_probe_ack(raw) {
                     return self
                         .handle_probe_ack(raw, incoming_face, ctx)
                         .unwrap_or(false);
@@ -446,6 +442,18 @@ impl<T: LinkMedium> DiscoveryProtocol for HelloProtocol<T> {
 
     fn on_tick(&self, now: Instant, ctx: &dyn DiscoveryContext) {
         let protocol = self.medium.protocol_id();
+
+        // Read config once per tick to avoid repeated lock acquisitions.
+        let (liveness_timeout, miss_limit, gossip_k, swim_k, probe_timeout) = {
+            let cfg = self.core.config.read().unwrap();
+            (
+                cfg.liveness_timeout,
+                cfg.liveness_miss_count,
+                cfg.gossip_fanout as usize,
+                cfg.swim_indirect_fanout as usize,
+                cfg.probe_timeout,
+            )
+        };
 
         // ── Hello probe scheduling ───────────────────────────────────────────
         let probes = { self.core.strategy.lock().unwrap().on_tick(now) };
@@ -478,9 +486,6 @@ impl<T: LinkMedium> DiscoveryProtocol for HelloProtocol<T> {
         }
 
         // ── Neighbor state machine ───────────────────────────────────────────
-        let liveness_timeout = self.core.config.liveness_timeout;
-        let miss_limit = self.core.config.liveness_miss_count;
-        let gossip_k = self.core.config.gossip_fanout as usize;
         let all = ctx.neighbors().all();
         for entry in &all {
             match &entry.state {
@@ -570,7 +575,7 @@ impl<T: LinkMedium> DiscoveryProtocol for HelloProtocol<T> {
         }
 
         // ── SWIM direct probes to established neighbors ──────────────────────
-        if self.core.config.swim_indirect_fanout > 0 {
+        if swim_k > 0 {
             for entry in all.iter().filter(|e| e.is_reachable()) {
                 if let Some((face_id, _, _)) = entry.faces.first() {
                     let nonce = self.core.nonce_counter.fetch_add(1, Ordering::Relaxed);
@@ -590,7 +595,6 @@ impl<T: LinkMedium> DiscoveryProtocol for HelloProtocol<T> {
         }
 
         // ── Expire hello pending probes ──────────────────────────────────────
-        let probe_timeout = self.core.config.probe_timeout;
         let mut timed_out = 0u32;
         {
             let mut st = self.core.state.lock().unwrap();
@@ -611,8 +615,8 @@ impl<T: LinkMedium> DiscoveryProtocol for HelloProtocol<T> {
         }
 
         // ── Expire SWIM direct probes; dispatch indirect probes on failure ───
-        if self.core.config.swim_indirect_fanout > 0 {
-            let k = self.core.config.swim_indirect_fanout as usize;
+        if swim_k > 0 {
+            let k = swim_k;
             let mut timed_out_swim: Vec<Name> = Vec::new();
             {
                 let mut st = self.core.state.lock().unwrap();
