@@ -31,11 +31,11 @@ Each stage receives `PacketContext` **by value** and returns an `Action` enum. T
 
 ## Library, Not Daemon
 
-ndn-rs is a library. There is no daemon/client split. The forwarding engine (`ndn-engine`) is a Rust library that any application can embed directly. The standalone router (`ndn-router`) is just one binary that links against this library; applications can equally embed the engine in-process and get a thin `AppFace` backed by a shared memory ring buffer.
+ndn-rs is a library. There is no daemon/client split. The forwarding engine (`ndn-engine`) is a Rust library that any application can embed directly. The standalone router (`ndn-fwd`) is just one binary that links against this library; applications can equally embed the engine in-process and get a thin `InProcFace` backed by a shared memory ring buffer.
 
 This means the same codebase runs as a full router, an embedded forwarder on a microcontroller (via `ndn-embedded` with `no_std`), or an in-process forwarder inside an application. No rewrite required.
 
-> **⚠️ Important:** ndn-rs is a **library, not a daemon**. There is no daemon/client split. Applications embed the forwarding engine directly and communicate via in-process `AppFace` channels -- no IPC serialization, no Unix socket round-trips. The standalone `ndn-router` binary is just one consumer of this library, not a privileged component. This is a fundamental departure from NFD's architecture.
+> **⚠️ Important:** ndn-rs is a **library, not a daemon**. There is no daemon/client split. Applications embed the forwarding engine directly and communicate via in-process `InProcFace` channels -- no IPC serialization, no Unix socket round-trips. The standalone `ndn-fwd` binary is just one consumer of this library, not a privileged component. This is a fundamental departure from NFD's architecture.
 
 ## Key Design Decisions
 
@@ -104,7 +104,7 @@ graph TD
     subgraph Faces
         F1["UdpFace task"]
         F2["TcpFace task"]
-        F3["AppFace task"]
+        F3["InProcFace task"]
         F4["EtherFace task"]
     end
 

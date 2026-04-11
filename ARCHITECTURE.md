@@ -6,28 +6,32 @@ NDN-RS models Named Data Networking as **composable async pipelines with trait-b
 
 ```
 Layer 0 — Binaries
-  ndn-router          Standalone forwarder with TOML config and management socket
+  ndn-fwd             Standalone forwarder with TOML config and management socket
   ndn-tools           ndn-peek, ndn-put, ndn-ping, ndn-traffic, ndn-iperf
   ndn-bench           Throughput and latency benchmarking
 
 Layer 1 — Engine & Application
   ndn-engine          ForwarderEngine, EngineBuilder, pipeline wiring, task topology
-  ndn-app             Application API: express(), produce(), subscribe()
-  ndn-ipc             IPC client/server, chunked transfer, service registry
+                      (includes ndn-pipeline: PipelineStage, PacketContext, Action)
+  ndn-app             Application API: Consumer, Producer, Subscriber
+  ndn-ipc             ForwarderClient, BlockingForwarderClient, chunked transfer, registry
   ndn-config          TOML config parsing, NFD management protocol
   ndn-discovery       Pluggable neighbor (SWIM) and service discovery
   ndn-routing         Pluggable routing protocols: StaticProtocol, DvrProtocol (DVR)
 
-Layer 2 — Pipeline, Strategy, Security
-  ndn-pipeline        PipelineStage trait, PacketContext, Action enum
+Layer 2 — Strategy & Security
   ndn-strategy        BestRoute, Multicast, ASF, composed strategies
-  ndn-security        Signer/Verifier, TrustSchema, Validator, SafeData
+  ndn-security        KeyChain, Signer/Verifier, TrustSchema, Validator, SafeData
 
 Layer 3 — Face Implementations
-  ndn-face-net        UdpFace, TcpFace, MulticastUdpFace, WebSocketFace
-  ndn-face-local      AppFace, UnixFace, ShmFace (optional)
-  ndn-face-serial     SerialFace (COBS framing)
-  ndn-face-l2         NamedEtherFace (AF_PACKET/PF_NDRV/Npcap), WfbFace, BluetoothFace
+  ndn-faces           All face types under feature flags:
+    net               UdpFace, TcpFace, MulticastUdpFace (default)
+    websocket         WebSocketFace (default); websocket-tls adds TLS server listener
+    local             InProcFace/InProcHandle, UnixFace (default)
+    spsc-shm          ShmFace/ShmHandle zero-copy ring (optional, Unix)
+    serial            SerialFace with COBS framing (optional)
+    l2                NamedEtherFace (AF_PACKET/PF_NDRV/Npcap), WfbFace
+    bluetooth         BleFace GATT stub (interop with NDNts web-bluetooth-transport)
 
 Layer 4 — Foundation
   ndn-transport       Face trait, FaceId, FaceTable, StreamFace, TlvCodec
@@ -55,12 +59,14 @@ Dependencies flow strictly downward. `ndn-tlv` and `ndn-packet` compile `no_std`
 | Trait / Type | Crate | Role |
 |---|---|---|
 | `Face` | ndn-transport | Async send/recv over any transport |
-| `PipelineStage` | ndn-pipeline | Single processing step; returns `Action` |
+| `PipelineStage` | ndn-engine | Single processing step; returns `Action` |
 | `Strategy` | ndn-strategy | Forwarding decision per Interest |
 | `ContentStore` | ndn-store | Pluggable cache backend |
+| `KeyChain` | ndn-security | Identity, signing, and trust anchors |
 | `Signer` / `Verifier` | ndn-security | Cryptographic operations |
 | `DiscoveryProtocol` | ndn-discovery | Neighbor/service discovery |
 | `RoutingProtocol` | ndn-routing | RIB population from routing algorithms |
+| `ForwarderClient` | ndn-ipc | App-to-forwarder IPC (async or blocking) |
 | `ComputeHandler` | ndn-compute | Named function execution |
 
 ## Pipeline Flow

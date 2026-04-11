@@ -38,7 +38,7 @@ The simplest form of in-network compute requires zero changes to the forwarder. 
 /sensor/room42/temperature/aggregated/window=60s
 ```
 
-The application computes the 60-second average via an `AppFace`, publishes it as Data, and the CS caches it. Consumers expressing Interests for this name do not know or care whether the Data came from a live computation or a cache hit. This is the most underappreciated form of in-network compute -- it already works with the standard pipeline.
+The application computes the 60-second average via an `InProcFace`, publishes it as Data, and the CS caches it. Consumers expressing Interests for this name do not know or care whether the Data came from a live computation or a cache hit. This is the most underappreciated form of in-network compute -- it already works with the standard pipeline.
 
 ### Level 2: Router-Side Handler
 
@@ -76,7 +76,7 @@ A handler receives an Interest, extracts parameters from the name components, pe
 - **`NotFound`** -- no handler matched this name (returned as `None` from dispatch, not as an error)
 - **`ComputeFailed(String)`** -- the handler ran but the computation itself failed
 
-Handlers are async. A handler can fetch data from other sources, call into libraries, or even express its own Interests through an `AppFace` to gather inputs before producing a result.
+Handlers are async. A handler can fetch data from other sources, call into libraries, or even express its own Interests through an `InProcFace` to gather inputs before producing a result.
 
 > **Design note:** The `ComputeHandler` trait uses `impl Future` in the return position, which avoids requiring handlers to manually box their futures. Internally, `ComputeRegistry` uses an `ErasedHandler` trait with `Pin<Box<dyn Future>>` for type-erased storage in the name trie. This means handler authors get ergonomic async syntax while the registry pays the boxing cost once at dispatch time.
 

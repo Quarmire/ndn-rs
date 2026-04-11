@@ -11,25 +11,25 @@ ndn-rs is a research and development platform. The core forwarding pipeline, fac
 The mapping is straightforward once you see the two layers:
 
 - **ndn-rs** (the library) is analogous to **ndn-cxx** (the C++ library). Both provide the core data structures, TLV codec, forwarding engine, and face abstractions that applications link against.
-- **ndn-router** (the standalone binary) is analogous to **NFD** (the daemon). Both are thin executables that instantiate the library, open network faces, and run a forwarding loop.
+- **ndn-fwd** (the standalone binary) is analogous to **NFD** (the daemon). Both are thin executables that instantiate the library, open network faces, and run a forwarding loop.
 
 The key difference is architectural philosophy. ndn-cxx and NFD are written in C++ with class hierarchies and virtual dispatch. ndn-rs models the same concepts as composable data pipelines with Rust traits, `Arc`-based shared ownership, and zero-copy `Bytes` throughout. Both follow the same NDN specifications (RFC 8569, RFC 8609), so they interoperate on the wire.
 
-### What's the difference between ndn-rs and ndn-router?
+### What's the difference between ndn-rs and ndn-fwd?
 
 ndn-rs is the library crate -- it contains the forwarding engine, PIT, FIB, Content Store, face abstractions, strategies, and the management protocol. You can embed it directly in your application.
 
-ndn-router is a standalone binary that depends on ndn-rs. It reads a configuration file, opens network faces (UDP, TCP, Ethernet, etc.), starts the management listener, and runs the forwarding pipeline. If you just want a forwarder running on a machine, ndn-router is what you install. If you want to build NDN into your own application, you depend on ndn-rs as a library.
+ndn-fwd is a standalone binary that depends on ndn-rs. It reads a configuration file, opens network faces (UDP, TCP, Ethernet, etc.), starts the management listener, and runs the forwarding pipeline. If you just want a forwarder running on a machine, ndn-fwd is what you install. If you want to build NDN into your own application, you depend on ndn-rs as a library.
 
-### Can I use ndn-rs in my application without running ndn-router?
+### Can I use ndn-rs in my application without running ndn-fwd?
 
-Absolutely -- this is one of the main design goals. Your application can instantiate the forwarding engine directly, create in-process `AppFace` channels, and exchange Interests and Data without any IPC overhead. The latency for an in-process `AppFace` round-trip is on the order of ~20 ns via `mpsc` channels, compared to ~2 us for Unix socket IPC to a separate daemon.
+Absolutely -- this is one of the main design goals. Your application can instantiate the forwarding engine directly, create in-process `InProcFace` channels, and exchange Interests and Data without any IPC overhead. The latency for an in-process `InProcFace` round-trip is on the order of ~20 ns via `mpsc` channels, compared to ~2 us for Unix socket IPC to a separate daemon.
 
-That said, if your application needs to talk to remote NDN nodes or other local applications, you will want either ndn-router running as a forwarder, or your application opening its own network faces through the library.
+That said, if your application needs to talk to remote NDN nodes or other local applications, you will want either ndn-fwd running as a forwarder, or your application opening its own network faces through the library.
 
 ### Can ndn-rs interoperate with NFD?
 
-Yes. ndn-rs uses the standard NDN TLV wire format and NDNLPv2 link protocol, so UDP, TCP, and WebSocket faces can connect to NFD nodes without any translation layer. The management protocol follows NFD's command format for compatibility, meaning tools written for NFD (like nfdc) can also manage ndn-router.
+Yes. ndn-rs uses the standard NDN TLV wire format and NDNLPv2 link protocol, so UDP, TCP, and WebSocket faces can connect to NFD nodes without any translation layer. The management protocol follows NFD's command format for compatibility, meaning tools written for NFD (like nfdc) can also manage ndn-fwd.
 
 ### How does ndn-rs handle security differently from ndn-cxx?
 
@@ -47,11 +47,11 @@ The `ndn-tlv` and `ndn-packet` crates compile with `no_std` (with `alloc`). The 
 
 ### Why is ndn-rs a library instead of a daemon?
 
-The analogy to draw is with ndn-cxx, not NFD. ndn-cxx is the C++ library that applications link against; NFD is one particular binary built on top of it. ndn-rs takes the same approach: the forwarding engine is a library, and ndn-router is one binary that uses it.
+The analogy to draw is with ndn-cxx, not NFD. ndn-cxx is the C++ library that applications link against; NFD is one particular binary built on top of it. ndn-rs takes the same approach: the forwarding engine is a library, and ndn-fwd is one binary that uses it.
 
-This means applications can embed the full forwarding engine directly, which unlocks several things. In-process communication through `AppFace` channels avoids IPC serialization entirely. The compiler can see through the entire pipeline and optimize accordingly. And applications that need custom forwarding behavior (novel strategies, application-layer caching, compute-on-fetch) can extend the engine in-process rather than through an external plugin API.
+This means applications can embed the full forwarding engine directly, which unlocks several things. In-process communication through `InProcFace` channels avoids IPC serialization entirely. The compiler can see through the entire pipeline and optimize accordingly. And applications that need custom forwarding behavior (novel strategies, application-layer caching, compute-on-fetch) can extend the engine in-process rather than through an external plugin API.
 
-For users who just want a standalone forwarder, ndn-router provides exactly that -- a thin binary that reads a config file and runs the engine.
+For users who just want a standalone forwarder, ndn-fwd provides exactly that -- a thin binary that reads a config file and runs the engine.
 
 ### Why DashMap for the PIT instead of a single Mutex?
 
@@ -73,7 +73,7 @@ Run `cargo bench -p ndn-engine` for pipeline throughput numbers on your hardware
 
 ### How do I profile ndn-rs?
 
-The library uses the `tracing` crate for structured logging with per-packet spans. Set `RUST_LOG=ndn_engine=trace` for detailed per-packet traces, or `RUST_LOG=ndn_engine=debug` for a less verbose view of forwarding decisions. For CPU profiling, `cargo flamegraph` or `perf record` on the ndn-router binary will show you where time is spent.
+The library uses the `tracing` crate for structured logging with per-packet spans. Set `RUST_LOG=ndn_engine=trace` for detailed per-packet traces, or `RUST_LOG=ndn_engine=debug` for a less verbose view of forwarding decisions. For CPU profiling, `cargo flamegraph` or `perf record` on the ndn-fwd binary will show you where time is spent.
 
 ## Development
 
@@ -91,7 +91,7 @@ See the [Implementing a Strategy](./guides/implementing-strategy.md) guide. Impl
 cargo bench -p ndn-packet    # Name operations
 cargo bench -p ndn-store     # Content Store (LRU, Sharded, Fjall)
 cargo bench -p ndn-engine    # Full pipeline
-cargo bench -p ndn-face-local  # Face latency/throughput
+cargo bench -p ndn-faces  # Face latency/throughput
 cargo bench -p ndn-security  # Signing and validation
 ```
 

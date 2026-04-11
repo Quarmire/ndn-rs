@@ -29,13 +29,13 @@ cargo fmt -- --check
 
 ## Building the router binary
 
-The standalone forwarder lives in `binaries/ndn-router`:
+The standalone forwarder lives in `binaries/ndn-fwd`:
 
 ```bash
-cargo build -p ndn-router
+cargo build -p ndn-fwd
 ```
 
-The compiled binary is at `target/debug/ndn-router` (or `target/release/ndn-router` with `--release`).
+The compiled binary is at `target/debug/ndn-fwd` (or `target/release/ndn-fwd` with `--release`).
 
 To build the CLI tools (ping, peek, put, ctl, traffic, iperf):
 
@@ -47,20 +47,20 @@ This produces several binaries: `ndn-ping`, `ndn-peek`, `ndn-put`, `ndn-ctl`, `n
 
 ## Optional features
 
-### ndn-router features
+### ndn-fwd features
 
 The router binary has three optional feature flags, all enabled by default:
 
 | Feature     | Description                                                  | Gate            |
 |-------------|--------------------------------------------------------------|-----------------|
-| `spsc-shm`  | Shared-memory data plane between apps and router (Unix only) | `ndn-face-local/spsc-shm` |
-| `websocket` | WebSocket face for browser and remote clients                | `ndn-face-net/websocket`  |
-| `serial`    | Serial port face (RS-232 / USB-serial)                       | `ndn-face-serial/serial`  |
+| `spsc-shm`  | Shared-memory data plane between apps and router (Unix only) | `ndn-faces/spsc-shm` |
+| `websocket` | WebSocket face for browser and remote clients                | `ndn-faces/websocket`  |
+| `serial`    | Serial port face (RS-232 / USB-serial)                       | `ndn-faces/serial`  |
 
 To build without WebSocket support, for example:
 
 ```bash
-cargo build -p ndn-router --no-default-features --features spsc-shm,serial
+cargo build -p ndn-fwd --no-default-features --features spsc-shm,serial
 ```
 
 ### ndn-store features
@@ -82,28 +82,28 @@ cargo test -p ndn-store --features fjall
 Copy the example configuration and adjust it for your environment:
 
 ```bash
-cp ndn-router.example.toml ndn-router.toml
+cp ndn-fwd.example.toml ndn-fwd.toml
 
 # Start the router (needs sudo for raw sockets / privileged ports)
-sudo ./target/debug/ndn-router --config ndn-router.toml
+sudo ./target/debug/ndn-fwd --config ndn-fwd.toml
 ```
 
 The config file can also be specified via the `NDN_CONFIG` environment variable:
 
 ```bash
-sudo NDN_CONFIG=ndn-router.toml ./target/release/ndn-router
+sudo NDN_CONFIG=ndn-fwd.toml ./target/release/ndn-fwd
 ```
 
 The log level defaults to `info` and can be overridden at runtime:
 
 ```bash
-sudo ./target/release/ndn-router --config ndn-router.toml --log-level debug
+sudo ./target/release/ndn-fwd --config ndn-fwd.toml --log-level debug
 ```
 
 Or via the standard `RUST_LOG` environment variable:
 
 ```bash
-sudo RUST_LOG=ndn_engine=debug ./target/release/ndn-router --config ndn-router.toml
+sudo RUST_LOG=ndn_engine=debug ./target/release/ndn-fwd --config ndn-fwd.toml
 ```
 
 See [Running the Router](./running-router.md) for a detailed configuration walkthrough.

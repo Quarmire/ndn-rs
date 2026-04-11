@@ -199,9 +199,9 @@ while let Some(update) = handle.recv().await {
 
 The `SyncUpdate` struct tells you who published, the name prefix to fetch under, and (for SVS) the sequence range you missed. For PSync, where there's no inherent ordering, `low_seq` and `high_seq` are both zero -- the update simply tells you a new name hash appeared.
 
-### Connecting to AppFace
+### Connecting to InProcFace
 
-In a typical ndn-rs deployment, the send/recv channels connect to an `AppFace`. The application registers the sync group prefix with the router, and the AppFace forwards matching Interests to the recv channel while the send channel pushes outgoing Interests through the router's forwarding pipeline. The sync protocol itself is oblivious to the transport -- it just reads from and writes to `mpsc` channels.
+In a typical ndn-rs deployment, the send/recv channels connect to an `InProcFace`. The application registers the sync group prefix with the router, and the InProcFace forwards matching Interests to the recv channel while the send channel pushes outgoing Interests through the router's forwarding pipeline. The sync protocol itself is oblivious to the transport -- it just reads from and writes to `mpsc` channels.
 
 > **Configuration knobs:** Both `SvsConfig` and `PSyncConfig` let you tune the sync interval (default 1 second), jitter range (default 200ms), and notification channel capacity (default 256). PSync additionally exposes `ibf_size` (default 80 cells). Increasing the IBF size allows larger set differences to decode successfully, at the cost of larger Sync Interests.
 

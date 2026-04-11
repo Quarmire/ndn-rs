@@ -6,17 +6,19 @@ Tracked stubs, placeholders, and deferred work across the codebase.
 
 ## Face implementations (all stub — recv/send return `FaceError::Closed`)
 
-- [x] **NamedEtherFace** — `ndn-face-l2/src/ether.rs` (Linux), `ether_macos.rs` (macOS), `ether_windows.rs` (Windows)
+- [x] **NamedEtherFace** — `ndn-faces/src/l2/ether.rs` (Linux), `ether_macos.rs` (macOS), `ether_windows.rs` (Windows)
       Linux: AF_PACKET + SOCK_DGRAM with TPACKET_V2 mmap ring buffers (RX + TX).
       macOS: PF_NDRV raw Ethernet via `NdrvSocket`; source-MAC filtering in software.
       Windows: Npcap via `PcapSocket`; background recv/send threads bridge to Tokio.
-- [ ] **WfbFace** — `ndn-face-l2/src/wfb.rs`
+- [ ] **WfbFace** — `ndn-faces/src/l2/wfb.rs`
       Unidirectional 802.11 monitor-mode injection via wfb-ng.
-      Tx recv parks with `pending()`; Rx recv/send stub.
-- [ ] **BluetoothFace** — `ndn-face-l2/src/bluetooth.rs`
-      RFCOMM stream with COBS framing (reuse SerialFace model).
-- [ ] **SerialFace** — `ndn-face-serial/src/serial.rs`
-      UART/LoRa/RS-485 with COBS framing via `tokio-serial`.
+      Tx recv parks with `pending()`; Rx recv/send stub. **(v0.2.0)**
+- [ ] **BleFace** — `ndn-faces/src/l2/bluetooth.rs`
+      Full GATT server implementation (NDNts `@ndn/web-bluetooth-transport` protocol).
+      Protocol spec and UUIDs are documented in the stub; requires a stable async
+      BLE GATT crate (candidates: `bluer`, `btleplug`). **(v0.2.0)**
+- [x] **SerialFace** — `ndn-faces/src/serial/serial.rs`
+      UART/LoRa/RS-485 with COBS framing via `tokio-serial`. Functional.
 
 ## Engine pipeline
 
@@ -45,14 +47,21 @@ Tracked stubs, placeholders, and deferred work across the codebase.
       `SecurityManager` passed into `EngineBuilder::security()` and stored in
       `EngineInner`. Accessible via `ForwarderEngine::security()`.
 
-## CLI tools (none connected to a live forwarder)
+## CLI tools
 
-- [ ] **ndn-peek** — `ndn-tools/src/peek.rs:49`
-      `// TODO: connect to local forwarder via AppFace`
-- [ ] **ndn-ping** — `ndn-tools/src/ping.rs:60`
-      Simulates RTT with `sleep(1ms)` instead of real Interest/Data.
-- [ ] **ndn-put** — `ndn-tools/src/put.rs:70`
-      Segments file but doesn't publish.
+- [x] **ndn-peek** — `crates/ndn-tools-core/src/peek.rs`
+      Single and segmented fetch via `ForwarderClient`, ndn-cxx compatible naming.
+- [x] **ndn-ping** — `crates/ndn-tools-core/src/ping.rs`
+      Server and client modes; measures RTT, emits per-packet and summary events.
+- [x] **ndn-put** — `crates/ndn-tools-core/src/put.rs`
+      Publishes chunked objects with `ChunkedProducer`; ndn-cxx compatible segments.
+
+## WebSocket TLS / ACME
+
+- [ ] **WebSocket ACME certificate distribution** — targeted for v0.2.0.
+      Automated certificate renewal via ACME (Let's Encrypt) with SVS-based
+      fleet distribution. `websocket-tls` feature (v0.1.0) supports self-signed
+      and user-supplied certs; ACME integration is deferred.
 
 ## Research
 

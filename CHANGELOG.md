@@ -12,6 +12,73 @@ For the narrative behind each release — design decisions, rejected approaches,
 
 ---
 
+## [0.1.0] — 2026-04-11
+
+Stable 0.1.0. Finalizes all public names, fills ergonomic gaps, and wires
+remaining stub features. Detailed narrative in the
+[0.1.0 wiki page](https://quarmire.github.io/ndn-rs/wiki/releases/v0-1-0.html).
+
+### Breaking Changes
+
+- **`ndn-router` binary renamed to `ndn-fwd`** — update scripts and Docker images.
+- **`ndn-packet` default features** changed from `["std"]` to `[]`. Downstream
+  crates that rely on the old default must add `features = ["std"]` to their
+  `ndn-packet` dependency.
+- **`AppError` variants** replaced with typed enum — `AppError::Engine(anyhow)` is
+  gone; use `Connection(ForwarderError)`, `Closed`, `Protocol(String)` instead.
+- **`Producer::serve`** handler signature changed from `Fn(Interest) -> Option<Bytes>`
+  to `Fn(Interest, Responder) -> Future<Output = ()>` — use `Responder` to reply.
+- **Crate consolidation** — `ndn-face-net`, `ndn-face-local`, `ndn-face-serial`,
+  `ndn-face-l2`, and `ndn-pipeline` are removed. Use `ndn-faces` (feature-gated
+  modules) and `ndn-engine::pipeline` respectively.
+- **`RouterClient` / `RouterError`** renamed to `ForwarderClient` / `ForwarderError`.
+- **`AppFace` / `AppHandle`** renamed to `InProcFace` / `InProcHandle`.
+
+### Added
+
+#### API ergonomics (ndn-app)
+- `Responder` — single-use reply builder for `Producer::serve` handlers; supports
+  `respond()`, `respond_bytes()`, and `nack(reason)`.
+- `Consumer::fetch_all()` — parallel multi-name fetch.
+- `Consumer::fetch_with_retry()` — retry with exponential backoff.
+- `Consumer::fetch_segmented()` — auto-segmented fetch (FinalBlockId-aware).
+- `Consumer::get_verified()` — fetch + signature verification in one call.
+- `Producer::publish_large()` — auto-segments large content via `ChunkedProducer`.
+- `Subscriber::connect_psync()` / `connect_psync_with_config()` — PSync variant.
+
+#### Security (ndn-security)
+- `KeyChain::trust_only(prefix)` — build a validator trusting only one anchor.
+- `KeyChain::sign_data(builder)` — sign a Data packet in one call.
+- `KeyChain::sign_interest(builder)` — sign an Interest in one call.
+- `KeyChain::build_validator()` — alias for `validator()` for API symmetry.
+
+#### IPC (ndn-ipc)
+- `BlockingForwarderClient` — synchronous wrapper; useful for FFI and Python bindings.
+- `ForwarderError` now publicly exported.
+- `ChunkedConsumer`, `ChunkedProducer`, `NDN_DEFAULT_SEGMENT_SIZE` re-exported.
+
+#### Config (ndn-config)
+- `ForwarderConfig` parses `${VAR}` environment variable references in TOML values.
+- `ForwarderConfig::validate()` checks face addresses, route prefixes, and CS size.
+
+#### Packets (ndn-packet)
+- `Name` and `NameComponent` implement `PartialOrd` + `Ord` (NDN canonical ordering).
+
+#### Faces (ndn-faces)
+- New `websocket-tls` feature: TLS WebSocket server listener via `WebSocketFace::listen_tls`.
+  Supports `TlsConfig::SelfSigned` (rcgen-generated cert) and `UserSupplied` (PEM files).
+  ACME / SVS fleet cert distribution deferred to v0.2.0.
+
+#### Operations
+- `binaries/ndn-fwd/Dockerfile` — multi-stage Debian image for `ndn-fwd`.
+- `binaries/ndn-fwd/ndn-fwd.default.toml` — ready-to-run default config.
+
+### Fixed
+- Validator chain-walk connected to `CertCache` on `Pending` result.
+- Spec compliance gaps documented in `docs/unimplemented.md`.
+
+---
+
 ## [0.1.0-alpha] — 2026-04-06
 
 First tagged alpha. The full stack compiles, forwards packets, and interoperates

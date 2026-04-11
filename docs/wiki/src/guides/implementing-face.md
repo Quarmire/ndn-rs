@@ -208,7 +208,7 @@ graph TD
 
 Network-facing transports (UDP, TCP, Ethernet, serial) should wrap packets in an NDNLPv2 `LpPacket` envelope before writing to the wire. Local transports (Unix, App, SHM) send the raw packet as-is. The existing `StreamFace` makes this explicit via an `lp_encode` constructor parameter -- follow the same convention based on `FaceKind::scope()`.
 
-> **🎯 Tip:** When in doubt about whether your face needs LP wrapping, check `FaceKind::scope()`. If it returns `NonLocal`, you almost certainly need LP encoding. Study `UdpFace` (simplest network face) or `AppFace` (simplest local face) as reference implementations for your transport category.
+> **🎯 Tip:** When in doubt about whether your face needs LP wrapping, check `FaceKind::scope()`. If it returns `NonLocal`, you almost certainly need LP encoding. Study `UdpFace` (simplest network face) or `InProcFace` (simplest local face) as reference implementations for your transport category.
 
 ### Error handling
 
@@ -220,12 +220,12 @@ Study these for patterns:
 
 | Face | Crate | Notes |
 |------|-------|-------|
-| `UdpFace` | `ndn-face-net` | Datagram transport, simplest network face |
-| `TcpFace` | `ndn-face-net` | Stream transport via `StreamFace` helper |
-| `AppFace` | `ndn-face-local` | In-process channel pair, no serialization |
-| `ShmFace` | `ndn-face-local` | Shared-memory ring buffer, highest throughput |
-| `NamedEtherFace` | `ndn-face-l2` | Raw Ethernet via `AF_PACKET` |
-| `SerialFace` | `ndn-face-serial` | UART/serial with framing |
-| `WfbFace` | `ndn-face-l2` | Wifibroadcast NG integration |
-| `WebSocketFace` | `ndn-face-net` | WebSocket transport |
+| `UdpFace` | `ndn-faces` | Datagram transport, simplest network face |
+| `TcpFace` | `ndn-faces` | Stream transport via `StreamFace` helper |
+| `InProcFace` | `ndn-faces` | In-process channel pair, no serialization |
+| `ShmFace` | `ndn-faces` | Shared-memory ring buffer, highest throughput |
+| `NamedEtherFace` | `ndn-faces` | Raw Ethernet via `AF_PACKET` |
+| `SerialFace` | `ndn-faces` | UART/serial with framing |
+| `WfbFace` | `ndn-faces` | Wifibroadcast NG integration |
+| `WebSocketFace` | `ndn-faces` | WebSocket transport |
 | `ComputeFace` | `ndn-compute` | Named function networking |

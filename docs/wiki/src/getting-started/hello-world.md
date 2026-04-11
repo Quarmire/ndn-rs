@@ -1,12 +1,12 @@
 # Hello World
 
-This tutorial shows how to run a complete Interest/Data exchange using the ndn-rs library in a single Rust program. No external router is needed -- everything runs in-process via `AppFace` channel pairs.
+This tutorial shows how to run a complete Interest/Data exchange using the ndn-rs library in a single Rust program. No external router is needed -- everything runs in-process via `InProcFace` channel pairs.
 
 ## How it works
 
 In NDN, communication follows a pull-based model: a **consumer** sends an Interest packet naming the data it wants, and a **producer** responds with a matching Data packet. The forwarding engine sits between them, matching Interests to Data via the PIT (Pending Interest Table) and FIB (Forwarding Information Base).
 
-> **💡 Key insight:** No external router is needed for this example. The `AppFace` creates an in-process channel pair -- one side for the application, one side for the engine. Packets flow through the full forwarding pipeline (PIT, FIB, CS, strategy) but never touch the network. This is the same mechanism used for production in-process applications.
+> **💡 Key insight:** No external router is needed for this example. The `InProcFace` creates an in-process channel pair -- one side for the application, one side for the engine. Packets flow through the full forwarding pipeline (PIT, FIB, CS, strategy) but never touch the network. This is the same mechanism used for production in-process applications.
 
 ```mermaid
 sequenceDiagram
@@ -28,7 +28,7 @@ graph LR
         APP["Application code<br/>(Consumer / Producer)"]
     end
 
-    subgraph "AppFace Channel Pair"
+    subgraph "InProcFace Channel Pair"
         direction TB
         TX1["app_handle.send()"] -->|"mpsc"| RX1["engine face.recv()"]
         TX2["engine face.send()"] -->|"mpsc"| RX2["app_handle.recv()"]
@@ -55,7 +55,7 @@ Add these to your `Cargo.toml`:
 [dependencies]
 ndn-app        = { path = "crates/ndn-app" }
 ndn-engine     = { path = "crates/ndn-engine" }
-ndn-face-local = { path = "crates/ndn-face-local" }
+ndn-faces = { path = "crates/ndn-faces" }
 ndn-packet     = { path = "crates/ndn-packet", features = ["std"] }
 ndn-transport  = { path = "crates/ndn-transport" }
 tokio          = { version = "1", features = ["rt-multi-thread", "macros"] }
@@ -68,7 +68,7 @@ If you are working within the ndn-rs workspace, use `workspace = true` instead o
 ```rust
 use ndn_app::{Consumer, EngineBuilder, Producer};
 use ndn_engine::EngineConfig;
-use ndn_face_local::AppFace;
+use ndn_faces::local::InProcFace;
 use ndn_packet::Name;
 use ndn_packet::encode::DataBuilder;
 use ndn_store::FibNexthop;
@@ -77,10 +77,10 @@ use ndn_transport::FaceId;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // 1. Create in-process face pairs.
-    //    Each AppFace::new() returns a face (for the engine) and a handle
+    //    Each InProcFace::new() returns a face (for the engine) and a handle
     //    (for the application).  They are connected by an mpsc channel.
-    let (consumer_face, consumer_handle) = AppFace::new(FaceId(1), 64);
-    let (producer_face, producer_handle) = AppFace::new(FaceId(2), 64);
+    let (consumer_face, consumer_handle) = InProcFace::new(FaceId(1), 64);
+    let (producer_face, producer_handle) = InProcFace::new(FaceId(2), 64);
 
     // 2. Build the forwarding engine with both faces.
     let (engine, shutdown) = EngineBuilder::new(EngineConfig::default())
@@ -131,9 +131,9 @@ async fn main() -> anyhow::Result<()> {
 
 ## Step-by-step walkthrough
 
-### 1. Create AppFace pairs
+### 1. Create InProcFace pairs
 
-`AppFace::new(face_id, capacity)` creates a face for the engine side and a handle for the application side, connected by a bounded channel. The `capacity` parameter controls backpressure -- 64 is a good default.
+`InProcFace::new(face_id, capacity)` creates a face for the engine side and a handle for the application side, connected by a bounded channel. The `capacity` parameter controls backpressure -- 64 is a good default.
 
 ### 2. Build the engine
 
@@ -180,11 +180,11 @@ The FIB maps name prefixes to outgoing faces. `add_nexthop(&prefix, FibNexthop {
 
 ### 5. The exchange
 
-When `consumer.fetch(name)` is called, it builds an Interest packet, sends it through the AppFace channel into the engine, which looks up the FIB, finds the producer face, and forwards the Interest. The producer's `serve()` callback receives it, builds a Data packet, and sends it back through the engine to the consumer.
+When `consumer.fetch(name)` is called, it builds an Interest packet, sends it through the InProcFace channel into the engine, which looks up the FIB, finds the producer face, and forwards the Interest. The producer's `serve()` callback receives it, builds a Data packet, and sends it back through the engine to the consumer.
 
 ## Connecting to an external router
 
-If you have a running `ndn-router` instead of an embedded engine, applications connect via the router's face socket:
+If you have a running `ndn-fwd` instead of an embedded engine, applications connect via the router's face socket:
 
 ```rust
 use ndn_app::Consumer;
@@ -203,6 +203,6 @@ This uses a Unix socket (with optional SHM data plane) instead of in-process cha
 
 ## Next steps
 
-- [Running the Router](./running-router.md) -- deploy `ndn-router` as a standalone forwarder
+- [Running the Router](./running-router.md) -- deploy `ndn-fwd` as a standalone forwarder
 - [PIT, FIB, and Content Store](../concepts/pit-fib-cs.md) -- understand the data structures behind the exchange
 - [Pipeline Walkthrough](../deep-dive/pipeline-walkthrough.md) -- trace a packet through every pipeline stage

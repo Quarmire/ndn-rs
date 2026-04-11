@@ -74,7 +74,7 @@ Now let's follow an Interest through the full journey.
 
 ## The Interest's Journey
 
-An Interest packet materializes on a face -- perhaps a UDP datagram from a downstream consumer, or bytes pushed through an in-process `AppFace`. Its journey begins.
+An Interest packet materializes on a face -- perhaps a UDP datagram from a downstream consumer, or bytes pushed through an in-process `InProcFace`. Its journey begins.
 
 ```mermaid
 flowchart TD

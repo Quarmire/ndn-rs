@@ -1,8 +1,8 @@
 # CLI Tools
 
-You've got ndn-router running. Now what? The ndn-tools suite gives you the equivalent of ping, curl, and iperf for NDN networks.
+You've got ndn-fwd running. Now what? The ndn-tools suite gives you the equivalent of ping, curl, and iperf for NDN networks.
 
-Every tool in the suite communicates with the local router over the same IPC path: a Unix domain socket (default `/tmp/ndn.sock`) with an optional shared-memory data plane for high throughput. The management commands use the NFD-compatible control protocol; the data-plane tools use an `AppFace` channel that plugs directly into the forwarding pipeline.
+Every tool in the suite communicates with the local router over the same IPC path: a Unix domain socket (default `/tmp/ndn.sock`) with an optional shared-memory data plane for high throughput. The management commands use the NFD-compatible control protocol; the data-plane tools use an `InProcFace` channel that plugs directly into the forwarding pipeline.
 
 ```mermaid
 flowchart LR
@@ -15,17 +15,17 @@ flowchart LR
         ctl["ndn-ctl"]
     end
 
-    subgraph "ndn-router"
+    subgraph "ndn-fwd"
         mgmt["Mgmt\n(NFD protocol)"]
         pipeline["Forwarding\nPipeline"]
         shm["SHM ring\nbuffer"]
     end
 
     ctl -- "control Interest/Data" --> mgmt
-    peek -- "AppFace (IPC)" --> pipeline
-    put -- "AppFace (IPC)" --> pipeline
-    ping -- "AppFace / RouterClient" --> pipeline
-    iperf -- "RouterClient + SHM" --> shm
+    peek -- "InProcFace (IPC)" --> pipeline
+    put -- "InProcFace (IPC)" --> pipeline
+    ping -- "InProcFace / ForwarderClient" --> pipeline
+    iperf -- "ForwarderClient + SHM" --> shm
     traffic -- "embedded engine" --> pipeline
 ```
 
@@ -58,7 +58,7 @@ ndn-put /ndn/video/clip clip.mp4 --chunk-size 4096
 
 ndn-put reads the file, splits it into segments using the NDN segmentation convention, and registers a prefix handler on the router to serve them. The default segment size follows the NDN standard (`NDN_DEFAULT_SEGMENT_SIZE`); use `--chunk-size` to override it for larger payloads.
 
-> **Note:** ndn-peek and ndn-put are currently stub implementations -- the Interest expression and prefix registration through the local router's AppFace are not yet wired up. The segmentation logic in ndn-put (via `ChunkedProducer`) is fully functional.
+
 
 
 ## ndn-ping
@@ -176,7 +176,7 @@ ndn-ctl security trust cert.ndnc
 
 ## ndn-traffic
 
-A self-contained traffic generator that does not need a running router. It spins up an embedded forwarding engine with in-process `AppFace` pairs and drives configurable Interest/Data traffic through the full pipeline. This makes it ideal for stress-testing the pipeline stages in isolation.
+A self-contained traffic generator that does not need a running router. It spins up an embedded forwarding engine with in-process `InProcFace` pairs and drives configurable Interest/Data traffic through the full pipeline. This makes it ideal for stress-testing the pipeline stages in isolation.
 
 ```bash
 ndn-traffic --count 100000 --rate 50000 --size 1024 --concurrency 4
@@ -273,7 +273,7 @@ ndn-iperf client --cc cubic --cubic-c 0.2 --window 32
 
 ## ndn-bench
 
-A lightweight micro-benchmark for measuring the overhead of the forwarding pipeline's internal channels. It spins up an embedded engine and drives Interests through `AppFace` channel round-trips, reporting latency percentiles and aggregate throughput.
+A lightweight micro-benchmark for measuring the overhead of the forwarding pipeline's internal channels. It spins up an embedded engine and drives Interests through `InProcFace` channel round-trips, reporting latency percentiles and aggregate throughput.
 
 ```bash
 ndn-bench
@@ -294,7 +294,7 @@ ndn-bench: 1250000 interests/sec over 0.04s
 rtt: n=50000 avg=3µs p50=2µs p95=5µs p99=8µs
 ```
 
-> **Note:** ndn-bench currently measures AppFace channel overhead only (the Interest is not wired through the full pipeline). It is most useful for establishing a baseline cost for the IPC mechanism itself.
+> **Note:** ndn-bench currently measures InProcFace channel overhead only (the Interest is not wired through the full pipeline). It is most useful for establishing a baseline cost for the IPC mechanism itself.
 
 
 ## Common Workflows

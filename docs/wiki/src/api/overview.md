@@ -6,25 +6,25 @@ This page enumerates all public API surfaces in ndn-rs, organized by crate. Each
 
 ## `ndn-app` — Application API (highest-level)
 
-The recommended entry point for application developers. Wraps the engine, IPC, and security layers behind a simple, ergonomic interface. The same API works whether you connect to an external `ndn-router` process or embed the engine directly in your binary (see [Building NDN Applications](../guides/building-ndn-apps.md)).
+The recommended entry point for application developers. Wraps the engine, IPC, and security layers behind a simple, ergonomic interface. The same API works whether you connect to an external `ndn-fwd` process or embed the engine directly in your binary (see [Building NDN Applications](../guides/building-ndn-apps.md)).
 
 | Type / Function | Description |
 |---|---|
 | `Consumer::connect(socket)` | Connect to an external router via Unix socket |
-| `Consumer::from_handle(handle)` | Connect via an in-process `AppFace` handle (embedded mode) |
+| `Consumer::from_handle(handle)` | Connect via an in-process `InProcFace` handle (embedded mode) |
 | `Consumer::get(name)` | Fetch content bytes by name (convenience wrapper) |
 | `Consumer::fetch(name)` | Fetch the full `Data` packet |
 | `Consumer::fetch_wire(wire, timeout)` | Send a hand-built Interest wire and await `Data` |
 | `Consumer::fetch_verified(name, validator)` | Fetch and cryptographically verify; returns `SafeData` |
 | `Producer::connect(socket, prefix)` | Register a prefix and connect to an external router |
-| `Producer::from_handle(handle, prefix)` | Register a prefix against an in-process `AppFace` handle |
+| `Producer::from_handle(handle, prefix)` | Register a prefix against an in-process `InProcFace` handle |
 | `Producer::serve(handler)` | Run the serve loop with an async `Interest → Option<Bytes>` handler |
 | `Subscriber::connect(socket, prefix, config)` | Join an SVS sync group and receive a `Sample` stream |
 | `Subscriber::recv()` | Await the next `Sample` from the sync group |
 | `Queryable::connect(socket, prefix)` | Register a prefix for request-response handling |
 | `Queryable::recv()` | Await the next `Query`; call `query.reply(wire)` to respond |
 | `KeyChain` | Re-exported from `ndn-security` — see that crate for the full API |
-| `NdnConnection` | Enum unifying external (`RouterClient`) and embedded (`AppFace`) connections |
+| `NdnConnection` | Enum unifying external (`ForwarderClient`) and embedded (`InProcFace`) connections |
 | `blocking::BlockingConsumer` | Synchronous wrapper — no async required |
 | `blocking::BlockingProducer` | Synchronous serve loop — plain `Fn(Interest) → Option<Bytes>` |
 | `ChunkedConsumer` | Reassemble multi-segment content transparently |
@@ -238,11 +238,11 @@ The low-level transport between application processes and the router. Applicatio
 
 | Type | Description |
 |---|---|
-| `RouterClient::connect(socket)` | Connect to an `ndn-router` Unix socket |
-| `RouterClient::send_interest(wire)` | Send an Interest and await the response |
-| `RouterClient::register_prefix(prefix)` | Register a name prefix for inbound Interests |
-| `AppFace` | In-process channel face (engine side of the pair) |
-| `AppHandle` | In-process channel handle (application side of the pair) |
+| `ForwarderClient::connect(socket)` | Connect to an `ndn-fwd` Unix socket |
+| `ForwarderClient::send_interest(wire)` | Send an Interest and await the response |
+| `ForwarderClient::register_prefix(prefix)` | Register a name prefix for inbound Interests |
+| `InProcFace` | In-process channel face (engine side of the pair) |
+| `InProcHandle` | In-process channel handle (application side of the pair) |
 | `SpscFace` | Zero-copy SHM ring face (engine side); 256-slot SPSC buffer |
 | `SpscHandle` | Application-side handle for the SHM ring |
 | `UnixFace` | Domain socket face with TLV codec framing |
@@ -276,7 +276,7 @@ A wasm-bindgen wrapper exposing the forwarding engine to JavaScript for the inte
 
 ## `ndn-config` — Configuration
 
-Serde-deserializable configuration types. Used by `ndn-router` to load TOML config files.
+Serde-deserializable configuration types. Used by `ndn-fwd` to load TOML config files.
 
 | Type | Description |
 |---|---|

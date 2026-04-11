@@ -6,7 +6,7 @@ If you are deploying a fleet of devices and want the full architectural context,
 
 ## Prerequisites
 
-- A running NDN router (`ndn-router` on the same host, or reachable via UDP/Ethernet)
+- A running NDN router (`ndn-fwd` on the same host, or reachable via UDP/Ethernet)
 - Rust toolchain and the ndn-rs workspace checked out
 - An identity for the CA (either self-signed or issued by a higher-level CA)
 

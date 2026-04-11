@@ -2,7 +2,7 @@
 
 ## The Problem: Finding Your Neighbors in a Content-Centric Network
 
-When an ndn-router starts up, it knows nothing about its neighbors. It has faces configured -- maybe a UDP socket, maybe a raw Ethernet interface -- but no idea who else is out there. In IP networking, you'd configure static routes or run BGP. In NDN, the question is different: you don't need to know *addresses*, you need to know *who has the content your consumers want*.
+When an ndn-fwd starts up, it knows nothing about its neighbors. It has faces configured -- maybe a UDP socket, maybe a raw Ethernet interface -- but no idea who else is out there. In IP networking, you'd configure static routes or run BGP. In NDN, the question is different: you don't need to know *addresses*, you need to know *who has the content your consumers want*.
 
 Discovery in ndn-rs solves this in three layers, each building on the one below. First, find your neighbors. Then, learn what content they serve. Finally, wire it all together so Interests flow to the right place automatically. The first two layers are fully implemented; the third builds on their foundation.
 
@@ -34,7 +34,7 @@ Multiple protocols run simultaneously via `CompositeDiscovery`, which fans out e
 
 ### The Hello Protocol
 
-Imagine two ndn-routers, A and B, sitting on the same Ethernet segment. Neither knows the other exists. Here's how they find each other.
+Imagine two ndn-fwds, A and B, sitting on the same Ethernet segment. Neither knows the other exists. Here's how they find each other.
 
 Node A's `HelloProtocol` fires its periodic tick and sends a multicast hello Interest to `/ndn/local/nd/hello/<nonce>`. The nonce is random -- it ensures the Interest isn't satisfied by a cached reply. Node B receives this Interest, recognizes it as a hello, and responds with a Data packet containing a `HelloPayload`:
 
@@ -269,7 +269,7 @@ When Node B eventually disappears (its face goes down, or its neighbor entry tra
 
 ## Layer 3: Network-Wide Routing (Planned)
 
-The current discovery layers provide link-local neighbor detection and one-hop (or relayed) service discovery. This is sufficient for many deployments -- a local mesh of ndn-routers can fully self-organize using just these two layers.
+The current discovery layers provide link-local neighbor detection and one-hop (or relayed) service discovery. This is sufficient for many deployments -- a local mesh of ndn-fwds can fully self-organize using just these two layers.
 
 Network-wide routing will build on this foundation, using the neighbor table as the link-state database input. The gossip infrastructure (SVS gossip, epidemic gossip) in `ndn-discovery` provides the dissemination substrate. The vision is a system where discovery scales seamlessly from a two-node setup to a continent-spanning network, with the same protocols operating at every level.
 

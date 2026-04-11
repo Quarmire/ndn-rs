@@ -106,7 +106,7 @@ pub trait Face {
 
 A face wraps whatever transport your MCU has: UART, SPI, LoRa, raw Ethernet MAC, or a memory-mapped buffer for inter-core communication. The `ErasedFace` trait provides dynamic dispatch so the forwarder can iterate over a heterogeneous slice of faces.
 
-For serial links (UART, SPI, I2C), `ndn-embedded` includes a COBS framing module (`cobs`) that eliminates 0x00 bytes from the payload and uses 0x00 as a frame delimiter. This is compatible with the desktop stack's `ndn-face-serial` framing.
+For serial links (UART, SPI, I2C), `ndn-embedded` includes a COBS framing module (`cobs`) that eliminates 0x00 bytes from the payload and uses 0x00 as a frame delimiter. This is compatible with the desktop stack's `ndn-faces` framing.
 
 ### Clock
 

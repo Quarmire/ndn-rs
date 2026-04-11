@@ -153,12 +153,12 @@ let mut producer = engine.register_producer("/my/prefix");
 ```rust
 use ndn_app::EngineBuilder;
 use ndn_engine::EngineConfig;
-use ndn_face_local::AppFace;
+use ndn_faces::local::InProcFace;
 use ndn_transport::FaceId;
 
 let mut builder = EngineBuilder::new(EngineConfig::default());
 let app_face_id = builder.alloc_face_id();
-let (face, handle) = AppFace::new(app_face_id, 64);
+let (face, handle) = InProcFace::new(app_face_id, 64);
 let (engine, _shutdown) = builder.face(face).build().await?;
 let mut consumer = ndn_app::Consumer::from_handle(handle);
 ```

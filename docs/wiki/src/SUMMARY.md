@@ -51,6 +51,7 @@
 - [Embedded Targets](./guides/embedded-targets.md)
 - [Setting Up an NDNCERT CA](./guides/ndncert-setup.md)
 - [Fleet and Swarm Security](./guides/fleet-security.md)
+- [Getting Started: Publish and Subscribe](./guides/getting-started.md)
 - [CLI Tools](./guides/cli-tools.md)
 - [Performance Tuning](./guides/performance-tuning.md)
 
@@ -75,6 +76,7 @@
 
 # Releases
 
+- [0.1.0](./releases/v0-1-0.md)
 - [0.1.0-alpha](./releases/v0-1-0-alpha.md)
 
 ---
