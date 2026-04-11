@@ -397,6 +397,49 @@ impl MgmtClient {
         self.command(module::SECURITY, verb::YUBIKEY_GENERATE, &params).await
     }
 
+    // ─── Discovery ──────────────────────────────────────────────────────────
+
+    /// Get discovery protocol status and current config: `discovery/status`.
+    pub async fn discovery_status(&self) -> Result<ControlResponse, RouterError> {
+        self.dataset(module::DISCOVERY, b"status").await
+    }
+
+    /// Update runtime-mutable discovery parameters: `discovery/config`.
+    ///
+    /// Pass parameters as a URL query string:
+    /// `"hello_interval_base_ms=5000&liveness_miss_count=3"`.
+    ///
+    /// Supported keys: `hello_interval_base_ms`, `hello_interval_max_ms`,
+    /// `hello_jitter`, `liveness_timeout_ms`, `liveness_miss_count`,
+    /// `probe_timeout_ms`, `swim_indirect_fanout`, `gossip_fanout`,
+    /// `auto_create_faces`.
+    pub async fn discovery_config_set(&self, params: &str) -> Result<ControlResponse, RouterError> {
+        let cp = ControlParameters {
+            uri: Some(params.to_owned()),
+            ..Default::default()
+        };
+        let name = command_name(module::DISCOVERY, verb::CONFIG, &cp);
+        self.send_interest(name).await
+    }
+
+    /// Get DVR routing protocol status: `routing/dvr-status`.
+    pub async fn routing_dvr_status(&self) -> Result<ControlResponse, RouterError> {
+        self.dataset(module::ROUTING, verb::DVR_STATUS).await
+    }
+
+    /// Update runtime-mutable DVR parameters: `routing/dvr-config`.
+    ///
+    /// Pass parameters as a URL query string:
+    /// `"update_interval_ms=30000&route_ttl_ms=90000"`.
+    pub async fn routing_dvr_config_set(&self, params: &str) -> Result<ControlResponse, RouterError> {
+        let cp = ControlParameters {
+            uri: Some(params.to_owned()),
+            ..Default::default()
+        };
+        let name = command_name(module::ROUTING, verb::DVR_CONFIG, &cp);
+        self.send_interest(name).await
+    }
+
     // ─── Log filter ─────────────────────────────────────────────────────
 
     /// Get the current runtime log filter string: `log/get-filter`.

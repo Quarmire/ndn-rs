@@ -24,6 +24,7 @@ pub mod module {
     pub const FIB: &[u8] = b"fib";
     pub const RIB: &[u8] = b"rib";
     pub const ROUTING: &[u8] = b"routing";
+    pub const DISCOVERY: &[u8] = b"discovery";
     pub const CS: &[u8] = b"cs";
     pub const STRATEGY: &[u8] = b"strategy-choice";
     pub const STATUS: &[u8] = b"status";
@@ -92,6 +93,10 @@ pub mod verb {
     pub const GET_FILTER:  &[u8] = b"get-filter";
     pub const SET_FILTER:  &[u8] = b"set-filter";
     pub const GET_RECENT:  &[u8] = b"get-recent";
+
+    // discovery
+    pub const DVR_STATUS: &[u8] = b"dvr-status";
+    pub const DVR_CONFIG: &[u8] = b"dvr-config";
 }
 
 // ─── Name builder ────────────────────────────────────────────────────────────
