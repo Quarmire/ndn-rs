@@ -20,12 +20,15 @@
 
 pub mod cert_cache;
 pub mod cert_fetcher;
+pub mod did;
 pub mod error;
 pub mod key_store;
+pub mod keychain;
 pub mod manager;
 pub mod pib;
 pub mod profile;
 pub mod safe_data;
+pub mod sign_ext;
 pub mod signer;
 pub mod trust_schema;
 pub mod validator;
@@ -37,12 +40,14 @@ pub use cert_cache::{CertCache, Certificate};
 pub use cert_fetcher::{CertFetcher, FetchFn};
 pub use error::TrustError;
 pub use key_store::{KeyAlgorithm, KeyStore, MemKeyStore};
+pub use keychain::KeyChain;
 #[cfg(feature = "yubikey-piv")]
 pub use yubikey::{YubikeyKeyStore, YubikeySlot};
 pub use manager::SecurityManager;
 pub use pib::{FilePib, PibError};
 pub use profile::SecurityProfile;
 pub use safe_data::SafeData;
+pub use sign_ext::SignWith;
 pub use signer::{Ed25519Signer, HmacSha256Signer, Signer};
 pub use trust_schema::{NamePattern, PatternComponent, TrustSchema};
 pub use validator::{ValidationResult, Validator};

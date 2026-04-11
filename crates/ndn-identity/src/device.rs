@@ -3,7 +3,7 @@
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use ndn_packet::Name;
-use ndn_security::SecurityManager;
+use ndn_security::{KeyChain, SecurityManager};
 
 use crate::{
     enroll::{ChallengeParams, NdncertClient},
@@ -134,12 +134,8 @@ pub async fn run_provisioning(config: DeviceConfig) -> Result<NdnIdentity, Ident
         )),
     };
 
-    Ok(NdnIdentity {
-        name: config.namespace,
-        manager,
-        key_name,
-        renewal,
-    })
+    let keychain = KeyChain::from_parts(manager, config.namespace.clone(), key_name);
+    Ok(NdnIdentity::from_keychain(keychain, renewal))
 }
 
 fn build_challenge(credential: &FactoryCredential, _key_name: &Name) -> ChallengeParams {

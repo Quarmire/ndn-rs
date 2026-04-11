@@ -52,7 +52,7 @@ impl NdncertCaBuilder {
     }
 
     pub fn signing_identity(mut self, identity: &NdnIdentity) -> Self {
-        self.identity = Some(identity.security_manager_arc());
+        self.identity = Some(identity.manager_arc());
         self
     }
 

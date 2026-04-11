@@ -9,14 +9,19 @@ use crate::Validator;
 pub enum SecurityProfile {
     /// Full chain validation with cert fetching and hierarchical trust.
     ///
-    /// This is the default. The engine auto-wires a `Validator` with:
+    /// This is the default. When a `SecurityManager` is set on the builder,
+    /// the engine wires a `Validator` with:
     /// - `TrustSchema::hierarchical()` (data and key share first component)
     /// - Shared `CertCache` from the `SecurityManager`
     /// - Trust anchors from the `SecurityManager`
     /// - `CertFetcher` for missing certificates
     ///
-    /// Requires a `SecurityManager` to be set on the `EngineBuilder`.
-    /// Falls back to `Disabled` with a warning if no manager is available.
+    /// **When no `SecurityManager` is set**, the engine falls back to
+    /// `AcceptSigned` behaviour: each Data packet's signature is verified
+    /// cryptographically but namespace hierarchy is not enforced. This keeps
+    /// security on by default even without a configured trust anchor.
+    ///
+    /// Use [`Disabled`](Self::Disabled) to explicitly turn off all validation.
     Default,
 
     /// Verify that signatures are present and cryptographically valid,

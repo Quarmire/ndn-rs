@@ -9,7 +9,6 @@ license.workspace = true
 ndn-packet   = { workspace = true, features = ["std"] }
 ndn-security = { workspace = true }
 ndn-cert     = { workspace = true }
-ndn-did      = { workspace = true }
 ndn-app      = { workspace = true }
 bytes        = { workspace = true, features = ["std"] }
 serde        = { workspace = true }

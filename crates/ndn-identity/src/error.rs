@@ -7,7 +7,7 @@ pub enum IdentityError {
     #[error("cert error: {0}")]
     Cert(#[from] ndn_cert::CertError),
     #[error("DID error: {0}")]
-    Did(#[from] ndn_did::DidError),
+    Did(#[from] ndn_security::did::DidError),
     #[error("app error: {0}")]
     App(#[from] ndn_app::AppError),
     #[error("IO error: {0}")]
