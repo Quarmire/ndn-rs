@@ -22,7 +22,8 @@ license.workspace = true
 [features]
 default = ["net", "websocket", "local"]
 net       = []
-websocket = ["net", "dep:tokio-tungstenite"]
+websocket     = ["net", "dep:tokio-tungstenite"]
+websocket-tls = ["websocket", "dep:tokio-rustls", "dep:rcgen", "dep:rustls-pemfile"]
 local     = []
 spsc-shm  = ["local", "dep:libc"]
 serial    = ["dep:tokio-serial"]
@@ -44,6 +45,9 @@ dashmap       = { workspace = true }
 
 # Optional deps gated by features
 tokio-tungstenite = { workspace = true, optional = true }
+tokio-rustls      = { workspace = true, optional = true }
+rcgen             = { workspace = true, optional = true }
+rustls-pemfile    = { workspace = true, optional = true }
 tokio-serial      = { workspace = true, optional = true }
 libc              = { workspace = true, optional = true }
 

@@ -29,3 +29,6 @@ pub use udp::UdpFace;
 
 #[cfg(feature = "websocket")]
 pub use websocket::WebSocketFace;
+
+#[cfg(feature = "websocket-tls")]
+pub use websocket::{TlsConfig, TlsWebSocketFace, WebSocketListener};

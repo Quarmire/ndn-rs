@@ -1,0 +1,56 @@
+# ndn-fwd default configuration
+#
+# Used by the Docker image and as a starting point for local deployments.
+# Copy this file, adjust as needed, and pass with: ndn-fwd --config <path>
+#
+# Environment variable expansion is supported for string fields:
+#   pib_path = "${HOME}/.ndn/pib"
+
+[engine]
+cs_capacity_mb      = 64
+pipeline_channel_cap = 4096
+
+[cs]
+variant          = "lru"
+capacity_mb      = 64
+admission_policy = "default"
+
+# ── Faces ──────────────────────────────────────────────────────────────────────
+
+[[face]]
+kind = "udp"
+bind = "0.0.0.0:6363"
+
+[[face]]
+kind = "tcp"
+bind = "0.0.0.0:6363"
+
+[[face]]
+kind = "web-socket"
+bind = "0.0.0.0:9696"
+
+# Uncomment to join the NDN testbed multicast group on a local interface:
+# [[face]]
+# kind      = "multicast"
+# group     = "224.0.23.170"
+# port      = 56363
+# interface = "eth0"
+
+# ── Management ────────────────────────────────────────────────────────────────
+
+[management]
+face_socket = "/run/ndn-fwd/ndn-fwd.sock"
+
+# ── Security ──────────────────────────────────────────────────────────────────
+
+[security]
+# Automatically generate an identity on first startup.
+auto_init = true
+# NDN identity name for this forwarder.
+# identity = "/ndn/router/docker"
+profile   = "default"
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+
+[logging]
+level = "info"
