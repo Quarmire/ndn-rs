@@ -165,6 +165,48 @@ ndn-rs ships two signer implementations:
 
 Both implement `sign_sync` for a CPU-only fast path -- no async state machine overhead when the operation is pure computation.
 
+## DataBuilder Signing Methods
+
+`DataBuilder` exposes several signing methods with different performance and conformance characteristics:
+
+| Method | Allocations | Crypto | NDN conformant | When to use |
+|--------|-------------|--------|----------------|-------------|
+| `sign_digest_sha256()` | **1** | SHA-256 in-place | Yes | Default for all high-throughput production |
+| `sign_sync(type, kl, fn)` | 2 | caller-supplied | Yes | Ed25519 / HMAC — synchronous callers |
+| `sign(type, kl, fn).await` | 3+ | caller-supplied | Yes | Ed25519 / HMAC — async callers |
+| `sign_none()` | **1** | None | **No** | Benchmarking raw engine throughput only |
+| `build()` | ~4 | None (zeroed SigValue) | Partial | Tests / non-validating consumers |
+
+### `sign_digest_sha256` fast-path details
+
+The fast path achieves its performance by pre-computing all TLV sizes before any allocation, writing every field directly into a single `BytesMut`, and hashing `&buf[signed_start..]` in-place:
+
+```
+1 BytesMut::with_capacity(total_size)
+  ├─ Data TLV header
+  ├─ Name TLV           ┐
+  ├─ MetaInfo TLV       │  signed region — hashed in-place, no copy
+  ├─ Content TLV        │
+  ├─ SignatureInfo (5B) ─┘
+  └─ SignatureValue (34B = type+len+SHA256)
+```
+
+#### Known limitations (not currently addressable)
+
+1. **No `no_std` support.** The fast path uses `ring` for SHA-256, which requires the standard library.  `no_std` callers must use `build()` and sign the packet externally.  Tracking: if a `ring`-compatible `no_std` SHA-256 is adopted in future, the `#[cfg(feature = "std")]` gate can be lifted.
+
+2. **No KeyLocator in DigestSha256.** The SignatureInfo bytes are hardcoded to `[0x16, 0x03, 0x1B, 0x01, 0x00]` — type, length, SignatureType=0 (DigestSha256) — with no room for a KeyLocator TLV.  This covers the vast majority of uses; self-signed certificates that carry DigestSha256 + KeyLocator must use `sign_sync` instead.
+
+3. **`debug_assert` guards only.** The size pre-computation is verified by `debug_assert_eq!` guards that are compiled out in release builds.  The math is fully deterministic (depends only on the name and content sizes, which don't change between the compute and write phases), so this is safe — the guards exist to catch bugs during development, not to handle runtime variability.
+
+4. **Duplicated encoding logic.** Name/MetaInfo/Content encoding is shared via private helpers (`FastPathSizes`, `write_fields`, `put_vu`) between `sign_digest_sha256` and `sign_none`.  The `sign_sync`/`sign`/`build` paths use `TlvWriter`-based helpers (`write_name`, `write_nni`) instead.  If a new optional field is added to MetaInfo (e.g., `ContentType`), it must be added in both the `TlvWriter` path and the fast-path helpers.
+
+### `sign_none` — benchmarking only
+
+`sign_none()` produces a packet with no `SignatureInfo` or `SignatureValue` TLVs.  It uses the same single-buffer fast path as `sign_digest_sha256` (1 allocation, no crypto), making it the ceiling for producer throughput.
+
+**Validators will reject `sign_none` packets.**  It is only safe to use in pipelines where validation is explicitly disabled — currently, only `FlowSignMode::None` in `ndn-iperf` (selected by passing `--sign none`).  Do not use in any production data plane.
+
 ## Trust Schemas in Depth
 
 Trust schemas are the *policy layer* that sits between raw cryptographic verification and actual trust. A valid signature from a stranger is meaningless; what matters is whether the signer was *authorized* to sign that particular data.
