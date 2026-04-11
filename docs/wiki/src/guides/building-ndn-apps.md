@@ -9,17 +9,17 @@ This guide walks through both modes with complete, runnable examples.
 ```mermaid
 graph LR
     subgraph "External router mode"
-        App1["your app"] -->|"Unix socket\n/tmp/ndn.sock"| R["ndn-router process"]
+        App1["your app"] -->|"Unix socket\n/tmp/ndn.sock"| R["ndn-fwd process"]
         R -->|"UDP / Ethernet"| Net["network"]
     end
 
     subgraph "Embedded engine mode"
-        App2["your app"] -->|"in-process\nAppFace"| E["ForwarderEngine\n(same process)"]
+        App2["your app"] -->|"in-process\nInProcFace"| E["ForwarderEngine\n(same process)"]
         E -->|"UDP / Ethernet"| Net2["network"]
     end
 ```
 
-**External router** — `ndn-router` runs as a separate process. Your app connects to its Unix socket. This is the standard deployment: one router per host, many apps sharing it. Requires a running router.
+**External router** — `ndn-fwd` runs as a separate process. Your app connects to its Unix socket. This is the standard deployment: one router per host, many apps sharing it. Requires a running router.
 
 **Embedded engine** — the `ForwarderEngine` lives inside your binary. There is no router process. The engine owns all faces and FIB state. This is the right choice for mobile apps, CLI tools, test harnesses, and any scenario where a separate process is inconvenient.
 
@@ -159,21 +159,21 @@ match consumer.fetch("/example/data").await {
 
 ## Mode 2: Embedded Engine
 
-The embedded mode builds a `ForwarderEngine` inside your process and connects `Consumer`/`Producer` to it via in-process `AppFace` channel pairs. No Unix sockets, no separate process.
+The embedded mode builds a `ForwarderEngine` inside your process and connects `Consumer`/`Producer` to it via in-process `InProcFace` channel pairs. No Unix sockets, no separate process.
 
 ```rust
 use ndn_app::{Consumer, Producer, EngineBuilder};
 use ndn_engine::EngineConfig;
-use ndn_face_local::AppFace;
+use ndn_faces::local::InProcFace;
 use ndn_packet::{Name, encode::DataBuilder};
 use ndn_transport::FaceId;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Create one AppFace for the consumer and one for the producer.
-    // Each AppFace::new returns the face (engine side) and its handle (app side).
-    let (consumer_face, consumer_handle) = AppFace::new(FaceId(1), 64);
-    let (producer_face, producer_handle) = AppFace::new(FaceId(2), 64);
+    // Create one InProcFace for the consumer and one for the producer.
+    // Each InProcFace::new returns the face (engine side) and its handle (app side).
+    let (consumer_face, consumer_handle) = InProcFace::new(FaceId(1), 64);
+    let (producer_face, producer_handle) = InProcFace::new(FaceId(2), 64);
 
     // Build the engine, registering both faces.
     let (engine, _shutdown) = EngineBuilder::new(EngineConfig::default())
@@ -210,7 +210,7 @@ The embedded mode is useful for:
 
 - **Integration tests** — spin up a full forwarding engine in `#[tokio::test]` without any external process
 - **Mobile / Android / iOS** — ship the engine as part of your app binary; no system daemon required
-- **CLI tools** — tools like `ndn-peek` and `ndn-ping` embed the engine so they work on machines that don't have `ndn-router` running
+- **CLI tools** — tools like `ndn-peek` and `ndn-ping` embed the engine so they work on machines that don't have `ndn-fwd` running
 
 > **Mobile shortcut:** If you are targeting Android or iOS, use `ndn-mobile` instead of assembling `EngineBuilder` by hand. It pre-configures the engine with mobile-tuned defaults (8 MB CS, single pipeline thread, security enabled), exposes background suspend/resume lifecycle hooks, and provides Bluetooth face support. See the [Mobile Apps guide](./mobile-apps.md).
 

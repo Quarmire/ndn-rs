@@ -75,7 +75,7 @@ Flamegraphs give you a visual map of where CPU time goes:
 cargo install flamegraph
 
 # Generate a flamegraph from a benchmark or your router binary
-cargo flamegraph --bin ndn-router -- --config my-config.toml
+cargo flamegraph --bin ndn-fwd -- --config my-config.toml
 
 # Or from the benchmark suite
 cargo flamegraph --bench pipeline -- --bench "interest_pipeline"

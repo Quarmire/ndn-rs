@@ -1,6 +1,6 @@
 # Running the Router
 
-This page explains how to configure and run `ndn-router` as a standalone NDN forwarder, connect applications and tools to it, and monitor its state.
+This page explains how to configure and run `ndn-fwd` as a standalone NDN forwarder, connect applications and tools to it, and monitor its state.
 
 ## Architecture overview
 
@@ -9,7 +9,7 @@ The router is the central forwarding engine. Applications, remote peers, and man
 ```mermaid
 %%{init: {"layout": "elk"}}%%
 graph TB
-    subgraph "ndn-router"
+    subgraph "ndn-fwd"
         E[Forwarding Engine]
         PIT[PIT]
         FIB[FIB]
@@ -54,10 +54,10 @@ graph TB
 
 ## Configuration file
 
-`ndn-router` reads a TOML configuration file. Start from the provided example:
+`ndn-fwd` reads a TOML configuration file. Start from the provided example:
 
 ```bash
-cp ndn-router.example.toml ndn-router.toml
+cp ndn-fwd.example.toml ndn-fwd.toml
 ```
 
 The file is loaded via `--config` (or `-c`) or the `NDN_CONFIG` environment variable.
@@ -228,20 +228,20 @@ served_prefixes = ["/ndn/site/sensors"]
 
 ```bash
 # Build in release mode for production
-cargo build -p ndn-router --release
+cargo build -p ndn-fwd --release
 
 # Start (sudo required for raw sockets and privileged ports)
-sudo ./target/release/ndn-router --config ndn-router.toml
+sudo ./target/release/ndn-fwd --config ndn-fwd.toml
 ```
 
 Override the log level at runtime:
 
 ```bash
-sudo ./target/release/ndn-router --config ndn-router.toml --log-level debug
+sudo ./target/release/ndn-fwd --config ndn-fwd.toml --log-level debug
 
 # Or with RUST_LOG for per-crate control
 sudo RUST_LOG="info,ndn_engine=debug,ndn_discovery=trace" \
-    ./target/release/ndn-router --config ndn-router.toml
+    ./target/release/ndn-fwd --config ndn-fwd.toml
 ```
 
 ## Connecting tools
@@ -333,7 +333,7 @@ cargo build -p ndn-dashboard --release
 
 The dashboard provides:
 
-- **Start Router** -- launch `ndn-router` as a managed subprocess with one of:
+- **Start Router** -- launch `ndn-fwd` as a managed subprocess with one of:
   - *Quick Start* (built-in defaults)
   - *Build Config* -- interactive config builder with startup faces, startup routes, CS settings, and log level
   - *Load Config File* -- point to an existing TOML file
@@ -355,7 +355,7 @@ The dashboard connects to the router's face socket (default `/tmp/ndn.sock`). If
 A common LAN deployment with two routers and local apps:
 
 ```bash
-# Router A (10.0.0.1) -- ndn-router.toml:
+# Router A (10.0.0.1) -- ndn-fwd.toml:
 #   UDP face on :6363
 #   Multicast face on 224.0.23.170:56363
 #   Route /ndn -> UDP face

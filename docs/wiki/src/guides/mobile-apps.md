@@ -1,15 +1,15 @@
 # NDN on Android and iOS
 
-`ndn-mobile` packages the NDN forwarding engine into a pre-configured crate tuned for Android and iOS. The forwarder runs inside the app process — no system daemon, no Unix sockets, no raw Ethernet faces. All app traffic uses in-process `AppFace` channels (zero IPC overhead), while UDP faces handle LAN and WAN connectivity.
+`ndn-mobile` packages the NDN forwarding engine into a pre-configured crate tuned for Android and iOS. The forwarder runs inside the app process — no system daemon, no Unix sockets, no raw Ethernet faces. All app traffic uses in-process `InProcFace` channels (zero IPC overhead), while UDP faces handle LAN and WAN connectivity.
 
 ```mermaid
 graph TD
     subgraph "Your Mobile App"
         C["Consumer / Producer"]
-        A["AppHandle (tokio mpsc)"]
+        A["InProcHandle (tokio mpsc)"]
         subgraph "MobileEngine"
             FWD["ForwarderEngine\n(FIB · PIT · CS)"]
-            AF["AppFace\n(in-process)"]
+            AF["InProcFace\n(in-process)"]
             MF["MulticastUdpFace\n(LAN 224.0.23.170)"]
             UF["UdpFace\n(unicast hub)"]
         end
@@ -138,7 +138,7 @@ Multiple unicast peers can be added; each becomes a `Persistent` UDP face.
 
 ## Producing Data
 
-`register_producer` allocates a new `AppFace`, installs a FIB route, and returns a ready `Producer` — all synchronously, with no async overhead:
+`register_producer` allocates a new `InProcFace`, installs a FIB route, and returns a ready `Producer` — all synchronously, with no async overhead:
 
 ```rust
 let mut producer = engine.register_producer("/mobile/sensor/temperature");
@@ -153,7 +153,7 @@ producer.serve(|interest| async move {
 }).await?;
 ```
 
-Call `register_producer` once per prefix. Each call creates an independent `AppFace` — a producer registered on `/a` and one on `/b` are isolated and can run concurrently.
+Call `register_producer` once per prefix. Each call creates an independent `InProcFace` — a producer registered on `/a` and one on `/b` are isolated and can run concurrently.
 
 ## Multiple App Components
 
@@ -173,7 +173,7 @@ let mut ui_consumer = ndn_mobile::Consumer::from_handle(ui_handle);
 
 ## Background and Foreground Lifecycle
 
-Mobile OSes aggressively restrict network I/O while apps are backgrounded. Call `suspend_network_faces` when the app moves to background and `resume_network_faces` when it returns to the foreground. The in-process `AppFace` (and any active consumers / producers) remains fully functional throughout.
+Mobile OSes aggressively restrict network I/O while apps are backgrounded. Call `suspend_network_faces` when the app moves to background and `resume_network_faces` when it returns to the foreground. The in-process `InProcFace` (and any active consumers / producers) remains fully functional throughout.
 
 ```rust
 // Android: call from onStop() or onPause()
@@ -210,7 +210,7 @@ let face = bluetooth_face_from_parts(
 engine.engine().add_face(face, engine.network_cancel_token().child_token());
 ```
 
-`bluetooth_face_from_parts` uses COBS framing — the same codec as `ndn-face-serial`. COBS is correct for Bluetooth because RFCOMM and L2CAP are stream-oriented; `0x00` never appears in a COBS-encoded payload, making it a reliable frame boundary after a dropped connection.
+`bluetooth_face_from_parts` uses COBS framing — the same codec as `ndn-faces`. COBS is correct for Bluetooth because RFCOMM and L2CAP are stream-oriented; `0x00` never appears in a COBS-encoded payload, making it a reliable frame boundary after a dropped connection.
 
 ### Android (Kotlin → JNI)
 
@@ -301,7 +301,7 @@ Profile first with `cargo flamegraph` or Android Profiler / Instruments before i
 
 | Feature | Android | iOS/iPadOS |
 |---------|---------|------------|
-| AppFace (in-process) | ✓ | ✓ |
+| InProcFace (in-process) | ✓ | ✓ |
 | UDP multicast | ✓ (Wi-Fi) | ✓ (Wi-Fi) |
 | UDP unicast | ✓ | ✓ |
 | Neighbor discovery (Hello/UDP) | ✓ | ✓ |

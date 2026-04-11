@@ -31,13 +31,13 @@ Named Data Networking is a network architecture where communication is driven by
 ## Crate Map
 
 ```
-Binaries        ndn-router  ndn-tools  ndn-bench
+Binaries        ndn-fwd  ndn-tools  ndn-bench
                      |          |          |
 Engine/App      ndn-engine  ndn-app  ndn-ipc  ndn-config  ndn-discovery
                      |          |        |
-Pipeline        ndn-pipeline  ndn-strategy  ndn-security
+Pipeline        ndn-engine  ndn-strategy  ndn-security
                      |             |
-Faces           ndn-face-net  ndn-face-local  ndn-face-serial  ndn-face-l2
+Faces           ndn-faces  ndn-faces  ndn-faces  ndn-faces
                      |              |
 Foundation      ndn-store  ndn-transport  ndn-packet  ndn-tlv
                                                          |
@@ -56,18 +56,18 @@ Dependencies flow strictly downward. `ndn-tlv` and `ndn-packet` compile `no_std`
         {"id": "ndn-transport"}, {"id": "ndn-embedded"}
     ]},
     { "label": "Faces", "nodes": [
-        {"id": "ndn-face-net"}, {"id": "ndn-face-local"},
-        {"id": "ndn-face-serial"}, {"id": "ndn-face-l2"}
+        {"id": "ndn-faces"}, {"id": "ndn-faces"},
+        {"id": "ndn-faces"}, {"id": "ndn-faces"}
     ]},
     { "label": "Pipeline & Strategy", "nodes": [
-        {"id": "ndn-pipeline"}, {"id": "ndn-strategy"}, {"id": "ndn-security"}
+        {"id": "ndn-engine"}, {"id": "ndn-strategy"}, {"id": "ndn-security"}
     ]},
     { "label": "Engine & App", "nodes": [
         {"id": "ndn-engine"}, {"id": "ndn-app"}, {"id": "ndn-ipc"},
         {"id": "ndn-config"}, {"id": "ndn-discovery"}
     ]},
     { "label": "Binaries", "nodes": [
-        {"id": "ndn-router"}, {"id": "ndn-tools"}, {"id": "ndn-bench"}
+        {"id": "ndn-fwd"}, {"id": "ndn-tools"}, {"id": "ndn-bench"}
     ]}
   ],
   "satellites": {
@@ -82,28 +82,28 @@ Dependencies flow strictly downward. `ndn-tlv` and `ndn-packet` compile `no_std`
     ["ndn-tlv",       "ndn-embedded"],
     ["ndn-packet",    "ndn-store"],
     ["ndn-packet",    "ndn-transport"],
-    ["ndn-transport", "ndn-face-net"],
-    ["ndn-transport", "ndn-face-local"],
-    ["ndn-transport", "ndn-face-serial"],
-    ["ndn-transport", "ndn-face-l2"],
-    ["ndn-face-net",    "ndn-pipeline"],
-    ["ndn-face-local",  "ndn-pipeline"],
-    ["ndn-face-serial", "ndn-pipeline"],
-    ["ndn-face-l2",     "ndn-pipeline"],
-    ["ndn-store",       "ndn-pipeline"],
-    ["ndn-pipeline",    "ndn-strategy"],
-    ["ndn-pipeline",    "ndn-security"],
+    ["ndn-transport", "ndn-faces"],
+    ["ndn-transport", "ndn-faces"],
+    ["ndn-transport", "ndn-faces"],
+    ["ndn-transport", "ndn-faces"],
+    ["ndn-faces",    "ndn-engine"],
+    ["ndn-faces",  "ndn-engine"],
+    ["ndn-faces", "ndn-engine"],
+    ["ndn-faces",     "ndn-engine"],
+    ["ndn-store",       "ndn-engine"],
+    ["ndn-engine",    "ndn-strategy"],
+    ["ndn-engine",    "ndn-security"],
     ["ndn-strategy",    "ndn-engine"],
     ["ndn-security",    "ndn-engine"],
-    ["ndn-pipeline",    "ndn-ipc"],
-    ["ndn-pipeline",    "ndn-discovery"],
-    ["ndn-engine",      "ndn-router"],
+    ["ndn-engine",    "ndn-ipc"],
+    ["ndn-engine",    "ndn-discovery"],
+    ["ndn-engine",      "ndn-fwd"],
     ["ndn-engine",      "ndn-tools"],
     ["ndn-engine",      "ndn-bench"],
     ["ndn-app",         "ndn-ipc"],
     ["ndn-app",         "ndn-tools"],
     ["ndn-app",         "ndn-bench"],
-    ["ndn-config",      "ndn-router"]
+    ["ndn-config",      "ndn-fwd"]
   ],
   "satellite_edges": [
     ["ndn-sim",           "ndn-engine"],

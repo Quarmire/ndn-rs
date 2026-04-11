@@ -7,8 +7,8 @@ Terms used throughout the ndn-rs codebase and NDN literature. Organized alphabet
 **Action**
 : Enum returned by each `PipelineStage` to control packet flow. Variants: `Continue` (pass to next stage), `Send` (forward to faces and exit), `Satisfy` (satisfy PIT entries), `Drop` (discard), `Nack` (send negative acknowledgement).
 
-**AppFace**
-: An in-process face that connects an application to the ndn-rs engine. Implemented as a pair of shared-memory ring buffers with a Unix socket control channel. Applications interact with the forwarder through `AppFace` rather than opening network sockets.
+**InProcFace**
+: An in-process face that connects an application to the ndn-rs engine. Implemented as a pair of shared-memory ring buffers with a Unix socket control channel. Applications interact with the forwarder through `InProcFace` rather than opening network sockets.
 
 **CanBePrefix**
 : An Interest selector indicating that the Interest name may be a proper prefix of the Data name. Without this flag, the Data name must exactly match the Interest name.

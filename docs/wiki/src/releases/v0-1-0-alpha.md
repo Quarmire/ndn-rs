@@ -92,7 +92,7 @@ Two higher-level discovery protocols layer on top: `EpidemicGossip` for pull-gos
 
 ### Mobile Support (Android / iOS)
 
-`ndn-mobile` packages the forwarder for Android and iOS. It runs in-process inside the app binary — no system daemon — using `AppFace` channels (zero IPC overhead) for app traffic and standard UDP faces for LAN/WAN connectivity.
+`ndn-mobile` packages the forwarder for Android and iOS. It runs in-process inside the app binary — no system daemon — using `InProcFace` channels (zero IPC overhead) for app traffic and standard UDP faces for LAN/WAN connectivity.
 
 Key features: `MobileEngine::builder()` with mobile-tuned defaults (8 MB CS, single pipeline thread, full security validation); `with_udp_multicast` + `with_discovery` for LAN neighbor discovery; `suspend_network_faces` / `resume_network_faces` for battery-efficient app lifecycle; `bluetooth_face_from_parts` for wrapping a platform-supplied async stream with COBS framing; optional persistent CS via the `fjall` feature.
 

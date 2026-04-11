@@ -250,7 +250,7 @@ graph TD
         L2 --> BT["BluetoothFace<br/>RFCOMM / L2CAP CoC"]
         L2 --> Serial["SerialFace<br/>COBS framing"]
 
-        Local --> App[AppFace]
+        Local --> App[InProcFace]
         Local --> Compute[ComputeFace]
     end
 

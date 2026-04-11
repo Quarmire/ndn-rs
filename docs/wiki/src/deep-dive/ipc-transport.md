@@ -79,15 +79,15 @@ Each ring has 256 slots by default, each holding up to 8960 bytes (enough for an
 
 > **💡 Key insight.** The spin-then-park protocol gives the best of both worlds. At high packet rates, the consumer never touches the pipe -- it spins for 64 iterations (sub-microsecond) and finds the next packet waiting. At low packet rates, it parks on the pipe and wakes up with zero latency via epoll/kqueue. The `SeqCst` fences on the parked flag guarantee that the producer never misses a sleeping consumer.
 
-> **⚠️ Important.** Because the wakeup pipes are opened `O_RDWR` by both sides (to avoid the FIFO blocking-open problem), EOF detection alone cannot tell the application that the engine has crashed. The `RouterClient` solves this with a disconnect monitor on the control socket -- see the RouterClient section below.
+> **⚠️ Important.** Because the wakeup pipes are opened `O_RDWR` by both sides (to avoid the FIFO blocking-open problem), EOF detection alone cannot tell the application that the engine has crashed. The `ForwarderClient` solves this with a disconnect monitor on the control socket -- see the ForwarderClient section below.
 
-### Tier 3: In-Process AppFace (~20 ns per packet)
+### Tier 3: In-Process InProcFace (~20 ns per packet)
 
-When the forwarder runs as a library inside the application process (the embedded mode), there is no serialization boundary at all. `AppFace` is a pair of `tokio::sync::mpsc` channels -- one for each direction. The application gets an `AppHandle`; the forwarder gets the `AppFace`. Sending a packet is a pointer handoff through the channel; the `Bytes` value (which is reference-counted) moves without copying.
+When the forwarder runs as a library inside the application process (the embedded mode), there is no serialization boundary at all. `InProcFace` is a pair of `tokio::sync::mpsc` channels -- one for each direction. The application gets an `InProcHandle`; the forwarder gets the `InProcFace`. Sending a packet is a pointer handoff through the channel; the `Bytes` value (which is reference-counted) moves without copying.
 
 ```rust
 // Create a linked face pair with 64-slot buffers
-let (face, handle) = AppFace::new(FaceId(1), 64);
+let (face, handle) = InProcFace::new(FaceId(1), 64);
 
 // Application sends an Interest to the forwarder
 handle.send(interest_bytes).await?;
@@ -98,20 +98,20 @@ let pkt = face.recv().await?;
 
 This mode is ideal for mobile applications (Android/iOS) where the forwarder and application are in the same process anyway, and for testing where you want to spin up a full forwarding pipeline without any OS-level resources.
 
-> **🔧 Implementation note.** The `face_rx` receiver inside `AppFace` is wrapped in a `Mutex` to satisfy the `&self` requirement of the `Face` trait. This looks like it could be a contention point, but the pipeline's single-consumer contract means the mutex never actually contends -- only one task ever calls `recv()`.
+> **🔧 Implementation note.** The `face_rx` receiver inside `InProcFace` is wrapped in a `Mutex` to satisfy the `&self` requirement of the `Face` trait. This looks like it could be a contention point, but the pipeline's single-consumer contract means the mutex never actually contends -- only one task ever calls `recv()`.
 
-## RouterClient: Connecting to the Forwarder
+## ForwarderClient: Connecting to the Forwarder
 
-Applications don't pick a transport tier manually. The `RouterClient` handles negotiation automatically.
+Applications don't pick a transport tier manually. The `ForwarderClient` handles negotiation automatically.
 
 ```mermaid
 sequenceDiagram
     participant App as Application
-    participant RC as RouterClient
+    participant RC as ForwarderClient
     participant Sock as Unix Socket
-    participant Router as ndn-router
+    participant Router as ndn-fwd
 
-    App->>RC: RouterClient::connect("/tmp/ndn.sock")
+    App->>RC: ForwarderClient::connect("/tmp/ndn.sock")
     RC->>Sock: Connect to face socket
     Sock->>Router: New IPC connection
 
@@ -134,7 +134,7 @@ sequenceDiagram
 
 The connection flow works like this:
 
-1. **Connect to the control socket.** `RouterClient::connect()` opens an `IpcFace` to the router's face socket. This socket handles management commands for the lifetime of the connection.
+1. **Connect to the control socket.** `ForwarderClient::connect()` opens an `IpcFace` to the router's face socket. This socket handles management commands for the lifetime of the connection.
 
 2. **Attempt SHM upgrade.** The client generates a unique name (`app-<pid>-<counter>`) and sends a `faces/create` command with URI `shm://<name>`. If the router supports SHM and the creation succeeds, the client calls `SpscHandle::connect()` to attach to the shared memory region. The control socket becomes a dedicated management channel.
 
@@ -142,10 +142,10 @@ The connection flow works like this:
 
 ```rust
 // Automatic SHM negotiation (preferred)
-let client = RouterClient::connect("/tmp/ndn.sock").await?;
+let client = ForwarderClient::connect("/tmp/ndn.sock").await?;
 
 // Explicit Unix-only mode (skip SHM attempt)
-let client = RouterClient::connect_unix_only("/tmp/ndn.sock").await?;
+let client = ForwarderClient::connect_unix_only("/tmp/ndn.sock").await?;
 
 // Check which transport was negotiated
 if client.is_shm() {
@@ -155,7 +155,7 @@ if client.is_shm() {
 
 **Prefix registration** follows the NFD management protocol. `register_prefix()` sends an Interest for `/localhost/nfd/rib/register` with `ControlParameters` encoding the prefix name and the face ID (the SHM face ID if using SHM, or 0 to default to the requesting face). The router installs a FIB entry pointing the prefix at the application's face.
 
-**Disconnect detection** is subtle in SHM mode. Because the data plane reads from shared memory, the application cannot detect router death from a failed `recv()` -- the SHM region persists after the router process exits. The `RouterClient` spawns a background monitor task (automatically, on the first `recv()` call) that watches the control socket. When the socket closes, the monitor fires a `CancellationToken` that propagates to the `SpscHandle`, causing its `recv()` to return `None` and `send()` to return `Err(Closed)`.
+**Disconnect detection** is subtle in SHM mode. Because the data plane reads from shared memory, the application cannot detect router death from a failed `recv()` -- the SHM region persists after the router process exits. The `ForwarderClient` spawns a background monitor task (automatically, on the first `recv()` call) that watches the control socket. When the socket closes, the monitor fires a `CancellationToken` that propagates to the `SpscHandle`, causing its `recv()` to return `None` and `send()` to return `Err(Closed)`.
 
 > **🔧 Implementation note.** The `NdnConnection` enum in `ndn-app` unifies embedded and external connections behind a single interface. `Consumer` and `Producer` work with either mode, so application code does not need to know whether it's talking to an in-process engine or an external router.
 
@@ -238,7 +238,7 @@ mgmt.service_withdraw(&"/myapp/service".parse()?).await?;
 
 ## Putting It All Together
 
-The IPC stack forms a clean layered architecture. At the bottom, transport faces (`IpcFace`, `ShmFace`, `AppFace`) move bytes. In the middle, `RouterClient` and `NdnConnection` handle transport negotiation and provide a unified send/recv interface. At the top, `Consumer`, `Producer`, `ChunkedProducer`/`ChunkedConsumer`, and `ServiceRegistry` provide application-level abstractions.
+The IPC stack forms a clean layered architecture. At the bottom, transport faces (`IpcFace`, `ShmFace`, `InProcFace`) move bytes. In the middle, `ForwarderClient` and `NdnConnection` handle transport negotiation and provide a unified send/recv interface. At the top, `Consumer`, `Producer`, `ChunkedProducer`/`ChunkedConsumer`, and `ServiceRegistry` provide application-level abstractions.
 
 An application that starts with `Consumer::connect("/tmp/ndn.sock")` gets SHM-accelerated data transfer, automatic prefix registration, and transparent chunked reassembly -- without knowing or caring about any of the machinery described in this page. And if that application later moves into the same process as the forwarder (say, for a mobile deployment), only the connection setup changes. The rest of the code stays identical.
 
