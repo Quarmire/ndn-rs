@@ -49,11 +49,11 @@ Tracked stubs, placeholders, and deferred work across the codebase.
 
 ## CLI tools
 
-- [x] **ndn-peek** — `crates/ndn-tools-core/src/peek.rs`
+- [x] **ndn-peek** — `crates/support/ndn-tools-core/src/peek.rs`
       Single and segmented fetch via `ForwarderClient`, ndn-cxx compatible naming.
-- [x] **ndn-ping** — `crates/ndn-tools-core/src/ping.rs`
+- [x] **ndn-ping** — `crates/support/ndn-tools-core/src/ping.rs`
       Server and client modes; measures RTT, emits per-packet and summary events.
-- [x] **ndn-put** — `crates/ndn-tools-core/src/put.rs`
+- [x] **ndn-put** — `crates/support/ndn-tools-core/src/put.rs`
       Publishes chunked objects with `ChunkedProducer`; ndn-cxx compatible segments.
 
 ## WebSocket TLS / ACME

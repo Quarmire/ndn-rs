@@ -107,7 +107,7 @@ Some routing algorithms — like DVR — need to send and receive NDN packets (r
 └─────────────────────────────┘
 ```
 
-The `DvrProtocol` in `crates/ndn-routing/src/protocols/dvr.rs` is the reference implementation.
+The `DvrProtocol` in `crates/protocols/ndn-routing/src/protocols/dvr.rs` is the reference implementation.
 
 ### Pattern skeleton
 
@@ -229,9 +229,9 @@ For protocols with packet I/O, consider using `ndn-sim` to create a simulated ne
 
 To add a new protocol to the `ndn-routing` crate:
 
-1. Create `crates/ndn-routing/src/protocols/your_protocol.rs`
+1. Create `crates/protocols/ndn-routing/src/protocols/your_protocol.rs`
 2. Implement `RoutingProtocol` (and `DiscoveryProtocol` if needed)
-3. Add `pub mod your_protocol;` to `crates/ndn-routing/src/protocols/mod.rs`
-4. Add `pub use protocols::your_protocol::YourProtocol;` to `crates/ndn-routing/src/lib.rs`
+3. Add `pub mod your_protocol;` to `crates/protocols/ndn-routing/src/protocols/mod.rs`
+4. Add `pub use protocols::your_protocol::YourProtocol;` to `crates/protocols/ndn-routing/src/lib.rs`
 
 See `protocols/static.rs` for a minimal example and `protocols/dvr.rs` for the full dual-protocol pattern.

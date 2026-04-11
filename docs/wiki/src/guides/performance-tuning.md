@@ -89,7 +89,7 @@ Look for wide bars (functions consuming a lot of time). Common findings:
 
 ### The benchmark suite
 
-ndn-rs includes a Criterion-based benchmark suite in `crates/ndn-engine/benches/pipeline.rs`. Use it to measure the impact of individual tuning changes in isolation before applying them to production:
+ndn-rs includes a Criterion-based benchmark suite in `crates/engine/ndn-engine/benches/pipeline.rs`. Use it to measure the impact of individual tuning changes in isolation before applying them to production:
 
 ```bash
 # Run all benchmarks

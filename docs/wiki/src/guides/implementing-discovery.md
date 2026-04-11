@@ -4,7 +4,7 @@ This guide walks through writing a custom discovery protocol for ndn-rs. Discove
 
 ## The DiscoveryProtocol Trait
 
-The trait lives in `ndn-discovery` (`crates/ndn-discovery/src/protocol.rs`):
+The trait lives in `ndn-discovery` (`crates/engine/ndn-discovery/src/protocol.rs`):
 
 ```rust
 pub trait DiscoveryProtocol: Send + Sync + 'static {

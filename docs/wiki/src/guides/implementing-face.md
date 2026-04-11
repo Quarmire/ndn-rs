@@ -4,7 +4,7 @@ This guide walks through implementing a custom face type for ndn-rs. Faces are t
 
 ## The Face Trait
 
-The core trait lives in `ndn-transport` (`crates/ndn-transport/src/face.rs`):
+The core trait lives in `ndn-transport` (`crates/foundation/ndn-transport/src/face.rs`):
 
 ```rust
 pub trait Face: Send + Sync + 'static {
@@ -44,7 +44,7 @@ stateDiagram-v2
 
 If your transport does not fit an existing `FaceKind`, add a new variant:
 
-1. Add the variant to the `FaceKind` enum in `crates/ndn-transport/src/face.rs`
+1. Add the variant to the `FaceKind` enum in `crates/foundation/ndn-transport/src/face.rs`
 2. Update `scope()` to classify it as `Local` or `NonLocal`
 3. Update the `Display` and `FromStr` implementations
 

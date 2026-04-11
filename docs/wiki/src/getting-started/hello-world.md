@@ -53,11 +53,11 @@ Add these to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-ndn-app        = { path = "crates/ndn-app" }
-ndn-engine     = { path = "crates/ndn-engine" }
-ndn-faces = { path = "crates/ndn-faces" }
-ndn-packet     = { path = "crates/ndn-packet", features = ["std"] }
-ndn-transport  = { path = "crates/ndn-transport" }
+ndn-app        = { path = "crates/engine/ndn-app" }
+ndn-engine     = { path = "crates/engine/ndn-engine" }
+ndn-faces = { path = "crates/faces/ndn-faces" }
+ndn-packet     = { path = "crates/foundation/ndn-packet", features = ["std"] }
+ndn-transport  = { path = "crates/foundation/ndn-transport" }
 tokio          = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 

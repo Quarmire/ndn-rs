@@ -31,7 +31,7 @@ Add `ndn-app` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-ndn-app = { path = "crates/ndn-app" }
+ndn-app = { path = "crates/engine/ndn-app" }
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -220,7 +220,7 @@ The `blocking` feature wraps `Consumer` and `Producer` in synchronous types that
 
 ```toml
 [dependencies]
-ndn-app = { path = "crates/ndn-app", features = ["blocking"] }
+ndn-app = { path = "crates/engine/ndn-app", features = ["blocking"] }
 ```
 
 ```rust

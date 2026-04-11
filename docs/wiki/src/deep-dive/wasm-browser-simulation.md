@@ -143,7 +143,7 @@ None of these are insurmountable. Together they represent a few days of careful 
 
 ## Building ndn-wasm
 
-The crate lives in `crates/ndn-wasm/` and is built with `wasm-pack`. From the repository root:
+The crate lives in `crates/sim/ndn-wasm/` and is built with `wasm-pack`. From the repository root:
 
 ```bash
 bash tools/ndn-explorer/build-wasm.sh
@@ -152,7 +152,7 @@ bash tools/ndn-explorer/build-wasm.sh
 This runs:
 
 ```bash
-wasm-pack build crates/ndn-wasm \
+wasm-pack build crates/sim/ndn-wasm \
   --target web \
   --out-dir tools/ndn-explorer/wasm \
   --out-name ndn_wasm \
@@ -168,7 +168,7 @@ The output is four files in `tools/ndn-explorer/wasm/`:
 
 After the build, open `tools/ndn-explorer/index.html` in a browser. The WASM badge in the top-right corner of the nav will switch from `WASM —` to `WASM ✓`, confirming that the Rust simulation is active. If the badge stays grey, open the browser console — the most common cause is a missing WASM file or a CORS error from loading a `file://` URL (use a local dev server instead).
 
-On every push to `main` that touches `crates/ndn-wasm/`, the GitHub Actions wiki workflow rebuilds the WASM binary as part of deploying the GitHub Pages site. The build step runs with `continue-on-error: true`, so a WASM compile failure doesn't block the site deploy — the explorer falls back to its JavaScript simulation until the next successful build.
+On every push to `main` that touches `crates/sim/ndn-wasm/`, the GitHub Actions wiki workflow rebuilds the WASM binary as part of deploying the GitHub Pages site. The build step runs with `continue-on-error: true`, so a WASM compile failure doesn't block the site deploy — the explorer falls back to its JavaScript simulation until the next successful build.
 
 ## Feature Comparison: ndn-wasm vs. Production Engine
 

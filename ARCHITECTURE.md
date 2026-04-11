@@ -4,55 +4,71 @@ NDN-RS models Named Data Networking as **composable async pipelines with trait-b
 
 ## Crate Map
 
+Crates are organised into subdirectories that mirror the dependency layers.
+Dependencies flow strictly downward; no layer may import from a layer above it.
+
 ```
-Layer 0 — Binaries
-  ndn-fwd             Standalone forwarder with TOML config and management socket
-  ndn-tools           ndn-peek, ndn-put, ndn-ping, ndn-traffic, ndn-iperf
-  ndn-bench           Throughput and latency benchmarking
+binaries/                      Deployable executables
+  ndn-fwd                      Standalone forwarder (TOML config, management socket)
+  ndn-tools                    CLI tools: ndn-peek, ndn-put, ndn-ping, ndn-iperf, …
+  ndn-bench                    Throughput and latency benchmarks
 
-Layer 1 — Engine & Application
-  ndn-engine          ForwarderEngine, EngineBuilder, pipeline wiring, task topology
-                      (includes ndn-pipeline: PipelineStage, PacketContext, Action)
-  ndn-app             Application API: Consumer, Producer, Subscriber
-  ndn-ipc             ForwarderClient, BlockingForwarderClient, chunked transfer, registry
-  ndn-config          TOML config parsing, NFD management protocol
-  ndn-discovery       Pluggable neighbor (SWIM) and service discovery
-  ndn-routing         Pluggable routing protocols: StaticProtocol, DvrProtocol (DVR)
+tools/
+  ndn-dashboard                Dioxus desktop management UI
 
-Layer 2 — Strategy & Security
-  ndn-strategy        BestRoute, Multicast, ASF, composed strategies
-  ndn-security        KeyChain, Signer/Verifier, TrustSchema, Validator, SafeData
+crates/support/                Shared libraries used by binaries and dashboard
+  ndn-tools-core               Embeddable tool logic (ping, iperf, peek, put)
+  ndn-filestore                Named chunked-file storage and retrieval
 
-Layer 3 — Face Implementations
-  ndn-faces           All face types under feature flags:
-    net               UdpFace, TcpFace, MulticastUdpFace (default)
-    websocket         WebSocketFace (default); websocket-tls adds TLS server listener
-    local             InProcFace/InProcHandle, UnixFace (default)
-    spsc-shm          ShmFace/ShmHandle zero-copy ring (optional, Unix)
-    serial            SerialFace with COBS framing (optional)
-    l2                NamedEtherFace (AF_PACKET/PF_NDRV/Npcap), WfbFace
-    bluetooth         BleFace GATT stub (interop with NDNts web-bluetooth-transport)
+crates/protocols/              Higher-level protocols built on the engine
+  ndn-routing                  Routing algorithms: StaticProtocol, DvrProtocol (DVR)
+  ndn-sync                     Dataset sync: SVS, PSync
+  ndn-did                      NDN-native Decentralised Identifiers (W3C DID)
+  ndn-cert                     NDNCERT 0.3 — certificate issuance and management
+  ndn-identity                 Key management, identity bootstrapping
 
-Layer 4 — Foundation
-  ndn-transport       Face trait, FaceId, FaceTable, StreamFace, TlvCodec
-  ndn-store           NameTrie, Fib, Pit, ContentStore (LruCs/ShardedCs/FjallCs)
-  ndn-packet          Name, Interest, Data, Nack — lazy decode, no_std
-  ndn-tlv             TlvReader, TlvWriter, varu64 — no_std
+crates/engine/                 Forwarding core — pipeline, strategies, security, app API
+  ndn-engine                   ForwarderEngine, EngineBuilder, pipeline stages, task topology
+  ndn-strategy                 BestRoute, Multicast, ASF, and composed strategies
+  ndn-security                 KeyChain, Signer/Verifier, TrustSchema, Validator, SafeData
+  ndn-app                      Application API: Consumer, Producer, Subscriber
+  ndn-ipc                      ForwarderClient, BlockingForwarderClient, chunked transfer
+  ndn-config                   TOML config parsing, NFD management protocol
+  ndn-discovery                Pluggable neighbour (SWIM) and service discovery
 
-Simulation
-  ndn-sim             SimFace, SimLink, topology builder, event tracer
+crates/faces/                  All face implementations in one consolidated crate
+  ndn-faces                    Feature-gated face types:
+    net                        UdpFace, TcpFace, MulticastUdpFace (default)
+    websocket                  WebSocketFace (default); websocket-tls adds TLS listener
+    local                      InProcFace/InProcHandle, UnixFace (default)
+    spsc-shm                   ShmFace/ShmHandle zero-copy ring (Unix)
+    serial                     SerialFace with COBS framing (embedded/IoT)
+    l2                         NamedEtherFace (AF_PACKET/PF_NDRV/Npcap), WfbFace
+    bluetooth                  BleFace GATT stub
 
-Research Extensions
-  ndn-research        FlowObserverStage, FlowTable, ChannelManager (nl80211)
-  ndn-compute         ComputeFace, ComputeRegistry for named function execution
-  ndn-sync            SVS, PSync dataset synchronisation
-  ndn-strategy-wasm   Hot-loadable WASM forwarding strategies
+crates/foundation/             Zero-NDN-dep building blocks — compile no_std compatible
+  ndn-transport                Face trait, FaceId, FaceTable, StreamFace, TlvCodec
+  ndn-store                    NameTrie, Fib, PIT, ContentStore (LruCs/ShardedCs/FjallCs)
+  ndn-packet                   Name, Interest, Data, Nack — lazy decode, no_std
+  ndn-tlv                      TlvReader, TlvWriter, varu64 — no_std
 
-Embedded
-  ndn-embedded        Minimal no_std forwarder for bare-metal targets
+crates/sim/                    Simulation and WebAssembly targets
+  ndn-sim                      SimFace, SimLink, topology builder, event tracer
+  ndn-wasm                     In-browser simulation via wasm-bindgen
+  ndn-strategy-wasm            Hot-loadable WASM forwarding strategies
+
+crates/research/               Experimental extensions
+  ndn-research                 FlowObserverStage, FlowTable, ChannelManager (nl80211)
+  ndn-compute                  ComputeFace, ComputeRegistry for named-function execution
+
+crates/platform/               Special deployment targets (not built by default)
+  ndn-embedded                 Minimal no_std forwarder for bare-metal MCUs
+  ndn-mobile                   Android/iOS forwarder with AppFace IPC
+
+bindings/                      FFI to other languages (not built by default)
+  ndn-python                   PyO3 Python bindings
+  ndn-boltffi                  BoltFFI — Kotlin/JVM and Swift bindings
 ```
-
-Dependencies flow strictly downward. `ndn-tlv` and `ndn-packet` compile `no_std` for embedded.
 
 ## Key Abstractions
 

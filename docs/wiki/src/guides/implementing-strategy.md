@@ -4,7 +4,7 @@ This guide covers how to write a custom forwarding strategy for ndn-rs. Strategi
 
 ## The Strategy Trait
 
-The trait lives in `ndn-strategy` (`crates/ndn-strategy/src/strategy.rs`):
+The trait lives in `ndn-strategy` (`crates/engine/ndn-strategy/src/strategy.rs`):
 
 ```rust
 pub trait Strategy: Send + Sync + 'static {
@@ -244,4 +244,4 @@ The `StrategyTable` is a `NameTrie` that performs longest-prefix match, just lik
 | `BestRouteStrategy` | Forward on the lowest-cost FIB nexthop (default) |
 | `MulticastStrategy` | Forward on all FIB nexthops (flood) |
 
-See `crates/ndn-strategy/src/` for the implementations.
+See `crates/engine/ndn-strategy/src/` for the implementations.

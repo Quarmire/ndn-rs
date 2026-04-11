@@ -2379,7 +2379,7 @@ All four depend on `ndn-transport`, which defines the `Face` trait, `FaceId`, `F
 Declaring shared dependencies at the workspace level with `[workspace.dependencies]` means every crate in the workspace uses the same version of `bytes`, `tokio`, `tracing`, `dashmap`, and `smallvec`. Version conflicts between workspace crates are impossible. Individual crates inherit versions with:
 
 ```toml
-# in crates/ndn-packet/Cargo.toml
+# in crates/foundation/ndn-packet/Cargo.toml
 [dependencies]
 bytes    = { workspace = true }
 smallvec = { workspace = true, features = ["union"] }

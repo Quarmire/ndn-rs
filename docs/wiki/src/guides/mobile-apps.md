@@ -47,7 +47,7 @@ Add `ndn-mobile` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-ndn-mobile = { path = "crates/ndn-mobile" }
+ndn-mobile = { path = "crates/platform/ndn-mobile" }
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -240,7 +240,7 @@ By default, the content store is an in-memory LRU cache that does not survive ap
 
 ```toml
 [dependencies]
-ndn-mobile = { path = "crates/ndn-mobile", features = ["fjall"] }
+ndn-mobile = { path = "crates/platform/ndn-mobile", features = ["fjall"] }
 ```
 
 ```rust

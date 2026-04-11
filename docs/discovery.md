@@ -995,7 +995,7 @@ is already the default.
 ## Module Structure
 
 ```
-crates/ndn-discovery/
+crates/engine/ndn-discovery/
   Cargo.toml
   src/
     lib.rs

@@ -1,7 +1,7 @@
 # NDN File Transfer Protocol (NDN-FT) v0.1
 
 > **Status:** Draft / Experimental
-> **Library:** `crates/ndn-filestore`
+> **Library:** `crates/support/ndn-filestore`
 > **Tools:** `ndn-send`, `ndn-recv`
 > **Dashboard:** Tools → File Transfer tab
 
@@ -247,7 +247,7 @@ The following capabilities define the v1.0 milestone:
 
 | Component | Status |
 |-----------|--------|
-| `crates/ndn-filestore` | ✅ v0.1 implemented |
+| `crates/support/ndn-filestore` | ✅ v0.1 implemented |
 | `ndn-send` binary | ✅ v0.1 implemented |
 | `ndn-recv` binary | ✅ v0.1 implemented |
 | Dashboard Tools → File Transfer | ✅ UI scaffolding (CLI command hints) |
@@ -263,6 +263,6 @@ The following capabilities define the v1.0 milestone:
 
 NDN-FT is designed to be the foundation for higher-level applications:
 
-- **NDN Sync** (`crates/ndn-sync`) — synchronise datasets across nodes using SVS or PSync, building on the same content-addressing primitives.
+- **NDN Sync** (`crates/protocols/ndn-sync`) — synchronise datasets across nodes using SVS or PSync, building on the same content-addressing primitives.
 - **NDN Streaming** — live video/audio streams served as sequential named segments, fetched by receivers using `ndn-peek --pipeline`.
 - **Distributed content store** — optionally push hosted files into the router's CS for network-wide caching.
