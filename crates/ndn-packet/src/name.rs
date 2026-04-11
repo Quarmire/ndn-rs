@@ -13,10 +13,33 @@ use ndn_tlv::TlvReader;
 /// A single NDN name component: a (type, value) pair.
 ///
 /// The value is a zero-copy slice of the original packet buffer.
+///
+/// Ordering follows the NDN Packet Format v0.3 §2.1 canonical order:
+/// TLV-TYPE first, then TLV-LENGTH (shorter is smaller), then TLV-VALUE
+/// byte-by-byte. This matches the order used by NFD and ndn-cxx.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct NameComponent {
     pub typ: u64,
     pub value: Bytes,
+}
+
+impl PartialOrd for NameComponent {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for NameComponent {
+    /// NDN canonical component ordering (NDN Packet Format v0.3 §2.1).
+    ///
+    /// Order: TLV-TYPE ascending, then TLV-LENGTH ascending (shorter is
+    /// smaller), then TLV-VALUE byte-by-byte ascending.
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.typ
+            .cmp(&other.typ)
+            .then_with(|| self.value.len().cmp(&other.value.len()))
+            .then_with(|| self.value.as_ref().cmp(other.value.as_ref()))
+    }
 }
 
 impl NameComponent {
@@ -122,9 +145,29 @@ fn decode_nonnegative_integer(bytes: &[u8]) -> u64 {
 ///
 /// Components are stored in a `SmallVec` with inline capacity for 8 elements,
 /// covering typical 4–8 component names without heap allocation.
+///
+/// Ordering follows the NDN Packet Format v0.3 §2.1 canonical order,
+/// component by component using [`NameComponent`]'s `Ord` impl.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Name {
     components: SmallVec<[NameComponent; 8]>,
+}
+
+impl PartialOrd for Name {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Name {
+    /// NDN canonical name ordering (NDN Packet Format v0.3 §2.1).
+    ///
+    /// Names are compared component by component from left to right.
+    /// If all shared components are equal, the shorter name is smaller
+    /// (prefix ordering).
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.components.iter().cmp(other.components.iter())
+    }
 }
 
 impl Name {

@@ -5,12 +5,15 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-# `std` is enabled by default. Disable for bare-metal embedded targets
-# (requires an allocator; configure `bytes`/`smallvec` without std):
+# `std` is NOT enabled by default. Bare-metal / no_std targets use this crate
+# without any features. All other targets should enable the `std` feature:
 #
-#   ndn-packet = { path = "...", default-features = false }
+#   ndn-packet = { ..., features = ["std"] }
+#
+# NOTE: this changed from `default = ["std"]` in v0.1.0-alpha. Crates that
+# relied on the old default must now add `features = ["std"]` explicitly.
 [features]
-default = ["std"]
+default = []
 std     = ["ndn-tlv/std", "bytes/std", "dep:ring"]
 
 [dependencies]

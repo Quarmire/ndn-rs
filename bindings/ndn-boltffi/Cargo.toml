@@ -20,7 +20,7 @@ fjall = ["ndn-mobile/fjall"]
 ndn-mobile      = { workspace = true }
 ndn-app         = { workspace = true }
 ndn-faces       = { workspace = true }
-ndn-packet      = { workspace = true }
+ndn-packet      = { workspace = true, features = ["std"] }
 ndn-security    = { workspace = true }
 tokio           = { workspace = true, features = ["rt-multi-thread"] }
 bytes           = { workspace = true, features = ["std"] }

@@ -19,6 +19,6 @@ extension-module = ["pyo3/extension-module"]
 
 [dependencies]
 ndn-app    = { workspace = true, features = ["blocking"] }
-ndn-packet = { workspace = true }
+ndn-packet = { workspace = true, features = ["std"] }
 bytes      = { workspace = true, features = ["std"] }
 pyo3       = { version = "0.22", features = ["macros"] }

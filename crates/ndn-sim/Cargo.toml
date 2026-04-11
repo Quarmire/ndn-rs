@@ -9,7 +9,7 @@ description = "In-process NDN network simulation with configurable link properti
 [dependencies]
 ndn-transport = { workspace = true }
 ndn-engine    = { workspace = true }
-ndn-packet    = { workspace = true }
+ndn-packet    = { workspace = true, features = ["std"] }
 ndn-store     = { workspace = true }
 
 bytes   = { workspace = true }

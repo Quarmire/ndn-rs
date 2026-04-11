@@ -54,9 +54,9 @@ impl AppSink {
                 reply: tx,
             })
             .await
-            .map_err(|_| AppError::Engine(anyhow::anyhow!("engine shut down")))?;
+            .map_err(|_| AppError::Closed)?;
         rx.await
-            .map_err(|_| AppError::Engine(anyhow::anyhow!("engine dropped reply channel")))?
+            .map_err(|_| AppError::Closed)?
     }
 
     /// Register a handler for Interests matching `prefix`.
@@ -70,7 +70,7 @@ impl AppSink {
                 handler: Box::new(handler),
             })
             .await
-            .map_err(|_| AppError::Engine(anyhow::anyhow!("engine shut down")))?;
+            .map_err(|_| AppError::Closed)?;
         Ok(())
     }
 }
@@ -132,7 +132,7 @@ mod tests {
         let (face, rx) = AppSink::new(FaceId(1), 8);
         drop(rx); // engine side dropped
         let result = face.express(make_interest("x")).await;
-        assert!(matches!(result, Err(AppError::Engine(_))));
+        assert!(matches!(result, Err(AppError::Closed)));
     }
 
     #[tokio::test]

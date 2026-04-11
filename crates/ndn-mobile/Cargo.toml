@@ -26,7 +26,7 @@ ndn-packet      = { workspace = true, features = ["std"] }
 ndn-security    = { workspace = true }
 ndn-store       = { workspace = true }
 ndn-transport   = { workspace = true }
-ndn-faces     = { workspace = true }
+ndn-faces     = { workspace = true, features = ["serial"] }
 tokio           = { workspace = true, features = ["sync", "time", "rt", "macros"] }
 tokio-util      = { workspace = true, features = ["codec"] }
 tracing         = { workspace = true }

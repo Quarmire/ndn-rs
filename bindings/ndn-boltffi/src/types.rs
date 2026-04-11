@@ -151,7 +151,9 @@ impl NdnError {
                 name: name.to_string(),
                 reason: format!("{reason:?}"),
             },
-            AppError::Engine(e) => NdnError::Engine { msg: e.to_string() },
+            AppError::Connection(e) => NdnError::Engine { msg: e.to_string() },
+            AppError::Closed => NdnError::Engine { msg: "connection closed".into() },
+            AppError::Protocol(msg) => NdnError::Engine { msg },
         }
     }
 
