@@ -4,6 +4,8 @@ A [Named Data Networking (NDN)](https://named-data.net/) forwarder stack written
 
 ndn-rs takes a Rust-idiomatic approach — composable async pipelines with trait-based polymorphism — and targets both standalone forwarder deployments and embedded use within research applications. The engine is a library, not a daemon.
 
+![ndn-rs logo](docs/logo.svg)
+
 **Version:** 0.1.0 · **[Releases](https://github.com/Quarmire/ndn-rs/releases)** · **[Wiki](https://quarmire.github.io/ndn-rs/wiki/)** · **[Explorer](https://quarmire.github.io/ndn-rs/explorer/)**
 
 ---
