@@ -1,7 +1,22 @@
 # Multi-stage Docker image for the ndn-fwd NDN forwarder.
 #
-# Build: docker build -f binaries/ndn-fwd/Dockerfile -t ndn-fwd .
-# Run:   docker run --rm -v /tmp:/tmp ndn-fwd
+# Build:
+#   docker build -f binaries/ndn-fwd/Dockerfile -t ndn-fwd .
+#
+# Run with default config:
+#   docker run --rm -p 6363:6363/udp -p 6363:6363/tcp ndn-fwd
+#
+# Run with a custom config file:
+#   docker run --rm -p 6363:6363/udp -p 6363:6363/tcp \
+#     -v /path/to/ndn-fwd.toml:/etc/ndn-fwd/config.toml:ro \
+#     ndn-fwd
+#
+# Run with TLS certificates (for websocket-tls):
+#   docker run --rm -p 6363:6363/udp -p 6363:6363/tcp -p 9696:9696/tcp \
+#     -v /path/to/ndn-fwd.toml:/etc/ndn-fwd/config.toml:ro \
+#     -v /path/to/cert.pem:/etc/ndn-fwd/cert.pem:ro \
+#     -v /path/to/key.pem:/etc/ndn-fwd/key.pem:ro \
+#     ndn-fwd
 #
 # Exposes:
 #   6363/udp  — NDN UDP face
@@ -10,12 +25,6 @@
 
 # ── Stage 1: builder ──────────────────────────────────────────────────────────
 FROM rust:1.85-slim AS builder
-
-# Install system libraries required for native-tls / OpenSSL.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    pkg-config \
-    libssl-dev \
-    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
 
@@ -33,10 +42,9 @@ COPY bindings/ bindings/
 RUN cargo build --release --bin ndn-fwd
 
 # ── Stage 2: runtime image ────────────────────────────────────────────────────
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libssl3 \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
@@ -45,6 +53,9 @@ COPY --from=builder /build/target/release/ndn-fwd /usr/local/bin/ndn-fwd
 
 # Copy the default configuration.
 COPY binaries/ndn-fwd/ndn-fwd.default.toml /etc/ndn-fwd/config.toml
+
+# Certificate directory — mount TLS certs here at runtime.
+RUN mkdir -p /etc/ndn-fwd/certs
 
 # Runtime socket directory.
 RUN mkdir -p /run/ndn-fwd
