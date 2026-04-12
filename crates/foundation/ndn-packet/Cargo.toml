@@ -14,13 +14,14 @@ license.workspace = true
 # relied on the old default must now add `features = ["std"]` explicitly.
 [features]
 default = []
-std     = ["ndn-tlv/std", "bytes/std", "dep:ring"]
+std     = ["ndn-tlv/std", "bytes/std", "dep:ring", "dep:blake3"]
 
 [dependencies]
 ndn-tlv  = { workspace = true, default-features = false }
 bytes    = { workspace = true }
 smallvec = { workspace = true }
 ring     = { workspace = true, optional = true }
+blake3   = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

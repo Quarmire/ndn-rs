@@ -18,6 +18,12 @@ use crate::{Name, SignatureType, tlv_type};
 /// be built via `sign_sync` / `sign` instead.
 const SIGINFO_DIGEST_SHA256: [u8; 5] = [0x16, 0x03, 0x1B, 0x01, 0x00];
 
+/// Encoded SignatureInfo TLV for DigestBlake3 with no KeyLocator (5 bytes, fixed).
+///
+/// Identical layout to `SIGINFO_DIGEST_SHA256` but with type code 6 (experimental
+/// BLAKE3 digest, not yet in the NDN Packet Format specification).
+const SIGINFO_DIGEST_BLAKE3: [u8; 5] = [0x16, 0x03, 0x1B, 0x01, 0x06];
+
 /// Write a VarNumber (u64) into `buf` using NDN's minimal-byte encoding.
 #[inline(always)]
 fn put_vu(buf: &mut BytesMut, v: u64) {
@@ -236,6 +242,56 @@ impl DataBuilder {
         let hash = ring::digest::digest(&ring::digest::SHA256, &buf[signed_start..]);
         buf.put_slice(&[0x17u8, 0x20]);
         buf.put_slice(hash.as_ref());
+        debug_assert_eq!(buf.len(), header_size + inner_size, "total size mismatch");
+
+        buf.freeze()
+    }
+
+    /// Build a Data packet signed with a **BLAKE3 digest** (experimental).
+    ///
+    /// Single-buffer fast path with **1 allocation, 0 copies of the signed region**,
+    /// identical structure to `sign_digest_sha256` but using BLAKE3.
+    ///
+    /// Produces the same 32-byte output as SHA-256, so encoded packet size is identical.
+    ///
+    /// # Performance characteristics
+    /// BLAKE3 uses SIMD (NEON on ARM, AVX2/AVX-512 on x86) and tree parallelism for
+    /// large inputs. However, for the small per-packet payloads typical of NDN iperf
+    /// (< a few KB), tree parallelism never activates. On hardware with dedicated SHA
+    /// accelerators — ARM crypto extensions (Apple Silicon, Cortex-A) or Intel SHA-NI —
+    /// `ring`'s SHA-256 implementation uses single-cycle hardware instructions and will
+    /// match or beat BLAKE3 at these payload sizes. BLAKE3's advantage over SHA-256
+    /// is most visible on hardware without such extensions (older x86, RISC-V, embedded).
+    ///
+    /// # Note
+    /// Uses signature type code 6 (`DigestBlake3`), which is an experimental
+    /// NDA extension not yet in the NDN Packet Format specification.
+    #[cfg(feature = "std")]
+    pub fn sign_digest_blake3(self) -> Bytes {
+        use ndn_tlv::varu64_size;
+
+        // SignatureValue: type(1) + len(1) + BLAKE3(32) = 34 bytes — same as SHA-256.
+        const SIGVALUE: usize = 34;
+
+        let sz = FastPathSizes::compute(
+            &self.name, self.freshness, self.final_block_id.as_ref(), &self.content,
+        );
+        let signed_size = sz.name_tlv + sz.metainfo_tlv + sz.content_tlv + SIGINFO_DIGEST_BLAKE3.len();
+        let inner_size  = signed_size + SIGVALUE;
+        let header_size = varu64_size(tlv_type::DATA) + varu64_size(inner_size as u64);
+
+        let mut buf = BytesMut::with_capacity(header_size + inner_size);
+        put_vu(&mut buf, tlv_type::DATA);
+        put_vu(&mut buf, inner_size as u64);
+
+        let signed_start = buf.len();
+        write_fields(&mut buf, &self.name, self.freshness, self.final_block_id.as_ref(), &self.content, &sz);
+        buf.put_slice(&SIGINFO_DIGEST_BLAKE3);
+        debug_assert_eq!(buf.len() - signed_start, signed_size, "signed region size mismatch");
+
+        let hash = blake3::hash(&buf[signed_start..]);
+        buf.put_slice(&[0x17u8, 0x20]);
+        buf.put_slice(hash.as_bytes());
         debug_assert_eq!(buf.len(), header_size + inner_size, "total size mismatch");
 
         buf.freeze()

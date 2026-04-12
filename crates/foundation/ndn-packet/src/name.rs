@@ -54,6 +54,27 @@ impl NameComponent {
         }
     }
 
+    /// Create a BLAKE3 content-digest component (type 0x03, 32 bytes).
+    ///
+    /// **Experimental / NDA extension.** The 32-byte BLAKE3 hash of a block's
+    /// content forms a self-certifying name component in NDA zones.  The actual
+    /// BLAKE3 computation must be performed by the caller.
+    pub fn blake3_digest(hash: [u8; 32]) -> Self {
+        Self::new(tlv_type::BLAKE3_DIGEST, Bytes::copy_from_slice(&hash))
+    }
+
+    /// Extract the 32-byte BLAKE3 digest value, or `None` if this is not a
+    /// `BLAKE3_DIGEST` (type 0x03) component or the value is not 32 bytes.
+    pub fn as_blake3_digest(&self) -> Option<[u8; 32]> {
+        if self.typ == tlv_type::BLAKE3_DIGEST && self.value.len() == 32 {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&self.value);
+            Some(arr)
+        } else {
+            None
+        }
+    }
+
     /// Create a Keyword component (type 0x20) with opaque bytes.
     pub fn keyword(value: Bytes) -> Self {
         Self::new(tlv_type::KEYWORD, value)
@@ -264,6 +285,33 @@ impl Name {
     pub fn append_byte_offset(self, off: u64) -> Self {
         self.append_component(NameComponent::byte_offset(off))
     }
+
+    /// Append a BLAKE3 digest component (type 0x03, 32 bytes).
+    ///
+    /// **Experimental / NDA extension.** See [`NameComponent::blake3_digest`].
+    pub fn append_blake3_digest(self, hash: [u8; 32]) -> Self {
+        self.append_component(NameComponent::blake3_digest(hash))
+    }
+
+    /// Build a single-component zone-root name from a pre-computed 32-byte hash.
+    ///
+    /// The hash should be the BLAKE3 digest of a public key (or any 32-byte
+    /// identifier). This is the low-level constructor; use
+    /// `ndn_security::ZoneKey::zone_root_name()` for the full API that computes
+    /// the hash from a public key.
+    ///
+    /// **Experimental / NDA extension** — BLAKE3 component type (0x03) is not
+    /// yet in the NDN Packet Format specification.
+    pub fn zone_root_from_hash(hash: [u8; 32]) -> Self {
+        Name::from_components([NameComponent::blake3_digest(hash)])
+    }
+
+    /// Returns `true` if this name is a single BLAKE3-digest component (a zone root).
+    pub fn is_zone_root(&self) -> bool {
+        self.components().len() == 1
+            && self.components()[0].typ == crate::tlv_type::BLAKE3_DIGEST
+            && self.components()[0].value.len() == 32
+    }
 }
 
 impl FromStr for Name {
@@ -388,6 +436,12 @@ impl core::fmt::Display for Name {
                 write!(f, "/")?;
             }
             match c.typ {
+                tlv_type::BLAKE3_DIGEST => {
+                    write!(f, "blake3digest=")?;
+                    for &b in c.value.iter() {
+                        write!(f, "{b:02x}")?;
+                    }
+                }
                 tlv_type::IMPLICIT_SHA256 => {
                     write!(f, "sha256digest=")?;
                     for &b in c.value.iter() {

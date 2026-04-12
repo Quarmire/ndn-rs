@@ -54,6 +54,13 @@ pub mod tlv_type {
     pub const NAME_COMPONENT: u64 = 0x08;
     pub const IMPLICIT_SHA256: u64 = 0x01;
     pub const PARAMETERS_SHA256: u64 = 0x02;
+    /// BLAKE3 content-digest component (32 bytes).
+    ///
+    /// **Experimental / NDA extension** — TLV type 0x03 is not yet assigned
+    /// by the NDN Packet Format specification. This value is used by the
+    /// Named Data Architecture (NDA) for self-certifying block identifiers.
+    /// A formal assignment request will be filed with the NDN community.
+    pub const BLAKE3_DIGEST: u64 = 0x03;
     pub const SEGMENT: u64 = 0x32;
     pub const KEYWORD: u64 = 0x20;
     pub const BYTE_OFFSET: u64 = 0x34;
