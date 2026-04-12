@@ -1,0 +1,65 @@
+# Interoperability test client image.
+#
+# Contains:
+#   - ndn-cxx tools: ndnpeek, ndnpoke, ndnping, ndnsec
+#   - NDNts CLI: ndnts-fetch, ndnts-serve
+#   - ndn-rs tools (copied from the ndn-fwd image): ndn-peek, ndn-put, ndn-ping, ndn-iperf
+FROM ubuntu:24.04 AS ndn-cxx-builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential cmake pkg-config \
+    libboost-all-dev libssl-dev libsqlite3-dev \
+    libpcap-dev \
+    ca-certificates curl git \
+    && rm -rf /var/lib/apt/lists/*
+
+# ndn-cxx + ndn-tools
+RUN git clone --depth 1 --branch ndn-cxx-24.07 \
+      https://github.com/named-data/ndn-cxx.git /src/ndn-cxx && \
+    cmake -S /src/ndn-cxx -B /build/ndn-cxx \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX=/usr/local && \
+    cmake --build /build/ndn-cxx -j"$(nproc)" && \
+    cmake --install /build/ndn-cxx
+
+RUN git clone --depth 1 --branch ndn-tools-24.07 \
+      https://github.com/named-data/ndn-tools.git /src/ndn-tools && \
+    cmake -S /src/ndn-tools -B /build/ndn-tools \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX=/usr/local && \
+    cmake --build /build/ndn-tools -j"$(nproc)" && \
+    cmake --install /build/ndn-tools
+
+# ── Final image ───────────────────────────────────────────────────────────────
+FROM ubuntu:24.04
+
+# Runtime libs for ndn-cxx
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libboost-filesystem1.83.0 \
+    libboost-program-options1.83.0 \
+    libboost-log1.83.0 \
+    libssl3 libsqlite3-0 libpcap0.8 \
+    nodejs npm \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# ndn-cxx tools
+COPY --from=ndn-cxx-builder /usr/local/bin/ndnpeek   /usr/local/bin/
+COPY --from=ndn-cxx-builder /usr/local/bin/ndnpoke   /usr/local/bin/
+COPY --from=ndn-cxx-builder /usr/local/bin/ndnping   /usr/local/bin/
+COPY --from=ndn-cxx-builder /usr/local/lib/           /usr/local/lib/
+
+# NDNts CLI tools
+RUN npm install -g @ndn/cli 2>/dev/null || \
+    npm install -g @yoursunny/ndn-ts-cli 2>/dev/null || true
+
+# ndn-rs tools (built separately, copied from ndn-fwd image context)
+COPY --from=ndn-fwd /usr/local/bin/ndn-peek  /usr/local/bin/
+COPY --from=ndn-fwd /usr/local/bin/ndn-put   /usr/local/bin/
+COPY --from=ndn-fwd /usr/local/bin/ndn-ping  /usr/local/bin/
+COPY --from=ndn-fwd /usr/local/bin/ndn-iperf /usr/local/bin/
+
+COPY tests/interop/ /testbed/tests/interop/
+RUN chmod +x /testbed/tests/interop/*.sh
+
+WORKDIR /testbed

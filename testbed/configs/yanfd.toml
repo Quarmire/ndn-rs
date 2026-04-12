@@ -1,0 +1,30 @@
+# yanfd (ndnd) testbed configuration
+
+[core]
+log_level = "INFO"
+
+[faces]
+  [faces.udp]
+    enabled   = true
+    port      = 6363
+    multicast = false
+
+  [faces.tcp]
+    enabled = true
+    port    = 6363
+
+  [faces.unix]
+    enabled = true
+    socket_path = "/run/yanfd.sock"
+
+[mgmt]
+  [mgmt.unix]
+    socket_path = "/run/yanfd-mgmt.sock"
+
+[tables]
+  [tables.cs]
+    capacity = 65536
+    replacement_policy = "lru"
+
+  [tables.strategy_choice]
+    "/ndn/broadcast" = "multicast"

@@ -1,0 +1,37 @@
+FROM rust:1.85-slim AS builder
+
+WORKDIR /build
+COPY . .
+
+RUN cargo build --release \
+    --bin ndn-iperf \
+    --bin ndn-ping \
+    --bin ndn-peek \
+    --bin ndn-put \
+    --bin ndn-sec \
+    --bin ndn-ctl
+
+# ── Runtime image ─────────────────────────────────────────────────────────────
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    netcat-openbsd \
+    jq \
+    bc \
+    curl \
+  && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /build/target/release/ndn-iperf  /usr/local/bin/
+COPY --from=builder /build/target/release/ndn-ping   /usr/local/bin/
+COPY --from=builder /build/target/release/ndn-peek   /usr/local/bin/
+COPY --from=builder /build/target/release/ndn-put    /usr/local/bin/
+COPY --from=builder /build/target/release/ndn-sec    /usr/local/bin/
+COPY --from=builder /build/target/release/ndn-ctl    /usr/local/bin/
+
+COPY testbed/tests  /testbed/tests
+COPY testbed/bench  /testbed/bench
+
+RUN chmod +x /testbed/tests/compliance/*.sh /testbed/bench/*.sh 2>/dev/null || true
+
+WORKDIR /testbed

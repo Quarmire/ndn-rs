@@ -1,0 +1,115 @@
+# NDN Forwarder Testbed
+#
+# Three-node topology for protocol compliance testing and benchmarking:
+#
+#   consumer ──── ndn-fwd ──┬── NFD    ──── producer
+#                            └── yanfd  ────/
+#
+# ndn-iperf is used for throughput/latency benchmarks.
+# NOTE: SHM face is only available between ndn-fwd and in-process tools;
+#       NFD and yanfd use UDP faces in this testbed.
+#
+# Usage:
+#   docker compose up -d
+#   ./tests/compliance/run_all.sh
+#   ./bench/run_all.sh
+
+name: ndn-testbed
+
+networks:
+  ndn-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+
+services:
+
+  # ── ndn-fwd (ndn-rs) ──────────────────────────────────────────────────────
+  ndn-fwd:
+    build:
+      context: ..
+      dockerfile: binaries/ndn-fwd/Dockerfile
+    container_name: ndn-fwd
+    hostname: ndn-fwd
+    networks:
+      ndn-net:
+        ipv4_address: 172.30.0.10
+    ports:
+      - "6363:6363/udp"
+      - "6363:6363/tcp"
+      - "6364:6364/tcp"   # management / WebSocket
+    volumes:
+      - ./configs/ndn-fwd.toml:/etc/ndn-fwd/config.toml:ro
+    command: ["/usr/local/bin/ndn-router", "-c", "/etc/ndn-fwd/config.toml"]
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 6363 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # ── NFD (named-data reference implementation) ─────────────────────────────
+  nfd:
+    image: ghcr.io/named-data/nfd:latest
+    container_name: nfd
+    hostname: nfd
+    networks:
+      ndn-net:
+        ipv4_address: 172.30.0.11
+    ports:
+      - "6366:6363/udp"
+      - "6366:6363/tcp"
+    volumes:
+      - ./configs/nfd.conf:/etc/ndn/nfd.conf:ro
+    command: ["nfd", "--config", "/etc/ndn/nfd.conf"]
+    healthcheck:
+      test: ["CMD-SHELL", "nfdc status 2>/dev/null | grep -q 'uptime' || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # ── yanfd (ndnd Go forwarder) ─────────────────────────────────────────────
+  yanfd:
+    image: ghcr.io/named-data/ndnd:latest
+    container_name: yanfd
+    hostname: yanfd
+    networks:
+      ndn-net:
+        ipv4_address: 172.30.0.12
+    ports:
+      - "6367:6363/udp"
+      - "6367:6363/tcp"
+    volumes:
+      - ./configs/yanfd.toml:/etc/yanfd/config.toml:ro
+    command: ["yanfd", "--config", "/etc/yanfd/config.toml"]
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 6363 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # ── Test runner (shared tools container) ──────────────────────────────────
+  # Used by bench and compliance scripts as the "outside" node.
+  # Has ndn-tools (ndn-iperf, ndn-ping, ndn-peek, ndn-put) installed.
+  testclient:
+    build:
+      context: ..
+      dockerfile: testbed/Dockerfile.testclient
+    container_name: testclient
+    hostname: testclient
+    networks:
+      ndn-net:
+        ipv4_address: 172.30.0.20
+    depends_on:
+      ndn-fwd:
+        condition: service_healthy
+      nfd:
+        condition: service_healthy
+      yanfd:
+        condition: service_healthy
+    volumes:
+      - ./results:/results
+    command: ["sleep", "infinity"]

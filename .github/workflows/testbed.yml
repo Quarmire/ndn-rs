@@ -1,0 +1,190 @@
+name: Testbed (compliance + benchmarks)
+
+# Runs the multi-forwarder testbed against ndn-fwd, NFD, and yanfd.
+#
+# Trigger conditions:
+#   - Manual dispatch (workflow_dispatch)
+#   - PR / push with the "testbed" label
+#   - Weekly cron on Monday 03:00 UTC (catches upstream NFD/yanfd regressions)
+#
+# This workflow is intentionally NOT part of the main CI because it requires
+# Docker Compose and takes ~15 minutes.  Failures here do not block merges —
+# they are tracked as separate quality signals.
+on:
+  workflow_dispatch:
+    inputs:
+      skip_compliance:
+        description: "Skip compliance tests"
+        type: boolean
+        default: false
+      skip_bench:
+        description: "Skip benchmarks"
+        type: boolean
+        default: false
+      skip_interop:
+        description: "Skip interoperability tests"
+        type: boolean
+        default: false
+
+  schedule:
+    # Weekly — Monday 03:00 UTC
+    - cron: "0 3 * * 1"
+
+  push:
+    branches: ["main"]
+    paths:
+      - "testbed/**"
+      - "binaries/ndn-fwd/**"
+      - ".github/workflows/testbed.yml"
+
+permissions:
+  contents: write      # push wiki bench table
+  pull-requests: write # post results as PR comment
+
+jobs:
+  testbed:
+    name: Testbed (${{ matrix.suite }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: compliance
+            skip_input: skip_compliance
+          - suite: bench
+            skip_input: skip_bench
+          - suite: interop
+            skip_input: skip_interop
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build images
+        working-directory: testbed
+        run: |
+          docker compose build --parallel
+
+      - name: Start testbed
+        working-directory: testbed
+        run: |
+          docker compose up -d
+          # Wait for all health checks to pass (up to 60 s).
+          for i in $(seq 1 12); do
+            ALL_HEALTHY=true
+            for svc in ndn-fwd nfd yanfd; do
+              STATUS=$(docker inspect --format='{{.State.Health.Status}}' "$svc" 2>/dev/null || echo "none")
+              if [ "$STATUS" != "healthy" ]; then
+                ALL_HEALTHY=false
+              fi
+            done
+            $ALL_HEALTHY && break
+            echo "Waiting for services to become healthy (attempt $i/12)..."
+            sleep 5
+          done
+          docker compose ps
+
+      # ── Compliance ──────────────────────────────────────────────────────────
+
+      - name: Run compliance tests
+        if: matrix.suite == 'compliance' && !fromJSON(inputs.skip_compliance || 'false')
+        working-directory: testbed
+        run: |
+          mkdir -p results
+          docker compose exec -T testclient bash /testbed/tests/compliance/run_all.sh
+          docker cp testclient:/results/. results/
+
+      # ── Benchmarks ─────────────────────────────────────────────────────────
+      # ndn-iperf is used as the benchmark driver.
+      # IMPORTANT: Only ndn-fwd supports the SHM face transport.  NFD and yanfd
+      # are benchmarked over UDP.  The report clearly labels each transport so
+      # numbers are not naively compared across forwarders.
+
+      - name: Run benchmarks
+        if: matrix.suite == 'bench' && !fromJSON(inputs.skip_bench || 'false')
+        working-directory: testbed
+        run: |
+          mkdir -p results
+          docker compose exec -T testclient bash /testbed/bench/run_all.sh
+          docker cp testclient:/results/. results/
+
+      # ── Interoperability ────────────────────────────────────────────────────
+      # Tests ndn-rs against ndn-cxx and NDNts in both directions:
+      #   - ndn-fwd as forwarder (ndn-cxx/NDNts consumer or producer)
+      #   - ndn-rs as application library (against NFD and yanfd)
+
+      - name: Build interop image
+        if: matrix.suite == 'interop' && !fromJSON(inputs.skip_interop || 'false')
+        working-directory: testbed
+        run: docker build -f Dockerfile.interop -t interop-client .
+
+      - name: Run interoperability tests
+        if: matrix.suite == 'interop' && !fromJSON(inputs.skip_interop || 'false')
+        working-directory: testbed
+        run: |
+          mkdir -p results
+          docker run --rm --network testbed_ndnnet \
+            -e FWD_HOST=ndn-fwd \
+            -e NFD_HOST=nfd \
+            -e YANFD_HOST=yanfd \
+            -e RESULTS_DIR=/results \
+            -v "$(pwd)/results:/results" \
+            interop-client \
+            bash /testbed/tests/interop/run_all.sh
+          docker cp testclient:/results/. results/ 2>/dev/null || true
+
+      - name: Generate comparison report
+        if: always()
+        working-directory: testbed
+        run: |
+          python3 report/compare.py results/*.md results/*.txt 2>/dev/null \
+            > results/summary.md || true
+          cat results/summary.md || true
+
+      # ── Upload artefacts ────────────────────────────────────────────────────
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: testbed-${{ matrix.suite }}-${{ github.run_number }}
+          path: testbed/results/
+          retention-days: 30
+
+      # ── Post bench table to wiki (bench suite, main branch only) ────────────
+
+      - name: Publish bench table to wiki
+        if: >
+          matrix.suite == 'bench' &&
+          github.ref == 'refs/heads/main' &&
+          !fromJSON(inputs.skip_bench || 'false')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          WIKI_PAGE="docs/wiki/src/bench-forwarder.md"
+          if [ -f "testbed/results/summary.md" ]; then
+            cat testbed/results/summary.md > "${WIKI_PAGE}"
+            git config user.name  "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add "${WIKI_PAGE}"
+            git diff --cached --quiet || \
+              git commit -m "chore(bench): update forwarder benchmark table [skip ci]"
+            git push
+          fi
+
+      # ── Teardown ────────────────────────────────────────────────────────────
+
+      - name: Dump logs on failure
+        if: failure()
+        working-directory: testbed
+        run: docker compose logs --no-color --tail=200
+
+      - name: Stop testbed
+        if: always()
+        working-directory: testbed
+        run: docker compose down -v
