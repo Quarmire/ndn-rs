@@ -64,6 +64,13 @@ enum Command {
         /// Certificate validity in days (default: 365).
         #[arg(long, default_value = "365")]
         days: u64,
+
+        /// Skip silently if a key for this identity already exists in the PIB.
+        ///
+        /// Useful for idempotent NixOS / systemd ExecStartPre invocations:
+        /// the key is generated on first boot and ignored on subsequent starts.
+        #[arg(long)]
+        skip_if_exists: bool,
     },
 
     /// Display certificate details for a stored key.
@@ -112,8 +119,8 @@ fn main() -> anyhow::Result<()> {
     let pib_path = resolve_pib_path(cli.pib.as_deref());
 
     match cli.command {
-        Command::Keygen { name, anchor, days } => {
-            cmd_keygen(&pib_path, &name, anchor, days)?;
+        Command::Keygen { name, anchor, days, skip_if_exists } => {
+            cmd_keygen(&pib_path, &name, anchor, days, skip_if_exists)?;
         }
         Command::Certdump { name } => {
             cmd_certdump(&pib_path, &name)?;
@@ -141,9 +148,18 @@ fn cmd_keygen(
     name_str: &str,
     make_anchor: bool,
     days: u64,
+    skip_if_exists: bool,
 ) -> anyhow::Result<()> {
     let key_name = parse_name(name_str)?;
     let pib = FilePib::new(pib_path)?;
+
+    // With --skip-if-exists: if a key already exists for this identity, do nothing.
+    if skip_if_exists
+        && let Ok(keys) = pib.list_keys()
+        && keys.iter().any(|k| k == &key_name)
+    {
+        return Ok(());
+    }
 
     // Generate key and store it.
     let signer = pib.generate_ed25519(&key_name)?;
