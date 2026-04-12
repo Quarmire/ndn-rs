@@ -16,6 +16,13 @@
 
 name: ndn-testbed
 
+# Named volumes share each forwarder's Unix socket directory with testclient,
+# so ndn-iperf / ndn-ping / ndn-ctl can connect via --face-socket without SHM.
+volumes:
+  ndn-fwd-sock:
+  nfd-sock:
+  yanfd-sock:
+
 networks:
   ndn-net:
     driver: bridge
@@ -41,6 +48,7 @@ services:
       - "6364:6364/tcp"   # management / WebSocket
     volumes:
       - ./configs/ndn-fwd.toml:/etc/ndn-fwd/config.toml:ro
+      - ndn-fwd-sock:/run/ndn-fwd
     healthcheck:
       test: ["CMD-SHELL", "nc -z localhost 6364 || exit 1"]
       interval: 5s
@@ -62,6 +70,7 @@ services:
       - "6366:6363/tcp"
     volumes:
       - ./configs/nfd.conf:/etc/ndn/nfd.conf:ro
+      - nfd-sock:/run/nfd
     command: ["nfd", "--config", "/etc/ndn/nfd.conf"]
     healthcheck:
       test: ["CMD-SHELL", "nfdc status 2>/dev/null | grep -q 'uptime' || exit 1"]
@@ -84,6 +93,7 @@ services:
       - "6367:6363/tcp"
     volumes:
       - ./configs/yanfd.yml:/etc/yanfd/config.yml:ro
+      - yanfd-sock:/run/nfd
     # ndnd >= 0.7: binary is "ndnd", subcommand "fw run <config>"
     command: ["fw", "run", "/etc/yanfd/config.yml"]
     healthcheck:
@@ -117,4 +127,7 @@ services:
         condition: service_healthy
     volumes:
       - ./results:/results
+      - ndn-fwd-sock:/run/ndn-fwd:ro
+      - nfd-sock:/run/nfd:ro
+      - yanfd-sock:/run/yanfd:ro
     command: ["sleep", "infinity"]

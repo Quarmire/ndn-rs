@@ -9,13 +9,11 @@
 #
 # Transport comparison:
 #   internal (Unix socket) ≈ forwarder throughput
-#   udp (loopback)         ≈ forwarder + OS network stack
-#   udp (cross-host)       ≈ forwarder + OS + physical NIC
+#   unix (cross-container) ≈ forwarder + volume mount overhead
 set -euo pipefail
 
 LABEL="${FWD_LABEL:-ndn-fwd-internal}"
-UNIX_SOCK="${UNIX_SOCK:-/run/ndn-fwd/mgmt.sock}"
-FACE="unix://${UNIX_SOCK}"
+SOCK="${FWD_SOCK:-/run/ndn-fwd/ndn-fwd.sock}"
 DURATION=10
 WINDOW=64
 PREFIX="/testbed/bench/internal/${LABEL}"
@@ -23,8 +21,8 @@ REPORT="${REPORT:-/dev/stdout}"
 
 echo "[${LABEL}/unix] internal throughput: starting iperf server"
 ndn-iperf server \
+  --face-socket "${SOCK}" --no-shm \
   --prefix "${PREFIX}" \
-  --face "${FACE}" \
   --duration "$(( DURATION + 5 ))" \
   --quiet &
 SRV_PID=$!
@@ -32,8 +30,8 @@ sleep 1
 
 echo "[${LABEL}/unix] internal throughput: running ${DURATION}s client"
 OUTPUT=$(ndn-iperf client \
+  --face-socket "${SOCK}" --no-shm \
   --prefix "${PREFIX}" \
-  --face "${FACE}" \
   --duration "${DURATION}" \
   --window "${WINDOW}" \
   2>&1)

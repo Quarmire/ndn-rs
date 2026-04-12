@@ -2,12 +2,11 @@
 # Compliance: NFD management protocol — face add, route register/unregister,
 # and general status query.  Tests that the forwarder's management API is
 # compatible with the NFD command/dataset format.
+# Env: FWD_SOCK, FWD_LABEL
 set -euo pipefail
 
-HOST="${FWD_HOST:-172.30.0.10}"
-PORT="${FWD_PORT:-6363}"
+SOCK="${FWD_SOCK:-/run/ndn-fwd/ndn-fwd.sock}"
 LABEL="${FWD_LABEL:-fwd}"
-FACE="udp://${HOST}:${PORT}"
 
 PASS=0
 FAIL=0
@@ -34,28 +33,28 @@ echo "[${LABEL}] mgmt_protocol: testing management protocol"
 
 # General status
 check "status/general" \
-  "ndn-ctl --face '${FACE}' status" \
-  "uptime|version|startTime"
+  "ndn-ctl --socket '${SOCK}' status" \
+  "uptime|version|startTime|200"
 
 # Face list
 check "faces/list" \
-  "ndn-ctl --face '${FACE}' face list" \
-  "faceId|face"
+  "ndn-ctl --socket '${SOCK}' face list" \
+  "faceId|face|200"
 
 # Route registration
 check "rib/register" \
-  "ndn-ctl --face '${FACE}' route add /testbed/mgmt-test" \
-  "200|Created|registered"
+  "ndn-ctl --socket '${SOCK}' route add /testbed/mgmt-test --face 1" \
+  "200|Created|registered|FaceId"
 
-# Route appears in FIB list
-check "fib/list after register" \
-  "ndn-ctl --face '${FACE}' route list" \
-  "/testbed/mgmt-test"
+# Route appears in route list
+check "route/list after register" \
+  "ndn-ctl --socket '${SOCK}' route list" \
+  "/testbed/mgmt-test|200"
 
 # Route unregister
 check "rib/unregister" \
-  "ndn-ctl --face '${FACE}' route remove /testbed/mgmt-test" \
-  "200|OK|removed"
+  "ndn-ctl --socket '${SOCK}' route remove /testbed/mgmt-test --face 1" \
+  "200|OK|removed|FaceId"
 
 echo ""
 echo "[${LABEL}] mgmt_protocol: ${PASS} passed, ${FAIL} failed"

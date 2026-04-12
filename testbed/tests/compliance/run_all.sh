@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 # Run the full compliance suite against all three forwarders.
 # Exit code: 0 = all pass, non-zero = failures.
+#
+# Connects to each forwarder via its shared Unix socket (mounted as a named
+# Docker volume into testclient) using --face-socket / --no-shm.
+#
+# Socket paths inside testclient:
+#   ndn-fwd : /run/ndn-fwd/ndn-fwd.sock
+#   nfd     : /run/nfd/nfd.sock
+#   yanfd   : /run/yanfd/nfd.sock
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -16,15 +24,14 @@ FAIL=0
 run_suite() {
   local label="$1"
   local script="$2"
-  local fwd_host="$3"
-  local fwd_port="${4:-6363}"
+  local fwd_sock="$3"
 
   echo ""
   echo "══════════════════════════════════════════════════════"
-  echo "  ${label}  (${fwd_host}:${fwd_port})"
+  echo "  ${label}  (${fwd_sock})"
   echo "══════════════════════════════════════════════════════"
 
-  if FWD_HOST="${fwd_host}" FWD_PORT="${fwd_port}" FWD_LABEL="${label}" \
+  if FWD_SOCK="${fwd_sock}" FWD_LABEL="${label}" \
        bash "${SCRIPT_DIR}/${script}" 2>&1 | tee -a "${REPORT}"; then
     echo "  PASS: ${script}"
     (( PASS++ ))
@@ -34,10 +41,15 @@ run_suite() {
   fi
 }
 
+declare -A FWD_SOCKS=(
+  ["ndn-fwd"]="/run/ndn-fwd/ndn-fwd.sock"
+  ["nfd"]="/run/nfd/nfd.sock"
+  ["yanfd"]="/run/yanfd/nfd.sock"
+)
+
 for script in basic_forwarding.sh pit_aggregation.sh cs_behavior.sh mgmt_protocol.sh; do
-  for fwd in "ndn-fwd:172.30.0.10:6363" "nfd:172.30.0.11:6363" "yanfd:172.30.0.12:6363"; do
-    IFS=: read -r label host port <<< "${fwd}"
-    run_suite "${label}" "${script}" "${host}" "${port}"
+  for label in ndn-fwd nfd yanfd; do
+    run_suite "${label}" "${script}" "${FWD_SOCKS[$label]}"
   done
 done
 

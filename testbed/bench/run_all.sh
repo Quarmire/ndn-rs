@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 # Run the full benchmark suite and write a markdown summary.
 #
-# NOTE on SHM face:
-#   ndn-fwd supports a shared-memory face (shm://) for in-process producers,
-#   which removes socket overhead and gives the lowest possible latency.
-#   NFD and yanfd do NOT support SHM — they use UDP faces in this testbed.
-#   The benchmark report clearly labels which transport is used for each result
-#   so numbers are not naively compared across forwarders.
+# Tools connect to each forwarder via its shared Unix socket (--face-socket,
+# --no-shm), making benchmarks independent of IP stack overhead for the
+# control plane.  All three forwarders are reachable from testclient because
+# their socket directories are mounted as named Docker volumes.
+#
+# Socket paths inside testclient:
+#   ndn-fwd : /run/ndn-fwd/ndn-fwd.sock
+#   nfd     : /run/nfd/nfd.sock
+#   yanfd   : /run/yanfd/nfd.sock
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -23,15 +26,13 @@ echo "|-----------|-----------|--------|-------|" >> "${REPORT}"
 
 run_bench() {
   local label="$1"
-  local host="$2"
-  local port="$3"
-  local transport="$4"
-  local script="$5"
+  local sock="$2"
+  local script="$3"
 
   echo ""
-  echo "── ${label} (${transport}) ──────────────────────────"
-  FWD_HOST="${host}" FWD_PORT="${port}" FWD_LABEL="${label}" \
-  FWD_TRANSPORT="${transport}" REPORT="${REPORT}" \
+  echo "── ${label} (unix) ──────────────────────────"
+  FWD_SOCK="${sock}" FWD_LABEL="${label}" \
+  FWD_TRANSPORT="unix" REPORT="${REPORT}" \
     bash "${SCRIPT_DIR}/${script}"
 }
 
@@ -40,19 +41,19 @@ run_bench() {
 echo ""
 echo "── ndn-fwd (unix/internal) ──────────────────────────────────"
 FWD_LABEL="ndn-fwd-internal" \
-UNIX_SOCK="/run/ndn-fwd/mgmt.sock" \
+FWD_SOCK="/run/ndn-fwd/ndn-fwd.sock" \
 REPORT="${REPORT}" \
   bash "${SCRIPT_DIR}/internal_throughput.sh"
 
-# Throughput — all forwarders via UDP
-run_bench "ndn-fwd" "172.30.0.10" "6363" "udp" throughput.sh
-run_bench "nfd"     "172.30.0.11" "6363" "udp" throughput.sh
-run_bench "yanfd"   "172.30.0.12" "6363" "udp" throughput.sh
+# Throughput — all forwarders via Unix socket
+run_bench "ndn-fwd" "/run/ndn-fwd/ndn-fwd.sock" throughput.sh
+run_bench "nfd"     "/run/nfd/nfd.sock"           throughput.sh
+run_bench "yanfd"   "/run/yanfd/nfd.sock"          throughput.sh
 
-# Latency — all forwarders via UDP
-run_bench "ndn-fwd" "172.30.0.10" "6363" "udp" latency.sh
-run_bench "nfd"     "172.30.0.11" "6363" "udp" latency.sh
-run_bench "yanfd"   "172.30.0.12" "6363" "udp" latency.sh
+# Latency — all forwarders via Unix socket
+run_bench "ndn-fwd" "/run/ndn-fwd/ndn-fwd.sock" latency.sh
+run_bench "nfd"     "/run/nfd/nfd.sock"           latency.sh
+run_bench "yanfd"   "/run/yanfd/nfd.sock"          latency.sh
 
 echo ""
 echo "Report written to: ${REPORT}"

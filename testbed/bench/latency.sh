@@ -4,29 +4,24 @@
 # Sends 200 pings and reports p50 / p95 / p99 RTT in microseconds.
 set -euo pipefail
 
-HOST="${FWD_HOST:-172.30.0.10}"
-PORT="${FWD_PORT:-6363}"
+SOCK="${FWD_SOCK:-/run/ndn-fwd/ndn-fwd.sock}"
 LABEL="${FWD_LABEL:-fwd}"
-TRANSPORT="${FWD_TRANSPORT:-udp}"
+TRANSPORT="${FWD_TRANSPORT:-unix}"
 COUNT=200
 PREFIX="/testbed/bench/latency/${LABEL}"
 REPORT="${REPORT:-/dev/stdout}"
 
-FACE="udp://${HOST}:${PORT}"
-
 echo "[${LABEL}/${TRANSPORT}] latency: starting ping server on ${PREFIX}"
-# ndn-ping server registers the prefix and echoes Interests as Data.
 ndn-ping server \
-  --prefix "${PREFIX}" \
-  --face "${FACE}" \
-  --quiet &
+  --face-socket "${SOCK}" --no-shm \
+  --prefix "${PREFIX}" &
 SRV_PID=$!
 sleep 0.5
 
 echo "[${LABEL}/${TRANSPORT}] latency: sending ${COUNT} pings"
 OUTPUT=$(ndn-ping client \
+  --face-socket "${SOCK}" --no-shm \
   --prefix "${PREFIX}" \
-  --face "${FACE}" \
   --count "${COUNT}" \
   --interval 10 \
   2>&1)
@@ -39,7 +34,6 @@ echo "${OUTPUT}"
 # Parse RTT lines: extract all RTT values and compute percentiles.
 RTTS=$(echo "${OUTPUT}" | grep -oE 'rtt=[0-9]+' | sed 's/rtt=//')
 if [ -z "${RTTS}" ]; then
-  # Alternative format: "RTT: X us"
   RTTS=$(echo "${OUTPUT}" | grep -oE '[0-9]+ us' | awk '{print $1}')
 fi
 

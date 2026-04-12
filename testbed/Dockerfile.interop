@@ -3,7 +3,7 @@
 # Contains:
 #   - ndn-cxx tools: ndnpeek, ndnpoke, ndnping, ndnsec
 #   - NDNts CLI: ndnts-fetch, ndnts-serve
-#   - ndn-rs tools (copied from the ndn-fwd image): ndn-peek, ndn-put, ndn-ping, ndn-iperf
+#   - ndn-rs tools (built from source): ndn-peek, ndn-put, ndn-ping, ndn-iperf
 FROM ubuntu:24.04 AS ndn-cxx-builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -30,6 +30,23 @@ RUN git clone --depth 1 --branch ndn-tools-24.07 \
     cmake --build /build/ndn-tools -j"$(nproc)" && \
     cmake --install /build/ndn-tools
 
+# ── ndn-rs tools builder ──────────────────────────────────────────────────────
+FROM rust:slim AS ndn-rs-builder
+
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY binaries/ binaries/
+COPY crates/ crates/
+COPY tools/ tools/
+COPY bindings/ bindings/
+COPY examples/ examples/
+
+RUN cargo build --release \
+    --bin ndn-peek \
+    --bin ndn-put \
+    --bin ndn-ping \
+    --bin ndn-iperf
+
 # ── Final image ───────────────────────────────────────────────────────────────
 FROM ubuntu:24.04
 
@@ -53,11 +70,11 @@ COPY --from=ndn-cxx-builder /usr/local/lib/           /usr/local/lib/
 RUN npm install -g @ndn/cli 2>/dev/null || \
     npm install -g @yoursunny/ndn-ts-cli 2>/dev/null || true
 
-# ndn-rs tools (built separately, copied from ndn-fwd image context)
-COPY --from=ndn-fwd /usr/local/bin/ndn-peek  /usr/local/bin/
-COPY --from=ndn-fwd /usr/local/bin/ndn-put   /usr/local/bin/
-COPY --from=ndn-fwd /usr/local/bin/ndn-ping  /usr/local/bin/
-COPY --from=ndn-fwd /usr/local/bin/ndn-iperf /usr/local/bin/
+# ndn-rs tools
+COPY --from=ndn-rs-builder /build/target/release/ndn-peek  /usr/local/bin/
+COPY --from=ndn-rs-builder /build/target/release/ndn-put   /usr/local/bin/
+COPY --from=ndn-rs-builder /build/target/release/ndn-ping  /usr/local/bin/
+COPY --from=ndn-rs-builder /build/target/release/ndn-iperf /usr/local/bin/
 
 COPY tests/interop/ /testbed/tests/interop/
 RUN chmod +x /testbed/tests/interop/*.sh

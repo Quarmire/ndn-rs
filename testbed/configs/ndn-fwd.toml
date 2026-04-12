@@ -22,5 +22,8 @@ bind = "0.0.0.0:6363"
 kind = "tcp"
 bind = "0.0.0.0:6364"
 
+[management]
+face_socket = "/run/ndn-fwd/ndn-fwd.sock"
+
 [logging]
 level = "info"
