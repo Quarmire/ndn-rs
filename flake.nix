@@ -52,11 +52,11 @@
         cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 
         # Individual binary packages.
-        ndn-router = craneLib.buildPackage (commonArgs // {
+        ndn-fwd = craneLib.buildPackage (commonArgs // {
           inherit cargoArtifacts;
-          pname = "ndn-router";
-          cargoExtraArgs = "--bin ndn-router";
-          meta.mainProgram = "ndn-router";
+          pname = "ndn-fwd";
+          cargoExtraArgs = "--bin ndn-fwd";
+          meta.mainProgram = "ndn-fwd";
         });
 
         ndn-tools = craneLib.buildPackage (commonArgs // {
@@ -84,14 +84,14 @@
         # ── Packages ────────────────────────────────────────────────────────
 
         packages = {
-          inherit ndn-router ndn-tools ndn-bench;
-          default = ndn-router;
+          inherit ndn-fwd ndn-tools ndn-bench;
+          default = ndn-fwd;
         };
 
         # ── Checks (CI) ────────────────────────────────────────────────────
 
         checks = {
-          inherit ndn-router ndn-tools ndn-bench;
+          inherit ndn-fwd ndn-tools ndn-bench;
 
           workspace-clippy = craneLib.cargoClippy (commonArgs // {
             inherit cargoArtifacts;
@@ -131,22 +131,27 @@
     {
       nixosModules.default = { config, lib, pkgs, ... }:
         let
-          cfg = config.services.ndn-router;
+          cfg = config.services.ndn-fwd;
+          toolsPkg = self.packages.${pkgs.system}.ndn-tools;
+          # Resolved PIB path — either user-supplied or under the state directory.
+          resolvedPibPath = if cfg.pibPath != null
+            then cfg.pibPath
+            else "/var/lib/ndn-fwd/pib";
         in {
-          options.services.ndn-router = {
+          options.services.ndn-fwd = {
             enable = lib.mkEnableOption "NDN router (ndn-rs forwarder)";
 
             package = lib.mkOption {
               type = lib.types.package;
-              default = self.packages.${pkgs.system}.ndn-router;
-              defaultText = lib.literalExpression "inputs.ndn-rs.packages.\${system}.ndn-router";
-              description = "The ndn-router package to use.";
+              default = self.packages.${pkgs.system}.ndn-fwd;
+              defaultText = lib.literalExpression "inputs.ndn-rs.packages.\${system}.ndn-fwd";
+              description = "The ndn-fwd package to use.";
             };
 
             configFile = lib.mkOption {
               type = lib.types.nullOr lib.types.path;
               default = null;
-              description = "Path to ndn-router TOML configuration file.";
+              description = "Path to ndn-fwd TOML configuration file.";
             };
 
             openFirewall = lib.mkOption {
@@ -160,6 +165,56 @@
               default = "info";
               description = "RUST_LOG filter string.";
             };
+
+            # ── Key management ──────────────────────────────────────────────
+
+            identity = lib.mkOption {
+              type = lib.types.nullOr lib.types.str;
+              default = null;
+              example = "/ndn/mysite/router1";
+              description = ''
+                NDN identity name for this router (e.g. <literal>/ndn/mysite/router1</literal>).
+
+                When set together with <option>generateIdentity = true</option> (the default),
+                a persistent Ed25519 key and self-signed certificate are generated on first
+                boot and stored in <option>pibPath</option>.  Subsequent starts reuse the
+                existing key without overwriting it.
+
+                On NixOS the system root is read-only, so keys must live in a writable
+                location such as the state directory.  Leave this unset to let the router
+                use an ephemeral in-memory key (useful for testing).
+              '';
+            };
+
+            pibPath = lib.mkOption {
+              type = lib.types.nullOr lib.types.str;
+              default = null;
+              defaultText = lib.literalExpression ''"''\${config.services.ndn-fwd.stateDir}/pib"'';
+              example = "/var/lib/ndn-fwd/pib";
+              description = ''
+                Path to the PIB directory that stores Ed25519 keys.
+
+                Defaults to <filename>/var/lib/ndn-fwd/pib</filename> (the service
+                state directory), which is writable even on NixOS immutable roots.
+                Set this if you want to share a single PIB across multiple routers or
+                store keys on an encrypted partition.
+              '';
+            };
+
+            generateIdentity = lib.mkOption {
+              type = lib.types.bool;
+              default = true;
+              description = ''
+                Auto-generate the <option>identity</option> key on first boot if it does
+                not already exist in the PIB.
+
+                Uses <command>ndn-sec keygen --anchor --skip-if-exists</command> as an
+                <literal>ExecStartPre</literal> step so the operation is idempotent:
+                subsequent restarts detect the existing key and skip generation silently.
+
+                Has no effect when <option>identity</option> is null.
+              '';
+            };
           };
 
           config = lib.mkIf cfg.enable {
@@ -169,14 +224,17 @@
               allowedTCPPorts = [ 6363 ];
             };
 
-            systemd.services.ndn-router = {
-              description = "NDN Router (ndn-rs)";
+            systemd.services.ndn-fwd = {
+              description = "NDN Forwarder (ndn-rs)";
               wantedBy = [ "multi-user.target" ];
               after = [ "network-online.target" ];
               wants = [ "network-online.target" ];
 
               environment = {
                 RUST_LOG = cfg.logLevel;
+                # Expose the PIB path so ndn-fwd picks it up via $NDN_PIB even
+                # when the user's config file does not set pib_path explicitly.
+                NDN_PIB = resolvedPibPath;
               };
 
               serviceConfig = {
@@ -185,15 +243,34 @@
                     args = lib.optionalString (cfg.configFile != null)
                       " -c ${cfg.configFile}";
                   in
-                    "${cfg.package}/bin/ndn-router${args}";
+                    "${cfg.package}/bin/ndn-fwd${args}";
+
+                # Idempotent key generation: run before the forwarder starts.
+                # ndn-sec --skip-if-exists is a no-op when the key already exists,
+                # so this is safe to run on every boot without overwriting keys.
+                ExecStartPre = lib.optional
+                  (cfg.identity != null && cfg.generateIdentity)
+                  (lib.escapeShellArgs [
+                    "${toolsPkg}/bin/ndn-sec"
+                    "--pib" resolvedPibPath
+                    "keygen"
+                    "--anchor"
+                    "--skip-if-exists"
+                    cfg.identity
+                  ]);
 
                 Restart = "on-failure";
                 RestartSec = 5;
 
                 # Hardening.
-                DynamicUser = true;
-                StateDirectory = "ndn-router";
-                RuntimeDirectory = "ndn-router";
+                # DynamicUser=true is intentionally NOT set here so that the
+                # ExecStartPre key-generation step and the router process share a
+                # stable UID that can own /var/lib/ndn-fwd consistently.
+                # The state directory is created and owned by systemd automatically.
+                User = "ndn-fwd";
+                Group = "ndn-fwd";
+                StateDirectory = "ndn-fwd";
+                RuntimeDirectory = "ndn-fwd";
                 ProtectSystem = "strict";
                 ProtectHome = true;
                 PrivateTmp = true;
@@ -215,6 +292,15 @@
                 ];
               };
             };
+
+            # Stable UID/GID for the router service (required since DynamicUser=false).
+            users.users.ndn-fwd = {
+              isSystemUser = true;
+              group = "ndn-fwd";
+              description = "NDN router service account";
+              home = "/var/lib/ndn-fwd";
+            };
+            users.groups.ndn-fwd = {};
           };
         };
     };
