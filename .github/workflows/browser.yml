@@ -1,0 +1,101 @@
+name: Browser — WebSocket interop (NDNts ↔ ndn-fwd)
+
+# Tests NDNts WsTransport running inside a real Chromium browser connecting to
+# the ndn-rs forwarder via WebSocket.  Two browser pages exchange NDN Interest
+# and Data through ndn-fwd's WS face — no external NDN tools required.
+#
+# Trigger conditions:
+#   - Manual dispatch
+#   - Push / PR that touches the WS face, ndn-fwd binary, or browser test code
+#   - Weekly cron (Monday 04:00 UTC) to catch NDNts upstream changes
+
+on:
+  workflow_dispatch:
+
+  schedule:
+    - cron: "0 4 * * 1"
+
+  push:
+    branches: [main]
+    paths:
+      - "crates/faces/ndn-faces/src/net/websocket.rs"
+      - "binaries/ndn-fwd/**"
+      - "testbed/tests/browser/**"
+      - ".github/workflows/browser.yml"
+
+  pull_request:
+    branches: [main]
+    paths:
+      - "crates/faces/ndn-faces/src/net/websocket.rs"
+      - "binaries/ndn-fwd/**"
+      - "testbed/tests/browser/**"
+      - ".github/workflows/browser.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  browser-ws:
+    name: Browser WS interop (Chromium)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Rust: build ndn-fwd ──────────────────────────────────────────────────
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore Rust build cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-ndn-fwd-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-ndn-fwd-
+
+      - name: Build ndn-fwd (release)
+        run: cargo build --release --bin ndn-fwd
+
+      # ── Node.js: install deps, bundle NDNts, install browsers ───────────────
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Node.js dependencies
+        working-directory: testbed/tests/browser
+        run: npm install
+
+      - name: Bundle NDNts for browser (esbuild)
+        working-directory: testbed/tests/browser
+        run: node build.mjs
+
+      - name: Install Playwright + Chromium
+        working-directory: testbed/tests/browser
+        run: npx playwright install --with-deps chromium
+
+      # ── Run tests ────────────────────────────────────────────────────────────
+
+      - name: Run browser WebSocket interop tests
+        working-directory: testbed/tests/browser
+        run: npm test
+        env:
+          NDN_FWD_BIN: ${{ github.workspace }}/target/release/ndn-fwd
+          CI: "true"
+
+      # ── Artefacts ────────────────────────────────────────────────────────────
+
+      - name: Upload Playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-${{ github.run_number }}
+          path: testbed/tests/browser/playwright-report/
+          retention-days: 14

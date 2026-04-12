@@ -1,0 +1,22 @@
+{
+  "name": "ndn-rs-browser-tests",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Browser WebSocket interop tests: NDNts ↔ ndn-rs forwarder",
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "playwright test",
+    "test:headed": "playwright test --headed",
+    "test:debug": "PWDEBUG=1 playwright test"
+  },
+  "dependencies": {
+    "@ndn/endpoint": "*",
+    "@ndn/fw": "*",
+    "@ndn/packet": "*",
+    "@ndn/ws-transport": "*"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.49.0",
+    "esbuild": "^0.24.0"
+  }
+}
