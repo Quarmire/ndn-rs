@@ -7,33 +7,29 @@
 FROM ubuntu:24.04 AS ndn-cxx-builder
 
 # ndn-cxx deps (per named-data getting started guide)
+# cmake also needed to build ndn-tools-24.07 against the waf-installed ndn-cxx
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential cmake pkg-config python3 \
     libboost-all-dev libssl-dev libsqlite3-dev \
+    libpcap-dev libsystemd-dev \
     ca-certificates git \
     && rm -rf /var/lib/apt/lists/*
 
-# ndn-cxx master (cmake, C++17 — successor to the deleted ndn-cxx-24.07 branch)
+# ndn-cxx master uses waf (cmake migration was only on now-deleted date branches)
 RUN git clone --depth 1 \
       https://github.com/named-data/ndn-cxx.git /src/ndn-cxx && \
-    cmake -S /src/ndn-cxx -B /build/ndn-cxx \
-      -DCMAKE_BUILD_TYPE=Release \
-      -DCMAKE_INSTALL_PREFIX=/usr/local && \
-    cmake --build /build/ndn-cxx -j"$(nproc)" && \
-    cmake --install /build/ndn-cxx
+    cd /src/ndn-cxx && \
+    ./waf configure --prefix=/usr/local && \
+    ./waf build -j"$(nproc)" && \
+    ./waf install
 
-# ndn-tools 24.07 (cmake) — adds libpcap-dev + libsystemd-dev per NFD getting started
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libpcap-dev libsystemd-dev \
-    && rm -rf /var/lib/apt/lists/*
-
+# ndn-tools 24.07 (waf build)
 RUN git clone --depth 1 --branch ndn-tools-24.07 \
       https://github.com/named-data/ndn-tools.git /src/ndn-tools && \
-    cmake -S /src/ndn-tools -B /build/ndn-tools \
-      -DCMAKE_BUILD_TYPE=Release \
-      -DCMAKE_INSTALL_PREFIX=/usr/local && \
-    cmake --build /build/ndn-tools -j"$(nproc)" && \
-    cmake --install /build/ndn-tools
+    cd /src/ndn-tools && \
+    ./waf configure --prefix=/usr/local && \
+    ./waf build -j"$(nproc)" && \
+    ./waf install
 
 # ── ndn-rs tools builder ──────────────────────────────────────────────────────
 FROM rust:slim AS ndn-rs-builder
