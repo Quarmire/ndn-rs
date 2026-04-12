@@ -81,13 +81,17 @@ services:
       - "6367:6363/udp"
       - "6367:6363/tcp"
     volumes:
-      - ./configs/yanfd.toml:/etc/yanfd/config.toml:ro
-    command: ["yanfd", "--config", "/etc/yanfd/config.toml"]
+      - ./configs/yanfd.yml:/etc/yanfd/config.yml:ro
+    # ndnd >= 0.7: binary is "ndnd", subcommand "fw run <config>"
+    command: ["fw", "run", "/etc/yanfd/config.yml"]
     healthcheck:
-      test: ["CMD-SHELL", "nc -z localhost 6363 || exit 1"]
+      # ndnd image is FROM scratch — no shell or nc; use the binary itself.
+      # "fw status" connects to the unix socket and exits 0 when the forwarder is up.
+      test: ["CMD", "/ndnd", "fw", "status"]
       interval: 5s
       timeout: 3s
       retries: 10
+      start_period: 5s
     restart: unless-stopped
 
   # ── Test runner (shared tools container) ──────────────────────────────────

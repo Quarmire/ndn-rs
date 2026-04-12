@@ -1,0 +1,29 @@
+# yanfd (ndnd) testbed configuration
+# YAML format required by ndnd >= 0.7; see fw/yanfd.sample.yml for all options.
+
+core:
+  log_level: INFO
+
+faces:
+  udp:
+    enabled_unicast: true
+    enabled_multicast: false
+    port_unicast: 6363
+
+  tcp:
+    enabled: true
+    port_unicast: 6363
+
+  unix:
+    enabled: true
+
+  websocket:
+    enabled: false
+
+tables:
+  content_store:
+    capacity: 65536
+    replacement_policy: lru
+
+  rib:
+    readvertise_nlsr: false
