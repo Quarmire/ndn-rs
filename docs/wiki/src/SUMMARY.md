@@ -56,6 +56,7 @@
 - [Fleet and Swarm Security](./guides/fleet-security.md)
 - [Getting Started: Publish and Subscribe](./guides/getting-started.md)
 - [Docker Deployment](./guides/docker-deployment.md)
+- [Browser WebSocket Testing](./guides/browser-testing.md)
 - [CLI Tools](./guides/cli-tools.md)
 - [Performance Tuning](./guides/performance-tuning.md)
 - [Security Identity and Key Management](./guides/security-identity.md)

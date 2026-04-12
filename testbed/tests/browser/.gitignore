@@ -1,0 +1,4 @@
+node_modules/
+fixture-page/ndnts.bundle.js
+playwright-report/
+test-results/
