@@ -16,7 +16,6 @@ echo "[${LABEL}] basic_forwarding: starting iperf server on ${PREFIX}"
 ndn-iperf server \
   --face-socket "${SOCK}" --no-shm \
   --prefix "${PREFIX}" \
-  --duration 10 \
   --quiet &
 SRV_PID=$!
 sleep 1   # allow server to register

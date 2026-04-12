@@ -20,7 +20,6 @@ echo "[${LABEL}/${TRANSPORT}] throughput: starting iperf server"
 ndn-iperf server \
   --face-socket "${SOCK}" --no-shm \
   --prefix "${PREFIX}" \
-  --duration "$(( DURATION + 5 ))" \
   --quiet &
 SRV_PID=$!
 sleep 1
