@@ -54,24 +54,27 @@ This document says: Alice can authenticate with this Ed25519 key, and data she a
 
 ## The did:ndn Method
 
-The `did:ndn` method maps NDN names to DIDs with a straightforward encoding. For names composed entirely of printable ASCII components with no special characters, the mapping is a simple colon-substitution: slashes become colons.
+The `did:ndn` method maps every NDN name to a DID using a single, unambiguous encoding: the **base64url (no padding) of the complete NDN Name TLV**, including the outer `07 <length>` bytes.
+
+```
+did:ndn:<base64url(Name TLV)>
+```
+
+The method-specific identifier contains no colons — colons are not in the base64url alphabet — so there is no ambiguity between component separators and encoding markers.
 
 ```
 NDN name:   /com/acme/alice
-did:ndn:    did:ndn:com:acme:alice
+Name TLV:   07 11 08 03 "com" 08 04 "acme" 08 05 "alice"
+did:ndn:    did:ndn:<base64url of the 20-byte TLV above>
 
-NDN name:   /edu/ucla/remap/sensor-array
-did:ndn:    did:ndn:edu:ucla:remap:sensor-array
+NDN name (zone root, BLAKE3_DIGEST component):   /<32 bytes>
+Name TLV:   07 22 03 20 <32 bytes>
+did:ndn:    did:ndn:<base64url of the 36-byte TLV above>
 ```
 
-For names containing arbitrary binary components, parameterized components, or non-ASCII characters — common in sensor networks and embedded systems — the `v1:` prefix signals a base64url-encoded TLV representation of the full name:
+This single form is lossless across all component types — GenericNameComponents, BLAKE3_DIGEST zone roots, versioned components, sequence numbers, and any future typed components — without type-specific special cases.
 
-```
-NDN name (with binary component):  /sensor/<binary-id>
-did:ndn:    did:ndn:v1:BgNkYXRh...  (base64url of TLV-encoded name)
-```
-
-The `v1:` form is lossless and handles any valid NDN name. The simple colon form is preferred for human-readable identifiers because it is legible in logs, configuration files, and UIs.
+> **Note on earlier drafts:** A previous version of this spec used a dual-form encoding: a "simple" colon-separated ASCII form and a `v1:` binary fallback. This was found to be ambiguous: a name whose first component is literally `v1` produced an identical DID string as a binary-encoded name whose base64url representation happened to begin with `v1:`. See [did:ndn Method Specification §1.2](../reference/did-ndn-method.md) for details.
 
 ### Converting Between Forms
 
@@ -82,19 +85,20 @@ use ndn_security::did::{name_to_did, did_to_name};
 
 let name: Name = "/com/acme/alice".parse()?;
 
-// Name → DID (simple form for ASCII names)
+// Name → DID (always binary encoding)
 let did = name_to_did(&name);
-assert_eq!(did, "did:ndn:com:acme:alice");
+// result is "did:ndn:<base64url(Name TLV)>", no colons in the method-specific-id
+assert!(did.starts_with("did:ndn:"));
+assert!(!did["did:ndn:".len()..].contains(':'));
 
-// DID → Name (works for both simple and v1: forms)
-let recovered = did_to_name("did:ndn:com:acme:alice")?;
+// DID → Name (round-trips correctly)
+let recovered = did_to_name(&did)?;
 assert_eq!(recovered, name);
 
-// Binary component: v1: encoding is used automatically
-let sensor_name: Name = "/sensor".parse()?;
-// (imagine a binary component appended)
-let did = name_to_did(&sensor_name);
-// If any component is not clean ASCII, result is "did:ndn:v1:<base64>"
+// Zone root name (BLAKE3_DIGEST component) — same encoding, no special case
+let zone_name: Name = /* from ZoneKey::zone_root_name() */;
+let zone_did = name_to_did(&zone_name);
+// still "did:ndn:<base64url>", no v1: prefix
 ```
 
 ### Resolution: an NDN Interest

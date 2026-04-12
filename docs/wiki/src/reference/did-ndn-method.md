@@ -23,33 +23,48 @@ Both strategies use NDN Interest/Data exchange for resolution; no DNS, HTTP, or 
 The ABNF for `did:ndn` identifiers is:
 
 ```abnf
-did-ndn         = "did:ndn:" (simple-id / zone-id)
-simple-id       = ndn-segment *(":" ndn-segment)
-ndn-segment     = 1*(ALPHA / DIGIT / "-" / "_" / ".")
-zone-id         = "v1:" base64url
-base64url       = 1*(ALPHA / DIGIT / "-" / "_")
+did-ndn   = "did:ndn:" base64url
+base64url = 1*(ALPHA / DIGIT / "-" / "_")
 ```
 
-### 1.1 Simple Encoding (CA-anchored)
-
-An NDN name whose components are all GenericNameComponents containing only ASCII alphanumeric characters, hyphens, underscores, or dots is encoded by joining component values with `:`.
+The method-specific identifier is the **base64url-encoded (no padding) complete NDN Name TLV wire format**, including the outer `Name-Type` (`0x07`) and `TLV-Length` octets.
 
 ```
-/com/acme/alice  →  did:ndn:com:acme:alice
-/edu/ucla/lab    →  did:ndn:edu:ucla:lab
+did:ndn:<base64url(Name TLV)>
 ```
 
-### 1.2 Zone Encoding (Self-Certifying)
+This single form handles all NDN names — GenericNameComponents, BLAKE3_DIGEST zone roots, versioned components, sequence numbers, and any future typed components — without type-specific special cases or dual-form ambiguity.
 
-An NDN name that contains non-generic components (such as a `BLAKE3_DIGEST` component of type `0x03`) or non-ASCII bytes is encoded as the base64url-encoded TLV wire format of the Name, prefixed with `v1:`.
-
-Zone root names take this form. A zone root name is a single-component NDN name whose component type is `BLAKE3_DIGEST` (TLV type `0x03`) and whose value is `blake3(ed25519_public_key)` (32 bytes).
+### 1.1 Encoding Examples
 
 ```
-/<blake3_digest(pubkey)>  →  did:ndn:v1:<base64url(TLV Name)>
+NDN name:              /com/acme/alice
+Name TLV (hex):        07 11 08 03 com 08 04 acme 08 05 alice
+did:ndn:               did:ndn:<base64url of above>
+
+NDN name:              /<blake3_digest(pubkey)>   (zone root, type 0x03)
+Name TLV (hex):        07 22 03 20 <32 bytes>
+did:ndn:               did:ndn:<base64url of above>
 ```
 
-The zone encoding makes the DID self-certifying: no trust anchor is needed to verify that the DID Document belongs to the stated DID. The resolver verifies `blake3(ed25519_pubkey_from_doc) == zone_root_component`.
+The method-specific identifier contains no colons (`:` is not in the base64url alphabet), which unambiguously distinguishes the current encoding from the deprecated dual-form encoding described in §1.2.
+
+### 1.2 Deprecated Encoding (Backward Compatibility)
+
+Earlier drafts of this spec defined two forms that are now deprecated:
+
+| Form | Syntax | Problem |
+|------|--------|---------|
+| Simple | `did:ndn:com:acme:alice` | Ambiguous when first component equals `v1` |
+| v1 binary | `did:ndn:v1:<base64url>` | `v1:` sentinel collides with a name whose first component is literally `v1` |
+
+**Ambiguity example:** Both of the following produced `did:ndn:v1:BwEA` under the old scheme:
+- The binary encoding of a name with a single zero-byte GenericNameComponent
+- The simple encoding of the name `/v1/BwEA` (two ASCII components)
+
+The unified binary form eliminates this: every NDN name maps to exactly one DID string.
+
+Implementations **must** still accept the deprecated forms in `did_to_name` for backward compatibility, but **must not** produce them. The presence of a `:` in the method-specific identifier identifies a deprecated DID; the presence of `v1:` as the first two characters identifies the deprecated binary form specifically.
 
 ---
 
@@ -99,26 +114,26 @@ Published as a signed NDN Data packet at the zone root name. Zone owners **must*
     "https://www.w3.org/ns/did/v1",
     "https://w3id.org/security/suites/jws-2020/v1"
   ],
-  "id": "did:ndn:v1:AAEB...",
+  "id": "did:ndn:<base64url(zone-root-Name-TLV)>",
   "verificationMethod": [
     {
-      "id": "did:ndn:v1:AAEB...#key-0",
+      "id": "did:ndn:<base64url>...#key-0",
       "type": "JsonWebKey2020",
-      "controller": "did:ndn:v1:AAEB...",
+      "controller": "did:ndn:<base64url>...",
       "publicKeyJwk": { "kty": "OKP", "crv": "Ed25519", "x": "..." }
     },
     {
-      "id": "did:ndn:v1:AAEB...#key-agreement-0",
+      "id": "did:ndn:<base64url>...#key-agreement-0",
       "type": "JsonWebKey2020",
-      "controller": "did:ndn:v1:AAEB...",
+      "controller": "did:ndn:<base64url>...",
       "publicKeyJwk": { "kty": "OKP", "crv": "X25519", "x": "..." }
     }
   ],
-  "authentication": ["did:ndn:v1:AAEB...#key-0"],
-  "assertionMethod": ["did:ndn:v1:AAEB...#key-0"],
-  "keyAgreement": ["did:ndn:v1:AAEB...#key-agreement-0"],
-  "capabilityInvocation": ["did:ndn:v1:AAEB...#key-0"],
-  "capabilityDelegation": ["did:ndn:v1:AAEB...#key-0"],
+  "authentication": ["did:ndn:<base64url>...#key-0"],
+  "assertionMethod": ["did:ndn:<base64url>...#key-0"],
+  "keyAgreement": ["did:ndn:<base64url>...#key-agreement-0"],
+  "capabilityInvocation": ["did:ndn:<base64url>...#key-0"],
+  "capabilityDelegation": ["did:ndn:<base64url>...#key-0"],
   "service": []
 }
 ```
@@ -167,7 +182,7 @@ A zone owner signals deactivation by publishing a succession document at the old
 ```rust
 use ndn_security::build_zone_succession_document;
 
-let doc = build_zone_succession_document(&old_zone_key, "did:ndn:v1:<new-zone>");
+let doc = build_zone_succession_document(&old_zone_key, "did:ndn:<base64url-of-new-zone>");
 // Publish doc at old_zone_key.zone_root_name()
 ```
 
