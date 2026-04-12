@@ -67,6 +67,7 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+      start_period: 5s
     restart: unless-stopped
 
   # ── yanfd (ndnd Go forwarder) ─────────────────────────────────────────────
