@@ -226,7 +226,7 @@ impl LinkMedium for EtherMedium {
     fn build_hello_data(&self, core: &HelloCore, interest_name: &Name) -> Bytes {
         let mut payload = crate::HelloPayload::new(core.node_name.clone());
 
-        if core.config.prefix_announcement == crate::PrefixAnnouncementMode::InHello {
+        if core.config.read().unwrap().prefix_announcement == crate::PrefixAnnouncementMode::InHello {
             let sp = core.served_prefixes.lock().unwrap();
             payload.served_prefixes = sp.clone();
         }
@@ -243,6 +243,8 @@ impl LinkMedium for EtherMedium {
         let content = payload.encode();
         let freshness_ms = core
             .config
+            .read()
+            .unwrap()
             .hello_interval_base
             .as_millis()
             .min(u32::MAX as u128) as u64
