@@ -130,7 +130,7 @@ jobs:
         working-directory: testbed
         run: |
           mkdir -p results
-          docker run --rm --network testbed_ndnnet \
+          docker run --rm --network ndn-testbed_ndn-net \
             -e FWD_HOST=ndn-fwd \
             -e NFD_HOST=nfd \
             -e YANFD_HOST=yanfd \
