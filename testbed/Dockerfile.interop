@@ -14,7 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # ndn-cxx + ndn-tools
-RUN git clone --depth 1 --branch ndn-cxx-24.07 \
+RUN git clone --depth 1 --branch ndn-cxx-0.9.0 \
       https://github.com/named-data/ndn-cxx.git /src/ndn-cxx && \
     cmake -S /src/ndn-cxx -B /build/ndn-cxx \
       -DCMAKE_BUILD_TYPE=Release \

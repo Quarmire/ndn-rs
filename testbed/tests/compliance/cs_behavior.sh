@@ -21,7 +21,12 @@ ndn-put \
   --freshness 60000 \
   "${PREFIX}/obj" "${TMP_CONTENT}" 2>"${TMP_PUT_LOG}" &
 PUT_PID=$!
-sleep 0.5
+
+# Wait up to 3s for ndn-put to register its prefix with the forwarder.
+for i in $(seq 1 30); do
+  grep -q "waiting for Interests" "${TMP_PUT_LOG}" 2>/dev/null && break
+  sleep 0.1
+done
 
 echo "[${LABEL}] cs_behavior: first fetch (populates CS)"
 OUT1=$(ndn-peek --face-socket "${SOCK}" --no-shm --can-be-prefix "${PREFIX}/obj" 2>&1 || echo "FAIL")
