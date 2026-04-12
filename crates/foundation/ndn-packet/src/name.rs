@@ -344,10 +344,54 @@ impl FromStr for Name {
             if part.is_empty() {
                 continue; // tolerate trailing slash
             }
-            let decoded = percent_decode(part).map_err(|_| {
-                PacketError::MalformedPacket("invalid percent-encoding in name".into())
-            })?;
-            components.push(NameComponent::generic(Bytes::from(decoded)));
+            // Typed component prefixes — mirrors the Display impl for roundtrip.
+            let comp = if let Some(rest) = part.strip_prefix("seg=") {
+                if let Ok(n) = rest.parse::<u64>() {
+                    NameComponent::new(tlv_type::SEGMENT, encode_nonnegtive_integer(n))
+                } else {
+                    NameComponent::generic(Bytes::from(percent_decode(part).map_err(|_| {
+                        PacketError::MalformedPacket("invalid percent-encoding in name".into())
+                    })?))
+                }
+            } else if let Some(rest) = part.strip_prefix("v=") {
+                if let Ok(n) = rest.parse::<u64>() {
+                    NameComponent::new(tlv_type::VERSION, encode_nonnegtive_integer(n))
+                } else {
+                    NameComponent::generic(Bytes::from(percent_decode(part).map_err(|_| {
+                        PacketError::MalformedPacket("invalid percent-encoding in name".into())
+                    })?))
+                }
+            } else if let Some(rest) = part.strip_prefix("off=") {
+                if let Ok(n) = rest.parse::<u64>() {
+                    NameComponent::new(tlv_type::BYTE_OFFSET, encode_nonnegtive_integer(n))
+                } else {
+                    NameComponent::generic(Bytes::from(percent_decode(part).map_err(|_| {
+                        PacketError::MalformedPacket("invalid percent-encoding in name".into())
+                    })?))
+                }
+            } else if let Some(rest) = part.strip_prefix("t=") {
+                if let Ok(n) = rest.parse::<u64>() {
+                    NameComponent::new(tlv_type::TIMESTAMP, encode_nonnegtive_integer(n))
+                } else {
+                    NameComponent::generic(Bytes::from(percent_decode(part).map_err(|_| {
+                        PacketError::MalformedPacket("invalid percent-encoding in name".into())
+                    })?))
+                }
+            } else if let Some(rest) = part.strip_prefix("seq=") {
+                if let Ok(n) = rest.parse::<u64>() {
+                    NameComponent::new(tlv_type::SEQUENCE_NUM, encode_nonnegtive_integer(n))
+                } else {
+                    NameComponent::generic(Bytes::from(percent_decode(part).map_err(|_| {
+                        PacketError::MalformedPacket("invalid percent-encoding in name".into())
+                    })?))
+                }
+            } else {
+                let decoded = percent_decode(part).map_err(|_| {
+                    PacketError::MalformedPacket("invalid percent-encoding in name".into())
+                })?;
+                NameComponent::generic(Bytes::from(decoded))
+            };
+            components.push(comp);
         }
 
         if components.is_empty() {

@@ -210,9 +210,10 @@ pub async fn run_producer(params: PutParams, tx: mpsc::Sender<ToolEvent>) -> Res
         } else {
             served_prefix.clone().append_segment(seg_idx as u64)
         };
+        let data_name_str = data_name.to_string();
 
-        let mut builder = DataBuilder::new(data_name, seg_bytes)
-            .final_block_id_typed_seg(last_seg as u64);
+        let mut builder =
+            DataBuilder::new(data_name, seg_bytes).final_block_id_typed_seg(last_seg as u64);
         if let Some(f) = freshness {
             builder = builder.freshness(f);
         }
@@ -238,7 +239,7 @@ pub async fn run_producer(params: PutParams, tx: mpsc::Sender<ToolEvent>) -> Res
             let _ = tx
                 .send(ToolEvent::info(format!(
                     "ndn-put: served segment {seg_idx}/{last_seg}  {}",
-                    interest.name
+                    data_name_str
                 )))
                 .await;
         }
