@@ -40,7 +40,7 @@ The signature is embedded in the packet's wire format. Routers can cache and for
 
 ## The Journey of a Data Packet
 
-To understand how these pieces fit together, follow a Data packet arriving at a forwarder that has validation enabled.
+To understand how these pieces fit together, follow a Data packet arriving at a forwarder with `profile = "default"` (forwarder-level validation opted in).
 
 **A temperature reading arrives.** The packet's name is `/sensor/node1/temp/1712400000`, and its SignatureInfo field says it was signed by key `/sensor/node1/KEY/k1`. The raw bytes are sitting in a buffer. At this point, it's just a `Data` -- an unverified blob.
 
@@ -252,6 +252,144 @@ ndn-rs provides three built-in schemas for common cases:
 - `TrustSchema::new()` -- empty, rejects everything (for strict configurations where you add rules explicitly)
 - `TrustSchema::accept_all()` -- wildcard, accepts any signed packet (for testing or trusted environments)
 - `TrustSchema::hierarchical()` -- data and key must share the same first name component; the actual hierarchy is enforced by the certificate chain walk
+
+### Text pattern format
+
+Patterns can be written and parsed as human-readable strings. Components are
+`/`-separated:
+
+| Syntax | Meaning |
+|---|---|
+| `/literal` | Matches exactly the component `literal` |
+| `/<var>` | Captures one component into `var` |
+| `/<**var>` | Captures all remaining components into `var` (must be last) |
+
+A rule is written as `<data_pattern> => <key_pattern>`:
+
+```text
+/sensor/<node>/<type> => /sensor/<node>/KEY/<id>
+```
+
+Parse and serialise in code:
+
+```rust
+use ndn_security::SchemaRule;
+
+let rule = SchemaRule::parse("/sensor/<node>/<type> => /sensor/<node>/KEY/<id>")?;
+println!("{}", rule.to_string());
+```
+
+### Configuring rules in the router TOML
+
+Add `[[security.rule]]` sections to `ndn-router.toml`. Rules are loaded at
+startup and added to the active schema on top of whatever the `profile` setting
+implies:
+
+```toml
+[security]
+# "disabled" is the default — no validation, matching NFD's forwarder behaviour.
+# Switch to "default" or "accept-signed" once trust anchors and keys are ready.
+profile = "disabled"
+trust_anchor = "/etc/ndn/ta.cert"
+
+# Rules are appended on top of whatever the profile implies.
+[[security.rule]]
+data = "/sensor/<node>/<type>"
+key  = "/sensor/<node>/KEY/<id>"
+
+[[security.rule]]
+data = "/admin/<**rest>"
+key  = "/admin/KEY/<id>"
+```
+
+**Profile defaults summary:**
+
+| Profile | Behaviour |
+|---|---|
+| `"disabled"` | No validation — Data is cached and forwarded as-is **(default)** |
+| `"accept-signed"` | Verify signatures but skip certificate chain walking |
+| `"default"` | Full hierarchical chain validation with trust schema |
+
+The default is `"disabled"` to match NFD's behaviour: in NDN, Data validation is a
+*consumer-side* concern. The producer signs; routers forward; consumers verify.
+Enabling forwarder-level validation is an opt-in hardening measure that requires
+all trust anchors and certificates to be provisioned first.
+
+Additional `[[security.rule]]` entries are always appended regardless of profile.
+
+> **Comparison with NFD/ndn-cxx:** NFD's *forwarder* does not validate Data at
+> all — `ValidatorConfig` is part of the `ndn-cxx` *application library*, not
+> the NFD daemon. ndn-rs matches this default (`profile = "disabled"`) but
+> additionally lets you opt in to forwarder-level validation, and supports
+> *runtime modification* of rules without restarting — NFD's `ValidatorConfig`
+> requires a process restart to change its rules.
+
+### Runtime trust schema management API
+
+The trust schema can be modified at runtime via NDN management commands sent to
+`/localhost/nfd/security/`:
+
+| Command | What it does |
+|---|---|
+| `schema-list` | List all active rules with their indices |
+| `schema-rule-add` | Append one rule (pass `Uri` = rule string) |
+| `schema-rule-remove` | Remove rule at index (pass `Count` = index) |
+| `schema-set` | Replace entire schema (pass `Uri` = newline-separated rules) |
+
+Using `ndn-ctl` (or any NFD-compatible management client):
+
+```sh
+# List the current rules
+ndn-ctl security schema-list
+
+# Add a new rule
+ndn-ctl security schema-rule-add "/dept/<team>/<**rest> => /dept/<team>/KEY/<id>"
+
+# Remove rule at index 0
+ndn-ctl security schema-rule-remove 0
+
+# Replace the whole schema (empty string rejects everything)
+ndn-ctl security schema-set "/org/<**rest> => /org/KEY/<id>"
+```
+
+Using the Rust `MgmtClient` API:
+
+```rust
+use ndn_ipc::MgmtClient;
+
+let client = MgmtClient::connect("/tmp/ndn.sock").await?;
+
+// List rules
+let resp = client.security_schema_list().await?;
+println!("{}", resp.status_text);
+
+// Add a rule
+client.security_schema_rule_add("/sensor/<node>/<type> => /sensor/<node>/KEY/<id>").await?;
+
+// Remove rule at index 0
+client.security_schema_rule_remove(0).await?;
+
+// Replace all rules at once
+client.security_schema_set(
+    "/sensor/<node>/<type> => /sensor/<node>/KEY/<id>\n\
+     /admin/<**rest> => /admin/KEY/<id>"
+).await?;
+```
+
+Changes take effect immediately for all subsequent validations. In-flight
+validations that have already passed the schema check are not affected.
+
+### Mutability design
+
+The schema inside `Validator` is stored behind an `Arc<RwLock<TrustSchema>>`.
+Reads (the hot validation path) acquire a shared lock for the duration of the
+`allows()` call — typically a few microseconds for small schemas. Writes
+(management API) acquire an exclusive lock, which blocks new reads momentarily
+but does not affect already-in-progress pipeline tasks.
+
+This design means the management API never requires rebuilding the validator or
+draining the pending queue — rules take effect atomically from the perspective
+of the validation path.
 
 ## The Local Trust Escape Hatch
 

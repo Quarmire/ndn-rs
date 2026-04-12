@@ -20,6 +20,9 @@
 - [Design Overview](./design/overview.md)
 - [vs. NFD (C++)](./design/vs-nfd.md)
 - [vs. ndnd (Go)](./design/vs-ndnd.md)
+- [vs. NDN-DPDK (C/Go, DPDK)](./design/vs-ndn-dpdk.md)
+- [vs. NDNph / NDN-Lite (Embedded)](./design/vs-embedded.md)
+- [vs. NDNts (TypeScript) and mw-nfd](./design/vs-ndnts.md)
 - [Zero-Copy Pipeline](./design/zero-copy-pipeline.md)
 - [Strategy Composition](./design/strategy-composition.md)
 
@@ -54,10 +57,12 @@
 - [Getting Started: Publish and Subscribe](./guides/getting-started.md)
 - [CLI Tools](./guides/cli-tools.md)
 - [Performance Tuning](./guides/performance-tuning.md)
+- [Security Identity and Key Management](./guides/security-identity.md)
 
 # Benchmarks
 
 - [Pipeline Benchmarks](./benchmarks/pipeline-benchmarks.md)
+- [Forwarder Comparison](./benchmarks/bench-forwarder.md)
 - [Methodology](./benchmarks/methodology.md)
 
 # App Notes
@@ -67,6 +72,7 @@
 # Reference
 
 - [Spec Compliance](./reference/spec-compliance.md)
+- [did:ndn Method Specification](./reference/did-ndn-method.md)
 - [External Links](./reference/external-links.md)
 
 # API Reference

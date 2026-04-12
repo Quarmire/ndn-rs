@@ -270,6 +270,81 @@ graph TD
 | `BluetoothFace` | RFCOMM / L2CAP CoC | COBS (via StreamFace) | BlueZ access | Linux | Short-range IoT, sensor networks |
 | `SerialFace` | UART / RS-485 | COBS (`0x00` delimiter) | Device access | All | Embedded sensors, LoRa modems, industrial bus |
 
+## Face System: Auto-Configuration and Interface Monitoring
+
+### The Problem with Static Face Configuration
+
+NFD requires every multicast face to be listed explicitly in `nfd.conf`. On a machine with four Ethernet ports, you must write four `[[face]]` entries — and if a USB Ethernet adapter is plugged in, the router has no idea it exists until you restart with an updated config.
+
+ndn-rs solves this with a `[face_system]` config section that mirrors NFD's auto-detection logic with three key additions: glob-based whitelist/blacklist filtering, a runtime interface watcher (Linux), and an explicit `ad_hoc` link-type flag for wireless MANET deployments.
+
+### Configuration
+
+```toml
+[face_system.ether]
+# Enumerate all eligible interfaces at startup and create a MulticastEtherFace for each.
+auto_multicast = true
+# Include only physical Ethernet interfaces; exclude virtual/Docker bridges.
+whitelist = ["eth*", "enp*", "en*"]
+blacklist = ["lo", "lo0", "docker*", "virbr*"]
+
+[face_system.udp]
+# Similarly auto-create MulticastUdpFace (224.0.23.170:6363) per interface IPv4 address.
+auto_multicast = true
+# Set to true for Wi-Fi IBSS / MANET — changes link type from MultiAccess to AdHoc.
+ad_hoc = false
+whitelist = ["*"]
+blacklist = ["lo", "lo0"]
+
+[face_system]
+# Subscribe to OS interface events and auto-create/destroy faces as interfaces
+# appear or disappear (Linux only; warning logged on macOS/Windows).
+watch_interfaces = true
+```
+
+### Interface Filtering
+
+The `whitelist` and `blacklist` fields accept **glob patterns** using `*` (any sequence) and `?` (one character). The filter logic follows NFD's precedence: blacklist is checked first and takes priority; the whitelist then must match.
+
+```
+interface_allowed("eth0", whitelist=["eth*"], blacklist=["lo"])
+→ true   (matches "eth*", not blocked)
+
+interface_allowed("docker0", whitelist=["*"], blacklist=["docker*"])
+→ false  (blacklisted regardless of whitelist)
+
+interface_allowed("virbr0", whitelist=["eth*", "enp*"], blacklist=[])
+→ false  (not in whitelist)
+```
+
+An interface also must be **UP**, **MULTICAST-capable**, and **not a loopback** to be eligible, regardless of the filter patterns.
+
+### Link Type: `MultiAccess` vs `AdHoc`
+
+Every face exposes a `link_type()` method that strategies use to decide whether to apply multi-access Interest suppression:
+
+| Link Type | When to use | Effect on strategies |
+|-----------|-------------|----------------------|
+| `PointToPoint` | Unicast TCP, UDP, serial | Normal forwarding; no suppression |
+| `MultiAccess` | Ethernet multicast, UDP multicast (LAN/AP) | Suppress duplicate Interests heard from the same face |
+| `AdHoc` | Wi-Fi IBSS, MANET, vehicular | Disable suppression — not all nodes hear every frame |
+
+Set `[face_system.udp] ad_hoc = true` when deploying in an ad-hoc wireless mesh where multicast frames are not reliably delivered to all nodes. The `ad_hoc()` builder method can also be used programmatically:
+
+```rust
+let face = MulticastUdpFace::ndn_default(iface_addr, face_id).await?;
+let face = face.ad_hoc(); // sets LinkType::AdHoc
+engine.add_face_with_persistency(face, cancel, FacePersistency::Permanent);
+```
+
+### Interface Hotplug (Linux)
+
+When `watch_interfaces = true`, a background task opens a `RTMGRP_LINK` netlink socket and receives `RTM_NEWLINK` / `RTM_DELLINK` messages from the kernel. On `Added` events, a new multicast face is created for the interface (if it passes the whitelist/blacklist filter). On `Removed` events, the face's cancellation token is fired, which causes the sender/reader tasks to exit and the face to be removed from the face table.
+
+This enables zero-config hotplug: plug in a USB Ethernet adapter, and within milliseconds a `MulticastEtherFace` appears on it. Unplug it, and the face disappears cleanly.
+
+The Linux netlink parsing uses only `libc` — no additional crates. On macOS and Windows, `watch_interfaces` logs a warning and is silently ignored; polling-based alternatives can be added in future.
+
 ## Performance: Link-Layer vs IP
 
 The honest performance picture for wireless: a single 802.11 hop has 300-500 us minimum latency (DIFS backoff + transmission + ACK). Engine overhead of 10-50 us is 3-15% of that total. The question is not "how do I match kernel bridge performance" but "what is the forwarding overhead relative to what I gain from NDN-aware forwarding decisions." A kernel bridge cannot make multi-radio selection decisions at all.

@@ -72,6 +72,34 @@ remaining stub features. Detailed narrative in the
 #### Operations
 - `binaries/ndn-fwd/Dockerfile` — multi-stage Debian image for `ndn-fwd`.
 - `binaries/ndn-fwd/ndn-fwd.default.toml` — ready-to-run default config.
+- **Testbed infrastructure** (`testbed/`): Docker Compose multi-forwarder
+  environment running `ndn-fwd`, NFD, and yanfd on a `172.30.0.0/24` subnet.
+- **Protocol compliance tests** (`testbed/tests/compliance/`): basic
+  forwarding, PIT aggregation, Content Store behavior, and NFD management
+  protocol compatibility — run against all three forwarders.
+- **Forwarder benchmarks** (`testbed/bench/`): sustained throughput
+  (ndn-iperf, 10 s) and round-trip latency (ndn-ping, 200 pings, p50/p95/p99)
+  for all forwarders via UDP. Only `ndn-fwd` is tested over SHM face; NFD and
+  yanfd use UDP. Results are emitted as a Markdown table.
+- **CI testbed workflow** (`.github/workflows/testbed.yml`): weekly cron +
+  `workflow_dispatch` + push to `testbed/**`; publishes bench table on `main`.
+
+#### Security and identity
+- **Ephemeral identity**: `ndn-fwd` always has a signing identity. When none
+  is configured, an in-memory ephemeral Ed25519 key is generated at startup;
+  name derived from `security.ephemeral_prefix`, `$HOSTNAME`, or `pid-<pid>`.
+- **PIB error recovery**: interactive TTY menu (generate / ephemeral / abort)
+  or structured log + ephemeral fallback in daemon mode.
+- **`security.pib_type`** and **`security.ephemeral_prefix`** config fields.
+- **`/localhost/nfd/security/identity-status`** management dataset: returns
+  `identity=<name> is_ephemeral=<bool> pib_path=<path>` regardless of PIB state.
+- **`MgmtClient::security_identity_status()`** in `ndn-ipc`.
+- **`ndn-sec keygen --skip-if-exists`**: idempotent key generation.
+- **NixOS flake module**: `identity`, `pibPath`, and `generateIdentity` options;
+  `ExecStartPre` runs idempotent key generation on every boot; stable
+  `ndn-router` user/group replacing `DynamicUser = true`.
+- **Dashboard identity status**: Security view shows ephemeral warning (yellow)
+  or persistent identity info bar (green).
 
 ### Fixed
 - Validator chain-walk connected to `CertCache` on `Pending` result.
