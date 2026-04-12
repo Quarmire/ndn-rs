@@ -1,30 +1,26 @@
 #!/usr/bin/env bash
 # Interop: ndn-cxx consumer ← ndn-fwd → ndn-rs producer.
 #
-# 1. ndn-rs producer registers /interop/cxx-consumer on ndn-fwd and serves Data
-#    signed with an Ed25519 key.
-# 2. ndn-cxx ndnpeek fetches /interop/cxx-consumer/test and verifies the Data
-#    arrives (content check only — ndn-cxx trust schema validation is opt-in).
+# 1. ndn-rs producer registers /interop/cxx-consumer on ndn-fwd and serves Data.
+# 2. ndn-cxx ndnpeek fetches /interop/cxx-consumer/test via ndn-fwd UDP.
 set -euo pipefail
 
 FWD_HOST="${FWD_HOST:-ndn-fwd}"
-FWD_UDP="udp://${FWD_HOST}:6363"
+FWD_SOCK="${FWD_SOCK:-/run/ndn-fwd/ndn-fwd.sock}"
 PREFIX="/interop/cxx-consumer"
+CONTENT="hello-from-ndn-rs"
 
-# ndn-rs producer: serve one Interest and exit.
-ndn-put \
-  --face "${FWD_UDP}" \
-  --prefix "${PREFIX}" \
-  --content "hello-from-ndn-rs" \
-  --ttl 5 \
-  --sign &
+TMP=$(mktemp)
+echo -n "${CONTENT}" > "${TMP}"
+ndn-put "${PREFIX}" "${TMP}" \
+  --face-socket "${FWD_SOCK}" --no-shm \
+  --freshness 5000 --timeout 10 &
 PUT_PID=$!
+rm -f "${TMP}"
 sleep 0.5
 
-# ndn-cxx consumer: fetch the Data.
-RESULT=$(ndnpeek --timeout 4000 "${PREFIX}/test" \
-  --face "${FWD_UDP}" 2>&1)
+RESULT=$(NDN_CLIENT_TRANSPORT="udp4://${FWD_HOST}:6363" \
+  ndnpeek --timeout 4000 "${PREFIX}/test" 2>&1)
 
 kill "${PUT_PID}" 2>/dev/null || true
-
-echo "${RESULT}" | grep -q "hello-from-ndn-rs"
+echo "${RESULT}" | grep -q "${CONTENT}"

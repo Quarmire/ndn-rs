@@ -1,26 +1,25 @@
 #!/usr/bin/env bash
 # Interop: ndn-cxx consumer → NFD → ndn-rs producer.
 #
-# Validates that ndn-cxx's ndnpeek can retrieve Data produced by ndn-rs
-# (verifying the Data arrives intact through NFD).
+# Both parties connect to NFD. ndn-rs registers on the NFD socket and serves Data.
+# ndn-cxx ndnpeek fetches it via the same NFD socket.
 set -euo pipefail
 
-NFD_HOST="${NFD_HOST:-nfd}"
-NFD_UDP="udp://${NFD_HOST}:6363"
+NFD_SOCK="${NFD_SOCK:-/run/nfd/nfd.sock}"
 PREFIX="/interop/app-nfd-rs"
+CONTENT="hello-from-ndn-rs-via-nfd"
 
-ndn-put \
-  --face "${NFD_UDP}" \
-  --prefix "${PREFIX}" \
-  --content "hello-from-ndn-rs-via-nfd" \
-  --ttl 5 \
-  --sign &
+TMP=$(mktemp)
+echo -n "${CONTENT}" > "${TMP}"
+ndn-put "${PREFIX}" "${TMP}" \
+  --face-socket "${NFD_SOCK}" --no-shm \
+  --freshness 5000 --timeout 10 &
 PUT_PID=$!
+rm -f "${TMP}"
 sleep 0.5
 
-RESULT=$(ndnpeek --timeout 4000 "${PREFIX}/test" \
-  --face "${NFD_UDP}" 2>&1)
+RESULT=$(NDN_CLIENT_TRANSPORT="unix://${NFD_SOCK}" \
+  ndnpeek --timeout 4000 "${PREFIX}/test" 2>&1)
 
 kill "${PUT_PID}" 2>/dev/null || true
-
-echo "${RESULT}" | grep -q "hello-from-ndn-rs-via-nfd"
+echo "${RESULT}" | grep -q "${CONTENT}"

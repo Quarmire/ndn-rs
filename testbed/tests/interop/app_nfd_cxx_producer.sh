@@ -1,26 +1,22 @@
 #!/usr/bin/env bash
-# Interop: ndn-rs consumer → NFD → ndn-cxx producer (signature validated).
+# Interop: ndn-rs consumer → NFD → ndn-cxx producer.
 #
-# Validates that a ndn-rs consumer can fetch Data produced by ndn-cxx and
-# that the Ed25519/DigestSha256 signature is verifiable end-to-end.
+# Both parties connect to NFD. ndn-cxx ndnpoke registers and serves Data via the NFD socket.
+# ndn-rs ndn-peek fetches it via the same NFD socket.
 set -euo pipefail
 
-NFD_HOST="${NFD_HOST:-nfd}"
-NFD_UDP="udp://${NFD_HOST}:6363"
+NFD_SOCK="${NFD_SOCK:-/run/nfd/nfd.sock}"
 PREFIX="/interop/app-nfd-cxx"
+CONTENT="hello-from-ndn-cxx-via-nfd"
 
-echo -n "hello-from-ndn-cxx-via-nfd" | ndnpoke \
-  --freshness 5000 \
-  --face "${NFD_UDP}" \
-  "${PREFIX}/test" &
+echo -n "${CONTENT}" | NDN_CLIENT_TRANSPORT="unix://${NFD_SOCK}" \
+  ndnpoke --freshness 5000 "${PREFIX}/test" &
 POKE_PID=$!
 sleep 0.5
 
-RESULT=$(ndn-peek \
-  --face "${NFD_UDP}" \
-  --name "${PREFIX}/test" \
-  --timeout 4 2>&1)
+RESULT=$(ndn-peek "${PREFIX}/test" \
+  --face-socket "${NFD_SOCK}" --no-shm \
+  --lifetime 4000 2>&1)
 
 kill "${POKE_PID}" 2>/dev/null || true
-
-echo "${RESULT}" | grep -q "hello-from-ndn-cxx-via-nfd"
+echo "${RESULT}" | grep -q "${CONTENT}"
