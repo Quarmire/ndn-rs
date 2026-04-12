@@ -12,14 +12,16 @@ echo "[${LABEL}] cs_behavior: producing one Data packet"
 
 CONTENT="cs-test-$(date +%s)"
 TMP_CONTENT=$(mktemp)
+TMP_PUT_LOG=$(mktemp)
 echo "${CONTENT}" > "${TMP_CONTENT}"
 
+# Redirect ndn-put's stderr to a log file so we can extract the exact Data name it served.
 ndn-put \
   --face-socket "${SOCK}" --no-shm \
   --freshness 60000 \
-  "${PREFIX}/obj" "${TMP_CONTENT}" &
+  "${PREFIX}/obj" "${TMP_CONTENT}" 2>"${TMP_PUT_LOG}" &
 PUT_PID=$!
-sleep 0.3
+sleep 0.5
 
 echo "[${LABEL}] cs_behavior: first fetch (populates CS)"
 OUT1=$(ndn-peek --face-socket "${SOCK}" --no-shm --can-be-prefix "${PREFIX}/obj" 2>&1 || echo "FAIL")
@@ -30,8 +32,19 @@ wait "${PUT_PID}" 2>/dev/null || true
 rm -f "${TMP_CONTENT}"
 sleep 0.2
 
+# Extract exact served Data name (e.g. /testbed/compliance/cs-test/obj/v=<ts>/0).
+# ndn-put stderr line: "ndn-put: served segment 0/0  /name/v=<ts>/0"
+SERVED_NAME=$(grep -m1 "served segment" "${TMP_PUT_LOG}" 2>/dev/null | awk '{print $NF}' || true)
+rm -f "${TMP_PUT_LOG}"
+
 echo "[${LABEL}] cs_behavior: second fetch (must come from CS)"
-OUT2=$(ndn-peek --face-socket "${SOCK}" --no-shm --can-be-prefix "${PREFIX}/obj" 2>&1 || echo "FAIL_CS")
+if [ -n "${SERVED_NAME}" ]; then
+  # Use exact name — every CS implementation supports exact-name lookup,
+  # bypassing CanBePrefix prefix-matching which some forwarders (yanfd) skip in CS.
+  OUT2=$(ndn-peek --face-socket "${SOCK}" --no-shm "${SERVED_NAME}" 2>&1 || echo "FAIL_CS")
+else
+  OUT2=$(ndn-peek --face-socket "${SOCK}" --no-shm --can-be-prefix "${PREFIX}/obj" 2>&1 || echo "FAIL_CS")
+fi
 
 if echo "${OUT1}" | grep -qF "${CONTENT}" && echo "${OUT2}" | grep -qF "${CONTENT}"; then
   echo "[${LABEL}] PASS: cs_behavior — both fetches succeeded (second from CS)"
