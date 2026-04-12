@@ -53,9 +53,8 @@ async fn watch_interfaces_linux(
     use std::os::unix::io::OwnedFd;
     use tokio::io::unix::AsyncFd;
 
-    // RTM_NEWLINK = 16, RTM_DELLINK = 17
+    // RTM_NEWLINK = 16 (RTM_DELLINK = 17 is handled by the else branch below)
     const RTM_NEWLINK: u16 = 16;
-    const RTM_DELLINK: u16 = 17;
 
     // Open NETLINK_ROUTE socket subscribed to RTMGRP_LINK.
     let fd: i32 = unsafe {
@@ -78,7 +77,7 @@ async fn watch_interfaces_linux(
     // (nl_pid=0 means kernel assigns, nl_pad=0 is reserved).
     let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
     addr.nl_family = libc::AF_NETLINK as u16;
-    addr.nl_groups = libc::RTMGRP_LINK as u32;
+    addr.nl_groups = libc::RTMGRP_LINK;
     let rc = unsafe {
         libc::bind(
             fd,
