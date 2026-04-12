@@ -40,7 +40,6 @@ default-members = [
     "crates/research/ndn-research",
     "crates/research/ndn-compute",
     # support — shared tool libraries
-    "crates/support/ndn-filestore",
     "crates/support/ndn-tools-core",
     # binaries
     "binaries/did-ndn-driver",
@@ -89,7 +88,6 @@ members = [
     "crates/platform/ndn-embedded", # bare-metal no_std
     "crates/platform/ndn-mobile",   # Android/iOS
     # support — shared tool libraries used by both binaries and dashboard
-    "crates/support/ndn-filestore",
     "crates/support/ndn-tools-core",
     # binaries
     "binaries/did-ndn-driver",
@@ -144,7 +142,6 @@ ndn-research  = { path = "crates/research/ndn-research" }
 ndn-compute   = { path = "crates/research/ndn-compute" }
 ndn-embedded  = { path = "crates/platform/ndn-embedded" }
 ndn-mobile    = { path = "crates/platform/ndn-mobile" }
-ndn-filestore  = { path = "crates/support/ndn-filestore" }
 ndn-tools-core = { path = "crates/support/ndn-tools-core" }
 
 # Core async runtime — individual crates enable only the features they need
@@ -184,6 +181,7 @@ base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 # Cryptography
 ring          = "0.17"
 ed25519-dalek = "2"
+blake3        = "1"
 # NDNCERT 0.3: ECDH (P-256), HKDF-SHA256, and AES-GCM-128
 p256          = { version = "0.13", default-features = false, features = ["ecdh"] }
 aes-gcm       = { version = "0.10", features = ["alloc", "getrandom"] }
@@ -216,6 +214,14 @@ fjall = "3"
 
 # Benchmarking
 criterion = { version = "0.5", features = ["html_reports"] }
+
+# Bluetooth LE GATT server (Linux/BlueZ, D-Bus)
+bluer = { version = "0.17", default-features = false, features = ["bluetoothd"] }
+
+# Bluetooth LE GATT server (macOS/iOS, CoreBluetooth via objc2)
+objc2                = { version = "0.5" }
+objc2-core-bluetooth = { version = "0.2" }
+objc2-foundation     = { version = "0.2" }
 
 # Raw packet capture (Windows Npcap / libpcap)
 pcap = "2"

@@ -33,16 +33,8 @@ path = "src/traffic.rs"
 name = "ndn-iperf"
 path = "src/iperf.rs"
 
-[[bin]]
-name = "ndn-send"
-path = "src/send.rs"
-
-[[bin]]
-name = "ndn-recv"
-path = "src/recv.rs"
-
 [dependencies]
-ndn-tools-core = { workspace = true, features = ["ping", "iperf", "peek", "put", "send", "recv"] }
+ndn-tools-core = { workspace = true, features = ["ping", "iperf", "peek", "put"] }
 ndn-engine     = { workspace = true }
 ndn-app        = { workspace = true }
 ndn-ipc        = { workspace = true }
@@ -51,7 +43,6 @@ ndn-security   = { workspace = true }
 ndn-config     = { workspace = true }
 ndn-transport  = { workspace = true }
 ndn-faces     = { workspace = true }
-ndn-filestore  = { workspace = true }
 bytes          = { workspace = true, features = ["std"] }
 serde          = { workspace = true }
 serde_json     = { workspace = true }
@@ -61,4 +52,3 @@ tracing        = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow         = { workspace = true }
 clap           = { version = "4", features = ["derive", "env"] }
-mime_guess     = "2"

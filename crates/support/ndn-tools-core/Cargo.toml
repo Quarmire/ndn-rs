@@ -11,8 +11,8 @@ ping    = []
 iperf   = []
 peek    = []
 put     = []
-send    = ["dep:ndn-filestore"]
-recv    = ["dep:ndn-filestore"]
+send    = []
+recv    = []
 
 [dependencies]
 ndn-app        = { workspace = true }
@@ -20,7 +20,6 @@ ndn-ipc        = { workspace = true }
 ndn-packet     = { workspace = true, features = ["std"] }
 ndn-security   = { workspace = true }
 ndn-transport  = { workspace = true }
-ndn-filestore  = { workspace = true, optional = true }
 tokio          = { workspace = true, features = ["rt", "sync", "time"] }
 anyhow         = { workspace = true }
 serde          = { workspace = true }

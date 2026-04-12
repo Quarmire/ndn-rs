@@ -32,8 +32,3 @@ pub mod peek;
 #[cfg(feature = "put")]
 pub mod put;
 
-#[cfg(feature = "send")]
-pub mod send;
-
-#[cfg(feature = "recv")]
-pub mod recv;
