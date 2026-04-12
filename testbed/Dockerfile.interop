@@ -76,7 +76,7 @@ COPY --from=ndn-rs-builder /build/target/release/ndn-put   /usr/local/bin/
 COPY --from=ndn-rs-builder /build/target/release/ndn-ping  /usr/local/bin/
 COPY --from=ndn-rs-builder /build/target/release/ndn-iperf /usr/local/bin/
 
-COPY tests/interop/ /testbed/tests/interop/
+COPY testbed/tests/interop/ /testbed/tests/interop/
 RUN chmod +x /testbed/tests/interop/*.sh
 
 WORKDIR /testbed
