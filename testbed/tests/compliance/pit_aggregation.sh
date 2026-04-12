@@ -42,7 +42,7 @@ done
 SUCCESSES=0
 for pid in "${PIDS[@]}"; do
   if wait "${pid}" 2>/dev/null; then
-    (( SUCCESSES++ ))
+    SUCCESSES=$((SUCCESSES + 1))
   fi
 done
 

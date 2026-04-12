@@ -16,7 +16,7 @@ check() {
   local cmd="$2"
   local expect="$3"
 
-  OUTPUT=$(eval "${cmd}" 2>&1 || true)
+  OUTPUT=$(eval "timeout 10 ${cmd}" 2>&1 || true)
   if echo "${OUTPUT}" | grep -qE "${expect}"; then
     echo "  PASS: ${desc}"
     PASS=$((PASS + 1))

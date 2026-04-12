@@ -97,7 +97,8 @@ jobs:
         run: |
           mkdir -p results
           docker compose exec -T testclient bash /testbed/tests/compliance/run_all.sh
-          docker cp testclient:/results/. results/
+          # Results are bind-mounted from testclient:/results → testbed/results/
+          # via the ./results:/results volume in docker-compose.yml; no cp needed.
 
       # ── Benchmarks ─────────────────────────────────────────────────────────
       # ndn-iperf is used as the benchmark driver.
@@ -111,7 +112,8 @@ jobs:
         run: |
           mkdir -p results
           docker compose exec -T testclient bash /testbed/bench/run_all.sh
-          docker cp testclient:/results/. results/
+          # Results are bind-mounted from testclient:/results → testbed/results/
+          # via the ./results:/results volume in docker-compose.yml; no cp needed.
 
       # ── Interoperability ────────────────────────────────────────────────────
       # Tests ndn-rs against ndn-cxx and NDNts in both directions:
@@ -121,7 +123,7 @@ jobs:
       - name: Build interop image
         if: matrix.suite == 'interop' && !fromJSON(inputs.skip_interop || 'false')
         working-directory: testbed
-        run: docker build -f Dockerfile.interop -t interop-client .
+        run: docker build -f Dockerfile.interop -t interop-client ..
 
       - name: Run interoperability tests
         if: matrix.suite == 'interop' && !fromJSON(inputs.skip_interop || 'false')
