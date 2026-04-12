@@ -40,8 +40,8 @@ wait "${SRV_PID}" 2>/dev/null || true
 
 echo "${OUTPUT}"
 
-MBPS=$(echo "${OUTPUT}" | grep -oE '[0-9]+\.[0-9]+ Mbps'   | tail -1 | awk '{print $1}')
-INTS=$(echo "${OUTPUT}" | grep -oE '[0-9]+ Interests/s'     | tail -1 | awk '{print $1}')
+MBPS=$(echo "${OUTPUT}" | grep 'throughput:' | grep -oE '[0-9]+\.[0-9]+ [A-Za-z]+ps' | head -1) || true
+INTS=$(echo "${OUTPUT}" | grep -oE '[0-9]+ pkt/s' | awk '{print $1}' | sort -n | tail -1) || true
 
 [ -z "${MBPS}" ] && MBPS="n/a"
 [ -z "${INTS}" ] && INTS="n/a"

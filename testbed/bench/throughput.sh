@@ -37,9 +37,10 @@ wait "${SRV_PID}" 2>/dev/null || true
 
 echo "${OUTPUT}"
 
-# Extract summary line: "Summary: X.XX Mbps, Y Interests/s"
-MBPS=$(echo "${OUTPUT}"  | grep -oE '[0-9]+\.[0-9]+ Mbps'      | tail -1 | awk '{print $1}')
-INTS=$(echo "${OUTPUT}"  | grep -oE '[0-9]+ Interests/s'        | tail -1 | awk '{print $1}')
+# Extract from summary: "  throughput:  3.43 Gbps" (unit varies: Gbps/Mbps/Kbps)
+MBPS=$(echo "${OUTPUT}" | grep 'throughput:' | grep -oE '[0-9]+\.[0-9]+ [A-Za-z]+ps' | head -1) || true
+# Extract max pkt/s from interval lines: "52515 pkt/s"
+INTS=$(echo "${OUTPUT}" | grep -oE '[0-9]+ pkt/s' | awk '{print $1}' | sort -n | tail -1) || true
 
 [ -z "${MBPS}" ] && MBPS="n/a"
 [ -z "${INTS}" ] && INTS="n/a"

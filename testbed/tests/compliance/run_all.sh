@@ -34,10 +34,10 @@ run_suite() {
   if FWD_SOCK="${fwd_sock}" FWD_LABEL="${label}" \
        bash "${SCRIPT_DIR}/${script}" 2>&1 | tee -a "${REPORT}"; then
     echo "  PASS: ${script}"
-    (( PASS++ ))
+    PASS=$((PASS + 1))
   else
     echo "  FAIL: ${script}"
-    (( FAIL++ ))
+    FAIL=$((FAIL + 1))
   fi
 }
 

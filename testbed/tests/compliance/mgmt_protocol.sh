@@ -19,13 +19,13 @@ check() {
   OUTPUT=$(eval "${cmd}" 2>&1 || true)
   if echo "${OUTPUT}" | grep -qE "${expect}"; then
     echo "  PASS: ${desc}"
-    (( PASS++ ))
+    PASS=$((PASS + 1))
   else
     echo "  FAIL: ${desc}"
     echo "        cmd:    ${cmd}"
     echo "        output: ${OUTPUT}"
     echo "        expect: ${expect}"
-    (( FAIL++ ))
+    FAIL=$((FAIL + 1))
   fi
 }
 
