@@ -13,7 +13,7 @@ The mapping is straightforward once you see the two layers:
 - **ndn-rs** (the library) is analogous to **ndn-cxx** (the C++ library). Both provide the core data structures, TLV codec, forwarding engine, and face abstractions that applications link against.
 - **ndn-fwd** (the standalone binary) is analogous to **NFD** (the daemon). Both are thin executables that instantiate the library, open network faces, and run a forwarding loop.
 
-The key difference is architectural philosophy. ndn-cxx and NFD are written in C++ with class hierarchies and virtual dispatch. ndn-rs models the same concepts as composable data pipelines with Rust traits, `Arc`-based shared ownership, and zero-copy `Bytes` throughout. Both follow the same NDN specifications (RFC 8569, RFC 8609), so they interoperate on the wire.
+The key difference is architectural philosophy. ndn-cxx and NFD are written in C++ with class hierarchies and virtual dispatch. ndn-rs models the same concepts as composable data pipelines with Rust traits, `Arc`-based shared ownership, and zero-copy `Bytes` throughout. Both implement the same NDN protocol (NDN Packet Format v0.3, NDNLPv2), so they interoperate on the wire.
 
 ### What's the difference between ndn-rs and ndn-fwd?
 
