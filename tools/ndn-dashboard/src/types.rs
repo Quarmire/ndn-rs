@@ -916,3 +916,43 @@ impl CaInfo {
         found.then_some(s)
     }
 }
+
+// ── Trust schema rules ────────────────────────────────────────────────────────
+
+/// A single trust schema rule returned by `security/schema-list`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SchemaRuleInfo {
+    pub index:        usize,
+    pub data_pattern: String,
+    pub key_pattern:  String,
+}
+
+impl SchemaRuleInfo {
+    /// Parse from `security/schema-list` response text.
+    ///
+    /// Format per line:
+    /// ```text
+    /// [0] /sensor/<node>/<type> => /sensor/<node>/KEY/<id>
+    /// ```
+    pub fn parse_list(text: &str) -> Vec<Self> {
+        let mut out = Vec::new();
+        for line in text.lines() {
+            let line = line.trim();
+            // Expected: "[<index>] <data> => <key>"
+            let bracket_end = match line.strip_prefix('[').and_then(|s| s.find(']')) {
+                Some(i) => i + 1, // offset of ']' relative to start of line (after '[')
+                None => continue,
+            };
+            let rest = line[bracket_end + 1..].trim();
+            if let Some((data, key)) = rest.split_once(" => ") {
+                let index = line[1..bracket_end].parse().unwrap_or(out.len());
+                out.push(SchemaRuleInfo {
+                    index,
+                    data_pattern: data.trim().to_string(),
+                    key_pattern:  key.trim().to_string(),
+                });
+            }
+        }
+        out
+    }
+}

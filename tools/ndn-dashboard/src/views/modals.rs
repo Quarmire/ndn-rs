@@ -141,6 +141,7 @@ fn assemble_config(
         }).collect(),
         security,
         discovery,
+        face_system: Default::default(),
     };
     cfg.to_toml_string().unwrap_or_default()
 }

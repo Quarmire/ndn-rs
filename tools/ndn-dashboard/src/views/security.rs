@@ -3,6 +3,7 @@
 
 use dioxus::prelude::*;
 use crate::app::{AppCtx, DashCmd};
+use crate::types::SchemaRuleInfo;
 use crate::views::onboarding::encode_did_ndn;
 
 // ── Tab IDs ───────────────────────────────────────────────────────────────────
@@ -13,14 +14,19 @@ const TAB_CHAIN:         u8 = 2;
 const TAB_DID:           u8 = 3;
 const TAB_CA:            u8 = 4;
 const TAB_YUBIKEY:       u8 = 5;
+const TAB_SCHEMA:        u8 = 6;
 
 // ── Root component ────────────────────────────────────────────────────────────
 
 #[component]
 pub fn Security() -> Element {
     let ctx = use_context::<AppCtx>();
-    let keys    = ctx.security_keys.read();
-    let anchors = ctx.security_anchors.read();
+    let keys            = ctx.security_keys.read();
+    let anchors         = ctx.security_anchors.read();
+    let schema          = ctx.schema_rules.read();
+    let is_ephemeral    = *ctx.identity_is_ephemeral.read();
+    let identity_name   = ctx.identity_name.read().clone();
+    let pib_path        = ctx.identity_pib_path.read().clone();
 
     let mut active_tab:   Signal<u8>     = use_signal(|| TAB_IDENTITIES);
     let new_key_name: Signal<String> = use_signal(String::new);
@@ -32,10 +38,61 @@ pub fn Security() -> Element {
         ("DID",            TAB_DID),
         ("CA / NDNCERT",   TAB_CA),
         ("YubiKey",        TAB_YUBIKEY),
+        ("Trust Schema",   TAB_SCHEMA),
     ];
 
     rsx! {
         div { class: "section",
+
+            // ── Ephemeral identity warning ────────────────────────────────────
+            if is_ephemeral && !identity_name.is_empty() {
+                div {
+                    style: "margin-bottom:16px;padding:12px 14px;\
+                            background:var(--yellow-bg,#2a2400)22;\
+                            border:1px solid var(--yellow,#f5c518)66;\
+                            border-radius:6px;font-size:12px;",
+                    div {
+                        style: "font-weight:600;color:var(--yellow,#f5c518);margin-bottom:6px;",
+                        "Ephemeral identity active — keys will not survive a restart"
+                    }
+                    div { style: "color:var(--text-muted);margin-bottom:8px;",
+                        "The router is signing data as "
+                        span { class: "mono", "{identity_name}" }
+                        " using an in-memory key. This identity is not persisted."
+                    }
+                    div { style: "color:var(--text-muted);font-size:11px;",
+                        "To use a persistent identity, set "
+                        span { class: "mono", "[security] identity" }
+                        " and "
+                        span { class: "mono", "pib_path" }
+                        " in your router config, or use the "
+                        strong { "Config" }
+                        " tab. Run "
+                        span { class: "mono", "ndn-sec keygen <name>" }
+                        " to create keys first."
+                    }
+                }
+            }
+
+            // ── Persistent identity info bar ──────────────────────────────────
+            if !is_ephemeral && !identity_name.is_empty() {
+                div {
+                    style: "margin-bottom:16px;padding:8px 12px;\
+                            background:var(--green-bg,#002a00)22;\
+                            border:1px solid var(--green,#3fb950)44;\
+                            border-radius:6px;font-size:11px;\
+                            display:flex;gap:12px;align-items:center;",
+                    span { class: "badge badge-green", "persistent" }
+                    span { style: "color:var(--text-muted);",
+                        "Identity: "
+                        span { class: "mono", "{identity_name}" }
+                        if let Some(ref p) = pib_path {
+                            span { style: "margin-left:8px;", "  PIB: " span { class: "mono", "{p}" } }
+                        }
+                    }
+                }
+            }
+
             // ── Tab bar ──────────────────────────────────────────────────────
             div { style: "display:flex;gap:6px;margin-bottom:16px;flex-wrap:wrap;",
                 for (label, tab_i) in tabs {
@@ -60,6 +117,7 @@ pub fn Security() -> Element {
                 TAB_DID        => rsx! { DidTab { keys: keys.clone() } },
                 TAB_CA         => rsx! { CaTab {} },
                 TAB_YUBIKEY    => rsx! { YubikeyTab {} },
+                TAB_SCHEMA     => rsx! { SchemaTab { rules: schema.clone() } },
                 _              => rsx! {},
             }
         }
@@ -765,6 +823,173 @@ fn YubikeyTab() -> Element {
             BootstrapStep { n: 3, step: "Router enrolls",     desc: "Router starts NDNCERT enrollment automatically on boot", first: false }
             BootstrapStep { n: 4, step: "Operator presses",   desc: "Press YubiKey button → 6-digit OTP emitted via USB HID", first: false }
             BootstrapStep { n: 5, step: "Certificate issued", desc: "CA verifies OTP against HOTP counter → cert issued", first: false }
+        }
+    }
+}
+
+// ── Tab: Trust Schema ─────────────────────────────────────────────────────────
+
+#[component]
+fn SchemaTab(rules: Vec<SchemaRuleInfo>) -> Element {
+    let ctx = use_context::<AppCtx>();
+    let mut new_rule:      Signal<String> = use_signal(String::new);
+    let mut bulk_rules:    Signal<String> = use_signal(String::new);
+    let mut show_bulk:     Signal<bool>   = use_signal(|| false);
+
+    rsx! {
+        div { class: "section-title", "Trust Schema" }
+
+        // Education card
+        div { class: "edu-card",
+            div { style: "display:flex;gap:12px;align-items:flex-start;",
+                div { style: "font-size:28px;flex-shrink:0;", "📐" }
+                div {
+                    div { style: "font-size:13px;font-weight:600;color:var(--accent);margin-bottom:4px;",
+                        "Local Trust Policy"
+                    }
+                    div { style: "font-size:12px;color:var(--text-muted);line-height:1.6;",
+                        "The trust schema is a local policy that controls which "
+                        span { class: "mono", "(data name, signing key)" }
+                        " pairs this node accepts. "
+                        "Rules use pattern syntax: "
+                        span { class: "mono", "/literal/<capture>/<**multi>" }
+                        " where variables with the same name must match the same value. "
+                        "The default profile is "
+                        span { class: "mono", "\"disabled\"" }
+                        " — matching NFD's behaviour of not validating Data at the forwarder."
+                    }
+                }
+            }
+        }
+
+        // Active rules list
+        div { class: "section-title", style: "margin-top:16px;font-size:12px;",
+            "Active Rules"
+            if !rules.is_empty() {
+                span { style: "margin-left:8px;", class: "badge badge-blue", "{rules.len()}" }
+            }
+        }
+        if rules.is_empty() {
+            div { class: "empty",
+                "No trust schema rules configured. All signed Data is accepted (security profile = disabled)."
+            }
+        } else {
+            table {
+                thead {
+                    tr {
+                        th { "Index" }
+                        th { "Data Pattern" }
+                        th { "" }
+                        th { "Key Pattern" }
+                        th { "Actions" }
+                    }
+                }
+                tbody {
+                    for rule in rules.iter() {
+                        {
+                            let idx = rule.index as u64;
+                            rsx! {
+                                tr {
+                                    td { span { class: "badge badge-gray", "{rule.index}" } }
+                                    td { class: "mono", style: "color:var(--accent);", "{rule.data_pattern}" }
+                                    td { style: "color:var(--text-muted);padding:0 6px;", "=>" }
+                                    td { class: "mono", style: "color:var(--green);", "{rule.key_pattern}" }
+                                    td {
+                                        button {
+                                            class: "btn btn-danger btn-sm",
+                                            onclick: move |_| ctx.cmd.send(DashCmd::SchemaRuleRemove(idx)),
+                                            "Remove"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Add single rule form
+        div { style: "margin-top:16px;",
+            div { class: "section-title", style: "font-size:12px;", "Add Rule" }
+            div { style: "font-size:11px;color:var(--text-muted);margin-bottom:8px;",
+                "Format: "
+                span { class: "mono", "/data/<node>/<type> => /data/<node>/KEY/<id>" }
+            }
+            div { class: "form-row",
+                div { class: "form-group", style: "flex:1;",
+                    input {
+                        r#type: "text",
+                        placeholder: "/sensor/<node>/<type> => /sensor/<node>/KEY/<id>",
+                        value: "{new_rule}",
+                        oninput: move |e| new_rule.set(e.value()),
+                        style: "width:100%;",
+                    }
+                }
+                button {
+                    class: "btn btn-primary",
+                    disabled: new_rule.read().trim().is_empty(),
+                    onclick: move |_| {
+                        let r = new_rule.read().trim().to_string();
+                        if !r.is_empty() {
+                            ctx.cmd.send(DashCmd::SchemaRuleAdd(r));
+                            new_rule.set(String::new());
+                        }
+                    },
+                    "Add Rule"
+                }
+            }
+        }
+
+        // Bulk edit section
+        div { style: "margin-top:16px;border:1px solid var(--border);border-radius:6px;overflow:hidden;",
+            div { style: "display:flex;justify-content:space-between;align-items:center;padding:10px 14px;background:var(--surface2);",
+                div { style: "font-size:12px;font-weight:600;color:var(--text);", "Bulk Edit / Replace Schema" }
+                button {
+                    class: "btn btn-secondary btn-sm",
+                    onclick: move |_| {
+                        let v = *show_bulk.read();
+                        show_bulk.set(!v);
+                    },
+                    if *show_bulk.read() { "▲ Cancel" } else { "▼ Edit" }
+                }
+            }
+            if *show_bulk.read() {
+                div { style: "padding:14px;border-top:1px solid var(--border);",
+                    div { style: "font-size:11px;color:var(--text-muted);margin-bottom:8px;",
+                        "Enter one rule per line in the form "
+                        span { class: "mono", "<data> => <key>" }
+                        ". This replaces the entire schema. Submit an empty text area to clear all rules."
+                    }
+                    textarea {
+                        style: "width:100%;height:120px;background:var(--surface);border:1px solid var(--border);border-radius:4px;padding:8px;font-family:monospace;font-size:11px;color:var(--text);resize:vertical;",
+                        placeholder: "/sensor/<node>/<type> => /sensor/<node>/KEY/<id>\n/admin/<**rest> => /admin/KEY/<id>",
+                        value: "{bulk_rules}",
+                        oninput: move |e| bulk_rules.set(e.value()),
+                    }
+                    div { style: "display:flex;gap:8px;margin-top:8px;",
+                        button {
+                            class: "btn btn-primary",
+                            onclick: move |_| {
+                                let r = bulk_rules.read().clone();
+                                ctx.cmd.send(DashCmd::SchemaSet(r));
+                                show_bulk.set(false);
+                                bulk_rules.set(String::new());
+                            },
+                            "Apply Schema"
+                        }
+                        button {
+                            class: "btn btn-danger",
+                            onclick: move |_| {
+                                ctx.cmd.send(DashCmd::SchemaSet(String::new()));
+                                show_bulk.set(false);
+                                bulk_rules.set(String::new());
+                            },
+                            "Clear All Rules"
+                        }
+                    }
+                }
+            }
         }
     }
 }
