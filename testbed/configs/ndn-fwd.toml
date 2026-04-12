@@ -2,22 +2,24 @@
 # Used by the Docker Compose testbed for protocol compliance and benchmarking.
 
 [engine]
-pipeline_threads = 2
-cs_capacity_mb   = 64
+pipeline_threads     = 2
+cs_capacity_mb       = 64
+pipeline_channel_cap = 4096
 
 [cs]
-variant    = "lru"
+variant     = "lru"
 capacity_mb = 64
 
 [security]
 # No persistent identity in testbed; ephemeral key is auto-generated.
 profile = "disabled"
 
-[udp]
-bind        = "0.0.0.0:6363"
-multicast   = false
+[[face]]
+kind = "udp"
+bind = "0.0.0.0:6363"
 
-[tcp]
+[[face]]
+kind = "tcp"
 bind = "0.0.0.0:6364"
 
 [logging]

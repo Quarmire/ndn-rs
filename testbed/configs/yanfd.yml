@@ -22,7 +22,7 @@ faces:
 
 tables:
   content_store:
-    capacity: 65536
+    capacity: 1024
     replacement_policy: lru
 
   rib:
