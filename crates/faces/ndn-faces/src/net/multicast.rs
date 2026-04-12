@@ -6,7 +6,7 @@ use bytes::Bytes;
 use tokio::net::UdpSocket;
 
 use ndn_packet::fragment::{DEFAULT_UDP_MTU, fragment_packet};
-use ndn_transport::{Face, FaceAddr, FaceError, FaceId, FaceKind};
+use ndn_transport::{Face, FaceAddr, FaceError, FaceId, FaceKind, LinkType};
 
 /// IANA-assigned NDN IPv4 link-local multicast group.
 pub const NDN_MULTICAST_V4: Ipv4Addr = Ipv4Addr::new(224, 0, 23, 170);
@@ -34,6 +34,9 @@ pub struct MulticastUdpFace {
     dest: SocketAddr,
     mtu: usize,
     seq: AtomicU64,
+    /// Link type reported by [`Face::link_type`].  Defaults to `MultiAccess`;
+    /// set to `AdHoc` for Wi-Fi IBSS / MANET deployments via [`Self::ad_hoc`].
+    link_type: LinkType,
 }
 
 impl MulticastUdpFace {
@@ -54,6 +57,7 @@ impl MulticastUdpFace {
             dest: SocketAddr::V4(SocketAddrV4::new(group, port)),
             mtu: DEFAULT_UDP_MTU,
             seq: AtomicU64::new(0),
+            link_type: LinkType::MultiAccess,
         })
     }
 
@@ -71,7 +75,18 @@ impl MulticastUdpFace {
             dest,
             mtu: DEFAULT_UDP_MTU,
             seq: AtomicU64::new(0),
+            link_type: LinkType::MultiAccess,
         }
+    }
+
+    /// Set link type to `AdHoc` for Wi-Fi IBSS / MANET deployments.
+    ///
+    /// Ad-hoc link type signals to forwarding strategies that not all nodes on
+    /// the link hear every multicast frame, so multi-access Interest suppression
+    /// should be disabled.
+    pub fn ad_hoc(mut self) -> Self {
+        self.link_type = LinkType::AdHoc;
+        self
     }
 
     pub fn dest(&self) -> SocketAddr {
@@ -99,6 +114,9 @@ impl Face for MulticastUdpFace {
     }
     fn kind(&self) -> FaceKind {
         FaceKind::Multicast
+    }
+    fn link_type(&self) -> LinkType {
+        self.link_type
     }
 
     /// Receive the next NDN packet from any sender on the multicast group.

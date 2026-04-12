@@ -7,7 +7,7 @@ use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
-use ndn_transport::{Face, FaceAddr, FaceError, FaceId, FaceKind};
+use ndn_transport::{Face, FaceAddr, FaceError, FaceId, FaceKind, LinkType};
 use tokio::io::unix::AsyncFd;
 
 use crate::NDN_ETHERTYPE;
@@ -131,6 +131,10 @@ impl Face for MulticastEtherFace {
     }
     fn kind(&self) -> FaceKind {
         FaceKind::EtherMulticast
+    }
+
+    fn link_type(&self) -> LinkType {
+        LinkType::MultiAccess
     }
 
     fn remote_uri(&self) -> Option<String> {

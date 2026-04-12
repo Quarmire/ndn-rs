@@ -8,7 +8,7 @@
 //! - [`NamedEtherFace`] / [`MulticastEtherFace`] — unicast and multicast raw Ethernet faces
 //! - [`WfbFace`] — Wifibroadcast NG face for 802.11 monitor-mode injection (Linux only)
 //! - [`BleFace`] — BLE GATT face implementing the NDNts web-bluetooth-transport
-//!   protocol (Linux only; full implementation targeted for v0.2.0)
+//!   protocol (Linux only; requires `bluetooth` feature and BlueZ)
 //! - [`RadioTable`] — metadata registry for radio-based faces
 //! - [`EtherNeighborDiscovery`] — link-layer neighbor discovery (Linux only)
 //!
@@ -54,7 +54,7 @@ pub mod ether_windows;
 #[cfg(target_os = "linux")]
 pub mod wfb;
 
-#[cfg(all(target_os = "linux", feature = "bluetooth"))]
+#[cfg(all(any(target_os = "linux", target_os = "macos"), feature = "bluetooth"))]
 pub mod bluetooth;
 
 // NeighborDiscovery uses AF_PACKET raw sockets, so it is Linux-only.
@@ -85,7 +85,7 @@ pub use multicast_ether::MulticastEtherFace;
 #[cfg(target_os = "linux")]
 pub use wfb::WfbFace;
 
-#[cfg(all(target_os = "linux", feature = "bluetooth"))]
+#[cfg(all(any(target_os = "linux", target_os = "macos"), feature = "bluetooth"))]
 pub use bluetooth::BleFace;
 
 #[cfg(target_os = "linux")]

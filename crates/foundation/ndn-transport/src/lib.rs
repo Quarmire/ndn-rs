@@ -33,7 +33,7 @@ pub mod tlv_codec;
 
 pub use any_map::AnyMap;
 pub use congestion::CongestionController;
-pub use face::{Face, FaceAddr, FaceError, FaceId, FaceKind, FacePersistency, FaceScope};
+pub use face::{Face, FaceAddr, FaceError, FaceId, FaceKind, FacePersistency, FaceScope, LinkType};
 pub use forwarding::{ForwardingAction, NackReason};
 pub use mac_addr::MacAddr;
 pub use face_event::FaceEvent;

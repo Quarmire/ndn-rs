@@ -25,10 +25,10 @@ net       = []
 websocket     = ["net", "dep:tokio-tungstenite"]
 websocket-tls = ["websocket", "dep:tokio-rustls", "dep:rcgen", "dep:rustls-pemfile"]
 local     = []
-spsc-shm  = ["local", "dep:libc"]
+spsc-shm  = ["local"]
 serial    = ["dep:tokio-serial"]
-l2        = ["dep:libc"]
-bluetooth = ["l2"]
+l2        = []
+bluetooth = ["l2", "dep:bluer", "dep:objc2"]
 wfb       = ["l2"]
 
 [dependencies]
@@ -49,7 +49,17 @@ tokio-rustls      = { workspace = true, optional = true }
 rcgen             = { workspace = true, optional = true }
 rustls-pemfile    = { workspace = true, optional = true }
 tokio-serial      = { workspace = true, optional = true }
-libc              = { workspace = true, optional = true }
+
+# libc is always available on unix — used for interface enumeration (getifaddrs)
+# and L2 raw sockets (AF_PACKET on Linux, PF_NDRV on macOS).
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+bluer = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 pcap        = { workspace = true }

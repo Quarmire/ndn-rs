@@ -25,14 +25,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use ndn_packet::Name;
-use ndn_transport::{Face, FaceAddr, FaceError, FaceId, FaceKind};
+use ndn_transport::{Face, FaceAddr, FaceError, FaceId, FaceKind, LinkType};
 
 use ndn_transport::MacAddr;
 
-use crate::ndrv::NdrvSocket;
-use crate::radio::RadioFaceMetadata;
+use super::ndrv::NdrvSocket;
+use super::radio::RadioFaceMetadata;
 
-pub use crate::ndrv::NDN_ETHER_MCAST_MAC;
+pub use super::ndrv::NDN_ETHER_MCAST_MAC;
 
 // ─── NamedEtherFace ──────────────────────────────────────────────────────────
 
@@ -167,6 +167,10 @@ impl Face for MulticastEtherFace {
     }
     fn kind(&self) -> FaceKind {
         FaceKind::EtherMulticast
+    }
+
+    fn link_type(&self) -> LinkType {
+        LinkType::MultiAccess
     }
 
     fn remote_uri(&self) -> Option<String> {

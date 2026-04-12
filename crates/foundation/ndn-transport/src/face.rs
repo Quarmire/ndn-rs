@@ -156,6 +156,38 @@ pub enum FacePersistency {
     Permanent = 2,
 }
 
+/// Link type for a face — indicates the connectivity model of the underlying link.
+///
+/// Forwarding strategies use this to decide whether to suppress duplicate Interests
+/// on the same face (multi-access suppression) and to select appropriate forwarding
+/// algorithms for partially-connected topologies.
+///
+/// Matches the NFD link-type model:
+/// - `PointToPoint`: single-peer link (unicast TCP, UDP, serial, Unix socket).
+/// - `MultiAccess`: all nodes on the link receive every frame (Ethernet multicast,
+///   UDP multicast on a wired LAN or Wi-Fi infrastructure AP).
+/// - `AdHoc`: partially-connected wireless (Wi-Fi IBSS, MANET) — not all nodes
+///   hear every frame, so multi-access suppression should be disabled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "kebab-case"))]
+pub enum LinkType {
+    #[default]
+    PointToPoint,
+    MultiAccess,
+    AdHoc,
+}
+
+impl core::fmt::Display for LinkType {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::PointToPoint => "point-to-point",
+            Self::MultiAccess => "multi-access",
+            Self::AdHoc => "ad-hoc",
+        })
+    }
+}
+
 impl FacePersistency {
     pub fn from_u64(v: u64) -> Option<Self> {
         match v {
@@ -226,6 +258,15 @@ pub trait Face: Send + Sync + 'static {
     /// constructor parameter.  Custom face implementations should follow the
     /// same convention based on [`FaceKind::scope()`].
     fn send(&self, pkt: Bytes) -> impl Future<Output = Result<(), FaceError>> + Send;
+
+    /// Link type of this face.
+    ///
+    /// The default is [`LinkType::PointToPoint`] for all unicast transports.
+    /// Multicast and broadcast faces override this to [`LinkType::MultiAccess`].
+    /// Wi-Fi ad-hoc / MANET faces should return [`LinkType::AdHoc`].
+    fn link_type(&self) -> LinkType {
+        LinkType::PointToPoint
+    }
 }
 
 use std::future::Future;

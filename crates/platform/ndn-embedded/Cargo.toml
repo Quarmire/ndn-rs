@@ -16,8 +16,9 @@ license.workspace = true
 [features]
 default  = []
 alloc    = ["dep:hashbrown"]  # heap allocator present
-cs       = []                                      # enable content store
-ipc      = []                                      # app-to-forwarder SPSC queues
+cs       = []                 # enable content store
+ipc      = []                 # app-to-forwarder SPSC queues
+ble      = []                 # BLE GATT face (BlePlatform trait + EmbeddedBleFace)
 
 [dependencies]
 ndn-tlv    = { workspace = true }

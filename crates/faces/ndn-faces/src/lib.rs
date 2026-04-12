@@ -19,6 +19,15 @@
 
 #![allow(missing_docs)]
 
+/// Network interface enumeration and whitelist/blacklist filtering.
+///
+/// Used by the face system auto-configuration (`[face_system]` in TOML) to
+/// enumerate interfaces and apply whitelist/blacklist patterns.
+pub mod iface;
+
+/// Dynamic interface add/remove watcher (Linux netlink; stubs on other platforms).
+pub mod iface_watcher;
+
 #[cfg(feature = "net")]
 pub mod net;
 

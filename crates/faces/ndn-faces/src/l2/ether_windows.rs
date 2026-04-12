@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use ndn_packet::Name;
-use ndn_transport::{Face, FaceError, FaceId, FaceKind};
+use ndn_transport::{Face, FaceError, FaceId, FaceKind, LinkType};
 
 use ndn_transport::MacAddr;
 
@@ -168,6 +168,10 @@ impl Face for MulticastEtherFace {
     }
     fn kind(&self) -> FaceKind {
         FaceKind::EtherMulticast
+    }
+
+    fn link_type(&self) -> LinkType {
+        LinkType::MultiAccess
     }
 
     fn remote_uri(&self) -> Option<String> {

@@ -24,6 +24,10 @@ pub mod unix;
 pub mod shm;
 
 pub use in_proc::{InProcFace, InProcHandle};
+
+/// Alias for [`InProcFace`]: the in-process app-to-engine face backed by
+/// `tokio::sync::mpsc` (zero syscalls, same-thread or cross-thread).
+pub type AppFace = InProcFace;
 pub use ipc::{IpcFace, IpcListener, ipc_face_connect};
 
 #[cfg(unix)]
