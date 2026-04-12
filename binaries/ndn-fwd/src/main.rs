@@ -487,7 +487,7 @@ async fn main() -> Result<()> {
                 auto_ether_ids.push((id, iface_info.name.clone()));
             }
         }
-        auto_ether_pre_alloc = auto_ether_ids;
+        auto_ether_pre_alloc = auto_ether_ids.clone();
         auto_udp_pre_alloc = auto_udp_ids;
 
         // Build DiscoveryConfig from profile + overrides.
