@@ -4,20 +4,10 @@ on:
   push:
     branches: [main]
     paths:
-      - "crates/ndn-tlv/**"
-      - "crates/ndn-packet/**"
-      - "crates/ndn-transport/**"
-      - "crates/ndn-face-net/**"
-      - "crates/ndn-face-local/**"
-      - "crates/ndn-pipeline/**"
-      - "crates/ndn-strategy/**"
-      - "crates/ndn-security/**"
-      - "crates/ndn-engine/**"
-      - "crates/ndn-app/**"
-      - "crates/ndn-ipc/**"
-      - "crates/ndn-config/**"
-      - "crates/ndn-store/**"
-      - "crates/ndn-mobile/**"
+      - "crates/foundation/**"
+      - "crates/engine/**"
+      - "crates/faces/**"
+      - "crates/platform/ndn-mobile/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/mobile.yml"
@@ -25,20 +15,10 @@ on:
   pull_request:
     branches: [main]
     paths:
-      - "crates/ndn-tlv/**"
-      - "crates/ndn-packet/**"
-      - "crates/ndn-transport/**"
-      - "crates/ndn-face-net/**"
-      - "crates/ndn-face-local/**"
-      - "crates/ndn-pipeline/**"
-      - "crates/ndn-strategy/**"
-      - "crates/ndn-security/**"
-      - "crates/ndn-engine/**"
-      - "crates/ndn-app/**"
-      - "crates/ndn-ipc/**"
-      - "crates/ndn-config/**"
-      - "crates/ndn-store/**"
-      - "crates/ndn-mobile/**"
+      - "crates/foundation/**"
+      - "crates/engine/**"
+      - "crates/faces/**"
+      - "crates/platform/ndn-mobile/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/mobile.yml"
@@ -74,21 +54,12 @@ jobs:
           cargo check --target aarch64-apple-ios \
             -p ndn-tlv -p ndn-packet -p ndn-transport
 
-      # Face layer — UDP/TCP faces (Tokio net) and local faces (AppFace, IpcFace)
-      # ndn-face-local: default features only (no spsc-shm — uses /tmp/ paths)
-      # ndn-face-serial: --no-default-features to skip tokio-serial (no serial ports on iOS)
+      # Face layer — UDP/TCP faces and local (in-process/Unix) faces only.
+      # Serial excluded (no UART on iOS). L2/Bluetooth excluded (needs entitlements).
       - name: Check face layer
         run: |
           cargo check --target aarch64-apple-ios \
-            -p ndn-face-net \
-            -p ndn-face-local \
-            -p ndn-face-serial --no-default-features
-
-      # Pipeline and strategy
-      - name: Check pipeline / strategy
-        run: |
-          cargo check --target aarch64-apple-ios \
-            -p ndn-pipeline -p ndn-strategy
+            -p ndn-faces --no-default-features --features net,local
 
       # Security (uses ring — has iOS asm, needs Xcode)
       - name: Check security
@@ -169,19 +140,11 @@ jobs:
           cargo ndk -t arm64-v8a check \
             -p ndn-tlv -p ndn-packet -p ndn-transport
 
-      # Face layer
+      # Face layer — UDP/TCP and local; serial excluded (no /dev/tty* guarantee on Android)
       - name: Check face layer
         run: |
           cargo ndk -t arm64-v8a check \
-            -p ndn-face-net \
-            -p ndn-face-local \
-            -p ndn-face-serial --no-default-features
-
-      # Pipeline and strategy
-      - name: Check pipeline / strategy
-        run: |
-          cargo ndk -t arm64-v8a check \
-            -p ndn-pipeline -p ndn-strategy
+            -p ndn-faces --no-default-features --features net,local
 
       # Security (ring has Android NDK asm support)
       - name: Check security

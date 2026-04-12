@@ -5,53 +5,28 @@ on:
     branches: [main]
     paths:
       - ".github/workflows/ci.yml"
-      - "crates/ndn-tlv/**"
-      - "crates/ndn-packet/**"
-      - "crates/ndn-transport/**"
-      - "crates/ndn-store/**"
-      - "crates/ndn-face-net/**"
-      - "crates/ndn-face-local/**"
-      - "crates/ndn-face-serial/**"
-      - "crates/ndn-pipeline/**"
-      - "crates/ndn-strategy/**"
-      - "crates/ndn-security/**"
-      - "crates/ndn-engine/**"
-      - "crates/ndn-app/**"
-      - "crates/ndn-ipc/**"
-      - "crates/ndn-config/**"
-      - "crates/ndn-discovery/**"
-      - "crates/ndn-sync/**"
-      - "crates/ndn-sim/**"
-      - "crates/ndn-wasm/**"
+      - "crates/foundation/**"
+      - "crates/engine/**"
+      - "crates/faces/**"
+      - "crates/protocols/**"
+      - "crates/sim/**"
+      - "crates/platform/**"
       - "binaries/**"
-      - "examples/**"
+      - "tools/**"
       - "Cargo.toml"
       - "Cargo.lock"
-      - ".github/workflows/ci.yml"
   workflow_dispatch:
   pull_request:
     branches: [main]
     paths:
-      - "crates/ndn-tlv/**"
-      - "crates/ndn-packet/**"
-      - "crates/ndn-transport/**"
-      - "crates/ndn-store/**"
-      - "crates/ndn-face-net/**"
-      - "crates/ndn-face-local/**"
-      - "crates/ndn-face-serial/**"
-      - "crates/ndn-pipeline/**"
-      - "crates/ndn-strategy/**"
-      - "crates/ndn-security/**"
-      - "crates/ndn-engine/**"
-      - "crates/ndn-app/**"
-      - "crates/ndn-ipc/**"
-      - "crates/ndn-config/**"
-      - "crates/ndn-discovery/**"
-      - "crates/ndn-sync/**"
-      - "crates/ndn-sim/**"
-      - "crates/ndn-wasm/**"
+      - "crates/foundation/**"
+      - "crates/engine/**"
+      - "crates/faces/**"
+      - "crates/protocols/**"
+      - "crates/sim/**"
+      - "crates/platform/**"
       - "binaries/**"
-      - "examples/**"
+      - "tools/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/ci.yml"
@@ -86,7 +61,6 @@ jobs:
         run: >
           cargo clippy
           --workspace
-          --exclude ndn-face-l2
           --exclude ndn-strategy-wasm
           --exclude ndn-research
           --exclude ndn-compute
@@ -97,7 +71,6 @@ jobs:
         run: >
           cargo test
           --workspace
-          --exclude ndn-face-l2
           --exclude ndn-strategy-wasm
           --exclude ndn-research
           --exclude ndn-compute
@@ -107,7 +80,6 @@ jobs:
         run: >
           cargo doc
           --workspace
-          --exclude ndn-face-l2
           --exclude ndn-strategy-wasm
           --exclude ndn-research
           --exclude ndn-compute

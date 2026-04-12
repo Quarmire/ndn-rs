@@ -41,7 +41,6 @@ services:
       - "6364:6364/tcp"   # management / WebSocket
     volumes:
       - ./configs/ndn-fwd.toml:/etc/ndn-fwd/config.toml:ro
-    command: ["/usr/local/bin/ndn-router", "-c", "/etc/ndn-fwd/config.toml"]
     healthcheck:
       test: ["CMD-SHELL", "nc -z localhost 6363 || exit 1"]
       interval: 5s

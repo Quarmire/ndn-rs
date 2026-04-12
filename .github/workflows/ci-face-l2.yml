@@ -4,14 +4,14 @@ on:
   push:
     branches: [main]
     paths:
-      - "crates/ndn-face-l2/**"
+      - "crates/faces/**"
       - "Cargo.lock"
       - ".github/workflows/ci-face-l2.yml"
   workflow_dispatch:
   pull_request:
     branches: [main]
     paths:
-      - "crates/ndn-face-l2/**"
+      - "crates/faces/**"
       - "Cargo.lock"
       - ".github/workflows/ci-face-l2.yml"
 
@@ -42,10 +42,10 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libpcap-dev
 
       - name: Lint
-        run: cargo clippy -p ndn-face-l2 -- -D warnings
+        run: cargo clippy -p ndn-faces --features l2 -- -D warnings
 
       - name: Test
-        run: cargo test -p ndn-face-l2
+        run: cargo test -p ndn-faces --features l2
 
       - name: Doc build
-        run: cargo doc -p ndn-face-l2 --no-deps
+        run: cargo doc -p ndn-faces --features l2 --no-deps
