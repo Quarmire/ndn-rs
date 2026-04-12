@@ -10,15 +10,20 @@ Dependencies flow strictly downward; no layer may import from a layer above it.
 ```
 binaries/                      Deployable executables
   ndn-fwd                      Standalone forwarder (TOML config, management socket)
-  ndn-tools                    CLI tools: ndn-peek, ndn-put, ndn-ping, ndn-iperf, …
+  ndn-tools                    CLI tools: ndn-peek, ndn-put, ndn-ping, ndn-iperf, ndn-sec, …
   ndn-bench                    Throughput and latency benchmarks
+
+testbed/                       Multi-forwarder compliance + benchmark testbed
+  docker-compose.yml           ndn-fwd + NFD + yanfd on 172.30.0.0/24
+  tests/compliance/            Protocol compliance tests (forwarding, PIT, CS, mgmt)
+  bench/                       Throughput (ndn-iperf) and latency (ndn-ping) scripts
+  report/compare.py            Markdown comparison table generator
 
 tools/
   ndn-dashboard                Dioxus desktop management UI
 
 crates/support/                Shared libraries used by binaries and dashboard
   ndn-tools-core               Embeddable tool logic (ping, iperf, peek, put)
-  ndn-filestore                Named chunked-file storage and retrieval
 
 crates/protocols/              Higher-level protocols built on the engine
   ndn-routing                  Routing algorithms: StaticProtocol, DvrProtocol (DVR)
