@@ -26,10 +26,10 @@ use std::sync::Arc;
 use anyhow::Result;
 use smallvec::SmallVec;
 
+use ndn_engine::pipeline::ForwardingAction;
 use ndn_engine::stages::ErasedStrategy;
 use ndn_engine::{ComposedStrategy, EngineBuilder, EngineConfig};
 use ndn_packet::Name;
-use ndn_engine::pipeline::ForwardingAction;
 use ndn_strategy::{
     BestRouteStrategy, LinkQualitySnapshot, RssiFilter, StrategyContext, StrategyFilter,
 };

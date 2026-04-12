@@ -22,9 +22,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::Result;
 use smallvec::{SmallVec, smallvec};
 
+use ndn_engine::pipeline::{ForwardingAction, NackReason};
 use ndn_engine::{EngineBuilder, EngineConfig};
 use ndn_packet::Name;
-use ndn_engine::pipeline::{ForwardingAction, NackReason};
 use ndn_strategy::{Strategy, StrategyContext};
 
 // ─── Custom strategy implementation ──────────────────────────────────────────
