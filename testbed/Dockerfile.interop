@@ -7,28 +7,26 @@
 FROM ubuntu:24.04 AS ndn-cxx-builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential cmake pkg-config \
+    build-essential pkg-config python3 \
     libboost-all-dev libssl-dev libsqlite3-dev \
     libpcap-dev \
     ca-certificates curl git \
     && rm -rf /var/lib/apt/lists/*
 
-# ndn-cxx + ndn-tools
+# ndn-cxx 0.9.0 + ndn-tools 0.7.1 — latest 0.x tagged releases (waf build)
 RUN git clone --depth 1 --branch ndn-cxx-0.9.0 \
       https://github.com/named-data/ndn-cxx.git /src/ndn-cxx && \
-    cmake -S /src/ndn-cxx -B /build/ndn-cxx \
-      -DCMAKE_BUILD_TYPE=Release \
-      -DCMAKE_INSTALL_PREFIX=/usr/local && \
-    cmake --build /build/ndn-cxx -j"$(nproc)" && \
-    cmake --install /build/ndn-cxx
+    cd /src/ndn-cxx && \
+    ./waf configure --prefix=/usr/local && \
+    ./waf build -j"$(nproc)" && \
+    ./waf install
 
-RUN git clone --depth 1 --branch ndn-tools-24.07 \
+RUN git clone --depth 1 --branch ndn-tools-0.7.1 \
       https://github.com/named-data/ndn-tools.git /src/ndn-tools && \
-    cmake -S /src/ndn-tools -B /build/ndn-tools \
-      -DCMAKE_BUILD_TYPE=Release \
-      -DCMAKE_INSTALL_PREFIX=/usr/local && \
-    cmake --build /build/ndn-tools -j"$(nproc)" && \
-    cmake --install /build/ndn-tools
+    cd /src/ndn-tools && \
+    ./waf configure --prefix=/usr/local && \
+    ./waf build -j"$(nproc)" && \
+    ./waf install
 
 # ── ndn-rs tools builder ──────────────────────────────────────────────────────
 FROM rust:slim AS ndn-rs-builder
