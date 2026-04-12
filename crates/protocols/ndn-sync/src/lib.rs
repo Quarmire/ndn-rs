@@ -33,4 +33,4 @@ pub mod psync_sync;
 
 pub use protocol::{SyncError, SyncHandle, SyncUpdate};
 pub use psync_sync::{PSyncConfig, join_psync_group};
-pub use svs_sync::{SvsConfig, join_svs_group};
+pub use svs_sync::{RetryPolicy, SvsConfig, fetch_with_retry, join_svs_group};

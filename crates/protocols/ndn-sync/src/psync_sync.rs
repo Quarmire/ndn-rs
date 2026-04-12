@@ -101,7 +101,7 @@ async fn psync_task(
     group: Name,
     send: mpsc::Sender<Bytes>,
     mut recv: mpsc::Receiver<Bytes>,
-    mut publish_rx: mpsc::Receiver<Name>,
+    mut publish_rx: mpsc::Receiver<(Name, Option<bytes::Bytes>)>,
     update_tx: mpsc::Sender<SyncUpdate>,
     config: PSyncConfig,
     cancel: CancellationToken,
@@ -139,6 +139,7 @@ async fn psync_task(
                                 name: group.clone().append(format!("{hash:016x}")),
                                 low_seq: 0,
                                 high_seq: 0,
+                                mapping: None,
                             };
                             let _ = update_tx.send(update).await;
                         }
@@ -155,9 +156,10 @@ async fn psync_task(
                 }
             }
 
-            Some(_pub_name) = publish_rx.recv() => {
+            Some((pub_name, _mapping)) = publish_rx.recv() => {
                 // Local publication: hash the name and insert into the IBF.
-                let hash = hash_name(&_pub_name);
+                // Mapping metadata is a SVS-only feature; PSync ignores it.
+                let hash = hash_name(&pub_name);
                 node.insert(hash);
                 // Immediately send updated IBF.
                 let ibf = node.build_ibf();
