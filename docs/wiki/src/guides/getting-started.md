@@ -23,29 +23,50 @@ tokio   = { version = "1", features = ["full"] }
 ## Mode 1: Embedded (in-process forwarder)
 
 No external router needed — ideal for testing, mobile apps, and embedded targets.
+The engine runs inside your process; `InProcFace` pairs replace IPC.
 
 ```rust
-use ndn_app::{EmbeddedRouter, Consumer, Producer, AppError};
-use ndn_packet::Name;
+use ndn_app::{Consumer, EngineBuilder, Producer};
+use ndn_engine::EngineConfig;
+use ndn_faces::local::InProcFace;
+use ndn_packet::{Name, encode::DataBuilder};
+use ndn_transport::FaceId;
 
 #[tokio::main]
-async fn main() -> Result<(), AppError> {
-    // Spin up an in-process forwarder.
-    let router = EmbeddedRouter::start().await?;
+async fn main() -> anyhow::Result<()> {
+    // 1. Create in-process face pairs: one for the consumer, one for the producer.
+    let (consumer_face, consumer_handle) = InProcFace::new(FaceId(1), 64);
+    let (producer_face, producer_handle) = InProcFace::new(FaceId(2), 64);
 
-    // Producer: register /hello and serve Data on request.
-    let mut producer = router.producer("/hello").await?;
+    // 2. Build the forwarding engine with both faces.
+    let (engine, shutdown) = EngineBuilder::new(EngineConfig::default())
+        .face(consumer_face)
+        .face(producer_face)
+        .build()
+        .await?;
+
+    // 3. Route Interests for /hello → the producer face.
+    let prefix: Name = "/hello".parse()?;
+    engine.fib().add_nexthop(&prefix, FaceId(2), 0);
+
+    // 4. Producer: serve Data on request.
+    let producer = Producer::from_handle(producer_handle, prefix.clone());
     tokio::spawn(async move {
-        producer.serve(|_interest, responder| async move {
-            responder.respond_bytes(b"Hello, NDN!".to_vec().into()).await.ok();
-        }).await;
+        producer.serve(|interest, responder| {
+            let name = (*interest.name).clone();
+            async move {
+                let wire = DataBuilder::new(name, b"Hello, NDN!").build();
+                responder.respond_bytes(wire).await.ok();
+            }
+        }).await
     });
 
-    // Consumer: fetch /hello/world.
-    let consumer = router.consumer().await?;
-    let data = consumer.fetch(&"/hello/world".parse::<Name>().unwrap()).await?;
+    // 5. Consumer: fetch /hello/world.
+    let mut consumer = Consumer::from_handle(consumer_handle);
+    let data = consumer.fetch("/hello/world").await?;
     println!("Received: {:?}", data.content());
 
+    shutdown.shutdown().await;
     Ok(())
 }
 ```

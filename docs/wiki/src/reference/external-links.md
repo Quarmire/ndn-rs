@@ -8,10 +8,15 @@
 
 ## Specifications
 
-- [RFC 8569: NDN Forwarding Semantics](https://datatracker.ietf.org/doc/rfc8569/) -- forwarding behavior, PIT/FIB/CS semantics, Nack handling
-- [RFC 8609: NDN TLV Wire Format](https://datatracker.ietf.org/doc/rfc8609/) -- TLV encoding rules, packet format, type assignments
-- [NDN Packet Format Specification](https://docs.named-data.net/NDN-packet-spec/current/) -- canonical reference for Interest, Data, and LpPacket encoding (updated more frequently than the RFCs)
-- [NDN Certificate Format](https://docs.named-data.net/NDN-packet-spec/current/certificate.html) -- certificate naming convention, content format, validity period
+> **Note:** RFC 8569 and RFC 8609 are **CCNx** specifications (Content-Centric
+> Networking, a related but distinct architecture). They are not NDN
+> specifications. NDN specs are published by the named-data.net project.
+
+- [NDN Packet Format v0.3](https://docs.named-data.net/NDN-packet-spec/current/) -- canonical TLV encoding for Interest, Data, and LpPacket; type assignments
+- [NDN Architecture (NDN-0001)](https://named-data.net/techreports/) -- forwarding semantics, PIT/FIB/CS behaviour, Nack handling
+- [NDNLPv2 Link Protocol](https://redmine.named-data.net/projects/nfd/wiki/NDNLPv2) -- fragmentation, reliability, congestion marking
+- [NDN Certificate Format v2](https://docs.named-data.net/NDN-packet-spec/current/certificate.html) -- certificate naming convention, content format, validity period
+- [NDNCERT 0.3](https://github.com/named-data/ndncert/blob/master/docs/NDNCERT-protocol-0.3.pdf) -- automated certificate issuance protocol
 
 ## Reference Implementations
 

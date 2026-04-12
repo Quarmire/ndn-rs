@@ -79,10 +79,10 @@ On NixOS, `/` is read-only and `DynamicUser = true` is incompatible with
 persistent key storage.  The ndn-rs NixOS module handles this automatically:
 
 ```nix
-services.ndn-router = {
+services.ndn-fwd = {
   enable = true;
   identity         = "/mynet/myhost";   # key name
-  pibPath          = null;              # defaults to /var/lib/ndn-router/pib
+  pibPath          = null;              # defaults to /var/lib/ndn-fwd/pib
   generateIdentity = true;              # run ndn-sec keygen on every boot (idempotent)
 };
 ```
@@ -90,14 +90,14 @@ services.ndn-router = {
 With `generateIdentity = true`, the service runs:
 
 ```
-ndn-sec --pib /var/lib/ndn-router/pib keygen --anchor --skip-if-exists /mynet/myhost
+ndn-sec --pib /var/lib/ndn-fwd/pib keygen --anchor --skip-if-exists /mynet/myhost
 ```
 
 before starting `ndn-fwd`.  This is idempotent — if the key already exists
 the step is a no-op.  Keys are persisted in
-`/var/lib/ndn-router/pib/` (the `StateDirectory`), which survives reboots.
+`/var/lib/ndn-fwd/pib/` (the `StateDirectory`), which survives reboots.
 
-The module creates a stable `ndn-router` user and group to own the state
+The module creates a stable `ndn-fwd` user and group to own the state
 directory and run the service.
 
 ## Configuration reference

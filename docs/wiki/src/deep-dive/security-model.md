@@ -162,6 +162,7 @@ ndn-rs ships two signer implementations:
 |-----------|--------|---------------|----------|
 | Ed25519 | `Ed25519Signer` | 64 bytes | Default for all Data packets |
 | HMAC-SHA256 | `HmacSh256Signer` | 32 bytes | Pre-shared key authentication (~10x faster) |
+| BLAKE3 | `Blake3Signer` | 32 bytes | High-throughput; experimental type code 6 (not yet in NDN Packet Format spec) |
 
 Both implement `sign_sync` for a CPU-only fast path -- no async state machine overhead when the operation is pure computation.
 
@@ -281,7 +282,7 @@ println!("{}", rule.to_string());
 
 ### Configuring rules in the router TOML
 
-Add `[[security.rule]]` sections to `ndn-router.toml`. Rules are loaded at
+Add `[[security.rule]]` sections to `ndn-fwd.toml`. Rules are loaded at
 startup and added to the active schema on top of whatever the `profile` setting
 implies:
 
