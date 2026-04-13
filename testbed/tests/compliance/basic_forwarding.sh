@@ -34,7 +34,7 @@ wait "${SRV_PID}" 2>/dev/null || true
 echo "${OUTPUT}"
 
 # Verify non-zero throughput was reported.
-if echo "${OUTPUT}" | grep -qE 'throughput|Mbps|kbps|[1-9][0-9]* Data'; then
+if echo "${OUTPUT}" | grep -qE 'throughput|Gbps|Mbps|Kbps|kbps|[1-9][0-9]* Data'; then
   echo "[${LABEL}] PASS: basic_forwarding"
   exit 0
 else

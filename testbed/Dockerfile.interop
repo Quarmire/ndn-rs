@@ -52,11 +52,17 @@ RUN cargo build --release \
 # ── Final image ───────────────────────────────────────────────────────────────
 FROM ubuntu:24.04
 
-# Runtime libs for ndn-cxx
+# Runtime libs for ndn-cxx tools.
+# Install all boost 1.83 runtime packages required by ndn-cxx/ndn-tools.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libboost-filesystem1.83.0 \
     libboost-program-options1.83.0 \
     libboost-log1.83.0 \
+    libboost-chrono1.83.0 \
+    libboost-thread1.83.0 \
+    libboost-atomic1.83.0 \
+    libboost-date-time1.83.0 \
+    libboost-regex1.83.0 \
     libssl3 libsqlite3-0 libpcap0.8 \
     nodejs npm \
     ca-certificates \
