@@ -47,8 +47,10 @@ run_test() {
     echo "[${scenario}] SKIP: ${desc}  (${ERR})" | tee -a "${REPORT}"
     SKIP=$(( SKIP + 1 ))
   else
-    ERR=$(tail -1 /tmp/interop-err)
-    echo "[${scenario}] FAIL: ${desc}  (${ERR})" | tee -a "${REPORT}"
+    # Capture up to 10 lines of stderr for context; collapse newlines into one line.
+    ERR=$(tail -10 /tmp/interop-err | tr '\n' '|' | sed 's/|$//')
+    echo "[${scenario}] FAIL: ${desc}" | tee -a "${REPORT}"
+    echo "  stderr: ${ERR}" | tee -a "${REPORT}"
     FAIL=$(( FAIL + 1 ))
   fi
 }

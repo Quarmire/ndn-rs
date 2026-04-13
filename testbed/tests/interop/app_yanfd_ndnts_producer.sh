@@ -25,7 +25,11 @@ sleep 1  # allow registration
 # component produced by ndncat, then fetches seg=0.
 RESULT=$(ndn-peek --pipeline 1 "${PREFIX}" \
   --face-socket "${YANFD_SOCK}" --no-shm \
-  --lifetime 4000 2>&1)
+  --lifetime 4000) || {
+  echo "ndn-peek failed (exit $?): ${RESULT}" >&2
+  kill "${SRV_PID}" 2>/dev/null || true
+  exit 1
+}
 
 kill "${SRV_PID}" 2>/dev/null || true
 echo "${RESULT}" | grep -q "${CONTENT}"
