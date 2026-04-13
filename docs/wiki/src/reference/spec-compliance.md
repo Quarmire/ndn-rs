@@ -77,7 +77,7 @@ All network faces use NDNLPv2 LpPacket framing (type 0x64). Fully implemented:
 - **Unix socket** — local IPC
 - **Shared memory (SHM)** — zero-copy ring for same-host apps
 - **Serial/UART** — COBS framing over tokio-serial
-- **Bluetooth LE** — NDNts/esp8266ndn-compatible GATT server (`bluetooth` feature, Linux/BlueZ); Service UUID `099577e3-0788-412a-8824-395084d97391`; NDNts fragmentation scheme; interoperable with Web Bluetooth API and ESP32 devices
+- **Bluetooth LE** — NDNts/esp8266ndn-compatible GATT server (`bluetooth` feature, Linux/BlueZ and macOS/CoreBluetooth); Service UUID `099577e3-0788-412a-8824-395084d97391`, CS `cc5abb89-a541-46d8-a351-2f95a6a81f49` (client→server write), SC `972f9527-0d83-4261-b95d-b1b2fc73bde4` (server→client notify); oversized packets are fragmented via NDNLPv2 at the Face layer — the BLE protocol itself defines no framing, matching NDNts and esp8266ndn exactly; interoperable with Web Bluetooth API and ESP32 devices
 
 ### Management
 
