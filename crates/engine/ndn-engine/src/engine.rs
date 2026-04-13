@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -9,6 +9,7 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use ndn_packet::Interest;
+use ndn_packet::lp::encode_lp_packet;
 use ndn_security::{SecurityManager, Validator};
 use ndn_store::{ErasedContentStore, Pit, PitToken, StrategyTable};
 use ndn_strategy::MeasurementsTable;
@@ -68,6 +69,14 @@ pub struct FaceState {
     /// NDNLPv2 per-hop reliability state (unicast UDP faces only).
     #[cfg(feature = "face-net")]
     pub reliability: Option<std::sync::Mutex<ndn_faces::net::reliability::LpReliability>>,
+    /// NDNLPv2 link mode: auto-detected at the face I/O layer when the remote
+    /// peer sends LP-wrapped packets (type 0x64).  Once set, the face sender
+    /// wraps all outgoing bare NDN packets in a minimal LpPacket so that
+    /// NDNLPv2-native peers (e.g. NDNts) can parse them.
+    ///
+    /// This mirrors NFD's `GenericLinkService` behavior: LP encoding is a
+    /// per-link property determined by what the peer sends, not by face kind.
+    pub uses_lp: AtomicBool,
 }
 
 impl FaceState {
@@ -88,6 +97,7 @@ impl FaceState {
             send_tx,
             #[cfg(feature = "face-net")]
             reliability: None,
+            uses_lp: AtomicBool::new(false),
         }
     }
 
@@ -112,6 +122,7 @@ impl FaceState {
             reliability: Some(std::sync::Mutex::new(
                 ndn_faces::net::reliability::LpReliability::new(mtu),
             )),
+            uses_lp: AtomicBool::new(false),
         }
     }
 
@@ -560,8 +571,21 @@ pub(crate) async fn run_face_sender(
                         }
                     }
                 } else {
-                    // Non-reliability path: send directly.
-                    if let Err(e) = face.send_bytes(pkt).await
+                    // Non-reliability path.
+                    // If the peer uses NDNLPv2 (auto-detected by run_face_reader when
+                    // the first LP-wrapped packet arrives), wrap outgoing packets in a
+                    // minimal LpPacket so the peer can parse them.  encode_lp_packet is
+                    // idempotent: LP-already-wrapped Nacks pass through unchanged.
+                    let wire = if face_states
+                        .get(&face_id)
+                        .map(|s| s.uses_lp.load(Ordering::Relaxed))
+                        .unwrap_or(false)
+                    {
+                        encode_lp_packet(&pkt)
+                    } else {
+                        pkt
+                    };
+                    if let Err(e) = face.send_bytes(wire).await
                         && handle_send_error(e)
                     {
                         return;

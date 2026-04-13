@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tracing::{debug, trace, warn};
 
+use ndn_packet::lp::is_lp_packet;
 use ndn_transport::{FaceAddr, FaceError, FaceKind, FacePersistency};
 
 use super::{FaceRunnerCtx, InboundPacket};
@@ -101,6 +102,19 @@ pub(crate) async fn run_face_reader(
                 if track_activity && let Some(state) = face_states.get(&face_id) {
                     state.last_activity.store(arrival, Ordering::Relaxed);
                 }
+                // NDNLPv2 link-mode detection: if the peer sends an LP-wrapped
+                // packet (type 0x64), mark this face so the sender can LP-wrap
+                // outgoing packets symmetrically.  This follows NFD's
+                // GenericLinkService behavior — LP encoding is a per-link
+                // property determined by what the peer sends.
+                if is_lp_packet(&raw)
+                    && let Some(state) = face_states.get(&face_id)
+                    && !state.uses_lp.load(Ordering::Relaxed)
+                {
+                    state.uses_lp.store(true, Ordering::Relaxed);
+                    trace!(face=%face_id, "face-reader: LP-mode detected, enabling LP encode for outgoing");
+                }
+
                 // Build InboundMeta from the link-layer source address when
                 // the face exposed it (e.g. MulticastUdpFace, NamedEtherFace).
                 // Flows through InboundPacket into process_packet where
