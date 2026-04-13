@@ -66,7 +66,7 @@ COPY --from=ndn-cxx-builder /usr/local/bin/ndnpeek   /usr/local/bin/
 COPY --from=ndn-cxx-builder /usr/local/bin/ndnpoke   /usr/local/bin/
 COPY --from=ndn-cxx-builder /usr/local/bin/ndnping   /usr/local/bin/
 COPY --from=ndn-cxx-builder /usr/local/lib/           /usr/local/lib/
-RUN ldconfig
+RUN echo "/usr/local/lib" > /etc/ld.so.conf.d/usr-local.conf && ldconfig
 
 # NDNts CLI tools
 RUN npm install -g @ndn/cli 2>/dev/null || \
