@@ -60,7 +60,11 @@ All network faces use NDNLPv2 LpPacket framing (type 0x64). Fully implemented:
 
 - **Ed25519** — type code 5 per spec; sign and verify end-to-end
 - **HMAC-SHA256** — symmetric signing for high-throughput use cases
-- **BLAKE3 digest** — experimental type code 6 (NDA extension, pending NDN spec assignment); `Blake3Signer` / `Blake3DigestVerifier` / `Blake3KeyedSigner` / `Blake3KeyedVerifier` — 3–8× faster than SHA-256 on SIMD CPUs
+- **BLAKE3** — two **distinct** experimental type codes pending reservation on the [NDN TLV SignatureType registry](https://redmine.named-data.net/projects/ndn-tlv/wiki/SignatureType):
+  - **Plain BLAKE3 digest** (type 6) — `Blake3Signer` / `Blake3DigestVerifier`; analogous to `DigestSha256` (type 0). Provides integrity and self-certifying naming but **no authentication** — anyone can produce a valid signature.
+  - **Keyed BLAKE3** (type 7) — `Blake3KeyedSigner` / `Blake3KeyedVerifier`; analogous to `SignatureHmacWithSha256` (type 4). Requires a 32-byte shared secret; provides both integrity and authentication.
+  - Rationale for distinct codes: sharing one code between plain and keyed modes enables a downgrade substitution attack where an attacker strips the keyed signature and replaces it with a plain BLAKE3 digest over their forged content — on the wire both look identical, and a verifier dispatching on type code alone would accept the forgery. Using two codes mirrors the existing NDN pattern (`DigestSha256` vs. `HmacWithSha256`).
+  - BLAKE3 is 3–8× faster than SHA-256 on modern SIMD CPUs.
 - **Signed Interests** — InterestSignatureInfo/InterestSignatureValue with anti-replay fields
 - **Trust chain validation** — `Validator::validate_chain()` walks Data → cert → trust anchor; cycle detection; configurable depth limit; `CertFetcher` deduplicates concurrent cert requests
 - **Certificate TLV format** — `Certificate::decode()` parses ValidityPeriod (0xFD) with NotBefore/NotAfter; certificate time validity enforced; `AdditionalDescription` TLV constants defined
