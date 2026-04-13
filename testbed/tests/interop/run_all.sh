@@ -37,8 +37,8 @@ run_test() {
   local script="$3"
   shift 3
 
-  bash "${SCRIPT_DIR}/${script}" "$@" 2>/tmp/interop-err
-  local EXIT=$?
+  local EXIT=0
+  bash "${SCRIPT_DIR}/${script}" "$@" 2>/tmp/interop-err || EXIT=$?
   if [ "${EXIT}" -eq 0 ]; then
     echo "[${scenario}] PASS: ${desc}" | tee -a "${REPORT}"
     PASS=$(( PASS + 1 ))
