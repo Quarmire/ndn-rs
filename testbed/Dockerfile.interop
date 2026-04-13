@@ -1,9 +1,9 @@
 # Interoperability test client image.
 #
 # Contains:
-#   - ndn-cxx tools: ndnpeek, ndnpoke, ndnping, ndnsec
+#   - ndn-cxx tools: ndnpeek, ndnpoke, ndnping, nfdc
 #   - NDNts CLI: ndncat (from @ndn/cat)
-#   - ndn-rs tools (built from source): ndn-peek, ndn-put, ndn-ping, ndn-iperf
+#   - ndn-rs tools (built from source): ndn-peek, ndn-put, ndn-ping, ndn-iperf, ndn-ctl
 FROM ubuntu:24.04 AS ndn-cxx-builder
 
 # ndn-cxx deps (per named-data getting started guide)
@@ -47,7 +47,8 @@ RUN cargo build --release \
     --bin ndn-peek \
     --bin ndn-put \
     --bin ndn-ping \
-    --bin ndn-iperf
+    --bin ndn-iperf \
+    --bin ndn-ctl
 
 # ── Final image ───────────────────────────────────────────────────────────────
 FROM ubuntu:24.04
@@ -75,6 +76,8 @@ RUN --mount=type=bind,from=ndn-cxx-builder,source=/,target=/builder \
 COPY --from=ndn-cxx-builder /usr/bin/ndnpeek   /usr/local/bin/
 COPY --from=ndn-cxx-builder /usr/bin/ndnpoke   /usr/local/bin/
 COPY --from=ndn-cxx-builder /usr/bin/ndnping   /usr/local/bin/
+# nfdc — NFD management CLI; sends unsigned dataset queries required by yanfd/NFD.
+COPY --from=ndn-cxx-builder /usr/bin/nfdc      /usr/local/bin/
 
 # ndn-cxx shared library — find wherever waf installed it in the builder and
 # copy to /usr/lib/ (always in ldconfig search path).  Fail the build loudly
@@ -101,6 +104,7 @@ COPY --from=ndn-rs-builder /build/target/release/ndn-peek  /usr/local/bin/
 COPY --from=ndn-rs-builder /build/target/release/ndn-put   /usr/local/bin/
 COPY --from=ndn-rs-builder /build/target/release/ndn-ping  /usr/local/bin/
 COPY --from=ndn-rs-builder /build/target/release/ndn-iperf /usr/local/bin/
+COPY --from=ndn-rs-builder /build/target/release/ndn-ctl   /usr/local/bin/
 
 COPY testbed/tests/interop/ /testbed/tests/interop/
 RUN chmod +x /testbed/tests/interop/*.sh
