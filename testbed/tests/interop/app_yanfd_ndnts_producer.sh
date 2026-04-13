@@ -21,7 +21,7 @@ NDNTS_ERR=$(mktemp)
 echo -n "${CONTENT}" | NDNTS_UPLINK="unix://${YANFD_SOCK}" \
   ndncat put-segmented "${PREFIX}" 2>"${NDNTS_ERR}" &
 SRV_PID=$!
-sleep 1  # allow registration
+sleep 2  # allow registration + yanfd RIB propagation
 
 # Check whether ndncat exited prematurely (registration failure).
 if ! kill -0 "${SRV_PID}" 2>/dev/null; then
