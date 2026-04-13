@@ -40,6 +40,8 @@ The baseline. An application connects to the router's IPC socket (`/tmp/ndn.sock
 
 The control channel is always a socket, even when the data plane uses a faster transport. Management commands (create face, register prefix, query status) flow over this socket using the NFD management protocol: the application sends an Interest for a name like `/localhost/nfd/rib/register/<parameters>` and receives a Data packet containing a `ControlResponse`.
 
+**NDNLPv2 framing.** External forwarders (NFD, yanfd/ndnd) use NDNLPv2 (LP) framing on all their Unix socket faces — they reject bare TLV packets silently. `ForwarderClient` and `MgmtClient` therefore wrap all outgoing packets in a minimal `LpPacket` (type `0x64`) before sending, and strip LP from received packets via `strip_lp`. The wrapping is idempotent — packets that are already LP-wrapped pass through unchanged. ndn-fwd (our own forwarder) accepts both LP and bare TLV, so this is compatible in all deployment configurations.
+
 > **📊 Performance.** Unix sockets are fast for control traffic, but each packet crosses the kernel twice (send buffer, receive buffer) and requires at least one context switch. At high packet rates (100K+ pps), the kernel copy cost dominates. For a 1 KB Interest, the round trip through the kernel adds roughly 1.5-2 us on Linux.
 
 This tier works everywhere and requires no special setup. It is the automatic fallback when shared memory is unavailable.
