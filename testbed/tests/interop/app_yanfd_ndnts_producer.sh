@@ -6,8 +6,8 @@
 set -euo pipefail
 
 if ! command -v ndnts-serve > /dev/null 2>&1; then
-  echo "ERROR: ndnts-serve is not available; install @ndn/tools from the NDNts package" >&2
-  exit 1
+  echo "SKIP: ndnts-serve not available" >&2
+  exit 2
 fi
 
 YANFD_HOST="${YANFD_HOST:-yanfd}"

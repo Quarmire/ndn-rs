@@ -16,11 +16,11 @@ ndn-put "${PREFIX}" "${TMP}" \
   --face-socket "${FWD_SOCK}" --no-shm \
   --freshness 5000 --timeout 10 &
 PUT_PID=$!
-rm -f "${TMP}"
 sleep 0.5
 
 RESULT=$(NDN_CLIENT_TRANSPORT="udp4://${FWD_HOST}:6363" \
   ndnpeek --timeout 4000 "${PREFIX}/test" 2>&1)
 
 kill "${PUT_PID}" 2>/dev/null || true
+rm -f "${TMP}"
 echo "${RESULT}" | grep -q "${CONTENT}"

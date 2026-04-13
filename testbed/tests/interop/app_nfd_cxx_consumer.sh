@@ -15,11 +15,11 @@ ndn-put "${PREFIX}" "${TMP}" \
   --face-socket "${NFD_SOCK}" --no-shm \
   --freshness 5000 --timeout 10 &
 PUT_PID=$!
-rm -f "${TMP}"
 sleep 0.5
 
 RESULT=$(NDN_CLIENT_TRANSPORT="unix://${NFD_SOCK}" \
   ndnpeek --timeout 4000 "${PREFIX}/test" 2>&1)
 
 kill "${PUT_PID}" 2>/dev/null || true
+rm -f "${TMP}"
 echo "${RESULT}" | grep -q "${CONTENT}"

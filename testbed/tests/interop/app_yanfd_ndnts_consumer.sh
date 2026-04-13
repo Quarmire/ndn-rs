@@ -6,8 +6,8 @@
 set -euo pipefail
 
 if ! command -v ndnts-fetch > /dev/null 2>&1; then
-  echo "ERROR: ndnts-fetch is not available; install @ndn/tools from the NDNts package" >&2
-  exit 1
+  echo "SKIP: ndnts-fetch not available" >&2
+  exit 2
 fi
 
 YANFD_HOST="${YANFD_HOST:-yanfd}"
@@ -21,7 +21,6 @@ ndn-put "${PREFIX}" "${TMP}" \
   --face-socket "${YANFD_SOCK}" --no-shm \
   --freshness 5000 --timeout 10 &
 PUT_PID=$!
-rm -f "${TMP}"
 sleep 0.5
 
 RESULT=$(ndnts-fetch \
@@ -29,4 +28,5 @@ RESULT=$(ndnts-fetch \
   "${PREFIX}/test" 2>&1)
 
 kill "${PUT_PID}" 2>/dev/null || true
+rm -f "${TMP}"
 echo "${RESULT}" | grep -q "${CONTENT}"

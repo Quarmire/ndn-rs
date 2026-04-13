@@ -67,11 +67,20 @@ COPY --from=ndn-cxx-builder /usr/bin/ndnpeek   /usr/local/bin/
 COPY --from=ndn-cxx-builder /usr/bin/ndnpoke   /usr/local/bin/
 COPY --from=ndn-cxx-builder /usr/bin/ndnping   /usr/local/bin/
 
-# ndn-cxx shared library — from /usr/lib (prefix=/usr; always in ldconfig path)
-# Copy all libndn-cxx*.so* files regardless of multiarch subdir placement.
-RUN --mount=from=ndn-cxx-builder,target=/builder \
-    find /builder/usr/lib -name 'libndn-cxx*.so*' -exec cp {} /usr/lib/ \; && \
-    ldconfig
+# ndn-cxx shared library — find wherever waf installed it in the builder and
+# copy to /usr/lib/ (always in ldconfig search path).  Fail the build loudly
+# if the library is missing so we get a clear signal, not a silent runtime error.
+RUN --mount=type=bind,from=ndn-cxx-builder,source=/,target=/builder \
+    sh -c ' \
+      LIB=$(find /builder -name "libndn-cxx.so.0.9.0" -type f 2>/dev/null | head -1); \
+      if [ -z "${LIB}" ]; then \
+        echo "BUILD ERROR: libndn-cxx.so.0.9.0 not found anywhere in builder" >&2; \
+        find /builder/usr -name "libndn-cxx*" 2>/dev/null; \
+        exit 1; \
+      fi; \
+      echo "Found library at: ${LIB}"; \
+      cp "${LIB}" /usr/lib/; \
+    ' && ldconfig
 
 # NDNts CLI tools
 RUN npm install -g @ndn/cli 2>/dev/null || \

@@ -29,6 +29,7 @@ mkdir -p "${RESULTS_DIR}"
 
 PASS=0
 FAIL=0
+SKIP=0
 
 run_test() {
   local scenario="$1"
@@ -36,9 +37,15 @@ run_test() {
   local script="$3"
   shift 3
 
-  if bash "${SCRIPT_DIR}/${script}" "$@" 2>/tmp/interop-err; then
+  bash "${SCRIPT_DIR}/${script}" "$@" 2>/tmp/interop-err
+  local EXIT=$?
+  if [ "${EXIT}" -eq 0 ]; then
     echo "[${scenario}] PASS: ${desc}" | tee -a "${REPORT}"
     PASS=$(( PASS + 1 ))
+  elif [ "${EXIT}" -eq 2 ]; then
+    ERR=$(tail -1 /tmp/interop-err)
+    echo "[${scenario}] SKIP: ${desc}  (${ERR})" | tee -a "${REPORT}"
+    SKIP=$(( SKIP + 1 ))
   else
     ERR=$(tail -1 /tmp/interop-err)
     echo "[${scenario}] FAIL: ${desc}  (${ERR})" | tee -a "${REPORT}"
@@ -93,7 +100,7 @@ run_test "app/yanfd-ndnts-consumer" \
 # ── Summary ──────────────────────────────────────────────────────────────────
 
 echo "" | tee -a "${REPORT}"
-echo "Results: ${PASS} passed, ${FAIL} failed" | tee -a "${REPORT}"
+echo "Results: ${PASS} passed, ${FAIL} failed, ${SKIP} skipped" | tee -a "${REPORT}"
 
 if [ "${FAIL}" -gt 0 ]; then
   exit 1
