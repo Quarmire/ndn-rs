@@ -569,7 +569,10 @@ mod tests {
         });
         let raw = w.finish();
         let i = Interest::decode(raw).expect("should accept despite wrong digest");
-        assert_eq!(i.app_parameters().map(|b| b.as_ref()), Some(b"hello".as_ref()));
+        assert_eq!(
+            i.app_parameters().map(|b| b.as_ref()),
+            Some(b"hello".as_ref())
+        );
     }
 
     #[test]
@@ -585,7 +588,10 @@ mod tests {
         });
         let raw = w.finish();
         let i = Interest::decode(raw).expect("should accept without digest component");
-        assert_eq!(i.app_parameters().map(|b| b.as_ref()), Some(b"hello".as_ref()));
+        assert_eq!(
+            i.app_parameters().map(|b| b.as_ref()),
+            Some(b"hello".as_ref())
+        );
     }
 
     #[test]

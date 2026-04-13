@@ -202,16 +202,15 @@ pub async fn run_producer(params: PutParams, tx: mpsc::Sender<ToolEvent>) -> Res
             None => continue,
         };
 
-        // For discovery (CanBePrefix) Interests — no SegmentNameComponent in the
-        // Interest name — respond with the versioned name ONLY (no segment
-        // appended).  Consumers such as NDNts's discoverVersion see
-        // VersionNameComponent as the last component and can extract the version
-        // correctly.  Subsequent Interests that include an explicit segment
-        // number (comps[4].is_segment()) get the normal versioned+segment name.
+        // Build the Data name.  For explicit-segment Interests use the Interest
+        // name as-is.  For CanBePrefix discovery Interests (no SegmentNameComponent
+        // in the name) append segment 0 under the versioned prefix, matching
+        // ndn-cxx ndnputchunks behaviour.  NDNts get-segmented --ver=cbp then
+        // finds the VersionNameComponent at name[-2] (before the segment).
         let data_name = if last_is_seg.is_some() {
             (*interest.name).clone()
         } else {
-            served_prefix.clone()
+            served_prefix.clone().append_segment(seg_idx as u64)
         };
         let data_name_str = data_name.to_string();
 
