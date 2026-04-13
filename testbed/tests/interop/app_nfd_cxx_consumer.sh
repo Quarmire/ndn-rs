@@ -18,7 +18,12 @@ PUT_PID=$!
 sleep 0.5
 
 RESULT=$(NDN_CLIENT_TRANSPORT="unix://${NFD_SOCK}" \
-  ndnpeek --prefix --timeout 4000 "${PREFIX}" 2>&1)
+  ndnpeek --prefix --timeout 4000 "${PREFIX}") || {
+  echo "ndnpeek failed (exit $?)." >&2
+  kill "${PUT_PID}" 2>/dev/null || true
+  rm -f "${TMP}"
+  exit 1
+}
 
 kill "${PUT_PID}" 2>/dev/null || true
 rm -f "${TMP}"
