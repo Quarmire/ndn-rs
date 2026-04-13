@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Interop: ndn-rs consumer ← ndn-fwd → NDNts producer.
 #
-# 1. NDNts ndncat registers /interop/ndnts-producer on ndn-fwd and serves Data.
+# 1. NDNts ndncat registers /interop/ndnts-producer on ndn-fwd via Unix socket.
 # 2. ndn-rs ndn-peek fetches it via the ndn-fwd Unix socket using segmented fetch
 #    (CanBePrefix discovery → version component → seg=0).
 set -euo pipefail
@@ -11,14 +11,13 @@ if ! command -v ndncat > /dev/null 2>&1; then
   exit 2
 fi
 
-FWD_HOST="${FWD_HOST:-ndn-fwd}"
 FWD_SOCK="${FWD_SOCK:-/run/ndn-fwd/ndn-fwd.sock}"
 PREFIX="/interop/ndnts-producer"
 CONTENT="hello-from-ndnts"
 
 # ndncat put-segmented reads payload from stdin, inserts a version component,
 # registers the prefix, and serves segment Interests reactively.
-echo -n "${CONTENT}" | NDNTS_UPLINK="udp4://${FWD_HOST}:6363" \
+echo -n "${CONTENT}" | NDNTS_UPLINK="unix://${FWD_SOCK}" \
   ndncat put-segmented "${PREFIX}" &
 SRV_PID=$!
 sleep 1  # allow registration

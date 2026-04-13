@@ -2,7 +2,7 @@
 # Interop: NDNts consumer → yanfd → ndn-rs producer.
 #
 # ndn-rs producer registers on the yanfd Unix socket and serves Data.
-# NDNts ndncat fetches it via yanfd using CanBePrefix version discovery.
+# NDNts ndncat fetches it via the yanfd Unix socket with CanBePrefix discovery.
 set -euo pipefail
 
 if ! command -v ndncat > /dev/null 2>&1; then
@@ -10,7 +10,6 @@ if ! command -v ndncat > /dev/null 2>&1; then
   exit 2
 fi
 
-YANFD_HOST="${YANFD_HOST:-yanfd}"
 YANFD_SOCK="${YANFD_SOCK:-/run/yanfd/nfd.sock}"
 PREFIX="/interop/app-yanfd-rs"
 CONTENT="hello-from-ndn-rs-via-yanfd"
@@ -24,9 +23,8 @@ PUT_PID=$!
 sleep 0.5
 
 # --ver=cbp: send CanBePrefix Interest to discover ndn-put's versioned name.
-# Redirect ndncat stderr to the script's stderr so run_all.sh captures it.
-RESULT=$(NDNTS_UPLINK="udp4://${YANFD_HOST}:6363" \
-  ndncat get-segmented --ver=cbp "${PREFIX}" 2>/dev/stderr)
+RESULT=$(NDNTS_UPLINK="unix://${YANFD_SOCK}" \
+  ndncat get-segmented --ver=cbp "${PREFIX}")
 
 kill "${PUT_PID}" 2>/dev/null || true
 rm -f "${TMP}"

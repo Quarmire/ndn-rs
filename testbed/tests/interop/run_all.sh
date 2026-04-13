@@ -43,11 +43,11 @@ run_test() {
     echo "[${scenario}] PASS: ${desc}" | tee -a "${REPORT}"
     PASS=$(( PASS + 1 ))
   elif [ "${EXIT}" -eq 2 ]; then
-    ERR=$(tail -5 /tmp/interop-err | tr '\n' '|')
+    ERR=$(tail -1 /tmp/interop-err)
     echo "[${scenario}] SKIP: ${desc}  (${ERR})" | tee -a "${REPORT}"
     SKIP=$(( SKIP + 1 ))
   else
-    ERR=$(tail -5 /tmp/interop-err | tr '\n' '|')
+    ERR=$(tail -1 /tmp/interop-err)
     echo "[${scenario}] FAIL: ${desc}  (${ERR})" | tee -a "${REPORT}"
     FAIL=$(( FAIL + 1 ))
   fi
