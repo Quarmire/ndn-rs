@@ -40,13 +40,22 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # latest=auto: metadata-action emits `:latest` automatically on
+          # semver tag pushes. Combined with the `latest` raw tag below, main
+          # also publishes `:latest` so a bare `docker pull ghcr.io/.../ndn-fwd`
+          # (which defaults to `:latest`) works pre-release. Once a release
+          # tag is pushed, `:latest` shifts to that semver build.
+          flavor: |
+            latest=auto
           tags: |
             # tag each release as vX.Y.Z and vX.Y and vX
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
-            # tag main branch as `edge`
+            # tag main branch as `edge` and also as `latest` so bare
+            # `docker pull` works before any semver release exists
             type=edge,branch=main
+            type=raw,value=latest,enable={{is_default_branch}}
             # always include the full commit SHA
             type=sha,format=long
 
