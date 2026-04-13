@@ -31,6 +31,11 @@ if ! kill -0 "${SRV_PID}" 2>/dev/null; then
   exit 1
 fi
 
+# Diagnostic: show yanfd's RIB to confirm NDNts registered the prefix.
+echo "  yanfd route list:" >&2
+ndn-ctl --socket "${YANFD_SOCK}" route list 2>&1 | grep -E "${PREFIX}|error|Error" >&2 || \
+  echo "  (route list unavailable or prefix not found)" >&2
+
 # --pipeline 1: segmented fetch mode; sends CanBePrefix to discover the version
 # component produced by ndncat, then fetches seg=0.
 RESULT=$(ndn-peek --pipeline 1 "${PREFIX}" \
