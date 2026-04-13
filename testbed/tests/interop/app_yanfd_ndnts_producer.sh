@@ -18,12 +18,10 @@ YANFD_SOCK="${YANFD_SOCK:-/run/yanfd/nfd.sock}"
 PREFIX="/interop/app-yanfd-ndnts"
 CONTENT="hello-from-ndnts-via-yanfd"
 
-# Helper: get all face IDs known to yanfd using nfdc (sends unsigned dataset
-# queries that yanfd/NFD require; ndn-ctl always signs and yanfd rejects that
-# for dataset queries).
+# Helper: get all face IDs known to yanfd using ndn-ctl (which now sends
+# unsigned Interests for dataset queries, as required by yanfd/NFD).
 yanfd_face_ids() {
-  NDN_CLIENT_TRANSPORT="unix://${YANFD_SOCK}" \
-    nfdc face list 2>/dev/null \
+  ndn-ctl --socket "${YANFD_SOCK}" face list 2>/dev/null \
     | grep -oE 'faceid=[0-9]+' | sed 's/faceid=//' | sort -n || true
 }
 
@@ -48,9 +46,8 @@ if ! kill -0 "${SRV_PID}" 2>/dev/null; then
 fi
 
 # Diagnostic: show yanfd's RIB to confirm NDNts registered the prefix.
-echo "  yanfd route list (via nfdc):" >&2
-NDN_CLIENT_TRANSPORT="unix://${YANFD_SOCK}" \
-  nfdc route list 2>&1 | grep -E "${PREFIX}|error|Error" >&2 || \
+echo "  yanfd route list:" >&2
+ndn-ctl --socket "${YANFD_SOCK}" route list 2>&1 | grep -E "${PREFIX}|error|Error" >&2 || \
   echo "  (route list unavailable or prefix not found)" >&2
 
 # If NDNts's automatic rib/register didn't land in yanfd's FIB, find the new

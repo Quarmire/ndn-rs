@@ -76,9 +76,6 @@ RUN --mount=type=bind,from=ndn-cxx-builder,source=/,target=/builder \
 COPY --from=ndn-cxx-builder /usr/bin/ndnpeek   /usr/local/bin/
 COPY --from=ndn-cxx-builder /usr/bin/ndnpoke   /usr/local/bin/
 COPY --from=ndn-cxx-builder /usr/bin/ndnping   /usr/local/bin/
-# nfdc — NFD management CLI; sends unsigned dataset queries required by yanfd/NFD.
-COPY --from=ndn-cxx-builder /usr/bin/nfdc      /usr/local/bin/
-
 # ndn-cxx shared library — find wherever waf installed it in the builder and
 # copy to /usr/lib/ (always in ldconfig search path).  Fail the build loudly
 # if the library is missing so we get a clear signal, not a silent runtime error.
