@@ -11,7 +11,7 @@ ndn-rs is wire-compatible with NFD and other NDN forwarders for the core Interes
 | Document | Scope |
 |----------|-------|
 | [NDN Packet Format v0.3](https://docs.named-data.net/NDN-packet-spec/current/) | Canonical TLV encoding, packet types, name components |
-| [NDN Architecture (NDN-0001)](https://named-data.net/publications/techreports/ndn-0001-trs-v3/) | Project architecture vision and research roadmap — motivates the design but does **not** specify forwarding behavior |
+| [NDN Architecture (NDN-0001)](https://named-data.net/publications/techreports/tr001ndn-proj/) | Project architecture vision and research roadmap — motivates the design but does **not** specify forwarding behavior |
 | [NFD Developer Guide (NDN-0021)](https://named-data.net/publications/techreports/ndn-0021-11-nfd-guide/) | The de-facto reference for NFD's forwarding pipeline, strategy API, and management protocol |
 | [NDNLPv2](https://redmine.named-data.net/projects/nfd/wiki/NDNLPv2) | Link-layer protocol: fragmentation, reliability, per-hop headers |
 | [NDN Certificate Format v2](https://docs.named-data.net/NDN-packet-spec/current/certificate.html) | Certificate TLV layout, naming conventions, validity period |
