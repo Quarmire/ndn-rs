@@ -15,11 +15,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates git \
     && rm -rf /var/lib/apt/lists/*
 
-# ndn-cxx master uses waf (cmake migration was only on now-deleted date branches)
+# Install to /usr so the library lands in /usr/lib (always in ldconfig search
+# path on all distros) rather than /usr/local/lib which requires explicit config.
 RUN git clone --depth 1 \
       https://github.com/named-data/ndn-cxx.git /src/ndn-cxx && \
     cd /src/ndn-cxx && \
-    ./waf configure --prefix=/usr/local && \
+    ./waf configure --prefix=/usr && \
     ./waf build -j"$(nproc)" && \
     ./waf install
 
@@ -27,7 +28,7 @@ RUN git clone --depth 1 \
 RUN git clone --depth 1 --branch ndn-tools-24.07 \
       https://github.com/named-data/ndn-tools.git /src/ndn-tools && \
     cd /src/ndn-tools && \
-    ./waf configure --prefix=/usr/local && \
+    ./waf configure --prefix=/usr && \
     ./waf build -j"$(nproc)" && \
     ./waf install
 
@@ -61,13 +62,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# ndn-cxx tools
-COPY --from=ndn-cxx-builder /usr/local/bin/ndnpeek   /usr/local/bin/
-COPY --from=ndn-cxx-builder /usr/local/bin/ndnpoke   /usr/local/bin/
-COPY --from=ndn-cxx-builder /usr/local/bin/ndnping   /usr/local/bin/
-COPY --from=ndn-cxx-builder /usr/local/lib/           /usr/local/lib/
-ENV LD_LIBRARY_PATH=/usr/local/lib
-RUN echo "/usr/local/lib" > /etc/ld.so.conf.d/usr-local.conf && ldconfig
+# ndn-cxx tools — binaries from /usr/bin (prefix=/usr build)
+COPY --from=ndn-cxx-builder /usr/bin/ndnpeek   /usr/local/bin/
+COPY --from=ndn-cxx-builder /usr/bin/ndnpoke   /usr/local/bin/
+COPY --from=ndn-cxx-builder /usr/bin/ndnping   /usr/local/bin/
+
+# ndn-cxx shared library — from /usr/lib (prefix=/usr; always in ldconfig path)
+# Copy all libndn-cxx*.so* files regardless of multiarch subdir placement.
+RUN --mount=from=ndn-cxx-builder,target=/builder \
+    find /builder/usr/lib -name 'libndn-cxx*.so*' -exec cp {} /usr/lib/ \; && \
+    ldconfig
 
 # NDNts CLI tools
 RUN npm install -g @ndn/cli 2>/dev/null || \
