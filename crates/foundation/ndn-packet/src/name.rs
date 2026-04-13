@@ -146,11 +146,20 @@ impl NameComponent {
     }
 }
 
-/// Encode a u64 as big-endian bytes with leading zeros stripped (at least 1 byte).
+/// Encode a u64 as an NDN TLV NonNegativeInteger.
+///
+/// NDN TLV NonNegativeInteger uses the minimum number of bytes from the set
+/// {1, 2, 4, 8} that can represent the value (big-endian). Arbitrary-length
+/// encodings are NOT valid per the NDN Packet Format spec, and interoperability
+/// with NDNts and ndn-cxx requires strict compliance.
 fn encode_nonnegtive_integer(v: u64) -> Bytes {
-    let bytes = v.to_be_bytes();
-    let start = bytes.iter().position(|&b| b != 0).unwrap_or(7);
-    Bytes::copy_from_slice(&bytes[start..])
+    let b = v.to_be_bytes();
+    Bytes::copy_from_slice(match v {
+        0..=0xFF => &b[7..],
+        0x100..=0xFFFF => &b[6..],
+        0x10000..=0xFFFF_FFFF => &b[4..],
+        _ => &b,
+    })
 }
 
 /// Decode big-endian stripped bytes back to u64.

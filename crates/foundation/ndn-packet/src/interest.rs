@@ -102,64 +102,12 @@ impl Interest {
             ));
         }
 
-        // Check if ApplicationParameters is present. If so, the Name must
-        // end with ParametersSha256DigestComponent (type 0x02) and the
-        // digest must match SHA-256 of the parameters digest-coverage region:
-        // ApplicationParameters TLV through the end of InterestSignatureValue
-        // TLV (whichever of InterestSignatureInfo / InterestSignatureValue are
-        // present), per NDN Packet Format v0.3 §5.4.
-        {
-            let inner_bytes = inner.as_bytes();
-            let mut scan = TlvReader::new(inner_bytes.clone());
-            let mut params_region_start: Option<usize> = None;
-            let mut params_region_end: usize = 0;
-
-            while !scan.is_empty() {
-                let pos_before = scan.position();
-                if let Ok((t, _v)) = scan.read_tlv() {
-                    match t {
-                        t if t == tlv_type::APP_PARAMETERS => {
-                            if params_region_start.is_none() {
-                                params_region_start = Some(pos_before);
-                            }
-                            params_region_end = scan.position();
-                        }
-                        t if t == tlv_type::INTEREST_SIGNATURE_INFO
-                            || t == tlv_type::INTEREST_SIGNATURE_VALUE =>
-                        {
-                            if params_region_start.is_some() {
-                                params_region_end = scan.position();
-                            }
-                        }
-                        _ => {}
-                    }
-                } else {
-                    break;
-                }
-            }
-
-            if let Some(start) = params_region_start {
-                let last_comp = name.components().last().unwrap();
-                if last_comp.typ != tlv_type::PARAMETERS_SHA256 {
-                    return Err(PacketError::MalformedPacket(
-                        "Interest with ApplicationParameters must have ParametersSha256DigestComponent as last name component".into()
-                    ));
-                }
-                // Verify digest matches SHA-256 of the parameters region.
-                // Skipped on no-std targets where ring is unavailable.
-                #[cfg(feature = "std")]
-                {
-                    let params_region = inner_bytes.slice(start..params_region_end);
-                    let expected = ring::digest::digest(&ring::digest::SHA256, &params_region);
-                    if last_comp.value.as_ref() != expected.as_ref() {
-                        return Err(PacketError::MalformedPacket(
-                            "ParametersSha256DigestComponent does not match ApplicationParameters"
-                                .into(),
-                        ));
-                    }
-                }
-            }
-        }
+        // ParametersSha256DigestComponent digest validation is an
+        // application-layer trust concern, not a routing concern.  Forwarders
+        // must accept and forward Signed Interests (NDNts v0.3, ndn-cxx) without
+        // validating the digest — rejecting them would silently drop management
+        // commands.  Applications that need integrity checking should call a
+        // dedicated verify method.
 
         Ok(Self {
             raw,
@@ -608,8 +556,9 @@ mod tests {
     }
 
     #[test]
-    fn decode_app_params_wrong_digest_rejected() {
-        // Interest with ApplicationParameters but wrong ParametersSha256 digest.
+    fn decode_app_params_wrong_digest_accepted() {
+        // Forwarders must accept Signed Interests even with a mismatched
+        // ParametersSha256DigestComponent — digest validation is an app concern.
         let mut w = TlvWriter::new();
         w.write_nested(tlv_type::INTEREST, |w| {
             w.write_nested(tlv_type::NAME, |w| {
@@ -619,12 +568,14 @@ mod tests {
             w.write_tlv(tlv_type::APP_PARAMETERS, b"hello");
         });
         let raw = w.finish();
-        assert!(Interest::decode(raw).is_err());
+        let i = Interest::decode(raw).expect("should accept despite wrong digest");
+        assert_eq!(i.app_parameters().map(|b| b.as_ref()), Some(b"hello".as_ref()));
     }
 
     #[test]
-    fn decode_app_params_missing_digest_rejected() {
-        // Interest with ApplicationParameters but no ParametersSha256.
+    fn decode_app_params_without_digest_accepted() {
+        // Forwarders must accept Interests with ApplicationParameters even if
+        // the name has no ParametersSha256DigestComponent.
         let mut w = TlvWriter::new();
         w.write_nested(tlv_type::INTEREST, |w| {
             w.write_nested(tlv_type::NAME, |w| {
@@ -633,7 +584,8 @@ mod tests {
             w.write_tlv(tlv_type::APP_PARAMETERS, b"hello");
         });
         let raw = w.finish();
-        assert!(Interest::decode(raw).is_err());
+        let i = Interest::decode(raw).expect("should accept without digest component");
+        assert_eq!(i.app_parameters().map(|b| b.as_ref()), Some(b"hello".as_ref()));
     }
 
     #[test]
