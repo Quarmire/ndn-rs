@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Interop: ndn-rs consumer → yanfd → NDNts producer.
 #
-# NDNts ndncat registers on yanfd via UDP and serves Data.
+# NDNts ndncat registers on yanfd via Unix socket and serves Data.
 # ndn-rs ndn-peek fetches it via the yanfd Unix socket using segmented fetch.
 set -euo pipefail
 
@@ -10,14 +10,13 @@ if ! command -v ndncat > /dev/null 2>&1; then
   exit 2
 fi
 
-YANFD_HOST="${YANFD_HOST:-yanfd}"
 YANFD_SOCK="${YANFD_SOCK:-/run/yanfd/nfd.sock}"
 PREFIX="/interop/app-yanfd-ndnts"
 CONTENT="hello-from-ndnts-via-yanfd"
 
 # ndncat put-segmented reads payload from stdin, inserts a version component,
 # registers the prefix, and serves segment Interests reactively.
-echo -n "${CONTENT}" | NDNTS_UPLINK="udp4://${YANFD_HOST}:6363" \
+echo -n "${CONTENT}" | NDNTS_UPLINK="unix://${YANFD_SOCK}" \
   ndncat put-segmented "${PREFIX}" &
 SRV_PID=$!
 sleep 1  # allow registration
