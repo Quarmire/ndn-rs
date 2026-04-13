@@ -125,6 +125,21 @@ jobs:
         working-directory: testbed
         run: docker build -f Dockerfile.interop -t interop-client ..
 
+      - name: Debug socket access
+        if: matrix.suite == 'interop' && !fromJSON(inputs.skip_interop || 'false')
+        working-directory: testbed
+        run: |
+          echo "=== ndn-fwd socket dir (inside ndn-fwd container) ==="
+          docker exec ndn-fwd ls -la /run/ndn-fwd/ 2>&1 || echo "exec failed"
+          echo "=== ndn-fwd socket dir (inside testclient, via volume) ==="
+          docker exec testclient ls -la /run/ndn-fwd/ 2>&1 || echo "exec failed"
+          echo "=== --volumes-from testclient socket view ==="
+          docker run --rm --volumes-from testclient ubuntu:24.04 ls -la /run/ndn-fwd/ 2>&1 || echo "run failed"
+          echo "=== interop image library check ==="
+          docker run --rm interop-client find /usr/lib -name 'libndn-cxx*' 2>&1 || echo "run failed"
+          echo "=== ndn-fwd container logs (last 30 lines) ==="
+          docker logs ndn-fwd --tail 30 2>&1 || true
+
       - name: Run interoperability tests
         if: matrix.suite == 'interop' && !fromJSON(inputs.skip_interop || 'false')
         working-directory: testbed
