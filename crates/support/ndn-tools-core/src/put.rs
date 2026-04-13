@@ -202,13 +202,16 @@ pub async fn run_producer(params: PutParams, tx: mpsc::Sender<ToolEvent>) -> Res
             None => continue,
         };
 
-        // Use the versioned+segment name for the Data.  For discovery Interests
-        // (no segment in the Interest name) we build the full name so consumers
-        // can discover the versioned prefix from the returned Data name.
+        // For discovery (CanBePrefix) Interests — no SegmentNameComponent in the
+        // Interest name — respond with the versioned name ONLY (no segment
+        // appended).  Consumers such as NDNts's discoverVersion see
+        // VersionNameComponent as the last component and can extract the version
+        // correctly.  Subsequent Interests that include an explicit segment
+        // number (comps[4].is_segment()) get the normal versioned+segment name.
         let data_name = if last_is_seg.is_some() {
             (*interest.name).clone()
         } else {
-            served_prefix.clone().append_segment(seg_idx as u64)
+            served_prefix.clone()
         };
         let data_name_str = data_name.to_string();
 

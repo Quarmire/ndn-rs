@@ -337,7 +337,18 @@ pub async fn run_ndn_mgmt_handler(
             }
         };
 
-        let params = parsed.params.unwrap_or_default();
+        // ControlParameters are at name[4] for ndn-cxx (NFD management v0.2 /
+        // v0.3 Signed Interest style).  NDNts Signed Interest v0.3 may place
+        // them in ApplicationParameters instead, so fall back to that field if
+        // name-based parsing yielded nothing.
+        let params = parsed
+            .params
+            .or_else(|| {
+                interest
+                    .app_parameters()
+                    .and_then(|app| ControlParameters::decode(app.clone()).ok())
+            })
+            .unwrap_or_default();
 
         let resp = dispatch_command(
             parsed.module.as_ref(),

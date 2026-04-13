@@ -419,14 +419,25 @@ fn next_shm_id() -> u32 {
 /// socket faces.  Unwrap the `Fragment` field and discard LP headers (PIT
 /// tokens, face IDs, congestion marks, etc.).
 ///
+/// Nack LP packets (LP with a Nack header) are returned as-is — the caller
+/// will see the raw LP bytes (type 0x64) and handle them gracefully rather
+/// than mistaking the nacked Interest fragment (type 0x05) for a Data packet.
+///
 /// Returns the original bytes unchanged if the packet is not LP-wrapped.
 pub(crate) fn strip_lp(raw: Bytes) -> Bytes {
     use ndn_packet::lp::{LpPacket, is_lp_packet};
     if is_lp_packet(&raw)
         && let Ok(lp) = LpPacket::decode(raw.clone())
-        && let Some(fragment) = lp.fragment
     {
-        return fragment;
+        // Do NOT strip Nack packets: the fragment is the nacked Interest
+        // (type 0x05), not Data.  Return the raw LP bytes so callers
+        // receive a recognisable LP type (0x64) instead of an Interest.
+        if lp.nack.is_some() {
+            return raw;
+        }
+        if let Some(fragment) = lp.fragment {
+            return fragment;
+        }
     }
     raw
 }
