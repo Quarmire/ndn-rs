@@ -2,6 +2,8 @@ use ndn_packet::{Name, NameComponent};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::lvs::{LvsError, LvsModel};
+
 /// Error returned when a pattern or rule string cannot be parsed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PatternParseError {
@@ -206,27 +208,87 @@ impl std::fmt::Display for SchemaRule {
     }
 }
 
-/// A collection of trust schema rules.
+/// A collection of trust schema rules, optionally backed by an imported
+/// LightVerSec model.
+///
+/// # Backing stores
+///
+/// A `TrustSchema` combines two independent rule sources, OR'd together:
+///
+/// 1. A vector of native [`SchemaRule`]s authored in ndn-rs's own text
+///    grammar (`data_pattern => key_pattern`). Convenient for simple
+///    hand-written policies.
+/// 2. An optional compiled [`LvsModel`] imported via
+///    [`TrustSchema::from_lvs_binary`] from the binary TLV format used by
+///    python-ndn, NDNts, and ndnd. Lets ndn-rs consume trust schemas
+///    authored in the wider NDN community's tooling.
+///
+/// [`TrustSchema::allows`] returns `true` if **either** source permits the
+/// `(data_name, key_name)` pair — you can mix a hand-written rule with an
+/// imported LVS model and both will be consulted.
 #[derive(Clone, Debug, Default)]
 pub struct TrustSchema {
     rules: Vec<SchemaRule>,
+    lvs: Option<Arc<LvsModel>>,
 }
 
 impl TrustSchema {
     pub fn new() -> Self {
-        Self { rules: Vec::new() }
+        Self {
+            rules: Vec::new(),
+            lvs: None,
+        }
     }
 
     pub fn add_rule(&mut self, rule: SchemaRule) {
         self.rules.push(rule);
     }
 
-    /// Returns `true` if at least one rule permits this (data_name, key_name) pair.
-    pub fn allows(&self, data_name: &Name, key_name: &Name) -> bool {
-        self.rules.iter().any(|r| r.check(data_name, key_name))
+    /// Construct a trust schema backed by a compiled LightVerSec model in
+    /// its TLV binary format.
+    ///
+    /// The binary format is defined at
+    /// <https://python-ndn.readthedocs.io/en/latest/src/lvs/binary-format.html>
+    /// and produced by python-ndn's LVS compiler, NDNts `@ndn/lvs`, and
+    /// ndnd. See the [`crate::lvs`] module docs for the supported feature
+    /// subset — notably, user functions (`$eq`, `$regex`, …) are parsed
+    /// but not dispatched in v0.1.0, so any rule that depends on one will
+    /// never match a packet. Inspect [`LvsModel::uses_user_functions`] on
+    /// the result of [`TrustSchema::lvs_model`] if you need to refuse
+    /// such schemas.
+    ///
+    /// The resulting schema has no native `SchemaRule`s — add them with
+    /// [`TrustSchema::add_rule`] if you want to mix the two sources.
+    pub fn from_lvs_binary(wire: &[u8]) -> Result<Self, LvsError> {
+        let model = LvsModel::decode(wire)?;
+        Ok(Self {
+            rules: Vec::new(),
+            lvs: Some(Arc::new(model)),
+        })
     }
 
-    /// Return an immutable slice of all rules in this schema.
+    /// Return the imported LVS model, if this schema was constructed from
+    /// one. Use this to inspect [`LvsModel::uses_user_functions`] or walk
+    /// the node graph for diagnostics.
+    pub fn lvs_model(&self) -> Option<&LvsModel> {
+        self.lvs.as_deref()
+    }
+
+    /// Returns `true` if at least one source permits this
+    /// `(data_name, key_name)` pair. Checks native rules first (cheap), then
+    /// falls through to the LVS model if present.
+    pub fn allows(&self, data_name: &Name, key_name: &Name) -> bool {
+        if self.rules.iter().any(|r| r.check(data_name, key_name)) {
+            return true;
+        }
+        if let Some(lvs) = self.lvs.as_deref() {
+            return lvs.check(data_name, key_name);
+        }
+        false
+    }
+
+    /// Return an immutable slice of all native rules in this schema.
+    /// Does not include rules inside an imported LVS model.
     pub fn rules(&self) -> &[SchemaRule] {
         &self.rules
     }
@@ -239,8 +301,10 @@ impl TrustSchema {
     }
 
     /// Remove all rules, returning the schema to its empty (reject-all) state.
+    /// Also clears any imported LVS model.
     pub fn clear(&mut self) {
         self.rules.clear();
+        self.lvs = None;
     }
 
     /// Accept any signed packet regardless of name relationship.
@@ -467,6 +531,141 @@ mod tests {
         });
         assert_eq!(schema.rules().len(), 1);
     }
+
+    // ── LVS binary import integration ─────────────────────────────────────
+
+    /// Build a minimal LVS binary fixture equivalent to the native rule
+    /// `"/app => /key"` — root has two ValueEdges, and the "app" node's
+    /// SignConstraint points at the "key" node.
+    fn lvs_hierarchical_fixture() -> Vec<u8> {
+        use crate::lvs::type_number as tn;
+        use bytes::BytesMut;
+        use ndn_tlv::TlvWriter;
+
+        fn write_tlv(buf: &mut BytesMut, t: u64, v: &[u8]) {
+            let mut w = TlvWriter::new();
+            w.write_tlv(t, v);
+            buf.extend_from_slice(&w.finish());
+        }
+        fn uint_tlv(buf: &mut BytesMut, t: u64, v: u64) {
+            let be = if v <= u8::MAX as u64 {
+                vec![v as u8]
+            } else {
+                (v as u32).to_be_bytes().to_vec()
+            };
+            write_tlv(buf, t, &be);
+        }
+        /// Write COMPONENT_VALUE TLV wrapping a GenericNameComponent.
+        fn write_cv(buf: &mut BytesMut, bytes: &[u8]) {
+            let mut nc = Vec::with_capacity(2 + bytes.len());
+            nc.push(0x08);
+            nc.push(bytes.len() as u8);
+            nc.extend_from_slice(bytes);
+            write_tlv(buf, tn::COMPONENT_VALUE, &nc);
+        }
+
+        let mut out = BytesMut::new();
+        uint_tlv(&mut out, tn::VERSION, crate::lvs::LVS_VERSION);
+        uint_tlv(&mut out, tn::NODE_ID, 0);
+        uint_tlv(&mut out, tn::NAMED_PATTERN_NUM, 0);
+
+        // Node 0 (root) with two ValueEdges
+        {
+            let mut node = BytesMut::new();
+            uint_tlv(&mut node, tn::NODE_ID, 0);
+            {
+                let mut ve = BytesMut::new();
+                uint_tlv(&mut ve, tn::NODE_ID, 1);
+                write_cv(&mut ve, b"app");
+                write_tlv(&mut node, tn::VALUE_EDGE, &ve);
+            }
+            {
+                let mut ve = BytesMut::new();
+                uint_tlv(&mut ve, tn::NODE_ID, 2);
+                write_cv(&mut ve, b"key");
+                write_tlv(&mut node, tn::VALUE_EDGE, &ve);
+            }
+            write_tlv(&mut out, tn::NODE, &node);
+        }
+        // Node 1 (app data endpoint) — sign_cons = [2]
+        {
+            let mut node = BytesMut::new();
+            uint_tlv(&mut node, tn::NODE_ID, 1);
+            uint_tlv(&mut node, tn::PARENT_ID, 0);
+            uint_tlv(&mut node, tn::KEY_NODE_ID, 2);
+            write_tlv(&mut out, tn::NODE, &node);
+        }
+        // Node 2 (key leaf / trust anchor)
+        {
+            let mut node = BytesMut::new();
+            uint_tlv(&mut node, tn::NODE_ID, 2);
+            uint_tlv(&mut node, tn::PARENT_ID, 0);
+            write_tlv(&mut out, tn::NODE, &node);
+        }
+        out.to_vec()
+    }
+
+    #[test]
+    fn trust_schema_from_lvs_binary_roundtrip() {
+        let schema = TrustSchema::from_lvs_binary(&lvs_hierarchical_fixture())
+            .expect("LVS import");
+        assert!(schema.lvs_model().is_some());
+        assert!(schema.allows(&name(&["app"]), &name(&["key"])));
+        assert!(!schema.allows(&name(&["app"]), &name(&["wrong"])));
+        assert!(!schema.allows(&name(&["stranger"]), &name(&["key"])));
+    }
+
+    #[test]
+    fn trust_schema_mixes_native_rules_with_lvs_model() {
+        let mut schema = TrustSchema::from_lvs_binary(&lvs_hierarchical_fixture()).unwrap();
+        // Native rule allows an entirely different namespace the LVS model
+        // knows nothing about. Both must work in the same schema.
+        schema.add_rule(SchemaRule::parse("/native => /native/KEY").unwrap());
+
+        // LVS-side check.
+        assert!(schema.allows(&name(&["app"]), &name(&["key"])));
+        // Native-side check.
+        assert!(schema.allows(&name(&["native"]), &name(&["native", "KEY"])));
+        // Still rejects things neither source covers.
+        assert!(!schema.allows(&name(&["foo"]), &name(&["bar"])));
+    }
+
+    #[test]
+    fn trust_schema_lvs_model_accessor_returns_parsed_model() {
+        let schema = TrustSchema::from_lvs_binary(&lvs_hierarchical_fixture()).unwrap();
+        let model = schema.lvs_model().expect("lvs model set");
+        assert_eq!(model.nodes.len(), 3);
+        assert!(!model.uses_user_functions());
+    }
+
+    #[test]
+    fn trust_schema_from_lvs_binary_bad_version_errors() {
+        use crate::lvs::LvsError;
+        let mut bad = lvs_hierarchical_fixture();
+        // Overwrite version TLV value byte (offset depends on the fixture
+        // layout; we know it's the first TLV with VERSION type 0x61 and a
+        // 4-byte payload). Easier: build a fresh fixture with a bad version.
+        bad.clear();
+        use crate::lvs::type_number as tn;
+        use bytes::BytesMut;
+        use ndn_tlv::TlvWriter;
+        let mut out = BytesMut::new();
+        {
+            let mut w = TlvWriter::new();
+            w.write_tlv(tn::VERSION, &0xDEADBEEFu32.to_be_bytes());
+            out.extend_from_slice(&w.finish());
+            let mut w = TlvWriter::new();
+            w.write_tlv(tn::NODE_ID, &[0u8]);
+            out.extend_from_slice(&w.finish());
+            let mut w = TlvWriter::new();
+            w.write_tlv(tn::NAMED_PATTERN_NUM, &[0u8]);
+            out.extend_from_slice(&w.finish());
+        }
+        let err = TrustSchema::from_lvs_binary(&out).unwrap_err();
+        assert!(matches!(err, LvsError::UnsupportedVersion { .. }));
+    }
+
+    // ── Original hierarchical test ─────────────────────────────────────────
 
     #[test]
     fn hierarchical_requires_matching_first_component() {

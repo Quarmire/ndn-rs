@@ -10,6 +10,24 @@ For the narrative behind each release — design decisions, rejected approaches,
 
 ## [Unreleased]
 
+### Added
+
+- **LightVerSec (LVS) binary trust schema import** (#9). `TrustSchema` now
+  has a `from_lvs_binary(&[u8])` constructor that parses the compiled LVS
+  TLV binary format used by python-ndn, NDNts `@ndn/lvs`, and ndnd, plus
+  a new `lvs_model()` accessor for inspecting the parsed graph. Supports
+  `ValueEdge` (literal) and `PatternEdge` (captures) dispatch per the LVS
+  spec, `SignConstraint` graph walks, and `ConstraintOption::Value` /
+  `ConstraintOption::Tag` constraint options. User functions (`$eq`,
+  `$regex`, …) parse cleanly but do not dispatch in v0.1.0 — any rule
+  that depends on one will never match a packet, and the loaded schema
+  raises its `LvsModel::uses_user_functions()` flag so strict callers
+  can refuse to use it. Native `SchemaRule`s and an imported LVS model
+  can coexist in a single `TrustSchema` — `allows()` checks both sources
+  and returns `true` if either accepts. Binary format version
+  `0x00011000` is accepted; other versions raise
+  `LvsError::UnsupportedVersion`.
+
 ### Security
 
 - **BLAKE3 signature types split into distinct plain and keyed codes** (#12).
