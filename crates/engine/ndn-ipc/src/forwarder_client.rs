@@ -39,6 +39,7 @@ use tokio_util::sync::CancellationToken;
 
 use ndn_faces::local::IpcFace;
 use ndn_packet::Name;
+use ndn_packet::lp::encode_lp_packet;
 use ndn_transport::{Face, FaceId};
 
 /// Error type for `ForwarderClient` operations.
@@ -238,6 +239,13 @@ impl ForwarderClient {
     }
 
     /// Send a packet on the data plane.
+    ///
+    /// On the Unix transport, packets are wrapped in a minimal NDNLPv2 LpPacket
+    /// before sending.  External forwarders (yanfd/ndnd, NFD) always use LP
+    /// framing on their Unix socket faces and reject bare TLV packets;
+    /// `encode_lp_packet` is idempotent so already-wrapped packets pass through
+    /// unchanged.  SHM transport does not use LP — the engine handles framing
+    /// internally.
     pub async fn send(&self, pkt: Bytes) -> Result<(), ForwarderError> {
         match &self.transport {
             #[cfg(all(
@@ -248,7 +256,10 @@ impl ForwarderClient {
             DataTransport::Shm { handle, .. } => {
                 handle.send(pkt).await.map_err(ForwarderError::Shm)
             }
-            DataTransport::Unix => self.control.send(pkt).await.map_err(ForwarderError::Face),
+            DataTransport::Unix => {
+                let wire = encode_lp_packet(&pkt);
+                self.control.send(wire).await.map_err(ForwarderError::Face)
+            }
         }
     }
 

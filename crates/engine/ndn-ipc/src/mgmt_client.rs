@@ -616,13 +616,18 @@ impl MgmtClient {
     /// Management Interests are signed with `DigestSha256` (SHA-256 of the
     /// signed region) so that NFD and ndnd accept them. Without a signature
     /// NFD silently drops the Interest and the client would hang forever.
+    ///
+    /// The Interest is LP-wrapped before sending: external forwarders (NFD,
+    /// yanfd/ndnd) require NDNLPv2 framing on their Unix socket faces.
     async fn send_interest(&self, name: Name) -> Result<ControlResponse, ForwarderError> {
         let interest_wire = InterestBuilder::new(name).sign_digest_sha256();
 
         // Serialise send+recv so concurrent callers don't interleave.
         let _guard = self.recv_lock.lock().await;
 
-        self.face.send(interest_wire).await?;
+        self.face
+            .send(ndn_packet::lp::encode_lp_packet(&interest_wire))
+            .await?;
 
         let data_wire = self
             .face
