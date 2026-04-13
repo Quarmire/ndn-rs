@@ -3763,6 +3763,7 @@ dependencies = [
 name = "ndn-app"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "bytes",
  "ndn-engine",
  "ndn-faces",

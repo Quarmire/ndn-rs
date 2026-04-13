@@ -24,5 +24,6 @@ tracing        = { workspace = true }
 thiserror      = { workspace = true }
 
 [dev-dependencies]
+anyhow        = { workspace = true }
 ndn-tlv       = { workspace = true, features = ["std"] }
-tokio   = { workspace = true, features = ["rt", "macros"] }
+tokio         = { workspace = true, features = ["rt", "macros"] }

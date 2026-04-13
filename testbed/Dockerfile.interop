@@ -53,20 +53,19 @@ RUN cargo build --release \
 FROM ubuntu:24.04
 
 # Runtime libs for ndn-cxx tools.
-# Install all boost 1.83 runtime packages required by ndn-cxx/ndn-tools.
+# libssl3, libsqlite3-0, libpcap0.8: direct ndn-cxx runtime deps.
+# nodejs/npm: for NDNts CLI install.
+# Boost: copy ALL versioned .so files from the builder stage rather than
+# enumerating packages (avoids missing e.g. libboost_stacktrace_backtrace).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libboost-filesystem1.83.0 \
-    libboost-program-options1.83.0 \
-    libboost-log1.83.0 \
-    libboost-chrono1.83.0 \
-    libboost-thread1.83.0 \
-    libboost-atomic1.83.0 \
-    libboost-date-time1.83.0 \
-    libboost-regex1.83.0 \
     libssl3 libsqlite3-0 libpcap0.8 \
     nodejs npm \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+
+RUN --mount=type=bind,from=ndn-cxx-builder,source=/,target=/builder \
+    find /builder/usr/lib -name "libboost_*.so.*" -type f \
+         -exec cp {} /usr/lib/ \; && ldconfig
 
 # ndn-cxx tools — binaries from /usr/bin (prefix=/usr build)
 COPY --from=ndn-cxx-builder /usr/bin/ndnpeek   /usr/local/bin/
@@ -88,9 +87,10 @@ RUN --mount=type=bind,from=ndn-cxx-builder,source=/,target=/builder \
       cp "${LIB}" /usr/lib/; \
     ' && ldconfig
 
-# NDNts CLI tools
-RUN npm install -g @ndn/cli 2>/dev/null || \
-    npm install -g @yoursunny/ndn-ts-cli 2>/dev/null || true
+# NDNts CLI tools — show install output so failures are visible in build logs.
+RUN npm install -g @ndn/cli --legacy-peer-deps || \
+    npm install -g @yoursunny/ndn-ts-cli --legacy-peer-deps || \
+    echo "WARN: NDNts CLI not available — ndnts tests will SKIP"
 
 # ndn-rs tools
 COPY --from=ndn-rs-builder /build/target/release/ndn-peek  /usr/local/bin/

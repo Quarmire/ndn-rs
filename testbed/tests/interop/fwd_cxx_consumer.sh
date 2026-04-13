@@ -19,7 +19,7 @@ PUT_PID=$!
 sleep 0.5
 
 RESULT=$(NDN_CLIENT_TRANSPORT="udp4://${FWD_HOST}:6363" \
-  ndnpeek --timeout 4000 "${PREFIX}/test" 2>&1)
+  ndnpeek --can-be-prefix --timeout 4000 "${PREFIX}" 2>&1)
 
 kill "${PUT_PID}" 2>/dev/null || true
 rm -f "${TMP}"
