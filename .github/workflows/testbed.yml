@@ -131,14 +131,12 @@ jobs:
         run: |
           mkdir -p results
           docker run --rm --network ndn-testbed_ndn-net \
+            --volumes-from testclient \
             -e FWD_HOST=ndn-fwd \
             -e NFD_HOST=nfd \
             -e YANFD_HOST=yanfd \
             -e RESULTS_DIR=/results \
             -v "$(pwd)/results:/results" \
-            -v ndn-testbed_ndn-fwd-sock:/run/ndn-fwd \
-            -v ndn-testbed_nfd-sock:/run/nfd \
-            -v ndn-testbed_yanfd-sock:/run/yanfd \
             interop-client \
             bash /testbed/tests/interop/run_all.sh
           docker cp testclient:/results/. results/ 2>/dev/null || true
