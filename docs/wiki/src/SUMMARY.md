@@ -86,7 +86,7 @@
 
 # Releases
 
-- [0.1.0](./releases/v0-1-0.md)
+- [0.1.0 (upcoming)](./releases/v0-1-0.md)
 - [0.1.0-alpha](./releases/v0-1-0-alpha.md)
 
 ---

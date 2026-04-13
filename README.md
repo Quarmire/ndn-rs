@@ -6,7 +6,7 @@ ndn-rs takes a Rust-idiomatic approach — composable async pipelines with trait
 
 ![ndn-rs logo](docs/logo.svg)
 
-**Version:** 0.1.0 · **[Releases](https://github.com/Quarmire/ndn-rs/releases)** · **[Wiki](https://quarmire.github.io/ndn-rs/wiki/)** · **[Explorer](https://quarmire.github.io/ndn-rs/explorer/)**
+**Status:** pre-release (working toward `v0.1.0` — not yet tagged; track `main` or pull `ghcr.io/quarmire/ndn-fwd:latest`) · **[Releases](https://github.com/Quarmire/ndn-rs/releases)** · **[Wiki](https://quarmire.github.io/ndn-rs/wiki/)** · **[Explorer](https://quarmire.github.io/ndn-rs/explorer/)**
 
 ---
 
@@ -63,7 +63,7 @@ The wiki covers everything from installation to deep dives into each subsystem:
 | **[Deep Dives](https://quarmire.github.io/ndn-rs/wiki/deep-dive/pipeline-walkthrough.html)** | TLV encoding, forwarding pipeline, security, simulation, WASM |
 | **[Guides](https://quarmire.github.io/ndn-rs/wiki/guides/implementing-face.html)** | Implementing a Face, Strategy, embedded targets, CLI tools |
 | **[Benchmarks](https://quarmire.github.io/ndn-rs/wiki/benchmarks/pipeline-benchmarks.html)** | Pipeline stage costs, forwarder comparison, methodology |
-| **[0.1.0 release notes](https://quarmire.github.io/ndn-rs/wiki/releases/v0-1-0.html)** | What's in this release, design decisions, roadmap |
+| **[0.1.0 draft release notes](https://quarmire.github.io/ndn-rs/wiki/releases/v0-1-0.html)** | Scope of the upcoming first tagged release (work in progress) |
 
 The [`ARCHITECTURE.md`](ARCHITECTURE.md) file has a crate map and dependency layer diagram for quick offline reference.
 

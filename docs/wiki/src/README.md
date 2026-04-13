@@ -1,5 +1,12 @@
 # ndn-rs Wiki
 
+> **Pre-release.** ndn-rs is working toward its first stable tag
+> (`v0.1.0`). The workspace version reads `0.1.0`, but no git tag or
+> GitHub Release has been published yet — this wiki documents `main`.
+> Pull `ghcr.io/quarmire/ndn-fwd:latest` or build from source to try the
+> current state. See the
+> [draft 0.1.0 release notes](./releases/v0-1-0.md) for the planned scope.
+
 **ndn-rs** is a Named Data Networking (NDN) forwarder stack written in Rust. It models NDN as composable data pipelines with trait-based polymorphism, departing from the class hierarchy approach of NFD/ndn-cxx.
 
 ## What is NDN?
