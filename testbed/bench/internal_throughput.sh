@@ -46,5 +46,5 @@ INTS=$(echo "${OUTPUT}" | grep -oE '[0-9]+ pkt/s' | awk '{print $1}' | sort -n |
 [ -z "${MBPS}" ] && MBPS="n/a"
 [ -z "${INTS}" ] && INTS="n/a"
 
-echo "| ${LABEL} | unix | internal-throughput | ${MBPS} Mbps / ${INTS} Int/s |" >> "${REPORT}"
-echo "[${LABEL}/unix] internal result: ${MBPS} Mbps  ${INTS} Int/s"
+echo "| ${LABEL} | unix | internal-throughput | ${MBPS} / ${INTS} Int/s |" >> "${REPORT}"
+echo "[${LABEL}/unix] internal result: ${MBPS}  ${INTS} Int/s"

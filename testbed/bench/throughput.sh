@@ -45,5 +45,5 @@ INTS=$(echo "${OUTPUT}" | grep -oE '[0-9]+ pkt/s' | awk '{print $1}' | sort -n |
 [ -z "${MBPS}" ] && MBPS="n/a"
 [ -z "${INTS}" ] && INTS="n/a"
 
-echo "| ${LABEL} | ${TRANSPORT} | throughput | ${MBPS} Mbps / ${INTS} Int/s |" >> "${REPORT}"
-echo "[${LABEL}/${TRANSPORT}] throughput result: ${MBPS} Mbps  ${INTS} Int/s"
+echo "| ${LABEL} | ${TRANSPORT} | throughput | ${MBPS} / ${INTS} Int/s |" >> "${REPORT}"
+echo "[${LABEL}/${TRANSPORT}] throughput result: ${MBPS}  ${INTS} Int/s"

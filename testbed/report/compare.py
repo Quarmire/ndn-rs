@@ -18,7 +18,8 @@ def parse_bench_table(text: str) -> list[dict]:
     rows = []
     for line in text.splitlines():
         m = re.match(r"\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|", line)
-        if m and m.group(1).strip() not in ("Forwarder", "-"):
+        if m and m.group(1).strip() not in ("Forwarder", "-") \
+                and not m.group(1).strip().startswith("-"):
             rows.append({
                 "fwd":     m.group(1).strip(),
                 "transport": m.group(2).strip(),
