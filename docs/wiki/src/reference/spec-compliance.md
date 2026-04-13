@@ -67,6 +67,7 @@ All network faces use NDNLPv2 LpPacket framing (type 0x64). Fully implemented:
   - BLAKE3 is 3–8× faster than SHA-256 on modern SIMD CPUs.
 - **Signed Interests** — InterestSignatureInfo/InterestSignatureValue with anti-replay fields
 - **Trust chain validation** — `Validator::validate_chain()` walks Data → cert → trust anchor; cycle detection; configurable depth limit; `CertFetcher` deduplicates concurrent cert requests
+- **Trust schema** — native `SchemaRule` rules in a `data_pattern => key_pattern` text grammar, plus import of **LightVerSec (LVS)** binary trust schemas via `TrustSchema::from_lvs_binary` — interoperable with the compiled output of python-ndn, NDNts `@ndn/lvs`, and ndnd `std/security/trust_schema`. Supports `ValueEdge` literal matches, `PatternEdge` captures, and `SignConstraint` graph walks; user functions (`$eq`, `$regex`, …) parse cleanly but do not dispatch in v0.1.0 and are flagged via `LvsModel::uses_user_functions()`. Version `0x00011000` of the binary format is accepted
 - **Certificate TLV format** — `Certificate::decode()` parses ValidityPeriod (0xFD) with NotBefore/NotAfter; certificate time validity enforced; `AdditionalDescription` TLV constants defined
 - **ValidationStage** — sits in Data pipeline between PitMatch and CsInsert; drops Data failing chain validation
 - **NDNCERT 0.3** — all four routes (INFO/PROBE/NEW/CHALLENGE/REVOKE) now use TLV wire format; JSON protocol types removed from CA handler
