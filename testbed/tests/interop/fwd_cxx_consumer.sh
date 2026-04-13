@@ -18,7 +18,7 @@ PUT_PID=$!
 sleep 0.5
 
 RESULT=$(NDN_CLIENT_TRANSPORT="unix://${FWD_SOCK}" \
-  ndnpeek --can-be-prefix --timeout 4000 "${PREFIX}" 2>&1)
+  ndnpeek --prefix --timeout 4000 "${PREFIX}" 2>&1)
 
 kill "${PUT_PID}" 2>/dev/null || true
 rm -f "${TMP}"
