@@ -1,6 +1,6 @@
 # NDN Specification Compliance
 
-ndn-rs is wire-compatible with NFD and other NDN forwarders. All critical and most important items from the original 25-gap compliance audit have been resolved. Five gaps remain, concentrated in certificate format details and a few validation checks that don't affect day-to-day forwarding or application development.
+ndn-rs is wire-compatible with NFD and other NDN forwarders for the core Interest/Data exchange, NDNLPv2 framing, and basic certificate validation. Five items from the original compliance audit remain open — none affect wire-level interoperability with NFD on the plain forwarding path — and two forwarding-behavior features used by the wider ecosystem (forwarding hints and PIT tokens) are not yet active in the pipeline and are tracked separately in ["Not Yet Implemented"](#not-yet-implemented) below.
 
 ## Reference Specifications
 
@@ -11,11 +11,13 @@ ndn-rs is wire-compatible with NFD and other NDN forwarders. All critical and mo
 | Document | Scope |
 |----------|-------|
 | [NDN Packet Format v0.3](https://docs.named-data.net/NDN-packet-spec/current/) | Canonical TLV encoding, packet types, name components |
-| [NDN Architecture (NDN-0001)](https://named-data.net/techreports/) | Forwarding semantics, FIB/PIT/CS model, scope rules |
+| [NDN Architecture (NDN-0001)](https://named-data.net/publications/techreports/ndn-0001-trs-v3/) | Project architecture vision and research roadmap — motivates the design but does **not** specify forwarding behavior |
+| [NFD Developer Guide (NDN-0021)](https://named-data.net/publications/techreports/ndn-0021-11-nfd-guide/) | The de-facto reference for NFD's forwarding pipeline, strategy API, and management protocol |
 | [NDNLPv2](https://redmine.named-data.net/projects/nfd/wiki/NDNLPv2) | Link-layer protocol: fragmentation, reliability, per-hop headers |
 | [NDN Certificate Format v2](https://docs.named-data.net/NDN-packet-spec/current/certificate.html) | Certificate TLV layout, naming conventions, validity period |
-| [NDNCERT 0.3](https://github.com/named-data/ndncert/blob/master/docs/DESIGN.md) | Automated certificate issuance over NDN |
-| [NFD Developer Guide](https://docs.named-data.net/NFD/current/) | Forwarder behavior, management protocol, strategy API |
+| [NDNCERT Protocol 0.3](https://github.com/named-data/ndncert/wiki/NDNCERT-Protocol-0.3) | Automated certificate issuance over NDN |
+
+> **Note on forwarding specification.** There is no single comprehensive document defining NDN forwarding behavior. NDN-0001 is the architecture vision. NDN-0021 (the NFD Developer Guide) describes one implementation's behavior, which the community treats as the de-facto reference. Recent forwarding developments — in particular **forwarding hints** (partially described in NFD redmine issues [#3000](https://redmine.named-data.net/issues/3000) and [#3333](https://redmine.named-data.net/issues/3333)) and **PIT tokens** (pioneered by NDN-DPDK) — are not yet folded into any single spec document. ndn-rs tracks these as open work, not as completed compliance items; see "Not Yet Implemented" below.
 
 ## What's Implemented
 
@@ -81,7 +83,16 @@ All network faces use NDNLPv2 LpPacket framing (type 0x64). Fully implemented:
 
 NFD-compatible TLV management protocol over Unix domain socket (`/localhost/nfd/`). Modules: `rib`, `faces`, `fib`, `strategy-choice`, `cs`, `status`.
 
-## Remaining Gaps
+## Not Yet Implemented
+
+Two forwarding-behavior features used by the wider NDN ecosystem are not yet handled by ndn-rs. Both are tracked in [issue #13](https://github.com/Quarmire/ndn-rs/issues/13) and are slated for v0.2.0.
+
+| Feature | Spec/reference | Status in ndn-rs |
+|---------|----------------|------------------|
+| **Forwarding hint handling** in the forwarding pipeline | NFD redmine [#3000](https://redmine.named-data.net/issues/3000), [#3333](https://redmine.named-data.net/issues/3333) | `ForwardingHint` is parsed and included in the PIT key, but the pipeline does not perform hint-based FIB lookup or fallback — it treats hints as opaque |
+| **PIT tokens** (NDN-DPDK convention) | NDNLPv2 PitToken field (0x62) | PitToken LP header is encoded/decoded on the wire, but is not generated or consumed by the forwarder — upstream producers cannot use it to demultiplex |
+
+## Remaining Compliance Gaps
 
 Five items remain unresolved. None affect wire-level interoperability with NFD.
 
@@ -97,9 +108,10 @@ Five items remain unresolved. None affect wire-level interoperability with NFD.
 
 ```mermaid
 %%{init: {'theme': 'default'}}%%
-pie title Spec Compliance (34 tracked items)
+pie title Spec Compliance (41 tracked items)
     "Resolved" : 34
-    "Remaining (untracked)" : 5
+    "Not yet implemented (forwarding features)" : 2
+    "Remaining compliance gaps" : 5
 ```
 
-34 explicitly tracked compliance items are resolved. The 5 remaining gaps are in certificate format details, name ordering, and lenient TLV parsing — none prevent interoperability with NFD or affect the forwarding pipeline.
+34 explicitly tracked compliance items are resolved. Two forwarding-behavior features used by the wider ecosystem — forwarding-hint dispatch and PIT-token echo — are partially wired but not yet active end-to-end. Five compliance gaps remain in certificate format details, name ordering, and lenient TLV parsing; none prevent interoperability with NFD on the plain forwarding path.

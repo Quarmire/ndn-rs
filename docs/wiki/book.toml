@@ -11,7 +11,7 @@ build-dir = "../../target/wiki"
 default-theme = "navy"
 preferred-dark-theme = "navy"
 git-repository-url = "https://github.com/Quarmire/ndn-rs"
-edit-url-template = "https://github.com/Quarmire/ndn-rs/edit/main/docs/wiki/src/{path}"
+edit-url-template = "https://github.com/Quarmire/ndn-rs/edit/main/docs/wiki/{path}"
 additional-js = ["mermaid-init.js", "d3graph-init.js"]
 
 [output.html.fold]
