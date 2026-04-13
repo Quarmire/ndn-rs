@@ -169,7 +169,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          WIKI_PAGE="docs/wiki/src/bench-forwarder.md"
+          WIKI_PAGE="docs/wiki/src/benchmarks/bench-forwarder.md"
           if [ -f "testbed/results/summary.md" ]; then
             cat testbed/results/summary.md > "${WIKI_PAGE}"
             git config user.name  "github-actions[bot]"
@@ -177,6 +177,28 @@ jobs:
             git add "${WIKI_PAGE}"
             git diff --cached --quiet || \
               git commit -m "chore(bench): update forwarder benchmark table [skip ci]"
+            git push
+          fi
+
+      # ── Post interop results to wiki (interop suite, main branch only) ───────
+
+      - name: Publish interop results to wiki
+        if: >
+          matrix.suite == 'interop' &&
+          github.ref == 'refs/heads/main' &&
+          !fromJSON(inputs.skip_interop || 'false')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          RESULT=$(ls testbed/results/interop-*.txt 2>/dev/null | sort | tail -1)
+          if [ -n "${RESULT}" ]; then
+            python3 testbed/report/compare.py "${RESULT}" \
+              > docs/wiki/src/reference/interop-results.md
+            git config user.name  "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add docs/wiki/src/reference/interop-results.md
+            git diff --cached --quiet || \
+              git commit -m "chore(interop): update interop results [skip ci]"
             git push
           fi
 

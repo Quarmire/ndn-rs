@@ -9,10 +9,11 @@ on:
       - 'crates/**'
       - 'binaries/**'
       - '.github/workflows/wiki.yml'
-  # Re-deploy after the benchmark workflow commits updated results to docs/wiki/.
-  # GITHUB_TOKEN commits do not trigger push events, so we chain via workflow_run.
+  # Re-deploy after benchmark or testbed workflows commit updated results to
+  # docs/wiki/.  GITHUB_TOKEN commits do not trigger push events, so we chain
+  # via workflow_run for both workflows.
   workflow_run:
-    workflows: ["benchmarks"]
+    workflows: ["benchmarks", "Testbed (compliance + benchmarks)"]
     types: [completed]
     branches: [main]
   workflow_dispatch:

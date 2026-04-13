@@ -30,6 +30,7 @@
 
 - [TLV Encoding](./deep-dive/tlv-encoding.md)
 - [Pipeline Walkthrough](./deep-dive/pipeline-walkthrough.md)
+- [Interoperability Testing](./deep-dive/interop-testing.md)
 - [Discovery Protocols](./deep-dive/discovery-protocols.md)
 - [Routing Protocols](./deep-dive/routing-protocols.md)
 - [Sync Protocols](./deep-dive/sync-protocols.md)
@@ -74,6 +75,7 @@
 # Reference
 
 - [Spec Compliance](./reference/spec-compliance.md)
+- [Interop Test Results](./reference/interop-results.md)
 - [did:ndn Method Specification](./reference/did-ndn-method.md)
 - [External Links](./reference/external-links.md)
 
