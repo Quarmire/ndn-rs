@@ -177,6 +177,7 @@ jobs:
             git add "${WIKI_PAGE}"
             git diff --cached --quiet || \
               git commit -m "chore(bench): update forwarder benchmark table [skip ci]"
+            git pull --rebase origin main
             git push
           fi
 
@@ -199,6 +200,7 @@ jobs:
             git add docs/wiki/src/reference/interop-results.md
             git diff --cached --quiet || \
               git commit -m "chore(interop): update interop results [skip ci]"
+            git pull --rebase origin main
             git push
           fi
 

@@ -116,5 +116,9 @@ jobs:
             echo "No changes to benchmark results"
           else
             git commit -m "chore: update benchmark results [skip ci]"
+            # Rebase onto current origin/main before pushing; concurrent pushes
+            # (e.g. a second benchmark run or a docs commit) can advance main
+            # while the bench job is running, causing a non-fast-forward rejection.
+            git pull --rebase origin main
             git push origin main
           fi
