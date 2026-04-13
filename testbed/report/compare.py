@@ -42,15 +42,34 @@ def parse_compliance(text: str) -> list[dict]:
 
 
 def emit_bench_summary(all_rows: list[dict]) -> str:
+    import datetime
+
     # Group by metric → fwd → value
     by_metric: dict[str, dict[str, str]] = defaultdict(dict)
+    ts = ""
     for r in all_rows:
         key = f"{r['metric']} ({r['transport']})"
         by_metric[key][r["fwd"]] = r["value"]
+        if not ts:
+            ts = r.get("timestamp", "")
 
     fwds = sorted({r["fwd"] for r in all_rows})
+    today = datetime.date.today().isoformat()
+
     lines = [
-        "## Forwarder Benchmarks",
+        "# Forwarder Comparison Benchmarks",
+        "",
+        "This page is automatically updated by the",
+        "[testbed CI workflow](https://github.com/Quarmire/ndn-rs/actions/workflows/testbed.yml)",
+        "on every push to `main` and weekly on Mondays.",
+        "",
+        "> **Transport note:** `unix` socket numbers are shown for all forwarders.",
+        "> ndn-fwd also supports an in-process SHM face (not tested here).",
+        "> Numbers using different transports are **not** directly comparable.",
+        "",
+        "<!-- The section below is machine-generated. Do not edit manually. -->",
+        "",
+        f"*Last run: `{today}` (ubuntu-latest, stable ndn-rs)*",
         "",
         "| Metric | " + " | ".join(fwds) + " |",
         "|--------|" + "|".join(["--------"] * len(fwds)) + "|",
@@ -60,12 +79,7 @@ def emit_bench_summary(all_rows: list[dict]) -> str:
         for fwd in fwds:
             row += f" {fwd_vals.get(fwd, 'n/a')} |"
         lines.append(row)
-    lines += [
-        "",
-        "> **Note:** `shm` transport is only available for ndn-fwd (in-process SHM face).",
-        "> `udp` numbers reflect socket overhead and are comparable across all forwarders.",
-        "",
-    ]
+    lines.append("")
     return "\n".join(lines)
 
 
@@ -180,7 +194,12 @@ def main():
 
     for path_str in sys.argv[1:]:
         for path in sorted(Path(".").glob(path_str)) or [Path(path_str)]:
-            text = path.read_text(errors="replace")
+            try:
+                text = path.read_text(errors="replace")
+            except (FileNotFoundError, IsADirectoryError, OSError):
+                # Shell passes literal glob strings when no files match;
+                # skip silently rather than crashing before any output.
+                continue
             if "interop" in path.name:
                 interop_datasets.append(parse_interop(text))
             elif "throughput" in path.name or "bench" in path.name:

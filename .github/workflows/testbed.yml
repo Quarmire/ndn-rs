@@ -160,21 +160,25 @@ jobs:
           retention-days: 30
 
       # ── Post bench table to wiki (bench suite, main branch only) ────────────
+      # Runs on success OR failure so a partial bench run still publishes
+      # whatever results were written before any failure.
 
       - name: Publish bench table to wiki
         if: >
+          (success() || failure()) &&
           matrix.suite == 'bench' &&
           github.ref == 'refs/heads/main' &&
           !fromJSON(inputs.skip_bench || 'false')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          WIKI_PAGE="docs/wiki/src/benchmarks/bench-forwarder.md"
-          if [ -f "testbed/results/summary.md" ]; then
-            cat testbed/results/summary.md > "${WIKI_PAGE}"
+          RESULT=$(ls testbed/results/bench-*.md 2>/dev/null | sort | tail -1)
+          if [ -n "${RESULT}" ]; then
+            python3 testbed/report/compare.py "${RESULT}" \
+              > docs/wiki/src/benchmarks/bench-forwarder.md
             git config user.name  "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add "${WIKI_PAGE}"
+            git add docs/wiki/src/benchmarks/bench-forwarder.md
             git diff --cached --quiet || \
               git commit -m "chore(bench): update forwarder benchmark table [skip ci]"
             git pull --rebase origin main
