@@ -5,10 +5,13 @@ use std::sync::Arc;
 use bluer::{
     Session,
     adv::{Advertisement, Type as AdvType},
-    gatt::local::{
-        Application, Characteristic, CharacteristicControlEvent, CharacteristicNotify,
-        CharacteristicNotifyMethod, CharacteristicWrite, CharacteristicWriteMethod, Service,
-        characteristic_control,
+    gatt::{
+        CharacteristicWriter,
+        local::{
+            Application, Characteristic, CharacteristicControlEvent, CharacteristicNotify,
+            CharacteristicNotifyMethod, CharacteristicWrite, CharacteristicWriteMethod, Service,
+            characteristic_control,
+        },
     },
 };
 use bytes::Bytes;
@@ -87,6 +90,9 @@ pub async fn bind(id: ndn_transport::FaceId) -> Result<BleFace, BleError> {
             ],
             ..Default::default()
         }],
+        // `Application` carries a private `_non_exhaustive` marker in
+        // bluer ≥0.17; `..Default::default()` fills it in.
+        ..Default::default()
     };
 
     let app_handle = adapter.serve_gatt_application(app).await?;
@@ -117,13 +123,24 @@ pub async fn bind(id: ndn_transport::FaceId) -> Result<BleFace, BleError> {
     // hand the raw bytes up to the face recv channel; the pipeline's
     // `TlvDecodeStage` handles NDNLPv2 reassembly via its per-face
     // `ReassemblyBuffer`, identical to UDP and Ethernet faces.
+    //
+    // In bluer ≥0.17, `CharacteristicControlEvent::Write` carries a
+    // `CharacteristicWriteIoRequest` that must be `accept()`-ed to yield
+    // the underlying `CharacteristicReader` (which is the AsyncRead).
     tokio::spawn({
         let _server = Arc::clone(&server);
         async move {
             futures::pin_mut!(cs_ctl);
             while let Some(evt) = cs_ctl.next().await {
-                let CharacteristicControlEvent::Write(mut reader) = evt else {
+                let CharacteristicControlEvent::Write(req) = evt else {
                     continue;
+                };
+                let mut reader = match req.accept() {
+                    Ok(r) => r,
+                    Err(e) => {
+                        warn!(%e, "BLE/Linux: RX accept failed");
+                        continue;
+                    }
                 };
                 let mtu = reader.mtu();
                 debug!(mtu, "BLE/Linux: RX client connected");
@@ -157,10 +174,14 @@ pub async fn bind(id: ndn_transport::FaceId) -> Result<BleFace, BleError> {
     // and fits, wrap in a single LpPacket envelope; if it's bare and
     // oversized, fragment via NDNLPv2 `fragment_packet`. Each resulting
     // LpPacket is sent as one BLE notify = one ATT write.
+    //
+    // In bluer ≥0.17, `CharacteristicControlEvent::Notify(n)` carries a
+    // `CharacteristicWriter` (the AsyncWrite side), not a
+    // `CharacteristicNotifier`.
     tokio::spawn(async move {
         futures::pin_mut!(sc_ctl);
         let mut tx_rx = tx_rx;
-        let mut notifier: Option<bluer::gatt::local::CharacteristicNotifier> = None;
+        let mut notifier: Option<CharacteristicWriter> = None;
         // Monotonic base sequence for NDNLPv2 fragment groups.
         let mut frag_seq: u64 = 0;
 
