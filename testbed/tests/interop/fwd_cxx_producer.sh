@@ -16,7 +16,11 @@ sleep 0.5
 
 RESULT=$(ndn-peek "${PREFIX}/test" \
   --face-socket "${FWD_SOCK}" --no-shm \
-  --lifetime 4000 2>&1)
+  --lifetime 4000) || {
+  echo "ndn-peek failed (exit $?)." >&2
+  kill "${POKE_PID}" 2>/dev/null || true
+  exit 1
+}
 
 kill "${POKE_PID}" 2>/dev/null || true
 echo "${RESULT}" | grep -q "${CONTENT}"

@@ -24,7 +24,12 @@ sleep 0.5
 
 # --ver=cbp: send CanBePrefix Interest to discover ndn-put's versioned name.
 RESULT=$(NDNTS_UPLINK="unix://${FWD_SOCK}" \
-  ndncat get-segmented --ver=cbp "${PREFIX}")
+  ndncat get-segmented --ver=cbp "${PREFIX}") || {
+  echo "ndncat get-segmented failed (exit $?)." >&2
+  kill "${PUT_PID}" 2>/dev/null || true
+  rm -f "${TMP}"
+  exit 1
+}
 
 kill "${PUT_PID}" 2>/dev/null || true
 rm -f "${TMP}"
