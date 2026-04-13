@@ -2,7 +2,7 @@
 #
 # Contains:
 #   - ndn-cxx tools: ndnpeek, ndnpoke, ndnping, ndnsec
-#   - NDNts CLI: ndnts-fetch, ndnts-serve
+#   - NDNts CLI: ndncat (from @ndn/cat)
 #   - ndn-rs tools (built from source): ndn-peek, ndn-put, ndn-ping, ndn-iperf
 FROM ubuntu:24.04 AS ndn-cxx-builder
 
@@ -87,10 +87,10 @@ RUN --mount=type=bind,from=ndn-cxx-builder,source=/,target=/builder \
       cp "${LIB}" /usr/lib/; \
     ' && ldconfig
 
-# NDNts CLI tools — show install output so failures are visible in build logs.
-RUN npm install -g @ndn/cli --legacy-peer-deps || \
-    npm install -g @yoursunny/ndn-ts-cli --legacy-peer-deps || \
-    echo "WARN: NDNts CLI not available — ndnts tests will SKIP"
+# NDNts CLI tools — @ndn/cat provides the `ndncat` binary used by interop tests.
+# Show install output so failures are visible; non-fatal so image still builds.
+RUN npm install -g @ndn/cat --legacy-peer-deps || \
+    echo "WARN: @ndn/cat install failed — ndnts tests will SKIP"
 
 # ndn-rs tools
 COPY --from=ndn-rs-builder /build/target/release/ndn-peek  /usr/local/bin/

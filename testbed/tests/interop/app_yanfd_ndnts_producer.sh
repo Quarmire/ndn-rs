@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Interop: ndn-rs consumer → yanfd → NDNts producer.
 #
-# NDNts ndnts-serve registers on yanfd via UDP and serves Data.
-# ndn-rs ndn-peek fetches it via the yanfd Unix socket.
+# NDNts ndncat registers on yanfd via UDP and serves Data.
+# ndn-rs ndn-peek fetches it via the yanfd Unix socket using segmented fetch.
 set -euo pipefail
 
-if ! command -v ndnts-serve > /dev/null 2>&1; then
-  echo "SKIP: ndnts-serve not available" >&2
+if ! command -v ndncat > /dev/null 2>&1; then
+  echo "SKIP: ndncat not available" >&2
   exit 2
 fi
 
@@ -15,14 +15,16 @@ YANFD_SOCK="${YANFD_SOCK:-/run/yanfd/nfd.sock}"
 PREFIX="/interop/app-yanfd-ndnts"
 CONTENT="hello-from-ndnts-via-yanfd"
 
-ndnts-serve \
-  --uplink "udp4://${YANFD_HOST}:6363" \
-  --prefix "${PREFIX}" \
-  --payload "${CONTENT}" &
+# ndncat put-segmented reads payload from stdin, inserts a version component,
+# registers the prefix, and serves segment Interests reactively.
+echo -n "${CONTENT}" | NDNTS_UPLINK="udp4://${YANFD_HOST}:6363" \
+  ndncat put-segmented "${PREFIX}" &
 SRV_PID=$!
-sleep 1
+sleep 1  # allow registration
 
-RESULT=$(ndn-peek "${PREFIX}/test" \
+# --pipeline 1: segmented fetch mode; sends CanBePrefix to discover the version
+# component produced by ndncat, then fetches seg=0.
+RESULT=$(ndn-peek --pipeline 1 "${PREFIX}" \
   --face-socket "${YANFD_SOCK}" --no-shm \
   --lifetime 4000 2>&1)
 

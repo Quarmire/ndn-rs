@@ -2,11 +2,11 @@
 # Interop: NDNts consumer ← ndn-fwd → ndn-rs producer.
 #
 # 1. ndn-rs producer registers /interop/ndnts-consumer on ndn-fwd and serves Data.
-# 2. NDNts ndnts-fetch fetches it via ndn-fwd.
+# 2. NDNts ndncat fetches it via ndn-fwd using CanBePrefix version discovery.
 set -euo pipefail
 
-if ! command -v ndnts-fetch > /dev/null 2>&1; then
-  echo "SKIP: ndnts-fetch not available" >&2
+if ! command -v ndncat > /dev/null 2>&1; then
+  echo "SKIP: ndncat not available" >&2
   exit 2
 fi
 
@@ -23,9 +23,9 @@ ndn-put "${PREFIX}" "${TMP}" \
 PUT_PID=$!
 sleep 0.5
 
-RESULT=$(ndnts-fetch \
-  --uplink "udp4://${FWD_HOST}:6363" \
-  "${PREFIX}/test" 2>&1)
+# --ver=cbp: send CanBePrefix Interest to discover ndn-put's versioned name.
+RESULT=$(NDNTS_UPLINK="udp4://${FWD_HOST}:6363" \
+  ndncat get-segmented --ver=cbp "${PREFIX}" 2>&1)
 
 kill "${PUT_PID}" 2>/dev/null || true
 rm -f "${TMP}"
