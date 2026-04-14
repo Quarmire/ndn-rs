@@ -427,7 +427,7 @@ The `did-ndn-driver` binary (in the `crates/did-ndn-driver` directory of this re
 cargo build --release -p did-ndn-driver
 
 # Run it (listens on port 8080 by default)
-./target/release/did-ndn-driver --port 8080 --ndn-socket /tmp/ndn.sock
+./target/release/did-ndn-driver --port 8080 --ndn-socket /run/nfd/nfd.sock
 ```
 
 ### 10.2 Driver API
@@ -476,7 +476,7 @@ ENTRYPOINT ["/did-ndn-driver"]
 ```bash
 docker build -t did-ndn-driver .
 docker run -p 8080:8080 \
-  -v /tmp/ndn.sock:/tmp/ndn.sock \
+  -v /run/nfd/nfd.sock:/run/nfd/nfd.sock \
   did-ndn-driver
 ```
 
