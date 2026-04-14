@@ -20,7 +20,7 @@ cross-process applications → iceoryx2 Data + mpsc Interest (~150 ns)
 remote peers             → UdpFace / EtherFace / TcpFace
 ```
 
-Inter-application forwarding requires either a shared process or a standalone `ndn-router` binary that external applications connect to via `AppFace` over shared memory.
+Inter-application forwarding requires either a shared process or a standalone `ndn-fwd` binary that external applications connect to via `AppFace` over shared memory.
 
 ## Key Design Decisions
 
@@ -40,7 +40,7 @@ Inter-application forwarding requires either a shared process or a standalone `n
 
 ```
 Layer 0 (binaries)
-  ndn-router   ndn-tools   ndn-bench
+  ndn-fwd   ndn-tools   ndn-bench
 
 Layer 1 (application & engine)
   ndn-app      ndn-ipc     ndn-engine

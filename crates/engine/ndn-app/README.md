@@ -1,6 +1,6 @@
 # ndn-app
 
-High-level Consumer, Producer, and Subscriber APIs for NDN applications. Supports two connection modes: connecting to a running `ndn-router` over a Unix socket, or running an embedded forwarder entirely in-process (useful for mobile/embedded targets). `KeyChain` handles identity and packet signing.
+High-level Consumer, Producer, and Subscriber APIs for NDN applications. Supports two connection modes: connecting to a running `ndn-fwd` forwarder over a Unix socket, or running an embedded forwarder entirely in-process (useful for mobile/embedded targets). `KeyChain` handles identity and packet signing.
 
 ## Key Types
 
@@ -24,9 +24,9 @@ High-level Consumer, Producer, and Subscriber APIs for NDN applications. Support
 ## Usage
 
 ```rust
-// Connect to a running ndn-router
+// Connect to a running ndn-fwd forwarder
 use ndn_app::Consumer;
-let mut consumer = Consumer::connect("/tmp/ndn.sock").await?;
+let mut consumer = Consumer::connect("/run/nfd/nfd.sock").await?;
 let data = consumer.fetch("/example/data").await?;
 
 // Or run embedded

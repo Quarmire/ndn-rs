@@ -1,7 +1,7 @@
 /// ndn-sec — NDN key and certificate management tool.
 ///
 /// Manages a file-based Public Info Base (PIB) that stores Ed25519 keys and
-/// their self-signed certificates for use by `ndn-router` and other NDN tools.
+/// their self-signed certificates for use by `ndn-fwd` and other NDN tools.
 ///
 /// # Quick start
 ///

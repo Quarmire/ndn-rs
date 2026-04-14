@@ -1,8 +1,8 @@
-/// Programmatic management client for NDN router control.
+/// Programmatic management client for `ndn-fwd` forwarder control.
 ///
 /// `MgmtClient` provides typed methods for every NFD management command,
 /// making it easy for control applications (routing daemons, CLI tools, etc.)
-/// to interact with a running ndn-router without hand-building Interest names.
+/// to interact with a running forwarder without hand-building Interest names.
 ///
 /// # Example
 ///
@@ -10,7 +10,7 @@
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 /// use ndn_ipc::MgmtClient;
 ///
-/// let mgmt = MgmtClient::connect("/tmp/ndn.sock").await?;
+/// let mgmt = MgmtClient::connect("/run/nfd/nfd.sock").await?;
 /// mgmt.route_add(&"/ndn".parse()?, Some(1), 10).await?;
 /// let status = mgmt.status().await?;
 /// println!("{} {}", status.status_code, status.status_text);
@@ -32,7 +32,7 @@ use ndn_transport::{Face, FaceId};
 
 use crate::forwarder_client::ForwarderError;
 
-/// Management client for a running ndn-router.
+/// Management client for a running `ndn-fwd` forwarder.
 ///
 /// Sends NFD management Interests over an [`IpcFace`] and decodes the
 /// `ControlResponse` from the returned Data packet.
@@ -45,10 +45,10 @@ pub struct MgmtClient {
 }
 
 impl MgmtClient {
-    /// Connect to the router's IPC socket.
+    /// Connect to the forwarder's IPC socket.
     ///
     /// `face_socket` is a Unix domain socket path on Unix (e.g.
-    /// `/tmp/ndn.sock`) or a Named Pipe path on Windows (e.g.
+    /// `/run/nfd/nfd.sock`) or a Named Pipe path on Windows (e.g.
     /// `\\.\pipe\ndn`).
     pub async fn connect(face_socket: impl AsRef<str>) -> Result<Self, ForwarderError> {
         let face =

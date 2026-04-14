@@ -1463,7 +1463,7 @@ fn default_socket_path() -> String {
     #[cfg(windows)]
     return r"\\.\pipe\ndn".to_string();
     #[cfg(not(windows))]
-    "/tmp/ndn.sock".to_string()
+    "/run/nfd/nfd.sock".to_string()
 }
 
 // ── Polling ───────────────────────────────────────────────────────────────────

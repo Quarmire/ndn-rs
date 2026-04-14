@@ -24,7 +24,7 @@
 //!
 //! | Platform | Default path |
 //! |----------|-------------|
-//! | Unix     | `/run/ndn/mgmt.sock` (or `/tmp/ndn.sock` in dev) |
+//! | Unix     | `/run/nfd/nfd.sock` |
 //! | Windows  | `\\.\pipe\ndn` |
 
 use std::io;
@@ -86,7 +86,7 @@ impl IpcListener {
         self.inner.cleanup();
     }
 
-    /// Human-readable URI for logging (e.g. `unix:///tmp/ndn.sock`).
+    /// Human-readable URI for logging (e.g. `unix:///run/nfd/nfd.sock`).
     pub fn uri(&self) -> &str {
         self.inner.uri()
     }
@@ -114,6 +114,12 @@ struct PlatformListener {
 #[cfg(unix)]
 impl PlatformListener {
     fn bind(path: &str) -> io::Result<Self> {
+        // Create parent directory if it doesn't exist (e.g. /run/nfd/ for /run/nfd/nfd.sock).
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
         let _ = std::fs::remove_file(path);
         let listener = tokio::net::UnixListener::bind(path)?;
         Ok(Self {

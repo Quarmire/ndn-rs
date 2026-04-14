@@ -130,7 +130,7 @@ pub struct ConnectConfig {
 impl Default for ConnectConfig {
     fn default() -> Self {
         #[cfg(unix)]
-        let face_socket = "/tmp/ndn.sock".to_string();
+        let face_socket = "/run/nfd/nfd.sock".to_string();
         #[cfg(windows)]
         let face_socket = r"\\.\pipe\ndn".to_string();
         Self {

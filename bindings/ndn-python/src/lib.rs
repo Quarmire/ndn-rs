@@ -18,11 +18,11 @@
 //! from ndn_rs import Consumer, Producer
 //!
 //! # Fetch content
-//! c = Consumer("/tmp/ndn.sock")
+//! c = Consumer("/run/nfd/nfd.sock")
 //! raw = c.get("/ndn/sensor/temperature")  # bytes
 //!
 //! # Serve data
-//! p = Producer("/tmp/ndn.sock", "/ndn/sensor")
+//! p = Producer("/run/nfd/nfd.sock", "/ndn/sensor")
 //! p.serve(lambda name: b"23.5" if "temperature" in name else None)
 //! ```
 
@@ -102,7 +102,7 @@ impl Data {
 
 /// Synchronous NDN consumer.
 ///
-/// Connects to a running ``ndn-router`` via its Unix socket. All calls block
+/// Connects to a running ``ndn-fwd`` forwarder via its Unix socket. All calls block
 /// the calling thread (and the Python GIL) for up to the Interest lifetime
 /// (default 4.5 s). For concurrent fetches, use ``asyncio.to_thread`` or
 /// create one :class:`Consumer` per thread.
@@ -110,17 +110,17 @@ impl Data {
 /// Parameters
 /// ----------
 /// socket : str
-///     Path to the router's face socket, e.g. ``"/tmp/ndn.sock"``.
+///     Path to the forwarder's face socket, e.g. ``"/run/nfd/nfd.sock"``.
 ///
 /// Raises
 /// ------
 /// RuntimeError
-///     If the connection to the router fails.
+///     If the connection to the forwarder fails.
 ///
 /// Examples
 /// --------
 /// ```python
-/// c = ndn_rs.Consumer("/tmp/ndn.sock")
+/// c = ndn_rs.Consumer("/run/nfd/nfd.sock")
 /// raw   = c.get("/ndn/sensor/temperature")   # bytes
 /// data  = c.fetch("/ndn/sensor/temperature")  # Data object
 /// print(data.name, data.content)
@@ -180,13 +180,13 @@ impl Consumer {
 
 /// Synchronous NDN producer.
 ///
-/// Connects to a running ``ndn-router``, registers a name prefix, and serves
+/// Connects to a running ``ndn-fwd`` forwarder, registers a name prefix, and serves
 /// Interests via a Python callback.
 ///
 /// Parameters
 /// ----------
 /// socket : str
-///     Path to the router's face socket.
+///     Path to the forwarder's face socket.
 /// prefix : str
 ///     NDN name prefix to register, e.g. ``"/ndn/sensor"``.
 ///
@@ -198,7 +198,7 @@ impl Consumer {
 /// Examples
 /// --------
 /// ```python
-/// p = ndn_rs.Producer("/tmp/ndn.sock", "/ndn/sensor")
+/// p = ndn_rs.Producer("/run/nfd/nfd.sock", "/ndn/sensor")
 ///
 /// def handler(name: str) -> bytes | None:
 ///     if name.endswith("/temperature"):

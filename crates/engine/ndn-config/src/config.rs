@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 /// Top-level forwarder configuration (loaded from TOML).
 ///
-/// Example `ndn-router.toml`:
+/// Example `ndn-fwd.toml`:
 ///
 /// ```toml
 /// [engine]
@@ -501,7 +501,7 @@ pub struct ManagementConfig {
     /// `ndn-ctl` and application processes connect here to exchange NDN packets
     /// with the forwarder.
     ///
-    /// Default (Unix): `/tmp/ndn.sock`
+    /// Default (Unix): `/run/nfd/nfd.sock`
     /// Default (Windows): `\\.\pipe\ndn`
     #[serde(default = "default_face_socket")]
     pub face_socket: String,
@@ -517,7 +517,7 @@ impl Default for ManagementConfig {
 
 fn default_face_socket() -> String {
     #[cfg(unix)]
-    return "/tmp/ndn.sock".to_owned();
+    return "/run/nfd/nfd.sock".to_owned();
     #[cfg(windows)]
     return r"\\.\pipe\ndn".to_owned();
 }
@@ -961,7 +961,7 @@ file = "/var/log/ndn/router.log"
 
     #[test]
     fn example_file_parses() {
-        let s = include_str!("../../../../ndn-router.example.toml");
+        let s = include_str!("../../../../ndn-fwd.example.toml");
         ForwarderConfig::from_str(s).expect("example config should parse");
     }
 }

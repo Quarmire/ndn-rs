@@ -1,6 +1,6 @@
 //! `ndn-ping` — measure round-trip time to a named prefix.
 //!
-//! Connects to a running `ndn-router` via Unix socket + optional SHM data plane.
+//! Connects to a running `ndn-fwd` forwarder via Unix socket + optional SHM data plane.
 //!
 //! ## Server mode
 //!
@@ -31,8 +31,8 @@ use ndn_tools_core::ping::{PingClientParams, PingServerParams};
 
 #[derive(Args, Clone)]
 struct ConnectOpts {
-    /// Router face socket path.
-    #[arg(long, default_value = "/tmp/ndn.sock")]
+    /// Forwarder face socket path.
+    #[arg(long, default_value = "/run/nfd/nfd.sock")]
     face_socket: String,
 
     /// Disable SHM and use Unix socket for data plane.

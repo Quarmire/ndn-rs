@@ -1,6 +1,6 @@
 /// NDN management client over WebSocket.
 ///
-/// Connects to an ndn-router's WebSocket face, sends NFD management
+/// Connects to an ndn-fwd forwarder's WebSocket face, sends NFD management
 /// Interest packets, and decodes Data responses.
 
 import { TlvEncoder, TlvDecoder, Type, encodeName, decodeName, decodeNameComponents } from './tlv.js';

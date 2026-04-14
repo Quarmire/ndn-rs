@@ -1,21 +1,21 @@
-/// App-side client for connecting to a running ndn-router.
+/// App-side client for connecting to a running `ndn-fwd` forwarder.
 ///
 /// `ForwarderClient` handles:
-/// - Connecting to the router's face socket (UnixFace)
+/// - Connecting to the forwarder's face socket (UnixFace)
 /// - Optionally creating an SHM face for high-performance data plane
 /// - Registering/unregistering prefixes via NFD `rib/register`/`rib/unregister`
 /// - Sending and receiving NDN packets on the data plane
 ///
 /// # Mobile (Android / iOS)
 ///
-/// On mobile the forwarder runs in-process; there is no separate router daemon
+/// On mobile the forwarder runs in-process; there is no separate forwarder daemon
 /// to connect to.  Use [`ndn_engine::ForwarderEngine`] in embedded mode with
 /// an [`ndn_faces::local::AppFace`] instead of `ForwarderClient`.
 ///
 /// # Connection flow (SHM preferred)
 ///
 /// ```text
-/// 1. Connect to /tmp/ndn.sock → UnixFace (control channel)
+/// 1. Connect to /run/nfd/nfd.sock → UnixFace (control channel)
 /// 2. Send faces/create {Uri:"shm://myapp"} → get FaceId
 /// 3. ShmHandle::connect("myapp") → data plane ready
 /// 4. Send rib/register {Name:"/prefix", FaceId} → route installed
@@ -25,7 +25,7 @@
 /// # Connection flow (Unix fallback)
 ///
 /// ```text
-/// 1. Connect to /tmp/ndn.sock → UnixFace (control + data)
+/// 1. Connect to /run/nfd/nfd.sock → UnixFace (control + data)
 /// 2. Send rib/register {Name:"/prefix"} → FaceId defaults to requesting face
 /// 3. Send/recv packets over same UnixFace
 /// ```
@@ -78,7 +78,7 @@ enum DataTransport {
     Unix,
 }
 
-/// Client for connecting to and communicating with a running ndn-router.
+/// Client for connecting to and communicating with a running `ndn-fwd` forwarder.
 pub struct ForwarderClient {
     /// Control channel (Unix domain socket on Unix, Named Pipe on Windows).
     control: Arc<IpcFace>,

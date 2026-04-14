@@ -1,15 +1,15 @@
 # ndn-ipc
 
-Connects application processes to the NDN router over Unix sockets, with an optional shared-memory SPSC ring buffer for high-throughput data paths. Provides chunked transfer for objects larger than a single NDN packet, and a local service registry for prefix advertisement and lookup.
+Connects application processes to the NDN forwarder over Unix sockets, with an optional shared-memory SPSC ring buffer for high-throughput data paths. Provides chunked transfer for objects larger than a single NDN packet, and a local service registry for prefix advertisement and lookup.
 
 ## Key Types
 
 | Type / Trait | Role |
 |---|---|
-| `IpcClient` | Unix-socket client endpoint for app-to-router communication |
-| `IpcServer` | Unix-socket server endpoint (used by the router) |
+| `IpcClient` | Unix-socket client endpoint for app-to-forwarder communication |
+| `IpcServer` | Unix-socket server endpoint (used by the forwarder) |
 | `RouterClient` | Ergonomic wrapper around `IpcClient` for common app operations |
-| `MgmtClient` | Control-plane client — sends NFD management commands to the router |
+| `MgmtClient` | Control-plane client — sends NFD management commands to the forwarder |
 | `ChunkedProducer` | Segments a large object and serves it over NDN |
 | `ChunkedConsumer` | Reassembles a segmented object from multiple Data packets |
 | `ServiceRegistry` | Local service advertisement and prefix lookup |
@@ -25,7 +25,7 @@ Connects application processes to the NDN router over Unix sockets, with an opti
 ```rust
 use ndn_ipc::RouterClient;
 
-let client = RouterClient::connect("/tmp/ndn.sock").await?;
+let client = RouterClient::connect("/run/nfd/nfd.sock").await?;
 client.register_prefix("/myapp/data").await?;
 ```
 

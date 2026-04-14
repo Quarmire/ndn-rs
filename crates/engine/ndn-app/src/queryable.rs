@@ -10,7 +10,7 @@
 //! use ndn_app::Queryable;
 //! use ndn_packet::encode::DataBuilder;
 //!
-//! let mut q = Queryable::connect("/tmp/ndn.sock", "/sensors/temp").await?;
+//! let mut q = Queryable::connect("/run/nfd/nfd.sock", "/sensors/temp").await?;
 //!
 //! while let Some(query) = q.recv().await {
 //!     let data = DataBuilder::new((*query.interest.name).clone(), b"22.5").build();

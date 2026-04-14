@@ -9,7 +9,7 @@
 //! use ndn_ipc::BlockingForwarderClient;
 //! use ndn_packet::Name;
 //!
-//! let mut client = BlockingForwarderClient::connect("/tmp/ndn.sock").unwrap();
+//! let mut client = BlockingForwarderClient::connect("/run/nfd/nfd.sock").unwrap();
 //! let prefix: Name = "/example".parse().unwrap();
 //! client.register_prefix(&prefix).unwrap();
 //!

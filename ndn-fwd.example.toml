@@ -1,11 +1,11 @@
-# ndn-router.example.toml
+# ndn-fwd.example.toml
 #
-# Complete reference configuration for ndn-router.
+# Complete reference configuration for ndn-fwd.
 # Every option is listed with its default value shown in a comment.
 # Copy this file, uncomment and adjust what you need.
 #
-# Load with:  ndn-router --config ndn-router.toml
-# Or set:     NDN_CONFIG=/path/to/ndn-router.toml
+# Load with:  ndn-fwd --config ndn-fwd.toml
+# Or set:     NDN_CONFIG=/path/to/ndn-fwd.toml
 
 # ─── Engine ──────────────────────────────────────────────────────────────────
 # Core forwarding-engine tuning.
@@ -147,9 +147,9 @@ cost = 10
 # packets and send management commands.
 # Unix: path to a Unix domain socket.
 # Windows: Named Pipe path.
-# Default (Unix):    /tmp/ndn.sock
+# Default (Unix):    /run/nfd/nfd.sock
 # Default (Windows): \\.\pipe\ndn
-# socket = "/tmp/ndn.sock"
+# socket = "/run/nfd/nfd.sock"
 
 
 # ─── Security ────────────────────────────────────────────────────────────────

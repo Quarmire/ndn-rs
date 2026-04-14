@@ -1,6 +1,6 @@
 //! Standalone NDN forwarder binary.
 //!
-//! `ndn-router` wraps [`ndn_engine::ForwarderEngine`] with TOML config loading,
+//! `ndn-fwd` wraps [`ndn_engine::ForwarderEngine`] with TOML config loading,
 //! face setup (UDP, TCP, Multicast, Ethernet, WebSocket, Serial), neighbor
 //! discovery, routing protocols, and an NDN-native management socket
 //! (NFD-compatible Interest/Data protocol on `/localhost/nfd/`).
@@ -8,9 +8,9 @@
 //! # Usage
 //!
 //! ```text
-//! ndn-router                    # start with built-in defaults
-//! ndn-router -c router.toml    # load config from file
-//! ndn-router --help
+//! ndn-fwd                       # start with built-in defaults
+//! ndn-fwd -c ndn-fwd.toml      # load config from file
+//! ndn-fwd --help
 //! ```
 //!
 //! Set `RUST_LOG=info` for status, `RUST_LOG=ndn_engine=trace` for pipeline tracing.
@@ -208,7 +208,7 @@ fn init_tracing(
             log_path.parent().unwrap_or(std::path::Path::new(".")),
             log_path
                 .file_name()
-                .unwrap_or(std::ffi::OsStr::new("ndn-router.log")),
+                .unwrap_or(std::ffi::OsStr::new("ndn-fwd.log")),
         );
         let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 

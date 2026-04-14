@@ -9,7 +9,7 @@
 //! # async fn example() -> Result<(), ndn_app::AppError> {
 //! use ndn_app::Subscriber;
 //!
-//! let mut sub = Subscriber::connect("/tmp/ndn.sock", "/chat/room1").await?;
+//! let mut sub = Subscriber::connect("/run/nfd/nfd.sock", "/chat/room1").await?;
 //!
 //! while let Some(sample) = sub.recv().await {
 //!     println!("{}: {:?}", sample.name, sample.payload);

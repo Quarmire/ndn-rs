@@ -30,8 +30,8 @@ const WIKI_PAGES = {
   'ndn-cert':          'deep-dive/ndncert.html',
   'ndn-identity':      'guides/ndncert-setup.html',
   'ndn-mobile':        'guides/mobile-apps.html',
-  'ndn-router':        'getting-started/running-router.html',
-  'ndn-dashboard':     'getting-started/running-router.html',
+  'ndn-fwd':           'getting-started/running-forwarder.html',
+  'ndn-dashboard':     'getting-started/running-forwarder.html',
   'ndn-wasm':          'deep-dive/wasm-browser-simulation.html',
   'ndn-tools':         'guides/cli-tools.html',
 };

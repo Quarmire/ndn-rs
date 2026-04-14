@@ -1,4 +1,4 @@
-/// ndn-ctl — send management commands to a running ndn-router.
+/// ndn-ctl — send management commands to a running ndn-fwd forwarder.
 ///
 /// Commands follow the `<noun> <verb>` pattern (like NFD's `nfdc`):
 ///
@@ -28,13 +28,13 @@ use ndn_ipc::MgmtClient;
 #[derive(Parser)]
 #[command(
     name = "ndn-ctl",
-    about = "Send management commands to a running ndn-router",
+    about = "Send management commands to a running ndn-fwd forwarder",
     version
 )]
 struct Cli {
     /// Router socket path.
     ///
-    /// On Unix: path to a Unix domain socket (e.g. `/tmp/ndn.sock`).
+    /// On Unix: path to a Unix domain socket (e.g. `/run/nfd/nfd.sock`).
     /// On Windows: a Named Pipe path (e.g. `\\.\pipe\ndn`).
     /// May also be set via $NDN_SOCK.
     #[arg(
@@ -260,7 +260,7 @@ async fn run_nfd(cli: &Cli) -> anyhow::Result<()> {
 
     let mgmt = MgmtClient::connect(&cli.socket)
         .await
-        .with_context(|| format!("Cannot connect to '{}'. Is ndn-router running?", cli.socket))?;
+        .with_context(|| format!("Cannot connect to '{}'. Is ndn-fwd running?", cli.socket))?;
 
     match &cli.command {
         Command::Route { action } => match action {
