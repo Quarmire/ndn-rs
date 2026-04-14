@@ -45,34 +45,45 @@ if ! kill -0 "${SRV_PID}" 2>/dev/null; then
   exit 1
 fi
 
-# Query the FIB to check whether NDNts self-registered via rib/register.
+# Query the RIB to check whether NDNts self-registered via rib/register.
+# yanfd may not support the route-list dataset command — if it returns nothing,
+# treat that as "unavailable" and trust NDNts self-registration rather than
+# falling back to manual route add (which kills the NDNts face immediately).
 echo "  yanfd route list:" >&2
 ROUTE_LIST=$(ndn-ctl --socket "${YANFD_SOCK}" route list 2>/dev/null || true)
-echo "${ROUTE_LIST}" | grep -E "${PREFIX}|error|Error" >&2 || \
-  echo "  (route list unavailable or prefix not found)" >&2
 
-# Extract the face ID from the FIB entry if the prefix is already registered.
-NDNTS_FACE=$(echo "${ROUTE_LIST}" | grep "${PREFIX}" \
-  | grep -oE 'faceid=[0-9]+' | sed 's/faceid=//' | head -1)
-
-if [ -n "${NDNTS_FACE}" ]; then
-  echo "  NDNts self-registered on face ${NDNTS_FACE}; no manual registration needed." >&2
+if [ -z "${ROUTE_LIST}" ]; then
+  # route list returned nothing → command not supported by this yanfd version.
+  # yanfd reliably propagates NDNts's own rib/register; skip manual registration.
+  echo "  (route list unavailable — trusting NDNts self-registration)" >&2
 else
-  echo "  NDNts did not self-register; finding face and registering manually." >&2
-  # Enumerate all active connection faces: face IDs below 0xFFFF_0000 (4294901760)
-  # exclude the reserved management face (0xFFFF_0001 = 4294901761).
-  # NDNts connected before this ndn-ctl query, so it has the lowest numeric face ID.
-  NDNTS_FACE=$(
-    ndn-ctl --socket "${YANFD_SOCK}" face list 2>/dev/null \
-      | grep -oE 'faceid=[0-9]+' | sed 's/faceid=//' \
-      | awk '$1 < 4294901760' | sort -n | head -1 || true
-  )
+  echo "${ROUTE_LIST}" | grep -E "${PREFIX}|error|Error" >&2 || \
+    echo "  (prefix not yet in route list)" >&2
+
+  # Extract the face ID from the FIB entry if the prefix is already registered.
+  NDNTS_FACE=$(echo "${ROUTE_LIST}" | grep "${PREFIX}" \
+    | grep -oE 'faceid=[0-9]+' | sed 's/faceid=//' | head -1)
+
   if [ -n "${NDNTS_FACE}" ]; then
-    echo "  Detected NDNts face: ${NDNTS_FACE}; registering route manually." >&2
-    ndn-ctl --socket "${YANFD_SOCK}" route add "${PREFIX}" --face "${NDNTS_FACE}" >&2 || \
-      echo "  (route add returned error — NDNts may have self-registered)" >&2
+    echo "  NDNts self-registered on face ${NDNTS_FACE}; no manual registration needed." >&2
   else
-    echo "  No connection faces found; cannot register route manually." >&2
+    # route list returned output but the prefix is absent — NDNts did not
+    # self-register.  Find the connection face and register manually.
+    echo "  NDNts did not self-register; finding face and registering manually." >&2
+    # Enumerate all active connection faces: face IDs below 0xFFFF_0000 (4294901760)
+    # exclude the reserved management face (0xFFFF_0001 = 4294901761).
+    NDNTS_FACE=$(
+      ndn-ctl --socket "${YANFD_SOCK}" face list 2>/dev/null \
+        | grep -oE 'faceid=[0-9]+' | sed 's/faceid=//' \
+        | awk '$1 < 4294901760' | sort -n | head -1 || true
+    )
+    if [ -n "${NDNTS_FACE}" ]; then
+      echo "  Detected NDNts face: ${NDNTS_FACE}; registering route manually." >&2
+      ndn-ctl --socket "${YANFD_SOCK}" route add "${PREFIX}" --face "${NDNTS_FACE}" >&2 || \
+        echo "  (route add returned error — NDNts may have self-registered)" >&2
+    else
+      echo "  No connection faces found; cannot register route manually." >&2
+    fi
   fi
 fi
 
