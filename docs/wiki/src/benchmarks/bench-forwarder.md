@@ -10,11 +10,11 @@ on every push to `main` and weekly on Mondays.
 
 <!-- The section below is machine-generated. Do not edit manually. -->
 
-*Last run: `2026-04-13` (ubuntu-latest, stable ndn-rs)*
+*Last run: `2026-04-14` (ubuntu-latest, stable ndn-rs)*
 
 | Metric | ndn-fwd | ndn-fwd-internal | nfd | yanfd |
 |--------|--------|--------|--------|--------|
-| internal-throughput (unix) | n/a | 3.13 Gbps / 49879 Int/s | n/a | n/a |
-| latency p50/p99 (unix) | 209µs / 372µs | n/a | 250µs / 350µs | 289µs / 456µs |
-| throughput (unix) | 3.20 Gbps / 49996 Int/s | n/a | 695.47 Mbps / 10942 Int/s | 1.43 Gbps / 25965 Int/s |
+| internal-throughput (unix) | n/a | 3.26 Gbps / 51480 Int/s | n/a | n/a |
+| latency p50/p99 (unix) | 206µs / 838µs | n/a | 239µs / 323µs | 289µs / 796µs |
+| throughput (unix) | 3.24 Gbps / 51342 Int/s | n/a | 749.85 Mbps / 11822 Int/s | 1.42 Gbps / 26922 Int/s |
 
