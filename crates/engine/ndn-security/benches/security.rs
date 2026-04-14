@@ -77,6 +77,23 @@ fn build_signed_data(signer: &Ed25519Signer, data_comp: &str, key_comp: &str) ->
 
 // ── Signing benchmarks ─────────────────────────────────────────────────────
 
+const PAYLOAD_SIZES: &[usize] = &[100, 500, 1000, 2000, 4000, 8000];
+
+fn size_label(size: usize) -> String {
+    if size % 1000 == 0 {
+        format!("{}KB", size / 1000)
+    } else {
+        format!("{}B", size)
+    }
+}
+
+fn make_regions() -> Vec<(String, Vec<u8>)> {
+    PAYLOAD_SIZES
+        .iter()
+        .map(|&n| (size_label(n), vec![0u8; n]))
+        .collect()
+}
+
 fn bench_signing(c: &mut Criterion) {
     let key_name = name1("key");
     let ed_signer = Ed25519Signer::from_seed(&[1u8; 32], key_name.clone());
@@ -84,12 +101,11 @@ fn bench_signing(c: &mut Criterion) {
     let blake3_plain_signer = Blake3Signer::new(key_name.clone());
     let blake3_keyed_signer = Blake3KeyedSigner::new(&[3u8; 32], key_name);
 
-    let region_100 = vec![0u8; 100];
-    let region_500 = vec![0u8; 500];
+    let regions = make_regions();
 
     {
         let mut group = c.benchmark_group("signing/ed25519");
-        for (label, region) in [("100B", &region_100), ("500B", &region_500)] {
+        for (label, region) in &regions {
             group.throughput(Throughput::Bytes(region.len() as u64));
             group.bench_with_input(BenchmarkId::new("sign_sync", label), region, |b, r| {
                 b.iter(|| {
@@ -104,7 +120,7 @@ fn bench_signing(c: &mut Criterion) {
 
     {
         let mut group = c.benchmark_group("signing/hmac");
-        for (label, region) in [("100B", &region_100), ("500B", &region_500)] {
+        for (label, region) in &regions {
             group.throughput(Throughput::Bytes(region.len() as u64));
             group.bench_with_input(BenchmarkId::new("sign_sync", label), region, |b, r| {
                 b.iter(|| {
@@ -117,10 +133,28 @@ fn bench_signing(c: &mut Criterion) {
         group.finish();
     }
 
+    // SHA256 plain digest — DigestSha256 (type 0). No key material.
+    // Uses ring::digest directly since the NDN spec's DigestSha256 is just
+    // a raw SHA256 over the signed region.
+    {
+        let mut group = c.benchmark_group("signing/sha256-digest");
+        for (label, region) in &regions {
+            group.throughput(Throughput::Bytes(region.len() as u64));
+            group.bench_with_input(BenchmarkId::new("sign_sync", label), region, |b, r| {
+                b.iter(|| {
+                    let digest = ring::digest::digest(&ring::digest::SHA256, r);
+                    debug_assert_eq!(digest.as_ref().len(), 32);
+                    digest
+                });
+            });
+        }
+        group.finish();
+    }
+
     // BLAKE3 plain digest — analogous to DigestSha256 (type 0).
     {
         let mut group = c.benchmark_group("signing/blake3-plain");
-        for (label, region) in [("100B", &region_100), ("500B", &region_500)] {
+        for (label, region) in &regions {
             group.throughput(Throughput::Bytes(region.len() as u64));
             group.bench_with_input(BenchmarkId::new("sign_sync", label), region, |b, r| {
                 b.iter(|| {
@@ -136,7 +170,7 @@ fn bench_signing(c: &mut Criterion) {
     // BLAKE3 keyed — analogous to HmacWithSha256 (type 4).
     {
         let mut group = c.benchmark_group("signing/blake3-keyed");
-        for (label, region) in [("100B", &region_100), ("500B", &region_500)] {
+        for (label, region) in &regions {
             group.throughput(Throughput::Bytes(region.len() as u64));
             group.bench_with_input(BenchmarkId::new("sign_sync", label), region, |b, r| {
                 b.iter(|| {
@@ -158,29 +192,39 @@ fn bench_verification(c: &mut Criterion) {
         .unwrap();
 
     let seed = [3u8; 32];
-    let signer = Ed25519Signer::from_seed(&seed, name1("key"));
-    let public_key = signer.public_key_bytes();
-    let verifier = Ed25519Verifier;
+    let ed_signer = Ed25519Signer::from_seed(&seed, name1("key"));
+    let public_key = ed_signer.public_key_bytes();
+    let ed_verifier = Ed25519Verifier;
 
-    // Pre-sign the region outside the iter closure.
-    let region_100 = vec![0u8; 100];
-    let region_500 = vec![0u8; 500];
-    let sig_100 = signer.sign_sync(&region_100).unwrap();
-    let sig_500 = signer.sign_sync(&region_500).unwrap();
+    let blake3_plain_signer = Blake3Signer::new(name1("key"));
+    let blake3_plain_verifier = Blake3DigestVerifier;
+
+    let blake3_key = [7u8; 32];
+    let blake3_keyed_signer = Blake3KeyedSigner::new(&blake3_key, name1("key"));
+    let blake3_keyed_verifier = Blake3KeyedVerifier;
+
+    // Pre-build regions and pre-sign them once per algorithm.
+    let regions = make_regions();
+    let presigned: Vec<(String, Vec<u8>, Bytes, Bytes, Bytes)> = regions
+        .into_iter()
+        .map(|(label, region)| {
+            let ed_sig = ed_signer.sign_sync(&region).unwrap();
+            let b3_plain_sig = blake3_plain_signer.sign_sync(&region).unwrap();
+            let b3_keyed_sig = blake3_keyed_signer.sign_sync(&region).unwrap();
+            (label, region, ed_sig, b3_plain_sig, b3_keyed_sig)
+        })
+        .collect();
 
     {
         let mut group = c.benchmark_group("verification/ed25519");
-        for (label, region, sig) in [
-            ("100B", region_100.as_slice(), sig_100.as_ref()),
-            ("500B", region_500.as_slice(), sig_500.as_ref()),
-        ] {
+        for (label, region, ed_sig, _, _) in &presigned {
             group.throughput(Throughput::Bytes(region.len() as u64));
             group.bench_with_input(
                 BenchmarkId::new("verify", label),
-                &(region, sig),
+                &(region.as_slice(), ed_sig.as_ref()),
                 |b, &(r, s)| {
                     b.iter(|| {
-                        let outcome = rt.block_on(verifier.verify(r, s, &public_key)).unwrap();
+                        let outcome = rt.block_on(ed_verifier.verify(r, s, &public_key)).unwrap();
                         debug_assert_eq!(outcome, ndn_security::VerifyOutcome::Valid);
                         outcome
                     });
@@ -190,25 +234,39 @@ fn bench_verification(c: &mut Criterion) {
         group.finish();
     }
 
-    // BLAKE3 plain-digest verification — no key material.
+    // SHA256 plain-digest verification — re-hash and compare.
     {
-        let blake3_plain_signer = Blake3Signer::new(name1("key"));
-        let sig_100 = blake3_plain_signer.sign_sync(&region_100).unwrap();
-        let sig_500 = blake3_plain_signer.sign_sync(&region_500).unwrap();
-        let verifier = Blake3DigestVerifier;
-
-        let mut group = c.benchmark_group("verification/blake3-plain");
-        for (label, region, sig) in [
-            ("100B", region_100.as_slice(), sig_100.as_ref()),
-            ("500B", region_500.as_slice(), sig_500.as_ref()),
-        ] {
+        let mut group = c.benchmark_group("verification/sha256-digest");
+        for (label, region, _, _, _) in &presigned {
+            let expected = ring::digest::digest(&ring::digest::SHA256, region);
+            let expected_bytes: Bytes = Bytes::copy_from_slice(expected.as_ref());
             group.throughput(Throughput::Bytes(region.len() as u64));
             group.bench_with_input(
                 BenchmarkId::new("verify", label),
-                &(region, sig),
+                &(region.as_slice(), expected_bytes.as_ref()),
                 |b, &(r, s)| {
                     b.iter(|| {
-                        let outcome = rt.block_on(verifier.verify(r, s, &[])).unwrap();
+                        let got = ring::digest::digest(&ring::digest::SHA256, r);
+                        debug_assert_eq!(got.as_ref(), s);
+                        got
+                    });
+                },
+            );
+        }
+        group.finish();
+    }
+
+    // BLAKE3 plain-digest verification — no key material.
+    {
+        let mut group = c.benchmark_group("verification/blake3-plain");
+        for (label, region, _, b3_plain_sig, _) in &presigned {
+            group.throughput(Throughput::Bytes(region.len() as u64));
+            group.bench_with_input(
+                BenchmarkId::new("verify", label),
+                &(region.as_slice(), b3_plain_sig.as_ref()),
+                |b, &(r, s)| {
+                    b.iter(|| {
+                        let outcome = rt.block_on(blake3_plain_verifier.verify(r, s, &[])).unwrap();
                         debug_assert_eq!(outcome, ndn_security::VerifyOutcome::Valid);
                         outcome
                     });
@@ -220,24 +278,17 @@ fn bench_verification(c: &mut Criterion) {
 
     // BLAKE3 keyed verification — 32-byte shared secret as "public_key".
     {
-        let key = [7u8; 32];
-        let blake3_keyed_signer = Blake3KeyedSigner::new(&key, name1("key"));
-        let sig_100 = blake3_keyed_signer.sign_sync(&region_100).unwrap();
-        let sig_500 = blake3_keyed_signer.sign_sync(&region_500).unwrap();
-        let verifier = Blake3KeyedVerifier;
-
         let mut group = c.benchmark_group("verification/blake3-keyed");
-        for (label, region, sig) in [
-            ("100B", region_100.as_slice(), sig_100.as_ref()),
-            ("500B", region_500.as_slice(), sig_500.as_ref()),
-        ] {
+        for (label, region, _, _, b3_keyed_sig) in &presigned {
             group.throughput(Throughput::Bytes(region.len() as u64));
             group.bench_with_input(
                 BenchmarkId::new("verify", label),
-                &(region, sig),
+                &(region.as_slice(), b3_keyed_sig.as_ref()),
                 |b, &(r, s)| {
                     b.iter(|| {
-                        let outcome = rt.block_on(verifier.verify(r, s, &key)).unwrap();
+                        let outcome = rt
+                            .block_on(blake3_keyed_verifier.verify(r, s, &blake3_key))
+                            .unwrap();
                         debug_assert_eq!(outcome, ndn_security::VerifyOutcome::Valid);
                         outcome
                     });
