@@ -692,8 +692,14 @@ mod tests {
         let entry = FibEntry {
             name: name(&[b"ndn", b"test"]),
             nexthops: vec![
-                NextHopRecord { face_id: 1, cost: 10 },
-                NextHopRecord { face_id: 2, cost: 5 },
+                NextHopRecord {
+                    face_id: 1,
+                    cost: 10,
+                },
+                NextHopRecord {
+                    face_id: 2,
+                    cost: 5,
+                },
             ],
         };
         let encoded = entry.encode();
@@ -738,6 +744,9 @@ mod tests {
         let mut buf = encoded.as_ref();
         let decoded = StrategyChoice::decode(&mut buf).unwrap();
         assert!(buf.is_empty());
-        assert_eq!(decoded.strategy.to_string(), "/localhost/nfd/strategy/best-route");
+        assert_eq!(
+            decoded.strategy.to_string(),
+            "/localhost/nfd/strategy/best-route"
+        );
     }
 }

@@ -80,7 +80,7 @@ fn build_signed_data(signer: &Ed25519Signer, data_comp: &str, key_comp: &str) ->
 const PAYLOAD_SIZES: &[usize] = &[100, 500, 1000, 2000, 4000, 8000];
 
 fn size_label(size: usize) -> String {
-    if size % 1000 == 0 {
+    if size.is_multiple_of(1000) {
         format!("{}KB", size / 1000)
     } else {
         format!("{}B", size)
@@ -266,7 +266,9 @@ fn bench_verification(c: &mut Criterion) {
                 &(region.as_slice(), b3_plain_sig.as_ref()),
                 |b, &(r, s)| {
                     b.iter(|| {
-                        let outcome = rt.block_on(blake3_plain_verifier.verify(r, s, &[])).unwrap();
+                        let outcome = rt
+                            .block_on(blake3_plain_verifier.verify(r, s, &[]))
+                            .unwrap();
                         debug_assert_eq!(outcome, ndn_security::VerifyOutcome::Valid);
                         outcome
                     });

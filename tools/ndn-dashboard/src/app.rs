@@ -1504,16 +1504,22 @@ async fn poll_all(
     // FaceCounter from it so we don't need a separate face_counters() call.
     match client.face_list().await {
         Ok(faces_data) => {
-            let face_infos: Vec<FaceInfo> = faces_data.iter().map(|fs| FaceInfo::from(fs.clone())).collect();
-            let derived_counters: Vec<FaceCounter> = face_infos.iter().map(|f| FaceCounter {
-                face_id: f.face_id,
-                in_interests: f.n_in_interests,
-                in_data: f.n_in_data,
-                out_interests: f.n_out_interests,
-                out_data: f.n_out_data,
-                in_bytes: f.n_in_bytes,
-                out_bytes: f.n_out_bytes,
-            }).collect();
+            let face_infos: Vec<FaceInfo> = faces_data
+                .iter()
+                .map(|fs| FaceInfo::from(fs.clone()))
+                .collect();
+            let derived_counters: Vec<FaceCounter> = face_infos
+                .iter()
+                .map(|f| FaceCounter {
+                    face_id: f.face_id,
+                    in_interests: f.n_in_interests,
+                    in_data: f.n_in_data,
+                    out_interests: f.n_out_interests,
+                    out_data: f.n_out_data,
+                    in_bytes: f.n_in_bytes,
+                    out_bytes: f.n_out_bytes,
+                })
+                .collect();
             faces.set(face_infos);
             counters.set(derived_counters);
         }
@@ -1532,9 +1538,12 @@ async fn poll_all(
         Err(e) => return Err(e.to_string()),
     }
     match client.strategy_list().await {
-        Ok(strategies_data) => {
-            strategies.set(strategies_data.into_iter().map(StrategyEntry::from).collect())
-        }
+        Ok(strategies_data) => strategies.set(
+            strategies_data
+                .into_iter()
+                .map(StrategyEntry::from)
+                .collect(),
+        ),
         Err(e) => return Err(e.to_string()),
     }
     // Best-effort endpoints — ignore errors so older routers still work.

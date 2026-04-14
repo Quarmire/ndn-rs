@@ -2,14 +2,10 @@ use bytes::Bytes;
 use criterion::{
     BatchSize, BenchmarkGroup, Criterion, Throughput, criterion_group, criterion_main,
 };
-use ndn_packet::{Name, NameComponent};
+use ndn_packet::Name;
 use ndn_store::{ContentStore, CsMeta, InsertResult, LruCs};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-
-fn comp(s: &str) -> NameComponent {
-    NameComponent::generic(Bytes::copy_from_slice(s.as_bytes()))
-}
 
 fn data_wire(name: &Name) -> Bytes {
     Bytes::copy_from_slice(name.to_string().as_bytes())

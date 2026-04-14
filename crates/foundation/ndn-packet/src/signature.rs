@@ -213,7 +213,7 @@ mod tests {
     fn decode_sig_time() {
         let mut w = TlvWriter::new();
         w.write_tlv(crate::tlv_type::SIGNATURE_TYPE, &[5]);
-        let ts: u64 = 1700000000_000; // millis
+        let ts: u64 = 1_700_000_000_000; // millis
         w.write_tlv(crate::tlv_type::SIGNATURE_TIME, &ts.to_be_bytes());
         let si = SignatureInfo::decode(w.finish()).unwrap();
         assert_eq!(si.sig_time, Some(ts));

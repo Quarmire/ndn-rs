@@ -634,10 +634,7 @@ impl MgmtClient {
     }
 
     /// Send an Interest and return the raw content bytes from the Data reply.
-    async fn send_content_bytes(
-        &self,
-        interest_wire: Bytes,
-    ) -> Result<Bytes, ForwarderError> {
+    async fn send_content_bytes(&self, interest_wire: Bytes) -> Result<Bytes, ForwarderError> {
         let _guard = self.recv_lock.lock().await;
 
         self.face

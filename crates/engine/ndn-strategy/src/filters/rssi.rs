@@ -68,8 +68,8 @@ impl StrategyFilter for RssiFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::MeasurementsTable;
     use crate::cross_layer::FaceLinkQuality;
-    use crate::{FibEntry, FibNexthop, MeasurementsTable};
     use ndn_packet::Name;
     use ndn_transport::{AnyMap, FaceId};
     use smallvec::smallvec;

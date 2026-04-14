@@ -464,7 +464,7 @@ mod tests {
         pib.generate_ed25519(&n1).unwrap();
         pib.generate_ed25519(&n2).unwrap();
         let mut keys = pib.list_keys().unwrap();
-        keys.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+        keys.sort_by_key(|a| a.to_string());
         assert_eq!(keys.len(), 2);
     }
 

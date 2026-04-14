@@ -35,6 +35,9 @@ const STALE_AT_LEN: usize = 8;
 /// LSM overhead).
 pub struct FjallCs {
     keyspace: fjall::Keyspace,
+    // Kept alive so the underlying fjall::Database is not dropped while the
+    // keyspace is in use.
+    #[allow(dead_code)]
     db: fjall::Database,
     max_bytes: AtomicUsize,
     current_bytes: AtomicUsize,
@@ -66,11 +69,11 @@ impl FjallCs {
         let mut count = 0usize;
         let mut bytes = 0usize;
         for guard in ks.iter() {
-            if let Ok((_key, val)) = guard.into_inner() {
-                if val.len() > STALE_AT_LEN {
-                    bytes += val.len() - STALE_AT_LEN;
-                    count += 1;
-                }
+            if let Ok((_key, val)) = guard.into_inner()
+                && val.len() > STALE_AT_LEN
+            {
+                bytes += val.len() - STALE_AT_LEN;
+                count += 1;
             }
         }
         (count, bytes)
@@ -254,17 +257,16 @@ impl ContentStore for FjallCs {
             let prefix_key = name_to_key(&interest.name);
             let mut found = None;
             for guard in self.keyspace.prefix(&prefix_key) {
-                if let Ok((key, val)) = guard.into_inner() {
-                    if let Some((stale_at, data)) = decode_value(&val) {
-                        if let Some(name) = key_to_name(&key) {
-                            found = Some(CsEntry {
-                                data,
-                                stale_at,
-                                name: Arc::new(name),
-                            });
-                            break;
-                        }
-                    }
+                if let Ok((key, val)) = guard.into_inner()
+                    && let Some((stale_at, data)) = decode_value(&val)
+                    && let Some(name) = key_to_name(&key)
+                {
+                    found = Some(CsEntry {
+                        data,
+                        stale_at,
+                        name: Arc::new(name),
+                    });
+                    break;
                 }
             }
             found?

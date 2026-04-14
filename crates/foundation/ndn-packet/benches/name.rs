@@ -20,22 +20,6 @@ fn build_name(n: usize) -> Name {
     Name::from_components(components)
 }
 
-/// Encode a Name as a full Name TLV (0x07 wrapping component TLVs).
-fn encode_name_wire(name: &Name) -> Bytes {
-    let mut w = TlvWriter::new();
-    let inner: Vec<u8> = name
-        .components()
-        .iter()
-        .flat_map(|c| {
-            let mut cw = TlvWriter::new();
-            cw.write_tlv(c.typ, &c.value);
-            cw.finish()
-        })
-        .collect();
-    w.write_tlv(0x07, &inner);
-    Bytes::copy_from_slice(&w.finish())
-}
-
 // ── parse (Name::from_str) ────────────────────────────────────────────────
 
 fn bench_parse(c: &mut Criterion) {

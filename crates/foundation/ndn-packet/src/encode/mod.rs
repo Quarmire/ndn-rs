@@ -107,7 +107,7 @@ pub(super) fn rand_nonce_bytes() -> [u8; 8] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Data, Interest, NameComponent, SignatureType};
+    use crate::{Data, NameComponent};
     use bytes::Bytes;
     use std::time::Duration;
 

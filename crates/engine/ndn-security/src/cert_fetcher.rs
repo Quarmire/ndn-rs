@@ -124,7 +124,7 @@ mod tests {
         // Name
         signed.write_nested(0x07, |w| {
             for comp in name.components() {
-                w.write_tlv(comp.typ as u64, &comp.value);
+                w.write_tlv(comp.typ, &comp.value);
             }
         });
         // Content with public key

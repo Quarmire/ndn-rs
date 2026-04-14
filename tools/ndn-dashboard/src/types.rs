@@ -1071,8 +1071,16 @@ impl From<ndn_config::FaceStatus> for FaceInfo {
         let persistency = fs.persistency_str().to_owned();
         FaceInfo {
             face_id: fs.face_id,
-            remote_uri: if fs.uri.is_empty() { None } else { Some(fs.uri) },
-            local_uri: if fs.local_uri.is_empty() { None } else { Some(fs.local_uri) },
+            remote_uri: if fs.uri.is_empty() {
+                None
+            } else {
+                Some(fs.uri)
+            },
+            local_uri: if fs.local_uri.is_empty() {
+                None
+            } else {
+                Some(fs.local_uri)
+            },
             persistency,
             kind: None,
             face_scope: fs.face_scope,
@@ -1149,9 +1157,17 @@ impl RibRoute {
     #[allow(dead_code)] // called inside rsx! closures; not visible to dead_code lint
     pub fn flags_label(&self) -> String {
         let mut parts = Vec::new();
-        if self.flags & 0x01 != 0 { parts.push("child-inherit"); }
-        if self.flags & 0x02 != 0 { parts.push("capture"); }
-        if parts.is_empty() { "—".to_string() } else { parts.join(",") }
+        if self.flags & 0x01 != 0 {
+            parts.push("child-inherit");
+        }
+        if self.flags & 0x02 != 0 {
+            parts.push("capture");
+        }
+        if parts.is_empty() {
+            "—".to_string()
+        } else {
+            parts.join(",")
+        }
     }
 }
 

@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use ndn_packet::{Name, NameComponent};
+use ndn_packet::Name;
 use ndn_store::{ContentStore, CsMeta, LruCs, ShardedCs};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

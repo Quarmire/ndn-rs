@@ -40,7 +40,7 @@ use ndn_packet::{Interest, Name, NameComponent, encode::encode_data_unsigned};
 use ndn_routing::DvrConfig;
 use ndn_security::{FilePib, SchemaRule};
 use ndn_strategy::{BestRouteStrategy, MulticastStrategy};
-use ndn_transport::{Face, FaceId, FacePersistency, FaceKind, FaceScope};
+use ndn_transport::{Face, FaceId, FaceKind, FacePersistency, FaceScope};
 use tokio_util::sync::CancellationToken;
 
 use ndn_config::{
@@ -440,15 +440,9 @@ async fn dispatch_command(
     } = ctx;
     match module_name {
         m if m == module::RIB => handle_rib(verb_name, params, source_face, engine),
-        m if m == module::ROUTING => {
-            handle_routing(verb_name, params, engine, dvr_cfg).into()
-        }
-        m if m == module::DISCOVERY => {
-            handle_discovery(verb_name, params, discovery_cfg).into()
-        }
-        m if m == module::FACES => {
-            handle_faces(verb_name, params, source_face, engine).await
-        }
+        m if m == module::ROUTING => handle_routing(verb_name, params, engine, dvr_cfg).into(),
+        m if m == module::DISCOVERY => handle_discovery(verb_name, params, discovery_cfg).into(),
+        m if m == module::FACES => handle_faces(verb_name, params, source_face, engine).await,
         m if m == module::FIB => handle_fib(verb_name, params, source_face, engine),
         m if m == module::STRATEGY => handle_strategy(verb_name, params, engine),
         m if m == module::CS => handle_cs(verb_name, params, engine).await.into(),
@@ -465,18 +459,16 @@ async fn dispatch_command(
         m if m == module::STATUS => handle_status(verb_name, engine, cancel).into(),
         m if m == module::MEASUREMENTS => handle_measurements(verb_name, engine).into(),
         m if m == module::CONFIG => handle_config(verb_name, config).into(),
-        m if m == module::SECURITY => {
-            handle_security(
-                verb_name,
-                params,
-                pib,
-                engine,
-                config,
-                security_is_ephemeral,
-            )
-            .await
-            .into()
-        }
+        m if m == module::SECURITY => handle_security(
+            verb_name,
+            params,
+            pib,
+            engine,
+            config,
+            security_is_ephemeral,
+        )
+        .await
+        .into(),
         m if m == module::LOG => handle_log(verb_name, params).into(),
         _ => ControlResponse::error(status::NOT_FOUND, "unknown module").into(),
     }
@@ -1137,7 +1129,11 @@ fn faces_list_dataset(engine: &ForwarderEngine) -> bytes::Bytes {
                     )
                 })
                 .unwrap_or_default();
-        let face_scope = if info.kind.scope() == FaceScope::Local { 1 } else { 0 };
+        let face_scope = if info.kind.scope() == FaceScope::Local {
+            1
+        } else {
+            0
+        };
         // Multi-access link types: EtherMulticast and Multicast faces.
         let link_type = match info.kind {
             FaceKind::EtherMulticast | FaceKind::Multicast => 1,

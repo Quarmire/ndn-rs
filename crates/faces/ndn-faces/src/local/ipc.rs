@@ -115,10 +115,10 @@ struct PlatformListener {
 impl PlatformListener {
     fn bind(path: &str) -> io::Result<Self> {
         // Create parent directory if it doesn't exist (e.g. /run/nfd/ for /run/nfd/nfd.sock).
-        if let Some(parent) = std::path::Path::new(path).parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
+        if let Some(parent) = std::path::Path::new(path).parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
         }
         let _ = std::fs::remove_file(path);
         let listener = tokio::net::UnixListener::bind(path)?;

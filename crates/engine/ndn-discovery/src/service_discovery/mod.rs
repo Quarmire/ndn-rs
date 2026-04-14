@@ -420,9 +420,11 @@ mod tests {
             }
         }
 
-        let mut cfg = ServiceDiscoveryConfig::default();
-        cfg.relay_records = true;
-        cfg.auto_populate_fib = false; // keep test focused on relay only
+        let cfg = ServiceDiscoveryConfig {
+            relay_records: true,
+            auto_populate_fib: false, // keep test focused on relay only
+            ..ServiceDiscoveryConfig::default()
+        };
         let sd = ServiceDiscoveryProtocol::new(name("/ndn/test/node"), cfg);
 
         let neighbors = NeighborTable::new();

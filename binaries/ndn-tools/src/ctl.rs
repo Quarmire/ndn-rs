@@ -297,10 +297,7 @@ async fn run_nfd(cli: &Cli) -> anyhow::Result<()> {
                 print_fib_list(&entries);
             }
             RouteAction::RibList => {
-                let entries = mgmt
-                    .rib_list()
-                    .await
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                let entries = mgmt.rib_list().await.map_err(|e| anyhow::anyhow!("{e}"))?;
                 print_rib_list(&entries);
             }
         },
@@ -574,7 +571,8 @@ fn expand_tilde(path: &str) -> std::path::PathBuf {
 fn face_kind(uri: &str) -> &'static str {
     if uri.starts_with("udp4://") || uri.starts_with("udp6://") || uri.starts_with("udp://") {
         "UDP"
-    } else if uri.starts_with("tcp4://") || uri.starts_with("tcp6://") || uri.starts_with("tcp://") {
+    } else if uri.starts_with("tcp4://") || uri.starts_with("tcp6://") || uri.starts_with("tcp://")
+    {
         "TCP"
     } else if uri.starts_with("ws://") || uri.starts_with("wss://") {
         "WS"
@@ -707,19 +705,13 @@ fn print_fib_list(entries: &[ndn_config::FibEntry]) {
         .unwrap_or(0)
         .max(6);
 
-    println!(
-        "{:<prefix_w$}  {:>6}  {:>6}",
-        "Prefix", "FaceID", "Cost"
-    );
+    println!("{:<prefix_w$}  {:>6}  {:>6}", "Prefix", "FaceID", "Cost");
     println!("{}", "\u{2500}".repeat(prefix_w + 16));
 
     for entry in entries {
         let prefix = entry.name.to_string();
         for nh in &entry.nexthops {
-            println!(
-                "{:<prefix_w$}  {:>6}  {:>6}",
-                prefix, nh.face_id, nh.cost
-            );
+            println!("{:<prefix_w$}  {:>6}  {:>6}", prefix, nh.face_id, nh.cost);
         }
     }
 }

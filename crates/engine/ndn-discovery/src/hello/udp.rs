@@ -657,19 +657,19 @@ mod tests {
 
         for diff in &payload.neighbor_diffs {
             for entry in &diff.entries {
-                if let crate::DiffEntry::Add(name) = entry {
-                    if ctx.neighbors.get(name).is_none() {
-                        ctx.neighbors.apply(NeighborUpdate::Upsert(NeighborEntry {
-                            node_name: name.clone(),
-                            state: NS::Probing {
-                                attempts: 0,
-                                last_probe: Instant::now(),
-                            },
-                            faces: Vec::new(),
-                            rtt_us: None,
-                            pending_nonce: None,
-                        }));
-                    }
+                if let crate::DiffEntry::Add(name) = entry
+                    && ctx.neighbors.get(name).is_none()
+                {
+                    ctx.neighbors.apply(NeighborUpdate::Upsert(NeighborEntry {
+                        node_name: name.clone(),
+                        state: NS::Probing {
+                            attempts: 0,
+                            last_probe: Instant::now(),
+                        },
+                        faces: Vec::new(),
+                        rtt_us: None,
+                        pending_nonce: None,
+                    }));
                 }
             }
         }

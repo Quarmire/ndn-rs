@@ -452,9 +452,9 @@ impl From<String> for Name {
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{assert_bytes_eq, hex, name};
+    use super::super::tests::{assert_bytes_eq, name};
     use super::*;
-    use crate::{Interest, NameComponent};
+    use crate::Interest;
     use bytes::Bytes;
     use std::time::Duration;
 

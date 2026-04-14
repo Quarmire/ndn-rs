@@ -23,7 +23,7 @@ async fn test_in_process_roundtrip() {
     let (engine, mut consumer) = build_minimal().await;
 
     let prefix: ndn_mobile::Name = "/test/data".parse().unwrap();
-    let mut producer = engine.register_producer(prefix.clone());
+    let producer = engine.register_producer(prefix.clone());
 
     // Serve one Data packet from the producer.
     let name = prefix.clone();
@@ -78,7 +78,7 @@ async fn test_suspend_resume_keeps_appface_alive() {
     let mut consumer = Consumer::from_handle(handle);
 
     let prefix: ndn_mobile::Name = "/test/suspend".parse().unwrap();
-    let mut producer = engine.register_producer(prefix.clone());
+    let producer = engine.register_producer(prefix.clone());
     let name = prefix.clone();
     tokio::spawn(async move {
         producer
