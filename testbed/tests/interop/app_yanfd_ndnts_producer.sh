@@ -60,12 +60,11 @@ else
   echo "${ROUTE_LIST}" | grep -E "${PREFIX}|error|Error" >&2 || \
     echo "  (prefix not yet in route list)" >&2
 
-  # Extract the face ID from the FIB entry if the prefix is already registered.
-  NDNTS_FACE=$(echo "${ROUTE_LIST}" | grep "${PREFIX}" \
-    | grep -oE 'faceid=[0-9]+' | sed 's/faceid=//' | head -1)
-
-  if [ -n "${NDNTS_FACE}" ]; then
-    echo "  NDNts self-registered on face ${NDNTS_FACE}; no manual registration needed." >&2
+  # Detect self-registration by presence of the prefix in the route list.
+  # The output format is "Prefix  FaceID  Cost" columns — if the prefix
+  # appears, NDNts completed rib/register and no manual route add is needed.
+  if echo "${ROUTE_LIST}" | grep -q "${PREFIX}"; then
+    echo "  NDNts self-registered; no manual registration needed." >&2
   else
     # route list returned output but the prefix is absent — NDNts did not
     # self-register.  Find the connection face and register manually.

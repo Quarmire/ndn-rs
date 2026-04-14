@@ -51,12 +51,12 @@ ROUTE_LIST=$(ndn-ctl --socket "${FWD_SOCK}" route list 2>/dev/null || true)
 echo "${ROUTE_LIST}" | grep -E "${PREFIX}|error|Error" >&2 || \
   echo "  (route list unavailable or prefix not found)" >&2
 
-# Extract the face ID from the FIB entry if the prefix is already registered.
-NDNTS_FACE=$(echo "${ROUTE_LIST}" | grep "${PREFIX}" \
-  | grep -oE 'faceid=[0-9]+' | sed 's/faceid=//' | head -1)
-
-if [ -n "${NDNTS_FACE}" ]; then
-  echo "  NDNts self-registered on face ${NDNTS_FACE}; no manual registration needed." >&2
+# Detect self-registration by presence of the prefix in the FIB.  The route
+# list output format is "Prefix  FaceID  Cost" columns — if the prefix appears
+# at all, NDNts completed rib/register successfully; the exact face ID does
+# not matter because no manual route add is needed.
+if echo "${ROUTE_LIST}" | grep -q "${PREFIX}"; then
+  echo "  NDNts self-registered; no manual registration needed." >&2
 else
   echo "  NDNts did not self-register; finding face and registering manually." >&2
   # Enumerate all active connection faces: face IDs below 0xFFFF_0000 (4294901760)
