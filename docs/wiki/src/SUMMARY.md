@@ -6,7 +6,7 @@
 
 - [Installation](./getting-started/installation.md)
 - [Hello World](./getting-started/hello-world.md)
-- [Running the Router](./getting-started/running-router.md)
+- [Running the Forwarder](./getting-started/running-forwarder.md)
 
 # Concepts
 
@@ -15,22 +15,40 @@
 - [PIT, FIB, and Content Store](./concepts/pit-fib-cs.md)
 - [Glossary](./concepts/glossary.md)
 
+# Application Development
+
+- [Building NDN Applications](./guides/building-ndn-apps.md)
+- [Publish and Subscribe](./guides/getting-started.md)
+- [API Patterns](./api/patterns.md)
+- [Security Identity and Keys](./guides/security-identity.md)
+- [Mobile Apps (Android / iOS)](./guides/mobile-apps.md)
+- [Embedded Targets](./guides/embedded-targets.md)
+- [Browser WebSocket Testing](./guides/browser-testing.md)
+
+# Operations
+
+- [CLI Tools](./guides/cli-tools.md)
+- [Docker Deployment](./guides/docker-deployment.md)
+- [Performance Tuning](./guides/performance-tuning.md)
+- [Setting Up an NDNCERT CA](./guides/ndncert-setup.md)
+- [Fleet and Swarm Security](./guides/fleet-security.md)
+
 # Design
 
 - [Design Overview](./design/overview.md)
 - [vs. NFD (C++)](./design/vs-nfd.md)
 - [vs. ndnd (Go)](./design/vs-ndnd.md)
-- [vs. NDN-DPDK (C/Go, DPDK)](./design/vs-ndn-dpdk.md)
+- [vs. NDN-DPDK](./design/vs-ndn-dpdk.md)
 - [vs. NDNph / NDN-Lite (Embedded)](./design/vs-embedded.md)
-- [vs. NDNts (TypeScript) and mw-nfd](./design/vs-ndnts.md)
-- [Zero-Copy Pipeline](./design/zero-copy-pipeline.md)
-- [Strategy Composition](./design/strategy-composition.md)
+- [vs. NDNts / mw-nfd](./design/vs-ndnts.md)
 
 # Deep Dive
 
 - [TLV Encoding](./deep-dive/tlv-encoding.md)
+- [Zero-Copy Pipeline](./design/zero-copy-pipeline.md)
 - [Pipeline Walkthrough](./deep-dive/pipeline-walkthrough.md)
-- [Interoperability Testing](./deep-dive/interop-testing.md)
+- [Strategy Composition](./design/strategy-composition.md)
+- [IPC and App Communication](./deep-dive/ipc-transport.md)
 - [Discovery Protocols](./deep-dive/discovery-protocols.md)
 - [Routing Protocols](./deep-dive/routing-protocols.md)
 - [Sync Protocols](./deep-dive/sync-protocols.md)
@@ -38,29 +56,18 @@
 - [Identity and Decentralized Identifiers](./deep-dive/identity-and-did.md)
 - [NDNCERT: Automated Certificate Issuance](./deep-dive/ndncert.md)
 - [Link-Layer and Wireless Faces](./deep-dive/link-layer-faces.md)
-- [IPC and App Communication](./deep-dive/ipc-transport.md)
 - [In-Network Compute](./deep-dive/in-network-compute.md)
 - [Simulation](./deep-dive/simulation.md)
 - [Browser Simulation (ndn-wasm)](./deep-dive/wasm-browser-simulation.md)
+- [Interoperability Testing](./deep-dive/interop-testing.md)
 
-# Guides
+# Extending ndn-rs
 
-- [Building NDN Applications](./guides/building-ndn-apps.md)
-- [Implementing a Discovery Protocol](./guides/implementing-discovery.md)
-- [Implementing a Routing Protocol](./guides/implementing-routing-protocol.md)
 - [Implementing a Face](./guides/implementing-face.md)
 - [Implementing a Strategy](./guides/implementing-strategy.md)
 - [WASM Strategies](./guides/wasm-strategies.md)
-- [Mobile Apps (Android / iOS)](./guides/mobile-apps.md)
-- [Embedded Targets](./guides/embedded-targets.md)
-- [Setting Up an NDNCERT CA](./guides/ndncert-setup.md)
-- [Fleet and Swarm Security](./guides/fleet-security.md)
-- [Getting Started: Publish and Subscribe](./guides/getting-started.md)
-- [Docker Deployment](./guides/docker-deployment.md)
-- [Browser WebSocket Testing](./guides/browser-testing.md)
-- [CLI Tools](./guides/cli-tools.md)
-- [Performance Tuning](./guides/performance-tuning.md)
-- [Security Identity and Key Management](./guides/security-identity.md)
+- [Implementing a Discovery Protocol](./guides/implementing-discovery.md)
+- [Implementing a Routing Protocol](./guides/implementing-routing-protocol.md)
 
 # Benchmarks
 
@@ -68,21 +75,17 @@
 - [Forwarder Comparison](./benchmarks/bench-forwarder.md)
 - [Methodology](./benchmarks/methodology.md)
 
+# Reference
+
+- [API Overview](./api/overview.md)
+- [Spec Compliance](./reference/spec-compliance.md)
+- [Interop Test Results](./reference/interop-results.md)
+- [did:ndn Method](./reference/did-ndn-method.md)
+- [External Links](./reference/external-links.md)
+
 # App Notes
 
 - [App Ideas](./app-notes/ideas.md)
-
-# Reference
-
-- [Spec Compliance](./reference/spec-compliance.md)
-- [Interop Test Results](./reference/interop-results.md)
-- [did:ndn Method Specification](./reference/did-ndn-method.md)
-- [External Links](./reference/external-links.md)
-
-# API Reference
-
-- [API Overview](./api/overview.md)
-- [Application Patterns](./api/patterns.md)
 
 # Releases
 

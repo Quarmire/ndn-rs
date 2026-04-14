@@ -192,7 +192,7 @@ use ndn_app::Consumer;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Connect to the router's management socket.
-    let mut consumer = Consumer::connect("/tmp/ndn.sock").await?;
+    let mut consumer = Consumer::connect("/run/nfd/nfd.sock").await?;
     let data = consumer.fetch("/ndn/hello").await?;
     println!("Got: {:?}", data.content());
     Ok(())
@@ -203,6 +203,6 @@ This uses a Unix socket (with optional SHM data plane) instead of in-process cha
 
 ## Next steps
 
-- [Running the Router](./running-router.md) -- deploy `ndn-fwd` as a standalone forwarder
+- [Running the Forwarder](./running-forwarder.md) -- deploy `ndn-fwd` as a standalone forwarder
 - [PIT, FIB, and Content Store](../concepts/pit-fib-cs.md) -- understand the data structures behind the exchange
 - [Pipeline Walkthrough](../deep-dive/pipeline-walkthrough.md) -- trace a packet through every pipeline stage

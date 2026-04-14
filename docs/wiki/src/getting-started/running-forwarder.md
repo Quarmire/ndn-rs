@@ -1,10 +1,10 @@
-# Running the Router
+# Running the Forwarder
 
 This page explains how to configure and run `ndn-fwd` as a standalone NDN forwarder, connect applications and tools to it, and monitor its state.
 
 ## Architecture overview
 
-The router is the central forwarding engine. Applications, remote peers, and management tools connect to it through various face types:
+The forwarder is the central forwarding engine. Applications, remote peers, and management tools connect to it through various face types:
 
 ```mermaid
 %%{init: {"layout": "elk"}}%%
@@ -91,7 +91,7 @@ cost = 10
 
 [management]
 transport = "ndn"
-face_socket = "/tmp/ndn.sock"
+face_socket = "/run/nfd/nfd.sock"
 
 [logging]
 level = "info"
@@ -222,9 +222,9 @@ profile = "lan"                          # "static", "lan", "campus", "mobile", 
 served_prefixes = ["/ndn/site/sensors"]
 ```
 
-## Starting the router
+## Starting the forwarder
 
-> **⚠️ Important:** `sudo` is required when the router uses raw sockets (Ethernet faces), privileged ports (UDP/TCP on port 6363 < 1024 on some systems), or multicast group membership. If you only use Unix socket faces and high-numbered ports, `sudo` is not needed. On Linux, you can alternatively grant `CAP_NET_RAW` and `CAP_NET_BIND_SERVICE` capabilities instead of running as root.
+> **⚠️ Important:** `sudo` is required when the forwarder uses raw sockets (Ethernet faces), privileged ports (UDP/TCP on port 6363 < 1024 on some systems), or multicast group membership. If you only use Unix socket faces and high-numbered ports, `sudo` is not needed. On Linux, you can alternatively grant `CAP_NET_RAW` and `CAP_NET_BIND_SERVICE` capabilities instead of running as root.
 
 ```bash
 # Build in release mode for production
@@ -248,10 +248,10 @@ sudo RUST_LOG="info,ndn_engine=debug,ndn_discovery=trace" \
 
 ### ndn-ctl
 
-`ndn-ctl` is the management CLI, similar to NFD's `nfdc`. It connects to the router's face socket and sends management commands as NDN Interest/Data:
+`ndn-ctl` is the management CLI, similar to NFD's `nfdc`. It connects to the forwarder's face socket and sends management commands as NDN Interest/Data:
 
 ```bash
-# Check router status
+# Check forwarder status
 ndn-ctl status
 
 # List active faces
@@ -324,7 +324,7 @@ ndn-iperf client --prefix /iperf --duration 10
 
 ## Monitoring with ndn-dashboard
 
-`ndn-dashboard` is a native desktop application (built with Dioxus) for managing and monitoring NDN routers. It communicates with the router via the NDN management protocol over the face socket.
+`ndn-dashboard` is a native desktop application (built with Dioxus) for managing and monitoring NDN forwarders. It communicates with the forwarder via the NDN management protocol over the face socket.
 
 ```bash
 cargo build -p ndn-dashboard --release
@@ -333,7 +333,7 @@ cargo build -p ndn-dashboard --release
 
 The dashboard provides:
 
-- **Start Router** -- launch `ndn-fwd` as a managed subprocess with one of:
+- **Start Forwarder** -- launch `ndn-fwd` as a managed subprocess with one of:
   - *Quick Start* (built-in defaults)
   - *Build Config* -- interactive config builder with startup faces, startup routes, CS settings, and log level
   - *Load Config File* -- point to an existing TOML file
@@ -343,16 +343,16 @@ The dashboard provides:
 - **Routes** -- FIB entries and nexthop costs
 - **Content Store** -- cache occupancy and hit/miss rates
 - **Strategy** -- per-prefix forwarding strategy assignments
-- **Config** -- view and edit router configuration; edit startup faces and routes; restart the managed router with an updated config via **↺ Restart with Config**
+- **Config** -- view and edit forwarder configuration; edit startup faces and routes; restart the managed forwarder with an updated config via **↺ Restart with Config**
 - **Logs** -- real-time log viewer with filter and split-pane modes
 - **Tools** -- embedded `ndn-ping`, `ndn-iperf`, `ndn-peek`, and `ndn-put`
 - **Light/Dark mode** -- toggle via the ☀/🌙 button in the toolbar
 
-The dashboard connects to the router's face socket (default `/tmp/ndn.sock`). If the router is started through the dashboard, log output is captured in the Logs view automatically.
+The dashboard connects to the forwarder's face socket (default `/run/nfd/nfd.sock`). If the forwarder is started through the dashboard, log output is captured in the Logs view automatically.
 
 ## Typical deployment
 
-A common LAN deployment with two routers and local apps:
+A common LAN deployment with two forwarders and local apps:
 
 ```bash
 # Router A (10.0.0.1) -- ndn-fwd.toml:

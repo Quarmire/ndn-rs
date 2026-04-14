@@ -358,7 +358,7 @@ Using the Rust `MgmtClient` API:
 ```rust
 use ndn_ipc::MgmtClient;
 
-let client = MgmtClient::connect("/tmp/ndn.sock").await?;
+let client = MgmtClient::connect("/run/nfd/nfd.sock").await?;
 
 // List rules
 let resp = client.security_schema_list().await?;

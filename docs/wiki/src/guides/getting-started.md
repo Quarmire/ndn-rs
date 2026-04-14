@@ -79,7 +79,7 @@ Start the forwarder first:
 
 ```bash
 ndn-fwd --config /etc/ndn-fwd/config.toml
-# or: ndn-fwd  # uses /tmp/ndn.sock by default
+# or: ndn-fwd  # uses /run/nfd/nfd.sock by default
 ```
 
 Then connect from your app:
@@ -88,7 +88,7 @@ Then connect from your app:
 use ndn_app::{Consumer, Producer, AppError};
 use ndn_packet::Name;
 
-const SOCKET: &str = "/tmp/ndn.sock";
+const SOCKET: &str = "/run/nfd/nfd.sock";
 
 #[tokio::main]
 async fn main() -> Result<(), AppError> {
@@ -119,7 +119,7 @@ async fn main() -> Result<(), AppError> {
 ```rust
 use ndn_app::Subscriber;
 
-let mut sub = Subscriber::connect("/tmp/ndn.sock", "/chat/room1").await?;
+let mut sub = Subscriber::connect("/run/nfd/nfd.sock", "/chat/room1").await?;
 
 while let Some(sample) = sub.recv().await {
     println!("[{}] seq={}: {:?}", sample.publisher, sample.seq, sample.payload);
@@ -129,7 +129,7 @@ while let Some(sample) = sub.recv().await {
 To use PSync instead of SVS:
 
 ```rust
-let mut sub = Subscriber::connect_psync("/tmp/ndn.sock", "/chat/room1").await?;
+let mut sub = Subscriber::connect_psync("/run/nfd/nfd.sock", "/chat/room1").await?;
 ```
 
 ---

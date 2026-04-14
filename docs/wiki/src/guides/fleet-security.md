@@ -249,7 +249,7 @@ async fn main() -> anyhow::Result<()> {
         .build()?;
 
     // Connect to the router and register the CA prefix
-    let producer = Producer::connect("/tmp/ndn.sock", "/fleet/ca").await?;
+    let producer = Producer::connect("/run/nfd/nfd.sock", "/fleet/ca").await?;
 
     println!("Fleet CA accepting enrollment requests...");
     ca.serve(producer).await?;

@@ -121,7 +121,7 @@ let ca = NdncertCa::builder()
     .build()?;
 
 // Register the CA prefix with the router and start serving
-let producer = Producer::connect("/tmp/ndn.sock", "/example/ca").await?;
+let producer = Producer::connect("/run/nfd/nfd.sock", "/example/ca").await?;
 
 println!("NDNCERT CA running on /example/ca");
 ca.serve(producer).await?;
@@ -277,7 +277,7 @@ async fn main() -> anyhow::Result<()> {
         .cert_lifetime(Duration::from_secs(24 * 3600))
         .build()?;
 
-    let producer = Producer::connect("/tmp/ndn.sock", "/demo/ca").await?;
+    let producer = Producer::connect("/run/nfd/nfd.sock", "/demo/ca").await?;
 
     // Spawn the CA in the background
     tokio::spawn(async move {

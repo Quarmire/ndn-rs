@@ -11,7 +11,7 @@ Fetch a named piece of content by name and wait for a response.
 **API:** `ndn_app::Consumer::get` or `Consumer::fetch`
 
 ```rust
-let mut consumer = Consumer::connect("/tmp/ndn.sock").await?;
+let mut consumer = Consumer::connect("/run/nfd/nfd.sock").await?;
 let bytes = consumer.get("/example/data").await?;
 ```
 
@@ -50,7 +50,7 @@ Register a prefix and respond to Interests with dynamically generated Data.
 **API:** `ndn_app::Producer::connect` + `serve`
 
 ```rust
-let mut producer = Producer::connect("/tmp/ndn.sock", "/sensor").await?;
+let mut producer = Producer::connect("/run/nfd/nfd.sock", "/sensor").await?;
 producer.serve(|interest| async move {
     Some(DataBuilder::new((*interest.name).clone(), b"42").build())
 }).await
@@ -66,7 +66,7 @@ Receive all new data published to a shared group prefix (SVS-based sync).
 
 ```rust
 let mut sub = Subscriber::connect(
-    "/tmp/ndn.sock",
+    "/run/nfd/nfd.sock",
     "/chat/room1",
     SubscriberConfig::default(),
 ).await?;
@@ -88,7 +88,7 @@ Handle request-response pairs where each reply goes only to the querying consume
 **API:** `ndn_app::Queryable`
 
 ```rust
-let mut queryable = Queryable::connect("/tmp/ndn.sock", "/compute").await?;
+let mut queryable = Queryable::connect("/run/nfd/nfd.sock", "/compute").await?;
 while let Some(query) = queryable.recv().await {
     let result = do_work(query.interest());
     query.reply(
@@ -245,7 +245,7 @@ Use NDN in blocking code (Python extensions, CLI tools, non-async Rust).
 **API:** `ndn_app::blocking::{BlockingConsumer, BlockingProducer}`
 
 ```rust
-let mut consumer = BlockingConsumer::connect("/tmp/ndn.sock")?;
+let mut consumer = BlockingConsumer::connect("/run/nfd/nfd.sock")?;
 let bytes = consumer.get("/example/hello")?;
 ```
 

@@ -58,7 +58,7 @@ face   = 0
 cost   = 10
 ```
 
-See [Running the Router](../getting-started/running-router.md) for the full configuration reference.
+See [Running the Forwarder](../getting-started/running-forwarder.md) for the full configuration reference.
 
 ## Supplying TLS certificates
 

@@ -27,7 +27,7 @@ cargo clippy -- -D warnings
 cargo fmt -- --check
 ```
 
-## Building the router binary
+## Building the forwarder binary
 
 The standalone forwarder lives in `binaries/ndn-fwd`:
 
@@ -49,11 +49,11 @@ This produces several binaries: `ndn-ping`, `ndn-peek`, `ndn-put`, `ndn-ctl`, `n
 
 ### ndn-fwd features
 
-The router binary has three optional feature flags, all enabled by default:
+The forwarder binary has three optional feature flags, all enabled by default:
 
 | Feature     | Description                                                  | Gate            |
 |-------------|--------------------------------------------------------------|-----------------|
-| `spsc-shm`  | Shared-memory data plane between apps and router (Unix only) | `ndn-faces/spsc-shm` |
+| `spsc-shm`  | Shared-memory data plane between apps and forwarder (Unix only) | `ndn-faces/spsc-shm` |
 | `websocket` | WebSocket face for browser and remote clients                | `ndn-faces/websocket`  |
 | `serial`    | Serial port face (RS-232 / USB-serial)                       | `ndn-faces/serial`  |
 
@@ -77,14 +77,14 @@ Enable it from a dependent crate or when running benchmarks:
 cargo test -p ndn-store --features fjall
 ```
 
-## Running the router
+## Running the forwarder
 
 Copy the example configuration and adjust it for your environment:
 
 ```bash
 cp ndn-fwd.example.toml ndn-fwd.toml
 
-# Start the router (needs sudo for raw sockets / privileged ports)
+# Start the forwarder (needs sudo for raw sockets / privileged ports)
 sudo ./target/debug/ndn-fwd --config ndn-fwd.toml
 ```
 
@@ -106,14 +106,14 @@ Or via the standard `RUST_LOG` environment variable:
 sudo RUST_LOG=ndn_engine=debug ./target/release/ndn-fwd --config ndn-fwd.toml
 ```
 
-See [Running the Router](./running-router.md) for a detailed configuration walkthrough.
+See [Running the Forwarder](./running-forwarder.md) for a detailed configuration walkthrough.
 
 ## Verifying the installation
 
-After the router starts, you should see log output indicating that faces are created and the pipeline is running. Use `ndn-ctl` to confirm the router is alive:
+After the forwarder starts, you should see log output indicating that faces are created and the pipeline is running. Use `ndn-ctl` to confirm the forwarder is alive:
 
 ```bash
 ndn-ctl status
 ```
 
-This connects to the router's management socket (default `/tmp/ndn.sock`) and prints forwarding engine state.
+This connects to the forwarder's management socket (default `/run/nfd/nfd.sock`) and prints forwarding engine state.
