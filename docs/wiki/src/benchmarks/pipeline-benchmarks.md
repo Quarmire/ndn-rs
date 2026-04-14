@@ -157,92 +157,92 @@ The HTML report at `target/criterion/report/index.html` includes violin plots, P
 
 | Benchmark | Median | ± Variance |
 |-----------|--------|------------|
-| `cs/hit` | 830 ns | ±3 ns |
-| `cs/miss` | 567 ns | ±10 ns |
+| `cs/hit` | 763 ns | ±3 ns |
+| `cs/miss` | 528 ns | ±29 ns |
 | | | |
-| `cs_insert/insert_new` | 7.66 µs | ±12.61 µs |
-| `cs_insert/insert_replace` | 1.04 µs | ±3 ns |
+| `cs_insert/insert_new` | 10.40 µs | ±18.28 µs |
+| `cs_insert/insert_replace` | 984 ns | ±4 ns |
 | | | |
-| `data_pipeline/4` | 2.14 µs | ±27 ns |
-| `data_pipeline/8` | 2.59 µs | ±65 ns |
+| `data_pipeline/4` | 1.95 µs | ±38 ns |
+| `data_pipeline/8` | 2.29 µs | ±43 ns |
 | | | |
-| `decode/data/4` | 469 ns | ±7 ns |
-| `decode/data/8` | 561 ns | ±1 ns |
-| `decode/interest/4` | 549 ns | ±13 ns |
-| `decode/interest/8` | 634 ns | ±2 ns |
+| `decode/data/4` | 397 ns | ±1 ns |
+| `decode/data/8` | 474 ns | ±1 ns |
+| `decode/interest/4` | 448 ns | ±4 ns |
+| `decode/interest/8` | 528 ns | ±3 ns |
 | | | |
-| `decode_throughput/4` | 546.14 µs | ±950 ns |
-| `decode_throughput/8` | 631.69 µs | ±5.91 µs |
+| `decode_throughput/4` | 457.77 µs | ±2.78 µs |
+| `decode_throughput/8` | 543.97 µs | ±4.52 µs |
 | | | |
-| `fib/lpm/10` | 36 ns | ±0 ns |
-| `fib/lpm/100` | 94 ns | ±0 ns |
-| `fib/lpm/1000` | 94 ns | ±0 ns |
+| `fib/lpm/10` | 33 ns | ±0 ns |
+| `fib/lpm/100` | 98 ns | ±0 ns |
+| `fib/lpm/1000` | 98 ns | ±0 ns |
 | | | |
-| `interest_pipeline/cs_hit` | 1.04 µs | ±5 ns |
-| `interest_pipeline/no_route/4` | 1.63 µs | ±7 ns |
-| `interest_pipeline/no_route/8` | 1.81 µs | ±9 ns |
+| `interest_pipeline/cs_hit` | 941 ns | ±2 ns |
+| `interest_pipeline/no_route/4` | 1.39 µs | ±5 ns |
+| `interest_pipeline/no_route/8` | 1.54 µs | ±9 ns |
 | | | |
-| `lru/evict` | 206 ns | ±1 ns |
-| `lru/evict_prefix` | 2.42 µs | ±3.19 µs |
-| `lru/get_can_be_prefix` | 314 ns | ±1 ns |
-| `lru/get_hit` | 218 ns | ±0 ns |
-| `lru/get_miss_empty` | 149 ns | ±1 ns |
-| `lru/get_miss_populated` | 191 ns | ±0 ns |
-| `lru/insert_new` | 2.26 µs | ±1.32 µs |
-| `lru/insert_replace` | 422 ns | ±1 ns |
+| `lru/evict` | 189 ns | ±2 ns |
+| `lru/evict_prefix` | 1.94 µs | ±2.10 µs |
+| `lru/get_can_be_prefix` | 294 ns | ±2 ns |
+| `lru/get_hit` | 211 ns | ±0 ns |
+| `lru/get_miss_empty` | 140 ns | ±7 ns |
+| `lru/get_miss_populated` | 186 ns | ±0 ns |
+| `lru/insert_new` | 2.13 µs | ±1.51 µs |
+| `lru/insert_replace` | 378 ns | ±3 ns |
 | | | |
-| `name/display/components/4` | 451 ns | ±3 ns |
-| `name/display/components/8` | 830 ns | ±1 ns |
-| `name/eq/eq_match` | 42 ns | ±0 ns |
+| `name/display/components/4` | 452 ns | ±7 ns |
+| `name/display/components/8` | 885 ns | ±6 ns |
+| `name/eq/eq_match` | 39 ns | ±0 ns |
 | `name/eq/eq_miss_first` | 2 ns | ±0 ns |
-| `name/eq/eq_miss_last` | 43 ns | ±1 ns |
-| `name/has_prefix/prefix_len/1` | 7 ns | ±0 ns |
-| `name/has_prefix/prefix_len/4` | 21 ns | ±0 ns |
-| `name/has_prefix/prefix_len/8` | 40 ns | ±0 ns |
-| `name/hash/components/4` | 94 ns | ±0 ns |
-| `name/hash/components/8` | 164 ns | ±0 ns |
-| `name/parse/components/12` | 628 ns | ±3 ns |
-| `name/parse/components/4` | 231 ns | ±0 ns |
-| `name/parse/components/8` | 417 ns | ±1 ns |
-| `name/tlv_decode/components/12` | 318 ns | ±1 ns |
-| `name/tlv_decode/components/4` | 140 ns | ±1 ns |
-| `name/tlv_decode/components/8` | 220 ns | ±0 ns |
+| `name/eq/eq_miss_last` | 36 ns | ±0 ns |
+| `name/has_prefix/prefix_len/1` | 8 ns | ±0 ns |
+| `name/has_prefix/prefix_len/4` | 19 ns | ±0 ns |
+| `name/has_prefix/prefix_len/8` | 36 ns | ±1 ns |
+| `name/hash/components/4` | 84 ns | ±0 ns |
+| `name/hash/components/8` | 163 ns | ±0 ns |
+| `name/parse/components/12` | 671 ns | ±3 ns |
+| `name/parse/components/4` | 273 ns | ±4 ns |
+| `name/parse/components/8` | 462 ns | ±8 ns |
+| `name/tlv_decode/components/12` | 313 ns | ±0 ns |
+| `name/tlv_decode/components/4` | 133 ns | ±0 ns |
+| `name/tlv_decode/components/8` | 217 ns | ±7 ns |
 | | | |
-| `pit/aggregate` | 2.47 µs | ±152 ns |
-| `pit/new_entry` | 1.42 µs | ±5 ns |
+| `pit/aggregate` | 2.32 µs | ±140 ns |
+| `pit/new_entry` | 1.22 µs | ±4 ns |
 | | | |
-| `pit_match/hit` | 1.84 µs | ±8 ns |
-| `pit_match/miss` | 2.20 µs | ±3 ns |
+| `pit_match/hit` | 1.56 µs | ±8 ns |
+| `pit_match/miss` | 1.96 µs | ±10 ns |
 | | | |
-| `sharded/get_hit/1` | 243 ns | ±1 ns |
-| `sharded/get_hit/16` | 239 ns | ±0 ns |
-| `sharded/get_hit/4` | 244 ns | ±0 ns |
-| `sharded/get_hit/8` | 241 ns | ±0 ns |
-| `sharded/insert/1` | 2.88 µs | ±1.44 µs |
-| `sharded/insert/16` | 2.07 µs | ±1.95 µs |
-| `sharded/insert/4` | 2.95 µs | ±1.02 µs |
-| `sharded/insert/8` | 2.48 µs | ±1.59 µs |
+| `sharded/get_hit/1` | 227 ns | ±1 ns |
+| `sharded/get_hit/16` | 227 ns | ±1 ns |
+| `sharded/get_hit/4` | 225 ns | ±2 ns |
+| `sharded/get_hit/8` | 227 ns | ±2 ns |
+| `sharded/insert/1` | 2.57 µs | ±1.59 µs |
+| `sharded/insert/16` | 1.84 µs | ±1.48 µs |
+| `sharded/insert/4` | 2.50 µs | ±1.79 µs |
+| `sharded/insert/8` | 2.77 µs | ±1.90 µs |
 | | | |
-| `signing/blake3-keyed/sign_sync/100B` | 224 ns | ±0 ns |
-| `signing/blake3-keyed/sign_sync/500B` | 745 ns | ±1 ns |
-| `signing/blake3-plain/sign_sync/100B` | 244 ns | ±3 ns |
-| `signing/blake3-plain/sign_sync/500B` | 763 ns | ±0 ns |
-| `signing/ed25519/sign_sync/100B` | 23.18 µs | ±45 ns |
-| `signing/ed25519/sign_sync/500B` | 24.83 µs | ±51 ns |
-| `signing/hmac/sign_sync/100B` | 303 ns | ±0 ns |
-| `signing/hmac/sign_sync/500B` | 577 ns | ±0 ns |
+| `signing/blake3-keyed/sign_sync/100B` | 181 ns | ±3 ns |
+| `signing/blake3-keyed/sign_sync/500B` | 616 ns | ±1 ns |
+| `signing/blake3-plain/sign_sync/100B` | 188 ns | ±0 ns |
+| `signing/blake3-plain/sign_sync/500B` | 623 ns | ±3 ns |
+| `signing/ed25519/sign_sync/100B` | 20.64 µs | ±62 ns |
+| `signing/ed25519/sign_sync/500B` | 22.17 µs | ±38 ns |
+| `signing/hmac/sign_sync/100B` | 267 ns | ±2 ns |
+| `signing/hmac/sign_sync/500B` | 506 ns | ±0 ns |
 | | | |
-| `validation/cert_missing` | 212 ns | ±0 ns |
-| `validation/schema_mismatch` | 158 ns | ±0 ns |
-| `validation/single_hop` | 45.30 µs | ±107 ns |
+| `validation/cert_missing` | 194 ns | ±0 ns |
+| `validation/schema_mismatch` | 146 ns | ±0 ns |
+| `validation/single_hop` | 42.92 µs | ±102 ns |
 | | | |
-| `validation_stage/cert_via_anchor` | 52.00 µs | ±59 ns |
-| `validation_stage/disabled` | 692 ns | ±1 ns |
+| `validation_stage/cert_via_anchor` | 46.71 µs | ±123 ns |
+| `validation_stage/disabled` | 639 ns | ±1 ns |
 | | | |
-| `verification/blake3-keyed/verify/100B` | 348 ns | ±0 ns |
-| `verification/blake3-keyed/verify/500B` | 870 ns | ±0 ns |
-| `verification/blake3-plain/verify/100B` | 357 ns | ±5 ns |
-| `verification/blake3-plain/verify/500B` | 880 ns | ±1 ns |
-| `verification/ed25519/verify/100B` | 44.26 µs | ±183 ns |
-| `verification/ed25519/verify/500B` | 45.56 µs | ±932 ns |
+| `verification/blake3-keyed/verify/100B` | 293 ns | ±1 ns |
+| `verification/blake3-keyed/verify/500B` | 728 ns | ±22 ns |
+| `verification/blake3-plain/verify/100B` | 299 ns | ±2 ns |
+| `verification/blake3-plain/verify/500B` | 735 ns | ±1 ns |
+| `verification/ed25519/verify/100B` | 41.86 µs | ±2.35 µs |
+| `verification/ed25519/verify/500B` | 43.11 µs | ±89 ns |
 <!-- BENCH_RESULTS_END -->
