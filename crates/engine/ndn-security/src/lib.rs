@@ -62,6 +62,7 @@ pub use trust_schema::{NamePattern, PatternComponent, PatternParseError, SchemaR
 pub use validator::{ValidationResult, Validator};
 pub use verifier::{
     Blake3DigestVerifier, Blake3KeyedVerifier, Ed25519Verifier, Verifier, VerifyOutcome,
+    ed25519_verify_batch,
 };
 #[cfg(feature = "yubikey-piv")]
 pub use yubikey::{YubikeyKeyStore, YubikeySlot};
