@@ -147,34 +147,31 @@ impl Signer for HmacSha256Signer {
 //   type 0  DigestSha256           (plain, unauthenticated)
 //   type 4  SignatureHmacWithSha256 (keyed, authenticated)
 //
-// ndn-rs therefore assigns BLAKE3 two distinct experimental type codes
-// rather than reusing one. These values are **not yet reserved** on the NDN
-// TLV SignatureType registry
-// (<https://redmine.named-data.net/projects/ndn-tlv/wiki/SignatureType>) —
-// they must be entered there before shipping a release to avoid conflicting
-// with any value the NDN community later standardizes in the same range.
-// The registration is a manual one-time action by the project maintainer.
+// ndn-rs therefore assigns BLAKE3 two distinct type codes rather than reusing
+// one. Both values are **reserved** on the NDN TLV SignatureType registry
+// (<https://redmine.named-data.net/projects/ndn-tlv/wiki/SignatureType>).
+// The wire format and verification rules are documented in
+// `docs/wiki/src/reference/blake3-signature-spec.md`.
 
-/// Signature type code for **plain** BLAKE3 digest (experimental, not yet in
-/// the NDN spec). Analogous to `DigestSha256` (type 0) — provides content
-/// integrity / self-certifying names but **no authentication**. Anyone can
-/// produce a valid signature.
+/// Signature type code for **plain** BLAKE3 digest. Analogous to
+/// `DigestSha256` (type 0) — provides content integrity / self-certifying
+/// names but **no authentication**. Anyone can produce a valid signature.
+/// See `DigestBlake3` in `blake3-signature-spec.md`.
 pub const SIGNATURE_TYPE_DIGEST_BLAKE3_PLAIN: u64 = 6;
 
-/// Signature type code for **keyed** BLAKE3 (experimental, not yet in the NDN
-/// spec). Analogous to `SignatureHmacWithSha256` (type 4) — requires a 32-byte
-/// shared secret; provides both integrity **and** authentication of the
-/// source. Distinct from the plain-digest code on purpose: see the
-/// plain-vs-keyed rationale above.
+/// Signature type code for **keyed** BLAKE3. Analogous to
+/// `SignatureHmacWithSha256` (type 4) — requires a 32-byte shared secret;
+/// provides both integrity **and** authentication of the source. Distinct
+/// from the plain-digest code on purpose: see the plain-vs-keyed rationale
+/// above. See `SignatureBlake3Keyed` in `blake3-signature-spec.md`.
 pub const SIGNATURE_TYPE_DIGEST_BLAKE3_KEYED: u64 = 7;
 
 /// BLAKE3 digest signer for high-throughput self-certifying content.
 ///
-/// **Experimental / NDA extension** — uses signature type code
-/// [`SIGNATURE_TYPE_DIGEST_BLAKE3_PLAIN`] (6), not yet assigned by the NDN
-/// Packet Format specification. This is analogous to `DigestSha256` (type 0)
-/// but uses BLAKE3, which is 3–8× faster on modern CPUs due to SIMD
-/// parallelism.
+/// Uses signature type code [`SIGNATURE_TYPE_DIGEST_BLAKE3_PLAIN`] (6),
+/// reserved on the NDN TLV SignatureType registry. Analogous to
+/// `DigestSha256` (type 0) but uses BLAKE3, which is 3–8× faster on modern
+/// CPUs due to SIMD parallelism.
 ///
 /// The "signature" is a 32-byte BLAKE3 hash of the signed region. There is no
 /// secret key — this provides integrity (content addressing) but **not**
@@ -212,9 +209,9 @@ impl Signer for Blake3Signer {
 
 /// BLAKE3 keyed signer for authenticated high-throughput content.
 ///
-/// **Experimental / NDA extension** — uses signature type code
-/// [`SIGNATURE_TYPE_DIGEST_BLAKE3_KEYED`] (7), distinct from the plain BLAKE3
-/// code on purpose (see the plain-vs-keyed rationale on the type code
+/// Uses signature type code [`SIGNATURE_TYPE_DIGEST_BLAKE3_KEYED`] (7),
+/// reserved on the NDN TLV SignatureType registry, distinct from the plain
+/// BLAKE3 code on purpose (see the plain-vs-keyed rationale on the type code
 /// constants above). Uses a 32-byte secret key with BLAKE3's built-in keyed
 /// hashing mode — faster than HMAC-SHA256 while providing equivalent security
 /// guarantees.
@@ -224,11 +221,12 @@ pub struct Blake3KeyedSigner {
 }
 
 impl Blake3KeyedSigner {
-    /// Create from a 32-byte key. Pads or truncates `key_bytes` to 32 bytes.
-    pub fn new(key_bytes: &[u8], key_name: Name) -> Self {
-        let mut key = [0u8; 32];
-        let len = key_bytes.len().min(32);
-        key[..len].copy_from_slice(&key_bytes[..len]);
+    /// Create from an exact 32-byte key. The `SignatureBlake3Keyed` spec
+    /// (`docs/wiki/src/reference/blake3-signature-spec.md`) requires keys
+    /// to be exactly 32 octets; the `[u8; 32]` argument enforces this at
+    /// compile time, eliminating any silent padding or truncation that
+    /// would let a caller weaken the MAC by accident.
+    pub fn new(key: [u8; 32], key_name: Name) -> Self {
         Self { key, key_name }
     }
 }
@@ -377,7 +375,7 @@ mod tests {
     #[test]
     fn blake3_plain_and_keyed_use_distinct_sig_types() {
         let plain = Blake3Signer::new(test_key_name());
-        let keyed = Blake3KeyedSigner::new(&[9u8; 32], test_key_name());
+        let keyed = Blake3KeyedSigner::new([9u8; 32], test_key_name());
         assert_eq!(
             plain.sig_type(),
             SignatureType::Other(SIGNATURE_TYPE_DIGEST_BLAKE3_PLAIN)
@@ -411,7 +409,7 @@ mod tests {
 
     #[test]
     fn blake3_keyed_produces_32_bytes() {
-        let s = Blake3KeyedSigner::new(&[1u8; 32], test_key_name());
+        let s = Blake3KeyedSigner::new([1u8; 32], test_key_name());
         let sig = s.sign_sync(b"hello ndn").unwrap();
         assert_eq!(sig.len(), 32);
     }
@@ -421,8 +419,8 @@ mod tests {
     /// keyed variant meaningful (vs. the plain one).
     #[test]
     fn blake3_keyed_different_key_different_sig() {
-        let s1 = Blake3KeyedSigner::new(&[1u8; 32], test_key_name());
-        let s2 = Blake3KeyedSigner::new(&[2u8; 32], test_key_name());
+        let s1 = Blake3KeyedSigner::new([1u8; 32], test_key_name());
+        let s2 = Blake3KeyedSigner::new([2u8; 32], test_key_name());
         assert_ne!(
             s1.sign_sync(b"data").unwrap(),
             s2.sign_sync(b"data").unwrap()
@@ -439,7 +437,7 @@ mod tests {
     #[test]
     fn blake3_plain_and_keyed_with_zero_key_differ() {
         let plain = Blake3Signer::new(test_key_name());
-        let keyed = Blake3KeyedSigner::new(&[0u8; 32], test_key_name());
+        let keyed = Blake3KeyedSigner::new([0u8; 32], test_key_name());
         assert_ne!(
             plain.sign_sync(b"region").unwrap(),
             keyed.sign_sync(b"region").unwrap()

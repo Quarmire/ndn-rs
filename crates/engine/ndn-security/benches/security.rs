@@ -99,7 +99,7 @@ fn bench_signing(c: &mut Criterion) {
     let ed_signer = Ed25519Signer::from_seed(&[1u8; 32], key_name.clone());
     let hmac_signer = HmacSha256Signer::new(&[2u8; 32], key_name.clone());
     let blake3_plain_signer = Blake3Signer::new(key_name.clone());
-    let blake3_keyed_signer = Blake3KeyedSigner::new(&[3u8; 32], key_name);
+    let blake3_keyed_signer = Blake3KeyedSigner::new([3u8; 32], key_name);
 
     let regions = make_regions();
 
@@ -200,7 +200,7 @@ fn bench_verification(c: &mut Criterion) {
     let blake3_plain_verifier = Blake3DigestVerifier;
 
     let blake3_key = [7u8; 32];
-    let blake3_keyed_signer = Blake3KeyedSigner::new(&blake3_key, name1("key"));
+    let blake3_keyed_signer = Blake3KeyedSigner::new(blake3_key, name1("key"));
     let blake3_keyed_verifier = Blake3KeyedVerifier;
 
     // Pre-build regions and pre-sign them once per algorithm.
