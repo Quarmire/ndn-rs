@@ -109,14 +109,22 @@ fn decode_be_u64(bytes: &[u8]) -> u64 {
 ///
 /// Certificates are just named Data packets — fetching one is a normal NDN
 /// Interest. The cache avoids re-fetching recently validated certificates.
+///
+/// Two indices are maintained: by certificate name (the canonical lookup
+/// used when a packet's `KeyLocator` carries a `Name`), and by SHA-256 of
+/// the public key (used when the locator carries a `KeyDigest`). Both are
+/// populated on `insert` so callers do not need to know which form a
+/// future verification will use.
 pub struct CertCache {
     local: DashMap<Arc<Name>, Certificate>,
+    by_digest: DashMap<[u8; 32], Arc<Name>>,
 }
 
 impl CertCache {
     pub fn new() -> Self {
         Self {
             local: DashMap::new(),
+            by_digest: DashMap::new(),
         }
     }
 
@@ -124,7 +132,24 @@ impl CertCache {
         self.local.get(key_name).map(|r| r.clone())
     }
 
+    /// Look up a certificate by the SHA-256 of its public key — used to
+    /// resolve `KeyLocator` → `KeyDigest` references. Only matches
+    /// certificates already in the cache: `KeyDigest` cannot be used to
+    /// fetch a certificate over the network because the cert's name is
+    /// not known to the caller.
+    pub fn get_by_key_digest(&self, digest: &[u8]) -> Option<Certificate> {
+        let key: &[u8; 32] = digest.try_into().ok()?;
+        let name = self.by_digest.get(key)?.clone();
+        self.local.get(&name).map(|r| r.clone())
+    }
+
     pub fn insert(&self, cert: Certificate) {
+        let digest = ring::digest::digest(&ring::digest::SHA256, &cert.public_key);
+        let digest_arr: [u8; 32] = digest
+            .as_ref()
+            .try_into()
+            .expect("SHA-256 output is always 32 bytes");
+        self.by_digest.insert(digest_arr, Arc::clone(&cert.name));
         self.local.insert(Arc::clone(&cert.name), cert);
     }
 }
@@ -224,6 +249,57 @@ mod tests {
         let wire = make_cert_data(&[], 0, u64::MAX);
         let data = Data::decode(wire).unwrap();
         assert!(Certificate::decode(&data).is_err());
+    }
+
+    #[test]
+    fn get_by_key_digest_returns_inserted_cert() {
+        let pk = vec![7u8; 32];
+        let cache = CertCache::new();
+        cache.insert(Certificate {
+            name: Arc::new(Name::from_components([NameComponent::generic(
+                Bytes::from_static(b"k1"),
+            )])),
+            public_key: Bytes::copy_from_slice(&pk),
+            valid_from: 0,
+            valid_until: u64::MAX,
+            issuer: None,
+            signed_region: None,
+            sig_value: None,
+        });
+
+        // Digest is SHA-256 of the public key bytes.
+        let expected = ring::digest::digest(&ring::digest::SHA256, &pk);
+        let cert = cache
+            .get_by_key_digest(expected.as_ref())
+            .expect("digest lookup should hit");
+        assert_eq!(cert.public_key.as_ref(), &pk[..]);
+    }
+
+    #[test]
+    fn get_by_key_digest_misses_for_unknown_digest() {
+        let cache = CertCache::new();
+        cache.insert(Certificate {
+            name: Arc::new(Name::from_components([NameComponent::generic(
+                Bytes::from_static(b"k1"),
+            )])),
+            public_key: Bytes::copy_from_slice(&[1u8; 32]),
+            valid_from: 0,
+            valid_until: u64::MAX,
+            issuer: None,
+            signed_region: None,
+            sig_value: None,
+        });
+        let bogus = [0xFFu8; 32];
+        assert!(cache.get_by_key_digest(&bogus).is_none());
+    }
+
+    #[test]
+    fn get_by_key_digest_rejects_wrong_length() {
+        let cache = CertCache::new();
+        // 31-byte digest cannot be valid SHA-256.
+        assert!(cache.get_by_key_digest(&[0u8; 31]).is_none());
+        // 33-byte digest cannot be valid SHA-256.
+        assert!(cache.get_by_key_digest(&[0u8; 33]).is_none());
     }
 
     #[test]

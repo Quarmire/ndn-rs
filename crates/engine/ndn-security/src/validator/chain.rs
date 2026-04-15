@@ -38,7 +38,20 @@ impl Validator {
             return ValidationResult::Invalid(TrustError::InvalidSignature);
         }
 
-        let Some(first_key) = &sig_info.key_locator else {
+        // Resolve the KeyLocator. NDN allows two forms: a Name pointing at
+        // the signer's certificate, or a KeyDigest carrying SHA-256 of the
+        // public key. The Name form is the common path; for the KeyDigest
+        // form we look the cert up in the local cache by its key digest
+        // (the cert must be pre-loaded — there's no way to fetch a cert
+        // over the network when only its key digest is known).
+        let first_key: Arc<Name> = if let Some(name) = &sig_info.key_locator {
+            Arc::clone(name)
+        } else if let Some(digest) = &sig_info.key_digest {
+            match self.cert_cache.get_by_key_digest(digest) {
+                Some(cert) => Arc::clone(&cert.name),
+                None => return ValidationResult::Invalid(TrustError::InvalidSignature),
+            }
+        } else {
             return ValidationResult::Invalid(TrustError::InvalidSignature);
         };
 
@@ -46,7 +59,7 @@ impl Validator {
             .schema
             .read()
             .expect("schema RwLock poisoned")
-            .allows(&data.name, first_key)
+            .allows(&data.name, &first_key)
         {
             return ValidationResult::Invalid(TrustError::SchemaMismatch);
         }
@@ -58,7 +71,7 @@ impl Validator {
         // Current entity to verify: starts with the Data packet itself.
         let mut current_signed_region: &[u8] = data.signed_region();
         let mut current_sig_value: &[u8] = data.sig_value();
-        let mut current_key_name: Arc<Name> = Arc::clone(first_key);
+        let mut current_key_name: Arc<Name> = first_key;
 
         // Owned buffers for intermediate cert signed regions / sig values.
         let mut owned_signed_region: bytes::Bytes;
@@ -391,6 +404,138 @@ mod tests {
             validator.validate_chain(&data).await,
             ValidationResult::Pending
         ));
+    }
+
+    /// Build a Data TLV signed with `signer` whose KeyLocator carries a
+    /// KeyDigest (SHA-256 of `signer`'s public key) instead of a Name.
+    /// Used to exercise the digest-form KeyLocator fallback in
+    /// `validate_chain`.
+    async fn make_signed_data_with_key_digest(
+        signer: &Ed25519Signer,
+        signer_pk: &[u8],
+        data_comp: &'static str,
+    ) -> Bytes {
+        use ndn_tlv::TlvWriter;
+
+        let nc = {
+            let mut w = TlvWriter::new();
+            w.write_tlv(0x08, data_comp.as_bytes());
+            w.finish()
+        };
+        let name_tlv = {
+            let mut w = TlvWriter::new();
+            w.write_tlv(0x07, &nc);
+            w.finish()
+        };
+
+        // KeyLocator carrying KeyDigest = SHA-256(public key).
+        let digest = ring::digest::digest(&ring::digest::SHA256, signer_pk);
+        let kloc_tlv = {
+            let mut w = TlvWriter::new();
+            w.write_nested(0x1c, |w| {
+                w.write_tlv(0x1d, digest.as_ref());
+            });
+            w.finish()
+        };
+        let stype_tlv = {
+            let mut w = TlvWriter::new();
+            w.write_tlv(0x1b, &[7u8]); // Ed25519
+            w.finish()
+        };
+        let sinfo_inner: Vec<u8> = stype_tlv.iter().chain(kloc_tlv.iter()).copied().collect();
+        let sinfo_tlv = {
+            let mut w = TlvWriter::new();
+            w.write_tlv(0x16, &sinfo_inner);
+            w.finish()
+        };
+
+        let signed_region: Vec<u8> = name_tlv.iter().chain(sinfo_tlv.iter()).copied().collect();
+        let sig = signer.sign(&signed_region).await.unwrap();
+
+        let sval_tlv = {
+            let mut w = TlvWriter::new();
+            w.write_tlv(0x17, &sig);
+            w.finish()
+        };
+        let inner: Vec<u8> = signed_region
+            .iter()
+            .chain(sval_tlv.iter())
+            .copied()
+            .collect();
+        let mut w = TlvWriter::new();
+        w.write_tlv(0x06, &inner);
+        w.finish()
+    }
+
+    #[tokio::test]
+    async fn chain_walk_resolves_key_digest_via_cache() {
+        // Same shape as chain_walk_data_to_anchor, but the Data's
+        // KeyLocator is a KeyDigest, not a Name. The validator must
+        // resolve the digest against the cert cache before the chain
+        // walk proceeds.
+        let anchor_seed = [30u8; 32];
+        let anchor_name = name1("anchor");
+        let anchor_signer = Ed25519Signer::from_seed(&anchor_seed, anchor_name.clone());
+        let anchor_pk = ed25519_dalek::SigningKey::from_bytes(&anchor_seed)
+            .verifying_key()
+            .to_bytes();
+
+        let key_seed = [31u8; 32];
+        let key_name = name1("key");
+        let key_signer = Ed25519Signer::from_seed(&key_seed, key_name.clone());
+        let key_pk = ed25519_dalek::SigningKey::from_bytes(&key_seed)
+            .verifying_key()
+            .to_bytes();
+
+        let cert_wire = make_cert_data_packet(&key_name, &key_pk, &anchor_signer).await;
+        let cert_data = Data::decode(cert_wire).unwrap();
+        let cert = Certificate::decode(&cert_data).unwrap();
+
+        let data_bytes = make_signed_data_with_key_digest(&key_signer, &key_pk, "data").await;
+        let data = Data::decode(data_bytes).unwrap();
+
+        let validator = Validator::new(wildcard_schema());
+        validator.add_trust_anchor(Certificate {
+            name: Arc::new(anchor_name),
+            public_key: Bytes::copy_from_slice(&anchor_pk),
+            valid_from: 0,
+            valid_until: u64::MAX,
+            issuer: None,
+            signed_region: None,
+            sig_value: None,
+        });
+        validator.cert_cache().insert(cert);
+
+        match validator.validate_chain(&data).await {
+            ValidationResult::Valid(safe) => {
+                assert_eq!(safe.inner.name, data.name);
+            }
+            ValidationResult::Invalid(e) => {
+                panic!("expected Valid, got Invalid: {e}")
+            }
+            ValidationResult::Pending => panic!("expected Valid, got Pending"),
+        }
+    }
+
+    #[tokio::test]
+    async fn chain_walk_key_digest_uncached_returns_invalid() {
+        // KeyDigest cannot be fetched over the network — if the cert is
+        // not in the cache, validation must fail rather than hang.
+        let key_seed = [32u8; 32];
+        let key_name = name1("key");
+        let key_signer = Ed25519Signer::from_seed(&key_seed, key_name);
+        let key_pk = ed25519_dalek::SigningKey::from_bytes(&key_seed)
+            .verifying_key()
+            .to_bytes();
+
+        let data_bytes = make_signed_data_with_key_digest(&key_signer, &key_pk, "data").await;
+        let data = Data::decode(data_bytes).unwrap();
+
+        let validator = Validator::new(wildcard_schema());
+        match validator.validate_chain(&data).await {
+            ValidationResult::Invalid(TrustError::InvalidSignature) => {}
+            other => panic!("expected Invalid(InvalidSignature), got: {other:?}"),
+        }
     }
 
     #[tokio::test]
