@@ -199,47 +199,113 @@ codebase is now.
 
 ### A. Tree-signed segmented Data: one signature per file
 
-**Status: design space, not yet implemented.**
+**Status: implemented in `ndn_security::merkle`; benched;
+surprising results.**
 
 A producer publishing a multi-segment file (`/foo/v=1/seg=0..N`)
 today must either (a) sign each segment Data packet individually, or
 (b) put the whole file inside one giant Data and sign it once. Option
-(a) is `O(N)` ECDSA / Ed25519 operations; option (b) breaks the NDN
+(a) is `O(N)` Ed25519 / ECDSA operations; option (b) breaks the NDN
 chunking model and prevents partial fetch.
 
-With BLAKE3 you can:
+With a Merkle tree you can do both:
 
-1. Compute a BLAKE3 tree over the **concatenation** of all segment
-   Content fields (the producer streams them through `Hasher::update`
-   in segment order).
-2. Take the root hash. Place it in a single "manifest" Data packet —
-   `/foo/v=1/_manifest` — signed once with whatever signature type
-   the application prefers (Ed25519, ECDSA, BLAKE3-keyed, even
-   BLAKE3-plain digest with a name-based trust schema).
-3. For each segment Data, attach the **leaf-to-root verification
-   path** as a small additional TLV in the SignatureInfo (a handful
-   of 32-byte sibling hashes, `O(log N)` per segment).
-4. Set the segment's SignatureType to BLAKE3-plain (type 6) with the
-   leaf hash as the SignatureValue. The KeyLocator points at the
-   manifest Data.
+1. Compute a Merkle tree over the segment Content bodies. The
+   producer hashes each segment into a **leaf**, combines leaves
+   pairwise into **parent** nodes, and repeats until a single 32-byte
+   **root** hash emerges.
+2. Place the root in a single "manifest" Data packet (e.g.
+   `/foo/v=1/_root`) signed once with whatever algorithm the
+   application prefers — Ed25519, ECDSA, BLAKE3-keyed — with a
+   regular trust chain up to an anchor.
+3. For each segment Data, set the SignatureValue to the segment's
+   leaf hash plus its `log₂ N` sibling hashes up to the root. The
+   KeyLocator Name points at the manifest Data.
+4. A consumer fetches segments in any order, verifies the manifest
+   once via the normal cert-chain path, caches the root, and then
+   verifies each arriving segment with `1 + log₂ N` cheap hash
+   operations against the cached root — **no further asymmetric
+   crypto**.
 
-A consumer receiving any segment can verify it in three steps:
+The interesting question is how much this actually saves, and
+whether BLAKE3 beats SHA-256 as the hash function inside the tree.
+The bench in `crates/engine/ndn-security/benches/merkle_segmented.rs`
+measures three schemes head-to-head.
 
-1. Recompute the BLAKE3 leaf hash over the segment's Content.
-2. Walk up the verification path, hashing pairs, to recompute the
-   root.
-3. Check the recomputed root against the manifest Data's signed
-   payload.
+#### Producer cost (publish a whole file)
 
-Cost per segment for the consumer: one BLAKE3 leaf hash (~hundreds
-of nanoseconds) + `log₂(N)` BLAKE3 parent compressions (~tens of
-nanoseconds each). For a 1 GB file split into 4 KB segments
-(N = 262144, log₂N = 18), this is roughly **2 µs per segment**, and
-exactly **one** ECDSA / Ed25519 verify across the entire file.
+| file / N | per-seg Ed25519 | SHA-256 Merkle | BLAKE3 Merkle |
+|---|---:|---:|---:|
+| 1 MB / 256 | 4.35 ms | **0.90 ms** | 1.86 ms |
+| 4 MB / 1024 | 17.91 ms | **3.67 ms** | 7.70 ms |
+| 16 MB / 2048 | 55.44 ms | **13.85 ms** | 23.59 ms |
 
-A SHA-256 deployment cannot do this without inventing its own tree
-construction on top, which would not interoperate with any other
-NDN implementation.
+#### Consumer cost (verify 10% of segments out of order)
+
+| file / N / K | per-seg Ed25519 | SHA-256 Merkle | BLAKE3 Merkle |
+|---|---:|---:|---:|
+| 1 MB / 256 / 25 | 603 µs | **111 µs** | 215 µs |
+| 4 MB / 1024 / 102 | 2.53 ms | **411 µs** | 864 µs |
+| 16 MB / 2048 / 204 | 6.07 ms | **1.39 ms** | 2.46 ms |
+
+(Apple Silicon, `cargo bench --release`. Absolute numbers scale
+with CPU; the ratios are stable across machines.)
+
+#### Two findings, both honest
+
+**1. The Merkle tree wins, but by ~4–5×, not 100×.** My original
+back-of-envelope estimate predicted orders of magnitude. The actual
+win is real but smaller, because (a) Ed25519 is ~17 µs per sign on
+modern hardware, not the ~50 µs of ECDSA; (b) building a Merkle tree
+over 4 MB of segment content takes ~2 ms on its own; and (c)
+encoding 1024 segment Data packets has non-trivial allocation cost
+regardless of signature scheme. The honest per-segment amortized
+cost goes from ~17 µs to ~3–4 µs, a ~4–5× win. At 1024 segments
+that's 17 ms → 3.7 ms on the producer, 2.5 ms → 0.4 ms on the
+consumer at K=102.
+
+**2. SHA-256 Merkle beats BLAKE3 Merkle by ~2× at NDN-typical
+segment sizes.** This is the *opposite* of what I predicted at the
+start of this work and the single most important finding of the
+bench. BLAKE3's raw-throughput advantage lives in the multi-MB
+contiguous-buffer regime where its tree mode SIMD can process many
+1024-byte chunks in parallel. At 4 KB leaves and 64-byte parent
+nodes — which is what a Merkle tree over NDN-typical segments
+actually produces — BLAKE3 can't use that parallelism and runs in
+its (slower) scalar path, while SHA-256 gets full SHA-NI hardware
+acceleration on every byte. The outcome: at 4 MB / 1024 segments,
+BLAKE3 Merkle takes 7.70 ms vs SHA-256 Merkle's 3.67 ms on the
+producer side, and 864 µs vs 411 µs on the consumer side.
+
+**Recommendation for v0.1.0:** if you want Merkle-signed segmented
+Data, use **SHA-256 Merkle** (signature type code 9, provisional).
+Ship the BLAKE3 Merkle variant (code 8, provisional) for completeness
+and for the handful of cases where segment sizes are ≥16 KB (above
+which BLAKE3 starts to pull ahead) or the producer is hashing
+multi-GB files with `Hasher::update_rayon` in parallel on many
+cores. Document that for the common NDN case, SHA-256 is the right
+hash under the tree, not BLAKE3.
+
+This is a more nuanced story than "BLAKE3 is faster at everything
+with a tree" — which the earlier version of this page implied. The
+bench corrects that, and the correction is the point of running it.
+
+#### What doesn't change
+
+The protocol-level argument for the Merkle approach is independent
+of which hash sits underneath. Both variants:
+
+- Turn O(N) producer signatures into O(1).
+- Turn O(K) consumer verifies (where K = partial fetch count) into
+  O(1) asymmetric verify + O(K log N) cheap hashes.
+- Allow out-of-order segment arrival with on-the-fly verification.
+- Allow a single root signature to certify an entire file regardless
+  of how many segments it spans.
+
+The hash choice is a ~2× constant factor on top of that structural
+win. The structural win is the reason to adopt the Merkle approach;
+the hash choice is a tactical decision that can flip as segment
+sizes or hash implementations evolve.
 
 ### B. Out-of-order parallel verification of segmented fetches
 

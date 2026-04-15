@@ -64,3 +64,7 @@ ndn-tlv    = { workspace = true, features = ["std"] }
 [[bench]]
 name    = "security"
 harness = false
+
+[[bench]]
+name    = "merkle_segmented"
+harness = false
