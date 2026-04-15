@@ -89,25 +89,58 @@ impl MerkleHasher for Sha256Merkle {
     }
 }
 
-/// BLAKE3-backed [`MerkleHasher`]. Per-call API (no tree mode, no
-/// rayon) — BLAKE3's *own* tree mode is orthogonal to the NDN Merkle
-/// tree we build here. Domain-separation bytes: `0x00` / `0x01` as
-/// with SHA-256 to keep the two impls comparable in the bench.
+/// BLAKE3-backed [`MerkleHasher`]. Uses `blake3::keyed_hash` — a
+/// fused one-shot API — with two precomputed domain-separation keys,
+/// one for leaves and one for internal nodes. This is strictly
+/// faster than the Hasher-based `new().update(prefix).update(data)
+/// .finalize()` pattern: one function call instead of four, and no
+/// buffered-update bookkeeping along the way. The initial bench
+/// (before this optimisation) showed a ~2× gap against SHA-256
+/// Merkle at NDN-typical segment sizes; the point of switching to
+/// keyed_hash is to see if BLAKE3 can close that gap.
+///
+/// The two keys are derived once at first access via
+/// [`blake3::Hasher::new_derive_key`] from context strings that
+/// include a version suffix, so changing the derivation rule in
+/// the future is a deliberate action (bump `/v1` → `/v2`). They are
+/// semantically equivalent to the SHA-256 variant's `0x00` / `0x01`
+/// prefix bytes but give BLAKE3 its natural keyed-hash code path.
 pub struct Blake3Merkle;
+
+static BLAKE3_LEAF_KEY: std::sync::LazyLock<[u8; 32]> = std::sync::LazyLock::new(|| {
+    let mut k = [0u8; 32];
+    k.copy_from_slice(
+        blake3::Hasher::new_derive_key("ndn-rs merkle leaf v1")
+            .finalize()
+            .as_bytes(),
+    );
+    k
+});
+
+static BLAKE3_NODE_KEY: std::sync::LazyLock<[u8; 32]> = std::sync::LazyLock::new(|| {
+    let mut k = [0u8; 32];
+    k.copy_from_slice(
+        blake3::Hasher::new_derive_key("ndn-rs merkle node v1")
+            .finalize()
+            .as_bytes(),
+    );
+    k
+});
 
 impl MerkleHasher for Blake3Merkle {
     fn hash_leaf(segment: &[u8]) -> MerkleHash {
-        let mut h = blake3::Hasher::new();
-        h.update(&[0x00u8]);
-        h.update(segment);
-        *h.finalize().as_bytes()
+        *blake3::keyed_hash(&BLAKE3_LEAF_KEY, segment).as_bytes()
     }
     fn hash_node(left: &MerkleHash, right: &MerkleHash) -> MerkleHash {
-        let mut h = blake3::Hasher::new();
-        h.update(&[0x01u8]);
-        h.update(left);
-        h.update(right);
-        *h.finalize().as_bytes()
+        // Pack the two 32-byte children into a 64-byte stack buffer
+        // so `keyed_hash` sees a single contiguous slice. The copy
+        // is 64 bytes into L1 cache — unmeasurably fast — and lets
+        // us take the fused one-shot path instead of the Hasher
+        // buffered-update path.
+        let mut buf = [0u8; 64];
+        buf[..32].copy_from_slice(left);
+        buf[32..].copy_from_slice(right);
+        *blake3::keyed_hash(&BLAKE3_NODE_KEY, &buf).as_bytes()
     }
 }
 

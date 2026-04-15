@@ -236,17 +236,17 @@ measures three schemes head-to-head.
 
 | file / N | per-seg Ed25519 | SHA-256 Merkle | BLAKE3 Merkle |
 |---|---:|---:|---:|
-| 1 MB / 256 | 4.35 ms | **0.90 ms** | 1.86 ms |
-| 4 MB / 1024 | 17.91 ms | **3.67 ms** | 7.70 ms |
-| 16 MB / 2048 | 55.44 ms | **13.85 ms** | 23.59 ms |
+| 1 MB / 256 | 4.42 ms | **0.92 ms** | 1.05 ms |
+| 4 MB / 1024 | 18.38 ms | **3.71 ms** | 4.28 ms |
+| 16 MB / 2048 | 55.59 ms | **13.89 ms** | 15.95 ms |
 
 #### Consumer cost (verify 10% of segments out of order)
 
 | file / N / K | per-seg Ed25519 | SHA-256 Merkle | BLAKE3 Merkle |
 |---|---:|---:|---:|
-| 1 MB / 256 / 25 | 603 µs | **111 µs** | 215 µs |
-| 4 MB / 1024 / 102 | 2.53 ms | **411 µs** | 864 µs |
-| 16 MB / 2048 / 204 | 6.07 ms | **1.39 ms** | 2.46 ms |
+| 1 MB / 256 / 25 | 619 µs | **112 µs** | 123 µs |
+| 4 MB / 1024 / 102 | 2.56 ms | **407 µs** | 464 µs |
+| 16 MB / 2048 / 204 | 6.00 ms | **1.39 ms** | 1.57 ms |
 
 (Apple Silicon, `cargo bench --release`. Absolute numbers scale
 with CPU; the ratios are stable across machines.)
@@ -264,31 +264,40 @@ cost goes from ~17 µs to ~3–4 µs, a ~4–5× win. At 1024 segments
 that's 17 ms → 3.7 ms on the producer, 2.5 ms → 0.4 ms on the
 consumer at K=102.
 
-**2. SHA-256 Merkle beats BLAKE3 Merkle by ~2× at NDN-typical
-segment sizes.** This is the *opposite* of what I predicted at the
-start of this work and the single most important finding of the
-bench. BLAKE3's raw-throughput advantage lives in the multi-MB
-contiguous-buffer regime where its tree mode SIMD can process many
-1024-byte chunks in parallel. At 4 KB leaves and 64-byte parent
-nodes — which is what a Merkle tree over NDN-typical segments
-actually produces — BLAKE3 can't use that parallelism and runs in
-its (slower) scalar path, while SHA-256 gets full SHA-NI hardware
-acceleration on every byte. The outcome: at 4 MB / 1024 segments,
-BLAKE3 Merkle takes 7.70 ms vs SHA-256 Merkle's 3.67 ms on the
-producer side, and 864 µs vs 411 µs on the consumer side.
+**2. SHA-256 Merkle beats BLAKE3 Merkle by ~15% at NDN-typical
+segment sizes — down from ~2× after the keyed_hash optimisation.**
+The initial `Blake3Merkle` implementation used the `Hasher` API
+(`Hasher::new() → update(prefix) → update(data) → finalize()`),
+which costs four function calls per leaf and per node plus per-call
+state-setup overhead that dominates at 4 KB leaves and 64-byte
+parent nodes. Switching to `blake3::keyed_hash` — a fused one-shot
+API that takes its entire input in one call and skips the
+incremental-processing state machine — closed the gap from ~2× to
+~15%. The residual 15% is hardware SHA-NI doing its thing per leaf
+byte, and that's not something BLAKE3 can beat without CPU
+instructions of its own. See `crates/engine/ndn-security/src/
+merkle.rs` for the precomputed `BLAKE3_LEAF_KEY` / `BLAKE3_NODE_KEY`
+derivation via `Hasher::new_derive_key` (done once at first use via
+`LazyLock`).
 
-**Recommendation for v0.1.0:** if you want Merkle-signed segmented
-Data, use **SHA-256 Merkle** (signature type code 9, provisional).
-Ship the BLAKE3 Merkle variant (code 8, provisional) for completeness
-and for the handful of cases where segment sizes are ≥16 KB (above
-which BLAKE3 starts to pull ahead) or the producer is hashing
-multi-GB files with `Hasher::update_rayon` in parallel on many
-cores. Document that for the common NDN case, SHA-256 is the right
-hash under the tree, not BLAKE3.
+**Recommendation for v0.1.0:** both hash choices are now in the
+same ballpark, so pick based on cryptographic ergonomics rather
+than raw speed. **SHA-256 Merkle** (signature type code 9,
+provisional) is marginally faster (~15%) on SHA-NI hardware and is
+the safe default. **BLAKE3 Merkle** (code 8, provisional) is
+available when the surrounding application already uses BLAKE3 for
+hashing / MAC / KDF / XOF and the single-primitive simplification
+is worth a modest perf penalty, or when segment sizes are ≥16 KB
+(the gap shrinks further) or a producer is hashing multi-GB files
+with `Hasher::update_rayon` in parallel on many cores (where
+BLAKE3 wins outright — see Section 3 above).
 
 This is a more nuanced story than "BLAKE3 is faster at everything
-with a tree" — which the earlier version of this page implied. The
-bench corrects that, and the correction is the point of running it.
+with a tree" (the earlier version of this page) *or* "SHA-256
+always beats BLAKE3 at per-segment hashing" (the first version of
+this section after the initial bench): the right API choice for
+BLAKE3 closes most of the gap, and the protocol-level Merkle win
+is what matters regardless of hash choice.
 
 #### What doesn't change
 
