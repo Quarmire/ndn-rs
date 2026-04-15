@@ -25,8 +25,9 @@ impl Validator {
         // DigestSha256 is self-contained: verify SHA-256(signed_region) == sig_value.
         // No key locator or trust chain is involved.
         if sig_info.sig_type == SignatureType::DigestSha256 {
-            let hash = ring::digest::digest(&ring::digest::SHA256, data.signed_region());
-            if hash.as_ref() == data.sig_value() {
+            use sha2::{Digest, Sha256};
+            let hash = Sha256::digest(data.signed_region());
+            if hash.as_slice() == data.sig_value() {
                 let safe = SafeData {
                     inner: Data::decode(data.raw().clone())
                         .expect("already decoded, re-decode cannot fail"),
@@ -429,11 +430,14 @@ mod tests {
         };
 
         // KeyLocator carrying KeyDigest = SHA-256(public key).
-        let digest = ring::digest::digest(&ring::digest::SHA256, signer_pk);
+        let digest = {
+            use sha2::{Digest, Sha256};
+            Sha256::digest(signer_pk)
+        };
         let kloc_tlv = {
             let mut w = TlvWriter::new();
             w.write_nested(0x1c, |w| {
-                w.write_tlv(0x1d, digest.as_ref());
+                w.write_tlv(0x1d, digest.as_slice());
             });
             w.finish()
         };

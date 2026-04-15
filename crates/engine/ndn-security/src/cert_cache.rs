@@ -144,11 +144,9 @@ impl CertCache {
     }
 
     pub fn insert(&self, cert: Certificate) {
-        let digest = ring::digest::digest(&ring::digest::SHA256, &cert.public_key);
-        let digest_arr: [u8; 32] = digest
-            .as_ref()
-            .try_into()
-            .expect("SHA-256 output is always 32 bytes");
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(&cert.public_key);
+        let digest_arr: [u8; 32] = digest.into();
         self.by_digest.insert(digest_arr, Arc::clone(&cert.name));
         self.local.insert(Arc::clone(&cert.name), cert);
     }
@@ -268,9 +266,10 @@ mod tests {
         });
 
         // Digest is SHA-256 of the public key bytes.
-        let expected = ring::digest::digest(&ring::digest::SHA256, &pk);
+        use sha2::{Digest, Sha256};
+        let expected = Sha256::digest(&pk);
         let cert = cache
-            .get_by_key_digest(expected.as_ref())
+            .get_by_key_digest(expected.as_slice())
             .expect("digest lookup should hit");
         assert_eq!(cert.public_key.as_ref(), &pk[..]);
     }

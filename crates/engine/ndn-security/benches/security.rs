@@ -135,35 +135,17 @@ fn bench_signing(c: &mut Criterion) {
 
     // SHA256 plain digest — DigestSha256 (type 0). No key material.
     //
-    // Two backends are benched in parallel so the SHA extension cost can be
-    // isolated on the same CI run without rebooting or masking CPU features:
-    //
-    // * `signing/sha256-digest-hw` — `ring::digest::SHA256`, which performs
-    //   runtime CPUID dispatch and uses Intel SHA-NI / ARMv8 SHA crypto
-    //   extensions when present. This is what the rest of ndn-security uses.
-    // * `signing/sha256-digest-sw` — `sha2::Sha256` from rustcrypto with
-    //   `default-features = false` (no asm, no SIMD), forcing the pure-Rust
-    //   software path. CPU extensions are not consulted.
-    //
-    // The ratio of (hw / sw) on a given CPU is the practical SHA-NI speedup.
-    // A negligible ratio (< 1.2x) means the runner's CPU lacks the extension.
-    {
-        let mut group = c.benchmark_group("signing/sha256-digest-hw");
-        for (label, region) in &regions {
-            group.throughput(Throughput::Bytes(region.len() as u64));
-            group.bench_with_input(BenchmarkId::new("sign_sync", label), region, |b, r| {
-                b.iter(|| {
-                    let digest = ring::digest::digest(&ring::digest::SHA256, r);
-                    debug_assert_eq!(digest.as_ref().len(), 32);
-                    digest
-                });
-            });
-        }
-        group.finish();
-    }
+    // Uses `sha2::Sha256` (rustcrypto), which dispatches to Intel SHA-NI /
+    // ARMv8 SHA crypto via the `cpufeatures` crate at runtime when the CPU
+    // exposes the extension. This matches the path that the rest of
+    // `ndn-security` uses. Earlier iterations of this bench split the group
+    // into ring (`-hw`) and sha2 (`-sw`) thinking that would isolate the
+    // SHA-NI cost — it doesn't, because both crates use cpufeatures and
+    // both end up on the same hardware-accelerated path on any CPU you
+    // care about. See `docs/wiki/src/deep-dive/why-blake3.md`.
     {
         use sha2::{Digest, Sha256};
-        let mut group = c.benchmark_group("signing/sha256-digest-sw");
+        let mut group = c.benchmark_group("signing/sha256-digest");
         for (label, region) in &regions {
             group.throughput(Throughput::Bytes(region.len() as u64));
             group.bench_with_input(BenchmarkId::new("sign_sync", label), region, |b, r| {
@@ -262,34 +244,12 @@ fn bench_verification(c: &mut Criterion) {
         group.finish();
     }
 
-    // SHA256 plain-digest verification — re-hash and compare. Hardware
-    // (ring with SHA-NI / ARMv8 crypto when present) and software (rustcrypto
-    // sha2 with default-features off — pure Rust, no asm) backends are
-    // benched in parallel; see the matching `signing/sha256-digest-{hw,sw}`
-    // groups for the rationale.
-    {
-        let mut group = c.benchmark_group("verification/sha256-digest-hw");
-        for (label, region, _, _, _) in &presigned {
-            let expected = ring::digest::digest(&ring::digest::SHA256, region);
-            let expected_bytes: Bytes = Bytes::copy_from_slice(expected.as_ref());
-            group.throughput(Throughput::Bytes(region.len() as u64));
-            group.bench_with_input(
-                BenchmarkId::new("verify", label),
-                &(region.as_slice(), expected_bytes.as_ref()),
-                |b, &(r, s)| {
-                    b.iter(|| {
-                        let got = ring::digest::digest(&ring::digest::SHA256, r);
-                        debug_assert_eq!(got.as_ref(), s);
-                        got
-                    });
-                },
-            );
-        }
-        group.finish();
-    }
+    // SHA256 plain-digest verification — re-hash and compare. Same backend
+    // as `signing/sha256-digest`; see that group for the rationale on
+    // sha2-vs-ring choice.
     {
         use sha2::{Digest, Sha256};
-        let mut group = c.benchmark_group("verification/sha256-digest-sw");
+        let mut group = c.benchmark_group("verification/sha256-digest");
         for (label, region, _, _, _) in &presigned {
             let mut h = Sha256::new();
             h.update(region);

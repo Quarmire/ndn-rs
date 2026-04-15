@@ -387,8 +387,17 @@ fn autodetect_pkcs1_or_sec1(der: &[u8]) -> Result<TpmKeyKind, FileTpmError> {
 
 fn sign_rsa(pkcs1_der: &[u8], region: &[u8]) -> Result<Bytes, FileTpmError> {
     use pkcs1::DecodeRsaPrivateKey;
+    // Use the sha2 re-export bundled by `rsa` rather than our top-level
+    // `sha2 0.11`. `rsa = 0.9` is on the older rustcrypto release wave
+    // with `digest 0.10`, and `Pkcs1v15Sign::new::<D>` is bound to that
+    // crate's own `Digest` trait — handing it a `Sha256` from `sha2 0.11`
+    // (which implements `digest 0.11::Digest`) is a different trait and
+    // fails type-check. The bundled re-export gives us the exact type
+    // `Pkcs1v15Sign::new` expects. When we eventually bump `rsa` to
+    // 0.10 alongside the rest of the rustcrypto stack, this and the
+    // matching block in the test module can drop the `rsa::` prefix.
+    use rsa::sha2::{Digest, Sha256};
     use rsa::{Pkcs1v15Sign, RsaPrivateKey};
-    use sha2::Sha256;
 
     let sk = RsaPrivateKey::from_pkcs1_der(pkcs1_der)
         .map_err(|e| FileTpmError::InvalidKey(format!("rsa pkcs1: {e}")))?;
@@ -678,10 +687,14 @@ mod tests {
         // 2048-bit RSA signature is 256 bytes.
         assert_eq!(sig.len(), 256);
 
-        // Verify using the recovered public key.
+        // Verify using the recovered public key. As in `sign_rsa`, we
+        // use rsa's bundled `sha2` re-export so the `Pkcs1v15Sign::new`
+        // type bound is satisfied — the workspace's top-level
+        // `sha2 0.11::Sha256` belongs to a different `Digest` trait
+        // family.
         use pkcs8::DecodePublicKey;
+        use rsa::sha2::{Digest, Sha256};
         use rsa::{Pkcs1v15Sign, RsaPublicKey};
-        use sha2::Sha256;
         let pk_der = tpm.public_key(&kn).unwrap();
         let pk = RsaPublicKey::from_public_key_der(&pk_der).unwrap();
         let hash = Sha256::digest(region);

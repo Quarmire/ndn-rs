@@ -182,11 +182,17 @@ base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 ring          = "0.17"
 ed25519-dalek = "2"
 blake3        = "1"
-# NDNCERT 0.3: ECDH (P-256), HKDF-SHA256, and AES-GCM-128
+# NDNCERT 0.3: ECDH (P-256), HKDF-SHA256, and AES-GCM-128.
+# Note: p256 and aes-gcm stay on the rustcrypto 0.10/0.13 release wave
+# until their 0.11/0.14 lines exit RC. sha2 + hkdf are on the newer wave
+# already — this works because the digest 0.11 trait family is wire-
+# compatible at runtime even when half the workspace still pulls
+# digest 0.10 transitively (the duplication is a few KB of code, not a
+# correctness issue, and p256 has no public API that touches digest).
 p256          = { version = "0.13", default-features = false, features = ["ecdh"] }
 aes-gcm       = { version = "0.10", features = ["alloc", "getrandom"] }
-hkdf          = "0.12"
-sha2          = "0.10"
+hkdf          = "0.13"
+sha2          = "0.11"
 
 # Serial port support
 tokio-serial = "5"

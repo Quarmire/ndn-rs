@@ -59,13 +59,7 @@ sqlite-pib  = ["dep:rusqlite"]
 tokio      = { workspace = true, features = ["rt", "macros", "sync", "time"] }
 tempfile   = "3"
 criterion  = { workspace = true }
-ndn-tlv       = { workspace = true, features = ["std"] }
-# Pure-Rust SHA-256 with the asm/SIMD backend explicitly disabled, used
-# only by the bench harness so we can compare against ring's hardware
-# (SHA-NI on x86_64, ARMv8 crypto extensions on aarch64) accelerated path.
-# `default-features = false` drops the asm feature; the resulting backend
-# is the rustcrypto soft path with no CPU-extension dispatch.
-sha2       = { version = "0.10", default-features = false }
+ndn-tlv    = { workspace = true, features = ["std"] }
 
 [[bench]]
 name    = "security"
