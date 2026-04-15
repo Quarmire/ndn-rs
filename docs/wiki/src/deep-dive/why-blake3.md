@@ -82,19 +82,50 @@ do this — its compression function is inherently sequential, so
 hashing a 16 MB buffer takes 16× longer than hashing a 1 MB buffer
 on the same core, no matter how many cores you have.
 
+ndn-rs has the `rayon` feature enabled and `Blake3Signer` /
+`Blake3DigestVerifier` automatically dispatch to `Hasher::update_rayon`
+when the input crosses `BLAKE3_RAYON_THRESHOLD` (128 KiB, the rule-of-
+thumb crossover from the blake3 docs). Per-packet signing of normal
+NDN signed portions never reaches that threshold and is unaffected;
+bulk content publication does.
+
+The `large/blake3-{single,rayon}` and `large/sha256` bench groups
+exercise the crossover at 256 KB / 1 MB / 4 MB. Local numbers from a
+multi-core development machine make the structural advantage concrete:
+
+| Input size | BLAKE3 single-thread | BLAKE3 rayon | rayon speedup | SHA-256 SHA-NI | BLAKE3 rayon vs SHA-NI |
+|---|---:|---:|---:|---:|---:|
+| 256 KB | 103 µs | 49 µs | **2.1×** | 95 µs | **1.95×** faster |
+| 1 MB | 413 µs | 93 µs | **4.4×** | 368 µs | **3.95×** faster |
+| 4 MB | 1.66 ms | 247 µs | **6.7×** | 1.46 ms | **5.92×** faster |
+
+Three observations from the numbers:
+
+1. **Single-thread BLAKE3 loses to SHA-NI at every size in the table.**
+   The narrative is identical to the per-packet bench above — SHA-256
+   with hardware acceleration is faster than single-thread BLAKE3 even
+   at 4 MB. BLAKE3's "I'm faster" story is not single-thread.
+2. **rayon turns the loss into a 6× win** by 4 MB. The crossover
+   happens around 256 KB, and once amortised, rayon scales near-linearly
+   with cores. SHA-NI cannot follow — there is no "SHA-NI rayon".
+3. **The crossover threshold matches the blake3 docs.** Below ~128 KiB
+   the rayon thread-spawn cost beats the per-byte savings; above it,
+   rayon dominates. This is exactly why ndn-rs gates the dispatch on
+   input size rather than always taking the rayon path.
+
 For NDN this matters at the **Content-Store insert** and
 **publication-time** boundary, not the per-Interest hot path:
 
 - A producer publishing a 1 GB Data object can compute its content
-  digest in seconds rather than minutes by spreading the work across
-  all available cores.
+  digest in ~250 ms rather than ~1.6 s on a multi-core machine — a
+  6× wall-clock win that scales with available cores.
 - A long-running ndn-fwd that ingests a large file via `ndn-put` or
   via a sync protocol can checksum the body with whatever cores it
   has spare without bottlenecking on a single thread.
 
 This is the only place where the "BLAKE3 is faster than SHA-256"
 claim survives in 2026: when you have many cores **and** an input
-that's large enough to amortize the tree overhead. SHA-NI cannot
+that's large enough to amortise the tree overhead. SHA-NI cannot
 follow you there; it accelerates one core at a time.
 
 ### 4. One algorithm: hash, MAC, KDF, XOF
