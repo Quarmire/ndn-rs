@@ -483,6 +483,22 @@ fn bench_blake3_large(c: &mut Criterion) {
     }
 }
 
+// Note: a one-time `bench_streaming_feasibility` micro-bench used to
+// live here, exercising sha2 / blake3 incremental-API overhead and
+// post-eviction cold-cache cost across NDN signed-portion sizes
+// (256 B, 1 KB, 4 KB, 16 KB) to decide whether to pursue
+// hash-during-TLV-decode as an optimisation. The answer was no, and
+// the bench is gone — the finding is permanent and lives in
+// `docs/wiki/src/deep-dive/why-blake3.md` ("Appendix: streaming hash
+// during TLV decode — investigated and rejected").
+//
+// Short version of why: SHA-256 streaming saves nothing because cache
+// locality is already a non-factor at NDN signed-portion sizes, and
+// BLAKE3 streaming is *worse* than the current oneshot pattern by ~2×
+// at 4 KB+ because feeding BLAKE3 in small chunks defeats its tree-
+// mode SIMD parallelism. The current "hash the slice after decode"
+// pattern is already optimal.
+
 criterion_group!(
     benches,
     bench_signing,

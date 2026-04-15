@@ -329,6 +329,90 @@ the cryptographic-surface-simplification angle on
 constrained-firmware targets. None of them are about beating SHA-NI
 at single-block hashing — that battle is over and SHA-NI won.
 
+## Appendix: streaming hash during TLV decode — investigated and rejected
+
+A natural optimisation idea: instead of `decode → hash the signed
+region after the fact`, feed bytes to an incremental hasher *during*
+TLV decode, so the digest is ready the moment parsing finishes.
+Eliminates one byte pass over the signed region. Both `sha2` and
+`blake3` expose `Hasher::update` for exactly this kind of streaming.
+The hypothesis was that the second pass costs real time because the
+bytes have been evicted from L1/L2 between decode and validate by
+the intervening pipeline work.
+
+**The hypothesis didn't survive contact with a micro-bench.** A
+one-time investigation measured (a) sha2 / blake3 incremental-API
+overhead at NDN sizes, and (b) the cold-cache cost after evicting
+2 MiB of memory between buffer setup and hash. Two results killed
+the idea:
+
+### Finding 1: SHA-256 cache locality is already a non-factor at NDN sizes
+
+| size | warm `Sha256::digest` | post-eviction `Sha256::digest` | ratio |
+|---|---:|---:|---:|
+| 256 B | 100 ns | 63 ns | 0.63× (*cold* faster!) |
+| 1 KB | 392 ns | 342 ns | 0.87× |
+| 4 KB | 1532 ns | 1419 ns | 0.93× |
+| 16 KB | 5619 ns | 5614 ns | 1.00× |
+
+The cold-hash measurement is **the same speed or faster** than the
+warm-hash measurement at every NDN-typical size. The post-eviction
+times being slightly *lower* is hardware-prefetch noise: the access
+pattern is sequential, the prefetcher predicts it perfectly, and the
+"cold cache" path benefits from L1 pre-population by the time the
+hash actually starts. Either way, the "savings from streaming
+SHA-256" is at most a handful of nanoseconds per packet, and is just
+as plausibly negative as positive.
+
+### Finding 2: BLAKE3 actively *punishes* the streaming pattern at large sizes
+
+| size | warm oneshot | warm `update(64-byte chunks)` | overhead |
+|---|---:|---:|---:|
+| 256 B | 197 ns | 211 ns | +7% |
+| 1 KB | 781 ns | 820 ns | +5% |
+| 4 KB | **1703 ns** | **3451 ns** | **+103%** |
+| 16 KB | **6561 ns** | **13785 ns** | **+110%** |
+
+This is the surprise. At 4 KB and 16 KB, feeding BLAKE3 in 64-byte
+chunks (which is exactly what a TLV decoder would do, since most NDN
+TLV bodies are tens to hundreds of bytes) is **2× slower** than
+calling `update` once on the full slice. With 256-byte chunks it's
+marginally better but still ~2× at 4 KB+.
+
+**Why:** BLAKE3's single-thread speed comes from its tree-mode SIMD
+implementation processing multiple 1024-byte chunks in parallel
+across SIMD lanes. When you call `update(big_slice)`, BLAKE3 sees
+the full buffer, splits it into chunks, and runs 4–16 chunks through
+SIMD lanes simultaneously. When you call `update(small_chunk)`
+repeatedly, BLAKE3 has no choice but to buffer up bytes until a full
+chunk is available, then process them serially because there's no
+"next chunk" yet to fill the other SIMD lanes. The parallelism is
+gone, and what's left is the serial fallback plus per-call buffering
+overhead.
+
+So **BLAKE3's tree mode requires contiguous large updates to be
+fast**. The current "hash the slice after decode" pattern is exactly
+the right shape for BLAKE3, and any move toward incremental updates
+would slow it down.
+
+### Conclusion
+
+For both algorithms the verdict is the same — for opposite reasons:
+
+- **SHA-256:** streaming saves nothing because there's nothing to
+  save. Cache locality at NDN sizes is already a no-op.
+- **BLAKE3:** streaming actively costs ~2× at 4 KB+ because it
+  defeats SIMD parallelism.
+
+The current architecture — `decode produces a slice, validator
+hashes the slice oneshot` — is **already optimal**, not by accident
+but because it matches the algorithms' performance models. There is
+no streaming-hash refactor to do. If the same idea comes up again,
+re-run the bench code that lived briefly in
+`crates/engine/ndn-security/benches/security.rs` (now removed; check
+the git history for `bench_streaming_feasibility`) to confirm the
+finding still holds on whatever hardware you care about.
+
 ## Summary
 
 | Question | Answer |
