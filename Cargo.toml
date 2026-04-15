@@ -181,7 +181,12 @@ base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 # Cryptography
 ring          = "0.17"
 ed25519-dalek = "2"
-blake3        = "1"
+# `rayon` enables `Hasher::update_rayon` for multi-thread hashing of a
+# single large buffer. Useful only above ~128 KiB (rayon overhead beats
+# update at smaller sizes); ndn-rs uses it for bulk content publication
+# in producer apps and gates per-call on input size. Per-packet signing
+# never reaches the threshold and is unaffected.
+blake3        = { version = "1", features = ["rayon"] }
 # NDNCERT 0.3: ECDH (P-256), HKDF-SHA256, and AES-GCM-128.
 # Note: p256 and aes-gcm stay on the rustcrypto 0.10/0.13 release wave
 # until their 0.11/0.14 lines exit RC. sha2 + hkdf are on the newer wave

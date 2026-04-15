@@ -202,8 +202,47 @@ impl Signer for Blake3Signer {
     }
 
     fn sign_sync(&self, region: &[u8]) -> Result<Bytes, TrustError> {
-        let hash = blake3::hash(region);
+        let hash = blake3_hash_auto(region);
         Ok(Bytes::copy_from_slice(hash.as_bytes()))
+    }
+}
+
+/// Threshold above which BLAKE3 hashing switches from single-thread
+/// `Hasher::update` to multi-thread `Hasher::update_rayon`. The blake3
+/// crate documents 128 KiB as the rule-of-thumb crossover on x86_64 —
+/// below that the rayon thread-spawn overhead beats the per-byte
+/// savings, so we always take the single-thread path. Per-packet
+/// signing of normal NDN signed portions (a few hundred bytes to a
+/// few KB) never reaches this threshold; bulk content publication
+/// (multi-MB Data) does.
+pub const BLAKE3_RAYON_THRESHOLD: usize = 128 * 1024;
+
+/// Compute an unkeyed BLAKE3 hash, automatically dispatching to the
+/// multi-thread `update_rayon` path when the input is large enough to
+/// benefit. See [`BLAKE3_RAYON_THRESHOLD`]. Used by both
+/// [`Blake3Signer`] (sign side) and `Blake3DigestVerifier` (verify
+/// side) so that a single-call API "just gets faster" on large inputs
+/// without callers needing to pick a code path.
+pub fn blake3_hash_auto(region: &[u8]) -> blake3::Hash {
+    if region.len() >= BLAKE3_RAYON_THRESHOLD {
+        let mut h = blake3::Hasher::new();
+        h.update_rayon(region);
+        h.finalize()
+    } else {
+        blake3::hash(region)
+    }
+}
+
+/// Compute a keyed BLAKE3 hash, automatically dispatching to
+/// `update_rayon` when the input is large enough to benefit. See
+/// [`BLAKE3_RAYON_THRESHOLD`].
+pub fn blake3_keyed_hash_auto(key: &[u8; 32], region: &[u8]) -> blake3::Hash {
+    if region.len() >= BLAKE3_RAYON_THRESHOLD {
+        let mut h = blake3::Hasher::new_keyed(key);
+        h.update_rayon(region);
+        h.finalize()
+    } else {
+        blake3::keyed_hash(key, region)
     }
 }
 
@@ -245,7 +284,7 @@ impl Signer for Blake3KeyedSigner {
     }
 
     fn sign_sync(&self, region: &[u8]) -> Result<Bytes, TrustError> {
-        let hash = blake3::keyed_hash(&self.key, region);
+        let hash = blake3_keyed_hash_auto(&self.key, region);
         Ok(Bytes::copy_from_slice(hash.as_bytes()))
     }
 }

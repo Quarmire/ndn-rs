@@ -78,6 +78,11 @@ impl Verifier for Ed25519Verifier {
 /// BLAKE3 digest verifier — checks that `sig_value` is the BLAKE3 hash of `region`.
 ///
 /// `public_key` is unused (BLAKE3 digest signing has no key). Pass an empty slice.
+///
+/// Hashes large inputs (≥ [`BLAKE3_RAYON_THRESHOLD`]) via `update_rayon`,
+/// which scales with available cores. Per-packet verification never
+/// reaches the threshold; bulk content verification (large segmented
+/// Data with a tree-signed root) does.
 pub struct Blake3DigestVerifier;
 
 impl Verifier for Blake3DigestVerifier {
@@ -91,7 +96,7 @@ impl Verifier for Blake3DigestVerifier {
             let Ok(expected): Result<&[u8; 32], _> = sig_value.try_into() else {
                 return Ok(VerifyOutcome::Invalid);
             };
-            let hash = blake3::hash(region);
+            let hash = crate::signer::blake3_hash_auto(region);
             if hash.as_bytes() == expected {
                 Ok(VerifyOutcome::Valid)
             } else {
@@ -103,7 +108,8 @@ impl Verifier for Blake3DigestVerifier {
 
 /// BLAKE3 keyed verifier — checks that `sig_value` is the BLAKE3 keyed hash of `region`.
 ///
-/// `public_key` must be exactly 32 bytes (the BLAKE3 key).
+/// `public_key` must be exactly 32 bytes (the BLAKE3 key). Same large-
+/// input dispatch as [`Blake3DigestVerifier`].
 pub struct Blake3KeyedVerifier;
 
 impl Verifier for Blake3KeyedVerifier {
@@ -118,7 +124,7 @@ impl Verifier for Blake3KeyedVerifier {
             let Ok(expected): Result<&[u8; 32], _> = sig_value.try_into() else {
                 return Ok(VerifyOutcome::Invalid);
             };
-            let hash = blake3::keyed_hash(key, region);
+            let hash = crate::signer::blake3_keyed_hash_auto(key, region);
             if hash.as_bytes() == expected {
                 Ok(VerifyOutcome::Valid)
             } else {

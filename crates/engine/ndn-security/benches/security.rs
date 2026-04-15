@@ -396,5 +396,98 @@ fn bench_validation(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_signing, bench_verification, bench_validation);
+// ── BLAKE3 large-input multi-thread bench ─────────────────────────────────
+//
+// The per-packet sign/verify benches above compare BLAKE3 against
+// hardware-accelerated SHA-256 on inputs the size of an NDN signed
+// portion (a few hundred bytes to a few KB). At those sizes BLAKE3
+// has no parallelism to extract — it's single-thread vs single-thread,
+// and SHA-NI wins. The interesting BLAKE3 win is at multi-MB inputs
+// where `Hasher::update_rayon` spreads the work across all cores.
+//
+// This group benches both sides of `BLAKE3_RAYON_THRESHOLD` so the
+// crossover is visible on whatever runner the bench lands on:
+//
+//   256 KB  — at the threshold, rayon barely wins
+//   1 MB    — comfortably above, ~2-4× speedup expected on multi-core
+//   4 MB    — fully amortised, near-linear scaling
+//
+// SHA-256 is included at the same sizes as a control. There is no
+// SHA-256 multi-thread variant — it's inherently sequential — so the
+// comparison shows the qualitative difference between an algorithm
+// that scales with cores and one that does not.
+const BLAKE3_LARGE_SIZES: &[usize] = &[256 * 1024, 1024 * 1024, 4 * 1024 * 1024];
+
+fn size_label_bytes(n: usize) -> String {
+    if n >= 1024 * 1024 {
+        format!("{}MB", n / (1024 * 1024))
+    } else if n >= 1024 {
+        format!("{}KB", n / 1024)
+    } else {
+        format!("{}B", n)
+    }
+}
+
+fn bench_blake3_large(c: &mut Criterion) {
+    use sha2::{Digest, Sha256};
+    let regions: Vec<(String, Vec<u8>)> = BLAKE3_LARGE_SIZES
+        .iter()
+        .map(|&n| (size_label_bytes(n), vec![0xA5u8; n]))
+        .collect();
+
+    // BLAKE3 single-thread.
+    {
+        let mut group = c.benchmark_group("large/blake3-single");
+        for (label, region) in &regions {
+            group.throughput(Throughput::Bytes(region.len() as u64));
+            group.bench_with_input(BenchmarkId::new("hash", label), region, |b, r| {
+                b.iter(|| blake3::hash(r));
+            });
+        }
+        group.finish();
+    }
+    // BLAKE3 multi-thread via rayon — the only place BLAKE3 has a
+    // structural advantage over SHA-256 on a single buffer.
+    {
+        let mut group = c.benchmark_group("large/blake3-rayon");
+        for (label, region) in &regions {
+            group.throughput(Throughput::Bytes(region.len() as u64));
+            group.bench_with_input(BenchmarkId::new("hash", label), region, |b, r| {
+                b.iter(|| {
+                    let mut h = blake3::Hasher::new();
+                    h.update_rayon(r);
+                    h.finalize()
+                });
+            });
+        }
+        group.finish();
+    }
+    // SHA-256 control. There is no `update_rayon` equivalent — SHA-256
+    // cannot be parallelised over a single buffer — so this row is the
+    // single-thread ceiling for SHA-256 at large sizes. The interesting
+    // comparison is `large/blake3-rayon` vs `large/sha256` on a multi-
+    // core runner: BLAKE3 should pull ahead by roughly the core count.
+    {
+        let mut group = c.benchmark_group("large/sha256");
+        for (label, region) in &regions {
+            group.throughput(Throughput::Bytes(region.len() as u64));
+            group.bench_with_input(BenchmarkId::new("hash", label), region, |b, r| {
+                b.iter(|| {
+                    let mut h = Sha256::new();
+                    h.update(r);
+                    h.finalize()
+                });
+            });
+        }
+        group.finish();
+    }
+}
+
+criterion_group!(
+    benches,
+    bench_signing,
+    bench_verification,
+    bench_validation,
+    bench_blake3_large,
+);
 criterion_main!(benches);
