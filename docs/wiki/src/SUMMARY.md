@@ -53,6 +53,7 @@
 - [Routing Protocols](./deep-dive/routing-protocols.md)
 - [Sync Protocols](./deep-dive/sync-protocols.md)
 - [Security Model](./deep-dive/security-model.md)
+- [Why BLAKE3 (when SHA-NI is everywhere)](./deep-dive/why-blake3.md)
 - [Identity and Decentralized Identifiers](./deep-dive/identity-and-did.md)
 - [NDNCERT: Automated Certificate Issuance](./deep-dive/ndncert.md)
 - [Link-Layer and Wireless Faces](./deep-dive/link-layer-faces.md)
