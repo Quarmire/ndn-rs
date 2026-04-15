@@ -22,6 +22,7 @@ pub mod cert_cache;
 pub mod cert_fetcher;
 pub mod did;
 pub mod error;
+pub mod file_tpm;
 pub mod key_store;
 pub mod keychain;
 pub mod lvs;

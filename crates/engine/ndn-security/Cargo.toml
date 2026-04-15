@@ -16,8 +16,24 @@ ring          = { workspace = true }
 # SQLite from source (~5 s) so we don't depend on a system library, which
 # matters for cross-compilation to Android, iOS, musl, and bare-metal.
 rusqlite      = { version = "0.32", features = ["bundled"], optional = true }
-ed25519-dalek = { workspace = true }
+ed25519-dalek = { workspace = true, features = ["pkcs8"] }
 blake3        = { workspace = true }
+# rustcrypto crates for ndn-cxx-compatible FileTpm + SafeBag.
+# Versions matched to the existing workspace `p256 = 0.13` (rustcrypto
+# 0.13-era release cycle) so all rustcrypto crates share traits cleanly.
+# Pure-Rust, no system libs — keeps mobile/embedded/wasm targets clean.
+rsa           = { version = "0.9",  default-features = false, features = ["std", "sha2"] }
+p256-ecdsa    = { package = "p256", version = "0.13", default-features = false, features = ["std", "ecdsa", "pkcs8"] }
+pkcs1         = { version = "0.7",  features = ["std", "alloc"] }
+sec1          = { version = "0.7",  default-features = false, features = ["std", "alloc", "der", "pem", "pkcs8"] }
+pkcs8         = { version = "0.10", default-features = false, features = ["std", "alloc", "encryption", "pem"] }
+sha2          = { workspace = true }
+# Symmetric crypto for SafeBag's PKCS#8-encrypted private key wrapping
+# (PBES2 / PBKDF2-HMAC-SHA256 / AES-256-CBC, matching what OpenSSL's
+# PKCS8_encrypt produces by default on modern releases).
+aes           = { version = "0.8",  default-features = false }
+cbc           = { version = "0.1",  default-features = false }
+pbkdf2        = { version = "0.12", default-features = false, features = ["hmac"] }
 # DID support (formerly ndn-did)
 serde         = { workspace = true }
 serde_json    = { workspace = true }
