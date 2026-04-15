@@ -136,10 +136,26 @@ impl CongestionController {
     // ─── Builder-style parameter setters ────────────────────────────────
 
     /// Set the initial and current window size.
+    ///
+    /// For Cubic, this also updates `w_max` to match so the cubic
+    /// formula's "recovery target" reflects the user's intent. Without
+    /// this, a caller that does `cubic().with_window(N).with_ssthresh(N)`
+    /// for large N would leave `w_max` at its tiny default value (2.0),
+    /// and the first `on_data()` call would take the cubic branch
+    /// (since `window >= ssthresh`) and collapse the window back toward
+    /// `w_max = 2`. See the `cubic_does_not_collapse_at_large_initial_window`
+    /// regression test.
     pub fn with_window(mut self, w: f64) -> Self {
         match &mut self {
-            Self::Aimd { window, .. } | Self::Cubic { window, .. } | Self::Fixed { window } => {
-                *window = w
+            Self::Aimd { window, .. } | Self::Fixed { window } => *window = w,
+            Self::Cubic { window, w_max, .. } => {
+                *window = w;
+                // Treat the new initial window as the current "best"
+                // so the cubic formula's post-loss trajectory points
+                // at this window, not the default 2.0.
+                if *w_max < w {
+                    *w_max = w;
+                }
             }
         }
         self
@@ -262,7 +278,19 @@ impl CongestionController {
                     let w_tcp = *w_max * *beta
                         + (3.0 * (1.0 - *beta) / (1.0 + *beta))
                             * (*acks_since_loss as f64 / *window);
-                    *window = w_cubic.max(w_tcp);
+                    // Congestion avoidance must be *monotonic* — a
+                    // successful data delivery can never justify
+                    // shrinking the window. Without the `.max(*window)`
+                    // clause, the cubic formula can return a value
+                    // below the current window when `t < K` (i.e. we
+                    // haven't "recovered" to `w_max` yet by the model's
+                    // clock). That happens naturally right after a
+                    // loss event but the model can also produce it at
+                    // initialisation if `w_max` hasn't caught up to
+                    // the user's initial window yet. The RFC 8312
+                    // phrasing is "cwnd SHOULD be set to max(cwnd,
+                    // W_cubic, W_est)"; we match that.
+                    *window = w_cubic.max(w_tcp).max(*window);
                 }
                 *window = window.min(*max_window);
             }
@@ -440,6 +468,106 @@ mod tests {
             cc.on_timeout();
         }
         assert!(cc.window() >= DEFAULT_MIN_WINDOW);
+    }
+
+    /// Regression test for the cubic collapse bug observed in the
+    /// `testbed/tests/chunked/matrix.sh` sweep.
+    ///
+    /// A consumer that called
+    /// `CongestionController::cubic().with_window(64).with_ssthresh(64)`
+    /// would see the first `on_data()` call drop the window from 64
+    /// to ~1.4 — because `with_window` didn't update `w_max` (it
+    /// stayed at the default 2.0), and the cubic formula's "recovery
+    /// target" was therefore ~2, which the code assigned to `*window`
+    /// unconditionally. At pipe=64 this turned a 60 ms fetch into a
+    /// 4.5 second fetch because `window.floor()` was 1 for most of
+    /// the subsequent slow-start recovery.
+    ///
+    /// The fix has two parts: `with_window` now updates `w_max` for
+    /// Cubic, and `on_data`'s cubic branch clamps the result to
+    /// `max(cwnd, W_cubic, W_est)` so successful data delivery can
+    /// never shrink the window.
+    #[test]
+    fn cubic_does_not_collapse_at_large_initial_window() {
+        let mut cc = CongestionController::cubic()
+            .with_window(64.0)
+            .with_ssthresh(64.0);
+        assert_eq!(cc.window(), 64.0);
+
+        // First on_data must not shrink.
+        cc.on_data();
+        assert!(
+            cc.window() >= 64.0,
+            "first on_data shrank window to {} (cubic collapse bug)",
+            cc.window()
+        );
+
+        // Many subsequent on_data calls must not shrink either.
+        for i in 0..1000 {
+            cc.on_data();
+            assert!(
+                cc.window() >= 64.0,
+                "on_data iteration {i} shrank window to {}",
+                cc.window()
+            );
+        }
+        // Cubic's model eventually allows growth past w_max; the
+        // window should be at least the initial 64.
+        assert!(cc.window() >= 64.0);
+    }
+
+    /// Same shape of test but at the other end of the matrix's
+    /// parameter space — ensures the fix works at the window size
+    /// that was already passing before.
+    #[test]
+    fn cubic_does_not_collapse_at_initial_window_256() {
+        let mut cc = CongestionController::cubic()
+            .with_window(256.0)
+            .with_ssthresh(256.0);
+        cc.on_data();
+        assert!(
+            cc.window() >= 256.0,
+            "cubic collapsed at init_window=256: now {}",
+            cc.window()
+        );
+    }
+
+    /// `with_window` updates `w_max` for Cubic so the cubic formula's
+    /// post-loss trajectory points at the user-requested window, not
+    /// the default 2.0.
+    #[test]
+    fn cubic_with_window_updates_w_max() {
+        let cc = CongestionController::cubic().with_window(100.0);
+        match cc {
+            CongestionController::Cubic { w_max, window, .. } => {
+                assert_eq!(window, 100.0);
+                assert_eq!(w_max, 100.0);
+            }
+            _ => panic!("expected Cubic"),
+        }
+    }
+
+    /// If the caller sets a *smaller* window than the default w_max,
+    /// `with_window` must not lower w_max — that would erase loss
+    /// history. The `if *w_max < w` guard preserves the existing
+    /// value when the caller's w is smaller.
+    #[test]
+    fn cubic_with_window_never_shrinks_w_max() {
+        // Start with a larger w_max via one loss cycle, then call
+        // with_window with a smaller value. w_max should be unchanged.
+        let cc = CongestionController::cubic()
+            .with_window(500.0) // sets w_max = 500
+            .with_window(10.0); // must not shrink w_max below 500
+        match cc {
+            CongestionController::Cubic { w_max, window, .. } => {
+                assert_eq!(window, 10.0);
+                assert_eq!(
+                    w_max, 500.0,
+                    "w_max must not shrink when caller passes smaller window"
+                );
+            }
+            _ => panic!("expected Cubic"),
+        }
     }
 
     #[test]
