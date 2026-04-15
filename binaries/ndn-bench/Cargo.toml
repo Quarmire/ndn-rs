@@ -20,3 +20,16 @@ tokio      = { workspace = true, features = ["rt-multi-thread", "macros", "time"
 tracing    = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow     = { workspace = true }
+
+[dev-dependencies]
+# Bench-only deps — don't bloat the release binary compile graph.
+# merkle_e2e wires a real ForwarderEngine between producer and
+# consumer InProcFace pairs and measures Merkle partial-fetch
+# throughput end-to-end through the pipeline.
+ndn-security = { workspace = true }
+criterion    = { workspace = true }
+tokio-util   = { workspace = true, features = ["rt"] }
+
+[[bench]]
+name    = "merkle_e2e"
+harness = false

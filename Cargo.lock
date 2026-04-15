@@ -3947,12 +3947,15 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "criterion",
  "ndn-app",
  "ndn-engine",
  "ndn-faces",
  "ndn-packet",
+ "ndn-security",
  "ndn-transport",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
 ]

@@ -251,6 +251,43 @@ measures three schemes head-to-head.
 (Apple Silicon, `cargo bench --release`. Absolute numbers scale
 with CPU; the ratios are stable across machines.)
 
+#### End-to-end through the forwarder pipeline
+
+The numbers above measure producer/consumer costs in **isolation**
+— encode, verify, raw primitive work. A companion bench at
+`binaries/ndn-bench/benches/merkle_e2e.rs` wires the same three
+schemes through an in-process `ForwarderEngine` with `InProcFace`
+pairs and measures the 4 MB / 1024 segment / K=102 partial fetch
+with the full pipeline in the loop: TLV decode on Interest
+ingress, PIT insert, FIB longest-prefix lookup, BestRoute strategy,
+dispatch to the producer face, the producer's lookup-by-name
+response, and a symmetric pipeline on the Data return path.
+
+| scheme | isolated (K=102) | **end-to-end** | overhead | vs per-segment |
+|---|---:|---:|---:|---:|
+| per-segment Ed25519 | 2.56 ms | 2.52 ms | ~0 | 1.00× |
+| SHA-256 Merkle | 407 µs | 540 µs | +33% | **4.67×** |
+| BLAKE3 Merkle | 464 µs | 571 µs | +23% | **4.42×** |
+
+Three observations:
+
+1. **Per-segment Ed25519 pays almost nothing extra end-to-end.**
+   Crypto (~25 µs / verify × 102) dominates pipeline cost (~1–2 µs
+   / packet), so the forwarder tax is in the noise.
+2. **Merkle rows pay ~130 µs of pipeline overhead** — roughly 1 µs
+   per segment × 102 segments, which matches back-of-envelope
+   estimates for a well-tuned NDN forwarder pipeline.
+3. **The ~4.5× Merkle advantage survives the forwarder.** The
+   in-process 6.2× → end-to-end 4.67× ratio drop is from adding
+   constant pipeline overhead to the Merkle row's small denominator;
+   the *advantage* is still an order of magnitude of wall-clock
+   savings on the consumer side.
+4. **The SHA-256 / BLAKE3 gap narrows from 14% to 6% end-to-end.**
+   Both Merkle variants pay the same forwarder overhead, so the
+   constant forwarder cost dilutes the per-leaf hash difference.
+   In a real deployment where the bench runs alongside actual
+   network I/O, the gap would shrink further.
+
 #### Two findings, both honest
 
 **1. The Merkle tree wins, but by ~4–5×, not 100×.** My original
