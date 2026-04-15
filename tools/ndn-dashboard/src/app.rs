@@ -959,6 +959,7 @@ pub fn App() -> Element {
                                         meta_only: false,
                                         verbose: false,
                                         can_be_prefix: false,
+                                        ..Default::default()
                                     },
                                     ttx,
                                 );
@@ -987,6 +988,11 @@ pub fn App() -> Element {
                                 let data_bytes = bytes::Bytes::from(data);
                                 tokio::spawn(async move {
                                     let (ttx, mut trx) = tokio::sync::mpsc::channel(256);
+                                    let sign_mode = if sign {
+                                        ndn_tools_core::put::SignMode::Ed25519
+                                    } else {
+                                        ndn_tools_core::put::SignMode::DigestSha256
+                                    };
                                     let run_fut = ndn_tools_core::put::run_producer(
                                         ndn_tools_core::put::PutParams {
                                             conn: ConnectConfig {
@@ -996,8 +1002,8 @@ pub fn App() -> Element {
                                             name,
                                             data: data_bytes,
                                             chunk_size: 0,
-                                            sign,
-                                            hmac: false,
+                                            sign_mode,
+                                            hash_algo: ndn_tools_core::put::HashAlgo::Sha256,
                                             freshness_ms,
                                             timeout_secs: 0,
                                             quiet: false,

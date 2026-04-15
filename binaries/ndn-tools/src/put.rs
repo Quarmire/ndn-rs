@@ -10,9 +10,60 @@ use bytes::Bytes;
 use clap::Parser;
 use tokio::sync::mpsc;
 
+use clap::ValueEnum;
 use ndn_ipc::chunked::NDN_DEFAULT_SEGMENT_SIZE;
 use ndn_tools_core::common::{ConnectConfig, EventLevel, ToolEvent};
-use ndn_tools_core::put::{PutParams, run_producer};
+use ndn_tools_core::put::{HashAlgo, PutParams, SignMode, run_producer};
+
+/// CLI sign mode mirror — clap can't directly use `ndn_tools_core::SignMode`
+/// because it lives in a sibling crate that doesn't depend on clap.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum CliSign {
+    /// No SignatureValue (debug only).
+    None,
+    /// NDN spec DigestSha256 (type 0). Default. ndn-cxx interoperable.
+    Digest,
+    /// ndn-rs experimental DigestBlake3 (type 6).
+    Blake3digest,
+    /// NDN spec HmacWithSha256 (type 4) with an ephemeral key.
+    Hmac,
+    /// ndn-rs experimental Blake3Keyed (type 7) with an ephemeral key.
+    Blake3keyed,
+    /// NDN spec SignatureSha256WithEd25519 (type 5).
+    Ed25519,
+    /// ndn-rs experimental Merkle-tree segment signing.
+    /// Pick the hash function with `--hash`.
+    Merkle,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum CliHash {
+    Sha256,
+    Blake3,
+}
+
+impl From<CliSign> for SignMode {
+    fn from(c: CliSign) -> Self {
+        match c {
+            CliSign::None => SignMode::None,
+            CliSign::Digest => SignMode::DigestSha256,
+            CliSign::Blake3digest => SignMode::DigestBlake3,
+            CliSign::Hmac => SignMode::HmacSha256,
+            CliSign::Blake3keyed => SignMode::Blake3Keyed,
+            CliSign::Ed25519 => SignMode::Ed25519,
+            CliSign::Merkle => SignMode::Merkle,
+        }
+    }
+}
+
+impl From<CliHash> for HashAlgo {
+    fn from(c: CliHash) -> Self {
+        match c {
+            CliHash::Sha256 => HashAlgo::Sha256,
+            CliHash::Blake3 => HashAlgo::Blake3,
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(
@@ -29,11 +80,15 @@ struct Cli {
     #[arg(long, default_value_t = NDN_DEFAULT_SEGMENT_SIZE)]
     chunk_size: usize,
 
-    #[arg(long)]
-    sign: bool,
+    /// Signing algorithm. `digest` (the default) is ndn-cxx
+    /// interoperable; `merkle` is ndn-rs only and pairs with
+    /// `--hash`. See the SignMode docs in ndn_tools_core::put.
+    #[arg(long, value_enum, default_value_t = CliSign::Digest)]
+    sign: CliSign,
 
-    #[arg(long)]
-    hmac: bool,
+    /// Hash function (only meaningful for `--sign=merkle`).
+    #[arg(long, value_enum, default_value_t = CliHash::Sha256)]
+    hash: CliHash,
 
     #[arg(long, default_value_t = 10_000)]
     freshness: u64,
@@ -82,8 +137,8 @@ async fn main() -> Result<()> {
             name: cli.name,
             data: Bytes::from(payload),
             chunk_size: cli.chunk_size,
-            sign: cli.sign,
-            hmac: cli.hmac,
+            sign_mode: cli.sign.into(),
+            hash_algo: cli.hash.into(),
             freshness_ms: cli.freshness,
             timeout_secs: cli.timeout,
             quiet: cli.quiet,

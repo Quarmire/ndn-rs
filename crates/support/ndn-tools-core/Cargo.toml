@@ -6,7 +6,11 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-default = []
+# `peek` and `put` are in the default set so `cargo test` (which can't
+# know to pass `--features peek,put`) compiles the integration tests
+# in `tests/merkle_e2e.rs`. The other tools stay opt-in. Binaries
+# that want a smaller subset can use `default-features = false`.
+default = ["peek", "put"]
 ping    = []
 iperf   = []
 peek    = []
@@ -14,15 +18,21 @@ put     = []
 send    = []
 recv    = []
 
+
 [dependencies]
 ndn-app        = { workspace = true }
 ndn-ipc        = { workspace = true }
 ndn-packet     = { workspace = true, features = ["std"] }
 ndn-security   = { workspace = true }
 ndn-transport  = { workspace = true }
-tokio          = { workspace = true, features = ["rt", "sync", "time"] }
+tokio          = { workspace = true, features = ["rt", "sync", "time", "fs"] }
 anyhow         = { workspace = true }
 serde          = { workspace = true }
 serde_json     = { workspace = true }
 bytes          = { workspace = true, features = ["std"] }
 tracing        = { workspace = true }
+# Direct hash deps for ndn-peek's --verify=digest-sha256 and
+# --verify=digest-blake3 paths. ndn-security already pulls these in
+# transitively but we need the names in scope.
+sha2           = { workspace = true }
+blake3         = { workspace = true }
