@@ -9,7 +9,7 @@
 # CC code path runs without errors on each algorithm.
 set -euo pipefail
 
-FWD_SOCK="${FWD_SOCK:-/run/ndn-fwd/ndn-fwd.sock}"
+FWD_SOCK="${FWD_SOCK:-/run/nfd/nfd.sock}"
 SIZE="${SIZE:-1048576}"
 CHUNK="${CHUNK:-4096}"
 

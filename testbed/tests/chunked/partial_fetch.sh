@@ -11,7 +11,7 @@
 # Merkle it's one manifest verify + K cheap hash walks.
 set -euo pipefail
 
-FWD_SOCK="${FWD_SOCK:-/run/ndn-fwd/ndn-fwd.sock}"
+FWD_SOCK="${FWD_SOCK:-/run/nfd/nfd.sock}"
 CHUNK=1024
 SEGS=16
 

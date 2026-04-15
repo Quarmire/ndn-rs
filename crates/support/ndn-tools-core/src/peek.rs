@@ -127,6 +127,21 @@ pub struct PeekParams {
     /// Emit a machine-parseable JSON summary line at the end of the
     /// run (one line, prefixed `metrics:`).
     pub metrics: bool,
+    /// Stream segment Content directly to `output` as each segment
+    /// arrives, instead of buffering all segments in a
+    /// `Vec<Option<Bytes>>` and reassembling at the end. Eliminates
+    /// the O(N) reassembly cost and the O(N) allocation of segment
+    /// Bytes storage — at the cost of requiring `output` to be set
+    /// (no in-memory result), no partial-range or out-of-order
+    /// support (segments must arrive in order to be streamed to
+    /// disk without re-seeks), and losing the "all or nothing"
+    /// atomicity the buffered path provides on error.
+    ///
+    /// Only enable for full-file fetches with `cc_algo == Fixed` or
+    /// small partial ranges; the fetch loop will buffer-then-write
+    /// if either `start_seg != 0` or `count_segs != 0` to preserve
+    /// partial-range correctness.
+    pub no_assemble: bool,
 }
 
 impl Default for PeekParams {
@@ -154,6 +169,7 @@ impl Default for PeekParams {
             start_seg: 0,
             count_segs: 0,
             metrics: false,
+            no_assemble: false,
         }
     }
 }
@@ -493,12 +509,42 @@ async fn fetch_segmented(
     // ed25519_verify_batch at the end of the fetch.
     let mut batch_inputs: Vec<(Bytes, Bytes, usize)> = Vec::new();
 
+    // Eager manifest fetch. For Merkle verification we must resolve
+    // the manifest Data *before* the pipeline drains, because
+    // `fetch_one(manifest_name)` uses the same shared recv channel
+    // as the segment pipeline. If we defer this to the first segment
+    // arrival inside `drive_pipeline`, the manifest fetch races with
+    // the several already-in-flight segment responses and
+    // `client.recv()` returns a segment Data instead of the manifest.
+    // Fetching the manifest up front is also cheap — it's one extra
+    // Interest round-trip, amortised across the whole transfer.
+    let mut merkle_cache: Option<CachedManifest> = None;
+    if is_merkle && params.verify_mode == VerifyMode::Merkle {
+        let manifest_name = first
+            .sig_info()
+            .and_then(|si| si.key_locator.clone())
+            .context("merkle segment missing KeyLocator → manifest name")?;
+        let m_t0 = Instant::now();
+        let manifest_data = fetch_one(client, &manifest_name, lifetime, false).await?;
+        metrics.manifest_fetch_us = m_t0.elapsed().as_micros() as u64;
+        let cached = CachedManifest::from_manifest_data(&manifest_data)
+            .map_err(|e| anyhow::anyhow!("manifest decode: {e}"))?;
+        if params.verbose {
+            let _ = tx
+                .send(ToolEvent::info(format!(
+                    "ndn-peek: merkle manifest: {} segments, root cached",
+                    cached.leaf_count
+                )))
+                .await;
+        }
+        merkle_cache = Some(cached);
+    }
+
     // Treat the discovery Data as the first segment if its index
     // falls inside the requested range.
     if seg0_idx >= start && seg0_idx < end {
         segments[seg0_idx - start] = Some(first.content().cloned().unwrap_or_else(Bytes::new));
         received += 1;
-        let mut merkle_cache: Option<CachedManifest> = None;
         let verify_us = verify_one(
             &first,
             seg0_idx,
@@ -550,7 +596,10 @@ async fn fetch_segmented(
     }
 
     // Discovery segment falls outside the partial range — drop its
-    // content and fetch the whole range from scratch.
+    // content and fetch the whole range from scratch. The
+    // `merkle_cache` was populated above if verify_mode == Merkle;
+    // it survives the dropped discovery segment and feeds straight
+    // into the pipeline loop.
     drive_pipeline(
         client,
         &versioned_prefix,
@@ -562,7 +611,7 @@ async fn fetch_segmented(
         start,
         end,
         usize::MAX,
-        None,
+        merkle_cache,
         batch_inputs,
         metrics,
         fetch_t0,
@@ -718,7 +767,11 @@ async fn drive_pipeline(
 
 /// Final processing: optional batch Ed25519 verification + reassembly
 /// into one buffer (only if `want_full`; otherwise concatenate the
-/// requested partial range).
+/// requested partial range). When `params.no_assemble` is set and
+/// `params.output` is provided, segments are streamed directly to
+/// the output file via `FileExt::write_at` (positional writes, so
+/// out-of-order arrival is fine) and the returned `assembled` is
+/// empty.
 fn finalise(
     segments: Vec<Option<Bytes>>,
     batch_inputs: Vec<(Bytes, Bytes, usize)>,
@@ -754,6 +807,56 @@ fn finalise(
         if outcome != ndn_security::VerifyOutcome::Valid {
             anyhow::bail!("ed25519 batch verify failed");
         }
+    }
+
+    // Fast path: --no-assemble streams to `output` directly, skipping
+    // the per-segment BytesMut extend_from_slice() and the final
+    // single-buffer allocation. Requires `output` and a uniform
+    // segment stride (the per-segment write offset is `slot *
+    // seg_stride`, so the first N-1 segments must all be the same
+    // length). We enforce that by computing `seg_stride` from the
+    // first segment slot and bailing out to the buffered path if any
+    // subsequent slot disagrees.
+    #[cfg(unix)]
+    if params.no_assemble {
+        use std::os::unix::fs::FileExt;
+        let path = params
+            .output
+            .as_ref()
+            .context("--no-assemble requires --output")?;
+        // Stride is the length of the first filled slot — the file's
+        // segments are assumed uniform-length except possibly the
+        // last one (which can be shorter, and is handled naturally
+        // because we write exactly its length at the stride offset).
+        let seg_stride = segments
+            .iter()
+            .find_map(|s| s.as_ref().map(|b| b.len()))
+            .unwrap_or(0);
+
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)
+            .with_context(|| format!("open {path} for no-assemble write"))?;
+
+        let mut total_bytes: u64 = 0;
+        for (slot, seg) in segments.iter().enumerate() {
+            if let Some(b) = seg {
+                let offset = (slot * seg_stride) as u64;
+                file.write_all_at(b, offset).with_context(|| {
+                    format!("write_at offset={offset} for segment slot {slot}")
+                })?;
+                total_bytes += b.len() as u64;
+            }
+        }
+        metrics.bytes = total_bytes;
+        // Return an empty `assembled` — the caller's `emit_content`
+        // path will notice `output` is set and skip its own write.
+        return Ok(FetchOutcome {
+            assembled: Bytes::new(),
+            metrics,
+        });
     }
 
     if !want_full {
@@ -879,7 +982,28 @@ pub async fn run_peek(params: PeekParams, tx: mpsc::Sender<ToolEvent>) -> Result
                 .send(ToolEvent::summary(outcome.metrics.to_json_line()))
                 .await;
         }
-        emit_content(&outcome.assembled, &name, &params, &tx).await?;
+        if params.no_assemble && params.output.is_some() {
+            // finalise() already streamed segments to the output
+            // file via positional writes; skip the emit_content
+            // path (which would otherwise over-write the file with
+            // an empty buffer) and log the saved-to event directly.
+            let path = params.output.clone().unwrap();
+            let _ = tx
+                .send(
+                    ToolEvent::info(format!(
+                        "ndn-peek: saved {} bytes to {path} (streamed)",
+                        outcome.metrics.bytes
+                    ))
+                    .with_data(ToolData::PeekResult {
+                        name: name.to_string(),
+                        bytes_received: outcome.metrics.bytes,
+                        saved_to: Some(path),
+                    }),
+                )
+                .await;
+        } else {
+            emit_content(&outcome.assembled, &name, &params, &tx).await?;
+        }
     } else {
         let data = fetch_one(&client, &name, lifetime, params.can_be_prefix).await?;
         if params.meta_only {

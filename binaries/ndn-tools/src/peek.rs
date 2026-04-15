@@ -158,6 +158,12 @@ struct Cli {
     #[arg(long)]
     metrics: bool,
 
+    /// Stream segments directly to `--output` instead of buffering
+    /// the assembled file in memory. Uses positional writes so
+    /// out-of-order arrival is fine. Requires `--output` to be set.
+    #[arg(long)]
+    no_assemble: bool,
+
     #[arg(long, default_value_t = ndn_config::ManagementConfig::default().face_socket)]
     face_socket: String,
 
@@ -236,6 +242,7 @@ async fn main() -> Result<()> {
             start_seg: cli.start,
             count_segs: cli.count,
             metrics: cli.metrics,
+            no_assemble: cli.no_assemble,
         },
         tx,
     )

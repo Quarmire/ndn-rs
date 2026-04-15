@@ -408,13 +408,26 @@ pub fn publish_segmented_merkle<H: MerkleHasher>(
 
     // 4. For each segment, build a Data with a SignatureValue of
     //    `leaf_hash || proof_len || proof_siblings*`. KeyLocator
-    //    points at the manifest Name.
+    //    points at the manifest Name. Every segment also carries a
+    //    `FinalBlockId` pointing at the last segment so that a
+    //    ndn-cxx-style CanBePrefix consumer can discover the total
+    //    segment count from the first Data (segment 0) and pipeline
+    //    the rest — without FinalBlockId the consumer sees no
+    //    MetaInfo hint and assumes the file is one segment long.
+    //
+    //    FinalBlockId lives in MetaInfo, which is covered by a
+    //    traditional signature's "signed region" — but Merkle
+    //    signatures do NOT sign the full region, they sign the
+    //    Content-only leaf hash. So adding FinalBlockId here changes
+    //    neither the leaf hash nor any proof, and the verifier's
+    //    `H::hash_leaf(content)` check still reconstructs the tree.
     let mut segment_wires = Vec::with_capacity(n);
     let effective_segments: Vec<&[u8]> = if content.is_empty() {
         vec![&[][..]]
     } else {
         segments_raw
     };
+    let last_seg = n.saturating_sub(1) as u64;
     for (i, seg_body) in effective_segments.iter().enumerate() {
         let seg_name = content_prefix.clone().append_segment(i as u64);
         let leaf = H::hash_leaf(seg_body);
@@ -425,15 +438,13 @@ pub fn publish_segmented_merkle<H: MerkleHasher>(
         for sibling in &proof {
             sig_value.extend_from_slice(sibling);
         }
-        let leaf_index_carrier = i as u64; // serialised into the segment name component
-        let _ = leaf_index_carrier;
         let sig_type = kind.sig_type();
         let mname = manifest_name.clone();
-        let wire = DataBuilder::new(seg_name, seg_body).sign_sync(
-            sig_type,
-            Some(&mname),
-            move |_signed_region| Bytes::from(sig_value),
-        );
+        let wire = DataBuilder::new(seg_name, seg_body)
+            .final_block_id_typed_seg(last_seg)
+            .sign_sync(sig_type, Some(&mname), move |_signed_region| {
+                Bytes::from(sig_value)
+            });
         segment_wires.push(wire);
     }
 

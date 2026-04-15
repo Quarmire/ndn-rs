@@ -104,6 +104,14 @@ pub struct PutParams {
     pub timeout_secs: u64,
     /// Suppress per-Interest log lines.
     pub quiet: bool,
+    /// Pre-sign every segment at startup into a name → wire lookup
+    /// table. The recv loop then serves by HashMap lookup with no
+    /// DataBuilder / hash work in the hot path. Always on for
+    /// `SignMode::Merkle` (the Merkle primitive requires the tree
+    /// to be built up front); opt-in for other modes. Trades startup
+    /// latency and memory (roughly one extra Bytes-size allocation
+    /// per segment) for steady-state throughput.
+    pub pre_sign: bool,
 }
 
 impl Default for PutParams {
@@ -118,6 +126,7 @@ impl Default for PutParams {
             freshness_ms: 10_000,
             timeout_secs: 0,
             quiet: false,
+            pre_sign: false,
         }
     }
 }
@@ -134,26 +143,56 @@ impl PutParams {
 // ── Run ───────────────────────────────────────────────────────────────────────
 
 /// Internal: how a particular sign mode produces a Data wire for a given
-/// segment index. Pre-built Merkle wires use a `MerkleSlate`; everything
-/// else lazily signs in the recv loop.
+/// segment index.
+///
+/// Two shapes:
+/// - **Lazy** (`None`, `DigestSha256`, `DigestBlake3`, `Signer`): the
+///   recv loop builds and signs each Data on demand as Interests
+///   arrive. Low startup cost, higher per-Interest cost.
+/// - **Prebuilt** (`PreSigned`, `Merkle`): every segment Data wire
+///   is signed once at startup into a `HashMap<Name, Bytes>` and the
+///   recv loop is a lookup. Higher startup cost, near-zero per-
+///   Interest cost. Merkle *requires* this shape because the tree
+///   depends on the full segment set; other modes enable it with
+///   `PutParams::pre_sign = true`.
 enum SignerSlate {
     /// No signature value (debug only).
     None,
-    /// DigestSha256 (NDN spec type 0).
+    /// DigestSha256 (NDN spec type 0). Lazy.
     DigestSha256,
-    /// DigestBlake3 (ndn-rs experimental type 6).
+    /// DigestBlake3 (ndn-rs experimental type 6). Lazy.
     DigestBlake3,
     /// Boxed `Signer` for HMAC-SHA256, Blake3-keyed, and Ed25519.
+    /// Lazy.
     Signer(Arc<dyn Signer>),
-    /// Pre-built Merkle publication. The `wires` map is keyed by
-    /// segment Data name and produced once at startup. `manifest_name`
-    /// and `manifest_wire` let the recv loop respond to manifest
-    /// Interests in the same dispatcher as segment Interests.
-    Merkle {
-        wires: HashMap<Name, Bytes>,
-        manifest_name: Name,
-        manifest_wire: Bytes,
-    },
+    /// Pre-signed segment wires for any non-Merkle mode. Built once
+    /// at startup when `PutParams::pre_sign` is set.
+    PreSigned { wires: HashMap<Name, Bytes> },
+    /// Pre-built Merkle publication. `wires` includes both the N
+    /// segments and the manifest Data, all keyed by Name. The recv
+    /// loop treats this identically to `PreSigned` (same name-lookup
+    /// path); the variant is kept distinct only so log lines can
+    /// say "merkle" vs "prebuilt" and so future Merkle-specific
+    /// bookkeeping has a place to live.
+    Merkle { wires: HashMap<Name, Bytes> },
+}
+
+impl SignerSlate {
+    /// True if this slate serves segments from a pre-built
+    /// HashMap<Name, Bytes> lookup (Merkle or explicit pre-sign).
+    fn is_prebuilt(&self) -> bool {
+        matches!(self, SignerSlate::PreSigned { .. } | SignerSlate::Merkle { .. })
+    }
+
+    /// Look up a pre-built wire by name. Returns `None` for lazy
+    /// slates and for names not in the map.
+    fn lookup(&self, name: &Name) -> Option<&Bytes> {
+        match self {
+            SignerSlate::PreSigned { wires } => wires.get(name),
+            SignerSlate::Merkle { wires, .. } => wires.get(name),
+            _ => None,
+        }
+    }
 }
 
 /// Publish `params.data` as segmented ndn-cxx compatible Data.
@@ -250,37 +289,33 @@ pub async fn run_producer(params: PutParams, tx: mpsc::Sender<ToolEvent>) -> Res
             Err(_) => continue,
         };
 
-        // Merkle slate: pre-built static map keyed by Data name.
-        // Look up the requested name (or the canonical
-        // `seg=0`/manifest name for CanBePrefix discovery) and serve
-        // the corresponding pre-signed wire — no per-Interest signing.
-        if let SignerSlate::Merkle {
-            wires,
-            manifest_name,
-            manifest_wire,
-        } = &slate
-        {
+        // Prebuilt slate: pre-signed map keyed by Data name. Applies
+        // to both `SignMode::Merkle` (always prebuilt, required by
+        // the tree) and any other mode with `pre_sign = true`. The
+        // recv loop is just an index + send with no DataBuilder or
+        // hash work in the hot path.
+        if slate.is_prebuilt() {
             // Resolve the requested name. Three cases:
             //   1. Explicit segment Interest: use interest.name.
-            //   2. Manifest Interest: use interest.name (for /<v>/_root).
-            //   3. CanBePrefix discovery: respond with segment 0 wire,
-            //      so consumers that send a discovery Interest get the
-            //      versioned prefix back. The Merkle path's manifest is
-            //      reachable separately via the segment Data's
-            //      KeyLocator name.
+            //   2. Manifest Interest (Merkle only): use interest.name
+            //      (which matches `<served_prefix>/_root`).
+            //   3. CanBePrefix discovery: respond with segment 0 wire.
             let last_is_seg = interest
                 .name
                 .components()
                 .last()
                 .and_then(|c| c.as_segment());
-            let lookup_name: Name = if interest.name.as_ref() == manifest_name {
-                manifest_name.clone()
-            } else if last_is_seg.is_some() {
+            let lookup_name: Name = if last_is_seg.is_some() {
+                (*interest.name).clone()
+            } else if slate.lookup(interest.name.as_ref()).is_some() {
+                // Non-segment name that happens to hit the table —
+                // e.g. the Merkle manifest at `<served_prefix>/_root`.
                 (*interest.name).clone()
             } else {
+                // CanBePrefix discovery fallback: segment 0.
                 served_prefix.clone().append_segment(0)
             };
-            let data_wire = match wires.get(&lookup_name) {
+            let data_wire = match slate.lookup(&lookup_name) {
                 Some(w) => w.clone(),
                 None => {
                     // Unknown name — could be an out-of-range segment,
@@ -307,16 +342,11 @@ pub async fn run_producer(params: PutParams, tx: mpsc::Sender<ToolEvent>) -> Res
             if !params.quiet {
                 let _ = tx
                     .send(ToolEvent::info(format!(
-                        "ndn-put: served (merkle) {}",
+                        "ndn-put: served (prebuilt) {}",
                         lookup_name
                     )))
                     .await;
             }
-            // Touch manifest_wire so the borrow checker doesn't
-            // complain about it being unused on this branch — it's
-            // already in `wires` under `manifest_name`, so the lookup
-            // above can return it directly.
-            let _ = manifest_wire;
             continue;
         }
 
@@ -385,7 +415,9 @@ pub async fn run_producer(params: PutParams, tx: mpsc::Sender<ToolEvent>) -> Res
                     s.sign_sync(region).expect("signing failed")
                 })
             }
-            SignerSlate::Merkle { .. } => unreachable!("handled above"),
+            SignerSlate::PreSigned { .. } | SignerSlate::Merkle { .. } => {
+                unreachable!("prebuilt slates are served via the is_prebuilt() branch above")
+            }
         };
 
         if let Err(e) = client.send(data_wire).await {
@@ -426,21 +458,33 @@ pub async fn run_producer(params: PutParams, tx: mpsc::Sender<ToolEvent>) -> Res
     Ok(())
 }
 
-/// Build the per-mode `SignerSlate` once at startup, including
-/// pre-building the full Merkle publication for `SignMode::Merkle`.
+/// Build the per-mode `SignerSlate` once at startup. For
+/// `SignMode::Merkle` (always) and any non-Merkle mode with
+/// `params.pre_sign = true`, the full segment set is pre-signed
+/// into a `HashMap<Name, Bytes>` and the recv loop serves by
+/// lookup. For other non-Merkle modes the slate is a "lazy"
+/// variant and the recv loop signs per Interest.
 async fn build_signer_slate(
     params: &PutParams,
     served_prefix: &Name,
     tx: &mpsc::Sender<ToolEvent>,
 ) -> Result<SignerSlate> {
-    match params.sign_mode {
+    // Merkle is its own thing — construct the publication via the
+    // security primitive and wrap it.
+    if params.sign_mode == SignMode::Merkle {
+        return build_merkle_slate(params, served_prefix, tx).await;
+    }
+
+    // Build a lazy slate first; the recv loop uses this directly
+    // when `pre_sign = false`.
+    let lazy: SignerSlate = match params.sign_mode {
         SignMode::None => {
             let _ = tx
                 .send(ToolEvent::warn(
                     "ndn-put: --sign=none → no SignatureValue (debug only)",
                 ))
                 .await;
-            Ok(SignerSlate::None)
+            SignerSlate::None
         }
         SignMode::DigestSha256 => {
             let _ = tx
@@ -448,7 +492,7 @@ async fn build_signer_slate(
                     "ndn-put: signing with DigestSha256 (NDN spec type 0)",
                 ))
                 .await;
-            Ok(SignerSlate::DigestSha256)
+            SignerSlate::DigestSha256
         }
         SignMode::DigestBlake3 => {
             let _ = tx
@@ -456,7 +500,7 @@ async fn build_signer_slate(
                     "ndn-put: signing with DigestBlake3 (ndn-rs experimental type 6)",
                 ))
                 .await;
-            Ok(SignerSlate::DigestBlake3)
+            SignerSlate::DigestBlake3
         }
         SignMode::HmacSha256 => {
             let key_name = Name::from_components([
@@ -473,7 +517,7 @@ async fn build_signer_slate(
                     s.key_name()
                 )))
                 .await;
-            Ok(SignerSlate::Signer(s))
+            SignerSlate::Signer(s)
         }
         SignMode::Blake3Keyed => {
             let key_name = Name::from_components([
@@ -490,7 +534,7 @@ async fn build_signer_slate(
                     s.key_name()
                 )))
                 .await;
-            Ok(SignerSlate::Signer(s))
+            SignerSlate::Signer(s)
         }
         SignMode::Ed25519 => {
             let keychain = KeyChain::ephemeral(params.name.as_str())?;
@@ -501,71 +545,146 @@ async fn build_signer_slate(
                     s.key_name()
                 )))
                 .await;
-            Ok(SignerSlate::Signer(s))
+            SignerSlate::Signer(s)
         }
-        SignMode::Merkle => {
-            // Build the full Merkle publication once at startup. The
-            // tree depends on the segment bodies and the served prefix
-            // (so manifest + segment names are stable), so we pre-sign
-            // every Data wire and stash it in a HashMap for the recv
-            // loop to look up by name.
-            let kind = match params.hash_algo {
-                HashAlgo::Sha256 => MerkleKind::Sha256,
-                HashAlgo::Blake3 => MerkleKind::Blake3,
-            };
-            let manifest_signer = KeyChain::ephemeral(params.name.as_str())?
-                .signer()
-                .map_err(|e| anyhow::anyhow!("merkle manifest signer: {e}"))?;
-            let chunk_size = if params.chunk_size == 0 {
-                NDN_DEFAULT_SEGMENT_SIZE
-            } else {
-                params.chunk_size
-            };
-            let pub_: MerkleSegmentedPublication = match kind {
-                MerkleKind::Sha256 => publish_segmented_merkle::<Sha256Merkle>(
-                    served_prefix,
-                    &params.data,
-                    chunk_size,
-                    kind,
-                    manifest_signer.as_ref(),
-                ),
-                MerkleKind::Blake3 => publish_segmented_merkle::<Blake3Merkle>(
-                    served_prefix,
-                    &params.data,
-                    chunk_size,
-                    kind,
-                    manifest_signer.as_ref(),
-                ),
-            }
-            .map_err(|e| anyhow::anyhow!("merkle publish: {e}"))?;
+        SignMode::Merkle => unreachable!("handled above"),
+    };
 
-            // Index every wire by its Name so the recv loop can serve
-            // both the manifest and any segment with one HashMap.
-            let mut wires: HashMap<Name, Bytes> = HashMap::with_capacity(pub_.segments.len() + 1);
-            for w in &pub_.segments {
-                let d = ndn_packet::Data::decode(w.clone())
-                    .map_err(|e| anyhow::anyhow!("decode merkle segment: {e}"))?;
-                wires.insert(d.name.as_ref().clone(), w.clone());
-            }
-            wires.insert(pub_.manifest_name.clone(), pub_.manifest.clone());
-
-            let kind_label = match kind {
-                MerkleKind::Sha256 => "sha256",
-                MerkleKind::Blake3 => "blake3",
-            };
-            let _ = tx
-                .send(ToolEvent::info(format!(
-                    "ndn-put: signing with Merkle/{} ({} segments + manifest at {})",
-                    kind_label,
-                    pub_.segments.len(),
-                    pub_.manifest_name
-                )))
-                .await;
-            Ok(SignerSlate::Merkle {
-                wires,
-                manifest_name: pub_.manifest_name,
-                manifest_wire: pub_.manifest,
-            })
-        }
+    if !params.pre_sign {
+        return Ok(lazy);
     }
+
+    // Pre-sign every segment into a name → wire table using the same
+    // DataBuilder path the recv loop would take lazily. The Interest
+    // matching in the recv loop still consults `served_prefix` to
+    // resolve CanBePrefix discovery and explicit segment Interests
+    // to the same names we populate here.
+    let chunk_size = if params.chunk_size == 0 {
+        NDN_DEFAULT_SEGMENT_SIZE
+    } else {
+        params.chunk_size
+    };
+    let n_segs = params.data.len().div_ceil(chunk_size).max(1);
+    let last_seg = n_segs.saturating_sub(1);
+    let freshness = (params.freshness_ms > 0).then(|| Duration::from_millis(params.freshness_ms));
+
+    let mut wires: HashMap<Name, Bytes> = HashMap::with_capacity(n_segs);
+    for (i, seg_body) in params.data.chunks(chunk_size).enumerate() {
+        let data_name = served_prefix.clone().append_segment(i as u64);
+        let mut builder = DataBuilder::new(data_name.clone(), seg_body)
+            .final_block_id_typed_seg(last_seg as u64);
+        if let Some(f) = freshness {
+            builder = builder.freshness(f);
+        }
+        let wire = match &lazy {
+            SignerSlate::None => builder.sign_none(),
+            SignerSlate::DigestSha256 => builder.sign_digest_sha256(),
+            SignerSlate::DigestBlake3 => builder.sign_digest_blake3(),
+            SignerSlate::Signer(s) => {
+                let sig_type = s.sig_type();
+                let kn = s.key_name().clone();
+                builder.sign_sync(sig_type, Some(&kn), |region| {
+                    s.sign_sync(region).expect("pre-sign failed")
+                })
+            }
+            SignerSlate::PreSigned { .. } | SignerSlate::Merkle { .. } => {
+                unreachable!("lazy slate can't be prebuilt at this point")
+            }
+        };
+        wires.insert(data_name, wire);
+    }
+    if params.data.is_empty() {
+        // Zero-byte input still produces one empty segment.
+        let data_name = served_prefix.clone().append_segment(0);
+        let builder =
+            DataBuilder::new(data_name.clone(), &[][..]).final_block_id_typed_seg(0);
+        let builder = match freshness {
+            Some(f) => builder.freshness(f),
+            None => builder,
+        };
+        let wire = match &lazy {
+            SignerSlate::None => builder.sign_none(),
+            SignerSlate::DigestSha256 => builder.sign_digest_sha256(),
+            SignerSlate::DigestBlake3 => builder.sign_digest_blake3(),
+            SignerSlate::Signer(s) => {
+                let sig_type = s.sig_type();
+                let kn = s.key_name().clone();
+                builder.sign_sync(sig_type, Some(&kn), |region| {
+                    s.sign_sync(region).expect("pre-sign failed")
+                })
+            }
+            _ => unreachable!(),
+        };
+        wires.insert(data_name, wire);
+    }
+
+    let _ = tx
+        .send(ToolEvent::info(format!(
+            "ndn-put: pre-signed {} segment(s) at startup",
+            wires.len()
+        )))
+        .await;
+
+    Ok(SignerSlate::PreSigned { wires })
+}
+
+/// Build the Merkle slate. Always prebuilt — the tree depends on
+/// every segment body.
+async fn build_merkle_slate(
+    params: &PutParams,
+    served_prefix: &Name,
+    tx: &mpsc::Sender<ToolEvent>,
+) -> Result<SignerSlate> {
+    let kind = match params.hash_algo {
+        HashAlgo::Sha256 => MerkleKind::Sha256,
+        HashAlgo::Blake3 => MerkleKind::Blake3,
+    };
+    let manifest_signer = KeyChain::ephemeral(params.name.as_str())?
+        .signer()
+        .map_err(|e| anyhow::anyhow!("merkle manifest signer: {e}"))?;
+    let chunk_size = if params.chunk_size == 0 {
+        NDN_DEFAULT_SEGMENT_SIZE
+    } else {
+        params.chunk_size
+    };
+    let pub_: MerkleSegmentedPublication = match kind {
+        MerkleKind::Sha256 => publish_segmented_merkle::<Sha256Merkle>(
+            served_prefix,
+            &params.data,
+            chunk_size,
+            kind,
+            manifest_signer.as_ref(),
+        ),
+        MerkleKind::Blake3 => publish_segmented_merkle::<Blake3Merkle>(
+            served_prefix,
+            &params.data,
+            chunk_size,
+            kind,
+            manifest_signer.as_ref(),
+        ),
+    }
+    .map_err(|e| anyhow::anyhow!("merkle publish: {e}"))?;
+
+    let mut wires: HashMap<Name, Bytes> = HashMap::with_capacity(pub_.segments.len() + 1);
+    for w in &pub_.segments {
+        let d = ndn_packet::Data::decode(w.clone())
+            .map_err(|e| anyhow::anyhow!("decode merkle segment: {e}"))?;
+        wires.insert(d.name.as_ref().clone(), w.clone());
+    }
+    wires.insert(pub_.manifest_name.clone(), pub_.manifest.clone());
+
+    let kind_label = match kind {
+        MerkleKind::Sha256 => "sha256",
+        MerkleKind::Blake3 => "blake3",
+    };
+    let _ = tx
+        .send(ToolEvent::info(format!(
+            "ndn-put: signing with Merkle/{} ({} segments + manifest at {})",
+            kind_label,
+            pub_.segments.len(),
+            pub_.manifest_name
+        )))
+        .await;
+    let _ = pub_.manifest_name; // silences unused-field warning
+    Ok(SignerSlate::Merkle { wires })
 }

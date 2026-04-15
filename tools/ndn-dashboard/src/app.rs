@@ -1001,12 +1001,9 @@ pub fn App() -> Element {
                                             },
                                             name,
                                             data: data_bytes,
-                                            chunk_size: 0,
                                             sign_mode,
-                                            hash_algo: ndn_tools_core::put::HashAlgo::Sha256,
                                             freshness_ms,
-                                            timeout_secs: 0,
-                                            quiet: false,
+                                            ..Default::default()
                                         },
                                         ttx,
                                     );

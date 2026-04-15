@@ -90,6 +90,14 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = CliHash::Sha256)]
     hash: CliHash,
 
+    /// Pre-sign every segment at startup into a name → wire
+    /// lookup table, so the recv loop serves by HashMap lookup
+    /// with no DataBuilder or hash work in the hot path. Always
+    /// on for `--sign=merkle`; opt-in for everything else.
+    /// Trades startup latency for steady-state throughput.
+    #[arg(long)]
+    pre_sign: bool,
+
     #[arg(long, default_value_t = 10_000)]
     freshness: u64,
 
@@ -142,6 +150,7 @@ async fn main() -> Result<()> {
             freshness_ms: cli.freshness,
             timeout_secs: cli.timeout,
             quiet: cli.quiet,
+            pre_sign: cli.pre_sign,
         },
         tx,
     )
