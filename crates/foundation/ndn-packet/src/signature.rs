@@ -203,7 +203,10 @@ mod tests {
         assert_eq!(kl.len(), 4);
         assert_eq!(kl.components()[0].value.as_ref(), b"sensor");
         assert_eq!(kl.components()[3].value.as_ref(), b"abc");
-        assert!(si.key_digest.is_none(), "Name-form locator must not populate key_digest");
+        assert!(
+            si.key_digest.is_none(),
+            "Name-form locator must not populate key_digest"
+        );
     }
 
     #[test]
@@ -217,7 +220,10 @@ mod tests {
         });
         let si = SignatureInfo::decode(w.finish()).unwrap();
         assert_eq!(si.sig_type, SignatureType::SignatureEd25519);
-        assert!(si.key_locator.is_none(), "KeyDigest form must not populate key_locator");
+        assert!(
+            si.key_locator.is_none(),
+            "KeyDigest form must not populate key_locator"
+        );
         let kd = si.key_digest.expect("key_digest present");
         assert_eq!(kd.len(), 32);
         assert!(kd.iter().all(|&b| b == 0xAB));
