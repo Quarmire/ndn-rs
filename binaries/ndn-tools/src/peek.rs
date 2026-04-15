@@ -25,9 +25,56 @@ use anyhow::Result;
 use clap::Parser;
 use tokio::sync::mpsc;
 
+use clap::ValueEnum;
 use ndn_tools_core::common::ConnectConfig;
 use ndn_tools_core::common::{EventLevel, ToolEvent};
-use ndn_tools_core::peek::{PeekParams, run_peek};
+use ndn_tools_core::peek::{CcAlgo, PeekParams, VerifyMode, run_peek};
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum CliVerify {
+    /// No verification (default). Faster, matches historical behaviour.
+    None,
+    /// DigestSha256 (recompute SHA-256 of signed region).
+    DigestSha256,
+    /// DigestBlake3 (ndn-rs experimental type 6).
+    DigestBlake3,
+    /// Ed25519 with `--pubkey`. Pair with `--batch-verify` for a
+    /// single batch verify at the end.
+    Ed25519,
+    /// Auto-detect Merkle from the segment SignatureType (codes 8/9),
+    /// fetch the manifest by KeyLocator name, and verify each segment
+    /// against the cached root.
+    Merkle,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum CliCc {
+    Fixed,
+    Aimd,
+    Cubic,
+}
+
+impl From<CliVerify> for VerifyMode {
+    fn from(c: CliVerify) -> Self {
+        match c {
+            CliVerify::None => VerifyMode::None,
+            CliVerify::DigestSha256 => VerifyMode::DigestSha256,
+            CliVerify::DigestBlake3 => VerifyMode::DigestBlake3,
+            CliVerify::Ed25519 => VerifyMode::Ed25519,
+            CliVerify::Merkle => VerifyMode::Merkle,
+        }
+    }
+}
+
+impl From<CliCc> for CcAlgo {
+    fn from(c: CliCc) -> Self {
+        match c {
+            CliCc::Fixed => CcAlgo::Fixed,
+            CliCc::Aimd => CcAlgo::Aimd,
+            CliCc::Cubic => CcAlgo::Cubic,
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(
@@ -43,7 +90,8 @@ struct Cli {
     #[arg(long, short = 'o')]
     output: Option<String>,
 
-    /// Segmented fetch pipeline depth.
+    /// Segmented fetch pipeline depth (turns on segmented mode).
+    /// Used as the initial congestion window when `--cc != fixed`.
     #[arg(long, short = 'p')]
     pipeline: Option<usize>,
 
@@ -59,11 +107,78 @@ struct Cli {
     #[arg(long)]
     can_be_prefix: bool,
 
+    /// Per-segment verification (segmented fetch only).
+    #[arg(long, value_enum, default_value_t = CliVerify::None)]
+    verify: CliVerify,
+
+    /// 32-byte Ed25519 public key as hex, for `--verify=ed25519`.
+    #[arg(long)]
+    pubkey: Option<String>,
+
+    /// Use ed25519_verify_batch for `--verify=ed25519` (collects all
+    /// signatures then runs one batch verify at the end of the fetch).
+    #[arg(long)]
+    batch_verify: bool,
+
+    /// Congestion control algorithm for the segmented pipeline.
+    #[arg(long, value_enum, default_value_t = CliCc::Fixed)]
+    cc: CliCc,
+
+    /// AIMD/Cubic minimum congestion window.
+    #[arg(long)]
+    cc_min_window: Option<f64>,
+
+    /// AIMD/Cubic maximum congestion window.
+    #[arg(long)]
+    cc_max_window: Option<f64>,
+
+    /// AIMD additive increase per RTT.
+    #[arg(long)]
+    cc_ai: Option<f64>,
+
+    /// AIMD/Cubic multiplicative decrease factor.
+    #[arg(long)]
+    cc_md: Option<f64>,
+
+    /// Cubic `C` parameter.
+    #[arg(long)]
+    cc_cubic_c: Option<f64>,
+
+    /// Partial fetch: starting segment index.
+    #[arg(long, default_value_t = 0)]
+    start: usize,
+
+    /// Partial fetch: number of segments to retrieve. 0 = all from
+    /// `--start` to the end of the file.
+    #[arg(long, default_value_t = 0)]
+    count: usize,
+
+    /// Print one machine-parseable JSON line at the end of the run
+    /// (`metrics: { ... }`).
+    #[arg(long)]
+    metrics: bool,
+
     #[arg(long, default_value_t = ndn_config::ManagementConfig::default().face_socket)]
     face_socket: String,
 
     #[arg(long)]
     no_shm: bool,
+}
+
+fn parse_pubkey(hex: &str) -> Result<[u8; 32]> {
+    let cleaned: String = hex.chars().filter(|c| !c.is_whitespace()).collect();
+    if cleaned.len() != 64 {
+        anyhow::bail!(
+            "--pubkey must be 32 bytes (64 hex chars), got {}",
+            cleaned.len()
+        );
+    }
+    let mut out = [0u8; 32];
+    for i in 0..32 {
+        out[i] = u8::from_str_radix(&cleaned[i * 2..i * 2 + 2], 16)
+            .map_err(|e| anyhow::anyhow!("--pubkey hex: {e}"))?;
+    }
+    Ok(out)
 }
 
 #[tokio::main]
@@ -84,6 +199,16 @@ async fn main() -> Result<()> {
         }
     });
 
+    let pubkey = match cli.pubkey {
+        Some(s) => Some(parse_pubkey(&s)?),
+        None => None,
+    };
+
+    // The legacy `--pipeline N` flag still toggles segmented mode and
+    // also sets the initial congestion window so existing scripts
+    // keep working unchanged.
+    let initial_window = cli.pipeline.unwrap_or(16).max(1);
+
     run_peek(
         PeekParams {
             conn: ConnectConfig {
@@ -98,6 +223,19 @@ async fn main() -> Result<()> {
             meta_only: cli.meta,
             verbose: cli.verbose,
             can_be_prefix: cli.can_be_prefix,
+            verify_mode: cli.verify.into(),
+            ed25519_public_key: pubkey,
+            batch_verify: cli.batch_verify,
+            cc_algo: cli.cc.into(),
+            initial_window,
+            min_window: cli.cc_min_window,
+            max_window: cli.cc_max_window,
+            ai: cli.cc_ai,
+            md: cli.cc_md,
+            cubic_c: cli.cc_cubic_c,
+            start_seg: cli.start,
+            count_segs: cli.count,
+            metrics: cli.metrics,
         },
         tx,
     )
