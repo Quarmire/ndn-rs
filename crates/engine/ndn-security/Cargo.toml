@@ -16,7 +16,7 @@ ring          = { workspace = true }
 # SQLite from source (~5 s) so we don't depend on a system library, which
 # matters for cross-compilation to Android, iOS, musl, and bare-metal.
 rusqlite      = { version = "0.32", features = ["bundled"], optional = true }
-ed25519-dalek = { workspace = true, features = ["pkcs8"] }
+ed25519-dalek = { workspace = true, features = ["pkcs8", "batch"] }
 blake3        = { workspace = true }
 # rustcrypto crates for ndn-cxx-compatible FileTpm + SafeBag.
 # Versions matched to the existing workspace `p256 = 0.13` (rustcrypto

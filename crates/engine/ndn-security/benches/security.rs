@@ -499,11 +499,95 @@ fn bench_blake3_large(c: &mut Criterion) {
 // mode SIMD parallelism. The current "hash the slice after decode"
 // pattern is already optimal.
 
+// ── Ed25519 batch verification ─────────────────────────────────────────────
+//
+// `ed25519_dalek::verify_batch` combines N verification equations
+// into one big check using random coefficients. All-valid batches
+// pass in one shot at ~2–3× the speed of N individual verifies;
+// any single invalid signature fails the whole batch, and the
+// caller then falls back to per-signature verify to find the
+// culprit. Useful for forwarder-ingest workloads where almost every
+// signature is valid on the happy path.
+//
+// Bench dimensions: batch sizes 1, 10, 100, 1000 with distinct
+// keypairs and per-key messages. The hw-equivalent cost for a
+// single sig verify is the `batch/1` row, which also measures the
+// setup overhead of `verify_batch` on its own.
+fn bench_ed25519_batch(c: &mut Criterion) {
+    use ed25519_dalek::{Signer as _, SigningKey};
+    use ndn_security::{Ed25519Verifier, ed25519_verify_batch};
+
+    let ed_verifier = Ed25519Verifier;
+
+    const BATCH_SIZES: &[usize] = &[1, 10, 100, 1000];
+    for &n in BATCH_SIZES {
+        // Set up N keypairs + messages + signatures. We generate
+        // distinct 32-byte seeds deterministically so the bench is
+        // reproducible across runs.
+        let skeys: Vec<SigningKey> = (0..n)
+            .map(|i| {
+                SigningKey::from_bytes(&{
+                    let mut seed = [0u8; 32];
+                    seed[0] = (i >> 24) as u8;
+                    seed[1] = (i >> 16) as u8;
+                    seed[2] = (i >> 8) as u8;
+                    seed[3] = i as u8;
+                    seed[31] = 0x42; // avoid the all-zero seed
+                    seed
+                })
+            })
+            .collect();
+        let public_keys: Vec<[u8; 32]> =
+            skeys.iter().map(|k| k.verifying_key().to_bytes()).collect();
+        let messages: Vec<Vec<u8>> = (0..n).map(|i| format!("msg {i}").into_bytes()).collect();
+        let signatures: Vec<[u8; 64]> = skeys
+            .iter()
+            .zip(&messages)
+            .map(|(k, m)| k.sign(m).to_bytes())
+            .collect();
+
+        // Per-signature verify loop (the baseline). Uses the sync
+        // verify path so we don't measure tokio overhead.
+        {
+            let mut g = c.benchmark_group("verification/ed25519-per-sig-loop");
+            g.throughput(Throughput::Elements(n as u64));
+            g.bench_with_input(BenchmarkId::from_parameter(n), &(), |b, _| {
+                b.iter(|| {
+                    for i in 0..n {
+                        let outcome =
+                            ed_verifier.verify_sync(&messages[i], &signatures[i], &public_keys[i]);
+                        debug_assert_eq!(outcome, ndn_security::VerifyOutcome::Valid);
+                    }
+                });
+            });
+            g.finish();
+        }
+
+        // Batch verify. This is the expected ~2–3× speedup path on
+        // homogeneous-valid workloads.
+        {
+            let mut g = c.benchmark_group("verification/ed25519-batch");
+            g.throughput(Throughput::Elements(n as u64));
+            let msg_refs: Vec<&[u8]> = messages.iter().map(|m| m.as_slice()).collect();
+            let sig_refs: Vec<&[u8; 64]> = signatures.iter().collect();
+            let key_refs: Vec<&[u8; 32]> = public_keys.iter().collect();
+            g.bench_with_input(BenchmarkId::from_parameter(n), &(), |b, _| {
+                b.iter(|| {
+                    let outcome = ed25519_verify_batch(&msg_refs, &sig_refs, &key_refs).unwrap();
+                    debug_assert_eq!(outcome, ndn_security::VerifyOutcome::Valid);
+                });
+            });
+            g.finish();
+        }
+    }
+}
+
 criterion_group!(
     benches,
     bench_signing,
     bench_verification,
     bench_validation,
     bench_blake3_large,
+    bench_ed25519_batch,
 );
 criterion_main!(benches);
