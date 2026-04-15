@@ -54,14 +54,20 @@
 #      AIMD, and cubic @ 64 and 256 all landed within ~5% of each
 #      other at the saturation ceiling.
 #
-#   6. KNOWN BUG: the `pipe-64-cubic` cell in sweep 4 produced 29
-#      Mbps (75× slower than every other cell) — the fetch wall hit
-#      4.57 seconds instead of ~62 ms. Cubic at initial_window=64
-#      appears to stall the window for some reason; `pipe-256-cubic`
-#      works fine. This is a bug in
-#      `crates/foundation/ndn-transport/src/congestion.rs`, not in
-#      this script. Avoid `--cc cubic` with pipeline < 128 until it
-#      is fixed.
+#   6. HISTORICAL BUG (FIXED): in the first run of this matrix, the
+#      `pipe-64-cubic` cell produced 29 Mbps (75× slower than every
+#      other cell) — the fetch wall hit 4.57 seconds instead of
+#      ~62 ms. Root cause was a collapse in
+#      `CongestionController::Cubic`: `with_window()` didn't update
+#      `w_max`, so the first `on_data()` call's cubic recovery
+#      formula dragged the window back toward the stale default
+#      `w_max = 2`. Fixed in
+#      `crates/foundation/ndn-transport/src/congestion.rs` with a
+#      two-part patch: `with_window` now also sets `w_max` for
+#      Cubic, and `on_data`'s cubic branch clamps the result to
+#      `max(cwnd, W_cubic, W_est)` so successful data delivery can
+#      never shrink the window (matching RFC 8312 §4.2). Regression
+#      tests live in `congestion::tests::cubic_does_not_collapse_*`.
 #
 #   7. `--no-assemble` at 64 MB gave a ~3% speed win (2347 → 2420
 #      Mbps) plus a ~130× memory reduction (~1 MB peak instead of
