@@ -27,6 +27,7 @@ pub mod key_store;
 pub mod keychain;
 pub mod lvs;
 pub mod manager;
+pub mod merkle;
 pub mod pib;
 pub mod profile;
 pub mod safe_bag;

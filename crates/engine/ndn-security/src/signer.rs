@@ -166,6 +166,44 @@ pub const SIGNATURE_TYPE_DIGEST_BLAKE3_PLAIN: u64 = 6;
 /// above. See `SignatureBlake3Keyed` in `blake3-signature-spec.md`.
 pub const SIGNATURE_TYPE_DIGEST_BLAKE3_KEYED: u64 = 7;
 
+// ── Merkle-tree signature types (provisional) ───────────────────────────────
+//
+// Tree-signed segmented Data: instead of signing every segment
+// independently (N asymmetric signs on the producer, K asymmetric
+// verifies on the consumer), the producer builds a Merkle tree over
+// the segment Contents, signs **only the root** once with whatever
+// algorithm the application chose (Ed25519, ECDSA, ...), and emits a
+// per-segment "signature" consisting of that segment's leaf hash
+// plus its verification path up to the root. A consumer fetching a
+// subset of segments verifies each one against the signed root with
+// `log₂ N` cheap hash operations instead of one asymmetric verify.
+//
+// **These codes are provisional.** They sit immediately after the
+// existing BLAKE3 spec codes (6, 7) and will only be submitted to
+// the NDN TLV registry after the bench in
+// `benches/merkle_segmented.rs` demonstrates the win that justifies
+// burning two code-points. Do not rely on these values externally
+// until the bench lands. See `docs/wiki/src/deep-dive/why-blake3.md`
+// for the design rationale and `ndn_security::merkle` for the
+// primitive.
+//
+// The SignatureValue for both types is:
+//     leaf_hash(32B) || proof_len(1B) || proof_len × 32B sibling hashes
+// The KeyLocator is a Name pointing at the manifest Data packet that
+// carries the tree's signed root, `leaf_count`, and `leaf_index`.
+
+/// Signature type code for a segmented Data packet whose per-segment
+/// "signature" is a BLAKE3 Merkle leaf hash + verification path.
+/// Provisional; see the block comment above.
+pub const SIGNATURE_TYPE_DIGEST_BLAKE3_MERKLE: u64 = 8;
+
+/// Signature type code for a segmented Data packet whose per-segment
+/// "signature" is a SHA-256 Merkle leaf hash + verification path.
+/// Provisional; see the block comment above. Exists primarily as a
+/// benchmark control against the BLAKE3 variant — the Merkle tree
+/// structure is hash-agnostic, so an honest comparison measures both.
+pub const SIGNATURE_TYPE_DIGEST_SHA256_MERKLE: u64 = 9;
+
 /// BLAKE3 digest signer for high-throughput self-certifying content.
 ///
 /// Uses signature type code [`SIGNATURE_TYPE_DIGEST_BLAKE3_PLAIN`] (6),
