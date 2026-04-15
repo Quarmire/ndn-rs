@@ -79,6 +79,7 @@
 
 - [API Overview](./api/overview.md)
 - [Spec Compliance](./reference/spec-compliance.md)
+- [Forwarder Comparison](./reference/forwarder-comparison.md)
 - [Interop Test Results](./reference/interop-results.md)
 - [did:ndn Method](./reference/did-ndn-method.md)
 - [External Links](./reference/external-links.md)
