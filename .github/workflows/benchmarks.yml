@@ -42,6 +42,20 @@ jobs:
       - name: Run ndn-security benchmarks
         run: cargo bench -p ndn-security --bench security -- --output-format bencher 2>/dev/null | tee bench-security.txt
 
+      - name: Pull latest main before applying bench table
+        # Pull *before* the python script writes pipeline-benchmarks.md so
+        # we always rewrite the file against the freshest upstream content.
+        # The bench-*.txt files (criterion output, one per crate) are
+        # outside git and survive a fast-forward pull, so the table data
+        # itself is preserved. This avoids the rebase merge-conflict that
+        # used to bite us when two benchmark runs touched the same lines
+        # in the BENCH_RESULTS_START..END block.
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git reset --hard origin/main
+
       - name: Update wiki benchmark page
         run: |
           python3 - <<'PYEOF'
@@ -108,17 +122,79 @@ jobs:
           PYEOF
 
       - name: Commit updated wiki page
+        # Push with retries so a race with a concurrent bench run resolves
+        # by re-applying the table on top of the latest upstream rather
+        # than failing the job. Each retry re-pulls main, re-runs nothing
+        # (the python step already wrote the table relative to the
+        # earlier pull), regenerates the table once more from the same
+        # bench-*.txt files (idempotent), and tries to push again.
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
           git add docs/wiki/src/benchmarks/pipeline-benchmarks.md
           if git diff --cached --quiet; then
             echo "No changes to benchmark results"
-          else
-            git commit -m "chore: update benchmark results [skip ci]"
-            # Rebase onto current origin/main before pushing; concurrent pushes
-            # (e.g. a second benchmark run or a docs commit) can advance main
-            # while the bench job is running, causing a non-fast-forward rejection.
-            git pull --rebase origin main
-            git push origin main
+            exit 0
           fi
+          git commit -m "chore: update benchmark results [skip ci]"
+
+          for attempt in 1 2 3; do
+            if git push origin main; then
+              echo "Pushed bench results (attempt $attempt)."
+              exit 0
+            fi
+            echo "Push rejected on attempt $attempt — re-syncing and retrying."
+            # Reset to upstream, then re-apply the table from the same
+            # bench-*.txt files. Idempotent: produces the same wiki diff
+            # against whatever main happens to look like now.
+            git fetch origin main
+            git reset --hard origin/main
+            python3 - <<'PYEOF'
+          import re, datetime, pathlib
+          results = []
+          for f in sorted(pathlib.Path('.').glob('bench-*.txt')):
+              for line in f.read_text().splitlines():
+                  m = re.match(
+                      r'test\s+(\S+)\s+\.\.\.\s+bench:\s+([\d,]+)\s+ns/iter\s+\(\+/-\s+([\d,]+)\)',
+                      line.strip()
+                  )
+                  if m:
+                      results.append((m.group(1),
+                                      int(m.group(2).replace(',', '')),
+                                      int(m.group(3).replace(',', ''))))
+          if not results:
+              exit(0)
+          def fmt_ns(n):
+              if n >= 1_000_000: return f"{n/1_000_000:.2f} ms"
+              if n >= 1_000:     return f"{n/1_000:.2f} µs"
+              return f"{n} ns"
+          def group_key(name):
+              return name.split('/')[0] if '/' in name else 'other'
+          results.sort(key=lambda r: (group_key(r[0]), r[0]))
+          lines = [f"*Last updated by CI on {datetime.date.today().isoformat()} (ubuntu-latest, stable Rust)*\n",
+                   "| Benchmark | Median | ± Variance |",
+                   "|-----------|--------|------------|"]
+          prev = None
+          for name, ns, var in results:
+              g = group_key(name)
+              if g != prev:
+                  if prev is not None: lines.append("| | | |")
+                  prev = g
+              lines.append(f"| `{name}` | {fmt_ns(ns)} | ±{fmt_ns(var)} |")
+          table = '\n'.join(lines)
+          wiki = pathlib.Path('docs/wiki/src/benchmarks/pipeline-benchmarks.md')
+          wiki.write_text(re.sub(
+              r'<!-- BENCH_RESULTS_START -->.*?<!-- BENCH_RESULTS_END -->',
+              f'<!-- BENCH_RESULTS_START -->\n{table}\n<!-- BENCH_RESULTS_END -->',
+              wiki.read_text(),
+              flags=re.DOTALL,
+          ))
+          PYEOF
+            git add docs/wiki/src/benchmarks/pipeline-benchmarks.md
+            if git diff --cached --quiet; then
+              echo "Re-synced upstream already had the same content; nothing to push."
+              exit 0
+            fi
+            git commit -m "chore: update benchmark results [skip ci]"
+          done
+
+          echo "Push failed after 3 attempts." >&2
+          exit 1
