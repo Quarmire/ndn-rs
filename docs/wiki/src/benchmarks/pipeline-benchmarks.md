@@ -150,6 +150,29 @@ Criterion reports **median** latency by default. Look for:
 
 The HTML report at `target/criterion/report/index.html` includes violin plots, PDFs, and regression analysis for each benchmark.
 
+### SHA-256 hardware vs software backends
+
+Two SHA-256 backends are benchmarked in parallel so the SHA extension cost
+can be isolated on the same CI run without rebooting or masking CPU
+features:
+
+- `signing/sha256-digest-hw` and `verification/sha256-digest-hw` use
+  `ring::digest::SHA256`, which performs runtime CPUID dispatch and uses
+  Intel SHA-NI (x86_64) or ARMv8 crypto extensions when present. This is
+  the path used by the rest of `ndn-security`.
+- `signing/sha256-digest-sw` and `verification/sha256-digest-sw` use
+  `sha2::Sha256` from rustcrypto with `default-features = false`,
+  forcing the pure-Rust software path. CPU extensions are not consulted.
+
+The ratio `(sw / hw)` on a given CPU is the practical SHA-extension
+speedup for that hardware. A ratio close to 1.0 means the runner's CPU
+lacks SHA-NI / ARMv8 SHA crypto and ring is already using its software
+fallback. A ratio of 3–5× is typical on a modern Ice Lake / M1 / M2
+class CPU. Compare against `signing/blake3-plain` to see how BLAKE3
+performs on the same hardware — it does not depend on a CPU extension
+and its lead over `sha256-digest-sw` is the apples-to-apples software
+comparison.
+
 ## Latest CI Results
 
 <!-- BENCH_RESULTS_START -->
