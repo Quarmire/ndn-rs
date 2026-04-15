@@ -150,28 +150,27 @@ Criterion reports **median** latency by default. Look for:
 
 The HTML report at `target/criterion/report/index.html` includes violin plots, PDFs, and regression analysis for each benchmark.
 
-### SHA-256 hardware vs software backends
+### SHA-256 vs BLAKE3 in this bench
 
-Two SHA-256 backends are benchmarked in parallel so the SHA extension cost
-can be isolated on the same CI run without rebooting or masking CPU
-features:
+`signing/sha256-digest` uses `sha2::Sha256` (rustcrypto), which on
+both x86_64 and aarch64 ships runtime CPUID dispatch through the
+[`cpufeatures`](https://docs.rs/cpufeatures) crate and uses Intel
+SHA-NI / ARMv8 SHA crypto when the CPU exposes them. **Effectively
+every modern CI runner and consumer CPU does**, so the absolute
+SHA-256 numbers in this table are SHA-NI numbers — there is no
+practical "software SHA" baseline left to compare against.
 
-- `signing/sha256-digest-hw` and `verification/sha256-digest-hw` use
-  `ring::digest::SHA256`, which performs runtime CPUID dispatch and uses
-  Intel SHA-NI (x86_64) or ARMv8 crypto extensions when present. This is
-  the path used by the rest of `ndn-security`.
-- `signing/sha256-digest-sw` and `verification/sha256-digest-sw` use
-  `sha2::Sha256` from rustcrypto with `default-features = false`,
-  forcing the pure-Rust software path. CPU extensions are not consulted.
-
-The ratio `(sw / hw)` on a given CPU is the practical SHA-extension
-speedup for that hardware. A ratio close to 1.0 means the runner's CPU
-lacks SHA-NI / ARMv8 SHA crypto and ring is already using its software
-fallback. A ratio of 3–5× is typical on a modern Ice Lake / M1 / M2
-class CPU. Compare against `signing/blake3-plain` to see how BLAKE3
-performs on the same hardware — it does not depend on a CPU extension
-and its lead over `sha256-digest-sw` is the apples-to-apples software
-comparison.
+That makes BLAKE3 a comparison between a hardware-accelerated SHA-256
+and an AVX2/NEON-vectorised BLAKE3, and it shows: BLAKE3 is **not**
+single-thread faster than SHA-256 on these CPUs at the input sizes a
+typical NDN signed portion has (a few hundred bytes to a few KB). The
+"BLAKE3 is 3–8× faster than SHA-256" claim refers to BLAKE3 vs *plain
+software* SHA-256 — true on chips without SHA extensions, but no
+longer the common case. See [Why BLAKE3](../deep-dive/why-blake3.md)
+for the actual reasons ndn-rs supports BLAKE3 (Merkle-tree partial
+verification of segmented Data, multi-thread hashing, single algorithm
+for hash + MAC + KDF + XOF) — none of which are about raw single-
+thread throughput.
 
 ## Latest CI Results
 
