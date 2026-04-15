@@ -80,6 +80,7 @@
 - [API Overview](./api/overview.md)
 - [Spec Compliance](./reference/spec-compliance.md)
 - [Forwarder Comparison](./reference/forwarder-comparison.md)
+- [BLAKE3 Signature Types](./reference/blake3-signature-spec.md)
 - [Interop Test Results](./reference/interop-results.md)
 - [did:ndn Method](./reference/did-ndn-method.md)
 - [External Links](./reference/external-links.md)
