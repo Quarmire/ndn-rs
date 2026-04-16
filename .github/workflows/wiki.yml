@@ -220,10 +220,14 @@ jobs:
       # ── Dashboard web build (WASM) ────────────────────────────────────────
       # Build with cargo directly + wasm-bindgen-cli instead of dx CLI
       # (dx 0.7.5 panics on workspace.default-members canonicalization in CI).
-      - name: Install wasm-bindgen-cli
+      - name: Install wasm-bindgen-cli (version must match Cargo.lock)
         id: wasm_bindgen_install
         continue-on-error: true
-        run: cargo install wasm-bindgen-cli --locked 2>&1 | tail -3
+        run: |
+          # Extract exact wasm-bindgen version from Cargo.lock to avoid schema mismatch
+          WB_VER=$(grep -A1 'name = "wasm-bindgen"' Cargo.lock | grep 'version' | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          echo "wasm-bindgen version from Cargo.lock: $WB_VER"
+          cargo install wasm-bindgen-cli --version "$WB_VER" --locked 2>&1 | tail -3
 
       - name: Build dashboard for web
         id: dash_build
