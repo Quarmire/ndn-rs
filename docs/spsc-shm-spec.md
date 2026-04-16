@@ -116,21 +116,27 @@ from a corrupted region.
 
 | Parameter | Default | Rationale |
 |-----------|---------|-----------|
-| `capacity` | 32 | Slots per ring; enough to keep a ~64-Interest pipeline warm without over-provisioning per-face memory |
-| `slot_size` | 272 384 | Covers a Data packet whose content body is up to 256 KiB (the largest segment size in routine use by `ndn-put`, `ndnputchunks`, and similar chunked producers). Rounded up to a 64-byte multiple for cache-line alignment. |
-| Total size | ~17 MB | `448 + 2 * 32 * 272 388` ≈ 17,433,088 bytes |
+| `capacity` | 256 | Slots per ring; deep enough to keep an iperf-class stream in L2 cache |
+| `slot_size` | 8960 | Covers a standard NDN Data packet (≤8800 bytes on most link types) with headroom |
+| Total size | ~4.4 MB | `448 + 2 * 256 * 8964` ≈ 4,590,016 bytes |
 
-These defaults supersede the v1.0-draft defaults (`capacity = 256`,
-`slot_size = 8960`), which were sized for the 8800-byte ndn-cxx spec
-maximum but silently dropped any Data packet carrying a larger segment
-body. See §3.5 for how producers negotiate a larger ring on demand.
+These defaults are sized for the majority of NDN traffic: Interests,
+single-packet Data, iperf probes, ping, management, etc. The ring
+fits in L2 cache on modern CPUs and maintains ~30 Gbps throughput on
+iperf benchmarks.
+
+Applications that need to carry larger Data (chunked file producers at
+64 KiB, 256 KiB, or 1 MiB segments) negotiate a bigger ring via the
+`mtu` field of `faces/create` (see §3.5). The router scales
+`slot_size` up and `capacity` down automatically to keep total ring
+memory within the same ~4.4 MiB budget via `capacity_for_slot()`.
 
 ### 3.5 Per-Face Slot-Size Negotiation
 
-The 256 KiB default covers typical workloads, but an application that
-plans to emit larger segments — e.g. a chunked producer at 1 MiB per
-segment — can request a larger slot when creating its face by setting
-the `mtu` field of the `faces/create` `ControlParameters`.
+An application that plans to emit larger segments — e.g. a chunked
+producer at 256 KiB or 1 MiB per segment — can request a larger slot
+when creating its face by setting the `mtu` field of the `faces/create`
+`ControlParameters`.
 
 ```
 faces/create {
@@ -142,14 +148,16 @@ faces/create {
 The router rounds the requested `mtu` up to a cache-line-aligned
 `slot_size` covering `mtu` plus a fixed overhead reserve for TLV,
 Name, MetaInfo, SignatureInfo, and SignatureValue (currently 16 KiB,
-see `SHM_SLOT_OVERHEAD` in `spsc.rs`). `capacity` remains at its
-default. The resulting `slot_size` is written into the SHM header and
-auto-discovered by `SpscHandle::connect` with no additional
-round-trip.
+see `SHM_SLOT_OVERHEAD` in `spsc.rs`). `capacity` is computed by
+`capacity_for_slot(slot_size)` to keep total ring memory within the
+same ~4.4 MiB budget (minimum 16 slots, even for very large slots).
+The resulting `slot_size` and `capacity` are written into the SHM
+header and auto-discovered by `SpscHandle::connect` with no
+additional round-trip.
 
 Apps that do not set `mtu` receive a face sized to the default
-`slot_size`. The router echoes the requested `mtu` back in the
-`faces/create` response.
+`slot_size` (8960) and `capacity` (256). The router echoes the
+requested `mtu` back in the `faces/create` response.
 
 Clients built on `ForwarderClient` request a per-face slot size via
 [`connect_with_mtu`]; `ndn-put` derives its `mtu` from
