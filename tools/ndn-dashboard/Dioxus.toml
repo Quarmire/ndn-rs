@@ -1,0 +1,17 @@
+[application]
+name = "ndn-dashboard"
+
+[web.app]
+title = "NDN Dashboard"
+
+[web.watcher]
+watch_path = ["src"]
+
+[web.resource]
+# Serve the legacy JS/CSS files alongside the WASM app
+style = []
+script = []
+
+[web.resource.dev]
+style = []
+script = []
