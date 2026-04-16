@@ -21,7 +21,7 @@ struct PendingEntry {
 /// Whether a pending entry is ready for action or still waiting.
 enum DrainResult {
     /// Certificate arrived — re-validate this packet.
-    Ready(PacketContext),
+    Ready(Box<PacketContext>),
     /// Timed out waiting for the certificate.
     Timeout,
 }
@@ -105,7 +105,7 @@ impl PendingQueue {
             if validator.cert_cache().get(&entry.needed_cert).is_some() {
                 let entry = self.entries.remove(i).unwrap();
                 self.total_bytes -= entry.byte_size;
-                results.push(DrainResult::Ready(entry.ctx));
+                results.push(DrainResult::Ready(Box::new(entry.ctx)));
                 continue;
             }
 
@@ -235,6 +235,7 @@ impl ValidationStage {
                     actions.push(Action::Drop(DropReason::ValidationTimeout));
                 }
                 DrainResult::Ready(ctx) => {
+                    let ctx = *ctx;
                     let data = match &ctx.packet {
                         DecodedPacket::Data(d) => d,
                         _ => {

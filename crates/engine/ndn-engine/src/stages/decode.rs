@@ -9,6 +9,7 @@ use ndn_packet::encode::ensure_nonce;
 use ndn_packet::fragment::ReassemblyBuffer;
 use ndn_packet::lp::{LpPacket, extract_fragment, is_lp_packet};
 use ndn_packet::{Data, Interest, Nack, Name, tlv_type};
+use ndn_store::NameHashes;
 use ndn_transport::{FaceId, FaceScope, FaceTable};
 
 /// Check if a name starts with `/localhost`.
@@ -107,6 +108,7 @@ impl TlvDecodeStage {
             t if t == tlv_type::DATA => match Data::decode(ctx.raw_bytes.clone()) {
                 Ok(data) => {
                     trace!(face=%ctx.face_id, name=%data.name, "decode: Data");
+                    ctx.name_hashes = Some(NameHashes::compute(&data.name));
                     ctx.name = Some(data.name.clone());
                     ctx.packet = DecodedPacket::Data(Box::new(data));
                     if let Some(drop) = self.check_scope(&ctx) {
@@ -136,6 +138,7 @@ impl TlvDecodeStage {
                 }
                 trace!(face=%ctx.face_id, name=%interest.name, nonce=?interest.nonce(), "decode: Interest");
                 ctx.raw_bytes = ensure_nonce(&ctx.raw_bytes);
+                ctx.name_hashes = Some(NameHashes::compute(&interest.name));
                 ctx.name = Some(interest.name.clone());
                 ctx.packet = DecodedPacket::Interest(Box::new(interest));
                 if let Some(drop) = self.check_scope(&ctx) {
@@ -241,6 +244,7 @@ impl TlvDecodeStage {
                 Ok(interest) => {
                     trace!(face=%ctx.face_id, name=%interest.name, reason=?reason, "decode: Nack");
                     let nack = Nack::new(interest, reason);
+                    ctx.name_hashes = Some(NameHashes::compute(&nack.interest.name));
                     ctx.name = Some(nack.interest.name.clone());
                     ctx.packet = DecodedPacket::Nack(Box::new(nack));
                     if let Some(drop) = self.check_scope(&ctx) {

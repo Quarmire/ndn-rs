@@ -5,8 +5,8 @@ use smallvec::SmallVec;
 use tracing::trace;
 
 use crate::pipeline::{Action, DecodedPacket, DropReason, PacketContext};
-use ndn_packet::{Name, Selector};
-use ndn_store::{Pit, PitEntry, PitToken};
+use ndn_packet::Selector;
+use ndn_store::{NameHashes, Pit, PitEntry, PitToken};
 use ndn_transport::FaceId;
 
 /// Checks the PIT for a pending Interest.
@@ -38,8 +38,13 @@ impl PitCheckStage {
             .unwrap_or(4_000); // NDN default 4 s
 
         let nonce = interest.nonce().unwrap_or(0);
-        let token = PitToken::from_interest_full(
-            &interest.name,
+        let name_hash = ctx
+            .name_hashes
+            .as_ref()
+            .map(|h| h.full_hash())
+            .unwrap_or_else(|| NameHashes::full_name_hash(&interest.name));
+        let token = PitToken::from_name_hash(
+            name_hash,
             Some(interest.selectors()),
             interest.forwarding_hint(),
         );
@@ -105,9 +110,17 @@ impl PitMatchStage {
             _ => return Action::Continue(ctx),
         };
 
+        // Pre-computed name hashes eliminate per-probe re-hashing.  For the
+        // full name we use the memoized hash; for CanBePrefix prefix probes
+        // we index into the prefix_hashes array instead of allocating a
+        // temporary Name and hashing it from scratch.
+        let hashes = ctx
+            .name_hashes
+            .get_or_insert_with(|| NameHashes::compute(&data.name));
+
         // Try all selector combinations to find the PIT entry.
         //
-        // PitCheck inserts with `from_interest_full(name, Some(selectors()), hint)`.
+        // PitCheck inserts with `from_name_hash(full, Some(selectors()), hint)`.
         // Since Data packets don't carry selector information, we must probe
         // all possible (can_be_prefix, must_be_fresh) combinations used at
         // insertion time.  The default (false, false) is tried first as the
@@ -132,8 +145,9 @@ impl PitMatchStage {
             None,
         ];
 
+        let full_hash = hashes.full_hash();
         for sel in selector_probes {
-            let token = PitToken::from_interest(&data.name, sel.as_ref());
+            let token = PitToken::from_name_hash(full_hash, sel.as_ref(), None);
             if let Some((_, entry)) = self.pit.remove(&token) {
                 let faces: SmallVec<[FaceId; 4]> = entry.in_record_faces().map(FaceId).collect();
                 trace!(face=%ctx.face_id, name=%data.name, out_faces=?faces, "pit-match: satisfied");
@@ -143,10 +157,8 @@ impl PitMatchStage {
         }
 
         // CanBePrefix: the Data name may be longer than the Interest name.
-        // Walk progressively shorter prefixes and check for a matching PIT entry
-        // with can_be_prefix=true.  This handles the common case where a producer
-        // responds under a versioned+segmented name to a plain CanBePrefix Interest.
-        let comps = data.name.components();
+        // Walk progressively shorter prefixes using pre-computed prefix hashes
+        // instead of allocating temporary Name objects and re-hashing.
         let can_be_prefix_probes: &[Option<Selector>] = &[
             Some(Selector {
                 can_be_prefix: true,
@@ -158,14 +170,15 @@ impl PitMatchStage {
             }),
             None,
         ];
-        for prefix_len in (1..comps.len()).rev() {
-            let prefix = Name::from_components(comps[..prefix_len].iter().cloned());
+        let n_comps = hashes.len();
+        for prefix_len in (1..n_comps).rev() {
+            let prefix_hash = hashes.prefix_hash(prefix_len);
             for sel in can_be_prefix_probes {
-                let token = PitToken::from_interest(&prefix, sel.as_ref());
+                let token = PitToken::from_name_hash(prefix_hash, sel.as_ref(), None);
                 if let Some((_, entry)) = self.pit.remove(&token) {
                     let faces: SmallVec<[FaceId; 4]> =
                         entry.in_record_faces().map(FaceId).collect();
-                    trace!(face=%ctx.face_id, name=%data.name, prefix=%prefix,
+                    trace!(face=%ctx.face_id, name=%data.name, prefix_len,
                            out_faces=?faces, "pit-match: satisfied (can-be-prefix)");
                     ctx.out_faces = faces;
                     return Action::Continue(ctx);

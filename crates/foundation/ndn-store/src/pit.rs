@@ -6,12 +6,90 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use smallvec::SmallVec;
 
-use ndn_packet::{Name, Selector};
+use ndn_packet::{Name, NameComponent, Selector};
+
+/// Pre-computed cumulative name-prefix hashes.
+///
+/// Computed once at TLV decode and reused for all PIT lookups (check, match,
+/// nack) without re-hashing name components on every probe.
+///
+/// Inspired by NDN-DPDK's memoized name hashing: the FIB/PIT dispatch layer
+/// hashes the name once at RX and reuses the hash for NDT, PCCT, and FIB
+/// lookups.
+///
+/// Ref: Shi et al., "NDN-DPDK: NDN Forwarding at 100 Gbps on Commodity
+/// Hardware" (ACM ICN 2020), §3.1.
+#[derive(Clone, Debug)]
+pub struct NameHashes {
+    /// `prefix_hashes[i]` is the hash of the first `i+1` name components.
+    pub prefix_hashes: SmallVec<[u64; 8]>,
+}
+
+/// FxHash-style multiplier for order-dependent accumulation.
+const HASH_MIX: u64 = 0x517cc1b727220a95;
+
+impl NameHashes {
+    /// Compute cumulative prefix hashes for all prefixes of `name`.
+    pub fn compute(name: &Name) -> Self {
+        Self::from_components(name.components())
+    }
+
+    /// Compute from a component slice (avoids requiring a `Name` value).
+    pub fn from_components(components: &[NameComponent]) -> Self {
+        let mut prefix_hashes = SmallVec::with_capacity(components.len());
+        let mut state: u64 = 0;
+        for comp in components {
+            state = Self::accumulate(state, comp);
+            prefix_hashes.push(state);
+        }
+        Self { prefix_hashes }
+    }
+
+    /// Hash of the full name (all components).
+    pub fn full_hash(&self) -> u64 {
+        self.prefix_hashes.last().copied().unwrap_or(0)
+    }
+
+    /// Hash of the first `n` components. Returns 0 for the root name (n=0).
+    pub fn prefix_hash(&self, n: usize) -> u64 {
+        if n == 0 { 0 } else { self.prefix_hashes[n - 1] }
+    }
+
+    pub fn len(&self) -> usize {
+        self.prefix_hashes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.prefix_hashes.is_empty()
+    }
+
+    /// Compute the full-name hash without storing intermediates.
+    pub fn full_name_hash(name: &Name) -> u64 {
+        let mut state: u64 = 0;
+        for comp in name.components() {
+            state = Self::accumulate(state, comp);
+        }
+        state
+    }
+
+    fn accumulate(state: u64, comp: &NameComponent) -> u64 {
+        let mut h = DefaultHasher::new();
+        comp.hash(&mut h);
+        let comp_hash = h.finish();
+        state.wrapping_mul(HASH_MIX).wrapping_add(comp_hash)
+    }
+}
 
 /// A stable, cheaply-copyable reference to a PIT entry.
 ///
 /// Computed as a hash of (Name, Option<Selector>) — safe to copy across tasks
 /// and `await` points without lifetime concerns.
+///
+/// Internally uses a two-phase hash: name components are hashed into a single
+/// `u64` via [`NameHashes`], then combined with selector and forwarding-hint
+/// hashes.  This lets [`NameHashes`] pre-compute the name hash once at decode
+/// and reuse it across all PIT probes — eliminating per-probe re-hashing in
+/// `PitMatchStage` (which may probe 5 + 3*(N-1) combinations).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PitToken(pub u64);
 
@@ -30,8 +108,21 @@ impl PitToken {
         selector: Option<&Selector>,
         forwarding_hint: Option<&[Arc<Name>]>,
     ) -> Self {
+        let name_hash = NameHashes::full_name_hash(name);
+        Self::from_name_hash(name_hash, selector, forwarding_hint)
+    }
+
+    /// Build a PIT token from a pre-computed name hash.
+    ///
+    /// Use with [`NameHashes::full_hash`] or [`NameHashes::prefix_hash`] to
+    /// avoid re-hashing name components on every probe.
+    pub fn from_name_hash(
+        name_hash: u64,
+        selector: Option<&Selector>,
+        forwarding_hint: Option<&[Arc<Name>]>,
+    ) -> Self {
         let mut h = DefaultHasher::new();
-        name.hash(&mut h);
+        name_hash.hash(&mut h);
         selector.hash(&mut h);
         if let Some(hints) = forwarding_hint {
             for hint in hints {

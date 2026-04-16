@@ -34,7 +34,7 @@
 //!   plus `.privkey` (or `.privkey-ed25519` for Ed25519). The hash input
 //!   is the **TLV wire encoding** of the Name (outer type 0x07 + length
 //!   + components), not the URI string. Easy to get wrong; the test
-//!   `filename_matches_known_hash` asserts the format.
+//!     `filename_matches_known_hash` asserts the format.
 //! - **File body**: base64 of the raw private-key DER, no PEM armor, no
 //!   header, no encryption.
 //!     - RSA → PKCS#1 `RSAPrivateKey` DER

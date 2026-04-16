@@ -44,7 +44,7 @@ pub use fib::{Fib, FibEntry, FibNexthop};
 pub use fjall_cs::FjallCs;
 pub use lru_cs::LruCs;
 pub use observable_cs::{CsEvent, CsObserver, ObservableCs};
-pub use pit::{InRecord, OutRecord, Pit, PitEntry, PitToken};
+pub use pit::{InRecord, NameHashes, OutRecord, Pit, PitEntry, PitToken};
 pub use sharded_cs::ShardedCs;
 pub use strategy_table::StrategyTable;
 pub use trie::NameTrie;
