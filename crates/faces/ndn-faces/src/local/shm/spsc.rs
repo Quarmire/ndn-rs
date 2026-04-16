@@ -303,6 +303,66 @@ unsafe fn ring_push(
     true
 }
 
+/// Push up to `pkts.len()` packets into the ring in one tail advance.
+///
+/// Loads the head once (Acquire), determines the free-slot count, writes
+/// as many packets as fit into consecutive slots, and publishes the tail
+/// with a single Release store. Returns the number of packets pushed
+/// (0 if the ring was full, `pkts.len()` on complete success, or a
+/// partial count in between).
+///
+/// Compared to calling [`ring_push`] N times, this function:
+/// - Loads the peer head *once* instead of N times (N−1 atomic loads
+///   saved).
+/// - Publishes a single Release store instead of N (N−1 release fences
+///   saved; the consumer sees all pushed packets at once).
+/// - Keeps the same per-slot length+memcpy work — batching does not
+///   save per-byte cost, only per-packet synchronisation cost.
+///
+/// The caller is responsible for handling the "ring full" case (yield
+/// and retry, same as single-packet `ring_push`).
+///
+/// # Safety
+/// Same as [`ring_push`]. Every packet must satisfy
+/// `pkt.len() <= slot_size`.
+unsafe fn ring_push_batch(
+    base: *mut u8,
+    ring_off: usize,
+    tail_off: usize,
+    head_off: usize,
+    capacity: u32,
+    slot_size: u32,
+    pkts: &[&[u8]],
+) -> usize {
+    if pkts.is_empty() {
+        return 0;
+    }
+    let tail_a = unsafe { AtomicU32::from_ptr(base.add(tail_off) as *mut u32) };
+    let head_a = unsafe { AtomicU32::from_ptr(base.add(head_off) as *mut u32) };
+
+    let mut t = tail_a.load(Ordering::Relaxed);
+    let h = head_a.load(Ordering::Acquire);
+    let free = capacity.wrapping_sub(t.wrapping_sub(h));
+    let to_push = (free as usize).min(pkts.len());
+    if to_push == 0 {
+        return 0;
+    }
+
+    for pkt in &pkts[..to_push] {
+        debug_assert!(pkt.len() <= slot_size as usize);
+        let idx = (t % capacity) as usize;
+        let slot = unsafe { base.add(ring_off + idx * slot_stride(slot_size)) };
+        unsafe {
+            (slot as *mut u32).write_unaligned(pkt.len() as u32);
+            std::ptr::copy_nonoverlapping(pkt.as_ptr(), slot.add(4), pkt.len());
+        }
+        t = t.wrapping_add(1);
+    }
+    // Single Release store publishes all `to_push` slots to the consumer.
+    tail_a.store(t, Ordering::Release);
+    to_push
+}
+
 /// Pop one packet from the ring. Returns `None` if empty.
 ///
 /// # Safety
@@ -519,6 +579,56 @@ impl SpscFace {
             )
         }
     }
+
+    fn try_push_batch_e2a(&self, pkts: &[&[u8]]) -> usize {
+        unsafe {
+            ring_push_batch(
+                self.shm.as_ptr(),
+                self.e2a_off,
+                OFF_E2A_TAIL,
+                OFF_E2A_HEAD,
+                self.capacity,
+                self.slot_size,
+                pkts,
+            )
+        }
+    }
+
+    /// Send multiple Data/Interest packets to the app in a single tail
+    /// advance. See [`SpscHandle::send_batch`] for the semantics — this
+    /// is the engine-side mirror.
+    pub async fn send_batch(&self, pkts: &[Bytes]) -> Result<(), FaceError> {
+        if pkts.is_empty() {
+            return Ok(());
+        }
+        for pkt in pkts {
+            if pkt.len() > self.slot_size as usize {
+                return Err(FaceError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "packet exceeds SHM slot size",
+                )));
+            }
+        }
+        // SAFETY: parked flag within mapped SHM region.
+        let parked =
+            unsafe { AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_E2A_PARKED) as *mut u32) };
+        // Build a `&[&[u8]]` view once — cheaper than re-slicing inside
+        // the yield loop.
+        let views: Vec<&[u8]> = pkts.iter().map(|p| p.as_ref()).collect();
+        let mut start = 0usize;
+        while start < views.len() {
+            let pushed = self.try_push_batch_e2a(&views[start..]);
+            if pushed == 0 {
+                tokio::task::yield_now().await;
+                continue;
+            }
+            start += pushed;
+            if parked.load(Ordering::SeqCst) != 0 {
+                pipe_write(&self.e2a_tx);
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Drop for SpscFace {
@@ -723,6 +833,86 @@ impl SpscHandle {
         }
     }
 
+    fn try_push_batch_a2e(&self, pkts: &[&[u8]]) -> usize {
+        unsafe {
+            ring_push_batch(
+                self.shm.as_ptr(),
+                self.a2e_off,
+                OFF_A2E_TAIL,
+                OFF_A2E_HEAD,
+                self.capacity,
+                self.slot_size,
+                pkts,
+            )
+        }
+    }
+
+    /// Send multiple packets to the engine in one tail advance.
+    ///
+    /// Equivalent in outcome to calling [`send`](Self::send) `pkts.len()`
+    /// times in order, but pays the synchronisation cost once rather than
+    /// N times:
+    ///
+    /// - One head load (Acquire) per ring-full check instead of N.
+    /// - One tail store (Release) per successful push batch instead of N.
+    /// - One wakeup pipe write at the end instead of up to N.
+    /// - Far fewer `tokio::task::yield_now().await` points when the ring
+    ///   is not contended: a window-fill of 16 Interests becomes one call,
+    ///   one atomic ring transition, and zero scheduler round trips in the
+    ///   common case (instead of 16 awaits and potentially 16 yields).
+    ///
+    /// Like `send`, this yields cooperatively if the ring fills mid-batch
+    /// and waits (up to a 5 s wall-clock deadline) for the engine to drain
+    /// enough slots. Partial progress is preserved across yields — the
+    /// caller is guaranteed that all `pkts` eventually reach the ring or
+    /// the call returns `Err(Closed)`.
+    ///
+    /// Every packet in `pkts` must satisfy `pkt.len() <= slot_size`, or
+    /// the call returns `Err(PacketTooLarge)` before publishing anything.
+    /// The size check is performed up-front so a batch is either fully
+    /// publishable or rejected atomically for the over-size case.
+    pub async fn send_batch(&self, pkts: &[Bytes]) -> Result<(), ShmError> {
+        if self.cancel.is_cancelled() {
+            return Err(ShmError::Closed);
+        }
+        if pkts.is_empty() {
+            return Ok(());
+        }
+        for pkt in pkts {
+            if pkt.len() > self.slot_size as usize {
+                return Err(ShmError::PacketTooLarge);
+            }
+        }
+        // SAFETY: parked flag within mapped SHM region.
+        let parked =
+            unsafe { AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_A2E_PARKED) as *mut u32) };
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let views: Vec<&[u8]> = pkts.iter().map(|p| p.as_ref()).collect();
+        let mut start = 0usize;
+        while start < views.len() {
+            let pushed = self.try_push_batch_a2e(&views[start..]);
+            if pushed == 0 {
+                if self.cancel.is_cancelled() {
+                    return Err(ShmError::Closed);
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(ShmError::Closed);
+                }
+                tokio::task::yield_now().await;
+                continue;
+            }
+            start += pushed;
+            // Wake the engine after each partial push so it can drain
+            // the ring. Without this, a batch larger than ring capacity
+            // deadlocks: we yield waiting for space, the engine parks
+            // because nobody woke it to consume the first partial push.
+            if parked.load(Ordering::SeqCst) != 0 {
+                pipe_write(&self.a2e_tx);
+            }
+        }
+        Ok(())
+    }
+
     /// Send a packet to the engine (enqueue in the a2e ring).
     ///
     /// Yields cooperatively if the ring is full (backpressure from the engine).
@@ -878,6 +1068,77 @@ mod tests {
             .unwrap();
         assert_eq!(received.len(), payload.len());
         assert_eq!(&received[..16], &payload[..16]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_batch_app_to_engine() {
+        let name = format!("{}-bae", test_name());
+        let face = SpscFace::create(FaceId(20), &name).unwrap();
+        let handle = SpscHandle::connect(&name).unwrap();
+
+        let pkts: Vec<Bytes> = (0u8..16)
+            .map(|i| Bytes::from(vec![i; 64]))
+            .collect();
+        handle.send_batch(&pkts).await.unwrap();
+
+        for i in 0u8..16 {
+            let received = tokio::time::timeout(std::time::Duration::from_secs(2), face.recv())
+                .await
+                .expect("timed out")
+                .unwrap();
+            assert_eq!(received.len(), 64);
+            assert_eq!(received[0], i);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_batch_engine_to_app() {
+        let name = format!("{}-bea", test_name());
+        let face = SpscFace::create(FaceId(21), &name).unwrap();
+        let handle = SpscHandle::connect(&name).unwrap();
+
+        let pkts: Vec<Bytes> = (0u8..16)
+            .map(|i| Bytes::from(vec![i; 64]))
+            .collect();
+        face.send_batch(&pkts).await.unwrap();
+
+        for i in 0u8..16 {
+            let received = tokio::time::timeout(std::time::Duration::from_secs(2), handle.recv())
+                .await
+                .expect("timed out")
+                .unwrap();
+            assert_eq!(received.len(), 64);
+            assert_eq!(received[0], i);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_batch_exceeds_ring_capacity() {
+        let name = format!("{}-bfull", test_name());
+        let face = SpscFace::create(FaceId(22), &name).unwrap();
+        let handle = SpscHandle::connect(&name).unwrap();
+
+        // DEFAULT_CAPACITY is 32 — send 48 packets. The batch must
+        // yield internally until the engine drains some slots.
+        let n = 48usize;
+        let pkts: Vec<Bytes> = (0..n)
+            .map(|i| Bytes::from(vec![(i & 0xFF) as u8; 32]))
+            .collect();
+
+        // Spawn the batch send as a task; drain from the engine side
+        // concurrently so the ring unblocks.
+        let send_handle = tokio::spawn({
+            let pkts = pkts.clone();
+            async move { handle.send_batch(&pkts).await }
+        });
+        for i in 0..n {
+            let received = tokio::time::timeout(std::time::Duration::from_secs(5), face.recv())
+                .await
+                .expect("timed out")
+                .unwrap();
+            assert_eq!(received[0], (i & 0xFF) as u8);
+        }
+        send_handle.await.unwrap().unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

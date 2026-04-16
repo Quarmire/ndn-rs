@@ -283,6 +283,46 @@ impl ForwarderClient {
         }
     }
 
+    /// Send multiple packets on the data plane in one synchronisation.
+    ///
+    /// On the SHM transport this goes through [`SpscHandle::send_batch`],
+    /// which publishes all `pkts` with a single atomic tail advance and
+    /// at most one wakeup — the primary reason this API exists. On the
+    /// Unix transport this is a plain loop over [`send`](Self::send);
+    /// the socket path has no equivalent batch primitive and per-packet
+    /// cost dominates anyway.
+    ///
+    /// A pipelined consumer filling a segmented-fetch window (e.g.
+    /// `ndn-peek`) should prefer `send_batch` over a loop of `send`
+    /// calls: it collapses the per-Interest scheduler round-trips into
+    /// a single ring transition and measurably reduces the small-
+    /// segment overhead (see `docs/notes/throughput-roadmap.md`).
+    pub async fn send_batch(&self, pkts: &[Bytes]) -> Result<(), ForwarderError> {
+        if pkts.is_empty() {
+            return Ok(());
+        }
+        match &self.transport {
+            #[cfg(all(
+                unix,
+                not(any(target_os = "android", target_os = "ios")),
+                feature = "spsc-shm"
+            ))]
+            DataTransport::Shm { handle, .. } => {
+                handle.send_batch(pkts).await.map_err(ForwarderError::Shm)
+            }
+            DataTransport::Unix => {
+                for pkt in pkts {
+                    let wire = encode_lp_packet(pkt);
+                    self.control
+                        .send(wire)
+                        .await
+                        .map_err(ForwarderError::Face)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
     /// Receive a packet from the data plane.
     ///
     /// Returns `None` if the data channel is closed or the router has
