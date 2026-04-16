@@ -221,7 +221,9 @@ jobs:
       - name: Install Dioxus CLI
         id: dx_install
         continue-on-error: true
-        run: cargo install dioxus-cli --locked 2>&1 | tail -5
+        run: |
+          cargo install dioxus-cli@0.7.5 --locked 2>&1 | tail -5
+          echo "installed=$?" >> "$GITHUB_OUTPUT"
 
       - name: Build dashboard for web
         id: dash_build
@@ -229,7 +231,8 @@ jobs:
         run: |
           if command -v dx &>/dev/null; then
             cd tools/ndn-dashboard
-            dx build --features web --platform web --release 2>&1 | tail -10
+            # Dioxus 0.7 uses --features to pass cargo features and --platform for target
+            dx build --release --features web --platform web 2>&1 | tail -20
             echo "built=true" >> "$GITHUB_OUTPUT"
           else
             echo "dx CLI not available — skipping dashboard web build"
@@ -239,6 +242,7 @@ jobs:
         run: |
           if [ "${{ steps.dash_build.outputs.built }}" = "true" ]; then
             echo "✓ Dashboard web build succeeded — will be live at /dashboard/"
+            ls -lh tools/ndn-dashboard/dist/ 2>/dev/null || ls -lh tools/ndn-dashboard/target/dx/ndn-dashboard/release/web/public/ 2>/dev/null || true
           else
             echo "⚠ Dashboard web build skipped or failed — /dashboard/ will show a placeholder"
           fi
@@ -254,9 +258,14 @@ jobs:
           cp -r target/wiki target/site/wiki
           cp -r tools/ndn-explorer target/site/explorer
 
-          # Dashboard — copy if built, otherwise drop in a placeholder
-          if [ "${{ steps.dash_build.outputs.built }}" = "true" ] && [ -d tools/ndn-dashboard/dist ]; then
-            cp -r tools/ndn-dashboard/dist target/site/dashboard
+          # Dashboard — copy if built, otherwise drop in a placeholder.
+          # Dioxus 0.7 outputs to target/dx/<name>/release/web/public/
+          DASH_OUT=""
+          for d in tools/ndn-dashboard/dist tools/ndn-dashboard/target/dx/ndn-dashboard/release/web/public target/dx/ndn-dashboard/release/web/public; do
+            if [ -d "$d" ]; then DASH_OUT="$d"; break; fi
+          done
+          if [ "${{ steps.dash_build.outputs.built }}" = "true" ] && [ -n "$DASH_OUT" ]; then
+            cp -r "$DASH_OUT" target/site/dashboard
           else
             mkdir -p target/site/dashboard
             printf '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><title>NDN Dashboard</title><style>body{font-family:sans-serif;background:#0d1117;color:#8b949e;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;flex-direction:column;gap:1rem}a{color:#58a6ff}</style></head><body><h2 style="color:#e6edf3">NDN Dashboard (Web)</h2><p>The WASM build is not yet available. For now, build and run the desktop version:</p><pre style="background:#161b22;padding:1rem;border-radius:8px;color:#e6edf3">cargo build -p ndn-dashboard --release\n./target/release/ndn-dashboard</pre><p><a href="../wiki/guides/operations/cli-tools.html">CLI tools guide</a> · <a href="../">Back to home</a></p></body></html>\n' \
