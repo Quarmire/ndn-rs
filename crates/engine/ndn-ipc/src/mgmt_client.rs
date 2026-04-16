@@ -126,8 +126,22 @@ impl MgmtClient {
 
     /// Create a face: `faces/create`.
     pub async fn face_create(&self, uri: &str) -> Result<ControlParameters, ForwarderError> {
+        self.face_create_with_mtu(uri, None).await
+    }
+
+    /// Create a face with an optional `mtu` hint: `faces/create`.
+    ///
+    /// For SHM faces the router uses `mtu` to size the ring slot so
+    /// it can carry Data packets whose content body is up to `mtu`
+    /// bytes. For Unix and network faces `mtu` is currently ignored.
+    pub async fn face_create_with_mtu(
+        &self,
+        uri: &str,
+        mtu: Option<u64>,
+    ) -> Result<ControlParameters, ForwarderError> {
         let params = ControlParameters {
             uri: Some(uri.to_owned()),
+            mtu,
             ..Default::default()
         };
         self.command(module::FACES, verb::CREATE, &params).await

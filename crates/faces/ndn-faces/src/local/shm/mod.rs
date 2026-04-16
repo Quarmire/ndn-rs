@@ -27,6 +27,15 @@
 #[cfg(all(unix, feature = "spsc-shm"))]
 pub mod spsc;
 
+/// Compute the slot_size required to carry a Data packet whose content
+/// can be up to `mtu` bytes. Mirrors [`spsc::slot_size_for_mtu`] so
+/// callers that don't depend on the `spsc` submodule can still derive
+/// a correct SHM ring sizing.
+#[cfg(all(unix, feature = "spsc-shm"))]
+pub fn slot_size_for_mtu(mtu: usize) -> u32 {
+    spsc::slot_size_for_mtu(mtu)
+}
+
 // ─── Unified error type ───────────────────────────────────────────────────────
 
 #[derive(Debug, thiserror::Error)]

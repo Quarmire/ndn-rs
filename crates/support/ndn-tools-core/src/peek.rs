@@ -266,7 +266,7 @@ pub async fn run_peek(params: PeekParams, tx: mpsc::Sender<ToolEvent>) -> Result
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let lifetime = Duration::from_millis(params.lifetime_ms);
     let client = if params.conn.use_shm {
-        ForwarderClient::connect(&params.conn.face_socket).await?
+        ForwarderClient::connect_with_mtu(&params.conn.face_socket, params.conn.mtu).await?
     } else {
         ForwarderClient::connect_unix_only(&params.conn.face_socket).await?
     };

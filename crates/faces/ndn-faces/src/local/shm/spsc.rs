@@ -56,10 +56,34 @@ use crate::local::shm::ShmError;
 
 const MAGIC: u64 = 0x4E44_4E5F_5348_4D00; // b"NDN_SHM\0"
 
-/// Default number of slots per ring.
-pub const DEFAULT_CAPACITY: u32 = 256;
-/// Default slot payload size in bytes (~8.75 KiB, covers typical NDN packets).
-pub const DEFAULT_SLOT_SIZE: u32 = 8960;
+/// Default number of slots per ring. Paired with [`DEFAULT_SLOT_SIZE`]
+/// so total default ring memory is ~17 MiB per face (32 × 272_384 × 2).
+pub const DEFAULT_CAPACITY: u32 = 32;
+/// Default slot payload size in bytes (~266 KiB). Sized to comfortably
+/// cover a Data packet whose content is a 256 KiB segment — the largest
+/// segment size in routine use by chunked producers such as `ndn-put`
+/// and `ndnputchunks`. Producers that need larger segments (e.g. 1 MiB
+/// rayon-sized leaves) request a per-face slot size via the `mtu`
+/// field of `faces/create` ControlParameters; see
+/// [`slot_size_for_mtu`].
+pub const DEFAULT_SLOT_SIZE: u32 = 272_384;
+
+/// NDN Data packet wire overhead above the raw content bytes:
+/// Data TLV + Name + MetaInfo + SignatureInfo + SignatureValue. 16 KiB
+/// is generous enough to cover a Data whose content is `mtu` bytes of
+/// payload plus a long name and a large signature (Ed25519, ECDSA with
+/// key locator, or a Merkle proof up to a few hundred hashes).
+pub const SHM_SLOT_OVERHEAD: usize = 16 * 1024;
+
+/// Pick a slot size for a face that needs to carry NDN Data whose
+/// *content* can be up to `mtu` bytes. Rounds up to the next multiple
+/// of 64 bytes so the per-slot stride stays cache-line aligned.
+pub fn slot_size_for_mtu(mtu: usize) -> u32 {
+    let raw = mtu.saturating_add(SHM_SLOT_OVERHEAD);
+    let aligned = raw.div_ceil(64) * 64;
+    let clamped = aligned.max(DEFAULT_SLOT_SIZE as usize).min(u32::MAX as usize);
+    clamped as u32
+}
 
 // Cache-line–aligned offsets for the four ring index atomics.
 const OFF_A2E_TAIL: usize = 64; // app writes (producer)
@@ -404,6 +428,15 @@ impl SpscFace {
     /// [`SpscHandle::connect`] in the application process.
     pub fn create(id: FaceId, name: &str) -> Result<Self, ShmError> {
         Self::create_with(id, name, DEFAULT_CAPACITY, DEFAULT_SLOT_SIZE)
+    }
+
+    /// Create a face sized for Data packets whose content can be up
+    /// to `mtu` bytes. Picks `slot_size = slot_size_for_mtu(mtu)` and
+    /// keeps [`DEFAULT_CAPACITY`]. Use this when an application has
+    /// announced its expected packet size via `faces/create`'s `mtu`
+    /// ControlParameter.
+    pub fn create_for_mtu(id: FaceId, name: &str, mtu: usize) -> Result<Self, ShmError> {
+        Self::create_with(id, name, DEFAULT_CAPACITY, slot_size_for_mtu(mtu))
     }
 
     /// Create with explicit ring parameters.
@@ -798,6 +831,53 @@ mod tests {
         let face = SpscFace::create(FaceId(7), &name).unwrap();
         assert_eq!(face.id(), FaceId(7));
         assert_eq!(face.kind(), FaceKind::Shm);
+    }
+
+    #[test]
+    fn slot_size_for_mtu_clamps_to_default_floor() {
+        // Small mtu + overhead is still below the default slot size, so
+        // we pay the default (no point provisioning less than the router
+        // handed to most clients).
+        assert_eq!(slot_size_for_mtu(1024), DEFAULT_SLOT_SIZE);
+        assert_eq!(slot_size_for_mtu(0), DEFAULT_SLOT_SIZE);
+        assert_eq!(slot_size_for_mtu(100_000), DEFAULT_SLOT_SIZE);
+    }
+
+    #[test]
+    fn slot_size_for_mtu_scales_up_for_large_mtu() {
+        // 1 MiB segment + 16 KiB overhead = 1 064 960; round up to
+        // next multiple of 64 = 1 064 960 (already aligned).
+        let one_mib = slot_size_for_mtu(1024 * 1024);
+        assert!(one_mib >= 1024 * 1024 + SHM_SLOT_OVERHEAD as u32);
+        assert_eq!(one_mib % 64, 0);
+    }
+
+    #[test]
+    fn slot_size_for_mtu_is_cache_line_aligned() {
+        for mtu in [256_000, 512_000, 768_000, 1_000_000, 2_000_000] {
+            let s = slot_size_for_mtu(mtu);
+            assert_eq!(s % 64, 0, "slot_size_for_mtu({mtu}) = {s} not 64-aligned");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_for_mtu_large_segment_roundtrip() {
+        // Reproduce the symptom that motivated the slot-size change:
+        // a Data packet carrying a ~256 KiB content body must pass
+        // through the SHM face without hitting "packet exceeds SHM
+        // slot size".
+        let name = format!("{}-big", test_name());
+        let face = SpscFace::create_for_mtu(FaceId(42), &name, 256 * 1024).unwrap();
+        let handle = SpscHandle::connect(&name).unwrap();
+
+        let payload = Bytes::from(vec![0xABu8; 260_000]);
+        handle.send(payload.clone()).await.unwrap();
+        let received = tokio::time::timeout(std::time::Duration::from_secs(2), face.recv())
+            .await
+            .expect("timed out")
+            .unwrap();
+        assert_eq!(received.len(), payload.len());
+        assert_eq!(&received[..16], &payload[..16]);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

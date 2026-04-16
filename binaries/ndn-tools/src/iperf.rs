@@ -25,6 +25,7 @@ impl From<ConnectOpts> for ConnectConfig {
         Self {
             face_socket: o.face_socket,
             use_shm: !o.no_shm,
+            mtu: None,
         }
     }
 }

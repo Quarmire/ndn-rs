@@ -49,6 +49,13 @@ struct Cli {
 
     #[arg(long)]
     no_shm: bool,
+
+    /// Hint for the SHM ring slot size: maximum Data content body the
+    /// producer expects to emit, in bytes. Defaults to `chunk_size`
+    /// so 1 MiB segments automatically get a 1 MiB-capable SHM ring.
+    /// Ignored with `--no-shm`.
+    #[arg(long)]
+    mtu: Option<usize>,
 }
 
 #[tokio::main]
@@ -78,6 +85,7 @@ async fn main() -> Result<()> {
             conn: ConnectConfig {
                 face_socket: cli.face_socket,
                 use_shm: !cli.no_shm,
+                mtu: cli.mtu,
             },
             name: cli.name,
             data: Bytes::from(payload),

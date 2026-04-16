@@ -863,8 +863,7 @@ pub fn App() -> Element {
                                     ndn_tools_core::ping::PingClientParams {
                                         conn: ConnectConfig {
                                             face_socket,
-                                            use_shm: true,
-                                        },
+                                            use_shm: true, mtu: None, },
                                         prefix,
                                         count,
                                         interval_ms,
@@ -900,8 +899,7 @@ pub fn App() -> Element {
                                 let (ttx, mut trx) = tokio::sync::mpsc::channel(256);
                                 let conn = ConnectConfig {
                                     face_socket,
-                                    use_shm: face_type == "shm",
-                                };
+                                    use_shm: face_type == "shm", mtu: None, };
                                 let run_fut = ndn_tools_core::iperf::run_client(
                                     ndn_tools_core::iperf::IperfClientParams {
                                         conn,
@@ -949,8 +947,7 @@ pub fn App() -> Element {
                                     ndn_tools_core::peek::PeekParams {
                                         conn: ConnectConfig {
                                             face_socket,
-                                            use_shm: true,
-                                        },
+                                            use_shm: true, mtu: None, },
                                         name,
                                         lifetime_ms: 4000,
                                         output: output_file,
@@ -991,8 +988,7 @@ pub fn App() -> Element {
                                         ndn_tools_core::put::PutParams {
                                             conn: ConnectConfig {
                                                 face_socket,
-                                                use_shm: true,
-                                            },
+                                                use_shm: true, mtu: None, },
                                             name,
                                             data: data_bytes,
                                             chunk_size: 0,
@@ -1053,8 +1049,7 @@ pub fn App() -> Element {
                                 ndn_tools_core::iperf::IperfServerParams {
                                     conn: ConnectConfig {
                                         face_socket,
-                                        use_shm: settings.iperf_face_type != "unix",
-                                    },
+                                        use_shm: settings.iperf_face_type != "unix", mtu: None, },
                                     prefix: iperf_prefix,
                                     payload_size,
                                     freshness_ms: 0,
@@ -1103,8 +1098,7 @@ pub fn App() -> Element {
                                 ndn_tools_core::ping::PingServerParams {
                                     conn: ConnectConfig {
                                         face_socket,
-                                        use_shm: true,
-                                    },
+                                        use_shm: true, mtu: None, },
                                     prefix: ping_prefix,
                                     freshness_ms: 0,
                                     sign: false,
