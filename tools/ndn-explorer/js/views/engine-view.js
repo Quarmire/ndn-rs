@@ -906,12 +906,7 @@ export class EngineView {
     svg.appendChild(discDiamond);
     this._svgText(svg, discX, discY_i + discSize + 8, 'disc', 7, '#d29922');
 
-    // Store nack stage positions
-    for (const s of nackStages) {
-      this.stagePositions[s.id + '_nack'] = { cx: s.x + stageW/2, cy: s.y + stageH/2 };
-    }
-    // Discovery stage position (for the consumed animation)
-    this.stagePositions['discovery_interest'] = { cx: discX, cy: discY_i };
+    // (nack + discovery positions stored below with all other stagePositions)
 
     // ── Packet dots (animated — supports multiple for concurrent scenarios)
     const PACKET_COLORS = ['#58a6ff', '#d2a8ff', '#ffa657'];
@@ -941,6 +936,12 @@ export class EngineView {
     // Also store inbound/outbound
     this.stagePositions['inbound_interest'] = { cx: 155, cy: 155 };
     this.stagePositions['inbound_data'] = { cx: 155, cy: 165 };
+    // Nack stage positions
+    for (const s of nackStages) {
+      this.stagePositions[s.id + '_nack'] = { cx: s.x + stageW/2, cy: s.y + stageH/2 };
+    }
+    // Discovery hook position
+    this.stagePositions['discovery_interest'] = { cx: discX, cy: discY_i };
 
     wrap.appendChild(svg);
     this.container.appendChild(wrap);
