@@ -56,17 +56,34 @@ use crate::local::shm::ShmError;
 
 const MAGIC: u64 = 0x4E44_4E5F_5348_4D00; // b"NDN_SHM\0"
 
-/// Default number of slots per ring. Paired with [`DEFAULT_SLOT_SIZE`]
-/// so total default ring memory is ~17 MiB per face (32 × 272_384 × 2).
-pub const DEFAULT_CAPACITY: u32 = 32;
-/// Default slot payload size in bytes (~266 KiB). Sized to comfortably
-/// cover a Data packet whose content is a 256 KiB segment — the largest
-/// segment size in routine use by chunked producers such as `ndn-put`
-/// and `ndnputchunks`. Producers that need larger segments (e.g. 1 MiB
-/// rayon-sized leaves) request a per-face slot size via the `mtu`
-/// field of `faces/create` ControlParameters; see
-/// [`slot_size_for_mtu`].
-pub const DEFAULT_SLOT_SIZE: u32 = 272_384;
+/// Default number of slots per ring.
+///
+/// Paired with [`DEFAULT_SLOT_SIZE`] so the total default ring memory
+/// is ~4.4 MiB per face (256 × 8960 × 2) — the same budget as the
+/// original v1 design. Tools that need larger Data packets (chunked
+/// producers at 64+ KiB segments) call `faces/create` with an explicit
+/// `mtu`, and the router creates a face with a proportionally larger
+/// slot_size and smaller capacity via [`capacity_for_slot`].
+pub const DEFAULT_CAPACITY: u32 = 256;
+
+/// Default slot payload size in bytes (~8.75 KiB). Covers a standard
+/// NDN Data packet (≤8800 bytes on most link types) with a small
+/// headroom margin. This is the right default for the majority of
+/// NDN traffic: Interests (~60–200 bytes), single-packet Data
+/// (~4–8 KiB content), iperf probes, ping, management, etc.
+///
+/// Tools that produce larger Data (chunked file transfers at 64 KiB,
+/// 256 KiB, or 1 MiB segments) negotiate a bigger slot via the `mtu`
+/// field of `faces/create` ControlParameters. `ndn-put` does this
+/// automatically from `--chunk-size`; `ndn-peek` accepts `--mtu`.
+pub const DEFAULT_SLOT_SIZE: u32 = 8960;
+
+/// Target SHM ring memory budget per face, in bytes. Used by
+/// [`capacity_for_slot`] to scale capacity inversely with slot_size
+/// so that faces with large slots (256 KiB for chunked producers)
+/// don't blow up memory, and faces with small slots (8960 for iperf)
+/// get a deep ring that stays in L2 cache.
+const SHM_BUDGET: usize = 2 * DEFAULT_CAPACITY as usize * slot_stride(DEFAULT_SLOT_SIZE);
 
 /// NDN Data packet wire overhead above the raw content bytes:
 /// Data TLV + Name + MetaInfo + SignatureInfo + SignatureValue. 16 KiB
@@ -78,11 +95,22 @@ pub const SHM_SLOT_OVERHEAD: usize = 16 * 1024;
 /// Pick a slot size for a face that needs to carry NDN Data whose
 /// *content* can be up to `mtu` bytes. Rounds up to the next multiple
 /// of 64 bytes so the per-slot stride stays cache-line aligned.
+/// Does **not** clamp to a floor — an explicit `mtu = 8800` gets a
+/// ~25 KiB slot, not the 272 KiB default. If no `mtu` is specified,
+/// the caller should use `DEFAULT_SLOT_SIZE` directly.
 pub fn slot_size_for_mtu(mtu: usize) -> u32 {
     let raw = mtu.saturating_add(SHM_SLOT_OVERHEAD);
     let aligned = raw.div_ceil(64) * 64;
-    let clamped = aligned.max(DEFAULT_SLOT_SIZE as usize).min(u32::MAX as usize);
-    clamped as u32
+    aligned.min(u32::MAX as usize) as u32
+}
+
+/// Compute ring capacity for a given slot_size, keeping total ring
+/// memory within [`SHM_BUDGET`]. Returns at least 16 (to keep some
+/// pipeline buffering even for very large slots).
+pub fn capacity_for_slot(slot_size: u32) -> u32 {
+    let stride = slot_stride(slot_size);
+    let cap = SHM_BUDGET / (2 * stride);
+    (cap as u32).max(16)
 }
 
 // Cache-line–aligned offsets for the four ring index atomics.
@@ -95,7 +123,7 @@ const OFF_A2E_PARKED: usize = 320; // engine (a2e consumer) parked flag
 const OFF_E2A_PARKED: usize = 384; // app (e2a consumer) parked flag
 const HEADER_SIZE: usize = 448; // 7 × 64-byte cache lines
 
-fn slot_stride(slot_size: u32) -> usize {
+const fn slot_stride(slot_size: u32) -> usize {
     4 + slot_size as usize
 }
 
@@ -492,11 +520,13 @@ impl SpscFace {
 
     /// Create a face sized for Data packets whose content can be up
     /// to `mtu` bytes. Picks `slot_size = slot_size_for_mtu(mtu)` and
-    /// keeps [`DEFAULT_CAPACITY`]. Use this when an application has
+    /// scales `capacity` inversely so the total ring memory stays
+    /// within [`SHM_BUDGET`]. Use this when an application has
     /// announced its expected packet size via `faces/create`'s `mtu`
     /// ControlParameter.
     pub fn create_for_mtu(id: FaceId, name: &str, mtu: usize) -> Result<Self, ShmError> {
-        Self::create_with(id, name, DEFAULT_CAPACITY, slot_size_for_mtu(mtu))
+        let ss = slot_size_for_mtu(mtu);
+        Self::create_with(id, name, capacity_for_slot(ss), ss)
     }
 
     /// Create with explicit ring parameters.
@@ -1024,22 +1054,35 @@ mod tests {
     }
 
     #[test]
-    fn slot_size_for_mtu_clamps_to_default_floor() {
-        // Small mtu + overhead is still below the default slot size, so
-        // we pay the default (no point provisioning less than the router
-        // handed to most clients).
-        assert_eq!(slot_size_for_mtu(1024), DEFAULT_SLOT_SIZE);
-        assert_eq!(slot_size_for_mtu(0), DEFAULT_SLOT_SIZE);
-        assert_eq!(slot_size_for_mtu(100_000), DEFAULT_SLOT_SIZE);
+    fn slot_size_for_mtu_no_floor_clamp() {
+        // slot_size_for_mtu does NOT clamp to DEFAULT_SLOT_SIZE anymore.
+        // mtu=1024 → 1024 + 16384 = 17408, aligned to 64 = 17408.
+        let small = slot_size_for_mtu(1024);
+        assert_eq!(small, 17408);
+        assert!(small < DEFAULT_SLOT_SIZE + SHM_SLOT_OVERHEAD as u32);
+
+        // mtu=0 → 0 + 16384 = 16384, aligned = 16384.
+        assert_eq!(slot_size_for_mtu(0), 16384);
     }
 
     #[test]
     fn slot_size_for_mtu_scales_up_for_large_mtu() {
-        // 1 MiB segment + 16 KiB overhead = 1 064 960; round up to
-        // next multiple of 64 = 1 064 960 (already aligned).
         let one_mib = slot_size_for_mtu(1024 * 1024);
         assert!(one_mib >= 1024 * 1024 + SHM_SLOT_OVERHEAD as u32);
         assert_eq!(one_mib % 64, 0);
+    }
+
+    #[test]
+    fn capacity_for_slot_inversely_scales() {
+        // Default slot → default capacity.
+        assert_eq!(capacity_for_slot(DEFAULT_SLOT_SIZE), DEFAULT_CAPACITY);
+        // 256 KiB slot → much smaller capacity.
+        let cap_256k = capacity_for_slot(272_384);
+        assert!(cap_256k < DEFAULT_CAPACITY);
+        assert!(cap_256k >= 16);
+        // 1 MiB slot → minimum capacity (16).
+        let cap_1m = capacity_for_slot(1_064_960);
+        assert_eq!(cap_1m, 16);
     }
 
     #[test]
