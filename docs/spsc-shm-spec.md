@@ -181,6 +181,39 @@ wrap around naturally via unsigned wrapping arithmetic.
 7. Store tail + 1 (Release)     — make writes visible to consumer
 ```
 
+### 4.2.1 Batch Push
+
+A batch variant of §4.2 pushes up to N packets with a single
+Acquire head load and a single Release tail store:
+
+```
+1. Load tail (Relaxed)
+2. Load head (Acquire)          — one head load, not N
+3. free = capacity - (tail - head)
+4. to_push = min(N, free)
+5. If to_push == 0 → ring full, return 0
+6. For each of the to_push packets:
+   a. idx = tail % capacity
+   b. Write length prefix at slot[idx].offset(0)
+   c. Copy packet bytes to slot[idx].offset(4)
+   d. tail += 1                 — local register bump, not a store
+7. Store tail (Release)         — single fence publishes all N slots
+8. Return to_push
+```
+
+This saves `N-1` Acquire loads and `N-1` Release stores compared to
+calling §4.2 in a loop. More importantly, when wrapped in the async
+`send_batch` API, the batch path collapses N tokio await-points and
+their associated scheduler round-trips into a single call — the
+primary motivation for the API (see `SpscHandle::send_batch` /
+`SpscFace::send_batch` in `spsc.rs`).
+
+When the batch exceeds ring capacity, the caller pushes a partial
+batch (up to `free` slots), wakes the peer to drain, yields, and
+retries the remainder. Partial pushes are published immediately
+(step 7 fires after each partial), so the peer can make forward
+progress without waiting for the full batch.
+
 ### 4.3 Pop (Consumer)
 
 ```
