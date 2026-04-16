@@ -169,6 +169,13 @@ struct Cli {
 
     #[arg(long)]
     no_shm: bool,
+
+    /// Hint for the SHM ring slot size: maximum Data content body
+    /// the consumer expects to receive, in bytes. Use this when
+    /// fetching segments larger than ~256 KiB over SHM. Ignored with
+    /// `--no-shm`.
+    #[arg(long)]
+    mtu: Option<usize>,
 }
 
 fn parse_pubkey(hex: &str) -> Result<[u8; 32]> {
@@ -220,6 +227,7 @@ async fn main() -> Result<()> {
             conn: ConnectConfig {
                 face_socket: cli.face_socket,
                 use_shm: !cli.no_shm,
+                mtu: cli.mtu,
             },
             name: cli.name,
             lifetime_ms: cli.lifetime,

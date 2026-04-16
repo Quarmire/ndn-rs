@@ -125,6 +125,13 @@ pub struct ConnectConfig {
     pub face_socket: String,
     /// Use shared memory for the data plane (set false for `--no-shm` behaviour).
     pub use_shm: bool,
+    /// Maximum Data content body the tool expects to send or receive,
+    /// in bytes. Used to size the SHM ring slot via `faces/create`'s
+    /// `mtu` ControlParameter. `None` uses the router's default slot
+    /// size, which comfortably covers Data packets up to a 256 KiB
+    /// content body. Set this to `Some(chunk_size)` when the tool
+    /// plans to emit larger segments (e.g. 1 MiB rayon sweeps).
+    pub mtu: Option<usize>,
 }
 
 impl Default for ConnectConfig {
@@ -136,6 +143,7 @@ impl Default for ConnectConfig {
         Self {
             face_socket,
             use_shm: true,
+            mtu: None,
         }
     }
 }

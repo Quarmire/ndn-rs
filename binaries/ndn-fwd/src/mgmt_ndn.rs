@@ -906,7 +906,7 @@ async fn faces_create(
     };
 
     if let Some(shm_name) = uri.strip_prefix("shm://") {
-        return faces_create_shm(shm_name, source_face, engine);
+        return faces_create_shm(shm_name, params.mtu, source_face, engine);
     }
 
     if let Some(addr_str) = uri.strip_prefix("udp4://") {
@@ -1004,12 +1004,24 @@ async fn faces_create_tcp(addr_str: &str, engine: &ForwarderEngine) -> ControlRe
 #[cfg(all(unix, feature = "spsc-shm"))]
 fn faces_create_shm(
     shm_name: &str,
+    mtu: Option<u64>,
     source_face: Option<FaceId>,
     engine: &ForwarderEngine,
 ) -> ControlResponse {
     let face_id = engine.faces().alloc_id();
 
-    match ndn_faces::local::ShmFace::create(face_id, shm_name) {
+    // If the app announced its expected packet size via ControlParameters.mtu,
+    // size the SHM slot to cover it. Otherwise use the default slot size,
+    // which already covers Data packets up to a 256 KiB content body.
+    let face_result = match mtu {
+        Some(m) => ndn_faces::local::shm::spsc::SpscFace::create_for_mtu(
+            face_id,
+            shm_name,
+            m as usize,
+        ),
+        None => ndn_faces::local::ShmFace::create(face_id, shm_name),
+    };
+    match face_result {
         Ok(face) => {
             // Use a child of the control face's cancel token so that when the
             // control face disconnects, this SHM face is also cancelled and
@@ -1022,11 +1034,12 @@ fn faces_create_shm(
             // (app exits), the child cancel token fires and the face is
             // fully cleaned up (SHM region unlinked, FIB routes removed).
             engine.add_face(face, cancel);
-            tracing::info!(face = face_id.0, shm = shm_name, "faces/create shm");
+            tracing::info!(face = face_id.0, shm = shm_name, mtu = ?mtu, "faces/create shm");
 
             let echo = ControlParameters {
                 face_id: Some(face_id.0 as u64),
                 uri: Some(format!("shm://{shm_name}")),
+                mtu,
                 ..Default::default()
             };
             ControlResponse::ok("OK", echo)
@@ -1041,6 +1054,7 @@ fn faces_create_shm(
 #[cfg(not(all(unix, feature = "spsc-shm")))]
 fn faces_create_shm(
     _shm_name: &str,
+    _mtu: Option<u64>,
     _source_face: Option<FaceId>,
     _engine: &ForwarderEngine,
 ) -> ControlResponse {

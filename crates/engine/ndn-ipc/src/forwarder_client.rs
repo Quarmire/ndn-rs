@@ -103,22 +103,39 @@ impl ForwarderClient {
     /// Automatically attempts SHM data plane with an auto-generated name;
     /// falls back to Unix socket if SHM is unavailable or fails.
     pub async fn connect(face_socket: impl AsRef<Path>) -> Result<Self, ForwarderError> {
+        Self::connect_with_mtu(face_socket, None).await
+    }
+
+    /// Connect with an explicit MTU hint for the SHM data plane.
+    ///
+    /// `mtu` is passed to the router's `faces/create` so the SHM ring
+    /// is sized to carry Data packets whose content body can be up
+    /// to `mtu` bytes. Pass `None` to use the default slot size
+    /// (enough for ~256 KiB content bodies). Producers that plan to
+    /// emit larger segments — e.g. chunked transfers at 1 MiB per
+    /// segment — should pass `Some(chunk_size)` here.
+    pub async fn connect_with_mtu(
+        face_socket: impl AsRef<Path>,
+        mtu: Option<usize>,
+    ) -> Result<Self, ForwarderError> {
         let auto_name = format!("app-{}-{}", std::process::id(), next_shm_id());
-        Self::connect_with_name(face_socket, Some(&auto_name)).await
+        Self::connect_with_name(face_socket, Some(&auto_name), mtu).await
     }
 
     /// Connect using only the Unix socket for data (no SHM attempt).
     pub async fn connect_unix_only(face_socket: impl AsRef<Path>) -> Result<Self, ForwarderError> {
-        Self::connect_with_name(face_socket, None).await
+        Self::connect_with_name(face_socket, None, None).await
     }
 
     /// Connect with an explicit SHM name for the data plane.
     ///
     /// If `shm_name` is `Some`, creates an SHM face with that name.
     /// If `None` or SHM creation fails, falls back to Unix-only mode.
+    /// `mtu` sizes the SHM ring slot for the expected max Data body.
     pub async fn connect_with_name(
         face_socket: impl AsRef<Path>,
         shm_name: Option<&str>,
+        mtu: Option<usize>,
     ) -> Result<Self, ForwarderError> {
         let path = face_socket.as_ref().to_str().unwrap_or_default().to_owned();
         let control = Arc::new(ndn_faces::local::ipc_face_connect(FaceId(0), &path).await?);
@@ -132,7 +149,7 @@ impl ForwarderClient {
             feature = "spsc-shm"
         ))]
         if let Some(name) = shm_name {
-            match Self::setup_shm(&control, name, cancel.child_token()).await {
+            match Self::setup_shm(&control, name, mtu, cancel.child_token()).await {
                 Ok(transport) => {
                     let mgmt = crate::mgmt_client::MgmtClient::from_face(Arc::clone(&control));
                     return Ok(Self {
@@ -172,10 +189,13 @@ impl ForwarderClient {
     async fn setup_shm(
         control: &Arc<IpcFace>,
         shm_name: &str,
+        mtu: Option<usize>,
         cancel: CancellationToken,
     ) -> Result<DataTransport, ForwarderError> {
         let mgmt = crate::mgmt_client::MgmtClient::from_face(Arc::clone(control));
-        let resp = mgmt.face_create(&format!("shm://{shm_name}")).await?;
+        let resp = mgmt
+            .face_create_with_mtu(&format!("shm://{shm_name}"), mtu.map(|m| m as u64))
+            .await?;
         let face_id = resp.face_id.ok_or(ForwarderError::MalformedResponse)?;
 
         // Connect the app-side SHM handle with cancellation from control face.

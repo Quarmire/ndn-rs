@@ -223,8 +223,14 @@ pub async fn run_producer(params: PutParams, tx: mpsc::Sender<ToolEvent>) -> Res
         .unwrap_or(0);
     let served_prefix = name.clone().append_component(NameComponent::version(ts_us));
 
+    // Size the SHM ring for the largest Data we'll emit: chunk_size
+    // plus signature/name overhead (handled inside the SHM face). Let
+    // the caller override via ConnectConfig.mtu; otherwise derive from
+    // chunk_size so producers emitting large segments don't silently
+    // exceed the default ~266 KiB slot.
+    let mtu_hint = params.conn.mtu.or(Some(chunk_size));
     let client = if params.conn.use_shm {
-        ForwarderClient::connect(&params.conn.face_socket).await?
+        ForwarderClient::connect_with_mtu(&params.conn.face_socket, mtu_hint).await?
     } else {
         ForwarderClient::connect_unix_only(&params.conn.face_socket).await?
     };
