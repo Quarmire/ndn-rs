@@ -81,6 +81,9 @@ impl Default for DashSettings {
     }
 }
 
+// ── Desktop: filesystem persistence ──────────────────────────────────────────
+
+#[cfg(feature = "desktop")]
 fn settings_path() -> std::path::PathBuf {
     dirs_next::config_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
@@ -88,6 +91,7 @@ fn settings_path() -> std::path::PathBuf {
         .join("settings.json")
 }
 
+#[cfg(feature = "desktop")]
 pub fn load_settings() -> DashSettings {
     let path = settings_path();
     if let Ok(content) = std::fs::read_to_string(&path)
@@ -98,12 +102,40 @@ pub fn load_settings() -> DashSettings {
     DashSettings::default()
 }
 
+#[cfg(feature = "desktop")]
 pub fn save_settings(settings: &DashSettings) -> anyhow::Result<()> {
     let path = settings_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(&path, serde_json::to_string_pretty(settings)?)?;
+    Ok(())
+}
+
+// ── Web: localStorage persistence ────────────────────────────────────────────
+
+#[cfg(feature = "web")]
+pub fn load_settings() -> DashSettings {
+    use gloo_storage::{LocalStorage, Storage};
+    LocalStorage::get("ndn-dashboard-settings").unwrap_or_default()
+}
+
+#[cfg(feature = "web")]
+pub fn save_settings(settings: &DashSettings) -> anyhow::Result<()> {
+    use gloo_storage::{LocalStorage, Storage};
+    LocalStorage::set("ndn-dashboard-settings", settings)
+        .map_err(|e| anyhow::anyhow!("localStorage write failed: {:?}", e))
+}
+
+// ── Fallback if neither feature is active ────────────────────────────────────
+
+#[cfg(not(any(feature = "desktop", feature = "web")))]
+pub fn load_settings() -> DashSettings {
+    DashSettings::default()
+}
+
+#[cfg(not(any(feature = "desktop", feature = "web")))]
+pub fn save_settings(_settings: &DashSettings) -> anyhow::Result<()> {
     Ok(())
 }
 

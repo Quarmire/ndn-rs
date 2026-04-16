@@ -1,6 +1,6 @@
 [package]
 name = "ndn-dashboard"
-description = "NDN router management dashboard (Dioxus desktop)"
+description = "NDN router management dashboard (desktop and web via Dioxus)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,21 +9,54 @@ license.workspace = true
 name = "ndn-dashboard"
 path = "src/main.rs"
 
+[features]
+default = ["desktop"]
+desktop = [
+  "dep:tray-icon",
+  "dep:dirs-next",
+  "dep:which",
+  "dep:ndn-ipc",
+  "dep:ndn-tools-core",
+  "dioxus/desktop",
+  "tokio/process",
+  "tokio/rt-multi-thread",
+]
+web = [
+  "dioxus/web",
+  "dep:gloo-net",
+  "dep:web-sys",
+  "dep:gloo-storage",
+  "dep:gloo-timers",
+]
+
 [dependencies]
-ndn-tools-core = { workspace = true, features = ["ping", "iperf", "peek", "put"] }
-ndn-ipc    = { workspace = true }
 ndn-config = { workspace = true }
-bytes      = { workspace = true, features = ["std"] }
 ndn-packet = { workspace = true, features = ["std"] }
-tokio      = { workspace = true, features = ["rt-multi-thread", "macros", "time", "process", "io-util"] }
-tray-icon  = "0.21"
+ndn-tlv    = { workspace = true, features = ["std"] }
+bytes      = { workspace = true, features = ["std"] }
+tokio      = { workspace = true, features = ["rt", "macros", "time", "io-util"] }
 futures    = { workspace = true }
 tracing    = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow     = { workspace = true }
-dioxus     = { version = "0.7", features = ["desktop"] }
+dioxus     = "0.7"
 getrandom  = "0.2"
 serde      = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-dirs-next  = "2"
-which      = "6"
+
+# Desktop-only dependencies (optional, activated by "desktop" feature)
+tray-icon      = { version = "0.21", optional = true }
+dirs-next      = { version = "2", optional = true }
+which          = { version = "6", optional = true }
+ndn-ipc        = { workspace = true, optional = true }
+ndn-tools-core = { workspace = true, features = ["ping", "iperf", "peek", "put"], optional = true }
+
+# Web-only dependencies (optional, activated by "web" feature)
+gloo-net     = { version = "0.6", optional = true }
+gloo-storage = { version = "0.3", optional = true }
+gloo-timers  = { version = "0.3", optional = true }
+
+[dependencies.web-sys]
+version = "0.3"
+optional = true
+features = ["Window", "Storage"]
