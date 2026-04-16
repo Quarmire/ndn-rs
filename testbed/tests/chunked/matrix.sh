@@ -184,6 +184,12 @@ run_cell() {
   if [ "${peek_tx}" = "unix" ]; then
     peek_extra+=" --no-shm"
   fi
+  # Size the consumer's SHM ring for the largest Data it will
+  # receive. ndn-put already auto-derives this from --chunk-size for
+  # its own face; mirror it on the peek side so large-segment cells
+  # (sweep 6's 1 MiB rayon row) don't hit the default 266 KiB slot
+  # ceiling on the consumer face.
+  peek_extra+=" --mtu ${chunk}"
 
   # shellcheck disable=SC2086
   ndn-put "${prefix}" "${payload}" \
