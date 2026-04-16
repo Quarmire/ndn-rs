@@ -317,17 +317,61 @@ merkle.rs` for the precomputed `BLAKE3_LEAF_KEY` / `BLAKE3_NODE_KEY`
 derivation via `Hasher::new_derive_key` (done once at first use via
 `LazyLock`).
 
+**Third datapoint: real forwarder, SHM transport, 1 MiB leaves.**
+`testbed/tests/chunked/matrix.sh` reproduces the same comparison
+through the complete `ndn-put` → `ndn-fwd` → `ndn-peek` pipeline
+with SHM faces on both sides (no in-process shortcut), at a regime
+where Criterion can't reach: a 64 MiB file published as 64 × 1 MiB
+segments, each served as a separately named Data packet, fetched
+back over a real tokio runtime with a 64-Interest window and AIMD
+congestion control. Apple Silicon, release build.
+
+| scheme | fetch wall | verify wall | throughput |
+|---|---:|---:|---:|
+| SHA-256 Merkle (type 9) | 80.99 ms | 66.89 ms | **6629 Mbps** |
+| BLAKE3 Merkle (type 8)  | 86.03 ms | 73.21 ms | 6240 Mbps |
+
+SHA-256 is **6% faster end-to-end** and **9% faster on the verify
+wall** at 1 MiB leaves — the gap is slightly *smaller* than the
+Criterion ~15% gap at 4 KB leaves, consistent with per-leaf
+overheads getting amortised as leaves grow. Crucially, **at these
+1 MiB leaves — well past the 128 KiB `Hasher::update_rayon`
+threshold — BLAKE3's multi-threaded tree mode still does not
+engage and pull ahead.** The reason is structural, not tunable:
+`publish_segmented_merkle` hashes each leaf via `blake3::keyed_hash`
+(a one-shot API designed for small-to-medium single-call inputs),
+not through the streaming `Hasher` that dispatches to rayon. A
+Merkle leaf is by definition a fixed-size chunk of segment bytes,
+so there is no meaningful place to slot in "parallelise the leaf"
+— the parallelism we want is *across* leaves, and that is the
+pipeline's job, not the hash primitive's. The `rayon-1024k-merkle-
+{sha,blake}` cells in sweep 6 are the load-bearing datapoints;
+`testbed/tests/chunked/matrix.sh` will print per-stage timings
+(recv / decode / verify / store) so future runs can track whether
+the ratio shifts as the pipeline tightens.
+
+Two calibration notes. At 1 MiB / 64 MiB, verify wall is **83–85%
+of fetch wall** — the first regime in the whole suite where crypto
+is the bottleneck rather than Unix socket I/O or segment-count
+overhead. Below this regime (4 KiB leaves, 16 MiB file), verify is
+<15% of fetch and the comparison is dominated by per-Interest
+plumbing. And SHA-256 Merkle's end-to-end 6629 Mbps was the top of
+the whole matrix at the time of this writing (Apr 2026) — see the
+run log in that commit for the full 46-cell sweep.
+
 **Recommendation for v0.1.0:** both hash choices are now in the
 same ballpark, so pick based on cryptographic ergonomics rather
 than raw speed. **SHA-256 Merkle** (signature type code 9,
-provisional) is marginally faster (~15%) on SHA-NI hardware and is
-the safe default. **BLAKE3 Merkle** (code 8, provisional) is
-available when the surrounding application already uses BLAKE3 for
-hashing / MAC / KDF / XOF and the single-primitive simplification
-is worth a modest perf penalty, or when segment sizes are ≥16 KB
-(the gap shrinks further) or a producer is hashing multi-GB files
-with `Hasher::update_rayon` in parallel on many cores (where
-BLAKE3 wins outright — see Section 3 above).
+provisional) is marginally faster (~6–15% depending on segment
+size) on SHA-NI hardware and is the safe default. **BLAKE3 Merkle**
+(code 8, provisional) is available when the surrounding application
+already uses BLAKE3 for hashing / MAC / KDF / XOF and the
+single-primitive simplification is worth a modest perf penalty, or
+when a producer is hashing multi-GB *non-Merkle* inputs with
+`Hasher::update_rayon` in parallel on many cores (the one regime
+where BLAKE3 wins outright — see Section 3 above). Do **not** pick
+BLAKE3 Merkle expecting rayon to kick in at large leaves; the
+structural argument above says it won't.
 
 This is a more nuanced story than "BLAKE3 is faster at everything
 with a tree" (the earlier version of this page) *or* "SHA-256
