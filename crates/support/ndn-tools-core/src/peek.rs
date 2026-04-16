@@ -152,14 +152,17 @@ async fn fetch_segmented(
     let mut seq: u64 = 0;
 
     loop {
-        // Build the batch of Interests to fill the pipeline window,
-        // then send them all in one ring transition. The per-Interest
-        // cost of this loop is now dominated by InterestBuilder
-        // allocation (~200 ns) rather than scheduler round-trips
-        // (~5–20 µs per yield_now().await in the old per-send path).
+        // Fill the pipeline window. When multiple slots are open (the
+        // common case at window-fill time and after processing a burst
+        // of Data responses), batch them into a single SHM ring
+        // transition. For the steady-state single-slot refill (one Data
+        // in → one Interest out), skip the Vec allocation overhead and
+        // send directly. This avoids the regression observed in small-
+        // segment cells where 98% of sends are single-Interest refills
+        // and the batch path's Vec alloc was more expensive than the old
+        // per-send() call.
         {
-            let mut batch = Vec::new();
-            let now = Instant::now();
+            let mut batch: Vec<(usize, Bytes)> = Vec::new();
             while in_flight.len() + batch.len() < pipeline && next_seg < total_segs {
                 if next_seg == seg0_idx {
                     next_seg += 1;
@@ -168,13 +171,16 @@ async fn fetch_segmented(
                 batch.push((next_seg, make_interest(next_seg)));
                 next_seg += 1;
             }
-            if !batch.is_empty() {
+            let now = Instant::now();
+            if batch.len() > 1 {
                 let wires: Vec<Bytes> = batch.iter().map(|(_, w)| w.clone()).collect();
                 client.send_batch(&wires).await?;
-                for (seg, _) in batch {
-                    in_flight.insert(seq, (seg, now));
-                    seq += 1;
-                }
+            } else if batch.len() == 1 {
+                client.send(batch[0].1.clone()).await?;
+            }
+            for (seg, _) in batch {
+                in_flight.insert(seq, (seg, now));
+                seq += 1;
             }
         }
         if received == total_segs {
