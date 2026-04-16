@@ -681,12 +681,12 @@ async fn drive_pipeline(
 
     let target = end - start;
     while received < target {
-        // Build the batch of Interests to fill the current congestion
-        // window, then send them all in one ring transition.
+        // Fill the CC window. Batch when multiple slots are open;
+        // fall back to single send for the steady-state 1-slot refill
+        // to avoid Vec alloc overhead on 98% of sends.
         {
             let window = cc.window().floor() as usize;
-            let mut batch = Vec::new();
-            let now = Instant::now();
+            let mut batch: Vec<(usize, Bytes)> = Vec::new();
             while in_flight.len() + batch.len() < window && next_seg < end {
                 if next_seg == skip_seg {
                     next_seg += 1;
@@ -695,13 +695,16 @@ async fn drive_pipeline(
                 batch.push((next_seg, make_interest(next_seg)));
                 next_seg += 1;
             }
-            if !batch.is_empty() {
+            let now = Instant::now();
+            if batch.len() > 1 {
                 let wires: Vec<Bytes> = batch.iter().map(|(_, w)| w.clone()).collect();
                 client.send_batch(&wires).await?;
-                for (seg, _) in batch {
-                    in_flight.insert(seq, (seg, now));
-                    seq += 1;
-                }
+            } else if batch.len() == 1 {
+                client.send(batch[0].1.clone()).await?;
+            }
+            for (seg, _) in batch {
+                in_flight.insert(seq, (seg, now));
+                seq += 1;
             }
         }
 

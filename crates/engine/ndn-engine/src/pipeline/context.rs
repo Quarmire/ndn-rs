@@ -4,7 +4,7 @@ use bytes::Bytes;
 use smallvec::SmallVec;
 
 use ndn_packet::{Data, Interest, Nack, Name};
-use ndn_store::PitToken;
+use ndn_store::{NameHashes, PitToken};
 use ndn_transport::{AnyMap, FaceId};
 
 /// The packet as it progresses through decode stages.
@@ -31,6 +31,10 @@ pub struct PacketContext {
     pub name: Option<Arc<Name>>,
     /// Decoded packet — starts as `Raw`, transitions after TlvDecodeStage.
     pub packet: DecodedPacket,
+    /// Pre-computed cumulative name-prefix hashes.  Set by `TlvDecodeStage`
+    /// immediately after the name is known; used by PIT and FIB stages to
+    /// avoid re-hashing name components on every probe.
+    pub name_hashes: Option<NameHashes>,
     /// PIT token — written by PitCheckStage, `None` before that stage runs.
     pub pit_token: Option<PitToken>,
     /// NDNLPv2 PIT token (opaque, 1-32 bytes) from the incoming LP header.
@@ -57,6 +61,7 @@ impl PacketContext {
             face_id,
             name: None,
             packet: DecodedPacket::Raw,
+            name_hashes: None,
             pit_token: None,
             lp_pit_token: None,
             out_faces: SmallVec::new(),
