@@ -587,7 +587,18 @@ export class EngineView {
   }
 
   onShow() {
-    if (!this._built) { this._build(); this._built = true; }
+    if (!this._built) {
+      try {
+        this._build();
+        this._built = true;
+      } catch (e) {
+        console.error('EngineView build error:', e);
+        this.container.innerHTML = `<div style="padding:2rem;color:#ff7b72;">
+          <h3>Engine View Error</h3>
+          <pre style="font-size:0.75rem;color:#e6edf3;background:#161b22;padding:1rem;border-radius:6px;overflow:auto;">${e.stack || e.message || e}</pre>
+        </div>`;
+      }
+    }
   }
 
   _build() {
@@ -700,18 +711,29 @@ export class EngineView {
     svg.classList.add('ev-pipeline-svg');
     this.svg = svg;
 
-    // Defs: arrowhead marker
-    svg.innerHTML = `<defs>
+    // Defs: inject via a temp container div for reliable SVG namespace handling.
+    // Direct svg.innerHTML or DOMParser can fail silently in some browsers.
+    const _tmp = document.createElement('div');
+    _tmp.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg"><defs>
       <marker id="ev-arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
-        <path d="M0,0 L8,3 L0,6" fill="#58a6ff"/>
+        <path d="M0,0 L8,3 L0,6" fill="#58a6ff"></path>
       </marker>
       <marker id="ev-arrow-red" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
-        <path d="M0,0 L8,3 L0,6" fill="#ff7b72"/>
+        <path d="M0,0 L8,3 L0,6" fill="#ff7b72"></path>
       </marker>
       <marker id="ev-arrow-green" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
-        <path d="M0,0 L8,3 L0,6" fill="#3fb950"/>
+        <path d="M0,0 L8,3 L0,6" fill="#3fb950"></path>
       </marker>
-    </defs>`;
+      <filter id="ev-glow">
+        <feGaussianBlur stdDeviation="3" result="blur"></feGaussianBlur>
+        <feMerge><feMergeNode in="blur"></feMergeNode><feMergeNode in="SourceGraphic"></feMergeNode></feMerge>
+      </filter>
+    </defs></svg>`;
+    const _tmpSvg = _tmp.querySelector('svg');
+    if (_tmpSvg) {
+      const _defs = _tmpSvg.querySelector('defs');
+      if (_defs) svg.appendChild(_defs);
+    }
 
     // ── Stage layout ────────────────────────────────────────────────────
     // Interest path: top lane
@@ -883,11 +905,6 @@ export class EngineView {
     // ── Packet dots (animated — supports multiple for concurrent scenarios)
     const PACKET_COLORS = ['#58a6ff', '#d2a8ff', '#ffa657'];
     this.packetDots = [];
-    const glow = document.createElementNS('http://www.w3.org/2000/svg', 'filter');
-    glow.id = 'ev-glow';
-    glow.innerHTML = '<feGaussianBlur stdDeviation="3" result="blur"/><feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>';
-    svg.querySelector('defs').appendChild(glow);
-
     for (let i = 0; i < 3; i++) {
       const dot = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
       dot.setAttribute('r', i === 0 ? '8' : '6');
@@ -983,7 +1000,8 @@ export class EngineView {
     });
 
     svg.appendChild(g);
-    this.stageEls[s.id + '_' + (s.y < 200 ? 'interest' : 'data')] = g;
+    const lane = s.y < 200 ? 'interest' : s.y < 350 ? 'data' : 'nack';
+    this.stageEls[s.id + '_' + lane] = g;
   }
 
   // ── PacketContext Strip ──────────────────────────────────────────────────

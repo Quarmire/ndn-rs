@@ -4,7 +4,7 @@
 
 /* ── Layout ──────────────────────────────────────────────────────────────── */
 
-.ev-root {
+.view.active.ev-root {
   display: flex;
   flex-direction: column;
   gap: 0;
