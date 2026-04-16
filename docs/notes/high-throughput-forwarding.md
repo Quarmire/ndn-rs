@@ -48,6 +48,12 @@ Cost model (5-component name, default selector probes):
 | Temporary `Name` allocations | 4 | 0 |
 | `DefaultHasher` rounds per probe | ~5 component hashes | 1 (two u64s) |
 
+Pre-computation is gated on `name.len() > 3`: for short names (≤3
+components, typical of iperf and simple apps) the upfront cost exceeds
+the savings, so NameHashes is left as `None` and downstream stages
+fall back to per-probe hashing.  The `get_or_insert_with` pattern in
+`PitMatchStage` ensures lazy computation when first needed.
+
 Inspired by NDN-DPDK's memoized name hashing at the RX layer (§3.1 of
 the ICN 2020 paper).
 

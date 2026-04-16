@@ -108,7 +108,9 @@ impl TlvDecodeStage {
             t if t == tlv_type::DATA => match Data::decode(ctx.raw_bytes.clone()) {
                 Ok(data) => {
                     trace!(face=%ctx.face_id, name=%data.name, "decode: Data");
-                    ctx.name_hashes = Some(NameHashes::compute(&data.name));
+                    if data.name.len() > 3 {
+                        ctx.name_hashes = Some(NameHashes::compute(&data.name));
+                    }
                     ctx.name = Some(data.name.clone());
                     ctx.packet = DecodedPacket::Data(Box::new(data));
                     if let Some(drop) = self.check_scope(&ctx) {
@@ -138,7 +140,12 @@ impl TlvDecodeStage {
                 }
                 trace!(face=%ctx.face_id, name=%interest.name, nonce=?interest.nonce(), "decode: Interest");
                 ctx.raw_bytes = ensure_nonce(&ctx.raw_bytes);
-                ctx.name_hashes = Some(NameHashes::compute(&interest.name));
+                // Pre-compute cumulative prefix hashes only when names are long
+                // enough to recoup the cost.  For ≤3 components the per-probe
+                // re-hashing in PitMatchStage is cheaper than the upfront work.
+                if interest.name.len() > 3 {
+                    ctx.name_hashes = Some(NameHashes::compute(&interest.name));
+                }
                 ctx.name = Some(interest.name.clone());
                 ctx.packet = DecodedPacket::Interest(Box::new(interest));
                 if let Some(drop) = self.check_scope(&ctx) {
@@ -244,7 +251,9 @@ impl TlvDecodeStage {
                 Ok(interest) => {
                     trace!(face=%ctx.face_id, name=%interest.name, reason=?reason, "decode: Nack");
                     let nack = Nack::new(interest, reason);
-                    ctx.name_hashes = Some(NameHashes::compute(&nack.interest.name));
+                    if nack.interest.name.len() > 3 {
+                        ctx.name_hashes = Some(NameHashes::compute(&nack.interest.name));
+                    }
                     ctx.name = Some(nack.interest.name.clone());
                     ctx.packet = DecodedPacket::Nack(Box::new(nack));
                     if let Some(drop) = self.check_scope(&ctx) {
