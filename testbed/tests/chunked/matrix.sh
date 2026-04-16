@@ -127,10 +127,19 @@ mkdir -p "$(dirname "${RESULTS}")"
 TMP_DIR=$(mktemp -d)
 trap 'rm -rf "${TMP_DIR}"' EXIT
 
-# Preserve the header only on a fresh run. Append on subsequent runs
-# so multiple matrix invocations accumulate into one spreadsheet.
-if [ ! -f "${RESULTS}" ]; then
-  printf 'file_mb\tseg_kb\tsign\thash\tpipeline\tcc\tpresign\tverify\tbatch\tno_asm\tput_tx\tpeek_tx\tresult\tbytes\tfetch_us\tverify_us\tmanifest_us\tthroughput_mbps\tlabel\n' \
+# Each run starts with a fresh TSV so the summary and the file on disk
+# match what the current invocation actually measured. Opt in to the
+# old "accumulate across runs" behaviour with APPEND=1.
+#
+# The old default was to preserve and append; this turned out to be a
+# foot-gun — stale FAIL rows from earlier runs kept showing up in the
+# "top 10" summary, the PASS/FAIL totals stopped matching the cell
+# count of the current run, and users had to remember to rm the TSV
+# between invocations.
+if [ "${APPEND:-0}" = "1" ] && [ -f "${RESULTS}" ]; then
+  : # keep existing rows; do not rewrite header
+else
+  printf 'file_mb\tseg_kb\tsign\thash\tpipeline\tcc\tpresign\tverify\tbatch\tno_asm\tput_tx\tpeek_tx\tresult\tbytes\tfetch_us\tverify_us\trecv_us\tdecode_us\tstore_us\tmanifest_us\tthroughput_mbps\tlabel\n' \
     > "${RESULTS}"
 fi
 
@@ -224,10 +233,13 @@ run_cell() {
     metrics_line=$(grep -h '^metrics:' "${log}" | head -1)
     # Strip the `metrics: ` prefix and parse the JSON inline with
     # plain awk — we don't want a jq dependency.
-    local bytes fetch_us verify_us manifest_us
+    local bytes fetch_us verify_us recv_us decode_us store_us manifest_us
     bytes=$(printf '%s' "${metrics_line}" | grep -o '"bytes":[0-9]*' | head -1 | cut -d: -f2)
     fetch_us=$(printf '%s' "${metrics_line}" | grep -o '"fetch_wall_us":[0-9]*' | head -1 | cut -d: -f2)
     verify_us=$(printf '%s' "${metrics_line}" | grep -o '"verify_wall_us":[0-9]*' | head -1 | cut -d: -f2)
+    recv_us=$(printf '%s' "${metrics_line}" | grep -o '"recv_wall_us":[0-9]*' | head -1 | cut -d: -f2)
+    decode_us=$(printf '%s' "${metrics_line}" | grep -o '"decode_wall_us":[0-9]*' | head -1 | cut -d: -f2)
+    store_us=$(printf '%s' "${metrics_line}" | grep -o '"store_wall_us":[0-9]*' | head -1 | cut -d: -f2)
     manifest_us=$(printf '%s' "${metrics_line}" | grep -o '"manifest_fetch_us":[0-9]*' | head -1 | cut -d: -f2)
     local throughput_mbps
     if [ -n "${fetch_us}" ] && [ "${fetch_us}" -gt 0 ]; then
@@ -236,15 +248,17 @@ run_cell() {
     else
       throughput_mbps=0
     fi
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
       "${file_mb}" "${seg_kb}" "${sign}" "${hash}" "${pipeline}" "${cc}" \
       "${pre_sign}" "${verify}" "${batch}" "${no_asm}" \
       "${put_tx}" "${peek_tx}" "${result}" \
-      "${bytes:-0}" "${fetch_us:-0}" "${verify_us:-0}" "${manifest_us:-0}" \
+      "${bytes:-0}" "${fetch_us:-0}" "${verify_us:-0}" \
+      "${recv_us:-0}" "${decode_us:-0}" "${store_us:-0}" \
+      "${manifest_us:-0}" \
       "${throughput_mbps}" "${label}" >> "${RESULTS}"
-    echo "[${label}] PASS  ${throughput_mbps} Mbps  (${put_tx}→${peek_tx}  bytes=${bytes:-?}  fetch=${fetch_us:-?}µs  verify=${verify_us:-?}µs)"
+    echo "[${label}] PASS  ${throughput_mbps} Mbps  (${put_tx}→${peek_tx}  bytes=${bytes:-?}  fetch=${fetch_us:-?}µs  verify=${verify_us:-?}µs  recv=${recv_us:-?}µs  decode=${decode_us:-?}µs  store=${store_us:-?}µs)"
   else
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t-\t-\t-\t-\t-\t%s\n' \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t-\t-\t-\t-\t-\t-\t-\t-\t%s\n' \
       "${file_mb}" "${seg_kb}" "${sign}" "${hash}" "${pipeline}" "${cc}" \
       "${pre_sign}" "${verify}" "${batch}" "${no_asm}" \
       "${put_tx}" "${peek_tx}" "FAIL" "${label}" \
@@ -345,9 +359,10 @@ done
 unset PUT_TRANSPORT PEEK_TRANSPORT
 
 # ── Summary ────────────────────────────────────────────────────────────────
-# Column indices after the put_tx/peek_tx additions:
-#   $13 result  $14 bytes  $15 fetch_us  $16 verify_us  $17 manifest_us
-#   $18 throughput_mbps  $19 label
+# Column indices after recv/decode/store stage breakdown additions:
+#   $13 result        $14 bytes       $15 fetch_us
+#   $16 verify_us     $17 recv_us     $18 decode_us    $19 store_us
+#   $20 manifest_us   $21 throughput_mbps              $22 label
 PASS_COUNT=$(awk -F'\t' 'NR>1 && $13=="PASS"' "${RESULTS}" | wc -l | tr -d ' ')
 FAIL_COUNT=$(awk -F'\t' 'NR>1 && $13=="FAIL"' "${RESULTS}" | wc -l | tr -d ' ')
 echo
@@ -356,8 +371,22 @@ echo "results → ${RESULTS}"
 echo
 echo "quick summary (top 10 by throughput, passing only):"
 awk -F'\t' 'NR==1 || $13=="PASS"' "${RESULTS}" \
-  | sort -t$'\t' -k18 -rn | head -11 \
+  | sort -t$'\t' -k21 -rn | head -11 \
   | awk -F'\t' 'BEGIN { printf "  %-32s %8s %6s %8s %-10s %s\n", "label", "Mbps", "seg", "cc", "tx", "pipe/psign/noasm" }
-                NR>1 { printf "  %-32s %8s %6s %8s %-10s %s/%s/%s\n", $19, $18, $2"KB", $6, $11"→"$12, $5, $7, $10 }'
+                NR>1 { printf "  %-32s %8s %6s %8s %-10s %s/%s/%s\n", $22, $21, $2"KB", $6, $11"→"$12, $5, $7, $10 }'
+echo
+echo "stage breakdown (top 5 by throughput; µs and % of fetch_wall):"
+awk -F'\t' 'NR==1 || $13=="PASS"' "${RESULTS}" \
+  | sort -t$'\t' -k21 -rn | head -6 \
+  | awk -F'\t' 'BEGIN { printf "  %-32s %10s %10s %10s %10s %10s\n", "label", "fetch", "recv", "decode", "verify", "store" }
+                NR>1 {
+                  f=$15+0; r=$17+0; d=$18+0; v=$16+0; s=$19+0;
+                  printf "  %-32s %9dµs %4d%% %4d%% %4d%% %4d%%\n",
+                    $22, f,
+                    (f>0?100*r/f:0),
+                    (f>0?100*d/f:0),
+                    (f>0?100*v/f:0),
+                    (f>0?100*s/f:0);
+                }'
 
 [ "${FAIL_COUNT}" -eq 0 ]

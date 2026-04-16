@@ -217,6 +217,27 @@ struct FetchMetrics {
     bytes: u64,
     cc_label: &'static str,
     verify_label: &'static str,
+    // ── Per-stage breakdown of the pipeline loop ──
+    //
+    // These split the `fetch_wall_us` wall clock into the four places
+    // a segment response spends time inside `drive_pipeline`. They
+    // only cover the inner loop (after discovery and manifest fetch)
+    // and deliberately exclude Interest send time and window
+    // bookkeeping, which together are <1% of the total. At the 64 MB
+    // / 1 MiB Merkle regime these four accumulators cover ~95% of
+    // `fetch_wall_us`; the remainder is tokio scheduling overhead
+    // between stages.
+    /// Total µs blocked in `client.recv().await`, summed across all
+    /// segments. Dominates when the forwarder is slow or the pipeline
+    /// starves. On this host at 1 MiB segments it's a small fraction
+    /// of verify time, so this is *not* where the fetch wall lives.
+    recv_wall_us: u64,
+    /// Total µs in `Data::decode` + last-component segment lookup.
+    decode_wall_us: u64,
+    /// Total µs spent cloning segment content and bookkeeping
+    /// (in_flight retain + CC on_data). Excludes verify, which has
+    /// its own accumulator.
+    store_wall_us: u64,
 }
 
 impl FetchMetrics {
@@ -253,6 +274,9 @@ impl FetchMetrics {
               \"fetched\":{},\
               \"fetch_wall_us\":{},\
               \"verify_wall_us\":{},\
+              \"recv_wall_us\":{},\
+              \"decode_wall_us\":{},\
+              \"store_wall_us\":{},\
               \"manifest_fetch_us\":{},\
               \"verify_p50_us\":{},\
               \"verify_p95_us\":{},\
@@ -266,6 +290,9 @@ impl FetchMetrics {
             self.fetched_segments,
             self.fetch_wall_us,
             self.verify_wall_us,
+            self.recv_wall_us,
+            self.decode_wall_us,
+            self.store_wall_us,
             self.manifest_fetch_us,
             self.p50(),
             self.p95(),
@@ -669,18 +696,26 @@ async fn drive_pipeline(
         }
 
         let drain = lifetime + Duration::from_millis(500);
-        match tokio::time::timeout(drain, client.recv()).await {
+        let recv_t0 = Instant::now();
+        let recv_result = tokio::time::timeout(drain, client.recv()).await;
+        metrics.recv_wall_us += recv_t0.elapsed().as_micros() as u64;
+        match recv_result {
             Ok(Some(raw)) => {
-                let data = match Data::decode(raw) {
-                    Ok(d) => d,
-                    Err(_) => continue,
+                let decode_t0 = Instant::now();
+                let decode = Data::decode(raw).ok().map(|d| {
+                    let idx = d
+                        .name
+                        .components()
+                        .last()
+                        .and_then(|c| c.as_segment())
+                        .map(|s| s as usize);
+                    (d, idx)
+                });
+                metrics.decode_wall_us += decode_t0.elapsed().as_micros() as u64;
+                let (data, seg_idx) = match decode {
+                    Some(x) => x,
+                    None => continue,
                 };
-                let seg_idx = data
-                    .name
-                    .components()
-                    .last()
-                    .and_then(|c| c.as_segment())
-                    .map(|s| s as usize);
                 if let Some(idx) = seg_idx {
                     if idx >= start && idx < end {
                         let slot = idx - start;
@@ -702,6 +737,7 @@ async fn drive_pipeline(
                                 metrics.verify_samples_us.push(verify_us);
                                 metrics.verify_wall_us += verify_us;
                             }
+                            let store_t0 = Instant::now();
                             if params.verify_mode == VerifyMode::Ed25519 && params.batch_verify {
                                 batch_inputs.push((
                                     Bytes::copy_from_slice(data.signed_region()),
@@ -714,6 +750,7 @@ async fn drive_pipeline(
                             received += 1;
                             cc.on_data();
                             in_flight.retain(|_, (s, _)| *s != idx);
+                            metrics.store_wall_us += store_t0.elapsed().as_micros() as u64;
                             if params.verbose && received.is_multiple_of(64) {
                                 let _ = tx
                                     .send(
