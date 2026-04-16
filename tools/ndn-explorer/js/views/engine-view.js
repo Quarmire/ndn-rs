@@ -291,22 +291,78 @@ function buildSteps(scenario, engineData) {
       detail: 'TLV parse identifies packet as Data (type 0x06).',
     });
 
-    // Validation
+    // Validation — expanded into sub-steps for security chain walk
     if (scenario.securityProfile === 'disabled') {
       add({
         stage: 'validation',
         durationNs: 724,
-        detail: 'Security profile: Disabled — passthrough (724ns overhead).',
+        securityStep: 'disabled',
+        detail: 'Security profile: Disabled — passthrough (724ns overhead). Matches NFD default behavior.',
       });
     } else {
+      // Step 1: Enter validation stage
       add({
         stage: 'validation',
-        durationNs: 46300,
-        fieldsSet: ['verified'],
-        fieldValues: { verified: 'true → SafeData' },
-        securityStep: 'full_chain',
+        durationNs: 100,
+        securityStep: 'enter',
+        detail: 'Entering ValidationStage. SecurityProfile: Default — full chain validation enabled.',
+      });
+
+      // Step 2: Extract KeyLocator
+      add({
+        stage: 'validation',
+        durationNs: 50,
+        securityStep: 'extract_keylocator',
+        detail: `KeyLocator extracted: /sensor/node1/KEY/k1 (from SignatureInfo field).`,
+      });
+
+      // Step 3: Trust schema check
+      add({
+        stage: 'validation',
+        durationNs: 158,
+        securityStep: 'schema_check',
+        rustFeature: 'rwlock_read',
+        detail: scenario.schemaRule
+          ? `Schema check: ${scenario.schemaRule} — captures match. schema.read() acquires shared RwLock (~1µs).`
+          : 'Trust schema check: data name and key name satisfy a rule. schema.read() shared lock.',
+      });
+
+      // Step 4: CertCache lookup
+      add({
+        stage: 'validation',
+        durationNs: 80,
+        securityStep: scenario.certCached ? 'cert_cache_hit' : 'cert_cache_miss',
+        rustFeature: 'dashmap',
+        detail: scenario.certCached
+          ? 'CertCache hit — certificate found via DashMap<Arc<Name>, Certificate>. O(1) lookup.'
+          : 'CertCache miss — spawning CertFetcher Interest to fetch certificate over the network.',
+      });
+
+      // Step 5: Verify signature
+      add({
+        stage: 'validation',
+        durationNs: 44370,
+        securityStep: 'verify_signature',
         rustFeature: 'sign_sync',
-        detail: 'Full Ed25519 verification: 46.3µs — 20× the rest of the pipeline.',
+        detail: 'Ed25519 verification: 44.37µs (100B payload). Verifier::verify_sync() — CPU-only, no Box::pin.',
+      });
+
+      // Step 6: Chain walk — check if trust anchor
+      add({
+        stage: 'validation',
+        durationNs: 500,
+        securityStep: 'trust_anchor_check',
+        detail: 'Issuer /sensor/KEY/root is a trust anchor — final signature verification.',
+      });
+
+      // Step 7: SafeData construction
+      add({
+        stage: 'validation',
+        durationNs: 50,
+        fieldsSet: ['verified'],
+        fieldValues: { verified: 'true → SafeData ✓' },
+        securityStep: 'safe_data',
+        detail: 'Data promoted to SafeData { inner: Data, trust_path: CertChain([...]), verified_at }. pub(crate) fields — compiler-enforced proof of verification.',
       });
     }
 
@@ -424,6 +480,9 @@ export class EngineView {
 
     // PacketContext strip
     this._buildContextStrip();
+
+    // Security chain walk panel (inline, between context strip and data structures)
+    this._buildSecurityPanel();
 
     // Data structure panels
     this._buildDataStructures();
@@ -748,6 +807,144 @@ export class EngineView {
     }
   }
 
+  // ── Security Chain Walk Panel ──────────────────────────────────────────
+
+  _buildSecurityPanel() {
+    const sec = this.ed?.security;
+    const chainSteps = sec?.validator?.chain_walk || [];
+    const profiles = sec?.profiles || [];
+
+    const panel = document.createElement('div');
+    panel.className = 'ev-security-expand';
+    panel.id = 'ev-security-panel';
+
+    // Build the step-by-step chain walk visualization
+    const stepsHtml = [
+      { id: 'enter', icon: '🔒', label: 'Enter Validation', sub: 'SecurityProfile determines behavior' },
+      { id: 'extract_keylocator', icon: '🔑', label: 'Extract KeyLocator', sub: 'Identify signing key from SignatureInfo' },
+      { id: 'schema_check', icon: '📋', label: 'Trust Schema Check', sub: 'schema.read() — shared RwLock, ~1µs' },
+      { id: 'cert_cache_hit', icon: '✅', label: 'CertCache Hit', sub: 'DashMap<Arc<Name>, Certificate> — O(1)' },
+      { id: 'cert_cache_miss', icon: '❌', label: 'CertCache Miss', sub: 'Spawn CertFetcher Interest → Pending' },
+      { id: 'verify_signature', icon: '🔐', label: 'Verify Signature', sub: 'Ed25519: 44.37µs — sign_sync() avoids Box::pin' },
+      { id: 'trust_anchor_check', icon: '⚓', label: 'Trust Anchor Check', sub: 'Chain terminates at pre-configured root' },
+      { id: 'safe_data', icon: '✓', label: 'SafeData Constructed', sub: 'pub(crate) fields — compiler enforces verification proof' },
+      { id: 'disabled', icon: '⏭', label: 'Passthrough (Disabled)', sub: '724ns — no validation, matches NFD default' },
+    ];
+
+    panel.innerHTML = `
+      <div style="padding:0.5rem 0.75rem;">
+        <div style="display:flex;align-items:center;gap:0.5rem;margin-bottom:0.4rem;">
+          <strong style="color:#d29922;font-size:0.82rem;">Security Chain Walk</strong>
+          <span class="ev-rust-badge">Arc&lt;RwLock&lt;TrustSchema&gt;&gt;</span>
+          <span style="margin-left:auto;font-size:0.68rem;color:var(--text2);">
+            Profile: <span id="ev-sec-profile" style="color:#d29922;">—</span>
+          </span>
+        </div>
+
+        <div style="display:flex;gap:0.3rem;margin-bottom:0.5rem;" id="ev-sec-profiles">
+          ${profiles.map(p => `
+            <span class="ev-sec-profile-badge" data-profile="${p.name.toLowerCase()}"
+                  style="padding:0.1rem 0.4rem;border-radius:3px;font-size:0.64rem;border:1px solid var(--border);opacity:0.4;transition:all 0.3s;"
+                  title="${p.use_case}">
+              ${p.name} ${p.sig_verify ? '✓sig' : ''} ${p.chain_fetch === true ? '✓chain' : ''}
+            </span>
+          `).join('')}
+        </div>
+
+        <div id="ev-sec-steps">
+          ${stepsHtml.map(s => `
+            <div class="ev-sec-step" id="ev-sec-step-${s.id}">
+              <span class="ev-sec-icon">${s.icon}</span>
+              <div>
+                <div style="font-weight:600;">${s.label}</div>
+                <div style="font-size:0.62rem;color:var(--text2);">${s.sub}</div>
+              </div>
+            </div>
+          `).join('')}
+        </div>
+
+        <div id="ev-sec-schema-rule" style="display:none;margin-top:0.4rem;padding:0.3rem 0.5rem;border:1px solid rgba(210,153,34,0.2);border-radius:4px;font-family:monospace;font-size:0.7rem;color:#d29922;">
+        </div>
+
+        <div id="ev-sec-safedata" style="display:none;margin-top:0.4rem;">
+          <span class="ev-safedata-badge">🔒 SafeData ✓</span>
+          <span style="font-size:0.66rem;color:var(--text2);margin-left:0.5rem;">
+            trust_path: <code>CertChain</code> | verified_at: <code>now()</code> | fields: <code>pub(crate)</code>
+          </span>
+        </div>
+      </div>
+    `;
+    this.container.appendChild(panel);
+  }
+
+  _animateSecurityStep(stepId) {
+    const panel = document.getElementById('ev-security-panel');
+    if (!panel) return;
+
+    // Open the panel
+    panel.classList.add('open');
+
+    // Highlight the active profile
+    if (stepId === 'disabled') {
+      panel.querySelector('[data-profile="disabled"]')?.style.setProperty('opacity', '1');
+      panel.querySelector('[data-profile="disabled"]')?.style.setProperty('border-color', '#d29922');
+      const profEl = document.getElementById('ev-sec-profile');
+      if (profEl) profEl.textContent = 'Disabled';
+    } else if (stepId === 'enter') {
+      panel.querySelector('[data-profile="default"]')?.style.setProperty('opacity', '1');
+      panel.querySelector('[data-profile="default"]')?.style.setProperty('border-color', '#d29922');
+      const profEl = document.getElementById('ev-sec-profile');
+      if (profEl) profEl.textContent = 'Default';
+    }
+
+    // Activate the step
+    const stepEl = document.getElementById(`ev-sec-step-${stepId}`);
+    if (stepEl) {
+      stepEl.classList.add('active');
+      // Mark previous steps as passed
+      let prev = stepEl.previousElementSibling;
+      while (prev) {
+        if (prev.classList.contains('ev-sec-step')) prev.classList.add('passed');
+        prev = prev.previousElementSibling;
+      }
+    }
+
+    // Show schema rule for schema_check step
+    if (stepId === 'schema_check' && this.scenario.schemaRule) {
+      const ruleEl = document.getElementById('ev-sec-schema-rule');
+      if (ruleEl) {
+        ruleEl.style.display = 'block';
+        // Highlight captures in the rule
+        const rule = this.scenario.schemaRule;
+        const highlighted = rule.replace(/<(\w+)>/g, '<span style="color:#58a6ff;font-weight:700;">&lt;$1&gt;</span>');
+        ruleEl.innerHTML = `Rule: ${highlighted}`;
+      }
+    }
+
+    // Show SafeData badge for safe_data step
+    if (stepId === 'safe_data') {
+      const sdEl = document.getElementById('ev-sec-safedata');
+      if (sdEl) sdEl.style.display = 'block';
+    }
+  }
+
+  _resetSecurityPanel() {
+    const panel = document.getElementById('ev-security-panel');
+    if (!panel) return;
+    panel.classList.remove('open');
+    panel.querySelectorAll('.ev-sec-step').forEach(el => {
+      el.classList.remove('active', 'passed');
+    });
+    panel.querySelectorAll('.ev-sec-profile-badge').forEach(el => {
+      el.style.opacity = '0.4';
+      el.style.borderColor = 'var(--border)';
+    });
+    const ruleEl = document.getElementById('ev-sec-schema-rule');
+    if (ruleEl) ruleEl.style.display = 'none';
+    const sdEl = document.getElementById('ev-sec-safedata');
+    if (sdEl) sdEl.style.display = 'none';
+  }
+
   // ── Data Structure Panels ───────────────────────────────────────────────
 
   _buildDataStructures() {
@@ -980,6 +1177,9 @@ export class EngineView {
     // Reset FIB highlights
     this.container.querySelectorAll('.ev-fib-node').forEach(el => el.classList.remove('matched'));
     this.container.querySelectorAll('.ev-fib-lock').forEach(el => el.classList.remove('visible'));
+
+    // Reset security panel
+    this._resetSecurityPanel();
   }
 
   _onStep(idx, step, direction) {
@@ -1042,6 +1242,11 @@ export class EngineView {
     // ── FIB LPM animation ────────────────────────────────────────────
     if (step.tableOp?.table === 'fib' && step.tableOp.op === 'lpm') {
       this._animateFibLpm(step.tableOp.match);
+    }
+
+    // ── Security chain walk ──────────────────────────────────────────
+    if (step.securityStep) {
+      this._animateSecurityStep(step.securityStep);
     }
   }
 

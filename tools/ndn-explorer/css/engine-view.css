@@ -559,6 +559,11 @@
 .ev-sec-step .ev-sec-icon { font-size: 0.8rem; }
 .ev-sec-step code { font-size: 0.64rem; }
 
+.ev-sec-profile-badge {
+  cursor: help;
+  font-family: monospace;
+}
+
 .ev-safedata-badge {
   display: inline-flex;
   align-items: center;
