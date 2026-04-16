@@ -28,6 +28,7 @@
 # Operations
 
 - [CLI Tools](./guides/cli-tools.md)
+- [Dashboard](./guides/dashboard.md)
 - [Docker Deployment](./guides/docker-deployment.md)
 - [Performance Tuning](./guides/performance-tuning.md)
 - [Setting Up an NDNCERT CA](./guides/ndncert-setup.md)

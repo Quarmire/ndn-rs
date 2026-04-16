@@ -1,16 +1,28 @@
 # Security Model
 
-## The Problem: Bolted-On vs. Built-In Security
+> **TL;DR** — NDN signs Data at the producer; the signature travels with the data through caches and routers. ndn-rs validates via trust schemas (policy) + certificate chain walks (key discovery) + `SafeData` typestate (compiler enforcement). Unverified data cannot reach code that expects verified data — it won't compile.
 
-In IP networking, security is an afterthought. TLS secures the *channel* between two endpoints, but the data itself has no inherent protection. Once a TLS session terminates at a CDN or cache, the original security guarantee evaporates. You trust the server, not the data.
+## Validation Outcome Reference
 
-NDN flips this entirely. Every Data packet is signed at birth, and the signature travels with the data forever. A cached copy served by a router three hops away is exactly as trustworthy as one delivered directly by the producer -- the signature is over the content, not the channel. This is a profound architectural advantage, but it creates challenges that don't exist in IP security:
+| Input | Schema check | Crypto check | Chain walk | Result | Type |
+|-------|-------------|--------------|------------|--------|------|
+| Data, profile=`disabled` | skip | skip | skip | **Accept** | `Data` (no upgrade) |
+| Data, profile=`accept-signed` | skip | verify sig | skip | **Accept** or **Reject** | `SafeData` or drop |
+| Data, profile=`default`, cert cached | match patterns | verify sig | walk to anchor | **Accept** or **Reject** | `SafeData` or drop |
+| Data, profile=`default`, cert missing | match patterns | — | fetch cert via Interest | **Pending** | queued, retry on cert arrival |
+| Data, local face (SHM/Unix) | skip | skip | skip | **Accept** | `SafeData` via `from_local_trusted` |
 
-- **Key discovery is a networking problem.** A Data packet says "I was signed by key `/sensor/node1/KEY/k1`" -- but that key's certificate is itself an NDN Data packet that must be fetched over the network.
-- **Trust is not transitive by default.** Just because a signature is cryptographically valid doesn't mean you should trust it. Which keys are authorized to sign which data? The answer requires *policy*, not just cryptography.
-- **Verification has a cost.** Ed25519 verification is fast, but doing it for every packet on a high-throughput forwarder adds up. Local applications on the same machine shouldn't pay that cost.
+## Data Security vs. Channel Security
 
-ndn-rs addresses all three challenges through a layered design: trust schemas define policy, certificate chain validation handles key discovery, and the `SafeData` typestate makes the compiler enforce that unverified data never reaches code that expects verified data.
+In IP networking, TLS secures the *channel* — but once a session terminates at a CDN, the guarantee evaporates. NDN secures the *data itself*: every Data packet is signed at birth, and the signature travels with it forever. A cached copy three hops away is exactly as trustworthy as one from the producer.
+
+This creates three challenges:
+
+| Challenge | How ndn-rs handles it |
+|-----------|----------------------|
+| **Key discovery is a networking problem** — certificates are NDN Data packets fetched over the network | Certificate chain walk with `CertCache` + side-channel Interest fetching |
+| **Trust is not transitive** — valid signature ≠ authorized signer | Trust schemas: pattern-matching rules binding data names to key names |
+| **Verification cost** — Ed25519 on every packet adds up | Local trust escape hatch (`SafeData::from_local_trusted`), `OnceLock` lazy decode |
 
 ```mermaid
 flowchart LR
@@ -162,7 +174,7 @@ ndn-rs ships two signer implementations:
 |-----------|--------|---------------|----------|
 | Ed25519 | `Ed25519Signer` | 64 bytes | Default for all Data packets |
 | HMAC-SHA256 | `HmacSh256Signer` | 32 bytes | Pre-shared key authentication (~10x faster) |
-| BLAKE3 | `Blake3Signer` | 32 bytes | High-throughput; experimental type code 6 (not yet in NDN Packet Format spec) |
+| BLAKE3 | `Blake3Signer` | 32 bytes | High-throughput; SignatureType codes 6/7 registered on NDN TLV registry |
 
 Both implement `sign_sync` for a CPU-only fast path -- no async state machine overhead when the operation is pure computation.
 
@@ -411,7 +423,26 @@ The critical point is that the `SafeData` type is the same in both paths. Downst
 
 ## SafeData: The Compiler as Security Auditor
 
-All of the mechanisms above converge on a single type: `SafeData`. This is a Data packet whose signature has been verified -- either through the full certificate chain or via local trust.
+All validation paths converge on a single type. The typestate pattern means `SafeData` can only be constructed inside `ndn-security` — application code cannot forge it:
+
+```mermaid
+flowchart LR
+    D["Data\n(unverified)"]
+
+    D -->|"Validator::validate_chain()"| Chain["CertChain\nvalidation"]
+    D -->|"SafeData::from_local_trusted()"| Local["Local face\n(SO_PEERCRED)"]
+
+    Chain -->|"valid"| SD["SafeData ✓\npub(crate) fields"]
+    Chain -->|"invalid"| Drop["Drop"]
+    Local --> SD
+
+    SD -->|"CS insert"| CS["ContentStore\n(only caches verified)"]
+    SD -->|"fan-out"| Faces["Send to\nin-record faces"]
+    D -.->|"❌ won't compile"| CS
+
+    style SD fill:#2d7a3a,color:#fff
+    style Drop fill:#8c2d2d,color:#fff
+```
 
 ```rust
 pub struct SafeData {

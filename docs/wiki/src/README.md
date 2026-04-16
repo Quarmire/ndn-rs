@@ -1,26 +1,19 @@
 # ndn-rs Wiki
 
-> **Pre-release.** ndn-rs is working toward its first stable tag
-> (`v0.1.0`). The workspace version reads `0.1.0`, but no git tag or
-> GitHub Release has been published yet — this wiki documents `main`.
-> Pull `ghcr.io/quarmire/ndn-fwd:latest` or build from source to try the
-> current state. See the
-> [draft 0.1.0 release notes](./releases/v0-1-0.md) for the planned scope.
+**ndn-rs** is a Rust NDN forwarder stack that models Named Data Networking as composable data pipelines with trait-based polymorphism — embeddable as a library, scalable from Cortex-M to multi-core routers.
 
-**ndn-rs** is a Named Data Networking (NDN) forwarder stack written in Rust. It models NDN as composable data pipelines with trait-based polymorphism, departing from the class hierarchy approach of NFD/ndn-cxx.
+> **Pre-release.** The workspace reads `0.1.0` but no tag has been published yet — this wiki documents `main`. Pull `ghcr.io/quarmire/ndn-fwd:latest` or build from source. See the [draft release notes](./releases/v0-1-0.md) for planned scope.
 
-## What is NDN?
+NDN replaces host-addressed networking with **named data**: consumers request content by name (Interest), the network locates and returns it (Data), and every Data packet is cryptographically signed at birth — enabling in-network caching and security that travels with the data.
 
-Named Data Networking is a network architecture where communication is driven by **named data** rather than host addresses. Consumers request data by name (Interest packets), and the network locates and returns the data (Data packets). Every Data packet is cryptographically signed by its producer, enabling in-network caching and security that travels with the data.
-
-## Why ndn-rs?
-
-- **Library, not daemon** -- `ForwarderEngine` embeds in any Rust application
-- **Zero-copy pipeline** -- wire-format `Bytes` flow from recv to send without re-encoding
-- **Compile-time safety** -- packet ownership through the pipeline prevents use-after-short-circuit; `SafeData` typestate enforces verification
-- **Concurrent data structures** -- `DashMap` PIT, `RwLock`-per-node FIB trie, sharded CS
-- **Pluggable everything** -- faces, strategies, CS backends, and pipeline stages via traits
-- **Embedded to server** -- `no_std` TLV and packet crates run on Cortex-M; same code scales to multi-core routers
+| What ndn-rs brings | How |
+|---------------------|-----|
+| Library, not daemon | `ForwarderEngine` embeds in any Rust process |
+| Zero-copy pipeline | Wire-format `Bytes` flow from `recv()` to `send()` untouched |
+| Compile-time safety | Move semantics prevent use-after-short-circuit; `SafeData` typestate enforces verification |
+| Lock-free hot path | `DashMap` PIT, `RwLock`-per-node FIB trie, sharded CS |
+| Pluggable everything | Faces, strategies, CS backends, discovery, routing — all traits |
+| Embedded to server | `no_std` TLV/packet crates on Cortex-M; same code on multi-core routers |
 
 ## Navigating This Wiki
 
@@ -37,23 +30,76 @@ Named Data Networking is a network architecture where communication is driven by
 
 ## Crate Map
 
-```
-Binaries        ndn-fwd  ndn-tools  ndn-bench
-                     |          |          |
-Engine/App      ndn-engine  ndn-app  ndn-ipc  ndn-config  ndn-discovery
-                     |          |        |
-Pipeline        ndn-engine  ndn-strategy  ndn-security
-                     |             |
-Faces           ndn-faces  ndn-faces  ndn-faces  ndn-faces
-                     |              |
-Foundation      ndn-store  ndn-transport  ndn-packet  ndn-tlv
-                                                         |
-Embedded                                           ndn-embedded
-
-Research        ndn-sim  ndn-compute  ndn-sync  ndn-research  ndn-strategy-wasm
-```
-
 Dependencies flow strictly downward. `ndn-tlv` and `ndn-packet` compile `no_std`.
+
+```mermaid
+%%{init: {"layout": "elk"}}%%
+flowchart TD
+    subgraph Binaries
+        fwd["ndn-fwd"]
+        tools["ndn-tools"]
+        bench["ndn-bench"]
+    end
+
+    subgraph Engine & App
+        engine["ndn-engine"]
+        app["ndn-app"]
+        ipc["ndn-ipc"]
+        config["ndn-config"]
+        discovery["ndn-discovery"]
+    end
+
+    subgraph Pipeline & Security
+        strategy["ndn-strategy"]
+        security["ndn-security"]
+    end
+
+    subgraph Faces
+        faces["ndn-faces\n(UDP, TCP, SHM, Ethernet, ...)"]
+    end
+
+    subgraph Foundation
+        store["ndn-store"]
+        transport["ndn-transport"]
+        packet["ndn-packet\n(no_std)"]
+        tlv["ndn-tlv\n(no_std)"]
+    end
+
+    fwd --> engine
+    fwd --> config
+    tools --> app
+    bench --> app
+    engine --> strategy
+    engine --> security
+    engine --> store
+    engine --> faces
+    app --> ipc
+    ipc --> engine
+    discovery --> engine
+    strategy --> transport
+    faces --> transport
+    store --> packet
+    transport --> packet
+    packet --> tlv
+
+    embedded["ndn-embedded\n(no_std)"] -.-> tlv
+
+    subgraph Research["Extensions"]
+        sim["ndn-sim"]
+        compute["ndn-compute"]
+        sync["ndn-sync"]
+        wasm_strat["ndn-strategy-wasm"]
+    end
+
+    sim -.-> engine
+    compute -.-> engine
+    sync -.-> app
+    wasm_strat -.-> strategy
+
+    style tlv fill:#79c0ff,color:#000
+    style packet fill:#79c0ff,color:#000
+    style embedded fill:#7ee787,color:#000
+```
 
 ```d3graph
 {

@@ -1,12 +1,22 @@
 # PIT, FIB, and Content Store
 
-Three data structures sit at the heart of every NDN forwarder. Together they answer three questions: "Do I already have this data?" (CS), "Is someone already looking for it?" (PIT), and "Where should I look?" (FIB).
+Three data structures answer three questions for every packet: **CS** — "Do I already have this data?", **PIT** — "Is someone already looking for it?", **FIB** — "Where should I look?"
 
-In ndn-rs, these three structures are not just containers -- they are active participants in every packet's lifecycle, tightly cooperating to move Interests upstream and Data downstream. Understanding how they work individually is important, but understanding how they work *together* is what makes the forwarding plane click.
+## Quick Reference
+
+| | Content Store | Pending Interest Table | Forwarding Information Base |
+|---|---|---|---|
+| **Purpose** | Cache recently seen Data | Track outstanding Interests | Map name prefixes → nexthop faces |
+| **Implementation** | Trait: `LruCs`, `ShardedCs`, `PersistentCs` | `DashMap<PitToken, PitEntry>` | `NameTrie<Arc<FibEntry>>` |
+| **Key** | Name (exact) | Name + selector hash | Name prefix (longest match) |
+| **Concurrency** | Backend-dependent (sharding available) | Sharded `RwLock` (DashMap) | `RwLock` per trie node (hand-over-hand) |
+| **Eviction** | LRU by byte count, or persistent | Timeout (timing wheel, O(1)) | Manual (management API) |
+| **Hot-path cost** | O(1) LRU lookup, zero-copy hit | O(1) insert/lookup | O(k) where k = name components |
+| **Consulted by** | Interest path (before PIT) | Interest path (after CS miss) + Data path | Interest path (after PIT) |
 
 ## The Cooperation
 
-Before diving into each structure's internals, let's see how they collaborate. When an Interest arrives, the forwarder consults all three in sequence. When Data returns, the PIT and CS work in concert to cache and deliver it:
+When an Interest arrives, the forwarder consults all three in sequence. When Data returns, the PIT and CS work in concert to cache and deliver:
 
 ```mermaid
 flowchart LR
@@ -27,9 +37,7 @@ flowchart LR
     OUT -.->|"Data returns"| D
 ```
 
-An Interest for `/a/b/c` first asks the CS: "Do you have it?" On a miss, the PIT records who is asking and checks for loops. Then the FIB answers: "Try face 3." When Data comes back on face 3, the PIT reveals who to deliver it to, the CS caches a copy for next time, and the PIT entry is consumed. Three structures, one fluid motion.
-
-Let's now examine each structure in depth, keeping in mind how each one's design decisions ripple through to the others.
+Interest hits CS → miss → PIT records the requester → FIB finds the route → Interest goes upstream. Data returns → PIT reveals the waiting consumers → CS caches → Data fans out. Three structures, one fluid motion.
 
 ## Content Store: "Do I Already Have This?"
 

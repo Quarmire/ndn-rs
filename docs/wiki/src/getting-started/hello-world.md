@@ -1,50 +1,21 @@
 # Hello World
 
-This tutorial shows how to run a complete Interest/Data exchange using the ndn-rs library in a single Rust program. No external router is needed -- everything runs in-process via `InProcFace` channel pairs.
-
-## How it works
-
-In NDN, communication follows a pull-based model: a **consumer** sends an Interest packet naming the data it wants, and a **producer** responds with a matching Data packet. The forwarding engine sits between them, matching Interests to Data via the PIT (Pending Interest Table) and FIB (Forwarding Information Base).
-
-> **💡 Key insight:** No external router is needed for this example. The `InProcFace` creates an in-process channel pair -- one side for the application, one side for the engine. Packets flow through the full forwarding pipeline (PIT, FIB, CS, strategy) but never touch the network. This is the same mechanism used for production in-process applications.
+A complete Interest/Data exchange in a single Rust program — no external router needed. `InProcFace` channel pairs connect consumer and producer through the full forwarding pipeline (PIT, FIB, CS, strategy) without touching the network.
 
 ```mermaid
 sequenceDiagram
     participant C as Consumer
-    participant E as Engine (PIT + FIB)
+    participant E as ForwarderEngine
     participant P as Producer
 
+    Note over C,P: InProcFace channel pairs — same mechanism used in production
+
     C->>E: Interest /ndn/hello
-    Note over E: PIT entry created<br/>FIB lookup -> Producer face
+    Note over E: PIT entry created<br/>FIB → Producer face
     E->>P: Interest /ndn/hello
     P->>E: Data /ndn/hello "hello, NDN!"
-    Note over E: PIT entry satisfied<br/>Forward Data to Consumer face
+    Note over E: PIT satisfied<br/>CS caches Data
     E->>C: Data /ndn/hello "hello, NDN!"
-```
-
-```mermaid
-graph LR
-    subgraph "Application Process"
-        APP["Application code<br/>(Consumer / Producer)"]
-    end
-
-    subgraph "InProcFace Channel Pair"
-        direction TB
-        TX1["app_handle.send()"] -->|"mpsc"| RX1["engine face.recv()"]
-        TX2["engine face.send()"] -->|"mpsc"| RX2["app_handle.recv()"]
-    end
-
-    subgraph "ForwarderEngine"
-        PIPE["Pipeline<br/>(FIB + PIT + CS + Strategy)"]
-    end
-
-    APP -->|"Interest"| TX1
-    RX1 -->|"Interest"| PIPE
-    PIPE -->|"Data"| TX2
-    RX2 -->|"Data"| APP
-
-    style APP fill:#e8f4fd,stroke:#2196F3
-    style PIPE fill:#fff3e0,stroke:#FF9800
 ```
 
 ## Dependencies
