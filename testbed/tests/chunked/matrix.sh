@@ -10,6 +10,16 @@
 #
 # ── What the first run of this matrix actually measured ────────────────────
 #
+# NOTE: the first run used `--no-shm` on both tools, pinning the test
+# to the Unix-socket transport. ndn-iperf later showed the forwarder
+# hitting ~2.9 Gbps on Unix/Unix and ~30 Gbps on SHM/SHM. The matrix
+# now defaults to SHM on both sides (`--no-shm` dropped) and grows a
+# transport sweep (see sweep 7) that repeats key cells at all four
+# (put-transport × peek-transport) combinations to reproduce the iperf
+# shape and expose where put/peek overhead lives. The numbered
+# findings below are from the original Unix/Unix run and remain the
+# reference for the ~2.3 Gbps ceiling on that transport.
+#
 # Run on 16 MB / 4 KB segments / pipeline=64 / AIMD, Apple Silicon,
 # all 31 cells passing, throughput ~2.3 Gbps steady state:
 #
@@ -99,10 +109,14 @@
 #   - consumer no-assemble: off, on
 #
 # Each cell emits a TSV row:
-#   file_mb  seg_kb  sign_mode  hash  pipeline  cc  pre_sign  verify_mode  batch  no_asm  result  bytes  fetch_us  verify_us  manifest_us  throughput_mbps
+#   file_mb  seg_kb  sign_mode  hash  pipeline  cc  pre_sign  verify_mode  batch  no_asm  put_tx  peek_tx  result  bytes  fetch_us  verify_us  manifest_us  throughput_mbps
 #
 # Baseline (held constant unless the test sweeps it):
-#   file=16 MB, seg=4 KB, pipeline=64, cc=aimd, pre_sign=on
+#   file=16 MB, seg=4 KB, pipeline=64, cc=aimd, pre_sign=on, put_tx=shm, peek_tx=shm
+#
+# Transport is controlled per-side via env vars PUT_TRANSPORT and
+# PEEK_TRANSPORT (values: "shm" or "unix"). Sweep 7 sets them per
+# cell to reproduce the iperf transport-combo shape.
 
 set -euo pipefail
 
@@ -116,7 +130,7 @@ trap 'rm -rf "${TMP_DIR}"' EXIT
 # Preserve the header only on a fresh run. Append on subsequent runs
 # so multiple matrix invocations accumulate into one spreadsheet.
 if [ ! -f "${RESULTS}" ]; then
-  printf 'file_mb\tseg_kb\tsign\thash\tpipeline\tcc\tpresign\tverify\tbatch\tno_asm\tresult\tbytes\tfetch_us\tverify_us\tmanifest_us\tthroughput_mbps\tlabel\n' \
+  printf 'file_mb\tseg_kb\tsign\thash\tpipeline\tcc\tpresign\tverify\tbatch\tno_asm\tput_tx\tpeek_tx\tresult\tbytes\tfetch_us\tverify_us\tmanifest_us\tthroughput_mbps\tlabel\n' \
     > "${RESULTS}"
 fi
 
@@ -143,6 +157,9 @@ run_cell() {
   local pipeline="$6" cc="$7" pre_sign="$8" verify="$9"
   local batch="${10}" no_asm="${11}"
 
+  local put_tx="${PUT_TRANSPORT:-shm}"
+  local peek_tx="${PEEK_TRANSPORT:-shm}"
+
   local payload
   payload=$(payload_for "${file_mb}")
   local chunk=$((seg_kb * 1024))
@@ -153,6 +170,9 @@ run_cell() {
   if [ "${pre_sign}" = "on" ]; then
     put_extra="--pre-sign"
   fi
+  if [ "${put_tx}" = "unix" ]; then
+    put_extra+=" --no-shm"
+  fi
 
   local peek_extra=""
   if [ "${batch}" = "on" ]; then
@@ -161,10 +181,13 @@ run_cell() {
   if [ "${no_asm}" = "on" ]; then
     peek_extra+=" --no-assemble"
   fi
+  if [ "${peek_tx}" = "unix" ]; then
+    peek_extra+=" --no-shm"
+  fi
 
   # shellcheck disable=SC2086
   ndn-put "${prefix}" "${payload}" \
-    --face-socket "${FWD_SOCK}" --no-shm \
+    --face-socket "${FWD_SOCK}" \
     --sign "${sign}" --hash "${hash}" \
     --chunk-size "${chunk}" \
     --freshness 5000 --timeout 60 --quiet \
@@ -182,7 +205,7 @@ run_cell() {
   local log="${TMP_DIR}/${label}.peek.log"
   # shellcheck disable=SC2086
   if ndn-peek "${prefix}" \
-      --face-socket "${FWD_SOCK}" --no-shm \
+      --face-socket "${FWD_SOCK}" \
       --pipeline "${pipeline}" \
       --cc "${cc}" \
       --verify "${verify}" \
@@ -207,16 +230,18 @@ run_cell() {
     else
       throughput_mbps=0
     fi
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
       "${file_mb}" "${seg_kb}" "${sign}" "${hash}" "${pipeline}" "${cc}" \
-      "${pre_sign}" "${verify}" "${batch}" "${no_asm}" "${result}" \
+      "${pre_sign}" "${verify}" "${batch}" "${no_asm}" \
+      "${put_tx}" "${peek_tx}" "${result}" \
       "${bytes:-0}" "${fetch_us:-0}" "${verify_us:-0}" "${manifest_us:-0}" \
       "${throughput_mbps}" "${label}" >> "${RESULTS}"
-    echo "[${label}] PASS  ${throughput_mbps} Mbps  (bytes=${bytes:-?}  fetch=${fetch_us:-?}µs  verify=${verify_us:-?}µs)"
+    echo "[${label}] PASS  ${throughput_mbps} Mbps  (${put_tx}→${peek_tx}  bytes=${bytes:-?}  fetch=${fetch_us:-?}µs  verify=${verify_us:-?}µs)"
   else
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t-\t-\t-\t-\t-\t%s\n' \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t-\t-\t-\t-\t-\t%s\n' \
       "${file_mb}" "${seg_kb}" "${sign}" "${hash}" "${pipeline}" "${cc}" \
-      "${pre_sign}" "${verify}" "${batch}" "${no_asm}" "FAIL" "${label}" \
+      "${pre_sign}" "${verify}" "${batch}" "${no_asm}" \
+      "${put_tx}" "${peek_tx}" "FAIL" "${label}" \
       >> "${RESULTS}"
     echo "[${label}] FAIL"
     tail -5 "${log}" >&2 || true
@@ -294,17 +319,39 @@ run_cell "rayon-256k-merkle-blake" 64 256 merkle blake3 64 aimd on merkle off of
 run_cell "rayon-1024k-merkle-sha"  64 1024 merkle sha256 64 aimd on merkle off off
 run_cell "rayon-1024k-merkle-blake" 64 1024 merkle blake3 64 aimd on merkle off off
 
+# ── Sweep 7: transport combinations (reproduce iperf shape) ────────────────
+# Default matrix runs all cells at SHM/SHM when the forwarder supports
+# it. This sweep flips producer and consumer transports independently
+# over a small set of cells to expose where put/peek overhead lives.
+# Key cells chosen to span crypto cost: digest (cheapest), merkle-sha,
+# merkle-blake.
+echo "── sweep 7: transport sweep — put_tx × peek_tx × {digest,merkle-sha,merkle-blake} ──"
+for combo in "shm:shm" "shm:unix" "unix:shm" "unix:unix"; do
+  p_tx="${combo%:*}"
+  c_tx="${combo#*:}"
+  export PUT_TRANSPORT="${p_tx}"
+  export PEEK_TRANSPORT="${c_tx}"
+  tag="${p_tx}-${c_tx}"
+  run_cell "tx-${tag}-digest"       16 4 digest sha256 64 aimd on digest-sha256 off off
+  run_cell "tx-${tag}-merkle-sha"   16 4 merkle sha256 64 aimd on merkle        off off
+  run_cell "tx-${tag}-merkle-blake" 16 4 merkle blake3 64 aimd on merkle        off off
+done
+unset PUT_TRANSPORT PEEK_TRANSPORT
+
 # ── Summary ────────────────────────────────────────────────────────────────
-PASS_COUNT=$(awk -F'\t' 'NR>1 && $11=="PASS"' "${RESULTS}" | wc -l | tr -d ' ')
-FAIL_COUNT=$(awk -F'\t' 'NR>1 && $11=="FAIL"' "${RESULTS}" | wc -l | tr -d ' ')
+# Column indices after the put_tx/peek_tx additions:
+#   $13 result  $14 bytes  $15 fetch_us  $16 verify_us  $17 manifest_us
+#   $18 throughput_mbps  $19 label
+PASS_COUNT=$(awk -F'\t' 'NR>1 && $13=="PASS"' "${RESULTS}" | wc -l | tr -d ' ')
+FAIL_COUNT=$(awk -F'\t' 'NR>1 && $13=="FAIL"' "${RESULTS}" | wc -l | tr -d ' ')
 echo
 echo "matrix: ${PASS_COUNT} passed, ${FAIL_COUNT} failed"
 echo "results → ${RESULTS}"
 echo
 echo "quick summary (top 10 by throughput, passing only):"
-awk -F'\t' 'NR==1 || $11=="PASS"' "${RESULTS}" \
-  | sort -t$'\t' -k16 -rn | head -11 \
-  | awk -F'\t' 'BEGIN { printf "  %-28s %8s %6s %8s %s\n", "label", "Mbps", "seg", "cc", "pipe/psign/noasm" }
-                NR>1 { printf "  %-28s %8s %6s %8s %s/%s/%s\n", $17, $16, $2"KB", $6, $5, $7, $10 }'
+awk -F'\t' 'NR==1 || $13=="PASS"' "${RESULTS}" \
+  | sort -t$'\t' -k18 -rn | head -11 \
+  | awk -F'\t' 'BEGIN { printf "  %-32s %8s %6s %8s %-10s %s\n", "label", "Mbps", "seg", "cc", "tx", "pipe/psign/noasm" }
+                NR>1 { printf "  %-32s %8s %6s %8s %-10s %s/%s/%s\n", $19, $18, $2"KB", $6, $11"→"$12, $5, $7, $10 }'
 
 [ "${FAIL_COUNT}" -eq 0 ]
