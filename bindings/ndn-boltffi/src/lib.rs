@@ -74,12 +74,14 @@
 //! print("got: \(String(bytes: data.content, encoding: .utf8)!)")
 //! ```
 
+pub mod codec;
 pub mod consumer;
 pub mod engine;
 pub mod producer;
 pub mod subscriber;
 pub mod types;
 
+pub use codec::NdnCodec;
 pub use consumer::NdnConsumer;
 pub use engine::NdnEngine;
 pub use producer::{NdnInterestHandler, NdnProducer};

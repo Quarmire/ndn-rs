@@ -1,0 +1,13 @@
+[package]
+name = "ndn-ble-test-jni"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+ndn-packet = { path = "../../../../crates/foundation/ndn-packet", features = ["std"] }
+bytes = { version = "1", features = ["std"] }
+jni = "0.21"

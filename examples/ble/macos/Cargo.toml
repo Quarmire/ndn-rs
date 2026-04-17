@@ -1,0 +1,23 @@
+[package]
+name = "example-ble-macos"
+version = "0.0.0"
+edition.workspace = true
+publish = false
+
+[[bin]]
+name = "ble-macos"
+path = "src/main.rs"
+
+[dependencies]
+ndn-packet    = { workspace = true, features = ["std"] }
+ndn-transport = { workspace = true }
+ndn-faces     = { workspace = true, features = ["bluetooth"] }
+ndn-engine    = { workspace = true }
+ndn-app       = { workspace = true }
+ndn-security  = { workspace = true }
+tokio         = { workspace = true, features = ["rt-multi-thread", "macros", "signal"] }
+tokio-util    = { workspace = true, features = ["rt"] }
+tracing       = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow        = { workspace = true }
+bytes         = { workspace = true, features = ["std"] }

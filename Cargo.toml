@@ -53,6 +53,7 @@ default-members = [
     "examples/strategy-composed",
     "examples/cross-layer-enricher",
     "examples/discovery-lan",
+    "examples/ble/macos",
 ]
 
 members = [
@@ -105,6 +106,7 @@ members = [
     "examples/cross-layer-enricher",
     "examples/wasm-strategy", # requires wasm32 target
     "examples/discovery-lan",
+    "examples/ble/macos",
 ]
 
 [workspace.package]

@@ -1,0 +1,30 @@
+[package]
+name = "ndn-ble-esp32c3"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# This is a standalone project — NOT part of the ndn-rs workspace.
+# esp-hal and esp-wifi have incompatible dep trees with the main workspace.
+
+[dependencies]
+ndn-embedded = { path = "../../../crates/platform/ndn-embedded", features = ["ble", "alloc"] }
+ndn-tlv      = { path = "../../../crates/foundation/ndn-tlv", default-features = false }
+ndn-packet   = { path = "../../../crates/foundation/ndn-packet", default-features = false }
+
+esp-hal      = { version = "1.0.0-beta.0", features = ["esp32c3"] }
+esp-wifi     = { version = "0.14.0", features = ["esp32c3", "ble"] }
+esp-alloc    = "0.7"
+esp-println  = { version = "0.13", features = ["esp32c3", "log"] }
+esp-backtrace = { version = "0.15", features = ["esp32c3", "panic-handler", "println"] }
+
+heapless = "0.8"
+nb       = "1"
+log      = "0.4"
+
+[profile.dev]
+opt-level = "s"    # Optimize for size even in debug (flash space)
+
+[profile.release]
+opt-level = "s"
+lto = true

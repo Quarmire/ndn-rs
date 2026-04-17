@@ -2338,6 +2338,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "example-ble-macos"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "ndn-app",
+ "ndn-engine",
+ "ndn-faces",
+ "ndn-packet",
+ "ndn-security",
+ "ndn-transport",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "example-cross-layer-enricher"
 version = "0.0.0"
 dependencies = [

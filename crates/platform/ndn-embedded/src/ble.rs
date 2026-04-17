@@ -46,9 +46,11 @@ use crate::face::{Face, FaceId};
 /// GATT service UUID for the NDN BLE transport (NDNts interop).
 pub const BLE_SERVICE_UUID: &str = "099577e3-0788-412a-8824-395084d97391";
 /// TX characteristic UUID — forwarder notifies client of outgoing NDN packets.
-pub const BLE_TX_CHAR_UUID: &str = "cc5abb89-a541-46d8-a351-2d95a8a1a374";
+/// This is the SC (server → client) characteristic in NDNts terminology.
+pub const BLE_TX_CHAR_UUID: &str = "972f9527-0d83-4261-b95d-b1b2fc73bde4";
 /// RX characteristic UUID — client writes incoming NDN packets to the forwarder.
-pub const BLE_RX_CHAR_UUID: &str = "972f9527-0d83-4261-b95d-b7b2a9e5007b";
+/// This is the CS (client → server) characteristic in NDNts terminology.
+pub const BLE_RX_CHAR_UUID: &str = "cc5abb89-a541-46d8-a351-2f95a6a81f49";
 
 // ── BlePlatform ───────────────────────────────────────────────────────────────
 
@@ -435,5 +437,18 @@ mod tests {
         }
         let n = result.expect("should have received complete packet");
         assert_eq!(&buf[..n], &pkt[..]);
+    }
+
+    // ── UUID interop guard ────────────────────────────────────────────────
+
+    /// Regression guard: embedded UUIDs must match the desktop `ndn-faces`
+    /// values, which are verified against NDNts and esp8266ndn upstream.
+    #[test]
+    fn gatt_uuids_match_ndnts_and_desktop() {
+        assert_eq!(BLE_SERVICE_UUID, "099577e3-0788-412a-8824-395084d97391");
+        // TX = SC (server→client, Notify) — matches ndn-faces BLE_SC_CHAR_UUID
+        assert_eq!(BLE_TX_CHAR_UUID, "972f9527-0d83-4261-b95d-b1b2fc73bde4");
+        // RX = CS (client→server, Write Without Response) — matches ndn-faces BLE_CS_CHAR_UUID
+        assert_eq!(BLE_RX_CHAR_UUID, "cc5abb89-a541-46d8-a351-2f95a6a81f49");
     }
 }
