@@ -2,11 +2,11 @@
 
 ## NDN as Composable Data Pipelines
 
-The central insight behind ndn-rs: Rust's ownership model and trait system map naturally onto NDN's packet processing as **composable data pipelines with trait-based polymorphism**. This stands in deliberate contrast to the class hierarchies used by NFD/ndn-cxx (C++) and the convention-based approach of ndnd (Go).
+ndn-rs models NDN packet processing as **composable data pipelines with trait-based polymorphism**.
 
-In ndn-rs, a packet enters the system as a `Bytes` buffer from a face, flows through a sequence of `PipelineStage` trait objects by value, and exits as a `Bytes` buffer sent to one or more faces. Each stage receives ownership of the `PacketContext`, processes it, and either passes it forward or consumes it (short-circuiting). The compiler enforces that no stage can accidentally use a packet after handing it off -- a guarantee that NFD achieves only through runtime checks and careful documentation.
+A packet enters the system as a `Bytes` buffer from a face, flows through a sequence of `PipelineStage` trait objects by value, and exits as a `Bytes` buffer sent to one or more faces. Each stage receives ownership of the `PacketContext`, processes it, and either passes it forward or consumes it (short-circuiting). The compiler enforces that no stage can use a packet after handing it off.
 
-> **💡 Key insight:** The central design principle is **trait composition over class hierarchy**. NFD and ndn-cxx model NDN with deep inheritance trees (Strategy, Face, Transport, LinkService). ndn-rs replaces each hierarchy with a flat trait and composes behaviors by wrapping types (e.g., `StrategyFilter` wraps a `Strategy`, `ShardedCs` wraps a `ContentStore`). This makes the extension points orthogonal -- you can combine any strategy with any filter without writing a new subclass.
+Extension points are flat traits composed by wrapping types (e.g., `StrategyFilter` wraps a `Strategy`, `ShardedCs` wraps a `ContentStore`). This makes the extension points orthogonal -- any strategy can be combined with any filter.
 
 ```mermaid
 flowchart LR
@@ -35,7 +35,7 @@ ndn-rs is a library. There is no daemon/client split. The forwarding engine (`nd
 
 This means the same codebase runs as a full router, an embedded forwarder on a microcontroller (via `ndn-embedded` with `no_std`), or an in-process forwarder inside an application. No rewrite required.
 
-> **⚠️ Important:** ndn-rs is a **library, not a daemon**. There is no daemon/client split. Applications embed the forwarding engine directly and communicate via in-process `InProcFace` channels -- no IPC serialization, no Unix socket round-trips. The standalone `ndn-fwd` binary is just one consumer of this library, not a privileged component. This is a fundamental departure from NFD's architecture.
+> **Note:** Applications can embed the forwarding engine directly and communicate via in-process `InProcFace` channels. The standalone `ndn-fwd` binary is one consumer of this library, not a privileged component.
 
 ## Key Design Decisions
 
@@ -47,7 +47,7 @@ This means the same codebase runs as a full router, an embedded forwarder on a m
 | **`NameTrie` FIB** | `HashMap<Component, Arc<RwLock<TrieNode>>>` per level | Concurrent longest-prefix match without holding parent locks. Each trie level is independently locked, so a lookup on `/a/b/c` does not block a concurrent lookup on `/x/y`. |
 | **Wire-format `Bytes` in CS** | Content Store stores the original wire-format `Bytes` | A cache hit sends the stored bytes directly to the outgoing face with zero re-encoding. `Bytes` is reference-counted, so multiple cache hits share the same allocation. |
 | **`SmallVec<[ForwardingAction; 2]>`** | Strategy returns a small-vec of forwarding actions | Most strategies produce 1-2 actions (forward + optional probe). SmallVec keeps them on the stack, avoiding a heap allocation on every Interest. |
-| **`SafeData` typestate** | Separate `Data` and `SafeData` types | The compiler enforces that only cryptographically verified data is inserted into the Content Store or forwarded. You cannot accidentally cache unverified data -- it is a type error. |
+| **`SafeData` typestate** | Separate `Data` and `SafeData` types | The validator produces `SafeData` to distinguish verified from unverified data at the type level. Not yet used to gate CS insertion or forwarding in the pipeline. |
 | **`u64` nanosecond timestamps** | `arrival`, `last_updated`, and all timing fields use `u64` ns since Unix epoch | Nanosecond resolution is needed for EWMA RTT measurements and sub-millisecond PIT expiry. A single `u64` avoids the overhead and platform variance of `Instant` or `SystemTime` in hot paths. |
 | **`OnceLock` lazy decode** | Packet fields decoded on demand via `OnceLock<T>` | A Content Store hit may short-circuit before the nonce or lifetime fields are ever accessed. Lazy decode avoids wasted work on the fast path. |
 | **`SmallVec<[NameComponent; 8]>` for names** | Name components stored in a `SmallVec` | Typical NDN names have 4-8 components. SmallVec keeps them on the stack, eliminating a heap allocation for the common case. |
@@ -69,27 +69,14 @@ This trait-based approach means new transports, strategies, and cache backends c
 
 ```mermaid
 graph TB
-    subgraph "NFD / ndn-cxx: Class Hierarchy"
-        direction TB
-        SBase["class Strategy (virtual)"]
-        SBase --> BR["class BestRouteStrategy"]
-        SBase --> MC["class MulticastStrategy"]
-        SBase --> ASF["class AsfStrategy"]
-        SBase -.->|"Extend via<br/>virtual override"| NEW1["class MyStrategy"]
-    end
+    STrait["trait Strategy"]
+    STrait -->|"impl"| BR2["BestRouteStrategy"]
+    STrait -->|"impl"| MC2["MulticastStrategy"]
+    STrait -->|"impl"| ASF2["AsfStrategy"]
+    STrait -.->|"impl for any type"| NEW2["MyStrategy"]
+    FTrait["trait StrategyFilter"] -->|"compose"| BR2
+    FTrait -->|"compose"| MC2
 
-    subgraph "ndn-rs: Trait Composition"
-        direction TB
-        STrait["trait Strategy"]
-        STrait -->|"impl"| BR2["BestRouteStrategy"]
-        STrait -->|"impl"| MC2["MulticastStrategy"]
-        STrait -->|"impl"| ASF2["AsfStrategy"]
-        STrait -.->|"impl for any type"| NEW2["MyStrategy"]
-        FTrait["trait Filter"] -->|"compose"| BR2
-        FTrait -->|"compose"| MC2
-    end
-
-    style SBase fill:#ffcdd2,stroke:#F44336
     style STrait fill:#c8e6c9,stroke:#4CAF50
     style FTrait fill:#c8e6c9,stroke:#4CAF50
 ```

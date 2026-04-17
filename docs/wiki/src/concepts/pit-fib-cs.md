@@ -93,7 +93,7 @@ flowchart LR
 
 The CS stores Data as the original wire-format `Bytes`, not as decoded Rust structs. On a cache hit, those bytes are handed directly to `face.send()` with zero allocation and zero copying -- `Bytes` uses reference-counted shared memory internally.
 
-> **💡 Key insight:** Storing wire-format bytes instead of decoded structs is a deliberate tradeoff. It means the CS cannot patch fields (e.g., decrementing a hop count) on cache hits. But NDN Data packets are immutable and cryptographically signed -- modifying them would invalidate the signature anyway. So wire-format storage is both the fastest and the most correct approach.
+> **Note:** Storing wire-format bytes instead of decoded structs means the CS cannot patch fields (e.g., decrementing a hop count) on cache hits. NDN Data packets are immutable and cryptographically signed -- modifying them would invalidate the signature anyway -- so wire-format storage avoids unnecessary re-encoding.
 
 This design choice connects directly to the PIT: because the CS returns raw bytes, a cache hit bypasses not just the PIT and FIB, but also any decoding that would be needed to re-encode the Data for transmission. The pipeline stage that performs CsLookup simply returns `Action::Send` with the cached bytes -- no further stages execute.
 

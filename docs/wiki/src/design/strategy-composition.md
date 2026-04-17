@@ -1,6 +1,6 @@
 # Strategy Composition
 
-The strategy system is how ndn-rs decides where to forward each Interest. Unlike NFD's class hierarchy, ndn-rs strategies are composable trait objects that can be swapped at runtime -- including hot-loading WASM modules without restarting the router.
+The strategy system is how ndn-rs decides where to forward each Interest. Strategies implement a trait and can be swapped at runtime per name prefix.
 
 ## The Strategy Trait
 

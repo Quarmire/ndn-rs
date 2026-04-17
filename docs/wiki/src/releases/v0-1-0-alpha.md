@@ -6,7 +6,7 @@
 
 This is the first tagged release of ndn-rs: a Named Data Networking forwarder stack written in Rust, built from scratch to prove that NDN's architecture maps cleanly onto Rust's ownership model and async runtime.
 
-What started as "can Rust model NDN's pipeline better than C++ can?" turned into a complete forwarder stack, wire-format library, embedded forwarder, browser simulation, management layer, and discovery stack. This release tags all of that as a coherent baseline.
+What started as an exploration of NDN's pipeline in Rust turned into a complete forwarder stack, wire-format library, embedded forwarder, browser simulation, management layer, and discovery stack. This release tags all of that as a coherent baseline.
 
 Everything in this release should be considered unstable. APIs will break. The `0.1.0` designation means "the stack works and interoperates with NFD," not "the API is stable for downstream crates."
 

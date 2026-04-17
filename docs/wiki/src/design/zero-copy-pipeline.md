@@ -91,13 +91,13 @@ CsInsert: store raw_bytes.clone() keyed by name
 CsLookup: if hit, return stored Bytes -- this IS the wire packet, ready to send
 ```
 
-This design means a cache hit is nearly free:
+A cache hit involves:
 
 1. Look up the name in the CS (hash map lookup).
 2. Clone the stored `Bytes` (atomic reference count increment).
 3. Send the cloned `Bytes` to the outgoing face.
 
-There is no re-encoding, no field patching, no serialization. The exact bytes that were received from the network are the exact bytes sent to the consumer. This is the fastest possible cache hit.
+There is no re-encoding, no field patching, no serialization. The bytes received from the network are the bytes sent to the consumer.
 
 ## Arc\<Name\>: Shared Name References
 
@@ -112,7 +112,7 @@ Names are the most frequently shared data in an NDN forwarder. A single name may
 
 Copying a name with 6 components means copying 6 `NameComponent` values (each containing a `Bytes` slice and a TLV type). `Arc<Name>` eliminates all of these copies: cloning the `Arc` is a single atomic increment, and all holders share the same `Name` allocation.
 
-> **📊 Performance:** Without `Arc<Name>`, every PIT insert, FIB lookup, CS insert, and strategy invocation would copy the full name (6 components = 6 `Bytes` slices + 6 TLV type tags). With `Arc`, all of these operations are a single atomic increment. On a forwarder processing 1M packets/second, this eliminates millions of allocations per second.
+`Arc<Name>` means PIT insert, FIB lookup, CS insert, and strategy invocation each cost a single atomic increment rather than copying the full name.
 
 ```mermaid
 graph TD
