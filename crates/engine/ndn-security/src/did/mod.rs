@@ -50,8 +50,6 @@ pub mod metadata;
 pub mod resolver;
 pub mod url;
 
-// ── Re-exports ────────────────────────────────────────────────────────────────
-
 pub use convert::{
     build_zone_did_document, build_zone_succession_document, cert_to_did_document,
     did_document_to_trust_anchor,

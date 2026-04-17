@@ -1,25 +1,7 @@
-//! `ServiceDiscoveryProtocol` — `/ndn/local/sd/services/` and `/ndn/local/nd/peers`.
+//! `ServiceDiscoveryProtocol` — service record publication/browsing and
+//! demand-driven peer list.
 //!
-//! This protocol implementation handles two closely related discovery functions:
-//!
-//! ## 1. Service record publication and browsing
-//!
-//! Producers call [`ServiceDiscoveryProtocol::publish`] to register a
-//! [`ServiceRecord`].  The protocol responds to incoming browse Interests
-//! (`/ndn/local/sd/services/` with `CanBePrefix`) with Data packets for each
-//! locally registered record.
-//!
-//! When an incoming service record Data arrives from a peer, the protocol
-//! optionally auto-populates the FIB using the announced prefix (governed by
-//! [`ServiceDiscoveryConfig::auto_populate_fib`] and related fields).
-//!
-//! ## 2. Demand-driven peer list (`/ndn/local/nd/peers`)
-//!
-//! Any node can express an Interest for `/ndn/local/nd/peers` to get a
-//! snapshot of the current neighbor table.  The protocol responds with a Data
-//! whose Content is a compact TLV list of neighbor names.
-//!
-//! ## Wire format — Peers response
+//! ## Wire format -- Peers response
 //!
 //! ```text
 //! PeerList ::= (PEER-ENTRY TLV)*
@@ -63,45 +45,21 @@ pub struct ServiceDiscoveryProtocol {
     /// This node's NDN name (used when building responses).
     #[expect(dead_code)]
     node_name: Name,
-    /// Service discovery configuration.
     pub(super) config: ServiceDiscoveryConfig,
-    /// Claimed name prefixes.
     claimed: Vec<Name>,
-    /// Locally published service records.
     pub(super) local_records: Mutex<Vec<RecordEntry>>,
-    /// Service records received from remote peers.
-    ///
-    /// Populated by [`handle_sd_data`].  Deduplicated on
-    /// `(announced_prefix, node_name)`: re-receiving a record updates it in-place.
+    /// Deduplicated on `(announced_prefix, node_name)`.
     pub(super) peer_records: Mutex<Vec<ServiceRecord>>,
-    /// Per-producer rate-limit state.
     pub(super) rate_limits: Mutex<HashMap<String, ProducerRateLimit>>,
-    /// Auto-populated FIB entries pending TTL expiry.
     pub(super) auto_fib: Mutex<Vec<AutoFibEntry>>,
-    /// Neighbors whose faces have already received an initial browse Interest.
-    ///
-    /// When `on_tick()` first sees a neighbor in `Established` state its name
-    /// is added here and a browse Interest is sent immediately (no interval
-    /// wait).  Periodic re-browse is then throttled by `last_browse`.
-    ///
-    /// Using the neighbor table (not raw face IDs) means management and app
-    /// faces — which are not NDN neighbors — are never browsed, avoiding the
-    /// "malformed management response" error when ndn-ctl connects.
+    /// Tracks which neighbors have received an initial browse Interest.
+    /// Uses neighbor table (not face IDs) to avoid browsing management/app faces.
     pub(super) browsed_neighbors: Mutex<HashSet<Name>>,
-    /// Timestamp of the last periodic browse broadcast to all established
-    /// neighbors.  Used to throttle re-browse in `on_tick()`.
     pub(super) last_browse: Mutex<Option<Instant>>,
 }
 
 impl ServiceDiscoveryProtocol {
-    /// Create a new `ServiceDiscoveryProtocol`.
-    ///
-    /// - `node_name`: this node's NDN name.
-    /// - `config`: service discovery parameters.
     pub fn new(node_name: Name, config: ServiceDiscoveryConfig) -> Self {
-        // Claimed prefixes: sd/services for service records, nd/peers for the
-        // demand-driven neighbor list.  The nd/peers prefix is under nd_root,
-        // not hello_prefix, so it doesn't conflict with hello traffic.
         let claimed = vec![sd_services().clone(), peers_prefix().clone()];
         Self {
             node_name,
@@ -116,13 +74,11 @@ impl ServiceDiscoveryProtocol {
         }
     }
 
-    /// Create with the default [`ServiceDiscoveryConfig`].
     pub fn with_defaults(node_name: Name) -> Self {
         Self::new(node_name, ServiceDiscoveryConfig::default())
     }
 }
 
-// ── DiscoveryProtocol impl ────────────────────────────────────────────────────
 
 impl DiscoveryProtocol for ServiceDiscoveryProtocol {
     fn protocol_id(&self) -> ProtocolId {
@@ -133,17 +89,9 @@ impl DiscoveryProtocol for ServiceDiscoveryProtocol {
         &self.claimed
     }
 
-    fn on_face_up(&self, _face_id: FaceId, _ctx: &dyn DiscoveryContext) {
-        // Browse is driven by on_tick() against the neighbor table, not here.
-        // on_face_up fires for ALL faces including management/app IPC faces;
-        // sending a browse Interest to those faces corrupts the management
-        // request/response serialisation at the client.
-    }
+    fn on_face_up(&self, _face_id: FaceId, _ctx: &dyn DiscoveryContext) {}
 
     fn on_face_down(&self, face_id: FaceId, ctx: &dyn DiscoveryContext) {
-        // Withdraw local service records that were owned by this face.
-        // This fires when an app's data face goes down, removing service
-        // records that would otherwise remain stale indefinitely.
         {
             let mut local = self.local_records.lock().unwrap();
             let before = local.len();
@@ -154,7 +102,6 @@ impl DiscoveryProtocol for ServiceDiscoveryProtocol {
             }
         }
 
-        // Find which neighbors were reachable via this face.
         let affected: Vec<Name> = ctx
             .neighbors()
             .all()
@@ -163,7 +110,6 @@ impl DiscoveryProtocol for ServiceDiscoveryProtocol {
             .map(|e| e.node_name.clone())
             .collect();
 
-        // Evict peer records received from those nodes.
         if !affected.is_empty() {
             let mut peer_recs = self.peer_records.lock().unwrap();
             peer_recs.retain(|r| !affected.contains(&r.node_name));
@@ -173,8 +119,6 @@ impl DiscoveryProtocol for ServiceDiscoveryProtocol {
             );
         }
 
-        // Remove auto-FIB entries that route via the downed face, and
-        // immediately remove the FIB entries from the engine.
         let mut fib_removals: Vec<(Name, FaceId)> = Vec::new();
         {
             let mut auto_fib = self.auto_fib.lock().unwrap();
@@ -194,9 +138,6 @@ impl DiscoveryProtocol for ServiceDiscoveryProtocol {
             debug!(count = fib_removals.len(), face = ?face_id, "ServiceDiscovery: removed auto-FIB entries for downed face");
         }
 
-        // Reset browsed state for affected nodes so they receive a fresh
-        // initial browse when they reconnect (rather than waiting for the
-        // periodic interval).
         if !affected.is_empty() {
             let mut seen = self.browsed_neighbors.lock().unwrap();
             for name in &affected {
@@ -212,17 +153,14 @@ impl DiscoveryProtocol for ServiceDiscoveryProtocol {
         _meta: &InboundMeta,
         ctx: &dyn DiscoveryContext,
     ) -> bool {
-        // Bytes arrive LP-unwrapped from the pipeline; dispatch directly.
         match raw.first() {
             Some(&0x05) => {
-                // Interest
                 if self.handle_sd_interest(raw, incoming_face, ctx) {
                     return true;
                 }
                 self.handle_peers_interest(raw, incoming_face, ctx)
             }
             Some(&0x06) => {
-                // Data
                 self.handle_sd_data(raw, incoming_face, ctx)
             }
             _ => false,
@@ -230,24 +168,13 @@ impl DiscoveryProtocol for ServiceDiscoveryProtocol {
     }
 
     fn on_tick(&self, now: Instant, ctx: &dyn DiscoveryContext) {
-        // Expire auto-populated FIB entries past their TTL.
         self.expire_auto_fib(now, ctx);
-
-        // Expire local records that have a finite TTL (publish_with_ttl).
         self.expire_local_records(now);
-
-        // Browse neighbor faces to exchange service records.
-        //
-        // Interval: half the shortest remaining auto-FIB TTL (guarantees
-        // refresh before expiry), floored at 10 s to avoid hammering on
-        // fast-tick profiles.  Newly-Established neighbors always get an
-        // immediate initial browse regardless of the interval.
         let browse_interval = self.compute_browse_interval(now);
         self.browse_neighbors(now, browse_interval, ctx);
     }
 }
 
-// ── Tests ──────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

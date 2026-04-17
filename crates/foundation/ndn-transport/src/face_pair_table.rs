@@ -35,8 +35,6 @@ impl FacePairTable {
         }
     }
 
-    /// Register an asymmetric link pair: Interests arrive on `rx`, Data is
-    /// sent on `tx`.
     pub fn insert(&self, rx: FaceId, tx: FaceId) {
         #[cfg(not(target_arch = "wasm32"))]
         self.pairs.insert(rx, tx);
@@ -44,8 +42,6 @@ impl FacePairTable {
         self.pairs.lock().unwrap().insert(rx, tx);
     }
 
-    /// Returns the tx face to use when Data should go back on `rx_face`.
-    /// Returns `None` for symmetric faces.
     pub fn get_tx_for_rx(&self, rx: FaceId) -> Option<FaceId> {
         #[cfg(not(target_arch = "wasm32"))]
         return self.pairs.get(&rx).map(|r| *r);
@@ -53,7 +49,6 @@ impl FacePairTable {
         return self.pairs.lock().unwrap().get(&rx).copied();
     }
 
-    /// Remove the pair for `rx`.
     pub fn remove(&self, rx: FaceId) {
         #[cfg(not(target_arch = "wasm32"))]
         self.pairs.remove(&rx);
@@ -115,7 +110,6 @@ mod tests {
     fn symmetric_face_returns_none() {
         let t = FacePairTable::new();
         t.insert(id(10), id(11));
-        // Face 99 is symmetric — not in the table.
         assert!(t.get_tx_for_rx(id(99)).is_none());
     }
 

@@ -58,8 +58,6 @@ use sha2::{Digest, Sha256};
 
 use crate::TrustError;
 
-// ─── Errors ───────────────────────────────────────────────────────────────────
-
 /// Errors returned by `FileTpm` operations. Mapped to `TrustError` at the
 /// public boundary so callers don't need to depend on this module's type.
 #[derive(Debug, thiserror::Error)]
@@ -83,8 +81,6 @@ impl From<FileTpmError> for TrustError {
         TrustError::KeyStore(e.to_string())
     }
 }
-
-// ─── Algorithm tag ────────────────────────────────────────────────────────────
 
 /// Algorithm of a key stored in the TPM. Determined by file suffix and
 /// (for `.privkey` files) by ASN.1 autodetection of the inner DER.
@@ -110,8 +106,6 @@ impl TpmKeyKind {
         }
     }
 }
-
-// ─── Path / filename derivation ──────────────────────────────────────────────
 
 /// Encode a Name to its canonical TLV wire form, the byte sequence that
 /// is hashed to produce the on-disk filename.
@@ -144,24 +138,18 @@ fn filename_stem(key_name: &Name) -> String {
     upper_hex(&digest)
 }
 
-// ─── Base64 (no-newline, no-armor) ──────────────────────────────────────────
-
 fn b64_encode(bytes: &[u8]) -> String {
     use base64::Engine;
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 fn b64_decode(s: &str) -> Result<Vec<u8>, FileTpmError> {
     use base64::Engine;
-    // Permissive: ignore embedded whitespace so files written by other
-    // tools with line wrapping still load cleanly. ndn-cxx's
-    // `base64Decode` filter does the same.
+    // Ignore embedded whitespace for ndn-cxx interop (base64Decode does the same).
     let cleaned: String = s.chars().filter(|c| !c.is_whitespace()).collect();
     base64::engine::general_purpose::STANDARD
         .decode(cleaned.as_bytes())
         .map_err(|e| FileTpmError::Base64(e.to_string()))
 }
-
-// ─── FileTpm ─────────────────────────────────────────────────────────────────
 
 /// File-backed TPM. Stores private keys under
 /// `<root>/<HEX>.privkey[-ed25519]` files and reads them back on
@@ -177,9 +165,7 @@ impl FileTpm {
     pub fn open(root: impl AsRef<Path>) -> Result<Self, FileTpmError> {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(&root)?;
-        // 0o700 — ndn-cxx omits this but we set it explicitly. Setting
-        // it is strictly safer than leaving it to umask, and it doesn't
-        // affect interop because ndn-cxx doesn't check directory mode.
+        // ndn-cxx omits the directory mode; we set 0o700 explicitly.
         #[cfg(unix)]
         {
             let _ = fs::set_permissions(&root, fs::Permissions::from_mode(0o700));
@@ -238,7 +224,7 @@ impl FileTpm {
         fs::write(&path, body.as_bytes())?;
         #[cfg(unix)]
         {
-            // ndn-cxx uses 0o400. Match exactly.
+            // Match ndn-cxx's 0o400 (read-only by owner).
             fs::set_permissions(&path, fs::Permissions::from_mode(0o400))?;
         }
         Ok(())
@@ -288,8 +274,6 @@ impl FileTpm {
             || self.root.join(format!("{stem}.privkey-ed25519")).exists()
     }
 
-    // ── High-level: generate, sign, derive public key ───────────────────────
-
     /// Generate a fresh Ed25519 key, persist it under the sentinel
     /// suffix, and return the 32-byte raw seed. Callers that want a
     /// `Signer` should pass the seed to `Ed25519Signer::from_seed`.
@@ -336,8 +320,6 @@ impl FileTpm {
         }
     }
 
-    // ── SafeBag import / export ──────────────────────────────────────────
-
     /// Export `key_name` as a [`crate::safe_bag::SafeBag`] for transfer
     /// to another machine. Bundles the password-encrypted private key
     /// with the certificate the caller looked up from the PIB.
@@ -366,7 +348,7 @@ impl FileTpm {
         let pkcs8_der: Vec<u8> = match kind {
             TpmKeyKind::Rsa => crate::safe_bag::rsa_pkcs1_to_pkcs8(&der)?,
             TpmKeyKind::EcdsaP256 => crate::safe_bag::ec_sec1_to_pkcs8(&der)?,
-            TpmKeyKind::Ed25519 => der, // already PKCS#8 on disk
+            TpmKeyKind::Ed25519 => der,
         };
         crate::safe_bag::SafeBag::encrypt(certificate, &pkcs8_der, password)
     }
@@ -397,14 +379,12 @@ impl FileTpm {
         let on_disk: Vec<u8> = match kind {
             TpmKeyKind::Rsa => crate::safe_bag::rsa_pkcs8_to_pkcs1(&pkcs8_der)?,
             TpmKeyKind::EcdsaP256 => crate::safe_bag::ec_pkcs8_to_sec1(&pkcs8_der)?,
-            TpmKeyKind::Ed25519 => pkcs8_der, // on-disk form IS pkcs8
+            TpmKeyKind::Ed25519 => pkcs8_der,
         };
         self.save_raw(key_name, kind, &on_disk)?;
         Ok(safebag.certificate.clone())
     }
 }
-
-// ─── Algorithm autodetection (RSA vs ECDSA from DER) ────────────────────────
 
 /// Look at the first few ASN.1 bytes to decide whether a `.privkey`
 /// file holds PKCS#1 RSA or SEC1 EC. ndn-cxx defers to OpenSSL's
@@ -442,15 +422,13 @@ fn autodetect_pkcs1_or_sec1(der: &[u8]) -> Result<TpmKeyKind, FileTpmError> {
         return Err(FileTpmError::InvalidKey("DER too short".into()));
     }
     match der[next_tag_idx] {
-        0x02 => Ok(TpmKeyKind::Rsa),       // INTEGER → RSA modulus
-        0x04 => Ok(TpmKeyKind::EcdsaP256), // OCTET STRING → SEC1 priv key
+        0x02 => Ok(TpmKeyKind::Rsa),
+        0x04 => Ok(TpmKeyKind::EcdsaP256),
         b => Err(FileTpmError::UnsupportedAlgorithm(format!(
             "unknown second-element tag 0x{b:02x}"
         ))),
     }
 }
-
-// ─── Signing implementations ─────────────────────────────────────────────────
 
 fn sign_rsa(pkcs1_der: &[u8], region: &[u8]) -> Result<Bytes, FileTpmError> {
     use pkcs1::DecodeRsaPrivateKey;
@@ -469,8 +447,6 @@ fn sign_rsa(pkcs1_der: &[u8], region: &[u8]) -> Result<Bytes, FileTpmError> {
     let sk = RsaPrivateKey::from_pkcs1_der(pkcs1_der)
         .map_err(|e| FileTpmError::InvalidKey(format!("rsa pkcs1: {e}")))?;
 
-    // NDN signs SHA-256(signed region) with PKCS#1 v1.5 padding —
-    // matching SignatureSha256WithRsa (TLV type 1).
     let hash = Sha256::digest(region);
     let sig = sk
         .sign(Pkcs1v15Sign::new::<Sha256>(), &hash)
@@ -486,7 +462,6 @@ fn public_key_rsa(pkcs1_der: &[u8]) -> Result<Vec<u8>, FileTpmError> {
     let sk = RsaPrivateKey::from_pkcs1_der(pkcs1_der)
         .map_err(|e| FileTpmError::InvalidKey(format!("rsa pkcs1: {e}")))?;
     let pk = sk.to_public_key();
-    // SubjectPublicKeyInfo DER — what the PIB key_bits column expects.
     pk.to_public_key_der()
         .map(|d| d.as_bytes().to_vec())
         .map_err(|e| FileTpmError::InvalidKey(format!("rsa spki: {e}")))
@@ -561,14 +536,12 @@ fn sign_ecdsa_p256(sec1_der: &[u8], region: &[u8]) -> Result<Bytes, FileTpmError
     use p256_ecdsa::ecdsa::{Signature, signature::Signer};
 
     let sk = signing_key_from_sec1(sec1_der)?;
-    // DER-encoded signature for ndn-cxx compatibility.
     let sig: Signature = sk.sign(region);
     Ok(Bytes::from(sig.to_der().as_bytes().to_vec()))
 }
 
 fn public_key_ecdsa_p256(sec1_der: &[u8]) -> Result<Vec<u8>, FileTpmError> {
     let sk = signing_key_from_sec1(sec1_der)?;
-    // Uncompressed SEC1 point: 0x04 || X(32) || Y(32) = 65 bytes.
     let point = sk.verifying_key().to_encoded_point(false);
     let sec1_bytes = point.as_bytes();
     debug_assert_eq!(sec1_bytes.len(), 65);
@@ -823,21 +796,6 @@ mod tests {
     fn rand_core_compat() -> rsa::rand_core::OsRng {
         rsa::rand_core::OsRng
     }
-
-    // ── SafeBag roundtrip tests ───────────────────────────────────────────
-    //
-    // For each supported algorithm, generate or import a key into TPM
-    // A, export to a SafeBag, decode the SafeBag wire bytes, import
-    // into a fresh TPM B, and verify the imported key produces a
-    // signature that the original key's public key can verify. This
-    // exercises the full path:
-    //
-    //   on-disk → PKCS#8 → encrypt → SafeBag TLV → decode → decrypt
-    //   → PKCS#8 → on-disk → load → sign
-    //
-    // If any link in that chain has a format error, the verify at the
-    // end fails. A wrong password also fails decryption (separately
-    // tested in safe_bag.rs).
 
     fn fake_cert_bytes() -> Bytes {
         // SafeBag treats the certificate as opaque; any well-formed

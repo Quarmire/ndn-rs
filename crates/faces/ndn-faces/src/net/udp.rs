@@ -111,16 +111,7 @@ impl Face for UdpFace {
             .map(|a| format!("udp4://{}:{}", a.ip(), a.port()))
     }
 
-    /// Receive the next datagram from the peer.
-    ///
-    /// Returns the raw datagram bytes (may be a bare packet or LpPacket).
-    /// Fragment reassembly is handled by the pipeline's TlvDecode stage,
-    /// not here — keeping the Face layer protocol-agnostic.
-    ///
-    /// Datagrams from addresses other than `self.peer` are silently discarded.
     async fn recv(&self) -> Result<Bytes, FaceError> {
-        // Reuse a stack buffer; only allocate the exact received size via
-        // copy_from_slice.  Avoids a 9 KB heap allocation per packet.
         let mut buf = [0u8; 9000];
         loop {
             let (n, src) = self.socket.recv_from(&mut buf).await?;
@@ -133,17 +124,12 @@ impl Face for UdpFace {
     }
 
     async fn send(&self, pkt: Bytes) -> Result<(), FaceError> {
-        // If the packet is already an LpPacket (e.g. from the reliability layer),
-        // send it directly — it's already correctly framed and within MTU.
         if ndn_packet::lp::is_lp_packet(&pkt) {
             trace!(face=%self.id, peer=%self.peer, len=pkt.len(), "udp: send (passthrough)");
             self.socket.send_to(&pkt, self.peer).await?;
             return Ok(());
         }
 
-        // LpPacket envelope adds ~4 bytes overhead.  Check whether the packet
-        // needs fragmentation *before* wrapping to avoid an 8 KB allocation
-        // that would immediately be discarded.
         if pkt.len() + 4 <= self.mtu {
             let wire = ndn_packet::lp::encode_lp_packet(&pkt);
             trace!(face=%self.id, peer=%self.peer, len=wire.len(), "udp: send");
@@ -152,13 +138,10 @@ impl Face for UdpFace {
             let seq = self.seq.fetch_add(1, Ordering::Relaxed);
             let fragments = fragment_packet(&pkt, self.mtu, seq);
             trace!(face=%self.id, peer=%self.peer, frags=fragments.len(), seq, "udp: send fragmented");
-            // Use try_send_to to avoid tokio async poll overhead per fragment.
-            // UDP sends almost never block (kernel just copies to send buffer).
             for frag in &fragments {
                 match self.socket.try_send_to(frag, self.peer) {
                     Ok(_) => {}
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        // Socket buffer full — fall back to async send.
                         self.socket.send_to(frag, self.peer).await?;
                     }
                     Err(e) => return Err(e.into()),

@@ -14,8 +14,6 @@ use bytes::Bytes;
 
 pub use ndn_transport::MacAddr;
 
-// ─── AF_PACKET helpers ───────────────────────────────────────────────────────
-
 /// Look up the interface index for `iface` via `SIOCGIFINDEX`.
 pub fn get_ifindex(fd: RawFd, iface: &str) -> std::io::Result<i32> {
     let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
@@ -39,7 +37,6 @@ pub fn get_ifindex(fd: RawFd, iface: &str) -> std::io::Result<i32> {
     Ok(unsafe { ifr.ifr_ifru.ifru_ifindex })
 }
 
-/// Build a `sockaddr_ll` for `bind` or `sendto`.
 pub fn make_sockaddr_ll(ifindex: i32, dst_mac: &MacAddr, protocol: u16) -> libc::sockaddr_ll {
     let mut addr: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
     addr.sll_family = libc::AF_PACKET as u16;
@@ -50,8 +47,8 @@ pub fn make_sockaddr_ll(ifindex: i32, dst_mac: &MacAddr, protocol: u16) -> libc:
     addr
 }
 
-/// Create an `AF_PACKET + SOCK_DGRAM` socket bound to `ifindex`, filtering
-/// only frames with ethertype `protocol`.  Returns a non-blocking `OwnedFd`.
+/// Create an `AF_PACKET + SOCK_DGRAM` socket bound to `ifindex`.
+/// Returns a non-blocking `OwnedFd`.
 pub fn open_packet_socket(ifindex: i32, protocol: u16) -> std::io::Result<OwnedFd> {
     let fd = unsafe {
         libc::socket(
@@ -65,7 +62,6 @@ pub fn open_packet_socket(ifindex: i32, protocol: u16) -> std::io::Result<OwnedF
     }
     let owned = unsafe { OwnedFd::from_raw_fd(fd) };
 
-    // Bind to the specific interface so we only receive frames from it.
     let bind_addr = make_sockaddr_ll(ifindex, &MacAddr::new([0; 6]), protocol);
     if unsafe {
         libc::bind(
@@ -81,7 +77,6 @@ pub fn open_packet_socket(ifindex: i32, protocol: u16) -> std::io::Result<OwnedF
     Ok(owned)
 }
 
-/// Generic `setsockopt` wrapper for a value of type `T`.
 pub fn setsockopt_val<T>(
     fd: RawFd,
     level: libc::c_int,
@@ -103,8 +98,6 @@ pub fn setsockopt_val<T>(
     Ok(())
 }
 
-// ─── TPACKET_V2 mmap ring buffer ────────────────────────────────────────────
-
 // TPACKET_V2 lives inside libc's `tpacket_versions` enum.
 pub(crate) const TPACKET_V2: libc::c_int = 1;
 
@@ -114,18 +107,13 @@ pub(crate) const fn tpacket_align(x: usize) -> usize {
     (x + TPACKET_ALIGNMENT - 1) & !(TPACKET_ALIGNMENT - 1)
 }
 
-// Ring geometry — each ring gets BLOCK_NR × BLOCK_SIZE bytes.
-// 2048-byte frames fit tpacket2_hdr (32 B) + sockaddr_ll (20 B) + 1500 B payload.
 pub(crate) const RING_FRAME_SIZE: u32 = 2048;
 pub(crate) const RING_BLOCK_SIZE: u32 = 1 << 12; // 4 KiB (one page, 2 frames/block)
 pub(crate) const RING_BLOCK_NR: u32 = 32; // 32 blocks → 128 KiB per ring
 pub(crate) const RING_FRAME_NR: u32 = (RING_BLOCK_SIZE / RING_FRAME_SIZE) * RING_BLOCK_NR; // 64
 
-/// Byte offset from TX frame start to the packet data payload.
 pub(crate) const TX_DATA_OFFSET: usize = tpacket_align(std::mem::size_of::<libc::tpacket2_hdr>())
     + std::mem::size_of::<libc::sockaddr_ll>();
-
-// ─── tp_status atomic access ─────────────────────────────────────────────────
 
 /// Read `tp_status` from a ring frame with Acquire ordering.
 ///
@@ -135,36 +123,24 @@ pub(crate) unsafe fn read_tp_status(frame: *mut u8) -> u32 {
     unsafe { (*AtomicU32::from_ptr(frame as *mut u32)).load(Ordering::Acquire) }
 }
 
-/// Write `tp_status` with Release ordering.
-///
 /// # Safety
 /// Same requirements as [`read_tp_status`].
 pub(crate) unsafe fn write_tp_status(frame: *mut u8, val: u32) {
     unsafe { (*AtomicU32::from_ptr(frame as *mut u32)).store(val, Ordering::Release) }
 }
 
-// ─── PacketRing ──────────────────────────────────────────────────────────────
-
 /// Mmap'd `PACKET_RX_RING` + `PACKET_TX_RING` for zero-copy packet I/O.
 pub struct PacketRing {
-    /// Mmap'd region (RX ring at offset 0, TX ring at `tx_offset`).
     map: *mut u8,
     map_len: usize,
     frame_size: usize,
     rx_frame_nr: u32,
     tx_frame_nr: u32,
-    /// Byte offset where the TX ring starts within the mmap region.
     tx_offset: usize,
-    /// Current RX consumer index (single consumer — Face::recv is single-task).
     rx_head: AtomicU32,
-    /// Current TX producer index, protected for concurrent Face::send calls.
     tx_head: std::sync::Mutex<u32>,
 }
 
-// Safety: the mmap'd region is shared with the kernel via MAP_SHARED.
-// Synchronisation is through atomic tp_status reads/writes with
-// Acquire/Release ordering.  rx_head is single-consumer; tx_head is
-// protected by a Mutex.
 unsafe impl Send for PacketRing {}
 unsafe impl Sync for PacketRing {}
 
@@ -180,17 +156,10 @@ impl PacketRing {
         }
     }
 
-    /// Try to dequeue one packet from the RX ring.
     pub fn try_pop_rx(&self) -> Option<Bytes> {
         self.try_pop_rx_with_source().map(|(bytes, _)| bytes)
     }
 
-    /// Try to dequeue one packet from the RX ring, also returning the source MAC.
-    ///
-    /// In a TPACKET_V2 frame the kernel embeds a `sockaddr_ll` immediately after
-    /// the aligned `tpacket2_hdr`.  For received frames the kernel fills in
-    /// `sll_addr` / `sll_halen` with the source Ethernet address, giving us the
-    /// peer MAC without any extra syscall.
     pub fn try_pop_rx_with_source(&self) -> Option<(Bytes, MacAddr)> {
         let idx = self.rx_head.load(Ordering::Relaxed);
         let frame = self.rx_frame(idx);
@@ -204,7 +173,6 @@ impl PacketRing {
         let tp_mac = unsafe { (*hdr).tp_mac } as usize;
         let tp_snaplen = unsafe { (*hdr).tp_snaplen } as usize;
 
-        // sockaddr_ll sits immediately after the aligned tpacket2_hdr.
         let sll_offset = tpacket_align(std::mem::size_of::<libc::tpacket2_hdr>());
         let sll = unsafe { &*(frame.add(sll_offset) as *const libc::sockaddr_ll) };
         let src_mac = MacAddr({
@@ -216,7 +184,6 @@ impl PacketRing {
         let data = unsafe { std::slice::from_raw_parts(frame.add(tp_mac), tp_snaplen) };
         let bytes = Bytes::copy_from_slice(data);
 
-        // Release frame back to the kernel.
         unsafe { write_tp_status(frame, libc::TP_STATUS_KERNEL) };
         self.rx_head
             .store((idx + 1) % self.rx_frame_nr, Ordering::Relaxed);
@@ -224,7 +191,6 @@ impl PacketRing {
         Some((bytes, src_mac))
     }
 
-    /// Try to enqueue one packet into the TX ring.
     pub fn try_push_tx(&self, data: &[u8]) -> bool {
         let mut head = self.tx_head.lock().unwrap();
         let frame = self.tx_frame(*head);
@@ -259,9 +225,7 @@ impl Drop for PacketRing {
     }
 }
 
-/// Configure TPACKET_V2, create RX + TX rings, and mmap them.
 pub fn setup_packet_ring(fd: RawFd) -> std::io::Result<PacketRing> {
-    // 1. Select TPACKET_V2.
     let version: libc::c_int = TPACKET_V2;
     setsockopt_val(fd, libc::SOL_PACKET, libc::PACKET_VERSION, &version)?;
 
@@ -272,11 +236,9 @@ pub fn setup_packet_ring(fd: RawFd) -> std::io::Result<PacketRing> {
         tp_frame_nr: RING_FRAME_NR,
     };
 
-    // 2. Configure RX ring, then TX ring (same geometry).
     setsockopt_val(fd, libc::SOL_PACKET, libc::PACKET_RX_RING, &req)?;
     setsockopt_val(fd, libc::SOL_PACKET, libc::PACKET_TX_RING, &req)?;
 
-    // 3. Mmap both rings.
     let rx_ring_size = (RING_BLOCK_SIZE as usize) * (RING_BLOCK_NR as usize);
     let tx_ring_size = rx_ring_size;
     let map_len = rx_ring_size + tx_ring_size;
@@ -321,7 +283,6 @@ pub fn get_interface_mac(iface: &str) -> std::io::Result<MacAddr> {
     let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
     let name_bytes = iface.as_bytes();
     let copy_len = name_bytes.len().min(libc::IFNAMSIZ - 1);
-    // SAFETY: ifr_name is a fixed-size C array, zeroed above.
     let name_ptr = ifr.ifr_name.as_mut_ptr() as *mut u8;
     unsafe { std::ptr::copy_nonoverlapping(name_bytes.as_ptr(), name_ptr, copy_len) };
 
@@ -330,7 +291,6 @@ pub fn get_interface_mac(iface: &str) -> std::io::Result<MacAddr> {
         return Err(std::io::Error::last_os_error());
     }
 
-    // ifr_hwaddr.sa_data holds the MAC bytes at offset 0.
     let sa_data = unsafe { ifr.ifr_ifru.ifru_hwaddr.sa_data };
     let mac = [
         sa_data[0] as u8,

@@ -109,14 +109,12 @@ impl Consumer {
             .map_err(|_| AppError::Timeout)?
             .ok_or(AppError::Closed)?;
 
-        // Check for Nack (LpPacket with Nack header).
         if is_lp_packet(&reply)
             && let Ok(lp) = LpPacket::decode(reply.clone())
         {
             if let Some(reason) = lp.nack {
                 return Err(AppError::Nacked { reason });
             }
-            // LpPacket without Nack — decode the fragment as Data.
             if let Some(fragment) = lp.fragment {
                 return Data::decode(fragment).map_err(|e| AppError::Protocol(e.to_string()));
             }
@@ -141,7 +139,6 @@ impl Consumer {
         }
     }
 
-    /// Convenience: fetch content as raw bytes.
     pub async fn get(&mut self, name: impl Into<Name>) -> Result<Bytes, AppError> {
         let data = self.fetch(name).await?;
         data.content()
@@ -210,7 +207,6 @@ impl Consumer {
     pub async fn fetch_segmented(&mut self, prefix: impl Into<Name>) -> Result<Bytes, AppError> {
         let prefix = prefix.into();
 
-        // Fetch segment 0 to discover FinalBlockId.
         let seg0_name = prefix.clone().append("0");
         let seg0 = self.fetch(seg0_name).await?;
 
@@ -225,7 +221,6 @@ impl Consumer {
             return Ok(seg0_content);
         }
 
-        // Fetch remaining segments sequentially.
         let mut chunks: Vec<Bytes> = Vec::with_capacity(last_seg + 1);
         chunks.push(seg0_content);
         for i in 1..=last_seg {
@@ -247,9 +242,6 @@ impl Consumer {
     }
 
     /// Fetch and verify against a `Validator`. Returns `SafeData` on success.
-    ///
-    /// This is a convenience wrapper around [`fetch`](Self::fetch) +
-    /// [`Validator::validate_chain`](ndn_security::Validator).
     pub async fn get_verified(
         &mut self,
         name: impl Into<Name>,

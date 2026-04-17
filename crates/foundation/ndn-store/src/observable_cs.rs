@@ -9,7 +9,6 @@ use ndn_packet::{Interest, Name};
 
 use crate::{CsCapacity, CsEntry, CsMeta, CsStats, ErasedContentStore, InsertResult};
 
-/// Events emitted by an observable content store.
 #[derive(Debug)]
 pub enum CsEvent {
     Hit { name: Arc<Name> },
@@ -26,7 +25,6 @@ pub trait CsObserver: Send + Sync + 'static {
     fn on_event(&self, event: CsEvent);
 }
 
-/// Atomic counters for CS hit/miss/insert/eviction tracking.
 struct CsStatsCounters {
     hits: AtomicU64,
     misses: AtomicU64,

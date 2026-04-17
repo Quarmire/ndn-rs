@@ -2,15 +2,7 @@ use std::sync::Arc;
 
 use ndn_packet::Name;
 
-/// High-level NDN IPC client.
-///
-/// Generic over the face type `F` so it can work with any transport:
-/// - `AppFace` for in-process use (library embedding)
-/// - `UnixFace` for cross-process use over a Unix domain socket
-/// - A future `ShmFace` for zero-copy cross-process IPC
-///
-/// The namespace is the root name under which this client operates; it is
-/// prepended to all expressed Interests by convention (not enforced here).
+/// High-level NDN IPC client, generic over face type `F`.
 pub struct IpcClient<F> {
     face: Arc<F>,
     namespace: Name,

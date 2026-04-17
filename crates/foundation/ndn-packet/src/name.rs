@@ -12,11 +12,9 @@ use ndn_tlv::TlvReader;
 
 /// A single NDN name component: a (type, value) pair.
 ///
-/// The value is a zero-copy slice of the original packet buffer.
-///
 /// Ordering follows the NDN Packet Format v0.3 §2.1 canonical order:
 /// TLV-TYPE first, then TLV-LENGTH (shorter is smaller), then TLV-VALUE
-/// byte-by-byte. This matches the order used by NFD and ndn-cxx.
+/// byte-by-byte.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct NameComponent {
     pub typ: u64,
@@ -75,32 +73,26 @@ impl NameComponent {
         }
     }
 
-    /// Create a Keyword component (type 0x20) with opaque bytes.
     pub fn keyword(value: Bytes) -> Self {
         Self::new(tlv_type::KEYWORD, value)
     }
 
-    /// Create a ByteOffset component (type 0x34), big-endian with leading zeros stripped.
     pub fn byte_offset(offset: u64) -> Self {
         Self::new(tlv_type::BYTE_OFFSET, encode_nonnegtive_integer(offset))
     }
 
-    /// Create a Version component (type 0x36), big-endian with leading zeros stripped.
     pub fn version(v: u64) -> Self {
         Self::new(tlv_type::VERSION, encode_nonnegtive_integer(v))
     }
 
-    /// Create a Timestamp component (type 0x38), big-endian with leading zeros stripped.
     pub fn timestamp(ts: u64) -> Self {
         Self::new(tlv_type::TIMESTAMP, encode_nonnegtive_integer(ts))
     }
 
-    /// Create a SequenceNum component (type 0x3A), big-endian with leading zeros stripped.
     pub fn sequence_num(seq: u64) -> Self {
         Self::new(tlv_type::SEQUENCE_NUM, encode_nonnegtive_integer(seq))
     }
 
-    /// Decode a Segment component value as u64. Returns `None` if not type 0x32.
     pub fn as_segment(&self) -> Option<u64> {
         if self.typ == tlv_type::SEGMENT {
             Some(decode_nonnegative_integer(&self.value))
@@ -109,7 +101,6 @@ impl NameComponent {
         }
     }
 
-    /// Decode a ByteOffset component value as u64. Returns `None` if not type 0x34.
     pub fn as_byte_offset(&self) -> Option<u64> {
         if self.typ == tlv_type::BYTE_OFFSET {
             Some(decode_nonnegative_integer(&self.value))
@@ -118,7 +109,6 @@ impl NameComponent {
         }
     }
 
-    /// Decode a Version component value as u64. Returns `None` if not type 0x36.
     pub fn as_version(&self) -> Option<u64> {
         if self.typ == tlv_type::VERSION {
             Some(decode_nonnegative_integer(&self.value))
@@ -127,7 +117,6 @@ impl NameComponent {
         }
     }
 
-    /// Decode a Timestamp component value as u64. Returns `None` if not type 0x38.
     pub fn as_timestamp(&self) -> Option<u64> {
         if self.typ == tlv_type::TIMESTAMP {
             Some(decode_nonnegative_integer(&self.value))
@@ -136,7 +125,6 @@ impl NameComponent {
         }
     }
 
-    /// Decode a SequenceNum component value as u64. Returns `None` if not type 0x3A.
     pub fn as_sequence_num(&self) -> Option<u64> {
         if self.typ == tlv_type::SEQUENCE_NUM {
             Some(decode_nonnegative_integer(&self.value))
@@ -162,7 +150,6 @@ fn encode_nonnegtive_integer(v: u64) -> Bytes {
     })
 }
 
-/// Decode big-endian stripped bytes back to u64.
 fn decode_nonnegative_integer(bytes: &[u8]) -> u64 {
     let mut val: u64 = 0;
     for &b in bytes {
@@ -172,9 +159,6 @@ fn decode_nonnegative_integer(bytes: &[u8]) -> u64 {
 }
 
 /// An NDN name: an ordered sequence of name components.
-///
-/// Components are stored in a `SmallVec` with inline capacity for 8 elements,
-/// covering typical 4–8 component names without heap allocation.
 ///
 /// Ordering follows the NDN Packet Format v0.3 §2.1 canonical order,
 /// component by component using [`NameComponent`]'s `Ord` impl.
@@ -201,7 +185,6 @@ impl Ord for Name {
 }
 
 impl Name {
-    /// The root (empty) name `/`.
     pub fn root() -> Self {
         Self {
             components: SmallVec::new(),
@@ -226,7 +209,6 @@ impl Name {
         self.components.is_empty()
     }
 
-    /// Returns `true` if `prefix` is a prefix of (or equal to) this name.
     pub fn has_prefix(&self, prefix: &Name) -> bool {
         if prefix.len() > self.len() {
             return false;
@@ -237,8 +219,6 @@ impl Name {
             .all(|(a, b)| a == b)
     }
 
-    /// Decode a `Name` TLV from `reader`. The reader must be positioned at the
-    /// start of the Name value (after the outer type+length have been consumed).
     pub fn decode(value: Bytes) -> Result<Self, PacketError> {
         let mut reader = TlvReader::new(value);
         let mut components = SmallVec::new();
@@ -249,9 +229,6 @@ impl Name {
         Ok(Self { components })
     }
 
-    // ── Builder methods ──────────────────────────────────────────────────────
-
-    /// Append a generic component from raw bytes.
     pub fn append(mut self, value: impl AsRef<[u8]>) -> Self {
         self.components
             .push(NameComponent::generic(Bytes::copy_from_slice(
@@ -260,14 +237,11 @@ impl Name {
         self
     }
 
-    /// Append an already-constructed component.
     pub fn append_component(mut self, comp: NameComponent) -> Self {
         self.components.push(comp);
         self
     }
 
-    /// Append a segment number component (type `0x32`, big-endian encoding with
-    /// leading zeros stripped per NDN naming conventions).
     pub fn append_segment(self, seg: u64) -> Self {
         self.append_component(NameComponent::new(
             tlv_type::SEGMENT,
@@ -275,28 +249,22 @@ impl Name {
         ))
     }
 
-    /// Append a Version component (type 0x36).
     pub fn append_version(self, v: u64) -> Self {
         self.append_component(NameComponent::version(v))
     }
 
-    /// Append a Timestamp component (type 0x38).
     pub fn append_timestamp(self, ts: u64) -> Self {
         self.append_component(NameComponent::timestamp(ts))
     }
 
-    /// Append a SequenceNum component (type 0x3A).
     pub fn append_sequence_num(self, seq: u64) -> Self {
         self.append_component(NameComponent::sequence_num(seq))
     }
 
-    /// Append a ByteOffset component (type 0x34).
     pub fn append_byte_offset(self, off: u64) -> Self {
         self.append_component(NameComponent::byte_offset(off))
     }
 
-    /// Append a BLAKE3 digest component (type 0x03, 32 bytes).
-    ///
     /// **Experimental / NDA extension.** See [`NameComponent::blake3_digest`].
     pub fn append_blake3_digest(self, hash: [u8; 32]) -> Self {
         self.append_component(NameComponent::blake3_digest(hash))
@@ -304,18 +272,12 @@ impl Name {
 
     /// Build a single-component zone-root name from a pre-computed 32-byte hash.
     ///
-    /// The hash should be the BLAKE3 digest of a public key (or any 32-byte
-    /// identifier). This is the low-level constructor; use
-    /// `ndn_security::ZoneKey::zone_root_name()` for the full API that computes
-    /// the hash from a public key.
-    ///
     /// **Experimental / NDA extension** — BLAKE3 component type (0x03) is not
     /// yet in the NDN Packet Format specification.
     pub fn zone_root_from_hash(hash: [u8; 32]) -> Self {
         Name::from_components([NameComponent::blake3_digest(hash)])
     }
 
-    /// Returns `true` if this name is a single BLAKE3-digest component (a zone root).
     pub fn is_zone_root(&self) -> bool {
         self.components().len() == 1
             && self.components()[0].typ == crate::tlv_type::BLAKE3_DIGEST
@@ -326,10 +288,6 @@ impl Name {
 impl FromStr for Name {
     type Err = PacketError;
 
-    /// Parse an NDN URI string into a `Name`.
-    ///
-    /// Handles percent-decoding to roundtrip with `Display`.
-    ///
     /// ```
     /// # use ndn_packet::Name;
     /// let name: Name = "/edu/ucla/data".parse().unwrap();
@@ -341,7 +299,6 @@ impl FromStr for Name {
             return Ok(Self::root());
         }
 
-        // Must start with '/'.
         if !s.starts_with('/') {
             return Err(PacketError::MalformedPacket(
                 "name must start with '/'".into(),
@@ -351,9 +308,8 @@ impl FromStr for Name {
         let mut components = SmallVec::new();
         for part in s[1..].split('/') {
             if part.is_empty() {
-                continue; // tolerate trailing slash
+                continue;
             }
-            // Typed component prefixes — mirrors the Display impl for roundtrip.
             let comp = if let Some(rest) = part.strip_prefix("seg=") {
                 if let Ok(n) = rest.parse::<u64>() {
                     NameComponent::new(tlv_type::SEGMENT, encode_nonnegtive_integer(n))
@@ -411,7 +367,6 @@ impl FromStr for Name {
     }
 }
 
-/// Decode percent-encoded bytes in a name component.
 fn percent_decode(s: &str) -> Result<Vec<u8>, ()> {
     let mut out = Vec::with_capacity(s.len());
     let bytes = s.as_bytes();
@@ -459,7 +414,6 @@ macro_rules! name {
     };
 }
 
-/// Build Name TLV value bytes (the content inside a `0x07` TLV) for testing.
 #[cfg(test)]
 pub(crate) fn build_name_value(components: &[&[u8]]) -> bytes::Bytes {
     let mut w = ndn_tlv::TlvWriter::new();
@@ -469,7 +423,6 @@ pub(crate) fn build_name_value(components: &[&[u8]]) -> bytes::Bytes {
     w.finish()
 }
 
-/// Percent-encode a byte slice for NDN URI display.
 fn percent_encode_component(f: &mut core::fmt::Formatter<'_>, value: &[u8]) -> core::fmt::Result {
     for &b in value {
         if b.is_ascii_graphic() && b != b'/' && b != b'%' {
@@ -527,7 +480,6 @@ impl core::fmt::Display for Name {
                     write!(f, "seq={}", decode_nonnegative_integer(&c.value))?;
                 }
                 _ => {
-                    // Generic component or unknown type: percent-encode.
                     percent_encode_component(f, &c.value)?;
                 }
             }
@@ -552,8 +504,6 @@ mod tests {
         NameComponent::generic(bytes::Bytes::copy_from_slice(s))
     }
 
-    // ── constructors ──────────────────────────────────────────────────────────
-
     #[test]
     fn root_is_empty() {
         let n = Name::root();
@@ -571,7 +521,6 @@ mod tests {
         assert_eq!(n.components()[2].value.as_ref(), b"news");
     }
 
-    // ── has_prefix ────────────────────────────────────────────────────────────
 
     #[test]
     fn has_prefix_true() {
@@ -606,7 +555,6 @@ mod tests {
         assert!(!name.has_prefix(&prefix));
     }
 
-    // ── decode ────────────────────────────────────────────────────────────────
 
     #[test]
     fn decode_empty_name() {
@@ -641,7 +589,6 @@ mod tests {
         assert_eq!(name.components()[0].typ, 0x01);
     }
 
-    // ── Display ───────────────────────────────────────────────────────────────
 
     #[test]
     fn display_root() {
@@ -668,7 +615,6 @@ mod tests {
         assert_eq!(n.to_string(), "/%00%FF");
     }
 
-    // ── Hash / Eq ─────────────────────────────────────────────────────────────
 
     #[test]
     fn equal_names_have_equal_hash() {
@@ -695,7 +641,6 @@ mod tests {
         assert_ne!(generic, implicit);
     }
 
-    // ── FromStr ───────────────────────────────────────────────────────────────
 
     #[test]
     fn from_str_simple() {
@@ -759,7 +704,6 @@ mod tests {
         assert_eq!(original, parsed);
     }
 
-    // ── append ────────────────────────────────────────────────────────────────
 
     #[test]
     fn append_builds_name() {
@@ -782,7 +726,6 @@ mod tests {
         assert_eq!(n.components()[0].value.as_ref(), &[0u8]);
     }
 
-    // ── name! macro ───────────────────────────────────────────────────────────
 
     #[test]
     fn name_macro() {
@@ -791,7 +734,6 @@ mod tests {
         assert_eq!(n.to_string(), "/iperf/data");
     }
 
-    // ── Typed component constructors ─────────────────────────────────────────
 
     #[test]
     fn keyword_component_roundtrip() {
@@ -851,7 +793,6 @@ mod tests {
         assert_eq!(n.components()[0].as_segment(), Some(99));
     }
 
-    // ── Builder method chaining ──────────────────────────────────────────────
 
     #[test]
     fn builder_chaining_all_types() {
@@ -880,7 +821,6 @@ mod tests {
         assert_eq!(n.components()[3].as_byte_offset(), Some(4096));
     }
 
-    // ── Display with typed components ────────────────────────────────────────
 
     #[test]
     fn display_segment() {

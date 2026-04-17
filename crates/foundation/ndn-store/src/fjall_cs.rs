@@ -35,8 +35,6 @@ const STALE_AT_LEN: usize = 8;
 /// LSM overhead).
 pub struct FjallCs {
     keyspace: fjall::Keyspace,
-    // Kept alive so the underlying fjall::Database is not dropped while the
-    // keyspace is in use.
     #[allow(dead_code)]
     db: fjall::Database,
     max_bytes: AtomicUsize,
@@ -52,7 +50,6 @@ impl FjallCs {
         let db = fjall::Database::builder(path).open()?;
         let keyspace = db.keyspace("cs", fjall::KeyspaceCreateOptions::default)?;
 
-        // Recover current_bytes and entry_count by scanning existing entries.
         let (count, bytes) = Self::scan_stats(&keyspace);
 
         Ok(Self {
@@ -64,7 +61,6 @@ impl FjallCs {
         })
     }
 
-    /// Scan the keyspace to recover entry count and total bytes.
     fn scan_stats(ks: &fjall::Keyspace) -> (usize, usize) {
         let mut count = 0usize;
         let mut bytes = 0usize;
@@ -79,8 +75,6 @@ impl FjallCs {
         (count, bytes)
     }
 
-    /// Evict the oldest entries (by insertion order / key order) until we are
-    /// within capacity. fjall iteration is in key-sorted order.
     fn evict_to_fit(&self, needed: usize) {
         let max = self.max_bytes.load(Ordering::Relaxed);
         let mut current = self.current_bytes.load(Ordering::Relaxed);
@@ -89,7 +83,6 @@ impl FjallCs {
             return;
         }
 
-        // Collect keys to delete — iterate in key order (oldest prefix first).
         let mut to_delete: Vec<(Vec<u8>, usize)> = Vec::new();
         for guard in self.keyspace.iter() {
             if current + needed <= max {
@@ -110,11 +103,9 @@ impl FjallCs {
     }
 }
 
-/// Encode a `Name` into its key bytes: concatenated component TLVs.
 fn name_to_key(name: &Name) -> Vec<u8> {
     let mut key = Vec::new();
     for comp in name.components() {
-        // Write component TLV: type (var) + length (var) + value
         write_var(&mut key, comp.typ);
         write_var(&mut key, comp.value.len() as u64);
         key.extend_from_slice(&comp.value);
@@ -122,7 +113,6 @@ fn name_to_key(name: &Name) -> Vec<u8> {
     key
 }
 
-/// Decode key bytes back into a `Name`.
 fn key_to_name(key: &[u8]) -> Option<Name> {
     use ndn_packet::NameComponent;
     let mut components = smallvec::SmallVec::<[NameComponent; 8]>::new();
@@ -145,7 +135,6 @@ fn key_to_name(key: &[u8]) -> Option<Name> {
     Some(Name::from_components(components))
 }
 
-/// Encode value: [stale_at: 8B BE][wire data bytes]
 fn encode_value(stale_at: u64, data: &[u8]) -> Vec<u8> {
     let mut v = Vec::with_capacity(STALE_AT_LEN + data.len());
     v.extend_from_slice(&stale_at.to_be_bytes());
@@ -153,7 +142,6 @@ fn encode_value(stale_at: u64, data: &[u8]) -> Vec<u8> {
     v
 }
 
-/// Decode value back into (stale_at, data_bytes).
 fn decode_value(val: &[u8]) -> Option<(u64, Bytes)> {
     if val.len() < STALE_AT_LEN {
         return None;
@@ -163,7 +151,6 @@ fn decode_value(val: &[u8]) -> Option<(u64, Bytes)> {
     Some((stale_at, data))
 }
 
-/// Write a TLV-style variable-length unsigned integer.
 fn write_var(buf: &mut Vec<u8>, val: u64) {
     if val < 253 {
         buf.push(val as u8);
@@ -179,7 +166,6 @@ fn write_var(buf: &mut Vec<u8>, val: u64) {
     }
 }
 
-/// Read a TLV-style variable-length unsigned integer. Returns (value, bytes_consumed).
 fn read_var(buf: &[u8]) -> Option<(u64, usize)> {
     if buf.is_empty() {
         return None;
@@ -235,13 +221,11 @@ impl ContentStore for FjallCs {
             !comps.is_empty() && comps.last().unwrap().typ == ndn_packet::tlv_type::IMPLICIT_SHA256;
 
         let entry = if has_implicit_digest {
-            // Build Data name (without digest component) and look up.
             let data_name = Name::from_components(comps[..comps.len() - 1].iter().cloned());
             let key = name_to_key(&data_name);
             let slice = self.keyspace.get(&key).ok()??;
             let (stale_at, data) = decode_value(&slice)?;
 
-            // Verify implicit digest.
             let expected_digest = &comps.last().unwrap().value;
             let actual = ring::digest::digest(&ring::digest::SHA256, &data);
             if expected_digest.as_ref() != actual.as_ref() {
@@ -253,7 +237,6 @@ impl ContentStore for FjallCs {
                 name: Arc::new(data_name),
             }
         } else if interest.selectors().can_be_prefix {
-            // Range scan: find first key with the interest name as prefix.
             let prefix_key = name_to_key(&interest.name);
             let mut found = None;
             for guard in self.keyspace.prefix(&prefix_key) {
@@ -271,7 +254,6 @@ impl ContentStore for FjallCs {
             }
             found?
         } else {
-            // Exact match.
             let key = name_to_key(&interest.name);
             let slice = self.keyspace.get(&key).ok()??;
             let (stale_at, data) = decode_value(&slice)?;
@@ -292,7 +274,6 @@ impl ContentStore for FjallCs {
         let entry_bytes = data.len();
         let key = name_to_key(&name);
 
-        // Check for existing entry.
         let was_present = if let Ok(Some(old_val)) = self.keyspace.get(&key) {
             let old_data_len = old_val.len().saturating_sub(STALE_AT_LEN);
             self.current_bytes
@@ -302,7 +283,6 @@ impl ContentStore for FjallCs {
             false
         };
 
-        // Evict to make room.
         self.evict_to_fit(entry_bytes);
 
         let val = encode_value(meta.stale_at, &data);
@@ -349,7 +329,6 @@ impl ContentStore for FjallCs {
 
     fn set_capacity(&self, max_bytes: usize) {
         self.max_bytes.store(max_bytes, Ordering::Relaxed);
-        // Evict excess.
         self.evict_to_fit(0);
     }
 
@@ -441,7 +420,6 @@ mod tests {
         FjallCs::open(dir.path(), capacity).unwrap()
     }
 
-    // ── key encoding roundtrip ───────────────────────────────────────────────
 
     #[test]
     fn name_key_roundtrip() {
@@ -466,7 +444,6 @@ mod tests {
         assert!(ck.starts_with(&pk));
     }
 
-    // ── basic insert / get ───────────────────────────────────────────────────
 
     #[tokio::test]
     async fn get_miss_returns_none() {
@@ -507,7 +484,6 @@ mod tests {
         assert_eq!(entry.data.as_ref(), b"new");
     }
 
-    // ── must_be_fresh ────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn must_be_fresh_rejects_stale_entry() {
@@ -533,7 +509,6 @@ mod tests {
         assert!(cs.get(&interest(&["a"])).await.is_some());
     }
 
-    // ── can_be_prefix ────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn can_be_prefix_finds_longer_name() {
@@ -560,7 +535,6 @@ mod tests {
         assert!(cs.get(&interest_can_be_prefix(&["a", "b"])).await.is_none());
     }
 
-    // ── evict ────────────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn evict_removes_entry() {
@@ -579,7 +553,6 @@ mod tests {
         assert!(!cs.evict(&arc_name(&["z"])).await);
     }
 
-    // ── capacity eviction ────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn capacity_eviction_keeps_byte_count_bounded() {
@@ -595,7 +568,6 @@ mod tests {
         assert!(cs.get(&interest(&["c"])).await.is_some());
     }
 
-    // ── implicit SHA-256 digest ──────────────────────────────────────────────
 
     #[tokio::test]
     async fn implicit_digest_lookup_matches() {
@@ -630,7 +602,6 @@ mod tests {
         assert!(cs.get(&i).await.is_none());
     }
 
-    // ── len / current_bytes / set_capacity ───────────────────────────────────
 
     #[tokio::test]
     async fn len_tracks_entries() {
@@ -665,7 +636,6 @@ mod tests {
         assert_eq!(cs.variant_name(), "fjall");
     }
 
-    // ── evict_prefix ─────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn evict_prefix_removes_matching_entries() {
@@ -728,7 +698,6 @@ mod tests {
         assert_eq!(cs.len(), 2);
     }
 
-    // ── persistence across reopen ────────────────────────────────────────────
 
     #[tokio::test]
     async fn data_survives_reopen() {

@@ -31,9 +31,7 @@ use crate::{
 
 /// Configuration for the forwarding engine.
 pub struct EngineConfig {
-    /// Capacity of the inter-task channel (backpressure bound).
     pub pipeline_channel_cap: usize,
-    /// Content store byte capacity. Zero disables caching.
     pub cs_capacity_bytes: usize,
     /// Number of parallel pipeline processing threads.
     ///
@@ -56,7 +54,6 @@ impl Default for EngineConfig {
     }
 }
 
-/// Constructs and wires a `ForwarderEngine`.
 pub struct EngineBuilder {
     config: EngineConfig,
     face_table: Arc<FaceTable>,
@@ -70,8 +67,6 @@ pub struct EngineBuilder {
     security_profile: SecurityProfile,
     discovery: Option<Arc<dyn DiscoveryProtocol>>,
     routing_protocols: Vec<Arc<dyn RoutingProtocol>>,
-    /// Static trust schema rules applied at startup in addition to those
-    /// implied by the security profile.
     schema_rules: Vec<SchemaRule>,
 }
 
@@ -94,18 +89,12 @@ impl EngineBuilder {
         }
     }
 
-    /// Pre-allocate a `FaceId` from the engine's face table.
-    ///
-    /// This allows callers to know the ID that will be assigned to a face
-    /// *before* calling `build()`, so the ID can be passed to discovery
-    /// protocols or other components at construction time.  The actual face
-    /// object should be added via `builder.face(…)` or
-    /// `engine.add_face_with_persistency(…)` after `build()`.
+    /// Pre-allocate a `FaceId` before `build()` so it can be passed to
+    /// discovery protocols or other components at construction time.
     pub fn alloc_face_id(&self) -> ndn_transport::FaceId {
         self.face_table.alloc_id()
     }
 
-    /// Register a face to be added at startup.
     pub fn face<F: Face>(mut self, face: F) -> Self {
         self.faces.push(Box::new(move |table| {
             table.insert(face);
@@ -113,115 +102,67 @@ impl EngineBuilder {
         self
     }
 
-    /// Override the forwarding strategy (default: `BestRouteStrategy`).
     pub fn strategy<S: ErasedStrategy>(mut self, s: S) -> Self {
         self.strategy = Some(Arc::new(s));
         self
     }
 
-    /// Set the security manager for signing and verification.
-    ///
-    /// When set, the engine exposes the manager via `ForwarderEngine::security()`
-    /// so pipeline stages and the management layer can access it.
     pub fn security(mut self, mgr: SecurityManager) -> Self {
         self.security = Some(Arc::new(mgr));
         self
     }
 
-    /// Override the content store implementation (default: `LruCs`).
     pub fn content_store(mut self, cs: Arc<dyn ErasedContentStore>) -> Self {
         self.cs = Some(cs);
         self
     }
 
-    /// Override the CS admission policy (default: `DefaultAdmissionPolicy`).
     pub fn admission_policy(mut self, policy: Arc<dyn CsAdmissionPolicy>) -> Self {
         self.admission = Some(policy);
         self
     }
 
-    /// Register a CS observer for hit/miss/insert/eviction events.
-    ///
-    /// When set, the CS is wrapped in [`ObservableCs`] which adds atomic
-    /// counters and calls the observer on every operation.
     pub fn cs_observer(mut self, obs: Arc<dyn CsObserver>) -> Self {
         self.cs_observer = Some(obs);
         self
     }
 
-    /// Set the security profile (default: `SecurityProfile::Default`).
-    ///
-    /// - `Default`: auto-wires validator + cert fetcher from SecurityManager
-    /// - `AcceptSigned`: verify signatures but skip chain walking
-    /// - `Disabled`: no validation (benchmarking only)
-    /// - `Custom(v)`: use a caller-provided validator
     pub fn security_profile(mut self, p: SecurityProfile) -> Self {
         self.security_profile = p;
         self
     }
 
-    /// Add a static trust schema rule loaded at startup.
-    ///
-    /// Rules are added to the validator's schema after the profile's default
-    /// rules are applied. Call this once per rule, or apply many rules by
-    /// iterating over a config list:
-    ///
-    /// ```rust,ignore
-    /// for rule in &config.security.rules {
-    ///     if let Ok(r) = SchemaRule::parse(&format!("{} => {}", rule.data, rule.key)) {
-    ///         builder = builder.schema_rule(r);
-    ///     }
-    /// }
-    /// ```
+    /// Add a static trust schema rule, applied after the profile's default rules.
     pub fn schema_rule(mut self, rule: SchemaRule) -> Self {
         self.schema_rules.push(rule);
         self
     }
 
-    /// Convenience: set a custom validator directly.
     pub fn validator(mut self, v: Arc<Validator>) -> Self {
         self.security_profile = SecurityProfile::Custom(v);
         self
     }
 
-    /// Set the discovery protocol (default: [`NoDiscovery`]).
-    ///
-    /// Use [`CompositeDiscovery`] to run multiple protocols simultaneously.
-    ///
-    /// [`CompositeDiscovery`]: ndn_discovery::CompositeDiscovery
     pub fn discovery<D: DiscoveryProtocol>(mut self, d: D) -> Self {
         self.discovery = Some(Arc::new(d));
         self
     }
 
-    /// Set a pre-boxed discovery protocol.
     pub fn discovery_arc(mut self, d: Arc<dyn DiscoveryProtocol>) -> Self {
         self.discovery = Some(d);
         self
     }
 
-    /// Register a routing protocol to start when the engine is built.
-    ///
-    /// Multiple protocols can be registered; each must use a distinct `origin`
-    /// value. They run as independent Tokio tasks and all write routes into the
-    /// shared RIB. Use [`ForwarderEngine::routing`] after `build()` to enable
-    /// or disable protocols dynamically at runtime.
     pub fn routing_protocol<P: RoutingProtocol>(mut self, proto: P) -> Self {
         self.routing_protocols.push(Arc::new(proto));
         self
     }
 
-    /// Register a cross-layer context enricher.
-    ///
-    /// Enrichers are called before every strategy invocation to populate
-    /// `StrategyContext::extensions` with data from external sources
-    /// (radio metrics, flow stats, location, etc.).
     pub fn context_enricher(mut self, e: Arc<dyn ContextEnricher>) -> Self {
         self.enrichers.push(e);
         self
     }
 
-    /// Build the engine, spawn all tasks, and return handles.
     pub async fn build(self) -> Result<(ForwarderEngine, ShutdownHandle)> {
         let fib = Arc::new(Fib::new());
         let rib = Arc::new(Rib::new());
@@ -237,7 +178,6 @@ impl EngineBuilder {
         let face_table = self.face_table;
         let measurements = Arc::new(MeasurementsTable::new());
 
-        // Register pre-configured faces.
         for add_face in self.faces {
             add_face(Arc::clone(&face_table));
         }
@@ -245,7 +185,6 @@ impl EngineBuilder {
         let cancel = CancellationToken::new();
         let mut tasks = JoinSet::new();
 
-        // PIT expiry task.
         {
             let pit_clone = Arc::clone(&pit);
             let cancel_clone = cancel.clone();
@@ -254,7 +193,6 @@ impl EngineBuilder {
             });
         }
 
-        // RIB expiry task — drains expired routes and recomputes affected FIB entries.
         {
             let rib_clone = Arc::clone(&rib);
             let fib_clone = Arc::clone(&fib);
@@ -264,7 +202,6 @@ impl EngineBuilder {
             });
         }
 
-        // Build strategy table with the default strategy at root.
         let default_strategy: Arc<dyn ErasedStrategy> = self
             .strategy
             .unwrap_or_else(|| Arc::new(BestRouteStrategy::new()));
@@ -273,26 +210,21 @@ impl EngineBuilder {
 
         let face_states = Arc::new(dashmap::DashMap::new());
 
-        // Resolve security profile into validator + cert fetcher.
         let (validator, cert_fetcher) =
             resolve_security_profile(self.security_profile, &self.security);
 
-        // Apply static schema rules from config (e.g. [[security.rule]] entries).
         if let Some(v) = &validator {
             for rule in self.schema_rules {
                 v.add_schema_rule(rule);
             }
         }
 
-        // Keep a clone of the validator Arc for the engine (management API access).
         let engine_validator = validator.clone();
 
-        // Discovery protocol (default: no-op).
         let discovery: Arc<dyn DiscoveryProtocol> =
             self.discovery.unwrap_or_else(|| Arc::new(NoDiscovery));
         let neighbors = NeighborTable::new();
 
-        // Routing manager — owns the RIB→FIB pipeline and running protocols.
         let routing = Arc::new(RoutingManager::new(
             Arc::clone(&rib),
             Arc::clone(&fib),
@@ -301,10 +233,6 @@ impl EngineBuilder {
             cancel.clone(),
         ));
 
-        // Build EngineInner first. `pipeline_tx` is a `OnceLock` so we can
-        // set it after `PacketDispatcher::spawn()` returns the sender, after
-        // the Arc<EngineInner> is already created (needed for the discovery
-        // context Weak back-reference).
         let inner = Arc::new(EngineInner {
             fib: Arc::clone(&fib),
             rib: Arc::clone(&rib),
@@ -323,8 +251,6 @@ impl EngineBuilder {
             discovery_ctx: OnceLock::new(),
         });
 
-        // Create the discovery context with a Weak back-reference to break
-        // the reference cycle (EngineInner → Arc<ctx> → Weak<EngineInner>).
         let discovery_ctx = EngineDiscoveryContext::new(
             Arc::downgrade(&inner),
             Arc::clone(&neighbors),
@@ -377,10 +303,8 @@ impl EngineBuilder {
 
         let pipeline_tx = dispatcher.spawn(cancel.clone(), &mut tasks);
 
-        // Now that we have the pipeline sender, store it in EngineInner.
         let _ = inner.pipeline_tx.set(pipeline_tx);
 
-        // Idle face sweep task.
         {
             let face_states_clone = Arc::clone(&face_states);
             let face_table_clone = Arc::clone(&face_table);
@@ -403,7 +327,6 @@ impl EngineBuilder {
             });
         }
 
-        // Discovery tick task — interval from protocol's tick_interval().
         {
             let d = Arc::clone(&discovery);
             let ctx = Arc::clone(&discovery_ctx);
@@ -423,12 +346,10 @@ impl EngineBuilder {
             });
         }
 
-        // Notify discovery about faces registered before build().
         for face_id in face_table.face_ids() {
             discovery.on_face_up(face_id, &*discovery_ctx);
         }
 
-        // Start any routing protocols registered before build().
         for proto in self.routing_protocols {
             routing.enable(proto);
         }
@@ -439,7 +360,6 @@ impl EngineBuilder {
     }
 }
 
-/// Resolve a `SecurityProfile` into a concrete validator and optional cert fetcher.
 fn resolve_security_profile(
     profile: SecurityProfile,
     security: &Option<Arc<SecurityManager>>,
@@ -455,8 +375,6 @@ fn resolve_security_profile(
             let schema = TrustSchema::accept_all();
             let validator = if let Some(mgr) = security {
                 let cert_cache = Arc::new(CertCache::new());
-                // Pre-populate from manager's cache.
-                // Trust anchors make AcceptSigned succeed for cached certs.
                 let anchors = Arc::new(dashmap::DashMap::new());
                 for name in mgr.trust_anchor_names() {
                     if let Some(cert) = mgr.trust_anchor(&name) {
@@ -466,7 +384,6 @@ fn resolve_security_profile(
                 }
                 Arc::new(Validator::with_chain(schema, cert_cache, anchors, None, 1))
             } else {
-                // No manager — accept_all schema with empty cache.
                 Arc::new(Validator::new(schema))
             };
             (Some(validator), None)
@@ -474,13 +391,8 @@ fn resolve_security_profile(
 
         SecurityProfile::Default => {
             let Some(mgr) = security else {
-                // No SecurityManager configured — fall back to AcceptSigned.
-                // Every Data packet must carry a cryptographically valid signature
-                // (DigestSha256 or stronger), but no trust anchor or namespace
-                // hierarchy is enforced.
-                //
-                // Configure a [security] block with trust anchors for full
-                // hierarchical validation.
+                // No SecurityManager — fall back to AcceptSigned (signature
+                // required, hierarchy not enforced).
                 tracing::info!(
                     "No SecurityManager configured; using AcceptSigned validation \
                      (DigestSha256 or stronger required, hierarchy not enforced). \
@@ -495,7 +407,6 @@ fn resolve_security_profile(
             let cert_cache = Arc::new(CertCache::new());
             let anchors = Arc::new(dashmap::DashMap::new());
 
-            // Load trust anchors from the manager.
             for name in mgr.trust_anchor_names() {
                 if let Some(cert) = mgr.trust_anchor(&name) {
                     cert_cache.insert(cert.clone());
@@ -503,10 +414,8 @@ fn resolve_security_profile(
                 }
             }
 
-            // Build a CertFetcher. The FetchFn is a no-op placeholder for now;
-            // the router wires a real one via AppFace after engine construction.
-            // Certs pre-loaded from trust anchors will satisfy most chain walks
-            // without fetching.
+            // No-op FetchFn placeholder; the router wires a real one via
+            // AppFace after engine construction.
             let fetcher = Arc::new(CertFetcher::new(
                 Arc::clone(&cert_cache),
                 Arc::new(|_name| Box::pin(async { None })),

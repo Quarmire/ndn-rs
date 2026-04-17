@@ -7,7 +7,6 @@ use ndn_transport::FaceId;
 // ndn-engine to avoid a circular dependency.
 pub use ndn_transport::{ForwardingAction, NackReason};
 
-/// Reason a packet was dropped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DropReason {
     MalformedPacket,
@@ -27,21 +26,14 @@ pub enum DropReason {
     Other,
 }
 
-/// The return value from a pipeline stage.
-///
-/// Ownership-based: `Continue` returns the context back to the runner.
-/// All other variants consume the context, making it a compiler error to
-/// use the context after it has been handed off.
+/// Ownership-based return from a pipeline stage: `Continue` returns the
+/// context to the runner; all other variants consume it, making
+/// use-after-hand-off a compile error.
 pub enum Action {
-    /// Pass context to the next stage.
     Continue(super::context::PacketContext),
-    /// Forward the packet to the given faces and exit the pipeline.
     Send(super::context::PacketContext, SmallVec<[FaceId; 4]>),
-    /// Satisfy pending PIT entries and exit the pipeline.
     Satisfy(super::context::PacketContext),
-    /// Drop the packet silently.
     Drop(DropReason),
-    /// Send a Nack back to the incoming face.
     Nack(super::context::PacketContext, NackReason),
 }
 

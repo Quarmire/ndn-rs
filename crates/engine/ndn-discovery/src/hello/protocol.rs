@@ -1,11 +1,6 @@
 //! `HelloProtocol<T>` — generic SWIM/hello/probe discovery state machine.
 //!
-//! Implements the shared logic for NDN neighbor discovery: hello
-//! Interest/Data exchange, SWIM direct and indirect probes, gossip diff
-//! piggyback, and the Established→Stale→Absent neighbor lifecycle.
-//!
-//! Link-specific operations (address extraction, face creation, packet
-//! signing) are delegated to a [`LinkMedium`] implementation.
+//! Link-specific operations are delegated to a [`LinkMedium`] implementation.
 
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -31,43 +26,29 @@ use crate::{
 };
 
 /// Generic neighbor discovery protocol over any [`LinkMedium`].
-///
-/// Contains the shared SWIM/hello/probe state machine and delegates to `T`
-/// for link-specific operations.  Concrete types are typically exposed via
-/// type aliases:
-///
-/// ```text
-/// pub type UdpNeighborDiscovery = HelloProtocol<UdpMedium>;
-/// pub type EtherNeighborDiscovery = HelloProtocol<EtherMedium>;
-/// ```
 pub struct HelloProtocol<T: LinkMedium> {
     pub core: HelloCore,
     pub medium: T,
 }
 
 impl<T: LinkMedium> HelloProtocol<T> {
-    /// Create a new `HelloProtocol` with the given medium, node name, and config.
     pub fn create(medium: T, node_name: Name, config: crate::config::DiscoveryConfig) -> Self {
         let core = HelloCore::new(node_name, config);
         Self { core, medium }
     }
 
-    /// Access the shared core state.
     pub fn core(&self) -> &HelloCore {
         &self.core
     }
 
-    /// Access the link medium.
     pub fn medium(&self) -> &T {
         &self.medium
     }
 
-    /// Set the prefixes this node serves (announced in Hello Data when InHello mode).
     pub fn set_served_prefixes(&self, prefixes: Vec<Name>) {
         *self.core.served_prefixes.lock().unwrap() = prefixes;
     }
 
-    // ── Shared packet builders ───────────────────────────────────────────────
 
     pub fn build_hello_interest(&self, nonce: u32) -> Bytes {
         let hello_interval_base = self.core.config.read().unwrap().hello_interval_base;
@@ -86,10 +67,6 @@ impl<T: LinkMedium> HelloProtocol<T> {
         w.finish()
     }
 
-    /// Build a `HelloPayload` from the current shared state.
-    ///
-    /// Called by `LinkMedium::build_hello_data` to get the payload content
-    /// before applying link-specific signing.
     pub fn build_hello_payload(&self) -> HelloPayload {
         let mut payload = HelloPayload::new(self.core.node_name.clone());
         if self.core.config.read().unwrap().prefix_announcement == PrefixAnnouncementMode::InHello {
@@ -106,7 +83,6 @@ impl<T: LinkMedium> HelloProtocol<T> {
         payload
     }
 
-    // ── Shared inbound handlers ──────────────────────────────────────────────
 
     fn handle_hello_data(
         &self,
@@ -152,7 +128,6 @@ impl<T: LinkMedium> HelloProtocol<T> {
             }
         };
 
-        // Link-specific: verify signature, extract address, create face.
         let (responder_name, peer_face_id) = match self
             .medium
             .verify_and_ensure_peer(raw, &payload, meta, &self.core, ctx)
@@ -161,7 +136,6 @@ impl<T: LinkMedium> HelloProtocol<T> {
             None => return true,
         };
 
-        // Update neighbor to Established.
         ctx.update_neighbor(NeighborUpdate::SetState {
             name: responder_name.clone(),
             state: NeighborState::Established {
@@ -169,7 +143,6 @@ impl<T: LinkMedium> HelloProtocol<T> {
             },
         });
 
-        // Record RTT if we have a matching send time.
         if let Some(sent) = send_time {
             let rtt = sent.elapsed();
             let rtt_us = rtt.as_micros().min(u32::MAX as u128) as u32;
@@ -180,7 +153,6 @@ impl<T: LinkMedium> HelloProtocol<T> {
             self.core.strategy.lock().unwrap().on_probe_success(rtt);
         }
 
-        // Auto-populate FIB with served prefixes (InHello mode).
         if self.core.config.read().unwrap().prefix_announcement == PrefixAnnouncementMode::InHello
             && let Some(face_id) = peer_face_id
         {
@@ -193,10 +165,8 @@ impl<T: LinkMedium> HelloProtocol<T> {
             }
         }
 
-        // Apply piggybacked SWIM gossip diffs.
         self.apply_neighbor_diffs(&payload, ctx);
 
-        // Record this neighbor for our own outbound diffs.
         {
             let mut st = self.core.state.lock().unwrap();
             st.recent_diffs.push_back(DiffEntry::Add(responder_name));
@@ -364,7 +334,6 @@ impl<T: LinkMedium> HelloProtocol<T> {
     }
 }
 
-// ── DiscoveryProtocol impl ──────────────────────────────────────────────────
 
 impl<T: LinkMedium> DiscoveryProtocol for HelloProtocol<T> {
     fn protocol_id(&self) -> ProtocolId {
@@ -443,7 +412,6 @@ impl<T: LinkMedium> DiscoveryProtocol for HelloProtocol<T> {
     fn on_tick(&self, now: Instant, ctx: &dyn DiscoveryContext) {
         let protocol = self.medium.protocol_id();
 
-        // Read config once per tick to avoid repeated lock acquisitions.
         let (liveness_timeout, miss_limit, gossip_k, swim_k, probe_timeout) = {
             let cfg = self.core.config.read().unwrap();
             (
@@ -455,7 +423,6 @@ impl<T: LinkMedium> DiscoveryProtocol for HelloProtocol<T> {
             )
         };
 
-        // ── Hello probe scheduling ───────────────────────────────────────────
         let probes = { self.core.strategy.lock().unwrap().on_tick(now) };
         for probe in probes {
             match probe {
@@ -485,7 +452,6 @@ impl<T: LinkMedium> DiscoveryProtocol for HelloProtocol<T> {
             }
         }
 
-        // ── Neighbor state machine ───────────────────────────────────────────
         let all = ctx.neighbors().all();
         for entry in &all {
             match &entry.state {
@@ -503,7 +469,6 @@ impl<T: LinkMedium> DiscoveryProtocol for HelloProtocol<T> {
                             .lock()
                             .unwrap()
                             .trigger(TriggerEvent::NeighborStale);
-                        // Send unicast hello directly to the stale neighbor's face.
                         if let Some((face_id, _, _)) = entry.faces.first() {
                             let nonce = self.core.nonce_counter.fetch_add(1, Ordering::Relaxed);
                             ctx.send_on(*face_id, self.build_hello_interest(nonce));
@@ -514,7 +479,6 @@ impl<T: LinkMedium> DiscoveryProtocol for HelloProtocol<T> {
                                 .pending_probes
                                 .insert(nonce, now);
                         }
-                        // Emergency gossip: K unicast hellos to other established peers.
                         if gossip_k > 0 {
                             let stale_name = &entry.node_name;
                             let peers: Vec<FaceId> = all
@@ -545,7 +509,6 @@ impl<T: LinkMedium> DiscoveryProtocol for HelloProtocol<T> {
                             peer = %entry.node_name, miss_count,
                             "{protocol}: peer unreachable, removing"
                         );
-                        // Link-specific cleanup (e.g. remove peer_faces for UDP).
                         {
                             let mut st = self.core.state.lock().unwrap();
                             self.medium.on_peer_removed(entry, &mut st);
@@ -574,7 +537,6 @@ impl<T: LinkMedium> DiscoveryProtocol for HelloProtocol<T> {
             }
         }
 
-        // ── SWIM direct probes to established neighbors ──────────────────────
         if swim_k > 0 {
             for entry in all.iter().filter(|e| e.is_reachable()) {
                 if let Some((face_id, _, _)) = entry.faces.first() {
@@ -594,7 +556,6 @@ impl<T: LinkMedium> DiscoveryProtocol for HelloProtocol<T> {
             }
         }
 
-        // ── Expire hello pending probes ──────────────────────────────────────
         let mut timed_out = 0u32;
         {
             let mut st = self.core.state.lock().unwrap();
@@ -614,7 +575,6 @@ impl<T: LinkMedium> DiscoveryProtocol for HelloProtocol<T> {
             }
         }
 
-        // ── Expire SWIM direct probes; dispatch indirect probes on failure ───
         if swim_k > 0 {
             let k = swim_k;
             let mut timed_out_swim: Vec<Name> = Vec::new();

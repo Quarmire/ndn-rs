@@ -244,11 +244,9 @@ impl Subscriber {
         let cancel = tokio_util::sync::CancellationToken::new();
         let (sample_tx, sample_rx) = mpsc::channel(config.svs.channel_capacity);
 
-        // Channels for sync protocol ↔ network.
         let (net_send_tx, mut net_send_rx) = mpsc::channel::<Bytes>(64);
         let (net_recv_tx, net_recv_rx) = mpsc::channel::<Bytes>(64);
 
-        // Join the SVS group.
         let mut sync_handle = ndn_sync::join_svs_group(
             group.clone(),
             local_name,
@@ -261,7 +259,6 @@ impl Subscriber {
         let fetch_timeout = config.fetch_timeout;
         let conn = Arc::new(conn);
 
-        // Network send pump: forward sync Interests to the router.
         let conn_send = Arc::clone(&conn);
         let cancel_send = cancel.clone();
         tokio::spawn(async move {
@@ -275,9 +272,8 @@ impl Subscriber {
             }
         });
 
-        // Network recv pump: read packets from the connection, forward sync
-        // Interests to the SVS task via net_recv_tx. Non-sync packets
-        // (Data responses for auto-fetch) are handled by the fetch path.
+        // Non-sync packets (Data responses for auto-fetch) are handled by
+        // the fetch path, not forwarded here.
         let conn_recv = Arc::clone(&conn);
         let cancel_recv = cancel.clone();
         tokio::spawn(async move {
@@ -286,16 +282,12 @@ impl Subscriber {
                     _ = cancel_recv.cancelled() => break,
                     pkt = conn_recv.recv() => match pkt {
                         Some(raw) => {
-                            // Simple heuristic: if the raw packet starts with
-                            // the sync group prefix, it's likely a sync Interest.
-                            // Forward everything to the sync task — it will
-                            // ignore what it doesn't understand.
+                            // 0x05 = Interest TLV type; forward to SVS task which
+                            // ignores non-sync Interests. Data (0x06) is consumed
+                            // by fetch tasks via separate recv calls.
                             if raw.len() > 2 && raw.starts_with(&[0x05]) {
-                                // Interest type (0x05) — could be sync
                                 let _ = net_recv_tx.send(raw).await;
                             }
-                            // Data packets (0x06) are consumed by fetch tasks
-                            // via separate recv calls and don't need routing here.
                         }
                         None => break,
                     }
@@ -303,7 +295,6 @@ impl Subscriber {
             }
         });
 
-        // Update processor: receive sync updates, optionally fetch data.
         let conn_fetch = Arc::clone(&conn);
         let task_cancel = cancel.clone();
         tokio::spawn(async move {
@@ -353,7 +344,6 @@ async fn fetch_data(conn: &NdnConnection, name: &Name, timeout: Duration) -> Opt
     let wire = encode_interest(name, None);
     conn.send(wire).await.ok()?;
     let reply = tokio::time::timeout(timeout, conn.recv()).await.ok()??;
-    // Decode to verify it's valid Data and extract content.
     let data = Data::decode(reply).ok()?;
     data.content().cloned()
 }

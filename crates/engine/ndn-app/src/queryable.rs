@@ -41,7 +41,6 @@ pub struct Query {
 }
 
 impl Query {
-    /// Send a Data reply for this query.
     pub async fn reply(&self, data: Bytes) -> Result<(), AppError> {
         self.conn.send(data).await
     }
@@ -54,7 +53,6 @@ pub struct Queryable {
 }
 
 impl Queryable {
-    /// Connect to an external router and register a prefix.
     pub async fn connect(
         socket: impl AsRef<Path>,
         prefix: impl Into<Name>,
@@ -81,7 +79,6 @@ impl Queryable {
         }
     }
 
-    /// The registered prefix.
     pub fn prefix(&self) -> &Name {
         &self.prefix
     }

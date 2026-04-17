@@ -14,8 +14,6 @@ use serde::{Deserialize, Serialize};
 
 use super::document::DidDocument;
 
-// ── Resolution options ────────────────────────────────────────────────────────
-
 /// Input options for DID resolution, per W3C DID Core §7.1.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DidResolutionOptions {
@@ -24,8 +22,6 @@ pub struct DidResolutionOptions {
     #[serde(rename = "accept", skip_serializing_if = "Option::is_none")]
     pub accept: Option<String>,
 }
-
-// ── Document metadata ─────────────────────────────────────────────────────────
 
 /// Metadata about the DID Document itself (not the DID or resolution process).
 ///
@@ -81,8 +77,6 @@ impl DidDocumentMetadata {
     }
 }
 
-// ── Resolution error codes ────────────────────────────────────────────────────
-
 /// Standardized DID resolution error codes per W3C DID Core §7.1.2.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -114,8 +108,6 @@ impl std::fmt::Display for DidResolutionError {
         f.write_str(s)
     }
 }
-
-// ── Resolution metadata ───────────────────────────────────────────────────────
 
 /// Metadata about the DID resolution process itself.
 ///
@@ -158,8 +150,6 @@ impl DidResolutionMetadata {
     }
 }
 
-// ── Resolution result ─────────────────────────────────────────────────────────
-
 /// The complete output of a DID resolution operation.
 ///
 /// Per W3C DID Core §7.1, `resolve(did, options)` returns a tuple of:
@@ -177,7 +167,6 @@ pub struct DidResolutionResult {
 }
 
 impl DidResolutionResult {
-    /// Successful resolution result.
     pub fn ok(document: DidDocument) -> Self {
         Self {
             did_document: Some(document),
@@ -186,7 +175,6 @@ impl DidResolutionResult {
         }
     }
 
-    /// Successful resolution with document metadata (e.g. deactivated flag).
     pub fn ok_with_metadata(document: DidDocument, doc_meta: DidDocumentMetadata) -> Self {
         Self {
             did_document: Some(document),
@@ -195,7 +183,6 @@ impl DidResolutionResult {
         }
     }
 
-    /// Failed resolution.
     pub fn err(code: DidResolutionError, message: impl Into<String>) -> Self {
         Self {
             did_document: None,
@@ -235,7 +222,6 @@ impl DidResolutionResult {
         }
     }
 
-    /// Whether this DID has been deactivated.
     pub fn is_deactivated(&self) -> bool {
         self.did_document_metadata.deactivated.unwrap_or(false)
     }

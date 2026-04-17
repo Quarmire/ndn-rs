@@ -90,17 +90,11 @@ impl ForwarderConfig {
         s.parse()
     }
 
-    /// Validate the parsed config for obvious errors.
-    ///
-    /// Called automatically from [`from_str`]. Returns [`ConfigError::Invalid`]
-    /// describing the first problem found.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        // Validate face URIs and addresses.
         for face in &self.faces {
             validate_face_config(face)?;
         }
 
-        // Validate route costs.
         for route in &self.routes {
             if route.prefix.is_empty() {
                 return Err(ConfigError::Invalid(
@@ -109,7 +103,6 @@ impl ForwarderConfig {
             }
         }
 
-        // Validate CS capacity sanity (> 0 MB when not disabled).
         if self.engine.cs_capacity_mb > 65536 {
             return Err(ConfigError::Invalid(format!(
                 "engine.cs_capacity_mb ({}) is unreasonably large (max 65536 MB)",
@@ -120,16 +113,12 @@ impl ForwarderConfig {
         Ok(())
     }
 
-    /// Serialize to a TOML string.
     pub fn to_toml_string(&self) -> Result<String, ConfigError> {
         toml::to_string_pretty(self).map_err(|e| ConfigError::Invalid(e.to_string()))
     }
 }
 
 /// Expand `${VAR}` environment variable references in a TOML string.
-///
-/// Each `${VAR}` is replaced with `std::env::var(VAR)`. If the variable is
-/// not set, it is replaced with an empty string and a warning is logged.
 fn expand_env_vars(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
@@ -140,7 +129,6 @@ fn expand_env_vars(s: &str) -> String {
             match std::env::var(&var_name) {
                 Ok(val) => result.push_str(&val),
                 Err(_) => {
-                    // Unknown variable — replace with empty string and warn on stderr.
                     eprintln!(
                         "ndn-config: unknown env var ${{{var_name}}}, replacing with empty string"
                     );
@@ -153,7 +141,6 @@ fn expand_env_vars(s: &str) -> String {
     result
 }
 
-/// Validate a single `FaceConfig` for obviously invalid fields.
 fn validate_face_config(face: &FaceConfig) -> Result<(), ConfigError> {
     match face {
         FaceConfig::Udp { bind, remote } | FaceConfig::Tcp { bind, remote } => {
@@ -207,34 +194,21 @@ fn validate_face_config(face: &FaceConfig) -> Result<(), ConfigError> {
                 ));
             }
         }
-        FaceConfig::Unix { .. } | FaceConfig::EtherMulticast { .. } => {
-            // No additional validation needed for these face types.
-        }
+        FaceConfig::Unix { .. } | FaceConfig::EtherMulticast { .. } => {}
     }
     Ok(())
 }
 
 /// Content store configuration.
-///
-/// ```toml
-/// [cs]
-/// variant = "lru"           # "lru" (default), "sharded-lru", "null"
-/// capacity_mb = 64
-/// shards = 4                # only for "sharded-lru"
-/// admission_policy = "default"  # "default" or "admit-all"
-/// ```
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CsConfig {
-    /// CS implementation variant.
     #[serde(default = "default_cs_variant")]
     pub variant: String,
-    /// Capacity in megabytes (0 = disable).
     #[serde(default = "default_cs_capacity_mb")]
     pub capacity_mb: usize,
-    /// Number of shards (only for "sharded-lru").
+    /// Only for "sharded-lru".
     #[serde(default)]
     pub shards: Option<usize>,
-    /// Admission policy: "default" or "admit-all".
     #[serde(default = "default_admission_policy")]
     pub admission_policy: String,
 }
@@ -263,18 +237,10 @@ impl Default for CsConfig {
 /// Engine tuning parameters.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct EngineConfig {
-    /// Content store capacity in megabytes (0 = disable).
-    /// Deprecated: use `[cs] capacity_mb` instead. Kept for backward compatibility.
+    /// Deprecated: use `[cs] capacity_mb` instead.
     pub cs_capacity_mb: usize,
-    /// Pipeline inter-task channel capacity (backpressure).
     pub pipeline_channel_cap: usize,
-    /// Number of parallel pipeline processing threads.
-    ///
-    /// - `0` (default): auto-detect from available CPU parallelism.
-    /// - `1`: single-threaded — all pipeline processing runs inline in the
-    ///   pipeline runner task (lowest latency, no task spawn overhead).
-    /// - `N`: spawn up to N concurrent tokio tasks per batch for pipeline
-    ///   processing (highest throughput on multi-core systems).
+    /// 0 = auto-detect, 1 = single-threaded inline, N = parallel tasks.
     #[serde(default)]
     pub pipeline_threads: usize,
 }
@@ -289,23 +255,7 @@ impl Default for EngineConfig {
     }
 }
 
-/// Configuration for a single face.
-///
-/// Each variant carries only the fields relevant to that transport type,
-/// making invalid combinations unrepresentable at parse time.
-///
-/// TOML syntax is unchanged — the `kind` field selects the variant:
-///
-/// ```toml
-/// [[face]]
-/// kind = "udp"
-/// bind = "0.0.0.0:6363"
-///
-/// [[face]]
-/// kind = "serial"
-/// path = "/dev/ttyUSB0"
-/// baud = 115200
-/// ```
+/// Configuration for a single face. The `kind` tag selects the variant.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum FaceConfig {
@@ -471,19 +421,13 @@ fn default_udp_iface_blacklist() -> Vec<String> {
     vec!["lo".to_owned(), "lo0".to_owned()]
 }
 
-/// Re-export the canonical `FaceKind` from `ndn-transport` — single source of
-/// truth for all face type classification.  Serde support is enabled via the
-/// `serde` feature on `ndn-transport`.
 pub use ndn_transport::FaceKind;
 
-/// A static FIB route entry.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RouteConfig {
-    /// NDN name prefix (e.g., `"/ndn"`).
     pub prefix: String,
     /// Zero-based face index (matches order in `faces`).
     pub face: usize,
-    /// Routing cost (lower is preferred).
     #[serde(default = "default_cost")]
     pub cost: u32,
 }
@@ -590,73 +534,29 @@ pub struct SecurityConfig {
     #[serde(default = "default_security_profile")]
     pub profile: String,
 
-    // ── NDNCERT CA (optional) ─────────────────────────────────────────────────
-    /// NDN name prefix for the built-in NDNCERT CA, e.g. `/ndn/edu/example/CA`.
-    ///
-    /// When set, the router registers handlers under `<ca_prefix>/CA/INFO`,
-    /// `<ca_prefix>/CA/PROBE`, `<ca_prefix>/CA/NEW`, and `<ca_prefix>/CA/CHALLENGE`.
-    ///
-    /// Leave unset to run in client-only mode (no CA hosted).
+    /// NDN name prefix for the built-in NDNCERT CA. Unset = client-only mode.
     #[serde(default)]
     pub ca_prefix: Option<String>,
 
-    /// Human-readable description of this CA, returned in CA INFO responses.
-    ///
-    /// Example: `"NDN Test Network CA"`.
     #[serde(default)]
     pub ca_info: String,
 
-    /// Maximum certificate lifetime (days) the CA will issue.
-    ///
-    /// Requests for longer validity are silently capped to this value.
-    /// Default: `365`.
     #[serde(default = "default_ca_max_validity_days")]
     pub ca_max_validity_days: u32,
 
-    /// Supported NDNCERT challenge types offered by the CA.
-    ///
-    /// Recognised values: `"token"`, `"pin"`, `"possession"`, `"email"`,
-    /// `"yubikey-hotp"`.  Default: `["token"]`.
+    /// Recognised: `"token"`, `"pin"`, `"possession"`, `"email"`, `"yubikey-hotp"`.
     #[serde(default = "default_ca_challenges")]
     pub ca_challenges: Vec<String>,
 
-    /// Static trust schema rules loaded at startup.
-    ///
-    /// These are added to the active validator's schema on startup in
-    /// addition to the rules implied by the `profile` setting.
-    ///
-    /// When `profile = "default"` the hierarchical rule is pre-loaded; additional
-    /// `[[security.rule]]` entries extend it. When `profile = "accept-signed"` the
-    /// accept-all rule is pre-loaded; additional rules are appended. When
-    /// `profile = "disabled"` this field is ignored.
-    ///
-    /// Rules can also be added or removed at runtime via the management API:
-    /// `/localhost/nfd/security/schema-rule-add` and `schema-rule-remove`.
+    /// Trust schema rules loaded at startup (extend the profile's defaults).
     #[serde(default, rename = "rule")]
     pub rules: Vec<TrustRuleConfig>,
 
-    // ── PIB backing store ─────────────────────────────────────────────────────
-    /// Key backing store type.
-    ///
-    /// - `"file"` — file-based PIB at `pib_path` (default, persisted across restarts)
-    /// - `"memory"` — ephemeral in-memory store; keys are lost on restart
-    ///
-    /// When `identity` is set and the PIB cannot be opened, the router falls
-    /// back to an ephemeral identity and logs a warning (or shows an interactive
-    /// recovery prompt when running in a terminal).
-    ///
-    /// Default: `"file"`.
+    /// `"file"` (default, persistent) or `"memory"` (ephemeral).
     #[serde(default = "default_pib_type")]
     pub pib_type: String,
 
-    /// NDN name prefix for the auto-generated ephemeral identity.
-    ///
-    /// When no `identity` is configured (or the PIB fails), an in-memory key is
-    /// generated under `<ephemeral_prefix>/<hostname>`.  If not set, the router
-    /// derives the name from the system hostname (e.g. `/ndn-fwd/router-host`).
-    ///
-    /// Set this to enforce a deterministic name for ephemeral identities, e.g.
-    /// in test environments where the hostname varies.
+    /// Prefix for auto-generated ephemeral identity (defaults to hostname).
     #[serde(default)]
     pub ephemeral_prefix: Option<String>,
 }
@@ -666,9 +566,7 @@ fn default_pib_type() -> String {
 }
 
 fn default_security_profile() -> String {
-    // Match NFD's default: forwarder does not validate Data at the network layer.
-    // Validation is a consumer-side concern in NDN; enable "default" or "accept-signed"
-    // explicitly if you want the forwarder to enforce signatures.
+    // Matches NFD: validation is a consumer-side concern in NDN.
     "disabled".to_owned()
 }
 
@@ -725,117 +623,56 @@ impl Default for LoggingConfig {
     }
 }
 
-// ─── Discovery TOML config ────────────────────────────────────────────────────
-
-/// `[discovery]` section — neighbor and service discovery configuration.
-///
-/// Discovery is disabled unless `node_name` is set.
-///
-/// ```toml
-/// [discovery]
-/// profile = "lan"
-/// node_name = "/ndn/site/myrouter"
-/// served_prefixes = ["/ndn/site/sensors"]
-/// # optional per-field overrides:
-/// hello_interval_base_ms = 5000
-/// hello_interval_max_ms  = 60000
-/// liveness_miss_count    = 3
-/// gossip_fanout          = 3
-/// relay_records          = false
-/// auto_fib_cost          = 100
-/// auto_fib_ttl_multiplier = 2.0
-/// ```
+/// `[discovery]` section. Discovery is disabled unless `node_name` is set.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct DiscoveryTomlConfig {
-    /// Deployment profile name: `static`, `lan`, `campus`, `mobile`,
-    /// `high-mobility`, or `asymmetric`.  Defaults to `lan`.
     #[serde(default)]
     pub profile: Option<String>,
 
-    /// This node's NDN name.  **Required** to enable discovery.
-    ///
-    /// If the value ends with `/`, the system hostname is appended
-    /// automatically (e.g. `"/ndn/site/"` → `"/ndn/site/router1"`).
+    /// Required to enable discovery. Trailing `/` appends hostname automatically.
     #[serde(default)]
     pub node_name: Option<String>,
 
-    /// Prefixes published as service records at startup via
-    /// `ServiceDiscoveryProtocol::publish()`.
     #[serde(default)]
     pub served_prefixes: Vec<String>,
 
-    // ── Per-field overrides (supplement the profile defaults) ─────────────
-    /// Override `hello_interval_base` in milliseconds.
     #[serde(default)]
     pub hello_interval_base_ms: Option<u64>,
-
-    /// Override `hello_interval_max` in milliseconds.
     #[serde(default)]
     pub hello_interval_max_ms: Option<u64>,
-
-    /// Override `liveness_miss_count`.
     #[serde(default)]
     pub liveness_miss_count: Option<u32>,
-
-    /// Override SWIM indirect-probe fanout K.
     #[serde(default)]
     pub swim_indirect_fanout: Option<u32>,
-
-    /// Override gossip broadcast fanout.
     #[serde(default)]
     pub gossip_fanout: Option<u32>,
-
-    /// Override `relay_records` in `ServiceDiscoveryConfig`.
     #[serde(default)]
     pub relay_records: Option<bool>,
-
-    /// Override auto-FIB route cost.
     #[serde(default)]
     pub auto_fib_cost: Option<u32>,
-
-    /// Override auto-FIB TTL multiplier.
     #[serde(default)]
     pub auto_fib_ttl_multiplier: Option<f32>,
-
-    /// Optional PIB (public information base) path for persistent key storage.
-    /// Defaults to `~/.ndn/pib.db`.
     #[serde(default)]
     pub pib_path: Option<String>,
 
-    /// Key name for signing hello packets.  If absent, a deterministic
-    /// ephemeral Ed25519 key is auto-generated from the node name.
+    /// If absent, an ephemeral Ed25519 key is auto-generated from node name.
     #[serde(default)]
     pub key_name: Option<String>,
 
-    /// Which link-layer transports to run discovery on.
-    ///
-    /// Accepted values:
-    /// - `"udp"` (default): UDP multicast only (`224.0.23.170:6363`).
-    /// - `"ether"`: raw Ethernet multicast only (EtherType 0x8624).
-    /// - `"both"`: UDP and Ethernet simultaneously.
-    ///
-    /// Ethernet discovery requires `CAP_NET_RAW` / root on Linux, or root on
-    /// macOS (PF_NDRV).  The `ether` and `both` options also require at least
-    /// one `[[face]]` entry with `kind = "ether-multicast"` (providing the
-    /// `FaceId` and interface name).
+    /// `"udp"` (default), `"ether"`, or `"both"`. Ethernet requires CAP_NET_RAW.
     #[serde(default)]
     pub discovery_transport: Option<String>,
 
-    /// Network interface name for Ethernet discovery (e.g. `"eth0"`, `"en0"`).
-    ///
     /// Required when `discovery_transport` is `"ether"` or `"both"`.
     #[serde(default)]
     pub ether_iface: Option<String>,
 }
 
 impl DiscoveryTomlConfig {
-    /// Returns `true` if discovery is enabled (i.e. `node_name` is set).
     pub fn enabled(&self) -> bool {
         self.node_name.is_some()
     }
 
-    /// Resolve the effective node name, appending the system hostname if
-    /// `node_name` ends with `/`.
     pub fn resolved_node_name(&self) -> Option<String> {
         let raw = self.node_name.as_deref()?;
         if raw.ends_with('/') {
@@ -848,7 +685,6 @@ impl DiscoveryTomlConfig {
 
     fn hostname() -> String {
         std::env::var("HOSTNAME").unwrap_or_else(|_| {
-            // Fallback: read from /etc/hostname or use "localhost".
             std::fs::read_to_string("/etc/hostname")
                 .map(|s| s.trim().to_owned())
                 .unwrap_or_else(|_| "localhost".to_owned())

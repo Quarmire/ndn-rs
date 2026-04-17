@@ -4,7 +4,6 @@ use std::sync::{Arc, Mutex};
 
 use crate::{Face, FaceId};
 
-/// Result type for [`ErasedFace::recv_bytes_with_addr`].
 type RecvWithAddrResult =
     Result<(bytes::Bytes, Option<crate::face::FaceAddr>), crate::face::FaceError>;
 
@@ -50,10 +49,6 @@ pub trait ErasedFace: Send + Sync + 'static {
     >;
 
     /// Object-safe version of [`Face::recv_with_addr`].
-    ///
-    /// Returns the raw packet together with the link-layer sender address
-    /// when the face type exposes it (e.g. multicast UDP). Returns `None`
-    /// for faces that receive from a single known peer.
     fn recv_bytes_with_addr(
         &self,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = RecvWithAddrResult> + Send + '_>>;
@@ -114,7 +109,7 @@ impl<F: Face> ErasedFace for F {
     }
 }
 
-/// Snapshot of a face's metadata for reporting/display.
+/// Snapshot of a face's metadata.
 #[derive(Debug, Clone)]
 pub struct FaceInfo {
     pub id: FaceId,
@@ -140,16 +135,12 @@ impl FaceTable {
     }
 
     /// Allocate the next available `FaceId`, reusing a recycled ID if possible.
-    ///
-    /// Never returns an ID in the reserved range (`>= RESERVED_FACE_ID_MIN`).
     pub fn alloc_id(&self) -> FaceId {
-        // Prefer a recycled ID.
         if let Ok(mut free) = self.free.lock()
             && let Some(id) = free.pop()
         {
             return FaceId(id);
         }
-        // Otherwise allocate a fresh one, skipping over the reserved range.
         loop {
             let id = self
                 .next_id
@@ -157,7 +148,6 @@ impl FaceTable {
             if id < RESERVED_FACE_ID_MIN {
                 return FaceId(id);
             }
-            // Wrap back to 1 and retry.
             let _ = self.next_id.compare_exchange(
                 id.wrapping_add(1),
                 1,
@@ -167,7 +157,6 @@ impl FaceTable {
         }
     }
 
-    /// Register a face. Returns the assigned `FaceId`.
     pub fn insert<F: Face>(&self, face: F) -> FaceId {
         let id = face.id();
         let arc: Arc<dyn ErasedFace> = Arc::new(face);
@@ -178,8 +167,7 @@ impl FaceTable {
         id
     }
 
-    /// Register a pre-wrapped erased face (e.g. a face accepted from a listener
-    /// that is already stored in an `Arc`).  Returns the face's `FaceId`.
+    /// Register a pre-wrapped erased face.
     pub fn insert_arc(&self, face: Arc<dyn ErasedFace>) -> FaceId {
         let id = face.id();
         #[cfg(not(target_arch = "wasm32"))]
@@ -189,7 +177,6 @@ impl FaceTable {
         id
     }
 
-    /// Look up a face handle. Returns `None` if the face has been removed.
     pub fn get(&self, id: FaceId) -> Option<Arc<dyn ErasedFace>> {
         #[cfg(not(target_arch = "wasm32"))]
         return self.faces.get(&id).map(|r| Arc::clone(&*r));
@@ -197,13 +184,12 @@ impl FaceTable {
         return self.faces.lock().unwrap().get(&id).map(Arc::clone);
     }
 
-    /// Remove a face from the table, recycling its ID for future `alloc_id()` calls.
+    /// Remove a face, recycling its ID for future `alloc_id()` calls.
     pub fn remove(&self, id: FaceId) {
         #[cfg(not(target_arch = "wasm32"))]
         self.faces.remove(&id);
         #[cfg(target_arch = "wasm32")]
         self.faces.lock().unwrap().remove(&id);
-        // Return dynamic IDs to the free list for reuse.
         if id.0 < RESERVED_FACE_ID_MIN
             && let Ok(mut free) = self.free.lock()
         {
@@ -211,7 +197,6 @@ impl FaceTable {
         }
     }
 
-    /// Number of registered faces.
     pub fn len(&self) -> usize {
         #[cfg(not(target_arch = "wasm32"))]
         return self.faces.len();
@@ -226,7 +211,6 @@ impl FaceTable {
         return self.faces.lock().unwrap().is_empty();
     }
 
-    /// Iterate over all registered face IDs.
     pub fn face_ids(&self) -> Vec<FaceId> {
         #[cfg(not(target_arch = "wasm32"))]
         return self.faces.iter().map(|r| *r.key()).collect();
@@ -234,7 +218,6 @@ impl FaceTable {
         return self.faces.lock().unwrap().keys().copied().collect();
     }
 
-    /// Return all registered faces as `(FaceId, FaceKind)` pairs.
     pub fn face_entries(&self) -> Vec<(FaceId, crate::face::FaceKind)> {
         #[cfg(not(target_arch = "wasm32"))]
         return self.faces.iter().map(|r| (r.id(), r.kind())).collect();
@@ -248,7 +231,6 @@ impl FaceTable {
             .collect();
     }
 
-    /// Return detailed info for all registered faces.
     pub fn face_info(&self) -> Vec<FaceInfo> {
         #[cfg(not(target_arch = "wasm32"))]
         return self

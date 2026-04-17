@@ -17,22 +17,18 @@ impl<S: Send + Sync + 'static + ?Sized> StrategyTable<S> {
         Self(NameTrie::new())
     }
 
-    /// Longest-prefix match — returns the strategy at the deepest matching node.
     pub fn lpm(&self, name: &Name) -> Option<Arc<S>> {
         self.0.lpm(name)
     }
 
-    /// Register a strategy for `prefix`, replacing any existing entry.
     pub fn insert(&self, prefix: &Name, strategy: Arc<S>) {
         self.0.insert(prefix, strategy);
     }
 
-    /// Remove the strategy registered at exactly `prefix`.
     pub fn remove(&self, prefix: &Name) {
         self.0.remove(prefix);
     }
 
-    /// Return all (prefix, strategy) entries for status reporting.
     pub fn dump(&self) -> Vec<(Name, Arc<S>)> {
         self.0.dump()
     }
@@ -58,7 +54,6 @@ mod tests {
         )
     }
 
-    // A trivial stand-in for a real strategy.
     struct MockStrategy(u32);
 
     #[test]

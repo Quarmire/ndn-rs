@@ -36,7 +36,6 @@ use crate::radio::RadioFaceMetadata;
 
 pub use crate::pcap_face::NDN_ETHER_MCAST_MAC;
 
-// ─── NamedEtherFace ──────────────────────────────────────────────────────────
 
 /// NDN face over raw Ethernet (Npcap / EtherType 0x8624) for Windows.
 ///
@@ -118,7 +117,6 @@ impl Face for NamedEtherFace {
     }
 }
 
-// ─── MulticastEtherFace ──────────────────────────────────────────────────────
 
 /// NDN face over multicast Ethernet (Npcap / EtherType 0x8624) for Windows.
 ///
@@ -205,7 +203,6 @@ impl Face for MulticastEtherFace {
     }
 }
 
-// ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

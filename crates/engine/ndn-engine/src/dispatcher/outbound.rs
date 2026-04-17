@@ -13,12 +13,6 @@ use ndn_transport::{FaceId, FaceScope};
 use super::PacketDispatcher;
 
 impl PacketDispatcher {
-    /// Push a packet to a face's outbound send queue.
-    ///
-    /// Uses `try_send` so the pipeline is never blocked by a slow face.
-    /// If the queue is full, the packet is dropped — this is equivalent to an
-    /// output-queue congestion drop and is the correct NDN behaviour (the
-    /// consumer will re-express the Interest).
     pub(super) fn enqueue_send(&self, face_id: FaceId, data: Bytes) {
         if let Some(state) = self.face_states.get(&face_id) {
             match state.send_tx.try_send(data) {
@@ -77,7 +71,6 @@ impl PacketDispatcher {
         }
     }
 
-    /// Fan Data (or a cached CS entry) back to all in-record faces.
     pub(super) fn satisfy(&self, ctx: PacketContext) {
         let data_bytes = if ctx.cs_hit {
             ctx.tags
@@ -110,7 +103,6 @@ impl PacketDispatcher {
     }
 }
 
-/// Check if a name starts with `/localhost`.
 fn is_localhost_name(name: &Name) -> bool {
     name.components()
         .first()

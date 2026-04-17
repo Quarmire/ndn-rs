@@ -7,27 +7,18 @@ use ndn_transport::FaceId;
 
 use crate::fib::{Fib, FibNexthop};
 
-/// A single route record in the RIB.
-///
-/// Routes are uniquely identified by `(face_id, origin)`. The same prefix can
-/// have multiple routes — from different faces or from different protocols
-/// (origins) for the same face.
 #[derive(Clone, Debug)]
 pub struct RibRoute {
     pub face_id: FaceId,
-    /// Route origin. Used to namespace routes by the protocol that installed them.
     /// See `ndn_config::control_parameters::origin` for standard values.
     pub origin: u64,
     pub cost: u32,
-    /// Route flags (e.g. `CHILD_INHERIT`, `CAPTURE`).
     /// See `ndn_config::control_parameters::route_flags`.
     pub flags: u64,
-    /// Absolute expiry time. `None` means the route never expires.
     pub expires_at: Option<Instant>,
 }
 
 impl RibRoute {
-    /// Returns the remaining lifetime as a `Duration`, or `None` if permanent.
     pub fn remaining(&self) -> Option<Duration> {
         self.expires_at
             .map(|exp| exp.saturating_duration_since(Instant::now()))
@@ -36,11 +27,6 @@ impl RibRoute {
 
 /// The Routing Information Base.
 ///
-/// Sits between routing protocols / static config and the FIB. Each route is
-/// stored with an **origin** value that identifies who installed it, and an
-/// optional expiration time. When routes change the caller invokes
-/// [`apply_to_fib`] to push the computed best nexthops into the FIB.
-///
 /// # RIB-to-FIB computation
 ///
 /// For each name prefix the RIB collapses all registered routes to a single
@@ -48,23 +34,8 @@ impl RibRoute {
 /// cost (ties broken by lowest origin value). The resulting nexthop set is
 /// atomically written to the FIB via [`Fib::set_nexthops`].
 ///
-/// # Multiple concurrent protocols
-///
-/// Each protocol uses a distinct origin value. All their routes coexist in the
-/// RIB; the FIB sees only the best computed result. Stopping a protocol with
-/// [`flush_origin`] removes its routes and recomputes the FIB for affected
-/// prefixes, revealing routes from other protocols that may have been shadowed.
-///
-/// # Note on discovery-managed routes
-///
-/// Discovery protocols (link-local neighbor discovery) write directly to the
-/// FIB via `EngineDiscoveryContext`. Those routes are **not** tracked in the
-/// RIB. For a given prefix, the RIB and discovery subsystem should not both
-/// manage the same face — in practice they target disjoint prefix ranges
-/// (`/ndn/local/…` for discovery, global prefixes for routing protocols).
-///
-/// [`apply_to_fib`]: Rib::apply_to_fib
-/// [`flush_origin`]: Rib::flush_origin
+/// Discovery protocols write directly to the FIB via `EngineDiscoveryContext`
+/// and are **not** tracked in the RIB.
 pub struct Rib {
     routes: DashMap<Name, Vec<RibRoute>>,
 }
@@ -76,11 +47,7 @@ impl Rib {
         }
     }
 
-    /// Register or update a route.
-    ///
-    /// Routes are keyed by `(face_id, origin)`. If a route with the same key
-    /// already exists, it is replaced. Returns `true` if the FIB should be
-    /// recomputed for this prefix (i.e. something actually changed).
+    /// Returns `true` if the FIB should be recomputed for this prefix.
     pub fn add(&self, prefix: &Name, route: RibRoute) -> bool {
         let mut entry = self.routes.entry(prefix.clone()).or_default();
         let routes = entry.value_mut();
@@ -99,9 +66,6 @@ impl Rib {
         }
     }
 
-    /// Remove a specific `(face_id, origin)` route from a prefix.
-    ///
-    /// Returns `true` if the route was found and removed.
     pub fn remove(&self, prefix: &Name, face_id: FaceId, origin: u64) -> bool {
         let Some(mut entry) = self.routes.get_mut(prefix) else {
             return false;
@@ -116,9 +80,6 @@ impl Rib {
         changed
     }
 
-    /// Remove all routes for `(prefix, face_id)` regardless of origin.
-    ///
-    /// Returns `true` if any routes were removed.
     pub fn remove_nexthop(&self, prefix: &Name, face_id: FaceId) -> bool {
         let Some(mut entry) = self.routes.get_mut(prefix) else {
             return false;
@@ -133,12 +94,6 @@ impl Rib {
         changed
     }
 
-    /// Remove all routes registered by `origin`.
-    ///
-    /// Returns the list of affected prefixes. Callers should call
-    /// [`apply_to_fib`] for each returned prefix to update the FIB.
-    ///
-    /// [`apply_to_fib`]: Rib::apply_to_fib
     pub fn flush_origin(&self, origin: u64) -> Vec<Name> {
         let mut affected = Vec::new();
         self.routes.retain(|name, routes| {
@@ -152,12 +107,6 @@ impl Rib {
         affected
     }
 
-    /// Remove all routes via `face_id`.
-    ///
-    /// Returns the list of affected prefixes. Callers should call
-    /// [`apply_to_fib`] for each returned prefix to update the FIB.
-    ///
-    /// [`apply_to_fib`]: Rib::apply_to_fib
     pub fn flush_face(&self, face_id: FaceId) -> Vec<Name> {
         let mut affected = Vec::new();
         self.routes.retain(|name, routes| {
@@ -171,12 +120,6 @@ impl Rib {
         affected
     }
 
-    /// Drain all expired entries.
-    ///
-    /// Returns the list of affected prefixes. Callers should call
-    /// [`apply_to_fib`] for each returned prefix to update the FIB.
-    ///
-    /// [`apply_to_fib`]: Rib::apply_to_fib
     pub fn drain_expired(&self) -> Vec<Name> {
         let now = Instant::now();
         let mut affected = Vec::new();
@@ -191,11 +134,6 @@ impl Rib {
         affected
     }
 
-    /// Compute the best nexthops for `prefix` and apply them to the FIB.
-    ///
-    /// For each unique `face_id`, selects the route with the lowest cost (ties
-    /// broken by lowest origin value). Atomically replaces the FIB entry with
-    /// the computed nexthops, or removes the entry if no routes remain.
     pub fn apply_to_fib(&self, prefix: &Name, fib: &Fib) {
         let Some(entry) = self.routes.get(prefix) else {
             fib.set_nexthops(prefix, Vec::new());
@@ -218,13 +156,10 @@ impl Rib {
         fib.set_nexthops(prefix, nexthops);
     }
 
-    /// Handle a face going down: flush all RIB routes via that face and
-    /// recompute affected FIB entries.
+    /// Flush RIB routes via `face_id` and recompute affected FIB entries.
     ///
-    /// Call this alongside [`Fib::remove_face`] for a complete face teardown.
-    /// The two operations are complementary: `Fib::remove_face` cleans up
-    /// discovery-managed routes that are not tracked in the RIB; this method
-    /// cleans up routing-protocol-managed routes.
+    /// Complementary to `Fib::remove_face` which handles discovery-managed
+    /// routes not tracked in the RIB.
     pub fn handle_face_down(&self, face_id: FaceId, fib: &Fib) {
         let affected = self.flush_face(face_id);
         for prefix in &affected {
@@ -232,7 +167,6 @@ impl Rib {
         }
     }
 
-    /// Dump all RIB entries for management display.
     pub fn dump(&self) -> Vec<(Name, Vec<RibRoute>)> {
         self.routes
             .iter()

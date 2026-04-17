@@ -23,8 +23,6 @@ use crate::stages::{
 
 pub(crate) use inbound::run_face_reader;
 
-/// Shared context passed to face reader/sender tasks to avoid exceeding the
-/// function argument limit while keeping all fields explicit.
 pub(crate) struct FaceRunnerCtx {
     pub(crate) face_id: FaceId,
     pub(crate) cancel: CancellationToken,
@@ -36,28 +34,13 @@ pub(crate) struct FaceRunnerCtx {
     pub(crate) discovery_ctx: Arc<EngineDiscoveryContext>,
 }
 
-/// A raw packet arriving from a face, bundled with the face it came from.
 pub(crate) struct InboundPacket {
     pub(crate) raw: Bytes,
     pub(crate) face_id: FaceId,
     pub(crate) arrival: u64,
-    /// Link-layer source metadata (source IP:port for UDP, source MAC for Ethernet).
-    /// Used by discovery protocols to create unicast reply faces.
-    /// `None` when the injection path does not have source information.
     pub(crate) meta: InboundMeta,
 }
 
-/// The packet dispatcher.
-///
-/// Spawns one Tokio task per face that reads packets from that face and sends
-/// them to a shared `mpsc` channel.  A single pipeline runner drains the
-/// channel, performs the fast-path fragment sieve, and spawns per-packet tasks
-/// for full pipeline processing across multiple cores.
-///
-/// The fragment sieve stays single-threaded (cheap DashMap entry, ~2 µs) while
-/// the expensive pipeline stages (decode, CS, PIT, strategy) run in parallel.
-/// All shared tables (PIT, FIB, CS, face table) are concurrent-safe, so
-/// parallel pipeline tasks are correct without additional synchronisation.
 pub struct PacketDispatcher {
     pub face_table: Arc<FaceTable>,
     pub face_states: Arc<dashmap::DashMap<FaceId, FaceState>>,
@@ -70,21 +53,12 @@ pub struct PacketDispatcher {
     pub validation: ValidationStage,
     pub cs_insert: CsInsertStage,
     pub channel_cap: usize,
-    /// Resolved pipeline thread count (always ≥ 1).
     pub pipeline_threads: usize,
-    /// Active discovery protocol — receives `on_inbound` calls before packets
-    /// enter the NDN forwarding pipeline.
     pub discovery: Arc<dyn DiscoveryProtocol>,
-    /// Engine discovery context — passed to protocol hooks.
     pub discovery_ctx: Arc<EngineDiscoveryContext>,
 }
 
 impl PacketDispatcher {
-    /// Spawn face-reader tasks for all currently registered faces, plus the
-    /// pipeline runner.
-    ///
-    /// Returns the pipeline channel sender so the engine can spawn reader tasks
-    /// for faces added dynamically after `build()`.
     pub(crate) fn spawn(
         self,
         cancel: CancellationToken,
@@ -93,10 +67,8 @@ impl PacketDispatcher {
         let (tx, rx) = mpsc::channel::<InboundPacket>(self.channel_cap);
         let dispatcher = Arc::new(self);
 
-        // Spawn reader + sender tasks for each pre-registered face.
         for face_id in dispatcher.face_table.face_ids() {
             if let Some(face) = dispatcher.face_table.get(face_id) {
-                // Create FaceState with a send queue if not already present.
                 if !dispatcher.face_states.contains_key(&face_id) {
                     let (send_tx, send_rx) = mpsc::channel(DEFAULT_SEND_QUEUE_CAP);
                     let persistency = FacePersistency::Permanent;
@@ -114,7 +86,6 @@ impl PacketDispatcher {
                     #[cfg(not(feature = "face-net"))]
                     let state = FaceState::new(cancel.child_token(), persistency, send_tx);
                     dispatcher.face_states.insert(face_id, state);
-                    // Spawn per-face send task.
                     let send_face = Arc::clone(&face);
                     let send_cancel = cancel.clone();
                     let fs = Arc::clone(&dispatcher.face_states);
@@ -156,14 +127,12 @@ impl PacketDispatcher {
             }
         }
 
-        // Pipeline runner.
         let d = Arc::clone(&dispatcher);
         let cancel2 = cancel.clone();
         tasks.spawn(async move {
             d.run_pipeline(rx, cancel2).await;
         });
 
-        // Validation pending queue drain task.
         if dispatcher.validation.validator.is_some() {
             let d = Arc::clone(&dispatcher);
             let cancel3 = cancel.clone();

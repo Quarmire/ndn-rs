@@ -242,7 +242,6 @@ impl LvsModel {
                 type_number::TAG_SYMBOL => {
                     tag_symbols.push(LvsTagSymbol::decode(value)?);
                 }
-                // Unknown top-level type — skip per TLV forward-compat convention.
                 _ => {}
             }
         }
@@ -648,8 +647,6 @@ impl LvsTagSymbol {
     }
 }
 
-// ── TLV primitive helpers ─────────────────────────────────────────────────────
-
 /// Read a TLV from the start of `input`, returning (type, value_slice, rest).
 fn read_tlv(input: &[u8]) -> Result<(u64, &[u8], &[u8]), LvsError> {
     let (t, tn) = ndn_tlv::read_varu64(input).map_err(|_| LvsError::Truncated("TLV type"))?;
@@ -723,12 +720,6 @@ mod tests {
     use super::*;
     use bytes::BytesMut;
 
-    // ── Hand-built fixtures ────────────────────────────────────────────────
-    //
-    // Each helper writes a TLV (type, value) pair in the same wire format
-    // python-ndn produces. Because python-ndn's IntField writes the minimum
-    // number of bytes (1/2/4/8) that fit the value, we do the same here.
-
     fn write_tlv(buf: &mut BytesMut, t: u64, value: &[u8]) {
         use ndn_tlv::TlvWriter;
         let mut w = TlvWriter::new();
@@ -736,8 +727,6 @@ mod tests {
         buf.extend_from_slice(&w.finish());
     }
 
-    /// Encode `bytes` as a GenericNameComponent TLV (type 0x08) — the form
-    /// the LVS binary compiler uses for literal values.
     fn encode_generic_nc(bytes: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(2 + bytes.len());
         out.push(0x08);
@@ -746,9 +735,6 @@ mod tests {
         out
     }
 
-    /// Write a COMPONENT_VALUE TLV whose value is a pre-encoded
-    /// GenericNameComponent wrapping `bytes`, matching the python-ndn LVS
-    /// compiler output.
     fn write_component_value_tlv(buf: &mut BytesMut, bytes: &[u8]) {
         let nc = encode_generic_nc(bytes);
         write_tlv(buf, type_number::COMPONENT_VALUE, &nc);
@@ -771,16 +757,7 @@ mod tests {
         write_tlv(buf, t, &be);
     }
 
-    // ── Basic fixture: hierarchical trust ─────────────────────────────────
-    //
-    // Three nodes:
-    //   0 (root)
-    //     --value("app")--> 1 (data)        sign_cons = [2]
-    //     --value("key")--> 2 (key, leaf)
-    //
-    // The "app" data name can be signed by the "key" key name.
-    //
-    // Named-pattern count is 0 (no pattern edges).
+    // Three nodes: root --"app"--> data (sign_cons=[2]) and --"key"--> key leaf.
     fn build_hierarchical_fixture() -> Vec<u8> {
         let mut out = BytesMut::new();
         // LvsModel envelope fields (flat, no outer wrapper).
@@ -868,28 +845,7 @@ mod tests {
         assert!(!model.check(&name(&["stranger"]), &name(&["key"])));
     }
 
-    // ── Pattern-edge fixture with capture variable ────────────────────────
-    //
-    // Models the schema:
-    //     /sensor/<node> => /sensor/<node>/KEY
-    //
-    // where <node> is a pattern variable that must be consistent between
-    // the data and key walks.
-    //
-    // Layout:
-    //   0 root
-    //     --value("sensor")--> 1
-    //   1 "sensor"
-    //     --pattern(tag=1, no constraints)--> 2  // data endpoint
-    //     --pattern(tag=1, no constraints)--> 3  // key endpoint prefix
-    //   2 (data, sign_cons=[4])
-    //   3 intermediate "key"
-    //     --value("KEY")--> 4
-    //   4 (key, leaf)
-    //
-    // This is a simplification — python-ndn's compiler would produce a
-    // more complex graph. But the parser and checker must handle the
-    // primitives used here correctly.
+    // Models `/sensor/<node>` signed by `/sensor/<node>/KEY`.
     fn build_pattern_fixture() -> Vec<u8> {
         let mut out = BytesMut::new();
         write_uint_tlv(&mut out, type_number::VERSION, LVS_VERSION);
@@ -920,19 +876,6 @@ mod tests {
                 write_uint_tlv(&mut pe, type_number::PATTERN_TAG, 1);
                 write_tlv(&mut node, type_number::PATTERN_EDGE, &pe);
             }
-            // PatternEdge → 3 with constraint: tag == 1 (consistency)
-            // Here we want the key-path pattern edge to BIND a new variable
-            // that must equal tag 1 from the data path. But bindings don't
-            // cross walks — the check is per-walk. Since ndn-rs evaluates
-            // data and key separately, consistency across walks is only
-            // possible via sign-constraint graph structure, which this
-            // fixture emulates by tying the two endpoints through sign_cons.
-            //
-            // For a meaningful test of the Tag constraint option, we add a
-            // constraint that says "this pattern edge must equal tag 1 from
-            // the SAME walk". That can't actually fire during a single walk
-            // without a preceding pattern-edge on the same path, so we add
-            // a pattern edge first on the key path (node 3 → 4).
             {
                 let mut pe = BytesMut::new();
                 write_uint_tlv(&mut pe, type_number::NODE_ID, 3);
@@ -996,8 +939,6 @@ mod tests {
         assert!(!model.check(&name(&["other", "temp"]), &name(&["sensor", "temp", "KEY"])));
     }
 
-    // ── Version check ──────────────────────────────────────────────────────
-
     #[test]
     fn unsupported_version_errors() {
         let mut out = BytesMut::new();
@@ -1009,8 +950,6 @@ mod tests {
             Err(LvsError::UnsupportedVersion { .. })
         ));
     }
-
-    // ── User function detection ────────────────────────────────────────────
 
     #[test]
     fn user_function_schema_parses_and_flags() {
@@ -1058,7 +997,6 @@ mod tests {
             model.uses_user_functions(),
             "user-fn schema must flag uses_user_functions"
         );
-        // The user-fn-gated edge never matches, so the packet is rejected.
         assert!(!model.check(&name(&["123"]), &name(&["123"])));
     }
 }

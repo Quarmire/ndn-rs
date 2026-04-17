@@ -13,9 +13,6 @@ use crate::discovery_context::EngineDiscoveryContext;
 use crate::engine::FaceState;
 use crate::rib::Rib;
 
-/// Background task that drains expired PIT entries every millisecond.
-///
-/// Runs until the cancellation token is cancelled.
 pub async fn run_expiry_task(pit: Arc<Pit>, cancel: CancellationToken) {
     let interval = Duration::from_millis(1);
     loop {
@@ -32,12 +29,6 @@ pub async fn run_expiry_task(pit: Arc<Pit>, cancel: CancellationToken) {
     }
 }
 
-/// Background task that drains expired RIB entries and recomputes affected FIB
-/// entries.
-///
-/// Runs every second. Route lifetimes are registered by routing protocols and
-/// apps via `expiration_period` in RIB register commands; this task purges them
-/// when they lapse and keeps the FIB converged.
 pub async fn run_rib_expiry_task(rib: Arc<Rib>, fib: Arc<Fib>, cancel: CancellationToken) {
     let interval = Duration::from_secs(1);
     loop {
@@ -56,16 +47,8 @@ pub async fn run_rib_expiry_task(rib: Arc<Rib>, fib: Arc<Fib>, cancel: Cancellat
     }
 }
 
-/// Default idle timeout for on-demand faces (5 minutes).
 const IDLE_TIMEOUT_NS: u64 = 5 * 60 * 1_000_000_000;
-
-/// Sweep interval for idle face detection.
 const IDLE_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
-
-/// Background task that removes on-demand faces that have been idle for too
-/// long (no packets sent or received within `IDLE_TIMEOUT_NS`).
-///
-/// Runs every 30 seconds until the cancellation token is cancelled.
 pub async fn run_idle_face_task(
     face_states: Arc<DashMap<FaceId, FaceState>>,
     face_table: Arc<FaceTable>,
@@ -86,15 +69,9 @@ pub async fn run_idle_face_task(
                     if entry.persistency != FacePersistency::OnDemand {
                         continue;
                     }
-                    // Local faces (App, SHM, Internal) use cancel-token lifecycle,
-                    // not idle timeout.  Their last_activity is never updated in
-                    // run_face_reader, so they would be falsely reaped here.
-                    //
-                    // Connection-oriented faces (Unix, Tcp, WebSocket, Management)
-                    // are also excluded: when the remote end closes the socket the
-                    // face reader exits and the OnDemand cleanup path in inbound.rs
-                    // removes the face immediately.  Idle timeout is only meaningful
-                    // for connectionless (UDP) faces where no disconnect signal exists.
+                    // Idle timeout only applies to connectionless (UDP) faces.
+                    // Local faces use cancel-token lifecycle; connection-oriented
+                    // faces clean up when the socket closes.
                     let face_id = *entry.key();
                     if let Some(face) = face_table.get(face_id)
                         && matches!(
@@ -121,8 +98,6 @@ pub async fn run_idle_face_task(
                     if let Some((_, state)) = face_states.remove(&face_id) {
                         state.cancel.cancel();
                     }
-                    // Flush RIB routes before FIB so apply_to_fib can recompute
-                    // from remaining routes. fib.remove_face handles discovery routes.
                     rib.handle_face_down(face_id, &fib);
                     fib.remove_face(face_id);
                     face_table.remove(face_id);

@@ -6,30 +6,19 @@ use ndn_packet::{Data, Name};
 use ndn_tlv::TlvReader;
 use std::sync::Arc;
 
-/// A decoded NDN certificate (a signed Data packet with a public key payload).
 #[derive(Clone, Debug)]
 pub struct Certificate {
     pub name: Arc<Name>,
     pub public_key: Bytes,
     pub valid_from: u64,
     pub valid_until: u64,
-    /// The issuer's key name (from SignatureInfo.KeyLocator).
-    /// Populated by `Certificate::decode()`; `None` for manually constructed certs.
     pub issuer: Option<Arc<Name>>,
-    /// The signed region of the certificate Data (Name through end of SigInfo).
-    /// Needed for chain-walking verification of this cert's own signature.
     pub signed_region: Option<Bytes>,
-    /// The signature value of the certificate Data.
     pub sig_value: Option<Bytes>,
 }
 
 impl Certificate {
     /// Decode a certificate from a Data packet.
-    ///
-    /// The Content field is expected to contain:
-    /// - TLV type 0x00: raw public key bytes
-    /// - TLV type 0xFD (ValidityPeriod): nested tlv_type::NOT_BEFORE (0xFE) + tlv_type::NOT_AFTER (0xFF)
-    ///   as big-endian nanosecond timestamps
     pub fn decode(data: &Data) -> Result<Self, TrustError> {
         let content = data.content().ok_or(TrustError::InvalidKey)?;
 
@@ -68,13 +57,11 @@ impl Certificate {
             return Err(TrustError::InvalidKey);
         }
 
-        // Extract issuer name from SignatureInfo.KeyLocator for chain walking.
         let issuer = data
             .sig_info()
             .and_then(|si| si.key_locator.as_ref())
             .map(Arc::clone);
 
-        // Preserve signed region and signature value for chain verification.
         let signed_region = Some(Bytes::copy_from_slice(data.signed_region()));
         let sig_value = Some(Bytes::copy_from_slice(data.sig_value()));
 
@@ -89,14 +76,11 @@ impl Certificate {
         })
     }
 
-    /// Returns `true` if the certificate is valid at the given time (nanoseconds
-    /// since Unix epoch).
     pub fn is_valid_at(&self, now_ns: u64) -> bool {
         now_ns >= self.valid_from && now_ns <= self.valid_until
     }
 }
 
-/// Decode a big-endian variable-length integer (up to 8 bytes).
 fn decode_be_u64(bytes: &[u8]) -> u64 {
     let mut val: u64 = 0;
     for &b in bytes.iter().take(8) {

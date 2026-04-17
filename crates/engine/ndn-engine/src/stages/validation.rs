@@ -10,7 +10,6 @@ use crate::pipeline::{Action, DecodedPacket, DropReason, PacketContext};
 use ndn_packet::Name;
 use ndn_security::{CertFetcher, ValidationResult, Validator};
 
-/// A queued packet awaiting certificate resolution.
 struct PendingEntry {
     ctx: PacketContext,
     needed_cert: Arc<Name>,
@@ -18,15 +17,11 @@ struct PendingEntry {
     byte_size: usize,
 }
 
-/// Whether a pending entry is ready for action or still waiting.
 enum DrainResult {
-    /// Certificate arrived — re-validate this packet.
     Ready(Box<PacketContext>),
-    /// Timed out waiting for the certificate.
     Timeout,
 }
 
-/// Bounded pending queue for packets awaiting cert fetch.
 struct PendingQueue {
     entries: VecDeque<PendingEntry>,
     total_bytes: usize,
@@ -35,7 +30,6 @@ struct PendingQueue {
     default_timeout: Duration,
 }
 
-/// Configuration for the pending validation queue.
 pub struct PendingQueueConfig {
     pub max_entries: usize,
     pub max_bytes: usize,
@@ -63,7 +57,6 @@ impl PendingQueue {
         }
     }
 
-    /// Enqueue a packet. If the queue is full, drop the oldest entry.
     fn push(&mut self, ctx: PacketContext, needed_cert: Arc<Name>) {
         let byte_size = ctx.raw_bytes.len();
 
@@ -85,7 +78,6 @@ impl PendingQueue {
         });
     }
 
-    /// Drain entries that are expired or whose certs are now in cache.
     fn drain_ready(&mut self, validator: &Validator) -> Vec<DrainResult> {
         let mut results = Vec::new();
         let now = Instant::now();
@@ -116,14 +108,6 @@ impl PendingQueue {
     }
 }
 
-/// Validates Data packet signatures before caching.
-///
-/// Sits between `PitMatchStage` and `CsInsertStage` in the data pipeline.
-/// When no validator is configured, packets pass through unconditionally.
-///
-/// When a certificate is not yet cached, the packet is queued in a bounded
-/// pending queue. A background drain task periodically re-validates queued
-/// packets as certificates arrive.
 pub struct ValidationStage {
     pub validator: Option<Arc<Validator>>,
     pub cert_fetcher: Option<Arc<CertFetcher>>,
@@ -143,7 +127,6 @@ impl ValidationStage {
         }
     }
 
-    /// Disabled validation — all packets pass through.
     pub fn disabled() -> Self {
         Self {
             validator: None,
@@ -164,9 +147,7 @@ impl ValidationStage {
             _ => return Action::Satisfy(ctx),
         };
 
-        // Skip validation for /localhost/ — these are router-generated management
-        // responses that are always local and can never arrive from the network.
-        // They are unsigned by design and do not participate in trust chain verification.
+        // /localhost/ management responses are unsigned by design.
         if data
             .name
             .components()
@@ -192,7 +173,6 @@ impl ValidationStage {
                 if let Some(cert_name) = needed_cert {
                     trace!(name=%data.name, cert=%cert_name, "validation: pending, queuing");
 
-                    // Kick off cert fetch in background.
                     if let Some(fetcher) = &self.cert_fetcher {
                         let fetcher = Arc::clone(fetcher);
                         let cn = Arc::clone(&cert_name);
@@ -202,8 +182,6 @@ impl ValidationStage {
                     }
 
                     self.pending.lock().await.push(ctx, cert_name);
-                    // Return Drop so the pipeline doesn't proceed — the packet
-                    // will be re-injected after cert fetch via the drain task.
                     Action::Drop(DropReason::ValidationFailed)
                 } else {
                     debug!(name=%data.name, "validation: pending but no key locator");
@@ -217,10 +195,6 @@ impl ValidationStage {
         }
     }
 
-    /// Drain the pending queue and re-validate packets whose certs arrived.
-    ///
-    /// Called periodically by the drain task spawned in the dispatcher.
-    /// Returns actions to inject back into the data pipeline.
     pub async fn drain_pending(&self) -> Vec<Action> {
         let Some(validator) = &self.validator else {
             return Vec::new();
@@ -243,15 +217,12 @@ impl ValidationStage {
                             continue;
                         }
                     };
-                    // Re-validate now that the cert is cached.
                     match validator.validate_chain(data).await {
                         ValidationResult::Valid(_) => {
                             trace!(name=%data.name, "validation: re-validated after cert fetch");
                             actions.push(Action::Satisfy(ctx));
                         }
                         ValidationResult::Pending => {
-                            // Still pending (chain has deeper missing certs).
-                            // Re-queue would risk infinite loops; drop instead.
                             debug!(name=%data.name, "validation: still pending after cert fetch, dropping");
                             actions.push(Action::Drop(DropReason::ValidationFailed));
                         }

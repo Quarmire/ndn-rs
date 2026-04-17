@@ -36,8 +36,6 @@ pub fn slot_size_for_mtu(mtu: usize) -> u32 {
     spsc::slot_size_for_mtu(mtu)
 }
 
-// ─── Unified error type ───────────────────────────────────────────────────────
-
 #[derive(Debug, thiserror::Error)]
 pub enum ShmError {
     #[error("I/O error: {0}")]
@@ -51,8 +49,6 @@ pub enum ShmError {
     #[error("SHM face closed (peer died or cancelled)")]
     Closed,
 }
-
-// ─── Type aliases ─────────────────────────────────────────────────────────────
 
 /// Engine-side SHM face — register with `ForwarderEngine::add_face`.
 #[cfg(all(unix, feature = "spsc-shm"))]

@@ -70,23 +70,18 @@ impl Validator {
         }
     }
 
-    /// Access the certificate cache.
     pub fn cert_cache(&self) -> &CertCache {
         &self.cert_cache
     }
 
-    /// Register a trust anchor.
     pub fn add_trust_anchor(&self, cert: Certificate) {
         self.cert_cache.insert(cert.clone());
         self.trust_anchors.insert(Arc::clone(&cert.name), cert);
     }
 
-    /// Check if a name is a trust anchor.
     pub fn is_trust_anchor(&self, name: &Name) -> bool {
         self.trust_anchors.iter().any(|r| r.key().as_ref() == name)
     }
-
-    // ── Runtime schema modification ───────────────────────────────────────────
 
     /// Replace the active trust schema.
     ///
@@ -95,7 +90,6 @@ impl Validator {
         *self.schema.write().expect("schema RwLock poisoned") = schema;
     }
 
-    /// Append a rule to the active schema.
     pub fn add_schema_rule(&self, rule: SchemaRule) {
         self.schema
             .write()
@@ -126,12 +120,9 @@ impl Validator {
             .collect()
     }
 
-    /// Returns a clone of the current [`TrustSchema`].
     pub fn schema_snapshot(&self) -> TrustSchema {
         self.schema.read().expect("schema RwLock poisoned").clone()
     }
-
-    // ── Validation ────────────────────────────────────────────────────────────
 
     /// Validate a Data packet (single-hop, returns Pending if cert missing).
     ///
@@ -209,10 +200,6 @@ mod tests {
         Name::from_components([comp(c)])
     }
 
-    /// Build a Data TLV signed with `signer`.
-    ///
-    /// Structure: DATA > NAME(/data_comp) + SIGINFO(Ed25519, key=/key_comp) + SIGVALUE
-    /// The signed region is NAME + SIGINFO (everything inside DATA before SIGVALUE).
     async fn make_signed_data(
         signer: &Ed25519Signer,
         data_comp: &'static str,

@@ -88,7 +88,6 @@ impl Producer {
         Ok(())
     }
 
-    /// The registered prefix.
     pub fn prefix(&self) -> &Name {
         &self.prefix
     }

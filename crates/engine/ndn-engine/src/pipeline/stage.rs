@@ -3,11 +3,8 @@ use super::context::PacketContext;
 
 /// A single stage in the NDN forwarding pipeline.
 ///
-/// Stages are fixed at build time (not runtime-configurable) so the compiler
-/// can inline and optimise the dispatch loop for the known concrete types.
-///
-/// `process` takes `PacketContext` by value. `Action::Continue` returns it
-/// to the runner. All other actions consume it, making use-after-hand-off
+/// `process` takes `PacketContext` by value — `Action::Continue` returns it
+/// to the runner; all other actions consume it, making use-after-hand-off
 /// a compile error.
 pub trait PipelineStage: Send + Sync + 'static {
     fn process(
@@ -16,10 +13,8 @@ pub trait PipelineStage: Send + Sync + 'static {
     ) -> impl std::future::Future<Output = Result<Action, super::action::DropReason>> + Send;
 }
 
-/// Object-safe wrapper around `PipelineStage` for runtime dispatch.
-///
-/// Used for stages that genuinely need dynamic dispatch (e.g., plugin stages).
-/// The built-in pipeline is monomorphised for zero-cost dispatch.
+/// Object-safe wrapper for stages that need dynamic dispatch (e.g. plugins).
+/// The built-in pipeline is monomorphised; this is only for plugin stages.
 pub type BoxedStage = Box<
     dyn Fn(
             PacketContext,

@@ -23,24 +23,20 @@ pub struct BlockingConsumer {
 }
 
 impl BlockingConsumer {
-    /// Connect to an external router (blocking).
     pub fn connect(socket: impl AsRef<Path>) -> Result<Self, AppError> {
         let rt = Runtime::new().map_err(|e| AppError::Protocol(e.to_string()))?;
         let inner = rt.block_on(super::Consumer::connect(socket))?;
         Ok(Self { rt, inner })
     }
 
-    /// Fetch Data by name (blocking).
     pub fn fetch(&mut self, name: impl Into<Name>) -> Result<Data, AppError> {
         self.rt.block_on(self.inner.fetch(name))
     }
 
-    /// Fetch raw content bytes (blocking).
     pub fn get(&mut self, name: impl Into<Name>) -> Result<Bytes, AppError> {
         self.rt.block_on(self.inner.get(name))
     }
 
-    /// Fetch and verify against a `Validator` (blocking).
     pub fn fetch_verified(
         &mut self,
         name: impl Into<Name>,
@@ -57,7 +53,6 @@ pub struct BlockingProducer {
 }
 
 impl BlockingProducer {
-    /// Connect to an external router and register a prefix (blocking).
     pub fn connect(socket: impl AsRef<Path>, prefix: impl Into<Name>) -> Result<Self, AppError> {
         let rt = Runtime::new().map_err(|e| AppError::Protocol(e.to_string()))?;
         let inner = rt.block_on(super::Producer::connect(socket, prefix))?;

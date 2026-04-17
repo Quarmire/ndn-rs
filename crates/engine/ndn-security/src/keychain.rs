@@ -51,8 +51,6 @@ pub struct KeyChain {
 const DEFAULT_CERT_VALIDITY_MS: u64 = 365 * 24 * 3600 * 1_000;
 
 impl KeyChain {
-    // ── Constructors ──────────────────────────────────────────────────────────
-
     /// Create an ephemeral, in-memory identity with a freshly generated Ed25519 key.
     ///
     /// The key is self-signed with a 365-day certificate and registered as a
@@ -120,21 +118,14 @@ impl KeyChain {
         }
     }
 
-    // ── Identity accessors ────────────────────────────────────────────────────
-
-    /// The NDN name of this identity (e.g. `/com/acme/alice`).
     pub fn name(&self) -> &Name {
         &self.name
     }
 
-    /// The name of the active signing key (e.g. `/com/acme/alice/KEY/v=0`).
     pub fn key_name(&self) -> &Name {
         &self.key_name
     }
 
-    // ── Security operations ───────────────────────────────────────────────────
-
-    /// Get the signer for this identity.
     pub fn signer(&self) -> Result<Arc<dyn Signer>, TrustError> {
         self.mgr.get_signer_sync(&self.key_name)
     }
@@ -192,7 +183,6 @@ impl KeyChain {
         })?;
         let kc = Self::ephemeral(anchor_prefix.as_ref())?;
         let v = Validator::new(TrustSchema::hierarchical());
-        // Register the self-signed certificate as the trust anchor.
         for anchor_name in kc.mgr.trust_anchor_names() {
             if anchor_name.to_string().starts_with(&prefix.to_string())
                 && let Some(cert) = kc.mgr.trust_anchor(&anchor_name)
@@ -247,8 +237,6 @@ impl KeyChain {
         self.validator()
     }
 
-    // ── Escape hatch ─────────────────────────────────────────────────────────
-
     /// The `Arc`-wrapped `SecurityManager` backing this keychain.
     ///
     /// Intended for framework code (e.g., background renewal tasks) that needs
@@ -297,19 +285,16 @@ mod tests {
         assert_eq!(kc.name().to_string(), "/test/alice");
         assert!(kc.key_name().to_string().contains("/KEY/"));
         assert!(kc.signer().is_ok());
-        // Trust anchor registered → validator can be built without panicking.
         let _v = kc.validator();
     }
 
     #[test]
     fn open_or_create_generates_on_empty_pib() {
         let dir = tempfile::tempdir().unwrap();
-        // Pass a non-existent sub-path; auto_init will create the PIB there.
         let pib_path = dir.path().join("pib");
         let kc = KeyChain::open_or_create(&pib_path, "/test/router1").unwrap();
         assert!(kc.signer().is_ok());
 
-        // Second call reloads, does not regenerate.
         let kc2 = KeyChain::open_or_create(&pib_path, "/test/router1").unwrap();
         assert_eq!(kc.key_name().to_string(), kc2.key_name().to_string(),);
     }

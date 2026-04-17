@@ -29,14 +29,12 @@ use super::{BLE_CS_CHAR_UUID, BLE_SC_CHAR_UUID, BLE_SERVICE_UUID, BleError, BleF
 /// ATT protocol overhead per write/notify (1-byte opcode + 2-byte handle).
 const ATT_OVERHEAD: usize = 3;
 
-// ── Server handle (keeps GATT app + advertisement alive) ─────────────────────
 
 pub struct BleServer {
     _app: bluer::gatt::local::ApplicationHandle,
     _adv: bluer::adv::AdvertisementHandle,
 }
 
-// ── Entry point ───────────────────────────────────────────────────────────────
 
 pub async fn bind(id: ndn_transport::FaceId) -> Result<BleFace, BleError> {
     let session = Session::new().await?;

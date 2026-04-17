@@ -36,7 +36,6 @@ impl<C: ContentStore> ShardedCs<C> {
         }
     }
 
-    /// Number of shards.
     pub fn shard_count(&self) -> usize {
         self.shard_count
     }
@@ -48,7 +47,7 @@ impl<C: ContentStore> ShardedCs<C> {
                 first.hash(&mut h);
                 (h.finish() as usize) % self.shard_count
             }
-            None => 0, // root name → shard 0
+            None => 0,
         }
     }
 }
@@ -94,7 +93,6 @@ impl<C: ContentStore> ContentStore for ShardedCs<C> {
     }
 
     async fn evict_prefix(&self, prefix: &Name, limit: Option<usize>) -> usize {
-        // Route to the correct shard based on first component.
         let idx = self.shard_for(prefix);
         self.shards[idx].evict_prefix(prefix, limit).await
     }
@@ -136,8 +134,6 @@ mod tests {
         ShardedCs::new((0..n).map(|_| LruCs::new(shard_bytes)).collect())
     }
 
-    // ── construction ─────────────────────────────────────────────────────────
-
     #[test]
     fn shard_count_reported() {
         let cs = make_sharded(4, 1024);
@@ -155,8 +151,6 @@ mod tests {
     fn empty_shards_panics() {
         let _cs: ShardedCs<LruCs> = ShardedCs::new(vec![]);
     }
-
-    // ── insert / get ──────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn insert_then_get_roundtrip() {
@@ -194,8 +188,6 @@ mod tests {
         assert!(cs.get(&interest(&["a", "2"])).await.is_some());
     }
 
-    // ── evict ─────────────────────────────────────────────────────────────────
-
     #[tokio::test]
     async fn evict_removes_entry() {
         let cs = make_sharded(2, 65536);
@@ -211,8 +203,6 @@ mod tests {
         let cs = make_sharded(2, 65536);
         assert!(!cs.evict(&arc_name(&["z"])).await);
     }
-
-    // ── single shard ──────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn single_shard_works() {

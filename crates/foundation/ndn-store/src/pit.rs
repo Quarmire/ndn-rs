@@ -21,7 +21,6 @@ use ndn_packet::{Name, NameComponent, Selector};
 /// Hardware" (ACM ICN 2020), §3.1.
 #[derive(Clone, Debug)]
 pub struct NameHashes {
-    /// `prefix_hashes[i]` is the hash of the first `i+1` name components.
     pub prefix_hashes: SmallVec<[u64; 8]>,
 }
 
@@ -29,12 +28,10 @@ pub struct NameHashes {
 const HASH_MIX: u64 = 0x517cc1b727220a95;
 
 impl NameHashes {
-    /// Compute cumulative prefix hashes for all prefixes of `name`.
     pub fn compute(name: &Name) -> Self {
         Self::from_components(name.components())
     }
 
-    /// Compute from a component slice (avoids requiring a `Name` value).
     pub fn from_components(components: &[NameComponent]) -> Self {
         let mut prefix_hashes = SmallVec::with_capacity(components.len());
         let mut state: u64 = 0;
@@ -45,12 +42,10 @@ impl NameHashes {
         Self { prefix_hashes }
     }
 
-    /// Hash of the full name (all components).
     pub fn full_hash(&self) -> u64 {
         self.prefix_hashes.last().copied().unwrap_or(0)
     }
 
-    /// Hash of the first `n` components. Returns 0 for the root name (n=0).
     pub fn prefix_hash(&self, n: usize) -> u64 {
         if n == 0 { 0 } else { self.prefix_hashes[n - 1] }
     }
@@ -63,7 +58,6 @@ impl NameHashes {
         self.prefix_hashes.is_empty()
     }
 
-    /// Compute the full-name hash without storing intermediates.
     pub fn full_name_hash(name: &Name) -> u64 {
         let mut state: u64 = 0;
         for comp in name.components() {
@@ -94,15 +88,12 @@ impl NameHashes {
 pub struct PitToken(pub u64);
 
 impl PitToken {
-    /// Build a PIT token from Interest fields.
-    ///
-    /// Per RFC 8569 §4.2, PIT aggregation uses (Name, Selectors,
+    /// Per RFC 8569 sect. 4.2, PIT aggregation uses (Name, Selectors,
     /// ForwardingHint) as the key.
     pub fn from_interest(name: &Name, selector: Option<&Selector>) -> Self {
         Self::from_interest_full(name, selector, None)
     }
 
-    /// Build a PIT token including ForwardingHint for correct aggregation.
     pub fn from_interest_full(
         name: &Name,
         selector: Option<&Selector>,
@@ -112,10 +103,6 @@ impl PitToken {
         Self::from_name_hash(name_hash, selector, forwarding_hint)
     }
 
-    /// Build a PIT token from a pre-computed name hash.
-    ///
-    /// Use with [`NameHashes::full_hash`] or [`NameHashes::prefix_hash`] to
-    /// avoid re-hashing name components on every probe.
     pub fn from_name_hash(
         name_hash: u64,
         selector: Option<&Selector>,
@@ -133,19 +120,15 @@ impl PitToken {
     }
 }
 
-/// Record of an incoming Interest (consumer-facing side of the PIT entry).
 #[derive(Clone, Debug)]
 pub struct InRecord {
-    /// Face the Interest arrived on (raw u32; mapped to FaceId by the engine).
     pub face_id: u32,
     pub nonce: u32,
     pub expires_at: u64,
-    /// NDNLPv2 PIT token from the LP header on this face.
-    /// Must be echoed back in the Data/Nack response.
+    /// NDNLPv2 PIT token from the LP header; must be echoed back in Data/Nack.
     pub lp_pit_token: Option<bytes::Bytes>,
 }
 
-/// Record of an outgoing Interest (producer-facing side of the PIT entry).
 #[derive(Clone, Debug)]
 pub struct OutRecord {
     pub face_id: u32,
@@ -153,13 +136,11 @@ pub struct OutRecord {
     pub sent_at: u64,
 }
 
-/// A single PIT entry — one per pending (Name, Option<Selector>) pair.
 pub struct PitEntry {
     pub name: Arc<Name>,
     pub selector: Option<Selector>,
     pub in_records: Vec<InRecord>,
     pub out_records: Vec<OutRecord>,
-    /// Nonces seen so far — inline for the common case of ≤4 nonces.
     pub nonces_seen: SmallVec<[u32; 4]>,
     pub is_satisfied: bool,
     pub created_at: u64,
@@ -206,7 +187,6 @@ impl PitEntry {
         });
     }
 
-    /// Returns the face IDs of all in-records (for Data fan-back).
     pub fn in_record_faces(&self) -> impl Iterator<Item = u32> + '_ {
         self.in_records.iter().map(|r| r.face_id)
     }
@@ -252,7 +232,6 @@ impl Pit {
         }
     }
 
-    /// Returns `true` if the PIT contains an entry for `token`.
     pub fn contains(&self, token: &PitToken) -> bool {
         #[cfg(not(target_arch = "wasm32"))]
         return self.entries.contains_key(token);
@@ -260,8 +239,6 @@ impl Pit {
         return self.entries.lock().unwrap().contains_key(token);
     }
 
-    /// Apply `f` to the entry for `token`, returning the closure's result.
-    /// Returns `None` if no entry exists.
     pub fn with_entry<R, F: FnOnce(&PitEntry) -> R>(&self, token: &PitToken, f: F) -> Option<R> {
         #[cfg(not(target_arch = "wasm32"))]
         return self.entries.get(token).map(|e| f(&e));
@@ -269,8 +246,6 @@ impl Pit {
         return self.entries.lock().unwrap().get(token).map(f);
     }
 
-    /// Apply `f` to the mutable entry for `token`, returning the closure's result.
-    /// Returns `None` if no entry exists.
     pub fn with_entry_mut<R, F: FnOnce(&mut PitEntry) -> R>(
         &self,
         token: &PitToken,
@@ -282,7 +257,6 @@ impl Pit {
         return self.entries.lock().unwrap().get_mut(token).map(f);
     }
 
-    /// Look up an entry by reference. Prefer `contains()` or `with_entry()` for new code.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn get(
         &self,
@@ -291,7 +265,6 @@ impl Pit {
         self.entries.get(token)
     }
 
-    /// Look up a mutable entry. Prefer `with_entry_mut()` for new code.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn get_mut(
         &self,
@@ -326,8 +299,6 @@ impl Pit {
         return self.entries.lock().unwrap().is_empty();
     }
 
-    /// Remove all entries whose `expires_at` ≤ `now_ns`.
-    /// Returns the tokens of expired entries.
     pub fn drain_expired(&self, now_ns: u64) -> Vec<PitToken> {
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -365,7 +336,6 @@ impl Pit {
     pub fn remove_face(&self, face_id: u32) -> usize {
         #[cfg(not(target_arch = "wasm32"))]
         {
-            // First pass: identify entries to remove entirely (sole consumer was this face).
             let mut to_remove = Vec::new();
             let mut to_prune = Vec::new();
 
@@ -386,7 +356,6 @@ impl Pit {
                 self.entries.remove(token);
             }
 
-            // Second pass: prune in-records for the dead face from multi-consumer entries.
             for token in &to_prune {
                 if let Some(mut entry) = self.entries.get_mut(token) {
                     entry.in_records.retain(|r| r.face_id != face_id);

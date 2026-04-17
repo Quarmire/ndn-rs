@@ -9,14 +9,6 @@ use ndn_store::{CsAdmissionPolicy, CsMeta, ErasedContentStore};
 
 use crate::stages::decode::LpCachePolicy;
 
-/// Look up the CS before hitting the PIT/FIB.
-///
-/// On a cache hit: stores `CsEntry` in `ctx.tags`, sets `ctx.cs_hit = true`,
-/// sets `ctx.out_faces = [ctx.face_id]`, and returns `Action::Satisfy(ctx)`
-/// so the dispatcher fans the cached Data back to the requesting face without
-/// touching the PIT.
-///
-/// On a miss: `Action::Continue(ctx)` to proceed to `PitCheckStage`.
 pub struct CsLookupStage {
     pub cs: Arc<dyn ErasedContentStore>,
 }
@@ -25,7 +17,6 @@ impl CsLookupStage {
     pub async fn process(&self, mut ctx: PacketContext) -> Action {
         let interest = match &ctx.packet {
             DecodedPacket::Interest(i) => i,
-            // CS lookup only applies to Interests.
             _ => return Action::Continue(ctx),
         };
 
@@ -42,12 +33,6 @@ impl CsLookupStage {
     }
 }
 
-/// Insert Data into the CS after a successful PIT match.
-///
-/// Reads `ctx.raw_bytes` (the wire-format Data) and the decoded name.
-/// Freshness defaults to 0 (immediately stale) if `FreshnessPeriod` is absent.
-/// The admission policy is consulted before inserting — Data that fails the
-/// policy check is not cached.
 pub struct CsInsertStage {
     pub cs: Arc<dyn ErasedContentStore>,
     pub admission: Arc<dyn CsAdmissionPolicy>,
@@ -56,7 +41,6 @@ pub struct CsInsertStage {
 impl CsInsertStage {
     pub async fn process(&self, ctx: PacketContext) -> Action {
         if let DecodedPacket::Data(ref data) = ctx.packet {
-            // NDNLPv2 CachePolicy::NoCache overrides admission.
             if ctx
                 .tags
                 .get::<LpCachePolicy>()

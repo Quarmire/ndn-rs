@@ -26,8 +26,6 @@ use super::{
     resolver::DidError,
 };
 
-// ── DID URL ───────────────────────────────────────────────────────────────────
-
 /// A parsed DID URL (DID + optional path, query, fragment).
 ///
 /// Per W3C DID Core §3.2.
@@ -110,7 +108,6 @@ impl DidUrl {
         })
     }
 
-    /// Whether this URL is a plain DID with no path, query, or fragment.
     pub fn is_bare_did(&self) -> bool {
         self.path.is_none() && self.query.is_none() && self.fragment.is_none()
     }
@@ -132,8 +129,6 @@ impl std::fmt::Display for DidUrl {
     }
 }
 
-// ── Dereferenced resource ─────────────────────────────────────────────────────
-
 /// The resource identified by a dereferenced DID URL.
 ///
 /// Per W3C DID Core §7.2, a DID URL deferences to one of these.
@@ -146,8 +141,6 @@ pub enum DereferencedResource<'a> {
     /// A specific service (fragment matched a service `id`).
     Service(&'a Service),
 }
-
-// ── Dereferencing ─────────────────────────────────────────────────────────────
 
 /// Dereference a DID URL against an already-resolved DID Document.
 ///

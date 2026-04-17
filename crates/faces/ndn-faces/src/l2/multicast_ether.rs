@@ -38,7 +38,6 @@ pub struct MulticastEtherFace {
     ifindex: i32,
     socket: AsyncFd<std::os::unix::io::OwnedFd>,
     ring: PacketRing,
-    /// Monotonic sequence counter for NDNLPv2 fragmentation.
     seq: AtomicU64,
 }
 
@@ -50,7 +49,6 @@ impl MulticastEtherFace {
     pub fn new(id: FaceId, iface: impl Into<String>) -> std::io::Result<Self> {
         let iface = iface.into();
 
-        // Resolve interface index.
         let probe_fd = unsafe {
             libc::socket(
                 libc::AF_PACKET,
@@ -71,7 +69,6 @@ impl MulticastEtherFace {
 
         let fd = open_packet_socket(ifindex, NDN_ETHERTYPE)?;
 
-        // Join the NDN Ethernet multicast group on this interface.
         let mreq = libc::packet_mreq {
             mr_ifindex: ifindex,
             mr_type: libc::PACKET_MR_MULTICAST as u16,
@@ -89,7 +86,6 @@ impl MulticastEtherFace {
             &mreq,
         )?;
 
-        // Set up mmap ring buffers BEFORE registering with AsyncFd.
         let ring = setup_packet_ring(fd.as_raw_fd())?;
         let socket = AsyncFd::new(fd)?;
 
@@ -103,17 +99,10 @@ impl MulticastEtherFace {
         })
     }
 
-    /// Interface name this face is bound to.
     pub fn iface(&self) -> &str {
         &self.iface
     }
 
-    /// Receive the next NDN packet along with the sender's MAC address.
-    ///
-    /// This is the discovery-layer variant of [`Face::recv`].  The source MAC
-    /// is extracted from the TPACKET_V2 `sockaddr_ll` embedded in each ring
-    /// frame — no extra syscall is needed.  Discovery protocols use this to
-    /// identify which peer sent a Hello packet and create a unicast face for it.
     pub async fn recv_with_source(&self) -> Result<(Bytes, MacAddr), ndn_transport::FaceError> {
         loop {
             if let Some(result) = self.ring.try_pop_rx_with_source() {
@@ -163,7 +152,6 @@ impl Face for MulticastEtherFace {
     async fn send(&self, pkt: Bytes) -> Result<(), FaceError> {
         let wire = ndn_packet::lp::encode_lp_packet(&pkt);
 
-        // Fragment if larger than Ethernet MTU (1500).
         let frames = if wire.len() > 1500 {
             let seq = self.seq.fetch_add(1, Ordering::Relaxed);
             ndn_packet::fragment::fragment_packet(&wire, 1500, seq)
@@ -172,7 +160,6 @@ impl Face for MulticastEtherFace {
         };
 
         for frame in &frames {
-            // Wait for an available TX frame.
             loop {
                 if self.ring.try_push_tx(frame) {
                     break;
@@ -181,7 +168,6 @@ impl Face for MulticastEtherFace {
                 guard.clear_ready();
             }
 
-            // Flush pending TX frames — destination is always the multicast MAC.
             let dst = make_sockaddr_ll(self.ifindex, &NDN_ETHER_MCAST_MAC, NDN_ETHERTYPE);
             let fd = self.socket.get_ref().as_raw_fd();
             let ret = unsafe {
@@ -211,7 +197,6 @@ mod tests {
 
     #[test]
     fn mcast_mac_is_multicast() {
-        // Bit 0 of byte 0 must be set for multicast.
         assert_eq!(NDN_ETHER_MCAST_MAC.as_bytes()[0] & 0x01, 0x01);
     }
 

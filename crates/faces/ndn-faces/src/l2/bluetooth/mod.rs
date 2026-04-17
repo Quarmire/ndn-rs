@@ -69,48 +69,28 @@ use linux::BleServer;
 #[cfg(target_os = "macos")]
 use macos::BleServer;
 
-// ── GATT UUIDs ────────────────────────────────────────────────────────────────
-//
-// These must match NDNts `@ndn/web-bluetooth-transport` and esp8266ndn
-// `BleServerTransport` exactly — verified against the upstream source files
-// referenced in the module-level docs above.
+// Must match NDNts and esp8266ndn exactly (see module-level docs).
 
-/// Primary GATT service UUID for the NDN BLE transport.
 pub const BLE_SERVICE_UUID: &str = "099577e3-0788-412a-8824-395084d97391";
-
-/// CS (client → server) characteristic UUID — Write Without Response.
-/// The forwarder (server) reads incoming NDN packets from this characteristic.
+/// CS (client -> server) — Write Without Response.
 pub const BLE_CS_CHAR_UUID: &str = "cc5abb89-a541-46d8-a351-2f95a6a81f49";
-
-/// SC (server → client) characteristic UUID — Notify.
-/// The forwarder (server) sends outgoing NDN packets as notifications
-/// on this characteristic.
+/// SC (server -> client) — Notify.
 pub const BLE_SC_CHAR_UUID: &str = "972f9527-0d83-4261-b95d-b1b2fc73bde4";
 
-// ── Constants ─────────────────────────────────────────────────────────────────
-
-/// Depth of the internal TX packet channel (pipeline → BLE notify task).
 pub(super) const CHAN_DEPTH: usize = 64;
 
-// ── Error type ────────────────────────────────────────────────────────────────
-
-/// Errors that can occur when binding a [`BleFace`].
 #[derive(Debug, thiserror::Error)]
 pub enum BleError {
-    /// BlueZ D-Bus or GATT error from the `bluer` crate (Linux only).
     #[cfg(target_os = "linux")]
     #[error("BlueZ error: {0}")]
     Bluer(#[from] bluer::Error),
-    /// No Bluetooth adapter was found on this system.
     #[error("no Bluetooth adapter available")]
     NoAdapter,
-    /// BLE face is already bound (macOS: only one per process is supported).
     #[cfg(target_os = "macos")]
     #[error("BLE already bound; only one BleFace per process is supported on macOS")]
     AlreadyBound,
 }
 
-// ── BleFace ───────────────────────────────────────────────────────────────────
 
 /// NDN face over Bluetooth LE using the NDNts `@ndn/web-bluetooth-transport`
 /// GATT profile.
@@ -172,10 +152,6 @@ impl Face for BleFace {
         self.rx.lock().await.recv().await.ok_or(FaceError::Closed)
     }
 
-    /// Enqueue a packet for BLE transmission.
-    ///
-    /// Applies back-pressure: awaits if the TX queue is full (64 slots).
-    /// Returns [`FaceError::Closed`] if the background TX task has exited.
     async fn send(&self, pkt: Bytes) -> Result<(), FaceError> {
         self.tx.send(pkt).await.map_err(|_| FaceError::Closed)
     }

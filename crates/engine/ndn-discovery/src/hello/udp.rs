@@ -1,40 +1,13 @@
 //! `UdpNeighborDiscovery` — cross-platform NDN neighbor discovery over UDP.
 //!
-//! Works on Linux, macOS, Windows, Android, and iOS without any platform-
-//! specific code.  Uses the IANA-assigned NDN multicast group
-//! (`224.0.23.170:6363`) for hello broadcasts and creates a unicast
-//! [`UdpFace`] per discovered peer.
+//! Uses the IANA-assigned NDN multicast group (`224.0.23.170:6363`) for
+//! hello broadcasts and creates a unicast [`UdpFace`] per discovered peer.
 //!
-//! # Protocol
+//! # Wire format
 //!
-//! **Hello Interest** (broadcast on the multicast face):
 //! ```text
-//! Name: /ndn/local/nd/hello/<nonce-u32>
-//! ```
-//!
-//! **Hello Data** (reply via the multicast socket):
-//! ```text
-//! Name:    /ndn/local/nd/hello/<nonce-u32>
-//! Content: HelloPayload TLV (NODE-NAME, SERVED-PREFIX*, CAPABILITIES?, NEIGHBOR-DIFF*)
-//! ```
-//!
-//! When `swim_indirect_fanout > 0`, the protocol also handles:
-//! - `/ndn/local/nd/probe/direct/<target>/<nonce>` — respond with ACK if we are the target
-//! - `/ndn/local/nd/probe/via/<us>/<target>/<nonce>` — relay liveness check to target
-//!
-//! # Usage
-//!
-//! ```rust,no_run
-//! use ndn_discovery::UdpNeighborDiscovery;
-//! use ndn_packet::Name;
-//! use ndn_transport::FaceId;
-//! use std::str::FromStr;
-//!
-//! let node_name = Name::from_str("/ndn/site/mynode").unwrap();
-//! let multicast_face_id = FaceId(1); // registered with engine beforehand
-//!
-//! let nd = UdpNeighborDiscovery::new(multicast_face_id, node_name);
-//! // Pass to EngineBuilder::discovery(nd)
+//! Hello Interest: /ndn/local/nd/hello/<nonce-u32>
+//! Hello Data:     /ndn/local/nd/hello/<nonce-u32>  Content = HelloPayload TLV
 //! ```
 
 use std::collections::HashMap;
@@ -62,25 +35,16 @@ use crate::{
 const PROTOCOL: ProtocolId = ProtocolId("udp-nd");
 
 /// UDP-specific link medium for [`HelloProtocol`].
-///
-/// Handles Ed25519 signing of hello Data, signature verification of incoming
-/// hello Data, UDP address extraction, and unicast face creation.
 pub struct UdpMedium {
-    /// All multicast face IDs (one per interface).
     multicast_face_ids: Vec<FaceId>,
-    /// Ed25519 signer for hello Data packets.
     signer: Arc<dyn Signer>,
-    /// UDP unicast listen port, advertised in hello payloads.
     unicast_port: Option<u16>,
-    /// Peer address → engine FaceId (UDP-specific state).
     peer_faces: Mutex<HashMap<SocketAddr, FaceId>>,
 }
 
-/// UDP neighbor discovery — type alias for `HelloProtocol<UdpMedium>`.
 pub type UdpNeighborDiscovery = HelloProtocol<UdpMedium>;
 
 impl UdpNeighborDiscovery {
-    /// Create a new `UdpNeighborDiscovery` with the default LAN profile.
     pub fn new(multicast_face_id: FaceId, node_name: Name) -> Self {
         Self::new_multi(
             vec![multicast_face_id],
@@ -97,18 +61,12 @@ impl UdpNeighborDiscovery {
         Self::new_multi(vec![multicast_face_id], node_name, config)
     }
 
-    /// Create a `UdpNeighborDiscovery` listening on multiple multicast faces
-    /// (one per network interface).
-    ///
-    /// A transient Ed25519 key is derived deterministically from the node name
-    /// via SHA-256.  Callers that need a persistent key should use
-    /// [`new_multi_with_signer`](Self::new_multi_with_signer).
+    /// Transient Ed25519 key derived from node name via SHA-256.
     pub fn new_multi(face_ids: Vec<FaceId>, node_name: Name, config: DiscoveryConfig) -> Self {
         let signer = UdpMedium::make_transient_signer(&node_name);
         Self::new_multi_with_signer(face_ids, node_name, config, signer)
     }
 
-    /// Create with an explicit signer (e.g. from the router's PIB).
     pub fn new_multi_with_signer(
         face_ids: Vec<FaceId>,
         node_name: Name,
@@ -124,7 +82,6 @@ impl UdpNeighborDiscovery {
         HelloProtocol::create(medium, node_name, config)
     }
 
-    /// Set the UDP unicast port this node listens on for forwarding traffic.
     pub fn with_unicast_port(mut self, port: u16) -> Self {
         self.medium.unicast_port = Some(port);
         self
@@ -144,7 +101,6 @@ impl UdpNeighborDiscovery {
 }
 
 impl UdpMedium {
-    /// Derive a deterministic transient Ed25519 key from the node name.
     fn make_transient_signer(node_name: &Name) -> Arc<dyn Signer> {
         let name_str = node_name.to_string();
         let digest = ring::digest::digest(&ring::digest::SHA256, name_str.as_bytes());
@@ -225,9 +181,6 @@ impl LinkMedium for UdpMedium {
     }
 
     fn build_hello_data(&self, core: &HelloCore, interest_name: &Name) -> Bytes {
-        // Use the HelloProtocol helper indirectly — we need the full proto
-        // to call build_hello_payload. Since we only have core here, replicate
-        // the payload build inline.
         let (prefix_announcement, hello_interval_base) = {
             let cfg = core.config.read().unwrap();
             (cfg.prefix_announcement.clone(), cfg.hello_interval_base)
@@ -301,7 +254,6 @@ impl LinkMedium for UdpMedium {
         core: &HelloCore,
         ctx: &dyn DiscoveryContext,
     ) -> Option<(Name, Option<FaceId>)> {
-        // Signature verification.
         if let Some(ref peer_pk) = payload.public_key {
             if let Ok(data_pkt) = ndn_packet::Data::decode(raw.clone()) {
                 let region = data_pkt.signed_region();
@@ -321,7 +273,6 @@ impl LinkMedium for UdpMedium {
             }
         }
 
-        // Node name uniqueness check.
         let responder_name = payload.node_name.clone();
         if responder_name == core.node_name {
             let our_pk = self.signer.public_key();
@@ -393,7 +344,6 @@ impl LinkMedium for UdpMedium {
     }
 }
 
-// ── Tests ──────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

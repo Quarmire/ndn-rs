@@ -35,7 +35,6 @@ pub use fib::{Fib, FibEntry, FibNexthop};
 pub use rib::{Rib, RibRoute};
 pub use routing::{RoutingHandle, RoutingManager, RoutingProtocol};
 
-// Re-export pipeline types at crate root for ergonomic access
 pub use pipeline::{
     Action, AnyMap, DecodedPacket, DropReason, ForwardingAction, NackReason, PacketContext,
     PipelineStage,

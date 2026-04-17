@@ -14,7 +14,6 @@ use crate::did::{
     resolver::DidResolver,
 };
 
-/// Multicodec prefix for Ed25519 public keys.
 const ED25519_MULTICODEC: [u8; 2] = [0xed, 0x01];
 
 /// Resolves `did:key` DIDs locally without any network access.
@@ -96,7 +95,6 @@ fn decode_multibase_key(encoded: &str) -> Result<Vec<u8>, String> {
     }
 }
 
-/// Minimal base58 decoder (Bitcoin alphabet).
 fn bs58_decode(s: &str) -> Result<Vec<u8>, ()> {
     const ALPHABET: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
     let mut result: Vec<u8> = vec![0];

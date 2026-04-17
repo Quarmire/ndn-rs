@@ -1,8 +1,4 @@
 //! `NoDiscovery` — null-object discovery protocol.
-//!
-//! Used by routers that rely entirely on static FIB configuration
-//! (e.g. infrastructure deployments where routes are pre-provisioned).
-//! Satisfies the `DiscoveryProtocol` bound without doing anything.
 
 use std::time::Instant;
 
@@ -12,20 +8,7 @@ use ndn_transport::FaceId;
 
 use crate::{DiscoveryContext, DiscoveryProtocol, InboundMeta, ProtocolId};
 
-/// No-op discovery protocol.
-///
-/// All hook methods are empty.  [`claimed_prefixes`] returns an empty slice,
-/// so `CompositeDiscovery` will never route inbound packets to it.
-///
-/// # Example
-///
-/// ```rust
-/// use ndn_discovery::NoDiscovery;
-///
-/// let nd = NoDiscovery;
-/// // Pass to the engine builder:
-/// // builder.discovery(nd)
-/// ```
+/// No-op discovery protocol.  All hooks are empty; claims no prefixes.
 pub struct NoDiscovery;
 
 impl DiscoveryProtocol for NoDiscovery {

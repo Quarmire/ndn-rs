@@ -1,21 +1,7 @@
 //! Passive neighbor-detection probe scheduler.
 //!
-//! Zero-overhead discovery for mesh networks where traffic flows continuously.
-//! The multicast face receives packets from all on-link nodes; the face layer
-//! surfaces each sender's MAC via [`recv_with_source`].  When an unknown MAC
-//! appears, the protocol emits a targeted unicast hello; no broadcast is needed.
-//!
-//! ## Fallback to backoff
-//!
-//! When the link is quiet (no passive detections within `passive_idle_timeout`)
-//! the scheduler falls back to [`BackoffScheduler`] probing to catch nodes
-//! that are present but not sending any traffic.  Once passive activity
-//! resumes, the backoff fallback is suppressed again.
-//!
-//! ## Unicast vs broadcast
-//!
-//! On `PassiveDetection` the scheduler emits a [`ProbeRequest::Unicast`] for
-//! the detected face.  The fallback path emits [`ProbeRequest::Broadcast`].
+//! Emits unicast hellos when unknown MACs are observed; falls back to
+//! backoff probing when the link is quiet.
 
 use std::time::{Duration, Instant};
 
@@ -25,36 +11,24 @@ use crate::backoff::{BackoffConfig, BackoffState};
 use crate::config::DiscoveryConfig;
 use crate::strategy::{NeighborProbeStrategy, ProbeRequest, TriggerEvent};
 
-// ─── PassiveScheduler ────────────────────────────────────────────────────────
 
-/// Probe scheduler that uses passive MAC overhearing with backoff fallback.
 pub struct PassiveScheduler {
-    /// Backoff config used for the fallback path.
     backoff_cfg: BackoffConfig,
-    /// Mutable backoff state for the fallback path.
     backoff_state: BackoffState,
-    /// When the next fallback probe should fire (`None` = not yet scheduled).
     next_fallback_at: Option<Instant>,
-    /// How long without a passive detection before the fallback is activated.
     passive_idle_timeout: Duration,
-    /// When we last saw a passive detection.
     last_passive: Option<Instant>,
-    /// Unicast probes requested by passive detections, not yet emitted.
     pending_unicast: Vec<FaceId>,
-    /// Whether a broadcast probe is pending (from a non-passive trigger).
     pending_broadcast: bool,
 }
 
 impl PassiveScheduler {
-    /// Build from the relevant fields of a [`DiscoveryConfig`].
     pub fn from_discovery_config(cfg: &DiscoveryConfig) -> Self {
         let backoff_cfg = BackoffConfig {
             initial_interval: cfg.hello_interval_base,
             max_interval: cfg.hello_interval_max,
             jitter_fraction: cfg.hello_jitter as f64,
         };
-        // Idle timeout = 3× max interval; if no passive traffic for this long
-        // we fall back to probing.
         let passive_idle_timeout = cfg.hello_interval_max * 3;
         Self {
             backoff_state: BackoffState::new(seed_from_now()),
@@ -79,18 +53,15 @@ impl NeighborProbeStrategy for PassiveScheduler {
     fn on_tick(&mut self, now: Instant) -> Vec<ProbeRequest> {
         let mut reqs: Vec<ProbeRequest> = Vec::new();
 
-        // Emit any queued unicast probes from passive detections.
         for face_id in self.pending_unicast.drain(..) {
             reqs.push(ProbeRequest::Unicast(face_id));
         }
 
-        // Emit a pending broadcast (from a non-passive trigger).
         if self.pending_broadcast {
             self.pending_broadcast = false;
             reqs.push(ProbeRequest::Broadcast);
         }
 
-        // Fallback backoff path: only when passive detection is idle.
         if !self.is_passive_active(now) {
             let fire_fallback = self.next_fallback_at.map(|t| now >= t).unwrap_or(true);
             if fire_fallback {
@@ -110,34 +81,24 @@ impl NeighborProbeStrategy for PassiveScheduler {
     }
 
     fn on_probe_timeout(&mut self) {
-        // Backoff advances on next fallback tick; nothing extra needed.
     }
 
     fn trigger(&mut self, event: TriggerEvent) {
         match event {
             TriggerEvent::PassiveDetection => {
-                // Update passive activity timestamp.
                 self.last_passive = Some(Instant::now());
-                // The caller is expected to call trigger with the detected
-                // face ID separately if a unicast probe is desired.  Here
-                // we just suppress the backoff fallback.
             }
             TriggerEvent::FaceUp => {
                 self.pending_broadcast = true;
             }
             TriggerEvent::ForwardingFailure | TriggerEvent::NeighborStale => {
                 self.pending_broadcast = true;
-                // Reset backoff so re-probe is fast.
                 self.backoff_state.reset(&self.backoff_cfg);
             }
         }
     }
 }
 
-/// Enqueue a unicast probe toward a specific face detected passively.
-///
-/// Call this after [`trigger`]`(TriggerEvent::PassiveDetection)` when the
-/// detected MAC maps to an existing [`FaceId`] that needs a hello.
 impl PassiveScheduler {
     pub fn enqueue_unicast(&mut self, face_id: FaceId) {
         if !self.pending_unicast.contains(&face_id) {
@@ -146,14 +107,12 @@ impl PassiveScheduler {
     }
 }
 
-// ─── RNG seed ────────────────────────────────────────────────────────────────
 
 fn seed_from_now() -> u32 {
     let ns = Instant::now().elapsed().subsec_nanos();
     if ns == 0 { 0xdeadbeef } else { ns }
 }
 
-// ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

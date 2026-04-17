@@ -22,8 +22,6 @@ impl Validator {
             return ValidationResult::Invalid(TrustError::InvalidSignature);
         };
 
-        // DigestSha256 is self-contained: verify SHA-256(signed_region) == sig_value.
-        // No key locator or trust chain is involved.
         if sig_info.sig_type == SignatureType::DigestSha256 {
             use sha2::{Digest, Sha256};
             let hash = Sha256::digest(data.signed_region());
@@ -39,12 +37,8 @@ impl Validator {
             return ValidationResult::Invalid(TrustError::InvalidSignature);
         }
 
-        // Resolve the KeyLocator. NDN allows two forms: a Name pointing at
-        // the signer's certificate, or a KeyDigest carrying SHA-256 of the
-        // public key. The Name form is the common path; for the KeyDigest
-        // form we look the cert up in the local cache by its key digest
-        // (the cert must be pre-loaded — there's no way to fetch a cert
-        // over the network when only its key digest is known).
+        // KeyLocator can be a Name or a KeyDigest. KeyDigest requires the
+        // cert to be pre-loaded (no way to fetch by digest alone).
         let first_key: Arc<Name> = if let Some(name) = &sig_info.key_locator {
             Arc::clone(name)
         } else if let Some(digest) = &sig_info.key_digest {
@@ -69,12 +63,10 @@ impl Validator {
         let mut chain_names: Vec<Name> = Vec::new();
         let mut seen: HashSet<Arc<Name>> = HashSet::new();
 
-        // Current entity to verify: starts with the Data packet itself.
         let mut current_signed_region: &[u8] = data.signed_region();
         let mut current_sig_value: &[u8] = data.sig_value();
         let mut current_key_name: Arc<Name> = first_key;
 
-        // Owned buffers for intermediate cert signed regions / sig values.
         let mut owned_signed_region: bytes::Bytes;
         let mut owned_sig_value: bytes::Bytes;
 
@@ -85,7 +77,6 @@ impl Validator {
                 });
             }
 
-            // Trust anchor terminates the chain.
             if let Some(anchor) = self.trust_anchors.get(&current_key_name) {
                 if !anchor.is_valid_at(now) {
                     return ValidationResult::Invalid(TrustError::CertNotFound {
@@ -113,7 +104,6 @@ impl Validator {
                 };
             }
 
-            // Fetch or look up the certificate.
             let cert = match self.resolve_cert(&current_key_name).await {
                 Some(c) => c,
                 None => return ValidationResult::Pending,
@@ -125,7 +115,6 @@ impl Validator {
                 });
             }
 
-            // Verify the current entity's signature with this cert's public key.
             match self
                 .verifier
                 .verify(current_signed_region, current_sig_value, &cert.public_key)
@@ -140,7 +129,6 @@ impl Validator {
 
             chain_names.push(current_key_name.as_ref().clone());
 
-            // Move up: verify this cert's own signature next.
             let Some(issuer) = &cert.issuer else {
                 return ValidationResult::Invalid(TrustError::CertNotFound {
                     name: format!("cert has no issuer: {}", cert.name),
@@ -200,7 +188,6 @@ mod tests {
         Name::from_components([comp(c)])
     }
 
-    /// Build a Data TLV signed with `signer`.
     async fn make_signed_data(
         signer: &Ed25519Signer,
         data_comp: &'static str,
@@ -264,8 +251,6 @@ mod tests {
         w.finish()
     }
 
-    /// Build a certificate Data packet: a Data whose name is `cert_name`,
-    /// Content contains the subject's public key, signed by `issuer_signer`.
     async fn make_cert_data_packet(
         cert_name: &Name,
         subject_pk: &[u8],
@@ -335,7 +320,6 @@ mod tests {
         w.finish()
     }
 
-    /// Build a wildcard schema that allows any data -> any key.
     fn wildcard_schema() -> TrustSchema {
         use crate::trust_schema::SchemaRule;
         let mut schema = TrustSchema::new();
@@ -407,10 +391,6 @@ mod tests {
         ));
     }
 
-    /// Build a Data TLV signed with `signer` whose KeyLocator carries a
-    /// KeyDigest (SHA-256 of `signer`'s public key) instead of a Name.
-    /// Used to exercise the digest-form KeyLocator fallback in
-    /// `validate_chain`.
     async fn make_signed_data_with_key_digest(
         signer: &Ed25519Signer,
         signer_pk: &[u8],
@@ -429,7 +409,6 @@ mod tests {
             w.finish()
         };
 
-        // KeyLocator carrying KeyDigest = SHA-256(public key).
         let digest = {
             use sha2::{Digest, Sha256};
             Sha256::digest(signer_pk)
@@ -473,10 +452,6 @@ mod tests {
 
     #[tokio::test]
     async fn chain_walk_resolves_key_digest_via_cache() {
-        // Same shape as chain_walk_data_to_anchor, but the Data's
-        // KeyLocator is a KeyDigest, not a Name. The validator must
-        // resolve the digest against the cert cache before the chain
-        // walk proceeds.
         let anchor_seed = [30u8; 32];
         let anchor_name = name1("anchor");
         let anchor_signer = Ed25519Signer::from_seed(&anchor_seed, anchor_name.clone());
@@ -523,8 +498,6 @@ mod tests {
 
     #[tokio::test]
     async fn chain_walk_key_digest_uncached_returns_invalid() {
-        // KeyDigest cannot be fetched over the network — if the cert is
-        // not in the cache, validation must fail rather than hang.
         let key_seed = [32u8; 32];
         let key_name = name1("key");
         let key_signer = Ed25519Signer::from_seed(&key_seed, key_name);

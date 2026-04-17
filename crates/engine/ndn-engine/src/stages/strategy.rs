@@ -18,20 +18,16 @@ use ndn_transport::face::FaceScope;
 
 /// Object-safe version of `Strategy` that boxes its futures.
 pub trait ErasedStrategy: Send + Sync + 'static {
-    /// Canonical name identifying this strategy (e.g. `/localhost/nfd/strategy/best-route`).
     fn name(&self) -> &Name;
 
-    /// Synchronous fast path — avoids the `Box::pin` heap allocation.
-    /// Returns `None` to fall through to the async path.
+    /// Synchronous fast path. Returns `None` to fall through to async.
     fn decide_sync(&self, ctx: &StrategyContext<'_>) -> Option<SmallVec<[ForwardingAction; 2]>>;
 
-    /// Async path for Interest forwarding decisions (boxed future).
     fn after_receive_interest_erased<'a>(
         &'a self,
         ctx: &'a StrategyContext<'a>,
     ) -> Pin<Box<dyn Future<Output = SmallVec<[ForwardingAction; 2]>> + Send + 'a>>;
 
-    /// Handle an incoming Nack and decide whether to retry or propagate.
     fn on_nack_erased<'a>(
         &'a self,
         ctx: &'a StrategyContext<'a>,
@@ -64,11 +60,6 @@ impl<S: Strategy> ErasedStrategy for S {
     }
 }
 
-/// Calls the strategy to produce a forwarding decision for Interests.
-///
-/// Performs LPM on the strategy table to find the per-prefix strategy.
-/// Falls back to `default_strategy` if no entry matches (should not happen
-/// if root is populated).
 pub struct StrategyStage {
     pub strategy_table: Arc<StrategyTable<dyn ErasedStrategy>>,
     pub default_strategy: Arc<dyn ErasedStrategy>,
@@ -76,12 +67,10 @@ pub struct StrategyStage {
     pub measurements: Arc<MeasurementsTable>,
     pub pit: Arc<Pit>,
     pub face_table: Arc<ndn_transport::FaceTable>,
-    /// Cross-layer enrichers run before the strategy to populate `StrategyContext::extensions`.
     pub enrichers: Vec<Arc<dyn ContextEnricher>>,
 }
 
 impl StrategyStage {
-    /// Run the per-prefix strategy for an Interest and return a pipeline action.
     pub async fn process(&self, mut ctx: PacketContext) -> Action {
         match &ctx.packet {
             DecodedPacket::Interest(_) => {}
@@ -103,7 +92,6 @@ impl StrategyStage {
             trace!(face=%ctx.face_id, name=%name, "strategy: FIB LPM miss (no route)");
         }
 
-        // Convert engine FibEntry → strategy FibEntry.
         let strategy_fib: Option<ndn_strategy::FibEntry> =
             fib_entry_ref.map(|e| ndn_strategy::FibEntry {
                 nexthops: e
@@ -116,7 +104,6 @@ impl StrategyStage {
                     .collect(),
             });
 
-        // Build cross-layer extensions via registered enrichers.
         let mut extensions = AnyMap::new();
         for enricher in &self.enrichers {
             enricher.enrich(strategy_fib.as_ref(), &mut extensions);
@@ -131,29 +118,22 @@ impl StrategyStage {
             extensions: &extensions,
         };
 
-        // Per-prefix strategy lookup (LPM on strategy table).
         let strategy = self
             .strategy_table
             .lpm(&name)
             .unwrap_or_else(|| Arc::clone(&self.default_strategy));
         trace!(face=%ctx.face_id, name=%name, strategy=%strategy.name(), "strategy: selected");
 
-        // Sync fast path: avoids Box::pin heap allocation for strategies
-        // like BestRoute / Multicast whose decisions are fully synchronous.
         let actions = if let Some(a) = strategy.decide_sync(&sctx) {
             a
         } else {
             strategy.after_receive_interest_erased(&sctx).await
         };
 
-        // Use the first actionable ForwardingAction.
         if let Some(action) = actions.into_iter().next() {
             match action {
                 ForwardingAction::Forward(faces) => {
                     trace!(face=%ctx.face_id, name=%name, out_faces=?faces, "strategy: Forward");
-                    // Link-local scope enforcement: /ndn/local/ packets must
-                    // not be forwarded to non-local (network) faces, mirroring
-                    // IPv6 fe80::/10 link-local semantics.
                     let effective_faces: SmallVec<[ndn_transport::FaceId; 4]> = if is_link_local(
                         &name,
                     ) {
@@ -170,7 +150,6 @@ impl StrategyStage {
                         faces.iter().copied().collect()
                     };
                     if effective_faces.is_empty() {
-                        // All nexthops filtered out — Nack.
                         return Action::Nack(ctx, NackReason::NoRoute);
                     }
                     ctx.out_faces.extend_from_slice(&effective_faces);

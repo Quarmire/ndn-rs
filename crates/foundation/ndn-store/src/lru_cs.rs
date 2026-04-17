@@ -10,21 +10,11 @@ use crate::{ContentStore, CsCapacity, CsEntry, CsMeta, InsertResult, NameTrie};
 
 /// In-memory LRU content store, bounded by total byte capacity.
 ///
-/// Maintains two indices:
-/// - `cache`: `LruCache<Arc<Name>, CsEntry>` — exact-match lookup in O(1).
-/// - `prefix_index`: `NameTrie<Arc<Name>>` — maps each cached name to itself,
-///   enabling `CanBePrefix` lookups via `first_descendant`.
-///
-/// All insertions and evictions update both indices atomically under the lock.
-///
-/// An atomic entry count (`entry_count`) allows `get()` to short-circuit
-/// without acquiring the Mutex when the CS is empty — eliminating lock
-/// contention on the hot path for workloads that don't cache (e.g. iperf).
+/// An atomic `entry_count` allows `get()` to skip the Mutex when the CS is
+/// empty, eliminating lock contention for workloads that don't cache.
 pub struct LruCs {
     inner: Mutex<LruInner>,
-    /// Maximum byte capacity. Atomic for lock-free runtime updates via `set_capacity`.
     capacity_bytes: AtomicUsize,
-    /// Atomic entry count — updated under the lock but readable without it.
     entry_count: AtomicUsize,
 }
 
@@ -53,7 +43,6 @@ impl LruCs {
         }
     }
 
-    /// Whether the cache is empty.
     pub fn is_empty(&self) -> bool {
         self.entry_count.load(Ordering::Relaxed) == 0
     }
@@ -61,7 +50,6 @@ impl LruCs {
 
 impl ContentStore for LruCs {
     async fn get(&self, interest: &Interest) -> Option<CsEntry> {
-        // Fast path: skip the Mutex entirely when the CS is empty.
         if self.entry_count.load(Ordering::Relaxed) == 0 {
             return None;
         }
@@ -103,7 +91,6 @@ impl ContentStore for LruCs {
         let capacity = self.capacity_bytes.load(Ordering::Relaxed);
         let mut inner = self.inner.lock().unwrap();
 
-        // Track whether we are replacing an existing entry.
         let was_present = if let Some(old) = inner.cache.peek(name.as_ref()) {
             inner.current_bytes = inner.current_bytes.saturating_sub(old.data.len());
             true
@@ -111,7 +98,6 @@ impl ContentStore for LruCs {
             false
         };
 
-        // Evict LRU entries until there is room, keeping prefix_index in sync.
         while inner.current_bytes + entry_bytes > capacity {
             if let Some((evicted_name, evicted)) = inner.cache.pop_lru() {
                 inner.current_bytes = inner.current_bytes.saturating_sub(evicted.data.len());
@@ -130,7 +116,6 @@ impl ContentStore for LruCs {
         inner.cache.put(name.clone(), entry);
         inner.current_bytes += entry_bytes;
 
-        // Only index new entries; replacements keep the same name in the trie.
         if !was_present {
             inner.prefix_index.insert(name.as_ref(), Arc::clone(&name));
         }
@@ -170,7 +155,6 @@ impl ContentStore for LruCs {
 
     fn set_capacity(&self, max_bytes: usize) {
         self.capacity_bytes.store(max_bytes, Ordering::Relaxed);
-        // Evict entries that exceed the new capacity.
         let mut inner = self.inner.lock().unwrap();
         while inner.current_bytes > max_bytes {
             if let Some((evicted_name, evicted)) = inner.cache.pop_lru() {
@@ -231,7 +215,7 @@ mod tests {
     }
 
     fn meta_stale() -> CsMeta {
-        CsMeta { stale_at: 0 } // already stale
+        CsMeta { stale_at: 0 }
     }
 
     fn interest(components: &[&str]) -> Interest {
@@ -272,8 +256,6 @@ mod tests {
         Interest::decode(w.finish()).unwrap()
     }
 
-    // ── basic insert / get ────────────────────────────────────────────────────
-
     #[tokio::test]
     async fn get_miss_returns_none() {
         let cs = LruCs::new(65536);
@@ -313,8 +295,6 @@ mod tests {
         assert_eq!(entry.data.as_ref(), b"new");
     }
 
-    // ── must_be_fresh ─────────────────────────────────────────────────────────
-
     #[tokio::test]
     async fn must_be_fresh_rejects_stale_entry() {
         let cs = LruCs::new(65536);
@@ -340,8 +320,6 @@ mod tests {
         assert!(cs.get(&interest(&["a"])).await.is_some());
     }
 
-    // ── can_be_prefix ─────────────────────────────────────────────────────────
-
     #[tokio::test]
     async fn can_be_prefix_finds_longer_name() {
         let cs = LruCs::new(65536);
@@ -366,8 +344,6 @@ mod tests {
         .await;
         assert!(cs.get(&interest_can_be_prefix(&["a", "b"])).await.is_none());
     }
-
-    // ── evict ─────────────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn evict_removes_entry() {
@@ -400,8 +376,6 @@ mod tests {
         assert!(cs.get(&interest_can_be_prefix(&["a"])).await.is_none());
     }
 
-    // ── capacity / LRU eviction ───────────────────────────────────────────────
-
     #[tokio::test]
     async fn capacity_is_reported() {
         let cs = LruCs::new(1024);
@@ -423,8 +397,6 @@ mod tests {
         assert!(cs.get(&interest(&["b"])).await.is_some());
         assert!(cs.get(&interest(&["c"])).await.is_some());
     }
-
-    // ── implicit SHA-256 digest ────────────────────────────────────────────
 
     #[tokio::test]
     async fn implicit_digest_lookup_matches() {
@@ -488,8 +460,6 @@ mod tests {
         // CanBePrefix for /a should now miss (evicted entry removed from index).
         assert!(cs.get(&interest_can_be_prefix(&["a"])).await.is_none());
     }
-
-    // ── new trait methods ─────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn len_tracks_entries() {

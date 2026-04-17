@@ -1,17 +1,9 @@
 //! Custom SPSC shared-memory face (Unix only, `spsc-shm` feature).
 //!
-//! A named POSIX SHM region holds two lock-free single-producer/single-consumer
-//! ring buffers — one for each direction.  Wakeup uses a named FIFO (pipe)
-//! pair on all platforms: the engine creates two FIFOs
-//! (`/tmp/.ndn-{name}.a2e.pipe` and `.e2a.pipe`); both sides open them
-//! `O_RDWR | O_NONBLOCK` (avoids the blocking-open problem).  The consumer
-//! awaits readability via `tokio::io::unix::AsyncFd`; the producer writes 1
-//! non-blocking byte.  The parked flag in SHM is still used to avoid
-//! unnecessary pipe writes when the consumer is active.
-//!
-//! This design integrates directly into Tokio's epoll/kqueue loop with zero
-//! thread transitions, unlike the previous Linux futex + `spawn_blocking`
-//! approach which routed every park through Tokio's blocking thread pool.
+//! A named POSIX SHM region holds two lock-free SPSC ring buffers (one per
+//! direction).  Wakeup uses named FIFOs integrated into Tokio's epoll/kqueue
+//! loop, chosen over futex + `spawn_blocking` to avoid routing every park
+//! through Tokio's blocking thread pool (2.5x throughput improvement).
 //!
 //! # SHM layout
 //!
@@ -44,60 +36,24 @@ use ndn_transport::{Face, FaceError, FaceId, FaceKind};
 
 use crate::local::shm::ShmError;
 
-// ─── Named FIFO wakeup helpers ───────────────────────────────────────────────
-//
-// Both Linux and macOS use named FIFOs (pipes) for cross-process wakeup,
-// wrapped in Tokio's AsyncFd for zero-thread-transition async integration.
-// The previous Linux path used futex + spawn_blocking which routed every
-// park through Tokio's blocking thread pool — expensive at 100K+ pkt/s
-// and responsible for the 2.5× throughput gap vs macOS.
-
-// ─── Constants ───────────────────────────────────────────────────────────────
-
 const MAGIC: u64 = 0x4E44_4E5F_5348_4D00; // b"NDN_SHM\0"
 
-/// Default number of slots per ring.
-///
-/// Paired with [`DEFAULT_SLOT_SIZE`] so the total default ring memory
-/// is ~4.4 MiB per face (256 × 8960 × 2) — the same budget as the
-/// original v1 design. Tools that need larger Data packets (chunked
-/// producers at 64+ KiB segments) call `faces/create` with an explicit
-/// `mtu`, and the router creates a face with a proportionally larger
-/// slot_size and smaller capacity via [`capacity_for_slot`].
+/// Default number of slots per ring (~4.4 MiB per face with default slot size).
 pub const DEFAULT_CAPACITY: u32 = 256;
 
-/// Default slot payload size in bytes (~8.75 KiB). Covers a standard
-/// NDN Data packet (≤8800 bytes on most link types) with a small
-/// headroom margin. This is the right default for the majority of
-/// NDN traffic: Interests (~60–200 bytes), single-packet Data
-/// (~4–8 KiB content), iperf probes, ping, management, etc.
-///
-/// Tools that produce larger Data (chunked file transfers at 64 KiB,
-/// 256 KiB, or 1 MiB segments) negotiate a bigger slot via the `mtu`
-/// field of `faces/create` ControlParameters. `ndn-put` does this
-/// automatically from `--chunk-size`; `ndn-peek` accepts `--mtu`.
+/// Default slot payload size (~8.75 KiB). Covers standard NDN Data packets.
+/// Larger segments negotiate a bigger slot via `faces/create` `mtu` parameter.
 pub const DEFAULT_SLOT_SIZE: u32 = 8960;
 
-/// Target SHM ring memory budget per face, in bytes. Used by
-/// [`capacity_for_slot`] to scale capacity inversely with slot_size
-/// so that faces with large slots (256 KiB for chunked producers)
-/// don't blow up memory, and faces with small slots (8960 for iperf)
-/// get a deep ring that stays in L2 cache.
+/// Target SHM ring memory budget per face. Capacity scales inversely with
+/// slot_size so large-slot faces don't blow up memory.
 const SHM_BUDGET: usize = 2 * DEFAULT_CAPACITY as usize * slot_stride(DEFAULT_SLOT_SIZE);
 
-/// NDN Data packet wire overhead above the raw content bytes:
-/// Data TLV + Name + MetaInfo + SignatureInfo + SignatureValue. 16 KiB
-/// is generous enough to cover a Data whose content is `mtu` bytes of
-/// payload plus a long name and a large signature (Ed25519, ECDSA with
-/// key locator, or a Merkle proof up to a few hundred hashes).
+/// NDN Data wire overhead above the raw content (TLV headers + name + signature).
 pub const SHM_SLOT_OVERHEAD: usize = 16 * 1024;
 
-/// Pick a slot size for a face that needs to carry NDN Data whose
-/// *content* can be up to `mtu` bytes. Rounds up to the next multiple
-/// of 64 bytes so the per-slot stride stays cache-line aligned.
-/// Does **not** clamp to a floor — an explicit `mtu = 8800` gets a
-/// ~25 KiB slot, not the 272 KiB default. If no `mtu` is specified,
-/// the caller should use `DEFAULT_SLOT_SIZE` directly.
+/// Pick a slot size for Data packets whose content can be up to `mtu` bytes.
+/// Rounds up to the next 64-byte multiple for cache-line alignment.
 pub fn slot_size_for_mtu(mtu: usize) -> u32 {
     let raw = mtu.saturating_add(SHM_SLOT_OVERHEAD);
     let aligned = raw.div_ceil(64) * 64;
@@ -105,20 +61,17 @@ pub fn slot_size_for_mtu(mtu: usize) -> u32 {
 }
 
 /// Compute ring capacity for a given slot_size, keeping total ring
-/// memory within [`SHM_BUDGET`]. Returns at least 16 (to keep some
-/// pipeline buffering even for very large slots).
+/// memory within [`SHM_BUDGET`]. Returns at least 16.
 pub fn capacity_for_slot(slot_size: u32) -> u32 {
     let stride = slot_stride(slot_size);
     let cap = SHM_BUDGET / (2 * stride);
     (cap as u32).max(16)
 }
 
-// Cache-line–aligned offsets for the four ring index atomics.
 const OFF_A2E_TAIL: usize = 64; // app writes (producer)
 const OFF_A2E_HEAD: usize = 128; // engine writes (consumer)
 const OFF_E2A_TAIL: usize = 192; // engine writes (producer)
 const OFF_E2A_HEAD: usize = 256; // app writes (consumer)
-// Parked flags: consumer sets to 1 before sleeping, clears on wake.
 const OFF_A2E_PARKED: usize = 320; // engine (a2e consumer) parked flag
 const OFF_E2A_PARKED: usize = 384; // app (e2a consumer) parked flag
 const HEADER_SIZE: usize = 448; // 7 × 64-byte cache lines
@@ -127,10 +80,8 @@ const fn slot_stride(slot_size: u32) -> usize {
     4 + slot_size as usize
 }
 
-/// Number of spin-loop iterations before falling through to the pipe
-/// wakeup path.  64 iterations ≈ sub-µs
-/// on modern hardware — enough to catch back-to-back packets without
-/// causing thermal throttling from sustained spinning across multiple faces.
+/// Spin-loop iterations before falling through to the pipe wakeup path.
+/// 64 iterations ~ sub-us on modern hardware.
 const SPIN_ITERS: u32 = 64;
 
 fn shm_total_size(capacity: u32, slot_size: u32) -> usize {
@@ -144,29 +95,22 @@ fn e2a_ring_offset(capacity: u32, slot_size: u32) -> usize {
     HEADER_SIZE + capacity as usize * slot_stride(slot_size)
 }
 
-// ─── Path helpers ─────────────────────────────────────────────────────────────
-
 fn posix_shm_name(name: &str) -> String {
     format!("/ndn-shm-{name}")
 }
 
-/// Path of the FIFO the *engine* reads from (app writes to wake engine).
 fn a2e_pipe_path(name: &str) -> PathBuf {
     PathBuf::from(format!("/tmp/.ndn-{name}.a2e.pipe"))
 }
 
-/// Path of the FIFO the *app* reads from (engine writes to wake app).
 fn e2a_pipe_path(name: &str) -> PathBuf {
     PathBuf::from(format!("/tmp/.ndn-{name}.e2a.pipe"))
 }
-
-// ─── POSIX SHM region ────────────────────────────────────────────────────────
 
 /// Owns a POSIX SHM mapping. The creator unlinks the name on drop.
 struct ShmRegion {
     ptr: *mut u8,
     size: usize,
-    /// Present when this process created the region; drives shm_unlink on drop.
     shm_name: Option<CString>,
 }
 
@@ -174,7 +118,6 @@ unsafe impl Send for ShmRegion {}
 unsafe impl Sync for ShmRegion {}
 
 impl ShmRegion {
-    /// Create and zero-initialise a new named SHM region.
     fn create(shm_name: &str, size: usize) -> Result<Self, ShmError> {
         let cname = CString::new(shm_name).map_err(|_| ShmError::InvalidName)?;
         let ptr = unsafe {
@@ -216,7 +159,6 @@ impl ShmRegion {
         })
     }
 
-    /// Open an existing named SHM region created by `ShmRegion::create`.
     fn open(shm_name: &str, size: usize) -> Result<Self, ShmError> {
         let cname = CString::new(shm_name).map_err(|_| ShmError::InvalidName)?;
         let ptr = unsafe {
@@ -250,8 +192,6 @@ impl ShmRegion {
         self.ptr
     }
 
-    /// Write the header fields (magic, capacity, slot_size).
-    ///
     /// # Safety
     /// Must be called exactly once immediately after `create()`, before any
     /// other process opens the region.
@@ -261,11 +201,8 @@ impl ShmRegion {
             (self.ptr.add(8) as *mut u32).write_unaligned(capacity);
             (self.ptr.add(12) as *mut u32).write_unaligned(slot_size);
         }
-        // Ring indices start at zero (mmap of new ftruncated fd is zero-initialised).
     }
 
-    /// Read and validate the header. Returns `(capacity, slot_size)`.
-    ///
     /// # Safety
     /// The region must have been initialised by `write_header`.
     unsafe fn read_header(&self) -> Result<(u32, u32), ShmError> {
@@ -291,8 +228,6 @@ impl Drop for ShmRegion {
         }
     }
 }
-
-// ─── SPSC ring operations ─────────────────────────────────────────────────────
 
 /// Push `data` into the ring at [`ring_off`] using the tail at [`tail_off`] and
 /// head at [`head_off`]. Returns `false` if the ring is full.
@@ -331,24 +266,8 @@ unsafe fn ring_push(
     true
 }
 
-/// Push up to `pkts.len()` packets into the ring in one tail advance.
-///
-/// Loads the head once (Acquire), determines the free-slot count, writes
-/// as many packets as fit into consecutive slots, and publishes the tail
-/// with a single Release store. Returns the number of packets pushed
-/// (0 if the ring was full, `pkts.len()` on complete success, or a
-/// partial count in between).
-///
-/// Compared to calling [`ring_push`] N times, this function:
-/// - Loads the peer head *once* instead of N times (N−1 atomic loads
-///   saved).
-/// - Publishes a single Release store instead of N (N−1 release fences
-///   saved; the consumer sees all pushed packets at once).
-/// - Keeps the same per-slot length+memcpy work — batching does not
-///   save per-byte cost, only per-packet synchronisation cost.
-///
-/// The caller is responsible for handling the "ring full" case (yield
-/// and retry, same as single-packet `ring_push`).
+/// Push up to `pkts.len()` packets in one tail advance (one Acquire load,
+/// one Release store instead of N each). Returns the number pushed.
 ///
 /// # Safety
 /// Same as [`ring_push`]. Every packet must satisfy
@@ -386,7 +305,6 @@ unsafe fn ring_push_batch(
         }
         t = t.wrapping_add(1);
     }
-    // Single Release store publishes all `to_push` slots to the consumer.
     tail_a.store(t, Ordering::Release);
     to_push
 }
@@ -416,22 +334,16 @@ unsafe fn ring_pop(
     let slot = unsafe { base.add(ring_off + idx * slot_stride(slot_size)) };
 
     let len = unsafe { (slot as *const u32).read_unaligned() as usize };
-    // Clamp to prevent out-of-bounds read if SHM is corrupted.
-    let len = len.min(slot_size as usize);
+    let len = len.min(slot_size as usize); // clamp against SHM corruption
     let data = unsafe { Bytes::copy_from_slice(std::slice::from_raw_parts(slot.add(4), len)) };
 
     head_a.store(h.wrapping_add(1), Ordering::Release);
     Some(data)
 }
 
-// ─── FIFO wakeup helpers ─────────────────────────────────────────────────────
-
-/// Open a named FIFO (must already exist) with `O_RDWR | O_NONBLOCK`.
-///
-/// `O_RDWR` avoids the blocking-open problem: the open succeeds immediately
-/// even if the other end has not yet opened the FIFO.  Both sides only use
-/// the fd in the direction they own (reads or writes), so no cross-reading
-/// occurs.
+/// Open a named FIFO with `O_RDWR | O_NONBLOCK`.
+/// `O_RDWR` avoids the blocking-open problem where open blocks until the
+/// other end has also opened the FIFO.
 fn open_fifo_rdwr(path: &std::path::Path) -> Result<std::os::unix::io::OwnedFd, ShmError> {
     use std::os::unix::io::{FromRawFd, OwnedFd};
     let cpath = CString::new(path.to_str().unwrap_or("")).map_err(|_| ShmError::InvalidName)?;
@@ -442,9 +354,7 @@ fn open_fifo_rdwr(path: &std::path::Path) -> Result<std::os::unix::io::OwnedFd, 
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
-/// Await readability on the pipe fd, then drain all buffered bytes.
-///
-/// Returns `Err` on EOF (peer died) or any I/O error.
+/// Await readability on the pipe fd, then drain buffered bytes.
 async fn pipe_await(
     rx: &tokio::io::unix::AsyncFd<std::os::unix::io::OwnedFd>,
 ) -> std::io::Result<()> {
@@ -459,7 +369,6 @@ async fn pipe_await(
             return Ok(());
         }
         if n == 0 {
-            // EOF — peer closed their end.
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "SHM wakeup pipe closed (peer died)",
@@ -474,10 +383,8 @@ async fn pipe_await(
     }
 }
 
-/// Write one wakeup byte to a non-blocking pipe fd.
-///
-/// Silently ignores `EAGAIN` (pipe buffer full): if the buffer is full the
-/// consumer is already being woken by a previous byte.
+/// Write one wakeup byte. Ignores `EAGAIN` (buffer full means consumer
+/// is already being woken).
 fn pipe_write(tx: &std::os::unix::io::OwnedFd) {
     use std::os::unix::io::AsRawFd;
     let b = [1u8];
@@ -486,13 +393,7 @@ fn pipe_write(tx: &std::os::unix::io::OwnedFd) {
     }
 }
 
-// ─── SpscFace (engine side) ───────────────────────────────────────────────────
-
 /// Engine-side SPSC SHM face.
-///
-/// Create with [`SpscFace::create`]; register with the engine via
-/// `ForwarderEngine::add_face`. Give the `name` to the application so it can
-/// call [`SpscHandle::connect`].
 pub struct SpscFace {
     id: FaceId,
     shm: ShmRegion,
@@ -500,36 +401,23 @@ pub struct SpscFace {
     slot_size: u32,
     a2e_off: usize,
     e2a_off: usize,
-    /// FIFO the engine awaits readability on (app writes here to wake engine).
     a2e_rx: tokio::io::unix::AsyncFd<std::os::unix::io::OwnedFd>,
-    /// FIFO the engine writes to (to wake the app).
     e2a_tx: std::os::unix::io::OwnedFd,
-    /// Paths of the FIFOs created by the engine — removed on drop.
     a2e_pipe_path: PathBuf,
     e2a_pipe_path: PathBuf,
 }
 
 impl SpscFace {
-    /// Create the SHM region and set up the wakeup mechanism.
-    ///
-    /// `name` identifies this face (e.g. `"sensor-0"`); pass it to
-    /// [`SpscHandle::connect`] in the application process.
     pub fn create(id: FaceId, name: &str) -> Result<Self, ShmError> {
         Self::create_with(id, name, DEFAULT_CAPACITY, DEFAULT_SLOT_SIZE)
     }
 
-    /// Create a face sized for Data packets whose content can be up
-    /// to `mtu` bytes. Picks `slot_size = slot_size_for_mtu(mtu)` and
-    /// scales `capacity` inversely so the total ring memory stays
-    /// within [`SHM_BUDGET`]. Use this when an application has
-    /// announced its expected packet size via `faces/create`'s `mtu`
-    /// ControlParameter.
+    /// Create a face sized for Data packets up to `mtu` bytes of content.
     pub fn create_for_mtu(id: FaceId, name: &str, mtu: usize) -> Result<Self, ShmError> {
         let ss = slot_size_for_mtu(mtu);
         Self::create_with(id, name, capacity_for_slot(ss), ss)
     }
 
-    /// Create with explicit ring parameters.
     pub fn create_with(
         id: FaceId,
         name: &str,
@@ -550,11 +438,9 @@ impl SpscFace {
         let a2e_path = a2e_pipe_path(name);
         let e2a_path = e2a_pipe_path(name);
 
-        // Remove stale FIFOs from a previous run.
         let _ = std::fs::remove_file(&a2e_path);
         let _ = std::fs::remove_file(&e2a_path);
 
-        // Create the named FIFOs.
         for p in [&a2e_path, &e2a_path] {
             let cp = CString::new(p.to_str().unwrap_or("")).map_err(|_| ShmError::InvalidName)?;
             if unsafe { libc::mkfifo(cp.as_ptr(), 0o600) } == -1 {
@@ -562,11 +448,9 @@ impl SpscFace {
             }
         }
 
-        // Engine reads from a2e (awaits wakeup from app).
         let a2e_fd = open_fifo_rdwr(&a2e_path)?;
         let a2e_rx = AsyncFd::new(a2e_fd).map_err(ShmError::Io)?;
 
-        // Engine writes to e2a (sends wakeup to app).
         let e2a_tx = open_fifo_rdwr(&e2a_path)?;
 
         Ok(SpscFace {
@@ -624,9 +508,7 @@ impl SpscFace {
         }
     }
 
-    /// Send multiple Data/Interest packets to the app in a single tail
-    /// advance. See [`SpscHandle::send_batch`] for the semantics — this
-    /// is the engine-side mirror.
+    /// Send multiple packets to the app in a single tail advance.
     pub async fn send_batch(&self, pkts: &[Bytes]) -> Result<(), FaceError> {
         if pkts.is_empty() {
             return Ok(());
@@ -639,11 +521,8 @@ impl SpscFace {
                 )));
             }
         }
-        // SAFETY: parked flag within mapped SHM region.
         let parked =
             unsafe { AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_E2A_PARKED) as *mut u32) };
-        // Build a `&[&[u8]]` view once — cheaper than re-slicing inside
-        // the yield loop.
         let views: Vec<&[u8]> = pkts.iter().map(|p| p.as_ref()).collect();
         let mut start = 0usize;
         while start < views.len() {
@@ -677,33 +556,27 @@ impl Face for SpscFace {
     }
 
     async fn recv(&self) -> Result<Bytes, FaceError> {
-        // SAFETY: parked flag is within the mapped SHM region.
         let parked =
             unsafe { AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_A2E_PARKED) as *mut u32) };
         loop {
             if let Some(pkt) = self.try_pop_a2e() {
                 return Ok(pkt);
             }
-            // Spin before parking — avoids expensive pipe syscall
-            // when packets arrive within microseconds of each other.
             for _ in 0..SPIN_ITERS {
                 std::hint::spin_loop();
                 if let Some(pkt) = self.try_pop_a2e() {
                     return Ok(pkt);
                 }
             }
-            // Announce intent to sleep with SeqCst so the app's next SeqCst
-            // load on the parked flag observes this before or after it pushes
-            // to the ring — never concurrently missed.
+            // SeqCst store ensures the app sees this flag before/after its
+            // ring push — preventing a missed wakeup.
             parked.store(1, Ordering::SeqCst);
-            // Second ring check: if the app already pushed between our first
-            // check and the flag store, we see it here and avoid sleeping.
+            // Second check: catch pushes between first check and flag store.
             if let Some(pkt) = self.try_pop_a2e() {
                 parked.store(0, Ordering::Relaxed);
                 return Ok(pkt);
             }
 
-            // Sleep until the app sends a wakeup via the FIFO.
             pipe_await(&self.a2e_rx)
                 .await
                 .map_err(|_| FaceError::Closed)?;
@@ -719,17 +592,14 @@ impl Face for SpscFace {
                 "packet exceeds SHM slot size",
             )));
         }
-        // SAFETY: parked flag within mapped SHM region.
         let parked =
             unsafe { AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_E2A_PARKED) as *mut u32) };
-        // Yield until there is space in the e2a ring (backpressure).
         loop {
             if self.try_push_e2a(&pkt) {
                 break;
             }
             tokio::task::yield_now().await;
         }
-        // Only send a wakeup if the app is actually sleeping.
         if parked.load(Ordering::SeqCst) != 0 {
             pipe_write(&self.e2a_tx);
         }
@@ -737,37 +607,23 @@ impl Face for SpscFace {
     }
 }
 
-// ─── SpscHandle (application side) ───────────────────────────────────────────
-
 /// Application-side SPSC SHM handle.
-///
-/// Connect with [`SpscHandle::connect`] using the same `name` passed to
-/// [`SpscFace::create`] in the engine process.
-///
-/// Set a `CancellationToken` via [`set_cancel`] to abort `recv`/`send` when
-/// the router's control face disconnects (the O_RDWR FIFO trick means EOF
-/// detection alone is unreliable).
 pub struct SpscHandle {
     shm: ShmRegion,
     capacity: u32,
     slot_size: u32,
     a2e_off: usize,
     e2a_off: usize,
-    /// FIFO the app awaits readability on (engine writes here to wake app).
     e2a_rx: tokio::io::unix::AsyncFd<std::os::unix::io::OwnedFd>,
-    /// FIFO the app writes to (to wake the engine).
     a2e_tx: std::os::unix::io::OwnedFd,
-    /// Cancelled when the router control face dies.
     cancel: tokio_util::sync::CancellationToken,
 }
 
 impl SpscHandle {
-    /// Open the SHM region created by the engine and set up the wakeup mechanism.
     pub fn connect(name: &str) -> Result<Self, ShmError> {
         let shm_name_str = posix_shm_name(name);
         let cname = CString::new(shm_name_str.as_str()).map_err(|_| ShmError::InvalidName)?;
 
-        // Phase 1: open just the header to read capacity and slot_size.
         let (capacity, slot_size) = unsafe {
             let fd = libc::shm_open(cname.as_ptr(), libc::O_RDONLY, 0);
             if fd == -1 {
@@ -797,7 +653,6 @@ impl SpscHandle {
             (cap, slen)
         };
 
-        // Phase 2: open the full region read-write.
         let size = shm_total_size(capacity, slot_size);
         let shm = ShmRegion::open(&shm_name_str, size)?;
         unsafe { shm.read_header()? };
@@ -807,13 +662,10 @@ impl SpscHandle {
 
         use tokio::io::unix::AsyncFd;
 
-        let a2e_path = a2e_pipe_path(name); // app writes here to wake engine
-        let e2a_path = e2a_pipe_path(name); // app reads here (engine wakes app)
+        let a2e_path = a2e_pipe_path(name);
+        let e2a_path = e2a_pipe_path(name);
 
-        // App writes to a2e FIFO (to wake engine).
         let a2e_tx = open_fifo_rdwr(&a2e_path)?;
-
-        // App reads from e2a FIFO (awaits wakeup from engine).
         let e2a_fd = open_fifo_rdwr(&e2a_path)?;
         let e2a_rx = AsyncFd::new(e2a_fd).map_err(ShmError::Io)?;
 
@@ -829,9 +681,6 @@ impl SpscHandle {
         })
     }
 
-    /// Attach a cancellation token (typically a child of the control face's
-    /// lifecycle token).  When cancelled, `recv()` returns `None` and `send()`
-    /// returns `Err`.
     pub fn set_cancel(&mut self, cancel: tokio_util::sync::CancellationToken) {
         self.cancel = cancel;
     }
@@ -879,28 +728,8 @@ impl SpscHandle {
 
     /// Send multiple packets to the engine in one tail advance.
     ///
-    /// Equivalent in outcome to calling [`send`](Self::send) `pkts.len()`
-    /// times in order, but pays the synchronisation cost once rather than
-    /// N times:
-    ///
-    /// - One head load (Acquire) per ring-full check instead of N.
-    /// - One tail store (Release) per successful push batch instead of N.
-    /// - One wakeup pipe write at the end instead of up to N.
-    /// - Far fewer `tokio::task::yield_now().await` points when the ring
-    ///   is not contended: a window-fill of 16 Interests becomes one call,
-    ///   one atomic ring transition, and zero scheduler round trips in the
-    ///   common case (instead of 16 awaits and potentially 16 yields).
-    ///
-    /// Like `send`, this yields cooperatively if the ring fills mid-batch
-    /// and waits (up to a 5 s wall-clock deadline) for the engine to drain
-    /// enough slots. Partial progress is preserved across yields — the
-    /// caller is guaranteed that all `pkts` eventually reach the ring or
-    /// the call returns `Err(Closed)`.
-    ///
-    /// Every packet in `pkts` must satisfy `pkt.len() <= slot_size`, or
-    /// the call returns `Err(PacketTooLarge)` before publishing anything.
-    /// The size check is performed up-front so a batch is either fully
-    /// publishable or rejected atomically for the over-size case.
+    /// Yields cooperatively if the ring fills mid-batch. Returns
+    /// `Err(PacketTooLarge)` if any packet exceeds `slot_size`.
     pub async fn send_batch(&self, pkts: &[Bytes]) -> Result<(), ShmError> {
         if self.cancel.is_cancelled() {
             return Err(ShmError::Closed);
@@ -913,7 +742,6 @@ impl SpscHandle {
                 return Err(ShmError::PacketTooLarge);
             }
         }
-        // SAFETY: parked flag within mapped SHM region.
         let parked =
             unsafe { AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_A2E_PARKED) as *mut u32) };
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -932,10 +760,8 @@ impl SpscHandle {
                 continue;
             }
             start += pushed;
-            // Wake the engine after each partial push so it can drain
-            // the ring. Without this, a batch larger than ring capacity
-            // deadlocks: we yield waiting for space, the engine parks
-            // because nobody woke it to consume the first partial push.
+            // Wake the engine after each partial push to prevent deadlock
+            // when a batch exceeds ring capacity.
             if parked.load(Ordering::SeqCst) != 0 {
                 pipe_write(&self.a2e_tx);
             }
@@ -943,15 +769,8 @@ impl SpscHandle {
         Ok(())
     }
 
-    /// Send a packet to the engine (enqueue in the a2e ring).
-    ///
-    /// Yields cooperatively if the ring is full (backpressure from the engine).
-    /// Returns `Err(Closed)` if the cancellation token fires (engine dead).
-    ///
-    /// Uses a wall-clock deadline so backpressure tolerance is independent
-    /// of system scheduling speed (the old yield-counter approach returned
-    /// `Closed` after ~100k yields ≈ 1s on fast machines, but could be much
-    /// shorter under heavy Tokio contention — falsely killing the caller).
+    /// Send a packet to the engine. Yields cooperatively if the ring is full.
+    /// Uses a wall-clock deadline for backpressure instead of a yield counter.
     pub async fn send(&self, pkt: Bytes) -> Result<(), ShmError> {
         if self.cancel.is_cancelled() {
             return Err(ShmError::Closed);
@@ -959,7 +778,6 @@ impl SpscHandle {
         if pkt.len() > self.slot_size as usize {
             return Err(ShmError::PacketTooLarge);
         }
-        // SAFETY: parked flag within mapped SHM region.
         let parked =
             unsafe { AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_A2E_PARKED) as *mut u32) };
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -975,30 +793,23 @@ impl SpscHandle {
             }
             tokio::task::yield_now().await;
         }
-        // Only send a wakeup if the engine is sleeping on the a2e ring.
         if parked.load(Ordering::SeqCst) != 0 {
             pipe_write(&self.a2e_tx);
         }
         Ok(())
     }
 
-    /// Receive a packet from the engine (dequeue from the e2a ring).
-    ///
-    /// Returns `None` when the engine face has been dropped or the
-    /// cancellation token fires.
+    /// Receive a packet from the engine. Returns `None` when closed.
     pub async fn recv(&self) -> Option<Bytes> {
         if self.cancel.is_cancelled() {
             return None;
         }
-        // SAFETY: parked flag within mapped SHM region.
         let parked =
             unsafe { AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_E2A_PARKED) as *mut u32) };
         loop {
             if let Some(pkt) = self.try_pop_e2a() {
                 return Some(pkt);
             }
-            // Spin before parking — avoids expensive pipe syscall
-            // when packets arrive within microseconds of each other.
             for _ in 0..SPIN_ITERS {
                 std::hint::spin_loop();
                 if let Some(pkt) = self.try_pop_e2a() {
@@ -1011,10 +822,6 @@ impl SpscHandle {
                 return Some(pkt);
             }
 
-            // Wait for pipe wakeup or cancellation.  We rely on the
-            // CancellationToken (propagated from the control face) rather
-            // than timeouts — idle waits are legitimate (e.g. iperf server
-            // waiting for a client).
             tokio::select! {
                 result = pipe_await(&self.e2a_rx) => {
                     parked.store(0, Ordering::Relaxed);
@@ -1028,11 +835,6 @@ impl SpscHandle {
         }
     }
 }
-
-// SpscHandle has no Drop impl: ShmRegion handles munmap, OwnedFd closes pipe
-// fds, and the FIFOs are created/removed by SpscFace (engine side).
-
-// ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

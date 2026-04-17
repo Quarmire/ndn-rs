@@ -6,31 +6,16 @@ use ndn_tlv::{TlvReader, TlvWriter};
 use super::{next_nonce, nni, rand_nonce_bytes, write_name, write_nni};
 use crate::{Name, SignatureType, tlv_type};
 
-// ──��� Public API ───────────────────────────────────────────────────────────────
 
-/// Encode a minimal Interest TLV.
-///
-/// Includes:
-/// - `Name` built from `name`
-/// - `Nonce` (4 bytes, process-local counter XOR process ID — sufficient for
-///   loop detection; not cryptographically random)
-/// - `InterestLifetime` fixed at 4 000 ms
-/// - `ApplicationParameters` (TLV type 0x24) if `app_params` is `Some`
-///
-/// The returned `Bytes` is a complete, self-contained TLV suitable for direct
-/// transmission over any NDN face.
 pub fn encode_interest(name: &Name, app_params: Option<&[u8]>) -> Bytes {
     let mut w = TlvWriter::new();
     w.write_nested(tlv_type::INTEREST, |w| {
         if let Some(params) = app_params {
-            // Compute ParametersSha256DigestComponent: SHA-256 of the
-            // ApplicationParameters TLV (type + length + value).
             let mut params_tlv = TlvWriter::new();
             params_tlv.write_tlv(tlv_type::APP_PARAMETERS, params);
             let params_wire = params_tlv.finish();
             let digest = ring::digest::digest(&ring::digest::SHA256, &params_wire);
 
-            // Write Name with ParametersSha256DigestComponent appended.
             w.write_nested(tlv_type::NAME, |w| {
                 for comp in name.components() {
                     w.write_tlv(comp.typ, &comp.value);
@@ -49,15 +34,8 @@ pub fn encode_interest(name: &Name, app_params: Option<&[u8]>) -> Bytes {
     w.finish()
 }
 
-/// Ensure an Interest has a Nonce field.
-///
-/// If the Interest wire bytes already contain a Nonce (TLV 0x0A), returns the
-/// bytes unchanged. Otherwise, re-encodes the Interest with a generated Nonce
-/// inserted after the Name.
-///
 /// Per RFC 8569 §4.2, a forwarder MUST add a Nonce before forwarding.
 pub fn ensure_nonce(interest_wire: &Bytes) -> Bytes {
-    // Quick scan: does a Nonce TLV already exist?
     let mut reader = TlvReader::new(interest_wire.clone());
     let Ok((typ, value)) = reader.read_tlv() else {
         return interest_wire.clone();
@@ -70,11 +48,10 @@ pub fn ensure_nonce(interest_wire: &Bytes) -> Bytes {
     while !inner.is_empty() {
         let Ok((t, _)) = inner.read_tlv() else { break };
         if t == tlv_type::NONCE {
-            return interest_wire.clone(); // already has Nonce
+            return interest_wire.clone();
         }
     }
 
-    // No Nonce found — re-encode with one inserted.
     let mut w = TlvWriter::new();
     w.write_nested(tlv_type::INTEREST, |w| {
         let mut inner = TlvReader::new(value);
@@ -82,24 +59,19 @@ pub fn ensure_nonce(interest_wire: &Bytes) -> Bytes {
         while !inner.is_empty() {
             let Ok((t, v)) = inner.read_tlv() else { break };
             w.write_tlv(t, &v);
-            // Insert Nonce right after Name (type 0x07).
             if !name_written && t == tlv_type::NAME {
                 w.write_tlv(tlv_type::NONCE, &next_nonce().to_be_bytes());
                 name_written = true;
             }
         }
         if !name_written {
-            // Name wasn't found (malformed), add Nonce at end as fallback.
             w.write_tlv(tlv_type::NONCE, &next_nonce().to_be_bytes());
         }
     });
     w.finish()
 }
 
-// ─── InterestBuilder ─────────────────────────────────────────────────────────
 
-/// Configurable Interest encoder.
-///
 /// ```
 /// # use ndn_packet::encode::InterestBuilder;
 /// # use std::time::Duration;
@@ -161,21 +133,7 @@ impl InterestBuilder {
         self
     }
 
-    /// Build the Interest wire and return a suitable local receive timeout.
-    ///
-    /// The timeout is the Interest lifetime plus a 500 ms forwarding buffer.
-    /// Use this with `Consumer::fetch_with` so you don't have to compute the
-    /// timeout manually:
-    ///
-    /// ```rust,ignore
-    /// use ndn_packet::encode::InterestBuilder;
-    /// let data = consumer.fetch_with(
-    ///     InterestBuilder::new("/ndn/test")
-    ///         .hop_limit(4)
-    ///         .forwarding_hint(vec!["/hint/hub".parse()?])
-    ///         .app_parameters(b"q=hello"),
-    /// ).await?;
-    /// ```
+    /// Returns `(wire, timeout)` where timeout is lifetime + 500ms buffer.
     pub fn build_with_timeout(self) -> (Bytes, std::time::Duration) {
         let lifetime = self
             .lifetime
@@ -190,7 +148,6 @@ impl InterestBuilder {
         let mut w = TlvWriter::new();
         w.write_nested(tlv_type::INTEREST, |w| {
             if let Some(ref params) = self.app_parameters {
-                // With ApplicationParameters: append ParametersSha256DigestComponent.
                 let mut params_tlv = TlvWriter::new();
                 params_tlv.write_tlv(tlv_type::APP_PARAMETERS, params);
                 let params_wire = params_tlv.finish();
@@ -230,20 +187,8 @@ impl InterestBuilder {
         w.finish()
     }
 
-    /// Encode and sign the Interest packet (Signed Interest per NDN v0.3 §5.4).
-    ///
-    /// `sig_type` and `key_locator` describe the signature algorithm and
-    /// optional KeyLocator name for InterestSignatureInfo. `sign_fn` receives
-    /// the signed region (Name through InterestSignatureInfo) and returns the
-    /// raw signature bytes.
-    ///
-    /// If `app_parameters` was not set, an empty ApplicationParameters TLV is
-    /// used — signed Interests must carry ApplicationParameters per spec.
-    ///
-    /// Anti-replay fields (SignatureNonce, SignatureTime, SignatureSeqNum) are
-    /// included in InterestSignatureInfo if set via the builder. If none are
-    /// set, a random 8-byte SignatureNonce and the current wall-clock
-    /// SignatureTime are generated automatically.
+    /// Signed Interest per NDN Packet Format v0.3 §5.4. Auto-generates
+    /// SignatureNonce and SignatureTime for replay protection.
     pub async fn sign<F, Fut>(
         self,
         sig_type: SignatureType,
@@ -258,19 +203,16 @@ impl InterestBuilder {
             self.build_signed_interest_region(sig_type, key_locator);
         let sig_value = sign_fn(&signed_region).await;
 
-        // Build the InterestSignatureValue TLV.
         let mut sigval_w = TlvWriter::new();
         sigval_w.write_tlv(tlv_type::INTEREST_SIGNATURE_VALUE, &sig_value);
         let sigval_bytes = sigval_w.finish();
 
-        // Compute the actual ParametersSha256DigestComponent value.
         let mut digest_input =
             Vec::with_capacity((signed_region.len() - app_params_offset) + sigval_bytes.len());
         digest_input.extend_from_slice(&signed_region[app_params_offset..]);
         digest_input.extend_from_slice(&sigval_bytes);
         let actual_digest = ring::digest::digest(&ring::digest::SHA256, &digest_input);
 
-        // Patch the placeholder with the actual digest.
         signed_region[digest_value_offset..digest_value_offset + 32]
             .copy_from_slice(actual_digest.as_ref());
 
@@ -283,14 +225,7 @@ impl InterestBuilder {
         outer.finish()
     }
 
-    /// Sign with `DigestSha256` — SHA-256 of the signed region.
-    ///
-    /// This is the minimum signature type accepted by NFD for management
-    /// Interests on the loopback face.  No key material is required; NFD
-    /// verifies the signature by recomputing the SHA-256 itself.
-    ///
-    /// Use this when sending management commands (`rib/register`, etc.) to
-    /// NFD or ndnd so they do not silently drop the Interest.
+    /// Minimum signature accepted by NFD for management Interests.
     #[cfg(feature = "std")]
     pub fn sign_digest_sha256(self) -> Bytes {
         self.sign_sync(SignatureType::DigestSha256, None, |region| {
@@ -299,7 +234,6 @@ impl InterestBuilder {
         })
     }
 
-    /// Synchronous encode-and-sign for CPU-only signers (Ed25519, HMAC).
     pub fn sign_sync<F>(
         self,
         sig_type: SignatureType,
@@ -313,12 +247,10 @@ impl InterestBuilder {
             self.build_signed_interest_region(sig_type, key_locator);
         let sig_value = sign_fn(&signed_region);
 
-        // Build the InterestSignatureValue TLV.
         let mut sigval_w = TlvWriter::new();
         sigval_w.write_tlv(tlv_type::INTEREST_SIGNATURE_VALUE, &sig_value);
         let sigval_bytes = sigval_w.finish();
 
-        // Compute the actual ParametersSha256DigestComponent value:
         // SHA-256 over ApplicationParameters + InterestSignatureInfo +
         // InterestSignatureValue TLVs (NDN Packet Format v0.3 §5.4).
         let mut digest_input =
@@ -327,7 +259,6 @@ impl InterestBuilder {
         digest_input.extend_from_slice(&sigval_bytes);
         let actual_digest = ring::digest::digest(&ring::digest::SHA256, &digest_input);
 
-        // Patch the 32-byte placeholder in the Name with the actual digest.
         signed_region[digest_value_offset..digest_value_offset + 32]
             .copy_from_slice(actual_digest.as_ref());
 
@@ -340,21 +271,9 @@ impl InterestBuilder {
         outer.finish()
     }
 
-    /// Build the signed region for a Signed Interest: Name (with a 32-byte
-    /// placeholder for ParametersSha256DigestComponent) through
-    /// InterestSignatureInfo, including all fields in between.
-    ///
-    /// Returns `(bytes, digest_value_offset, app_params_offset)`:
-    /// - `bytes`: the full signed region
-    /// - `digest_value_offset`: byte offset of the 32-byte placeholder that
-    ///   must be replaced with the actual SHA-256 digest after signing
-    /// - `app_params_offset`: byte offset where ApplicationParameters TLV
-    ///   starts — used as the beginning of the digest-coverage region
-    ///
-    /// The caller computes the actual ParametersSha256DigestComponent value as
-    /// SHA-256 of `bytes[app_params_offset..]` (ApplicationParameters +
-    /// InterestSignatureInfo) concatenated with the InterestSignatureValue TLV,
-    /// then patches `bytes[digest_value_offset..digest_value_offset+32]`.
+    /// Returns `(bytes, digest_value_offset, app_params_offset)`. The caller
+    /// patches the 32-byte ParametersSha256DigestComponent placeholder after
+    /// signing.
     fn build_signed_interest_region(
         self,
         sig_type: SignatureType,
@@ -365,19 +284,14 @@ impl InterestBuilder {
 
         let mut inner = TlvWriter::new();
 
-        // Name with a 32-byte placeholder for ParametersSha256DigestComponent.
-        // The actual digest is computed after the signature is known and patched
-        // in by the caller.
         inner.write_nested(tlv_type::NAME, |w| {
             for comp in self.name.components() {
                 w.write_tlv(comp.typ, &comp.value);
             }
             w.write_tlv(tlv_type::PARAMETERS_SHA256, &[0u8; 32]);
         });
-        // The placeholder is the last 32 bytes of the Name TLV.
         let digest_value_offset = inner.len() - 32;
 
-        // Selectors.
         if self.can_be_prefix {
             inner.write_tlv(tlv_type::CAN_BE_PREFIX, &[]);
         }
@@ -385,7 +299,6 @@ impl InterestBuilder {
             inner.write_tlv(tlv_type::MUST_BE_FRESH, &[]);
         }
 
-        // ForwardingHint.
         if let Some(ref hints) = self.forwarding_hint {
             inner.write_nested(tlv_type::FORWARDING_HINT, |w| {
                 for h in hints {
@@ -394,20 +307,16 @@ impl InterestBuilder {
             });
         }
 
-        // Nonce, Lifetime, HopLimit.
         inner.write_tlv(tlv_type::NONCE, &next_nonce().to_be_bytes());
         write_nni(&mut inner, tlv_type::INTEREST_LIFETIME, lifetime_ms);
         if let Some(h) = self.hop_limit {
             inner.write_tlv(tlv_type::HOP_LIMIT, &[h]);
         }
 
-        // Track start of ApplicationParameters TLV for digest-coverage.
         let app_params_offset = inner.len();
 
-        // ApplicationParameters.
         inner.write_tlv(tlv_type::APP_PARAMETERS, &params);
 
-        // InterestSignatureInfo with anti-replay fields.
         inner.write_nested(tlv_type::INTEREST_SIGNATURE_INFO, |w| {
             write_nni(w, tlv_type::SIGNATURE_TYPE, sig_type.code());
             if let Some(kl) = key_locator {
@@ -415,8 +324,6 @@ impl InterestBuilder {
                     write_name(w, kl);
                 });
             }
-            // Auto-generate SignatureNonce (8 random bytes) and SignatureTime
-            // (current wall clock) for replay protection.
             let nonce_bytes: [u8; 8] = rand_nonce_bytes();
             w.write_tlv(tlv_type::SIGNATURE_NONCE, &nonce_bytes);
             let now_ms = std::time::SystemTime::now()
@@ -435,7 +342,6 @@ impl InterestBuilder {
     }
 }
 
-/// Allow `&str` and `String` to convert into `Name` for builder ergonomics.
 impl From<&str> for Name {
     fn from(s: &str) -> Self {
         s.parse().unwrap_or_else(|_| Name::root())
@@ -448,7 +354,6 @@ impl From<String> for Name {
     }
 }
 
-// ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -472,12 +377,10 @@ mod tests {
         let params = br#"{"cmd":"add_route","prefix":"/ndn","face":1,"cost":10}"#;
         let bytes = encode_interest(&n, Some(params));
         let interest = Interest::decode(bytes).unwrap();
-        // Name has the original components plus ParametersSha256DigestComponent.
         assert_eq!(interest.name.len(), n.len() + 1);
         for (i, comp) in n.components().iter().enumerate() {
             assert_eq!(interest.name.components()[i], *comp);
         }
-        // Last component is the digest (type 0x02, 32 bytes).
         let last = &interest.name.components()[n.len()];
         assert_eq!(last.typ, tlv_type::PARAMETERS_SHA256);
         assert_eq!(last.value.len(), 32);
@@ -534,7 +437,6 @@ mod tests {
         assert_ne!(i1.nonce(), i2.nonce());
     }
 
-    // ── InterestBuilder ──────────────────────────────────────────────────────
 
     #[test]
     fn interest_builder_basic() {
@@ -748,7 +650,6 @@ mod tests {
         assert!(i.signed_region().is_some());
     }
 
-    // ── Wire-format tests ────────────────────────────────────────────────────
 
     #[test]
     fn wire_interest_nni_lifetime() {

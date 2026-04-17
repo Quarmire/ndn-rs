@@ -14,24 +14,17 @@ use ndn_packet::lp::{encode_lp_acks, encode_lp_reliable, extract_acks};
 /// Maximum number of Ack TLVs to piggyback per outgoing packet.
 const MAX_PIGGYBACKED_ACKS: usize = 16;
 
-/// Maximum retransmission attempts before giving up on a packet.
-/// Keep low — NDN already has end-to-end recovery via Interest re-expression;
-/// per-hop reliability is just best-effort loss recovery.
 const DEFAULT_MAX_RETRIES: u8 = 1;
 
-/// Maximum retransmit packets per `check_retransmit()` call.
-/// Prevents burst retransmissions from blocking the face_sender, which would
-/// starve delivery of new packets and cause a throughput collapse.
+/// Cap retransmits per tick to prevent burst retransmissions from
+/// starving new packet delivery and causing throughput collapse.
 const MAX_RETX_PER_TICK: usize = 8;
 
-/// Maximum entries in the unacked map.
-/// Caps how long post-flow retransmit drain can last:
-/// MAX_UNACKED / (MAX_RETX_PER_TICK × ticks/sec) ≈ 256 / 160 ≈ 1.6s.
+/// Cap unacked map to prevent minutes of lingering retransmit traffic
+/// after high-throughput flows end.
 const MAX_UNACKED: usize = 256;
 
-// ─── RTO defaults ────────────────────────────────────────────────────────────
-
-/// RFC 6298 defaults.
+// RFC 6298 defaults.
 const RFC6298_INITIAL_RTO_US: u64 = 1_000_000; // 1 second
 const RFC6298_MIN_RTO_US: u64 = 200_000; // 200 ms
 const RFC6298_MAX_RTO_US: u64 = 4_000_000; // 4 seconds
@@ -39,7 +32,7 @@ const RFC6298_GRANULARITY_US: u64 = 100_000; // 100 ms
 const RFC6298_ALPHA: f64 = 0.125; // 1/8
 const RFC6298_BETA: f64 = 0.25; // 1/4
 
-/// QUIC (RFC 9002) defaults.
+// QUIC (RFC 9002) defaults.
 const QUIC_INITIAL_RTO_US: u64 = 333_000; // 333 ms
 const QUIC_MIN_RTO_US: u64 = 1_000; // 1 µs (QUIC has no minimum)
 const QUIC_MAX_RTO_US: u64 = 4_000_000; // 4 seconds
@@ -76,9 +69,6 @@ pub enum RtoStrategy {
 
 /// Per-face reliability configuration.
 ///
-/// Bundles all tunable knobs into a single struct that can be stored in
-/// config files, passed when creating faces, or selected via presets.
-///
 /// # Presets
 ///
 /// ```rust
@@ -91,13 +81,9 @@ pub enum RtoStrategy {
 /// ```
 #[derive(Debug, Clone)]
 pub struct ReliabilityConfig {
-    /// RTO computation algorithm.
     pub rto_strategy: RtoStrategy,
-    /// Maximum retransmission attempts before giving up (default: 1).
     pub max_retries: u8,
-    /// Maximum unacked entries before oldest are evicted (default: 256).
     pub max_unacked: usize,
-    /// Maximum retransmit packets per timer tick (default: 8).
     pub max_retx_per_tick: usize,
 }
 
@@ -113,7 +99,6 @@ impl Default for ReliabilityConfig {
 }
 
 impl ReliabilityConfig {
-    /// Local faces (Unix socket, SHM). Fixed 1ms RTO, minimal retries.
     pub fn local() -> Self {
         Self {
             rto_strategy: RtoStrategy::Fixed { rto_us: 1_000 },
@@ -123,7 +108,6 @@ impl ReliabilityConfig {
         }
     }
 
-    /// Stable wired Ethernet. QUIC-style adaptive with tight bounds.
     pub fn ethernet() -> Self {
         Self {
             rto_strategy: RtoStrategy::Quic,
@@ -133,7 +117,6 @@ impl ReliabilityConfig {
         }
     }
 
-    /// Lossy wireless (WiFi, Bluetooth). More retries, jitter-tolerant RTO.
     pub fn wifi() -> Self {
         Self {
             rto_strategy: RtoStrategy::Rfc6298,
@@ -153,9 +136,6 @@ struct UnackedEntry {
 }
 
 /// Per-face NDNLPv2 reliability state.
-///
-/// Tracks outbound TxSequences, piggybacked Acks, and adaptive RTO.
-/// All methods are synchronous and return wire-ready packets.
 pub struct LpReliability {
     next_seq: u64,
     unacked: HashMap<u64, UnackedEntry>,
@@ -181,12 +161,10 @@ fn initial_rto_for(strategy: &RtoStrategy) -> u64 {
 }
 
 impl LpReliability {
-    /// Create with default configuration (RFC 6298, conservative).
     pub fn new(mtu: usize) -> Self {
         Self::from_config(mtu, ReliabilityConfig::default())
     }
 
-    /// Create from a full configuration.
     pub fn from_config(mtu: usize, config: ReliabilityConfig) -> Self {
         let initial_rto = initial_rto_for(&config.rto_strategy);
         Self {
@@ -205,7 +183,6 @@ impl LpReliability {
         }
     }
 
-    /// Apply a new configuration. Resets RTO adaptation state.
     pub fn apply_config(&mut self, config: ReliabilityConfig) {
         self.rto_us = initial_rto_for(&config.rto_strategy);
         self.srtt_us = 0.0;
@@ -217,7 +194,6 @@ impl LpReliability {
         self.rto_strategy = config.rto_strategy;
     }
 
-    /// Current configuration (snapshot).
     pub fn config(&self) -> ReliabilityConfig {
         ReliabilityConfig {
             rto_strategy: self.rto_strategy.clone(),
@@ -234,15 +210,12 @@ impl LpReliability {
     pub fn on_send(&mut self, pkt: &[u8]) -> Vec<Bytes> {
         let now = Instant::now();
 
-        // Drain pending acks to piggyback.
         let acks: Vec<u64> = self
             .pending_acks
             .drain(..self.pending_acks.len().min(MAX_PIGGYBACKED_ACKS))
             .collect();
 
-        // Compute per-fragment payload capacity.
-        // Ack overhead: each Ack TLV is ~1-2 (type) + 1 (length) + 1-8 (value) bytes.
-        // Conservative: 10 bytes per ack.
+        // ~10 bytes per piggybacked Ack TLV.
         let ack_overhead = acks.len() * 10;
         let payload_cap = self
             .mtu
@@ -270,14 +243,9 @@ impl LpReliability {
                 None
             };
 
-            // Only piggyback acks on the first fragment.
             let frag_acks = if i == 0 { &acks[..] } else { &[] };
             let wire = encode_lp_reliable(chunk, seq, frag_info, frag_acks);
 
-            // Evict oldest entries if at capacity to prevent unbounded growth.
-            // Without this cap, high-throughput flows accumulate thousands of
-            // entries that drain at ~160/sec after the flow ends, causing
-            // minutes of lingering retransmit traffic.
             while self.unacked.len() >= self.max_unacked {
                 if let Some(&oldest_seq) = self.unacked.keys().min() {
                     self.unacked.remove(&oldest_seq);
@@ -303,17 +271,13 @@ impl LpReliability {
         wires
     }
 
-    /// Process an inbound raw LpPacket: extract TxSequence (queue for Ack)
-    /// and process any piggybacked Acks (clear unacked, measure RTT).
     pub fn on_receive(&mut self, raw: &[u8]) {
         let (tx_seq, acks) = extract_acks(raw);
 
-        // Queue ack for the sender's TxSequence.
         if let Some(seq) = tx_seq {
             self.pending_acks.push_back(seq);
         }
 
-        // Process Acks from the remote.
         let now = Instant::now();
         for ack_seq in acks {
             if let Some(entry) = self.unacked.remove(&ack_seq) {
@@ -327,10 +291,6 @@ impl LpReliability {
     }
 
     /// Check for retransmit-eligible entries. Returns wire packets to resend.
-    ///
-    /// Rate-limited to `MAX_RETX_PER_TICK` to prevent burst retransmissions
-    /// from blocking the face_sender (which would starve new packet delivery
-    /// and cause throughput collapse).
     pub fn check_retransmit(&mut self) -> Vec<Bytes> {
         let now = Instant::now();
         let rto = std::time::Duration::from_micros(self.rto_us);
@@ -347,12 +307,10 @@ impl LpReliability {
             }
         }
 
-        // Remove entries that exceeded max retries.
         for seq in expired {
             self.unacked.remove(&seq);
         }
 
-        // Rate-limit retransmissions to avoid blocking the face_sender.
         let mut wires = Vec::with_capacity(retx.len().min(self.max_retx_per_tick));
         for seq in retx.into_iter().take(self.max_retx_per_tick) {
             if let Some(entry) = self.unacked.get_mut(&seq) {
@@ -367,7 +325,6 @@ impl LpReliability {
     }
 
     /// Flush pending Acks as a bare Ack-only LpPacket.
-    /// Call when the retransmit timer fires and there's been no recent outgoing traffic.
     pub fn flush_acks(&mut self) -> Option<Bytes> {
         if self.pending_acks.is_empty() {
             return None;
@@ -376,28 +333,22 @@ impl LpReliability {
         Some(encode_lp_acks(&acks))
     }
 
-    /// Number of unacknowledged packets in flight.
     pub fn unacked_count(&self) -> usize {
         self.unacked.len()
     }
 
-    /// Current RTO in microseconds.
     pub fn rto_us(&self) -> u64 {
         self.rto_us
     }
 
-    /// Update SRTT, RTTVAR, and RTO based on the active strategy.
     fn update_rto(&mut self, rtt_us: f64) {
-        // Track min RTT for MinRtt strategy.
         let rtt_int = rtt_us as u64;
         if rtt_int < self.min_rtt_us {
             self.min_rtt_us = rtt_int;
         }
 
         match &self.rto_strategy {
-            RtoStrategy::Fixed { .. } => {
-                // No adaptation — RTO stays constant.
-            }
+            RtoStrategy::Fixed { .. } => {}
             RtoStrategy::MinRtt { margin_us } => {
                 self.rto_us = self.min_rtt_us.saturating_add(*margin_us);
             }
@@ -414,7 +365,6 @@ impl LpReliability {
         }
     }
 
-    /// EWMA update shared by RFC 6298 and QUIC strategies.
     fn update_ewma(&mut self, rtt_us: f64, alpha: f64, beta: f64) {
         if self.srtt_us == 0.0 {
             self.srtt_us = rtt_us;

@@ -18,7 +18,6 @@ pub enum NdnConnection {
 }
 
 impl NdnConnection {
-    /// Send a packet.
     pub async fn send(&self, pkt: Bytes) -> Result<(), AppError> {
         match self {
             NdnConnection::Embedded(h) => h.send(pkt).await.map_err(|_| AppError::Closed),

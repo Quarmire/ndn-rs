@@ -10,8 +10,6 @@
 
 use serde::{Deserialize, Serialize};
 
-// ── Controller ────────────────────────────────────────────────────────────────
-
 /// The `controller` property — either a single DID string or a set of DIDs.
 ///
 /// Per W3C DID Core §5.1.2, the controller can be one or more DID strings.
@@ -25,7 +23,6 @@ pub enum DidController {
 }
 
 impl DidController {
-    /// Iterate over all controller DIDs.
     pub fn iter(&self) -> impl Iterator<Item = &str> {
         match self {
             Self::One(s) => std::slice::from_ref(s).iter().map(String::as_str),
@@ -33,7 +30,6 @@ impl DidController {
         }
     }
 
-    /// Returns `true` if `did` is listed as a controller.
     pub fn contains(&self, did: &str) -> bool {
         self.iter().any(|d| d == did)
     }
@@ -54,8 +50,6 @@ impl From<Vec<String>> for DidController {
         }
     }
 }
-
-// ── Verification method ───────────────────────────────────────────────────────
 
 /// A verification method entry in a DID Document.
 ///
@@ -173,8 +167,6 @@ impl VerificationMethod {
     }
 }
 
-// ── Verification reference ────────────────────────────────────────────────────
-
 /// A reference to a verification method — either embedded or a URI reference.
 ///
 /// Per W3C DID Core §5.3, verification relationships contain either:
@@ -196,8 +188,6 @@ impl VerificationRef {
         }
     }
 }
-
-// ── Service ───────────────────────────────────────────────────────────────────
 
 /// A service endpoint in a DID Document.
 ///
@@ -228,8 +218,6 @@ pub enum ServiceEndpoint {
     /// An array of endpoint URIs or objects.
     Set(Vec<ServiceEndpoint>),
 }
-
-// ── DID Document ──────────────────────────────────────────────────────────────
 
 /// A W3C DID Document.
 ///
@@ -342,7 +330,6 @@ impl DidDocument {
         }
     }
 
-    /// Return the first Ed25519 public key bytes found in any verification method.
     pub fn ed25519_public_key(&self) -> Option<[u8; 32]> {
         for vm in &self.verification_methods {
             if let Some(bytes) = vm.ed25519_key_bytes() {
@@ -360,7 +347,6 @@ impl DidDocument {
         None
     }
 
-    /// Return the first X25519 key agreement public key bytes.
     pub fn x25519_key_agreement_key(&self) -> Option<[u8; 32]> {
         for vr in &self.key_agreement {
             match vr {
@@ -382,7 +368,6 @@ impl DidDocument {
         None
     }
 
-    /// Find a verification method by its `id`.
     pub fn find_vm(&self, id: &str) -> Option<&VerificationMethod> {
         self.verification_methods
             .iter()

@@ -11,18 +11,14 @@ use crate::prefix_announce::ServiceRecord;
 
 use super::{PROTOCOL, ServiceDiscoveryProtocol};
 
-/// An auto-populated FIB entry that must be expired after its TTL.
 pub(crate) struct AutoFibEntry {
     pub(super) prefix: Name,
     pub(super) face_id: FaceId,
     pub(super) expires_at: Instant,
-    /// NDN name of the peer that published this record; used to evict
-    /// `peer_records` and reset `browsed_neighbors` on expiry or face-down.
     pub(super) node_name: Name,
 }
 
 impl ServiceDiscoveryProtocol {
-    /// Auto-populate the FIB for a received service record.
     pub(super) fn auto_populate_fib(
         &self,
         record: &ServiceRecord,
@@ -46,7 +42,6 @@ impl ServiceDiscoveryProtocol {
         let expires_at = ctx.now() + Duration::from_millis(ttl_ms);
         {
             let mut auto_fib = self.auto_fib.lock().unwrap();
-            // Replace any existing entry for the same prefix+face.
             auto_fib.retain(|e| !(e.prefix == record.announced_prefix && e.face_id == fib_face));
             auto_fib.push(AutoFibEntry {
                 prefix: record.announced_prefix.clone(),
@@ -61,14 +56,8 @@ impl ServiceDiscoveryProtocol {
         );
     }
 
-    /// Expire auto-populated FIB entries past their TTL.
-    ///
-    /// On expiry we also evict the peer_record for the same
-    /// (prefix, node_name) pair and clear the node from
-    /// `browsed_neighbors`.  This causes the next `browse_neighbors` call
-    /// to treat the peer as "new" and issue an immediate re-browse —
-    /// critical for the role-switch case where the same peer registers a
-    /// different prefix after the previous record's TTL expires.
+    /// Also evicts peer_records and resets browsed_neighbors for the
+    /// affected node so re-browse is triggered on the next tick.
     pub(super) fn expire_auto_fib(&self, now: Instant, ctx: &dyn DiscoveryContext) {
         struct Expired {
             prefix: Name,
@@ -92,8 +81,6 @@ impl ServiceDiscoveryProtocol {
             });
         }
         if !expired.is_empty() {
-            // Evict peer records whose announced prefix just expired so stale
-            // records from old-role peers are removed from `all_records()`.
             {
                 let mut peer_recs = self.peer_records.lock().unwrap();
                 for e in &expired {
@@ -103,9 +90,6 @@ impl ServiceDiscoveryProtocol {
                 }
             }
 
-            // Reset browsed state for affected nodes so they receive an
-            // immediate re-browse on the next tick (catches role-switch: same
-            // peer, different prefix, same face still up).
             {
                 let mut seen = self.browsed_neighbors.lock().unwrap();
                 for e in &expired {
@@ -125,7 +109,6 @@ impl ServiceDiscoveryProtocol {
         }
     }
 
-    /// Expire local records that have a finite TTL (publish_with_ttl).
     pub(super) fn expire_local_records(&self, now: Instant) {
         let mut local = self.local_records.lock().unwrap();
         let before = local.len();
@@ -138,7 +121,6 @@ impl ServiceDiscoveryProtocol {
         }
     }
 
-    /// Compute the browse interval based on current auto-FIB state.
     pub(super) fn compute_browse_interval(&self, now: Instant) -> Duration {
         const BROWSE_FLOOR: Duration = Duration::from_secs(10);
         let auto_fib = self.auto_fib.lock().unwrap();

@@ -39,16 +39,11 @@ use crate::{
     key_store::{KeyAlgorithm, KeyStore},
 };
 
-/// PIV slot identifier for YubiKey key storage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum YubikeySlot {
-    /// Slot 9a — Authentication (recommended for NDN node identity).
     Authentication,
-    /// Slot 9c — Digital Signature (for sub-CA or certificate signing).
     Signature,
-    /// Slot 9d — Key Management.
     KeyManagement,
-    /// Slot 9e — Card Authentication.
     CardAuthentication,
 }
 
@@ -70,12 +65,10 @@ impl From<YubikeySlot> for SlotId {
 /// async executor during PC/SC I/O.
 pub struct YubikeyKeyStore {
     yk: Arc<std::sync::Mutex<YubiKey>>,
-    /// Maps NDN key names to their PIV slot.
     slots: DashMap<Arc<Name>, YubikeySlot>,
 }
 
 impl YubikeyKeyStore {
-    /// Connect to the first available YubiKey.
     pub fn open() -> Result<Self, TrustError> {
         let yk =
             YubiKey::open().map_err(|e| TrustError::KeyStore(format!("YubiKey not found: {e}")))?;
@@ -85,9 +78,7 @@ impl YubikeyKeyStore {
         })
     }
 
-    /// Register a pre-existing key (already generated in the slot) under `key_name`.
-    ///
-    /// Does not communicate with the device — only records the name→slot mapping.
+    /// Record a name-to-slot mapping (does not communicate with the device).
     pub fn register_slot(&self, key_name: Name, slot: YubikeySlot) {
         self.slots.insert(Arc::new(key_name), slot);
     }
@@ -119,7 +110,6 @@ impl YubikeyKeyStore {
                 )
                 .map_err(|e| TrustError::KeyStore(format!("YubiKey generate failed: {e}")))?;
 
-                // Extract the raw EC public key point (65 bytes for P-256 uncompressed).
                 Ok(spki.subject_public_key.raw_bytes().to_vec())
             })
             .await
@@ -172,7 +162,6 @@ struct YubikeySigner {
 
 impl Signer for YubikeySigner {
     fn sig_type(&self) -> SignatureType {
-        // YubiKey PIV with P-256 uses ECDSA-SHA256.
         SignatureType::SignatureSha256WithEcdsa
     }
 
@@ -185,7 +174,6 @@ impl Signer for YubikeySigner {
         region: &'a [u8],
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Bytes, TrustError>> + Send + 'a>>
     {
-        // Compute SHA-256 digest in software; the YubiKey signs the digest on-device.
         let digest = {
             use ring::digest;
             digest::digest(&digest::SHA256, region).as_ref().to_vec()

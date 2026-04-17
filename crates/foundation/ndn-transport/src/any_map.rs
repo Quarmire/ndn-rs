@@ -9,22 +9,18 @@ use std::collections::HashMap;
 pub struct AnyMap(HashMap<TypeId, Box<dyn Any + Send + Sync>>);
 
 impl AnyMap {
-    /// Create an empty map.
     pub fn new() -> Self {
         Self(HashMap::new())
     }
 
-    /// Insert a value, replacing any previous value of the same type.
     pub fn insert<T: Any + Send + Sync>(&mut self, val: T) {
         self.0.insert(TypeId::of::<T>(), Box::new(val));
     }
 
-    /// Retrieve a reference to a value by type, if present.
     pub fn get<T: Any + Send + Sync>(&self) -> Option<&T> {
         self.0.get(&TypeId::of::<T>())?.downcast_ref()
     }
 
-    /// Remove and return a value by type, if present.
     pub fn remove<T: Any + Send + Sync>(&mut self) -> Option<T> {
         self.0
             .remove(&TypeId::of::<T>())

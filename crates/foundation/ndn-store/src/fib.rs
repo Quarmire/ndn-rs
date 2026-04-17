@@ -15,7 +15,6 @@ pub struct FibNexthop {
     pub cost: u32,
 }
 
-/// A FIB entry — the set of nexthops for one name prefix.
 #[derive(Clone, Debug)]
 pub struct FibEntry {
     pub nexthops: Vec<FibNexthop>,
@@ -39,22 +38,18 @@ impl Fib {
         Self(NameTrie::new())
     }
 
-    /// Longest-prefix match for `name`.
     pub fn lpm(&self, name: &Name) -> Option<Arc<FibEntry>> {
         self.0.lpm(name)
     }
 
-    /// Exact lookup — returns `Some` only if `prefix` is registered exactly.
     pub fn get(&self, prefix: &Name) -> Option<Arc<FibEntry>> {
         self.0.get(prefix)
     }
 
-    /// Register or replace the entry for `prefix`.
     pub fn insert(&self, prefix: &Name, entry: FibEntry) {
         self.0.insert(prefix, Arc::new(entry));
     }
 
-    /// Add one nexthop to `prefix`, creating the entry if it does not exist.
     pub fn add_nexthop(&self, prefix: &Name, nexthop: FibNexthop) {
         let nexthops = match self.0.get(prefix) {
             Some(existing) => {
@@ -67,7 +62,6 @@ impl Fib {
         self.0.insert(prefix, Arc::new(FibEntry { nexthops }));
     }
 
-    /// Remove the entry for `prefix` entirely.
     pub fn remove(&self, prefix: &Name) {
         self.0.remove(prefix);
     }
@@ -96,8 +90,6 @@ mod tests {
     fn nexthop(face_id: u32, cost: u32) -> FibNexthop {
         FibNexthop { face_id, cost }
     }
-
-    // ── lpm ──────────────────────────────────────────────────────────────────
 
     #[test]
     fn lpm_empty_returns_none() {
@@ -130,8 +122,6 @@ mod tests {
         assert_eq!(entry.nexthops[0].face_id, 3);
     }
 
-    // ── add_nexthop ───────────────────────────────────────────────────────────
-
     #[test]
     fn add_nexthop_creates_entry() {
         let fib = Fib::new();
@@ -151,8 +141,6 @@ mod tests {
         assert!(entry.nexthops.iter().any(|n| n.face_id == 1));
         assert!(entry.nexthops.iter().any(|n| n.face_id == 2));
     }
-
-    // ── remove ────────────────────────────────────────────────────────────────
 
     #[test]
     fn remove_clears_prefix() {

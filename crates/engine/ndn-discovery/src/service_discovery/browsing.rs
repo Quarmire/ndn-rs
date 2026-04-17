@@ -17,11 +17,9 @@ use crate::wire::{parse_raw_data, parse_raw_interest, write_name_tlv, write_nni}
 
 use super::ServiceDiscoveryProtocol;
 
-/// TLV type for a peer entry in the `/ndn/local/nd/peers` response.
 const T_PEER_ENTRY: u64 = 0xE0;
 
 impl ServiceDiscoveryProtocol {
-    // ── Inbound handlers ──────────────────────────────────────────────────────
 
     pub(super) fn handle_sd_interest(
         &self,
@@ -73,7 +71,7 @@ impl ServiceDiscoveryProtocol {
 
         let content = match parsed.content {
             Some(c) => c,
-            None => return true, // no content, consume but ignore
+            None => return true,
         };
 
         let record = match ServiceRecord::decode(&content) {
@@ -131,7 +129,6 @@ impl ServiceDiscoveryProtocol {
             return true;
         }
 
-        // Cache the peer record for browse queries.
         {
             let mut peer_recs = self.peer_records.lock().unwrap();
             if let Some(idx) = peer_recs.iter().position(|r| {
@@ -143,19 +140,10 @@ impl ServiceDiscoveryProtocol {
             }
         }
 
-        // Auto-populate FIB with TTL tracking.
-        //
-        // Use the producer's unicast face rather than incoming_face.  Browse
-        // responses arrive on the multicast face (because the remote sends
-        // them back via its own multicast face), and routing data traffic over
-        // the multicast face broadcasts every Interest to all peers.  The
-        // correct nexthop is the unicast face we have for the producer.
         if self.config.auto_populate_fib {
             self.auto_populate_fib(&record, incoming_face, ctx);
         }
 
-        // Relay service record to established neighbors when enabled.
-        // Exclude the face the record arrived on to prevent loops.
         if self.config.relay_records {
             let relay_faces: Vec<FaceId> = ctx
                 .neighbors()
@@ -275,27 +263,13 @@ impl ServiceDiscoveryProtocol {
         true
     }
 
-    // ── Browse helpers ────────────────────────────────────────────────────────
 
-    /// Send a browse Interest on `face_id` to solicit service records from
-    /// the peer on that face.  When the peer's SD protocol receives this
-    /// Interest it will respond with its local records as Data packets;
-    /// those are handled by [`handle_sd_data`] which auto-populates the FIB.
     pub(super) fn send_browse_interest(&self, face_id: FaceId, ctx: &dyn DiscoveryContext) {
         let interest = encode_interest(sd_services(), None);
         ctx.send_on(face_id, interest);
         trace!(face = ?face_id, "ServiceDiscovery: sent browse Interest");
     }
 
-    /// Browse established neighbors, distinguishing two cases:
-    ///
-    /// - **Newly established** (not yet in `browsed_neighbors`): browse
-    ///   immediately regardless of the periodic interval.
-    /// - **Already browsed**: re-browse only if `browse_interval` has elapsed
-    ///   since `last_browse`.
-    ///
-    /// Using the neighbor table (not raw face IDs) ensures that management
-    /// and app faces are never sent unsolicited browse Interests.
     pub(super) fn browse_neighbors(
         &self,
         now: Instant,
@@ -319,13 +293,11 @@ impl ServiceDiscoveryProtocol {
             }
             let is_new = seen.insert(entry.node_name.clone());
             if is_new {
-                // First time we see this neighbor as Established — browse now.
-                for (face_id, _, _) in &entry.faces {
+                    for (face_id, _, _) in &entry.faces {
                     self.send_browse_interest(*face_id, ctx);
                 }
                 new_count += 1;
             } else if periodic_due {
-                // Periodic refresh for already-known neighbors.
                 for (face_id, _, _) in &entry.faces {
                     self.send_browse_interest(*face_id, ctx);
                 }
@@ -349,8 +321,6 @@ impl ServiceDiscoveryProtocol {
             );
         }
 
-        // Prune departed neighbors from the seen set so they get a fresh
-        // initial browse if they reconnect later.
         let active: HashSet<Name> = neighbors
             .iter()
             .filter(|e| e.is_reachable())
@@ -360,11 +330,7 @@ impl ServiceDiscoveryProtocol {
     }
 }
 
-// ── Wire helpers ──────────────────────────────────────────────────────────────
 
-/// Decode a `PeerList` Data Content into a `Vec<Name>`.
-///
-/// Used by consumers of the `/ndn/local/nd/peers` response.
 pub fn decode_peer_list(content: &[u8]) -> Vec<Name> {
     let mut peers = Vec::new();
     let mut pos = 0;
@@ -413,7 +379,6 @@ fn read_varnumber(b: &[u8], pos: usize) -> Option<(u64, usize)> {
 }
 
 fn decode_name_tlv(b: &[u8]) -> Option<Name> {
-    // b is the value of a T_PEER_ENTRY, which is a Name TLV (type 0x07).
     if b.is_empty() || b[0] != 0x07 {
         return None;
     }
@@ -434,7 +399,6 @@ fn decode_name_tlv(b: &[u8]) -> Option<Name> {
     if comps.is_empty() {
         return Some(Name::root());
     }
-    // Build canonical URI to re-parse.
     let mut uri = String::new();
     for comp in &comps {
         uri.push('/');

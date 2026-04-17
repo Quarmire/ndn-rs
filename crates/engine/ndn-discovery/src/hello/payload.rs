@@ -1,7 +1,4 @@
-//! `HelloPayload` — NDN neighbor discovery hello packet TLV codec.
-//!
-//! Both `EtherNeighborDiscovery` and `UdpNeighborDiscovery` encode their
-//! Data Content using this shared format.
+//! `HelloPayload` — hello Data content TLV codec.
 //!
 //! ## Wire format
 //!
@@ -18,21 +15,6 @@
 //! ADD-ENTRY     ::= 0xC5 length Name
 //! REMOVE-ENTRY  ::= 0xC6 length Name
 //! ```
-//!
-//! TLV types use the application-specific range (≥ 0xC0) to avoid collisions
-//! with NDN packet-level types.
-//!
-//! ## Hello Interest / Data names
-//!
-//! ```text
-//! Interest: /ndn/local/nd/hello/<nonce-u32>
-//! Data:     /ndn/local/nd/hello/<nonce-u32>
-//!           Content = HelloPayload TLV (this module)
-//! ```
-//!
-//! The Interest carries no AppParams.  The sender's link-layer address is
-//! obtained from the socket (`recv_with_source`) and never embedded in the
-//! NDN packet.
 
 use bytes::Bytes;
 use ndn_packet::Name;
@@ -40,85 +22,54 @@ use ndn_tlv::{TlvReader, TlvWriter};
 
 use crate::wire::{parse_name_from_tlv, write_name_tlv};
 
-// ─── TLV type constants ───────────────────────────────────────────────────────
 
-/// `NODE-NAME` TLV type: the sender's NDN node name.
 pub const T_NODE_NAME: u64 = 0xC1;
-/// `SERVED-PREFIX` TLV type: a prefix the sender can serve.
 pub const T_SERVED_PREFIX: u64 = 0xC2;
-/// `CAPABILITIES` TLV type: advisory capability flags byte.
 pub const T_CAPABILITIES: u64 = 0xC3;
-/// `NEIGHBOR-DIFF` TLV type: SWIM gossip piggyback.
 pub const T_NEIGHBOR_DIFF: u64 = 0xC4;
-/// `ADD-ENTRY` within a `NEIGHBOR-DIFF`: a newly discovered neighbor.
 pub const T_ADD_ENTRY: u64 = 0xC5;
-/// `REMOVE-ENTRY` within a `NEIGHBOR-DIFF`: a departed neighbor.
 pub const T_REMOVE_ENTRY: u64 = 0xC6;
-/// `PUBLIC-KEY` TLV type: raw 32-byte Ed25519 public key for self-attesting signed hellos.
 pub const T_PUBLIC_KEY: u64 = 0xC8;
-/// `UNICAST-PORT` TLV type: the sender's UDP unicast listen port.
-///
-/// Included in hello Data so that receivers create unicast faces on the
-/// correct port rather than the multicast source port.  Encoded as a
-/// big-endian `u16` (2 bytes).
+/// Sender's UDP unicast listen port (big-endian u16).  Receivers create
+/// unicast faces on this port rather than the multicast source port.
 pub const T_UNICAST_PORT: u64 = 0xC9;
 
-// ─── Capability flags ─────────────────────────────────────────────────────────
 
-/// Capability flag: this node can reassemble NDN fragments.
 pub const CAP_FRAGMENTATION: u8 = 0x01;
-/// Capability flag: this node has an active content store.
 pub const CAP_CONTENT_STORE: u8 = 0x02;
-/// Capability flag: this node validates signatures on forwarded data.
 pub const CAP_VALIDATION: u8 = 0x04;
-/// Capability flag: this node supports State Vector Sync (SVS).
 pub const CAP_SVS: u8 = 0x08;
 
-// ─── NeighborDiff entry ───────────────────────────────────────────────────────
 
-/// A single entry inside a [`NeighborDiff`]: add or remove a neighbor name.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DiffEntry {
     Add(Name),
     Remove(Name),
 }
 
-/// SWIM gossip piggyback carried in hello Data Content.
-///
-/// Encodes recently discovered and departed neighbors so that other nodes
-/// on the link can update their neighbor tables without waiting for their own
-/// hellos to complete.  Zero additional messages are required — the diff rides
-/// in spare capacity of existing hello traffic.
+/// SWIM gossip piggyback: recently discovered/departed neighbors riding in
+/// spare capacity of existing hello traffic.
 #[derive(Clone, Debug, Default)]
 pub struct NeighborDiff {
     pub entries: Vec<DiffEntry>,
 }
 
-// ─── HelloPayload ─────────────────────────────────────────────────────────────
 
 /// Payload carried in the Content of a hello Data packet.
 #[derive(Clone, Debug)]
 pub struct HelloPayload {
-    /// Mandatory: the sender's NDN node name.
     pub node_name: Name,
-    /// Prefixes this node produces (for service discovery bootstrapping).
     pub served_prefixes: Vec<Name>,
-    /// Advisory capability flags (see `CAP_*` constants).
     pub capabilities: u8,
-    /// SWIM gossip diffs piggybacked on this hello.
     pub neighbor_diffs: Vec<NeighborDiff>,
-    /// Raw 32-byte Ed25519 public key (self-attesting signed hellos).
-    /// When present, the hello Data is signed by the corresponding private key
-    /// and receivers can verify without any certificate infrastructure.
+    /// Ed25519 public key for self-attesting signed hellos.
     pub public_key: Option<Bytes>,
-    /// UDP unicast listen port.  When present, receivers should create their
-    /// unicast face to `<sender-ip>:<unicast_port>` rather than to the
-    /// source port of the hello packet (which may be the multicast port).
+    /// When present, receivers create unicast faces on this port instead
+    /// of the multicast source port.
     pub unicast_port: Option<u16>,
 }
 
 impl HelloPayload {
-    /// Construct a minimal hello payload with just the node name.
     pub fn new(node_name: Name) -> Self {
         Self {
             node_name,
@@ -130,26 +81,20 @@ impl HelloPayload {
         }
     }
 
-    // ─── Encoding ──────────────────────────────────────────────────────────
 
-    /// Encode the payload to wire bytes (the Content TLV value).
     pub fn encode(&self) -> Bytes {
         let mut w = TlvWriter::new();
-        // NODE-NAME
         w.write_nested(T_NODE_NAME, |w: &mut TlvWriter| {
             write_name_tlv(w, &self.node_name);
         });
-        // SERVED-PREFIX (zero or more)
         for prefix in &self.served_prefixes {
             w.write_nested(T_SERVED_PREFIX, |w: &mut TlvWriter| {
                 write_name_tlv(w, prefix);
             });
         }
-        // CAPABILITIES (omit if zero)
         if self.capabilities != 0 {
             w.write_tlv(T_CAPABILITIES, &[self.capabilities]);
         }
-        // NEIGHBOR-DIFF (zero or more)
         for diff in &self.neighbor_diffs {
             w.write_nested(T_NEIGHBOR_DIFF, |w: &mut TlvWriter| {
                 for entry in &diff.entries {
@@ -168,23 +113,16 @@ impl HelloPayload {
                 }
             });
         }
-        // PUBLIC-KEY (omit if not present)
         if let Some(ref pk) = self.public_key {
             w.write_tlv(T_PUBLIC_KEY, pk);
         }
-        // UNICAST-PORT (omit if not present)
         if let Some(port) = self.unicast_port {
             w.write_tlv(T_UNICAST_PORT, &port.to_be_bytes());
         }
         w.finish()
     }
 
-    // ─── Decoding ──────────────────────────────────────────────────────────
 
-    /// Decode a `HelloPayload` from Content bytes.
-    ///
-    /// Returns `None` if the `NODE-NAME` field is missing or malformed;
-    /// unknown TLV types are silently skipped for forward compatibility.
     pub fn decode(content: &Bytes) -> Option<Self> {
         let mut r = TlvReader::new(content.clone());
         let mut node_name: Option<Name> = None;
@@ -223,7 +161,7 @@ impl HelloPayload {
                         unicast_port = Some(u16::from_be_bytes([v[0], v[1]]));
                     }
                 }
-                _ => {} // forward-compatible: skip unknown types
+                _ => {}
             }
         }
 
@@ -238,10 +176,7 @@ impl HelloPayload {
     }
 }
 
-// ─── Private decode helpers ───────────────────────────────────────────────────
 
-/// The value of a `NODE-NAME` or `SERVED-PREFIX` TLV is a Name TLV.
-/// This function parses a Name from the nested Name TLV bytes.
 fn decode_name_from_nested(v: &Bytes) -> Option<Name> {
     parse_name_from_tlv(v)
 }
@@ -268,7 +203,6 @@ fn decode_neighbor_diff(v: &Bytes) -> Option<NeighborDiff> {
     Some(NeighborDiff { entries })
 }
 
-// ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

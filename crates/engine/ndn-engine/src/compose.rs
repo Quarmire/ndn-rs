@@ -23,7 +23,6 @@ pub struct ComposedStrategy {
 }
 
 impl ComposedStrategy {
-    /// Build a composed strategy from an inner strategy and an ordered filter chain.
     pub fn new(
         name: Name,
         inner: Arc<dyn ErasedStrategy>,
@@ -73,8 +72,6 @@ impl ErasedStrategy for ComposedStrategy {
         ctx: &'a StrategyContext<'a>,
         reason: NackReason,
     ) -> Pin<Box<dyn Future<Output = ForwardingAction> + Send + 'a>> {
-        // Nack returns a single ForwardingAction, not a SmallVec —
-        // wrap it for filtering, then unwrap.
         Box::pin(async move {
             let action = self.inner.on_nack_erased(ctx, reason).await;
             let mut actions = SmallVec::new();

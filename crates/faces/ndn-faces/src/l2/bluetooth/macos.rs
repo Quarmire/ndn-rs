@@ -49,7 +49,6 @@ use super::{BLE_CS_CHAR_UUID, BLE_SC_CHAR_UUID, BLE_SERVICE_UUID, BleError, BleF
 /// ATT protocol overhead per write/notify (1-byte opcode + 2-byte handle).
 const ATT_OVERHEAD: usize = 3;
 
-// ── GCD dispatch-queue FFI ────────────────────────────────────────────────────
 
 // libdispatch is part of libSystem on macOS; no explicit link attribute needed.
 type DispatchQueue = *mut c_void;
@@ -67,7 +66,6 @@ unsafe extern "C" {
     static CBAdvertisementDataLocalNameKey: *const AnyObject;
 }
 
-// ── Shared state between GCD queue and tokio ──────────────────────────────────
 
 struct MacosShared {
     /// Raw retained `CBPeripheralManager *` — only touch from `ble_queue`.
@@ -113,7 +111,6 @@ unsafe fn shared_ref<'a>() -> &'a mut MacosShared {
     &mut *raw
 }
 
-// ── CoreBluetooth constants ───────────────────────────────────────────────────
 
 /// `CBManagerStatePoweredOn` — the adapter is on and ready.
 const CB_MANAGER_STATE_POWERED_ON: i64 = 5;
@@ -125,7 +122,6 @@ const CB_PROP_WRITE_NO_RESP: usize = 0x04;
 /// `CBAttributePermissionsWriteable` (0x02).
 const CB_PERM_WRITABLE: usize = 0x02;
 
-// ── Server handle ─────────────────────────────────────────────────────────────
 
 pub struct BleServer {
     /// Raw `CBPeripheralManager *` (retained +1).
@@ -161,7 +157,6 @@ impl Drop for BleServer {
     }
 }
 
-// ── Delegate class registration ────────────────────────────────────────────────
 
 fn delegate_class() -> &'static AnyClass {
     static CELL: std::sync::OnceLock<&'static AnyClass> = std::sync::OnceLock::new();
@@ -202,7 +197,6 @@ fn delegate_class() -> &'static AnyClass {
     })
 }
 
-// ── Delegate method implementations ──────────────────────────────────────────
 
 /// Called when the Bluetooth adapter state changes.  We wait for PoweredOn,
 /// then register the NDN GATT service.
@@ -310,7 +304,6 @@ unsafe extern "C" fn cb_ready_to_update(
     // TODO: drain any pending TX packets buffered during flow-control
 }
 
-// ── CoreBluetooth object helpers ──────────────────────────────────────────────
 
 /// Create the NDN GATT `CBMutableService` with its SC (notify) and CS (write)
 /// characteristics. Returns a raw `CBMutableService *` with retain count +1
@@ -439,7 +432,6 @@ unsafe fn start_advertising(manager: *mut AnyObject) {
     info!("BLE/macOS: advertising started");
 }
 
-// ── TX dispatch work ──────────────────────────────────────────────────────────
 
 struct TxWork {
     shared_ptr: *mut MacosShared,
@@ -506,7 +498,6 @@ unsafe fn make_nsdata(bytes: &[u8]) -> *mut AnyObject {
     ]
 }
 
-// ── Entry point ───────────────────────────────────────────────────────────────
 
 pub async fn bind(id: ndn_transport::FaceId) -> Result<BleFace, BleError> {
     // Channels.

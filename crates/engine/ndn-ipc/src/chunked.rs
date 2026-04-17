@@ -6,16 +6,12 @@ use ndn_packet::Name;
 pub const NDN_DEFAULT_SEGMENT_SIZE: usize = 8192;
 
 /// Segments a large payload into fixed-size chunks for NDN-style chunked transfer.
-///
-/// Each segment is identified by its zero-based index; the total segment count
-/// is available via `segment_count()` for FinalBlockId encoding.
 pub struct ChunkedProducer {
     prefix: Name,
     segments: Vec<Bytes>,
 }
 
 impl ChunkedProducer {
-    /// Segment `payload` into chunks of at most `segment_size` bytes.
     pub fn new(prefix: Name, payload: Bytes, segment_size: usize) -> Self {
         let seg_size = segment_size.max(1);
         let segments = payload
@@ -33,7 +29,6 @@ impl ChunkedProducer {
         self.segments.len()
     }
 
-    /// Return the payload for segment `index`, or `None` if out of range.
     pub fn segment(&self, index: usize) -> Option<&Bytes> {
         self.segments.get(index)
     }
@@ -50,7 +45,6 @@ pub struct ChunkedConsumer {
 }
 
 impl ChunkedConsumer {
-    /// Create a consumer expecting exactly `segment_count` segments.
     pub fn new(prefix: Name, segment_count: usize) -> Self {
         Self {
             prefix,
@@ -67,19 +61,17 @@ impl ChunkedConsumer {
         self.segment_count
     }
 
-    /// Store the payload for `index`.  Out-of-range indices are silently dropped.
     pub fn receive_segment(&mut self, index: usize, payload: Bytes) {
         if index < self.segment_count {
             self.received[index] = Some(payload);
         }
     }
 
-    /// Returns `true` when every segment has been received.
     pub fn is_complete(&self) -> bool {
         self.received.iter().all(Option::is_some)
     }
 
-    /// Concatenate all segments in order.  Returns `None` if incomplete.
+    /// Returns `None` if incomplete.
     pub fn reassemble(&self) -> Option<Bytes> {
         if !self.is_complete() {
             return None;

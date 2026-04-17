@@ -3,7 +3,6 @@ use dashmap::DashMap;
 use ndn_packet::Name;
 use std::sync::Arc;
 
-/// Supported key algorithms.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyAlgorithm {
     Ed25519,
@@ -11,7 +10,6 @@ pub enum KeyAlgorithm {
     Rsa2048,
 }
 
-/// Persistent key storage.
 pub trait KeyStore: Send + Sync + 'static {
     fn get_signer(
         &self,
@@ -30,7 +28,6 @@ pub trait KeyStore: Send + Sync + 'static {
     ) -> impl std::future::Future<Output = Result<(), TrustError>> + Send;
 }
 
-/// In-memory key store for testing.
 pub struct MemKeyStore {
     keys: DashMap<Arc<Name>, Arc<dyn Signer>>,
 }
@@ -42,7 +39,6 @@ impl MemKeyStore {
         }
     }
 
-    /// Look up a signer synchronously.
     pub fn get_signer_sync(&self, key_name: &Name) -> Result<Arc<dyn Signer>, TrustError> {
         self.keys
             .iter()

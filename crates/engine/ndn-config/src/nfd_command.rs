@@ -16,8 +16,6 @@ use crate::control_parameters::ControlParameters;
 /// The standard NFD management prefix: `/localhost/nfd`.
 pub const NFD_PREFIX: &[&[u8]] = &[b"localhost", b"nfd"];
 
-// ─── Command modules and verbs ───────────────────────────────────────────────
-
 /// Management module names.
 pub mod module {
     pub const FACES: &[u8] = b"faces";
@@ -36,93 +34,53 @@ pub mod module {
     pub const LOG: &[u8] = b"log";
 }
 
-/// Command verbs per module.
 pub mod verb {
-    // config
     pub const GET: &[u8] = b"get";
 
-    // faces
     pub const CREATE: &[u8] = b"create";
     pub const UPDATE: &[u8] = b"update";
     pub const DESTROY: &[u8] = b"destroy";
     pub const LIST: &[u8] = b"list";
 
-    // fib
     pub const ADD_NEXTHOP: &[u8] = b"add-nexthop";
     pub const REMOVE_NEXTHOP: &[u8] = b"remove-nexthop";
-
-    // rib
     pub const REGISTER: &[u8] = b"register";
     pub const UNREGISTER: &[u8] = b"unregister";
-
-    // strategy-choice
     pub const SET: &[u8] = b"set";
     pub const UNSET: &[u8] = b"unset";
-
-    // cs
     pub const CONFIG: &[u8] = b"config";
     pub const INFO: &[u8] = b"info";
     pub const ERASE: &[u8] = b"erase";
-
-    // service
     pub const ANNOUNCE: &[u8] = b"announce";
     pub const WITHDRAW: &[u8] = b"withdraw";
     pub const BROWSE: &[u8] = b"browse";
-
-    // faces extension
     pub const COUNTERS: &[u8] = b"counters";
-
-    // security — identity
     pub const IDENTITY_LIST: &[u8] = b"identity-list";
     pub const IDENTITY_GENERATE: &[u8] = b"identity-generate";
     pub const IDENTITY_DID: &[u8] = b"identity-did";
-    /// Dataset that returns the active identity status (name, is_ephemeral, pib_path).
     pub const IDENTITY_STATUS: &[u8] = b"identity-status";
     pub const ANCHOR_LIST: &[u8] = b"anchor-list";
     pub const KEY_DELETE: &[u8] = b"key-delete";
-
-    // security — NDNCERT CA
     pub const CA_INFO: &[u8] = b"ca-info";
     pub const CA_ENROLL: &[u8] = b"ca-enroll";
     pub const CA_TOKEN_ADD: &[u8] = b"ca-token-add";
     pub const CA_REQUESTS: &[u8] = b"ca-requests";
-
-    // security — YubiKey PIV
     pub const YUBIKEY_DETECT: &[u8] = b"yubikey-detect";
     pub const YUBIKEY_GENERATE: &[u8] = b"yubikey-generate";
-
-    // security — trust schema management
-    /// Add a rule to the active trust schema.
-    /// ControlParameters.uri = `"<data_pattern> => <key_pattern>"`.
     pub const SCHEMA_RULE_ADD: &[u8] = b"schema-rule-add";
-    /// Remove the rule at the given index.
-    /// ControlParameters.count = `rule_index`.
     pub const SCHEMA_RULE_REMOVE: &[u8] = b"schema-rule-remove";
-    /// List all active trust schema rules (dataset, no parameters).
     pub const SCHEMA_LIST: &[u8] = b"schema-list";
-    /// Replace the entire schema.
-    /// ControlParameters.uri = newline-separated rule strings.
     pub const SCHEMA_SET: &[u8] = b"schema-set";
-
-    // log
     pub const GET_FILTER: &[u8] = b"get-filter";
     pub const SET_FILTER: &[u8] = b"set-filter";
     pub const GET_RECENT: &[u8] = b"get-recent";
-
-    // discovery
     pub const DVR_STATUS: &[u8] = b"dvr-status";
     pub const DVR_CONFIG: &[u8] = b"dvr-config";
 }
 
-// ─── Name builder ────────────────────────────────────────────────────────────
-
-/// Build a management command name with embedded ControlParameters.
+/// Build `/localhost/nfd/<module>/<verb>/<params-component>`.
 ///
-/// Result: `/localhost/nfd/<module>/<verb>/<params-component>`
-///
-/// The ControlParameters name component contains the **full** TLV block
-/// (type 0x68 + length + fields), matching the NFD management protocol spec
-/// and what NFD/ndnd expect.
+/// The params component contains the full 0x68 TLV block per NFD spec.
 pub fn command_name(module: &[u8], verb: &[u8], params: &ControlParameters) -> Name {
     let params_tlv = params.encode();
     Name::from_components([
@@ -134,9 +92,7 @@ pub fn command_name(module: &[u8], verb: &[u8], params: &ControlParameters) -> N
     ])
 }
 
-/// Build a dataset (status) name without parameters.
-///
-/// Result: `/localhost/nfd/<module>/<verb>`
+/// Build `/localhost/nfd/<module>/<verb>` (no parameters).
 pub fn dataset_name(module: &[u8], verb: &[u8]) -> Name {
     Name::from_components([
         NameComponent::generic(Bytes::from_static(b"localhost")),
@@ -146,8 +102,6 @@ pub fn dataset_name(module: &[u8], verb: &[u8]) -> Name {
     ])
 }
 
-// ─── Name parser ─────────────────────────────────────────────────────────────
-
 /// Parsed management command extracted from an Interest name.
 #[derive(Debug)]
 pub struct ParsedCommand {
@@ -156,19 +110,13 @@ pub struct ParsedCommand {
     pub params: Option<ControlParameters>,
 }
 
-/// Parse a management command from an Interest name.
-///
-/// Expects: `/localhost/nfd/<module>/<verb>[/<params>][/<signed-interest-components>]`
-///
-/// Returns `None` if the name doesn't match the management prefix or has
-/// too few components.
+/// Parse `/localhost/nfd/<module>/<verb>[/<params>]` from an Interest name.
 pub fn parse_command_name(name: &Name) -> Option<ParsedCommand> {
     let comps = name.components();
     if comps.len() < 4 {
         return None;
     }
 
-    // Check /localhost/nfd prefix.
     if comps[0].value.as_ref() != b"localhost" || comps[1].value.as_ref() != b"nfd" {
         return None;
     }
@@ -176,10 +124,6 @@ pub fn parse_command_name(name: &Name) -> Option<ParsedCommand> {
     let module = comps[2].value.clone();
     let verb = comps[3].value.clone();
 
-    // The 5th component (index 4), if present, is the ControlParameters TLV
-    // (full block including the 0x68 type byte, per NFD management spec).
-    // Components beyond index 4 (e.g. ParametersSha256DigestComponent from a
-    // signed Interest) are ignored — the router does not validate signatures.
     let params = if comps.len() >= 5 {
         ControlParameters::decode(comps[4].value.clone()).ok()
     } else {
@@ -192,8 +136,6 @@ pub fn parse_command_name(name: &Name) -> Option<ParsedCommand> {
         params,
     })
 }
-
-// ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

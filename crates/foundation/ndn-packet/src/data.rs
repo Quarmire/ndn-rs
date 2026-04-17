@@ -16,37 +16,22 @@ use ndn_tlv::TlvReader;
 
 /// An NDN Data packet.
 ///
-/// Stores wire-format bytes for zero-copy CS storage and signature verification.
-/// The signed region is contiguous in the wire encoding — it is sliced directly
-/// from `raw` without copying.
+/// The signed region is contiguous in the wire encoding and sliced directly
+/// from `raw` without copying, enabling zero-copy CS storage and verification.
 #[derive(Debug)]
 pub struct Data {
-    /// Wire-format bytes of the full Data TLV.
     pub(crate) raw: Bytes,
-
-    /// Byte range of the signed region within `raw`.
     signed_start: usize,
     signed_end: usize,
-
-    /// Byte range of the SignatureValue within `raw`.
     sig_value_start: usize,
     sig_value_end: usize,
-
-    /// Name — always decoded eagerly.
     pub name: Arc<Name>,
-
-    /// MetaInfo — decoded on first access.
     meta_info: OnceLock<Option<MetaInfo>>,
-
-    /// Content payload — decoded on first access.
     content: OnceLock<Option<Bytes>>,
-
-    /// Signature info — decoded on first access.
     sig_info: OnceLock<Option<SignatureInfo>>,
 }
 
 impl Data {
-    /// Decode a Data packet from raw wire bytes.
     pub fn decode(raw: Bytes) -> Result<Self, PacketError> {
         let mut reader = TlvReader::new(raw.clone());
         let (typ, value) = reader.read_tlv()?;
@@ -54,9 +39,6 @@ impl Data {
             return Err(PacketError::UnknownPacketType(typ));
         }
 
-        // Signed region starts at byte 2 (after outer TLV header) and ends
-        // just before the SignatureValue TLV. We track byte offsets here;
-        // a full implementation would scan for the SignatureValue boundary.
         let outer_header_len = raw.len() - value.len();
         let signed_start = outer_header_len;
 
@@ -73,7 +55,6 @@ impl Data {
             ));
         }
 
-        // Scan for SignatureValue to determine the signed region end.
         let mut sig_value_start = 0;
         let mut sig_value_end = 0;
         let _ = scan_for_sig_value(
@@ -101,15 +82,10 @@ impl Data {
         })
     }
 
-    /// The signed region — a zero-copy slice suitable for signature verification.
     pub fn signed_region(&self) -> &[u8] {
         &self.raw[self.signed_start..self.signed_end]
     }
 
-    /// The signature value bytes — a zero-copy slice.
-    ///
-    /// `sig_value_start` points to the `SignatureValue` TLV's type byte (`0x17`).
-    /// This method parses past the type and length to return only the raw value bytes.
     pub fn sig_value(&self) -> &[u8] {
         if self.sig_value_start == 0 || self.sig_value_end == 0 {
             return &[];
@@ -130,8 +106,7 @@ impl Data {
         &self.raw
     }
 
-    /// The implicit SHA-256 digest of this Data packet — the SHA-256 hash
-    /// of the full wire encoding. Used for exact Data retrieval via
+    /// SHA-256 of the full wire encoding, used for exact Data retrieval via
     /// ImplicitSha256DigestComponent (type 0x01) in Interest names.
     #[cfg(feature = "std")]
     pub fn implicit_digest(&self) -> ring::digest::Digest {
@@ -156,11 +131,8 @@ impl Data {
             .as_ref()
     }
 
-    /// Parse the delegation list from a Link object (ContentType=LINK).
-    ///
     /// Per NDN Packet Format v0.3 §6.3.1, when ContentType is LINK the Content
-    /// field contains one or more Name TLVs. Returns `None` if this Data is not
-    /// a Link or has no content.
+    /// field contains one or more delegation Name TLVs.
     #[cfg(feature = "std")]
     pub fn link_delegations(&self) -> Option<Vec<Arc<Name>>> {
         let mi = self.meta_info()?;
@@ -272,7 +244,6 @@ fn decode_sig_info(raw: &Bytes) -> Result<Option<SignatureInfo>, PacketError> {
 mod tests {
     use super::*;
 
-    // ── Data::decode — name ───────────────────────────────────────────────────
 
     #[test]
     fn decode_name() {
@@ -283,7 +254,6 @@ mod tests {
         assert_eq!(d.name.components()[1].value.as_ref(), b"ucla");
     }
 
-    // ── content (lazy) ────────────────────────────────────────────────────────
 
     #[test]
     fn decode_content() {
@@ -297,12 +267,10 @@ mod tests {
     fn decode_empty_content() {
         let raw = build_data_packet(&[b"test"], b"", None, 0, &[0x00]);
         let d = Data::decode(raw).unwrap();
-        // Empty content — the TLV is present so we get Some with empty bytes.
         let content = d.content().expect("content present");
         assert_eq!(content.len(), 0);
     }
 
-    // ── meta_info (lazy) ──────────────────────────────────────────────────────
 
     #[test]
     fn decode_meta_info_freshness() {
@@ -322,7 +290,6 @@ mod tests {
         assert!(d.meta_info().is_none());
     }
 
-    // ── sig_info (lazy) ───────────────────────────────────────────────────────
 
     #[test]
     fn decode_sig_info_type() {
@@ -332,7 +299,6 @@ mod tests {
         assert_eq!(si.sig_type, crate::SignatureType::SignatureEd25519);
     }
 
-    // ── signed_region and sig_value ───────────────────────────────────────────
 
     #[test]
     fn signed_region_excludes_sig_value() {
@@ -341,11 +307,7 @@ mod tests {
         let d = Data::decode(raw.clone()).unwrap();
 
         let region = d.signed_region();
-        // Signed region must not be empty.
         assert!(!region.is_empty());
-        // Signed region must not contain the sig value bytes at the end.
-        // (The last 4 bytes of the packet are the sig value content; they should
-        //  not appear at the end of the signed region.)
         assert!(!region.ends_with(sig_bytes));
     }
 
@@ -354,20 +316,16 @@ mod tests {
         let sig_bytes: &[u8] = &[0x11, 0x22, 0x33, 0x44];
         let raw = build_data_packet(&[b"test"], b"content", None, 5, sig_bytes);
         let d = Data::decode(raw).unwrap();
-        // sig_value() returns only the VALUE bytes inside the SignatureValue TLV.
         assert_eq!(d.sig_value(), sig_bytes);
     }
 
     #[test]
     fn signed_end_equals_sig_value_start() {
-        // The signed region must end exactly where the SignatureValue TLV begins —
-        // they are adjacent in the NDN wire encoding.
         let raw = build_data_packet(&[b"n"], b"x", None, 0, &[0xAB, 0xCD]);
         let d = Data::decode(raw).unwrap();
         assert_eq!(d.signed_end, d.sig_value_start);
     }
 
-    // ── raw field ─────────────────────────────────────────────────────────────
 
     #[test]
     fn raw_field_is_full_wire_bytes() {
@@ -376,7 +334,6 @@ mod tests {
         assert_eq!(d.raw(), &raw);
     }
 
-    // ── link_delegations ───────────────────────────────────────────────────
 
     fn build_link_data(name_comps: &[&[u8]], delegations: &[&[&[u8]]]) -> Bytes {
         let mut content_w = ndn_tlv::TlvWriter::new();
@@ -428,7 +385,6 @@ mod tests {
         assert!(d.link_delegations().is_none());
     }
 
-    // ── implicit_digest ────────────────────────────────────────────────────
 
     #[test]
     fn implicit_digest_is_sha256_of_raw() {
@@ -438,13 +394,11 @@ mod tests {
         assert_eq!(d.implicit_digest().as_ref(), expected.as_ref());
     }
 
-    // ── error cases ───────────────────────────────────────────────────────────
 
     #[test]
     fn decode_wrong_type_errors() {
         let mut w = ndn_tlv::TlvWriter::new();
         w.write_nested(0x05, |w| {
-            // INTEREST type, not DATA
             w.write_nested(crate::tlv_type::NAME, |w| {
                 w.write_tlv(crate::tlv_type::NAME_COMPONENT, b"test");
             });

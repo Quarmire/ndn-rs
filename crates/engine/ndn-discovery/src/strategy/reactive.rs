@@ -1,41 +1,21 @@
 //! Event-driven (reactive) probe scheduler.
 //!
-//! No periodic timer in the steady state.  A probe is sent only when a
-//! [`TriggerEvent`] is received:
-//!
-//! - Face comes up — bootstrap the neighbor table immediately.
-//! - Forwarding failure — verify the affected face is still alive.
-//! - Neighbor goes stale — re-probe before declaring it absent.
-//!
-//! [`PassiveDetection`](TriggerEvent::PassiveDetection) is ignored; use
-//! [`PassiveScheduler`](super::PassiveScheduler) for that case.
-//!
-//! ## Rate limiting
-//!
-//! To prevent a storm of hellos after a flap, a minimum interval is enforced.
-//! No probe is emitted within [`DiscoveryConfig::hello_interval_base`] of the
-//! previous one.  The implementation collapses multiple queued triggers into
-//! one probe when they arrive within the minimum interval.
+//! No periodic timer in steady state -- probes fire only on [`TriggerEvent`]s.
+//! Rate-limited to one probe per `hello_interval_base`.
 
 use std::time::{Duration, Instant};
 
 use crate::config::DiscoveryConfig;
 use crate::strategy::{NeighborProbeStrategy, ProbeRequest, TriggerEvent};
 
-// ─── ReactiveScheduler ───────────────────────────────────────────────────────
 
-/// Probe scheduler that sends only on topology events, with rate limiting.
 pub struct ReactiveScheduler {
-    /// Minimum gap between consecutive probes.
     min_interval: Duration,
-    /// When the last probe was sent (`None` = never sent).
     last_sent: Option<Instant>,
-    /// A probe has been requested but not yet emitted (rate-limited).
     pending: bool,
 }
 
 impl ReactiveScheduler {
-    /// Build from the relevant fields of a [`DiscoveryConfig`].
     pub fn from_discovery_config(cfg: &DiscoveryConfig) -> Self {
         Self {
             min_interval: cfg.hello_interval_base,
@@ -51,11 +31,10 @@ impl NeighborProbeStrategy for ReactiveScheduler {
             return Vec::new();
         }
 
-        // Enforce minimum interval.
         if let Some(last) = self.last_sent
             && now.duration_since(last) < self.min_interval
         {
-            return Vec::new(); // still rate-limited; keep pending
+            return Vec::new();
         }
 
         self.pending = false;
@@ -64,19 +43,15 @@ impl NeighborProbeStrategy for ReactiveScheduler {
     }
 
     fn on_probe_success(&mut self, _rtt: Duration) {
-        // Nothing to reset; the next probe fires only on a trigger.
     }
 
     fn on_probe_timeout(&mut self) {
-        // Timed out — re-trigger to verify.
         self.pending = true;
     }
 
     fn trigger(&mut self, event: TriggerEvent) {
         match event {
-            TriggerEvent::PassiveDetection => {
-                // Not applicable to this scheduler; ignore.
-            }
+            TriggerEvent::PassiveDetection => {}
             TriggerEvent::FaceUp
             | TriggerEvent::ForwardingFailure
             | TriggerEvent::NeighborStale => {
@@ -86,7 +61,6 @@ impl NeighborProbeStrategy for ReactiveScheduler {
     }
 }
 
-// ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

@@ -43,7 +43,7 @@ use ndn_tlv::{TlvReader, TlvWriter};
 
 use crate::file_tpm::{FileTpmError, TpmKeyKind};
 
-// SafeBag TLV type codes — pinned from ndn-cxx encoding/tlv-security.hpp.
+// TLV type codes from ndn-cxx encoding/tlv-security.hpp.
 const TLV_SAFE_BAG: u64 = 0x80; // 128
 const TLV_ENCRYPTED_KEY: u64 = 0x81; // 129
 
@@ -77,24 +77,15 @@ pub struct SafeBag {
 }
 
 impl SafeBag {
-    /// Encode the SafeBag to its TLV wire form. Output starts with
-    /// `0x80` and is suitable for writing to a file or passing to
-    /// `ndnsec import`.
     pub fn encode(&self) -> Bytes {
         let mut w = TlvWriter::new();
         w.write_nested(TLV_SAFE_BAG, |w| {
-            // Certificate is already a complete TLV (type 0x06 +
-            // length + body); splice it in raw via write_raw rather
-            // than re-wrapping with write_tlv.
             w.write_raw(&self.certificate);
             w.write_tlv(TLV_ENCRYPTED_KEY, &self.encrypted_key);
         });
         w.finish()
     }
 
-    /// Decode a SafeBag from its TLV wire form. Tolerates trailing
-    /// bytes after the outer SafeBag TLV (per the TLV spec, anything
-    /// after the encoded length is the next packet).
     pub fn decode(wire: &[u8]) -> Result<Self, SafeBagError> {
         let mut outer = TlvReader::new(Bytes::copy_from_slice(wire));
         let (typ, body) = outer
@@ -106,11 +97,6 @@ impl SafeBag {
             )));
         }
 
-        // Inside the SafeBag: first the Data certificate (type 0x06
-        // + length + body), then the EncryptedKey TLV (type 0x81).
-        // We need to re-emit the certificate with its outer header
-        // because TlvReader consumed it; capture the type and length
-        // and rebuild.
         let mut inner = TlvReader::new(body);
 
         let (cert_type, cert_body) = inner
@@ -121,8 +107,7 @@ impl SafeBag {
                 "expected Data (0x06) inside SafeBag, got 0x{cert_type:x}"
             )));
         }
-        // Re-emit the Data TLV header + body so callers receive the
-        // full wire-encoded certificate they can pass to a decoder.
+        // Re-emit the full Data TLV (TlvReader consumed the header).
         let mut cert_w = TlvWriter::new();
         cert_w.write_tlv(tlv_type::DATA, &cert_body);
         let certificate = cert_w.finish();
@@ -178,16 +163,6 @@ impl SafeBag {
         Ok(decrypted.as_bytes().to_vec())
     }
 }
-
-// ─── Algorithm-specific PKCS#8 conversion helpers ───────────────────────────
-//
-// FileTpm stores private keys in three algorithm-specific on-disk
-// forms (PKCS#1 for RSA, SEC1 for ECDSA-P256, PKCS#8 for Ed25519).
-// PKCS#8 EncryptedPrivateKeyInfo wraps a PKCS#8 PrivateKeyInfo, so
-// for export we have to convert the on-disk form *to* PKCS#8 first;
-// for import we convert *from* PKCS#8 back to the on-disk form. The
-// PKCS#8 algorithm OID identifies which conversion to apply on the
-// way back in.
 
 /// Convert an RSA PKCS#1 `RSAPrivateKey` DER (the FileTpm on-disk
 /// form for RSA) into a PKCS#8 `PrivateKeyInfo` DER.
@@ -250,24 +225,16 @@ pub(crate) fn ec_pkcs8_to_sec1(pkcs8_der: &[u8]) -> Result<Vec<u8>, SafeBagError
     Ok(sec1_doc.as_slice().to_vec())
 }
 
-/// Inspect the algorithm OID inside a PKCS#8 PrivateKeyInfo DER and
-/// dispatch to one of the [`TpmKeyKind`] variants. This is how
-/// SafeBag import knows which on-disk form to write.
 pub(crate) fn detect_pkcs8_algorithm(pkcs8_der: &[u8]) -> Result<TpmKeyKind, SafeBagError> {
     use pkcs8::PrivateKeyInfo;
     let pki = PrivateKeyInfo::try_from(pkcs8_der)
         .map_err(|e| SafeBagError::Pkcs8(format!("PrivateKeyInfo parse: {e}")))?;
-    // OIDs from RFC 8017 (RSA), RFC 5480 (EC), RFC 8410 (Ed25519).
     let oid = pki.algorithm.oid;
     if oid.to_string() == "1.2.840.113549.1.1.1" {
         Ok(TpmKeyKind::Rsa)
     } else if oid.to_string() == "1.2.840.10045.2.1" {
-        // id-ecPublicKey — narrow further by checking parameters.
-        // For SafeBag we only support P-256 (the curve FileTpm
-        // generates), so this is good enough.
         Ok(TpmKeyKind::EcdsaP256)
     } else if oid.to_string() == "1.3.101.112" {
-        // id-Ed25519
         Ok(TpmKeyKind::Ed25519)
     } else {
         Err(SafeBagError::UnsupportedAlgorithm(format!(

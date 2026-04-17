@@ -16,8 +16,6 @@
 //!   Disable for `no_std` environments (an allocator is still required).
 
 #![allow(missing_docs)]
-// Enable no_std when the `std` feature is disabled.
-// The crate still requires an allocator (for `BytesMut` / `Bytes`).
 #![cfg_attr(not(feature = "std"), no_std)]
 #[cfg(not(feature = "std"))]
 extern crate alloc;
@@ -113,8 +111,6 @@ pub fn varu64_size(value: u64) -> usize {
 mod tests {
     use super::*;
 
-    // ── varu64_size ────────────────────────────────────────────────────────────
-
     #[test]
     fn varu64_size_boundaries() {
         assert_eq!(varu64_size(0), 1);
@@ -126,8 +122,6 @@ mod tests {
         assert_eq!(varu64_size(0x1_0000_0000), 9);
         assert_eq!(varu64_size(u64::MAX), 9);
     }
-
-    // ── write_varu64 / read_varu64 round-trips ─────────────────────────────────
 
     fn roundtrip(value: u64) {
         let mut buf = [0u8; 9];
@@ -163,8 +157,6 @@ mod tests {
         roundtrip(0x1_0000_0000);
         roundtrip(u64::MAX);
     }
-
-    // ── read_varu64 error cases ────────────────────────────────────────────────
 
     #[test]
     fn read_varu64_eof_empty() {

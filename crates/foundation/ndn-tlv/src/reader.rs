@@ -24,26 +24,22 @@ impl TlvReader {
         self.pos >= self.buf.len()
     }
 
-    /// Current byte position within the original buffer.
     pub fn position(&self) -> usize {
         self.pos
     }
 
-    /// Read the next TLV type code.
     pub fn read_type(&mut self) -> Result<u64, TlvError> {
         let (v, n) = read_varu64(&self.buf[self.pos..])?;
         self.pos += n;
         Ok(v)
     }
 
-    /// Read the next TLV length field.
     pub fn read_length(&mut self) -> Result<usize, TlvError> {
         let (v, n) = read_varu64(&self.buf[self.pos..])?;
         self.pos += n;
         Ok(v as usize)
     }
 
-    /// Read exactly `len` bytes as a zero-copy `Bytes` slice.
     pub fn read_bytes(&mut self, len: usize) -> Result<Bytes, TlvError> {
         if self.pos + len > self.buf.len() {
             return Err(TlvError::UnexpectedEof);
@@ -53,7 +49,6 @@ impl TlvReader {
         Ok(slice)
     }
 
-    /// Read a complete TLV element: returns `(type, value_bytes)`.
     pub fn read_tlv(&mut self) -> Result<(u64, Bytes), TlvError> {
         let typ = self.read_type()?;
         let len = self.read_length()?;
@@ -61,7 +56,6 @@ impl TlvReader {
         Ok((typ, val))
     }
 
-    /// Peek at the next TLV type without advancing the position.
     pub fn peek_type(&self) -> Result<u64, TlvError> {
         let (v, _) = read_varu64(&self.buf[self.pos..])?;
         Ok(v)
@@ -84,13 +78,11 @@ impl TlvReader {
         Ok(())
     }
 
-    /// Return a sub-reader scoped to `len` bytes from the current position.
     pub fn scoped(&mut self, len: usize) -> Result<TlvReader, TlvError> {
         let slice = self.read_bytes(len)?;
         Ok(TlvReader::new(slice))
     }
 
-    /// Return the full remaining buffer as a `Bytes` slice without advancing.
     pub fn as_bytes(&self) -> Bytes {
         self.buf.slice(self.pos..)
     }
@@ -105,8 +97,6 @@ mod tests {
         v.extend_from_slice(value);
         Bytes::from(v)
     }
-
-    // ── basic read_tlv ─────────────────────────────────────────────────────────
 
     #[test]
     fn read_tlv_basic() {
@@ -163,8 +153,6 @@ mod tests {
         assert!(r.is_empty());
     }
 
-    // ── peek_type ─────────────────────────────────────────────────────────────
-
     #[test]
     fn peek_type_does_not_advance() {
         let raw = make_tlv(0x05, b"data");
@@ -176,8 +164,6 @@ mod tests {
         assert_eq!(r.remaining(), 6); // type(1) + len(1) + value(4)
     }
 
-    // ── remaining / is_empty / position ───────────────────────────────────────
-
     #[test]
     fn remaining_and_is_empty() {
         let raw = Bytes::from(vec![0x08, 0x01, 0x42]);
@@ -188,8 +174,6 @@ mod tests {
         assert!(r.is_empty());
         assert_eq!(r.remaining(), 0);
     }
-
-    // ── skip_unknown (critical-bit rule) ──────────────────────────────────────
 
     #[test]
     fn skip_unknown_even_type_above_31_succeeds() {
@@ -225,8 +209,6 @@ mod tests {
         let err = r.skip_unknown(typ).unwrap_err();
         assert_eq!(err, TlvError::UnknownCriticalType(0x21));
     }
-
-    // ── scoped sub-reader ─────────────────────────────────────────────────────
 
     #[test]
     fn scoped_reader_contains_only_inner_bytes() {
@@ -264,8 +246,6 @@ mod tests {
         let (t3, _) = r2.read_tlv().unwrap();
         assert_eq!(t3, 0x15);
     }
-
-    // ── error cases ───────────────────────────────────────────────────────────
 
     #[test]
     fn read_tlv_truncated_value_errors() {

@@ -33,9 +33,6 @@ pub enum OutboundRequest {
 
 impl AppSink {
     /// Create a new `AppSink` and the matching request receiver.
-    ///
-    /// The caller (typically the engine) holds the `Receiver` and dispatches
-    /// `OutboundRequest` messages as they arrive.
     pub fn new(face_id: FaceId, capacity: usize) -> (AppSink, mpsc::Receiver<OutboundRequest>) {
         let (tx, rx) = mpsc::channel(capacity);
         (AppSink { face_id, tx }, rx)
@@ -117,7 +114,6 @@ mod tests {
         let (face, mut rx) = AppSink::new(FaceId(1), 8);
         let interest = make_interest("hello");
         let task = tokio::spawn(async move { face.express(interest).await });
-        // Engine side: receive the request and reply.
         if let Some(OutboundRequest::Interest { reply, .. }) = rx.recv().await {
             reply.send(Ok(make_data())).unwrap();
         } else {
@@ -129,7 +125,7 @@ mod tests {
     #[tokio::test]
     async fn express_returns_error_when_channel_closed() {
         let (face, rx) = AppSink::new(FaceId(1), 8);
-        drop(rx); // engine side dropped
+        drop(rx);
         let result = face.express(make_interest("x")).await;
         assert!(matches!(result, Err(AppError::Closed)));
     }

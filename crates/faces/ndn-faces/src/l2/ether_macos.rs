@@ -34,8 +34,6 @@ use super::radio::RadioFaceMetadata;
 
 pub use super::ndrv::NDN_ETHER_MCAST_MAC;
 
-// ─── NamedEtherFace ──────────────────────────────────────────────────────────
-
 /// NDN face over raw Ethernet (`PF_NDRV` / EtherType 0x8624) for macOS.
 ///
 /// Sends unicast frames to `peer_mac` and receives frames whose source MAC
@@ -44,20 +42,14 @@ pub use super::ndrv::NDN_ETHER_MCAST_MAC;
 /// Requires root.
 pub struct NamedEtherFace {
     id: FaceId,
-    /// NDN node name of the remote peer.
     pub node_name: Name,
     peer_mac: MacAddr,
-    /// Radio metadata for multi-radio strategies.
     pub radio: RadioFaceMetadata,
     socket: NdrvSocket,
 }
 
 impl NamedEtherFace {
-    /// Create a new Ethernet face bound to `iface` pointing at `peer_mac`.
-    ///
-    /// Opens a `PF_NDRV` socket, registers EtherType 0x8624, and joins the
-    /// NDN multicast group (so that multicast traffic is also visible if
-    /// needed).  Requires root.
+    /// Requires root.
     pub fn new(
         id: FaceId,
         node_name: Name,
@@ -75,17 +67,14 @@ impl NamedEtherFace {
         })
     }
 
-    /// Update the peer MAC address (e.g. after a mobility event).
     pub fn set_peer_mac(&mut self, mac: MacAddr) {
         self.peer_mac = mac;
     }
 
-    /// Current peer MAC address.
     pub fn peer_mac(&self) -> MacAddr {
         self.peer_mac
     }
 
-    /// Interface name this face is bound to.
     pub fn iface(&self) -> &str {
         self.socket.iface()
     }
@@ -105,7 +94,6 @@ impl Face for NamedEtherFace {
             if src_mac == self.peer_mac {
                 return Ok(payload);
             }
-            // Frame from a different source; discard and wait for the next.
         }
     }
 
@@ -116,8 +104,6 @@ impl Face for NamedEtherFace {
             .map_err(FaceError::Io)
     }
 }
-
-// ─── MulticastEtherFace ──────────────────────────────────────────────────────
 
 /// NDN face over multicast Ethernet (`PF_NDRV` / EtherType 0x8624) for macOS.
 ///
@@ -130,12 +116,10 @@ pub struct MulticastEtherFace {
     id: FaceId,
     iface: String,
     socket: NdrvSocket,
-    /// Monotonic sequence counter for NDNLPv2 fragmentation.
     seq: AtomicU64,
 }
 
 impl MulticastEtherFace {
-    /// Create a new multicast Ethernet face on `iface`.  Requires root.
     pub fn new(id: FaceId, iface: impl Into<String>) -> std::io::Result<Self> {
         let iface = iface.into();
         let socket = NdrvSocket::new(&iface)?;
@@ -147,7 +131,6 @@ impl MulticastEtherFace {
         })
     }
 
-    /// Interface name this face is bound to.
     pub fn iface(&self) -> &str {
         &self.iface
     }
@@ -209,7 +192,6 @@ impl Face for MulticastEtherFace {
     }
 }
 
-// ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

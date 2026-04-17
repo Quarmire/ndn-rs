@@ -1,29 +1,14 @@
 //! SWIM-style fixed-interval probe scheduler.
 //!
-//! Unlike [`BackoffScheduler`], `SwimScheduler` does NOT apply exponential
-//! back-off — it broadcasts at a constant period T, matching the SWIM paper's
-//! requirement that each node probes exactly one random peer per protocol
-//! period.
-//!
-//! **Indirect probing** (K-fanout via `/ndn/local/nd/probe/via/`) is handled
-//! by the protocol layer, not here.  This scheduler only decides *when* to
-//! send the next broadcast hello.
+//! Broadcasts at constant period T per the SWIM paper.  Indirect probing
+//! (K-fanout) is handled by the protocol layer.
 
 use std::time::{Duration, Instant};
 
 use crate::config::DiscoveryConfig;
 use crate::strategy::{NeighborProbeStrategy, ProbeRequest, TriggerEvent};
 
-// ── SwimScheduler ─────────────────────────────────────────────────────────────
 
-/// Fixed-interval SWIM probe scheduler.
-///
-/// Broadcasts a hello at every `interval`.  Unlike [`BackoffScheduler`] it
-/// never increases its interval after a successful exchange.  Topology changes
-/// (`trigger()`) cause an immediate probe on the next tick, after which the
-/// regular period resumes.
-///
-/// [`BackoffScheduler`]: super::BackoffScheduler
 pub struct SwimScheduler {
     interval: Duration,
     next_probe_at: Instant,
@@ -31,10 +16,6 @@ pub struct SwimScheduler {
 }
 
 impl SwimScheduler {
-    /// Create a scheduler firing every `interval`.
-    ///
-    /// Sends an immediate probe on the first tick to bootstrap the neighbor
-    /// table.
     pub fn new(interval: Duration) -> Self {
         let now = Instant::now();
         Self {
@@ -44,8 +25,6 @@ impl SwimScheduler {
         }
     }
 
-    /// Build from a [`DiscoveryConfig`], using `hello_interval_base` as the
-    /// fixed SWIM protocol period T.
     pub fn from_discovery_config(cfg: &DiscoveryConfig) -> Self {
         Self::new(cfg.hello_interval_base)
     }
@@ -62,15 +41,9 @@ impl NeighborProbeStrategy for SwimScheduler {
         }
     }
 
-    fn on_probe_success(&mut self, _rtt: Duration) {
-        // SWIM uses a fixed interval; a successful exchange does not alter the
-        // schedule.
-    }
+    fn on_probe_success(&mut self, _rtt: Duration) {}
 
-    fn on_probe_timeout(&mut self) {
-        // Indirect probing on failure is handled by the protocol layer.
-        // The scheduler keeps its fixed rate regardless of probe outcomes.
-    }
+    fn on_probe_timeout(&mut self) {}
 
     fn trigger(&mut self, event: TriggerEvent) {
         match event {
@@ -79,14 +52,11 @@ impl NeighborProbeStrategy for SwimScheduler {
             | TriggerEvent::NeighborStale => {
                 self.pending_immediate = true;
             }
-            TriggerEvent::PassiveDetection => {
-                // Passive MAC overhearing is not a SWIM topology event; ignore.
-            }
+            TriggerEvent::PassiveDetection => {}
         }
     }
 }
 
-// ── Tests ──────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

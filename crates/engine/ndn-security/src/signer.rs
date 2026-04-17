@@ -7,27 +7,18 @@ use ndn_packet::{Name, SignatureType};
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// Signs a region of bytes and produces a signature value.
-///
-/// Implemented as a dyn-compatible trait using `BoxFuture` so it can be stored
-/// as `Arc<dyn Signer>` in the key store.
 pub trait Signer: Send + Sync + 'static {
     fn sig_type(&self) -> SignatureType;
     fn key_name(&self) -> &Name;
-    /// The certificate name to embed as a key locator in SignatureInfo, if any.
     fn cert_name(&self) -> Option<&Name> {
         None
     }
-    /// Return the raw public key bytes, if available.
     fn public_key(&self) -> Option<Bytes> {
         None
     }
 
     fn sign<'a>(&'a self, region: &'a [u8]) -> BoxFuture<'a, Result<Bytes, TrustError>>;
 
-    /// Synchronous signing — avoids `Box::pin` and async state machine overhead.
-    ///
-    /// Signers whose work is pure CPU (Ed25519, HMAC) should override this.
     fn sign_sync(&self, region: &[u8]) -> Result<Bytes, TrustError> {
         let _ = region;
         unimplemented!(
@@ -36,7 +27,6 @@ pub trait Signer: Send + Sync + 'static {
     }
 }
 
-/// Ed25519 signer using `ed25519-dalek`.
 pub struct Ed25519Signer {
     signing_key: ed25519_dalek::SigningKey,
     key_name: Name,
@@ -56,13 +46,11 @@ impl Ed25519Signer {
         }
     }
 
-    /// Construct from raw 32-byte seed bytes.
     pub fn from_seed(seed: &[u8; 32], key_name: Name) -> Self {
         let signing_key = ed25519_dalek::SigningKey::from_bytes(seed);
         Self::new(signing_key, key_name, None)
     }
 
-    /// Return the 32-byte compressed Ed25519 public key (verifying key).
     pub fn public_key_bytes(&self) -> [u8; 32] {
         self.signing_key.verifying_key().to_bytes()
     }
@@ -96,17 +84,12 @@ impl Signer for Ed25519Signer {
     }
 }
 
-/// HMAC-SHA256 signer for symmetric (pre-shared key) authentication.
-///
-/// Significantly faster than Ed25519 (~10x) since it only computes a keyed
-/// hash rather than elliptic curve math.
 pub struct HmacSha256Signer {
     key: ring::hmac::Key,
     key_name: Name,
 }
 
 impl HmacSha256Signer {
-    /// Create from raw key bytes (any length; 32+ bytes recommended).
     pub fn new(key_bytes: &[u8], key_name: Name) -> Self {
         Self {
             key: ring::hmac::Key::new(ring::hmac::HMAC_SHA256, key_bytes),
@@ -134,50 +117,14 @@ impl Signer for HmacSha256Signer {
     }
 }
 
-// ── BLAKE3 signature type codes ───────────────────────────────────────────────
-//
-// NDN defines separate SignatureType values for plain digests and keyed
-// digests for a reason: the verifier must be able to tell which algorithm to
-// run, and a shared code opens a trivial downgrade attack (an attacker strips
-// a keyed signature and replaces the Content with a plain BLAKE3 hash over
-// their forged payload — on the wire both look identical, so a verifier that
-// dispatches on type code alone picks the plain-digest path and validates
-// the forgery). This matches the existing NDN pattern:
-//
-//   type 0  DigestSha256           (plain, unauthenticated)
-//   type 4  SignatureHmacWithSha256 (keyed, authenticated)
-//
-// ndn-rs therefore assigns BLAKE3 two distinct type codes rather than reusing
-// one. Both values are **reserved** on the NDN TLV SignatureType registry
-// (<https://redmine.named-data.net/projects/ndn-tlv/wiki/SignatureType>).
-// The wire format and verification rules are documented in
-// `docs/wiki/src/reference/blake3-signature-spec.md`.
+// Plain and keyed BLAKE3 use distinct type codes to prevent downgrade attacks.
+// Both are reserved on the NDN TLV SignatureType registry.
+// See `docs/wiki/src/reference/blake3-signature-spec.md`.
 
-/// Signature type code for **plain** BLAKE3 digest. Analogous to
-/// `DigestSha256` (type 0) — provides content integrity / self-certifying
-/// names but **no authentication**. Anyone can produce a valid signature.
-/// See `DigestBlake3` in `blake3-signature-spec.md`.
 pub const SIGNATURE_TYPE_DIGEST_BLAKE3_PLAIN: u64 = 6;
-
-/// Signature type code for **keyed** BLAKE3. Analogous to
-/// `SignatureHmacWithSha256` (type 4) — requires a 32-byte shared secret;
-/// provides both integrity **and** authentication of the source. Distinct
-/// from the plain-digest code on purpose: see the plain-vs-keyed rationale
-/// above. See `SignatureBlake3Keyed` in `blake3-signature-spec.md`.
 pub const SIGNATURE_TYPE_DIGEST_BLAKE3_KEYED: u64 = 7;
 
-/// BLAKE3 digest signer for high-throughput self-certifying content.
-///
-/// Uses signature type code [`SIGNATURE_TYPE_DIGEST_BLAKE3_PLAIN`] (6),
-/// reserved on the NDN TLV SignatureType registry. Analogous to
-/// `DigestSha256` (type 0) but uses BLAKE3, which is 3–8× faster on modern
-/// CPUs due to SIMD parallelism.
-///
-/// The "signature" is a 32-byte BLAKE3 hash of the signed region. There is no
-/// secret key — this provides integrity (content addressing) but **not**
-/// authentication. For keyed BLAKE3 (authentication), use [`Blake3KeyedSigner`],
-/// which uses a distinct type code so verifiers cannot be downgraded from
-/// keyed to plain mode via a substitution attack.
+/// Plain BLAKE3 digest signer (type 6). No secret key -- integrity only.
 pub struct Blake3Signer {
     key_name: Name,
 }
@@ -207,22 +154,9 @@ impl Signer for Blake3Signer {
     }
 }
 
-/// Threshold above which BLAKE3 hashing switches from single-thread
-/// `Hasher::update` to multi-thread `Hasher::update_rayon`. The blake3
-/// crate documents 128 KiB as the rule-of-thumb crossover on x86_64 —
-/// below that the rayon thread-spawn overhead beats the per-byte
-/// savings, so we always take the single-thread path. Per-packet
-/// signing of normal NDN signed portions (a few hundred bytes to a
-/// few KB) never reaches this threshold; bulk content publication
-/// (multi-MB Data) does.
+/// 128 KiB: crossover where rayon thread-spawn overhead pays for itself.
 pub const BLAKE3_RAYON_THRESHOLD: usize = 128 * 1024;
 
-/// Compute an unkeyed BLAKE3 hash, automatically dispatching to the
-/// multi-thread `update_rayon` path when the input is large enough to
-/// benefit. See [`BLAKE3_RAYON_THRESHOLD`]. Used by both
-/// [`Blake3Signer`] (sign side) and `Blake3DigestVerifier` (verify
-/// side) so that a single-call API "just gets faster" on large inputs
-/// without callers needing to pick a code path.
 pub fn blake3_hash_auto(region: &[u8]) -> blake3::Hash {
     if region.len() >= BLAKE3_RAYON_THRESHOLD {
         let mut h = blake3::Hasher::new();
@@ -233,9 +167,6 @@ pub fn blake3_hash_auto(region: &[u8]) -> blake3::Hash {
     }
 }
 
-/// Compute a keyed BLAKE3 hash, automatically dispatching to
-/// `update_rayon` when the input is large enough to benefit. See
-/// [`BLAKE3_RAYON_THRESHOLD`].
 pub fn blake3_keyed_hash_auto(key: &[u8; 32], region: &[u8]) -> blake3::Hash {
     if region.len() >= BLAKE3_RAYON_THRESHOLD {
         let mut h = blake3::Hasher::new_keyed(key);
@@ -246,25 +177,13 @@ pub fn blake3_keyed_hash_auto(key: &[u8; 32], region: &[u8]) -> blake3::Hash {
     }
 }
 
-/// BLAKE3 keyed signer for authenticated high-throughput content.
-///
-/// Uses signature type code [`SIGNATURE_TYPE_DIGEST_BLAKE3_KEYED`] (7),
-/// reserved on the NDN TLV SignatureType registry, distinct from the plain
-/// BLAKE3 code on purpose (see the plain-vs-keyed rationale on the type code
-/// constants above). Uses a 32-byte secret key with BLAKE3's built-in keyed
-/// hashing mode — faster than HMAC-SHA256 while providing equivalent security
-/// guarantees.
+/// Keyed BLAKE3 signer (type 7). Requires a 32-byte secret.
 pub struct Blake3KeyedSigner {
     key: [u8; 32],
     key_name: Name,
 }
 
 impl Blake3KeyedSigner {
-    /// Create from an exact 32-byte key. The `SignatureBlake3Keyed` spec
-    /// (`docs/wiki/src/reference/blake3-signature-spec.md`) requires keys
-    /// to be exactly 32 octets; the `[u8; 32]` argument enforces this at
-    /// compile time, eliminating any silent padding or truncation that
-    /// would let a caller weaken the MAC by accident.
     pub fn new(key: [u8; 32], key_name: Name) -> Self {
         Self { key, key_name }
     }
@@ -344,7 +263,6 @@ mod tests {
         assert!(s.cert_name().is_none());
     }
 
-    // ── HMAC-SHA256 tests ──────────────────────────────────────────────────
 
     #[test]
     fn hmac_sig_type() {
@@ -387,7 +305,6 @@ mod tests {
         assert_eq!(async_sig, sync_sig);
     }
 
-    // ── Ed25519 sign_sync tests ────────────────────────────────────────────
 
     #[test]
     fn ed25519_sign_sync_produces_64_bytes() {
@@ -404,13 +321,6 @@ mod tests {
         assert_eq!(async_sig, sync_sig);
     }
 
-    // ── BLAKE3 tests ───────────────────────────────────────────────────────
-
-    /// Plain and keyed BLAKE3 must use distinct SignatureType codes so that
-    /// a verifier dispatching on type code cannot be tricked into running
-    /// the unauthenticated plain-digest path against a packet that was
-    /// originally signed with the keyed (authenticated) mode. This mirrors
-    /// the existing NDN pattern (`DigestSha256` = 0, `HmacWithSha256` = 4).
     #[test]
     fn blake3_plain_and_keyed_use_distinct_sig_types() {
         let plain = Blake3Signer::new(test_key_name());
@@ -430,9 +340,6 @@ mod tests {
         );
     }
 
-    /// Historical values that external callers may have depended on. Kept
-    /// as an explicit assertion so any future change to the numbers is a
-    /// deliberate, flagged break.
     #[test]
     fn blake3_sig_type_code_values_are_pinned() {
         assert_eq!(SIGNATURE_TYPE_DIGEST_BLAKE3_PLAIN, 6);
@@ -453,9 +360,6 @@ mod tests {
         assert_eq!(sig.len(), 32);
     }
 
-    /// Regression: with distinct keys, keyed signatures over the same region
-    /// must differ. This is the core authenticity property that makes the
-    /// keyed variant meaningful (vs. the plain one).
     #[test]
     fn blake3_keyed_different_key_different_sig() {
         let s1 = Blake3KeyedSigner::new([1u8; 32], test_key_name());
@@ -466,13 +370,6 @@ mod tests {
         );
     }
 
-    /// Plain BLAKE3 and keyed BLAKE3 with an all-zero key must still produce
-    /// different bytes over the same region (BLAKE3's keyed mode is not just
-    /// plain hash when key = 0). This is the main reason sharing a type code
-    /// would be unsafe: a verifier that picked the wrong mode would compute
-    /// a different expected hash and (usually) reject the packet — but under
-    /// a shared type code, a substitution attack recomputes the plain digest
-    /// to match, and the verifier cannot tell the difference.
     #[test]
     fn blake3_plain_and_keyed_with_zero_key_differ() {
         let plain = Blake3Signer::new(test_key_name());

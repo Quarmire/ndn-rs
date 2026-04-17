@@ -1,9 +1,7 @@
 //! Neighbor table — engine-owned state for all discovered peers.
 //!
-//! The table is owned by the engine (via [`DiscoveryContext`]) rather than by
-//! any individual protocol implementation.  This means the table survives
-//! protocol swaps at runtime and can be shared across multiple simultaneous
-//! protocols (e.g. EtherND + SWIM running together).
+//! Owned by the engine (not individual protocols) so it survives protocol
+//! swaps and can be shared across simultaneous protocols.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -18,45 +16,31 @@ use crate::MacAddr;
 /// Lifecycle state of a neighbor peer.
 #[derive(Clone, Debug)]
 pub enum NeighborState {
-    /// Actively probing — waiting for a hello response.
     Probing {
-        /// Number of consecutive unanswered probe attempts.
         attempts: u8,
-        /// When the last probe was sent.
         last_probe: Instant,
     },
-    /// Link confirmed reachable.
     Established {
-        /// Timestamp of last successful exchange.
         last_seen: Instant,
     },
-    /// Missed several hellos; link may be degrading.
     Stale {
-        /// Number of consecutive missed hellos.
         miss_count: u8,
-        /// Timestamp of last successful exchange before failures began.
         last_seen: Instant,
     },
-    /// Peer is considered unreachable; entry pending removal.
+    /// Peer unreachable; entry pending removal.
     Absent,
 }
 
 /// A discovered neighbor and its per-link face bindings.
 #[derive(Clone, Debug)]
 pub struct NeighborEntry {
-    /// NDN node name (e.g. `/ndn/site/host`).
     pub node_name: Name,
-    /// Current reachability state.
     pub state: NeighborState,
-    /// Per-link face bindings: `(face_id, source_mac, interface_name)`.
-    ///
-    /// A peer may be reachable over multiple interfaces simultaneously
-    /// (e.g. Ethernet + Wi-Fi).  Each gets its own unicast face.
+    /// `(face_id, source_mac, interface_name)` — a peer may be reachable
+    /// over multiple interfaces simultaneously.
     pub faces: Vec<(FaceId, MacAddr, String)>,
-    /// Estimated round-trip time in microseconds (EWMA, `None` until measured).
+    /// Estimated RTT in microseconds (EWMA, `None` until measured).
     pub rtt_us: Option<u32>,
-    /// Nonce sent in the most recent outstanding hello Interest, used for
-    /// replay detection and RTT measurement.
     pub pending_nonce: Option<u32>,
 }
 
@@ -74,12 +58,10 @@ impl NeighborEntry {
         }
     }
 
-    /// Return whether this neighbor has any live unicast faces.
     pub fn is_reachable(&self) -> bool {
         matches!(self.state, NeighborState::Established { .. }) && !self.faces.is_empty()
     }
 
-    /// Find the face for the given MAC + interface, if one already exists.
     pub fn face_for(&self, mac: &MacAddr, iface: &str) -> Option<FaceId> {
         self.faces
             .iter()
@@ -90,22 +72,16 @@ impl NeighborEntry {
 
 /// Mutation applied to the neighbor table via [`DiscoveryContext::update_neighbor`].
 pub enum NeighborUpdate {
-    /// Insert or replace a full entry.
     Upsert(NeighborEntry),
-    /// Transition an existing entry to a new state.
     SetState { name: Name, state: NeighborState },
-    /// Add a face binding to an existing entry.
     AddFace {
         name: Name,
         face_id: FaceId,
         mac: MacAddr,
         iface: String,
     },
-    /// Remove a face binding.
     RemoveFace { name: Name, face_id: FaceId },
-    /// Record a measured RTT for an entry.
     UpdateRtt { name: Name, rtt_us: u32 },
-    /// Remove the entry entirely.
     Remove(Name),
 }
 
@@ -119,9 +95,6 @@ fn state_label(s: &NeighborState) -> &'static str {
 }
 
 /// Engine-owned, lock-protected neighbor table.
-///
-/// Wrapped in `Arc<NeighborTable>` so both the engine and the
-/// `DiscoveryContext` implementation can hold a reference.
 pub struct NeighborTable {
     inner: Mutex<HashMap<Name, NeighborEntry>>,
 }
@@ -133,7 +106,6 @@ impl NeighborTable {
         })
     }
 
-    /// Apply a [`NeighborUpdate`].
     pub fn apply(&self, update: NeighborUpdate) {
         let mut map = self.inner.lock().unwrap();
         match update {
@@ -151,8 +123,6 @@ impl NeighborTable {
                     let from = state_label(&entry.state);
                     let to = state_label(&state);
                     if from != to {
-                        // State-variant transitions are meaningful lifecycle events;
-                        // same-variant updates (e.g. refreshing last_seen) are silent.
                         if matches!(state, NeighborState::Established { .. }) {
                             info!(peer = %name, %from, %to, "neighbor established");
                         } else if matches!(state, NeighborState::Stale { .. }) {
@@ -170,11 +140,10 @@ impl NeighborTable {
                 mac,
                 iface,
             } => {
-                if let Some(entry) = map.get_mut(&name) {
-                    // Avoid duplicates.
-                    if entry.face_for(&mac, &iface).is_none() {
-                        entry.faces.push((face_id, mac, iface));
-                    }
+                if let Some(entry) = map.get_mut(&name)
+                    && entry.face_for(&mac, &iface).is_none()
+                {
+                    entry.faces.push((face_id, mac, iface));
                 }
             }
             NeighborUpdate::RemoveFace { name, face_id } => {
@@ -199,17 +168,14 @@ impl NeighborTable {
         }
     }
 
-    /// Snapshot a single entry by name.
     pub fn get(&self, name: &Name) -> Option<NeighborEntry> {
         self.inner.lock().unwrap().get(name).cloned()
     }
 
-    /// Snapshot all entries.
     pub fn all(&self) -> Vec<NeighborEntry> {
         self.inner.lock().unwrap().values().cloned().collect()
     }
 
-    /// Find a face for the given MAC + interface across all entries.
     pub fn face_for_peer(&self, mac: &MacAddr, iface: &str) -> Option<FaceId> {
         let map = self.inner.lock().unwrap();
         for entry in map.values() {

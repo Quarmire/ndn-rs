@@ -8,13 +8,10 @@ use std::time::Duration;
 
 use ndn_packet::Name;
 
-// ─── HelloStrategyKind ────────────────────────────────────────────────────────
-
-/// Which probe-scheduling algorithm a discovery protocol builds when
-/// constructed from a [`DiscoveryConfig`].
+/// Which probe-scheduling algorithm to use.
 ///
-/// This controls *when* hellos are sent; the state machine (face creation,
-/// FIB wiring, neighbor table) is independent and stays in the protocol impl.
+/// Controls *when* hellos are sent; the state machine (face creation,
+/// FIB wiring, neighbor table) is independent.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HelloStrategyKind {
     /// Exponential backoff with jitter.  Default for most deployments.
@@ -30,8 +27,6 @@ pub enum HelloStrategyKind {
     Swim,
 }
 
-// ─── PrefixAnnouncementMode ───────────────────────────────────────────────────
-
 /// How this node announces its own prefixes to neighbours.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PrefixAnnouncementMode {
@@ -43,28 +38,20 @@ pub enum PrefixAnnouncementMode {
     NlsrLsa,
 }
 
-// ─── DiscoveryConfig ──────────────────────────────────────────────────────────
-
 /// Concrete discovery parameters.
 ///
-/// Obtain via [`DiscoveryConfig::for_profile`] and adjust as needed,
-/// or construct from scratch for fully custom deployments.
+/// Obtain via [`DiscoveryConfig::for_profile`] and adjust as needed.
 #[derive(Clone, Debug)]
 pub struct DiscoveryConfig {
-    /// Probe-scheduling algorithm.
     pub hello_strategy: HelloStrategyKind,
-    /// Initial hello interval (fast bootstrap).
     pub hello_interval_base: Duration,
-    /// Maximum hello interval after full exponential backoff.
     pub hello_interval_max: Duration,
-    /// Fractional jitter applied to each hello interval (0.0–0.5).
-    /// `0.25` means ±25 % of the current interval is added as random noise.
+    /// Fractional jitter (0.0-0.5) applied to each hello interval.
     pub hello_jitter: f32,
-    /// How long without a hello response before `Established → Stale`.
+    /// How long without a hello response before `Established -> Stale`.
     pub liveness_timeout: Duration,
-    /// Consecutive missed hellos before `Stale → Absent` (face/FIB removal).
+    /// Consecutive missed hellos before `Stale -> Absent` (face/FIB removal).
     pub liveness_miss_count: u32,
-    /// How long to wait for a hello response before declaring a probe lost.
     pub probe_timeout: Duration,
     /// SWIM indirect-probe fanout K (0 = SWIM disabled).
     pub swim_indirect_fanout: u32,
@@ -72,18 +59,12 @@ pub struct DiscoveryConfig {
     /// When a neighbor goes Stale, K unicast hellos are sent to other
     /// established peers so they can independently verify the failure.
     pub gossip_fanout: u32,
-    /// Prefix announcement mode.
     pub prefix_announcement: PrefixAnnouncementMode,
-    /// Automatically create unicast faces for discovered peers.
     pub auto_create_faces: bool,
-    /// How often the engine calls `DiscoveryProtocol::on_tick`.
-    /// Smaller values improve responsiveness at the cost of CPU overhead.
-    /// Default: 100 ms.
     pub tick_interval: Duration,
 }
 
 impl DiscoveryConfig {
-    /// Build the default config for the given deployment profile.
     pub fn for_profile(profile: &DiscoveryProfile) -> Self {
         match profile {
             DiscoveryProfile::Static => Self::static_routes(),
@@ -96,7 +77,6 @@ impl DiscoveryConfig {
         }
     }
 
-    /// Static routing — no hello traffic at all.
     fn static_routes() -> Self {
         Self {
             hello_strategy: HelloStrategyKind::Backoff,
@@ -114,8 +94,6 @@ impl DiscoveryConfig {
         }
     }
 
-    /// Link-local LAN: stable topology, low overhead.
-    ///
     /// # Liveness invariant
     ///
     /// `liveness_timeout` (30 s) must exceed `hello_interval_max × (1 + jitter)`
@@ -142,8 +120,6 @@ impl DiscoveryConfig {
         }
     }
 
-    /// Campus / enterprise: mix of stable and dynamic peers.
-    ///
     /// # Liveness invariant
     ///
     /// `liveness_timeout` (120 s) must exceed `hello_interval_max × (1 + jitter)`.
@@ -168,8 +144,6 @@ impl DiscoveryConfig {
         }
     }
 
-    /// Mobile / vehicular: topology changes at human-movement timescales.
-    ///
     /// # Liveness invariant
     ///
     /// `liveness_timeout` (3 s) must exceed `hello_interval_max × (1 + jitter)`.
@@ -194,8 +168,6 @@ impl DiscoveryConfig {
         }
     }
 
-    /// High-mobility (drones, V2X): sub-second topology changes.
-    ///
     /// # Liveness invariant
     ///
     /// `liveness_timeout` (750 ms) must exceed `hello_interval_max × (1 + jitter)`.
@@ -220,7 +192,6 @@ impl DiscoveryConfig {
         }
     }
 
-    /// Asymmetric / unidirectional link (Wifibroadcast, satellite downlink).
     fn asymmetric() -> Self {
         Self {
             hello_strategy: HelloStrategyKind::Passive,
@@ -245,74 +216,50 @@ impl Default for DiscoveryConfig {
     }
 }
 
-// ─── DiscoveryProfile ─────────────────────────────────────────────────────────
-
 /// High-level deployment profiles mapping to tuned [`DiscoveryConfig`] sets.
 #[derive(Clone, Debug, Default)]
 pub enum DiscoveryProfile {
-    /// No discovery.  FIB and faces configured statically.
     Static,
-    /// Link-local LAN (home, small office).
     #[default]
     Lan,
-    /// Campus or enterprise network.
     Campus,
-    /// Mobile / vehicular network.
     Mobile,
-    /// High-mobility (drones, V2X).
     HighMobility,
-    /// Asymmetric unidirectional link (Wifibroadcast, satellite downlink).
     Asymmetric,
-    /// Fully custom parameters.
     Custom(DiscoveryConfig),
 }
-
-// ─── ServiceDiscoveryConfig ───────────────────────────────────────────────────
 
 /// Scope at which service records are consumed or propagated.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DiscoveryScope {
-    /// `/ndn/local/` — never forwarded beyond the local link.
     LinkLocal,
-    /// `/ndn/site/` — distributed within an administrative domain.
     Site,
-    /// `/ndn/global/` — federated global registry.
     Global,
 }
 
 /// Validation policy for incoming service records.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ServiceValidationPolicy {
-    /// No validation.  Accept any record.  Fast; for closed networks.
     Skip,
-    /// Log unsigned/unverified records but act on them anyway.
     WarnOnly,
-    /// Drop unsigned records; only auto-populate FIB from verified Data.
     Required,
 }
 
 /// Configuration for the service-discovery layer (`/ndn/local/sd/`).
 #[derive(Clone, Debug)]
 pub struct ServiceDiscoveryConfig {
-    /// Automatically add FIB entries when service records arrive.
     pub auto_populate_fib: bool,
-    /// Restrict auto-population to this scope.
     pub auto_populate_scope: DiscoveryScope,
     /// Route cost for auto-populated FIB entries (should exceed manual routes).
     pub auto_fib_cost: u32,
-    /// Auto-populated entries expire after `freshness_period × multiplier`.
+    /// Auto-populated entries expire after `freshness_period * multiplier`.
     pub auto_fib_ttl_multiplier: f32,
     /// Only auto-populate for these prefixes (empty = accept any).
     pub auto_populate_prefix_filter: Vec<Name>,
-    /// Maximum service records per scope prefix.
     pub max_records_per_scope: usize,
-    /// Max registrations per producer per time window (rate limiting).
     pub max_registrations_per_producer: u32,
-    /// Time window for the per-producer rate limit.
     pub max_registrations_window: Duration,
-    /// Whether to relay service records received from peers.
     pub relay_records: bool,
-    /// Validation policy for incoming service records.
     pub validation: ServiceValidationPolicy,
 }
 
@@ -332,8 +279,6 @@ impl Default for ServiceDiscoveryConfig {
         }
     }
 }
-
-// ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

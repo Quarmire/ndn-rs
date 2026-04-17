@@ -110,21 +110,11 @@ impl PitMatchStage {
             _ => return Action::Continue(ctx),
         };
 
-        // Pre-computed name hashes eliminate per-probe re-hashing.  For the
-        // full name we use the memoized hash; for CanBePrefix prefix probes
-        // we index into the prefix_hashes array instead of allocating a
-        // temporary Name and hashing it from scratch.
         let hashes = ctx
             .name_hashes
             .get_or_insert_with(|| NameHashes::compute(&data.name));
 
-        // Try all selector combinations to find the PIT entry.
-        //
-        // PitCheck inserts with `from_name_hash(full, Some(selectors()), hint)`.
-        // Since Data packets don't carry selector information, we must probe
-        // all possible (can_be_prefix, must_be_fresh) combinations used at
-        // insertion time.  The default (false, false) is tried first as the
-        // common-case fast path.
+        // Data packets don't carry selectors, so probe all combinations.
         let selector_probes: &[Option<Selector>] = &[
             Some(Selector {
                 can_be_prefix: false,
@@ -156,9 +146,7 @@ impl PitMatchStage {
             }
         }
 
-        // CanBePrefix: the Data name may be longer than the Interest name.
-        // Walk progressively shorter prefixes using pre-computed prefix hashes
-        // instead of allocating temporary Name objects and re-hashing.
+        // CanBePrefix: walk progressively shorter prefixes.
         let can_be_prefix_probes: &[Option<Selector>] = &[
             Some(Selector {
                 can_be_prefix: true,

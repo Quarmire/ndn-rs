@@ -8,8 +8,6 @@ use ndn_packet::{Name, NameComponent};
 
 use crate::{TrustError, cert_cache::Certificate, signer::Ed25519Signer};
 
-// ─── Error ────────────────────────────────────────────────────────────────────
-
 #[derive(Debug, Error)]
 pub enum PibError {
     #[error("I/O error: {0}")]
@@ -29,8 +27,6 @@ impl From<PibError> for TrustError {
         TrustError::KeyStore(e.to_string())
     }
 }
-
-// ─── FilePib ──────────────────────────────────────────────────────────────────
 
 /// File-based Public Info Base (PIB) for persistent key and certificate storage.
 ///
@@ -64,7 +60,6 @@ pub struct FilePib {
 }
 
 impl FilePib {
-    /// Create or open a PIB at `root`, creating the directory tree if needed.
     pub fn new(root: impl Into<PathBuf>) -> Result<Self, PibError> {
         let root = root.into();
         std::fs::create_dir_all(root.join("keys"))?;
@@ -72,8 +67,6 @@ impl FilePib {
         Ok(Self { root })
     }
 
-    /// Open an existing PIB without creating it.  Returns an error if `root`
-    /// does not contain an initialised PIB.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, PibError> {
         let root = root.into();
         if !root.join("keys").exists() {
@@ -88,12 +81,9 @@ impl FilePib {
         Ok(Self { root })
     }
 
-    /// Return the root directory of this PIB.
     pub fn root(&self) -> &Path {
         &self.root
     }
-
-    // ─── Keys ─────────────────────────────────────────────────────────────────
 
     /// Generate a new Ed25519 key using a cryptographically random seed and
     /// persist it to the PIB.  Returns the signer so the caller can immediately
@@ -107,7 +97,6 @@ impl FilePib {
         Ok(signer)
     }
 
-    /// Load the signer for `key_name` from the PIB.
     pub fn get_signer(&self, key_name: &Name) -> Result<Ed25519Signer, PibError> {
         let dir = self
             .existing_key_dir(key_name)
@@ -123,7 +112,6 @@ impl FilePib {
         Ok(Ed25519Signer::from_seed(&seed, key_name.clone()))
     }
 
-    /// Delete a key and its associated certificate from the PIB.
     pub fn delete_key(&self, key_name: &Name) -> Result<(), PibError> {
         if let Some(dir) = self.existing_key_dir(key_name) {
             std::fs::remove_dir_all(dir)?;
@@ -131,21 +119,16 @@ impl FilePib {
         Ok(())
     }
 
-    /// List all key names stored in the PIB.
     pub fn list_keys(&self) -> Result<Vec<Name>, PibError> {
         list_names_in(&self.root.join("keys"))
     }
 
-    // ─── Certificates ─────────────────────────────────────────────────────────
-
-    /// Persist a certificate for `key_name` in its key directory.
     pub fn store_cert(&self, key_name: &Name, cert: &Certificate) -> Result<(), PibError> {
         let dir = self.key_dir(key_name)?;
         std::fs::write(dir.join("cert.ndnc"), encode_cert(cert))?;
         Ok(())
     }
 
-    /// Load the certificate for `key_name`.
     pub fn get_cert(&self, key_name: &Name) -> Result<Certificate, PibError> {
         let dir = self
             .existing_key_dir(key_name)
@@ -155,8 +138,6 @@ impl FilePib {
         decode_cert(Arc::new(key_name.clone()), &data)
     }
 
-    // ─── Trust anchors ────────────────────────────────────────────────────────
-
     /// Persist a certificate as a trust anchor.
     pub fn add_trust_anchor(&self, key_name: &Name, cert: &Certificate) -> Result<(), PibError> {
         let dir = self.anchor_dir(key_name)?;
@@ -165,7 +146,6 @@ impl FilePib {
         Ok(())
     }
 
-    /// Remove a trust anchor from the PIB.
     pub fn remove_trust_anchor(&self, key_name: &Name) -> Result<(), PibError> {
         let dir = self.root.join("anchors").join(name_hash(key_name));
         if dir.exists() {
@@ -174,7 +154,6 @@ impl FilePib {
         Ok(())
     }
 
-    /// Load all trust anchor certificates from the PIB.
     pub fn trust_anchors(&self) -> Result<Vec<Certificate>, PibError> {
         let anchors_root = self.root.join("anchors");
         if !anchors_root.exists() {
@@ -198,12 +177,9 @@ impl FilePib {
         Ok(certs)
     }
 
-    /// List all trust anchor names stored in the PIB.
     pub fn list_anchors(&self) -> Result<Vec<Name>, PibError> {
         list_names_in(&self.root.join("anchors"))
     }
-
-    // ─── Internal helpers ─────────────────────────────────────────────────────
 
     /// Return the key directory for `name`, creating it (and `name.uri`) if
     /// it does not already exist.
@@ -225,8 +201,6 @@ impl FilePib {
         Ok(dir)
     }
 }
-
-// ─── Certificate encoding ─────────────────────────────────────────────────────
 
 const NDNC_MAGIC: &[u8; 4] = b"NDNC";
 const NDNC_VERSION: u8 = 1;
@@ -251,7 +225,6 @@ pub fn decode_cert(name: Arc<Name>, data: &[u8]) -> Result<Certificate, PibError
     if &data[..4] != NDNC_MAGIC {
         return Err(PibError::Corrupt("invalid magic bytes".into()));
     }
-    // data[4] = version (reserved for future format changes)
     let valid_from = u64::from_be_bytes(data[5..13].try_into().unwrap());
     let valid_until = u64::from_be_bytes(data[13..21].try_into().unwrap());
     let pk_len = u32::from_be_bytes(data[21..25].try_into().unwrap()) as usize;
@@ -269,8 +242,6 @@ pub fn decode_cert(name: Arc<Name>, data: &[u8]) -> Result<Certificate, PibError
         sig_value: None,
     })
 }
-
-// ─── Name helpers ─────────────────────────────────────────────────────────────
 
 /// Compute a hex-encoded SHA-256 of the canonical name bytes for use as a
 /// stable, filesystem-safe directory name.
@@ -374,8 +345,6 @@ fn list_names_in(dir: &Path) -> Result<Vec<Name>, PibError> {
     Ok(names)
 }
 
-// ─── Randomness ───────────────────────────────────────────────────────────────
-
 fn random_seed() -> [u8; 32] {
     use ring::rand::{SecureRandom, SystemRandom};
     let rng = SystemRandom::new();
@@ -383,8 +352,6 @@ fn random_seed() -> [u8; 32] {
     rng.fill(&mut seed).expect("system RNG unavailable");
     seed
 }
-
-// ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

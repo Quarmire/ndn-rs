@@ -38,7 +38,6 @@ use ndn_transport::MacAddr;
 
 use crate::NDN_ETHERTYPE;
 
-// ─── Darwin constants (from <net/ndrv.h>) ────────────────────────────────────
 
 /// Protocol family for PF_NDRV sockets.
 const PF_NDRV: libc::c_int = 27;
@@ -55,7 +54,6 @@ const NDRV_PROTOCOL_DESC_VERS: u32 = 1;
 /// Maximum length of an interface name (IFNAMSIZ).
 const IFNAMSIZ: usize = 16;
 
-// ─── Darwin structs ───────────────────────────────────────────────────────────
 
 /// `sockaddr_ndrv` — used for `bind()` and `sendto()`.
 #[repr(C)]
@@ -130,14 +128,12 @@ impl SockaddrDl {
     }
 }
 
-// ─── NDN Ethernet constants ───────────────────────────────────────────────────
 
 /// NDN Ethernet multicast MAC: `01:00:5e:00:17:aa`
 pub const NDN_ETHER_MCAST_MAC: MacAddr = MacAddr([0x01, 0x00, 0x5E, 0x00, 0x17, 0xAA]);
 /// Ethernet header size: dst(6) + src(6) + EtherType(2).
 const ETHER_HEADER_LEN: usize = 14;
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
 
 /// Return the MAC address of `iface` via `getifaddrs(3)`.
 pub fn get_iface_mac(iface: &str) -> std::io::Result<MacAddr> {
@@ -179,7 +175,6 @@ pub fn get_iface_mac(iface: &str) -> std::io::Result<MacAddr> {
     }
 }
 
-// ─── NdrvSocket ───────────────────────────────────────────────────────────────
 
 /// Async-capable PF_NDRV socket bound to a specific Ethernet interface.
 ///
@@ -364,7 +359,6 @@ impl NdrvSocket {
     }
 }
 
-// ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

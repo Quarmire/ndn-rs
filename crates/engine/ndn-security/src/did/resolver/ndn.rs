@@ -33,8 +33,6 @@ use crate::{
     },
 };
 
-// ── Fetcher function types ────────────────────────────────────────────────────
-
 /// Fetch an NDN certificate by name (used for CA-anchored DIDs).
 pub type NdnFetchFn =
     Arc<dyn Fn(Name) -> Pin<Box<dyn Future<Output = Option<Certificate>> + Send>> + Send + Sync>;
@@ -46,8 +44,6 @@ pub type NdnFetchFn =
 pub type NdnDidDocFetchFn =
     Arc<dyn Fn(Name) -> Pin<Box<dyn Future<Output = Option<Vec<u8>>> + Send>> + Send + Sync>;
 
-// ── Resolver ─────────────────────────────────────────────────────────────────
-
 /// Resolves `did:ndn` DIDs by sending NDN Interests.
 ///
 /// Configure via the builder methods:
@@ -58,9 +54,7 @@ pub type NdnDidDocFetchFn =
 /// Both can be configured on the same instance.
 #[derive(Default, Clone)]
 pub struct NdnDidResolver {
-    /// Fetcher for CA-anchored DIDs: fetches `<identity-name>/KEY`.
     cert_fetcher: Option<NdnFetchFn>,
-    /// Fetcher for zone DIDs: fetches the zone root DID Document.
     did_doc_fetcher: Option<NdnDidDocFetchFn>,
 }
 
@@ -117,8 +111,6 @@ impl DidResolver for NdnDidResolver {
     }
 }
 
-// ── CA-anchored resolution ────────────────────────────────────────────────────
-
 async fn resolve_ca_did(
     did: &str,
     identity_name: Name,
@@ -143,8 +135,6 @@ async fn resolve_ca_did(
         ),
     }
 }
-
-// ── Zone DID resolution ───────────────────────────────────────────────────────
 
 async fn resolve_zone_did(
     did: &str,
@@ -202,11 +192,6 @@ async fn resolve_zone_did(
             );
         }
     }
-
-    // Check deactivation — if the document itself says deactivated, reflect that.
-    // A zone owner signals deactivation by publishing a document with `alsoKnownAs`
-    // pointing to the successor zone DID and deactivated=true in the metadata.
-    // We can't know from the document alone; the caller is responsible for that.
 
     DidResolutionResult::ok(doc)
 }

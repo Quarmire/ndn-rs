@@ -5,7 +5,6 @@ use bytes::Bytes;
 use crate::{PacketError, tlv_type};
 use ndn_tlv::TlvReader;
 
-/// NDN content types.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ContentType {
     #[default]
@@ -28,7 +27,6 @@ impl ContentType {
     }
 }
 
-/// Metadata carried in a Data packet's MetaInfo TLV.
 #[derive(Clone, Debug, Default)]
 pub struct MetaInfo {
     pub content_type: ContentType,

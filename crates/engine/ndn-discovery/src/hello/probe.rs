@@ -42,7 +42,6 @@ use ndn_tlv::TlvWriter;
 use crate::scope::{probe_direct, probe_via};
 use crate::wire::{parse_raw_data, parse_raw_interest, write_name_tlv, write_nni};
 
-// ─── Packet builders ──────────────────────────────────────────────────────────
 
 /// Build a direct probe Interest.
 ///
@@ -112,7 +111,6 @@ pub fn build_probe_ack(interest_name: &Name) -> Bytes {
     w.finish()
 }
 
-// ─── Packet parsers ───────────────────────────────────────────────────────────
 
 /// Parse a direct probe Interest name.
 ///
@@ -261,7 +259,6 @@ pub fn is_probe_ack(raw: &Bytes) -> bool {
     name.has_prefix(probe_direct()) || name.has_prefix(probe_via())
 }
 
-// ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

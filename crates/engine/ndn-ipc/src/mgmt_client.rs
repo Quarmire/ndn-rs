@@ -36,9 +36,6 @@ use crate::forwarder_client::ForwarderError;
 ///
 /// Sends NFD management Interests over an [`IpcFace`] and decodes the
 /// `ControlResponse` from the returned Data packet.
-///
-/// On Unix the transport is a Unix domain socket; on Windows it is a
-/// Named Pipe.  Both are accessed through the same `MgmtClient` API.
 pub struct MgmtClient {
     face: Arc<IpcFace>,
     recv_lock: Mutex<()>,
@@ -46,10 +43,6 @@ pub struct MgmtClient {
 
 impl MgmtClient {
     /// Connect to the forwarder's IPC socket.
-    ///
-    /// `face_socket` is a Unix domain socket path on Unix (e.g.
-    /// `/run/nfd/nfd.sock`) or a Named Pipe path on Windows (e.g.
-    /// `\\.\pipe\ndn`).
     pub async fn connect(face_socket: impl AsRef<str>) -> Result<Self, ForwarderError> {
         let face =
             Arc::new(ndn_faces::local::ipc_face_connect(FaceId(0), face_socket.as_ref()).await?);
@@ -59,15 +52,12 @@ impl MgmtClient {
         })
     }
 
-    /// Wrap an existing [`IpcFace`] (e.g. from a `ForwarderClient`).
     pub fn from_face(face: Arc<IpcFace>) -> Self {
         Self {
             face,
             recv_lock: Mutex::new(()),
         }
     }
-
-    // ─── Route management ───────────────────────────────────────────────
 
     /// Add (or update) a route: `rib/register`.
     ///
@@ -122,8 +112,6 @@ impl MgmtClient {
         Ok(ndn_config::RibEntry::decode_all(&bytes))
     }
 
-    // ─── Face management ────────────────────────────────────────────────
-
     /// Create a face: `faces/create`.
     pub async fn face_create(&self, uri: &str) -> Result<ControlParameters, ForwarderError> {
         self.face_create_with_mtu(uri, None).await
@@ -164,8 +152,6 @@ impl MgmtClient {
         Ok(ndn_config::FaceStatus::decode_all(&bytes))
     }
 
-    // ─── Strategy management ────────────────────────────────────────────
-
     /// Set forwarding strategy for a prefix: `strategy-choice/set`.
     pub async fn strategy_set(
         &self,
@@ -196,8 +182,6 @@ impl MgmtClient {
         let bytes = self.dataset_raw(module::STRATEGY, verb::LIST).await?;
         Ok(ndn_config::StrategyChoice::decode_all(&bytes))
     }
-
-    // ─── Content store ──────────────────────────────────────────────────
 
     /// Content store info: `cs/info`.
     pub async fn cs_info(&self) -> Result<ControlResponse, ForwarderError> {
@@ -236,14 +220,10 @@ impl MgmtClient {
         self.command(module::CS, verb::ERASE, &params).await
     }
 
-    // ─── Neighbors ──────────────────────────────────────────────────────
-
     /// List discovered neighbors: `neighbors/list`.
     pub async fn neighbors_list(&self) -> Result<ControlResponse, ForwarderError> {
         self.dataset(module::NEIGHBORS, verb::LIST).await
     }
-
-    // ─── Service discovery ──────────────────────────────────────────────
 
     /// List locally announced services: `service/list`.
     pub async fn service_list(&self) -> Result<ControlResponse, ForwarderError> {
@@ -295,8 +275,6 @@ impl MgmtClient {
         self.send_interest(name).await
     }
 
-    // ─── Status ─────────────────────────────────────────────────────────
-
     /// General forwarder status: `status/general`.
     pub async fn status(&self) -> Result<ControlResponse, ForwarderError> {
         self.dataset(module::STATUS, b"general").await
@@ -307,28 +285,20 @@ impl MgmtClient {
         self.dataset(module::STATUS, b"shutdown").await
     }
 
-    // ─── Config ──────────────────────────────────────────────────────────────
-
     /// Retrieve the running router configuration as TOML: `config/get`.
     pub async fn config_get(&self) -> Result<ControlResponse, ForwarderError> {
         self.dataset(module::CONFIG, verb::GET).await
     }
-
-    // ─── Faces counters ─────────────────────────────────────────────────
 
     /// Per-face packet/byte counters: `faces/counters`.
     pub async fn face_counters(&self) -> Result<ControlResponse, ForwarderError> {
         self.dataset(module::FACES, verb::COUNTERS).await
     }
 
-    // ─── Measurements ───────────────────────────────────────────────────
-
     /// Per-prefix measurements (satisfaction rate, RTTs): `measurements/list`.
     pub async fn measurements_list(&self) -> Result<ControlResponse, ForwarderError> {
         self.dataset(module::MEASUREMENTS, verb::LIST).await
     }
-
-    // ─── Security ────────────────────────────────────────────────────────
 
     /// List all identity keys in the PIB: `security/identity-list`.
     pub async fn security_identity_list(&self) -> Result<ControlResponse, ForwarderError> {
@@ -466,8 +436,6 @@ impl MgmtClient {
             .await
     }
 
-    // ─── Trust schema ───────────────────────────────────────────────────────
-
     /// List all active trust schema rules: `security/schema-list`.
     ///
     /// Returns a human-readable list of rules; one per line in the `status_text`:
@@ -524,8 +492,6 @@ impl MgmtClient {
         self.send_interest(name).await
     }
 
-    // ─── Discovery ──────────────────────────────────────────────────────────
-
     /// Get discovery protocol status and current config: `discovery/status`.
     pub async fn discovery_status(&self) -> Result<ControlResponse, ForwarderError> {
         self.dataset(module::DISCOVERY, b"status").await
@@ -573,8 +539,6 @@ impl MgmtClient {
         self.send_interest(name).await
     }
 
-    // ─── Log filter ─────────────────────────────────────────────────────
-
     /// Get the current runtime log filter string: `log/get-filter`.
     pub async fn log_get_filter(&self) -> Result<ControlResponse, ForwarderError> {
         self.dataset(module::LOG, verb::GET_FILTER).await
@@ -609,8 +573,6 @@ impl MgmtClient {
         let name = command_name(module::LOG, verb::SET_FILTER, &params);
         self.send_interest(name).await
     }
-
-    // ─── Core transport ─────────────────────────────────────────────────
 
     /// Send a command Interest with ControlParameters and decode the response.
     async fn command(
@@ -704,11 +666,9 @@ impl MgmtClient {
         self.send_raw(interest_wire).await
     }
 
-    /// Core send+recv: LP-wrap `interest_wire`, send to face, decode response.
     async fn send_raw(&self, interest_wire: Bytes) -> Result<ControlResponse, ForwarderError> {
         let interest_wire = interest_wire;
 
-        // Serialise send+recv so concurrent callers don't interleave.
         let _guard = self.recv_lock.lock().await;
 
         self.face

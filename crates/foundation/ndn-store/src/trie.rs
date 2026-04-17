@@ -33,7 +33,6 @@ impl<V: Clone + Send + Sync + 'static> NameTrie<V> {
         }
     }
 
-    /// Longest-prefix match — returns the value at the deepest matching node.
     pub fn lpm(&self, name: &Name) -> Option<V> {
         let root = self.root.read().unwrap();
         let mut best = root.entry.clone();
@@ -60,8 +59,6 @@ impl<V: Clone + Send + Sync + 'static> NameTrie<V> {
         best
     }
 
-    /// Exact-prefix lookup — only returns a value if `name` exactly matches
-    /// a registered prefix.
     pub fn get(&self, name: &Name) -> Option<V> {
         let mut current = Arc::clone(&self.root);
         for component in name.components() {
@@ -78,7 +75,6 @@ impl<V: Clone + Send + Sync + 'static> NameTrie<V> {
         node.entry.clone()
     }
 
-    /// Insert or replace the value at `name`.
     pub fn insert(&self, name: &Name, value: V) {
         let mut current = Arc::clone(&self.root);
         for component in name.components() {
@@ -95,7 +91,6 @@ impl<V: Clone + Send + Sync + 'static> NameTrie<V> {
         node.entry = Some(value);
     }
 
-    /// Remove the value at exactly `name`. Does not prune empty nodes.
     pub fn remove(&self, name: &Name) {
         let mut current = Arc::clone(&self.root);
         for component in name.components() {
@@ -112,16 +107,12 @@ impl<V: Clone + Send + Sync + 'static> NameTrie<V> {
         node.entry = None;
     }
 
-    /// Walk the entire trie and return all `(Name, V)` pairs in depth-first order.
     pub fn dump(&self) -> Vec<(Name, V)> {
         let mut out = Vec::new();
         dump_subtree(&self.root, &mut Vec::new(), &mut out);
         out
     }
 
-    /// Collect all values stored at or below `prefix` in the trie.
-    ///
-    /// Used for prefix-based eviction (e.g. `cs erase /prefix`).
     pub fn descendants(&self, prefix: &Name) -> Vec<V> {
         let mut current = Arc::clone(&self.root);
         for component in prefix.components() {
@@ -139,11 +130,6 @@ impl<V: Clone + Send + Sync + 'static> NameTrie<V> {
         out
     }
 
-    /// Returns the first value found at or below `prefix` in the trie.
-    ///
-    /// Used for `CanBePrefix` CS lookups: walk to the Interest name position,
-    /// then return any Data stored at or below that node. The traversal order
-    /// within a level is unspecified (HashMap iteration order).
     pub fn first_descendant(&self, prefix: &Name) -> Option<V> {
         let mut current = Arc::clone(&self.root);
         for component in prefix.components() {
@@ -166,7 +152,6 @@ impl<V: Clone + Send + Sync + 'static> Default for NameTrie<V> {
     }
 }
 
-/// Depth-first collection of all (Name, V) entries at or below `node`.
 fn dump_subtree<V: Clone + Send + Sync + 'static>(
     node: &Arc<RwLock<TrieNode<V>>>,
     path: &mut Vec<NameComponent>,
@@ -176,7 +161,6 @@ fn dump_subtree<V: Clone + Send + Sync + 'static>(
     if let Some(v) = &guard.entry {
         out.push((Name::from_components(path.iter().cloned()), v.clone()));
     }
-    // Collect children first to release the lock before recursing.
     let children: Vec<(NameComponent, Arc<RwLock<TrieNode<V>>>)> = guard
         .children
         .iter()
@@ -190,7 +174,6 @@ fn dump_subtree<V: Clone + Send + Sync + 'static>(
     }
 }
 
-/// Collect all values at or below `node` into `out`.
 fn collect_subtree<V: Clone + Send + Sync + 'static>(
     node: &Arc<RwLock<TrieNode<V>>>,
     out: &mut Vec<V>,
@@ -206,7 +189,6 @@ fn collect_subtree<V: Clone + Send + Sync + 'static>(
     }
 }
 
-/// Depth-first search for the first value at or below `node`.
 fn first_in_subtree<V: Clone>(node: &Arc<RwLock<TrieNode<V>>>) -> Option<V> {
     let guard = node.read().unwrap();
     if let Some(v) = &guard.entry {
@@ -233,8 +215,6 @@ mod tests {
                 .map(|s| NameComponent::generic(Bytes::copy_from_slice(s.as_bytes()))),
         )
     }
-
-    // ── lpm ──────────────────────────────────────────────────────────────────
 
     #[test]
     fn lpm_empty_trie_returns_none() {
@@ -273,8 +253,6 @@ mod tests {
         assert_eq!(trie.lpm(&name(&["x", "y", "z"])), Some(99));
     }
 
-    // ── get (exact) ───────────────────────────────────────────────────────────
-
     #[test]
     fn get_returns_none_for_missing_prefix() {
         let trie: NameTrie<u32> = NameTrie::new();
@@ -289,8 +267,6 @@ mod tests {
         trie.insert(&name(&["a", "b"]), 7);
         assert_eq!(trie.get(&name(&["a", "b"])), Some(7));
     }
-
-    // ── insert / remove ───────────────────────────────────────────────────────
 
     #[test]
     fn insert_replaces_value() {
@@ -313,8 +289,6 @@ mod tests {
         let trie: NameTrie<u32> = NameTrie::new();
         trie.remove(&name(&["x"])); // should not panic
     }
-
-    // ── first_descendant ─────────────────────────────────────────────────────
 
     #[test]
     fn first_descendant_exact_node_has_value() {

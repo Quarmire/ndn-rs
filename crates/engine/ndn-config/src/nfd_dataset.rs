@@ -13,10 +13,7 @@ use bytes::{Bytes, BytesMut};
 use ndn_packet::{Name, NameComponent};
 use ndn_tlv::{TlvReader, TlvWriter};
 
-// ─── TLV type constants ──────────────────────────────────────────────────────
-
 mod tlv {
-    // Shared across dataset types (also overlap with ControlParameters fields).
     pub const FACE_ID: u64 = 0x69;
     pub const COST: u64 = 0x6a;
     pub const STRATEGY_WRAPPER: u64 = 0x6b;
@@ -25,7 +22,6 @@ mod tlv {
     pub const ORIGIN: u64 = 0x6f;
     pub const URI: u64 = 0x72;
 
-    // FaceStatus
     pub const FACE_STATUS: u64 = 0x80;
     pub const LOCAL_URI: u64 = 0x81;
     pub const FACE_SCOPE: u64 = 0x84;
@@ -43,22 +39,15 @@ mod tlv {
     pub const N_IN_NACKS: u64 = 0x97;
     pub const N_OUT_NACKS: u64 = 0x98;
 
-    // FibEntry / RibEntry outer container
     pub const ENTRY: u64 = 0x80;
-    // FibEntry NextHopRecord
     pub const NEXT_HOP_RECORD: u64 = 0x81;
-    // RibEntry Route
     pub const ROUTE: u64 = 0x81;
-
-    // Standard NDN Name type.
     pub const NAME: u64 = 0x07;
     #[allow(dead_code)]
     pub const NAME_COMPONENT: u64 = 0x08;
 }
 
-// ─── NonNegativeInteger helpers ──────────────────────────────────────────────
-
-/// Encode a NonNegativeInteger: the shortest big-endian representation.
+/// NDN NonNegativeInteger: shortest big-endian representation.
 fn encode_non_neg_int(value: u64) -> Vec<u8> {
     if value <= 0xFF {
         vec![value as u8]
@@ -71,12 +60,10 @@ fn encode_non_neg_int(value: u64) -> Vec<u8> {
     }
 }
 
-/// Write a TLV element with a NonNegativeInteger value.
 fn write_non_neg_int(w: &mut TlvWriter, typ: u64, value: u64) {
     w.write_tlv(typ, &encode_non_neg_int(value));
 }
 
-/// Read a NonNegativeInteger from a value slice (1, 2, 4, or 8 bytes).
 fn read_non_neg_int(buf: &[u8]) -> Option<u64> {
     match buf.len() {
         1 => Some(buf[0] as u64),
@@ -88,8 +75,6 @@ fn read_non_neg_int(buf: &[u8]) -> Option<u64> {
         _ => None,
     }
 }
-
-// ─── Name helpers ─────────────────────────────────────────────────────────────
 
 fn encode_name(w: &mut TlvWriter, name: &Name) {
     w.write_nested(tlv::NAME, |w| {
@@ -113,23 +98,16 @@ fn decode_name(value: Bytes) -> Option<Name> {
     }
 }
 
-// ─── FaceStatus ───────────────────────────────────────────────────────────────
-
 /// NFD FaceStatus dataset entry (TLV type 0x80).
 ///
 /// Returned by `faces/list`.
 #[derive(Debug, Clone)]
 pub struct FaceStatus {
     pub face_id: u64,
-    /// Remote URI (e.g. `udp4://192.168.1.1:6363`)
     pub uri: String,
-    /// Local URI (e.g. `udp4://0.0.0.0:6363`)
     pub local_uri: String,
-    /// 0 = non-local, 1 = local
     pub face_scope: u64,
-    /// 0 = persistent, 1 = on-demand, 2 = permanent
     pub face_persistency: u64,
-    /// 0 = point-to-point, 1 = multi-access
     pub link_type: u64,
     pub mtu: Option<u64>,
     pub base_congestion_marking_interval: Option<u64>,
@@ -145,7 +123,6 @@ pub struct FaceStatus {
 }
 
 impl FaceStatus {
-    /// Encode to a complete FaceStatus TLV block (type 0x80).
     pub fn encode(&self) -> Bytes {
         let mut w = TlvWriter::new();
         w.write_nested(tlv::FACE_STATUS, |w| {
@@ -176,14 +153,12 @@ impl FaceStatus {
         w.finish()
     }
 
-    /// Decode one FaceStatus entry from the front of `buf`, advancing the cursor.
     pub fn decode(buf: &mut &[u8]) -> Option<Self> {
         let mut r = TlvReader::new(Bytes::copy_from_slice(buf));
         let (typ, value) = r.read_tlv().ok()?;
         if typ != tlv::FACE_STATUS {
             return None;
         }
-        // Advance the caller's cursor past this entry.
         let consumed = buf.len() - r.remaining();
         *buf = &buf[consumed..];
 
@@ -230,7 +205,7 @@ impl FaceStatus {
                 tlv::N_OUT_NACKS => n_out_nacks = read_non_neg_int(&v)?,
                 tlv::N_IN_BYTES => n_in_bytes = read_non_neg_int(&v)?,
                 tlv::N_OUT_BYTES => n_out_bytes = read_non_neg_int(&v)?,
-                _ => {} // skip unknown fields
+                _ => {}
             }
         }
 
@@ -255,7 +230,6 @@ impl FaceStatus {
         })
     }
 
-    /// Decode a concatenated series of FaceStatus entries (full dataset content).
     pub fn decode_all(bytes: &[u8]) -> Vec<Self> {
         let mut buf = bytes;
         let mut out = Vec::new();
@@ -268,7 +242,6 @@ impl FaceStatus {
         out
     }
 
-    /// Persistency label for display.
     pub fn persistency_str(&self) -> &'static str {
         match self.face_persistency {
             0 => "persistent",
@@ -278,7 +251,6 @@ impl FaceStatus {
         }
     }
 
-    /// Scope label for display.
     pub fn scope_str(&self) -> &'static str {
         match self.face_scope {
             1 => "local",
@@ -286,8 +258,6 @@ impl FaceStatus {
         }
     }
 }
-
-// ─── NextHopRecord / FibEntry ─────────────────────────────────────────────────
 
 /// A single nexthop in a FIB entry.
 #[derive(Debug, Clone)]
@@ -306,7 +276,6 @@ pub struct FibEntry {
 }
 
 impl FibEntry {
-    /// Encode to a complete FibEntry TLV block (type 0x80).
     pub fn encode(&self) -> Bytes {
         let mut w = TlvWriter::new();
         w.write_nested(tlv::ENTRY, |w| {
@@ -321,7 +290,6 @@ impl FibEntry {
         w.finish()
     }
 
-    /// Decode one FibEntry from the front of `buf`, advancing the cursor.
     pub fn decode(buf: &mut &[u8]) -> Option<Self> {
         let mut r = TlvReader::new(Bytes::copy_from_slice(buf));
         let (typ, value) = r.read_tlv().ok()?;
@@ -364,7 +332,6 @@ impl FibEntry {
         })
     }
 
-    /// Decode a concatenated series of FibEntry entries (full dataset content).
     pub fn decode_all(bytes: &[u8]) -> Vec<Self> {
         let mut buf = bytes;
         let mut out = Vec::new();
@@ -377,8 +344,6 @@ impl FibEntry {
         out
     }
 }
-
-// ─── Route / RibEntry ─────────────────────────────────────────────────────────
 
 /// A single route in a RIB entry.
 #[derive(Debug, Clone)]
@@ -400,7 +365,6 @@ pub struct RibEntry {
 }
 
 impl RibEntry {
-    /// Encode to a complete RibEntry TLV block (type 0x80).
     pub fn encode(&self) -> Bytes {
         let mut w = TlvWriter::new();
         w.write_nested(tlv::ENTRY, |w| {
@@ -420,7 +384,6 @@ impl RibEntry {
         w.finish()
     }
 
-    /// Decode one RibEntry from the front of `buf`, advancing the cursor.
     pub fn decode(buf: &mut &[u8]) -> Option<Self> {
         let mut r = TlvReader::new(Bytes::copy_from_slice(buf));
         let (typ, value) = r.read_tlv().ok()?;
@@ -485,7 +448,6 @@ impl RibEntry {
         })
     }
 
-    /// Decode a concatenated series of RibEntry entries (full dataset content).
     pub fn decode_all(bytes: &[u8]) -> Vec<Self> {
         let mut buf = bytes;
         let mut out = Vec::new();
@@ -499,8 +461,6 @@ impl RibEntry {
     }
 }
 
-// ─── StrategyChoice ───────────────────────────────────────────────────────────
-
 /// NFD StrategyChoice dataset entry (TLV type 0x80).
 ///
 /// Returned by `strategy-choice/list`.
@@ -511,7 +471,6 @@ pub struct StrategyChoice {
 }
 
 impl StrategyChoice {
-    /// Encode to a complete StrategyChoice TLV block (type 0x80).
     pub fn encode(&self) -> Bytes {
         let mut w = TlvWriter::new();
         w.write_nested(tlv::ENTRY, |w| {
@@ -523,7 +482,6 @@ impl StrategyChoice {
         w.finish()
     }
 
-    /// Decode one StrategyChoice from the front of `buf`, advancing the cursor.
     pub fn decode(buf: &mut &[u8]) -> Option<Self> {
         let mut r = TlvReader::new(Bytes::copy_from_slice(buf));
         let (typ, value) = r.read_tlv().ok()?;
@@ -542,7 +500,6 @@ impl StrategyChoice {
             match t {
                 tlv::NAME => name = decode_name(v),
                 tlv::STRATEGY_WRAPPER => {
-                    // strategy wrapper contains a Name
                     let mut sr = TlvReader::new(v);
                     if let Ok((st, sv)) = sr.read_tlv()
                         && st == tlv::NAME
@@ -560,7 +517,6 @@ impl StrategyChoice {
         })
     }
 
-    /// Decode a concatenated series of StrategyChoice entries (full dataset content).
     pub fn decode_all(bytes: &[u8]) -> Vec<Self> {
         let mut buf = bytes;
         let mut out = Vec::new();
@@ -573,8 +529,6 @@ impl StrategyChoice {
         out
     }
 }
-
-// ─── Encode helpers ───────────────────────────────────────────────────────────
 
 /// Concatenate multiple encoded dataset entries into a single `Bytes` buffer.
 pub fn encode_dataset<T, F>(items: &[T], encode_fn: F) -> Bytes

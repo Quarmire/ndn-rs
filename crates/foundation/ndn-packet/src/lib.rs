@@ -1,16 +1,7 @@
 //! # ndn-packet -- NDN packet types and wire-format codec
 //!
-//! Defines the core NDN packet structures and their TLV serialization.
 //! Fields are decoded lazily via `OnceLock` so that fast-path operations
 //! (e.g. Content Store hits) avoid parsing unused fields.
-//!
-//! ## Key types
-//!
-//! - [`Name`] / [`NameComponent`] -- NDN hierarchical names (`SmallVec`-backed).
-//! - [`Interest`] -- Interest packet with lazy decode and optional [`Selector`].
-//! - [`Data`] -- Data packet carrying content, [`MetaInfo`], and [`SignatureInfo`].
-//! - [`Nack`] / [`NackReason`] -- Network-layer negative acknowledgement.
-//! - [`LpHeaders`] -- NDNLPv2 link-protocol header fields.
 //!
 //! ## Feature flags
 //!
@@ -18,8 +9,6 @@
 //!   Disable for `no_std` environments (an allocator is still required).
 
 #![allow(missing_docs)]
-// Enable no_std when the `std` feature is disabled.
-// The crate requires an allocator (Name uses SmallVec, Bytes uses heap).
 #![cfg_attr(not(feature = "std"), no_std)]
 #[cfg(not(feature = "std"))]
 extern crate alloc;
@@ -46,7 +35,6 @@ pub use nack::{Nack, NackReason};
 pub use name::{Name, NameComponent};
 pub use signature::{SignatureInfo, SignatureType};
 
-/// Well-known NDN TLV type codes.
 pub mod tlv_type {
     pub const INTEREST: u64 = 0x05;
     pub const DATA: u64 = 0x06;
@@ -87,7 +75,6 @@ pub mod tlv_type {
     pub const NACK: u64 = 0x0320;
     pub const NACK_REASON: u64 = 0x0321;
 
-    // NDNLPv2 types
     pub const LP_PACKET: u64 = 0x64;
     pub const LP_FRAGMENT: u64 = 0x50;
     pub const LP_SEQUENCE: u64 = 0x51;

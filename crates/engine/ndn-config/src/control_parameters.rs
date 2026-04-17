@@ -15,8 +15,6 @@ use bytes::Bytes;
 use ndn_packet::{Name, NameComponent};
 use ndn_tlv::{TlvReader, TlvWriter};
 
-// ─── TLV type constants ──────────────────────────────────────────────────────
-
 pub mod tlv {
     pub const CONTROL_PARAMETERS: u64 = 0x68;
     pub const FACE_ID: u64 = 0x69;
@@ -35,7 +33,6 @@ pub mod tlv {
     pub const DEF_CONG_THRESHOLD: u64 = 0x88;
     pub const MTU: u64 = 0x89;
 
-    // Standard NDN Name type.
     pub const NAME: u64 = 0x07;
     pub const NAME_COMPONENT: u64 = 0x08;
 }
@@ -58,9 +55,7 @@ pub mod route_flags {
     pub const CAPTURE: u64 = 2;
 }
 
-// ─── ControlParameters ───────────────────────────────────────────────────────
-
-/// NFD ControlParameters — all fields optional.
+/// NFD ControlParameters -- all fields optional.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ControlParameters {
     pub name: Option<Name>,
@@ -84,7 +79,6 @@ impl ControlParameters {
         Self::default()
     }
 
-    /// Encode to wire format as a complete ControlParameters TLV (type 0x68).
     pub fn encode(&self) -> Bytes {
         let mut w = TlvWriter::new();
         w.write_nested(tlv::CONTROL_PARAMETERS, |w| {
@@ -93,8 +87,7 @@ impl ControlParameters {
         w.finish()
     }
 
-    /// Encode the inner fields (without the outer 0x68 wrapper).
-    /// Useful for embedding in a name component.
+    /// Encode without the outer 0x68 wrapper (for embedding in a name component).
     pub fn encode_value(&self) -> Bytes {
         let mut w = TlvWriter::new();
         self.encode_inner(&mut w);
@@ -148,7 +141,6 @@ impl ControlParameters {
         }
     }
 
-    /// Decode from a complete ControlParameters TLV (type 0x68).
     pub fn decode(wire: Bytes) -> Result<Self, ControlParametersError> {
         let mut r = TlvReader::new(wire);
         let (typ, value) = r
@@ -160,7 +152,6 @@ impl ControlParameters {
         Self::decode_value(value)
     }
 
-    /// Decode from the inner value bytes (without the outer 0x68 wrapper).
     pub fn decode_value(value: Bytes) -> Result<Self, ControlParametersError> {
         let mut r = TlvReader::new(value);
         let mut params = ControlParameters::default();
@@ -227,7 +218,6 @@ impl ControlParameters {
                 tlv::COUNT => {
                     params.count = Some(read_non_neg_int(&val)?);
                 }
-                // Unknown non-critical types are silently skipped.
                 _ => {}
             }
         }
@@ -235,8 +225,6 @@ impl ControlParameters {
         Ok(params)
     }
 }
-
-// ─── Errors ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ControlParametersError {
@@ -250,9 +238,7 @@ pub enum ControlParametersError {
     InvalidUtf8,
 }
 
-// ─── NonNegativeInteger helpers ──────────────────────────────────────────────
-
-/// Encode a NonNegativeInteger: the shortest big-endian representation.
+/// NDN NonNegativeInteger: shortest big-endian representation (1/2/4/8 bytes).
 fn encode_non_neg_int(value: u64) -> Vec<u8> {
     if value <= 0xFF {
         vec![value as u8]
@@ -265,12 +251,10 @@ fn encode_non_neg_int(value: u64) -> Vec<u8> {
     }
 }
 
-/// Write a TLV element with a NonNegativeInteger value.
 fn write_non_neg_int(w: &mut TlvWriter, typ: u64, value: u64) {
     w.write_tlv(typ, &encode_non_neg_int(value));
 }
 
-/// Read a NonNegativeInteger from a value slice (1, 2, 4, or 8 bytes).
 fn read_non_neg_int(buf: &[u8]) -> Result<u64, ControlParametersError> {
     match buf.len() {
         1 => Ok(buf[0] as u64),
@@ -282,8 +266,6 @@ fn read_non_neg_int(buf: &[u8]) -> Result<u64, ControlParametersError> {
         _ => Err(ControlParametersError::InvalidNonNegInt),
     }
 }
-
-// ─── Name helpers ────────────────────────────────────────────────────────────
 
 fn encode_name(w: &mut TlvWriter, name: &Name) {
     w.write_nested(tlv::NAME, |w| {
@@ -308,8 +290,6 @@ fn decode_name(value: Bytes) -> Result<Name, ControlParametersError> {
         Ok(Name::from_components(components))
     }
 }
-
-// ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

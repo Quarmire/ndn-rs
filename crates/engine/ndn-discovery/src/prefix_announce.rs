@@ -1,23 +1,10 @@
 //! Service record publisher and browser.
 //!
-//! Implements the `/ndn/local/sd/services/` naming convention for browsable
-//! prefix advertisement.  Any producer can publish a thin TLV record at a
-//! well-known name; any consumer discovers available prefixes by expressing a
-//! prefix Interest for `/ndn/local/sd/services/`.
-//!
 //! ## Naming convention
 //!
 //! ```text
 //! /ndn/local/sd/services/<prefix-hash>/<node-name>/v=<timestamp-ms>
 //! ```
-//!
-//! - `<prefix-hash>` — first 8 hex bytes of the FNV-1a hash of the announced
-//!   prefix in canonical URI form.  Allows O(1) FIB lookup when many records
-//!   are present.
-//! - `<node-name>` — the producer's NDN name components (flattened into the
-//!   hierarchical name).
-//! - `v=<timestamp-ms>` — version component using NDN naming conventions.
-//!   Consumers express `CanBePrefix=true` to fetch the latest version.
 //!
 //! ## Content TLV
 //!
@@ -28,19 +15,7 @@
 //!                   CAPABILITIES TLV?
 //! ```
 //!
-//! TLV type assignments (within the `0xC0–0xFF` experimental range):
-//!
-//! | Type | Name |
-//! |------|------|
-//! | 0xD0 | `ANNOUNCED-PREFIX` |
-//! | 0xD1 | `SD-NODE-NAME`     |
-//! | 0xD2 | `FRESHNESS-MS`     |
-//! | 0xD3 | `SD-CAPABILITIES`  |
-//!
-//! The `FRESHNESS-MS` field is advisory: consumers that cache service records
-//! should re-fetch after this many milliseconds even if the CS has not expired
-//! the entry.  It is separate from the NDN `FreshnessPeriod` in MetaInfo (which
-//! controls CS behaviour at the forwarder level).
+//! TLV types 0xD0-0xD3 (experimental range).
 
 use bytes::Bytes;
 use ndn_packet::{Name, NameComponent, tlv_type};
@@ -49,34 +24,24 @@ use ndn_tlv::TlvWriter;
 use crate::scope::sd_services;
 use crate::wire::{parse_raw_data, write_name_tlv, write_nni};
 
-// ─── TLV type constants ───────────────────────────────────────────────────────
 
 const T_ANNOUNCED_PREFIX: u32 = 0xD0;
 const T_SD_NODE_NAME: u32 = 0xD1;
 const T_FRESHNESS_MS: u32 = 0xD2;
 const T_SD_CAPABILITIES: u32 = 0xD3;
 
-// ─── ServiceRecord ────────────────────────────────────────────────────────────
 
 /// A service advertisement record.
-///
-/// Produced by a prefix producer to announce its prefix to neighbouring nodes.
-/// Consumed by any node doing prefix browsability.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ServiceRecord {
-    /// The prefix being announced (e.g. `/ndn/sensor/temp`).
     pub announced_prefix: Name,
-    /// The producer's NDN node name.
     pub node_name: Name,
-    /// How long (ms) this record should be considered fresh.  `0` = rely on
-    /// NDN FreshnessPeriod only.
+    /// Advisory freshness in ms (`0` = rely on NDN FreshnessPeriod only).
     pub freshness_ms: u64,
-    /// Capability flags (same encoding as HelloPayload capabilities).
     pub capabilities: u8,
 }
 
 impl ServiceRecord {
-    /// Create a minimal record with default freshness (30 s) and no flags.
     pub fn new(announced_prefix: Name, node_name: Name) -> Self {
         Self {
             announced_prefix,
@@ -86,7 +51,6 @@ impl ServiceRecord {
         }
     }
 
-    /// Encode as a content TLV blob.
     pub fn encode(&self) -> Bytes {
         let mut w = TlvWriter::new();
         // ANNOUNCED-PREFIX
@@ -106,7 +70,6 @@ impl ServiceRecord {
         w.finish()
     }
 
-    /// Decode from a content TLV blob produced by [`encode`].
     pub fn decode(b: &[u8]) -> Option<Self> {
         let mut pos = 0;
         let mut announced_prefix: Option<Name> = None;
@@ -135,7 +98,7 @@ impl ServiceRecord {
                 T_SD_CAPABILITIES => {
                     capabilities = *val.first()?;
                 }
-                _ => {} // forward-compatible: ignore unknown fields
+                _ => {}
             }
             pos = val_end;
         }
@@ -148,19 +111,10 @@ impl ServiceRecord {
         })
     }
 
-    /// Construct the NDN name for this record.
-    ///
-    /// `timestamp_ms` should be a monotonically increasing value (e.g.
-    /// milliseconds since Unix epoch) so that `CanBePrefix=true` Interests
-    /// retrieve the freshest record.
     pub fn make_name(&self, timestamp_ms: u64) -> Name {
         make_record_name(&self.announced_prefix, &self.node_name, timestamp_ms)
     }
 
-    /// Build a complete NDN Data packet for this record.
-    ///
-    /// The Data name follows the naming convention above; the Content is the
-    /// encoded `ServiceRecord`.  `FreshnessPeriod` is set to `freshness_ms`.
     pub fn build_data(&self, timestamp_ms: u64) -> Bytes {
         let name = self.make_name(timestamp_ms);
         let content = self.encode();
@@ -185,10 +139,6 @@ impl ServiceRecord {
         w.finish()
     }
 
-    /// Extract and decode the `ServiceRecord` from a raw NDN Data packet.
-    ///
-    /// Returns `None` if the packet is not a service record Data or the content
-    /// cannot be decoded.
     pub fn from_data_packet(raw: &Bytes) -> Option<Self> {
         let parsed = parse_raw_data(raw)?;
         if !parsed.name.has_prefix(sd_services()) {
@@ -199,29 +149,20 @@ impl ServiceRecord {
     }
 }
 
-// ─── Name construction ────────────────────────────────────────────────────────
 
-/// Construct the full Data name for a service record.
-///
-/// `/ndn/local/sd/services/<prefix-hash>/<node-name...>/v=<timestamp-ms>`
 pub fn make_record_name(announced_prefix: &Name, node_name: &Name, timestamp_ms: u64) -> Name {
     let hash = fnv1a_hash_name(announced_prefix);
     let hash_hex = format!("{hash:016x}");
 
-    // Start with /ndn/local/sd/services
     let mut comps: Vec<NameComponent> = sd_services().components().to_vec();
-
-    // <prefix-hash> as a single GenericNameComponent
     comps.push(NameComponent {
         typ: tlv_type::NAME_COMPONENT,
         value: hash_hex.as_bytes().to_vec().into(),
     });
 
-    // <node-name> flattened
     comps.extend(node_name.components().iter().cloned());
 
-    // v=<timestamp-ms> as a VersionNameComponent (type 0x0D)
-    // NDN convention: version component type 0x0D, value = big-endian u64.
+    // VersionNameComponent (type 0x0D), value = big-endian u64.
     comps.push(NameComponent {
         typ: 0x0D,
         value: timestamp_ms.to_be_bytes().to_vec().into(),
@@ -230,10 +171,6 @@ pub fn make_record_name(announced_prefix: &Name, node_name: &Name, timestamp_ms:
     Name::from_components(comps)
 }
 
-/// Build a prefix Interest for browsing.
-///
-/// Returns a raw TLV Interest for `/ndn/local/sd/services/` with
-/// `CanBePrefix=true` and `MustBeFresh=true`.
 pub fn build_browse_interest() -> Bytes {
     let prefix = sd_services();
     let mut w = TlvWriter::new();
@@ -248,12 +185,7 @@ pub fn build_browse_interest() -> Bytes {
     w.finish()
 }
 
-// ─── FNV-1a hash ─────────────────────────────────────────────────────────────
 
-/// FNV-1a 64-bit hash of the canonical URI string of a name.
-///
-/// Used to derive the first path component of a service record name.
-/// Collision probability for < 10 000 distinct prefixes is negligible.
 fn fnv1a_hash_name(name: &Name) -> u64 {
     const OFFSET: u64 = 14695981039346656037;
     const PRIME: u64 = 1099511628211;
@@ -262,25 +194,18 @@ fn fnv1a_hash_name(name: &Name) -> u64 {
         .fold(OFFSET, |h, b| (h ^ b as u64).wrapping_mul(PRIME))
 }
 
-// ─── TLV encoding helpers ─────────────────────────────────────────────────────
 
-/// Encode a `Name` into raw TLV bytes (Name TLV wrapper + components).
 fn encode_name_raw(name: &Name) -> Bytes {
     let mut w = TlvWriter::new();
     write_name_tlv(&mut w, name);
     w.finish()
 }
 
-/// Decode a `Name` from raw TLV bytes.
 fn decode_name_raw(b: &[u8]) -> Option<Name> {
-    // The raw bytes are a Name TLV (type 0x07).
     if b.is_empty() || b[0] != 0x07 {
         return None;
     }
     use std::str::FromStr;
-    // Re-parse via the wire format: build a minimal Interest-ish context by
-    // using the Name parser directly via its TLV path.
-    // Fallback: parse by reconstructing a canonical URI from the TLV components.
     let (_, len, hl) = read_tlv_header(b, 0)?;
     let comps_bytes = &b[hl..hl + len];
     let mut comps = Vec::new();
@@ -297,7 +222,6 @@ fn decode_name_raw(b: &[u8]) -> Option<Name> {
     if comps.is_empty() {
         return Some(Name::root());
     }
-    // Reconstruct via canonical URI then parse.
     let uri = {
         let mut s = String::new();
         for comp in &comps {
@@ -315,7 +239,6 @@ fn decode_name_raw(b: &[u8]) -> Option<Name> {
     Name::from_str(&uri).ok()
 }
 
-/// Write a non-negative integer TLV into a `TlvWriter`.
 fn write_nni_to_writer(w: &mut TlvWriter, typ: u32, val: u64) {
     let bytes = nni_bytes(val);
     w.write_tlv(typ.into(), &bytes);
@@ -343,11 +266,7 @@ fn read_nni(b: &[u8]) -> Option<u64> {
     }
 }
 
-// ─── Minimal TLV reader ───────────────────────────────────────────────────────
 
-/// Read a (type, length, header_len) triple from `b` at `pos`.
-///
-/// Supports NDN TLV variable-length encoding.
 fn read_tlv_header(b: &[u8], pos: usize) -> Option<(u32, usize, usize)> {
     if pos >= b.len() {
         return None;
@@ -377,7 +296,6 @@ fn read_varnumber(b: &[u8], pos: usize) -> Option<(u64, usize)> {
     }
 }
 
-// ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

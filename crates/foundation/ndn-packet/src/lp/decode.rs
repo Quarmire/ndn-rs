@@ -8,44 +8,26 @@ use super::{CachePolicyType, decode_be_u64};
 use crate::nack::NackReason;
 use crate::tlv_type;
 
-/// A decoded NDNLPv2 LpPacket.
 #[derive(Debug)]
 pub struct LpPacket {
-    /// The network-layer fragment (Interest or Data wire bytes).
-    /// `None` for bare Ack-only packets (no payload).
     pub fragment: Option<Bytes>,
-    /// Nack header — present when this LpPacket carries a Nack.
     pub nack: Option<NackReason>,
-    /// Hop-by-hop congestion mark (0 = no congestion).
     pub congestion_mark: Option<u64>,
-    /// Fragment sequence number (for reassembly ordering).
     pub sequence: Option<u64>,
-    /// Zero-based index of this fragment within the original packet.
     pub frag_index: Option<u64>,
-    /// Total number of fragments the original packet was split into.
     pub frag_count: Option<u64>,
-    /// Piggybacked Ack TxSequences (NDNLPv2 reliability).
     pub acks: Vec<u64>,
-    /// PIT token (opaque, 1-32 bytes).
     pub pit_token: Option<Bytes>,
-    /// Incoming face ID (local control header).
     pub incoming_face_id: Option<u64>,
-    /// Next-hop face ID (local control header).
     pub next_hop_face_id: Option<u64>,
-    /// Cache policy.
     pub cache_policy: Option<CachePolicyType>,
     /// Reliability TxSequence (0x0348) — distinct from fragmentation Sequence (0x51).
     pub tx_sequence: Option<u64>,
-    /// NonDiscovery flag (presence = true).
     pub non_discovery: bool,
-    /// Prefix announcement (raw Data bytes).
     pub prefix_announcement: Option<Bytes>,
 }
 
 impl LpPacket {
-    /// Decode an LpPacket from raw wire bytes.
-    ///
-    /// The input must start with TLV type 0x64 (LP_PACKET).
     pub fn decode(raw: Bytes) -> Result<Self, crate::PacketError> {
         let mut reader = TlvReader::new(raw);
         let (typ, value) = reader.read_tlv()?;
@@ -139,7 +121,6 @@ impl LpPacket {
             }
         }
 
-        // A valid LpPacket must have either a fragment or at least one Ack.
         if fragment.is_none() && acks.is_empty() {
             return Err(crate::PacketError::MalformedPacket(
                 "LpPacket has neither fragment nor acks".into(),
@@ -166,21 +147,17 @@ impl LpPacket {
 }
 
 impl LpPacket {
-    /// Returns `true` if this LpPacket is a fragment of a larger packet.
     pub fn is_fragmented(&self) -> bool {
         self.frag_count.is_some_and(|c| c > 1)
     }
 
-    /// Returns `true` if this LpPacket is a bare Ack (no payload fragment).
     pub fn is_ack_only(&self) -> bool {
         self.fragment.is_none() && !self.acks.is_empty()
     }
 }
 
-/// Decode the Nack header field value to extract the NackReason.
 fn decode_nack_header(value: Bytes) -> Result<NackReason, crate::PacketError> {
     if value.is_empty() {
-        // Nack with no reason = unspecified.
         return Ok(NackReason::Other(0));
     }
     let mut reader = TlvReader::new(value);
@@ -229,7 +206,6 @@ mod tests {
         assert_eq!(lp.nack, Some(NackReason::NoRoute));
         assert!(lp.congestion_mark.is_none());
 
-        // Fragment should be the original Interest.
         let interest = Interest::decode(lp.fragment.unwrap()).unwrap();
         assert_eq!(*interest.name, n);
     }
@@ -377,7 +353,6 @@ mod tests {
         assert!(LpPacket::decode(w.finish()).is_err());
     }
 
-    // ─── NDNLPv2 header field tests ──────────────────────────────────────────
 
     #[test]
     fn decode_pit_token_valid() {

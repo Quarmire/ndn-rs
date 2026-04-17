@@ -20,7 +20,6 @@ pub type SerialFace = ndn_transport::StreamFace<
     CobsCodec,
 >;
 
-/// Open a serial port and wrap it as an NDN [`SerialFace`].
 #[cfg(feature = "serial")]
 pub fn serial_face_open(
     id: FaceId,
@@ -43,8 +42,6 @@ pub fn serial_face_open(
         CobsCodec::new(),
     ))
 }
-
-// ─── Fallback when `serial` feature is disabled ────────────────────────────
 
 #[cfg(not(feature = "serial"))]
 use bytes::Bytes;

@@ -32,26 +32,23 @@ impl Decoder for TlvCodec {
             return Ok(None);
         }
 
-        // Peek the type field (varu64) to find its encoded length.
         let (_, type_len) = match read_varu64(src) {
             Ok(r) => r,
-            Err(_) => return Ok(None), // not enough bytes yet
+            Err(_) => return Ok(None),
         };
 
-        // Peek the length field (varu64) that follows the type.
         if src.len() < type_len + 1 {
             return Ok(None);
         }
         let (value_len, len_len) = match read_varu64(&src[type_len..]) {
             Ok(r) => r,
-            Err(_) => return Ok(None), // not enough bytes yet
+            Err(_) => return Ok(None),
         };
 
         let header_len = type_len + len_len;
         let frame_len = header_len + value_len as usize;
 
         if src.len() < frame_len {
-            // Tell tokio-util how much more we'll need so it can pre-allocate.
             src.reserve(frame_len - src.len());
             return Ok(None);
         }
@@ -85,14 +82,11 @@ mod tests {
         TlvCodec.decode(src).unwrap()
     }
 
-    // ── basic decode ─────────────────────────────────────────────────────────
-
     #[test]
     fn decode_complete_tlv() {
         let tlv = make_tlv(0x05, b"hello");
         let mut src = BytesMut::from(tlv.as_ref());
         let frame = decode_one(&mut src).unwrap();
-        // Decoded frame matches the original TLV bytes.
         assert_eq!(frame.as_ref(), tlv.as_ref());
         assert!(src.is_empty());
     }
@@ -107,14 +101,12 @@ mod tests {
 
     #[test]
     fn decode_incomplete_returns_none() {
-        // Only 1 byte — not enough to parse type + length + value.
         let mut src = BytesMut::from(&[0x05u8][..]);
         assert!(decode_one(&mut src).is_none());
     }
 
     #[test]
     fn decode_partial_value_returns_none() {
-        // Header says 5 bytes of value; only 2 are present.
         let mut src = BytesMut::new();
         src.put_u8(0x08); // type
         src.put_u8(0x05); // length = 5
@@ -139,7 +131,7 @@ mod tests {
 
     #[test]
     fn decode_large_value() {
-        let value = vec![0xABu8; 300]; // length > 0xFD, needs 3-byte varu64
+        let value = vec![0xABu8; 300];
         let mut w = TlvWriter::new();
         w.write_tlv(0x06, &value);
         let tlv = w.finish();
@@ -147,8 +139,6 @@ mod tests {
         let frame = decode_one(&mut src).unwrap();
         assert_eq!(frame.as_ref(), tlv.as_ref());
     }
-
-    // ── encode ───────────────────────────────────────────────────────────────
 
     #[test]
     fn encode_appends_bytes_as_is() {

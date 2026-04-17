@@ -95,11 +95,9 @@ mod tests {
             .sign_with_sync(&*signer)
             .unwrap();
 
-        // Wire must decode as a valid Data packet.
         let data = ndn_packet::Data::decode(wire).unwrap();
         assert_eq!(data.name.to_string(), "/test/producer/data");
 
-        // SignatureInfo must carry the correct key locator.
         let si = data.sig_info().unwrap();
         let kl = si.key_locator.as_ref().unwrap();
         assert_eq!(kl.to_string(), signer.key_name().to_string());
@@ -115,7 +113,6 @@ mod tests {
             .sign_with_sync(&signer)
             .unwrap();
 
-        // Must decode as a valid Interest packet.
         let _interest = ndn_packet::Interest::decode(wire).unwrap();
     }
 }

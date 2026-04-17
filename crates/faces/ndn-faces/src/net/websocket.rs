@@ -130,7 +130,6 @@ impl Face for WebSocketFace {
                     return Ok(data);
                 }
                 Message::Close(_) => return Err(FaceError::Closed),
-                // Skip text, ping, pong frames.
                 _ => continue,
             }
         }
@@ -147,7 +146,6 @@ impl Face for WebSocketFace {
     }
 }
 
-// ── TLS support (feature = "websocket-tls") ───────────────────────────────────
 
 /// TLS configuration for a WebSocket server listener.
 ///

@@ -3,19 +3,15 @@ use thiserror::Error;
 
 /// Link-layer source address returned by multicast/broadcast faces.
 ///
-/// Using a dedicated enum (rather than re-exporting the `ndn-discovery`
-/// `LinkAddr`) keeps `ndn-transport` free of a dependency on `ndn-discovery`.
-/// The engine converts `FaceAddr` into `ndn_discovery::InboundMeta` in the
-/// face reader, which *does* depend on `ndn-discovery`.
+/// Kept separate from `ndn-discovery::LinkAddr` to avoid a circular dependency.
+/// The engine converts `FaceAddr` into `InboundMeta` in the face reader.
 #[derive(Clone, Debug)]
 pub enum FaceAddr {
-    /// Source UDP `SocketAddr` from `recvfrom` on a multicast socket.
     Udp(std::net::SocketAddr),
-    /// Source MAC address extracted from the Ethernet frame header.
     Ether([u8; 6]),
 }
 
-/// Opaque identifier for a face. Cheap to copy; safe to use across tasks.
+/// Opaque face identifier.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FaceId(pub u32);
 
@@ -29,7 +25,7 @@ impl core::fmt::Display for FaceId {
     }
 }
 
-/// Classifies a face by its transport type (informational; not used for routing).
+/// Classifies a face by its transport type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "kebab-case"))]
@@ -59,7 +55,7 @@ pub enum FaceKind {
 }
 
 impl FaceKind {
-    /// Whether this face is local (in-process / same-host IPC) or non-local (network).
+    /// Whether this face is local (same-host IPC) or non-local (network).
     pub fn scope(&self) -> FaceScope {
         match self {
             FaceKind::Unix
@@ -80,7 +76,6 @@ impl FaceKind {
         }
     }
 
-    /// Whether this face has operator-level implicit trust (management socket).
     pub fn is_management(&self) -> bool {
         matches!(self, FaceKind::Management)
     }
@@ -218,24 +213,20 @@ pub trait Face: Send + Sync + 'static {
     fn id(&self) -> FaceId;
     fn kind(&self) -> FaceKind;
 
-    /// Remote URI (e.g. `udp4://192.168.1.1:6363`). Returns `None` for face
-    /// types that don't have a meaningful remote endpoint.
+    /// Remote URI (e.g. `udp4://192.168.1.1:6363`).
     fn remote_uri(&self) -> Option<String> {
         None
     }
 
-    /// Local URI (e.g. `unix:///run/nfd/nfd.sock`). Returns `None` for face
-    /// types that don't expose local binding info.
+    /// Local URI (e.g. `unix:///run/nfd/nfd.sock`).
     fn local_uri(&self) -> Option<String> {
         None
     }
 
-    /// Receive the next packet. Blocks until a packet arrives or the face closes.
     fn recv(&self) -> impl Future<Output = Result<Bytes, FaceError>> + Send;
 
     /// Receive the next packet together with the link-layer sender address.
     ///
-    /// The default implementation returns `None` for the source address.
     /// Multicast and broadcast faces override this to return the link-layer
     /// source, enabling discovery to create unicast reply faces without
     /// embedding addresses in NDN payloads.
@@ -245,7 +236,7 @@ pub trait Face: Send + Sync + 'static {
         async { self.recv().await.map(|b| (b, None)) }
     }
 
-    /// Send a packet. Must not block the caller; use internal buffering.
+    /// Send a packet.
     ///
     /// # LP encoding convention
     ///
@@ -259,11 +250,6 @@ pub trait Face: Send + Sync + 'static {
     /// same convention based on [`FaceKind::scope()`].
     fn send(&self, pkt: Bytes) -> impl Future<Output = Result<(), FaceError>> + Send;
 
-    /// Link type of this face.
-    ///
-    /// The default is [`LinkType::PointToPoint`] for all unicast transports.
-    /// Multicast and broadcast faces override this to [`LinkType::MultiAccess`].
-    /// Wi-Fi ad-hoc / MANET faces should return [`LinkType::AdHoc`].
     fn link_type(&self) -> LinkType {
         LinkType::PointToPoint
     }

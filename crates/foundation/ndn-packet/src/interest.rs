@@ -16,7 +16,6 @@ use crate::tlv_type;
 use crate::{Name, PacketError, SignatureInfo};
 use ndn_tlv::TlvReader;
 
-/// Selectors that control Interest-Data matching.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Selector {
     pub can_be_prefix: bool,
@@ -25,44 +24,24 @@ pub struct Selector {
 
 /// An NDN Interest packet.
 ///
-/// Fields beyond the name and selectors are lazily decoded via `OnceLock`
-/// so that pipeline stages that short-circuit (e.g., CS hit) pay no decode cost
-/// for fields they never access.
+/// Fields beyond the name are lazily decoded via `OnceLock` so that pipeline
+/// stages that short-circuit (e.g., CS hit) pay no decode cost for fields
+/// they never access.
 #[derive(Debug)]
 pub struct Interest {
-    /// Wire-format bytes of the full Interest TLV.
     pub(crate) raw: Bytes,
-
-    /// Name — always decoded eagerly (every stage needs it).
     pub name: Arc<Name>,
-
-    /// Selectors — decoded on first access.
     selectors: OnceLock<Selector>,
-
-    /// Nonce — decoded on first access.
     nonce: OnceLock<Option<u32>>,
-
-    /// Interest lifetime — decoded on first access.
     lifetime: OnceLock<Option<Duration>>,
-
-    /// ApplicationParameters (TLV 0x24) — decoded on first access.
     app_params: OnceLock<Option<Bytes>>,
-
-    /// HopLimit (TLV 0x22) — decoded on first access.
     hop_limit: OnceLock<Option<u8>>,
-
-    /// ForwardingHint (TLV 0x1E) — list of delegation Names, decoded on first access.
     forwarding_hint: OnceLock<Option<Vec<Arc<Name>>>>,
-
-    /// InterestSignatureInfo (TLV 0x2C) — decoded on first access.
     sig_info: OnceLock<Option<SignatureInfo>>,
-
-    /// InterestSignatureValue (TLV 0x2E) — raw signature bytes, decoded on first access.
     sig_value: OnceLock<Option<Bytes>>,
 }
 
 impl Interest {
-    /// Construct a minimal Interest with only a name (for testing / app use).
     pub fn new(name: Name) -> Self {
         Self {
             raw: Bytes::new(),
@@ -78,7 +57,6 @@ impl Interest {
         }
     }
 
-    /// Decode an Interest from raw wire bytes.
     pub fn decode(raw: Bytes) -> Result<Self, PacketError> {
         let mut reader = TlvReader::new(raw.clone());
         let (typ, value) = reader.read_tlv()?;
@@ -87,7 +65,6 @@ impl Interest {
         }
         let mut inner = TlvReader::new(value);
 
-        // Name is mandatory and must come first.
         let (name_typ, name_val) = inner.read_tlv()?;
         if name_typ != tlv_type::NAME {
             return Err(PacketError::UnknownPacketType(name_typ));
@@ -140,55 +117,42 @@ impl Interest {
             .get_or_init(|| decode_lifetime(&self.raw).ok().flatten())
     }
 
-    /// The `ApplicationParameters` TLV value (type 0x24), if present.
-    ///
-    /// Returns `None` when the Interest was constructed without parameters (e.g.
-    /// via `Interest::new`) or when the wire format contains no 0x24 TLV.
     pub fn app_parameters(&self) -> Option<&Bytes> {
         self.app_params
             .get_or_init(|| decode_app_params(&self.raw).ok().flatten())
             .as_ref()
     }
 
-    /// ForwardingHint delegation names, if present.
-    ///
-    /// Per NDN Packet Format v0.3 §5.2, ForwardingHint (TLV 0x1E) contains
-    /// one or more Name TLVs representing delegation prefixes that a
-    /// forwarder can use to reach the Data producer.
+    /// Per NDN Packet Format v0.3 §5.2, ForwardingHint contains one or more
+    /// delegation Name TLVs a forwarder can use to reach the Data producer.
     pub fn forwarding_hint(&self) -> Option<&[Arc<Name>]> {
         self.forwarding_hint
             .get_or_init(|| decode_forwarding_hint(&self.raw).ok().flatten())
             .as_deref()
     }
 
-    /// HopLimit value (0–255), if present in the wire format.
-    ///
-    /// Per NDN Packet Format v0.3 §5.2, this is a 1-byte field.
-    /// The forwarder must decrement before forwarding and drop if zero.
+    /// Per NDN Packet Format v0.3 §5.2, the forwarder must decrement before
+    /// forwarding and drop if zero.
     pub fn hop_limit(&self) -> Option<u8> {
         *self
             .hop_limit
             .get_or_init(|| decode_hop_limit(&self.raw).ok().flatten())
     }
 
-    /// InterestSignatureInfo, if present (Signed Interest per NDN Packet Format v0.3 §5.4).
     pub fn sig_info(&self) -> Option<&SignatureInfo> {
         self.sig_info
             .get_or_init(|| decode_interest_sig_info(&self.raw).ok().flatten())
             .as_ref()
     }
 
-    /// InterestSignatureValue bytes, if present.
     pub fn sig_value(&self) -> Option<&Bytes> {
         self.sig_value
             .get_or_init(|| decode_interest_sig_value(&self.raw).ok().flatten())
             .as_ref()
     }
 
-    /// The signed region of a Signed Interest — from the start of Name TLV
-    /// through the end of InterestSignatureInfo TLV (inclusive).
-    ///
-    /// Returns `None` if InterestSignatureInfo is not present.
+    /// Per NDN Packet Format v0.3 §5.4, the signed region spans from the
+    /// start of the Name TLV through the end of InterestSignatureInfo TLV.
     pub fn signed_region(&self) -> Option<&[u8]> {
         compute_interest_signed_region(&self.raw).ok().flatten()
     }
@@ -201,7 +165,7 @@ impl Interest {
 fn decode_selectors(raw: &Bytes) -> Result<Selector, PacketError> {
     let mut sel = Selector::default();
     let mut reader = TlvReader::new(raw.clone());
-    let (_, value) = reader.read_tlv()?; // outer Interest TLV
+    let (_, value) = reader.read_tlv()?;
     let mut inner = TlvReader::new(value);
     while !inner.is_empty() {
         let (typ, _) = inner.read_tlv()?;
@@ -257,7 +221,6 @@ fn decode_forwarding_hint(raw: &Bytes) -> Result<Option<Vec<Arc<Name>>>, PacketE
     while !inner.is_empty() {
         let (typ, val) = inner.read_tlv()?;
         if typ == tlv_type::FORWARDING_HINT {
-            // ForwardingHint value contains one or more Name TLVs.
             let mut hint_reader = TlvReader::new(val);
             let mut names = Vec::new();
             while !hint_reader.is_empty() {
@@ -326,11 +289,6 @@ fn decode_interest_sig_value(raw: &Bytes) -> Result<Option<Bytes>, PacketError> 
     Ok(None)
 }
 
-/// Compute the signed region for a Signed Interest.
-///
-/// Per NDN Packet Format v0.3 §5.4, the signed portion covers from the first
-/// byte of the Name TLV through the last byte of the InterestSignatureInfo TLV,
-/// all relative to the Interest's inner value (after the outer TLV header).
 fn compute_interest_signed_region(raw: &Bytes) -> Result<Option<&[u8]>, PacketError> {
     if raw.is_empty() {
         return Ok(None);
@@ -350,7 +308,6 @@ fn compute_interest_signed_region(raw: &Bytes) -> Result<Option<&[u8]>, PacketEr
     if sig_info_end == 0 {
         return Ok(None);
     }
-    // Signed region: from start of Name (first byte of inner value) to end of SigInfo.
     Ok(Some(&raw[outer_header_len..sig_info_end]))
 }
 
@@ -376,7 +333,6 @@ mod tests {
     use super::*;
     use ndn_tlv::TlvWriter;
 
-    /// Build a complete Interest wire packet for testing.
     fn build_interest(
         components: &[&[u8]],
         nonce: Option<u32>,
@@ -428,7 +384,6 @@ mod tests {
         w.finish()
     }
 
-    // ── Interest::new ─────────────────────────────────────────────────────────
 
     #[test]
     fn new_stores_name() {
@@ -445,7 +400,6 @@ mod tests {
         assert_eq!(i.lifetime(), None);
     }
 
-    // ── Interest::decode ──────────────────────────────────────────────────────
 
     #[test]
     fn decode_name_only() {
@@ -512,7 +466,6 @@ mod tests {
 
     #[test]
     fn decode_wrong_outer_type_errors() {
-        // Start with DATA type (0x06) instead of INTEREST (0x05).
         let mut w = TlvWriter::new();
         w.write_nested(tlv_type::DATA, |w| {
             w.write_nested(tlv_type::NAME, |w| {
@@ -557,8 +510,6 @@ mod tests {
 
     #[test]
     fn decode_app_params_wrong_digest_accepted() {
-        // Forwarders must accept Signed Interests even with a mismatched
-        // ParametersSha256DigestComponent — digest validation is an app concern.
         let mut w = TlvWriter::new();
         w.write_nested(tlv_type::INTEREST, |w| {
             w.write_nested(tlv_type::NAME, |w| {
@@ -577,8 +528,6 @@ mod tests {
 
     #[test]
     fn decode_app_params_without_digest_accepted() {
-        // Forwarders must accept Interests with ApplicationParameters even if
-        // the name has no ParametersSha256DigestComponent.
         let mut w = TlvWriter::new();
         w.write_nested(tlv_type::INTEREST, |w| {
             w.write_nested(tlv_type::NAME, |w| {
@@ -596,7 +545,6 @@ mod tests {
 
     #[test]
     fn decode_empty_name_rejected() {
-        // Interest with zero name components should fail.
         let mut w = TlvWriter::new();
         w.write_nested(tlv_type::INTEREST, |w| {
             w.write_tlv(tlv_type::NAME, &[]); // empty Name
@@ -632,7 +580,6 @@ mod tests {
         assert_eq!(i.hop_limit(), Some(0));
     }
 
-    // ── Signed Interest ────────────────────────────────────────────────────
 
     fn build_signed_interest(components: &[&[u8]], sig_type_code: u8, sig_value: &[u8]) -> Bytes {
         let mut w = TlvWriter::new();
@@ -714,7 +661,6 @@ mod tests {
 
     #[test]
     fn lazy_fields_decoded_once_and_cached() {
-        // Access each lazy field twice; result should be identical.
         let raw = build_interest(&[b"x"], Some(99), Some(1000), true, false);
         let i = Interest::decode(raw).unwrap();
         assert_eq!(i.nonce(), i.nonce());

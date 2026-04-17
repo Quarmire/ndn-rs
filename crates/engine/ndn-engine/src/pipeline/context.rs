@@ -22,35 +22,21 @@ pub enum DecodedPacket {
 /// a stage that short-circuits simply does not return the context,
 /// so Rust's ownership system prevents use-after-hand-off at compile time.
 pub struct PacketContext {
-    /// Wire-format bytes of the original packet.
     pub raw_bytes: Bytes,
-    /// Face the packet arrived on.
     pub face_id: FaceId,
-    /// Decoded name — hoisted to top level because every stage needs it.
     /// `None` until `TlvDecodeStage` runs.
     pub name: Option<Arc<Name>>,
-    /// Decoded packet — starts as `Raw`, transitions after TlvDecodeStage.
     pub packet: DecodedPacket,
-    /// Pre-computed cumulative name-prefix hashes.  Set by `TlvDecodeStage`
-    /// immediately after the name is known; used by PIT and FIB stages to
-    /// avoid re-hashing name components on every probe.
     pub name_hashes: Option<NameHashes>,
-    /// PIT token — written by PitCheckStage, `None` before that stage runs.
+    /// `None` before `PitCheckStage` runs.
     pub pit_token: Option<PitToken>,
-    /// NDNLPv2 PIT token (opaque, 1-32 bytes) from the incoming LP header.
-    /// Distinct from the internal `pit_token` hash — this is the wire-protocol
-    /// hop-by-hop token that must be echoed in Data/Nack responses.
+    /// NDNLPv2 hop-by-hop PIT token from the incoming LP header (distinct from
+    /// the internal `pit_token` hash).
     pub lp_pit_token: Option<Bytes>,
-    /// Faces selected for forwarding by the strategy stage.
     pub out_faces: SmallVec<[FaceId; 4]>,
-    /// Set to `true` by CsLookupStage on a cache hit.
     pub cs_hit: bool,
-    /// Set to `true` by the security validation stage.
     pub verified: bool,
-    /// Arrival time in nanoseconds since the Unix epoch (set by the face task).
     pub arrival: u64,
-    /// Escape hatch for inter-stage communication not covered by explicit fields.
-    /// Use sparingly; prefer explicit fields for anything the core pipeline touches.
     pub tags: AnyMap,
 }
 

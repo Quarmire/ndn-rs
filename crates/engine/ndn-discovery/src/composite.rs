@@ -14,39 +14,20 @@ use ndn_transport::FaceId;
 
 use crate::{DiscoveryContext, DiscoveryProtocol, InboundMeta, ProtocolId};
 
-/// Wrapper that runs multiple [`DiscoveryProtocol`] implementations in parallel.
+/// Runs multiple [`DiscoveryProtocol`] implementations in parallel.
 ///
-/// # Namespace safety
-///
-/// [`CompositeDiscovery::new`] returns an error if any two protocols claim
-/// overlapping name prefixes (one is a prefix of the other).  Each protocol
-/// must use a distinct sub-tree of `/ndn/local/`.
-///
-/// # Inbound routing
-///
-/// When a raw packet arrives, `CompositeDiscovery` tries to parse its top-level
-/// NDN name and routes it to the first protocol whose `claimed_prefixes` contains
-/// a matching prefix.  If the name cannot be parsed or no protocol matches, the
-/// packet is not consumed (returns `false`).
-///
-/// # Tick delivery
-///
-/// All protocols receive every `on_tick` call.  Order is not guaranteed.
+/// Validates at construction time that no two protocols claim overlapping
+/// name prefixes.  Routes inbound packets to the matching protocol by
+/// prefix; delivers lifecycle hooks to all protocols.
 pub struct CompositeDiscovery {
     protocols: Vec<Arc<dyn DiscoveryProtocol>>,
 }
 
 impl CompositeDiscovery {
-    /// Construct a composite from a list of protocols.
-    ///
-    /// Returns `Err` with a human-readable message if any two protocols claim
-    /// overlapping prefixes.
     pub fn new(protocols: Vec<Arc<dyn DiscoveryProtocol>>) -> Result<Self, String> {
-        // Collect all (prefix, protocol_id) pairs and check for overlaps.
         let mut all_prefixes: Vec<(Name, ProtocolId)> = Vec::new();
         for proto in &protocols {
             for prefix in proto.claimed_prefixes() {
-                // Check against all previously registered prefixes.
                 for (existing, existing_id) in &all_prefixes {
                     if prefixes_overlap(existing, prefix) {
                         return Err(format!(
@@ -64,7 +45,6 @@ impl CompositeDiscovery {
         Ok(Self { protocols })
     }
 
-    /// Number of contained protocols.
     pub fn len(&self) -> usize {
         self.protocols.len()
     }
@@ -73,12 +53,7 @@ impl CompositeDiscovery {
         self.protocols.is_empty()
     }
 
-    /// Collect all prefixes claimed by any child protocol.
-    ///
-    /// Unlike `claimed_prefixes()` (which returns the composite's own
-    /// top-level claims), this method flattens the claims of all children.
-    /// Use this to enumerate the full set of prefixes owned by the discovery
-    /// stack (e.g. for management security enforcement).
+    /// Flattened union of all child protocol prefixes.
     pub fn all_claimed_prefixes(&self) -> Vec<Name> {
         self.protocols
             .iter()
@@ -93,9 +68,6 @@ impl DiscoveryProtocol for CompositeDiscovery {
     }
 
     fn claimed_prefixes(&self) -> &[Name] {
-        // CompositeDiscovery doesn't claim additional prefixes beyond
-        // what its children claim — return empty here since children
-        // are already registered and checked.
         &[]
     }
 
@@ -118,7 +90,6 @@ impl DiscoveryProtocol for CompositeDiscovery {
         meta: &InboundMeta,
         ctx: &dyn DiscoveryContext,
     ) -> bool {
-        // Try to parse the packet name for prefix-based routing.
         if let Some(name) = parse_first_name(raw) {
             for proto in &self.protocols {
                 for prefix in proto.claimed_prefixes() {
@@ -127,11 +98,9 @@ impl DiscoveryProtocol for CompositeDiscovery {
                     }
                 }
             }
-            // Name parsed but no protocol claimed it — not consumed.
             return false;
         }
 
-        // Name parse failed — try all protocols in order (fallback).
         for proto in &self.protocols {
             if proto.on_inbound(raw, incoming_face, meta, ctx) {
                 return true;
@@ -147,46 +116,29 @@ impl DiscoveryProtocol for CompositeDiscovery {
     }
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-/// Returns true if `a` is a prefix of `b` or vice-versa (i.e. they overlap
-/// in the name tree).
 fn prefixes_overlap(a: &Name, b: &Name) -> bool {
     b.has_prefix(a) || a.has_prefix(b)
 }
 
-/// Try to parse the first NDN name out of a raw TLV packet.
-///
-/// NDN packet TLV: Interest (0x05) or Data (0x06), then a Name TLV (0x07)
-/// immediately as the first child.  This does a minimal parse — just enough
-/// to route the packet to the correct sub-protocol.
-///
-/// Bytes arrive LP-unwrapped from the pipeline (TlvDecodeStage strips LP
-/// before on_inbound is called), so no LP handling is needed here.
+/// Minimal parse: extract the NDN name from a raw Interest/Data TLV for
+/// prefix-based routing.  Expects LP-unwrapped bytes.
 fn parse_first_name(raw: &Bytes) -> Option<Name> {
-    // Require at least a 2-byte TLV header.
     if raw.len() < 4 {
         return None;
     }
     let pkt_type = raw[0];
     if pkt_type != 0x05 && pkt_type != 0x06 {
-        return None; // Not an Interest or Data
+        return None;
     }
-    // Skip packet type + length (variable-length varint).
     let (_, inner) = skip_tlv_header(raw)?;
-    // First child should be a Name TLV (type 0x07).
     if inner.is_empty() || inner[0] != 0x07 {
         return None;
     }
-    // inner begins with the Name TLV; skip its type+length to get just the
-    // component bytes that Name::decode expects.
     let (_, name_value) = skip_tlv_header(inner)?;
     let name_bytes = bytes::Bytes::copy_from_slice(name_value);
     Name::decode(name_bytes).ok()
 }
 
-/// Skip a TLV type+length prefix, returning a slice of the value bytes.
-/// Returns `(type, value_bytes)` or `None` on truncation.
 fn skip_tlv_header(buf: &[u8]) -> Option<(u8, &[u8])> {
     if buf.is_empty() {
         return None;
@@ -197,7 +149,6 @@ fn skip_tlv_header(buf: &[u8]) -> Option<(u8, &[u8])> {
     Some((t, buf.get(1 + hdr_size..end)?))
 }
 
-/// Read a minimal NDN TLV varint.  Returns `(value, bytes_consumed)`.
 fn read_varu(buf: &[u8]) -> Option<(usize, usize)> {
     match buf.first()? {
         b if *b < 253 => Some((*b as usize, 1)),
@@ -213,7 +164,7 @@ fn read_varu(buf: &[u8]) -> Option<(usize, usize)> {
             let b4 = *buf.get(4)? as usize;
             Some(((b1 << 24) | (b2 << 16) | (b3 << 8) | b4, 5))
         }
-        _ => None, // 8-byte form not needed for discovery packets
+        _ => None,
     }
 }
 
@@ -227,7 +178,6 @@ mod tests {
     use std::str::FromStr;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    // ── Helpers ───────────────────────────────────────────────────────────────
 
     /// Build a minimal, parseable Interest TLV for `name`.
     ///
@@ -306,7 +256,6 @@ mod tests {
         }
     }
 
-    // ── Construction tests ────────────────────────────────────────────────────
 
     #[test]
     fn no_overlap_is_ok() {
@@ -337,7 +286,6 @@ mod tests {
         assert!(CompositeDiscovery::new(vec![nd, nd2]).is_ok());
     }
 
-    // ── on_inbound routing tests ──────────────────────────────────────────────
 
     #[test]
     fn routes_to_matching_protocol() {

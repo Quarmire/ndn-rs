@@ -15,7 +15,6 @@ use crate::did::{
     encoding::name_to_did,
 };
 
-/// TLV type for GenericNameComponent.
 const GENERIC_NAME_COMPONENT: u64 = 8;
 const KEY_COMPONENT: &[u8] = b"KEY";
 
@@ -55,7 +54,6 @@ pub fn cert_to_did_document(cert: &Certificate, x25519_key: Option<&[u8]>) -> Di
         also_known_as: vec![],
     };
 
-    // Add X25519 key agreement VM if provided.
     if let Some(x25519_bytes) = x25519_key {
         let ka_id = format!("{did}#key-agreement-0");
         let ka_vm = VerificationMethod::x25519_jwk(&ka_id, &did, x25519_bytes);
@@ -63,7 +61,6 @@ pub fn cert_to_did_document(cert: &Certificate, x25519_key: Option<&[u8]>) -> Di
         doc.key_agreement.push(VerificationRef::Reference(ka_id));
     }
 
-    // Set also_known_as from issuer name if different from subject.
     if let Some(issuer) = &cert.issuer {
         let issuer_identity = strip_key_suffix(issuer.as_ref());
         let issuer_did = name_to_did(&issuer_identity);
@@ -168,9 +165,6 @@ pub fn did_document_to_trust_anchor(doc: &DidDocument, name: Arc<Name>) -> Optio
     })
 }
 
-/// Strip the `/KEY/<version>/<issuer>` suffix from a certificate name.
-///
-/// `/com/acme/alice/KEY/v=123/self` → `/com/acme/alice`
 pub(crate) fn strip_key_suffix(name: &Name) -> Name {
     let comps = name.components();
     let key_pos = comps
@@ -215,8 +209,6 @@ mod tests {
             sig_value: None,
         };
         let doc = cert_to_did_document(&cert, None);
-        // name_to_did always produces binary-encoded DIDs; verify the id round-trips
-        // back to the identity name rather than asserting the deprecated simple form.
         let identity_name: Name = "/com/acme/alice".parse().unwrap();
         let expected_did = crate::did::encoding::name_to_did(&identity_name);
         assert_eq!(doc.id, expected_did);
@@ -244,7 +236,6 @@ mod tests {
         let doc = cert_to_did_document(&cert, Some(&x25519));
         assert!(!doc.key_agreement.is_empty());
         assert_eq!(doc.verification_methods.len(), 2);
-        // The X25519 VM should have crv=X25519.
         let ka_vm = &doc.verification_methods[1];
         let crv = ka_vm
             .public_key_jwk

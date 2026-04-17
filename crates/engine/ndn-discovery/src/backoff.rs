@@ -1,28 +1,13 @@
 //! Exponential backoff with jitter for hello/probe scheduling.
-//!
-//! Used by neighbor discovery to schedule retransmits and probes without
-//! creating correlated bursts across multiple nodes (thundering-herd effect).
-//!
-//! The algorithm:
-//! 1. Start at `initial_interval`.
-//! 2. On each failure, double the interval (capped at `max_interval`).
-//! 3. Add uniform random jitter of ±`jitter_fraction` of the current interval.
-//! 4. On success, reset to `initial_interval`.
 
 use std::time::Duration;
 
 /// Static configuration for a backoff strategy.
-///
-/// Construct once and pass by reference; per-instance mutable state lives
-/// in [`BackoffState`].
 #[derive(Clone, Debug)]
 pub struct BackoffConfig {
-    /// Initial retry interval.
     pub initial_interval: Duration,
-    /// Maximum retry interval (backoff ceiling).
     pub max_interval: Duration,
-    /// Jitter fraction in [0.0, 1.0].  `0.25` means ±25 % of the current
-    /// interval is added as random noise.
+    /// Jitter fraction in [0.0, 1.0].
     pub jitter_fraction: f64,
 }
 
@@ -37,10 +22,6 @@ impl Default for BackoffConfig {
 }
 
 impl BackoffConfig {
-    /// Backoff profile suitable for link-local neighbor discovery hellos.
-    ///
-    /// Short initial interval for fast bootstrap; caps at 10 s to avoid
-    /// stale neighbor entries persisting too long.
     pub fn for_neighbor_hello() -> Self {
         Self {
             initial_interval: Duration::from_millis(500),
@@ -49,9 +30,6 @@ impl BackoffConfig {
         }
     }
 
-    /// Backoff profile for SWIM indirect probing.
-    ///
-    /// Shorter intervals to match SWIM's failure-detection SLA.
     pub fn for_swim_probe() -> Self {
         Self {
             initial_interval: Duration::from_millis(200),
@@ -62,9 +40,6 @@ impl BackoffConfig {
 }
 
 /// Per-instance mutable backoff state.
-///
-/// Carries the current interval and a lightweight pseudo-random seed
-/// so that no external RNG dependency is needed.
 #[derive(Clone, Debug)]
 pub struct BackoffState {
     current: Duration,
@@ -73,10 +48,6 @@ pub struct BackoffState {
 }
 
 impl BackoffState {
-    /// Create fresh state, seeded from the given value.
-    ///
-    /// Use a per-peer value (e.g. truncated FaceId or timestamp) as the seed
-    /// to decorrelate hellos across nodes.
     pub fn new(seed: u32) -> Self {
         Self {
             current: Duration::ZERO,
@@ -84,9 +55,6 @@ impl BackoffState {
         }
     }
 
-    /// Compute the next wait duration and update internal state.
-    ///
-    /// Call this after a *failed* probe to get the retry delay.
     pub fn next_failure(&mut self, cfg: &BackoffConfig) -> Duration {
         if self.current.is_zero() {
             self.current = cfg.initial_interval;
@@ -96,15 +64,10 @@ impl BackoffState {
         self.apply_jitter(cfg)
     }
 
-    /// Reset to the initial interval after a *successful* exchange.
-    ///
-    /// Clears the current interval so the next [`next_failure`] call
-    /// starts fresh from `cfg.initial_interval`.
     pub fn reset(&mut self, _cfg: &BackoffConfig) {
         self.current = Duration::ZERO;
     }
 
-    /// Current interval without modification (peek).
     pub fn current(&self) -> Duration {
         self.current
     }

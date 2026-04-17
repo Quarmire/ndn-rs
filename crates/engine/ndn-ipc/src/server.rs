@@ -2,14 +2,7 @@ use std::sync::Arc;
 
 use ndn_packet::Name;
 
-/// High-level NDN IPC server.
-///
-/// Generic over the face type `F` so it can work with any transport:
-/// - `AppFace` for in-process prefix handlers
-/// - `UnixFace` for cross-process server endpoints
-/// - A future `ShmFace` for zero-copy cross-process IPC
-///
-/// The prefix is the name under which this server handles incoming Interests.
+/// High-level NDN IPC server, generic over face type `F`.
 pub struct IpcServer<F> {
     face: Arc<F>,
     prefix: Name,

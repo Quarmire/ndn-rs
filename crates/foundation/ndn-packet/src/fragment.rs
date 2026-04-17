@@ -18,27 +18,14 @@ use ndn_tlv::TlvWriter;
 use crate::encode::nni;
 use crate::tlv_type;
 
-/// Default MTU for UDP faces (conservative for Ethernet + IP + UDP headers).
 pub const DEFAULT_UDP_MTU: usize = 1400;
-
-/// Default timeout for incomplete reassemblies.
 const DEFAULT_REASSEMBLY_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Overhead per fragment: LpPacket TLV envelope + Sequence(8) + FragIndex(max 4)
-/// + FragCount(max 4) + Fragment TLV header.  Conservative estimate.
+/// LpPacket TLV envelope + Sequence(8) + FragIndex(max 4) + FragCount(max 4)
+/// + Fragment TLV header. Conservative estimate.
 pub const FRAG_OVERHEAD: usize = 50;
 
 /// Fragment a network-layer packet into NDNLPv2 LpPacket fragments.
-///
-/// Each fragment is an independently-decodable LpPacket containing:
-/// - `Sequence` = `base_seq` (same for all fragments of one packet)
-/// - `FragIndex` = 0-based index
-/// - `FragCount` = total number of fragments
-/// - `Fragment` = the chunk of the original packet
-///
-/// If the packet fits in a single fragment, a single LpPacket is returned
-/// (still carrying the fragmentation fields, as required by NDNLPv2 when
-/// the sender uses fragmentation).
 ///
 /// # Panics
 ///
@@ -73,7 +60,6 @@ pub fn fragment_packet(packet: &[u8], mtu: usize, base_seq: u64) -> Vec<Bytes> {
     fragments
 }
 
-/// State for one in-progress reassembly.
 struct Pending {
     fragments: Vec<Option<Bytes>>,
     frag_count: usize,
@@ -82,9 +68,6 @@ struct Pending {
 }
 
 /// Per-peer reassembly buffer for NDNLPv2 fragments.
-///
-/// Tracks incomplete reassemblies keyed by sequence number.  When all fragments
-/// of a packet arrive, `process()` returns the reassembled packet.
 pub struct ReassemblyBuffer {
     pending: HashMap<u64, Pending>,
     timeout: Duration,
@@ -98,11 +81,7 @@ impl ReassemblyBuffer {
         }
     }
 
-    /// Feed a decoded LpPacket fragment.
-    ///
-    /// Returns `Some(complete_packet)` when all fragments of the original
-    /// packet have been received.  Returns `None` if fragments are still
-    /// missing or if the packet has no fragmentation fields.
+    /// Returns `Some(complete_packet)` when all fragments have arrived.
     pub fn process(
         &mut self,
         seq: u64,
@@ -124,12 +103,10 @@ impl ReassemblyBuffer {
             created: Instant::now(),
         });
 
-        // Validate consistency.
         if entry.frag_count != count || idx >= entry.frag_count {
             return None;
         }
 
-        // Don't double-count duplicates.
         if entry.fragments[idx].is_none() {
             entry.received += 1;
         }
@@ -152,13 +129,11 @@ impl ReassemblyBuffer {
         }
     }
 
-    /// Drop incomplete reassemblies older than the configured timeout.
     pub fn purge_expired(&mut self) {
         let timeout = self.timeout;
         self.pending.retain(|_, v| v.created.elapsed() < timeout);
     }
 
-    /// Number of in-progress reassemblies.
     pub fn pending_count(&self) -> usize {
         self.pending.len()
     }
@@ -180,7 +155,6 @@ mod tests {
         let frags = fragment_packet(&data, DEFAULT_UDP_MTU, 100);
         assert_eq!(frags.len(), 1);
 
-        // Decode the LpPacket and check fields.
         let lp = crate::lp::LpPacket::decode(frags[0].clone()).unwrap();
         assert_eq!(lp.sequence, Some(100));
         assert_eq!(lp.frag_index, Some(0));
@@ -199,12 +173,10 @@ mod tests {
             frags.len()
         );
 
-        // Reassemble using base_seq = sequence - frag_index.
         let mut buf = ReassemblyBuffer::default();
         let mut result = None;
         for (i, frag_bytes) in frags.iter().enumerate() {
             let lp = crate::lp::LpPacket::decode(frag_bytes.clone()).unwrap();
-            // Per-fragment unique sequence: base_seq + i.
             assert_eq!(lp.sequence, Some(42 + i as u64));
             assert!(lp.is_fragmented());
 
@@ -222,7 +194,6 @@ mod tests {
         assert_eq!(buf.pending_count(), 0);
     }
 
-    /// Helper: compute base_seq from per-fragment unique sequence.
     fn base_seq(lp: &crate::lp::LpPacket) -> u64 {
         lp.sequence.unwrap() - lp.frag_index.unwrap()
     }
@@ -233,7 +204,6 @@ mod tests {
         let frags = fragment_packet(&data, 200, 7);
         assert!(frags.len() > 2);
 
-        // Feed in reverse order.
         let mut buf = ReassemblyBuffer::default();
         let mut result = None;
         for frag_bytes in frags.iter().rev() {
@@ -256,7 +226,6 @@ mod tests {
         let frags = fragment_packet(&data, 200, 1);
 
         let mut buf = ReassemblyBuffer::default();
-        // Feed all fragments, then re-feed the first one.
         for frag_bytes in &frags[..frags.len() - 1] {
             let lp = crate::lp::LpPacket::decode(frag_bytes.clone()).unwrap();
             let r = buf.process(
@@ -267,7 +236,6 @@ mod tests {
             );
             assert!(r.is_none());
         }
-        // Duplicate of first fragment.
         let lp0 = crate::lp::LpPacket::decode(frags[0].clone()).unwrap();
         let r = buf.process(
             base_seq(&lp0),
@@ -277,7 +245,6 @@ mod tests {
         );
         assert!(r.is_none());
 
-        // Now feed the last fragment to complete.
         let lp_last = crate::lp::LpPacket::decode(frags.last().unwrap().clone()).unwrap();
         let r = buf.process(
             base_seq(&lp_last),
@@ -294,7 +261,6 @@ mod tests {
         let frags = fragment_packet(&data, 200, 1);
 
         let mut buf = ReassemblyBuffer::new(Duration::from_millis(0));
-        // Feed only the first fragment.
         let lp = crate::lp::LpPacket::decode(frags[0].clone()).unwrap();
         buf.process(
             base_seq(&lp),
@@ -304,7 +270,6 @@ mod tests {
         );
         assert_eq!(buf.pending_count(), 1);
 
-        // Purge — timeout is 0ms so everything is expired.
         buf.purge_expired();
         assert_eq!(buf.pending_count(), 0);
     }

@@ -33,8 +33,6 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use ndn_transport::{FaceId, FaceKind, StreamFace, TlvCodec};
 
-// ─── Type alias ──────────────────────────────────────────────────────────────
-
 type DynRead = Box<dyn AsyncRead + Send + Sync + Unpin>;
 type DynWrite = Box<dyn AsyncWrite + Send + Sync + Unpin>;
 
@@ -44,13 +42,9 @@ type DynWrite = Box<dyn AsyncWrite + Send + Sync + Unpin>;
 /// The concrete type is the same on all platforms.
 pub type IpcFace = StreamFace<DynRead, DynWrite, TlvCodec>;
 
-// ─── Shared helpers ──────────────────────────────────────────────────────────
-
 fn make_face(id: FaceId, kind: FaceKind, uri: String, r: DynRead, w: DynWrite) -> IpcFace {
     StreamFace::new(id, kind, false, None, Some(uri), r, w, TlvCodec)
 }
-
-// ─── IpcListener ─────────────────────────────────────────────────────────────
 
 /// Listens for IPC connections on the management socket path.
 ///
@@ -66,33 +60,25 @@ pub struct IpcListener {
 }
 
 impl IpcListener {
-    /// Bind to `path` and start listening.
     pub fn bind(path: &str) -> io::Result<Self> {
         Ok(Self {
             inner: PlatformListener::bind(path)?,
         })
     }
 
-    /// Accept the next connection.
-    ///
-    /// Returns an `IpcFace` tagged [`FaceKind::Management`].
     pub async fn accept(&self, face_id: FaceId) -> io::Result<IpcFace> {
         let (r, w, uri) = self.inner.accept().await?;
         Ok(make_face(face_id, FaceKind::Management, uri, r, w))
     }
 
-    /// Remove the socket file (Unix) or perform platform cleanup.
     pub fn cleanup(&self) {
         self.inner.cleanup();
     }
 
-    /// Human-readable URI for logging (e.g. `unix:///run/nfd/nfd.sock`).
     pub fn uri(&self) -> &str {
         self.inner.uri()
     }
 }
-
-// ─── Client connect ──────────────────────────────────────────────────────────
 
 /// Connect to the IPC socket at `path` and return an [`IpcFace`].
 ///
@@ -103,8 +89,6 @@ pub async fn ipc_face_connect(id: FaceId, path: &str) -> io::Result<IpcFace> {
     Ok(make_face(id, FaceKind::Unix, uri, r, w))
 }
 
-// ─── Unix implementation ─────────────────────────────────────────────────────
-
 #[cfg(unix)]
 struct PlatformListener {
     listener: tokio::net::UnixListener,
@@ -114,7 +98,6 @@ struct PlatformListener {
 #[cfg(unix)]
 impl PlatformListener {
     fn bind(path: &str) -> io::Result<Self> {
-        // Create parent directory if it doesn't exist (e.g. /run/nfd/ for /run/nfd/nfd.sock).
         if let Some(parent) = std::path::Path::new(path).parent()
             && !parent.as_os_str().is_empty()
         {
@@ -152,13 +135,9 @@ async fn platform_connect(path: &str) -> io::Result<(DynRead, DynWrite, String)>
     Ok((Box::new(r), Box::new(w), uri))
 }
 
-// ─── Windows Named Pipe implementation ───────────────────────────────────────
-
 #[cfg(windows)]
 struct PlatformListener {
     path: String,
-    /// True until the first accept() call — creates the pipe with
-    /// FILE_FLAG_FIRST_PIPE_INSTANCE so only one process can own this name.
     first: std::sync::atomic::AtomicBool,
 }
 
@@ -184,8 +163,6 @@ impl PlatformListener {
         use std::sync::atomic::Ordering;
         use tokio::net::windows::named_pipe::ServerOptions;
 
-        // first_pipe_instance(true) on the very first server instance ensures
-        // only one process can own this pipe name (prevents hijacking).
         let first = self.first.swap(false, Ordering::AcqRel);
         let server = ServerOptions::new()
             .first_pipe_instance(first)
@@ -200,9 +177,8 @@ impl PlatformListener {
         Ok((Box::new(r), Box::new(w), uri))
     }
 
-    fn cleanup(&self) {
-        // Named pipes are cleaned up automatically when all handles are closed.
-    }
+    fn cleanup(&self) {}
+
 
     fn uri(&self) -> &str {
         &self.path
@@ -213,13 +189,11 @@ impl PlatformListener {
 async fn platform_connect(path: &str) -> io::Result<(DynRead, DynWrite, String)> {
     use tokio::net::windows::named_pipe::ClientOptions;
 
-    // Named pipe client open is synchronous on Windows.  ERROR_PIPE_BUSY (231)
-    // means all server instances are currently handling a connection — retry.
+    // ERROR_PIPE_BUSY (231): all server instances busy — retry.
     let client = loop {
         match ClientOptions::new().open(path) {
             Ok(c) => break c,
             Err(e) if e.raw_os_error() == Some(231) => {
-                // All server instances busy; wait briefly and retry.
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
             Err(e) => return Err(e),
@@ -230,8 +204,6 @@ async fn platform_connect(path: &str) -> io::Result<(DynRead, DynWrite, String)>
     let uri = format!("pipe://{path}");
     Ok((Box::new(r), Box::new(w), uri))
 }
-
-// ─── Unsupported platforms ────────────────────────────────────────────────────
 
 #[cfg(not(any(unix, windows)))]
 compile_error!(

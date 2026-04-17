@@ -57,14 +57,12 @@ use ndn_transport::MacAddr;
 
 use crate::NDN_ETHERTYPE;
 
-// ─── Ethernet constants ───────────────────────────────────────────────────────
 
 /// NDN Ethernet multicast MAC: `01:00:5e:00:17:aa`
 pub const NDN_ETHER_MCAST_MAC: MacAddr = MacAddr([0x01, 0x00, 0x5E, 0x00, 0x17, 0xAA]);
 /// Ethernet header: dst(6) + src(6) + EtherType(2).
 const ETHER_HEADER_LEN: usize = 14;
 
-// ─── MAC address lookup ───────────────────────────────────────────────────────
 
 /// Return the MAC address of the named adapter via `GetAdaptersAddresses`.
 ///
@@ -155,7 +153,6 @@ fn wide_eq(ptr: *const u16, s: &str) -> bool {
     unsafe { *ptr.add(wide.len()) == 0 }
 }
 
-// ─── PcapSocket ───────────────────────────────────────────────────────────────
 
 /// Async-capable pcap socket bound to a specific Ethernet interface.
 ///
@@ -277,7 +274,6 @@ impl PcapSocket {
     }
 }
 
-// ─── Background thread loops ──────────────────────────────────────────────────
 
 fn recv_loop(mut cap: Capture<pcap::Active>, tx: mpsc::Sender<(Bytes, MacAddr)>) {
     loop {
@@ -305,13 +301,11 @@ fn send_loop(mut cap: Capture<pcap::Active>, mut rx: mpsc::UnboundedReceiver<Vec
     }
 }
 
-// ─── Error conversion ─────────────────────────────────────────────────────────
 
 fn pcap_err(e: pcap::Error) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
 }
 
-// ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

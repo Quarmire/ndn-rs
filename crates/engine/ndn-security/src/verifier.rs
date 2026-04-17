@@ -5,15 +5,12 @@ use crate::TrustError;
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// Outcome of a signature verification attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VerifyOutcome {
     Valid,
-    /// Signature is cryptographically invalid.
     Invalid,
 }
 
-/// Verifies a signature against a public key.
 pub trait Verifier: Send + Sync + 'static {
     fn verify<'a>(
         &'a self,
@@ -23,11 +20,9 @@ pub trait Verifier: Send + Sync + 'static {
     ) -> BoxFuture<'a, Result<VerifyOutcome, TrustError>>;
 }
 
-/// Ed25519 verifier.
 pub struct Ed25519Verifier;
 
 impl Ed25519Verifier {
-    /// Synchronous Ed25519 verification — avoids boxing a Future for CPU-only work.
     pub fn verify_sync(&self, region: &[u8], sig_value: &[u8], public_key: &[u8]) -> VerifyOutcome {
         use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
 
@@ -75,30 +70,8 @@ impl Verifier for Ed25519Verifier {
     }
 }
 
-// ─── Batch Ed25519 verification ────────────────────────────────────────────
-//
-// For a forwarder or consumer ingesting many independent Ed25519
-// signatures at once (sync snapshot, batched Interest set, a fetch
-// of N segment Data packets), verifying them **together** via
-// `ed25519_dalek::verify_batch` is ~2–3× faster than N separate
-// `verify()` calls. The technique combines the N verification
-// equations into one big check using random coefficients — if every
-// signature is valid the batch passes in one shot; if any is invalid
-// the batch fails and you don't know which one (fallback is to
-// re-verify individually).
-
-/// Batch-verify a homogeneous slice of Ed25519 signatures. All three
-/// inputs must have the same length. Returns `Ok(())` if every
-/// signature is valid under its paired `(message, public_key)`; any
-/// single invalid signature causes the whole batch to fail with
-/// [`VerifyOutcome::Invalid`] (you then have to fall back to
-/// per-signature verify to find the culprit).
-///
-/// For a homogeneous-message workload (all messages identical — e.g.
-/// SVS sync state blobs in a group), callers can pass the same
-/// `&[u8]` multiple times in `messages` and still get the batch
-/// speedup because `ed25519_dalek::verify_batch` is message-by-
-/// reference.
+/// Batch-verify Ed25519 signatures (~2-3x faster than individual verify).
+/// Any single invalid signature fails the whole batch.
 pub fn ed25519_verify_batch(
     messages: &[&[u8]],
     signatures: &[&[u8; 64]],
@@ -114,8 +87,6 @@ pub fn ed25519_verify_batch(
         return Ok(VerifyOutcome::Valid); // vacuous truth
     }
 
-    // Decode signatures into `ed25519_dalek::Signature` objects.
-    // `Signature::from_bytes` is infallible for `[u8; 64]` inputs.
     let sigs: Vec<Signature> = signatures
         .iter()
         .map(|s| Signature::from_bytes(s))

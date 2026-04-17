@@ -61,17 +61,14 @@ impl ZoneKey {
         &self.zone_root
     }
 
-    /// The raw 32-byte Ed25519 verifying (public) key.
     pub fn public_key_bytes(&self) -> &[u8; 32] {
         &self.pub_key_bytes
     }
 
-    /// The signer — can be used with `DataBuilder::sign()` or `SignWith`.
     pub fn signer(&self) -> &Ed25519Signer {
         &self.signer
     }
 
-    /// Returns an `Arc<dyn Signer>` suitable for storage in a `KeyStore`.
     pub fn into_arc_signer(self) -> Arc<dyn Signer> {
         Arc::new(self.signer)
     }
@@ -94,7 +91,6 @@ impl ZoneKey {
         zone_root_to_did(&self.zone_root)
     }
 
-    /// Verify that a name is a direct child of this zone (has zone root as prefix).
     pub fn is_zone_child(&self, name: &Name) -> bool {
         let zc = self.zone_root.components();
         let nc = name.components();
@@ -102,21 +98,15 @@ impl ZoneKey {
     }
 }
 
-/// Compute the zone root name for a given Ed25519 verifying key.
-///
-/// The name is a single BLAKE3_DIGEST component containing
-/// `blake3(public_key_bytes)`.
 pub fn zone_root_from_pubkey(public_key_bytes: &[u8]) -> Name {
     let hash = blake3::hash(public_key_bytes);
     Name::zone_root_from_hash(*hash.as_bytes())
 }
 
-/// Convert a zone root name to its `did:ndn` DID string representation.
 pub fn zone_root_to_did(zone_root: &Name) -> String {
     crate::did::name_to_did(zone_root)
 }
 
-/// Verify that a given zone root name matches the expected public key.
 pub fn verify_zone_root(zone_root: &Name, public_key_bytes: &[u8]) -> bool {
     let expected = zone_root_from_pubkey(public_key_bytes);
     zone_root == &expected

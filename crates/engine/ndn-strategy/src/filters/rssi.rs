@@ -4,20 +4,13 @@ use crate::filter::StrategyFilter;
 use ndn_transport::ForwardingAction;
 use smallvec::SmallVec;
 
-/// Removes faces with RSSI below a configurable threshold from `Forward` actions.
-///
-/// If all faces in a `Forward` are filtered out, the action is dropped entirely
-/// so the strategy falls through to the next action (typically `Nack` or `Suppress`).
-///
-/// When no `LinkQualitySnapshot` is present in the extensions (e.g. on wired-only
-/// routers), the filter is a no-op — all actions pass through unchanged.
+/// Removes faces with RSSI below a threshold from `Forward` actions.
+/// No-op when no `LinkQualitySnapshot` is present in extensions.
 pub struct RssiFilter {
-    /// Minimum RSSI in dBm. Faces below this threshold are removed.
     pub min_rssi_dbm: i8,
 }
 
 impl RssiFilter {
-    /// Create a filter that drops faces with RSSI below `min_rssi_dbm`.
     pub fn new(min_rssi_dbm: i8) -> Self {
         Self { min_rssi_dbm }
     }
@@ -35,7 +28,7 @@ impl StrategyFilter for RssiFilter {
     ) -> SmallVec<[ForwardingAction; 2]> {
         let snapshot = match ctx.extensions.get::<LinkQualitySnapshot>() {
             Some(s) => s,
-            None => return actions, // no radio data — pass through
+            None => return actions,
         };
 
         actions
@@ -53,7 +46,7 @@ impl StrategyFilter for RssiFilter {
                             })
                             .collect();
                         if filtered.is_empty() {
-                            None // all faces filtered out — drop this action
+                            None
                         } else {
                             Some(ForwardingAction::Forward(filtered))
                         }

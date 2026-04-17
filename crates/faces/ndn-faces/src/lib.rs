@@ -40,8 +40,6 @@ pub mod serial;
 #[cfg(feature = "l2")]
 pub mod l2;
 
-// ── Crate-root re-exports ────────────────────────────────────────────────────
-
 #[cfg(feature = "net")]
 pub use ndn_packet::fragment::DEFAULT_UDP_MTU;
 #[cfg(feature = "net")]

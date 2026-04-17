@@ -11,20 +11,11 @@ use crate::{
     signer::{Ed25519Signer, Signer},
 };
 
-/// High-level NDN security manager.
-///
-/// Owns a key store and certificate cache, and provides operations for:
-/// - Key pair generation
-/// - Self-signed certificate issuance (trust-anchor certificates)
-/// - Certificate issuance (signing a key Data packet with another key)
-/// - Trust anchor registration
-/// - Retrieving a signer for a key name
-///
-/// For production use, replace `MemKeyStore` with a file-backed store.
+/// Owns a key store and certificate cache, providing key generation,
+/// certificate issuance, and trust anchor management.
 pub struct SecurityManager {
     keys: MemKeyStore,
     cert_cache: CertCache,
-    /// Trust anchors — self-signed certs that are implicitly trusted.
     anchors: dashmap::DashMap<Arc<Name>, Certificate>,
 }
 
@@ -37,13 +28,9 @@ impl SecurityManager {
         }
     }
 
-    /// Generate a new Ed25519 key pair using a cryptographically random seed
-    /// and store it in the in-memory key store.
+    /// Generate a new Ed25519 key pair from a random seed and store it.
     ///
-    /// `key_name` should follow NDN key naming convention:
-    /// `/<identity>/KEY/<key-id>`.
-    ///
-    /// Returns the key name on success.
+    /// `key_name` should follow `/<identity>/KEY/<key-id>`.
     pub fn generate_ed25519(&self, key_name: Name) -> Result<Name, TrustError> {
         use ring::rand::{SecureRandom, SystemRandom};
         let rng = SystemRandom::new();
@@ -55,7 +42,6 @@ impl SecurityManager {
         Ok(key_name)
     }
 
-    /// Generate a new Ed25519 key from explicit raw seed bytes (for testing).
     pub fn generate_ed25519_from_seed(
         &self,
         key_name: Name,
@@ -66,10 +52,9 @@ impl SecurityManager {
         Ok(key_name)
     }
 
-    /// Issue a self-signed certificate (trust anchor).
+    /// Issue a self-signed certificate and register it as a trust anchor.
     ///
-    /// The certificate is inserted into both the cert cache and the anchor set.
-    /// `validity_ms` is the certificate lifetime in milliseconds; pass `u64::MAX`
+    /// `validity_ms` is the certificate lifetime in milliseconds; `u64::MAX`
     /// for non-expiring anchors.
     pub fn issue_self_signed(
         &self,
@@ -100,11 +85,8 @@ impl SecurityManager {
 
     /// Issue a certificate for `subject_key` signed by `issuer_key`.
     ///
-    /// Both keys must already exist in the key store. The issuer signs a
-    /// complete NDN certificate Data packet (TLV-encoded) whose Content
-    /// carries the subject's public key and validity period. The resulting
-    /// `Certificate` is stored in the cert cache; the full wire-format Data
-    /// packet is stored in `Certificate::wire`.
+    /// Both keys must already exist in the key store. The resulting
+    /// `Certificate` is stored in the cert cache.
     pub async fn certify(
         &self,
         subject_key_name: &Name,
@@ -117,7 +99,6 @@ impl SecurityManager {
         let now_ns = now_ns();
         let valid_until = now_ns + validity_ms * 1_000_000;
 
-        // Encode and sign the full certificate Data packet.
         let _wire = encode_cert_data(
             subject_key_name,
             &subject_public_key,
@@ -140,13 +121,11 @@ impl SecurityManager {
         Ok(cert)
     }
 
-    /// Register a pre-existing certificate as a trust anchor.
     pub fn add_trust_anchor(&self, cert: Certificate) {
         self.anchors.insert(Arc::clone(&cert.name), cert.clone());
         self.cert_cache.insert(cert);
     }
 
-    /// Look up a trust anchor by key name.
     pub fn trust_anchor(&self, key_name: &Name) -> Option<Certificate> {
         self.anchors
             .iter()
@@ -154,48 +133,37 @@ impl SecurityManager {
             .map(|r| r.value().clone())
     }
 
-    /// List all trust anchor names.
     pub fn trust_anchor_names(&self) -> Vec<Arc<Name>> {
         self.anchors.iter().map(|r| Arc::clone(r.key())).collect()
     }
 
-    /// Retrieve a signer for the given key name.
     pub async fn get_signer(&self, key_name: &Name) -> Result<Arc<dyn Signer>, TrustError> {
         use crate::key_store::KeyStore;
         self.keys.get_signer(key_name).await
     }
 
-    /// Retrieve a signer synchronously (for use in non-async contexts).
     pub fn get_signer_sync(&self, key_name: &Name) -> Result<Arc<dyn Signer>, TrustError> {
         self.keys.get_signer_sync(key_name)
     }
 
-    /// Access the certificate cache (e.g., to pass to a `Validator`).
     pub fn cert_cache(&self) -> &CertCache {
         &self.cert_cache
     }
 
-    /// Build a `SecurityManager` by loading an identity from a [`FilePib`].
-    ///
-    /// - Loads the signing key for `identity` from the PIB.
-    /// - If a certificate is present for that identity, inserts it into the
-    ///   cert cache.
-    /// - Loads all trust anchors stored in the PIB.
+    /// Load an identity from a [`FilePib`], including its signing key,
+    /// certificate, and trust anchors.
     ///
     /// [`FilePib`]: crate::pib::FilePib
     pub fn from_pib(pib: &crate::pib::FilePib, identity: &Name) -> Result<Self, TrustError> {
         let mgr = SecurityManager::new();
 
-        // Load the signing key.
         let signer = pib.get_signer(identity)?;
         mgr.keys.add(Arc::new(identity.clone()), signer);
 
-        // Load the identity's certificate if present.
         if let Ok(cert) = pib.get_cert(identity) {
             mgr.cert_cache.insert(cert);
         }
 
-        // Load all trust anchors.
         for anchor in pib.trust_anchors()? {
             mgr.add_trust_anchor(anchor);
         }
@@ -203,21 +171,17 @@ impl SecurityManager {
         Ok(mgr)
     }
 
-    /// Auto-initialize security state from a PIB directory.
+    /// Auto-initialize from a PIB directory: generates a new Ed25519
+    /// identity if none exists, otherwise loads the first one found.
     ///
-    /// If the PIB has no keys, generates a new Ed25519 identity with a
-    /// self-signed certificate and stores it. If keys already exist,
-    /// loads the first identity found.
-    ///
-    /// Returns `(SecurityManager, bool)` where the bool is `true` if a
-    /// new identity was generated (useful for logging).
+    /// Returns `(SecurityManager, bool)` where `true` means a new
+    /// identity was generated.
     pub fn auto_init(
         identity: &Name,
         pib_path: &std::path::Path,
     ) -> Result<(Self, bool), TrustError> {
         use crate::pib::FilePib;
 
-        // Open or create the PIB.
         let pib = if pib_path.exists() {
             FilePib::open(pib_path)?
         } else {
@@ -226,17 +190,14 @@ impl SecurityManager {
 
         let existing_keys = pib.list_keys()?;
         if !existing_keys.is_empty() {
-            // Load the first existing identity.
             let key_name = &existing_keys[0];
             let mgr = SecurityManager::from_pib(&pib, key_name)?;
             return Ok((mgr, false));
         }
 
-        // No keys — generate a new identity.
         let key_name = append_key_component(identity);
         let signer = pib.generate_ed25519(&key_name)?;
 
-        // Self-signed certificate: 1 year validity.
         let pk = Bytes::copy_from_slice(&signer.public_key_bytes());
         let now_ns = now_ns();
         let one_year_ns = 365 * 24 * 3600 * 1_000_000_000u64;
@@ -245,7 +206,7 @@ impl SecurityManager {
             public_key: pk,
             valid_from: now_ns,
             valid_until: now_ns.saturating_add(one_year_ns),
-            issuer: Some(Arc::new(key_name.clone())), // self-signed
+            issuer: Some(Arc::new(key_name.clone())),
             signed_region: None,
             sig_value: None,
         };
@@ -272,17 +233,10 @@ impl Default for SecurityManager {
     }
 }
 
-/// Encode the signed region of an NDN certificate Data packet and sign it.
+/// Encode and sign a full NDN certificate Data packet.
 ///
-/// An NDN certificate is a regular Data packet whose:
-/// - Name follows the NDN key naming convention
-/// - Content is the subject's public key bytes
-/// - SignatureInfo contains `SignatureEd25519` and a `KeyLocator` pointing
-///   to the issuer's key name
-/// - SignatureValue is the Ed25519 signature over the signed region
-///   (Name through end of SignatureInfo)
-///
-/// Returns the full wire-format Data packet as `Bytes`.
+/// An NDN certificate is a Data packet whose Content carries the subject's
+/// public key and validity period, signed by the issuer.
 async fn encode_cert_data(
     subject_key_name: &Name,
     subject_public_key: &[u8],
@@ -290,57 +244,44 @@ async fn encode_cert_data(
     valid_from_ns: u64,
     valid_until_ns: u64,
 ) -> Result<Bytes, TrustError> {
-    // Build the signed region: Name + MetaInfo + Content + SignatureInfo.
     let mut signed = TlvWriter::new();
 
-    // Name
     write_name(&mut signed, subject_key_name);
 
-    // MetaInfo: ContentType = KEY (2), FreshnessPeriod = 3600000 ms (1 h)
+    // ContentType = KEY (2), FreshnessPeriod = 1 hour.
     signed.write_nested(tlv_type::META_INFO, |w| {
         w.write_tlv(tlv_type::CONTENT_TYPE, &2u64.to_be_bytes());
         w.write_tlv(tlv_type::FRESHNESS_PERIOD, &3_600_000u64.to_be_bytes());
     });
 
-    // Content: raw public key bytes + validity period
     signed.write_nested(tlv_type::CONTENT, |w| {
-        w.write_tlv(0x00, subject_public_key); // raw key material
-
-        // Validity period sub-TLV
+        w.write_tlv(0x00, subject_public_key);
         w.write_nested(tlv_type::VALIDITY_PERIOD, |w| {
             w.write_tlv(tlv_type::NOT_BEFORE, &valid_from_ns.to_be_bytes());
             w.write_tlv(tlv_type::NOT_AFTER, &valid_until_ns.to_be_bytes());
         });
     });
 
-    // SignatureInfo
     let sig_type_code = issuer_signer.sig_type().code();
     signed.write_nested(tlv_type::SIGNATURE_INFO, |w| {
         w.write_tlv(tlv_type::SIGNATURE_TYPE, &[sig_type_code as u8]);
-        // KeyLocator: issuer key name
         w.write_nested(tlv_type::KEY_LOCATOR, |w| {
             write_name(w, issuer_signer.key_name());
         });
     });
 
     let signed_region = signed.finish();
-
-    // Sign the region.
     let signature = issuer_signer.sign(&signed_region).await?;
 
-    // Wrap everything in the outer Data TLV.
     let mut outer = TlvWriter::new();
     outer.write_nested(tlv_type::DATA, |w| {
-        // Write signed region verbatim.
         w.write_raw(&signed_region);
-        // SignatureValue
         w.write_tlv(tlv_type::SIGNATURE_VALUE, &signature);
     });
 
     Ok(outer.finish())
 }
 
-/// Write a `Name` TLV into a writer.
 fn write_name(w: &mut TlvWriter, name: &Name) {
     w.write_nested(tlv_type::NAME, |w| {
         for comp in name.components() {
@@ -452,13 +393,11 @@ mod tests {
     async fn certify_produces_signed_cert() {
         let mgr = SecurityManager::new();
 
-        // Generate issuer (CA) key.
         let ca_name = key_name("ca");
         let ca_seed = [1u8; 32];
         mgr.generate_ed25519_from_seed(ca_name.clone(), &ca_seed)
             .unwrap();
 
-        // Generate subject key.
         let subj_name = key_name("subject");
         let subj_seed = [2u8; 32];
         mgr.generate_ed25519_from_seed(subj_name.clone(), &subj_seed)
@@ -469,7 +408,6 @@ mod tests {
                 .public_key_bytes(),
         );
 
-        // Issue certificate.
         let cert = mgr
             .certify(&subj_name, subj_pk.clone(), &ca_name, 60_000)
             .await
@@ -479,7 +417,6 @@ mod tests {
         assert_eq!(cert.public_key, subj_pk);
         assert!(cert.valid_until > cert.valid_from);
 
-        // Certificate should be in the cache.
         assert!(mgr.cert_cache().get(&Arc::new(subj_name)).is_some());
     }
 
@@ -505,7 +442,6 @@ mod tests {
         assert!(generated);
         assert!(!mgr.trust_anchor_names().is_empty());
 
-        // Second call should load existing, not regenerate.
         let (_mgr2, generated2) = SecurityManager::auto_init(&identity, &pib_path).unwrap();
         assert!(!generated2);
     }

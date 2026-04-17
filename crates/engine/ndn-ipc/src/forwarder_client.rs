@@ -62,9 +62,7 @@ pub enum ForwarderError {
     Shm(#[from] ndn_faces::local::ShmError),
 }
 
-/// Data plane transport — either SHM (preferred) or reuse the control UnixFace.
 enum DataTransport {
-    /// High-performance shared-memory data plane.
     #[cfg(all(
         unix,
         not(any(target_os = "android", target_os = "ios")),
@@ -74,34 +72,25 @@ enum DataTransport {
         handle: ndn_faces::local::shm::spsc::SpscHandle,
         face_id: u64,
     },
-    /// Fallback: reuse the control UnixFace for data.
     Unix,
 }
 
-/// Client for connecting to and communicating with a running `ndn-fwd` forwarder.
 pub struct ForwarderClient {
-    /// Control channel (Unix domain socket on Unix, Named Pipe on Windows).
     control: Arc<IpcFace>,
-    /// Typed management API — shares the control face.
     pub mgmt: crate::mgmt_client::MgmtClient,
-    /// Mutex for serialising recv on the control face (Unix data path).
     recv_lock: Mutex<()>,
-    /// Data transport — SHM or reuse control face.
     transport: DataTransport,
     /// Cancelled when the router control face disconnects.
     /// Propagates to SHM handle so recv/send abort promptly.
     cancel: CancellationToken,
-    /// Set when the control face health monitor detects disconnection.
     dead: Arc<AtomicBool>,
-    /// Guards single-start of the disconnect monitor (0 = not started, 1 = started).
     monitor_started: AtomicU8,
 }
 
 impl ForwarderClient {
     /// Connect to the router's face socket.
     ///
-    /// Automatically attempts SHM data plane with an auto-generated name;
-    /// falls back to Unix socket if SHM is unavailable or fails.
+    /// Attempts SHM data plane; falls back to Unix socket on failure.
     pub async fn connect(face_socket: impl AsRef<Path>) -> Result<Self, ForwarderError> {
         Self::connect_with_mtu(face_socket, None).await
     }
@@ -142,7 +131,6 @@ impl ForwarderClient {
         let cancel = CancellationToken::new();
         let dead = Arc::new(AtomicBool::new(false));
 
-        // Try SHM data plane if a name is provided.
         #[cfg(all(
             unix,
             not(any(target_os = "android", target_os = "ios")),
@@ -180,7 +168,6 @@ impl ForwarderClient {
         })
     }
 
-    /// Set up SHM data plane by sending `faces/create` to the router.
     #[cfg(all(
         unix,
         not(any(target_os = "android", target_os = "ios")),
@@ -198,7 +185,6 @@ impl ForwarderClient {
             .await?;
         let face_id = resp.face_id.ok_or(ForwarderError::MalformedResponse)?;
 
-        // Connect the app-side SHM handle with cancellation from control face.
         let mut handle = ndn_faces::local::shm::spsc::SpscHandle::connect(shm_name)?;
         handle.set_cancel(cancel);
 
@@ -207,9 +193,8 @@ impl ForwarderClient {
 
     /// Register a prefix with the router via `rib/register`.
     pub async fn register_prefix(&self, prefix: &Name) -> Result<(), ForwarderError> {
-        // In SHM mode, route traffic to the SHM face.  In Unix mode pass None
-        // so the router uses the requesting face — passing 0 would create a
-        // FIB entry for a non-existent face, silently dropping all packets.
+        // SHM mode: route to the SHM face. Unix mode: None lets the router
+        // default to the requesting face (passing 0 would silently black-hole).
         let face_id = self.shm_face_id();
         let resp = self.mgmt.route_add(prefix, face_id, 0).await?;
         tracing::debug!(
@@ -227,11 +212,8 @@ impl ForwarderClient {
         Ok(())
     }
 
-    /// Gracefully tear down this client: cancel ongoing ops, destroy the SHM
-    /// face (if any) via `faces/destroy`, then close the control socket.
-    ///
-    /// Call this before dropping the client to ensure the router removes the
-    /// SHM face immediately rather than waiting for GC.
+    /// Gracefully tear down: destroy the SHM face (if any) so the router
+    /// cleans up immediately rather than waiting for GC.
     pub async fn close(self) {
         self.cancel.cancel();
         #[cfg(all(
@@ -242,10 +224,8 @@ impl ForwarderClient {
         if let DataTransport::Shm { face_id, .. } = &self.transport {
             let _ = self.mgmt.face_destroy(*face_id).await;
         }
-        // Dropping self here closes the control socket.
     }
 
-    /// Get the SHM face ID if using SHM transport.
     fn shm_face_id(&self) -> Option<u64> {
         #[cfg(all(
             unix,
@@ -283,20 +263,9 @@ impl ForwarderClient {
         }
     }
 
-    /// Send multiple packets on the data plane in one synchronisation.
+    /// Send multiple packets in one synchronisation.
     ///
-    /// On the SHM transport this goes through [`SpscHandle::send_batch`],
-    /// which publishes all `pkts` with a single atomic tail advance and
-    /// at most one wakeup — the primary reason this API exists. On the
-    /// Unix transport this is a plain loop over [`send`](Self::send);
-    /// the socket path has no equivalent batch primitive and per-packet
-    /// cost dominates anyway.
-    ///
-    /// A pipelined consumer filling a segmented-fetch window (e.g.
-    /// `ndn-peek`) should prefer `send_batch` over a loop of `send`
-    /// calls: it collapses the per-Interest scheduler round-trips into
-    /// a single ring transition and measurably reduces the small-
-    /// segment overhead (see `docs/notes/throughput-roadmap.md`).
+    /// SHM: single atomic tail advance + one wakeup. Unix: plain loop.
     pub async fn send_batch(&self, pkts: &[Bytes]) -> Result<(), ForwarderError> {
         if pkts.is_empty() {
             return Ok(());
@@ -323,12 +292,7 @@ impl ForwarderClient {
         }
     }
 
-    /// Receive a packet from the data plane.
-    ///
-    /// Returns `None` if the data channel is closed or the router has
-    /// disconnected.  On the first call, automatically starts the disconnect
-    /// monitor (see [`ForwarderClient::spawn_disconnect_monitor`]) so that callers
-    /// do not need to start it explicitly.
+    /// Returns `None` if the data channel is closed.
     pub async fn recv(&self) -> Option<Bytes> {
         self.start_monitor_once();
         match &self.transport {
@@ -345,24 +309,15 @@ impl ForwarderClient {
         }
     }
 
-    /// Start the disconnect monitor the first time it is needed.
-    ///
-    /// In **SHM mode** the data plane reads from shared memory and does not
-    /// observe socket closure directly.  This starts a background task that
-    /// drains the control socket (which is otherwise idle after setup) and
-    /// fires the internal [`CancellationToken`] when the socket closes.
-    ///
-    /// In **Unix mode** the data `recv()` already returns `None` on socket
-    /// closure, so no additional monitor is needed.
-    ///
-    /// Safe to call multiple times — only one monitor is ever started.
+    /// In SHM mode, watches the control socket for closure and cancels
+    /// the token so SHM recv/send abort. No-op in Unix mode.
     fn start_monitor_once(&self) {
         if self
             .monitor_started
             .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed)
             .is_err()
         {
-            return; // already started
+            return;
         }
 
         #[cfg(all(
@@ -375,19 +330,12 @@ impl ForwarderClient {
             let cancel = self.cancel.clone();
             let dead = Arc::clone(&self.dead);
             tokio::spawn(async move {
-                // In SHM mode the control socket is used only for management
-                // commands.  After setup, no traffic is expected on it.  Any
-                // recv error means the socket was closed (router died).
-                // Stray successful reads (e.g. unsolicited router messages) are
-                // drained harmlessly; only errors trigger cancellation.
                 loop {
                     tokio::select! {
                         _ = cancel.cancelled() => break,
                         result = control.recv() => {
                             match result {
-                                Ok(_) => {
-                                    // Stray data on control socket — drain it.
-                                }
+                                Ok(_) => {}
                                 Err(_) => {
                                     dead.store(true, Ordering::Relaxed);
                                     cancel.cancel();
@@ -401,7 +349,6 @@ impl ForwarderClient {
         }
     }
 
-    /// Whether this client is using SHM for data transport.
     pub fn is_shm(&self) -> bool {
         #[cfg(all(
             unix,
@@ -414,36 +361,20 @@ impl ForwarderClient {
         false
     }
 
-    /// Whether the router connection has been lost.
     pub fn is_dead(&self) -> bool {
         self.dead.load(Ordering::Relaxed)
     }
 
-    /// Explicitly start the disconnect monitor.
-    ///
-    /// This is called automatically on the first [`ForwarderClient::recv`] call,
-    /// so most applications do not need to call this directly.
-    ///
-    /// In **SHM mode** the monitor watches the control socket for closure
-    /// (no probes are sent; the control socket is idle after setup).  In
-    /// **Unix mode** the data `recv()` already returns `None` on closure, so
-    /// this is a no-op.
-    ///
-    /// Safe to call multiple times — only one monitor is ever started.
+    /// Explicitly start the disconnect monitor (called automatically on first `recv`).
     pub fn spawn_disconnect_monitor(&self) {
         self.start_monitor_once();
     }
 
-    /// Check if the control face is still connected by attempting a
-    /// non-blocking management probe.  Returns `true` if the router is alive.
-    ///
-    /// Called lazily by applications that detect SHM stalls.
+    /// Probe whether the router is still alive via a management Interest.
     pub async fn probe_alive(&self) -> bool {
         if self.dead.load(Ordering::Relaxed) {
             return false;
         }
-        // Try sending a trivial Interest on the control face.
-        // If the socket is closed, send will fail immediately.
         let probe = ndn_packet::encode::InterestBuilder::new("/localhost/nfd/status/general")
             .sign_digest_sha256();
         match self.control.send(probe).await {
@@ -459,10 +390,6 @@ impl ForwarderClient {
 
 impl Drop for ForwarderClient {
     fn drop(&mut self) {
-        // Cancel the cancel token so the disconnect-monitor task (which holds
-        // a clone of Arc<IpcFace>) exits promptly.  Once the task drops its
-        // clone, the Arc refcount reaches zero, the Unix socket is closed, and
-        // the router detects the disconnect → cleans up the SHM face.
         self.cancel.cancel();
     }
 }

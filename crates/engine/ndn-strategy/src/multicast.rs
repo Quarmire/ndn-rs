@@ -13,7 +13,6 @@ pub struct MulticastStrategy {
 }
 
 impl MulticastStrategy {
-    /// NFD strategy name: `/localhost/nfd/strategy/multicast`
     pub fn strategy_name() -> Name {
         Name::from_components([
             NameComponent::generic(Bytes::from_static(b"localhost")),

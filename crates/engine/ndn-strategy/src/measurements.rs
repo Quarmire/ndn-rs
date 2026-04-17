@@ -8,16 +8,12 @@ use std::sync::Arc;
 /// EWMA RTT measurement for a (prefix, face) pair.
 #[derive(Clone, Debug)]
 pub struct EwmaRtt {
-    /// Smoothed RTT in nanoseconds.
     pub srtt_ns: f64,
-    /// RTT variance.
     pub rttvar_ns: f64,
-    /// Number of samples.
     pub samples: u32,
 }
 
 impl EwmaRtt {
-    /// Incorporate an RTT sample (nanoseconds) using EWMA smoothing.
     pub fn update(&mut self, sample_ns: f64) {
         const ALPHA: f64 = 0.125;
         const BETA: f64 = 0.25;
@@ -32,7 +28,6 @@ impl EwmaRtt {
         self.samples += 1;
     }
 
-    /// RTO estimate: srtt + 4 * rttvar.
     pub fn rto_ns(&self) -> f64 {
         self.srtt_ns + 4.0 * self.rttvar_ns
     }
@@ -48,25 +43,16 @@ impl Default for EwmaRtt {
     }
 }
 
-/// Per-prefix measurements entry.
 #[derive(Clone, Debug, Default)]
 pub struct MeasurementsEntry {
-    /// Per-face RTT measurements.
     pub rtt_per_face: HashMap<FaceId, EwmaRtt>,
-    /// EWMA satisfaction rate over the last N Interests (0.0–1.0).
     pub satisfaction_rate: f32,
-    /// Timestamp of last update (ns since Unix epoch).
     pub last_updated: u64,
 }
 
-/// Concurrent measurements table — one entry per name prefix, keyed by the
-/// longest-matching prefix used during the forwarding decision.
+/// Concurrent measurements table, one entry per name prefix.
 ///
-/// Updated on every Data arrival by the `MeasurementsUpdateStage`.
-/// Read by strategies via `StrategyContext`.
-///
-/// On native targets uses `DashMap` for sharded concurrent access.
-/// On `wasm32` uses a `Mutex<HashMap>` (single-threaded WASM has no contention).
+/// `DashMap` on native, `Mutex<HashMap>` on wasm32.
 pub struct MeasurementsTable {
     #[cfg(not(target_arch = "wasm32"))]
     entries: DashMap<Arc<Name>, MeasurementsEntry>,
@@ -75,7 +61,6 @@ pub struct MeasurementsTable {
 }
 
 impl MeasurementsTable {
-    /// Create an empty measurements table.
     pub fn new() -> Self {
         Self {
             #[cfg(not(target_arch = "wasm32"))]
@@ -85,7 +70,6 @@ impl MeasurementsTable {
         }
     }
 
-    /// Look up the measurements entry for a name prefix, returning a clone.
     pub fn get(&self, name: &Arc<Name>) -> Option<MeasurementsEntry> {
         #[cfg(not(target_arch = "wasm32"))]
         return self.entries.get(name).map(|r| r.clone());
@@ -93,7 +77,6 @@ impl MeasurementsTable {
         return self.entries.lock().unwrap().get(name).cloned();
     }
 
-    /// Record an RTT sample for a (prefix, face) pair, creating the entry if needed.
     pub fn update_rtt(&self, name: Arc<Name>, face: FaceId, rtt_ns: f64) {
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -110,9 +93,6 @@ impl MeasurementsTable {
         }
     }
 
-    /// Snapshot all entries, returning a `Vec` of `(prefix, entry)` pairs.
-    ///
-    /// Intended for management dataset queries (`measurements/list`).
     pub fn dump(&self) -> Vec<(Arc<Name>, MeasurementsEntry)> {
         #[cfg(not(target_arch = "wasm32"))]
         return self
@@ -130,7 +110,6 @@ impl MeasurementsTable {
             .collect();
     }
 
-    /// Record an Interest satisfaction outcome, updating the EWMA satisfaction rate.
     pub fn update_satisfaction(&self, name: Arc<Name>, satisfied: bool) {
         const ALPHA: f32 = 0.1;
         #[cfg(not(target_arch = "wasm32"))]

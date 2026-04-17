@@ -8,11 +8,9 @@ use bytes::Bytes;
 /// not from when the pipeline runner dequeues it.
 #[derive(Debug, Clone)]
 pub struct RawPacket {
-    /// Wire-format bytes.
     pub bytes: Bytes,
-    /// Face the packet arrived on.
     pub face_id: FaceId,
-    /// Arrival time as nanoseconds since the Unix epoch.
+    /// Nanoseconds since the Unix epoch; taken at `recv()` time.
     pub arrival: u64,
 }
 

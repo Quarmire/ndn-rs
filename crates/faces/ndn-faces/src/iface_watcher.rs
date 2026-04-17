@@ -10,12 +10,9 @@
 //! - **macOS**: not yet supported — logs a warning and the task exits.
 //! - **Windows**: not yet supported — logs a warning and the task exits.
 
-/// An interface lifecycle event delivered by the watcher task.
 #[derive(Debug, Clone)]
 pub enum InterfaceEvent {
-    /// A new interface has appeared (or come up).
     Added(String),
-    /// An interface has been removed (or gone down permanently).
     Removed(String),
 }
 
@@ -43,8 +40,6 @@ pub async fn watch_interfaces(
     }
 }
 
-// ── Linux implementation ──────────────────────────────────────────────────────
-
 #[cfg(target_os = "linux")]
 async fn watch_interfaces_linux(
     tx: tokio::sync::mpsc::Sender<InterfaceEvent>,
@@ -53,10 +48,8 @@ async fn watch_interfaces_linux(
     use std::os::unix::io::OwnedFd;
     use tokio::io::unix::AsyncFd;
 
-    // RTM_NEWLINK = 16 (RTM_DELLINK = 17 is handled by the else branch below)
     const RTM_NEWLINK: u16 = 16;
 
-    // Open NETLINK_ROUTE socket subscribed to RTMGRP_LINK.
     let fd: i32 = unsafe {
         libc::socket(
             libc::AF_NETLINK,
@@ -72,14 +65,11 @@ async fn watch_interfaces_linux(
         return;
     }
 
-    // Bind to RTMGRP_LINK multicast group.
     // SAFETY: sockaddr_nl is a plain C struct; zero-initialising is correct
     // (nl_pid=0 means kernel assigns, nl_pad=0 is reserved).
     let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
     addr.nl_family = libc::AF_NETLINK as u16;
-    // RTMGRP_LINK = 1 is a stable Linux kernel ABI constant.
-    // We use a literal to avoid libc type variance (c_uint vs c_int across versions).
-    addr.nl_groups = 1;
+    addr.nl_groups = 1; // RTMGRP_LINK
     let rc = unsafe {
         libc::bind(
             fd,
@@ -98,7 +88,6 @@ async fn watch_interfaces_linux(
         return;
     }
 
-    // Wrap in OwnedFd so it closes on drop.
     let owned: OwnedFd = unsafe { std::os::unix::io::FromRawFd::from_raw_fd(fd) };
     let async_fd = match AsyncFd::new(owned) {
         Ok(f) => f,
@@ -135,7 +124,6 @@ async fn watch_interfaces_linux(
                 if n <= 0 {
                     continue;
                 }
-                // Parse netlink messages from the buffer.
                 let msgs = parse_rtm_link_messages(&buf[..n as usize]);
                 for (msg_type, iface_name) in msgs {
                     let event = if msg_type == RTM_NEWLINK {
@@ -149,7 +137,7 @@ async fn watch_interfaces_linux(
                         "interface event"
                     );
                     if tx.send(event).await.is_err() {
-                        return; // receiver dropped
+                        return;
                     }
                 }
             }
@@ -165,8 +153,6 @@ use std::os::unix::io::AsRawFd;
 /// Returns `(msg_type, interface_name)` pairs for all IFLA_IFNAME attributes found.
 #[cfg(target_os = "linux")]
 fn parse_rtm_link_messages(buf: &[u8]) -> Vec<(u16, String)> {
-    // Netlink header is 16 bytes, ifinfomsg is 16 bytes.
-    // Attribute (rtattr) header is 4 bytes.
     const NLMSG_HDR: usize = 16;
     const IFINFO_HDR: usize = 16;
     const RTA_HDR: usize = 4;
@@ -178,7 +164,6 @@ fn parse_rtm_link_messages(buf: &[u8]) -> Vec<(u16, String)> {
     let mut offset = 0usize;
 
     while offset + NLMSG_HDR <= buf.len() {
-        // Parse nlmsghdr.
         let nlmsg_len = u32::from_ne_bytes(buf[offset..offset + 4].try_into().unwrap()) as usize;
         let nlmsg_type = u16::from_ne_bytes(buf[offset + 4..offset + 6].try_into().unwrap());
 
@@ -187,7 +172,6 @@ fn parse_rtm_link_messages(buf: &[u8]) -> Vec<(u16, String)> {
         }
 
         if nlmsg_type == RTM_NEWLINK || nlmsg_type == RTM_DELLINK {
-            // Skip nlmsghdr (16) + ifinfomsg (16) to reach attributes.
             let attr_start = offset + NLMSG_HDR + IFINFO_HDR;
             let attr_end = offset + nlmsg_len;
             let mut attr_off = attr_start;
@@ -202,19 +186,16 @@ fn parse_rtm_link_messages(buf: &[u8]) -> Vec<(u16, String)> {
                 }
                 if rta_type == IFLA_IFNAME {
                     let data = &buf[attr_off + RTA_HDR..attr_off + rta_len];
-                    // IFLA_IFNAME is a NUL-terminated string.
                     let name = data.split(|&b| b == 0).next().unwrap_or(data);
                     if let Ok(s) = std::str::from_utf8(name) {
                         results.push((nlmsg_type, s.to_owned()));
                     }
                 }
-                // rtattr lengths are aligned to 4 bytes.
                 let aligned = (rta_len + 3) & !3;
                 attr_off += aligned;
             }
         }
 
-        // Advance to the next message (NLMSG_ALIGN to 4 bytes).
         let aligned = (nlmsg_len + 3) & !3;
         offset += aligned;
     }

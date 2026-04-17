@@ -41,14 +41,7 @@ pub struct BlockingForwarderClient {
 }
 
 impl BlockingForwarderClient {
-    /// Connect to the forwarder's face socket (blocking).
-    ///
-    /// Automatically attempts SHM data plane; falls back to Unix socket.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ForwarderError`] if the socket is unreachable or the
-    /// connection handshake fails.
+    /// Attempts SHM data plane; falls back to Unix socket.
     pub fn connect(face_socket: impl AsRef<Path>) -> Result<Self, ForwarderError> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -58,7 +51,6 @@ impl BlockingForwarderClient {
         Ok(Self { rt, inner })
     }
 
-    /// Connect using only the Unix socket for data (no SHM attempt).
     pub fn connect_unix_only(face_socket: impl AsRef<Path>) -> Result<Self, ForwarderError> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -68,39 +60,30 @@ impl BlockingForwarderClient {
         Ok(Self { rt, inner })
     }
 
-    /// Send a raw NDN packet (blocking).
     pub fn send(&self, pkt: Bytes) -> Result<(), ForwarderError> {
         self.rt.block_on(self.inner.send(pkt))
     }
 
-    /// Receive a raw NDN packet (blocking).
-    ///
-    /// Returns `None` if the forwarder connection is closed.
     pub fn recv(&self) -> Option<Bytes> {
         self.rt.block_on(self.inner.recv())
     }
 
-    /// Register a prefix with the forwarder (blocking).
     pub fn register_prefix(&self, prefix: &Name) -> Result<(), ForwarderError> {
         self.rt.block_on(self.inner.register_prefix(prefix))
     }
 
-    /// Unregister a prefix from the forwarder (blocking).
     pub fn unregister_prefix(&self, prefix: &Name) -> Result<(), ForwarderError> {
         self.rt.block_on(self.inner.unregister_prefix(prefix))
     }
 
-    /// Whether this client is using SHM for data transport.
     pub fn is_shm(&self) -> bool {
         self.inner.is_shm()
     }
 
-    /// Whether the forwarder connection has been lost.
     pub fn is_dead(&self) -> bool {
         self.inner.is_dead()
     }
 
-    /// Gracefully tear down the client (blocking).
     pub fn close(self) {
         let Self { rt, inner } = self;
         rt.block_on(inner.close());

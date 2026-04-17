@@ -43,38 +43,32 @@ impl Default for CobsCodec {
     }
 }
 
-// ─── COBS encode ────────────────────────────────────────────────────────────
-
 /// COBS-encode `src` into `dst`.  The caller must append a `0x00` delimiter.
 fn cobs_encode(src: &[u8], dst: &mut BytesMut) {
-    // Reserve worst case: input_len + ceil(input_len/254) + 1
     let max_overhead = (src.len() / 254) + 2;
     dst.reserve(src.len() + max_overhead);
 
     let mut code_idx = dst.len();
-    dst.put_u8(0); // placeholder for first code byte
+    dst.put_u8(0);
     let mut code: u8 = 1;
 
     for &byte in src {
         if byte == 0x00 {
-            // End of run — write the run length at code_idx.
             dst[code_idx] = code;
             code_idx = dst.len();
-            dst.put_u8(0); // placeholder for next code byte
+            dst.put_u8(0);
             code = 1;
         } else {
             dst.put_u8(byte);
             code += 1;
             if code == 0xFF {
-                // Max run length (254 data bytes) — flush and start new run.
                 dst[code_idx] = code;
                 code_idx = dst.len();
-                dst.put_u8(0); // placeholder
+                dst.put_u8(0);
                 code = 1;
             }
         }
     }
-    // Final code byte.
     dst[code_idx] = code;
 }
 
@@ -100,8 +94,6 @@ fn cobs_decode(src: &[u8], dst: &mut BytesMut) -> Result<(), std::io::Error> {
         }
         dst.extend_from_slice(&src[i..i + run_len]);
         i += run_len;
-        // If code < 0xFF there's an implicit zero (end of original zero-delimited run),
-        // unless we've consumed all input.
         if code < 0xFF && i < src.len() {
             dst.put_u8(0x00);
         }
@@ -109,20 +101,15 @@ fn cobs_decode(src: &[u8], dst: &mut BytesMut) -> Result<(), std::io::Error> {
     Ok(())
 }
 
-// ─── Decoder ────────────────────────────────────────────────────────────────
-
 impl Decoder for CobsCodec {
     type Item = Bytes;
     type Error = std::io::Error;
 
     fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<Bytes>, std::io::Error> {
-        // Scan for frame delimiter (0x00).
         let delim_pos = buf.iter().position(|&b| b == 0x00);
         let delim_pos = match delim_pos {
             Some(pos) => pos,
             None => {
-                // No delimiter yet.  If the buffer is unreasonably large,
-                // discard it (corrupt stream).
                 if buf.len() > self.max_frame_len * 2 {
                     buf.clear();
                 }
@@ -130,16 +117,12 @@ impl Decoder for CobsCodec {
             }
         };
 
-        // Extract the encoded frame (excluding delimiter).
         let encoded = buf.split_to(delim_pos);
-        buf.advance(1); // consume the 0x00 delimiter
-
-        // Empty frame (consecutive delimiters) — skip.
+        buf.advance(1);
         if encoded.is_empty() {
             return Ok(None);
         }
 
-        // Decode.
         let mut decoded = BytesMut::new();
         match cobs_decode(&encoded, &mut decoded) {
             Ok(()) => {
@@ -152,21 +135,18 @@ impl Decoder for CobsCodec {
                 Ok(Some(decoded.freeze()))
             }
             Err(_) => {
-                // Corrupt frame — discard and wait for next delimiter.
                 Ok(None)
             }
         }
     }
 }
 
-// ─── Encoder ────────────────────────────────────────────────────────────────
-
 impl Encoder<Bytes> for CobsCodec {
     type Error = std::io::Error;
 
     fn encode(&mut self, item: Bytes, dst: &mut BytesMut) -> Result<(), std::io::Error> {
         cobs_encode(&item, dst);
-        dst.put_u8(0x00); // frame delimiter
+        dst.put_u8(0x00);
         Ok(())
     }
 }

@@ -4,7 +4,6 @@ use bytes::Bytes;
 
 /// A registered service entry in the local namespace.
 pub struct ServiceEntry {
-    /// Encoded capabilities blob (application-defined format).
     pub capabilities: Bytes,
 }
 
@@ -27,18 +26,15 @@ impl ServiceRegistry {
         }
     }
 
-    /// Advertise `name` with the given `capabilities` blob.
     pub fn register(&mut self, name: impl Into<String>, capabilities: Bytes) {
         self.services
             .insert(name.into(), ServiceEntry { capabilities });
     }
 
-    /// Look up a registered service by name.
     pub fn lookup(&self, name: &str) -> Option<&ServiceEntry> {
         self.services.get(name)
     }
 
-    /// Remove a service. Returns `true` if it was registered.
     pub fn unregister(&mut self, name: &str) -> bool {
         self.services.remove(name).is_some()
     }

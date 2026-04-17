@@ -1,32 +1,20 @@
 use super::decode_be_u64;
 
-/// Result of lightweight fragment extraction.
-///
-/// Returned by [`extract_fragment`] for packets that carry fragmentation fields
-/// (`FragCount > 1`).  Holds the minimum information needed for reassembly
-/// without parsing Nack, CongestionMark, or other LpPacket headers.
 pub struct FragmentHeader {
     pub sequence: u64,
     pub frag_index: u64,
     pub frag_count: u64,
-    /// Byte range of the Fragment TLV value within the original raw buffer.
     pub frag_start: usize,
     pub frag_end: usize,
 }
 
-/// Lightweight fragment extraction from an LpPacket.
-///
-/// Scans the TLV fields for Sequence, FragIndex, FragCount, and Fragment
-/// **without** creating `Bytes` sub-slices, parsing Nack headers, or allocating.
-/// Returns `Some` only if the packet is a multi-fragment LpPacket (`frag_count > 1`).
-///
-/// This is the hot-path parser for the fragment sieve — unfragmented LpPackets,
-/// Nacks, and bare Interest/Data fall through to the full `LpPacket::decode`.
+/// Hot-path fragment extraction: scans for Sequence, FragIndex, FragCount, and
+/// Fragment without allocating. Returns `Some` only for multi-fragment LpPackets.
+/// Unfragmented packets fall through to `LpPacket::decode`.
 pub fn extract_fragment(raw: &[u8]) -> Option<FragmentHeader> {
     if raw.first() != Some(&0x64) {
         return None;
     }
-    // Read outer TLV: type (0x64) + length.
     let (_, type_len) = ndn_tlv::read_varu64(raw).ok()?;
     let (outer_len, len_len) = ndn_tlv::read_varu64(&raw[type_len..]).ok()?;
     let header_len = type_len + len_len;
@@ -55,11 +43,10 @@ pub fn extract_fragment(raw: &[u8]) -> Option<FragmentHeader> {
                 let c = decode_be_u64(&inner[pos..pos + l]);
                 if c <= 1 {
                     return None;
-                } // Not fragmented — let full decode handle it.
+                }
                 frag_count = Some(c);
             }
             0x50 => {
-                // frag_start relative to raw, not inner.
                 frag_start = header_len + pos;
                 frag_end = frag_start + l;
             }
@@ -77,10 +64,6 @@ pub fn extract_fragment(raw: &[u8]) -> Option<FragmentHeader> {
     })
 }
 
-/// Fast-path extraction of Sequence and Ack fields from a raw LpPacket.
-///
-/// Scans for Sequence (0x51) and Ack (0x0344) TLVs without allocating `Bytes`.
-/// Returns `(tx_sequence, acks)`. Used only for reliability-enabled faces.
 pub fn extract_acks(raw: &[u8]) -> (Option<u64>, smallvec::SmallVec<[u64; 8]>) {
     let mut tx_seq = None;
     let mut acks = smallvec::SmallVec::new();

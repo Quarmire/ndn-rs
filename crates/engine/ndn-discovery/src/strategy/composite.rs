@@ -1,21 +1,5 @@
-//! Composite probe scheduler — runs multiple strategies simultaneously.
-//!
-//! `CompositeStrategy` allows combining schedulers.  The primary use case is
-//! running [`PassiveScheduler`] for passive MAC detection alongside
-//! [`BackoffScheduler`] as a fallback, or combining [`ReactiveScheduler`]
-//! with SWIM probing.
-//!
-//! ## Deduplication
-//!
-//! Multiple strategies may independently decide to broadcast on the same tick.
-//! `CompositeStrategy` collapses all [`ProbeRequest::Broadcast`] emissions from
-//! one tick into a single broadcast.  [`ProbeRequest::Unicast`] requests are
-//! deduplicated per `FaceId` — one unicast per face per tick.
-//!
-//! ## Forwarding
-//!
-//! [`on_probe_success`], [`on_probe_timeout`], and [`trigger`] are forwarded
-//! to **all** member strategies so that each maintains consistent internal state.
+//! Composite probe scheduler — runs multiple strategies simultaneously,
+//! deduplicating broadcast and unicast requests per tick.
 
 use std::time::{Duration, Instant};
 
@@ -23,30 +7,23 @@ use ndn_transport::FaceId;
 
 use crate::strategy::{NeighborProbeStrategy, ProbeRequest, TriggerEvent};
 
-// ─── CompositeStrategy ───────────────────────────────────────────────────────
 
-/// A composite probe scheduler that runs multiple strategies in parallel and
-/// deduplicates their output.
 pub struct CompositeStrategy {
     members: Vec<Box<dyn NeighborProbeStrategy>>,
 }
 
 impl CompositeStrategy {
-    /// Create an empty composite.  At least one strategy must be added before
-    /// the first tick, or `on_tick` will return an empty list.
     pub fn new() -> Self {
         Self {
             members: Vec::new(),
         }
     }
 
-    /// Add a strategy to the composite (builder).
     pub fn with(mut self, strategy: Box<dyn NeighborProbeStrategy>) -> Self {
         self.members.push(strategy);
         self
     }
 
-    /// Add a strategy by reference (builder variant for use without consuming).
     pub fn push(&mut self, strategy: Box<dyn NeighborProbeStrategy>) {
         self.members.push(strategy);
     }
@@ -105,7 +82,6 @@ impl NeighborProbeStrategy for CompositeStrategy {
     }
 }
 
-// ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

@@ -11,8 +11,6 @@ use super::af_packet::{
 use super::radio::RadioFaceMetadata;
 use crate::NDN_ETHERTYPE;
 
-// ─── NamedEtherFace ──────────────────────────────────────────────────────────
-
 /// NDN face over raw Ethernet (`AF_PACKET` / Ethertype 0x8624).
 ///
 /// Uses `SOCK_DGRAM` with a TPACKET_V2 mmap'd ring buffer for zero-copy
@@ -27,28 +25,17 @@ use crate::NDN_ETHERTYPE;
 /// Requires `CAP_NET_RAW` or root.
 pub struct NamedEtherFace {
     id: FaceId,
-    /// NDN node name of the remote peer.
     pub node_name: Name,
-    /// Resolved MAC address of the remote peer.
     peer_mac: MacAddr,
-    /// Local network interface name.
     iface: String,
-    /// Interface index (cached from constructor).
     ifindex: i32,
-    /// Radio metadata for multi-radio strategies.
     pub radio: RadioFaceMetadata,
-    /// Non-blocking AF_PACKET socket registered with tokio.
     socket: AsyncFd<std::os::unix::io::OwnedFd>,
-    /// Mmap'd TPACKET_V2 RX + TX ring buffers.
     ring: PacketRing,
 }
 
 impl NamedEtherFace {
-    /// Create a new Ethernet face bound to `iface`.
-    ///
-    /// Opens an `AF_PACKET + SOCK_DGRAM` socket, configures a TPACKET_V2 mmap
-    /// ring buffer, binds to the given network interface, and registers the
-    /// socket with the tokio reactor.  Requires `CAP_NET_RAW`.
+    /// Requires `CAP_NET_RAW`.
     pub fn new(
         id: FaceId,
         node_name: Name,
@@ -58,7 +45,6 @@ impl NamedEtherFace {
     ) -> std::io::Result<Self> {
         let iface = iface.into();
 
-        // Temporary socket to resolve the interface index.
         let probe_fd = unsafe {
             libc::socket(
                 libc::AF_PACKET,
@@ -79,7 +65,6 @@ impl NamedEtherFace {
 
         let fd = open_packet_socket(ifindex, NDN_ETHERTYPE)?;
 
-        // Set up mmap ring buffers BEFORE registering with AsyncFd.
         let ring = setup_packet_ring(fd.as_raw_fd())?;
         let socket = AsyncFd::new(fd)?;
 
@@ -95,17 +80,14 @@ impl NamedEtherFace {
         })
     }
 
-    /// Update the peer MAC address (e.g. after a mobility event).
     pub fn set_peer_mac(&mut self, mac: MacAddr) {
         self.peer_mac = mac;
     }
 
-    /// Current peer MAC address.
     pub fn peer_mac(&self) -> MacAddr {
         self.peer_mac
     }
 
-    /// Interface name this face is bound to.
     pub fn iface(&self) -> &str {
         &self.iface
     }
@@ -130,7 +112,6 @@ impl Face for NamedEtherFace {
     }
 
     async fn send(&self, pkt: Bytes) -> Result<(), FaceError> {
-        // Wait for an available TX frame.
         loop {
             if self.ring.try_push_tx(&pkt) {
                 break;
@@ -139,7 +120,6 @@ impl Face for NamedEtherFace {
             guard.clear_ready();
         }
 
-        // Flush pending TX frames.
         let dst = make_sockaddr_ll(self.ifindex, &self.peer_mac, NDN_ETHERTYPE);
         let fd = self.socket.get_ref().as_raw_fd();
         let ret = unsafe {
@@ -161,8 +141,6 @@ impl Face for NamedEtherFace {
         Ok(())
     }
 }
-
-// ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

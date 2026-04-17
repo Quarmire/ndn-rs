@@ -38,7 +38,6 @@ use ndn_packet::name::NameComponent;
 
 use crate::did::resolver::DidError;
 
-/// TLV type for Name container.
 const NAME_TLV_TYPE: u64 = 7;
 
 /// Encode an NDN [`Name`] as a `did:ndn` DID string.
@@ -76,28 +75,22 @@ pub fn did_to_name(did: &str) -> Result<Name, DidError> {
         .ok_or_else(|| DidError::InvalidDid(did.to_string()))?;
 
     if rest.contains(':') {
-        // Legacy forms (both use colons, which are not in the base64url alphabet).
         if let Some(encoded) = rest.strip_prefix("v1:") {
-            // Deprecated v1: binary form.
             let bytes = base64_url_decode(encoded)
                 .map_err(|_| DidError::InvalidDid(format!("invalid base64url in {did}")))?;
             decode_name_tlv(&bytes)
                 .map_err(|_| DidError::InvalidDid(format!("invalid TLV name in {did}")))
         } else {
-            // Deprecated simple colon-encoded form.
             colon_decode(rest)
                 .ok_or_else(|| DidError::InvalidDid(format!("invalid did:ndn: {did}")))
         }
     } else {
-        // Current binary form: the entire method-specific-id is base64url.
         let bytes = base64_url_decode(rest)
             .map_err(|_| DidError::InvalidDid(format!("invalid base64url in {did}")))?;
         decode_name_tlv(&bytes)
             .map_err(|_| DidError::InvalidDid(format!("invalid TLV name in {did}")))
     }
 }
-
-// ── Legacy helpers (kept for did_to_name backward compat) ────────────────────
 
 fn colon_decode(s: &str) -> Option<Name> {
     if s.is_empty() {
@@ -112,8 +105,6 @@ fn colon_decode(s: &str) -> Option<Name> {
     }
     Some(name)
 }
-
-// ── TLV encoding / decoding ───────────────────────────────────────────────────
 
 fn encode_name_tlv(name: &Name) -> Vec<u8> {
     let mut inner: Vec<u8> = Vec::new();
@@ -256,8 +247,6 @@ mod tests {
         let back = did_to_name(&did).unwrap();
         assert_eq!(back, name);
     }
-
-    // ── Backward-compat parsing ───────────────────────────────────────────────
 
     #[test]
     fn compat_simple_form() {

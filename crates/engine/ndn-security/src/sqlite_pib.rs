@@ -44,8 +44,6 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
 use crate::pib::PibError;
 
-// ─── Schema (verbatim from ndn-cxx pib-sqlite3.cpp DB_INIT) ───────────────────
-
 /// Schema embedded character-for-character from ndn-cxx 0.9.0
 /// `ndn-cxx/security/pib/impl/pib-sqlite3.cpp` lines 33–186. **Do not edit.**
 /// Any divergence from this string will cause silent incompatibility with
@@ -205,8 +203,6 @@ CREATE TRIGGER IF NOT EXISTS
   END;
 "#;
 
-// ─── Name <-> wire-format BLOB ────────────────────────────────────────────────
-
 /// Encode a `Name` to its canonical TLV wire form (outer type `0x07` +
 /// length + components), as ndn-cxx's `Name::wireEncode()` produces.
 /// This is the byte sequence stored in the `identity`, `key_name`, and
@@ -221,8 +217,6 @@ fn name_wire_encode(name: &Name) -> Vec<u8> {
     w.finish().to_vec()
 }
 
-/// Decode a Name from a wire-format BLOB read from the SQLite PIB.
-/// The blob is expected to be `[type=0x07] [length] [components]`.
 fn name_wire_decode(blob: &[u8]) -> Result<Name, PibError> {
     let mut reader = TlvReader::new(Bytes::copy_from_slice(blob));
     let (typ, value) = reader
@@ -235,8 +229,6 @@ fn name_wire_decode(blob: &[u8]) -> Result<Name, PibError> {
     }
     Name::decode(value).map_err(|e| PibError::Corrupt(format!("name body: {e:?}")))
 }
-
-// ─── SqlitePib ────────────────────────────────────────────────────────────────
 
 /// SQLite-backed PIB, wire-compatible with ndn-cxx `pib-sqlite3`.
 ///
@@ -296,12 +288,9 @@ impl SqlitePib {
         Self::open(dir.join("pib.db"))
     }
 
-    /// Path to the underlying database file.
     pub fn path(&self) -> &Path {
         &self.path
     }
-
-    // ── tpmInfo ──────────────────────────────────────────────────────────────
 
     /// Return the TPM locator string the PIB was last associated with,
     /// e.g. `"tpm-file:"` or `"tpm-file:/custom/path"`. `None` if no
@@ -338,8 +327,6 @@ impl SqlitePib {
         Ok(())
     }
 
-    // ── identities ───────────────────────────────────────────────────────────
-
     /// Add `identity` to the PIB. Idempotent: re-adding an existing
     /// identity is a no-op (the unique index on `identity` would otherwise
     /// reject it).
@@ -364,7 +351,6 @@ impl SqlitePib {
         Ok(())
     }
 
-    /// Return `true` if the named identity is in the PIB.
     pub fn has_identity(&self, identity: &Name) -> Result<bool, PibError> {
         let conn = self.conn.lock().expect("sqlite mutex poisoned");
         let blob = name_wire_encode(identity);
@@ -389,7 +375,6 @@ impl SqlitePib {
         Ok(())
     }
 
-    /// List all identities in the PIB, in insertion order.
     pub fn list_identities(&self) -> Result<Vec<Name>, PibError> {
         let conn = self.conn.lock().expect("sqlite mutex poisoned");
         let mut stmt = conn
@@ -424,7 +409,6 @@ impl SqlitePib {
         Ok(())
     }
 
-    /// Return the current default identity, if one is set.
     pub fn get_default_identity(&self) -> Result<Option<Name>, PibError> {
         let conn = self.conn.lock().expect("sqlite mutex poisoned");
         let blob: Option<Vec<u8>> = conn
@@ -440,8 +424,6 @@ impl SqlitePib {
             None => None,
         })
     }
-
-    // ── keys ─────────────────────────────────────────────────────────────────
 
     /// Add a key under an existing identity. The identity must already
     /// exist; ndn-cxx's `addKey` adds it implicitly via a subquery, so
@@ -501,7 +483,6 @@ impl SqlitePib {
         Ok(())
     }
 
-    /// Return the raw `key_bits` (public-key BLOB) for a key, if present.
     pub fn get_key_bits(&self, key_name: &Name) -> Result<Option<Vec<u8>>, PibError> {
         let conn = self.conn.lock().expect("sqlite mutex poisoned");
         let blob = name_wire_encode(key_name);
@@ -514,7 +495,6 @@ impl SqlitePib {
         .map_err(map_sqlite_err)
     }
 
-    /// Delete a key and (via cascade) all certificates issued under it.
     pub fn delete_key(&self, key_name: &Name) -> Result<(), PibError> {
         let conn = self.conn.lock().expect("sqlite mutex poisoned");
         let blob = name_wire_encode(key_name);
@@ -523,7 +503,6 @@ impl SqlitePib {
         Ok(())
     }
 
-    /// List all keys under `identity`, in insertion order.
     pub fn list_keys(&self, identity: &Name) -> Result<Vec<Name>, PibError> {
         let conn = self.conn.lock().expect("sqlite mutex poisoned");
         let blob = name_wire_encode(identity);
@@ -581,8 +560,6 @@ impl SqlitePib {
         })
     }
 
-    // ── certificates ─────────────────────────────────────────────────────────
-
     /// Add a certificate under an existing key. The key must already
     /// exist (we don't auto-create it; ndn-cxx fails the foreign key
     /// constraint here too).
@@ -620,7 +597,6 @@ impl SqlitePib {
         Ok(())
     }
 
-    /// Return the full Data-wire bytes of `cert_name`, if present.
     pub fn get_certificate(&self, cert_name: &Name) -> Result<Option<Vec<u8>>, PibError> {
         let conn = self.conn.lock().expect("sqlite mutex poisoned");
         let blob = name_wire_encode(cert_name);
@@ -633,7 +609,6 @@ impl SqlitePib {
         .map_err(map_sqlite_err)
     }
 
-    /// Delete a certificate by name.
     pub fn delete_certificate(&self, cert_name: &Name) -> Result<(), PibError> {
         let conn = self.conn.lock().expect("sqlite mutex poisoned");
         let blob = name_wire_encode(cert_name);
@@ -645,7 +620,6 @@ impl SqlitePib {
         Ok(())
     }
 
-    /// List all certificate names issued under `key_name`.
     pub fn list_certificates(&self, key_name: &Name) -> Result<Vec<Name>, PibError> {
         let conn = self.conn.lock().expect("sqlite mutex poisoned");
         let blob = name_wire_encode(key_name);
@@ -683,7 +657,6 @@ impl SqlitePib {
         Ok(())
     }
 
-    /// Return the default certificate Data-wire for `key_name`, if any.
     pub fn get_default_certificate(&self, key_name: &Name) -> Result<Option<Vec<u8>>, PibError> {
         let conn = self.conn.lock().expect("sqlite mutex poisoned");
         let blob = name_wire_encode(key_name);
@@ -699,8 +672,6 @@ impl SqlitePib {
     }
 }
 
-// ─── Error mapping ────────────────────────────────────────────────────────────
-
 fn map_sqlite_err(e: rusqlite::Error) -> PibError {
     PibError::Corrupt(format!("sqlite: {e}"))
 }
@@ -709,7 +680,6 @@ fn name_to_string(name: &Name) -> String {
     let mut s = String::new();
     for c in name.components() {
         s.push('/');
-        // Best-effort URI-ish — only used in error messages.
         for &b in c.value.iter() {
             if b.is_ascii_graphic() && b != b'/' {
                 s.push(b as char);
@@ -721,8 +691,6 @@ fn name_to_string(name: &Name) -> String {
     if s.is_empty() { "/".into() } else { s }
 }
 
-// Suppress unused-import warning for NameComponent on builds that only
-// hit the public surface. The tests below use it.
 #[allow(dead_code)]
 fn _force_use(_c: NameComponent) {}
 

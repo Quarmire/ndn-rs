@@ -1,17 +1,4 @@
 //! Exponential-backoff probe scheduler.
-//!
-//! Starts at [`DiscoveryConfig::hello_interval_base`] and doubles on each tick
-//! where no probe is needed, up to [`DiscoveryConfig::hello_interval_max`].
-//! Jitter of ±[`DiscoveryConfig::hello_jitter`] × interval is applied to
-//! each computed deadline to desynchronise nodes that started simultaneously.
-//!
-//! # Reset behaviour
-//!
-//! Any [`TriggerEvent`] resets the interval to the base and sets
-//! `pending_immediate = true` so that the very next [`on_tick`] call emits
-//! a [`ProbeRequest::Broadcast`] without waiting for the deadline.  A
-//! successful probe ([`on_probe_success`]) similarly resets the interval; a
-//! probe timeout ([`on_probe_timeout`]) advances to the next (doubled) level.
 
 use std::time::{Duration, Instant};
 
@@ -19,20 +6,15 @@ use crate::backoff::{BackoffConfig, BackoffState};
 use crate::config::DiscoveryConfig;
 use crate::strategy::{NeighborProbeStrategy, ProbeRequest, TriggerEvent};
 
-// ─── BackoffScheduler ────────────────────────────────────────────────────────
 
-/// Probe scheduler that uses exponential back-off with jitter.
 pub struct BackoffScheduler {
     cfg: BackoffConfig,
     state: BackoffState,
-    /// When the next probe should be sent.
     next_probe_at: Option<Instant>,
-    /// Set to `true` by trigger events so the next `on_tick` fires immediately.
     pending_immediate: bool,
 }
 
 impl BackoffScheduler {
-    /// Build from the relevant fields of a [`DiscoveryConfig`].
     pub fn from_discovery_config(cfg: &DiscoveryConfig) -> Self {
         let backoff_cfg = BackoffConfig {
             initial_interval: cfg.hello_interval_base,
@@ -47,7 +29,6 @@ impl BackoffScheduler {
         }
     }
 
-    /// Schedule a deadline `interval` from `now`.
     fn schedule_next(&mut self, now: Instant, interval: Duration) {
         self.next_probe_at = Some(now + interval);
     }
@@ -62,7 +43,6 @@ impl NeighborProbeStrategy for BackoffScheduler {
         }
 
         self.pending_immediate = false;
-        // Advance to next backoff level.
         let interval = self.state.next_failure(&self.cfg);
         self.schedule_next(now, interval);
 
@@ -71,31 +51,25 @@ impl NeighborProbeStrategy for BackoffScheduler {
 
     fn on_probe_success(&mut self, _rtt: Duration) {
         self.state.reset(&self.cfg);
-        // Schedule next probe at base interval.
         let next = self.cfg.initial_interval;
         self.schedule_next(Instant::now(), next);
     }
 
     fn on_probe_timeout(&mut self) {
-        // Advance backoff on next on_tick via the existing state; no change
-        // needed here — next_failure will be called from on_tick.
     }
 
     fn trigger(&mut self, _event: TriggerEvent) {
-        // Reset to base and fire immediately.
         self.state.reset(&self.cfg);
         self.pending_immediate = true;
     }
 }
 
-// ─── RNG seed ────────────────────────────────────────────────────────────────
 
 fn seed_from_now() -> u32 {
     let ns = Instant::now().elapsed().subsec_nanos();
     if ns == 0 { 0xdeadbeef } else { ns }
 }
 
-// ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

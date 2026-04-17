@@ -13,7 +13,6 @@ pub struct BestRouteStrategy {
 }
 
 impl BestRouteStrategy {
-    /// NFD strategy name: `/localhost/nfd/strategy/best-route`
     pub fn strategy_name() -> Name {
         Name::from_components([
             NameComponent::generic(Bytes::from_static(b"localhost")),
@@ -56,8 +55,6 @@ impl Strategy for BestRouteStrategy {
         &self,
         ctx: &StrategyContext<'_>,
     ) -> SmallVec<[ForwardingAction; 2]> {
-        // Sync fast path handles all cases; this is unreachable when
-        // called through ErasedStrategy but kept for direct Strategy use.
         self.decide(ctx).unwrap()
     }
 
@@ -65,7 +62,6 @@ impl Strategy for BestRouteStrategy {
         &self,
         _ctx: &StrategyContext<'_>,
     ) -> SmallVec<[ForwardingAction; 2]> {
-        // Fan-back to in-record faces is handled by the engine via PIT lookup.
         SmallVec::new()
     }
 }

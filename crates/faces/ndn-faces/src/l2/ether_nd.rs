@@ -59,16 +59,9 @@ use crate::radio::RadioFaceMetadata;
 const PROTOCOL: ProtocolId = ProtocolId("ether-nd");
 
 /// Ethernet-specific link medium for [`HelloProtocol`].
-///
-/// Handles unsigned hello Data, MAC address extraction from inbound
-/// metadata, passive detection of new MACs, and unicast face creation
-/// via [`NamedEtherFace`].
 pub struct EtherMedium {
-    /// Multicast face used for hello broadcasts.
     multicast_face_id: FaceId,
-    /// Network interface name (e.g. "wlan0").
     iface: String,
-    /// Our Ethernet MAC address (stored for future use, e.g. source filtering).
     #[allow(dead_code)]
     local_mac: MacAddr,
 }
@@ -120,7 +113,6 @@ impl DiscoveryProtocol for EtherNeighborDiscovery {
 }
 
 impl EtherNeighborDiscovery {
-    /// Create a new instance with the default LAN profile.
     pub fn new(
         multicast_face_id: FaceId,
         iface: impl Into<String>,
@@ -136,7 +128,6 @@ impl EtherNeighborDiscovery {
         )
     }
 
-    /// Create with an explicit [`DiscoveryConfig`].
     pub fn new_with_config(
         multicast_face_id: FaceId,
         iface: impl Into<String>,
@@ -152,7 +143,6 @@ impl EtherNeighborDiscovery {
         Self(HelloProtocol::create(medium, node_name, config))
     }
 
-    /// Create with a named deployment profile.
     pub fn from_profile(
         multicast_face_id: FaceId,
         iface: impl Into<String>,
@@ -286,7 +276,6 @@ impl LinkMedium for EtherMedium {
             return false;
         }
 
-        // Extract sender MAC from link-layer metadata.
         let sender_mac = match &meta.source {
             Some(LinkAddr::Ether(mac)) => *mac,
             _ => {
@@ -295,7 +284,6 @@ impl LinkMedium for EtherMedium {
             }
         };
 
-        // Trigger PassiveDetection when a previously-unknown MAC sends a hello.
         let is_new = ctx
             .neighbors()
             .face_for_peer(&sender_mac, &self.iface)
@@ -347,16 +335,10 @@ impl LinkMedium for EtherMedium {
         face_id == self.multicast_face_id
     }
 
-    fn on_face_down(&self, _face_id: FaceId, _state: &mut HelloState, _ctx: &dyn DiscoveryContext) {
-        // Ethernet has no link-specific state to clean up on face down.
-    }
+    fn on_face_down(&self, _face_id: FaceId, _state: &mut HelloState, _ctx: &dyn DiscoveryContext) {}
 
-    fn on_peer_removed(&self, _entry: &NeighborEntry, _state: &mut HelloState) {
-        // Ethernet has no link-specific state to clean up on peer removal.
-    }
+    fn on_peer_removed(&self, _entry: &NeighborEntry, _state: &mut HelloState) {}
 }
-
-// ── Tests ──────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

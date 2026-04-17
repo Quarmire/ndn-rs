@@ -3,14 +3,12 @@ use ndn_store::NameTrie;
 use ndn_transport::FaceId;
 use std::sync::Arc;
 
-/// A single FIB nexthop: a face with an associated routing cost.
 #[derive(Clone, Debug)]
 pub struct FibNexthop {
     pub face_id: FaceId,
     pub cost: u32,
 }
 
-/// A FIB entry at a name prefix: one or more nexthops.
 #[derive(Clone, Debug)]
 pub struct FibEntry {
     pub nexthops: Vec<FibNexthop>,
@@ -26,10 +24,6 @@ impl FibEntry {
     }
 }
 
-/// The Forwarding Information Base.
-///
-/// A name trie mapping prefixes to `FibEntry` values. Concurrent longest-prefix
-/// match with per-node `RwLock` (via `NameTrie`).
 pub struct Fib {
     trie: NameTrie<Arc<FibEntry>>,
 }
@@ -41,35 +35,26 @@ impl Fib {
         }
     }
 
-    /// Longest-prefix match lookup.
     pub fn lpm(&self, name: &Name) -> Option<Arc<FibEntry>> {
         self.trie.lpm(name)
     }
 
-    /// Register a nexthop for `prefix`. Replaces any existing entry.
     pub fn add_nexthop(&self, prefix: &Name, face_id: FaceId, cost: u32) {
         let existing = self.trie.get(prefix);
         let mut nexthops = existing.map(|e| e.nexthops.clone()).unwrap_or_default();
-        // Remove any existing entry for this face, then add the new one.
         nexthops.retain(|n| n.face_id != face_id);
         nexthops.push(FibNexthop { face_id, cost });
         self.trie.insert(prefix, Arc::new(FibEntry { nexthops }));
     }
 
-    /// Return all FIB entries as `(prefix_uri, [(face_id, cost)])` tuples.
     pub fn dump(&self) -> Vec<(Name, Arc<FibEntry>)> {
         self.trie.dump()
     }
 
-    /// Remove the entry for `prefix` entirely, regardless of nexthops.
     pub fn remove_prefix(&self, prefix: &Name) {
         self.trie.remove(prefix);
     }
 
-    /// Atomically replace all nexthops for `prefix`.
-    ///
-    /// Used by the RIB to apply computed nexthops. If `nexthops` is empty the
-    /// entry is removed.
     pub fn set_nexthops(&self, prefix: &Name, nexthops: Vec<FibNexthop>) {
         if nexthops.is_empty() {
             self.trie.remove(prefix);
@@ -78,9 +63,6 @@ impl Fib {
         }
     }
 
-    /// Remove all nexthops pointing to `face_id` across all prefixes.
-    ///
-    /// Called when a face is closed to prevent stale routes from accumulating.
     pub fn remove_face(&self, face_id: FaceId) {
         let entries = self.trie.dump();
         for (prefix, entry) in entries {
@@ -90,7 +72,6 @@ impl Fib {
         }
     }
 
-    /// Remove the nexthop for `face_id` from `prefix`.
     pub fn remove_nexthop(&self, prefix: &Name, face_id: FaceId) {
         let Some(existing) = self.trie.get(prefix) else {
             return;

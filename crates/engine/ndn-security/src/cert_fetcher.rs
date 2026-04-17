@@ -16,28 +16,17 @@ use tokio::sync::broadcast;
 use crate::TrustError;
 use crate::cert_cache::{CertCache, Certificate};
 
-/// Type alias for the async fetch callback.
-///
-/// The callback takes a certificate Name and returns `Option<Data>`.
-/// `None` means the fetch failed (timeout, no route, etc.).
 pub type FetchFn =
     Arc<dyn Fn(Name) -> Pin<Box<dyn Future<Output = Option<Data>> + Send>> + Send + Sync>;
 
-/// Fetches certificates over NDN with deduplication and caching.
 pub struct CertFetcher {
     cert_cache: Arc<CertCache>,
     fetch_fn: FetchFn,
-    /// In-flight fetch deduplication.
-    /// When a cert is being fetched, subsequent requests wait on a broadcast.
     in_flight: DashMap<Arc<Name>, broadcast::Sender<Option<Certificate>>>,
     timeout: Duration,
 }
 
 impl CertFetcher {
-    /// Create a new fetcher.
-    ///
-    /// `fetch_fn` is called to express an Interest and return the Data response.
-    /// It is typically wired to an `AppHandle` in the engine.
     pub fn new(cert_cache: Arc<CertCache>, fetch_fn: FetchFn, timeout: Duration) -> Self {
         Self {
             cert_cache,
@@ -47,18 +36,12 @@ impl CertFetcher {
         }
     }
 
-    /// Fetch a certificate by name.
-    ///
-    /// Returns immediately if the cert is already cached. Otherwise, expresses
-    /// an Interest, decodes the response, and caches it. Concurrent requests
-    /// for the same name are deduplicated (only one Interest is sent).
+    /// Fetch a certificate by name, deduplicating concurrent requests.
     pub async fn fetch(&self, cert_name: &Arc<Name>) -> Result<Certificate, TrustError> {
-        // Fast path: already cached.
         if let Some(cert) = self.cert_cache.get(cert_name) {
             return Ok(cert);
         }
 
-        // Check if someone is already fetching this cert.
         if let Some(entry) = self.in_flight.get(cert_name) {
             let mut rx = entry.subscribe();
             drop(entry);
@@ -70,13 +53,11 @@ impl CertFetcher {
             };
         }
 
-        // We're the first — initiate the fetch.
         let (tx, _) = broadcast::channel(1);
         self.in_flight.insert(Arc::clone(cert_name), tx.clone());
 
         let result = self.do_fetch(cert_name).await;
 
-        // Notify waiters and clean up.
         let cert = result.as_ref().ok().cloned();
         let _ = tx.send(cert);
         self.in_flight.remove(cert_name);
@@ -118,7 +99,6 @@ mod tests {
         ]))
     }
 
-    /// Build a minimal cert Data packet for testing.
     fn make_cert_data(name: &Name, pk: &[u8]) -> Data {
         let mut signed = TlvWriter::new();
         // Name
@@ -189,7 +169,6 @@ mod tests {
         let cert = fetcher.fetch(&cert_name).await.unwrap();
         assert_eq!(cert.public_key.as_ref(), &[2; 32]);
 
-        // Should be in cache now.
         assert!(cache.get(&cert_name).is_some());
     }
 
@@ -229,7 +208,6 @@ mod tests {
 
         let fetcher = Arc::new(CertFetcher::new(cache, fetch_fn, Duration::from_secs(1)));
 
-        // Launch two concurrent fetches for the same cert.
         let f1 = {
             let fetcher = Arc::clone(&fetcher);
             let name = Arc::clone(&cert_name);
@@ -244,7 +222,6 @@ mod tests {
         let (r1, r2) = tokio::join!(f1, f2);
         assert!(r1.unwrap().is_ok());
         assert!(r2.unwrap().is_ok());
-        // Only one actual fetch should have been made.
         assert_eq!(fetch_count.load(Ordering::Relaxed), 1);
     }
 }

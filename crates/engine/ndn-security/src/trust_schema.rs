@@ -532,8 +532,6 @@ mod tests {
         assert_eq!(schema.rules().len(), 1);
     }
 
-    // ── LVS binary import integration ─────────────────────────────────────
-
     /// Build a minimal LVS binary fixture equivalent to the native rule
     /// `"/app => /key"` — root has two ValueEdges, and the "app" node's
     /// SignConstraint points at the "key" node.
@@ -555,7 +553,6 @@ mod tests {
             };
             write_tlv(buf, t, &be);
         }
-        /// Write COMPONENT_VALUE TLV wrapping a GenericNameComponent.
         fn write_cv(buf: &mut BytesMut, bytes: &[u8]) {
             let mut nc = Vec::with_capacity(2 + bytes.len());
             nc.push(0x08);
@@ -663,8 +660,6 @@ mod tests {
         let err = TrustSchema::from_lvs_binary(&out).unwrap_err();
         assert!(matches!(err, LvsError::UnsupportedVersion { .. }));
     }
-
-    // ── Original hierarchical test ─────────────────────────────────────────
 
     #[test]
     fn hierarchical_requires_matching_first_component() {

@@ -29,7 +29,6 @@ impl TlvWriter {
         self.buf.put_slice(&tmp[..n]);
     }
 
-    /// Write a flat TLV element (type + length + value bytes).
     pub fn write_tlv(&mut self, typ: u64, value: &[u8]) {
         self.write_varu64_inner(typ);
         self.write_varu64_inner(value.len() as u64);
@@ -38,9 +37,6 @@ impl TlvWriter {
 
     /// Write a nested TLV element. The closure encodes the inner content;
     /// this method wraps it with the correct outer type and length.
-    ///
-    /// Inner content is written to a temporary writer, then the type, minimal
-    /// length, and content are appended to the main buffer.
     pub fn write_nested<F>(&mut self, typ: u64, f: F)
     where
         F: FnOnce(&mut TlvWriter),
@@ -54,40 +50,27 @@ impl TlvWriter {
         self.buf.put_slice(&inner_bytes);
     }
 
-    /// Write a raw VarNumber (type or length field) without TLV framing.
     pub fn write_varu64(&mut self, value: u64) {
         self.write_varu64_inner(value);
     }
 
-    /// Write raw bytes directly into the buffer (no TLV framing).
-    ///
-    /// Used when embedding a pre-encoded signed region into an outer TLV.
     pub fn write_raw(&mut self, data: &[u8]) {
         self.buf.put_slice(data);
     }
 
-    /// Return a zero-copy view of the bytes written since `start` offset.
-    ///
-    /// Used to read back a signed region written incrementally — e.g. to pass
-    /// it to a signing function or to copy it into an outer TLV.  No allocation.
     pub fn slice_from(&self, start: usize) -> &[u8] {
         &self.buf[start..]
     }
 
-    /// Return a copy of the bytes written since `start` offset.
-    ///
-    /// Prefer [`slice_from`] when a borrowed slice is sufficient.
     #[deprecated(note = "use slice_from for a zero-copy &[u8]")]
     pub fn snapshot(&self, start: usize) -> Vec<u8> {
         self.buf[start..].to_vec()
     }
 
-    /// Freeze and return the encoded bytes.
     pub fn finish(self) -> bytes::Bytes {
         self.buf.freeze()
     }
 
-    /// Current encoded length in bytes.
     pub fn len(&self) -> usize {
         self.buf.len()
     }
@@ -103,7 +86,6 @@ impl Default for TlvWriter {
     }
 }
 
-/// Compute the total encoded size of a TLV element without allocating.
 pub fn tlv_size(typ: u64, value_len: usize) -> usize {
     varu64_size(typ) + varu64_size(value_len as u64) + value_len
 }
@@ -112,8 +94,6 @@ pub fn tlv_size(typ: u64, value_len: usize) -> usize {
 mod tests {
     use super::*;
     use crate::TlvReader;
-
-    // ── write_tlv ─────────────────────────────────────────────────────────────
 
     #[test]
     fn write_tlv_empty_value() {
@@ -170,8 +150,6 @@ mod tests {
         assert_eq!(v2.as_ref(), b"content");
         assert!(r.is_empty());
     }
-
-    // ── write_nested ──────────────────────────────────────────────────────────
 
     #[test]
     fn write_nested_empty_inner() {
@@ -231,8 +209,6 @@ mod tests {
         assert_eq!(v2.as_ref(), b"test");
     }
 
-    // ── tlv_size ──────────────────────────────────────────────────────────────
-
     #[test]
     fn tlv_size_matches_write_tlv_output() {
         let cases: &[(u64, &[u8])] = &[(0x08, b"hello"), (0x0320, &[0xAB, 0xCD]), (0x21, &[])];
@@ -248,8 +224,6 @@ mod tests {
             );
         }
     }
-
-    // ── len / is_empty / with_capacity ────────────────────────────────────────
 
     #[test]
     fn writer_starts_empty() {

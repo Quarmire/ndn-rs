@@ -17,9 +17,7 @@ use ndn_transport::AnyMap;
 ///
 /// No changes to `StrategyContext`, `StrategyStage`, or existing enrichers are needed.
 pub trait ContextEnricher: Send + Sync + 'static {
-    /// Human-readable name (for logging / debug).
     fn name(&self) -> &str;
 
-    /// Insert zero or more typed values into `extensions`.
     fn enrich(&self, fib_entry: Option<&FibEntry>, extensions: &mut AnyMap);
 }

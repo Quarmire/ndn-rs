@@ -12,22 +12,18 @@ use ndn_packet::{Data, Interest, Nack, Name, tlv_type};
 use ndn_store::NameHashes;
 use ndn_transport::{FaceId, FaceScope, FaceTable};
 
-/// Check if a name starts with `/localhost`.
 fn is_localhost_name(name: &Name) -> bool {
     name.components()
         .first()
         .is_some_and(|c| c.value.as_ref() == b"localhost")
 }
 
-/// NDNLPv2 congestion mark, stored as a tag in `PacketContext::tags`.
 #[derive(Clone, Copy, Debug)]
 pub struct CongestionMark(pub u64);
 
-/// NDNLPv2 NextHopFaceId (app→forwarder), stored as a tag.
 #[derive(Clone, Copy, Debug)]
 pub struct NextHopFaceId(pub u64);
 
-/// NDNLPv2 CachePolicy from LP header, stored as a tag.
 #[derive(Clone, Copy, Debug)]
 pub struct LpCachePolicy(pub ndn_packet::CachePolicyType);
 
@@ -43,16 +39,10 @@ pub struct LpCachePolicy(pub ndn_packet::CachePolicyType);
 /// arriving on non-local faces are dropped.
 pub struct TlvDecodeStage {
     pub face_table: Arc<FaceTable>,
-    /// Per-face NDNLPv2 fragment reassembly buffers.
-    ///
-    /// Keyed by FaceId so fragments from different faces are reassembled
-    /// independently.  Buffers are created on first fragmented packet and
-    /// cleaned up lazily via `purge_expired()`.
     pub(crate) reassembly: DashMap<FaceId, ReassemblyBuffer>,
 }
 
 impl TlvDecodeStage {
-    /// Create a new decode stage.
     pub fn new(face_table: Arc<FaceTable>) -> Self {
         Self {
             face_table,
@@ -60,27 +50,19 @@ impl TlvDecodeStage {
         }
     }
 
-    /// Fast-path fragment collection that bypasses `PacketContext` creation.
+    /// Fast-path fragment collection bypassing `PacketContext` creation.
     ///
-    /// If the raw bytes are a fragmented LpPacket, parses just the header fields
-    /// and feeds the fragment to the per-face `ReassemblyBuffer`.
-    ///
-    /// Returns:
-    /// - `Ok(Some(bytes))` — reassembly completed, `bytes` is the full packet
-    /// - `Ok(None)` — fragment buffered, waiting for more
-    /// - `Err(bytes)` — not a fragment (bare packet, unfragmented LpPacket, or
-    ///   Nack); caller should process through the full pipeline. The original
-    ///   bytes are returned back.
+    /// - `Ok(Some(bytes))` -- reassembly complete
+    /// - `Ok(None)` -- fragment buffered, waiting for more
+    /// - `Err(bytes)` -- not a fragment; process through full pipeline
     pub fn try_collect_fragment(
         &self,
         face_id: FaceId,
         raw: Bytes,
     ) -> Result<Option<Bytes>, Bytes> {
-        // Lightweight parse: only extract fragmentation fields, no Bytes
-        // allocation, no Nack/CongestionMark parsing.
         let hdr = match extract_fragment(&raw) {
             Some(h) => h,
-            None => return Err(raw), // Not a multi-fragment LpPacket.
+            None => return Err(raw),
         };
         let fragment = raw.slice(hdr.frag_start..hdr.frag_end);
         let base_seq = hdr.sequence - hdr.frag_index;
@@ -130,7 +112,6 @@ impl TlvDecodeStage {
         }
     }
 
-    /// Decode a bare Interest, enforcing HopLimit and inserting Nonce.
     fn decode_interest(&self, mut ctx: PacketContext) -> Action {
         match Interest::decode(ctx.raw_bytes.clone()) {
             Ok(interest) => {
@@ -140,9 +121,6 @@ impl TlvDecodeStage {
                 }
                 trace!(face=%ctx.face_id, name=%interest.name, nonce=?interest.nonce(), "decode: Interest");
                 ctx.raw_bytes = ensure_nonce(&ctx.raw_bytes);
-                // Pre-compute cumulative prefix hashes only when names are long
-                // enough to recoup the cost.  For ≤3 components the per-probe
-                // re-hashing in PitMatchStage is cheaper than the upfront work.
                 if interest.name.len() > 3 {
                     ctx.name_hashes = Some(NameHashes::compute(&interest.name));
                 }
@@ -160,7 +138,6 @@ impl TlvDecodeStage {
         }
     }
 
-    /// Drop packets with `/localhost` names arriving on non-local faces.
     fn check_scope(&self, ctx: &PacketContext) -> Option<Action> {
         if let Some(ref name) = ctx.name
             && is_localhost_name(name)
@@ -192,7 +169,6 @@ impl TlvDecodeStage {
             }
         };
 
-        // Propagate LP header fields through the pipeline via tags/context.
         if let Some(mark) = lp.congestion_mark {
             ctx.tags.insert(CongestionMark(mark));
         }
@@ -206,7 +182,6 @@ impl TlvDecodeStage {
             ctx.tags.insert(LpCachePolicy(*policy));
         }
 
-        // Bare Ack-only packets have no payload to process.
         if lp.is_ack_only() {
             return Action::Drop(DropReason::FragmentCollect);
         }
@@ -222,7 +197,6 @@ impl TlvDecodeStage {
             None => return Action::Drop(DropReason::MalformedPacket),
         };
 
-        // Fragment reassembly: buffer until all fragments arrive.
         if is_fragmented {
             let face_id = ctx.face_id;
             let complete = {
@@ -239,14 +213,12 @@ impl TlvDecodeStage {
                     return self.process(ctx);
                 }
                 None => {
-                    // Still waiting for more fragments — not an error.
                     return Action::Drop(DropReason::FragmentCollect);
                 }
             }
         }
 
         if let Some(reason) = nack {
-            // LpPacket with Nack header: fragment is the nacked Interest.
             match Interest::decode(fragment) {
                 Ok(interest) => {
                     trace!(face=%ctx.face_id, name=%interest.name, reason=?reason, "decode: Nack");
@@ -267,7 +239,6 @@ impl TlvDecodeStage {
                 }
             }
         } else {
-            // Plain LpPacket wrapping Interest or Data.
             ctx.raw_bytes = fragment;
             self.process(ctx)
         }

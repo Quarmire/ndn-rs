@@ -4,45 +4,6 @@
 //! decouple discovery logic from the engine core, along with supporting types
 //! and the [`NoDiscovery`] null object for routers that do not need automatic
 //! neighbor finding.
-//!
-//! ## Architecture
-//!
-//! The engine owns a single `Arc<dyn DiscoveryProtocol>` field.  Protocols
-//! observe face lifecycle events and inbound packets via hooks; they mutate
-//! engine state (faces, FIB, neighbor table) exclusively through the narrow
-//! [`DiscoveryContext`] interface.
-//!
-//! Multiple protocols can run simultaneously via [`CompositeDiscovery`], which
-//! validates that their claimed name prefixes do not overlap at construction
-//! time and routes inbound packets by prefix match.
-//!
-//! ## Crate layout
-//!
-//! **Framework (crate root):** Core traits and shared infrastructure.
-//!
-//! | Module | Contents |
-//! |--------|----------|
-//! | [`protocol`]        | `DiscoveryProtocol` trait, `ProtocolId` |
-//! | [`context`]         | `DiscoveryContext`, `NeighborTableView` traits |
-//! | [`neighbor`]        | `NeighborTable`, `NeighborEntry`, `NeighborState`, `NeighborUpdate` |
-//! | [`mac_addr`]        | `MacAddr` — link-layer address shared between discovery and face layer |
-//! | [`no_discovery`]    | `NoDiscovery` — no-op protocol for standalone deployments |
-//! | [`composite`]       | `CompositeDiscovery` — runs multiple protocols simultaneously |
-//! | [`backoff`]         | `BackoffConfig`, `BackoffState` — exponential backoff with jitter |
-//! | [`config`]          | `DiscoveryConfig`, `DiscoveryProfile`, `ServiceDiscoveryConfig` |
-//! | [`scope`]           | Well-known namespace prefixes and link-local scope predicates |
-//! | [`wire`]            | Shared TLV encoding/decoding helpers |
-//!
-//! **Protocol implementations (subdirectories):**
-//!
-//! | Module | Contents |
-//! |--------|----------|
-//! | [`hello`]            | SWIM/Hello protocol family: payload codec, state machine, UDP impl |
-//! | [`hello::probe`]     | SWIM direct/indirect probe packet builders and parsers |
-//! | [`gossip`]           | Epidemic gossip and SVS service-discovery sync |
-//! | [`service_discovery`]| Service record publication and browsing (`/ndn/local/sd/services/`) |
-//! | [`strategy`]         | `NeighborProbeStrategy` trait and scheduler implementations |
-//! | [`prefix_announce`]  | Service record publisher and browser |
 
 #![allow(missing_docs)]
 

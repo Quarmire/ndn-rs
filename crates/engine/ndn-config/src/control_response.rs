@@ -11,15 +11,11 @@ use ndn_tlv::{TlvReader, TlvWriter};
 
 use crate::control_parameters::ControlParameters;
 
-// ─── TLV type constants ──────────────────────────────────────────────────────
-
 pub mod tlv {
     pub const CONTROL_RESPONSE: u64 = 0x65;
     pub const STATUS_CODE: u64 = 0x66;
     pub const STATUS_TEXT: u64 = 0x67;
 }
-
-// ─── Status codes ────────────────────────────────────────────────────────────
 
 pub mod status {
     pub const OK: u64 = 200;
@@ -29,8 +25,6 @@ pub mod status {
     pub const CONFLICT: u64 = 409;
     pub const SERVER_ERROR: u64 = 500;
 }
-
-// ─── ControlResponse ─────────────────────────────────────────────────────────
 
 /// NFD ControlResponse.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,7 +36,6 @@ pub struct ControlResponse {
 }
 
 impl ControlResponse {
-    /// Create a 200 OK response with echoed parameters.
     pub fn ok(text: impl Into<String>, body: ControlParameters) -> Self {
         Self {
             status_code: status::OK,
@@ -51,7 +44,6 @@ impl ControlResponse {
         }
     }
 
-    /// Create a 200 OK response with no body.
     pub fn ok_empty(text: impl Into<String>) -> Self {
         Self {
             status_code: status::OK,
@@ -60,7 +52,6 @@ impl ControlResponse {
         }
     }
 
-    /// Create an error response.
     pub fn error(code: u64, text: impl Into<String>) -> Self {
         Self {
             status_code: code,
@@ -69,19 +60,16 @@ impl ControlResponse {
         }
     }
 
-    /// Whether the response indicates success (2xx).
     pub fn is_ok(&self) -> bool {
         (200..300).contains(&self.status_code)
     }
 
-    /// Encode to wire format as a complete ControlResponse TLV (type 0x65).
     pub fn encode(&self) -> Bytes {
         let mut w = TlvWriter::new();
         w.write_nested(tlv::CONTROL_RESPONSE, |w| {
             write_non_neg_int(w, tlv::STATUS_CODE, self.status_code);
             w.write_tlv(tlv::STATUS_TEXT, self.status_text.as_bytes());
             if let Some(ref body) = self.body {
-                // Encode ControlParameters inline (with outer 0x68 wrapper).
                 let body_bytes = body.encode();
                 w.write_raw(&body_bytes);
             }
@@ -89,7 +77,6 @@ impl ControlResponse {
         w.finish()
     }
 
-    /// Decode from a complete ControlResponse TLV (type 0x65).
     pub fn decode(wire: Bytes) -> Result<Self, ControlResponseError> {
         let mut r = TlvReader::new(wire);
         let (typ, value) = r
@@ -101,7 +88,6 @@ impl ControlResponse {
         Self::decode_value(value)
     }
 
-    /// Decode from the inner value bytes (without the outer 0x65 wrapper).
     pub fn decode_value(value: Bytes) -> Result<Self, ControlResponseError> {
         let mut r = TlvReader::new(value);
         let mut status_code = None;
@@ -129,7 +115,7 @@ impl ControlResponse {
                             .map_err(|_| ControlResponseError::MalformedTlv)?,
                     );
                 }
-                _ => {} // skip unknown
+                _ => {}
             }
         }
 
@@ -140,8 +126,6 @@ impl ControlResponse {
         })
     }
 }
-
-// ─── Errors ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ControlResponseError {
@@ -156,8 +140,6 @@ pub enum ControlResponseError {
     #[error("missing required field: {0}")]
     MissingField(&'static str),
 }
-
-// ─── NonNegativeInteger helpers ──────────────────────────────────────────────
 
 fn encode_non_neg_int(value: u64) -> Vec<u8> {
     if value <= 0xFF {
@@ -186,8 +168,6 @@ fn read_non_neg_int(buf: &[u8]) -> Result<u64, ControlResponseError> {
         _ => Err(ControlResponseError::InvalidNonNegInt),
     }
 }
-
-// ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

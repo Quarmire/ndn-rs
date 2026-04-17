@@ -79,30 +79,26 @@ pub enum CongestionController {
     Fixed { window: f64 },
 }
 
-// ─── Defaults ────────────────────────────────────────────────────────────────
-
 const DEFAULT_INITIAL_WINDOW: f64 = 2.0;
 const DEFAULT_MIN_WINDOW: f64 = 2.0;
 const DEFAULT_MAX_WINDOW: f64 = 65536.0;
 const DEFAULT_SSTHRESH: f64 = f64::MAX;
 
-// AIMD defaults (matches ndncatchunks).
 const AIMD_ADDITIVE_INCREASE: f64 = 1.0;
 const AIMD_MULTIPLICATIVE_DECREASE: f64 = 0.5;
 
-// CUBIC defaults (RFC 8312).
+// RFC 8312 defaults.
 const CUBIC_C: f64 = 0.4;
 const CUBIC_BETA: f64 = 0.7;
 
 impl Default for CongestionController {
-    /// Default: AIMD with standard parameters.
     fn default() -> Self {
         Self::aimd()
     }
 }
 
 impl CongestionController {
-    /// AIMD with standard parameters (matches `ndncatchunks`).
+    /// AIMD with `ndncatchunks`-compatible parameters.
     pub fn aimd() -> Self {
         Self::Aimd {
             window: DEFAULT_INITIAL_WINDOW,
@@ -114,7 +110,7 @@ impl CongestionController {
         }
     }
 
-    /// CUBIC with standard parameters (RFC 8312).
+    /// CUBIC with RFC 8312 parameters.
     pub fn cubic() -> Self {
         Self::Cubic {
             window: DEFAULT_INITIAL_WINDOW,
@@ -128,31 +124,20 @@ impl CongestionController {
         }
     }
 
-    /// Fixed window (no adaptation).
     pub fn fixed(window: f64) -> Self {
         Self::Fixed { window }
     }
 
-    // ─── Builder-style parameter setters ────────────────────────────────
-
     /// Set the initial and current window size.
     ///
-    /// For Cubic, this also updates `w_max` to match so the cubic
-    /// formula's "recovery target" reflects the user's intent. Without
-    /// this, a caller that does `cubic().with_window(N).with_ssthresh(N)`
-    /// for large N would leave `w_max` at its tiny default value (2.0),
-    /// and the first `on_data()` call would take the cubic branch
-    /// (since `window >= ssthresh`) and collapse the window back toward
-    /// `w_max = 2`. See the `cubic_does_not_collapse_at_large_initial_window`
-    /// regression test.
+    /// For Cubic, also updates `w_max` so the cubic formula's recovery
+    /// target reflects the caller's intent rather than the default 2.0.
+    /// See `cubic_does_not_collapse_at_large_initial_window` regression test.
     pub fn with_window(mut self, w: f64) -> Self {
         match &mut self {
             Self::Aimd { window, .. } | Self::Fixed { window } => *window = w,
             Self::Cubic { window, w_max, .. } => {
                 *window = w;
-                // Treat the new initial window as the current "best"
-                // so the cubic formula's post-loss trajectory points
-                // at this window, not the default 2.0.
                 if *w_max < w {
                     *w_max = w;
                 }
@@ -161,7 +146,7 @@ impl CongestionController {
         self
     }
 
-    /// Set the minimum window (floor after decrease). Ignored by Fixed.
+    /// Set the minimum window (floor after decrease).
     pub fn with_min_window(mut self, w: f64) -> Self {
         match &mut self {
             Self::Aimd { min_window, .. } | Self::Cubic { min_window, .. } => *min_window = w,
@@ -170,7 +155,7 @@ impl CongestionController {
         self
     }
 
-    /// Set the maximum window (ceiling). Ignored by Fixed.
+    /// Set the maximum window.
     pub fn with_max_window(mut self, w: f64) -> Self {
         match &mut self {
             Self::Aimd { max_window, .. } | Self::Cubic { max_window, .. } => *max_window = w,
@@ -179,7 +164,7 @@ impl CongestionController {
         self
     }
 
-    /// Set AIMD additive increase per RTT (default: 1.0). Only affects AIMD.
+    /// Set AIMD additive increase per RTT (default: 1.0).
     pub fn with_additive_increase(mut self, ai: f64) -> Self {
         if let Self::Aimd {
             additive_increase, ..
@@ -203,7 +188,7 @@ impl CongestionController {
         self
     }
 
-    /// Set CUBIC scaling constant C (default: 0.4). Only affects CUBIC.
+    /// Set CUBIC scaling constant C (default: 0.4, RFC 8312).
     pub fn with_cubic_c(mut self, c_val: f64) -> Self {
         if let Self::Cubic { c, .. } = &mut self {
             *c = c_val;
@@ -224,9 +209,7 @@ impl CongestionController {
         self
     }
 
-    /// Current window size (number of Interests allowed in flight).
-    ///
-    /// Callers should use `window().floor() as usize` for the actual limit.
+    /// Current window size. Use `window().floor() as usize` for the actual limit.
     pub fn window(&self) -> f64 {
         match self {
             Self::Aimd { window, .. } | Self::Cubic { window, .. } | Self::Fixed { window } => {
@@ -235,7 +218,7 @@ impl CongestionController {
         }
     }
 
-    /// A Data packet was received successfully (no congestion mark).
+    /// A Data packet was received without a congestion mark.
     pub fn on_data(&mut self) {
         match self {
             Self::Aimd {
@@ -246,10 +229,8 @@ impl CongestionController {
                 ..
             } => {
                 if *window < *ssthresh {
-                    // Slow start: exponential growth.
                     *window += 1.0;
                 } else {
-                    // Congestion avoidance: additive increase.
                     *window += *additive_increase / *window;
                 }
                 *window = window.min(*max_window);
@@ -274,22 +255,11 @@ impl CongestionController {
                     let t = *acks_since_loss as f64 / *window;
                     let k = ((*w_max * (1.0 - *beta)) / *c).cbrt();
                     let w_cubic = *c * (t - k).powi(3) + *w_max;
-                    // TCP-friendly region: at least as aggressive as AIMD.
+                    // TCP-friendly region (RFC 8312 section 4.3).
                     let w_tcp = *w_max * *beta
                         + (3.0 * (1.0 - *beta) / (1.0 + *beta))
                             * (*acks_since_loss as f64 / *window);
-                    // Congestion avoidance must be *monotonic* — a
-                    // successful data delivery can never justify
-                    // shrinking the window. Without the `.max(*window)`
-                    // clause, the cubic formula can return a value
-                    // below the current window when `t < K` (i.e. we
-                    // haven't "recovered" to `w_max` yet by the model's
-                    // clock). That happens naturally right after a
-                    // loss event but the model can also produce it at
-                    // initialisation if `w_max` hasn't caught up to
-                    // the user's initial window yet. The RFC 8312
-                    // phrasing is "cwnd SHOULD be set to max(cwnd,
-                    // W_cubic, W_est)"; we match that.
+                    // RFC 8312: "cwnd SHOULD be set to max(cwnd, W_cubic, W_est)".
                     *window = w_cubic.max(w_tcp).max(*window);
                 }
                 *window = window.min(*max_window);
@@ -298,18 +268,12 @@ impl CongestionController {
         }
     }
 
-    /// A CongestionMark was received on a Data packet.
-    ///
-    /// Reduces the window but does NOT trigger retransmission — the Data
-    /// was delivered successfully, only the sending rate should decrease.
+    /// A CongestionMark was received. Reduces window but not retransmission.
     pub fn on_congestion_mark(&mut self) {
         self.decrease("mark");
     }
 
-    /// An Interest timed out (no Data received within lifetime).
-    ///
-    /// More aggressive reduction than congestion mark since timeout
-    /// indicates actual packet loss, not just queue buildup.
+    /// An Interest timed out.
     pub fn on_timeout(&mut self) {
         self.decrease("timeout");
     }
@@ -344,7 +308,7 @@ impl CongestionController {
         }
     }
 
-    /// Reset to initial state (e.g. on route change or new flow).
+    /// Reset to initial state.
     pub fn reset(&mut self) {
         match self {
             Self::Aimd {
@@ -379,7 +343,7 @@ mod tests {
         let mut cc = CongestionController::aimd();
         assert_eq!(cc.window(), 2.0);
         cc.on_data();
-        assert_eq!(cc.window(), 3.0); // +1 in slow start
+        assert_eq!(cc.window(), 3.0);
         cc.on_data();
         assert_eq!(cc.window(), 4.0);
     }
@@ -387,11 +351,9 @@ mod tests {
     #[test]
     fn aimd_congestion_avoidance() {
         let mut cc = CongestionController::aimd();
-        // Force out of slow start.
-        cc.on_congestion_mark(); // ssthresh = 2*0.5 = 2, window = 2
+        cc.on_congestion_mark();
         assert_eq!(cc.window(), DEFAULT_MIN_WINDOW);
 
-        // Now in congestion avoidance: window grows by 1/window per ack.
         let w_before = cc.window();
         cc.on_data();
         let expected = w_before + 1.0 / w_before;
@@ -401,7 +363,6 @@ mod tests {
     #[test]
     fn aimd_multiplicative_decrease() {
         let mut cc = CongestionController::aimd();
-        // Grow window in slow start.
         for _ in 0..10 {
             cc.on_data();
         }
@@ -424,7 +385,6 @@ mod tests {
     #[test]
     fn aimd_respects_min_window() {
         let mut cc = CongestionController::aimd();
-        // Repeated losses should not go below min_window.
         for _ in 0..20 {
             cc.on_timeout();
         }
@@ -442,19 +402,14 @@ mod tests {
     #[test]
     fn cubic_recovers_after_loss() {
         let mut cc = CongestionController::cubic();
-        // Grow to a decent window.
         for _ in 0..50 {
             cc.on_data();
         }
         let w_peak = cc.window();
-
-        // Loss event.
         cc.on_congestion_mark();
         let w_after_loss = cc.window();
         assert!(w_after_loss < w_peak);
         assert!((w_after_loss - w_peak * CUBIC_BETA).abs() < 1.0);
-
-        // Recovery: CUBIC should eventually return to w_peak.
         for _ in 0..500 {
             cc.on_data();
         }
@@ -470,23 +425,10 @@ mod tests {
         assert!(cc.window() >= DEFAULT_MIN_WINDOW);
     }
 
-    /// Regression test for the cubic collapse bug observed in the
-    /// `testbed/tests/chunked/matrix.sh` sweep.
-    ///
-    /// A consumer that called
-    /// `CongestionController::cubic().with_window(64).with_ssthresh(64)`
-    /// would see the first `on_data()` call drop the window from 64
-    /// to ~1.4 — because `with_window` didn't update `w_max` (it
-    /// stayed at the default 2.0), and the cubic formula's "recovery
-    /// target" was therefore ~2, which the code assigned to `*window`
-    /// unconditionally. At pipe=64 this turned a 60 ms fetch into a
-    /// 4.5 second fetch because `window.floor()` was 1 for most of
-    /// the subsequent slow-start recovery.
-    ///
-    /// The fix has two parts: `with_window` now updates `w_max` for
-    /// Cubic, and `on_data`'s cubic branch clamps the result to
-    /// `max(cwnd, W_cubic, W_est)` so successful data delivery can
-    /// never shrink the window.
+    /// Regression: `cubic().with_window(64).with_ssthresh(64)` collapsed
+    /// the window to ~1.4 on first `on_data()` because `with_window`
+    /// didn't update `w_max` (stayed at default 2.0). Fixed by syncing
+    /// `w_max` in `with_window` and clamping to `max(cwnd, W_cubic, W_est)`.
     #[test]
     fn cubic_does_not_collapse_at_large_initial_window() {
         let mut cc = CongestionController::cubic()
@@ -511,14 +453,10 @@ mod tests {
                 cc.window()
             );
         }
-        // Cubic's model eventually allows growth past w_max; the
-        // window should be at least the initial 64.
         assert!(cc.window() >= 64.0);
     }
 
-    /// Same shape of test but at the other end of the matrix's
-    /// parameter space — ensures the fix works at the window size
-    /// that was already passing before.
+    /// Same regression at the other end of the parameter space.
     #[test]
     fn cubic_does_not_collapse_at_initial_window_256() {
         let mut cc = CongestionController::cubic()
@@ -532,9 +470,7 @@ mod tests {
         );
     }
 
-    /// `with_window` updates `w_max` for Cubic so the cubic formula's
-    /// post-loss trajectory points at the user-requested window, not
-    /// the default 2.0.
+    /// `with_window` updates `w_max` for Cubic.
     #[test]
     fn cubic_with_window_updates_w_max() {
         let cc = CongestionController::cubic().with_window(100.0);
@@ -547,17 +483,12 @@ mod tests {
         }
     }
 
-    /// If the caller sets a *smaller* window than the default w_max,
-    /// `with_window` must not lower w_max — that would erase loss
-    /// history. The `if *w_max < w` guard preserves the existing
-    /// value when the caller's w is smaller.
+    /// `with_window` must not lower `w_max` — that would erase loss history.
     #[test]
     fn cubic_with_window_never_shrinks_w_max() {
-        // Start with a larger w_max via one loss cycle, then call
-        // with_window with a smaller value. w_max should be unchanged.
         let cc = CongestionController::cubic()
-            .with_window(500.0) // sets w_max = 500
-            .with_window(10.0); // must not shrink w_max below 500
+            .with_window(500.0)
+            .with_window(10.0);
         match cc {
             CongestionController::Cubic { w_max, window, .. } => {
                 assert_eq!(window, 10.0);

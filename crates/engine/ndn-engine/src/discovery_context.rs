@@ -20,28 +20,16 @@ use tracing::warn;
 
 use crate::engine::{DEFAULT_SEND_QUEUE_CAP, EngineInner, FaceState};
 
-/// Side-table tracking which FIB entries were installed by each discovery
-/// protocol, so they can be bulk-removed via `remove_fib_entries_by_owner`.
 type OwnedRoutes = DashMap<ProtocolId, Vec<(Name, FaceId)>>;
 
-/// Engine implementation of `DiscoveryContext`.
-///
-/// Constructed once at engine build time and stored in `EngineInner`.  Every
-/// task that may call `on_face_up` / `on_face_down` / `on_inbound` receives an
-/// `Arc<EngineDiscoveryContext>`.
 pub struct EngineDiscoveryContext {
-    /// Weak reference to the engine's shared inner state.  We use `Weak` here
-    /// so that `EngineInner → Arc<EngineDiscoveryContext> → Weak<EngineInner>`
-    /// doesn't form a strong reference cycle.
+    /// `Weak` breaks the reference cycle
+    /// (EngineInner -> Arc<EngineDiscoveryContext> -> Weak<EngineInner>).
     pub(crate) inner: Weak<EngineInner>,
-    /// Direct strong reference to the neighbor table.  This is the same
-    /// `Arc<NeighborTable>` stored in `EngineInner::neighbors`, duplicated here
-    /// so `neighbors() -> &dyn NeighborTableView` can return a reference valid
-    /// for the lifetime of `&self` without needing to upgrade the `Weak`.
+    /// Duplicated from `EngineInner::neighbors` so `neighbors()` can return a
+    /// reference valid for `&self` without upgrading the `Weak`.
     neighbors: Arc<NeighborTable>,
-    /// Cancellation token for faces dynamically added by discovery protocols.
     pub(crate) cancel: CancellationToken,
-    /// Tracks `(prefix, nexthop_face_id)` pairs for each owning protocol.
     owned_routes: Arc<OwnedRoutes>,
 }
 
@@ -61,7 +49,6 @@ impl EngineDiscoveryContext {
 }
 
 impl DiscoveryContext for EngineDiscoveryContext {
-    // ── Face management ──────────────────────────────────────────────────────
 
     fn alloc_face_id(&self) -> FaceId {
         let inner = match self.inner.upgrade() {
@@ -111,7 +98,6 @@ impl DiscoveryContext for EngineDiscoveryContext {
             .expect("EngineDiscoveryContext not yet initialized")
             .clone();
 
-        // Spawn outbound send task.
         {
             let d = Arc::clone(&discovery);
             let ctx = Arc::clone(&discovery_ctx);
@@ -132,7 +118,6 @@ impl DiscoveryContext for EngineDiscoveryContext {
             ));
         }
 
-        // Spawn inbound recv task.
         let pipeline_tx = match inner.pipeline_tx.get() {
             Some(tx) => tx.clone(),
             None => {
@@ -172,7 +157,6 @@ impl DiscoveryContext for EngineDiscoveryContext {
         inner.face_table.remove(face_id);
     }
 
-    // ── FIB management ───────────────────────────────────────────────────────
 
     fn add_fib_entry(&self, prefix: &Name, nexthop: FaceId, cost: u32, owner: ProtocolId) {
         let inner = match self.inner.upgrade() {
@@ -209,7 +193,6 @@ impl DiscoveryContext for EngineDiscoveryContext {
         }
     }
 
-    // ── Neighbor table ───────────────────────────────────────────────────────
 
     fn neighbors(&self) -> Arc<dyn NeighborTableView> {
         Arc::clone(&self.neighbors) as Arc<dyn NeighborTableView>
@@ -219,7 +202,6 @@ impl DiscoveryContext for EngineDiscoveryContext {
         self.neighbors.apply(update);
     }
 
-    // ── Packet I/O ───────────────────────────────────────────────────────────
 
     fn send_on(&self, face_id: FaceId, pkt: Bytes) {
         let inner = match self.inner.upgrade() {
@@ -231,7 +213,6 @@ impl DiscoveryContext for EngineDiscoveryContext {
         }
     }
 
-    // ── Time ─────────────────────────────────────────────────────────────────
 
     fn now(&self) -> Instant {
         Instant::now()

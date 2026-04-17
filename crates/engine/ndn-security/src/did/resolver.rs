@@ -19,8 +19,6 @@ use crate::did::{
     metadata::{DidResolutionError, DidResolutionResult},
 };
 
-// ── Error type (legacy convenience) ──────────────────────────────────────────
-
 /// High-level DID error for use in application code.
 ///
 /// Resolvers return [`DidResolutionResult`] per the W3C spec; `DidError` is
@@ -40,8 +38,6 @@ pub enum DidError {
     InvalidDocument(String),
 }
 
-// ── DidResolver trait ─────────────────────────────────────────────────────────
-
 /// A resolver that can dereference a DID string to a [`DidResolutionResult`].
 ///
 /// Per W3C DID Core §7.1, `resolve` must return the complete resolution result
@@ -57,8 +53,6 @@ pub trait DidResolver: Send + Sync {
         did: &'a str,
     ) -> Pin<Box<dyn Future<Output = DidResolutionResult> + Send + 'a>>;
 }
-
-// ── UniversalResolver ─────────────────────────────────────────────────────────
 
 /// A resolver that dispatches to method-specific resolvers.
 ///

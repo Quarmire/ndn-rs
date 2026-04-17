@@ -8,7 +8,6 @@ use bytes::Bytes;
 use crate::{Name, PacketError, tlv_type};
 use ndn_tlv::TlvReader;
 
-/// NDN signature algorithm identifiers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SignatureType {
     DigestSha256,
@@ -43,28 +42,20 @@ impl SignatureType {
     }
 }
 
-/// SignatureInfo TLV — algorithm and optional key locator.
+/// SignatureInfo TLV — algorithm, optional key locator, and anti-replay fields.
 ///
-/// The `KeyLocator` TLV may carry either a `Name` (0x07) referencing the
-/// signer's certificate, or a `KeyDigest` (0x1d) carrying a SHA-256 of the
-/// public key. Both forms are decoded; the unused field is `None`. At most
-/// one of `key_locator` or `key_digest` is populated for a given packet.
-///
-/// Also decodes the anti-replay fields from InterestSignatureInfo:
-/// SignatureNonce (0x26), SignatureTime (0x28), SignatureSeqNum (0x2A).
+/// `KeyLocator` carries either a `Name` (signer's certificate) or a `KeyDigest`
+/// (NDN Packet Format §3.2.5). At most one is populated per packet.
 #[derive(Clone, Debug)]
 pub struct SignatureInfo {
     pub sig_type: SignatureType,
-    /// `KeyLocator` → `Name` form: the signer's certificate name.
     pub key_locator: Option<Arc<Name>>,
-    /// `KeyLocator` → `KeyDigest` form: a hash of the signer's public key.
-    /// Implementations resolve this against a local certificate cache.
     pub key_digest: Option<Bytes>,
-    /// Random nonce for anti-replay (NDN Packet Format v0.3 §5.4).
+    /// NDN Packet Format v0.3 §5.4.
     pub sig_nonce: Option<Bytes>,
-    /// Timestamp in milliseconds since Unix epoch (NDN Packet Format v0.3 §5.4).
+    /// NDN Packet Format v0.3 §5.4.
     pub sig_time: Option<u64>,
-    /// Monotonically increasing sequence number (NDN Packet Format v0.3 §5.4).
+    /// NDN Packet Format v0.3 §5.4.
     pub sig_seq_num: Option<u64>,
 }
 
@@ -89,8 +80,6 @@ impl SignatureInfo {
                     sig_type = SignatureType::from_code(code);
                 }
                 t if t == tlv_type::KEY_LOCATOR => {
-                    // KeyLocator carries exactly one of Name (0x07) or
-                    // KeyDigest (0x1d). NDN Packet Format §3.2.5.
                     let mut inner = TlvReader::new(val);
                     if !inner.is_empty() {
                         let (kt, kv) = inner.read_tlv()?;
@@ -151,7 +140,6 @@ mod tests {
         w.finish()
     }
 
-    // ── SignatureType code round-trips ─────────────────────────────────────────
 
     #[test]
     fn sig_type_known_codes() {
@@ -175,7 +163,6 @@ mod tests {
         assert_eq!(SignatureType::from_code(99), SignatureType::Other(99));
     }
 
-    // ── SignatureInfo::decode ─────────────────────────────────────────────────
 
     #[test]
     fn decode_sig_type_only() {
@@ -211,7 +198,6 @@ mod tests {
 
     #[test]
     fn decode_with_key_digest_locator() {
-        // KeyLocator → KeyDigest form: the 32-byte SHA-256 of the public key.
         let digest = [0xABu8; 32];
         let mut w = TlvWriter::new();
         w.write_tlv(crate::tlv_type::SIGNATURE_TYPE, &[5]);
@@ -231,13 +217,11 @@ mod tests {
 
     #[test]
     fn decode_empty_is_other_zero() {
-        // No fields — sig_type defaults to Other(0).
         let si = SignatureInfo::decode(bytes::Bytes::new()).unwrap();
         assert_eq!(si.sig_type, SignatureType::Other(0));
         assert!(si.key_locator.is_none());
     }
 
-    // ── Anti-replay fields ──────────────────────────────────────────────────
 
     #[test]
     fn decode_sig_nonce() {

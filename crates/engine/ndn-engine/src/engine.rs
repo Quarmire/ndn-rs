@@ -37,8 +37,6 @@ use crate::routing::RoutingManager;
 /// links without silent drops.
 pub const DEFAULT_SEND_QUEUE_CAP: usize = 2048;
 
-/// Per-face packet and byte counters.  All fields are `AtomicU64`, updated by
-/// the pipeline without holding any lock.
 #[derive(Default)]
 pub struct FaceCounters {
     pub in_interests: AtomicU64,
@@ -49,33 +47,22 @@ pub struct FaceCounters {
     pub out_bytes: AtomicU64,
 }
 
-/// Per-face lifecycle state stored alongside the cancellation token.
 pub struct FaceState {
     pub cancel: CancellationToken,
     pub persistency: FacePersistency,
     /// Last packet activity (nanoseconds since Unix epoch).
     /// Updated on recv and send; used for idle-timeout of on-demand faces.
     pub last_activity: AtomicU64,
-    /// Per-face traffic counters (incremented by pipeline stages).
     pub counters: FaceCounters,
-    /// Outbound send queue.
-    ///
-    /// The pipeline pushes packets here via `try_send` (non-blocking) and a
-    /// dedicated per-face send task drains the queue, calling `face.send()`
-    /// sequentially.  This decouples pipeline processing from I/O, preserves
+    /// Outbound send queue. Decouples pipeline processing from I/O, preserves
     /// per-face ordering (critical for TCP framing), and provides bounded
     /// backpressure.
     pub send_tx: mpsc::Sender<bytes::Bytes>,
-    /// NDNLPv2 per-hop reliability state (unicast UDP faces only).
     #[cfg(feature = "face-net")]
     pub reliability: Option<std::sync::Mutex<ndn_faces::net::reliability::LpReliability>>,
-    /// NDNLPv2 link mode: auto-detected at the face I/O layer when the remote
-    /// peer sends LP-wrapped packets (type 0x64).  Once set, the face sender
-    /// wraps all outgoing bare NDN packets in a minimal LpPacket so that
-    /// NDNLPv2-native peers (e.g. NDNts) can parse them.
-    ///
-    /// This mirrors NFD's `GenericLinkService` behavior: LP encoding is a
-    /// per-link property determined by what the peer sends, not by face kind.
+    /// Auto-detected when the remote peer sends LP-wrapped packets (type 0x64).
+    /// Mirrors NFD's `GenericLinkService` behavior: LP encoding is a per-link
+    /// property determined by what the peer sends, not by face kind.
     pub uses_lp: AtomicBool,
 }
 
@@ -101,7 +88,6 @@ impl FaceState {
         }
     }
 
-    /// Create a FaceState with NDNLPv2 reliability enabled.
     #[cfg(feature = "face-net")]
     pub fn new_reliable(
         cancel: CancellationToken,
@@ -135,7 +121,6 @@ impl FaceState {
     }
 }
 
-/// Shared tables owned by the engine, accessible to all tasks via `Arc`.
 pub struct EngineInner {
     pub fib: Arc<Fib>,
     pub rib: Arc<Rib>,
@@ -145,29 +130,18 @@ pub struct EngineInner {
     pub face_table: Arc<FaceTable>,
     pub measurements: Arc<MeasurementsTable>,
     pub strategy_table: Arc<StrategyTable<dyn ErasedStrategy>>,
-    /// Security manager for signing/verification (optional — `None` disables
-    /// security policy enforcement).
     pub security: Option<Arc<SecurityManager>>,
-    /// Active validator — shared with `ValidationStage` and the management API.
-    ///
-    /// The schema inside the validator is behind a `RwLock`, allowing runtime
+    /// Schema inside the validator is behind a `RwLock`, allowing runtime
     /// modification via `/localhost/nfd/security/schema-*` commands.
     pub validator: Option<Arc<Validator>>,
-    /// Pipeline inbound channel — used to spawn readers for dynamically-added
-    /// faces (those registered after `build()` completes).
-    ///
-    /// Stored in `OnceLock` because the sender is obtained from
-    /// `PacketDispatcher::spawn()` which runs after `Arc<EngineInner>` is
-    /// created (needed for the discovery context back-reference).
+    /// `OnceLock` because the sender comes from `PacketDispatcher::spawn()`
+    /// which runs after `Arc<EngineInner>` is created.
     pub(crate) pipeline_tx: OnceLock<mpsc::Sender<InboundPacket>>,
-    /// Per-face state: cancellation token, persistency level, and last activity.
     pub(crate) face_states: Arc<DashMap<FaceId, FaceState>>,
-    /// Active discovery protocol (default: `NoDiscovery`).
     pub discovery: Arc<dyn DiscoveryProtocol>,
-    /// Engine-owned neighbor table shared with discovery protocols.
     pub neighbors: Arc<NeighborTable>,
-    /// Discovery context.  Set once after `Arc<EngineInner>` is created to
-    /// break the reference cycle (EngineInner → Arc<ctx> → Weak<EngineInner>).
+    /// Set once after `Arc<EngineInner>` is created to break the reference
+    /// cycle (EngineInner -> Arc<ctx> -> Weak<EngineInner>).
     pub(crate) discovery_ctx: OnceLock<Arc<EngineDiscoveryContext>>,
 }
 
@@ -208,12 +182,6 @@ impl ForwarderEngine {
         self.inner.security.as_ref().map(Arc::clone)
     }
 
-    /// The active validator, if any.
-    ///
-    /// The returned `Arc<Validator>` is the same instance used by the pipeline.
-    /// Its trust schema can be modified at runtime via
-    /// [`Validator::add_schema_rule`], [`Validator::remove_schema_rule`], and
-    /// [`Validator::set_schema`].
     pub fn validator(&self) -> Option<Arc<Validator>> {
         self.inner.validator.as_ref().map(Arc::clone)
     }
@@ -234,8 +202,6 @@ impl ForwarderEngine {
         Arc::clone(&self.inner.discovery)
     }
 
-    /// The discovery context for this engine.
-    ///
     /// Panics if called before `build()` completes (OnceLock not yet set).
     pub fn discovery_ctx(&self) -> Arc<EngineDiscoveryContext> {
         self.inner
@@ -245,7 +211,6 @@ impl ForwarderEngine {
             .clone()
     }
 
-    /// Look up the source face that originally sent an Interest.
     pub fn source_face_id(&self, interest: &Interest) -> Option<FaceId> {
         let token = PitToken::from_interest_full(
             &interest.name,
@@ -260,19 +225,10 @@ impl ForwarderEngine {
             .flatten()
     }
 
-    /// Register a face and immediately start its packet-reader task.
-    ///
-    /// Persistence defaults to `OnDemand`. Use `add_face_with_persistency` for
-    /// management-created or permanent faces.
     pub fn add_face<F: Face + 'static>(&self, face: F, cancel: CancellationToken) {
         self.add_face_with_persistency(face, cancel, FacePersistency::OnDemand);
     }
 
-    /// Register a face with an explicit persistence level.
-    ///
-    /// Spawns both a recv-reader task (pushes inbound packets to the pipeline
-    /// channel) and a send-writer task (drains the per-face outbound queue
-    /// and calls `face.send()`).
     pub fn add_face_with_persistency<F: Face + 'static>(
         &self,
         face: F,
@@ -306,7 +262,6 @@ impl ForwarderEngine {
         let discovery = Arc::clone(&self.inner.discovery);
         let discovery_ctx = self.discovery_ctx();
 
-        // Spawn the outbound send task.
         tokio::spawn(run_face_sender(
             Arc::clone(&erased),
             send_rx,
@@ -323,7 +278,6 @@ impl ForwarderEngine {
             },
         ));
 
-        // Spawn the inbound recv task.
         tokio::spawn(crate::dispatcher::run_face_reader(
             erased,
             self.inner
@@ -344,18 +298,14 @@ impl ForwarderEngine {
             },
         ));
 
-        // Notify discovery that a new face is up.
         let ctx = self.discovery_ctx();
         discovery.on_face_up(face_id, &*ctx);
     }
 
     /// Register a send-only face (no recv loop spawned).
     ///
-    /// Use this for faces created by a listener that handles inbound packets
-    /// itself via `inject_packet`.  The face is added to the face table so
-    /// the dispatcher can send Data/Nack to it, but no `run_face_reader`
-    /// task is spawned.  A send-writer task is spawned to drain the outbound
-    /// queue.
+    /// For faces created by a listener that handles inbound packets itself
+    /// via `inject_packet`.
     pub fn add_face_send_only<F: Face + 'static>(&self, face: F, cancel: CancellationToken) {
         let face_id = face.id();
         let kind = face.kind();
@@ -399,20 +349,10 @@ impl ForwarderEngine {
             },
         ));
 
-        // Notify discovery (send-only faces are still reachable peers).
         discovery.on_face_up(face_id, &*discovery_ctx);
     }
 
     /// Inject a raw packet into the pipeline as if it arrived from `face_id`.
-    ///
-    /// Processes the reliability layer (Ack extraction / piggybacked Ack
-    /// processing) before enqueuing, matching the same path as `run_face_reader`.
-    /// `meta` carries the link-layer source address when available (use
-    /// `InboundMeta::udp(src)` for UDP listeners, `InboundMeta::none()` when
-    /// the source is implicit in the face).
-    ///
-    /// `discovery.on_inbound()` is called later inside `process_packet`, after
-    /// LP-unwrap and fragment reassembly, at the single call site in the pipeline.
     ///
     /// Returns `Err(())` if the pipeline channel is closed.
     pub async fn inject_packet(
@@ -422,9 +362,6 @@ impl ForwarderEngine {
         arrival: u64,
         meta: ndn_discovery::InboundMeta,
     ) -> Result<(), ()> {
-        // Feed inbound packet to the reliability layer (same as run_face_reader).
-        // This extracts TxSeq for Ack and processes piggybacked Acks from the
-        // remote end.  Only applies when the face has reliability enabled.
         if let Some(states) = self.inner.face_states.get(&face_id)
             && let Some(rel) = states.reliability.as_ref()
         {
@@ -445,7 +382,6 @@ impl ForwarderEngine {
         .map_err(|_| ())
     }
 
-    /// Get the cancellation token for a face, if one exists.
     pub fn face_token(&self, face_id: FaceId) -> Option<CancellationToken> {
         self.inner
             .face_states
@@ -453,25 +389,21 @@ impl ForwarderEngine {
             .map(|r| r.cancel.clone())
     }
 
-    /// Access the face states map (for idle timeout sweeps).
     pub fn face_states(&self) -> Arc<DashMap<FaceId, FaceState>> {
         Arc::clone(&self.inner.face_states)
     }
 }
 
-/// Handle to gracefully shut down the engine.
 pub struct ShutdownHandle {
     pub(crate) cancel: CancellationToken,
     pub(crate) tasks: JoinSet<()>,
 }
 
 impl ShutdownHandle {
-    /// Get a clone of the cancellation token for this engine.
     pub fn cancel_token(&self) -> CancellationToken {
         self.cancel.clone()
     }
 
-    /// Cancel all engine tasks and wait for them to finish.
     pub async fn shutdown(mut self) {
         self.cancel.cancel();
         while let Some(result) = self.tasks.join_next().await {
@@ -482,21 +414,9 @@ impl ShutdownHandle {
     }
 }
 
-/// Per-face outbound send task.
-///
-/// Drains the face's outbound channel and calls `face.send_bytes()` for each
-/// packet, preserving per-face ordering (critical for TCP TLV framing).
-///
-/// For reliability-enabled faces (unicast UDP), outgoing packets are processed
-/// through `LpReliability::on_send()` which fragments, assigns TxSequences,
-/// piggybacks Acks, and buffers for retransmit. A 50ms tick drives the
-/// retransmit timer and flushes pending Acks.
-///
-/// On send error:
-/// - **Permanent**: log and continue (the face retries on the next packet).
-/// - **Persistent/OnDemand**: stop the send loop.
-///
-/// On cancellation or channel close: exits cleanly.
+/// Per-face outbound send task, preserving per-face ordering (critical for
+/// TCP TLV framing). For reliability-enabled faces (unicast UDP), a 50ms tick
+/// drives retransmit and Ack flushing.
 pub(crate) async fn run_face_sender(
     face: Arc<dyn ndn_transport::ErasedFace>,
     mut rx: mpsc::Receiver<bytes::Bytes>,
@@ -513,7 +433,6 @@ pub(crate) async fn run_face_sender(
         discovery,
         discovery_ctx,
     } = ctx;
-    // Check if reliability is enabled by looking at the face state.
     let has_reliability = face_states
         .get(&face_id)
         .map(|s| s.reliability.is_some())
@@ -522,7 +441,6 @@ pub(crate) async fn run_face_sender(
     let mut retx_tick = tokio::time::interval(std::time::Duration::from_millis(50));
     retx_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    // Helper closure for send errors.
     let handle_send_error = |e: ndn_transport::FaceError| -> bool {
         match persistency {
             FacePersistency::Permanent => {
@@ -555,7 +473,6 @@ pub(crate) async fn run_face_sender(
                 };
 
                 if has_reliability {
-                    // Reliability-enabled path: fragment + assign TxSeq + piggyback Acks.
                     let wires = {
                         let state = face_states.get(&face_id);
                         match state.as_ref().and_then(|s| s.reliability.as_ref()) {
@@ -571,11 +488,6 @@ pub(crate) async fn run_face_sender(
                         }
                     }
                 } else {
-                    // Non-reliability path.
-                    // If the peer uses NDNLPv2 (auto-detected by run_face_reader when
-                    // the first LP-wrapped packet arrives), wrap outgoing packets in a
-                    // minimal LpPacket so the peer can parse them.  encode_lp_packet is
-                    // idempotent: LP-already-wrapped Nacks pass through unchanged.
                     let wire = if face_states
                         .get(&face_id)
                         .map(|s| s.uses_lp.load(Ordering::Relaxed))
