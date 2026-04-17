@@ -2,9 +2,8 @@ Great question — this is something the architecture is actually well-positione
 
     What's Already Favorable
 
-    The library-not-daemon design is the key enabler. Unlike NFD (which is a standalone daemon you poke via Unix sockets), ndn-rs is an embeddable library. ForwarderEngine is just a struct you instantiate
-    in-process. This means you can spin up N forwarders in a single process without N OS processes, containers, or network namespaces — which is exactly what makes Mini-NDN hacky (it orchestrates real NFD
-    processes via Mininet/Linux namespaces).
+    The library-not-daemon design is the key enabler. ndn-rs is an embeddable library — ForwarderEngine is just a struct you instantiate
+    in-process. This means you can spin up N forwarders in a single process without N OS processes, containers, or network namespaces.
 
     AppFace / in-process channels. Applications connect via AppFace (channel pair) or ShmFace (shared memory ring). For simulation, AppFace is perfect — it's just a Tokio channel, no real network needed.
 

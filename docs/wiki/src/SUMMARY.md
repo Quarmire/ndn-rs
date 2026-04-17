@@ -37,11 +37,6 @@
 # Design
 
 - [Design Overview](./design/overview.md)
-- [vs. NFD (C++)](./design/vs-nfd.md)
-- [vs. ndnd (Go)](./design/vs-ndnd.md)
-- [vs. NDN-DPDK](./design/vs-ndn-dpdk.md)
-- [vs. NDNph / NDN-Lite (Embedded)](./design/vs-embedded.md)
-- [vs. NDNts / mw-nfd](./design/vs-ndnts.md)
 
 # Deep Dive
 

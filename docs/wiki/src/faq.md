@@ -13,7 +13,7 @@ The mapping is straightforward once you see the two layers:
 - **ndn-rs** (the library) is analogous to **ndn-cxx** (the C++ library). Both provide the core data structures, TLV codec, forwarding engine, and face abstractions that applications link against.
 - **ndn-fwd** (the standalone binary) is analogous to **NFD** (the daemon). Both are thin executables that instantiate the library, open network faces, and run a forwarding loop.
 
-The key difference is architectural philosophy. ndn-cxx and NFD are written in C++ with class hierarchies and virtual dispatch. ndn-rs models the same concepts as composable data pipelines with Rust traits, `Arc`-based shared ownership, and zero-copy `Bytes` throughout. Both implement the same NDN protocol (NDN Packet Format v0.3, NDNLPv2), so they interoperate on the wire.
+Both implement the same NDN protocol (NDN Packet Format v0.3, NDNLPv2), so they interoperate on the wire.
 
 ### What's the difference between ndn-rs and ndn-fwd?
 
@@ -31,13 +31,11 @@ That said, if your application needs to talk to remote NDN nodes or other local 
 
 Yes. ndn-rs uses the standard NDN TLV wire format and NDNLPv2 link protocol, so UDP, TCP, and WebSocket faces can connect to NFD nodes without any translation layer. The management protocol follows NFD's command format for compatibility, meaning tools written for NFD (like nfdc) can also manage ndn-fwd.
 
-### How does ndn-rs handle security differently from ndn-cxx?
+### How does ndn-rs handle security?
 
-NDN's security model is baked into the data itself -- every Data packet carries a signature, and consumers validate signatures against a trust schema. ndn-rs implements the same signing and validation algorithms (ECDSA, RSA, HMAC-SHA256) but leans on Rust's type system to enforce correctness at compile time.
+NDN's security model is baked into the data itself -- every Data packet carries a signature, and consumers validate signatures against a trust schema. ndn-rs implements the same signing and validation algorithms (ECDSA, RSA, HMAC-SHA256).
 
-The `SafeData` vs `Data` distinction is a good example: the type system ensures that only signature-verified data can be inserted into the Content Store or forwarded to faces. In ndn-cxx, this invariant is enforced by convention and runtime checks. In ndn-rs, passing unverified `Data` where `SafeData` is expected is a compile error.
-
-The `ndn-security` crate also provides the trust schema engine and keychain, but unlike ndn-cxx it avoids C library dependencies (no OpenSSL) in favor of pure-Rust cryptography crates (`ring`, `p256`, `rsa`).
+The `ndn-security` crate provides the trust schema engine and keychain, using pure-Rust cryptography crates (`ring`, `p256`).
 
 ### Does ndn-rs support no_std / embedded?
 
@@ -49,21 +47,21 @@ The `ndn-tlv` and `ndn-packet` crates compile with `no_std` (with `alloc`). The 
 
 The analogy to draw is with ndn-cxx, not NFD. ndn-cxx is the C++ library that applications link against; NFD is one particular binary built on top of it. ndn-rs takes the same approach: the forwarding engine is a library, and ndn-fwd is one binary that uses it.
 
-This means applications can embed the full forwarding engine directly, which unlocks several things. In-process communication through `InProcFace` channels avoids IPC serialization entirely. The compiler can see through the entire pipeline and optimize accordingly. And applications that need custom forwarding behavior (novel strategies, application-layer caching, compute-on-fetch) can extend the engine in-process rather than through an external plugin API.
+This means applications can embed the full forwarding engine directly. In-process communication through `InProcFace` channels avoids IPC serialization, and applications that need custom forwarding behavior (novel strategies, application-layer caching) can extend the engine in-process.
 
 For users who just want a standalone forwarder, ndn-fwd provides exactly that -- a thin binary that reads a config file and runs the engine.
 
 ### Why DashMap for the PIT instead of a single Mutex?
 
-The PIT sits on the hot path of every single packet. A single `Mutex` would serialize all pipeline tasks behind one lock, turning your multi-core machine into a single-threaded forwarder under load. `DashMap` provides sharded concurrent access -- multiple pipeline tasks can insert and look up PIT entries in parallel as long as they hash to different shards. In practice, NDN traffic has enough name diversity that shard contention is rare.
+The PIT sits on the hot path of every packet. `DashMap` provides sharded concurrent access so that multiple pipeline tasks can insert and look up PIT entries in parallel as long as they hash to different shards.
 
 ### Why does the CS store wire-format Bytes?
 
-When you get a Content Store hit, the goal is to send the cached Data packet back to the requesting face as fast as possible. Storing wire-format `Bytes` means a CS hit boils down to `face.send(cached_bytes.clone())` -- one atomic reference count increment and you are done. There is no re-encoding step from a decoded `Data` struct back to TLV wire format. For a forwarder where CS hit rate directly determines throughput, this matters.
+Storing wire-format `Bytes` means a CS hit boils down to `face.send(cached_bytes.clone())` -- one atomic reference count increment. There is no re-encoding step from a decoded `Data` struct back to TLV wire format.
 
 ### Why Arc\<Name\> everywhere?
 
-A single Interest creates references to its name in the PIT entry, the FIB lookup, the CS lookup, and the pipeline context -- four places that all need the same name simultaneously. `Arc<Name>` shares one heap allocation across all of them without copying the name's component bytes. Combined with `SmallVec<[NameComponent; 8]>` for stack-allocating typical short names, this keeps per-packet allocation pressure low.
+A single Interest creates references to its name in the PIT entry, the FIB lookup, the CS lookup, and the pipeline context. `Arc<Name>` shares one heap allocation across all of them without copying the name's component bytes.
 
 ## Performance
 

@@ -2,9 +2,9 @@
 
 ## Design Philosophy
 
-This stack treats NDN as **composable data pipelines** with **trait-based polymorphism** rather than class hierarchies. Key departures from ndn-cxx/NFD:
+This stack treats NDN as **composable data pipelines** with **trait-based polymorphism**. Key design choices:
 
-- No separate daemon process — `ForwarderEngine` is a library crate, not a service
+- `ForwarderEngine` is a library crate, not a daemon — applications can embed it directly
 - `AppFace` uses in-process `mpsc` channels as the local fast path; no Unix socket on the data path
 - `PacketContext` passes **by value** through pipeline stages — ownership makes short-circuits compiler-enforced
 - Security is application-layer; the forwarder does not validate signatures on transit Data
@@ -12,7 +12,7 @@ This stack treats NDN as **composable data pipelines** with **trait-based polymo
 
 ## Unified Engine Model
 
-Unlike NFD + ndn-cxx, there is no IPC boundary between the forwarder and the application API:
+There is no IPC boundary between the forwarder and the application API when embedded in-process:
 
 ```
 same-process applications → AppFace (mpsc, ~20 ns)
