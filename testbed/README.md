@@ -84,7 +84,7 @@ corresponding fix lands.
 | A.01 `BLAKE3_DIGEST` 0x03 component rejected by spec-compliant peers | BLOCKER | `tests/audit/a01_blake3_name_component.sh` | FAIL (to be fixed) |
 | A.02 Missing `ParametersSha256DigestComponent` structural validation | MAJOR | `tests/audit/a02_psdc_structural.sh` | pending |
 | A.03 Unknown critical TLVs silently ignored in bodies | MAJOR | `tests/audit/a03_unknown_critical_tlv.sh` | pending |
-| A.09 Signed Interest signs placeholder, not real digest | BLOCKER | `tests/audit/a09_signed_interest_verify.sh` | FAIL (to be fixed) |
+| A.09 Signed Interest signs placeholder, not real digest | ~~BLOCKER~~ **RESOLVED** 2026-05-01 | `tests/audit/a09_signed_interest_verify.sh` + ndn-packet unit test `interest_builder_sign_sync_signed_region_matches_extractor` | unit PASS; interop witness pending helper binary |
 | A.10 `DataBuilder::build()` emits forged DigestSha256 | MAJOR | `tests/audit/a10_databuilder_build_sig.sh` | pending |
 | A.12 Invented "bare Nack TLV" form | MAJOR | already exercised by interop tests (no separate witness) | — |
 | A.15 KeyLocator required/forbidden rules unenforced | MAJOR | `tests/audit/a15_keylocator_rules.sh` | pending |

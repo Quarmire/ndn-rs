@@ -101,14 +101,17 @@ audit doc for file-line citations and recommended remediation.
   `Name` containing this component is rejected by conforming
   decoders. Takes the `ZoneKey` zone-root naming and `did:ndn:v1:…`
   DID integration with it. (*Audit A.01.*)
-- **Signed Interest signing computes the signature over a
-  placeholder `ParametersSha256DigestComponent` and patches the
-  real digest post-sign.** Peers computing the signed region over
-  the real-digest wire bytes will not match the signature. Affects
-  every signed Interest from `ndn-ctl`, `ndn-app`, and any user of
-  `InterestBuilder::sign_sync`. (*Audit A.09 — confirmed against
-  ndn-cxx `Interest::extractSignedRanges`; this is the first item
-  the remediation track will resolve.*)
+- ~~Signed Interest signing computes the signature over a
+  placeholder `ParametersSha256DigestComponent`~~ **RESOLVED
+  2026-05-01.** `InterestBuilder::sign_sync` / `sign` now emit
+  the spec two-range signed region (Name-without-PSDC ‖
+  AppParameters ‖ InterestSignatureInfo) and compute the PSDC
+  value per spec after the signer returns. `Interest::signed_region`
+  on the receive side reconstructs the same two ranges. A new
+  regression witness in `ndn-packet`
+  (`interest_builder_sign_sync_signed_region_matches_extractor`)
+  asserts that the bytes passed to `sign_fn` equal the bytes an
+  extractor reconstructs from the wire. (*Audit A.09.*)
 - **Link-layer reliability emits `Sequence` (0x51, fragmentation)
   where NDNLPv2 requires `TxSequence` (0x0348, reliability).**
   Cross-implementation reliability is broken in both directions.

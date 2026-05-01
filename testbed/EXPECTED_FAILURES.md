@@ -29,7 +29,7 @@ the date and container digest.
 | Finding | Witness test | Status | Predicted failure | Last seen |
 |---------|------|--------|----|-|
 | A.01 | `a01_blake3_name_component.sh` | EXPECTED-FAIL | ndn-cxx / NFD reject Name containing `BLAKE3_DIGEST` (TLV 0x03) | not yet run |
-| A.09 | `a09_signed_interest_verify.sh` | EXPECTED-FAIL | ndn-cxx signature verify fails on a signed Interest produced by ndn-rs | not yet run |
+| A.09 | `a09_signed_interest_verify.sh` | RESOLVED (code-level; interop witness pending helper binary) | Fix landed 2026-05-01; unit regression test `interest_builder_sign_sync_signed_region_matches_extractor` in ndn-packet asserts sign/extract agreement. Interop helper (`ndn-rs-emit-signed-interest`) still needs to be added to unblock the testclient-side witness. | code test added 2026-05-01 |
 | B.01 | `b01_reliability_txsequence.sh` | EXPECTED-FAIL | NFD sees `Sequence` (0x51) where reliability reads `TxSequence` (0x0348); retransmits never cleared | not yet run |
 | C.01 | `c01_ecdsa_verify.sh` | EXPECTED-FAIL | ndn-rs validator returns `Invalid` on an ECDSA-signed Data from ndn-cxx | not yet run |
 | D.01 | `d01_hoplimit_decrement.sh` | EXPECTED-FAIL | tcpdump on ndn-fwd's egress interface shows HopLimit unchanged from ingress | not yet run |
