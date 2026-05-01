@@ -1,12 +1,36 @@
 # ndn-rs
 
+> **Notice: primarily AI-authored, not yet proven correct.**
+>
+> This codebase is primarily authored by an AI coding assistant. A
+> recent evidence-based audit against the NDN specifications —
+> [`docs/notes/spec-compliance-audit-2026-04-20.md`](docs/notes/spec-compliance-audit-2026-04-20.md)
+> — found numerous spec-compliance errors, including BLOCKER-tier
+> wire-format bugs that any conforming NDN peer would reject.
+> Remediation is in progress in the open; see
+> [`testbed/EXPECTED_FAILURES.md`](testbed/EXPECTED_FAILURES.md)
+> for current known-bad behaviours and the
+> [honest spec-compliance summary](docs/wiki/src/reference/spec-compliance.md)
+> for what has been verified against the spec.
+>
+> **Do not use `ndn-rs` as a reference implementation of NDN or
+> cite it as one.** Use [NFD](https://github.com/named-data/NFD),
+> [ndn-cxx](https://github.com/named-data/ndn-cxx),
+> [NDNts](https://github.com/yoursunny/NDNts),
+> [ndnd](https://github.com/named-data/ndnd), or
+> [python-ndn](https://github.com/named-data/python-ndn).
+> `ndn-rs` is developed as an experimental Rust-native NDN stack
+> that aspires to become a trusted implementation via packet-
+> captured interop evidence under [`testbed/`](testbed/), not
+> unilateral claims.
+
 A [Named Data Networking (NDN)](https://named-data.net/) forwarder stack written in Rust (edition 2024). NDN routes packets by name rather than address: consumers express **Interests**; the network routes them toward producers and returns **Data** along the reverse path, caching at every hop.
 
 ndn-rs takes a Rust-idiomatic approach — composable async pipelines with trait-based polymorphism — and targets both standalone forwarder deployments and embedded use within research applications. The engine is a library, not a daemon.
 
 ![ndn-rs logo](docs/logo.svg)
 
-**Status:** pre-release (working toward `v0.1.0` — not yet tagged; track `main` or pull `ghcr.io/quarmire/ndn-fwd:latest`) · **[Releases](https://github.com/Quarmire/ndn-rs/releases)** · **[Wiki](https://quarmire.github.io/ndn-rs/wiki/)** · **[Explorer](https://quarmire.github.io/ndn-rs/explorer/)**
+**Status:** experimental · primarily AI-authored · under spec-compliance remediation (see notice above) · **[Releases](https://github.com/Quarmire/ndn-rs/releases)** · **[Wiki](https://quarmire.github.io/ndn-rs/wiki/)** · **[Explorer](https://quarmire.github.io/ndn-rs/explorer/)**
 
 ---
 

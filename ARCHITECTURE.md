@@ -1,5 +1,16 @@
 # Architecture
 
+> **Notice: primarily AI-authored, not yet proven correct.** The
+> code described below is primarily written by an AI coding
+> assistant and contains spec-compliance bugs catalogued in
+> [`docs/notes/spec-compliance-audit-2026-04-20.md`](docs/notes/spec-compliance-audit-2026-04-20.md).
+> Architectural *intent* is described here; actual *behaviour* may
+> not match until the audit findings are resolved. See the
+> [honest spec-compliance summary](docs/wiki/src/reference/spec-compliance.md)
+> and [`testbed/EXPECTED_FAILURES.md`](testbed/EXPECTED_FAILURES.md).
+> Do not cite this document as evidence of wire-level NDN
+> compatibility.
+
 NDN-RS models Named Data Networking as **composable async pipelines with trait-based polymorphism** — not class hierarchies. The engine is a library, not a daemon.
 
 ## Crate Map

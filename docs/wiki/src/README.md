@@ -1,5 +1,17 @@
 # ndn-rs Wiki
 
+> **Notice: primarily AI-authored, not yet proven correct.** This
+> codebase is primarily authored by an AI coding assistant. A
+> recent spec-compliance audit
+> ([`docs/notes/spec-compliance-audit-2026-04-20.md`](https://github.com/Quarmire/ndn-rs/blob/main/docs/notes/spec-compliance-audit-2026-04-20.md))
+> found numerous wire-format and protocol-semantics errors,
+> including BLOCKER-tier issues that any conforming NDN peer would
+> reject. Remediation is in progress in the open — see the
+> [spec-compliance summary](./reference/spec-compliance.md) and
+> [testbed/EXPECTED_FAILURES.md](https://github.com/Quarmire/ndn-rs/blob/main/testbed/EXPECTED_FAILURES.md).
+> **Do not cite `ndn-rs` as a reference implementation of NDN.**
+> For a reference, use NFD / ndn-cxx / NDNts / ndnd / python-ndn.
+
 **ndn-rs** is a Rust NDN forwarder stack that models Named Data Networking as composable data pipelines with trait-based polymorphism — embeddable as a library, scalable from Cortex-M to multi-core routers.
 
 > **Pre-release.** The workspace reads `0.1.0` but no tag has been published yet — this wiki documents `main`. Pull `ghcr.io/quarmire/ndn-fwd:latest` or build from source. See the [draft release notes](./releases/v0-1-0.md) for planned scope.
