@@ -1,0 +1,31 @@
+=== N.02 BEFORE FIX (2026-05-02) ===
+
+Synthetic transcript: pre-fix, `ReassemblyBuffer::process` took a
+4-arg signature `(seq, frag_index, frag_count, fragment)` and the
+internal `pending` HashMap was keyed by `seq: u64` alone. The
+regression test `n02_per_endpoint_keying_isolates_overlapping_sequences`
+calls `process(endpoint_id, seq, ...)` with 5 args and asserts that
+two endpoints with overlapping `seq=42` produce two distinct pending
+entries — that fails to compile against the old signature
+(E0061 "this method takes 4 arguments but 5 arguments were supplied")
+and would otherwise observe `pending.len() == 1` because the second
+peer's first fragment overwrites the first's slot.
+
+Code-level evidence pre-fix:
+
+  $ grep -n 'pending: HashMap' \
+        crates/foundation/ndn-packet/src/fragment.rs
+  ...:    pending: HashMap<u64, Pending>,    # ← seq-only key
+
+  $ grep -n 'pub fn process' \
+        crates/foundation/ndn-packet/src/fragment.rs
+  ...:    pub fn process(
+  ...:        &mut self,
+  ...:        seq: u64,                    # ← no endpoint_id arg
+  ...:        frag_index: u64,
+  ...:        frag_count: u64,
+  ...:        fragment: Bytes,
+  ...:    ) -> Option<Bytes>
+
+Reference: NFD `daemon/face/lp-reassembler.hpp:134-137` keys by
+`(EndpointId, Sequence)`.
