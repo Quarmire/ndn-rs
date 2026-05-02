@@ -1,0 +1,36 @@
+=== N.03 BEFORE FIX (2026-05-02) ===
+
+
+running 4 tests
+. 1/4
+lp::decode::tests::n03_lp_decode_rejects_out_of_order_headers --- FAILED
+lp::decode::tests::n03_lp_decode_rejects_header_after_fragment --- FAILED
+lp::decode::tests::n03_lp_decode_rejects_duplicate_incoming_face_id --- FAILED
+
+failures:
+
+---- lp::decode::tests::n03_lp_decode_rejects_out_of_order_headers stdout ----
+
+thread 'lp::decode::tests::n03_lp_decode_rejects_out_of_order_headers' (38007525) panicked at crates/foundation/ndn-packet/src/lp/decode.rs:261:14:
+out-of-order LP headers must be rejected (N.03): LpPacket { fragment: Some(b"\x05\x18\x07\x0c\x08\x05audit\x08\x03n03\n\x04\xef\xc8\0\x02\x0c\x02\x0f\xa0"), nack: Some(NoRoute), congestion_mark: None, sequence: None, frag_index: None, frag_count: None, acks: [], pit_token: None, incoming_face_id: Some(3), next_hop_face_id: None, cache_policy: None, tx_sequence: None, non_discovery: false, prefix_announcement: None }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- lp::decode::tests::n03_lp_decode_rejects_header_after_fragment stdout ----
+
+thread 'lp::decode::tests::n03_lp_decode_rejects_header_after_fragment' (38007524) panicked at crates/foundation/ndn-packet/src/lp/decode.rs:302:14:
+header after Fragment must be rejected (N.03): LpPacket { fragment: Some(b"\x05\x18\x07\x0c\x08\x05audit\x08\x03n03\n\x04\xef\xc8\0\0\x0c\x02\x0f\xa0"), nack: None, congestion_mark: None, sequence: None, frag_index: None, frag_count: None, acks: [], pit_token: None, incoming_face_id: Some(7), next_hop_face_id: None, cache_policy: None, tx_sequence: None, non_discovery: false, prefix_announcement: None }
+
+---- lp::decode::tests::n03_lp_decode_rejects_duplicate_incoming_face_id stdout ----
+
+thread 'lp::decode::tests::n03_lp_decode_rejects_duplicate_incoming_face_id' (38007523) panicked at crates/foundation/ndn-packet/src/lp/decode.rs:232:14:
+duplicate IncomingFaceId must be rejected (N.03): LpPacket { fragment: Some(b"\x05\x18\x07\x0c\x08\x05audit\x08\x03n03\n\x04\xef\xc8\0\x01\x0c\x02\x0f\xa0"), nack: None, congestion_mark: None, sequence: None, frag_index: None, frag_count: None, acks: [], pit_token: None, incoming_face_id: Some(11), next_hop_face_id: None, cache_policy: None, tx_sequence: None, non_discovery: false, prefix_announcement: None }
+
+
+failures:
+    lp::decode::tests::n03_lp_decode_rejects_duplicate_incoming_face_id
+    lp::decode::tests::n03_lp_decode_rejects_header_after_fragment
+    lp::decode::tests::n03_lp_decode_rejects_out_of_order_headers
+
+test result: FAILED. 1 passed; 3 failed; 0 ignored; 0 measured; 218 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p ndn-packet --lib`
