@@ -1,0 +1,32 @@
+=== E.03 BEFORE FIX (2026-05-02) ===
+
+The witness pre-fix is a synthetic transcript: the regression tests
+`e03_is_extended_module_classifies_correctly`,
+`e03_effective_require_signed_forces_extended_modules`, and
+`e03_unsigned_security_command_rejected_by_default` reference helper
+functions that did not exist on `main` prior to this commit —
+`is_extended_module` and `effective_require_signed` were added
+alongside the call-site change in `run_ndn_mgmt_handler`. Compiling the
+tests today fails with E0425 ("cannot find function `is_extended_module`"
+and "cannot find function `effective_require_signed`").
+
+Code-level evidence pre-fix:
+
+  $ grep -n 'fn is_extended_module\|fn effective_require_signed' \
+        binaries/ndn-fwd/src/mgmt_ndn.rs
+  (no hits)
+
+  $ grep -n 'authorize_command' binaries/ndn-fwd/src/mgmt_ndn.rs
+  ...
+  if let Err(reason) = authorize_command(
+      &interest,
+      mgmt_handles.command_validator.as_deref(),
+      mgmt_handles.require_signed_commands,
+  )
+
+The audit text at § E.03 is explicit on the privilege concern: "any
+local process can generate an identity, enroll a cert, add a schema
+rule, or delete a key" via `/localhost/nfd/security/*` while
+`require_signed_commands` defaults to `false`. The fix forces the
+extended modules to escalate to signed-required regardless of the
+global flag.

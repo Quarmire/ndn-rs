@@ -1,0 +1,13 @@
+=== E.03 AFTER FIX (2026-05-02) ===
+
+
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+
+=== Witness: testbed/tests/audit/e03_extended_modules_unsigned.sh ===
+ok: extended modules unconditionally require signed commands
+
+=== E.03 RESOLVED — extended mgmt modules require signed commands ===
+EXIT: 0
