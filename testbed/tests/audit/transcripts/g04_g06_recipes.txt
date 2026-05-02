@@ -1,0 +1,18 @@
+=== G.04 + G.06 RECIPE-LEVEL WITNESS (2026-05-02) ===
+
+--- G.04 (NOT-WITNESSABLE: NLSR absence) ---
+ok: no NLSR struct / impl / module in crates/protocols/ndn-routing/
+ok: no callers emit routes under origin=NLSR
+
+=== G.04 NOT-WITNESSABLE — NLSR absence confirmed (roadmap item) ===
+    Re-target this witness once NLSR lands.
+EXIT: 0
+
+--- G.06 (BLOCKED-BY-INTEROP: SWIM-over-NDN vs ndn-autoconfig) ---
+ok: SWIM-over-NDN discovery surface still present (audit-aligned)
+ok: no ndn-autoconfig PROBE handler (architecture-side gap confirmed)
+info: live `ndn-autoconfig` PROBE → response interop is BLOCKED-BY-INTEROP
+      until the ndn-cxx binary plus a DNS TXT fixture land in the testclient image.
+
+=== G.06 BLOCKED-BY-INTEROP — SWIM-over-NDN architecture confirmed; live AutoConfig deferred ===
+EXIT: 0
