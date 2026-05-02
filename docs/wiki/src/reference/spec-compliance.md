@@ -96,11 +96,16 @@ audit doc for file-line citations and recommended remediation.
 
 ### BLOCKER — will be rejected or mis-decoded by any conforming NDN peer
 
-- **`BLAKE3_DIGEST` name component uses TLV-TYPE 0x03**, which is
-  unassigned and in the grandfathered-critical 0–31 range. Any
-  `Name` containing this component is rejected by conforming
-  decoders. Takes the `ZoneKey` zone-root naming and `did:ndn:v1:…`
-  DID integration with it. (*Audit A.01.*)
+- ~~`BLAKE3_DIGEST` name component uses TLV-TYPE 0x03~~ **RESOLVED
+  2026-05-01.** The TLV-TYPE 0x03 name-component surface (the
+  `BLAKE3_DIGEST` constant, `NameComponent::blake3_digest` /
+  `as_blake3_digest`, `Name::append_blake3_digest` /
+  `zone_root_from_hash` / `is_zone_root`, the `blake3digest=` URI
+  alt-form) was removed from `ndn-packet`. The `ZoneKey` module and
+  the zone-bound DID builders / resolver branch were extracted from
+  `ndn-security`; the CA-anchored DID resolver path is retained.
+  Witness: `testbed/tests/audit/a01_blake3_name_component.sh` (now a
+  GREP-PROOF). (*Audit A.01.*)
 - ~~Signed Interest signing computes the signature over a
   placeholder `ParametersSha256DigestComponent`~~ **RESOLVED
   2026-05-01.** `InterestBuilder::sign_sync` / `sign` now emit
@@ -112,10 +117,15 @@ audit doc for file-line citations and recommended remediation.
   (`interest_builder_sign_sync_signed_region_matches_extractor`)
   asserts that the bytes passed to `sign_fn` equal the bytes an
   extractor reconstructs from the wire. (*Audit A.09.*)
-- **Link-layer reliability emits `Sequence` (0x51, fragmentation)
-  where NDNLPv2 requires `TxSequence` (0x0348, reliability).**
-  Cross-implementation reliability is broken in both directions.
-  (*Audit B.01.*)
+- ~~Link-layer reliability emits `Sequence` (0x51) where NDNLPv2
+  requires `TxSequence` (0x0348)~~ **RESOLVED 2026-05-01.**
+  `encode_lp_reliable` now emits `TxSequence` (0x0348) for the
+  per-LP reliability sequence and emits `Sequence` (0x51) only as
+  the network-packet identifier shared across fragments;
+  `extract_acks` reads `0x0348`; `LpReliability` keys its `unacked`
+  map on TxSequence (since Acks reference TxSequence values).
+  Witness: `testbed/tests/audit/b01_reliability_txsequence.sh`
+  (RUST-UNIT). (*Audit B.01 + B.09.*)
 - **`Validator` hard-wires `Ed25519Verifier` as a concrete
   field** instead of dispatching on `SignatureType`. RSA and ECDSA
   packets — every NDN testbed packet — return `Invalid`. No
@@ -170,7 +180,8 @@ audit doc for file-line citations and recommended remediation.
   with `<Version>` encoded as `VersionNameComponent` (0x36).
   Content is the raw Ed25519 public key, not DER-wrapped
   `SubjectPublicKeyInfo`. Identities built by ndn-rs cannot be
-  used by ndn-cxx's `ndnsec`. (*C.07, C.08.*)
+  used by ndn-cxx's `ndnsec`. (*C.07, C.08 — both **RESOLVED
+  2026-05-01**.*)
 - **No path validates signed Interests.** `ValidationStage`
   handles Data only; `mgmt_ndn.rs` dispatches on command
   Interests without touching signature fields. (*C.11,

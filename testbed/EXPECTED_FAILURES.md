@@ -18,23 +18,36 @@ before/after transcripts to the PR description.
   cannot produce a failing test — it's the absence of a
   protocol).
 
-Last reviewed: 2026-04-20 (initial, immediately after the audit;
-no interop run has been executed against these scripts yet — the
-statuses below are predictions from the audit, not measurements).
-When the harness is first run, update the "Last seen" column with
-the date and container digest.
+Last reviewed: 2026-05-01 (cross-reference pass; see
+`docs/notes/spec-compliance-cross-reference-2026-05-01.md` for the
+ndn-cxx / NFD / ndnd / ndn-svs source-line citations and the
+reverification recipe per finding). No interop run has been executed
+against these scripts yet — the statuses below remain predictions, not
+measurements. When the harness is first run, update the "Last seen"
+column with the date and container digest.
+
+The 2026-05-01 cross-reference also retracted four findings (A.17,
+C.04, B.03, B.04) and added thirteen new entries (N.01–N.14); the
+new rows appear below under the appropriate severity tiers.
 
 ## BLOCKER
 
 | Finding | Witness test | Status | Predicted failure | Last seen |
 |---------|------|--------|----|-|
-| A.01 | `a01_blake3_name_component.sh` | EXPECTED-FAIL | ndn-cxx / NFD reject Name containing `BLAKE3_DIGEST` (TLV 0x03) | not yet run |
+| A.01 | `a01_blake3_name_component.sh` | RESOLVED 2026-05-01 | BLAKE3_DIGEST 0x03 surface removed: tlv constant, NameComponent helpers, Name helpers, Display alt-form, ZoneKey + zone-bound DID surface all extracted. Witness flipped to GREP-PROOF; before/after transcripts at `testbed/tests/audit/transcripts/a01_{before,after}.txt`. | 2026-05-01 (grep witness) |
 | A.09 | `a09_signed_interest_verify.sh` | RESOLVED (code-level; interop witness pending helper binary) | Fix landed 2026-05-01; unit regression test `interest_builder_sign_sync_signed_region_matches_extractor` in ndn-packet asserts sign/extract agreement. Interop helper (`ndn-rs-emit-signed-interest`) still needs to be added to unblock the testclient-side witness. | code test added 2026-05-01 |
-| B.01 | `b01_reliability_txsequence.sh` | EXPECTED-FAIL | NFD sees `Sequence` (0x51) where reliability reads `TxSequence` (0x0348); retransmits never cleared | not yet run |
+| B.01 | `b01_reliability_txsequence.sh` | RESOLVED 2026-05-01 | encoder writes `TxSequence` (0x0348), decoder + ack-extractor read `0x0348`, reliability layer keys `unacked` on TxSequence; witness flipped to RUST-UNIT (`b01_b09_reliable_wire_uses_tx_sequence` + `b01_b09_fragmented_reliable_carries_both_sequences`). Before/after transcripts at `testbed/tests/audit/transcripts/b01_{before,after}.txt`. | 2026-05-01 (rust-unit witness) |
+| B.09 | rolled into `b01_reliability_txsequence.sh` | RESOLVED 2026-05-01 | fragmented frames now carry both `Sequence` (0x51) shared across fragments and per-LP `TxSequence` (0x0348); `LpReliability` splits `next_seq` (network-packet) from `next_tx_seq` (per-LP). | 2026-05-01 |
 | C.01 | `c01_ecdsa_verify.sh` | EXPECTED-FAIL | ndn-rs validator returns `Invalid` on an ECDSA-signed Data from ndn-cxx | not yet run |
+| C.07 | `c07_cert_naming.sh` | RESOLVED 2026-05-01 | KeyChain ephemeral now produces cert names ending `/KEY/<keyid>/<issuer>/<version>` per ndn-cxx Certificate::isValidName. Witness: RUST-UNIT in `ndn-security` integration tests/cert_format.rs. Before/after transcripts at `testbed/tests/audit/transcripts/c07_{before,after}.txt`. | 2026-05-01 |
+| C.08 | `c08_cert_content.sh` | RESOLVED 2026-05-01 | cert Content body is DER SubjectPublicKeyInfo (44-byte Ed25519 envelope per RFC 8410); `encode_cert_data` wraps via `ndn_security::spki::wrap_ed25519`; `Certificate::decode` unwraps. Before/after transcripts at `testbed/tests/audit/transcripts/c08_{before,after}.txt`. | 2026-05-01 |
+| C.13 | `c13_ndncert_challenge_tlv.sh` | BLOCKED-BY-INTEROP | ndncert-ca-server image required; CHALLENGE plaintext is JSON not TLV pairs | not yet run |
+| C.18 | `c18_validity_period_iso8601.sh` | RESOLVED 2026-05-01 | NotBefore/NotAfter are 15-byte ASCII `YYYYMMDDTHHMMSS` strings per ndn-cxx ISO_DATETIME_SIZE=15; ValidityPeriod relocated from Content to SignatureInfo. New `ndn_security::iso8601` helper. Before/after transcripts at `testbed/tests/audit/transcripts/c18_{before,after}.txt`. | 2026-05-01 |
 | D.01 | `d01_hoplimit_decrement.sh` | EXPECTED-FAIL | tcpdump on ndn-fwd's egress interface shows HopLimit unchanged from ingress | not yet run |
+| E.04 | `e04_dataset_segmentation.sh` | EXPECTED-FAIL | `faces/list` over MTU is truncated; `nfdc` parse fails (no SegmentName/FinalBlockId) | not yet run |
+| N.01 | `n01_fragcount_dos.sh` | EXPECTED-FAIL | Crafted FragCount=u32::MAX triggers unbounded vec allocation in ReassemblyBuffer (DoS, no auth required) | not yet run |
 | E.01 | `e01_mgmt_unauth.sh` | EXPECTED-FAIL | unsigned `rib/register` command is accepted by ndn-fwd (NFD rejects — control) | not yet run |
-| G.03 | `g03_psync_interop.sh` | EXPECTED-FAIL | ndn-rs PSync and C++ PSync produce different IBF decoding; no sync progress | not yet run |
+| G.03 | `g03_psync_interop.sh` | BLOCKED-BY-INTEROP | PSync C++ peer required; ndn-rs IBF uses splitmix64 + custom hash, not Murmur3 | not yet run |
 
 ## MAJOR
 
@@ -44,23 +57,35 @@ the date and container digest.
 | A.03 | `a03_unknown_critical_tlv.sh` | EXPECTED-FAIL | Interest carrying unknown critical TLV type inside body accepted by ndn-rs, rejected by ndn-cxx | not yet run |
 | A.10 | `a10_databuilder_build_sig.sh` | EXPECTED-FAIL | Data emitted by `DataBuilder::build()` has zero-bytes signature; ndn-cxx DigestSha256 verify fails | not yet run |
 | A.15 | `a15_keylocator_rules.sh` | EXPECTED-FAIL | Ed25519 Data without KeyLocator accepted by ndn-rs, rejected by ndn-cxx | not yet run |
-| A.17 | `a17_blake3_sigtype_rejected.sh` | EXPECTED-FAIL | Data signed with SignatureType=6 (BLAKE3) rejected by ndn-cxx (unknown type) | not yet run |
 | C.02 | `c02_hmac_roundtrip.sh` | EXPECTED-FAIL | Self-signed HMAC Data round-trips through ndn-rs validator as `Invalid` | not yet run |
 | C.03 | `c03_digest_sha256_verify.sh` | EXPECTED-FAIL | DigestSha256 Data from ndn-cxx rejected by ndn-rs validator | not yet run |
-| C.07 | `c07_cert_naming.sh` | EXPECTED-FAIL | ndn-cxx `ndnsec-cert-dump` rejects ndn-rs-issued cert as "not a certificate name" | not yet run |
-| C.08 | `c08_cert_content.sh` | EXPECTED-FAIL | ndn-cxx cert-content decode fails on ndn-rs Content (raw pubkey, not DER SPKI) | not yet run |
+| C.06 | `c06_keychain_sigtype_label.sh` | EXPECTED-FAIL | KeyChain backed by HmacSha256Signer produces Data labelled SignatureEd25519 | not yet run |
 | C.11 | `c11_signed_interest_validate.sh` | EXPECTED-FAIL | Signed management Interest's `InterestSignatureInfo` not parsed by ndn-rs validator path | not yet run |
-| C.13 | `c13_ndncert_challenge_tlv.sh` | BLOCKED-BY-INTEROP | ndncert-ca-server not yet in the testclient image; once added, expect CHALLENGE parameter parse failure | not yet run |
+| C.14 | `c14_ndncert_error_names.sh` | EXPECTED-FAIL | NDNCERT ErrorCode names (`BadInterest`/`InvalidSignature`) diverge from spec (`BadInterestFormat`/`BadSignature`) — numbers OK | not yet run |
 | D.02 | `d02_localhop_scope.sh` | EXPECTED-FAIL | `/localhop/nfd/*` Interest received on a non-local face is forwarded further | not yet run |
 | D.03 | `d03_nexthop_faceid.sh` | EXPECTED-FAIL | Interest with `NextHopFaceId` LP header goes through strategy LPM instead of to the named face | not yet run |
 | D.04 | `d04_pit_aggregation_selectors.sh` | EXPECTED-FAIL | Two Interests for the same Name with different selectors produce two PIT entries, leading to double upstream forward | not yet run |
 | D.07 | `d07_pit_token_echo.sh` | EXPECTED-FAIL | Data response to a PitToken-tagged Interest lacks the echoed token | not yet run |
 | D.09 | `d09_bestroute_nack_retry.sh` | EXPECTED-FAIL | On nexthop-1 Nack, ndn-rs does not retry nexthop-2; propagates Nack immediately | not yet run |
+| D.10 | `d10_strategy_name_version.sh` | EXPECTED-FAIL | BestRouteStrategy::strategy_name() last component is not a Version (TLV 0x36); NFD `nfdc` rejects | not yet run |
 | D.13 | `d13_localhost_unvalidated.sh` | EXPECTED-FAIL | Forged `/localhost/...` Data (zeroed signature) accepted by ndn-rs, rejected by ndn-cxx | not yet run |
-| E.04 | `e04_dataset_segmentation.sh` | EXPECTED-FAIL | `faces/list` dataset does not use SegmentName convention; `nfdc` parse fails | not yet run |
-| E.05 | `e05_notifications.sh` | BLOCKED-BY-INTEROP | ndn-fwd does not publish `/localhost/nfd/<module>/notifications` streams | not yet run |
+| E.03 | `e03_extended_modules_unsigned.sh` | EXPECTED-FAIL | `/localhost/nfd/security/*` and other ndn-rs-extended modules accept commands without auth | not yet run |
 | F.01 | `f01_ipv6_faceuri.sh` | EXPECTED-FAIL | IPv6 peer Face reports `udp4://[…]`, rejected by NFD FaceUri parser | not yet run |
 | F.03 | `f03_faceuri_schemes.sh` | EXPECTED-FAIL | TCP face emits `tcp://`, should be `tcp4://`/`tcp6://` | not yet run |
+| F.06 | `f06_websocket_uri.sh` | EXPECTED-FAIL | WS face emits `ws://` regardless of direction; spec uses `wsclient`/`wsserver`/`wss` | not yet run |
+| G.02 | `g02_svs_typed_components.sh` | EXPECTED-FAIL | Two NodeIDs with identical wire bytes but different URI strings produce 2 state-map entries | not yet run |
+| G.06 | `g06_swim_vs_autoconfig.sh` | BLOCKED-BY-INTEROP | needs ndn-autoconfig-server peer; ndn-rs hello/gossip is SWIM, not AutoConfig PROBE | not yet run |
+| G.09 | `g09_prefix_announcement_consume.sh` | EXPECTED-FAIL | LP `PrefixAnnouncement` decoded into LpPacket but no strategy reads it (no self-learning) | not yet run |
+| N.02 | `n02_lp_reassembly_collision.sh` | EXPECTED-FAIL | Two peers with same Sequence on a multi-access face overwrite each other's partials | not yet run |
+| N.03 | `n03_lp_header_order.sh` | EXPECTED-FAIL | LpPacket with duplicate IncomingFaceId or unsorted headers accepted; ndn-cxx rejects | not yet run |
+| N.04 | `n04_critical_in_metainfo_siginfo.sh` | EXPECTED-FAIL | Unknown critical TLV inside MetaInfo or SignatureInfo body silently stripped | not yet run |
+| N.05 | `n05_nack_no_reason.sh` | EXPECTED-FAIL | Nack header without NackReason decodes as `Other(0)` instead of `None` | not yet run |
+| N.06 | `n06_dead_nonce_list.sh` | EXPECTED-FAIL | Re-entered Interest with recently-used nonce after PIT erasure not detected as loop (no DNL) | not yet run |
+| N.07 | `n07_localhost_data_ingress.sh` | EXPECTED-FAIL | `/localhost/...` Data from non-local face accepted into CS; NFD drops at ingress | not yet run |
+| N.10 | `n10_command_replay.sh` | EXPECTED-FAIL (depends on E.01 fix) | Captured signed command replays accepted indefinitely; no SignatureTime window | not yet run |
+| N.11 | `n11_control_param_binding.sh` | EXPECTED-FAIL (depends on E.01) | ControlParameters in AppParams without matching PSDC dispatched | not yet run |
+| N.12 | `n12_mgmt_response_signing.sh` | EXPECTED-FAIL (depends on C.07/C.08 fix) | All control responses use DigestSha256; ndn-cxx `nfd::Controller` with trust schema rejects | not yet run |
+| N.13 | `n13_cert_serialize_tlv.sh` | RESOLVED 2026-05-01 | `serialize_cert` reconstitutes the cert as a real NDN Data TLV from `signed_region`+`sig_value`; `deserialize_cert` parses Data and calls `Certificate::decode`. `SecurityManager::issue_self_signed` and `certify` now populate the wire bytes. Before/after transcripts at `testbed/tests/audit/transcripts/n13_{before,after}.txt`. | 2026-05-01 |
 
 ## NOT-WITNESSABLE
 
@@ -68,6 +93,25 @@ the date and container digest.
 |---------|-|-|-|
 | G.04 | MAJOR | NLSR absence cannot be exercised via a packet exchange — the feature simply isn't there. Track as a roadmap item, not a test. | audit §G.04 |
 | C.16 | MAJOR | LVS user functions fail silently open — the failure is semantic, not observable as a wire event. Needs a dedicated LVS unit test. | audit §C.16 |
+| E.05 | MAJOR | Notification streams missing; witness must show absence (no `/localhost/nfd/<module>/notifications` producer). Use a GREP-PROOF instead of a wire test. | cross-ref §E.05 |
+| N.08 | MINOR | No unsolicited-Data policy hook; absence test, not wire-observable. | cross-ref §N.08 |
+| N.09 | MINOR | Ad-hoc/multi-access link-type Nack handling missing; semantic gap. | cross-ref §N.09 |
+| N.14 | MINOR | `add_trust_anchor` skips validity-period check; RUST-UNIT only (no wire path). | cross-ref §N.14 |
+
+## RETRACTED 2026-05-01
+
+The following findings from the 2026-04-20 audit were **withdrawn**
+during the cross-reference pass against the on-disk reference
+implementations. Do not author witness tests for these. The audit
+document should be updated to mark them retracted (with the citation
+below as the reason). Removed rows are kept here for traceability.
+
+| Finding | Original severity | Reason for retraction | Citation |
+|---------|-------------------|-----------------------|----------|
+| A.17 | MAJOR | BLAKE3 SignatureType codes 6 and 7 are now officially registered on the NDN TLV registry (yoursunny). ndn-rs wire is fine; only stale comments remain. | `redmine.named-data.net/projects/ndn-tlv/wiki/SignatureType` |
+| C.04 | MAJOR | Same as A.17. | same |
+| B.03 | MINOR | ndn-cxx `lp/packet.cpp:107-110` also accepts a top-level Interest/Data inside an LpPacket as the implicit fragment. Standard tolerance, not an ndn-rs deviation. | ndn-cxx `lp/packet.cpp` |
+| B.04 | MINOR | PitToken 1-32 byte bound IS the spec; ndn-cxx `lp/pit-token.cpp:28-37` defines `LENGTH_MIN=1`, `LENGTH_MAX=32`. ndn-rs matches. | ndn-cxx `lp/pit-token.cpp` |
 
 ## When to add a row here
 
