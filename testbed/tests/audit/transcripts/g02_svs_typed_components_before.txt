@@ -1,0 +1,25 @@
+=== G.02 BEFORE FIX (2026-05-02) ===
+
+Synthetic transcript: pre-fix, `SvsNode.vector` was `HashMap<String, u64>`
+keyed on the `Name::to_string()` URI rendering. Two peers using
+equivalent renderings of the same canonical Name (e.g. `/v=3` shorthand
+vs the explicit `/54=%03` numeric form) hashed to different keys and
+produced two state-vector entries. The new regression test
+`g02_typed_components_canonicalize_to_single_entry` would have observed
+`snap.len() == 3` (local + two peer "duplicates") instead of the
+post-fix `snap.len() == 2`. The new `merge_names` Name-keyed API
+(exercised by `g02_merge_names_aggregates_equal_name_keys`) did not
+exist on `main` prior to this commit; compilation would fail with
+E0599 ("no method named `merge_names`").
+
+Code-level evidence pre-fix:
+
+  $ grep -n 'vector: RwLock<HashMap' \
+        crates/protocols/ndn-sync/src/svs.rs
+  ...:    vector: RwLock<HashMap<String, u64>>,    # ← URI string key
+
+  $ grep -n 'fn merge_names' crates/protocols/ndn-sync/src/svs.rs
+  (no hits)
+
+Reference: ndn-svs `common.hpp:41` `using NodeID = ndn::Name`;
+`version-vector.hpp:83` `std::map<NodeID, SeqNo>`.
