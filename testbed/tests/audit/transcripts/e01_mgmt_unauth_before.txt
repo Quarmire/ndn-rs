@@ -1,0 +1,28 @@
+=== E.01 / C.11 BEFORE FIX (2026-05-01) ===
+FAIL: C.11
+FAIL: E.01
+
+=== E.01 / C.11 EXPECTED-FAIL — auth gate or validate_interest missing ===
+warning: unused variable: `signer`
+   --> crates/engine/ndn-security/src/validator/mod.rs:686:13
+    |
+686 |         let signer = Ed25519Signer::from_seed(&seed, key_name.clone());
+    |             ^^^^^^ help: if this is intentional, prefix it with an underscore: `_signer`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+
+running 2 tests
+. 1/2
+validator::tests::c11_validate_signed_interest_returns_valid --- FAILED
+
+failures:
+
+---- validator::tests::c11_validate_signed_interest_returns_valid stdout ----
+
+thread 'validator::tests::c11_validate_signed_interest_returns_valid' (37553123) panicked at crates/engine/ndn-security/src/validator/mod.rs:725:22:
+C.11 — signed Interest must validate; got: Invalid(InvalidSignature)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+EXIT: 1

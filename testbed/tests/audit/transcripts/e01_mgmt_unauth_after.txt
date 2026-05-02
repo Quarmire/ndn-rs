@@ -1,0 +1,7 @@
+=== E.01 / C.11 AFTER FIX (2026-05-01) ===
+ok: C.11 (validate_interest)
+ok: E.01 (authorize_command)
+
+=== E.01 / C.11 RESOLVED — command auth + validate_interest in place ===
+
+EXIT: 0
