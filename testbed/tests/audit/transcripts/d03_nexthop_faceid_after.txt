@@ -1,0 +1,32 @@
+=== D.03 AFTER FIX (2026-05-02) ===
+
+--- GREP: NextHopFaceId now read in strategy.rs ---
+63:/// Audit D.03 — outcome of consulting the `NextHopFaceId` LP header (NDNLPv2
+67:    /// No `NextHopFaceId` tag set; the strategy must run normally.
+78:/// Audit D.03 — pure decision over the `NextHopFaceId` override.
+80:/// A `NextHopFaceId` LP header is a privileged "send this Interest to this
+85:pub(crate) fn next_hop_override(
+89:    use crate::stages::decode::NextHopFaceId;
+90:    let Some(NextHopFaceId(face_id_u64)) = tags.get::<NextHopFaceId>().copied() else {
+127:        // Audit D.03 — `NextHopFaceId` LP header is a privileged forwarding
+131:        match next_hop_override(&ctx.tags, |fid| self.face_table.get(fid).is_some()) {
+133:                trace!(face=%ctx.face_id, name=%name, override_face=%face_id, "strategy: NextHopFaceId override");
+
+--- Helper unit tests ---
+
+running 4 tests
+....
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 37 filtered out; finished in 0.00s
+
+
+=== Witness: testbed/tests/audit/d03_nexthop_faceid.sh ===
+ok: stages/strategy.rs reads NextHopFaceId
+ok: d03_next_hop_override_* helper tests pass
+
+=== D.03 RESOLVED — strategy stage honours NextHopFaceId override ===
+EXIT: 0
+
+=== Full ndn-engine --lib (regression sweep) ===
+.........................................
+test result: ok. 41 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+

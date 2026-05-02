@@ -1,0 +1,7 @@
+=== D.03 BEFORE FIX (2026-05-02) ===
+
+--- GREP-PROOF: only decode.rs reads NextHopFaceId, no strategy/dispatcher read-site ---
+crates/engine/ndn-engine/src/stages/decode.rs:37:pub struct NextHopFaceId(pub u64);
+crates/engine/ndn-engine/src/stages/decode.rs:216:            ctx.tags.insert(NextHopFaceId(face_id));
+
+(the only mentions are in stages/decode.rs at the LP unwrap; stages/strategy.rs has no read-site)
