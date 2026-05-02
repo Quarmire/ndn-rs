@@ -1,0 +1,26 @@
+=== D.07 BEFORE FIX (2026-05-02) ===
+
+The witness pre-fix is a synthetic transcript: the regression tests
+`d07_encode_lp_nack_with_pit_token_emits_token` and
+`d07_pit_match_propagates_lp_token_to_out_tokens` reference APIs that
+did not exist on `main` prior to this commit — `encode_lp_nack_with_pit_token`
+was not a public symbol of `ndn_packet::lp` and `PacketContext.out_pit_tokens`
+was not a field. Compiling the tests today therefore fails with E0425
+("cannot find function `encode_lp_nack_with_pit_token`") and E0609
+("no field `out_pit_tokens`") respectively.
+
+Code-level evidence pre-fix:
+
+  $ grep -n 'encode_lp_nack_with_pit_token' crates/foundation/ndn-packet/src/lp/
+  (no hits)
+
+  $ grep -n 'out_pit_tokens' crates/engine/ndn-engine/src/
+  (no hits)
+
+  $ grep -n 'lp_pit_token' crates/engine/ndn-engine/src/dispatcher/outbound.rs
+  (no hits — `satisfy` sends raw `data_bytes` regardless of consumer's PitToken)
+
+The InRecord storage shape is correct (`pub lp_pit_token: Option<bytes::Bytes>`
+since 0ca8132); only the egress consumer paths were missing. The audit
+text at § D.07 is explicit on this: "PIT in-records store `lp_pit_token`
+but outbound Data/Nack paths do not echo it".
