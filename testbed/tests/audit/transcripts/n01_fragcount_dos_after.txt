@@ -1,0 +1,4 @@
+=== N.01 AFTER FIX (2026-05-01) ===
+=== N.01 RESOLVED — FragCount capped at MAX_FRAGMENTS=400 before allocation ===
+
+EXIT: 0

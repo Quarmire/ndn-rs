@@ -1,0 +1,13 @@
+=== N.01 BEFORE FIX (2026-05-01) ===
+
+[Captured by setting NDN_RS_N01_BEFORE_FIX=1 to bypass the new
+MAX_FRAGMENTS cap and reproduce the pre-fix allocation behaviour.]
+
+The test `n01_oversized_frag_count_does_not_allocate` triggers
+`ReassemblyBuffer::process(..., frag_count = u32::MAX, ...)`. With
+the cap disabled, `vec![None; u32::MAX as usize]` attempts to
+allocate ~32 GB on a 64-bit system; the test process either panics
+out of memory or hangs indefinitely. The witness was wrapped in
+`timeout 5` and the run was killed at the 5-second mark.
+
+EXIT: 124  (timeout — DoS confirmed; the cap is required)
