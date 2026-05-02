@@ -1,0 +1,75 @@
+=== A.02 / A.21 BEFORE FIX (2026-05-01) ===
+Test: cargo test -p ndn-packet --features std --lib --quiet a02_
+
+
+running 3 tests
+interest::tests::a02_a21_decode_rejects_psdc_not_last --- FAILED
+interest::tests::a02_decode_rejects_multiple_psdc --- FAILED
+interest::tests::a02_decode_rejects_app_params_without_psdc --- FAILED
+
+failures:
+
+---- interest::tests::a02_a21_decode_rejects_psdc_not_last stdout ----
+
+thread 'interest::tests::a02_a21_decode_rejects_psdc_not_last' (37658566) panicked at crates/foundation/ndn-packet/src/interest.rs:683:41:
+Interest with PSDC anywhere but the last position must be rejected: Interest { raw: b"\x055\x07,\x02 \0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\x08\x08trailing$\x05hello", name: Name { components: [NameComponent { typ: 2, value: b"\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0" }, NameComponent { typ: 8, value: b"trailing" }] }, selectors: OnceLock(<uninit>), nonce: OnceLock(<uninit>), lifetime: OnceLock(<uninit>), app_params: OnceLock(<uninit>), hop_limit: OnceLock(<uninit>), forwarding_hint: OnceLock(<uninit>), sig_info: OnceLock(<uninit>), sig_value: OnceLock(<uninit>) }
+
+---- interest::tests::a02_decode_rejects_multiple_psdc stdout ----
+
+thread 'interest::tests::a02_decode_rejects_multiple_psdc' (37658568) panicked at crates/foundation/ndn-packet/src/interest.rs:708:41:
+Interest with more than one ParametersSha256DigestComponent must be rejected: Interest { raw: b"\x05P\x07G\x08\x01a\x02 \0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\x02 \x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01$\x05hello", name: Name { components: [NameComponent { typ: 8, value: b"a" }, NameComponent { typ: 2, value: b"\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0" }, NameComponent { typ: 2, value: b"\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01" }] }, selectors: OnceLock(<uninit>), nonce: OnceLock(<uninit>), lifetime: OnceLock(<uninit>), app_params: OnceLock(<uninit>), hop_limit: OnceLock(<uninit>), forwarding_hint: OnceLock(<uninit>), sig_info: OnceLock(<uninit>), sig_value: OnceLock(<uninit>) }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- interest::tests::a02_decode_rejects_app_params_without_psdc stdout ----
+
+thread 'interest::tests::a02_decode_rejects_app_params_without_psdc' (37658567) panicked at crates/foundation/ndn-packet/src/interest.rs:658:41:
+Interest with ApplicationParameters but no ParametersSha256DigestComponent must be rejected: Interest { raw: b"\x05\x10\x07\x07\x08\x05audit$\x05hello", name: Name { components: [NameComponent { typ: 8, value: b"audit" }] }, selectors: OnceLock(<uninit>), nonce: OnceLock(<uninit>), lifetime: OnceLock(<uninit>), app_params: OnceLock(<uninit>), hop_limit: OnceLock(<uninit>), forwarding_hint: OnceLock(<uninit>), sig_info: OnceLock(<uninit>), sig_value: OnceLock(<uninit>) }
+
+
+failures:
+    interest::tests::a02_a21_decode_rejects_psdc_not_last
+    interest::tests::a02_decode_rejects_app_params_without_psdc
+    interest::tests::a02_decode_rejects_multiple_psdc
+
+test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 203 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p ndn-packet --lib`
+
+=== Witness: testbed/tests/audit/a02_psdc_structural.sh ===
+FAIL: ndn-packet accepts malformed PSDC structure on decode
+
+=== A.02 / A.21 EXPECTED-FAIL — PSDC structural validation missing ===
+
+running 3 tests
+interest::tests::a02_decode_rejects_app_params_without_psdc --- FAILED
+interest::tests::a02_decode_rejects_multiple_psdc --- FAILED
+interest::tests::a02_a21_decode_rejects_psdc_not_last --- FAILED
+
+failures:
+
+---- interest::tests::a02_decode_rejects_app_params_without_psdc stdout ----
+
+thread 'interest::tests::a02_decode_rejects_app_params_without_psdc' (37658638) panicked at crates/foundation/ndn-packet/src/interest.rs:658:41:
+Interest with ApplicationParameters but no ParametersSha256DigestComponent must be rejected: Interest { raw: b"\x05\x10\x07\x07\x08\x05audit$\x05hello", name: Name { components: [NameComponent { typ: 8, value: b"audit" }] }, selectors: OnceLock(<uninit>), nonce: OnceLock(<uninit>), lifetime: OnceLock(<uninit>), app_params: OnceLock(<uninit>), hop_limit: OnceLock(<uninit>), forwarding_hint: OnceLock(<uninit>), sig_info: OnceLock(<uninit>), sig_value: OnceLock(<uninit>) }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- interest::tests::a02_decode_rejects_multiple_psdc stdout ----
+
+thread 'interest::tests::a02_decode_rejects_multiple_psdc' (37658639) panicked at crates/foundation/ndn-packet/src/interest.rs:708:41:
+Interest with more than one ParametersSha256DigestComponent must be rejected: Interest { raw: b"\x05P\x07G\x08\x01a\x02 \0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\x02 \x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01$\x05hello", name: Name { components: [NameComponent { typ: 8, value: b"a" }, NameComponent { typ: 2, value: b"\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0" }, NameComponent { typ: 2, value: b"\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01" }] }, selectors: OnceLock(<uninit>), nonce: OnceLock(<uninit>), lifetime: OnceLock(<uninit>), app_params: OnceLock(<uninit>), hop_limit: OnceLock(<uninit>), forwarding_hint: OnceLock(<uninit>), sig_info: OnceLock(<uninit>), sig_value: OnceLock(<uninit>) }
+
+---- interest::tests::a02_a21_decode_rejects_psdc_not_last stdout ----
+
+thread 'interest::tests::a02_a21_decode_rejects_psdc_not_last' (37658637) panicked at crates/foundation/ndn-packet/src/interest.rs:683:41:
+Interest with PSDC anywhere but the last position must be rejected: Interest { raw: b"\x055\x07,\x02 \0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\x08\x08trailing$\x05hello", name: Name { components: [NameComponent { typ: 2, value: b"\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0" }, NameComponent { typ: 8, value: b"trailing" }] }, selectors: OnceLock(<uninit>), nonce: OnceLock(<uninit>), lifetime: OnceLock(<uninit>), app_params: OnceLock(<uninit>), hop_limit: OnceLock(<uninit>), forwarding_hint: OnceLock(<uninit>), sig_info: OnceLock(<uninit>), sig_value: OnceLock(<uninit>) }
+
+
+failures:
+    interest::tests::a02_a21_decode_rejects_psdc_not_last
+    interest::tests::a02_decode_rejects_app_params_without_psdc
+    interest::tests::a02_decode_rejects_multiple_psdc
+
+test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 203 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p ndn-packet --lib`
+EXIT: 1

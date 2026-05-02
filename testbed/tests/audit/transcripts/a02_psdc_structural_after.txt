@@ -1,0 +1,21 @@
+=== A.02 / A.21 AFTER FIX (2026-05-01) ===
+Test: cargo test -p ndn-packet --features std --lib --quiet a02_
+
+
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 203 filtered out; finished in 0.00s
+
+
+=== Witness: testbed/tests/audit/a02_psdc_structural.sh ===
+ok: ndn-packet rejects malformed PSDC structure on decode
+
+=== A.02 / A.21 RESOLVED — Interest::decode enforces PSDC structure ===
+EXIT: 0
+
+=== Full ndn-packet --lib (regression sweep) ===
+....................................................................................... 87/206
+....................................................................................... 174/206
+................................
+test result: ok. 206 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
