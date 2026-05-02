@@ -66,13 +66,9 @@ The method-specific identifier contains no colons — colons are not in the base
 NDN name:   /com/acme/alice
 Name TLV:   07 11 08 03 "com" 08 04 "acme" 08 05 "alice"
 did:ndn:    did:ndn:<base64url of the 20-byte TLV above>
-
-NDN name (zone root, BLAKE3_DIGEST component):   /<32 bytes>
-Name TLV:   07 22 03 20 <32 bytes>
-did:ndn:    did:ndn:<base64url of the 36-byte TLV above>
 ```
 
-This single form is lossless across all component types — GenericNameComponents, BLAKE3_DIGEST zone roots, versioned components, sequence numbers, and any future typed components — without type-specific special cases.
+This single form is lossless across all component types — GenericNameComponents, ImplicitSha256DigestComponent, ParametersSha256DigestComponent, KeywordNameComponent, versioned components, sequence numbers, and any future typed components — without type-specific special cases.
 
 > **Note on earlier drafts:** A previous version of this spec used a dual-form encoding: a "simple" colon-separated ASCII form and a `v1:` binary fallback. This was found to be ambiguous: a name whose first component is literally `v1` produced an identical DID string as a binary-encoded name whose base64url representation happened to begin with `v1:`. See [did:ndn Method Specification §1.2](../reference/did-ndn-method.md) for details.
 
@@ -94,11 +90,6 @@ assert!(!did["did:ndn:".len()..].contains(':'));
 // DID → Name (round-trips correctly)
 let recovered = did_to_name(&did)?;
 assert_eq!(recovered, name);
-
-// Zone root name (BLAKE3_DIGEST component) — same encoding, no special case
-let zone_name: Name = /* from ZoneKey::zone_root_name() */;
-let zone_did = name_to_did(&zone_name);
-// still "did:ndn:<base64url>", no v1: prefix
 ```
 
 ### Resolution: an NDN Interest
