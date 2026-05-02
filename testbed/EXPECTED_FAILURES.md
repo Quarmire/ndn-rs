@@ -83,6 +83,7 @@ new rows appear below under the appropriate severity tiers.
 | N.10 | `n10_command_replay.sh` | EXPECTED-FAIL (depends on E.01 fix) | Captured signed command replays accepted indefinitely; no SignatureTime window | not yet run |
 | N.11 | `n11_control_param_binding.sh` | EXPECTED-FAIL (depends on E.01) | ControlParameters in AppParams without matching PSDC dispatched | not yet run |
 | N.12 | `n12_mgmt_response_signing.sh` | EXPECTED-FAIL (depends on C.07/C.08 fix) | All control responses use DigestSha256; ndn-cxx `nfd::Controller` with trust schema rejects | not yet run |
+| E.05 | `e05_notification_streams.sh` | RESOLVED 2026-05-02 (architecture; live `nfdc events` still BLOCKED-BY-INTEROP) | New `ndn_config::NotificationStream` publishing primitive in `crates/engine/ndn-config/src/notifications.rs`. Each call to `publish(payload)` allocates the next `u64` sequence and emits a self-signed `DigestSha256` Data on `<prefix>/<SequenceNumberComponent>` (TLV-TYPE 0x3A), mirroring ndn-cxx `mgmt/dispatcher.cpp:299-329` `addNotificationStream` / `postNotification`. Wiring the publisher to actual face/route/strategy event sources and the live `nfdc events` interop are follow-ups. Witness: RUST-UNIT trio `e05_*` in `ndn-config::notifications::tests`. Before/after transcripts at `testbed/tests/audit/transcripts/e05_notification_streams_{before,after}.txt`. | 2026-05-02 (rust-unit witness) |
 | N.13 | `n13_cert_serialize_tlv.sh` | RESOLVED 2026-05-01 | `serialize_cert` reconstitutes the cert as a real NDN Data TLV from `signed_region`+`sig_value`; `deserialize_cert` parses Data and calls `Certificate::decode`. `SecurityManager::issue_self_signed` and `certify` now populate the wire bytes. Before/after transcripts at `testbed/tests/audit/transcripts/n13_{before,after}.txt`. | 2026-05-01 |
 
 ## NOT-WITNESSABLE
@@ -91,7 +92,7 @@ new rows appear below under the appropriate severity tiers.
 |---------|-|-|-|
 | G.04 | MAJOR | NLSR absence cannot be exercised via a packet exchange — the feature simply isn't there. Track as a roadmap item, not a test. | audit §G.04 |
 | C.16 | MAJOR | LVS user functions fail silently open — the failure is semantic, not observable as a wire event. Needs a dedicated LVS unit test. | audit §C.16 |
-| E.05 | MAJOR | Notification streams missing; witness must show absence (no `/localhost/nfd/<module>/notifications` producer). Use a GREP-PROOF instead of a wire test. | cross-ref §E.05 |
+| E.05 | MAJOR | Notification streams: architecture-side RESOLVED 2026-05-02 (`ndn_config::NotificationStream` lands the publisher primitive at `<prefix>/<SequenceNumberComponent>` per ndn-cxx `dispatcher.cpp:299-329`); see `e05_notification_streams.sh` row in the MAJOR table. Live `nfdc events` interop still BLOCKED-BY-INTEROP. | cross-ref §E.05 |
 | N.08 | MINOR | No unsolicited-Data policy hook; absence test, not wire-observable. | cross-ref §N.08 |
 | N.09 | MINOR | Ad-hoc/multi-access link-type Nack handling missing; semantic gap. | cross-ref §N.09 |
 | N.14 | MINOR | `add_trust_anchor` skips validity-period check; RUST-UNIT only (no wire path). | cross-ref §N.14 |
