@@ -1,0 +1,21 @@
+=== E.05 BEFORE FIX (2026-05-02) ===
+
+Synthetic transcript: pre-fix the `NotificationStream` type and the
+`ndn-config::notifications` module did not exist. Compiling the
+regression tests fails with E0432 ("unresolved import
+`ndn_config::NotificationStream`") and E0433 ("failed to resolve:
+`crate::notifications::NotificationStream`").
+
+Code-level evidence pre-fix:
+
+  $ grep -rnE 'NotificationStream|notifications/' \
+        binaries/ndn-fwd/ crates/engine/
+  (no hits — confirming the cross-reference doc's "returns 0 today"
+  reverify recipe at § E.05)
+
+The audit text at § E.05 cites NFD `face-manager.cpp:71`
+`registerNotificationStream("events")` and ndn-cxx
+`dispatcher.cpp:299-329` `addNotificationStream` / `postNotification`
+as the reference publisher. The witness here covers the publisher
+primitive only; wiring it to face / route / strategy event sources
+plus the live `nfdc events` subscriber interop are the follow-ups.
