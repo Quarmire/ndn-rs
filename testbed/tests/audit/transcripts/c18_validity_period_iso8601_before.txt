@@ -1,0 +1,10 @@
+=== c18_validity_period_iso8601 BEFORE FIX ===
+=== C.18 EXPECTED-FAIL — ValidityPeriod is u64 ns and in Content ===
+
+running 1 test
+c18_cert_validity_period_is_iso8601_inside_signature_info --- FAILED
+
+failures:
+
+---- c18_cert_validity_period_is_iso8601_inside_signature_info stdout ----
+

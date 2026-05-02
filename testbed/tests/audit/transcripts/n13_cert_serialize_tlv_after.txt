@@ -1,0 +1,3 @@
+=== n13_cert_serialize_tlv AFTER FIX ===
+=== N.13 RESOLVED — serialize_cert emits a Data TLV ===
+EXIT: 0

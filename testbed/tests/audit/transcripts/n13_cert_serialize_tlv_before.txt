@@ -1,0 +1,10 @@
+=== n13_cert_serialize_tlv BEFORE FIX ===
+=== N.13 EXPECTED-FAIL — serialize_cert emits custom binary blob ===
+
+running 1 test
+n13_serialize_cert_returns_parseable_data_tlv --- FAILED
+
+failures:
+
+---- n13_serialize_cert_returns_parseable_data_tlv stdout ----
+

@@ -1,0 +1,10 @@
+=== c08_cert_content BEFORE FIX ===
+=== C.08 EXPECTED-FAIL — cert Content is raw key, not SPKI ===
+
+running 1 test
+c08_cert_content_body_is_der_spki --- FAILED
+
+failures:
+
+---- c08_cert_content_body_is_der_spki stdout ----
+

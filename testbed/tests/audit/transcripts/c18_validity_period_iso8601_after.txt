@@ -1,0 +1,3 @@
+=== c18_validity_period_iso8601 AFTER FIX ===
+=== C.18 RESOLVED — ValidityPeriod is 15-byte ISO-8601, in SignatureInfo ===
+EXIT: 0

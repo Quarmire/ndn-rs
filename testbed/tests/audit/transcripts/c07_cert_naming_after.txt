@@ -1,0 +1,3 @@
+=== c07_cert_naming AFTER FIX ===
+=== C.07 RESOLVED — cert name has KEY/<keyid>/<issuer>/<version> trailing ===
+EXIT: 0

@@ -1,0 +1,10 @@
+=== c07_cert_naming BEFORE FIX ===
+=== C.07 EXPECTED-FAIL — cert name shorter than spec requires ===
+
+running 1 test
+c07_keychain_ephemeral_cert_name_has_four_trailing_components --- FAILED
+
+failures:
+
+---- c07_keychain_ephemeral_cert_name_has_four_trailing_components stdout ----
+
