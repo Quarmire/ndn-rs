@@ -1,0 +1,18 @@
+=== N.06 AFTER FIX (2026-05-02) ===
+
+
+running 6 tests
+......
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 92 filtered out; finished in 0.00s
+
+
+=== Witness: testbed/tests/audit/n06_dead_nonce_list.sh ===
+ok: DeadNonceList tracks nonces with NFD-equivalent semantics
+
+=== N.06 RESOLVED 2026-05-02 (data-structure; engine wire-up follow-up) ===
+EXIT: 0
+
+=== Full ndn-store --lib (regression sweep) ===
+...........
+test result: ok. 98 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.03s
+

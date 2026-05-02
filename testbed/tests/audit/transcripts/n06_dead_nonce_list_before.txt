@@ -1,0 +1,17 @@
+=== N.06 BEFORE FIX (2026-05-02) ===
+
+Synthetic transcript: pre-fix the `DeadNonceList`, `NonceFingerprint`
+types and the `dead_nonce_list` module did not exist anywhere in
+ndn-store. Per the cross-ref doc's GREP-PROOF reverify recipe, a
+`grep -rni 'DeadNonce\|dead_nonce' crates/` returned 0. Compiling the
+new regression tests against `main` would fail with E0432 ("unresolved
+import `ndn_store::DeadNonceList`").
+
+Code-level evidence pre-fix:
+
+  $ grep -rni 'DeadNonce\|dead_nonce' crates/
+  (no hits)
+
+Reference: NFD `daemon/fw/forwarder.cpp:341,374` consults
+`m_deadNonceList`; `daemon/table/dead-nonce-list.cpp:32` sets the
+default per-entry lifetime to 6 seconds.
