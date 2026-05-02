@@ -1,0 +1,13 @@
+=== N.11 AFTER FIX (2026-05-02) ===
+
+
+running 4 tests
+....
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.00s
+
+
+=== Witness: testbed/tests/audit/n11_control_params_binding.sh ===
+ok: ControlParameters resolver rejects ambiguous both-locations shape
+
+=== N.11 RESOLVED — ControlParameters location is unambiguous ===
+EXIT: 0

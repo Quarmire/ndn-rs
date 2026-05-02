@@ -1,0 +1,27 @@
+=== N.11 BEFORE FIX (2026-05-02) ===
+
+Synthetic transcript: pre-fix the `resolve_control_parameters` helper
+did not exist on `main`. The mgmt dispatch flow at
+`binaries/ndn-fwd/src/mgmt_ndn.rs:565` did:
+
+    let params = parsed
+        .params                                         // CP in Name
+        .or_else(|| {
+            interest.app_parameters()                   // CP in AppParams
+                .and_then(|app| ControlParameters::decode(app.clone()).ok())
+        })
+        .unwrap_or_default();
+
+so when both locations were populated, the Name-side value was used
+and the AppParameters-side value silently ignored — an ambiguous shape
+that could mask a bind-mismatch attack against an unsigned command.
+For SIGNED commands the audit A.09 signed-region calculation already
+covers both locations (modifying either invalidates the signature)
+and audit A.02's PSDC enforcement (RESOLVED 2026-05-02) requires the
+Name's last component to commit to AppParameters' SHA-256, so the
+binding is tight there too. N.11's residual concern was the
+single-location-only shape, which this commit makes explicit by
+rejecting the both-locations Interest at the dispatch boundary.
+
+Compiling the regression tests against `main` would fail with E0425
+("cannot find function `resolve_control_parameters`").
