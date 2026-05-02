@@ -1,40 +1,45 @@
 #!/usr/bin/env bash
-# Witness test for audit finding B.01 — NDNLPv2 link-layer reliability
-# emits `Sequence` (0x51) where the spec requires `TxSequence` (0x0348).
+# Witness test for audit findings B.01 / B.09 — NDNLPv2 link-layer
+# reliability emits `Sequence` (TLV-TYPE 0x51) where the spec requires
+# `TxSequence` (TLV-TYPE 0x0348). B.09 is the consequence: a fragmented
+# + reliably-tracked LP packet cannot represent both fields because the
+# encoder uses one slot for both purposes.
 #
-# Finding:     docs/notes/spec-compliance-audit-2026-04-20.md § B.01
+# Finding:     docs/notes/spec-compliance-audit-2026-04-20.md § B.01 + B.09
 # Severity:    BLOCKER
-# Spec ref:    NDNLPv2 Link-Layer Reliability — TxSequence (0x0348) is
-#              distinct from the fragmentation Sequence (0x51). Ack
-#              headers (0x0344) reference TxSequence values.
-# Witnesses:   Packets emitted by LpReliability::on_send carry 0x51
-#              where the spec expects 0x0348. tcpdump on the ndn-fwd ↔
-#              NFD link shows the field type; no Ack arrives from NFD.
+# Spec ref:    NDNLPv2 Link-Layer Reliability;
+#              ndn-cxx lp/tlv.hpp:39,51 (Sequence=81, TxSequence=840);
+#              NFD daemon/face/lp-reliability.cpp:73-83 (orthogonal fields)
+# Witnesses:   The ndn-packet RUST-UNIT tests
+#              `b01_b09_reliable_wire_uses_tx_sequence` and
+#              `b09_fragmented_reliable_carries_both_sequences` exercise
+#              the wire-format invariant directly: a reliable LP frame
+#              must contain `FD 03 48` (TxSequence varnumber); a
+#              fragmented + reliable frame must additionally contain a
+#              `Sequence` (0x51) header.
+#
+# Today (B.01 + B.09 unfixed): the unit test panics because the encoder
+#                              writes 0x51 instead of 0x0348.
+# After fix:                   the encoder writes 0x0348 and the test
+#                              passes.
 #
 # Exit codes:  0 PASS / 1 FAIL / 2 SKIP
 set -euo pipefail
 
-cat >&2 <<'EOF'
-SKIP: B.01 witness requires enabling link-layer reliability on both
-      ndn-fwd and the NFD peer, then sniffing the wire to inspect the
-      header TLV-TYPE bytes. This is expected state, not implemented
-      yet in the harness:
+REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
+cd "$REPO_ROOT"
 
-  1. Add `reliability = true` to the relevant face in
-     testbed/configs/ndn-fwd.toml (syntax to be wired up in Phase E
-     remediation).
-  2. Enable `ReliabilityOptions` on the corresponding NFD face
-     (`nfdc face update <id> reliability on`).
-  3. Generate sustained traffic so reliability's retransmit path
-     fires (ndn-iperf with artificial loss via `tc netem`).
-  4. Capture with tcpdump and filter for LpPacket headers:
-       tshark -r capture.pcap -Y 'ndn.lp.tx_sequence || ndn.lp.sequence'
-  5. Assert the presence of tlv-type 0x0348 (TxSequence). Current
-     code emits 0x51 (Sequence), so this fails today.
+if ! command -v cargo >/dev/null 2>&1; then
+    echo "SKIP: cargo not in PATH" >&2
+    exit 2
+fi
 
-The fix is trivial: change `LP_SEQUENCE` to `LP_TX_SEQUENCE` in
-crates/foundation/ndn-packet/src/lp/encode.rs::encode_lp_reliable,
-and change `extract_acks` in lp/fragment.rs to read 0x0348. The
-hard part is the witness harness setup.
-EOF
-exit 2
+if cargo test -p ndn-packet --features std --lib --quiet b01_b09_ \
+       >/tmp/b01_witness.log 2>&1; then
+    echo "=== B.01 + B.09 RESOLVED — TxSequence emitted; fragmented frames carry both ==="
+    exit 0
+else
+    echo "=== B.01 / B.09 EXPECTED-FAIL — encoder still writes Sequence (0x51) ==="
+    cat /tmp/b01_witness.log
+    exit 1
+fi

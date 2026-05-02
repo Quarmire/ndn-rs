@@ -1,0 +1,24 @@
+=== B.01 / B.09 RUST-UNIT WITNESS — BEFORE FIX (2026-05-01) ===
+
+=== B.01 / B.09 EXPECTED-FAIL — encoder still writes Sequence (0x51) ===
+
+running 1 test
+lp::encode::tests::b01_b09_reliable_wire_uses_tx_sequence --- FAILED
+
+failures:
+
+---- lp::encode::tests::b01_b09_reliable_wire_uses_tx_sequence stdout ----
+
+thread 'lp::encode::tests::b01_b09_reliable_wire_uses_tx_sequence' (37340487) panicked at crates/foundation/ndn-packet/src/lp/encode.rs:160:9:
+encode_lp_reliable must emit TxSequence (TLV-TYPE 0x0348) for per-link reliability ack tracking. Wire bytes: b"d\x07Q\x01\x07P\x02\x05\0"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    lp::encode::tests::b01_b09_reliable_wire_uses_tx_sequence
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 196 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p ndn-packet --lib`
+
+=== EXIT: 1 ===

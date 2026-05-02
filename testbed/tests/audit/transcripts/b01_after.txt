@@ -1,0 +1,5 @@
+=== B.01 / B.09 RUST-UNIT WITNESS — AFTER FIX (2026-05-01) ===
+
+=== B.01 + B.09 RESOLVED — TxSequence emitted; fragmented frames carry both ===
+
+=== EXIT: 0 ===
