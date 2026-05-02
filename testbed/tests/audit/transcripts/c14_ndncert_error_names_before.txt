@@ -1,0 +1,118 @@
+=== C.14 BEFORE FIX (2026-05-02) ===
+
+--- RUST-UNIT (will fail to compile: canonical variants don't exist) ---
+    |                         ^^^^^^^^^^^^^ variant or associated item not found in `protocol::ErrorCode`
+    |
+help: there is a variant with a similar name
+    |
+213 -             (ErrorCode::RunOutOfTries, 7, "RunOutOfTries"),
+213 +             (ErrorCode::OutOfTries, 7, "RunOutOfTries"),
+    |
+
+error[E0599]: no variant or associated item named `RunOutOfTime` found for enum `protocol::ErrorCode` in the current scope
+   --> crates/protocols/ndn-cert/src/protocol.rs:214:25
+    |
+112 | pub enum ErrorCode {
+    | ------------------ variant or associated item `RunOutOfTime` not found for this enum
+...
+214 |             (ErrorCode::RunOutOfTime, 8, "RunOutOfTime"),
+    |                         ^^^^^^^^^^^^ variant or associated item not found in `protocol::ErrorCode`
+    |
+help: there is a variant with a similar name
+    |
+214 -             (ErrorCode::RunOutOfTime, 8, "RunOutOfTime"),
+214 +             (ErrorCode::OutOfTime, 8, "RunOutOfTime"),
+    |
+
+For more information about this error, try `rustc --explain E0599`.
+error: could not compile `ndn-cert` (lib test) due to 5 previous errors
+
+=== Witness: testbed/tests/audit/c14_ndncert_error_names.sh ===
+FAIL: diverged ErrorCode names still present in protocol.rs:
+113:    BadInterest = 1,
+114:    BadApplicationParameters = 2,
+115:    InvalidSignature = 3,
+119:    OutOfTries = 7,
+120:    OutOfTime = 8,
+134:            1 => Ok(Self::BadInterest),
+135:            2 => Ok(Self::BadApplicationParameters),
+136:            3 => Ok(Self::InvalidSignature),
+140:            7 => Ok(Self::OutOfTries),
+141:            8 => Ok(Self::OutOfTime),
+199:    /// `BadInterest` (→ `BadInterestFormat`),
+200:    /// `BadApplicationParameters` (→ `BadParameterFormat`),
+201:    /// `InvalidSignature` (→ `BadSignature`),
+202:    /// `OutOfTries` (→ `RunOutOfTries`),
+203:    /// `OutOfTime` (→ `RunOutOfTime`).
+ok: canonical BadInterestFormat present
+ok: canonical BadParameterFormat present
+ok: canonical BadSignature present
+ok: canonical InvalidParameters present
+ok: canonical NameNotAllowed present
+ok: canonical BadValidityPeriod present
+ok: canonical RunOutOfTries present
+ok: canonical RunOutOfTime present
+ok: canonical NoAvailableNames present
+FAIL: c14 round-trip test
+
+=== C.14 EXPECTED-FAIL — NDNCERT ErrorCode names diverge from spec ===
+error[E0599]: no variant or associated item named `BadInterestFormat` found for enum `protocol::ErrorCode` in the current scope
+   --> crates/protocols/ndn-cert/src/protocol.rs:207:25
+    |
+112 | pub enum ErrorCode {
+    | ------------------ variant or associated item `BadInterestFormat` not found for this enum
+...
+207 |             (ErrorCode::BadInterestFormat, 1, "BadInterestFormat"),
+    |                         ^^^^^^^^^^^^^^^^^ variant or associated item not found in `protocol::ErrorCode`
+
+error[E0599]: no variant or associated item named `BadParameterFormat` found for enum `protocol::ErrorCode` in the current scope
+   --> crates/protocols/ndn-cert/src/protocol.rs:208:25
+    |
+112 | pub enum ErrorCode {
+    | ------------------ variant or associated item `BadParameterFormat` not found for this enum
+...
+208 |             (ErrorCode::BadParameterFormat, 2, "BadParameterFormat"),
+    |                         ^^^^^^^^^^^^^^^^^^ variant or associated item not found in `protocol::ErrorCode`
+
+error[E0599]: no variant or associated item named `BadSignature` found for enum `protocol::ErrorCode` in the current scope
+   --> crates/protocols/ndn-cert/src/protocol.rs:209:25
+    |
+112 | pub enum ErrorCode {
+    | ------------------ variant or associated item `BadSignature` not found for this enum
+...
+209 |             (ErrorCode::BadSignature, 3, "BadSignature"),
+    |                         ^^^^^^^^^^^^ variant or associated item not found in `protocol::ErrorCode`
+
+error[E0599]: no variant or associated item named `RunOutOfTries` found for enum `protocol::ErrorCode` in the current scope
+   --> crates/protocols/ndn-cert/src/protocol.rs:213:25
+    |
+112 | pub enum ErrorCode {
+    | ------------------ variant or associated item `RunOutOfTries` not found for this enum
+...
+213 |             (ErrorCode::RunOutOfTries, 7, "RunOutOfTries"),
+    |                         ^^^^^^^^^^^^^ variant or associated item not found in `protocol::ErrorCode`
+    |
+help: there is a variant with a similar name
+    |
+213 -             (ErrorCode::RunOutOfTries, 7, "RunOutOfTries"),
+213 +             (ErrorCode::OutOfTries, 7, "RunOutOfTries"),
+    |
+
+error[E0599]: no variant or associated item named `RunOutOfTime` found for enum `protocol::ErrorCode` in the current scope
+   --> crates/protocols/ndn-cert/src/protocol.rs:214:25
+    |
+112 | pub enum ErrorCode {
+    | ------------------ variant or associated item `RunOutOfTime` not found for this enum
+...
+214 |             (ErrorCode::RunOutOfTime, 8, "RunOutOfTime"),
+    |                         ^^^^^^^^^^^^ variant or associated item not found in `protocol::ErrorCode`
+    |
+help: there is a variant with a similar name
+    |
+214 -             (ErrorCode::RunOutOfTime, 8, "RunOutOfTime"),
+214 +             (ErrorCode::OutOfTime, 8, "RunOutOfTime"),
+    |
+
+For more information about this error, try `rustc --explain E0599`.
+error: could not compile `ndn-cert` (lib test) due to 5 previous errors
+EXIT: 1

@@ -1,0 +1,29 @@
+=== C.14 AFTER FIX (2026-05-02) ===
+
+--- RUST-UNIT (canonical names round-trip) ---
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 23 filtered out; finished in 0.00s
+
+
+=== Witness: testbed/tests/audit/c14_ndncert_error_names.sh ===
+ok: diverged ErrorCode names absent from protocol.rs
+ok: canonical BadInterestFormat present
+ok: canonical BadParameterFormat present
+ok: canonical BadSignature present
+ok: canonical InvalidParameters present
+ok: canonical NameNotAllowed present
+ok: canonical BadValidityPeriod present
+ok: canonical RunOutOfTries present
+ok: canonical RunOutOfTime present
+ok: canonical NoAvailableNames present
+ok: c14_error_code_canonical_names_and_numbers
+
+=== C.14 RESOLVED — NDNCERT ErrorCode names match the canonical spec ===
+EXIT: 0
+
+=== Full ndn-cert --lib (regression sweep) ===
+........................
+test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
