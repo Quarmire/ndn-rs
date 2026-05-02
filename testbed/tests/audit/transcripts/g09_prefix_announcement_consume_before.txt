@@ -1,0 +1,23 @@
+=== G.09 BEFORE FIX (2026-05-02) ===
+
+Synthetic transcript: pre-fix the `PrefixAnnouncement` newtype in
+`stages/decode.rs` did not exist, and the `process_lp` LP-unwrap path
+extracted CongestionMark / NextHopFaceId / LpCachePolicy into
+`ctx.tags` but skipped `lp.prefix_announcement`. Compiling the
+regression test `g09_decode_stage_surfaces_prefix_announcement_tag`
+fails with E0405 ("cannot find type `PrefixAnnouncement` in this
+scope") and the runtime assertion would otherwise observe
+`ctx.tags.get::<PrefixAnnouncement>() == None`.
+
+Code-level evidence pre-fix:
+
+  $ grep -n 'PrefixAnnouncement' crates/engine/ndn-engine/src/stages/decode.rs
+  (no hits — only the LpPacket struct field read at the ndn-packet
+  level, never re-surfaced)
+
+  $ grep -rn 'prefix_announcement\b' crates/engine/
+  (only the LpPacket struct field; no consumer)
+
+The audit text at § G.09 cites NFD `self-learning-strategy.cpp:122-245`
+reading `data.getTag<lp::PrefixAnnouncementTag>()` to insert routes —
+that consumer remains a D.14 follow-up.
