@@ -1,0 +1,27 @@
+=== D.10 / E.06 BEFORE FIX (2026-05-02) ===
+
+failures:
+
+---- best_route::tests::d10_strategy_name_ends_with_version_v5 stdout ----
+
+thread 'best_route::tests::d10_strategy_name_ends_with_version_v5' (37943593) panicked at crates/engine/ndn-strategy/src/best_route.rs:275:9:
+assertion `left == right` failed: name must have 5 components incl. version
+  left: 4
+ right: 5
+
+---- multicast::tests::d10_strategy_name_ends_with_version_v5 stdout ----
+
+thread 'multicast::tests::d10_strategy_name_ends_with_version_v5' (37943594) panicked at crates/engine/ndn-strategy/src/multicast.rs:180:9:
+assertion `left == right` failed
+  left: 4
+ right: 5
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    best_route::tests::d10_strategy_name_ends_with_version_v5
+    multicast::tests::d10_strategy_name_ends_with_version_v5
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 22 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p ndn-strategy --lib`
