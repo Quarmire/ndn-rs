@@ -1,0 +1,24 @@
+=== D.09 BEFORE FIX (2026-05-02) ===
+
+The witness pre-fix is a synthetic transcript: the regression tests
+`d09_on_nack_retries_another_nexthop`, `d09_on_nack_propagates_when_exhausted`,
+and `d09_on_nack_propagates_when_no_fib` exercise the `Strategy::on_nack`
+override that did not exist on `main` prior to this commit. The default
+trait-level `on_nack` returns `ForwardingAction::Suppress`
+(`crates/engine/ndn-strategy/src/strategy.rs:32-38`), which causes the
+`Forward(...)` assertion in `d09_on_nack_retries_another_nexthop` to fail
+("expected Forward to nexthop 3 on retry; default `Suppress` is the broken
+behaviour D.09 fixes").
+
+Code-level evidence pre-fix:
+
+  $ grep -n 'fn on_nack' crates/engine/ndn-strategy/src/best_route.rs
+  (no hits — uses trait default)
+
+  $ grep -n 'fn on_nack' crates/engine/ndn-strategy/src/strategy.rs
+  32:    fn on_nack(
+
+The audit text at § D.09 cites NFD
+`daemon/fw/best-route-strategy.cpp:120-125` `afterReceiveNack` →
+`processNack` as the reference implementation that ndn-rs's
+BestRouteStrategy was missing.
