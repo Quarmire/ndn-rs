@@ -68,7 +68,7 @@ new rows appear below under the appropriate severity tiers.
 | D.07 | `d07_pit_token_echo.sh` | EXPECTED-FAIL | Data response to a PitToken-tagged Interest lacks the echoed token | not yet run |
 | D.09 | `d09_bestroute_nack_retry.sh` | EXPECTED-FAIL | On nexthop-1 Nack, ndn-rs does not retry nexthop-2; propagates Nack immediately | not yet run |
 | D.10 | `d10_strategy_name_version.sh` | EXPECTED-FAIL | BestRouteStrategy::strategy_name() last component is not a Version (TLV 0x36); NFD `nfdc` rejects | not yet run |
-| D.13 | `d13_localhost_unvalidated.sh` | EXPECTED-FAIL | Forged `/localhost/...` Data (zeroed signature) accepted by ndn-rs, rejected by ndn-cxx | not yet run |
+| D.13 | `d13_localhost_unvalidated.sh` | RESOLVED 2026-05-01 (RUST-UNIT + GREP-PROOF; live forgery interop still BLOCKED-BY-INTEROP) | The blanket `/localhost` skip is removed from `validation.rs`; /localhost Data goes through the same chain walk as any other Data. Mgmt responses use DigestSha256 today (covered by the C.01/C.03 verifier dispatch). Before/after transcripts at `testbed/tests/audit/transcripts/d13_localhost_unvalidated_{before,after}.txt`. | 2026-05-01 |
 | E.03 | `e03_extended_modules_unsigned.sh` | EXPECTED-FAIL | `/localhost/nfd/security/*` and other ndn-rs-extended modules accept commands without auth | not yet run |
 | F.01 | `f01_ipv6_faceuri.sh` | EXPECTED-FAIL | IPv6 peer Face reports `udp4://[…]`, rejected by NFD FaceUri parser | not yet run |
 | F.03 | `f03_faceuri_schemes.sh` | EXPECTED-FAIL | TCP face emits `tcp://`, should be `tcp4://`/`tcp6://` | not yet run |
@@ -81,7 +81,7 @@ new rows appear below under the appropriate severity tiers.
 | N.04 | `n04_critical_in_metainfo_siginfo.sh` | EXPECTED-FAIL | Unknown critical TLV inside MetaInfo or SignatureInfo body silently stripped | not yet run |
 | N.05 | `n05_nack_no_reason.sh` | EXPECTED-FAIL | Nack header without NackReason decodes as `Other(0)` instead of `None` | not yet run |
 | N.06 | `n06_dead_nonce_list.sh` | EXPECTED-FAIL | Re-entered Interest with recently-used nonce after PIT erasure not detected as loop (no DNL) | not yet run |
-| N.07 | `n07_localhost_data_ingress.sh` | EXPECTED-FAIL | `/localhost/...` Data from non-local face accepted into CS; NFD drops at ingress | not yet run |
+| N.07 | rolled into `d13_localhost_unvalidated.sh` | RESOLVED 2026-05-01 | The decode-stage `check_scope` already covered Data (it keys on `ctx.name`, not packet kind); the audit's "ingress check missing for Data" claim was outdated. RUST-UNIT `n07_is_localhost_name_recognises_prefix` confirms the helper. | 2026-05-01 |
 | N.10 | `n10_command_replay.sh` | EXPECTED-FAIL (depends on E.01 fix) | Captured signed command replays accepted indefinitely; no SignatureTime window | not yet run |
 | N.11 | `n11_control_param_binding.sh` | EXPECTED-FAIL (depends on E.01) | ControlParameters in AppParams without matching PSDC dispatched | not yet run |
 | N.12 | `n12_mgmt_response_signing.sh` | EXPECTED-FAIL (depends on C.07/C.08 fix) | All control responses use DigestSha256; ndn-cxx `nfd::Controller` with trust schema rejects | not yet run |
