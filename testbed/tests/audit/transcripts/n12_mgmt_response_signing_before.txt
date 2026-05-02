@@ -1,0 +1,25 @@
+=== N.12 BEFORE FIX (2026-05-02) ===
+
+Synthetic transcript: pre-fix `send_response` always called
+`encode_data_unsigned`, which since A.10's RESOLVED 2026-05-01 fix
+emits real DigestSha256-signed Data — but DigestSha256 alone is the
+finding's specific concern: ndn-cxx `nfd::Controller` configured
+against an NFD trust schema rejects responses without a real
+KeyLocator-bearing signature. The `build_mgmt_response_wire` helper,
+the `MgmtHandles.command_response_signer` field, and the regression
+tests below did not exist on `main` prior to this commit.
+
+Code-level evidence pre-fix:
+
+  $ grep -n 'fn build_mgmt_response_wire\|command_response_signer' \
+        binaries/ndn-fwd/src/mgmt_ndn.rs binaries/ndn-fwd/src/main.rs
+  (no hits)
+
+  $ grep -n 'fn send_response' binaries/ndn-fwd/src/mgmt_ndn.rs
+  ...:async fn send_response(handle: &InProcHandle, name: &Name, resp: &ControlResponse) {
+  ...:    let content = resp.encode();
+  ...:    let data = encode_data_unsigned(name, &content);   # ← always DigestSha256
+
+Reference: NFD `mgmt/dispatcher.cpp` signs control responses with the
+daemon's identity key; ndn-cxx `nfd::Controller` validates against the
+configured trust schema.
