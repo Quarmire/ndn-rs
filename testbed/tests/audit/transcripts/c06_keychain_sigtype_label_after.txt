@@ -1,0 +1,32 @@
+=== C.06 AFTER FIX (2026-05-02) ===
+
+679 |         let signer = Ed25519Signer::from_seed(&seed, key_name.clone());
+    |             ^^^^^^ help: if this is intentional, prefix it with an underscore: `_signer`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+
+running 2 tests
+..
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 189 filtered out; finished in 0.01s
+
+
+=== Witness: testbed/tests/audit/c06_keychain_sigtype_label.sh ===
+ok: KeyChain reads sig_type from active Signer
+
+=== C.06 RESOLVED — KeyChain sign_data / sign_interest read signer.sig_type ===
+EXIT: 0
+
+=== Full ndn-security --lib (regression sweep) ===
+....................................................................................... 87/191
+....................................................................................... 174/191
+.................
+test result: ok. 191 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 39.53s
+
+
+=== ndn-packet --lib regression ===
+....................................................................................... 87/216
+....................................................................................... 174/216
+..........................................
+test result: ok. 216 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
