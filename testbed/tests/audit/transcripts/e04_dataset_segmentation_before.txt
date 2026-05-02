@@ -1,0 +1,28 @@
+=== E.04 BEFORE FIX (2026-05-01) ===
+=== E.04 EXPECTED-FAIL — status datasets emitted as single Data ===
+
+running 2 tests
+mgmt_ndn::e04_tests::e04_single_segment_response_carries_version_segment_and_final_block_id --- FAILED
+mgmt_ndn::e04_tests::e04_multi_segment_response_marks_only_last_segment_as_final --- FAILED
+
+failures:
+
+---- mgmt_ndn::e04_tests::e04_single_segment_response_carries_version_segment_and_final_block_id stdout ----
+
+thread 'mgmt_ndn::e04_tests::e04_single_segment_response_carries_version_segment_and_final_block_id' (37539120) panicked at binaries/ndn-fwd/src/mgmt_ndn.rs:2621:9:
+assertion `left == right` failed
+  left: 8
+ right: 54
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- mgmt_ndn::e04_tests::e04_multi_segment_response_marks_only_last_segment_as_final stdout ----
+
+thread 'mgmt_ndn::e04_tests::e04_multi_segment_response_marks_only_last_segment_as_final' (37539119) panicked at binaries/ndn-fwd/src/mgmt_ndn.rs:2638:9:
+assertion `left == right` failed: expected 3 segments for 2.x payload
+  left: 1
+ right: 3
+
+
+failures:
+
+EXIT: 1

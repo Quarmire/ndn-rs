@@ -1,0 +1,4 @@
+=== E.04 AFTER FIX (2026-05-01) ===
+=== E.04 RESOLVED — status datasets are versioned + segmented + carry FinalBlockId ===
+
+EXIT: 0
