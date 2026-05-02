@@ -1,0 +1,11 @@
+=== A.01 GREP-PROOF — AFTER FIX (2026-05-01) ===
+
+ok: no BLAKE3_DIGEST constant in ndn-packet
+ok: no blake3_digest helpers in ndn-packet
+ok: no ZoneKey / zone module in ndn-security
+ok: no build_zone_did_document / build_zone_succession_document in ndn-security
+ok: zone.rs deleted
+
+=== A.01 RESOLVED — no BLAKE3_DIGEST 0x03 surface in ndn-rs ===
+
+=== EXIT: 0 (spec-compliant — no BLAKE3_DIGEST surface present) ===

@@ -1,0 +1,61 @@
+=== A.01 GREP-PROOF — BEFORE FIX (2026-05-01) ===
+
+--- ndn-packet/src/lib.rs (BLAKE3_DIGEST constant) ---
+51:    pub const BLAKE3_DIGEST: u64 = 0x03;
+
+--- ndn-packet/src/name.rs (helpers + Display arm) ---
+60:    pub fn blake3_digest(hash: [u8; 32]) -> Self {
+61:        Self::new(tlv_type::BLAKE3_DIGEST, Bytes::copy_from_slice(&hash))
+65:    /// `BLAKE3_DIGEST` (type 0x03) component or the value is not 32 bytes.
+66:    pub fn as_blake3_digest(&self) -> Option<[u8; 32]> {
+67:        if self.typ == tlv_type::BLAKE3_DIGEST && self.value.len() == 32 {
+268:    /// **Experimental / NDA extension.** See [`NameComponent::blake3_digest`].
+269:    pub fn append_blake3_digest(self, hash: [u8; 32]) -> Self {
+270:        self.append_component(NameComponent::blake3_digest(hash))
+277:    pub fn zone_root_from_hash(hash: [u8; 32]) -> Self {
+278:        Name::from_components([NameComponent::blake3_digest(hash)])
+281:    pub fn is_zone_root(&self) -> bool {
+283:            && self.components()[0].typ == crate::tlv_type::BLAKE3_DIGEST
+445:                tlv_type::BLAKE3_DIGEST => {
+446:                    write!(f, "blake3digest=")?;
+
+--- ndn-security (ZoneKey + zone-bound DID surface) ---
+crates/engine/ndn-security/src/lib.rs:68:pub use zone::{ZoneKey, verify_zone_root, zone_root_from_pubkey, zone_root_to_did};
+crates/engine/ndn-security/src/lib.rs:75:    build_zone_did_document, build_zone_succession_document, cert_to_did_document, deref_did_url,
+crates/engine/ndn-security/src/did/convert.rs:75:/// Build a W3C DID Document for a self-certifying [`ZoneKey`].
+crates/engine/ndn-security/src/did/convert.rs:86:pub fn build_zone_did_document(
+crates/engine/ndn-security/src/did/convert.rs:87:    zone_key: &crate::zone::ZoneKey,
+crates/engine/ndn-security/src/did/convert.rs:91:    let did = zone_key.zone_root_did();
+crates/engine/ndn-security/src/did/convert.rs:129:pub fn build_zone_succession_document(
+crates/engine/ndn-security/src/did/convert.rs:130:    old_zone_key: &crate::zone::ZoneKey,
+crates/engine/ndn-security/src/did/convert.rs:133:    let did = old_zone_key.zone_root_did();
+crates/engine/ndn-security/src/zone.rs:10://! zone_root = Name[ BLAKE3_DIGEST(blake3(public_key_bytes)) ]
+crates/engine/ndn-security/src/zone.rs:28:pub struct ZoneKey {
+crates/engine/ndn-security/src/zone.rs:30:    zone_root: Name,
+crates/engine/ndn-security/src/zone.rs:34:impl ZoneKey {
+crates/engine/ndn-security/src/zone.rs:35:    /// Derive a `ZoneKey` from a raw 32-byte Ed25519 seed.
+crates/engine/ndn-security/src/zone.rs:42:        let zone_root = zone_root_from_pubkey(&pub_key_bytes);
+crates/engine/ndn-security/src/zone.rs:43:        let signer = Ed25519Signer::from_seed(seed, zone_root.clone());
+crates/engine/ndn-security/src/zone.rs:46:            zone_root,
+crates/engine/ndn-security/src/zone.rs:51:    /// Derive a `ZoneKey` from raw Ed25519 signing-key bytes (32-byte seed).
+crates/engine/ndn-security/src/zone.rs:60:    pub fn zone_root_name(&self) -> &Name {
+crates/engine/ndn-security/src/zone.rs:61:        &self.zone_root
+crates/engine/ndn-security/src/zone.rs:82:        let mut components = self.zone_root.components().to_vec();
+crates/engine/ndn-security/src/zone.rs:90:    pub fn zone_root_did(&self) -> String {
+crates/engine/ndn-security/src/zone.rs:91:        zone_root_to_did(&self.zone_root)
+crates/engine/ndn-security/src/zone.rs:95:        let zc = self.zone_root.components();
+crates/engine/ndn-security/src/zone.rs:101:pub fn zone_root_from_pubkey(public_key_bytes: &[u8]) -> Name {
+crates/engine/ndn-security/src/zone.rs:103:    Name::zone_root_from_hash(*hash.as_bytes())
+crates/engine/ndn-security/src/zone.rs:106:pub fn zone_root_to_did(zone_root: &Name) -> String {
+crates/engine/ndn-security/src/zone.rs:107:    crate::did::name_to_did(zone_root)
+crates/engine/ndn-security/src/zone.rs:110:pub fn verify_zone_root(zone_root: &Name, public_key_bytes: &[u8]) -> bool {
+crates/engine/ndn-security/src/zone.rs:111:    let expected = zone_root_from_pubkey(public_key_bytes);
+crates/engine/ndn-security/src/zone.rs:112:    zone_root == &expected
+crates/engine/ndn-security/src/did/mod.rs:54:    build_zone_did_document, build_zone_succession_document, cert_to_did_document,
+crates/engine/ndn-security/src/did/resolver/ndn.rs:105:            if name.is_zone_root() {
+crates/engine/ndn-security/src/did/resolver/ndn.rs:141:    zone_root: Name,
+crates/engine/ndn-security/src/did/resolver/ndn.rs:154:    let raw = match fetch(zone_root.clone()).await {
+crates/engine/ndn-security/src/did/resolver/ndn.rs:187:        let expected_zone = crate::zone::zone_root_from_pubkey(&pubkey_bytes);
+crates/engine/ndn-security/src/did/resolver/ndn.rs:188:        if expected_zone != zone_root {
+
+=== EXIT: 1 (spec violation present) ===
