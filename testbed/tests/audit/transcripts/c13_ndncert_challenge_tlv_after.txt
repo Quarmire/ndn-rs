@@ -1,0 +1,4 @@
+=== C.13 AFTER FIX (2026-05-01) ===
+=== C.13 RESOLVED — CHALLENGE plaintext is TLV ParameterKey/ParameterValue ===
+
+EXIT: 0

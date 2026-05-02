@@ -1,0 +1,11 @@
+=== C.13 BEFORE FIX (2026-05-01) ===
+=== C.13 EXPECTED-FAIL — CHALLENGE plaintext is JSON, not TLV ===
+
+running 1 test
+client::tests::c13_challenge_request_plaintext_is_tlv_not_json --- FAILED
+
+failures:
+
+---- client::tests::c13_challenge_request_plaintext_is_tlv_not_json stdout ----
+
+EXIT: 1
