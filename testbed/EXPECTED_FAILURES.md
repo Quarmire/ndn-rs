@@ -55,7 +55,7 @@ new rows appear below under the appropriate severity tiers.
 |---------|------|--------|----|-|
 | A.02 | `a02_psdc_structural.sh` | EXPECTED-FAIL | Interest with `ApplicationParameters` but no PSDC accepted by ndn-rs, rejected by ndn-cxx | not yet run |
 | A.03 | `a03_unknown_critical_tlv.sh` | EXPECTED-FAIL | Interest carrying unknown critical TLV type inside body accepted by ndn-rs, rejected by ndn-cxx | not yet run |
-| A.10 | `a10_databuilder_build_sig.sh` | EXPECTED-FAIL | Data emitted by `DataBuilder::build()` has zero-bytes signature; ndn-cxx DigestSha256 verify fails | not yet run |
+| A.10 | `a10_databuilder_build_sig.sh` | RESOLVED 2026-05-01 | `DataBuilder::build()` now routes through the existing `sign_digest_sha256()` fast path so `SignatureValue` is the real `SHA-256(signed region)` per NDN Packet Format §6.3.2. Witness: RUST-UNIT `a10_databuilder_build_emits_real_sha256` in ndn-packet. Before/after transcripts at `testbed/tests/audit/transcripts/a10_databuilder_build_sig_{before,after}.txt`. | 2026-05-01 (rust-unit witness) |
 | A.15 | `a15_keylocator_rules.sh` | EXPECTED-FAIL | Ed25519 Data without KeyLocator accepted by ndn-rs, rejected by ndn-cxx | not yet run |
 | C.02 | rolled into `c01_ecdsa_verify.sh` | RESOLVED 2026-05-01 | `HmacSha256Verifier` added; reachable via `verify_by_sig_type` for SignatureType code 4. | 2026-05-01 |
 | C.03 | rolled into `c01_ecdsa_verify.sh` | RESOLVED 2026-05-01 | `DigestSha256Verifier` added; reachable on the basic `Validator::validate` path (no KeyLocator required). | 2026-05-01 |
