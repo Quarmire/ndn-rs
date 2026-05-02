@@ -1,0 +1,21 @@
+=== A.10 AFTER FIX (2026-05-01) ===
+Test: cargo test -p ndn-packet --features std --lib --quiet a10_databuilder_build_emits_real_sha256
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 202 filtered out; finished in 0.00s
+
+
+=== Witness: testbed/tests/audit/a10_databuilder_build_sig.sh ===
+ok: ndn-packet DataBuilder::build emits real SHA-256
+
+=== A.10 RESOLVED — DataBuilder::build() emits real SHA-256 ===
+EXIT: 0
+
+=== Full ndn-packet --lib (regression sweep) ===
+....................................................................................... 87/203
+....................................................................................... 174/203
+.............................
+test result: ok. 203 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

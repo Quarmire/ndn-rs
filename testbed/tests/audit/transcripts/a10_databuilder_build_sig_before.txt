@@ -1,0 +1,47 @@
+=== A.10 BEFORE FIX (2026-05-01) ===
+Test: cargo test -p ndn-packet --features std --lib --quiet a10_databuilder_build_emits_real_sha256
+
+
+running 1 test
+encode::data::tests::a10_databuilder_build_emits_real_sha256 --- FAILED
+
+failures:
+
+---- encode::data::tests::a10_databuilder_build_emits_real_sha256 stdout ----
+
+thread 'encode::data::tests::a10_databuilder_build_emits_real_sha256' (37640135) panicked at crates/foundation/ndn-packet/src/encode/data.rs:586:9:
+SignatureValue must not be all zeros (forged DigestSha256)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    encode::data::tests::a10_databuilder_build_emits_real_sha256
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 202 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p ndn-packet --lib`
+
+=== Witness: testbed/tests/audit/a10_databuilder_build_sig.sh ===
+FAIL: ndn-packet DataBuilder::build forges DigestSha256
+
+=== A.10 EXPECTED-FAIL — DataBuilder::build() forges DigestSha256 ===
+
+running 1 test
+encode::data::tests::a10_databuilder_build_emits_real_sha256 --- FAILED
+
+failures:
+
+---- encode::data::tests::a10_databuilder_build_emits_real_sha256 stdout ----
+
+thread 'encode::data::tests::a10_databuilder_build_emits_real_sha256' (37640203) panicked at crates/foundation/ndn-packet/src/encode/data.rs:586:9:
+SignatureValue must not be all zeros (forged DigestSha256)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    encode::data::tests::a10_databuilder_build_emits_real_sha256
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 202 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p ndn-packet --lib`
+EXIT: 1
