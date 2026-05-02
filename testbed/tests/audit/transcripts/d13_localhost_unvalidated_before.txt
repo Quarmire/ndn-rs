@@ -1,0 +1,23 @@
+=== D.13 / I.08 + N.07 BEFORE FIX (2026-05-01) ===
+
+[Pre-fix state of crates/engine/ndn-engine/src/stages/validation.rs:
+
+    // /localhost/ management responses are unsigned by design.
+    if data.name.components().first().map(|c| c.value.as_ref()
+            == b"localhost").unwrap_or(false) {
+        trace!(name=%data.name, "validation: skipping /localhost/ management data");
+        return Action::Satisfy(ctx);
+    }
+
+This blanket-trusts any Data whose name starts with /localhost,
+including forgeries arriving from non-local faces. The audit's
+N.07 concern (no /localhost Data ingress check) was already
+addressed by check_scope at decode-time, but the validation-stage
+blanket-trust still let any /localhost Data through unsigned.]
+
+FAIL: blanket /localhost skip still in validation.rs
+   $ grep -nE 'skipping /localhost' crates/engine/ndn-engine/src/stages/validation.rs
+   crates/engine/ndn-engine/src/stages/validation.rs:158:
+       trace!(name=%data.name, "validation: skipping /localhost/ management data");
+
+EXIT: 1  (D.13 / I.08 unresolved)

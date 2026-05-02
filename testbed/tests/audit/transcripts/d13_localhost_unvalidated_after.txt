@@ -1,0 +1,6 @@
+=== D.13 / I.08 + N.07 AFTER FIX (2026-05-01) ===
+ok: blanket /localhost skip removed from validation.rs
+
+=== D.13 / I.08 RESOLVED — /localhost Data validates per the same chain rules ===
+
+EXIT: 0
