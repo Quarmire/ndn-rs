@@ -1,0 +1,28 @@
+=== D.01 / I.09 BEFORE FIX (2026-05-01) ===
+ok: ndn-packet helper (decrement_hop_limit)
+FAIL: ndn-engine decode stage
+
+=== D.01 / I.09 EXPECTED-FAIL — HopLimit not decremented before forward ===
+
+running 2 tests
+..
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 198 filtered out; finished in 0.00s
+
+
+running 3 tests
+.. 2/3
+stages::decode::d01_tests::d01_decode_stage_decrements_hop_limit --- FAILED
+
+failures:
+
+---- stages::decode::d01_tests::d01_decode_stage_decrements_hop_limit stdout ----
+
+thread 'stages::decode::d01_tests::d01_decode_stage_decrements_hop_limit' (37577716) panicked at crates/engine/ndn-engine/src/stages/decode.rs:287:9:
+assertion `left == right` failed: HopLimit must be decremented by the decode stage
+  left: Some(7)
+ right: Some(6)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+
+EXIT: 1
