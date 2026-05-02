@@ -1,0 +1,4 @@
+=== G.03 AFTER FIX (2026-05-01) ===
+=== G.03 RESOLVED (architecture) — IBF hash family is MurmurHash3 ===
+
+EXIT: 0

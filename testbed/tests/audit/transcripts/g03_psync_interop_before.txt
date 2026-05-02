@@ -1,0 +1,15 @@
+=== G.03 BEFORE FIX (2026-05-01) ===
+=== G.03 EXPECTED-FAIL — IBF still uses custom splitmix64 + multiply ===
+
+running 2 tests
+psync::tests::g03_ibf_cell_hash_is_murmur3 --- FAILED
+psync::tests::g03_ibf_cell_indices_use_murmur3_seeds --- FAILED
+
+failures:
+
+---- psync::tests::g03_ibf_cell_hash_is_murmur3 stdout ----
+
+thread 'psync::tests::g03_ibf_cell_hash_is_murmur3' (37524133) panicked at crates/protocols/ndn-sync/src/psync.rs:252:9:
+assertion `left == right` failed: PSync IBF keyCheck hash must be MurmurHash3(value, N_HASHCHECK=11) per PSync iblt.{hpp,cpp}; got cell_hash(0x123456789abcdef) = 0xf7bb6a55f054df18, expected 0xceac6569
+
+EXIT: 1
