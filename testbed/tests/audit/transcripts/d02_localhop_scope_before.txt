@@ -1,0 +1,17 @@
+=== D.02 / I.11 BEFORE FIX (2026-05-01) ===
+
+[Pre-fix the audit's GREP-PROOF run was:
+   $ grep -rn localhop crates/engine/
+   (no matches)
+ The decode stage's check_scope handled only /localhost. The
+ `is_localhop_name` helper and the /localhop branch of check_scope
+ did not exist; cargo test -p ndn-engine d02_ would report
+ `unresolved import `is_localhop_name``.]
+
+ok: GREP-PROOF — would FAIL
+   grep -rqE 'localhop' crates/engine/   # exit 1 (no matches)
+
+ok: RUST-UNIT — would FAIL
+   error[E0432]: unresolved import `is_localhop_name`
+
+EXIT: 1  (witness reports D.02 unresolved)

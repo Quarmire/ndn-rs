@@ -1,0 +1,7 @@
+=== D.02 / I.11 AFTER FIX (2026-05-01) ===
+ok: GREP-PROOF — 'localhop' present in crates/engine/
+ok: RUST-UNIT — is_localhop_name helper
+
+=== D.02 / I.11 RESOLVED — /localhop scope check present ===
+
+EXIT: 0
