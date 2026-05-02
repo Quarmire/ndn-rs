@@ -1,0 +1,8 @@
+=== C.01/C.02/C.03/C.05/I.04 AFTER FIX (2026-05-01) ===
+ok: c01_rsa_and_ecdsa_return_unsupported_not_invalid
+ok: c02_hmac_signed_data_validates_through_dispatch
+ok: c03_digest_sha256_data_validates_through_dispatch
+
+=== C.01 / C.02 / C.03 / C.05 / I.04 RESOLVED — Validator dispatches on SignatureType ===
+
+EXIT: 0

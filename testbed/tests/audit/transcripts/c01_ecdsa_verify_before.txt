@@ -1,0 +1,107 @@
+=== C.01/C.02/C.03/C.05/I.04 BEFORE FIX (2026-05-01) ===
+FAIL: c01_rsa_and_ecdsa_return_unsupported_not_invalid
+FAIL: c02_hmac_signed_data_validates_through_dispatch
+FAIL: c03_digest_sha256_data_validates_through_dispatch
+
+=== C.01 / C.05 / I.04 EXPECTED-FAIL — Validator hardwired or dispatch missing ===
+warning: unused import: `verify_by_sig_type`
+  --> crates/engine/ndn-security/src/validator/mod.rs:11:33
+   |
+11 | use crate::verifier::{Verifier, verify_by_sig_type};
+   |                                 ^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `Ed25519Verifier`
+  --> crates/engine/ndn-security/src/validator/mod.rs:12:24
+   |
+12 | use crate::{CertCache, Ed25519Verifier, SafeData, TrustError, TrustSchema, VerifyOutcome};
+   |                        ^^^^^^^^^^^^^^^
+
+
+running 1 test
+validator::tests::c01_rsa_and_ecdsa_return_unsupported_not_invalid --- FAILED
+
+failures:
+
+---- validator::tests::c01_rsa_and_ecdsa_return_unsupported_not_invalid stdout ----
+
+thread 'validator::tests::c01_rsa_and_ecdsa_return_unsupported_not_invalid' (37501372) panicked at crates/engine/ndn-security/src/validator/mod.rs:583:26:
+C.01 — sig type 1 must surface as Unsupported, got: Valid(SafeData { inner: Data { raw: b"\x06V\x07\x06\x08\x04data\x16\n\x1b\x01\x01\x1c\x05\x07\x03\x08\x01k\x17@\xc3\xd2\xc2\x0c\xb0\xe0F>R*{5\xce\xd3\xe3t\xcat5#\x02\x03\xcb\x17\x10\xa7\xd4\x99g\xbbOg\x8f\x9e\x15%\\\x8a\x94/\xa2\x1d\xa4\x8a\x1bDH\xac\xb0\0_\xfeJ@;V\x06#\xa2W\xeb\x8a\xcd\x03", signed_start: 2, signed_end: 22, sig_value_start: 22, sig_value_end: 88, name: Name { components: [NameComponent { typ: 8, value: b"data" }] }, meta_info: OnceLock(<uninit>), content: OnceLock(<uninit>), sig_info: OnceLock(<uninit>) }, trust_path: CertChain([Name { components: [NameComponent { typ: 8, value: b"k" }] }]), verified_at: 1777692653753303000 })
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    validator::tests::c01_rsa_and_ecdsa_return_unsupported_not_invalid
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 186 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p ndn-security --lib`
+warning: unused import: `verify_by_sig_type`
+  --> crates/engine/ndn-security/src/validator/mod.rs:11:33
+   |
+11 | use crate::verifier::{Verifier, verify_by_sig_type};
+   |                                 ^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `Ed25519Verifier`
+  --> crates/engine/ndn-security/src/validator/mod.rs:12:24
+   |
+12 | use crate::{CertCache, Ed25519Verifier, SafeData, TrustError, TrustSchema, VerifyOutcome};
+   |                        ^^^^^^^^^^^^^^^
+
+
+running 1 test
+validator::tests::c02_hmac_signed_data_validates_through_dispatch --- FAILED
+
+failures:
+
+---- validator::tests::c02_hmac_signed_data_validates_through_dispatch stdout ----
+
+thread 'validator::tests::c02_hmac_signed_data_validates_through_dispatch' (37501398) panicked at crates/engine/ndn-security/src/validator/mod.rs:491:22:
+C.02 — HMAC dispatch failed; expected Valid, got: Invalid(InvalidKey)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    validator::tests::c02_hmac_signed_data_validates_through_dispatch
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 186 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p ndn-security --lib`
+warning: unused import: `verify_by_sig_type`
+  --> crates/engine/ndn-security/src/validator/mod.rs:11:33
+   |
+11 | use crate::verifier::{Verifier, verify_by_sig_type};
+   |                                 ^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `Ed25519Verifier`
+  --> crates/engine/ndn-security/src/validator/mod.rs:12:24
+   |
+12 | use crate::{CertCache, Ed25519Verifier, SafeData, TrustError, TrustSchema, VerifyOutcome};
+   |                        ^^^^^^^^^^^^^^^
+
+
+running 1 test
+validator::tests::c03_digest_sha256_data_validates_through_dispatch --- FAILED
+
+failures:
+
+---- validator::tests::c03_digest_sha256_data_validates_through_dispatch stdout ----
+
+thread 'validator::tests::c03_digest_sha256_data_validates_through_dispatch' (37501421) panicked at crates/engine/ndn-security/src/validator/mod.rs:545:22:
+C.03 — DigestSha256 not reachable on basic validate path; got: Invalid(InvalidSignature)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    validator::tests::c03_digest_sha256_data_validates_through_dispatch
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 186 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p ndn-security --lib`
+
+EXIT: 1
