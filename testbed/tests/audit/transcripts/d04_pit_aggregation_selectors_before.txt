@@ -1,0 +1,53 @@
+=== D.04 BEFORE FIX (2026-05-02) ===
+
+RUST-UNIT (will fail to compile: PitToken::from_interest takes a selector arg, InRecord has no selector field):
+   --> crates/foundation/ndn-store/src/pit.rs:164:12
+    |
+164 |     pub fn add_in_record(
+    |            ^^^^^^^^^^^^^
+help: remove the extra argument
+    |
+547 -             None,
+548 -             Selector {
+549 -                 can_be_prefix: false,
+550 -                 must_be_fresh: true,
+551 -             },
+547 +             None,
+    |
+
+error[E0061]: this function takes 2 arguments but 1 argument was supplied
+   --> crates/foundation/ndn-store/src/pit.rs:555:23
+    |
+555 |         let token_b = PitToken::from_interest(&name);
+    |                       ^^^^^^^^^^^^^^^^^^^^^^^------- argument #2 of type `Option<&Selector>` is missing
+    |
+note: associated function defined here
+   --> crates/foundation/ndn-store/src/pit.rs:93:12
+    |
+ 93 |     pub fn from_interest(name: &Name, selector: Option<&Selector>) -> Self {
+    |            ^^^^^^^^^^^^^              ---------------------------
+help: provide the argument
+    |
+555 |         let token_b = PitToken::from_interest(&name, /* Option<&Selector> */);
+    |                                                    +++++++++++++++++++++++++
+
+error[E0061]: this method takes 4 arguments but 5 arguments were supplied
+   --> crates/foundation/ndn-store/src/pit.rs:558:15
+    |
+558 |             e.add_in_record(2, 20, 999, None, Selector::default());
+    |               ^^^^^^^^^^^^^                   ------------------- unexpected argument #5 of type `Selector`
+    |
+note: method defined here
+   --> crates/foundation/ndn-store/src/pit.rs:164:12
+    |
+164 |     pub fn add_in_record(
+    |            ^^^^^^^^^^^^^
+help: remove the extra argument
+    |
+558 -             e.add_in_record(2, 20, 999, None, Selector::default());
+558 +             e.add_in_record(2, 20, 999, None);
+    |
+
+Some errors have detailed explanations: E0061, E0609.
+For more information about an error, try `rustc --explain E0061`.
+error: could not compile `ndn-store` (lib test) due to 12 previous errors
