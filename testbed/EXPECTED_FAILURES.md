@@ -47,7 +47,7 @@ new rows appear below under the appropriate severity tiers.
 | E.04 | `e04_dataset_segmentation.sh` | EXPECTED-FAIL | `faces/list` over MTU is truncated; `nfdc` parse fails (no SegmentName/FinalBlockId) | not yet run |
 | N.01 | `n01_fragcount_dos.sh` | EXPECTED-FAIL | Crafted FragCount=u32::MAX triggers unbounded vec allocation in ReassemblyBuffer (DoS, no auth required) | not yet run |
 | E.01 | `e01_mgmt_unauth.sh` | EXPECTED-FAIL | unsigned `rib/register` command is accepted by ndn-fwd (NFD rejects — control) | not yet run |
-| G.03 | `g03_psync_interop.sh` | BLOCKED-BY-INTEROP | PSync C++ peer required; ndn-rs IBF uses splitmix64 + custom hash, not Murmur3 | not yet run |
+| G.03 | `g03_psync_interop.sh` | RESOLVED 2026-05-01 (architecture; live PSync interop still BLOCKED-BY-INTEROP) | IBF cell-selection and `keyCheck` now use `MurmurHash3_x86_32` per PSync `detail/util.cpp::murmurHash3` with `N_HASH=3` and `N_HASHCHECK=11`. Witness rewritten as RUST-UNIT (Murmur3 canonical vectors + IBF dispatch). The remaining wire-format gap (PSync uses `uint32_t` keys; ndn-rs IBF stores `u64`) plus the IBF TLV envelope and segmented Sync Data flow still block live interop with the PSync C++ peer. Before/after transcripts at `testbed/tests/audit/transcripts/g03_psync_interop_{before,after}.txt`. | 2026-05-01 (architecture) |
 
 ## MAJOR
 
