@@ -53,7 +53,7 @@ new rows appear below under the appropriate severity tiers.
 
 | Finding | Witness test | Status | Predicted failure | Last seen |
 |---------|------|--------|----|-|
-| A.02 | `a02_psdc_structural.sh` | EXPECTED-FAIL | Interest with `ApplicationParameters` but no PSDC accepted by ndn-rs, rejected by ndn-cxx | not yet run |
+| A.02 / A.21 | `a02_psdc_structural.sh` | RESOLVED 2026-05-02 | `Interest::decode` now calls a new `validate_psdc_structure` after `Name::decode` and a forked-reader `body_has_app_params` scan; rejects (i) AppParams without PSDC, (ii) PSDC not at the last position, (iii) more than one PSDC. Mirrors ndn-cxx `interest.cpp:171-173,303,692-710` and ndnd `spec_2022/spec.go:513-518`. Witness: RUST-UNIT covering all three shapes. Before/after transcripts at `testbed/tests/audit/transcripts/a02_psdc_structural_{before,after}.txt`. | 2026-05-01 (rust-unit witness) |
 | A.03 | `a03_unknown_critical_tlv.sh` | EXPECTED-FAIL | Interest carrying unknown critical TLV type inside body accepted by ndn-rs, rejected by ndn-cxx | not yet run |
 | A.10 | `a10_databuilder_build_sig.sh` | RESOLVED 2026-05-01 | `DataBuilder::build()` now routes through the existing `sign_digest_sha256()` fast path so `SignatureValue` is the real `SHA-256(signed region)` per NDN Packet Format §6.3.2. Witness: RUST-UNIT `a10_databuilder_build_emits_real_sha256` in ndn-packet. Before/after transcripts at `testbed/tests/audit/transcripts/a10_databuilder_build_sig_{before,after}.txt`. | 2026-05-01 (rust-unit witness) |
 | A.15 | `a15_keylocator_rules.sh` | EXPECTED-FAIL | Ed25519 Data without KeyLocator accepted by ndn-rs, rejected by ndn-cxx | not yet run |
