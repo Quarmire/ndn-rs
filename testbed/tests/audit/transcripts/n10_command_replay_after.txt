@@ -1,0 +1,13 @@
+=== N.10 AFTER FIX (2026-05-02) ===
+
+
+running 6 tests
+......
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.01s
+
+
+=== Witness: testbed/tests/audit/n10_command_replay.sh ===
+ok: SignatureTime window enforced; replay rejected
+
+=== N.10 RESOLVED — replay protection on signed commands ===
+EXIT: 0

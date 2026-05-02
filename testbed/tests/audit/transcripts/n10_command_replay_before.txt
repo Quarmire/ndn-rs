@@ -1,0 +1,28 @@
+=== N.10 BEFORE FIX (2026-05-02) ===
+
+Synthetic transcript: pre-fix the `check_sig_time` helper, the
+`CommandReplayCache` type, and the `MgmtHandles.command_replay_cache`
+field did not exist on `main`. `authorize_command` had a 3-arg
+signature `(&interest, validator, require_signed)` that validated only
+the cryptographic signature; a captured Interest could be replayed
+indefinitely. Compiling the regression tests fails with E0425 and the
+end-to-end test would observe the second `authorize_command` call
+returning `Ok(())` instead of an Err.
+
+Code-level evidence pre-fix:
+
+  $ grep -n 'fn check_sig_time\|CommandReplayCache\|command_replay_cache' \
+        binaries/ndn-fwd/src/mgmt_ndn.rs
+  (no hits)
+
+  $ grep -n 'pub(crate) async fn authorize_command' \
+        binaries/ndn-fwd/src/mgmt_ndn.rs
+  ...:pub(crate) async fn authorize_command(
+  ...:    interest: &ndn_packet::Interest,
+  ...:    validator: Option<&ndn_security::Validator>,
+  ...:    require_signed: bool,
+  ...:) -> Result<(), String> {
+
+Reference: ndn-cxx `ValidationPolicyCommandInterest` keeps a per-signer
+`lastTimestamp` and rejects either out-of-window or non-strictly-
+increasing values.
