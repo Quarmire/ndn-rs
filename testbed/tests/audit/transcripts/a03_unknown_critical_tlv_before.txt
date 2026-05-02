@@ -1,0 +1,177 @@
+=== A.03 / A.04 / N.04 BEFORE FIX (2026-05-02) ===
+
+--- A.03 (criticality) ---
+. 1/3
+data::tests::a03_data_decode_rejects_unknown_critical_tlv_in_body --- FAILED
+interest::tests::a03_interest_decode_rejects_unknown_critical_tlv_in_body --- FAILED
+
+failures:
+
+---- data::tests::a03_data_decode_rejects_unknown_critical_tlv_in_body stdout ----
+
+thread 'data::tests::a03_data_decode_rejects_unknown_critical_tlv_in_body' (37820201) panicked at crates/foundation/ndn-packet/src/data.rs:267:37:
+Data with an unknown critical TLV in body must be rejected (A.03): Data { raw: b"\x067\x07\x07\x08\x05audit\x99\x01x\x15\x02hi\x16\x03\x1b\x01\0\x17 \0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", signed_start: 2, signed_end: 23, sig_value_start: 23, sig_value_end: 57, name: Name { components: [NameComponent { typ: 8, value: b"audit" }] }, meta_info: OnceLock(<uninit>), content: OnceLock(<uninit>), sig_info: OnceLock(<uninit>) }
+
+---- interest::tests::a03_interest_decode_rejects_unknown_critical_tlv_in_body stdout ----
+
+thread 'interest::tests::a03_interest_decode_rejects_unknown_critical_tlv_in_body' (37820203) panicked at crates/foundation/ndn-packet/src/interest.rs:704:41:
+Interest with an unknown critical TLV in body must be rejected (A.03): Interest { raw: b"\x05\x0c\x07\x07\x08\x05audit\x99\x01x", name: Name { components: [NameComponent { typ: 8, value: b"audit" }] }, selectors: OnceLock(<uninit>), nonce: OnceLock(<uninit>), lifetime: OnceLock(<uninit>), app_params: OnceLock(<uninit>), hop_limit: OnceLock(<uninit>), forwarding_hint: OnceLock(<uninit>), sig_info: OnceLock(<uninit>), sig_value: OnceLock(<uninit>) }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    data::tests::a03_data_decode_rejects_unknown_critical_tlv_in_body
+    interest::tests::a03_interest_decode_rejects_unknown_critical_tlv_in_body
+
+test result: FAILED. 1 passed; 2 failed; 0 ignored; 0 measured; 213 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p ndn-packet --lib`
+
+--- A.04 (ordering) ---
+---- interest::tests::a04_interest_decode_rejects_duplicate_nonce stdout ----
+
+thread 'interest::tests::a04_interest_decode_rejects_duplicate_nonce' (37820228) panicked at crates/foundation/ndn-packet/src/interest.rs:770:41:
+Duplicate Nonce TLV in Interest body must be rejected (A.04): Interest { raw: b"\x05\x15\x07\x07\x08\x05audit\n\x04\0\0\0\x01\n\x04\0\0\0\x02", name: Name { components: [NameComponent { typ: 8, value: b"audit" }] }, selectors: OnceLock(<uninit>), nonce: OnceLock(<uninit>), lifetime: OnceLock(<uninit>), app_params: OnceLock(<uninit>), hop_limit: OnceLock(<uninit>), forwarding_hint: OnceLock(<uninit>), sig_info: OnceLock(<uninit>), sig_value: OnceLock(<uninit>) }
+
+---- interest::tests::a04_interest_decode_rejects_must_be_fresh_before_can_be_prefix stdout ----
+
+thread 'interest::tests::a04_interest_decode_rejects_must_be_fresh_before_can_be_prefix' (37820229) panicked at crates/foundation/ndn-packet/src/interest.rs:746:41:
+MustBeFresh before CanBePrefix is out of spec order (A.04): Interest { raw: b"\x05\r\x07\x07\x08\x05audit\x12\0!\0", name: Name { components: [NameComponent { typ: 8, value: b"audit" }] }, selectors: OnceLock(<uninit>), nonce: OnceLock(<uninit>), lifetime: OnceLock(<uninit>), app_params: OnceLock(<uninit>), hop_limit: OnceLock(<uninit>), forwarding_hint: OnceLock(<uninit>), sig_info: OnceLock(<uninit>), sig_value: OnceLock(<uninit>) }
+
+---- data::tests::a04_data_decode_rejects_content_before_meta_info stdout ----
+
+thread 'data::tests::a04_data_decode_rejects_content_before_meta_info' (37820227) panicked at crates/foundation/ndn-packet/src/data.rs:298:37:
+Content before MetaInfo is out of spec order (A.04): Data { raw: b"\x06:\x07\x07\x08\x05audit\x15\x02hi\x14\x04\x19\x02\0\x01\x16\x03\x1b\x01\0\x17 \0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", signed_start: 2, signed_end: 26, sig_value_start: 26, sig_value_end: 60, name: Name { components: [NameComponent { typ: 8, value: b"audit" }] }, meta_info: OnceLock(<uninit>), content: OnceLock(<uninit>), sig_info: OnceLock(<uninit>) }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    data::tests::a04_data_decode_rejects_content_before_meta_info
+    interest::tests::a04_interest_decode_rejects_duplicate_nonce
+    interest::tests::a04_interest_decode_rejects_must_be_fresh_before_can_be_prefix
+
+test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 213 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p ndn-packet --lib`
+
+--- N.04 (criticality inside MetaInfo/SigInfo) ---
+.. 2/4
+signature::tests::n04_sig_info_decode_rejects_unknown_critical_tlv --- FAILED
+meta_info::tests::n04_meta_info_decode_rejects_unknown_critical_tlv --- FAILED
+
+failures:
+
+---- signature::tests::n04_sig_info_decode_rejects_unknown_critical_tlv stdout ----
+
+thread 'signature::tests::n04_sig_info_decode_rejects_unknown_critical_tlv' (37820256) panicked at crates/foundation/ndn-packet/src/signature.rs:153:14:
+unknown critical TLV inside SignatureInfo must be rejected (N.04): SignatureInfo { sig_type: SignatureEd25519, key_locator: None, key_digest: None, sig_nonce: None, sig_time: None, sig_seq_num: None }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- meta_info::tests::n04_meta_info_decode_rejects_unknown_critical_tlv stdout ----
+
+thread 'meta_info::tests::n04_meta_info_decode_rejects_unknown_critical_tlv' (37820254) panicked at crates/foundation/ndn-packet/src/meta_info.rs:107:14:
+unknown critical TLV inside MetaInfo must be rejected (N.04): MetaInfo { content_type: Blob, freshness_period: Some(500ms), final_block_id: None }
+
+
+failures:
+    meta_info::tests::n04_meta_info_decode_rejects_unknown_critical_tlv
+    signature::tests::n04_sig_info_decode_rejects_unknown_critical_tlv
+
+test result: FAILED. 2 passed; 2 failed; 0 ignored; 0 measured; 212 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p ndn-packet --lib`
+
+=== Witness: testbed/tests/audit/a03_unknown_critical_tlv.sh ===
+FAIL: a03_ tests
+FAIL: a04_ tests
+FAIL: n04_ tests
+
+=== A.03 / A.04 / N.04 EXPECTED-FAIL — body-level decoders silently skip critical TLVs / ordering ===
+
+running 3 tests
+. 1/3
+interest::tests::a03_interest_decode_rejects_unknown_critical_tlv_in_body --- FAILED
+data::tests::a03_data_decode_rejects_unknown_critical_tlv_in_body --- FAILED
+
+failures:
+
+---- interest::tests::a03_interest_decode_rejects_unknown_critical_tlv_in_body stdout ----
+
+thread 'interest::tests::a03_interest_decode_rejects_unknown_critical_tlv_in_body' (37820322) panicked at crates/foundation/ndn-packet/src/interest.rs:704:41:
+Interest with an unknown critical TLV in body must be rejected (A.03): Interest { raw: b"\x05\x0c\x07\x07\x08\x05audit\x99\x01x", name: Name { components: [NameComponent { typ: 8, value: b"audit" }] }, selectors: OnceLock(<uninit>), nonce: OnceLock(<uninit>), lifetime: OnceLock(<uninit>), app_params: OnceLock(<uninit>), hop_limit: OnceLock(<uninit>), forwarding_hint: OnceLock(<uninit>), sig_info: OnceLock(<uninit>), sig_value: OnceLock(<uninit>) }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- data::tests::a03_data_decode_rejects_unknown_critical_tlv_in_body stdout ----
+
+thread 'data::tests::a03_data_decode_rejects_unknown_critical_tlv_in_body' (37820320) panicked at crates/foundation/ndn-packet/src/data.rs:267:37:
+Data with an unknown critical TLV in body must be rejected (A.03): Data { raw: b"\x067\x07\x07\x08\x05audit\x99\x01x\x15\x02hi\x16\x03\x1b\x01\0\x17 \0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", signed_start: 2, signed_end: 23, sig_value_start: 23, sig_value_end: 57, name: Name { components: [NameComponent { typ: 8, value: b"audit" }] }, meta_info: OnceLock(<uninit>), content: OnceLock(<uninit>), sig_info: OnceLock(<uninit>) }
+
+
+failures:
+    data::tests::a03_data_decode_rejects_unknown_critical_tlv_in_body
+    interest::tests::a03_interest_decode_rejects_unknown_critical_tlv_in_body
+
+test result: FAILED. 1 passed; 2 failed; 0 ignored; 0 measured; 213 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p ndn-packet --lib`
+
+running 3 tests
+interest::tests::a04_interest_decode_rejects_must_be_fresh_before_can_be_prefix --- FAILED
+interest::tests::a04_interest_decode_rejects_duplicate_nonce --- FAILED
+data::tests::a04_data_decode_rejects_content_before_meta_info --- FAILED
+
+failures:
+
+---- interest::tests::a04_interest_decode_rejects_must_be_fresh_before_can_be_prefix stdout ----
+
+thread 'interest::tests::a04_interest_decode_rejects_must_be_fresh_before_can_be_prefix' (37820346) panicked at crates/foundation/ndn-packet/src/interest.rs:746:41:
+MustBeFresh before CanBePrefix is out of spec order (A.04): Interest { raw: b"\x05\r\x07\x07\x08\x05audit\x12\0!\0", name: Name { components: [NameComponent { typ: 8, value: b"audit" }] }, selectors: OnceLock(<uninit>), nonce: OnceLock(<uninit>), lifetime: OnceLock(<uninit>), app_params: OnceLock(<uninit>), hop_limit: OnceLock(<uninit>), forwarding_hint: OnceLock(<uninit>), sig_info: OnceLock(<uninit>), sig_value: OnceLock(<uninit>) }
+
+---- interest::tests::a04_interest_decode_rejects_duplicate_nonce stdout ----
+
+thread 'interest::tests::a04_interest_decode_rejects_duplicate_nonce' (37820345) panicked at crates/foundation/ndn-packet/src/interest.rs:770:41:
+Duplicate Nonce TLV in Interest body must be rejected (A.04): Interest { raw: b"\x05\x15\x07\x07\x08\x05audit\n\x04\0\0\0\x01\n\x04\0\0\0\x02", name: Name { components: [NameComponent { typ: 8, value: b"audit" }] }, selectors: OnceLock(<uninit>), nonce: OnceLock(<uninit>), lifetime: OnceLock(<uninit>), app_params: OnceLock(<uninit>), hop_limit: OnceLock(<uninit>), forwarding_hint: OnceLock(<uninit>), sig_info: OnceLock(<uninit>), sig_value: OnceLock(<uninit>) }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- data::tests::a04_data_decode_rejects_content_before_meta_info stdout ----
+
+thread 'data::tests::a04_data_decode_rejects_content_before_meta_info' (37820344) panicked at crates/foundation/ndn-packet/src/data.rs:298:37:
+Content before MetaInfo is out of spec order (A.04): Data { raw: b"\x06:\x07\x07\x08\x05audit\x15\x02hi\x14\x04\x19\x02\0\x01\x16\x03\x1b\x01\0\x17 \0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", signed_start: 2, signed_end: 26, sig_value_start: 26, sig_value_end: 60, name: Name { components: [NameComponent { typ: 8, value: b"audit" }] }, meta_info: OnceLock(<uninit>), content: OnceLock(<uninit>), sig_info: OnceLock(<uninit>) }
+
+
+failures:
+    data::tests::a04_data_decode_rejects_content_before_meta_info
+    interest::tests::a04_interest_decode_rejects_duplicate_nonce
+    interest::tests::a04_interest_decode_rejects_must_be_fresh_before_can_be_prefix
+
+test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 213 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p ndn-packet --lib`
+
+running 4 tests
+.. 2/4
+signature::tests::n04_sig_info_decode_rejects_unknown_critical_tlv --- FAILED
+meta_info::tests::n04_meta_info_decode_rejects_unknown_critical_tlv --- FAILED
+
+failures:
+
+---- signature::tests::n04_sig_info_decode_rejects_unknown_critical_tlv stdout ----
+
+thread 'signature::tests::n04_sig_info_decode_rejects_unknown_critical_tlv' (37820372) panicked at crates/foundation/ndn-packet/src/signature.rs:153:14:
+unknown critical TLV inside SignatureInfo must be rejected (N.04): SignatureInfo { sig_type: SignatureEd25519, key_locator: None, key_digest: None, sig_nonce: None, sig_time: None, sig_seq_num: None }
+
+---- meta_info::tests::n04_meta_info_decode_rejects_unknown_critical_tlv stdout ----
+
+thread 'meta_info::tests::n04_meta_info_decode_rejects_unknown_critical_tlv' (37820370) panicked at crates/foundation/ndn-packet/src/meta_info.rs:107:14:
+unknown critical TLV inside MetaInfo must be rejected (N.04): MetaInfo { content_type: Blob, freshness_period: Some(500ms), final_block_id: None }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    meta_info::tests::n04_meta_info_decode_rejects_unknown_critical_tlv
+    signature::tests::n04_sig_info_decode_rejects_unknown_critical_tlv
+
+test result: FAILED. 2 passed; 2 failed; 0 ignored; 0 measured; 212 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p ndn-packet --lib`
+EXIT: 1

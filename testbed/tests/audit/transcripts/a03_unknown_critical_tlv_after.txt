@@ -1,0 +1,45 @@
+=== A.03 / A.04 / N.04 AFTER FIX (2026-05-02) ===
+
+--- A.03 (criticality) ---
+
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 213 filtered out; finished in 0.00s
+
+
+--- A.04 (ordering) ---
+
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 213 filtered out; finished in 0.00s
+
+
+--- N.04 (criticality inside MetaInfo/SigInfo) ---
+
+running 4 tests
+....
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 212 filtered out; finished in 0.00s
+
+
+=== Witness: testbed/tests/audit/a03_unknown_critical_tlv.sh ===
+ok: a03_ tests
+ok: a04_ tests
+ok: n04_ tests
+
+=== A.03 / A.04 / N.04 RESOLVED — body-level decoders enforce critical-bit + ordering ===
+EXIT: 0
+
+=== Full ndn-packet --lib (regression sweep) ===
+....................................................................................... 87/216
+....................................................................................... 174/216
+..........................................
+test result: ok. 216 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+=== Downstream sanity (ndn-engine / ndn-faces lib) ===
+.....................................
+test result: ok. 37 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+.....................................................
+test result: ok. 53 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.01s
+
