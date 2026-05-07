@@ -1,5 +1,10 @@
 FROM rust:slim AS builder
 
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config \
+    libdbus-1-dev \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /build
 COPY . .
 
@@ -20,6 +25,9 @@ RUN apt-get update && apt-get install -y \
     jq \
     bc \
     curl \
+    tcpdump \
+    tshark \
+    iproute2 \
   && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/target/release/ndn-iperf  /usr/local/bin/

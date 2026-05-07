@@ -106,6 +106,28 @@ services:
       start_period: 5s
     restart: unless-stopped
 
+  # ── Interop client (ndn-cxx + NDNts + ndn-rs tools) ─────────────────────
+  # Used by live interop audit witnesses that need ndn-cxx ndnpeek/ndnpoke.
+  interop:
+    build:
+      context: ..
+      dockerfile: testbed/Dockerfile.interop
+    container_name: interop
+    hostname: interop
+    networks:
+      ndn-net:
+        ipv4_address: 172.30.0.21
+    depends_on:
+      ndn-fwd:
+        condition: service_healthy
+      nfd:
+        condition: service_healthy
+    volumes:
+      - ndn-fwd-sock:/run/ndn-fwd:ro
+      - nfd-sock:/run/nfd:ro
+      - ./tests:/testbed/tests:ro
+    command: ["sleep", "infinity"]
+
   # ── Test runner (shared tools container) ──────────────────────────────────
   # Used by bench and compliance scripts as the "outside" node.
   # Has ndn-tools (ndn-iperf, ndn-ping, ndn-peek, ndn-put) installed.

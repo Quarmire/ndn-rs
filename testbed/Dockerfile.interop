@@ -35,6 +35,11 @@ RUN git clone --depth 1 --branch ndn-tools-24.07 \
 # ── ndn-rs tools builder ──────────────────────────────────────────────────────
 FROM rust:slim AS ndn-rs-builder
 
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config \
+    libdbus-1-dev \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY binaries/ binaries/
