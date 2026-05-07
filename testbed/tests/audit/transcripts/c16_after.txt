@@ -1,0 +1,6 @@
+ok: LvsError::UserFunctionsNotSupported exists
+ok: from_lvs_binary returns UserFunctionsNotSupported
+ok: c16_from_lvs_binary_rejects_user_functions
+
+=== C.16 RESOLVED — from_lvs_binary fail-safe; user-fn schemas rejected ===
+exit 0
