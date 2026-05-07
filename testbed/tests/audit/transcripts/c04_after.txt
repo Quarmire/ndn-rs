@@ -1,0 +1,6 @@
+ok: signer.rs uses 'registered'
+ok: blake3-signature-spec.md uses 'registered'
+ok: no 'experimental' language for BLAKE3 type codes
+
+=== C.04 RESOLVED — BLAKE3 type codes described as registered ===
+exit 0

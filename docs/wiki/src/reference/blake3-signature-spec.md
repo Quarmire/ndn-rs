@@ -10,8 +10,9 @@ the existing `DigestSha256` and `SignatureHmacWithSha256` definitions in the
 | `DigestBlake3` | 6 | no | 32 octets |
 | `SignatureBlake3Keyed` | 7 | yes (32-byte shared key) | 32 octets |
 
-Both type codes are reserved on the
-[NDN TLV `SignatureType` registry](https://redmine.named-data.net/projects/ndn-tlv/wiki/SignatureType).
+Both type codes are registered on the
+[NDN TLV `SignatureType` registry](https://redmine.named-data.net/projects/ndn-tlv/wiki/SignatureType)
+(registry issue #12, closed).
 
 ## 1. DigestBlake3
 
