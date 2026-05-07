@@ -33,6 +33,7 @@
 - [Performance Tuning](./guides/performance-tuning.md)
 - [Setting Up an NDNCERT CA](./guides/ndncert-setup.md)
 - [Fleet and Swarm Security](./guides/fleet-security.md)
+- [Management Command Security](./guides/mgmt-security.md)
 
 # Design
 
