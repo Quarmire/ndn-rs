@@ -14,6 +14,13 @@ capacity_mb = 64
 # No persistent identity in testbed; ephemeral key is auto-generated.
 profile = "disabled"
 
+# Management-command security: disable signing requirement in the testbed
+# so existing unsigned-command compliance scripts continue to work.
+# Production deployments should set require_signed_commands = true and
+# provide trust_anchor_pib pointing to a populated PIB.
+[security.mgmt]
+require_signed_commands = false
+
 [[face]]
 kind = "udp"
 bind = "0.0.0.0:6363"
