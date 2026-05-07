@@ -1,0 +1,6 @@
+ok: KeyChain::validator uses TrustSchema::hierarchical()
+ok: KeyChain::validator does not default to accept_all
+ok: c17_keychain_validator_uses_hierarchical
+
+=== C.17 RESOLVED — KeyChain::validator() defaults to hierarchical schema ===
+exit 0
