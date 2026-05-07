@@ -1,0 +1,1 @@
+SKIP: 'nfd' not in PATH — install NFD from https://named-data.net/doc/NFD/
