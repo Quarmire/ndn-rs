@@ -108,6 +108,17 @@ rtt min/avg/max/p50/p99/stddev = 45µs/62µs/120µs/58µs/120µs/22 µs
 
 Runtime management of a running router, following the same `noun verb` pattern as NFD's `nfdc`. Under the hood, ndn-ctl sends NFD management Interests over the IPC socket and decodes the ControlResponse Data that comes back.
 
+By default command Interests are signed with `DigestSha256`, which satisfies ndn-fwd and localhost-configured NFD (`certfile any`). When connecting to testbed NFD with `rib.localhop_security`, use `--identity` to sign commands with a key-backed signer:
+
+```bash
+# Testbed NFD: register a prefix using a key from the local PIB
+ndn-ctl --socket /run/nfd/nfd.sock --identity /ndn/router1 route add /ndn --face 1
+# Custom PIB path
+ndn-ctl --identity /ndn/router1 --pib ~/.ndn/my-pib route add /ndn --face 1
+```
+
+The identity key must already exist in the PIB (`ndn-ctl security init --name /ndn/router1` creates one).
+
 ### Face management
 
 ```bash
