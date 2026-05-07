@@ -1,0 +1,13 @@
+ok: RsaSha256Verifier declared
+ok: EcdsaSha256Verifier declared
+ok: SignatureSha256WithRsa arm no longer returns UnsupportedSignatureType
+ok: SignatureSha256WithEcdsa arm no longer returns UnsupportedSignatureType
+ok: verifier::tests::rsa_valid_signature_returns_valid
+ok: verifier::tests::rsa_wrong_signature_returns_invalid
+ok: verifier::tests::rsa_bad_key_returns_err
+ok: verifier::tests::ecdsa_valid_signature_returns_valid
+ok: verifier::tests::ecdsa_wrong_signature_returns_invalid
+ok: verifier::tests::ecdsa_bad_key_returns_err
+ok: validator::tests::c01_rsa_and_ecdsa_verifiers_are_wired
+
+=== C.01 RESOLVED — RsaSha256Verifier and EcdsaSha256Verifier wired ===
