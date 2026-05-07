@@ -87,6 +87,12 @@ testbed Docker environment.
   network-packet fragment identifier only.
   Witness: `testbed/tests/audit/b01_reliability_txsequence.sh` (RUST-UNIT). (*B.01, B.09.*)
 
+- **`fragment_packet` encodes Sequence/FragIndex/FragCount as exactly 8 bytes** —
+  NDNLPv2 §6.3 requires all three fragment fields to be 64-bit integers. `fragment_packet`
+  (the UDP/BLE/Ethernet fragmentation path) now uses `.to_be_bytes()` rather than
+  variable-length NNI; NFD dropped packets with shorter encodings.
+  Witness: `cargo test -p ndn-packet --features std -- fragment` (RUST-UNIT). (*B.13.*)
+
 ### Signatures and certificates (Phase C)
 
 - **SignatureType-dispatched verifier** — `Validator` dispatches on `SignatureType`:
