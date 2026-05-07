@@ -2,32 +2,39 @@
 # Witness recipe for audit finding G.04 — NLSR interop with C++ NLSR.
 #
 # Finding:     docs/notes/spec-compliance-audit-2026-04-20.md § G.04
-# Severity:    MAJOR
-# Status:      BLOCKED-BY-INTEROP — C++ NLSR service not yet integrated
-#              into the testbed Docker stack.
+# Severity:    MAJOR / BLOCKED-BY-INTEROP
 #
 # What this script tests:
-#   1. Stand up an ndn-rs router with NLSR enabled.
-#   2. Stand up a C++ NLSR router in a separate container.
-#   3. Both routers peer over UDP (172.30.0.30 ↔ 172.30.0.31).
-#   4. ndn-rs advertises /ndn/test/ndn-rs-prefix.
-#   5. C++ NLSR advertises /ndn/test/nlsr-cxx-prefix.
-#   6. After ≤ 60 s, each side's RIB must contain the other's prefix.
+#   1. Stand up ndn-fwd-nlsr (ndn-rs with [routing.nlsr]) at 172.30.0.30.
+#   2. Stand up nfd-nlsr (NFD sidecar) + nlsr-cxx (C++ NLSR) at 172.30.0.13/14.
+#   3. Both routers peer over UDP.
+#   4. ndn-fwd-nlsr advertises /test/r2/data.
+#   5. nlsr-cxx advertises /test/r1/data.
+#   6. After ≤ 90 s, each side's RIB must contain the other's prefix.
+#   7. Wire traffic is captured via tshark and saved as transcripts.
 #
-# Blocking issue:
-#   The `nlsr-cxx` Docker service needs a C++ NLSR container image.
-#   The upstream Dockerfile at NLSR/Dockerfile builds from source;
-#   a trimmed single-node image is pending.  Until it is added to
-#   testbed/docker-compose.yml this script exits 1 with diagnosis.
+# Docker host:
+#   This script calls "docker compose …" with no --host or --context flags.
+#   The calling environment supplies the Docker endpoint:
+#     - GitHub Actions: uses the default Docker daemon.
+#     - Developer machines: set DOCKER_HOST or "docker context use <name>"
+#       before running.  Example for a remote host:
+#         export DOCKER_HOST=ssh://main.Docker.peterminhanle.coder
+#   Do NOT bake host-specific values into this file.
 #
-# To run once the infra is ready:
-#   docker compose -f testbed/docker-compose.yml up -d nlsr-rs nlsr-cxx
-#   bash testbed/tests/audit/g04_nlsr_interop.sh
-#
-# Exit codes: 0 PASS / 1 FAIL / 2 SKIP (infra not available)
+# Exit codes: 0 PASS / 1 FAIL / 2 SKIP (docker not available)
 set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 cd "$REPO_ROOT"
+
+COMPOSE="docker compose -f testbed/docker-compose.yml"
+TRANSCRIPT_DIR="testbed/tests/audit/transcripts"
+PCAP_FILE="$TRANSCRIPT_DIR/g04_nlsr_interop_after.pcap"
+TXT_FILE="$TRANSCRIPT_DIR/g04_nlsr_interop_after.txt"
+NDN_FWD_NLSR_PREFIX="/test/r2/data"
+NLSR_CXX_PREFIX="/test/r1/data"
+TIMEOUT=90
+POLL=5
 
 # ── Infra availability check ──────────────────────────────────────────────────
 
@@ -36,66 +43,92 @@ if ! command -v docker &>/dev/null; then
     exit 2
 fi
 
-# Check whether the nlsr-cxx and nlsr-rs services are running.
-NLSR_CXX_UP=$(docker compose -f testbed/docker-compose.yml ps -q nlsr-cxx 2>/dev/null || true)
-NLSR_RS_UP=$(docker compose -f testbed/docker-compose.yml ps -q nlsr-rs 2>/dev/null || true)
+mkdir -p "$TRANSCRIPT_DIR"
 
-if [[ -z "$NLSR_CXX_UP" || -z "$NLSR_RS_UP" ]]; then
-    echo "FAIL: nlsr-cxx or nlsr-rs service not running."
-    echo "      BLOCKED-BY-INTEROP: add [nlsr-cxx] and [nlsr-rs] services to"
-    echo "      testbed/docker-compose.yml, then re-run."
-    echo ""
-    echo "  Diagnosis:"
-    echo "    - nlsr-cxx service: $(if [[ -n "$NLSR_CXX_UP" ]]; then echo UP; else echo MISSING; fi)"
-    echo "    - nlsr-rs  service: $(if [[ -n "$NLSR_RS_UP" ]]; then echo UP; else echo MISSING; fi)"
-    echo ""
-    echo "  Required testbed additions:"
-    echo "    services:"
-    echo "      nlsr-rs:"
-    echo "        image: ndn-rs:nlsr     # built from binaries/ndn-fwd/Dockerfile with NLSR config"
-    echo "        ipv4_address: 172.30.0.30"
-    echo "        config: testbed/configs/nlsr-rs.toml"
-    echo "      nlsr-cxx:"
-    echo "        image: ghcr.io/named-data/nlsr:latest  # or built from NLSR/Dockerfile"
-    echo "        ipv4_address: 172.30.0.31"
-    echo "        config: testbed/configs/nlsr-cxx.conf"
-    echo ""
-    echo "  ndn-rs NLSR config snippet (testbed/configs/nlsr-rs.toml):"
-    echo "    [routing.nlsr]"
-    echo "    enabled = true"
-    echo "    network = \"/ndn\""
-    echo "    router  = \"/ndn/testbed/nlsr-rs\""
-    echo "    name_prefixes = [\"/ndn/test/ndn-rs-prefix\"]"
-    echo "    permissive_validation = true"
-    echo ""
-    echo "    [[routing.nlsr.neighbor]]"
-    echo "    name     = \"/ndn/testbed/nlsr-cxx\""
-    echo "    face_uri = \"udp4://172.30.0.31:6363\""
-    echo "    link_cost = 10.0"
-    echo ""
-    echo "  C++ NLSR config snippet (testbed/configs/nlsr-cxx.conf):"
-    echo "    network /ndn"
-    echo "    site /testbed"
-    echo "    router /nlsr-cxx"
-    echo "    prefix /ndn/test/nlsr-cxx-prefix"
-    echo "    neighbor"
-    echo "      name /ndn/testbed/nlsr-rs"
-    echo "      face-uri udp4://172.30.0.30:6363"
-    echo "      link-cost 10"
-    echo "    end-neighbor"
-    exit 1
-fi
+# ── Cleanup function (runs on success and failure) ────────────────────────────
 
-# ── Convergence check ─────────────────────────────────────────────────────────
+cleanup() {
+    echo ""
+    echo "--- cleanup: stopping nlsr services ---"
+    $COMPOSE stop ndn-fwd-nlsr nfd-nlsr nlsr-cxx 2>/dev/null || true
+    $COMPOSE rm -f ndn-fwd-nlsr nfd-nlsr nlsr-cxx 2>/dev/null || true
+}
+trap cleanup EXIT
 
-echo "Both NLSR services running.  Waiting up to 60 s for route convergence..."
+# ── Start pcap capture in background ─────────────────────────────────────────
+# Uses a sidecar container with tshark; falls back to skipping capture if
+# tshark is not available on the Docker host.
 
-NDN_RS_ADDR="172.30.0.30"
-NLSR_CXX_ADDR="172.30.0.31"
-NDN_RS_PREFIX="/ndn/test/ndn-rs-prefix"
-NLSR_CXX_PREFIX="/ndn/test/nlsr-cxx-prefix"
-TIMEOUT=60
-POLL=5
+start_pcap() {
+    if docker run --rm --network ndn-testbed_ndn-net \
+           --name g04-tshark \
+           -v "$(pwd)/$TRANSCRIPT_DIR:/out" \
+           --detach \
+           nicolaka/netshoot \
+           tshark -i any -w /out/g04_nlsr_interop_after.pcap \
+           "host 172.30.0.30 or host 172.30.0.14" \
+           >/dev/null 2>&1; then
+        echo "tshark capture started (container: g04-tshark)"
+        PCAP_STARTED=1
+    else
+        echo "WARNING: could not start tshark capture container — skipping pcap"
+        PCAP_STARTED=0
+    fi
+}
+
+stop_pcap() {
+    if [[ "${PCAP_STARTED:-0}" -eq 1 ]]; then
+        docker stop g04-tshark 2>/dev/null || true
+        # Dump human-readable summary if pcap was written
+        if [[ -f "$PCAP_FILE" ]]; then
+            docker run --rm \
+                -v "$(pwd)/$TRANSCRIPT_DIR:/out" \
+                nicolaka/netshoot \
+                tshark -r /out/g04_nlsr_interop_after.pcap \
+                -Y "udp.port == 6363" \
+                -V 2>/dev/null > "$TXT_FILE" || true
+            echo "pcap saved: $PCAP_FILE"
+            echo "text transcript: $TXT_FILE"
+        fi
+    fi
+}
+
+# ── Bring up NLSR services ────────────────────────────────────────────────────
+
+echo "=== G.04 NLSR interop witness ==="
+echo "Starting ndn-fwd-nlsr, nfd-nlsr, nlsr-cxx …"
+
+# --build ensures ndn-fwd-nlsr is rebuilt if Rust sources changed.
+$COMPOSE up -d --build --no-deps ndn-fwd-nlsr
+$COMPOSE up -d --no-deps nfd-nlsr
+
+# Wait for nfd-nlsr healthy before starting nlsr-cxx
+echo "Waiting for nfd-nlsr to become healthy …"
+WAIT=0
+while [[ $WAIT -lt 30 ]]; do
+    STATUS=$($COMPOSE ps nfd-nlsr --format "{{.Health}}" 2>/dev/null || echo "")
+    if [[ "$STATUS" == "healthy" ]]; then break; fi
+    sleep 2
+    WAIT=$((WAIT + 2))
+done
+
+# Wait for ndn-fwd-nlsr healthy
+WAIT=0
+while [[ $WAIT -lt 30 ]]; do
+    STATUS=$($COMPOSE ps ndn-fwd-nlsr --format "{{.Health}}" 2>/dev/null || echo "")
+    if [[ "$STATUS" == "healthy" ]]; then break; fi
+    sleep 2
+    WAIT=$((WAIT + 2))
+done
+
+$COMPOSE up -d --no-deps nlsr-cxx
+
+start_pcap
+
+# ── Convergence poll ──────────────────────────────────────────────────────────
+
+echo "Waiting up to ${TIMEOUT}s for route convergence …"
+
 ELAPSED=0
 RS_SEES_CXX=0
 CXX_SEES_RS=0
@@ -104,41 +137,100 @@ while [[ $ELAPSED -lt $TIMEOUT ]]; do
     sleep $POLL
     ELAPSED=$((ELAPSED + POLL))
 
-    # Check ndn-rs RIB for the C++ NLSR-originated prefix.
-    if docker exec nlsr-rs ndn-ctl rib list 2>/dev/null | grep -qF "$NLSR_CXX_PREFIX"; then
+    # ndn-rs side: check debug logs for NLSR route install message.
+    # ndn-ctl is not bundled in the ndn-fwd image; logs are the available signal.
+    # NlsrProtocol emits:  debug!(prefix = %prefix, ... "NLSR route added")
+    if docker logs ndn-fwd-nlsr 2>&1 \
+            | grep -q "NLSR route added.*$NLSR_CXX_PREFIX\|$NLSR_CXX_PREFIX.*NLSR route added"; then
         RS_SEES_CXX=1
     fi
 
-    # Check C++ NLSR RIB for the ndn-rs-originated prefix.
-    if docker exec nlsr-cxx nlsrc status routingtable 2>/dev/null | grep -qF "$NDN_RS_PREFIX"; then
+    # C++ NLSR side: query routing table for ndn-rs prefix.
+    # nlsrc subcommand is "routing" (not "status routingtable").
+    if docker exec nlsr-cxx \
+            env NDN_CLIENT_TRANSPORT=unix:///run/nfd-nlsr/nfd.sock \
+            nlsrc routing 2>/dev/null \
+            | grep -qF "$NDN_FWD_NLSR_PREFIX"; then
         CXX_SEES_RS=1
     fi
 
-    echo "  t=${ELAPSED}s: nlsr-rs sees cxx-prefix=${RS_SEES_CXX}  nlsr-cxx sees rs-prefix=${CXX_SEES_RS}"
+    echo "  t=${ELAPSED}s: ndn-fwd-nlsr sees cxx-prefix=${RS_SEES_CXX}  nlsr-cxx sees rs-prefix=${CXX_SEES_RS}"
 
     if [[ $RS_SEES_CXX -eq 1 && $CXX_SEES_RS -eq 1 ]]; then
         break
     fi
 done
 
+stop_pcap
+
+# ── Diagnostic dump on failure ────────────────────────────────────────────────
+
+if [[ $RS_SEES_CXX -eq 0 || $CXX_SEES_RS -eq 0 ]]; then
+    echo ""
+    echo "--- ndn-fwd-nlsr logs (last 60 lines) ---"
+    docker logs ndn-fwd-nlsr 2>&1 | tail -60 || true
+
+    echo ""
+    echo "--- nfd-nlsr logs (last 30 lines) ---"
+    docker logs nfd-nlsr 2>&1 | tail -30 || true
+
+    echo ""
+    echo "--- nlsr-cxx logs (last 60 lines) ---"
+    docker logs nlsr-cxx 2>&1 | tail -60 || true
+
+    echo ""
+    echo "--- ndn-fwd-nlsr NLSR route log entries ---"
+    docker logs ndn-fwd-nlsr 2>&1 | grep -i "NLSR route\|nlsr.*prefix\|rib.*add" | tail -20 || true
+
+    echo ""
+    echo "--- nlsr-cxx routing table ---"
+    docker exec nlsr-cxx \
+        env NDN_CLIENT_TRANSPORT=unix:///run/nfd-nlsr/nfd.sock \
+        nlsrc routing 2>/dev/null || true
+fi
+
 # ── Result ────────────────────────────────────────────────────────────────────
 
 if [[ $RS_SEES_CXX -eq 0 ]]; then
-    echo "FAIL: nlsr-rs does not have ${NLSR_CXX_PREFIX} in its RIB after ${TIMEOUT} s"
-    echo "      Diagnosis: check LSA exchange on ndn-rs side:"
-    echo "        docker logs nlsr-rs | grep -i 'nlsr\\|lsa\\|hello'"
+    echo ""
+    echo "FAIL: ndn-fwd-nlsr does not have ${NLSR_CXX_PREFIX} in its RIB after ${TIMEOUT}s."
+    echo ""
+    echo "Known root cause (G.04 BLOCKED-BY-INTEROP):"
+    echo "  NlsrSync.run() installs remote LSAs only when PSync updates carry"
+    echo "  mapping bytes (update.mapping is Some).  C++ NLSR's PSync sends seq"
+    echo "  numbers only — no mapping bytes on the wire.  ndn-rs receives the"
+    echo "  PSync update but skips LSA installation (update.mapping == None)."
+    echo "  Separately, ndn-rs does not issue Interest/Data fetches for LSA"
+    echo "  content (LSA fetching deferred in NlsrSync; see phase 5 comment)."
+    echo ""
+    echo "  Fix required: implement LSA content fetch in NlsrSync:"
+    echo "    - On PSync update with no mapping bytes, send an Interest for the"
+    echo "      LSA name (<lsa_prefix>/<router>/<type>/<seq>) via the sync face."
+    echo "    - Serve own LSAs as NDN Data packets so C++ NLSR can fetch them."
+    echo "    - This is a separate commit from G.04 phase 6 integration."
+    echo ""
+    echo "  See: crates/protocols/ndn-routing/src/protocols/nlsr/sync.rs:196"
+    echo "       (the 'Phase 5: install LSA if the PSync update carries the wire"
+    echo "       bytes' block — the else branch is the missing implementation)."
     exit 1
 fi
 
 if [[ $CXX_SEES_RS -eq 0 ]]; then
-    echo "FAIL: nlsr-cxx does not have ${NDN_RS_PREFIX} in its routing table after ${TIMEOUT} s"
-    echo "      Diagnosis: check Hello/LSA on C++ NLSR side:"
-    echo "        docker logs nlsr-cxx | grep -i 'hello\\|lsa\\|adjacency'"
+    echo ""
+    echo "FAIL: nlsr-cxx does not have ${NDN_FWD_NLSR_PREFIX} in its routing table after ${TIMEOUT}s."
+    echo ""
+    echo "Known root cause (G.04 BLOCKED-BY-INTEROP):"
+    echo "  C++ NLSR issues an Interest for ndn-rs's LSA after seeing its seq"
+    echo "  number via PSync.  ndn-rs does not serve LSAs as NDN Data packets,"
+    echo "  so the Interest times out and C++ NLSR never learns the prefix."
+    echo ""
+    echo "  Fix required: ndn-rs must register and serve the LSA namespace"
+    echo "    <network>/nlsr/LSA/<own_router>/NAME/<seq> as NDN Data (signed)."
     exit 1
 fi
 
 echo ""
 echo "=== G.04 PASS — NLSR ↔ C++ NLSR route convergence witnessed ==="
-echo "    ndn-rs   : has ${NLSR_CXX_PREFIX}"
-echo "    nlsr-cxx : has ${NDN_RS_PREFIX}"
+echo "    ndn-fwd-nlsr : has ${NLSR_CXX_PREFIX}"
+echo "    nlsr-cxx     : has ${NDN_FWD_NLSR_PREFIX}"
 exit 0

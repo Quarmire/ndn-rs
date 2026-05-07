@@ -22,6 +22,9 @@ volumes:
   ndn-fwd-sock:
   nfd-sock:
   yanfd-sock:
+  nfd-nlsr-sock:      # shared between nfd-nlsr and nlsr-cxx (Unix socket handoff)
+  nlsr-cxx-data:      # /var/lib/nlsr state for C++ NLSR
+  ndn-fwd-nlsr-sock:  # management socket for the NLSR-enabled ndn-rs instance
 
 networks:
   ndn-net:
@@ -127,6 +130,82 @@ services:
       - nfd-sock:/run/nfd:ro
       - ./tests:/testbed/tests:ro
     command: ["sleep", "infinity"]
+
+  # ── nfd-nlsr (NFD sidecar for C++ NLSR) ──────────────────────────────────────
+  # C++ NLSR requires a co-located NFD it can reach via Unix socket.
+  # This sidecar shares the nfd-nlsr-sock volume with nlsr-cxx so NLSR
+  # can call nfdc/ndn-cxx without talking to the compliance-test NFD service.
+  nfd-nlsr:
+    image: ghcr.io/named-data/nfd:latest
+    container_name: nfd-nlsr
+    hostname: nfd-nlsr
+    networks:
+      ndn-net:
+        ipv4_address: 172.30.0.14
+    volumes:
+      - ./configs/nfd-nlsr/nfd.conf:/etc/ndn/nfd.conf:ro
+      - nfd-nlsr-sock:/run/nfd-nlsr
+    command: ["nfd", "--config", "/etc/ndn/nfd.conf"]
+    healthcheck:
+      test: ["CMD-SHELL", "NDN_CLIENT_SOCK=/run/nfd-nlsr/nfd.sock nfdc status 2>/dev/null | grep -q 'uptime' || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  # ── nlsr-cxx (C++ NLSR reference implementation) ──────────────────────────────
+  # Uses the published ghcr.io/named-data/nlsr:latest runtime image.
+  # Connects to nfd-nlsr via Unix socket (NDN_CLIENT_SOCK) and peers with
+  # ndn-fwd-nlsr over UDP for the G.04 NLSR interop witness.
+  nlsr-cxx:
+    image: ghcr.io/named-data/nlsr:latest
+    container_name: nlsr-cxx
+    hostname: nlsr-cxx
+    networks:
+      ndn-net:
+        ipv4_address: 172.30.0.13
+    depends_on:
+      nfd-nlsr:
+        condition: service_healthy
+      ndn-fwd-nlsr:
+        condition: service_healthy
+    volumes:
+      - ./configs/nlsr-cxx/nlsr.conf:/etc/ndn/nlsr.conf:ro
+      - ./configs/nlsr-cxx/entrypoint.sh:/entrypoint.sh:ro
+      - nfd-nlsr-sock:/run/nfd-nlsr
+      - nlsr-cxx-data:/var/lib/nlsr
+    environment:
+      NDN_CLIENT_TRANSPORT: "unix:///run/nfd-nlsr/nfd.sock"
+    # Override the image ENTRYPOINT (not CMD) so the identity-gen script runs
+    # before NLSR starts.  The image entrypoint is /usr/bin/nlsr; using
+    # 'entrypoint:' replaces it entirely.
+    entrypoint: ["/bin/bash", "/entrypoint.sh"]
+    restart: unless-stopped
+
+  # ── ndn-fwd-nlsr (ndn-rs with NLSR enabled, for G.04 interop witness) ─────────
+  # Separate from the baseline ndn-fwd service so other compliance tests
+  # are unaffected.  Uses configs/ndn-fwd-nlsr/ndn-fwd.toml which adds
+  # [routing.nlsr] and a point-to-point UDP face to nfd-nlsr.
+  ndn-fwd-nlsr:
+    build:
+      context: ..
+      dockerfile: binaries/ndn-fwd/Dockerfile
+    container_name: ndn-fwd-nlsr
+    hostname: ndn-fwd-nlsr
+    networks:
+      ndn-net:
+        ipv4_address: 172.30.0.30
+    volumes:
+      - ./configs/ndn-fwd-nlsr/ndn-fwd.toml:/etc/ndn-fwd/config.toml:ro
+      - ndn-fwd-nlsr-sock:/run/ndn-fwd
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 6364 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
 
   # ── Test runner (shared tools container) ──────────────────────────────────
   # Used by bench and compliance scripts as the "outside" node.
