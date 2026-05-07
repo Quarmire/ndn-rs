@@ -1,0 +1,6 @@
+ok: send_interest uses sign_digest_sha256
+ok: dataset queries use send_unsigned_interest
+ok: sign_digest_sha256 is documented as NFD minimum
+
+=== C.12 RESOLVED — MgmtClient signs command Interests with DigestSha256 ===
+exit 0

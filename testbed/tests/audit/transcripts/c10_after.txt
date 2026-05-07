@@ -1,0 +1,6 @@
+ok: keychain.rs delegates sign_interest to InterestBuilder
+ok: interest_builder_sign_sync_signed_region_matches_extractor
+ok: interest_builder_sign_sync_roundtrip
+
+=== C.10 RESOLVED — ndn-security inherits A.09 fix; signed Interest region correct ===
+exit 0
