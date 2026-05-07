@@ -37,7 +37,7 @@ crates/support/                Shared libraries used by binaries and dashboard
   ndn-tools-core               Embeddable tool logic (ping, iperf, peek, put)
 
 crates/protocols/              Higher-level protocols built on the engine
-  ndn-routing                  Routing algorithms: StaticProtocol, DvrProtocol (DVR)
+  ndn-routing                  Routing algorithms: StaticProtocol, DvrProtocol, NlsrProtocol
   ndn-sync                     Dataset sync: SVS, PSync
   ndn-did                      NDN-native Decentralised Identifiers (W3C DID)
   ndn-cert                     NDNCERT 0.3 — certificate issuance and management
@@ -148,17 +148,15 @@ enforced by `KeyChain::ephemeral` and `ndn-sec keygen`.
 
 ## Routing
 
-The `RoutingProtocol` trait populates the RIB. Two implementations ship:
+The `RoutingProtocol` trait populates the RIB. Three implementations ship:
 
 - **`StaticProtocol`** — TOML-configured static routes.
 - **`DvrProtocol`** — experimental distance-vector protocol (ndn-rs-specific; no
   cross-implementation peer).
-
-NLSR (the NDN testbed routing protocol) is in-flight: phases 0 and 1 (module
-skeleton and LSA wire format) are landed in `ndn-routing`; phases 2–7 are tracked
-in `docs/notes/nlsr-implementation-plan-2026-05-07.md` and prompts under
-`.claude/prompts/nlsr/`. Until NLSR is complete, ndn-rs cannot participate in the
-NDN testbed routing mesh (audit finding G.04).
+- **`NlsrProtocol`** — Named-data Link State Routing; implements the NDN testbed
+  routing protocol. Runs Hello liveness detection, PSync-based LSA flooding, and
+  Dijkstra-based routing-table computation. Enabled via `[routing.nlsr]` in
+  `ndnd.toml`. See `docs/wiki/src/protocols/nlsr.md` for operator guidance.
 
 ## Testbed
 

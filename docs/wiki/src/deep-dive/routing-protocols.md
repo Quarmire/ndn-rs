@@ -6,8 +6,8 @@ ndn-rs separates the **Routing Information Base (RIB)** from the **Forwarding In
 
 ```
   ┌──────────────┐   ┌──────────────┐   ┌──────────────┐
-  │  Static      │   │  DVR         │   │  (future)    │
-  │  Protocol    │   │  Protocol    │   │  NLSR / …    │
+  │  Static      │   │  DVR         │   │  NLSR        │
+  │  Protocol    │   │  Protocol    │   │  Protocol    │
   └──────┬───────┘   └──────┬───────┘   └──────┬───────┘
          │ origin=255        │ origin=127        │ origin=128
          └──────────────────┴──────────────────►│
@@ -115,7 +115,45 @@ The ndn-rs DVR is **not interoperable** with ndnd's `dv` module. ndnd uses a fun
 | Loop prevention | Split horizon | Poison reverse + split horizon |
 | Security | None | LightVerSec (Ed25519) |
 
-For testbed interoperability, a future NLSR-compatible protocol (origin 128) is required. The ndn-rs DVR is designed for private, trust-homogeneous networks only.
+For testbed interoperability, use `NlsrProtocol` (origin 128), which speaks the standard NDN NLSR link-state routing protocol. The ndn-rs DVR is designed for private, trust-homogeneous networks only.
+
+### `NlsrProtocol`
+
+Named-data Link State Routing — the routing protocol used by the NDN testbed. Enabled via `[routing.nlsr]` in `ndnd.toml`.
+
+```toml
+[routing.nlsr]
+enabled      = true
+network      = "/ndn"
+router       = "/ndn/site/router1"
+name_prefixes = ["/ndn/site/data"]
+
+[[routing.nlsr.neighbor]]
+name      = "/ndn/site/router2"
+face_uri  = "udp4://10.0.0.2:6363"
+link_cost = 10.0
+```
+
+**Architecture**: three concurrent sub-tasks:
+
+1. **Hello loop** — sends periodic `/<neighbor>/nlsr/INFO/<own_router>` Interests to each configured neighbor; updates `AdjacencyLSA` on state changes.
+2. **Sync loop** — uses PSync FullProducer to flood LSA names to all peers; receivers decode LSAs from mapping bytes and install them into the LSDB.
+3. **Routing-calc loop** — on every LSDB change, runs Dijkstra over the AdjacencyLSA graph; diffs the NamePrefixTable against the current RIB and calls `rib.add` / `rib.remove`.
+
+**Configuration knobs** (all with upstream defaults from `NLSR/src/conf-parameter.hpp`):
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `lsa_refresh_secs` | 1800 | LSA lifetime |
+| `hello_interval_secs` | 60 | Hello send interval |
+| `hello_retries` | 3 | Retries before marking a neighbor Inactive |
+| `hello_timeout_secs` | 1 | Per-Interest timeout |
+| `routing_calc_interval_secs` | 15 | Minimum interval between Dijkstra runs |
+| `sync_interest_lifetime_ms` | 60000 | PSync Interest lifetime |
+| `permissive_validation` | false | Skip LSA trust-chain validation (bringup only) |
+| `max_faces_per_prefix` | 0 (no limit) | Cap on FIB nexthops per prefix |
+
+**Faces**: `NlsrProtocol` resolves neighbor `face_uri` values against the engine's face table at startup. The faces must already exist — configure them as `[[face]]` entries pointing to each neighbor's address before enabling NLSR.
 
 ## `RoutingManager`
 
