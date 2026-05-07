@@ -61,11 +61,13 @@ crates/faces/                  All face implementations in one consolidated crat
     serial                     SerialFace with COBS framing (embedded/IoT)
     l2                         NamedEtherFace (AF_PACKET/PF_NDRV/Npcap), WfbFace
     bluetooth                  BleFace GATT stub
+    virtual                    CallbackFace — virtual face driven by a Rust closure (e.g., CS prewarm hooks)
 
 crates/foundation/             Zero-NDN-dep building blocks — compile no_std compatible
+  ndn-foundation-types         Name, NameComponent, canonical Ord — shared with ndf-rs
   ndn-transport                Face trait, FaceId, FaceTable, StreamFace, TlvCodec
-  ndn-store                    NameTrie, Fib, PIT, ContentStore (LruCs/ShardedCs/FjallCs)
-  ndn-packet                   Name, Interest, Data, Nack — lazy decode, no_std
+  ndn-store                    NameTrie, Fib, PIT, ContentStore (LruCs/ShardedCs/FjallCs), DeadNonceList
+  ndn-packet                   Interest, Data, Nack — lazy decode, no_std; re-exports ndn-foundation-types
   ndn-tlv                      TlvReader, TlvWriter, varu64 — no_std
 
 crates/sim/                    Simulation and WebAssembly targets
@@ -94,8 +96,8 @@ bindings/                      FFI to other languages (not built by default)
 | `PipelineStage` | ndn-engine | Single processing step; returns `Action` |
 | `Strategy` | ndn-strategy | Forwarding decision per Interest |
 | `ContentStore` | ndn-store | Pluggable cache backend |
-| `KeyChain` | ndn-security | Identity, signing, and trust anchors |
-| `Signer` / `Verifier` | ndn-security | Cryptographic operations |
+| `KeyChain` | ndn-security | Identity, signing, and trust anchors; `--identity`/`--pib` flags in ndn-ctl |
+| `Signer` / `Verifier` | ndn-security | Cryptographic operations; dispatched on `SignatureType` (RSA/ECDSA/HMAC/Digest/BLAKE3) |
 | `DiscoveryProtocol` | ndn-discovery | Neighbor/service discovery |
 | `RoutingProtocol` | ndn-routing | RIB population from routing algorithms |
 | `ForwarderClient` | ndn-ipc | App-to-forwarder IPC (async or blocking) |
@@ -128,6 +130,51 @@ pipeline_runner → per-packet processing inline
 
 expiry_task → drains expired PIT entries (1 ms tick)
 ```
+
+## Security
+
+`ndn-fwd` always has a signing identity. At startup it reads (or generates) a
+key from the PIB path configured under `[security]`. The `[security.mgmt]` block
+controls signed-command enforcement: `require_signed_commands = true` (default)
+rejects management Interests without valid `InterestSignatureInfo`; a
+`trust_anchor_pib` path points at the anchor certificates that management clients
+must chain to. The `ndn-ctl --identity`/`--pib` flags pick the signing key for
+command Interests.
+
+`Validator` dispatches on `SignatureType`: Ed25519, ECDSA-SHA-256, RSA-SHA-256,
+HMAC-SHA-256, DigestSha256, and BLAKE3 plain/keyed verifiers are all wired.
+Certificate Format v2 names (`/<identity>/KEY/<KeyId>/<IssuerId>/<Version>`) are
+enforced by `KeyChain::ephemeral` and `ndn-sec keygen`.
+
+## Routing
+
+The `RoutingProtocol` trait populates the RIB. Two implementations ship:
+
+- **`StaticProtocol`** — TOML-configured static routes.
+- **`DvrProtocol`** — experimental distance-vector protocol (ndn-rs-specific; no
+  cross-implementation peer).
+
+NLSR (the NDN testbed routing protocol) is in-flight: phases 0 and 1 (module
+skeleton and LSA wire format) are landed in `ndn-routing`; phases 2–7 are tracked
+in `docs/notes/nlsr-implementation-plan-2026-05-07.md` and prompts under
+`.claude/prompts/nlsr/`. Until NLSR is complete, ndn-rs cannot participate in the
+NDN testbed routing mesh (audit finding G.04).
+
+## Testbed
+
+`testbed/docker-compose.yml` spins up an `ndn-fwd` instance, a C++ NFD instance,
+and a YaNFD instance on a `172.30.0.0/24` network plus an `interop` container
+with ndn-cxx tooling. The harness supports two test classes:
+
+- **`testbed/tests/audit/<id>_<slug>.sh`** — per-finding witnesses. Each script
+  exits 1 against a broken codebase and 0 after the fix. RUST-UNIT witnesses
+  drive `cargo test`; GREP-PROOF witnesses verify code absence; INTEROP witnesses
+  exchange packets across containers.
+- **`testbed/tests/interop/`** — cross-implementation packet exchange tests
+  (ndn-rs app vs NFD forwarder, ndn-cxx consumer vs ndn-rs forwarder, etc.).
+
+Testbed CI runs on push to `testbed/**` and weekly via cron
+(`.github/workflows/testbed.yml`).
 
 ## Design Docs
 
