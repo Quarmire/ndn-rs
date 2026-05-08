@@ -1,0 +1,245 @@
+name: Audit witnesses
+
+# Runs every audit witness script in testbed/tests/audit/ on each PR and on
+# push to main.  Two jobs:
+#
+#   unit     — GREP-PROOF + RUST-UNIT witnesses.  Runs on every PR; needs only
+#              cargo and standard shell tools.  Fails on any regression (a
+#              previously-passing resolved finding now failing).
+#
+#   interop  — Docker-based NLSR interop witness (g04_nlsr_interop.sh).  Only
+#              runs on push-to-main or PRs with the "testbed" label.  Boots
+#              ndn-fwd-nlsr, nfd-nlsr, and nlsr-cxx and verifies convergence
+#              within 90 s.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "binaries/**"
+      - "testbed/tests/audit/**"
+      - ".github/workflows/audit-witnesses.yml"
+
+concurrency:
+  group: audit-witnesses-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  # ── GREP-PROOF + RUST-UNIT witnesses ──────────────────────────────────────
+  unit:
+    name: Unit witnesses (GREP-PROOF + RUST-UNIT)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-audit-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-audit-
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libdbus-1-dev
+
+      - name: Build workspace
+        run: cargo build --workspace
+
+      - name: Run unit witnesses
+        run: |
+          # Exit-code contract per witness script:
+          #   0  PASS — finding resolved (code is compliant)
+          #   1  FAIL — finding open (bug still present) or regression
+          #   2  SKIP — blocked on an external dependency not present here
+          #
+          # KNOWN_OPEN: scripts for findings that are not yet resolved.
+          # CI tolerates these exiting 1.  When one transitions FAIL → PASS
+          # it means the finding was fixed; remove it from this list and add
+          # a Verified-compliant entry to docs/wiki/src/reference/spec-compliance.md.
+          KNOWN_OPEN=(
+            g03_psync_interop        # BLOCKED: no C++ PSync container in this job (exits 1)
+            e05_notification_streams # BLOCKED: needs live nfdc subscriber
+          )
+
+          set +e
+          PASS=0 KNOWN_FAIL=0 SKIP=0 REGRESS=0
+          REGRESS_NAMES=()
+
+          {
+            echo "## Unit witness results"
+            echo ""
+            echo "| Script | Result |"
+            echo "|--------|--------|"
+          } > /tmp/unit-summary.md
+
+          for script in testbed/tests/audit/*.sh; do
+            name=$(basename "$script" .sh)
+            [[ "$name" == "run_all" || "$name" == "_template" ]] && continue
+            # g04_nlsr_interop needs the full NLSR testbed — handled by the
+            # interop job below.
+            [[ "$name" == "g04_nlsr_interop" ]] && continue
+
+            bash "$script" > /tmp/witness-"$name".log 2>&1
+            rc=$?
+
+            is_open=false
+            for o in "${KNOWN_OPEN[@]}"; do
+              [[ "$o" == "$name" ]] && is_open=true && break
+            done
+
+            case $rc in
+              0)
+                echo "✅ PASS    $name"
+                echo "| \`$name\` | ✅ PASS |" >> /tmp/unit-summary.md
+                PASS=$((PASS + 1))
+                ;;
+              2)
+                echo "⏭  SKIP    $name"
+                echo "| \`$name\` | ⏭ SKIP |" >> /tmp/unit-summary.md
+                SKIP=$((SKIP + 1))
+                ;;
+              *)
+                if $is_open; then
+                  echo "⚠️  FAIL    $name  (known open)"
+                  echo "| \`$name\` | ⚠️ FAIL (known open) |" >> /tmp/unit-summary.md
+                  KNOWN_FAIL=$((KNOWN_FAIL + 1))
+                else
+                  echo "❌ REGRESS  $name"
+                  echo "| \`$name\` | ❌ REGRESSION |" >> /tmp/unit-summary.md
+                  echo ""
+                  echo "=== $name transcript ==="
+                  cat /tmp/witness-"$name".log
+                  echo "==="
+                  REGRESS=$((REGRESS + 1))
+                  REGRESS_NAMES+=("$name")
+                fi
+                ;;
+            esac
+          done
+
+          {
+            echo ""
+            echo "**${PASS} PASS · ${KNOWN_FAIL} known-open · ${SKIP} SKIP · ${REGRESS} regression**"
+            if [[ ${#REGRESS_NAMES[@]} -gt 0 ]]; then
+              echo ""
+              echo "> ❌ Regressions: ${REGRESS_NAMES[*]}"
+              echo ">"
+              echo "> Add the finding to KNOWN_OPEN above if it is intentionally deferred,"
+              echo "> or fix the regression before merging."
+            fi
+          } >> /tmp/unit-summary.md
+
+          cat /tmp/unit-summary.md >> "$GITHUB_STEP_SUMMARY"
+          echo ""
+          echo "Results: ${PASS} PASS · ${KNOWN_FAIL} known-open · ${SKIP} SKIP · ${REGRESS} regression"
+          exit $REGRESS
+
+  # ── INTEROP witness — g04 NLSR ────────────────────────────────────────────
+  # Boots ndn-fwd-nlsr (ndn-rs) + nfd-nlsr + nlsr-cxx (C++ NLSR) and
+  # verifies both routing tables converge within 90 s.
+  #
+  # Trigger conditions:
+  #   push to main          — all merges verify the full witness suite
+  #   PR with "testbed" label — opt in to interop on any PR
+  #
+  # Build time note: the ndn-fwd Docker image compiles the full Rust workspace
+  # in release mode.  Cold builds take ~10 min; the BuildKit GHA layer cache
+  # speeds up runs where only post-COPY source files changed.
+  # TODO: adopt cargo-chef in binaries/ndn-fwd/Dockerfile to separate the
+  # dependency compilation layer from the source compilation layer, reducing
+  # incremental rebuilds to ~2–3 min.
+  interop:
+    name: INTEROP witness (g04 NLSR)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    if: >-
+      github.event_name == 'push' ||
+      contains(github.event.pull_request.labels.*.name, 'testbed')
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build ndn-fwd image (BuildKit + GHA cache)
+        # Builds via the buildx container driver and stores layers in the GHA
+        # cache.  When the witness script later calls `docker compose up --build`,
+        # Docker Compose v2 uses the same buildx default driver and finds the
+        # cached layers — the compose rebuild is effectively instantaneous on
+        # cache hit.
+        # Cold build (empty GHA cache or Cargo.lock changed): ~8–10 min.
+        # TODO: adopt cargo-chef in binaries/ndn-fwd/Dockerfile to make
+        # incremental source-only rebuilds fast (~2–3 min).
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: binaries/ndn-fwd/Dockerfile
+          push: false
+          load: true
+          tags: ndn-fwd-nlsr:ci
+          cache-from: type=gha,scope=ndn-fwd-ci
+          cache-to: type=gha,scope=ndn-fwd-ci,mode=max
+
+      - name: Pre-pull external images
+        run: |
+          docker pull ghcr.io/named-data/nfd:latest  &
+          docker pull ghcr.io/named-data/nlsr:latest &
+          wait
+
+      - name: Run g04 NLSR interop witness
+        id: g04
+        timeout-minutes: 10
+        run: bash testbed/tests/audit/g04_nlsr_interop.sh
+
+      - name: Write step summary
+        if: always()
+        run: |
+          if [[ "${{ steps.g04.outcome }}" == "success" ]]; then
+            {
+              echo "## G.04 NLSR interop: ✅ PASS"
+              echo ""
+              echo "Both routing tables converged within 90 s."
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo "## G.04 NLSR interop: ❌ FAIL"
+              echo ""
+              echo "See container logs in the job transcript above."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload wire transcripts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: g04-nlsr-transcripts-${{ github.run_number }}
+          path: testbed/tests/audit/transcripts/
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Dump container logs on failure
+        if: failure()
+        run: |
+          echo "=== ndn-fwd-nlsr ==="
+          docker logs ndn-fwd-nlsr 2>&1 | tail -100 || true
+          echo "=== nfd-nlsr ==="
+          docker logs nfd-nlsr     2>&1 | tail -50  || true
+          echo "=== nlsr-cxx ==="
+          docker logs nlsr-cxx     2>&1 | tail -100 || true
