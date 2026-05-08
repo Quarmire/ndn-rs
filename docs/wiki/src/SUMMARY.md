@@ -7,6 +7,7 @@
 - [Installation](./getting-started/installation.md)
 - [Hello World](./getting-started/hello-world.md)
 - [Running the Forwarder](./getting-started/running-forwarder.md)
+- [Browser Demo (Dioxus)](./getting-started/browser-demo.md)
 
 # Concepts
 

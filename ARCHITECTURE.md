@@ -210,6 +210,12 @@ on both targets — wasm32 uses `xwt-web` (`web-sys::WebTransport`), other
 targets use `xwt-wtransport` (`quinn` + `wtransport`) so loopback witnesses
 can run without a real browser.
 
+## Demos
+
+| Demo | Crate | Notes |
+| --- | --- | --- |
+| In-browser ndn-rs (Dioxus + WebTransport) | [`crates/research/dioxus-demo/`](crates/research/dioxus-demo/) | Phase 4 deliverable; see [`docs/wiki/src/getting-started/browser-demo.md`](docs/wiki/src/getting-started/browser-demo.md). Pure Rust→WASM (no JS), uses [`BrowserWebTransportFace`](crates/faces/ndn-face-webtransport-wasm/) and [`ndn-runtime::default_runtime`](crates/foundation/ndn-runtime/src/lib.rs). Witnesses live at `testbed/tests/browser/dioxus_demo_*.spec.ts`. |
+
 ## Design Docs
 
 | Document | Contents |
