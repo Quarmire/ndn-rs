@@ -1,4 +1,19 @@
-FROM rust:slim AS builder
+# Testbed client image.
+#
+# Contains:
+#   - ndn-rs tools (built from source): ndn-iperf, ndn-ping, ndn-peek,
+#     ndn-put, ndn-sec, ndn-ctl
+#
+# Uses cargo-chef for dependency layer caching.  See binaries/ndn-fwd/Dockerfile
+# for a full explanation of the planner → cacher → builder pattern.
+#
+# Build (from repo root):
+#   docker build -f testbed/Dockerfile.testclient -t ndn-testclient .
+
+# ── Stage 1: chef base ────────────────────────────────────────────────────────
+FROM rust:slim AS chef
+
+RUN cargo install cargo-chef --locked
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
@@ -6,8 +21,28 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
-COPY . .
 
+# ── Stage 2: planner ──────────────────────────────────────────────────────────
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+# ── Stage 3: cacher ───────────────────────────────────────────────────────────
+FROM chef AS cacher
+COPY --from=planner /build/recipe.json recipe.json
+RUN cargo chef cook --release \
+    --bin ndn-iperf \
+    --bin ndn-ping \
+    --bin ndn-peek \
+    --bin ndn-put \
+    --bin ndn-sec \
+    --bin ndn-ctl \
+    --recipe-path recipe.json
+
+# ── Stage 4: builder ──────────────────────────────────────────────────────────
+FROM chef AS builder
+COPY . .
+COPY --from=cacher /build/target target
 RUN cargo build --release \
     --bin ndn-iperf \
     --bin ndn-ping \
@@ -16,7 +51,7 @@ RUN cargo build --release \
     --bin ndn-sec \
     --bin ndn-ctl
 
-# ── Runtime image ─────────────────────────────────────────────────────────────
+# ── Stage 5: runtime image ────────────────────────────────────────────────────
 FROM debian:trixie-slim
 
 RUN apt-get update && apt-get install -y \

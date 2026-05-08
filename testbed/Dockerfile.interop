@@ -32,8 +32,12 @@ RUN git clone --depth 1 --branch ndn-tools-24.07 \
     ./waf build -j"$(nproc)" && \
     ./waf install
 
-# ── ndn-rs tools builder ──────────────────────────────────────────────────────
-FROM rust:slim AS ndn-rs-builder
+# ── ndn-rs tools: chef base ───────────────────────────────────────────────────
+# Uses cargo-chef for dependency layer caching.  See binaries/ndn-fwd/Dockerfile
+# for a full explanation of the planner → cacher → builder pattern.
+FROM rust:slim AS ndn-rs-chef
+
+RUN cargo install cargo-chef --locked
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
@@ -41,13 +45,27 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
-COPY Cargo.toml Cargo.lock ./
-COPY binaries/ binaries/
-COPY crates/ crates/
-COPY tools/ tools/
-COPY bindings/ bindings/
-COPY examples/ examples/
 
+# ── ndn-rs tools: planner ─────────────────────────────────────────────────────
+FROM ndn-rs-chef AS ndn-rs-planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+# ── ndn-rs tools: cacher ──────────────────────────────────────────────────────
+FROM ndn-rs-chef AS ndn-rs-cacher
+COPY --from=ndn-rs-planner /build/recipe.json recipe.json
+RUN cargo chef cook --release \
+    --bin ndn-peek \
+    --bin ndn-put \
+    --bin ndn-ping \
+    --bin ndn-iperf \
+    --bin ndn-ctl \
+    --recipe-path recipe.json
+
+# ── ndn-rs tools: builder ─────────────────────────────────────────────────────
+FROM ndn-rs-chef AS ndn-rs-builder
+COPY . .
+COPY --from=ndn-rs-cacher /build/target target
 RUN cargo build --release \
     --bin ndn-peek \
     --bin ndn-put \
