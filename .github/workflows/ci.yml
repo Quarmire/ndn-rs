@@ -99,3 +99,32 @@ jobs:
           --exclude ndn-compute
           --exclude ndn-python
           --no-deps
+
+  wasm32:
+    name: WASM — wasm32-unknown-unknown check (foundation + runtime)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-wasm32-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-wasm32-
+
+      - name: Check foundation crates for wasm32-unknown-unknown
+        run: |
+          cargo check -p ndn-foundation-types --target wasm32-unknown-unknown
+          cargo check -p ndn-tlv             --target wasm32-unknown-unknown
+          cargo check -p ndn-packet          --target wasm32-unknown-unknown --no-default-features --features std-wasm
+          cargo check -p ndn-transport       --target wasm32-unknown-unknown
+          cargo check -p ndn-store           --target wasm32-unknown-unknown
+          cargo check -p ndn-strategy        --target wasm32-unknown-unknown
+          cargo check -p ndn-runtime         --target wasm32-unknown-unknown
