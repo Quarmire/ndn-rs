@@ -107,10 +107,12 @@ bindings/                      FFI to other languages (not built by default)
 
 ```
 Interest: FaceCheck → TlvDecode → CsLookup → PitCheck → Strategy → Dispatch
-Data:     FaceCheck → TlvDecode → PitMatch  → Strategy → CsInsert → Dispatch
+Data:     FaceCheck → TlvDecode → PitMatch  → Validation → CsInsert → Dispatch
 ```
 
 `PacketContext` passes **by value** — ownership transfer makes short-circuits compiler-enforced. Each stage returns `Action`: `Continue`, `Send`, `Satisfy`, `Drop`, or `Nack`.
+
+`ValidationStage` sets `ctx.verified = true` on the valid path. `CsInsertStage` gates on `ctx.verified` — unverified Data is never cached. Local-face Data is trusted by the OS-level IPC credential and also sets `ctx.verified`. When `validator_enabled = false`, the validator is permissive and still sets `ctx.verified` so the CS admission invariant holds in dev mode.
 
 ## Core Data Structures
 

@@ -100,12 +100,40 @@ the step is a no-op.  Keys are persisted in
 The module creates a stable `ndn-fwd` user and group to own the state
 directory and run the service.
 
+## Data validation and ContentStore admission
+
+As of 2026-05-08, the ContentStore only admits Data that has passed the
+validation stage (`ctx.verified = true`). The trust verdict flows through
+`PacketContext` — the CS gate is independent of the admission policy
+(FreshnessPeriod check) and runs first.
+
+**Default validation profile:** `"default"`. When no `[security]` block is
+configured, the router uses `AcceptSigned` validation: any Data with a valid
+signature (DigestSha256 or stronger) is admitted; trust hierarchy is not
+enforced. Configure a `[security]` block with `trust_anchor` or `trust_anchor_pib`
+for full hierarchical validation.
+
+**Dev/lab opt-out:** set `validator_enabled = false` to skip crypto verification.
+All incoming Data is then treated as permissive-verified so it can reach the CS.
+This removes the trust barrier — **use only in isolated environments.**
+
+```toml
+[security]
+validator_enabled = false   # dev/lab only — no trust anchor required
+```
+
+Trust anchors and the validation profile are independent of `validator_enabled`.
+Setting `validator_enabled = false` overrides `profile` to `"disabled"` for
+the forwarding pipeline regardless of what `profile` says.
+
 ## Configuration reference
 
 ```toml
 [security]
-identity         = "/mynet/myhost"       # key name; omit for ephemeral
-pib_path         = "~/.ndn/pib"          # path to FilePib directory
-pib_type         = "file"                # "file" | "memory"
-ephemeral_prefix = "/ndn/ephemeral"      # name prefix for ephemeral identity
+identity          = "/mynet/myhost"       # key name; omit for ephemeral
+pib_path          = "~/.ndn/pib"          # path to FilePib directory
+pib_type          = "file"                # "file" | "memory"
+ephemeral_prefix  = "/ndn/ephemeral"      # name prefix for ephemeral identity
+validator_enabled = true                  # false = dev/lab, no trust anchor needed
+profile           = "default"             # "default" | "accept-signed" | "disabled"
 ```
