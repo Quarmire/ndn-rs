@@ -94,9 +94,10 @@ jobs:
           for script in testbed/tests/audit/*.sh; do
             name=$(basename "$script" .sh)
             [[ "$name" == "run_all" || "$name" == "_template" ]] && continue
-            # g04_nlsr_interop needs the full NLSR testbed — handled by the
-            # interop job below.
+            # g04_nlsr_interop and c13_ndncert_live_interop need Docker compose
+            # testbed infra — handled by the interop jobs below.
             [[ "$name" == "g04_nlsr_interop" ]] && continue
+            [[ "$name" == "c13_ndncert_live_interop" ]] && continue
 
             bash "$script" > /tmp/witness-"$name".log 2>&1
             rc=$?
@@ -246,6 +247,100 @@ jobs:
           docker logs nfd-nlsr     2>&1 | tail -50  || true
           echo "=== nlsr-cxx ==="
           docker logs nlsr-cxx     2>&1 | tail -100 || true
+
+  # ── INTEROP witness — c13 NDNCERT live CA ────────────────────────────────────
+  # Boots nfd-ndncert + ndncert-ca (upstream ndncert-ca-server) and runs the
+  # ndn-rs enroll-ndncert binary for a full NEW → CHALLENGE (pin) → cert-fetch
+  # round-trip.  Verifies the issued cert decodes through ndn-rs's cert decoder.
+  #
+  # Build time note: ndncert-ca is built from source (git clone + waf).
+  # Cold build takes ~10 min; GHA layer cache speeds up incremental runs.
+  c13-ndncert:
+    name: INTEROP witness (c13 NDNCERT live CA)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: >-
+      github.event_name == 'push' ||
+      contains(github.event.pull_request.labels.*.name, 'testbed')
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build interop image (BuildKit + GHA cache)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: testbed/Dockerfile.interop
+          push: false
+          load: true
+          tags: ndn-testbed-interop:ci
+          cache-from: type=gha,scope=ndn-testbed-interop-ci
+          cache-to: type=gha,scope=ndn-testbed-interop-ci,mode=max
+
+      - name: Build ndncert-ca image (BuildKit + GHA cache)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: testbed/Dockerfile.ndncert-ca
+          push: false
+          load: true
+          tags: ndn-testbed-ndncert-ca:ci
+          cache-from: type=gha,scope=ndn-testbed-ndncert-ca-ci
+          cache-to: type=gha,scope=ndn-testbed-ndncert-ca-ci,mode=max
+
+      - name: Pre-pull external images
+        run: |
+          docker pull ghcr.io/named-data/nfd:latest &
+          wait
+
+      - name: Bring up interop container
+        run: |
+          docker compose -f testbed/docker-compose.yml up -d --no-deps \
+            ndn-fwd nfd interop
+
+      - name: Run c13 NDNCERT live CA interop witness
+        id: c13
+        timeout-minutes: 20
+        run: bash testbed/tests/audit/c13_ndncert_live_interop.sh
+
+      - name: Write step summary
+        if: always()
+        run: |
+          if [[ "${{ steps.c13.outcome }}" == "success" ]]; then
+            {
+              echo "## C.13 NDNCERT live CA interop: ✅ PASS"
+              echo ""
+              echo "Full NEW → CHALLENGE (pin) → cert-fetch round-trip witnessed."
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo "## C.13 NDNCERT live CA interop: ❌ FAIL"
+              echo ""
+              echo "See container logs in the job transcript above."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload wire transcripts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: c13-ndncert-transcripts-${{ github.run_number }}
+          path: testbed/tests/audit/transcripts/
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Dump container logs on failure
+        if: failure()
+        run: |
+          echo "=== ndncert-ca ==="
+          docker logs ndncert-ca 2>&1 | tail -100 || true
+          echo "=== nfd-ndncert ==="
+          docker logs nfd-ndncert 2>&1 | tail -50  || true
+          echo "=== interop ==="
+          docker logs interop    2>&1 | tail -50  || true
 
   # ── Spawn-path regression probe ───────────────────────────────────────────
   # Runs the spawn_overhead criterion group and uploads the JSON estimates as
