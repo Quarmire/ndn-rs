@@ -1,0 +1,10 @@
+=== WASM Phase 1 — in-scope crates ===
+  checking ndn-foundation-types ... PASS
+  checking ndn-tlv ... PASS
+  checking ndn-packet ... PASS
+  checking ndn-transport ... PASS
+  checking ndn-store ... PASS
+  checking ndn-strategy ... PASS
+  checking ndn-runtime ... PASS
+
+PASS: all in-scope crates compile for wasm32-unknown-unknown
