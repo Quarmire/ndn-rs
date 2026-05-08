@@ -1,0 +1,69 @@
+# ndn-fwd config for G.04 NLSR interop witness.
+#
+# Identical to configs/ndn-fwd.toml but adds:
+#   - A point-to-point UDP face to nfd-nlsr (172.30.0.14:6363)
+#   - [routing.nlsr] section enabling NlsrProtocol
+#
+# Network topology:
+#   ndn-fwd-nlsr  /test/r-nlsr/%C1.Router/r2  172.30.0.30
+#   nlsr-cxx      /test/c-nlsr/%C1.Router/r1  172.30.0.13 (via nfd-nlsr 172.30.0.14)
+
+[engine]
+pipeline_threads     = 2
+cs_capacity_mb       = 16
+pipeline_channel_cap = 4096
+
+[cs]
+variant     = "lru"
+capacity_mb = 16
+
+[security]
+profile = "disabled"
+
+[security.mgmt]
+require_signed_commands = false
+
+# Listening UDP face (receives Hello Interests and PSync from nfd-nlsr).
+[[face]]
+kind = "udp"
+bind = "0.0.0.0:6363"
+
+# Listening TCP face (management / ndn-ctl connectivity).
+[[face]]
+kind = "tcp"
+bind = "0.0.0.0:6364"
+
+# Point-to-point UDP face to nfd-nlsr.
+# NlsrProtocol.find_face_by_uri() matches on remote_uri() == "udp4://172.30.0.14:6363".
+[[face]]
+kind   = "udp"
+remote = "172.30.0.14:6363"
+
+[management]
+face_socket = "/run/ndn-fwd/ndn-fwd.sock"
+
+[logging]
+level = "debug"
+
+[routing.nlsr]
+enabled  = true
+network  = "/test"
+router   = "/test/r-nlsr/%C1.Router/r2"
+name_prefixes = ["/test/r2/data"]
+
+# permissive_validation is currently a declared config knob with no effect:
+# NlsrProtocol does not yet call the engine Validator on received LSAs.
+# Setting true makes the intent explicit while the wiring is absent.
+# See docs/notes/spec-compliance-audit-2026-04-20.md § G.04 (D)b.
+permissive_validation = true
+
+# Reduced intervals for the two-node witness so convergence fits in 90 s.
+# Production defaults: hello=60, adj_lsa_build=10, routing_calc=15.
+hello_interval_secs         = 5
+adj_lsa_build_interval_secs = 2
+routing_calc_interval_secs  = 5
+
+[[routing.nlsr.neighbor]]
+name      = "/test/c-nlsr/%C1.Router/r1"
+face_uri  = "udp4://172.30.0.14:6363"
+link_cost = 10.0
