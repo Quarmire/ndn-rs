@@ -1,0 +1,43 @@
+# Phase 4 in-browser demo forwarder.
+#
+# Boots a WebTransport listener that the Dioxus demo dials into, plus a
+# UDP face so a native ndn-tools peek can fetch from the browser-served
+# producer (the load-bearing producer-round-trip witness).
+#
+# Cert: self-signed for loopback only — the browser is started with
+# `--ignore-certificate-errors-spki-list` (or the SHA-256 hash supplied
+# via `serverCertificateHashes`) by the demo's docker-compose entry.
+
+[engine]
+pipeline_threads     = 1
+cs_capacity_mb       = 16
+pipeline_channel_cap = 1024
+
+[cs]
+variant     = "lru"
+capacity_mb = 16
+
+[security]
+profile = "disabled"
+
+[security.mgmt]
+require_signed_commands = false
+
+[[face]]
+kind = "udp"
+bind = "0.0.0.0:6363"
+
+[[face]]
+kind = "tcp"
+bind = "0.0.0.0:6364"
+
+[listeners.webtransport]
+enabled = true
+listen  = "0.0.0.0:4433"
+cert_source = { type = "self_signed_dev" }
+
+[management]
+face_socket = "/run/ndn-fwd/ndn-fwd.sock"
+
+[logging]
+level = "info"

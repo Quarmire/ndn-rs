@@ -26,6 +26,7 @@ volumes:
   nlsr-cxx-data:      # /var/lib/nlsr state for C++ NLSR
   ndn-fwd-nlsr-sock:  # management socket for the NLSR-enabled ndn-rs instance
   nfd-ndncert-sock:   # shared between nfd-ndncert, ndncert-ca, and interop (C.13 witness)
+  dioxus-demo-sock:   # management socket for Phase 4 in-browser demo forwarder
 
 networks:
   ndn-net:
@@ -283,3 +284,32 @@ services:
       - nfd-sock:/run/nfd:ro
       - yanfd-sock:/run/yanfd:ro
     command: ["sleep", "infinity"]
+
+  # ── dioxus-demo-fwd (Phase 4 in-browser demo) ───────────────────────────
+  # Boots a WebTransport listener on :4433 plus UDP/TCP on :6363/:6364 so the
+  # browser tab can dial in and a native ndn-tools peek can fetch from the
+  # browser-served producer (the load-bearing producer-round-trip witness).
+  dioxus-demo-fwd:
+    profiles: ["demo"]
+    build:
+      context: ..
+      dockerfile: binaries/ndn-fwd/Dockerfile
+    container_name: dioxus-demo-fwd
+    hostname: dioxus-demo-fwd
+    networks:
+      ndn-net:
+        ipv4_address: 172.30.0.30
+    ports:
+      - "4433:4433/udp"   # WebTransport (QUIC)
+      - "6373:6363/udp"   # native ndn-tools peek
+      - "6373:6363/tcp"
+    volumes:
+      - ./configs/dioxus-demo-fwd.toml:/etc/ndn-fwd/config.toml:ro
+      - dioxus-demo-sock:/run/ndn-fwd
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 6363 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
