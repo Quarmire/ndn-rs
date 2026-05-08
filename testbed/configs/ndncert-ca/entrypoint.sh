@@ -12,20 +12,26 @@ set -e
 CA_NAME="/test/ndncert/CA"
 CA_CONF="/config/ndncert-ca.conf"
 
-# Wait for NFD to accept connections.
-echo "[entrypoint] waiting for NFD at /run/nfd/nfd.sock …"
+# NDN_CLIENT_TRANSPORT is set by docker-compose; ndn-cxx >= 0.8 uses this
+# env var to locate the NFD Unix socket.  Strip the "unix://" prefix to get
+# a plain path for socket file existence checks (nfdc is not in this image).
+export NDN_CLIENT_TRANSPORT="${NDN_CLIENT_TRANSPORT:-unix:///run/nfd/nfd.sock}"
+SOCK_PATH="${NDN_CLIENT_TRANSPORT#unix://}"
+
+# Wait for the NFD socket file to appear.
+echo "[entrypoint] waiting for NFD socket at ${SOCK_PATH} …"
 WAIT=0
 while [[ $WAIT -lt 30 ]]; do
-    if nfdc status >/dev/null 2>&1; then break; fi
+    if [[ -S "$SOCK_PATH" ]]; then break; fi
     sleep 1
     WAIT=$((WAIT + 1))
 done
 
-if ! nfdc status >/dev/null 2>&1; then
-    echo "[entrypoint] ERROR: NFD not ready after 30 s" >&2
+if [[ ! -S "$SOCK_PATH" ]]; then
+    echo "[entrypoint] ERROR: NFD socket not ready after 30 s" >&2
     exit 1
 fi
-echo "[entrypoint] NFD ready"
+echo "[entrypoint] NFD socket ready"
 
 # Generate CA identity if not already present.
 if ! ndnsec list 2>/dev/null | grep -qF "$CA_NAME"; then

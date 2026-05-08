@@ -39,7 +39,8 @@ TRANSCRIPT_DIR="testbed/tests/audit/transcripts"
 PCAP_FILE="$TRANSCRIPT_DIR/c13_ndncert_live_interop_after.pcap"
 TXT_FILE="$TRANSCRIPT_DIR/c13_ndncert_live_interop_after.txt"
 CA_PREFIX="/test/ndncert/CA"
-REQUESTER_NAME="/test/requester"
+# Identity must be a strict extension of CA_PREFIX (NDNCERT 0.3 §3.1).
+REQUESTER_NAME="${CA_PREFIX}/requester"
 PIN_TIMEOUT=60
 ENROLL_TIMEOUT=120
 
@@ -130,7 +131,7 @@ WAIT=0
 CA_READY=0
 while [[ $WAIT -lt 90 ]]; do
     if docker exec nfd-ndncert \
-            env NDN_CLIENT_SOCK=/run/nfd-ndncert/nfd.sock \
+            env NDN_CLIENT_TRANSPORT=unix:///run/nfd-ndncert/nfd.sock \
             nfdc fib 2>/dev/null | grep -qF "$CA_PREFIX"; then
         CA_READY=1
         break
@@ -169,12 +170,15 @@ mkfifo /tmp/c13_pin_pipe
 ENROLL_LOG=/tmp/c13_enroll.log
 > "$ENROLL_LOG"
 
+# Open the fifo for both read and write on fd 9 so docker exec's stdin
+# redirection doesn't block on fifo open() before a writer attaches.
+exec 9<>/tmp/c13_pin_pipe
 docker exec -i interop \
     enroll-ndncert \
         --face-socket /run/nfd-ndncert/nfd.sock \
         --ca-prefix "$CA_PREFIX" \
         --name "$REQUESTER_NAME" \
-    < /tmp/c13_pin_pipe \
+    <&9 \
     >> "$ENROLL_LOG" 2>&1 &
 ENROLL_PID=$!
 

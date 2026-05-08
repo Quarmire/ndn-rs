@@ -149,7 +149,7 @@ services:
       - nfd-nlsr-sock:/run/nfd-nlsr
     command: ["nfd", "--config", "/etc/ndn/nfd.conf"]
     healthcheck:
-      test: ["CMD-SHELL", "NDN_CLIENT_SOCK=/run/nfd-nlsr/nfd.sock nfdc status 2>/dev/null | grep -q 'uptime' || exit 1"]
+      test: ["CMD-SHELL", "NDN_CLIENT_TRANSPORT=unix:///run/nfd-nlsr/nfd.sock nfdc status 2>/dev/null | grep -q 'uptime' || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -201,7 +201,7 @@ services:
       - nfd-ndncert-sock:/run/nfd-ndncert
     command: ["nfd", "--config", "/etc/ndn/nfd.conf"]
     healthcheck:
-      test: ["CMD-SHELL", "NDN_CLIENT_SOCK=/run/nfd-ndncert/nfd.sock nfdc status 2>/dev/null | grep -q 'uptime' || exit 1"]
+      test: ["CMD-SHELL", "NDN_CLIENT_TRANSPORT=unix:///run/nfd-ndncert/nfd.sock nfdc status 2>/dev/null | grep -q 'uptime' || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -230,7 +230,7 @@ services:
       - ./configs/ndncert-ca/entrypoint.sh:/config/entrypoint.sh:ro
       - nfd-ndncert-sock:/run/nfd
     environment:
-      NDN_CLIENT_SOCK: "unix:///run/nfd/nfd.sock"
+      NDN_CLIENT_TRANSPORT: "unix:///run/nfd/nfd.sock"
       NDN_LOG: "ndncert.challenge.pin=TRACE"
     restart: unless-stopped
 

@@ -9,6 +9,8 @@
 
 FROM ghcr.io/named-data/ndn-cxx-build:latest AS build
 
+RUN apt-get update -qq && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+
 RUN git clone --depth 1 https://github.com/named-data/ndncert /src/ndncert
 
 RUN cd /src/ndncert && \
