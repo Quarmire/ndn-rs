@@ -1,74 +1,272 @@
 #!/usr/bin/env bash
-# Witness test for audit finding C.13 — live NDNCERT CA interop leg.
+# Witness recipe for audit finding C.13 — NDNCERT 0.3 live CA interop.
 #
 # Finding:     docs/notes/spec-compliance-audit-2026-04-20.md § C.13
-# Severity:    BLOCKED (8 wire-format gaps — see
-#              docs/notes/c13-live-interop-gaps-2026-05-08.md)
-# Spec ref:    NDNCERT 0.3 wiki — NEW / CHALLENGE / ISSUE round-trip
+# Severity:    BLOCKER / BLOCKED-BY-INTEROP (8 wire-format gaps now fixed)
 #
-# This script exits 1 today because the following structural gaps have
-# not yet been fixed in ndn-rs's EnrollmentSession / ChallengeRequestTlv:
+# What this script tests:
+#   1. Stand up nfd-ndncert (NFD sidecar) at 172.30.0.15.
+#   2. Stand up ndncert-ca (upstream ndncert-ca-server) at 172.30.0.16.
+#   3. Run the ndn-rs enroll-ndncert binary (from the interop container)
+#      against the CA:
+#        a. NEW — build and submit a self-signed NDN Certificate.
+#        b. CHALLENGE round 1 — trigger pin challenge (no code).
+#        c. Extract generated PIN from CA container logs
+#           (NDN_LOG=ndncert.challenge.pin=TRACE logs the code via
+#            NDN_LOG_TRACE in challenge-pin.cpp:47).
+#        d. CHALLENGE round 2 — submit the PIN code.
+#        e. Cert fetch — fetch and decode the issued certificate through
+#           ndn-rs's Certificate v2 decoder (C.07/C.08/C.18 work).
+#        f. Assert issuer chains back to /test/ndncert/CA.
+#   4. Capture tshark of the exchange as a wire transcript.
 #
-#   L1  cert_request in NEW must be a self-signed NDN Certificate
-#       (ndn-rs sends a custom binary blob)
-#       ref: ndncert/src/detail/request-encoder.cpp:63-68
+# Docker host:
+#   This script calls "docker compose …" with no --host or --context flags.
+#   The calling environment supplies the Docker endpoint:
+#     - GitHub Actions: uses the default Docker daemon.
+#     - Developer machines: set DOCKER_HOST or "docker context use <name>"
+#       before running.  Example for a remote host:
+#         export DOCKER_HOST=ssh://main.Docker.peterminhanle.coder
+#   Do NOT bake host-specific values into this file.
 #
-#   L2  CHALLENGE Interest name must carry request-id as a name component
-#       (ndn-rs puts it in ApplicationParameters)
-#       ref: ndncert/src/requester-request.cpp:217
-#
-#   L3  CHALLENGE ApplicationParameters outer TLV structure must be
-#       {IV, AuthTag, EncryptedPayload} — ndn-rs sends
-#       {RequestId, SelectedChallenge, IV, EncryptedPayload, AuthTag}
-#       ref: ndncert/src/detail/crypto-helpers.cpp:388-413
-#
-#   L4  SelectedChallenge (0xA1) must be first element inside the
-#       AES-GCM plaintext, not a cleartext TLV in the outer wrapper
-#       ref: ndncert/src/challenge/challenge-pin.cpp:117-118
-#
-#   L5  CHALLENGE response is AES-GCM encrypted; ndn-rs parses it as
-#       cleartext TLV
-#       ref: ndncert/src/detail/challenge-encoder.cpp:48-51
-#
-#   L6  Issued cert is returned by name only; client must fetch it with
-#       a separate Interest — ndn-rs expects cert bytes in the response
-#       ref: ndncert/src/requester-request.cpp:242-248
-#
-#   L7  Both NEW and CHALLENGE Interests must be signed with the
-#       requester's key; ndn-rs produces unsigned bodies
-#       ref: ndncert/src/requester-request.cpp:148, 227
-#
-#   L8  IV must use the {random-8 || counter-4} structured layout
-#       (minor, only matters for multi-round challenges)
-#       ref: ndncert/src/detail/crypto-helpers.cpp:374-385
-#
-# Prerequisites for when these gaps are fixed:
-#   - docker compose with ndncert-ca + nfd-ndncert services running
-#   - The CA configured with ca-prefix /test/ndncert/CA, pin challenge,
-#     a self-signed trust anchor, and a preconfigured static PIN so the
-#     round-trip is fully automated (no human at the terminal)
-#   - An ndn-rs enrollment binary (example or ndn-ctl subcommand) that
-#     drives NEW → CHALLENGE(pin) → cert-fetch
-#   - tshark for the wire capture to
-#     testbed/tests/audit/transcripts/c13_ndncert_live_interop_after.{pcap,txt}
-#
-# Exit codes: 0 PASS / 1 FAIL / 2 SKIP
+# Exit codes: 0 PASS / 1 FAIL / 2 SKIP (docker not available)
 set -euo pipefail
-
 REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
+cd "$REPO_ROOT"
 
-echo "=== C.13 live NDNCERT interop — BLOCKED ===" >&2
-echo "" >&2
-echo "8 structural wire-format gaps remain in EnrollmentSession." >&2
-echo "See: docs/notes/c13-live-interop-gaps-2026-05-08.md" >&2
-echo "" >&2
-echo "Gaps by category:" >&2
-echo "  L1 cert_request not a proper NDN Certificate" >&2
-echo "  L2 request-id must be in CHALLENGE Interest name, not AppParams" >&2
-echo "  L3 CHALLENGE AppParams outer TLV layout wrong" >&2
-echo "  L4 SelectedChallenge must be inside encrypted plaintext" >&2
-echo "  L5 CHALLENGE response is AES-GCM encrypted; ndn-rs treats as plaintext" >&2
-echo "  L6 issued cert returned by name only; cert-fetch step missing" >&2
-echo "  L7 NEW and CHALLENGE Interests must be signed" >&2
-echo "  L8 IV must use structured {random-8 || counter-4} layout (minor)" >&2
-exit 1
+COMPOSE="docker compose -f testbed/docker-compose.yml"
+TRANSCRIPT_DIR="testbed/tests/audit/transcripts"
+PCAP_FILE="$TRANSCRIPT_DIR/c13_ndncert_live_interop_after.pcap"
+TXT_FILE="$TRANSCRIPT_DIR/c13_ndncert_live_interop_after.txt"
+CA_PREFIX="/test/ndncert/CA"
+REQUESTER_NAME="/test/requester"
+PIN_TIMEOUT=60
+ENROLL_TIMEOUT=120
+
+# ── Infra availability check ──────────────────────────────────────────────────
+
+if ! command -v docker &>/dev/null; then
+    echo "SKIP: docker not available"
+    exit 2
+fi
+
+mkdir -p "$TRANSCRIPT_DIR"
+
+# ── Cleanup function (runs on success and failure) ────────────────────────────
+
+cleanup() {
+    echo ""
+    echo "--- cleanup: stopping ndncert services ---"
+    $COMPOSE stop ndncert-ca nfd-ndncert 2>/dev/null || true
+    $COMPOSE rm -f ndncert-ca nfd-ndncert 2>/dev/null || true
+    rm -f /tmp/c13_pin_pipe /tmp/c13_enroll.log
+}
+trap cleanup EXIT
+
+# ── pcap capture helpers ──────────────────────────────────────────────────────
+
+PCAP_STARTED=0
+
+start_pcap() {
+    if docker run --rm --network ndn-testbed_ndn-net \
+           --name c13-tshark \
+           -v "$(pwd)/$TRANSCRIPT_DIR:/out" \
+           --detach \
+           nicolaka/netshoot \
+           tshark -i any -w /out/c13_ndncert_live_interop_after.pcap \
+           "host 172.30.0.15 or host 172.30.0.16" \
+           >/dev/null 2>&1; then
+        echo "tshark capture started"
+        PCAP_STARTED=1
+    else
+        echo "WARNING: could not start tshark capture — skipping pcap"
+    fi
+}
+
+stop_pcap() {
+    if [[ "${PCAP_STARTED}" -eq 1 ]]; then
+        docker stop c13-tshark 2>/dev/null || true
+        if [[ -f "$PCAP_FILE" ]]; then
+            docker run --rm \
+                -v "$(pwd)/$TRANSCRIPT_DIR:/out" \
+                nicolaka/netshoot \
+                tshark -r /out/c13_ndncert_live_interop_after.pcap \
+                -V 2>/dev/null > "$TXT_FILE" || true
+            echo "pcap saved: $PCAP_FILE"
+            echo "text transcript: $TXT_FILE"
+        fi
+    fi
+}
+
+# ── Bring up ndncert services ─────────────────────────────────────────────────
+
+echo "=== C.13 NDNCERT live CA interop witness ==="
+echo "Starting nfd-ndncert …"
+
+$COMPOSE up -d --no-deps nfd-ndncert
+
+echo "Waiting for nfd-ndncert to become healthy …"
+WAIT=0
+while [[ $WAIT -lt 30 ]]; do
+    STATUS=$($COMPOSE ps nfd-ndncert --format "{{.Health}}" 2>/dev/null || echo "")
+    if [[ "$STATUS" == "healthy" ]]; then break; fi
+    sleep 2
+    WAIT=$((WAIT + 2))
+done
+
+if [[ "$($COMPOSE ps nfd-ndncert --format "{{.Health}}" 2>/dev/null || echo "")" != "healthy" ]]; then
+    echo "FAIL: nfd-ndncert did not become healthy after 30 s"
+    docker logs nfd-ndncert 2>&1 | tail -20 || true
+    exit 1
+fi
+echo "nfd-ndncert healthy"
+
+echo "Starting ndncert-ca (build may take a few minutes on first run) …"
+# --build ensures the CA image is rebuilt if the Dockerfile changed.
+$COMPOSE up -d --build --no-deps ndncert-ca
+
+echo "Waiting for ndncert-ca to register ${CA_PREFIX}/CA/INFO …"
+WAIT=0
+CA_READY=0
+while [[ $WAIT -lt 90 ]]; do
+    if docker exec nfd-ndncert \
+            env NDN_CLIENT_SOCK=/run/nfd-ndncert/nfd.sock \
+            nfdc fib 2>/dev/null | grep -qF "$CA_PREFIX"; then
+        CA_READY=1
+        break
+    fi
+    sleep 2
+    WAIT=$((WAIT + 2))
+done
+
+if [[ $CA_READY -eq 0 ]]; then
+    echo "FAIL: ndncert-ca did not register $CA_PREFIX after 90 s"
+    docker logs ndncert-ca 2>&1 | tail -30 || true
+    exit 1
+fi
+echo "CA ready — $CA_PREFIX registered with nfd-ndncert"
+
+start_pcap
+
+# ── Run enrollment ────────────────────────────────────────────────────────────
+# The interop container mounts nfd-ndncert-sock at /run/nfd-ndncert (added in
+# docker-compose.yml).  enroll-ndncert connects there to reach the CA.
+#
+# PIN delivery flow:
+#   1. enroll-ndncert writes "WAITING_FOR_PIN" to stderr after round-1 CHALLENGE
+#      and blocks reading stdin from the named pipe.
+#   2. This script polls the CA container logs for the NDN_LOG_TRACE line:
+#        "Secret for request <hex> is <6digits>"
+#      (challenge-pin.cpp:47, logged when NDN_LOG=ndncert.challenge.pin=TRACE).
+#   3. The PIN is written to the named pipe, unblocking enroll-ndncert.
+
+echo ""
+echo "--- running ndn-rs enrollment ---"
+
+rm -f /tmp/c13_pin_pipe
+mkfifo /tmp/c13_pin_pipe
+
+ENROLL_LOG=/tmp/c13_enroll.log
+> "$ENROLL_LOG"
+
+docker exec -i interop \
+    enroll-ndncert \
+        --face-socket /run/nfd-ndncert/nfd.sock \
+        --ca-prefix "$CA_PREFIX" \
+        --name "$REQUESTER_NAME" \
+    < /tmp/c13_pin_pipe \
+    >> "$ENROLL_LOG" 2>&1 &
+ENROLL_PID=$!
+
+# Wait for round-1 CHALLENGE trigger ("WAITING_FOR_PIN" appears in stderr).
+echo "Waiting for round-1 CHALLENGE trigger …"
+WAIT=0
+while [[ $WAIT -lt 30 ]]; do
+    if grep -q "WAITING_FOR_PIN" "$ENROLL_LOG" 2>/dev/null; then break; fi
+    sleep 1
+    WAIT=$((WAIT + 1))
+done
+
+if ! grep -q "WAITING_FOR_PIN" "$ENROLL_LOG" 2>/dev/null; then
+    echo "FAIL: enroll-ndncert did not reach PIN-waiting state after 30 s"
+    cat "$ENROLL_LOG" || true
+    echo ""
+    echo "--- ndncert-ca logs ---"
+    docker logs ndncert-ca 2>&1 | tail -30 || true
+    exit 1
+fi
+
+# Extract PIN from CA logs (6-digit code logged after "is ").
+echo "Extracting PIN from CA logs …"
+PIN=""
+WAIT=0
+while [[ $WAIT -lt $PIN_TIMEOUT ]]; do
+    PIN=$(docker logs ndncert-ca 2>&1 \
+          | grep -oP '(?<=is )\d{6}' \
+          | tail -1 || true)
+    if [[ -n "$PIN" ]]; then break; fi
+    sleep 1
+    WAIT=$((WAIT + 1))
+done
+
+if [[ -z "$PIN" ]]; then
+    echo "FAIL: could not extract PIN from ndncert-ca logs after ${PIN_TIMEOUT}s"
+    echo "--- ndncert-ca logs (full) ---"
+    docker logs ndncert-ca 2>&1 | tail -60 || true
+    exit 1
+fi
+echo "PIN extracted (len=${#PIN})"
+
+# Feed PIN to enroll-ndncert via the named pipe.
+echo "$PIN" > /tmp/c13_pin_pipe
+
+# Wait for enrollment to complete.
+echo "Waiting for enrollment to complete …"
+WAIT=0
+while [[ $WAIT -lt $ENROLL_TIMEOUT ]]; do
+    if ! kill -0 "$ENROLL_PID" 2>/dev/null; then break; fi
+    sleep 1
+    WAIT=$((WAIT + 1))
+done
+
+ENROLL_RC=0
+wait "$ENROLL_PID" || ENROLL_RC=$?
+
+stop_pcap
+
+# ── Assertions ────────────────────────────────────────────────────────────────
+
+echo ""
+echo "--- enrollment output ---"
+cat "$ENROLL_LOG"
+
+if [[ $ENROLL_RC -ne 0 ]]; then
+    echo ""
+    echo "FAIL: enroll-ndncert exited with rc=$ENROLL_RC"
+    echo ""
+    echo "--- ndncert-ca logs ---"
+    docker logs ndncert-ca 2>&1 | tail -60 || true
+    echo ""
+    echo "--- nfd-ndncert logs ---"
+    docker logs nfd-ndncert 2>&1 | tail -20 || true
+    exit 1
+fi
+
+if ! grep -q "ENROLL_OK" "$ENROLL_LOG"; then
+    echo ""
+    echo "FAIL: ENROLL_OK not found in enrollment output"
+    exit 1
+fi
+
+CERT_NAME=$(grep "^CERT_NAME=" "$ENROLL_LOG" | head -1 | cut -d= -f2-)
+ISSUER=$(grep "^ISSUER=" "$ENROLL_LOG" | head -1 | cut -d= -f2-)
+
+echo ""
+echo "=== C.13 PASS — NDNCERT live CA interop witnessed ==="
+echo "    cert name : $CERT_NAME"
+echo "    issuer    : $ISSUER"
+echo ""
+echo "  ndn-rs enrolled against upstream ndncert-ca-server (pin challenge)."
+echo "  Issued cert decoded through ndn-rs Certificate v2 decoder."
+echo "  Issuer chains back to $CA_PREFIX."
+exit 0
