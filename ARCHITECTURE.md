@@ -64,6 +64,8 @@ crates/faces/                  All face implementations in one consolidated crat
     bluetooth                  BleFace GATT stub
     virtual                    CallbackFace — virtual face driven by a Rust closure (e.g., CS prewarm hooks)
   ndn-face-webtransport        Server-side WebTransport listener (HTTP/3 + QUIC datagrams) — issue #14
+  ndn-face-webtransport-wasm   Browser-side WebTransport client face; pure Rust→WASM via xwt-web,
+                               also compiles natively via xwt-wtransport for unit witnesses — issue #14 phase 3
 
 crates/foundation/ndn-acme     ACME (RFC 8555) DNS-01 cert provisioning for the WS-TLS face (issue #3) and the WT listener (issue #14)
 
@@ -180,6 +182,20 @@ with ndn-cxx tooling. The harness supports two test classes:
 
 Testbed CI runs on push to `testbed/**` and weekly via cron
 (`.github/workflows/testbed.yml`).
+
+## Browser target
+
+The engine compiles to `wasm32-unknown-unknown` via the
+[`ndn-runtime`](crates/foundation/ndn-runtime/) `Spawn`/`Sleep`/`Now` trait
+abstraction (see the readiness audit at
+`docs/notes/wasm-readiness-audit-2026-05-07.md`). The browser-side
+WebTransport client face lives in
+[`crates/faces/ndn-face-webtransport-wasm/`](crates/faces/ndn-face-webtransport-wasm/);
+the wiki page [`transports/webtransport-browser`](docs/wiki/src/transports/webtransport-browser.md)
+walks through wiring it into a Rust→WASM application. The crate compiles
+on both targets — wasm32 uses `xwt-web` (`web-sys::WebTransport`), other
+targets use `xwt-wtransport` (`quinn` + `wtransport`) so loopback witnesses
+can run without a real browser.
 
 ## Design Docs
 

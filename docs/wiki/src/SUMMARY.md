@@ -25,6 +25,7 @@
 - [Embedded Targets](./guides/embedded-targets.md)
 - [Browser WebSocket Testing](./guides/browser-testing.md)
 - [WebTransport Face](./transports/webtransport.md)
+- [WebTransport — Browser Client](./transports/webtransport-browser.md)
 
 # Operations
 
