@@ -34,16 +34,17 @@ NET="ndn-acme-pebble-net-$$"
 docker network create "$NET" >/dev/null
 trap 'docker network rm "$NET" >/dev/null 2>&1 || true' EXIT
 
+# challtestsrv: defaults are dnsserver=:8053, management=:8055.
+# Pebble: image entrypoint is `/usr/bin/pebble`, no extra wrapper word.
 CHALL=$(docker run -d --rm --network "$NET" --name "chall-$$" \
     -p 8055:8055 -p 8053:8053/udp -p 8053:8053 \
-    ghcr.io/letsencrypt/pebble-challtestsrv:latest \
-    pebble-challtestsrv -dns01 :8053 -management :8055 -http01 "" -tlsalpn01 "" -https01 "")
+    ghcr.io/letsencrypt/pebble-challtestsrv:latest)
 
 PEBBLE=$(docker run -d --rm --network "$NET" --name "pebble-$$" \
     -p 14000:14000 -p 15000:15000 \
     -e "PEBBLE_VA_DNSSERVER=chall-$$:8053" \
     ghcr.io/letsencrypt/pebble:latest \
-    pebble -config /test/config/pebble-config.json -dnsserver "chall-$$:8053")
+    -config /test/config/pebble-config.json -dnsserver "chall-$$:8053")
 
 trap 'docker rm -f "$PEBBLE" "$CHALL" >/dev/null 2>&1 || true; docker network rm "$NET" >/dev/null 2>&1 || true' EXIT
 
