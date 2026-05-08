@@ -50,7 +50,8 @@ crates/engine/                 Forwarding core — pipeline, strategies, securit
   ndn-app                      Application API: Consumer, Producer, Subscriber
   ndn-ipc                      ForwarderClient, BlockingForwarderClient, chunked transfer
   ndn-config                   TOML config parsing, NFD management protocol
-  ndn-discovery                Pluggable neighbour (SWIM) and service discovery
+  ndn-discovery                Pluggable discovery: NDN AutoConfig hub-discovery,
+                               per-neighbor liveness probe, SVS service discovery
 
 crates/faces/                  All face implementations in one consolidated crate
   ndn-faces                    Feature-gated face types:
@@ -190,7 +191,7 @@ Testbed CI runs on push to `testbed/**` and weekly via cron
 | [`docs/engine.md`](docs/engine.md) | ForwarderEngine, EngineBuilder, tracing |
 | [`docs/security.md`](docs/security.md) | Signing, trust schema, SafeData |
 | [`docs/ipc.md`](docs/ipc.md) | Transport tiers, chunked transfer, service registry |
-| [`docs/discovery.md`](docs/discovery.md) | SWIM protocol, service discovery |
+| [`docs/discovery.md`](docs/discovery.md) | NDN AutoConfig, neighbor liveness probe, service discovery |
 | [`docs/protocols/routing.md`](docs/protocols/routing.md) | DVR algorithm, static routes, RIB lifecycle |
 | [`docs/wireless.md`](docs/wireless.md) | Multi-radio, nl80211, wfb-ng |
 | [`docs/compute.md`](docs/compute.md) | In-network compute levels |
