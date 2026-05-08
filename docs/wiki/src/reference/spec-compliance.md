@@ -1,13 +1,13 @@
 # NDN Specification Compliance
 
-As of 2026-05-07, the compliance picture for ndn-rs is substantially improved from
+As of 2026-05-08, the compliance picture for ndn-rs is substantially improved from
 the initial April audit state. Of 126 findings across phases A–I in
 [`docs/notes/spec-compliance-audit-2026-04-20.md`](https://github.com/Quarmire/ndn-rs/blob/main/docs/notes/spec-compliance-audit-2026-04-20.md),
-48 findings in phases A–H are resolved with at least a code fix. Five of those —
+49 findings in phases A–H are resolved with at least a code fix. Six of those —
 D.01 (HopLimit decrement), D.02 (/localhop scope), E.01 (management signing),
-E.04 (segmented datasets), and G.04 phase 1 (NLSR LSA wire format) — have been
-witnessed against C++ NFD or the ndn-cxx reference library via the live testbed
-harness at `testbed/tests/`. The remaining open findings are categorised below.
+E.04 (segmented datasets), G.04 phase 1 (NLSR LSA wire format), and G.04 full
+NLSR interop — have been witnessed against C++ NFD or C++ NLSR via the live
+testbed harness at `testbed/tests/`. The remaining open findings are categorised below.
 Wire compatibility claims on this page are backed by scripts in
 `testbed/tests/audit/` (per-finding unit and GREP-PROOF witnesses) and
 `testbed/tests/interop/` (cross-implementation packet exchange tests).
@@ -40,7 +40,7 @@ are not listed as open bugs. Witness paths reference scripts under
 | D | Forwarding pipeline and tables | 18 | 8 | D.12 (CS admits unvalidated Data by default, MAJOR), D.06 (nonce regeneration on outgoing, MINOR), D.08 (4-byte nonce collision handling, MINOR) |
 | E | NFD management protocol | 8 | 5 | E.02 (source-face identity from PIT not face, MINOR), E.07 (faces/update stub, MINOR), E.08 (FaceStatus Flags field absent, MINOR) |
 | F | Face implementations | 12 | 3 | F.02 (multicast UDP port 6363 vs 56363, MINOR), F.04 (TCP bare TLV, no LP wrapping, MINOR), F.10 (Ethernet open TODOs, MINOR) |
-| G | Routing, discovery, sync | 9 | 3 | G.04 (NLSR not implemented, MAJOR — phases 0/1 landed), G.06 (SWIM vs AutoConfig, MAJOR) |
+| G | Routing, discovery, sync | 9 | 4 | G.06 (SWIM vs AutoConfig, MAJOR) |
 | H | Binaries and CLI tools | 11 | 4 | H.02 (ndn-ping prefix not ndn-cxx compatible, MINOR), H.03 (ndn-iperf proprietary naming, MINOR) |
 | I | Cross-cutting architectural misunderstandings | 14 | 14 | All cleared as of audit. |
 
@@ -206,6 +206,15 @@ testbed Docker environment.
   ndn-cxx's `readString` format.
   Witness: `testbed/tests/audit/g04_nlsr_lsa_roundtrip.sh` (RUST-UNIT). (*G.04 phase 1.*)
 
+- **NLSR full interop with C++ NLSR** — ndn-rs (`ndn-fwd` + `NlsrProtocol`) and
+  C++ NLSR converge routing tables within 90 s in the two-node testbed Docker
+  environment. ndn-fwd-nlsr learns `/test/r1/data` from nlsr-cxx; nlsr-cxx
+  learns `/test/r2/data` from ndn-fwd-nlsr. Fixes: PSync PSyncContent (0x80)
+  wrap/unwrap, CanBePrefix on sync Interests, private Hello UDP face (no engine
+  interference), `CallbackFace` at `/<own_router>/nlsr/INFO` for incoming Hello
+  Interests, reduced hello/adj-lsa-build/routing-calc intervals (5/2/5 s).
+  Witness: `testbed/tests/audit/g04_nlsr_interop.sh` (**INTEROP** — exits 0 as of 2026-05-08). (*G.04.*)
+
 ### Management tool (Phase H)
 
 - **`ndn-ctl` command Interests are key-backed signed** — `MgmtClient` accepts a
@@ -243,11 +252,6 @@ testbed Docker environment.
 - **ContentStore admits Data without signature verification** when the engine is
   built without a `Validator` (the default factory). An injected forged Data
   packet would satisfy subsequent Interests from cache. (*D.12.*)
-
-- **NLSR is not yet fully implemented.** Phases 0 and 1 (module skeleton, LSA
-  wire format) are landed; phases 2–7 (LSDB, Hello, LSDB sync, routing
-  computation, RIB wiring, testbed integration) remain. An ndn-rs router cannot
-  participate in the NDN testbed routing mesh until G.04 is complete. (*G.04.*)
 
 - **Neighbor discovery uses a SWIM-style protocol, not NDN AutoConfig.** The
   Hello/gossip protocol in `ndn-discovery` uses ndn-rs-defined TLV types and
