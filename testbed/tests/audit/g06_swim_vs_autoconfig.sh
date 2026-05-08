@@ -1,60 +1,60 @@
 #!/usr/bin/env bash
-# Witness recipe for audit finding G.06 — `ndn-discovery` uses a
-# SWIM-style gossip protocol; NDN AutoConfig (DNS-based PROBE ↔
-# Certificate) is the spec-side neighbor-discovery primitive.
+# Witness recipe for audit finding G.06 — SWIM removed; NDN AutoConfig wired.
 #
 # Finding:     docs/notes/spec-compliance-audit-2026-04-20.md § G.06
-# Severity:    MAJOR (BLOCKED-BY-INTEROP — needs ndn-autoconfig-server)
-# Spec ref:    ndn-cxx `tools/ndn-autoconfig` reads DNS TXT records to
-#              fetch a NDN-cert chain; NFD's auto-discovery is via
-#              `/localhop/nfd/*` prefixes and prefix announcements.
-#              ndn-rs's `ndn-discovery` Hello/gossip protocol is a
-#              SWIM-over-NDN design (Stutzbach/van Renesse) borrowed
-#              into NDN packets, with its own TLV types
-#              (`T_ADD_ENTRY` / `T_REMOVE_ENTRY` / capability set).
-# Witness:     GREP-PROOF that ndn-rs's discovery surface remains the
-#              SWIM design (architecture-side stamp). The live interop
-#              part — sending a real `ndn-autoconfig` PROBE Interest at
-#              ndn-rs and observing the empty / mismatched response —
-#              is BLOCKED-BY-INTEROP: it needs the ndn-cxx
-#              `ndn-autoconfig` binary in the testclient image, plus a
-#              DNS TXT record fixture.
+# Severity:    RESOLVED 2026-05-08
+# Type:        GREP-PROOF
 #
-# Exit codes:  0 PASS / 1 FAIL / 2 SKIP
+# Original finding: ndn-rs used SWIM-over-NDN for neighbor discovery;
+# NDN AutoConfig (DNS-based hub finding + NeighborProbeProtocol) is the
+# spec-aligned primitive.
+#
+# Resolution: SWIM hello/ machinery removed; replaced by:
+#   - NeighborProbeProtocol (/ndn/local/nd/probe/ping) for liveness probing
+#   - AutoConfigProtocol (/localhop/ndn-autoconf/hub) for hub discovery
+#
+# This script verifies SWIM artifacts are absent and NDN AutoConfig is wired.
+#
+# Exit codes:  0 PASS / 1 FAIL
 set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 cd "$REPO_ROOT"
 
 fail=0
 
-# 1. SWIM machinery is still present (unchanged audit observation).
-if grep -rqE '\bSwim\b|swim_failure|HelloProtocol\b|epidemic' \
+# 1. SWIM machinery is gone.
+if grep -rqE '\bHelloProtocol\b|\bUdpNeighborDiscovery\b|\bSwimScheduler\b' \
         crates/engine/ndn-discovery/src/ 2>/dev/null; then
-    echo "ok: SWIM-over-NDN discovery surface still present (audit-aligned)"
+    echo "FAIL: SWIM types still present"
+    fail=1
 else
-    echo "FAIL: SWIM/Hello surface no longer present — re-target this witness"
+    echo "ok: SWIM types absent"
+fi
+
+# 2. NeighborProbeProtocol is present.
+if grep -rqE '\bNeighborProbeProtocol\b' \
+        crates/engine/ndn-discovery/src/ 2>/dev/null; then
+    echo "ok: NeighborProbeProtocol present"
+else
+    echo "FAIL: NeighborProbeProtocol not found"
     fail=1
 fi
 
-# 2. There is no `ndn-autoconfig` PROBE handler in ndn-rs.
-if grep -rqEi '\bndn[_-]?autoconfig\b|fn handle_autoconfig_probe' \
-        crates/engine/ndn-discovery/src/ binaries/ 2>/dev/null; then
-    echo "FAIL: an ndn-autoconfig PROBE handler appeared — update this witness for live interop"
-    fail=1
+# 3. AutoConfigDiscovery (hub discovery) is present.
+if grep -rqE '\bAutoConfigDiscovery\b' \
+        crates/engine/ndn-discovery/src/ 2>/dev/null; then
+    echo "ok: AutoConfigDiscovery present"
 else
-    echo "ok: no ndn-autoconfig PROBE handler (architecture-side gap confirmed)"
+    echo "FAIL: AutoConfigDiscovery not found"
+    fail=1
 fi
-
-# 3. Live interop note.
-echo 'info: live `ndn-autoconfig` PROBE → response interop is BLOCKED-BY-INTEROP'
-echo '      until the ndn-cxx binary plus a DNS TXT fixture land in the testclient image.'
 
 if [ "$fail" -eq 0 ]; then
     echo
-    echo "=== G.06 BLOCKED-BY-INTEROP — SWIM-over-NDN architecture confirmed; live AutoConfig deferred ==="
+    echo "=== G.06 RESOLVED — SWIM removed, NeighborProbeProtocol + AutoConfig wired ==="
     exit 0
 else
     echo
-    echo "=== G.06 — architecture diverged from audit; update witness ==="
+    echo "=== G.06 — unexpected state; see above ==="
     exit 1
 fi

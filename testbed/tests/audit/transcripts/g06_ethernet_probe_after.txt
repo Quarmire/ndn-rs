@@ -1,0 +1,67 @@
+Running EtherNeighborDiscovery unit tests...
+   Compiling hashbrown v0.14.5
+   Compiling ring v0.17.14
+   Compiling spki v0.7.3
+   Compiling untrusted v0.9.0
+   Compiling constant_time_eq v0.4.2
+   Compiling itoa v1.0.18
+   Compiling semver v1.0.27
+   Compiling arrayref v0.3.9
+   Compiling arrayvec v0.7.6
+   Compiling ndn-foundation-types v0.1.0 (/Users/pmle/Documents/Dev/ndn-rs/crates/foundation/ndn-foundation-types)
+   Compiling cipher v0.4.4
+   Compiling hmac v0.12.1
+warning: ring@0.17.14: Compiler family detection failed due to error: ToolNotFound: failed to find tool "x86_64-linux-gnu-gcc": No such file or directory (os error 2)
+warning: ring@0.17.14: Compiler family detection failed due to error: ToolNotFound: failed to find tool "x86_64-linux-gnu-gcc": No such file or directory (os error 2)
+error: failed to run custom build command for `ring v0.17.14`
+
+Caused by:
+  process didn't exit successfully: `/Users/pmle/Documents/Dev/ndn-rs/target/debug/build/ring-fdb3bb9447676c13/build-script-build` (exit status: 1)
+  --- stdout
+  cargo:rerun-if-env-changed=CARGO_MANIFEST_DIR
+  cargo:rerun-if-env-changed=CARGO_PKG_NAME
+  cargo:rerun-if-env-changed=CARGO_PKG_VERSION_MAJOR
+  cargo:rerun-if-env-changed=CARGO_PKG_VERSION_MINOR
+  cargo:rerun-if-env-changed=CARGO_PKG_VERSION_PATCH
+  cargo:rerun-if-env-changed=CARGO_PKG_VERSION_PRE
+  cargo:rerun-if-env-changed=CARGO_MANIFEST_LINKS
+  cargo:rerun-if-env-changed=RING_PREGENERATE_ASM
+  cargo:rerun-if-env-changed=OUT_DIR
+  cargo:rerun-if-env-changed=CARGO_CFG_TARGET_ARCH
+  cargo:rerun-if-env-changed=CARGO_CFG_TARGET_OS
+  cargo:rerun-if-env-changed=CARGO_CFG_TARGET_ENV
+  cargo:rerun-if-env-changed=CARGO_CFG_TARGET_ENDIAN
+  cargo:rerun-if-env-changed=CC_x86_64-unknown-linux-gnu
+  CC_x86_64-unknown-linux-gnu = None
+  cargo:rerun-if-env-changed=CC_x86_64_unknown_linux_gnu
+  CC_x86_64_unknown_linux_gnu = None
+  cargo:rerun-if-env-changed=TARGET_CC
+  TARGET_CC = None
+  cargo:rerun-if-env-changed=CC
+  CC = None
+  cargo:rerun-if-env-changed=CROSS_COMPILE
+  CROSS_COMPILE = None
+  PATH = Some(/Users/pmle/Documents/Dev/ardupilot/Tools/autotest:/Users/pmle/Documents/Dev/ardupilot/Tools/autotest:/opt/homebrew/opt/ccache/libexec:/Users/pmle/Documents/Dev/ardupilot/Tools/autotest:/opt/gcc-arm-none-eabi-10-2020-q4-major/bin:/Users/pmle/.pyenv/shims:/Users/pmle/.pyenv/bin:/Users/pmle/.local/bin:/opt/local/bin:/opt/local/sbin:/opt/homebrew/bin:/Users/pmle/Documents/Dev/ardupilot/Tools/autotest:/Users/pmle/Documents/Dev/ardupilot/Tools/autotest:/opt/homebrew/opt/ccache/libexec:/Users/pmle/Documents/Dev/ardupilot/Tools/autotest:/opt/gcc-arm-none-eabi-10-2020-q4-major/bin:/Users/pmle/.pyenv/bin:/Users/pmle/.local/bin:/opt/local/bin:/opt/local/sbin:/opt/homebrew/bin:/Users/pmle/Documents/Dev/ardupilot/Tools/autotest:/Users/pmle/Documents/Dev/ardupilot/Tools/autotest:/opt/homebrew/opt/ccache/libexec:/Users/pmle/Documents/Dev/ardupilot/Tools/autotest:/opt/gcc-arm-none-eabi-10-2020-q4-major/bin:/Users/pmle/.pyenv/bin:/Users/pmle/.local/bin:/opt/local/bin:/opt/local/sbin:/Users/pmle/.cargo/bin:/opt/homebrew/bin:/Users/pmle/.nix-profile/bin:/run/current-system/sw/bin:/nix/var/nix/profiles/default/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/pmle/.claude/plugins/cache/claude-plugins-official/rust-analyzer-lsp/1.0.0/bin:/Users/pmle/.claude/plugins/cache/claude-plugins-official/clangd-lsp/1.0.0/bin)
+  cargo:rerun-if-env-changed=CC_ENABLE_DEBUG_OUTPUT
+  cargo:warning=Compiler family detection failed due to error: ToolNotFound: failed to find tool "x86_64-linux-gnu-gcc": No such file or directory (os error 2)
+  cargo:rerun-if-env-changed=CRATE_CC_NO_DEFAULTS
+  CRATE_CC_NO_DEFAULTS = None
+  cargo:rerun-if-env-changed=CFLAGS
+  CFLAGS = None
+  cargo:rerun-if-env-changed=TARGET_CFLAGS
+  TARGET_CFLAGS = None
+  cargo:rerun-if-env-changed=CFLAGS_x86_64_unknown_linux_gnu
+  CFLAGS_x86_64_unknown_linux_gnu = None
+  cargo:rerun-if-env-changed=CFLAGS_x86_64-unknown-linux-gnu
+  CFLAGS_x86_64-unknown-linux-gnu = None
+  cargo:warning=Compiler family detection failed due to error: ToolNotFound: failed to find tool "x86_64-linux-gnu-gcc": No such file or directory (os error 2)
+
+  --- stderr
+
+
+  error occurred in cc-rs: failed to find tool "x86_64-linux-gnu-gcc": No such file or directory (os error 2)
+
+
+warning: build failed, waiting for other jobs to finish...
+SKIP: ether-nd tests require Linux target or ether-nd feature
+(non-Linux host — architecture verified by GREP-PROOF in g06_swim_deleted.sh)

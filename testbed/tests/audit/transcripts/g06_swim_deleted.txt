@@ -1,0 +1,14 @@
+=== G.06 SWIM-deletion witness ===
+ok: HelloProtocol type absent
+ok: DirectProbe type absent
+ok: IndirectProbe type absent
+ok: LinkMedium trait (SWIM hello interface) absent
+ok: HelloCore struct absent
+ok: HelloState struct absent
+ok: UdpNeighborDiscovery type absent
+ok: swim substring (case-insensitive) absent
+ok: hello_prefix scope constant absent
+ok: hello/ directory absent from ndn-discovery
+ok: ndn-faces/src/l2/ether_nd.rs absent
+
+PASS: all SWIM artifacts removed
