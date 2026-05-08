@@ -22,6 +22,9 @@ on:
       - "binaries/**"
       - "testbed/tests/audit/**"
       - ".github/workflows/audit-witnesses.yml"
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * 1"   # weekly, Monday 03:00 UTC
 
 concurrency:
   group: audit-witnesses-${{ github.ref }}
@@ -243,3 +246,59 @@ jobs:
           docker logs nfd-nlsr     2>&1 | tail -50  || true
           echo "=== nlsr-cxx ==="
           docker logs nlsr-cxx     2>&1 | tail -100 || true
+
+  # ── Spawn-path regression probe ───────────────────────────────────────────
+  # Runs the spawn_overhead criterion group and uploads the JSON estimates as
+  # an artifact.  Intended for manual regression investigations and as a weekly
+  # canary; NOT on every PR (criterion numbers on shared GHA runners have
+  # significant variance — only large regressions are actionable here).
+  #
+  # To compare two runs: download both artifacts, diff the estimates.json files
+  # under target/criterion/spawn_overhead/*/new/.
+  bench-spawn:
+    name: Bench spawn_overhead (criterion JSON)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: bench-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: bench-${{ runner.os }}-
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends pkg-config libdbus-1-dev
+
+      - name: Run spawn_overhead bench
+        run: |
+          cargo bench -p ndn-engine --bench pipeline -- spawn_overhead \
+            2>&1 | tee /tmp/bench-spawn.txt
+
+      - name: Upload criterion JSON artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-spawn-overhead-${{ github.run_number }}
+          path: target/criterion/spawn_overhead/
+          retention-days: 90
+          if-no-files-found: warn
+
+      - name: Write step summary
+        if: always()
+        run: |
+          echo "## spawn_overhead bench" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          grep -E 'time:|thrpt:|change:' /tmp/bench-spawn.txt >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Criterion JSON artifact: \`criterion-spawn-overhead-${{ github.run_number }}\` (90-day retention)" >> "$GITHUB_STEP_SUMMARY"
