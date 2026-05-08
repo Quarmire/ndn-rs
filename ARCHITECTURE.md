@@ -63,6 +63,9 @@ crates/faces/                  All face implementations in one consolidated crat
     l2                         NamedEtherFace (AF_PACKET/PF_NDRV/Npcap), WfbFace
     bluetooth                  BleFace GATT stub
     virtual                    CallbackFace — virtual face driven by a Rust closure (e.g., CS prewarm hooks)
+  ndn-face-webtransport        Server-side WebTransport listener (HTTP/3 + QUIC datagrams) — issue #14
+
+crates/foundation/ndn-acme     ACME (RFC 8555) DNS-01 cert provisioning for the WS-TLS face (issue #3) and the WT listener (issue #14)
 
 crates/foundation/             Zero-NDN-dep building blocks — compile no_std compatible
   ndn-foundation-types         Name, NameComponent, canonical Ord — shared with ndf-rs
