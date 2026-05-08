@@ -188,7 +188,20 @@ Testbed CI runs on push to `testbed/**` and weekly via cron
 The engine compiles to `wasm32-unknown-unknown` via the
 [`ndn-runtime`](crates/foundation/ndn-runtime/) `Spawn`/`Sleep`/`Now` trait
 abstraction (see the readiness audit at
-`docs/notes/wasm-readiness-audit-2026-05-07.md`). The browser-side
+`docs/notes/wasm-readiness-audit-2026-05-07.md`). The wasm-safe trait
+shapes used by the engine — `DiscoveryProtocol`, `DiscoveryContext`,
+`NeighborTable`, scope helpers — live in
+[`crates/engine/ndn-discovery-core/`](crates/engine/ndn-discovery-core/);
+[`ndn-discovery`](crates/engine/ndn-discovery/) re-exports them and adds
+the native-only protocols (autoconfig, gossip, ether-ND, probe,
+service-discovery). On wasm `ndn-engine` drops `ndn-security` (pulls
+`ring`) entirely and substitutes a permissive [`ValidationStage`
+stub](crates/engine/ndn-engine/src/stages/validation_stub.rs); the
+[`builder`](crates/engine/ndn-engine/src/builder.rs) is also
+non-wasm-only, so wasm callers construct `ForwarderEngine`
+programmatically.
+
+The browser-side
 WebTransport client face lives in
 [`crates/faces/ndn-face-webtransport-wasm/`](crates/faces/ndn-face-webtransport-wasm/);
 the wiki page [`transports/webtransport-browser`](docs/wiki/src/transports/webtransport-browser.md)
