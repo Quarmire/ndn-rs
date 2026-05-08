@@ -51,7 +51,7 @@ docker exec -it interop bash
 enroll-ndncert \
     --face-socket /run/nfd-ndncert/nfd.sock \
     --ca-prefix /test/ndncert/CA \
-    --name /my/identity \
+    --name /test/ndncert/CA/my-identity \
     --pin 123456
 ```
 
