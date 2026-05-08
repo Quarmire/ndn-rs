@@ -60,6 +60,7 @@ RUN cargo chef cook --release \
     --bin ndn-ping \
     --bin ndn-iperf \
     --bin ndn-ctl \
+    --bin enroll-ndncert \
     --recipe-path recipe.json
 
 # ── ndn-rs tools: builder ─────────────────────────────────────────────────────
@@ -71,7 +72,8 @@ RUN cargo build --release \
     --bin ndn-put \
     --bin ndn-ping \
     --bin ndn-iperf \
-    --bin ndn-ctl
+    --bin ndn-ctl \
+    --bin enroll-ndncert
 
 # ── Final image ───────────────────────────────────────────────────────────────
 FROM ubuntu:24.04
@@ -120,11 +122,12 @@ RUN npm install -g @ndn/cat --legacy-peer-deps || \
     echo "WARN: @ndn/cat install failed — ndnts tests will SKIP"
 
 # ndn-rs tools
-COPY --from=ndn-rs-builder /build/target/release/ndn-peek  /usr/local/bin/
-COPY --from=ndn-rs-builder /build/target/release/ndn-put   /usr/local/bin/
-COPY --from=ndn-rs-builder /build/target/release/ndn-ping  /usr/local/bin/
-COPY --from=ndn-rs-builder /build/target/release/ndn-iperf /usr/local/bin/
-COPY --from=ndn-rs-builder /build/target/release/ndn-ctl   /usr/local/bin/
+COPY --from=ndn-rs-builder /build/target/release/ndn-peek       /usr/local/bin/
+COPY --from=ndn-rs-builder /build/target/release/ndn-put        /usr/local/bin/
+COPY --from=ndn-rs-builder /build/target/release/ndn-ping       /usr/local/bin/
+COPY --from=ndn-rs-builder /build/target/release/ndn-iperf      /usr/local/bin/
+COPY --from=ndn-rs-builder /build/target/release/ndn-ctl        /usr/local/bin/
+COPY --from=ndn-rs-builder /build/target/release/enroll-ndncert /usr/local/bin/
 
 COPY testbed/tests/interop/ /testbed/tests/interop/
 RUN chmod +x /testbed/tests/interop/*.sh

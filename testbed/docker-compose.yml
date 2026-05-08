@@ -25,6 +25,7 @@ volumes:
   nfd-nlsr-sock:      # shared between nfd-nlsr and nlsr-cxx (Unix socket handoff)
   nlsr-cxx-data:      # /var/lib/nlsr state for C++ NLSR
   ndn-fwd-nlsr-sock:  # management socket for the NLSR-enabled ndn-rs instance
+  nfd-ndncert-sock:   # shared between nfd-ndncert, ndncert-ca, and interop (C.13 witness)
 
 networks:
   ndn-net:
@@ -128,6 +129,7 @@ services:
     volumes:
       - ndn-fwd-sock:/run/ndn-fwd:ro
       - nfd-sock:/run/nfd:ro
+      - nfd-ndncert-sock:/run/nfd-ndncert:ro
       - ./tests:/testbed/tests:ro
     command: ["sleep", "infinity"]
 
@@ -181,6 +183,55 @@ services:
     # before NLSR starts.  The image entrypoint is /usr/bin/nlsr; using
     # 'entrypoint:' replaces it entirely.
     entrypoint: ["/bin/bash", "/entrypoint.sh"]
+    restart: unless-stopped
+
+  # ── nfd-ndncert (NFD sidecar for C.13 ndncert-ca) ──────────────────────────────
+  # ndncert-ca-server requires a co-located NFD to register prefixes and exchange
+  # NDN packets.  Socket at /run/nfd-ndncert/nfd.sock to avoid colliding with the
+  # compliance-test NFD at /run/nfd/nfd.sock.
+  nfd-ndncert:
+    image: ghcr.io/named-data/nfd:latest
+    container_name: nfd-ndncert
+    hostname: nfd-ndncert
+    networks:
+      ndn-net:
+        ipv4_address: 172.30.0.15
+    volumes:
+      - ./configs/nfd-ndncert/nfd.conf:/etc/ndn/nfd.conf:ro
+      - nfd-ndncert-sock:/run/nfd-ndncert
+    command: ["nfd", "--config", "/etc/ndn/nfd.conf"]
+    healthcheck:
+      test: ["CMD-SHELL", "NDN_CLIENT_SOCK=/run/nfd-ndncert/nfd.sock nfdc status 2>/dev/null | grep -q 'uptime' || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  # ── ndncert-ca (upstream ndncert-ca-server, for C.13 live interop witness) ──────
+  # Runs against nfd-ndncert.  CA prefix: /test/ndncert/CA.  Challenge: pin only
+  # (simplest automation path — no SMTP infra required).
+  # NDN_LOG=ndncert.challenge.pin=TRACE makes the generated PIN visible in
+  # docker logs so the witness script can extract it without a human operator.
+  ndncert-ca:
+    build:
+      context: ..
+      dockerfile: testbed/Dockerfile.ndncert-ca
+    container_name: ndncert-ca
+    hostname: ndncert-ca
+    networks:
+      ndn-net:
+        ipv4_address: 172.30.0.16
+    depends_on:
+      nfd-ndncert:
+        condition: service_healthy
+    volumes:
+      - ./configs/ndncert-ca/ca.conf:/config/ndncert-ca.conf:ro
+      - ./configs/ndncert-ca/entrypoint.sh:/config/entrypoint.sh:ro
+      - nfd-ndncert-sock:/run/nfd
+    environment:
+      NDN_CLIENT_SOCK: "unix:///run/nfd/nfd.sock"
+      NDN_LOG: "ndncert.challenge.pin=TRACE"
     restart: unless-stopped
 
   # ── ndn-fwd-nlsr (ndn-rs with NLSR enabled, for G.04 interop witness) ─────────
