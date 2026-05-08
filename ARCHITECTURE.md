@@ -70,6 +70,7 @@ crates/foundation/             Zero-NDN-dep building blocks — compile no_std c
   ndn-store                    NameTrie, Fib, PIT, ContentStore (LruCs/ShardedCs/FjallCs), DeadNonceList
   ndn-packet                   Interest, Data, Nack — lazy decode, no_std; re-exports ndn-foundation-types
   ndn-tlv                      TlvReader, TlvWriter, varu64 — no_std
+  ndn-runtime                  Spawn/Sleep/Now trait abstraction; TokioRuntime (native) / WasmRuntime (browser)
 
 crates/sim/                    Simulation and WebAssembly targets
   ndn-sim                      SimFace, SimLink, topology builder, event tracer
@@ -157,7 +158,7 @@ The `RoutingProtocol` trait populates the RIB. Three implementations ship:
 - **`DvrProtocol`** — experimental distance-vector protocol (ndn-rs-specific; no
   cross-implementation peer).
 - **`NlsrProtocol`** — Named-data Link State Routing; implements the NDN testbed
-  routing protocol. Runs Hello liveness detection, PSync-based LSA flooding, and
+  routing protocol. Runs `NeighborProbeProtocol` for liveness, PSync-based LSA flooding, and
   Dijkstra-based routing-table computation. Enabled via `[routing.nlsr]` in
   `ndnd.toml`. See `docs/wiki/src/protocols/nlsr.md` for operator guidance.
 

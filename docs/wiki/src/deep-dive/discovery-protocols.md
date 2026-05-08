@@ -191,9 +191,9 @@ analog: reachability in NDN is carried by the routing protocol (NLSR/DV) via
 LSA propagation, not a separate gossip layer.  `EpidemicGossip` has been
 removed.
 
-The SWIM hello machinery (`hello/` directory) remains for backward compatibility
-while `ndn-faces` and `ndn-mobile` migrate to `NeighborProbeProtocol`.  It is
-not the spec-aligned path.
+The SWIM hello machinery (`hello/` directory) has been removed (2026-05-08).
+`ndn-faces` uses `EtherNeighborDiscovery` (a thin wrapper around
+`NeighborProbeProtocol`) and `ndn-mobile` uses `NeighborProbeProtocol` directly.
 
 ## Runtime Configuration
 

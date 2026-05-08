@@ -61,7 +61,7 @@ Every extension point in ndn-rs is a trait:
 - **`Strategy`** -- a forwarding decision function that reads `StrategyContext` and returns `ForwardingAction` values
 - **`ContentStore`** -- pluggable cache backend (`LruCs`, `ShardedCs`, `FjallCs`)
 - **`Signer` / `Verifier`** -- cryptographic operations decoupled from packet types
-- **`DiscoveryProtocol`** -- neighbor and service discovery (SWIM, mDNS, etc.)
+- **`DiscoveryProtocol`** -- neighbor and service discovery (`NeighborProbeProtocol`, `AutoConfigDiscovery`, etc.)
 
 This trait-based approach means new transports, strategies, and cache backends can be added without modifying the core pipeline. The built-in pipeline is monomorphised at compile time for zero-cost dispatch; only plugin stages use dynamic dispatch via `ErasedPipelineStage`.
 

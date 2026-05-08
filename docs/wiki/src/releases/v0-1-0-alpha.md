@@ -76,11 +76,9 @@ This was more work than expected. The initial Linux implementation used futex sy
 
 ### Discovery
 
-The discovery layer implements SWIM (Scalable Weakly-consistent Infection-style Membership) for link-layer peer discovery. Each node sends periodic hello Interests; missed hellos trigger direct probes; missed direct probes trigger K indirect probes via randomly chosen established neighbors. The result is a failure detector that converges quickly without flooding the network.
+The discovery layer uses NDN-native neighbor probing (`NeighborProbeProtocol`) and hub discovery (`AutoConfigDiscovery`). Each neighbor is probed periodically with an Interest under `/ndn/local/nd/probe/ping`; three missed replies mark the neighbor stale. Hub discovery follows the NDN AutoConfig spec via `/localhop/ndn-autoconf/hub` multicast Interest and optional NDN-FCH HTTP fallback.
 
-Hello packets use a spec-compliant TLV format (`HelloPayload` with `NODE-NAME`, `SERVED-PREFIX`, `CAPABILITIES`, `NEIGHBOR-DIFF` fields). The `NEIGHBOR-DIFF` field carries SWIM gossip piggybacked on every hello, so membership information disseminates for free.
-
-Two higher-level discovery protocols layer on top: `EpidemicGossip` for pull-gossip over `/ndn/local/nd/gossip/`, and `SvsServiceDiscovery` for push notifications using the SVS sync protocol.
+`ServiceDiscoveryProtocol` provides demand-driven service record publication and browsing over `/ndn/local/sd/`.
 
 ### Sync Protocols
 
