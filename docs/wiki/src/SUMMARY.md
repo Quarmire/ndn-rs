@@ -31,6 +31,8 @@
 - [Dashboard](./guides/dashboard.md)
 - [Docker Deployment](./guides/docker-deployment.md)
 - [Logging and Observability](./guides/logging.md)
+- [Debugging with tokio-console](./operations/tokio-console.md)
+- [NDNCERT Enrollment](./operations/ndncert-enrollment.md)
 - [Performance Tuning](./guides/performance-tuning.md)
 - [Setting Up an NDNCERT CA](./guides/ndncert-setup.md)
 - [Fleet and Swarm Security](./guides/fleet-security.md)
