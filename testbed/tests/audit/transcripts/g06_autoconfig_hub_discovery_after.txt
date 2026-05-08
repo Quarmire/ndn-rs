@@ -1,0 +1,15 @@
+Running AutoConfig hub-discovery unit tests...
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.17s
+     Running unittests src/lib.rs (target/debug/deps/ndn_discovery-41f8bc69c9241fe5)
+
+running 6 tests
+test autoconfig::client::tests::parse_http_url_with_port ... ok
+test autoconfig::client::tests::parse_http_url_basic ... ok
+test autoconfig::client::tests::parse_hub_uri_missing_element_returns_none ... ok
+test autoconfig::client::tests::parse_hub_uri_extracts_faceuri ... ok
+test autoconfig::client::tests::build_hub_data_round_trips_uri ... ok
+test autoconfig::client::tests::hub_discovery_interest_has_correct_name ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 93 filtered out; finished in 0.00s
+
+PASS: all hub-discovery unit tests passed

@@ -1,0 +1,16 @@
+Running neighbor-probe unit tests...
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s
+     Running unittests src/lib.rs (target/debug/deps/ndn_discovery-41f8bc69c9241fe5)
+
+running 7 tests
+test hello::probe::tests::probe_ack_is_detected ... ok
+test hello::probe::tests::direct_probe_rejects_wrong_prefix ... ok
+test probe::tests::probe_interest_has_correct_prefix ... ok
+test hello::probe::tests::direct_probe_roundtrip ... ok
+test hello::probe::tests::indirect_probe_roundtrip ... ok
+test probe::tests::probe_protocol_replies_to_incoming_probe_interest ... ok
+test probe::tests::probe_protocol_sends_probe_on_tick ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 92 filtered out; finished in 0.01s
+
+PASS: all neighbor-probe unit tests passed
