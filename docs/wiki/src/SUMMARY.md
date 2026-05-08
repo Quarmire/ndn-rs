@@ -30,6 +30,7 @@
 - [CLI Tools](./guides/cli-tools.md)
 - [Dashboard](./guides/dashboard.md)
 - [Docker Deployment](./guides/docker-deployment.md)
+- [Logging and Observability](./guides/logging.md)
 - [Performance Tuning](./guides/performance-tuning.md)
 - [Setting Up an NDNCERT CA](./guides/ndncert-setup.md)
 - [Fleet and Swarm Security](./guides/fleet-security.md)
