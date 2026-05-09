@@ -66,6 +66,9 @@ crates/faces/                  All face implementations in one consolidated crat
   ndn-face-webtransport        Server-side WebTransport listener (HTTP/3 + QUIC datagrams) — issue #14
   ndn-face-webtransport-wasm   Browser-side WebTransport client face; pure Rust→WASM via xwt-web,
                                also compiles natively via xwt-wtransport for unit witnesses — issue #14 phase 3
+  ndn-face-webrtc              Peer-to-peer datachannel face — turns the browser into a real
+                               ndn-rs peer (Phase 5; native impl on webrtc-rs, wasm on web-sys);
+                               bootstraps via out-of-band signaling (manual / HTTP relay)
 
 crates/foundation/ndn-acme     ACME (RFC 8555) DNS-01 cert provisioning for the WS-TLS face (issue #3) and the WT listener (issue #14)
 
