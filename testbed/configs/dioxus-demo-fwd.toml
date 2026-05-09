@@ -40,4 +40,4 @@ cert_source = { type = "self_signed_dev" }
 face_socket = "/run/ndn-fwd/ndn-fwd.sock"
 
 [logging]
-level = "info"
+level = "info,face.wt=trace,face.lp=trace,fwd.pipeline=trace,fwd.fib=trace,mgmt.rib=trace,mgmt.security=trace,engine=debug"
