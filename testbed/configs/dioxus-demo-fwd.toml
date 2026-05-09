@@ -43,8 +43,17 @@ bind = "0.0.0.0:6364"
 
 [listeners.webtransport]
 enabled = true
-listen  = "0.0.0.0:4433"
-cert_source = { type = "self_signed_dev" }
+# Dual-stack bind so `https://localhost:4433` works on macOS too —
+# macOS resolves `localhost` to `::1` first, and an IPv4-only
+# listener (0.0.0.0) refuses that connection. `[::]:4433` accepts
+# both IPv6 and IPv4-mapped-IPv6 connections on every OS we
+# support.
+listen  = "[::]:4433"
+# Cert SAN list — both `localhost` and `127.0.0.1` so URL bar
+# auto-completion + curl/peek probes against either name match a
+# self-signed dev cert without falling back to
+# `?cert=<spki-hash>`-only verification.
+cert_source = { type = "self_signed_dev", hostnames = ["localhost", "127.0.0.1"] }
 
 [management]
 face_socket = "/run/ndn-fwd/ndn-fwd.sock"
