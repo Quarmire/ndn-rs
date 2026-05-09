@@ -127,9 +127,10 @@ Data:     FaceCheck → TlvDecode → PitMatch  → Validation → CsInsert → 
 ## Core Data Structures
 
 - **FIB** — `NameTrie` with per-node `RwLock`; concurrent longest-prefix match
-- **PIT** — `DashMap<PitToken, PitEntry>`; sharded, no global lock on hot path
+- **PIT** — `DashMap<PitToken, PitEntry>`; sharded, no global lock on hot path; entries optionally carry `PersistentState` for subscription-mode Interests
 - **Content Store** — trait-based; `LruCs` (in-memory), `ShardedCs` (parallel), `FjallCs` (disk)
 - **Strategy Table** — name trie mapping prefixes to `Arc<dyn Strategy>`
+- **SubscriptionRequest** — `ndn-packet` sub-TLV (type `0x230`) inside `ApplicationParameters`; enables persistent Interests that survive multiple Data deliveries; degrades gracefully on unsigned or unvalidated Interests
 
 ## Task Topology
 

@@ -148,17 +148,45 @@ stateDiagram-v2
     Created --> Pending: In-record added\nfor incoming face
     Pending --> Aggregated: Duplicate Interest\nfrom different face\n(add in-record)
     Aggregated --> Aggregated: More duplicates
-    Pending --> Satisfied: Matching Data arrives
-    Aggregated --> Satisfied: Matching Data arrives
+    Pending --> Satisfied: Matching Data arrives\n(classical Interest)
+    Aggregated --> Satisfied: Matching Data arrives\n(classical Interest)
     Satisfied --> [*]: Data sent to all\nin-record faces,\nentry removed
+    Pending --> PersistentPending: Matching Data arrives\n(persistent Interest,\ncredit > 0)
+    PersistentPending --> PersistentPending: More Data arrives,\ndecrement credit
+    PersistentPending --> Satisfied: Credit exhausted
     Pending --> Expired: Interest lifetime\nelapsed, no Data
     Aggregated --> Expired: Interest lifetime\nelapsed, no Data
-    Expired --> [*]: Entry cleaned up\nby timing wheel
+    PersistentPending --> Expired: Hard lifetime\n(reap_at) elapsed
+    Expired --> [*]: Entry cleaned up\nby expiry reaper
     Pending --> Nacked: Upstream returns Nack,\nno alternative nexthops
     Nacked --> [*]: Nack propagated\ndownstream, entry removed
 ```
 
-> **🔧 Implementation note:** ndn-rs does not scan the entire PIT for expired entries. Instead, a hierarchical timing wheel provides O(1) insertion and expiry notification. When a PIT entry is created, it is registered with the wheel at its `expires_at` time. The wheel fires a callback when that time passes, and the entry is removed -- no periodic sweeps, no wasted CPU.
+> **🔧 Implementation note:** ndn-rs does not scan the entire PIT for expired entries on every tick. The expiry reaper drains entries whose `expires_at <= now`. Both classical (per `InterestLifetime`) and persistent (per `reap_at`) entries use the same field, so no separate scheduling is needed for persistent entries.
+
+### Persistent Interests
+
+A **persistent Interest** keeps its PIT entry alive across multiple Data deliveries, enabling subscription-like patterns without application-layer polling. The requesting consumer embeds a `SubscriptionRequest` sub-TLV (type `0x230`) inside the Interest's `ApplicationParameters`:
+
+```
+SubscriptionRequest ::= TLV-TYPE(0x230) TLV-LENGTH(9)
+                        version:u8          -- must be 1
+                        max_data_count:u32  -- BE, upper bound on deliveries
+                        max_lifetime_secs:u32 -- BE, hard deadline (≤ 3600 s)
+```
+
+When `PitCheckStage` sees a valid `SubscriptionRequest`, it authenticates the Interest via the configured `Validator`. If validation succeeds, a `PersistentState` is attached to the new `PitEntry`:
+
+```rust
+pub struct PersistentState {
+    pub data_count_remaining: u32,  // decremented on each Data match
+    pub reap_at: u64,               // absolute epoch-ns; entry forced-reaped here
+}
+```
+
+`PitMatchStage` decrements `data_count_remaining` instead of removing the entry on each matching Data packet. The entry is removed only when the credit reaches zero, or when the expiry reaper fires at `reap_at`.
+
+**Graceful degradation:** If no `Validator` is configured, or if the Interest's signature does not pass validation, the entry is treated as a classical Interest — the `SubscriptionRequest` sub-TLV is silently ignored. This means persistent Interests are backward-compatible: forwarders that lack validation support still forward them as ordinary one-shot Interests.
 
 The PIT's connection to the other structures is direct and essential. It depends on the CS having already been checked (no point tracking an Interest the CS can satisfy). And when Data arrives, the PIT entry's in-records tell the dispatch stage exactly where to send it -- information that the FIB never had, because the FIB only knows about *upstream* paths, not about which *downstream* faces are waiting.
 
