@@ -108,6 +108,33 @@ same way it would on UDP or WebTransport. The DTLS fingerprint
 is **not** bound to NDN identity — that complication is
 unnecessary as long as ndn-rs is the one consuming both sides.
 
+## Try it: two-tab demo (manual signaling)
+
+The `dioxus-demo` crate ships a "WebRTC Peer" panel that
+exercises the wasm `WebRtcConnector` end-to-end. No relay needed
+— the two tabs paste SDP+ICE bundles between each other.
+
+1. Boot the demo forwarder + serve the demo app:
+   ```bash
+   sudo target/release/ndn-fwd -c testbed/configs/dioxus-demo-fwd.toml
+   cd crates/research/dioxus-demo && dx serve --release
+   ```
+2. Open the printed URL in **two** browser tabs.
+3. In tab A, scroll to the **WebRTC Peer** panel and click
+   **Create offer**. Copy the offer bundle from the textarea.
+4. In tab B, paste the bundle into the **Paste peer's offer**
+   box, then click **Accept offer**. Copy the answer bundle.
+5. Back in tab A, paste the answer bundle into **Paste peer's
+   answer**, then click **Finalize with answer**. Both tabs
+   should show "connected".
+6. Click **Send ping** on either side. The other tab will echo
+   it back via the on-channel auto-reply, and you'll see
+   `recv: pong: ping from dioxus-demo` in the message line.
+
+This is the load-bearing witness that the wasm `WebRtcConnector`
+works at runtime — every `web_sys` callback fires, the closure
+bag stays alive long enough, and the SDP/ICE round-trip lands.
+
 ## Witness status
 
 See `docs/notes/webrtc-design-2026-05-07.md` for the design
