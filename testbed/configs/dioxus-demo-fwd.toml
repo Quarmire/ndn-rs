@@ -23,6 +23,16 @@ profile = "disabled"
 [security.mgmt]
 require_signed_commands = false
 
+# Embedded NDNCERT CA. Browser tabs request certs from `/demo/CA/{INFO,
+# NEW,CHALLENGE/<id>}` over the WebTransport face, then sign
+# `/localhop/nfd/rib/register` Interests with the issued cert. The CA's
+# self-signed root is installed as a /localhop trust anchor at boot —
+# no PIB file required for the demo.
+[demo_ca]
+enabled  = true
+prefix   = "/demo/CA"
+identity = "/demo/CA"
+
 [[face]]
 kind = "udp"
 bind = "0.0.0.0:6363"
