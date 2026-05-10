@@ -29,6 +29,16 @@ import { test, expect, Page } from '@playwright/test';
 const DEMO_URL = process.env.DEMO_URL ?? 'http://127.0.0.1:8080/';
 const HANDSHAKE_TIMEOUT = 30_000;
 
+// Skip when the demo server isn't reachable — CI doesn't yet provision it.
+test.beforeAll(async () => {
+  try {
+    const res = await fetch(DEMO_URL, { signal: AbortSignal.timeout(2000) });
+    if (!res.ok) test.skip(true, `dioxus-demo not reachable at ${DEMO_URL} (HTTP ${res.status})`);
+  } catch (e) {
+    test.skip(true, `dioxus-demo not reachable at ${DEMO_URL} (${(e as Error).message})`);
+  }
+});
+
 async function statusOf(page: Page): Promise<string> {
   return page.getByTestId('rtc-status').innerText();
 }

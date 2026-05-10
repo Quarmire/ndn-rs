@@ -38,6 +38,16 @@ function peek(name: string): Buffer {
   );
 }
 
+// Skip when the demo server isn't reachable — CI doesn't yet provision it.
+test.beforeAll(async () => {
+  try {
+    const res = await fetch(DEMO_URL, { signal: AbortSignal.timeout(2000) });
+    if (!res.ok) test.skip(true, `dioxus-demo not reachable at ${DEMO_URL} (HTTP ${res.status})`);
+  } catch (e) {
+    test.skip(true, `dioxus-demo not reachable at ${DEMO_URL} (${(e as Error).message})`);
+  }
+});
+
 test('dioxus demo: browser produces, native ndn-tools peek fetches', async ({ page }) => {
   await page.goto(DEMO_URL);
 

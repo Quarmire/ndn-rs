@@ -81,6 +81,22 @@ jobs:
       - name: Build ndn-fwd (release)
         run: cargo build --release --bin ndn-fwd
 
+      # ── SharedWorker / transit WASM bundle ───────────────────────────────────
+      # Phase 6 (sharedworker_cache_hit) and Phase 7 (transit_browser_as_
+      # forwarder) fixture pages load `/sw-pkg/shared_engine_bg.wasm` which is
+      # built from `crates/tooling/dioxus-demo` with the `shared-engine`
+      # feature.  The output is gitignored, so CI builds it from source.
+
+      - name: Add wasm32 target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        run: |
+          curl -sSf https://rustwasm.github.io/wasm-pack/installer/init.sh | sh
+
+      - name: Build shared_engine wasm bundle
+        run: bash testbed/tests/browser/build-shared-engine.sh
+
       # ── Node.js: install deps, bundle NDNts, install browsers ───────────────
 
       - name: Set up Node.js

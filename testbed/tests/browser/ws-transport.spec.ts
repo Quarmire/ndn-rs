@@ -42,9 +42,17 @@ const WS_PORT = 9797;
 // WebSocket-only forwarder: no UDP/TCP faces needed since both sides are browsers.
 // Note: omit [engine] entirely — cs_capacity_mb has no #[serde(default)] so the
 // section would require it; without the section ndn-fwd uses built-in defaults.
+//
+// `require_signed_commands = false` is required: NDNts `ribRegister()` issues a
+// plain (unsigned) `/localhost/nfd/rib/register` Interest, and the default
+// production setting rejects unsigned commands with 403 UNAUTHORIZED.  The
+// producer would then never register, so the consumer's Interest expires.
 const FWD_CONFIG = `
 [security]
 profile = "disabled"
+
+[security.mgmt]
+require_signed_commands = false
 
 [[face]]
 kind = "web-socket"

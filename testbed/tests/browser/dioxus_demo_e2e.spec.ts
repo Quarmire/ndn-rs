@@ -31,6 +31,18 @@ const TRANSCRIPT_DIR = path.resolve(
   'transcripts',
 );
 
+// The dioxus-demo binary must be running externally (e.g. via
+// `docker compose up dioxus-demo-fwd` or `dx serve`).  When it isn't, skip
+// rather than fail — CI doesn't yet provision the demo server.
+test.beforeAll(async () => {
+  try {
+    const res = await fetch(DEMO_URL, { signal: AbortSignal.timeout(2000) });
+    if (!res.ok) test.skip(true, `dioxus-demo not reachable at ${DEMO_URL} (HTTP ${res.status})`);
+  } catch (e) {
+    test.skip(true, `dioxus-demo not reachable at ${DEMO_URL} (${(e as Error).message})`);
+  }
+});
+
 test('dioxus demo: consumer expresses Interest and renders Data', async ({ page }) => {
   await page.goto(DEMO_URL);
 
