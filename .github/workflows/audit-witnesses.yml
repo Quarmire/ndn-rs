@@ -56,10 +56,21 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-audit-
 
       - name: Install system dependencies
+        # ndn-dashboard pulls Dioxus desktop transitively, which links
+        # webkit2gtk / GTK / glib / dbus on Linux.  Mirror ci.yml's apt
+        # list so `cargo build --workspace` finds the .pc files it needs.
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            pkg-config libdbus-1-dev
+            pkg-config \
+            libdbus-1-dev \
+            libglib2.0-dev \
+            libgtk-3-dev \
+            libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev \
+            libxdo-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev
 
       - name: Build workspace
         run: cargo build --workspace
@@ -371,9 +382,19 @@ jobs:
           restore-keys: bench-${{ runner.os }}-
 
       - name: Install system dependencies
+        # See unit job above for the rationale for this full set.
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends pkg-config libdbus-1-dev
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libdbus-1-dev \
+            libglib2.0-dev \
+            libgtk-3-dev \
+            libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev \
+            libxdo-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev
 
       - name: Run spawn_overhead bench
         run: |

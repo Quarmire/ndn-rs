@@ -33,7 +33,11 @@ PCAP_FILE="$TRANSCRIPT_DIR/g04_nlsr_interop_after.pcap"
 TXT_FILE="$TRANSCRIPT_DIR/g04_nlsr_interop_after.txt"
 NDN_FWD_NLSR_PREFIX="/test/r2/data"
 NLSR_CXX_PREFIX="/test/r1/data"
-TIMEOUT=90
+# C++ NLSR enforces hello-interval >= 30 (conf-file-processor). With the
+# minimum hello-interval, first adjacency takes up to ~30s, then LSA
+# propagation needs another ~30-60s. 180s budget gives convergence
+# headroom on slow runners.
+TIMEOUT=180
 POLL=5
 
 # ── Infra availability check ──────────────────────────────────────────────────
@@ -195,23 +199,21 @@ if [[ $RS_SEES_CXX -eq 0 ]]; then
     echo ""
     echo "FAIL: ndn-fwd-nlsr does not have ${NLSR_CXX_PREFIX} in its RIB after ${TIMEOUT}s."
     echo ""
-    echo "Known root cause (G.04 BLOCKED-BY-INTEROP):"
-    echo "  NlsrSync.run() installs remote LSAs only when PSync updates carry"
-    echo "  mapping bytes (update.mapping is Some).  C++ NLSR's PSync sends seq"
-    echo "  numbers only — no mapping bytes on the wire.  ndn-rs receives the"
-    echo "  PSync update but skips LSA installation (update.mapping == None)."
-    echo "  Separately, ndn-rs does not issue Interest/Data fetches for LSA"
-    echo "  content (LSA fetching deferred in NlsrSync; see phase 5 comment)."
-    echo ""
-    echo "  Fix required: implement LSA content fetch in NlsrSync:"
-    echo "    - On PSync update with no mapping bytes, send an Interest for the"
-    echo "      LSA name (<lsa_prefix>/<router>/<type>/<seq>) via the sync face."
-    echo "    - Serve own LSAs as NDN Data packets so C++ NLSR can fetch them."
-    echo "    - This is a separate commit from G.04 phase 6 integration."
-    echo ""
-    echo "  See: crates/spec/ndn-routing/src/protocols/nlsr/sync.rs:196"
-    echo "       (the 'Phase 5: install LSA if the PSync update carries the wire"
-    echo "       bytes' block — the else branch is the missing implementation)."
+    echo "Triage checklist (most-likely → least-likely):"
+    echo "  1. nlsr-cxx config rejected — check its container logs for"
+    echo "     'Invalid value for hello-interval' / 'Error in configuration"
+    echo "     file processing'.  The C++ NLSR validator requires"
+    echo "     hello-interval in [30, 90].  If it rejected the config, the"
+    echo "     C++ side never started peering."
+    echo "  2. Hello did not arrive — adjacency LSA never built.  Look for"
+    echo "     'NLSR: received Hello' in ndn-fwd-nlsr logs and the matching"
+    echo "     'Hello sent' / 'getting status' line in nlsr-cxx logs."
+    echo "  3. PSync update arrived but LSA fetch failed — look in"
+    echo "     ndn-fwd-nlsr logs for 'fetched LSA' (PASS) vs 'LSA Interest"
+    echo "     timed out' (FAIL).  See crates/spec/ndn-routing/src/protocols/"
+    echo "     nlsr/sync.rs::fetch_remote_lsa."
+    echo "  4. NameLSA never advertised our prefix — confirm ndn-fwd-nlsr"
+    echo "     logs show 'own NameLSA installed' with prefixes=1+."
     exit 1
 fi
 
@@ -219,13 +221,12 @@ if [[ $CXX_SEES_RS -eq 0 ]]; then
     echo ""
     echo "FAIL: nlsr-cxx does not have ${NDN_FWD_NLSR_PREFIX} in its routing table after ${TIMEOUT}s."
     echo ""
-    echo "Known root cause (G.04 BLOCKED-BY-INTEROP):"
-    echo "  C++ NLSR issues an Interest for ndn-rs's LSA after seeing its seq"
-    echo "  number via PSync.  ndn-rs does not serve LSAs as NDN Data packets,"
-    echo "  so the Interest times out and C++ NLSR never learns the prefix."
-    echo ""
-    echo "  Fix required: ndn-rs must register and serve the LSA namespace"
-    echo "    <network>/nlsr/LSA/<own_router>/NAME/<seq> as NDN Data (signed)."
+    echo "Triage checklist:"
+    echo "  1. Did the LSA serve path register?  Look in ndn-fwd-nlsr logs"
+    echo "     for 'NLSR LSA producer registered' or similar."
+    echo "  2. Did nlsr-cxx fetch the LSA?  Its logs show 'LSA interest sent'"
+    echo "     and 'received Data' on success, 'timed out' on failure."
+    echo "  3. nlsr-cxx config rejected — see RS_SEES_CXX checklist item #1."
     exit 1
 fi
 
