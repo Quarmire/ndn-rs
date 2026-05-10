@@ -67,19 +67,31 @@ the token; it just checks set membership.
 
 ## Generating tokens
 
-Until a built-in `ndn-fwd-tokens` CLI lands, mint tokens
-manually:
+Use the `ndn-fwd-tokens` CLI:
 
 ```bash
-# 16 random bytes, hex-encoded
-openssl rand -hex 16
+# Mint one token + URL.
+ndn-fwd-tokens new --domain ndn.example.com
 
-# Or with /dev/urandom
-head -c 16 /dev/urandom | xxd -p
+# Five at once.
+ndn-fwd-tokens new --domain ndn.example.com --count 5
+
+# Render a QR code in the terminal (great for slacking a link).
+ndn-fwd-tokens new --domain ndn.example.com --qr
+
+# SVG QR file for printing / paper handoff.
+ndn-fwd-tokens new --domain ndn.example.com --qr --qr-format png
 ```
 
-Copy each token into `ndn-fwd.toml`'s `tokens = [...]` list and
-restart. The matching join URL goes to the user.
+Each invocation prints `token = "..."` and the matching URL.
+Paste the token into `ndn-fwd.toml`'s `[demo_ca].tokens` array
+and restart; share the URL with the user. The CLI doesn't talk
+to a running CA — it's a pure local mint + format helper, so it
+works offline.
+
+(For low-tech bootstrapping without the CLI, `openssl rand -hex 16`
+or `head -c 16 /dev/urandom | xxd -p` produces a token of the
+same shape; the URL is then just `https://<domain>/#join=<hex>`.)
 
 ## Revoking an invite
 
@@ -111,8 +123,10 @@ revocation surface.
 
 ## Follow-ups (not yet shipped)
 
-- `ndn-fwd-tokens add` / `list` / `remove` CLI for live token
-  management without restarts.
-- QR-code generation built into the CLI (PNG to stdout / file).
+- Live token management against a running CA (`ndn-fwd-tokens
+  add` / `list` / `remove` over the management socket, no
+  restart). Today's `new` mints + formats only — operator must
+  edit the toml + restart to enable a fresh batch.
 - Out-of-band revocation channel (`/localhost/nfd/...` mgmt
-  command).
+  command) for revoking *issued certs*, separate from
+  unclaimed-token cleanup.

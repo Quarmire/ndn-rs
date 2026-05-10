@@ -31,8 +31,9 @@ non-trickle so the SDP is bundled in a single round trip.
 
 ## What's persisted
 
-Three things go into your browser's IndexedDB at the host's
-origin:
+Your identity is stored in your browser's IndexedDB as a **SafeBag**
+— the same canonical NDN container `ndnsec export` produces. One
+file (well, one IndexedDB row) carries:
 
 - Your identity name (`/com/example/users/<random-id>`).
 - Your signing key (16 bytes; never leaves your browser).
@@ -58,14 +59,30 @@ re-spawns the worker; the worker pulls your identity back
 from IndexedDB and you're connected again — no re-join, no
 new token needed.
 
-> **Known limitation.** As of this writing, only the cert is
-> persisted across reloads — the signer key isn't yet
-> round-tripped through IndexedDB. Reload short-circuits the
-> *cert recognition* step but you'll still re-run NDNCERT
-> against the host CA to mint a fresh signing key. This is
-> tracked as a follow-on (see `crates/research/dioxus-demo/src/join.rs`'s
-> `persist` TODO); once it lands, reload is a true zero-cost
-> short-circuit.
+Both halves of your identity round-trip through IndexedDB: the
+issued cert AND the encrypted signing key, bundled as a SafeBag.
+Reload is a true zero-cost short-circuit — no NDNCERT round-trip,
+the restored signer is the same one you started with.
+
+The SafeBag wire format is the spec-canonical container the rest
+of the NDN ecosystem speaks. In principle a future "Export
+identity" button on the host's page will hand you the same bytes
+`ndnsec export` would produce; you can carry that file to a
+native machine and `ndnsec import` it to sign Data from the
+command-line as the same identity. (Today the export button isn't
+shipped — but the bytes are already in the right shape, so when
+it lands the interop is free.)
+
+> **Where the encryption key lives.** The SafeBag encrypts your
+> private key with a passphrase. Today that passphrase lives in
+> your browser's IndexedDB right next to the bag — meaning a
+> hostile browser extension or an XSS bug at the host's origin
+> could lift both. This is the honest truth about the current
+> threat model and matches what every "in-browser key" service
+> ships before WebAuthn integration. The wire shape is forward-
+> compatible: a future version derives the passphrase from a
+> WebAuthn passkey or asks you to type it; only the passphrase
+> source changes, the SafeBag bytes stay the same.
 
 ## What if I clear my browser data
 
