@@ -84,7 +84,9 @@ crates/extension/               Pragmatic engineering, no NDN spec basis
   ndn-strategy-wasm             Hot-loadable WASM forwarding strategies
   ndn-embedded                  Minimal no_std forwarder for bare-metal MCUs
   ndn-mobile                    Android/iOS forwarder with AppFace IPC
-  ndn-dashboard                 Dioxus desktop / web management UI
+  ndn-dashboard                 Dioxus desktop / web mgmt UI; runtime profile selection
+                                across ndn-fwd / NFD / YaNFD; in-page engine via
+                                `--features browser-engine` + `?engine=local`
   ndn-python                    PyO3 Python bindings
   ndn-boltffi                   BoltFFI — Kotlin/JVM and Swift bindings
 

@@ -7,6 +7,12 @@ RIB, Content Store, strategy chain, dispatcher, and pipeline tasks
 that run inside `ndn-fwd` natively, hosted by a per-origin
 SharedWorker.
 
+> **The dashboard ships this too.** Loading
+> `ndn-dashboard?engine=local` (built with `--features browser-engine`)
+> hosts a `ForwarderEngine` directly in the dashboard tab — the
+> management UI *is* the forwarder. See
+> [Dashboard → Browser-engine mode](../guides/dashboard.md#browser-engine-mode-phase-7).
+
 Crate: `ndn-engine` (the existing crate, now wasm-buildable). Public
 API: [`WasmEngineBuilder`] + [`WasmEngineConfig`] mirroring the
 native [`EngineBuilder`]; [`ForwarderEngine`] is identical on both
