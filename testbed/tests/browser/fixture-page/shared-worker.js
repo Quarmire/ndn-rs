@@ -1,0 +1,55 @@
+// Phase 6 SharedWorker bootstrap.
+//
+// Three-step pattern to avoid the W3C SharedWorker connect-event race:
+// the very first tab's `connect` fires after this script's first task
+// completes — i.e. before any `await` inside `worker_main` has had a
+// chance to install the Rust-side onconnect. We:
+//
+//   1. Install a synchronous onconnect that buffers ports.
+//   2. Load wasm + call worker_main (which stashes the listener).
+//   3. Drain the buffer via `accept_port_from_js` and replace
+//      onconnect with a forwarder that calls the same function for
+//      every subsequent connect event.
+
+const __pendingPorts = [];
+self.onconnect = (e) => {
+  const port = e.ports[0];
+  if (port) {
+    port.start();
+    __pendingPorts.push(port);
+  }
+};
+
+importScripts('/sw-pkg/shared_engine.js');
+
+// `self.name` is the second argument the tab passed to
+// `new SharedWorker(url, name)` — we encode upstream + producers
+// into it as URL-encoded query params so the bootstrap can read
+// both without a separate config channel.
+const params = self.name ? new URLSearchParams(self.name) : new URLSearchParams();
+const UPSTREAM = params.get('upstream') ?? '';
+const PRODUCERS = params.get('producers') ?? '/cache-test';
+
+(async () => {
+  await wasm_bindgen('/sw-pkg/shared_engine_bg.wasm');
+  console.log('[bootstrap] wasm initialised; calling worker_main');
+  await wasm_bindgen.worker_main(UPSTREAM, PRODUCERS);
+  console.log('[bootstrap] worker_main returned; draining', __pendingPorts.length, 'pending port(s)');
+
+  // Drain pre-buffer.
+  for (const port of __pendingPorts) {
+    wasm_bindgen.accept_port_from_js(port);
+  }
+  __pendingPorts.length = 0;
+
+  // Replace onconnect with a forwarder for live connects.
+  self.onconnect = (e) => {
+    const port = e.ports[0];
+    if (port) {
+      wasm_bindgen.accept_port_from_js(port);
+    }
+  };
+  console.log('[bootstrap] live forwarder installed');
+})().catch((err) => {
+  console.error('[bootstrap] fatal:', err);
+});
