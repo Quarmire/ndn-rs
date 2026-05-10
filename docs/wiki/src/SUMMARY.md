@@ -37,6 +37,8 @@
 - [Dashboard](./guides/dashboard.md)
 - [Docker Deployment](./guides/docker-deployment.md)
 - [Self-Hosting](./operations/self-hosting.md)
+- [Invite tokens (operator)](./getting-started/invite-flow.md)
+- [Joining as a user](./getting-started/joining-as-a-user.md)
 - [Logging and Observability](./guides/logging.md)
 - [Debugging with tokio-console](./operations/tokio-console.md)
 - [NDNCERT Enrollment](./operations/ndncert-enrollment.md)
