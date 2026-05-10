@@ -221,7 +221,7 @@ can run without a real browser.
 
 | Demo | Crate | Notes |
 | --- | --- | --- |
-| In-browser ndn-rs (Dioxus + WebTransport) | [`crates/research/dioxus-demo/`](crates/research/dioxus-demo/) | Phase 4 deliverable; see [`docs/wiki/src/getting-started/browser-demo.md`](docs/wiki/src/getting-started/browser-demo.md). Pure Rust→WASM (no JS), uses [`BrowserWebTransportFace`](crates/faces/ndn-face-webtransport-wasm/) and [`ndn-runtime::default_runtime`](crates/foundation/ndn-runtime/src/lib.rs). Witnesses live at `testbed/tests/browser/dioxus_demo_*.spec.ts`. |
+| In-browser ndn-rs (Dioxus + WebTransport) | [`crates/research/dioxus-demo/`](crates/research/dioxus-demo/) | Phase 7: full `ForwarderEngine` (PIT, FIB, CS, dispatcher, pipeline) running in the browser via [`WasmEngineBuilder`](crates/engine/ndn-engine/src/wasm_builder.rs) — same code path as native `ndn-fwd` modulo `ValidationStage::disabled`. Tab-side `BrowserWebTransportFace`; SharedWorker hosts the engine ([Phase 6](docs/wiki/src/transports/shared-worker.md)). Pure Rust→WASM. Witnesses: `testbed/tests/browser/{dioxus_demo,sharedworker_cache_hit}_*.spec.ts`. See [`docs/wiki/src/transports/browser-as-forwarder.md`](docs/wiki/src/transports/browser-as-forwarder.md). |
 
 ## Design Docs
 

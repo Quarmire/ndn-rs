@@ -29,6 +29,7 @@
 - [WebTransport — Browser Client](./transports/webtransport-browser.md)
 - [WebRTC Datachannel Face](./transports/webrtc.md)
 - [SharedWorker Face](./transports/shared-worker.md)
+- [Browser as Forwarder](./transports/browser-as-forwarder.md)
 
 # Operations
 
