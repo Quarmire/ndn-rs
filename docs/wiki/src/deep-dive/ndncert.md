@@ -129,6 +129,47 @@ Not allowed:    /com/acme/hr/employee/alice   (different subtree)
 
 For more complex cases, `DelegationPolicy` allows explicit rules — useful when a sub-CA needs to issue certificates in a namespace that doesn't strictly match its own prefix.
 
+### Post-challenge issuance gating
+
+`NamespacePolicy` runs *before* the challenge phase: it answers "is this name even in scope?" Once the challenge passes, a separate hook — **`IssuancePolicy`** — gets the final say on whether to mint the cert and what validity to grant. This is the seam registries plug into without forking `ndn-cert`.
+
+```rust,ignore
+use std::time::Duration;
+use ndn_cert::{IssuanceContext, IssuanceDecision, IssuancePolicy};
+
+/// Registry-tier policy: only issue under the registry's zone, only
+/// after the `token` challenge (one-time email/SMS/etc.), and shorten
+/// validity to 7 days regardless of the CA's default.
+struct RegistryIssuance { allowed_zone: ndn_packet::Name }
+
+impl IssuancePolicy for RegistryIssuance {
+    fn decide(&self, ctx: &IssuanceContext<'_>) -> IssuanceDecision {
+        if ctx.challenge_type != "token" {
+            return IssuanceDecision::Deny(
+                format!("registry requires `token` challenge, got `{}`", ctx.challenge_type),
+            );
+        }
+        let Ok(name) = ctx.cert_request.name.parse::<ndn_packet::Name>() else {
+            return IssuanceDecision::Deny(format!("unparsable: {}", ctx.cert_request.name));
+        };
+        if !name.has_prefix(&self.allowed_zone) {
+            return IssuanceDecision::Deny(
+                format!("{name} outside registry zone {}", self.allowed_zone),
+            );
+        }
+        IssuanceDecision::Issue { validity: Duration::from_secs(7 * 86_400) }
+    }
+}
+```
+
+The default — `AcceptAllIssuance` — issues every challenge-passing request at the CA's configured `default_validity`, preserving the pre-F7 behavior. Three-stage policy summary:
+
+| Stage | Trait | When | Typical use |
+|-------|-------|------|-------------|
+| Pre-challenge | `NamespacePolicy` | First inbound NEW | "Is this name in scope at all?" — stops obvious cross-namespace abuse |
+| Interactive | `ChallengeHandler` | NEW → CHALLENGE | Did the requester pass the challenge (PIN, token, possession, …)? |
+| Post-challenge | `IssuancePolicy` | After `Approved` | Registry-aware final gate: did we approve mint, with what validity? |
+
 ```mermaid
 graph TD
     Root["Root CA\n/com/acme\n(offline, air-gapped)"]
