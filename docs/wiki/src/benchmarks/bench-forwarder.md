@@ -14,7 +14,7 @@ on every push to `main` and weekly on Mondays.
 
 | Metric | ndn-fwd | ndn-fwd-internal | nfd | yanfd |
 |--------|--------|--------|--------|--------|
-| internal-throughput (unix) | n/a | 2.57 Gbps / 41626 Int/s | n/a | n/a |
-| latency p50/p99 (unix) | 229µs / 319µs | n/a | 237µs / 451µs | 280µs / 351µs |
-| throughput (unix) | 2.52 Gbps / 41297 Int/s | n/a | 849.32 Mbps / 13697 Int/s | 1.40 Gbps / 26426 Int/s |
+| internal-throughput (unix) | n/a | 2.44 Gbps / 40838 Int/s | n/a | n/a |
+| latency p50/p99 (unix) | 245µs / 340µs | n/a | 233µs / 297µs | 276µs / 368µs |
+| throughput (unix) | 2.51 Gbps / 40148 Int/s | n/a | 712.08 Mbps / 11353 Int/s | 1.42 Gbps / 25556 Int/s |
 
