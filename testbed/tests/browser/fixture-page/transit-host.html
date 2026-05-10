@@ -1,0 +1,31 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Phase 7 transit-host fixture</title>
+</head>
+<body>
+  <p>Phase 7 transit-host fixture — drives `TransitHost` from Playwright.</p>
+  <pre id="log"></pre>
+  <script src="/sw-pkg/shared_engine.js"></script>
+  <script>
+    function log(msg) {
+      const el = document.getElementById('log');
+      el.textContent += msg + '\n';
+      console.log('[host-tab]', msg);
+    }
+    (async () => {
+      await wasm_bindgen('/sw-pkg/shared_engine_bg.wasm');
+      const { TransitHost } = wasm_bindgen;
+      // Producer prefix the engine serves locally — Interest from
+      // tab 3 over WebRTC matches /transit-test → AppFace.
+      window.__host = await new TransitHost('/transit-test');
+      log('TransitHost ready');
+      window.__hostReady = true;
+    })().catch((e) => {
+      log('FATAL: ' + (e?.message ?? String(e)));
+      window.__hostReadyError = String(e);
+    });
+  </script>
+</body>
+</html>
