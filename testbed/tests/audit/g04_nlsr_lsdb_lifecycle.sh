@@ -26,7 +26,7 @@ else
     fail=1
 fi
 
-if grep -q 'mod lsdb' crates/spec/ndn-routing/src/protocols/nlsr/lsdb.rs 2>/dev/null; then
+if grep -qE '^mod (lsdb|tests) \{' crates/spec/ndn-routing/src/protocols/nlsr/lsdb.rs 2>/dev/null; then
     echo "ok: lsdb test module present in lsdb.rs"
 else
     echo "FAIL: lsdb test module not found in lsdb.rs"

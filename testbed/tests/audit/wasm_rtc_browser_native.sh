@@ -50,4 +50,15 @@ if ! command -v node >/dev/null 2>&1; then
 fi
 
 cd testbed/tests/browser
+
+# Playwright needs @playwright/test from the local package.  When CI runs
+# this witness without the audit-witnesses workflow having installed the
+# browser test deps, `npx playwright` falls back to a global fetch that
+# can't resolve the config's `import { test } from '@playwright/test'`.
+# `npm install --silent --no-audit --no-fund` is idempotent: a fresh
+# checkout populates node_modules; a cached one no-ops in ~1s.
+if [ ! -d node_modules/@playwright/test ]; then
+    npm install --silent --no-audit --no-fund
+fi
+
 npx playwright test rtc_browser_native.spec.ts
