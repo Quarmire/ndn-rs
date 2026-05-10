@@ -36,6 +36,7 @@
 - [CLI Tools](./guides/cli-tools.md)
 - [Dashboard](./guides/dashboard.md)
 - [Docker Deployment](./guides/docker-deployment.md)
+- [Self-Hosting](./operations/self-hosting.md)
 - [Logging and Observability](./guides/logging.md)
 - [Debugging with tokio-console](./operations/tokio-console.md)
 - [NDNCERT Enrollment](./operations/ndncert-enrollment.md)
