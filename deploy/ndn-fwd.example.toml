@@ -1,0 +1,118 @@
+# ndn-fwd — operator-facing example config.
+#
+# This file is the template `deploy/install.sh` writes; you can also
+# copy it manually:
+#
+#   cp deploy/ndn-fwd.example.toml deploy/ndn-fwd.toml
+#
+# Then bind-mounted into the container as `/etc/ndn-fwd/config.toml`
+# by `deploy/docker-compose.yml`.
+#
+# ── ONE OPERATOR-REQUIRED EDIT ────────────────────────────────────────────────
+# The `[security]` block's `identity =` field. Set it to the NDN
+# namespace you control (typically the reverse-DNS of your domain).
+# Everything else has sensible defaults.
+# ──────────────────────────────────────────────────────────────────────────────
+
+[engine]
+cs_capacity_mb       = 64
+pipeline_channel_cap = 4096
+
+[cs]
+variant          = "lru"
+capacity_mb      = 64
+admission_policy = "default"
+
+# ── Faces ──────────────────────────────────────────────────────────────────────
+
+[[face]]
+kind = "udp"
+bind = "0.0.0.0:6363"
+
+[[face]]
+kind = "tcp"
+bind = "0.0.0.0:6363"
+
+[[face]]
+kind = "web-socket"
+bind = "0.0.0.0:9696"
+
+# Uncomment to join the NDN testbed multicast group on a host interface:
+# [[face]]
+# kind      = "multicast"
+# group     = "224.0.23.170"
+# port      = 56363
+# interface = "eth0"
+
+# ── Listeners ─────────────────────────────────────────────────────────────────
+#
+# WebTransport: HTTP/3 + QUIC datagrams. This is the transport browsers
+# use to talk to your forwarder directly (no native install needed).
+# A real Let's Encrypt cert is auto-managed via the ACME block below;
+# the `cache_dir` lives on the `ndn-fwd-acme` volume so renewals
+# survive container restarts.
+#
+# CHANGE: the `domain` in `cert_source.acme` MUST be your real FQDN.
+# `install.sh` writes this for you; if you're hand-editing, fill it in.
+
+[listeners.webtransport]
+enabled = true
+listen  = "0.0.0.0:443"
+
+[listeners.webtransport.cert_source]
+type           = "acme"
+directory_url  = "https://acme-v02.api.letsencrypt.org/directory"
+email          = "you@example.com"             # ACME account contact
+domain         = "ndn.example.com"             # FQDN you control
+dns_provider   = "cloudflare"                  # or any registered DnsProvider
+cache_dir      = "/var/lib/ndn-fwd/acme"
+
+# Cloudflare-specific knobs. For a different provider, see
+# `crates/foundation/ndn-acme/src/dns.rs` for the registered impls
+# and required `params` shape.
+[listeners.webtransport.cert_source.params]
+api_token = "${CLOUDFLARE_API_TOKEN}"          # supplied via env
+zone_id   = "${CLOUDFLARE_ZONE_ID}"
+
+# WebRTC: peer-to-peer datachannels via the signaling relay sidecar.
+# Tabs that exchange Blocks browser↔browser hit your forwarder only
+# for the rendezvous; the actual NDN traffic stays peer-to-peer.
+# `signaling_url` points at the `signaling-relay` service in the
+# compose file (host networking; no DNS needed).
+#
+# Each `session_id` is one rendezvous slot — the operator allocates
+# them, the forwarder polls each one for inbound offers.
+
+[listeners.webrtc]
+enabled        = true
+signaling_url  = "http://localhost:8888"
+session_ids    = ["public-rendezvous"]
+
+# ── Management ────────────────────────────────────────────────────────────────
+
+[management]
+face_socket = "/run/ndn-fwd/ndn-fwd.sock"
+
+# ── Security ──────────────────────────────────────────────────────────────────
+
+[security]
+# Auto-mint an identity at first startup if none exists. The cert
+# lives on the `ndn-fwd-pib` volume; back it up via `deploy/backup.sh`.
+auto_init = true
+
+# *** CHANGE THIS *** — your NDN namespace. Reverse-DNS of your
+# domain is the conventional default; if your domain is
+# `ndn.example.com` then `/com/example/ndn` is a reasonable choice.
+identity = "/com/example/ndn"
+
+# Validation profile. `default` = hierarchical: chains every Data
+# back to a configured trust anchor. `accept_signed` = permissive
+# (signature required, no chain check) — for early-development only.
+profile = "default"
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+
+[logging]
+level = "info"
+# `level = "debug"` is too noisy for production; use it briefly when
+# diagnosing. Per-target overrides via the RUST_LOG env are honored.

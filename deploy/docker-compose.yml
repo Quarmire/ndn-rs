@@ -1,0 +1,96 @@
+# Operator-facing docker-compose for self-hosted ndn-rs.
+#
+# Spins up:
+#   - ndn-fwd            — the NDN forwarder (UDP/TCP 6363, WebTransport :443,
+#                          WebSocket :9696, optional inbound WebRTC via signaling)
+#   - signaling-relay    — HTTP rendezvous for browser↔browser / browser↔fwd
+#                          WebRTC face setup
+#   - watchtower         — auto-update sidecar (opt-in; profile `watchtower`)
+#
+# Usage:
+#   curl -fsSL https://example.com/install.sh | bash       # interactive install
+#   docker compose up -d                                    # bring up stack
+#   docker compose --profile watchtower up -d               # ...with auto-update
+#   docker compose down                                     # stop
+#
+# Image-tag pinning policy. The default for both ndn-rs services is
+# `:vX-stable` — a moving alias that gets minor + patch updates but
+# *never* a major bump that might require config migration. Override
+# via env to track latest (`NDN_FWD_TAG=latest`) or pin to an exact
+# release (`NDN_FWD_TAG=v0.1.3`).
+#
+# A self-hoster who never touches this file gets safe rolling updates
+# via watchtower; one who pins to an explicit `:v0.1.3` gets a frozen
+# stack until they bump the env. The two extremes are explicit; the
+# middle (`:vX-stable`) is the default and the recommended path.
+
+services:
+  ndn-fwd:
+    image: ${NDN_FWD_IMAGE:-ghcr.io/named-data/ndn-fwd}:${NDN_FWD_TAG:-v0-stable}
+    container_name: ndn-fwd
+    restart: unless-stopped
+    network_mode: host
+    # `network_mode: host` is the right call for an NDN forwarder:
+    # multicast discovery + reachability for native peers + ACME
+    # challenges all want the host's network stack. The signaling
+    # relay below stays on the bridge so it can be load-balanced /
+    # exposed independently.
+    volumes:
+      - ndn-fwd-config:/etc/ndn-fwd
+      - ndn-fwd-pib:/var/lib/ndn-fwd/pib
+      - ndn-fwd-acme:/var/lib/ndn-fwd/acme
+      - ndn-fwd-run:/run/ndn-fwd
+      # Bind-mount the operator's config from the deploy/ dir.
+      - ./ndn-fwd.toml:/etc/ndn-fwd/config.toml:ro
+    environment:
+      - RUST_LOG=${NDN_FWD_LOG:-info}
+    healthcheck:
+      # The forwarder's UDP face is the most-honest reachability
+      # signal. `nc -uz` returns success if the socket is at least
+      # bound and accepting; doesn't verify NDN-layer health, but
+      # that's fine for a container readiness probe.
+      test: ["CMD", "nc", "-uz", "127.0.0.1", "6363"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    labels:
+      # Default opt-in for watchtower's update group.
+      com.centurylinklabs.watchtower.enable: "true"
+
+  signaling-relay:
+    image: ${NDN_RELAY_IMAGE:-ghcr.io/named-data/ndn-rtc-signaling-relay}:${NDN_RELAY_TAG:-v0-stable}
+    container_name: ndn-signaling-relay
+    restart: unless-stopped
+    ports:
+      - "${NDN_RELAY_BIND:-0.0.0.0:8888}:8888"
+    healthcheck:
+      test: ["CMD", "/usr/bin/getent", "hosts", "localhost"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    labels:
+      com.centurylinklabs.watchtower.enable: "true"
+
+  watchtower:
+    profiles: ["watchtower"]
+    image: containrrr/watchtower:latest
+    container_name: ndn-watchtower
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      # Hourly check for new image tags. Stable tags only update on
+      # minor/patch releases — major bumps require an env change.
+      - WATCHTOWER_POLL_INTERVAL=3600
+      - WATCHTOWER_CLEANUP=true
+      - WATCHTOWER_LABEL_ENABLE=true
+      - WATCHTOWER_NOTIFICATIONS=${WATCHTOWER_NOTIFICATIONS:-}
+      - WATCHTOWER_NOTIFICATION_URL=${WATCHTOWER_NOTIFICATION_URL:-}
+
+volumes:
+  ndn-fwd-config:
+  ndn-fwd-pib:
+  ndn-fwd-acme:
+  ndn-fwd-run:
