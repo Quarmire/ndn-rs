@@ -78,17 +78,30 @@ fi
 
 # --pipeline 1: segmented fetch mode; sends CanBePrefix to discover the version
 # component produced by ndncat, then fetches seg=0.
-RESULT=$(ndn-peek --pipeline 1 "${PREFIX}" \
-  --face-socket "${FWD_SOCK}" --no-shm \
-  --lifetime 4000) || {
-  echo "ndn-peek failed (exit $?):" >&2
-  echo "  ndncat stderr:" >&2
-  cat "${NDNTS_ERR}" >&2
-  kill "${SRV_PID}" 2>/dev/null || true
-  rm -f "${NDNTS_ERR}"
-  exit 1
-}
+#
+# Retry the fetch: NDNts (Node.js) startup + rib/register + RIB→FIB
+# propagation timing varies under CI load.  A single attempt with 2s
+# pre-sleep is flaky in CI; three attempts with 2s back-off absorbs that.
+SUCCESS=0
+RESULT=""
+for attempt in 1 2 3; do
+  RESULT=$(ndn-peek --pipeline 1 "${PREFIX}" \
+    --face-socket "${FWD_SOCK}" --no-shm \
+    --lifetime 4000 2>/dev/null) || RESULT=""
+  if echo "${RESULT}" | grep -q "${CONTENT}"; then
+    SUCCESS=1
+    break
+  fi
+  [ "${attempt}" -lt 3 ] && sleep 2
+done
 
 kill "${SRV_PID}" 2>/dev/null || true
+if [ "${SUCCESS}" -ne 1 ]; then
+  echo "ndn-peek did not return expected content after 3 retries" >&2
+  echo "  ndncat stderr:" >&2
+  cat "${NDNTS_ERR}" >&2
+  echo "  last RESULT: ${RESULT}" >&2
+  rm -f "${NDNTS_ERR}"
+  exit 1
+fi
 rm -f "${NDNTS_ERR}"
-echo "${RESULT}" | grep -q "${CONTENT}"

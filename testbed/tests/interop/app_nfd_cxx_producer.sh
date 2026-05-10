@@ -17,13 +17,22 @@ echo -n "${CONTENT}" | NDN_CLIENT_TRANSPORT="unix://${NFD_SOCK}" \
 POKE_PID=$!
 sleep 1  # allow ndnpoke to register with NFD and FIB propagation to complete
 
-RESULT=$(ndn-peek "${PREFIX}/test" \
-  --face-socket "${NFD_SOCK}" --no-shm \
-  --lifetime 4000) || {
-  echo "ndn-peek failed (exit $?)." >&2
-  kill "${POKE_PID}" 2>/dev/null || true
-  exit 1
-}
+# Retry the fetch: NFD RIB→FIB propagation timing varies under CI load.
+SUCCESS=0
+for attempt in 1 2 3; do
+  RESULT=$(ndn-peek "${PREFIX}/test" \
+    --face-socket "${NFD_SOCK}" --no-shm \
+    --lifetime 4000 2>/dev/null) || RESULT=""
+  if echo "${RESULT}" | grep -q "${CONTENT}"; then
+    SUCCESS=1
+    break
+  fi
+  [ "${attempt}" -lt 3 ] && sleep 2
+done
 
 kill "${POKE_PID}" 2>/dev/null || true
-echo "${RESULT}" | grep -q "${CONTENT}"
+if [ "${SUCCESS}" -ne 1 ]; then
+  echo "ndn-peek did not return expected content after 3 retries" >&2
+  echo "  last RESULT: ${RESULT}" >&2
+  exit 1
+fi

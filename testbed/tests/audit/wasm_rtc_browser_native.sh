@@ -61,4 +61,12 @@ if [ ! -d node_modules/@playwright/test ]; then
     npm install --silent --no-audit --no-fund
 fi
 
+# Playwright needs the Chromium browser binary cached under
+# ~/.cache/ms-playwright.  On a fresh CI runner the audit-witnesses
+# workflow has not yet downloaded it (the browser.yml workflow does, but
+# this witness runs from audit-witnesses.yml).  `playwright install
+# chromium` is idempotent: it's a no-op when the cache already has the
+# matching version.
+npx playwright install --with-deps chromium 2>&1 | grep -vE "^\s*$" | tail -5
+
 npx playwright test rtc_browser_native.spec.ts

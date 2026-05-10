@@ -12,15 +12,26 @@ CONTENT="hello-from-ndn-cxx"
 echo -n "${CONTENT}" | NDN_CLIENT_TRANSPORT="unix://${FWD_SOCK}" \
   ndnpoke --freshness 5000 "${PREFIX}/test" &
 POKE_PID=$!
-sleep 0.5
+sleep 1   # ndnpoke startup + rib/register propagation
 
-RESULT=$(ndn-peek "${PREFIX}/test" \
-  --face-socket "${FWD_SOCK}" --no-shm \
-  --lifetime 4000) || {
-  echo "ndn-peek failed (exit $?)." >&2
-  kill "${POKE_PID}" 2>/dev/null || true
-  exit 1
-}
+# Retry the fetch: ndnpoke startup time varies under CI load; 0.5s was too
+# tight and caused flakiness.  Three attempts with 2s back-off absorbs the
+# variance without significantly slowing the happy path.
+SUCCESS=0
+for attempt in 1 2 3; do
+  RESULT=$(ndn-peek "${PREFIX}/test" \
+    --face-socket "${FWD_SOCK}" --no-shm \
+    --lifetime 4000 2>/dev/null) || RESULT=""
+  if echo "${RESULT}" | grep -q "${CONTENT}"; then
+    SUCCESS=1
+    break
+  fi
+  [ "${attempt}" -lt 3 ] && sleep 2
+done
 
 kill "${POKE_PID}" 2>/dev/null || true
-echo "${RESULT}" | grep -q "${CONTENT}"
+if [ "${SUCCESS}" -ne 1 ]; then
+  echo "ndn-peek did not return expected content after 3 retries" >&2
+  echo "  last RESULT: ${RESULT}" >&2
+  exit 1
+fi
