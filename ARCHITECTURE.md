@@ -13,6 +13,27 @@
 
 NDN-RS models Named Data Networking as **composable async pipelines with trait-based polymorphism** — not class hierarchies. The engine is a library, not a daemon.
 
+## Scope policy
+
+Every crate in the workspace carries a `[package.metadata.scope]`
+classification — one of `spec`, `extension`, `research`, `tooling`.
+The categories define what the crate commits to and what review
+bar changes face. Spec crates implement an authoritative NDN
+community spec; extension crates are pragmatic engineering
+without a spec basis (browser PIB, ACME, dashboard); research
+crates are author-led with no stability promise; tooling crates
+are operator-facing CLIs.
+
+The full policy is at [`docs/notes/scope-policy.md`](docs/notes/scope-policy.md);
+the rationale + recommendation thread is at
+[`docs/notes/personal-vs-spec-split-2026-05-10.md`](docs/notes/personal-vs-spec-split-2026-05-10.md).
+
+Today this is soft signal only — the metadata is informational.
+A future commit reorganises the directory tree to make the
+boundary visible at a glance and adds a workspace-level lint
+that enforces the dependency direction (`spec` may not depend on
+`extension` or above).
+
 ## Crate Map
 
 Crates are organised into subdirectories that mirror the dependency layers.
