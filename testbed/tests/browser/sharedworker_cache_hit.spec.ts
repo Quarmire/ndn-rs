@@ -35,9 +35,54 @@ test.describe('Phase 6 — SharedWorker cache hit', () => {
   test('tab B sees tab A\'s cached counter value', async ({ browser }) => {
     const ctx = await browser.newContext();
 
+    // Capture SharedWorker console via CDP so worker_main / bootstrap
+    // diagnostics are visible alongside tab logs.
+    const browserCDP = await (browser as any)._connection?._transport ? null : null;
+
     // Tab A.
     const tabA = await ctx.newPage();
     tabA.on('console', (m) => console.log('[tabA]', m.type(), m.text()));
+
+    // CDP: discover all targets including shared workers, attach to
+    // them as they appear, forward their console messages.
+    const cdp = await ctx.newCDPSession(tabA);
+    await cdp.send('Target.setDiscoverTargets', { discover: true });
+    cdp.on('Target.attachedToTarget' as any, async (params: any) => {
+      const sessionId = params.sessionId;
+      const targetType = params.targetInfo?.type;
+      const targetUrl = params.targetInfo?.url;
+      console.log(`[cdp] attached ${targetType} ${targetUrl}`);
+      const send = (method: string, p: any = {}) =>
+        cdp.send('Target.sendMessageToTarget' as any, {
+          sessionId,
+          message: JSON.stringify({ id: Math.floor(Math.random() * 1e9), method, params: p }),
+        });
+      try {
+        await send('Runtime.enable');
+        await send('Log.enable');
+      } catch (e) {
+        console.log('[cdp] enable failed', e);
+      }
+    });
+    cdp.on('Target.receivedMessageFromTarget' as any, (params: any) => {
+      try {
+        const msg = JSON.parse(params.message);
+        if (msg.method === 'Runtime.consoleAPICalled') {
+          const args = (msg.params.args || [])
+            .map((a: any) => a.value ?? a.description ?? '')
+            .join(' ');
+          console.log(`[worker:${msg.params.type}]`, args);
+        } else if (msg.method === 'Log.entryAdded') {
+          console.log('[worker:log]', msg.params.entry?.text);
+        }
+      } catch {}
+    });
+    await cdp.send('Target.setAutoAttach', {
+      autoAttach: true,
+      waitForDebuggerOnStart: false,
+      flatten: true,
+    });
+
     await tabA.goto(TAB_URL);
     await tabA.waitForFunction(() => (window as any).__sharedReady === true, null, {
       timeout: 15_000,

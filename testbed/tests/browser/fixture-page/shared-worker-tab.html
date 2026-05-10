@@ -15,6 +15,16 @@
       console.log('[tab]', msg);
     }
 
+    // Mirror BroadcastChannel('worker-log') messages from the SharedWorker
+    // into this tab's console so Playwright captures them.
+    try {
+      const bc = new BroadcastChannel('worker-log');
+      bc.onmessage = (e) => {
+        const { level = 'log', text = '' } = e.data || {};
+        console[level === 'error' ? 'error' : 'log']('[worker]', text);
+      };
+    } catch {}
+
     (async () => {
       await wasm_bindgen('/sw-pkg/shared_engine_bg.wasm');
       const { SharedClient } = wasm_bindgen;

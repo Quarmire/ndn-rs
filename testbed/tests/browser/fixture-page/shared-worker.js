@@ -11,6 +11,21 @@
 //      onconnect with a forwarder that calls the same function for
 //      every subsequent connect event.
 
+// Bridge worker console to tab side via BroadcastChannel so Playwright
+// (which only captures tab console, not SharedWorker) can see worker
+// diagnostics. Tab fixture subscribes to the same channel.
+const __logBC = new BroadcastChannel('worker-log');
+const __origLog = console.log.bind(console);
+console.log = (...args) => {
+  __origLog(...args);
+  try { __logBC.postMessage({ level: 'log', text: args.map(String).join(' ') }); } catch {}
+};
+const __origErr = console.error.bind(console);
+console.error = (...args) => {
+  __origErr(...args);
+  try { __logBC.postMessage({ level: 'error', text: args.map(String).join(' ') }); } catch {}
+};
+
 // Buffer ports synchronously without calling port.start() — start()
 // before the Rust-side onmessage handler is installed would dispatch
 // any already-queued tab→worker messages with no listener and the
