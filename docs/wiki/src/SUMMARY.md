@@ -28,6 +28,7 @@
 - [WebTransport Face](./transports/webtransport.md)
 - [WebTransport — Browser Client](./transports/webtransport-browser.md)
 - [WebRTC Datachannel Face](./transports/webrtc.md)
+- [SharedWorker Face](./transports/shared-worker.md)
 
 # Operations
 

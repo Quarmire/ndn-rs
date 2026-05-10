@@ -69,6 +69,9 @@ crates/faces/                  All face implementations in one consolidated crat
   ndn-face-webrtc              Peer-to-peer datachannel face — turns the browser into a real
                                ndn-rs peer (Phase 5; native impl on webrtc-rs, wasm on web-sys);
                                bootstraps via out-of-band signaling (manual / HTTP relay)
+  ndn-face-shared-worker       Per-origin SharedWorker face — one engine instance shared across
+                               every browser tab of an origin (Phase 6); tab-side proxy face +
+                               worker-side per-port face, raw NDN TLV over MessagePort
 
 crates/foundation/ndn-acme     ACME (RFC 8555) DNS-01 cert provisioning for the WS-TLS face (issue #3) and the WT listener (issue #14)
 
