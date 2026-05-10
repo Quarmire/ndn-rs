@@ -11,11 +11,15 @@
 //      onconnect with a forwarder that calls the same function for
 //      every subsequent connect event.
 
+// Buffer ports synchronously without calling port.start() — start()
+// before the Rust-side onmessage handler is installed would dispatch
+// any already-queued tab→worker messages with no listener and the
+// HTML spec drops them. The per-port pump's set_onmessage implicitly
+// starts the port at the moment the listener is attached.
 const __pendingPorts = [];
 self.onconnect = (e) => {
   const port = e.ports[0];
   if (port) {
-    port.start();
     __pendingPorts.push(port);
   }
 };
