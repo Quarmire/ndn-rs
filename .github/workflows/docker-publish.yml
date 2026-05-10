@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
     paths:
-      - "binaries/ndn-fwd/**"
+      - "binaries/spec/ndn-fwd/**"
       - "crates/**"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -71,7 +71,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: binaries/ndn-fwd/Dockerfile
+          file: binaries/spec/ndn-fwd/Dockerfile
           push: true
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}

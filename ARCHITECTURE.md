@@ -15,111 +15,107 @@ NDN-RS models Named Data Networking as **composable async pipelines with trait-b
 
 ## Scope policy
 
-Every crate in the workspace carries a `[package.metadata.scope]`
-classification — one of `spec`, `extension`, `research`, `tooling`.
-The categories define what the crate commits to and what review
-bar changes face. Spec crates implement an authoritative NDN
-community spec; extension crates are pragmatic engineering
-without a spec basis (browser PIB, ACME, dashboard); research
-crates are author-led with no stability promise; tooling crates
-are operator-facing CLIs.
+Every crate in the workspace lives in one of four buckets, visible
+in the directory tree (`crates/{spec,extension,tooling,draft}/`)
+and recorded in each crate's `Cargo.toml` `[package.metadata.scope]`
+field:
 
-The full policy is at [`docs/notes/scope-policy.md`](docs/notes/scope-policy.md);
-the rationale + recommendation thread is at
-[`docs/notes/personal-vs-spec-split-2026-05-10.md`](docs/notes/personal-vs-spec-split-2026-05-10.md).
+- **`spec`** — implements an authoritative NDN community spec
+  (Packet Format v0.3, NFD architecture, NDNCERT 0.3, did:ndn,
+  NLSR, SVS, Certificate Format v2, SafeBag). Witness-first;
+  cross-referenced; reverify-recipe per the existing audit
+  conventions.
+- **`extension`** — pragmatic engineering without a spec basis:
+  browser-tier transports, IndexedDB PIB, ACME, simulation,
+  embedded/mobile ports, FFI bindings.
+- **`tooling`** — operator-facing CLIs and shared tool libs;
+  CLI surface stable between releases.
+- **`draft`** — author-led, exploratory; compiles + honest README
+  is the bar.
 
-Today this is soft signal only — the metadata is informational.
-A future commit reorganises the directory tree to make the
-boundary visible at a glance and adds a workspace-level lint
-that enforces the dependency direction (`spec` may not depend on
-`extension` or above).
+Dependency-direction rule (`draft` → `tooling` → `extension` →
+`spec`): a `spec` crate may not depend on anything to its right.
+Honored by convention today; a future commit will add a
+workspace-level lint.
+
+Full policy at [`docs/notes/scope-policy.md`](docs/notes/scope-policy.md).
 
 ## Crate Map
 
-Crates are organised into subdirectories that mirror the dependency layers.
-Dependencies flow strictly downward; no layer may import from a layer above it.
+Crates are organised by **scope** (see [`docs/notes/scope-policy.md`](docs/notes/scope-policy.md)).
+The dependency-direction rule: `draft` → `tooling` → `extension` →
+`spec`. A `spec` crate may not depend on anything to its right.
 
 ```
-binaries/                      Deployable executables
-  ndn-fwd                      Standalone forwarder (TOML config, management socket)
-  ndn-tools                    CLI tools: ndn-peek, ndn-put, ndn-ping, ndn-iperf, ndn-sec, …
-  ndn-bench                    Throughput and latency benchmarks
+crates/spec/                    NDN community specs implemented faithfully
+  ndn-tlv                       TlvReader, TlvWriter, varu64 — no_std
+  ndn-foundation-types          Name, NameComponent, canonical Ord — shared with ndf-rs
+  ndn-packet                    Interest, Data, Nack (Packet Format v0.3) — lazy decode, no_std
+  ndn-transport                 Face trait, FaceId, FaceTable, StreamFace, TlvCodec
+  ndn-store                     NameTrie, Fib, PIT, ContentStore (LruCs/ShardedCs/FjallCs), DeadNonceList
+  ndn-safebag                   SafeBag (cert + PKCS#5-encrypted key) — wasm-buildable carve-out of safe_bag.rs
+  ndn-faces                     Feature-gated native face types (UDP, TCP, WebSocket, Unix, SHM,
+                                serial, ethernet, BLE, virtual)
+  ndn-face-webtransport         Server-side WebTransport listener (HTTP/3 + QUIC datagrams)
+  ndn-strategy                  BestRoute, Multicast, ASF, composed strategies
+  ndn-security                  KeyChain, Signer/Verifier, TrustSchema, Validator, SafeData
+  ndn-engine                    ForwarderEngine, EngineBuilder/WasmEngineBuilder, pipeline, task topology
+  ndn-app                       Application API: Consumer, Producer, Subscriber
+  ndn-ipc                       ForwarderClient, BlockingForwarderClient, chunked transfer
+  ndn-discovery, ndn-discovery-core
+                                NDN AutoConfig, per-neighbor probe, SVS service discovery
+  ndn-routing                   StaticProtocol, DvrProtocol, NlsrProtocol
+  ndn-sync                      Dataset sync: SVS, PSync
+  ndn-did                       NDN-native Decentralised Identifiers (W3C DID + did:ndn method)
+  ndn-cert                      NDNCERT 0.3 — INFO/NEW/CHALLENGE + IssuancePolicy hook
+  ndn-identity                  Bridges KeyChain + DID + NDNCERT
 
-testbed/                       Multi-forwarder compliance + benchmark testbed
-  docker-compose.yml           ndn-fwd + NFD + yanfd on 172.30.0.0/24
-  tests/compliance/            Protocol compliance tests (forwarding, PIT, CS, mgmt)
-  bench/                       Throughput (ndn-iperf) and latency (ndn-ping) scripts
-  report/compare.py            Markdown comparison table generator
+crates/extension/               Pragmatic engineering, no NDN spec basis
+  ndn-runtime                   Spawn/Sleep/Now trait abstraction; TokioRuntime / WasmRuntime
+  ndn-acme                      ACME (RFC 8555) DNS-01 for the WT listener
+  ndn-config                    TOML config + NFD management protocol
+  ndn-pib-idb                   IndexedDB-backed PIB (browser persistence)
+  ndn-face-webtransport-wasm    Browser-side WebTransport client face
+  ndn-face-webrtc               Peer-to-peer datachannel face (browser-as-peer)
+  ndn-face-shared-worker        Per-origin SharedWorker face (one engine across tabs)
+  ndn-rtc-signaling-relay       HTTP rendezvous server for browser↔browser WebRTC
+  ndn-sim                       SimFace, SimLink, topology builder, event tracer
+  ndn-wasm                      In-browser simulation via wasm-bindgen
+  ndn-strategy-wasm             Hot-loadable WASM forwarding strategies
+  ndn-embedded                  Minimal no_std forwarder for bare-metal MCUs
+  ndn-mobile                    Android/iOS forwarder with AppFace IPC
+  ndn-dashboard                 Dioxus desktop / web management UI
+  ndn-python                    PyO3 Python bindings
+  ndn-boltffi                   BoltFFI — Kotlin/JVM and Swift bindings
 
-tools/
-  ndn-dashboard                Dioxus desktop management UI
+crates/tooling/                 Operator-facing tools and shared tool libs
+  ndn-tools-core                Embeddable tool logic (ping, iperf, peek, put)
+  dioxus-demo                   In-browser demo (TransitHost/Peer + JoinClient + SharedClient)
 
-crates/support/                Shared libraries used by binaries and dashboard
-  ndn-tools-core               Embeddable tool logic (ping, iperf, peek, put)
+crates/draft/                   Author-led, no stability promise
+  ndn-research                  FlowObserverStage, FlowTable, ChannelManager (nl80211)
+  ndn-compute                   ComputeFace, ComputeRegistry for named-function execution
 
-crates/protocols/              Higher-level protocols built on the engine
-  ndn-routing                  Routing algorithms: StaticProtocol, DvrProtocol, NlsrProtocol
-  ndn-sync                     Dataset sync: SVS, PSync
-  ndn-did                      NDN-native Decentralised Identifiers (W3C DID)
-  ndn-cert                     NDNCERT 0.3 — certificate issuance and management
-  ndn-identity                 Key management, identity bootstrapping
+binaries/spec/                  Standalone executable that implements the spec
+  ndn-fwd                       The forwarder (NFD-comparable; TOML config, management socket)
+binaries/extension/             Project-specific operator tools
+  ndn-fwd-tokens                Invite-token mint + QR codes for onboarding-link UX
+binaries/tooling/               Operator CLIs
+  ndn-tools                     ndn-peek, ndn-put, ndn-ping, ndn-iperf, ndn-sec, …
+  ndn-bench                     Throughput + latency benchmarks
+  did-ndn-driver                DIF Universal Resolver target for did:ndn
+  enroll-ndncert                NDNCERT enrollment client
 
-crates/engine/                 Forwarding core — pipeline, strategies, security, app API
-  ndn-engine                   ForwarderEngine, EngineBuilder, pipeline stages, task topology
-  ndn-strategy                 BestRoute, Multicast, ASF, and composed strategies
-  ndn-security                 KeyChain, Signer/Verifier, TrustSchema, Validator, SafeData
-  ndn-app                      Application API: Consumer, Producer, Subscriber
-  ndn-ipc                      ForwarderClient, BlockingForwarderClient, chunked transfer
-  ndn-config                   TOML config parsing, NFD management protocol
-  ndn-discovery                Pluggable discovery: NDN AutoConfig hub-discovery,
-                               per-neighbor liveness probe, SVS service discovery
+deploy/                         Operator-facing self-host bundle
+  docker-compose.yml            ndn-fwd + signaling-relay + opt-in watchtower
+  ndn-fwd.example.toml          Annotated config template (WT+ACME pre-filled)
+  install.sh, backup.sh         Interactive installer + cron-friendly backup
 
-crates/faces/                  All face implementations in one consolidated crate
-  ndn-faces                    Feature-gated face types:
-    net                        UdpFace, TcpFace, MulticastUdpFace (default)
-    websocket                  WebSocketFace (default); websocket-tls adds TLS listener
-    local                      InProcFace/InProcHandle, UnixFace (default)
-    spsc-shm                   ShmFace/ShmHandle zero-copy ring (Unix)
-    serial                     SerialFace with COBS framing (embedded/IoT)
-    l2                         NamedEtherFace (AF_PACKET/PF_NDRV/Npcap), WfbFace
-    bluetooth                  BleFace GATT stub
-    virtual                    CallbackFace — virtual face driven by a Rust closure (e.g., CS prewarm hooks)
-  ndn-face-webtransport        Server-side WebTransport listener (HTTP/3 + QUIC datagrams) — issue #14
-  ndn-face-webtransport-wasm   Browser-side WebTransport client face; pure Rust→WASM via xwt-web,
-                               also compiles natively via xwt-wtransport for unit witnesses — issue #14 phase 3
-  ndn-face-webrtc              Peer-to-peer datachannel face — turns the browser into a real
-                               ndn-rs peer (Phase 5; native impl on webrtc-rs, wasm on web-sys);
-                               bootstraps via out-of-band signaling (manual / HTTP relay)
-  ndn-face-shared-worker       Per-origin SharedWorker face — one engine instance shared across
-                               every browser tab of an origin (Phase 6); tab-side proxy face +
-                               worker-side per-port face, raw NDN TLV over MessagePort
+testbed/                        Multi-forwarder compliance + Playwright browser tests
+  tests/audit/*.sh              Spec-compliance witness scripts (exit 1 today / 0 after)
+  tests/browser/*.spec.ts       Phase-6/7/onboarding witnesses (Chromium-only)
 
-crates/foundation/ndn-acme     ACME (RFC 8555) DNS-01 cert provisioning for the WS-TLS face (issue #3) and the WT listener (issue #14)
-
-crates/foundation/             Zero-NDN-dep building blocks — compile no_std compatible
-  ndn-foundation-types         Name, NameComponent, canonical Ord — shared with ndf-rs
-  ndn-transport                Face trait, FaceId, FaceTable, StreamFace, TlvCodec
-  ndn-store                    NameTrie, Fib, PIT, ContentStore (LruCs/ShardedCs/FjallCs), DeadNonceList
-  ndn-packet                   Interest, Data, Nack — lazy decode, no_std; re-exports ndn-foundation-types
-  ndn-tlv                      TlvReader, TlvWriter, varu64 — no_std
-  ndn-runtime                  Spawn/Sleep/Now trait abstraction; TokioRuntime (native) / WasmRuntime (browser)
-
-crates/sim/                    Simulation and WebAssembly targets
-  ndn-sim                      SimFace, SimLink, topology builder, event tracer
-  ndn-wasm                     In-browser simulation via wasm-bindgen
-  ndn-strategy-wasm            Hot-loadable WASM forwarding strategies
-
-crates/research/               Experimental extensions
-  ndn-research                 FlowObserverStage, FlowTable, ChannelManager (nl80211)
-  ndn-compute                  ComputeFace, ComputeRegistry for named-function execution
-
-crates/platform/               Special deployment targets (not built by default)
-  ndn-embedded                 Minimal no_std forwarder for bare-metal MCUs
-  ndn-mobile                   Android/iOS forwarder with AppFace IPC
-
-bindings/                      FFI to other languages (not built by default)
-  ndn-python                   PyO3 Python bindings
-  ndn-boltffi                  BoltFFI — Kotlin/JVM and Swift bindings
+examples/                       Documentation-grade examples (strategy, discovery, BLE)
 ```
 
 ## Key Abstractions
@@ -214,24 +210,24 @@ Testbed CI runs on push to `testbed/**` and weekly via cron
 ## Browser target
 
 The engine compiles to `wasm32-unknown-unknown` via the
-[`ndn-runtime`](crates/foundation/ndn-runtime/) `Spawn`/`Sleep`/`Now` trait
+[`ndn-runtime`](crates/extension/ndn-runtime/) `Spawn`/`Sleep`/`Now` trait
 abstraction (see the readiness audit at
 `docs/notes/wasm-readiness-audit-2026-05-07.md`). The wasm-safe trait
 shapes used by the engine — `DiscoveryProtocol`, `DiscoveryContext`,
 `NeighborTable`, scope helpers — live in
-[`crates/engine/ndn-discovery-core/`](crates/engine/ndn-discovery-core/);
-[`ndn-discovery`](crates/engine/ndn-discovery/) re-exports them and adds
+[`crates/spec/ndn-discovery-core/`](crates/spec/ndn-discovery-core/);
+[`ndn-discovery`](crates/spec/ndn-discovery/) re-exports them and adds
 the native-only protocols (autoconfig, gossip, ether-ND, probe,
 service-discovery). On wasm `ndn-engine` drops `ndn-security` (pulls
 `ring`) entirely and substitutes a permissive [`ValidationStage`
-stub](crates/engine/ndn-engine/src/stages/validation_stub.rs); the
-[`builder`](crates/engine/ndn-engine/src/builder.rs) is also
+stub](crates/spec/ndn-engine/src/stages/validation_stub.rs); the
+[`builder`](crates/spec/ndn-engine/src/builder.rs) is also
 non-wasm-only, so wasm callers construct `ForwarderEngine`
 programmatically.
 
 The browser-side
 WebTransport client face lives in
-[`crates/faces/ndn-face-webtransport-wasm/`](crates/faces/ndn-face-webtransport-wasm/);
+[`crates/extension/ndn-face-webtransport-wasm/`](crates/extension/ndn-face-webtransport-wasm/);
 the wiki page [`transports/webtransport-browser`](docs/wiki/src/transports/webtransport-browser.md)
 walks through wiring it into a Rust→WASM application. The crate compiles
 on both targets — wasm32 uses `xwt-web` (`web-sys::WebTransport`), other
@@ -242,7 +238,7 @@ can run without a real browser.
 
 | Demo | Crate | Notes |
 | --- | --- | --- |
-| In-browser ndn-rs (Dioxus + WebTransport) | [`crates/research/dioxus-demo/`](crates/research/dioxus-demo/) | Phase 7: full `ForwarderEngine` (PIT, FIB, CS, dispatcher, pipeline) running in the browser via [`WasmEngineBuilder`](crates/engine/ndn-engine/src/wasm_builder.rs) — same code path as native `ndn-fwd` modulo `ValidationStage::disabled`. Tab-side `BrowserWebTransportFace`; SharedWorker hosts the engine ([Phase 6](docs/wiki/src/transports/shared-worker.md)). Pure Rust→WASM. Witnesses: `testbed/tests/browser/{dioxus_demo,sharedworker_cache_hit}_*.spec.ts`. See [`docs/wiki/src/transports/browser-as-forwarder.md`](docs/wiki/src/transports/browser-as-forwarder.md). |
+| In-browser ndn-rs (Dioxus + WebTransport) | [`crates/tooling/dioxus-demo/`](crates/tooling/dioxus-demo/) | Phase 7: full `ForwarderEngine` (PIT, FIB, CS, dispatcher, pipeline) running in the browser via [`WasmEngineBuilder`](crates/spec/ndn-engine/src/wasm_builder.rs) — same code path as native `ndn-fwd` modulo `ValidationStage::disabled`. Tab-side `BrowserWebTransportFace`; SharedWorker hosts the engine ([Phase 6](docs/wiki/src/transports/shared-worker.md)). Pure Rust→WASM. Witnesses: `testbed/tests/browser/{dioxus_demo,sharedworker_cache_hit}_*.spec.ts`. See [`docs/wiki/src/transports/browser-as-forwarder.md`](docs/wiki/src/transports/browser-as-forwarder.md). |
 
 ## Design Docs
 

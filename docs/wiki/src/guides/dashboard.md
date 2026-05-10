@@ -103,7 +103,7 @@ The web target compiles the entire dashboard — including NDN packet encoding, 
 cargo install dioxus-cli
 
 # Serve locally with hot reload
-cd tools/ndn-dashboard
+cd crates/tooling/ndn-dashboard
 dx serve --features web --platform web
 
 # Production build

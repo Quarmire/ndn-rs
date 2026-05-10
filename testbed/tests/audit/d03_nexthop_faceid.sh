@@ -27,7 +27,7 @@ if ! command -v cargo >/dev/null 2>&1; then echo "SKIP: cargo missing" >&2; exit
 fail=0
 
 # 1. GREP-PROOF: strategy stage must reference NextHopFaceId after the fix.
-if grep -qE 'NextHopFaceId\b' crates/engine/ndn-engine/src/stages/strategy.rs; then
+if grep -qE 'NextHopFaceId\b' crates/spec/ndn-engine/src/stages/strategy.rs; then
     echo "ok: stages/strategy.rs reads NextHopFaceId"
 else
     echo "FAIL: stages/strategy.rs has no NextHopFaceId read-site"

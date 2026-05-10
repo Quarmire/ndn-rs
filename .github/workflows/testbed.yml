@@ -34,7 +34,7 @@ on:
     branches: ["main"]
     paths:
       - "testbed/**"
-      - "binaries/ndn-fwd/**"
+      - "binaries/spec/ndn-fwd/**"
       - ".github/workflows/testbed.yml"
 
 permissions:

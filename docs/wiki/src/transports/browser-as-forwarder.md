@@ -79,7 +79,7 @@ The wasm-side engine is the same engine. Specifically:
 ```
 
 The dioxus-demo's wrapper `Engine` (in
-`crates/research/dioxus-demo/src/engine.rs`) keeps an internal
+`crates/tooling/dioxus-demo/src/engine.rs`) keeps an internal
 `AppFace` plumbed into the engine for application-tier I/O. Tabs
 that connect through `SharedWorkerProxyFace` become `WorkerPortFace`
 instances inside the engine; producers, the demo's CA flow, and

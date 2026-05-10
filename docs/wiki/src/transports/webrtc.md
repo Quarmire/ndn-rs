@@ -117,7 +117,7 @@ exercises the wasm `WebRtcConnector` end-to-end. No relay needed
 1. Boot the demo forwarder + serve the demo app:
    ```bash
    sudo target/release/ndn-fwd -c testbed/configs/dioxus-demo-fwd.toml
-   cd crates/research/dioxus-demo && dx serve --release
+   cd crates/tooling/dioxus-demo && dx serve --release
    ```
 2. Open the printed URL in **two** browser tabs.
 3. In tab A, scroll to the **WebRTC Peer** panel and click

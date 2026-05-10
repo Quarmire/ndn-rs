@@ -41,7 +41,7 @@ services:
   ndn-fwd:
     build:
       context: ..
-      dockerfile: binaries/ndn-fwd/Dockerfile
+      dockerfile: binaries/spec/ndn-fwd/Dockerfile
     container_name: ndn-fwd
     hostname: ndn-fwd
     networks:
@@ -242,7 +242,7 @@ services:
   ndn-fwd-nlsr:
     build:
       context: ..
-      dockerfile: binaries/ndn-fwd/Dockerfile
+      dockerfile: binaries/spec/ndn-fwd/Dockerfile
     container_name: ndn-fwd-nlsr
     hostname: ndn-fwd-nlsr
     networks:
@@ -293,7 +293,7 @@ services:
     profiles: ["demo"]
     build:
       context: ..
-      dockerfile: binaries/ndn-fwd/Dockerfile
+      dockerfile: binaries/spec/ndn-fwd/Dockerfile
     container_name: dioxus-demo-fwd
     hostname: dioxus-demo-fwd
     networks:

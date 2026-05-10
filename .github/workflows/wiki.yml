@@ -247,15 +247,15 @@ jobs:
             exit 1
           fi
 
-          mkdir -p tools/ndn-dashboard/web-dist
+          mkdir -p crates/tooling/ndn-dashboard/web-dist
           wasm-bindgen "$WASM_FILE" \
-            --out-dir tools/ndn-dashboard/web-dist \
+            --out-dir crates/tooling/ndn-dashboard/web-dist \
             --out-name ndn_dashboard \
             --target web \
             --no-typescript
 
           # 3. Generate index.html that loads the WASM
-          cat > tools/ndn-dashboard/web-dist/index.html << 'DASH_HTML'
+          cat > crates/tooling/ndn-dashboard/web-dist/index.html << 'DASH_HTML'
           <!DOCTYPE html>
           <html lang="en">
           <head>
@@ -279,7 +279,7 @@ jobs:
 
           echo "built=true" >> "$GITHUB_OUTPUT"
           echo "✓ Dashboard WASM build complete"
-          ls -lh tools/ndn-dashboard/web-dist/
+          ls -lh crates/tooling/ndn-dashboard/web-dist/
 
       - name: Report dashboard build status
         run: |
@@ -301,8 +301,8 @@ jobs:
           cp -r tools/ndn-explorer target/site/explorer
 
           # Dashboard — copy web-dist if built, otherwise placeholder
-          if [ "${{ steps.dash_build.outputs.built }}" = "true" ] && [ -d tools/ndn-dashboard/web-dist ]; then
-            cp -r tools/ndn-dashboard/web-dist target/site/dashboard
+          if [ "${{ steps.dash_build.outputs.built }}" = "true" ] && [ -d crates/tooling/ndn-dashboard/web-dist ]; then
+            cp -r crates/tooling/ndn-dashboard/web-dist target/site/dashboard
           else
             mkdir -p target/site/dashboard
             printf '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><title>NDN Dashboard</title><style>body{font-family:sans-serif;background:#0d1117;color:#8b949e;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;flex-direction:column;gap:1rem}a{color:#58a6ff}</style></head><body><h2 style="color:#e6edf3">NDN Dashboard (Web)</h2><p>The WASM build is not yet available. For now, build and run the desktop version:</p><pre style="background:#161b22;padding:1rem;border-radius:8px;color:#e6edf3">cargo build -p ndn-dashboard --release\n./target/release/ndn-dashboard</pre><p><a href="../wiki/guides/operations/cli-tools.html">CLI tools guide</a> · <a href="../">Back to home</a></p></body></html>\n' \

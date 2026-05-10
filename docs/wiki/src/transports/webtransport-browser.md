@@ -64,7 +64,7 @@ no benefit.
 
 ## Witnesses
 
-- Native: `crates/faces/ndn-face-webtransport-wasm/tests/native_xwt_roundtrip.rs`
+- Native: `crates/extension/ndn-face-webtransport-wasm/tests/native_xwt_roundtrip.rs`
   — listener + face in-process via xwt-wtransport, audit script
   `testbed/tests/audit/wasm_wt_browser_face.sh`.
 - Browser: Playwright spec under `testbed/tests/browser/` (Phase 4

@@ -38,7 +38,7 @@ if [ ! -x "$HELPER" ]; then
 SKIP: helper binary '$HELPER' not present.
 
 This witness test requires a small Rust binary (to be added under
-binaries/ndn-tools/src/ or as an example) that:
+binaries/tooling/ndn-tools/src/ or as an example) that:
 
   1. Builds an ed25519 keypair in-process.
   2. Uses ndn_packet::encode::InterestBuilder with

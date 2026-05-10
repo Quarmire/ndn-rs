@@ -55,7 +55,7 @@ if [[ -z "${DEMO_URL:-}" ]]; then
         export DEMO_URL="http://127.0.0.1:8080/"
     else
         echo "SKIP: DEMO_URL unset and no dioxus-demo bundle reachable at"
-        echo "      http://127.0.0.1:8080/. Run \`cd crates/research/dioxus-demo &&"
+        echo "      http://127.0.0.1:8080/. Run \`cd crates/tooling/dioxus-demo &&"
         echo "      dx serve --release\` in another terminal first."
         exit 2
     fi

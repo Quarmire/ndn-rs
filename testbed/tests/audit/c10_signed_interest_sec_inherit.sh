@@ -20,7 +20,7 @@ if ! command -v cargo >/dev/null 2>&1; then echo "SKIP: cargo missing" >&2; exit
 
 # Verify that KeyChain::sign_interest delegates to InterestBuilder (GREP-PROOF)
 if grep -q "InterestBuilder" \
-    "$REPO_ROOT/crates/engine/ndn-security/src/keychain.rs"; then
+    "$REPO_ROOT/crates/spec/ndn-security/src/keychain.rs"; then
     echo "ok: keychain.rs delegates sign_interest to InterestBuilder"
 else
     echo "FAIL: keychain.rs does not reference InterestBuilder for signing"

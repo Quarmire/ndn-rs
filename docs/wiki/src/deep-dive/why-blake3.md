@@ -409,7 +409,7 @@ hashes the slice oneshot` — is **already optimal**, not by accident
 but because it matches the algorithms' performance models. There is
 no streaming-hash refactor to do. If the same idea comes up again,
 re-run the bench code that lived briefly in
-`crates/engine/ndn-security/benches/security.rs` (now removed; check
+`crates/spec/ndn-security/benches/security.rs` (now removed; check
 the git history for `bench_streaming_feasibility`) to confirm the
 finding still holds on whatever hardware you care about.
 

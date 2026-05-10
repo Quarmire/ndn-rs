@@ -10,7 +10,7 @@
 #
 # Today: FAIL (exit 1) — the crate doesn't exist.
 # After fix: PASS (exit 0) — the integration test in
-#            crates/faces/ndn-face-webtransport/tests/loopback.rs goes green.
+#            crates/spec/ndn-face-webtransport/tests/loopback.rs goes green.
 set -euo pipefail
 
 cd "$(dirname "$0")/../../.."

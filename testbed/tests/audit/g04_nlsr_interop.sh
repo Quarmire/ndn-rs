@@ -209,7 +209,7 @@ if [[ $RS_SEES_CXX -eq 0 ]]; then
     echo "    - Serve own LSAs as NDN Data packets so C++ NLSR can fetch them."
     echo "    - This is a separate commit from G.04 phase 6 integration."
     echo ""
-    echo "  See: crates/protocols/ndn-routing/src/protocols/nlsr/sync.rs:196"
+    echo "  See: crates/spec/ndn-routing/src/protocols/nlsr/sync.rs:196"
     echo "       (the 'Phase 5: install LSA if the PSync update carries the wire"
     echo "       bytes' block — the else branch is the missing implementation)."
     exit 1

@@ -14,9 +14,9 @@ The CA uses `ndn-identity`, `ndn-cert`, and `ndn-app`. Add them to your `Cargo.t
 
 ```toml
 [dependencies]
-ndn-identity = { path = "crates/protocols/ndn-identity" }
-ndn-cert     = { path = "crates/protocols/ndn-cert" }
-ndn-app      = { path = "crates/engine/ndn-app" }
+ndn-identity = { path = "crates/spec/ndn-identity" }
+ndn-cert     = { path = "crates/spec/ndn-cert" }
+ndn-app      = { path = "crates/spec/ndn-app" }
 tokio        = { version = "1", features = ["full"] }
 anyhow       = "1"
 ```

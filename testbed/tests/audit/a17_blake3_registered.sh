@@ -19,8 +19,8 @@ fail=0
 
 # encode/data.rs must not say "experimental" for BLAKE3 constant or method
 for file in \
-    "$REPO_ROOT/crates/foundation/ndn-packet/src/encode/data.rs" \
-    "$REPO_ROOT/crates/support/ndn-tools-core/src/iperf.rs"; do
+    "$REPO_ROOT/crates/spec/ndn-packet/src/encode/data.rs" \
+    "$REPO_ROOT/crates/tooling/ndn-tools-core/src/iperf.rs"; do
     if grep -qE "experimental" "$file" 2>/dev/null; then
         echo "FAIL: 'experimental' still present in $file"
         grep -n "experimental" "$file"

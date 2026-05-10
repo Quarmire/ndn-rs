@@ -24,7 +24,7 @@ fail=0
 
 # 1. SWIM machinery is gone.
 if grep -rqE '\bHelloProtocol\b|\bUdpNeighborDiscovery\b|\bSwimScheduler\b' \
-        crates/engine/ndn-discovery/src/ 2>/dev/null; then
+        crates/spec/ndn-discovery/src/ 2>/dev/null; then
     echo "FAIL: SWIM types still present"
     fail=1
 else
@@ -33,7 +33,7 @@ fi
 
 # 2. NeighborProbeProtocol is present.
 if grep -rqE '\bNeighborProbeProtocol\b' \
-        crates/engine/ndn-discovery/src/ 2>/dev/null; then
+        crates/spec/ndn-discovery/src/ 2>/dev/null; then
     echo "ok: NeighborProbeProtocol present"
 else
     echo "FAIL: NeighborProbeProtocol not found"
@@ -42,7 +42,7 @@ fi
 
 # 3. AutoConfigDiscovery (hub discovery) is present.
 if grep -rqE '\bAutoConfigDiscovery\b' \
-        crates/engine/ndn-discovery/src/ 2>/dev/null; then
+        crates/spec/ndn-discovery/src/ 2>/dev/null; then
     echo "ok: AutoConfigDiscovery present"
 else
     echo "FAIL: AutoConfigDiscovery not found"

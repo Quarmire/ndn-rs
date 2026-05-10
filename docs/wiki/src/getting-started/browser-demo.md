@@ -7,7 +7,7 @@ opens a [`BrowserWebTransportFace`] to a local forwarder, and exchanges
 real Interest/Data packets — both as a consumer (browser → host) and a
 producer (host → browser).
 
-The demo crate lives at `crates/research/dioxus-demo/`.
+The demo crate lives at `crates/tooling/dioxus-demo/`.
 
 ## Three commands
 
@@ -25,7 +25,7 @@ The demo crate lives at `crates/research/dioxus-demo/`.
 2. **Serve the Dioxus app.**
 
    ```bash
-   cd crates/research/dioxus-demo
+   cd crates/tooling/dioxus-demo
    dx serve --release
    ```
 

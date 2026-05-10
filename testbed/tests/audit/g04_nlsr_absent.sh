@@ -5,7 +5,7 @@
 # Severity:    RESOLVED 2026-05-08
 # Spec ref:    NLSR is the deployed NDN testbed routing protocol.
 # Witness:     GREP-PROOF — passes when the NlsrProtocol surface exists
-#              under crates/protocols/ndn-routing/ and the forwarder binary
+#              under crates/spec/ndn-routing/ and the forwarder binary
 #              wires it up.  Fails if either surface disappears (regression).
 #
 # Exit codes:  0 PASS / 1 FAIL / 2 SKIP
@@ -17,16 +17,16 @@ fail=0
 
 # 1. NlsrProtocol struct / impl must exist in ndn-routing.
 nlsr_code=$(grep -rnE '^\s*(pub\s+)?(struct|enum|trait|fn|impl|mod)\s+\w*[Nn]lsr\b|::\s*Nlsr\s*\(' \
-        crates/protocols/ndn-routing/src/ 2>/dev/null || true)
+        crates/spec/ndn-routing/src/ 2>/dev/null || true)
 if [ -n "$nlsr_code" ]; then
-    echo "ok: NLSR surface present in crates/protocols/ndn-routing/"
+    echo "ok: NLSR surface present in crates/spec/ndn-routing/"
 else
-    echo "FAIL: NLSR surface missing from crates/protocols/ndn-routing/ — regression"
+    echo "FAIL: NLSR surface missing from crates/spec/ndn-routing/ — regression"
     fail=1
 fi
 
 # 2. The forwarder binary must reference NlsrProtocol (wired-up check).
-if grep -qE 'NlsrProtocol|nlsr_cfg|routing\.nlsr' binaries/ndn-fwd/src/main.rs 2>/dev/null; then
+if grep -qE 'NlsrProtocol|nlsr_cfg|routing\.nlsr' binaries/spec/ndn-fwd/src/main.rs 2>/dev/null; then
     echo "ok: ndn-fwd wires NlsrProtocol"
 else
     echo "FAIL: ndn-fwd no longer wires NlsrProtocol — regression"

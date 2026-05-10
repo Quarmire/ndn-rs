@@ -27,7 +27,7 @@ fail=0
 check_absent() {
     local pattern="$1"
     local desc="$2"
-    local dirs="${3:-crates/engine/ndn-discovery crates/faces/ndn-faces crates/platform/ndn-mobile}"
+    local dirs="${3:-crates/spec/ndn-discovery crates/spec/ndn-faces crates/extension/ndn-mobile}"
     if grep -rqE "$pattern" $dirs --include="*.rs" 2>/dev/null; then
         echo "FAIL: found $desc" | tee -a "$TRANSCRIPT"
         grep -rE "$pattern" $dirs --include="*.rs" -l 2>/dev/null | tee -a "$TRANSCRIPT"
@@ -52,16 +52,16 @@ check_absent '(?i)\bswim\b'              "swim substring (case-insensitive)"
 check_absent '\bhello_prefix\b'           "hello_prefix scope constant"
 
 # hello/ directory itself must not exist in ndn-discovery.
-if [ -d "$REPO_ROOT/crates/engine/ndn-discovery/src/hello" ]; then
-    echo "FAIL: crates/engine/ndn-discovery/src/hello/ still exists" | tee -a "$TRANSCRIPT"
+if [ -d "$REPO_ROOT/crates/spec/ndn-discovery/src/hello" ]; then
+    echo "FAIL: crates/spec/ndn-discovery/src/hello/ still exists" | tee -a "$TRANSCRIPT"
     fail=1
 else
     echo "ok: hello/ directory absent from ndn-discovery" | tee -a "$TRANSCRIPT"
 fi
 
 # Orphan ether_nd.rs in ndn-faces must not exist.
-if [ -f "$REPO_ROOT/crates/faces/ndn-faces/src/l2/ether_nd.rs" ]; then
-    echo "FAIL: crates/faces/ndn-faces/src/l2/ether_nd.rs still exists" | tee -a "$TRANSCRIPT"
+if [ -f "$REPO_ROOT/crates/spec/ndn-faces/src/l2/ether_nd.rs" ]; then
+    echo "FAIL: crates/spec/ndn-faces/src/l2/ether_nd.rs still exists" | tee -a "$TRANSCRIPT"
     fail=1
 else
     echo "ok: ndn-faces/src/l2/ether_nd.rs absent" | tee -a "$TRANSCRIPT"

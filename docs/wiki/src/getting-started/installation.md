@@ -29,7 +29,7 @@ cargo fmt -- --check
 
 ## Building the forwarder binary
 
-The standalone forwarder lives in `binaries/ndn-fwd`:
+The standalone forwarder lives in `binaries/spec/ndn-fwd`:
 
 ```bash
 cargo build -p ndn-fwd

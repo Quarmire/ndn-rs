@@ -21,9 +21,9 @@ fail=0
 
 # 1. NlsrProtocol struct exists in ndn-routing.
 nlsr_struct=$(grep -rn 'pub struct NlsrProtocol' \
-        crates/protocols/ndn-routing/src/ 2>/dev/null || true)
+        crates/spec/ndn-routing/src/ 2>/dev/null || true)
 if [ -z "$nlsr_struct" ]; then
-    echo "FAIL: NlsrProtocol not found in crates/protocols/ndn-routing/src/"
+    echo "FAIL: NlsrProtocol not found in crates/spec/ndn-routing/src/"
     fail=1
 else
     echo "ok: NlsrProtocol struct present"
@@ -31,7 +31,7 @@ fi
 
 # 2. mod nlsr is declared in protocols/mod.rs.
 nlsr_mod=$(grep -n 'mod nlsr' \
-        crates/protocols/ndn-routing/src/protocols/mod.rs 2>/dev/null || true)
+        crates/spec/ndn-routing/src/protocols/mod.rs 2>/dev/null || true)
 if [ -z "$nlsr_mod" ]; then
     echo "FAIL: 'mod nlsr' not found in protocols/mod.rs"
     fail=1

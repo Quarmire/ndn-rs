@@ -263,6 +263,6 @@ The following capabilities define the v1.0 milestone:
 
 NDN-FT is designed to be the foundation for higher-level applications:
 
-- **NDN Sync** (`crates/protocols/ndn-sync`) — synchronise datasets across nodes using SVS or PSync, building on the same content-addressing primitives.
+- **NDN Sync** (`crates/spec/ndn-sync`) — synchronise datasets across nodes using SVS or PSync, building on the same content-addressing primitives.
 - **NDN Streaming** — live video/audio streams served as sequential named segments, fetched by receivers using `ndn-peek --pipeline`.
 - **Distributed content store** — optionally push hosted files into the router's CS for network-wide caching.

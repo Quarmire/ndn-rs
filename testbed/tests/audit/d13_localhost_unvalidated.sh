@@ -10,7 +10,7 @@
 #              instead of blanket-trusting /localhost Data.
 # Witnesses:   GREP-PROOF that the blanket skip is gone:
 #                grep -nE 'skipping /localhost'
-#                  crates/engine/ndn-engine/src/stages/validation.rs
+#                  crates/spec/ndn-engine/src/stages/validation.rs
 #              must return zero hits.
 #
 # Live ndn-cxx-poked /localhost forgery against ndn-fwd is
@@ -24,7 +24,7 @@ REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 cd "$REPO_ROOT"
 fail=0
 
-if grep -qE 'skipping /localhost' crates/engine/ndn-engine/src/stages/validation.rs; then
+if grep -qE 'skipping /localhost' crates/spec/ndn-engine/src/stages/validation.rs; then
     echo "FAIL: blanket /localhost skip still in validation.rs"
     fail=1
 else

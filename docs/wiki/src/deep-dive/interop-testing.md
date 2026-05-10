@@ -219,7 +219,7 @@ This makes the happy path (NDNts self-registers) fast and the fallback path (man
 
 See [Interop Test Results](../reference/interop-results.md) for the live test matrix from the most recent CI run.
 
-All eight scenarios pass on every scheduled weekly run and on every push to `main` that touches `testbed/` or `binaries/ndn-fwd/`. Failures are tracked as separate quality signals — they do not block merges but are investigated promptly.
+All eight scenarios pass on every scheduled weekly run and on every push to `main` that touches `testbed/` or `binaries/spec/ndn-fwd/`. Failures are tracked as separate quality signals — they do not block merges but are investigated promptly.
 
 ### What Is Not Yet Tested
 

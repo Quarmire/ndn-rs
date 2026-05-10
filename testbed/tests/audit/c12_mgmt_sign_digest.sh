@@ -26,7 +26,7 @@ fail=0
 
 # MgmtClient::send_interest must call sign_digest_sha256
 if grep -q "sign_digest_sha256" \
-    "$REPO_ROOT/crates/engine/ndn-ipc/src/mgmt_client.rs"; then
+    "$REPO_ROOT/crates/spec/ndn-ipc/src/mgmt_client.rs"; then
     echo "ok: send_interest uses sign_digest_sha256"
 else
     echo "FAIL: send_interest does not use sign_digest_sha256"
@@ -35,7 +35,7 @@ fi
 
 # Dataset queries must NOT be signed (they use send_unsigned_interest)
 if grep -q "send_unsigned_interest" \
-    "$REPO_ROOT/crates/engine/ndn-ipc/src/mgmt_client.rs"; then
+    "$REPO_ROOT/crates/spec/ndn-ipc/src/mgmt_client.rs"; then
     echo "ok: dataset queries use send_unsigned_interest"
 else
     echo "FAIL: send_unsigned_interest path is missing"
@@ -44,7 +44,7 @@ fi
 
 # sign_digest_sha256 must be described as the minimum NFD signature
 if grep -q "Minimum signature accepted by NFD" \
-    "$REPO_ROOT/crates/foundation/ndn-packet/src/encode/interest.rs"; then
+    "$REPO_ROOT/crates/spec/ndn-packet/src/encode/interest.rs"; then
     echo "ok: sign_digest_sha256 is documented as NFD minimum"
 else
     echo "FAIL: sign_digest_sha256 not described as NFD minimum"

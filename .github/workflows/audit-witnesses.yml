@@ -165,7 +165,7 @@ jobs:
   # Build time note: the ndn-fwd Docker image compiles the full Rust workspace
   # in release mode.  Cold builds take ~10 min; the BuildKit GHA layer cache
   # speeds up runs where only post-COPY source files changed.
-  # TODO: adopt cargo-chef in binaries/ndn-fwd/Dockerfile to separate the
+  # TODO: adopt cargo-chef in binaries/spec/ndn-fwd/Dockerfile to separate the
   # dependency compilation layer from the source compilation layer, reducing
   # incremental rebuilds to ~2–3 min.
   interop:
@@ -189,12 +189,12 @@ jobs:
         # cached layers — the compose rebuild is effectively instantaneous on
         # cache hit.
         # Cold build (empty GHA cache or Cargo.lock changed): ~8–10 min.
-        # TODO: adopt cargo-chef in binaries/ndn-fwd/Dockerfile to make
+        # TODO: adopt cargo-chef in binaries/spec/ndn-fwd/Dockerfile to make
         # incremental source-only rebuilds fast (~2–3 min).
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: binaries/ndn-fwd/Dockerfile
+          file: binaries/spec/ndn-fwd/Dockerfile
           push: false
           load: true
           tags: ndn-fwd-nlsr:ci

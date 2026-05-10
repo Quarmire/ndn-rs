@@ -152,7 +152,7 @@ volumes:
 From the repository root:
 
 ```bash
-docker build -f binaries/ndn-fwd/Dockerfile -t ndn-fwd .
+docker build -f binaries/spec/ndn-fwd/Dockerfile -t ndn-fwd .
 docker run --rm -p 6363:6363/udp ndn-fwd
 ```
 

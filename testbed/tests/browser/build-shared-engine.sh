@@ -11,7 +11,7 @@ REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 OUT_DIR="$REPO_ROOT/testbed/tests/browser/fixture-page/sw-pkg"
 
 cd "$REPO_ROOT"
-exec wasm-pack build crates/research/dioxus-demo \
+exec wasm-pack build crates/tooling/dioxus-demo \
   --target no-modules \
   --out-dir "$OUT_DIR" \
   --out-name shared_engine \

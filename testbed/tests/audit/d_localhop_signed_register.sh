@@ -46,7 +46,7 @@ fi
 #      It prints a copy-paste-ready URL like
 #         https://127.0.0.1:4433/ndn?cert=<spki-hash>
 #   2. In a second terminal:
-#         cd crates/research/dioxus-demo
+#         cd crates/tooling/dioxus-demo
 #         dx serve --release
 #   3. Open the printed URL in Chrome. The browser console should
 #      log "NDNCERT issued cert: …" then "signed /localhop register

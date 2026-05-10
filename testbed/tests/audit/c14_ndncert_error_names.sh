@@ -26,7 +26,7 @@ fail=0
 
 # 1. GREP-PROOF: the diverged old names must not appear in protocol.rs.
 old_names_re='\b(BadInterest|BadApplicationParameters|InvalidSignature|OutOfTries|OutOfTime)\b'
-hits=$(grep -nE "$old_names_re" crates/protocols/ndn-cert/src/protocol.rs 2>/dev/null || true)
+hits=$(grep -nE "$old_names_re" crates/spec/ndn-cert/src/protocol.rs 2>/dev/null || true)
 if [ -n "$hits" ]; then
     echo "FAIL: diverged ErrorCode names still present in protocol.rs:"
     echo "$hits"
@@ -39,7 +39,7 @@ fi
 for canonical in BadInterestFormat BadParameterFormat BadSignature \
                  InvalidParameters NameNotAllowed BadValidityPeriod \
                  RunOutOfTries RunOutOfTime NoAvailableNames; do
-    if grep -qE "\b${canonical}\b" crates/protocols/ndn-cert/src/protocol.rs; then
+    if grep -qE "\b${canonical}\b" crates/spec/ndn-cert/src/protocol.rs; then
         echo "ok: canonical ${canonical} present"
     else
         echo "FAIL: canonical ${canonical} missing from protocol.rs"

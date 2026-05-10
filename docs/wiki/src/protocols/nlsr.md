@@ -97,7 +97,7 @@ decode failure) are logged at `WARN` level with structured fields
 
 ndn-rs also serves its own LSAs under the same prefix so C++ NLSR can fetch
 them. The serve path is `NlsrProtocol::lsa_io_task` / `serve_lsa_interest`
-in `crates/protocols/ndn-routing/src/protocols/nlsr/protocol.rs`.
+in `crates/spec/ndn-routing/src/protocols/nlsr/protocol.rs`.
 
 **Operator note:** LSA fetch can silently fail if the trust-anchor setup is
 wrong. C++ NLSR validates received LSA Data against its configured trust

@@ -21,7 +21,7 @@ fail=0
 
 # KeyChain::validator() must call hierarchical(), not accept_all()
 if grep -A 5 "pub fn validator" \
-    "$REPO_ROOT/crates/engine/ndn-security/src/keychain.rs" \
+    "$REPO_ROOT/crates/spec/ndn-security/src/keychain.rs" \
     | grep -q "TrustSchema::hierarchical()"; then
     echo "ok: KeyChain::validator uses TrustSchema::hierarchical()"
 else
@@ -31,7 +31,7 @@ fi
 
 # It must NOT use accept_all as the default
 if grep -A 5 "pub fn validator" \
-    "$REPO_ROOT/crates/engine/ndn-security/src/keychain.rs" \
+    "$REPO_ROOT/crates/spec/ndn-security/src/keychain.rs" \
     | grep -q "accept_all"; then
     echo "FAIL: KeyChain::validator still uses accept_all as default"
     fail=1

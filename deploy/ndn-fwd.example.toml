@@ -68,7 +68,7 @@ dns_provider   = "cloudflare"                  # or any registered DnsProvider
 cache_dir      = "/var/lib/ndn-fwd/acme"
 
 # Cloudflare-specific knobs. For a different provider, see
-# `crates/foundation/ndn-acme/src/dns.rs` for the registered impls
+# `crates/extension/ndn-acme/src/dns.rs` for the registered impls
 # and required `params` shape.
 [listeners.webtransport.cert_source.params]
 api_token = "${CLOUDFLARE_API_TOKEN}"          # supplied via env

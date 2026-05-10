@@ -24,7 +24,7 @@ fail=0
 
 # LvsError must contain UserFunctionsNotSupported
 if grep -q "UserFunctionsNotSupported" \
-    "$REPO_ROOT/crates/engine/ndn-security/src/lvs.rs"; then
+    "$REPO_ROOT/crates/spec/ndn-security/src/lvs.rs"; then
     echo "ok: LvsError::UserFunctionsNotSupported exists"
 else
     echo "FAIL: LvsError::UserFunctionsNotSupported not found"
@@ -33,7 +33,7 @@ fi
 
 # from_lvs_binary must check uses_user_functions and return error
 if grep -A 5 "uses_user_functions" \
-    "$REPO_ROOT/crates/engine/ndn-security/src/trust_schema.rs" \
+    "$REPO_ROOT/crates/spec/ndn-security/src/trust_schema.rs" \
     | grep -q "UserFunctionsNotSupported"; then
     echo "ok: from_lvs_binary returns UserFunctionsNotSupported"
 else

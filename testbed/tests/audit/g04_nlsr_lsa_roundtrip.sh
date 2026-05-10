@@ -20,7 +20,7 @@ cd "$REPO_ROOT"
 fail=0
 
 # 1. Verify the roundtrip test module exists in the source.
-if grep -rq 'mod roundtrip' crates/protocols/ndn-routing/src/protocols/nlsr/lsa/mod.rs 2>/dev/null; then
+if grep -rq 'mod roundtrip' crates/spec/ndn-routing/src/protocols/nlsr/lsa/mod.rs 2>/dev/null; then
     echo "ok: roundtrip test module present in lsa/mod.rs"
 else
     echo "FAIL: roundtrip test module not found in lsa/mod.rs"
