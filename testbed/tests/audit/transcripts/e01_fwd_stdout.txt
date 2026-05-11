@@ -1,0 +1,2 @@
+2026-05-11T00:02:10.743902Z  WARN engine: NOTICE: ndn-rs is primarily AI-authored and not yet proven spec-compliant. See docs/notes/spec-compliance-audit-2026-04-20.md and testbed/EXPECTED_FAILURES.md for known issues. Do not use as a reference implementation of NDN.
+2026-05-11T00:02:10.745351Z  WARN security: no [security] identity configured — using ephemeral in-memory key; add `identity = "/your/name"` to the [security] config to persist signing ephemeral_identity=/ndn-fwd/pid-75412

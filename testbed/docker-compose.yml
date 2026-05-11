@@ -251,6 +251,8 @@ services:
       context: ..
       dockerfile: binaries/spec/ndn-fwd/Dockerfile
     container_name: ndn-fwd-nlsr
+    environment:
+      RUST_LOG: "info"
     hostname: ndn-fwd-nlsr
     networks:
       ndn-net:

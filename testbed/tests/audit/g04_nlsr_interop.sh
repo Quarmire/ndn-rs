@@ -149,12 +149,17 @@ while [[ $ELAPSED -lt $TIMEOUT ]]; do
         RS_SEES_CXX=1
     fi
 
-    # C++ NLSR side: query routing table for ndn-rs prefix.
-    # nlsrc subcommand is "routing" (not "status routingtable").
-    if docker exec nlsr-cxx \
+    # C++ NLSR side: NLSR's `nlsrc routing` only lists router-level
+    # destinations.  The actual name-prefix install happens via NLSR's
+    # NPT → NFD RIB: NLSR registers each NameLSA prefix in NFD's RIB
+    # under origin=nlsr (see NLSR/src/nfd-rib-commands.cpp).  So the
+    # authoritative check that nlsr-cxx has internalised our NameLSA is
+    # `nfdc route list` showing `/test/r2/data` with `origin=nlsr`.
+    if docker exec nfd-nlsr \
             env NDN_CLIENT_TRANSPORT=unix:///run/nfd-nlsr/nfd.sock \
-            nlsrc routing 2>/dev/null \
-            | grep -qF "$NDN_FWD_NLSR_PREFIX"; then
+            nfdc route list 2>/dev/null \
+            | grep -F "prefix=$NDN_FWD_NLSR_PREFIX" \
+            | grep -q "origin=nlsr"; then
         CXX_SEES_RS=1
     fi
 

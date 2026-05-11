@@ -1,0 +1,6 @@
+✓ 200 OK
+  name:      /dev/test
+  face-id:   1
+  cost:      10
+  origin:    app (0)
+  flags:     child-inherit (0x1)
