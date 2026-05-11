@@ -76,6 +76,22 @@ multiplexing key, two replayed signed Interests would otherwise
 silently coalesce into one PIT entry. Treat the guard as a
 structural prerequisite of the universal-strip choice.
 
+**Wired by default.** `EngineBuilder::build()` populates the
+guard from `EngineConfig.replay_guard`. The default
+(`ReplayGuardConfig::default()`) is `enabled: true,
+per_key_capacity: 64, monotonic: false`. `monotonic = false` is
+the safe default — legitimate signed-Interest emitters re-attach
+after clock skew, device sleep, or process restart, and enforcing
+monotonic timestamps at the engine level would reject those.
+
+Opt-in to monotonic floors:
+`EngineBuilder::new(EngineConfig { replay_guard: ReplayGuardConfig::monotonic(), .. })`.
+Disable entirely (test-only): `EngineBuilder::replay_guard_disabled()`.
+
+The doctrine witness is
+`builder::tests::default_build_has_replay_guard_active` in
+`crates/spec/ndn-engine/src/builder.rs`.
+
 ## Future work
 
 - **Secondary-index PIT** — a localised redesign that restores

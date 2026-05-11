@@ -182,8 +182,15 @@ are recorded in
 - **Replay guard is the integrity floor.** Once PSDC is no longer
   a multiplexing key, the `ndn_security::ReplayGuard` (per-key
   nonce/timestamp/seq-num LRU) is structurally required to prevent
-  replayed signed Interests from coalescing into one PIT entry. It
-  is wired into `PitCheckStage` and is not optional in production.
+  replayed signed Interests from coalescing into one PIT entry.
+  `EngineBuilder::build()` wires it by default
+  (`ReplayGuardConfig::default()` is `enabled, per_key_capacity=64,
+  monotonic=false`).  `monotonic=false` is the safe default because
+  legitimate signed-Interest emitters re-attach after clock skew,
+  device sleep, or process restart; hardened deployments can opt
+  into `ReplayGuardConfig::monotonic()`.  Disabling the guard via
+  `EngineBuilder::replay_guard_disabled()` is a test-only escape
+  hatch.
 
 ## Task Topology
 
