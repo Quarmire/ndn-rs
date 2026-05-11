@@ -1,0 +1,3 @@
+Prefix  Strategy
+────────────────────────────────────────
+/       /localhost/nfd/strategy/best-route/v=5

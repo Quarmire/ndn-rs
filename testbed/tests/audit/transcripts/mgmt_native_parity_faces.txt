@@ -1,0 +1,10 @@
+faceid=3  ?  on-demand  local  point-to-point
+  remote: internal://management
+  local:  unix:///var/folders/yc/ptyz21hs0lnfxrc3ybqdg9q40000gn/T/tmp.0OOqzikweA/ndn-fwd.sock
+  in:  interests=1  data=0  nacks=0  bytes=45 B
+  out: interests=0  data=0  nacks=0  bytes=0 B
+
+faceid=1  ?  on-demand  local  point-to-point
+  remote: internal://app
+  in:  interests=0  data=1  nacks=0  bytes=114 B
+  out: interests=2  data=0  nacks=0  bytes=94 B
