@@ -1,6 +1,6 @@
-[2m2026-05-11T14:29:40.497062Z[0m [32m INFO[0m strict-mgmt-validation: starting [3msocket[0m[2m=[0m/var/folders/yc/ptyz21hs0lnfxrc3ybqdg9q40000gn/T/tmp.BmzuMSCDsp/ndn-fwd.sock [3mpib[0m[2m=[0m/var/folders/yc/ptyz21hs0lnfxrc3ybqdg9q40000gn/T/tmp.BmzuMSCDsp/pib
-[2m2026-05-11T14:29:40.497485Z[0m [32m INFO[0m loaded trust anchors from PIB [3mcount[0m[2m=[0m1
-[2m2026-05-11T14:29:40.497555Z[0m [32m INFO[0m installing trust anchor [3manchor[0m[2m=[0m/test/strict-trust-router/KEY/self
-[2m2026-05-11T14:29:40.497699Z[0m [32m INFO[0m connected to ndn-fwd mgmt socket
-[2m2026-05-11T14:29:40.498467Z[0m [32m INFO[0m received response Data [3mname[0m[2m=[0m/localhost/nfd/status/general/params-sha256=ad61fa4518228f80594c833c127ca79779c233fe3363639ec0ddfcc9227bb5c6
-[2m2026-05-11T14:29:40.498860Z[0m [32m INFO[0m VALID — signature verifies under the daemon's trust anchor [3mname[0m[2m=[0m/localhost/nfd/status/general/params-sha256=ad61fa4518228f80594c833c127ca79779c233fe3363639ec0ddfcc9227bb5c6 [3msig_type[0m[2m=[0mSome(SignatureEd25519)
+[2m2026-05-11T14:42:32.320217Z[0m [32m INFO[0m strict-mgmt-validation: starting [3msocket[0m[2m=[0m/var/folders/yc/ptyz21hs0lnfxrc3ybqdg9q40000gn/T/tmp.228bwuKkyT/ndn-fwd.sock [3mpib[0m[2m=[0m/var/folders/yc/ptyz21hs0lnfxrc3ybqdg9q40000gn/T/tmp.228bwuKkyT/pib
+[2m2026-05-11T14:42:32.320621Z[0m [32m INFO[0m loaded trust anchors from PIB [3mcount[0m[2m=[0m1
+[2m2026-05-11T14:42:32.320715Z[0m [32m INFO[0m installing trust anchor [3manchor[0m[2m=[0m/test/strict-trust-router/KEY/self
+[2m2026-05-11T14:42:32.320874Z[0m [32m INFO[0m connected to ndn-fwd mgmt socket
+[2m2026-05-11T14:42:32.323293Z[0m [32m INFO[0m received response Data [3mname[0m[2m=[0m/localhost/nfd/status/general/params-sha256=b6fe0fcdd8bbdc06ee9b8237c577b7f17cabc1ddfdca0440ac1abf324bd96d27
+[2m2026-05-11T14:42:32.326517Z[0m [32m INFO[0m VALID — signature verifies under the daemon's trust anchor [3mname[0m[2m=[0m/localhost/nfd/status/general/params-sha256=b6fe0fcdd8bbdc06ee9b8237c577b7f17cabc1ddfdca0440ac1abf324bd96d27 [3msig_type[0m[2m=[0mSome(SignatureSha256WithEcdsa)

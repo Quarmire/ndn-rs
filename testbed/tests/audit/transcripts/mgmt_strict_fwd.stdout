@@ -1,1 +1,1 @@
-2026-05-11T14:29:39.151652Z  WARN engine: NOTICE: ndn-rs is primarily AI-authored and not yet proven spec-compliant. See docs/notes/spec-compliance-audit-2026-04-20.md and testbed/EXPECTED_FAILURES.md for known issues. Do not use as a reference implementation of NDN.
+2026-05-11T14:42:30.910291Z  WARN engine: NOTICE: ndn-rs is primarily AI-authored and not yet proven spec-compliant. See docs/notes/spec-compliance-audit-2026-04-20.md and testbed/EXPECTED_FAILURES.md for known issues. Do not use as a reference implementation of NDN.

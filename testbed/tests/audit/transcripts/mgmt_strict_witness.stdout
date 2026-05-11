@@ -1,1 +1,1 @@
-PASS: mgmt response /localhost/nfd/status/general validates against trust anchor /test/strict-trust-router/KEY/self (sig_type=Some(SignatureEd25519))
+PASS: mgmt response /localhost/nfd/status/general validates against trust anchor /test/strict-trust-router/KEY/self (sig_type=Some(SignatureSha256WithEcdsa))
