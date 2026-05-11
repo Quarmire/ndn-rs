@@ -131,17 +131,34 @@ second response, proving:
   Data — but since each origin gets its own SharedWorker, this
   affects only that origin's tabs. Cross-origin tabs run
   independent engines.
-- The wasm engine doesn't validate signatures
-  (`ValidationStage::disabled`); applications that require
-  signature verification must layer it on top (see NDF's
-  composition pipeline as a reference). Without app-layer
-  validation, a peer face can inject any byte sequence and the
-  engine will route it.
-- WebRTC peering doesn't yet plug into the wasm engine's face
-  table — the worker entrypoint accepts `WorkerPortFace`s only.
-  Phase-5's `WebRtcFace` works tab-side but isn't yet
-  integrated into the worker's face graph; that wiring is a
-  follow-on (browser-as-transit witness deferred).
+- The wasm engine now supports a real [`Validator`]: pass one to
+  [`WasmEngineBuilder::with_validator`] (the worker entrypoint
+  seeds one from `IdbPib::build_validator` at startup).  When no
+  validator is passed the engine runs permissive (every Data
+  marked verified) — apps that need verification either install
+  one at engine build time or layer their own at the app tier.
+- WebRTC peering can't be owned by the SharedWorker directly —
+  `RTCPeerConnection` is not exposed in `WorkerGlobalScope` per
+  W3C.  The practical pattern is a **tab-side bridge**: a tab
+  owns the `RTCPeerConnection` (and an [`ndn-face-webrtc`]
+  `WebRtcFace`), connects to the per-origin SharedWorker via a
+  [`SharedWorkerProxyFace`], and pumps bytes between the two
+  faces.  The worker then treats the bridge tab like any other
+  tab — its `WorkerPortFace` shows up in the engine's face graph
+  and FIB routes apply normally.  Sketch in
+  [`crates/extension/ndn-face-webrtc/docs/worker-bridge.md`].
+
+## Discovery on wasm
+
+Link-layer multicast hello has no direct browser-tier analogue
+(no UDP multicast, no L2).  Within an origin, every tab joins the
+same SharedWorker — discovery is moot.  Across origins inside the
+same browser, a future `BroadcastChannelDiscovery` impl could
+serve as a hello-equivalent (origin-local but cross-tab).
+Cross-host peering uses WebRTC, where discovery is the signaling
+channel's job, not the engine's.  Today the wasm engine ships
+`NoDiscovery` only — see the candidate design at
+[`docs/notes/wasm-discovery.md`].
 
 ## Wiring (sketch)
 
