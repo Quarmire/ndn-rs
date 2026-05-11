@@ -83,51 +83,128 @@ const CR_TYPE = 0x65;
 const CR_STATUS_CODE = 0x66;
 const CR_STATUS_TEXT = 0x67;
 
-test('wasm engine answers /localhost/nfd/status/general with a 200 ControlResponse', async ({
-  browser,
-}) => {
-  const ctx = await browser.newContext();
-  const tab = await ctx.newPage();
-  tab.on('console', (m) => console.log('[tab]', m.type(), m.text()));
+// NFD dataset entry envelopes — every status dataset entry is wrapped
+// in a generic type-0x80 TLV (`FaceStatus`, `FibEntry`, `RibEntry`,
+// `StrategyChoice` all share the same outer type).
+const DATASET_ENTRY = 0x80;
 
-  await tab.goto(TAB_URL);
-  await tab.waitForFunction(() => (window as any).__sharedReady === true, null, {
-    timeout: 15_000,
+async function expressContent(tab: any, name: string, timeoutMs = 3000): Promise<Uint8Array> {
+  const content: number[] = await tab.evaluate(
+    async ({ name, timeoutMs }: { name: string; timeoutMs: number }) => {
+      const arr: Uint8Array = await (window as any).__sharedClient.express_interest(
+        name,
+        timeoutMs,
+      );
+      return Array.from(arr);
+    },
+    { name, timeoutMs },
+  );
+  return new Uint8Array(content);
+}
+
+test.describe('wasm engine — NFD management surface', () => {
+  test.beforeEach(async ({ page }) => {
+    page.on('console', (m) => console.log('[tab]', m.type(), m.text()));
+    await page.goto(TAB_URL);
+    await page.waitForFunction(() => (window as any).__sharedReady === true, null, {
+      timeout: 15_000,
+    });
   });
 
-  // Express the management Interest and pull back the Data content bytes.
-  // SharedClient.express_interest resolves to the Data's `content` field —
-  // for an NFD ControlResponse this is the encoded TLV (type 0x65).
-  const content: number[] = await tab.evaluate(async () => {
-    const arr: Uint8Array = await (window as any).__sharedClient.express_interest(
-      '/localhost/nfd/status/general',
-      3000,
-    );
-    return Array.from(arr);
+  test('status/general → 200 ControlResponse with faces/fib/pit/cs counters', async ({
+    page,
+  }) => {
+    const bytes = await expressContent(page, '/localhost/nfd/status/general');
+    expect(bytes.length, 'ControlResponse content must be non-empty').toBeGreaterThan(0);
+
+    const { tlv: outer } = decodeTlv(bytes, 0);
+    expect(outer.type, 'top-level type must be ControlResponse (0x65)').toBe(CR_TYPE);
+
+    const children = readChildren(outer.value);
+    const sc = children.find((c) => c.type === CR_STATUS_CODE);
+    const st = children.find((c) => c.type === CR_STATUS_TEXT);
+    expect(sc, 'StatusCode TLV must be present').toBeDefined();
+    expect(st, 'StatusText TLV must be present').toBeDefined();
+
+    expect(readNni(sc!.value), 'status/general must return 200 OK').toBe(200);
+
+    const text = new TextDecoder().decode(st!.value);
+    console.log('[witness] status/general text:', text);
+    expect(text, 'StatusText must report faces= counter').toMatch(/^faces=\d+ /);
+    expect(text, 'StatusText must include fib= counter').toMatch(/fib=\d+/);
+    expect(text, 'StatusText must include pit= counter').toMatch(/pit=\d+/);
+    expect(text, 'StatusText must include cs= counter').toMatch(/cs=\d+/);
   });
-  const bytes = new Uint8Array(content);
 
-  expect(bytes.length, 'ControlResponse content must be non-empty').toBeGreaterThan(0);
+  test('faces/list dataset enumerates the engine\'s faces', async ({ page }) => {
+    const bytes = await expressContent(page, '/localhost/nfd/faces/list');
+    expect(bytes.length, 'faces/list dataset content must be non-empty').toBeGreaterThan(0);
 
-  // Outer envelope is type 0x65 (ControlResponse).
-  const { tlv: outer } = decodeTlv(bytes, 0);
-  expect(outer.type, 'top-level type must be ControlResponse (0x65)').toBe(CR_TYPE);
+    const entries = readChildren(bytes);
+    expect(
+      entries.length,
+      'dataset must contain at least the mgmt face + the worker port face',
+    ).toBeGreaterThanOrEqual(2);
+    for (const e of entries) {
+      expect(e.type, 'every faces/list entry must be FaceStatus (0x80)').toBe(DATASET_ENTRY);
+    }
+    console.log(`[witness] faces/list: ${entries.length} entries`);
+  });
 
-  // Pull StatusCode + StatusText out of the children.
-  const children = readChildren(outer.value);
-  const sc = children.find((c) => c.type === CR_STATUS_CODE);
-  const st = children.find((c) => c.type === CR_STATUS_TEXT);
-  expect(sc, 'StatusCode TLV must be present').toBeDefined();
-  expect(st, 'StatusText TLV must be present').toBeDefined();
+  test('fib/list dataset includes the management prefix', async ({ page }) => {
+    const bytes = await expressContent(page, '/localhost/nfd/fib/list');
+    expect(bytes.length, 'fib/list dataset content must be non-empty').toBeGreaterThan(0);
 
-  expect(readNni(sc!.value), 'status/general must return 200 OK').toBe(200);
+    const entries = readChildren(bytes);
+    expect(entries.length, 'FIB must have at least /localhost/nfd + /localhop/nfd').toBeGreaterThanOrEqual(2);
+    for (const e of entries) {
+      expect(e.type, 'every fib/list entry must be FibEntry (0x80)').toBe(DATASET_ENTRY);
+    }
 
-  const text = new TextDecoder().decode(st!.value);
-  console.log('[witness] status/general text:', text);
-  expect(text, 'StatusText must report faces= counter').toMatch(/^faces=\d+ /);
-  expect(text, 'StatusText must include fib= counter').toMatch(/fib=\d+/);
-  expect(text, 'StatusText must include pit= counter').toMatch(/pit=\d+/);
-  expect(text, 'StatusText must include cs= counter').toMatch(/cs=\d+/);
+    // The mgmt face must be reachable via `/localhost/nfd` somewhere
+    // in the FIB — search for the ASCII literal in any entry.
+    const haystack = new TextDecoder('utf-8', { fatal: false }).decode(bytes);
+    expect(haystack, 'FIB must contain /localhost/nfd').toContain('localhost');
+    expect(haystack, 'FIB must contain /localhop/nfd').toContain('localhop');
+    console.log(`[witness] fib/list: ${entries.length} entries`);
+  });
 
-  await ctx.close();
+  test('rib/list dataset is well-formed (possibly empty)', async ({ page }) => {
+    const bytes = await expressContent(page, '/localhost/nfd/rib/list');
+    // An empty RIB still produces a valid dataset Data with empty content.
+    // Either way, every entry present must be a RibEntry (0x80).
+    const entries = readChildren(bytes);
+    for (const e of entries) {
+      expect(e.type, 'every rib/list entry must be RibEntry (0x80)').toBe(DATASET_ENTRY);
+    }
+    console.log(`[witness] rib/list: ${entries.length} entries`);
+  });
+
+  test('strategy-choice/list dataset enumerates installed strategies', async ({ page }) => {
+    const bytes = await expressContent(page, '/localhost/nfd/strategy-choice/list');
+    expect(bytes.length, 'strategy-choice/list dataset content must be non-empty').toBeGreaterThan(0);
+
+    const entries = readChildren(bytes);
+    expect(entries.length, 'strategy-choice/list must have at least the root default').toBeGreaterThanOrEqual(1);
+    for (const e of entries) {
+      expect(e.type, 'every strategy-choice entry must be 0x80').toBe(DATASET_ENTRY);
+    }
+    console.log(`[witness] strategy-choice/list: ${entries.length} entries`);
+  });
+
+  test('extended modules are auth-gated (no anchors → 403)', async ({ page }) => {
+    // ndn-rs-only modules (routing/discovery/service/security/neighbors)
+    // unconditionally require signed commands per audit E.03 — see
+    // `is_extended_module` in ndn-mgmt. With no validator wired on the
+    // demo's wasm engine the auth gate returns 403 before the wasm
+    // NOT_IMPLEMENTED arm is reached. Witnessing 403 confirms the
+    // fail-secure policy is intact in the browser dispatcher.
+    const bytes = await expressContent(page, '/localhost/nfd/routing/list');
+    const { tlv: outer } = decodeTlv(bytes, 0);
+    expect(outer.type, 'auth-rejected response is still a ControlResponse').toBe(CR_TYPE);
+    const children = readChildren(outer.value);
+    const sc = children.find((c) => c.type === CR_STATUS_CODE);
+    expect(sc, 'StatusCode TLV must be present').toBeDefined();
+    expect(readNni(sc!.value), 'unsigned extended-module command must be 403 UNAUTHORIZED').toBe(403);
+  });
 });
