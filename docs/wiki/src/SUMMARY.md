@@ -90,6 +90,7 @@
 
 - [API Overview](./api/overview.md)
 - [Spec Compliance](./reference/spec-compliance.md)
+- [PIT Substrate Doctrine](./reference/pit-substrate-doctrine.md)
 - [Forwarder Comparison](./reference/forwarder-comparison.md)
 - [BLAKE3 Signature Types](./reference/blake3-signature-spec.md)
 - [Interop Test Results](./reference/interop-results.md)

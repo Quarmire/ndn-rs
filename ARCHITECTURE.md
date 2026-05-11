@@ -149,10 +149,41 @@ Data:     FaceCheck → TlvDecode → PitMatch  → Validation → CsInsert → 
 ## Core Data Structures
 
 - **FIB** — `NameTrie` with per-node `RwLock`; concurrent longest-prefix match
-- **PIT** — `DashMap<PitToken, PitEntry>`; sharded, no global lock on hot path; entries optionally carry `PersistentState` for subscription-mode Interests
+- **PIT** — `DashMap<PitToken, PitEntry>`; sharded, no global lock on hot path; PIT key tuple is `(LogicalName, ForwardingHint, PitKeyDiscriminator)` where the discriminator separates classical from persistent-attach entries (see substrate doctrine below)
 - **Content Store** — trait-based; `LruCs` (in-memory), `ShardedCs` (parallel), `FjallCs` (disk)
 - **Strategy Table** — name trie mapping prefixes to `Arc<dyn Strategy>`
 - **SubscriptionRequest** — `ndn-packet` sub-TLV (type `0x230`) inside `ApplicationParameters`; enables persistent Interests that survive multiple Data deliveries; degrades gracefully on unsigned or unvalidated Interests
+
+### PIT substrate-extension doctrine
+
+ndn-rs deliberately diverges from NFD-spec PIT semantics on three
+points to support NDF SparkStream persistent-attach. The decisions
+are recorded in
+[`docs/notes/substrate-extension-pit-doctrine-2026-05-11.md`](docs/notes/substrate-extension-pit-doctrine-2026-05-11.md).
+
+- **Universal strip-at-insert.** PIT and CS keys remove a trailing
+  `ParametersSha256DigestComponent` (`0x02`) or
+  `ImplicitSha256DigestComponent` (`0x01`) symmetrically on both
+  sides. PSDC is *not* a multiplexing key in ndn-rs. Future
+  signed-Interest RPC patterns must disambiguate concurrent calls
+  via a request-id-class name component, not via
+  `ApplicationParameters` digest. All current callers (`MgmtClient`,
+  NDNCERT) already comply.
+- **Marker gates persistence only.** `SubscriptionRequest` is the
+  substrate marker. It installs `PersistentState` on the in-record
+  and routes the entry through `PitKeyDiscriminator::PersistentAttach`,
+  so marker-bearing and non-marker Interests at the same logical
+  name occupy distinct entries. The marker does not gate
+  strip-at-insert (which is universal).
+- **Per-`InRecord` credit.** `PersistentState` lives on each
+  `InRecord`, not on the entry. Each subscriber owns its own
+  credit pool, deadline, and lifecycle. Trust-model consequence:
+  revocation, expiry, and ACL evaluation are per-subscriber.
+- **Replay guard is the integrity floor.** Once PSDC is no longer
+  a multiplexing key, the `ndn_security::ReplayGuard` (per-key
+  nonce/timestamp/seq-num LRU) is structurally required to prevent
+  replayed signed Interests from coalescing into one PIT entry. It
+  is wired into `PitCheckStage` and is not optional in production.
 
 ## Task Topology
 
