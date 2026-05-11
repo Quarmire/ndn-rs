@@ -76,8 +76,9 @@ multiplexing key, two replayed signed Interests would otherwise
 silently coalesce into one PIT entry. Treat the guard as a
 structural prerequisite of the universal-strip choice.
 
-**Wired by default.** `EngineBuilder::build()` populates the
-guard from `EngineConfig.replay_guard`. The default
+**Wired by default, native and wasm.** Both `EngineBuilder::build()`
+and `WasmEngineBuilder::build()` populate the guard from their
+respective config. The default
 (`ReplayGuardConfig::default()`) is `enabled: true,
 per_key_capacity: 64, monotonic: false`. `monotonic = false` is
 the safe default — legitimate signed-Interest emitters re-attach
