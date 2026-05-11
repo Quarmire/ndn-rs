@@ -147,8 +147,15 @@ services:
         ipv4_address: 172.30.0.14
     volumes:
       - ./configs/nfd-nlsr/nfd.conf:/etc/ndn/nfd.conf:ro
+      - ./configs/nfd-nlsr/entrypoint.sh:/entrypoint.sh:ro
       - nfd-nlsr-sock:/run/nfd-nlsr
-    command: ["nfd", "--config", "/etc/ndn/nfd.conf"]
+    # Override the image ENTRYPOINT so we can start nfd, wait for its
+    # socket, and run the nfdc bootstrap that pre-registers the outbound
+    # UDP face + route to ndn-fwd-nlsr before nlsr-cxx tries to peer.
+    # The `nlsr:latest` image doesn't ship nfdc, so the bootstrap has
+    # to live in the NFD container.  See configs/nfd-nlsr/entrypoint.sh.
+    entrypoint: ["/bin/bash", "/entrypoint.sh"]
+    command: []
     healthcheck:
       test: ["CMD-SHELL", "NDN_CLIENT_TRANSPORT=unix:///run/nfd-nlsr/nfd.sock nfdc status 2>/dev/null | grep -q 'uptime' || exit 1"]
       interval: 5s

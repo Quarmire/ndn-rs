@@ -221,21 +221,32 @@ jobs:
       - name: Run g04 NLSR interop witness
         id: g04
         timeout-minutes: 10
-        # KNOWN-OPEN — the witness reliably gets ndn-fwd-nlsr's side of
-        # the Hello adjacency to Active but nlsr-cxx's bootstrap of the
-        # outbound UDP face + neighbor route (the path that should be
-        # set up automatically from the `neighbor { face-uri ... }`
-        # block in nlsr.conf) does not fire against the current
-        # `ghcr.io/named-data/nlsr:latest` image.  Without that
-        # neighbor route on nfd-nlsr's side, nlsr-cxx's own Hellos go
-        # NoRoute and full LSA convergence stalls.
+        # KNOWN-OPEN — bidirectional Hello adjacency now forms (both
+        # sides build their own NameLSA + AdjacencyLSA), but PSync
+        # sync updates aren't propagating the LSAs between routers,
+        # so the routing tables stay empty.
         #
-        # Treat as soft-fail until a manual face/route bootstrap is
-        # added to the nlsr-cxx entrypoint or the upstream image lands
-        # an automatic-bootstrap fix.  The PSync MustBeFresh fix in
-        # commit bae2037 closed one half of the symptom (Hello +
-        # one-way adjacency now work); the remaining half is tracked
-        # in the witness script's diagnostic checklist.
+        # Closed so far:
+        #   - `nfdc face create + route add` bootstrap for the
+        #     neighbor link, done from the nfd-nlsr entrypoint (see
+        #     testbed/configs/nfd-nlsr/entrypoint.sh) — works around
+        #     the chicken-and-egg where the published `nlsr:latest`
+        #     image's neighbor bootstrap fires only after the first
+        #     Hello, which itself NoRoutes without an existing route.
+        #   - PSync sync Interest MustBeFresh (commit bae2037) — stops
+        #     intermediate NFDs from serving stale cached sync Data.
+        #
+        # Still open:
+        #   - LSA propagation: ndn-rs's NLSR runs the PSync update
+        #     receive loop, but neither side appears to either install
+        #     the remote LSA (when sync update carries mapping bytes)
+        #     nor send the LSA-fetch Interest (when the update doesn't).
+        #     Likely in crates/spec/ndn-routing/src/protocols/nlsr/
+        #     sync.rs — the sync_loop receive path or the lsa_io_task
+        #     dispatcher.
+        #
+        # Soft-fail until LSA propagation lands; the witness still
+        # runs so the partial-convergence regression check fires.
         continue-on-error: true
         run: bash testbed/tests/audit/g04_nlsr_interop.sh
 
