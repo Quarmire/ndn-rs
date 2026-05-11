@@ -192,6 +192,55 @@ test.describe('wasm engine — NFD management surface', () => {
     console.log(`[witness] strategy-choice/list: ${entries.length} entries`);
   });
 
+  test('mgmt response is signed with a real key, not DigestSha256', async ({ page }) => {
+    // worker_main sets up an ephemeral Ed25519 signer when IdbPib
+    // has no SafeBag (mirrors ndn-fwd's make_ephemeral). The wasm
+    // engine threads it into ndn_mgmt::MgmtHandles.command_response_signer
+    // so every mgmt response Data carries a real SignatureInfo +
+    // KeyLocator pointing at the engine's identity key.
+    const wire: number[] = await page.evaluate(async () => {
+      const arr: Uint8Array = await (window as any).__sharedClient.express_interest_wire(
+        '/localhost/nfd/status/general',
+        3000,
+      );
+      return Array.from(arr);
+    });
+    const buf = new Uint8Array(wire);
+
+    // Walk Data children, find SignatureInfo (0x16).
+    const data = decodeTlv(buf, 0);
+    expect(data.tlv.type, 'wire must be Data (0x06)').toBe(0x06);
+    let sigInfo: Tlv | null = null;
+    let off = 0;
+    while (off < data.tlv.value.length) {
+      const { tlv, next } = decodeTlv(data.tlv.value, off);
+      if (tlv.type === 0x16) {
+        sigInfo = tlv;
+        break;
+      }
+      off = next;
+    }
+    expect(sigInfo, 'Data must carry SignatureInfo').not.toBeNull();
+
+    let sigType: number | null = null;
+    let keyLocatorPresent = false;
+    let s = 0;
+    while (s < sigInfo!.value.length) {
+      const { tlv, next } = decodeTlv(sigInfo!.value, s);
+      if (tlv.type === 0x1b) {
+        sigType = readNni(tlv.value);
+      } else if (tlv.type === 0x1c) {
+        keyLocatorPresent = true;
+      }
+      s = next;
+    }
+    console.log(
+      `[witness] wasm engine response SignatureType=${sigType} (1=RSA / 3=ECDSA / 5=Ed25519)`,
+    );
+    expect(sigType, 'wasm mgmt response must NOT use DigestSha256 (audit N.12)').not.toBe(0);
+    expect(keyLocatorPresent, 'real signature must carry KeyLocator').toBe(true);
+  });
+
   test('extended modules are auth-gated (no anchors → 403)', async ({ page }) => {
     // ndn-rs-only modules (routing/discovery/service/security/neighbors)
     // unconditionally require signed commands per audit E.03 — see

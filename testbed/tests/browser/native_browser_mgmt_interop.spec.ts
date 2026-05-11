@@ -227,16 +227,51 @@ level = "warn"
     const data = readTlv(dataWire, 0);
     expect(data.type, 'top-level type must be Data (0x06)').toBe(0x06);
     let content: Uint8Array | null = null;
+    let sigInfo: Uint8Array | null = null;
     let off = data.valOff;
     while (off < data.end) {
       const t = readTlv(dataWire, off);
       if (t.type === 0x15) {
         content = dataWire.subarray(t.valOff, t.end);
-        break;
+      } else if (t.type === 0x16) {
+        // SignatureInfo (NDN packet format § Data).
+        sigInfo = dataWire.subarray(t.valOff, t.end);
       }
       off = t.end;
     }
     expect(content, 'Data must carry Content').not.toBeNull();
+
+    // ── N.12 — mgmt response must carry a real SignatureInfo with a
+    // non-DigestSha256 SignatureType.  ndn-fwd's load_security ran
+    // SecurityManager::auto_init, generating an Ed25519 identity;
+    // mount_management pulled that signer through MgmtHandles and
+    // ndn_mgmt::build_mgmt_response_wire called DataBuilder::sign_sync.
+    expect(sigInfo, 'Data must carry SignatureInfo').not.toBeNull();
+    let sigType: number | null = null;
+    let keyLocatorPresent = false;
+    let soff = 0;
+    while (soff < sigInfo!.length) {
+      const t = readTlv(sigInfo!, soff);
+      if (t.type === 0x1b) {
+        // SignatureType (NNI).
+        let v = 0;
+        for (const b of sigInfo!.subarray(t.valOff, t.end)) v = v * 256 + b;
+        sigType = v;
+      } else if (t.type === 0x1c) {
+        // KeyLocator.
+        keyLocatorPresent = true;
+      }
+      soff = t.end;
+    }
+    expect(sigType, 'SignatureInfo must carry SignatureType').not.toBeNull();
+    // 0 = DigestSha256 (the legacy fallback we're moving off of).
+    // 1 = SignatureSha256WithRsa, 3 = SignatureSha256WithEcdsa,
+    // 5 = SignatureEd25519, 6 = SignatureBlake3, 7 = SignatureSha256WithBlake3.
+    expect(sigType, 'mgmt response must NOT use DigestSha256 (audit N.12)').not.toBe(0);
+    expect(keyLocatorPresent, 'real signature must carry KeyLocator').toBe(true);
+    console.log(
+      `[witness] response signed with SignatureType=${sigType} (1=RSA / 3=ECDSA / 5=Ed25519)`,
+    );
 
     // ControlResponse (0x65).
     const cr = readTlv(content!, 0);
