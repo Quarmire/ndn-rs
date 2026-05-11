@@ -1,4 +1,4 @@
 Prefix          FaceID    Cost
 ──────────────────────────────
-/localhop/nfd        1       0
 /localhost/nfd       1       0
+/localhop/nfd        1       0

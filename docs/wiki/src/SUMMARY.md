@@ -14,6 +14,7 @@
 - [NDN Overview](./concepts/ndn-overview.md)
 - [Interest/Data Lifecycle](./concepts/interest-data-lifecycle.md)
 - [PIT, FIB, and Content Store](./concepts/pit-fib-cs.md)
+- [Identity, Keys, and SafeBags](./concepts/identity-and-keys.md)
 - [Glossary](./concepts/glossary.md)
 
 # Application Development
