@@ -1,0 +1,44 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>WebRTC ↔ SharedWorker bridge fixture</title>
+</head>
+<body>
+  <p>WebRTC ↔ SharedWorker bridge fixture — drives `TransitBridge`
+  from Playwright.</p>
+  <pre id="log"></pre>
+  <script src="/sw-pkg/shared_engine.js"></script>
+  <script>
+    function log(msg) {
+      const el = document.getElementById('log');
+      el.textContent += msg + '\n';
+      console.log('[bridge-tab]', msg);
+    }
+    // Mirror SharedWorker console via BroadcastChannel so the witness
+    // can see worker_main diagnostics inline.
+    try {
+      const bc = new BroadcastChannel('worker-log');
+      bc.onmessage = (e) => {
+        const { level = 'log', text = '' } = e.data || {};
+        console[level === 'error' ? 'error' : 'log']('[worker]', text);
+      };
+    } catch {}
+    (async () => {
+      await wasm_bindgen('/sw-pkg/shared_engine_bg.wasm');
+      const { TransitBridge } = wasm_bindgen;
+      // Use the same worker name pattern as `shared-worker-tab.html`
+      // so both fixtures join the *same* SharedWorker instance.  The
+      // worker's `producers=` parameter pre-registers `/cache-test` so
+      // an Interest from the peer through the bridge reaches it.
+      const workerName = 'producers=%2Fcache-test';
+      window.__bridge = new TransitBridge('/shared-worker.js', workerName);
+      log('TransitBridge ready (connected to per-origin SharedWorker)');
+      window.__bridgeReady = true;
+    })().catch((e) => {
+      log('FATAL: ' + (e?.message ?? String(e)));
+      window.__bridgeReadyError = String(e);
+    });
+  </script>
+</body>
+</html>
