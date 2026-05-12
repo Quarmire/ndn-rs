@@ -100,7 +100,7 @@ check "nlsr_sync" \
 
 # mgmt_request — per-request enrollment task
 check "mgmt_request" \
-    "binaries/spec/ndn-fwd/src/mgmt_ndn.rs" \
+    "crates/spec/ndn-mgmt/src/lib.rs" \
     '"mgmt_request"'
 
 echo ""
