@@ -205,8 +205,9 @@ echo "Extracting PIN from CA logs …"
 PIN=""
 WAIT=0
 while [[ $WAIT -lt $PIN_TIMEOUT ]]; do
+    # BSD grep (macOS) lacks -P; use sed for the look-behind equivalent.
     PIN=$(docker logs ndncert-ca 2>&1 \
-          | grep -oP '(?<=is )\d{6}' \
+          | sed -nE 's/.*is ([0-9]{6})( |$).*/\1/p' \
           | tail -1 || true)
     if [[ -n "$PIN" ]]; then break; fi
     sleep 1

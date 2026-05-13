@@ -45,7 +45,7 @@ are not listed as open bugs. Witness paths reference scripts under
 | D | Forwarding pipeline and tables | 19 | 18 | D.16 deferred to Phase E (FIB/RIB mgmt mapping) — no forwarding-plane gap |
 | E | NFD management protocol | 8 | 8 | E.05 (live notification stream) — BLOCKED-BY-INTEROP only |
 | F | Face implementations | 13 | 12 | F.13 WebTransport listener landed (counted) — Phase F effectively closed |
-| G | Routing, discovery, sync | 9 | 9 | — Phase G closed (G.06 archived in BLOCKED-BY-INTEROP) |
+| G | Routing, discovery, sync | 9 | 9 | — Phase G closed (G.06 archived as ndn-rs extension) |
 | H | Binaries and CLI tools | 11 | 10 | H.00 is the positives header, not a finding — Phase H effectively closed |
 | I | Cross-cutting architectural misunderstandings | 14 | 14 | All cleared as of audit. |
 
@@ -639,35 +639,43 @@ testbed Docker environment.
 
 ## BLOCKED-BY-INTEROP
 
-These findings have code-level implementations but their wire-level correctness
-against a reference NDN peer is not yet confirmed by a passing interop test.
-The specific blocker for each is noted.
+These findings have code-level implementations.  This section tracks which
+ones have a passing live-peer witness against a reference NDN implementation
+versus which still rely on architecture-only witnesses.
 
-- **NDNCERT 0.3 CHALLENGE round-trip against ndncert-ca-server** (*C.13* — PENDING).
-  The ndn-rs CHALLENGE encoder is TLV; the decoder path is present. Requires
-  running the full enrollment flow against `named-data/ndncert` CA. Not currently
-  wired into `testbed/tests/interop/`.
+- **NDNCERT 0.3 CHALLENGE round-trip against `ndncert-ca-server`** (*C.13* —
+  **WITNESSED 2026-05-13**).  `testbed/tests/audit/c13_ndncert_live_interop.sh`
+  drives the full NEW → CHALLENGE pin → cert-issue flow against the upstream
+  `named-data/ndncert` CA via the `nfd-ndncert` + `ndncert-ca` containers.
+  Issued cert decodes through ndn-rs's Certificate v2 decoder; issuer chains
+  back to `/test/ndncert/CA`.  Live pcap transcript:
+  `testbed/tests/audit/transcripts/c13_ndncert_live_interop_after.pcap`.
 
-- **PSync dataset sync with a C++ PSync peer** (*G.03* — PENDING). The IBF hash
-  family is now MurmurHash3 (matching C++). A full sync exchange against
-  `named-data/PSync` has not been run. Blocker: no PSync-specific interop
-  container in the testbed.
+- **PSync dataset sync with a C++ PSync peer** (*G.03* — **architecture
+  WITNESSED**; live interop PENDING).
+  `testbed/tests/audit/g03_psync_iblt_roundtrip.sh` and
+  `g03_psync_reconcile.sh` exercise the wire-format primitives (MurmurHash3
+  IBF, BCH-shaped reconciliation) entirely in Rust.  A bidirectional live
+  sync against `named-data/PSync` would discharge the remaining live marker
+  but needs (a) a Rust `ndn-psync-consumer` CLI in `ndn-tools` and (b) a
+  cmake-built C++ `full-producer` example on the test host.
 
-- **E.05 — live management notification streams** (*E.05* — PENDING). The
-  `NotificationStream` publisher is implemented. Interop requires a live
-  `nfdc watch` subscriber or equivalent. Testbed container integration pending.
+- **Live management notification streams** (*E.05* — architecture WITNESSED;
+  live interop PENDING).  `testbed/tests/audit/e05_notification_streams.sh`
+  exits 0 today against the `NotificationStream` publisher unit tests in
+  `ndn-config`.  Live `nfdc events` subscriber interop is blocked on the
+  testclient image carrying the ndn-cxx `nfdc` binary.
 
-- **`nfdc` trust-schema validation of mgmt responses signed by ndn-rs** (*N.12* —
-  PENDING). Management responses are signed with the daemon identity. A real
-  `nfdc` client enforcing the default NFD trust schema has not been run against
-  an ndn-rs forwarder. Blocker: trust schema configuration for the testbed
-  ndn-fwd container.
+- **`nfdc` trust-schema validation of mgmt responses signed by ndn-rs**
+  (*N.12* — architecture WITNESSED; live interop PENDING).
+  `testbed/tests/audit/n12_mgmt_response_signing.sh` exits 0 today against
+  the `ndn-fwd` mgmt-response-signer unit tests (SignatureEd25519 +
+  KeyLocator).  Live `nfdc` trust-schema enforcement is blocked on the
+  testclient image carrying `nfdc` plus a configured trust anchor.
 
-- **NDN AutoConfig interop** (*G.06* — BLOCKED). ndn-rs uses SWIM-over-NDN for
-  discovery; the NDN standard is `ndn-autoconfig` (DNS-based probe/cert
-  discovery). Resolving this requires either implementing AutoConfig or clearly
-  scoping SWIM as a non-testbed extension. The present SWIM protocol does not
-  interoperate with `ndn-autoconfig` or NFD's prefix-announcement flow.
+G.06 (SWIM-over-NDN vs NDN AutoConfig) is no longer in this section — it is
+[archived](#known-non-compliant) as an ndn-rs extension rather than a
+testbed-blocked interop case.
 
 ## How to report a spec compliance issue
 
