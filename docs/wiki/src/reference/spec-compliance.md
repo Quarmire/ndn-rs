@@ -313,20 +313,29 @@ testbed Docker environment.
 > falls through to PIT + strategy + upstream forwarding.  The
 > earlier wiki summary was incorrect.
 
-> **E.07 RESOLVED 2026-05-13** — `mgmt::faces_*` now dispatches
-> `verb::UPDATE` to a `faces_update` handler.  The handler returns
-> a 200 ControlResponse for a no-op (FaceId-only) request and a 409
-> ControlResponse when the caller asks for a runtime parameter
-> ndn-rs does not yet expose (`Flags`, `Mask`, `FacePersistency`,
-> `Mtu`).  Management privilege gate matches `faces/destroy`.
-> Witness: `testbed/tests/audit/e07_faces_update_verb.sh`.
+> **E.07 RESOLVED 2026-05-13** — `mgmt::faces_*` dispatches
+> `verb::UPDATE` to a `faces_update` handler that honours NFD
+> `Flags`+`Mask` semantics: each bit set in `Mask` selects whether
+> the corresponding `Flags` bit replaces the current per-face
+> bitmap (`FaceState.flags`), and the 200 ControlResponse echoes
+> the new `Flags` value.  Without `Mask`, `Flags` is ignored.
+> Parameters ndn-rs does not yet wire up at runtime
+> (`FacePersistency`, `Mtu`) return 409 CONFLICT.  Management
+> privilege gate matches `faces/destroy`.  Witness:
+> `testbed/tests/audit/e07_faces_update_verb.sh`.
 
-> **E.08 RESOLVED 2026-05-13** — `FaceStatus` now emits `Flags`
-> (0x6c), `NSatisfiedInterests` (0x99), and `NUnsatisfiedInterests`
-> (0x9a) per ndn-cxx `tlv-nfd.hpp`.  ndn-rs does not yet expose
-> per-face flag toggles or per-face satisfaction counters, so all
-> three are emitted as zero, but the TLVs are present so `nfdc
-> face list` does not see them as absent.  Witness:
+> **E.08 RESOLVED 2026-05-13** — `FaceStatus` emits `Flags` (0x6c),
+> `NSatisfiedInterests` (0x99), and `NUnsatisfiedInterests` (0x9a)
+> per ndn-cxx `tlv-nfd.hpp` with live per-face values.  Each
+> `FaceState` carries `in_satisfied_interests` and
+> `in_unsatisfied_interests` `AtomicU64` counters: the satisfied
+> counter is bumped in `dispatcher/outbound.rs::satisfy` for every
+> downstream face the matched Data is sent to, and the unsatisfied
+> counter is bumped in `run_expiry_task` for every in-face on a
+> timed-out PIT entry.  `FaceState.flags` carries the NFD
+> `FaceFlagBit` bitmap: bit 0 (LocalFieldsEnabled) auto-set for
+> local-scope faces, bit 1 (LpReliabilityEnabled) auto-set when
+> `face-net` reliability is wired up.  Witness:
 > `testbed/tests/audit/e08_face_status_flags.sh`.
 
 > **F.02 RESOLVED 2026-05-12** — `MulticastUdpFace::ndn_default` now

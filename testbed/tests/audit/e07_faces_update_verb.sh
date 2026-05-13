@@ -38,6 +38,11 @@ if ! grep -q 'status::CONFLICT' "$LIB"; then
     echo "FAIL: faces_update does not signal CONFLICT for unsupported changes"
     exit 1
 fi
+# Mask semantics: new = (current & !mask) | (flags & mask)
+if ! grep -q '(current & !mask) | (flags & mask)' "$LIB"; then
+    echo "FAIL: faces_update does not implement NFD Flags+Mask semantics"
+    exit 1
+fi
 
 if ! cargo build -p ndn-mgmt --quiet 2>&1 | tail -3; then
     echo "FAIL: ndn-mgmt does not build with faces/update handler"
