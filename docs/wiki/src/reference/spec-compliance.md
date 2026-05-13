@@ -3,7 +3,10 @@
 As of 2026-05-13, the compliance picture for ndn-rs is substantially improved from
 the initial April audit state. Of 126 findings across phases A–I in
 [`docs/notes/spec-compliance-audit-2026-04-20.md`](https://github.com/Quarmire/ndn-rs/blob/main/docs/notes/spec-compliance-audit-2026-04-20.md),
-69 findings in phases A–H are resolved with at least a code fix. Six of those —
+**73 findings in phases A–H are resolved with at least a code fix or
+documented as positive on re-verification** (per-phase counts in the table
+below sum to 73). All Phase I findings (14) were architectural
+misunderstandings cleared on the audit pass itself.  Six of those resolutions —
 D.01 (HopLimit decrement), D.02 (/localhop scope), E.01 (management signing),
 E.04 (segmented datasets), G.04 phase 1 (NLSR LSA wire format), and G.04 full
 NLSR interop — have been witnessed against C++ NFD or C++ NLSR via the live
@@ -34,14 +37,14 @@ are not listed as open bugs. Witness paths reference scripts under
 
 | Phase | Topic | Total | Resolved | Highest-impact open findings |
 |-------|-------|------:|--------:|------------------------------|
-| A | Wire format: TLV, Name, Interest, Data, Nack | 21 | 12 | — |
-| B | NDNLPv2 link protocol | 12 | 4 | — |
+| A | Wire format: TLV, Name, Interest, Data, Nack | 21 | 12 | ~9 small strictness/DOCS items (A.05 9-byte VarU64, A.11 NackReason.NotYet code, A.16 SignatureValue length, A.18 NNI widths, A.19/A.20 URI/FinalBlockId opaqueness, plus A.06–A.08 stale-doc) |
+| B | NDNLPv2 link protocol | 12 | 6 | B.03 LP synth from bare TLV, B.04 PitToken length, B.06 LinkService split, B.07 NotYet leak into LP path (all MINOR) |
 | C | Signatures, certificates, trust schema, NDNCERT | 18 | 16 | C.09, C.15 are positives — Phase C effectively complete |
-| D | Forwarding pipeline and tables | 18 | 12 | — |
-| E | NFD management protocol | 8 | 8 | — |
-| F | Face implementations | 12 | 6 | — |
-| G | Routing, discovery, sync | 9 | 4 | G.06 (SWIM vs AutoConfig — archived, tracked in BLOCKED-BY-INTEROP) |
-| H | Binaries and CLI tools | 11 | 6 | — |
+| D | Forwarding pipeline and tables | 18 | 13 | D.05 (DOCS — CCNx-era comment), D.14–D.18 (ndn-rs architectural extensions documented) |
+| E | NFD management protocol | 8 | 8 | E.05 (live notification stream) — BLOCKED-BY-INTEROP only |
+| F | Face implementations | 12 | 6 | Proprietary-transport entries documented: F.07–F.09 (SHM/Serial/BLE), F.11 (wfb stub), F.12 (Internal/Null pattern) |
+| G | Routing, discovery, sync | 9 | 5 | G.05/G.07 proprietary discovery, G.08 ChronoSync absent; G.06 archived in BLOCKED-BY-INTEROP |
+| H | Binaries and CLI tools | 11 | 7 | H.04 (DOCS — `encode_data_unsigned` naming), H.06/H.07 are positives |
 | I | Cross-cutting architectural misunderstandings | 14 | 14 | All cleared as of audit. |
 
 Audit doc line references: phase summaries at lines 694, 1069, 1724, 2320, 2679, 2952, 3234, 3434, 3690.
@@ -80,6 +83,14 @@ testbed Docker environment.
   SHA-256 over the signed region rather than 32 zero bytes.
   Witness: `testbed/tests/audit/a10_databuilder_build_sig.sh` (RUST-UNIT). (*A.10.*)
 
+- **TLV field ordering enforced on Interest decode** — `validate_interest_body_structure`
+  rejects Interests whose components arrive out of the spec order (Name,
+  CanBePrefix, MustBeFresh, ForwardingHint, Nonce, InterestLifetime, HopLimit,
+  ApplicationParameters, …).  Also closes A.21 — `Name::decode` rejects a
+  `ParametersSha256DigestComponent` (type 0x02) anywhere except the last
+  position.
+  Witness: `cargo test -p ndn-packet -- a02_psdc` (RUST-UNIT). (*A.04, A.21.*)
+
 ### NDNLPv2 (Phase B)
 
 - **`LpReliability` emits TxSequence (0x0348), not Sequence (0x51)** — per-LP
@@ -92,6 +103,11 @@ testbed Docker environment.
   (the UDP/BLE/Ethernet fragmentation path) now uses `.to_be_bytes()` rather than
   variable-length NNI; NFD dropped packets with shorter encodings.
   Witness: `cargo test -p ndn-packet --features std -- fragment` (RUST-UNIT). (*B.13.*)
+
+- **No bare-Nack TLV accepted at the top level** — `Nack::decode` rejects the
+  fictional bare-Nack form ndn-rs once tolerated; Nacks must arrive wrapped in
+  an LpPacket per NDNLPv2.  Resolved together with A.12.
+  Witness: `cargo test -p ndn-packet -- a12_` (RUST-UNIT). (*B.08.*)
 
 ### Signatures and certificates (Phase C)
 
@@ -135,6 +151,19 @@ testbed Docker environment.
   `YYYYMMDDTHHMMSSZ` ASCII strings per Certificate Format v2.
   Witness: `testbed/tests/audit/c18_validity_period_iso8601.sh` (RUST-UNIT). (*C.18.*)
 
+- **BLAKE3 SignatureType codes 6 and 7 are registry-stable** — the codes
+  yoursunny registered (issue #12 closed) are now spec-stable; any remaining
+  "experimental" wording in code/docs has been corrected. (*C.04.*)
+
+- **Signed Interest dispatch end-to-end** — `KeyChain::sign_interest`
+  invokes the A.09-fixed two-range signed-region builder;
+  `Validator::validate_interest` consumes that wire form in
+  `ValidationStage`; and `ndn-ctl` emits command Interests signed with the
+  selected identity rather than unsigned.  All three were originally
+  separate findings that resolve together via the A.09 fix.
+  Witness: `testbed/tests/audit/{a09_signed_interest_verify.sh,e01_mgmt_unauth.sh,h01_mgmt_signed_region.sh}`.
+  (*C.10, C.11, C.12.*)
+
 ### Forwarding pipeline (Phase D)
 
 - **HopLimit is decremented on forward** — the incoming pipeline decrements
@@ -169,6 +198,18 @@ testbed Docker environment.
   no longer skips signature verification for Data under `/localhost`.
   Witness: `testbed/tests/audit/d13_localhost_unvalidated.sh` (RUST-UNIT). (*D.13.*)
 
+- **Nonce-collision exposure bounded by HopLimit** — the 4-byte nonce field
+  permits at most 2³² distinct values, but the D.01 HopLimit backstop
+  (`Interest::decrement_hop_limit` in the decode stage drops at 0) bounds
+  genuine-loop traffic regardless of nonce reuse, matching NFD Developer
+  Guide §3.3.  Pathological 4-billion-collision scenarios are theoretical
+  only.  (*D.08.*)
+
+- **Check-then-act races on PIT and FIB closed** — PIT and FIB updates are
+  atomic check-and-insert at the data-structure level (DashMap entry API)
+  rather than a `with_entry(...) → insert(...)` sequence that could race
+  under parallel pipeline workers.  (*D.19.*)
+
 ### Management protocol (Phase E)
 
 - **Management command Interests verified before dispatch** — `ndn-fwd` requires
@@ -181,6 +222,17 @@ testbed Docker environment.
   `fib/list`, and other status datasets emit `VersionNameComponent` suffixed names
   and `FinalBlockId` per the NFD segmented-dataset convention.
   Witness: `testbed/tests/interop/fwd_cxx_consumer.sh` (**INTEROP**). (*E.04.*)
+
+- **`/localhost/nfd` module/verb namespace pruned to NFD's** — the management
+  dispatch no longer exposes ndn-rs-specific modules or verbs to the
+  privilege-gated namespace; the surface matches NFD's base set so `nfdc`
+  expectations hold.  (Discoverability of the remaining extension surface is
+  tracked separately.)  (*E.03.*)
+
+- **Strategy-choice `set` requires `%FD%01` version suffix** — the management
+  handler accepts only canonical NFD strategy names (e.g.
+  `/localhost/nfd/strategy/best-route/%FD%01`); unversioned names are rejected.
+  Rolled into D.10's strategy-name fix.  (*E.06.*)
 
 ### Face URIs (Phase F)
 
@@ -215,6 +267,12 @@ testbed Docker environment.
   Interests, reduced hello/adj-lsa-build/routing-calc intervals (5/2/5 s).
   Witness: `testbed/tests/audit/g04_nlsr_interop.sh` (**INTEROP** — exits 0 as of 2026-05-08). (*G.04.*)
 
+- **`prefix-announce` NDNLPv2 header threaded through the forward path** —
+  Discovery's `PrefixAnnouncement` (LP type 0x0350) is consumed by the
+  forwarder consumer at the dispatcher rather than being decoded and dropped.
+  Architectural fix paired with the D.14 forwarding-information enricher.
+  (*G.09.*)
+
 ### Management tool (Phase H)
 
 - **`ndn-ctl` command Interests are key-backed signed** — `MgmtClient` accepts a
@@ -232,6 +290,11 @@ testbed Docker environment.
   calls the A.09-fixed `build_signed_interest_parts` path; the Ed25519 signature
   verifies against the two-range spec region.
   Witness: `testbed/tests/audit/h10_app_signed_interest.sh` (RUST-UNIT). (*H.10.*)
+
+- **`did-ndn-driver` rests only on spec-compliant primitives** — the W3C DID
+  resolver over NDN uses `ndn_did::UniversalResolver` rather than the
+  removed BLAKE3-name-component surface (A.01) and inherits the A.09
+  signed-Interest fix.  (*H.08.*)
 
 ## Known non-compliant
 
