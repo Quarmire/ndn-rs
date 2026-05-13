@@ -3,7 +3,7 @@
 As of 2026-05-13, the compliance picture for ndn-rs is substantially improved from
 the initial April audit state. Of 126 findings across phases A–I in
 [`docs/notes/spec-compliance-audit-2026-04-20.md`](https://github.com/Quarmire/ndn-rs/blob/main/docs/notes/spec-compliance-audit-2026-04-20.md),
-64 findings in phases A–H are resolved with at least a code fix. Six of those —
+66 findings in phases A–H are resolved with at least a code fix. Six of those —
 D.01 (HopLimit decrement), D.02 (/localhop scope), E.01 (management signing),
 E.04 (segmented datasets), G.04 phase 1 (NLSR LSA wire format), and G.04 full
 NLSR interop — have been witnessed against C++ NFD or C++ NLSR via the live
@@ -37,8 +37,8 @@ are not listed as open bugs. Witness paths reference scripts under
 | A | Wire format: TLV, Name, Interest, Data, Nack | 21 | 12 | — |
 | B | NDNLPv2 link protocol | 12 | 4 | — |
 | C | Signatures, certificates, trust schema, NDNCERT | 18 | 16 | C.09, C.15 are positives — Phase C effectively complete |
-| D | Forwarding pipeline and tables | 18 | 11 | D.08 (4-byte nonce collision handling, MINOR) |
-| E | NFD management protocol | 8 | 7 | E.02 (source-face identity from PIT not face, MINOR) |
+| D | Forwarding pipeline and tables | 18 | 12 | — |
+| E | NFD management protocol | 8 | 8 | — |
 | F | Face implementations | 12 | 4 | F.04 (TCP bare TLV, no LP wrapping, MINOR), F.10 (Ethernet open TODOs, MINOR) |
 | G | Routing, discovery, sync | 9 | 4 | G.06 (SWIM vs AutoConfig — archived, tracked in BLOCKED-BY-INTEROP) |
 | H | Binaries and CLI tools | 11 | 6 | — |
@@ -312,6 +312,17 @@ testbed Docker environment.
 > (`crates/spec/ndn-engine/src/stages/cs.rs:33`) so the Interest
 > falls through to PIT + strategy + upstream forwarding.  The
 > earlier wiki summary was incorrect.
+
+> **E.02 RESOLVED 2026-05-13** — `run_ndn_mgmt_handler` binds
+> `source_face = Some(handle.face_id())` directly from the
+> `InProcHandle` it is reading from.  Previously the handler called
+> `engine.source_face_id(&interest)`, which walked the PIT and
+> returned the first in-record's face_id for a matching name hash;
+> two commands from different faces with identical name hashes
+> inside the 4-second PIT lifetime could resolve to each other's
+> face_id, an authorization boundary bug.  `InProcHandle` now
+> exposes the paired `InProcFace.id` via `face_id()`.  Witness:
+> `testbed/tests/audit/e02_source_face_from_handle.sh`.
 
 > **E.07 RESOLVED 2026-05-13** — `mgmt::faces_*` dispatches
 > `verb::UPDATE` to a `faces_update` handler that honours NFD
