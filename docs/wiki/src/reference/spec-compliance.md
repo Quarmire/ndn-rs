@@ -3,9 +3,9 @@
 As of 2026-05-13, the compliance picture for ndn-rs is substantially improved from
 the initial April audit state. Of 126 findings across phases A–I in
 [`docs/notes/spec-compliance-audit-2026-04-20.md`](https://github.com/Quarmire/ndn-rs/blob/main/docs/notes/spec-compliance-audit-2026-04-20.md),
-**77 findings in phases A–H are resolved with at least a code fix or
-documented as positive on re-verification** (per-phase counts in the table
-below sum to 73). All Phase I findings (14) were architectural
+**82 findings in phases A–H are resolved with at least a code fix or
+documented as positive on re-verification**, including all 21 in
+Phase A (per-phase counts in the table below sum to 82). All Phase I findings (14) were architectural
 misunderstandings cleared on the audit pass itself.  Six of those resolutions —
 D.01 (HopLimit decrement), D.02 (/localhop scope), E.01 (management signing),
 E.04 (segmented datasets), G.04 phase 1 (NLSR LSA wire format), and G.04 full
@@ -37,7 +37,7 @@ are not listed as open bugs. Witness paths reference scripts under
 
 | Phase | Topic | Total | Resolved | Highest-impact open findings |
 |-------|-------|------:|--------:|------------------------------|
-| A | Wire format: TLV, Name, Interest, Data, Nack | 21 | 16 | A.19/A.20 (URI round-trip / FinalBlockId opaqueness, MINOR), A.06–A.08 (stale-doc DOCS) |
+| A | Wire format: TLV, Name, Interest, Data, Nack | 21 | 21 | — Phase A closed |
 | B | NDNLPv2 link protocol | 12 | 6 | B.03 LP synth from bare TLV, B.04 PitToken length, B.06 LinkService split, B.07 NotYet leak into LP path (all MINOR) |
 | C | Signatures, certificates, trust schema, NDNCERT | 18 | 16 | C.09, C.15 are positives — Phase C effectively complete |
 | D | Forwarding pipeline and tables | 18 | 13 | D.05 (DOCS — CCNx-era comment), D.14–D.18 (ndn-rs architectural extensions documented) |
@@ -115,6 +115,33 @@ testbed Docker environment.
   SignatureType, SignatureTime, and SignatureSeqNum decoders route
   through it; 3/5/6/7-octet NNIs and zero-length NNIs are rejected.
   Witness: `testbed/tests/audit/a05_a18_tlv_strictness.sh` (RUST-UNIT). (*A.18.*)
+
+- **`Name` and `NameComponent` have spec-canonical `Ord`** — TLV-TYPE
+  ascending, then TLV-LENGTH ascending, then lexicographic value;
+  `Name` compares component-wise so prefix-shorter-first holds.  Code
+  unchanged; earlier wiki "remaining gaps" claim was stale. (*A.06.*)
+
+- **`Name::decode` accepts the root (empty) name** — `name.html` defines
+  the empty Name as valid; the outer `Interest::decode` and
+  `Data::decode` still require ≥ 1 component, but `KeyLocator` and
+  `ForwardingHint` Name fields can be empty. (*A.07.*)
+
+- **`ensure_nonce` cites the NFD Developer Guide, not RFC 8569** —
+  the comment in `encode/interest.rs::ensure_nonce` now refers to NFD
+  Developer Guide §3.4 (outgoing-Interest pipeline) and explicitly
+  flags that RFC 8569 is the CCNx document, not NDN. (*A.08.*)
+
+- **URI round-trip preserves typed components** — `Name::FromStr` now
+  parses the alternates `Name::Display` emits: `sha256digest=<hex>`,
+  `params-sha256=<hex>`, `keyword=<text>`, and the canonical
+  `<type-number>=<value>` decimal-prefix form (`name.html`).
+  Witness: `testbed/tests/audit/a19_a20_uri_finalblockid.sh` (RUST-UNIT). (*A.19.*)
+
+- **`FinalBlockId` exposes its wrapped NameComponent** — new
+  `MetaInfo::final_block_component` decodes the inner NameComponent
+  TLV (per `data.html`) into a typed `NameComponent`; the raw `Bytes`
+  field is still available for callers that don't need the parse.
+  Witness: `testbed/tests/audit/a19_a20_uri_finalblockid.sh` (RUST-UNIT). (*A.20.*)
 
 ### NDNLPv2 (Phase B)
 
