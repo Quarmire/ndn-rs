@@ -3,9 +3,10 @@
 As of 2026-05-13, the compliance picture for ndn-rs is substantially improved from
 the initial April audit state. Of 126 findings across phases A–I in
 [`docs/notes/spec-compliance-audit-2026-04-20.md`](https://github.com/Quarmire/ndn-rs/blob/main/docs/notes/spec-compliance-audit-2026-04-20.md),
-**82 findings in phases A–H are resolved with at least a code fix or
+**87 findings in phases A–H are resolved with at least a code fix or
 documented as positive on re-verification**, including all 21 in
-Phase A (per-phase counts in the table below sum to 82). All Phase I findings (14) were architectural
+Phase A and 11 of 12 in Phase B (per-phase counts in the table
+below sum to 87). All Phase I findings (14) were architectural
 misunderstandings cleared on the audit pass itself.  Six of those resolutions —
 D.01 (HopLimit decrement), D.02 (/localhop scope), E.01 (management signing),
 E.04 (segmented datasets), G.04 phase 1 (NLSR LSA wire format), and G.04 full
@@ -38,7 +39,7 @@ are not listed as open bugs. Witness paths reference scripts under
 | Phase | Topic | Total | Resolved | Highest-impact open findings |
 |-------|-------|------:|--------:|------------------------------|
 | A | Wire format: TLV, Name, Interest, Data, Nack | 21 | 21 | — Phase A closed |
-| B | NDNLPv2 link protocol | 12 | 6 | B.03 LP synth from bare TLV, B.04 PitToken length, B.06 LinkService split, B.07 NotYet leak into LP path (all MINOR) |
+| B | NDNLPv2 link protocol | 12 | 11 | — B.11/B.12 are positives (BLE, Serial framing); Phase B effectively closed |
 | C | Signatures, certificates, trust schema, NDNCERT | 18 | 16 | C.09, C.15 are positives — Phase C effectively complete |
 | D | Forwarding pipeline and tables | 18 | 13 | D.05 (DOCS — CCNx-era comment), D.14–D.18 (ndn-rs architectural extensions documented) |
 | E | NFD management protocol | 8 | 8 | E.05 (live notification stream) — BLOCKED-BY-INTEROP only |
@@ -160,6 +161,36 @@ testbed Docker environment.
   fictional bare-Nack form ndn-rs once tolerated; Nacks must arrive wrapped in
   an LpPacket per NDNLPv2.  Resolved together with A.12.
   Witness: `cargo test -p ndn-packet -- a12_` (RUST-UNIT). (*B.08.*)
+
+- **Bare `Interest`/`Data` inside an LpPacket body rejected** — NDNLPv2
+  requires the network packet to be wrapped in `LpFragment` (0x50).
+  `LpPacket::decode` previously synthesised a fragment around a bare
+  top-level Interest or Data inside the body; it now returns
+  `MalformedPacket`, surfacing non-conformant peers.
+  Witness: `testbed/tests/audit/b03_b04_lp_strictness.sh` (RUST-UNIT). (*B.03.*)
+
+- **PitToken length follows NDNLPv2 "one or more bytes" without an upper
+  bound** — the LP decoder only rejects the empty-length case; tokens
+  longer than the previous 32-byte ndn-rs-private ceiling now decode.
+  Witness: `testbed/tests/audit/b03_b04_lp_strictness.sh` (RUST-UNIT). (*B.04.*)
+
+- **PitToken wire surface scoped as future feature, not spec gap** —
+  encode + decode are spec-correct; downstream-side PitToken generation
+  and upstream-side consumption (NDN-DPDK multi-consumer pattern) are
+  not wired in the forwarder.  ndn-rs does not advertise NDN-DPDK
+  interop, so this is a documented limitation rather than a deviation.
+  (*B.05.*)
+
+- **`LinkService`/`Transport` split fused into the `Face` trait** — the
+  per-face `LpReliability` state is only allocated by
+  `FaceState::new_reliable` (UDP today); other faces don't pay the
+  cost.  ndn-rs's single-trait composition is an architectural choice,
+  not a wire-format deviation.  (*B.06.*)
+
+- **`NackReason::NotYet` in LP path documented as ndn-rs-private** —
+  same fix as A.11: external peers decoding the wire see `Other(160)`,
+  not a registered NackReason; `NackReason::is_registered()` returns
+  `false` for it. (*B.07 via A.11.*)
 
 ### Signatures and certificates (Phase C)
 
