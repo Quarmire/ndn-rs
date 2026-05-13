@@ -3,7 +3,7 @@
 As of 2026-05-13, the compliance picture for ndn-rs is substantially improved from
 the initial April audit state. Of 126 findings across phases A–I in
 [`docs/notes/spec-compliance-audit-2026-04-20.md`](https://github.com/Quarmire/ndn-rs/blob/main/docs/notes/spec-compliance-audit-2026-04-20.md),
-57 findings in phases A–H are resolved with at least a code fix. Six of those —
+61 findings in phases A–H are resolved with at least a code fix. Six of those —
 D.01 (HopLimit decrement), D.02 (/localhop scope), E.01 (management signing),
 E.04 (segmented datasets), G.04 phase 1 (NLSR LSA wire format), and G.04 full
 NLSR interop — have been witnessed against C++ NFD or C++ NLSR via the live
@@ -37,11 +37,11 @@ are not listed as open bugs. Witness paths reference scripts under
 | A | Wire format: TLV, Name, Interest, Data, Nack | 21 | 12 | — |
 | B | NDNLPv2 link protocol | 12 | 3 | B.10 (reassembly buffer unbounded, MINOR) |
 | C | Signatures, certificates, trust schema, NDNCERT | 18 | 16 | C.09, C.15 are positives — Phase C effectively complete |
-| D | Forwarding pipeline and tables | 18 | 9 | D.06 (nonce regeneration on outgoing, MINOR), D.08 (4-byte nonce collision handling, MINOR) |
-| E | NFD management protocol | 8 | 5 | E.02 (source-face identity from PIT not face, MINOR), E.07 (faces/update stub, MINOR), E.08 (FaceStatus Flags field absent, MINOR) |
+| D | Forwarding pipeline and tables | 18 | 10 | D.08 (4-byte nonce collision handling, MINOR), D.11 (CS fall-through on freshness miss, MINOR) |
+| E | NFD management protocol | 8 | 6 | E.02 (source-face identity from PIT not face, MINOR), E.07 (faces/update stub, MINOR) |
 | F | Face implementations | 12 | 4 | F.04 (TCP bare TLV, no LP wrapping, MINOR), F.10 (Ethernet open TODOs, MINOR) |
-| G | Routing, discovery, sync | 9 | 4 | G.06 (SWIM vs AutoConfig, MAJOR) |
-| H | Binaries and CLI tools | 11 | 4 | H.02 (ndn-ping prefix not ndn-cxx compatible, MINOR), H.03 (ndn-iperf proprietary naming, MINOR) |
+| G | Routing, discovery, sync | 9 | 4 | G.06 (SWIM vs AutoConfig — archived, tracked in BLOCKED-BY-INTEROP) |
+| H | Binaries and CLI tools | 11 | 6 | — |
 | I | Cross-cutting architectural misunderstandings | 14 | 14 | All cleared as of audit. |
 
 Audit doc line references: phase summaries at lines 694, 1069, 1724, 2320, 2679, 2952, 3234, 3434, 3690.
@@ -267,12 +267,11 @@ testbed Docker environment.
 > `verified = true` for `FaceScope::Local` Data before this stage runs.
 > Witness: `testbed/tests/audit/d12_cs_unverified_admission.sh`.
 
-- **Neighbor discovery uses a SWIM-style protocol, not NDN AutoConfig.** The
-  Hello/gossip protocol in `ndn-discovery` uses ndn-rs-defined TLV types and
-  SWIM failure-detector semantics. It does not interoperate with NDN AutoConfig
-  (`ndn-autoconfig`) or the NFD `/localhop/nfd/*` prefix-announcement flow.
-  Presenting this as "NDN-native" discovery is inaccurate; it is NDN-transport
-  SWIM. (*G.06.*)
+> **G.06 ARCHIVED 2026-05-13** — SWIM-over-NDN is now scoped as a
+> non-testbed ndn-rs extension rather than an AutoConfig substitute.
+> See the BLOCKED-BY-INTEROP entry below for the standards-track gap.
+> Open work on NDN AutoConfig itself is tracked separately and not a
+> blocker for testbed interop today.
 
 ### MINOR — strictness gaps and edge cases
 
@@ -292,8 +291,14 @@ testbed Docker environment.
 - **NDNLPv2 reassembly buffer memory unbounded.** A peer may inflate ndn-rs
   memory by sending many partial fragment chains. (*B.10.*)
 
-- **PIT outgoing Interest does not regenerate or verify the outbound Nonce.**
-  (*D.06.*)
+> **D.06 RESOLVED 2026-05-13** — `StrategyStage` now records each
+> outbound `(face_id, nonce)` pair in the PIT entry's `out_records`
+> and suppresses any re-send to the same face with the same nonce
+> (`crates/spec/ndn-engine/src/stages/strategy.rs`, `Forward`
+> branch).  If every chosen out-face is a duplicate, the Interest
+> is dropped with `DropReason::Suppressed`.  Mirrors NFD
+> Developer Guide §3.4.  Witness:
+> `testbed/tests/audit/d06_pit_out_record_dedup.sh`.
 
 - **ContentStore freshness check at match time does not fall through to upstream
   on a MustBeFresh miss.** The pipeline drops rather than forwarding. (*D.11.*)
@@ -301,8 +306,13 @@ testbed Docker environment.
 - **`faces/update` verb declared but not implemented in the management handler.**
   (*E.07.*)
 
-- **`FaceStatus` TLV omits `Flags` (0x6C)** and aggregate counters `NInSatisfied` /
-  `NInUnsatisfied`. `nfdc face list` shows these as zero. (*E.08.*)
+> **E.08 RESOLVED 2026-05-13** — `FaceStatus` now emits `Flags`
+> (0x6c), `NSatisfiedInterests` (0x99), and `NUnsatisfiedInterests`
+> (0x9a) per ndn-cxx `tlv-nfd.hpp`.  ndn-rs does not yet expose
+> per-face flag toggles or per-face satisfaction counters, so all
+> three are emitted as zero, but the TLVs are present so `nfdc
+> face list` does not see them as absent.  Witness:
+> `testbed/tests/audit/e08_face_status_flags.sh`.
 
 > **F.02 RESOLVED 2026-05-12** — `MulticastUdpFace::ndn_default` now
 > binds the multicast group on UDP/56363, matching NFD's
@@ -311,10 +321,17 @@ testbed Docker environment.
 > `NDN_PORT` (unicast).  Witness:
 > `testbed/tests/audit/f02_multicast_port_56363.sh`.
 
-- **`ndn-ping` default prefix `/ping` is not ndn-cxx `ndnping`-compatible.** The
-  reference tool expects `/ndn/ping`. (*H.02.*)
+> **H.02 RESOLVED 2026-05-13** — `ndn-ping` server now registers
+> `<prefix>/ping` (matching ndn-tools `ping-server.cpp:43`) and the
+> CLI default `--prefix` is `/ndn`, so the default registered name
+> is `/ndn/ping` per the ndn-cxx ndnping convention.  Witness:
+> `testbed/tests/audit/h02_ping_prefix_ndnping_compat.sh`.
 
-- **`ndn-iperf` uses an ndn-rs-specific name convention.** (*H.03.*)
+> **H.03 DOCUMENTED 2026-05-13** — `ndn-iperf` is scoped as a
+> proprietary ndn-rs-only tool: no ndn-cxx `ndniperf` equivalent
+> exists and the segment naming / `--sign-mode` parameter are
+> not standardised.  Crate-level doc on `binaries/tooling/ndn-tools/src/iperf.rs`
+> declares this; the tool is interop only between `ndn-iperf` peers.
 
 ### DOCS — documentation was incorrect or stale
 
