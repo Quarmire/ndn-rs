@@ -49,7 +49,7 @@ The dependency-direction rule: `draft` → `tooling` → `extension` →
 ```
 crates/spec/                    NDN community specs implemented faithfully
   ndn-tlv                       TlvReader, TlvWriter, varu64 — no_std
-  ndn-foundation-types          Name, NameComponent, canonical Ord — shared with ndf-rs
+  ndn-foundation-types          Name, NameComponent, canonical Ord — shared with downstream NDN-stack crates
   ndn-packet                    Interest, Data, Nack (Packet Format v0.3) — lazy decode, no_std
   ndn-transport                 Face trait, FaceId, FaceTable, StreamFace, TlvCodec
   ndn-store                     NameTrie, Fib, PIT, ContentStore (LruCs/ShardedCs/FjallCs), DeadNonceList
@@ -157,8 +157,8 @@ Data:     FaceCheck → TlvDecode → PitMatch  → Validation → CsInsert → 
 ### PIT substrate-extension doctrine
 
 ndn-rs deliberately diverges from NFD-spec PIT semantics on three
-points to support NDF SparkStream persistent-attach. The decisions
-are recorded in
+points to support persistent-attach subscribers. The decisions are
+recorded in
 [`docs/notes/substrate-extension-pit-doctrine-2026-05-11.md`](docs/notes/substrate-extension-pit-doctrine-2026-05-11.md).
 
 - **Universal strip-at-insert.** PIT and CS keys remove a trailing

@@ -1,9 +1,9 @@
 # PIT Substrate Doctrine
 
 ndn-rs deliberately diverges from NFD-spec PIT semantics on a small
-number of points to support NDF SparkStream persistent-attach. This
-page summarises the choices and the discipline they impose on
-callers; the canonical record is
+number of points to support persistent-attach subscribers. This page
+summarises the choices and the discipline they impose on callers; the
+canonical record is
 [`docs/notes/substrate-extension-pit-doctrine-2026-05-11.md`](https://github.com/Quarmire/ndn-rs/blob/main/docs/notes/substrate-extension-pit-doctrine-2026-05-11.md).
 
 ## What's the same as NFD
@@ -61,8 +61,9 @@ its own credit pool, deadline, and lifecycle. Two subscribers
 aggregating into one entry track their credit independently.
 
 **Trust-model consequence.** Revocation, expiry, and ACL evaluation
-are per-subscriber, not per-entry. NDF mediator policy code must
-scope these decisions to the `InRecord`, not the `PitEntry`.
+are per-subscriber, not per-entry. Application-side mediator policy
+code must scope these decisions to the `InRecord`, not the
+`PitEntry`.
 
 ### 4. Replay guard is the integrity floor
 
@@ -98,7 +99,7 @@ The doctrine witness is
 - **Secondary-index PIT** — a localised redesign that restores
   wire-name multiplexing if NFD-producer interop becomes a real
   requirement. Not built today; the secondary-index option is
-  local to `ndn-store::pit` and does not touch SparkStream.
+  local to `ndn-store::pit` and does not touch persistent-attach.
 - **`subscribe_sync`** — engine-local subscription registry over
   PSync or StateVectorSync, for low-rate fan-out-heavy workloads.
   Roadmap item, not a replacement for persistent-attach.

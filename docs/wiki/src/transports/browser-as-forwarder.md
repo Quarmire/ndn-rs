@@ -204,8 +204,8 @@ loop {
 ## Next steps
 
 Phase 7 lands the engine; the mgmt-parity follow-on closes the
-operational surface.  The remaining browser-tier work for the
-NDF-readiness ladder:
+operational surface.  The remaining browser-tier work toward full
+substrate-consumer readiness:
 
 - WebRTC face integration inside the worker (peer-to-peer transit
   through the shared engine).  `ndn-face-webrtc` runs tab-side
