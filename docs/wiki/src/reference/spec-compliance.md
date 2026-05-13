@@ -3,10 +3,11 @@
 As of 2026-05-13, the compliance picture for ndn-rs is substantially improved from
 the initial April audit state. Of 126 findings across phases A–I in
 [`docs/notes/spec-compliance-audit-2026-04-20.md`](https://github.com/Quarmire/ndn-rs/blob/main/docs/notes/spec-compliance-audit-2026-04-20.md),
-**96 findings in phases A–H are resolved with at least a code fix or
+**106 findings in phases A–H are resolved with at least a code fix or
 documented as positive on re-verification**, including all 21 in
-Phase A, 11 of 12 in Phase B, 18 of 19 in Phase D, and all 9 in
-Phase G (per-phase counts in the table below sum to 96). All Phase I findings (14) were architectural
+Phase A, 11 of 12 in Phase B, 18 of 19 in Phase D, all 9 in
+Phase G, all 13 in Phase F, and 10 of 11 in Phase H (per-phase
+counts in the table below sum to 106). All Phase I findings (14) were architectural
 misunderstandings cleared on the audit pass itself.  Six of those resolutions —
 D.01 (HopLimit decrement), D.02 (/localhop scope), E.01 (management signing),
 E.04 (segmented datasets), G.04 phase 1 (NLSR LSA wire format), and G.04 full
@@ -43,9 +44,9 @@ are not listed as open bugs. Witness paths reference scripts under
 | C | Signatures, certificates, trust schema, NDNCERT | 18 | 16 | C.09, C.15 are positives — Phase C effectively complete |
 | D | Forwarding pipeline and tables | 19 | 18 | D.16 deferred to Phase E (FIB/RIB mgmt mapping) — no forwarding-plane gap |
 | E | NFD management protocol | 8 | 8 | E.05 (live notification stream) — BLOCKED-BY-INTEROP only |
-| F | Face implementations | 12 | 6 | Proprietary-transport entries documented: F.07–F.09 (SHM/Serial/BLE), F.11 (wfb stub), F.12 (Internal/Null pattern) |
+| F | Face implementations | 13 | 12 | F.13 WebTransport listener landed (counted) — Phase F effectively closed |
 | G | Routing, discovery, sync | 9 | 9 | — Phase G closed (G.06 archived in BLOCKED-BY-INTEROP) |
-| H | Binaries and CLI tools | 11 | 7 | H.04 (DOCS — `encode_data_unsigned` naming), H.06/H.07 are positives |
+| H | Binaries and CLI tools | 11 | 10 | H.00 is the positives header, not a finding — Phase H effectively closed |
 | I | Cross-cutting architectural misunderstandings | 14 | 14 | All cleared as of audit. |
 
 Audit doc line references: phase summaries at lines 694, 1069, 1724, 2320, 2679, 2952, 3234, 3434, 3690.
@@ -352,6 +353,34 @@ testbed Docker environment.
   conventions that `nfdc` expects.
   Witness: `testbed/tests/audit/f01_faceuri_schemes.sh` (RUST-UNIT). (*F.01, F.03, F.06.*)
 
+- **WebSocket framing: one LpPacket per binary frame** — `net/websocket.rs`
+  emits one LpPacket per tungstenite binary message; text messages are
+  ignored.  Matches NDNts and `@ndn-cxx/websocket-face`.  (*F.05.*)
+
+- **SHM SPSC face documented as ndn-rs-only same-host transport** —
+  feature-gated behind `spsc-shm`.  The only spec'd local face is
+  `unix://`; SHM SPSC is a proprietary ndn-rs extension. (*F.07.*)
+
+- **Serial / COBS face documented as proprietary** — COBS framing
+  follows the esp8266ndn convention but no NDN standard exists for
+  serial transport.  `serial://` FaceUri is ndn-rs-invented. (*F.08.*)
+
+- **BLE face matches NDNts/esp8266ndn** — GATT service /
+  characteristic UUIDs match reference implementations; framing
+  uses NDNLPv2 fragmentation with no private header.  Positive.
+  (*F.09, B.11.*)
+
+- **`WfbFace` is an explicit not-implemented stub** — declared-
+  experimental and listed on the v0.2.0 deferred list in
+  `docs/unimplemented.md`; returns `FaceError::Closed` as the
+  signal.  No spec claim is made. (*F.11.*)
+
+- **`InProcHandle`/`InProcFace` mirrors NFD's `InternalFace`** —
+  connects the management dispatcher to the engine without a
+  network round-trip.  Reachable via `engine.faces()` directly,
+  so the formatter doesn't emit `internal://` — naming drift, not
+  a capability gap. (*F.12.*)
+
 ### Routing and sync (Phase G)
 
 - **SVS state vector keyed on canonical Name** — `SvsNode.vector` uses
@@ -427,6 +456,22 @@ testbed Docker environment.
   resolver over NDN uses `ndn_did::UniversalResolver` rather than the
   removed BLAKE3-name-component surface (A.01) and inherits the A.09
   signed-Interest fix.  (*H.08.*)
+
+- **`encode_data_digest_sha256` accurately names the legacy helper** —
+  the misleading `encode_data_unsigned` name (output is in fact
+  `DigestSha256`-signed Data) now has an accurately-named replacement;
+  the old name is retained as a `#[doc(hidden)]` alias so existing
+  call sites in `ndn-engine`, `ndn-store`, `ndn-fwd`, and the test
+  harnesses don't churn.  (*H.04.*)
+
+- **`ndn-fwd` UDP listener is equivalent to NFD's UDP channel** —
+  the listener owns the socket and creates send-only `UdpFace`
+  references per peer, pushing received bytes via `inject_packet`.
+  Valid implementation of the NFD channel concept; positive. (*H.06.*)
+
+- **`ndn-fwd` TCP listener inherits the F.04 LP-wrap fix** — non-
+  local egress is wrapped in `LpPacket` so per-hop headers have a
+  frame to live in.  Witness: `testbed/tests/audit/f04_lp_wrap_nonlocal_egress.sh`. (*H.07.*)
 
 ## Known non-compliant
 
