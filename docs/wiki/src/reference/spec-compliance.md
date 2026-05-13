@@ -3,7 +3,7 @@
 As of 2026-05-13, the compliance picture for ndn-rs is substantially improved from
 the initial April audit state. Of 126 findings across phases A–I in
 [`docs/notes/spec-compliance-audit-2026-04-20.md`](https://github.com/Quarmire/ndn-rs/blob/main/docs/notes/spec-compliance-audit-2026-04-20.md),
-**73 findings in phases A–H are resolved with at least a code fix or
+**77 findings in phases A–H are resolved with at least a code fix or
 documented as positive on re-verification** (per-phase counts in the table
 below sum to 73). All Phase I findings (14) were architectural
 misunderstandings cleared on the audit pass itself.  Six of those resolutions —
@@ -37,7 +37,7 @@ are not listed as open bugs. Witness paths reference scripts under
 
 | Phase | Topic | Total | Resolved | Highest-impact open findings |
 |-------|-------|------:|--------:|------------------------------|
-| A | Wire format: TLV, Name, Interest, Data, Nack | 21 | 12 | ~9 small strictness/DOCS items (A.05 9-byte VarU64, A.11 NackReason.NotYet code, A.16 SignatureValue length, A.18 NNI widths, A.19/A.20 URI/FinalBlockId opaqueness, plus A.06–A.08 stale-doc) |
+| A | Wire format: TLV, Name, Interest, Data, Nack | 21 | 16 | A.19/A.20 (URI round-trip / FinalBlockId opaqueness, MINOR), A.06–A.08 (stale-doc DOCS) |
 | B | NDNLPv2 link protocol | 12 | 6 | B.03 LP synth from bare TLV, B.04 PitToken length, B.06 LinkService split, B.07 NotYet leak into LP path (all MINOR) |
 | C | Signatures, certificates, trust schema, NDNCERT | 18 | 16 | C.09, C.15 are positives — Phase C effectively complete |
 | D | Forwarding pipeline and tables | 18 | 13 | D.05 (DOCS — CCNx-era comment), D.14–D.18 (ndn-rs architectural extensions documented) |
@@ -90,6 +90,31 @@ testbed Docker environment.
   `ParametersSha256DigestComponent` (type 0x02) anywhere except the last
   position.
   Witness: `cargo test -p ndn-packet -- a02_psdc` (RUST-UNIT). (*A.04, A.21.*)
+
+- **TLV-TYPE restricted to VAR-NUMBER-1/3/5** — `TlvReader::read_type` rejects
+  the 9-byte form (legal only for TLV-LENGTH per `tlv.html`) and any value
+  above `u32::MAX` with `TlvError::TypeOutOfRange`.
+  Witness: `testbed/tests/audit/a05_a18_tlv_strictness.sh` (RUST-UNIT). (*A.05.*)
+
+- **`NackReason::NotYet` declared as ndn-rs-private extension** — the
+  registered NackReason codes are 50/100/150; ndn-rs's internal `NotYet=160`
+  signal is now flagged via `NackReason::is_registered()` and an enum-level
+  doc note so peers and tooling see it as `Other(160)` on the wire, not as a
+  registered value. (*A.11.*)
+
+- **`SignatureValue` length validated against `SignatureType`** —
+  `validate_data_body_structure` rejects fixed-width algorithms whose
+  `SignatureValue` doesn't match the spec width (Sha256=32, Hmac=32,
+  Ed25519=64, BLAKE3=32); variable-width algorithms (RSA, ECDSA) pass
+  through.  `SignatureType::required_signature_value_len` is the helper.
+  Witness: `testbed/tests/audit/a16_signature_value_length.sh` (RUST-UNIT). (*A.16.*)
+
+- **NonNegativeInteger widths restricted to {1,2,4,8} octets** — new
+  `ndn_packet::decode_nni` helper enforces the spec widths
+  (`tlv.html`).  InterestLifetime, FreshnessPeriod, ContentType,
+  SignatureType, SignatureTime, and SignatureSeqNum decoders route
+  through it; 3/5/6/7-octet NNIs and zero-length NNIs are rejected.
+  Witness: `testbed/tests/audit/a05_a18_tlv_strictness.sh` (RUST-UNIT). (*A.18.*)
 
 ### NDNLPv2 (Phase B)
 
