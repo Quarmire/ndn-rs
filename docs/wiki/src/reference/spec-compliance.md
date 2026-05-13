@@ -3,10 +3,10 @@
 As of 2026-05-13, the compliance picture for ndn-rs is substantially improved from
 the initial April audit state. Of 126 findings across phases A–I in
 [`docs/notes/spec-compliance-audit-2026-04-20.md`](https://github.com/Quarmire/ndn-rs/blob/main/docs/notes/spec-compliance-audit-2026-04-20.md),
-**87 findings in phases A–H are resolved with at least a code fix or
+**92 findings in phases A–H are resolved with at least a code fix or
 documented as positive on re-verification**, including all 21 in
-Phase A and 11 of 12 in Phase B (per-phase counts in the table
-below sum to 87). All Phase I findings (14) were architectural
+Phase A, 11 of 12 in Phase B, and 18 of 19 in Phase D (per-phase
+counts in the table below sum to 92). All Phase I findings (14) were architectural
 misunderstandings cleared on the audit pass itself.  Six of those resolutions —
 D.01 (HopLimit decrement), D.02 (/localhop scope), E.01 (management signing),
 E.04 (segmented datasets), G.04 phase 1 (NLSR LSA wire format), and G.04 full
@@ -41,7 +41,7 @@ are not listed as open bugs. Witness paths reference scripts under
 | A | Wire format: TLV, Name, Interest, Data, Nack | 21 | 21 | — Phase A closed |
 | B | NDNLPv2 link protocol | 12 | 11 | — B.11/B.12 are positives (BLE, Serial framing); Phase B effectively closed |
 | C | Signatures, certificates, trust schema, NDNCERT | 18 | 16 | C.09, C.15 are positives — Phase C effectively complete |
-| D | Forwarding pipeline and tables | 18 | 13 | D.05 (DOCS — CCNx-era comment), D.14–D.18 (ndn-rs architectural extensions documented) |
+| D | Forwarding pipeline and tables | 19 | 18 | D.16 deferred to Phase E (FIB/RIB mgmt mapping) — no forwarding-plane gap |
 | E | NFD management protocol | 8 | 8 | E.05 (live notification stream) — BLOCKED-BY-INTEROP only |
 | F | Face implementations | 12 | 6 | Proprietary-transport entries documented: F.07–F.09 (SHM/Serial/BLE), F.11 (wfb stub), F.12 (Internal/Null pattern) |
 | G | Routing, discovery, sync | 9 | 5 | G.05/G.07 proprietary discovery, G.08 ChronoSync absent; G.06 archived in BLOCKED-BY-INTEROP |
@@ -292,6 +292,34 @@ testbed Docker environment.
   atomic check-and-insert at the data-structure level (DashMap entry API)
   rather than a `with_entry(...) → insert(...)` sequence that could race
   under parallel pipeline workers.  (*D.19.*)
+
+- **PIT aggregation docs cite NFD Developer Guide §4.1, not RFC 8569** —
+  the original RFC 8569 (CCNx 1.0 Semantics) reference on `PitToken` has
+  been removed by the PIT-key refactor; remaining `ensure_nonce` /
+  wasm-nonce-counter comments in `crates/spec/ndn-packet/src/wire.rs`
+  now cite NFD Developer Guide §3.4 and flag the CCNx category error
+  explicitly. (*D.05.*)
+
+- **`ForwardingAction::ForwardAfter` documented as ndn-rs extension** —
+  the delayed-send strategy action is not in the NFD strategy API
+  (which uses `afterReceiveInterest` + `scheduleEvent`); ndn-rs's own
+  strategies are free to use it but ported NFD strategy code should
+  fall back to the callback pattern.  No wire-format effect. (*D.14.*)
+
+- **`StrategyFilter` composition is an opt-in ndn-rs extension** —
+  the strategy-choice management surface (Phase E) still enforces
+  one strategy per prefix matching NFD; filters layer on at engine-
+  builder time only. (*D.15.*)
+
+- **`/localhost` scope enforced upstream of FIB LPM** — the decode-
+  stage scope drop runs before `StrategyStage::process` calls
+  `self.fib.lpm(&name)`, so a `/localhost` Interest reaching the
+  strategy stage is guaranteed to have arrived on a local face. (*D.17.*)
+
+- **Default-strategy fallback matches NFD `best-route`** — when the
+  per-prefix `StrategyTable` LPM lookup misses, `StrategyStage`
+  falls through to `BestRouteStrategy`, which is NFD's default
+  StrategyChoice for the root namespace. (*D.18.*)
 
 ### Management protocol (Phase E)
 
