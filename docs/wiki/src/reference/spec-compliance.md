@@ -3,10 +3,10 @@
 As of 2026-05-13, the compliance picture for ndn-rs is substantially improved from
 the initial April audit state. Of 126 findings across phases A–I in
 [`docs/notes/spec-compliance-audit-2026-04-20.md`](https://github.com/Quarmire/ndn-rs/blob/main/docs/notes/spec-compliance-audit-2026-04-20.md),
-**92 findings in phases A–H are resolved with at least a code fix or
+**96 findings in phases A–H are resolved with at least a code fix or
 documented as positive on re-verification**, including all 21 in
-Phase A, 11 of 12 in Phase B, and 18 of 19 in Phase D (per-phase
-counts in the table below sum to 92). All Phase I findings (14) were architectural
+Phase A, 11 of 12 in Phase B, 18 of 19 in Phase D, and all 9 in
+Phase G (per-phase counts in the table below sum to 96). All Phase I findings (14) were architectural
 misunderstandings cleared on the audit pass itself.  Six of those resolutions —
 D.01 (HopLimit decrement), D.02 (/localhop scope), E.01 (management signing),
 E.04 (segmented datasets), G.04 phase 1 (NLSR LSA wire format), and G.04 full
@@ -44,7 +44,7 @@ are not listed as open bugs. Witness paths reference scripts under
 | D | Forwarding pipeline and tables | 19 | 18 | D.16 deferred to Phase E (FIB/RIB mgmt mapping) — no forwarding-plane gap |
 | E | NFD management protocol | 8 | 8 | E.05 (live notification stream) — BLOCKED-BY-INTEROP only |
 | F | Face implementations | 12 | 6 | Proprietary-transport entries documented: F.07–F.09 (SHM/Serial/BLE), F.11 (wfb stub), F.12 (Internal/Null pattern) |
-| G | Routing, discovery, sync | 9 | 5 | G.05/G.07 proprietary discovery, G.08 ChronoSync absent; G.06 archived in BLOCKED-BY-INTEROP |
+| G | Routing, discovery, sync | 9 | 9 | — Phase G closed (G.06 archived in BLOCKED-BY-INTEROP) |
 | H | Binaries and CLI tools | 11 | 7 | H.04 (DOCS — `encode_data_unsigned` naming), H.06/H.07 are positives |
 | I | Cross-cutting architectural misunderstandings | 14 | 14 | All cleared as of audit. |
 
@@ -383,6 +383,27 @@ testbed Docker environment.
   forwarder consumer at the dispatcher rather than being decoded and dropped.
   Architectural fix paired with the D.14 forwarding-information enricher.
   (*G.09.*)
+
+- **SVS wire format matches ndn-svs C++** — `ndn-sync` uses
+  `TLV_STATE_VECTOR = 0xC9`, `TLV_SV_ENTRY = 0xCA`,
+  `TLV_SV_SEQ_NO = 0xCC`, `TLV_MAPPING_DATA = 0xCD`,
+  `TLV_MAPPING_ENTRY = 0xCE`, matching `named-data/ndn-svs`'s
+  `tlv.hpp`.  SyncInterests follow the `/<group-prefix>/svs`
+  ApplicationParameters convention.  (*G.01.*)
+
+- **`DvrProtocol` scoped as proprietary ndn-rs routing** — distance-
+  vector routing over NDN with no published spec or cross-
+  implementation peer.  For inter-implementation routing use NLSR
+  (G.04); DVR is available for ndn-rs-only topologies. (*G.05.*)
+
+- **`service_discovery` (BROWSE/ANNOUNCE/WITHDRAW) is ndn-rs-internal** —
+  no published NDN standard exists at this layer.  The module is
+  scoped for ndn-rs-internal interop only. (*G.07.*)
+
+- **ChronoSync absence is a deliberate scope choice** — the
+  historical first NDN sync protocol is unimplemented; modern
+  deployments use SVS, which ndn-rs ships with spec-correct wire
+  format and canonical-Name keying. (*G.08.*)
 
 ### Management tool (Phase H)
 
