@@ -3,7 +3,7 @@
 As of 2026-05-13, the compliance picture for ndn-rs is substantially improved from
 the initial April audit state. Of 126 findings across phases A–I in
 [`docs/notes/spec-compliance-audit-2026-04-20.md`](https://github.com/Quarmire/ndn-rs/blob/main/docs/notes/spec-compliance-audit-2026-04-20.md),
-61 findings in phases A–H are resolved with at least a code fix. Six of those —
+64 findings in phases A–H are resolved with at least a code fix. Six of those —
 D.01 (HopLimit decrement), D.02 (/localhop scope), E.01 (management signing),
 E.04 (segmented datasets), G.04 phase 1 (NLSR LSA wire format), and G.04 full
 NLSR interop — have been witnessed against C++ NFD or C++ NLSR via the live
@@ -35,10 +35,10 @@ are not listed as open bugs. Witness paths reference scripts under
 | Phase | Topic | Total | Resolved | Highest-impact open findings |
 |-------|-------|------:|--------:|------------------------------|
 | A | Wire format: TLV, Name, Interest, Data, Nack | 21 | 12 | — |
-| B | NDNLPv2 link protocol | 12 | 3 | B.10 (reassembly buffer unbounded, MINOR) |
+| B | NDNLPv2 link protocol | 12 | 4 | — |
 | C | Signatures, certificates, trust schema, NDNCERT | 18 | 16 | C.09, C.15 are positives — Phase C effectively complete |
-| D | Forwarding pipeline and tables | 18 | 10 | D.08 (4-byte nonce collision handling, MINOR), D.11 (CS fall-through on freshness miss, MINOR) |
-| E | NFD management protocol | 8 | 6 | E.02 (source-face identity from PIT not face, MINOR), E.07 (faces/update stub, MINOR) |
+| D | Forwarding pipeline and tables | 18 | 11 | D.08 (4-byte nonce collision handling, MINOR) |
+| E | NFD management protocol | 8 | 7 | E.02 (source-face identity from PIT not face, MINOR) |
 | F | Face implementations | 12 | 4 | F.04 (TCP bare TLV, no LP wrapping, MINOR), F.10 (Ethernet open TODOs, MINOR) |
 | G | Routing, discovery, sync | 9 | 4 | G.06 (SWIM vs AutoConfig — archived, tracked in BLOCKED-BY-INTEROP) |
 | H | Binaries and CLI tools | 11 | 6 | — |
@@ -288,8 +288,12 @@ testbed Docker environment.
 > `ContentType::PrefixAnn` (5) are now typed enum variants.
 > Witness: `testbed/tests/audit/a14_content_type_typed_variants.sh`.
 
-- **NDNLPv2 reassembly buffer memory unbounded.** A peer may inflate ndn-rs
-  memory by sending many partial fragment chains. (*B.10.*)
+> **B.10 RESOLVED 2026-05-13** — `ReassemblyBuffer` is now capped at
+> `MAX_PENDING_PACKETS = 1024` concurrent partial groups.  Insertions
+> over the cap run a lazy `purge_expired` first and then evict the
+> oldest entry, so a peer flooding never-completed first-fragments
+> cannot inflate buffer memory between external ticks.  Witness:
+> `testbed/tests/audit/b10_reassembly_cap.sh`.
 
 > **D.06 RESOLVED 2026-05-13** — `StrategyStage` now records each
 > outbound `(face_id, nonce)` pair in the PIT entry's `out_records`
@@ -300,11 +304,22 @@ testbed Docker environment.
 > Developer Guide §3.4.  Witness:
 > `testbed/tests/audit/d06_pit_out_record_dedup.sh`.
 
-- **ContentStore freshness check at match time does not fall through to upstream
-  on a MustBeFresh miss.** The pipeline drops rather than forwarding. (*D.11.*)
+> **D.11 RESOLVED 2026-05-13 (positive finding)** — Re-verified
+> against the audit doc: both LRU and Fjall CS backends drop stale
+> entries when `MustBeFresh` is set
+> (`crates/spec/ndn-store/src/{lru_cs.rs:83,fjall_cs.rs:267}`), and
+> `CsLookupStage` returns `Action::Continue` on every miss
+> (`crates/spec/ndn-engine/src/stages/cs.rs:33`) so the Interest
+> falls through to PIT + strategy + upstream forwarding.  The
+> earlier wiki summary was incorrect.
 
-- **`faces/update` verb declared but not implemented in the management handler.**
-  (*E.07.*)
+> **E.07 RESOLVED 2026-05-13** — `mgmt::faces_*` now dispatches
+> `verb::UPDATE` to a `faces_update` handler.  The handler returns
+> a 200 ControlResponse for a no-op (FaceId-only) request and a 409
+> ControlResponse when the caller asks for a runtime parameter
+> ndn-rs does not yet expose (`Flags`, `Mask`, `FacePersistency`,
+> `Mtu`).  Management privilege gate matches `faces/destroy`.
+> Witness: `testbed/tests/audit/e07_faces_update_verb.sh`.
 
 > **E.08 RESOLVED 2026-05-13** — `FaceStatus` now emits `Flags`
 > (0x6c), `NSatisfiedInterests` (0x99), and `NUnsatisfiedInterests`
