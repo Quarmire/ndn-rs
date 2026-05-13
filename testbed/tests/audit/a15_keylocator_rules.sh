@@ -27,10 +27,27 @@ fail=0
 if cargo test -p ndn-packet --features std --lib --quiet \
         a15_keylocator_ \
         >/tmp/a15_witness.log 2>&1; then
-    echo "ok: KeyLocator rules enforced per SignatureType"
+    echo "ok: SignatureInfo::decode enforces KeyLocator rules per SignatureType"
 else
     echo "FAIL: a15_keylocator_* tests did not pass"
     cat /tmp/a15_witness.log
+    fail=1
+fi
+
+# 2026-05-13 — extend A.15 to the outer decoders.  The previous
+# SignatureInfo::decode rule held but Data::decode and
+# Interest::decode swallowed the error via the lazy `sig_info()`
+# accessor's `.ok().flatten()`, so a malformed packet decoded
+# silently with `sig_info() == None`.  Now the body-structure
+# validators call SignatureInfo::decode eagerly when they see the
+# signature TLV.
+if cargo test -p ndn-packet --features std --lib --quiet \
+        a15_data_decode_rejects_ \
+        >/tmp/a15_outer_witness.log 2>&1; then
+    echo "ok: Data::decode surfaces KeyLocator-rule violations eagerly"
+else
+    echo "FAIL: a15_data_decode_rejects_* tests did not pass"
+    cat /tmp/a15_outer_witness.log
     fail=1
 fi
 

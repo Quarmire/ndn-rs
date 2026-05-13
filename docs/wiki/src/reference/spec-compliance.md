@@ -3,7 +3,7 @@
 As of 2026-05-13, the compliance picture for ndn-rs is substantially improved from
 the initial April audit state. Of 126 findings across phases A–I in
 [`docs/notes/spec-compliance-audit-2026-04-20.md`](https://github.com/Quarmire/ndn-rs/blob/main/docs/notes/spec-compliance-audit-2026-04-20.md),
-53 findings in phases A–H are resolved with at least a code fix. Six of those —
+57 findings in phases A–H are resolved with at least a code fix. Six of those —
 D.01 (HopLimit decrement), D.02 (/localhop scope), E.01 (management signing),
 E.04 (segmented datasets), G.04 phase 1 (NLSR LSA wire format), and G.04 full
 NLSR interop — have been witnessed against C++ NFD or C++ NLSR via the live
@@ -34,10 +34,10 @@ are not listed as open bugs. Witness paths reference scripts under
 
 | Phase | Topic | Total | Resolved | Highest-impact open findings |
 |-------|-------|------:|--------:|------------------------------|
-| A | Wire format: TLV, Name, Interest, Data, Nack | 21 | 10 | A.12 (invented bare-Nack TLV, MAJOR), A.15 (KeyLocator rules per SignatureType not enforced, MAJOR) |
-| B | NDNLPv2 link protocol | 12 | 2 | B.02 (unknown LP header TLVs not rejected, MAJOR), B.10 (reassembly buffer unbounded, MINOR) |
+| A | Wire format: TLV, Name, Interest, Data, Nack | 21 | 12 | — |
+| B | NDNLPv2 link protocol | 12 | 3 | B.10 (reassembly buffer unbounded, MINOR) |
 | C | Signatures, certificates, trust schema, NDNCERT | 18 | 16 | C.09, C.15 are positives — Phase C effectively complete |
-| D | Forwarding pipeline and tables | 18 | 8 | D.12 (CS admits unvalidated Data by default, MAJOR), D.06 (nonce regeneration on outgoing, MINOR), D.08 (4-byte nonce collision handling, MINOR) |
+| D | Forwarding pipeline and tables | 18 | 9 | D.06 (nonce regeneration on outgoing, MINOR), D.08 (4-byte nonce collision handling, MINOR) |
 | E | NFD management protocol | 8 | 5 | E.02 (source-face identity from PIT not face, MINOR), E.07 (faces/update stub, MINOR), E.08 (FaceStatus Flags field absent, MINOR) |
 | F | Face implementations | 12 | 4 | F.04 (TCP bare TLV, no LP wrapping, MINOR), F.10 (Ethernet open TODOs, MINOR) |
 | G | Routing, discovery, sync | 9 | 4 | G.06 (SWIM vs AutoConfig, MAJOR) |
@@ -237,21 +237,35 @@ testbed Docker environment.
 
 ### MAJOR — deviations a reference implementation would reject or misinterpret
 
-- **`Nack::decode` accepts a non-standard bare Nack TLV (0x0320)** not defined
-  by NDNLPv2. Test helper `build_nack` still emits this form; a conforming peer
-  would not produce it. (*A.12.*)
+> **A.12 RESOLVED 2026-04 (witness 2026-05-13 sweep)** — `Nack::decode`
+> rejects any outer TLV that is not `LpPacket` (0x64) and only accepts
+> the NDNLPv2-wrapped Nack form.  The legacy bare-Nack test helper has
+> been removed.  Witness: `testbed/tests/audit/a12_nack_lp_only.sh`.
 
-- **`KeyLocator` required/forbidden rules per `SignatureType` are unenforced.**
-  A `DigestSha256`-labelled packet may carry a `KeyLocator`; an `Ed25519` packet
-  may omit one. No validation at decode time. (*A.15.*)
+> **A.15 RESOLVED 2026-05-13** — `Data::decode` and `Interest::decode`
+> now call `SignatureInfo::decode` eagerly when they see the signature
+> TLV.  KeyLocator-by-`SignatureType` rule violations
+> (`DigestSha256` with a KeyLocator, `Ed25519` without one, etc.)
+> are now surfaced as `KeyLocatorRule` errors at outer-packet decode
+> time instead of being silently swallowed by the lazy `sig_info()`
+> accessor.  Witness: `testbed/tests/audit/a15_keylocator_rules.sh`
+> (extended with `a15_data_decode_rejects_*` cases).
 
-- **Unknown LP header TLVs silently ignored.** `LpPacket::decode` iterates with
-  `_ => {}` on the header field loop rather than checking the critical-bit rule
-  for LP field TLV-TYPEs. (*B.02.*)
+> **B.02 RESOLVED 2026-05-13** — `LpPacket::decode` enforces the
+> critical-bit rule (`is_critical_tlv_type`) on unknown LP header
+> TLVs instead of silently skipping them.  Unknown ODD types
+> (critical) reject with `MalformedPacket`; unknown EVEN types
+> (non-critical) are tolerated for forward compat.  Witness:
+> `testbed/tests/audit/b02_lp_unknown_critical.sh`.
 
-- **ContentStore admits Data without signature verification** when the engine is
-  built without a `Validator` (the default factory). An injected forged Data
-  packet would satisfy subsequent Interests from cache. (*D.12.*)
+> **D.12 RESOLVED 2026-05-13** — `ValidationStage::process` no longer
+> opportunistically sets `ctx.verified = true` when the engine was built
+> without a `Validator`.  The fix is fail-secure: `validator = None`
+> returns `Action::Satisfy(ctx)` without touching `verified`, so
+> `CsInsertStage` (`stages/cs.rs:50`) skips admission.  Local-face Data
+> is still cached because `dispatcher/pipeline.rs:320` short-circuits
+> `verified = true` for `FaceScope::Local` Data before this stage runs.
+> Witness: `testbed/tests/audit/d12_cs_unverified_admission.sh`.
 
 - **Neighbor discovery uses a SWIM-style protocol, not NDN AutoConfig.** The
   Hello/gossip protocol in `ndn-discovery` uses ndn-rs-defined TLV types and
