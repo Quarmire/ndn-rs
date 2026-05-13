@@ -19,6 +19,8 @@ on:
     branches: [main]
     paths:
       - "crates/spec/ndn-faces/src/net/websocket.rs"
+      - "crates/spec/ndn-mgmt/**"
+      - "crates/tooling/ndn-dashboard/**"
       - "binaries/spec/ndn-fwd/**"
       - "testbed/tests/browser/**"
       - ".github/workflows/browser.yml"
@@ -27,6 +29,8 @@ on:
     branches: [main]
     paths:
       - "crates/spec/ndn-faces/src/net/websocket.rs"
+      - "crates/spec/ndn-mgmt/**"
+      - "crates/tooling/ndn-dashboard/**"
       - "binaries/spec/ndn-fwd/**"
       - "testbed/tests/browser/**"
       - ".github/workflows/browser.yml"
@@ -96,6 +100,11 @@ jobs:
 
       - name: Build shared_engine wasm bundle
         run: bash testbed/tests/browser/build-shared-engine.sh
+
+      # `wsmgmt_wire.spec.ts` loads the dashboard's `WsMgmtClient`
+      # exposed via wasm-bindgen under the `witness-export` feature.
+      - name: Build ndn-dashboard mgmt-wire witness bundle
+        run: bash testbed/tests/browser/build-dashboard-witness.sh
 
       # ── Node.js: install deps, bundle NDNts, install browsers ───────────────
 
