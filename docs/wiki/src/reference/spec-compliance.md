@@ -3,7 +3,7 @@
 As of 2026-05-13, the compliance picture for ndn-rs is substantially improved from
 the initial April audit state. Of 126 findings across phases A–I in
 [`docs/notes/spec-compliance-audit-2026-04-20.md`](https://github.com/Quarmire/ndn-rs/blob/main/docs/notes/spec-compliance-audit-2026-04-20.md),
-66 findings in phases A–H are resolved with at least a code fix. Six of those —
+69 findings in phases A–H are resolved with at least a code fix. Six of those —
 D.01 (HopLimit decrement), D.02 (/localhop scope), E.01 (management signing),
 E.04 (segmented datasets), G.04 phase 1 (NLSR LSA wire format), and G.04 full
 NLSR interop — have been witnessed against C++ NFD or C++ NLSR via the live
@@ -39,7 +39,7 @@ are not listed as open bugs. Witness paths reference scripts under
 | C | Signatures, certificates, trust schema, NDNCERT | 18 | 16 | C.09, C.15 are positives — Phase C effectively complete |
 | D | Forwarding pipeline and tables | 18 | 12 | — |
 | E | NFD management protocol | 8 | 8 | — |
-| F | Face implementations | 12 | 4 | F.04 (TCP bare TLV, no LP wrapping, MINOR), F.10 (Ethernet open TODOs, MINOR) |
+| F | Face implementations | 12 | 6 | — |
 | G | Routing, discovery, sync | 9 | 4 | G.06 (SWIM vs AutoConfig — archived, tracked in BLOCKED-BY-INTEROP) |
 | H | Binaries and CLI tools | 11 | 6 | — |
 | I | Cross-cutting architectural misunderstandings | 14 | 14 | All cleared as of audit. |
@@ -349,6 +349,23 @@ testbed Docker environment.
 > `face-net` reliability is wired up.  Witness:
 > `testbed/tests/audit/e08_face_status_flags.sh`.
 
+> **F.10 RESOLVED 2026-05-13 (positive)** — Re-verified against the
+> audit doc: the wire-level pieces are spec-correct on every backend
+> (`l2/{ether,ether_macos,ether_windows,af_packet,ndrv,pcap_face,
+> multicast_ether}.rs`) — EtherType `0x8624` and NDN multicast MAC
+> `01:00:5e:00:17:aa`, matching NFD.  The original audit text
+> flagged ~46 FIXMEs around `AF_PACKET` mmap tuning / socket
+> lifecycle as implementation quality (not a spec gap); they remain
+> tracked as engineering work in `docs/notes/`.
+
+> **F.04 RESOLVED 2026-05-13** — Egress on non-local faces is
+> wrapped in an LpPacket so per-hop NDNLPv2 headers
+> (`CongestionMark`, `NextHopFaceId`, `IncomingFaceId`,
+> `PitToken` on Data) have a frame to live in, matching NFD's
+> `GenericLinkService` behaviour on network faces.  Local-scope
+> faces keep bare TLV.  Witness:
+> `testbed/tests/audit/f04_lp_wrap_nonlocal_egress.sh`.
+
 > **F.02 RESOLVED 2026-05-12** — `MulticastUdpFace::ndn_default` now
 > binds the multicast group on UDP/56363, matching NFD's
 > `DEFAULT_MULTICAST_PORT` (`daemon/face/multicast-udp-factory.cpp`).
@@ -370,10 +387,15 @@ testbed Docker environment.
 
 ### DOCS — documentation was incorrect or stale
 
-- **`ndn-bench` uses `DataBuilder::build()` for load Data.** Benchmark throughput
-  numbers reflect the DigestSha256 path, not real Ed25519 signing. Results are
-  valid for relative comparisons but not as absolute throughput under production
-  signing. (*H.09.*)
+> **H.09 RESOLVED 2026-05-13** — `ndn-bench` does not actually emit
+> signed Data; on inspection it measures `InProcHandle ↔
+> InProcFace` channel round-trip overhead with a fixed 3-byte
+> dummy payload and never reaches the signing or CS paths.  The
+> crate-level doc on `binaries/tooling/ndn-bench/src/main.rs`
+> declares this scope explicitly (no end-to-end forwarding, no
+> signing throughput) so readers do not misinterpret the numbers.
+> Use `ndn-iperf` against a wired-up `ForwarderEngine` for real
+> benchmarks.
 
 ## BLOCKED-BY-INTEROP
 
