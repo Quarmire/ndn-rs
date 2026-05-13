@@ -1,0 +1,37 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>ndn-dashboard mgmt-wire witness</title>
+</head>
+<body>
+  <p>ndn-dashboard mgmt-wire witness fixture — drives WsMgmtClient
+     against a live ndn-fwd from Playwright.</p>
+  <pre id="log"></pre>
+  <script src="/dashboard-witness-pkg/dashboard_witness.js"></script>
+  <script>
+    function log(msg) {
+      const el = document.getElementById('log');
+      el.textContent += msg + '\n';
+      console.log('[witness]', msg);
+    }
+
+    (async () => {
+      await wasm_bindgen('/dashboard-witness-pkg/dashboard_witness_bg.wasm');
+      // Hoist the witness API onto `window` so Playwright can call it.
+      window.__witness = {
+        status_general:  wasm_bindgen.witness_status_general,
+        faces_list:      wasm_bindgen.witness_faces_list,
+        cs_config:       wasm_bindgen.witness_cs_config,
+        face_create:     wasm_bindgen.witness_face_create,
+        rib_register:    wasm_bindgen.witness_rib_register,
+      };
+      window.__witnessReady = true;
+      log('witness API ready');
+    })().catch((e) => {
+      log('init failed: ' + e);
+      console.error(e);
+    });
+  </script>
+</body>
+</html>
