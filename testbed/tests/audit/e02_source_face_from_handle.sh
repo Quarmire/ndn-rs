@@ -57,11 +57,11 @@ grep -q 'engine.set_local_fields(face_id, true);' "$MGMT" \
 #    IncomingFaceId.
 grep -q 'local_fields_enabled' "$OUT" \
     || fail "dispatcher does not gate LP wrap on LocalFieldsEnabled"
-grep -q 'incoming_face_id: Some(ctx.face_id.0 as u64)' "$OUT" \
+grep -qE 'incoming_face_id: Some\(ctx\.face_id\.0( as u64)?\)' "$OUT" \
     || fail "dispatcher does not attach IncomingFaceId on local-fields egress"
 
 # 4. Mgmt handler reads IncomingFaceId from the LP wrapper.
-grep -q 'lp.incoming_face_id.map(|id| FaceId(id as u32))' "$MGMT" \
+grep -qE 'lp\.incoming_face_id\.map\((\|id\| FaceId\(id( as u32| as u64)?\)|FaceId)\)' "$MGMT" \
     || fail "mgmt handler does not extract IncomingFaceId from LP header"
 grep -q 'let source_face = source_face_from_lp.or_else' "$MGMT" \
     || fail "mgmt handler does not prefer LP IncomingFaceId over PIT lookup"
