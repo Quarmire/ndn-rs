@@ -1,9 +1,9 @@
 # NDN Specification Compliance
 
-As of 2026-05-08, the compliance picture for ndn-rs is substantially improved from
+As of 2026-05-13, the compliance picture for ndn-rs is substantially improved from
 the initial April audit state. Of 126 findings across phases A–I in
 [`docs/notes/spec-compliance-audit-2026-04-20.md`](https://github.com/Quarmire/ndn-rs/blob/main/docs/notes/spec-compliance-audit-2026-04-20.md),
-49 findings in phases A–H are resolved with at least a code fix. Six of those —
+53 findings in phases A–H are resolved with at least a code fix. Six of those —
 D.01 (HopLimit decrement), D.02 (/localhop scope), E.01 (management signing),
 E.04 (segmented datasets), G.04 phase 1 (NLSR LSA wire format), and G.04 full
 NLSR interop — have been witnessed against C++ NFD or C++ NLSR via the live
@@ -34,12 +34,12 @@ are not listed as open bugs. Witness paths reference scripts under
 
 | Phase | Topic | Total | Resolved | Highest-impact open findings |
 |-------|-------|------:|--------:|------------------------------|
-| A | Wire format: TLV, Name, Interest, Data, Nack | 21 | 7 | A.12 (invented bare-Nack TLV, MAJOR), A.15 (KeyLocator rules per SignatureType not enforced, MAJOR), A.17 (BLAKE3 SignatureType codes in spec-reserved range, DOCS/registered) |
+| A | Wire format: TLV, Name, Interest, Data, Nack | 21 | 10 | A.12 (invented bare-Nack TLV, MAJOR), A.15 (KeyLocator rules per SignatureType not enforced, MAJOR) |
 | B | NDNLPv2 link protocol | 12 | 2 | B.02 (unknown LP header TLVs not rejected, MAJOR), B.10 (reassembly buffer unbounded, MINOR) |
 | C | Signatures, certificates, trust schema, NDNCERT | 18 | 16 | C.09, C.15 are positives — Phase C effectively complete |
 | D | Forwarding pipeline and tables | 18 | 8 | D.12 (CS admits unvalidated Data by default, MAJOR), D.06 (nonce regeneration on outgoing, MINOR), D.08 (4-byte nonce collision handling, MINOR) |
 | E | NFD management protocol | 8 | 5 | E.02 (source-face identity from PIT not face, MINOR), E.07 (faces/update stub, MINOR), E.08 (FaceStatus Flags field absent, MINOR) |
-| F | Face implementations | 12 | 3 | F.02 (multicast UDP port 6363 vs 56363, MINOR), F.04 (TCP bare TLV, no LP wrapping, MINOR), F.10 (Ethernet open TODOs, MINOR) |
+| F | Face implementations | 12 | 4 | F.04 (TCP bare TLV, no LP wrapping, MINOR), F.10 (Ethernet open TODOs, MINOR) |
 | G | Routing, discovery, sync | 9 | 4 | G.06 (SWIM vs AutoConfig, MAJOR) |
 | H | Binaries and CLI tools | 11 | 4 | H.02 (ndn-ping prefix not ndn-cxx compatible, MINOR), H.03 (ndn-iperf proprietary naming, MINOR) |
 | I | Cross-cutting architectural misunderstandings | 14 | 14 | All cleared as of audit. |
@@ -262,16 +262,18 @@ testbed Docker environment.
 
 ### MINOR — strictness gaps and edge cases
 
-- **BLAKE3 SignatureType codes 6 and 7** were in the spec-reserved range at
-  audit time. Issue #12 (yoursunny) has since registered both values on the
-  NDN TLV SignatureType registry. Any documentation still describing these as
-  "experimental and unregistered" should be updated. (*A.17.*)
+> **A.17 RESOLVED 2026-05-12** — BLAKE3 SignatureType codes 6 and 7 are
+> now registered on the NDN TLV SignatureType registry (yoursunny issue #12
+> closed).  Any remaining documentation describing them as "experimental
+> and unregistered" should be updated; the codes are spec-stable.
 
-- **`Nonce` length mismatch silently drops the nonce** rather than rejecting the
-  Interest. (*A.13.*)
+> **A.13 RESOLVED 2026-05-12** — `Interest::decode` now rejects any
+> Nonce TLV whose length is not exactly 4 bytes (NDN Packet Format
+> v0.3 §3.2).  Witness: `testbed/tests/audit/a13_nonce_length_rejected.sh`.
 
-- **`MetaInfo::ContentType` missing `Manifest (4)` and `PrefixAnn (5)` typed
-  variants.** These content types decode as `Other(n)`. (*A.14.*)
+> **A.14 RESOLVED 2026-05-12** — `ContentType::Manifest` (4) and
+> `ContentType::PrefixAnn` (5) are now typed enum variants.
+> Witness: `testbed/tests/audit/a14_content_type_typed_variants.sh`.
 
 - **NDNLPv2 reassembly buffer memory unbounded.** A peer may inflate ndn-rs
   memory by sending many partial fragment chains. (*B.10.*)
@@ -288,8 +290,12 @@ testbed Docker environment.
 - **`FaceStatus` TLV omits `Flags` (0x6C)** and aggregate counters `NInSatisfied` /
   `NInUnsatisfied`. `nfdc face list` shows these as zero. (*E.08.*)
 
-- **Multicast UDP group uses port 6363.** Modern NFD defaults to 56363 for the
-  multicast group. (*F.02.*)
+> **F.02 RESOLVED 2026-05-12** — `MulticastUdpFace::ndn_default` now
+> binds the multicast group on UDP/56363, matching NFD's
+> `DEFAULT_MULTICAST_PORT` (`daemon/face/multicast-udp-factory.cpp`).
+> The new `NDN_MULTICAST_PORT` constant disambiguates from
+> `NDN_PORT` (unicast).  Witness:
+> `testbed/tests/audit/f02_multicast_port_56363.sh`.
 
 - **`ndn-ping` default prefix `/ping` is not ndn-cxx `ndnping`-compatible.** The
   reference tool expects `/ndn/ping`. (*H.02.*)
