@@ -100,6 +100,12 @@ jobs:
           --exclude ndn-python
           --no-deps
 
+      - name: ndn-dashboard glossary is exhaustive (EduGloss CI guard)
+        # Every `EduGloss { term: "X", ... }` callsite must have a
+        # matching `[[entries]]` block in glossary.toml. See §9.1 of
+        # `docs/notes/dashboard-security-design-2026-05-13.md`.
+        run: cargo run -q -p dash-glossary -- check .
+
       - name: ndn-dashboard ships zero authored JavaScript
         # The dashboard is pure Rust → Dioxus (desktop webview / wasm).
         # The only legitimate `document::eval` callers are in comments
