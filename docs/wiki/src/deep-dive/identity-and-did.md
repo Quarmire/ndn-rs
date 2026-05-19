@@ -264,6 +264,17 @@ translates a cert-layer failure into DID-layer prose ("DID Document
 not fetchable" / "controller missing" / "signature invalid") with a
 fix action.
 
+### DID extensions
+
+DID Documents may carry **extension fields** beyond the W3C-canonical
+core — substrate-defined posture fields, deployment-specific metadata,
+verifiable-credential schemas, anything a deployment chooses to bind
+to the DID. The dashboard exposes a startup-time `DidExtensionRegistry`
+(§4.8) so a built or installed renderer can declare itself for a
+given extension key; unknown extension keys fall back to a
+"Show raw" affordance that prints the JSON value. v1 ships zero
+specific renderers — the registry is the hook, not content.
+
 ## See Also
 
 - [NDNCERT: Automated Certificate Issuance](./ndncert.md) — how devices obtain namespace certificates using NDNCERT, building on the identity foundation described here
