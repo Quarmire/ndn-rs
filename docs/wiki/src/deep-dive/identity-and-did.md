@@ -275,6 +275,24 @@ given extension key; unknown extension keys fall back to a
 "Show raw" affordance that prints the JSON value. v1 ships zero
 specific renderers — the registry is the hook, not content.
 
+### SafeBag
+
+A **SafeBag** is the ndn-cxx-compatible identity-export envelope —
+TLV `0x80` that bundles a certificate Data (TLV `0x06`) with an
+encrypted PKCS#8 private key (TLV `0x81`, PBES2 default parameters).
+The encryption passphrase travels out-of-band; without it the SafeBag
+is opaque. SafeBags interop with `ndnsec export`/`ndnsec import` and
+are the canonical "move my identity between machines" wire.
+
+The ndn-dashboard's §5.1 drag-drop import accepts any `.tpb` (or
+arbitrary SafeBag wire), decodes the cleartext cert in-browser,
+surfaces identity/key/cert/validity for confirmation, runs a
+pre-import trust check against the dashboard's known anchors +
+schema, then fires `/localhost/nfd/security/safebag-import` to
+persist the decrypted identity into the forwarder's PIB. Imports
+never proceed with broken trust — every failure shows the specific
+reason with a remediation hint.
+
 ## See Also
 
 - [NDNCERT: Automated Certificate Issuance](./ndncert.md) — how devices obtain namespace certificates using NDNCERT, building on the identity foundation described here
