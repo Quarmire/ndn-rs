@@ -221,6 +221,49 @@ let validator = Validator::builder()
 
 This closes the loop on the bootstrap problem. Instead of burning a raw certificate into firmware, you burn a DID. The device resolves that DID on first boot to obtain the CA's public key, then uses that key as the trust anchor for all future certificate validation.
 
+## DID Document anatomy (dashboard glossary anchors)
+
+The ndn-dashboard §4.7 DID lens links these subsections directly from
+its inline glosses.
+
+### DID verification methods
+
+A **verification method** is one entry under `verificationMethod` in a
+DID Document — a key that's allowed to sign as the DID. Each entry has
+an `id` (DID URL like `did:ndn:/lab/alice#k1`), a `type`
+(`Ed25519VerificationKey2020`, `JsonWebKey2020`, …), and a
+`controller`. Verification relationships (`authentication`,
+`assertionMethod`, `keyAgreement`, `capabilityInvocation`,
+`capabilityDelegation`) reference these methods by id and pin *what*
+the key is allowed to do. ([W3C DID Core §5.2](https://www.w3.org/TR/did-core/#verification-methods))
+
+### DID controllers
+
+The **controller** of a DID is the DID (or set of DIDs) authorized to
+update or deactivate its DID Document. When the field is absent, the
+subject controls itself. In NDN the controller is typically the parent
+namespace's DID — `did:ndn:/lab/alice`'s controller is `did:ndn:/lab`,
+mirroring NDN's hierarchical namespace delegation. ([W3C DID Core §5.1.2](https://www.w3.org/TR/did-core/#did-controller))
+
+### DID service endpoints
+
+A **service endpoint** declares a location (NDN prefix, URL, or
+structured value) where this DID's data or interactions live.
+Examples: an inbox prefix, a credential offer endpoint, a CA's
+NDNCERT base name. ([W3C DID Core §5.4](https://www.w3.org/TR/did-core/#services))
+
+### DID resolution
+
+**Resolution** fetches and verifies a DID Document. For `did:ndn`:
+follow the KeyLocator to the cert at the DID-derived name, validate
+the cert chain back to an installed trust anchor, decode the DID
+Document from the cert payload, apply controller/service rules. The
+dashboard's §4.7.2 search box composes this trace on top of the
+existing §4.2 cert-chain trace; the §4.7.3 failure inspector
+translates a cert-layer failure into DID-layer prose ("DID Document
+not fetchable" / "controller missing" / "signature invalid") with a
+fix action.
+
 ## See Also
 
 - [NDNCERT: Automated Certificate Issuance](./ndncert.md) — how devices obtain namespace certificates using NDNCERT, building on the identity foundation described here
