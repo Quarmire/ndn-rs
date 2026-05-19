@@ -1,20 +1,25 @@
 #!/usr/bin/env bash
-# Witness for audit finding G.05 — ndn-rs's DvrProtocol diverged from its
-# intended ndnd-DV derivation. This witness pins the current ndn-rs wire
-# format (regression catch) and asserts that ndnd's distinct TLV codes are
-# NOT present in the current implementation — making the divergence
-# mechanically visible until v0.2 alignment work lands.
+# Witness for audit finding G.05 — ndn-rs's DvrProtocol does not implement
+# the published ndn-dv specification. This witness pins the current ndn-rs
+# wire format (regression catch) and asserts that the spec's TLV codes are
+# NOT present in the current implementation — making the gap mechanically
+# visible until the v0.2 spec-aligned implementation lands.
 #
 # Finding:    docs/notes/spec-compliance-audit-2026-04-20.md § G.05
-# Follow-up:  docs/notes/dvr-ndnd-alignment-NEXT.md
-# Severity:   DOCUMENTED 2026-05-19 (intended ndnd derivation; current
-#             implementation is a prefix-vector protocol with different
-#             TLV codes and architecture — Interest broadcast vs ndnd's
-#             SVS-driven advertisement sync).
+# Follow-up:  docs/notes/dvr-ndnd-alignment-NEXT.md (v0.2 implementation plan)
+# Severity:   MAJOR (revised 2026-05-19 from MINOR; current impl uses
+#             non-spec TLV codes 0xD0-0xD4 instead of the spec's 201/202/
+#             204/206/208/210/301... and an Interest-broadcast architecture
+#             instead of the spec's SVS-ALO advertisement sync).
 # Type:       GREP-PROOF
-# Reference:  ~/Documents/Dev/ndnd/dv/tlv/definitions.go (ndnd TLV codes);
-#             ~/Documents/Dev/ndnd/dv/dv/{router.go,advert_sync.go}
-#             (SVS-driven architecture).
+# Spec:       ~/Documents/Dev/ndnd/dv/SPEC.md §3 (TLV codes are decimal:
+#             ADVERTISEMENT=201, ADV-ENTRY=202, DESTINATION=204,
+#             NEXT-HOP=206, COST=208, OTHER-COST=210, PREFIX-OP-LIST=301,
+#             PREFIX-OP-RESET=302, PREFIX-OP-ADD=304, PREFIX-OP-REMOVE=306).
+# Paper:      Patil et al, "Distance Vector Routing for Named Data
+#             Networking", CoNEXT '24, DOI 10.1145/3680121.3699885
+#             (local: ~/Downloads/ndn-drv.pdf).
+# Reference:  ~/Documents/Dev/ndnd/dv/ (Go reference implementation).
 #
 # What this pins (ndn-rs's current wire format):
 #   T_DVR_UPDATE = 0xD0 (root TLV for DVR advertisement AppParams)
@@ -24,22 +29,24 @@
 #   T_DVR_COST   = 0xD4
 #   Interest name prefix: /ndn/local/dvr/adv
 #
-# What this asserts is NOT in the ndn-rs DVR file (ndnd's distinct codes):
-#   - `0xC9` Advertisement
-#   - `0xCA` Entries
-#   - `0xCC` Destination
-#   - `0xCE` NextHop
-#   - `0x12D` PrefixOpList
-#   - `Destination`, `NextHop`, `OtherCost`, `PrefixOpAdd`, `PrefixOpRemove`
-#     identifiers (which would only appear if the ndnd model were adopted).
+# What this asserts is NOT in the ndn-rs DVR file (spec's authoritative
+# codes per SPEC.md §3 — should all appear once the v0.2 alignment lands):
+#   - 0xC9  / 201  Advertisement
+#   - 0xCA  / 202  AdvEntry
+#   - 0xCC  / 204  Destination
+#   - 0xCE  / 206  NextHop
+#   - 0x12D / 301  PrefixOpList
+#   - Spec identifiers AdvEntry, OtherCost, PrefixOpList, PrefixOpAdd,
+#     PrefixOpRemove, NextHop (their presence would mean partial alignment
+#     landed without an audit update).
 #
 # Reverify recipe:
 #   bash testbed/tests/audit/g05_dvr_wire_drift.sh
-#   Expected: exit 0 (PASS) — divergence still present and labelled.
-#   If this script ever fails, it means either (a) ndn-rs's DVR was
-#   re-aligned with ndnd (good — close G.05 and delete this witness), or
-#   (b) a partial alignment landed without updating the audit (bad — fix
-#   the audit text or the code, depending on intent).
+#   Expected: exit 0 (PASS) — gap still present and labelled.
+#   When the v0.2 spec-aligned implementation lands, this witness should be
+#   inverted (or replaced): the spec codes MUST be present, the prefix-
+#   vector codes (T_DVR_*) MUST NOT be present, and a real interop witness
+#   against ndnd's dv/ router gates the closure of G.05.
 #
 # Exit codes: 0 PASS / 1 FAIL
 set -euo pipefail
@@ -139,9 +146,9 @@ fi
 
 echo
 if [ "$fail" -eq 0 ]; then
-    echo "=== G.05 DOCUMENTED — DVR drift from ndnd's dv/ still in effect; alignment tracked for v0.2 ==="
+    echo "=== G.05 MAJOR — DVR does not implement published ndn-dv spec; v0.2 implementation plan tracked ==="
     exit 0
 else
-    echo "=== G.05 FAIL — wire format drifted unexpectedly; reconcile audit text or code ==="
+    echo "=== G.05 FAIL — wire format changed unexpectedly; reconcile audit text or code ==="
     exit 1
 fi
