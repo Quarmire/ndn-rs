@@ -126,7 +126,8 @@ examples/                       Documentation-grade examples (strategy, discover
 
 | Trait / Type | Crate | Role |
 |---|---|---|
-| `Face` | ndn-transport | Async send/recv over any transport |
+| `Face` | ndn-transport | Async send/recv over any transport (`Transport` + `LinkService` composition; see [Face system](#face-system) below) |
+| `LinkServiceFeature` | ndn-transport | Per-LP-frame extension point — Reliability, CongestionMarking, TraceContext, IncomingFaceId, … |
 | `PipelineStage` | ndn-engine | Single processing step; returns `Action` |
 | `Strategy` | ndn-strategy | Forwarding decision per Interest |
 | `ContentStore` | ndn-store | Pluggable cache backend |
@@ -195,6 +196,68 @@ recorded in
   into `ReplayGuardConfig::monotonic()`.  Disabling the guard via
   `EngineBuilder::replay_guard_disabled()` is a test-only escape
   hatch.
+
+## Face system
+
+Each face is a `Transport` (raw bytes — UDP, TCP, Shm, InProc, Ethernet,
+WebTransport, …) paired with a `LinkService` (NDNLPv2 framing, runtime
+options, per-LP-frame feature pipeline). The `Face = Transport + LinkService`
+split mirrors NFD's `daemon/face/face.hpp`.
+
+Two `LinkService` impls ship: `PassthroughLinkService` for local-scope faces
+(no LP framing; carries in-process source-face provenance) and
+`LpLinkService` for non-local faces (LP-wraps every outbound packet; runs the
+feature pipeline below).
+
+**The default `LpLinkService` feature pipeline:**
+
+| Order | Feature                     | Owns                                                    |
+| ---   | ---                         | ---                                                     |
+| 1     | `FragmentationFeature`      | LP fragmentation policy.                                |
+| 2     | `ReassemblyFeature`         | Reassembly buffers on ingress.                          |
+| 3     | `LocalFieldsFeature`        | Gate for `IncomingFaceId` egress stamping.              |
+| 4     | `IncomingFaceIdFeature`     | Stamps source face id when LocalFields bit on.          |
+| 5     | `NackFeature`               | Nack-on-ingress / passthrough on egress.                |
+| 6     | `TraceContextFeature`       | LP `TraceContext` (0x520) codec; Phase-3 OTel hook.     |
+| 7     | `ReliabilityFeature`        | NDNLPv2 reliability state machine — runtime ON/OFF.     |
+| 8     | `CongestionMarkingFeature`  | CoDel egress marking; emits LP `CongestionMark` (0x340). |
+
+**Runtime knobs**: `LinkService::apply(FaceOption)` flips per-feature
+switches; `Transport::set_send_mtu` / `set_persistency` mutate transport-
+level state. The `faces/update` mgmt handler dispatches each option to its
+right home and surfaces failure with a named-field error body
+(`field=<option> reason=<machine-readable>`). Status codes:
+
+- `200 OK` — applied.
+- `400 BAD_PARAMS` — value out of range.
+- `404 NOT_FOUND` — no such face.
+- `409 CONFLICT` — option exists but is immutable on this face / transport.
+- `423 LOCKED` — management-face protection (you can never do this from
+  this role; distinct from `401 UNAUTHORIZED`).
+- `503 SERVICE_UNAVAILABLE` — transport / LinkService doesn't support it.
+
+**Face notifications** publish on `/localhost/nfd/faces/notifications`.
+`FaceEventKind = 0xC1` codepoints:
+
+| Kind  | Variant                | NFD?    |
+| ---   | ---                    | ---     |
+| 1     | `Created`              | ✓       |
+| 2     | `Destroyed`            | ✓       |
+| 3     | `Up`                   | ✓       |
+| 4     | `Down`                 | ✓       |
+| 5     | `MtuChanged`           | ndn-rs  |
+| 6     | `PersistencyChanged`   | ndn-rs  |
+| 7     | `ReliabilityBackoff`   | ndn-rs  |
+| 8     | `CongestionMark`       | ndn-rs  |
+| 9     | `OptionRefused`        | ndn-rs  |
+
+NFD clients ignoring kind > 4 see the lifecycle subset; ndn-rs clients
+(`ndn-ctl`, `ndn-dashboard`) read every kind.
+
+References: [`docs/wiki/src/operations/faces.md`](docs/wiki/src/operations/faces.md)
+(operator guide), [`docs/wiki/src/design/link-service.md`](docs/wiki/src/design/link-service.md)
+(design reference), [`docs/notes/face-system-design-2026-05-20.md`](docs/notes/face-system-design-2026-05-20.md)
+(design doc with every decision + rationale).
 
 ## Task Topology
 

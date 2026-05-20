@@ -43,6 +43,7 @@
 - [Logging and Observability](./guides/logging.md)
 - [Debugging with tokio-console](./operations/tokio-console.md)
 - [NDNCERT Enrollment](./operations/ndncert-enrollment.md)
+- [Faces](./operations/faces.md)
 - [Performance Tuning](./guides/performance-tuning.md)
 - [Setting Up an NDNCERT CA](./guides/ndncert-setup.md)
 - [Fleet and Swarm Security](./guides/fleet-security.md)
@@ -51,6 +52,7 @@
 # Design
 
 - [Design Overview](./design/overview.md)
+- [Link Service composition](./design/link-service.md)
 
 # Deep Dive
 
