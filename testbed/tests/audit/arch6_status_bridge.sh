@@ -56,6 +56,13 @@ check_grep '/localhost/nlsr/status'                  "$FWD/src/installs/dv.rs" '
 check_grep 'Status::encode_content|s\.encode_content' \
     "$FWD/src/installs/dv.rs" 'DV status uses Status::encode_content'
 
+# (2b) NLSR installer mounts the same bridge (Phase-2b S11).
+check_grep 'mount_routing_status\(builder, post_build, status_prefix' \
+    "$FWD/src/installs/nlsr.rs" 'NlsrInstaller calls mount_routing_status'
+check_grep '/localhost/nlsr/status'                  "$FWD/src/installs/nlsr.rs" 'NLSR status prefix matches ndnd dvc'
+check_grep 'Status::encode_content|s\.encode_content' \
+    "$FWD/src/installs/nlsr.rs" 'NLSR status uses ndnd-shape Status::encode_content'
+
 # (3) RUST-INTEG — the producer serves the status_provider bytes.
 echo "→ cargo test -p ndn-mgmt --test status_bridge"
 if ! cargo test --quiet -p ndn-mgmt --test status_bridge >/dev/null 2>&1; then

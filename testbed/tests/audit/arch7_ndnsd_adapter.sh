@@ -38,9 +38,10 @@ MGMT=crates/spec/ndn-mgmt
 
 # (1) Adapter primitive lives in ndn-mgmt + is re-exported.
 check_grep 'pub fn mount_ndnsd_discovery'     "$MGMT/src/ndnsd_adapter.rs" 'mount_ndnsd_discovery helper'
+check_grep 'pub fn mount_ndnsd_service_info' "$MGMT/src/ndnsd_adapter.rs" 'mount_ndnsd_service_info helper (Phase-2b)'
 check_grep 'pub struct NdnsdServiceInfo'      "$MGMT/src/ndnsd_adapter.rs" 'NdnsdServiceInfo type'
-check_grep 'pub use ndnsd_adapter::\{NdnsdServiceInfo, encode_service_list, mount_ndnsd_discovery\}' \
-    "$MGMT/src/lib.rs" 'mgmt re-exports the NDNSD adapter API'
+check_grep 'pub const NDNSD_SERVICE_INFO'     "$MGMT/src/ndnsd_adapter.rs" 'NDNSD_SERVICE_INFO TLV code (Phase-2b canonical TLV)'
+check_grep 'mount_ndnsd_service_info' "$MGMT/src/lib.rs" 'mgmt re-exports per-service mount helper'
 
 # (2) Adapter mounts under the NDNSD layout (`/NDNSD/discovery`).
 check_grep 'NDNSD' "$MGMT/src/ndnsd_adapter.rs" 'NDNSD prefix component'
