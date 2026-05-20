@@ -139,6 +139,30 @@ pub trait StrategyFilter: Send + Sync + 'static {
 
 A filter receives the actions produced by the inner strategy and can transform, prune, or augment them. For example, a rate-limiting filter could replace `Forward` with `Suppress` if the face is congested, without the inner strategy needing to know about congestion control.
 
+### Scope — engine-builder only, never wired into the mgmt surface (ARCH-14 / S7)
+
+`StrategyFilter` is an **ndn-rs-specific extension** over NFD's one-strategy-per-prefix model. NFD's `/localhost/nfd/strategy-choice/{set,unset,list}` mgmt protocol exposes a single strategy per prefix and has no composition primitive; ndn-rs preserves that contract on the wire so NFD-trained tooling (`nfdc strategy-choice set …`) keeps working byte-for-byte.
+
+The composition itself is **assembled at engine-builder time**, not at mgmt time:
+
+```rust
+use ndn_engine::{EngineBuilder, ComposedStrategy};
+
+let strategy = ComposedStrategy::new(
+    BestRouteStrategy::new(),
+    vec![Box::new(RssiFilter::new(threshold))],
+);
+let mut builder = EngineBuilder::new(cfg);
+builder.add_face(face);
+// ...
+// the composition becomes one `dyn Strategy` to the engine + mgmt
+let (engine, _) = builder.strategy(strategy).build().await?;
+```
+
+The mgmt surface sees a single strategy; `strategy-choice/set` installs it for a prefix the same way it would install any built-in. Operators wanting different filter chains per prefix register different `ComposedStrategy` instances during builder construction and use `strategy-choice/set` to bind them. The `StrategyFilter` trait deliberately stays out of the management protocol — runtime reconfiguration of filter chains is intentionally **not** part of v0.1's NFD-parity surface.
+
+This matches the `feedback_no_comparisons` posture: ndn-rs adds capability the embedder can opt into without breaking NFD parity for everyone else.
+
 ## WASM Strategies
 
 The `ndn-strategy-wasm` crate enables loading forwarding strategies as WebAssembly modules at runtime:
