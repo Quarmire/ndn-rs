@@ -20,12 +20,10 @@
 # Reverify recipe: GREP-PROOF + RUST-UNIT. Runs in any checkout of
 # ndn-rs; no Docker required.
 #
-# Note: the prompt's aspirational `main.rs < 800 lines` is checked
-# softly — current main.rs is ~2050 lines after S18 (down from 2602).
-# Further extraction (face listeners, tracing init) is queued as
-# follow-up Phase-2b work; the architectural primitive (the
-# `InstallableProtocol` trait subsuming `routing_protocol*` and
-# `discovery*`) is what ARCH-13 actually gates.
+# Phase-2b update: main.rs is now gated under 800 lines as the
+# prompt called for. The extracted scaffolding lives in
+# `binaries/spec/ndn-fwd/src/{face_setup,host_helpers,security_init,
+# tracing_init,transport_listeners}.rs`.
 #
 # Exit codes:
 #   0 — PASS (InstallableProtocol replaces old methods; main.rs has no
@@ -102,8 +100,14 @@ if ! cargo test --quiet -p ndn-routing >/dev/null 2>&1; then
     fail=1
 fi
 
+# (7) Phase-2b S18 — main.rs is under the 800-line cap.
+main_lines=$(wc -l < "$MAIN" | tr -d ' ')
+if [ "$main_lines" -gt 800 ]; then
+    echo "FAIL: $MAIN is $main_lines lines (cap: 800)" >&2
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
-    main_lines=$(wc -l < "$MAIN" | tr -d ' ')
-    echo "PASS: ARCH-13 — InstallableProtocol entry; main.rs=$main_lines lines (no protocol-specific inline blocks)."
+    echo "PASS: ARCH-13 — InstallableProtocol entry; main.rs=$main_lines lines (no protocol-specific inline blocks; under 800-line cap)."
 fi
 exit "$fail"
