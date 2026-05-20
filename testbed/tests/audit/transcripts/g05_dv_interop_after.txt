@@ -1,0 +1,10 @@
+g05 dv-interop witness — PASS
+  ndn-rs (ndn-fwd-dv) Adv Data applied to RIB: yes
+  ndnd (ndnd-dv) status:
+    General DV status:
+         version=51774b8
+      routerName=/ndn/r-ndnd
+     networkName=/ndn
+     nRibEntries=1
+      nNeighbors=1
+     nFibEntries=0

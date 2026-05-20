@@ -1,0 +1,20 @@
+# ndnd dv daemon configuration for the G.05 interop witness.
+#
+# The `ndnd dv run` binary embeds a built-in forwarder face when
+# `keychain: insecure`, so we don't need a separate `ndnd fw` sidecar.
+# Peers with ndn-fwd-dv at 172.30.0.40 over UDP.
+#
+# Spec: ~/Documents/Dev/ndnd/dv/dv.sample.yml.
+
+dv:
+  network: /ndn
+  router: /ndn/r-ndnd
+
+  keychain: "insecure"
+  trust_anchors: []
+
+  neighbors:
+    - uri: udp4://172.30.0.40:6363
+
+  advertise_interval: 2000
+  router_dead_interval: 30000

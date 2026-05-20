@@ -22,6 +22,7 @@ volumes:
   ndn-fwd-sock:
   nfd-sock:
   yanfd-sock:
+  ndnd-fw-dv-sock:    # shared between ndnd-fw-dv and ndnd-dv (dv daemon's app socket)
   nfd-nlsr-sock:      # shared between nfd-nlsr and nlsr-cxx (Unix socket handoff)
   nlsr-cxx-data:      # /var/lib/nlsr state for C++ NLSR
   ndn-fwd-nlsr-sock:  # management socket for the NLSR-enabled ndn-rs instance
@@ -267,6 +268,78 @@ services:
       retries: 10
       start_period: 10s
     restart: unless-stopped
+
+  # ── ndn-fwd-dv (ndn-rs with ndn-dv routing, for G.05 interop witness) ─────
+  # Pairs with `ndnd-dv` over UDP to prove on-the-wire compatibility
+  # with ndnd's `dv run` daemon. Uses configs/ndn-fwd-dv.toml which
+  # enables `[routing.dv]` with a single static neighbour pointing
+  # at 172.30.0.41 (ndnd-dv). Tight 2 s sync intervals so the witness
+  # converges inside its budget.
+  ndn-fwd-dv:
+    profiles: ["dv-interop"]
+    # Same binary as `ndn-fwd` / `ndn-fwd-nlsr` — only the mounted
+    # config differs. Reuses the pre-built image to skip the cargo-chef
+    # build chain (which can OOM on 8 GB-RAM Docker Desktop hosts).
+    image: ndn-testbed-ndn-fwd:latest
+    build:
+      context: ..
+      dockerfile: binaries/spec/ndn-fwd/Dockerfile
+    container_name: ndn-fwd-dv
+    environment:
+      RUST_LOG: "info,routing.dv=debug,face.udp=info"
+    hostname: ndn-fwd-dv
+    networks:
+      ndn-net:
+        ipv4_address: 172.30.0.40
+    volumes:
+      - ./configs/ndn-fwd-dv.toml:/etc/ndn-fwd/config.toml:ro
+    restart: "no"
+
+  # ── ndnd-fw-dv (ndnd forwarder backing ndnd-dv) ──────────────────────────
+  # `ndnd dv run` connects to a forwarder via a Unix socket; the
+  # ndnd image is FROM scratch, so we run two ndnd processes in two
+  # containers and share `/run/nfd/nfd.sock` via a named volume.
+  # This forwarder listens on UDP 6363 for ndn-rs's Sync Interests.
+  ndnd-fw-dv:
+    profiles: ["dv-interop"]
+    image: ghcr.io/named-data/ndnd:latest
+    container_name: ndnd-fw-dv
+    hostname: ndnd-fw-dv
+    networks:
+      ndn-net:
+        ipv4_address: 172.30.0.41
+    volumes:
+      - ./configs/ndnd-fw-dv.yml:/etc/ndnd/fw.yml:ro
+      - ndnd-fw-dv-sock:/run/nfd
+    command: ["fw", "run", "/etc/ndnd/fw.yml"]
+    healthcheck:
+      test: ["CMD", "/ndnd", "fw", "status"]
+      interval: 3s
+      timeout: 2s
+      retries: 8
+      start_period: 3s
+    restart: "no"
+
+  # ── ndnd-dv (ndnd's distance-vector daemon, G.05 interop peer) ───────────
+  # Runs `ndnd dv run` against an `insecure`-mode config that lists
+  # ndn-fwd-dv (172.30.0.40) as its only neighbour. ndnd's DV daemon
+  # speaks Adv Sync and Pfx Sync via /localhop, exactly the wire
+  # contract `crates/spec/ndn-routing/src/protocols/dv/` implements.
+  ndnd-dv:
+    profiles: ["dv-interop"]
+    image: ghcr.io/named-data/ndnd:latest
+    container_name: ndnd-dv
+    hostname: ndnd-dv
+    depends_on:
+      ndnd-fw-dv:
+        condition: service_healthy
+    networks:
+      ndn-net: {}
+    volumes:
+      - ./configs/ndnd-dv.yml:/etc/ndnd/dv.yml:ro
+      - ndnd-fw-dv-sock:/run/nfd
+    command: ["dv", "run", "/etc/ndnd/dv.yml"]
+    restart: "no"
 
   # ── Test runner (shared tools container) ──────────────────────────────────
   # Used by bench and compliance scripts as the "outside" node.

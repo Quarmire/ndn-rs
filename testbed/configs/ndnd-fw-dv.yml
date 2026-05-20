@@ -1,0 +1,34 @@
+# ndnd forwarder config for the G.05 DV interop testbed.
+#
+# Companion to `ndnd-fw-dv` (172.30.0.41). The `ndnd-dv` sidecar
+# connects to this forwarder via the Unix socket exported on the
+# `ndnd-fw-dv-sock` named volume, and DV control traffic reaches
+# ndn-fwd-dv via the UDP face this listener creates.
+
+core:
+  log_level: INFO
+
+faces:
+  udp:
+    enabled_unicast: true
+    enabled_multicast: false
+    port_unicast: 6363
+
+  tcp:
+    enabled: false
+
+  unix:
+    enabled: true
+    # ndnd dv expects the socket at /run/nfd/nfd.sock (the volume
+    # mount path matches ndnd's `engine.NewDefaultFace()` default).
+
+  websocket:
+    enabled: false
+
+tables:
+  content_store:
+    capacity: 256
+    replacement_policy: lru
+
+  rib:
+    readvertise_nlsr: false
