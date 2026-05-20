@@ -45,19 +45,20 @@ cd "$REPO_ROOT"
 FACE_LOCAL="crates/spec/ndn-face-local/src/lib.rs"
 OUT="crates/spec/ndn-engine/src/dispatcher/outbound.rs"
 MGMT="crates/spec/ndn-mgmt/src/lib.rs"
-TRANSPORT="crates/spec/ndn-transport/src/face.rs"
+TRANSPORT="crates/spec/ndn-transport/src/transport.rs"
 
 fail() { echo "FAIL: $*"; exit 1; }
 
-# 1. Face trait offers send_with_source.
-grep -q 'fn send_with_source' "$TRANSPORT" \
-    || fail "Face trait lacks send_with_source extension point"
+# 1. Transport trait offers send_bytes_with_source (ARCH-4 rename of
+#    the pre-split `Face::send_with_source` extension point).
+grep -q 'fn send_bytes_with_source' "$TRANSPORT" \
+    || fail "Transport trait lacks send_bytes_with_source extension point"
 
-# 2. InProcFace overrides send_with_source to deliver a TaggedBytes.
-grep -q 'async fn send_with_source' "$FACE_LOCAL" \
-    || fail "InProcFace does not override Face::send_with_source"
+# 2. InProcFace overrides send_bytes_with_source to deliver a TaggedBytes.
+grep -q 'async fn send_bytes_with_source' "$FACE_LOCAL" \
+    || fail "InProcFace does not override Transport::send_bytes_with_source"
 grep -q 'source_face: Some(source)' "$FACE_LOCAL" \
-    || fail "InProcFace::send_with_source does not stamp source on TaggedBytes"
+    || fail "InProcFace::send_bytes_with_source does not stamp source on TaggedBytes"
 
 # 3. InProcHandle exposes recv_tagged.
 grep -q 'pub async fn recv_tagged' "$FACE_LOCAL" \

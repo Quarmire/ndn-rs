@@ -1,33 +1,57 @@
 # Implementing a Face
 
-This guide walks through implementing a custom face type for ndn-rs. Faces are the abstraction over network transports -- every link-layer connection (UDP, TCP, Ethernet, serial, in-process channel) is a face.
+This guide walks through implementing a custom face type for ndn-rs.
+Faces are the abstraction over network transports — every link-layer
+connection (UDP, TCP, Ethernet, serial, in-process channel) is a face.
 
-## The Face Trait
+A `Face` in ndn-rs is **two traits composed**: a [`Transport`] for
+byte-level send/recv, and a [`LinkService`] for NDNLPv2 framing,
+fragmentation, congestion-mark handling, and reliability. This mirrors
+NFD (`daemon/face/face.hpp`). Custom face types implement
+[`Transport`] only; the engine pairs the transport with the default
+[`LinkService`] for its [`FaceKind`].
 
-The core trait lives in `ndn-transport` (`crates/spec/ndn-transport/src/face.rs`):
+## The Transport Trait
+
+The Transport trait lives in `ndn-transport`
+(`crates/spec/ndn-transport/src/transport.rs`):
 
 ```rust
-pub trait Face: Send + Sync + 'static {
+pub trait Transport: Send + Sync + 'static {
     fn id(&self) -> FaceId;
     fn kind(&self) -> FaceKind;
 
     fn remote_uri(&self) -> Option<String> { None }
     fn local_uri(&self) -> Option<String> { None }
+    fn link_type(&self) -> LinkType { LinkType::PointToPoint }
 
-    fn recv(&self) -> impl Future<Output = Result<Bytes, FaceError>> + Send;
-    fn send(&self, pkt: Bytes) -> impl Future<Output = Result<(), FaceError>> + Send;
+    /// Maximum per-frame byte budget. `None` for stream transports
+    /// (TCP, Unix). `Some(n)` for datagram-bound transports — the
+    /// LinkService fragments outbound packets above this size.
+    fn send_mtu(&self) -> Option<usize> { None }
+
+    fn send_bytes(&self, wire: Bytes) -> impl Future<Output = Result<(), FaceError>> + Send;
+    fn recv_bytes(&self) -> impl Future<Output = Result<Bytes, FaceError>> + Send;
 }
 ```
 
 Key points:
 
-- **`id()`** returns a `FaceId(u32)` assigned by the `FaceTable`. Call `face_table.alloc_id()` to get one before constructing your face.
-- **`kind()`** returns a `FaceKind` variant classifying the transport. This determines the face's scope (local vs. non-local) and is used for NFD management reporting.
-- **`recv()`** is called from a single dedicated task per face. It blocks (async) until a packet arrives or the face closes.
-- **`send()`** may be called concurrently from multiple pipeline tasks. It takes `&self`, so internal synchronization is required if the underlying transport is not inherently concurrent.
+- **`id()`** returns a `FaceId(u64)` assigned by the `FaceTable`. Call `face_table.alloc_id()` to get one before constructing your transport.
+- **`kind()`** returns a `FaceKind` variant. This determines the face's scope (local vs. non-local) and selects the default `LinkService` paired with it.
+- **`recv_bytes()`** is called from a single dedicated task per face.
+- **`send_bytes()`** may be called concurrently from multiple pipeline tasks. It takes `&self`, so internal synchronization is required if the underlying transport is not inherently concurrent.
+- **`send_mtu()`** returns the link MTU. `LpLinkService` uses it to fragment oversized packets.
 - **`remote_uri()` / `local_uri()`** are optional and used for NFD management status reporting.
 
-There is also an optional `recv_with_addr()` method for multicast/broadcast faces that need to return the link-layer sender address alongside the packet.
+Optional overrides:
+- `recv_bytes_with_addr()` — multicast/broadcast transports return the link-layer sender address alongside the wire payload.
+- `send_bytes_with_source(wire, source)` — in-process transports (like `InProcFace`) deliver an in-process source-face tag alongside the bytes; mirrors NFD's `IncomingFaceIdTag`.
+
+The engine wraps your `Transport` impl with the default `LinkService`
+via `Face::from_transport(t)` — Passthrough for local kinds (Unix,
+App, Shm, …), `LpLinkService` for non-local kinds (Udp, Tcp,
+Ethernet, …).
 
 ```mermaid
 stateDiagram-v2
@@ -65,7 +89,7 @@ Here is a minimal face wrapping a hypothetical `CustomSocket` type:
 use std::sync::Arc;
 use bytes::Bytes;
 use tokio::sync::mpsc;
-use ndn_transport::{Face, FaceId, FaceKind, FaceError};
+use ndn_transport::{Transport, FaceId, FaceKind, FaceError};
 
 pub struct CustomFace {
     id: FaceId,
@@ -101,7 +125,7 @@ impl CustomFace {
     }
 }
 
-impl Face for CustomFace {
+impl Transport for CustomFace {
     fn id(&self) -> FaceId {
         self.id
     }
@@ -114,7 +138,7 @@ impl Face for CustomFace {
         Some("custom://10.0.0.1:9000".to_string())
     }
 
-    async fn recv(&self) -> Result<Bytes, FaceError> {
+    async fn recv_bytes(&self) -> Result<Bytes, FaceError> {
         self.rx
             .lock()
             .await
@@ -123,9 +147,9 @@ impl Face for CustomFace {
             .ok_or(FaceError::Closed)
     }
 
-    async fn send(&self, pkt: Bytes) -> Result<(), FaceError> {
+    async fn send_bytes(&self, wire: Bytes) -> Result<(), FaceError> {
         self.tx
-            .send(pkt)
+            .send(wire)
             .await
             .map_err(|_| FaceError::Closed)
     }
@@ -214,6 +238,40 @@ Network-facing transports (UDP, TCP, Ethernet, serial) should wrap packets in an
 
 Return `FaceError::Closed` when the underlying transport is permanently gone. Return `FaceError::Io(e)` for transient I/O errors. Return `FaceError::Full` if a non-blocking send would exceed buffer capacity (the pipeline may retry or Nack).
 
+## FaceUri schemes
+
+A face's `remote_uri()` returns a URI whose scheme identifies the
+transport. NFD-standard schemes (`udp4://`, `udp6://`, `tcp4://`,
+`tcp6://`, `unix://`, `ether://`, `ws://`, `wss://`, `internal://`) are
+the lingua franca across NDN implementations; cross-impl tooling
+(`nfdc`, ndn-cxx control clients) parses them directly.
+
+ndn-rs additionally emits two schemes that are not in the NFD FaceUri
+registry:
+
+- **`shm://...`** — shared-memory SPSC face
+  (`crates/spec/ndn-faces/src/local/shm/spsc.rs`). No other NDN
+  implementation ships a shared-memory transport; the scheme is
+  ndn-rs-proprietary and only meaningful between two ndn-rs
+  processes on the same host. Gated behind the `spsc-shm` feature.
+- **`serial://<dev>:<baud>`** — serial / COBS-framed face
+  (`crates/spec/ndn-faces/src/serial/serial.rs`). The framing matches
+  the esp8266ndn convention used by the Arduino / ESP NDN community,
+  but the URI scheme itself is not in the registry. Gated behind the
+  `serial` feature.
+
+Both schemes are deliberately ndn-rs-specific and stable within the
+workspace. Tools that parse FaceUris from other implementations should
+treat `shm://` and `serial://` as unknown schemes; the underlying
+transports are not interoperable with non-ndn-rs nodes by design (SHM
+because there is no peer impl, serial because the framing is a
+community convention rather than a spec).
+
+When implementing a new face, prefer one of the NFD-standard schemes
+if the transport maps to an existing category. Only invent a new
+scheme when the transport has no NFD analogue, and document the
+invention here.
+
 ## Existing face implementations
 
 Study these for patterns:
@@ -223,9 +281,9 @@ Study these for patterns:
 | `UdpFace` | `ndn-faces` | Datagram transport, simplest network face |
 | `TcpFace` | `ndn-faces` | Stream transport via `StreamFace` helper |
 | `InProcFace` | `ndn-faces` | In-process channel pair, no serialization |
-| `ShmFace` | `ndn-faces` | Shared-memory ring buffer, highest throughput |
+| `ShmFace` | `ndn-faces` | Shared-memory ring buffer (`shm://`, ndn-rs-only) |
 | `NamedEtherFace` | `ndn-faces` | Raw Ethernet via `AF_PACKET` |
-| `SerialFace` | `ndn-faces` | UART/serial with framing |
+| `SerialFace` | `ndn-faces` | UART/serial with COBS framing (`serial://`, ndn-rs-only) |
 | `WfbFace` | `ndn-faces` | Wifibroadcast NG integration |
 | `WebSocketFace` | `ndn-faces` | WebSocket transport |
 | `ComputeFace` | `ndn-compute` | Named function networking |

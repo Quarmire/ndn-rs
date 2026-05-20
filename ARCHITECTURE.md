@@ -51,7 +51,9 @@ crates/spec/                    NDN community specs implemented faithfully
   ndn-tlv                       TlvReader, TlvWriter, varu64 — no_std
   ndn-foundation-types          Name, NameComponent, canonical Ord — shared with downstream NDN-stack crates
   ndn-packet                    Interest, Data, Nack (Packet Format v0.3) — lazy decode, no_std
-  ndn-transport                 Face trait, FaceId, FaceTable, StreamFace, TlvCodec
+  ndn-transport                 Transport + LinkService traits, Face struct
+                                (NFD-style split), FaceId, FaceTable,
+                                StreamFace, TlvCodec
   ndn-store                     NameTrie, Fib, PIT, ContentStore (LruCs/ShardedCs/FjallCs), DeadNonceList
   ndn-safebag                   SafeBag (cert + PKCS#5-encrypted key) — wasm-buildable carve-out of safe_bag.rs
   ndn-faces                     Feature-gated native face types (UDP, TCP, WebSocket, Unix, SHM,
