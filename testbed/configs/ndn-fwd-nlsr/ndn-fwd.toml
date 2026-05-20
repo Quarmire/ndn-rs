@@ -33,11 +33,10 @@ bind = "0.0.0.0:6363"
 kind = "tcp"
 bind = "0.0.0.0:6364"
 
-# Point-to-point UDP face to nfd-nlsr.
-# NlsrProtocol.find_face_by_uri() matches on remote_uri() == "udp4://172.30.0.14:6363".
-[[face]]
-kind   = "udp"
-remote = "172.30.0.14:6363"
+# NLSR allocates its own UDP face to each [[routing.nlsr.neighbor]]
+# entry via the engine (ARCH-1 migration). No separate [[face]] block
+# is needed — the per-neighbour face is engine-registered and the
+# RIB writer's URI lookup (`find_face_id_by_uri`) finds it.
 
 [management]
 face_socket = "/run/ndn-fwd/ndn-fwd.sock"
