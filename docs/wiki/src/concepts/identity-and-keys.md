@@ -1,124 +1,153 @@
-# Identity, keys, and SafeBags
+# Identity and keys
 
-This page clears up the most-asked question on the security path:
+An NDN identity is a name plus a key pair, signed by a certificate.
+The `KeyChain` is the single object that holds identities, their
+keys, and the policies that govern signing and validation. This
+page covers the three things an application author needs to know:
+identities, signing info, and trust policies.
 
-> If I enroll an identity in the browser, persist a SafeBag, and then
-> want to talk to NFD as well, do I have a "split identity"?  Why do
-> we even pick an algorithm?
+## KeyChain
 
-**Short answer:** no split. An NDN identity is a *Name* — under it
-you can have any number of keys, any number of algorithms.  The
-SafeBag is one *key bundle*, not the identity.  You pick the
-algorithm based on who needs to verify your signatures.
+```rust,ignore
+use ndn::prelude::*;
+use ndn::KeyChain;
 
-## The model
-
-```
-identity   /alice              ← a Name; people / apps know you by this
-   │
-   ├── key  /alice/KEY/<id1>   ← one Ed25519 keypair under /alice
-   │       └── cert            ← certificate issued for this key (self-signed
-   │                              for testing, NDNCERT-issued in production)
-   │
-   └── key  /alice/KEY/<id2>   ← a second keypair, e.g. ECDSA-P256, under
-           └── cert              the same /alice identity
+# async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+let keychain = KeyChain::open_default().await?;
+# Ok(()) }
 ```
 
-An identity can carry **many keys** simultaneously.  Each key has
-its own certificate.  Both keys legitimately speak for `/alice`.
+`KeyChain::open_default()` opens the operating-system PIB (Personal
+Information Base) at `~/.ndn/pib.db` on native targets and an
+IndexedDB-backed PIB in the browser. The opened keychain knows the
+host's identities, their keys, and any certificates that have been
+imported.
 
-A **SafeBag** is the portable on-disk shape of *one* key:
+`KeyChain` lives at `crates/spec/ndn-security/src/keychain.rs`. The
+Develop tier re-exports it as `ndn::KeyChain`.
 
-- the encrypted private key (PKCS#8 PrivateKeyInfo, PBES2-wrapped)
-- its certificate (a Data packet)
+## Identities
 
-`ndnsec export /alice` produces a SafeBag for the active key under
-`/alice`.  `ndnsec import` reverses it.
+An identity is a name. Each identity owns one or more keys; one of
+those keys is the *default* and is used for signing unless an
+explicit selector overrides it.
 
-## Why algorithm matters: who verifies?
-
-Different NDN implementations support different signature types:
-
-| SignatureType                    | Code | ndn-rs | ndn-cxx / NFD     | Notes                                                  |
-| -------------------------------- | ---- | ------ | ----------------- | ------------------------------------------------------ |
-| `DigestSha256`                   | 0    | ✓      | ✓                 | Hash-only; useful for localhost; not a real signature  |
-| `SignatureSha256WithRsa`         | 1    | ✗      | ✓                 | RSA-PKCS1 v1.5; widely supported but slow              |
-| `SignatureSha256WithEcdsa`       | 3    | ✓      | ✓ (KeyType::EC)   | **The lowest common denominator for interop**          |
-| `SignatureHmacWithSha256`        | 4    | ✓      | ✓ (KeyType::HMAC) | Symmetric; out-of-band shared secret                   |
-| `SignatureEd25519`               | 5    | ✓      | ✗                 | Fast, small, **ndn-rs-only today**                     |
-| `SignatureBlake3`                | 6    | ✓      | ✗                 | ndn-rs extension (yoursunny registration)              |
-| `SignatureSha256WithBlake3`      | 7    | ✓      | ✗                 | ndn-rs extension                                       |
-
-The ndn-cxx `KeyType` enum at `security-common.hpp:106` is the
-authoritative list of what NFD can *generate* and *verify* today:
-
-```cpp
-enum class KeyType { NONE = 0, RSA, EC, AES, HMAC };
+```rust,ignore
+# use ndn::prelude::*;
+# use ndn::KeyChain;
+# async fn run(keychain: &mut KeyChain) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+let identity = keychain.create_identity("/alice").await?;
+let key = identity.default_key();
+let cert = identity.self_signed_cert();
+# Ok(()) }
 ```
 
-No Ed25519, no BLAKE3.  ndn-cxx's wire decoder *recognizes* code 5
-for display strings, but the security stack can't verify it —
-`tools/ndn-iperf.cpp:290` literally falls back when asked for
-Ed25519.
+The on-disk shape: each identity gets a directory under the PIB;
+keys are stored as Ed25519 / ECDSA private keys; certificates are
+stored as `Data` packets under the standard NDN cert naming
+convention (`/<identity>/KEY/<key-id>/<issuer-id>/<version>`).
 
-## The practical guidance
+## Certificates
 
-| You want…                                       | Pick                         |
-| ----------------------------------------------- | ---------------------------- |
-| ndn-rs forwarder + ndn-rs clients only          | `Ed25519` (fast, small)      |
-| ndn-rs forwarder + NFD / `nfdc` / `ndnsec` interop | `ECDSA-P256`              |
-| Browser-only deployment (everything is ndn-rs)  | `Ed25519`                    |
-| Anything that might federate with the testbed   | `ECDSA-P256`                 |
+A certificate is a signed `Data` packet whose content is the
+identity's public key. Certificates carry a validity period and a
+key locator pointing to the issuer's key.
 
-You can also hold **both** — generate one key per algorithm under
-the same identity Name, store separate SafeBags, sign with
-whichever the consumer expects.  No split identity; the Name
-`/alice` is the same.
+| Verb | Where |
+|---|---|
+| Create a self-signed cert | `identity.self_signed_cert()` |
+| Import a cert (e.g. from NDNCERT enrollment) | `keychain.import_cert(&cert).await?` |
+| Issue a cert for another identity | `keychain.issue_cert(&other_key, ...).await?` |
+| Enroll via NDNCERT | See [NDNCERT setup](../guides/ndncert-setup.md). |
 
-## What ndn-rs defaults to today
+## SigningInfo
 
-- **`KeyChain::ephemeral(name)`** — Ed25519 (the historical default).
-- **`KeyChain::ephemeral_ecdsa(name)`** — ECDSA-P256.
-- **`ndn-fwd`** auto-init: **ECDSA-P256** since 2026-05-11, because the
-  daemon's mgmt responses need to be verifiable by whatever client
-  shows up (often `ndn-ctl` *but sometimes* `nfdc`).
-- **dioxus-demo SharedWorker** ephemeral fallback: **ECDSA-P256** for
-  consistency.  An IdbPib-persisted Ed25519 SafeBag still wins via
-  `IdbPib::build_signer`, which inspects the SafeBag's algorithm OID
-  and returns the matching `Signer` impl.
+`SigningInfo` is the "sign me with X" descriptor. The `KeyChain`
+takes it; the producer takes it; the Responder takes it.
 
-## What `IdbPib::build_signer` does
+```rust,ignore
+use ndn::SigningInfo;
 
-```rust
-let bag = pib.get_safebag(&key_name).await?;
-match bag.algorithm(&passphrase)? {
-    SafeBagAlgorithm::Ed25519   => Arc::new(Ed25519Signer::from_seed(seed, key_name)),
-    SafeBagAlgorithm::EcdsaP256 => Arc::new(EcdsaP256Signer::from_pkcs8_der(&pkcs8, key_name)?),
-    SafeBagAlgorithm::Other(oid) => return Err("unsupported OID"),
-}
+// Sign with /alice's default key:
+let info = SigningInfo::by_identity("/alice");
+
+// Sign with a specific key under /alice:
+let info = SigningInfo::by_key("/alice/KEY/...");
+
+// Sign with an explicit cert (key + cert metadata):
+let info = SigningInfo::by_cert(cert.name().clone());
+
+// SHA-256 digest only (no producer identity):
+let info = SigningInfo::sha256_digest();
 ```
 
-This is the path that lets a single persisted identity be reused
-across page-loads without baking the algorithm into the codebase.
+A `SigningInfo` resolves to a `SignerSelection` inside the
+`KeyChain`. That extra step exists so `TrustPolicy` decisions are
+applied before the bytes are signed. See `crates/spec/ndn-security/src/keychain.rs:143`
+for the resolution path.
 
-## Witness gates
+## Trust policies
 
-After 2026-05-11 the engine fails closed if:
+When you fetch a `Data`, the Consumer's `ValidationPolicy` decides
+whether to accept it. Both the policy and its building blocks are
+re-exported from the Develop umbrella:
 
-- A SafeBag carries an algorithm we can't build a Signer for
-  (`SafeBagAlgorithm::Other`).
-- A SafeBag is present but the companion passphrase row is missing
-  (storage corruption — the join flow always writes both
-  atomically).
+```rust,ignore
+use ndn::{InsecureTrust, StaticTrust, LvsTrust, HierarchicalPolicy, ValidationPolicy};
+```
 
-This is intentional: silently falling back to DigestSha256 would
-mask a real corruption.
+| Policy | What it accepts |
+|---|---|
+| `InsecureTrust` | Any signature. Tests only. |
+| `StaticTrust` | Signatures from an explicit allowlist of keys. |
+| `LvsTrust` | Light Versatile Schema rules (LVS) — pattern-based. |
+| `HierarchicalPolicy` | Parent-name key signs child-name data. |
+| `AcceptAllPolicy` | Skips validation entirely (degraded mode). |
 
-## What about RSA?
+For a tabular catalog with rule examples: [Trust policies](../reference/trust-policies.md).
 
-ndn-rs has RSA verification (via the `rsa` crate, default-features
-off so it stays wasm-clean) but no `RsaSigner` yet.  Generating an
-RSA key in-browser is also expensive (slow keygen).  Until a real
-consumer surfaces, RSA stays read-only.  `SafeBagAlgorithm::Other`
-captures the OID so a future RSA path can dispatch off it without
-re-touching the public API.
+## PIB backends
+
+| Backend | Where it lives | Used by |
+|---|---|---|
+| `SqlitePib` | SQLite database at `~/.ndn/pib.db` | Native targets (Linux/macOS/Windows). |
+| `IdbPib` | IndexedDB origin store | Browser (`wasm32-unknown-unknown`). |
+| `MemPib` | In-process map | Tests; the `KeyChain::open_memory()` constructor. |
+
+The default constructor picks the right backend for the build
+target. To override the path:
+
+```rust,ignore
+use ndn::KeyChain;
+# async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+let keychain = KeyChain::open_at("/var/lib/myapp/pib.db").await?;
+# Ok(()) }
+```
+
+## SafeBag — exporting identities
+
+A `SafeBag` is a passphrase-encrypted bundle of an identity, its
+keys, and its certificates. The format is interoperable with
+ndnsec; the operator workflow is in
+[NDNCERT setup → invite tokens](../guides/ndncert-setup.md).
+
+```rust,ignore
+use ndn::KeyChain;
+# async fn run(keychain: &KeyChain) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+let bytes = keychain.export_safebag("/alice", b"passphrase").await?;
+std::fs::write("alice.safebag", &bytes)?;
+# Ok(()) }
+```
+
+The receiving side calls `keychain.import_safebag(&bytes, passphrase)`.
+
+## See also
+
+- [NDNCERT setup](../guides/ndncert-setup.md) — operator and joiner
+  workflow for automated certificate issuance.
+- [Trust policies](../reference/trust-policies.md) — concrete policy
+  catalog with rule shapes.
+- [Develop tier → KeyChain](../api/develop.md#keychain) — full API
+  surface.
+- `crates/spec/ndn-security/` — implementation; the trait surfaces
+  are in `trust.rs`, `validation_policy.rs`, `keychain.rs`.
