@@ -1,102 +1,198 @@
-# ndn-rs
+<p align="center">
+  <img src="docs/logo.svg" alt="ndn-rs" width="180">
+</p>
+
+<h1 align="center">ndn-rs</h1>
+
+<p align="center">
+  A Named Data Networking forwarder stack in Rust.
+</p>
 
 > **Notice: primarily AI-authored, not yet proven correct.**
 >
-> This codebase is primarily authored by an AI coding assistant. A
-> recent evidence-based audit against the NDN specifications —
-> [`docs/notes/spec-compliance-audit-2026-04-20.md`](docs/notes/spec-compliance-audit-2026-04-20.md)
-> — found numerous spec-compliance errors, including BLOCKER-tier
-> wire-format bugs that any conforming NDN peer would reject.
-> Remediation is in progress in the open; see
-> [`testbed/EXPECTED_FAILURES.md`](testbed/EXPECTED_FAILURES.md)
+> This codebase is primarily authored by an AI coding assistant. An
+> evidence-based audit against the NDN specifications found numerous
+> spec-compliance errors, including BLOCKER-tier wire-format bugs that
+> any conforming NDN peer would reject. Remediation is in progress in
+> the open; see [`testbed/EXPECTED_FAILURES.md`](testbed/EXPECTED_FAILURES.md)
 > for current known-bad behaviours and the
-> [honest spec-compliance summary](docs/wiki/src/reference/spec-compliance.md)
+> [spec-compliance summary](docs/wiki/src/reference/spec-compliance.md)
 > for what has been verified against the spec.
 >
-> **Do not use `ndn-rs` as a reference implementation of NDN or
-> cite it as one.** Use [NFD](https://github.com/named-data/NFD),
+> **Do not use `ndn-rs` as a reference implementation of NDN or cite
+> it as one.** Use [NFD](https://github.com/named-data/NFD),
 > [ndn-cxx](https://github.com/named-data/ndn-cxx),
 > [NDNts](https://github.com/yoursunny/NDNts),
 > [ndnd](https://github.com/named-data/ndnd), or
 > [python-ndn](https://github.com/named-data/python-ndn).
-> `ndn-rs` is developed as an experimental Rust-native NDN stack
-> that aspires to become a trusted implementation via packet-
-> captured interop evidence under [`testbed/`](testbed/), not
-> unilateral claims.
 
-A [Named Data Networking (NDN)](https://named-data.net/) forwarder stack written in Rust (edition 2024). NDN routes packets by name rather than address: consumers express **Interests**; the network routes them toward producers and returns **Data** along the reverse path, caching at every hop.
-
-ndn-rs takes a Rust-idiomatic approach — composable async pipelines with trait-based polymorphism — and targets both standalone forwarder deployments and embedded use within research applications. The engine is a library, not a daemon.
-
-![ndn-rs logo](docs/logo.svg)
-
-**Status:** experimental · primarily AI-authored · under spec-compliance remediation (see notice above) · **[Releases](https://github.com/Quarmire/ndn-rs/releases)** · **[Wiki](https://quarmire.github.io/ndn-rs/wiki/)** · **[Explorer](https://quarmire.github.io/ndn-rs/explorer/)**
+[Named Data Networking](https://named-data.net/) routes packets by
+name rather than address: consumers express **Interests**; the network
+routes them toward producers and returns **Data** along the reverse
+path, caching at every hop. ndn-rs is a Rust implementation of that
+substrate — a forwarder engine plus the tools and libraries around it.
 
 ---
 
-## Quick Start
+## Features
+
+- Async pipeline with and pluggable forwarding strategies.
+- Multiple face transports: UDP, TCP, Unix socket, in-process channel,
+  shared-memory, serial, BLE, Ethernet, WebSocket, WebTransport.
+- Identity and trust: KeyChain, signing-info composition, validation
+  policies, NDNCERT enrollment.
+- NFD-compatible management surface (`/localhost/nfd/...`) for
+  cross-stack tooling.
+- Browser-ready: the engine builds for `wasm32-unknown-unknown` and
+  runs in a browser tab.
+
+---
+
+## Implementations and applications
+
+| Binary | What it does |
+|---|---|
+| [`ndn-fwd`](binaries/spec/ndn-fwd) | The forwarder daemon. |
+| [`ndn-ctl`](binaries/tooling/ndn-tools) | Management CLI (NFD-compatible). |
+| [`ndn-peek`, `ndn-put`, `ndn-ping`](binaries/tooling/ndn-tools) | Operator utilities. |
+| [`ndn-sec`](binaries/tooling/ndn-tools) | Identity / key / cert management. |
+| [`ndn-traffic`, `ndn-iperf`](binaries/tooling/ndn-tools) | Synthetic load + throughput measurement. |
+| [`ndn-otel-bridge`](binaries/tooling/ndn-otel-bridge) | OpenTelemetry export for engine traces. |
+
+### Other ndn-rs projects
+
+*Repositories not yet published. Linked once they land.*
+
+- **ndn-dashboard** — desktop / browser UI for managing one or more
+  forwarders.
+
+---
+
+## Build from source
+
+### Forwarder
 
 ```bash
-# Build
-cargo build --release
-
-# Run the forwarder (default: UDP + TCP listeners on port 6363)
-cargo run --release --bin ndn-fwd
-
-# With a config file
-cargo run --release --bin ndn-fwd -- -c ndn-fwd.toml
+cargo build --release -p ndn-fwd
+./target/release/ndn-fwd -c examples/ndn-fwd.example.toml
 ```
 
-Set `RUST_LOG=info` for status output, `RUST_LOG=ndn_engine=trace` to trace individual pipeline stages.
-
-### Management
+### Tools
 
 ```bash
-# Add a FIB route
-ndn-ctl rib register /ndn/example --face 1 --cost 10
-
-# List faces
-ndn-ctl faces list
-
-# Content store info
-ndn-ctl cs info
-
-# Identity status
-ndn-ctl security identity-status
+cargo build --release -p ndn-tools
+# Builds: ndn-peek, ndn-put, ndn-ping, ndn-sec, ndn-ctl, ndn-traffic, ndn-iperf
 ```
 
-`ndn-ctl` speaks the NFD management protocol (TLV over `/localhost/nfd/`), so any NFD-compatible tool works as well.
+Run any binary with `--help` for its full option set.
 
-### Measure throughput
+---
+
+## Self-host
+
+Two ways to deploy:
+
+### Nix (recommended)
+
+The flake exposes every shipped binary as a `nix run`/`nix profile
+install` target, plus a NixOS module for running the forwarder as a
+hardened systemd service.
 
 ```bash
-ndn-iperf server --prefix /bench
-ndn-iperf client --prefix /bench --duration 10
+# Run the forwarder ad-hoc
+nix run github:Quarmire/ndn-rs
+
+# Install operator CLIs
+nix profile install github:Quarmire/ndn-rs#ndn-tools
+
+# Run a specific tool
+nix run github:Quarmire/ndn-rs#ndn-fwd-tokens -- --help
 ```
+
+To run the forwarder as a NixOS system service:
+
+```nix
+{
+  inputs.ndn-rs.url = "github:Quarmire/ndn-rs";
+
+  outputs = { self, nixpkgs, ndn-rs }: {
+    nixosConfigurations.router = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        ndn-rs.nixosModules.default
+        {
+          services.ndn-fwd.enable = true;
+          services.ndn-fwd.openFirewall = true;
+          services.ndn-fwd.identity = "/ndn/mysite/router1";
+          services.ndn-fwd.configFile = ./ndn-fwd.toml;
+        }
+      ];
+    };
+  };
+}
+```
+
+The NixOS module:
+
+- Creates a `ndn-fwd` system user + state directory at `/var/lib/ndn-fwd`.
+- Optionally auto-generates the router's Ed25519 identity on first boot.
+- Hardens the service (`ProtectSystem=strict`, `NoNewPrivileges`,
+  capability bounding, etc.) and grants only `CAP_NET_RAW` +
+  `CAP_NET_BIND_SERVICE` for raw faces and privileged ports.
+- Optionally opens UDP/TCP 6363 in the firewall.
+
+### Docker Compose
+
+A turnkey docker-compose stack is at [`deploy/`](deploy/), including a
+forwarder, an NDNCERT CA, and a WebRTC signaling relay. Start with
+[`deploy/install.sh`](deploy/install.sh).
+
+---
+
+## Develop
+
+```bash
+# Native (Tokio)
+cargo build --workspace
+cargo test  --workspace -- --skip ignored
+cargo clippy --workspace -- -D warnings
+
+# Browser target (wasm32)
+cargo build --target wasm32-unknown-unknown -p ndn
+
+# Wiki
+mdbook build docs/wiki
+```
+
+With Nix, `nix develop` enters a shell with the rust toolchain,
+rust-analyzer, clippy, mdbook + mdbook-mermaid, and the workflow
+tools. `nix develop .#wasm` adds wasm-pack and wasm-bindgen-cli for
+the in-browser builds.
 
 ---
 
 ## Documentation
 
-The wiki covers everything from installation to deep dives into each subsystem:
-
 | | |
 |--|--|
-| **[Getting Started](https://quarmire.github.io/ndn-rs/wiki/getting-started/installation.html)** | Install, first run, config reference |
-| **[Architecture](https://quarmire.github.io/ndn-rs/wiki/design/overview.html)** | Pipeline design, crate layers, key data structures |
-| **[Deep Dives](https://quarmire.github.io/ndn-rs/wiki/deep-dive/pipeline-walkthrough.html)** | TLV encoding, forwarding pipeline, security, simulation, WASM |
-| **[Guides](https://quarmire.github.io/ndn-rs/wiki/guides/implementing-face.html)** | Implementing a Face, Strategy, embedded targets, CLI tools |
-| **[Benchmarks](https://quarmire.github.io/ndn-rs/wiki/benchmarks/pipeline-benchmarks.html)** | Pipeline stage costs, forwarder comparison, methodology |
-| **[0.1.0 draft release notes](https://quarmire.github.io/ndn-rs/wiki/releases/v0-1-0.html)** | Scope of the upcoming first tagged release (work in progress) |
-
-The [`ARCHITECTURE.md`](ARCHITECTURE.md) file has a crate map and dependency layer diagram for quick offline reference.
+| [**Wiki**](https://quarmire.github.io/ndn-rs/wiki/) | Quickstart, concepts, API reference, guides, operations. |
+| [**Releases**](https://github.com/Quarmire/ndn-rs/releases) | Tagged versions and release notes. |
+| [`ARCHITECTURE.md`](ARCHITECTURE.md) | Crate map and dependency-layer overview. |
+| [`docs/specs/`](docs/specs) | ndn-rs-proprietary specs. |
 
 ---
 
-## Acknowledgments
+## Acknowledgements
 
-This project builds on the [Named Data Networking](https://named-data.net/) architecture developed by the NDN research team led by Lixia Zhang at UCLA, with contributions from NIST, University of Memphis, University of Arizona, and others. The protocol specifications, packet format, and forwarding semantics are defined by the NDN team's technical reports and specifications. This implementation aims for compatibility with [NFD](https://github.com/named-data/NFD) and [ndn-cxx](https://github.com/named-data/ndn-cxx) where applicable.
+ndn-rs builds on the Named Data Networking architecture developed by
+the NDN research team led by Lixia Zhang at UCLA, with contributions
+from NIST, the University of Memphis, the University of Arizona, and
+others. Protocol specifications, packet format, and forwarding
+semantics are defined by the NDN team's technical reports and
+specifications. ndn-rs's surfaces borrow shape from the long-standing
+reference implementations the wider community maintains.
 
 ## License
 
-Licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE) at your option.
+Licensed under either [MIT](LICENSE-MIT) or
+[Apache-2.0](LICENSE-APACHE) at your option.
