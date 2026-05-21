@@ -42,6 +42,7 @@
 - [Joining as a user](./getting-started/joining-as-a-user.md)
 - [Logging and Observability](./guides/logging.md)
 - [Debugging with tokio-console](./operations/tokio-console.md)
+- [OpenTelemetry (NDN-native)](./operations/opentelemetry.md)
 - [NDNCERT Enrollment](./operations/ndncert-enrollment.md)
 - [Faces](./operations/faces.md)
 - [Performance Tuning](./guides/performance-tuning.md)

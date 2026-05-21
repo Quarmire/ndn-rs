@@ -298,6 +298,31 @@ The `RoutingProtocol` trait populates the RIB. Three implementations ship:
   Dijkstra-based routing-table computation. Enabled via `[routing.nlsr]` in
   `ndnd.toml`. See `docs/wiki/src/protocols/nlsr.md` for operator guidance.
 
+## Observability
+
+ndn-fwd ships an OpenTelemetry-compatible span pipeline. The substrate is
+**NDN**, not OTLP/gRPC: completed `tracing` spans are encoded as OTLP `Span`
+protobufs and published as Data under a configurable prefix (default
+`/localhost/nfd/observability`). Consumers — the dashboard, an `ndn-ctl
+trace` CLI, or a small `ndn-otel-bridge` sidecar that forwards to standard
+OTel backends — Interest by trace_id / span_id. PIT aggregation, CS caching,
+NAC, and per-span signing all apply at no extra cost.
+
+The publisher lives in
+[`crates/spec/ndn-observability/`](crates/spec/ndn-observability/); the
+`tracing::Subscriber` Layer is attached during
+[`init_tracing`](binaries/spec/ndn-fwd/src/tracing_init.rs) when
+`[observability] publish_to_ndn = true` in the forwarder TOML. Cross-router
+trace stitching uses the [`TraceContext` LP TLV](crates/spec/ndn-packet/src/lp/trace_context.rs)
+(type `0x520`, 33-byte value matching the W3C trace-context binary form
+plus an 8-byte single-hop timestamp); see
+[`docs/wiki/src/operations/opentelemetry.md`](docs/wiki/src/operations/opentelemetry.md)
+for the operator guide and
+[`docs/notes/cross-router-trace-context-2026-05-07.md`](docs/notes/cross-router-trace-context-2026-05-07.md)
+for the design rationale. The rationale for choosing the NDN substrate over
+OTLP/gRPC push lives in
+[`docs/notes/ndn-native-observability-2026-05-20.md`](docs/notes/ndn-native-observability-2026-05-20.md).
+
 ## Testbed
 
 `testbed/docker-compose.yml` spins up an `ndn-fwd` instance, a C++ NFD instance,
