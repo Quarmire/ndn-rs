@@ -75,23 +75,28 @@ The bytes you get back can be fed directly into any OTLP-aware decoder
 ## Bridge to Jaeger / Tempo / Honeycomb
 
 For operators who want the spans in standard OTel tooling, run the
-`ndn-otel-bridge` sidecar binary. It expresses Interests under your
-observability prefix, decodes the OTLP `Span` protobuf, batches into
-`ResourceSpans`, and pushes via OTLP/gRPC to whatever backend you've
-configured.
+`ndn-otel-bridge` sidecar binary. It polls `<prefix>/recent` on the
+publisher, fetches each unseen span's Data, decodes the OTLP `Span`
+protobuf, batches into `ExportTraceServiceRequest`, and POSTs via
+OTLP/HTTP-protobuf to whatever backend you've configured. No gRPC
+toolchain — any collector that accepts OTLP/HTTP (every major
+backend) works.
 
 ```sh
 ndn-otel-bridge \
+  --socket /run/nfd/nfd.sock \
   --ndn-prefix /localhost/nfd/observability \
-  --otlp-endpoint http://localhost:4317
+  --otlp-endpoint http://localhost:4318/v1/traces \
+  --batch-size 100 \
+  --batch-timeout 5s \
+  --poll-interval 1s
 ```
 
-> **Status:** the bridge binary is deferred from the Phase-3 prompt
-> (`.claude/prompts/observability/phase3-otel-and-trace-id.md` §C status). The
-> publisher and OTLP protobuf encoding ship today; the bridge is small (~200
-> LOC) and lands in a follow-on. Operators with bridge-shaped needs can write
-> a one-off Consumer in Python or Go using the on-wire shape documented
-> above.
+Jaeger all-in-one (`jaegertracing/all-in-one:1.x`) exposes the OTLP
+HTTP receiver on port 4318 with `COLLECTOR_OTLP_ENABLED=true`. The
+default endpoint in the bridge points there. Operators on Tempo /
+Honeycomb / Datadog / Grafana Cloud / SigNoz / etc. swap the
+endpoint URL — protobuf wire is identical.
 
 ## Cross-router stitching
 
