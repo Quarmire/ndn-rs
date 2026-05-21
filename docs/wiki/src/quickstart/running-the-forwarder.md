@@ -14,7 +14,7 @@ cargo run -p ndn-fwd
 
 `ndn-fwd` reads `ndn-fwd.toml` from the current directory; if absent
 it uses defaults. The example config is at
-`ndn-fwd.example.toml` in the repository root.
+`examples/ndn-fwd.example.toml`.
 
 By default the forwarder:
 

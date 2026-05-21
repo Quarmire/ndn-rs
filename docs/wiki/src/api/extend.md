@@ -35,7 +35,6 @@ graph TB
 | `ValidationPolicy` | `ndn_security::validation_policy` | Pluggable verdict chain. |
 | `Signer` / `Verifier` | `ndn_security::{signer, verifier}` | Crypto primitives. |
 
-Full inventory + ARCH-N references: `docs/notes/tiered-api-design-2026-05-20.md` §3.
 
 ## Strategy {#strategy}
 
@@ -72,7 +71,7 @@ wiring is required.
 
 In-tree references: `crates/spec/ndn-strategy/src/best_route.rs`,
 `crates/spec/ndn-strategy/src/multicast.rs`, and
-`examples/tier2-extend-strategy/`.
+[`examples/strategy-custom/`](https://github.com/Quarmire/ndn-rs/tree/main/examples/strategy-custom).
 
 ## RoutingProtocol {#routingprotocol}
 
@@ -83,8 +82,7 @@ without parsing free-form strings.
 In-tree references: `crates/spec/ndn-routing/src/protocols/static.rs`
 (static FIB), `…/nlsr/protocol.rs` (link-state),
 `…/dv/...` (distance vector). The DV implementation uses the
-typed status codes 201/202/204/206/208/210/301 (catalogued in
-`docs/notes/spec-compliance-cross-reference-2026-05-01.md`).
+typed status codes 201/202/204/206/208/210/301.
 
 To install a routing protocol into an engine, implement
 `InstallableProtocol`. `EngineBuilder::install(protocol)` then wires
@@ -170,7 +168,6 @@ Concrete policies and the LVS rule schema: [Trust policies](../reference/trust-p
   Grep for `impl <Trait> for ` to find one.
 - Every Extend-tier trait has `///` docs on the trait and every
   required method, including preconditions, ownership, and threading.
-  This is checked by the Phase-3 audit (`docs/notes/tiered-api-design-2026-05-20.md` §3.4).
 - Extend-tier surfaces stay SemVer-stable across v0.1.x patches.
 
 ## See also
@@ -179,5 +176,7 @@ Concrete policies and the LVS rule schema: [Trust policies](../reference/trust-p
 - [Implementing a face](../guides/implementing-a-face.md) — full walkthrough.
 - [Instrument tier](./instrument.md) — researcher access below the
   Extend trait surface.
-- [`examples/tier2-extend-strategy/`](https://github.com/Quarmire/ndn-rs/tree/main/examples/tier2-extend-strategy) —
-  the audit-witnessed reference example.
+- [`examples/strategy-custom/`](https://github.com/Quarmire/ndn-rs/tree/main/examples/strategy-custom),
+  [`examples/strategy-composed/`](https://github.com/Quarmire/ndn-rs/tree/main/examples/strategy-composed),
+  [`examples/context-enricher/`](https://github.com/Quarmire/ndn-rs/tree/main/examples/context-enricher),
+  [`examples/wasm-strategy/`](https://github.com/Quarmire/ndn-rs/tree/main/examples/wasm-strategy).

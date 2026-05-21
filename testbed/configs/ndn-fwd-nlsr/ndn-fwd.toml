@@ -53,7 +53,6 @@ name_prefixes = ["/test/r2/data"]
 # permissive_validation is currently a declared config knob with no effect:
 # NlsrProtocol does not yet call the engine Validator on received LSAs.
 # Setting true makes the intent explicit while the wiring is absent.
-# See docs/notes/spec-compliance-audit-2026-04-20.md § G.04 (D)b.
 permissive_validation = true
 
 # Reduced intervals for the two-node witness so convergence fits in 90 s.

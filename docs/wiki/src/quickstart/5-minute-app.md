@@ -66,6 +66,3 @@ split.
 - **Run the engine in-process** (mobile, tests, browser):
   [Develop tier → embedded engine](../api/develop.md#embedded-engine).
 
-A working version of the program above lives at
-`examples/tier1-develop-5min/` and is exercised by the audit witness
-`testbed/tests/audit/phase3_example_tier1_runs.sh`.

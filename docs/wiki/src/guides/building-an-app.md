@@ -120,9 +120,8 @@ while let Some(sample) = sub.next().await {
 # Ok(()) }
 ```
 
-In v0.1.0 `Subscriber` is read-only — see
-`docs/notes/api-completeness-check-2026-05-20.md` GAP-5 for the
-write-path follow-up.
+In v0.1.0 `Subscriber` is read-only; sync-group publishing is
+filed for v0.1.x.
 
 ## Step 6 — Run the engine in-process
 

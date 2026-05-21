@@ -59,7 +59,7 @@ path = "/tmp/ndn-fwd.shm"
 capacity_mb = 16
 ```
 
-The full per-kind option set is in `ndn-fwd.example.toml`.
+The full per-kind option set is in `examples/ndn-fwd.example.toml`.
 
 ## Programmatic faces (not in `ndn-fwd.toml`)
 

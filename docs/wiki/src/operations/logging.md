@@ -86,10 +86,9 @@ Project memory `feedback_dioxus_ndn_native` records why.
 
 NDNLPv2 carries an optional TraceContext field (Phase-3 work). When
 present, the strategy stamps it into outbound packets, enabling
-cross-router span linkage. The design is in
-`docs/notes/cross-router-trace-context-2026-05-07.md`. The wire
-inject/extract lives in `crates/spec/ndn-engine/src/`; downstream
-forwarders honour and propagate it.
+cross-router span linkage. The wire inject/extract lives in
+`crates/spec/ndn-engine/src/`; downstream forwarders honour and
+propagate it.
 
 ## Recipes
 

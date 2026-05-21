@@ -121,7 +121,7 @@ async fn main() -> Result<()> {
     // 4. If all faces are filtered out, fall through to Nack
     //
     // Cross-layer data (RSSI, RTT) comes from ContextEnrichers registered
-    // via EngineBuilder::context_enricher(). See the `cross-layer-enricher`
+    // via EngineBuilder::context_enricher(). See the `context-enricher`
     // example for how to implement one.
 
     shutdown.shutdown().await;

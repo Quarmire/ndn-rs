@@ -62,9 +62,8 @@ admission policy excluding traffic.
 ## Benchmarks
 
 In-tree benchmarks live under `binaries/tooling/ndn-bench/`.
-Per project memory, `docs/notes/wasm-phase1-bench-results-2026-05-08.md`
-records WASM-target numbers; native-target numbers are in
-`docs/notes/high-throughput-forwarding.md`.
+Wasm-target and native-target numbers are tracked internally;
+rerun the benchmarks to refresh.
 
 For your own workload, capture before/after with `ndn-bench` and
 compare. Single numbers in isolation are not informative; the

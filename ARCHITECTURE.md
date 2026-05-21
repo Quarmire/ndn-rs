@@ -2,10 +2,10 @@
 
 > **Notice: primarily AI-authored, not yet proven correct.** The
 > code described below is primarily written by an AI coding
-> assistant and contains spec-compliance bugs catalogued in
-> [`docs/notes/spec-compliance-audit-2026-04-20.md`](docs/notes/spec-compliance-audit-2026-04-20.md).
-> Architectural *intent* is described here; actual *behaviour* may
-> not match until the audit findings are resolved. See the
+> assistant and contains spec-compliance bugs catalogued in the
+> internal audit log. Architectural *intent* is described here;
+> actual *behaviour* may not match until the audit findings are
+> resolved. See the
 > [honest spec-compliance summary](docs/wiki/src/reference/spec-compliance.md)
 > and [`testbed/EXPECTED_FAILURES.md`](testbed/EXPECTED_FAILURES.md).
 > Do not cite this document as evidence of wire-level NDN
@@ -38,11 +38,9 @@ Dependency-direction rule (`draft` → `tooling` → `extension` →
 Honored by convention today; a future commit will add a
 workspace-level lint.
 
-Full policy at [`docs/notes/scope-policy.md`](docs/notes/scope-policy.md).
-
 ## Crate Map
 
-Crates are organised by **scope** (see [`docs/notes/scope-policy.md`](docs/notes/scope-policy.md)).
+Crates are organised by **scope**.
 The dependency-direction rule: `draft` → `tooling` → `extension` →
 `spec`. A `spec` crate may not depend on anything to its right.
 
@@ -112,7 +110,7 @@ binaries/tooling/               Operator CLIs
 
 deploy/                         Operator-facing self-host bundle
   docker-compose.yml            ndn-fwd + signaling-relay + opt-in watchtower
-  ndn-fwd.example.toml          Annotated config template (WT+ACME pre-filled)
+  examples/ndn-fwd.example.toml          Annotated config template (WT+ACME pre-filled)
   install.sh, backup.sh         Interactive installer + cron-friendly backup
 
 testbed/                        Multi-forwarder compliance + Playwright browser tests
@@ -161,8 +159,7 @@ Data:     FaceCheck → TlvDecode → PitMatch  → Validation → CsInsert → 
 
 ndn-rs deliberately diverges from NFD-spec PIT semantics on three
 points to support persistent-attach subscribers. The decisions are
-recorded in
-[`docs/notes/substrate-extension-pit-doctrine-2026-05-11.md`](docs/notes/substrate-extension-pit-doctrine-2026-05-11.md).
+recorded in the internal substrate-extension PIT doctrine.
 
 - **Universal strip-at-insert.** PIT and CS keys remove a trailing
   `ParametersSha256DigestComponent` (`0x02`) or
@@ -256,8 +253,7 @@ NFD clients ignoring kind > 4 see the lifecycle subset; ndn-rs clients
 
 References: [`docs/wiki/src/operations/faces.md`](docs/wiki/src/operations/faces.md)
 (operator guide), [`docs/wiki/src/design/link-service.md`](docs/wiki/src/design/link-service.md)
-(design reference), [`docs/notes/face-system-design-2026-05-20.md`](docs/notes/face-system-design-2026-05-20.md)
-(design doc with every decision + rationale).
+(design reference).
 
 ## Task Topology
 
@@ -317,11 +313,7 @@ trace stitching uses the [`TraceContext` LP TLV](crates/spec/ndn-packet/src/lp/t
 (type `0x520`, 33-byte value matching the W3C trace-context binary form
 plus an 8-byte single-hop timestamp); see
 [`docs/wiki/src/operations/opentelemetry.md`](docs/wiki/src/operations/opentelemetry.md)
-for the operator guide and
-[`docs/notes/cross-router-trace-context-2026-05-07.md`](docs/notes/cross-router-trace-context-2026-05-07.md)
-for the design rationale. The rationale for choosing the NDN substrate over
-OTLP/gRPC push lives in
-[`docs/notes/ndn-native-observability-2026-05-20.md`](docs/notes/ndn-native-observability-2026-05-20.md).
+for the operator guide.
 
 ## Testbed
 
@@ -343,8 +335,7 @@ Testbed CI runs on push to `testbed/**` and weekly via cron
 
 The engine compiles to `wasm32-unknown-unknown` via the
 [`ndn-runtime`](crates/extension/ndn-runtime/) `Spawn`/`Sleep`/`Now` trait
-abstraction (see the readiness audit at
-`docs/notes/wasm-readiness-audit-2026-05-07.md`). The wasm-safe trait
+abstraction. The wasm-safe trait
 shapes used by the engine — `DiscoveryProtocol`, `DiscoveryContext`,
 `NeighborTable`, scope helpers — live in
 [`crates/spec/ndn-discovery-core/`](crates/spec/ndn-discovery-core/);

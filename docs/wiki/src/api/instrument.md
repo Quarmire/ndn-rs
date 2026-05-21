@@ -32,7 +32,6 @@ below).
 | `CallbackFace` | `ndn_faces::callback::CallbackFace` | Virtual face whose send-path is a Rust callback. |
 | `TapFace` | `ndn_faces::callback::TapFace` | Records every wire packet sent to it without participating in forwarding. |
 
-Full inventory: `docs/notes/tiered-api-design-2026-05-20.md` §4.2.
 
 ## Gating
 
@@ -82,9 +81,7 @@ for bytes in captured.lock().unwrap().iter() {
 it, the bytes accumulate, and nothing is returned. Use it alongside
 real faces to record what the engine *would have* sent over them.
 
-In-tree reference: `crates/spec/ndn-faces/src/callback.rs`. The
-audit-witnessed reference experiment is at
-[`examples/tier3-instrument-tap/`](https://github.com/Quarmire/ndn-rs/tree/main/examples/tier3-instrument-tap).
+In-tree reference: `crates/spec/ndn-faces/src/callback.rs`.
 
 ## Engine table access
 
@@ -110,8 +107,7 @@ for entry in engine.fib().iter() {
 ```
 
 These accessors return read-only views by default. Mutating PIT
-state (e.g. injecting fake in-records) is filed for v0.1.x — see
-`docs/notes/tiered-api-design-2026-05-20.md` §6 item 5.
+state (e.g. injecting fake in-records) is filed for v0.1.x.
 
 ## CallbackFace
 
@@ -160,13 +156,9 @@ opening any network sockets.
 - Strategy injection at runtime (bypass `register_strategy!`).
   v0.1.x if a use case appears.
 
-Decision log: `docs/notes/tiered-api-design-2026-05-20.md` §4.4.
-
 ## See also
 
 - [Develop tier](./develop.md) — application-author surface.
 - [Extend tier](./extend.md) — protocol-author trait surface.
 - [Logging](../operations/logging.md) — `observability::targets` is
   the same taxonomy the operator-facing logging page uses.
-- [`examples/tier3-instrument-tap/`](https://github.com/Quarmire/ndn-rs/tree/main/examples/tier3-instrument-tap) —
-  the audit-witnessed reference example.

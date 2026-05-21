@@ -1,11 +1,10 @@
-name: Wiki + Explorer
+name: Wiki
 
 on:
   push:
     branches: [main]
     paths:
       - 'docs/wiki/**'
-      - 'tools/ndn-explorer/**'
       - 'crates/**'
       - 'binaries/**'
       - '.github/workflows/wiki.yml'
@@ -62,30 +61,6 @@ jobs:
           key: ${{ runner.os }}-doc-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}
           restore-keys: ${{ runner.os }}-doc-
 
-      - name: Install wasm-pack
-        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
-
-      - name: Build ndn-wasm
-        id: wasm_build
-        continue-on-error: true   # site still deploys with JS fallback if this fails
-        run: |
-          wasm-pack build crates/ndn-wasm \
-            --target web \
-            --out-dir "$PWD/tools/ndn-explorer/wasm" \
-            --out-name ndn_wasm \
-            --no-typescript \
-            --release
-          echo "built=true" >> "$GITHUB_OUTPUT"
-
-      - name: Report WASM build status
-        run: |
-          if [ "${{ steps.wasm_build.outputs.built }}" = "true" ]; then
-            echo "✓ ndn-wasm built — WASM simulation will be active in the Explorer"
-            ls -lh tools/ndn-explorer/wasm/
-          else
-            echo "⚠ ndn-wasm build failed — Explorer will use JS fallback simulation"
-          fi
-
       # ── API docs (cargo doc) ──────────────────────────────────────────────────
       - name: Build API docs
         id: docs_build
@@ -103,9 +78,8 @@ jobs:
             --exclude ndn-python \
             --exclude example-strategy-custom \
             --exclude example-strategy-composed \
-            --exclude example-cross-layer-enricher \
+            --exclude example-context-enricher \
             --exclude example-wasm-strategy \
-            --exclude example-discovery-lan \
             2>&1 | tail -20
           # Create a root index that lists all documented crates
           cat > target/doc/index.html << 'HTML'
@@ -292,13 +266,11 @@ jobs:
       # Assemble the site:
       #   /             → landing page
       #   /wiki/        → mdBook output
-      #   /explorer/    → static explorer app
       #   /dashboard/   → Dioxus web WASM app
       - name: Assemble site
         run: |
           mkdir -p target/site
           cp -r target/wiki target/site/wiki
-          cp -r tools/ndn-explorer target/site/explorer
 
           # Dashboard — copy web-dist if built, otherwise placeholder
           if [ "${{ steps.dash_build.outputs.built }}" = "true" ] && [ -d crates/tooling/ndn-dashboard/web-dist ]; then
@@ -360,11 +332,6 @@ jobs:
               <p style="margin-top:0.5rem">Named Data Networking forwarder stack in Rust</p>
             </div>
             <div class="cards">
-              <a class="card" href="explorer/">
-                <div class="card-icon">🗺️</div>
-                <h2>Explorer</h2>
-                <p>Interactive crate map, dependency graph, and pipeline trace</p>
-              </a>
               <a class="card" href="wiki/">
                 <div class="card-icon">📖</div>
                 <h2>Wiki</h2>

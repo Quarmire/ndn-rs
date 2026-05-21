@@ -1,15 +1,9 @@
 # Spec compliance
 
 ndn-rs's compliance with the NDN Packet Specification and the
-NDNCERT specification is tracked in the audit at
-`docs/notes/spec-compliance-audit-2026-04-20.md` and the
-cross-reference at
-`docs/notes/spec-compliance-cross-reference-2026-05-01.md`. Live
-witness scripts under `testbed/tests/audit/` exit non-zero when a
-compliance claim regresses.
-
-This page summarises which areas are covered; the audit doc is the
-authoritative record.
+NDNCERT specification is tracked by live witness scripts under
+`testbed/tests/audit/` that exit non-zero when a compliance claim
+regresses. This page summarises which areas are covered.
 
 ## Coverage areas
 
@@ -29,14 +23,8 @@ authoritative record.
 | Architectural cleanup | Phase 2 ARCH-1..20 | (ARCH-N) | `arch*` (per-item witnesses) |
 | Tiered API surface | Phase 3 §3 | tier docs | `phase3_*` |
 
-The audit file enumerates every (finding, witness) pair. Reading
-order:
-
-1. `docs/notes/spec-compliance-audit-2026-04-20.md` — findings with
-   severity and disposition.
-2. `docs/notes/spec-compliance-cross-reference-2026-05-01.md` —
-   cross-references to reference impls on disk.
-3. `testbed/tests/audit/*.sh` — runnable witnesses.
+The `testbed/tests/audit/*.sh` scripts are the runnable witnesses;
+each exits non-zero when the claim it tracks regresses.
 
 ## Reading the witnesses
 
@@ -67,17 +55,14 @@ new findings follow the same shape (project memory
 
 ## Cross-impl on-disk references
 
-The audit cross-reference doc cites file:line in the reference
-implementations under `~/Documents/Dev/`. Per project memory
-`feedback_cross_reference_standard`, every finding cites the source
-implementation it tracks. These references live in the audit doc;
-this wiki page links to the audit rather than duplicating it.
+Per project memory `feedback_cross_reference_standard`, every
+audit finding cites the source implementation it tracks
+(`~/Documents/Dev/{ndn-cxx,NFD,ndnd,ndn-svs}`). The references
+live alongside each witness script's `# Finding:` header comment.
 
 ## TLV codepoint allocations
 
-ndn-rs's own TLV allocations are tracked in
-`docs/notes/ndn-rs-tlv-allocations-2026-05-20.md`. The doc
-distinguishes:
+ndn-rs's TLV allocations split into three classes:
 
 - IANA / registry codes ndn-rs implements (forwarding).
 - ndn-rs-internal codes used only on in-process or shared-memory
@@ -86,15 +71,10 @@ distinguishes:
 
 ## Releasing under v0.1.0
 
-The audit's green state is a precondition for v0.1.0. The audit
-doc records findings status; release-readiness is gated on every
-critical-severity finding being closed (project memory
-`project_audit_honesty_pass`).
+Release-readiness is gated on every critical-severity audit
+finding being closed (project memory `project_audit_honesty_pass`).
 
 ## See also
 
-- `docs/notes/spec-compliance-audit-2026-04-20.md` — authoritative.
-- `docs/notes/spec-compliance-cross-reference-2026-05-01.md` —
-  per-finding cross-reference.
 - `testbed/tests/audit/` — runnable witness scripts.
 - [Phase 4 release notes](../releases/v0.1.0.md) — what shipped.

@@ -28,7 +28,7 @@ Per project memory `project_self_hosted_stack`, the stack landed
 
 ```sh
 cd deploy/
-cp ndn-fwd.example.toml ndn-fwd.toml
+cp examples/ndn-fwd.example.toml ndn-fwd.toml
 # edit ndn-fwd.toml for your host:
 #   [mgmt] socket, [face.udp] listen, [face.ws] listen, [ndncert.ca] identity
 
@@ -62,7 +62,7 @@ to the same paths before `install.sh`.
 
 Per project memory `feedback_docker_rust_version`, the Dockerfiles
 use `rust:slim` (latest stable), not pinned `rust:X.Y-slim`. The
-MSRV is read from `rust-toolchain.toml`.
+MSRV is whatever the latest stable provides.
 
 ## Update
 

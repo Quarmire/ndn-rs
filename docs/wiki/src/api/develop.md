@@ -8,8 +8,7 @@ and `ndn-security` from the `ndn-rs-prelude` crate (library name
 
 Package vs library: `Cargo.toml` carries `ndn-rs-prelude = "0.1"`;
 imports read `use ndn::Consumer;`. The split is recorded in
-`crates/spec/ndn-rs-prelude/Cargo.toml` and in the tier design notes
-at `docs/notes/tiered-api-design-2026-05-20.md` §2.
+`crates/spec/ndn-rs-prelude/Cargo.toml`.
 
 ## Inventory
 
@@ -38,8 +37,6 @@ graph LR
 | `InterestBuilder`, `DataBuilder` | `ndn_packet::encode::*` | Builder-style packet construction. |
 | `AppError` | `ndn_app::error::AppError` | Single error type at the Develop tier boundary. |
 
-The full inventory and decision log lives in
-`docs/notes/tiered-api-design-2026-05-20.md` §2.1.
 
 ## Consumer
 
@@ -123,8 +120,7 @@ while let Some(sample) = sub.next().await {
 ```
 
 Note: in v0.1.0 the `Subscriber` is read-only. Publishing into a
-sync group from Develop-tier code is filed for v0.1.x — see
-`docs/notes/api-completeness-check-2026-05-20.md` GAP-5.
+sync group from Develop-tier code is filed for v0.1.x.
 
 ## Connection {#connection}
 
@@ -204,8 +200,6 @@ The Develop tier deliberately omits:
 - Per-crate error enums (`ConfigError`, `TrustError`, etc.) — they
   collapse into `AppError` at this boundary.
 
-The full omission list is in
-`docs/notes/tiered-api-design-2026-05-20.md` §2.4.
 
 ## See also
 
@@ -215,5 +209,3 @@ The full omission list is in
   lines.
 - [Ten-minute producer](../quickstart/10-minute-producer.md) —
   Producer + Consumer pair.
-- [`examples/tier1-develop-5min/`](https://github.com/Quarmire/ndn-rs/tree/main/examples/tier1-develop-5min) —
-  the audit-witnessed reference example.

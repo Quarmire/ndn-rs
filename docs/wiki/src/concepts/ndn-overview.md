@@ -20,9 +20,9 @@ arbitrary bytes; conventionally they are written as URI segments.
 
 Each component carries a TLV *type* (regular, sequence number,
 version, segment, timestamp, keyword, parameters-sha256-digest,
-implicit-sha256-digest, etc.). The type system is documented in the
-NDN Packet Specification and in the audit doc at
-`docs/notes/spec-compliance-audit-2026-04-20.md`.
+implicit-sha256-digest, etc.). The type system is documented in
+the NDN Packet Specification; ndn-rs's coverage is tracked in the
+[spec-compliance summary](../reference/spec-compliance.md).
 
 Component types in ndn-rs are `ndn_packet::NameComponent` variants;
 naming a `Data` packet under `/example/blog/post/seg=0` parses to
@@ -118,5 +118,5 @@ WebRTC, BLE, Ethernet, shared memory, in-process. The catalog is in
 - The packet lifecycle: [Interest and Data lifecycle](./interest-data-lifecycle.md).
 - Identities, certs, key chains: [Identity and keys](./identity-and-keys.md).
 - One-page jargon reference: [Glossary](./glossary.md).
-- Wire format details: the audit doc at
-  `docs/notes/spec-compliance-audit-2026-04-20.md`.
+- Wire format details: the
+  [spec-compliance summary](../reference/spec-compliance.md).

@@ -105,9 +105,9 @@ let (engine, _shutdown) = EngineBuilder::new(EngineConfig::default())
 # Ok(()) }
 ```
 
-The reference example at `examples/tier2-extend-strategy/` shows the
-end-to-end shape and is exercised by
-`testbed/tests/audit/phase3_example_tier2_runs.sh`.
+The reference example at [`examples/strategy-custom/`](https://github.com/Quarmire/ndn-rs/tree/main/examples/strategy-custom)
+shows the end-to-end shape (engine wired with a custom strategy
+implementation).
 
 ## Built-in references
 
@@ -146,4 +146,6 @@ applies; the loader handles the host/guest boundary. See
   what the strategy is in the middle of.
 - [Management verbs](../reference/mgmt-verbs.md) — `strategy set` /
   `strategy unset` verbs.
-- [`examples/tier2-extend-strategy/`](https://github.com/Quarmire/ndn-rs/tree/main/examples/tier2-extend-strategy).
+- [`examples/strategy-custom/`](https://github.com/Quarmire/ndn-rs/tree/main/examples/strategy-custom),
+  [`examples/strategy-composed/`](https://github.com/Quarmire/ndn-rs/tree/main/examples/strategy-composed),
+  [`examples/context-enricher/`](https://github.com/Quarmire/ndn-rs/tree/main/examples/context-enricher).

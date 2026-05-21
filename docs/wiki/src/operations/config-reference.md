@@ -1,10 +1,10 @@
 # Config reference
 
 `ndn-fwd.toml` configures the forwarder. The shipped example is
-`ndn-fwd.example.toml` in the repository root — every option with
+`examples/ndn-fwd.example.toml` — every option with
 its default in a comment.
 
-This page lists the option groups; consult `ndn-fwd.example.toml`
+This page lists the option groups; consult `examples/ndn-fwd.example.toml`
 for the full set with defaults.
 
 ## File location
@@ -102,12 +102,11 @@ auto-enrollment. See [NDNCERT setup](../guides/ndncert-setup.md).
 
 ## `[rate_limit]` — token-bucket rate limits
 
-Per project memory `project_dashboard_multi_forwarder`. See
-`docs/notes/rate-limit-design-2026-05-12.md` for the design.
+Per project memory `project_dashboard_multi_forwarder`.
 
 ## See also
 
-- `ndn-fwd.example.toml` — the source of truth; every key with
+- `examples/ndn-fwd.example.toml` — the source of truth; every key with
   defaults and inline comments.
 - [ndn-fwd](./ndn-fwd.md) — operator workflows.
 - [Face transports](../reference/face-transports.md) — per-face
