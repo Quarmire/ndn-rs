@@ -148,3 +148,34 @@ jobs:
           cargo check -p ndn-store           --target wasm32-unknown-unknown
           cargo check -p ndn-strategy        --target wasm32-unknown-unknown
           cargo check -p ndn-runtime         --target wasm32-unknown-unknown
+
+  riscv32imc:
+    name: Embedded — riscv32imc-unknown-none-elf build (no-CAS no_std chain)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: riscv32imc-unknown-none-elf
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-riscv32imc-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-riscv32imc-
+
+      - name: Build no_std crates for riscv32imc-unknown-none-elf
+        # Mirrors testbed/tests/audit/embedded_riscv32imc_build.sh. The target
+        # has no atomic-CAS in hardware; `portable-atomic` feature swaps
+        # Arc/Bytes refcounting through portable-atomic-util, with the
+        # `unsafe-assume-single-core` polyfill chosen via rustflag.
+        env:
+          RUSTFLAGS: --cfg=portable_atomic_unsafe_assume_single_core
+        run: |
+          cargo build --target riscv32imc-unknown-none-elf \
+            --no-default-features --features portable-atomic \
+            -p ndn-foundation-types -p ndn-tlv -p ndn-packet -p ndn-embedded
