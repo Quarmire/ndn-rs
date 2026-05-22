@@ -13,6 +13,7 @@
     "@ndn/endpoint": "*",
     "@ndn/fw": "*",
     "@ndn/packet": "*",
+    "@ndn/quic-transport": "^0.0.20250307",
     "@ndn/ws-transport": "*"
   },
   "devDependencies": {

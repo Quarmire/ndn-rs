@@ -5,11 +5,12 @@
 // esbuild bundles this into fixture-page/ndnts.bundle.js as an IIFE.
 
 import { WsTransport } from "@ndn/ws-transport";
+import { H3Transport } from "@ndn/quic-transport";
 import { consume, produce } from "@ndn/endpoint";
 import { Data, Interest, Name, Component } from "@ndn/packet";
 import { Encoder } from "@ndn/tlv";
 
-export { WsTransport, consume, produce, Data, Interest, Name, Component, Encoder };
+export { WsTransport, H3Transport, consume, produce, Data, Interest, Name, Component, Encoder };
 
 /**
  * Send a rib/register Interest to ndn-fwd so that Interests matching `prefix`
