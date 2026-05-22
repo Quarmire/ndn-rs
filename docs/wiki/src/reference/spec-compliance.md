@@ -56,9 +56,10 @@ new findings follow the same shape (project memory
 ## Cross-impl on-disk references
 
 Per project memory `feedback_cross_reference_standard`, every
-audit finding cites the source implementation it tracks
-(`~/Documents/Dev/{ndn-cxx,NFD,ndnd,ndn-svs}`). The references
-live alongside each witness script's `# Finding:` header comment.
+audit finding cites the source implementation it tracks against
+the upstream NDN reference implementations cloned on disk. The
+references live alongside each witness script's `# Finding:`
+header comment.
 
 ## TLV codepoint allocations
 
