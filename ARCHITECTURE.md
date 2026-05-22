@@ -89,6 +89,8 @@ crates/extension/               Pragmatic engineering, no NDN spec basis
                                 `--features browser-engine` + `?engine=local`
   ndn-python                    PyO3 Python bindings
   ndn-boltffi                   BoltFFI — Kotlin/JVM and Swift bindings
+  ndn-compute                   In-network compute: ComputeService (tiered API),
+                                ComputeFace, ComputeRegistry, ComputeHandler
 
 crates/tooling/                 Operator-facing tools and shared tool libs
   ndn-tools-core                Embeddable tool logic (ping, iperf, peek, put)
@@ -96,7 +98,6 @@ crates/tooling/                 Operator-facing tools and shared tool libs
 
 crates/draft/                   Author-led, no stability promise
   ndn-research                  FlowObserverStage, FlowTable, ChannelManager (nl80211)
-  ndn-compute                   ComputeFace, ComputeRegistry for named-function execution
 
 binaries/spec/                  Standalone executable that implements the spec
   ndn-fwd                       The forwarder (NFD-comparable; TOML config, management socket)
@@ -380,5 +381,5 @@ can run without a real browser.
 | [`docs/discovery.md`](docs/discovery.md) | NDN AutoConfig, neighbor liveness probe, service discovery |
 | [`docs/protocols/routing.md`](docs/protocols/routing.md) | DVR algorithm, static routes, RIB lifecycle |
 | [`docs/wireless.md`](docs/wireless.md) | Multi-radio, nl80211, wfb-ng |
-| [`docs/compute.md`](docs/compute.md) | In-network compute levels |
+| [`docs/compute.md`](docs/compute.md) | In-network compute: tiered API, determinism, wire spec |
 | [`docs/spsc-shm-spec.md`](docs/spsc-shm-spec.md) | Shared memory ring buffer spec |
