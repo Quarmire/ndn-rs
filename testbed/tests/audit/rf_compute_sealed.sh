@@ -10,6 +10,9 @@
 #                wrong_node_key_cannot_open, truncated_blob_is_malformed}
 #              - reflexive_sealed_end_to_end: consumer seals params to the node's
 #                ephemeral key; node decrypts and computes; blob is ciphertext.
+#              - reflexive_secure_* : authenticated + confidential combined
+#                (signed Data carrying the sealed blob; node validates then
+#                decrypts; unsigned is rejected before decryption).
 #
 # Exit codes: 0 PASS / 1 FAIL / 2 SKIP
 set -euo pipefail
@@ -22,8 +25,11 @@ if ! cargo test -p ndn-compute --features sealed-params --lib --quiet sealed:: \
         >/tmp/rf_sealed_witness.log 2>&1; then
     fail=1
 fi
-if ! cargo test -p ndn-compute --features sealed-params --test end_to_end --quiet \
-        reflexive_sealed_end_to_end >>/tmp/rf_sealed_witness.log 2>&1; then
+if ! cargo test -p ndn-compute --features sealed-params --test end_to_end --quiet -- \
+        reflexive_sealed_end_to_end \
+        reflexive_secure_validates_decrypts_and_computes \
+        reflexive_secure_rejects_unsigned_sealed \
+        >>/tmp/rf_sealed_witness.log 2>&1; then
     fail=1
 fi
 
