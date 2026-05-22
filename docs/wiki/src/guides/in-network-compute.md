@@ -106,6 +106,26 @@ let pixels: Vec<u8> = client
 thunk, then poll. Identical arguments map to the same thunk, so several
 clients waiting on the same job share one execution.
 
+## Pulling parameters by reference
+
+When an input is too large to put in the name, register the function with
+`function_ref` and take the parameter's *name* as the argument. The handler
+receives a `ComputeContext` and fetches the value itself:
+
+```rust,ignore
+compute.function_ref("/sum", |param: String, ctx| async move {
+    let bytes = ctx.fetch(param.parse::<ndn_packet::Name>().unwrap()).await?;
+    Ok(bytes.iter().map(|&b| b as u64).sum::<u64>())
+});
+```
+
+The referenced name must be routable to a producer — the consumer publishes the
+parameter under a name and the compute node fetches it. (Calling back a consumer
+that holds no routable name is a separate, planned capability.)
+
+Because the handler re-enters the forwarder to fetch, the engine must run on a
+multi-threaded async runtime — the default for the forwarder binary.
+
 ## Testing
 
 The in-process engine is the testing fixture — drive a `ComputeClient`
