@@ -6,9 +6,10 @@
 # Witnesses:
 #   (a) GREP-PROOF — PitStore exposes the write surface (record_pending,
 #       satisfy, discard_pending), all keyed by `&[&[u8]]` component slices.
-#   (b) GREP-PROOF — the embedded forwarder uses record_pending / satisfy /
-#       discard_pending instead of hand-rolling PIT name hashing in the shell
-#       (the obsolete name_hash_from_components helper is gone).
+#   (b) GREP-PROOF — the embedded forwarder drives the PIT write surface
+#       instead of hand-rolling name hashing in the shell: record_pending and
+#       discard_pending directly, and satisfy via pipeline::decide_data (the
+#       obsolete name_hash_from_components helper is gone).
 #   (c) RUST-UNIT  — ndn-fwd-core + ndn-embedded tests pass, including the
 #       strengthened data_satisfies_pit assertion (Data reaches the recorded
 #       downstream face and the entry is consumed).
@@ -36,10 +37,14 @@ grep -qE 'components:[[:space:]]*&\[&\[u8\]\]' "$STORE" 2>/dev/null \
     || { echo "FAIL: PitStore write surface is not keyed by &[&[u8]] slices" >&2; fail=1; }
 
 # (b) forwarder drives the trait; the old shell-side hasher is gone.
-for m in record_pending satisfy discard_pending; do
+#     record_pending + discard_pending are called directly; satisfy is driven
+#     through the core's decide_data orchestrator (the Data path).
+for m in record_pending discard_pending; do
     grep -qE "\.$m\(" "$FWD" 2>/dev/null \
         || { echo "FAIL: $FWD does not use PitStore::$m" >&2; fail=1; }
 done
+grep -qE 'decide_data' "$FWD" 2>/dev/null \
+    || { echo "FAIL: $FWD does not drive PitStore::satisfy via decide_data" >&2; fail=1; }
 if grep -qE 'fn[[:space:]]+name_hash_from_components' "$FWD" 2>/dev/null; then
     echo "FAIL: $FWD still hand-rolls name_hash_from_components" >&2
     fail=1
