@@ -23,6 +23,10 @@ By default the forwarder:
 - Stores PIB and KeyChain at `~/.ndn/`.
 - Logs to stderr at `info` level (override with `RUST_LOG`).
 
+WebRTC datachannel faces are opt-in: they pull in the full WebRTC
+stack, so build with `--features webrtc` to enable the
+`[listeners.webrtc]` config section.
+
 ## Verify
 
 In another terminal:
