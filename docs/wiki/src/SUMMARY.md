@@ -42,6 +42,7 @@
 # Reference
 
 - [Face transports](./reference/face-transports.md)
+- [NDN over BLE — GATT profile](./reference/ndn-ble-gatt-profile.md)
 - [Management verbs](./reference/mgmt-verbs.md)
 - [Trust policies](./reference/trust-policies.md)
 - [Spec compliance](./reference/spec-compliance.md)
