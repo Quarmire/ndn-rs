@@ -68,7 +68,7 @@ crates/spec/                    NDN community specs implemented faithfully
   ndn-routing                   StaticProtocol, DvrProtocol, NlsrProtocol
   ndn-sync                      Dataset sync: SVS, PSync
   ndn-did                       NDN-native Decentralised Identifiers (W3C DID + did:ndn method)
-  ndn-cert                      NDNCERT 0.3 — INFO/NEW/CHALLENGE + IssuancePolicy hook
+  ndn-cert                      NDNCERT 0.3 — INFO/NEW/CHALLENGE + IssuancePolicy hook + challenge attestations
   ndn-identity                  Bridges KeyChain + DID + NDNCERT
 
 crates/extension/               Pragmatic engineering, no NDN spec basis

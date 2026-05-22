@@ -128,6 +128,35 @@ A holder of `cert-N` proves possession of its key to obtain
 `cert-N+1`. The Producer can be configured to auto-renew before
 expiry; see `crates/spec/ndn-cert/src/auto_renew.rs`.
 
+## Challenge attestations
+
+A CA can record *how* a challenge was satisfied directly in the
+issued certificate. The record rides in the cert's
+`SignatureInfo` → `AdditionalDescription` (the non-critical
+extension point used for cert metadata), so it is covered by the
+CA's signature and skipped cleanly by verifiers that don't read it.
+
+It is off by default — issued certs are byte-identical to the
+plain flow until you opt in:
+
+```rust,ignore
+let config = CaConfig::new(/* … */).emit_attestations(true);
+```
+
+With it enabled, a token-challenge cert carries a single-leaf set
+naming `token`. Composite challenges record one leaf per satisfied
+sub with that sub's own evidence: `all-of` carries every sub,
+`nofm` carries the `n` that were met, and `any-of` carries the one
+that won. A cross-process `device-approval` leaf additionally
+carries the approving device's identity and signature, verifiable
+independently of the CA. The dashboard's trust-path inspector
+renders the leaves, and `security/validate` returns them under
+`challenge_attestations`.
+
+The wire shape and the per-handler evidence each leaf carries are
+documented in `docs/ndncert-attestations.md`; see
+`crates/spec/ndn-cert/src/attestation.rs` for the types.
+
 ## See also
 
 - [Identity and keys](../concepts/identity-and-keys.md) — KeyChain
