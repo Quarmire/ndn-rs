@@ -26,6 +26,7 @@
 - [Building an application](./guides/building-an-app.md)
 - [Writing a strategy](./guides/writing-a-strategy.md)
 - [Implementing a face](./guides/implementing-a-face.md)
+- [In-network compute](./guides/in-network-compute.md)
 - [NDNCERT setup](./guides/ndncert-setup.md)
 - [Running the dashboard](./guides/running-the-dashboard.md)
 - [Self-hosting](./guides/self-hosting.md)
