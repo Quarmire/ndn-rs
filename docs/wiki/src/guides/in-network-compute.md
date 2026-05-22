@@ -120,8 +120,13 @@ compute.function_ref("/sum", |param: String, ctx| async move {
 ```
 
 The referenced name must be routable to a producer — the consumer publishes the
-parameter under a name and the compute node fetches it. (Calling back a consumer
-that holds no routable name is a separate, planned capability.)
+parameter under a name and the compute node fetches it.
+
+When the consumer holds no routable name, use `function_reflexive` instead: the
+invocation Interest carries an unpredictable reflexive name, and the node
+Interests the parameters back along the reverse path the Interest arrived on, so
+the consumer answers without registering any prefix. This relies on the
+forwarders on the path supporting reflexive forwarding.
 
 ## Testing
 
