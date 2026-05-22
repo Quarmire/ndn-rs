@@ -98,6 +98,15 @@ reassembled segmented `Data`.
 | `config` | Adjust admission policy at runtime. |
 | `erase` | Erase entries matching a prefix. |
 
+`reflexive` (ndn-rs extension; reflexive-forwarding control):
+
+| Verb | Effect |
+|---|---|
+| `enable` / `disable` | Toggle installing new reverse routes (`disable` drains gracefully). |
+| `config` | Set the per-face cap and route-lifetime ceiling. |
+| `flush` | Drop all reverse routes immediately. |
+| `info` | Settings, live route count, and counters. |
+
 The full per-module verb list is in each module file's
 docstring.
 
