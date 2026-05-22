@@ -24,7 +24,7 @@ transport see [Implementing a face](../guides/implementing-a-face.md).
 | Bluetooth LE — peripheral | `crates/spec/ndn-faces/src/l2/bluetooth/mod.rs` | `[listeners.ble]` | GATT server; advertises the NDN service (Linux/macOS). |
 | Serial (UART) | `crates/spec/ndn-faces/src/serial/mod.rs` | `serial` | Embedded / microcontroller. |
 | WebSocket | `crates/spec/ndn-faces/` (`ws`) | `ws` | Browser-to-forwarder over WebSocket. |
-| WebTransport | `crates/spec/ndn-face-webtransport/`; wasm: `crates/extension/ndn-face-webtransport-wasm/` | `webtransport` | Browser-to-forwarder over QUIC datagrams. |
+| WebTransport | `crates/spec/ndn-face-webtransport/`; wasm: `crates/extension/ndn-face-webtransport-wasm/` | `[listeners.webtransport]`; dial via `[[face]] kind = "web-transport"` or `faces/create wts://…` | Browser↔forwarder and forwarder↔forwarder (NAT-traversing) over QUIC datagrams; oversized packets are NDNLPv2-fragmented to `maxDatagramSize` (interoperates with NDNts `H3Transport`). |
 | WebRTC datachannel | `crates/extension/ndn-face-webrtc/` | `webrtc` | Browser ↔ browser, browser ↔ relay. |
 | SharedWorker | `crates/extension/ndn-face-shared-worker/` | (programmatic) | Per-origin engine sharing across tabs. |
 | Callback / Tap | `crates/spec/ndn-faces/src/callback.rs` | (Instrument tier) | Researcher: virtual face whose send-path is a closure. |
@@ -41,15 +41,33 @@ bind = "0.0.0.0:6363"
 # remote = "10.0.0.1:6363"  # optional: point-to-point only
 ```
 
-WebTransport face listener:
+WebTransport listener (inbound; browsers and peer forwarders connect here):
+
+```toml
+[listeners.webtransport]
+enabled = true
+listen = "0.0.0.0:4443"
+# Self-signed dev cert (browser pins it via serverCertificateHashes):
+cert_source = { type = "self_signed_dev", hostnames = ["localhost"] }
+# Or PEM:  { type = "pem", cert_pem = "/etc/ndn-fwd/wt.pem", key_pem = "/etc/ndn-fwd/wt.key" }
+# Or ACME: { type = "acme", directory_url = "…", email = "…", domain = "…",
+#            dns_provider = "cloudflare", cache_dir = "/var/lib/ndn-fwd/acme" }
+```
+
+WebTransport outbound dial (forwarder-to-forwarder over NAT):
 
 ```toml
 [[face]]
-kind = "webtransport"
-listen = "0.0.0.0:4443"
-cert = "/etc/ndn-fwd/wt.pem"
-key  = "/etc/ndn-fwd/wt.key"
+kind = "web-transport"
+remote = "wts://peer.example:4443"
+# Pin a self-signed peer's leaf cert by SHA-256 (hex); omit for WebPKI:
+cert_sha256 = "ab12…64hex"
+# webpki = true   # validate against the OS trust store instead
 ```
+
+The listener's TLS cert status (notAfter, days remaining, renewal state) is
+readable per listener via the `/localhost/nfd/webtransport/cert-status`
+management dataset.
 
 Shared-memory face (per-host IPC):
 
