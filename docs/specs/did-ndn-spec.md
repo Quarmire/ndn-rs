@@ -178,7 +178,7 @@ For certificates issued by an NDNCERT CA rather than self-signed, the certificat
 6. Convert the certificate to a DID Document (Section 5).
 
 ```rust
-use ndn_did::UniversalResolver;
+use ndn_security::did::UniversalResolver;
 
 let resolver = UniversalResolver::new();
 let doc = resolver.resolve("did:ndn:com:acme:alice").await?;
@@ -492,9 +492,10 @@ To add `did:ndn` to the DIF Universal Resolver (https://dev.uniresolver.io/):
 
 ## 11. Reference Implementation
 
-The reference implementation of the `did:ndn` method is the `ndn-did` crate in this repository:
+The reference implementation of the `did:ndn` method lives in the
+`ndn-security` crate's `did` module in this repository:
 
-- **Crate:** `crates/spec/ndn-did`
+- **Module:** `crates/spec/ndn-security/src/did/` (`ndn_security::did`)
 - **Repository:** https://github.com/ndn-rs/ndn-rs
 - **Key types:** `UniversalResolver`, `DidDocument`, `DidError`
 - **Key functions:** `name_to_did`, `did_to_name`, `cert_to_did_document`
