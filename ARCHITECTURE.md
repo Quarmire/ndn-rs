@@ -55,7 +55,8 @@ crates/spec/                    NDN community specs implemented faithfully
   ndn-store                     NameTrie, Fib, PIT, ContentStore (LruCs/ShardedCs/FjallCs), DeadNonceList
   ndn-safebag                   SafeBag (cert + PKCS#5-encrypted key) — wasm-buildable carve-out of safe_bag.rs
   ndn-faces                     Feature-gated native face types (UDP, TCP, WebSocket, Unix, SHM,
-                                serial, ethernet, BLE, virtual)
+                                serial, ethernet, virtual; BLE central via `ble://` + peripheral
+                                via `[listeners.ble]`, NDNts web-bluetooth GATT profile)
   ndn-face-webtransport         Server-side WebTransport listener (HTTP/3 + QUIC datagrams)
   ndn-strategy                  BestRoute, Multicast, ASF, composed strategies
   ndn-security                  KeyChain, Signer/Verifier, TrustSchema, Validator, SafeData
@@ -78,6 +79,7 @@ crates/extension/               Pragmatic engineering, no NDN spec basis
   ndn-face-webtransport-wasm    Browser-side WebTransport client face
   ndn-face-webrtc               Peer-to-peer datachannel face (browser-as-peer)
   ndn-face-shared-worker        Per-origin SharedWorker face (one engine across tabs)
+  ndn-face-webble               Browser-side Web Bluetooth central face (dials NDN-BLE peripherals)
   ndn-rtc-signaling-relay       HTTP rendezvous server for browser↔browser WebRTC
   ndn-sim                       SimFace, SimLink, topology builder, event tracer
   ndn-wasm                      In-browser simulation via wasm-bindgen
@@ -91,6 +93,8 @@ crates/extension/               Pragmatic engineering, no NDN spec basis
   ndn-boltffi                   BoltFFI — Kotlin/JVM and Swift bindings
   ndn-compute                   In-network compute: ComputeService (tiered API),
                                 ComputeFace, ComputeRegistry, ComputeHandler
+  ndn-coding                    Network coding (F1 FEC): CodedProducer / CodedFetcher
+                                endpoint API, GF(2^8) K-of-N codec, coding policy table
 
 crates/tooling/                 Operator-facing tools and shared tool libs
   ndn-tools-core                Embeddable tool logic (ping, iperf, peek, put)
@@ -136,6 +140,7 @@ examples/                       Documentation-grade examples (strategy, discover
 | `RoutingProtocol` | ndn-routing | RIB population from routing algorithms |
 | `ForwarderClient` | ndn-ipc | App-to-forwarder IPC (async or blocking) |
 | `ComputeHandler` | ndn-compute | Named function execution |
+| `CodedProducer` / `CodedFetcher` | ndn-coding | End-to-end K-of-N FEC over named Data |
 
 ## Pipeline Flow
 
@@ -382,4 +387,5 @@ can run without a real browser.
 | [`docs/protocols/routing.md`](docs/protocols/routing.md) | DVR algorithm, static routes, RIB lifecycle |
 | [`docs/wireless.md`](docs/wireless.md) | Multi-radio, nl80211, wfb-ng |
 | [`docs/compute.md`](docs/compute.md) | In-network compute: tiered API, determinism, wire spec |
+| [`docs/coding.md`](docs/coding.md) | Network coding: F1 FEC, CodedProducer/CodedFetcher, wire spec |
 | [`docs/spsc-shm-spec.md`](docs/spsc-shm-spec.md) | Shared memory ring buffer spec |
