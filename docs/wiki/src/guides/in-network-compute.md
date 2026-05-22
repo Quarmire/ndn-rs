@@ -123,9 +123,6 @@ The referenced name must be routable to a producer — the consumer publishes th
 parameter under a name and the compute node fetches it. (Calling back a consumer
 that holds no routable name is a separate, planned capability.)
 
-Because the handler re-enters the forwarder to fetch, the engine must run on a
-multi-threaded async runtime — the default for the forwarder binary.
-
 ## Testing
 
 The in-process engine is the testing fixture — drive a `ComputeClient`
