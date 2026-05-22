@@ -45,6 +45,10 @@ substrate — a forwarder engine plus the tools and libraries around it.
   cross-stack tooling.
 - Browser-ready: the engine builds for `wasm32-unknown-unknown` and
   runs in a browser tab.
+- Embedded and mobile: a `no_std` forwarder for bare-metal MCUs serving
+  NDN-over-BLE (verified on ESP32-C3 and ESP32-S3), and a single BoltFFI
+  surface that generates Kotlin, Swift, and TypeScript/WASM bindings from
+  one Rust definition.
 
 ---
 
