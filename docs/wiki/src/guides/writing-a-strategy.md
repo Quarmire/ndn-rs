@@ -88,6 +88,33 @@ longest-prefix-match strategy for each Interest.
 
 The full surface is in `crates/ndn-strategy/src/context.rs`.
 
+## Cross-layer signals
+
+`ctx.signals` exposes external/environmental inputs — radio link quality
+(RSSI, SNR, congestion) and node state (GPS position, battery) — distinct from
+`ctx.measurements` (which are derived from observed traffic):
+
+```rust,ignore
+// Prefer the nexthop with the strongest signal.
+let best = nexthops.iter().copied().max_by_key(|f| {
+    ctx.signals.link(*f).and_then(|l| l.rssi_dbm).unwrap_or(i8::MIN)
+});
+```
+
+Signals are *pushed* by **signal sources** (a background driver feeds a shared
+store), so reading them never blocks: register a source with
+`EngineBuilder::signal_source(...)` from `ndn-signal-sources` (radio metrics,
+GPS; pluggable hardware/mock backends).
+
+A measured strategy can share **one decision kernel across native and
+embedded**: write a pure `fn(&dyn SignalView<F>, nexthops, incoming, emit)` and
+call it from both the native `Strategy` adapter and the embedded sans-IO
+`Strategy`. `ndn-strategy-cclf` is the worked example.
+
+The taxonomy, trait contracts, units, and the read-only
+`/localhost/nfd/faces/link-quality` dataset are specified in
+[`docs/signals.md`](https://github.com/Quarmire/ndn-rs/blob/main/docs/signals.md).
+
 ## Testing
 
 The in-process engine is the right testing fixture:
