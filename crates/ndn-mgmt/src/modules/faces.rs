@@ -392,6 +392,10 @@ async fn handle_faces(
             events: Vec::new(),
         },
         v if v == verb::COUNTERS => faces_counters(engine).into(),
+        v if v == verb::LINK_QUALITY => VerbOutcome {
+            response: MgmtResponse::Dataset(faces_link_quality_dataset(engine)),
+            events: Vec::new(),
+        },
         _ => ControlResponse::error(status::NOT_FOUND, "unknown faces verb").into(),
     }
 }
@@ -1327,6 +1331,69 @@ fn faces_list_dataset(engine: &ForwarderEngine) -> bytes::Bytes {
     buf.freeze()
 }
 
+// --- faces/link-quality (ndn-rs-local cross-layer telemetry dataset) ---------
+//
+// NOT an NFD dataset — observability only. TLV codes are ndn-rs-local
+// (application range, single-byte). Each entry: LqEntry{ FaceId, [Rssi],
+// [Snr], [Congestion], UpdatedMs }. RSSI/SNR are signed dB(m) carried as one
+// two's-complement byte; congestion is 0=Low,1=Medium,2=High.
+mod link_quality_tlv {
+    pub const ENTRY: u8 = 0xC0;
+    pub const FACE_ID: u8 = 0x69; // reuse NFD FaceId
+    pub const RSSI: u8 = 0xC1;
+    pub const SNR: u8 = 0xC2;
+    pub const CONGESTION: u8 = 0xC3;
+    pub const UPDATED_MS: u8 = 0xC4;
+}
+
+/// Pure encoder for the link-quality dataset (testable without an engine).
+fn encode_link_quality(entries: &[(u64, ndn_strategy::LinkSignals)]) -> bytes::Bytes {
+    use ndn_strategy::CongestionLevel;
+    use link_quality_tlv as t;
+
+    fn tlv(buf: &mut Vec<u8>, typ: u8, val: &[u8]) {
+        buf.push(typ);
+        buf.push(val.len() as u8);
+        buf.extend_from_slice(val);
+    }
+
+    let mut out = bytes::BytesMut::new();
+    for (face_id, sig) in entries {
+        let mut body = Vec::new();
+        tlv(&mut body, t::FACE_ID, &face_id.to_be_bytes());
+        if let Some(r) = sig.rssi_dbm {
+            tlv(&mut body, t::RSSI, &[r as u8]);
+        }
+        if let Some(s) = sig.snr_db {
+            tlv(&mut body, t::SNR, &[s as u8]);
+        }
+        if let Some(c) = sig.congestion {
+            let code = match c {
+                CongestionLevel::Low => 0u8,
+                CongestionLevel::Medium => 1,
+                CongestionLevel::High => 2,
+            };
+            tlv(&mut body, t::CONGESTION, &[code]);
+        }
+        tlv(&mut body, t::UPDATED_MS, &sig.updated_ms.to_be_bytes());
+
+        out.extend_from_slice(&[t::ENTRY, body.len() as u8]);
+        out.extend_from_slice(&body);
+    }
+    out.freeze()
+}
+
+fn faces_link_quality_dataset(engine: &ForwarderEngine) -> bytes::Bytes {
+    let mut links: Vec<(u64, ndn_strategy::LinkSignals)> = engine
+        .signals()
+        .dump_links()
+        .into_iter()
+        .map(|(f, s)| (f.0, s))
+        .collect();
+    links.sort_by_key(|(f, _)| *f); // deterministic dataset order
+    encode_link_quality(&links)
+}
+
 fn duration_to_us(d: std::time::Duration) -> u64 {
     d.as_micros().min(u64::MAX as u128) as u64
 }
@@ -1394,6 +1461,58 @@ impl MgmtModule for FacesModule {
 mod tests {
     use super::*;
     use crate::notification::NotificationEvent;
+
+    #[test]
+    fn link_quality_dataset_round_trips() {
+        use link_quality_tlv as t;
+        use ndn_strategy::{CongestionLevel, LinkSignals};
+
+        let entries = vec![
+            (
+                5u64,
+                LinkSignals {
+                    rssi_dbm: Some(-67),
+                    snr_db: Some(9),
+                    congestion: Some(CongestionLevel::High),
+                    updated_ms: 12345,
+                    ..Default::default()
+                },
+            ),
+            (9u64, LinkSignals { rssi_dbm: Some(-50), updated_ms: 7, ..Default::default() }),
+        ];
+        let wire = encode_link_quality(&entries);
+
+        // Walk the TLV entries back out.
+        let b = wire.as_ref();
+        let mut pos = 0;
+        let mut decoded: Vec<(u64, Option<i8>, Option<u8>, u32)> = Vec::new();
+        while pos < b.len() {
+            assert_eq!(b[pos], t::ENTRY);
+            let len = b[pos + 1] as usize;
+            let body = &b[pos + 2..pos + 2 + len];
+            pos += 2 + len;
+
+            let (mut fid, mut rssi, mut cong, mut updated) = (0u64, None, None, 0u32);
+            let mut p = 0;
+            while p < body.len() {
+                let (ty, l) = (body[p], body[p + 1] as usize);
+                let v = &body[p + 2..p + 2 + l];
+                match ty {
+                    x if x == t::FACE_ID => fid = u64::from_be_bytes(v.try_into().unwrap()),
+                    x if x == t::RSSI => rssi = Some(v[0] as i8),
+                    x if x == t::CONGESTION => cong = Some(v[0]),
+                    x if x == t::UPDATED_MS => updated = u32::from_be_bytes(v.try_into().unwrap()),
+                    _ => {}
+                }
+                p += 2 + l;
+            }
+            decoded.push((fid, rssi, cong, updated));
+        }
+
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0], (5, Some(-67), Some(2), 12345)); // High=2
+        assert_eq!(decoded[1], (9, Some(-50), None, 7)); // no congestion field
+    }
 
     fn round_trip(event: FaceEvent) -> FaceEvent {
         let wire = event.encode();

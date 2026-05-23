@@ -66,6 +66,9 @@ pub mod verb {
     pub const WITHDRAW: &[u8] = b"withdraw";
     pub const BROWSE: &[u8] = b"browse";
     pub const COUNTERS: &[u8] = b"counters";
+    /// ndn-rs-local read dataset: per-face cross-layer link signals
+    /// (RSSI/SNR/congestion). Not an NFD verb — observability only.
+    pub const LINK_QUALITY: &[u8] = b"link-quality";
     pub const IDENTITY_LIST: &[u8] = b"identity-list";
     pub const IDENTITY_GENERATE: &[u8] = b"identity-generate";
     pub const IDENTITY_DID: &[u8] = b"identity-did";

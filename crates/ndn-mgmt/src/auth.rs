@@ -90,6 +90,10 @@ pub(crate) fn is_public_dataset_verb(module: &[u8], verb: &[u8]) -> bool {
     if standard.contains(&module) && verb == v::LIST {
         return true;
     }
+    // ndn-rs-local read-only telemetry dataset (cross-layer link signals).
+    if module == m::FACES && verb == v::LINK_QUALITY {
+        return true;
+    }
     if module == m::SECURITY
         && (verb == v::POLICY_GET || verb == v::VALIDATION_STATS || verb == v::VALIDATE)
     {
