@@ -73,14 +73,16 @@ management dataset.
 QUIC backbone link (forwarder-to-forwarder; TLS 1.3 + connection migration):
 
 ```toml
-# Inbound (logs the self-signed leaf SHA-256 at startup — pin it on dialers):
+# Inbound (logs the leaf SHA-256 at startup — pin it on dialers). The cert
+# source is the SAME `cert_source` shape as the WebTransport listener:
 [listeners.quic]
 enabled = true
 listen = "0.0.0.0:6367"
-# hostnames = ["my-fwd.example"]   # SANs for the self-signed cert (default ["localhost"])
-# For a WebPKI-trusted listener, serve an ACME/CA PEM instead of self-signed:
-# cert_pem = "/etc/ndn-fwd/quic.pem"
-# key_pem  = "/etc/ndn-fwd/quic.key"
+# Default when omitted: a long-lived self-signed cert for ["localhost"].
+# cert_source = { type = "self_signed_dev", hostnames = ["my-fwd.example"] }
+# Or PEM:  { type = "pem", cert_pem = "/etc/ndn-fwd/quic.pem", key_pem = "/etc/ndn-fwd/quic.key" }
+# Or ACME: { type = "acme", directory_url = "…", email = "…", domain = "…",
+#            dns_provider = "cloudflare", cache_dir = "/var/lib/ndn-fwd/acme" }
 
 # Outbound dial — pin a self-signed peer by leaf SHA-256:
 [[face]]
@@ -95,6 +97,28 @@ The QUIC face does not reach browsers (that is WebTransport's role) — it is th
 native router-to-router link whose connection (and routes) survive a peer's
 address change. Dial auth is cert-pinning (`cert_sha256` / `?cert=`) or WebPKI
 (`webpki` / `?webpki`).
+
+### Shared cert provisioning
+
+The WebTransport and QUIC listeners share one cert-source shape (`self_signed_dev`
+/ `pem` / `acme`, resolved by `ndn-acme`), so a QUIC backbone can equally serve a
+self-signed (pin the logged leaf hash), an operator PEM, or an ACME-provisioned
+cert — the same options WebTransport already had. A self-signed QUIC cert is
+long-lived (a pinned dialer trusts the leaf hash, not the expiry); a self-signed
+WebTransport cert is capped at 13 days to stay within Chrome's
+`serverCertificateHashes` limit. The dialer trust policy (`cert_sha256` pin vs
+`webpki`) is likewise one shared `ndn_transport::ClientTls` type for both faces.
+
+### Interop: WebTransport with ndnd
+
+ndn-rs's WebTransport face interoperates with **ndnd**'s HTTP/3 WebTransport
+face (the one QUIC-family transport the two stacks share — NFD has none). The
+witness `testbed/tests/audit/wt02_ndnd_interop.sh` round-trips an Interest/Data
+over the link. Note: stock ndnd's `fw/face/http3-listener.go` cannot complete a
+WebTransport handshake with *any* spec-conformant client — it sets no `h3` TLS
+ALPN and never calls `webtransport.ConfigureHTTP3Server`, so the witness builds
+ndnd with those two one-line fixes applied (via `go build -overlay`, leaving the
+ndnd checkout untouched). ndn-rs's client side needs no changes.
 
 Shared-memory face (per-host IPC):
 
