@@ -25,7 +25,7 @@ impl<F> IpcClient<F> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndn_faces::local::InProcFace;
+    use ndn_face_native::local::InProcFace;
     use ndn_transport::{FaceId, Transport};
 
     #[test]

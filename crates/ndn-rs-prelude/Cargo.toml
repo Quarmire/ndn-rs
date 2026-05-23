@@ -32,7 +32,7 @@ ndn-packet   = { workspace = true, features = ["std"] }
 ndn-security = { path = "../ndn-security", default-features = false }
 
 # Develop-tier application API lives in `ndn-app`, which pulls
-# `ndn-engine` + `ndn-faces` + full Tokio. None of those build on
+# `ndn-engine` + `ndn-face-native` + full Tokio. None of those build on
 # wasm32 today; the umbrella exposes them on native only. Wasm
 # callers use `ndn-engine::WasmEngineBuilder` for the embedded-engine
 # path (Phase-4 wiki documents this split).

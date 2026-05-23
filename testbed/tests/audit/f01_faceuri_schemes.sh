@@ -9,7 +9,7 @@
 #                wsclient/wsserver (per direction),
 #                wssclient/wss (TLS variants).
 # Witnesses:   RUST-UNIT in `ndn-transport` (`f01_ip_face_uri_*`) and in
-#              `ndn-faces` (`f06_ws_direction_scheme_*`,
+#              `ndn-face-native` (`f06_ws_direction_scheme_*`,
 #              `f06_websocket_face_uri_distinguishes_client_and_server`).
 #
 # Exit codes:  0 PASS / 1 FAIL / 2 SKIP
@@ -25,7 +25,7 @@ if cargo test -p ndn-transport --lib --quiet f01_ \
 else
     echo "FAIL: ip_face_uri scheme dispatch"; fail=1
 fi
-if cargo test -p ndn-faces --lib --quiet f06_ \
+if cargo test -p ndn-face-native --lib --quiet f06_ \
         >>/tmp/f01_witness.log 2>&1; then
     echo "ok: WebSocket face emits wsclient/wsserver per direction"
 else

@@ -11,9 +11,9 @@ classification = "spec"
 [features]
 # Forwarded by binaries. Off by default — the library compiles standalone.
 yubikey-piv = ["ndn-security/yubikey-piv", "ndn-cert/yubikey-challenge", "dep:base64"]
-spsc-shm    = ["ndn-faces/spsc-shm"]
+spsc-shm    = ["ndn-face-native/spsc-shm"]
 # Enables ble:// (central) and ble-peripheral:// (server) faces/create arms.
-bluetooth   = ["ndn-faces/bluetooth"]
+bluetooth   = ["ndn-face-native/bluetooth"]
 # Enables the wts:// faces/create arm (outbound WebTransport dial).
 webtransport = ["dep:ndn-face-webtransport"]
 
@@ -21,7 +21,7 @@ webtransport = ["dep:ndn-face-webtransport"]
 # Portable deps — build on every target including wasm32-unknown-unknown.
 ndn-engine       = { workspace = true }
 ndn-face-local   = { workspace = true }
-# `ndn-faces` is pulled only for native-only face transports (UDP/TCP/SHM
+# `ndn-face-native` is pulled only for native-only face transports (UDP/TCP/SHM
 # creation, IPC listeners); see the target-cfg section below.
 
 ndn-strategy     = { workspace = true }
@@ -64,7 +64,7 @@ serde_json       = { workspace = true }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 ndn-discovery    = { workspace = true, features = ["udp-hello"] }
 ndn-routing      = { workspace = true }
-ndn-faces        = { workspace = true }
+ndn-face-native        = { workspace = true }
 # Optional: the wts:// faces/create dialer (pulls the QUIC stack).
 ndn-face-webtransport = { workspace = true, optional = true }
 # ndn-app powers the status_bridge.rs Producer mount (ARCH-6 / S11).

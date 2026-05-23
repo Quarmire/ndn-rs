@@ -15,7 +15,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use ndn_faces::local::InProcFace;
+use ndn_face_native::local::InProcFace;
 use ndn_packet::encode::{DataBuilder, InterestBuilder};
 use ndn_packet::{Interest, Name};
 use ndn_transport::FaceId;

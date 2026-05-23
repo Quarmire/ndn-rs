@@ -25,5 +25,5 @@ tracing      = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }
 ndn-engine    = { workspace = true }
-ndn-faces     = { workspace = true }
+ndn-face-native     = { workspace = true }
 ndn-transport = { workspace = true }

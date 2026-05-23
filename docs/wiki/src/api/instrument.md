@@ -28,9 +28,9 @@ below).
 | `ForwarderEngine::fib()` / `rib()` / `pit()` / `cs()` / `strategy_table()` / `measurements()` / `routing()` / `discovery_ctx()` | `ndn_engine::engine` (`crates/ndn-engine/src/engine.rs`) | Direct table access. |
 | `ContextEnricher` | `ndn_engine::enricher` | Pipeline-stage hook for cross-layer enrichment. |
 | `observability::targets` | `ndn_engine::observability::targets` | Tracing target taxonomy. |
-| `InProcFace::new_kind` | `ndn_faces::local::InProcFace` | Synthesize an in-process face with a custom `FaceKind`. |
-| `CallbackFace` | `ndn_faces::callback::CallbackFace` | Virtual face whose send-path is a Rust callback. |
-| `TapFace` | `ndn_faces::callback::TapFace` | Records every wire packet sent to it without participating in forwarding. |
+| `InProcFace::new_kind` | `ndn_face_native::local::InProcFace` | Synthesize an in-process face with a custom `FaceKind`. |
+| `CallbackFace` | `ndn_face_native::callback::CallbackFace` | Virtual face whose send-path is a Rust callback. |
+| `TapFace` | `ndn_face_native::callback::TapFace` | Records every wire packet sent to it without participating in forwarding. |
 
 
 ## Gating
@@ -38,7 +38,7 @@ below).
 Each carrier crate declares the feature:
 
 ```toml
-# crates/ndn-engine/Cargo.toml — and likewise for ndn-faces
+# crates/ndn-engine/Cargo.toml — and likewise for ndn-face-native
 [features]
 experimental-instrument = []
 ```
@@ -52,7 +52,7 @@ To use the tier in your own crate:
 ```toml
 [dependencies]
 ndn-engine = { version = "0.1", features = ["experimental-instrument"] }
-ndn-faces  = { version = "0.1", features = ["experimental-instrument"] }
+ndn-face-native  = { version = "0.1", features = ["experimental-instrument"] }
 ```
 
 ## TapFace
@@ -60,7 +60,7 @@ ndn-faces  = { version = "0.1", features = ["experimental-instrument"] }
 `TapFace` is the workhorse for wire-packet tracing.
 
 ```rust,ignore
-use ndn_faces::callback::TapFace;
+use ndn_face_native::callback::TapFace;
 use ndn_engine::{EngineBuilder, EngineConfig};
 use ndn_transport::FaceId;
 
@@ -81,7 +81,7 @@ for bytes in captured.lock().unwrap().iter() {
 it, the bytes accumulate, and nothing is returned. Use it alongside
 real faces to record what the engine *would have* sent over them.
 
-In-tree reference: `crates/ndn-faces/src/callback.rs`.
+In-tree reference: `crates/ndn-face-native/src/callback.rs`.
 
 ## Engine table access
 
@@ -116,7 +116,7 @@ and whose recv-path is fed from outside. Use it to splice an
 external test harness into the engine's pipeline.
 
 ```rust,ignore
-use ndn_faces::callback::CallbackFace;
+use ndn_face_native::callback::CallbackFace;
 use ndn_transport::FaceId;
 
 let face = CallbackFace::new(FaceId(7), |bytes| {
@@ -131,7 +131,7 @@ A common Instrument-tier pattern is wiring two engines through a
 pair of in-process faces:
 
 ```rust,ignore
-use ndn_faces::local::InProcFace;
+use ndn_face_native::local::InProcFace;
 use ndn_engine::{EngineBuilder, EngineConfig};
 use ndn_transport::FaceId;
 

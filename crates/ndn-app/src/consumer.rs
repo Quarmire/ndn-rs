@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 
-use ndn_faces::local::InProcHandle;
+use ndn_face_native::local::InProcHandle;
 use ndn_ipc::ForwarderClient;
 use ndn_packet::encode::InterestBuilder;
 use ndn_packet::lp::{LpPacket, is_lp_packet};

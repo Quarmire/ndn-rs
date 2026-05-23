@@ -59,7 +59,7 @@ jobs:
       - name: Check face layer
         run: |
           cargo check --target aarch64-apple-ios \
-            -p ndn-faces --no-default-features --features net,local
+            -p ndn-face-native --no-default-features --features net,local
 
       # Security (uses ring — has iOS asm, needs Xcode)
       - name: Check security
@@ -144,7 +144,7 @@ jobs:
       - name: Check face layer
         run: |
           cargo ndk -t arm64-v8a check \
-            -p ndn-faces --no-default-features --features net,local
+            -p ndn-face-native --no-default-features --features net,local
 
       # Security (ring has Android NDK asm support)
       - name: Check security

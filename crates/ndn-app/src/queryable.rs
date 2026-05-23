@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
-use ndn_faces::local::InProcHandle;
+use ndn_face_native::local::InProcHandle;
 use ndn_ipc::ForwarderClient;
 use ndn_packet::{Interest, Name};
 

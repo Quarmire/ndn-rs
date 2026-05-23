@@ -5,7 +5,7 @@
 # Severity:    BLOCKER for Phase 4 (Dioxus browser demo)
 # Witnesses:   `cargo build --target wasm32-unknown-unknown -p ndn-engine`
 #              succeeds (exit 0). Today this fails because ndn-engine
-#              hard-deps ndn-discovery, ndn-security, and ndn-faces, all
+#              hard-deps ndn-discovery, ndn-security, and ndn-face-native, all
 #              of which pull in tokio::net / ring / std::fs.
 #
 # Expected today: FAIL (exit 1). After Phase 1.5 deps refactor, this

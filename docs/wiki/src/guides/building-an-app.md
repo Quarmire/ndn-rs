@@ -131,7 +131,7 @@ For tests or "talk to yourself" scenarios:
 use ndn::prelude::*;
 use ndn::{Consumer, InProcConnection};
 use ndn_engine::{EngineBuilder, EngineConfig};
-use ndn_faces::local::InProcFace;
+use ndn_face_native::local::InProcFace;
 use ndn_transport::FaceId;
 
 # async fn embed() -> anyhow::Result<()> {

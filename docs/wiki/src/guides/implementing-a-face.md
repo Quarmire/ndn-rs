@@ -145,14 +145,14 @@ method on `WasmEngineBuilder` if the face is meant to run in-browser.
 
 | Face | Crate | Transport shape |
 |---|---|---|
-| UDP | `crates/ndn-faces/src/net/udp.rs` | UDP socket per peer. |
-| TCP | `crates/ndn-faces/src/net/tcp.rs` | TCP connection. |
-| Unix | `crates/ndn-faces/src/local/unix.rs` | Local Unix socket. |
-| InProc | `crates/ndn-faces/src/local/in_proc.rs` | In-process channel. |
-| Shm | `crates/ndn-faces/src/local/shm.rs` | Shared-memory ring (spsc-shm). |
-| Ether | `crates/ndn-faces/src/l2/ether.rs` | Raw Ethernet. |
-| Bluetooth | `crates/ndn-faces/src/l2/bluetooth/mod.rs` | BLE L2CAP. |
-| Serial | `crates/ndn-faces/src/serial/mod.rs` | UART. |
+| UDP | `crates/ndn-face-native/src/net/udp.rs` | UDP socket per peer. |
+| TCP | `crates/ndn-face-native/src/net/tcp.rs` | TCP connection. |
+| Unix | `crates/ndn-face-native/src/local/unix.rs` | Local Unix socket. |
+| InProc | `crates/ndn-face-native/src/local/in_proc.rs` | In-process channel. |
+| Shm | `crates/ndn-face-native/src/local/shm.rs` | Shared-memory ring (spsc-shm). |
+| Ether | `crates/ndn-face-native/src/l2/ether.rs` | Raw Ethernet. |
+| Bluetooth | `crates/ndn-face-native/src/l2/bluetooth/mod.rs` | BLE L2CAP. |
+| Serial | `crates/ndn-face-native/src/serial/mod.rs` | UART. |
 | WebTransport | `crates/ndn-face-webtransport*` | QUIC datagrams. |
 | WebRTC | `crates/ndn-face-webrtc/` | Datachannel. |
 | SharedWorker | `crates/ndn-face-shared-worker/` | Per-origin engine sharing. |

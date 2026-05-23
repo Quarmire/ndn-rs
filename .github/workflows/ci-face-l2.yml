@@ -42,20 +42,20 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libpcap-dev
 
       - name: Lint
-        run: cargo clippy -p ndn-faces --features l2 -- -D warnings
+        run: cargo clippy -p ndn-face-native --features l2 -- -D warnings
 
       - name: Test
-        run: cargo test -p ndn-faces --features l2
+        run: cargo test -p ndn-face-native --features l2
 
       - name: Doc build
-        run: cargo doc -p ndn-faces --features l2 --no-deps
+        run: cargo doc -p ndn-face-native --features l2 --no-deps
 
       # ── Bluetooth face ────────────────────────────────────────────────────
       # The bluetooth feature is linted and tested separately so the
       # NDNts / esp8266ndn UUID and fragmentation regression tests in
       # `l2::bluetooth::tests` are exercised on CI.
       - name: Lint (bluetooth)
-        run: cargo clippy -p ndn-faces --features bluetooth -- -D warnings
+        run: cargo clippy -p ndn-face-native --features bluetooth -- -D warnings
 
       - name: Test (bluetooth)
-        run: cargo test -p ndn-faces --features bluetooth bluetooth
+        run: cargo test -p ndn-face-native --features bluetooth bluetooth

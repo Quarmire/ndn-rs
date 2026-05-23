@@ -7,7 +7,7 @@
 #              constant `DEFAULT_MULTICAST_PORT`; the historical co-located
 #              port broke when a unicast face and the multicast group
 #              tried to bind the same address.
-# Witness:     RUST-UNIT — `cargo test -p ndn-faces --lib
+# Witness:     RUST-UNIT — `cargo test -p ndn-face-native --lib
 #              ndn_multicast_port_is_56363`.  GREP-PROOF —
 #              `MulticastUdpFace::ndn_default` references
 #              `NDN_MULTICAST_PORT`, not `NDN_PORT`.
@@ -19,7 +19,7 @@ cd "$REPO_ROOT"
 
 fail=0
 
-if ! cargo test -p ndn-faces --lib \
+if ! cargo test -p ndn-face-native --lib \
         net::multicast::tests::ndn_multicast_port_is_56363 \
         --quiet 2>&1 | tail -3; then
     echo "FAIL: F.02 port-constant unit test"
@@ -28,7 +28,7 @@ fi
 
 # GREP-PROOF: `ndn_default` uses the new multicast-port constant.
 if ! grep -q "Self::new(iface, NDN_MULTICAST_PORT, NDN_MULTICAST_V4" \
-        "$REPO_ROOT/crates/ndn-faces/src/net/multicast.rs"; then
+        "$REPO_ROOT/crates/ndn-face-native/src/net/multicast.rs"; then
     echo "FAIL: ndn_default still uses the unicast port"
     fail=1
 fi

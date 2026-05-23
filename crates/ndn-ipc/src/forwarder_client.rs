@@ -2,7 +2,7 @@
 //! (UnixFace) for control, optionally creates an SHM face for the
 //! data plane, registers prefixes via NFD `rib/{register,unregister}`,
 //! and shuttles packets. On Android / iOS use
-//! `ndn_engine::ForwarderEngine` with `ndn_faces::local::AppFace`
+//! `ndn_engine::ForwarderEngine` with `ndn_face_native::local::AppFace`
 //! instead — there's no separate forwarder daemon to connect to.
 use std::path::Path;
 use std::sync::Arc;
@@ -12,7 +12,7 @@ use bytes::Bytes;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use ndn_faces::local::IpcFace;
+use ndn_face_native::local::IpcFace;
 use ndn_packet::Name;
 use ndn_packet::lp::encode_lp_packet;
 use ndn_transport::{FaceId, Transport};
@@ -35,7 +35,7 @@ pub enum ForwarderError {
         feature = "spsc-shm"
     ))]
     #[error("SHM error: {0}")]
-    Shm(#[from] ndn_faces::local::ShmError),
+    Shm(#[from] ndn_face_native::local::ShmError),
 }
 
 enum DataTransport {
@@ -45,7 +45,7 @@ enum DataTransport {
         feature = "spsc-shm"
     ))]
     Shm {
-        handle: ndn_faces::local::shm::spsc::SpscHandle,
+        handle: ndn_face_native::local::shm::spsc::SpscHandle,
         face_id: u64,
     },
     Unix,
@@ -101,7 +101,7 @@ impl ForwarderClient {
         mtu: Option<usize>,
     ) -> Result<Self, ForwarderError> {
         let path = face_socket.as_ref().to_str().unwrap_or_default().to_owned();
-        let control = Arc::new(ndn_faces::local::ipc_face_connect(FaceId(0), &path).await?);
+        let control = Arc::new(ndn_face_native::local::ipc_face_connect(FaceId(0), &path).await?);
         let cancel = CancellationToken::new();
         let dead = Arc::new(AtomicBool::new(false));
 
@@ -159,7 +159,7 @@ impl ForwarderClient {
             .await?;
         let face_id = resp.face_id.ok_or(ForwarderError::MalformedResponse)?;
 
-        let mut handle = ndn_faces::local::shm::spsc::SpscHandle::connect(shm_name)?;
+        let mut handle = ndn_face_native::local::shm::spsc::SpscHandle::connect(shm_name)?;
         handle.set_cancel(cancel);
 
         Ok(DataTransport::Shm { handle, face_id })

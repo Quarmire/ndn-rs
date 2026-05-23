@@ -10,7 +10,7 @@ use ndn_config::{
     ControlParameters, ControlResponse,
     nfd_command::{command_name, dataset_name, module, verb},
 };
-use ndn_faces::local::IpcFace;
+use ndn_face_native::local::IpcFace;
 use ndn_packet::{Name, encode::InterestBuilder};
 use ndn_security::Signer;
 use ndn_transport::{FaceId, Transport};
@@ -36,7 +36,7 @@ pub struct MgmtClient {
 impl MgmtClient {
     pub async fn connect(face_socket: impl AsRef<str>) -> Result<Self, ForwarderError> {
         let face =
-            Arc::new(ndn_faces::local::ipc_face_connect(FaceId(0), face_socket.as_ref()).await?);
+            Arc::new(ndn_face_native::local::ipc_face_connect(FaceId(0), face_socket.as_ref()).await?);
         Ok(Self {
             face,
             recv_lock: Mutex::new(()),

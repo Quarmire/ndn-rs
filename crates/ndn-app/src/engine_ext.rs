@@ -8,7 +8,7 @@
 //! callers work in prefixes, not plumbing.
 //!
 //! Lives in `ndn-app` rather than `ndn-engine` because `InProcFace` is a
-//! concrete face (in `ndn-faces`) layered above the core engine; pulling it
+//! concrete face (in `ndn-face-native`) layered above the core engine; pulling it
 //! into `ndn-engine` would invert the dependency.
 //!
 //! ```no_run
@@ -23,7 +23,7 @@
 //! ```
 
 use ndn_engine::ForwarderEngine;
-use ndn_faces::local::InProcFace;
+use ndn_face_native::local::InProcFace;
 use ndn_packet::Name;
 use tokio_util::sync::CancellationToken;
 

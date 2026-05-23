@@ -12,7 +12,7 @@
 #       a 2018 placeholder on crates.io); library name is `ndn` so
 #       callers still write `use ndn::Consumer;`.
 #   (b) GREP-PROOF — the lib.rs re-exports only Develop-tier symbols.
-#       No `ndn-engine`, `ndn-faces`, `ndn-discovery*`, `ndn-routing`,
+#       No `ndn-engine`, `ndn-face-native`, `ndn-discovery*`, `ndn-routing`,
 #       `ndn-strategy`, `ndn-mgmt`, `ndn-transport`, `ndn-runtime`,
 #       `ndn-store` re-exports (those are Extend / Instrument).
 #   (c) RUST-UNIT  — `cargo build -p ndn-rs-prelude` (native) and
@@ -58,7 +58,7 @@ check_grep 'ndn-packet'   "$CARGO" 'ndn-packet dep'
 check_grep 'ndn-security' "$CARGO" 'ndn-security dep'
 check_grep 'ndn-app'      "$CARGO" 'ndn-app dep (native-only target)'
 
-for forbidden in ndn-engine ndn-faces ndn-discovery ndn-routing \
+for forbidden in ndn-engine ndn-face-native ndn-discovery ndn-routing \
                  ndn-strategy ndn-mgmt ndn-transport ndn-runtime \
                  ndn-store ndn-tlv; do
     # Match the dep on a dependency line (starts with the crate name +
@@ -71,7 +71,7 @@ for forbidden in ndn-engine ndn-faces ndn-discovery ndn-routing \
 done
 
 # (b) lib.rs re-export hygiene — no Extend / Instrument paths re-exported.
-for forbidden in ndn_engine ndn_faces ndn_discovery ndn_routing \
+for forbidden in ndn_engine ndn_face_native ndn_discovery ndn_routing \
                  ndn_strategy ndn_mgmt ndn_transport ndn_runtime \
                  ndn_store; do
     if grep -nE "^pub use ${forbidden}::" "$LIB" >/dev/null 2>&1; then

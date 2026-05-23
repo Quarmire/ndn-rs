@@ -441,7 +441,7 @@ async fn faces_create(
     // `ble://<name-or-address>[?opts]` dials a peripheral as a GATT central
     // (Linux/macOS/Windows). The peripheral (GATT server) is NOT created here —
     // it is an NFD-style listener configured via `[listeners.ble]` (see
-    // `ndn_faces::l2::BleListener`). Any `?query` is split off the target; the
+    // `ndn_face_native::l2::BleListener`). Any `?query` is split off the target; the
     // params are a reserved extension point (e.g. `?adapter=hci0`).
     #[cfg(all(not(target_arch = "wasm32"), feature = "bluetooth"))]
     {
@@ -584,7 +584,7 @@ async fn faces_create_udp(addr_str: &str, engine: &ForwarderEngine) -> ControlRe
         "[::]:0".parse().unwrap()
     };
 
-    match ndn_faces::net::UdpFace::bind(local, peer, face_id).await {
+    match ndn_face_native::net::UdpFace::bind(local, peer, face_id).await {
         Ok(face) => {
             let local_uri = face.local_uri().unwrap_or_default();
             let cancel = CancellationToken::new();
@@ -623,7 +623,7 @@ async fn faces_create_tcp(addr_str: &str, engine: &ForwarderEngine) -> ControlRe
 
     let face_id = engine.faces().alloc_id();
 
-    match ndn_faces::net::tcp_face_connect(face_id, peer).await {
+    match ndn_face_native::net::tcp_face_connect(face_id, peer).await {
         Ok(face) => {
             let local_uri = face.local_uri().unwrap_or_default();
             let cancel = CancellationToken::new();
@@ -706,11 +706,11 @@ async fn faces_create_webtransport(uri: &str, engine: &ForwarderEngine) -> Contr
 
 /// Parse `framing=ndnts|ndnlpv2` out of a `ble://` URI query string.
 #[cfg(all(not(target_arch = "wasm32"), feature = "bluetooth"))]
-fn parse_ble_framing(query: &str) -> Option<ndn_faces::l2::BleFraming> {
+fn parse_ble_framing(query: &str) -> Option<ndn_face_native::l2::BleFraming> {
     let v = parse_ble_query(query, "framing")?;
     match v.to_ascii_lowercase().as_str() {
-        "ndnts" => Some(ndn_faces::l2::BleFraming::Ndnts),
-        "ndnlpv2" => Some(ndn_faces::l2::BleFraming::Ndnlpv2),
+        "ndnts" => Some(ndn_face_native::l2::BleFraming::Ndnts),
+        "ndnlpv2" => Some(ndn_face_native::l2::BleFraming::Ndnlpv2),
         _ => None,
     }
 }
@@ -727,12 +727,12 @@ fn parse_ble_query(query: &str, key: &str) -> Option<String> {
 #[cfg(all(not(target_arch = "wasm32"), feature = "bluetooth"))]
 async fn faces_create_ble_central(
     target: &str,
-    framing: Option<ndn_faces::l2::BleFraming>,
+    framing: Option<ndn_face_native::l2::BleFraming>,
     adapter: Option<&str>,
     engine: &ForwarderEngine,
 ) -> ControlResponse {
     let face_id = engine.faces().alloc_id();
-    match ndn_faces::l2::BleCentralFace::connect(face_id, target, framing, adapter).await {
+    match ndn_face_native::l2::BleCentralFace::connect(face_id, target, framing, adapter).await {
         Ok(face) => {
             let remote_uri = face.remote_uri().unwrap_or_else(|| format!("ble://{target}"));
             engine.add_face_with_persistency(
@@ -767,9 +767,9 @@ fn faces_create_shm(
 
     let face_result = match mtu {
         Some(m) => {
-            ndn_faces::local::shm::spsc::SpscFace::create_for_mtu(face_id, shm_name, m as usize)
+            ndn_face_native::local::shm::spsc::SpscFace::create_for_mtu(face_id, shm_name, m as usize)
         }
-        None => ndn_faces::local::ShmFace::create(face_id, shm_name),
+        None => ndn_face_native::local::ShmFace::create(face_id, shm_name),
     };
     match face_result {
         Ok(face) => {

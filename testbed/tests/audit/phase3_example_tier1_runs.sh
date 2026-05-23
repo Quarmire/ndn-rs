@@ -7,9 +7,9 @@
 # Witnesses:
 #   (a) GREP-PROOF — `examples/tier1-develop-5min/Cargo.toml` depends
 #       only on `ndn-rs-prelude`, `tokio`, and `anyhow` (no
-#       direct dep on `ndn-engine`, `ndn-faces`, `ndn-strategy`, etc).
+#       direct dep on `ndn-engine`, `ndn-face-native`, `ndn-strategy`, etc).
 #   (b) GREP-PROOF — `examples/tier1-develop-5min/src/main.rs` does
-#       not `use ndn_engine::`, `use ndn_faces::`, `use ndn_strategy::`,
+#       not `use ndn_engine::`, `use ndn_face_native::`, `use ndn_strategy::`,
 #       `use ndn_mgmt::`, or any other Extend / Instrument crate.
 #   (c) RUST-BUILD — `cargo build -p example-tier1-develop-5min`
 #       succeeds.
@@ -40,7 +40,7 @@ check_grep() {
 
 # (a) Cargo.toml only references ndn-rs-prelude (no Extend/Instrument crates).
 check_grep '^ndn-rs-prelude' "$CARGO" 'tier1 depends on ndn-rs-prelude'
-for forbidden in ndn-engine ndn-faces ndn-strategy ndn-mgmt ndn-transport ndn-routing ndn-discovery ndn-runtime ndn-store ndn-face-local; do
+for forbidden in ndn-engine ndn-face-native ndn-strategy ndn-mgmt ndn-transport ndn-routing ndn-discovery ndn-runtime ndn-store ndn-face-local; do
     if grep -nE "^${forbidden}[[:space:]]*=" "$CARGO" >/dev/null 2>&1; then
         echo "FAIL: tier1 Cargo.toml lists $forbidden (must depend only on ndn-rs-prelude)" >&2
         grep -nE "^${forbidden}[[:space:]]*=" "$CARGO" >&2
@@ -49,7 +49,7 @@ for forbidden in ndn-engine ndn-faces ndn-strategy ndn-mgmt ndn-transport ndn-ro
 done
 
 # (b) main.rs doesn't reach below the umbrella.
-for forbidden in ndn_engine ndn_faces ndn_strategy ndn_mgmt ndn_transport ndn_routing ndn_discovery; do
+for forbidden in ndn_engine ndn_face_native ndn_strategy ndn_mgmt ndn_transport ndn_routing ndn_discovery; do
     if grep -nE "use ${forbidden}::" "$MAIN" >/dev/null 2>&1; then
         echo "FAIL: tier1 main.rs imports $forbidden (Develop tier should use only the umbrella)" >&2
         grep -nE "use ${forbidden}::" "$MAIN" >&2

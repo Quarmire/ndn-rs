@@ -57,7 +57,7 @@ scope = spec   (flat under crates/)   NDN community specs implemented faithfully
                                 StreamFace, TlvCodec
   ndn-store                     NameTrie, Fib, PIT, ContentStore (LruCs/ShardedCs/FjallCs), DeadNonceList
   ndn-safebag                   SafeBag (cert + PKCS#5-encrypted key) — wasm-buildable carve-out of safe_bag.rs
-  ndn-faces                     Feature-gated native face types (UDP, TCP, WebSocket, Unix, SHM,
+  ndn-face-native                     Feature-gated native face types (UDP, TCP, WebSocket, Unix, SHM,
                                 serial, ethernet, virtual; BLE central via `ble://` + peripheral
                                 via `[listeners.ble]`, NDNts web-bluetooth GATT profile)
   ndn-face-webtransport         Server-side WebTransport listener (HTTP/3 + QUIC datagrams)

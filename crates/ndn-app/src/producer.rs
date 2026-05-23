@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
-use ndn_faces::local::InProcHandle;
+use ndn_face_native::local::InProcHandle;
 use ndn_ipc::{ChunkedProducer, ForwarderClient, NDN_DEFAULT_SEGMENT_SIZE};
 use ndn_packet::encode::DataBuilder;
 use ndn_packet::{Interest, Name};

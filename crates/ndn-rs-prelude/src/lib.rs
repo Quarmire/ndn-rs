@@ -3,7 +3,7 @@
 //! Curated re-exports of the application-author API surface. Depend on
 //! this crate to fetch a Data by name or serve one and treat the
 //! forwarder as opaque. Protocol authors reach into `ndn-engine`,
-//! `ndn-strategy`, `ndn-faces` directly.
+//! `ndn-strategy`, `ndn-face-native` directly.
 //!
 //! The crates.io package is `ndn-rs-prelude` but the library is named
 //! `ndn`, so user code writes `use ndn::Consumer;`.

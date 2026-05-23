@@ -1,7 +1,7 @@
 //! In-process NDN face ([`InProcFace`] + [`InProcHandle`]) wiring an
 //! application to `ndn_engine::ForwarderEngine` over `tokio::sync::mpsc`.
 //!
-//! Split from `ndn-faces` so wasm32 consumers get the channel face without
+//! Split from `ndn-face-native` so wasm32 consumers get the channel face without
 //! OS-socket transports.
 
 use bytes::Bytes;

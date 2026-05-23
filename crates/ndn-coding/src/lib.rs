@@ -35,7 +35,7 @@
 //!   recoded Data is authenticated end-to-end. Feature-gated by
 //!   `f2-recode`, not implemented.
 //! - **F3 (out of scope):** COPE-style inter-flow MAC-layer NC. Belongs
-//!   in an `ndn-faces` link driver, not here.
+//!   in an `ndn-face-native` link driver, not here.
 //!
 //! ## Module map
 //!

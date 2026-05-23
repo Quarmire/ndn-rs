@@ -18,7 +18,7 @@ on:
   push:
     branches: [main]
     paths:
-      - "crates/ndn-faces/src/net/websocket.rs"
+      - "crates/ndn-face-native/src/net/websocket.rs"
       - "crates/ndn-mgmt/**"
       - "crates/tooling/ndn-dashboard/**"
       - "binaries/ndn-fwd/**"
@@ -28,7 +28,7 @@ on:
   pull_request:
     branches: [main]
     paths:
-      - "crates/ndn-faces/src/net/websocket.rs"
+      - "crates/ndn-face-native/src/net/websocket.rs"
       - "crates/ndn-mgmt/**"
       - "crates/tooling/ndn-dashboard/**"
       - "binaries/ndn-fwd/**"

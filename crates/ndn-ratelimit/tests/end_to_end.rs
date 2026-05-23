@@ -9,7 +9,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use ndn_app::{Consumer, EngineBuilder, Producer};
 use ndn_engine::EngineConfig;
-use ndn_faces::local::InProcFace;
+use ndn_face_native::local::InProcFace;
 use ndn_packet::Name;
 use ndn_packet::encode::DataBuilder;
 use ndn_transport::FaceId;

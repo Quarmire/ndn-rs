@@ -11,19 +11,19 @@ Code-level evidence pre-fix:
 
   $ grep -n 'pub fn ip_face_uri\|pub enum WsDirection' \
         crates/foundation/ndn-transport/src/face.rs \
-        crates/faces/ndn-faces/src/net/websocket.rs
+        crates/faces/ndn-face-native/src/net/websocket.rs
   (no hits)
 
-  $ grep -n 'udp4://' crates/faces/ndn-faces/src/net/udp.rs
+  $ grep -n 'udp4://' crates/faces/ndn-face-native/src/net/udp.rs
   ...:103:    fn remote_uri(&self) -> Option<String> {
   ...:104:        Some(format!("udp4://{}:{}", self.peer.ip(), self.peer.port()))
   (hardcoded `udp4://` for both IPv4 and IPv6 peers)
 
-  $ grep -n 'tcp4://' crates/faces/ndn-faces/src/net/tcp.rs
+  $ grep -n 'tcp4://' crates/faces/ndn-face-native/src/net/tcp.rs
   (hardcoded `tcp4://` for both families)
 
   $ grep -n 'self.remote_addr.clone' \
-        crates/faces/ndn-faces/src/net/websocket.rs
+        crates/faces/ndn-face-native/src/net/websocket.rs
   ...:111:        Some(self.remote_addr.clone())
   (raw remote address with no scheme prefix; tests for client/server
   direction would see no `wsclient://` or `wsserver://` prefix)

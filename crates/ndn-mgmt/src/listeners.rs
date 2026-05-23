@@ -43,7 +43,7 @@ fn set_recv_buf_size(_socket: &tokio::net::UdpSocket, _size: usize) {}
 /// `path` is a Unix domain socket path on Unix (e.g. `/run/nfd/nfd.sock`)
 /// or a Named Pipe path on Windows (e.g. `\\.\pipe\ndn`).
 pub async fn run_face_listener(path: &str, engine: ForwarderEngine, cancel: CancellationToken) {
-    let listener = match ndn_faces::local::IpcListener::bind(path) {
+    let listener = match ndn_face_native::local::IpcListener::bind(path) {
         Ok(l) => l,
         Err(e) => {
             tracing::error!(target: "face.system", path = %path, error = %e, "face-listener: bind failed");
@@ -133,7 +133,7 @@ pub async fn run_udp_listener(
                     // socket. Inbound bytes come from the listener's
                     // demux via `inject_packet`, so no recv loop runs.
                     let face_id = engine.faces().alloc_id();
-                    let face = ndn_faces::net::UdpFace::from_shared_socket(
+                    let face = ndn_face_native::net::UdpFace::from_shared_socket(
                         face_id, Arc::clone(&socket), src,
                     );
                     let peer_cancel = cancel.child_token();
@@ -190,7 +190,7 @@ pub async fn run_tcp_listener(
         };
 
         let face_id = engine.faces().alloc_id();
-        let face = ndn_faces::net::tcp_face_from_stream(face_id, stream);
+        let face = ndn_face_native::net::tcp_face_from_stream(face_id, stream);
         let conn_cancel = cancel.child_token();
         engine.add_face(face, conn_cancel);
         tracing::info!(target: "face.tcp", face=%face_id, peer=%peer, "tcp-listener: accepted connection");

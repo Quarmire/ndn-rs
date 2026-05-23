@@ -12,14 +12,14 @@ options beyond stderr: tokio-console and OpenTelemetry.
 `ndn-ctl log set` at runtime.
 
 ```sh
-RUST_LOG=info,ndn_engine=debug,ndn_faces::net::udp=trace ndn-fwd
+RUST_LOG=info,ndn_engine=debug,ndn_face_native::net::udp=trace ndn-fwd
 ```
 
 | Directive | Effect |
 |---|---|
 | `info` | All targets at info or above. |
 | `ndn_engine=debug` | Engine internals at debug. |
-| `ndn_faces=trace` | Every face at trace. |
+| `ndn_face_native=trace` | Every face at trace. |
 | `[span_name=value]=debug` | Records with `span_name="value"` at debug. |
 | `off` | Silence. |
 
@@ -37,7 +37,7 @@ catalogues the targets the engine and faces use. Stable across v0.1.x.
 | `ndn_engine::strategy` | Strategy decisions. |
 | `ndn_engine::routing` | Routing protocol events. |
 | `ndn_engine::dispatch::outbound` | Outbound packet dispatch. |
-| `ndn_faces::*` | Per-face transport events. |
+| `ndn_face_native::*` | Per-face transport events. |
 | `ndn_mgmt::*` | Mgmt verb dispatch and replies. |
 | `ndn_cert::*` | NDNCERT protocol events. |
 | `ndn_discovery::*` | Discovery protocol events. |

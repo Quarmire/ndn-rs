@@ -26,7 +26,7 @@ impl<F> IpcServer<F> {
 mod tests {
     use super::*;
     use bytes::Bytes;
-    use ndn_faces::local::InProcFace;
+    use ndn_face_native::local::InProcFace;
     use ndn_packet::NameComponent;
     use ndn_transport::{FaceId, Transport};
 

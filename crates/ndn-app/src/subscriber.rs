@@ -128,7 +128,7 @@ impl Subscriber {
 
     /// Convenience wrapper for [`InProcHandle`].
     pub fn from_handle(
-        handle: ndn_faces::local::InProcHandle,
+        handle: ndn_face_native::local::InProcHandle,
         group: Name,
         local_name: Name,
         config: SubscriberConfig,

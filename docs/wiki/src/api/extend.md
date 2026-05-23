@@ -110,7 +110,7 @@ Twelve face transports ship in-tree; the catalog is in
 [Face transports](../reference/face-transports.md). To add a new
 transport, implement `Transport` and pick a link service.
 
-In-tree references: `crates/ndn-faces/src/{net,local,l2,serial}/`.
+In-tree references: `crates/ndn-face-native/src/{net,local,l2,serial}/`.
 
 ## DiscoveryProtocol
 

@@ -6,7 +6,7 @@
 # Severity:    Phase 3 deliverable (pre-v0.1.0)
 # Witnesses:
 #   (a) GREP-PROOF — the `experimental-instrument` feature exists in
-#       `ndn-engine`, `ndn-faces`, and `ndn-face-local`.
+#       `ndn-engine`, `ndn-face-native`, and `ndn-face-local`.
 #   (b) GREP-PROOF — each Instrument-tier item carries
 #       `#[cfg_attr(not(feature = "experimental-instrument"),
 #       doc(hidden))]`.
@@ -15,7 +15,7 @@
 #                       strategy_table, measurements, routing,
 #                       discovery_ctx}`, `ContextEnricher`,
 #                       `observability::targets`.
-#         ndn-faces  — `CallbackFace`, `TapFace`.
+#         ndn-face-native  — `CallbackFace`, `TapFace`.
 #         ndn-face-local — `InProcFace::new_kind`.
 #   (c) RUST-DOC   — `cargo doc -p ndn-engine --no-deps` (no feature)
 #       generates a `struct.ForwarderEngine.html` page with **zero**
@@ -24,7 +24,7 @@
 #   (d) RUST-DOC   — `cargo doc -p ndn-engine --no-deps --features
 #       experimental-instrument` generates the same page with at least
 #       4 such anchors.
-#   (e) RUST-BUILD — `cargo build -p ndn-engine -p ndn-faces -p
+#   (e) RUST-BUILD — `cargo build -p ndn-engine -p ndn-face-native -p
 #       ndn-face-local` succeeds *without* the feature (proving the
 #       items are still `pub` and in-tree code keeps compiling).
 #
@@ -50,7 +50,7 @@ check_grep() {
 
 # (a) Features.
 check_grep '^experimental-instrument =' crates/ndn-engine/Cargo.toml      'ndn-engine experimental-instrument feature'
-check_grep '^experimental-instrument =' crates/ndn-faces/Cargo.toml       'ndn-faces experimental-instrument feature'
+check_grep '^experimental-instrument =' crates/ndn-face-native/Cargo.toml       'ndn-face-native experimental-instrument feature'
 check_grep '^experimental-instrument =' crates/ndn-face-local/Cargo.toml  'ndn-face-local experimental-instrument feature'
 
 # (b) Engine table accessors carry the doc-hidden attr.
@@ -98,15 +98,15 @@ check_preceding_attr crates/ndn-engine/src/observability/mod.rs \
     '^pub mod targets' 'observability::targets doc-hidden gate'
 
 # CallbackFace + TapFace + InProcFace::new_kind.
-check_grep 'doc\(hidden\)' crates/ndn-faces/src/callback.rs     'callback.rs doc-hidden gate (CallbackFace/TapFace)'
-check_grep 'pub struct TapFace'         crates/ndn-faces/src/callback.rs  'TapFace struct exists'
+check_grep 'doc\(hidden\)' crates/ndn-face-native/src/callback.rs     'callback.rs doc-hidden gate (CallbackFace/TapFace)'
+check_grep 'pub struct TapFace'         crates/ndn-face-native/src/callback.rs  'TapFace struct exists'
 check_grep 'pub use callback::\{CallbackFace, TapFace\}' \
-    crates/ndn-faces/src/lib.rs 'TapFace re-exported'
+    crates/ndn-face-native/src/lib.rs 'TapFace re-exported'
 check_grep 'doc\(hidden\)' crates/ndn-face-local/src/lib.rs     'InProcFace::new_kind doc-hidden gate'
 
 # (e) Build without the feature.
 echo "→ cargo build (default features) — Instrument items stay pub"
-if ! cargo build --quiet -p ndn-engine -p ndn-faces -p ndn-face-local >/dev/null 2>&1; then
+if ! cargo build --quiet -p ndn-engine -p ndn-face-native -p ndn-face-local >/dev/null 2>&1; then
     echo "FAIL: build broke without experimental-instrument feature" >&2
     fail=1
 fi
