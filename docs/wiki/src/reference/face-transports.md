@@ -245,6 +245,27 @@ high-throughput exceptions:
 
 See `crates/ndn-transport/src/link_service.rs` for the trait.
 
+## Per-face NDNLPv2 local fields
+
+`IncomingFaceId` and `NextHopFaceId` are NDNLPv2 local fields, gated per-face by
+the `LocalFields` flag (off by default). If `IncomingFaceId` always reads
+`0`/absent, the face hasn't enabled LocalFields — enable it first via
+`faces/update` (`Flags`+`Mask` bit 0 = LocalFields, 1 = LpReliability, 2 =
+CongestionMarking):
+
+```sh
+ndn-ctl faces update face-id 263 flags 0x1 mask 0x1   # LocalFields on
+```
+
+With it enabled: `IncomingFaceId` (0x032C) is attached to packets sent out that
+face — the face the packet arrived on (or the reserved Content-Store id `254` on
+a cache hit), readable from `LpInfo` (`Consumer::fetch_with_meta`); and
+`NextHopFaceId` (0x0330) is honoured on Interests arriving on it, pinning an
+Interest to an egress face past the FIB (`Consumer::fetch_on`). A face without
+LocalFields ignores `NextHopFaceId`, so an untrusted peer cannot steer
+forwarding. Local-scope only; the bundled routing protocol enables it on its
+own faces.
+
 ## Compile-time gates
 
 | Feature | Carrier crate | Effect |

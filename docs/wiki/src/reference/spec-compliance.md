@@ -15,6 +15,7 @@ regresses. This page summarises which areas are covered.
 | Signature types | Packet spec §5 | A.16, A.17, BLAKE3 | `a16_signature_value_length`, `a17_blake3_registered` |
 | KeyLocator rules | Packet spec §5.5 | A.15 | `a15_keylocator_rules` |
 | LP TLV (NDNLPv2) | LP spec | A.11, A.12 | `a11_nack_reason_documented`, `a12_nack_lp_only` |
+| LP IncomingFaceId / LocalFields | NDNLPv2 §local fields | X.02 | `x02_incoming_face_id_local_fields` |
 | Nonce length | Packet spec §3 | A.13 | `a13_nonce_length_rejected` |
 | FinalBlockId / UriComponent | Naming convention | A.19, A.20 | `a19_a20_uri_finalblockid` |
 | Signed Interests | Packet spec §3 (signed) | A.09 | `a09_signed_interest_verify` |
