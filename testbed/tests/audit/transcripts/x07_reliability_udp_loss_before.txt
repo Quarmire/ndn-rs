@@ -1,0 +1,77 @@
+=== standing up ndn-fwd-rel-a and ndn-fwd-rel-b ===
+ Container ndn-fwd-rel-b Creating 
+ Container ndn-fwd-rel-a Creating 
+ Container ndn-fwd-rel-a Created 
+ Container ndn-fwd-rel-b Created 
+ Container ndn-fwd-rel-a Starting 
+ Container ndn-fwd-rel-b Starting 
+ Container ndn-fwd-rel-a Started 
+ Container ndn-fwd-rel-b Started 
+--- waiting for management sockets ---
+=== starting ndn-ping server on ndn-fwd-rel-b for /rel ===
+=== creating UDP face A(172.30.0.50) -> B(172.30.0.51):6363 ===
+    F_AB = 7
+--- warmup ping (lossless) to seed B's on-demand return face ---
+PING /rel — 3 packets, interval 200ms, lifetime 2000ms
+  /rel/ping/0: seq=0 rtt=473µs
+  /rel/ping/1: seq=1 rtt=698µs
+  /rel/ping/2: seq=2 rtt=972µs
+
+--- /rel ping statistics ---
+3 transmitted, 3 received, 0 nacked, 0.0% loss, time 0.4s
+rtt min/avg/max/p50/p99/stddev = 473µs/714µs/972µs/698µs/972µs/204 µs
+
+=== NO_RELIABILITY=1: skipping faces/update — baseline (before) leg ===
+=== applying 30% netem loss on both eth0 (A and B) ===
+=== 40 pings under loss (reliability ON) ===
+PING /rel — 40 packets, interval 150ms, lifetime 4000ms
+  /rel/ping/0: seq=0 rtt=430µs
+  seq=1: timeout
+  seq=2: timeout
+  /rel/ping/3: seq=3 rtt=700µs
+  seq=4: timeout
+  seq=5: timeout
+  /rel/ping/6: seq=6 rtt=792µs
+  /rel/ping/7: seq=7 rtt=649µs
+  /rel/ping/8: seq=8 rtt=605µs
+  /rel/ping/9: seq=9 rtt=698µs
+  /rel/ping/10: seq=10 rtt=1.08ms
+  seq=11: timeout
+  seq=12: timeout
+  seq=13: timeout
+  /rel/ping/14: seq=14 rtt=914µs
+  seq=15: timeout
+  /rel/ping/16: seq=16 rtt=730µs
+  /rel/ping/17: seq=17 rtt=747µs
+  seq=18: timeout
+  /rel/ping/19: seq=19 rtt=781µs
+  seq=20: timeout
+  seq=21: timeout
+  /rel/ping/22: seq=22 rtt=924µs
+  seq=23: timeout
+  seq=24: timeout
+  seq=25: timeout
+  seq=26: timeout
+  /rel/ping/27: seq=27 rtt=748µs
+  seq=28: timeout
+  seq=29: timeout
+  /rel/ping/30: seq=30 rtt=838µs
+  seq=31: timeout
+  /rel/ping/32: seq=32 rtt=907µs
+  seq=33: timeout
+  seq=34: timeout
+  seq=35: timeout
+  seq=36: timeout
+  seq=37: timeout
+  seq=38: timeout
+  /rel/ping/39: seq=39 rtt=1.09ms
+
+--- /rel ping statistics ---
+40 transmitted, 16 received, 0 nacked, 60.0% loss, time 102.3s
+rtt min/avg/max/p50/p99/stddev = 430µs/789µs/1.09ms/781µs/1.09ms/165 µs
+24 timeouts
+=== received=16/40  resent=0 ===
+FAIL: only 16/40 responses under 30% loss (need >= 28) — reliability did not recover
+FAIL: F_AB reports resent=0 — no LP retransmissions fired
+--- cleanup ---
+Going to remove ndn-fwd-rel-b, ndn-fwd-rel-a

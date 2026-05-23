@@ -1,0 +1,51 @@
+x07 reliability over lossy UDP — 2026-05-23T22:28:03Z
+loss=30% per direction  pings=40  min_recv=28
+
+PING /rel — 40 packets, interval 150ms, lifetime 4000ms
+  /rel/ping/0: seq=0 rtt=1.0s
+  /rel/ping/1: seq=1 rtt=781µs
+  /rel/ping/2: seq=2 rtt=725µs
+  /rel/ping/3: seq=3 rtt=585µs
+  /rel/ping/4: seq=4 rtt=208.15ms
+  /rel/ping/5: seq=5 rtt=806µs
+  seq=6: timeout
+  /rel/ping/7: seq=7 rtt=1.26ms
+  /rel/ping/8: seq=8 rtt=720µs
+  /rel/ping/9: seq=9 rtt=208.28ms
+  /rel/ping/10: seq=10 rtt=260.59ms
+  /rel/ping/11: seq=11 rtt=889µs
+  /rel/ping/12: seq=12 rtt=635µs
+  /rel/ping/13: seq=13 rtt=636µs
+  /rel/ping/14: seq=14 rtt=209.66ms
+  /rel/ping/15: seq=15 rtt=208.74ms
+  /rel/ping/16: seq=16 rtt=679µs
+  seq=17: timeout
+  seq=18: timeout
+  /rel/ping/19: seq=19 rtt=729µs
+  /rel/ping/20: seq=20 rtt=672µs
+  /rel/ping/21: seq=21 rtt=892µs
+  /rel/ping/22: seq=22 rtt=209.10ms
+  /rel/ping/23: seq=23 rtt=1.01ms
+  /rel/ping/24: seq=24 rtt=890µs
+  /rel/ping/25: seq=25 rtt=208.53ms
+  seq=26: timeout
+  /rel/ping/27: seq=27 rtt=207.47ms
+  /rel/ping/28: seq=28 rtt=207.91ms
+  /rel/ping/29: seq=29 rtt=755µs
+  /rel/ping/30: seq=30 rtt=719µs
+  /rel/ping/31: seq=31 rtt=657µs
+  /rel/ping/32: seq=32 rtt=1.17ms
+  /rel/ping/33: seq=33 rtt=208.55ms
+  /rel/ping/34: seq=34 rtt=208.95ms
+  /rel/ping/35: seq=35 rtt=210.51ms
+  /rel/ping/36: seq=36 rtt=207.03ms
+  /rel/ping/37: seq=37 rtt=418.59ms
+  /rel/ping/38: seq=38 rtt=793µs
+  seq=39: timeout
+
+--- /rel ping statistics ---
+40 transmitted, 35 received, 0 nacked, 12.5% loss, time 30.4s
+rtt min/avg/max/p50/p99/stddev = 585µs/121.02ms/1.0s/1.01ms/1.0s/194897 µs
+5 timeouts
+
+A face F_AB=7 reliability line:   reliability: rto=200000µs  resent=18

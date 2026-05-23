@@ -341,6 +341,51 @@ services:
     command: ["dv", "run", "/etc/ndnd/dv.yml"]
     restart: "no"
 
+  # ── Reliability witness: two forwarders over a lossy UDP link (x07) ───────
+  # Both built from the testclient image, which bundles ndn-fwd *and* the
+  # tools + iproute2 (tc/netem) + ndn-ctl, so each container can run a
+  # forwarder, apply netem loss to its own eth0, and be driven via the local
+  # management socket. Clients (ndn-ping) connect over the Unix socket, so the
+  # only eth0 traffic is the inter-forwarder link — unfiltered netem isolates
+  # loss to exactly that link. NET_ADMIN is required for `tc`.
+  ndn-fwd-rel-a:
+    profiles: ["reliability"]
+    image: ndn-testbed-testclient:latest
+    build:
+      context: ..
+      dockerfile: testbed/Dockerfile.testclient
+    container_name: ndn-fwd-rel-a
+    hostname: ndn-fwd-rel-a
+    cap_add: ["NET_ADMIN"]
+    environment:
+      RUST_LOG: "info,face.udp=info"
+    networks:
+      ndn-net:
+        ipv4_address: 172.30.0.50
+    volumes:
+      - ./configs/ndn-fwd.toml:/etc/ndn-fwd/config.toml:ro
+    command: ["sh", "-c", "mkdir -p /run/ndn-fwd && exec ndn-fwd --config /etc/ndn-fwd/config.toml"]
+    restart: "no"
+
+  ndn-fwd-rel-b:
+    profiles: ["reliability"]
+    image: ndn-testbed-testclient:latest
+    build:
+      context: ..
+      dockerfile: testbed/Dockerfile.testclient
+    container_name: ndn-fwd-rel-b
+    hostname: ndn-fwd-rel-b
+    cap_add: ["NET_ADMIN"]
+    environment:
+      RUST_LOG: "info,face.udp=info"
+    networks:
+      ndn-net:
+        ipv4_address: 172.30.0.51
+    volumes:
+      - ./configs/ndn-fwd.toml:/etc/ndn-fwd/config.toml:ro
+    command: ["sh", "-c", "mkdir -p /run/ndn-fwd && exec ndn-fwd --config /etc/ndn-fwd/config.toml"]
+    restart: "no"
+
   # ── Test runner (shared tools container) ──────────────────────────────────
   # Used by bench and compliance scripts as the "outside" node.
   # Has ndn-tools (ndn-iperf, ndn-ping, ndn-peek, ndn-put) installed.
