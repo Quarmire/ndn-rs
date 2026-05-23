@@ -98,6 +98,11 @@ scope = extension   (flat under crates/)   Pragmatic engineering, no NDN spec ba
                                 ComputeFace, ComputeRegistry, ComputeHandler
   ndn-coding                    Network coding (F1 FEC): CodedProducer / CodedFetcher
                                 endpoint API, GF(2^8) K-of-N codec, coding policy table
+  ndn-abe                       Attribute-based encryption: CP-ABE (BSW) +
+                                MA-ABE (AW11) via rabe (BN-254); versioned
+                                NDN-TLV AbeCiphertext container. One-to-many
+                                confidentiality tier above the ndn-crypto-core
+                                AEAD baseline; producer / capable-node only
 
 crates/tooling/                 Operator-facing tools and shared tool libs
   ndn-tools-core                Embeddable tool logic (ping, iperf, peek, put)
