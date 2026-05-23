@@ -69,6 +69,17 @@ pub trait CsStore {
     /// Admit a Data's wire bytes to the cache. `freshness_ms` is the Data's
     /// FreshnessPeriod (0 = immediately stale); `now_ms` stamps the insert.
     fn admit(&mut self, components: &[&[u8]], wire: &[u8], freshness_ms: u32, now_ms: u32);
+
+    /// Number of entries currently cached (for status introspection). Defaults
+    /// to 0 — a real store overrides it; [`NoCs`] keeps the default.
+    fn len(&self) -> usize {
+        0
+    }
+
+    /// Whether the cache is empty.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 /// A [`CsStore`] that caches nothing — the default for forwarders built without
