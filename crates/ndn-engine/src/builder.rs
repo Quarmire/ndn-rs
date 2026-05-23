@@ -396,7 +396,7 @@ impl EngineBuilder {
             face_states: Arc::clone(&face_states),
             rib: Arc::clone(&rib),
             runtime: Arc::clone(&runtime),
-            decode: TlvDecodeStage::new(Arc::clone(&face_table)),
+            decode: TlvDecodeStage::new(Arc::clone(&face_table), Arc::clone(&face_states)),
             cs_lookup: CsLookupStage {
                 cs: Arc::clone(&cs),
             },
@@ -627,7 +627,10 @@ mod tests {
     ) {
         let id = engine.faces().alloc_id();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        engine.add_face(CaptureFace { id, tx }, tokio_util::sync::CancellationToken::new());
+        engine.add_face(
+            CaptureFace { id, tx },
+            tokio_util::sync::CancellationToken::new(),
+        );
         (id, rx)
     }
 
@@ -847,8 +850,12 @@ mod tests {
         inject(&engine, other, ndn_transport::FaceId(778)).await;
 
         assert!(
-            !received_interest(&mut rx, "/rfx/not-installed/params", Duration::from_millis(500))
-                .await,
+            !received_interest(
+                &mut rx,
+                "/rfx/not-installed/params",
+                Duration::from_millis(500)
+            )
+            .await,
             "an Interest under an unrouted reflexive name must not be reverse-routed",
         );
 

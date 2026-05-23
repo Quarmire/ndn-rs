@@ -728,7 +728,9 @@ async fn faces_create_quic(uri: &str, engine: &ForwarderEngine) -> ControlRespon
     };
     let params: Vec<&str> = query.map(|q| q.split('&').collect()).unwrap_or_default();
     let cert_hex = params.iter().find_map(|kv| kv.strip_prefix("cert="));
-    let webpki = params.iter().any(|kv| *kv == "webpki" || *kv == "webpki=true");
+    let webpki = params
+        .iter()
+        .any(|kv| *kv == "webpki" || *kv == "webpki=true");
 
     let tls = if let Some(hex) = cert_hex {
         match ndn_config::parse_cert_sha256_hex(hex) {
@@ -777,7 +779,10 @@ async fn faces_create_quic(uri: &str, engine: &ForwarderEngine) -> ControlRespon
         }
         Err(e) => {
             tracing::warn!(target: "mgmt.face", error = %e, remote = %authority, "faces/create quic failed");
-            ControlResponse::error(status::SERVER_ERROR, format!("QUIC face creation failed: {e}"))
+            ControlResponse::error(
+                status::SERVER_ERROR,
+                format!("QUIC face creation failed: {e}"),
+            )
         }
     }
 }
@@ -812,7 +817,9 @@ async fn faces_create_ble_central(
     let face_id = engine.faces().alloc_id();
     match ndn_face_native::l2::BleCentralFace::connect(face_id, target, framing, adapter).await {
         Ok(face) => {
-            let remote_uri = face.remote_uri().unwrap_or_else(|| format!("ble://{target}"));
+            let remote_uri = face
+                .remote_uri()
+                .unwrap_or_else(|| format!("ble://{target}"));
             engine.add_face_with_persistency(
                 face,
                 CancellationToken::new(),
@@ -844,9 +851,9 @@ fn faces_create_shm(
     let face_id = engine.faces().alloc_id();
 
     let face_result = match mtu {
-        Some(m) => {
-            ndn_face_native::local::shm::spsc::SpscFace::create_for_mtu(face_id, shm_name, m as usize)
-        }
+        Some(m) => ndn_face_native::local::shm::spsc::SpscFace::create_for_mtu(
+            face_id, shm_name, m as usize,
+        ),
         None => ndn_face_native::local::ShmFace::create(face_id, shm_name),
     };
     match face_result {
@@ -1202,6 +1209,8 @@ fn faces_list_dataset(engine: &ForwarderEngine) -> bytes::Bytes {
             n_satisfied_interests,
             n_unsatisfied_interests,
             face_flags,
+            n_in_nacks,
+            n_out_nacks,
         ) = state
             .as_ref()
             .map(|s| {
@@ -1215,6 +1224,8 @@ fn faces_list_dataset(engine: &ForwarderEngine) -> bytes::Bytes {
                     s.counters.in_satisfied_interests.load(Ordering::Relaxed),
                     s.counters.in_unsatisfied_interests.load(Ordering::Relaxed),
                     s.face_flags_raw(),
+                    s.counters.in_nacks.load(Ordering::Relaxed),
+                    s.counters.out_nacks.load(Ordering::Relaxed),
                 )
             })
             .unwrap_or_default();
@@ -1279,10 +1290,10 @@ fn faces_list_dataset(engine: &ForwarderEngine) -> bytes::Bytes {
             default_congestion_threshold: def_cong_threshold,
             n_in_interests,
             n_in_data,
-            n_in_nacks: 0,
+            n_in_nacks,
             n_out_interests,
             n_out_data,
-            n_out_nacks: 0,
+            n_out_nacks,
             n_in_bytes,
             n_out_bytes,
             n_satisfied_interests,

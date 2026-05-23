@@ -10,7 +10,6 @@ use crate::observability::targets as t;
 use crate::pipeline::{
     Action, DecodedPacket, DropReason, ForwardingAction, NackReason, PacketContext,
 };
-use ndn_packet::wire::encode_nack;
 use ndn_store::PitToken;
 use ndn_transport::{FaceId, FaceScope};
 
@@ -217,7 +216,10 @@ impl PacketDispatcher {
             && let Some(rname) = i.reflexive_name()
         {
             let lifetime = i.lifetime().unwrap_or(Duration::from_millis(4000));
-            if !self.reflexive.install(rname.as_ref(), ctx.face_id, lifetime) {
+            if !self
+                .reflexive
+                .install(rname.as_ref(), ctx.face_id, lifetime)
+            {
                 debug!(
                     target: t::FWD_PIPELINE,
                     face = %ctx.face_id,
@@ -313,16 +315,18 @@ impl PacketDispatcher {
         match action {
             ForwardingAction::Forward(faces) => {
                 let interest_wire = nack.interest.raw().clone();
-                let wire_len = interest_wire.len() as u64;
                 for face_id in &faces {
                     if let Some(state) = self.face_states.get(face_id) {
                         state.counters.out_interests.fetch_add(1, Ordering::Relaxed);
-                        state
-                            .counters
-                            .out_bytes
-                            .fetch_add(wire_len, Ordering::Relaxed);
                     }
-                    self.enqueue_send(*face_id, interest_wire.clone()).await;
+                    // out_bytes is counted once, in the send loop, where the
+                    // framed wire length is known.
+                    self.enqueue_send(
+                        *face_id,
+                        interest_wire.clone(),
+                        crate::engine::EgressIntent::default(),
+                    )
+                    .await;
                 }
             }
             ForwardingAction::Nack(_reason) => {
@@ -331,8 +335,16 @@ impl PacketDispatcher {
                     let packet_reason = nack.reason;
                     for face_id_raw in entry.in_record_faces() {
                         let face_id = FaceId(face_id_raw);
-                        let nack_bytes = encode_nack(packet_reason, &interest_wire);
-                        self.enqueue_send(face_id, nack_bytes).await;
+                        let intent = crate::engine::EgressIntent {
+                            nack: Some(packet_reason),
+                            ..Default::default()
+                        };
+                        // NFD NOutNacks.
+                        if let Some(state) = self.face_states.get(&face_id) {
+                            state.counters.out_nacks.fetch_add(1, Ordering::Relaxed);
+                        }
+                        self.enqueue_send(face_id, interest_wire.clone(), intent)
+                            .await;
                     }
                 }
             }

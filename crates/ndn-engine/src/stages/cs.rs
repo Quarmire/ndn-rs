@@ -22,6 +22,8 @@ impl CsLookupStage {
             _ => return Action::Continue(ctx),
         };
 
+        // The Serve gate lives inside the CS (`get` returns None when disabled),
+        // mirroring NFD's Cs::findImpl.
         if let Some(entry) = self.cs.get_erased(interest).await {
             trace!(target: t::FWD_CS, face=%ctx.face_id, name=?ctx.name, hit=true, "cs lookup");
             ctx.cs_hit = true;
@@ -43,6 +45,8 @@ pub struct CsInsertStage {
 impl CsInsertStage {
     pub async fn process(&self, ctx: PacketContext) -> Action {
         if let DecodedPacket::Data(ref data) = ctx.packet {
+            // The Admit gate lives inside the CS (`insert` is a no-op when
+            // disabled), mirroring NFD's Cs::insert.
             // Only verified Data enters the CS; unverified bytes could poison
             // downstream consumers. `ctx.verified` is set by ValidationStage
             // or by the local-face trusted-bypass in the pipeline.

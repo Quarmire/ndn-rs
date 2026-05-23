@@ -279,7 +279,7 @@ impl WasmEngineBuilder {
             face_states: Arc::clone(&face_states),
             rib: Arc::clone(&rib),
             runtime: Arc::clone(&runtime),
-            decode: TlvDecodeStage::new(Arc::clone(&face_table)),
+            decode: TlvDecodeStage::new(Arc::clone(&face_table), Arc::clone(&face_states)),
             cs_lookup: CsLookupStage {
                 cs: Arc::clone(&cs),
             },

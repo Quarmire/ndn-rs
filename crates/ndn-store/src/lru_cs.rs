@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
@@ -15,6 +15,9 @@ pub struct LruCs {
     inner: Mutex<LruInner>,
     capacity_bytes: AtomicUsize,
     entry_count: AtomicUsize,
+    /// NFD cs/config Admit/Serve toggles (default on).
+    admit: AtomicBool,
+    serve: AtomicBool,
 }
 
 struct LruInner {
@@ -37,6 +40,8 @@ impl LruCs {
             }),
             capacity_bytes: AtomicUsize::new(capacity_bytes),
             entry_count: AtomicUsize::new(0),
+            admit: AtomicBool::new(true),
+            serve: AtomicBool::new(true),
         }
     }
 
@@ -47,6 +52,11 @@ impl LruCs {
 
 impl ContentStore for LruCs {
     async fn get(&self, interest: &Interest) -> Option<CsEntry> {
+        // NFD cs/config Serve gate (Cs::findImpl): don't satisfy from cache
+        // when serving is disabled.
+        if !self.serve.load(Ordering::Relaxed) {
+            return None;
+        }
         if self.entry_count.load(Ordering::Relaxed) == 0 {
             return None;
         }
@@ -86,6 +96,11 @@ impl ContentStore for LruCs {
     }
 
     async fn insert(&self, data: Bytes, name: Arc<Name>, meta: CsMeta) -> InsertResult {
+        // NFD cs/config Admit gate (Cs::insert): admit no new Data when
+        // admission is disabled.
+        if !self.admit.load(Ordering::Relaxed) {
+            return InsertResult::Skipped;
+        }
         let entry_bytes = data.len();
         let capacity = self.capacity_bytes.load(Ordering::Relaxed);
         let mut inner = self.inner.lock().unwrap();
@@ -164,6 +179,19 @@ impl ContentStore for LruCs {
                 break;
             }
         }
+    }
+
+    fn admit_enabled(&self) -> bool {
+        self.admit.load(Ordering::Relaxed)
+    }
+    fn serve_enabled(&self) -> bool {
+        self.serve.load(Ordering::Relaxed)
+    }
+    fn set_admit(&self, enabled: bool) {
+        self.admit.store(enabled, Ordering::Relaxed);
+    }
+    fn set_serve(&self, enabled: bool) {
+        self.serve.store(enabled, Ordering::Relaxed);
     }
 
     fn variant_name(&self) -> &str {
@@ -378,6 +406,50 @@ mod tests {
     async fn capacity_is_reported() {
         let cs = LruCs::new(1024);
         assert_eq!(cs.capacity().max_bytes, 1024);
+    }
+
+    #[tokio::test]
+    async fn serve_flag_gates_lookup() {
+        let cs = LruCs::new(65536);
+        cs.insert(Bytes::from_static(b"x"), arc_name(&["a"]), meta_fresh())
+            .await;
+        assert!(
+            cs.get(&interest(&["a"])).await.is_some(),
+            "served by default"
+        );
+
+        cs.set_serve(false);
+        assert!(
+            cs.get(&interest(&["a"])).await.is_none(),
+            "serve disabled → cache not consulted"
+        );
+        cs.set_serve(true);
+        assert!(
+            cs.get(&interest(&["a"])).await.is_some(),
+            "serve re-enabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn admit_flag_gates_insert() {
+        let cs = LruCs::new(65536);
+        cs.set_admit(false);
+        let r = cs
+            .insert(Bytes::from_static(b"x"), arc_name(&["a"]), meta_fresh())
+            .await;
+        assert!(
+            matches!(r, InsertResult::Skipped),
+            "admit off → not inserted"
+        );
+        assert!(cs.get(&interest(&["a"])).await.is_none(), "nothing cached");
+
+        cs.set_admit(true);
+        cs.insert(Bytes::from_static(b"x"), arc_name(&["a"]), meta_fresh())
+            .await;
+        assert!(
+            cs.get(&interest(&["a"])).await.is_some(),
+            "admit on → cached"
+        );
     }
 
     #[tokio::test]

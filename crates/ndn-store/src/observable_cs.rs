@@ -147,6 +147,19 @@ impl ErasedContentStore for ObservableCs {
         self.inner.set_capacity(max_bytes);
     }
 
+    fn admit_enabled(&self) -> bool {
+        self.inner.admit_enabled()
+    }
+    fn serve_enabled(&self) -> bool {
+        self.inner.serve_enabled()
+    }
+    fn set_admit(&self, enabled: bool) {
+        self.inner.set_admit(enabled);
+    }
+    fn set_serve(&self, enabled: bool) {
+        self.inner.set_serve(enabled);
+    }
+
     fn len(&self) -> usize {
         self.inner.len()
     }

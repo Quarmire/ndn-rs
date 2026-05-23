@@ -24,6 +24,11 @@ async fn handle_cs(
     }
 }
 
+// NFD `CsFlagBit` (ndn-cxx nfd-constants.hpp): admit gates insertion, serve
+// gates satisfying Interests from cache.
+const BIT_CS_ENABLE_ADMIT: u64 = 1 << 0;
+const BIT_CS_ENABLE_SERVE: u64 = 1 << 1;
+
 fn cs_config(params: ControlParameters, engine: &ForwarderEngine) -> ControlResponse {
     let cs = engine.cs();
 
@@ -32,9 +37,27 @@ fn cs_config(params: ControlParameters, engine: &ForwarderEngine) -> ControlResp
         tracing::info!(target: "mgmt.cs", capacity = new_cap, "cs capacity updated");
     }
 
+    // Admit/Serve flags, Flags+Mask shaped like faces/update (NFD CsManager).
+    if let (Some(flags), Some(mask)) = (params.flags, params.mask) {
+        if mask & BIT_CS_ENABLE_ADMIT != 0 {
+            cs.set_admit(flags & BIT_CS_ENABLE_ADMIT != 0);
+        }
+        if mask & BIT_CS_ENABLE_SERVE != 0 {
+            cs.set_serve(flags & BIT_CS_ENABLE_SERVE != 0);
+        }
+    }
+
     let cap = cs.capacity();
+    let mut flags = 0u64;
+    if cs.admit_enabled() {
+        flags |= BIT_CS_ENABLE_ADMIT;
+    }
+    if cs.serve_enabled() {
+        flags |= BIT_CS_ENABLE_SERVE;
+    }
     let echo = ControlParameters {
         capacity: Some(cap.max_bytes as u64),
+        flags: Some(flags),
         ..Default::default()
     };
     ControlResponse::ok("OK", echo)

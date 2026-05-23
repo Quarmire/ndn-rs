@@ -21,6 +21,7 @@ pub enum CachePolicyType {
     Other(u64),
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LpHeaders {
     pub pit_token: Option<bytes::Bytes>,
     pub congestion_mark: Option<u64>,

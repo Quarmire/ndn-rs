@@ -27,7 +27,6 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 
 use ndn_packet::Interest;
-use ndn_packet::lp::encode_lp_packet;
 #[cfg(not(target_arch = "wasm32"))]
 use ndn_security::SecurityManager;
 use ndn_security::Validator;
@@ -73,12 +72,62 @@ pub struct FaceCounters {
     /// NFD `NUnsatisfiedInterests`: Interests on this face whose PIT entry
     /// expired without a matching Data.
     pub in_unsatisfied_interests: AtomicU64,
+    /// NFD `NInNacks`: Nacks received on this face.
+    pub in_nacks: AtomicU64,
+    /// NFD `NOutNacks`: Nacks sent on this face.
+    pub out_nacks: AtomicU64,
 }
 
-/// Per-egress-packet queue item. Pairs wire bytes with the originating
-/// face id; [`FaceId::INVALID`] denotes locally produced packets (Nacks,
-/// retransmissions, discovery beacons).
-pub type EgressItem = (bytes::Bytes, FaceId);
+/// NDNLPv2 framing intent for one outbound packet. Produced by the
+/// forwarding pipeline (which no longer frames the wire itself) and applied
+/// once, downstream, by [`frame_with_intent`] in the per-face send loop —
+/// the single egress-framing authority. This is what lets the reliability
+/// layer frame *bare* packets canonically (it sees them before LP-wrap).
+#[derive(Debug, Clone, Default)]
+pub struct EgressIntent {
+    /// LP headers to attach (PitToken, IncomingFaceId, …). All-`None` for a
+    /// plain wrap.
+    pub headers: ndn_packet::lp::LpHeaders,
+    /// When set, the payload is the Interest a Nack wraps (not a fragment).
+    pub nack: Option<ndn_packet::NackReason>,
+}
+
+/// Per-egress-packet queue item: **bare** network payload, the originating
+/// face id ([`FaceId::INVALID`] = locally produced — Nacks, beacons), and the
+/// LP framing intent. Framing happens once in the send loop, not the pipeline.
+pub type EgressItem = (bytes::Bytes, FaceId, EgressIntent);
+
+/// Turn a bare network packet + [`EgressIntent`] into wire bytes — the one
+/// place egress LP framing happens. Reproduces, byte-for-byte, what the
+/// dispatcher used to encode inline:
+/// - a Nack wraps the Interest (`encode_lp_nack_with_pit_token` / `encode_nack`);
+/// - an LP-framed face wraps the payload, attaching any headers;
+/// - an IPC (bare-TLV) face stays bare unless a PitToken forces an LP frame;
+/// - already-LP input (a retransmission) passes through untouched.
+pub fn frame_with_intent(payload: &[u8], intent: &EgressIntent, uses_lp: bool) -> bytes::Bytes {
+    use ndn_packet::lp::{
+        encode_lp_nack_with_pit_token, encode_lp_packet, encode_lp_with_headers, is_lp_packet,
+    };
+    use ndn_packet::wire::encode_nack;
+    if let Some(reason) = intent.nack {
+        return match intent.headers.pit_token.as_deref() {
+            Some(token) => encode_lp_nack_with_pit_token(reason, payload, Some(token)),
+            None => encode_nack(reason, payload),
+        };
+    }
+    if is_lp_packet(payload) {
+        // Already framed (e.g. a reliability retransmission) — never re-wrap.
+        return encode_lp_packet(payload);
+    }
+    if uses_lp {
+        // All-`None` headers make this identical to `encode_lp_packet`.
+        encode_lp_with_headers(payload, &intent.headers)
+    } else if intent.headers.pit_token.is_some() {
+        encode_lp_with_headers(payload, &intent.headers)
+    } else {
+        bytes::Bytes::copy_from_slice(payload)
+    }
+}
 
 pub struct FaceState {
     pub cancel: CancellationToken,
@@ -97,8 +146,6 @@ pub struct FaceState {
     /// queue's depth to emit LP `CongestionMark` TLVs); this is the
     /// **queue-full** fallback, not the queue-depth signal.
     pub congestion_policy: CongestionPolicy,
-    #[cfg(feature = "face-net")]
-    pub reliability: Option<std::sync::Mutex<ndn_transport::reliability::LpReliability>>,
     /// Set when the remote peer sends LP-wrapped packets (type 0x64). LP
     /// encoding is a per-link property determined by what the peer sends.
     pub uses_lp: AtomicBool,
@@ -126,37 +173,8 @@ impl FaceState {
             counters: FaceCounters::default(),
             send_tx,
             congestion_policy,
-            #[cfg(feature = "face-net")]
-            reliability: None,
             uses_lp: AtomicBool::new(false),
             flags: AtomicU64::new(0),
-        }
-    }
-
-    #[cfg(feature = "face-net")]
-    pub fn new_reliable(
-        cancel: CancellationToken,
-        persistency: FacePersistency,
-        send_tx: mpsc::Sender<EgressItem>,
-        congestion_policy: CongestionPolicy,
-        mtu: usize,
-    ) -> Self {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
-        Self {
-            cancel,
-            persistency,
-            last_activity: AtomicU64::new(now),
-            counters: FaceCounters::default(),
-            send_tx,
-            congestion_policy,
-            reliability: Some(std::sync::Mutex::new(
-                ndn_transport::reliability::LpReliability::new(mtu),
-            )),
-            uses_lp: AtomicBool::new(false),
-            flags: AtomicU64::new(BIT_LP_RELIABILITY),
         }
     }
 
@@ -545,10 +563,14 @@ impl ForwarderEngine {
         arrival: u64,
         meta: ndn_discovery_core::InboundMeta,
     ) -> Result<(), ()> {
-        if let Some(states) = self.inner.face_states.get(&face_id)
-            && let Some(rel) = states.reliability.as_ref()
+        // Discovery's recv path bypasses the LinkService feature pipeline, so
+        // feed inbound bytes to the reliability feature here (peer Acks clear
+        // tracked frames; received reliable frames queue an Ack). Socket faces
+        // drive the same state via `LinkServiceFeature::on_ingress`.
+        if let Some(face) = self.inner.face_table.get(face_id)
+            && let Some(feature) = face.link_service.reliability_feature_handle()
         {
-            rel.lock().unwrap().on_receive(&raw);
+            feature.note_receive(&raw);
         }
 
         let tx = match self.inner.pipeline_tx.get() {
@@ -576,9 +598,13 @@ impl ForwarderEngine {
         Arc::clone(&self.inner.face_states)
     }
 
-    /// Toggle the NFD `LocalFieldsEnabled` flag on `face_id`. Surfaced in
-    /// `FaceStatus.Flags` (bit 0) for NFD-mgmt parity; source-face provenance
-    /// rides the tag-bag instead, so this is purely a wire-visible flag.
+    /// Toggle the NFD `LocalFieldsEnabled` flag on `face_id` (bit 0 of
+    /// `FaceStatus.Flags`). When enabled, the dispatcher attaches the NDNLPv2
+    /// `IncomingFaceId` header to that face's LP-framed egress — the ingress
+    /// face of the forwarded Interest/Data — matching NFD's
+    /// `GenericLinkService::encodeLpFields` gate on `allowLocalFields`.
+    /// Off by default. (In-process source-face provenance for mgmt rides the
+    /// tag-bag separately; see `InProcHandle::recv_tagged`.)
     pub fn set_local_fields(&self, face_id: FaceId, enabled: bool) {
         if let Some(state) = self.inner.face_states.get(&face_id) {
             state.set_local_fields_bit(enabled);
@@ -673,16 +699,11 @@ pub(crate) async fn run_face_sender(
         runtime,
         face_lifecycle_sink,
     } = ctx;
-    let has_reliability = face_states
-        .get(&face_id)
-        .map(|s| s.reliability.is_some())
-        .unwrap_or(false);
-
-    // The LinkService-side reliability feature may also be on this face
-    // (runtime-mutable). Pump both on the same retx tick so faces that have
-    // reliability flipped on via `faces/update` still see retransmissions.
+    // NDNLPv2 reliability lives entirely in the per-face `ReliabilityFeature`
+    // (runtime-mutable via `faces/update` / discovery enablement). The send arm
+    // frames through it when enabled; the retx tick pumps its retransmissions
+    // and Acks. `take_*` are empty when disabled, so the tick is cheap.
     let lp_reliability_feature = face.link_service.reliability_feature_handle();
-    let has_lp_reliability_feature = lp_reliability_feature.is_some();
 
     let retx_tick_dur = std::time::Duration::from_millis(50);
 
@@ -719,36 +740,27 @@ pub(crate) async fn run_face_sender(
         tokio::select! {
             biased;            _ = cancel.cancelled() => break,
             item = rx.recv() => {
-                let (pkt, source) = match item {
+                let (pkt, source, intent) = match item {
                     Some(p) => p,
                     None => break,
                 };
 
-                if has_reliability {
-                    let wires = {
-                        let state = face_states.get(&face_id);
-                        match state.as_ref().and_then(|s| s.reliability.as_ref()) {
-                            Some(rel) => rel.lock().unwrap().on_send(&pkt),
-                            None => vec![pkt],
-                        }
-                    };
-                    for wire in wires {
-                        if let Err(e) = face.send_bytes_with_source(wire, source).await
-                            && handle_send_error(e)
-                        {
-                            return;
-                        }
+                // Single egress-framing point. When the reliability feature is
+                // enabled it frames canonically (TxSequence + piggybacked Acks +
+                // retx tracking); otherwise frame the bare payload + intent.
+                // (A reliable face ignores `intent` headers — the only traffic
+                // on reliable faces today is header-less control/beacons.)
+                let wires = match lp_reliability_feature.as_ref() {
+                    Some(feature) if feature.is_enabled() => feature.frame(&pkt),
+                    _ => vec![frame_with_intent(&pkt, &intent, face.kind().uses_lp_framing())],
+                };
+                for wire in wires {
+                    if let Some(state) = face_states.get(&face_id) {
+                        state
+                            .counters
+                            .out_bytes
+                            .fetch_add(wire.len() as u64, Ordering::Relaxed);
                     }
-                } else {
-                    let wire = if face_states
-                        .get(&face_id)
-                        .map(|s| s.uses_lp.load(Ordering::Relaxed))
-                        .unwrap_or(false)
-                    {
-                        encode_lp_packet(&pkt)
-                    } else {
-                        pkt
-                    };
                     if let Err(e) = face.send_bytes_with_source(wire, source).await
                         && handle_send_error(e)
                     {
@@ -756,34 +768,9 @@ pub(crate) async fn run_face_sender(
                     }
                 }
             },
-            _ = retx_sleep, if has_reliability || has_lp_reliability_feature => {
-                let (retx, ack_pkt) = if has_reliability {
-                    let state = face_states.get(&face_id);
-                    match state.as_ref().and_then(|s| s.reliability.as_ref()) {
-                        Some(rel) => {
-                            let mut rel = rel.lock().unwrap();
-                            let retx = rel.check_retransmit();
-                            let ack_pkt = rel.flush_acks();
-                            (retx, ack_pkt)
-                        }
-                        None => (vec![], None),
-                    }
-                } else {
-                    (vec![], None)
-                };
-                for wire in retx {
-                    if let Err(e) = face.send_bytes(wire).await
-                        && handle_send_error(e)
-                    {
-                        return;
-                    }
-                }
-                if let Some(wire) = ack_pkt {
-                    let _ = face.send_bytes(wire).await;
-                }
-                // Pump per-face ReliabilityFeature retransmissions onto the
-                // same egress path. `take_retransmissions` is empty when
-                // disabled, so this is cheap.
+            _ = retx_sleep, if lp_reliability_feature.is_some() => {
+                // Pump the reliability feature's retransmissions and standalone
+                // Acks onto the egress path. Both are empty when disabled.
                 if let Some(feature) = lp_reliability_feature.as_ref() {
                     for wire in feature.take_retransmissions() {
                         if let Err(e) = face.send_bytes(wire).await
@@ -791,6 +778,9 @@ pub(crate) async fn run_face_sender(
                         {
                             return;
                         }
+                    }
+                    if let Some(ack) = feature.take_acks() {
+                        let _ = face.send_bytes(ack).await;
                     }
                 }
             }

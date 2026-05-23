@@ -5,35 +5,47 @@ use bytes::Bytes;
 use tokio::sync::mpsc;
 use tracing::{debug, trace};
 
+use crate::engine::EgressIntent;
 use crate::observability::targets as t;
 use crate::pipeline::{Action, NackReason, PacketContext};
 use ndn_packet::Name;
-use ndn_packet::lp::{LpHeaders, encode_lp_nack_with_pit_token, encode_lp_with_headers};
-use ndn_packet::wire::encode_nack;
+use ndn_packet::lp::LpHeaders;
 use ndn_store::CsEntry;
 use ndn_transport::{CongestionPolicy, FaceId, FaceScope};
 
 use super::PacketDispatcher;
 
 impl PacketDispatcher {
-    pub(super) async fn enqueue_send(&self, face_id: FaceId, data: Bytes) {
-        self.enqueue_send_with_source(face_id, data, FaceId::INVALID)
+    /// Whether `face_id` has the per-face NDNLPv2 `LocalFields` option enabled
+    /// (NFD `BIT_LOCAL_FIELDS`, toggled via `faces/update`). Gates attaching
+    /// `IncomingFaceId` to that face's egress.
+    fn local_fields_enabled(&self, face_id: FaceId) -> bool {
+        self.face_states
+            .get(&face_id)
+            .is_some_and(|s| s.local_fields_enabled())
+    }
+
+    pub(super) async fn enqueue_send(&self, face_id: FaceId, payload: Bytes, intent: EgressIntent) {
+        self.enqueue_send_with_source(face_id, payload, FaceId::INVALID, intent)
             .await;
     }
 
-    /// Push `data` onto `face_id`'s outbound queue, tagging it with the
-    /// originating face id `source`. `FaceId::INVALID` means no source.
-    /// In-process consumers read the tag via `InProcHandle::recv_tagged`.
+    /// Push a **bare** `payload` + framing `intent` onto `face_id`'s outbound
+    /// queue, tagging it with the originating face id `source`
+    /// (`FaceId::INVALID` = none). Framing happens once, in the send loop
+    /// ([`crate::engine::frame_with_intent`]); in-process consumers read the
+    /// `source` tag via `InProcHandle::recv_tagged`.
     pub(super) async fn enqueue_send_with_source(
         &self,
         face_id: FaceId,
-        data: Bytes,
+        payload: Bytes,
         source: FaceId,
+        intent: EgressIntent,
     ) {
         let Some(state) = self.face_states.get(&face_id) else {
             return;
         };
-        let item = (data, source);
+        let item = (payload, source, intent);
         match state.congestion_policy {
             CongestionPolicy::Drop => match state.send_tx.try_send(item) {
                 Ok(()) => {}
@@ -104,29 +116,36 @@ impl PacketDispatcher {
                         debug!(target: t::FWD_PIPELINE, face=%face_id, name=?ctx.name, "rate-limit: outbound Interest dropped");
                         continue;
                     }
-                    // Wrap egress in LpPacket on LP-framed (wire) faces so
-                    // per-hop headers (CongestionMark, NextHopFaceId, …) have a
-                    // frame. IPC faces keep bare TLV; source-face provenance
-                    // rides the tag-bag instead.
+                    // NDNLPv2 IncomingFaceId (0x032C) is attached only when the
+                    // egress face has the per-face LocalFields option enabled
+                    // (faces/update, BIT_LOCAL_FIELDS), mirroring NFD's
+                    // GenericLinkService::encodeLpFields gate on
+                    // `allowLocalFields`. The value is the ingress face the
+                    // Interest arrived on (NFD onIncomingInterest tag). The
+                    // actual LP wrap happens once, downstream, in the send loop.
                     let uses_lp = face
                         .as_ref()
                         .map(|f| f.kind().uses_lp_framing())
                         .unwrap_or(false);
-                    let egress_bytes = if uses_lp {
-                        ndn_packet::lp::encode_lp_packet(&ctx.raw_bytes)
-                    } else {
-                        ctx.raw_bytes.clone()
+                    let incoming_face_id =
+                        (uses_lp && self.local_fields_enabled(*face_id)).then_some(ctx.face_id.0);
+                    let intent = EgressIntent {
+                        headers: LpHeaders {
+                            incoming_face_id,
+                            ..Default::default()
+                        },
+                        nack: None,
                     };
-                    let egress_len = egress_bytes.len() as u64;
                     if let Some(state) = self.face_states.get(face_id) {
                         state.counters.out_interests.fetch_add(1, Ordering::Relaxed);
-                        state
-                            .counters
-                            .out_bytes
-                            .fetch_add(egress_len, Ordering::Relaxed);
                     }
-                    self.enqueue_send_with_source(*face_id, egress_bytes, ctx.face_id)
-                        .await;
+                    self.enqueue_send_with_source(
+                        *face_id,
+                        ctx.raw_bytes.clone(),
+                        ctx.face_id,
+                        intent,
+                    )
+                    .await;
                 }
             }
             Action::Satisfy(ctx) => {
@@ -142,15 +161,23 @@ impl PacketDispatcher {
                     NackReason::Congestion => ndn_packet::NackReason::Congestion,
                     NackReason::NotYet => ndn_packet::NackReason::NotYet,
                 };
-                // Echo the consumer's PitToken on the Nack return path so
-                // it can correlate the response with its outstanding request.
-                let nack_bytes = match ctx.lp_pit_token.as_deref() {
-                    Some(token) => {
-                        encode_lp_nack_with_pit_token(packet_reason, &ctx.raw_bytes, Some(token))
-                    }
-                    None => encode_nack(packet_reason, &ctx.raw_bytes),
+                // Echo the consumer's PitToken on the Nack return path so it
+                // can correlate the response with its outstanding request. The
+                // Nack LP frame (with the Interest as payload) is built in the
+                // send loop from this intent.
+                let intent = EgressIntent {
+                    headers: LpHeaders {
+                        pit_token: ctx.lp_pit_token.clone(),
+                        ..Default::default()
+                    },
+                    nack: Some(packet_reason),
                 };
-                self.enqueue_send(ctx.face_id, nack_bytes).await;
+                // NFD NOutNacks (LinkService::sendNack, link-service.cpp:73).
+                if let Some(state) = self.face_states.get(&ctx.face_id) {
+                    state.counters.out_nacks.fetch_add(1, Ordering::Relaxed);
+                }
+                self.enqueue_send(ctx.face_id, ctx.raw_bytes.clone(), intent)
+                    .await;
             }
             Action::Continue(_) => {}
         }
@@ -185,35 +212,32 @@ impl PacketDispatcher {
                 debug!(target: t::FWD_PIPELINE, face=%face_id, name=?ctx.name, "rate-limit: outbound Data dropped");
                 continue;
             }
-            // Wrap Data in LpPacket on LP-framed (wire) egress so the PitToken
-            // attached on ingress is echoed back to the consumer. IPC faces keep
-            // bare TLV (in-proc apps don't speak LP).
+            // Returned Data echoes the consumer's PitToken (so it can correlate
+            // the response) and, on a LocalFields face, the IncomingFaceId — the
+            // face the Data arrived on (producer face, or the reserved
+            // Content-Store id on a cache hit, NFD onContentStoreHit). The LP
+            // wrap (or bare TLV, for IPC) is applied once, in the send loop.
             let uses_lp = self
                 .face_table
                 .get(*face_id)
                 .map(|f| f.kind().uses_lp_framing())
                 .unwrap_or(false);
-            let egress_bytes = match ctx.out_pit_tokens.get(i).and_then(|t| t.clone()) {
-                Some(token) => encode_lp_with_headers(
-                    &data_bytes,
-                    &LpHeaders {
-                        pit_token: Some(token),
-                        congestion_mark: None,
-                        incoming_face_id: None,
-                        next_hop_face_id: None,
-                        cache_policy: None,
-                    },
-                ),
-                None if uses_lp => ndn_packet::lp::encode_lp_packet(&data_bytes),
-                None => data_bytes.clone(),
+            let incoming_face_id =
+                (uses_lp && self.local_fields_enabled(*face_id)).then_some(if ctx.cs_hit {
+                    FaceId::CONTENT_STORE.0
+                } else {
+                    ctx.face_id.0
+                });
+            let intent = EgressIntent {
+                headers: LpHeaders {
+                    pit_token: ctx.out_pit_tokens.get(i).and_then(|t| t.clone()),
+                    incoming_face_id,
+                    ..Default::default()
+                },
+                nack: None,
             };
-            let egress_len = egress_bytes.len() as u64;
             if let Some(state) = self.face_states.get(face_id) {
                 state.counters.out_data.fetch_add(1, Ordering::Relaxed);
-                state
-                    .counters
-                    .out_bytes
-                    .fetch_add(egress_len, Ordering::Relaxed);
                 // `NSatisfiedInterests` credits the in-face of the original
                 // Interest, which here is the egress face for returning Data
                 // (PIT match populated `out_faces` from `in_record_faces`).
@@ -222,7 +246,8 @@ impl PacketDispatcher {
                     .in_satisfied_interests
                     .fetch_add(1, Ordering::Relaxed);
             }
-            self.enqueue_send(*face_id, egress_bytes).await;
+            self.enqueue_send(*face_id, data_bytes.clone(), intent)
+                .await;
         }
     }
 }
@@ -259,7 +284,11 @@ mod tests {
 
     async fn enqueue_with_state(state: &FaceState, data: Bytes) {
         use web_time::Instant;
-        let item = (data, FaceId::INVALID);
+        let item = (
+            data,
+            FaceId::INVALID,
+            crate::engine::EgressIntent::default(),
+        );
         match state.congestion_policy {
             CongestionPolicy::Drop => match state.send_tx.try_send(item) {
                 Ok(()) => {}

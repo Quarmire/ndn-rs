@@ -74,30 +74,26 @@ impl FaceLifecycleContext for EngineDiscoveryContext {
         let (send_tx, send_rx) = mpsc::channel(DEFAULT_SEND_QUEUE_CAP);
         let cancel = self.cancel.child_token();
 
-        #[cfg(feature = "face-net")]
-        let state = if kind == ndn_transport::FaceKind::Udp {
-            FaceState::new_reliable(
-                cancel.clone(),
-                FacePersistency::OnDemand,
-                send_tx,
-                congestion_policy,
-                ndn_transport::DEFAULT_UDP_MTU,
-            )
-        } else {
-            FaceState::new(
-                cancel.clone(),
-                FacePersistency::OnDemand,
-                send_tx,
-                congestion_policy,
-            )
-        };
-        #[cfg(not(feature = "face-net"))]
         let state = FaceState::new(
             cancel.clone(),
             FacePersistency::OnDemand,
             send_tx,
             congestion_policy,
         );
+        // Discovery UDP links use NDNLPv2 reliability. Enable the per-face
+        // reliability feature (canonical TxSequence + Ack + retx, the same path
+        // faces/update toggles) and mirror it in the FaceFlags bitmap so
+        // faces/list reports it.
+        #[cfg(feature = "face-net")]
+        if kind == ndn_transport::FaceKind::Udp {
+            let _ = face
+                .link_service
+                .apply(ndn_transport::FaceOption::LpReliability(true));
+            state.apply_face_flags_mask(
+                ndn_transport::BIT_LP_RELIABILITY,
+                ndn_transport::BIT_LP_RELIABILITY,
+            );
+        }
         inner.face_states.insert(face_id, state);
         inner.face_table.insert_arc(Arc::clone(&face));
 
@@ -230,7 +226,11 @@ impl DiscoveryContext for EngineDiscoveryContext {
         if let Some(state) = inner.face_states.get(&face_id) {
             // Discovery beacons are locally produced; `FaceId::INVALID`
             // marks them as having no upstream source.
-            let _ = state.send_tx.try_send((pkt, FaceId::INVALID));
+            let _ = state.send_tx.try_send((
+                pkt,
+                FaceId::INVALID,
+                crate::engine::EgressIntent::default(),
+            ));
         }
     }
 

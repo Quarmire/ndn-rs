@@ -173,8 +173,9 @@ impl LinkService for PassthroughLinkService {
 /// fragmentation, and the per-frame feature pipeline.
 pub struct LpLinkService {
     pub reliability: Option<ReliabilityConfig>,
-    /// Surface in-process originator id as NDNLPv2 `IncomingFaceId` on egress.
-    pub local_fields_enabled: bool,
+    // NDNLPv2 LocalFields (IncomingFaceId) live in the engine layer
+    // (`FaceState.flags`, read by the dispatcher), not here — there is no
+    // link-service-side `local_fields_enabled` flag.
     /// Monotonic fragmentation sequence; each oversized packet claims one
     /// sequence and emits N consecutive LP fragments under it.
     fragment_seq: AtomicU64,
@@ -191,7 +192,6 @@ impl LpLinkService {
         let set = features::default_features_for_network_face();
         Self {
             reliability: None,
-            local_fields_enabled: false,
             fragment_seq: AtomicU64::new(0),
             features: set.features,
             reliability_feature: set.reliability,
@@ -212,7 +212,6 @@ impl LpLinkService {
         }
         Self {
             reliability: Some(reliability),
-            local_fields_enabled: false,
             fragment_seq: AtomicU64::new(0),
             features,
             reliability_feature,
@@ -242,7 +241,9 @@ impl Default for LpLinkService {
 impl LinkService for LpLinkService {
     /// Encodes Interest/Data in an `LpPacket`, fragmenting to the
     /// transport's MTU. Already-LP input passes through unchanged.
-    /// `source` is dropped on the wire unless `local_fields_enabled`.
+    /// `source` is unused here: the in-proc tag-bag carries it for IPC faces,
+    /// and the dispatcher attaches NDNLPv2 `IncomingFaceId` on LP egress when
+    /// the face has LocalFields enabled (`FaceState.flags`).
     fn send<'a>(
         &'a self,
         transport: &'a dyn ErasedTransport,
@@ -339,7 +340,9 @@ impl LinkService for LpLinkService {
         FaceOptions {
             lp_reliability: self.reliability_feature.is_enabled(),
             congestion_marking: self.congestion_marking_feature.is_enabled(),
-            local_fields: self.local_fields_enabled,
+            // local_fields is engine-layer state (FaceState.flags); the
+            // link service does not track it. Left at default (false) here —
+            // faces/list reports the truth from the FaceState flags bitmap.
             base_congestion_marking_interval: Some(
                 self.congestion_marking_feature.base_cong_interval(),
             ),

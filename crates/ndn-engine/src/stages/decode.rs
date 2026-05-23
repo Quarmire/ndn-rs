@@ -54,15 +54,31 @@ pub struct TlvDecodeStage {
     /// Per-face ingress option overrides. Missing entries fall back to
     /// `FaceOptions::default_for_kind` (local computes, network skips).
     face_options: DashMap<FaceId, FaceOptions>,
+    /// Engine face state, read to gate privileged ingress local fields
+    /// (NextHopFaceId) on the ingress face's `LocalFields` option.
+    face_states: Arc<DashMap<FaceId, crate::engine::FaceState>>,
 }
 
 impl TlvDecodeStage {
-    pub fn new(face_table: Arc<FaceTable>) -> Self {
+    pub fn new(
+        face_table: Arc<FaceTable>,
+        face_states: Arc<DashMap<FaceId, crate::engine::FaceState>>,
+    ) -> Self {
         Self {
             face_table,
             reassembly: DashMap::new(),
             face_options: DashMap::new(),
+            face_states,
         }
+    }
+
+    /// Whether the ingress face opted into NDNLPv2 LocalFields. Gates
+    /// acceptance of privileged ingress fields (NextHopFaceId), mirroring
+    /// NFD's `allowLocalFields` check.
+    fn ingress_local_fields(&self, face_id: FaceId) -> bool {
+        self.face_states
+            .get(&face_id)
+            .is_some_and(|s| s.local_fields_enabled())
     }
 
     /// Override the ingress options for `face_id`, taking precedence over
@@ -224,7 +240,17 @@ impl TlvDecodeStage {
             ctx.lp_pit_token = Some(token);
         }
         if let Some(face_id) = lp.next_hop_face_id {
-            ctx.tags.insert(NextHopFaceId(face_id));
+            // NextHopFaceId is a privileged local field: honour it only from a
+            // face that opted into LocalFields, mirroring NFD's GenericLinkService
+            // which DROPs NextHopFaceId unless `allowLocalFields`
+            // (generic-link-service.cpp:362-370). Without the gate any
+            // unprivileged remote peer could steer forwarding by injecting it.
+            if self.ingress_local_fields(ctx.face_id) {
+                ctx.tags.insert(NextHopFaceId(face_id));
+            } else {
+                trace!(target: t::FACE_LP, face=%ctx.face_id,
+                    "decode: NextHopFaceId from face without LocalFields, ignoring");
+            }
         }
         if let Some(ref policy) = lp.cache_policy {
             ctx.tags.insert(LpCachePolicy(*policy));
@@ -279,6 +305,13 @@ impl TlvDecodeStage {
                     }
                     ctx.name = Some(nack.interest.name.clone());
                     ctx.packet = DecodedPacket::Nack(Box::new(nack));
+                    // NFD NInNacks: count Nacks received on the ingress face
+                    // (LinkService::receiveNack, link-service.cpp:103).
+                    if let Some(s) = self.face_states.get(&ctx.face_id) {
+                        s.counters
+                            .in_nacks
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                     if let Some(drop) = self.check_scope(&ctx) {
                         return drop;
                     }
@@ -333,7 +366,7 @@ mod d01_tests {
     /// Decode stage decrements HopLimit before passing Interests downstream.
     #[test]
     fn d01_decode_stage_decrements_hop_limit() {
-        let stage = TlvDecodeStage::new(empty_face_table());
+        let stage = TlvDecodeStage::new(empty_face_table(), Arc::new(DashMap::new()));
         let name: Name = "/audit/d01".parse().unwrap();
         let wire = InterestBuilder::new(name).hop_limit(7).sign_digest_sha256();
 
@@ -353,7 +386,7 @@ mod d01_tests {
 
     #[test]
     fn d01_decode_stage_drops_when_hop_limit_zero() {
-        let stage = TlvDecodeStage::new(empty_face_table());
+        let stage = TlvDecodeStage::new(empty_face_table(), Arc::new(DashMap::new()));
         let name: Name = "/audit/d01-zero".parse().unwrap();
         let wire = InterestBuilder::new(name).hop_limit(0).sign_digest_sha256();
 
@@ -369,7 +402,7 @@ mod d01_tests {
         use ndn_packet::Name;
         use ndn_packet::encode::InterestBuilder;
 
-        let stage = TlvDecodeStage::new(empty_face_table());
+        let stage = TlvDecodeStage::new(empty_face_table(), Arc::new(DashMap::new()));
         let name: Name = "/audit/g09".parse().unwrap();
         let interest_wire = InterestBuilder::new(name).sign_digest_sha256();
         assert!(
@@ -418,7 +451,7 @@ mod d01_tests {
 
     #[test]
     fn d01_decode_stage_no_hop_limit_passes_through() {
-        let stage = TlvDecodeStage::new(empty_face_table());
+        let stage = TlvDecodeStage::new(empty_face_table(), Arc::new(DashMap::new()));
         let name: Name = "/audit/d01-none".parse().unwrap();
         let wire = ndn_packet::encode::encode_interest(&name, None);
 
@@ -485,7 +518,7 @@ mod content_sha256_tests {
     fn decode_stage_with_face(face_id: FaceId, kind: FaceKind) -> (TlvDecodeStage, Arc<FaceTable>) {
         let face_table = Arc::new(FaceTable::new());
         face_table.insert(MockFace { id: face_id, kind });
-        let stage = TlvDecodeStage::new(Arc::clone(&face_table));
+        let stage = TlvDecodeStage::new(Arc::clone(&face_table), Arc::new(DashMap::new()));
         (stage, face_table)
     }
 

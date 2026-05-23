@@ -39,8 +39,12 @@ pub enum RtoStrategy {
     #[default]
     Rfc6298,
     Quic,
-    MinRtt { margin_us: u64 },
-    Fixed { rto_us: u64 },
+    MinRtt {
+        margin_us: u64,
+    },
+    Fixed {
+        rto_us: u64,
+    },
 }
 
 /// Per-face reliability configuration. Presets: `default()` (RFC 6298),
@@ -240,36 +244,6 @@ impl LpReliability {
         }
 
         wires
-    }
-
-    /// Track an already-LP-wrapped wire for retransmission without re-encoding.
-    /// Allocates a fresh TxSequence for bookkeeping but does not inject it
-    /// into `wire`; the receiver won't Ack via the canonical NDNLPv2 path and
-    /// retx fires until `max_retries`. For spec-canonical behaviour use
-    /// [`Self::on_send`].
-    pub fn on_send_track(&mut self, wire: &Bytes) {
-        let now = Instant::now();
-        let tx_seq = self.next_tx_seq;
-        self.next_tx_seq += 1;
-
-        while self.unacked.len() >= self.max_unacked {
-            if let Some(&oldest_seq) = self.unacked.keys().min() {
-                self.unacked.remove(&oldest_seq);
-            } else {
-                break;
-            }
-        }
-
-        self.unacked.insert(
-            tx_seq,
-            UnackedEntry {
-                wire: wire.clone(),
-                first_sent: now,
-                last_sent: now,
-                retx_count: 0,
-                is_retx: false,
-            },
-        );
     }
 
     pub fn on_receive(&mut self, raw: &[u8]) {

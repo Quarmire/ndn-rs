@@ -86,6 +86,19 @@ pub trait ContentStore: Send + Sync + 'static {
 
     fn set_capacity(&self, _max_bytes: usize) {}
 
+    /// NFD CS `cs/config` Admit (BIT 0): when false, `insert` is a no-op.
+    /// Default true.
+    fn admit_enabled(&self) -> bool {
+        true
+    }
+    /// NFD CS `cs/config` Serve (BIT 1): when false, `get` returns `None`
+    /// (the CS does not satisfy Interests from cache). Default true.
+    fn serve_enabled(&self) -> bool {
+        true
+    }
+    fn set_admit(&self, _enabled: bool) {}
+    fn set_serve(&self, _enabled: bool) {}
+
     fn variant_name(&self) -> &str {
         "unknown"
     }
@@ -131,6 +144,10 @@ pub trait ErasedContentStore: Send + Sync + 'static {
 
     fn capacity(&self) -> CsCapacity;
     fn set_capacity(&self, max_bytes: usize);
+    fn admit_enabled(&self) -> bool;
+    fn serve_enabled(&self) -> bool;
+    fn set_admit(&self, enabled: bool);
+    fn set_serve(&self, enabled: bool);
     fn len(&self) -> usize;
     fn is_empty(&self) -> bool;
     fn current_bytes(&self) -> usize;
@@ -176,6 +193,19 @@ impl<T: ContentStore> ErasedContentStore for T {
 
     fn set_capacity(&self, max_bytes: usize) {
         ContentStore::set_capacity(self, max_bytes)
+    }
+
+    fn admit_enabled(&self) -> bool {
+        ContentStore::admit_enabled(self)
+    }
+    fn serve_enabled(&self) -> bool {
+        ContentStore::serve_enabled(self)
+    }
+    fn set_admit(&self, enabled: bool) {
+        ContentStore::set_admit(self, enabled)
+    }
+    fn set_serve(&self, enabled: bool) {
+        ContentStore::set_serve(self, enabled)
     }
 
     fn len(&self) -> usize {

@@ -71,6 +71,39 @@ impl ReliabilityFeature {
         }
         retx
     }
+
+    /// Canonically frame a bare network packet for reliable egress: assign a
+    /// `TxSequence`, piggyback any pending Acks, and buffer for retransmission
+    /// (`LpReliability::on_send`). The single egress framer (the per-face send
+    /// loop) calls this — instead of `frame_with_intent` — when reliability is
+    /// enabled. Returns the wire frame(s); empty when disabled.
+    pub fn frame(&self, payload: &[u8]) -> Vec<Bytes> {
+        if !self.is_enabled() {
+            return Vec::new();
+        }
+        self.state.lock().unwrap().on_send(payload)
+    }
+
+    /// Standalone Ack frame for received reliable frames not yet piggybacked,
+    /// pumped on the retx tick alongside [`Self::take_retransmissions`]. `None`
+    /// when disabled or nothing to Ack.
+    pub fn take_acks(&self) -> Option<Bytes> {
+        if !self.is_enabled() {
+            return None;
+        }
+        self.state.lock().unwrap().flush_acks()
+    }
+
+    /// Feed inbound wire bytes so peer Acks clear tracked entries and received
+    /// reliable frames queue an Ack. For the discovery `inject_packet` recv
+    /// path, which does not run the LinkService feature pipeline; the socket
+    /// recv path drives the same state via [`LinkServiceFeature::on_ingress`].
+    pub fn note_receive(&self, raw: &[u8]) {
+        if !self.is_enabled() {
+            return;
+        }
+        self.state.lock().unwrap().on_receive(raw);
+    }
 }
 
 impl Default for ReliabilityFeature {
@@ -84,18 +117,11 @@ impl LinkServiceFeature for ReliabilityFeature {
         "reliability"
     }
 
-    /// Only LP-wrapped frames enter the unacked map; non-LP frames
-    /// (passthrough Nacks built upstream) are ignored.
-    fn on_egress(&self, frame: &mut OutboundLpFrame, _ctx: &EgressCtx) {
-        if !self.is_enabled() {
-            return;
-        }
-        if !frame.is_lp_wrapped {
-            return;
-        }
-        let mut s = self.state.lock().unwrap();
-        s.on_send_track(&frame.wire);
-    }
+    /// Reliable egress framing happens in the send loop ([`Self::frame`], which
+    /// assigns a `TxSequence`), not here — by `on_egress` time the wire is
+    /// already framed (or a retransmission). No-op; the feature stays in the
+    /// pipeline only for `on_ingress` (Ack consumption on socket faces).
+    fn on_egress(&self, _frame: &mut OutboundLpFrame, _ctx: &EgressCtx) {}
 
     fn on_ingress(&self, frame: &InboundLpFrame, _ctx: &IngressCtx) {
         if !self.is_enabled() {
@@ -112,9 +138,7 @@ pub type SharedReliabilityFeature = Arc<ReliabilityFeature>;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::FaceId;
     use crate::reliability::{ReliabilityConfig, RtoStrategy};
-    use ndn_packet::lp::encode_lp_packet;
     use std::thread;
     use std::time::Duration;
 
@@ -146,12 +170,11 @@ mod tests {
         let f = ReliabilityFeature::with_config(config);
         f.set_enabled(true);
 
-        let lp_wire = encode_lp_packet(&bare_interest());
-        let mut frame = OutboundLpFrame::new(lp_wire, true);
-        let ctx = EgressCtx::new(FaceId(1), None);
-
+        // Canonical egress framing: each `frame` call assigns a TxSequence and
+        // buffers the wire for retransmission.
         for _ in 0..3 {
-            f.on_egress(&mut frame, &ctx);
+            let frames = f.frame(&bare_interest());
+            assert_eq!(frames.len(), 1, "small packet → one reliable frame");
         }
 
         thread::sleep(Duration::from_millis(20));
@@ -166,10 +189,8 @@ mod tests {
     #[test]
     fn reliability_feature_disabled_is_inert() {
         let f = ReliabilityFeature::new();
-        let lp_wire = encode_lp_packet(&bare_interest());
-        let mut frame = OutboundLpFrame::new(lp_wire, true);
-        let ctx = EgressCtx::new(FaceId(2), None);
-        f.on_egress(&mut frame, &ctx);
+        // Disabled: `frame` returns nothing and tracks nothing.
+        assert!(f.frame(&bare_interest()).is_empty());
 
         thread::sleep(Duration::from_millis(20));
         let retx = f.take_retransmissions();

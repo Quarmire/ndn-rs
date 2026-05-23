@@ -50,14 +50,6 @@ pub(crate) async fn run_face_reader(
                 | FaceKind::Management,
         );
 
-    #[cfg(feature = "face-net")]
-    let has_reliability = face_states
-        .get(&face_id)
-        .map(|s| s.reliability.is_some())
-        .unwrap_or(false);
-    #[cfg(not(feature = "face-net"))]
-    let has_reliability = false;
-
     loop {
         let result = tokio::select! {
             biased;            _ = cancel.cancelled() => break,
@@ -66,14 +58,8 @@ pub(crate) async fn run_face_reader(
         match result {
             Ok((raw, src_addr)) => {
                 trace!(target: t::FACE_SYSTEM, face=%face_id, len=raw.len(), "face-reader: recv");
-
-                #[cfg(feature = "face-net")]
-                if has_reliability
-                    && let Some(state) = face_states.get(&face_id)
-                    && let Some(rel) = state.reliability.as_ref()
-                {
-                    rel.lock().unwrap().on_receive(&raw);
-                }
+                // Reliability Ack-consumption for socket faces runs inside
+                // `link_service.recv` (the feature's `on_ingress`).
 
                 let arrival = SystemTime::now()
                     .duration_since(UNIX_EPOCH)

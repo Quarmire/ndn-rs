@@ -32,6 +32,13 @@ pub struct FaceId(pub u64);
 
 impl FaceId {
     pub const INVALID: FaceId = FaceId(u64::MAX);
+
+    /// Reserved id reported as NDNLPv2 `IncomingFaceId` on Data answered from
+    /// the Content Store rather than a real ingress face. Mirrors NFD's
+    /// `face::FACEID_CONTENT_STORE` (`NFD/daemon/face/face-common.hpp`), which
+    /// `onContentStoreHit` stamps so a `LocalFields` consumer can tell a cache
+    /// hit from a producer reply.
+    pub const CONTENT_STORE: FaceId = FaceId(254);
 }
 
 impl core::fmt::Display for FaceId {
@@ -240,7 +247,10 @@ fn host_is_loopback(uri: &str) -> bool {
     let host = if let Some(rest) = authority.strip_prefix('[') {
         rest.split(']').next().unwrap_or(rest)
     } else {
-        authority.rsplit_once(':').map(|(h, _)| h).unwrap_or(authority)
+        authority
+            .rsplit_once(':')
+            .map(|(h, _)| h)
+            .unwrap_or(authority)
     };
     if host.eq_ignore_ascii_case("localhost") {
         return true;
@@ -457,11 +467,23 @@ mod tests {
     #[test]
     fn scope_policy_partitions_kinds() {
         assert_eq!(FaceKind::Shm.scope_policy(), ScopePolicy::AlwaysLocal);
-        assert_eq!(FaceKind::Management.scope_policy(), ScopePolicy::AlwaysLocal);
-        assert_eq!(FaceKind::Ethernet.scope_policy(), ScopePolicy::AlwaysNonLocal);
-        assert_eq!(FaceKind::Multicast.scope_policy(), ScopePolicy::AlwaysNonLocal);
+        assert_eq!(
+            FaceKind::Management.scope_policy(),
+            ScopePolicy::AlwaysLocal
+        );
+        assert_eq!(
+            FaceKind::Ethernet.scope_policy(),
+            ScopePolicy::AlwaysNonLocal
+        );
+        assert_eq!(
+            FaceKind::Multicast.scope_policy(),
+            ScopePolicy::AlwaysNonLocal
+        );
         assert_eq!(FaceKind::Udp.scope_policy(), ScopePolicy::ByRemoteAddress);
-        assert_eq!(FaceKind::WebTransport.scope_policy(), ScopePolicy::ByRemoteAddress);
+        assert_eq!(
+            FaceKind::WebTransport.scope_policy(),
+            ScopePolicy::ByRemoteAddress
+        );
     }
 
     #[test]

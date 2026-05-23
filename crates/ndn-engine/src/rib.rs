@@ -135,26 +135,89 @@ impl Rib {
         affected
     }
 
-    pub fn apply_to_fib(&self, prefix: &Name, fib: &Fib) {
-        let Some(entry) = self.routes.get(prefix) else {
-            fib.set_nexthops(prefix, Vec::new());
-            return;
-        };
+    /// Effective FIB nexthops for `prefix`, honouring route flags. A prefix
+    /// gets a FIB entry only if it has its own RIB routes; that entry is then
+    /// augmented with routes inherited from ancestors carrying
+    /// `CHILD_INHERIT` — unless `prefix`, or a nearer ancestor, carries
+    /// `CAPTURE`, which blocks inheritance from above it. Per face, an own
+    /// route takes precedence over an inherited one. (Pure-inheritance to
+    /// unregistered prefixes is handled by FIB longest-prefix match.)
+    fn effective_nexthops(&self, prefix: &Name) -> Vec<FibNexthop> {
+        // Route-flag bits (ndn_config::control_parameters::route_flags;
+        // ndn-cxx nfd-constants.hpp): CHILD_INHERIT=1, CAPTURE=2.
+        const CHILD_INHERIT: u64 = 1;
+        const CAPTURE: u64 = 2;
 
-        let mut best: HashMap<FaceId, (u32, u64)> = HashMap::new();
-        for route in entry.iter() {
-            let e = best.entry(route.face_id).or_insert((u32::MAX, u64::MAX));
-            if route.cost < e.0 || (route.cost == e.0 && route.origin < e.1) {
-                *e = (route.cost, route.origin);
+        let Some(own_entry) = self.routes.get(prefix) else {
+            return Vec::new();
+        };
+        // Best own cost per face (ties → lowest origin), and whether this
+        // prefix captures (blocks inheriting from ancestors).
+        let mut best_own: HashMap<FaceId, (u32, u64)> = HashMap::new();
+        let mut own_captures = false;
+        for r in own_entry.iter() {
+            own_captures |= r.flags & CAPTURE != 0;
+            let e = best_own.entry(r.face_id).or_insert((u32::MAX, u64::MAX));
+            if r.cost < e.0 || (r.cost == e.0 && r.origin < e.1) {
+                *e = (r.cost, r.origin);
+            }
+        }
+        drop(own_entry);
+
+        // Inherited: walk strict ancestors nearest→farthest, collecting
+        // CHILD_INHERIT routes; stop after a capturing ancestor.
+        let mut best_inh: HashMap<FaceId, u32> = HashMap::new();
+        if !own_captures {
+            for n in (0..prefix.len()).rev() {
+                let anc = Name::from_components(prefix.components()[..n].iter().cloned());
+                let Some(routes) = self.routes.get(&anc) else {
+                    continue;
+                };
+                let mut anc_captures = false;
+                for r in routes.iter() {
+                    anc_captures |= r.flags & CAPTURE != 0;
+                    if r.flags & CHILD_INHERIT != 0 {
+                        let e = best_inh.entry(r.face_id).or_insert(u32::MAX);
+                        if r.cost < *e {
+                            *e = r.cost;
+                        }
+                    }
+                }
+                if anc_captures {
+                    break;
+                }
             }
         }
 
-        let nexthops: Vec<FibNexthop> = best
-            .into_iter()
-            .map(|(face_id, (cost, _))| FibNexthop { face_id, cost })
+        let mut nexthops: Vec<FibNexthop> = best_own
+            .iter()
+            .map(|(face_id, (cost, _))| FibNexthop {
+                face_id: *face_id,
+                cost: *cost,
+            })
             .collect();
+        for (face_id, cost) in best_inh {
+            if !best_own.contains_key(&face_id) {
+                nexthops.push(FibNexthop { face_id, cost });
+            }
+        }
+        nexthops
+    }
 
-        fib.set_nexthops(prefix, nexthops);
+    /// Recompute the FIB for `prefix` **and every RIB descendant** — a change
+    /// to a `CHILD_INHERIT`/`CAPTURE` route at `prefix` changes what its
+    /// more-specific RIB entries inherit.
+    pub fn apply_to_fib(&self, prefix: &Name, fib: &Fib) {
+        fib.set_nexthops(prefix, self.effective_nexthops(prefix));
+        let descendants: Vec<Name> = self
+            .routes
+            .iter()
+            .map(|e| e.key().clone())
+            .filter(|k| k != prefix && k.has_prefix(prefix))
+            .collect();
+        for d in descendants {
+            fib.set_nexthops(&d, self.effective_nexthops(&d));
+        }
     }
 
     /// Flush RIB routes via `face_id` and recompute affected FIB entries.
@@ -270,6 +333,83 @@ mod tests {
         let entries = rib.dump();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].1[0].face_id, FaceId(2));
+    }
+
+    fn nn(s: &str) -> Name {
+        s.parse().unwrap()
+    }
+
+    fn flagged(face_id: u64, cost: u32, flags: u64) -> RibRoute {
+        RibRoute {
+            face_id: FaceId(face_id),
+            origin: 255,
+            cost,
+            flags,
+            expires_at: None,
+        }
+    }
+
+    fn faces_at(fib: &Fib, name: &str) -> Vec<u64> {
+        let mut v: Vec<u64> = fib
+            .lpm(&nn(name))
+            .map(|e| e.nexthops.iter().map(|h| h.face_id.0).collect())
+            .unwrap_or_default();
+        v.sort_unstable();
+        v
+    }
+
+    #[test]
+    fn child_inherit_propagates_to_descendant_rib_entry() {
+        const CHILD_INHERIT: u64 = 1;
+        let rib = Rib::new();
+        let fib = Fib::new();
+        // /a → face1 (CHILD_INHERIT); /a/b → face2 (plain).
+        rib.add(&nn("/a"), flagged(1, 10, CHILD_INHERIT));
+        rib.add(&nn("/a/b"), flagged(2, 10, 0));
+        rib.apply_to_fib(&nn("/a"), &fib);
+        rib.apply_to_fib(&nn("/a/b"), &fib);
+
+        assert_eq!(faces_at(&fib, "/a"), vec![1], "/a → its own face");
+        // /a/b inherits /a's CHILD_INHERIT route on top of its own.
+        assert_eq!(
+            faces_at(&fib, "/a/b"),
+            vec![1, 2],
+            "/a/b must inherit face1 from /a plus its own face2"
+        );
+    }
+
+    #[test]
+    fn capture_blocks_inheritance() {
+        const CHILD_INHERIT: u64 = 1;
+        const CAPTURE: u64 = 2;
+        let rib = Rib::new();
+        let fib = Fib::new();
+        // /a → face1 (CHILD_INHERIT); /a/b → face2 (CAPTURE).
+        rib.add(&nn("/a"), flagged(1, 10, CHILD_INHERIT));
+        rib.add(&nn("/a/b"), flagged(2, 10, CAPTURE));
+        rib.apply_to_fib(&nn("/a"), &fib);
+
+        assert_eq!(
+            faces_at(&fib, "/a/b"),
+            vec![2],
+            "CAPTURE at /a/b must block inheriting face1 from /a"
+        );
+    }
+
+    #[test]
+    fn plain_ancestor_route_is_not_inherited() {
+        let rib = Rib::new();
+        let fib = Fib::new();
+        // /a → face1 (no CHILD_INHERIT); /a/b → face2.
+        rib.add(&nn("/a"), flagged(1, 10, 0));
+        rib.add(&nn("/a/b"), flagged(2, 10, 0));
+        rib.apply_to_fib(&nn("/a"), &fib);
+
+        assert_eq!(
+            faces_at(&fib, "/a/b"),
+            vec![2],
+            "without CHILD_INHERIT, /a's route is not pushed into /a/b"
+        );
     }
 
     #[test]
