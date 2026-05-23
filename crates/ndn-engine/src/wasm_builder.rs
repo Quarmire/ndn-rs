@@ -296,6 +296,9 @@ impl WasmEngineBuilder {
                 face_table: Arc::clone(&face_table),
                 enrichers: self.enrichers,
                 runtime: Arc::clone(&runtime),
+                network_region: Arc::new(crate::stages::strategy::NetworkRegionTable::new(
+                    self.config.network_region.clone(),
+                )),
             },
             pit_match: PitMatchStage {
                 pit: Arc::clone(&pit),

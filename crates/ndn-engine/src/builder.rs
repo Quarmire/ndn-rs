@@ -53,6 +53,11 @@ pub struct EngineConfig {
     /// Reflexive-forwarding defaults (enabled / per-face cap / lifetime). The
     /// values are runtime-mutable afterwards via the `reflexive` mgmt module.
     pub reflexive: crate::reflexive::ReflexiveConfig,
+    /// Producer-region prefixes for NDNLPv2 ForwardingHint handling
+    /// (NFD NetworkRegionTable). An Interest whose forwarding hint reaches one
+    /// of these regions has its hint stripped; otherwise it is forwarded toward
+    /// the hint's delegation name. Empty (default) = no local producer region.
+    pub network_region: Vec<ndn_packet::Name>,
 }
 
 pub use crate::replay_guard_config::ReplayGuardConfig;
@@ -65,6 +70,7 @@ impl Default for EngineConfig {
             pipeline_threads: 0,
             replay_guard: ReplayGuardConfig::default(),
             reflexive: crate::reflexive::ReflexiveConfig::default(),
+            network_region: Vec::new(),
         }
     }
 }
@@ -414,6 +420,9 @@ impl EngineBuilder {
                 face_table: Arc::clone(&face_table),
                 enrichers: self.enrichers,
                 runtime: Arc::clone(&runtime),
+                network_region: Arc::new(crate::stages::strategy::NetworkRegionTable::new(
+                    self.config.network_region.clone(),
+                )),
             },
             pit_match: PitMatchStage {
                 pit: Arc::clone(&pit),

@@ -57,6 +57,29 @@ pub(crate) fn next_hop_override(
     }
 }
 
+/// Producer-region prefixes for NDNLPv2 ForwardingHint handling — the
+/// NFD `NetworkRegionTable`. Empty = this forwarder hosts no producer region,
+/// so a hinted Interest is always forwarded toward its hint.
+#[derive(Default)]
+pub struct NetworkRegionTable {
+    regions: Vec<Name>,
+}
+
+impl NetworkRegionTable {
+    pub fn new(regions: Vec<Name>) -> Self {
+        Self { regions }
+    }
+
+    /// True if any delegation in the hint reaches (is a prefix of) a producer
+    /// region — `NetworkRegionTable::isInProducerRegion`. At that point NFD
+    /// strips the hint and forwards by the Interest name.
+    pub fn is_in_producer_region(&self, hint: &[Arc<Name>]) -> bool {
+        self.regions
+            .iter()
+            .any(|region| hint.iter().any(|deleg| region.has_prefix(deleg)))
+    }
+}
+
 pub struct StrategyStage {
     pub strategy_table: Arc<StrategyTable<dyn ErasedStrategy>>,
     pub default_strategy: Arc<dyn ErasedStrategy>,
@@ -66,6 +89,33 @@ pub struct StrategyStage {
     pub face_table: Arc<ndn_transport::FaceTable>,
     pub enrichers: Vec<Arc<dyn ContextEnricher>>,
     pub runtime: Arc<dyn ndn_runtime::Runtime>,
+    pub network_region: Arc<NetworkRegionTable>,
+}
+
+impl StrategyStage {
+    /// NDNLPv2 ForwardingHint: the FIB lookup name. Normally the Interest name,
+    /// but when the Interest carries a forwarding hint that has not yet reached
+    /// a producer region, forward toward the hint's delegation name instead
+    /// (NFD `onIncomingInterest`). The PIT still keys on the Interest name.
+    fn fib_lookup_name(&self, ctx: &PacketContext, interest_name: &Name) -> Name {
+        let DecodedPacket::Interest(i) = &ctx.packet else {
+            return interest_name.clone();
+        };
+        let Some(hint) = i.forwarding_hint() else {
+            return interest_name.clone();
+        };
+        if hint.is_empty() || self.network_region.is_in_producer_region(hint) {
+            return interest_name.clone();
+        }
+        // Forward toward the first delegation that resolves in the FIB; if none
+        // do, use the first delegation (the lookup misses → NoRoute).
+        for deleg in hint {
+            if self.fib.lpm(deleg).is_some() {
+                return deleg.as_ref().clone();
+            }
+        }
+        hint[0].as_ref().clone()
+    }
 }
 
 impl StrategyStage {
@@ -94,7 +144,10 @@ impl StrategyStage {
             NextHopOverride::None => {}
         }
 
-        let fib_entry_arc = self.fib.lpm(&name);
+        // ForwardingHint: FIB lookup may target the hint's delegation rather
+        // than the Interest name (the PIT still keys on the Interest name).
+        let fib_name = self.fib_lookup_name(&ctx, &name);
+        let fib_entry_arc = self.fib.lpm(&fib_name);
         let fib_entry_ref = fib_entry_arc.as_deref();
 
         if let Some(e) = fib_entry_ref {
