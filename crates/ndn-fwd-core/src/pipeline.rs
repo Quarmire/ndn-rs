@@ -27,6 +27,21 @@ pub enum DropReason {
     SplitHorizon,
 }
 
+/// A single forwarding action a strategy asks the shell to enact for an
+/// Interest. A strategy's output is a list of these (an empty list = suppress).
+/// The shared sans-IO vocabulary: the core decides *what* to send and *when*;
+/// the I/O shell (native runtime or embedded tick loop) performs the send and
+/// owns the timer. `delay_ms` is relative; a shell without a scheduler may
+/// degrade `After` to an immediate send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForwardAction<F> {
+    /// Forward to `face` now.
+    Now(F),
+    /// Forward to `face` after `delay_ms`, unless suppressed (cancelled by
+    /// overhearing the same Interest) before the timer fires.
+    After(F, u32),
+}
+
 /// What to do with an incoming Interest, decided post-decode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InterestDecision<F> {
