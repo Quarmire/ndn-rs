@@ -9,10 +9,9 @@
 
 use ndn_abe::{
     aw11_authgen, aw11_decrypt, aw11_encrypt, aw11_global_setup, aw11_keygen, bsw_keygen,
-    bsw_setup, decrypt, encrypt, master_params_hash, AbeCiphertext, AbeSchemeId,
-    CIPHERTEXT_SCHEMA_VERSION,
+    bsw_setup, decrypt, encrypt, AbeCiphertext, AbeSchemeId, CIPHERTEXT_SCHEMA_VERSION,
 };
-use ndn_foundation_types::{Name, TlvDecode, TlvEncode};
+use ndn_foundation_types::{Hash, Name, TlvDecode, TlvEncode};
 use ndn_packet::{encode::encode_data_digest_sha256, Data};
 
 /// Round-trip an `AbeCiphertext` through a signed Data packet and return the
@@ -34,7 +33,7 @@ fn cpabe_ciphertext_rides_signed_data_and_policy_gates() {
     let policy = ndn_abe::PolicyExpr::parse("dept:eng AND clearance:high").unwrap();
     let kgc_name: Name = "/example/kgc".parse().unwrap();
     let (mp, ms) = bsw_setup().unwrap();
-    let hash = master_params_hash(&mp.public_key_bytes);
+    let hash = Hash::of(&mp.public_key_bytes);
 
     let plaintext = b"one-to-many payload under a policy";
     let ct = encrypt(&policy, plaintext, &(kgc_name, hash, mp.clone())).unwrap();

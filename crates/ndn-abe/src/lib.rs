@@ -58,21 +58,6 @@ pub use scheme::{
 
 use ndn_foundation_types::{Hash, Name};
 
-/// SHA-256 over `bytes`, producing the [`Hash`] used as a
-/// [`KgcRef::master_params_hash`]. A producer hashes the KGC's published
-/// master-params payload so consumers can match the parameters they fetch.
-///
-/// (We compute this here rather than via `Hash::of` because that constructor is
-/// gated behind a foundation-types feature that does not build in this
-/// workspace; see this crate's `Cargo.toml`.)
-pub fn master_params_hash(bytes: &[u8]) -> Hash {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(bytes);
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&digest);
-    Hash::from_bytes(out)
-}
-
 /// ABE scheme discriminator.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum AbeSchemeId {
@@ -128,7 +113,7 @@ mod tests {
     fn setup_kgc(name: &str) -> (Name, Hash, BswMasterParams, BswMasterSecret) {
         let kgc_name: Name = name.parse().unwrap();
         let (mp, ms) = bsw_setup().unwrap();
-        let hash = master_params_hash(&mp.public_key_bytes);
+        let hash = Hash::of(&mp.public_key_bytes);
         (kgc_name, hash, mp, ms)
     }
 

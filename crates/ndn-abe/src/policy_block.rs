@@ -172,7 +172,7 @@ mod tests {
             policy_source: "role:doctor".to_string(),
             kgc_refs: vec![KgcRef {
                 kgc_did: "/hospital/kgc".parse().unwrap(),
-                master_params_hash: crate::master_params_hash(b"params-hash"),
+                master_params_hash: Hash::of(b"params-hash"),
             }],
         };
         assert_eq!(payload, round_trip(payload.clone()));
@@ -196,8 +196,8 @@ mod tests {
             scheme: AbeSchemeId::LewkoWaters,
             policy_source: "ROLE:DOCTOR and DEPT:CARDIOLOGY".to_string(),
             kgc_refs: vec![
-                KgcRef { kgc_did: "/hospital/kgc-1".parse().unwrap(), master_params_hash: crate::master_params_hash(b"kgc1") },
-                KgcRef { kgc_did: "/licensing/kgc-2".parse().unwrap(), master_params_hash: crate::master_params_hash(b"kgc2") },
+                KgcRef { kgc_did: "/hospital/kgc-1".parse().unwrap(), master_params_hash: Hash::of(b"kgc1") },
+                KgcRef { kgc_did: "/licensing/kgc-2".parse().unwrap(), master_params_hash: Hash::of(b"kgc2") },
             ],
         };
         assert_eq!(payload, round_trip(payload.clone()));

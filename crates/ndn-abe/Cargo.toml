@@ -13,14 +13,9 @@ license.workspace = true
 classification = "extension"
 
 [dependencies]
-# NOTE: foundation-types' `std` feature is intentionally NOT enabled — it does
-# not compile standalone in this workspace (its `extern crate alloc` is gated to
-# `not(std)`). The parts we use (Name, codec traits, the `Hash` newtype) are all
-# alloc-only, so we depend on it default-features=false and compute SHA-256 here
-# via `sha2` directly (see `master_params_hash`).
-ndn-foundation-types = { workspace = true }
+# `std` gives us `Hash::of` (SHA-256) for KGC master-params hashing.
+ndn-foundation-types = { workspace = true, features = ["std"] }
 ndn-tlv              = { workspace = true, features = ["std"] }
-sha2                 = { workspace = true }
 thiserror            = { workspace = true }
 serde                = { workspace = true, features = ["derive"] }
 bincode              = { workspace = true }

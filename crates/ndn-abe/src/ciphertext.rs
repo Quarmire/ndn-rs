@@ -229,7 +229,7 @@ mod tests {
             policy_source: "role:doctor AND dept:cardiology".into(),
             kgc_refs: vec![KgcRef {
                 kgc_did: "/hospital/kgc".parse().unwrap(),
-                master_params_hash: crate::master_params_hash(b"params"),
+                master_params_hash: Hash::of(b"params"),
             }],
             rabe_ciphertext_bytes: Bytes::from_static(b"fake_rabe_bytes"),
         }
