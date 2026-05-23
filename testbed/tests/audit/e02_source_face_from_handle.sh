@@ -64,9 +64,11 @@ grep -q 'source_face: Some(source)' "$FACE_LOCAL" \
 grep -q 'pub async fn recv_tagged' "$FACE_LOCAL" \
     || fail "InProcHandle has no recv_tagged accessor"
 
-# 4. Dispatcher uses enqueue_send_with_source on the Forward branch.
-grep -q 'enqueue_send_with_source(\*face_id, egress_bytes, ctx.face_id)' "$OUT" \
-    || fail "dispatcher Forward branch does not pass ctx.face_id through"
+# 4. Dispatcher passes the ingress face id (ctx.face_id) as the egress source
+#    on the Forward branch. Since the egress-framing unification the call spans
+#    multiple lines (bare payload + EgressIntent), so match within the call.
+grep -A4 'self.enqueue_send_with_source(' "$OUT" | grep -q 'ctx.face_id' \
+    || fail "dispatcher Forward branch does not pass ctx.face_id through as source"
 
 # 5. Mgmt handler reads source via the tag bag.
 grep -q 'handle.recv_tagged()' "$MGMT" \
@@ -74,12 +76,15 @@ grep -q 'handle.recv_tagged()' "$MGMT" \
 grep -qE 'tagged(\.|\s*\.\s*\n?\s*)source_face|source_face\s*=\s*tagged' "$MGMT" \
     || fail "mgmt handler does not read source_face from the tag bag"
 
-# 6. The retired LP-IncomingFaceId-on-LocalFieldsEnabled branch is gone.
-if grep -q 'incoming_face_id: Some(ctx.face_id' "$OUT"; then
-    fail "dispatcher still LP-wraps with IncomingFaceId on local fields"
-fi
+# 6. Mgmt source-provenance does NOT ride LP IncomingFaceId. Any
+#    IncomingFaceId the dispatcher attaches is gated on the per-face
+#    LocalFields flag (NFD `encodeLpFields` parity — proven positively by
+#    x02_incoming_face_id_local_fields.sh), and mount_management never
+#    force-enables that flag for its own provenance needs.
+grep -q 'local_fields_enabled' "$OUT" \
+    || fail "dispatcher attaches IncomingFaceId without a LocalFields gate"
 if grep -q 'engine.set_local_fields(face_id, true)' "$MGMT"; then
-    fail "mount_management still opts into LocalFieldsEnabled (no longer needed)"
+    fail "mount_management still opts into LocalFieldsEnabled (provenance rides the tag-bag)"
 fi
 
 cargo build --release --bin ndn-fwd --quiet 2>&1 | tail -3 \
