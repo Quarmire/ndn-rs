@@ -35,6 +35,8 @@ pub mod reflexive;
 pub mod replay_guard_config;
 pub mod rib;
 pub mod routing;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod signals_driver;
 pub mod stages;
 #[cfg(target_arch = "wasm32")]
 pub mod wasm_builder;

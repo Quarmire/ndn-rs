@@ -82,6 +82,7 @@ pub struct EngineBuilder {
     strategy: Option<Arc<dyn ErasedStrategy>>,
     security: Option<Arc<SecurityManager>>,
     enrichers: Vec<Arc<dyn ContextEnricher>>,
+    signal_sources: Vec<Box<dyn ndn_signal_sources::SignalSource<ndn_transport::FaceId>>>,
     cs: Option<Arc<dyn ErasedContentStore>>,
     admission: Option<Arc<dyn CsAdmissionPolicy>>,
     cs_observer: Option<Arc<dyn CsObserver>>,
@@ -106,6 +107,7 @@ impl EngineBuilder {
             strategy: None,
             security: None,
             enrichers: Vec::new(),
+            signal_sources: Vec::new(),
             cs: None,
             admission: None,
             cs_observer: None,
@@ -260,7 +262,19 @@ impl EngineBuilder {
         self
     }
 
-    pub async fn build(self) -> Result<(ForwarderEngine, ShutdownHandle)> {
+    /// Register a cross-layer [`SignalSource`](ndn_signal_sources::SignalSource)
+    /// (radio metrics, GPS, …). The engine spawns a background task that polls
+    /// every registered source on its cadence and pushes readings into the
+    /// shared `SignalsTable`, which strategies read via `StrategyContext::signals`.
+    pub fn signal_source(
+        mut self,
+        source: Box<dyn ndn_signal_sources::SignalSource<ndn_transport::FaceId>>,
+    ) -> Self {
+        self.signal_sources.push(source);
+        self
+    }
+
+    pub async fn build(mut self) -> Result<(ForwarderEngine, ShutdownHandle)> {
         let fib = Arc::new(Fib::new());
         let rib = Arc::new(Rib::new());
         let pit = Arc::new(Pit::new());
@@ -318,6 +332,22 @@ impl EngineBuilder {
                     rib_clone,
                     fib_clone,
                     reflexive_clone,
+                    cancel_clone,
+                    runtime_clone,
+                )
+                .await;
+            });
+        }
+
+        if !self.signal_sources.is_empty() {
+            let sources = std::mem::take(&mut self.signal_sources);
+            let signals_clone = Arc::clone(&signals);
+            let cancel_clone = cancel.clone();
+            let runtime_clone = Arc::clone(&runtime);
+            tasks.spawn(async move {
+                crate::signals_driver::run_signal_sources(
+                    sources,
+                    signals_clone,
                     cancel_clone,
                     runtime_clone,
                 )
