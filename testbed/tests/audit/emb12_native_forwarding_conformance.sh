@@ -40,6 +40,9 @@ grep -rqE 'decide_interest_matches_conformance_vectors' "$CRATE_DIR/src" 2>/dev/
 if [ -f "$NATIVE_TEST" ]; then
     grep -qE 'INTEREST_DECISION_CASES' "$NATIVE_TEST" || { echo "FAIL: native test ignores shared vectors" >&2; fail=1; }
     grep -qE 'EngineBuilder' "$NATIVE_TEST" || { echo "FAIL: native test does not build a real engine" >&2; fail=1; }
+    # Data-path pin: satisfy → consumer, unsolicited → drop.
+    grep -qE 'native_data_satisfies_pit_to_consumer' "$NATIVE_TEST" || { echo "FAIL: native test lacks Data satisfy pin" >&2; fail=1; }
+    grep -qE 'native_unsolicited_data_dropped' "$NATIVE_TEST" || { echo "FAIL: native test lacks unsolicited-Data pin" >&2; fail=1; }
 fi
 
 # (c) both pins pass.
