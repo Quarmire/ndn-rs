@@ -7,7 +7,10 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 #![allow(missing_docs)]
 
-#[cfg(not(feature = "std"))]
+// `alloc` is named unconditionally: `name.rs` and `key_locator.rs` use
+// `alloc::` paths in both configs. Unlike `std`/`core`, the bare `alloc` crate
+// is not in the extern prelude, so it must be declared even when `std` is on
+// (where it is otherwise harmless).
 extern crate alloc;
 
 pub mod codec;
