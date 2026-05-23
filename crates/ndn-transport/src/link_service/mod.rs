@@ -536,6 +536,24 @@ mod tests {
     }
 
     #[test]
+    fn congestion_params_apply_and_snapshot() {
+        // faces/update routes BaseCongestionMarkingInterval / DefaultCongestionThreshold
+        // here; the values must take effect and be reported in the snapshot.
+        let ls = LpLinkService::new();
+        ls.apply(FaceOption::BaseCongestionMarkingInterval(
+            std::time::Duration::from_micros(50_000),
+        ))
+        .unwrap();
+        ls.apply(FaceOption::DefaultCongestionThreshold(4321)).unwrap();
+        let snap = ls.snapshot();
+        assert_eq!(
+            snap.base_congestion_marking_interval,
+            Some(std::time::Duration::from_micros(50_000))
+        );
+        assert_eq!(snap.default_congestion_threshold, Some(4321));
+    }
+
+    #[test]
     fn default_link_service_matches_framing() {
         // Wire kinds (incl. WS/WT/WebRTC) frame with NDNLPv2.
         for kind in [

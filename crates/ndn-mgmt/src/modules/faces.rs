@@ -972,6 +972,20 @@ fn faces_update(
         }
     }
 
+    // CongestionMarking value parameters (runtime-mutable, like NFD's
+    // BaseCongestionMarkingInterval / DefaultCongestionThreshold). Surfaced on
+    // faces/list; ignored by transports without a congestion-marking feature.
+    if let Some(us) = params.base_cong_interval {
+        let _ = target.link_service.apply(FaceOption::BaseCongestionMarkingInterval(
+            std::time::Duration::from_micros(us),
+        ));
+    }
+    if let Some(threshold) = params.def_cong_threshold {
+        let _ = target
+            .link_service
+            .apply(FaceOption::DefaultCongestionThreshold(threshold));
+    }
+
     let mut applied_mtu: Option<u64> = None;
     let old_mtu_hint = target.transport.send_mtu().map(|n| n as u64);
     if let Some(mtu) = params.mtu {

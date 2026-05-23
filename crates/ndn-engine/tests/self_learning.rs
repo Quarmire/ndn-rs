@@ -69,6 +69,7 @@ fn use_self_learning(engine: &ndn_engine::ForwarderEngine) {
 /// caller can inspect the FIB. `self_learning` chooses the gate.
 async fn run_announcement_flow(
     self_learning: bool,
+    pa: Bytes,
 ) -> (ndn_engine::ForwarderEngine, ndn_engine::ShutdownHandle) {
     let (fc, hc) = InProcFace::new(FaceId(CONSUMER), 128);
     let (fnb, hnb) = InProcFace::new(FaceId(NEIGHBOR), 128);
@@ -92,23 +93,49 @@ async fn run_announcement_flow(
     let _ = recv_timeout(&hnb).await;
 
     let data = DataBuilder::new("/carrier/d", b"x").sign_digest_sha256();
-    let wire = data_with_prefix_announcement(&data, &pa_for("/learned"));
+    let wire = data_with_prefix_announcement(&data, &pa);
     hnb.send(wire).await.unwrap();
     let _ = recv_timeout(&hc).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
     (engine, shutdown)
 }
 
+fn learned_route_present(engine: &ndn_engine::ForwarderEngine) -> bool {
+    engine
+        .fib()
+        .lpm(&"/learned".parse().unwrap())
+        .is_some_and(|e| e.nexthops.iter().any(|h| h.face_id == FaceId(NEIGHBOR)))
+}
+
+/// A PrefixAnnouncement signed by an Ed25519 key with no trust anchor — the
+/// engine validator cannot establish trust, so it must not install a route.
+async fn untrusted_ed25519_pa(prefix: &str) -> Bytes {
+    use ndn_security::Signer;
+    let name: Name = prefix.parse().unwrap();
+    let pa_name = name
+        .append_component(NameComponent::keyword(Bytes::from_static(b"PA")))
+        .append_version(1);
+    let key_name: Name = "/untrusted/KEY/k1".parse().unwrap();
+    let signer = ndn_security::Ed25519Signer::from_seed(&[7u8; 32], key_name.clone());
+    DataBuilder::new(pa_name, b"")
+        .sign(
+            ndn_packet::SignatureType::SignatureEd25519,
+            Some(&key_name),
+            move |region: &[u8]| {
+                let owned = region.to_vec();
+                async move { signer.sign(&owned).await.unwrap() }
+            },
+        )
+        .await
+}
+
 /// Self-learning + a validated PrefixAnnouncement → a route is installed toward
 /// the announcing (neighbor) face.
 #[tokio::test]
 async fn validated_announcement_installs_route() {
-    let (engine, shutdown) = run_announcement_flow(true).await;
-    let entry = engine.fib().lpm(&"/learned".parse().unwrap());
+    let (engine, shutdown) = run_announcement_flow(true, pa_for("/learned")).await;
     assert!(
-        entry
-            .as_ref()
-            .is_some_and(|e| e.nexthops.iter().any(|h| h.face_id == FaceId(NEIGHBOR))),
+        learned_route_present(&engine),
         "self-learning must install a /learned route toward the neighbor face"
     );
     shutdown.shutdown().await;
@@ -118,10 +145,38 @@ async fn validated_announcement_installs_route() {
 /// PrefixAnnouncement is ignored — no route is installed.
 #[tokio::test]
 async fn non_self_learning_strategy_ignores_announcement() {
-    let (engine, shutdown) = run_announcement_flow(false).await;
+    let (engine, shutdown) = run_announcement_flow(false, pa_for("/learned")).await;
     assert!(
-        engine.fib().lpm(&"/learned".parse().unwrap()).is_none(),
+        !learned_route_present(&engine),
         "without the self-learning strategy, a PrefixAnnouncement installs no route"
+    );
+    shutdown.shutdown().await;
+}
+
+/// Security: a PrefixAnnouncement with a corrupted signature fails validation,
+/// so no route is installed (the validation gate is enforced, not bypassed).
+#[tokio::test]
+async fn tampered_announcement_installs_no_route() {
+    let mut pa = pa_for("/learned").to_vec();
+    let n = pa.len();
+    pa[n - 1] ^= 0xFF; // corrupt the trailing SignatureValue byte
+    let (engine, shutdown) = run_announcement_flow(true, Bytes::from(pa)).await;
+    assert!(
+        !learned_route_present(&engine),
+        "a PrefixAnnouncement that fails validation must install no route"
+    );
+    shutdown.shutdown().await;
+}
+
+/// Security: a PrefixAnnouncement signed by an untrusted key (no trust anchor)
+/// does not validate, so no route is installed.
+#[tokio::test]
+async fn untrusted_announcement_installs_no_route() {
+    let pa = untrusted_ed25519_pa("/learned").await;
+    let (engine, shutdown) = run_announcement_flow(true, pa).await;
+    assert!(
+        !learned_route_present(&engine),
+        "a PrefixAnnouncement signed by an untrusted key must install no route"
     );
     shutdown.shutdown().await;
 }
