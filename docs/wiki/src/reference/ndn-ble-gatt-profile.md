@@ -152,10 +152,10 @@ MAY omit it.
 
 | Element | Location |
 |---|---|
-| Profile constants, listener, per-central faces | `crates/spec/ndn-faces/src/l2/bluetooth/` |
-| Framing codec + detection | `crates/spec/ndn-faces/src/l2/bluetooth/framing.rs` |
+| Profile constants, listener, per-central faces | `crates/ndn-faces/src/l2/bluetooth/` |
+| Framing codec + detection | `crates/ndn-faces/src/l2/bluetooth/framing.rs` |
 | Native central (Linux `bluer`, macOS/Windows `btleplug`) | `…/bluetooth/central/` |
-| Browser central (Web Bluetooth) | `crates/extension/ndn-face-webble/` |
+| Browser central (Web Bluetooth) | `crates/ndn-face-webble/` |
 
 See [Face transports → Bluetooth LE](./face-transports.md#bluetooth-le) for the
 operator-facing `ble://` / `[listeners.ble]` surface.

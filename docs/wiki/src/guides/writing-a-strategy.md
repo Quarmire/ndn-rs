@@ -6,7 +6,7 @@ guide walks through writing a third-party strategy, registering it,
 and pinning it under a prefix.
 
 The trait surface is [Extend tier → Strategy](../api/extend.md#strategy);
-the contract lives at `crates/spec/ndn-strategy/src/strategy.rs:7`.
+the contract lives at `crates/ndn-strategy/src/strategy.rs:7`.
 
 ## When to write a strategy
 
@@ -15,7 +15,7 @@ the contract lives at `crates/spec/ndn-strategy/src/strategy.rs:7`.
 - You're researching strategy behaviour and want a measurement
   fixture under your control.
 - You're building a sandboxed strategy (WASM); see
-  `crates/spec/ndn-wasm-strategy/`.
+  `crates/ndn-wasm-strategy/`.
 
 For everything else the built-ins (`BestRouteStrategy`,
 `MulticastStrategy`, `ComposedStrategy`) are usually correct.
@@ -86,7 +86,7 @@ longest-prefix-match strategy for each Interest.
 - `ctx.schedule(at, event)` — wake up at a future time with an event.
 - `ctx.measurements()` — read/write per-prefix measurement state.
 
-The full surface is in `crates/spec/ndn-strategy/src/context.rs`.
+The full surface is in `crates/ndn-strategy/src/context.rs`.
 
 ## Testing
 
@@ -113,11 +113,11 @@ implementation).
 
 Read these for working templates:
 
-- `crates/spec/ndn-strategy/src/best_route.rs` — probe primary, fall
+- `crates/ndn-strategy/src/best_route.rs` — probe primary, fall
   back to alternates on NACK/timeout. Demonstrates `schedule()`.
-- `crates/spec/ndn-strategy/src/multicast.rs` — fan out to every
+- `crates/ndn-strategy/src/multicast.rs` — fan out to every
   matching nexthop.
-- `crates/spec/ndn-strategy/src/composed.rs` — chain strategies by
+- `crates/ndn-strategy/src/composed.rs` — chain strategies by
   prefix.
 
 ## WASM strategies
@@ -125,7 +125,7 @@ Read these for working templates:
 A WASM strategy is compiled to `wasm32-unknown-unknown` and loaded
 at runtime via `ndn-wasm-strategy`. The same `Strategy` trait
 applies; the loader handles the host/guest boundary. See
-`crates/spec/ndn-wasm-strategy/` for the host API and
+`crates/ndn-wasm-strategy/` for the host API and
 `examples/wasm-strategy/` for a guest example.
 
 ## Conventions

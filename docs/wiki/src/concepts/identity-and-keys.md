@@ -23,7 +23,7 @@ IndexedDB-backed PIB in the browser. The opened keychain knows the
 host's identities, their keys, and any certificates that have been
 imported.
 
-`KeyChain` lives at `crates/spec/ndn-security/src/keychain.rs`. The
+`KeyChain` lives at `crates/ndn-security/src/keychain.rs`. The
 Develop tier re-exports it as `ndn::KeyChain`.
 
 ## Identities
@@ -83,7 +83,7 @@ let info = SigningInfo::sha256_digest();
 
 A `SigningInfo` resolves to a `SignerSelection` inside the
 `KeyChain`. That extra step exists so `TrustPolicy` decisions are
-applied before the bytes are signed. See `crates/spec/ndn-security/src/keychain.rs:143`
+applied before the bytes are signed. See `crates/ndn-security/src/keychain.rs:143`
 for the resolution path.
 
 ## Trust policies
@@ -149,5 +149,5 @@ The receiving side calls `keychain.import_safebag(&bytes, passphrase)`.
   catalog with rule shapes.
 - [Develop tier → KeyChain](../api/develop.md#keychain) — full API
   surface.
-- `crates/spec/ndn-security/` — implementation; the trait surfaces
+- `crates/ndn-security/` — implementation; the trait surfaces
   are in `trust.rs`, `validation_policy.rs`, `keychain.rs`.

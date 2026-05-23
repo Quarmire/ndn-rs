@@ -495,7 +495,7 @@ To add `did:ndn` to the DIF Universal Resolver (https://dev.uniresolver.io/):
 The reference implementation of the `did:ndn` method lives in the
 `ndn-security` crate's `did` module in this repository:
 
-- **Module:** `crates/spec/ndn-security/src/did/` (`ndn_security::did`)
+- **Module:** `crates/ndn-security/src/did/` (`ndn_security::did`)
 - **Repository:** https://github.com/ndn-rs/ndn-rs
 - **Key types:** `UniversalResolver`, `DidDocument`, `DidError`
 - **Key functions:** `name_to_did`, `did_to_name`, `cert_to_did_document`

@@ -64,7 +64,7 @@ tokio-console
 
 The forwarder exposes the console listener on `127.0.0.1:6669` by
 default. Useful for diagnosing stuck strategies and pipeline
-backpressure. See `crates/spec/ndn-engine/Cargo.toml` for the
+backpressure. See `crates/ndn-engine/Cargo.toml` for the
 feature gate.
 
 ## OpenTelemetry (NDN-native)
@@ -87,7 +87,7 @@ Project memory `feedback_dioxus_ndn_native` records why.
 NDNLPv2 carries an optional TraceContext field (Phase-3 work). When
 present, the strategy stamps it into outbound packets, enabling
 cross-router span linkage. The wire inject/extract lives in
-`crates/spec/ndn-engine/src/`; downstream forwarders honour and
+`crates/ndn-engine/src/`; downstream forwarders honour and
 propagate it.
 
 ## Recipes
@@ -103,7 +103,7 @@ propagate it.
 
 ## See also
 
-- `crates/spec/ndn-engine/src/observability/` — target definitions.
+- `crates/ndn-engine/src/observability/` — target definitions.
 - [Performance](./performance.md) — when high log levels hurt
   throughput.
 - [ndn-fwd](./ndn-fwd.md) — runtime log filter via mgmt.

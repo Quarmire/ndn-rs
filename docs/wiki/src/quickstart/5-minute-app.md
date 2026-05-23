@@ -43,7 +43,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 That's the 5-minute path. The crate `ndn-rs-prelude` exposes itself
 as the library `ndn`, so `use ndn::...` reads cleanly even though
 Cargo.toml names the dependency by its longer form. See
-`crates/spec/ndn-rs-prelude/Cargo.toml` for the package/library
+`crates/ndn-rs-prelude/Cargo.toml` for the package/library
 split.
 
 ## What just happened

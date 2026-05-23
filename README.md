@@ -56,7 +56,7 @@ substrate — a forwarder engine plus the tools and libraries around it.
 
 | Binary | What it does |
 |---|---|
-| [`ndn-fwd`](binaries/spec/ndn-fwd) | The forwarder daemon. |
+| [`ndn-fwd`](binaries/ndn-fwd) | The forwarder daemon. |
 | [`ndn-ctl`](binaries/tooling/ndn-tools) | Management CLI (NFD-compatible). |
 | [`ndn-peek`, `ndn-put`, `ndn-ping`](binaries/tooling/ndn-tools) | Operator utilities. |
 | [`ndn-sec`](binaries/tooling/ndn-tools) | Identity / key / cert management. |

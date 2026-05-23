@@ -67,7 +67,7 @@ Interest for this name and is still waiting. When a `Data` arrives,
 the PIT entry is consumed: the `Data` is sent out on every recorded
 face, the entry is removed.
 
-ndn-rs's PIT is a `DashMap` (`crates/spec/ndn-engine/src/pit/`). No
+ndn-rs's PIT is a `DashMap` (`crates/ndn-engine/src/pit/`). No
 global lock on the hot path. The PIT entry is consulted via the
 `Pit` accessor from the [Instrument tier](../api/instrument.md).
 
@@ -97,7 +97,7 @@ in the cache, the cached `Data` is returned and the Interest never
 needs to leave the forwarder.
 
 ndn-rs's default Content Store is LRU; the `ContentStore` trait
-allows custom impls. See `crates/spec/ndn-store/`.
+allows custom impls. See `crates/ndn-store/`.
 
 ## Strategy decisions
 

@@ -145,23 +145,23 @@ method on `WasmEngineBuilder` if the face is meant to run in-browser.
 
 | Face | Crate | Transport shape |
 |---|---|---|
-| UDP | `crates/spec/ndn-faces/src/net/udp.rs` | UDP socket per peer. |
-| TCP | `crates/spec/ndn-faces/src/net/tcp.rs` | TCP connection. |
-| Unix | `crates/spec/ndn-faces/src/local/unix.rs` | Local Unix socket. |
-| InProc | `crates/spec/ndn-faces/src/local/in_proc.rs` | In-process channel. |
-| Shm | `crates/spec/ndn-faces/src/local/shm.rs` | Shared-memory ring (spsc-shm). |
-| Ether | `crates/spec/ndn-faces/src/l2/ether.rs` | Raw Ethernet. |
-| Bluetooth | `crates/spec/ndn-faces/src/l2/bluetooth/mod.rs` | BLE L2CAP. |
-| Serial | `crates/spec/ndn-faces/src/serial/mod.rs` | UART. |
-| WebTransport | `crates/extension/ndn-face-webtransport*` | QUIC datagrams. |
-| WebRTC | `crates/extension/ndn-face-webrtc/` | Datachannel. |
-| SharedWorker | `crates/extension/ndn-face-shared-worker/` | Per-origin engine sharing. |
-| BoltFFI | `crates/extension/ndn-boltffi/` | FFI bridge. |
+| UDP | `crates/ndn-faces/src/net/udp.rs` | UDP socket per peer. |
+| TCP | `crates/ndn-faces/src/net/tcp.rs` | TCP connection. |
+| Unix | `crates/ndn-faces/src/local/unix.rs` | Local Unix socket. |
+| InProc | `crates/ndn-faces/src/local/in_proc.rs` | In-process channel. |
+| Shm | `crates/ndn-faces/src/local/shm.rs` | Shared-memory ring (spsc-shm). |
+| Ether | `crates/ndn-faces/src/l2/ether.rs` | Raw Ethernet. |
+| Bluetooth | `crates/ndn-faces/src/l2/bluetooth/mod.rs` | BLE L2CAP. |
+| Serial | `crates/ndn-faces/src/serial/mod.rs` | UART. |
+| WebTransport | `crates/ndn-face-webtransport*` | QUIC datagrams. |
+| WebRTC | `crates/ndn-face-webrtc/` | Datachannel. |
+| SharedWorker | `crates/ndn-face-shared-worker/` | Per-origin engine sharing. |
+| BoltFFI | `crates/ndn-boltffi/` | FFI bridge. |
 
 ## See also
 
 - [Extend tier → Face](../api/extend.md#face) — trait inventory.
 - [Face transports](../reference/face-transports.md) — catalog with
   feature flags and use cases.
-- `crates/spec/ndn-transport/` — `Transport`, `LinkService`, and
+- `crates/ndn-transport/` — `Transport`, `LinkService`, and
   `Face` definitions.

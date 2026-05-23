@@ -2,7 +2,7 @@
 
 > **Status:** ndn-rs-proprietary, experimental TLV range.
 > **TLV-TYPE:** `0x520` (NDNLPv2 experimental).
-> **Reference impl:** [`crates/spec/ndn-packet/src/lp/trace_context.rs`](../../crates/spec/ndn-packet/src/lp/trace_context.rs).
+> **Reference impl:** [`crates/ndn-packet/src/lp/trace_context.rs`](../../crates/ndn-packet/src/lp/trace_context.rs).
 
 A per-hop LP header that carries
 [W3C trace-context](https://w3c.github.io/trace-context-binary/) plus
@@ -103,8 +103,8 @@ out-of-band per the W3C model.
 
 ## Implementation status
 
-- **Codec:** complete (`crates/spec/ndn-packet/src/lp/trace_context.rs`).
-- **Engine inject/extract:** see `crates/spec/ndn-engine/src/` —
+- **Codec:** complete (`crates/ndn-packet/src/lp/trace_context.rs`).
+- **Engine inject/extract:** see `crates/ndn-engine/src/` —
   the strategy stage stamps it on outbound packets when configured.
 - **SDK / bridge:** [`binaries/tooling/ndn-otel-bridge`](../../binaries/tooling/ndn-otel-bridge)
   consumes the codec and exports spans through the OpenTelemetry

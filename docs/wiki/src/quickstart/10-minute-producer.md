@@ -32,7 +32,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 ```
 
 `publish_object` is the RDR-shaped publish verb in
-`crates/spec/ndn-app/src/producer.rs`. It signs the `Data` with the
+`crates/ndn-app/src/producer.rs`. It signs the `Data` with the
 default identity from the `KeyChain`, registers the name prefix with
 the forwarder, and serves the segmented object on demand.
 

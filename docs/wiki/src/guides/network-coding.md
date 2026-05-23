@@ -1,6 +1,6 @@
 # Network coding (FEC)
 
-`ndn-coding` (`crates/extension/ndn-coding`) adds end-to-end forward error
+`ndn-coding` (`crates/ndn-coding`) adds end-to-end forward error
 correction over named Data. A producer publishes K source + (N−K) parity
 segments per generation; a consumer recovers the payload once any K of the
 N segments arrive. Every coded segment is an ordinary named, signed Data

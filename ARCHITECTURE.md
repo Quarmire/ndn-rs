@@ -15,10 +15,10 @@ NDN-RS models Named Data Networking as **composable async pipelines with trait-b
 
 ## Scope policy
 
-Every crate in the workspace lives in one of four buckets, visible
-in the directory tree (`crates/{spec,extension,tooling,draft}/`)
-and recorded in each crate's `Cargo.toml` `[package.metadata.scope]`
-field:
+Every crate in the workspace has one of four scope buckets, recorded
+in each crate's `Cargo.toml` `[package.metadata.scope]` field. `spec`
+and `extension` crates live flat under `crates/`; `tooling/` and
+`draft/` remain as subdirectories:
 
 - **`spec`** — implements an authoritative NDN community spec
   (Packet Format v0.3, NFD architecture, NDNCERT 0.3, did:ndn,
@@ -40,12 +40,15 @@ workspace-level lint.
 
 ## Crate Map
 
-Crates are organised by **scope**.
-The dependency-direction rule: `draft` → `tooling` → `extension` →
-`spec`. A `spec` crate may not depend on anything to its right.
+Crates are organised by **scope**, recorded per crate in
+`[package.metadata.scope] classification` (all crates live flat under
+`crates/`; the former `spec/` and `extension/` directories were removed).
+The dependency-direction rule still holds: `draft` → `tooling` →
+`extension` → `spec`. A `spec`-scope crate may not depend on anything to
+its right.
 
 ```
-crates/spec/                    NDN community specs implemented faithfully
+scope = spec   (flat under crates/)   NDN community specs implemented faithfully
   ndn-tlv                       TlvReader, TlvWriter, varu64 — no_std
   ndn-foundation-types          Name, NameComponent, canonical Ord — shared with downstream NDN-stack crates
   ndn-packet                    Interest, Data, Nack (Packet Format v0.3) — lazy decode, no_std
@@ -71,7 +74,7 @@ crates/spec/                    NDN community specs implemented faithfully
   ndn-cert                      NDNCERT 0.3 — INFO/NEW/CHALLENGE + IssuancePolicy hook + challenge attestations
   ndn-identity                  Bridges KeyChain + DID + NDNCERT
 
-crates/extension/               Pragmatic engineering, no NDN spec basis
+scope = extension   (flat under crates/)   Pragmatic engineering, no NDN spec basis
   ndn-runtime                   Spawn/Sleep/Now trait abstraction; TokioRuntime / WasmRuntime
   ndn-acme                      ACME (RFC 8555) DNS-01 for the WT listener
   ndn-config                    TOML config + NFD management protocol
@@ -103,9 +106,8 @@ crates/tooling/                 Operator-facing tools and shared tool libs
 crates/draft/                   Author-led, no stability promise
   ndn-research                  FlowObserverStage, FlowTable, ChannelManager (nl80211)
 
-binaries/spec/                  Standalone executable that implements the spec
+binaries/ (flat)                Standalone executables
   ndn-fwd                       The forwarder (NFD-comparable; TOML config, management socket)
-binaries/extension/             Project-specific operator tools
   ndn-fwd-tokens                Invite-token mint + QR codes for onboarding-link UX
 binaries/tooling/               Operator CLIs
   ndn-tools                     ndn-peek, ndn-put, ndn-ping, ndn-iperf, ndn-sec, …
@@ -311,11 +313,11 @@ OTel backends — Interest by trace_id / span_id. PIT aggregation, CS caching,
 NAC, and per-span signing all apply at no extra cost.
 
 The publisher lives in
-[`crates/spec/ndn-observability/`](crates/spec/ndn-observability/); the
+[`crates/ndn-observability/`](crates/ndn-observability/); the
 `tracing::Subscriber` Layer is attached during
-[`init_tracing`](binaries/spec/ndn-fwd/src/tracing_init.rs) when
+[`init_tracing`](binaries/ndn-fwd/src/tracing_init.rs) when
 `[observability] publish_to_ndn = true` in the forwarder TOML. Cross-router
-trace stitching uses the [`TraceContext` LP TLV](crates/spec/ndn-packet/src/lp/trace_context.rs)
+trace stitching uses the [`TraceContext` LP TLV](crates/ndn-packet/src/lp/trace_context.rs)
 (type `0x520`, 33-byte value matching the W3C trace-context binary form
 plus an 8-byte single-hop timestamp); see
 [`docs/wiki/src/operations/opentelemetry.md`](docs/wiki/src/operations/opentelemetry.md)
@@ -340,23 +342,23 @@ Testbed CI runs on push to `testbed/**` and weekly via cron
 ## Browser target
 
 The engine compiles to `wasm32-unknown-unknown` via the
-[`ndn-runtime`](crates/extension/ndn-runtime/) `Spawn`/`Sleep`/`Now` trait
+[`ndn-runtime`](crates/ndn-runtime/) `Spawn`/`Sleep`/`Now` trait
 abstraction. The wasm-safe trait
 shapes used by the engine — `DiscoveryProtocol`, `DiscoveryContext`,
 `NeighborTable`, scope helpers — live in
-[`crates/spec/ndn-discovery-core/`](crates/spec/ndn-discovery-core/);
-[`ndn-discovery`](crates/spec/ndn-discovery/) re-exports them and adds
+[`crates/ndn-discovery-core/`](crates/ndn-discovery-core/);
+[`ndn-discovery`](crates/ndn-discovery/) re-exports them and adds
 the native-only protocols (autoconfig, gossip, ether-ND, probe,
 service-discovery). On wasm `ndn-engine` drops `ndn-security` (pulls
 `ring`) entirely and substitutes a permissive [`ValidationStage`
-stub](crates/spec/ndn-engine/src/stages/validation_stub.rs); the
-[`builder`](crates/spec/ndn-engine/src/builder.rs) is also
+stub](crates/ndn-engine/src/stages/validation_stub.rs); the
+[`builder`](crates/ndn-engine/src/builder.rs) is also
 non-wasm-only, so wasm callers construct `ForwarderEngine`
 programmatically.
 
 The browser-side
 WebTransport client face lives in
-[`crates/extension/ndn-face-webtransport-wasm/`](crates/extension/ndn-face-webtransport-wasm/);
+[`crates/ndn-face-webtransport-wasm/`](crates/ndn-face-webtransport-wasm/);
 the wiki page [`transports/webtransport-browser`](docs/wiki/src/transports/webtransport-browser.md)
 walks through wiring it into a Rust→WASM application. The crate compiles
 on both targets — wasm32 uses `xwt-web` (`web-sys::WebTransport`), other
@@ -367,7 +369,7 @@ can run without a real browser.
 
 | Demo | Crate | Notes |
 | --- | --- | --- |
-| In-browser ndn-rs (Dioxus + WebTransport) | [`crates/tooling/dioxus-demo/`](crates/tooling/dioxus-demo/) | Phase 7: full `ForwarderEngine` (PIT, FIB, CS, dispatcher, pipeline) running in the browser via [`WasmEngineBuilder`](crates/spec/ndn-engine/src/wasm_builder.rs) — same code path as native `ndn-fwd` modulo `ValidationStage::disabled`. Tab-side `BrowserWebTransportFace`; SharedWorker hosts the engine ([Phase 6](docs/wiki/src/transports/shared-worker.md)). Pure Rust→WASM. Witnesses: `testbed/tests/browser/{dioxus_demo,sharedworker_cache_hit}_*.spec.ts`. See [`docs/wiki/src/transports/browser-as-forwarder.md`](docs/wiki/src/transports/browser-as-forwarder.md). |
+| In-browser ndn-rs (Dioxus + WebTransport) | [`crates/tooling/dioxus-demo/`](crates/tooling/dioxus-demo/) | Phase 7: full `ForwarderEngine` (PIT, FIB, CS, dispatcher, pipeline) running in the browser via [`WasmEngineBuilder`](crates/ndn-engine/src/wasm_builder.rs) — same code path as native `ndn-fwd` modulo `ValidationStage::disabled`. Tab-side `BrowserWebTransportFace`; SharedWorker hosts the engine ([Phase 6](docs/wiki/src/transports/shared-worker.md)). Pure Rust→WASM. Witnesses: `testbed/tests/browser/{dioxus_demo,sharedworker_cache_hit}_*.spec.ts`. See [`docs/wiki/src/transports/browser-as-forwarder.md`](docs/wiki/src/transports/browser-as-forwarder.md). |
 
 ## Design Docs
 

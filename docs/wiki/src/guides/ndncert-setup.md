@@ -6,9 +6,9 @@ proof-of-possession); on success the CA signs and returns the cert.
 This guide covers running an NDNCERT CA, joining as a user, and the
 invite-token flow.
 
-The implementation lives in `crates/spec/ndn-cert/`. The CA binary
+The implementation lives in `crates/ndn-cert/`. The CA binary
 is `binaries/tooling/enroll-ndncert/`. Tokens are managed by
-`binaries/extension/ndn-fwd-tokens/`.
+`binaries/ndn-fwd-tokens/`.
 
 ## Run a CA
 
@@ -32,7 +32,7 @@ What this does:
 
 The CA's `IssuancePolicy` decides whether an authenticated
 applicant gets a cert. See
-`crates/spec/ndn-cert/src/issuance_policy.rs`. The default is
+`crates/ndn-cert/src/issuance_policy.rs`. The default is
 `AcceptAllIssuance` — fine for lab deployments, not for production.
 
 ## Join as a user
@@ -92,7 +92,7 @@ single-use or TTL-bounded.
 | `email` | Receives a mail token | Public deployments (with an SMTP-aware adapter). |
 | `acme-dns01` | Wins an ACME DNS-01 challenge | Domain-bound names; see `testbed/tests/audit/acme_dns01.sh`. |
 
-The challenge surface is in `crates/spec/ndn-cert/src/challenge/`.
+The challenge surface is in `crates/ndn-cert/src/challenge/`.
 
 ## Issuance policy
 
@@ -102,7 +102,7 @@ The post-challenge gate. An `IssuancePolicy` impl returns:
 - `Reject(reason)` — refuse, with a human-readable reason.
 - `Defer(callback)` — out-of-band hold (admin approval, etc.).
 
-Built-ins in `crates/spec/ndn-cert/src/issuance_policy.rs`:
+Built-ins in `crates/ndn-cert/src/issuance_policy.rs`:
 `AcceptAllIssuance` (default), `NamespacePolicy`,
 `ChallengeHandler` (three-stage seam recorded in
 `project_f7_issuance_policy`).
@@ -126,7 +126,7 @@ Run as a system service via the docker-compose stack — see
 
 A holder of `cert-N` proves possession of its key to obtain
 `cert-N+1`. The Producer can be configured to auto-renew before
-expiry; see `crates/spec/ndn-cert/src/auto_renew.rs`.
+expiry; see `crates/ndn-cert/src/auto_renew.rs`.
 
 ## Challenge attestations
 
@@ -155,7 +155,7 @@ renders the leaves, and `security/validate` returns them under
 
 The wire shape and the per-handler evidence each leaf carries are
 documented in `docs/ndncert-attestations.md`; see
-`crates/spec/ndn-cert/src/attestation.rs` for the types.
+`crates/ndn-cert/src/attestation.rs` for the types.
 
 ## See also
 
@@ -165,4 +165,4 @@ documented in `docs/ndncert-attestations.md`; see
   consumer checks against the cert chain.
 - [Self-hosting](./self-hosting.md) — running CA and forwarder as
   containers.
-- `crates/spec/ndn-cert/` — implementation and protocol shape.
+- `crates/ndn-cert/` — implementation and protocol shape.

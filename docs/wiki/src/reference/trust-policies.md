@@ -7,7 +7,7 @@ given name. ndn-rs splits this across two traits:
 - `ValidationPolicy` — composition of `TrustPolicy`s with chaining
   and override rules.
 
-Implementations live in `crates/spec/ndn-security/src/`. The
+Implementations live in `crates/ndn-security/src/`. The
 Develop-tier re-exports are listed below.
 
 For the trait surface see
@@ -81,7 +81,7 @@ let trust = LvsTrust::from_schema(&schema)?;
 # Ok(trust) }
 ```
 
-The LVS rule shape is in `crates/spec/ndn-security/src/lvs/`.
+The LVS rule shape is in `crates/ndn-security/src/lvs/`.
 
 ## Writing a custom policy
 
@@ -130,4 +130,4 @@ let validation = ChainedPolicy::new()
 - [NDNCERT setup](../guides/ndncert-setup.md) — issuing the certs
   these policies validate against.
 - [Extend tier](../api/extend.md) — implementing custom policies.
-- `crates/spec/ndn-security/` — the implementation.
+- `crates/ndn-security/` — the implementation.

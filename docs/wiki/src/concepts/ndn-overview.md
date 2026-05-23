@@ -91,7 +91,7 @@ the original producer. This makes NDN naturally multicast: ten
 consumers asking for the same name hit one Data exchange and nine
 cache responses.
 
-ndn-rs's Content Store is `crates/spec/ndn-store/`. It implements
+ndn-rs's Content Store is `crates/ndn-store/`. It implements
 the `ContentStore` trait; the default is an LRU with policy hooks
 for freshness and Must-Be-Fresh handling.
 

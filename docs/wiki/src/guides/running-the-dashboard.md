@@ -118,7 +118,7 @@ not run an open mgmt socket on a network face.
 
 ## See also
 
-- `crates/spec/ndn-dashboard/` — implementation.
+- `crates/ndn-dashboard/` — implementation.
 - [Management verbs](../reference/mgmt-verbs.md) — every verb the
   dashboard issues.
 - [ndn-fwd](../operations/ndn-fwd.md) — forwarder ops.
