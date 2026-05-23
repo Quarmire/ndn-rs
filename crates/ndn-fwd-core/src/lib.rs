@@ -32,3 +32,4 @@ pub mod freshness;
 pub mod lpm;
 pub mod pipeline;
 pub mod store;
+pub mod strategy;
