@@ -551,7 +551,7 @@ async fn did_authorizer_reads_published_trusted_approvers() {
 #[tokio::test]
 async fn canonical_signed_approval_validated_via_schema() {
     use ndn_security::{Certificate, Ed25519Signer, SchemaRule, Signer, TrustSchema, Validator};
-    use ndn_identity::{offer_signed_approval, serve_approve_feed_validated};
+    use ndn_identity::offer_signed_approval;
 
     let (adv_face, adv_handle) = InProcFace::new(FaceId(1), 64);
     let (serve_face, serve_handle) = InProcFace::new(FaceId(2), 64);
@@ -596,12 +596,12 @@ async fn canonical_signed_approval_validated_via_schema() {
     let validator = Arc::new(Validator::new(schema));
     validator.add_trust_anchor(approver_cert);
 
-    let ca = tokio::spawn(serve_approve_feed_validated(
+    // Exercise the ergonomic builder (wraps serve_approve_feed_validated).
+    let ca_feed = ndn_identity::ApprovalFeed::validated(store.clone(), Arc::clone(&validator))
+        .timeout(Duration::from_secs(2));
+    let ca = tokio::spawn(ca_feed.serve(
         Producer::from_handle(serve_handle, feed.clone()),
         Consumer::from_handle(pull_handle),
-        store.clone(),
-        Arc::clone(&validator),
-        Duration::from_secs(2),
     ));
 
     let mut approver = Consumer::from_handle(adv_handle);

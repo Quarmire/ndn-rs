@@ -600,8 +600,7 @@ pub async fn pull_and_validate_approval<S>(
     side: &mut Consumer,
     sink: &S,
     approver_forward: &Interest,
-    cert_name: &str,
-    request_id: &str,
+    pending: &PendingApproval,
     validator: &Validator,
     timeout: Duration,
 ) -> Result<bool, IdentityError>
@@ -612,11 +611,11 @@ where
         IdentityError::Enrollment("approver forward Interest carries no reflexive name".into())
     })?;
     let ask = serde_json::to_vec(&ApprovalAsk {
-        cert_name: cert_name.to_string(),
-        request_id: request_id.to_string(),
+        cert_name: pending.cert_name.clone(),
+        request_id: pending.request_id.clone(),
     })
     .map_err(|e| IdentityError::Enrollment(format!("encode approval ask: {e}")))?;
-    let name = (**reflexive).clone().append("approve");
+    let name = (**reflexive).clone().append(APPROVE_SUFFIX);
     let reverse = side
         .fetch_with(
             InterestBuilder::new(name)
@@ -634,7 +633,7 @@ where
         .map_err(|e| IdentityError::Enrollment(format!("decode approval data: {e}")))?;
 
     // Bind the approval to THIS enrollment (the request_id nonce is in the name).
-    if approval_data_name(cert_name, request_id).as_ref() != Some(&*inner.name) {
+    if approval_data_name(&pending.cert_name, &pending.request_id).as_ref() != Some(&*inner.name) {
         return Ok(false);
     }
 
@@ -646,7 +645,7 @@ where
                 .and_then(|si| si.key_locator_name())
                 .map(|n| n.to_string())
                 .unwrap_or_default();
-            sink.record_validated(request_id, &approver, inner.sig_value().to_vec());
+            sink.record_validated(&pending.request_id, &approver, inner.sig_value().to_vec());
             Ok(true)
         }
         _ => Ok(false),
@@ -682,8 +681,7 @@ where
                         &mut sc,
                         &sink,
                         &interest,
-                        &req.cert_name,
-                        &req.request_id,
+                        &req,
                         &validator,
                         timeout,
                     )
@@ -697,4 +695,57 @@ where
         })
         .await?;
     Ok(())
+}
+
+/// Default per-cycle reverse-pull timeout for [`ApprovalFeed`].
+pub const DEFAULT_APPROVAL_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Ergonomic builder for the canonical (validator-checked) APPROVE-FEED.
+///
+/// Bundles the [`ApprovalSink`] + [`Validator`] + timeout so a caller doesn't
+/// hand-assemble [`serve_approve_feed_validated`]'s arguments:
+///
+/// ```ignore
+/// use std::time::Duration;
+/// ApprovalFeed::validated(store, validator)   // store: impl ApprovalSink, validator: Arc<Validator>
+///     .timeout(Duration::from_secs(5))
+///     .serve(producer, side)                  // producer serves /<ca>/CA/APPROVE-FEED
+///     .await?;
+/// ```
+///
+/// Distinct from [`ApproveFeed`](crate::ApproveFeed), the config struct accepted
+/// by [`NdncertCa::serve_with_feed`](crate::NdncertCa::serve_with_feed) for the
+/// NDNCERT integration; this builder is the standalone, schema-authorized feed.
+pub struct ApprovalFeed<S> {
+    sink: S,
+    validator: Arc<Validator>,
+    timeout: Duration,
+}
+
+impl<S> ApprovalFeed<S>
+where
+    S: ApprovalSink + Clone + Send + Sync + 'static,
+{
+    /// Canonical feed: each approval Data is validated through `validator`
+    /// (signature + certificate chain + trust schema).
+    pub fn validated(sink: S, validator: Arc<Validator>) -> Self {
+        Self {
+            sink,
+            validator,
+            timeout: DEFAULT_APPROVAL_TIMEOUT,
+        }
+    }
+
+    /// Per-cycle reverse-pull timeout (default [`DEFAULT_APPROVAL_TIMEOUT`]).
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// Run the feed until the producer connection closes. `producer` serves the
+    /// APPROVE-FEED prefix; `side` is a *separate* consumer for the reverse pull
+    /// (the producer face is busy receiving forward Interests).
+    pub async fn serve(self, producer: Producer, side: Consumer) -> Result<(), IdentityError> {
+        serve_approve_feed_validated(producer, side, self.sink, self.validator, self.timeout).await
+    }
 }
