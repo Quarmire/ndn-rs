@@ -1,0 +1,36 @@
+[package]
+name = "ndn-abe"
+description = "Attribute-based encryption for NDN content — CP-ABE (BSW) + MA-ABE (AW11) via rabe, with a versioned NDN-TLV ciphertext container."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+# Heavyweight confidentiality extension: std + pairing crypto (rabe/BN-254).
+# A capable-node / producer feature, not the embedded security baseline
+# (baseline = Ed25519 + ChaCha20-Poly1305 in ndn-crypto-core). No adopted
+# community spec for the wire container, so the crate is an `extension`.
+classification = "extension"
+
+[dependencies]
+# NOTE: foundation-types' `std` feature is intentionally NOT enabled — it does
+# not compile standalone in this workspace (its `extern crate alloc` is gated to
+# `not(std)`). The parts we use (Name, codec traits, the `Hash` newtype) are all
+# alloc-only, so we depend on it default-features=false and compute SHA-256 here
+# via `sha2` directly (see `master_params_hash`).
+ndn-foundation-types = { workspace = true }
+ndn-tlv              = { workspace = true, features = ["std"] }
+sha2                 = { workspace = true }
+thiserror            = { workspace = true }
+serde                = { workspace = true, features = ["derive"] }
+bincode              = { workspace = true }
+bytes                = { workspace = true, features = ["std"] }
+tracing              = { workspace = true }
+# rabe 0.4.2: BN-254 curve (rabe-bn); the `serde` feature lets us
+# bincode-serialize the crypto types into the TLV container. BLS12-381 is not
+# available in rabe 0.4 — see the crate-level docs (revisit if rabe stalls).
+rabe                 = { version = "0.4", features = ["serde"] }
+
+[dev-dependencies]
+# Witness: carry the ABE container in the Content of a signed Data packet.
+ndn-packet = { workspace = true, features = ["std"] }
