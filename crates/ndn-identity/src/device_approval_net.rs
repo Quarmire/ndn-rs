@@ -242,9 +242,59 @@ where
 ///
 /// Call this from the APPROVE-FEED producer's serve handler with a *side*
 /// [`Consumer`], then answer `approver_forward` to release the approver.
-pub async fn pull_and_record_approval<R>(
+/// A request currently awaiting approval, as the feed sees it.
+#[derive(Debug, Clone)]
+pub struct PendingApproval {
+    pub request_id: String,
+    pub cert_name: String,
+}
+
+/// Where the cross-device approval transport reads pending requests and records
+/// outcomes. ndncert's [`PendingApprovalStore`] implements it (adapter below).
+///
+/// The transport functions are generic over this trait, so they don't depend on
+/// the concrete ndncert store — other capabilities (capability tokens, the
+/// trust fob) can supply their own sink. This is the seam for a future
+/// `ndn-approve` extraction; see
+/// `.claude/notes/trust-fob-and-cross-device-auth-2026-05-23.md`.
+pub trait ApprovalSink: Send + Sync {
+    /// Requests currently awaiting approval (oldest first).
+    fn pending(&self) -> Vec<PendingApproval>;
+    /// Record a statement-signed approval (trait-authorizer path).
+    fn record_signed(&self, request_id: &str, approver: &str, approver_pubkey: Vec<u8>, signature: Vec<u8>);
+    /// Record a validator-checked approval (canonical path).
+    fn record_validated(&self, request_id: &str, approver: &str, signature: Vec<u8>);
+}
+
+impl ApprovalSink for PendingApprovalStore {
+    fn pending(&self) -> Vec<PendingApproval> {
+        PendingApprovalStore::pending(self)
+            .into_iter()
+            .map(|r| PendingApproval {
+                request_id: r.id,
+                cert_name: r.cert_name,
+            })
+            .collect()
+    }
+
+    fn record_signed(
+        &self,
+        request_id: &str,
+        approver: &str,
+        approver_pubkey: Vec<u8>,
+        signature: Vec<u8>,
+    ) {
+        self.approve_signed(request_id, approver, approver_pubkey, signature);
+    }
+
+    fn record_validated(&self, request_id: &str, approver: &str, signature: Vec<u8>) {
+        self.approve_validated(request_id, approver, signature);
+    }
+}
+
+pub async fn pull_and_record_approval<S, R>(
     side: &mut Consumer,
-    store: &PendingApprovalStore,
+    sink: &S,
     approver_forward: &Interest,
     cert_name: &str,
     request_id: &str,
@@ -252,6 +302,7 @@ pub async fn pull_and_record_approval<R>(
     timeout: Duration,
 ) -> Result<bool, IdentityError>
 where
+    S: ApprovalSink + ?Sized,
     R: Fn(&str) -> Option<Vec<u8>>,
 {
     let hello = parse_hello(approver_forward)?;
@@ -286,7 +337,7 @@ where
     let statement = approval_statement(cert_name, request_id);
     match Ed25519Verifier.verify(&statement, &sig, &pubkey).await {
         Ok(VerifyOutcome::Valid) => {
-            store.approve_signed(request_id, &hello.approver, pubkey, sig);
+            sink.record_signed(request_id, &hello.approver, pubkey, sig);
             Ok(true)
         }
         _ => Ok(false),
@@ -316,16 +367,19 @@ pub async fn resolve_approver_key(resolver: &UniversalResolver, approver: &str) 
 /// and gate on `authorizer` (the `trustedApprovers` check) *before* pulling —
 /// an approver not authorized for `cert_name` is never contacted.
 #[allow(clippy::too_many_arguments)]
-pub async fn pull_and_record_approval_with_resolver(
+pub async fn pull_and_record_approval_with_resolver<S>(
     side: &mut Consumer,
-    store: &PendingApprovalStore,
+    sink: &S,
     approver_forward: &Interest,
     cert_name: &str,
     request_id: &str,
     resolver: &UniversalResolver,
     authorizer: &dyn ApproverAuthorizer,
     timeout: Duration,
-) -> Result<bool, IdentityError> {
+) -> Result<bool, IdentityError>
+where
+    S: ApprovalSink + ?Sized,
+{
     let hello = parse_hello(approver_forward)?;
 
     // Authorization gate: is this approver permitted to approve this name?
@@ -346,7 +400,7 @@ pub async fn pull_and_record_approval_with_resolver(
     };
     pull_and_record_approval(
         side,
-        store,
+        sink,
         approver_forward,
         cert_name,
         request_id,
@@ -402,23 +456,26 @@ where
 ///
 /// Correlation is oldest-pending-first; per-principal scoping arrives with
 /// `trustedApprovers`.
-pub async fn serve_approve_feed(
+pub async fn serve_approve_feed<S>(
     producer: Producer,
     side: Consumer,
-    store: PendingApprovalStore,
+    sink: S,
     resolver: Arc<UniversalResolver>,
     authorizer: Arc<dyn ApproverAuthorizer>,
     timeout: Duration,
-) -> Result<(), IdentityError> {
+) -> Result<(), IdentityError>
+where
+    S: ApprovalSink + Clone + Send + Sync + 'static,
+{
     let side = Arc::new(tokio::sync::Mutex::new(side));
     producer
         .serve(move |interest, responder| {
             let side = Arc::clone(&side);
-            let store = store.clone();
+            let sink = sink.clone();
             let resolver = Arc::clone(&resolver);
             let authorizer = Arc::clone(&authorizer);
             async move {
-                let Some(req) = store.pending().into_iter().next() else {
+                let Some(req) = sink.pending().into_iter().next() else {
                     // Nothing to approve: hold the Interest (drop the responder).
                     return;
                 };
@@ -426,10 +483,10 @@ pub async fn serve_approve_feed(
                     let mut sc = side.lock().await;
                     let _ = pull_and_record_approval_with_resolver(
                         &mut sc,
-                        &store,
+                        &sink,
                         &interest,
                         &req.cert_name,
-                        &req.id,
+                        &req.request_id,
                         &resolver,
                         authorizer.as_ref(),
                         timeout,
@@ -539,15 +596,18 @@ where
 /// On a valid approval whose name binds to `(cert_name, request_id)`, records
 /// it via [`PendingApprovalStore::approve_validated`]. Returns `Ok(true)` when
 /// recorded.
-pub async fn pull_and_validate_approval(
+pub async fn pull_and_validate_approval<S>(
     side: &mut Consumer,
-    store: &PendingApprovalStore,
+    sink: &S,
     approver_forward: &Interest,
     cert_name: &str,
     request_id: &str,
     validator: &Validator,
     timeout: Duration,
-) -> Result<bool, IdentityError> {
+) -> Result<bool, IdentityError>
+where
+    S: ApprovalSink + ?Sized,
+{
     let reflexive = approver_forward.reflexive_name().ok_or_else(|| {
         IdentityError::Enrollment("approver forward Interest carries no reflexive name".into())
     })?;
@@ -586,7 +646,7 @@ pub async fn pull_and_validate_approval(
                 .and_then(|si| si.key_locator_name())
                 .map(|n| n.to_string())
                 .unwrap_or_default();
-            store.approve_validated(request_id, approver, inner.sig_value().to_vec());
+            sink.record_validated(request_id, &approver, inner.sig_value().to_vec());
             Ok(true)
         }
         _ => Ok(false),
@@ -596,31 +656,34 @@ pub async fn pull_and_validate_approval(
 /// CA-side APPROVE-FEED loop using the canonical [`pull_and_validate_approval`]
 /// (trust-schema authorization). Mirrors [`serve_approve_feed`] but takes a
 /// [`Validator`] instead of a resolver + [`ApproverAuthorizer`].
-pub async fn serve_approve_feed_validated(
+pub async fn serve_approve_feed_validated<S>(
     producer: Producer,
     side: Consumer,
-    store: PendingApprovalStore,
+    sink: S,
     validator: Arc<Validator>,
     timeout: Duration,
-) -> Result<(), IdentityError> {
+) -> Result<(), IdentityError>
+where
+    S: ApprovalSink + Clone + Send + Sync + 'static,
+{
     let side = Arc::new(tokio::sync::Mutex::new(side));
     producer
         .serve(move |interest, responder| {
             let side = Arc::clone(&side);
-            let store = store.clone();
+            let sink = sink.clone();
             let validator = Arc::clone(&validator);
             async move {
-                let Some(req) = store.pending().into_iter().next() else {
+                let Some(req) = sink.pending().into_iter().next() else {
                     return;
                 };
                 {
                     let mut sc = side.lock().await;
                     let _ = pull_and_validate_approval(
                         &mut sc,
-                        &store,
+                        &sink,
                         &interest,
                         &req.cert_name,
-                        &req.id,
+                        &req.request_id,
                         &validator,
                         timeout,
                     )

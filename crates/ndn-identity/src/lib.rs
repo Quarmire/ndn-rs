@@ -22,8 +22,8 @@ pub use ca::{ApproveFeed, NdncertCa, NdncertCaBuilder};
 pub use device::{DeviceConfig, FactoryCredential, RenewalPolicy};
 pub use email::LoggingEmailSender;
 pub use device_approval_net::{
-    AllowAnyApprover, ApproverAuthorizer, DidApproverAuthorizer, StaticTrustedApprovers,
-    offer_approval, offer_signed_approval, pull_and_record_approval,
+    AllowAnyApprover, ApproverAuthorizer, ApprovalSink, DidApproverAuthorizer, PendingApproval,
+    StaticTrustedApprovers, offer_approval, offer_signed_approval, pull_and_record_approval,
     pull_and_record_approval_with_resolver, pull_and_validate_approval, resolve_approver_key,
     run_approver, serve_approve_feed, serve_approve_feed_validated,
 };
