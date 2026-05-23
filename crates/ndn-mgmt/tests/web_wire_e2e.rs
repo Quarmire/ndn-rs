@@ -150,14 +150,12 @@ async fn web_wire_status_general_returns_dataset() {
 
     let data = Data::decode(data_wire).expect("Data decode");
     let content = data.content().cloned().unwrap_or_default();
-    // status/general comes back as a ControlResponse with the text
-    // "faces=N fib=N pit=N cs=N" (see ndn-mgmt handle_status).
-    let cr = ControlResponse::decode(content).expect("ControlResponse decode");
-    assert_eq!(cr.status_code, 200);
+    // status/general is the spec NFD ForwarderStatus (GeneralStatus) dataset.
+    let gs = ndn_mgmt_wire::GeneralStatus::decode(content).expect("GeneralStatus decode");
     assert!(
-        cr.status_text.contains("faces=") || cr.status_text.contains("fib="),
-        "unexpected status text: {:?}",
-        cr.status_text,
+        gs.nfd_version.starts_with("ndn-rs"),
+        "unexpected NfdVersion: {:?}",
+        gs.nfd_version,
     );
 
     cancel.cancel();

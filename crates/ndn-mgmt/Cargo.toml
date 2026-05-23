@@ -38,6 +38,7 @@ ndn-strategy     = { workspace = true }
 ndn-security     = { path = "../ndn-security", default-features = false }
 ndn-cert         = { path = "../ndn-cert",     default-features = false }
 ndn-config       = { workspace = true }
+ndn-mgmt-wire    = { workspace = true }
 ndn-packet       = { workspace = true, features = ["std"] }
 ndn-tlv          = { workspace = true }
 ndn-transport    = { workspace = true }

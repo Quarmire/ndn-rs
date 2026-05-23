@@ -279,9 +279,11 @@ impl MgmtClient {
         self.send_interest(name).await
     }
 
-    /// General forwarder status: `status/general`.
-    pub async fn status(&self) -> Result<ControlResponse, ForwarderError> {
-        self.dataset(module::STATUS, b"general").await
+    /// General forwarder status: `status/general` — the NFD ForwarderStatus
+    /// (GeneralStatus) dataset.
+    pub async fn status(&self) -> Result<ndn_mgmt_wire::GeneralStatus, ForwarderError> {
+        let bytes = self.dataset_raw(module::STATUS, b"general").await?;
+        ndn_mgmt_wire::GeneralStatus::decode(bytes).map_err(|_| ForwarderError::MalformedResponse)
     }
 
     /// Request graceful shutdown: `status/shutdown`.

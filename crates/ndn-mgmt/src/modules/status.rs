@@ -1,37 +1,35 @@
-//! `/localhost/nfd/status/*` — general counters + shutdown.
+//! `/localhost/nfd/status/*` — NFD ForwarderStatus dataset + shutdown.
 
 use async_trait::async_trait;
 use ndn_config::{
     ControlParameters, ControlResponse, control_response::status, nfd_command::module,
 };
 use ndn_engine::ForwarderEngine;
-use tokio_util::sync::CancellationToken;
+use ndn_mgmt_wire::GeneralStatus;
 
 use crate::MgmtResponse;
 use crate::module::{MgmtContext, MgmtModule};
 
-fn handle_status(
-    verb_name: &[u8],
-    engine: &ForwarderEngine,
-    cancel: &CancellationToken,
-) -> ControlResponse {
-    match verb_name {
-        b"general" => {
-            let n_faces = engine.faces().face_entries().len();
-            let n_fib = engine.fib().dump().len();
-            let n_pit = engine.pit().len();
-            let n_cs = engine.cs().len();
-
-            let text = format!("faces={n_faces} fib={n_fib} pit={n_pit} cs={n_cs}");
-            ControlResponse::ok_empty(text)
-        }
-        b"shutdown" => {
-            tracing::info!(target: "engine", "status/shutdown requested");
-            cancel.cancel();
-            ControlResponse::ok_empty("OK")
-        }
-        _ => ControlResponse::error(status::NOT_FOUND, "unknown status verb"),
-    }
+/// Build the spec NFD ForwarderStatus (GeneralStatus) dataset from live engine
+/// state. Table counts are real; forwarder-wide packet counters are not yet
+/// aggregated and are reported as 0 (the wire format is now spec-correct
+/// regardless — see `ndn-mgmt-wire`).
+fn general_status_dataset(engine: &ForwarderEngine) -> bytes::Bytes {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let status = GeneralStatus {
+        nfd_version: format!("ndn-rs {}", env!("CARGO_PKG_VERSION")),
+        // No engine start-time is tracked yet; report start == current (uptime 0).
+        start_timestamp_ms: now_ms,
+        current_timestamp_ms: now_ms,
+        n_fib_entries: engine.fib().dump().len() as u64,
+        n_pit_entries: engine.pit().len() as u64,
+        n_cs_entries: engine.cs().len() as u64,
+        ..Default::default()
+    };
+    status.encode()
 }
 
 pub(crate) struct StatusModule;
@@ -48,6 +46,14 @@ impl MgmtModule for StatusModule {
         _params: ControlParameters,
         ctx: &MgmtContext<'_>,
     ) -> MgmtResponse {
-        handle_status(verb, ctx.engine, ctx.cancel).into()
+        match verb {
+            b"general" => MgmtResponse::Dataset(general_status_dataset(ctx.engine)),
+            b"shutdown" => {
+                tracing::info!(target: "engine", "status/shutdown requested");
+                ctx.cancel.cancel();
+                ControlResponse::ok_empty("OK").into()
+            }
+            _ => ControlResponse::error(status::NOT_FOUND, "unknown status verb").into(),
+        }
     }
 }
