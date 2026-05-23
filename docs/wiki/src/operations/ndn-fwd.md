@@ -73,6 +73,16 @@ ndn-ctl route add /lab faceid:<id>
 The face ID comes from `face create`'s output; it is monotonic and
 never recycled (project memory `feedback_face_id_no_recycle`).
 
+Per-face NDNLPv2 options are toggled with `face update` (the `faces/update`
+flag bits — 0 = LocalFields, 1 = LpReliability, 2 = CongestionMarking):
+
+```sh
+ndn-ctl face update <id> --flags 0x2   # enable LpReliability on a lossy link
+```
+
+Bits outside `--mask` (default: the bits in `--flags`) are preserved. See
+[Per-face NDNLPv2 local fields](../reference/face-transports.md#per-face-ndnlpv2-local-fields).
+
 ## Logs
 
 `ndn-fwd` writes structured logs to stderr (or the journal under
