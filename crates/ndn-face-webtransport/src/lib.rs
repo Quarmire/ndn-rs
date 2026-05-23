@@ -20,7 +20,7 @@ use thiserror::Error;
 use tokio::sync::Mutex;
 use tracing::{trace, warn};
 
-use ndn_transport::{FaceError, FaceId, FaceKind, Transport};
+use ndn_transport::{ClientTls, FaceError, FaceId, FaceKind, Transport};
 use wtransport::{Endpoint, Identity, ServerConfig, endpoint::IncomingSession};
 
 /// Conservative QUIC-datagram floor used when the connection cannot yet report
@@ -38,18 +38,6 @@ pub enum WtTlsConfig {
         cert_chain_pem: Vec<u8>,
         private_key_pem: Vec<u8>,
     },
-}
-
-/// Client-side TLS policy for dialing a WebTransport peer (forwarder-to-
-/// forwarder over NAT, or browser-trusted endpoints).
-pub enum WtClientTls {
-    /// Pin the peer's leaf cert by SHA-256 — the dialing counterpart to a
-    /// listener's `SelfSigned` / `serverCertificateHashes` workflow. Secure
-    /// even for self-signed peers; get the value from
-    /// [`WebTransportListener::leaf_cert_sha256`].
-    CertHashes(Vec<[u8; 32]>),
-    /// Validate against the OS trust store (WebPKI; e.g. ACME-provisioned).
-    WebPki,
 }
 
 #[derive(Debug, Error)]
@@ -99,7 +87,7 @@ impl WebTransportListener {
         };
 
         // SHA-256 of the leaf cert — a dialing peer pins this via
-        // `WtClientTls::CertHashes`, and browsers via `serverCertificateHashes`.
+        // `ClientTls::CertHashes`, and browsers via `serverCertificateHashes`.
         let leaf_cert_sha256 = identity
             .certificate_chain()
             .as_slice()
@@ -127,7 +115,7 @@ impl WebTransportListener {
     }
 
     /// SHA-256 of the listener's leaf certificate, for dialers to pin via
-    /// [`WtClientTls::CertHashes`] or browsers via `serverCertificateHashes`.
+    /// [`ClientTls::CertHashes`] or browsers via `serverCertificateHashes`.
     pub fn leaf_cert_sha256(&self) -> Option<[u8; 32]> {
         self.leaf_cert_sha256
     }
@@ -193,15 +181,18 @@ impl WebTransportFace {
     /// counterpart to [`WebTransportListener`]; QUIC/HTTP3 traverses NAT and
     /// firewalls like HTTPS. TLS authenticates the link only — NDN trust is
     /// layered on top via signed Data.
-    pub async fn connect(id: FaceId, url: &str, tls: WtClientTls) -> Result<Self, WtError> {
+    pub async fn connect(id: FaceId, url: &str, tls: ClientTls) -> Result<Self, WtError> {
         let builder = wtransport::ClientConfig::builder().with_bind_default();
         let client_config = match tls {
-            WtClientTls::CertHashes(hashes) => builder
+            ClientTls::CertHashes(hashes) => builder
                 .with_server_certificate_hashes(
                     hashes.into_iter().map(wtransport::tls::Sha256Digest::new),
                 )
                 .build(),
-            WtClientTls::WebPki => builder.with_native_certs().build(),
+            // wtransport validates against the OS trust store here; the QUIC
+            // face uses the bundled webpki-roots. Both check trusted roots —
+            // the difference is only the root source.
+            ClientTls::WebPki => builder.with_native_certs().build(),
         };
         let endpoint =
             Endpoint::client(client_config).map_err(|e| WtError::Wt(format!("client: {e}")))?;

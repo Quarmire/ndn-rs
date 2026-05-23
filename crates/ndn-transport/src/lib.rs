@@ -23,6 +23,7 @@ pub mod mac_addr;
 pub mod raw_packet;
 pub mod reliability;
 pub mod stream_face;
+pub mod tls;
 pub mod tlv_codec;
 pub mod transport;
 
@@ -50,5 +51,6 @@ pub use mac_addr::MacAddr;
 pub use ndn_packet::ContentHashTarget;
 pub use raw_packet::RawPacket;
 pub use stream_face::StreamFace;
+pub use tls::ClientTls;
 pub use tlv_codec::TlvCodec;
 pub use transport::{ErasedTransport, MtuError, PersistencyError, Transport};

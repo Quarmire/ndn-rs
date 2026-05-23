@@ -9,11 +9,9 @@ use std::time::Duration;
 use bytes::Bytes;
 use ndn_packet::fragment::ReassemblyBuffer;
 use ndn_packet::lp::extract_fragment;
-use ndn_transport::{FaceId, Transport};
+use ndn_transport::{ClientTls, FaceId, Transport};
 
-use ndn_face_webtransport::{
-    WebTransportFace, WebTransportListener, WtClientTls, WtTlsConfig,
-};
+use ndn_face_webtransport::{WebTransportFace, WebTransportListener, WtTlsConfig};
 
 fn make_tlv(tag: u8, value: &[u8]) -> Bytes {
     use ndn_tlv::TlvWriter;
@@ -144,7 +142,7 @@ async fn i14_wt_connect_dials_listener() {
 
     let url = format!("https://{server_addr}/ndn");
     let client_face =
-        WebTransportFace::connect(FaceId(0), &url, WtClientTls::CertHashes(vec![hash]))
+        WebTransportFace::connect(FaceId(0), &url, ClientTls::CertHashes(vec![hash]))
             .await
             .expect("dial");
     let server_face = server_task.await.unwrap().expect("accept");
