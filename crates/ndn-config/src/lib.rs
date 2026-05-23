@@ -21,9 +21,9 @@ pub use config::{
     FaceKind, SmtpConfig,
     ForwarderConfig, ListenersConfig, LoggingConfig, ManagementConfig, MgmtSecurityConfig,
     NlsrNeighborConfig, NlsrTomlConfig, ObservabilityTomlConfig, ReflexiveTomlConfig,
-    RequireAttestationConfig, RouteConfig, RoutingTomlConfig, SecurityConfig, TrustRuleConfig,
-    WebRtcListenerConfig, WebTransportListenerConfig, WtAcmeConfig, WtCertSource, WtIceServers,
-    WtSelfSignedDev, WtTurnServer, parse_cert_sha256_hex,
+    QuicListenerConfig, RequireAttestationConfig, RouteConfig, RoutingTomlConfig, SecurityConfig,
+    TrustRuleConfig, WebRtcListenerConfig, WebTransportListenerConfig, WtAcmeConfig, WtCertSource,
+    WtIceServers, WtSelfSignedDev, WtTurnServer, parse_cert_sha256_hex,
 };
 pub use control_parameters::ControlParameters;
 pub use control_response::ControlResponse;

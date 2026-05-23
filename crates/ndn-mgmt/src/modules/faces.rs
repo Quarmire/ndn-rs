@@ -438,6 +438,15 @@ async fn faces_create(
         }
     }
 
+    // `quic://host:port?cert=<sha256hex>` dials a raw-QUIC backbone peer. The
+    // `?cert=` pin is required (no WebPKI path for the raw-QUIC dialer).
+    #[cfg(all(not(target_arch = "wasm32"), feature = "quic"))]
+    {
+        if uri.starts_with("quic://") {
+            return faces_create_quic(&uri, engine).await;
+        }
+    }
+
     // `ble://<name-or-address>[?opts]` dials a peripheral as a GATT central
     // (Linux/macOS/Windows). The peripheral (GATT server) is NOT created here —
     // it is an NFD-style listener configured via `[listeners.ble]` (see
@@ -700,6 +709,61 @@ async fn faces_create_webtransport(uri: &str, engine: &ForwarderEngine) -> Contr
                 status::SERVER_ERROR,
                 format!("WebTransport face creation failed: {e}"),
             )
+        }
+    }
+}
+
+/// Dial a `quic://host:port?cert=<sha256hex>` raw-QUIC peer.
+#[cfg(all(not(target_arch = "wasm32"), feature = "quic"))]
+async fn faces_create_quic(uri: &str, engine: &ForwarderEngine) -> ControlResponse {
+    use ndn_face_quic::{QuicClientTls, QuicConnector};
+
+    let rest = uri.strip_prefix("quic://").unwrap_or(uri);
+    let (authority, query) = match rest.split_once('?') {
+        Some((a, q)) => (a, Some(q)),
+        None => (rest, None),
+    };
+    let cert_hex = query.and_then(|q| {
+        q.split('&')
+            .find_map(|kv| kv.strip_prefix("cert="))
+            .map(str::to_owned)
+    });
+    let Some(hash) = cert_hex.as_deref().and_then(ndn_config::parse_cert_sha256_hex) else {
+        return ControlResponse::error(
+            status::BAD_PARAMS,
+            "quic:// requires ?cert=<64 hex chars> (leaf cert SHA-256 to pin)",
+        );
+    };
+
+    let connector = match QuicConnector::new(QuicClientTls::CertHashes(vec![hash])) {
+        Ok(c) => c,
+        Err(e) => {
+            return ControlResponse::error(status::SERVER_ERROR, format!("QUIC connector: {e}"));
+        }
+    };
+    let face_id = engine.faces().alloc_id();
+    // The connector (endpoint) may drop after connect; the face's streams keep
+    // the connection and its I/O driver alive.
+    match connector.connect_authority(face_id, authority).await {
+        Ok(face) => {
+            let local_uri = face.local_uri().unwrap_or_default();
+            engine.add_face_with_persistency(
+                face,
+                CancellationToken::new(),
+                FacePersistency::Persistent,
+            );
+            tracing::info!(target: "mgmt.face", face = face_id.0, remote = %authority, "faces/create quic");
+            let echo = ControlParameters {
+                face_id: Some(face_id.0),
+                uri: Some(format!("quic://{authority}")),
+                local_uri: Some(local_uri),
+                ..Default::default()
+            };
+            ControlResponse::ok("OK", echo)
+        }
+        Err(e) => {
+            tracing::warn!(target: "mgmt.face", error = %e, remote = %authority, "faces/create quic failed");
+            ControlResponse::error(status::SERVER_ERROR, format!("QUIC face creation failed: {e}"))
         }
     }
 }

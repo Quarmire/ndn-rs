@@ -16,6 +16,8 @@ spsc-shm    = ["ndn-face-native/spsc-shm"]
 bluetooth   = ["ndn-face-native/bluetooth"]
 # Enables the wts:// faces/create arm (outbound WebTransport dial).
 webtransport = ["dep:ndn-face-webtransport"]
+# Enables the quic:// faces/create arm (outbound raw-QUIC dial).
+quic = ["dep:ndn-face-quic"]
 
 [dependencies]
 # Portable deps — build on every target including wasm32-unknown-unknown.
@@ -68,6 +70,8 @@ ndn-routing      = { workspace = true }
 ndn-face-native        = { workspace = true }
 # Optional: the wts:// faces/create dialer (pulls the QUIC stack).
 ndn-face-webtransport = { workspace = true, optional = true }
+# Optional: the quic:// faces/create dialer (raw QUIC).
+ndn-face-quic = { workspace = true, optional = true }
 # ndn-app powers the status_bridge.rs Producer mount (ARCH-6 / S11).
 ndn-app          = { workspace = true }
 tokio            = { workspace = true, features = ["net", "io-util"] }

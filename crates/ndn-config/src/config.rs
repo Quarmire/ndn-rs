@@ -251,9 +251,24 @@ pub struct ListenersConfig {
     #[serde(default)]
     pub webtransport: Option<WebTransportListenerConfig>,
     #[serde(default)]
+    pub quic: Option<QuicListenerConfig>,
+    #[serde(default)]
     pub webrtc: Option<WebRtcListenerConfig>,
     #[serde(default)]
     pub ble: Option<BleListenerConfig>,
+}
+
+/// Raw-QUIC backbone listener (forwarder-to-forwarder). Self-signed TLS today;
+/// dialers pin the advertised leaf SHA-256 (logged at startup).
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct QuicListenerConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Bind address, e.g. `0.0.0.0:6367`.
+    pub listen: String,
+    /// SANs for the self-signed cert; `None` uses `["localhost"]`.
+    #[serde(default)]
+    pub hostnames: Option<Vec<String>>,
 }
 
 /// BLE GATT-server (peripheral) listener. When enabled, the forwarder binds
@@ -768,6 +783,21 @@ fn validate_face_config(face: &FaceConfig) -> Result<(), ConfigError> {
                 (None, true) => {}
             }
         }
+        FaceConfig::Quic {
+            remote,
+            cert_sha256,
+        } => {
+            if !remote.starts_with("quic://") {
+                return Err(ConfigError::Invalid(format!(
+                    "QUIC remote must start with quic://: {remote}"
+                )));
+            }
+            if parse_cert_sha256_hex(cert_sha256).is_none() {
+                return Err(ConfigError::Invalid(format!(
+                    "QUIC cert_sha256 must be 64 hex chars (32 bytes): {cert_sha256}"
+                )));
+            }
+        }
         FaceConfig::Unix { .. } | FaceConfig::EtherMulticast { .. } => {}
     }
     Ok(())
@@ -930,6 +960,15 @@ pub enum FaceConfig {
         /// Validate against the OS trust store (public-CA / ACME peers).
         #[serde(default)]
         webpki: bool,
+    },
+    /// Outbound raw-QUIC dial (forwarder-to-forwarder backbone link; TLS 1.3,
+    /// connection migration). The inbound side is `[listeners.quic]`.
+    Quic {
+        /// Peer to dial as `quic://host:port`.
+        remote: String,
+        /// Pin the peer's leaf cert by SHA-256 (hex). Required — the raw-QUIC
+        /// dialer authenticates by cert pin (no WebPKI path yet).
+        cert_sha256: String,
     },
     Serial {
         path: String,
