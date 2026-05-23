@@ -660,7 +660,8 @@ async fn faces_create_tcp(addr_str: &str, engine: &ForwarderEngine) -> ControlRe
 /// Dial a `wts://host:port[?cert=<sha256hex>]` WebTransport peer.
 #[cfg(all(not(target_arch = "wasm32"), feature = "webtransport"))]
 async fn faces_create_webtransport(uri: &str, engine: &ForwarderEngine) -> ControlResponse {
-    use ndn_face_webtransport::{WebTransportFace, WtClientTls};
+    use ndn_face_webtransport::WebTransportFace;
+    use ndn_transport::ClientTls;
 
     let rest = uri.strip_prefix("wts://").unwrap_or(uri);
     let (authority, query) = match rest.split_once('?') {
@@ -676,7 +677,7 @@ async fn faces_create_webtransport(uri: &str, engine: &ForwarderEngine) -> Contr
     });
     let tls = match cert_hex {
         Some(hex) => match ndn_config::parse_cert_sha256_hex(&hex) {
-            Some(h) => WtClientTls::CertHashes(vec![h]),
+            Some(h) => ClientTls::CertHashes(vec![h]),
             None => {
                 return ControlResponse::error(
                     status::BAD_PARAMS,
@@ -684,7 +685,7 @@ async fn faces_create_webtransport(uri: &str, engine: &ForwarderEngine) -> Contr
                 );
             }
         },
-        None => WtClientTls::WebPki,
+        None => ClientTls::WebPki,
     };
 
     let face_id = engine.faces().alloc_id();
@@ -717,7 +718,8 @@ async fn faces_create_webtransport(uri: &str, engine: &ForwarderEngine) -> Contr
 /// (validate against WebPKI roots) raw-QUIC peer.
 #[cfg(all(not(target_arch = "wasm32"), feature = "quic"))]
 async fn faces_create_quic(uri: &str, engine: &ForwarderEngine) -> ControlResponse {
-    use ndn_face_quic::{QuicClientTls, QuicConnector};
+    use ndn_face_quic::QuicConnector;
+    use ndn_transport::ClientTls;
 
     let rest = uri.strip_prefix("quic://").unwrap_or(uri);
     let (authority, query) = match rest.split_once('?') {
@@ -730,7 +732,7 @@ async fn faces_create_quic(uri: &str, engine: &ForwarderEngine) -> ControlRespon
 
     let tls = if let Some(hex) = cert_hex {
         match ndn_config::parse_cert_sha256_hex(hex) {
-            Some(h) => QuicClientTls::CertHashes(vec![h]),
+            Some(h) => ClientTls::CertHashes(vec![h]),
             None => {
                 return ControlResponse::error(
                     status::BAD_PARAMS,
@@ -739,7 +741,7 @@ async fn faces_create_quic(uri: &str, engine: &ForwarderEngine) -> ControlRespon
             }
         }
     } else if webpki {
-        QuicClientTls::WebPki
+        ClientTls::WebPki
     } else {
         return ControlResponse::error(
             status::BAD_PARAMS,

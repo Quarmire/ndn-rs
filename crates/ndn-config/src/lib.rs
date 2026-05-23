@@ -17,13 +17,13 @@ pub mod nfd_dataset;
 pub mod notifications;
 
 pub use config::{
-    ChallengeConfig, CsConfig, DemoCaConfig, DiscoveryTomlConfig, EngineConfig, FaceConfig,
-    FaceKind, SmtpConfig,
+    AcmeTomlConfig, CertSourceConfig, ChallengeConfig, CsConfig, DemoCaConfig, DiscoveryTomlConfig,
+    EngineConfig, FaceConfig, FaceKind, SmtpConfig,
     ForwarderConfig, ListenersConfig, LoggingConfig, ManagementConfig, MgmtSecurityConfig,
     NlsrNeighborConfig, NlsrTomlConfig, ObservabilityTomlConfig, ReflexiveTomlConfig,
     QuicListenerConfig, RequireAttestationConfig, RouteConfig, RoutingTomlConfig, SecurityConfig,
-    TrustRuleConfig, WebRtcListenerConfig, WebTransportListenerConfig, WtAcmeConfig, WtCertSource,
-    WtIceServers, WtSelfSignedDev, WtTurnServer, parse_cert_sha256_hex,
+    SelfSignedDevConfig, TrustRuleConfig, WebRtcListenerConfig, WebTransportListenerConfig,
+    WtIceServers, WtTurnServer, parse_cert_sha256_hex,
 };
 pub use control_parameters::ControlParameters;
 pub use control_response::ControlResponse;

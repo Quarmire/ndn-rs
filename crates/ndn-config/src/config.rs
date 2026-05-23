@@ -258,25 +258,22 @@ pub struct ListenersConfig {
     pub ble: Option<BleListenerConfig>,
 }
 
-/// Raw-QUIC backbone listener (forwarder-to-forwarder). Self-signed TLS today;
-/// dialers pin the advertised leaf SHA-256 (logged at startup).
+/// Raw-QUIC backbone listener (forwarder-to-forwarder).
+///
+/// Shares the [`CertSourceConfig`] cert-provisioning shape with the
+/// WebTransport listener, so a QUIC backbone can equally serve a self-signed
+/// (pin the logged leaf SHA-256), PEM, or ACME-provisioned certificate.
+/// Defaults to a long-lived self-signed cert for `localhost`.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct QuicListenerConfig {
     #[serde(default)]
     pub enabled: bool,
     /// Bind address, e.g. `0.0.0.0:6367`.
     pub listen: String,
-    /// SANs for the self-signed cert; `None` uses `["localhost"]`. Ignored when
-    /// `cert_pem`/`key_pem` are set.
+    /// TLS certificate source. Defaults to a self-signed cert for `localhost`
+    /// (dialers pin the leaf SHA-256 logged at startup).
     #[serde(default)]
-    pub hostnames: Option<Vec<String>>,
-    /// PEM cert chain file (e.g. ACME-provisioned) for WebPKI dialers. Requires
-    /// `key_pem`. When set, overrides the self-signed path.
-    #[serde(default)]
-    pub cert_pem: Option<String>,
-    /// PEM private key file paired with `cert_pem`.
-    #[serde(default)]
-    pub key_pem: Option<String>,
+    pub cert_source: CertSourceConfig,
 }
 
 /// BLE GATT-server (peripheral) listener. When enabled, the forwarder binds
@@ -339,10 +336,11 @@ pub struct WebTransportListenerConfig {
     pub enabled: bool,
     pub listen: String,
     /// TLS certificate source for the listener.
-    pub cert_source: WtCertSource,
+    pub cert_source: CertSourceConfig,
 }
 
-/// TLS certificate source for the WebTransport (and WS-TLS) listener.
+/// TLS certificate source for a cert-bearing face listener (WebTransport,
+/// WS-TLS, raw QUIC).
 ///
 /// Structurally mirrors `ndn_acme::CertSource` — the forwarder round-trips this
 /// into it — so `ndn-config` stays decoupled from the ACME/QUIC stack and keeps
@@ -350,27 +348,44 @@ pub struct WebTransportListenerConfig {
 /// round-trip.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum WtCertSource {
+pub enum CertSourceConfig {
     /// PEM cert chain + private key read from disk.
     Pem { cert_pem: String, key_pem: String },
     /// ACME (RFC 8555) DNS-01 provisioning with automatic renewal.
-    Acme(WtAcmeConfig),
-    /// Ephemeral self-signed cert (dev / `serverCertificateHashes` workflow).
-    SelfSignedDev(WtSelfSignedDev),
+    Acme(AcmeTomlConfig),
+    /// Ephemeral self-signed cert (dev / `serverCertificateHashes` workflow,
+    /// or a pinned backbone link).
+    SelfSignedDev(SelfSignedDevConfig),
+}
+
+/// A self-signed source defaults to a `localhost` cert — the zero-config path
+/// for a loopback QUIC backbone or a dev WebTransport listener.
+impl Default for CertSourceConfig {
+    fn default() -> Self {
+        CertSourceConfig::SelfSignedDev(SelfSignedDevConfig::default())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct WtSelfSignedDev {
-    #[serde(default = "default_wt_hostnames")]
+pub struct SelfSignedDevConfig {
+    #[serde(default = "default_cert_hostnames")]
     pub hostnames: Vec<String>,
 }
 
-fn default_wt_hostnames() -> Vec<String> {
+impl Default for SelfSignedDevConfig {
+    fn default() -> Self {
+        Self {
+            hostnames: default_cert_hostnames(),
+        }
+    }
+}
+
+fn default_cert_hostnames() -> Vec<String> {
     vec!["localhost".into()]
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct WtAcmeConfig {
+pub struct AcmeTomlConfig {
     /// e.g. `https://acme-v02.api.letsencrypt.org/directory`.
     pub directory_url: String,
     pub email: String,
