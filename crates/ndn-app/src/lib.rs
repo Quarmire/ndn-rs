@@ -27,7 +27,7 @@ pub mod subscriber;
 pub mod blocking;
 
 pub use app_face::OutboundRequest;
-pub use connection::{Connection, InProcConnection, IpcConnection};
+pub use connection::{Connection, InProcConnection, IpcConnection, LpInfo};
 pub use consumer::{
     Consumer, DEFAULT_INTEREST_LIFETIME, DEFAULT_TIMEOUT, SubscribeOptions, Subscription,
 };

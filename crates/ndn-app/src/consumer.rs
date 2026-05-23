@@ -12,7 +12,7 @@ use ndn_packet::{Data, MAX_PERSISTENT_LIFETIME_SECS, Name, SubscriptionRequest};
 use ndn_security::{SafeData, ValidationResult, Validator};
 
 use crate::AppError;
-use crate::connection::{Connection, InProcConnection, IpcConnection};
+use crate::connection::{Connection, InProcConnection, IpcConnection, LpInfo};
 
 pub const DEFAULT_INTEREST_LIFETIME: Duration = Duration::from_millis(4000);
 
@@ -110,6 +110,27 @@ impl Consumer {
         }
 
         Data::decode(reply).map_err(|e| AppError::Protocol(e.to_string()))
+    }
+
+    /// Like [`fetch`](Self::fetch) but also returns the received Data's
+    /// NDNLPv2 local fields ([`LpInfo`]) — the `getTag<IncomingFaceIdTag>()`
+    /// equivalent. `incoming_face_id` is populated when the consumer face has
+    /// LocalFields enabled (or, for an embedded app, always — via the in-proc
+    /// source tag-bag).
+    pub async fn fetch_with_meta(
+        &mut self,
+        name: impl Into<Name>,
+    ) -> Result<(Data, LpInfo), AppError> {
+        let wire = InterestBuilder::new(name)
+            .lifetime(DEFAULT_INTEREST_LIFETIME)
+            .build();
+        self.conn.send(wire).await?;
+        let (reply, lp) = tokio::time::timeout(DEFAULT_TIMEOUT, self.conn.recv_with_meta())
+            .await
+            .map_err(|_| AppError::Timeout)?
+            .ok_or(AppError::Closed)?;
+        let data = decode_data_lp(reply)?;
+        Ok((data, lp))
     }
 
     /// Send without awaiting a reply; pairs with [`Self::recv_data`]
