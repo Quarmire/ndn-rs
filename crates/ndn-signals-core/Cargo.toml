@@ -1,0 +1,17 @@
+[package]
+name = "ndn-signals-core"
+description = "Canonical, runtime-agnostic cross-layer signal taxonomy + SignalView/SignalStore traits (sans-IO; shared by the native engine and the embedded forwarder)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+classification = "spec"
+
+[features]
+# This crate is `#![no_std]` and never gains a `std` feature. The taxonomy
+# (`LinkSignals`/`NodeSignals`) and the view/store traits need no allocation;
+# concrete stores live in the per-engine adapters, not here.
+default = []
+
+[dependencies]
