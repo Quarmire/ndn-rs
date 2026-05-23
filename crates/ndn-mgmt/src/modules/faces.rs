@@ -713,7 +713,8 @@ async fn faces_create_webtransport(uri: &str, engine: &ForwarderEngine) -> Contr
     }
 }
 
-/// Dial a `quic://host:port?cert=<sha256hex>` raw-QUIC peer.
+/// Dial a `quic://host:port?cert=<sha256hex>` (pin) or `quic://host:port?webpki`
+/// (validate against WebPKI roots) raw-QUIC peer.
 #[cfg(all(not(target_arch = "wasm32"), feature = "quic"))]
 async fn faces_create_quic(uri: &str, engine: &ForwarderEngine) -> ControlResponse {
     use ndn_face_quic::{QuicClientTls, QuicConnector};
@@ -723,19 +724,30 @@ async fn faces_create_quic(uri: &str, engine: &ForwarderEngine) -> ControlRespon
         Some((a, q)) => (a, Some(q)),
         None => (rest, None),
     };
-    let cert_hex = query.and_then(|q| {
-        q.split('&')
-            .find_map(|kv| kv.strip_prefix("cert="))
-            .map(str::to_owned)
-    });
-    let Some(hash) = cert_hex.as_deref().and_then(ndn_config::parse_cert_sha256_hex) else {
+    let params: Vec<&str> = query.map(|q| q.split('&').collect()).unwrap_or_default();
+    let cert_hex = params.iter().find_map(|kv| kv.strip_prefix("cert="));
+    let webpki = params.iter().any(|kv| *kv == "webpki" || *kv == "webpki=true");
+
+    let tls = if let Some(hex) = cert_hex {
+        match ndn_config::parse_cert_sha256_hex(hex) {
+            Some(h) => QuicClientTls::CertHashes(vec![h]),
+            None => {
+                return ControlResponse::error(
+                    status::BAD_PARAMS,
+                    format!("invalid cert hash (need 64 hex chars): {hex}"),
+                );
+            }
+        }
+    } else if webpki {
+        QuicClientTls::WebPki
+    } else {
         return ControlResponse::error(
             status::BAD_PARAMS,
-            "quic:// requires ?cert=<64 hex chars> (leaf cert SHA-256 to pin)",
+            "quic:// requires ?cert=<64 hex chars> (pin) or ?webpki",
         );
     };
 
-    let connector = match QuicConnector::new(QuicClientTls::CertHashes(vec![hash])) {
+    let connector = match QuicConnector::new(tls) {
         Ok(c) => c,
         Err(e) => {
             return ControlResponse::error(status::SERVER_ERROR, format!("QUIC connector: {e}"));

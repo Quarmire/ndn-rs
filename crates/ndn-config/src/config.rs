@@ -266,9 +266,17 @@ pub struct QuicListenerConfig {
     pub enabled: bool,
     /// Bind address, e.g. `0.0.0.0:6367`.
     pub listen: String,
-    /// SANs for the self-signed cert; `None` uses `["localhost"]`.
+    /// SANs for the self-signed cert; `None` uses `["localhost"]`. Ignored when
+    /// `cert_pem`/`key_pem` are set.
     #[serde(default)]
     pub hostnames: Option<Vec<String>>,
+    /// PEM cert chain file (e.g. ACME-provisioned) for WebPKI dialers. Requires
+    /// `key_pem`. When set, overrides the self-signed path.
+    #[serde(default)]
+    pub cert_pem: Option<String>,
+    /// PEM private key file paired with `cert_pem`.
+    #[serde(default)]
+    pub key_pem: Option<String>,
 }
 
 /// BLE GATT-server (peripheral) listener. When enabled, the forwarder binds
@@ -786,16 +794,32 @@ fn validate_face_config(face: &FaceConfig) -> Result<(), ConfigError> {
         FaceConfig::Quic {
             remote,
             cert_sha256,
+            webpki,
         } => {
             if !remote.starts_with("quic://") {
                 return Err(ConfigError::Invalid(format!(
                     "QUIC remote must start with quic://: {remote}"
                 )));
             }
-            if parse_cert_sha256_hex(cert_sha256).is_none() {
-                return Err(ConfigError::Invalid(format!(
-                    "QUIC cert_sha256 must be 64 hex chars (32 bytes): {cert_sha256}"
-                )));
+            match (cert_sha256.as_deref(), webpki) {
+                (Some(_), true) => {
+                    return Err(ConfigError::Invalid(
+                        "QUIC face: set either cert_sha256 or webpki, not both".into(),
+                    ));
+                }
+                (None, false) => {
+                    return Err(ConfigError::Invalid(
+                        "QUIC face requires cert_sha256 (self-signed peer) or webpki = true".into(),
+                    ));
+                }
+                (Some(hex), false) => {
+                    if parse_cert_sha256_hex(hex).is_none() {
+                        return Err(ConfigError::Invalid(format!(
+                            "QUIC cert_sha256 must be 64 hex chars (32 bytes): {hex}"
+                        )));
+                    }
+                }
+                (None, true) => {}
             }
         }
         FaceConfig::Unix { .. } | FaceConfig::EtherMulticast { .. } => {}
@@ -966,9 +990,14 @@ pub enum FaceConfig {
     Quic {
         /// Peer to dial as `quic://host:port`.
         remote: String,
-        /// Pin the peer's leaf cert by SHA-256 (hex). Required — the raw-QUIC
-        /// dialer authenticates by cert pin (no WebPKI path yet).
-        cert_sha256: String,
+        /// Pin the peer's leaf cert by SHA-256 (hex) — for self-signed peers.
+        /// Mutually exclusive with `webpki`.
+        #[serde(default)]
+        cert_sha256: Option<String>,
+        /// Validate the peer's chain against the bundled WebPKI roots (a
+        /// publicly-trusted / ACME cert). Mutually exclusive with `cert_sha256`.
+        #[serde(default)]
+        webpki: bool,
     },
     Serial {
         path: String,
