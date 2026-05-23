@@ -13,8 +13,11 @@ classification = "spec"
 default = []
 
 [dependencies]
-ndn-tlv       = { workspace = true }
-ed25519-dalek = { version = "2", default-features = false }
+ndn-tlv          = { workspace = true }
+ed25519-dalek    = { version = "2", default-features = false }
+# no_std AEAD (in-place detached) — content confidentiality baseline. ChaCha20
+# over AES: fast in software, no AES-NI/HW needed, constant-time.
+chacha20poly1305 = { version = "0.10", default-features = false }
 
 [dev-dependencies]
 ndn-packet    = { workspace = true, features = ["std"] }

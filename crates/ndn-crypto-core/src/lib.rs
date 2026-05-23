@@ -171,12 +171,86 @@ pub fn verify_data_ed25519(wire: &[u8], public_key: &[u8; 32]) -> bool {
     vk.verify(&inner[..signed_end], &Signature::from_bytes(&arr)).is_ok()
 }
 
+// ---------------------------------------------------------------------------
+// Content confidentiality (the no_std baseline). Provability (signing) and
+// confidentiality are orthogonal in NDN: sign the *encrypted* Data so caches
+// still verify + forward without decrypting. Key distribution / access control
+// (NAC, ABE) layer on top of this primitive.
+// ---------------------------------------------------------------------------
+
+use chacha20poly1305::aead::AeadInPlace;
+use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce, Tag};
+
+/// Encrypt `buffer` in place with ChaCha20-Poly1305, returning the 16-byte
+/// detached authentication tag. `aad` is authenticated but not encrypted (e.g.
+/// the Data name). No allocation. `None` only on a bad key length.
+pub fn seal_in_place(
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    aad: &[u8],
+    buffer: &mut [u8],
+) -> Option<[u8; 16]> {
+    let cipher = ChaCha20Poly1305::new_from_slice(key).ok()?;
+    let tag = cipher
+        .encrypt_in_place_detached(Nonce::from_slice(nonce), aad, buffer)
+        .ok()?;
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&tag);
+    Some(out)
+}
+
+/// Decrypt `buffer` in place; returns `true` iff `tag` authenticates under
+/// (`key`, `nonce`, `aad`). On failure the buffer contents are unspecified and
+/// must be discarded.
+pub fn open_in_place(
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    aad: &[u8],
+    buffer: &mut [u8],
+    tag: &[u8; 16],
+) -> bool {
+    let Ok(cipher) = ChaCha20Poly1305::new_from_slice(key) else {
+        return false;
+    };
+    cipher
+        .decrypt_in_place_detached(Nonce::from_slice(nonce), aad, buffer, Tag::from_slice(tag))
+        .is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use bytes::Bytes;
     use ed25519_dalek::SigningKey;
     use ndn_packet::Data;
+
+    #[test]
+    fn aead_round_trips_and_rejects_tampering() {
+        let key = [3u8; 32];
+        let nonce = [9u8; 12];
+        let aad = b"/ndn/sensor/temp";
+        let mut buf = *b"22.5C reading payload";
+        let plain = buf;
+
+        let tag = seal_in_place(&key, &nonce, aad, &mut buf).expect("seal");
+        assert_ne!(buf, plain, "ciphertext differs from plaintext");
+
+        // Correct key/nonce/aad/tag -> recovers plaintext.
+        let mut ct = buf;
+        assert!(open_in_place(&key, &nonce, aad, &mut ct, &tag));
+        assert_eq!(ct, plain);
+
+        // Tampered ciphertext -> rejected.
+        let mut bad = buf;
+        bad[0] ^= 0xFF;
+        assert!(!open_in_place(&key, &nonce, aad, &mut bad, &tag));
+
+        // Wrong key / wrong AAD -> rejected.
+        let mut ct2 = buf;
+        assert!(!open_in_place(&[4u8; 32], &nonce, aad, &mut ct2, &tag));
+        let mut ct3 = buf;
+        assert!(!open_in_place(&key, &nonce, b"/ndn/other", &mut ct3, &tag));
+    }
 
     #[test]
     fn signed_data_verifies_decodes_and_rejects_tampering() {
