@@ -21,6 +21,7 @@ pub mod lp;
 pub mod meta_info;
 pub mod nack;
 pub mod name;
+pub mod prefix_announcement;
 pub mod signature;
 pub mod subscription;
 #[cfg(any(feature = "std", feature = "std-wasm"))]
@@ -36,6 +37,7 @@ pub use meta_info::MetaInfo;
 pub use nack::{Nack, NackReason};
 pub use name::{Name, NameComponent};
 pub use ndn_foundation_types::{Hash, KeyLocator, SignatureValue};
+pub use prefix_announcement::PrefixAnnouncement;
 pub use signature::{SignatureInfo, SignatureType};
 pub use subscription::{
     MAX_PERSISTENT_LIFETIME_SECS, SubscriptionRequest, TLV_SUBSCRIPTION_REQUEST,

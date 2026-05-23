@@ -14,6 +14,7 @@ pub mod filters;
 pub mod measurements;
 pub mod multicast;
 pub mod registry;
+pub mod self_learning;
 pub mod strategy;
 
 pub use best_route::BestRouteStrategy;

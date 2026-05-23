@@ -348,7 +348,9 @@ impl PacketDispatcher {
                     }
                 }
             }
-            ForwardingAction::Suppress | ForwardingAction::ForwardAfter { .. } => {
+            ForwardingAction::Suppress
+            | ForwardingAction::ForwardAfter { .. }
+            | ForwardingAction::Broadcast => {
                 debug!(target: t::FWD_STRATEGY, "nack suppressed by strategy");
             }
         }
@@ -395,8 +397,70 @@ impl PacketDispatcher {
             }
         };
 
+        // Self-learning: a Data may carry a PrefixAnnouncement; learn a route
+        // from it (validated) before caching/satisfying.
+        self.try_self_learn(&ctx).await;
+
         let action = self.cs_insert.process(ctx).await;
         self.dispatch_action(action).await;
+    }
+
+    /// Self-learning route install (mirrors NFD self-learning-strategy +
+    /// RibManager::slAnnounce). On a Data carrying a PrefixAnnouncement, when
+    /// the active strategy for the announced prefix is self-learning, **validate
+    /// the announcement** (a separate signed object — *not* the outer Data) and
+    /// only then install a route toward the arriving face. Fails closed: no
+    /// validator, or an invalid/untrusted announcement, installs nothing.
+    async fn try_self_learn(&self, ctx: &PacketContext) {
+        use crate::stages::decode::PrefixAnnouncement as PaTag;
+        let Some(pa_tag) = ctx.tags.get::<PaTag>() else {
+            return;
+        };
+        let Ok(pa) = ndn_packet::PrefixAnnouncement::decode(pa_tag.0.clone()) else {
+            return;
+        };
+        // Gate: only the self-learning strategy learns from announcements.
+        let is_self_learning = self
+            .strategy
+            .strategy_table
+            .lpm(&pa.announced_prefix)
+            .is_some_and(|s| {
+                s.name()
+                    .components()
+                    .iter()
+                    .any(|c| c.value.as_ref() == b"self-learning")
+            });
+        if !is_self_learning {
+            return;
+        }
+        // Validate the announcement against trust anchors. No validator → no
+        // install (an unverified announcement must never install a route).
+        let Some(validator) = self.validation.validator.as_ref() else {
+            debug!(target: t::SECURITY, "self-learning: no validator, ignoring PrefixAnnouncement");
+            return;
+        };
+        match validator.validate(&pa.data).await {
+            ndn_security::ValidationResult::Valid(_) => {
+                // NFD ROUTE_ORIGIN_PREFIXANN = 130.
+                let expires_at = pa.expiration.map(|d| web_time::Instant::now() + d);
+                self.rib.add(
+                    &pa.announced_prefix,
+                    crate::rib::RibRoute {
+                        face_id: ctx.face_id,
+                        origin: 130,
+                        cost: 0,
+                        flags: 0,
+                        expires_at,
+                    },
+                );
+                self.rib
+                    .apply_to_fib(&pa.announced_prefix, &self.strategy.fib);
+                debug!(target: t::FWD_FIB, prefix=%pa.announced_prefix, face=%ctx.face_id, "self-learning: route installed from PrefixAnnouncement");
+            }
+            _ => {
+                debug!(target: t::SECURITY, prefix=%pa.announced_prefix, "self-learning: PrefixAnnouncement failed validation, no route installed");
+            }
+        }
     }
 
     pub(super) async fn run_validation_drain(&self, cancel: CancellationToken) {

@@ -195,8 +195,25 @@ impl StrategyStage {
             strategy.after_receive_interest_erased(&sctx).await
         };
 
-        if let Some(action) = actions.into_iter().next() {
+        // Self-learning discovery: expand `Broadcast` to every eligible face
+        // (the strategy has no face table). The Forward handling below applies
+        // scope and split-horizon, so a no-route flood is safe.
+        let action = match actions.into_iter().next() {
+            Some(ForwardingAction::Broadcast) => {
+                let faces: smallvec::SmallVec<[ndn_transport::FaceId; 4]> = self
+                    .face_table
+                    .face_ids()
+                    .into_iter()
+                    .filter(|f| *f != ctx.face_id)
+                    .collect();
+                Some(ForwardingAction::Forward(faces))
+            }
+            other => other,
+        };
+
+        if let Some(action) = action {
             match action {
+                ForwardingAction::Broadcast => unreachable!("mapped to Forward above"),
                 ForwardingAction::Forward(faces) => {
                     trace!(target: t::FWD_STRATEGY, face=%ctx.face_id, name=%name, out_faces=?faces, action="forward", "strategy decision");
                     // Egress scope (mirrors NFD `wouldViolateScope`):

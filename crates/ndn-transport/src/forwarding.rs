@@ -22,4 +22,8 @@ pub enum ForwardingAction {
     },
     Nack(NackReason),
     Suppress,
+    /// Flood to all eligible faces — the self-learning *discovery* Interest
+    /// when no route is known. The engine expands this to the face set (the
+    /// strategy has no face table); scope/split-horizon checks still apply.
+    Broadcast,
 }
