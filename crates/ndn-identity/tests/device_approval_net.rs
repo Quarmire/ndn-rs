@@ -394,7 +394,7 @@ fn approver_did_setup(
 #[tokio::test]
 async fn ndncert_ca_serve_with_feed_approves() {
     use ndn_cert::challenge::device_approval::DeviceApprovalChallenge;
-    use ndn_identity::{ApproveFeed, NdnIdentity, NdncertCa, StaticTrustedApprovers};
+    use ndn_identity::{CaApproveFeed, NdnIdentity, NdncertCa, StaticTrustedApprovers};
 
     let approver_name = "/lab/alice/devices/phone";
     let (signer, resolver) = approver_did_setup(approver_name);
@@ -433,7 +433,7 @@ async fn ndncert_ca_serve_with_feed_approves() {
     let authorizer = Arc::new(
         StaticTrustedApprovers::new().allow("/lab/alice".parse().unwrap(), approver_name),
     );
-    let feed = ApproveFeed {
+    let feed = CaApproveFeed {
         producer: Producer::from_handle(feed_handle, feed_prefix.clone()),
         side: Consumer::from_handle(side_handle),
         store: store.clone(),

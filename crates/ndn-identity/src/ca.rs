@@ -147,7 +147,7 @@ pub struct NdncertCa {
 /// `/<prefix>/CA/APPROVE-FEED` on its own face — a longer prefix than the
 /// main `/<prefix>/CA`, so the forwarder routes feed Interests to it — and
 /// `side` is a separate consumer for the reverse pull.
-pub struct ApproveFeed {
+pub struct CaApproveFeed {
     pub producer: ndn_app::Producer,
     pub side: ndn_app::Consumer,
     pub store: ndn_cert::challenge::device_approval::PendingApprovalStore,
@@ -165,13 +165,13 @@ impl NdncertCa {
         &self.prefix
     }
 
-    /// Run the `/CA/*` service and an [`ApproveFeed`] concurrently, each until
+    /// Run the `/CA/*` service and an [`CaApproveFeed`] concurrently, each until
     /// its connection closes. Use this instead of [`serve`](Self::serve) when
     /// the CA offers cross-process device-approval.
     pub async fn serve_with_feed(
         self,
         ca_producer: ndn_app::Producer,
-        feed: ApproveFeed,
+        feed: CaApproveFeed,
     ) -> Result<(), IdentityError> {
         let main = self.serve(ca_producer);
         let feed_loop = crate::device_approval_net::serve_approve_feed(

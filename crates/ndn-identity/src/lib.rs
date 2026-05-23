@@ -18,7 +18,7 @@ pub mod error;
 pub mod identity;
 pub mod renewal;
 
-pub use ca::{ApproveFeed, NdncertCa, NdncertCaBuilder};
+pub use ca::{CaApproveFeed, NdncertCa, NdncertCaBuilder};
 pub use device::{DeviceConfig, FactoryCredential, RenewalPolicy};
 pub use email::LoggingEmailSender;
 pub use device_approval_net::{

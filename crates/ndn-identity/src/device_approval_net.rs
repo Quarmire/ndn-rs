@@ -713,7 +713,7 @@ pub const DEFAULT_APPROVAL_TIMEOUT: Duration = Duration::from_secs(2);
 ///     .await?;
 /// ```
 ///
-/// Distinct from [`ApproveFeed`](crate::ApproveFeed), the config struct accepted
+/// Distinct from [`CaApproveFeed`](crate::CaApproveFeed), the config struct accepted
 /// by [`NdncertCa::serve_with_feed`](crate::NdncertCa::serve_with_feed) for the
 /// NDNCERT integration; this builder is the standalone, schema-authorized feed.
 pub struct ApprovalFeed<S> {
