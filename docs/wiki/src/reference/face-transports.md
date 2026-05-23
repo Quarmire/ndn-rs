@@ -25,6 +25,7 @@ transport see [Implementing a face](../guides/implementing-a-face.md).
 | Serial (UART) | `crates/ndn-face-native/src/serial/mod.rs` | `serial` | Embedded / microcontroller. |
 | WebSocket | `crates/ndn-face-native/` (`ws`) | `ws` | Browser-to-forwarder over WebSocket. |
 | WebTransport | `crates/ndn-face-webtransport/`; wasm: `crates/ndn-face-webtransport-wasm/` | `[listeners.webtransport]`; dial via `[[face]] kind = "web-transport"` or `faces/create wts://…` | Browser↔forwarder and forwarder↔forwarder (NAT-traversing) over QUIC datagrams; oversized packets are NDNLPv2-fragmented to `maxDatagramSize` (interoperates with NDNts `H3Transport`). |
+| QUIC | `crates/ndn-face-quic/` | `[listeners.quic]`; dial via `[[face]] kind = "quic"` or `faces/create quic://…` | Forwarder-to-forwarder backbone over raw QUIC (TLS 1.3, **connection migration**, 0-RTT); one reliable bidi stream of NDN TLV. No HTTP/3 layer (does not reach browsers). |
 | WebRTC datachannel | `crates/ndn-face-webrtc/` | `webrtc` | Browser ↔ browser, browser ↔ relay. |
 | SharedWorker | `crates/ndn-face-shared-worker/` | (programmatic) | Per-origin engine sharing across tabs. |
 | Callback / Tap | `crates/ndn-face-native/src/callback.rs` | (Instrument tier) | Researcher: virtual face whose send-path is a closure. |
@@ -68,6 +69,26 @@ cert_sha256 = "ab12…64hex"
 The listener's TLS cert status (notAfter, days remaining, renewal state) is
 readable per listener via the `/localhost/nfd/webtransport/cert-status`
 management dataset.
+
+QUIC backbone link (forwarder-to-forwarder; TLS 1.3 + connection migration):
+
+```toml
+# Inbound (logs the self-signed leaf SHA-256 at startup — pin it on dialers):
+[listeners.quic]
+enabled = true
+listen = "0.0.0.0:6367"
+# hostnames = ["my-fwd.example"]   # SANs for the self-signed cert (default ["localhost"])
+
+# Outbound dial:
+[[face]]
+kind = "quic"
+remote = "quic://peer.example:6367"
+cert_sha256 = "ab12…64hex"   # required: the peer listener's logged leaf hash
+```
+
+Unlike WebTransport, the QUIC face authenticates by cert pin only (no WebPKI
+path yet) and does not reach browsers — it is the native router-to-router link
+whose connection (and routes) survive a peer's address change.
 
 Shared-memory face (per-host IPC):
 
