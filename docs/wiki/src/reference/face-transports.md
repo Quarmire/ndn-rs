@@ -1,12 +1,9 @@
 # Face transports
 
-Catalogue of face transports shipped in ndn-rs. Each row points at
-the implementation crate, the `[[face]] kind` value, and the
-typical use case.
-
-For the `Face = Transport + LinkService` shape see
-[Extend tier → Face](../api/extend.md#face). For writing a new
-transport see [Implementing a face](../guides/implementing-a-face.md).
+Catalogue of face transports shipped in ndn-rs, each row pointing at the
+implementation crate, the `[[face]] kind` value, and the typical use. For the
+`Face = Transport + LinkService` shape see [Extend tier → Face](../api/extend.md#face);
+for writing a new transport see [Implementing a face](../guides/implementing-a-face.md).
 
 ## Catalogue
 
@@ -42,188 +39,59 @@ bind = "0.0.0.0:6363"
 # remote = "10.0.0.1:6363"  # optional: point-to-point only
 ```
 
-WebTransport listener (inbound; browsers and peer forwarders connect here):
+TLS faces — **WebTransport** (browser↔forwarder and NAT-traversing
+forwarder↔forwarder over QUIC datagrams) and **QUIC** (native router-to-router
+backbone, TLS 1.3 with connection migration) — share one listener `cert_source`
+shape (`self_signed_dev` / `pem` / `acme`, resolved by `ndn-acme`) and one
+dialer trust policy (`cert_sha256` leaf-pin or `webpki`):
 
 ```toml
-[listeners.webtransport]
+[listeners.webtransport]    # or [listeners.quic]
 enabled = true
 listen = "0.0.0.0:4443"
-# Self-signed dev cert (browser pins it via serverCertificateHashes):
 cert_source = { type = "self_signed_dev", hostnames = ["localhost"] }
-# Or PEM:  { type = "pem", cert_pem = "/etc/ndn-fwd/wt.pem", key_pem = "/etc/ndn-fwd/wt.key" }
-# Or ACME: { type = "acme", directory_url = "…", email = "…", domain = "…",
-#            dns_provider = "cloudflare", cache_dir = "/var/lib/ndn-fwd/acme" }
-```
 
-WebTransport outbound dial (forwarder-to-forwarder over NAT):
-
-```toml
-[[face]]
-kind = "web-transport"
+[[face]]                     # outbound dial
+kind = "web-transport"       # or "quic"
 remote = "wts://peer.example:4443"
-# Pin a self-signed peer's leaf cert by SHA-256 (hex); omit for WebPKI:
-cert_sha256 = "ab12…64hex"
-# webpki = true   # validate against the OS trust store instead
+cert_sha256 = "ab12…64hex"   # pin the peer's logged leaf hash; or webpki = true
 ```
 
-The listener's TLS cert status (notAfter, days remaining, renewal state) is
-readable per listener via the `/localhost/nfd/webtransport/cert-status`
-management dataset.
+A self-signed WebTransport cert is capped at 13 days (Chrome's
+`serverCertificateHashes` limit); a self-signed QUIC cert is long-lived (a
+pinned dialer trusts the leaf hash, not the expiry). Listener cert status
+(notAfter, renewal state) is readable via
+`/localhost/nfd/webtransport/cert-status`. The WebTransport face interoperates
+with **ndnd**'s HTTP/3 face (witness `testbed/tests/audit/wt02_ndnd_interop.sh`);
+QUIC does not reach browsers — that is WebTransport's role.
 
-QUIC backbone link (forwarder-to-forwarder; TLS 1.3 + connection migration):
-
-```toml
-# Inbound (logs the leaf SHA-256 at startup — pin it on dialers). The cert
-# source is the SAME `cert_source` shape as the WebTransport listener:
-[listeners.quic]
-enabled = true
-listen = "0.0.0.0:6367"
-# Default when omitted: a long-lived self-signed cert for ["localhost"].
-# cert_source = { type = "self_signed_dev", hostnames = ["my-fwd.example"] }
-# Or PEM:  { type = "pem", cert_pem = "/etc/ndn-fwd/quic.pem", key_pem = "/etc/ndn-fwd/quic.key" }
-# Or ACME: { type = "acme", directory_url = "…", email = "…", domain = "…",
-#            dns_provider = "cloudflare", cache_dir = "/var/lib/ndn-fwd/acme" }
-
-# Outbound dial — pin a self-signed peer by leaf SHA-256:
-[[face]]
-kind = "quic"
-remote = "quic://peer.example:6367"
-cert_sha256 = "ab12…64hex"   # the peer listener's logged leaf hash
-# ...or validate a publicly-trusted (ACME) peer against the WebPKI roots:
-# webpki = true               # mutually exclusive with cert_sha256
-```
-
-The QUIC face does not reach browsers (that is WebTransport's role) — it is the
-native router-to-router link whose connection (and routes) survive a peer's
-address change. Dial auth is cert-pinning (`cert_sha256` / `?cert=`) or WebPKI
-(`webpki` / `?webpki`).
-
-### Shared cert provisioning
-
-The WebTransport and QUIC listeners share one cert-source shape (`self_signed_dev`
-/ `pem` / `acme`, resolved by `ndn-acme`), so a QUIC backbone can equally serve a
-self-signed (pin the logged leaf hash), an operator PEM, or an ACME-provisioned
-cert — the same options WebTransport already had. A self-signed QUIC cert is
-long-lived (a pinned dialer trusts the leaf hash, not the expiry); a self-signed
-WebTransport cert is capped at 13 days to stay within Chrome's
-`serverCertificateHashes` limit. The dialer trust policy (`cert_sha256` pin vs
-`webpki`) is likewise one shared `ndn_transport::ClientTls` type for both faces.
-
-### Interop: WebTransport with ndnd
-
-ndn-rs's WebTransport face interoperates with **ndnd**'s HTTP/3 WebTransport
-face (the one QUIC-family transport the two stacks share — NFD has none). The
-witness `testbed/tests/audit/wt02_ndnd_interop.sh` round-trips an Interest/Data
-over the link. Note: stock ndnd's `fw/face/http3-listener.go` cannot complete a
-WebTransport handshake with *any* spec-conformant client — it sets no `h3` TLS
-ALPN and never calls `webtransport.ConfigureHTTP3Server`, so the witness builds
-ndnd with those two one-line fixes applied (via `go build -overlay`, leaving the
-ndnd checkout untouched). ndn-rs's client side needs no changes.
-
-Shared-memory face (per-host IPC):
-
-```toml
-[[face]]
-kind = "shm"
-path = "/tmp/ndn-fwd.shm"
-capacity_mb = 16
-```
-
+A shared-memory face (`kind = "shm"`, `path`, `capacity_mb`) gives per-host IPC.
 The full per-kind option set is in `examples/ndn-fwd.example.toml`.
 
 ## Bluetooth LE
 
-BLE has two roles, modelled differently because central and peripheral are
-distinct GATT roles — not a flag on one face. Both use the NDNts
-`web-bluetooth-transport` GATT *profile* (service `099577e3-…`), so device
-discovery/connect interoperate with browser Web Bluetooth and `esp8266ndn`.
-Requires `ndn-fwd --features bluetooth`.
-
-> **Profile is shared; framing is not — but it's auto-negotiated.** ndn-rs
-> prefers **NDNLPv2** (one `LpPacket` per ATT write, same path as UDP/Ethernet);
-> stock NDNts and `esp8266ndn` use a **1-byte fragmentation header** on the same
-> UUIDs. ndn-rs faces speak both and disambiguate automatically (see below), so
-> they interoperate with each other *and* with stock NDNts/ESP32 peers.
-
-### Framing disambiguation
-
-The two framings share every UUID, so discovery alone can't tell them apart.
-ndn-rs resolves it without manual selection:
-
-- **Responder (peripheral):** sniffs the first inbound write — `0x64` is the
-  `LpPacket` TLV (NDNLPv2), anything else is NDNts — latches it per central, and
-  **mirrors** it on reply. Zero config.
-- **Initiator (central):** reads an optional read-only **capability
-  characteristic** (`099577e3-…-…d97392`) after connecting. Present ⇒ the
-  peer's advertised framing (NDNLPv2 for ndn-rs peers); **absent ⇒ NDNts** (a
-  stock NDNts/esp8266ndn peer never exposes it). No probing or write
-  amplification — absence is itself the signal.
-- **Override:** `ble://<addr>?framing=ndnts` (or `framing=ndnlpv2`) forces a
-  framing and skips the capability read.
-
-NDNts framing is reassembled inside the face (the pipeline only understands
-NDNLPv2); NDNLPv2 passes through to the pipeline's `ReassemblyBuffer` as before.
-
-The wire-level rules (UUIDs, framing octets, negotiation, conformance) are
-specified normatively in
+BLE has two roles, modelled as distinct faces (central and peripheral are
+distinct GATT roles, not a flag): a **central** dials a peripheral as GATT
+client, a **peripheral** runs the GATT server. Both use the NDNts
+`web-bluetooth-transport` GATT profile, so they interoperate with browser Web
+Bluetooth and `esp8266ndn`. Requires `ndn-fwd --features bluetooth`. The wire
+rules — UUIDs, the NDNLPv2-vs-NDNts framing split, and its automatic
+disambiguation — are normative in
 [NDN over BLE — GATT profile](./ndn-ble-gatt-profile.md).
 
-**Central** — dial a specific peripheral. Created at runtime via `faces/create`
-(it is an outgoing face to a remote, exactly like `udp4://host:port`):
-
-```text
-ble://<device-name-or-address>
-ble://ndn-rs-esp32c3
-ble://AA:BB:CC:DD:EE:FF
-```
-
-The `?query` carries transport-specific knobs: `?framing=ndnts|ndnlpv2` forces
-a wire framing (see disambiguation below), and `?adapter=hci0` is reserved for
-adapter selection. Per-face options that aren't BLE-specific — persistency,
-MTU, lp-reliability — flow through the standard `faces` management module like
-every other face, not through the URI.
-
-**Peripheral** — run the GATT server. It advertises and accepts inbound
-centrals, so (per NFD's channel/listener model) it is configured as a listener,
-**not** created via `faces/create`:
-
-```toml
-[listeners.ble]
-enabled = true
-```
-
-Each connected central becomes its **own** NDN face: the listener's accept loop
-yields one `BleFace` per central, keyed by the BlueZ device address (Linux) or
-`CBCentral.identifier` (macOS), so a peripheral serving several centrals shows
-several faces. Adapter selection and a custom advertised name are planned
-`[listeners.ble]` knobs (today the default adapter and `ndn-rs` name are used).
-
-### `ble` management module
-
-Because the peripheral has controller-level state (advertising on/off,
-connected centrals), it gets a small management module —
-`/localhost/nfd/ble/<verb>`:
-
-| Verb | Effect |
-|---|---|
-| `list` | Status line: `supported`, `advertising`, `adapter`, `centrals` (count). |
-| `start` | Begin advertising the NDN service (idempotent). |
-| `stop` | Stop advertising and tear down the listener. |
-
-`start`/`stop` share one lifecycle with the `[listeners.ble]` auto-start, so the
-operator can toggle the peripheral at runtime. The backend is `BleControl` in
-`ndn-fwd`; the module returns `404` when the forwarder is built without
-`--features bluetooth`.
-
-Per-face knobs that aren't BLE-specific (persistency, MTU, lp-reliability) still
-go through the `faces` module, and central-creation knobs ride the `ble://`
-FaceUri query string — the `ble` module is only for peripheral/controller state
-(a future home for pairing/bonding).
+A central is an outgoing face created at runtime via `faces/create` with a
+`ble://` URI (`ble://ndn-rs-esp32c3`, `ble://AA:BB:CC:DD:EE:FF`); `?framing=`
+and `?adapter=` ride the query string, other per-face knobs go through the
+`faces` module. A peripheral is a listener (`[listeners.ble]` → `enabled =
+true`) whose accept loop yields one face per connected central. Because the
+peripheral carries controller state it gets a small management module
+`/localhost/nfd/ble/<verb>`: `list` (status: advertising, adapter, central
+count), `start` and `stop` (toggle advertising at runtime). The module returns
+`404` without `--features bluetooth`.
 
 ## Programmatic faces (not in `ndn-fwd.toml`)
 
-Some faces are constructed by application code rather than by
-listener config:
+Some faces are constructed by application code rather than by listener config:
 
 - `InProcFace` — created in the same process, paired between two
   engines. The pattern is in
@@ -235,15 +103,10 @@ listener config:
 
 ## Link service per face
 
-The default `LinkService` is `LpLinkService` (NDNLPv2 framing). The
-high-throughput exceptions:
-
-- `InProcFace` uses `PassthroughLinkService` — bytes go in, bytes
-  come out, no framing overhead.
-- `ShmFace` uses `PassthroughLinkService` by default;
-  switch to `LpLinkService` for cross-host wire compatibility.
-
-See `crates/ndn-transport/src/link_service.rs` for the trait.
+The default `LinkService` is `LpLinkService` (NDNLPv2 framing); the
+high-throughput exceptions use `PassthroughLinkService` — `InProcFace` always,
+and `ShmFace` by default (switch it to `LpLinkService` for cross-host wire
+compatibility). See `crates/ndn-transport/src/link_service.rs` for the trait.
 
 ## Per-face NDNLPv2 local fields
 
