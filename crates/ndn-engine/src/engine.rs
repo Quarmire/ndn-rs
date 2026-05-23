@@ -31,7 +31,7 @@ use ndn_packet::Interest;
 use ndn_security::SecurityManager;
 use ndn_security::Validator;
 use ndn_store::{ErasedContentStore, Pit, PitToken, StrategyTable};
-use ndn_strategy::MeasurementsTable;
+use ndn_strategy::{MeasurementsTable, SignalsTable};
 use ndn_transport::{
     BIT_CONGESTION_MARKING, BIT_LOCAL_FIELDS, BIT_LP_RELIABILITY, CongestionPolicy, FaceId,
     FacePersistency, FaceTable, NFD_FLAG_BITS,
@@ -232,6 +232,7 @@ pub struct EngineInner {
     pub cs: Arc<dyn ErasedContentStore>,
     pub face_table: Arc<FaceTable>,
     pub measurements: Arc<MeasurementsTable>,
+    pub signals: Arc<SignalsTable>,
     pub strategy_table: Arc<StrategyTable<dyn ErasedStrategy>>,
     #[cfg(not(target_arch = "wasm32"))]
     pub security: Option<Arc<SecurityManager>>,
@@ -334,6 +335,12 @@ impl ForwarderEngine {
     #[cfg_attr(not(feature = "experimental-instrument"), doc(hidden))]
     pub fn measurements(&self) -> Arc<MeasurementsTable> {
         Arc::clone(&self.inner.measurements)
+    }
+
+    /// The cross-layer signal store. Signal sources push readings here; the
+    /// strategy stage reads it via `StrategyContext::signals`.
+    pub fn signals(&self) -> Arc<SignalsTable> {
+        Arc::clone(&self.inner.signals)
     }
 
     #[cfg_attr(not(feature = "experimental-instrument"), doc(hidden))]

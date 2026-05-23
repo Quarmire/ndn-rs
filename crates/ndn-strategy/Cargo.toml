@@ -12,6 +12,7 @@ classification = "spec"
 ndn-runtime   = { workspace = true }
 ndn-store     = { workspace = true }
 ndn-transport = { workspace = true }
+ndn-signals-core = { workspace = true }
 bytes         = { workspace = true, features = ["std"] }
 linkme        = { workspace = true }
 smallvec      = { workspace = true }

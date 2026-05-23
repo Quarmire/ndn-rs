@@ -113,6 +113,7 @@ mod tests {
             fib_entry: fib,
             pit_token: None,
             measurements: m,
+            signals: &crate::NoSignals,
             extensions: &EMPTY,
             runtime: &RT,
         }

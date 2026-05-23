@@ -15,6 +15,7 @@ pub mod measurements;
 pub mod multicast;
 pub mod registry;
 pub mod self_learning;
+pub mod signals;
 pub mod strategy;
 
 pub use best_route::BestRouteStrategy;
@@ -25,4 +26,9 @@ pub use filter::StrategyFilter;
 pub use filters::RssiFilter;
 pub use measurements::{MeasurementsEntry, MeasurementsTable};
 pub use multicast::MulticastStrategy;
+// Cross-layer signals: re-export the core taxonomy/traits + the native store.
+pub use ndn_signals_core::{
+    CongestionLevel, GeoPos, LinkSignals, NoSignals, NodeSignals, SignalStore, SignalView,
+};
+pub use signals::SignalsTable;
 pub use strategy::{ScheduledEvent, Strategy};

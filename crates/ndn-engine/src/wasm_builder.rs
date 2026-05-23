@@ -19,7 +19,7 @@ use ndn_packet::Name;
 use ndn_runtime::{Runtime, default_runtime};
 use ndn_security::Validator;
 use ndn_store::{ErasedContentStore, LruCs, ObservableCs, Pit, StrategyTable};
-use ndn_strategy::{BestRouteStrategy, MeasurementsTable};
+use ndn_strategy::{BestRouteStrategy, MeasurementsTable, SignalsTable};
 use ndn_transport::{Face, FaceTable};
 use tokio_util::sync::CancellationToken;
 
@@ -159,6 +159,7 @@ impl WasmEngineBuilder {
         let cs: Arc<dyn ErasedContentStore> = Arc::new(ObservableCs::new(base_cs, None));
         let face_table = self.face_table;
         let measurements = Arc::new(MeasurementsTable::new());
+        let signals = Arc::new(SignalsTable::new());
 
         for face in self.pending_faces {
             face_table.insert_arc(face);
@@ -254,6 +255,7 @@ impl WasmEngineBuilder {
             cs: Arc::clone(&cs),
             face_table: Arc::clone(&face_table),
             measurements: Arc::clone(&measurements),
+            signals: Arc::clone(&signals),
             strategy_table: Arc::clone(&strategy_table),
             validator: validator.clone(),
             replay_guard: replay_guard.clone(),
@@ -292,6 +294,7 @@ impl WasmEngineBuilder {
                 default_strategy: Arc::clone(&default_strategy),
                 fib: Arc::clone(&fib),
                 measurements: Arc::clone(&measurements),
+                signals: Arc::clone(&signals),
                 pit: Arc::clone(&pit),
                 face_table: Arc::clone(&face_table),
                 enrichers: self.enrichers,

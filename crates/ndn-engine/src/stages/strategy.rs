@@ -24,7 +24,7 @@ fn is_localhop_name(name: &Name) -> bool {
         .is_some_and(|c| c.value.as_ref() == b"localhop")
 }
 use ndn_store::{Pit, StrategyTable};
-use ndn_strategy::{ErasedStrategy, MeasurementsTable, StrategyContext};
+use ndn_strategy::{ErasedStrategy, MeasurementsTable, SignalsTable, StrategyContext};
 use ndn_transport::face::FaceScope;
 
 /// Outcome of consulting the `NextHopFaceId` LP header (NDNLPv2 0x0330)
@@ -85,6 +85,7 @@ pub struct StrategyStage {
     pub default_strategy: Arc<dyn ErasedStrategy>,
     pub fib: Arc<Fib>,
     pub measurements: Arc<MeasurementsTable>,
+    pub signals: Arc<SignalsTable>,
     pub pit: Arc<Pit>,
     pub face_table: Arc<ndn_transport::FaceTable>,
     pub enrichers: Vec<Arc<dyn ContextEnricher>>,
@@ -179,6 +180,7 @@ impl StrategyStage {
             fib_entry: strategy_fib.as_ref(),
             pit_token: ctx.pit_token,
             measurements: &self.measurements,
+            signals: self.signals.as_ref(),
             extensions: &extensions,
             runtime: &self.runtime,
         };

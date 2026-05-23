@@ -26,9 +26,15 @@ impl StrategyFilter for RssiFilter {
         ctx: &StrategyContext,
         actions: SmallVec<[ForwardingAction; 2]>,
     ) -> SmallVec<[ForwardingAction; 2]> {
-        let snapshot = match ctx.extensions.get::<LinkQualitySnapshot>() {
-            Some(s) => s,
-            None => return actions,
+        // Canonical path: the cross-layer `SignalView`. Legacy fallback: the
+        // `LinkQualitySnapshot` enricher DTO (retired once all sources push
+        // into the SignalsTable — see signals design note step 7).
+        let legacy = ctx.extensions.get::<LinkQualitySnapshot>();
+        let rssi_for = |face_id: ndn_transport::FaceId| -> Option<i8> {
+            ctx.signals
+                .link(face_id)
+                .and_then(|l| l.rssi_dbm)
+                .or_else(|| legacy.and_then(|s| s.for_face(face_id)).and_then(|lq| lq.rssi_dbm))
         };
 
         actions
@@ -38,10 +44,7 @@ impl StrategyFilter for RssiFilter {
                     let filtered: SmallVec<[_; 4]> = faces
                         .into_iter()
                         .filter(|face_id| {
-                            snapshot
-                                .for_face(*face_id)
-                                .and_then(|lq| lq.rssi_dbm)
-                                .is_none_or(|rssi| rssi >= self.min_rssi_dbm)
+                            rssi_for(*face_id).is_none_or(|rssi| rssi >= self.min_rssi_dbm)
                         })
                         .collect();
                     if filtered.is_empty() {
@@ -66,9 +69,10 @@ mod tests {
     use smallvec::smallvec;
     use std::sync::Arc;
 
-    fn make_ctx_with_snapshot<'a>(
+    fn make_ctx<'a>(
         name: &'a Arc<Name>,
         measurements: &'a MeasurementsTable,
+        signals: &'a (dyn crate::SignalView<FaceId> + Send + Sync),
         extensions: &'a AnyMap,
     ) -> StrategyContext<'a> {
         static RUNTIME: std::sync::LazyLock<Arc<dyn ndn_runtime::Runtime>> =
@@ -79,9 +83,18 @@ mod tests {
             fib_entry: None,
             pit_token: None,
             measurements,
+            signals,
             extensions,
             runtime: &RUNTIME,
         }
+    }
+
+    fn make_ctx_with_snapshot<'a>(
+        name: &'a Arc<Name>,
+        measurements: &'a MeasurementsTable,
+        extensions: &'a AnyMap,
+    ) -> StrategyContext<'a> {
+        make_ctx(name, measurements, &crate::NoSignals, extensions)
     }
 
     #[test]
@@ -146,6 +159,34 @@ mod tests {
                 // FaceId(1) passes (-50 >= -60), FaceId(2) fails (-70 < -60), FaceId(3) passes (no RSSI = pass)
                 assert_eq!(faces.as_slice(), &[FaceId(1), FaceId(3)]);
             }
+            _ => panic!("expected Forward"),
+        }
+    }
+
+    #[test]
+    fn filters_from_signal_view() {
+        // Canonical path: RSSI read from the SignalsTable, not the legacy DTO.
+        use crate::{SignalStore, SignalsTable};
+        use ndn_signals_core::LinkSignals;
+
+        let name = Arc::new(Name::root());
+        let m = MeasurementsTable::new();
+        let ext = AnyMap::new();
+        let signals = SignalsTable::new();
+        signals.set_link(FaceId(1), LinkSignals { rssi_dbm: Some(-50), ..Default::default() });
+        signals.set_link(FaceId(2), LinkSignals { rssi_dbm: Some(-70), ..Default::default() });
+        // FaceId(3) has no signal -> passes (unknown = pass).
+        let ctx = make_ctx(&name, &m, &signals, &ext);
+
+        let filter = RssiFilter::new(-60);
+        let actions = smallvec![ForwardingAction::Forward(smallvec![
+            FaceId(1),
+            FaceId(2),
+            FaceId(3)
+        ])];
+        let result = filter.filter(&ctx, actions);
+        match &result[0] {
+            ForwardingAction::Forward(faces) => assert_eq!(faces.as_slice(), &[FaceId(1), FaceId(3)]),
             _ => panic!("expected Forward"),
         }
     }

@@ -14,7 +14,7 @@ use ndn_security::{
 use ndn_store::{
     CsAdmissionPolicy, CsObserver, ErasedContentStore, LruCs, ObservableCs, Pit, StrategyTable,
 };
-use ndn_strategy::{BestRouteStrategy, MeasurementsTable};
+use ndn_strategy::{BestRouteStrategy, MeasurementsTable, SignalsTable};
 use ndn_transport::{FaceTable, Transport};
 
 use crate::observability::targets as t;
@@ -274,6 +274,7 @@ impl EngineBuilder {
         };
         let face_table = self.face_table;
         let measurements = Arc::new(MeasurementsTable::new());
+        let signals = Arc::new(SignalsTable::new());
 
         for add_face in self.faces {
             add_face(Arc::clone(&face_table));
@@ -376,6 +377,7 @@ impl EngineBuilder {
             cs: Arc::clone(&cs),
             face_table: Arc::clone(&face_table),
             measurements: Arc::clone(&measurements),
+            signals: Arc::clone(&signals),
             strategy_table: Arc::clone(&strategy_table),
             security: self.security,
             validator: engine_validator,
@@ -416,6 +418,7 @@ impl EngineBuilder {
                 default_strategy: Arc::clone(&default_strategy),
                 fib: Arc::clone(&fib),
                 measurements: Arc::clone(&measurements),
+                signals: Arc::clone(&signals),
                 pit: Arc::clone(&pit),
                 face_table: Arc::clone(&face_table),
                 enrichers: self.enrichers,

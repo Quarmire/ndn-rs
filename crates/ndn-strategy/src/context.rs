@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use ndn_packet::Name;
 use ndn_runtime::Runtime;
+use ndn_signals_core::SignalView;
 use ndn_store::PitToken;
 use ndn_transport::{AnyMap, FaceId};
 
@@ -36,7 +37,13 @@ pub struct StrategyContext<'a> {
     pub fib_entry: Option<&'a FibEntry>,
     pub pit_token: Option<PitToken>,
     pub measurements: &'a MeasurementsTable,
-    /// Cross-layer data (radio metrics, flow stats) from `ContextEnricher`s.
+    /// External/environmental signals (RSSI, SNR, GPS, …) pushed by signal
+    /// sources. The canonical cross-layer input surface — read via
+    /// [`SignalView::link`] / [`SignalView::node`] / [`SignalView::neighbor`].
+    /// `&NoSignals` when no source is installed.
+    pub signals: &'a (dyn SignalView<FaceId> + Send + Sync),
+    /// Open-ended cross-layer DTOs from `ContextEnricher`s. Prefer
+    /// [`Self::signals`] for known metrics; this slot is for experimental data.
     pub extensions: &'a AnyMap,
     /// Platform-agnostic spawn/sleep handle used by
     /// [`crate::Strategy::schedule`].

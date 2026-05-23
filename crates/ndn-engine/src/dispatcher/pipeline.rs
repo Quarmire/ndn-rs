@@ -294,6 +294,7 @@ impl PacketDispatcher {
             fib_entry: strategy_fib.as_ref(),
             pit_token: Some(token),
             measurements: &self.strategy.measurements,
+            signals: self.strategy.signals.as_ref(),
             extensions: &extensions,
             runtime: &self.strategy.runtime,
         };
