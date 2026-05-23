@@ -219,6 +219,8 @@ fn write_varu64(buf: &mut BytesMut, v: u64) {
     }
 }
 
+pub type SharedCongestionMarkingFeature = Arc<CongestionMarkingFeature>;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,5 +306,3 @@ mod tests {
         assert_eq!(frag, bare_interest());
     }
 }
-
-pub type SharedCongestionMarkingFeature = Arc<CongestionMarkingFeature>;
