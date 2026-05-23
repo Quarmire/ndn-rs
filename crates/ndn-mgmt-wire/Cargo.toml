@@ -1,0 +1,17 @@
+[package]
+name = "ndn-mgmt-wire"
+description = "Shared no_std codec for NFD management wire formats (ForwarderStatus dataset), used byte-identically by the native engine and the embedded forwarder"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+classification = "spec"
+
+[features]
+# no_std + alloc (uses bytes::Bytes / alloc::string::String). Never gains std.
+default = []
+
+[dependencies]
+ndn-tlv = { workspace = true }
+bytes   = { workspace = true }
