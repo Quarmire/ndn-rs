@@ -189,6 +189,42 @@ Browser callers build the engine in-page with
 `ndn-engine` directly. The split is intentional and documented in
 the prelude crate's top-level docs.
 
+## Cross-platform parity {#parity}
+
+The endpoint API keeps the same *names and arguments* on every target,
+so application logic ports unchanged. The execution model is the only
+divergence — and it is forced by the platform, not chosen:
+
+| Axis | native / browser | embedded (`ndn-embedded`) |
+|---|---|---|
+| Suspension | `async fn … .await` | `nb::Result` poll (`WouldBlock`) |
+| Result | owned `Data` / `Bytes` | borrowed `&[u8]` into an `MTU` buffer |
+| Sizing | heap | const-generic buffers, no alloc |
+| Ownership | `Arc<Engine>`, `&self` | `&mut Forwarder<…>` |
+
+The packet, name, and signing primitives (`Name`, `Interest`, `Data`,
+Ed25519 sign/verify) are the *same crates* on all three targets, so
+only the seam above changes. `ndn-embedded` exposes
+`Consumer::fetch(name)` and `Producer::serve(handler)` — the same verbs
+as this tier, returning `nb::Result` rather than a future:
+
+```rust,ignore
+use ndn_embedded::{Consumer, Producer};
+
+// native:   let data = consumer.fetch("/ndn/sensor/temp").await?;
+// embedded:  poll the same call (here driven to completion with nb::block!)
+let mut c: Consumer<_> = Consumer::new(&mut face, seed);
+let data: &[u8] = nb::block!(c.fetch("/ndn/sensor/temp"))?;
+
+// native:   producer.serve(|interest, responder| async move { … }).await?;
+// embedded:  one Interest per poll, from your event loop
+let mut p: Producer<_> = Producer::new(&mut face, "/app");
+let _ = p.serve(|_name, out| {
+    out[..2].copy_from_slice(b"on");
+    Some(2) // content length, or None to decline
+});
+```
+
 ## What this tier does not expose
 
 The Develop tier deliberately omits:
