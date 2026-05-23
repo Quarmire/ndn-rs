@@ -283,10 +283,21 @@ impl PacketDispatcher {
                     .collect(),
             });
 
-        let mut extensions = ndn_transport::AnyMap::new();
-        for enricher in &self.strategy.enrichers {
-            enricher.enrich(strategy_fib.as_ref(), &mut extensions);
-        }
+        // See StrategyStage::process — skip the per-packet AnyMap when no
+        // enricher is registered (known signals come from `signals`).
+        let built_extensions;
+        let extensions: &ndn_transport::AnyMap = if self.strategy.enrichers.is_empty() {
+            static EMPTY: std::sync::LazyLock<ndn_transport::AnyMap> =
+                std::sync::LazyLock::new(ndn_transport::AnyMap::new);
+            &EMPTY
+        } else {
+            let mut e = ndn_transport::AnyMap::new();
+            for enricher in &self.strategy.enrichers {
+                enricher.enrich(strategy_fib.as_ref(), &mut e);
+            }
+            built_extensions = e;
+            &built_extensions
+        };
 
         let sctx = ndn_strategy::StrategyContext {
             name: &name,
@@ -295,7 +306,7 @@ impl PacketDispatcher {
             pit_token: Some(token),
             measurements: &self.strategy.measurements,
             signals: self.strategy.signals.as_ref(),
-            extensions: &extensions,
+            extensions,
             runtime: &self.strategy.runtime,
         };
 

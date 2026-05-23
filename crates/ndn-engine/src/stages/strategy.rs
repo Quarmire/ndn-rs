@@ -169,10 +169,21 @@ impl StrategyStage {
                     .collect(),
             });
 
-        let mut extensions = AnyMap::new();
-        for enricher in &self.enrichers {
-            enricher.enrich(strategy_fib.as_ref(), &mut extensions);
-        }
+        // Hot path: known cross-layer inputs (RSSI, GPS, …) come from
+        // `signals`, so when no open-ended enricher is registered we skip
+        // building a per-packet AnyMap entirely and share one empty map.
+        let built_extensions;
+        let extensions: &AnyMap = if self.enrichers.is_empty() {
+            static EMPTY: std::sync::LazyLock<AnyMap> = std::sync::LazyLock::new(AnyMap::new);
+            &EMPTY
+        } else {
+            let mut e = AnyMap::new();
+            for enricher in &self.enrichers {
+                enricher.enrich(strategy_fib.as_ref(), &mut e);
+            }
+            built_extensions = e;
+            &built_extensions
+        };
 
         let sctx = StrategyContext {
             name: &name,
@@ -181,7 +192,7 @@ impl StrategyStage {
             pit_token: ctx.pit_token,
             measurements: &self.measurements,
             signals: self.signals.as_ref(),
-            extensions: &extensions,
+            extensions,
             runtime: &self.runtime,
         };
 
