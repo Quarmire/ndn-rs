@@ -142,6 +142,25 @@ impl MgmtClient {
         self.command(module::FACES, verb::DESTROY, &params).await
     }
 
+    /// Update per-face flags: `faces/update`. `flags` carries the desired bit
+    /// values, `mask` selects which bits to write (bit 0 = LocalFields,
+    /// 1 = LpReliability, 2 = CongestionMarking); bits outside the mask are
+    /// preserved.
+    pub async fn face_update(
+        &self,
+        face_id: u64,
+        flags: u64,
+        mask: u64,
+    ) -> Result<ControlParameters, ForwarderError> {
+        let params = ControlParameters {
+            face_id: Some(face_id),
+            flags: Some(flags),
+            mask: Some(mask),
+            ..Default::default()
+        };
+        self.command(module::FACES, verb::UPDATE, &params).await
+    }
+
     /// `faces/list` decoded as NFD `FaceStatus` entries.
     pub async fn face_list(&self) -> Result<Vec<ndn_config::FaceStatus>, ForwarderError> {
         let bytes = self.dataset_raw(module::FACES, verb::LIST).await?;
