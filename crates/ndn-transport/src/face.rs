@@ -63,6 +63,11 @@ pub enum FaceKind {
     /// NDNLPv2-fragmented to `maxDatagramSize` (interoperates with NDNts).
     /// Listens for browsers and dials peer forwarders.
     WebTransport,
+    /// Raw QUIC face — forwarder-to-forwarder backbone link (TLS 1.3,
+    /// connection migration, 0-RTT). One reliable bidirectional stream of
+    /// length-delimited NDN TLV; no HTTP/3 layer (unlike WebTransport, it
+    /// does not reach browsers).
+    Quic,
     /// WebRTC datachannel (peer-to-peer SCTP/DTLS); browser-as-peer transport.
     /// Local-scope by classification (signaling typically loopback), trust
     /// boundary matches `WebTransport`.
@@ -93,7 +98,8 @@ impl FaceKind {
             | FaceKind::Tcp
             | FaceKind::WebSocket
             | FaceKind::WebTransport
-            | FaceKind::WebRtc => ScopePolicy::ByRemoteAddress,
+            | FaceKind::WebRtc
+            | FaceKind::Quic => ScopePolicy::ByRemoteAddress,
         }
     }
 
@@ -119,7 +125,8 @@ impl FaceKind {
             | FaceKind::Multicast
             | FaceKind::WebSocket
             | FaceKind::WebTransport
-            | FaceKind::WebRtc => true,
+            | FaceKind::WebRtc
+            | FaceKind::Quic => true,
         }
     }
 
@@ -147,6 +154,7 @@ impl core::fmt::Display for FaceKind {
             Self::WebSocket => "web-socket",
             Self::WebTransport => "web-transport",
             Self::WebRtc => "web-rtc",
+            Self::Quic => "quic",
             Self::Management => "management",
         })
     }
@@ -172,6 +180,7 @@ impl core::str::FromStr for FaceKind {
             "multicast" => Ok(Self::Multicast),
             "web-socket" => Ok(Self::WebSocket),
             "web-transport" => Ok(Self::WebTransport),
+            "quic" => Ok(Self::Quic),
             "management" => Ok(Self::Management),
             _ => Err(()),
         }
