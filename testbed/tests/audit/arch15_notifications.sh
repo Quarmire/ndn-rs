@@ -36,7 +36,7 @@ check_grep() {
     fi
 }
 
-MGMT=crates/spec/ndn-mgmt
+MGMT=crates/ndn-mgmt
 
 # (1) Trait + struct + per-module event types exist.
 check_grep 'pub struct NotificationStream'    "$MGMT/src/notification.rs" 'NotificationStream struct'

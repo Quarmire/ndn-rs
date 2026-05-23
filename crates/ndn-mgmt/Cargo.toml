@@ -1,0 +1,76 @@
+[package]
+name = "ndn-mgmt"
+description = "NFD-compatible NDN management dispatcher (modules: rib, faces, fib, cs, strategy-choice, status, neighbors, service, security, routing, discovery, log)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+classification = "spec"
+
+[features]
+# Forwarded by binaries. Off by default — the library compiles standalone.
+yubikey-piv = ["ndn-security/yubikey-piv", "ndn-cert/yubikey-challenge", "dep:base64"]
+spsc-shm    = ["ndn-faces/spsc-shm"]
+# Enables ble:// (central) and ble-peripheral:// (server) faces/create arms.
+bluetooth   = ["ndn-faces/bluetooth"]
+# Enables the wts:// faces/create arm (outbound WebTransport dial).
+webtransport = ["dep:ndn-face-webtransport"]
+
+[dependencies]
+# Portable deps — build on every target including wasm32-unknown-unknown.
+ndn-engine       = { workspace = true }
+ndn-face-local   = { workspace = true }
+# `ndn-faces` is pulled only for native-only face transports (UDP/TCP/SHM
+# creation, IPC listeners); see the target-cfg section below.
+
+ndn-strategy     = { workspace = true }
+# `default-features = false` skips ndn-security's `sqlite-pib` (libsqlite3-sys
+# does not build on wasm). Native consumers of ndn-mgmt re-enable defaults
+# via their own dep declaration; cargo unifies the feature set so FilePib
+# etc. remain available on native builds.
+# Inline path deps (not workspace inherited) so we can pass
+# `default-features = false` — workspace inheritance can only ADD
+# features, not override defaults. The native consumers of ndn-mgmt
+# still pull the full feature set via their own workspace deps; cargo
+# unifies, so FilePib + sqlite-pib + yubikey-challenge remain available
+# on native builds.
+ndn-security     = { path = "../ndn-security", default-features = false }
+ndn-cert         = { path = "../ndn-cert",     default-features = false }
+ndn-config       = { workspace = true }
+ndn-packet       = { workspace = true, features = ["std"] }
+ndn-tlv          = { workspace = true }
+ndn-transport    = { workspace = true }
+
+bytes            = { workspace = true, features = ["std"] }
+# `web_time::Instant` is wire-compatible with `std::time::Instant` on
+# native and uses `performance.now()` on wasm32; the engine's RibRoute
+# uses it so we must match.
+web-time         = { workspace = true }
+base64           = { workspace = true, optional = true }
+# `net` and `io-util` are native-only; the wasm32 target excludes them
+# below.  `rt + macros + time + sync` is enough for `tokio::select!`,
+# `tokio::time::timeout`, and `tokio::spawn` on wasm.
+tokio            = { workspace = true, features = ["rt", "macros", "time", "sync"] }
+tokio-util       = { workspace = true, features = ["rt"] }
+tracing          = { workspace = true }
+async-trait      = { workspace = true }
+getrandom        = { workspace = true }
+serde            = { workspace = true, features = ["derive"] }
+serde_json       = { workspace = true }
+
+# Native-only deps. ndn-discovery/ndn-routing both pull tokio's `net`
+# feature (mio), which does not build on wasm32.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ndn-discovery    = { workspace = true, features = ["udp-hello"] }
+ndn-routing      = { workspace = true }
+ndn-faces        = { workspace = true }
+# Optional: the wts:// faces/create dialer (pulls the QUIC stack).
+ndn-face-webtransport = { workspace = true, optional = true }
+# ndn-app powers the status_bridge.rs Producer mount (ARCH-6 / S11).
+ndn-app          = { workspace = true }
+tokio            = { workspace = true, features = ["net", "io-util"] }
+libc             = { workspace = true }
+
+[dev-dependencies]
+tempfile         = "3"

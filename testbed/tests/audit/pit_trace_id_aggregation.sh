@@ -42,7 +42,7 @@ check_grep() {
     fi
 }
 
-PIT=crates/spec/ndn-store/src/pit.rs
+PIT=crates/ndn-store/src/pit.rs
 
 # (a) Field on InRecord.
 check_grep 'trace_ids:' "$PIT" 'InRecord.trace_ids field'

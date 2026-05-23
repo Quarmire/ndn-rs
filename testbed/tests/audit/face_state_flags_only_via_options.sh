@@ -14,13 +14,13 @@
 #              accessor methods on `FaceState`.
 #
 # Witnesses:
-#   (a) GREP-PROOF — `crates/spec/ndn-transport/src/face_options.rs`
+#   (a) GREP-PROOF — `crates/ndn-transport/src/face_options.rs`
 #       defines the three `BIT_*` constants.
 #   (b) GREP-PROOF — `FaceState` has the accessor methods
 #       (`face_flags_raw`, `apply_face_flags_mask`,
 #       `set_local_fields_bit`, etc.) — checked by name.
 #   (c) GREP-PROOF — outside `engine.rs` and `face_options.rs`, NO
-#       file in `crates/spec/ndn-mgmt/` or `crates/spec/ndn-engine/`
+#       file in `crates/ndn-mgmt/` or `crates/ndn-engine/`
 #       touches `.flags.load|.flags.store|.flags.fetch_or|.flags.fetch_and`
 #       on a `FaceState` reference.  Mgmt and external sites go
 #       through accessors.
@@ -57,9 +57,9 @@ check_absent_in_paths() {
     fi
 }
 
-FACE_OPTIONS=crates/spec/ndn-transport/src/face_options.rs
-ENGINE=crates/spec/ndn-engine/src/engine.rs
-MGMT_FACES=crates/spec/ndn-mgmt/src/modules/faces.rs
+FACE_OPTIONS=crates/ndn-transport/src/face_options.rs
+ENGINE=crates/ndn-engine/src/engine.rs
+MGMT_FACES=crates/ndn-mgmt/src/modules/faces.rs
 
 # (a) Bit constants live in face_options.rs.
 check_grep '\bBIT_LOCAL_FIELDS\b'      "$FACE_OPTIONS" 'BIT_LOCAL_FIELDS const'

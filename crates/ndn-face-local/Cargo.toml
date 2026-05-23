@@ -1,0 +1,29 @@
+[package]
+name = "ndn-face-local"
+description = "In-process NDN face (InProcFace / InProcHandle) backed by tokio::sync::mpsc — wasm-clean"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+classification = "spec"
+
+[features]
+default = []
+# Phase 3 Instrument-tier — opts researchers into `InProcFace::new_kind`
+# in `cargo doc` output. The method stays `pub` so in-tree callers
+# (mgmt dispatcher, compute responders) keep compiling without the
+# feature. 
+experimental-instrument = []
+
+[dependencies]
+bytes         = { workspace = true, features = ["std"] }
+ndn-transport = { workspace = true }
+# `sync` is the only feature this crate needs.  Deliberately *not* pulling
+# `net` / `io-util` keeps `mio` out of the dep tree so the crate builds
+# cleanly on wasm32-unknown-unknown.
+tokio         = { workspace = true, features = ["sync"] }
+
+[dev-dependencies]
+tokio   = { workspace = true, features = ["rt", "macros", "sync"] }
+ndn-tlv = { workspace = true, features = ["std"] }

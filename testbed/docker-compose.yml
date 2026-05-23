@@ -42,7 +42,7 @@ services:
   ndn-fwd:
     build:
       context: ..
-      dockerfile: binaries/spec/ndn-fwd/Dockerfile
+      dockerfile: binaries/ndn-fwd/Dockerfile
     container_name: ndn-fwd
     hostname: ndn-fwd
     networks:
@@ -250,7 +250,7 @@ services:
   ndn-fwd-nlsr:
     build:
       context: ..
-      dockerfile: binaries/spec/ndn-fwd/Dockerfile
+      dockerfile: binaries/ndn-fwd/Dockerfile
     container_name: ndn-fwd-nlsr
     environment:
       RUST_LOG: "info"
@@ -283,7 +283,7 @@ services:
     image: ndn-testbed-ndn-fwd:latest
     build:
       context: ..
-      dockerfile: binaries/spec/ndn-fwd/Dockerfile
+      dockerfile: binaries/ndn-fwd/Dockerfile
     container_name: ndn-fwd-dv
     environment:
       RUST_LOG: "info,routing.dv=debug,face.udp=info"
@@ -324,7 +324,7 @@ services:
   # Runs `ndnd dv run` against an `insecure`-mode config that lists
   # ndn-fwd-dv (172.30.0.40) as its only neighbour. ndnd's DV daemon
   # speaks Adv Sync and Pfx Sync via /localhop, exactly the wire
-  # contract `crates/spec/ndn-routing/src/protocols/dv/` implements.
+  # contract `crates/ndn-routing/src/protocols/dv/` implements.
   ndnd-dv:
     profiles: ["dv-interop"]
     image: ghcr.io/named-data/ndnd:latest
@@ -375,7 +375,7 @@ services:
     profiles: ["demo"]
     build:
       context: ..
-      dockerfile: binaries/spec/ndn-fwd/Dockerfile
+      dockerfile: binaries/ndn-fwd/Dockerfile
     container_name: dioxus-demo-fwd
     hostname: dioxus-demo-fwd
     networks:

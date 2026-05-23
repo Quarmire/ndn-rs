@@ -11,7 +11,7 @@
 # Witness:     RUST-UNIT
 #                d06_pit_out_record_detects_duplicate_face_nonce
 #              The fix lives in
-#              crates/spec/ndn-engine/src/stages/strategy.rs:
+#              crates/ndn-engine/src/stages/strategy.rs:
 #              after a `ForwardingAction::Forward` decision, every
 #              effective out-face is filtered through the PIT
 #              entry's out-records and admitted only when no
@@ -31,7 +31,7 @@ fi
 
 # Anchor the prose claim: strategy stage must read out_records.
 if ! grep -q "or.face_id == fid.0 && or.last_nonce == nonce" \
-        crates/spec/ndn-engine/src/stages/strategy.rs; then
+        crates/ndn-engine/src/stages/strategy.rs; then
     echo "FAIL: StrategyStage no longer consults PIT out_records"
     exit 1
 fi

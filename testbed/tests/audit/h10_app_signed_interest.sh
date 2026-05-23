@@ -17,7 +17,7 @@
 #              the Ed25519 signature. SignatureType must be Ed25519.
 #
 # Scope note: ndn-app::security re-exports ndn_security::KeyChain directly
-# (crates/spec/ndn-app/src/security.rs). Tests in ndn-security cover
+# (crates/ndn-app/src/security.rs). Tests in ndn-security cover
 # the behaviour; this witness confirms the inheritance path is correct.
 #
 # Exit codes:  0 PASS / 1 FAIL / 2 SKIP

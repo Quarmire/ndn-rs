@@ -9,13 +9,13 @@
 #              No API change in v0.1 — document the scope.
 #
 # Witnesses:
-#   (a) GREP-PROOF — `crates/spec/ndn-strategy/src/filter.rs`
+#   (a) GREP-PROOF — `crates/ndn-strategy/src/filter.rs`
 #       documents the builder-only scope on both the module-level
 #       docstring and the trait itself.
 #   (b) GREP-PROOF — the strategy-composition wiki page covers the
 #       scope decision under a dedicated heading.
 #   (c) GREP-PROOF — no `MgmtModule` impl under
-#       `crates/spec/ndn-mgmt/src/modules/strategy.rs` references
+#       `crates/ndn-mgmt/src/modules/strategy.rs` references
 #       `StrategyFilter` (the mgmt surface stays single-strategy).
 #
 # Reverify recipe: GREP-PROOF only. Runs in any checkout of ndn-rs.
@@ -47,9 +47,9 @@ check_absent_in_file() {
     fi
 }
 
-FILTER=crates/spec/ndn-strategy/src/filter.rs
+FILTER=crates/ndn-strategy/src/filter.rs
 WIKI=docs/wiki/src/design/strategy-composition.md
-MGMT_STRATEGY=crates/spec/ndn-mgmt/src/modules/strategy.rs
+MGMT_STRATEGY=crates/ndn-mgmt/src/modules/strategy.rs
 
 # (1) Module-level + trait-level docs explain the builder-only scope.
 check_grep 'advanced engine-builder use only' "$FILTER" 'module-level scope doc'

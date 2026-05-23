@@ -26,7 +26,7 @@ command -v cargo >/dev/null 2>&1 || { echo "SKIP: cargo not in PATH" >&2; exit 2
 fail=0
 CRATE_DIR=$(find crates -type d -name ndn-fwd-core 2>/dev/null | head -1)
 STORE=$(find "$CRATE_DIR/src" -name store.rs 2>/dev/null | head -1)
-FWD=crates/extension/ndn-embedded/src/forwarder.rs
+FWD=crates/ndn-embedded/src/forwarder.rs
 
 # (a) PitStore write surface, slice-keyed.
 for m in record_pending satisfy discard_pending; do

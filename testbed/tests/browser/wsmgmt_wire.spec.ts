@@ -1,7 +1,7 @@
 /**
  * Witness — ndn-dashboard `WsMgmtClient` against a live `ndn-fwd`.
  *
- * Browser-side counterpart to `crates/spec/ndn-mgmt/tests/web_wire_e2e.rs`.
+ * Browser-side counterpart to `crates/ndn-mgmt/tests/web_wire_e2e.rs`.
  * Where the native test proves the wire bytes parse correctly inside
  * `mount_management`, this one proves the *production browser path* —
  * `InterestBuilder::app_parameters(ControlParameters::encode())`

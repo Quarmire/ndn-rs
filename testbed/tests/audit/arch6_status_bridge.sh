@@ -9,7 +9,7 @@
 #   (b) GREP-PROOF — `DvInstaller::install` calls
 #       `mount_routing_status` with a DV-shape `Status` TLV provider
 #       at `/localhost/nlsr/status` (wire-compat with ndnd `dvc`).
-#   (c) RUST-INTEG — `crates/spec/ndn-mgmt/tests/status_bridge.rs`
+#   (c) RUST-INTEG — `crates/ndn-mgmt/tests/status_bridge.rs`
 #       exercises the full install → build → apply → Producer-serve
 #       path: a subscriber face sends an Interest at the status
 #       prefix, the producer task replies with the bytes the
@@ -41,8 +41,8 @@ check_grep() {
     fi
 }
 
-MGMT=crates/spec/ndn-mgmt
-FWD=binaries/spec/ndn-fwd
+MGMT=crates/ndn-mgmt
+FWD=binaries/ndn-fwd
 
 # (1) The bridge helper exists + is re-exported.
 check_grep 'pub fn mount_routing_status'             "$MGMT/src/status_bridge.rs" 'mount_routing_status helper'

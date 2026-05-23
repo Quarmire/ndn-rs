@@ -1,0 +1,44 @@
+[package]
+name = "ndn-transport"
+description = "NDN Face trait, FaceId, FaceTable, RawPacket, TlvCodec, and FacePairTable"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+classification = "spec"
+
+[features]
+default = []
+serde = ["dep:serde"]
+
+[dependencies]
+ndn-tlv    = { workspace = true, features = ["std"] }
+bytes      = { workspace = true, features = ["std"] }
+futures    = { workspace = true }
+tokio      = { workspace = true, features = ["sync"] }
+tokio-util = { workspace = true, features = ["codec"] }
+thiserror  = { workspace = true }
+smallvec   = { workspace = true }
+serde      = { workspace = true, optional = true }
+web-time   = "1"
+
+# ring (via ndn-packet "std") doesn't build for wasm32-unknown-unknown.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ndn-packet = { workspace = true, features = ["std"] }
+dashmap    = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+ndn-packet = { workspace = true, features = ["std-wasm"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["sync", "macros", "rt"] }
+# Face-system Tier 4 §9.9 — TraceContextFeature OTel-overhead bench.
+# Native-only because Criterion does not run on wasm32.
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "face_otel_overhead"
+harness = false

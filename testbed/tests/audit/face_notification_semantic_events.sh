@@ -33,7 +33,7 @@ cd "$REPO_ROOT"
 
 fail=0
 
-TEST=crates/spec/ndn-mgmt/tests/face_notification_semantic_events.rs
+TEST=crates/ndn-mgmt/tests/face_notification_semantic_events.rs
 if [ ! -f "$TEST" ]; then
     echo "FAIL: integration test $TEST missing" >&2
     fail=1

@@ -10,7 +10,7 @@
 #              Name ‖ router-id)[..16].
 #
 # Witnesses:
-#   (a) GREP-PROOF — `crates/spec/ndn-packet/src/lp/trace_context.rs`
+#   (a) GREP-PROOF — `crates/ndn-packet/src/lp/trace_context.rs`
 #       exists; defines `TraceContext`, `TraceId`, `SpanId`,
 #       `TraceFlags`; `TLV_TRACE_CONTEXT` pinned to 0x520.
 #   (b) RUST-UNIT — `cargo test -p ndn-packet trace_context`
@@ -58,7 +58,7 @@ check_absent_in_paths() {
     fi
 }
 
-TC_FILE=crates/spec/ndn-packet/src/lp/trace_context.rs
+TC_FILE=crates/ndn-packet/src/lp/trace_context.rs
 
 # (a) File + types + TLV constant.
 check_grep 'pub struct TraceContext'  "$TC_FILE" 'TraceContext struct'

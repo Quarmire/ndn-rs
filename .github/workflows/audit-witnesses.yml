@@ -176,7 +176,7 @@ jobs:
   # Build time note: the ndn-fwd Docker image compiles the full Rust workspace
   # in release mode.  Cold builds take ~10 min; the BuildKit GHA layer cache
   # speeds up runs where only post-COPY source files changed.
-  # TODO: adopt cargo-chef in binaries/spec/ndn-fwd/Dockerfile to separate the
+  # TODO: adopt cargo-chef in binaries/ndn-fwd/Dockerfile to separate the
   # dependency compilation layer from the source compilation layer, reducing
   # incremental rebuilds to ~2–3 min.
   interop:
@@ -200,12 +200,12 @@ jobs:
         # cached layers — the compose rebuild is effectively instantaneous on
         # cache hit.
         # Cold build (empty GHA cache or Cargo.lock changed): ~8–10 min.
-        # TODO: adopt cargo-chef in binaries/spec/ndn-fwd/Dockerfile to make
+        # TODO: adopt cargo-chef in binaries/ndn-fwd/Dockerfile to make
         # incremental source-only rebuilds fast (~2–3 min).
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: binaries/spec/ndn-fwd/Dockerfile
+          file: binaries/ndn-fwd/Dockerfile
           push: false
           load: true
           tags: ndn-fwd-nlsr:ci
@@ -241,7 +241,7 @@ jobs:
         #     receive loop, but neither side appears to either install
         #     the remote LSA (when sync update carries mapping bytes)
         #     nor send the LSA-fetch Interest (when the update doesn't).
-        #     Likely in crates/spec/ndn-routing/src/protocols/nlsr/
+        #     Likely in crates/ndn-routing/src/protocols/nlsr/
         #     sync.rs — the sync_loop receive path or the lsa_io_task
         #     dispatcher.
         #

@@ -22,7 +22,7 @@ cd "$REPO_ROOT"
 
 fail=0
 CRATE_DIR=$(find crates -type d -name ndn-fwd-core 2>/dev/null | head -1)
-EMB_CS=crates/extension/ndn-embedded/src/cs.rs
+EMB_CS=crates/ndn-embedded/src/cs.rs
 
 if [ -z "$CRATE_DIR" ]; then
     echo "FAIL: ndn-fwd-core not found (EMB-01 must pass first)" >&2

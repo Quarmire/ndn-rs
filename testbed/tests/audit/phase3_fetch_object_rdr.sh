@@ -5,16 +5,16 @@
 # Finding:     docs/notes/tiered-api-design-2026-05-20.md §2.5
 # Severity:    Phase 3 deliverable (pre-v0.1.0)
 # Witnesses:
-#   (a) GREP-PROOF — `crates/spec/ndn-app/src/consumer.rs` exposes
+#   (a) GREP-PROOF — `crates/ndn-app/src/consumer.rs` exposes
 #       `pub async fn fetch_object`.
-#   (b) GREP-PROOF — `crates/spec/ndn-app/src/producer.rs` exposes
+#   (b) GREP-PROOF — `crates/ndn-app/src/producer.rs` exposes
 #       `pub async fn publish_object`.
 #   (c) GREP-PROOF — the RDR helpers (`MetaData`, `metadata_name`,
-#       `PreparedObject`) live in `crates/spec/ndn-app/src/rdr.rs` and
+#       `PreparedObject`) live in `crates/ndn-app/src/rdr.rs` and
 #       reference `<name>/32=metadata` via the `METADATA_KEYWORD`
 #       constant.
 #   (d) RUST-INTEG — the two-engine round-trip
-#       `crates/spec/ndn-app/tests/rdr_round_trip.rs` passes (
+#       `crates/ndn-app/tests/rdr_round_trip.rs` passes (
 #       producer publishes a 20 000-byte segmented object,
 #       consumer reassembles via metadata + segment fetches,
 #       byte equality asserted).
@@ -43,10 +43,10 @@ check_grep() {
     fi
 }
 
-CONS=crates/spec/ndn-app/src/consumer.rs
-PROD=crates/spec/ndn-app/src/producer.rs
-RDR=crates/spec/ndn-app/src/rdr.rs
-TEST=crates/spec/ndn-app/tests/rdr_round_trip.rs
+CONS=crates/ndn-app/src/consumer.rs
+PROD=crates/ndn-app/src/producer.rs
+RDR=crates/ndn-app/src/rdr.rs
+TEST=crates/ndn-app/tests/rdr_round_trip.rs
 
 # (a)(b)(c) — surface presence.
 check_grep 'pub async fn fetch_object'   "$CONS" 'Consumer::fetch_object exists'

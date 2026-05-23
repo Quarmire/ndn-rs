@@ -1,0 +1,200 @@
+//! Native-only listener loops — accept incoming face / udp / tcp
+//! connections and add each new peer to the engine face table.
+
+#![cfg(not(target_arch = "wasm32"))]
+
+use std::sync::Arc;
+
+use ndn_engine::ForwarderEngine;
+use ndn_transport::FaceId;
+use tokio_util::sync::CancellationToken;
+
+/// Best-effort `SO_RCVBUF` bump (Unix). Failure is logged but non-fatal.
+/// Effective ceiling: `net.core.rmem_max` on Linux (doubled by the
+/// kernel), `kern.ipc.maxsockbuf` on macOS. Not supported on Windows.
+#[cfg(unix)]
+fn set_recv_buf_size(socket: &tokio::net::UdpSocket, size: usize) {
+    use std::os::fd::AsRawFd;
+    let fd = socket.as_raw_fd();
+    let size = size as libc::c_int;
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &size as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if ret != 0 {
+        tracing::warn!(
+            target: "face.udp",
+            error=%std::io::Error::last_os_error(),
+            "udp-listener: failed to set SO_RCVBUF (continuing with default)"
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn set_recv_buf_size(_socket: &tokio::net::UdpSocket, _size: usize) {}
+
+/// Accept NDN face connections on `path` and register each as a dynamic face.
+///
+/// `path` is a Unix domain socket path on Unix (e.g. `/run/nfd/nfd.sock`)
+/// or a Named Pipe path on Windows (e.g. `\\.\pipe\ndn`).
+pub async fn run_face_listener(path: &str, engine: ForwarderEngine, cancel: CancellationToken) {
+    let listener = match ndn_faces::local::IpcListener::bind(path) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!(target: "face.system", path = %path, error = %e, "face-listener: bind failed");
+            return;
+        }
+    };
+
+    tracing::info!(target: "face.system", path = %listener.uri(), "NDN face listener ready");
+
+    loop {
+        let face_id = engine.faces().alloc_id();
+        let face = tokio::select! {
+            _ = cancel.cancelled() => break,
+            r = listener.accept(face_id) => match r {
+                Ok(f)  => f,
+                Err(e) => {
+                    tracing::warn!(target: "face.system", error = %e, "face-listener: accept error");
+                    continue;
+                }
+            },
+        };
+
+        tracing::debug!(target: "face.system", face = %face_id, "face-listener: accepted management connection");
+        // Per-connection child token isolates teardown to one peer.
+        let conn_cancel = cancel.child_token();
+        engine.add_face(face, conn_cancel);
+    }
+
+    listener.cleanup();
+    tracing::info!(target: "face.system", "NDN face listener stopped");
+}
+
+/// Listen for incoming UDP datagrams on `bind_addr` and auto-create a
+/// `UdpFace` per source address (NFD "UDP channel" pattern).
+///
+/// A single unconnected socket serves every peer. The per-peer face
+/// shares the listener socket for sending via `send_to`; inbound bytes
+/// are demuxed by the listener and injected directly into the pipeline,
+/// since the face's own `recv()` would race the listener for the same
+/// socket.
+pub async fn run_udp_listener(
+    bind_addr: std::net::SocketAddr,
+    engine: ForwarderEngine,
+    cancel: CancellationToken,
+) {
+    let socket = match tokio::net::UdpSocket::bind(bind_addr).await {
+        Ok(s) => {
+            // Default OS buffer (~212 KB on Linux) is too small for
+            // fragment bursts at high window sizes and causes drops.
+            set_recv_buf_size(&s, 4 * 1024 * 1024);
+            Arc::new(s)
+        }
+        Err(e) => {
+            tracing::error!(target: "face.udp", addr=%bind_addr, error=%e, "udp-listener: bind failed");
+            return;
+        }
+    };
+
+    let local = socket.local_addr().unwrap_or(bind_addr);
+    tracing::info!(target: "face.udp", addr=%local, "UDP listener ready");
+
+    // Dedupe faces by (IP, port). Replies go to the datagram's source
+    // address so consumer apps on ephemeral ports — not port 6363 —
+    // still receive the Data.
+    let mut peers = std::collections::HashMap::<std::net::SocketAddr, FaceId>::new();
+    let mut buf = [0u8; 9000];
+
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            r = socket.recv_from(&mut buf) => {
+                let (n, src) = match r {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        tracing::warn!(target: "face.udp", error=%e, "udp-listener: recv error");
+                        continue;
+                    }
+                };
+
+                tracing::debug!(target: "face.udp", src=%src, len=n, "udp-listener: recv packet");
+                let raw = bytes::Bytes::copy_from_slice(&buf[..n]);
+
+                let face_id = if let Some(&id) = peers.get(&src) {
+                    id
+                } else {
+                    // New peer: send-only UdpFace sharing the listener
+                    // socket. Inbound bytes come from the listener's
+                    // demux via `inject_packet`, so no recv loop runs.
+                    let face_id = engine.faces().alloc_id();
+                    let face = ndn_faces::net::UdpFace::from_shared_socket(
+                        face_id, Arc::clone(&socket), src,
+                    );
+                    let peer_cancel = cancel.child_token();
+                    engine.add_face_send_only(face, peer_cancel);
+                    peers.insert(src, face_id);
+                    tracing::info!(target: "face.udp", face=%face_id, peer=%src, "udp-listener: new face");
+                    face_id
+                };
+
+                // TlvDecode handles per-face fragment reassembly downstream.
+                let arrival = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as u64;
+                let meta = ndn_discovery::InboundMeta::udp(src);
+                if engine.inject_packet(raw, face_id, arrival, meta).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+
+    tracing::info!(target: "face.udp", "UDP listener stopped");
+}
+
+/// Accept incoming TCP connections on `bind_addr` and create a
+/// `TcpFace` per connection. `TcpFace` owns TLV length-prefix framing.
+pub async fn run_tcp_listener(
+    bind_addr: std::net::SocketAddr,
+    engine: ForwarderEngine,
+    cancel: CancellationToken,
+) {
+    let listener = match tokio::net::TcpListener::bind(bind_addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!(target: "face.tcp", addr=%bind_addr, error=%e, "tcp-listener: bind failed");
+            return;
+        }
+    };
+
+    let local = listener.local_addr().unwrap_or(bind_addr);
+    tracing::info!(target: "face.tcp", addr=%local, "TCP listener ready");
+
+    loop {
+        let (stream, peer) = tokio::select! {
+            _ = cancel.cancelled() => break,
+            r = listener.accept() => match r {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(target: "face.tcp", error=%e, "tcp-listener: accept error");
+                    continue;
+                }
+            },
+        };
+
+        let face_id = engine.faces().alloc_id();
+        let face = ndn_faces::net::tcp_face_from_stream(face_id, stream);
+        let conn_cancel = cancel.child_token();
+        engine.add_face(face, conn_cancel);
+        tracing::info!(target: "face.tcp", face=%face_id, peer=%peer, "tcp-listener: accepted connection");
+    }
+
+    tracing::info!(target: "face.tcp", "TCP listener stopped");
+}

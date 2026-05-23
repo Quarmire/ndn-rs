@@ -29,8 +29,8 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 cd "$REPO_ROOT"
 
-FT="crates/spec/ndn-transport/src/face_table.rs"
-FC="crates/spec/ndn-transport/src/face.rs"
+FT="crates/ndn-transport/src/face_table.rs"
+FC="crates/ndn-transport/src/face.rs"
 
 fail() { echo "FAIL: $*"; exit 1; }
 

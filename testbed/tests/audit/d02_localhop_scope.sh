@@ -7,7 +7,7 @@
 # Spec ref:    NFD `daemon/fw/scope-prefix.hpp:46-58` (LOCALHOP);
 #              `daemon/fw/algorithm.cpp:45-49` wouldViolateScope rule.
 # Witnesses:
-#   Part 1 — GREP-PROOF + RUST-UNIT (localhop in crates/spec/;
+#   Part 1 — GREP-PROOF + RUST-UNIT (localhop in crates/;
 #             d02_is_localhop_name_recognises_prefix unit test)
 #   Part 2 — INTEROP-SCRIPT: face-scope split test via testbed
 #
@@ -35,10 +35,10 @@ fail=0
 # ── Part 1: GREP-PROOF + RUST-UNIT ────────────────────────────────────────
 if ! command -v cargo >/dev/null 2>&1; then echo "SKIP: cargo missing" >&2; exit 2; fi
 
-if grep -rqE 'localhop' crates/spec/; then
-    echo "ok: GREP-PROOF — 'localhop' present in crates/spec/"
+if grep -rqE 'localhop' crates/; then
+    echo "ok: GREP-PROOF — 'localhop' present in crates/"
 else
-    echo "FAIL: GREP-PROOF — 'localhop' missing from crates/spec/"
+    echo "FAIL: GREP-PROOF — 'localhop' missing from crates/"
     fail=1
 fi
 

@@ -52,8 +52,8 @@ check_grep() {
     fi
 }
 
-FACE_OPTIONS=crates/spec/ndn-transport/src/face_options.rs
-LINK_SERVICE_DIR=crates/spec/ndn-transport/src/link_service
+FACE_OPTIONS=crates/ndn-transport/src/face_options.rs
+LINK_SERVICE_DIR=crates/ndn-transport/src/link_service
 
 # (a) Typed enum with the seven variants.
 check_grep 'pub enum FaceOption'                "$FACE_OPTIONS" 'FaceOption enum'

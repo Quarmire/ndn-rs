@@ -8,7 +8,7 @@
 #   (a) GREP-PROOF — `ndnsd_adapter` module exists in ndn-mgmt;
 #       `mount_ndnsd_discovery` helper + `NdnsdServiceInfo` type are
 #       publicly exported.
-#   (b) RUST-INTEG — `crates/spec/ndn-mgmt/tests/ndnsd_adapter.rs`
+#   (b) RUST-INTEG — `crates/ndn-mgmt/tests/ndnsd_adapter.rs`
 #       round-trips two published service records through the
 #       persistent Producer at `<root>/NDNSD/discovery`: subscriber
 #       Interest goes out, Data Content matches the encoded list.
@@ -34,7 +34,7 @@ check_grep() {
     fi
 }
 
-MGMT=crates/spec/ndn-mgmt
+MGMT=crates/ndn-mgmt
 
 # (1) Adapter primitive lives in ndn-mgmt + is re-exported.
 check_grep 'pub fn mount_ndnsd_discovery'     "$MGMT/src/ndnsd_adapter.rs" 'mount_ndnsd_discovery helper'

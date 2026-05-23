@@ -8,7 +8,7 @@
 #   (a) GREP-PROOF — `InstallableProtocol` trait + `PostBuildQueue`
 #       exist in ndn-engine; old `routing_protocol*` / `discovery*`
 #       methods are gone.
-#   (b) GREP-PROOF — `binaries/spec/ndn-fwd/src/main.rs` no longer
+#   (b) GREP-PROOF — `binaries/ndn-fwd/src/main.rs` no longer
 #       contains protocol-specific FIB writes, sentinel face-id
 #       constructors, or inline `nlsr_post_build` / `dv_neighbor_seeds`
 #       setup blocks.
@@ -22,7 +22,7 @@
 #
 # Phase-2b update: main.rs is now gated under 800 lines as the
 # prompt called for. The extracted scaffolding lives in
-# `binaries/spec/ndn-fwd/src/{face_setup,host_helpers,security_init,
+# `binaries/ndn-fwd/src/{face_setup,host_helpers,security_init,
 # tracing_init,transport_listeners}.rs`.
 #
 # Exit codes:
@@ -52,9 +52,9 @@ check_absent_in_file() {
     fi
 }
 
-MAIN=binaries/spec/ndn-fwd/src/main.rs
-ENGINE=crates/spec/ndn-engine
-INSTALLS=binaries/spec/ndn-fwd/src/installs
+MAIN=binaries/ndn-fwd/src/main.rs
+ENGINE=crates/ndn-engine
+INSTALLS=binaries/ndn-fwd/src/installs
 
 # (1) The InstallableProtocol trait + PostBuildQueue exist in ndn-engine.
 check_grep 'pub trait InstallableProtocol' "$ENGINE/src/installable.rs" 'InstallableProtocol trait'

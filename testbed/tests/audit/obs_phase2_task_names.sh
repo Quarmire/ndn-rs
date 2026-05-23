@@ -32,75 +32,75 @@ echo "=== obs_phase2_task_names — long-lived task instrumentation ==="
 
 # engine_task — discovery tick in builder.rs
 check "engine_task" \
-    "crates/spec/ndn-engine/src/builder.rs" \
+    "crates/ndn-engine/src/builder.rs" \
     '"engine_task"'
 
 # pipeline_dispatch — main packet processing loop (spawned in dispatcher/mod.rs)
 check "pipeline_dispatch" \
-    "crates/spec/ndn-engine/src/dispatcher/mod.rs" \
+    "crates/ndn-engine/src/dispatcher/mod.rs" \
     '"pipeline_dispatch"'
 
 # validation_drain — async validation queue drain (spawned in dispatcher/mod.rs)
 check "validation_drain" \
-    "crates/spec/ndn-engine/src/dispatcher/mod.rs" \
+    "crates/ndn-engine/src/dispatcher/mod.rs" \
     '"validation_drain"'
 
 # face_write — per-face outbound send task
 check "face_write (engine.rs)" \
-    "crates/spec/ndn-engine/src/engine.rs" \
+    "crates/ndn-engine/src/engine.rs" \
     '"face_write"'
 
 # face_read — per-face inbound read task
 check "face_read (engine.rs)" \
-    "crates/spec/ndn-engine/src/engine.rs" \
+    "crates/ndn-engine/src/engine.rs" \
     '"face_read"'
 
 # face_write in dispatcher/mod.rs
 check "face_write (dispatcher)" \
-    "crates/spec/ndn-engine/src/dispatcher/mod.rs" \
+    "crates/ndn-engine/src/dispatcher/mod.rs" \
     '"face_write"'
 
 # face_read in dispatcher/mod.rs
 check "face_read (dispatcher)" \
-    "crates/spec/ndn-engine/src/dispatcher/mod.rs" \
+    "crates/ndn-engine/src/dispatcher/mod.rs" \
     '"face_read"'
 
 # expiry tasks — pit, rib, idle_face in expiry.rs
 check "expiry pit" \
-    "crates/spec/ndn-engine/src/expiry.rs" \
+    "crates/ndn-engine/src/expiry.rs" \
     '"pit"'
 
 check "expiry rib" \
-    "crates/spec/ndn-engine/src/expiry.rs" \
+    "crates/ndn-engine/src/expiry.rs" \
     '"rib"'
 
 check "expiry idle_face" \
-    "crates/spec/ndn-engine/src/expiry.rs" \
+    "crates/ndn-engine/src/expiry.rs" \
     '"idle_face"'
 
 # dvr_adv — DVR stub wait task
 check "dvr_adv" \
-    "crates/spec/ndn-routing/src/protocols/dvr.rs" \
+    "crates/ndn-routing/src/protocols/dvr.rs" \
     '"dvr_adv"'
 
 # nlsr_hello — Hello coordinator task
 check "nlsr_hello" \
-    "crates/spec/ndn-routing/src/protocols/nlsr/hello.rs" \
+    "crates/ndn-routing/src/protocols/nlsr/hello.rs" \
     '"nlsr_hello"'
 
 # nlsr_recompute — routing recompute task
 check "nlsr_recompute" \
-    "crates/spec/ndn-routing/src/protocols/nlsr/protocol.rs" \
+    "crates/ndn-routing/src/protocols/nlsr/protocol.rs" \
     '"nlsr_recompute"'
 
 # nlsr_sync — NlsrSync task
 check "nlsr_sync" \
-    "crates/spec/ndn-routing/src/protocols/nlsr/protocol.rs" \
+    "crates/ndn-routing/src/protocols/nlsr/protocol.rs" \
     '"nlsr_sync"'
 
 # mgmt_request — per-request enrollment task
 check "mgmt_request" \
-    "crates/spec/ndn-mgmt/src/lib.rs" \
+    "crates/ndn-mgmt/src/lib.rs" \
     '"mgmt_request"'
 
 echo ""

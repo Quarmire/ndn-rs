@@ -1,0 +1,61 @@
+[package]
+name = "ndn-store"
+description = "NDN forwarding tables: NameTrie, PIT, and ContentStore"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+classification = "spec"
+
+[features]
+default = []
+fjall = ["dep:fjall"]
+
+[dependencies]
+ndn-fwd-core = { workspace = true }
+bytes    = { workspace = true, features = ["std"] }
+smallvec = { workspace = true }
+# Portable deps used by LruCs / ShardedCs / Pit on both native and wasm.
+dashmap   = { workspace = true }
+lru       = { workspace = true }
+thiserror = { workspace = true }
+# Pure-Rust SHA-256 for implicit-digest verification in LruCs. Used to
+# be `ring::digest::digest`; phase 7 swapped it for `sha2` so LruCs is
+# wasm-buildable (ring doesn't compile on wasm32-unknown-unknown).
+sha2      = { workspace = true }
+# `std::time::SystemTime`/`Instant` panic on wasm32-unknown-unknown.
+# `web_time` shims them to `Date.now()` / `performance.now()` on wasm
+# and re-exports the real `std::time` types on native.
+web-time  = { workspace = true }
+
+# Native gets `ring` for any other native-only digest paths plus the
+# real `ndn-packet` std feature (which itself pulls ring).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ndn-packet = { workspace = true, features = ["std"] }
+ring       = { workspace = true }
+fjall      = { workspace = true, optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+ndn-packet = { workspace = true, features = ["std-wasm"] }
+
+[dev-dependencies]
+ndn-tlv       = { workspace = true, features = ["std"] }
+tokio    = { workspace = true, features = ["rt", "macros"] }
+fjall    = { workspace = true }
+tempfile = "3"
+criterion = { workspace = true }
+ndn-packet = { workspace = true, features = ["std"] }
+
+[[bench]]
+name    = "lru"
+harness = false
+
+[[bench]]
+name    = "sharded"
+harness = false
+
+[[bench]]
+name              = "fjall"
+harness           = false
+required-features = ["fjall"]

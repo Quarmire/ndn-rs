@@ -20,7 +20,7 @@ fail=0
 
 # signer.rs must say "registered" not "reserved" for the BLAKE3 type codes
 if grep -q "Both are registered on the NDN TLV SignatureType registry" \
-    "$REPO_ROOT/crates/spec/ndn-security/src/signer.rs"; then
+    "$REPO_ROOT/crates/ndn-security/src/signer.rs"; then
     echo "ok: signer.rs uses 'registered'"
 else
     echo "FAIL: signer.rs still says 'reserved' or lacks 'registered' comment"
@@ -38,7 +38,7 @@ fi
 
 # No "experimental" language for type codes 6 or 7
 if grep -rn "experimental.*\(type 6\|type 7\|6.*7\)" \
-    "$REPO_ROOT/crates/spec/ndn-security/src/" \
+    "$REPO_ROOT/crates/ndn-security/src/" \
     "$REPO_ROOT/docs/wiki/src/reference/blake3-signature-spec.md" 2>/dev/null \
     | grep -v "^Binary file"; then
     echo "FAIL: found 'experimental' language for BLAKE3 type codes"

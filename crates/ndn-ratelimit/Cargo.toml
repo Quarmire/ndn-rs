@@ -1,0 +1,40 @@
+[package]
+name = "ndn-ratelimit"
+description = "Admission-control rate limiting for the ndn-rs forwarding pipeline"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+# See  Operational feature with no
+# spec exposure; classified `extension`.
+classification = "extension"
+
+[features]
+default = []
+# Reserved for a future Linux-only XDP fast path that mirrors the
+# in-engine policy table. Not implemented here.
+xdp-mirror = []
+
+[dependencies]
+ndn-foundation-types = { workspace = true }
+ndn-packet           = { workspace = true, features = ["std"] }
+ndn-transport        = { workspace = true }
+ndn-engine           = { workspace = true }
+ndn-mgmt             = { workspace = true }
+ndn-config           = { workspace = true }
+governor             = "0.6"
+dashmap              = { workspace = true }
+serde                = { workspace = true, features = ["derive"] }
+thiserror            = { workspace = true }
+toml                 = "0.8"
+tracing              = { workspace = true }
+
+[dev-dependencies]
+tokio        = { workspace = true, features = ["rt", "macros", "time"] }
+ndn-app      = { workspace = true }
+ndn-faces    = { workspace = true }
+ndn-packet   = { workspace = true, features = ["std"] }
+ndn-engine   = { workspace = true }
+ndn-transport = { workspace = true }
+bytes        = { workspace = true, features = ["std"] }

@@ -21,7 +21,7 @@ command -v cargo >/dev/null 2>&1 || { echo "SKIP: cargo not in PATH" >&2; exit 2
 
 fail=0
 CRATE_DIR=$(find crates -type d -name ndn-fwd-core 2>/dev/null | head -1)
-FWD=crates/extension/ndn-embedded/src/forwarder.rs
+FWD=crates/ndn-embedded/src/forwarder.rs
 
 # (a) core exposes the Data decision.
 if [ -z "$CRATE_DIR" ] \

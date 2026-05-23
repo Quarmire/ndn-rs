@@ -53,7 +53,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 cd "$REPO_ROOT"
 
-DVR="crates/spec/ndn-routing/src/protocols/dvr.rs"
+DVR="crates/ndn-routing/src/protocols/dvr.rs"
 
 if [ ! -f "$DVR" ]; then
     echo "FAIL: expected file missing: $DVR"

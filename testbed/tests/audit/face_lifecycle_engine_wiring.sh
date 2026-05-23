@@ -53,10 +53,10 @@ check_grep() {
     fi
 }
 
-LS=crates/spec/ndn-transport/src/link_service/mod.rs
-EVENT=crates/spec/ndn-transport/src/face_event.rs
-ENGINE=crates/spec/ndn-engine/src/engine.rs
-MGMT=crates/spec/ndn-mgmt/src/lib.rs
+LS=crates/ndn-transport/src/link_service/mod.rs
+EVENT=crates/ndn-transport/src/face_event.rs
+ENGINE=crates/ndn-engine/src/engine.rs
+MGMT=crates/ndn-mgmt/src/lib.rs
 
 # (a) LinkService trait seams.
 check_grep 'fn wire_queue_depth_fn'         "$LS"    'LinkService::wire_queue_depth_fn'

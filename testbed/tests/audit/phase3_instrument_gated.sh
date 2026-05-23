@@ -49,12 +49,12 @@ check_grep() {
 }
 
 # (a) Features.
-check_grep '^experimental-instrument =' crates/spec/ndn-engine/Cargo.toml      'ndn-engine experimental-instrument feature'
-check_grep '^experimental-instrument =' crates/spec/ndn-faces/Cargo.toml       'ndn-faces experimental-instrument feature'
-check_grep '^experimental-instrument =' crates/spec/ndn-face-local/Cargo.toml  'ndn-face-local experimental-instrument feature'
+check_grep '^experimental-instrument =' crates/ndn-engine/Cargo.toml      'ndn-engine experimental-instrument feature'
+check_grep '^experimental-instrument =' crates/ndn-faces/Cargo.toml       'ndn-faces experimental-instrument feature'
+check_grep '^experimental-instrument =' crates/ndn-face-local/Cargo.toml  'ndn-face-local experimental-instrument feature'
 
 # (b) Engine table accessors carry the doc-hidden attr.
-ENGINE_SRC=crates/spec/ndn-engine/src/engine.rs
+ENGINE_SRC=crates/ndn-engine/src/engine.rs
 for method in fib rib pit cs strategy_table measurements routing discovery_ctx; do
     # Each gated method must have a doc(hidden) cfg_attr on a line
     # before its `pub fn <method>(` declaration.
@@ -92,17 +92,17 @@ check_preceding_attr() {
     fi
 }
 
-check_preceding_attr crates/spec/ndn-engine/src/enricher.rs \
+check_preceding_attr crates/ndn-engine/src/enricher.rs \
     '^pub trait ContextEnricher' 'ContextEnricher doc-hidden gate'
-check_preceding_attr crates/spec/ndn-engine/src/observability/mod.rs \
+check_preceding_attr crates/ndn-engine/src/observability/mod.rs \
     '^pub mod targets' 'observability::targets doc-hidden gate'
 
 # CallbackFace + TapFace + InProcFace::new_kind.
-check_grep 'doc\(hidden\)' crates/spec/ndn-faces/src/callback.rs     'callback.rs doc-hidden gate (CallbackFace/TapFace)'
-check_grep 'pub struct TapFace'         crates/spec/ndn-faces/src/callback.rs  'TapFace struct exists'
+check_grep 'doc\(hidden\)' crates/ndn-faces/src/callback.rs     'callback.rs doc-hidden gate (CallbackFace/TapFace)'
+check_grep 'pub struct TapFace'         crates/ndn-faces/src/callback.rs  'TapFace struct exists'
 check_grep 'pub use callback::\{CallbackFace, TapFace\}' \
-    crates/spec/ndn-faces/src/lib.rs 'TapFace re-exported'
-check_grep 'doc\(hidden\)' crates/spec/ndn-face-local/src/lib.rs     'InProcFace::new_kind doc-hidden gate'
+    crates/ndn-faces/src/lib.rs 'TapFace re-exported'
+check_grep 'doc\(hidden\)' crates/ndn-face-local/src/lib.rs     'InProcFace::new_kind doc-hidden gate'
 
 # (e) Build without the feature.
 echo "→ cargo build (default features) — Instrument items stay pub"

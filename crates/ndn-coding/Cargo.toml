@@ -1,0 +1,51 @@
+[package]
+name = "ndn-coding"
+description = "Network coding for NDN — F1 producer/consumer systematic FEC over named segment-sets"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+# F1 is content-layer FEC: pragmatic engineering with no adopted
+# community spec (RFC 9273 is the nearest anchor), so the crate is an
+# `extension`, not `spec`. F2 (RLNC in-network recoding) is gated
+# behind a future trust-model doctrine memo (`f2-recode` feature).
+classification = "extension"
+
+[features]
+default = ["endpoint"]
+# Ergonomic producer/consumer API (`CodedProducer`, `CodedFetcher`).
+# Pulls in `ndn-app`; turn it off for the pure FEC core (the
+# wasm32/embedded-minimal build that only wants codec + GF(2^8) +
+# encoder/decoder).
+endpoint = ["dep:ndn-app", "dep:ndn-transport", "dep:tokio"]
+# Enable AVX2/NEON SIMD path for GF(2^8) arithmetic. Off by default;
+# scalar path is the reference implementation.
+simd = []
+# Reserved for F2 in-network RLNC recoding. Not implemented; only
+# present so downstream code can feature-detect the gate.
+f2-recode = []
+
+[dependencies]
+ndn-foundation-types = { workspace = true }
+ndn-packet           = { workspace = true, features = ["std"] }
+ndn-tlv              = { workspace = true, features = ["std"] }
+ndn-store            = { workspace = true }
+ndn-mgmt             = { workspace = true }
+toml                 = "0.8"
+bytes                = { workspace = true, features = ["std"] }
+thiserror            = { workspace = true }
+tracing              = { workspace = true }
+serde                = { workspace = true, features = ["derive"] }
+# endpoint-only runtime deps (optional; enabled by the `endpoint` feature)
+ndn-app              = { workspace = true, optional = true }
+ndn-transport        = { workspace = true, optional = true }
+tokio                = { workspace = true, features = ["rt", "sync", "time", "macros"], optional = true }
+
+[dev-dependencies]
+tokio        = { workspace = true, features = ["rt", "macros", "time"] }
+ndn-app      = { workspace = true }
+ndn-config   = { workspace = true }
+ndn-engine   = { workspace = true }
+ndn-faces    = { workspace = true }
+ndn-transport = { workspace = true }

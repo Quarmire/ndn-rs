@@ -18,20 +18,20 @@ on:
   push:
     branches: [main]
     paths:
-      - "crates/spec/ndn-faces/src/net/websocket.rs"
-      - "crates/spec/ndn-mgmt/**"
+      - "crates/ndn-faces/src/net/websocket.rs"
+      - "crates/ndn-mgmt/**"
       - "crates/tooling/ndn-dashboard/**"
-      - "binaries/spec/ndn-fwd/**"
+      - "binaries/ndn-fwd/**"
       - "testbed/tests/browser/**"
       - ".github/workflows/browser.yml"
 
   pull_request:
     branches: [main]
     paths:
-      - "crates/spec/ndn-faces/src/net/websocket.rs"
-      - "crates/spec/ndn-mgmt/**"
+      - "crates/ndn-faces/src/net/websocket.rs"
+      - "crates/ndn-mgmt/**"
       - "crates/tooling/ndn-dashboard/**"
-      - "binaries/spec/ndn-fwd/**"
+      - "binaries/ndn-fwd/**"
       - "testbed/tests/browser/**"
       - ".github/workflows/browser.yml"
 

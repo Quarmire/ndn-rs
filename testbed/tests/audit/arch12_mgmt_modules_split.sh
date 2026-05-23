@@ -6,7 +6,7 @@
 # Witnesses:
 #   (a) GREP-PROOF — lib.rs is under the 800-line cap.
 #   (b) GREP-PROOF — one MgmtModule-impl file per NFD module exists
-#       under crates/spec/ndn-mgmt/src/modules/.
+#       under crates/ndn-mgmt/src/modules/.
 #   (c) GREP-PROOF — `MgmtRouter` is the dispatch surface (no
 #       residual `dispatch_command` free function in lib.rs).
 #   (d) RUST-UNIT  — the existing ndn-mgmt test suite still passes
@@ -24,8 +24,8 @@ cd "$REPO_ROOT"
 
 fail=0
 
-LIB=crates/spec/ndn-mgmt/src/lib.rs
-MODULES_DIR=crates/spec/ndn-mgmt/src/modules
+LIB=crates/ndn-mgmt/src/lib.rs
+MODULES_DIR=crates/ndn-mgmt/src/modules
 
 # (1) lib.rs orchestrator size cap.
 lib_lines=$(wc -l < "$LIB" | tr -d ' ')

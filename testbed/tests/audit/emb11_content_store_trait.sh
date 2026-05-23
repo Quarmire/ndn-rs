@@ -26,8 +26,8 @@ fail=0
 CRATE_DIR=$(find crates -type d -name ndn-fwd-core 2>/dev/null | head -1)
 STORE="$CRATE_DIR/src/store.rs"
 PIPE="$CRATE_DIR/src/pipeline.rs"
-FWD=crates/extension/ndn-embedded/src/forwarder.rs
-CS=crates/extension/ndn-embedded/src/cs.rs
+FWD=crates/ndn-embedded/src/forwarder.rs
+CS=crates/ndn-embedded/src/cs.rs
 
 # (a) CsStore + NoCs.
 grep -qE 'trait[[:space:]]+CsStore' "$STORE" || { echo "FAIL: no CsStore trait" >&2; fail=1; }

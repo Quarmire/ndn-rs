@@ -28,7 +28,7 @@ cd "$REPO_ROOT"
 
 # Verify the Criterion harness Phase-3 will populate exists in tree
 # so this scaffold cannot be deleted in a "tidy unused files" pass.
-HARNESS=crates/spec/ndn-transport/benches/face_otel_overhead.rs
+HARNESS=crates/ndn-transport/benches/face_otel_overhead.rs
 if [ ! -f "$HARNESS" ]; then
     echo "FAIL: Criterion harness $HARNESS missing" >&2
     exit 1

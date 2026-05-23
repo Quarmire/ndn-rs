@@ -27,7 +27,7 @@ fail=0
 
 # (a) Locate a conformance suite that names both forwarders.
 HITS=$(grep -rlnE 'cross.?impl|conformance' --include='*.rs' \
-        crates/extension/ndn-embedded crates/spec/ndn-engine tests 2>/dev/null \
+        crates/ndn-embedded crates/ndn-engine tests 2>/dev/null \
         | xargs -r grep -lE 'ndn_embedded' 2>/dev/null || true)
 if [ -z "$HITS" ]; then
     echo "FAIL: no cross-impl conformance suite found (native vs embedded vectors)" >&2

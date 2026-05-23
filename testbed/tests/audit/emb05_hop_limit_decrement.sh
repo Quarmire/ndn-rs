@@ -24,7 +24,7 @@ REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 cd "$REPO_ROOT"
 
 fail=0
-FWD=crates/extension/ndn-embedded/src/forwarder.rs
+FWD=crates/ndn-embedded/src/forwarder.rs
 
 if [ ! -f "$FWD" ]; then
     echo "FAIL: $FWD not found" >&2
@@ -41,7 +41,7 @@ if ! grep -qE 'decrement_hop_limit_in_place|hop_limit\s*-\s*1|saturating_sub\s*\
     fail=1
 fi
 # The shared in-place helper must exist in ndn-packet (its rightful home).
-if ! grep -qE 'pub fn decrement_hop_limit_in_place' crates/spec/ndn-packet/src/interest.rs; then
+if ! grep -qE 'pub fn decrement_hop_limit_in_place' crates/ndn-packet/src/interest.rs; then
     echo "FAIL: ndn-packet lacks decrement_hop_limit_in_place (no-alloc wire helper)" >&2
     fail=1
 fi

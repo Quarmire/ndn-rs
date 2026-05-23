@@ -3,7 +3,7 @@
 #
 # Finding:     docs/notes/architecture-gap-inventory-2026-05-20.md § ARCH-19
 # Severity:    Phase 2 architectural cleanup (pre-v0.1.0)
-# Witnesses:   `binaries/spec/ndn-fwd/src/` contains zero occurrences
+# Witnesses:   `binaries/ndn-fwd/src/` contains zero occurrences
 #              of `FaceId(u64::MAX...)`. The old NLSR private-face
 #              workaround stamped `FaceId(u64::MAX)` and
 #              `FaceId(u64::MAX - 1)` on UDP sockets it deliberately
@@ -19,7 +19,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 cd "$REPO_ROOT"
 
-FWD_DIR=binaries/spec/ndn-fwd/src
+FWD_DIR=binaries/ndn-fwd/src
 
 # Match `u64::MAX` inside any `FaceId(...)` constructor — catches both
 # `FaceId(u64::MAX)` and `FaceId(u64::MAX - 1)`.

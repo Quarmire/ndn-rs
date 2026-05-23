@@ -1,0 +1,17 @@
+[package]
+name = "ndn-fwd-core"
+description = "Canonical, runtime-agnostic NDN forwarding rules (sans-IO seed shared by the native engine and the embedded forwarder)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+classification = "spec"
+
+[features]
+# This crate is `#![no_std]` and never gains a `std` feature. `alloc` is opt-in
+# for the (future) table-owning helpers; the rule predicates need neither.
+default = []
+alloc = []
+
+[dependencies]

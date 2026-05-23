@@ -1,0 +1,33 @@
+[package]
+name = "ndn-face-webtransport"
+description = "Server-side WebTransport (HTTP/3 + QUIC) face for ndn-rs (issue #14)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+classification = "spec"
+
+[dependencies]
+ndn-transport = { workspace = true }
+ndn-packet    = { workspace = true, features = ["std"] }
+bytes         = { workspace = true, features = ["std"] }
+tracing       = { workspace = true }
+thiserror     = { workspace = true }
+tokio         = { workspace = true, features = ["sync", "rt", "macros", "time"] }
+rustls-pemfile = { workspace = true }
+sha2          = { workspace = true }
+
+# wtransport: pure-Rust WebTransport over HTTP/3 / QUIC, built on quinn.
+# Server side mirrors ndnd's quic-go + webtransport-go choice in PR #138 /
+# main `fw/face/http3-listener.go`.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+wtransport = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+ndn-tlv = { workspace = true }
+rcgen = { workspace = true }
+# `dangerous-configuration` enables `with_no_cert_validation` for the loopback
+# witness — the listener uses a self-signed cert and the client must accept it.
+wtransport = { workspace = true, features = ["dangerous-configuration"] }

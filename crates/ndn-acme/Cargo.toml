@@ -1,0 +1,40 @@
+[package]
+name = "ndn-acme"
+description = "ACME (RFC 8555) DNS-01 cert provisioning for ndn-rs WebSocket-TLS and WebTransport faces"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+classification = "extension"
+
+[dependencies]
+# instant-acme: maintained, focused ACME client (Let's Encrypt, ZeroSSL, Pebble);
+# DNS-01 fits its order/challenge model cleanly. Picked over `acme2` (mostly
+# unmaintained) and `rustls-acme` (TLS-ALPN-01 only).
+instant-acme   = { workspace = true }
+rcgen          = { workspace = true }
+reqwest        = { workspace = true }
+rustls-pemfile = { workspace = true }
+x509-parser    = { workspace = true }
+serde          = { workspace = true }
+serde_json     = { workspace = true }
+tokio          = { workspace = true, features = ["rt", "macros", "time", "fs"] }
+tokio-util     = { workspace = true, features = ["rt"] }
+async-trait    = "0.1"
+thiserror      = { workspace = true }
+tracing        = { workspace = true }
+time           = "0.3"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+async-trait = "0.1"
+reqwest     = { workspace = true }
+serde_json  = { workspace = true }
+hyper       = { version = "1", features = ["client"] }
+hyper-util  = { version = "0.1", features = ["client-legacy", "http1", "http2", "tokio"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "ring", "tls12"] }
+http-body-util = "0.1"
+rustls      = { version = "0.23", default-features = false, features = ["std"] }
+bytes       = { workspace = true, features = ["std"] }
+rcgen       = { workspace = true }

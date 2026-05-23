@@ -27,7 +27,7 @@ command -v cargo >/dev/null 2>&1 || { echo "SKIP: cargo not in PATH" >&2; exit 2
 
 fail=0
 CRATE_DIR=$(find crates -type d -name ndn-fwd-core 2>/dev/null | head -1)
-NATIVE_TEST=crates/spec/ndn-engine/tests/forwarding_conformance.rs
+NATIVE_TEST=crates/ndn-engine/tests/forwarding_conformance.rs
 
 # (a) shared vectors + sans-IO pin.
 grep -rqE 'INTEREST_DECISION_CASES' "$CRATE_DIR/src" 2>/dev/null \

@@ -21,7 +21,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 cd "$REPO_ROOT"
 
-# Behavioural witnesses live in `crates/spec/ndn-transport/src/link_service.rs`
+# Behavioural witnesses live in `crates/ndn-transport/src/link_service.rs`
 # under the `tests` module — they construct a CaptureTransport mock and
 # verify wire bytes:
 #   - `passthrough_does_not_lp_encode`

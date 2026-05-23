@@ -23,7 +23,7 @@ fail=0
 # GREP-PROOF: struct declarations exist
 for sym in RsaSha256Verifier EcdsaSha256Verifier; do
     if grep -q "pub struct $sym" \
-        "$REPO_ROOT/crates/spec/ndn-security/src/verifier.rs"; then
+        "$REPO_ROOT/crates/ndn-security/src/verifier.rs"; then
         echo "ok: $sym declared"
     else
         echo "FAIL: $sym not found"
@@ -33,7 +33,7 @@ done
 
 # GREP-PROOF: both arms wired in verify_by_sig_type (no longer UnsupportedSignatureType)
 if ! grep -A2 "SignatureSha256WithRsa" \
-        "$REPO_ROOT/crates/spec/ndn-security/src/verifier.rs" \
+        "$REPO_ROOT/crates/ndn-security/src/verifier.rs" \
         | grep -q "UnsupportedSignatureType"; then
     echo "ok: SignatureSha256WithRsa arm no longer returns UnsupportedSignatureType"
 else
@@ -42,7 +42,7 @@ else
 fi
 
 if ! grep -A2 "SignatureSha256WithEcdsa" \
-        "$REPO_ROOT/crates/spec/ndn-security/src/verifier.rs" \
+        "$REPO_ROOT/crates/ndn-security/src/verifier.rs" \
         | grep -q "UnsupportedSignatureType"; then
     echo "ok: SignatureSha256WithEcdsa arm no longer returns UnsupportedSignatureType"
 else

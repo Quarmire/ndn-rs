@@ -1,0 +1,24 @@
+[package]
+name = "ndn-sync"
+description = "NDN dataset synchronisation protocols: SVS, PSync"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+classification = "spec"
+
+[dependencies]
+ndn-packet = { workspace = true, features = ["std"] }
+ndn-tlv    = { workspace = true, features = ["std"] }
+bytes         = { workspace = true, features = ["std"] }
+tokio      = { workspace = true, features = ["sync", "time", "rt", "macros"] }
+tokio-util = { workspace = true }
+thiserror  = { workspace = true }
+fastrand   = "2"
+# zlib compression for PSync IBLT wire encoding (PSync/detail/util.cpp CompressionScheme::ZLIB)
+flate2     = "1"
+tracing    = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }

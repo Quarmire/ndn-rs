@@ -1,0 +1,486 @@
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+use tracing::{Instrument, debug, trace};
+
+use crate::observability::targets as t;
+use crate::pipeline::{
+    Action, DecodedPacket, DropReason, ForwardingAction, NackReason, PacketContext,
+};
+use ndn_packet::wire::encode_nack;
+use ndn_store::PitToken;
+use ndn_transport::{FaceId, FaceScope};
+
+use super::{InboundPacket, PacketDispatcher};
+
+impl PacketDispatcher {
+    pub(super) const BATCH_SIZE: usize = 64;
+
+    pub(super) async fn run_pipeline(
+        self: &Arc<Self>,
+        mut rx: mpsc::Receiver<InboundPacket>,
+        cancel: CancellationToken,
+    ) {
+        let mut batch = Vec::with_capacity(Self::BATCH_SIZE);
+        loop {
+            let first = tokio::select! {
+                biased;                _ = cancel.cancelled() => break,
+                pkt = rx.recv() => match pkt {
+                    Some(p) => p,
+                    None    => break,
+                },
+            };
+            batch.push(first);
+
+            while batch.len() < Self::BATCH_SIZE {
+                match rx.try_recv() {
+                    Ok(p) => batch.push(p),
+                    Err(_) => break,
+                }
+            }
+
+            let parallel = self.pipeline_threads > 1;
+            for pkt in batch.drain(..) {
+                let InboundPacket {
+                    raw,
+                    face_id,
+                    arrival,
+                    meta,
+                } = pkt;
+                match self.decode.try_collect_fragment(face_id, raw) {
+                    Ok(None) => {
+                        trace!(target: t::FACE_LP, face=%face_id, "fragment collected, awaiting reassembly");
+                    }
+                    Ok(Some(reassembled)) => {
+                        let pkt = InboundPacket {
+                            raw: reassembled,
+                            face_id,
+                            arrival,
+                            meta,
+                        };
+                        if parallel {
+                            let d = Arc::clone(self);
+                            self.runtime.spawn(Box::pin(async move { d.process_packet(pkt).await }.instrument(
+                                tracing::info_span!(target: t::FWD_PIPELINE, "pipeline_dispatch"),
+                            )));
+                        } else {
+                            self.process_packet(pkt).await;
+                        }
+                    }
+                    Err(raw) => {
+                        let pkt = InboundPacket {
+                            raw,
+                            face_id,
+                            arrival,
+                            meta,
+                        };
+                        if parallel {
+                            let d = Arc::clone(self);
+                            self.runtime.spawn(Box::pin(async move { d.process_packet(pkt).await }.instrument(
+                                tracing::info_span!(target: t::FWD_PIPELINE, "pipeline_dispatch"),
+                            )));
+                        } else {
+                            self.process_packet(pkt).await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    async fn process_packet(&self, pkt: InboundPacket) {
+        let face_id = pkt.face_id;
+        let span = tracing::info_span!(
+            target: t::FWD_PIPELINE,
+            "interest",
+            in_face = %face_id,
+            name = tracing::field::Empty,
+            nonce = tracing::field::Empty,
+        );
+        self.process_packet_inner(pkt).instrument(span).await
+    }
+
+    async fn process_packet_inner(&self, pkt: InboundPacket) {
+        trace!(target: t::FWD_PIPELINE, face=%pkt.face_id, len=pkt.raw.len(), "pipeline: packet arrived");
+        let meta = pkt.meta;
+        let ctx = PacketContext::new(pkt.raw, pkt.face_id, pkt.arrival);
+
+        let ctx = match self.decode.process(ctx) {
+            Action::Continue(ctx) => ctx,
+            Action::Drop(DropReason::FragmentCollect) => {
+                trace!(target: t::FACE_LP, face=%pkt.face_id, "fragment collected, awaiting reassembly");
+                return;
+            }
+            Action::Drop(r) => {
+                debug!(target: t::FWD_PIPELINE, face=%pkt.face_id, reason=?r, "drop at decode");
+                return;
+            }
+            other => {
+                self.dispatch_action(other).await;
+                return;
+            }
+        };
+
+        if let Some(ref name) = ctx.name {
+            tracing::Span::current().record("name", name.to_string());
+        }
+        if let DecodedPacket::Interest(ref i) = ctx.packet
+            && let Some(nonce) = i.nonce()
+        {
+            tracing::Span::current().record("nonce", nonce);
+        }
+
+        if self
+            .discovery
+            .on_inbound(&ctx.raw_bytes, ctx.face_id, &meta, &*self.discovery_ctx)
+        {
+            return;
+        }
+
+        let is_interest = matches!(ctx.packet, DecodedPacket::Interest(_));
+        let is_data = matches!(ctx.packet, DecodedPacket::Data(_));
+        if is_interest || is_data {
+            if let Some(state) = self.face_states.get(&ctx.face_id) {
+                if is_interest {
+                    state.counters.in_interests.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    state.counters.in_data.fetch_add(1, Ordering::Relaxed);
+                }
+                state
+                    .counters
+                    .in_bytes
+                    .fetch_add(ctx.raw_bytes.len() as u64, Ordering::Relaxed);
+            }
+            let ctx = match self.check_rate_limit_inbound(ctx) {
+                Ok(c) => c,
+                Err(action) => {
+                    self.dispatch_action(*action).await;
+                    return;
+                }
+            };
+            if is_interest {
+                trace!(target: t::FWD_PIPELINE, face=%ctx.face_id, name=?ctx.name, "pipeline: Interest → interest_pipeline");
+                self.interest_pipeline(ctx).await;
+            } else {
+                trace!(target: t::FWD_PIPELINE, face=%ctx.face_id, name=?ctx.name, "pipeline: Data → data_pipeline");
+                self.data_pipeline(ctx).await;
+            }
+        } else {
+            match &ctx.packet {
+                DecodedPacket::Nack(_) => {
+                    trace!(target: t::FWD_PIPELINE, face=%ctx.face_id, name=?ctx.name, "pipeline: Nack → nack_pipeline");
+                    self.nack_pipeline(ctx).await;
+                }
+                DecodedPacket::Raw => {}
+                _ => unreachable!("Interest/Data handled in the is_interest||is_data branch"),
+            }
+        }
+    }
+
+    async fn interest_pipeline(&self, ctx: PacketContext) {
+        let ctx = match self.cs_lookup.process(ctx).await {
+            Action::Continue(ctx) => ctx,
+            Action::Satisfy(ctx) => {
+                self.satisfy(ctx).await;
+                return;
+            }
+            Action::Drop(r) => {
+                debug!(target: t::FWD_CS, reason=?r, "drop at cs lookup");
+                return;
+            }
+            other => {
+                self.dispatch_action(other).await;
+                return;
+            }
+        };
+
+        let ctx = match self.pit_check.process(ctx).await {
+            Action::Continue(ctx) => ctx,
+            Action::Drop(r) => {
+                debug!(target: t::FWD_PIT, reason=?r, "drop at pit check");
+                return;
+            }
+            other => {
+                self.dispatch_action(other).await;
+                return;
+            }
+        };
+
+        // Reflexive forwarding: an Interest carrying a REFLEXIVE_NAME installs a
+        // temporary reverse route `name -> incoming face` (W-RF-1: only ever the
+        // incoming face), bounded by the Interest lifetime (W-RF-3). A later
+        // reverse Interest under that name routes back along this face.
+        if let DecodedPacket::Interest(i) = &ctx.packet
+            && let Some(rname) = i.reflexive_name()
+        {
+            let lifetime = i.lifetime().unwrap_or(Duration::from_millis(4000));
+            if !self.reflexive.install(rname.as_ref(), ctx.face_id, lifetime) {
+                debug!(
+                    target: t::FWD_PIPELINE,
+                    face = %ctx.face_id,
+                    "reflexive route refused (per-face cap or face collision)"
+                );
+            }
+        }
+
+        // Reverse routing: an Interest whose name matches a live reflexive route
+        // is a producer's reverse Interest — forward it *only* along that reverse
+        // route (the exact inverse of the path the original Interest came in on),
+        // never via FIB (W-RF-5). Reflexive names are unpredictable and never
+        // appear in the FIB, so a normal Interest cannot match one.
+        let reverse_face = if self.reflexive.is_empty() {
+            None
+        } else {
+            ctx.name.as_deref().and_then(|n| self.reflexive.lookup(n))
+        };
+        if let Some(rev_face) = reverse_face {
+            trace!(target: t::FWD_PIPELINE, face=%ctx.face_id, rev_face=%rev_face, "reflexive: reverse routing");
+            self.dispatch_action(Action::Send(ctx, smallvec::smallvec![rev_face]))
+                .await;
+            return;
+        }
+
+        let action = self.strategy.process(ctx).await;
+        self.dispatch_action(action).await;
+    }
+
+    async fn nack_pipeline(&self, ctx: PacketContext) {
+        let nack = match &ctx.packet {
+            DecodedPacket::Nack(n) => n,
+            _ => return,
+        };
+
+        let name = match &ctx.name {
+            Some(n) => n.clone(),
+            None => return,
+        };
+
+        // PIT key is the bare Interest name; selectors live on each in-record.
+        let token = PitToken::from_interest(&nack.interest.name);
+
+        let has_pit_entry = self.strategy.pit.contains(&token);
+        if !has_pit_entry {
+            debug!(target: t::FWD_PIT, face=?ctx.face_id, "nack for unknown PIT entry, dropping");
+            return;
+        }
+
+        let fib_entry_arc = self.strategy.fib.lpm(&name);
+        let fib_entry_ref = fib_entry_arc.as_deref();
+        let strategy_fib: Option<ndn_strategy::FibEntry> =
+            fib_entry_ref.map(|e| ndn_strategy::FibEntry {
+                nexthops: e
+                    .nexthops
+                    .iter()
+                    .map(|nh| ndn_strategy::FibNexthop {
+                        face_id: nh.face_id,
+                        cost: nh.cost,
+                    })
+                    .collect(),
+            });
+
+        let mut extensions = ndn_transport::AnyMap::new();
+        for enricher in &self.strategy.enrichers {
+            enricher.enrich(strategy_fib.as_ref(), &mut extensions);
+        }
+
+        let sctx = ndn_strategy::StrategyContext {
+            name: &name,
+            in_face: ctx.face_id,
+            fib_entry: strategy_fib.as_ref(),
+            pit_token: Some(token),
+            measurements: &self.strategy.measurements,
+            extensions: &extensions,
+            runtime: &self.strategy.runtime,
+        };
+
+        let nack_reason = match nack.reason {
+            ndn_packet::NackReason::NoRoute => NackReason::NoRoute,
+            ndn_packet::NackReason::Duplicate => NackReason::Duplicate,
+            ndn_packet::NackReason::Congestion => NackReason::Congestion,
+            ndn_packet::NackReason::NotYet => NackReason::NotYet,
+            ndn_packet::NackReason::Other(_) => NackReason::NoRoute,
+        };
+
+        let strategy = self
+            .strategy
+            .strategy_table
+            .lpm(&name)
+            .unwrap_or_else(|| Arc::clone(&self.strategy.default_strategy));
+        let action = strategy.on_nack_erased(&sctx, nack_reason).await;
+        match action {
+            ForwardingAction::Forward(faces) => {
+                let interest_wire = nack.interest.raw().clone();
+                let wire_len = interest_wire.len() as u64;
+                for face_id in &faces {
+                    if let Some(state) = self.face_states.get(face_id) {
+                        state.counters.out_interests.fetch_add(1, Ordering::Relaxed);
+                        state
+                            .counters
+                            .out_bytes
+                            .fetch_add(wire_len, Ordering::Relaxed);
+                    }
+                    self.enqueue_send(*face_id, interest_wire.clone()).await;
+                }
+            }
+            ForwardingAction::Nack(_reason) => {
+                if let Some((_, entry)) = self.strategy.pit.remove(&token) {
+                    let interest_wire = nack.interest.raw().clone();
+                    let packet_reason = nack.reason;
+                    for face_id_raw in entry.in_record_faces() {
+                        let face_id = FaceId(face_id_raw);
+                        let nack_bytes = encode_nack(packet_reason, &interest_wire);
+                        self.enqueue_send(face_id, nack_bytes).await;
+                    }
+                }
+            }
+            ForwardingAction::Suppress | ForwardingAction::ForwardAfter { .. } => {
+                debug!(target: t::FWD_STRATEGY, "nack suppressed by strategy");
+            }
+        }
+    }
+
+    async fn data_pipeline(&self, ctx: PacketContext) {
+        let ctx = match self.pit_match.process(ctx) {
+            Action::Continue(ctx) => ctx,
+            Action::Drop(r) => {
+                debug!(target: t::FWD_PIT, reason=?r, "unsolicited data");
+                return;
+            }
+            other => {
+                self.dispatch_action(other).await;
+                return;
+            }
+        };
+
+        // Local faces (IPC or a loopback remote) are trusted by OS-level
+        // access control; skip crypto for them. A remote WS/WT/WebRTC peer is
+        // NonLocal here, so its Data is verified — unlike the old kind-only
+        // classification, which trusted any browser peer.
+        let is_local = self
+            .face_table
+            .get(ctx.face_id)
+            .map(|f| f.scope() == FaceScope::Local)
+            .unwrap_or(false);
+
+        let ctx = if is_local {
+            let mut ctx = ctx;
+            ctx.verified = true;
+            ctx
+        } else {
+            match self.validation.process(ctx).await {
+                Action::Satisfy(ctx) => ctx,
+                Action::Drop(r) => {
+                    debug!(target: t::SECURITY, reason=?r, "data validation failed");
+                    return;
+                }
+                other => {
+                    self.dispatch_action(other).await;
+                    return;
+                }
+            }
+        };
+
+        let action = self.cs_insert.process(ctx).await;
+        self.dispatch_action(action).await;
+    }
+
+    pub(super) async fn run_validation_drain(&self, cancel: CancellationToken) {
+        let tick_dur = Duration::from_millis(100);
+
+        loop {
+            let sleep = self.runtime.sleep(tick_dur);
+            tokio::select! {
+                biased;                _ = cancel.cancelled() => break,
+                _ = sleep => {
+                    let actions = self.validation.drain_pending().await;
+                    for action in actions {
+                        match action {
+                            Action::Satisfy(ctx) => {
+                                let action = self.cs_insert.process(ctx).await;
+                                self.dispatch_action(action).await;
+                            }
+                            other => self.dispatch_action(other).await,
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Consult the rate-limit hook for an inbound packet. `Ok(ctx)` if the
+    /// hook permits (or none installed); `Err(action)` short-circuits with
+    /// `Drop(RateLimited)` or `Nack(Congestion)`. Boxed to keep the success
+    /// path small (clippy `result_large_err`).
+    fn check_rate_limit_inbound(&self, ctx: PacketContext) -> Result<PacketContext, Box<Action>> {
+        let Some(hook) = self.rate_limit.as_ref() else {
+            return Ok(ctx);
+        };
+        let Some(name) = ctx.name.as_ref() else {
+            return Ok(ctx);
+        };
+        let (kind, is_interest) = match &ctx.packet {
+            DecodedPacket::Interest(_) => (crate::rate_limit_hook::PacketKind::Interest, true),
+            DecodedPacket::Data(_) => (crate::rate_limit_hook::PacketKind::Data, false),
+            _ => return Ok(ctx),
+        };
+        let decision = hook.check_inbound(ctx.face_id, name, kind, ctx.raw_bytes.len());
+        match decision {
+            crate::rate_limit_hook::Decision::Permit => Ok(ctx),
+            crate::rate_limit_hook::Decision::Drop => {
+                debug!(
+                    target: t::FWD_PIPELINE,
+                    face = %ctx.face_id,
+                    name = ?ctx.name,
+                    "rate-limit: inbound dropped"
+                );
+                Err(Box::new(Action::Drop(DropReason::RateLimited)))
+            }
+            crate::rate_limit_hook::Decision::Nack if is_interest => {
+                debug!(
+                    target: t::FWD_PIPELINE,
+                    face = %ctx.face_id,
+                    name = ?ctx.name,
+                    "rate-limit: inbound Interest NACKed (Congestion)"
+                );
+                Err(Box::new(Action::Nack(ctx, NackReason::Congestion)))
+            }
+            crate::rate_limit_hook::Decision::Nack => {
+                // NACK is not meaningful for Data; fall back to silent drop.
+                debug!(
+                    target: t::FWD_PIPELINE,
+                    face = %ctx.face_id,
+                    name = ?ctx.name,
+                    "rate-limit: inbound Data dropped (NACK not valid for Data)"
+                );
+                Err(Box::new(Action::Drop(DropReason::RateLimited)))
+            }
+        }
+    }
+
+    /// Consult the rate-limit hook for an outbound packet. Returns `true` if
+    /// the packet may pass, `false` to drop.
+    pub(super) fn check_rate_limit_outbound(
+        &self,
+        face: FaceId,
+        name: Option<&ndn_packet::Name>,
+        is_interest: bool,
+        wire_bytes: usize,
+    ) -> bool {
+        let Some(hook) = self.rate_limit.as_ref() else {
+            return true;
+        };
+        let Some(name) = name else {
+            return true;
+        };
+        let kind = if is_interest {
+            crate::rate_limit_hook::PacketKind::Interest
+        } else {
+            crate::rate_limit_hook::PacketKind::Data
+        };
+        let decision = hook.check_outbound(face, name, kind, wire_bytes);
+        matches!(decision, crate::rate_limit_hook::Decision::Permit)
+    }
+}

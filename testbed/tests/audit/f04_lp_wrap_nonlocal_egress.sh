@@ -9,7 +9,7 @@
 #              (CongestionMark, NextHopFaceId, IncomingFaceId,
 #              PitToken on Data) on net→net forwards.
 # Witness:     GREP-PROOF — egress branches in
-#              `crates/spec/ndn-engine/src/dispatcher/outbound.rs`
+#              `crates/ndn-engine/src/dispatcher/outbound.rs`
 #              now wrap non-local egress in LpPacket via
 #              `encode_lp_packet`, the same wrapper NFD's link
 #              service uses.  Local-scope faces keep bare TLV.
@@ -21,7 +21,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 cd "$REPO_ROOT"
 
-OUT="crates/spec/ndn-engine/src/dispatcher/outbound.rs"
+OUT="crates/ndn-engine/src/dispatcher/outbound.rs"
 if ! grep -q 'encode_lp_packet(&ctx.raw_bytes)' "$OUT"; then
     echo "FAIL: Send branch does not LP-wrap non-local Interest egress"
     exit 1

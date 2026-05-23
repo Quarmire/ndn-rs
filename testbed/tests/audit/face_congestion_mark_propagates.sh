@@ -52,7 +52,7 @@ check_grep() {
     fi
 }
 
-CM=crates/spec/ndn-transport/src/link_service/features/congestion_marking.rs
+CM=crates/ndn-transport/src/link_service/features/congestion_marking.rs
 
 check_grep 'pub struct CongestionMarkingFeature' "$CM" 'CongestionMarkingFeature struct'
 check_grep 'queue_depth_fn'                      "$CM" 'queue_depth_fn closure field'

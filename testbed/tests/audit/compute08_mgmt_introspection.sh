@@ -2,7 +2,7 @@
 # Witness — C-COMPUTE-08: the read-only `/localhost/nfd/compute/list`
 # introspection module reports the registered compute function table.
 #
-# Feature:    compute management introspection — `crates/spec/ndn-mgmt`
+# Feature:    compute management introspection — `crates/ndn-mgmt`
 #             module `compute`, backed by `ComputeService::mgmt_backend()`.
 # Witnesses:
 #   GREP-PROOF — the module is registered in register_builtins, the
@@ -16,15 +16,15 @@ cd "$REPO_ROOT"
 
 fail=0
 
-if ! grep -q 'compute::ComputeModule' crates/spec/ndn-mgmt/src/modules/mod.rs; then
+if ! grep -q 'compute::ComputeModule' crates/ndn-mgmt/src/modules/mod.rs; then
     echo "FAIL: ComputeModule not registered in register_builtins" >&2
     fail=1
 fi
-if ! grep -q 'COMPUTE: &\[u8\] = b"compute"' crates/extension/ndn-config/src/nfd_command.rs; then
+if ! grep -q 'COMPUTE: &\[u8\] = b"compute"' crates/ndn-config/src/nfd_command.rs; then
     echo "FAIL: compute module name const missing in ndn-config" >&2
     fail=1
 fi
-if ! grep -q 'fn mgmt_backend' crates/extension/ndn-compute/src/service.rs; then
+if ! grep -q 'fn mgmt_backend' crates/ndn-compute/src/service.rs; then
     echo "FAIL: ComputeService::mgmt_backend() missing" >&2
     fail=1
 fi

@@ -2,7 +2,7 @@
 # Witness — NC.03: the ndn-coding endpoint API (CodedProducer / CodedFetcher)
 # round-trips through an embedded forwarder, including parity recovery.
 #
-# Feature:    network-coding F1 endpoint API — `crates/extension/ndn-coding`.
+# Feature:    network-coding F1 endpoint API — `crates/ndn-coding`.
 # Witnesses:  two RUST-UNIT tests in ndn-coding's tests/end_to_end:
 #               - endpoint_round_trip_no_loss
 #                 (CodedProducer serves N segments; CodedFetcher recovers

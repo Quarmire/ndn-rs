@@ -42,10 +42,10 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 cd "$REPO_ROOT"
 
-FACE_LOCAL="crates/spec/ndn-face-local/src/lib.rs"
-OUT="crates/spec/ndn-engine/src/dispatcher/outbound.rs"
-MGMT="crates/spec/ndn-mgmt/src/lib.rs"
-TRANSPORT="crates/spec/ndn-transport/src/transport.rs"
+FACE_LOCAL="crates/ndn-face-local/src/lib.rs"
+OUT="crates/ndn-engine/src/dispatcher/outbound.rs"
+MGMT="crates/ndn-mgmt/src/lib.rs"
+TRANSPORT="crates/ndn-transport/src/transport.rs"
 
 fail() { echo "FAIL: $*"; exit 1; }
 

@@ -15,7 +15,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 cd "$REPO_ROOT"
 
-CRATE=crates/extension/ndn-coding
+CRATE=crates/ndn-coding
 fail=0
 
 if [ ! -d "$CRATE" ]; then

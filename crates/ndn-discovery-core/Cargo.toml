@@ -1,0 +1,24 @@
+[package]
+name = "ndn-discovery-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Wasm-safe trait shapes for ndn-discovery (DiscoveryProtocol, NeighborTable, scope helpers)"
+
+[package.metadata.scope]
+classification = "spec"
+
+[dependencies]
+ndn-packet    = { workspace = true, default-features = false }
+ndn-transport = { workspace = true }
+bytes         = { workspace = true, features = ["std"] }
+tracing       = { workspace = true }
+
+# `std` and `std-wasm` are mutually exclusive opt-ins for ndn-packet's
+# crypto path; ring (under `std`) does not build for wasm32-unknown-unknown.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ndn-packet    = { workspace = true, features = ["std"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+ndn-packet    = { workspace = true, features = ["std-wasm"] }

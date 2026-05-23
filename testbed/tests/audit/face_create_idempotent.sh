@@ -15,7 +15,7 @@
 #
 # Witnesses:
 #   (a) GREP-PROOF — `existing_face_id_for_uri` + `faces_create_idempotent`
-#       helpers live in `crates/spec/ndn-mgmt/src/modules/faces.rs`.
+#       helpers live in `crates/ndn-mgmt/src/modules/faces.rs`.
 #   (b) GREP-PROOF — `ControlParameters` carries `partial_failures`.
 #   (c) GREP-PROOF — TLV constants for PARTIAL_FAILURES / PARTIAL_FAILURE
 #       / OPTION_NAME / REFUSAL_REASON exist.
@@ -46,8 +46,8 @@ check_grep() {
     fi
 }
 
-MGMT=crates/spec/ndn-mgmt/src/modules/faces.rs
-CP=crates/extension/ndn-config/src/control_parameters.rs
+MGMT=crates/ndn-mgmt/src/modules/faces.rs
+CP=crates/ndn-config/src/control_parameters.rs
 
 # (a) Idempotent-path helpers.
 check_grep 'fn existing_face_id_for_uri' "$MGMT" 'existing_face_id_for_uri helper'

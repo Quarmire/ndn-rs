@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Witness test for inbound Interest-flood rate limiting.
 #
-# Feature:     in-engine rate-limit — `crates/extension/ndn-ratelimit`.
+# Feature:     in-engine rate-limit — `crates/ndn-ratelimit`.
 # Spec ref:    no NDN spec governs admission control; design memo at
 #              `docs/notes/rate-limit-design-2026-05-12.md`. The hook
 #              issues `NACK(reason=Congestion)` for inbound Interest

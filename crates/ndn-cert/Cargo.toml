@@ -1,0 +1,42 @@
+[package]
+name = "ndn-cert"
+description = "NDNCERT: NDN certificate management protocol — issuance, challenges, and CA logic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+classification = "spec"
+
+[features]
+default = ["yubikey-challenge"]
+# YubiKey HOTP challenge handler. Pulls `ring::hmac` which fails to
+# compile for `wasm32-unknown-unknown`; disable for browser builds.
+yubikey-challenge = ["dep:ring"]
+# Browser/wasm enrollment client — minimal surface, no native challenges.
+wasm-client = []
+
+[dependencies]
+ndn-tlv      = { workspace = true, features = ["std"] }
+ndn-packet   = { workspace = true, features = ["std"] }
+ndn-security = { path = "../ndn-security", default-features = false }
+bytes        = { workspace = true, features = ["std"] }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+thiserror    = { workspace = true }
+dashmap      = { workspace = true }
+ring         = { workspace = true, optional = true }
+getrandom    = { workspace = true }
+futures      = { workspace = true }
+tokio        = { workspace = true, features = ["sync", "time"] }
+base64       = { workspace = true }
+tracing      = { workspace = true }
+web-time     = { workspace = true }
+# NDNCERT 0.3 Phase 1C: ECDH + HKDF + AES-GCM
+p256         = { workspace = true }
+aes-gcm      = { workspace = true }
+hkdf         = { workspace = true }
+sha2         = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }

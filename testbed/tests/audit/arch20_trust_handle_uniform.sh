@@ -42,20 +42,20 @@ check_absent() {
 }
 
 # (1) TrustPolicy + the three built-ins live in ndn-security.
-check_grep 'pub trait TrustPolicy'   crates/spec/ndn-security/src/trust.rs   'TrustPolicy trait'
-check_grep 'pub struct InsecureTrust' crates/spec/ndn-security/src/trust.rs  'InsecureTrust'
-check_grep 'pub struct StaticTrust'   crates/spec/ndn-security/src/trust.rs  'StaticTrust'
-check_grep 'pub struct LvsTrust'      crates/spec/ndn-security/src/trust.rs  'LvsTrust'
+check_grep 'pub trait TrustPolicy'   crates/ndn-security/src/trust.rs   'TrustPolicy trait'
+check_grep 'pub struct InsecureTrust' crates/ndn-security/src/trust.rs  'InsecureTrust'
+check_grep 'pub struct StaticTrust'   crates/ndn-security/src/trust.rs  'StaticTrust'
+check_grep 'pub struct LvsTrust'      crates/ndn-security/src/trust.rs  'LvsTrust'
 
 # (2) DV / NLSR / ndn-cert reference the canonical TrustPolicy.
-check_grep 'ndn_security::TrustPolicy' crates/spec/ndn-routing/src/protocols/dv/signing.rs 'DV references TrustPolicy'
-check_grep 'ndn_security::TrustPolicy' crates/spec/ndn-routing/src/protocols/nlsr/protocol.rs 'NLSR references TrustPolicy'
-check_grep 'ndn_security::TrustPolicy' crates/spec/ndn-cert/src/policy.rs 'ndn-cert references TrustPolicy'
+check_grep 'ndn_security::TrustPolicy' crates/ndn-routing/src/protocols/dv/signing.rs 'DV references TrustPolicy'
+check_grep 'ndn_security::TrustPolicy' crates/ndn-routing/src/protocols/nlsr/protocol.rs 'NLSR references TrustPolicy'
+check_grep 'ndn_security::TrustPolicy' crates/ndn-cert/src/policy.rs 'ndn-cert references TrustPolicy'
 
 # (3) NLSR no longer carries a `permissive_validation` config field.
 #     (Comments + TOML back-compat parsing may still mention the
 #     phrase; the protocol-side struct must not.)
-NLSR_PROTOCOL=crates/spec/ndn-routing/src/protocols/nlsr/protocol.rs
+NLSR_PROTOCOL=crates/ndn-routing/src/protocols/nlsr/protocol.rs
 if grep -nE '^\s*pub\s+permissive_validation\s*:\s*bool' "$NLSR_PROTOCOL" >/dev/null 2>&1; then
     echo "FAIL: NlsrConfig still declares permissive_validation: bool" >&2
     grep -nE '^\s*pub\s+permissive_validation\s*:\s*bool' "$NLSR_PROTOCOL" >&2

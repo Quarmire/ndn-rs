@@ -40,7 +40,7 @@ check_grep() {
     fi
 }
 
-FACES=crates/spec/ndn-mgmt/src/modules/faces.rs
+FACES=crates/ndn-mgmt/src/modules/faces.rs
 
 # (a) FaceEventKind has the five new variants.
 for variant in MtuChanged PersistencyChanged ReliabilityBackoff CongestionMark OptionRefused; do

@@ -1,0 +1,26 @@
+[package]
+name = "ndn-runtime"
+description = "Platform-agnostic async runtime traits for ndn-rs: Spawn, Sleep, Now"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+classification = "extension"
+
+[dependencies]
+# BoxFuture / LocalBoxFuture convenience types
+futures = { workspace = true }
+# web-time provides Instant/SystemTime on both native (delegates to std) and
+# wasm32 (uses performance.now()).  Using it unconditionally means Now::now()
+# returns the same type on every target.
+web-time = "1"
+
+# Native async runtime — gated so wasm builds never pull in mio/socket2.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true, features = ["rt", "time"] }
+
+# Browser async primitives — gated so native builds never pull in js-sys/wasm glue.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen-futures = "0.4"
+gloo-timers          = { version = "0.3", features = ["futures"] }

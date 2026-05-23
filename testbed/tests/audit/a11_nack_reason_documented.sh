@@ -17,7 +17,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 cd "$REPO_ROOT"
 
-NACK="crates/spec/ndn-packet/src/nack.rs"
+NACK="crates/ndn-packet/src/nack.rs"
 
 if ! grep -q "ndn-rs-private extension" "$NACK"; then
     echo "FAIL: NackReason doc does not flag NotYet as private"

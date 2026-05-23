@@ -1,0 +1,54 @@
+[package]
+name = "ndn-packet"
+description = "NDN packet types: Name, Interest, Data, Nack"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# `std` is NOT enabled by default. Bare-metal / no_std targets use this crate
+# without any features. All other targets should enable the `std` feature:
+#
+#   ndn-packet = { ..., features = ["std"] }
+#
+# NOTE: this changed from `default = ["std"]` in v0.1.0-alpha. Crates that
+# relied on the old default must now add `features = ["std"]` explicitly.
+
+[package.metadata.scope]
+classification = "spec"
+
+[features]
+default = []
+std     = ["ndn-tlv/std", "bytes/std", "dep:sha2", "dep:getrandom", "dep:blake3", "dep:web-time"]
+# Legacy alias from when `std` pulled `ring`. After the ring removal
+# (2026-05-09), `std` is wasm-clean; keep the name as a no-op alias so
+# downstream crates don't need lockstep updates.
+std-wasm = ["std"]
+
+## Route `bytes::Bytes` and `Arc` refcounting through `portable-atomic` for
+## no_std targets without atomic CAS in hardware (riscv32imc, thumbv6m, etc.).
+## The dependent binary must pick a CAS polyfill via a `portable-atomic`
+## feature or rustflag (typically `--cfg portable_atomic_unsafe_assume_single_core`
+## on uniprocessor MCUs).
+portable-atomic = ["dep:portable-atomic-util", "bytes/extra-platforms"]
+
+[dependencies]
+ndn-foundation-types = { workspace = true, default-features = false }
+ndn-tlv  = { workspace = true, default-features = false }
+bytes    = { workspace = true }
+smallvec = { workspace = true }
+sha2     = { workspace = true, optional = true }
+getrandom = { workspace = true, optional = true }
+blake3   = { workspace = true, optional = true }
+web-time = { workspace = true, optional = true }
+portable-atomic-util = { version = "0.2", optional = true, default-features = false, features = ["alloc"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { workspace = true, features = ["js"] }
+
+[dev-dependencies]
+criterion = { workspace = true }
+ndn-tlv       = { workspace = true, features = ["std"] }
+
+[[bench]]
+name    = "name"
+harness = false

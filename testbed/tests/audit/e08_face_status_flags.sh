@@ -36,19 +36,19 @@ if ! cargo test -p ndn-store --lib --quiet \
 fi
 # Live counter wiring at the satisfied path.
 if ! grep -q 'in_satisfied_interests' \
-        crates/spec/ndn-engine/src/dispatcher/outbound.rs; then
+        crates/ndn-engine/src/dispatcher/outbound.rs; then
     echo "FAIL: satisfied path does not credit NSatisfiedInterests"
     exit 1
 fi
 # Live counter wiring at the expiry path.
 if ! grep -q 'in_unsatisfied_interests' \
-        crates/spec/ndn-engine/src/expiry.rs; then
+        crates/ndn-engine/src/expiry.rs; then
     echo "FAIL: expiry task does not credit NUnsatisfiedInterests"
     exit 1
 fi
 # FaceState carries the flags bitmap and faces_list reads it.
 if ! grep -q 's.flags.load' \
-        crates/spec/ndn-mgmt/src/lib.rs; then
+        crates/ndn-mgmt/src/lib.rs; then
     echo "FAIL: faces_list_dataset does not surface FaceState.flags"
     exit 1
 fi

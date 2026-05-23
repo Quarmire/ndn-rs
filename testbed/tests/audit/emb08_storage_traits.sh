@@ -22,9 +22,9 @@ command -v cargo >/dev/null 2>&1 || { echo "SKIP: cargo not in PATH" >&2; exit 2
 
 fail=0
 CRATE_DIR=$(find crates -type d -name ndn-fwd-core 2>/dev/null | head -1)
-FIB=crates/extension/ndn-embedded/src/fib.rs
-PIT=crates/extension/ndn-embedded/src/pit.rs
-FWD=crates/extension/ndn-embedded/src/forwarder.rs
+FIB=crates/ndn-embedded/src/fib.rs
+PIT=crates/ndn-embedded/src/pit.rs
+FWD=crates/ndn-embedded/src/forwarder.rs
 
 # (a) core defines the traits + the store-driven orchestration.
 if [ -z "$CRATE_DIR" ] \

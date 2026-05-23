@@ -5,7 +5,7 @@
 # Finding:     docs/notes/tiered-api-design-2026-05-20.md §2
 # Severity:    Phase 3 deliverable (pre-v0.1.0)
 # Witnesses:
-#   (a) GREP-PROOF — `crates/spec/ndn-rs-prelude/Cargo.toml` lists only
+#   (a) GREP-PROOF — `crates/ndn-rs-prelude/Cargo.toml` lists only
 #       `ndn-app`, `ndn-packet`, `ndn-security` (and no other workspace
 #       crate) as a runtime dependency. Package name is
 #       `ndn-rs-prelude` (the unqualified `ndn` crate name is held by
@@ -31,8 +31,8 @@ REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 cd "$REPO_ROOT"
 
 fail=0
-CARGO=crates/spec/ndn-rs-prelude/Cargo.toml
-LIB=crates/spec/ndn-rs-prelude/src/lib.rs
+CARGO=crates/ndn-rs-prelude/Cargo.toml
+LIB=crates/ndn-rs-prelude/src/lib.rs
 
 check_grep() {
     local pattern="$1" path="$2" label="$3"

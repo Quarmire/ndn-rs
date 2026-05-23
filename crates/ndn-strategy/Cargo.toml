@@ -1,0 +1,30 @@
+[package]
+name = "ndn-strategy"
+description = "Built-in NDN forwarding strategies"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+classification = "spec"
+
+[dependencies]
+ndn-runtime   = { workspace = true }
+ndn-store     = { workspace = true }
+ndn-transport = { workspace = true }
+bytes         = { workspace = true, features = ["std"] }
+linkme        = { workspace = true }
+smallvec      = { workspace = true }
+tokio-util    = { workspace = true }
+# `std::time::SystemTime` panics on wasm32; web-time shims it.
+web-time      = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ndn-packet = { workspace = true, features = ["std"] }
+dashmap    = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+ndn-packet = { workspace = true, features = ["std-wasm"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }

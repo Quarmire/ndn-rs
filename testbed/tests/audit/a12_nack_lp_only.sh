@@ -26,7 +26,7 @@ fail=0
 
 # 1. build_nack (invented-form emitter) must not exist anywhere in nack.rs
 if grep -q "fn build_nack" \
-        "$REPO_ROOT/crates/spec/ndn-packet/src/nack.rs"; then
+        "$REPO_ROOT/crates/ndn-packet/src/nack.rs"; then
     echo "FAIL: fn build_nack still present in nack.rs"
     fail=1
 else
@@ -37,7 +37,7 @@ fi
 #    as an outer packet type (LP decode/encode legitimately reference it for
 #    the LP-field usage — only nack.rs decode() is in scope here).
 nack_non_test=$(awk '/^#\[cfg\(test\)\]/{exit} {print}' \
-    "$REPO_ROOT/crates/spec/ndn-packet/src/nack.rs")
+    "$REPO_ROOT/crates/ndn-packet/src/nack.rs")
 if echo "$nack_non_test" | grep -qE 'tlv_type::NACK\b'; then
     echo "FAIL: non-test nack.rs still references tlv_type::NACK as outer type"
     fail=1

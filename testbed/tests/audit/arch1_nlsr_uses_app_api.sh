@@ -18,10 +18,10 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 cd "$REPO_ROOT"
 
-NLSR_PROTOCOL=crates/spec/ndn-routing/src/protocols/nlsr/protocol.rs
-NLSR_HELLO=crates/spec/ndn-routing/src/protocols/nlsr/hello.rs
-NLSR_SYNC=crates/spec/ndn-routing/src/protocols/nlsr/sync.rs
-FWD_MAIN=binaries/spec/ndn-fwd/src/main.rs
+NLSR_PROTOCOL=crates/ndn-routing/src/protocols/nlsr/protocol.rs
+NLSR_HELLO=crates/ndn-routing/src/protocols/nlsr/hello.rs
+NLSR_SYNC=crates/ndn-routing/src/protocols/nlsr/sync.rs
+FWD_MAIN=binaries/ndn-fwd/src/main.rs
 
 fail=0
 

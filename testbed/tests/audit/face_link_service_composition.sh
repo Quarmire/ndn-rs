@@ -5,7 +5,7 @@
 # Finding:     docs/notes/face-system-design-2026-05-20.md § Tier 1
 # Severity:    Phase-2b architectural cleanup (pre-v0.1.0)
 # Decision:    Q1=(a) — feature trait + composer live in
-#              `crates/spec/ndn-transport/src/link_service/`.  Six
+#              `crates/ndn-transport/src/link_service/`.  Six
 #              inert built-in features ship in Tier 1; reliability,
 #              congestion-marking, and TraceContext-emission slot in
 #              behind the same trait in later tiers.
@@ -57,7 +57,7 @@ check_absent_in_paths() {
     fi
 }
 
-LS_DIR=crates/spec/ndn-transport/src/link_service
+LS_DIR=crates/ndn-transport/src/link_service
 FEATURE_FILE="$LS_DIR/feature.rs"
 
 # (a) Trait + four method names.

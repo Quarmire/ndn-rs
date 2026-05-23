@@ -6,7 +6,7 @@
 # Witnesses:
 #   (a) GREP-PROOF — the native forwarding-table crate (ndn-store, which the
 #       async engine composes) depends on ndn-fwd-core.
-#   (b) GREP-PROOF — crates/extension/ndn-embedded/Cargo.toml depends on it too.
+#   (b) GREP-PROOF — crates/ndn-embedded/Cargo.toml depends on it too.
 #   This is the fact that turns "two forwarders" into "two table layers over one
 #   rule set." (ndn-engine inherits the rules transitively via ndn-store; a
 #   direct engine-side adoption — hop-limit/PIT on the hot path — is a later,
@@ -20,8 +20,8 @@ REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 cd "$REPO_ROOT"
 
 fail=0
-STORE_TOML=crates/spec/ndn-store/Cargo.toml
-EMBEDDED_TOML=crates/extension/ndn-embedded/Cargo.toml
+STORE_TOML=crates/ndn-store/Cargo.toml
+EMBEDDED_TOML=crates/ndn-embedded/Cargo.toml
 
 for toml in "$STORE_TOML" "$EMBEDDED_TOML"; do
     if [ ! -f "$toml" ]; then

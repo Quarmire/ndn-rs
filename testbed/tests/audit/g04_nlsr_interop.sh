@@ -215,7 +215,7 @@ if [[ $RS_SEES_CXX -eq 0 ]]; then
     echo "     'Hello sent' / 'getting status' line in nlsr-cxx logs."
     echo "  3. PSync update arrived but LSA fetch failed — look in"
     echo "     ndn-fwd-nlsr logs for 'fetched LSA' (PASS) vs 'LSA Interest"
-    echo "     timed out' (FAIL).  See crates/spec/ndn-routing/src/protocols/"
+    echo "     timed out' (FAIL).  See crates/ndn-routing/src/protocols/"
     echo "     nlsr/sync.rs::fetch_remote_lsa."
     echo "  4. NameLSA never advertised our prefix — confirm ndn-fwd-nlsr"
     echo "     logs show 'own NameLSA installed' with prefixes=1+."

@@ -28,7 +28,7 @@ fi
 
 # GREP-PROOF: `ndn_default` uses the new multicast-port constant.
 if ! grep -q "Self::new(iface, NDN_MULTICAST_PORT, NDN_MULTICAST_V4" \
-        "$REPO_ROOT/crates/spec/ndn-faces/src/net/multicast.rs"; then
+        "$REPO_ROOT/crates/ndn-faces/src/net/multicast.rs"; then
     echo "FAIL: ndn_default still uses the unicast port"
     fail=1
 fi

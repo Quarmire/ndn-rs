@@ -16,7 +16,7 @@
 #      ndrv.rs"; git -p -S 'FIXME'/'TODO' confirms the tokens have never
 #      appeared in either file.  This witness keeps the audit honest by
 #      regressing if any future change introduces an untracked FIXME.)
-#   2. NDN_ETHERTYPE = 0x8624 is bound once in crates/spec/ndn-faces/src/l2/mod.rs.
+#   2. NDN_ETHERTYPE = 0x8624 is bound once in crates/ndn-faces/src/l2/mod.rs.
 #   3. NDN_ETHER_MCAST_MAC = [0x01, 0x00, 0x5E, 0x00, 0x17, 0xAA] is bound in
 #      pcap_face.rs and ndrv.rs (duplicate definition is a code-quality
 #      follow-up; both values match the spec).
@@ -30,7 +30,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 cd "$REPO_ROOT"
 
-L2_DIR="crates/spec/ndn-faces/src/l2"
+L2_DIR="crates/ndn-faces/src/l2"
 FILES=(
     "$L2_DIR/ether.rs"
     "$L2_DIR/ether_macos.rs"

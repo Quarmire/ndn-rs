@@ -15,9 +15,9 @@
 #
 # Witnesses:
 #   (a) GREP-PROOF — `ReliabilityFeature` struct exists in
-#       `crates/spec/ndn-transport/src/link_service/features/reliability.rs`.
+#       `crates/ndn-transport/src/link_service/features/reliability.rs`.
 #   (b) GREP-PROOF — `CongestionMarkingFeature` exists in
-#       `crates/spec/ndn-transport/src/link_service/features/congestion_marking.rs`.
+#       `crates/ndn-transport/src/link_service/features/congestion_marking.rs`.
 #   (c) GREP-PROOF — `LpLinkService::apply` dispatches to features
 #       (looks for `feature.set_enabled` or `set_lp_reliability_enabled`).
 #   (d) GREP-PROOF — `default_features_for_network_face` registers
@@ -48,8 +48,8 @@ check_grep() {
     fi
 }
 
-FEATURES=crates/spec/ndn-transport/src/link_service/features
-LP=crates/spec/ndn-transport/src/link_service/mod.rs
+FEATURES=crates/ndn-transport/src/link_service/features
+LP=crates/ndn-transport/src/link_service/mod.rs
 
 # (a) ReliabilityFeature impl on disk.
 check_grep 'pub struct ReliabilityFeature'   "$FEATURES/reliability.rs"        'ReliabilityFeature struct'

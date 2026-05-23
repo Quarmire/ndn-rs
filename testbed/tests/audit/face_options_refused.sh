@@ -63,9 +63,9 @@ check_absent_in_paths() {
     fi
 }
 
-MGMT_FACES=crates/spec/ndn-mgmt/src/modules/faces.rs
-STATUS=crates/extension/ndn-config/src/control_response.rs
-CONTROL_PARAMS=crates/extension/ndn-config/src/control_parameters.rs
+MGMT_FACES=crates/ndn-mgmt/src/modules/faces.rs
+STATUS=crates/ndn-config/src/control_response.rs
+CONTROL_PARAMS=crates/ndn-config/src/control_parameters.rs
 
 # (a) The dead-end "not yet supported" guard is gone.
 check_absent_in_paths 'not yet supported' \

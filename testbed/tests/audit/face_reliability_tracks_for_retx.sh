@@ -48,7 +48,7 @@ check_grep() {
     fi
 }
 
-FEATURES=crates/spec/ndn-transport/src/link_service/features
+FEATURES=crates/ndn-transport/src/link_service/features
 
 check_grep 'n_lp_resent_packets'        "$FEATURES/reliability.rs" 'n_lp_resent_packets counter'
 check_grep 'Mutex<LpReliability>'       "$FEATURES/reliability.rs" 'wraps existing LpReliability state machine'

@@ -11,7 +11,7 @@
 #
 # Expected today: FAIL (exit 1) — TraceContext LP TLV is decoded but
 # `on_egress` does not yet inject (OutboundLpFrame typed slot is still
-# TODO from Tier 1).  See `crates/spec/ndn-transport/src/link_service/
+# TODO from Tier 1).  See `crates/ndn-transport/src/link_service/
 # features/trace_context.rs` Phase-3 status block for the remaining
 # wiring.
 #

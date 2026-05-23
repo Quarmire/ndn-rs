@@ -45,26 +45,26 @@ check() {
 # 1. The TLV-TYPE 0x03 constant must not exist in ndn-packet.
 check "no BLAKE3_DIGEST constant in ndn-packet" \
     'BLAKE3_DIGEST' \
-    crates/spec/ndn-packet/src/
+    crates/ndn-packet/src/
 
 # 2. The Name component / helper / Display alt-form must not exist.
 check "no blake3_digest helpers in ndn-packet" \
     'blake3_digest|blake3digest=|append_blake3_digest|as_blake3_digest|zone_root_from_hash|is_zone_root' \
-    crates/spec/ndn-packet/src/
+    crates/ndn-packet/src/
 
 # 3. The zone module and ZoneKey must not exist in ndn-security.
 check "no ZoneKey / zone module in ndn-security" \
     'ZoneKey|crate::zone|pub mod zone\b|zone_root_from_pubkey|verify_zone_root|zone_root_to_did' \
-    crates/spec/ndn-security/src/
+    crates/ndn-security/src/
 
 # 4. The zone-bound DID builder functions must not exist.
 check "no build_zone_did_document / build_zone_succession_document in ndn-security" \
     'build_zone_did_document|build_zone_succession_document' \
-    crates/spec/ndn-security/src/
+    crates/ndn-security/src/
 
 # 5. zone.rs file itself must be gone.
-if [ -e crates/spec/ndn-security/src/zone.rs ]; then
-    echo "FAIL: crates/spec/ndn-security/src/zone.rs still exists"
+if [ -e crates/ndn-security/src/zone.rs ]; then
+    echo "FAIL: crates/ndn-security/src/zone.rs still exists"
     fail=1
 else
     echo "ok: zone.rs deleted"

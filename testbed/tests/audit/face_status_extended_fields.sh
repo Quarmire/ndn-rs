@@ -45,8 +45,8 @@ check_grep() {
     fi
 }
 
-FS=crates/extension/ndn-config/src/nfd_dataset.rs
-MGMT=crates/spec/ndn-mgmt/src/modules/faces.rs
+FS=crates/ndn-config/src/nfd_dataset.rs
+MGMT=crates/ndn-mgmt/src/modules/faces.rs
 
 # (a) Struct fields.
 for field in n_lp_resent_packets n_congestion_marks_sent n_congestion_marks_received effective_mtu feature_set rto_micros; do

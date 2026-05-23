@@ -13,7 +13,7 @@
 # Today: FAIL (exit 1) — the `ndn-face-webtransport-wasm` crate doesn't exist
 #                        and `cargo metadata` returns no match.
 # After fix: PASS (exit 0) — the integration test in
-#            crates/extension/ndn-face-webtransport-wasm/tests/native_xwt_roundtrip.rs
+#            crates/ndn-face-webtransport-wasm/tests/native_xwt_roundtrip.rs
 #            goes green.
 set -euo pipefail
 

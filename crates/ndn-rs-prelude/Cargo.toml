@@ -1,0 +1,40 @@
+[package]
+name = "ndn-rs-prelude"
+description = "ndn-rs Develop-tier umbrella: curated re-exports of the application-author API surface."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+# Develop-tier umbrella; classification matches the spec crates it re-exports.
+classification = "spec"
+
+# Library name is `ndn` so callers write `use ndn::Consumer;` even
+# though the crates.io package is `ndn-rs-prelude`. The unqualified
+# `ndn` crate name is held by a 2018 placeholder at version 0.0.1.
+# 
+[lib]
+name = "ndn"
+path = "src/lib.rs"
+
+[features]
+default = []
+
+[dependencies]
+# Wasm-safe core: packet types + builders + security primitives.
+# `ndn-security` is pulled without its default `sqlite-pib` feature so
+# the umbrella builds for wasm32-unknown-unknown. Callers that need
+# the SQLite-backed PIB depend on `ndn-security` directly.
+ndn-packet   = { workspace = true, features = ["std"] }
+# Cargo's workspace-dep inheritance can't override `default-features`,
+# so pull `ndn-security` by path and explicitly drop its default
+# `sqlite-pib` feature (sqlite-bundled doesn't cross-compile to wasm32).
+ndn-security = { path = "../ndn-security", default-features = false }
+
+# Develop-tier application API lives in `ndn-app`, which pulls
+# `ndn-engine` + `ndn-faces` + full Tokio. None of those build on
+# wasm32 today; the umbrella exposes them on native only. Wasm
+# callers use `ndn-engine::WasmEngineBuilder` for the embedded-engine
+# path (Phase-4 wiki documents this split).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ndn-app = { workspace = true }

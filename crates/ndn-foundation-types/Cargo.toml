@@ -1,0 +1,23 @@
+[package]
+name = "ndn-foundation-types"
+description = "Shared foundation types: Name, Hash, KeyLocator, SignatureValue, TlvEncode/TlvDecode"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Feature flags:
+#   default = []   — no_std capable (allocator required); Hash::of unavailable.
+#   std            — enables bytes/std and SHA-256 Hash::of via sha2.
+
+[package.metadata.scope]
+classification = "spec"
+
+[features]
+default = []
+std     = ["bytes/std", "dep:sha2"]
+
+[dependencies]
+ndn-tlv  = { workspace = true, default-features = false }
+bytes    = { version = "1", default-features = false }
+smallvec = { workspace = true }
+sha2     = { version = "0.11", optional = true, default-features = false, features = ["alloc"] }
