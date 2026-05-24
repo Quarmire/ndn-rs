@@ -62,6 +62,9 @@ pub enum FaceKind {
     Serial,
     Bluetooth,
     Wfb,
+    /// Wi-Fi Aware (NAN) connectionless coordination bearer — AP-less,
+    /// association-less follow-up messages. `link_type() == AdHoc`.
+    WifiAware,
     Compute,
     Internal,
     Multicast,
@@ -100,6 +103,7 @@ impl FaceKind {
             | FaceKind::Serial
             | FaceKind::Bluetooth
             | FaceKind::Wfb
+            | FaceKind::WifiAware
             | FaceKind::Multicast => ScopePolicy::AlwaysNonLocal,
             FaceKind::Udp
             | FaceKind::Tcp
@@ -129,6 +133,7 @@ impl FaceKind {
             | FaceKind::Serial
             | FaceKind::Bluetooth
             | FaceKind::Wfb
+            | FaceKind::WifiAware
             | FaceKind::Multicast
             | FaceKind::WebSocket
             | FaceKind::WebTransport
@@ -155,6 +160,7 @@ impl core::fmt::Display for FaceKind {
             Self::Serial => "serial",
             Self::Bluetooth => "bluetooth",
             Self::Wfb => "wfb",
+            Self::WifiAware => "wifi-aware",
             Self::Compute => "compute",
             Self::Internal => "internal",
             Self::Multicast => "multicast",
@@ -182,6 +188,7 @@ impl core::str::FromStr for FaceKind {
             "serial" => Ok(Self::Serial),
             "bluetooth" => Ok(Self::Bluetooth),
             "wfb" => Ok(Self::Wfb),
+            "wifi-aware" => Ok(Self::WifiAware),
             "compute" => Ok(Self::Compute),
             "internal" => Ok(Self::Internal),
             "multicast" => Ok(Self::Multicast),
