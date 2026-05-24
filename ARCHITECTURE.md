@@ -138,6 +138,7 @@ examples/                       Documentation-grade examples (strategy, discover
 |---|---|---|
 | `Face` | ndn-transport | Async send/recv over any transport (`Transport` + `LinkService` composition; see [Face system](#face-system) below) |
 | `LinkServiceFeature` | ndn-transport | Per-LP-frame extension point — Reliability, CongestionMarking, TraceContext, IncomingFaceId, … |
+| `FaceSink` | ndn-transport | Seam between face *provisioning* (interface enumeration, auto-multicast, hotplug — `ndn-face-native::provision`) and the engine that owns the face table; implemented by `ForwarderEngine`, so any embedding engine reuses the same provisioner |
 | `PipelineStage` | ndn-engine | Single processing step; returns `Action` |
 | `Strategy` | ndn-strategy | Forwarding decision per Interest |
 | `ContentStore` | ndn-store | Pluggable cache backend |
