@@ -18,6 +18,7 @@ The pipeline shape (PacketContext by value, DashMap PIT,
 | `[cs] capacity_mb` | `ndn-fwd.toml` | Bigger cache → more hits → less producer round-trip. |
 | Log filter | `RUST_LOG` / `[log] filter` | `debug`/`trace` is expensive on hot paths. Run production at `info`. |
 | Face MTU / fragmentation | `[[face]] mtu` | Larger MTU = fewer NDNLPv2 fragments. |
+| UDP socket buffers | (automatic) | UDP faces request 4 MiB receive / 1 MiB send on bind (kernel-clamped to `net.core.{r,w}mem_max`), reducing drops under bursty load. |
 
 ## Latency knobs
 
