@@ -116,6 +116,14 @@ impl RecoderState {
     /// Mint a coded Data answering `<object>/_gen/<id>/_req/<j>`, or `None`
     /// if disabled, the generation is unknown, fewer than two packets are
     /// held, or the policy forbids recoding.
+    ///
+    /// **Systematic-first (perf):** the first K requests (`req < K`) are served
+    /// as the *systematic* source packets (unit coding vectors) — the recoder
+    /// already holds them, so this is a copy with **no GF combine**, and a
+    /// consumer that gets the K sources decodes by the unit-vector fast path
+    /// (no Gauss-Jordan). Only requests beyond K mint random repair
+    /// combinations. On a clean path this is the common case and erases most of
+    /// the coding overhead.
     async fn mint(
         &self,
         object: &Name,
@@ -132,15 +140,20 @@ impl RecoderState {
         if matches!(buf.descriptor().recode, crate::recode::RecodePolicy::None) {
             return None; // policy gate
         }
-        let n = buf.held().len();
-        if n < 2 {
-            return None;
-        }
-        let coeffs = self.next_coeffs(n);
-        let combo = buf.recode(&coeffs)?;
+        let k = buf.descriptor().k;
+        let combo = if req < k as u64 {
+            // Systematic source `req` — the exact unit-vector combination.
+            buf.recode_exact(&CodingVector::unit(k, req as u16))?
+        } else {
+            let n = buf.held().len();
+            if n < 2 {
+                return None;
+            }
+            buf.recode(&self.next_coeffs(n))?
+        };
         let meta = CodedMetadata {
             generation_id,
-            k: buf.descriptor().k,
+            k,
             field: buf.descriptor().field,
             vector: combo.vector,
         };
@@ -466,6 +479,33 @@ mod tests {
         }
         assert!(consumer.is_decodable());
         assert_eq!(consumer.decode().unwrap().as_ref(), sources.concat().as_slice());
+    }
+
+    #[tokio::test]
+    async fn systematic_first_serves_sources_then_repair() {
+        let object: Name = "/alice/clip".parse().unwrap();
+        let (desc, sources) = descriptor(&object, crate::recode::RecodePolicy::Open, None);
+        let k = desc.k;
+        let state = RecoderState::new();
+        seed(&state, &object, &desc, &sources).await;
+
+        // The first K requests are the systematic sources (unit vectors) — no
+        // GF combine to serve, no Gauss-Jordan to decode.
+        for i in 0..k as u64 {
+            let wire = state.mint(&object, desc.generation_id, i, None).await.unwrap();
+            let data = Data::decode(wire).unwrap();
+            let (meta, _) = CodedMetadata::split(data.content().unwrap()).unwrap();
+            assert_eq!(
+                meta.vector,
+                CodingVector::unit(k, i as u16),
+                "req {i} (< K) is served as systematic source {i}"
+            );
+        }
+        // Requests beyond K are repair combinations (still serve fine).
+        let wire = state.mint(&object, desc.generation_id, k as u64, None).await.unwrap();
+        let data = Data::decode(wire).unwrap();
+        let (meta, _) = CodedMetadata::split(data.content().unwrap()).unwrap();
+        assert_eq!(meta.vector.len(), k as usize);
     }
 
     #[tokio::test]

@@ -16,6 +16,8 @@
 //! by construction — there is no API to combine packets of different
 //! generations (doctrine §5, "Mixing scope").
 
+use std::sync::OnceLock;
+
 use serde::{Deserialize, Serialize};
 
 use bytes::Bytes;
@@ -44,6 +46,7 @@ const TYPE_FP_H: u64 = 0xEC;
 const TYPE_RECODE_TOKEN: u64 = 0xEE;
 const TYPE_TOKEN_RECODER: u64 = 0xF0;
 const TYPE_TOKEN_SIG: u64 = 0xF2;
+const TYPE_FP_SEED_HASH: u64 = 0xF4;
 
 /// Wire byte for `Role`: a recoded linear combination (wire spec §4).
 /// Extends F1's 0 = source, 1 = parity.
@@ -149,28 +152,64 @@ pub enum SourceCommitment {
 /// `(vector c, payload y)`, `<r, y>` must equal `Σ c[s]·h[s]` — homomorphic,
 /// so it checks an arbitrary linear combination without decoding.
 ///
-/// Caveat (doctrine §6): if `r` is public before an adaptive attacker crafts
-/// a packet, the attacker can pass the check. Use with delayed-seed reveal or
-/// a consumer-chosen challenge for adversarial settings; as a non-adaptive /
-/// buggy-recoder filter it is effective and cheap.
+/// Adaptive resistance (doctrine §6): if `r` is public before an attacker
+/// crafts a packet, it can be defeated. The **delayed-seed** mode
+/// ([`LinearFingerprint::delayed`]) commits to `seed_hash = SHA-256(r)` while
+/// withholding `r` (so `r` is empty until [`reveal`](Self::reveal)); coders
+/// cannot filter in-flight (the seed is secret), but once the producer reveals
+/// `r` the check verifies retroactively and *identifies* polluters — which an
+/// attacker who committed before the reveal cannot pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinearFingerprint {
-    /// Random projection vector, length = symbol size.
+    /// Random projection vector, length = symbol size. **Empty** in the
+    /// delayed mode until the seed is revealed.
     pub r: Vec<u8>,
     /// Per-source-row projections, length = K.
     pub h: Vec<u8>,
+    /// `Some(SHA-256(r))` in the delayed mode; `None` for the immediate
+    /// (public-`r`) mode.
+    pub seed_hash: Option<[u8; 32]>,
 }
 
 impl LinearFingerprint {
-    /// Compute `h[s] = <r, source[s]>` for each source row.
+    /// Immediate mode: `r` is public; coders filter pollution in-flight.
     pub fn for_sources(r: Vec<u8>, sources: &[Vec<u8>]) -> Self {
         let h = sources.iter().map(|row| gf_dot(&r, row)).collect();
-        Self { r, h }
+        Self { r, h, seed_hash: None }
+    }
+
+    /// Delayed mode: commit to `SHA-256(r)` and publish `h`, but **withhold
+    /// `r`** (it stays empty until [`reveal`](Self::reveal)). No in-flight
+    /// filtering; adaptive-resistant retroactive verification after reveal.
+    pub fn delayed(r: &[u8], sources: &[Vec<u8>]) -> Self {
+        let h = sources.iter().map(|row| gf_dot(r, row)).collect();
+        Self { r: Vec::new(), h, seed_hash: Some(row_hash(r)) }
+    }
+
+    /// `true` if this is a delayed commitment whose seed is not yet revealed.
+    pub fn is_delayed_unrevealed(&self) -> bool {
+        self.seed_hash.is_some() && self.r.is_empty()
+    }
+
+    /// Reveal the seed: if `SHA-256(r)` matches the commitment, return the
+    /// usable (immediate-equivalent) fingerprint with `r` filled in. `None` if
+    /// the seed does not match the commitment (or this was not delayed).
+    pub fn reveal(&self, r: &[u8]) -> Option<LinearFingerprint> {
+        match self.seed_hash {
+            Some(hash) if row_hash(r) == hash => Some(LinearFingerprint {
+                r: r.to_vec(),
+                h: self.h.clone(),
+                seed_hash: self.seed_hash,
+            }),
+            _ => None,
+        }
     }
 
     /// Check a coded packet: `<r, payload>` must equal `Σ vector[s]·h[s]`.
+    /// Returns `false` if `r` is not available (delayed-unrevealed) — callers
+    /// must not treat that as a pass; gate with [`is_delayed_unrevealed`].
     pub fn check(&self, vector: &CodingVector, payload: &[u8]) -> bool {
-        if payload.len() != self.r.len() || vector.len() != self.h.len() {
+        if self.r.is_empty() || payload.len() != self.r.len() || vector.len() != self.h.len() {
             return false;
         }
         let expected = vector
@@ -221,10 +260,13 @@ impl GenerationDescriptor {
         if self.recode.is_delegated() && self.delegation.is_none() {
             return false;
         }
-        if let Some(fp) = &self.fingerprint
-            && (fp.r.len() != self.symbol_size as usize || fp.h.len() != self.k as usize)
-        {
-            return false;
+        if let Some(fp) = &self.fingerprint {
+            // `r` is empty in the delayed mode (withheld until reveal); only
+            // require its length in the immediate / revealed case.
+            let r_ok = fp.is_delayed_unrevealed() || fp.r.len() == self.symbol_size as usize;
+            if !r_ok || fp.h.len() != self.k as usize {
+                return false;
+            }
         }
         match &self.source_commitment {
             SourceCommitment::RowHashes(h) => h.len() == self.k as usize,
@@ -251,8 +293,11 @@ impl GenerationDescriptor {
             }
             if let Some(fp) = &self.fingerprint {
                 inner.write_nested(TYPE_FINGERPRINT, |f| {
-                    f.write_tlv(TYPE_FP_R, &fp.r);
+                    f.write_tlv(TYPE_FP_R, &fp.r); // empty in delayed mode
                     f.write_tlv(TYPE_FP_H, &fp.h);
+                    if let Some(sh) = &fp.seed_hash {
+                        f.write_tlv(TYPE_FP_SEED_HASH, sh);
+                    }
                 });
             }
         });
@@ -718,6 +763,9 @@ pub struct GenerationBuffer {
     attempts: usize,
     rejected: usize,
     quarantined: bool,
+    /// Decoded source rows, computed once at full rank and reused by
+    /// `recode_exact`/`decode` (perf: avoids re-solving per call).
+    sources: OnceLock<Vec<Vec<u8>>>,
 }
 
 impl GenerationBuffer {
@@ -735,7 +783,23 @@ impl GenerationBuffer {
             attempts: 0,
             rejected: 0,
             quarantined: false,
+            sources: OnceLock::new(),
         }
+    }
+
+    /// The recovered K source rows, computed once at full rank and cached.
+    /// Uses the systematic fast path (unit vectors → index, no GF work) when
+    /// the held packets are systematic, else Gauss-Jordan. `None` until rank K.
+    fn recovered_sources(&self) -> Option<&[Vec<u8>]> {
+        let k = self.descriptor.k as usize;
+        if self.basis.rank() < k {
+            return None;
+        }
+        Some(self.sources.get_or_init(|| {
+            systematic_sources(&self.packets, k, self.symbol_size)
+                .or_else(|| solve_sources(&self.packets, k, self.symbol_size))
+                .expect("rank == K decodes")
+        }))
     }
 
     /// Set forwarder-local pollution limits (doctrine §6): `budget` caps total
@@ -799,8 +863,11 @@ impl GenerationBuffer {
             return Err(DecodeError::Mismatch);
         }
         // In-flight pollution filter (doctrine §6): drop a packet that fails
-        // the homomorphic fingerprint before it can pollute the basis.
+        // the homomorphic fingerprint before it can pollute the basis. Skipped
+        // for a delayed-seed fingerprint (the seed is secret in flight — it is
+        // checked retroactively via `verify_with_revealed_seed`).
         if let Some(fp) = &self.fingerprint
+            && !fp.is_delayed_unrevealed()
             && !fp.check(&meta.vector, &payload)
         {
             self.note_rejection();
@@ -839,10 +906,10 @@ impl GenerationBuffer {
     /// returns `None` otherwise or on a width mismatch. The result is a pure
     /// function of `(generation, target)`, hence cacheable by name.
     pub fn recode_exact(&self, target: &CodingVector) -> Option<CodedPacket> {
-        if target.len() != self.descriptor.k as usize || self.basis.rank() < self.descriptor.k as usize {
+        if target.len() != self.descriptor.k as usize {
             return None;
         }
-        let sources = solve_sources(&self.packets, self.descriptor.k as usize, self.symbol_size)?;
+        let sources = self.recovered_sources()?;
         let mut payload = vec![0u8; self.symbol_size];
         for (s, row) in sources.iter().enumerate() {
             field::mul_add(&mut payload, row, target.0[s]);
@@ -853,26 +920,73 @@ impl GenerationBuffer {
         })
     }
 
+    /// Retroactively verify all held packets against a now-revealed delayed
+    /// fingerprint seed (doctrine §6, adaptive-resistant). Checks
+    /// `SHA-256(r)` against the committed `seed_hash`, then every held packet's
+    /// homomorphic fingerprint. `Err(FingerprintFailed)` on a seed mismatch or
+    /// any polluted packet (an attacker who committed before the reveal cannot
+    /// have passed); `Ok(())` if all pass or there is no delayed fingerprint.
+    pub fn verify_with_revealed_seed(&self, r: &[u8]) -> std::result::Result<(), DecodeError> {
+        let Some(fp) = &self.fingerprint else {
+            return Ok(());
+        };
+        if fp.seed_hash.is_none() {
+            return Ok(()); // immediate fingerprint: already filtered in-flight
+        }
+        let revealed = fp.reveal(r).ok_or(DecodeError::FingerprintFailed)?;
+        for p in &self.packets {
+            if !revealed.check(&p.vector, &p.payload) {
+                return Err(DecodeError::FingerprintFailed);
+            }
+        }
+        Ok(())
+    }
+
     /// Decode the K source rows and verify them against the descriptor's
     /// `SourceCommitment` (verify-on-decode). On success returns the
     /// recovered payload (sources concatenated). On a commitment mismatch
     /// returns `CommitmentFailed` and the content is discarded as pollution.
     pub fn decode(&self) -> std::result::Result<Bytes, DecodeError> {
         let k = self.descriptor.k as usize;
-        if self.basis.rank() < k {
-            return Err(DecodeError::Incomplete);
-        }
-        let sources = solve_sources(&self.packets, k, self.symbol_size)
-            .ok_or(DecodeError::Incomplete)?;
-        if !verify_sources(&sources, &self.descriptor.source_commitment) {
+        let sources = self.recovered_sources().ok_or(DecodeError::Incomplete)?;
+        if !verify_sources(sources, &self.descriptor.source_commitment) {
             return Err(DecodeError::CommitmentFailed);
         }
         let mut out = bytes::BytesMut::with_capacity(k * self.symbol_size);
-        for row in &sources {
+        for row in sources {
             out.extend_from_slice(row);
         }
         Ok(out.freeze())
     }
+}
+
+/// Fast-path recovery when the held packets are **systematic** — each a unit
+/// coding vector covering `0..k`. Recovers sources by index with **no GF
+/// work** (vs the O(k²·symbol) Gauss-Jordan). `None` if not systematic, so the
+/// caller falls back to [`solve_sources`].
+fn systematic_sources(packets: &[CodedPacket], k: usize, symbol_size: usize) -> Option<Vec<Vec<u8>>> {
+    if packets.len() != k {
+        return None;
+    }
+    let mut slots: Vec<Option<&Bytes>> = vec![None; k];
+    for p in packets {
+        // The vector must be a unit vector: exactly one coefficient, equal to 1.
+        let mut idx = None;
+        for (i, &c) in p.vector.0.iter().enumerate() {
+            if c != 0 {
+                if idx.is_some() || c != 1 {
+                    return None;
+                }
+                idx = Some(i);
+            }
+        }
+        let i = idx?;
+        if i >= k || slots[i].is_some() || p.payload.len() != symbol_size {
+            return None;
+        }
+        slots[i] = Some(&p.payload);
+    }
+    slots.into_iter().map(|s| s.map(|b| b.to_vec())).collect()
 }
 
 /// Recover the K source rows by Gauss-Jordan elimination over GF(2^8) on the
@@ -1037,18 +1151,27 @@ fn decode_commitment(v: &[u8]) -> Result<SourceCommitment> {
 
 fn decode_fingerprint(v: Bytes) -> Result<LinearFingerprint> {
     let mut r = TlvReader::new(v);
-    let (mut rr, mut hh) = (None, None);
+    let (mut rr, mut hh, mut seed) = (None, None, None);
     while !r.is_empty() {
         let (t, val) = r.read_tlv().map_err(|_| CodingError::MalformedMetadata)?;
         match t {
             TYPE_FP_R => rr = Some(val.to_vec()),
             TYPE_FP_H => hh = Some(val.to_vec()),
+            TYPE_FP_SEED_HASH => {
+                if val.len() != 32 {
+                    return Err(CodingError::MalformedMetadata);
+                }
+                let mut a = [0u8; 32];
+                a.copy_from_slice(&val);
+                seed = Some(a);
+            }
             _ => {}
         }
     }
     Ok(LinearFingerprint {
         r: rr.ok_or(CodingError::MalformedMetadata)?,
         h: hh.ok_or(CodingError::MalformedMetadata)?,
+        seed_hash: seed,
     })
 }
 
@@ -1407,6 +1530,54 @@ mod tests {
         let m = CodedMetadata { generation_id: 0x0102_0304, k: 3, field: Field::Gf8, vector: CodingVector::unit(3, 0) };
         assert!(bbuf.absorb(&m, Bytes::from_static(&[1, 2])).is_ok());
         assert_eq!(bbuf.absorb(&m, Bytes::from_static(&[1, 2])), Err(DecodeError::BudgetExceeded));
+    }
+
+    #[test]
+    fn delayed_fingerprint_detects_pollution_after_reveal() {
+        let sources: Vec<Vec<u8>> = vec![vec![1, 2], vec![3, 4], vec![5, 6]];
+        let r = vec![9u8, 13];
+        let fp = LinearFingerprint::delayed(&r, &sources);
+        assert!(fp.is_delayed_unrevealed());
+        assert!(fp.r.is_empty(), "seed withheld until reveal");
+        assert!(fp.reveal(&r).is_some());
+        assert!(fp.reveal(&[0, 0]).is_none(), "wrong seed rejected by commitment");
+
+        let mut desc = sample_descriptor(
+            3,
+            2,
+            SourceCommitment::RowHashes(sources.iter().map(|r| row_hash(r)).collect()),
+        );
+        desc.fingerprint = Some(fp);
+        assert_eq!(GenerationDescriptor::from_tlv(&desc.to_tlv()).unwrap(), desc);
+
+        let meta = |i: u16| CodedMetadata {
+            generation_id: 0x0102_0304,
+            k: 3,
+            field: Field::Gf8,
+            vector: CodingVector::unit(3, i),
+        };
+
+        // Clean buffer: sources absorb (no in-flight filter — seed secret),
+        // and verify retroactively once the seed is revealed.
+        let mut good = GenerationBuffer::new(desc.clone());
+        for (i, row) in sources.iter().enumerate() {
+            assert!(good.absorb(&meta(i as u16), Bytes::from(row.clone())).unwrap());
+        }
+        assert!(good.verify_with_revealed_seed(&r).is_ok());
+        assert_eq!(
+            good.verify_with_revealed_seed(&[0, 0]),
+            Err(DecodeError::FingerprintFailed),
+            "a wrong revealed seed fails the commitment"
+        );
+
+        // Polluted packet is admitted in flight (delayed → no filter) but
+        // caught on reveal — which an attacker who committed first can't pass.
+        let mut bad = GenerationBuffer::new(desc);
+        assert!(bad.absorb(&meta(0), Bytes::from_static(&[42, 42])).unwrap());
+        assert_eq!(
+            bad.verify_with_revealed_seed(&r),
+            Err(DecodeError::FingerprintFailed)
+        );
     }
 
     #[test]

@@ -41,6 +41,10 @@ f3-link = []
 # supplied by the forwarding plane (the layering constraint); the
 # reception-report control protocol and engine-egress integration are seams.
 f3-link-face = ["f3-link", "dep:ndn-transport", "dep:tokio"]
+# F3 mesh auto-installation — CopeMesh installs one CopeMemberFace per
+# neighbor (from a routing/neighbor table) + a single ingress face on a live
+# engine, with a reception-report/flush ticker. Native.
+f3-link-mesh = ["f3-link-face", "dep:ndn-engine", "dep:tokio-util"]
 # F2 native engine integration — the synthetic `RecoderFace` (mirrors
 # ndn-compute's ComputeFace) plus delegated-recoder signing/verify.
 # Native only (pulls the forwarder + signer); not built for wasm.

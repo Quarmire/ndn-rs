@@ -177,11 +177,21 @@ impl<T: Transport> CopeBroadcastLink<T> {
 pub struct CopeMemberFace<T: Transport> {
     neighbor: NeighborId,
     link: Arc<CopeBroadcastLink<T>>,
+    /// When `false`, `recv_bytes` parks forever (egress-only) — used in a mesh
+    /// where a single ingress face drains the shared link, avoiding contention.
+    recv_via_link: bool,
 }
 
 impl<T: Transport> CopeMemberFace<T> {
+    /// A standalone member face: `recv_bytes` decodes from the shared link.
     pub fn new(neighbor: NeighborId, link: Arc<CopeBroadcastLink<T>>) -> Self {
-        Self { neighbor, link }
+        Self { neighbor, link, recv_via_link: true }
+    }
+
+    /// An egress-only member face: `send_bytes` codes; `recv_bytes` parks (the
+    /// mesh's single ingress face owns the receive path).
+    pub fn send_only(neighbor: NeighborId, link: Arc<CopeBroadcastLink<T>>) -> Self {
+        Self { neighbor, link, recv_via_link: false }
     }
 }
 
@@ -195,6 +205,38 @@ impl<T: Transport> Transport for CopeMemberFace<T> {
     async fn send_bytes(&self, pkt: Bytes) -> Result<(), FaceError> {
         self.link.enqueue(self.neighbor, pkt).await;
         Ok(())
+    }
+    async fn recv_bytes(&self) -> Result<Bytes, FaceError> {
+        if self.recv_via_link {
+            self.link.recv_native().await.map(|(_id, payload)| payload)
+        } else {
+            std::future::pending().await // egress-only; ingress face receives
+        }
+    }
+}
+
+/// The mesh's single receive face: drains decoded natives from the shared
+/// link into the engine. `send_bytes` is a no-op (it is not a FIB next-hop).
+pub struct CopeIngressFace<T: Transport> {
+    id: ndn_transport::FaceId,
+    link: Arc<CopeBroadcastLink<T>>,
+}
+
+impl<T: Transport> CopeIngressFace<T> {
+    pub fn new(id: ndn_transport::FaceId, link: Arc<CopeBroadcastLink<T>>) -> Self {
+        Self { id, link }
+    }
+}
+
+impl<T: Transport> Transport for CopeIngressFace<T> {
+    fn id(&self) -> ndn_transport::FaceId {
+        self.id
+    }
+    fn kind(&self) -> ndn_transport::FaceKind {
+        ndn_transport::FaceKind::EtherMulticast
+    }
+    async fn send_bytes(&self, _pkt: Bytes) -> Result<(), FaceError> {
+        Ok(()) // ingress-only
     }
     async fn recv_bytes(&self) -> Result<Bytes, FaceError> {
         self.link.recv_native().await.map(|(_id, payload)| payload)
