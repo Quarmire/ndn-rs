@@ -128,6 +128,28 @@ impl EcdsaP256Signer {
             .map_err(|e| TrustError::KeyStore(format!("from_pkcs8_der: {e}")))?;
         Ok(Self::new(sk, key_name, None))
     }
+
+    /// Export the private key as PKCS#8 `PrivateKeyInfo` DER — the unencrypted
+    /// shape [`SafeBag::encrypt`](../../ndn_safebag/struct.SafeBag.html) wraps.
+    /// Round-trips with [`Self::from_pkcs8_der`].
+    pub fn to_pkcs8_der(&self) -> Result<Vec<u8>, TrustError> {
+        use p256_ecdsa::pkcs8::EncodePrivateKey;
+        // `ecdsa::SigningKey` doesn't impl `EncodePrivateKey`; go via the
+        // `p256::SecretKey` (same scalar) which does.
+        let sk = p256_ecdsa::SecretKey::from_bytes(&self.signing_key.to_bytes())
+            .map_err(|_| TrustError::InvalidKey)?;
+        let der = sk
+            .to_pkcs8_der()
+            .map_err(|e| TrustError::KeyStore(format!("to_pkcs8_der: {e}")))?;
+        Ok(der.as_bytes().to_vec())
+    }
+
+    /// Attach the issued certificate name (set after NDNCERT enrollment so the
+    /// signer stamps `KeyLocator=<cert_name>`).
+    pub fn with_cert_name(mut self, cert_name: Name) -> Self {
+        self.cert_name = Some(cert_name);
+        self
+    }
 }
 
 impl Signer for EcdsaP256Signer {
@@ -449,6 +471,20 @@ mod tests {
         assert_ne!(
             plain.sign_sync(b"region").unwrap(),
             keyed.sign_sync(b"region").unwrap()
+        );
+    }
+
+    #[test]
+    fn ecdsa_pkcs8_round_trips_and_preserves_key() {
+        let original = EcdsaP256Signer::from_seed(&[7u8; 32], test_key_name()).unwrap();
+        let der = original.to_pkcs8_der().unwrap();
+        // Re-import the exported PKCS#8 and confirm it is the same key:
+        // identical SPKI public key and identical signatures.
+        let reimported = EcdsaP256Signer::from_pkcs8_der(&der, test_key_name()).unwrap();
+        assert_eq!(original.public_key(), reimported.public_key());
+        assert_eq!(
+            original.sign_sync(b"enroll witness").unwrap(),
+            reimported.sign_sync(b"enroll witness").unwrap()
         );
     }
 }
