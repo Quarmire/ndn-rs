@@ -18,6 +18,9 @@ use ndn_transport::{
     BIT_CONGESTION_MARKING, BIT_LOCAL_FIELDS, BIT_LP_RELIABILITY, FaceId, FaceKind, FaceOption,
     FaceOptionError, FacePersistency, FaceScope, MtuError, PersistencyError,
 };
+// Only the native face-creation paths (UDP/TCP/… dialing) spawn faces with a
+// cancel token; wasm32 has no such transports here.
+#[cfg(not(target_arch = "wasm32"))]
 use tokio_util::sync::CancellationToken;
 
 use super::common::is_management_face;
