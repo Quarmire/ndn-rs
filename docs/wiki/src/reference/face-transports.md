@@ -11,11 +11,12 @@ for writing a new transport see [Implementing a face](../guides/implementing-a-f
 |---|---|---|---|
 | UDP | `crates/ndn-face-native/src/net/udp.rs` | `udp` | NDN-over-UDP across hosts. |
 | TCP | `crates/ndn-face-native/src/net/tcp.rs` | `tcp` | NDN-over-TCP across hosts (firewall-friendlier). |
-| Multicast UDP | `crates/ndn-face-native/src/net/multicast.rs` | `multicast` | Link-local neighbour discovery (group `224.0.23.170`). |
+| Multicast UDP | `crates/ndn-face-native/src/net/multicast.rs` | `multicast` | Link-local neighbour discovery (group `224.0.23.170`); auto-created per interface via `[face_system.udp] auto_multicast`. |
 | Unix socket | `crates/ndn-face-native/src/local/unix.rs` | `unix` | App-to-forwarder IPC. |
 | In-process | `crates/ndn-face-native/src/local/in_proc.rs` | (programmatic) | Embedded engine, tests. |
 | Shared memory | `crates/ndn-face-native/src/local/shm.rs` | `shm` | High-throughput per-host IPC (feature `spsc-shm`). |
-| Raw Ethernet | `crates/ndn-face-native/src/l2/ether.rs` | `ether` | EtherType `0x8624`. Requires `CAP_NET_RAW`/root. |
+| Ethernet unicast | `crates/ndn-face-native/src/l2/ether.rs` | `ether` (TOML) or `faces/create ether://[<mac>]/<iface>` | Point-to-point link to a known peer MAC. EtherType `0x8624`; requires `CAP_NET_RAW`/root. |
+| Ethernet multicast | `crates/ndn-face-native/src/l2/multicast_ether.rs` | `ether-multicast` | Group `01:00:5e:00:17:aa`; auto-created per interface via `[face_system.ether] auto_multicast` (Linux). |
 | WiFi Direct/AP | `crates/ndn-face-native/src/l2/wfb.rs` | `wfb` | WiFi direct broadcast. |
 | Bluetooth LE — central | `crates/ndn-face-native/src/l2/bluetooth/central/` | `ble://<name-or-addr>` (via `faces/create`) | Dial a peripheral as GATT client (Linux/macOS/Windows). |
 | Bluetooth LE — peripheral | `crates/ndn-face-native/src/l2/bluetooth/mod.rs` | `[listeners.ble]` | GATT server; advertises the NDN service (Linux/macOS). |
@@ -67,6 +68,31 @@ QUIC does not reach browsers — that is WebTransport's role.
 
 A shared-memory face (`kind = "shm"`, `path`, `capacity_mb`) gives per-host IPC.
 The full per-kind option set is in `examples/ndn-fwd.example.toml`.
+
+Ethernet faces (EtherType `0x8624`, `CAP_NET_RAW`/root) come in three forms — a
+unicast link to a known peer MAC, a multicast group face, and per-interface
+auto-creation:
+
+```toml
+[[face]]                       # unicast point-to-point
+kind = "ether"
+interface = "eth0"
+peer-mac = "aa:bb:cc:dd:ee:ff"
+
+[[face]]                       # multicast group face (Linux)
+kind = "ether-multicast"
+interface = "eth0"
+
+[face_system.ether]            # auto-create a multicast face per matching NIC
+auto_multicast = true          # + add/remove on hotplug with watch_interfaces
+```
+
+A unicast Ethernet face can also be created at runtime:
+`nfdc face create ether://[aa:bb:cc:dd:ee:ff]/eth0`. The peer MAC is explicit —
+neighbour discovery is a separate path. As with every wire face, NDNLPv2
+framing and fragmentation are owned by the paired `LpLinkService`: the face is
+payload-only and reports a 1500-byte send-MTU, so the link service fragments
+once at the Ethernet boundary (it does **not** re-frame at the transport).
 
 ## Bluetooth LE
 
