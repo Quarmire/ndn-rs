@@ -23,7 +23,12 @@
 //! ```
 
 use ndn_engine::ForwarderEngine;
+// Same `InProcFace` type on both targets; the wasm path imports it straight
+// from `ndn-face-local` to avoid `ndn-face-native`'s OS-socket transports.
+#[cfg(not(target_arch = "wasm32"))]
 use ndn_face_native::local::InProcFace;
+#[cfg(target_arch = "wasm32")]
+use ndn_face_local::InProcFace;
 use ndn_packet::Name;
 use tokio_util::sync::CancellationToken;
 

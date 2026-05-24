@@ -6,7 +6,14 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 
+// `InProcHandle` is the same type on both targets — `ndn-face-native` simply
+// re-exports it from `ndn-face-local`. The wasm path imports it directly so it
+// doesn't pull `ndn-face-native`'s OS-socket transports.
+#[cfg(not(target_arch = "wasm32"))]
 use ndn_face_native::local::InProcHandle;
+#[cfg(target_arch = "wasm32")]
+use ndn_face_local::InProcHandle;
+#[cfg(not(target_arch = "wasm32"))]
 use ndn_ipc::ForwarderClient;
 use ndn_packet::Name;
 use ndn_packet::lp::{LpPacket, is_lp_packet};
@@ -67,10 +74,14 @@ pub trait Connection: Send + Sync {
     async fn register_prefix(&self, prefix: &Name) -> Result<(), AppError>;
 }
 
+/// Talks to an external `ndn-fwd` over a Unix socket via [`ForwarderClient`].
+/// Native-only — the browser reaches its engine through [`InProcConnection`].
+#[cfg(not(target_arch = "wasm32"))]
 pub struct IpcConnection {
     client: ForwarderClient,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl IpcConnection {
     pub fn new(client: ForwarderClient) -> Self {
         Self { client }
@@ -81,6 +92,7 @@ impl IpcConnection {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[async_trait]
 impl Connection for IpcConnection {
     async fn send(&self, wire: Bytes) -> Result<(), AppError> {

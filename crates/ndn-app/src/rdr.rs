@@ -169,8 +169,10 @@ pub struct PreparedObject {
 impl PreparedObject {
     /// Version is the current Unix millis.
     pub fn build(object_name: Name, content: Bytes, chunk_size: usize) -> Self {
-        let version = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        // web_time::SystemTime delegates to std natively; on wasm32 it reads
+        // Date.now() instead of panicking like std::time::SystemTime::now().
+        let version = web_time::SystemTime::now()
+            .duration_since(web_time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(1);
         let versioned_name = object_name.clone().append_version(version);

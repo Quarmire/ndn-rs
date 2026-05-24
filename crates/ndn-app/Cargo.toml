@@ -12,21 +12,49 @@ classification = "spec"
 default = []
 blocking = ["tokio/rt"]
 
+# Wasm-safe core (both targets). The Consumer/Producer/EngineAppExt client
+# surface builds for wasm32 so an in-browser embedded engine (WasmEngineBuilder)
+# gets the same app API as native — see ndn-web-attach's in-page tier.
 [dependencies]
-ndn-packet     = { workspace = true, features = ["std"] }
 ndn-tlv        = { workspace = true, features = ["std"] }
 ndn-engine     = { workspace = true }
-ndn-security   = { workspace = true }
 ndn-transport  = { workspace = true }
-ndn-face-native     = { workspace = true }
-ndn-ipc        = { workspace = true }
+# ndn-sync (SVS/PSync) builds for wasm32 too, so the Subscriber pub/sub API is
+# available in the browser.
 ndn-sync       = { workspace = true }
 bytes         = { workspace = true, features = ["std"] }
-tokio          = { workspace = true, features = ["sync", "rt", "time"] }
 tokio-util     = { workspace = true }
 tracing        = { workspace = true }
 thiserror      = { workspace = true }
 async-trait    = { workspace = true }
+# Instant/SystemTime that work on both native (delegates to std) and wasm32
+# (JS clocks) — std::time::{Instant,SystemTime}::now() panic on wasm32.
+web-time       = { workspace = true }
+
+# Native-only: external-forwarder IPC (Unix socket), SVS sync, the SQLite PIB
+# (pulls libsqlite3-sys — never wasm-buildable), and the full tokio timer.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ndn-packet     = { workspace = true, features = ["std"] }
+ndn-security   = { workspace = true }
+ndn-face-native = { workspace = true }
+ndn-ipc        = { workspace = true }
+tokio          = { workspace = true, features = ["sync", "rt", "time"] }
+
+# Browser: in-process face from ndn-face-local (no OS sockets), security
+# without the SQLite PIB, and gloo-timers/futures for the sleep + timeout the
+# fetch path needs (tokio `time` panics on wasm32).
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+ndn-packet     = { workspace = true, features = ["std-wasm"] }
+# Direct path (not `workspace = true`) so `default-features = false` is allowed
+# — Cargo forbids overriding a workspace dep's default-features. Drops the
+# SQLite PIB (libsqlite3-sys), which can't build for wasm32. Mirrors ndn-engine.
+ndn-security   = { path = "../ndn-security", default-features = false }
+ndn-face-local = { workspace = true }
+tokio          = { workspace = true, features = ["sync"] }
+futures        = { workspace = true }
+gloo-timers    = { version = "0.3", features = ["futures"] }
+# spawn_local for the Subscriber driver tasks (no ambient tokio runtime on wasm).
+wasm-bindgen-futures = "0.4"
 
 [dev-dependencies]
 anyhow        = { workspace = true }

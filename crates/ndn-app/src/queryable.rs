@@ -2,17 +2,24 @@
 //! stream of [`Query`] objects (Zenoh-shaped). [`Producer`](crate::Producer)
 //! is the closure-style equivalent.
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 use std::sync::Arc;
 
 use bytes::Bytes;
 
+#[cfg(not(target_arch = "wasm32"))]
 use ndn_face_native::local::InProcHandle;
+#[cfg(target_arch = "wasm32")]
+use ndn_face_local::InProcHandle;
+#[cfg(not(target_arch = "wasm32"))]
 use ndn_ipc::ForwarderClient;
 use ndn_packet::{Interest, Name};
 
 use crate::AppError;
-use crate::connection::{Connection, InProcConnection, IpcConnection};
+use crate::connection::{Connection, InProcConnection};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::connection::IpcConnection;
 
 pub struct Query {
     pub interest: Interest,
@@ -31,6 +38,7 @@ pub struct Queryable {
 }
 
 impl Queryable {
+    #[cfg(not(target_arch = "wasm32"))]
     pub async fn connect(
         socket: impl AsRef<Path>,
         prefix: impl Into<Name>,

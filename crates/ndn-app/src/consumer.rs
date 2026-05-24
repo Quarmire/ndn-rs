@@ -1,10 +1,15 @@
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
 
+#[cfg(not(target_arch = "wasm32"))]
 use ndn_face_native::local::InProcHandle;
+#[cfg(target_arch = "wasm32")]
+use ndn_face_local::InProcHandle;
+#[cfg(not(target_arch = "wasm32"))]
 use ndn_ipc::ForwarderClient;
 use ndn_packet::encode::InterestBuilder;
 use ndn_packet::lp::{LpPacket, is_lp_packet};
@@ -12,7 +17,9 @@ use ndn_packet::{Data, MAX_PERSISTENT_LIFETIME_SECS, Name, SubscriptionRequest};
 use ndn_security::{SafeData, ValidationResult, Validator};
 
 use crate::AppError;
-use crate::connection::{Connection, InProcConnection, IpcConnection, LpInfo};
+use crate::connection::{Connection, InProcConnection, LpInfo};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::connection::IpcConnection;
 
 pub const DEFAULT_INTEREST_LIFETIME: Duration = Duration::from_millis(4000);
 
@@ -31,6 +38,7 @@ impl Consumer {
         Self { conn }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub async fn connect(socket: impl AsRef<Path>) -> Result<Self, AppError> {
         let client = ForwarderClient::connect(socket)
             .await
@@ -93,7 +101,7 @@ impl Consumer {
     pub async fn fetch_wire(&mut self, wire: Bytes, timeout: Duration) -> Result<Data, AppError> {
         self.conn.send(wire).await?;
 
-        let reply = tokio::time::timeout(timeout, self.conn.recv())
+        let reply = crate::rt::timeout(timeout, self.conn.recv())
             .await
             .map_err(|_| AppError::Timeout)?
             .ok_or(AppError::Closed)?;
@@ -125,7 +133,7 @@ impl Consumer {
             .lifetime(DEFAULT_INTEREST_LIFETIME)
             .build();
         self.conn.send(wire).await?;
-        let (reply, lp) = tokio::time::timeout(DEFAULT_TIMEOUT, self.conn.recv_with_meta())
+        let (reply, lp) = crate::rt::timeout(DEFAULT_TIMEOUT, self.conn.recv_with_meta())
             .await
             .map_err(|_| AppError::Timeout)?
             .ok_or(AppError::Closed)?;
@@ -233,7 +241,7 @@ impl Consumer {
                 Err(e) => {
                     last_err = e;
                     if attempt + 1 < attempts {
-                        tokio::time::sleep(delay).await;
+                        crate::rt::sleep(delay).await;
                         delay *= 2;
                     }
                 }

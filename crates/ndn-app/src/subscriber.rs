@@ -2,6 +2,7 @@
 //! group, receives new-data notifications from peers, and optionally
 //! auto-fetches.
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -9,12 +10,16 @@ use std::time::Duration;
 use bytes::Bytes;
 use tokio::sync::mpsc;
 
+#[cfg(not(target_arch = "wasm32"))]
 use ndn_ipc::ForwarderClient;
 use ndn_packet::encode::encode_interest;
 use ndn_packet::{Data, Name};
 
 use crate::AppError;
-use crate::connection::{Connection, InProcConnection, IpcConnection};
+use crate::connection::{Connection, InProcConnection};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::connection::IpcConnection;
+use crate::rt;
 
 #[derive(Clone, Debug)]
 pub struct Sample {
@@ -52,7 +57,9 @@ pub struct Subscriber {
 
 impl Subscriber {
     /// SVS-based subscription. Registers the group prefix and starts
-    /// receiving peer updates.
+    /// receiving peer updates. Native-only (Unix-socket IPC); in the browser
+    /// use [`from_handle`](Self::from_handle) against an embedded engine.
+    #[cfg(not(target_arch = "wasm32"))]
     pub async fn connect(
         socket: impl AsRef<Path>,
         group_prefix: impl Into<Name>,
@@ -60,6 +67,7 @@ impl Subscriber {
         Self::connect_with_config(socket, group_prefix, SubscriberConfig::default()).await
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub async fn connect_with_config(
         socket: impl AsRef<Path>,
         group_prefix: impl Into<Name>,
@@ -85,7 +93,8 @@ impl Subscriber {
     }
 
     /// PSync variant of [`Self::connect`]; pick this when peers in the
-    /// group speak PSync.
+    /// group speak PSync. Native-only (Unix-socket IPC).
+    #[cfg(not(target_arch = "wasm32"))]
     pub async fn connect_psync(
         socket: impl AsRef<Path>,
         group_prefix: impl Into<Name>,
@@ -94,6 +103,7 @@ impl Subscriber {
             .await
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub async fn connect_psync_with_config(
         socket: impl AsRef<Path>,
         group_prefix: impl Into<Name>,
@@ -126,7 +136,8 @@ impl Subscriber {
         Self::run(conn, group, local_name, config)
     }
 
-    /// Convenience wrapper for [`InProcHandle`].
+    /// Convenience wrapper for an in-process engine handle.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn from_handle(
         handle: ndn_face_native::local::InProcHandle,
         group: Name,
@@ -141,6 +152,27 @@ impl Subscriber {
         )
     }
 
+    /// Convenience wrapper for an in-process engine handle (browser).
+    #[cfg(target_arch = "wasm32")]
+    pub fn from_handle(
+        handle: ndn_face_local::InProcHandle,
+        group: Name,
+        local_name: Name,
+        config: SubscriberConfig,
+    ) -> Result<Self, AppError> {
+        Self::run(
+            Arc::new(InProcConnection::new(handle)),
+            group,
+            local_name,
+            config,
+        )
+    }
+
+    // Only reached via the native-only `connect_psync*` IPC ctors today. The
+    // driver itself is wasm-safe (rt::spawn); exposing browser PSync just needs
+    // a `from_handle_psync` entry point — deferred. SVS is browser-reachable via
+    // `from_handle`.
+    #[cfg(not(target_arch = "wasm32"))]
     fn run_psync(
         conn: Arc<dyn Connection>,
         group: Name,
@@ -160,7 +192,7 @@ impl Subscriber {
 
         let conn_send = Arc::clone(&conn);
         let cancel_send = cancel.clone();
-        tokio::spawn(async move {
+        rt::spawn(async move {
             loop {
                 tokio::select! {
                     _ = cancel_send.cancelled() => break,
@@ -171,7 +203,7 @@ impl Subscriber {
 
         let conn_recv = Arc::clone(&conn);
         let cancel_recv = cancel.clone();
-        tokio::spawn(async move {
+        rt::spawn(async move {
             loop {
                 tokio::select! {
                     _ = cancel_recv.cancelled() => break,
@@ -185,7 +217,7 @@ impl Subscriber {
 
         let conn_fetch = Arc::clone(&conn);
         let task_cancel = cancel.clone();
-        tokio::spawn(async move {
+        rt::spawn(async move {
             loop {
                 tokio::select! {
                     _ = task_cancel.cancelled() => break,
@@ -240,7 +272,7 @@ impl Subscriber {
 
         let conn_send = Arc::clone(&conn);
         let cancel_send = cancel.clone();
-        tokio::spawn(async move {
+        rt::spawn(async move {
             loop {
                 tokio::select! {
                     _ = cancel_send.cancelled() => break,
@@ -255,7 +287,7 @@ impl Subscriber {
         // only Interests (0x05) flow to the SVS task here.
         let conn_recv = Arc::clone(&conn);
         let cancel_recv = cancel.clone();
-        tokio::spawn(async move {
+        rt::spawn(async move {
             loop {
                 tokio::select! {
                     _ = cancel_recv.cancelled() => break,
@@ -273,7 +305,7 @@ impl Subscriber {
 
         let conn_fetch = Arc::clone(&conn);
         let task_cancel = cancel.clone();
-        tokio::spawn(async move {
+        rt::spawn(async move {
             loop {
                 tokio::select! {
                     _ = task_cancel.cancelled() => break,
@@ -315,7 +347,7 @@ impl Subscriber {
 async fn fetch_data(conn: &Arc<dyn Connection>, name: &Name, timeout: Duration) -> Option<Bytes> {
     let wire = encode_interest(name, None);
     conn.send(wire).await.ok()?;
-    let reply = tokio::time::timeout(timeout, conn.recv()).await.ok()??;
+    let reply = rt::timeout(timeout, conn.recv()).await.ok()??;
     let data = Data::decode(reply).ok()?;
     data.content().cloned()
 }

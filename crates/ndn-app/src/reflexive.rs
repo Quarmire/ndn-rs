@@ -28,7 +28,9 @@
 //! satisfy this; heterogeneous paths do not.
 
 use std::future::Future;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use crate::rt::Instant;
 
 use bytes::Bytes;
 
@@ -73,7 +75,7 @@ impl Consumer {
             let remaining = deadline
                 .checked_duration_since(Instant::now())
                 .ok_or(AppError::Timeout)?;
-            let pkt = tokio::time::timeout(remaining, self.recv_raw())
+            let pkt = crate::rt::timeout(remaining, self.recv_raw())
                 .await
                 .map_err(|_| AppError::Timeout)?
                 .ok_or(AppError::Closed)?;

@@ -8,7 +8,9 @@ pub enum AppError {
     /// The forwarder returned a Nack.
     #[error("interest was nacked: {reason:?}")]
     Nacked { reason: ndn_packet::NackReason },
-    /// An external [`ndn_ipc::ForwarderClient`] operation failed.
+    /// An external [`ndn_ipc::ForwarderClient`] operation failed. Only the
+    /// Unix-socket `connect()` paths produce this, so it's native-only.
+    #[cfg(not(target_arch = "wasm32"))]
     #[error("forwarder connection error: {0}")]
     Connection(#[from] ndn_ipc::ForwarderError),
     /// The in-process channel or external connection was closed.

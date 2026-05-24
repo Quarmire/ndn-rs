@@ -1,18 +1,30 @@
 use std::future::Future;
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 use std::sync::Arc;
 
 use bytes::Bytes;
 
+#[cfg(not(target_arch = "wasm32"))]
 use ndn_face_native::local::InProcHandle;
-use ndn_ipc::{ChunkedProducer, ForwarderClient, NDN_DEFAULT_SEGMENT_SIZE};
+#[cfg(target_arch = "wasm32")]
+use ndn_face_local::InProcHandle;
+#[cfg(not(target_arch = "wasm32"))]
+use ndn_ipc::{ChunkedProducer, ForwarderClient};
 use ndn_packet::encode::DataBuilder;
 use ndn_packet::{Interest, Name};
 use std::time::Duration;
 
 use crate::AppError;
-use crate::connection::{Connection, InProcConnection, IpcConnection};
+use crate::connection::{Connection, InProcConnection};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::connection::IpcConnection;
 use crate::responder::Responder;
+
+/// Default RDR segment size when the caller passes `chunk_size == 0`. Mirrors
+/// `ndn_ipc::NDN_DEFAULT_SEGMENT_SIZE`; redefined here so the wasm build (which
+/// can't link ndn-ipc) shares the same value.
+const DEFAULT_SEGMENT_SIZE: usize = 8192;
 
 pub struct Producer {
     conn: Arc<dyn Connection>,
@@ -26,6 +38,7 @@ impl Producer {
         Self { conn, prefix }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub async fn connect(
         socket: impl AsRef<Path>,
         prefix: impl Into<Name>,
@@ -102,7 +115,7 @@ impl Producer {
         chunk_size: usize,
     ) -> Result<(), AppError> {
         let seg_size = if chunk_size == 0 {
-            NDN_DEFAULT_SEGMENT_SIZE
+            DEFAULT_SEGMENT_SIZE
         } else {
             chunk_size
         };
@@ -160,6 +173,11 @@ impl Producer {
 
     /// One-shot segmented publish without the RDR metadata round trip;
     /// pair with [`Consumer::fetch_segmented`](crate::Consumer::fetch_segmented).
+    ///
+    /// Native-only: the legacy segmentation helper (`ndn_ipc::ChunkedProducer`)
+    /// lives in the native-only `ndn-ipc` crate. In the browser, use
+    /// [`publish_object`](Self::publish_object) (the RDR path).
+    #[cfg(not(target_arch = "wasm32"))]
     pub async fn publish_large(
         &self,
         prefix: &Name,
@@ -167,7 +185,7 @@ impl Producer {
         chunk_size: usize,
     ) -> Result<(), AppError> {
         let seg_size = if chunk_size == 0 {
-            NDN_DEFAULT_SEGMENT_SIZE
+            DEFAULT_SEGMENT_SIZE
         } else {
             chunk_size
         };
