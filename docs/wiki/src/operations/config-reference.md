@@ -35,6 +35,7 @@ Absent file → defaults from `ndn-config`.
 | `capacity_mb` | 64 | Capacity in MiB. |
 | `shards` | (auto) | Number of LRU shards (sharded-lru only). |
 | `admission_policy` | `default` | `default` (PIT-bound) or `admit-all`. |
+| `unsolicited_policy` | `drop-all` | Caching of Data with no pending PIT entry: `drop-all`, `admit-local`, `admit-network`, `admit-all`. Use `admit-network` on a broadcast/ad-hoc bearer. |
 
 ## `[mgmt]` — management plane
 

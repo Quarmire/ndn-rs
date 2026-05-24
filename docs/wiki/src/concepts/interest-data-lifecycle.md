@@ -75,6 +75,16 @@ The PIT is what makes NDN naturally multicast: ten consumers
 asking for the same name leave one PIT entry; the producer's Data
 satisfies all ten in-records in a single fan-out.
 
+One `Data` can satisfy *several* PIT entries at once — an exact-name
+entry plus any `CanBePrefix` entry at a shorter prefix. All matching
+entries are satisfied and the union of their downstream faces is served
+(deduplicated by face), matching NFD's `findAllDataMatches`.
+
+Forwarded `Data` is not echoed back out the face it arrived on — except
+on an **ad-hoc** link (`LinkType::AdHoc`), where re-radiating onto the
+shared medium is how other listeners hear it. This is what lets a single
+broadcast face act as a relay for the neighbours behind it.
+
 ## FIB — Forwarding Information Base
 
 Indexed by name prefix. Each entry lists the faces the forwarder
@@ -98,6 +108,14 @@ needs to leave the forwarder.
 
 ndn-rs's default Content Store is LRU; the `ContentStore` trait
 allows custom impls. See `crates/ndn-store/`.
+
+**Unsolicited Data** — `Data` that arrives with no matching PIT entry
+(e.g. overheard on a broadcast medium) — is dropped by default. The
+`UnsolicitedDataPolicy` knob (`[cs] unsolicited_policy`, or
+`EngineBuilder::unsolicited_data_policy`) can opt to cache it instead:
+`admit-network` is the choice for a broadcast/ad-hoc bearer, so a later
+Interest is served locally. Admitted Data is cached only (never
+forwarded) and still must pass validation before entering the CS.
 
 ## Strategy decisions
 
