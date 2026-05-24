@@ -711,6 +711,10 @@ pub(crate) async fn run_face_sender(
     // frames through it when enabled; the retx tick pumps its retransmissions
     // and Acks. `take_*` are empty when disabled, so the tick is cheap.
     let lp_reliability_feature = face.link_service.reliability_feature_handle();
+    // A-LAL idle-fallback beacon (CCLF): the tick emits a beacon on a face that
+    // has been silent for the configured interval. Disabled unless a beacon is
+    // installed, so the tick stays cheap.
+    let a_lal_feature = face.link_service.a_lal_feature_handle();
 
     let retx_tick_dur = std::time::Duration::from_millis(50);
 
@@ -803,7 +807,8 @@ pub(crate) async fn run_face_sender(
                     }
                 }
             },
-            _ = retx_sleep, if lp_reliability_feature.is_some() => {
+            _ = retx_sleep, if lp_reliability_feature.is_some()
+                || a_lal_feature.as_ref().is_some_and(|a| a.is_beacon_enabled()) => {
                 // Pump the reliability feature's retransmissions and standalone
                 // Acks onto the egress path. Both are empty when disabled.
                 if let Some(feature) = lp_reliability_feature.as_ref() {
@@ -817,6 +822,15 @@ pub(crate) async fn run_face_sender(
                     if let Some(ack) = feature.take_acks() {
                         let _ = face.send_bytes(ack).await;
                     }
+                }
+                // A-LAL idle beacon: emit when the face has been silent for the
+                // configured interval (a no-op otherwise).
+                if let Some(a) = a_lal_feature.as_ref()
+                    && let Some(beacon) = a.due_beacon()
+                    && let Err(e) = face.send_bytes(beacon).await
+                    && handle_send_error(e)
+                {
+                    return;
                 }
             }
         }

@@ -152,6 +152,11 @@ pub trait LinkService: Send + Sync + 'static {
     fn reliability_feature_handle(&self) -> Option<Arc<features::ReliabilityFeature>> {
         None
     }
+
+    /// Handle for the per-face tick task to emit A-LAL idle beacons (CCLF).
+    fn a_lal_feature_handle(&self) -> Option<Arc<features::AlalFeature>> {
+        None
+    }
 }
 
 /// LinkService for local (same-host IPC) faces. Skips LP framing in both
@@ -206,6 +211,7 @@ pub struct LpLinkService {
     /// Typed handle into `features` so `apply()` can flip the switch directly.
     reliability_feature: Arc<ReliabilityFeature>,
     congestion_marking_feature: Arc<CongestionMarkingFeature>,
+    a_lal_feature: Arc<features::AlalFeature>,
 }
 
 impl LpLinkService {
@@ -217,6 +223,7 @@ impl LpLinkService {
             features: set.features,
             reliability_feature: set.reliability,
             congestion_marking_feature: set.congestion_marking,
+            a_lal_feature: set.a_lal,
         }
     }
 
@@ -237,6 +244,7 @@ impl LpLinkService {
             features,
             reliability_feature,
             congestion_marking_feature: set.congestion_marking,
+            a_lal_feature: set.a_lal,
         }
     }
 
@@ -250,6 +258,10 @@ impl LpLinkService {
 
     pub fn congestion_marking_feature(&self) -> &Arc<CongestionMarkingFeature> {
         &self.congestion_marking_feature
+    }
+
+    pub fn a_lal_feature(&self) -> &Arc<features::AlalFeature> {
+        &self.a_lal_feature
     }
 }
 
@@ -432,6 +444,10 @@ impl LinkService for LpLinkService {
 
     fn reliability_feature_handle(&self) -> Option<Arc<features::ReliabilityFeature>> {
         Some(Arc::clone(&self.reliability_feature))
+    }
+
+    fn a_lal_feature_handle(&self) -> Option<Arc<features::AlalFeature>> {
+        Some(Arc::clone(&self.a_lal_feature))
     }
 }
 

@@ -18,7 +18,7 @@ pub mod signals;
 pub mod strategy;
 
 pub use best_route::BestRouteStrategy;
-pub use context::{FibEntry, FibNexthop, StrategyContext};
+pub use context::{DataLocation, FibEntry, FibNexthop, PrevHopLocation, StrategyContext};
 pub use erased::ErasedStrategy;
 pub use filter::StrategyFilter;
 pub use filters::RssiFilter;

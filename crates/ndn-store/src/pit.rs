@@ -181,6 +181,12 @@ pub struct PitEntry {
     /// each in-record (see [`InRecord::persistent`]); the match stage falls
     /// back to this only when no in-record carries one.
     pub persistent: Option<PersistentState>,
+    /// Overhear-cancel flag for a *scheduled* forward (CCLF election). Set when
+    /// a neighbor is observed forwarding the same Interest instance (duplicate
+    /// nonce) while this node has a `ForwardAfter` pending; the timer task
+    /// checks it on wake and skips the redundant transmission. Inert for
+    /// strategies that forward immediately.
+    pub forward_cancelled: bool,
 }
 
 impl PitEntry {
@@ -194,6 +200,7 @@ impl PitEntry {
             created_at: now,
             expires_at: now + lifetime_ms * 1_000_000,
             persistent: None,
+            forward_cancelled: false,
         }
     }
 
@@ -797,5 +804,32 @@ mod tests {
         let mut entry = PitEntry::new(name, 0, 0);
         entry.add_in_record(1, 1, 100, None, Selector::default());
         assert!(entry.in_records[0].trace_ids.is_empty());
+    }
+
+    /// Overhear-cancel (CCLF): a fresh entry is not cancelled, and the flag can
+    /// be set via `with_entry_or_insert`'s on-existing path — the exact seam the
+    /// engine's PIT stage uses on a duplicate-nonce (overheard) Interest.
+    #[test]
+    fn forward_cancelled_defaults_false_and_sets_on_existing() {
+        let pit = Pit::new();
+        let name = std::sync::Arc::new(make_name(&["cclf", "overhear"]));
+        let token = PitToken(0x0CCF);
+        let entry = PitEntry::new(name, 0, 1000);
+        assert!(!entry.forward_cancelled, "new entry must not be cancelled");
+        pit.insert(token, entry);
+
+        // Simulate the duplicate-nonce path setting the cancel flag.
+        pit.with_entry_or_insert(
+            token,
+            |e| {
+                e.forward_cancelled = true;
+            },
+            || unreachable!("entry exists"),
+        );
+        assert_eq!(
+            pit.with_entry(&token, |e| e.forward_cancelled),
+            Some(true),
+            "overhear must set the cancel flag the ForwardAfter task reads"
+        );
     }
 }

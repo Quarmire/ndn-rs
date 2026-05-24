@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use super::LinkServiceFeature;
 
+pub mod al_lal;
 pub mod congestion_marking;
 pub mod fragmentation;
 pub mod incoming_face_id;
@@ -18,6 +19,10 @@ pub mod reassembly;
 pub mod reliability;
 pub mod trace_context;
 
+pub use al_lal::{
+    AlalFeature, PresenceSink, PresenceSource, install_global_presence_sink,
+    install_global_presence_source,
+};
 pub use congestion_marking::CongestionMarkingFeature;
 pub use fragmentation::FragmentationFeature;
 pub use incoming_face_id::IncomingFaceIdFeature;
@@ -37,12 +42,16 @@ pub struct NetworkFeatureSet {
     pub features: Vec<Arc<dyn LinkServiceFeature>>,
     pub reliability: Arc<ReliabilityFeature>,
     pub congestion_marking: Arc<CongestionMarkingFeature>,
+    /// A-LAL (CCLF presence piggyback / neighbor observation). Disabled until
+    /// the app sets a presence + sink and enables it.
+    pub a_lal: Arc<AlalFeature>,
 }
 
 /// Fresh per-face bundle. Order is significant (see module docs).
 pub fn default_features_for_network_face() -> NetworkFeatureSet {
     let reliability = Arc::new(ReliabilityFeature::new());
     let congestion_marking = Arc::new(CongestionMarkingFeature::new());
+    let a_lal = Arc::new(AlalFeature::new());
     let features: Vec<Arc<dyn LinkServiceFeature>> = vec![
         Arc::new(FragmentationFeature::new()),
         Arc::new(ReassemblyFeature::new()),
@@ -52,11 +61,15 @@ pub fn default_features_for_network_face() -> NetworkFeatureSet {
         Arc::new(TraceContextFeature::new()),
         Arc::clone(&reliability) as Arc<dyn LinkServiceFeature>,
         Arc::clone(&congestion_marking) as Arc<dyn LinkServiceFeature>,
+        // A-LAL last: it splices presence onto the fully framed egress wire and
+        // is inert (early-return) until enabled, so it adds nothing by default.
+        Arc::clone(&a_lal) as Arc<dyn LinkServiceFeature>,
     ];
     NetworkFeatureSet {
         features,
         reliability,
         congestion_marking,
+        a_lal,
     }
 }
 
@@ -79,6 +92,7 @@ mod tests {
                 "trace-context",
                 "reliability",
                 "congestion-marking",
+                "a-lal",
             ]
         );
     }

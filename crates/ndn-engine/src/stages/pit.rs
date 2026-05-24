@@ -113,6 +113,11 @@ impl PitCheckStage {
             token,
             |entry| {
                 if entry.nonces_seen.contains(&nonce) {
+                    // Overhear-cancel (CCLF): a duplicate nonce means a neighbor
+                    // is forwarding this very Interest instance. If we have a
+                    // scheduled forward pending (timer election), cancel it —
+                    // a peer already won. Inert for immediate-forward strategies.
+                    entry.forward_cancelled = true;
                     return CheckResult::Loop;
                 }
                 let expires_at = now_ns + lifetime_ms * 1_000_000;

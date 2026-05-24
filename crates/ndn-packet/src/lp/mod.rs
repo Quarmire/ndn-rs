@@ -1,10 +1,14 @@
 //! NDNLPv2 Link Protocol Packet framing.
 
+pub mod al_lal;
 mod decode;
 mod encode;
 mod fragment;
 pub mod trace_context;
 
+pub use al_lal::{GeoFix, TLV_AL_DATA_LOC, TLV_AL_PRESENCE, TLV_AL_PREV_HOP_LOC};
+#[cfg(feature = "std")]
+pub use al_lal::{extract_lp_header, splice_lp_header};
 pub use decode::LpPacket;
 pub use encode::{
     encode_lp_acks, encode_lp_nack, encode_lp_nack_with_pit_token, encode_lp_packet,

@@ -56,6 +56,23 @@ pub struct ForwarderConfig {
     /// `/localhost/nfd/reflexive` management module.
     #[serde(default)]
     pub reflexive: ReflexiveTomlConfig,
+
+    /// CCLF (content-aware forwarding) boot config. CCLF is selected per-prefix
+    /// via strategy-choice like any other strategy (requires the `cclf` build
+    /// feature); this section only sets the network-layer **presence** this
+    /// node advertises so neighbors count it for density (A-LAL).
+    #[serde(default)]
+    pub cclf: CclfTomlConfig,
+}
+
+/// CCLF presence configuration. See [`ForwarderConfig::cclf`].
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct CclfTomlConfig {
+    /// NDN name this node advertises as its A-LAL presence — its network-layer
+    /// neighbor identity (NOT a MAC/host address). Unset → this node observes
+    /// neighbors but does not advertise itself, so peers won't count it.
+    #[serde(default)]
+    pub presence_name: Option<String>,
 }
 
 /// Opt-in span publisher; defaults are conservative (no publishing,

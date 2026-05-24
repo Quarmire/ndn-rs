@@ -266,6 +266,26 @@ impl TlvDecodeStage {
         if let Some(ref pa) = lp.prefix_announcement {
             ctx.tags.insert(PrefixAnnouncement(pa.clone()));
         }
+        // A-LAL geographic headers (CCLF Location Score). Surfaced as typed
+        // tags; the strategy stage forwards them into `StrategyContext::extensions`.
+        if let Some(ref pl) = lp.al_prev_hop_loc
+            && let Some(g) = ndn_packet::lp::GeoFix::decode_value(pl)
+        {
+            ctx.tags.insert(ndn_strategy::PrevHopLocation(ndn_strategy::GeoPos {
+                lat_e7: g.lat_e7,
+                lon_e7: g.lon_e7,
+                alt_cm: g.alt_cm,
+            }));
+        }
+        if let Some(ref dl) = lp.al_data_loc
+            && let Some(g) = ndn_packet::lp::GeoFix::decode_value(dl)
+        {
+            ctx.tags.insert(ndn_strategy::DataLocation(ndn_strategy::GeoPos {
+                lat_e7: g.lat_e7,
+                lon_e7: g.lon_e7,
+                alt_cm: g.alt_cm,
+            }));
+        }
 
         if lp.is_ack_only() {
             return Action::Drop(DropReason::FragmentCollect);

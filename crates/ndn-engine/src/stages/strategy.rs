@@ -170,16 +170,26 @@ impl StrategyStage {
             });
 
         // Hot path: known cross-layer inputs (RSSI, GPS, …) come from
-        // `signals`, so when no open-ended enricher is registered we skip
-        // building a per-packet AnyMap entirely and share one empty map.
+        // `signals`, so when no open-ended enricher is registered and no A-LAL
+        // geo headers were decoded, we skip building a per-packet AnyMap
+        // entirely and share one empty map.
+        let pl = ctx.tags.get::<ndn_strategy::PrevHopLocation>().copied();
+        let dl = ctx.tags.get::<ndn_strategy::DataLocation>().copied();
         let built_extensions;
-        let extensions: &AnyMap = if self.enrichers.is_empty() {
+        let extensions: &AnyMap = if self.enrichers.is_empty() && pl.is_none() && dl.is_none() {
             static EMPTY: std::sync::LazyLock<AnyMap> = std::sync::LazyLock::new(AnyMap::new);
             &EMPTY
         } else {
             let mut e = AnyMap::new();
             for enricher in &self.enrichers {
                 enricher.enrich(strategy_fib.as_ref(), &mut e);
+            }
+            // Forward A-LAL geo headers (CCLF Location Score) per-Interest.
+            if let Some(pl) = pl {
+                e.insert(pl);
+            }
+            if let Some(dl) = dl {
+                e.insert(dl);
             }
             built_extensions = e;
             &built_extensions
@@ -311,12 +321,17 @@ impl StrategyStage {
                     let sleep = runtime.sleep(delay);
                     self.runtime.spawn(Box::pin(async move {
                         sleep.await;
-                        // Re-check PIT — if the entry was already satisfied or
-                        // expired, do not send (the Interest is no longer pending).
-                        if let Some(token) = pit_token
-                            && !pit.contains(&token)
-                        {
-                            return;
+                        // Re-check the PIT on wake. Skip the (re)broadcast if the
+                        // entry is gone (satisfied by Data / expired) OR its
+                        // overhear-cancel flag was set — a neighbor forwarded the
+                        // same Interest first and won the CCLF election.
+                        if let Some(token) = pit_token {
+                            let proceed = pit
+                                .with_entry(&token, |e| !e.forward_cancelled)
+                                .unwrap_or(false);
+                            if !proceed {
+                                return;
+                            }
                         }
                         for face_id in &faces {
                             if let Some(face) = face_table.get(*face_id) {

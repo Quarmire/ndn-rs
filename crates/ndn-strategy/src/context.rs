@@ -2,11 +2,22 @@ use std::sync::Arc;
 
 use ndn_packet::Name;
 use ndn_runtime::Runtime;
-use ndn_signals_core::SignalView;
+use ndn_signals_core::{GeoPos, SignalView};
 use ndn_store::PitToken;
 use ndn_transport::{AnyMap, FaceId};
 
 use crate::MeasurementsTable;
+
+/// Previous-hop geographic position (NDNLPv2 A-LAL PL header), surfaced
+/// per-Interest in [`StrategyContext::extensions`] for geographic strategies
+/// (CCLF Location Score). The previous hop is whoever forwarded this Interest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PrevHopLocation(pub GeoPos);
+
+/// Destination/data geographic position (NDNLPv2 A-LAL DL header), surfaced
+/// per-Interest in [`StrategyContext::extensions`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DataLocation(pub GeoPos);
 
 #[derive(Clone, Copy, Debug)]
 pub struct FibNexthop {

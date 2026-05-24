@@ -27,6 +27,13 @@ pub struct LpPacket {
     pub tx_sequence: Option<u64>,
     pub non_discovery: bool,
     pub prefix_announcement: Option<Bytes>,
+    /// A-LAL presence: the forwarding node's encoded Name wire (network-layer
+    /// neighbor identity for CCLF density). See [`super::al_lal`].
+    pub al_presence: Option<Bytes>,
+    /// A-LAL previous-hop location (12-byte [`super::GeoFix`]) for Location Score.
+    pub al_prev_hop_loc: Option<Bytes>,
+    /// A-LAL destination/data location (12-byte [`super::GeoFix`]) for Location Score.
+    pub al_data_loc: Option<Bytes>,
 }
 
 impl LpPacket {
@@ -52,6 +59,9 @@ impl LpPacket {
         let mut tx_sequence = None;
         let mut non_discovery = false;
         let mut prefix_announcement = None;
+        let mut al_presence = None;
+        let mut al_prev_hop_loc = None;
+        let mut al_data_loc = None;
 
         // Enforce NDNLPv2 §"Element Order": LP headers ascend by TLV-TYPE,
         // only `Ack` (0x0344) is repeatable, and `Fragment` (0x50) is last.
@@ -146,6 +156,15 @@ impl LpPacket {
                 tlv_type::LP_PREFIX_ANNOUNCEMENT => {
                     prefix_announcement = Some(v);
                 }
+                super::al_lal::TLV_AL_PRESENCE => {
+                    al_presence = Some(v);
+                }
+                super::al_lal::TLV_AL_PREV_HOP_LOC => {
+                    al_prev_hop_loc = Some(v);
+                }
+                super::al_lal::TLV_AL_DATA_LOC => {
+                    al_data_loc = Some(v);
+                }
                 tlv_type::INTEREST | tlv_type::DATA => {
                     // NDNLPv2 requires the network-layer packet to be wrapped
                     // in `LpFragment` (0x50). Bare Interest/Data is not spec.
@@ -186,6 +205,9 @@ impl LpPacket {
             tx_sequence,
             non_discovery,
             prefix_announcement,
+            al_presence,
+            al_prev_hop_loc,
+            al_data_loc,
         })
     }
 }
@@ -657,6 +679,9 @@ mod tests {
         assert!(lp.tx_sequence.is_none());
         assert!(!lp.non_discovery);
         assert!(lp.prefix_announcement.is_none());
+        assert!(lp.al_presence.is_none());
+        assert!(lp.al_prev_hop_loc.is_none());
+        assert!(lp.al_data_loc.is_none());
     }
 
     #[test]
