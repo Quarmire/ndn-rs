@@ -35,6 +35,7 @@ web-time      = { workspace = true }
 bytes         = { workspace = true, features = ["std"] }
 smallvec      = { workspace = true }
 dashmap       = { workspace = true }
+arc-swap      = { workspace = true }
 tokio-util    = { workspace = true, features = ["rt"] }
 tracing       = { workspace = true }
 thiserror     = { workspace = true }

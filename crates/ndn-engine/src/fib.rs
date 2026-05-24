@@ -1,7 +1,9 @@
-use ndn_packet::Name;
-use ndn_store::NameTrie;
-use ndn_transport::FaceId;
+use std::collections::HashMap;
 use std::sync::Arc;
+
+use arc_swap::ArcSwap;
+use ndn_packet::{Name, NameComponent};
+use ndn_transport::FaceId;
 
 #[derive(Clone, Debug)]
 pub struct FibNexthop {
@@ -24,69 +26,176 @@ impl FibEntry {
     }
 }
 
+/// Immutable, lock-free name trie holding the FIB. Reads (LPM on every
+/// Interest) traverse a frozen snapshot with no locks; writes copy-on-write a
+/// fresh trie and atomically swap it in. Mirrors NDN-DPDK's lock-free FIB-read
+/// design (liburcu there; `arc-swap` here) — see
+/// `.claude/notes/high-throughput-forwarding.md` Tier 1.
+#[derive(Clone, Default)]
+struct FibTrie {
+    entry: Option<Arc<FibEntry>>,
+    children: HashMap<NameComponent, FibTrie>,
+}
+
+impl FibTrie {
+    fn lpm(&self, name: &Name) -> Option<Arc<FibEntry>> {
+        let mut best = self.entry.clone();
+        let mut node = self;
+        for comp in name.components() {
+            match node.children.get(comp) {
+                Some(child) => {
+                    if child.entry.is_some() {
+                        best = child.entry.clone();
+                    }
+                    node = child;
+                }
+                None => break,
+            }
+        }
+        best
+    }
+
+    fn get(&self, name: &Name) -> Option<Arc<FibEntry>> {
+        let mut node = self;
+        for comp in name.components() {
+            match node.children.get(comp) {
+                Some(child) => node = child,
+                None => return None,
+            }
+        }
+        node.entry.clone()
+    }
+
+    fn insert(&mut self, name: &Name, value: Arc<FibEntry>) {
+        let mut node = self;
+        for comp in name.components() {
+            node = node.children.entry(comp.clone()).or_default();
+        }
+        node.entry = Some(value);
+    }
+
+    /// Clear the entry at `name` (intermediate nodes are left in place, like
+    /// the prior `NameTrie`; `dump`/`lpm` ignore `None` entries).
+    fn remove(&mut self, name: &Name) {
+        let mut node = self;
+        for comp in name.components() {
+            match node.children.get_mut(comp) {
+                Some(child) => node = child,
+                None => return,
+            }
+        }
+        node.entry = None;
+    }
+
+    fn dump(&self, path: &mut Vec<NameComponent>, out: &mut Vec<(Name, Arc<FibEntry>)>) {
+        if let Some(e) = &self.entry {
+            out.push((Name::from_components(path.iter().cloned()), Arc::clone(e)));
+        }
+        for (comp, child) in &self.children {
+            path.push(comp.clone());
+            child.dump(path, out);
+            path.pop();
+        }
+    }
+}
+
 pub struct Fib {
-    trie: NameTrie<Arc<FibEntry>>,
+    trie: ArcSwap<FibTrie>,
 }
 
 impl Fib {
     pub fn new() -> Self {
         Self {
-            trie: NameTrie::new(),
+            trie: ArcSwap::from_pointee(FibTrie::default()),
         }
     }
 
     pub fn lpm(&self, name: &Name) -> Option<Arc<FibEntry>> {
-        self.trie.lpm(name)
+        self.trie.load().lpm(name)
     }
 
     pub fn add_nexthop(&self, prefix: &Name, face_id: FaceId, cost: u32) {
-        let existing = self.trie.get(prefix);
-        let mut nexthops = existing.map(|e| e.nexthops.clone()).unwrap_or_default();
-        nexthops.retain(|n| n.face_id != face_id);
-        nexthops.push(FibNexthop { face_id, cost });
-        self.trie.insert(prefix, Arc::new(FibEntry { nexthops }));
+        // `rcu` retries the closure on a concurrent swap, so the
+        // read-modify-write is atomic (the prior trie did this per-leaf; the
+        // engine-side get-then-insert here used to race).
+        self.trie.rcu(|cur| {
+            let mut t = FibTrie::clone(cur);
+            let mut nexthops = t.get(prefix).map(|e| e.nexthops.clone()).unwrap_or_default();
+            nexthops.retain(|n| n.face_id != face_id);
+            nexthops.push(FibNexthop { face_id, cost });
+            t.insert(prefix, Arc::new(FibEntry { nexthops }));
+            t
+        });
     }
 
     pub fn dump(&self) -> Vec<(Name, Arc<FibEntry>)> {
-        self.trie.dump()
+        let mut out = Vec::new();
+        self.trie.load().dump(&mut Vec::new(), &mut out);
+        out
     }
 
     pub fn remove_prefix(&self, prefix: &Name) {
-        self.trie.remove(prefix);
+        self.trie.rcu(|cur| {
+            let mut t = FibTrie::clone(cur);
+            t.remove(prefix);
+            t
+        });
     }
 
     pub fn set_nexthops(&self, prefix: &Name, nexthops: Vec<FibNexthop>) {
-        if nexthops.is_empty() {
-            self.trie.remove(prefix);
-        } else {
-            self.trie.insert(prefix, Arc::new(FibEntry { nexthops }));
-        }
+        self.trie.rcu(|cur| {
+            let mut t = FibTrie::clone(cur);
+            if nexthops.is_empty() {
+                t.remove(prefix);
+            } else {
+                t.insert(prefix, Arc::new(FibEntry { nexthops: nexthops.clone() }));
+            }
+            t
+        });
     }
 
     pub fn remove_face(&self, face_id: FaceId) {
-        let entries = self.trie.dump();
-        for (prefix, entry) in entries {
-            if entry.nexthops.iter().any(|n| n.face_id == face_id) {
-                self.remove_nexthop(&prefix, face_id);
+        self.trie.rcu(|cur| {
+            let mut t = FibTrie::clone(cur);
+            let mut entries = Vec::new();
+            t.dump(&mut Vec::new(), &mut entries);
+            for (prefix, entry) in entries {
+                if entry.nexthops.iter().any(|n| n.face_id == face_id) {
+                    let nexthops: Vec<_> = entry
+                        .nexthops
+                        .iter()
+                        .filter(|n| n.face_id != face_id)
+                        .cloned()
+                        .collect();
+                    if nexthops.is_empty() {
+                        t.remove(&prefix);
+                    } else {
+                        t.insert(&prefix, Arc::new(FibEntry { nexthops }));
+                    }
+                }
             }
-        }
+            t
+        });
     }
 
     pub fn remove_nexthop(&self, prefix: &Name, face_id: FaceId) {
-        let Some(existing) = self.trie.get(prefix) else {
-            return;
-        };
-        let nexthops: Vec<_> = existing
-            .nexthops
-            .iter()
-            .filter(|n| n.face_id != face_id)
-            .cloned()
-            .collect();
-        if nexthops.is_empty() {
-            self.trie.remove(prefix);
-        } else {
-            self.trie.insert(prefix, Arc::new(FibEntry { nexthops }));
-        }
+        self.trie.rcu(|cur| {
+            let mut t = FibTrie::clone(cur);
+            if let Some(existing) = t.get(prefix) {
+                let nexthops: Vec<_> = existing
+                    .nexthops
+                    .iter()
+                    .filter(|n| n.face_id != face_id)
+                    .cloned()
+                    .collect();
+                if nexthops.is_empty() {
+                    t.remove(prefix);
+                } else {
+                    t.insert(prefix, Arc::new(FibEntry { nexthops }));
+                }
+            }
+            t
+        });
     }
 }
 
