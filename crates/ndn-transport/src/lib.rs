@@ -16,6 +16,7 @@ pub mod face;
 pub mod face_event;
 pub mod face_options;
 pub mod face_pair_table;
+pub mod face_sink;
 pub mod face_table;
 pub mod forwarding;
 pub mod link_service;
@@ -41,6 +42,7 @@ pub use face_options::{
     FaceOptions, NFD_FLAG_BITS,
 };
 pub use face_pair_table::FacePairTable;
+pub use face_sink::FaceSink;
 pub use face_table::{FaceInfo, FaceTable};
 pub use forwarding::{ForwardingAction, NackReason};
 pub use link_service::{

@@ -794,3 +794,36 @@ pub(crate) async fn run_face_sender(
         }
     }
 }
+
+/// Lets an external face provisioner (interface enumeration, auto-multicast,
+/// hotplug — see `ndn_transport::FaceSink`) install and tear down faces on the
+/// engine. Implemented here so the provisioner stays decoupled from the engine
+/// and is reusable by any engine that embeds a `ForwarderEngine`.
+impl ndn_transport::FaceSink for ForwarderEngine {
+    fn alloc_face_id(&self) -> FaceId {
+        self.faces().alloc_id()
+    }
+
+    fn install_transport<T: ndn_transport::Transport + 'static>(
+        &self,
+        face: T,
+        cancel: CancellationToken,
+        persistency: FacePersistency,
+    ) {
+        self.add_face_with_persistency(face, cancel, persistency);
+    }
+
+    fn installed_face_ids(&self) -> Vec<FaceId> {
+        self.faces().face_ids()
+    }
+
+    fn face_local_uri(&self, id: FaceId) -> Option<String> {
+        self.faces().get(id).and_then(|f| f.local_uri())
+    }
+
+    fn cancel_face(&self, id: FaceId) {
+        if let Some(tok) = self.face_token(id) {
+            tok.cancel();
+        }
+    }
+}
