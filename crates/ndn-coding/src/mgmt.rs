@@ -84,12 +84,24 @@ impl ndn_mgmt::CodingHandler for CodingMgmtHandler {
             .entries()
             .into_iter()
             .map(|(prefix, role, policy)| {
-                let CodingPolicy::Fec(fec) = policy;
-                let entry = ndn_mgmt::CodingEntry {
-                    role: map_role_to_wire(role),
-                    k: fec.k,
-                    n: fec.n,
-                    field: map_field_to_wire(fec.field),
+                let entry = match policy {
+                    CodingPolicy::Fec(fec) => ndn_mgmt::CodingEntry {
+                        role: map_role_to_wire(role),
+                        k: fec.k,
+                        n: fec.n,
+                        field: map_field_to_wire(fec.field),
+                    },
+                    // F2 has no fixed N (recoders mint further combinations),
+                    // so report `k` as the decode-rank target. Surfacing the
+                    // recode policy in mgmt is deferred to the F2
+                    // implementation pass (wire spec §8).
+                    #[cfg(feature = "f2-recode")]
+                    CodingPolicy::Rlnc(r) => ndn_mgmt::CodingEntry {
+                        role: map_role_to_wire(role),
+                        k: r.k,
+                        n: r.k,
+                        field: map_field_to_wire(r.field),
+                    },
                 };
                 (prefix, entry)
             })

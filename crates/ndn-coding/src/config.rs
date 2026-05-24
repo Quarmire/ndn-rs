@@ -111,6 +111,8 @@ mod tests {
             .unwrap();
         match p {
             CodingPolicy::Fec(fp) => assert_eq!((fp.k, fp.n), (16, 20)),
+            #[cfg(feature = "f2-recode")]
+            CodingPolicy::Rlnc(_) => unreachable!("config inserts only Fec"),
         }
     }
 

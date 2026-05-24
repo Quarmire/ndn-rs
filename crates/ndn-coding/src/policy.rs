@@ -18,6 +18,10 @@ pub enum PolicyRole {
 #[serde(tag = "mode", rename_all = "lowercase")]
 pub enum CodingPolicy {
     Fec(FecPolicy),
+    /// F2 in-network RLNC recoding (feature `f2-recode`). See
+    /// [`crate::recode`] and `docs/doctrine/nc-recoding-trust-model-2026-05-23.md`.
+    #[cfg(feature = "f2-recode")]
+    Rlnc(crate::recode::RlncPolicy),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -146,11 +150,15 @@ mod tests {
         let policy = table.lookup(&child, PolicyRole::Produced).unwrap();
         match policy {
             CodingPolicy::Fec(p) => assert_eq!((p.k, p.n), (16, 20)),
+            #[cfg(feature = "f2-recode")]
+            CodingPolicy::Rlnc(_) => unreachable!("test inserts only Fec"),
         }
         let other: Name = "/alice/photos/seg=0".parse().unwrap();
         let policy = table.lookup(&other, PolicyRole::Produced).unwrap();
         match policy {
             CodingPolicy::Fec(p) => assert_eq!((p.k, p.n), (4, 6)),
+            #[cfg(feature = "f2-recode")]
+            CodingPolicy::Rlnc(_) => unreachable!("test inserts only Fec"),
         }
     }
 
@@ -162,9 +170,13 @@ mod tests {
         table.set(&prefix, PolicyRole::Consumed, fec_policy(16, 20));
         match table.lookup(&prefix, PolicyRole::Produced).unwrap() {
             CodingPolicy::Fec(p) => assert_eq!(p.k, 8),
+            #[cfg(feature = "f2-recode")]
+            CodingPolicy::Rlnc(_) => unreachable!("test inserts only Fec"),
         }
         match table.lookup(&prefix, PolicyRole::Consumed).unwrap() {
             CodingPolicy::Fec(p) => assert_eq!(p.k, 16),
+            #[cfg(feature = "f2-recode")]
+            CodingPolicy::Rlnc(_) => unreachable!("test inserts only Fec"),
         }
     }
 

@@ -8,8 +8,9 @@ license.workspace = true
 [package.metadata.scope]
 # F1 is content-layer FEC: pragmatic engineering with no adopted
 # community spec (RFC 9273 is the nearest anchor), so the crate is an
-# `extension`, not `spec`. F2 (RLNC in-network recoding) is gated
-# behind a future trust-model doctrine memo (`f2-recode` feature).
+# `extension`, not `spec`. F2 (RLNC in-network recoding) stays gated
+# behind `f2-recode`; its trust model is decided in
+# docs/doctrine/nc-recoding-trust-model-2026-05-23.md.
 classification = "extension"
 
 [features]
@@ -22,9 +23,39 @@ endpoint = ["dep:ndn-app", "dep:ndn-transport", "dep:tokio"]
 # Enable AVX2/NEON SIMD path for GF(2^8) arithmetic. Off by default;
 # scalar path is the reference implementation.
 simd = []
-# Reserved for F2 in-network RLNC recoding. Not implemented; only
-# present so downstream code can feature-detect the gate.
-f2-recode = []
+# F2 in-network RLNC recoding — pure core (descriptor/vector codec,
+# generation buffer, verify-on-decode). Stays wasm32/embedded-clean:
+# adds only `sha2` for the source-row commitment hash. The trust model
+# is `docs/doctrine/nc-recoding-trust-model-2026-05-23.md`, the wire
+# format `docs/notes/coding-f2-wire-spec-2026-05-23.md`.
+f2-recode = ["dep:sha2"]
+# F3 link-layer inter-flow (COPE-style) network coding — the pure coding
+# core (`cope` module): a relay XORs native frames for different next-hops
+# when each recipient holds the others (overheard). XOR-only, no extra deps,
+# wasm/embedded-clean. Face-driver wiring (a broadcast-face LinkServiceFeature)
+# is the deployment seam, not in this crate. See the design memo and the
+# doctrine's F3 placement note.
+f3-link = []
+# F3 broadcast-link wiring — `CopeBroadcastLink<T: Transport>` over a
+# broadcast medium (code-on-egress / decode-on-ingress). Native next-hop is
+# supplied by the forwarding plane (the layering constraint); the
+# reception-report control protocol and engine-egress integration are seams.
+f3-link-face = ["f3-link", "dep:ndn-transport", "dep:tokio"]
+# F2 native engine integration — the synthetic `RecoderFace` (mirrors
+# ndn-compute's ComputeFace) plus delegated-recoder signing/verify.
+# Native only (pulls the forwarder + signer); not built for wasm.
+f2-recode-face = [
+    "f2-recode",
+    "dep:ndn-engine",
+    "dep:ndn-security",
+    "dep:ndn-transport",
+    "dep:tokio",
+    "dep:tokio-util",
+]
+# Register the `_nc/<vector>` deterministic recode as an ndn-compute function
+# (Tier-0 ComputeHandler), so it appears in /localhost/nfd/compute/list and
+# composes with the compute machinery. Native.
+f2-recode-compute = ["f2-recode-face", "dep:ndn-compute"]
 
 [dependencies]
 ndn-foundation-types = { workspace = true }
@@ -41,6 +72,12 @@ serde                = { workspace = true, features = ["derive"] }
 ndn-app              = { workspace = true, optional = true }
 ndn-transport        = { workspace = true, optional = true }
 tokio                = { workspace = true, features = ["rt", "sync", "time", "macros"], optional = true }
+# F2 deps (optional; enabled by `f2-recode` / `f2-recode-face`)
+sha2                 = { workspace = true, optional = true }
+ndn-engine           = { workspace = true, optional = true }
+ndn-security         = { workspace = true, optional = true }
+ndn-compute          = { workspace = true, optional = true }
+tokio-util           = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio        = { workspace = true, features = ["rt", "macros", "time"] }
