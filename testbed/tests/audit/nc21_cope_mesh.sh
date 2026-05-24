@@ -14,7 +14,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 cd "$REPO_ROOT"
 command -v cargo >/dev/null 2>&1 || { echo "SKIP: cargo missing" >&2; exit 2; }
-if cargo test -p ndn-coding --features f3-link-mesh --test cope_mesh --quiet \
+if cargo test -p ndn-coding --features f3-link-mesh --test cope_mesh --quiet -- mesh_installs_member_faces_and_codes_over_engine \
         >/tmp/nc21_witness.log 2>&1 && grep -qE "result: ok\. [1-9]" /tmp/nc21_witness.log; then
     echo "=== NC.21 PASS — CopeMesh installs member+ingress faces, codes over engine ==="
     grep -E "test result|running" /tmp/nc21_witness.log | tail -n 2
