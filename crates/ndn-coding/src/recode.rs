@@ -205,6 +205,30 @@ impl LinearFingerprint {
         }
     }
 
+    /// Encode as a standalone `Fingerprint` TLV — used to carry a
+    /// consumer-challenge response as Data `Content` (wire spec §3.3).
+    pub fn to_tlv(&self) -> Bytes {
+        let mut w = TlvWriter::new();
+        w.write_nested(TYPE_FINGERPRINT, |f| {
+            f.write_tlv(TYPE_FP_R, &self.r);
+            f.write_tlv(TYPE_FP_H, &self.h);
+            if let Some(sh) = &self.seed_hash {
+                f.write_tlv(TYPE_FP_SEED_HASH, sh);
+            }
+        });
+        w.finish()
+    }
+
+    /// Decode a standalone `Fingerprint` TLV.
+    pub fn from_tlv(bytes: &[u8]) -> Result<Self> {
+        let mut r = TlvReader::new(Bytes::copy_from_slice(bytes));
+        let (typ, value) = r.read_tlv().map_err(|_| CodingError::MalformedMetadata)?;
+        if typ != TYPE_FINGERPRINT {
+            return Err(CodingError::MalformedMetadata);
+        }
+        decode_fingerprint(value)
+    }
+
     /// Check a coded packet: `<r, payload>` must equal `Σ vector[s]·h[s]`.
     /// Returns `false` if `r` is not available (delayed-unrevealed) — callers
     /// must not treat that as a pass; gate with [`is_delayed_unrevealed`].
@@ -591,6 +615,9 @@ pub mod naming {
     /// Named-combination marker (deterministic combination for an explicit
     /// coding vector — the recode-as-named-computation form, doctrine §8).
     pub const NC_MARKER: &[u8] = b"_nc";
+    /// Consumer-challenge marker: `…/_chal/<r>` requests the fingerprint
+    /// response for the consumer-chosen projection `r` (doctrine §6).
+    pub const CHAL_MARKER: &[u8] = b"_chal";
 
     /// `<object>/_gen/<id>`.
     pub fn generation_name(object: &Name, generation_id: u64) -> Name {
@@ -648,6 +675,24 @@ pub mod naming {
         let vector = CodingVector(c[n - 1].value.to_vec());
         let object = Name::from_components(c[..n - 4].iter().cloned());
         Some((object, generation_id, vector))
+    }
+
+    /// `<object>/_gen/<id>/_chal/<r>` — a consumer-challenge for projection `r`.
+    pub fn challenge_name(object: &Name, generation_id: u64, r: &[u8]) -> Name {
+        generation_name(object, generation_id).append(CHAL_MARKER).append(r)
+    }
+
+    /// Parse a `…/_gen/<id>/_chal/<r>` name into `(object, gen, r)`.
+    pub fn parse_challenge(name: &Name) -> Option<(Name, u64, Vec<u8>)> {
+        let c = name.components();
+        let n = c.len();
+        if n < 4 || c[n - 4].value.as_ref() != GEN_MARKER || c[n - 2].value.as_ref() != CHAL_MARKER {
+            return None;
+        }
+        let generation_id = decimal(&c[n - 3].value)?;
+        let r = c[n - 1].value.to_vec();
+        let object = Name::from_components(c[..n - 4].iter().cloned());
+        Some((object, generation_id, r))
     }
 }
 
@@ -918,6 +963,34 @@ impl GenerationBuffer {
             vector: target.clone(),
             payload: Bytes::from(payload),
         })
+    }
+
+    /// Answer a consumer's fingerprint **challenge** (doctrine §6,
+    /// adaptive-resistant): given the consumer-chosen projection `r`, return
+    /// `LinearFingerprint::for_sources(r, …)`. Only a holder whose recovered
+    /// sources **verify against the descriptor commitment** answers (so the
+    /// response is sound); `None` otherwise. The caller signs the response.
+    pub fn answer_challenge(&self, r: &[u8]) -> Option<LinearFingerprint> {
+        let sources = self.recovered_sources()?;
+        if !verify_sources(sources, &self.descriptor.source_commitment) {
+            return None;
+        }
+        Some(LinearFingerprint::for_sources(r.to_vec(), sources))
+    }
+
+    /// Consumer side: verify every held packet against a (signed) challenge
+    /// response `fp`. Because the consumer chose `r` *after* packets were in
+    /// flight, an attacker could not have crafted pollution to pass.
+    pub fn verify_against_challenge(
+        &self,
+        fp: &LinearFingerprint,
+    ) -> std::result::Result<(), DecodeError> {
+        for p in &self.packets {
+            if !fp.check(&p.vector, &p.payload) {
+                return Err(DecodeError::FingerprintFailed);
+            }
+        }
+        Ok(())
     }
 
     /// Retroactively verify all held packets against a now-revealed delayed

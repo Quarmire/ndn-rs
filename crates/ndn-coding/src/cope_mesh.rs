@@ -1,20 +1,27 @@
 //! F3 mesh auto-installation (feature `f3-link-mesh`).
 //!
-//! [`CopeMesh`] turns a neighbor set — as a routing/neighbor table would
-//! supply — into a running COPE coding mesh on a live engine: one egress
+//! [`CopeMesh`] turns a neighbor set — as a routing/neighbor table supplies —
+//! into a running COPE coding mesh on a live engine: one egress
 //! [`CopeMemberFace`](crate::cope_face::CopeMemberFace) per neighbor (the
 //! engine's FIB routes to it by `FaceId`, so the next-hop is the out-`FaceId`),
 //! a single [`CopeIngressFace`](crate::cope_face::CopeIngressFace) draining
 //! decoded natives, and a background ticker that broadcasts reception reports
-//! (`announce`) and flushes coded frames over the shared broadcast medium.
+//! (`announce`) and flushes coded frames.
 //!
-//! The neighbor-id IS the member `FaceId`; a routing protocol assigns neighbor
-//! ids (= face ids) and installs FIB next-hops toward them via
-//! [`CopeMesh::neighbor_face`]. Distributing the reception reports and feeding
-//! the neighbor set from a live routing protocol are the remaining operational
-//! hooks; the mechanism is here.
+//! **Fed from a live routing protocol:** the neighbor set is *dynamic*. As the
+//! routing layer (e.g. NLSR's `NeighborConfig`, or any `RoutingProtocol`)
+//! gains or loses an adjacency, it calls [`CopeMesh::add_neighbor`] /
+//! [`CopeMesh::remove_neighbor`], or [`CopeMesh::sync_neighbors`] with the
+//! current neighbor list. Each member face has its own child cancellation
+//! token, so removing one neighbor reaps only that face. A routing protocol
+//! installs FIB next-hops toward each neighbor via [`CopeMesh::neighbor_face`].
+//!
+//! The neighbor-id IS the member `FaceId`, so neighbor ids **must be allocated
+//! from the engine's face-id space** (`engine.faces().alloc_id()`) to avoid
+//! colliding with the ingress face or other faces — the routing layer assigns
+//! them.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,20 +32,25 @@ use tokio_util::sync::CancellationToken;
 use crate::cope::NeighborId;
 use crate::cope_face::{CopeBroadcastLink, CopeIngressFace, CopeMemberFace};
 
-/// A COPE coding mesh installed on a [`ForwarderEngine`].
+/// A COPE coding mesh installed on a [`ForwarderEngine`], with a dynamic
+/// neighbor set driven by routing.
 pub struct CopeMesh<T: Transport> {
+    engine: ForwarderEngine,
     link: Arc<CopeBroadcastLink<T>>,
-    members: HashMap<NeighborId, FaceId>,
+    /// neighbor → (member face id, that face's cancel token).
+    members: HashMap<NeighborId, (FaceId, CancellationToken)>,
     ingress_face_id: FaceId,
+    /// Parent token; cancelling it (on drop) reaps every member + the ingress.
     cancel: CancellationToken,
 }
 
 impl<T: Transport> CopeMesh<T> {
-    /// Install a mesh over the broadcast transport `inner` for the given
-    /// `neighbors` (the routing-table-derived neighbor set). `self_id` is this
-    /// node's neighbor id (used in its reception reports). Registers one
-    /// egress member face per neighbor (`FaceId(neighbor)`) plus one ingress
-    /// face, all `Permanent`.
+    /// Install a mesh over the broadcast transport `inner` for the initial
+    /// `neighbors` (the routing-table-derived set). `self_id` is this node's
+    /// neighbor id (used in its reception reports). Registers one egress member
+    /// face per neighbor (`FaceId(neighbor)`) plus one ingress face, all
+    /// `Permanent`. Use [`add_neighbor`](Self::add_neighbor) /
+    /// [`sync_neighbors`](Self::sync_neighbors) to track routing changes.
     pub fn install(
         engine: &ForwarderEngine,
         inner: T,
@@ -48,30 +60,79 @@ impl<T: Transport> CopeMesh<T> {
         let cancel = CancellationToken::new();
         let link = Arc::new(CopeBroadcastLink::new(self_id, inner));
 
-        let mut members = HashMap::with_capacity(neighbors.len());
-        for &n in neighbors {
-            let face = CopeMemberFace::send_only(n, Arc::clone(&link));
-            let fid = face.id();
-            engine.add_face_with_persistency(face, cancel.clone(), FacePersistency::Permanent);
-            members.insert(n, fid);
-        }
-
         let ingress_face_id = engine.faces().alloc_id();
         let ingress = CopeIngressFace::new(ingress_face_id, Arc::clone(&link));
         engine.add_face_with_persistency(ingress, cancel.clone(), FacePersistency::Permanent);
 
-        Self {
+        let mut mesh = Self {
+            engine: engine.clone(),
             link,
-            members,
+            members: HashMap::new(),
             ingress_face_id,
             cancel,
+        };
+        for &n in neighbors {
+            mesh.add_neighbor(n);
+        }
+        mesh
+    }
+
+    /// Add a neighbor (routing discovered an adjacency): install its egress
+    /// member face. Idempotent — returns the existing `FaceId` if present.
+    pub fn add_neighbor(&mut self, neighbor: NeighborId) -> FaceId {
+        if let Some((fid, _)) = self.members.get(&neighbor) {
+            return *fid;
+        }
+        let token = self.cancel.child_token();
+        let face = CopeMemberFace::send_only(neighbor, Arc::clone(&self.link));
+        let fid = face.id();
+        self.engine
+            .add_face_with_persistency(face, token.clone(), FacePersistency::Permanent);
+        self.members.insert(neighbor, (fid, token));
+        fid
+    }
+
+    /// Remove a neighbor (routing lost the adjacency): cancel just its member
+    /// face and drop it from the engine. Returns `true` if it was present.
+    pub fn remove_neighbor(&mut self, neighbor: NeighborId) -> bool {
+        match self.members.remove(&neighbor) {
+            Some((fid, token)) => {
+                token.cancel(); // stop this member's I/O tasks
+                self.engine.faces().remove(fid);
+                true
+            }
+            None => false,
         }
     }
 
-    /// The `FaceId` to route toward `neighbor` in the FIB (a routing protocol
-    /// installs the next-hop using this).
+    /// Reconcile the installed members to exactly `desired` — the idiomatic
+    /// call on a routing neighbor-table change: adds new neighbors, removes
+    /// vanished ones.
+    pub fn sync_neighbors(&mut self, desired: &[NeighborId]) {
+        let want: HashSet<NeighborId> = desired.iter().copied().collect();
+        let stale: Vec<NeighborId> = self
+            .members
+            .keys()
+            .copied()
+            .filter(|n| !want.contains(n))
+            .collect();
+        for n in stale {
+            self.remove_neighbor(n);
+        }
+        for &n in desired {
+            self.add_neighbor(n);
+        }
+    }
+
+    /// Current member neighbors.
+    pub fn neighbors(&self) -> Vec<NeighborId> {
+        self.members.keys().copied().collect()
+    }
+
+    /// The `FaceId` to route toward `neighbor` (a routing protocol installs the
+    /// FIB next-hop using this).
     pub fn neighbor_face(&self, neighbor: NeighborId) -> Option<FaceId> {
-        self.members.get(&neighbor).copied()
+        self.members.get(&neighbor).map(|(fid, _)| *fid)
     }
 
     /// The ingress face decoded natives arrive on.
@@ -85,8 +146,7 @@ impl<T: Transport> CopeMesh<T> {
     }
 
     /// Start the background ticker: every `interval`, broadcast this node's
-    /// reception report (`announce`) and flush coded frames. Stops when the
-    /// mesh is dropped (its `CancellationToken` fires).
+    /// reception report (`announce`) and flush coded frames. Stops on drop.
     pub fn start_ticker(&self, interval: Duration) {
         let link = Arc::clone(&self.link);
         let cancel = self.cancel.clone();
@@ -106,6 +166,6 @@ impl<T: Transport> CopeMesh<T> {
 
 impl<T: Transport> Drop for CopeMesh<T> {
     fn drop(&mut self) {
-        self.cancel.cancel(); // stop the ticker + reap the mesh faces
+        self.cancel.cancel(); // stop the ticker + reap all mesh faces
     }
 }

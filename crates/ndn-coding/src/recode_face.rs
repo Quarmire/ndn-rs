@@ -193,6 +193,27 @@ impl RecoderState {
         let name = naming::vector_request_name(object, generation_id, &combo.vector);
         Some(build_signed(name, content, signer))
     }
+
+    /// Answer a consumer fingerprint challenge `…/_chal/<r>` (doctrine §6):
+    /// compute `LinearFingerprint::for_sources(r, …)` from descriptor-verified
+    /// sources and return it (signed) as `Content`. `None` if the generation is
+    /// unknown or its sources do not verify against the commitment.
+    async fn mint_challenge(
+        &self,
+        object: &Name,
+        generation_id: u64,
+        r: Vec<u8>,
+        signer: Option<&Arc<dyn Signer>>,
+    ) -> Option<Bytes> {
+        if !self.is_enabled() {
+            return None;
+        }
+        let key = naming::generation_name(object, generation_id);
+        let gens = self.generations.lock().await;
+        let fp = gens.get(&key)?.answer_challenge(&r)?;
+        let name = naming::challenge_name(object, generation_id, &r);
+        Some(build_signed(name, fp.to_tlv(), signer))
+    }
 }
 
 /// Build a coded Data: delegated-signed when a `signer` is present, else
@@ -264,6 +285,10 @@ impl Transport for RecoderFace {
         {
             self.state
                 .mint_exact(&object, generation_id, vector, self.signer.as_ref())
+                .await
+        } else if let Some((object, generation_id, r)) = naming::parse_challenge(&interest.name) {
+            self.state
+                .mint_challenge(&object, generation_id, r, self.signer.as_ref())
                 .await
         } else {
             return Ok(()); // not a coded request
@@ -479,6 +504,51 @@ mod tests {
         }
         assert!(consumer.is_decodable());
         assert_eq!(consumer.decode().unwrap().as_ref(), sources.concat().as_slice());
+    }
+
+    #[tokio::test]
+    async fn consumer_challenge_detects_pollution() {
+        use crate::recode::{GenerationBuffer, LinearFingerprint};
+
+        let object: Name = "/alice/clip".parse().unwrap();
+        let (desc, sources) = descriptor(&object, crate::recode::RecodePolicy::Open, None);
+        let state = RecoderState::new();
+        seed(&state, &object, &desc, &sources).await;
+
+        // Consumer picks a fresh random projection r (length = symbol size = 2)
+        // and asks the recoder (which holds descriptor-verified sources).
+        let r = vec![7u8, 11];
+        let wire = state
+            .mint_challenge(&object, desc.generation_id, r.clone(), None)
+            .await
+            .expect("challenge answered");
+        let data = Data::decode(wire).unwrap();
+        let fp = LinearFingerprint::from_tlv(data.content().unwrap()).unwrap();
+        assert_eq!(fp.r, r, "response is the fingerprint for the consumer's r");
+
+        let (gen_id, k) = (desc.generation_id, desc.k);
+        let meta = |i: u16| CodedMetadata {
+            generation_id: gen_id,
+            k,
+            field: Field::Gf8,
+            vector: CodingVector::unit(k, i),
+        };
+
+        // A consumer holding the genuine sources passes the challenge.
+        let mut good = GenerationBuffer::new(desc.clone());
+        for (i, row) in sources.iter().enumerate() {
+            good.absorb(&meta(i as u16), Bytes::from(row.clone())).unwrap();
+        }
+        assert!(good.verify_against_challenge(&fp).is_ok());
+
+        // A consumer holding a polluted packet (chosen before r was known)
+        // fails — the fresh challenge catches it.
+        let mut bad = GenerationBuffer::new(desc);
+        bad.absorb(&meta(0), Bytes::from_static(&[0xAA, 0xBB])).unwrap();
+        assert_eq!(
+            bad.verify_against_challenge(&fp),
+            Err(crate::recode::DecodeError::FingerprintFailed)
+        );
     }
 
     #[tokio::test]
