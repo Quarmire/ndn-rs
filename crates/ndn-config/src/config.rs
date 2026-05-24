@@ -866,6 +866,12 @@ pub struct CsConfig {
     pub shards: Option<usize>,
     #[serde(default = "default_admission_policy")]
     pub admission_policy: String,
+    /// Caching of **unsolicited** Data (Data with no matching PIT entry).
+    /// NFD-compatible tokens: `drop-all` (default), `admit-local`,
+    /// `admit-network`, `admit-all`. `admit-network` is the choice for a
+    /// broadcast/ad-hoc bearer where overhearing peers' Data is the point.
+    #[serde(default = "default_unsolicited_policy")]
+    pub unsolicited_policy: String,
 }
 
 fn default_cs_variant() -> String {
@@ -877,6 +883,9 @@ fn default_cs_capacity_mb() -> usize {
 fn default_admission_policy() -> String {
     "default".to_string()
 }
+fn default_unsolicited_policy() -> String {
+    "drop-all".to_string()
+}
 
 impl Default for CsConfig {
     fn default() -> Self {
@@ -885,6 +894,7 @@ impl Default for CsConfig {
             capacity_mb: default_cs_capacity_mb(),
             shards: None,
             admission_policy: default_admission_policy(),
+            unsolicited_policy: default_unsolicited_policy(),
         }
     }
 }
