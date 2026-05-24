@@ -84,11 +84,72 @@ pub async fn run_face_listener(path: &str, engine: ForwarderEngine, cancel: Canc
 /// are demuxed by the listener and injected directly into the pipeline,
 /// since the face's own `recv()` would race the listener for the same
 /// socket.
+/// Resolve the configured `rx_sockets` knob to an actual socket count:
+/// `0` → auto (min(num_cpus, 4)); otherwise the configured value. Clamped to
+/// 1 on platforms without `SO_REUSEPORT` flow-balancing.
+fn resolve_rx_sockets(rx_sockets: usize) -> usize {
+    #[cfg(unix)]
+    {
+        if rx_sockets == 0 {
+            let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+            cpus.clamp(1, 4)
+        } else {
+            rx_sockets
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = rx_sockets;
+        1
+    }
+}
+
+/// Run the UDP listener for `bind_addr`. With `rx_sockets > 1` (Linux/BSD),
+/// opens that many `SO_REUSEPORT` sockets — each with its own reader task — so
+/// the kernel spreads inbound flows across cores. Falls back to one socket
+/// otherwise.
 pub async fn run_udp_listener(
     bind_addr: std::net::SocketAddr,
     engine: ForwarderEngine,
     cancel: CancellationToken,
+    rx_sockets: usize,
 ) {
+    let n = resolve_rx_sockets(rx_sockets);
+
+    if n > 1 {
+        #[cfg(unix)]
+        {
+            let mut started = 0;
+            for _ in 0..n {
+                match ndn_face_native::net::sockopt::bind_reuseport_udp(bind_addr) {
+                    Ok(std_sock) => {
+                        if let Err(e) = std_sock.set_nonblocking(true) {
+                            tracing::warn!(target: "face.udp", error=%e, "udp-listener: set_nonblocking failed");
+                            continue;
+                        }
+                        match tokio::net::UdpSocket::from_std(std_sock) {
+                            Ok(tok) => {
+                                let eng = engine.clone();
+                                let c = cancel.child_token();
+                                tokio::spawn(async move { udp_rx_loop(Arc::new(tok), eng, c).await });
+                                started += 1;
+                            }
+                            Err(e) => tracing::warn!(target: "face.udp", error=%e, "udp-listener: from_std failed"),
+                        }
+                    }
+                    Err(e) => tracing::warn!(target: "face.udp", addr=%bind_addr, error=%e, "udp-listener: SO_REUSEPORT bind failed"),
+                }
+            }
+            if started > 0 {
+                tracing::info!(target: "face.udp", addr=%bind_addr, sockets=started, "UDP listener ready (SO_REUSEPORT RX sharding)");
+                cancel.cancelled().await;
+                return;
+            }
+            tracing::warn!(target: "face.udp", "udp-listener: no SO_REUSEPORT sockets opened, falling back to single socket");
+        }
+    }
+
+    // Single-socket path.
     let socket = match tokio::net::UdpSocket::bind(bind_addr).await {
         Ok(s) => {
             // Default OS buffer (~212 KB on Linux) is too small for
@@ -101,10 +162,17 @@ pub async fn run_udp_listener(
             return;
         }
     };
+    tracing::info!(target: "face.udp", addr=%socket.local_addr().unwrap_or(bind_addr), "UDP listener ready");
+    udp_rx_loop(socket, engine, cancel).await;
+}
 
-    let local = socket.local_addr().unwrap_or(bind_addr);
-    tracing::info!(target: "face.udp", addr=%local, "UDP listener ready");
-
+/// One UDP receive loop: demux datagrams by source address into send-only
+/// faces and inject into the engine. One of these runs per listener socket.
+async fn udp_rx_loop(
+    socket: Arc<tokio::net::UdpSocket>,
+    engine: ForwarderEngine,
+    cancel: CancellationToken,
+) {
     // Dedupe faces by (IP, port). Replies go to the datagram's source
     // address so consumer apps on ephemeral ports — not port 6363 —
     // still receive the Data.

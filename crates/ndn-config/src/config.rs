@@ -1118,6 +1118,18 @@ pub struct UdpFaceSystemConfig {
     /// Default `["lo"]`.
     #[serde(default = "default_udp_iface_blacklist")]
     pub blacklist: Vec<String>,
+    /// Number of `SO_REUSEPORT` listener sockets per UDP bind. Each gets its
+    /// own reader task, and the kernel load-balances inbound flows across them
+    /// (Linux per-4-tuple hash), so multi-flow wire RX scales across cores
+    /// instead of serialising on one. `0` = auto (min(num_cpus, 4)); `1` =
+    /// single socket (current behaviour). Linux/BSD only; elsewhere clamped
+    /// to 1. See testbed/bench/multiflow_wire.sh.
+    #[serde(default = "default_udp_rx_sockets")]
+    pub rx_sockets: usize,
+}
+
+fn default_udp_rx_sockets() -> usize {
+    1
 }
 
 impl Default for UdpFaceSystemConfig {
@@ -1127,6 +1139,7 @@ impl Default for UdpFaceSystemConfig {
             ad_hoc: false,
             whitelist: default_iface_whitelist(),
             blacklist: default_udp_iface_blacklist(),
+            rx_sockets: default_udp_rx_sockets(),
         }
     }
 }
