@@ -65,7 +65,8 @@
 //! - `cope_face` — F3 `CopeBroadcastLink` + per-neighbor `CopeMemberFace`
 //!   (next-hop feed) + reception-report frames (feature `f3-link-face`).
 //! - `cope_mesh` — `CopeMesh`: auto-install member faces per neighbor on an
-//!   engine + report/flush ticker (feature `f3-link-mesh`).
+//!   engine + report/flush ticker + `spawn_neighbor_sync` routing-fed
+//!   reconciliation (feature `f3-link-mesh`).
 //!
 //! Design and wire spec: `docs/notes/coding-design-2026-05-22.md`,
 //! `docs/notes/coding-wire-spec-2026-05-22.md`, the F2 wire spec

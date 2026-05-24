@@ -145,6 +145,58 @@ impl<T: Transport> CopeMesh<T> {
         &self.link
     }
 
+    /// The mesh's cancellation token (fires on drop) — pass it to
+    /// [`spawn_neighbor_sync`](Self::spawn_neighbor_sync) so the driver stops
+    /// with the mesh.
+    pub fn cancel_token(&self) -> CancellationToken {
+        self.cancel.clone()
+    }
+
+    /// Drive the neighbor set from a routing protocol's neighbor-change stream:
+    /// spawn a task that calls [`sync_neighbors`](Self::sync_neighbors) every
+    /// time `rx` reports a new active-neighbor-id set. This is the decoupled
+    /// hook — `ndn-coding` stays independent of any routing crate. The adapter
+    /// that maps a concrete protocol's events to this `watch` is a few lines in
+    /// the integration layer, e.g. for NLSR:
+    ///
+    /// ```ignore
+    /// // hello: ndn_routing …::hello::HelloProtocol
+    /// let mut adj = hello.adjacency_watch(); // watch<AdjacencySnapshot>
+    /// let (tx, rx) = tokio::sync::watch::channel(Vec::new());
+    /// CopeMesh::spawn_neighbor_sync(Arc::clone(&mesh), rx, mesh_lock.cancel_token());
+    /// tokio::spawn(async move {
+    ///     while adj.changed().await.is_ok() {
+    ///         let ids = adj.borrow().neighbors.iter()
+    ///             .filter(|(_, s)| matches!(s, NeighborState::Active))
+    ///             .filter_map(|(n, _)| name_to_neighbor_id(n))
+    ///             .collect();
+    ///         let _ = tx.send(ids);
+    ///     }
+    /// });
+    /// ```
+    pub fn spawn_neighbor_sync(
+        mesh: Arc<tokio::sync::Mutex<Self>>,
+        mut rx: tokio::sync::watch::Receiver<Vec<NeighborId>>,
+        cancel: CancellationToken,
+    ) where
+        T: 'static,
+    {
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    changed = rx.changed() => {
+                        if changed.is_err() {
+                            break; // routing stream closed
+                        }
+                        let desired = rx.borrow_and_update().clone();
+                        mesh.lock().await.sync_neighbors(&desired);
+                    }
+                }
+            }
+        });
+    }
+
     /// Start the background ticker: every `interval`, broadcast this node's
     /// reception report (`announce`) and flush coded frames. Stops on drop.
     pub fn start_ticker(&self, interval: Duration) {

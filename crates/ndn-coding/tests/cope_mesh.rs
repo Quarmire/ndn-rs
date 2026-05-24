@@ -121,3 +121,51 @@ async fn mesh_tracks_routing_neighbor_changes() {
     drop(engine);
     shutdown.shutdown().await;
 }
+
+/// The neighbor-sync driver reconciles the mesh from a routing protocol's
+/// neighbor-change stream (a `watch<Vec<NeighborId>>` an adapter feeds from,
+/// e.g., NLSR's `adjacency_watch`). ndn-coding stays decoupled from any
+/// routing crate; here we drive the watch directly to model routing updates.
+#[tokio::test]
+async fn neighbor_sync_driver_tracks_routing_stream() {
+    let (engine, shutdown) = engine().await;
+    let n1 = engine.faces().alloc_id().0;
+    let n2 = engine.faces().alloc_id().0;
+    let n3 = engine.faces().alloc_id().0;
+    let capture = Capture {
+        id: engine.faces().alloc_id(),
+        sent: Arc::new(Mutex::new(Vec::new())),
+    };
+    let mesh = CopeMesh::install(&engine, capture, 9999, &[]); // start empty
+    let cancel = mesh.cancel_token();
+    let mesh = Arc::new(tokio::sync::Mutex::new(mesh));
+
+    let (tx, rx) = tokio::sync::watch::channel(Vec::<u64>::new());
+    CopeMesh::spawn_neighbor_sync(Arc::clone(&mesh), rx, cancel);
+
+    // Routing reports {n1, n2} active.
+    tx.send(vec![n1, n2]).unwrap();
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    {
+        let g = mesh.lock().await;
+        assert_eq!(g.neighbor_face(n1), Some(FaceId(n1)));
+        assert_eq!(g.neighbor_face(n2), Some(FaceId(n2)));
+    }
+    assert!(engine.faces().get(FaceId(n1)).is_some());
+
+    // Routing update: n1 drops, n3 appears.
+    tx.send(vec![n2, n3]).unwrap();
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    {
+        let g = mesh.lock().await;
+        assert_eq!(g.neighbor_face(n1), None, "dropped neighbor removed");
+        assert_eq!(g.neighbor_face(n3), Some(FaceId(n3)), "new neighbor installed");
+    }
+    assert!(engine.faces().get(FaceId(n1)).is_none());
+    assert!(engine.faces().get(FaceId(n3)).is_some());
+
+    drop(tx); // routing stream closes → driver task exits
+    drop(mesh);
+    drop(engine);
+    shutdown.shutdown().await;
+}

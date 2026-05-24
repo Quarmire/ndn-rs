@@ -27,7 +27,9 @@ use tracing::warn;
 use ndn_engine::ForwarderEngine;
 use ndn_packet::encode::DataBuilder;
 use ndn_packet::{Data, Interest, Name};
-use ndn_security::{Ed25519Verifier, Signer, TrustSchema, VerifyOutcome};
+use ndn_security::{
+    Ed25519Verifier, Signer, TrustSchema, ValidationResult, Validator, VerifyOutcome,
+};
 use ndn_transport::{FaceError, FaceId, FaceKind, FacePersistency, Transport};
 
 use crate::recode::{
@@ -387,6 +389,36 @@ pub fn verify_delegated_recoder_schema(
     )
 }
 
+/// Verify a delegated-recoded coded Data by **resolving its certificate chain
+/// to a trust anchor** (doctrine §3b) — the strongest delegated check. The
+/// recoded Data's signer key is resolved (KeyLocator → cert cache / fetcher),
+/// its certificate chain is walked to a configured trust anchor, and the
+/// producer `TrustSchema` is enforced, all by the engine's [`Validator`]
+/// (`validate_chain`). The descriptor's `delegation` namespace is applied as a
+/// cheap pre-check before the (async, possibly cert-fetching) validation.
+///
+/// This supersedes [`verify_delegated_recoder`] (namespace + a supplied public
+/// key) and [`verify_delegated_recoder_schema`] (schema gate + one signature):
+/// here the recoder's authority is anchored by a real certificate chain, with
+/// no public key supplied out of band. Multi-hop chain walking itself is
+/// covered by `ndn-security`'s validator tests; this wires recoded Data into
+/// it.
+pub async fn verify_delegated_recoder_chained(
+    data: &Data,
+    descriptor: &GenerationDescriptor,
+    validator: &Validator,
+) -> bool {
+    if let Some(deleg) = &descriptor.delegation {
+        let Some(key_name) = data.sig_info().and_then(|s| s.key_locator_name()) else {
+            return false;
+        };
+        if !key_name.has_prefix(deleg) {
+            return false; // signer outside the descriptor's recoder namespace
+        }
+    }
+    matches!(validator.validate_chain(data).await, ValidationResult::Valid(_))
+}
+
 /// Issue a producer-signed [`RecodeToken`] authorizing `recoder` (a key or
 /// namespace) to recode `generation_id` under `RecodePolicy::token-required`
 /// (wire spec §3.2). `producer` must be the generation's producer key.
@@ -656,6 +688,71 @@ mod tests {
             SchemaRule::parse("/alice/clip/_gen/<id>/_req/<j> => /other/recoders/<k>").unwrap(),
         );
         assert!(!verify_delegated_recoder_schema(&data, &other, &pk));
+    }
+
+    #[tokio::test]
+    async fn chained_verify_resolves_cert_to_anchor() {
+        use ndn_security::{Certificate, TrustSchema, ValidationResult, Validator};
+        use std::sync::Arc as StdArc;
+
+        let object: Name = "/alice/clip".parse().unwrap();
+        let deleg: Name = "/site-a/recoders".parse().unwrap();
+        let (desc, sources) = descriptor(&object, RecodePolicy::Delegated, Some(deleg));
+
+        // Producer/anchor key, and a recoder key whose cert the anchor signs.
+        let anchor_name: Name = "/alice/KEY/anchor".parse().unwrap();
+        let anchor = Ed25519Signer::from_seed(&[1u8; 32], anchor_name.clone());
+        let anchor_pk = anchor.public_key_bytes();
+        let key_name: Name = "/site-a/recoders/k1/KEY/1".parse().unwrap();
+        let recoder = Ed25519Signer::from_seed(&[2u8; 32], key_name.clone());
+        let recoder_pk = recoder.public_key_bytes();
+
+        // Recoder certificate (Data named by the key, content = pubkey) signed
+        // by the anchor — the intermediate the chain walks through.
+        let cert_wire = DataBuilder::new(key_name.clone(), &recoder_pk).sign_sync(
+            ndn_packet::SignatureType::SignatureEd25519,
+            Some(&anchor_name),
+            |region| anchor.sign_sync(region).expect("anchor signs cert"),
+        );
+        let cert = Certificate::decode(&Data::decode(cert_wire).unwrap()).unwrap();
+
+        // The recoder mints a coded Data signed by its key.
+        let recoder_arc: Arc<dyn Signer> = Arc::new(recoder);
+        let state = RecoderState::new();
+        seed(&state, &object, &desc, &sources).await;
+        let wire = state
+            .mint(&object, desc.generation_id, 0, Some(&recoder_arc))
+            .await
+            .unwrap();
+        let data = Data::decode(wire).unwrap();
+
+        // Validator: anchor trusted, recoder cert in cache → chain resolves.
+        let validator = Validator::new(TrustSchema::accept_all());
+        validator.add_trust_anchor(Certificate {
+            name: StdArc::new(anchor_name),
+            public_key: Bytes::copy_from_slice(&anchor_pk),
+            valid_from: 0,
+            valid_until: u64::MAX,
+            issuer: None,
+            signed_region: None,
+            sig_value: None,
+            sig_type: ndn_packet::SignatureType::SignatureEd25519,
+        });
+        validator.cert_cache().insert(cert);
+        assert!(
+            matches!(validator.validate_chain(&data).await, ValidationResult::Valid(_)),
+            "sanity: chain resolves"
+        );
+        assert!(verify_delegated_recoder_chained(&data, &desc, &validator).await);
+
+        // Descriptor delegation mismatch → rejected before validation.
+        let mut bad = desc.clone();
+        bad.delegation = Some("/other/recoders".parse().unwrap());
+        assert!(!verify_delegated_recoder_chained(&data, &bad, &validator).await);
+
+        // No anchor / cert → chain unresolved → rejected.
+        let empty = Validator::new(TrustSchema::accept_all());
+        assert!(!verify_delegated_recoder_chained(&data, &desc, &empty).await);
     }
 
     #[tokio::test]
