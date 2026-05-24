@@ -101,7 +101,13 @@ the TLV codes are provisional pending F2.
 ## What's not here
 
 - **F2 — in-network RLNC recoding.** A recoded packet is a new linear
-  combination the producer never signed, so authenticating it end-to-end
-  needs a trust-model decision that has not been made. Gated behind the
-  `f2-recode` feature; not implemented.
-- **F3 — link-layer (inter-flow) coding.** Belongs in a face/link driver.
+  combination the producer never signed. Authenticating it is settled in
+  the F2 trust-model doctrine (verify recovered sources against a
+  producer-signed generation descriptor; optional delegated-recoder
+  signing inside a trust domain). Implemented behind the `f2-recode` and
+  `f2-recode-face` features — **off by default**, with provisional wire
+  codes — so it does not affect the default build.
+- **F3 — link-layer (inter-flow) coding.** COPE-style XOR of frames for
+  different next-hops on a shared broadcast medium, recovered via overhearing.
+  The coding core ships behind the `f3-link` feature (off by default); wiring
+  it into a broadcast face is a face/link-driver concern.
