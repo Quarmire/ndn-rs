@@ -7,6 +7,9 @@
 /// MurmurHash3_x86_32 — the hash family used by PSync's IBF.
 pub mod murmur3;
 
+/// Runtime-portable spawn/sleep/Instant for the driver loops (native + wasm32).
+mod rt;
+
 pub mod protocol;
 
 pub mod svs;

@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use bytes::Bytes;
 use flate2::Compression;
@@ -28,6 +28,7 @@ use ndn_packet::Name;
 use ndn_packet::encode::{DataBuilder, InterestBuilder};
 
 use crate::murmur3::{N_HASHCHECK, murmur3_x86_32};
+use crate::rt;
 use crate::protocol::{SyncHandle, SyncUpdate};
 use crate::psync::{Ibf, PSyncNode};
 
@@ -86,7 +87,7 @@ pub fn join_psync_group(
     let (publish_tx, publish_rx) = mpsc::channel(64);
 
     let task_cancel = cancel.clone();
-    tokio::spawn(async move {
+    rt::spawn(async move {
         psync_task(
             group,
             send,
@@ -121,7 +122,7 @@ async fn psync_task(
         tokio::select! {
             _ = cancel.cancelled() => break,
 
-            _ = tokio::time::sleep(interval) => {
+            _ = rt::sleep(interval) => {
                 send_sync_interest(&group, &node, &send).await;
             }
 
@@ -303,8 +304,9 @@ fn encode_sync_data_names(interest_name: &Name, names: &[Name]) -> Bytes {
     let content = zlib_compress(&psync_content);
 
     // Data name: <interest_name>/<version(µs)>/<seg=0>
-    let version = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
+    // web_time::SystemTime delegates to std natively; reads Date.now() on wasm32.
+    let version = web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_micros() as u64;
     let data_name = interest_name

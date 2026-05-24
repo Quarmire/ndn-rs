@@ -8,17 +8,32 @@ license.workspace = true
 [package.metadata.scope]
 classification = "spec"
 
+# Protocol logic is target-agnostic; only the driver loops' spawn/timer differ
+# (see src/rt.rs). The crate builds for wasm32 so SVS/PSync run in the browser.
 [dependencies]
-ndn-packet = { workspace = true, features = ["std"] }
 ndn-tlv    = { workspace = true, features = ["std"] }
 bytes         = { workspace = true, features = ["std"] }
-tokio      = { workspace = true, features = ["sync", "time", "rt", "macros"] }
 tokio-util = { workspace = true }
 thiserror  = { workspace = true }
 fastrand   = "2"
-# zlib compression for PSync IBLT wire encoding (PSync/detail/util.cpp CompressionScheme::ZLIB)
+# zlib compression for PSync IBLT wire encoding (PSync/detail/util.cpp CompressionScheme::ZLIB).
+# Default `miniz_oxide` backend is pure-Rust → wasm-safe.
 flate2     = "1"
 tracing    = { workspace = true }
+# Instant/SystemTime that work on both targets (std::time::*::now() panics on wasm32).
+web-time   = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ndn-packet = { workspace = true, features = ["std"] }
+tokio      = { workspace = true, features = ["sync", "time", "rt", "macros"] }
+
+# wasm32: tokio without `time` (its timer wheel panics in the browser); the
+# driver loops use gloo-timers + spawn_local via src/rt.rs instead.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+ndn-packet           = { workspace = true, features = ["std-wasm"] }
+tokio                = { workspace = true, features = ["sync", "rt", "macros"] }
+gloo-timers          = { version = "0.3", features = ["futures"] }
+wasm-bindgen-futures = "0.4"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }

@@ -25,8 +25,9 @@ use std::time::Duration;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use tokio::sync::mpsc;
-use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
+
+use crate::rt::{self, Instant};
 
 use ndn_packet::Name;
 use ndn_packet::encode::InterestBuilder;
@@ -76,7 +77,7 @@ where
                 if attempt == policy.max_retries {
                     return Err(e);
                 }
-                tokio::time::sleep(delay).await;
+                rt::sleep(delay).await;
                 delay = Duration::from_secs_f64(
                     (delay.as_secs_f64() * policy.backoff_factor).min(60.0),
                 );
@@ -123,7 +124,7 @@ pub fn join_svs_group(
     let (publish_tx, publish_rx) = mpsc::channel(64);
 
     let task_cancel = cancel.clone();
-    tokio::spawn(async move {
+    rt::spawn(async move {
         svs_task(
             group,
             local_name,
@@ -162,7 +163,9 @@ async fn svs_task(
         tokio::select! {
             _ = cancel.cancelled() => break,
 
-            _ = tokio::time::sleep_until(next_send) => {
+            // Portable equivalent of `sleep_until(next_send)` — recomputed each
+            // loop iteration, so a reset of `next_send` reschedules correctly.
+            _ = rt::sleep(next_send.saturating_duration_since(Instant::now())) => {
                 send_sync_interest(&group, &node, &send, current_mapping.clone()).await;
                 next_send = Instant::now() + jitter_interval(&config);
             }
