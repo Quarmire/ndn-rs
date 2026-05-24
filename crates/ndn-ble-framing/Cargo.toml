@@ -1,0 +1,15 @@
+[package]
+name = "ndn-ble-framing"
+description = "Shared BLE wire-framing codec for ndn-rs — NDNLPv2 and the NDNts/esp8266ndn 1-byte fragmentation header, with single- and per-sender reassembly"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+classification = "extension"
+
+[dependencies]
+# wasm-compatible (no tokio, no native-only deps) so the Web Bluetooth crate
+# can share it with the native faces.
+ndn-packet = { workspace = true, features = ["std"] }
+bytes      = { workspace = true, features = ["std"] }
