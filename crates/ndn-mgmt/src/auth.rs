@@ -99,6 +99,16 @@ pub(crate) fn is_public_dataset_verb(module: &[u8], verb: &[u8]) -> bool {
     {
         return true;
     }
+    // `compute/list` is read-only capability introspection (the in-network
+    // function table) with no secrets — symmetric with the canonical `*/list`
+    // datasets and NFD's unsigned status reads, and useful for discovering
+    // which named functions a node offers (invocation is separately gated).
+    // NOTE: `coding/list` and `rate-limit/list` stay signed — those are
+    // operational/defensive policy config (e.g. per-prefix rate thresholds),
+    // not discovery, and disclosing them aids an attacker.
+    if module == m::COMPUTE && verb == v::LIST {
+        return true;
+    }
     false
 }
 
@@ -615,6 +625,29 @@ mod e01_tests {
                 String::from_utf8_lossy(ext_mod)
             );
         }
+    }
+
+    /// `compute/list` is a public read-only introspection dataset (no secrets,
+    /// useful for function discovery), but the operational/defensive policy
+    /// lists `coding/list` and `rate-limit/list` stay signed — disclosing rate
+    /// thresholds aids an attacker and is not discovery info.
+    #[test]
+    fn compute_list_public_but_policy_lists_signed() {
+        use ndn_config::nfd_command::{module as m, verb as v};
+        assert!(
+            is_public_dataset_verb(m::COMPUTE, v::LIST),
+            "compute/list must be a public read"
+        );
+        assert!(
+            !is_public_dataset_verb(m::RATE_LIMIT, v::LIST),
+            "rate-limit/list must stay signed (defensive-config disclosure)"
+        );
+        assert!(
+            !is_public_dataset_verb(m::CODING, v::LIST),
+            "coding/list must stay signed (operational policy, not discovery)"
+        );
+        // And a write verb on compute is never a public read.
+        assert!(!is_public_dataset_verb(m::COMPUTE, v::REGISTER));
     }
 
     /// Extended modules always require signed commands even when the

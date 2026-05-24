@@ -537,8 +537,9 @@ pub async fn run_ndn_mgmt_handler(
                 }
             }
         } else {
-            // `*/list` dataset verbs on NFD-canonical modules are public
-            // read-only queries; ndn-rs-only modules always require signing.
+            // Read-only dataset queries (canonical `*/list`, the security
+            // inspection verbs, and `compute/list`) are public; other ndn-rs
+            // extension verbs require signing. See `is_public_dataset_verb`.
             let req = if is_public_dataset_verb(&parsed.module, &parsed.verb) {
                 false
             } else {
