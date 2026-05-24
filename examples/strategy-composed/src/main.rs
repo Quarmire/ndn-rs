@@ -17,7 +17,7 @@
 //!
 //! - [`StrategyFilter`] trait: post-processes forwarding actions
 //! - [`ComposedStrategy`]: wraps an inner strategy + filter chain
-//! - Filters inspect [`StrategyContext::extensions`] for cross-layer data
+//! - Filters read [`StrategyContext::signals`] for cross-layer data (RSSI, RTT)
 //! - If a filter removes all faces from a `Forward`, the action is dropped
 //!   and the strategy falls through to the next action (e.g. `Nack`)
 
@@ -30,9 +30,7 @@ use ndn_engine::pipeline::ForwardingAction;
 use ndn_engine::stages::ErasedStrategy;
 use ndn_engine::{ComposedStrategy, EngineBuilder, EngineConfig};
 use ndn_packet::Name;
-use ndn_strategy::{
-    BestRouteStrategy, LinkQualitySnapshot, RssiFilter, StrategyContext, StrategyFilter,
-};
+use ndn_strategy::{BestRouteStrategy, RssiFilter, StrategyContext, StrategyFilter};
 use ndn_transport::FaceId;
 
 // ─── Custom filter: LatencyFilter ────────────────────────────────────────────
@@ -52,11 +50,6 @@ impl StrategyFilter for LatencyFilter {
         ctx: &StrategyContext,
         actions: SmallVec<[ForwardingAction; 2]>,
     ) -> SmallVec<[ForwardingAction; 2]> {
-        let snapshot = match ctx.extensions.get::<LinkQualitySnapshot>() {
-            Some(s) => s,
-            None => return actions, // no cross-layer data — pass through
-        };
-
         actions
             .into_iter()
             .filter_map(|action| match action {
@@ -64,10 +57,11 @@ impl StrategyFilter for LatencyFilter {
                     let filtered: SmallVec<[FaceId; 4]> = faces
                         .into_iter()
                         .filter(|fid| {
-                            snapshot
-                                .for_face(*fid)
-                                .and_then(|lq| lq.observed_rtt_ms)
-                                .is_none_or(|rtt| rtt <= self.max_rtt_ms)
+                            // Unknown RTT passes; otherwise keep faces within budget.
+                            ctx.signals
+                                .link(*fid)
+                                .and_then(|l| l.observed_rtt_ms)
+                                .is_none_or(|rtt| f64::from(rtt) <= self.max_rtt_ms)
                         })
                         .collect();
                     if filtered.is_empty() {
@@ -120,9 +114,9 @@ async fn main() -> Result<()> {
     // 3. Pass the result through LatencyFilter (removes high-latency faces)
     // 4. If all faces are filtered out, fall through to Nack
     //
-    // Cross-layer data (RSSI, RTT) comes from ContextEnrichers registered
-    // via EngineBuilder::context_enricher(). See the `context-enricher`
-    // example for how to implement one.
+    // Cross-layer data (RSSI, RTT) is pushed by signal sources registered
+    // via EngineBuilder::signal_source() and read through ctx.signals.
+    // See `ndn-signal-sources` and docs/signals.md.
 
     shutdown.shutdown().await;
     Ok(())

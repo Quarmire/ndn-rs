@@ -1,16 +1,20 @@
 use ndn_strategy::FibEntry;
 use ndn_transport::AnyMap;
 
-/// Populates cross-layer data in the strategy context extensions.
-/// Implementations pull from their data source (RadioTable, GPS, battery, …)
-/// and insert a DTO into the `AnyMap`. `StrategyStage` calls every enricher
-/// before each strategy invocation.
+/// Populates open-ended cross-layer data in the strategy context extensions.
+/// `StrategyStage` calls every enricher before each strategy invocation.
 ///
-/// # Adding a new data source
+/// Note: for known cross-layer signals (RSSI, SNR, GPS, …) prefer the typed
+/// signal subsystem — implement a `SignalSource` (`ndn-signal-sources`) and
+/// read `ctx.signals`. Enrichers are for experimental / one-off DTOs that
+/// don't fit the [`ndn_signals_core`] taxonomy.
 ///
-/// 1. Define a DTO in `ndn-strategy::cross_layer`.
+/// # Adding an experimental DTO
+///
+/// 1. Define a DTO type.
 /// 2. Implement `ContextEnricher` and call `extensions.insert(dto)`.
-/// 3. Register via `EngineBuilder::context_enricher(...)`.
+/// 3. Register via `EngineBuilder::context_enricher(...)`; read it with
+///    `ctx.extensions.get::<Dto>()` in your strategy/filter.
 #[cfg_attr(not(feature = "experimental-instrument"), doc(hidden))]
 pub trait ContextEnricher: Send + Sync + 'static {
     fn name(&self) -> &str;

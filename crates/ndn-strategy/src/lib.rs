@@ -7,7 +7,6 @@
 
 pub mod best_route;
 pub mod context;
-pub mod cross_layer;
 pub mod erased;
 pub mod filter;
 pub mod filters;
@@ -20,7 +19,6 @@ pub mod strategy;
 
 pub use best_route::BestRouteStrategy;
 pub use context::{FibEntry, FibNexthop, StrategyContext};
-pub use cross_layer::{FaceLinkQuality, LinkQualitySnapshot};
 pub use erased::ErasedStrategy;
 pub use filter::StrategyFilter;
 pub use filters::RssiFilter;
