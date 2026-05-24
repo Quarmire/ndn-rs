@@ -233,6 +233,10 @@ impl PitCheckStage {
     }
 }
 
+/// A CanBePrefix in-record drained during the prefix-walk: (face id, LP PIT
+/// token to echo, trace ids for fan-out instrumentation).
+type DrainedInRecord = (u64, Option<bytes::Bytes>, Vec<ndn_packet::lp::TraceId>);
+
 enum PersistentMatchResult {
     /// Persistent entry: faces collected, per-subscriber counter decremented.
     Matched {
@@ -253,19 +257,31 @@ pub struct PitMatchStage {
 
 impl PitMatchStage {
     pub fn process(&self, mut ctx: PacketContext) -> Action {
-        let data = match &ctx.packet {
-            DecodedPacket::Data(d) => d,
-            _ => return Action::Continue(ctx),
+        if !matches!(&ctx.packet, DecodedPacket::Data(_)) {
+            return Action::Continue(ctx);
+        }
+        // Owned name handle so we don't hold an immutable borrow of
+        // `ctx.packet` across the later mutation of `ctx.out_faces`.
+        let data_name = match &ctx.packet {
+            DecodedPacket::Data(d) => d.name.clone(),
+            _ => unreachable!(),
         };
 
-        let hashes = ctx
-            .name_hashes
-            .get_or_insert_with(|| NameHashes::compute(&data.name));
+        // Materialize every name hash we need up front, then release the
+        // borrow of `ctx.name_hashes` so the tail is free to mutate `ctx`.
+        // `prefix_hashes` is the longest-first list of proper-prefix hashes
+        // for the CanBePrefix walk.
+        let (full_hash, prefix_hashes) = {
+            let hashes = ctx
+                .name_hashes
+                .get_or_insert_with(|| NameHashes::compute(&data_name));
+            let n = hashes.len();
+            let prefixes: SmallVec<[u64; 8]> =
+                (1..n).rev().map(|pl| hashes.prefix_hash(pl)).collect();
+            (hashes.full_hash(), prefixes)
+        };
 
         // PIT key is Name(+ForwardingHint); selectors live on each in-record.
-        // Data does not know which regime its PIT entry uses; probe the
-        // PersistentAttach discriminator first (hot path), then Classical.
-        let full_hash = hashes.full_hash();
         let token =
             PitToken::from_name_hash_keyed(full_hash, None, PitKeyDiscriminator::PersistentAttach);
         let token_classical =
@@ -276,7 +292,7 @@ impl PitMatchStage {
         // full-name Data) must still match; compute the stripped fallback.
         let stripped_token = {
             use ndn_packet::tlv_type::{IMPLICIT_SHA256, PARAMETERS_SHA256};
-            let comps = data.name.components();
+            let comps = data_name.components();
             let last_typ = comps.last().map(|c| c.typ);
             if (last_typ == Some(PARAMETERS_SHA256) || last_typ == Some(IMPLICIT_SHA256))
                 && comps.len() > 1
@@ -290,265 +306,206 @@ impl PitMatchStage {
             }
         };
 
-        // Per-subscriber credit: each in-record owns its own pool. Records
-        // whose credit hits zero are pruned; the entry is reaped when no
-        // persistent in-records remain (or the entry-level legacy counter
-        // hits zero for entries that have not migrated yet).
-        let persistent_probe = |tok: &PitToken| {
-            self.pit.with_entry_mut(tok, |entry| {
-                let any_per_record = entry.in_records.iter().any(|r| r.persistent.is_some());
-                if !any_per_record && entry.persistent.is_none() {
-                    return PersistentMatchResult::Classical;
-                }
+        // findAllDataMatches (NFD forwarder.cpp:315): one Data can satisfy
+        // *several* PIT entries at once — the exact-name entry under either
+        // discriminator, the PSDC/digest-stripped fallback, and any CanBePrefix
+        // entry at a shorter prefix. Accumulate the union of their downstream
+        // faces, deduped by face id, rather than returning on the first hit.
+        let mut faces: SmallVec<[FaceId; 4]> = SmallVec::new();
+        let mut tokens: SmallVec<[Option<bytes::Bytes>; 4]> = SmallVec::new();
+        let mut seen: SmallVec<[u64; 8]> = SmallVec::new();
+        let mut fan_out: Vec<(u64, Vec<ndn_packet::lp::TraceId>)> = Vec::new();
 
-                let mut faces: SmallVec<[FaceId; 4]> = SmallVec::new();
-                let mut lp_tokens: SmallVec<[Option<bytes::Bytes>; 4]> = SmallVec::new();
-                let mut exhausted: SmallVec<[usize; 4]> = SmallVec::new();
-
-                for (i, r) in entry.in_records.iter_mut().enumerate() {
-                    if let Some(ps) = r.persistent.as_mut() {
-                        if ps.data_count_remaining > 0 {
-                            ps.data_count_remaining -= 1;
-                            faces.push(FaceId(r.face_id));
-                            lp_tokens.push(r.lp_pit_token.clone());
-                            if ps.data_count_remaining == 0 {
-                                exhausted.push(i);
-                            }
-                        }
-                    } else if entry.persistent.is_some() {
-                        faces.push(FaceId(r.face_id));
-                        lp_tokens.push(r.lp_pit_token.clone());
-                    }
-                }
-
-                if let Some(p) = entry.persistent.as_mut() {
-                    p.data_count_remaining = p.data_count_remaining.saturating_sub(1);
-                }
-
-                for &idx in exhausted.iter().rev() {
-                    entry.in_records.swap_remove(idx);
-                }
-
-                let no_persistent_left = !entry.in_records.iter().any(|r| r.persistent.is_some());
-                let entry_level_exhausted = entry
-                    .persistent
-                    .as_ref()
-                    .is_some_and(|p| p.data_count_remaining == 0);
-                let should_reap = if any_per_record {
-                    no_persistent_left
-                } else {
-                    entry_level_exhausted
-                };
-                PersistentMatchResult::Matched {
-                    faces,
-                    lp_tokens,
-                    should_reap,
-                }
-            })
-        };
-
-        // Probe PersistentAttach → Classical → stripped-name fallback.
-        let mut matched_token = token;
-        let mut probe = persistent_probe(&token);
-        if matches!(probe, None | Some(PersistentMatchResult::Classical)) {
-            let alt_probe = persistent_probe(&token_classical);
-            if alt_probe.is_some() {
-                matched_token = token_classical;
-                probe = alt_probe;
-            }
+        // Exact-name entries: every in-record matches regardless of CanBePrefix.
+        self.consume_entry(&token, false, &mut faces, &mut tokens, &mut seen, &mut fan_out);
+        self.consume_entry(
+            &token_classical,
+            false,
+            &mut faces,
+            &mut tokens,
+            &mut seen,
+            &mut fan_out,
+        );
+        if let Some(alt) = stripped_token.as_ref() {
+            self.consume_entry(alt, false, &mut faces, &mut tokens, &mut seen, &mut fan_out);
         }
-        if matches!(probe, None | Some(PersistentMatchResult::Classical))
-            && let Some(alt) = stripped_token
-        {
-            let alt_probe = persistent_probe(&alt);
-            if alt_probe.is_some() {
-                matched_token = alt;
-                probe = alt_probe;
+
+        // CanBePrefix walk: at each shorter prefix only CanBePrefix in-records
+        // participate.
+        for prefix_hash in prefix_hashes {
+            for disc in [
+                PitKeyDiscriminator::PersistentAttach,
+                PitKeyDiscriminator::Classical,
+            ] {
+                let tok = PitToken::from_name_hash_keyed(prefix_hash, None, disc);
+                self.consume_entry(&tok, true, &mut faces, &mut tokens, &mut seen, &mut fan_out);
             }
         }
 
-        if let Some(PersistentMatchResult::Matched {
-            faces,
-            lp_tokens,
-            should_reap,
-        }) = probe
-        {
-            if should_reap {
-                let _ = self.pit.remove(&matched_token);
+        if !faces.is_empty() {
+            if !fan_out.is_empty() {
+                crate::observability::fan_out::emit_data_fan_out(fan_out, &data_name.to_string());
             }
-            trace!(
-                target: t::FWD_PIT,
-                face=%ctx.face_id,
-                name=%data.name,
-                out_faces=?faces,
-                action="satisfy-persistent",
-                "pit op"
-            );
-            ctx.out_faces = faces;
-            ctx.out_pit_tokens = lp_tokens;
-            return Action::Continue(ctx);
-        }
-
-        // Classical remove-on-match: full-name token first, then PSDC-stripped
-        // so AppParameters Interests still match Data named with the PSDC.
-        let classical = self
-            .pit
-            .remove(&token)
-            .or_else(|| self.pit.remove(&token_classical))
-            .or_else(|| stripped_token.and_then(|alt| self.pit.remove(&alt)));
-        if let Some((_, entry)) = classical {
-            let faces: SmallVec<[FaceId; 4]> = entry.in_record_faces().map(FaceId).collect();
-            let tokens: SmallVec<[Option<bytes::Bytes>; 4]> = entry
-                .in_records
-                .iter()
-                .map(|r| r.lp_pit_token.clone())
-                .collect();
-            let fan_out_records: Vec<(u64, Vec<ndn_packet::lp::TraceId>)> = entry
-                .in_records
-                .iter()
-                .map(|r| (r.face_id, r.trace_ids.iter().copied().collect()))
-                .collect();
-            crate::observability::fan_out::emit_data_fan_out(
-                fan_out_records,
-                &data.name.to_string(),
-            );
-            trace!(target: t::FWD_PIT, face=%ctx.face_id, name=%data.name, out_faces=?faces, action="satisfy", "pit op");
+            trace!(target: t::FWD_PIT, face=%ctx.face_id, name=%data_name, out_faces=?faces, action="satisfy", "pit op");
             ctx.out_faces = faces;
             ctx.out_pit_tokens = tokens;
             return Action::Continue(ctx);
         }
 
-        // CanBePrefix: walk progressively shorter prefixes, probing both
-        // discriminators at each depth.
-        let n_comps = hashes.len();
-        for prefix_len in (1..n_comps).rev() {
-            let prefix_hash = hashes.prefix_hash(prefix_len);
-            let candidates = [
-                PitToken::from_name_hash_keyed(
-                    prefix_hash,
-                    None,
-                    PitKeyDiscriminator::PersistentAttach,
-                ),
-                PitToken::from_name_hash_keyed(prefix_hash, None, PitKeyDiscriminator::Classical),
-            ];
-            let token = match candidates.iter().find(|tok| {
-                self.pit
-                    .with_entry(tok, |e| {
-                        e.in_records.iter().any(|r| r.selector.can_be_prefix)
-                    })
-                    .unwrap_or(false)
-            }) {
-                Some(t) => *t,
-                None => continue,
-            };
-            let satisfies_any = true;
-            if !satisfies_any {
-                continue;
+        // No PIT entry matched. The Data is unsolicited: it is never forwarded
+        // (`out_faces` stays empty). Carry it through with the `unsolicited`
+        // flag set so the dispatcher can apply its `UnsolicitedDataPolicy`
+        // (drop by default, or opportunistically cache on a broadcast bearer).
+        trace!(target: t::FWD_PIT, face=%ctx.face_id, name=%data_name, "pit-match: unsolicited Data");
+        ctx.unsolicited = true;
+        Action::Continue(ctx)
+    }
+
+    /// Consume a single PIT entry identified by `token`, appending its
+    /// downstream faces + LP tokens to `faces`/`tokens` (deduped via `seen` by
+    /// face id). `cbp_only` restricts participation to CanBePrefix in-records —
+    /// the prefix-walk case — so exact-match subscribers at a shorter prefix
+    /// are left untouched. Handles per-subscriber persistent-credit decrement
+    /// and entry reaping. A no-op when no entry exists at `token`.
+    #[allow(clippy::too_many_arguments)]
+    fn consume_entry(
+        &self,
+        token: &PitToken,
+        cbp_only: bool,
+        faces: &mut SmallVec<[FaceId; 4]>,
+        tokens: &mut SmallVec<[Option<bytes::Bytes>; 4]>,
+        seen: &mut SmallVec<[u64; 8]>,
+        fan_out: &mut Vec<(u64, Vec<ndn_packet::lp::TraceId>)>,
+    ) {
+        // Persistent-aware path: per-subscriber credit pools, survives until
+        // exhausted (mirrors the classic persistent-Interest semantics).
+        let probe = self.pit.with_entry_mut(token, |entry| {
+            let any_per_record = entry
+                .in_records
+                .iter()
+                .any(|r| r.persistent.is_some() && (!cbp_only || r.selector.can_be_prefix));
+            if !any_per_record && entry.persistent.is_none() {
+                return PersistentMatchResult::Classical;
             }
 
-            // Persistent-entry probe at the prefix-walk depth. Only
-            // CanBePrefix in-records participate.
-            let probe = self.pit.with_entry_mut(&token, |entry| {
-                let any_per_record = entry
-                    .in_records
-                    .iter()
-                    .any(|r| r.persistent.is_some() && r.selector.can_be_prefix);
-                if !any_per_record && entry.persistent.is_none() {
-                    return PersistentMatchResult::Classical;
+            let mut f: SmallVec<[FaceId; 4]> = SmallVec::new();
+            let mut t: SmallVec<[Option<bytes::Bytes>; 4]> = SmallVec::new();
+            let mut exhausted: SmallVec<[usize; 4]> = SmallVec::new();
+
+            for (i, r) in entry.in_records.iter_mut().enumerate() {
+                if cbp_only && !r.selector.can_be_prefix {
+                    continue;
                 }
+                if let Some(ps) = r.persistent.as_mut() {
+                    if ps.data_count_remaining > 0 {
+                        ps.data_count_remaining -= 1;
+                        f.push(FaceId(r.face_id));
+                        t.push(r.lp_pit_token.clone());
+                        if ps.data_count_remaining == 0 {
+                            exhausted.push(i);
+                        }
+                    }
+                } else if entry.persistent.is_some() {
+                    f.push(FaceId(r.face_id));
+                    t.push(r.lp_pit_token.clone());
+                }
+            }
 
-                let mut faces: SmallVec<[FaceId; 4]> = SmallVec::new();
-                let mut lp_tokens: SmallVec<[Option<bytes::Bytes>; 4]> = SmallVec::new();
-                let mut exhausted: SmallVec<[usize; 4]> = SmallVec::new();
+            if let Some(p) = entry.persistent.as_mut() {
+                p.data_count_remaining = p.data_count_remaining.saturating_sub(1);
+            }
 
-                for (i, r) in entry.in_records.iter_mut().enumerate() {
-                    if !r.selector.can_be_prefix {
+            for &idx in exhausted.iter().rev() {
+                entry.in_records.swap_remove(idx);
+            }
+
+            let no_persistent_left = !entry.in_records.iter().any(|r| r.persistent.is_some());
+            let entry_level_exhausted = entry
+                .persistent
+                .as_ref()
+                .is_some_and(|p| p.data_count_remaining == 0);
+            let should_reap = if any_per_record {
+                no_persistent_left
+            } else {
+                entry_level_exhausted
+            };
+            PersistentMatchResult::Matched {
+                faces: f,
+                lp_tokens: t,
+                should_reap,
+            }
+        });
+
+        match probe {
+            Some(PersistentMatchResult::Matched {
+                faces: f,
+                lp_tokens: t,
+                should_reap,
+            }) => {
+                if should_reap {
+                    let _ = self.pit.remove(token);
+                }
+                for (fid, tok) in f.into_iter().zip(t) {
+                    if seen.contains(&fid.0) {
                         continue;
                     }
-                    if let Some(ps) = r.persistent.as_mut() {
-                        if ps.data_count_remaining > 0 {
-                            ps.data_count_remaining -= 1;
-                            faces.push(FaceId(r.face_id));
-                            lp_tokens.push(r.lp_pit_token.clone());
-                            if ps.data_count_remaining == 0 {
-                                exhausted.push(i);
-                            }
-                        }
-                    } else if entry.persistent.is_some() {
-                        faces.push(FaceId(r.face_id));
-                        lp_tokens.push(r.lp_pit_token.clone());
-                    }
+                    seen.push(fid.0);
+                    faces.push(fid);
+                    tokens.push(tok);
                 }
-
-                if let Some(p) = entry.persistent.as_mut() {
-                    p.data_count_remaining = p.data_count_remaining.saturating_sub(1);
-                }
-
-                for &idx in exhausted.iter().rev() {
-                    entry.in_records.swap_remove(idx);
-                }
-
-                let no_persistent_left = !entry.in_records.iter().any(|r| r.persistent.is_some());
-                let entry_level_exhausted = entry
-                    .persistent
-                    .as_ref()
-                    .is_some_and(|p| p.data_count_remaining == 0);
-                let should_reap = if any_per_record {
-                    no_persistent_left
-                } else {
-                    entry_level_exhausted
-                };
-                PersistentMatchResult::Matched {
-                    faces,
-                    lp_tokens,
-                    should_reap,
-                }
-            });
-            if let Some(PersistentMatchResult::Matched {
-                faces,
-                lp_tokens,
-                should_reap,
-            }) = probe
-            {
-                if should_reap {
-                    let _ = self.pit.remove(&token);
-                }
-                trace!(
-                    target: t::FWD_PIT,
-                    face=%ctx.face_id,
-                    name=%data.name,
-                    prefix_len,
-                    out_faces=?faces,
-                    action="satisfy-persistent",
-                    "pit op"
-                );
-                ctx.out_faces = faces;
-                ctx.out_pit_tokens = lp_tokens;
-                return Action::Continue(ctx);
+                return;
             }
-
-            if let Some((_, entry)) = self.pit.remove(&token) {
-                let mut faces: SmallVec<[FaceId; 4]> = SmallVec::new();
-                let mut tokens: SmallVec<[Option<bytes::Bytes>; 4]> = SmallVec::new();
-                let mut fan_out_records: Vec<(u64, Vec<ndn_packet::lp::TraceId>)> = Vec::new();
-                for r in entry.in_records.iter().filter(|r| r.selector.can_be_prefix) {
-                    faces.push(FaceId(r.face_id));
-                    tokens.push(r.lp_pit_token.clone());
-                    fan_out_records.push((r.face_id, r.trace_ids.iter().copied().collect()));
-                }
-                crate::observability::fan_out::emit_data_fan_out(
-                    fan_out_records,
-                    &data.name.to_string(),
-                );
-                trace!(target: t::FWD_PIT, face=%ctx.face_id, name=%data.name, prefix_len, out_faces=?faces, action="satisfy", "pit op");
-                ctx.out_faces = faces;
-                ctx.out_pit_tokens = tokens;
-                return Action::Continue(ctx);
-            }
+            Some(PersistentMatchResult::Classical) | None => {}
         }
 
-        trace!(target: t::FWD_PIT, face=%ctx.face_id, name=%data.name, "pit-match: unsolicited Data");
-        Action::Drop(DropReason::Other)
+        // Classical remove-on-match.
+        if cbp_only {
+            // Prefix-walk: a Data at a longer name satisfies only the
+            // CanBePrefix in-records at this prefix. Drain *those* and leave any
+            // exact-match subscribers (who want Data named exactly at the
+            // prefix) pending — removing the whole entry would silently starve
+            // them. Reap the entry only once it is empty.
+            let drained = self.pit.with_entry_mut(token, |entry| {
+                let mut taken: SmallVec<[DrainedInRecord; 4]> = SmallVec::new();
+                let mut i = 0;
+                while i < entry.in_records.len() {
+                    if entry.in_records[i].selector.can_be_prefix {
+                        let r = entry.in_records.swap_remove(i);
+                        taken.push((r.face_id, r.lp_pit_token, r.trace_ids.iter().copied().collect()));
+                    } else {
+                        i += 1;
+                    }
+                }
+                (taken, entry.in_records.is_empty())
+            });
+            if let Some((taken, now_empty)) = drained {
+                for (face_id, lp_token, trace_ids) in taken {
+                    if seen.contains(&face_id) {
+                        continue;
+                    }
+                    seen.push(face_id);
+                    faces.push(FaceId(face_id));
+                    tokens.push(lp_token);
+                    fan_out.push((face_id, trace_ids));
+                }
+                if now_empty {
+                    let _ = self.pit.remove(token);
+                }
+            }
+            return;
+        }
+        // Exact match: every in-record is satisfied; remove the entry.
+        if let Some((_, entry)) = self.pit.remove(token) {
+            for r in entry.in_records.iter() {
+                if seen.contains(&r.face_id) {
+                    continue;
+                }
+                seen.push(r.face_id);
+                faces.push(FaceId(r.face_id));
+                tokens.push(r.lp_pit_token.clone());
+                fan_out.push((r.face_id, r.trace_ids.iter().copied().collect()));
+            }
+        }
     }
 }
 
@@ -617,6 +574,182 @@ mod d07_tests {
             Some(lp_token.as_ref()),
         );
         let _ = Name::from_str("/").map(|_| ());
+    }
+}
+
+#[cfg(test)]
+mod multi_match_tests {
+    use super::*;
+    use ndn_packet::encode::encode_data_unsigned;
+    use ndn_packet::{Data, Name, Selector};
+    use ndn_store::PitEntry;
+
+    fn run_match(stage: &PitMatchStage, data_wire: bytes::Bytes) -> Action {
+        let data = Data::decode(data_wire.clone()).unwrap();
+        let mut ctx = PacketContext::new(data_wire, FaceId(99), 0);
+        ctx.packet = DecodedPacket::Data(Box::new(data));
+        stage.process(ctx)
+    }
+
+    /// One Data satisfies BOTH an exact-name pending Interest and a CanBePrefix
+    /// pending Interest at a shorter prefix (NFD findAllDataMatches). Both
+    /// downstream faces must appear in `out_faces` — the pre-rewrite code
+    /// returned on the first (exact) match and starved the CanBePrefix one.
+    #[test]
+    fn data_satisfies_exact_and_canbeprefix_entries() {
+        let pit = Arc::new(Pit::new());
+
+        let exact: Name = "/a/b/c".parse().unwrap();
+        let mut e1 = PitEntry::new(Arc::new(exact.clone()), 0, 4000);
+        e1.add_in_record(1, 11, u64::MAX, None, Selector::default());
+        pit.insert(PitToken::from_interest(&exact), e1);
+
+        let prefix: Name = "/a".parse().unwrap();
+        let sel = Selector {
+            can_be_prefix: true,
+            ..Selector::default()
+        };
+        let mut e2 = PitEntry::new(Arc::new(prefix.clone()), 0, 4000);
+        e2.add_in_record(2, 22, u64::MAX, None, sel);
+        pit.insert(PitToken::from_interest(&prefix), e2);
+
+        let stage = PitMatchStage {
+            pit: Arc::clone(&pit),
+        };
+        let action = run_match(&stage, encode_data_unsigned(&exact, b"x"));
+        let ctx = match action {
+            Action::Continue(c) => c,
+            _ => panic!("Data must satisfy at least one entry"),
+        };
+
+        let mut got: Vec<u64> = ctx.out_faces.iter().map(|f| f.0).collect();
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            vec![1, 2],
+            "both exact and CanBePrefix downstreams must be satisfied by one Data"
+        );
+        assert!(!ctx.unsolicited);
+        assert!(!pit.contains(&PitToken::from_interest(&exact)));
+        assert!(!pit.contains(&PitToken::from_interest(&prefix)));
+    }
+
+    /// A single face that expressed both an exact and a prefix Interest gets
+    /// exactly one Data copy (dedup by face id, like NFD's `pendingDownstreams`
+    /// set).
+    #[test]
+    fn duplicate_downstream_face_deduped() {
+        let pit = Arc::new(Pit::new());
+
+        let exact: Name = "/x/y".parse().unwrap();
+        let mut e1 = PitEntry::new(Arc::new(exact.clone()), 0, 4000);
+        e1.add_in_record(5, 1, u64::MAX, None, Selector::default());
+        pit.insert(PitToken::from_interest(&exact), e1);
+
+        let prefix: Name = "/x".parse().unwrap();
+        let sel = Selector {
+            can_be_prefix: true,
+            ..Selector::default()
+        };
+        let mut e2 = PitEntry::new(Arc::new(prefix.clone()), 0, 4000);
+        e2.add_in_record(5, 2, u64::MAX, None, sel);
+        pit.insert(PitToken::from_interest(&prefix), e2);
+
+        let stage = PitMatchStage {
+            pit: Arc::clone(&pit),
+        };
+        let action = run_match(&stage, encode_data_unsigned(&exact, b"x"));
+        let ctx = match action {
+            Action::Continue(c) => c,
+            _ => panic!("must satisfy"),
+        };
+        assert_eq!(
+            ctx.out_faces.as_slice(),
+            &[FaceId(5)],
+            "a face that appears in two matched entries must receive one copy"
+        );
+    }
+
+    /// A prefix entry holding ONLY an exact-match (non-CanBePrefix) subscriber
+    /// must NOT be consumed by Data at a longer name — the prefix-walk only
+    /// touches CanBePrefix in-records.
+    #[test]
+    fn prefix_entry_without_canbeprefix_untouched() {
+        let pit = Arc::new(Pit::new());
+
+        let prefix: Name = "/p".parse().unwrap();
+        let mut e = PitEntry::new(Arc::new(prefix.clone()), 0, 4000);
+        // can_be_prefix = false → wants Data named exactly /p.
+        e.add_in_record(3, 1, u64::MAX, None, Selector::default());
+        pit.insert(PitToken::from_interest(&prefix), e);
+
+        let stage = PitMatchStage {
+            pit: Arc::clone(&pit),
+        };
+        let longer: Name = "/p/q".parse().unwrap();
+        let action = run_match(&stage, encode_data_unsigned(&longer, b"x"));
+        let ctx = match action {
+            Action::Continue(c) => c,
+            _ => panic!(),
+        };
+        assert!(
+            ctx.unsolicited,
+            "Data /p/q must not satisfy an exact-only /p subscriber"
+        );
+        assert!(
+            pit.contains(&PitToken::from_interest(&prefix)),
+            "the exact-only prefix entry must remain pending"
+        );
+    }
+
+    /// A prefix entry holding BOTH a CanBePrefix subscriber and an exact-match
+    /// subscriber: Data at a longer name satisfies only the CanBePrefix one;
+    /// the exact-match in-record stays pending and the entry survives. Guards
+    /// the latent "remove-whole-entry starves exact subscribers" bug.
+    #[test]
+    fn mixed_prefix_entry_drains_only_canbeprefix_records() {
+        let pit = Arc::new(Pit::new());
+
+        let prefix: Name = "/m".parse().unwrap();
+        let mut e = PitEntry::new(Arc::new(prefix.clone()), 0, 4000);
+        // Face 1: CanBePrefix (wants Data under /m). Face 2: exact (wants /m).
+        let cbp = Selector {
+            can_be_prefix: true,
+            ..Selector::default()
+        };
+        e.add_in_record(1, 1, u64::MAX, None, cbp);
+        e.add_in_record(2, 2, u64::MAX, None, Selector::default());
+        pit.insert(PitToken::from_interest(&prefix), e);
+
+        let stage = PitMatchStage {
+            pit: Arc::clone(&pit),
+        };
+        let longer: Name = "/m/seq=0".parse().unwrap();
+        let action = run_match(&stage, encode_data_unsigned(&longer, b"x"));
+        let ctx = match action {
+            Action::Continue(c) => c,
+            _ => panic!("CanBePrefix subscriber must be satisfied"),
+        };
+
+        assert_eq!(
+            ctx.out_faces.as_slice(),
+            &[FaceId(1)],
+            "only the CanBePrefix in-record is satisfied by the longer-named Data"
+        );
+        // The entry survives, now holding just the exact-match subscriber.
+        let remaining = pit
+            .with_entry(&PitToken::from_interest(&prefix), |e| {
+                e.in_records
+                    .iter()
+                    .map(|r| (r.face_id, r.selector.can_be_prefix))
+                    .collect::<Vec<_>>()
+            })
+            .expect("entry must still exist for the exact-match subscriber");
+        assert_eq!(
+            remaining,
+            vec![(2, false)],
+            "the exact-match (non-CanBePrefix) subscriber must remain pending"
+        );
     }
 }
 
@@ -1190,13 +1323,18 @@ mod persistent_tests {
             "classical entry must be removed on first match"
         );
 
-        // Second Data under the same prefix is unsolicited.
+        // Second Data under the same prefix is unsolicited: PitMatchStage now
+        // carries it through as Continue with `unsolicited` set (the dispatcher
+        // applies the UnsolicitedDataPolicy), rather than dropping in-stage.
         let data2_wire = encode_data_unsigned(&child_name, b"payload2");
         let a2 = run_match(&match_stage, data2_wire);
-        assert!(
-            matches!(a2, Action::Drop(_)),
-            "second Data under removed entry must be unsolicited"
-        );
+        match a2 {
+            Action::Continue(c) => {
+                assert!(c.unsolicited, "unmatched Data must be flagged unsolicited");
+                assert!(c.out_faces.is_empty(), "unsolicited Data forwards nowhere");
+            }
+            _ => panic!("unsolicited Data must Continue with the unsolicited flag"),
+        }
     }
 
     /// Past-deadline persistent entry is reaped by `drain_expired`.

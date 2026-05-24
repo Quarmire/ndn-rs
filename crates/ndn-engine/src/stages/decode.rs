@@ -105,6 +105,7 @@ impl TlvDecodeStage {
     pub fn try_collect_fragment(
         &self,
         face_id: FaceId,
+        endpoint_id: u64,
         raw: Bytes,
     ) -> Result<Option<Bytes>, Bytes> {
         let hdr = match extract_fragment(&raw) {
@@ -114,9 +115,16 @@ impl TlvDecodeStage {
         let fragment = raw.slice(hdr.frag_start..hdr.frag_end);
         let base_seq = hdr.sequence - hdr.frag_index;
         let mut rb = self.reassembly.entry(face_id).or_default();
-        // `0` is the unicast endpoint id; multi-access faces (UDP multicast /
-        // Ethernet / BLE) need a per-source identifier here.
-        Ok(rb.process(0, base_seq, hdr.frag_index, hdr.frag_count, fragment))
+        // `endpoint_id` (from the link-layer sender; 0 for unicast) keys
+        // reassembly per-sender so concurrent fragmenting peers on a
+        // multi-access face don't alias overlapping sequences.
+        Ok(rb.process(
+            endpoint_id,
+            base_seq,
+            hdr.frag_index,
+            hdr.frag_count,
+            fragment,
+        ))
     }
 
     pub fn process(&self, mut ctx: PacketContext) -> Action {
@@ -281,7 +289,13 @@ impl TlvDecodeStage {
                 let seq = sequence.unwrap_or(0);
                 let idx = frag_index.unwrap_or(0);
                 let base_seq = seq - idx;
-                rb.process(0, base_seq, idx, frag_count.unwrap_or(1), fragment)
+                rb.process(
+                    ctx.endpoint_id,
+                    base_seq,
+                    idx,
+                    frag_count.unwrap_or(1),
+                    fragment,
+                )
             };
             match complete {
                 Some(packet) => {
@@ -655,5 +669,48 @@ mod content_sha256_tests {
             None,
             "Tcp → None"
         );
+    }
+}
+
+#[cfg(test)]
+mod reassembly_endpoint_tests {
+    use super::*;
+    use ndn_packet::encode::DataBuilder;
+    use ndn_packet::fragment::fragment_packet;
+
+    fn stage() -> TlvDecodeStage {
+        TlvDecodeStage::new(Arc::new(FaceTable::new()), Arc::new(DashMap::new()))
+    }
+
+    /// Two senders on one multi-access face whose fragment sequences overlap
+    /// (both base_seq 0) must reassemble independently when keyed by distinct
+    /// endpoint ids — the per-sender keying the dispatcher now supplies from
+    /// the link-layer source. Pre-fix, both used endpoint id 0 and aliased.
+    #[test]
+    fn distinct_endpoints_isolate_overlapping_sequences() {
+        let s = stage();
+        let face = FaceId(7);
+        let a = DataBuilder::new("/peer/a", &vec![0xAA; 300]).sign_digest_sha256();
+        let b = DataBuilder::new("/peer/b", &vec![0xBB; 300]).sign_digest_sha256();
+        let fa = fragment_packet(&a, 100, 0);
+        let fb = fragment_packet(&b, 100, 0);
+        assert!(fa.len() > 1 && fb.len() > 1, "both must be multi-fragment");
+
+        let mut got_a = None;
+        let mut got_b = None;
+        for i in 0..fa.len().max(fb.len()) {
+            if let Some(f) = fa.get(i)
+                && let Ok(Some(p)) = s.try_collect_fragment(face, 1, f.clone())
+            {
+                got_a = Some(p);
+            }
+            if let Some(f) = fb.get(i)
+                && let Ok(Some(p)) = s.try_collect_fragment(face, 2, f.clone())
+            {
+                got_b = Some(p);
+            }
+        }
+        assert_eq!(got_a.expect("peer A reassembles"), a);
+        assert_eq!(got_b.expect("peer B reassembles"), b);
     }
 }

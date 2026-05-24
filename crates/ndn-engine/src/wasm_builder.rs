@@ -47,6 +47,9 @@ pub struct WasmEngineConfig {
     /// Empty = this forwarder hosts no producer region. Mirrors native
     /// `EngineConfig::network_region`.
     pub network_region: Vec<ndn_packet::Name>,
+    /// Unsolicited-Data caching policy. Mirrors native
+    /// `EngineConfig::unsolicited_data`; default `DropAll`.
+    pub unsolicited_data: crate::unsolicited::UnsolicitedDataPolicy,
 }
 
 impl Default for WasmEngineConfig {
@@ -56,6 +59,7 @@ impl Default for WasmEngineConfig {
             cs_capacity_bytes: 8 * 1024 * 1024,
             replay_guard: crate::replay_guard_config::ReplayGuardConfig::default(),
             network_region: Vec::new(),
+            unsolicited_data: crate::unsolicited::UnsolicitedDataPolicy::default(),
         }
     }
 }
@@ -321,6 +325,7 @@ impl WasmEngineBuilder {
                 cs: Arc::clone(&cs),
                 admission: Arc::new(ndn_store::DefaultAdmissionPolicy),
             },
+            unsolicited_policy: self.config.unsolicited_data,
             channel_cap: self.config.pipeline_channel_cap,
             pipeline_threads: 1,
             discovery: Arc::clone(&discovery),

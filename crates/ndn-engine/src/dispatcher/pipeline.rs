@@ -49,7 +49,10 @@ impl PacketDispatcher {
                     arrival,
                     meta,
                 } = pkt;
-                match self.decode.try_collect_fragment(face_id, raw) {
+                match self
+                    .decode
+                    .try_collect_fragment(face_id, meta.endpoint_id(), raw)
+                {
                     Ok(None) => {
                         trace!(target: t::FACE_LP, face=%face_id, "fragment collected, awaiting reassembly");
                     }
@@ -105,7 +108,8 @@ impl PacketDispatcher {
     async fn process_packet_inner(&self, pkt: InboundPacket) {
         trace!(target: t::FWD_PIPELINE, face=%pkt.face_id, len=pkt.raw.len(), "pipeline: packet arrived");
         let meta = pkt.meta;
-        let ctx = PacketContext::new(pkt.raw, pkt.face_id, pkt.arrival);
+        let mut ctx = PacketContext::new(pkt.raw, pkt.face_id, pkt.arrival);
+        ctx.endpoint_id = meta.endpoint_id();
 
         let ctx = match self.decode.process(ctx) {
             Action::Continue(ctx) => ctx,
@@ -372,7 +376,7 @@ impl PacketDispatcher {
         let ctx = match self.pit_match.process(ctx) {
             Action::Continue(ctx) => ctx,
             Action::Drop(r) => {
-                debug!(target: t::FWD_PIT, reason=?r, "unsolicited data");
+                debug!(target: t::FWD_PIT, reason=?r, "data dropped at pit-match");
                 return;
             }
             other => {
@@ -380,6 +384,24 @@ impl PacketDispatcher {
                 return;
             }
         };
+
+        // Unsolicited Data (no matching PIT entry) is never forwarded
+        // (`out_faces` is empty). Whether it is *cached* is the
+        // UnsolicitedDataPolicy's call (NFD onDataUnsolicited): drop by default,
+        // or opportunistically cache when overheard on a broadcast/ad-hoc
+        // bearer. Admission still flows through validation below, so only
+        // verified Data ever enters the CS (fail-secure).
+        if ctx.unsolicited {
+            let scope = self
+                .face_table
+                .get(ctx.face_id)
+                .map(|f| f.scope())
+                .unwrap_or(FaceScope::NonLocal);
+            if !self.unsolicited_policy.admits(scope) {
+                debug!(target: t::FWD_PIT, face=%ctx.face_id, "unsolicited data dropped (policy)");
+                return;
+            }
+        }
 
         // Local faces (IPC or a loopback remote) are trusted by OS-level
         // access control; skip crypto for them. A remote WS/WT/WebRTC peer is
@@ -410,8 +432,11 @@ impl PacketDispatcher {
         };
 
         // Self-learning: a Data may carry a PrefixAnnouncement; learn a route
-        // from it (validated) before caching/satisfying.
-        self.try_self_learn(&ctx).await;
+        // from it (validated) before caching/satisfying. Unsolicited Data is
+        // cache-only and never drives route installation.
+        if !ctx.unsolicited {
+            self.try_self_learn(&ctx).await;
+        }
 
         let action = self.cs_insert.process(ctx).await;
         self.dispatch_action(action).await;

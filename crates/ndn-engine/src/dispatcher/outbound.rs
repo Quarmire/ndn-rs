@@ -11,7 +11,7 @@ use crate::pipeline::{Action, NackReason, PacketContext};
 use ndn_packet::Name;
 use ndn_packet::lp::LpHeaders;
 use ndn_store::CsEntry;
-use ndn_transport::{CongestionPolicy, FaceId, FaceScope};
+use ndn_transport::{CongestionPolicy, FaceId, FaceScope, LinkType};
 
 use super::PacketDispatcher;
 
@@ -196,6 +196,23 @@ impl PacketDispatcher {
         let is_localhost = ctx.name.as_ref().is_some_and(|n| is_localhost_name(n));
         let name_for_rl = ctx.name.as_deref();
         for (i, face_id) in ctx.out_faces.iter().enumerate() {
+            // Don't echo forwarded Data back out the face it arrived on —
+            // EXCEPT on ad-hoc links, where re-radiating onto the shared
+            // medium is how other listeners (including the node we relay for)
+            // hear it (NFD onIncomingData, forwarder.cpp:383 guards the
+            // skip with `!= LINK_TYPE_AD_HOC`). Cache hits are exempt: there
+            // `ctx.face_id` is the consumer's own Interest face and is exactly
+            // where the answer must go.
+            if !ctx.cs_hit && *face_id == ctx.face_id {
+                let ad_hoc = self
+                    .face_table
+                    .get(*face_id)
+                    .is_some_and(|f| f.link_type() == LinkType::AdHoc);
+                if !ad_hoc {
+                    trace!(target: t::FWD_PIPELINE, face=%face_id, "satisfy: not echoing Data back out non-ad-hoc ingress face");
+                    continue;
+                }
+            }
             if is_localhost
                 && let Some(face) = self.face_table.get(*face_id)
                 && face.scope() == FaceScope::NonLocal

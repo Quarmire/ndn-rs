@@ -56,6 +56,9 @@ pub struct PacketDispatcher {
     pub pit_match: PitMatchStage,
     pub validation: ValidationStage,
     pub cs_insert: CsInsertStage,
+    /// Whether (and on which face scope) to opportunistically cache Data that
+    /// arrives without a matching PIT entry. Default `DropAll` (NFD parity).
+    pub unsolicited_policy: crate::unsolicited::UnsolicitedDataPolicy,
     pub channel_cap: usize,
     pub pipeline_threads: usize,
     pub discovery: Arc<dyn DiscoveryProtocol>,

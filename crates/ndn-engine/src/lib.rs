@@ -38,6 +38,7 @@ pub mod routing;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod signals_driver;
 pub mod stages;
+pub mod unsolicited;
 #[cfg(target_arch = "wasm32")]
 pub mod wasm_builder;
 
@@ -65,3 +66,4 @@ pub use pipeline::{
 };
 pub use rate_limit_hook::{Decision, PacketKind, RateLimitHook, SharedRateLimitHook};
 pub use reflexive::{ReflexiveConfig, ReflexiveStatus, ReflexiveTable};
+pub use unsolicited::UnsolicitedDataPolicy;

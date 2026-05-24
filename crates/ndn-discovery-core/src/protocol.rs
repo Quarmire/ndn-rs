@@ -39,6 +39,56 @@ impl InboundMeta {
             source: Some(LinkAddr::Udp(addr)),
         }
     }
+
+    /// Stable per-sender id for NDNLPv2 reassembly keying on a multi-access
+    /// face. `0` means "no link-layer source" (point-to-point / unicast), which
+    /// the reassembler treats as a single stream. Distinct senders on a shared
+    /// medium (Ethernet/UDP multicast, BLE advertising) get distinct ids so
+    /// their fragment sequences cannot alias into a corrupt reassembly. Mirrors
+    /// NFD's `(EndpointId, Sequence)` reassembly key.
+    pub fn endpoint_id(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        match &self.source {
+            None => 0,
+            Some(LinkAddr::Ether(mac)) => {
+                // 48-bit MAC packed into the low bits — never collides for
+                // distinct MACs. `max(1)` keeps it distinct from the unicast 0.
+                let b = mac.as_bytes();
+                let v = (b[0] as u64) << 40
+                    | (b[1] as u64) << 32
+                    | (b[2] as u64) << 24
+                    | (b[3] as u64) << 16
+                    | (b[4] as u64) << 8
+                    | (b[5] as u64);
+                v.max(1)
+            }
+            Some(LinkAddr::Udp(addr)) => {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                addr.hash(&mut h);
+                h.finish().max(1)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod endpoint_id_tests {
+    use super::*;
+    use crate::MacAddr;
+
+    #[test]
+    fn endpoint_id_distinguishes_senders() {
+        let a = InboundMeta::ether(MacAddr([0xAA, 0, 0, 0, 0, 1]));
+        let b = InboundMeta::ether(MacAddr([0xAA, 0, 0, 0, 0, 2]));
+        assert_ne!(a.endpoint_id(), b.endpoint_id(), "distinct MACs → distinct ids");
+        assert_eq!(
+            a.endpoint_id(),
+            InboundMeta::ether(MacAddr([0xAA, 0, 0, 0, 0, 1])).endpoint_id(),
+            "same MAC → same id"
+        );
+        assert_eq!(InboundMeta::none().endpoint_id(), 0, "no source → unicast 0");
+        assert_ne!(a.endpoint_id(), 0, "a real sender id must not collide with unicast 0");
+    }
 }
 
 /// Stable owner id for FIB / neighbour-table entries installed by a

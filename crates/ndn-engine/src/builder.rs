@@ -58,6 +58,12 @@ pub struct EngineConfig {
     /// of these regions has its hint stripped; otherwise it is forwarded toward
     /// the hint's delegation name. Empty (default) = no local producer region.
     pub network_region: Vec<ndn_packet::Name>,
+    /// Whether to opportunistically cache **unsolicited** Data (Data with no
+    /// matching PIT entry, e.g. overheard on a broadcast/ad-hoc medium).
+    /// Default `DropAll` (NFD parity); `AdmitNetwork` is the choice for a
+    /// broadcast bearer. Admitted Data is cached only, never forwarded, and
+    /// still must pass validation before entering the CS.
+    pub unsolicited_data: crate::unsolicited::UnsolicitedDataPolicy,
 }
 
 pub use crate::replay_guard_config::ReplayGuardConfig;
@@ -71,6 +77,7 @@ impl Default for EngineConfig {
             replay_guard: ReplayGuardConfig::default(),
             reflexive: crate::reflexive::ReflexiveConfig::default(),
             network_region: Vec::new(),
+            unsolicited_data: crate::unsolicited::UnsolicitedDataPolicy::default(),
         }
     }
 }
@@ -186,6 +193,16 @@ impl EngineBuilder {
 
     pub fn content_store(mut self, cs: Arc<dyn ErasedContentStore>) -> Self {
         self.cs = Some(cs);
+        self
+    }
+
+    /// Set the unsolicited-Data caching policy (default `DropAll`). Convenience
+    /// over building an [`EngineConfig`] by hand.
+    pub fn unsolicited_data_policy(
+        mut self,
+        policy: crate::unsolicited::UnsolicitedDataPolicy,
+    ) -> Self {
+        self.config.unsolicited_data = policy;
         self
     }
 
@@ -472,6 +489,7 @@ impl EngineBuilder {
                     .admission
                     .unwrap_or_else(|| Arc::new(ndn_store::DefaultAdmissionPolicy)),
             },
+            unsolicited_policy: self.config.unsolicited_data,
             channel_cap: self.config.pipeline_channel_cap,
             pipeline_threads: resolve_pipeline_threads(self.config.pipeline_threads),
             discovery: Arc::clone(&discovery),

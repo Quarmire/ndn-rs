@@ -32,8 +32,15 @@ pub struct PacketContext {
     /// Per-egress NDNLPv2 PitToken to echo on the return path. Parallel to
     /// `out_faces`; `None` at index `i` means no LP wrap for that face.
     pub out_pit_tokens: SmallVec<[Option<Bytes>; 4]>,
+    /// Link-layer sender id (from `InboundMeta`), used to key NDNLPv2
+    /// reassembly per-sender on a multi-access face. `0` = unicast / no source.
+    pub endpoint_id: u64,
     pub cs_hit: bool,
     pub verified: bool,
+    /// Set by `PitMatchStage` when an incoming Data matched no PIT entry. Such
+    /// Data is never forwarded (`out_faces` stays empty); whether it is cached
+    /// is decided by the engine's `UnsolicitedDataPolicy`.
+    pub unsolicited: bool,
     pub arrival: u64,
     pub tags: AnyMap,
 }
@@ -50,8 +57,10 @@ impl PacketContext {
             lp_pit_token: None,
             out_faces: SmallVec::new(),
             out_pit_tokens: SmallVec::new(),
+            endpoint_id: 0,
             cs_hit: false,
             verified: false,
+            unsolicited: false,
             arrival,
             tags: AnyMap::new(),
         }
