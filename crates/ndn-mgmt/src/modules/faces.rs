@@ -435,6 +435,21 @@ async fn faces_create(
         }
     }
 
+    // `ether://[<peer-mac>]/<iface>` opens a unicast NDN-over-Ethernet link
+    // (EtherType 0x8624) to a known peer MAC. Linux/macOS/Windows; requires
+    // CAP_NET_RAW/root. The peer MAC must be supplied — neighbor discovery is
+    // not yet wired into runtime creation.
+    #[cfg(all(
+        feature = "l2",
+        not(target_arch = "wasm32"),
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    ))]
+    {
+        if uri.starts_with("ether://") {
+            return faces_create_ether(&uri, engine);
+        }
+    }
+
     // `wts://host:port[?cert=<sha256hex>]` dials a WebTransport peer
     // (forwarder-to-forwarder over QUIC/HTTP3). `?cert=` pins a self-signed
     // peer's leaf cert; without it the OS trust store (WebPKI) is used.
@@ -662,6 +677,72 @@ async fn faces_create_tcp(addr_str: &str, engine: &ForwarderEngine) -> ControlRe
             )
         }
     }
+}
+
+/// Open a unicast Ethernet face from `ether://[<peer-mac>]/<iface>`.
+#[cfg(all(
+    feature = "l2",
+    not(target_arch = "wasm32"),
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
+fn faces_create_ether(uri: &str, engine: &ForwarderEngine) -> ControlResponse {
+    let (peer_mac, iface) = match parse_ether_uri(uri) {
+        Ok(parsed) => parsed,
+        Err(msg) => return ControlResponse::error(status::BAD_PARAMS, msg),
+    };
+
+    let face_id = engine.faces().alloc_id();
+    match ndn_face_native::l2::NamedEtherFace::new(
+        face_id,
+        ndn_packet::Name::root(),
+        peer_mac,
+        &iface,
+        ndn_face_native::l2::RadioFaceMetadata::default(),
+    ) {
+        Ok(face) => {
+            let remote_uri = face.remote_uri();
+            let local_uri = face.local_uri().unwrap_or_default();
+            let cancel = CancellationToken::new();
+            engine.add_face_with_persistency(face, cancel, FacePersistency::Persistent);
+            tracing::info!(target: "mgmt.face", face = face_id.0, uri = %uri, "faces/create ether");
+            let echo = ControlParameters {
+                face_id: Some(face_id.0),
+                uri: remote_uri,
+                local_uri: Some(local_uri),
+                ..Default::default()
+            };
+            ControlResponse::ok("OK", echo)
+        }
+        Err(e) => {
+            tracing::warn!(target: "mgmt.face", error = %e, uri = %uri, "faces/create ether failed");
+            ControlResponse::error(
+                status::SERVER_ERROR,
+                format!("Ethernet face creation failed: {e}"),
+            )
+        }
+    }
+}
+
+/// Parse `ether://[<peer-mac>]/<iface>` into `(peer_mac, iface)`. Pure (no I/O
+/// or privileges) so it is unit-testable. Returns a user-facing error string
+/// on malformed input.
+#[cfg(all(
+    feature = "l2",
+    not(target_arch = "wasm32"),
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
+fn parse_ether_uri(uri: &str) -> Result<(ndn_transport::MacAddr, String), String> {
+    let rest = uri.strip_prefix("ether://").unwrap_or(uri);
+    let (mac_str, iface) = rest
+        .strip_prefix('[')
+        .and_then(|r| r.split_once(']'))
+        .and_then(|(mac, tail)| tail.strip_prefix('/').map(|iface| (mac, iface)))
+        .filter(|(_, iface)| !iface.is_empty())
+        .ok_or_else(|| format!("ether URI must be ether://[<peer-mac>]/<iface>: {uri}"))?;
+    let peer_mac: ndn_transport::MacAddr = mac_str
+        .parse()
+        .map_err(|_| format!("invalid peer MAC '{mac_str}'"))?;
+    Ok((peer_mac, iface.to_owned()))
 }
 
 /// Dial a `wts://host:port[?cert=<sha256hex>]` WebTransport peer.
@@ -1464,6 +1545,25 @@ impl MgmtModule for FacesModule {
 mod tests {
     use super::*;
     use crate::notification::NotificationEvent;
+
+    #[cfg(all(
+        feature = "l2",
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    ))]
+    #[test]
+    fn ether_uri_parses_mac_and_iface() {
+        let (mac, iface) = parse_ether_uri("ether://[aa:bb:cc:dd:ee:ff]/eth0").unwrap();
+        assert_eq!(mac.as_bytes(), &[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+        assert_eq!(iface, "eth0");
+
+        // Round-trips against the URI a NamedEtherFace emits.
+        assert!(parse_ether_uri("ether://[01:00:5e:00:17:aa]/en1").is_ok());
+
+        // Malformed inputs are rejected before any socket is opened.
+        assert!(parse_ether_uri("ether://aa:bb:cc:dd:ee:ff/eth0").is_err()); // no brackets
+        assert!(parse_ether_uri("ether://[aa:bb:cc:dd:ee:ff]/").is_err()); // empty iface
+        assert!(parse_ether_uri("ether://[zz:zz:zz:zz:zz:zz]/eth0").is_err()); // bad MAC
+    }
 
     #[test]
     fn link_quality_dataset_round_trips() {

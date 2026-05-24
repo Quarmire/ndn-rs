@@ -12,6 +12,8 @@ classification = "spec"
 # Forwarded by binaries. Off by default — the library compiles standalone.
 yubikey-piv = ["ndn-security/yubikey-piv", "ndn-cert/yubikey-challenge", "dep:base64"]
 spsc-shm    = ["ndn-face-native/spsc-shm"]
+# Enables the ether:// faces/create arm (unicast NDN-over-Ethernet).
+l2          = ["ndn-face-native/l2"]
 # Enables ble:// (central) and ble-peripheral:// (server) faces/create arms.
 bluetooth   = ["ndn-face-native/bluetooth"]
 # Enables the wts:// faces/create arm (outbound WebTransport dial).

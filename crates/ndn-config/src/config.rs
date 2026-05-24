@@ -837,6 +837,26 @@ fn validate_face_config(face: &FaceConfig) -> Result<(), ConfigError> {
                 (None, true) => {}
             }
         }
+        FaceConfig::Ether {
+            interface,
+            peer_mac,
+        } => {
+            if interface.is_empty() {
+                return Err(ConfigError::Invalid(
+                    "ether face interface must not be empty".into(),
+                ));
+            }
+            let octets: Vec<&str> = peer_mac.split(':').collect();
+            let well_formed = octets.len() == 6
+                && octets
+                    .iter()
+                    .all(|o| o.len() == 2 && o.bytes().all(|b| b.is_ascii_hexdigit()));
+            if !well_formed {
+                return Err(ConfigError::Invalid(format!(
+                    "ether face peer-mac must be aa:bb:cc:dd:ee:ff: {peer_mac}"
+                )));
+            }
+        }
         FaceConfig::Unix { .. } | FaceConfig::EtherMulticast { .. } => {}
     }
     Ok(())
@@ -1031,6 +1051,15 @@ pub enum FaceConfig {
     },
     #[serde(rename = "ether-multicast")]
     EtherMulticast { interface: String },
+    /// Unicast NDN-over-Ethernet link to a known peer MAC on `interface`
+    /// (EtherType 0x8624). Linux/macOS/Windows; requires `CAP_NET_RAW`/root.
+    /// Peer MAC must be supplied — neighbor discovery is not yet wired.
+    Ether {
+        interface: String,
+        /// Peer MAC as `aa:bb:cc:dd:ee:ff`.
+        #[serde(rename = "peer-mac")]
+        peer_mac: String,
+    },
 }
 
 fn default_baud() -> u32 {
