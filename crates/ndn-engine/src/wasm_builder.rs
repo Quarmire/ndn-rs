@@ -43,6 +43,10 @@ pub struct WasmEngineConfig {
     pub cs_capacity_bytes: usize,
     /// Pre-PIT replay-guard config. Same baseline as native.
     pub replay_guard: crate::replay_guard_config::ReplayGuardConfig,
+    /// NDNLPv2 ForwardingHint producer regions (NFD `NetworkRegionTable`).
+    /// Empty = this forwarder hosts no producer region. Mirrors native
+    /// `EngineConfig::network_region`.
+    pub network_region: Vec<ndn_packet::Name>,
 }
 
 impl Default for WasmEngineConfig {
@@ -51,6 +55,7 @@ impl Default for WasmEngineConfig {
             pipeline_channel_cap: 1024,
             cs_capacity_bytes: 8 * 1024 * 1024,
             replay_guard: crate::replay_guard_config::ReplayGuardConfig::default(),
+            network_region: Vec::new(),
         }
     }
 }
