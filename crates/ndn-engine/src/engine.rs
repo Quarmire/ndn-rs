@@ -747,32 +747,60 @@ pub(crate) async fn run_face_sender(
         tokio::select! {
             biased;            _ = cancel.cancelled() => break,
             item = rx.recv() => {
-                let (pkt, source, intent) = match item {
+                let first = match item {
                     Some(p) => p,
                     None => break,
                 };
 
-                // Single egress-framing point. When the reliability feature is
-                // enabled it frames canonically (TxSequence + piggybacked Acks +
-                // retx tracking); otherwise frame the bare payload + intent.
-                // (A reliable face ignores `intent` headers — the only traffic
-                // on reliable faces today is header-less control/beacons.)
-                let wires = match lp_reliability_feature.as_ref() {
-                    Some(feature) if feature.is_enabled() => feature.frame(&pkt),
-                    _ => vec![frame_with_intent(&pkt, &intent, face.kind().uses_lp_framing())],
+                let bump = |wires: &[bytes::Bytes]| {
+                    if let Some(state) = face_states.get(&face_id) {
+                        let total: u64 = wires.iter().map(|w| w.len() as u64).sum();
+                        state.counters.out_bytes.fetch_add(total, Ordering::Relaxed);
+                    }
                 };
-                // One packet's fragment burst shares a peer and ordering, so
-                // ship it via the link service's batch path — a single
-                // `sendmmsg` where the transport supports it, else the same
-                // per-datagram sends. Sum the byte counter once.
-                if let Some(state) = face_states.get(&face_id) {
-                    let total: u64 = wires.iter().map(|w| w.len() as u64).sum();
-                    state.counters.out_bytes.fetch_add(total, Ordering::Relaxed);
-                }
-                if let Err(e) = face.send_batch(&wires, Some(source)).await
-                    && handle_send_error(e)
-                {
-                    return;
+
+                // Reliability frames canonically per packet (TxSequence +
+                // piggybacked Acks + retx tracking) and is low-volume, so it
+                // bypasses cross-item batching. (A reliable face ignores
+                // `intent` headers — its only traffic is header-less control.)
+                if lp_reliability_feature.as_ref().is_some_and(|f| f.is_enabled()) {
+                    let wires = lp_reliability_feature.as_ref().unwrap().frame(&first.0);
+                    bump(&wires);
+                    if let Err(e) = face.send_batch(&wires, Some(first.1)).await
+                        && handle_send_error(e)
+                    {
+                        return;
+                    }
+                } else {
+                    // Opportunistic egress batching: drain whatever is already
+                    // queued (non-blocking — no added latency at low load) and
+                    // coalesce same-`source` runs into one `send_batch`, i.e. a
+                    // single `sendmmsg` on UDP. Source grouping keeps the egress
+                    // feature context (e.g. IncomingFaceId) correct per frame.
+                    const MAX_DRAIN: usize = 64;
+                    let lp = face.kind().uses_lp_framing();
+                    let mut items = vec![first];
+                    while items.len() < MAX_DRAIN {
+                        match rx.try_recv() {
+                            Ok(i) => items.push(i),
+                            Err(_) => break,
+                        }
+                    }
+                    let mut idx = 0;
+                    while idx < items.len() {
+                        let src = items[idx].1;
+                        let mut wires = Vec::new();
+                        while idx < items.len() && items[idx].1 == src {
+                            wires.push(frame_with_intent(&items[idx].0, &items[idx].2, lp));
+                            idx += 1;
+                        }
+                        bump(&wires);
+                        if let Err(e) = face.send_batch(&wires, Some(src)).await
+                            && handle_send_error(e)
+                        {
+                            return;
+                        }
+                    }
                 }
             },
             _ = retx_sleep, if lp_reliability_feature.is_some() => {

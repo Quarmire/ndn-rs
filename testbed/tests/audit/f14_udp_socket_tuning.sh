@@ -50,9 +50,9 @@ check "sendmmsg module Linux+feature gated" 'cfg\(all\(feature = "udp-sendmmsg",
 check "send_batch seam on Transport"      'fn send_batch' "crates/ndn-transport/src/transport.rs"
 check "LinkService batches egress"        'fn send_batch' "crates/ndn-transport/src/link_service/mod.rs"
 if echo "$default_line" | grep -q "udp-sendmmsg"; then
-    echo "FAIL: udp-sendmmsg must stay opt-in (not yet benchmarked) ($default_line)"; fail=1
+    echo "ok: udp-sendmmsg is default-on (validated+benchmarked; no-op off-Linux)"
 else
-    echo "ok: udp-sendmmsg is opt-in"
+    echo "FAIL: udp-sendmmsg should be in the default feature set ($default_line)"; fail=1
 fi
 
 echo
