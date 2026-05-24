@@ -761,18 +761,18 @@ pub(crate) async fn run_face_sender(
                     Some(feature) if feature.is_enabled() => feature.frame(&pkt),
                     _ => vec![frame_with_intent(&pkt, &intent, face.kind().uses_lp_framing())],
                 };
-                for wire in wires {
-                    if let Some(state) = face_states.get(&face_id) {
-                        state
-                            .counters
-                            .out_bytes
-                            .fetch_add(wire.len() as u64, Ordering::Relaxed);
-                    }
-                    if let Err(e) = face.send_bytes_with_source(wire, source).await
-                        && handle_send_error(e)
-                    {
-                        return;
-                    }
+                // One packet's fragment burst shares a peer and ordering, so
+                // ship it via the link service's batch path — a single
+                // `sendmmsg` where the transport supports it, else the same
+                // per-datagram sends. Sum the byte counter once.
+                if let Some(state) = face_states.get(&face_id) {
+                    let total: u64 = wires.iter().map(|w| w.len() as u64).sum();
+                    state.counters.out_bytes.fetch_add(total, Ordering::Relaxed);
+                }
+                if let Err(e) = face.send_batch(&wires, Some(source)).await
+                    && handle_send_error(e)
+                {
+                    return;
                 }
             },
             _ = retx_sleep, if lp_reliability_feature.is_some() => {

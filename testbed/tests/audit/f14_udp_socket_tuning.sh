@@ -32,18 +32,28 @@ check "sockopt helper exists"            'fn tune_datagram_socket' "$NF/src/net/
 check "udp face tunes on bind"           'sockopt::tune_datagram_socket' "$NF/src/net/udp.rs"
 check "multicast face tunes on bind"     'sockopt::tune_datagram_socket' "$NF/src/net/multicast.rs"
 
-# B. recvmmsg batch path present, Linux-gated, OFF by default.
+# B. recvmmsg batch path present, Linux-gated, DEFAULT-ON (validated+benchmarked).
 check "udp-recvmmsg feature declared"    'udp-recvmmsg = ' "$NF/Cargo.toml"
 check "recvmmsg module Linux+feature gated" 'cfg\(all\(feature = "udp-recvmmsg", target_os = "linux"\)\)' "$NF/src/net/recvmmsg.rs"
-# The default feature set must NOT pull in udp-recvmmsg.
 default_line=$(grep -E '^default = ' "$NF/Cargo.toml" || true)
 if echo "$default_line" | grep -q "udp-recvmmsg"; then
-    echo "FAIL: udp-recvmmsg is in the default feature set (must stay opt-in)"; fail=1
+    echo "ok: udp-recvmmsg is default-on (validated+benchmarked; no-op off-Linux)"
 else
-    echo "ok: udp-recvmmsg is OFF by default ($default_line)"
+    echo "FAIL: udp-recvmmsg should be in the default feature set ($default_line)"; fail=1
 fi
-# The single-recv path remains the default (non-feature) receive path.
-check "default single-recv path retained" 'fn recv_bytes_single' "$NF/src/net/udp.rs"
+# The single-recv path is still present for non-Linux / non-feature builds.
+check "single-recv path retained"        'fn recv_bytes_single' "$NF/src/net/udp.rs"
+
+# C. sendmmsg batch path present, Linux+feature gated, OFF by default (opt-in).
+check "udp-sendmmsg feature declared"    'udp-sendmmsg = ' "$NF/Cargo.toml"
+check "sendmmsg module Linux+feature gated" 'cfg\(all\(feature = "udp-sendmmsg", target_os = "linux"\)\)' "$NF/src/net/sendmmsg.rs"
+check "send_batch seam on Transport"      'fn send_batch' "crates/ndn-transport/src/transport.rs"
+check "LinkService batches egress"        'fn send_batch' "crates/ndn-transport/src/link_service/mod.rs"
+if echo "$default_line" | grep -q "udp-sendmmsg"; then
+    echo "FAIL: udp-sendmmsg must stay opt-in (not yet benchmarked) ($default_line)"; fail=1
+else
+    echo "ok: udp-sendmmsg is opt-in"
+fi
 
 echo
 if [ "$fail" -eq 0 ]; then

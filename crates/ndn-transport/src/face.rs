@@ -426,6 +426,15 @@ impl Face {
             .await
     }
 
+    /// Send a packet's already-framed NDNLPv2 fragment burst (all to the same
+    /// peer) through the link service, which batches the egress syscall where
+    /// the transport supports it (`sendmmsg`).
+    pub async fn send_batch(&self, wires: &[Bytes], source: Option<FaceId>) -> Result<(), FaceError> {
+        self.link_service
+            .send_batch(&*self.transport, wires, source)
+            .await
+    }
+
     /// Receive the next wire packet. For link-layer addr or LP-surfaced
     /// metadata use [`Face::recv_frame`].
     pub async fn recv_bytes(&self) -> Result<Bytes, FaceError> {

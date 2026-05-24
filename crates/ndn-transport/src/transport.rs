@@ -101,6 +101,19 @@ pub trait Transport: Send + Sync + 'static {
 
     fn send_bytes(&self, wire: Bytes) -> impl Future<Output = Result<(), FaceError>> + Send;
 
+    /// Send a burst of already-framed datagrams to the same peer in one shot.
+    /// The default ships them one at a time; datagram transports may override
+    /// with a batched syscall (`sendmmsg`). Used for a single packet's NDNLPv2
+    /// fragment burst, so all entries share the destination and ordering.
+    fn send_batch(&self, wires: &[Bytes]) -> impl Future<Output = Result<(), FaceError>> + Send {
+        async move {
+            for wire in wires {
+                self.send_bytes(wire.clone()).await?;
+            }
+            Ok(())
+        }
+    }
+
     fn recv_bytes(&self) -> impl Future<Output = Result<Bytes, FaceError>> + Send;
 
     /// Receive payload + link-layer sender address. Multicast/broadcast
@@ -158,6 +171,11 @@ pub trait ErasedTransport: Send + Sync + 'static {
         source: FaceId,
     ) -> Pin<Box<dyn Future<Output = Result<(), FaceError>> + Send + '_>>;
 
+    fn send_batch<'a>(
+        &'a self,
+        wires: &'a [Bytes],
+    ) -> Pin<Box<dyn Future<Output = Result<(), FaceError>> + Send + 'a>>;
+
     fn recv_bytes(&self) -> Pin<Box<dyn Future<Output = Result<Bytes, FaceError>> + Send + '_>>;
 
     fn recv_bytes_with_addr(
@@ -201,6 +219,13 @@ impl<T: Transport> ErasedTransport for T {
         source: FaceId,
     ) -> Pin<Box<dyn Future<Output = Result<(), FaceError>> + Send + '_>> {
         Box::pin(Transport::send_bytes_with_source(self, wire, source))
+    }
+
+    fn send_batch<'a>(
+        &'a self,
+        wires: &'a [Bytes],
+    ) -> Pin<Box<dyn Future<Output = Result<(), FaceError>> + Send + 'a>> {
+        Box::pin(Transport::send_batch(self, wires))
     }
 
     fn recv_bytes(&self) -> Pin<Box<dyn Future<Output = Result<Bytes, FaceError>> + Send + '_>> {

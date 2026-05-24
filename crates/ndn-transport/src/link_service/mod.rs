@@ -80,6 +80,27 @@ pub trait LinkService: Send + Sync + 'static {
         source: Option<FaceId>,
     ) -> Pin<Box<dyn Future<Output = Result<(), FaceError>> + Send + 'a>>;
 
+    /// Send a burst of already-framed wires (the NDNLPv2 fragments of one
+    /// packet) sharing one `source`. The default ships them through [`send`]
+    /// one at a time; a framing link service may override to apply the egress
+    /// feature pipeline per frame and then hand the whole burst to
+    /// [`ErasedTransport::send_batch`] for a single batched syscall.
+    ///
+    /// [`send`]: LinkService::send
+    fn send_batch<'a>(
+        &'a self,
+        transport: &'a dyn ErasedTransport,
+        wires: &'a [Bytes],
+        source: Option<FaceId>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), FaceError>> + Send + 'a>> {
+        Box::pin(async move {
+            for wire in wires {
+                self.send(transport, wire.clone(), source).await?;
+            }
+            Ok(())
+        })
+    }
+
     fn recv<'a>(
         &'a self,
         transport: &'a dyn ErasedTransport,
@@ -284,6 +305,40 @@ impl LinkService for LpLinkService {
                     transport.send_bytes(frame.wire).await
                 }
             }
+        })
+    }
+
+    /// Batched counterpart to [`send`](LpLinkService::send). The engine hands
+    /// us a packet's already-LP-framed fragments; we run the egress feature
+    /// pipeline on each (exactly as the `is_lp_packet` branch of `send` does)
+    /// and ship the whole burst with one [`ErasedTransport::send_batch`]. Falls
+    /// back to the per-wire path if any wire is not already LP-framed.
+    fn send_batch<'a>(
+        &'a self,
+        transport: &'a dyn ErasedTransport,
+        wires: &'a [Bytes],
+        source: Option<FaceId>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), FaceError>> + Send + 'a>> {
+        Box::pin(async move {
+            if wires.is_empty() {
+                return Ok(());
+            }
+            if !wires.iter().all(|w| ndn_packet::lp::is_lp_packet(w)) {
+                for wire in wires {
+                    self.send(transport, wire.clone(), source).await?;
+                }
+                return Ok(());
+            }
+            let egress_ctx = EgressCtx::new(FaceId(transport.id().0), source);
+            let mut out = Vec::with_capacity(wires.len());
+            for wire in wires {
+                let mut frame = OutboundLpFrame::new(wire.clone(), true);
+                for feature in &self.features {
+                    feature.on_egress(&mut frame, &egress_ctx);
+                }
+                out.push(frame.wire);
+            }
+            transport.send_batch(&out).await
         })
     }
 
