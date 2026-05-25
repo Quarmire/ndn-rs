@@ -329,6 +329,23 @@ pub struct PendingApprovalInfo {
 /// (see the blanket impl below), so a CA wires `Some(Arc::new(store))`.
 pub trait ApprovalMgmtBackend: Send + Sync {
     fn pending(&self) -> Vec<PendingApprovalInfo>;
+    /// Mark a pending request as approved. `approver` is the validated
+    /// signer cert name from the signed mgmt-command Interest (or the
+    /// caller-supplied authority label when running unsigned). Returns
+    /// `true` when the request existed and was `Pending`.
+    ///
+    /// v1 ships mgmt-mediated approval: the signed mgmt-Interest's
+    /// command-validator already established the approver's identity,
+    /// and the SECURITY-module's extended-signed-commands rule plus
+    /// the operator-configured trust anchor / schema gate authorisation.
+    /// The canonical signed-Data-on-approval-feed path
+    /// (`ndn_identity::offer_signed_approval`) remains the v2 deepening
+    /// for cross-process cryptographic provenance.
+    fn approve(&self, id: &str, approver: &str) -> bool;
+    /// Mark a pending request as denied with a reason. Same gating
+    /// as `approve`. Returns `true` when the request existed and was
+    /// `Pending`.
+    fn deny(&self, id: &str, reason: &str) -> bool;
 }
 
 impl ApprovalMgmtBackend for ndn_cert::challenge::device_approval::PendingApprovalStore {
@@ -341,6 +358,19 @@ impl ApprovalMgmtBackend for ndn_cert::challenge::device_approval::PendingApprov
                 description: r.description,
             })
             .collect()
+    }
+
+    fn approve(&self, id: &str, approver: &str) -> bool {
+        // The mgmt path is "trusted by signed-command auth" — the
+        // approver string came from the validated mgmt-Interest's
+        // signer cert. Record it as the approver with an empty
+        // signature (the cryptographic chain lives in the mgmt
+        // Interest, not in a separate approval Data).
+        self.approve_validated(id, approver, Vec::new())
+    }
+
+    fn deny(&self, id: &str, reason: &str) -> bool {
+        self.deny(id, reason)
     }
 }
 

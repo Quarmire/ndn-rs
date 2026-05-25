@@ -32,7 +32,11 @@ const TYPE_REQUEST_ID: u64 = 0xCC;
 const TYPE_CERT_NAME: u64 = 0xCE;
 const TYPE_DESCRIPTION: u64 = 0xD0;
 
-fn handle_ca(verb_name: &[u8], handler: Option<&Arc<dyn ApprovalMgmtBackend>>) -> MgmtResponse {
+fn handle_ca(
+    verb_name: &[u8],
+    params: ControlParameters,
+    handler: Option<&Arc<dyn ApprovalMgmtBackend>>,
+) -> MgmtResponse {
     let Some(handler) = handler else {
         return ControlResponse::error(
             status::NOT_FOUND,
@@ -44,8 +48,55 @@ fn handle_ca(verb_name: &[u8], handler: Option<&Arc<dyn ApprovalMgmtBackend>>) -
         v if v == verb::LIST_APPROVALS => {
             MgmtResponse::Dataset(approvals_dataset(&handler.pending()))
         }
-        _ => ControlResponse::error(status::NOT_FOUND, "unknown ca verb (only `list-approvals`)")
-            .into(),
+        v if v == verb::APPROVE => approve_handler(params, handler.as_ref()).into(),
+        v if v == verb::DENY => deny_handler(params, handler.as_ref()).into(),
+        _ => ControlResponse::error(
+            status::NOT_FOUND,
+            "unknown ca verb (try `list-approvals`, `approve`, or `deny`)",
+        )
+        .into(),
+    }
+}
+
+/// Approve a pending request. Params: `uri` carries the request id.
+/// The signed-command gate authenticates the operator; the recorded
+/// approver label is the conventional `"approved-via-mgmt"` until
+/// the v2 canonical signed-Data approval path lands.
+fn approve_handler(params: ControlParameters, handler: &dyn ApprovalMgmtBackend) -> ControlResponse {
+    let Some(id) = params.uri.as_deref() else {
+        return ControlResponse::error(status::BAD_PARAMS, "request id required in `uri`");
+    };
+    if handler.approve(id, "approved-via-mgmt") {
+        ControlResponse::ok_empty(format!("approved {id}"))
+    } else {
+        ControlResponse::error(
+            status::NOT_FOUND,
+            format!("no pending request with id {id:?} (already resolved or never existed)"),
+        )
+    }
+}
+
+/// Deny a pending request. Params: `uri` carries `<request_id>:<reason>`
+/// (reason optional). Mirrors the `safebag-import` two-half hex
+/// convention so callers don't need a new TLV field.
+fn deny_handler(params: ControlParameters, handler: &dyn ApprovalMgmtBackend) -> ControlResponse {
+    let Some(raw) = params.uri.as_deref() else {
+        return ControlResponse::error(
+            status::BAD_PARAMS,
+            "request id required in `uri` (format: `<id>` or `<id>:<reason>`)",
+        );
+    };
+    let (id, reason) = match raw.split_once(':') {
+        Some((id, reason)) => (id, reason),
+        None => (raw, "denied"),
+    };
+    if handler.deny(id, reason) {
+        ControlResponse::ok_empty(format!("denied {id}"))
+    } else {
+        ControlResponse::error(
+            status::NOT_FOUND,
+            format!("no pending request with id {id:?} (already resolved or never existed)"),
+        )
     }
 }
 
@@ -74,10 +125,10 @@ impl MgmtModule for CaModule {
     async fn dispatch(
         &self,
         verb: &[u8],
-        _params: ControlParameters,
+        params: ControlParameters,
         ctx: &MgmtContext<'_>,
     ) -> MgmtResponse {
-        handle_ca(verb, ctx.approval_handler)
+        handle_ca(verb, params, ctx.approval_handler)
     }
 }
 
@@ -88,17 +139,51 @@ mod ca_tests {
 
     struct StubBackend {
         rows: Mutex<Vec<PendingApprovalInfo>>,
+        approved: Mutex<Vec<(String, String)>>,
+        denied: Mutex<Vec<(String, String)>>,
     }
     impl ApprovalMgmtBackend for StubBackend {
         fn pending(&self) -> Vec<PendingApprovalInfo> {
             self.rows.lock().unwrap().clone()
         }
+        fn approve(&self, id: &str, approver: &str) -> bool {
+            // Mirror PendingApprovalStore semantics: only flip if the
+            // request is still in the pending list.
+            let mut rows = self.rows.lock().unwrap();
+            let Some(pos) = rows.iter().position(|r| r.id == id) else {
+                return false;
+            };
+            rows.remove(pos);
+            self.approved
+                .lock()
+                .unwrap()
+                .push((id.to_string(), approver.to_string()));
+            true
+        }
+        fn deny(&self, id: &str, reason: &str) -> bool {
+            let mut rows = self.rows.lock().unwrap();
+            let Some(pos) = rows.iter().position(|r| r.id == id) else {
+                return false;
+            };
+            rows.remove(pos);
+            self.denied
+                .lock()
+                .unwrap()
+                .push((id.to_string(), reason.to_string()));
+            true
+        }
     }
 
-    fn backend(rows: Vec<PendingApprovalInfo>) -> Arc<dyn ApprovalMgmtBackend> {
+    fn backend(rows: Vec<PendingApprovalInfo>) -> Arc<StubBackend> {
         Arc::new(StubBackend {
             rows: Mutex::new(rows),
+            approved: Mutex::new(Vec::new()),
+            denied: Mutex::new(Vec::new()),
         })
+    }
+
+    fn as_dyn(b: &Arc<StubBackend>) -> Arc<dyn ApprovalMgmtBackend> {
+        b.clone()
     }
 
     fn info(id: &str, cert: &str, desc: &str) -> PendingApprovalInfo {
@@ -109,9 +194,16 @@ mod ca_tests {
         }
     }
 
+    fn cp_uri(s: &str) -> ControlParameters {
+        ControlParameters {
+            uri: Some(s.to_string()),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn returns_404_when_no_backend() {
-        match handle_ca(verb::LIST_APPROVALS, None) {
+        match handle_ca(verb::LIST_APPROVALS, ControlParameters::default(), None) {
             MgmtResponse::Control(cr) => assert_eq!(cr.status_code, status::NOT_FOUND),
             _ => panic!("expected ControlResponse"),
         }
@@ -120,7 +212,7 @@ mod ca_tests {
     #[test]
     fn unknown_verb_returns_404() {
         let h = backend(vec![]);
-        match handle_ca(b"approve", Some(&h)) {
+        match handle_ca(b"nope", ControlParameters::default(), Some(&as_dyn(&h))) {
             MgmtResponse::Control(cr) => assert_eq!(cr.status_code, status::NOT_FOUND),
             _ => panic!("expected ControlResponse"),
         }
@@ -132,7 +224,11 @@ mod ca_tests {
             info("req-1", "/lab/alice/devices/laptop", "laptop"),
             info("req-2", "/lab/bob/devices/watch", ""),
         ]);
-        let bytes = match handle_ca(verb::LIST_APPROVALS, Some(&h)) {
+        let bytes = match handle_ca(
+            verb::LIST_APPROVALS,
+            ControlParameters::default(),
+            Some(&as_dyn(&h)),
+        ) {
             MgmtResponse::Dataset(b) => b,
             _ => panic!("expected dataset"),
         };
@@ -146,5 +242,59 @@ mod ca_tests {
         let (t1, _) = r.read_tlv().expect("second approval");
         assert_eq!(t1, TYPE_PENDING_APPROVAL);
         assert!(r.is_empty());
+    }
+
+    #[test]
+    fn approve_succeeds_on_pending_request() {
+        let h = backend(vec![info("req-1", "/lab/alice", "")]);
+        let resp = match handle_ca(verb::APPROVE, cp_uri("req-1"), Some(&as_dyn(&h))) {
+            MgmtResponse::Control(cr) => cr,
+            _ => panic!("expected ControlResponse"),
+        };
+        assert!(resp.is_ok(), "expected 2xx; got {}", resp.status_code);
+        let approved = h.approved.lock().unwrap();
+        assert_eq!(approved.len(), 1);
+        assert_eq!(approved[0].0, "req-1");
+        assert_eq!(approved[0].1, "approved-via-mgmt");
+    }
+
+    #[test]
+    fn approve_requires_request_id() {
+        let h = backend(vec![info("req-1", "/lab/alice", "")]);
+        match handle_ca(verb::APPROVE, ControlParameters::default(), Some(&as_dyn(&h))) {
+            MgmtResponse::Control(cr) => assert_eq!(cr.status_code, status::BAD_PARAMS),
+            _ => panic!("expected ControlResponse"),
+        }
+    }
+
+    #[test]
+    fn approve_unknown_id_returns_404() {
+        let h = backend(vec![info("req-1", "/lab/alice", "")]);
+        match handle_ca(verb::APPROVE, cp_uri("req-missing"), Some(&as_dyn(&h))) {
+            MgmtResponse::Control(cr) => assert_eq!(cr.status_code, status::NOT_FOUND),
+            _ => panic!("expected ControlResponse"),
+        }
+    }
+
+    #[test]
+    fn deny_with_reason_records_reason() {
+        let h = backend(vec![info("req-1", "/lab/alice", "")]);
+        match handle_ca(verb::DENY, cp_uri("req-1:not on team"), Some(&as_dyn(&h))) {
+            MgmtResponse::Control(cr) => assert!(cr.is_ok()),
+            _ => panic!("expected ControlResponse"),
+        }
+        let denied = h.denied.lock().unwrap();
+        assert_eq!(denied.len(), 1);
+        assert_eq!(denied[0].1, "not on team");
+    }
+
+    #[test]
+    fn deny_without_reason_defaults_to_denied() {
+        let h = backend(vec![info("req-1", "/lab/alice", "")]);
+        match handle_ca(verb::DENY, cp_uri("req-1"), Some(&as_dyn(&h))) {
+            MgmtResponse::Control(cr) => assert!(cr.is_ok()),
+            _ => panic!("expected ControlResponse"),
+        }
+        assert_eq!(h.denied.lock().unwrap()[0].1, "denied");
     }
 }

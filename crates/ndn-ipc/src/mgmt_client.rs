@@ -222,11 +222,46 @@ impl MgmtClient {
     /// pending device-approval requests. Returns one tuple per pending
     /// request: `(request_id, cert_name, description)`. Empty when no
     /// CA is wired or no requests are pending. Powers the §5.5
-    /// dashboard approver UI; resolution (approve/deny) happens via
-    /// the canonical signed-Data approval feed, not over mgmt.
+    /// dashboard approver UI.
     pub async fn ca_list_approvals(&self) -> Result<Vec<(String, String, String)>, ForwarderError> {
         let bytes = self.dataset_raw(module::CA, verb::LIST_APPROVALS).await?;
         Ok(decode_pending_approvals(&bytes))
+    }
+
+    /// `ca/approve`. Approves a pending device-approval request by id.
+    /// Signed-command gated (SECURITY-extended-module rule); the
+    /// signer's identity authorises the approval. v1 records
+    /// `"approved-via-mgmt"` as the approver label until the v2
+    /// canonical signed-Data path lands.
+    pub async fn ca_approve(
+        &self,
+        request_id: &str,
+    ) -> Result<ControlParameters, ForwarderError> {
+        let params = ControlParameters {
+            uri: Some(request_id.to_owned()),
+            ..Default::default()
+        };
+        self.command(module::CA, verb::APPROVE, &params).await
+    }
+
+    /// `ca/deny`. Denies a pending request. `reason` is recorded as
+    /// the denial detail (defaults to `"denied"` if empty). Signed-
+    /// command gated like `ca_approve`.
+    pub async fn ca_deny(
+        &self,
+        request_id: &str,
+        reason: &str,
+    ) -> Result<ControlParameters, ForwarderError> {
+        let uri = if reason.is_empty() {
+            request_id.to_owned()
+        } else {
+            format!("{request_id}:{reason}")
+        };
+        let params = ControlParameters {
+            uri: Some(uri),
+            ..Default::default()
+        };
+        self.command(module::CA, verb::DENY, &params).await
     }
 
     /// `cs/config`. `Some(capacity)` sets the new bytes cap; always

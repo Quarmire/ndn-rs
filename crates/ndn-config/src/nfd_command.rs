@@ -52,6 +52,14 @@ pub mod verb {
     pub const LIST: &[u8] = b"list";
     /// `ca` module — list pending device-approval requests.
     pub const LIST_APPROVALS: &[u8] = b"list-approvals";
+    /// `ca/approve` — approve a pending request. Signed-command gated
+    /// (SECURITY-extended-module rule); the signer's cert name is
+    /// recorded as the approver. v1 dashboard surface for the §5.5
+    /// device-approval flow.
+    pub const APPROVE: &[u8] = b"approve";
+    /// `ca/deny` — deny a pending request with a reason. Same gating
+    /// as `approve`.
+    pub const DENY: &[u8] = b"deny";
 
     pub const ADD_NEXTHOP: &[u8] = b"add-nexthop";
     pub const REMOVE_NEXTHOP: &[u8] = b"remove-nexthop";
