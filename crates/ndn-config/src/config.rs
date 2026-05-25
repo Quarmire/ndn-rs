@@ -981,6 +981,14 @@ pub struct EngineConfig {
     /// 0 = auto-detect, 1 = single-threaded inline, N = parallel tasks.
     #[serde(default)]
     pub pipeline_threads: usize,
+    /// Data-plane runtime: `"shared"` (default) or `"partitioned"`. The
+    /// partitioned (per-worker) runtime requires `ndn-fwd` built with the
+    /// `partitioned-fwd` feature; otherwise it falls back to shared.
+    #[serde(default = "default_data_plane")]
+    pub data_plane: String,
+    /// Worker count for the partitioned data plane. 0 = auto (physical cores).
+    #[serde(default)]
+    pub workers: usize,
 }
 
 fn default_cs_capacity_mb_engine() -> usize {
@@ -989,6 +997,9 @@ fn default_cs_capacity_mb_engine() -> usize {
 fn default_pipeline_channel_cap() -> usize {
     4096
 }
+fn default_data_plane() -> String {
+    "shared".to_string()
+}
 
 impl Default for EngineConfig {
     fn default() -> Self {
@@ -996,6 +1007,8 @@ impl Default for EngineConfig {
             cs_capacity_mb: default_cs_capacity_mb_engine(),
             pipeline_channel_cap: default_pipeline_channel_cap(),
             pipeline_threads: 0,
+            data_plane: default_data_plane(),
+            workers: 0,
         }
     }
 }
