@@ -35,8 +35,9 @@ pub struct MgmtClient {
 
 impl MgmtClient {
     pub async fn connect(face_socket: impl AsRef<str>) -> Result<Self, ForwarderError> {
-        let face =
-            Arc::new(ndn_face_native::local::ipc_face_connect(FaceId(0), face_socket.as_ref()).await?);
+        let face = Arc::new(
+            ndn_face_native::local::ipc_face_connect(FaceId(0), face_socket.as_ref()).await?,
+        );
         Ok(Self {
             face,
             recv_lock: Mutex::new(()),
@@ -215,6 +216,17 @@ impl MgmtClient {
     pub async fn rate_limit_list(&self) -> Result<Vec<ControlParameters>, ForwarderError> {
         let bytes = self.dataset_raw(module::RATE_LIMIT, verb::LIST).await?;
         Ok(ControlParameters::decode_all(&bytes))
+    }
+
+    /// `ca/list-approvals`. Read-only introspection of the NDNCERT CA's
+    /// pending device-approval requests. Returns one tuple per pending
+    /// request: `(request_id, cert_name, description)`. Empty when no
+    /// CA is wired or no requests are pending. Powers the §5.5
+    /// dashboard approver UI; resolution (approve/deny) happens via
+    /// the canonical signed-Data approval feed, not over mgmt.
+    pub async fn ca_list_approvals(&self) -> Result<Vec<(String, String, String)>, ForwarderError> {
+        let bytes = self.dataset_raw(module::CA, verb::LIST_APPROVALS).await?;
+        Ok(decode_pending_approvals(&bytes))
     }
 
     /// `cs/config`. `Some(capacity)` sets the new bytes cap; always
@@ -820,6 +832,45 @@ impl MgmtClient {
         ControlResponse::decode(Bytes::copy_from_slice(content))
             .map_err(|_| ForwarderError::MalformedResponse)
     }
+}
+
+/// Decode the `ca/list-approvals` dataset. Mirrors the TLV layout in
+/// `crates/ndn-mgmt/src/modules/ca.rs::approvals_dataset`:
+///   PendingApproval (0xCA) { RequestId (0xCC), CertName (0xCE), [Description (0xD0)] }
+fn decode_pending_approvals(bytes: &[u8]) -> Vec<(String, String, String)> {
+    const TYPE_PENDING_APPROVAL: u64 = 0xCA;
+    const TYPE_REQUEST_ID: u64 = 0xCC;
+    const TYPE_CERT_NAME: u64 = 0xCE;
+    const TYPE_DESCRIPTION: u64 = 0xD0;
+    let mut out = Vec::new();
+    let mut reader = ndn_tlv::TlvReader::new(Bytes::copy_from_slice(bytes));
+    while !reader.is_empty() {
+        let Ok((typ, body)) = reader.read_tlv() else {
+            break;
+        };
+        if typ != TYPE_PENDING_APPROVAL {
+            continue;
+        }
+        let mut inner = ndn_tlv::TlvReader::new(body);
+        let mut id = String::new();
+        let mut cert = String::new();
+        let mut desc = String::new();
+        while !inner.is_empty() {
+            let Ok((t, v)) = inner.read_tlv() else {
+                break;
+            };
+            match t {
+                TYPE_REQUEST_ID => id = String::from_utf8_lossy(&v).into_owned(),
+                TYPE_CERT_NAME => cert = String::from_utf8_lossy(&v).into_owned(),
+                TYPE_DESCRIPTION => desc = String::from_utf8_lossy(&v).into_owned(),
+                _ => {}
+            }
+        }
+        if !id.is_empty() && !cert.is_empty() {
+            out.push((id, cert, desc));
+        }
+    }
+    out
 }
 
 #[cfg(test)]
