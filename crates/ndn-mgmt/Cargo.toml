@@ -10,7 +10,7 @@ classification = "spec"
 
 [features]
 # Forwarded by binaries. Off by default — the library compiles standalone.
-yubikey-piv = ["ndn-security/yubikey-piv", "ndn-cert/yubikey-challenge", "dep:base64"]
+yubikey-piv = ["ndn-security/yubikey-piv", "ndn-cert/yubikey-challenge"]
 spsc-shm    = ["ndn-face-native/spsc-shm"]
 # Enables the ether:// faces/create arm (unicast NDN-over-Ethernet).
 l2          = ["ndn-face-native/l2"]
@@ -52,7 +52,7 @@ bytes            = { workspace = true, features = ["std"] }
 # native and uses `performance.now()` on wasm32; the engine's RibRoute
 # uses it so we must match.
 web-time         = { workspace = true }
-base64           = { workspace = true, optional = true }
+base64           = { workspace = true }
 # `net` and `io-util` are native-only; the wasm32 target excludes them
 # below.  `rt + macros + time + sync` is enough for `tokio::select!`,
 # `tokio::time::timeout`, and `tokio::spawn` on wasm.

@@ -3,7 +3,6 @@
 
 use std::sync::{Arc, RwLock};
 
-#[cfg(feature = "yubikey-piv")]
 use base64::Engine as _;
 
 use async_trait::async_trait;
@@ -135,20 +134,21 @@ fn security_identity_list(pib: &FilePib) -> ControlResponse {
     let mut text = format!("{} identities\n", keys.len());
     for key_name in &keys {
         let cert = pib.get_cert(key_name);
-        let (has_cert, valid_until) = match cert {
+        let (has_cert, valid_until, public_key_b64) = match cert {
             Ok(c) => {
                 let exp = if c.valid_until == u64::MAX {
                     "never".to_string()
                 } else {
                     format!("{}ns", c.valid_until)
                 };
-                (true, exp)
+                let pk = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&c.public_key);
+                (true, exp, pk)
             }
-            Err(_) => (false, "-".to_string()),
+            Err(_) => (false, "-".to_string(), "-".to_string()),
         };
         text.push_str(&format!(
-            "  name={} has_cert={} valid_until={}\n",
-            key_name, has_cert, valid_until,
+            "  name={} has_cert={} valid_until={} public_key={}\n",
+            key_name, has_cert, valid_until, public_key_b64,
         ));
     }
     ControlResponse::ok_empty(text)
@@ -762,11 +762,8 @@ async fn run_enrollment(
     );
 
     // NEW.
-    let mut session = EnrollmentSession::new(
-        identity_name.clone(),
-        std::sync::Arc::clone(&signer),
-        86400,
-    );
+    let mut session =
+        EnrollmentSession::new(identity_name.clone(), std::sync::Arc::clone(&signer), 86400);
 
     let new_body = session
         .new_request_body()
