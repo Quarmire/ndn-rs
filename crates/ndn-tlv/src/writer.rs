@@ -60,11 +60,6 @@ impl TlvWriter {
         &self.buf[start..]
     }
 
-    #[deprecated(note = "use slice_from for a zero-copy &[u8]")]
-    pub fn snapshot(&self, start: usize) -> Vec<u8> {
-        self.buf[start..].to_vec()
-    }
-
     pub fn finish(self) -> bytes::Bytes {
         self.buf.freeze()
     }
