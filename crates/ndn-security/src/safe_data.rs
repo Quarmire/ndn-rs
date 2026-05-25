@@ -32,7 +32,7 @@ pub struct SafeData {
 impl SafeData {
     /// Construct from a Data packet that arrived on a trusted local face,
     /// bypassing crypto verification.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn from_local_trusted(data: Data, uid: u32) -> Self {
         Self {
             inner: data,
@@ -54,7 +54,7 @@ impl SafeData {
     }
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn now_ns() -> u64 {
     use web_time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()

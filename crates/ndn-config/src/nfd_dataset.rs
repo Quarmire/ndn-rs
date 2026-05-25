@@ -53,8 +53,6 @@ mod tlv {
     pub const NEXT_HOP_RECORD: u64 = 0x81;
     pub const ROUTE: u64 = 0x81;
     pub const NAME: u64 = 0x07;
-    #[allow(dead_code)]
-    pub const NAME_COMPONENT: u64 = 0x08;
 }
 
 fn encode_non_neg_int(value: u64) -> Vec<u8> {

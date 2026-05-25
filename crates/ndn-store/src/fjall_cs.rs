@@ -22,6 +22,7 @@ const STALE_AT_LEN: usize = 8;
 /// overhead); data survives process restarts.
 pub struct FjallCs {
     keyspace: fjall::Keyspace,
+    // Held to keep the database open for `keyspace`'s lifetime; never read directly.
     #[allow(dead_code)]
     db: fjall::Database,
     max_bytes: AtomicUsize,

@@ -11,7 +11,6 @@ use tracing::{info, warn};
 use crate::device::RenewalPolicy;
 
 pub struct RenewalHandle {
-    #[allow(dead_code)]
     task: JoinHandle<()>,
 }
 

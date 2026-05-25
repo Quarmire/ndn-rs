@@ -15,6 +15,7 @@ use crate::{
 /// background renewal are needed.
 pub struct NdnIdentity {
     pub(crate) keychain: KeyChain,
+    // Owns the background renewal task; dropped (and aborted) with the identity.
     #[allow(dead_code)]
     pub(crate) renewal: Option<RenewalHandle>,
 }

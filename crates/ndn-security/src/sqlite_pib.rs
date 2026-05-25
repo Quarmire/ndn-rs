@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use bytes::Bytes;
-use ndn_packet::{Name, NameComponent, tlv_type};
+use ndn_packet::{Name, tlv_type};
 use ndn_tlv::{TlvReader, TlvWriter};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
@@ -675,12 +675,10 @@ fn name_to_string(name: &Name) -> String {
     if s.is_empty() { "/".into() } else { s }
 }
 
-#[allow(dead_code)]
-fn _force_use(_c: NameComponent) {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ndn_packet::NameComponent;
     use tempfile::tempdir;
 
     fn comp(s: &'static str) -> NameComponent {
