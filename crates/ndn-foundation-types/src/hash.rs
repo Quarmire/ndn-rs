@@ -38,8 +38,7 @@ impl core::fmt::Debug for Hash {
     }
 }
 
-// Guards the `std` feature, which gates `Hash::of` and was previously a
-// dead/non-compiling configuration (`alloc` was not in scope under `std`).
+// Guards the `std` feature, which gates `Hash::of`.
 #[cfg(all(test, feature = "std"))]
 mod tests {
     use super::Hash;

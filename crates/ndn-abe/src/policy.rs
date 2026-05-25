@@ -152,8 +152,6 @@ impl PolicyExpr {
     }
 }
 
-// ── Tokenizer ────────────────────────────────────────────────────────────────
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Token {
     Attr(String),   // raw attribute string, possibly with authority prefix
@@ -192,8 +190,6 @@ fn tokenize(src: &str) -> Result<Vec<Token>, String> {
     }
     Ok(tokens)
 }
-
-// ── Recursive-descent parser ─────────────────────────────────────────────────
 
 fn parse_or(tokens: &[Token], pos: &mut usize) -> Result<PolicyExpr, String> {
     let mut lhs = parse_and(tokens, pos)?;

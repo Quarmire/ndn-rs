@@ -154,7 +154,7 @@ pub struct DemoCaConfig {
     /// Legacy shortcut; ignored when `challenge` is non-empty.
     #[serde(default)]
     pub tokens: Vec<String>,
-    /// Explicit challenge set. When non-empty it replaces the legacy
+    /// Explicit challenge set. When non-empty it overrides the
     /// `tokens`-driven nop/token selection — the CA offers exactly these
     /// challenges. Serialized as `[[demo_ca.challenge]]` array-of-tables.
     #[serde(default, rename = "challenge")]

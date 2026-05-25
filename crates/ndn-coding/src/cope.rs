@@ -173,8 +173,6 @@ fn xor_into(acc: &mut [u8], src: &[u8]) {
     }
 }
 
-// ---- link framing for the broadcast medium ----
-//
 // A COPE link carries two opaque frame shapes, distinguished by a 1-byte tag.
 // This is link-layer framing (below the trust boundary, like NDNLP fragments);
 // the carried native is whatever signed packet it always was.

@@ -1415,7 +1415,7 @@ fn faces_list_dataset(engine: &ForwarderEngine) -> bytes::Bytes {
     buf.freeze()
 }
 
-// --- faces/link-quality (ndn-rs-local cross-layer telemetry dataset) ---------
+// faces/link-quality: ndn-rs-local cross-layer telemetry dataset
 //
 // NOT an NFD dataset — observability only. TLV codes are ndn-rs-local
 // (application range, single-byte). Each entry: LqEntry{ FaceId, [Rssi],

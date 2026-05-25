@@ -23,9 +23,6 @@ use rabe::utils::policy::pest::PolicyLanguage;
 
 use crate::error::AbeError;
 
-// ───────────────────────────────────────────────────────────────────────────
-// Opaque byte-blob wrappers (bincode-serialized rabe types)
-
 /// Serialized `Aw11GlobalKey` — shared across all authorities in a deployment.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Aw11GlobalKeyBytes(pub Bytes);
@@ -42,9 +39,6 @@ pub struct Aw11MasterKeyBytes(pub Bytes);
 /// accumulated from multiple authorities.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Aw11UserKey(pub Bytes);
-
-// ───────────────────────────────────────────────────────────────────────────
-// Serde helpers
 
 fn serialize_gk(gk: &Aw11GlobalKey) -> Result<Bytes, AbeError> {
     bincode::serialize(gk)
@@ -89,9 +83,6 @@ fn deserialize_sk(b: &[u8]) -> Result<Aw11SecretKey, AbeError> {
 fn deserialize_ct(b: &[u8]) -> Result<rabe::schemes::aw11::Aw11Ciphertext, AbeError> {
     bincode::deserialize(b).map_err(|e| AbeError::Serialization(e.to_string()))
 }
-
-// ───────────────────────────────────────────────────────────────────────────
-// Public API
 
 /// Generate the shared AW11 global key.
 /// Every authority and consumer in a deployment uses the same global key.

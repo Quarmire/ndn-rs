@@ -14,8 +14,6 @@ use tracing::instrument;
 
 use crate::{AbeError, PolicyExpr};
 
-// ── Opaque byte containers for rabe crypto types ──────────────────────────
-
 /// BSW master public parameters (the encryption/E-KEY material).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BswMasterParams {
@@ -36,8 +34,6 @@ pub struct BswAttributeKeys {
     /// bincode-serialized `CpAbeSecretKey`.
     pub keys_bytes: Bytes,
 }
-
-// ── Serialization helpers ─────────────────────────────────────────────────
 
 fn serialize<T: serde::Serialize>(v: &T) -> Result<Bytes, AbeError> {
     bincode::serialize(v)
@@ -85,8 +81,6 @@ impl BswAttributeKeys {
         deserialize(&self.keys_bytes)
     }
 }
-
-// ── BSW scheme functions ──────────────────────────────────────────────────
 
 /// Generate fresh BSW master key pair.
 #[instrument(skip_all)]

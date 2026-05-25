@@ -668,8 +668,6 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    // ---- reflexive-forwarding test helpers ----
-
     /// A face that captures every packet the engine sends to it.
     struct CaptureFace {
         id: ndn_transport::FaceId,

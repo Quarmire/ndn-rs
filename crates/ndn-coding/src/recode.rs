@@ -800,7 +800,7 @@ pub struct GenerationBuffer {
     packets: Vec<CodedPacket>,
     symbol_size: usize,
     fingerprint: Option<LinearFingerprint>,
-    // ---- pollution-resilience accounting (doctrine §6) ----
+    // pollution-resilience accounting (doctrine §6)
     /// Max absorb attempts before refusing (0 = unlimited). DoS guard.
     budget: usize,
     /// Rejected-packet count before quarantining the generation (0 = never).
@@ -1154,7 +1154,7 @@ pub fn row_hash(row: &[u8]) -> [u8; 32] {
     h.finalize().into()
 }
 
-// ---- wire helpers (mirrors metadata.rs; kept local to the F2 module) ----
+// wire helpers, kept local to the F2 module
 
 fn field_code(f: Field) -> u8 {
     match f {
@@ -1364,8 +1364,6 @@ mod tests {
         // mismatched lengths rejected
         assert!(recode_combine(&held, &[1]).is_none());
     }
-
-    // ---- codec + buffer (F2 wire spec) ----
 
     fn sample_descriptor(k: u16, sym: u32, commit: SourceCommitment) -> GenerationDescriptor {
         GenerationDescriptor {

@@ -64,8 +64,6 @@ pub(crate) fn read_name(r: &mut TlvReader) -> Result<Name, TlvCodecError> {
     Name::decode(inner).map_err(|_| TlvCodecError::MalformedField(tlv_type::NAME))
 }
 
-// ── AbeSchemeId wire helpers ──────────────────────────────────────────────────
-
 impl AbeSchemeId {
     pub(crate) const fn wire_disc(self) -> u8 {
         match self {
@@ -81,8 +79,6 @@ impl AbeSchemeId {
         }
     }
 }
-
-// ── TLV encoding ─────────────────────────────────────────────────────────────
 
 impl TlvEncode for AbeCiphertext {
     const TYPE: u64 = ABE_CIPHERTEXT_TYPE;

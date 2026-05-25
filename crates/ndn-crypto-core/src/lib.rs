@@ -171,12 +171,10 @@ pub fn verify_data_ed25519(wire: &[u8], public_key: &[u8; 32]) -> bool {
     vk.verify(&inner[..signed_end], &Signature::from_bytes(&arr)).is_ok()
 }
 
-// ---------------------------------------------------------------------------
 // Content confidentiality (the no_std baseline). Provability (signing) and
 // confidentiality are orthogonal in NDN: sign the *encrypted* Data so caches
 // still verify + forward without decrypting. Key distribution / access control
 // (NAC, ABE) layer on top of this primitive.
-// ---------------------------------------------------------------------------
 
 use chacha20poly1305::aead::AeadInPlace;
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce, Tag};

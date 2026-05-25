@@ -317,7 +317,7 @@ mod tests {
         assert_ne!(a.trace_id, b.trace_id);
     }
 
-    // ── splice / extract ─────────────────────────────────────────────
+    // splice / extract
 
     #[cfg(feature = "std")]
     fn lp_packet_around(inner_interest: &[u8]) -> Bytes {
