@@ -875,11 +875,9 @@ fn validate_face_config(face: &FaceConfig) -> Result<(), ConfigError> {
                     "ether face peer-mac must be aa:bb:cc:dd:ee:ff: {peer_mac}"
                 )));
             }
-            if io.as_deref() == Some("afxdp") && bpf_object.is_none() {
-                return Err(ConfigError::Invalid(
-                    "ether face io = \"afxdp\" requires bpf-object".into(),
-                ));
-            }
+            // `io = "afxdp"` works with no `bpf-object` (the embedded redirect
+            // program is used); a path, if given, just overrides it.
+            let _ = (io, bpf_object);
         }
         FaceConfig::Unix { .. } | FaceConfig::EtherMulticast { .. } => {}
     }
