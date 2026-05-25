@@ -857,6 +857,8 @@ fn validate_face_config(face: &FaceConfig) -> Result<(), ConfigError> {
         FaceConfig::Ether {
             interface,
             peer_mac,
+            io,
+            bpf_object,
         } => {
             if interface.is_empty() {
                 return Err(ConfigError::Invalid(
@@ -872,6 +874,11 @@ fn validate_face_config(face: &FaceConfig) -> Result<(), ConfigError> {
                 return Err(ConfigError::Invalid(format!(
                     "ether face peer-mac must be aa:bb:cc:dd:ee:ff: {peer_mac}"
                 )));
+            }
+            if io.as_deref() == Some("afxdp") && bpf_object.is_none() {
+                return Err(ConfigError::Invalid(
+                    "ether face io = \"afxdp\" requires bpf-object".into(),
+                ));
             }
         }
         FaceConfig::Unix { .. } | FaceConfig::EtherMulticast { .. } => {}
@@ -1089,6 +1096,14 @@ pub enum FaceConfig {
         /// Peer MAC as `aa:bb:cc:dd:ee:ff`.
         #[serde(rename = "peer-mac")]
         peer_mac: String,
+        /// I/O backend: `"af-packet"` (default) or `"afxdp"` (kernel-bypass,
+        /// Linux; requires `ndn-fwd` built with the `af-xdp` feature).
+        #[serde(default)]
+        io: Option<String>,
+        /// Path to the compiled XDP redirect object. Required when
+        /// `io = "afxdp"`.
+        #[serde(default, rename = "bpf-object")]
+        bpf_object: Option<String>,
     },
 }
 
