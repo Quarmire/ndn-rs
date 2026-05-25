@@ -724,9 +724,7 @@ fn expand_env_vars(s: &str) -> String {
             match std::env::var(&var_name) {
                 Ok(val) => result.push_str(&val),
                 Err(_) => {
-                    eprintln!(
-                        "ndn-config: unknown env var ${{{var_name}}}, replacing with empty string"
-                    );
+                    tracing::warn!(var = %var_name, "unknown env var, replacing with empty string");
                 }
             }
         } else {
