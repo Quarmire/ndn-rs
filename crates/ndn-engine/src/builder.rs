@@ -69,6 +69,11 @@ pub struct EngineConfig {
     /// and requires the `partitioned-fwd` feature (otherwise it falls back to
     /// `Shared` with a warning). See `crate::dispatcher::DataPlane`.
     pub data_plane: crate::dispatcher::DataPlane,
+    /// Require cryptographic Data validation even on Local-scope faces
+    /// (IPC/SHM/loopback), which otherwise skip it. Default `false`. Set `true`
+    /// on a multi-tenant host so a local app cannot poison the CS or spoof
+    /// another namespace; applied to every Local face as it is added.
+    pub require_local_validation: bool,
 }
 
 pub use crate::replay_guard_config::ReplayGuardConfig;
@@ -81,6 +86,7 @@ impl Default for EngineConfig {
             pipeline_threads: 0,
             replay_guard: ReplayGuardConfig::default(),
             reflexive: crate::reflexive::ReflexiveConfig::default(),
+            require_local_validation: false,
             network_region: Vec::new(),
             unsolicited_data: crate::unsolicited::UnsolicitedDataPolicy::default(),
             data_plane: crate::dispatcher::DataPlane::default(),
@@ -436,6 +442,7 @@ impl EngineBuilder {
             validator: engine_validator,
             replay_guard: replay_guard.clone(),
             pipeline_tx: OnceLock::new(),
+            require_local_validation: self.config.require_local_validation,
             face_states: Arc::clone(&face_states),
             discovery: Arc::clone(&discovery),
             neighbors: Arc::clone(&neighbors),

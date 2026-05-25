@@ -269,6 +269,7 @@ impl WasmEngineBuilder {
             validator: validator.clone(),
             replay_guard: replay_guard.clone(),
             pipeline_tx: OnceLock::new(),
+            require_local_validation: false,
             face_states: Arc::clone(&face_states),
             discovery: Arc::clone(&discovery),
             neighbors: Arc::clone(&neighbors),

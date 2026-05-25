@@ -27,6 +27,14 @@ DURATION="${DURATION:-10}"
 WINDOW="${WINDOW:-256}"        # ≥256 → throughput-bound, not RTT-bound
 ITERS="${ITERS:-3}"           # client runs per mode; the max (peak) is reported
 WORKERS="${WORKERS:-1}"       # partitioned worker count (1 = isolate seam overhead)
+VALIDATE="${VALIDATE:-0}"     # 1 = force forwarder Data validation on the SHM
+                              #     (Local) faces. NOTE: ndn-iperf's control
+                              #     exchange stalls under forced validation; for
+                              #     a clean crypto-stress shared-vs-partitioned
+                              #     comparison use the in-process harness
+                              #     `cargo test -p ndn-engine --features
+                              #     partitioned-fwd --release --test
+                              #     partition_throughput -- --ignored` (VALIDATE=1).
 REGRESS_PCT="${REGRESS_PCT:-90}"
 SIGN="${SIGN:-digest_sha256}"
 SIZE="${SIZE:-8192}"
@@ -60,16 +68,29 @@ run_mode() {
   local sock="$tmp/ndn-fwd.sock"
   local cfg="$tmp/config.toml"
 
+  local engine_validate="" security_block="[security.mgmt]
+require_signed_commands = false"
+  if [ "$VALIDATE" = "1" ]; then
+    # Force the forwarder to verify every Data even on the Local SHM faces,
+    # against an accept-all validator (DigestSha256 self-validates).
+    engine_validate="require_local_validation = true"
+    security_block="[security]
+validator_enabled = true
+profile = \"default\"
+
+[security.mgmt]
+require_signed_commands = false"
+  fi
   cat > "$cfg" <<EOF
 [engine]
 data_plane = "$mode"
 workers    = $WORKERS
+$engine_validate
 
 [management]
 face_socket = "$sock"
 
-[security.mgmt]
-require_signed_commands = false
+$security_block
 EOF
 
   "$FWD" -c "$cfg" >"$tmp/fwd.log" 2>&1 &
@@ -106,7 +127,7 @@ EOF
   echo "$best"
 }
 
-echo "=== data-plane regression: SHM + $SIGN, ${DURATION}s × ${ITERS} (peak), window ${WINDOW}, size ${SIZE}B ==="
+echo "=== data-plane: SHM + $SIGN, validate=$VALIDATE, workers=$WORKERS, ${DURATION}s × ${ITERS} (peak), window ${WINDOW}, size ${SIZE}B ==="
 SHARED_G="$(run_mode shared)"
 echo "  shared       : ${SHARED_G} Gbps (peak of ${ITERS})"
 PART_G="$(run_mode partitioned)"

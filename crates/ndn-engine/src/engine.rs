@@ -266,6 +266,9 @@ pub struct EngineInner {
     /// `OnceLock` because the sender is created by `PacketDispatcher::spawn`
     /// after `Arc<EngineInner>` exists.
     pub(crate) pipeline_tx: OnceLock<mpsc::Sender<InboundPacket>>,
+    /// Force Data validation on Local faces as they are added (see
+    /// `EngineConfig::require_local_validation`).
+    pub(crate) require_local_validation: bool,
     pub(crate) face_states: Arc<DashMap<FaceId, FaceState>>,
     pub discovery: Arc<dyn DiscoveryProtocol>,
     pub neighbors: Arc<NeighborTable>,
@@ -430,7 +433,8 @@ impl ForwarderEngine {
         persistency: FacePersistency,
     ) {
         let face_id = face.id();
-        let congestion_policy = CongestionPolicy::default_for_scope(face.scope());
+        let scope = face.scope();
+        let congestion_policy = CongestionPolicy::default_for_scope(scope);
         let (send_tx, send_rx) = mpsc::channel(DEFAULT_SEND_QUEUE_CAP);
         let state = FaceState::new(
             cancel.clone(),
@@ -438,6 +442,9 @@ impl ForwarderEngine {
             send_tx.clone(),
             congestion_policy,
         );
+        if self.inner.require_local_validation && scope == ndn_transport::FaceScope::Local {
+            state.set_require_data_validation(true);
+        }
         self.inner.face_states.insert(face_id, state);
         self.inner.face_table.insert(face);
         let erased = self

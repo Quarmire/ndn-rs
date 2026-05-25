@@ -996,6 +996,11 @@ pub struct EngineConfig {
     /// Worker count for the partitioned data plane. 0 = auto (physical cores).
     #[serde(default)]
     pub workers: usize,
+    /// Require Data signature validation even on Local faces (IPC/SHM), which
+    /// otherwise skip it. Default false. For multi-tenant hosts (or to stress
+    /// the validation path under load).
+    #[serde(default)]
+    pub require_local_validation: bool,
 }
 
 fn default_cs_capacity_mb_engine() -> usize {
@@ -1016,6 +1021,7 @@ impl Default for EngineConfig {
             pipeline_threads: 0,
             data_plane: default_data_plane(),
             workers: 0,
+            require_local_validation: false,
         }
     }
 }
