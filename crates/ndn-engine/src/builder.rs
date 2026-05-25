@@ -64,6 +64,11 @@ pub struct EngineConfig {
     /// broadcast bearer. Admitted Data is cached only, never forwarded, and
     /// still must pass validation before entering the CS.
     pub unsolicited_data: crate::unsolicited::UnsolicitedDataPolicy,
+    /// Which data-plane runtime to run. Default `Shared` (one pipeline over a
+    /// single PIT). `Partitioned` selects the decode-in-RX + per-worker model
+    /// and requires the `partitioned-fwd` feature (otherwise it falls back to
+    /// `Shared` with a warning). See `crate::dispatcher::DataPlane`.
+    pub data_plane: crate::dispatcher::DataPlane,
 }
 
 pub use crate::replay_guard_config::ReplayGuardConfig;
@@ -78,6 +83,7 @@ impl Default for EngineConfig {
             reflexive: crate::reflexive::ReflexiveConfig::default(),
             network_region: Vec::new(),
             unsolicited_data: crate::unsolicited::UnsolicitedDataPolicy::default(),
+            data_plane: crate::dispatcher::DataPlane::default(),
         }
     }
 }
@@ -496,6 +502,7 @@ impl EngineBuilder {
             discovery_ctx: Arc::clone(&discovery_ctx),
             reflexive: Arc::clone(&reflexive),
             rate_limit: self.rate_limit_hook.clone(),
+            data_plane: self.config.data_plane,
         };
 
         let pipeline_tx = dispatcher.spawn(cancel.clone(), &mut tasks);

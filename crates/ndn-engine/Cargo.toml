@@ -22,6 +22,12 @@ face-net = []
 #              items may move between patch releases. See
 #              
 experimental-instrument = []
+# Partitioned forwarding data-plane runtime (native-only). Selects a
+# decode-in-RX + per-worker forwarding model via `EngineConfig::data_plane`,
+# the path toward NDN-DPDK-style per-core state partitioning. Phase 1 is a
+# single-worker seam with no semantic change vs the shared runtime. Design:
+# `.claude/notes/partitioned-fwd-design-2026-05-24.md`.
+partitioned-fwd = []
 
 [dependencies]
 ndn-packet    = { workspace = true, default-features = false }

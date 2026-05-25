@@ -127,6 +127,46 @@ impl TlvDecodeStage {
         ))
     }
 
+    /// One-shot inbound decode entrypoint: NDNLPv2 fragment fast-path followed
+    /// by full TLV/LP decode. Turns raw link-layer bytes into a decoded
+    /// `PacketContext` (`Action::Continue`), a buffered fragment
+    /// (`Action::Drop(FragmentCollect)`), or a drop. Both data-plane runtimes
+    /// decode through here so they behave identically — the dispatcher pipeline
+    /// via `decode_resolved` (it runs the fast-path itself for batch/spawn
+    /// shaping), the partitioned-forwarding RX path via this one-shot form (see
+    /// `.claude/notes/partitioned-fwd-design-2026-05-24.md`).
+    pub fn decode_inbound(
+        &self,
+        raw: Bytes,
+        face_id: FaceId,
+        arrival: u64,
+        endpoint_id: u64,
+    ) -> Action {
+        let raw = match self.try_collect_fragment(face_id, endpoint_id, raw) {
+            Ok(None) => return Action::Drop(DropReason::FragmentCollect),
+            Ok(Some(reassembled)) => reassembled,
+            Err(raw) => raw,
+        };
+        self.decode_resolved(raw, face_id, arrival, endpoint_id)
+    }
+
+    /// Decode bytes that have already cleared the fragment fast-path (a bare
+    /// TLV packet or a completed reassembly): build the `PacketContext` and run
+    /// the decode stage. The dispatcher pipeline calls this directly because it
+    /// runs `try_collect_fragment` itself; `decode_inbound` wraps it with the
+    /// fast-path for callers without that pre-step.
+    pub fn decode_resolved(
+        &self,
+        raw: Bytes,
+        face_id: FaceId,
+        arrival: u64,
+        endpoint_id: u64,
+    ) -> Action {
+        let mut ctx = PacketContext::new(raw, face_id, arrival);
+        ctx.endpoint_id = endpoint_id;
+        self.process(ctx)
+    }
+
     pub fn process(&self, mut ctx: PacketContext) -> Action {
         let first_byte = match ctx.raw_bytes.first() {
             Some(&b) => b as u64,
@@ -732,5 +772,35 @@ mod reassembly_endpoint_tests {
         }
         assert_eq!(got_a.expect("peer A reassembles"), a);
         assert_eq!(got_b.expect("peer B reassembles"), b);
+    }
+
+    /// `decode_inbound` (the one-shot entrypoint the partitioned RX path will
+    /// use) runs the fragment fast-path and then full decode: non-final
+    /// fragments buffer (`Drop(FragmentCollect)`), the final fragment yields a
+    /// decoded `PacketContext`. Same outcome the dispatcher reaches via
+    /// `try_collect_fragment` + `decode_resolved`.
+    #[test]
+    fn decode_inbound_reassembles_then_decodes() {
+        let s = stage();
+        let face = FaceId(9);
+        let data = DataBuilder::new("/peer/c", &vec![0xCC; 300]).sign_digest_sha256();
+        let frags = fragment_packet(&data, 100, 0);
+        assert!(frags.len() > 1, "fixture must be multi-fragment");
+
+        let mut decoded = None;
+        for (i, f) in frags.iter().enumerate() {
+            match s.decode_inbound(f.clone(), face, 0, 0) {
+                Action::Continue(ctx) => decoded = Some(ctx),
+                Action::Drop(DropReason::FragmentCollect) => {
+                    assert!(i < frags.len() - 1, "only non-final fragments buffer");
+                }
+                _ => panic!("unexpected decode action"),
+            }
+        }
+        let ctx = decoded.expect("final fragment completes decode");
+        match ctx.packet {
+            DecodedPacket::Data(d) => assert_eq!(d.name.to_string(), "/peer/c"),
+            _ => panic!("expected reassembled Data"),
+        }
     }
 }

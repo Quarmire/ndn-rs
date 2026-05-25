@@ -10,6 +10,7 @@ use crate::observability::targets as t;
 use crate::pipeline::{
     Action, DecodedPacket, DropReason, ForwardingAction, NackReason, PacketContext,
 };
+use ndn_discovery_core::InboundMeta;
 use ndn_store::PitToken;
 use ndn_transport::{FaceId, FaceScope};
 
@@ -108,10 +109,10 @@ impl PacketDispatcher {
     async fn process_packet_inner(&self, pkt: InboundPacket) {
         trace!(target: t::FWD_PIPELINE, face=%pkt.face_id, len=pkt.raw.len(), "pipeline: packet arrived");
         let meta = pkt.meta;
-        let mut ctx = PacketContext::new(pkt.raw, pkt.face_id, pkt.arrival);
-        ctx.endpoint_id = meta.endpoint_id();
-
-        let ctx = match self.decode.process(ctx) {
+        let ctx = match self
+            .decode
+            .decode_resolved(pkt.raw, pkt.face_id, pkt.arrival, meta.endpoint_id())
+        {
             Action::Continue(ctx) => ctx,
             Action::Drop(DropReason::FragmentCollect) => {
                 trace!(target: t::FACE_LP, face=%pkt.face_id, "fragment collected, awaiting reassembly");
@@ -127,6 +128,16 @@ impl PacketDispatcher {
             }
         };
 
+        self.forward_decoded(ctx, meta).await;
+    }
+
+    /// Forward an already-decoded packet: discovery hook, ingress counters,
+    /// inbound rate limit, then the Interest/Data/Nack pipeline. Split out of
+    /// `process_packet_inner` so the shared runtime (decode + forward in one
+    /// task) and the partitioned runtime (decode in the RX front-end, forward
+    /// in a worker) run the identical forwarding path. See
+    /// `.claude/notes/partitioned-fwd-design-2026-05-24.md`.
+    pub(crate) async fn forward_decoded(&self, ctx: PacketContext, meta: InboundMeta) {
         if let Some(ref name) = ctx.name {
             tracing::Span::current().record("name", name.to_string());
         }
@@ -407,17 +418,36 @@ impl PacketDispatcher {
         // access control; skip crypto for them. A remote WS/WT/WebRTC peer is
         // NonLocal here, so its Data is verified — unlike the old kind-only
         // classification, which trusted any browser peer.
+        //
+        // A face may opt OUT of the local fast-path via
+        // `require_data_validation` (multi-tenant host: forged Data from one
+        // local app must not poison the shared CS or spoof another app's
+        // namespace). When required, validation runs as for a NonLocal face,
+        // and fail-closes if no validator is configured.
         let is_local = self
             .face_table
             .get(ctx.face_id)
             .map(|f| f.scope() == FaceScope::Local)
             .unwrap_or(false);
+        let require_local_validation = is_local
+            && self
+                .face_states
+                .get(&ctx.face_id)
+                .is_some_and(|s| s.require_data_validation());
 
-        let ctx = if is_local {
+        let ctx = if is_local && !require_local_validation {
             let mut ctx = ctx;
             ctx.verified = true;
             ctx
         } else {
+            if require_local_validation && self.validation.validator.is_none() {
+                debug!(
+                    target: t::SECURITY,
+                    face = %ctx.face_id,
+                    "data on a require-validation face but no validator configured; dropping (fail-closed)"
+                );
+                return;
+            }
             match self.validation.process(ctx).await {
                 Action::Satisfy(ctx) => ctx,
                 Action::Drop(r) => {

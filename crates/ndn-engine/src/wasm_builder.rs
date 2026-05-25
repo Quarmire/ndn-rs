@@ -332,6 +332,8 @@ impl WasmEngineBuilder {
             discovery_ctx: Arc::clone(&discovery_ctx),
             reflexive: Arc::clone(&reflexive),
             rate_limit: self.rate_limit_hook.clone(),
+            // wasm is single-threaded: the partitioned runtime never applies.
+            data_plane: crate::dispatcher::DataPlane::Shared,
         };
 
         let pipeline_tx = dispatcher.spawn(cancel.clone(), &mut tasks);

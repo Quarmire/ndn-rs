@@ -149,6 +149,14 @@ pub struct FaceState {
     /// Set when the remote peer sends LP-wrapped packets (type 0x64). LP
     /// encoding is a per-link property determined by what the peer sends.
     pub uses_lp: AtomicBool,
+    /// Require cryptographic Data validation on this face even when it is
+    /// Local-scope. Default `false`: Local faces (IPC/SHM/loopback) are trusted
+    /// by OS access control and skip verification (the fast path). Set `true`
+    /// for a multi-tenant host where mutually-distrusting local apps share one
+    /// forwarder, so forged Data cannot poison the CS or spoof another app's
+    /// namespace. Fail-closed: with no validator configured, required-validation
+    /// Data is dropped. NonLocal faces always validate regardless of this flag.
+    pub require_data_validation: AtomicBool,
     /// NFD `FaceFlags` bitmap (`FaceStatus.Flags`, TLV 0x6C), mutable via
     /// `faces/update` with `Flags`+`Mask`. External callers go through the
     /// named accessors on this struct.
@@ -174,8 +182,19 @@ impl FaceState {
             send_tx,
             congestion_policy,
             uses_lp: AtomicBool::new(false),
+            require_data_validation: AtomicBool::new(false),
             flags: AtomicU64::new(0),
         }
+    }
+
+    /// Whether this face requires Data validation even when Local-scope.
+    pub fn require_data_validation(&self) -> bool {
+        self.require_data_validation.load(Ordering::Relaxed)
+    }
+
+    /// Set the [`require_data_validation`](Self::require_data_validation) policy.
+    pub fn set_require_data_validation(&self, enabled: bool) {
+        self.require_data_validation.store(enabled, Ordering::Relaxed);
     }
 
     /// Raw NFD face-flags bitmap. Prefer the named accessors below.
@@ -615,6 +634,19 @@ impl ForwarderEngine {
     pub fn set_local_fields(&self, face_id: FaceId, enabled: bool) {
         if let Some(state) = self.inner.face_states.get(&face_id) {
             state.set_local_fields_bit(enabled);
+        }
+    }
+
+    /// Require cryptographic Data validation on `face_id` even when it is
+    /// Local-scope. Off by default (Local faces are trusted by OS access
+    /// control and skip verification). Enable on a multi-tenant host so a
+    /// malicious/buggy local app cannot inject forged Data into the shared CS
+    /// or satisfy another app's Interests. Fail-closed: with no validator
+    /// configured, Data on a required-validation face is dropped. See
+    /// `data_pipeline` and `.claude/notes/partitioned-fwd-design-2026-05-24.md`.
+    pub fn set_require_data_validation(&self, face_id: FaceId, enabled: bool) {
+        if let Some(state) = self.inner.face_states.get(&face_id) {
+            state.set_require_data_validation(enabled);
         }
     }
 }

@@ -1,5 +1,7 @@
 mod inbound;
 mod outbound;
+#[cfg(feature = "partitioned-fwd")]
+mod partitioned;
 mod pipeline;
 
 use std::sync::Arc;
@@ -45,6 +47,21 @@ pub(crate) struct InboundPacket {
     pub(crate) meta: InboundMeta,
 }
 
+/// Which data-plane runtime the engine runs. `Shared` is the default: one
+/// pipeline task over a single (`DashMap`) PIT. `Partitioned` selects the
+/// decode-in-RX + per-worker forwarding model (`partitioned-fwd` feature; the
+/// variant is always present so config round-trips even in a build without the
+/// feature, where it falls back to `Shared`). See
+/// `.claude/notes/partitioned-fwd-design-2026-05-24.md`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DataPlane {
+    #[default]
+    Shared,
+    Partitioned {
+        workers: usize,
+    },
+}
+
 pub struct PacketDispatcher {
     pub face_table: Arc<FaceTable>,
     pub face_states: Arc<dashmap::DashMap<FaceId, FaceState>>,
@@ -68,6 +85,8 @@ pub struct PacketDispatcher {
     /// `None` is the zero-cost path: every probe site short-circuits on
     /// `Option::is_none`, so the per-packet cost is one untaken branch.
     pub rate_limit: Option<crate::rate_limit_hook::SharedRateLimitHook>,
+    /// Which data-plane runtime to spawn. Default `Shared`.
+    pub data_plane: DataPlane,
 }
 
 impl PacketDispatcher {
@@ -159,17 +178,24 @@ impl PacketDispatcher {
             }
         }
 
-        let d = Arc::clone(&dispatcher);
         let cancel2 = cancel.clone();
-        tasks.spawn(
-            async move {
-                d.run_pipeline(rx, cancel2).await;
+        #[cfg(feature = "partitioned-fwd")]
+        match dispatcher.data_plane {
+            DataPlane::Partitioned { workers } => {
+                dispatcher.spawn_partitioned(rx, cancel2, tasks, workers.max(1));
             }
-            .instrument(tracing::info_span!(
-                target: crate::observability::targets::FWD_PIPELINE,
-                "pipeline_dispatch",
-            )),
-        );
+            DataPlane::Shared => dispatcher.spawn_shared_pipeline(rx, cancel2, tasks),
+        }
+        #[cfg(not(feature = "partitioned-fwd"))]
+        {
+            if matches!(dispatcher.data_plane, DataPlane::Partitioned { .. }) {
+                tracing::warn!(
+                    target: crate::observability::targets::FWD_PIPELINE,
+                    "data_plane=partitioned requested but the `partitioned-fwd` feature is not built; using the shared runtime"
+                );
+            }
+            dispatcher.spawn_shared_pipeline(rx, cancel2, tasks);
+        }
 
         if dispatcher.validation.validator.is_some() {
             let d = Arc::clone(&dispatcher);
@@ -186,5 +212,25 @@ impl PacketDispatcher {
         }
 
         tx
+    }
+
+    /// Spawn the shared (default) data-plane: one pipeline task draining the
+    /// inbound channel over the single PIT.
+    fn spawn_shared_pipeline(
+        self: &Arc<Self>,
+        rx: mpsc::Receiver<InboundPacket>,
+        cancel: CancellationToken,
+        tasks: &mut TaskTracker,
+    ) {
+        let d = Arc::clone(self);
+        tasks.spawn(
+            async move {
+                d.run_pipeline(rx, cancel).await;
+            }
+            .instrument(tracing::info_span!(
+                target: crate::observability::targets::FWD_PIPELINE,
+                "pipeline_dispatch",
+            )),
+        );
     }
 }
