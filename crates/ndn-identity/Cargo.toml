@@ -21,6 +21,9 @@ base64       = { workspace = true }
 futures      = { workspace = true }
 tokio        = { workspace = true, features = ["sync", "time", "rt"] }
 tracing      = { workspace = true }
+async-trait  = { workspace = true }
+sha2         = { workspace = true }
+dashmap      = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }
