@@ -41,5 +41,6 @@ pub use error::IdentityError;
 pub use identity::NdnIdentity;
 pub use trust_context::{
     AdoptionProvenance, CapabilitySet, FaceIdRef, Fingerprint, IdentityLifetime, IdentityRef,
-    KeyId, SharedTrustContext, SyncBundle, TrustContext, TrustContextError, VerificationOutcome,
+    KeyId, SharedTrustContext, SyncBundle, SyncBundleError, TrustContext, TrustContextError,
+    VerificationOutcome,
 };

@@ -11,6 +11,7 @@ classification = "spec"
 [dependencies]
 ndn-packet   = { workspace = true, features = ["std"] }
 ndn-security = { workspace = true }
+ndn-tlv      = { workspace = true }
 ndn-cert     = { workspace = true }
 ndn-app      = { workspace = true }
 bytes        = { workspace = true, features = ["std"] }

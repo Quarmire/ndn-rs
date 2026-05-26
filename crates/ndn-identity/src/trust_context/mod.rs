@@ -18,11 +18,12 @@ mod fingerprint;
 mod identity_ref;
 mod provenance;
 mod sync;
+pub mod sync_tlv;
 
 pub use fingerprint::Fingerprint;
 pub use identity_ref::{CapabilitySet, IdentityLifetime, IdentityRef, KeyId};
 pub use provenance::{AdoptionProvenance, FaceIdRef};
-pub use sync::SyncBundle;
+pub use sync::{SyncBundle, SyncBundleError};
 
 /// Error surface for portable-context operations (identity lookup, signing
 /// authorization decisions, sync export/import).
