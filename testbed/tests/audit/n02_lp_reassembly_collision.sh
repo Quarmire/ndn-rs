@@ -13,13 +13,15 @@
 #              Two simulated peers feed `seq=42` first fragments with
 #              distinct endpoint identifiers; post-fix they produce two
 #              pending entries and reassemble independently.
-#
-# Deferred:    The face → engine wire-up that derives a stable per-source
-#              `endpoint_id` from `FaceAddr` for multi-access faces is a
-#              follow-up; today the engine passes `0` (unicast assumption)
-#              from `TlvDecodeStage::process_lp`. The data-structure-side
-#              collision fix is in place so the wire-up is the only
-#              remaining step.
+#              RUST-UNIT in `ndn-engine`:
+#                - n02_face_addr_meta_yields_*_endpoint_ids
+#                - n02_*decode*/reassembly tests
+#              prove FaceAddr-derived UDP/MAC endpoint ids feed the decode
+#              stage, so shared-medium senders do not alias at LP reassembly.
+#              LIVE-UDP in `ndn-face-native`:
+#                - n02_live_udp_shared_medium_source_addrs_drive_reassembly
+#              sends colliding fragment sequences from two real UDP sockets
+#              into one shared-medium face and reassembles both by source.
 #
 # Exit codes:  0 PASS / 1 FAIL / 2 SKIP
 set -euo pipefail
@@ -36,9 +38,26 @@ else
     fail=1
 fi
 
+if cargo test -p ndn-engine --lib --quiet n02_ \
+        >>/tmp/n02_witness.log 2>&1; then
+    echo "ok: FaceAddr-derived endpoint ids reach engine LP reassembly"
+else
+    echo "FAIL: engine does not preserve per-sender endpoint ids"
+    fail=1
+fi
+
+if cargo test -p ndn-face-native --test shared_medium_live --quiet \
+        n02_live_udp_shared_medium_source_addrs_drive_reassembly \
+        >>/tmp/n02_witness.log 2>&1; then
+    echo "ok: live UDP shared-medium senders reassemble independently"
+else
+    echo "FAIL: live UDP shared-medium reassembly fixture failed"
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo
-    echo "=== N.02 RESOLVED 2026-05-02 (data-structure; multi-access wire-up follow-up) ==="
+    echo "=== N.02 RESOLVED 2026-05-28 — LP reassembly keyed by live FaceAddr-derived endpoint ids ==="
     exit 0
 else
     echo

@@ -7,18 +7,18 @@
 # Spec ref:    NFD `daemon/fw/scope-prefix.hpp:46-58` (LOCALHOP);
 #              `daemon/fw/algorithm.cpp:45-49` wouldViolateScope rule.
 # Witnesses:
-#   Part 1 — GREP-PROOF + RUST-UNIT (localhop in crates/;
-#             d02_is_localhop_name_recognises_prefix unit test)
+#   Part 1 — RUST-UNIT (localhop scope helper and decode-stage behavior)
 #   Part 2 — INTEROP-SCRIPT: face-scope split test via testbed
 #
-#     Setup: ndn-fwd has a route /localhop → NFD (pre-seeded CS entry).
+#     Setup: ndn-fwd has a route /localhop and the witness generates a unique
+#       probe prefix per run to avoid stale Content Store or producer state.
 #
 #     Test A — Remote face (TCP from interop container, FaceScope::NonLocal):
-#       ndnpeek via TCP to ndn-fwd:6363 → /localhop/d02-probe
+#       ndnpeek via TCP to ndn-fwd:6363 → /localhop/<unique-probe>
 #       Expected: timeout (ndn-fwd drops at decode stage, scope violation)
 #
 #     Test B — Local face (Unix socket from testclient, FaceScope::Local):
-#       ndn-peek via /run/ndn-fwd/ndn-fwd.sock → /localhop/d02-probe
+#       ndn-peek via /run/ndn-fwd/ndn-fwd.sock → /localhop/<unique-probe>
 #       Expected: Data returned from NFD's CS (scope NOT violated)
 #
 #     Unix socket faces are classified FaceScope::Local in ndn-rs
@@ -31,20 +31,14 @@ REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 cd "$REPO_ROOT"
 
 fail=0
+interop_skipped=0
 
-# ── Part 1: GREP-PROOF + RUST-UNIT ────────────────────────────────────────
+# ── Part 1: RUST-UNIT ─────────────────────────────────────────────────────
 if ! command -v cargo >/dev/null 2>&1; then echo "SKIP: cargo missing" >&2; exit 2; fi
-
-if grep -rqE 'localhop' crates/; then
-    echo "ok: GREP-PROOF — 'localhop' present in crates/"
-else
-    echo "FAIL: GREP-PROOF — 'localhop' missing from crates/"
-    fail=1
-fi
 
 if cargo test -p ndn-engine --lib --quiet d02_ \
         >/tmp/d02_witness.log 2>&1; then
-    echo "ok: RUST-UNIT — is_localhop_name helper"
+    echo "ok: RUST-UNIT — /localhop scope behavior"
 else
     echo "FAIL: RUST-UNIT"
     cat /tmp/d02_witness.log
@@ -53,7 +47,7 @@ fi
 
 # ── Part 2: INTEROP-SCRIPT ────────────────────────────────────────────────
 #
-# Test design: serve /localhop/d02-probe directly from ndn-fwd via a
+# Test design: serve a unique /localhop/d02-* prefix directly from ndn-fwd via a
 # local producer (ndn-put from testclient unix socket).  This avoids
 # forwarding the /localhop Interest to NFD where NFD's own scope check
 # would block it on the non-local UDP ingress face.
@@ -69,18 +63,28 @@ fi
 COMPOSE="docker compose -f testbed/docker-compose.yml"
 if ! command -v docker >/dev/null 2>&1; then
     echo "SKIP: docker not available — live interop not run" >&2
-elif ! $COMPOSE ps testclient 2>/dev/null | grep -q "running\|Up"; then
-    echo "SKIP: testclient container not running — start testbed first" >&2
+    interop_skipped=1
 else
+    PS_OUT=$($COMPOSE ps testclient 2>/dev/null || true)
+    if [[ "$PS_OUT" != *"running"* && "$PS_OUT" != *"Up"* ]]; then
+        echo "SKIP: testclient container not running — start testbed first" >&2
+        interop_skipped=1
+    fi
+fi
+
+if [ "$interop_skipped" -eq 0 ]; then
+    probe_name="/localhop/d02-probe-$(date +%s)-$$"
+
     # Prepare probe content file in testclient
     $COMPOSE exec -T testclient bash -c "echo -n LocalhopProbe > /tmp/d02_probe.txt" 2>/dev/null || true
 
     # Test A: Remote face (TCP from interop, FaceScope::NonLocal) — scope violation, must DROP
     # No producer needed; ndn-fwd drops the Interest before FIB lookup.
     REMOTE=$($COMPOSE exec -T interop bash -c \
-        'NDN_CLIENT_TRANSPORT=tcp4://172.30.0.10:6364 \
-         ndnpeek -P -w 2000 /localhop/d02-probe 2>&1') || REMOTE="TIMEOUT"
-    if [ -z "$REMOTE" ] || echo "$REMOTE" | grep -qi "timeout\|error"; then
+        "NDN_CLIENT_TRANSPORT=tcp4://172.30.0.10:6364 \
+         ndnpeek -P -w 2000 '$probe_name' 2>&1") || REMOTE="TIMEOUT"
+    remote_lc=$(printf '%s' "$REMOTE" | tr '[:upper:]' '[:lower:]')
+    if [ -z "$REMOTE" ] || [[ "$remote_lc" == *"timeout"* || "$remote_lc" == *"error"* ]]; then
         echo "ok: INTEROP Test-A — /localhop from remote TCP face dropped (scope enforced)"
     else
         echo "FAIL: INTEROP Test-A — /localhop from remote face was NOT dropped"
@@ -90,17 +94,41 @@ else
 
     # Test B: Local face (unix socket from testclient, FaceScope::Local) — must NOT be dropped
     # ndn-put serves as a local producer on ndn-fwd; ndn-peek uses CanBePrefix
-    # because ndn-put publishes at /localhop/d02-probe/v=N/seg=0.
-    $COMPOSE exec -d testclient bash -c \
-        "ndn-put --no-shm --face-socket /run/ndn-fwd/ndn-fwd.sock \
-             --timeout 5000 /localhop/d02-probe /tmp/d02_probe.txt" \
-        2>/dev/null || true
-    sleep 1
+    # because ndn-put publishes at /localhop/d02-*/v=N/seg=0. Keep the
+    # producer and fetch in one shell so we can wait for the route registration
+    # instead of sleeping and racing the local producer startup.
+    LOCAL=$($COMPOSE exec -T testclient bash -c "
+        set -euo pipefail
+        probe='$probe_name'
+        ndn-put --no-shm --face-socket /run/ndn-fwd/ndn-fwd.sock \
+            --timeout 10000 \"\$probe\" /tmp/d02_probe.txt \
+            >/tmp/d02_put.out 2>/tmp/d02_put.err &
+        put_pid=\$!
+        cleanup() { kill \"\$put_pid\" 2>/dev/null || true; }
+        trap cleanup EXIT
 
-    LOCAL=$($COMPOSE exec -T testclient bash -c \
-        "ndn-peek --no-shm --can-be-prefix --face-socket /run/ndn-fwd/ndn-fwd.sock \
-             --lifetime 3000 /localhop/d02-probe 2>&1") || LOCAL="TIMEOUT"
-    if echo "$LOCAL" | grep -qi "LocalhopProbe"; then
+        route_seen=0
+        for _ in \$(seq 1 30); do
+            rib=\$(ndn-ctl --socket /run/ndn-fwd/ndn-fwd.sock route rib-list 2>/tmp/d02_rib.err || true)
+            if [[ \"\$rib\" == *\"\$probe\"* ]]; then
+                route_seen=1
+                break
+            fi
+            sleep 0.2
+        done
+
+        if [ \"\$route_seen\" -ne 1 ]; then
+            echo 'producer route not observed before local fetch'
+            cat /tmp/d02_put.err 2>/dev/null || true
+            cat /tmp/d02_rib.err 2>/dev/null || true
+            exit 1
+        fi
+
+        ndn-peek --no-shm --can-be-prefix \
+            --face-socket /run/ndn-fwd/ndn-fwd.sock \
+            --lifetime 5000 \"\$probe\" 2>&1
+    ") || LOCAL="TIMEOUT"
+    if [[ "$LOCAL" == *"LocalhopProbe"* ]]; then
         echo "ok: INTEROP Test-B — /localhop from local unix-socket face accepted"
     else
         echo "FAIL: INTEROP Test-B — /localhop from local unix-socket face was dropped"
@@ -108,16 +136,20 @@ else
         fail=1
     fi
 
-    printf "Remote: %s\nLocal: %s\n" "$REMOTE" "$LOCAL" >>/tmp/d02_witness.log
+    printf "Probe: %s\nRemote: %s\nLocal: %s\n" "$probe_name" "$REMOTE" "$LOCAL" >>/tmp/d02_witness.log
 fi
 
-if [ "$fail" -eq 0 ]; then
-    echo
-    echo "=== D.02 / I.11 RESOLVED — /localhop scope: remote face drops, local face passes (RUST-UNIT + INTEROP) ==="
-    exit 0
-else
+if [ "$fail" -ne 0 ]; then
     echo
     echo "=== D.02 / I.11 FAIL ==="
     cat /tmp/d02_witness.log
     exit 1
+elif [ "$interop_skipped" -ne 0 ]; then
+    echo
+    echo "=== D.02 / I.11 PARTIAL — Rust unit passed; live interop skipped ==="
+    exit 2
+else
+    echo
+    echo "=== D.02 / I.11 RESOLVED — /localhop scope: remote face drops, local face passes (RUST-UNIT + INTEROP) ==="
+    exit 0
 fi

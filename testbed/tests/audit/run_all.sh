@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run every audit witness test in this directory and print a
+# Run every audit witness named by testbed/EXPECTED_FAILURES.md and print a
 # summary tagged with expected vs actual outcomes.
 #
 # Exit codes:
@@ -11,26 +11,50 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+TRACKER="${REPO_ROOT}/testbed/EXPECTED_FAILURES.md"
 RESULTS_DIR="${RESULTS_DIR:-/results}"
 TIMESTAMP=$(date -u +"%Y%m%dT%H%M%SZ")
 REPORT="${RESULTS_DIR}/audit-${TIMESTAMP}.txt"
+LOG_DIR="${RESULTS_DIR}/audit-${TIMESTAMP}-logs"
 
 mkdir -p "${RESULTS_DIR}"
+mkdir -p "${LOG_DIR}"
 
-# Per-test expected outcomes, read from the EXPECTED_FAILURES.md table.
-# Keyed by finding id (lowercase, no dot — e.g. "a01").
-declare -A EXPECTED=(
-  ["a01"]="FAIL"   ["a02"]="FAIL"   ["a03"]="FAIL"   ["a09"]="FAIL"
-  ["a10"]="FAIL"   ["a15"]="FAIL"   ["a17"]="FAIL"
-  ["b01"]="FAIL"
-  ["c01"]="FAIL"   ["c02"]="FAIL"   ["c03"]="FAIL"
-  ["c07"]="FAIL"   ["c08"]="FAIL"   ["c11"]="FAIL"   ["c13"]="SKIP"
-  ["d01"]="FAIL"   ["d02"]="FAIL"   ["d03"]="FAIL"   ["d04"]="FAIL"
-  ["d07"]="FAIL"   ["d09"]="FAIL"   ["d13"]="FAIL"
-  ["e01"]="FAIL"   ["e04"]="FAIL"   ["e05"]="SKIP"
-  ["f01"]="FAIL"   ["f03"]="FAIL"
-  ["g03"]="FAIL"
-)
+# Per-script expected outcomes, derived from EXPECTED_FAILURES.md:
+# RESOLVED -> PASS, EXPECTED-FAIL -> FAIL, BLOCKED-BY-INTEROP -> SKIP.
+declare -A EXPECTED=()
+declare -A FINDING=()
+scripts=()
+
+while IFS='|' read -r _ finding witness status _rest; do
+    finding="$(printf "%s" "${finding}" | xargs)"
+    status="$(printf "%s" "${status}" | xargs)"
+    [[ -z "${finding}" || "${finding}" == "Finding" ]] && continue
+    [[ "${finding}" == --* ]] && continue
+
+    case "${status}" in
+        RESOLVED*) expected="PASS" ;;
+        EXPECTED-FAIL*) expected="FAIL" ;;
+        BLOCKED-BY-INTEROP*) expected="SKIP" ;;
+        *) continue ;;
+    esac
+
+    remaining="${witness}"
+    while [[ "${remaining}" == *'`'*'.sh`'* ]]; do
+        script_name="${remaining#*\`}"
+        script_name="${script_name%%\`*}"
+        remaining="${remaining#*\`}"
+        remaining="${remaining#*\`}"
+
+        [[ "${script_name}" == *.sh ]] || continue
+        if [[ -z "${EXPECTED[${script_name}]+x}" ]]; then
+            scripts+=("${script_name}")
+        fi
+        EXPECTED["${script_name}"]="${expected}"
+        FINDING["${script_name}"]="${finding}"
+    done
+done < "${TRACKER}"
 
 DIVERGED=0
 PREDICTED_PASS=0
@@ -39,26 +63,31 @@ PREDICTED_SKIP=0
 
 echo "# Audit Witness Run — ${TIMESTAMP}" | tee "${REPORT}"
 echo "" | tee -a "${REPORT}"
-echo "Finding | Expected | Actual | Verdict" | tee -a "${REPORT}"
-echo "--------|----------|--------|--------" | tee -a "${REPORT}"
+echo "Finding | Script | Expected | Actual | Verdict" | tee -a "${REPORT}"
+echo "--------|--------|----------|--------|--------" | tee -a "${REPORT}"
 
-for script in "${SCRIPT_DIR}"/*.sh; do
-    name="$(basename "${script}" .sh)"
-    [[ "${name}" == "run_all" || "${name}" == "_template" ]] && continue
+for script_name in "${scripts[@]}"; do
+    script="${SCRIPT_DIR}/${script_name}"
+    finding_id="${FINDING[${script_name}]}"
+    expected="${EXPECTED[${script_name}]:-UNKNOWN}"
 
-    # finding id is the leading a01 / b03 / cXX / etc. prefix.
-    finding_id="${name%%_*}"
-    expected="${EXPECTED[${finding_id}]:-UNKNOWN}"
+    log_file="${LOG_DIR}/${script_name%.sh}.log"
 
-    bash "${script}" >/tmp/audit-out 2>&1
-    rc=$?
+    if [[ ! -f "${script}" ]]; then
+        actual="MISSING"
+    else
+        set +e
+        bash "${script}" >"${log_file}" 2>&1
+        rc=$?
+        set -e
 
-    case "${rc}" in
-        0) actual="PASS" ;;
-        1) actual="FAIL" ;;
-        2) actual="SKIP" ;;
-        *) actual="ERROR(${rc})" ;;
-    esac
+        case "${rc}" in
+            0) actual="PASS" ;;
+            1) actual="FAIL" ;;
+            2) actual="SKIP" ;;
+            *) actual="ERROR(${rc})" ;;
+        esac
+    fi
 
     verdict="— "
     case "${expected}-${actual}" in
@@ -77,6 +106,10 @@ for script in "${SCRIPT_DIR}"/*.sh; do
             verdict="DIVERGED — investigate"
             DIVERGED=$((DIVERGED + 1))
             ;;
+        "PASS-MISSING"|"FAIL-MISSING"|"SKIP-MISSING")
+            verdict="MISSING — tracker names a script that is absent or not executable"
+            DIVERGED=$((DIVERGED + 1))
+            ;;
         *)
             verdict="UNKNOWN expectation"
             DIVERGED=$((DIVERGED + 1))
@@ -89,8 +122,8 @@ for script in "${SCRIPT_DIR}"/*.sh; do
         SKIP) PREDICTED_SKIP=$((PREDICTED_SKIP + 1)) ;;
     esac
 
-    printf "%s | %s | %s | %s\n" \
-        "${finding_id}" "${expected}" "${actual}" "${verdict}" \
+    printf "%s | %s | %s | %s | %s\n" \
+        "${finding_id}" "${script_name}" "${expected}" "${actual}" "${verdict}" \
         | tee -a "${REPORT}"
 done
 
@@ -99,6 +132,7 @@ echo "Predicted: ${PREDICTED_PASS} PASS / ${PREDICTED_FAIL} FAIL / ${PREDICTED_S
     | tee -a "${REPORT}"
 echo "Divergences from expected: ${DIVERGED}" | tee -a "${REPORT}"
 echo "Report: ${REPORT}"
+echo "Logs: ${LOG_DIR}"
 
 if [ "${DIVERGED}" -eq 0 ]; then
     exit 0

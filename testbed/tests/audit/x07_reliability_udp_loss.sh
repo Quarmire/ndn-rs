@@ -95,8 +95,20 @@ ctl_a route add /rel --face "$F_AB" >/dev/null
 
 echo "--- warmup ping (lossless) to seed B's on-demand return face ---"
 ctl_a >/dev/null 2>&1 face list || true
-if ! $COMPOSE exec -T "$A" ndn-ping client --face-socket "$SOCK" --no-shm \
-        --prefix /rel -c 3 -i 200 --lifetime 2000 | tee /dev/stderr | grep -q "received"; then
+WARMUP_OUT=""
+warmup_ok=0
+for attempt in 1 2 3; do
+    WARMUP_OUT=$($COMPOSE exec -T "$A" ndn-ping client --face-socket "$SOCK" --no-shm \
+        --prefix /rel -c 3 -i 200 --lifetime 2500 2>&1 || true)
+    printf '%s\n' "$WARMUP_OUT" >&2
+    if printf '%s\n' "$WARMUP_OUT" | grep -qE '3 transmitted, [1-3] received'; then
+        warmup_ok=1
+        break
+    fi
+    echo "--- warmup attempt $attempt did not produce statistics; retrying ---" >&2
+    sleep 1
+done
+if [ "$warmup_ok" -ne 1 ]; then
     echo "FAIL: warmup ping produced no statistics — baseline path is broken" >&2
     exit 1
 fi

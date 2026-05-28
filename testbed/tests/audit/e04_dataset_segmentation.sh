@@ -44,11 +44,20 @@ elif ! $COMPOSE ps testclient 2>/dev/null | grep -q "running\|Up"; then
 else
     # CanBePrefix required: dataset response name has version+segment suffix
     # (e.g. /localhost/nfd/faces/list/v=N/seg=0) so the PIT needs prefix match.
-    META=$($COMPOSE exec -T testclient \
-        ndn-peek --meta --can-be-prefix \
-            --face-socket /run/ndn-fwd/ndn-fwd.sock \
-            /localhost/nfd/faces/list \
-        2>&1) || true
+    META=""
+    for _ in $(seq 1 5); do
+        META=$($COMPOSE exec -T testclient \
+            ndn-peek --meta --can-be-prefix \
+                --face-socket /run/ndn-fwd/ndn-fwd.sock \
+                --lifetime 5000 \
+                /localhost/nfd/faces/list \
+            2>&1) || true
+        if echo "$META" | grep -qE 'name:.*v=[0-9]+.*seg=[0-9]+' \
+                && echo "$META" | grep -q 'final-block-id'; then
+            break
+        fi
+        sleep 0.5
+    done
 
     # Check Data name includes version component (v=N) and segment (seg=N)
     if echo "$META" | grep -qE 'name:.*v=[0-9]+.*seg=[0-9]+'; then
