@@ -1,13 +1,10 @@
-=== N.02 AFTER FIX (2026-05-02) ===
-
-
-running 1 test
-.
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 222 filtered out; finished in 0.00s
+=== N.02 AFTER FOLLOW-UP (2026-05-28) ===
 
 
 === Witness: testbed/tests/audit/n02_lp_reassembly_collision.sh ===
 ok: per-endpoint reassembly key isolates overlapping sequences
+ok: FaceAddr-derived endpoint ids reach engine LP reassembly
+ok: live UDP shared-medium senders reassemble independently
 
-=== N.02 RESOLVED 2026-05-02 (data-structure; multi-access wire-up follow-up) ===
+=== N.02 RESOLVED 2026-05-28 — LP reassembly keyed by live FaceAddr-derived endpoint ids ===
 EXIT: 0

@@ -20,6 +20,25 @@ fixed, the PR description needs:
 3. A line in [`EXPECTED_FAILURES.md`](../../EXPECTED_FAILURES.md)
    flipping the finding from `EXPECTED-FAIL` to `RESOLVED`.
 
+## Proof quality
+
+Grep-only checks are not sufficient evidence for NDN protocol
+compliance. They may be used for documentation hygiene, source-tree
+inventory, or proving that a deliberately removed API surface has not
+reappeared, but a wire or semantic claim needs at least one behavioral
+witness:
+
+- `RUST-UNIT` for pure codec, table, validator, or strategy behavior.
+- `RUST-INTEG` for engine, management, or application behavior inside
+  the Rust workspace.
+- `INTEROP-SCRIPT` for ndn-rs behavior against NFD, ndn-cxx, NDNts,
+  ndnd/yanfd, PSync, NLSR, or NDNCERT peers.
+- `WIRE-CAPTURE` when the claim is the exact emitted TLV shape.
+
+If a grep check remains in a protocol witness, treat it as a regression
+guard, not the proof. Pair it with one of the behavioral witness types
+above before using the row as release-ready evidence.
+
 ## Exit codes
 
 Following the testbed convention (see `../interop/run_all.sh`):
@@ -46,8 +65,12 @@ Following the testbed convention (see `../interop/run_all.sh`):
 ## Running
 
 ```bash
-# All witness tests — produces a summary of expected vs actual
-# failures:
+# All release-tracked witness tests — the harness reads
+# ../../EXPECTED_FAILURES.md for the script list and expected outcomes:
+RESULTS_DIR=/tmp/ndn-audit-results \
+    bash testbed/tests/audit/run_all.sh
+
+# The same harness from inside the testclient container:
 docker compose -f testbed/docker-compose.yml exec testclient \
     bash /testbed/tests/audit/run_all.sh
 
@@ -65,10 +88,15 @@ to RESOLVED) or a regression was introduced (open an issue).
 ## Non-witnessable findings
 
 Some audit findings cannot be observed as a single packet
-exchange — e.g. the **absence** of NLSR (G.04), or silent
-fail-open behaviour in LVS user functions (C.16). These are
-tracked as `NOT-WITNESSABLE` in `EXPECTED_FAILURES.md` and
-require either:
+exchange, but they should still be converted to unit,
+integration, interop, or wire-capture witnesses once concrete
+runtime behavior exists. C.16 is the current model: its
+LVS user-function failure mode is semantic rather than a
+packet event, so `c16_lvs_user_fn_failsafe.sh` now runs Rust
+tests inside `ndn-security` instead of relying on source grep.
+Only findings with no behavior surface at all should be tracked
+as `NOT-WITNESSABLE` in `EXPECTED_FAILURES.md`; those require
+either:
 
 - Unit-level tests inside the crate (`cargo test -p
   ndn-security`), or

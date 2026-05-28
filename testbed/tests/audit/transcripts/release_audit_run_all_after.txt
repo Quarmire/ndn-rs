@@ -1,0 +1,61 @@
+# Audit Witness Run - 20260528T213710Z
+
+Finding | Script | Expected | Actual | Verdict
+--------|--------|----------|--------|--------
+A.01 | a01_blake3_name_component.sh | PASS | PASS | as expected
+A.09 | a09_signed_interest_verify.sh | PASS | PASS | as expected
+B.09 | b01_reliability_txsequence.sh | PASS | PASS | as expected
+C.03 | c01_ecdsa_verify.sh | PASS | PASS | as expected
+C.01 | c01_rsa_ecdsa_verifiers.sh | PASS | PASS | as expected
+C.07 | c07_cert_naming.sh | PASS | PASS | as expected
+C.08 | c08_cert_content.sh | PASS | PASS | as expected
+C.09 | c09_safebag_ndnsec_interop.sh | PASS | PASS | as expected
+C.13 | c13_ndncert_challenge_tlv.sh | PASS | PASS | as expected
+C.13 | c13_ndncert_live_interop.sh | PASS | PASS | as expected
+C.18 | c18_validity_period_iso8601.sh | PASS | PASS | as expected
+D.01 | d01_hoplimit_decrement.sh | PASS | PASS | as expected
+E.04 | e04_dataset_segmentation.sh | PASS | PASS | as expected
+N.01 | n01_fragcount_dos.sh | PASS | PASS | as expected
+C.11 | e01_mgmt_unauth.sh | PASS | PASS | as expected
+G.03 | g03_psync_interop.sh | PASS | PASS | as expected
+G.04 | g04_nlsr_interop.sh | PASS | PASS | as expected
+X.04 | x04_reliability_feature_canonical.sh | PASS | PASS | as expected
+X.07 | x07_reliability_udp_loss.sh | PASS | PASS | as expected
+A.02 / A.21 | a02_psdc_structural.sh | PASS | PASS | as expected
+N.04 | a03_unknown_critical_tlv.sh | PASS | PASS | as expected
+A.10 | a10_databuilder_build_sig.sh | PASS | PASS | as expected
+A.15 | a15_keylocator_rules.sh | PASS | PASS | as expected
+C.06 | c06_keychain_sigtype_label.sh | PASS | PASS | as expected
+C.12 | c12_mgmt_sign_digest.sh | PASS | PASS | as expected
+C.12 | c12_mgmt_sign_key.sh | PASS | PASS | as expected
+C.12 | c12_mgmt_dataset_fresh.sh | PASS | PASS | as expected
+C.14 | c14_ndncert_error_names.sh | PASS | PASS | as expected
+C.16 | c16_lvs_user_fn_failsafe.sh | PASS | PASS | as expected
+Validator config | validator_config_behavior.sh | PASS | PASS | as expected
+D.02 | d02_localhop_scope.sh | PASS | PASS | as expected
+D.03 | d03_nexthop_faceid.sh | PASS | PASS | as expected
+D.04 | d04_pit_aggregation_selectors.sh | PASS | PASS | as expected
+D.07 | d07_pit_token_echo.sh | PASS | PASS | as expected
+D.09 | d09_bestroute_nack_retry.sh | PASS | PASS | as expected
+D.10 / E.06 | d10_strategy_name_version.sh | PASS | PASS | as expected
+N.07 | d13_localhost_unvalidated.sh | PASS | PASS | as expected
+E.03 | e03_extended_modules_unsigned.sh | PASS | PASS | as expected
+F.01 / F.03 / F.06 | f01_faceuri_schemes.sh | PASS | PASS | as expected
+G.02 | g02_svs_typed_components.sh | PASS | PASS | as expected
+G.06 | g06_swim_vs_autoconfig.sh | PASS | PASS | as expected
+G.09 | g09_prefix_announcement_consume.sh | PASS | PASS | as expected
+N.02 | n02_lp_reassembly_collision.sh | PASS | PASS | as expected
+N.03 | n03_lp_header_order.sh | PASS | PASS | as expected
+N.05 | n05_nack_no_reason.sh | PASS | PASS | as expected
+N.06 | n06_dead_nonce_list.sh | PASS | PASS | as expected
+N.08 | n08_unsolicited_data_policy.sh | PASS | PASS | as expected
+N.09 | n09_multiaccess_nack_policy.sh | PASS | PASS | as expected
+N.10 | n10_command_replay.sh | PASS | PASS | as expected
+N.11 | n11_control_params_binding.sh | PASS | PASS | as expected
+N.12 | n12_mgmt_response_signing.sh | PASS | PASS | as expected
+E.05 | e05_notification_streams.sh | PASS | PASS | as expected
+N.13 | n13_cert_serialize_tlv.sh | PASS | PASS | as expected
+N.14 | n14_trust_anchor_validity.sh | PASS | PASS | as expected
+
+Predicted: 54 PASS / 0 FAIL / 0 SKIP
+Divergences from expected: 0
