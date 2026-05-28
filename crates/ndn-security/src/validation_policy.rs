@@ -143,6 +143,97 @@ impl ValidationPolicy for LvsPolicy {
     }
 }
 
+/// Checker used by a configuration-style validation rule.
+#[derive(Clone, Debug)]
+pub enum ConfigChecker {
+    /// Data and key must satisfy the standard hierarchical relationship.
+    Hierarchical,
+    /// KeyLocator must be under the configured prefix.
+    KeyLocatorPrefix(Box<Name>),
+}
+
+impl ConfigChecker {
+    pub fn key_locator_prefix(prefix: Name) -> Self {
+        Self::KeyLocatorPrefix(Box::new(prefix))
+    }
+
+    fn check(&self, data: &Data, key_locator: &Name) -> PolicyVerdict {
+        match self {
+            ConfigChecker::Hierarchical => {
+                if TrustSchema::hierarchical().allows(&data.name, key_locator) {
+                    PolicyVerdict::Allow
+                } else {
+                    PolicyVerdict::Deny(TrustError::SchemaMismatch)
+                }
+            }
+            ConfigChecker::KeyLocatorPrefix(prefix) => {
+                if key_locator.has_prefix(prefix.as_ref()) {
+                    PolicyVerdict::Allow
+                } else {
+                    PolicyVerdict::Deny(TrustError::SchemaMismatch)
+                }
+            }
+        }
+    }
+}
+
+/// One ordered rule in a configuration-style validator.
+#[derive(Clone, Debug)]
+pub struct ConfigRule {
+    pub data_prefix: Name,
+    pub checker: ConfigChecker,
+}
+
+impl ConfigRule {
+    pub fn new(data_prefix: Name, checker: ConfigChecker) -> Self {
+        Self {
+            data_prefix,
+            checker,
+        }
+    }
+
+    fn matches(&self, data: &Data) -> bool {
+        data.name.has_prefix(&self.data_prefix)
+    }
+}
+
+/// Minimal ndn-cxx `ValidatorConfig` behavior model.
+///
+/// Rules are evaluated in order. The first rule whose filter matches the
+/// packet name decides the verdict; no later rule can rescue it. If no rule
+/// matches, the packet is invalid.
+pub struct ConfigPolicy {
+    rules: Vec<ConfigRule>,
+}
+
+impl ConfigPolicy {
+    pub fn new(rules: Vec<ConfigRule>) -> Self {
+        Self { rules }
+    }
+
+    pub fn rules(&self) -> &[ConfigRule] {
+        &self.rules
+    }
+}
+
+impl ValidationPolicy for ConfigPolicy {
+    fn check<'a>(
+        &'a self,
+        data: &'a Data,
+        key_locator: &'a Name,
+        _depth: usize,
+    ) -> Pin<Box<dyn Future<Output = PolicyVerdict> + Send + 'a>> {
+        Box::pin(async move {
+            for rule in &self.rules {
+                if rule.matches(data) {
+                    return rule.checker.check(data, key_locator);
+                }
+            }
+            PolicyVerdict::Deny(TrustError::SchemaMismatch)
+        })
+    }
+}
+
 /// Evaluate a sequence of policies with first-Deny short-circuit:
 /// `Deny` ends the chain, `NeedCert` propagates to the driver, `Allow`
 /// advances to the next policy. The chain Allows iff every member does.
@@ -199,6 +290,68 @@ mod tests {
         s.parse().unwrap()
     }
 
+    fn c16_user_fn_lvs_model() -> LvsModel {
+        use crate::lvs::{LVS_VERSION, type_number as tn};
+        use bytes::BytesMut;
+        use ndn_tlv::TlvWriter;
+
+        fn write_tlv(buf: &mut BytesMut, t: u64, v: &[u8]) {
+            let mut w = TlvWriter::new();
+            w.write_tlv(t, v);
+            buf.extend_from_slice(&w.finish());
+        }
+        fn uint_tlv(buf: &mut BytesMut, t: u64, v: u64) {
+            let be = if v <= u8::MAX as u64 {
+                vec![v as u8]
+            } else {
+                (v as u32).to_be_bytes().to_vec()
+            };
+            write_tlv(buf, t, &be);
+        }
+        fn component_value(buf: &mut BytesMut, value: &[u8]) {
+            let mut nc = Vec::with_capacity(value.len() + 2);
+            nc.push(0x08u8);
+            nc.push(value.len() as u8);
+            nc.extend_from_slice(value);
+            write_tlv(buf, tn::COMPONENT_VALUE, &nc);
+        }
+
+        let mut out = BytesMut::new();
+        uint_tlv(&mut out, tn::VERSION, LVS_VERSION);
+        uint_tlv(&mut out, tn::NODE_ID, 0);
+        uint_tlv(&mut out, tn::NAMED_PATTERN_NUM, 1);
+
+        {
+            let mut node = BytesMut::new();
+            uint_tlv(&mut node, tn::NODE_ID, 0);
+            let mut pe = BytesMut::new();
+            uint_tlv(&mut pe, tn::NODE_ID, 1);
+            uint_tlv(&mut pe, tn::PATTERN_TAG, 1);
+            let mut cons = BytesMut::new();
+            let mut opt = BytesMut::new();
+            let mut call = BytesMut::new();
+            write_tlv(&mut call, tn::USER_FN_ID, b"$regex");
+            let mut arg = BytesMut::new();
+            component_value(&mut arg, b"^[0-9]+$");
+            write_tlv(&mut call, tn::FN_ARGS, &arg);
+            write_tlv(&mut opt, tn::USER_FN_CALL, &call);
+            write_tlv(&mut cons, tn::CONS_OPTION, &opt);
+            write_tlv(&mut pe, tn::CONSTRAINT, &cons);
+            write_tlv(&mut node, tn::PATTERN_EDGE, &pe);
+            write_tlv(&mut out, tn::NODE, &node);
+        }
+
+        {
+            let mut node = BytesMut::new();
+            uint_tlv(&mut node, tn::NODE_ID, 1);
+            uint_tlv(&mut node, tn::PARENT_ID, 0);
+            uint_tlv(&mut node, tn::KEY_NODE_ID, 1);
+            write_tlv(&mut out, tn::NODE, &node);
+        }
+
+        LvsModel::decode(&out).expect("user-fn fixture decodes")
+    }
+
     #[tokio::test]
     async fn accept_all_always_allows() {
         let p = AcceptAllPolicy;
@@ -222,6 +375,22 @@ mod tests {
         let data = make_data("/com/example/data");
         let kl = name("/org/unrelated/KEY/k1");
         assert!(p.check(&data, &kl, 0).await.is_deny());
+    }
+
+    #[tokio::test]
+    async fn c16_lvs_policy_denies_user_function_model() {
+        let model = Arc::new(c16_user_fn_lvs_model());
+        assert!(
+            model.uses_user_functions(),
+            "fixture must exercise a user-function constraint"
+        );
+        let policy = LvsPolicy::new(model);
+        let data = make_data("/123");
+        let key = name("/123");
+        assert!(
+            policy.check(&data, &key, 0).await.is_deny(),
+            "unsupported LVS user functions must fail closed in policy evaluation"
+        );
     }
 
     /// `ChainedPolicy` is first-Deny: a Data that passes one policy but
@@ -296,5 +465,63 @@ mod tests {
         let kl = name("/k");
         let v = chain.check(&data, &kl, 0).await;
         assert!(matches!(v, PolicyVerdict::NeedCert(n) if n.to_string() == "/needed/cert"));
+    }
+
+    #[tokio::test]
+    async fn validator_config_no_matching_rule_denies() {
+        let policy = ConfigPolicy::new(vec![ConfigRule::new(
+            name("/configured"),
+            ConfigChecker::Hierarchical,
+        )]);
+        let data = make_data("/unconfigured/data");
+        let kl = name("/unconfigured/KEY/k1");
+        assert!(
+            policy.check(&data, &kl, 0).await.is_deny(),
+            "configuration validator must reject packets matching no rule"
+        );
+    }
+
+    #[tokio::test]
+    async fn validator_config_hierarchical_checker() {
+        let policy = ConfigPolicy::new(vec![ConfigRule::new(
+            name("/lab"),
+            ConfigChecker::Hierarchical,
+        )]);
+        let data = make_data("/lab/alice/data");
+        assert!(
+            policy
+                .check(&data, &name("/lab/KEY/k1"), 0)
+                .await
+                .is_allow()
+        );
+        assert!(
+            policy
+                .check(&data, &name("/other/KEY/k1"), 0)
+                .await
+                .is_deny(),
+            "hierarchical checker must reject cross-namespace signers"
+        );
+    }
+
+    #[tokio::test]
+    async fn validator_config_first_matching_rule_wins() {
+        let policy = ConfigPolicy::new(vec![
+            ConfigRule::new(
+                name("/app"),
+                ConfigChecker::key_locator_prefix(name("/denied/KEY")),
+            ),
+            ConfigRule::new(
+                name("/app"),
+                ConfigChecker::key_locator_prefix(name("/allowed/KEY")),
+            ),
+        ]);
+        let data = make_data("/app/data");
+        assert!(
+            policy
+                .check(&data, &name("/allowed/KEY/k1"), 0)
+                .await
+                .is_deny(),
+            "later matching rules must not rescue a failed first match"
+        );
     }
 }

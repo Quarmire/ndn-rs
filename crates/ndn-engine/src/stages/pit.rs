@@ -7,7 +7,10 @@ use tracing::trace;
 
 use crate::observability::targets as t;
 use crate::pipeline::{Action, DecodedPacket, DropReason, PacketContext};
-use ndn_store::{NameHashes, PersistentState, Pit, PitEntry, PitKeyDiscriminator, PitToken};
+use ndn_store::{
+    DeadNonceList, NameHashes, NonceFingerprint, PersistentState, Pit, PitEntry,
+    PitKeyDiscriminator, PitToken,
+};
 use ndn_transport::FaceId;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -25,6 +28,7 @@ pub const MAX_PERSISTENT_LIFETIME_SECS: u32 = ndn_packet::MAX_PERSISTENT_LIFETIM
 /// - else → create a new entry, set `ctx.pit_token`, continue
 pub struct PitCheckStage {
     pub pit: Arc<Pit>,
+    pub dead_nonce_list: Option<Arc<DeadNonceList>>,
     #[cfg(not(target_arch = "wasm32"))]
     pub validator: Option<Arc<Validator>>,
     /// Pre-PIT replay guard. Rejects signed Interests whose `SignatureInfo`
@@ -100,6 +104,21 @@ impl PitCheckStage {
             PitToken::from_name_hash_keyed(name_hash, interest.forwarding_hint(), discriminator);
         ctx.pit_token = Some(token);
         let in_selector = interest.selectors().clone();
+
+        if let Some(dnl) = self.dead_nonce_list.as_ref() {
+            let fp = NonceFingerprint::new(name_hash, nonce);
+            if dnl.contains(fp, now_ns) {
+                trace!(
+                    target: t::FWD_PIT,
+                    face=%ctx.face_id,
+                    name=%interest.name,
+                    nonce,
+                    action="dead-nonce-loop",
+                    "pit op"
+                );
+                return Action::Drop(DropReason::LoopDetected);
+            }
+        }
 
         enum CheckResult {
             Loop,
@@ -258,6 +277,7 @@ enum PersistentMatchResult {
 /// are removed on first match. Unsolicited Data is dropped.
 pub struct PitMatchStage {
     pub pit: Arc<Pit>,
+    pub dead_nonce_list: Option<Arc<DeadNonceList>>,
 }
 
 impl PitMatchStage {
@@ -322,7 +342,14 @@ impl PitMatchStage {
         let mut fan_out: Vec<(u64, Vec<ndn_packet::lp::TraceId>)> = Vec::new();
 
         // Exact-name entries: every in-record matches regardless of CanBePrefix.
-        self.consume_entry(&token, false, &mut faces, &mut tokens, &mut seen, &mut fan_out);
+        self.consume_entry(
+            &token,
+            false,
+            &mut faces,
+            &mut tokens,
+            &mut seen,
+            &mut fan_out,
+        );
         self.consume_entry(
             &token_classical,
             false,
@@ -447,8 +474,8 @@ impl PitMatchStage {
                 lp_tokens: t,
                 should_reap,
             }) => {
-                if should_reap {
-                    let _ = self.pit.remove(token);
+                if should_reap && let Some((_, entry)) = self.pit.remove(token) {
+                    insert_dead_nonces(&self.dead_nonce_list, &entry);
                 }
                 for (fid, tok) in f.into_iter().zip(t) {
                     if seen.contains(&fid.0) {
@@ -476,7 +503,11 @@ impl PitMatchStage {
                 while i < entry.in_records.len() {
                     if entry.in_records[i].selector.can_be_prefix {
                         let r = entry.in_records.swap_remove(i);
-                        taken.push((r.face_id, r.lp_pit_token, r.trace_ids.iter().copied().collect()));
+                        taken.push((
+                            r.face_id,
+                            r.lp_pit_token,
+                            r.trace_ids.iter().copied().collect(),
+                        ));
                     } else {
                         i += 1;
                     }
@@ -493,14 +524,15 @@ impl PitMatchStage {
                     tokens.push(lp_token);
                     fan_out.push((face_id, trace_ids));
                 }
-                if now_empty {
-                    let _ = self.pit.remove(token);
+                if now_empty && let Some((_, entry)) = self.pit.remove(token) {
+                    insert_dead_nonces(&self.dead_nonce_list, &entry);
                 }
             }
             return;
         }
         // Exact match: every in-record is satisfied; remove the entry.
         if let Some((_, entry)) = self.pit.remove(token) {
+            insert_dead_nonces(&self.dead_nonce_list, &entry);
             for r in entry.in_records.iter() {
                 if seen.contains(&r.face_id) {
                     continue;
@@ -511,6 +543,18 @@ impl PitMatchStage {
                 fan_out.push((r.face_id, r.trace_ids.iter().copied().collect()));
             }
         }
+    }
+}
+
+pub(crate) fn insert_dead_nonces(dnl: &Option<Arc<DeadNonceList>>, entry: &PitEntry) {
+    let Some(dnl) = dnl.as_ref() else {
+        return;
+    };
+    let key_name = strip_digest_components(&entry.name);
+    let name_hash = NameHashes::full_name_hash(&key_name);
+    let now = now_ns();
+    for &nonce in &entry.nonces_seen {
+        dnl.insert(NonceFingerprint::new(name_hash, nonce), now);
     }
 }
 
@@ -560,6 +604,7 @@ mod d07_tests {
 
         let stage = PitMatchStage {
             pit: Arc::clone(&pit),
+            dead_nonce_list: None,
         };
         let data_wire = encode_data_unsigned(&name, b"payload");
         let data = Data::decode(data_wire.clone()).unwrap();
@@ -620,6 +665,7 @@ mod multi_match_tests {
 
         let stage = PitMatchStage {
             pit: Arc::clone(&pit),
+            dead_nonce_list: None,
         };
         let action = run_match(&stage, encode_data_unsigned(&exact, b"x"));
         let ctx = match action {
@@ -662,6 +708,7 @@ mod multi_match_tests {
 
         let stage = PitMatchStage {
             pit: Arc::clone(&pit),
+            dead_nonce_list: None,
         };
         let action = run_match(&stage, encode_data_unsigned(&exact, b"x"));
         let ctx = match action {
@@ -690,6 +737,7 @@ mod multi_match_tests {
 
         let stage = PitMatchStage {
             pit: Arc::clone(&pit),
+            dead_nonce_list: None,
         };
         let longer: Name = "/p/q".parse().unwrap();
         let action = run_match(&stage, encode_data_unsigned(&longer, b"x"));
@@ -728,6 +776,7 @@ mod multi_match_tests {
 
         let stage = PitMatchStage {
             pit: Arc::clone(&pit),
+            dead_nonce_list: None,
         };
         let longer: Name = "/m/seq=0".parse().unwrap();
         let action = run_match(&stage, encode_data_unsigned(&longer, b"x"));
@@ -759,6 +808,63 @@ mod multi_match_tests {
 }
 
 #[cfg(test)]
+mod n06_dead_nonce_engine_tests {
+    use super::*;
+    use bytes::Bytes;
+    use ndn_packet::encode::{InterestBuilder, encode_data_unsigned};
+    use ndn_packet::{Data, Interest, Name};
+
+    fn interest_ctx(wire: Bytes, face: FaceId) -> PacketContext {
+        let interest = Interest::decode(wire.clone()).unwrap();
+        let mut ctx = PacketContext::new(wire, face, 0);
+        ctx.packet = DecodedPacket::Interest(Box::new(interest));
+        ctx
+    }
+
+    fn data_ctx(name: &Name) -> PacketContext {
+        let wire = encode_data_unsigned(name, b"payload");
+        let data = Data::decode(wire.clone()).unwrap();
+        let mut ctx = PacketContext::new(wire, FaceId(99), 0);
+        ctx.packet = DecodedPacket::Data(Box::new(data));
+        ctx
+    }
+
+    #[tokio::test]
+    async fn n06_dnl_rejects_nonce_after_satisfied_pit_entry_is_erased() {
+        let pit = Arc::new(Pit::new());
+        let dnl = Arc::new(DeadNonceList::new());
+        let check = PitCheckStage {
+            pit: Arc::clone(&pit),
+            dead_nonce_list: Some(Arc::clone(&dnl)),
+            validator: None,
+            replay_guard: None,
+        };
+        let match_stage = PitMatchStage {
+            pit: Arc::clone(&pit),
+            dead_nonce_list: Some(Arc::clone(&dnl)),
+        };
+        let name: Name = "/audit/n06/dead-nonce".parse().unwrap();
+        let interest_wire = InterestBuilder::new(name.clone()).build();
+
+        let first = check
+            .process(interest_ctx(interest_wire.clone(), FaceId(1)))
+            .await;
+        assert!(matches!(first, Action::Continue(_)));
+
+        let satisfied = match_stage.process(data_ctx(&name));
+        assert!(matches!(satisfied, Action::Continue(_)));
+        assert!(pit.is_empty(), "Data satisfaction must erase the PIT entry");
+        assert_eq!(dnl.len(), 1, "erased PIT nonce must enter the DNL");
+
+        let replay = check.process(interest_ctx(interest_wire, FaceId(2))).await;
+        assert!(
+            matches!(replay, Action::Drop(DropReason::LoopDetected)),
+            "same name+nonce after PIT erasure must hit the DeadNonceList"
+        );
+    }
+}
+
+#[cfg(test)]
 mod d19_tests {
     use super::*;
     use ndn_packet::Name;
@@ -769,6 +875,7 @@ mod d19_tests {
         let pit = Arc::new(Pit::new());
         let stage = Arc::new(PitCheckStage {
             pit: Arc::clone(&pit),
+            dead_nonce_list: None,
             #[cfg(not(target_arch = "wasm32"))]
             validator: None,
             replay_guard: None,
@@ -892,11 +999,13 @@ mod persistent_tests {
         let pit = Arc::new(Pit::new());
         let check = Arc::new(PitCheckStage {
             pit: Arc::clone(&pit),
+            dead_nonce_list: None,
             validator: Some(make_validator()),
             replay_guard: None,
         });
         let match_stage = PitMatchStage {
             pit: Arc::clone(&pit),
+            dead_nonce_list: None,
         };
 
         let name: Name = "/persistent/test".parse().unwrap();
@@ -963,11 +1072,13 @@ mod persistent_tests {
         // Use a validator that verifies the sig; a corrupted sig returns Invalid.
         let check = Arc::new(PitCheckStage {
             pit: Arc::clone(&pit),
+            dead_nonce_list: None,
             validator: Some(make_validator()),
             replay_guard: None,
         });
         let match_stage = PitMatchStage {
             pit: Arc::clone(&pit),
+            dead_nonce_list: None,
         };
 
         // Build a correctly signed Interest and then corrupt the last byte.
@@ -1009,6 +1120,7 @@ mod persistent_tests {
         let pit = Arc::new(Pit::new());
         let check = Arc::new(PitCheckStage {
             pit: Arc::clone(&pit),
+            dead_nonce_list: None,
             validator: Some(make_validator()),
             replay_guard: None,
         });
@@ -1027,6 +1139,7 @@ mod persistent_tests {
         let pit = Arc::new(Pit::new());
         let check = Arc::new(PitCheckStage {
             pit: Arc::clone(&pit),
+            dead_nonce_list: None,
             validator: Some(make_validator()),
             replay_guard: None,
         });
@@ -1045,6 +1158,7 @@ mod persistent_tests {
         let pit = Arc::new(Pit::new());
         let check = Arc::new(PitCheckStage {
             pit: Arc::clone(&pit),
+            dead_nonce_list: None,
             validator: Some(make_validator()),
             replay_guard: None,
         });
@@ -1064,6 +1178,7 @@ mod persistent_tests {
         let pit = Arc::new(Pit::new());
         let check = Arc::new(PitCheckStage {
             pit: Arc::clone(&pit),
+            dead_nonce_list: None,
             validator: Some(make_validator()),
             replay_guard: None,
         });
@@ -1095,6 +1210,7 @@ mod persistent_tests {
         let pit = Arc::new(Pit::new());
         let check = Arc::new(PitCheckStage {
             pit: Arc::clone(&pit),
+            dead_nonce_list: None,
             validator: Some(make_validator()),
             replay_guard: None,
         });
@@ -1146,6 +1262,7 @@ mod persistent_tests {
         let pit = Arc::new(Pit::new());
         let check = Arc::new(PitCheckStage {
             pit: Arc::clone(&pit),
+            dead_nonce_list: None,
             validator: Some(make_validator()),
             replay_guard: None,
         });
@@ -1189,11 +1306,13 @@ mod persistent_tests {
         let pit = Arc::new(Pit::new());
         let check = Arc::new(PitCheckStage {
             pit: Arc::clone(&pit),
+            dead_nonce_list: None,
             validator: None,
             replay_guard: None,
         });
         let match_stage = PitMatchStage {
             pit: Arc::clone(&pit),
+            dead_nonce_list: None,
         };
 
         let wire = build_persistent_interest("/persistent/novalidator", 5, 60);
@@ -1223,11 +1342,13 @@ mod persistent_tests {
         let pit = Arc::new(Pit::new());
         let check = Arc::new(PitCheckStage {
             pit: Arc::clone(&pit),
+            dead_nonce_list: None,
             validator: Some(make_validator()),
             replay_guard: None,
         });
         let match_stage = PitMatchStage {
             pit: Arc::clone(&pit),
+            dead_nonce_list: None,
         };
 
         // Build a persistent Interest with CanBePrefix for /stream, credit 3.
@@ -1294,11 +1415,13 @@ mod persistent_tests {
         let pit = Arc::new(Pit::new());
         let check = Arc::new(PitCheckStage {
             pit: Arc::clone(&pit),
+            dead_nonce_list: None,
             validator: Some(make_validator()),
             replay_guard: None,
         });
         let match_stage = PitMatchStage {
             pit: Arc::clone(&pit),
+            dead_nonce_list: None,
         };
 
         // Non-persistent Interest with CanBePrefix.
