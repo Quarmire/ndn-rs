@@ -4,8 +4,16 @@
 operator dashboard. It lives beside the legacy dashboard so the new
 architecture can prove itself without breaking existing workflows.
 
-The first milestone is a working vertical scaffold:
+The first milestone now starts with an operator entry spine. The default
+workspace is **Operations**, which keeps attach state, selected target,
+router lifecycle actions, security posture, observability posture, recent
+evidence, and active tool runs visible before the operator enters a deeper
+workspace.
 
+The vertical scaffold remains:
+
+- **Operations** — attach target, lifecycle actions, posture residue,
+  evidence summary, and quick diagnostics.
 - **Observe** — NDN-native traces, span timeline, PIT fan-out, CS and
   strategy attributes, and correlated logs.
 - **Trust** — TrustContext posture, identity/context selection,
@@ -47,9 +55,14 @@ probe behind each feature state. This keeps browser, desktop, relay, NFD,
 YaNFD, and ndn-rs-native paths on the same UI contract while live transport
 adapters are added.
 
-The default workspace is Engine, with a persistent connection band above every
+The persistent Attach bar and Operations Home use NDN vocabulary: the dashboard
+attaches to an engine, adopts TrustContexts, enrolls identities, and authorizes
+mutations through a custodian. It does not model engine operation as sign-in,
+account switching, or joining a network.
+
+The default workspace is Operations, with a persistent attach band above every
 workspace. It shows whether the current profile has been probed, the selected
-attach target, and the immediate actions an operator expects: connect, connect
+attach target, and the immediate actions an operator expects: attach, attach
 default, start local `ndn-fwd`, stop a dashboard-started `ndn-fwd`, and open
 Settings. Browser builds keep the same band but disable local process lifecycle
 buttons with explicit browser-safe deployment guidance.
@@ -72,6 +85,7 @@ The crate is shaped for a future standalone repository:
 | `app` | Dioxus shell, responsive layout, routing, platform bootstrap. |
 | `core` | Pure models, capability sets, posture derivation, fixtures. |
 | `client` | Attach targets and capability probing seams. |
+| `operations` | Dashboard run state, attach state, engine ownership, lifecycle actions, and Operations Home view models. |
 | `config` | Dashboard settings, router config drafts, presets, TOML/JSON import/export, and restart diffing. |
 | `engine` | Read-only forwarder datasets and Engine view models. |
 | `network` | Fleet, neighbor, discovery, routing, radio, and topology normalization. |

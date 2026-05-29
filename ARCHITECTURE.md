@@ -94,7 +94,9 @@ scope = extension   (flat under crates/)   Pragmatic engineering, no NDN spec ba
                                 `--features browser-engine` + `?engine=local`
   ndn-dashboard-next            Repo-split-ready rewrite scaffold with browser-first
                                 deployment, compact responsive operator UI,
-                                typed attach/probe adapters, capability profiles,
+                                Operations Home entry spine, typed attach/probe
+                                adapters, dashboard run / attach state /
+                                engine ownership lifecycle models, capability profiles,
                                 compact Trust security cockpit and dialog view models with ndn-security/identity snapshot adapters,
                                 TOFU adoption, NDNCERT enrollment, validation/DID framing,
                                 Observe/Tools slices, read-only Engine
@@ -104,7 +106,7 @@ scope = extension   (flat under crates/)   Pragmatic engineering, no NDN spec ba
                                 export posture, configurable Tools workflow
                                 adapters with focused run management,
                                 mutation preflight gates, typed mutation
-                                session replay, first-screen attach and local
+                                replay, first-screen attach and local
                                 ndn-fwd launch/stop controls, live desktop face, route,
                                 strategy, CS, and lifecycle mutation adapters, and
                                 NFD / YaNFD compatibility
