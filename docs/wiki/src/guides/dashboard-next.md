@@ -126,6 +126,18 @@ topology, network coding, rate limits, and compute diagnostics all pass through
 typed view models. NFD and YaNFD keep read-only or unsupported states explicit
 instead of rendering controls that cannot work.
 
+Logs and audit follow the old dashboard's useful split between live log
+filter/export and signed security audit, but are secondary evidence under
+Observe and Trust rather than primary navigation. Log rows carry level, target,
+message, and optional trace ID; event-stream state records whether notification
+streams are live or polling is the fallback; security audit rows can be exported
+with the same typed model used for operation history.
+
+Browser deployment, PWA assets, visual language, and cutover readiness are now
+documented separately. The preview keeps legacy `ndn-dashboard` runnable while
+dashboard-next tracks parity by surface and target: desktop ndn-rs, browser
+ndn-rs, NFD, and YaNFD.
+
 The Tools workbench consumes reusable tool crates rather than reimplementing
 packet workflows in UI code. Desktop local attach runs `ndn-tools-core` ping,
 iperf, peek, and put workflows where the selected forwarder supports compatible

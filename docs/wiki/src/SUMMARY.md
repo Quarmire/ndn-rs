@@ -31,6 +31,8 @@
 - [NDNCERT setup](./guides/ndncert-setup.md)
 - [Running the dashboard](./guides/running-the-dashboard.md)
 - [Dashboard next](./guides/dashboard-next.md)
+- [Dashboard next deployment](./guides/dashboard-next-deployment.md)
+- [Dashboard next cutover](./guides/dashboard-next-cutover.md)
 - [Self-hosting](./guides/self-hosting.md)
 
 # Operations
@@ -42,6 +44,7 @@
 
 # Reference
 
+- [Dashboard next visual language](./design/dashboard-next-visual-language.md)
 - [Face transports](./reference/face-transports.md)
 - [NDN over BLE — GATT profile](./reference/ndn-ble-gatt-profile.md)
 - [Management verbs](./reference/mgmt-verbs.md)
