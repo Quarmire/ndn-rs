@@ -92,6 +92,21 @@ scope = extension   (flat under crates/)   Pragmatic engineering, no NDN spec ba
   ndn-dashboard                 Dioxus desktop / web mgmt UI; runtime profile selection
                                 across ndn-fwd / NFD / YaNFD; in-page engine via
                                 `--features browser-engine` + `?engine=local`
+  ndn-dashboard-next            Repo-split-ready rewrite scaffold with browser-first
+                                deployment, compact responsive operator UI,
+                                typed attach/probe adapters, capability profiles,
+                                compact Trust security cockpit and dialog view models with ndn-security/identity snapshot adapters,
+                                TOFU adoption, NDNCERT enrollment, validation/DID framing,
+                                Observe/Tools slices, read-only Engine
+                                dataset view models, live desktop Observe span
+                                fetch/OTLP decode, span tree/PIT fan-out view
+                                models, trace-correlated log evidence, bridge
+                                export posture, configurable Tools workflow
+                                adapters with focused run management,
+                                mutation preflight gates, typed mutation
+                                session replay, live desktop face, route,
+                                strategy, CS, and lifecycle mutation adapters, and
+                                NFD / YaNFD compatibility
   ndn-python                    PyO3 Python bindings
   ndn-boltffi                   BoltFFI — Kotlin/JVM and Swift bindings
   ndn-compute                   In-network compute: ComputeService (tiered API),
