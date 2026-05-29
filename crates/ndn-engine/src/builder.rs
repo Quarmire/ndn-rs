@@ -12,7 +12,8 @@ use ndn_security::{
     Validator,
 };
 use ndn_store::{
-    CsAdmissionPolicy, CsObserver, ErasedContentStore, LruCs, ObservableCs, Pit, StrategyTable,
+    CsAdmissionPolicy, CsObserver, DeadNonceList, ErasedContentStore, LruCs, ObservableCs, Pit,
+    StrategyTable,
 };
 use ndn_strategy::{BestRouteStrategy, MeasurementsTable, SignalsTable};
 use ndn_transport::{FaceTable, Transport};
@@ -307,6 +308,7 @@ impl EngineBuilder {
         let fib = Arc::new(Fib::new());
         let rib = Arc::new(Rib::new());
         let pit = Arc::new(Pit::new());
+        let dead_nonce_list = Arc::new(DeadNonceList::new());
         let base_cs: Arc<dyn ErasedContentStore> = self
             .cs
             .unwrap_or_else(|| Arc::new(LruCs::new(self.config.cs_capacity_bytes)));
@@ -470,6 +472,7 @@ impl EngineBuilder {
             },
             pit_check: PitCheckStage {
                 pit: Arc::clone(&pit),
+                dead_nonce_list: Some(Arc::clone(&dead_nonce_list)),
                 validator: validator.clone(),
                 replay_guard: replay_guard.clone(),
             },
@@ -489,6 +492,7 @@ impl EngineBuilder {
             },
             pit_match: PitMatchStage {
                 pit: Arc::clone(&pit),
+                dead_nonce_list: Some(Arc::clone(&dead_nonce_list)),
             },
             validation: ValidationStage::new(
                 validator,
