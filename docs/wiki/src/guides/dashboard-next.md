@@ -47,13 +47,21 @@ probe behind each feature state. This keeps browser, desktop, relay, NFD,
 YaNFD, and ndn-rs-native paths on the same UI contract while live transport
 adapters are added.
 
+The default workspace is Engine, with a persistent connection band above every
+workspace. It shows whether the current profile has been probed, the selected
+attach target, and the immediate actions an operator expects: connect, connect
+default, start local `ndn-fwd`, stop a dashboard-started `ndn-fwd`, and open
+Settings. Browser builds keep the same band but disable local process lifecycle
+buttons with explicit browser-safe deployment guidance.
+
 Settings also carries the old dashboard's useful config workflow forward
 without inheriting its component coupling. Dashboard preferences and router
 config are typed models, presets live outside UI state, TOML/JSON export is
 generated from structured drafts, and config diffs identify runtime-editable
 versus restart-bound fields. Browser profiles keep router config read-only
-until a browser-safe write path exists; desktop profiles can stage generated
-TOML for managed-router startup.
+until a browser-safe write path exists; desktop profiles can start local
+`ndn-fwd` from generated TOML and retain a stop handle for the process that the
+dashboard launched.
 
 ## Architecture
 

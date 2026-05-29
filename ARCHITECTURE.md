@@ -104,7 +104,8 @@ scope = extension   (flat under crates/)   Pragmatic engineering, no NDN spec ba
                                 export posture, configurable Tools workflow
                                 adapters with focused run management,
                                 mutation preflight gates, typed mutation
-                                session replay, live desktop face, route,
+                                session replay, first-screen attach and local
+                                ndn-fwd launch/stop controls, live desktop face, route,
                                 strategy, CS, and lifecycle mutation adapters, and
                                 NFD / YaNFD compatibility
   ndn-python                    PyO3 Python bindings
