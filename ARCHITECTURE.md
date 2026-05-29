@@ -106,7 +106,9 @@ scope = extension   (flat under crates/)   Pragmatic engineering, no NDN spec ba
                                 export posture, configurable Tools workflow
                                 adapters with focused run management,
                                 mutation preflight gates, typed mutation
-                                replay, first-screen attach and local
+                                replay, first-screen attach controls,
+                                focused Start Router workflow with structured
+                                config/TOML/preset/diff handling, local
                                 ndn-fwd launch/stop controls, live desktop face, route,
                                 strategy, CS, and lifecycle mutation adapters, and
                                 NFD / YaNFD compatibility

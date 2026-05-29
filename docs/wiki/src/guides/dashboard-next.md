@@ -63,9 +63,20 @@ account switching, or joining a network.
 The default workspace is Operations, with a persistent attach band above every
 workspace. It shows whether the current profile has been probed, the selected
 attach target, and the immediate actions an operator expects: attach, attach
-default, start local `ndn-fwd`, stop a dashboard-started `ndn-fwd`, and open
-Settings. Browser builds keep the same band but disable local process lifecycle
-buttons with explicit browser-safe deployment guidance.
+default, open the Start Router workflow, stop a dashboard-started `ndn-fwd`,
+and open Settings. Browser builds keep the same band but disable local process
+lifecycle buttons with explicit browser-safe deployment guidance.
+
+The Start Router workflow is deliberately modal and focused. It mirrors the
+old dashboard's useful startup/config affordances without hiding process
+ownership behind a single preset button: operators can quick-start from the
+current draft, edit the structured router config, paste TOML, switch presets,
+review restart-bound diffs, export TOML, and then launch local `ndn-fwd` on
+desktop. The same lifecycle action appears in Operations Home so a detached
+dashboard has a visible recovery path before the operator enters Settings.
+Browser builds keep the workflow visible as deployment documentation, but the
+start command remains unavailable until the target is a desktop shell or a
+browser-safe engine/relay attach path.
 
 Settings also carries the old dashboard's useful config workflow forward
 without inheriting its component coupling. Dashboard preferences and router
