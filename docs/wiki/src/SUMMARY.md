@@ -30,6 +30,7 @@
 - [Network coding (FEC)](./guides/network-coding.md)
 - [NDNCERT setup](./guides/ndncert-setup.md)
 - [Running the dashboard](./guides/running-the-dashboard.md)
+- [Dashboard next](./guides/dashboard-next.md)
 - [Self-hosting](./guides/self-hosting.md)
 
 # Operations
@@ -45,6 +46,9 @@
 - [NDN over BLE — GATT profile](./reference/ndn-ble-gatt-profile.md)
 - [Management verbs](./reference/mgmt-verbs.md)
 - [Trust policies](./reference/trust-policies.md)
+- [Dashboard extension: network coding](./reference/extensions/coding.md)
+- [Dashboard extension: rate limit](./reference/extensions/rate-limit.md)
+- [Dashboard extension: compute](./reference/extensions/compute.md)
 - [Spec compliance](./reference/spec-compliance.md)
 
 # Releases

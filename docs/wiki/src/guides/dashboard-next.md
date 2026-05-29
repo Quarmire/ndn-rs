@@ -66,6 +66,8 @@ The crate is shaped for a future standalone repository:
 | `client` | Attach targets and capability probing seams. |
 | `config` | Dashboard settings, router config drafts, presets, TOML/JSON import/export, and restart diffing. |
 | `engine` | Read-only forwarder datasets and Engine view models. |
+| `network` | Fleet, neighbor, discovery, routing, radio, and topology normalization. |
+| `extensions` | Registry surfaces for coding, rate-limit, compute, and future ndn-rs extensions. |
 | `observe` | OTLP Span decode, `<prefix>/recent` parsing, live span fetch, trace grouping, observability view models. |
 | `identity` | Dashboard-facing adapters over reusable trust/identity APIs. |
 | `tools` | Structured network-test run state, workflow adapters, result normalization, Observe pivot refs. |
@@ -115,6 +117,14 @@ useful session recorder, dashboard-next records replayable writes as typed
 operations instead of stringly `DashCmd` entries, exposes retryable transport
 failures separately from hard failures, and can replay the typed mutation
 session after a restart. Trust-specific writes are separate follow-up slices.
+
+The Engine workspace now carries the old dashboard's breadth for fleet,
+routing, radio, and advanced extension visibility, but the surfaces are
+capability-normalized rather than tab-specific globals. Discovery, static
+routing, DVR, NLSR, neighbor trust posture, radio transport support, route
+topology, network coding, rate limits, and compute diagnostics all pass through
+typed view models. NFD and YaNFD keep read-only or unsupported states explicit
+instead of rendering controls that cannot work.
 
 The Tools workbench consumes reusable tool crates rather than reimplementing
 packet workflows in UI code. Desktop local attach runs `ndn-tools-core` ping,
