@@ -47,6 +47,14 @@ probe behind each feature state. This keeps browser, desktop, relay, NFD,
 YaNFD, and ndn-rs-native paths on the same UI contract while live transport
 adapters are added.
 
+Settings also carries the old dashboard's useful config workflow forward
+without inheriting its component coupling. Dashboard preferences and router
+config are typed models, presets live outside UI state, TOML/JSON export is
+generated from structured drafts, and config diffs identify runtime-editable
+versus restart-bound fields. Browser profiles keep router config read-only
+until a browser-safe write path exists; desktop profiles can stage generated
+TOML for managed-router startup.
+
 ## Architecture
 
 The crate is shaped for a future standalone repository:
@@ -56,6 +64,7 @@ The crate is shaped for a future standalone repository:
 | `app` | Dioxus shell, responsive layout, routing, platform bootstrap. |
 | `core` | Pure models, capability sets, posture derivation, fixtures. |
 | `client` | Attach targets and capability probing seams. |
+| `config` | Dashboard settings, router config drafts, presets, TOML/JSON import/export, and restart diffing. |
 | `engine` | Read-only forwarder datasets and Engine view models. |
 | `observe` | OTLP Span decode, `<prefix>/recent` parsing, live span fetch, trace grouping, observability view models. |
 | `identity` | Dashboard-facing adapters over reusable trust/identity APIs. |
