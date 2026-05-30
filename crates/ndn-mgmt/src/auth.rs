@@ -90,6 +90,17 @@ pub(crate) fn is_public_dataset_verb(module: &[u8], verb: &[u8]) -> bool {
     if standard.contains(&module) && verb == v::LIST {
         return true;
     }
+    // NFD's ForwarderStatus dataset (`status/general`) is an unsigned public
+    // read, like the `*/list` datasets — but its verb is `general`, not
+    // `list`, so the check above never matched it. Without this, a
+    // secure-by-default forwarder (`require_signed_commands = true`) rejects
+    // the unsigned status read with UNAUTHORIZED, and the client decodes that
+    // error response as a GeneralStatus → "malformed management response",
+    // leaving every client (ndn-ctl, the dashboard) unable to read basic
+    // status. `status/shutdown` stays gated — it is a command, not a read.
+    if module == m::STATUS && verb == b"general" {
+        return true;
+    }
     // ndn-rs-local read-only telemetry dataset (cross-layer link signals).
     if module == m::FACES && verb == v::LINK_QUALITY {
         return true;
@@ -499,6 +510,17 @@ mod e01_tests {
 
     /// `resolve_control_parameters` rejects CP in both locations, accepts
     /// either single location, and returns `None` when neither is present.
+    #[test]
+    fn status_general_is_a_public_unsigned_read() {
+        use ndn_config::nfd_command::module as m;
+        // The ForwarderStatus dataset must be readable without signing, like
+        // NFD — otherwise a secure-by-default forwarder rejects every client's
+        // status read and the response decodes as "malformed".
+        assert!(is_public_dataset_verb(m::STATUS, b"general"));
+        // The shutdown *command* must stay gated.
+        assert!(!is_public_dataset_verb(m::STATUS, b"shutdown"));
+    }
+
     #[test]
     fn n11_resolve_control_parameters_rejects_both_locations() {
         let cp1 = ControlParameters::default();
