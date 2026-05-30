@@ -72,11 +72,17 @@ old dashboard's useful startup/config affordances without hiding process
 ownership behind a single preset button: operators can quick-start from the
 current draft, edit the structured router config, paste TOML, switch presets,
 review restart-bound diffs, export TOML, and then launch local `ndn-fwd` on
-desktop. The same lifecycle action appears in Operations Home so a detached
-dashboard has a visible recovery path before the operator enters Settings.
-Browser builds keep the workflow visible as deployment documentation, but the
-start command remains unavailable until the target is a desktop shell or a
-browser-safe engine/relay attach path.
+desktop. A successful desktop launch immediately creates a dashboard-started
+attach target from the configured management socket, probes it, records it as
+selected/recent, and marks the engine binding as dashboard-owned so Stop is
+only offered when the process belongs to this dashboard. If launch succeeds
+but attach fails, Operations keeps the PID, config path, socket, and recovery
+message visible instead of leaving the operator with a blank detached app. The
+same lifecycle action appears in Operations Home so a detached dashboard has a
+visible recovery path before the operator enters Settings. Browser builds keep
+the workflow visible as deployment documentation, but the start command remains
+unavailable until the target is a desktop shell or a browser-safe engine/relay
+attach path.
 
 Settings also carries the old dashboard's useful config workflow forward
 without inheriting its component coupling. Dashboard preferences and router

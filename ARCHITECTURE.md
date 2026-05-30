@@ -108,7 +108,8 @@ scope = extension   (flat under crates/)   Pragmatic engineering, no NDN spec ba
                                 mutation preflight gates, typed mutation
                                 replay, first-screen attach controls,
                                 focused Start Router workflow with structured
-                                config/TOML/preset/diff handling, local
+                                config/TOML/preset/diff handling, auto-attach
+                                for dashboard-started local routers, local
                                 ndn-fwd launch/stop controls, live desktop face, route,
                                 strategy, CS, and lifecycle mutation adapters, and
                                 NFD / YaNFD compatibility
