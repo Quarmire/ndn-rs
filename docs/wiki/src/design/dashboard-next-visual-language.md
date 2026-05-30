@@ -26,6 +26,9 @@ The visual rules are:
 - Treat names, prefixes, endpoints, trace IDs, and cert/key IDs as data rows,
   not prose.
 - Do not duplicate the same action in multiple loud visual treatments.
+- Do not make attach topology diagrams the primary dashboard surface. The
+  forwarder/target binding belongs in a compact command strip with status
+  markers and details-on-demand.
 - Keep the default surface minimal and move secondary evidence into details,
   popovers, drawers, or dialogs.
 - Prefer visual state maps, meters, timelines, sparklines, and topology strips
