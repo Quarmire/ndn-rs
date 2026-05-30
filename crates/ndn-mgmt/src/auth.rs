@@ -101,6 +101,11 @@ pub(crate) fn is_public_dataset_verb(module: &[u8], verb: &[u8]) -> bool {
     if module == m::STATUS && verb == b"general" {
         return true;
     }
+    // NFD also serves the CS info dataset (`cs/info`) unsigned — read-only
+    // Content Store statistics (capacity, entries, hit rate), no secrets.
+    if module == m::CS && verb == v::INFO {
+        return true;
+    }
     // ndn-rs-local read-only telemetry dataset (cross-layer link signals).
     if module == m::FACES && verb == v::LINK_QUALITY {
         return true;
@@ -519,6 +524,10 @@ mod e01_tests {
         assert!(is_public_dataset_verb(m::STATUS, b"general"));
         // The shutdown *command* must stay gated.
         assert!(!is_public_dataset_verb(m::STATUS, b"shutdown"));
+        // CS info is an unsigned read like the other NFD status datasets.
+        assert!(is_public_dataset_verb(m::CS, b"info"));
+        // CS config (capacity/erase) is a command and stays gated.
+        assert!(!is_public_dataset_verb(m::CS, b"config"));
     }
 
     #[test]

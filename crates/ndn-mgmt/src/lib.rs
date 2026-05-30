@@ -548,55 +548,61 @@ pub async fn run_ndn_mgmt_handler(
             .components()
             .first()
             .is_some_and(|c| c.value.as_ref() == b"localhop");
-        let (active_validator, effective_required) = if is_localhop_command {
-            match mgmt_handles.localhop_command_validator.as_deref() {
-                Some(v) => (Some(v), true),
-                None => {
-                    let resp = ControlResponse::error(
-                        status::UNAUTHORIZED,
-                        "localhop registration disabled (no trust anchor configured)",
-                    );
-                    send_response(
-                        &handle,
-                        &interest.name,
-                        &resp,
-                        mgmt_handles.command_response_signer.as_deref(),
-                    )
-                    .await;
-                    continue;
+        // Public read-only dataset queries (the canonical NFD status datasets
+        // — `*/list`, `status/general`, `cs/info` — plus the security
+        // inspection verbs and `compute/list`) are served unsigned by design.
+        // Skip authorization for them entirely: they need no signature, and
+        // routing them through `authorize_command` made every poll emit an
+        // "unsigned command accepted" warning. localhop commands are never
+        // public. See `is_public_dataset_verb`.
+        let is_public_read =
+            !is_localhop_command && is_public_dataset_verb(&parsed.module, &parsed.verb);
+        if !is_public_read {
+            let (active_validator, effective_required) = if is_localhop_command {
+                match mgmt_handles.localhop_command_validator.as_deref() {
+                    Some(v) => (Some(v), true),
+                    None => {
+                        let resp = ControlResponse::error(
+                            status::UNAUTHORIZED,
+                            "localhop registration disabled (no trust anchor configured)",
+                        );
+                        send_response(
+                            &handle,
+                            &interest.name,
+                            &resp,
+                            mgmt_handles.command_response_signer.as_deref(),
+                        )
+                        .await;
+                        continue;
+                    }
                 }
-            }
-        } else {
-            // Read-only dataset queries (canonical `*/list`, the security
-            // inspection verbs, and `compute/list`) are public; other ndn-rs
-            // extension verbs require signing. See `is_public_dataset_verb`.
-            let req = if is_public_dataset_verb(&parsed.module, &parsed.verb) {
-                false
             } else {
-                effective_require_signed(
-                    &parsed.module,
-                    mgmt_handles.effective_require_signed_commands(),
+                (
+                    mgmt_handles.command_validator.as_deref(),
+                    effective_require_signed(
+                        &parsed.module,
+                        mgmt_handles.effective_require_signed_commands(),
+                    ),
                 )
             };
-            (mgmt_handles.command_validator.as_deref(), req)
-        };
-        if let Err(reason) = authorize_command(
-            &interest,
-            active_validator,
-            effective_required,
-            mgmt_handles.command_replay_cache.as_ref(),
-        )
-        .await
-        {
-            let resp = ControlResponse::error(status::UNAUTHORIZED, reason);
-            send_response(
-                &handle,
-                &interest.name,
-                &resp,
-                mgmt_handles.command_response_signer.as_deref(),
+            if let Err(reason) = authorize_command(
+                &interest,
+                active_validator,
+                effective_required,
+                mgmt_handles.command_replay_cache.as_ref(),
             )
-            .await;
-            continue;
+            .await
+            {
+                let resp = ControlResponse::error(status::UNAUTHORIZED, reason);
+                send_response(
+                    &handle,
+                    &interest.name,
+                    &resp,
+                    mgmt_handles.command_response_signer.as_deref(),
+                )
+                .await;
+                continue;
+            }
         }
 
         // ControlParameters MUST appear in exactly one location (name
