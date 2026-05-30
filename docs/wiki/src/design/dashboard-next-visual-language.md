@@ -26,6 +26,13 @@ The visual rules are:
 - Treat names, prefixes, endpoints, trace IDs, and cert/key IDs as data rows,
   not prose.
 - Do not duplicate the same action in multiple loud visual treatments.
+- Keep the default surface minimal and move secondary evidence into details,
+  popovers, drawers, or dialogs.
+- Prefer visual state maps, meters, timelines, sparklines, and topology strips
+  over plain lists when the data describes flow, health, or change over time.
+- Tables that carry operational data should grow into reusable table widgets
+  with column resize, sorting, filtering, and collapsible row detail instead of
+  one-off grid snippets.
 
 The dashboard uses a carbon-black operational theme with electric-blue accents.
 Color semantics:
