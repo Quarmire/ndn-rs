@@ -4,6 +4,7 @@
 # Caps (line count, including blank lines and code blocks):
 #   start/       : 130   (kernel pages — narrative + one diagram)
 #   path/        : 90    (thin persona ramps)
+#   choosing/    : 120   (decision guides — table + how-to-decide)
 #   quickstart/  : 100
 #   concepts/    : 200
 #   api/         : 250
@@ -27,6 +28,7 @@ cap_for() {
         docs/wiki/src/SUMMARY.md)    echo 80 ;;
         docs/wiki/src/start/*)       echo 130 ;;
         docs/wiki/src/path/*)        echo 90 ;;
+        docs/wiki/src/choosing/*)    echo 120 ;;
         docs/wiki/src/quickstart/*)  echo 100 ;;
         docs/wiki/src/concepts/*)    echo 200 ;;
         docs/wiki/src/api/*)         echo 250 ;;
