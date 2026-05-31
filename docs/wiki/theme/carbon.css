@@ -11,18 +11,23 @@
    Loaded after fonts.css (see book.toml `additional-css`).
    ───────────────────────────────────────────────────────────────────── */
 
-/* ── Carbon tokens ──────────────────────────────────────────────────── */
+/* ── Carbon tokens ──────────────────────────────────────────────────────
+   NOTE: mdBook sets `:root { font-size: 62.5% }`, so in this book 1rem =
+   10px. All rem values below are authored in that 10px base (e.g. 1.6rem =
+   16px). Keep that in mind when editing — a value that looks like "1rem"
+   here is 10px, not 16px. --content-max-width is left in px to avoid the
+   ambiguity entirely. */
 :root {
-  /* spacing — Carbon 2x grid */
-  --cds-1: 0.125rem; --cds-2: 0.25rem; --cds-3: 0.5rem;  --cds-4: 0.75rem;
-  --cds-5: 1rem;     --cds-6: 1.5rem;  --cds-7: 2rem;     --cds-8: 2.5rem;
-  --cds-9: 3rem;     --cds-10: 4rem;
+  /* spacing — Carbon 2x grid (px shown in comments) */
+  --cds-1: 0.2rem;  --cds-2: 0.4rem;  --cds-3: 0.8rem;  --cds-4: 1.2rem; /* 2 4 8 12 */
+  --cds-5: 1.6rem;  --cds-6: 2.4rem;  --cds-7: 3.2rem;  --cds-8: 4rem;   /* 16 24 32 40 */
+  --cds-9: 4.8rem;  --cds-10: 6.4rem;                                    /* 48 64 */
 
   --font-sans: 'IBM Plex Sans','IBM Plex Sans Var',system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;
   --font-mono: 'IBM Plex Mono','SF Mono',ui-monospace,SFMono-Regular,Consolas,monospace;
 
-  /* editorial reading measure ≈ 75–80ch in Plex */
-  --content-max-width: 58rem;
+  /* editorial reading measure — wider than mdBook's 750px default */
+  --content-max-width: 960px;
 }
 
 /* dark — mapped from styles.rs :root (Carbon Gray 100 base) */
@@ -90,7 +95,7 @@ html { font-family: var(--font-sans); }
 .content main {
   max-width: var(--content-max-width);
   line-height: 1.65;
-  font-size: 1.1875rem;            /* ~19px reading body */
+  font-size: 1.9rem;               /* 19px (10px rem base) */
 }
 .content h1, .content h2, .content h3,
 .content h4, .content h5, .content h6 {
@@ -99,11 +104,11 @@ html { font-family: var(--font-sans); }
   line-height: 1.25;
   letter-spacing: 0;
 }
-.content h1 { font-size: 2.25rem; margin-top: var(--cds-9); }
-.content h2 { font-size: 1.75rem; margin-top: var(--cds-8);
+.content h1 { font-size: 3.6rem; margin-top: var(--cds-9); }       /* 36px */
+.content h2 { font-size: 2.8rem; margin-top: var(--cds-8);          /* 28px */
   padding-top: var(--cds-5); border-top: 1px solid var(--cds-border-subtle); }
-.content h3 { font-size: 1.25rem; margin-top: var(--cds-7); }
-.content h4 { font-size: 1rem; color: var(--cds-text-muted);
+.content h3 { font-size: 2rem; margin-top: var(--cds-7); }          /* 20px */
+.content h4 { font-size: 1.6rem; color: var(--cds-text-muted);      /* 16px */
   text-transform: uppercase; letter-spacing: 0.08em; }
 .content p, .content li { letter-spacing: 0; }
 .content a { text-decoration: none; }
@@ -173,8 +178,8 @@ html { font-family: var(--font-sans); }
 /* Scope tag — the non-standard disclaimer chip (matches SUMMARY markers) */
 .scope {
   display: inline-block; font-family: var(--font-mono);
-  font-size: 0.6875rem; letter-spacing: 0.04em; text-transform: uppercase;
-  padding: 0.1rem 0.4rem; border: 1px solid currentColor; line-height: 1.4;
+  font-size: 1.1rem; letter-spacing: 0.04em; text-transform: uppercase; /* 11px */
+  padding: 0.2rem 0.6rem; border: 1px solid currentColor; line-height: 1.4;
   vertical-align: middle;
 }
 .scope.extension { color: var(--cds-ext); }
@@ -189,13 +194,13 @@ html { font-family: var(--font-sans); }
   margin: 0 0 var(--cds-7);
 }
 .cds-hero h1 { margin: 0 0 var(--cds-3); border: none; padding: 0; }
-.cds-hero p  { color: var(--cds-text-muted); margin: 0; max-width: 42rem; }
+.cds-hero p  { color: var(--cds-text-muted); margin: 0; max-width: 67rem; } /* 670px */
 
 /* Card grid — Carbon 2x grid of linked tiles (persona ramps, choices) */
 .cds-card-grid {
   display: grid; gap: 1px; background: var(--cds-border-subtle);
   border: 1px solid var(--cds-border-subtle);
-  grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(24rem, 1fr)); /* 240px */
   margin: var(--cds-6) 0;
 }
 .cds-card {
@@ -205,20 +210,20 @@ html { font-family: var(--font-sans); }
 }
 .cds-card:hover { background: var(--cds-layer); border-left-color: var(--cds-interactive); }
 .cds-card .cds-card-title { font-weight: 600; display: block; margin-bottom: var(--cds-2); }
-.cds-card .cds-card-desc  { color: var(--cds-text-muted); font-size: 0.9375rem; }
+.cds-card .cds-card-desc  { color: var(--cds-text-muted); font-size: 1.5rem; } /* 15px */
 
 /* Carbon icons — vendored under src/images/icons/. Rendered via CSS mask
    so the external SVG takes the token text colour (and recolours on hover),
    which a plain <img> cannot do. Use:
      <span class="cds-icon" style="--i:url(../images/icons/app.svg)"></span> */
 .cds-icon {
-  display: inline-block; width: 1.25rem; height: 1.25rem;
+  display: inline-block; width: 2rem; height: 2rem;        /* 20px */
   vertical-align: -0.2em; margin-right: var(--cds-3);
   background-color: currentColor;
   -webkit-mask: var(--i) no-repeat center / contain;
   mask: var(--i) no-repeat center / contain;
 }
-.cds-card .cds-icon { width: 1.75rem; height: 1.75rem; margin: 0 0 var(--cds-3); display: block; }
+.cds-card .cds-icon { width: 2.8rem; height: 2.8rem; margin: 0 0 var(--cds-3); display: block; } /* 28px */
 .cds-card .cds-icon { color: var(--cds-text-muted); }
 .cds-card:hover .cds-icon { color: var(--cds-interactive); }
 
@@ -230,6 +235,6 @@ html { font-family: var(--font-sans); }
 }
 .content figure { margin: var(--cds-6) 0; }
 .content figcaption {
-  color: var(--cds-text-faint); font-size: 0.875rem;
+  color: var(--cds-text-faint); font-size: 1.4rem;     /* 14px */
   margin-top: var(--cds-3); text-align: center;
 }
