@@ -80,7 +80,7 @@ scope = spec   (flat under crates/)   NDN community specs implemented faithfully
   ndn-sync                      Dataset sync: SVS, PSync
   ndn-did                       NDN-native Decentralised Identifiers (W3C DID + did:ndn method)
   ndn-cert                      NDNCERT 0.3 — INFO/NEW/CHALLENGE + IssuancePolicy hook + challenge attestations + BootstrapTicket/hub onboarding
-  ndn-custodian                 Custodian trait (InPage/OsKeyring/Fob/BrowserExtension) + KeyId; wasm-safe (no PIB/sqlite) so dashboard/extension/mobile can use it
+  ndn-custodian                 Custodian trait (InPage/OsKeyring/Fob/BrowserExtension) + KeyId + CustodianSigner (Custodian→Signer adapter); wasm-safe (no PIB/sqlite) so dashboard/extension/mobile can use it
   ndn-identity                  Bridges KeyChain + DID + NDNCERT; re-exports ndn-custodian
 
 scope = extension   (flat under crates/)   Pragmatic engineering, no NDN spec basis
@@ -92,6 +92,7 @@ scope = extension   (flat under crates/)   Pragmatic engineering, no NDN spec ba
   ndn-face-webrtc               Peer-to-peer datachannel face (browser-as-peer)
   ndn-face-shared-worker        Per-origin SharedWorker face (one engine across tabs)
   ndn-face-webble               Browser-side Web Bluetooth central face (dials NDN-BLE peripherals)
+  ndn-face-monitor-wifi         802.11 monitor-mode raw-injection face (named-radio bearer; per-frame MCS, no association/ARQ)
   ndn-rtc-signaling-relay       HTTP rendezvous server for browser↔browser WebRTC
   ndn-sim                       SimFace, SimLink, topology builder, event tracer
   ndn-wasm                      In-browser simulation via wasm-bindgen
