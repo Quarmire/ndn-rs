@@ -10,11 +10,9 @@
 //!
 //! ```no_run
 //! use ndn::prelude::*;
-//! use ndn::IpcConnection;
 //!
 //! # async fn run() -> Result<(), ndn::AppError> {
-//! let conn = IpcConnection::connect("/run/nfd/nfd.sock").await?;
-//! let mut consumer = Consumer::new(conn);
+//! let mut consumer = Consumer::connect("/run/nfd/nfd.sock").await?;
 //! let data = consumer.fetch("/example/data").await?;
 //! # Ok(()) }
 //! ```
