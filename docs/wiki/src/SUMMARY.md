@@ -28,6 +28,15 @@
 - [Identity and keys](./concepts/identity-and-keys.md)
 - [Glossary](./concepts/glossary.md)
 
+# Choosing
+
+- [How to read these pages](./choosing/README.md)
+- [Confidentiality](./choosing/confidentiality.md)
+- [Faces & transports](./choosing/faces-and-transports.md)
+- [Routing & discovery](./choosing/routing-and-discovery.md)
+- [Reliability & throughput](./choosing/reliability-and-throughput.md)
+- [When to use in-network compute](./choosing/in-network-compute.md)
+
 # API
 
 - [Develop tier](./api/develop.md)
