@@ -91,6 +91,13 @@ directly, and the dashboard signs after you import `op-alice.safebag`
 the anchor configured in step 2). Read-only datasets (`*/list`,
 `status/general`, `cs/info`) stay unsigned and work without any of this.
 
+> **Mind the section.** `trust_anchor_pib` lives under `[security.mgmt]`
+> — it configures *who may manage this forwarder*. It is **not** the same
+> as `[security] identity`, which is the forwarder's *own* signing key (a
+> separate role; you don't need it just to accept operator commands). A
+> misplaced key is now rejected at startup with an `unknown field` error
+> rather than being silently ignored.
+
 ## Faces and prefixes
 
 Apps register their own prefixes via the IPC face. The operator
