@@ -62,8 +62,9 @@ the appliance from your identity from what you publish:
 - **Engine** — the forwarder you operate: Overview, Strategy, Coding,
   Rate Limit, Routing, Radio, Logs, Fleet, Tools.
 - **Identity** — who you are: a **Trust Context** summary (the roots this node
-  trusts, its CA, and your identities with cert-expiry up front), the detailed
-  Security tabs behind it, and Session.
+  trusts, its CA, your identities with cert-expiry up front, and where your
+  signing key lives on this machine), the detailed Security tabs behind it, and
+  Session.
 - **Compose** — what you publish: the prefixes a local producer or client
   has registered on the attached engine.
 
