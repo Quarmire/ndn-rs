@@ -1,0 +1,235 @@
+/* ─────────────────────────────────────────────────────────────────────
+   ndn-rs wiki — IBM Carbon theme
+   Maps the dashboard's Carbon design tokens (crates/tooling/ndn-dashboard/
+   src/styles.rs) onto mdBook's `navy` (dark, the configured default) and
+   `light` themes, so the docs and the dashboard read as one product.
+
+   Doctrine: Carbon FOUNDATIONS (Plex type, token colour, 2x spacing,
+   square corners) applied at EDITORIAL density — wide reading measure,
+   generous line-height — not the dashboard's data density.
+
+   Loaded after fonts.css (see book.toml `additional-css`).
+   ───────────────────────────────────────────────────────────────────── */
+
+/* ── Carbon tokens ──────────────────────────────────────────────────── */
+:root {
+  /* spacing — Carbon 2x grid */
+  --cds-1: 0.125rem; --cds-2: 0.25rem; --cds-3: 0.5rem;  --cds-4: 0.75rem;
+  --cds-5: 1rem;     --cds-6: 1.5rem;  --cds-7: 2rem;     --cds-8: 2.5rem;
+  --cds-9: 3rem;     --cds-10: 4rem;
+
+  --font-sans: 'IBM Plex Sans','IBM Plex Sans Var',system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;
+  --font-mono: 'IBM Plex Mono','SF Mono',ui-monospace,SFMono-Regular,Consolas,monospace;
+
+  /* editorial reading measure ≈ 70–75ch in Plex */
+  --content-max-width: 46rem;
+}
+
+/* dark — mapped from styles.rs :root (Carbon Gray 100 base) */
+.navy, .coal {
+  --cds-bg:#161616; --cds-layer:#262626; --cds-layer2:#393939;
+  --cds-border:#525252; --cds-border-subtle:#393939;
+  --cds-text:#f4f4f4; --cds-text-muted:#a8a8a8; --cds-text-faint:#6f6f6f;
+  --cds-link:#78a9ff; --cds-interactive:#4589ff; --cds-selected:#001d6c;
+  --cds-success:#42be65; --cds-success-bg:#022d0d;
+  --cds-warning:#f1c21b; --cds-warning-bg:#302400;
+  --cds-error:#fa4d56;   --cds-error-bg:#3a0b0d;
+  --cds-info:#78a9ff;    --cds-info-bg:#001d6c;
+  --cds-ext:#be95ff;     --cds-ext-bg:#1f1144;   /* non-standard marker */
+}
+
+/* light — mapped from styles.rs .light-mode (Carbon White base) */
+.light, .rust, .ayu {
+  --cds-bg:#ffffff; --cds-layer:#f4f4f4; --cds-layer2:#e0e0e0;
+  --cds-border:#c6c6c6; --cds-border-subtle:#e0e0e0;
+  --cds-text:#161616; --cds-text-muted:#525252; --cds-text-faint:#8d8d8d;
+  --cds-link:#0f62fe; --cds-interactive:#0f62fe; --cds-selected:#d0e2ff;
+  --cds-success:#24a148; --cds-success-bg:#defbe6;
+  --cds-warning:#b28600; --cds-warning-bg:#fcf4d6;
+  --cds-error:#da1e28;   --cds-error-bg:#fff1f1;
+  --cds-info:#0f62fe;    --cds-info-bg:#d0e2ff;
+  --cds-ext:#8a3ffc;     --cds-ext-bg:#f6f2ff;
+}
+
+/* ── Bind mdBook's own variables to Carbon tokens ──────────────────────
+   Overriding mdBook's variable names re-skins chrome (sidebar, search,
+   tables, popups) without fighting its stylesheet rule-by-rule. */
+.navy, .coal, .light, .rust, .ayu {
+  --bg: var(--cds-bg);
+  --fg: var(--cds-text);
+  --sidebar-bg: var(--cds-layer);
+  --sidebar-fg: var(--cds-text-muted);
+  --sidebar-non-existant: var(--cds-text-faint);
+  --sidebar-active: var(--cds-link);
+  --sidebar-spacer: var(--cds-border-subtle);
+  --scrollbar: var(--cds-border);
+  --icons: var(--cds-text-faint);
+  --icons-hover: var(--cds-link);
+  --links: var(--cds-link);
+  --inline-code-color: var(--cds-link);
+  --theme-popup-bg: var(--cds-layer);
+  --theme-popup-border: var(--cds-border);
+  --theme-hover: var(--cds-layer2);
+  --quote-bg: var(--cds-layer);
+  --quote-border: var(--cds-border);
+  --table-border-color: var(--cds-border);
+  --table-header-bg: var(--cds-layer2);
+  --table-alternate-bg: var(--cds-layer);
+  --searchbar-border-color: var(--cds-border);
+  --searchbar-bg: var(--cds-layer);
+  --searchbar-fg: var(--cds-text);
+  --search-results-header-fg: var(--cds-text-muted);
+  --search-results-border-color: var(--cds-border);
+  --search-results-li-bg: var(--cds-layer);
+  --warning-border: var(--cds-warning);
+}
+
+/* ── Typography — Plex, editorial scale ────────────────────────────────*/
+html { font-family: var(--font-sans); }
+.content { font-family: var(--font-sans); }
+.content main {
+  max-width: var(--content-max-width);
+  line-height: 1.6;
+  font-size: 1.0625rem;            /* ~17px reading body */
+}
+.content h1, .content h2, .content h3,
+.content h4, .content h5, .content h6 {
+  font-family: var(--font-sans);
+  font-weight: 600;
+  line-height: 1.25;
+  letter-spacing: 0;
+}
+.content h1 { font-size: 2.25rem; margin-top: var(--cds-9); }
+.content h2 { font-size: 1.75rem; margin-top: var(--cds-8);
+  padding-top: var(--cds-5); border-top: 1px solid var(--cds-border-subtle); }
+.content h3 { font-size: 1.25rem; margin-top: var(--cds-7); }
+.content h4 { font-size: 1rem; color: var(--cds-text-muted);
+  text-transform: uppercase; letter-spacing: 0.08em; }
+.content p, .content li { letter-spacing: 0; }
+.content a { text-decoration: none; }
+.content a:hover { text-decoration: underline;
+  text-underline-offset: 3px; text-decoration-thickness: 1px; }
+
+/* ── Square corners everywhere (Carbon) ────────────────────────────────*/
+.content pre, .content code, .content table,
+.content blockquote, .menu-title, #searchbar,
+.theme-popup, .cds-card, .cds-callout, .cds-hero, .scope, img {
+  border-radius: 0 !important;
+}
+
+/* ── Code — Plex Mono on a layer surface ───────────────────────────────*/
+.content code { font-family: var(--font-mono); font-size: 0.875em; }
+.content pre {
+  background: var(--cds-layer);
+  border: 1px solid var(--cds-border-subtle);
+  border-left: 2px solid var(--cds-interactive);
+  padding: var(--cds-5);
+}
+.content :not(pre) > code {
+  background: var(--cds-layer);
+  padding: 0.1em 0.35em;
+  border: 1px solid var(--cds-border-subtle);
+}
+
+/* ── Tables — Carbon: strong header rule, zebra layer ───────────────────*/
+.content table { border-collapse: collapse; width: 100%; }
+.content table thead th {
+  background: var(--cds-layer2);
+  border-bottom: 2px solid var(--cds-border);
+  text-align: left; font-weight: 600;
+  padding: var(--cds-3) var(--cds-4);
+}
+.content table td { border: none;
+  border-bottom: 1px solid var(--cds-border-subtle);
+  padding: var(--cds-3) var(--cds-4); }
+.content table tbody tr:nth-child(odd) { background: var(--cds-layer); }
+
+/* ── Blockquote → Carbon notification (left accent bar) ─────────────────*/
+.content blockquote {
+  background: var(--cds-info-bg);
+  border: none; border-left: 3px solid var(--cds-info);
+  color: var(--cds-text); padding: var(--cds-4) var(--cds-5);
+}
+
+/* ── Reusable Carbon components for pages ───────────────────────────────
+   Author in markdown with raw HTML, e.g.
+     <div class="cds-callout extension"> … </div>                         */
+
+/* Notification / callout, four intents + the non-standard marker */
+.cds-callout {
+  border-left: 3px solid var(--cds-info);
+  background: var(--cds-info-bg);
+  padding: var(--cds-4) var(--cds-5);
+  margin: var(--cds-6) 0;
+}
+.cds-callout.success   { border-color: var(--cds-success); background: var(--cds-success-bg); }
+.cds-callout.warning   { border-color: var(--cds-warning); background: var(--cds-warning-bg); }
+.cds-callout.error     { border-color: var(--cds-error);   background: var(--cds-error-bg); }
+.cds-callout.extension { border-color: var(--cds-ext);     background: var(--cds-ext-bg); }
+.cds-callout .cds-callout-title {
+  font-weight: 600; display: block; margin-bottom: var(--cds-2);
+}
+
+/* Scope tag — the non-standard disclaimer chip (matches SUMMARY markers) */
+.scope {
+  display: inline-block; font-family: var(--font-mono);
+  font-size: 0.6875rem; letter-spacing: 0.04em; text-transform: uppercase;
+  padding: 0.1rem 0.4rem; border: 1px solid currentColor; line-height: 1.4;
+  vertical-align: middle;
+}
+.scope.extension { color: var(--cds-ext); }
+.scope.draft     { color: var(--cds-warning); }
+.scope.spec      { color: var(--cds-success); }
+
+/* Hero — Carbon expressive block for the top of landing/start pages */
+.cds-hero {
+  background: var(--cds-layer);
+  border-left: 4px solid var(--cds-interactive);
+  padding: var(--cds-7) var(--cds-7) var(--cds-6);
+  margin: 0 0 var(--cds-7);
+}
+.cds-hero h1 { margin: 0 0 var(--cds-3); border: none; padding: 0; }
+.cds-hero p  { color: var(--cds-text-muted); margin: 0; max-width: 42rem; }
+
+/* Card grid — Carbon 2x grid of linked tiles (persona ramps, choices) */
+.cds-card-grid {
+  display: grid; gap: 1px; background: var(--cds-border-subtle);
+  border: 1px solid var(--cds-border-subtle);
+  grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+  margin: var(--cds-6) 0;
+}
+.cds-card {
+  background: var(--cds-bg); padding: var(--cds-5);
+  text-decoration: none !important; color: var(--cds-text);
+  border-left: 2px solid transparent; transition: border-color .1s, background .1s;
+}
+.cds-card:hover { background: var(--cds-layer); border-left-color: var(--cds-interactive); }
+.cds-card .cds-card-title { font-weight: 600; display: block; margin-bottom: var(--cds-2); }
+.cds-card .cds-card-desc  { color: var(--cds-text-muted); font-size: 0.9375rem; }
+
+/* Carbon icons — vendored under src/images/icons/. Rendered via CSS mask
+   so the external SVG takes the token text colour (and recolours on hover),
+   which a plain <img> cannot do. Use:
+     <span class="cds-icon" style="--i:url(../images/icons/app.svg)"></span> */
+.cds-icon {
+  display: inline-block; width: 1.25rem; height: 1.25rem;
+  vertical-align: -0.2em; margin-right: var(--cds-3);
+  background-color: currentColor;
+  -webkit-mask: var(--i) no-repeat center / contain;
+  mask: var(--i) no-repeat center / contain;
+}
+.cds-card .cds-icon { width: 1.75rem; height: 1.75rem; margin: 0 0 var(--cds-3); display: block; }
+.cds-card .cds-icon { color: var(--cds-text-muted); }
+.cds-card:hover .cds-icon { color: var(--cds-interactive); }
+
+/* Diagrams sit on their own surface, full reading width */
+.content img[src$=".svg"] {
+  display: block; width: 100%; height: auto;
+  border: 1px solid var(--cds-border-subtle);
+  margin: var(--cds-6) 0;
+}
+.content figure { margin: var(--cds-6) 0; }
+.content figcaption {
+  color: var(--cds-text-faint); font-size: 0.875rem;
+  margin-top: var(--cds-3); text-align: center;
+}

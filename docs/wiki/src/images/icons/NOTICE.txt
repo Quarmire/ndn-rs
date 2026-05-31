@@ -1,0 +1,12 @@
+# Vendored Carbon icons
+
+These SVGs are from [@carbon/icons](https://github.com/carbon-design-system/carbon),
+licensed under **Apache-2.0**. `fill` attributes were stripped so the icons
+inherit `currentColor` and follow the wiki's Carbon token palette.
+
+To add or refresh an icon:
+
+    curl -fsSL "https://cdn.jsdelivr.net/npm/@carbon/icons@11/svg/32/<name>.svg" \
+      -o docs/wiki/src/images/icons/<local-name>.svg
+    perl -0pi -e 's/\sfill="[^"]*"//g; s/<svg /<svg fill="currentColor" /' \
+      docs/wiki/src/images/icons/<local-name>.svg

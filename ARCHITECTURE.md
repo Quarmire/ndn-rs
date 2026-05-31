@@ -15,7 +15,7 @@ NDN-RS models Named Data Networking as **composable async pipelines with trait-b
 
 ## Scope policy
 
-Every crate in the workspace has one of four scope buckets, recorded
+Every crate in the workspace has one of the scope buckets recorded
 in each crate's `Cargo.toml` `[package.metadata.scope]` field. `spec`
 and `extension` crates live flat under `crates/`; `tooling/` and
 `draft/` remain as subdirectories:
@@ -32,11 +32,19 @@ and `extension` crates live flat under `crates/`; `tooling/` and
   CLI surface stable between releases.
 - **`draft`** — author-led, exploratory; compiles + honest README
   is the bar.
+- **`research`** — legacy label for exploratory research crates;
+  treated like `draft` for release-boundary decisions until it is
+  either promoted or renamed.
 
 Dependency-direction rule (`draft` → `tooling` → `extension` →
 `spec`): a `spec` crate may not depend on anything to its right.
 Honored by convention today; a future commit will add a
 workspace-level lint.
+
+For the first stable release, only the `spec` crates and the subset of
+`tooling` needed to run and verify them are in the v0.1.0 stability
+boundary. `extension`, `draft`, and `research` crates may build and
+ship in the repository without carrying the same SemVer promise.
 
 ## Crate Map
 
@@ -62,7 +70,7 @@ scope = spec   (flat under crates/)   NDN community specs implemented faithfully
                                 via `[listeners.ble]`, NDNts web-bluetooth GATT profile)
   ndn-face-webtransport         Server-side WebTransport listener (HTTP/3 + QUIC datagrams)
   ndn-strategy                  BestRoute, Multicast, ASF, composed strategies
-  ndn-security                  KeyChain, Signer/Verifier, TrustSchema, Validator, SafeData
+  ndn-security                  KeyChain, Signer/Verifier, TrustSchema, Validator, SafeData, Keyring/TrustContext
   ndn-engine                    ForwarderEngine, EngineBuilder/WasmEngineBuilder, pipeline, task topology
   ndn-app                       Application API: Consumer, Producer, Subscriber
   ndn-ipc                       ForwarderClient, BlockingForwarderClient, chunked transfer
@@ -71,7 +79,7 @@ scope = spec   (flat under crates/)   NDN community specs implemented faithfully
   ndn-routing                   StaticProtocol, DvrProtocol, NlsrProtocol
   ndn-sync                      Dataset sync: SVS, PSync
   ndn-did                       NDN-native Decentralised Identifiers (W3C DID + did:ndn method)
-  ndn-cert                      NDNCERT 0.3 — INFO/NEW/CHALLENGE + IssuancePolicy hook + challenge attestations
+  ndn-cert                      NDNCERT 0.3 — INFO/NEW/CHALLENGE + IssuancePolicy hook + challenge attestations + BootstrapTicket/hub onboarding
   ndn-identity                  Bridges KeyChain + DID + NDNCERT
 
 scope = extension   (flat under crates/)   Pragmatic engineering, no NDN spec basis
@@ -179,6 +187,10 @@ Data:     FaceCheck → TlvDecode → PitMatch  → Validation → CsInsert → 
 ```
 
 `PacketContext` passes **by value** — ownership transfer makes short-circuits compiler-enforced. Each stage returns `Action`: `Continue`, `Send`, `Satisfy`, `Drop`, or `Nack`.
+Nacks are treated as point-to-point feedback: the dispatcher suppresses
+generated Nacks on multi-access/ad-hoc ingress faces, ignores incoming Nacks
+from shared-medium faces, and skips Nack propagation to shared-medium
+downstream in-records.
 
 `ValidationStage` sets `ctx.verified = true` on the valid path. `CsInsertStage` gates on `ctx.verified` — unverified Data is never cached. Local-face Data is trusted by the OS-level IPC credential and also sets `ctx.verified`. When `validator_enabled = false`, the validator is permissive and still sets `ctx.verified` so the CS admission invariant holds in dev mode.
 
@@ -186,7 +198,14 @@ Data:     FaceCheck → TlvDecode → PitMatch  → Validation → CsInsert → 
 
 - **FIB** — `NameTrie` with per-node `RwLock`; concurrent longest-prefix match
 - **PIT** — `DashMap<PitToken, PitEntry>`; sharded, no global lock on hot path; PIT key tuple is `(LogicalName, ForwardingHint, PitKeyDiscriminator)` where the discriminator separates classical from persistent-attach entries (see substrate doctrine below)
-- **Content Store** — trait-based; `LruCs` (in-memory), `ShardedCs` (parallel), `FjallCs` (disk)
+- **LP reassembly** — per-face `ReassemblyBuffer` keys pending fragments by
+  `(endpoint_id, sequence)`. Shared-medium transports surface `FaceAddr`
+  (UDP sender or MAC), which the dispatcher turns into stable nonzero endpoint
+  ids before decode so overlapping fragment sequences from different senders do
+  not collide.
+- **Dead Nonce List** — engine-owned `DeadNonceList` retaining `(name_hash, nonce)` fingerprints after PIT erasure; `PitCheckStage` consults it before aggregation, while `PitMatchStage` and the PIT expiry task insert retiring nonces.
+- **Content Store** — trait-based; `LruCs` (in-memory), `ShardedCs` (parallel), `FjallCs` (disk). Entries carry an absolute `stale_at` derived from `FreshnessPeriod`; `MustBeFresh` Interests miss stale entries at both the store and `CsLookupStage`, while non-`MustBeFresh` Interests may still use stale cached Data.
+- **Unsolicited Data policy** — `DropAll` by default, with `AdmitLocal`, `AdmitNetwork`, and `AdmitAll` available for operators that want NFD-style opportunistic caching on shared media. Admitted unsolicited Data is cache-only and still must pass validation before CS insertion.
 - **Strategy Table** — name trie mapping prefixes to `Arc<dyn Strategy>`
 - **SubscriptionRequest** — `ndn-packet` sub-TLV (type `0x230`) inside `ApplicationParameters`; enables persistent Interests that survive multiple Data deliveries; degrades gracefully on unsigned or unvalidated Interests
 
@@ -286,9 +305,9 @@ right home and surfaces failure with a named-field error body
 NFD clients ignoring kind > 4 see the lifecycle subset; ndn-rs clients
 (`ndn-ctl`, `ndn-dashboard`) read every kind.
 
-References: [`docs/wiki/src/operations/faces.md`](docs/wiki/src/operations/faces.md)
-(operator guide), [`docs/wiki/src/design/link-service.md`](docs/wiki/src/design/link-service.md)
-(design reference).
+References: [`docs/wiki/src/reference/face-transports.md`](docs/wiki/src/reference/face-transports.md)
+(operator catalog) and [`docs/wiki/src/guides/implementing-a-face.md`](docs/wiki/src/guides/implementing-a-face.md)
+(extension guide).
 
 ## Task Topology
 
@@ -314,8 +333,51 @@ command Interests.
 
 `Validator` dispatches on `SignatureType`: Ed25519, ECDSA-SHA-256, RSA-SHA-256,
 HMAC-SHA-256, DigestSha256, and BLAKE3 plain/keyed verifiers are all wired.
+The audit witnesses now exercise RSA/ECDSA with valid signatures, wrong
+signatures, malformed keys, and validator dispatch instead of source scans.
 Certificate Format v2 names (`/<identity>/KEY/<KeyId>/<IssuerId>/<Version>`) are
 enforced by `KeyChain::ephemeral` and `ndn-sec keygen`.
+SafeBag export/import uses CertificateV2 plus encrypted PKCS#8 private keys;
+the encrypted-key profile is PBES2 with PBKDF2-HMAC-SHA256 and AES-256-CBC so
+reference `ndnsec import/export` can round-trip ndn-rs SafeBags.
+`ConfigPolicy` models the release-relevant configuration-validator behavior:
+ordered first-match rules, no-match denial, exact KeyLocator-prefix checks, and
+hierarchical checking. It is not a full ndn-cxx `validator.conf` parser.
+LVS binary schemas with unsupported user functions fail closed: import rejects
+them for trust-schema enforcement, and direct model/policy evaluation treats the
+unsupported function constraint as non-matching.
+
+Management command Interests are signed by `ndn-ipc` before they are LP-wrapped:
+the default localhost path emits DigestSha256 over the decoded spec signed
+region, and `MgmtClient::with_signer` emits key-backed command Interests for
+NFD `localhop_security` deployments.
+Management dataset Interests are unsigned but set both CanBePrefix and
+MustBeFresh: CanBePrefix matches versioned/segmented dataset Data, while
+MustBeFresh prevents a cached management segment from hiding a just-applied
+change such as a newly registered RIB entry.
+Trust-anchor insertion fails closed on expired or not-yet-valid certificates:
+invalid anchors do not enter the anchor set, cert cache, or PIB anchor store.
+
+### TrustContext keyring (per-namespace dispatch)
+
+A node holds a `Keyring` — a set of adopted `TrustContext`s, each binding a
+`namespace` to its own anchor set and trust schema — rather than one flat
+anchor pile. The `Validator` is keyring-backed and dispatches every packet to
+the context selected by *its name's* namespace (longest-prefix match); it is
+validated only against that context's schema **and** anchors, never "any
+anchor I hold." Hierarchical contexts (the default) additionally enforce the
+`keyLocator.isPrefixOf(name)` floor — the signing key's identity must prefix
+the signed name — which closes the skeleton-key authorization gap (NFD #2856).
+The flat-anchor API (`Validator::new` / `with_chain` / `add_trust_anchor` /
+`set_schema`) targets an ambient root-namespace context, so existing
+single-anchor callers are unchanged. A `TrustContext` is also a signed,
+versioned NDN object (`/<ns>/32=trust-context/v=N`, TLV `0x0410–0x041F`); the
+keyring refuses a strictly older version (anti-rollback). Onboarding lives in
+`ndn-cert`: a `BootstrapTicket` (QR/deep-link fragment) carries the namespace + root
+anchor *fingerprint*, and `adopt_with_tofu` is the only sanctioned path from
+"received a context" to "trusted" — adoption is never automatic. The chain walk
+also honours a context's `revocations`, so an issuing-CA compromise is
+contained by a pulled context bump (no re-bootstrap).
 
 ## Routing
 
@@ -327,7 +389,16 @@ The `RoutingProtocol` trait populates the RIB. Three implementations ship:
 - **`NlsrProtocol`** — Named-data Link State Routing; implements the NDN testbed
   routing protocol. Runs `NeighborProbeProtocol` for liveness, PSync-based LSA flooding, and
   Dijkstra-based routing-table computation. Enabled via `[routing.nlsr]` in
-  `ndnd.toml`. See `docs/wiki/src/protocols/nlsr.md` for operator guidance.
+  `ndnd.toml`. The G.04 Docker witness runs this implementation against C++
+  NLSR and requires bidirectional route convergence; live interop status is
+  tracked by the audit witnesses and
+  [`testbed/EXPECTED_FAILURES.md`](testbed/EXPECTED_FAILURES.md).
+
+The self-learning strategy broadcasts discovery Interests when no route exists.
+When Data returns with an LP `PrefixAnnouncement`, the engine validates the
+signed announcement, installs a PrefixAnnouncement-origin route toward the
+announcing face, and later Interests under that prefix forward on the learned
+route. Tampered or untrusted announcements install no route.
 
 ## Observability
 
@@ -347,19 +418,31 @@ The publisher lives in
 trace stitching uses the [`TraceContext` LP TLV](crates/ndn-packet/src/lp/trace_context.rs)
 (type `0x520`, 33-byte value matching the W3C trace-context binary form
 plus an 8-byte single-hop timestamp); see
-[`docs/wiki/src/operations/opentelemetry.md`](docs/wiki/src/operations/opentelemetry.md)
-for the operator guide.
+[`docs/wiki/src/operations/logging.md`](docs/wiki/src/operations/logging.md)
+for the current operator-facing logging and tracing guide.
 
 ## Testbed
 
 `testbed/docker-compose.yml` spins up an `ndn-fwd` instance, a C++ NFD instance,
 and a YaNFD instance on a `172.30.0.0/24` network plus an `interop` container
-with ndn-cxx tooling. The harness supports two test classes:
+with ndn-cxx tooling. The interop image also carries targeted reference-side
+fixtures such as the deterministic C++ PSync FullProducer used by the G.03
+witness, reference NFD `nfdc` for management dataset decoding, plus the matching
+ndn-rs `ndn-psync-consumer` CLI, `ndn-mgmt-response-verify` trust-anchor
+witness, and `ndn-mgmt-notification-fetch` event-stream witness. NDNts coverage
+uses `ndncat` on Node 24 and the image build smoke-checks the CLI so
+runtime-package drift is caught before packet interop begins. Heavy reference
+tool builds are capped by `NDN_TESTBED_BUILD_JOBS` (default `2`), and
+`testbed/tools/up-g06-low-memory.sh` brings up the AutoConfig witness topology
+sequentially for Docker Desktop hosts with limited VM memory. The harness
+supports two test classes:
 
 - **`testbed/tests/audit/<id>_<slug>.sh`** — per-finding witnesses. Each script
   exits 1 against a broken codebase and 0 after the fix. RUST-UNIT witnesses
-  drive `cargo test`; GREP-PROOF witnesses verify code absence; INTEROP witnesses
-  exchange packets across containers.
+  drive `cargo test`; INTEROP witnesses exchange packets across containers.
+  Grep checks may remain as source-regression guards, but they are not sufficient
+  evidence for protocol-compliance claims unless paired with behavioral or wire
+  witnesses.
 - **`testbed/tests/interop/`** — cross-implementation packet exchange tests
   (ndn-rs app vs NFD forwarder, ndn-cxx consumer vs ndn-rs forwarder, etc.).
 
@@ -386,8 +469,8 @@ programmatically.
 The browser-side
 WebTransport client face lives in
 [`crates/ndn-face-webtransport-wasm/`](crates/ndn-face-webtransport-wasm/);
-the wiki page [`transports/webtransport-browser`](docs/wiki/src/transports/webtransport-browser.md)
-walks through wiring it into a Rust→WASM application. The crate compiles
+the face catalog [`docs/wiki/src/reference/face-transports.md`](docs/wiki/src/reference/face-transports.md)
+summarises the WebTransport variants. The crate compiles
 on both targets — wasm32 uses `xwt-web` (`web-sys::WebTransport`), other
 targets use `xwt-wtransport` (`quinn` + `wtransport`) so loopback witnesses
 can run without a real browser.
@@ -396,25 +479,24 @@ can run without a real browser.
 
 | Demo | Crate | Notes |
 | --- | --- | --- |
-| In-browser ndn-rs (Dioxus + WebTransport) | [`crates/tooling/dioxus-demo/`](crates/tooling/dioxus-demo/) | Phase 7: full `ForwarderEngine` (PIT, FIB, CS, dispatcher, pipeline) running in the browser via [`WasmEngineBuilder`](crates/ndn-engine/src/wasm_builder.rs) — same code path as native `ndn-fwd` modulo `ValidationStage::disabled`. Tab-side `BrowserWebTransportFace`; SharedWorker hosts the engine ([Phase 6](docs/wiki/src/transports/shared-worker.md)). Pure Rust→WASM. Witnesses: `testbed/tests/browser/{dioxus_demo,sharedworker_cache_hit}_*.spec.ts`. See [`docs/wiki/src/transports/browser-as-forwarder.md`](docs/wiki/src/transports/browser-as-forwarder.md). |
+| In-browser ndn-rs (Dioxus + WebTransport) | [`crates/tooling/dioxus-demo/`](crates/tooling/dioxus-demo/) | Phase 7: full `ForwarderEngine` (PIT, FIB, CS, dispatcher, pipeline) running in the browser via [`WasmEngineBuilder`](crates/ndn-engine/src/wasm_builder.rs) — same code path as native `ndn-fwd` modulo `ValidationStage::disabled`. Tab-side `BrowserWebTransportFace`; SharedWorker hosts the engine. Pure Rust→WASM. Witnesses: `testbed/tests/browser/{dioxus_demo,sharedworker_cache_hit}_*.spec.ts`. This remains outside the v0.1.0 stable boundary unless promoted by release notes. |
 
 ## Design Docs
 
+Current user-facing docs live in [`docs/wiki/src/`](docs/wiki/src/).
+Pre-v0.1 design essays that were archived during the documentation
+rewrite live under `.claude/docs-archive-pre-v0.1.0/` and
+`.claude/wiki-archive-pre-v0.1.0/`; treat them as design history, not
+current behavior.
+
 | Document | Contents |
 |---|---|
-| [`docs/architecture.md`](docs/architecture.md) | Design philosophy, key decisions, task topology |
-| [`docs/tlv-encoding.md`](docs/tlv-encoding.md) | varu64, TlvReader, partial decode, COBS |
-| [`docs/packet-types.md`](docs/packet-types.md) | Name, Interest, Data, PacketContext |
-| [`docs/pipeline.md`](docs/pipeline.md) | PipelineStage, Action, stage sequences |
-| [`docs/forwarding-tables.md`](docs/forwarding-tables.md) | FIB, PIT, Content Store implementations |
-| [`docs/faces.md`](docs/faces.md) | Face trait, task topology, all face types |
-| [`docs/strategy.md`](docs/strategy.md) | Strategy trait, BestRoute, measurements |
-| [`docs/engine.md`](docs/engine.md) | ForwarderEngine, EngineBuilder, tracing |
-| [`docs/security.md`](docs/security.md) | Signing, trust schema, SafeData |
-| [`docs/ipc.md`](docs/ipc.md) | Transport tiers, chunked transfer, service registry |
-| [`docs/discovery.md`](docs/discovery.md) | NDN AutoConfig, neighbor liveness probe, service discovery |
-| [`docs/protocols/routing.md`](docs/protocols/routing.md) | DVR algorithm, static routes, RIB lifecycle |
-| [`docs/wireless.md`](docs/wireless.md) | Multi-radio, nl80211, wfb-ng |
+| [`docs/wiki/src/`](docs/wiki/src/) | Current mdBook: quickstarts, API tiers, operations, reference, release boundary |
+| [`docs/wiki/src/reference/spec-compliance.md`](docs/wiki/src/reference/spec-compliance.md) | Reader-facing map to audit witnesses and release blockers |
+| [`docs/wiki/src/releases/v0.1.0.md`](docs/wiki/src/releases/v0.1.0.md) | Candidate v0.1.0 stability boundary |
+| [`docs/specs/`](docs/specs/) | ndn-rs-specific wire specs and extension TLVs |
 | [`docs/compute.md`](docs/compute.md) | In-network compute: tiered API, determinism, wire spec |
 | [`docs/coding.md`](docs/coding.md) | Network coding: F1 FEC, CodedProducer/CodedFetcher, wire spec |
-| [`docs/spsc-shm-spec.md`](docs/spsc-shm-spec.md) | Shared memory ring buffer spec |
+| [`docs/abe.md`](docs/abe.md) | Attribute-based encryption extension notes |
+| [`docs/cclf.md`](docs/cclf.md) | CCLF strategy notes |
+| [`docs/doctrine/`](docs/doctrine/) | Design doctrine notes that are still intentionally retained |

@@ -6,9 +6,17 @@ Develop-tier umbrella crate (`ndn-rs-prelude`, library name `ndn`)
 that an application reaches for to fetch a `Data` by name or serve
 one.
 
-The same workspace runs on Linux, macOS, Windows, mobile, and
-`wasm32-unknown-unknown`. The engine builds for the browser via
-`WasmEngineBuilder`; the dashboard runs the real engine in-page.
+The first stable boundary is the spec-aligned core plus the tooling
+needed to run and verify it. Browser, embedded, mobile, BLE, WebRTC,
+in-network compute, network coding, ABE, and dashboard work live in
+extension or research scopes unless their individual pages say
+otherwise.
+
+The project is primarily AI-authored and still carries known
+spec-compliance findings. Do not cite ndn-rs as a reference
+implementation of NDN; use the live audit tracker and
+[spec-compliance page](./reference/spec-compliance.md) to decide what
+has actually been witnessed.
 
 Three API tiers separate audience from intent:
 
@@ -30,6 +38,7 @@ Three API tiers separate audience from intent:
 - Writing your first app? → [Five-minute app](./quickstart/5-minute-app.md).
 - Running a node? → [Running the forwarder](./quickstart/running-the-forwarder.md).
 - Building a strategy or face? → [Extend tier](./api/extend.md).
+- Checking release readiness? → [v0.1.0 boundary](./releases/v0.1.0.md).
 
 The source lives at
 [`github.com/Quarmire/ndn-rs`](https://github.com/Quarmire/ndn-rs).

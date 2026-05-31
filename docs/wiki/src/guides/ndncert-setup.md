@@ -93,6 +93,10 @@ single-use or TTL-bounded.
 | `acme-dns01` | Wins an ACME DNS-01 challenge | Domain-bound names; see `testbed/tests/audit/acme_dns01.sh`. |
 
 The challenge surface is in `crates/ndn-cert/src/challenge/`.
+Client-side enrollment uses `ndn_identity::NdncertClient`; standard token and
+possession challenges have typed helpers, and named custom challenges can pass
+their challenge identifier plus structured parameters through the same
+NDNCERT NEW/CHALLENGE session.
 
 ## Issuance policy
 

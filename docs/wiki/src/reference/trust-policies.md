@@ -123,6 +123,43 @@ let validation = ChainedPolicy::new()
 | `Producer::publish_object` | Pre-sign guard via the supplied `KeyChain`. |
 | `Subscriber::next` | Validator (per `SubscriberConfig`). |
 
+## Trust contexts and onboarding
+
+A node does not "join a network"; it adopts a set of **trust contexts**
+(a `Keyring`). Each `TrustContext` binds a `namespace` to its own anchor
+set and schema. The validator dispatches each packet to the context
+selected by *its name's* namespace (longest-prefix match) and validates
+it only against that context's schema **and** anchors — trust held for
+one namespace never authorizes another. Hierarchical contexts (the
+default) also require the signing key's identity to be a prefix of the
+signed name.
+
+```rust,ignore
+use ndn_security::{TrustContext, Validator, TrustSchema};
+
+let validator = Validator::new(TrustSchema::hierarchical());
+let home = std::sync::Arc::new(TrustContext::hierarchical("/home/bob".parse()?));
+home.add_anchor(home_anchor_cert);
+validator.adopt_context(home); // data under /home/bob now validates against it
+```
+
+Onboarding (in `ndn-cert`) splits into two unrelated operations:
+
+- **Adopt-to-verify** — acquire a context's anchor + schema to *verify*
+  data. Free, no CA. A `BootstrapTicket` (a QR / deep-link fragment carrying
+  the namespace and the root anchor *fingerprint*) seeds root
+  authenticity; `adopt_with_tofu` adopts a fetched context only if its
+  anchor matches that fingerprint — adoption is never automatic.
+- **Enroll-to-be-verified** — get a cert issued to *produce*. Gated by
+  NDNCERT challenges; the hub default is `token AND device-approval`,
+  and tokens are single-use, TTL-bounded, and name-scoped.
+
+`ndn-fwd init --profile hub --namespace /home/bob` stands up a root and
+prints a bootstrap ticket; `ndn-fwd adopt <ticket>` reports the fingerprint
+it will pin. Contexts are signed, versioned NDN objects
+(`/<ns>/32=trust-context/v=N`); a node refuses an older version
+(anti-rollback) and honours a context's revocation list.
+
 ## See also
 
 - [Identity and keys](../concepts/identity-and-keys.md) — KeyChain

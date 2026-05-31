@@ -119,6 +119,8 @@ not run an open mgmt socket on a network face.
 ## See also
 
 - `crates/ndn-dashboard/` — implementation.
+- [Dashboard next](./dashboard-next.md) — browser-first rewrite
+  scaffold and migration target.
 - [Management verbs](../reference/mgmt-verbs.md) — every verb the
   dashboard issues.
 - [ndn-fwd](../operations/ndn-fwd.md) — forwarder ops.

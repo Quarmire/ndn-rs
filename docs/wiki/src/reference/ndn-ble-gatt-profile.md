@@ -2,7 +2,7 @@
 
 **Status:** Draft / experimental. This page documents the GATT profile and
 framing rules ndn-rs implements, written normatively so other implementations
-can interoperate. The ndn-rs reference implementation has not been validated on
+can interoperate. The ndn-rs implementation has not been validated on
 hardware against a second implementation; treat the conformance language as the
 *intended* contract, not a proven one.
 

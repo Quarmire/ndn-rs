@@ -36,19 +36,36 @@ substrate — a forwarder engine plus the tools and libraries around it.
 
 ## Features
 
-- Async pipeline with and pluggable forwarding strategies.
-- Multiple face transports: UDP, TCP, Unix socket, in-process channel,
-  shared-memory, serial, BLE, Ethernet, WebSocket, WebTransport.
+- Async forwarding pipeline with pluggable strategies.
+- Core face transports for local and networked deployments: UDP, TCP,
+  Unix socket, in-process channel, shared memory, Ethernet, WebSocket,
+  and WebTransport.
 - Identity and trust: KeyChain, signing-info composition, validation
-  policies, NDNCERT enrollment.
+  policies, and NDNCERT enrollment pieces.
 - NFD-compatible management surface (`/localhost/nfd/...`) for
   cross-stack tooling.
-- Browser-ready: the engine builds for `wasm32-unknown-unknown` and
-  runs in a browser tab.
-- Embedded and mobile: a `no_std` forwarder for bare-metal MCUs serving
-  NDN-over-BLE (verified on ESP32-C3 and ESP32-S3), and a single BoltFFI
-  surface that generates Kotlin, Swift, and TypeScript/WASM bindings from
-  one Rust definition.
+- Extension tracks for browser, embedded, mobile, BLE, WebRTC,
+  in-network compute, network coding, and dashboard workflows.
+
+## Release boundary
+
+The first stable release is scoped to the spec-aligned core plus the
+operator tooling needed to run and verify it. Crates and binaries are
+classified with `[package.metadata.scope]`:
+
+- `spec` — NDN packet, forwarding, security, management, sync,
+  routing, app, and forwarder surfaces that aim to follow published
+  NDN specifications.
+- `tooling` — CLIs, benchmark tools, dashboards, and audit helpers.
+- `extension` — useful but non-standard engineering such as browser
+  transports, embedded/mobile surfaces, compute, coding, ABE, and
+  deployment glue.
+- `draft` / `research` — exploratory code with no stability promise.
+
+Treat v0.1.0 as a release candidate until every critical audit finding
+in [`testbed/EXPECTED_FAILURES.md`](testbed/EXPECTED_FAILURES.md) is
+closed and a fresh `interop` image run passes the cross-implementation
+suite.
 
 ---
 
@@ -158,8 +175,10 @@ forwarder, an NDNCERT CA, and a WebRTC signaling relay. Start with
 ```bash
 # Native (Tokio)
 cargo build --workspace
-cargo test  --workspace -- --skip ignored
 cargo clippy --workspace -- -D warnings
+
+# Tests are useful, but scoped runs are preferred during development:
+cargo test -p ndn-packet
 
 # Browser target (wasm32)
 cargo build --target wasm32-unknown-unknown -p ndn

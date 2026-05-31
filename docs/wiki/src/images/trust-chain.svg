@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 430" font-family="'IBM Plex Sans', system-ui, sans-serif" role="img" aria-label="Trust chain: a Data packet's signature is followed up a chain of certificates to a trust anchor you pinned, then a schema gate yields SafeData or a drop">
+  <defs>
+    <marker id="u" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#78a9ff"/></marker>
+    <marker id="ok" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#42be65"/></marker>
+    <marker id="no" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#fa4d56"/></marker>
+  </defs>
+
+  <rect width="980" height="430" fill="#161616"/>
+  <text x="32" y="40" fill="#f4f4f4" font-size="22" font-weight="600">Trust, first</text>
+  <text x="32" y="62" fill="#a8a8a8" font-size="13">Security is a property of the bytes. Every Data carries a signature you follow up to an anchor you chose.</text>
+
+  <text x="32" y="100" fill="#6f6f6f" font-size="11" letter-spacing="1.5">FOLLOW THE SIGNATURE UP THE CHAIN →</text>
+
+  <!-- Data -->
+  <rect x="32" y="118" width="180" height="74" fill="#262626" stroke="#525252"/>
+  <text x="48" y="142" fill="#f4f4f4" font-size="13" font-weight="600">Data</text>
+  <text x="48" y="162" fill="#78a9ff" font-size="11" font-family="'IBM Plex Mono', monospace">/alice/photo</text>
+  <text x="48" y="180" fill="#a8a8a8" font-size="10">+ signature, KeyLocator</text>
+
+  <!-- Cert: alice -->
+  <rect x="262" y="118" width="180" height="74" fill="#262626" stroke="#525252"/>
+  <text x="278" y="142" fill="#f4f4f4" font-size="13" font-weight="600">Cert</text>
+  <text x="278" y="162" fill="#78a9ff" font-size="11" font-family="'IBM Plex Mono', monospace">/alice/KEY</text>
+  <text x="278" y="180" fill="#a8a8a8" font-size="10">alice's signing key</text>
+
+  <!-- Cert: issuer -->
+  <rect x="492" y="118" width="180" height="74" fill="#262626" stroke="#525252"/>
+  <text x="508" y="142" fill="#f4f4f4" font-size="13" font-weight="600">Cert</text>
+  <text x="508" y="162" fill="#78a9ff" font-size="11" font-family="'IBM Plex Mono', monospace">/alice/issuer</text>
+  <text x="508" y="180" fill="#a8a8a8" font-size="10">issued alice's key</text>
+
+  <!-- Trust anchor -->
+  <rect x="722" y="118" width="190" height="74" fill="#001d6c" stroke="#4589ff"/>
+  <text x="738" y="142" fill="#f4f4f4" font-size="13" font-weight="600">★ Trust anchor</text>
+  <text x="738" y="162" fill="#78a9ff" font-size="11" font-family="'IBM Plex Mono', monospace">/root</text>
+  <text x="738" y="180" fill="#a8a8a8" font-size="10">you pinned this</text>
+
+  <path d="M212 155 L262 155" stroke="#78a9ff" stroke-width="1.5" marker-end="url(#u)"/>
+  <path d="M442 155 L492 155" stroke="#78a9ff" stroke-width="1.5" marker-end="url(#u)"/>
+  <path d="M672 155 L722 155" stroke="#78a9ff" stroke-width="1.5" marker-end="url(#u)"/>
+
+  <!-- Trust schema gate -->
+  <rect x="32" y="232" width="640" height="68" fill="#262626" stroke="#525252"/>
+  <text x="48" y="258" fill="#f4f4f4" font-size="13" font-weight="600">Trust schema</text>
+  <text x="48" y="280" fill="#a8a8a8" font-size="12">Is <tspan font-family="'IBM Plex Mono', monospace" fill="#78a9ff">/alice/photo</tspan> allowed to be signed by this key, for this name? Binding is by rule, not faith.</text>
+
+  <!-- Outcomes -->
+  <rect x="722" y="220" width="226" height="44" fill="#022d0d" stroke="#42be65"/>
+  <text x="738" y="240" fill="#42be65" font-size="12" font-weight="600">SafeData ✓</text>
+  <text x="738" y="256" fill="#a7f0ba" font-size="10" font-family="'IBM Plex Mono', monospace">forwardable, cacheable</text>
+
+  <rect x="722" y="276" width="226" height="44" fill="#3a0b0d" stroke="#fa4d56"/>
+  <text x="738" y="296" fill="#fa4d56" font-size="12" font-weight="600">Dropped ✗</text>
+  <text x="738" y="312" fill="#fa4d56" font-size="10">unverified Data never moves</text>
+
+  <path d="M672 252 L722 242" stroke="#42be65" stroke-width="1.5" marker-end="url(#ok)"/>
+  <path d="M672 280 L722 296" stroke="#fa4d56" stroke-width="1.5" marker-end="url(#no)"/>
+
+  <text x="32" y="358" fill="#a8a8a8" font-size="12">The type system enforces this: only <tspan font-family="'IBM Plex Mono', monospace" fill="#78a9ff">SafeData</tspan> can be forwarded. The compiler won't let you skip the check.</text>
+</svg>

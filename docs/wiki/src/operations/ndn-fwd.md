@@ -32,7 +32,7 @@ protocol against the running forwarder.
 
 | Verb | What it shows |
 |---|---|
-| `ndn-ctl status` | Forwarder summary: uptime, version, mgmt prefix, face count. |
+| `ndn-ctl status` | Forwarder summary: NFD-compatible status, version, timestamps, uptime, table counts, and packet counters. |
 | `ndn-ctl face list` | Every face with kind, scope, persistency, byte/packet counters. |
 | `ndn-ctl fib list` | FIB entries by prefix with nexthops. |
 | `ndn-ctl rib list` | RIB entries (registered prefixes, origin, expiry). |

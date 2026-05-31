@@ -23,9 +23,30 @@
                         div.textContent = block.textContent;
                         pre.parentElement.replaceChild(div, pre);
                     });
+                    // Carbon palette — pick dark/light from the active
+                    // mdBook theme class so diagrams match the dashboard
+                    // tokens (crates/tooling/ndn-dashboard/src/styles.rs).
+                    var cls = document.documentElement.className;
+                    var dark = /\b(navy|coal)\b/.test(cls);
+                    var c = dark
+                        ? { bg: '#262626', bg2: '#393939', border: '#525252',
+                            text: '#f4f4f4', line: '#78a9ff', accent: '#001d6c' }
+                        : { bg: '#f4f4f4', bg2: '#e0e0e0', border: '#c6c6c6',
+                            text: '#161616', line: '#0f62fe', accent: '#d0e2ff' };
                     mermaid.initialize({
                         startOnLoad: true,
-                        theme: 'default',
+                        theme: 'base',
+                        themeVariables: {
+                            fontFamily: "'IBM Plex Sans', system-ui, sans-serif",
+                            primaryColor: c.bg,
+                            primaryTextColor: c.text,
+                            primaryBorderColor: c.border,
+                            secondaryColor: c.bg2,
+                            tertiaryColor: c.accent,
+                            lineColor: c.line,
+                            textColor: c.text,
+                            background: 'transparent',
+                        },
                         // ELK is available globally; diagrams opt-in with
                         // %%{init: {"layout": "elk"}}%% on their first line.
                         flowchart: { htmlLabels: true },
