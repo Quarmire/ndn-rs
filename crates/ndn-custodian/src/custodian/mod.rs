@@ -53,6 +53,39 @@ pub enum CustodianRef {
     Tpm { device_id: String },
 }
 
+impl CustodianRef {
+    /// Short human label for the security-tier badge.
+    pub fn label(&self) -> &'static str {
+        match self {
+            CustodianRef::InPage => "In-page (memory)",
+            CustodianRef::BrowserExtension => "Browser extension",
+            CustodianRef::OsKeyring => "OS keyring",
+            CustodianRef::Fob { .. } => "Hardware fob",
+            CustodianRef::Remote { .. } => "Remote signer",
+            CustodianRef::Tpm { .. } => "TPM",
+        }
+    }
+
+    /// Whether the private key material physically resides on this machine.
+    /// `false` for fob/remote signers — the key never touches the host, which
+    /// is what makes them safe on a machine you don't control.
+    pub fn key_on_this_machine(&self) -> bool {
+        !matches!(self, CustodianRef::Fob { .. } | CustodianRef::Remote { .. })
+    }
+
+    /// Whether every `sign()` requires an explicit user action (fob touch,
+    /// extension popup, remote tap). Mirrors each impl's `prompts_per_action`.
+    pub fn prompts_per_action(&self) -> bool {
+        matches!(
+            self,
+            CustodianRef::BrowserExtension
+                | CustodianRef::Fob { .. }
+                | CustodianRef::Remote { .. }
+                | CustodianRef::Tpm { .. }
+        )
+    }
+}
+
 /// Caller-provided unlock material. Custodians decide whether they need it.
 /// `InPageCustodian` ignores it; `OsKeyringCustodian` may use the secret as
 /// a passphrase; `FobCustodian` uses none — its unlock is the remote tap.
@@ -161,5 +194,30 @@ impl std::fmt::Debug for CustodianRegistry {
         f.debug_struct("CustodianRegistry")
             .field("entries", &self.table.len())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod ref_tests {
+    use super::*;
+
+    #[test]
+    fn custodian_ref_semantics() {
+        // Fob/Remote keep the key off this machine and prompt per action.
+        let fob = CustodianRef::Fob {
+            fob_id: "phone".into(),
+        };
+        assert!(!fob.key_on_this_machine());
+        assert!(fob.prompts_per_action());
+        assert_eq!(fob.label(), "Hardware fob");
+
+        // In-page is on-machine and silent.
+        assert!(CustodianRef::InPage.key_on_this_machine());
+        assert!(!CustodianRef::InPage.prompts_per_action());
+
+        // OS keyring is on-machine and silent; extension is on-machine but prompts.
+        assert!(CustodianRef::OsKeyring.key_on_this_machine());
+        assert!(!CustodianRef::OsKeyring.prompts_per_action());
+        assert!(CustodianRef::BrowserExtension.prompts_per_action());
     }
 }
