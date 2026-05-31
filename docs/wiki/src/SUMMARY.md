@@ -8,6 +8,13 @@
 - [One packet, six depths](./start/one-packet-six-depths.md)
 - [Trust, first](./start/trust-first.md)
 
+# Your path
+
+- [App author](./path/app-author.md)
+- [Operator](./path/operator.md)
+- [Extender](./path/extender.md)
+- [Researcher](./path/researcher.md)
+
 # Quickstart
 
 - [Five-minute app](./quickstart/5-minute-app.md)

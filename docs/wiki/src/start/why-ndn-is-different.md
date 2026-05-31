@@ -98,24 +98,24 @@ You have the one idea. Pick the path that matches why you are here — each
 assumes the flip above and nothing more.
 
 <div class="cds-card-grid">
-<a class="cds-card" href="../api/develop.md">
+<a class="cds-card" href="../path/app-author.md">
 <span class="cds-icon" style="--i:url(../images/icons/app.svg)"></span>
-<span class="cds-card-title">Build an app</span>
+<span class="cds-card-title">App author</span>
 <span class="cds-card-desc">Fetch and publish Data by name. The five-minute path.</span>
 </a>
-<a class="cds-card" href="../operations/ndn-fwd.md">
+<a class="cds-card" href="../path/operator.md">
 <span class="cds-icon" style="--i:url(../images/icons/operator.svg)"></span>
-<span class="cds-card-title">Run a node</span>
+<span class="cds-card-title">Operator</span>
 <span class="cds-card-desc">Stand up the forwarder and watch traffic move.</span>
 </a>
-<a class="cds-card" href="../api/extend.md">
+<a class="cds-card" href="../path/extender.md">
 <span class="cds-icon" style="--i:url(../images/icons/extender.svg)"></span>
-<span class="cds-card-title">Extend the stack</span>
+<span class="cds-card-title">Extender</span>
 <span class="cds-card-desc">Write a strategy or a face without forking the engine.</span>
 </a>
-<a class="cds-card" href="../api/instrument.md">
+<a class="cds-card" href="../path/researcher.md">
 <span class="cds-icon" style="--i:url(../images/icons/researcher.svg)"></span>
-<span class="cds-card-title">Measure and research</span>
+<span class="cds-card-title">Researcher</span>
 <span class="cds-card-desc">Observe every packet; wire two engines together.</span>
 </a>
 </div>
