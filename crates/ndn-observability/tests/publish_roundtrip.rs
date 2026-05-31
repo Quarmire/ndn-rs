@@ -71,10 +71,7 @@ async fn publish_then_fetch_via_engine() {
     let interest_wire = InterestBuilder::new(span_name.clone())
         .must_be_fresh()
         .build();
-    app_handle
-        .send(interest_wire)
-        .await
-        .expect("send interest");
+    app_handle.send(interest_wire).await.expect("send interest");
 
     // Wait for the Data response.
     let wire = tokio::time::timeout(Duration::from_millis(500), app_handle.recv())

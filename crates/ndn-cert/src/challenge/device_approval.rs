@@ -242,13 +242,11 @@ impl ChallengeHandler for DeviceApprovalChallenge {
         Box::pin(async move {
             let id = match state.data.get("request_id").and_then(|v| v.as_str()) {
                 Some(s) => s.to_string(),
-                None => {
-                    parameters
-                        .get("request_id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string()
-                }
+                None => parameters
+                    .get("request_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
             };
             let entry = match self.store.get(&id) {
                 Some(e) => e,
@@ -318,9 +316,8 @@ async fn build_signed_attestation(
             }
         }
         leaf = leaf.with_evidence("approved_by", serde_json::json!(approver));
-        leaf.signature = Some(
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&entry.signed_approval),
-        );
+        leaf.signature =
+            Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&entry.signed_approval));
     }
     Ok(AttestationSet::single(leaf))
 }
@@ -397,7 +394,10 @@ mod tests {
     }
 
     /// Drive the challenge to its single approval round and return the id.
-    async fn begin_request(challenge: &DeviceApprovalChallenge, name: &str) -> (ChallengeState, String) {
+    async fn begin_request(
+        challenge: &DeviceApprovalChallenge,
+        name: &str,
+    ) -> (ChallengeState, String) {
         let state = challenge.begin(&req(name)).await.unwrap();
         let id = state.data["request_id"].as_str().unwrap().to_string();
         (state, id)
@@ -420,15 +420,18 @@ mod tests {
         };
         let leaf = &set.leaves[0];
         assert_eq!(leaf.kind, "device-approval");
-        assert!(leaf.signature.is_none(), "in-process flow carries no signature");
+        assert!(
+            leaf.signature.is_none(),
+            "in-process flow carries no signature"
+        );
         assert!(leaf.evidence.contains_key("request_id"));
         assert!(!leaf.evidence.contains_key("approved_by"));
     }
 
     #[tokio::test]
     async fn signed_approval_verifies_and_records_signature() {
-        use ndn_security::{Ed25519Signer, Signer};
         use ndn_packet::Name;
+        use ndn_security::{Ed25519Signer, Signer};
 
         let store = PendingApprovalStore::new();
         let challenge = DeviceApprovalChallenge::new(store.clone());
@@ -453,7 +456,10 @@ mod tests {
         };
         let leaf = &set.leaves[0];
         assert_eq!(leaf.kind, "device-approval");
-        assert!(leaf.signature.is_some(), "signed flow records the signature");
+        assert!(
+            leaf.signature.is_some(),
+            "signed flow records the signature"
+        );
         assert_eq!(
             leaf.evidence.get("approved_by").unwrap(),
             &serde_json::json!(approver.to_string())
@@ -462,8 +468,8 @@ mod tests {
 
     #[tokio::test]
     async fn forged_signature_is_denied() {
-        use ndn_security::{Ed25519Signer, Signer};
         use ndn_packet::Name;
+        use ndn_security::{Ed25519Signer, Signer};
 
         let store = PendingApprovalStore::new();
         let challenge = DeviceApprovalChallenge::new(store.clone());

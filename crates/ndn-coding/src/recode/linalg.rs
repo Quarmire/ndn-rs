@@ -17,7 +17,11 @@ pub(super) fn gf_dot(a: &[u8], b: &[u8]) -> u8 {
 /// coding vector covering `0..k`. Recovers sources by index with **no GF
 /// work** (vs the O(k²·symbol) Gauss-Jordan). `None` if not systematic, so the
 /// caller falls back to [`solve_sources`].
-pub(super) fn systematic_sources(packets: &[CodedPacket], k: usize, symbol_size: usize) -> Option<Vec<Vec<u8>>> {
+pub(super) fn systematic_sources(
+    packets: &[CodedPacket],
+    k: usize,
+    symbol_size: usize,
+) -> Option<Vec<Vec<u8>>> {
     if packets.len() != k {
         return None;
     }
@@ -45,7 +49,11 @@ pub(super) fn systematic_sources(packets: &[CodedPacket], k: usize, symbol_size:
 /// Recover the K source rows by Gauss-Jordan elimination over GF(2^8) on the
 /// `(coefficient | payload)` augmented matrix of the held packets. Returns
 /// the K source rows in index order, or `None` if rank < K.
-pub(super) fn solve_sources(packets: &[CodedPacket], k: usize, symbol_size: usize) -> Option<Vec<Vec<u8>>> {
+pub(super) fn solve_sources(
+    packets: &[CodedPacket],
+    k: usize,
+    symbol_size: usize,
+) -> Option<Vec<Vec<u8>>> {
     // Augmented rows: K coefficient columns followed by symbol_size payload columns.
     let mut rows: Vec<Vec<u8>> = packets
         .iter()
@@ -101,7 +109,9 @@ pub(super) fn verify_sources(sources: &[Vec<u8>], commitment: &SourceCommitment)
         })
         .collect();
     match commitment {
-        SourceCommitment::RowHashes(expected) => expected.len() == hashes.len() && *expected == hashes,
+        SourceCommitment::RowHashes(expected) => {
+            expected.len() == hashes.len() && *expected == hashes
+        }
         SourceCommitment::MerkleRoot(root) => merkle_root(&hashes) == *root,
     }
 }

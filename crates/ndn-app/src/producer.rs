@@ -5,10 +5,10 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
-#[cfg(not(target_arch = "wasm32"))]
-use ndn_face_native::local::InProcHandle;
 #[cfg(target_arch = "wasm32")]
 use ndn_face_local::InProcHandle;
+#[cfg(not(target_arch = "wasm32"))]
+use ndn_face_native::local::InProcHandle;
 #[cfg(not(target_arch = "wasm32"))]
 use ndn_ipc::{ChunkedProducer, ForwarderClient};
 use ndn_packet::encode::DataBuilder;
@@ -16,9 +16,9 @@ use ndn_packet::{Interest, Name};
 use std::time::Duration;
 
 use crate::AppError;
-use crate::connection::{Connection, InProcConnection};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::connection::IpcConnection;
+use crate::connection::{Connection, InProcConnection};
 use crate::responder::Responder;
 
 /// Default RDR segment size when the caller passes `chunk_size == 0`. Mirrors
@@ -120,8 +120,9 @@ impl Producer {
             chunk_size
         };
         let prepared = crate::rdr::PreparedObject::build(name.clone(), content, seg_size);
-        let metadata_keyword =
-            ndn_packet::NameComponent::keyword(bytes::Bytes::from_static(crate::rdr::METADATA_KEYWORD));
+        let metadata_keyword = ndn_packet::NameComponent::keyword(bytes::Bytes::from_static(
+            crate::rdr::METADATA_KEYWORD,
+        ));
 
         loop {
             let raw = match self.conn.recv().await {
@@ -135,16 +136,17 @@ impl Producer {
             let i_name: &Name = &interest.name;
 
             if i_name.has_prefix(&name)
-                && i_name
-                    .components()
-                    .iter()
-                    .skip(name.len())
-                    .any(|c| c.typ == ndn_packet::tlv_type::KEYWORD && c.value == metadata_keyword.value)
+                && i_name.components().iter().skip(name.len()).any(|c| {
+                    c.typ == ndn_packet::tlv_type::KEYWORD && c.value == metadata_keyword.value
+                })
             {
-                let data = DataBuilder::new(prepared.metadata_data_name.clone(), &prepared.metadata_content)
-                    .freshness(Duration::from_millis(1000))
-                    .final_block_id_typed_seg(0)
-                    .build();
+                let data = DataBuilder::new(
+                    prepared.metadata_data_name.clone(),
+                    &prepared.metadata_content,
+                )
+                .freshness(Duration::from_millis(1000))
+                .final_block_id_typed_seg(0)
+                .build();
                 self.conn.send(data).await?;
                 continue;
             }

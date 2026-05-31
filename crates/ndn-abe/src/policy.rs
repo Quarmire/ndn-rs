@@ -100,12 +100,8 @@ impl PolicyExpr {
                 }
                 Ok(format!("\"{}\"", a.flat()))
             }
-            PolicyExpr::And(l, r) => {
-                Ok(format!("{} and {}", l.to_rabe_bsw()?, r.to_rabe_bsw()?))
-            }
-            PolicyExpr::Or(l, r) => {
-                Ok(format!("({} or {})", l.to_rabe_bsw()?, r.to_rabe_bsw()?))
-            }
+            PolicyExpr::And(l, r) => Ok(format!("{} and {}", l.to_rabe_bsw()?, r.to_rabe_bsw()?)),
+            PolicyExpr::Or(l, r) => Ok(format!("({} or {})", l.to_rabe_bsw()?, r.to_rabe_bsw()?)),
         }
     }
 
@@ -154,7 +150,7 @@ impl PolicyExpr {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Token {
-    Attr(String),   // raw attribute string, possibly with authority prefix
+    Attr(String), // raw attribute string, possibly with authority prefix
     And,
     Or,
     LParen,
@@ -167,9 +163,17 @@ fn tokenize(src: &str) -> Result<Vec<Token>, String> {
 
     while let Some(&c) = chars.peek() {
         match c {
-            ' ' | '\t' | '\n' | '\r' => { chars.next(); }
-            '(' => { chars.next(); tokens.push(Token::LParen); }
-            ')' => { chars.next(); tokens.push(Token::RParen); }
+            ' ' | '\t' | '\n' | '\r' => {
+                chars.next();
+            }
+            '(' => {
+                chars.next();
+                tokens.push(Token::LParen);
+            }
+            ')' => {
+                chars.next();
+                tokens.push(Token::RParen);
+            }
             _ => {
                 // Collect a word (attribute or keyword)
                 let mut word = String::new();
@@ -182,7 +186,7 @@ fn tokenize(src: &str) -> Result<Vec<Token>, String> {
                 }
                 match word.to_uppercase().as_str() {
                     "AND" => tokens.push(Token::And),
-                    "OR"  => tokens.push(Token::Or),
+                    "OR" => tokens.push(Token::Or),
                     _ => tokens.push(Token::Attr(word)),
                 }
             }
@@ -242,22 +246,34 @@ fn parse_primary(tokens: &[Token], pos: &mut usize) -> Result<PolicyExpr, String
 fn parse_attr_ref(raw: &str) -> Result<AttributeRef, String> {
     if raw.starts_with('/') {
         // Multi-authority: find the last '/' that separates path from key:value
-        let last_slash = raw.rfind('/').ok_or_else(|| format!("malformed attr: {raw}"))?;
+        let last_slash = raw
+            .rfind('/')
+            .ok_or_else(|| format!("malformed attr: {raw}"))?;
         let authority_str = &raw[..last_slash];
         let kv = &raw[last_slash + 1..];
         let authority: Name = authority_str
             .parse()
             .map_err(|e| format!("invalid authority name '{authority_str}': {e}"))?;
         let (key, value) = split_kv(kv)?;
-        Ok(AttributeRef { authority: Some(authority), key, value })
+        Ok(AttributeRef {
+            authority: Some(authority),
+            key,
+            value,
+        })
     } else {
         let (key, value) = split_kv(raw)?;
-        Ok(AttributeRef { authority: None, key, value })
+        Ok(AttributeRef {
+            authority: None,
+            key,
+            value,
+        })
     }
 }
 
 fn split_kv(s: &str) -> Result<(String, String), String> {
-    let colon = s.find(':').ok_or_else(|| format!("attribute missing ':' separator: {s}"))?;
+    let colon = s
+        .find(':')
+        .ok_or_else(|| format!("attribute missing ':' separator: {s}"))?;
     let key = s[..colon].to_string();
     let value = s[colon + 1..].to_string();
     if key.is_empty() {
@@ -292,8 +308,16 @@ mod tests {
         assert_eq!(
             expr,
             PolicyExpr::And(
-                Box::new(PolicyExpr::Attribute(AttributeRef { authority: None, key: "role".into(), value: "doctor".into() })),
-                Box::new(PolicyExpr::Attribute(AttributeRef { authority: None, key: "dept".into(), value: "cardiology".into() })),
+                Box::new(PolicyExpr::Attribute(AttributeRef {
+                    authority: None,
+                    key: "role".into(),
+                    value: "doctor".into()
+                })),
+                Box::new(PolicyExpr::Attribute(AttributeRef {
+                    authority: None,
+                    key: "dept".into(),
+                    value: "cardiology".into()
+                })),
             )
         );
     }
@@ -318,9 +342,9 @@ mod tests {
 
     #[test]
     fn policy_parses_multi_authority() {
-        let expr = PolicyExpr::parse(
-            "/hospital-A/role:doctor AND /licensing-board/cardiology:certified",
-        ).unwrap();
+        let expr =
+            PolicyExpr::parse("/hospital-A/role:doctor AND /licensing-board/cardiology:certified")
+                .unwrap();
         let auths = expr.authorities();
         assert_eq!(auths.len(), 2);
     }
@@ -344,9 +368,12 @@ mod tests {
 
     #[test]
     fn policy_to_rabe_bsw_rejects_multi_auth() {
-        let expr = PolicyExpr::parse(
-            "/hospital-A/role:doctor AND /licensing-board/cardiology:certified",
-        ).unwrap();
-        assert!(matches!(expr.to_rabe_bsw(), Err(AbeError::MultiAuthorityNotSupported)));
+        let expr =
+            PolicyExpr::parse("/hospital-A/role:doctor AND /licensing-board/cardiology:certified")
+                .unwrap();
+        assert!(matches!(
+            expr.to_rabe_bsw(),
+            Err(AbeError::MultiAuthorityNotSupported)
+        ));
     }
 }

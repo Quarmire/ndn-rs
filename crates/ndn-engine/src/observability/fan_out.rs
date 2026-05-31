@@ -87,10 +87,7 @@ mod tests {
     fn emit_is_no_op_without_sink() {
         // OnceLock makes any installed sink permanent across the test
         // binary; this test relies on the no-op being safe regardless.
-        emit_data_fan_out(
-            vec![(1, vec![TraceId([0xAA; 16])])],
-            "/audit/fan-out",
-        );
+        emit_data_fan_out(vec![(1, vec![TraceId([0xAA; 16])])], "/audit/fan-out");
     }
 
     #[test]

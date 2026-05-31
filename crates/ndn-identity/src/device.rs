@@ -90,12 +90,7 @@ pub async fn run_provisioning(config: DeviceConfig) -> Result<NdnIdentity, Ident
     let mut client = NdncertClient::new(consumer, ca_prefix);
 
     let cert = client
-        .enroll(
-            key_name.clone(),
-            Arc::clone(&signer),
-            86400,
-            challenge,
-        )
+        .enroll(key_name.clone(), Arc::clone(&signer), 86400, challenge)
         .await?;
 
     manager.add_trust_anchor(cert);

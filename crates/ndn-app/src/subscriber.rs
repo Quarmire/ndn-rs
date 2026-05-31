@@ -16,9 +16,9 @@ use ndn_packet::encode::encode_interest;
 use ndn_packet::{Data, Name};
 
 use crate::AppError;
-use crate::connection::{Connection, InProcConnection};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::connection::IpcConnection;
+use crate::connection::{Connection, InProcConnection};
 use crate::rt;
 
 #[derive(Clone, Debug)]

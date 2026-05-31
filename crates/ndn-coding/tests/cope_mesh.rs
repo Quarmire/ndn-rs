@@ -68,8 +68,14 @@ async fn mesh_installs_member_faces_and_codes_over_engine() {
     assert!(engine.faces().get(mesh.ingress_face_id()).is_some());
 
     // Two natives to two neighbors, each holding the other → one coded frame.
-    let id_a = mesh.link().enqueue(neighbors[0], Bytes::from_static(b"to-a")).await;
-    let id_b = mesh.link().enqueue(neighbors[1], Bytes::from_static(b"to-b")).await;
+    let id_a = mesh
+        .link()
+        .enqueue(neighbors[0], Bytes::from_static(b"to-a"))
+        .await;
+    let id_b = mesh
+        .link()
+        .enqueue(neighbors[1], Bytes::from_static(b"to-b"))
+        .await;
     mesh.link().report(neighbors[0], id_b).await;
     mesh.link().report(neighbors[1], id_a).await;
     mesh.link().announce().await.unwrap();
@@ -77,8 +83,16 @@ async fn mesh_installs_member_faces_and_codes_over_engine() {
     assert_eq!((sent_n, coded_n), (1, 1));
 
     let frames = sent.lock().unwrap().clone();
-    assert!(frames.iter().any(|f| matches!(decode_wire(f), Some(CopeWire::Report { .. }))));
-    assert!(frames.iter().any(|f| matches!(decode_wire(f), Some(CopeWire::Coded(_)))));
+    assert!(
+        frames
+            .iter()
+            .any(|f| matches!(decode_wire(f), Some(CopeWire::Report { .. })))
+    );
+    assert!(
+        frames
+            .iter()
+            .any(|f| matches!(decode_wire(f), Some(CopeWire::Coded(_))))
+    );
 
     drop(mesh);
     drop(engine);
@@ -102,7 +116,10 @@ async fn mesh_tracks_routing_neighbor_changes() {
     mesh.sync_neighbors(&[n2, n3]);
 
     assert_eq!(mesh.neighbor_face(n1), None);
-    assert!(engine.faces().get(FaceId(n1)).is_none(), "dropped member face evicted");
+    assert!(
+        engine.faces().get(FaceId(n1)).is_none(),
+        "dropped member face evicted"
+    );
     assert_eq!(mesh.neighbor_face(n3), Some(FaceId(n3)));
     assert!(engine.faces().get(FaceId(n3)).is_some());
 
@@ -159,7 +176,11 @@ async fn neighbor_sync_driver_tracks_routing_stream() {
     {
         let g = mesh.lock().await;
         assert_eq!(g.neighbor_face(n1), None, "dropped neighbor removed");
-        assert_eq!(g.neighbor_face(n3), Some(FaceId(n3)), "new neighbor installed");
+        assert_eq!(
+            g.neighbor_face(n3),
+            Some(FaceId(n3)),
+            "new neighbor installed"
+        );
     }
     assert!(engine.faces().get(FaceId(n1)).is_none());
     assert!(engine.faces().get(FaceId(n3)).is_some());

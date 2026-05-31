@@ -87,8 +87,8 @@ impl MetaData {
                 _ => {}
             }
         }
-        let versioned_name = versioned_name
-            .ok_or_else(|| AppError::Protocol("metadata missing Name".into()))?;
+        let versioned_name =
+            versioned_name.ok_or_else(|| AppError::Protocol("metadata missing Name".into()))?;
         let final_block_id = final_block_id
             .ok_or_else(|| AppError::Protocol("metadata missing FinalBlockID".into()))?;
         Ok(Self {
@@ -250,7 +250,14 @@ mod tests {
         let prep = PreparedObject::build("/obj".parse().unwrap(), payload, 8192);
         assert_eq!(prep.segments.len(), 4);
         assert_eq!(prep.last_seg, 3);
-        assert!(prep.versioned_name.components().last().unwrap().as_version().is_some());
+        assert!(
+            prep.versioned_name
+                .components()
+                .last()
+                .unwrap()
+                .as_version()
+                .is_some()
+        );
     }
 
     #[test]

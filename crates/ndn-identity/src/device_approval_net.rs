@@ -30,15 +30,13 @@ use serde::{Deserialize, Serialize};
 
 use ndn_app::Consumer;
 use ndn_app::{AppError, Producer, random_reflexive_name};
+use ndn_cert::challenge::device_approval::approval_data_name;
 use ndn_cert::challenge::device_approval::{PendingApprovalStore, approval_statement};
+use ndn_packet::Data;
 use ndn_packet::encode::{DataBuilder, InterestBuilder};
 use ndn_packet::{Interest, Name};
-use ndn_packet::Data;
 use ndn_security::did::{UniversalResolver, name_to_did};
-use ndn_security::{
-    Ed25519Verifier, Signer, ValidationResult, Validator, VerifyOutcome, Verifier,
-};
-use ndn_cert::challenge::device_approval::approval_data_name;
+use ndn_security::{Ed25519Verifier, Signer, ValidationResult, Validator, Verifier, VerifyOutcome};
 
 use crate::error::IdentityError;
 
@@ -157,7 +155,11 @@ impl ApproverAuthorizer for DidApproverAuthorizer {
             let Some(principal) = (self.principal_of)(cert_name) else {
                 return false;
             };
-            let Ok(doc) = self.resolver.resolve_document(&name_to_did(&principal)).await else {
+            let Ok(doc) = self
+                .resolver
+                .resolve_document(&name_to_did(&principal))
+                .await
+            else {
                 return false;
             };
             doc.trusted_approvers().iter().any(|a| a == approver)
@@ -261,7 +263,13 @@ pub trait ApprovalSink: Send + Sync {
     /// Requests currently awaiting approval (oldest first).
     fn pending(&self) -> Vec<PendingApproval>;
     /// Record a statement-signed approval (trait-authorizer path).
-    fn record_signed(&self, request_id: &str, approver: &str, approver_pubkey: Vec<u8>, signature: Vec<u8>);
+    fn record_signed(
+        &self,
+        request_id: &str,
+        approver: &str,
+        approver_pubkey: Vec<u8>,
+        signature: Vec<u8>,
+    );
     /// Record a validator-checked approval (canonical path).
     fn record_validated(&self, request_id: &str, approver: &str, signature: Vec<u8>);
 }
@@ -307,7 +315,10 @@ where
 {
     let hello = parse_hello(approver_forward)?;
     let pubkey = resolve_pubkey(&hello.approver).ok_or_else(|| {
-        IdentityError::Enrollment(format!("approver {} is not a trusted approver", hello.approver))
+        IdentityError::Enrollment(format!(
+            "approver {} is not a trusted approver",
+            hello.approver
+        ))
     })?;
 
     let reflexive = approver_forward.reflexive_name().ok_or_else(|| {
@@ -568,7 +579,10 @@ where
                         .ok_or_else(|| {
                             ndn_app::AppError::Protocol("unparseable cert name for approval".into())
                         })?;
-                    let key_locator = signer.cert_name().unwrap_or_else(|| signer.key_name()).clone();
+                    let key_locator = signer
+                        .cert_name()
+                        .unwrap_or_else(|| signer.key_name())
+                        .clone();
                     let sig_type = signer.sig_type();
                     let inner = DataBuilder::new(approval_name, &[][..])
                         .sign(sig_type, Some(&key_locator), |region| {
@@ -678,12 +692,7 @@ where
                 {
                     let mut sc = side.lock().await;
                     let _ = pull_and_validate_approval(
-                        &mut sc,
-                        &sink,
-                        &interest,
-                        &req,
-                        &validator,
-                        timeout,
+                        &mut sc, &sink, &interest, &req, &validator, timeout,
                     )
                     .await;
                 }

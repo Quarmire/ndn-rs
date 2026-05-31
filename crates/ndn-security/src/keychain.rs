@@ -262,8 +262,8 @@ impl KeyChain {
 
     /// Add an external trust anchor (e.g. a network-wide root discovered
     /// via NDNCERT).
-    pub fn add_trust_anchor(&self, cert: Certificate) {
-        self.mgr.add_trust_anchor(cert);
+    pub fn add_trust_anchor(&self, cert: Certificate) -> bool {
+        self.mgr.add_trust_anchor(cert)
     }
 
     pub fn cert_cache(&self) -> &CertCache {

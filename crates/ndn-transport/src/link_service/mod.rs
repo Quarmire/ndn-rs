@@ -615,7 +615,8 @@ mod tests {
             std::time::Duration::from_micros(50_000),
         ))
         .unwrap();
-        ls.apply(FaceOption::DefaultCongestionThreshold(4321)).unwrap();
+        ls.apply(FaceOption::DefaultCongestionThreshold(4321))
+            .unwrap();
         let snap = ls.snapshot();
         assert_eq!(
             snap.base_congestion_marking_interval,

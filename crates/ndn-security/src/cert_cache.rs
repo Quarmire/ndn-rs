@@ -63,6 +63,14 @@ impl Certificate {
     pub fn is_valid_at(&self, now_ns: u64) -> bool {
         now_ns >= self.valid_from && now_ns <= self.valid_until
     }
+
+    pub fn is_valid_now(&self) -> bool {
+        let now = web_time::SystemTime::now()
+            .duration_since(web_time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        self.is_valid_at(now)
+    }
 }
 
 /// Parse `(valid_from_ns, valid_until_ns)` from the cert's `ValidityPeriod`

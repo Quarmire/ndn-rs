@@ -180,12 +180,6 @@ impl FaceStatus {
             write_non_neg_int(w, tlv::N_OUT_NACKS, self.n_out_nacks);
             write_non_neg_int(w, tlv::N_IN_BYTES, self.n_in_bytes);
             write_non_neg_int(w, tlv::N_OUT_BYTES, self.n_out_bytes);
-            write_non_neg_int(w, tlv::N_SATISFIED_INTERESTS, self.n_satisfied_interests);
-            write_non_neg_int(
-                w,
-                tlv::N_UNSATISFIED_INTERESTS,
-                self.n_unsatisfied_interests,
-            );
             write_non_neg_int(w, tlv::FLAGS, self.flags);
 
             // Tier 4 §4.3 — ndn-rs extension fields, append at the
@@ -696,13 +690,11 @@ mod tests {
         assert_eq!(decoded.local_uri, "udp4://0.0.0.0:6363");
         assert_eq!(decoded.mtu, Some(8800));
         assert_eq!(decoded.n_in_interests, 100);
-        assert_eq!(decoded.n_satisfied_interests, 42);
-        assert_eq!(decoded.n_unsatisfied_interests, 3);
         assert_eq!(decoded.flags, 0b101);
     }
 
     #[test]
-    fn face_status_emits_flags_and_satisfaction_counters() {
+    fn face_status_emits_flags() {
         let fs = FaceStatus {
             face_id: 7,
             uri: "udp4://10.0.0.1:6363".to_owned(),
@@ -731,18 +723,46 @@ mod tests {
             encoded.windows(1).any(|b| b[0] == tlv::FLAGS as u8),
             "Flags TLV (0x6c) absent"
         );
-        assert!(
-            encoded
-                .windows(1)
-                .any(|b| b[0] == tlv::N_SATISFIED_INTERESTS as u8),
-            "NSatisfiedInterests TLV (0x99) absent"
-        );
-        assert!(
-            encoded
-                .windows(1)
-                .any(|b| b[0] == tlv::N_UNSATISFIED_INTERESTS as u8),
-            "NUnsatisfiedInterests TLV (0x9a) absent"
-        );
+    }
+
+    #[test]
+    fn face_status_wire_order_keeps_nfd_required_flags_before_extensions() {
+        let fs = FaceStatus {
+            face_id: 7,
+            uri: "udp4://10.0.0.1:6363".to_owned(),
+            local_uri: "udp4://0.0.0.0:6363".to_owned(),
+            face_scope: 0,
+            face_persistency: 0,
+            link_type: 0,
+            flags: 0,
+            n_lp_resent_packets: Some(3),
+            ..Default::default()
+        };
+        let encoded = fs.encode();
+        let mut outer = TlvReader::new(encoded);
+        let (typ, value) = outer.read_tlv().unwrap();
+        assert_eq!(typ, tlv::FACE_STATUS);
+
+        let mut inner = TlvReader::new(value);
+        let mut seen_flags = false;
+        while !inner.is_empty() {
+            let (typ, _) = inner.read_tlv().unwrap();
+            assert_ne!(
+                typ,
+                tlv::N_SATISFIED_INTERESTS,
+                "FaceStatus must not emit GeneralStatus NSatisfiedInterests"
+            );
+            assert_ne!(
+                typ,
+                tlv::N_UNSATISFIED_INTERESTS,
+                "FaceStatus must not emit GeneralStatus NUnsatisfiedInterests"
+            );
+            if typ == tlv::N_LP_RESENT_PACKETS {
+                assert!(seen_flags, "NFD-required Flags must precede extensions");
+            }
+            seen_flags |= typ == tlv::FLAGS;
+        }
+        assert!(seen_flags, "Flags TLV (0x6c) absent");
     }
 
     #[test]

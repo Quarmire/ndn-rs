@@ -19,11 +19,11 @@
 //!   }
 
 use bytes::Bytes;
-use ndn_foundation_types::{tlv_type, Hash, Name, TlvCodecError, TlvDecode, TlvEncode};
+use ndn_foundation_types::{Hash, Name, TlvCodecError, TlvDecode, TlvEncode, tlv_type};
 use ndn_tlv::{TlvReader, TlvWriter};
 
-use crate::types::*;
 use crate::AbeSchemeId;
+use crate::types::*;
 
 /// Current schema version for `AbeCiphertext` encoding.
 pub const CIPHERTEXT_SCHEMA_VERSION: u16 = 1;
@@ -57,7 +57,10 @@ pub struct KgcRef {
 pub(crate) fn read_name(r: &mut TlvReader) -> Result<Name, TlvCodecError> {
     let typ = r.read_type()?;
     if typ != tlv_type::NAME {
-        return Err(TlvCodecError::UnexpectedType { expected: tlv_type::NAME, found: typ });
+        return Err(TlvCodecError::UnexpectedType {
+            expected: tlv_type::NAME,
+            found: typ,
+        });
     }
     let len = r.read_length()?;
     let inner = r.read_bytes(len)?;
@@ -133,7 +136,10 @@ impl TlvDecode for AbeCiphertext {
         // scheme_id
         let typ = r.read_type()?;
         if typ != ABE_SCHEME_ID_TYPE {
-            return Err(TlvCodecError::UnexpectedType { expected: ABE_SCHEME_ID_TYPE, found: typ });
+            return Err(TlvCodecError::UnexpectedType {
+                expected: ABE_SCHEME_ID_TYPE,
+                found: typ,
+            });
         }
         let len = r.read_length()?;
         let disc_bytes = r.read_bytes(len)?;
@@ -156,7 +162,10 @@ impl TlvDecode for AbeCiphertext {
         // kgc_refs
         let typ = r.read_type()?;
         if typ != ABE_KGC_REFS_TYPE {
-            return Err(TlvCodecError::UnexpectedType { expected: ABE_KGC_REFS_TYPE, found: typ });
+            return Err(TlvCodecError::UnexpectedType {
+                expected: ABE_KGC_REFS_TYPE,
+                found: typ,
+            });
         }
         let refs_len = r.read_length()?;
         let mut refs_r = r.scoped(refs_len)?;
@@ -190,7 +199,10 @@ impl TlvDecode for AbeCiphertext {
             }
             let mut arr = [0u8; 32];
             arr.copy_from_slice(&hbytes);
-            kgc_refs.push(KgcRef { kgc_did, master_params_hash: Hash::from_bytes(arr) });
+            kgc_refs.push(KgcRef {
+                kgc_did,
+                master_params_hash: Hash::from_bytes(arr),
+            });
         }
 
         // rabe ciphertext blob

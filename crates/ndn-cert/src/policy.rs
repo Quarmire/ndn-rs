@@ -205,7 +205,8 @@ impl IssuancePolicy for RequireAttestationKind {
         }
         let satisfied = ctx.attestation.is_some_and(|set| {
             set.leaves.iter().any(|leaf| {
-                leaf.kind == self.required_kind && (!self.require_signed || leaf.signature.is_some())
+                leaf.kind == self.required_kind
+                    && (!self.require_signed || leaf.signature.is_some())
             })
         });
         if satisfied {
@@ -380,10 +381,7 @@ mod issuance_tests {
 
     #[test]
     fn require_attestation_allows_outside_gated_prefix() {
-        let policy = RequireAttestationKind::new(
-            "/high-trust".parse().unwrap(),
-            "device-approval",
-        );
+        let policy = RequireAttestationKind::new("/high-trust".parse().unwrap(), "device-approval");
         let r = req("/registry/zone-a/device/x");
         let ca = "/registry/CA".parse::<Name>().unwrap();
         // No attestation, but name is outside /high-trust → issue.
@@ -395,10 +393,7 @@ mod issuance_tests {
 
     #[test]
     fn require_attestation_gates_inside_prefix() {
-        let policy = RequireAttestationKind::new(
-            "/high-trust".parse().unwrap(),
-            "device-approval",
-        );
+        let policy = RequireAttestationKind::new("/high-trust".parse().unwrap(), "device-approval");
         let r = req("/high-trust/device/x");
         let ca = "/high-trust/CA".parse::<Name>().unwrap();
 

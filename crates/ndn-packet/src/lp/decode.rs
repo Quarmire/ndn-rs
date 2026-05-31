@@ -7,13 +7,13 @@ use bytes::Bytes;
 use ndn_tlv::TlvReader;
 
 use super::{CachePolicyType, decode_be_u64};
-use crate::nack::NackReason;
+use crate::nack::{NackHeader, NackReason};
 use crate::tlv_type;
 
 #[derive(Debug)]
 pub struct LpPacket {
     pub fragment: Option<Bytes>,
-    pub nack: Option<NackReason>,
+    pub nack: Option<NackHeader>,
     pub congestion_mark: Option<u64>,
     pub sequence: Option<u64>,
     pub frag_index: Option<u64>,
@@ -222,9 +222,9 @@ impl LpPacket {
     }
 }
 
-fn decode_nack_header(value: Bytes) -> Result<NackReason, crate::PacketError> {
+fn decode_nack_header(value: Bytes) -> Result<NackHeader, crate::PacketError> {
     if value.is_empty() {
-        return Ok(NackReason::Other(0));
+        return Ok(NackHeader::new(None));
     }
     let mut reader = TlvReader::new(value);
     while !reader.is_empty() {
@@ -234,10 +234,10 @@ fn decode_nack_header(value: Bytes) -> Result<NackReason, crate::PacketError> {
             for &b in v.iter() {
                 code = (code << 8) | b as u64;
             }
-            return Ok(NackReason::from_code(code));
+            return Ok(NackHeader::new(Some(NackReason::from_code(code))));
         }
     }
-    Ok(NackReason::Other(0))
+    Ok(NackHeader::new(None))
 }
 
 #[cfg(test)]
@@ -389,7 +389,10 @@ mod tests {
         assert!(is_lp_packet(&lp_wire));
 
         let lp = LpPacket::decode(lp_wire).unwrap();
-        assert_eq!(lp.nack, Some(NackReason::NoRoute));
+        assert_eq!(
+            lp.nack.and_then(|header| header.reason),
+            Some(NackReason::NoRoute)
+        );
         assert!(lp.congestion_mark.is_none());
 
         let interest = Interest::decode(lp.fragment.unwrap()).unwrap();
@@ -403,7 +406,10 @@ mod tests {
         let lp_wire = encode_lp_nack(NackReason::Congestion, &interest_wire);
 
         let lp = LpPacket::decode(lp_wire).unwrap();
-        assert_eq!(lp.nack, Some(NackReason::Congestion));
+        assert_eq!(
+            lp.nack.and_then(|header| header.reason),
+            Some(NackReason::Congestion)
+        );
     }
 
     #[test]
@@ -421,6 +427,23 @@ mod tests {
         assert!(lp.nack.is_none());
         let interest = Interest::decode(lp.fragment.unwrap()).unwrap();
         assert_eq!(*interest.name, n);
+    }
+
+    #[test]
+    fn n05_nack_header_without_reason_decodes_none() {
+        let interest_wire = fixture_interest_wire();
+        let mut w = TlvWriter::new();
+        w.write_nested(tlv_type::LP_PACKET, |w| {
+            w.write_nested(tlv_type::NACK, |_w| {});
+            w.write_tlv(tlv_type::LP_FRAGMENT, &interest_wire);
+        });
+
+        let lp = LpPacket::decode(w.finish()).unwrap();
+        let header = lp.nack.expect("Nack header is present");
+        assert_eq!(
+            header.reason, None,
+            "absent NackReason must not be represented as Other(0)"
+        );
     }
 
     #[test]

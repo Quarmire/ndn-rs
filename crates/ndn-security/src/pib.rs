@@ -211,6 +211,12 @@ impl FilePib {
     }
 
     pub fn add_trust_anchor(&self, key_name: &Name, cert: &Certificate) -> Result<(), PibError> {
+        if !cert.is_valid_now() {
+            return Err(PibError::Corrupt(format!(
+                "trust anchor {} is expired or not yet valid",
+                cert.name
+            )));
+        }
         let dir = self.anchor_dir(key_name)?;
         std::fs::write(dir.join("cert.ndnc"), encode_cert(cert))?;
         std::fs::write(dir.join("name.uri"), name_to_uri(key_name))?;

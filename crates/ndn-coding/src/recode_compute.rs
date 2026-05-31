@@ -78,8 +78,5 @@ pub fn register_named_recode(
     buffer: Arc<Mutex<GenerationBuffer>>,
 ) {
     let prefix = naming::generation_name(&object, generation_id).append(naming::NC_MARKER);
-    service.register(
-        prefix,
-        NcComputeHandler::new(object, generation_id, buffer),
-    );
+    service.register(prefix, NcComputeHandler::new(object, generation_id, buffer));
 }

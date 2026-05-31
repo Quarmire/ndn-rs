@@ -5,27 +5,51 @@ use ndn_packet::{Name, tlv_type};
 use ndn_tlv::TlvWriter;
 
 use crate::{
-    TrustError,
+    TrustError, TrustSchema,
     cert_cache::{CertCache, Certificate},
     key_store::MemKeyStore,
+    keyring::Keyring,
     signer::{Ed25519Signer, Signer},
+    trust_context::TrustContext,
 };
 
-/// Owns a key store and certificate cache, providing key generation,
-/// certificate issuance, and trust anchor management.
+/// Owns a key store, certificate cache, and a [`Keyring`] of trust contexts,
+/// providing key generation, certificate issuance, and trust anchor management.
+///
+/// The flat trust-anchor API ([`add_trust_anchor`](Self::add_trust_anchor),
+/// [`trust_anchor`](Self::trust_anchor), [`trust_anchor_names`](Self::trust_anchor_names),
+/// …) is a **view over the keyring's ambient (root-namespace) context**;
+/// named contexts are adopted directly on the [`keyring`](Self::keyring). An
+/// engine shares this same `Arc<Keyring>` with its [`Validator`](crate::Validator),
+/// so anchors inserted here are visible to validation without copying.
 pub struct SecurityManager {
     keys: MemKeyStore,
     cert_cache: Arc<CertCache>,
-    anchors: dashmap::DashMap<Arc<Name>, Certificate>,
+    keyring: Arc<Keyring>,
 }
 
 impl SecurityManager {
     pub fn new() -> Self {
+        // Ambient context starts with an empty (reject-all) schema and no
+        // hierarchy floor; the engine sets the operative schema when it wires
+        // this keyring into a validator. No warning is emitted (this is the
+        // dedicated ambient path, not `TrustContext::accept_all`).
+        let ambient = Arc::new(TrustContext::ambient(
+            TrustSchema::new(),
+            Arc::new(dashmap::DashMap::new()),
+        ));
         Self {
             keys: MemKeyStore::new(),
             cert_cache: Arc::new(CertCache::new()),
-            anchors: dashmap::DashMap::new(),
+            keyring: Arc::new(Keyring::with_ambient(ambient)),
         }
+    }
+
+    /// The keyring this manager owns. An engine wires this same handle into
+    /// its [`Validator`](crate::Validator) so issued anchors and adopted
+    /// contexts are seen by validation directly.
+    pub fn keyring(&self) -> &Arc<Keyring> {
+        &self.keyring
     }
 
     /// Shared cert-cache handle so an external `Validator` sees certs the
@@ -124,8 +148,7 @@ impl SecurityManager {
         };
 
         self.cert_cache.insert(cert.clone());
-        self.anchors
-            .insert(Arc::new(key_name.clone()), cert.clone());
+        self.keyring.ambient().add_anchor(cert.clone());
         Ok(cert)
     }
 
@@ -185,36 +208,46 @@ impl SecurityManager {
         Ok(cert)
     }
 
-    pub fn add_trust_anchor(&self, cert: Certificate) {
-        self.anchors.insert(Arc::clone(&cert.name), cert.clone());
-        self.cert_cache.insert(cert);
+    pub fn add_trust_anchor(&self, cert: Certificate) -> bool {
+        if !cert.is_valid_now() {
+            return false;
+        }
+        self.cert_cache.insert(cert.clone());
+        self.keyring.ambient().add_anchor(cert)
     }
 
     /// Remove a trust anchor by name; returns whether anything was
     /// removed. Does not evict the cert from the cache — it can still
     /// participate in chain walks, just no longer as a root.
     pub fn remove_trust_anchor(&self, key_name: &Name) -> bool {
-        let key_arc = self
-            .anchors
+        let anchors = self.keyring.ambient().anchors();
+        let key_arc = anchors
             .iter()
             .find(|r| r.key().as_ref() == key_name)
             .map(|r| Arc::clone(r.key()));
         if let Some(k) = key_arc {
-            self.anchors.remove(&k).is_some()
+            anchors.remove(&k).is_some()
         } else {
             false
         }
     }
 
     pub fn trust_anchor(&self, key_name: &Name) -> Option<Certificate> {
-        self.anchors
+        self.keyring
+            .ambient()
+            .anchors()
             .iter()
             .find(|r| r.key().as_ref() == key_name)
             .map(|r| r.value().clone())
     }
 
     pub fn trust_anchor_names(&self) -> Vec<Arc<Name>> {
-        self.anchors.iter().map(|r| Arc::clone(r.key())).collect()
+        self.keyring
+            .ambient()
+            .anchors()
+            .iter()
+            .map(|r| Arc::clone(r.key()))
+            .collect()
     }
 
     pub async fn get_signer(&self, key_name: &Name) -> Result<Arc<dyn Signer>, TrustError> {
@@ -472,9 +505,37 @@ mod tests {
             sig_value: None,
             sig_type: ndn_packet::SignatureType::SignatureEd25519,
         };
-        mgr.add_trust_anchor(cert.clone());
+        assert!(mgr.add_trust_anchor(cert.clone()));
         assert!(mgr.trust_anchor(&kn).is_some());
         assert!(mgr.cert_cache().get(&Arc::new(kn)).is_some());
+    }
+
+    #[test]
+    fn n14_add_trust_anchor_rejects_invalid_validity_window() {
+        let mgr = SecurityManager::new();
+        let expired_name = key_name("expired-anchor");
+        let not_yet_name = key_name("future-anchor");
+
+        let mut expired = Certificate {
+            name: Arc::new(expired_name.clone()),
+            public_key: Bytes::from_static(&[1u8; 32]),
+            valid_from: 0,
+            valid_until: 1,
+            issuer: None,
+            signed_region: None,
+            sig_value: None,
+            sig_type: ndn_packet::SignatureType::SignatureEd25519,
+        };
+        assert!(!mgr.add_trust_anchor(expired.clone()));
+        assert!(mgr.trust_anchor(&expired_name).is_none());
+        assert!(mgr.cert_cache().get(&Arc::new(expired_name)).is_none());
+
+        expired.name = Arc::new(not_yet_name.clone());
+        expired.valid_from = u64::MAX - 1;
+        expired.valid_until = u64::MAX;
+        assert!(!mgr.add_trust_anchor(expired));
+        assert!(mgr.trust_anchor(&not_yet_name).is_none());
+        assert!(mgr.cert_cache().get(&Arc::new(not_yet_name)).is_none());
     }
 
     #[test]

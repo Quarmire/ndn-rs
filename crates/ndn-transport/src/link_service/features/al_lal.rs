@@ -26,7 +26,7 @@ use std::time::Instant;
 use bytes::Bytes;
 use ndn_packet::lp::{TLV_AL_PRESENCE, extract_lp_header, splice_lp_header};
 
-use super::super::{EgressCtx, IngressCtx, InboundLpFrame, LinkServiceFeature, OutboundLpFrame};
+use super::super::{EgressCtx, InboundLpFrame, IngressCtx, LinkServiceFeature, OutboundLpFrame};
 use crate::face::FaceId;
 
 /// Egress presence provider: returns this node's encoded `Name` wire to
@@ -92,7 +92,8 @@ impl AlalFeature {
         if let Ok(mut g) = self.beacon.write() {
             *g = source;
         }
-        self.beacon_interval_ms.store(interval_ms, Ordering::Relaxed);
+        self.beacon_interval_ms
+            .store(interval_ms, Ordering::Relaxed);
     }
 
     /// Whether the idle beacon is enabled (so the engine tick should run).
@@ -105,7 +106,8 @@ impl AlalFeature {
     }
 
     fn note_activity(&self) {
-        self.last_activity_ms.store(self.elapsed_ms(), Ordering::Relaxed);
+        self.last_activity_ms
+            .store(self.elapsed_ms(), Ordering::Relaxed);
     }
 
     /// If the idle beacon is due (enabled, a source is set, and the face has
@@ -120,7 +122,11 @@ impl AlalFeature {
         if now.saturating_sub(self.last_activity_ms.load(Ordering::Relaxed)) < interval {
             return None;
         }
-        let wire = self.beacon.read().ok().and_then(|g| g.as_ref().and_then(|s| s()));
+        let wire = self
+            .beacon
+            .read()
+            .ok()
+            .and_then(|g| g.as_ref().and_then(|s| s()));
         if wire.is_some() {
             self.last_activity_ms.store(now, Ordering::Relaxed);
         }
@@ -168,7 +174,9 @@ impl Default for AlalFeature {
 
 impl core::fmt::Debug for AlalFeature {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("AlalFeature").field("active", &self.active.load(Ordering::Relaxed)).finish()
+        f.debug_struct("AlalFeature")
+            .field("active", &self.active.load(Ordering::Relaxed))
+            .finish()
     }
 }
 
@@ -184,13 +192,17 @@ impl LinkServiceFeature for AlalFeature {
         if !frame.is_lp_wrapped {
             return;
         }
-        let Some(name_wire) = self.presence_wire() else { return };
+        let Some(name_wire) = self.presence_wire() else {
+            return;
+        };
         self.active.store(true, Ordering::Relaxed);
         frame.wire = splice_lp_header(frame.wire.clone(), TLV_AL_PRESENCE, &name_wire);
     }
 
     fn on_ingress(&self, frame: &InboundLpFrame, ctx: &IngressCtx) {
-        let Some(sink) = self.ingress_sink() else { return };
+        let Some(sink) = self.ingress_sink() else {
+            return;
+        };
         if let Some(name_wire) = extract_lp_header(&frame.wire, TLV_AL_PRESENCE) {
             self.active.store(true, Ordering::Relaxed);
             sink(ctx.face_id, name_wire);
@@ -254,12 +266,19 @@ mod tests {
         let f = AlalFeature::new();
         assert!(f.due_beacon().is_none(), "no beacon source → never due");
         // Fresh face, long interval → not idle long enough yet.
-        f.set_beacon(Some(Arc::new(|| Some(Bytes::from_static(b"beacon")))), 10_000);
+        f.set_beacon(
+            Some(Arc::new(|| Some(Bytes::from_static(b"beacon")))),
+            10_000,
+        );
         assert!(f.due_beacon().is_none(), "not idle beyond interval");
         // Short interval, wait past it → due once, then resets.
         f.set_beacon(Some(Arc::new(|| Some(Bytes::from_static(b"beacon")))), 2);
         std::thread::sleep(std::time::Duration::from_millis(8));
-        assert_eq!(f.due_beacon().as_deref(), Some(&b"beacon"[..]), "idle → beacon due");
+        assert_eq!(
+            f.due_beacon().as_deref(),
+            Some(&b"beacon"[..]),
+            "idle → beacon due"
+        );
     }
 
     #[test]
@@ -279,7 +298,14 @@ mod tests {
         f.set_sink(Some(Arc::new(move |_f, _n| {
             c2.fetch_add(1, Ordering::Relaxed);
         })));
-        f.on_ingress(&InboundLpFrame::bare(lp_wire(b"\x05\x02\x00\x00")), &IngressCtx::new(FaceId(9)));
-        assert_eq!(calls.load(Ordering::Relaxed), 0, "no presence → no sink call");
+        f.on_ingress(
+            &InboundLpFrame::bare(lp_wire(b"\x05\x02\x00\x00")),
+            &IngressCtx::new(FaceId(9)),
+        );
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            0,
+            "no presence → no sink call"
+        );
     }
 }

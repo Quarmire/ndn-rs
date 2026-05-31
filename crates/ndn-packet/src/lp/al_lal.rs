@@ -53,8 +53,13 @@ impl GeoFix {
         if value.len() != GEO_LEN {
             return None;
         }
-        let i32_at = |o: usize| i32::from_be_bytes([value[o], value[o + 1], value[o + 2], value[o + 3]]);
-        Some(Self { lat_e7: i32_at(0), lon_e7: i32_at(4), alt_cm: i32_at(8) })
+        let i32_at =
+            |o: usize| i32::from_be_bytes([value[o], value[o + 1], value[o + 2], value[o + 3]]);
+        Some(Self {
+            lat_e7: i32_at(0),
+            lon_e7: i32_at(4),
+            alt_cm: i32_at(8),
+        })
     }
 }
 
@@ -169,7 +174,11 @@ mod tests {
 
     #[test]
     fn geofix_value_roundtrip() {
-        let g = GeoFix { lat_e7: 351_234_567, lon_e7: -901_234_567, alt_cm: 12_345 };
+        let g = GeoFix {
+            lat_e7: 351_234_567,
+            lon_e7: -901_234_567,
+            alt_cm: 12_345,
+        };
         assert_eq!(GeoFix::decode_value(&g.encode_value()), Some(g));
         assert_eq!(GeoFix::decode_value(&[0u8; 11]), None);
     }
@@ -194,20 +203,33 @@ mod tests {
         let lp = lp_around(&minimal_interest());
         let once = splice_lp_header(lp, TLV_AL_PRESENCE, b"aaaa");
         let twice = splice_lp_header(once, TLV_AL_PRESENCE, b"bbbb");
-        assert_eq!(extract_lp_header(&twice, TLV_AL_PRESENCE).as_deref(), Some(&b"bbbb"[..]));
+        assert_eq!(
+            extract_lp_header(&twice, TLV_AL_PRESENCE).as_deref(),
+            Some(&b"bbbb"[..])
+        );
     }
 
     #[test]
     fn location_headers_coexist_in_order() {
         let lp = lp_around(&minimal_interest());
-        let pl = GeoFix { lat_e7: 1, lon_e7: 2, alt_cm: 3 };
-        let dl = GeoFix { lat_e7: 4, lon_e7: 5, alt_cm: 6 };
+        let pl = GeoFix {
+            lat_e7: 1,
+            lon_e7: 2,
+            alt_cm: 3,
+        };
+        let dl = GeoFix {
+            lat_e7: 4,
+            lon_e7: 5,
+            alt_cm: 6,
+        };
         let w1 = splice_lp_header(lp, TLV_AL_PRESENCE, b"n");
         let w2 = splice_lp_header(w1, TLV_AL_PREV_HOP_LOC, &pl.encode_value());
         let w3 = splice_lp_header(w2, TLV_AL_DATA_LOC, &dl.encode_value());
         // All three present and the packet still decodes.
         let pkt = crate::lp::LpPacket::decode(w3.clone()).expect("decodes");
-        assert!(pkt.al_presence.is_some() && pkt.al_prev_hop_loc.is_some() && pkt.al_data_loc.is_some());
+        assert!(
+            pkt.al_presence.is_some() && pkt.al_prev_hop_loc.is_some() && pkt.al_data_loc.is_some()
+        );
         assert_eq!(
             GeoFix::decode_value(&extract_lp_header(&w3, TLV_AL_PREV_HOP_LOC).unwrap()),
             Some(pl)

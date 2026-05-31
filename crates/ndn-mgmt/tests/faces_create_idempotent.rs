@@ -108,15 +108,37 @@ async fn faces_create_idempotent_returns_existing_face_id() {
         .as_ref()
         .and_then(|b| b.face_id)
         .expect("face_id on first create");
+    let first_body = first.body.as_ref().expect("first body");
+    assert_eq!(
+        first_body.flags,
+        Some(0),
+        "faces/create must echo Flags for NFD FaceCreateCommand compatibility",
+    );
+    assert_eq!(
+        first_body.face_persistency,
+        Some(0),
+        "faces/create must echo persistent FacePersistency for NFD clients",
+    );
 
     // Second create — same URI, should reuse the existing id and
     // ship no partial failures (no extra options requested).
     let second = dispatch(&env, b"create", &cp).await;
     assert_eq!(second.status_code, 200);
-    let second_id = second.body.as_ref().and_then(|b| b.face_id).unwrap();
+    let second_body = second.body.as_ref().expect("second body");
+    let second_id = second_body.face_id.unwrap();
     assert_eq!(
         second_id, first_id,
         "idempotent create must return the same face_id",
+    );
+    assert_eq!(
+        second_body.flags,
+        Some(0),
+        "idempotent faces/create must echo current Flags for NFD clients",
+    );
+    assert_eq!(
+        second_body.face_persistency,
+        Some(0),
+        "idempotent faces/create must echo current FacePersistency for NFD clients",
     );
     assert!(
         second

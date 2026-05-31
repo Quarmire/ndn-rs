@@ -8,18 +8,18 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
-#[cfg(not(target_arch = "wasm32"))]
-use ndn_face_native::local::InProcHandle;
 #[cfg(target_arch = "wasm32")]
 use ndn_face_local::InProcHandle;
+#[cfg(not(target_arch = "wasm32"))]
+use ndn_face_native::local::InProcHandle;
 #[cfg(not(target_arch = "wasm32"))]
 use ndn_ipc::ForwarderClient;
 use ndn_packet::{Interest, Name};
 
 use crate::AppError;
-use crate::connection::{Connection, InProcConnection};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::connection::IpcConnection;
+use crate::connection::{Connection, InProcConnection};
 
 pub struct Query {
     pub interest: Interest,

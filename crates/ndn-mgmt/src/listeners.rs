@@ -91,7 +91,9 @@ fn resolve_rx_sockets(rx_sockets: usize) -> usize {
     #[cfg(unix)]
     {
         if rx_sockets == 0 {
-            let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+            let cpus = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1);
             cpus.clamp(1, 4)
         } else {
             rx_sockets
@@ -131,13 +133,19 @@ pub async fn run_udp_listener(
                             Ok(tok) => {
                                 let eng = engine.clone();
                                 let c = cancel.child_token();
-                                tokio::spawn(async move { udp_rx_loop(Arc::new(tok), eng, c).await });
+                                tokio::spawn(
+                                    async move { udp_rx_loop(Arc::new(tok), eng, c).await },
+                                );
                                 started += 1;
                             }
-                            Err(e) => tracing::warn!(target: "face.udp", error=%e, "udp-listener: from_std failed"),
+                            Err(e) => {
+                                tracing::warn!(target: "face.udp", error=%e, "udp-listener: from_std failed")
+                            }
                         }
                     }
-                    Err(e) => tracing::warn!(target: "face.udp", addr=%bind_addr, error=%e, "udp-listener: SO_REUSEPORT bind failed"),
+                    Err(e) => {
+                        tracing::warn!(target: "face.udp", addr=%bind_addr, error=%e, "udp-listener: SO_REUSEPORT bind failed")
+                    }
                 }
             }
             if started > 0 {

@@ -182,6 +182,7 @@ fn bench_pit_check(c: &mut Criterion) {
             let pit = Arc::new(Pit::new());
             let stage = PitCheckStage {
                 pit,
+                dead_nonce_list: None,
                 validator: None,
                 replay_guard: None,
             };
@@ -199,6 +200,7 @@ fn bench_pit_check(c: &mut Criterion) {
         let pit = Arc::new(Pit::new());
         let stage = PitCheckStage {
             pit: Arc::clone(&pit),
+            dead_nonce_list: None,
             validator: None,
             replay_guard: None,
         };
@@ -286,7 +288,10 @@ fn bench_pit_match(c: &mut Criterion) {
             );
             pit.insert(token, entry);
 
-            let stage = PitMatchStage { pit };
+            let stage = PitMatchStage {
+                pit,
+                dead_nonce_list: None,
+            };
             let mut c = ctx(data_bytes.clone());
             let data = ndn_packet::Data::decode(data_bytes.clone()).unwrap();
             c.name = Some(data.name.clone());
@@ -299,7 +304,10 @@ fn bench_pit_match(c: &mut Criterion) {
     group.bench_function("miss", |b| {
         let data_bytes = data_wire(4);
         let pit = Arc::new(Pit::new());
-        let stage = PitMatchStage { pit };
+        let stage = PitMatchStage {
+            pit,
+            dead_nonce_list: None,
+        };
 
         b.iter(|| {
             let mut c = ctx(data_bytes.clone());
@@ -481,6 +489,7 @@ fn bench_interest_pipeline(c: &mut Criterion) {
             };
             let pit_check = PitCheckStage {
                 pit: Arc::clone(&pit),
+                dead_nonce_list: None,
                 #[cfg(not(target_arch = "wasm32"))]
                 validator: None,
                 replay_guard: None,
@@ -581,6 +590,7 @@ fn bench_data_pipeline(c: &mut Criterion) {
                 );
                 let pit_match = PitMatchStage {
                     pit: Arc::clone(&pit),
+                    dead_nonce_list: None,
                 };
                 let cs_insert = CsInsertStage {
                     cs: Arc::clone(&cs) as Arc<dyn ErasedContentStore>,

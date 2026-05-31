@@ -469,4 +469,28 @@ mod tests {
         assert_eq!(parsed.components()[0].typ, 200);
         assert_eq!(parsed.components()[0].value.as_ref(), b"abc");
     }
+
+    #[test]
+    fn a19_uri_display_preserves_arbitrary_typed_component() {
+        let n = Name::root().append_component(NameComponent::new(200, Bytes::from_static(b"abc")));
+        assert_eq!(n.to_string(), "/200=abc");
+        let parsed: Name = n
+            .to_string()
+            .parse()
+            .expect("typed-component URI must parse");
+        assert_eq!(parsed.components()[0].typ, 200);
+        assert_eq!(parsed.components()[0].value.as_ref(), b"abc");
+    }
+
+    #[test]
+    fn a01_type3_component_has_no_blake3_uri_semantics() {
+        let n = Name::root().append_component(NameComponent::new(3, Bytes::from_static(b"abc")));
+        assert_eq!(n.to_string(), "/3=abc");
+
+        let parsed: Name = "/blake3digest=abc"
+            .parse()
+            .expect("unrecognized URI prefix falls back to generic component");
+        assert_eq!(parsed.components()[0].typ, tlv_type::NAME_COMPONENT);
+        assert_eq!(parsed.components()[0].value.as_ref(), b"blake3digest=abc");
+    }
 }

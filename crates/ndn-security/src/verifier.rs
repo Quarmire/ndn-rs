@@ -465,7 +465,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rsa_valid_signature_returns_valid() {
+    async fn c01_rsa_valid_signature_returns_valid() {
         use rsa::{
             pkcs8::EncodePublicKey,
             signature::{SignatureEncoding, Signer as _},
@@ -483,7 +483,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rsa_wrong_signature_returns_invalid() {
+    async fn c01_rsa_wrong_signature_returns_invalid() {
         use rsa::pkcs8::EncodePublicKey;
 
         let (_sk, vk) = rsa_keypair_2048();
@@ -497,7 +497,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rsa_bad_key_returns_err() {
+    async fn c01_rsa_bad_key_returns_err() {
         let result = RsaSha256Verifier
             .verify(b"data", &[0u8; 256], b"not-a-der-key")
             .await;
@@ -513,7 +513,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ecdsa_valid_signature_returns_valid() {
+    async fn c01_ecdsa_valid_signature_returns_valid() {
         use p256_ecdsa::{
             ecdsa::{DerSignature, signature::Signer as _},
             pkcs8::EncodePublicKey,
@@ -531,7 +531,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ecdsa_wrong_signature_returns_invalid() {
+    async fn c01_ecdsa_wrong_signature_returns_invalid() {
         use p256_ecdsa::pkcs8::EncodePublicKey;
 
         let (_sk, pk) = ecdsa_keypair();
@@ -547,7 +547,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ecdsa_bad_key_returns_err() {
+    async fn c01_ecdsa_bad_key_returns_err() {
         let result = EcdsaSha256Verifier
             .verify(b"data", &[0u8; 64], b"not-a-der-key")
             .await;

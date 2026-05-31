@@ -95,9 +95,11 @@ pub(super) fn faces_update(
     // BaseCongestionMarkingInterval / DefaultCongestionThreshold). Surfaced on
     // faces/list; ignored by transports without a congestion-marking feature.
     if let Some(us) = params.base_cong_interval {
-        let _ = target.link_service.apply(FaceOption::BaseCongestionMarkingInterval(
-            std::time::Duration::from_micros(us),
-        ));
+        let _ = target
+            .link_service
+            .apply(FaceOption::BaseCongestionMarkingInterval(
+                std::time::Duration::from_micros(us),
+            ));
     }
     if let Some(threshold) = params.def_cong_threshold {
         let _ = target

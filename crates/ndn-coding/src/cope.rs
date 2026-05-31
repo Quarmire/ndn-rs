@@ -109,9 +109,7 @@ impl CopeCoder {
             // g's recipient must already hold every native currently in the set …
             let g_can_decode = ids.iter().all(|&id| self.neighbor_holds(g.next_hop, id));
             // … and every current recipient must hold g's native.
-            let others_can_decode = recipients
-                .iter()
-                .all(|&r| self.neighbor_holds(r, g.id));
+            let others_can_decode = recipients.iter().all(|&r| self.neighbor_holds(r, g.id));
             if g_can_decode && others_can_decode {
                 chosen.push(i);
                 recipients.push(g.next_hop);
@@ -299,8 +297,16 @@ mod tests {
         let p1 = Bytes::from_static(b"packet-to-bob");
         let p2 = Bytes::from_static(b"the-packet-for-alice"); // different length on purpose
         let mut relay = CopeCoder::new();
-        relay.enqueue(NativeFrame { id: 1, next_hop: BOB, payload: p1.clone() });
-        relay.enqueue(NativeFrame { id: 2, next_hop: ALICE, payload: p2.clone() });
+        relay.enqueue(NativeFrame {
+            id: 1,
+            next_hop: BOB,
+            payload: p1.clone(),
+        });
+        relay.enqueue(NativeFrame {
+            id: 2,
+            next_hop: ALICE,
+            payload: p2.clone(),
+        });
         relay.report(ALICE, 1); // Alice overheard p1
         relay.report(BOB, 2); // Bob overheard p2
 
@@ -321,7 +327,10 @@ mod tests {
         let n = encode_native(7, b"hello");
         assert_eq!(
             decode_wire(&n),
-            Some(CopeWire::Native { id: 7, payload: Bytes::from_static(b"hello") })
+            Some(CopeWire::Native {
+                id: 7,
+                payload: Bytes::from_static(b"hello")
+            })
         );
         let coded = CodedFrame {
             members: vec![(1, 4), (2, 6)],
@@ -333,7 +342,10 @@ mod tests {
         let r = encode_report(42, &[1, 2, 3]);
         assert_eq!(
             decode_wire(&r),
-            Some(CopeWire::Report { from: 42, ids: vec![1, 2, 3] })
+            Some(CopeWire::Report {
+                from: 42,
+                ids: vec![1, 2, 3]
+            })
         );
 
         assert_eq!(decode_wire(b""), None);
@@ -343,8 +355,16 @@ mod tests {
     #[test]
     fn not_codeable_without_overhearing() {
         let mut relay = CopeCoder::new();
-        relay.enqueue(NativeFrame { id: 1, next_hop: BOB, payload: Bytes::from_static(b"aaaa") });
-        relay.enqueue(NativeFrame { id: 2, next_hop: ALICE, payload: Bytes::from_static(b"bbbb") });
+        relay.enqueue(NativeFrame {
+            id: 1,
+            next_hop: BOB,
+            payload: Bytes::from_static(b"aaaa"),
+        });
+        relay.enqueue(NativeFrame {
+            id: 2,
+            next_hop: ALICE,
+            payload: Bytes::from_static(b"bbbb"),
+        });
         // No reception reports: neither recipient holds the other's native.
         let coded = relay.encode_next().unwrap();
         assert!(!coded.is_coded(), "head sent uncoded; can't safely combine");
@@ -358,9 +378,21 @@ mod tests {
         let p2 = Bytes::from_static(b"two2");
         let p3 = Bytes::from_static(b"three3");
         let mut relay = CopeCoder::new();
-        relay.enqueue(NativeFrame { id: 1, next_hop: ALICE, payload: p1.clone() });
-        relay.enqueue(NativeFrame { id: 2, next_hop: BOB, payload: p2.clone() });
-        relay.enqueue(NativeFrame { id: 3, next_hop: CARLA, payload: p3.clone() });
+        relay.enqueue(NativeFrame {
+            id: 1,
+            next_hop: ALICE,
+            payload: p1.clone(),
+        });
+        relay.enqueue(NativeFrame {
+            id: 2,
+            next_hop: BOB,
+            payload: p2.clone(),
+        });
+        relay.enqueue(NativeFrame {
+            id: 3,
+            next_hop: CARLA,
+            payload: p3.clone(),
+        });
         // Each recipient overheard the other two.
         relay.report(ALICE, 2);
         relay.report(ALICE, 3);

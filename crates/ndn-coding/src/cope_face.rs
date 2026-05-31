@@ -132,7 +132,10 @@ impl<T: Transport> CopeBroadcastLink<T> {
                     let snapshot: HashMap<FrameId, Bytes> = self.held.lock().await.clone();
                     if let Some((id, native)) = decode(&coded, &snapshot) {
                         self.held.lock().await.insert(id, native.clone());
-                        return Ok(CopeEvent::Native { id, payload: native });
+                        return Ok(CopeEvent::Native {
+                            id,
+                            payload: native,
+                        });
                     }
                     // Can't decode (missing >1) or already hold all members.
                 }
@@ -141,7 +144,10 @@ impl<T: Transport> CopeBroadcastLink<T> {
                     for id in &ids {
                         coder.report(from, *id);
                     }
-                    return Ok(CopeEvent::ReportApplied { from, count: ids.len() });
+                    return Ok(CopeEvent::ReportApplied {
+                        from,
+                        count: ids.len(),
+                    });
                 }
                 None => { /* malformed frame; ignore */ }
             }
@@ -185,13 +191,21 @@ pub struct CopeMemberFace<T: Transport> {
 impl<T: Transport> CopeMemberFace<T> {
     /// A standalone member face: `recv_bytes` decodes from the shared link.
     pub fn new(neighbor: NeighborId, link: Arc<CopeBroadcastLink<T>>) -> Self {
-        Self { neighbor, link, recv_via_link: true }
+        Self {
+            neighbor,
+            link,
+            recv_via_link: true,
+        }
     }
 
     /// An egress-only member face: `send_bytes` codes; `recv_bytes` parks (the
     /// mesh's single ingress face owns the receive path).
     pub fn send_only(neighbor: NeighborId, link: Arc<CopeBroadcastLink<T>>) -> Self {
-        Self { neighbor, link, recv_via_link: false }
+        Self {
+            neighbor,
+            link,
+            recv_via_link: false,
+        }
     }
 }
 
@@ -374,8 +388,14 @@ mod tests {
 
         // The engine sends Data out the chosen out-face — next-hop is implicit
         // in WHICH member face. enqueue assigns ids 1 (→Alice) then 2 (→Bob).
-        face_a.send_bytes(Bytes::from_static(b"for-alice")).await.unwrap();
-        face_b.send_bytes(Bytes::from_static(b"for-bob")).await.unwrap();
+        face_a
+            .send_bytes(Bytes::from_static(b"for-alice"))
+            .await
+            .unwrap();
+        face_b
+            .send_bytes(Bytes::from_static(b"for-bob"))
+            .await
+            .unwrap();
         // Reception reports: Alice holds frame 2, Bob holds frame 1.
         link.report(ALICE, 2).await;
         link.report(BOB, 1).await;
@@ -386,7 +406,11 @@ mod tests {
             (1, 1),
             "the two member-face sends are coded into one broadcast"
         );
-        assert_eq!(face_a.id().0, ALICE, "member face id is its neighbor/next-hop");
+        assert_eq!(
+            face_a.id().0,
+            ALICE,
+            "member face id is its neighbor/next-hop"
+        );
     }
 
     /// Seam B: the reception-report control protocol. Alice announces the
@@ -405,6 +429,12 @@ mod tests {
         alice.announce().await.unwrap();
 
         let ev = relay.recv_event().await.unwrap();
-        assert_eq!(ev, CopeEvent::ReportApplied { from: ALICE, count: 2 });
+        assert_eq!(
+            ev,
+            CopeEvent::ReportApplied {
+                from: ALICE,
+                count: 2
+            }
+        );
     }
 }

@@ -20,6 +20,7 @@ mod hmac_sha256;
 pub mod iso8601;
 pub mod key_store;
 pub mod keychain;
+pub mod keyring;
 pub mod lvs;
 pub mod manager;
 pub mod pib;
@@ -34,6 +35,7 @@ pub mod spki;
 #[cfg(feature = "sqlite-pib")]
 pub mod sqlite_pib;
 pub mod trust;
+pub mod trust_context;
 pub mod trust_schema;
 pub mod validation_policy;
 pub mod validator;
@@ -46,6 +48,7 @@ pub use cert_fetcher::{CertFetcher, FetchFn};
 pub use error::TrustError;
 pub use key_store::{KeyAlgorithm, KeyStore, MemKeyStore};
 pub use keychain::KeyChain;
+pub use keyring::Keyring;
 pub use lvs::{LvsError, LvsModel};
 pub use manager::{SecurityManager, encode_cert_data, encode_cert_data_with_description};
 pub use pib::{FilePib, PibError};
@@ -59,11 +62,16 @@ pub use signer::{
 };
 pub use signing_info::{SignatureInfoOverrides, SignerSelection, SigningInfo};
 pub use trust::{InsecureTrust, LvsTrust, StaticTrust, TrustPolicy};
+pub use trust_context::{
+    EnrollmentHint, SchemaBlob, SchemaFormat, SigningPair, TrustContext, TrustContextError,
+    dryrun_orphans,
+};
 pub use trust_schema::{
     NamePattern, PatternComponent, PatternParseError, SchemaGate, SchemaRule, TrustSchema,
 };
 pub use validation_policy::{
-    AcceptAllPolicy, ChainedPolicy, HierarchicalPolicy, LvsPolicy, PolicyVerdict, ValidationPolicy,
+    AcceptAllPolicy, ChainedPolicy, ConfigChecker, ConfigPolicy, ConfigRule, HierarchicalPolicy,
+    LvsPolicy, PolicyVerdict, ValidationPolicy,
 };
 pub use validator::{InterestValidationOutcome, ValidationResult, Validator};
 pub use verifier::{

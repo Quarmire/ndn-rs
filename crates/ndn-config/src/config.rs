@@ -792,9 +792,7 @@ fn validate_face_config(face: &FaceConfig) -> Result<(), ConfigError> {
             cert_sha256,
             webpki,
         } => {
-            if !remote.starts_with("wts://")
-                && !remote.starts_with("https://")
-            {
+            if !remote.starts_with("wts://") && !remote.starts_with("https://") {
                 return Err(ConfigError::Invalid(format!(
                     "WebTransport remote must start with wts:// or https://: {remote}"
                 )));

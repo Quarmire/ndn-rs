@@ -60,8 +60,7 @@ async fn reflexive_reverse_pull_round_trip() {
                         .await
                     {
                         Ok(pulled) => {
-                            let content =
-                                pulled.content().map(|c| c.to_vec()).unwrap_or_default();
+                            let content = pulled.content().map(|c| c.to_vec()).unwrap_or_default();
                             let d1 = DataBuilder::new((*interest.name).clone(), &content).build();
                             responder.respond_bytes(d1).await.ok();
                         }
@@ -80,10 +79,15 @@ async fn reflexive_reverse_pull_round_trip() {
     let r = random_reflexive_name();
     let forward = InterestBuilder::new("/svc/req1").lifetime(Duration::from_secs(4));
     let d1 = advertiser
-        .fetch_reflexive(forward, r, Duration::from_secs(4), |reverse: Interest| async move {
-            // Answer the reverse Interest, named after it, with the approval.
-            Ok(DataBuilder::new((*reverse.name).clone(), b"approved").build())
-        })
+        .fetch_reflexive(
+            forward,
+            r,
+            Duration::from_secs(4),
+            |reverse: Interest| async move {
+                // Answer the reverse Interest, named after it, with the approval.
+                Ok(DataBuilder::new((*reverse.name).clone(), b"approved").build())
+            },
+        )
         .await
         .expect("forward Data should arrive after the reverse pull");
 

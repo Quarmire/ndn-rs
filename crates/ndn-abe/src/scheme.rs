@@ -42,14 +42,15 @@ fn serialize<T: serde::Serialize>(v: &T) -> Result<Bytes, AbeError> {
 }
 
 fn deserialize<T: serde::de::DeserializeOwned>(b: &[u8]) -> Result<T, AbeError> {
-    bincode::deserialize(b)
-        .map_err(|e| AbeError::CiphertextMalformed(e.to_string()))
+    bincode::deserialize(b).map_err(|e| AbeError::CiphertextMalformed(e.to_string()))
 }
 
 impl BswMasterParams {
     /// Construct from a rabe public key.
     pub fn from_rabe(pk: &CpAbePublicKey) -> Result<Self, AbeError> {
-        Ok(Self { public_key_bytes: serialize(pk)? })
+        Ok(Self {
+            public_key_bytes: serialize(pk)?,
+        })
     }
 
     /// Deserialize back to the rabe type.
@@ -61,7 +62,9 @@ impl BswMasterParams {
 impl BswMasterSecret {
     /// Construct from a rabe master key.
     pub fn from_rabe(msk: &CpAbeMasterKey) -> Result<Self, AbeError> {
-        Ok(Self { master_key_bytes: serialize(msk)? })
+        Ok(Self {
+            master_key_bytes: serialize(msk)?,
+        })
     }
 
     /// Deserialize back to the rabe type.
@@ -73,7 +76,9 @@ impl BswMasterSecret {
 impl BswAttributeKeys {
     /// Construct from a rabe secret key.
     pub fn from_rabe(sk: &CpAbeSecretKey) -> Result<Self, AbeError> {
-        Ok(Self { keys_bytes: serialize(sk)? })
+        Ok(Self {
+            keys_bytes: serialize(sk)?,
+        })
     }
 
     /// Deserialize back to the rabe type.
@@ -86,7 +91,10 @@ impl BswAttributeKeys {
 #[instrument(skip_all)]
 pub fn bsw_setup() -> Result<(BswMasterParams, BswMasterSecret), AbeError> {
     let (pk, msk) = bsw::setup();
-    Ok((BswMasterParams::from_rabe(&pk)?, BswMasterSecret::from_rabe(&msk)?))
+    Ok((
+        BswMasterParams::from_rabe(&pk)?,
+        BswMasterSecret::from_rabe(&msk)?,
+    ))
 }
 
 /// Derive attribute keys for a consumer. `attrs` are flat `key:value` strings.
@@ -116,8 +124,9 @@ pub fn bsw_encrypt(
 ) -> Result<Bytes, AbeError> {
     let pk = mp.to_rabe()?;
     let rabe_policy = policy.to_rabe_bsw()?;
-    let ct: CpAbeCiphertext = bsw::encrypt(&pk, &rabe_policy, PolicyLanguage::HumanPolicy, plaintext)
-        .map_err(|e| AbeError::SchemeError(e.to_string()))?;
+    let ct: CpAbeCiphertext =
+        bsw::encrypt(&pk, &rabe_policy, PolicyLanguage::HumanPolicy, plaintext)
+            .map_err(|e| AbeError::SchemeError(e.to_string()))?;
     serialize(&ct)
 }
 
@@ -138,7 +147,12 @@ mod tests {
 
     fn setup_with_attrs(attrs: &[&str]) -> (BswMasterParams, BswMasterSecret, BswAttributeKeys) {
         let (mp, ms) = bsw_setup().unwrap();
-        let ak = bsw_keygen(&mp, &ms, &attrs.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap();
+        let ak = bsw_keygen(
+            &mp,
+            &ms,
+            &attrs.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        )
+        .unwrap();
         (mp, ms, ak)
     }
 

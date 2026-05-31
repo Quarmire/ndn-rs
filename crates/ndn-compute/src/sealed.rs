@@ -65,7 +65,8 @@ fn derive_key(shared: &[u8]) -> [u8; 32] {
         .expand(&[HKDF_INFO], Aes256KeyLen)
         .expect("hkdf expand for 32 bytes is infallible");
     let mut out = [0u8; 32];
-    okm.fill(&mut out).expect("hkdf fill for 32 bytes is infallible");
+    okm.fill(&mut out)
+        .expect("hkdf fill for 32 bytes is infallible");
     out
 }
 
@@ -82,9 +83,11 @@ impl NodeKeypair {
     /// Generate a fresh node keypair.
     pub fn generate() -> Result<Self, SealError> {
         let rng = SystemRandom::new();
-        let private =
-            EphemeralPrivateKey::generate(&agreement::X25519, &rng).map_err(|_| SealError::Crypto)?;
-        let pubk = private.compute_public_key().map_err(|_| SealError::Crypto)?;
+        let private = EphemeralPrivateKey::generate(&agreement::X25519, &rng)
+            .map_err(|_| SealError::Crypto)?;
+        let pubk = private
+            .compute_public_key()
+            .map_err(|_| SealError::Crypto)?;
         let mut public = [0u8; PUB_LEN];
         public.copy_from_slice(pubk.as_ref());
         Ok(Self { public, private })
@@ -105,7 +108,8 @@ impl NodeKeypair {
         let key = agreement::agree_ephemeral(self.private, &peer, derive_key)
             .map_err(|_| SealError::Crypto)?;
 
-        let unbound = aead::UnboundKey::new(&aead::AES_256_GCM, &key).map_err(|_| SealError::Crypto)?;
+        let unbound =
+            aead::UnboundKey::new(&aead::AES_256_GCM, &key).map_err(|_| SealError::Crypto)?;
         let opening = aead::LessSafeKey::new(unbound);
         let mut in_out = ciphertext.to_vec();
         let plain = opening

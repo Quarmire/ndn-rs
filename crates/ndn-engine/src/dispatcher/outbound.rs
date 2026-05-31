@@ -25,6 +25,20 @@ impl PacketDispatcher {
             .is_some_and(|s| s.local_fields_enabled())
     }
 
+    pub(super) fn face_link_type(&self, face_id: FaceId) -> LinkType {
+        self.face_table
+            .get(face_id)
+            .map(|f| f.link_type())
+            .unwrap_or(LinkType::PointToPoint)
+    }
+
+    /// NDNLPv2 Nacks are point-to-point feedback. Do not emit or accept them
+    /// on shared media where one peer's failure must not suppress another
+    /// peer's chance to satisfy the Interest.
+    pub(super) fn nacks_allowed_on_face(&self, face_id: FaceId) -> bool {
+        self.face_link_type(face_id) == LinkType::PointToPoint
+    }
+
     pub(super) async fn enqueue_send(&self, face_id: FaceId, payload: Bytes, intent: EgressIntent) {
         self.enqueue_send_with_source(face_id, payload, FaceId::INVALID, intent)
             .await;
@@ -155,6 +169,10 @@ impl PacketDispatcher {
             Action::Drop(r) => debug!(target: t::FWD_PIPELINE, reason=?r, "packet dropped"),
             Action::Nack(ctx, reason) => {
                 trace!(target: t::FWD_PIPELINE, face=%ctx.face_id, name=?ctx.name, reason=?reason, "dispatch: Nack");
+                if !self.nacks_allowed_on_face(ctx.face_id) {
+                    debug!(target: t::FWD_PIPELINE, face=%ctx.face_id, "nack suppressed on multi-access/ad-hoc face");
+                    return;
+                }
                 let packet_reason = match reason {
                     NackReason::NoRoute => ndn_packet::NackReason::NoRoute,
                     NackReason::Duplicate => ndn_packet::NackReason::Duplicate,

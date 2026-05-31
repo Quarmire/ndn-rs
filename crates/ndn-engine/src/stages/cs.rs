@@ -97,7 +97,7 @@ mod tests {
     use std::sync::Arc;
 
     use bytes::Bytes;
-    use ndn_packet::encode::DataBuilder;
+    use ndn_packet::encode::{DataBuilder, InterestBuilder};
     use ndn_packet::{Data, Interest, Name, SignatureType};
     use ndn_security::{Certificate, Ed25519Signer, Signer, TrustSchema, Validator};
     use ndn_store::{AdmitAllPolicy, LruCs};
@@ -128,6 +128,62 @@ mod tests {
             admission: Arc::new(AdmitAllPolicy),
         };
         (stage, cs)
+    }
+
+    fn interest_ctx(wire: Bytes) -> PacketContext {
+        let interest = Interest::decode(wire.clone()).unwrap();
+        let mut ctx = PacketContext::new(wire, FaceId(7), 0);
+        ctx.name = Some(Arc::clone(&interest.name));
+        ctx.packet = DecodedPacket::Interest(Box::new(interest));
+        ctx
+    }
+
+    #[tokio::test]
+    async fn d04_cs_lookup_must_be_fresh_misses_stale_cached_data() {
+        let cs = Arc::new(LruCs::new(1024 * 1024));
+        let name: Arc<Name> = Arc::new("/test/d04/stale".parse().unwrap());
+        cs.insert_erased(
+            Bytes::from_static(b"stale-data-wire"),
+            Arc::clone(&name),
+            CsMeta { stale_at: 0 },
+        )
+        .await;
+
+        let stage = CsLookupStage {
+            cs: Arc::clone(&cs) as Arc<dyn ndn_store::ErasedContentStore>,
+        };
+        let wire = InterestBuilder::new((*name).clone())
+            .must_be_fresh()
+            .build();
+
+        let action = stage.process(interest_ctx(wire)).await;
+        assert!(
+            matches!(action, Action::Continue(_)),
+            "stale cached Data must not satisfy MustBeFresh Interests"
+        );
+    }
+
+    #[tokio::test]
+    async fn d04_cs_lookup_without_must_be_fresh_hits_stale_cached_data() {
+        let cs = Arc::new(LruCs::new(1024 * 1024));
+        let name: Arc<Name> = Arc::new("/test/d04/stale-ok".parse().unwrap());
+        cs.insert_erased(
+            Bytes::from_static(b"stale-data-wire"),
+            Arc::clone(&name),
+            CsMeta { stale_at: 0 },
+        )
+        .await;
+
+        let stage = CsLookupStage {
+            cs: Arc::clone(&cs) as Arc<dyn ndn_store::ErasedContentStore>,
+        };
+        let wire = InterestBuilder::new((*name).clone()).build();
+
+        let action = stage.process(interest_ctx(wire)).await;
+        assert!(
+            matches!(action, Action::Satisfy(_)),
+            "non-MustBeFresh Interests may be satisfied by stale cached Data"
+        );
     }
 
     #[tokio::test]

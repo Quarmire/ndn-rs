@@ -5,10 +5,10 @@ use std::time::Duration;
 
 use bytes::Bytes;
 
-#[cfg(not(target_arch = "wasm32"))]
-use ndn_face_native::local::InProcHandle;
 #[cfg(target_arch = "wasm32")]
 use ndn_face_local::InProcHandle;
+#[cfg(not(target_arch = "wasm32"))]
+use ndn_face_native::local::InProcHandle;
 #[cfg(not(target_arch = "wasm32"))]
 use ndn_ipc::ForwarderClient;
 use ndn_packet::encode::InterestBuilder;
@@ -17,9 +17,9 @@ use ndn_packet::{Data, MAX_PERSISTENT_LIFETIME_SECS, Name, SubscriptionRequest};
 use ndn_security::{SafeData, ValidationResult, Validator};
 
 use crate::AppError;
-use crate::connection::{Connection, InProcConnection, LpInfo};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::connection::IpcConnection;
+use crate::connection::{Connection, InProcConnection, LpInfo};
 
 pub const DEFAULT_INTEREST_LIFETIME: Duration = Duration::from_millis(4000);
 
@@ -109,8 +109,10 @@ impl Consumer {
         if is_lp_packet(&reply)
             && let Ok(lp) = LpPacket::decode(reply.clone())
         {
-            if let Some(reason) = lp.nack {
-                return Err(AppError::Nacked { reason });
+            if let Some(header) = lp.nack {
+                return Err(AppError::Nacked {
+                    reason: header.reason,
+                });
             }
             if let Some(fragment) = lp.fragment {
                 return Data::decode(fragment).map_err(|e| AppError::Protocol(e.to_string()));
@@ -358,8 +360,10 @@ pub(crate) fn decode_data_lp(reply: Bytes) -> Result<Data, AppError> {
     if is_lp_packet(&reply)
         && let Ok(lp) = LpPacket::decode(reply.clone())
     {
-        if let Some(reason) = lp.nack {
-            return Err(AppError::Nacked { reason });
+        if let Some(header) = lp.nack {
+            return Err(AppError::Nacked {
+                reason: header.reason,
+            });
         }
         if let Some(fragment) = lp.fragment {
             return Data::decode(fragment).map_err(|e| AppError::Protocol(e.to_string()));

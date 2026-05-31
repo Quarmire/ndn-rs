@@ -152,13 +152,21 @@ mod tests {
         let m = ReflexiveModule;
 
         // disable → table reports disabled and refuses new routes.
-        m.dispatch(b"disable", ControlParameters::default(), &ctx(&engine, &cancel, &config))
-            .await;
+        m.dispatch(
+            b"disable",
+            ControlParameters::default(),
+            &ctx(&engine, &cancel, &config),
+        )
+        .await;
         assert!(!engine.reflexive().is_enabled());
 
         // enable → back on.
-        m.dispatch(b"enable", ControlParameters::default(), &ctx(&engine, &cancel, &config))
-            .await;
+        m.dispatch(
+            b"enable",
+            ControlParameters::default(),
+            &ctx(&engine, &cancel, &config),
+        )
+        .await;
         assert!(engine.reflexive().is_enabled());
 
         // config → caps applied and echoed.
@@ -174,23 +182,37 @@ mod tests {
         assert_eq!(s.max_lifetime_ms, 3000);
 
         // flush → install a route, then flush it away.
-        engine
-            .reflexive()
-            .install(&"/rfx/q".parse().unwrap(), ndn_transport::FaceId(1), Duration::from_secs(4));
+        engine.reflexive().install(
+            &"/rfx/q".parse().unwrap(),
+            ndn_transport::FaceId(1),
+            Duration::from_secs(4),
+        );
         assert!(!engine.reflexive().is_empty());
-        m.dispatch(b"flush", ControlParameters::default(), &ctx(&engine, &cancel, &config))
-            .await;
+        m.dispatch(
+            b"flush",
+            ControlParameters::default(),
+            &ctx(&engine, &cancel, &config),
+        )
+        .await;
         assert!(engine.reflexive().is_empty());
 
         // info → returns a Control response (text), not an error.
         let resp = m
-            .dispatch(b"info", ControlParameters::default(), &ctx(&engine, &cancel, &config))
+            .dispatch(
+                b"info",
+                ControlParameters::default(),
+                &ctx(&engine, &cancel, &config),
+            )
             .await;
         assert!(matches!(resp, MgmtResponse::Control(_)));
 
         // unknown verb → NOT_FOUND.
         let resp = m
-            .dispatch(b"bogus", ControlParameters::default(), &ctx(&engine, &cancel, &config))
+            .dispatch(
+                b"bogus",
+                ControlParameters::default(),
+                &ctx(&engine, &cancel, &config),
+            )
             .await;
         match resp {
             MgmtResponse::Control(cr) => assert_eq!(cr.status_code, status::NOT_FOUND),

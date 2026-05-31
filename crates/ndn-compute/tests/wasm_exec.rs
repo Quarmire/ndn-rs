@@ -39,7 +39,9 @@ fn wasm_executor_traps_on_fuel_exhaustion() {
     let wasm = wat::parse_str(SPIN_WAT).expect("assemble spin wat");
     let exec = WasmExecutor::from_bytes(&wasm, 10_000).expect("load spin module");
 
-    let err = exec.execute(b"").expect_err("infinite loop must exhaust fuel");
+    let err = exec
+        .execute(b"")
+        .expect_err("infinite loop must exhaust fuel");
     assert!(
         matches!(err, ComputeError::ComputeFailed(_)),
         "expected ComputeFailed, got {err:?}"

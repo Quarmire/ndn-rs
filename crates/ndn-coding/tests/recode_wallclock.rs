@@ -60,7 +60,9 @@ fn descriptor(object: &Name, g: u64, sources: &[Vec<u8>]) -> GenerationDescripto
         symbol_size: SYMBOL as u32,
         field: Field::Gf8,
         content_name: object.clone(),
-        source_commitment: SourceCommitment::RowHashes(sources.iter().map(|r| row_hash(r)).collect()),
+        source_commitment: SourceCommitment::RowHashes(
+            sources.iter().map(|r| row_hash(r)).collect(),
+        ),
         recode: RecodePolicy::Open,
         delegation: None,
         fingerprint: None,
@@ -86,8 +88,16 @@ async fn time_recode() -> Duration {
         engine.fib().add_nexthop(&gen_prefix, handle.face_id, 0);
         handle.state.install_generation(desc.clone()).await;
         for (i, row) in sources.iter().enumerate() {
-            let meta = CodedMetadata { generation_id: g, k: K, field: Field::Gf8, vector: CodingVector::unit(K, i as u16) };
-            handle.state.feed(&object, g, &meta, Bytes::from(row.clone())).await;
+            let meta = CodedMetadata {
+                generation_id: g,
+                k: K,
+                field: Field::Gf8,
+                vector: CodingVector::unit(K, i as u16),
+            };
+            handle
+                .state
+                .feed(&object, g, &meta, Bytes::from(row.clone()))
+                .await;
         }
 
         let start = Instant::now();
@@ -131,7 +141,10 @@ async fn time_plain() -> Duration {
     let mut table: HashMap<Name, Bytes> = HashMap::new();
     for g in 0..ITERS {
         for (i, row) in make_sources(g).into_iter().enumerate() {
-            let name = object.clone().append(format!("v={g}")).append(i.to_string());
+            let name = object
+                .clone()
+                .append(format!("v={g}"))
+                .append(i.to_string());
             table.insert(name, Bytes::from(row));
         }
     }
@@ -159,7 +172,10 @@ async fn time_plain() -> Duration {
         let start = Instant::now();
         let mut payload = Vec::with_capacity(K as usize * SYMBOL);
         for i in 0..K {
-            let name = object.clone().append(format!("v={g}")).append(i.to_string());
+            let name = object
+                .clone()
+                .append(format!("v={g}"))
+                .append(i.to_string());
             let data = tokio::time::timeout(Duration::from_millis(500), consumer.fetch(name))
                 .await
                 .expect("no timeout")
@@ -190,7 +206,11 @@ async fn wallclock_recode_vs_plain() {
     );
     eprintln!("  path     ms/gen    MB/s");
     eprintln!("  ------   ------   ------");
-    eprintln!("  recode   {:>6.3}   {:>6.1}", per_gen(recode), mbps(recode));
+    eprintln!(
+        "  recode   {:>6.3}   {:>6.1}",
+        per_gen(recode),
+        mbps(recode)
+    );
     eprintln!("  plain    {:>6.3}   {:>6.1}", per_gen(plain), mbps(plain));
     eprintln!(
         "  → coding overhead on a clean path: {:.2}x (expected > 1; the doctrine\n    calls clean-path coding pure overhead — the win is multicast/lossy).",
@@ -199,6 +219,14 @@ async fn wallclock_recode_vs_plain() {
 
     // Sanity only (wall-clock thresholds are environment-dependent): both
     // complete and a generation recovers in well under the per-fetch timeout.
-    assert!(per_gen(recode) < 100.0, "recode/g {:.3} ms unexpectedly high", per_gen(recode));
-    assert!(per_gen(plain) < 100.0, "plain/g {:.3} ms unexpectedly high", per_gen(plain));
+    assert!(
+        per_gen(recode) < 100.0,
+        "recode/g {:.3} ms unexpectedly high",
+        per_gen(recode)
+    );
+    assert!(
+        per_gen(plain) < 100.0,
+        "plain/g {:.3} ms unexpectedly high",
+        per_gen(plain)
+    );
 }

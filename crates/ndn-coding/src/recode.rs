@@ -25,7 +25,9 @@ use ndn_foundation_types::Name;
 use ndn_tlv::{TlvReader, TlvWriter};
 
 use crate::field;
-use crate::metadata::{TYPE_FEC_FIELD, TYPE_FEC_GENERATION, TYPE_FEC_K, TYPE_FEC_METADATA, TYPE_FEC_ROLE};
+use crate::metadata::{
+    TYPE_FEC_FIELD, TYPE_FEC_GENERATION, TYPE_FEC_K, TYPE_FEC_METADATA, TYPE_FEC_ROLE,
+};
 use crate::policy::Field;
 use crate::{CodingError, Result};
 
@@ -181,7 +183,11 @@ impl LinearFingerprint {
     /// Immediate mode: `r` is public; coders filter pollution in-flight.
     pub fn for_sources(r: Vec<u8>, sources: &[Vec<u8>]) -> Self {
         let h = sources.iter().map(|row| gf_dot(&r, row)).collect();
-        Self { r, h, seed_hash: None }
+        Self {
+            r,
+            h,
+            seed_hash: None,
+        }
     }
 
     /// Delayed mode: commit to `SHA-256(r)` and publish `h`, but **withhold
@@ -189,7 +195,11 @@ impl LinearFingerprint {
     /// filtering; adaptive-resistant retroactive verification after reveal.
     pub fn delayed(r: &[u8], sources: &[Vec<u8>]) -> Self {
         let h = sources.iter().map(|row| gf_dot(r, row)).collect();
-        Self { r: Vec::new(), h, seed_hash: Some(row_hash(r)) }
+        Self {
+            r: Vec::new(),
+            h,
+            seed_hash: Some(row_hash(r)),
+        }
     }
 
     /// `true` if this is a delayed commitment whose seed is not yet revealed.
@@ -309,7 +319,10 @@ impl GenerationDescriptor {
             inner.write_tlv(TYPE_FEC_FIELD, &[field_code(self.field)]);
             inner.write_tlv(TYPE_CODING_VECTOR_WIDTH, &self.k.to_be_bytes());
             inner.write_tlv(TYPE_CONTENT_NAME, &self.content_name.encode_to_tlv());
-            inner.write_tlv(TYPE_SOURCE_COMMITMENT, &encode_commitment(&self.source_commitment));
+            inner.write_tlv(
+                TYPE_SOURCE_COMMITMENT,
+                &encode_commitment(&self.source_commitment),
+            );
             inner.write_tlv(TYPE_RECODE_POLICY, &[self.recode.as_u8()]);
             if let Some(d) = &self.delegation {
                 inner.write_tlv(TYPE_DELEGATION_LOCATOR, &d.encode_to_tlv());
@@ -339,7 +352,9 @@ impl GenerationDescriptor {
         let (mut name, mut commit, mut recode, mut deleg) = (None, None, None, None);
         let mut fingerprint = None;
         while !inner.is_empty() {
-            let (t, v) = inner.read_tlv().map_err(|_| CodingError::MalformedMetadata)?;
+            let (t, v) = inner
+                .read_tlv()
+                .map_err(|_| CodingError::MalformedMetadata)?;
             match t {
                 TYPE_FEC_GENERATION => gen_id = Some(decode_u64_be(&v)?),
                 TYPE_FEC_K => k = Some(decode_u16_be(&v)?),
@@ -347,16 +362,19 @@ impl GenerationDescriptor {
                 TYPE_FEC_FIELD => field = Some(field_from_code(one_byte(&v)?)?),
                 TYPE_CODING_VECTOR_WIDTH => width = Some(decode_u16_be(&v)?),
                 TYPE_CONTENT_NAME => {
-                    name = Some(Name::decode_from_tlv(v).map_err(|_| CodingError::MalformedMetadata)?)
+                    name =
+                        Some(Name::decode_from_tlv(v).map_err(|_| CodingError::MalformedMetadata)?)
                 }
                 TYPE_SOURCE_COMMITMENT => commit = Some(decode_commitment(&v)?),
                 TYPE_RECODE_POLICY => {
                     recode = Some(
-                        RecodePolicy::from_u8(one_byte(&v)?).ok_or(CodingError::MalformedMetadata)?,
+                        RecodePolicy::from_u8(one_byte(&v)?)
+                            .ok_or(CodingError::MalformedMetadata)?,
                     )
                 }
                 TYPE_DELEGATION_LOCATOR => {
-                    deleg = Some(Name::decode_from_tlv(v).map_err(|_| CodingError::MalformedMetadata)?)
+                    deleg =
+                        Some(Name::decode_from_tlv(v).map_err(|_| CodingError::MalformedMetadata)?)
                 }
                 TYPE_FINGERPRINT => fingerprint = Some(decode_fingerprint(v)?),
                 _ => {} // unknown sub-TLV ignored (forward compatibility)
@@ -434,7 +452,9 @@ impl RecodeToken {
         let mut inner = TlvReader::new(value);
         let (mut gen_id, mut recoder, mut sig) = (None, None, None);
         while !inner.is_empty() {
-            let (t, v) = inner.read_tlv().map_err(|_| CodingError::MalformedMetadata)?;
+            let (t, v) = inner
+                .read_tlv()
+                .map_err(|_| CodingError::MalformedMetadata)?;
             match t {
                 TYPE_FEC_GENERATION => gen_id = Some(decode_u64_be(&v)?),
                 TYPE_TOKEN_RECODER => {
@@ -620,7 +640,10 @@ pub mod naming {
 
     /// `<object>/_gen/<id>`.
     pub fn generation_name(object: &Name, generation_id: u64) -> Name {
-        object.clone().append(GEN_MARKER).append(generation_id.to_string())
+        object
+            .clone()
+            .append(GEN_MARKER)
+            .append(generation_id.to_string())
     }
 
     /// `<object>/_gen/<id>/_desc`.
@@ -678,14 +701,17 @@ pub mod naming {
 
     /// `<object>/_gen/<id>/_chal/<r>` — a consumer-challenge for projection `r`.
     pub fn challenge_name(object: &Name, generation_id: u64, r: &[u8]) -> Name {
-        generation_name(object, generation_id).append(CHAL_MARKER).append(r)
+        generation_name(object, generation_id)
+            .append(CHAL_MARKER)
+            .append(r)
     }
 
     /// Parse a `…/_gen/<id>/_chal/<r>` name into `(object, gen, r)`.
     pub fn parse_challenge(name: &Name) -> Option<(Name, u64, Vec<u8>)> {
         let c = name.components();
         let n = c.len();
-        if n < 4 || c[n - 4].value.as_ref() != GEN_MARKER || c[n - 2].value.as_ref() != CHAL_MARKER {
+        if n < 4 || c[n - 4].value.as_ref() != GEN_MARKER || c[n - 2].value.as_ref() != CHAL_MARKER
+        {
             return None;
         }
         let generation_id = decimal(&c[n - 3].value)?;
@@ -741,7 +767,9 @@ impl CodedMetadata {
         let mut inner = TlvReader::new(value);
         let (mut gen_id, mut role, mut field, mut k, mut vec) = (None, None, None, None, None);
         while !inner.is_empty() {
-            let (t, v) = inner.read_tlv().map_err(|_| CodingError::MalformedMetadata)?;
+            let (t, v) = inner
+                .read_tlv()
+                .map_err(|_| CodingError::MalformedMetadata)?;
             match t {
                 TYPE_FEC_GENERATION => gen_id = Some(decode_u64_be(&v)?),
                 TYPE_FEC_ROLE => role = Some(one_byte(&v)?),
@@ -889,7 +917,11 @@ impl GenerationBuffer {
     /// admits it **only if it adds rank** (rank-aware admission, doctrine §5).
     /// Returns `Ok(true)` if innovative and stored, `Ok(false)` if dependent
     /// (dropped), `Err(Mismatch)` if it does not belong to this generation.
-    pub fn absorb(&mut self, meta: &CodedMetadata, payload: Bytes) -> std::result::Result<bool, DecodeError> {
+    pub fn absorb(
+        &mut self,
+        meta: &CodedMetadata,
+        payload: Bytes,
+    ) -> std::result::Result<bool, DecodeError> {
         if self.quarantined {
             return Err(DecodeError::Quarantined);
         }
@@ -1095,7 +1127,10 @@ mod tests {
             delegation: None,
             fingerprint: None,
         };
-        assert!(!d.is_well_formed(), "delegated without namespace is ill-formed");
+        assert!(
+            !d.is_well_formed(),
+            "delegated without namespace is ill-formed"
+        );
         d.delegation = Some("/site-a/recoders".parse().unwrap());
         assert!(d.is_well_formed());
     }
@@ -1206,8 +1241,7 @@ mod tests {
     #[test]
     fn buffer_decodes_and_verifies_sources() {
         let sources: Vec<Vec<u8>> = vec![vec![1, 2, 3, 4], vec![5, 6, 7, 8], vec![9, 10, 11, 12]];
-        let commit =
-            SourceCommitment::RowHashes(sources.iter().map(|r| row_hash(r)).collect());
+        let commit = SourceCommitment::RowHashes(sources.iter().map(|r| row_hash(r)).collect());
         let desc = sample_descriptor(3, 4, commit);
         let mut buf = GenerationBuffer::new(desc);
         for (i, row) in sources.iter().enumerate() {
@@ -1231,8 +1265,7 @@ mod tests {
     #[test]
     fn recoded_combinations_still_verify() {
         let sources: Vec<Vec<u8>> = vec![vec![10, 20], vec![30, 40], vec![50, 60]];
-        let commit =
-            SourceCommitment::RowHashes(sources.iter().map(|r| row_hash(r)).collect());
+        let commit = SourceCommitment::RowHashes(sources.iter().map(|r| row_hash(r)).collect());
         let desc = sample_descriptor(3, 2, commit.clone());
 
         // First buffer holds the systematic packets.
@@ -1270,8 +1303,7 @@ mod tests {
     #[test]
     fn pollution_fails_verify_on_decode() {
         let sources: Vec<Vec<u8>> = vec![vec![1, 1], vec![2, 2], vec![3, 3]];
-        let commit =
-            SourceCommitment::RowHashes(sources.iter().map(|r| row_hash(r)).collect());
+        let commit = SourceCommitment::RowHashes(sources.iter().map(|r| row_hash(r)).collect());
         let desc = sample_descriptor(3, 2, commit);
         let mut buf = GenerationBuffer::new(desc);
         for (i, row) in sources.iter().enumerate() {
@@ -1363,10 +1395,19 @@ mod tests {
             field: Field::Gf8,
             vector: CodingVector::unit(3, 0),
         };
-        assert_eq!(buf.absorb(&bad, Bytes::from_static(&[0, 0])), Err(DecodeError::FingerprintFailed));
+        assert_eq!(
+            buf.absorb(&bad, Bytes::from_static(&[0, 0])),
+            Err(DecodeError::FingerprintFailed)
+        );
         assert!(!buf.is_quarantined());
-        assert_eq!(buf.absorb(&bad, Bytes::from_static(&[0, 0])), Err(DecodeError::FingerprintFailed));
-        assert!(buf.is_quarantined(), "quarantined after threshold rejections");
+        assert_eq!(
+            buf.absorb(&bad, Bytes::from_static(&[0, 0])),
+            Err(DecodeError::FingerprintFailed)
+        );
+        assert!(
+            buf.is_quarantined(),
+            "quarantined after threshold rejections"
+        );
         // Even a clean packet is now refused.
         assert_eq!(
             buf.absorb(&bad, Bytes::from(sources[0].clone())),
@@ -1376,9 +1417,17 @@ mod tests {
         // Budget caps total attempts.
         let desc2 = sample_descriptor(3, 2, SourceCommitment::MerkleRoot([0u8; 32]));
         let mut bbuf = GenerationBuffer::new(desc2).with_limits(1, 0);
-        let m = CodedMetadata { generation_id: 0x0102_0304, k: 3, field: Field::Gf8, vector: CodingVector::unit(3, 0) };
+        let m = CodedMetadata {
+            generation_id: 0x0102_0304,
+            k: 3,
+            field: Field::Gf8,
+            vector: CodingVector::unit(3, 0),
+        };
         assert!(bbuf.absorb(&m, Bytes::from_static(&[1, 2])).is_ok());
-        assert_eq!(bbuf.absorb(&m, Bytes::from_static(&[1, 2])), Err(DecodeError::BudgetExceeded));
+        assert_eq!(
+            bbuf.absorb(&m, Bytes::from_static(&[1, 2])),
+            Err(DecodeError::BudgetExceeded)
+        );
     }
 
     #[test]
@@ -1389,7 +1438,10 @@ mod tests {
         assert!(fp.is_delayed_unrevealed());
         assert!(fp.r.is_empty(), "seed withheld until reveal");
         assert!(fp.reveal(&r).is_some());
-        assert!(fp.reveal(&[0, 0]).is_none(), "wrong seed rejected by commitment");
+        assert!(
+            fp.reveal(&[0, 0]).is_none(),
+            "wrong seed rejected by commitment"
+        );
 
         let mut desc = sample_descriptor(
             3,
@@ -1397,7 +1449,10 @@ mod tests {
             SourceCommitment::RowHashes(sources.iter().map(|r| row_hash(r)).collect()),
         );
         desc.fingerprint = Some(fp);
-        assert_eq!(GenerationDescriptor::from_tlv(&desc.to_tlv()).unwrap(), desc);
+        assert_eq!(
+            GenerationDescriptor::from_tlv(&desc.to_tlv()).unwrap(),
+            desc
+        );
 
         let meta = |i: u16| CodedMetadata {
             generation_id: 0x0102_0304,
@@ -1410,7 +1465,10 @@ mod tests {
         // and verify retroactively once the seed is revealed.
         let mut good = GenerationBuffer::new(desc.clone());
         for (i, row) in sources.iter().enumerate() {
-            assert!(good.absorb(&meta(i as u16), Bytes::from(row.clone())).unwrap());
+            assert!(
+                good.absorb(&meta(i as u16), Bytes::from(row.clone()))
+                    .unwrap()
+            );
         }
         assert!(good.verify_with_revealed_seed(&r).is_ok());
         assert_eq!(
@@ -1489,6 +1547,9 @@ mod tests {
             field: Field::Gf8,
             vector: CodingVector::unit(2, 0),
         };
-        assert_eq!(buf.absorb(&wrong, Bytes::from_static(&[1, 2])), Err(DecodeError::Mismatch));
+        assert_eq!(
+            buf.absorb(&wrong, Bytes::from_static(&[1, 2])),
+            Err(DecodeError::Mismatch)
+        );
     }
 }

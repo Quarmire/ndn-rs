@@ -129,7 +129,7 @@ mod tests {
         if let Some(OutboundRequest::Interest { reply, .. }) = rx.recv().await {
             reply
                 .send(Err(AppError::Nacked {
-                    reason: NackReason::NoRoute,
+                    reason: Some(NackReason::NoRoute),
                 }))
                 .unwrap();
         }
@@ -137,7 +137,7 @@ mod tests {
         assert!(matches!(
             result,
             Err(AppError::Nacked {
-                reason: NackReason::NoRoute
+                reason: Some(NackReason::NoRoute)
             })
         ));
     }

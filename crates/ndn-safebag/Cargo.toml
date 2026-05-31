@@ -24,6 +24,7 @@ bytes    = { workspace = true, features = ["std"] }
 thiserror = { workspace = true }
 # Pure-Rust crypto for the encrypted-key path.
 pkcs8         = { version = "0.10", default-features = false, features = ["std", "alloc", "encryption", "pem"] }
+pkcs5         = { version = "0.7",  default-features = false, features = ["alloc", "pbes2"] }
 ed25519-dalek = { workspace = true, features = ["pkcs8"] }
 # OsRng on wasm needs getrandom's `js` feature; that flag lives
 # in the workspace `getrandom` definition and is enabled by any

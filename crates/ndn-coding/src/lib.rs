@@ -92,10 +92,10 @@ pub mod mgmt;
 pub mod policy;
 #[cfg(feature = "f2-recode")]
 pub mod recode;
-#[cfg(feature = "f2-recode-face")]
-pub mod recode_face;
 #[cfg(feature = "f2-recode-compute")]
 pub mod recode_compute;
+#[cfg(feature = "f2-recode-face")]
+pub mod recode_face;
 pub mod segmenter;
 
 pub use assembler::CodedAssembler;

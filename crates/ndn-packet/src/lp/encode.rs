@@ -184,7 +184,7 @@ mod tests {
 
         let lp = LpPacket::decode(lp_wire).expect("LpPacket must decode");
         assert_eq!(
-            lp.nack,
+            lp.nack.and_then(|header| header.reason),
             Some(NackReason::NoRoute),
             "Nack reason must round-trip"
         );
@@ -203,7 +203,10 @@ mod tests {
         let lp_wire = encode_lp_nack(NackReason::NoRoute, &interest_wire);
         let lp = LpPacket::decode(lp_wire).expect("LpPacket must decode");
         assert!(lp.pit_token.is_none());
-        assert_eq!(lp.nack, Some(NackReason::NoRoute));
+        assert_eq!(
+            lp.nack.and_then(|header| header.reason),
+            Some(NackReason::NoRoute)
+        );
     }
 
     /// `encode_lp_reliable` must emit `TxSequence` (0x0348) for per-link

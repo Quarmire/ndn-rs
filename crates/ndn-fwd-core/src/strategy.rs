@@ -86,7 +86,11 @@ mod tests {
     use super::*;
 
     /// Collect emitted actions into a fixed buffer (ndn-fwd-core stays light).
-    fn collect<S: Strategy<u8>>(s: &S, nexthops: &[u8], incoming: u8) -> ([ForwardAction<u8>; 8], usize) {
+    fn collect<S: Strategy<u8>>(
+        s: &S,
+        nexthops: &[u8],
+        incoming: u8,
+    ) -> ([ForwardAction<u8>; 8], usize) {
         let mut out = [ForwardAction::Now(0u8); 8];
         let mut n = 0;
         let ctx = DecideCtx {

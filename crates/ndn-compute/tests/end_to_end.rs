@@ -149,7 +149,10 @@ async fn wasm_executor_function_round_trip() {
 
     let service = ComputeService::attach(&engine);
     let wasm = wat::parse_str(ECHO_WAT).unwrap();
-    service.executor_function(prefix.clone(), WasmExecutor::from_bytes(&wasm, 1_000_000).unwrap());
+    service.executor_function(
+        prefix.clone(),
+        WasmExecutor::from_bytes(&wasm, 1_000_000).unwrap(),
+    );
 
     let mut client = ComputeClient::new(consumers.remove(0));
     let out: Bytes = client
@@ -282,11 +285,21 @@ async fn opaque_job_runs_each_call_separately() {
 
     let mut client = ComputeClient::new(consumers.remove(0));
     let first: u64 = client
-        .call_opaque_job::<(), u64>(prefix.clone(), (), Duration::from_millis(25), Duration::from_secs(3))
+        .call_opaque_job::<(), u64>(
+            prefix.clone(),
+            (),
+            Duration::from_millis(25),
+            Duration::from_secs(3),
+        )
         .await
         .expect("first opaque job");
     let second: u64 = client
-        .call_opaque_job::<(), u64>(prefix.clone(), (), Duration::from_millis(25), Duration::from_secs(3))
+        .call_opaque_job::<(), u64>(
+            prefix.clone(),
+            (),
+            Duration::from_millis(25),
+            Duration::from_secs(3),
+        )
         .await
         .expect("second opaque job");
 
@@ -343,13 +356,16 @@ async fn function_ref_pulls_parameter_by_reference() {
 
     // /compute/sum takes a parameter *name*, fetches it, and sums its bytes.
     let service = ComputeService::attach(&engine);
-    service.function_ref("/compute/sum", |name: String, ctx: ComputeContext| async move {
-        let pname: Name = name
-            .parse()
-            .map_err(|_| ComputeError::BadArguments("argument is not a name".into()))?;
-        let bytes = ctx.fetch(pname).await?;
-        Ok::<u64, ComputeError>(bytes.iter().map(|&b| b as u64).sum())
-    });
+    service.function_ref(
+        "/compute/sum",
+        |name: String, ctx: ComputeContext| async move {
+            let pname: Name = name
+                .parse()
+                .map_err(|_| ComputeError::BadArguments("argument is not a name".into()))?;
+            let bytes = ctx.fetch(pname).await?;
+            Ok::<u64, ComputeError>(bytes.iter().map(|&b| b as u64).sum())
+        },
+    );
 
     let mut client = ComputeClient::new(Consumer::from_handle(chandle));
     let sum: u64 = client
@@ -415,7 +431,9 @@ async fn reflexive_function_end_to_end() {
                 // Result D1.
                 let d1 = Data::decode(pkt).expect("decode D1");
                 let content = d1.content().expect("D1 content");
-                result = std::str::from_utf8(content).ok().and_then(|s| s.parse().ok());
+                result = std::str::from_utf8(content)
+                    .ok()
+                    .and_then(|s| s.parse().ok());
                 break;
             }
             _ => {}
@@ -452,9 +470,13 @@ async fn reflexive_authenticated_validates_and_computes() {
 
     let service = ComputeService::attach(&engine);
     let validator = Arc::new(Validator::new(TrustSchema::accept_all()));
-    service.function_reflexive_authenticated("/svc/auth", validator, |params: Bytes, _signer| async move {
-        Ok::<u64, ComputeError>(params.iter().map(|&b| b as u64).sum())
-    });
+    service.function_reflexive_authenticated(
+        "/svc/auth",
+        validator,
+        |params: Bytes, _signer| async move {
+            Ok::<u64, ComputeError>(params.iter().map(|&b| b as u64).sum())
+        },
+    );
 
     let i1 = InterestBuilder::new("/svc/auth/req-1")
         .reflexive_name(random_reflexive_name())
@@ -478,7 +500,9 @@ async fn reflexive_authenticated_validates_and_computes() {
             Some(&0x06) => {
                 let d1 = Data::decode(pkt).expect("decode D1");
                 let content = d1.content().expect("D1 content");
-                result = std::str::from_utf8(content).ok().and_then(|s| s.parse().ok());
+                result = std::str::from_utf8(content)
+                    .ok()
+                    .and_then(|s| s.parse().ok());
                 break;
             }
             _ => {}
@@ -509,9 +533,13 @@ async fn reflexive_authenticated_rejects_unsigned() {
 
     let service = ComputeService::attach(&engine);
     let validator = Arc::new(Validator::new(TrustSchema::accept_all()));
-    service.function_reflexive_authenticated("/svc/auth", validator, |params: Bytes, _signer| async move {
-        Ok::<u64, ComputeError>(params.iter().map(|&b| b as u64).sum())
-    });
+    service.function_reflexive_authenticated(
+        "/svc/auth",
+        validator,
+        |params: Bytes, _signer| async move {
+            Ok::<u64, ComputeError>(params.iter().map(|&b| b as u64).sum())
+        },
+    );
 
     let i1 = InterestBuilder::new("/svc/auth/req-2")
         .reflexive_name(random_reflexive_name())
@@ -540,7 +568,10 @@ async fn reflexive_authenticated_rejects_unsigned() {
             _ => {}
         }
     }
-    assert!(!got_result, "unsigned params must be rejected — no result computed");
+    assert!(
+        !got_result,
+        "unsigned params must be rejected — no result computed"
+    );
 
     drop(chandle);
     drop(engine);
@@ -585,7 +616,13 @@ async fn reflexive_sealed_end_to_end() {
                 let i2 = Interest::decode(pkt).expect("decode I2");
                 // The reverse Interest carries the node's ephemeral pubkey as its
                 // last component; seal the params to it.
-                let node_pub = i2.name.components().last().expect("pubkey component").value.clone();
+                let node_pub = i2
+                    .name
+                    .components()
+                    .last()
+                    .expect("pubkey component")
+                    .value
+                    .clone();
                 let blob = ndn_compute::seal(&node_pub, &[1u8, 2, 3, 4]).expect("seal");
                 // The sealed blob must not contain the plaintext bytes verbatim.
                 assert!(blob.windows(4).all(|w| w != [1u8, 2, 3, 4]));
@@ -595,14 +632,20 @@ async fn reflexive_sealed_end_to_end() {
             Some(&0x06) => {
                 let d1 = Data::decode(pkt).expect("decode D1");
                 let content = d1.content().expect("D1 content");
-                result = std::str::from_utf8(content).ok().and_then(|s| s.parse().ok());
+                result = std::str::from_utf8(content)
+                    .ok()
+                    .and_then(|s| s.parse().ok());
                 break;
             }
             _ => {}
         }
     }
 
-    assert_eq!(result, Some(10), "node must decrypt sealed params and compute the sum");
+    assert_eq!(
+        result,
+        Some(10),
+        "node must decrypt sealed params and compute the sum"
+    );
 
     drop(chandle);
     drop(engine);
@@ -629,9 +672,13 @@ async fn reflexive_secure_validates_decrypts_and_computes() {
 
     let service = ComputeService::attach(&engine);
     let validator = Arc::new(Validator::new(TrustSchema::accept_all()));
-    service.function_reflexive_secure("/svc/secure", validator, |params: Bytes, _signer| async move {
-        Ok::<u64, ComputeError>(params.iter().map(|&b| b as u64).sum())
-    });
+    service.function_reflexive_secure(
+        "/svc/secure",
+        validator,
+        |params: Bytes, _signer| async move {
+            Ok::<u64, ComputeError>(params.iter().map(|&b| b as u64).sum())
+        },
+    );
 
     let i1 = InterestBuilder::new("/svc/secure/req-1")
         .reflexive_name(random_reflexive_name())
@@ -657,13 +704,19 @@ async fn reflexive_secure_validates_decrypts_and_computes() {
             Some(&0x06) => {
                 let d1 = Data::decode(pkt).expect("decode D1");
                 let content = d1.content().expect("D1 content");
-                result = std::str::from_utf8(content).ok().and_then(|s| s.parse().ok());
+                result = std::str::from_utf8(content)
+                    .ok()
+                    .and_then(|s| s.parse().ok());
                 break;
             }
             _ => {}
         }
     }
-    assert_eq!(result, Some(10), "secure variant must validate, decrypt, and compute");
+    assert_eq!(
+        result,
+        Some(10),
+        "secure variant must validate, decrypt, and compute"
+    );
 
     drop(chandle);
     drop(engine);
@@ -689,9 +742,13 @@ async fn reflexive_secure_rejects_unsigned_sealed() {
 
     let service = ComputeService::attach(&engine);
     let validator = Arc::new(Validator::new(TrustSchema::accept_all()));
-    service.function_reflexive_secure("/svc/secure", validator, |params: Bytes, _signer| async move {
-        Ok::<u64, ComputeError>(params.iter().map(|&b| b as u64).sum())
-    });
+    service.function_reflexive_secure(
+        "/svc/secure",
+        validator,
+        |params: Bytes, _signer| async move {
+            Ok::<u64, ComputeError>(params.iter().map(|&b| b as u64).sum())
+        },
+    );
 
     let i1 = InterestBuilder::new("/svc/secure/req-2")
         .reflexive_name(random_reflexive_name())
@@ -722,7 +779,10 @@ async fn reflexive_secure_rejects_unsigned_sealed() {
             _ => {}
         }
     }
-    assert!(!got_result, "unsigned sealed params must be rejected by the auth gate");
+    assert!(
+        !got_result,
+        "unsigned sealed params must be rejected by the auth gate"
+    );
 
     drop(chandle);
     drop(engine);
@@ -759,15 +819,28 @@ async fn reflexive_multi_hop_traverses_intermediate_forwarder() {
             self.to_peer.send(pkt).await.map_err(|_| FaceError::Closed)
         }
         async fn recv_bytes(&self) -> Result<Bytes, FaceError> {
-            self.from_peer.lock().await.recv().await.ok_or(FaceError::Closed)
+            self.from_peer
+                .lock()
+                .await
+                .recv()
+                .await
+                .ok_or(FaceError::Closed)
         }
     }
     fn link_pair(id_a: FaceId, id_b: FaceId) -> (LinkEnd, LinkEnd) {
         let (a2b_tx, a2b_rx) = tokio::sync::mpsc::channel(256);
         let (b2a_tx, b2a_rx) = tokio::sync::mpsc::channel(256);
         (
-            LinkEnd { id: id_a, to_peer: a2b_tx, from_peer: tokio::sync::Mutex::new(b2a_rx) },
-            LinkEnd { id: id_b, to_peer: b2a_tx, from_peer: tokio::sync::Mutex::new(a2b_rx) },
+            LinkEnd {
+                id: id_a,
+                to_peer: a2b_tx,
+                from_peer: tokio::sync::Mutex::new(b2a_rx),
+            },
+            LinkEnd {
+                id: id_b,
+                to_peer: b2a_tx,
+                from_peer: tokio::sync::Mutex::new(a2b_rx),
+            },
         )
     }
 
@@ -821,7 +894,9 @@ async fn reflexive_multi_hop_traverses_intermediate_forwarder() {
             Some(&0x06) => {
                 let d1 = Data::decode(pkt).expect("decode D1");
                 let content = d1.content().expect("D1 content");
-                result = std::str::from_utf8(content).ok().and_then(|s| s.parse().ok());
+                result = std::str::from_utf8(content)
+                    .ok()
+                    .and_then(|s| s.parse().ok());
                 break;
             }
             _ => {}

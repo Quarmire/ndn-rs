@@ -31,23 +31,47 @@ pub struct LpmCase {
 
 /// Routes installed into the FIB under test before [`LPM_CASES`].
 pub const LPM_ROUTES: &[LpmRoute] = &[
-    LpmRoute { prefix: "/ndn", nexthop: 1 },
-    LpmRoute { prefix: "/ndn/edu", nexthop: 2 },
-    LpmRoute { prefix: "/ndn/edu/ucla", nexthop: 3 },
+    LpmRoute {
+        prefix: "/ndn",
+        nexthop: 1,
+    },
+    LpmRoute {
+        prefix: "/ndn/edu",
+        nexthop: 2,
+    },
+    LpmRoute {
+        prefix: "/ndn/edu/ucla",
+        nexthop: 3,
+    },
 ];
 
 /// Longest-prefix-match cases over [`LPM_ROUTES`].
 pub const LPM_CASES: &[LpmCase] = &[
     // Most specific wins.
-    LpmCase { name: "/ndn/edu/ucla/data", expect: Some(3) },
+    LpmCase {
+        name: "/ndn/edu/ucla/data",
+        expect: Some(3),
+    },
     // Falls back to the next-shorter prefix.
-    LpmCase { name: "/ndn/edu/mit", expect: Some(2) },
+    LpmCase {
+        name: "/ndn/edu/mit",
+        expect: Some(2),
+    },
     // Falls back to the shortest prefix.
-    LpmCase { name: "/ndn/other", expect: Some(1) },
+    LpmCase {
+        name: "/ndn/other",
+        expect: Some(1),
+    },
     // Exact match at the prefix's own length.
-    LpmCase { name: "/ndn", expect: Some(1) },
+    LpmCase {
+        name: "/ndn",
+        expect: Some(1),
+    },
     // No prefix matches → miss.
-    LpmCase { name: "/com/example", expect: None },
+    LpmCase {
+        name: "/com/example",
+        expect: None,
+    },
 ];
 
 /// A freshness vector. `now`/`stored`/`period` share one unit (ms).
@@ -122,9 +146,29 @@ pub const INTEREST_DECISION_CASES: &[InterestDecisionCase] = &[
 
 /// Relative-period freshness cases (see [`crate::freshness::fresh_for`]).
 pub const FRESH_FOR_CASES: &[FreshForCase] = &[
-    FreshForCase { now: 50, stored: 0, period: 100, fresh: true },
-    FreshForCase { now: 100, stored: 0, period: 100, fresh: false },
-    FreshForCase { now: 0, stored: 0, period: 0, fresh: false },
+    FreshForCase {
+        now: 50,
+        stored: 0,
+        period: 100,
+        fresh: true,
+    },
+    FreshForCase {
+        now: 100,
+        stored: 0,
+        period: 100,
+        fresh: false,
+    },
+    FreshForCase {
+        now: 0,
+        stored: 0,
+        period: 0,
+        fresh: false,
+    },
     // Survives a u32 clock wrap: true age 10ms < 100ms.
-    FreshForCase { now: 5, stored: u32::MAX - 4, period: 100, fresh: true },
+    FreshForCase {
+        now: 5,
+        stored: u32::MAX - 4,
+        period: 100,
+        fresh: true,
+    },
 ];

@@ -130,7 +130,7 @@ async fn engine_up_and_mgmt_created_both_publish_on_face_create() {
         ..Default::default()
     };
     let cr = dispatch(&env, b"create", &cp).await;
-    assert_eq!(cr.status_code, 200);
+    assert_eq!(cr.status_code, 200, "faces/create failed: {cr:?}");
 
     // Both kinds must appear within the first two segments — exact
     // ordering depends on async scheduling between the face-task's

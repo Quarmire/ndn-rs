@@ -915,7 +915,7 @@ mod tests {
     }
 
     #[test]
-    fn user_function_schema_parses_and_flags() {
+    fn c16_user_function_schema_parses_flags_and_never_matches() {
         let mut out = BytesMut::new();
         write_uint_tlv(&mut out, type_number::VERSION, LVS_VERSION);
         write_uint_tlv(&mut out, type_number::NODE_ID, 0);
@@ -952,6 +952,7 @@ mod tests {
             let mut node = BytesMut::new();
             write_uint_tlv(&mut node, type_number::NODE_ID, 1);
             write_uint_tlv(&mut node, type_number::PARENT_ID, 0);
+            write_uint_tlv(&mut node, type_number::KEY_NODE_ID, 1);
             write_tlv(&mut out, type_number::NODE, &node);
         }
 
@@ -960,6 +961,9 @@ mod tests {
             model.uses_user_functions(),
             "user-fn schema must flag uses_user_functions"
         );
-        assert!(!model.check(&name(&["123"]), &name(&["123"])));
+        assert!(
+            !model.check(&name(&["123"]), &name(&["123"])),
+            "unsupported user functions must fail closed rather than matching as true"
+        );
     }
 }

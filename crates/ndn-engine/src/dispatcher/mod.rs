@@ -103,8 +103,7 @@ impl PacketDispatcher {
                 if !dispatcher.face_states.contains_key(&face_id) {
                     let (send_tx, send_rx) = mpsc::channel(DEFAULT_SEND_QUEUE_CAP);
                     let persistency = FacePersistency::Permanent;
-                    let congestion_policy =
-                        CongestionPolicy::default_for_scope(face.scope());
+                    let congestion_policy = CongestionPolicy::default_for_scope(face.scope());
                     // NDN-LP reliability (TxSequence / Ack, types 0x0344 /
                     // 0x0348) is an optional NDNLPv2 extension that ndnd
                     // rejects outright. Default OFF on all faces to preserve

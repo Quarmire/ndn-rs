@@ -232,7 +232,12 @@ mod tests {
 
     fn big_tlv(payload_len: usize) -> Bytes {
         // 0x06 (Data), 3-byte length form, then payload.
-        let mut pkt = vec![0x06, 253, (payload_len >> 8) as u8, (payload_len & 0xff) as u8];
+        let mut pkt = vec![
+            0x06,
+            253,
+            (payload_len >> 8) as u8,
+            (payload_len & 0xff) as u8,
+        ];
         pkt.extend((0..payload_len).map(|i| (i % 251) as u8));
         Bytes::from(pkt)
     }

@@ -311,20 +311,22 @@ impl TlvDecodeStage {
         if let Some(ref pl) = lp.al_prev_hop_loc
             && let Some(g) = ndn_packet::lp::GeoFix::decode_value(pl)
         {
-            ctx.tags.insert(ndn_strategy::PrevHopLocation(ndn_strategy::GeoPos {
-                lat_e7: g.lat_e7,
-                lon_e7: g.lon_e7,
-                alt_cm: g.alt_cm,
-            }));
+            ctx.tags
+                .insert(ndn_strategy::PrevHopLocation(ndn_strategy::GeoPos {
+                    lat_e7: g.lat_e7,
+                    lon_e7: g.lon_e7,
+                    alt_cm: g.alt_cm,
+                }));
         }
         if let Some(ref dl) = lp.al_data_loc
             && let Some(g) = ndn_packet::lp::GeoFix::decode_value(dl)
         {
-            ctx.tags.insert(ndn_strategy::DataLocation(ndn_strategy::GeoPos {
-                lat_e7: g.lat_e7,
-                lon_e7: g.lon_e7,
-                alt_cm: g.alt_cm,
-            }));
+            ctx.tags
+                .insert(ndn_strategy::DataLocation(ndn_strategy::GeoPos {
+                    lat_e7: g.lat_e7,
+                    lon_e7: g.lon_e7,
+                    alt_cm: g.alt_cm,
+                }));
         }
 
         if lp.is_ack_only() {
@@ -369,11 +371,12 @@ impl TlvDecodeStage {
             }
         }
 
-        if let Some(reason) = nack {
+        if let Some(header) = nack {
             match Interest::decode(fragment) {
                 Ok(interest) => {
+                    let reason = header.reason;
                     trace!(target: t::FWD_PIPELINE, face=%ctx.face_id, name=%interest.name, reason=?reason, "decode: Nack");
-                    let nack = Nack::new(interest, reason);
+                    let nack = Nack::new_with_reason(interest, reason);
                     if nack.interest.name.len() > 3 {
                         ctx.name_hashes = Some(NameHashes::compute(&nack.interest.name));
                     }
@@ -747,7 +750,7 @@ mod reassembly_endpoint_tests {
     /// endpoint ids — the per-sender keying the dispatcher now supplies from
     /// the link-layer source. Pre-fix, both used endpoint id 0 and aliased.
     #[test]
-    fn distinct_endpoints_isolate_overlapping_sequences() {
+    fn n02_distinct_endpoints_isolate_overlapping_sequences() {
         let s = stage();
         let face = FaceId(7);
         let a = DataBuilder::new("/peer/a", &vec![0xAA; 300]).sign_digest_sha256();
@@ -780,7 +783,7 @@ mod reassembly_endpoint_tests {
     /// decoded `PacketContext`. Same outcome the dispatcher reaches via
     /// `try_collect_fragment` + `decode_resolved`.
     #[test]
-    fn decode_inbound_reassembles_then_decodes() {
+    fn n02_decode_inbound_reassembles_then_decodes() {
         let s = stage();
         let face = FaceId(9);
         let data = DataBuilder::new("/peer/c", &vec![0xCC; 300]).sign_digest_sha256();
@@ -801,6 +804,56 @@ mod reassembly_endpoint_tests {
         match ctx.packet {
             DecodedPacket::Data(d) => assert_eq!(d.name.to_string(), "/peer/c"),
             _ => panic!("expected reassembled Data"),
+        }
+    }
+
+    #[test]
+    fn n02_inbound_meta_endpoint_ids_isolate_overlapping_sequences() {
+        use ndn_discovery_core::InboundMeta;
+
+        let s = stage();
+        let face = FaceId(11);
+        let data_a = DataBuilder::new("/peer/udp-a", &vec![0xA1; 300]).sign_digest_sha256();
+        let data_b = DataBuilder::new("/peer/udp-b", &vec![0xB2; 300]).sign_digest_sha256();
+        let frags_a = fragment_packet(&data_a, 100, 0);
+        let frags_b = fragment_packet(&data_b, 100, 0);
+        assert!(
+            frags_a.len() > 1 && frags_b.len() > 1,
+            "fixtures must be multi-fragment"
+        );
+
+        let endpoint_a = InboundMeta::udp("192.0.2.11:6363".parse().unwrap()).endpoint_id();
+        let endpoint_b = InboundMeta::udp("192.0.2.12:6363".parse().unwrap()).endpoint_id();
+        assert_ne!(endpoint_a, 0);
+        assert_ne!(endpoint_b, 0);
+        assert_ne!(endpoint_a, endpoint_b);
+
+        let mut got_a = None;
+        let mut got_b = None;
+        for i in 0..frags_a.len().max(frags_b.len()) {
+            if let Some(frag) = frags_a.get(i) {
+                match s.decode_inbound(frag.clone(), face, 0, endpoint_a) {
+                    Action::Continue(ctx) => got_a = Some(ctx),
+                    Action::Drop(DropReason::FragmentCollect) => {}
+                    _ => panic!("unexpected decode action for peer A"),
+                }
+            }
+            if let Some(frag) = frags_b.get(i) {
+                match s.decode_inbound(frag.clone(), face, 0, endpoint_b) {
+                    Action::Continue(ctx) => got_b = Some(ctx),
+                    Action::Drop(DropReason::FragmentCollect) => {}
+                    _ => panic!("unexpected decode action for peer B"),
+                }
+            }
+        }
+
+        match got_a.expect("peer A reassembles").packet {
+            DecodedPacket::Data(d) => assert_eq!(d.name.to_string(), "/peer/udp-a"),
+            _ => panic!("expected peer A Data"),
+        }
+        match got_b.expect("peer B reassembles").packet {
+            DecodedPacket::Data(d) => assert_eq!(d.name.to_string(), "/peer/udp-b"),
+            _ => panic!("expected peer B Data"),
         }
     }
 }

@@ -13,6 +13,18 @@ use crate::observability::targets as t;
 
 use super::{FaceRunnerCtx, InboundPacket};
 
+pub(crate) fn inbound_meta_from_face_addr(
+    src_addr: Option<FaceAddr>,
+) -> ndn_discovery_core::InboundMeta {
+    match src_addr {
+        Some(FaceAddr::Udp(addr)) => ndn_discovery_core::InboundMeta::udp(addr),
+        Some(FaceAddr::Ether(mac)) => {
+            ndn_discovery_core::InboundMeta::ether(ndn_discovery_core::MacAddr::new(mac))
+        }
+        None => ndn_discovery_core::InboundMeta::none(),
+    }
+}
+
 pub(crate) async fn run_face_reader(
     face: Arc<ndn_transport::Face>,
     tx: mpsc::Sender<InboundPacket>,
@@ -84,13 +96,7 @@ pub(crate) async fn run_face_reader(
                     trace!(target: t::FACE_LP, face=%face_id, "face-reader: LP-mode detected, enabling LP encode for outgoing");
                 }
 
-                let meta = match src_addr {
-                    Some(FaceAddr::Udp(addr)) => ndn_discovery_core::InboundMeta::udp(addr),
-                    Some(FaceAddr::Ether(mac)) => ndn_discovery_core::InboundMeta::ether(
-                        ndn_discovery_core::MacAddr::new(mac),
-                    ),
-                    None => ndn_discovery_core::InboundMeta::none(),
-                };
+                let meta = inbound_meta_from_face_addr(src_addr);
 
                 match tx.try_send(InboundPacket {
                     raw,
@@ -149,5 +155,58 @@ pub(crate) async fn run_face_reader(
                 debug!(target: t::FACE_SYSTEM, face=%face_id, "on-demand face removed from table (FIB routes cleaned)");
             }
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::SocketAddr;
+
+    #[test]
+    fn n02_face_addr_meta_yields_stable_nonzero_udp_endpoint_ids() {
+        let a: SocketAddr = "192.0.2.1:6363".parse().unwrap();
+        let b: SocketAddr = "192.0.2.2:6363".parse().unwrap();
+
+        let endpoint_a = inbound_meta_from_face_addr(Some(FaceAddr::Udp(a))).endpoint_id();
+        let endpoint_b = inbound_meta_from_face_addr(Some(FaceAddr::Udp(b))).endpoint_id();
+
+        assert_ne!(endpoint_a, 0, "UDP source must not alias unicast stream");
+        assert_ne!(endpoint_b, 0, "UDP source must not alias unicast stream");
+        assert_ne!(
+            endpoint_a, endpoint_b,
+            "distinct UDP senders on one shared face need distinct reassembly keys"
+        );
+        assert_eq!(
+            endpoint_a,
+            inbound_meta_from_face_addr(Some(FaceAddr::Udp(a))).endpoint_id(),
+            "same UDP sender must map to a stable endpoint id"
+        );
+    }
+
+    #[test]
+    fn n02_face_addr_meta_yields_stable_nonzero_ether_endpoint_ids() {
+        let a = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+        let b = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
+
+        let endpoint_a = inbound_meta_from_face_addr(Some(FaceAddr::Ether(a))).endpoint_id();
+        let endpoint_b = inbound_meta_from_face_addr(Some(FaceAddr::Ether(b))).endpoint_id();
+
+        assert_ne!(endpoint_a, 0, "Ether source must not alias unicast stream");
+        assert_ne!(endpoint_b, 0, "Ether source must not alias unicast stream");
+        assert_ne!(
+            endpoint_a, endpoint_b,
+            "distinct MAC senders on one shared face need distinct reassembly keys"
+        );
+        assert_eq!(
+            endpoint_a,
+            inbound_meta_from_face_addr(Some(FaceAddr::Ether(a))).endpoint_id(),
+            "same MAC sender must map to a stable endpoint id"
+        );
+    }
+
+    #[test]
+    fn n02_absent_face_addr_uses_unicast_endpoint_zero() {
+        assert_eq!(inbound_meta_from_face_addr(None).endpoint_id(), 0);
     }
 }

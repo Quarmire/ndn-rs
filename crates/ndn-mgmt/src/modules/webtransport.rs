@@ -19,9 +19,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use ndn_config::{
-    ControlParameters, ControlResponse,
-    control_response::status,
-    nfd_command::module,
+    ControlParameters, ControlResponse, control_response::status, nfd_command::module,
 };
 
 use crate::module::{MgmtContext, MgmtModule};
@@ -76,7 +74,10 @@ fn cert_status_dataset(rows: &[WtCertStatusInfo]) -> bytes::Bytes {
             inner.write_tlv(TYPE_WT_LISTEN, info.listen.as_bytes());
             // notAfter is always in the future-or-past but a positive epoch
             // second; clamp a (theoretically impossible) negative to 0.
-            inner.write_tlv(TYPE_WT_NOT_AFTER, &nni_be(info.not_after_unix.max(0) as u64));
+            inner.write_tlv(
+                TYPE_WT_NOT_AFTER,
+                &nni_be(info.not_after_unix.max(0) as u64),
+            );
             inner.write_tlv(TYPE_WT_NEEDS_RENEWAL, &[u8::from(info.needs_renewal)]);
         });
     }

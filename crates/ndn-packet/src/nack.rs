@@ -45,14 +45,34 @@ impl NackReason {
     }
 }
 
+/// NDNLPv2 Nack header. `NackReason` is optional in the wire format;
+/// absence means the upstream did not state why it rejected the Interest.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct NackHeader {
+    pub reason: Option<NackReason>,
+}
+
+impl NackHeader {
+    pub fn new(reason: Option<NackReason>) -> Self {
+        Self { reason }
+    }
+}
+
 #[derive(Debug)]
 pub struct Nack {
-    pub reason: NackReason,
+    pub reason: Option<NackReason>,
     pub interest: Interest,
 }
 
 impl Nack {
     pub fn new(interest: Interest, reason: NackReason) -> Self {
+        Self {
+            reason: Some(reason),
+            interest,
+        }
+    }
+
+    pub fn new_with_reason(interest: Interest, reason: Option<NackReason>) -> Self {
         Self { reason, interest }
     }
 
@@ -69,14 +89,17 @@ impl Nack {
         }
 
         let lp = crate::lp::LpPacket::decode(raw)?;
-        let reason = lp
+        let header = lp
             .nack
             .ok_or_else(|| PacketError::MalformedPacket("LpPacket has no Nack header".into()))?;
         let fragment = lp
             .fragment
             .ok_or_else(|| PacketError::MalformedPacket("Nack LpPacket has no fragment".into()))?;
         let interest = Interest::decode(fragment)?;
-        Ok(Self { reason, interest })
+        Ok(Self {
+            reason: header.reason,
+            interest,
+        })
     }
 }
 
@@ -124,7 +147,7 @@ mod tests {
         let name = Name::from_components([NameComponent::generic(Bytes::from_static(b"test"))]);
         let interest = Interest::new(name.clone());
         let nack = Nack::new(interest, NackReason::NoRoute);
-        assert_eq!(nack.reason, NackReason::NoRoute);
+        assert_eq!(nack.reason, Some(NackReason::NoRoute));
         assert_eq!(*nack.interest.name, name);
     }
 
@@ -132,7 +155,7 @@ mod tests {
     fn decode_nack_reason_and_name() {
         let raw = make_nack_lp(NackReason::NoRoute, &[b"edu", b"ucla"]);
         let nack = Nack::decode(raw).unwrap();
-        assert_eq!(nack.reason, NackReason::NoRoute);
+        assert_eq!(nack.reason, Some(NackReason::NoRoute));
         assert_eq!(nack.interest.name.len(), 2);
         assert_eq!(nack.interest.name.components()[0].value.as_ref(), b"edu");
     }
@@ -141,7 +164,22 @@ mod tests {
     fn decode_nack_congestion() {
         let raw = make_nack_lp(NackReason::Congestion, &[b"test"]);
         let nack = Nack::decode(raw).unwrap();
-        assert_eq!(nack.reason, NackReason::Congestion);
+        assert_eq!(nack.reason, Some(NackReason::Congestion));
+    }
+
+    #[test]
+    fn n05_decode_nack_without_reason_as_none() {
+        let name = Name::from_components([NameComponent::generic(Bytes::from_static(b"n05"))]);
+        let interest_wire = encode_interest(&name, None);
+        let mut w = TlvWriter::new();
+        w.write_nested(tlv_type::LP_PACKET, |w| {
+            w.write_nested(tlv_type::NACK, |_w| {});
+            w.write_tlv(tlv_type::LP_FRAGMENT, &interest_wire);
+        });
+
+        let nack = Nack::decode(w.finish()).unwrap();
+        assert_eq!(nack.reason, None);
+        assert_eq!(*nack.interest.name, name);
     }
 
     #[test]
@@ -185,7 +223,7 @@ mod tests {
 
         let raw = make_nack_lp(NackReason::NoRoute, &[b"ndn", b"test"]);
         let nack = Nack::decode(raw).unwrap();
-        assert_eq!(nack.reason, NackReason::NoRoute);
+        assert_eq!(nack.reason, Some(NackReason::NoRoute));
         assert_eq!(nack.interest.name.len(), 2);
     }
 }

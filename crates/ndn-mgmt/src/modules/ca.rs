@@ -19,7 +19,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use ndn_config::{
-    ControlParameters, ControlResponse, control_response::status,
+    ControlParameters, ControlResponse,
+    control_response::status,
     nfd_command::{module, verb},
 };
 
@@ -62,7 +63,10 @@ fn handle_ca(
 /// The signed-command gate authenticates the operator; the recorded
 /// approver label is the conventional `"approved-via-mgmt"` until
 /// the v2 canonical signed-Data approval path lands.
-fn approve_handler(params: ControlParameters, handler: &dyn ApprovalMgmtBackend) -> ControlResponse {
+fn approve_handler(
+    params: ControlParameters,
+    handler: &dyn ApprovalMgmtBackend,
+) -> ControlResponse {
     let Some(id) = params.uri.as_deref() else {
         return ControlResponse::error(status::BAD_PARAMS, "request id required in `uri`");
     };
@@ -261,7 +265,11 @@ mod ca_tests {
     #[test]
     fn approve_requires_request_id() {
         let h = backend(vec![info("req-1", "/lab/alice", "")]);
-        match handle_ca(verb::APPROVE, ControlParameters::default(), Some(&as_dyn(&h))) {
+        match handle_ca(
+            verb::APPROVE,
+            ControlParameters::default(),
+            Some(&as_dyn(&h)),
+        ) {
             MgmtResponse::Control(cr) => assert_eq!(cr.status_code, status::BAD_PARAMS),
             _ => panic!("expected ControlResponse"),
         }

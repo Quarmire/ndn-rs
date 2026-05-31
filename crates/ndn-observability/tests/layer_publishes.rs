@@ -8,9 +8,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use ndn_observability::{
-    NdnObservabilityLayer, SpanPublisher, SpanRetention, ratio_sampler,
-};
+use ndn_observability::{NdnObservabilityLayer, SpanPublisher, SpanRetention, ratio_sampler};
 use ndn_packet::{Data, Name, NameComponent};
 use tracing_subscriber::layer::SubscriberExt;
 
@@ -35,7 +33,10 @@ fn span_close_publishes_otlp_data() {
     }
     // Drop closes the span and triggers on_close → publish.
 
-    assert!(!publisher.is_empty(), "expected at least one published span");
+    assert!(
+        !publisher.is_empty(),
+        "expected at least one published span"
+    );
     let wire = publisher.latest_wire().expect("latest");
     // Decode as Data; Content is the OTLP Span protobuf.
     let data = Data::decode(wire).expect("Data decode");

@@ -203,7 +203,6 @@ mod tests {
             Box::pin(async move { Some(data) })
         });
 
-
         let fetcher = CertFetcher::new(Arc::clone(&cache), fetch_fn, Duration::from_secs(1));
         let cert = fetcher.fetch(&cert_name).await.unwrap();
         assert_eq!(cert.public_key.as_ref(), &[2; 32]);

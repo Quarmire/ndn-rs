@@ -152,7 +152,7 @@ mod tests {
     }
 
     #[test]
-    fn insert_and_lookup_within_lifetime() {
+    fn n06_insert_and_lookup_within_lifetime() {
         let dnl = DeadNonceList::with_lifetime(Duration::from_millis(100));
         let key = fp(0xDEAD_BEEF, 42);
         let now = 1_000_000_000u64;
@@ -163,14 +163,14 @@ mod tests {
     }
 
     #[test]
-    fn lookup_absent_entry() {
+    fn n06_lookup_absent_entry() {
         let dnl = DeadNonceList::new();
         assert!(!dnl.contains(fp(1, 1), 0));
         assert!(!dnl.contains(fp(1, 1), u64::MAX));
     }
 
     #[test]
-    fn reinsert_bumps_expiry() {
+    fn n06_reinsert_bumps_expiry() {
         let dnl = DeadNonceList::with_lifetime(Duration::from_millis(50));
         let key = fp(0xAA, 7);
         let t0 = 0u64;
@@ -182,7 +182,7 @@ mod tests {
     }
 
     #[test]
-    fn purge_expired_drops_stale_only() {
+    fn n06_purge_expired_drops_stale_only() {
         let dnl = DeadNonceList::with_lifetime(Duration::from_millis(10));
         let now = 1_000_000_000u64;
         dnl.insert(fp(1, 1), now);
@@ -197,7 +197,7 @@ mod tests {
     }
 
     #[test]
-    fn distinct_nonces_under_same_name_hash() {
+    fn n06_distinct_nonces_under_same_name_hash() {
         let dnl = DeadNonceList::new();
         let now = 1_000_000_000u64;
         dnl.insert(fp(0xCAFE, 100), now);
@@ -208,7 +208,7 @@ mod tests {
     }
 
     #[test]
-    fn default_lifetime_matches_nfd() {
+    fn n06_default_lifetime_matches_nfd() {
         let dnl = DeadNonceList::default();
         assert_eq!(
             dnl.lifetime_ns(),

@@ -232,7 +232,8 @@ async fn endpoint_fetcher_recovers_via_parity() {
     let plan = segment_payload(&payload, &policy, 1).expect("segment_payload");
     let table: Arc<HashMap<u16, Bytes>> =
         Arc::new(plan.into_iter().map(|s| (s.index, s.content)).collect());
-    let withheld: Arc<std::collections::HashSet<u16>> = Arc::new([1u16, 4, 6].into_iter().collect());
+    let withheld: Arc<std::collections::HashSet<u16>> =
+        Arc::new([1u16, 4, 6].into_iter().collect());
     let producer = Producer::from_handle(producer_handle, object.clone());
     let serve_object = object.clone();
     let producer_task = tokio::spawn(async move {

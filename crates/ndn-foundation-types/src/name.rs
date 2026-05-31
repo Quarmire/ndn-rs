@@ -308,8 +308,7 @@ fn parse_component(part: &str) -> Result<NameComponent, NameError> {
         let typ: u64 = typ_str
             .parse()
             .map_err(|_| NameError("invalid typed-component TLV-TYPE"))?;
-        let decoded =
-            percent_decode(val_str).map_err(|_| NameError("invalid percent-encoding"))?;
+        let decoded = percent_decode(val_str).map_err(|_| NameError("invalid percent-encoding"))?;
         return Ok(NameComponent::new(typ, Bytes::from(decoded)));
     }
     let decoded = percent_decode(part).map_err(|_| NameError("invalid percent-encoding"))?;
@@ -423,15 +422,17 @@ impl core::fmt::Display for Name {
                     percent_encode_component(f, &c.value)?;
                 }
                 tlv_type::SEGMENT => write!(f, "seg={}", decode_nonnegative_integer(&c.value))?,
-                tlv_type::BYTE_OFFSET => {
-                    write!(f, "off={}", decode_nonnegative_integer(&c.value))?
-                }
+                tlv_type::BYTE_OFFSET => write!(f, "off={}", decode_nonnegative_integer(&c.value))?,
                 tlv_type::VERSION => write!(f, "v={}", decode_nonnegative_integer(&c.value))?,
                 tlv_type::TIMESTAMP => write!(f, "t={}", decode_nonnegative_integer(&c.value))?,
                 tlv_type::SEQUENCE_NUM => {
                     write!(f, "seq={}", decode_nonnegative_integer(&c.value))?
                 }
-                _ => percent_encode_component(f, &c.value)?,
+                tlv_type::GENERIC_NAME_COMPONENT => percent_encode_component(f, &c.value)?,
+                _ => {
+                    write!(f, "{}=", c.typ)?;
+                    percent_encode_component(f, &c.value)?;
+                }
             }
         }
         Ok(())

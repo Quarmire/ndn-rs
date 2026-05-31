@@ -1,13 +1,15 @@
 mod chain;
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
 
 use dashmap::DashMap;
 use ndn_packet::{Data, Interest, Name};
 
 use crate::cert_cache::Certificate;
 use crate::cert_fetcher::CertFetcher;
+use crate::keyring::Keyring;
+use crate::trust_context::TrustContext;
 use crate::trust_schema::SchemaRule;
 use crate::verifier::verify_by_sig_type;
 use crate::{CertCache, SafeData, TrustError, TrustSchema, VerifyOutcome};
@@ -80,18 +82,23 @@ pub enum InterestValidationOutcome {
     Pending,
 }
 
-/// Validates Data packets against a trust schema and certificate chain.
+/// Validates Data packets against a [`Keyring`] of trust contexts and a
+/// certificate chain.
 ///
-/// The active [`TrustSchema`] is stored in an `Arc<RwLock<TrustSchema>>` so
-/// it can be replaced at runtime without rebuilding the validator. The
-/// default policy is deny: validation fails unless schema, signature, and
-/// chain all check out.
+/// Each packet is dispatched to the [`TrustContext`] selected by its name's
+/// namespace (longest-prefix match); the packet is validated against *that*
+/// context's schema and anchors only — never "any anchor I hold." The default
+/// policy is deny: validation fails unless the selected context authorizes the
+/// pair and the signature and chain all check out.
+///
+/// The flat-anchor / single-schema API ([`new`](Self::new),
+/// [`with_chain`](Self::with_chain), [`add_trust_anchor`](Self::add_trust_anchor),
+/// [`set_schema`](Self::set_schema)) targets the keyring's ambient context, so
+/// existing single-anchor callers keep working unchanged.
 pub struct Validator {
-    pub(super) schema: Arc<RwLock<TrustSchema>>,
+    pub(super) keyring: Arc<Keyring>,
     pub(super) cert_cache: Arc<CertCache>,
     pub(super) max_chain: usize,
-    /// Implicitly trusted certificates that terminate a chain walk.
-    pub(super) trust_anchors: Arc<DashMap<Arc<Name>, Certificate>>,
     pub(super) cert_fetcher: Option<Arc<CertFetcher>>,
     /// Monotonic counters bumped on terminal `Valid` / `Invalid` results;
     /// `Pending` is not counted (re-validation bumps when the cert lands).
@@ -100,13 +107,14 @@ pub struct Validator {
 }
 
 impl Validator {
-    /// Create a validator with a private cert cache (no chain walking).
+    /// Create a validator with a private cert cache (no chain walking). The
+    /// `schema` backs the ambient context.
     pub fn new(schema: TrustSchema) -> Self {
+        let ambient = Arc::new(TrustContext::ambient(schema, Arc::new(DashMap::new())));
         Self {
-            schema: Arc::new(RwLock::new(schema)),
+            keyring: Arc::new(Keyring::with_ambient(ambient)),
             cert_cache: Arc::new(CertCache::new()),
             max_chain: 5,
-            trust_anchors: Arc::new(DashMap::new()),
             cert_fetcher: None,
             verified_total: AtomicU64::new(0),
             rejected_total: AtomicU64::new(0),
@@ -114,6 +122,9 @@ impl Validator {
     }
 
     /// Create a validator wired to shared infrastructure for chain walking.
+    /// `schema` and `trust_anchors` back the ambient context; the
+    /// `trust_anchors` handle is shared as-is so anchors inserted elsewhere
+    /// (e.g. by a CA) stay visible.
     pub fn with_chain(
         schema: TrustSchema,
         cert_cache: Arc<CertCache>,
@@ -121,15 +132,46 @@ impl Validator {
         cert_fetcher: Option<Arc<CertFetcher>>,
         max_chain: usize,
     ) -> Self {
+        let ambient = Arc::new(TrustContext::ambient(schema, trust_anchors));
         Self {
-            schema: Arc::new(RwLock::new(schema)),
+            keyring: Arc::new(Keyring::with_ambient(ambient)),
             cert_cache,
             max_chain,
-            trust_anchors,
             cert_fetcher,
             verified_total: AtomicU64::new(0),
             rejected_total: AtomicU64::new(0),
         }
+    }
+
+    /// Build a validator over an existing [`Keyring`]. Use this to seed a
+    /// validator that already holds named contexts (the onboarding path).
+    pub fn with_keyring(
+        keyring: Arc<Keyring>,
+        cert_cache: Arc<CertCache>,
+        cert_fetcher: Option<Arc<CertFetcher>>,
+        max_chain: usize,
+    ) -> Self {
+        Self {
+            keyring,
+            cert_cache,
+            max_chain,
+            cert_fetcher,
+            verified_total: AtomicU64::new(0),
+            rejected_total: AtomicU64::new(0),
+        }
+    }
+
+    /// The keyring this validator dispatches against.
+    pub fn keyring(&self) -> &Arc<Keyring> {
+        &self.keyring
+    }
+
+    /// Adopt a named [`TrustContext`] into the keyring. Data under its
+    /// namespace is thereafter validated against its schema and anchors.
+    /// Returns `false` if refused by the keyring's anti-rollback rule (a
+    /// strictly older version than one already held).
+    pub fn adopt_context(&self, ctx: Arc<TrustContext>) -> bool {
+        self.keyring.adopt(ctx)
     }
 
     /// Snapshot `(verified_total, rejected_total)` since construction.
@@ -152,50 +194,57 @@ impl Validator {
         &self.cert_cache
     }
 
-    pub fn add_trust_anchor(&self, cert: Certificate) {
+    /// Add an anchor to the ambient context (the flat-anchor compatibility
+    /// path). Anchors for a *named* namespace belong on that context — see
+    /// [`adopt_context`](Self::adopt_context) / [`TrustContext::add_anchor`].
+    pub fn add_trust_anchor(&self, cert: Certificate) -> bool {
+        if !cert.is_valid_now() {
+            return false;
+        }
         self.cert_cache.insert(cert.clone());
-        self.trust_anchors.insert(Arc::clone(&cert.name), cert);
+        self.keyring.ambient().add_anchor(cert)
     }
 
+    /// Whether `name` is an anchor in any held context (ambient included).
     pub fn is_trust_anchor(&self, name: &Name) -> bool {
-        self.trust_anchors.iter().any(|r| r.key().as_ref() == name)
+        self.keyring.is_anchor(name)
     }
 
-    /// Replace the active trust schema; takes effect on the next validation.
+    /// Replace the ambient context's schema; takes effect on the next
+    /// validation. Named contexts are unaffected.
     pub fn set_schema(&self, schema: TrustSchema) {
-        *self.schema.write().expect("schema RwLock poisoned") = schema;
+        self.keyring.ambient().set_schema(schema);
     }
 
     pub fn add_schema_rule(&self, rule: SchemaRule) {
-        self.schema
-            .write()
-            .expect("schema RwLock poisoned")
-            .add_rule(rule);
+        self.keyring.ambient().with_schema_mut(|s| s.add_rule(rule));
     }
 
-    /// Remove the rule at `index`; returns `None` if out of bounds.
+    /// Remove the rule at `index` from the ambient schema; `None` if out of bounds.
     pub fn remove_schema_rule(&self, index: usize) -> Option<SchemaRule> {
-        let mut guard = self.schema.write().expect("schema RwLock poisoned");
-        if index < guard.rules().len() {
-            Some(guard.remove_rule(index))
-        } else {
-            None
-        }
+        self.keyring.ambient().with_schema_mut(|s| {
+            if index < s.rules().len() {
+                Some(s.remove_rule(index))
+            } else {
+                None
+            }
+        })
     }
 
-    /// Snapshot the current schema rules as `(data_pattern, key_pattern)` text pairs.
+    /// Snapshot the ambient schema's rules as `(data_pattern, key_pattern)` text pairs.
     pub fn schema_rules_text(&self) -> Vec<(String, String)> {
-        self.schema
-            .read()
-            .expect("schema RwLock poisoned")
+        self.keyring
+            .ambient()
+            .schema_snapshot()
             .rules()
             .iter()
             .map(|r| (r.data_pattern.to_string(), r.key_pattern.to_string()))
             .collect()
     }
 
+    /// Snapshot the ambient context's schema.
     pub fn schema_snapshot(&self) -> TrustSchema {
-        self.schema.read().expect("schema RwLock poisoned").clone()
+        self.keyring.ambient().schema_snapshot()
     }
 
     /// Validate a Data packet (single-hop; returns `Pending` if the cert is
@@ -255,10 +304,9 @@ impl Validator {
         };
 
         if !self
-            .schema
-            .read()
-            .expect("schema RwLock poisoned")
-            .allows(&data.name, &key_name)
+            .keyring
+            .context_for(&data.name)
+            .authorizes(&data.name, &key_name)
         {
             return ValidationResult::Invalid(TrustError::SchemaMismatch);
         }
@@ -336,10 +384,9 @@ impl Validator {
         };
 
         if !self
-            .schema
-            .read()
-            .expect("schema RwLock poisoned")
-            .allows(&interest.name, &key_name)
+            .keyring
+            .context_for(&interest.name)
+            .authorizes(&interest.name, &key_name)
         {
             return InterestValidationOutcome::Invalid(TrustError::SchemaMismatch);
         }
@@ -594,6 +641,56 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn n14_add_trust_anchor_rejects_invalid_validity_window() {
+        let valid_key = name1("valid-anchor");
+        let expired_key = name1("expired-anchor");
+        let future_key = name1("future-anchor");
+        let validator = Validator::new(open_schema("data", "key"));
+
+        let valid = Certificate {
+            name: Arc::new(valid_key.clone()),
+            public_key: Bytes::from_static(&[1u8; 32]),
+            valid_from: 0,
+            valid_until: u64::MAX,
+            issuer: None,
+            signed_region: None,
+            sig_value: None,
+            sig_type: ndn_packet::SignatureType::SignatureEd25519,
+        };
+        assert!(validator.add_trust_anchor(valid));
+        assert!(validator.is_trust_anchor(&valid_key));
+        assert!(validator.cert_cache().get(&Arc::new(valid_key)).is_some());
+
+        let expired = Certificate {
+            name: Arc::new(expired_key.clone()),
+            public_key: Bytes::from_static(&[2u8; 32]),
+            valid_from: 0,
+            valid_until: 1,
+            issuer: None,
+            signed_region: None,
+            sig_value: None,
+            sig_type: ndn_packet::SignatureType::SignatureEd25519,
+        };
+        assert!(!validator.add_trust_anchor(expired));
+        assert!(!validator.is_trust_anchor(&expired_key));
+        assert!(validator.cert_cache().get(&Arc::new(expired_key)).is_none());
+
+        let future = Certificate {
+            name: Arc::new(future_key.clone()),
+            public_key: Bytes::from_static(&[3u8; 32]),
+            valid_from: u64::MAX - 1,
+            valid_until: u64::MAX,
+            issuer: None,
+            signed_region: None,
+            sig_value: None,
+            sig_type: ndn_packet::SignatureType::SignatureEd25519,
+        };
+        assert!(!validator.add_trust_anchor(future));
+        assert!(!validator.is_trust_anchor(&future_key));
+        assert!(validator.cert_cache().get(&Arc::new(future_key)).is_none());
+    }
+
     /// Build a Data wire signed by `signer` with an explicit
     /// `SignatureType` code in the SignatureInfo.
     async fn make_signed_data_with_sig_type(
@@ -658,7 +755,7 @@ mod tests {
 
     /// HMAC-SHA-256 dispatches via `verify_by_sig_type`.
     #[tokio::test]
-    async fn hmac_signed_data_validates_through_dispatch() {
+    async fn c02_hmac_signed_data_validates_through_dispatch() {
         let key_bytes = [0x42u8; 32];
         let key_name = name1("hmac-key");
         let signer = crate::signer::HmacSha256Signer::new(&key_bytes, key_name.clone());
@@ -686,7 +783,7 @@ mod tests {
 
     /// DigestSha256 reachable from `Validator::validate` (non-chain path).
     #[tokio::test]
-    async fn digest_sha256_data_validates_through_dispatch() {
+    async fn c03_digest_sha256_data_validates_through_dispatch() {
         use ndn_tlv::TlvWriter;
         use sha2::{Digest, Sha256};
 
@@ -738,7 +835,7 @@ mod tests {
 
     /// Signed-Interest validation path returns `Valid` for a good signature.
     #[tokio::test]
-    async fn validate_signed_interest_returns_valid() {
+    async fn c11_validate_signed_interest_returns_valid() {
         use ndn_packet::Interest;
         use ndn_packet::encode::InterestBuilder;
 
@@ -788,7 +885,7 @@ mod tests {
 
     /// Unsigned Interest must surface as `Invalid`, not bypass validation.
     #[tokio::test]
-    async fn unsigned_interest_returns_invalid() {
+    async fn c11_unsigned_interest_returns_invalid() {
         use ndn_packet::Interest;
         use ndn_packet::encode::encode_interest;
 
@@ -807,7 +904,7 @@ mod tests {
     /// bytes must surface as `InvalidKey` — the verifier is reached and
     /// rejects the malformed key, not silently dropped as unsupported.
     #[tokio::test]
-    async fn rsa_and_ecdsa_verifiers_are_wired() {
+    async fn c01_rsa_and_ecdsa_verifiers_are_wired() {
         let signer = Ed25519Signer::from_seed(&[0xFFu8; 32], name1("k"));
         let key_bytes = signer.public_key_bytes();
 

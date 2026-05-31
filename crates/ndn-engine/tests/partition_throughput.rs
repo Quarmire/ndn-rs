@@ -33,7 +33,10 @@ const FACE_A: u64 = 1; // consumer
 const FACE_B: u64 = 2; // producer
 
 fn env_u64(k: &str, d: u64) -> u64 {
-    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    std::env::var(k)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(d)
 }
 
 /// Decode an Interest from a (possibly LP-wrapped) forwarded wire.
@@ -93,11 +96,10 @@ async fn measure(data_plane: DataPlane, validate: bool) -> f64 {
         let payload = payload.clone();
         tokio::spawn(async move {
             while !stop.load(Ordering::Relaxed) {
-                let Some(raw) =
-                    tokio::time::timeout(Duration::from_millis(200), handle_b.recv())
-                        .await
-                        .ok()
-                        .flatten()
+                let Some(raw) = tokio::time::timeout(Duration::from_millis(200), handle_b.recv())
+                    .await
+                    .ok()
+                    .flatten()
                 else {
                     continue;
                 };
@@ -113,7 +115,9 @@ async fn measure(data_plane: DataPlane, validate: bool) -> f64 {
     let mut seq: u64 = 0;
     let send_interest = |seq: u64| -> bytes::Bytes {
         let name: Name = format!("/t/{seq}").parse().expect("name");
-        InterestBuilder::new(name).lifetime(Duration::from_secs(4)).build()
+        InterestBuilder::new(name)
+            .lifetime(Duration::from_secs(4))
+            .build()
     };
 
     // Prime the window.
@@ -164,6 +168,9 @@ async fn partition_throughput_sweep() {
     eprintln!("  shared            : {shared:.2} Gbps");
     for &w in &workers_list {
         let g = measure(DataPlane::Partitioned { workers: w }, validate).await;
-        eprintln!("  partitioned(N={w}) : {g:.2} Gbps  ({:+.0}% vs shared)", 100.0 * (g - shared) / shared);
+        eprintln!(
+            "  partitioned(N={w}) : {g:.2} Gbps  ({:+.0}% vs shared)",
+            100.0 * (g - shared) / shared
+        );
     }
 }

@@ -446,6 +446,44 @@ impl Pit {
             .map(|v| (*token, v));
     }
 
+    /// Drain expired PIT entries with their full entry state. Forwarders use
+    /// this when erasure needs more than the in-record face IDs, such as
+    /// populating the Dead Nonce List.
+    pub fn drain_expired_entries(&self, now_ns: u64) -> Vec<(PitToken, PitEntry)> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let expired: Vec<PitToken> = self
+                .entries
+                .iter()
+                .filter(|r| r.expires_at <= now_ns)
+                .map(|r| *r.key())
+                .collect();
+            let mut out: Vec<(PitToken, PitEntry)> = Vec::with_capacity(expired.len());
+            for token in &expired {
+                if let Some((_, entry)) = self.entries.remove(token) {
+                    out.push((*token, entry));
+                }
+            }
+            out
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let mut entries = self.entries.lock().unwrap();
+            let expired: Vec<PitToken> = entries
+                .iter()
+                .filter(|(_, e)| e.expires_at <= now_ns)
+                .map(|(k, _)| *k)
+                .collect();
+            let mut out: Vec<(PitToken, PitEntry)> = Vec::with_capacity(expired.len());
+            for token in &expired {
+                if let Some(entry) = entries.remove(token) {
+                    out.push((*token, entry));
+                }
+            }
+            out
+        }
+    }
+
     pub fn len(&self) -> usize {
         #[cfg(not(target_arch = "wasm32"))]
         return self.entries.len();
@@ -464,44 +502,14 @@ impl Pit {
     /// list of in-record face IDs so the expiry task can credit
     /// `NUnsatisfiedInterests` per upstream face.
     pub fn drain_expired(&self, now_ns: u64) -> Vec<(PitToken, smallvec::SmallVec<[u64; 4]>)> {
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let expired: Vec<PitToken> = self
-                .entries
-                .iter()
-                .filter(|r| r.expires_at <= now_ns)
-                .map(|r| *r.key())
-                .collect();
-            let mut out: Vec<(PitToken, smallvec::SmallVec<[u64; 4]>)> =
-                Vec::with_capacity(expired.len());
-            for token in &expired {
-                if let Some((_, entry)) = self.entries.remove(token) {
-                    let faces: smallvec::SmallVec<[u64; 4]> =
-                        entry.in_records.iter().map(|r| r.face_id).collect();
-                    out.push((*token, faces));
-                }
-            }
-            out
-        }
-        #[cfg(target_arch = "wasm32")]
-        {
-            let mut entries = self.entries.lock().unwrap();
-            let expired: Vec<PitToken> = entries
-                .iter()
-                .filter(|(_, e)| e.expires_at <= now_ns)
-                .map(|(k, _)| *k)
-                .collect();
-            let mut out: Vec<(PitToken, smallvec::SmallVec<[u64; 4]>)> =
-                Vec::with_capacity(expired.len());
-            for token in &expired {
-                if let Some(entry) = entries.remove(token) {
-                    let faces: smallvec::SmallVec<[u64; 4]> =
-                        entry.in_records.iter().map(|r| r.face_id).collect();
-                    out.push((*token, faces));
-                }
-            }
-            out
-        }
+        self.drain_expired_entries(now_ns)
+            .into_iter()
+            .map(|(token, entry)| {
+                let faces: smallvec::SmallVec<[u64; 4]> =
+                    entry.in_records.iter().map(|r| r.face_id).collect();
+                (token, faces)
+            })
+            .collect()
     }
 
     /// Remove PIT entries whose only in-record face is `face_id`. Entries

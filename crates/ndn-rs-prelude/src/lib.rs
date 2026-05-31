@@ -27,7 +27,7 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 pub use ndn_packet::encode::{DataBuilder, InterestBuilder};
-pub use ndn_packet::{Data, Interest, Name, NameComponent, NackReason};
+pub use ndn_packet::{Data, Interest, NackReason, Name, NameComponent};
 
 pub use ndn_security::{
     AcceptAllPolicy, HierarchicalPolicy, InsecureTrust, LvsTrust, SignerSelection, SigningInfo,

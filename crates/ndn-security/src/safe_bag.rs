@@ -116,10 +116,17 @@ impl SafeBag {
         password: &[u8],
     ) -> Result<Self, SafeBagError> {
         use pkcs8::PrivateKeyInfo;
+        use rand_core::RngCore;
         let pki = PrivateKeyInfo::try_from(pkcs8_pki_der)
             .map_err(|e| SafeBagError::Pkcs8(format!("parse PrivateKeyInfo: {e}")))?;
+        let mut salt = [0u8; 16];
+        let mut iv = [0u8; 16];
+        rsa::rand_core::OsRng.fill_bytes(&mut salt);
+        rsa::rand_core::OsRng.fill_bytes(&mut iv);
+        let params = pkcs5::pbes2::Parameters::pbkdf2_sha256_aes256cbc(2048, &salt, &iv)
+            .map_err(|e| SafeBagError::Pkcs8(format!("pbes2 params: {e}")))?;
         let encrypted = pki
-            .encrypt(rsa::rand_core::OsRng, password)
+            .encrypt_with_params(params, password)
             .map_err(|e| SafeBagError::Pkcs8(format!("encrypt: {e}")))?;
         Ok(Self {
             certificate,

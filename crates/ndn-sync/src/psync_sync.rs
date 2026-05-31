@@ -28,9 +28,9 @@ use ndn_packet::Name;
 use ndn_packet::encode::{DataBuilder, InterestBuilder};
 
 use crate::murmur3::{N_HASHCHECK, murmur3_x86_32};
-use crate::rt;
 use crate::protocol::{SyncHandle, SyncUpdate};
 use crate::psync::{Ibf, PSyncNode};
+use crate::rt;
 
 #[derive(Clone, Debug)]
 pub struct PSyncConfig {
@@ -136,6 +136,11 @@ async fn psync_task(
                             tracing::debug!(target: "sync.psync", count=names.len(), "psync: parsed Sync Data names");
                             for name in names {
                                 let hash = hash_name(&name);
+                                if node.contains(hash) {
+                                    tracing::trace!(target: "sync.psync", %name, "psync: skip already-known Sync Data name");
+                                    continue;
+                                }
+                                node.insert(hash);
                                 let mapping = name_map.get(&hash).and_then(|(_, m)| m.clone());
                                 let seq_no = name
                                     .components()

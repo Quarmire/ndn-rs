@@ -27,8 +27,8 @@ use ndn_security::FilePib;
 use crate::MgmtAccessPolicy;
 use crate::{
     ApprovalMgmtBackend, BleMgmtBackend, CodingHandler, ComputeMgmtBackend, FaceEvent,
-    LogInspector, MgmtResponse,
-    NotificationStream, RateLimitMgmtBackend, RouteEvent, StrategyEvent, WtCertStatusBackend,
+    LogInspector, MgmtResponse, NotificationStream, RateLimitMgmtBackend, RouteEvent,
+    StrategyEvent, WtCertStatusBackend,
 };
 
 /// Per-Interest dispatch context. Threaded by the router into each

@@ -161,9 +161,21 @@ mod tests {
 
     #[test]
     fn planar_dist2_is_monotonic_and_zero_at_identity() {
-        let a = GeoPos { lat_e7: 377_749_000, lon_e7: -1_224_194_000, alt_cm: 0 };
-        let near = GeoPos { lat_e7: 377_749_100, lon_e7: -1_224_194_000, alt_cm: 0 };
-        let far = GeoPos { lat_e7: 377_759_000, lon_e7: -1_224_194_000, alt_cm: 0 };
+        let a = GeoPos {
+            lat_e7: 377_749_000,
+            lon_e7: -1_224_194_000,
+            alt_cm: 0,
+        };
+        let near = GeoPos {
+            lat_e7: 377_749_100,
+            lon_e7: -1_224_194_000,
+            alt_cm: 0,
+        };
+        let far = GeoPos {
+            lat_e7: 377_759_000,
+            lon_e7: -1_224_194_000,
+            alt_cm: 0,
+        };
         assert_eq!(a.planar_dist2(&a), 0);
         assert!(a.planar_dist2(&near) < a.planar_dist2(&far));
     }

@@ -66,7 +66,10 @@ impl Thunk {
 
     /// Whether `content` is a thunk (vs. a final result), by leading TLV type.
     pub fn content_is_thunk(content: &[u8]) -> bool {
-        TlvReader::new(Bytes::copy_from_slice(content)).peek_type().ok() == Some(THUNK_TYPE)
+        TlvReader::new(Bytes::copy_from_slice(content))
+            .peek_type()
+            .ok()
+            == Some(THUNK_TYPE)
     }
 }
 

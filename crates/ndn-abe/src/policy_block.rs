@@ -22,9 +22,9 @@ use bytes::Bytes;
 use ndn_foundation_types::{Hash, TlvCodecError, TlvDecode, TlvEncode};
 use ndn_tlv::{TlvReader, TlvWriter};
 
-use crate::ciphertext::{read_name, KgcRef};
-use crate::types::*;
 use crate::AbeSchemeId;
+use crate::ciphertext::{KgcRef, read_name};
+use crate::types::*;
 
 /// Current schema version for `PolicyBlockPayload` encoding.
 pub const POLICY_BLOCK_SCHEMA_VERSION: u16 = 1;
@@ -93,7 +93,10 @@ impl TlvDecode for PolicyBlockPayload {
         // scheme_id
         let typ = r.read_type()?;
         if typ != ABE_SCHEME_ID_TYPE {
-            return Err(TlvCodecError::UnexpectedType { expected: ABE_SCHEME_ID_TYPE, found: typ });
+            return Err(TlvCodecError::UnexpectedType {
+                expected: ABE_SCHEME_ID_TYPE,
+                found: typ,
+            });
         }
         let len = r.read_length()?;
         let disc_bytes = r.read_bytes(len)?;
@@ -116,7 +119,10 @@ impl TlvDecode for PolicyBlockPayload {
         // kgc_refs
         let typ = r.read_type()?;
         if typ != ABE_KGC_REFS_TYPE {
-            return Err(TlvCodecError::UnexpectedType { expected: ABE_KGC_REFS_TYPE, found: typ });
+            return Err(TlvCodecError::UnexpectedType {
+                expected: ABE_KGC_REFS_TYPE,
+                found: typ,
+            });
         }
         let refs_len = r.read_length()?;
         let mut refs_r = r.scoped(refs_len)?;
@@ -148,10 +154,18 @@ impl TlvDecode for PolicyBlockPayload {
             }
             let mut arr = [0u8; 32];
             arr.copy_from_slice(&hbytes);
-            kgc_refs.push(KgcRef { kgc_did, master_params_hash: Hash::from_bytes(arr) });
+            kgc_refs.push(KgcRef {
+                kgc_did,
+                master_params_hash: Hash::from_bytes(arr),
+            });
         }
 
-        Ok(PolicyBlockPayload { schema_version, scheme, policy_source, kgc_refs })
+        Ok(PolicyBlockPayload {
+            schema_version,
+            scheme,
+            policy_source,
+            kgc_refs,
+        })
     }
 }
 
@@ -196,8 +210,14 @@ mod tests {
             scheme: AbeSchemeId::LewkoWaters,
             policy_source: "ROLE:DOCTOR and DEPT:CARDIOLOGY".to_string(),
             kgc_refs: vec![
-                KgcRef { kgc_did: "/hospital/kgc-1".parse().unwrap(), master_params_hash: Hash::of(b"kgc1") },
-                KgcRef { kgc_did: "/licensing/kgc-2".parse().unwrap(), master_params_hash: Hash::of(b"kgc2") },
+                KgcRef {
+                    kgc_did: "/hospital/kgc-1".parse().unwrap(),
+                    master_params_hash: Hash::of(b"kgc1"),
+                },
+                KgcRef {
+                    kgc_did: "/licensing/kgc-2".parse().unwrap(),
+                    master_params_hash: Hash::of(b"kgc2"),
+                },
             ],
         };
         assert_eq!(payload, round_trip(payload.clone()));

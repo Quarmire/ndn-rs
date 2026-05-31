@@ -294,10 +294,7 @@ fn decode_hex(s: &str) -> Result<Vec<u8>, String> {
 ///
 /// `FilePib::store_safebag` fails-fast on wire/decrypt/sanity errors
 /// so partial PIB state is impossible.
-pub(super) fn security_safebag_import(
-    params: ControlParameters,
-    pib: &FilePib,
-) -> ControlResponse {
+pub(super) fn security_safebag_import(params: ControlParameters, pib: &FilePib) -> ControlResponse {
     let key_name = match params.name {
         Some(n) => n,
         None => {

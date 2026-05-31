@@ -18,4 +18,6 @@ pub enum TrustError {
     KeyStore(String),
     #[error("unsupported signature type: {name} (code {code})")]
     UnsupportedSignatureType { code: u64, name: String },
+    #[error("certificate revoked in trust context: {name}")]
+    Revoked { name: String },
 }

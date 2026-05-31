@@ -31,7 +31,9 @@ pub enum CongestionController {
         beta: f64,
         ssthresh: f64,
     },
-    Fixed { window: f64 },
+    Fixed {
+        window: f64,
+    },
 }
 
 const DEFAULT_INITIAL_WINDOW: f64 = 2.0;

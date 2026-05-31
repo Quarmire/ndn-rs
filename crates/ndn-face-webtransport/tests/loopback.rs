@@ -141,10 +141,9 @@ async fn i14_wt_connect_dials_listener() {
     let server_task = tokio::spawn(async move { listener.accept(FaceId(1)).await });
 
     let url = format!("https://{server_addr}/ndn");
-    let client_face =
-        WebTransportFace::connect(FaceId(0), &url, ClientTls::CertHashes(vec![hash]))
-            .await
-            .expect("dial");
+    let client_face = WebTransportFace::connect(FaceId(0), &url, ClientTls::CertHashes(vec![hash]))
+        .await
+        .expect("dial");
     let server_face = server_task.await.unwrap().expect("accept");
 
     let interest = make_tlv(0x05, b"dialed");

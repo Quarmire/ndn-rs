@@ -291,7 +291,10 @@ async fn approve_feed_loop_with_did_resolution() {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert!(approved, "feed loop must approve the pending request via DID resolution");
+    assert!(
+        approved,
+        "feed loop must approve the pending request via DID resolution"
+    );
     let entry = store.get(&request_id).unwrap();
     assert_eq!(entry.approver.as_deref(), Some(approver_name));
     assert!(!entry.signed_approval.is_empty());
@@ -308,10 +311,10 @@ async fn approve_feed_loop_with_did_resolution() {
 #[tokio::test]
 async fn unauthorized_approver_is_gated_before_pull() {
     use ndn_app::random_reflexive_name;
+    use ndn_identity::{StaticTrustedApprovers, pull_and_record_approval_with_resolver};
     use ndn_packet::Interest;
     use ndn_packet::encode::InterestBuilder;
     use ndn_security::did::UniversalResolver;
-    use ndn_identity::{StaticTrustedApprovers, pull_and_record_approval_with_resolver};
 
     let (_face, handle) = InProcFace::new(FaceId(1), 64);
     let mut side = Consumer::from_handle(handle);
@@ -348,17 +351,17 @@ async fn unauthorized_approver_is_gated_before_pull() {
     .expect("gate returns cleanly");
 
     assert!(!recorded, "unauthorized approver must not be recorded");
-    assert_eq!(store.get(&request_id).unwrap().state, ApprovalState::Pending);
+    assert_eq!(
+        store.get(&request_id).unwrap().state,
+        ApprovalState::Pending
+    );
 }
 
 /// Build an approver identity with a self-signed cert and a DID resolver that
 /// resolves it (fixture cert fetcher). Returns (signer, resolver).
 fn approver_did_setup(
     approver_name: &str,
-) -> (
-    Arc<dyn Signer>,
-    Arc<ndn_security::did::UniversalResolver>,
-) {
+) -> (Arc<dyn Signer>, Arc<ndn_security::did::UniversalResolver>) {
     use std::future::Future;
     use std::pin::Pin;
 
@@ -386,7 +389,10 @@ fn approver_did_setup(
         fetch_fn,
         Duration::from_secs(1),
     ));
-    (signer, Arc::new(UniversalResolver::with_cert_fetcher(fetcher)))
+    (
+        signer,
+        Arc::new(UniversalResolver::with_cert_fetcher(fetcher)),
+    )
 }
 
 /// The feed wired into NdncertCa: `serve_with_feed` runs the `/CA/*` service and
@@ -430,9 +436,8 @@ async fn ndncert_ca_serve_with_feed_approves() {
         .build()
         .unwrap();
 
-    let authorizer = Arc::new(
-        StaticTrustedApprovers::new().allow("/lab/alice".parse().unwrap(), approver_name),
-    );
+    let authorizer =
+        Arc::new(StaticTrustedApprovers::new().allow("/lab/alice".parse().unwrap(), approver_name));
     let feed = CaApproveFeed {
         producer: Producer::from_handle(feed_handle, feed_prefix.clone()),
         side: Consumer::from_handle(side_handle),
@@ -441,9 +446,8 @@ async fn ndncert_ca_serve_with_feed_approves() {
         authorizer,
         timeout: Duration::from_secs(2),
     };
-    let ca_task = tokio::spawn(
-        ca.serve_with_feed(Producer::from_handle(ca_handle, ca_prefix.clone()), feed),
-    );
+    let ca_task =
+        tokio::spawn(ca.serve_with_feed(Producer::from_handle(ca_handle, ca_prefix.clone()), feed));
 
     let feed_for_approver = feed_prefix.clone();
     let approver_owned = approver_name.to_string();
@@ -472,7 +476,10 @@ async fn ndncert_ca_serve_with_feed_approves() {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert!(approved, "serve_with_feed must run the APPROVE-FEED and approve via DID resolution");
+    assert!(
+        approved,
+        "serve_with_feed must run the APPROVE-FEED and approve via DID resolution"
+    );
 
     drop(engine);
     shutdown.shutdown().await;
@@ -489,16 +496,20 @@ async fn did_authorizer_reads_published_trusted_approvers() {
     use std::pin::Pin;
 
     use bytes::Bytes;
+    use ndn_identity::{ApproverAuthorizer, DidApproverAuthorizer};
     use ndn_packet::Data;
     use ndn_security::did::{UniversalResolver, encode_trusted_approvers_description};
     use ndn_security::{CertCache, CertFetcher, FetchFn, SecurityManager};
-    use ndn_identity::{ApproverAuthorizer, DidApproverAuthorizer};
 
     // Alice's cert publishes /lab/alice/devices/phone as a trusted approver.
     let mgr = SecurityManager::new();
     let alice_key: Name = "/lab/alice/KEY/k1".parse().unwrap();
     mgr.generate_ed25519(alice_key.clone()).unwrap();
-    let alice_pub = mgr.get_signer_sync(&alice_key).unwrap().public_key().unwrap();
+    let alice_pub = mgr
+        .get_signer_sync(&alice_key)
+        .unwrap()
+        .public_key()
+        .unwrap();
     let ad = encode_trusted_approvers_description(&["/lab/alice/devices/phone".to_string()]);
     let alice_cert = mgr
         .certify_with_additional_description(
@@ -550,8 +561,8 @@ async fn did_authorizer_reads_published_trusted_approvers() {
 /// synthetic names, no bare identities.
 #[tokio::test]
 async fn canonical_signed_approval_validated_via_schema() {
-    use ndn_security::{Certificate, Ed25519Signer, SchemaRule, Signer, TrustSchema, Validator};
     use ndn_identity::offer_signed_approval;
+    use ndn_security::{Certificate, Ed25519Signer, SchemaRule, Signer, TrustSchema, Validator};
 
     let (adv_face, adv_handle) = InProcFace::new(FaceId(1), 64);
     let (serve_face, serve_handle) = InProcFace::new(FaceId(2), 64);
@@ -636,8 +647,8 @@ async fn canonical_signed_approval_validated_via_schema() {
 /// validator rejects the approval, so the request stays pending.
 #[tokio::test]
 async fn canonical_approval_denied_by_schema() {
-    use ndn_security::{Certificate, Ed25519Signer, SchemaRule, Signer, TrustSchema, Validator};
     use ndn_identity::{offer_signed_approval, serve_approve_feed_validated};
+    use ndn_security::{Certificate, Ed25519Signer, SchemaRule, Signer, TrustSchema, Validator};
 
     let (adv_face, adv_handle) = InProcFace::new(FaceId(1), 64);
     let (serve_face, serve_handle) = InProcFace::new(FaceId(2), 64);

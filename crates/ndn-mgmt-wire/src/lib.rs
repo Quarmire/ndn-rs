@@ -194,7 +194,10 @@ mod tests {
 
     #[test]
     fn wire_order_starts_with_version() {
-        let s = GeneralStatus { nfd_version: "v".into(), ..Default::default() };
+        let s = GeneralStatus {
+            nfd_version: "v".into(),
+            ..Default::default()
+        };
         let wire = s.encode();
         assert_eq!(wire[0] as u64, tlv::NFD_VERSION); // NfdVersion is first on the wire
     }

@@ -8,8 +8,7 @@ use tracing::Instrument as _;
 
 use ndn_packet::Name;
 use ndn_security::{
-    CertCache, CertFetcher, ReplayGuard, SchemaRule, SecurityManager, SecurityProfile, TrustSchema,
-    Validator,
+    CertFetcher, ReplayGuard, SchemaRule, SecurityManager, SecurityProfile, TrustSchema, Validator,
 };
 use ndn_store::{
     CsAdmissionPolicy, CsObserver, DeadNonceList, ErasedContentStore, LruCs, ObservableCs, Pit,
@@ -338,12 +337,14 @@ impl EngineBuilder {
 
         {
             let pit_clone = Arc::clone(&pit);
+            let dead_nonce_list_clone = Some(Arc::clone(&dead_nonce_list));
             let face_states_clone = Arc::clone(&face_states);
             let cancel_clone = cancel.clone();
             let runtime_clone = Arc::clone(&runtime);
             tasks.spawn(async move {
                 crate::expiry::run_expiry_task(
                     pit_clone,
+                    dead_nonce_list_clone,
                     face_states_clone,
                     cancel_clone,
                     runtime_clone,
@@ -431,10 +432,12 @@ impl EngineBuilder {
         ));
 
         let inner = Arc::new(EngineInner {
+            start_timestamp_ms: crate::engine::unix_time_ms(),
             fib: Arc::clone(&fib),
             rib: Arc::clone(&rib),
             routing: Arc::clone(&routing),
             pit: Arc::clone(&pit),
+            dead_nonce_list: Arc::clone(&dead_nonce_list),
             cs: Arc::clone(&cs),
             face_table: Arc::clone(&face_table),
             measurements: Arc::clone(&measurements),
@@ -595,19 +598,20 @@ fn resolve_security_profile(
         SecurityProfile::Custom(v) => (Some(v), None),
 
         SecurityProfile::AcceptSigned => {
-            let schema = TrustSchema::accept_all();
             let validator = if let Some(mgr) = security {
-                let cert_cache = Arc::new(CertCache::new());
-                let anchors = Arc::new(dashmap::DashMap::new());
-                for name in mgr.trust_anchor_names() {
-                    if let Some(cert) = mgr.trust_anchor(&name) {
-                        cert_cache.insert(cert.clone());
-                        anchors.insert(name, cert);
-                    }
-                }
-                Arc::new(Validator::with_chain(schema, cert_cache, anchors, None, 1))
+                // Share the manager's keyring: its ambient context already
+                // holds the loaded anchors; just set the operative schema.
+                mgr.keyring()
+                    .ambient()
+                    .set_schema(TrustSchema::accept_all());
+                Arc::new(Validator::with_keyring(
+                    Arc::clone(mgr.keyring()),
+                    mgr.cert_cache_arc(),
+                    None,
+                    1,
+                ))
             } else {
-                Arc::new(Validator::new(schema))
+                Arc::new(Validator::new(TrustSchema::accept_all()))
             };
             (Some(validator), None)
         }
@@ -624,16 +628,14 @@ fn resolve_security_profile(
                 return (Some(validator), None);
             };
 
-            let schema = TrustSchema::hierarchical();
-            let cert_cache = Arc::new(CertCache::new());
-            let anchors = Arc::new(dashmap::DashMap::new());
-
-            for name in mgr.trust_anchor_names() {
-                if let Some(cert) = mgr.trust_anchor(&name) {
-                    cert_cache.insert(cert.clone());
-                    anchors.insert(name, cert);
-                }
-            }
+            // Share the manager's keyring (its ambient context holds the
+            // loaded anchors) and cert cache (holds issued certs), so the
+            // validator sees CA-issued material without copying. Set the
+            // operative schema on the shared ambient context.
+            mgr.keyring()
+                .ambient()
+                .set_schema(TrustSchema::hierarchical());
+            let cert_cache = mgr.cert_cache_arc();
 
             // No-op FetchFn placeholder; the router wires a real one via
             // AppFace after engine construction.
@@ -643,10 +645,9 @@ fn resolve_security_profile(
                 Duration::from_secs(4),
             ));
 
-            let validator = Arc::new(Validator::with_chain(
-                schema,
-                Arc::clone(&cert_cache),
-                anchors,
+            let validator = Arc::new(Validator::with_keyring(
+                Arc::clone(mgr.keyring()),
+                cert_cache,
                 Some(Arc::clone(&fetcher)),
                 5,
             ));

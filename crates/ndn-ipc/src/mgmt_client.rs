@@ -233,10 +233,7 @@ impl MgmtClient {
     /// signer's identity authorises the approval. v1 records
     /// `"approved-via-mgmt"` as the approver label until the v2
     /// canonical signed-Data path lands.
-    pub async fn ca_approve(
-        &self,
-        request_id: &str,
-    ) -> Result<ControlParameters, ForwarderError> {
+    pub async fn ca_approve(&self, request_id: &str) -> Result<ControlParameters, ForwarderError> {
         let params = ControlParameters {
             uri: Some(request_id.to_owned()),
             ..Default::default()
@@ -828,8 +825,9 @@ impl MgmtClient {
         let name = dataset_name(module_name, verb_name);
         // CanBePrefix: dataset responses are versioned+segmented Data names
         // (e.g. /localhost/nfd/faces/list/v=N/seg=0) that are longer than
-        // the Interest name.  Without CanBePrefix the PIT never matches.
-        let interest_wire = InterestBuilder::new(name).can_be_prefix().build();
+        // the Interest name. MustBeFresh avoids satisfying management reads
+        // from an older cached dataset segment after a mutating command.
+        let interest_wire = build_dataset_interest(name);
         self.send_content_bytes(interest_wire).await
     }
 
@@ -865,37 +863,18 @@ impl MgmtClient {
 
     /// `CanBePrefix` is set so the PIT matches dataset responses
     /// whose names carry version+segment suffixes (e.g. `/.../v=N/seg=0`).
+    /// `MustBeFresh` prevents a previous dataset segment from hiding a recent
+    /// management change, such as a route registered immediately before a RIB
+    /// list query.
     async fn send_unsigned_interest(&self, name: Name) -> Result<ControlResponse, ForwarderError> {
-        let interest_wire = InterestBuilder::new(name).can_be_prefix().build();
+        let interest_wire = build_dataset_interest(name);
         self.send_raw(interest_wire).await
     }
 
     /// Signs per the active [`SigningPolicy`] and LP-wraps the
     /// Interest (NFD/yanfd/ndnd require NDNLPv2 on Unix faces).
     async fn send_interest(&self, name: Name) -> Result<ControlResponse, ForwarderError> {
-        let interest_wire = match &self.signing {
-            SigningPolicy::DigestSha256 => InterestBuilder::new(name).sign_digest_sha256(),
-            SigningPolicy::Key(signer) => {
-                let signer = Arc::clone(signer);
-                let sig_type = signer.sig_type();
-                let key_loc = signer
-                    .cert_name()
-                    .or_else(|| Some(signer.key_name()))
-                    .cloned();
-                InterestBuilder::new(name)
-                    .sign_fallible(sig_type, key_loc.as_ref(), |region: &[u8]| {
-                        let region = bytes::Bytes::copy_from_slice(region);
-                        let signer = Arc::clone(&signer);
-                        async move {
-                            signer
-                                .sign(&region)
-                                .await
-                                .map_err(|e| ForwarderError::SigningFailed(e.to_string()))
-                        }
-                    })
-                    .await?
-            }
-        };
+        let interest_wire = build_signed_interest_with_policy(&self.signing, name).await?;
         self.send_raw(interest_wire).await
     }
 
@@ -920,6 +899,42 @@ impl MgmtClient {
 
         ControlResponse::decode(Bytes::copy_from_slice(content))
             .map_err(|_| ForwarderError::MalformedResponse)
+    }
+}
+
+fn build_dataset_interest(name: Name) -> Bytes {
+    InterestBuilder::new(name)
+        .can_be_prefix()
+        .must_be_fresh()
+        .build()
+}
+
+async fn build_signed_interest_with_policy(
+    signing: &SigningPolicy,
+    name: Name,
+) -> Result<Bytes, ForwarderError> {
+    match signing {
+        SigningPolicy::DigestSha256 => Ok(InterestBuilder::new(name).sign_digest_sha256()),
+        SigningPolicy::Key(signer) => {
+            let signer = Arc::clone(signer);
+            let sig_type = signer.sig_type();
+            let key_loc = signer
+                .cert_name()
+                .or_else(|| Some(signer.key_name()))
+                .cloned();
+            InterestBuilder::new(name)
+                .sign_fallible(sig_type, key_loc.as_ref(), |region: &[u8]| {
+                    let region = bytes::Bytes::copy_from_slice(region);
+                    let signer = Arc::clone(&signer);
+                    async move {
+                        signer
+                            .sign(&region)
+                            .await
+                            .map_err(|e| ForwarderError::SigningFailed(e.to_string()))
+                    }
+                })
+                .await
+        }
     }
 }
 
@@ -967,11 +982,11 @@ mod tests {
     use std::sync::Arc;
 
     use bytes::Bytes;
-    use ndn_config::nfd_command::{command_name, module, verb};
+    use ndn_config::nfd_command::{command_name, dataset_name, module, verb};
     use ndn_packet::{SignatureType, encode::InterestBuilder};
     use ndn_security::{Ed25519Signer, Signer};
 
-    use super::SigningPolicy;
+    use super::{SigningPolicy, build_dataset_interest, build_signed_interest_with_policy};
 
     fn rib_register_name() -> ndn_packet::Name {
         let params = ndn_config::ControlParameters {
@@ -984,37 +999,31 @@ mod tests {
     }
 
     async fn sign_with_policy(signing: SigningPolicy) -> Bytes {
-        match signing {
-            SigningPolicy::DigestSha256 => {
-                InterestBuilder::new(rib_register_name()).sign_digest_sha256()
-            }
-            SigningPolicy::Key(signer) => {
-                let sig_type = signer.sig_type();
-                let key_loc = signer
-                    .cert_name()
-                    .or_else(|| Some(signer.key_name()))
-                    .cloned();
-                InterestBuilder::new(rib_register_name())
-                    .sign_fallible(sig_type, key_loc.as_ref(), |region: &[u8]| {
-                        let region = Bytes::copy_from_slice(region);
-                        let signer = Arc::clone(&signer);
-                        async move {
-                            signer
-                                .sign(&region)
-                                .await
-                                .map_err(|e| format!("signing failed: {e}"))
-                        }
-                    })
-                    .await
-                    .expect("signing must not fail in test")
-            }
-        }
+        build_signed_interest_with_policy(&signing, rib_register_name())
+            .await
+            .expect("signing must not fail in test")
+    }
+
+    #[test]
+    fn dataset_interest_uses_can_be_prefix_and_must_be_fresh() {
+        let wire = build_dataset_interest(dataset_name(module::RIB, verb::LIST));
+        let interest = ndn_packet::Interest::decode(wire).unwrap();
+        let selectors = interest.selectors();
+
+        assert!(
+            selectors.can_be_prefix,
+            "management datasets need CanBePrefix for versioned segments"
+        );
+        assert!(
+            selectors.must_be_fresh,
+            "management datasets must bypass stale cached status segments"
+        );
     }
 
     /// DigestSha256 sig_value must equal `SHA-256(signed_region)` per
     /// ndn-cxx `command-interest-signer.cpp:sendCommandInterest`.
     #[test]
-    fn digest_sha256_signed_region_verifies() {
+    fn c12_digest_sha256_signed_region_verifies() {
         use sha2::{Digest as _, Sha256};
         let wire = InterestBuilder::new(rib_register_name()).sign_digest_sha256();
         let interest = ndn_packet::Interest::decode(wire).unwrap();
@@ -1031,7 +1040,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn digest_sha256_policy_produces_signed_interest() {
+    async fn c12_digest_sha256_policy_produces_signed_interest() {
         let wire = sign_with_policy(SigningPolicy::DigestSha256).await;
         let interest = ndn_packet::Interest::decode(wire).unwrap();
         assert_eq!(
@@ -1045,7 +1054,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn key_signer_produces_verifiable_ed25519_interest() {
+    async fn c12_key_signer_produces_verifiable_ed25519_interest() {
         use ndn_security::{
             Ed25519Verifier,
             verifier::{Verifier, VerifyOutcome},
@@ -1078,7 +1087,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn key_signer_key_name_in_sig_info() {
+    async fn c12_key_signer_key_name_in_sig_info() {
         let key_name: ndn_packet::Name = "/ndn/test/router1/KEY/1".parse().unwrap();
         let signer = Arc::new(Ed25519Signer::from_seed(&[0xABu8; 32], key_name.clone()));
         let wire =

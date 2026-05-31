@@ -80,14 +80,26 @@ mod endpoint_id_tests {
     fn endpoint_id_distinguishes_senders() {
         let a = InboundMeta::ether(MacAddr([0xAA, 0, 0, 0, 0, 1]));
         let b = InboundMeta::ether(MacAddr([0xAA, 0, 0, 0, 0, 2]));
-        assert_ne!(a.endpoint_id(), b.endpoint_id(), "distinct MACs → distinct ids");
+        assert_ne!(
+            a.endpoint_id(),
+            b.endpoint_id(),
+            "distinct MACs → distinct ids"
+        );
         assert_eq!(
             a.endpoint_id(),
             InboundMeta::ether(MacAddr([0xAA, 0, 0, 0, 0, 1])).endpoint_id(),
             "same MAC → same id"
         );
-        assert_eq!(InboundMeta::none().endpoint_id(), 0, "no source → unicast 0");
-        assert_ne!(a.endpoint_id(), 0, "a real sender id must not collide with unicast 0");
+        assert_eq!(
+            InboundMeta::none().endpoint_id(),
+            0,
+            "no source → unicast 0"
+        );
+        assert_ne!(
+            a.endpoint_id(),
+            0,
+            "a real sender id must not collide with unicast 0"
+        );
     }
 }
 

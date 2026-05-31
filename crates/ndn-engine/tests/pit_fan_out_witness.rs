@@ -40,10 +40,7 @@ fn fan_out_event_shape_per_trace() {
     // Simulate three consumers — two on face 7 (aggregated under
     // different trace ids), one on face 9.
     let records = vec![
-        (
-            7u64,
-            vec![TraceId([0x11; 16]), TraceId([0x22; 16])],
-        ),
+        (7u64, vec![TraceId([0x11; 16]), TraceId([0x22; 16])]),
         (9u64, vec![TraceId([0x33; 16])]),
     ];
     for (face_id, traces) in records {

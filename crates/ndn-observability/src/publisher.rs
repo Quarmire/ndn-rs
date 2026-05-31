@@ -320,9 +320,7 @@ mod tests {
 
     #[test]
     fn publish_then_lookup_roundtrip() {
-        let prefix = Name::from_components([NameComponent::generic(Bytes::from_static(
-            b"obs",
-        ))]);
+        let prefix = Name::from_components([NameComponent::generic(Bytes::from_static(b"obs"))]);
         let pub_ = SpanPublisher::new(prefix.clone(), SpanRetention::default());
         let span = sample_span(0xAA, 0xBB);
         pub_.publish(&span);

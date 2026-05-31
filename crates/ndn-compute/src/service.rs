@@ -149,7 +149,13 @@ impl ComputeService {
     }
 
     /// Record a registration in the introspection table.
-    fn note(&self, prefix: &Name, determinism: Determinism, kind: ComputeFnKind, fuel: Option<u64>) {
+    fn note(
+        &self,
+        prefix: &Name,
+        determinism: Determinism,
+        kind: ComputeFnKind,
+        fuel: Option<u64>,
+    ) {
         self.functions.lock().unwrap().insert(
             prefix.clone(),
             FnRec {
@@ -183,8 +189,11 @@ impl ComputeService {
             .get_or_init(|| {
                 let id = self.engine.faces().alloc_id();
                 let (face, handle) = InProcFace::new(id, 256);
-                self.engine
-                    .add_face_with_persistency(face, self.cancel.clone(), FacePersistency::Permanent);
+                self.engine.add_face_with_persistency(
+                    face,
+                    self.cancel.clone(),
+                    FacePersistency::Permanent,
+                );
                 Arc::new(AsyncMutex::new(Consumer::from_handle(handle)))
             })
             .clone();
@@ -317,7 +326,9 @@ impl ComputeService {
     pub fn register<H: ComputeHandler>(&self, prefix: impl Into<Name>, handler: H) {
         let prefix = prefix.into();
         self.registry.register(&prefix, handler);
-        self.engine.fib().add_nexthop(&prefix, self.face_id, self.cost);
+        self.engine
+            .fib()
+            .add_nexthop(&prefix, self.face_id, self.cost);
         // Tier-0 default; higher-level methods overwrite with a more
         // specific label after delegating here.
         self.note(&prefix, Determinism::Transparent, ComputeFnKind::Raw, None);
@@ -343,7 +354,12 @@ impl ComputeService {
             _pd: PhantomData,
         };
         self.register(prefix.clone(), handler);
-        self.note(&prefix, Determinism::Transparent, ComputeFnKind::Typed, None);
+        self.note(
+            &prefix,
+            Determinism::Transparent,
+            ComputeFnKind::Typed,
+            None,
+        );
     }
 
     /// Tier 1+: register a transparent typed function whose handler can pull
@@ -370,7 +386,12 @@ impl ComputeService {
             _pd: PhantomData,
         };
         self.register(prefix.clone(), handler);
-        self.note(&prefix, Determinism::Transparent, ComputeFnKind::Typed, None);
+        self.note(
+            &prefix,
+            Determinism::Transparent,
+            ComputeFnKind::Typed,
+            None,
+        );
     }
 
     /// Tier 1: register an opaque (non-deterministic) typed function. The
@@ -413,7 +434,12 @@ impl ComputeService {
             async move { executor.execute(&input) }
         });
         // Overwrite the `Typed` note that `function` laid down.
-        self.note(&prefix, Determinism::Transparent, ComputeFnKind::Executor, fuel);
+        self.note(
+            &prefix,
+            Determinism::Transparent,
+            ComputeFnKind::Executor,
+            fuel,
+        );
     }
 
     /// Tier 3: register a long-running transparent job. The invocation Interest
@@ -557,7 +583,11 @@ where
     Fut: Future<Output = Result<O, ComputeError>> + Send,
 {
     async fn compute(&self, interest: &Interest) -> Result<Data, ComputeError> {
-        let arg_comps = arg_components(interest.name.components(), self.prefix_len, self.determinism)?;
+        let arg_comps = arg_components(
+            interest.name.components(),
+            self.prefix_len,
+            self.determinism,
+        )?;
         let args = A::from_components(arg_comps)?;
         let out = (self.f)(args).await?;
         build_data((*interest.name).clone(), &out.encode(), self.freshness)
@@ -582,8 +612,11 @@ where
     Fut: Future<Output = Result<O, ComputeError>> + Send,
 {
     async fn compute(&self, interest: &Interest) -> Result<Data, ComputeError> {
-        let arg_comps =
-            arg_components(interest.name.components(), self.prefix_len, Determinism::Transparent)?;
+        let arg_comps = arg_components(
+            interest.name.components(),
+            self.prefix_len,
+            Determinism::Transparent,
+        )?;
         let args = A::from_components(arg_comps)?;
         let out = (self.f)(args, self.ctx.clone()).await?;
         build_data((*interest.name).clone(), &out.encode(), self.freshness)
@@ -688,10 +721,9 @@ where
             Some(KeyLocator::Name(n)) => Some((**n).clone()),
             _ => None,
         });
-        let blob = safe
-            .data()
-            .content()
-            .ok_or_else(|| ComputeError::ComputeFailed("sealed params Data had no content".into()))?;
+        let blob = safe.data().content().ok_or_else(|| {
+            ComputeError::ComputeFailed("sealed params Data had no content".into())
+        })?;
         let params = node
             .open(blob)
             .map_err(|e| ComputeError::ComputeFailed(format!("decrypt params: {e}")))?;
@@ -767,7 +799,11 @@ fn arg_components(
 }
 
 /// Build a signed-with-DigestSha256 Data named `name`, optionally fresh.
-fn build_data(name: Name, content: &[u8], freshness: Option<Duration>) -> Result<Data, ComputeError> {
+fn build_data(
+    name: Name,
+    content: &[u8],
+    freshness: Option<Duration>,
+) -> Result<Data, ComputeError> {
     let mut builder = DataBuilder::new(name, content);
     if let Some(freshness) = freshness {
         builder = builder.freshness(freshness);
@@ -851,9 +887,7 @@ impl ComputeHandler for PollHandler {
         let thunk_name = (*interest.name).clone();
         let state = self.jobs.lock().unwrap().get(&thunk_name).cloned();
         match state {
-            Some(JobState::Done(bytes)) => {
-                build_data(thunk_name, &bytes, self.result_freshness)
-            }
+            Some(JobState::Done(bytes)) => build_data(thunk_name, &bytes, self.result_freshness),
             Some(JobState::Failed(e)) => Err(ComputeError::ComputeFailed(e)),
             Some(JobState::Pending) => {
                 let thunk = Thunk {

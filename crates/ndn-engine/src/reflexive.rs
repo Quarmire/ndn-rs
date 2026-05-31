@@ -166,8 +166,10 @@ impl ReflexiveTable {
                 self.refused.fetch_add(1, Ordering::Relaxed);
                 return false;
             }
-            self.routes
-                .insert(reflexive_name, Arc::new(ReflexiveRoute { face_id, expiry_ns }));
+            self.routes.insert(
+                reflexive_name,
+                Arc::new(ReflexiveRoute { face_id, expiry_ns }),
+            );
             return true;
         }
 
@@ -179,8 +181,10 @@ impl ReflexiveTable {
         *count += 1;
         drop(count);
 
-        self.routes
-            .insert(reflexive_name, Arc::new(ReflexiveRoute { face_id, expiry_ns }));
+        self.routes.insert(
+            reflexive_name,
+            Arc::new(ReflexiveRoute { face_id, expiry_ns }),
+        );
         self.live.fetch_add(1, Ordering::Relaxed);
         self.installs.fetch_add(1, Ordering::Relaxed);
         true

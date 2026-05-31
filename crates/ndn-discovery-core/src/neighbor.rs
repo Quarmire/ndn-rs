@@ -13,17 +13,9 @@ use crate::MacAddr;
 
 #[derive(Clone, Debug)]
 pub enum NeighborState {
-    Probing {
-        attempts: u8,
-        last_probe: Instant,
-    },
-    Established {
-        last_seen: Instant,
-    },
-    Stale {
-        miss_count: u8,
-        last_seen: Instant,
-    },
+    Probing { attempts: u8, last_probe: Instant },
+    Established { last_seen: Instant },
+    Stale { miss_count: u8, last_seen: Instant },
     Absent,
 }
 

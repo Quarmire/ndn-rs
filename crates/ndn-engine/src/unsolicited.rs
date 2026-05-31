@@ -104,6 +104,9 @@ mod tests {
             Some(UnsolicitedDataPolicy::AdmitNetwork)
         );
         assert_eq!(UnsolicitedDataPolicy::from_token("bogus"), None);
-        assert_eq!(UnsolicitedDataPolicy::default(), UnsolicitedDataPolicy::DropAll);
+        assert_eq!(
+            UnsolicitedDataPolicy::default(),
+            UnsolicitedDataPolicy::DropAll
+        );
     }
 }

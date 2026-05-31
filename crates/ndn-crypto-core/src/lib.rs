@@ -126,7 +126,9 @@ pub fn verify_data_ed25519(wire: &[u8], public_key: &[u8; 32]) -> bool {
     if typ != TYPE_DATA {
         return false;
     }
-    let Some(rest) = wire.get(type_len..) else { return false };
+    let Some(rest) = wire.get(type_len..) else {
+        return false;
+    };
     let Ok((inner_len, len_len)) = read_varu64(rest) else {
         return false;
     };
@@ -168,7 +170,8 @@ pub fn verify_data_ed25519(wire: &[u8], public_key: &[u8; 32]) -> bool {
     };
     let mut arr = [0u8; 64];
     arr.copy_from_slice(sig_bytes);
-    vk.verify(&inner[..signed_end], &Signature::from_bytes(&arr)).is_ok()
+    vk.verify(&inner[..signed_end], &Signature::from_bytes(&arr))
+        .is_ok()
 }
 
 // Content confidentiality (the no_std baseline). Provability (signing) and
@@ -256,13 +259,21 @@ mod tests {
         let pk = sk.verifying_key().to_bytes();
 
         let mut out = [0u8; 512];
-        let n = sign_data_ed25519(&mut out, &[b"ndn", b"sensor"], b"22C", &[7u8; 32], &[b"ndn", b"KEY", b"k1"])
-            .expect("sign");
+        let n = sign_data_ed25519(
+            &mut out,
+            &[b"ndn", b"sensor"],
+            b"22C",
+            &[7u8; 32],
+            &[b"ndn", b"KEY", b"k1"],
+        )
+        .expect("sign");
 
         // Verifies under the right key…
         assert!(verify_data_ed25519(&out[..n], &pk));
         // …fails under a wrong key…
-        let wrong = SigningKey::from_bytes(&[9u8; 32]).verifying_key().to_bytes();
+        let wrong = SigningKey::from_bytes(&[9u8; 32])
+            .verifying_key()
+            .to_bytes();
         assert!(!verify_data_ed25519(&out[..n], &wrong));
         // …and fails if the signed region is tampered.
         let mut bad = out;

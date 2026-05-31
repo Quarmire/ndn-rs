@@ -134,7 +134,12 @@ impl Interest {
     /// pull parameters / run a callback. `None` when absent.
     pub fn reflexive_name(&self) -> Option<&Arc<Name>> {
         self.reflexive_name
-            .get_or_init(|| decode_reflexive_name(&self.raw).ok().flatten().map(Arc::new))
+            .get_or_init(|| {
+                decode_reflexive_name(&self.raw)
+                    .ok()
+                    .flatten()
+                    .map(Arc::new)
+            })
             .as_ref()
     }
 
@@ -857,8 +862,8 @@ mod tests {
             w.write_tlv(tlv_type::CAN_BE_PREFIX, &[]);
         });
         let raw = w.finish();
-        let err = Interest::decode(raw)
-            .expect_err("MustBeFresh before CanBePrefix is out of spec order");
+        let err =
+            Interest::decode(raw).expect_err("MustBeFresh before CanBePrefix is out of spec order");
         match err {
             PacketError::MalformedPacket(_) => {}
             other => panic!("expected MalformedPacket, got {other:?}"),
@@ -1024,7 +1029,10 @@ mod tests {
         let mut buf = wire.to_vec();
         let before = buf.clone();
         assert!(decrement_hop_limit_in_place(&mut buf).is_none());
-        assert_eq!(buf, before, "wire must be untouched when no HopLimit present");
+        assert_eq!(
+            buf, before,
+            "wire must be untouched when no HopLimit present"
+        );
     }
 
     /// Wire without HopLimit returns `None`; callers leave it unchanged.

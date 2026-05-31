@@ -124,7 +124,11 @@ mod tests {
         let pem = ck.cert.pem();
         let st = cert_status(pem.as_bytes()).expect("status");
         // rcgen's default validity is well over the 30-day renewal window.
-        assert!(st.days_remaining > 30, "days_remaining={}", st.days_remaining);
+        assert!(
+            st.days_remaining > 30,
+            "days_remaining={}",
+            st.days_remaining
+        );
         assert!(!st.needs_renewal);
         assert!(!needs_renewal(pem.as_bytes()).unwrap());
     }

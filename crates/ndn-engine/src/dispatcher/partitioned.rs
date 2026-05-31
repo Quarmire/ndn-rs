@@ -93,13 +93,13 @@ impl PacketDispatcher {
             worker_txs.push(wtx);
             let w = Arc::clone(self);
             let wc = cancel.clone();
-            tasks.spawn(
-                async move { w.run_worker(wrx, wc).await }.instrument(tracing::info_span!(
+            tasks.spawn(async move { w.run_worker(wrx, wc).await }.instrument(
+                tracing::info_span!(
                     target: t::FWD_PIPELINE,
                     "fwd_worker",
                     id = id as u32,
-                )),
-            );
+                ),
+            ));
         }
 
         let r = Arc::clone(self);
@@ -137,12 +137,17 @@ impl PacketDispatcher {
             } = pkt;
             let endpoint_id = meta.endpoint_id();
             if let Action::Continue(ctx) =
-                self.decode.decode_inbound(raw, face_id, arrival, endpoint_id)
+                self.decode
+                    .decode_inbound(raw, face_id, arrival, endpoint_id)
             {
                 let worker = ctx.name.as_deref().map_or(0, |n| ndt.worker_for(n));
                 // Backpressure on the chosen worker; an error means it stopped
                 // (shutdown), so the router winds down too.
-                if worker_txs[worker].send(WorkerMsg { ctx, meta }).await.is_err() {
+                if worker_txs[worker]
+                    .send(WorkerMsg { ctx, meta })
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }

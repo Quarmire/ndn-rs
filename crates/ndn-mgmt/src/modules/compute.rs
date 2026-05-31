@@ -20,7 +20,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use ndn_config::{
-    ControlResponse, ControlParameters, control_response::status, nfd_command::{module, verb},
+    ControlParameters, ControlResponse,
+    control_response::status,
+    nfd_command::{module, verb},
 };
 
 use crate::module::{MgmtContext, MgmtModule};
@@ -54,10 +56,7 @@ fn fnkind_code(k: ComputeFnKind) -> u8 {
     }
 }
 
-fn handle_compute(
-    verb_name: &[u8],
-    handler: Option<&Arc<dyn ComputeMgmtBackend>>,
-) -> MgmtResponse {
+fn handle_compute(verb_name: &[u8], handler: Option<&Arc<dyn ComputeMgmtBackend>>) -> MgmtResponse {
     let Some(handler) = handler else {
         return ControlResponse::error(
             status::NOT_FOUND,
@@ -88,7 +87,10 @@ fn compute_list_dataset(rows: &[ComputeFunctionInfo]) -> bytes::Bytes {
             // `encode_to_tlv()` is the full Name TLV (TYPE_NAME header +
             // value), written verbatim into the function container.
             inner.write_raw(&info.prefix.encode_to_tlv());
-            inner.write_tlv(TYPE_COMPUTE_DETERMINISM, &[determinism_code(info.determinism)]);
+            inner.write_tlv(
+                TYPE_COMPUTE_DETERMINISM,
+                &[determinism_code(info.determinism)],
+            );
             inner.write_tlv(TYPE_COMPUTE_FNKIND, &[fnkind_code(info.kind)]);
             if let Some(fuel) = info.fuel {
                 inner.write_tlv(TYPE_COMPUTE_FUEL, &nni_be(fuel));

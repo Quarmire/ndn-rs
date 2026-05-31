@@ -156,13 +156,30 @@ mod tests {
         assert_eq!(t.link(FaceId(1)).and_then(|l| l.rssi_dbm), Some(-55));
 
         t.set_node(NodeSignals {
-            position: Some(GeoPos { lat_e7: 1, lon_e7: 2, alt_cm: 3 }),
+            position: Some(GeoPos {
+                lat_e7: 1,
+                lon_e7: 2,
+                alt_cm: 3,
+            }),
             ..Default::default()
         });
-        assert_eq!(t.node().position, Some(GeoPos { lat_e7: 1, lon_e7: 2, alt_cm: 3 }));
+        assert_eq!(
+            t.node().position,
+            Some(GeoPos {
+                lat_e7: 1,
+                lon_e7: 2,
+                alt_cm: 3
+            })
+        );
 
         assert_eq!(t.neighbor(FaceId(9)), None);
-        t.set_neighbor(FaceId(9), NodeSignals { battery_pct: Some(42), ..Default::default() });
+        t.set_neighbor(
+            FaceId(9),
+            NodeSignals {
+                battery_pct: Some(42),
+                ..Default::default()
+            },
+        );
         assert_eq!(t.neighbor(FaceId(9)).and_then(|n| n.battery_pct), Some(42));
     }
 }

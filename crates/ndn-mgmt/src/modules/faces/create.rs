@@ -10,9 +10,9 @@ use ndn_transport::{
 // Only the native face-creation paths (UDP/TCP/… dialing) spawn faces with a
 // cancel token; wasm32 has no such transports here.
 #[cfg(not(target_arch = "wasm32"))]
-use tokio_util::sync::CancellationToken;
-#[cfg(not(target_arch = "wasm32"))]
 use ndn_transport::Transport;
+#[cfg(not(target_arch = "wasm32"))]
+use tokio_util::sync::CancellationToken;
 
 use super::update::{mtu_refusal_reason, persistency_refusal_reason, refusal_reason_text};
 
@@ -112,6 +112,21 @@ fn existing_face_id_for_uri(engine: &ForwarderEngine, uri: &str) -> Option<FaceI
         .map(|info| info.id)
 }
 
+fn face_persistency_code(persistency: FacePersistency) -> u64 {
+    match persistency {
+        FacePersistency::Persistent => 0,
+        FacePersistency::OnDemand => 1,
+        FacePersistency::Permanent => 2,
+    }
+}
+
+fn face_flags(engine: &ForwarderEngine, face_id: FaceId) -> Option<u64> {
+    engine
+        .face_states()
+        .get(&face_id)
+        .map(|state| state.face_flags_raw())
+}
+
 /// Re-attach an existing face and best-effort apply mtu / flags /
 /// persistency from `params`. Returns `200 OK` with the existing
 /// face_id even when some options refuse; refusals surface in
@@ -135,8 +150,14 @@ fn faces_create_idempotent(
 
     let mut partial_failures = Vec::new();
     let mut applied_mtu = None;
-    let mut applied_persistency = None;
-    let mut applied_flags = None;
+    let mut applied_persistency = engine
+        .face_states()
+        .get(&face_id)
+        .map(|s| face_persistency_code(s.persistency));
+    let mut applied_flags = engine
+        .face_states()
+        .get(&face_id)
+        .map(|s| s.face_flags_raw());
 
     // Flags+Mask: refused bits collect into `partial_failures`
     // instead of short-circuiting (mirrors faces/update layout).
@@ -239,6 +260,8 @@ async fn faces_create_udp(addr_str: &str, engine: &ForwarderEngine) -> ControlRe
                 face_id: Some(face_id.0),
                 uri: Some(format!("udp4://{peer}")),
                 local_uri: Some(local_uri),
+                face_persistency: Some(face_persistency_code(FacePersistency::Persistent)),
+                flags: face_flags(engine, face_id),
                 ..Default::default()
             };
             ControlResponse::ok("OK", echo)
@@ -278,6 +301,8 @@ async fn faces_create_tcp(addr_str: &str, engine: &ForwarderEngine) -> ControlRe
                 face_id: Some(face_id.0),
                 uri: Some(format!("tcp4://{peer}")),
                 local_uri: Some(local_uri),
+                face_persistency: Some(face_persistency_code(FacePersistency::Persistent)),
+                flags: face_flags(engine, face_id),
                 ..Default::default()
             };
             ControlResponse::ok("OK", echo)
@@ -322,6 +347,8 @@ fn faces_create_ether(uri: &str, engine: &ForwarderEngine) -> ControlResponse {
                 face_id: Some(face_id.0),
                 uri: remote_uri,
                 local_uri: Some(local_uri),
+                face_persistency: Some(face_persistency_code(FacePersistency::Persistent)),
+                flags: face_flags(engine, face_id),
                 ..Default::default()
             };
             ControlResponse::ok("OK", echo)
@@ -401,6 +428,8 @@ async fn faces_create_webtransport(uri: &str, engine: &ForwarderEngine) -> Contr
                 face_id: Some(face_id.0),
                 uri: Some(format!("wts://{authority}")),
                 local_uri: Some(local_uri),
+                face_persistency: Some(face_persistency_code(FacePersistency::Persistent)),
+                flags: face_flags(engine, face_id),
                 ..Default::default()
             };
             ControlResponse::ok("OK", echo)
@@ -474,6 +503,8 @@ async fn faces_create_quic(uri: &str, engine: &ForwarderEngine) -> ControlRespon
                 face_id: Some(face_id.0),
                 uri: Some(format!("quic://{authority}")),
                 local_uri: Some(local_uri),
+                face_persistency: Some(face_persistency_code(FacePersistency::Persistent)),
+                flags: face_flags(engine, face_id),
                 ..Default::default()
             };
             ControlResponse::ok("OK", echo)
@@ -531,6 +562,8 @@ async fn faces_create_ble_central(
                 face_id: Some(face_id.0),
                 uri: Some(remote_uri.clone()),
                 local_uri: Some(remote_uri),
+                face_persistency: Some(face_persistency_code(FacePersistency::Persistent)),
+                flags: face_flags(engine, face_id),
                 ..Default::default()
             };
             ControlResponse::ok("OK", echo)
@@ -570,6 +603,8 @@ fn faces_create_shm(
                 face_id: Some(face_id.0),
                 uri: Some(format!("shm://{shm_name}")),
                 mtu,
+                face_persistency: Some(face_persistency_code(FacePersistency::OnDemand)),
+                flags: face_flags(engine, face_id),
                 ..Default::default()
             };
             ControlResponse::ok("OK", echo)

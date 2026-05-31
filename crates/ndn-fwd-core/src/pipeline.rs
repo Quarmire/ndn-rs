@@ -172,14 +172,22 @@ mod tests {
         duplicate_nonce: bool,
         nexthop: Option<u8>,
     ) -> InterestInputs<u8> {
-        InterestInputs { hop_limit, duplicate_nonce, nexthop, incoming_face: 0 }
+        InterestInputs {
+            hop_limit,
+            duplicate_nonce,
+            nexthop,
+            incoming_face: 0,
+        }
     }
 
     #[test]
     fn forwards_to_route() {
         assert_eq!(
             decide_interest(inputs(None, false, Some(1))),
-            InterestDecision::Forward { nexthop: 1, decrement_hop_limit: false }
+            InterestDecision::Forward {
+                nexthop: 1,
+                decrement_hop_limit: false
+            }
         );
     }
 
@@ -187,7 +195,10 @@ mod tests {
     fn forward_flags_hop_limit_present() {
         assert_eq!(
             decide_interest(inputs(Some(5), false, Some(1))),
-            InterestDecision::Forward { nexthop: 1, decrement_hop_limit: true }
+            InterestDecision::Forward {
+                nexthop: 1,
+                decrement_hop_limit: true
+            }
         );
     }
 
@@ -250,7 +261,13 @@ mod tests {
     #[test]
     fn with_stores_forwards() {
         let decision = decide_interest_with(&MockFib(Some(2)), &MockPit(0), &[b"a"], None, 7, 1);
-        assert_eq!(decision, InterestDecision::Forward { nexthop: 2, decrement_hop_limit: false });
+        assert_eq!(
+            decision,
+            InterestDecision::Forward {
+                nexthop: 2,
+                decrement_hop_limit: false
+            }
+        );
     }
 
     #[test]
@@ -264,7 +281,13 @@ mod tests {
     fn with_stores_nonce_zero_is_not_a_loop() {
         // nonce 0 is "absent" and never a duplicate even if the PIT reports it.
         let decision = decide_interest_with(&MockFib(Some(2)), &MockPit(0), &[b"a"], None, 0, 1);
-        assert_eq!(decision, InterestDecision::Forward { nexthop: 2, decrement_hop_limit: false });
+        assert_eq!(
+            decision,
+            InterestDecision::Forward {
+                nexthop: 2,
+                decrement_hop_limit: false
+            }
+        );
     }
 
     /// A PIT that satisfies once with a single recorded downstream face.
@@ -325,7 +348,11 @@ mod tests {
         const OTHER: u8 = 2;
         for case in crate::conformance::INTEREST_DECISION_CASES {
             let nexthop = if case.has_route {
-                Some(if case.route_to_incoming { INCOMING } else { OTHER })
+                Some(if case.route_to_incoming {
+                    INCOMING
+                } else {
+                    OTHER
+                })
             } else {
                 None
             };
@@ -345,7 +372,9 @@ mod tests {
         let mut pit = SatPit(None);
         let mut cs = RecCs::default();
         let mut called = false;
-        let decision = decide_data(&mut pit, &mut cs, &[b"a"], b"wire", 1000, 0, |_| called = true);
+        let decision = decide_data(&mut pit, &mut cs, &[b"a"], b"wire", 1000, 0, |_| {
+            called = true
+        });
         assert_eq!(decision, DataDecision::Unsolicited);
         assert!(!called, "no downstream send for unsolicited Data");
         assert!(!cs.admitted, "unsolicited Data must not be cached");

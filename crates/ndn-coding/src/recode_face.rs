@@ -222,11 +222,11 @@ impl RecoderState {
 /// `DigestSha256` coded evidence (verify-on-decode).
 fn build_signed(name: Name, content: Bytes, signer: Option<&Arc<dyn Signer>>) -> Bytes {
     match signer {
-        Some(s) => DataBuilder::new(name, &content).sign_sync(
-            s.sig_type(),
-            Some(s.key_name()),
-            |region| s.sign_sync(region).expect("recoder sign"),
-        ),
+        Some(s) => {
+            DataBuilder::new(name, &content).sign_sync(s.sig_type(), Some(s.key_name()), |region| {
+                s.sign_sync(region).expect("recoder sign")
+            })
+        }
         None => DataBuilder::new(name, &content).sign_digest_sha256(),
     }
 }
@@ -416,7 +416,10 @@ pub async fn verify_delegated_recoder_chained(
             return false; // signer outside the descriptor's recoder namespace
         }
     }
-    matches!(validator.validate_chain(data).await, ValidationResult::Valid(_))
+    matches!(
+        validator.validate_chain(data).await,
+        ValidationResult::Valid(_)
+    )
 }
 
 /// Issue a producer-signed [`RecodeToken`] authorizing `recoder` (a key or
@@ -483,10 +486,14 @@ mod tests {
 
     use ndn_security::Ed25519Signer;
 
-    use crate::recode::{CodingVector, SourceCommitment, row_hash};
     use crate::policy::Field;
+    use crate::recode::{CodingVector, SourceCommitment, row_hash};
 
-    fn descriptor(object: &Name, recode: crate::recode::RecodePolicy, deleg: Option<Name>) -> (GenerationDescriptor, Vec<Vec<u8>>) {
+    fn descriptor(
+        object: &Name,
+        recode: crate::recode::RecodePolicy,
+        deleg: Option<Name>,
+    ) -> (GenerationDescriptor, Vec<Vec<u8>>) {
         let sources = vec![vec![1u8, 2], vec![3, 4], vec![5, 6]];
         let commit = SourceCommitment::RowHashes(sources.iter().map(|r| row_hash(r)).collect());
         let d = GenerationDescriptor {
@@ -503,7 +510,12 @@ mod tests {
         (d, sources)
     }
 
-    async fn seed(state: &RecoderState, object: &Name, desc: &GenerationDescriptor, sources: &[Vec<u8>]) {
+    async fn seed(
+        state: &RecoderState,
+        object: &Name,
+        desc: &GenerationDescriptor,
+        sources: &[Vec<u8>],
+    ) {
         state.install_generation(desc.clone()).await;
         for (i, row) in sources.iter().enumerate() {
             let meta = CodedMetadata {
@@ -512,7 +524,11 @@ mod tests {
                 field: Field::Gf8,
                 vector: CodingVector::unit(desc.k, i as u16),
             };
-            assert!(state.feed(object, desc.generation_id, &meta, Bytes::from(row.clone())).await);
+            assert!(
+                state
+                    .feed(object, desc.generation_id, &meta, Bytes::from(row.clone()))
+                    .await
+            );
         }
     }
 
@@ -535,7 +551,10 @@ mod tests {
             req += 1;
         }
         assert!(consumer.is_decodable());
-        assert_eq!(consumer.decode().unwrap().as_ref(), sources.concat().as_slice());
+        assert_eq!(
+            consumer.decode().unwrap().as_ref(),
+            sources.concat().as_slice()
+        );
     }
 
     #[tokio::test]
@@ -569,14 +588,16 @@ mod tests {
         // A consumer holding the genuine sources passes the challenge.
         let mut good = GenerationBuffer::new(desc.clone());
         for (i, row) in sources.iter().enumerate() {
-            good.absorb(&meta(i as u16), Bytes::from(row.clone())).unwrap();
+            good.absorb(&meta(i as u16), Bytes::from(row.clone()))
+                .unwrap();
         }
         assert!(good.verify_against_challenge(&fp).is_ok());
 
         // A consumer holding a polluted packet (chosen before r was known)
         // fails — the fresh challenge catches it.
         let mut bad = GenerationBuffer::new(desc);
-        bad.absorb(&meta(0), Bytes::from_static(&[0xAA, 0xBB])).unwrap();
+        bad.absorb(&meta(0), Bytes::from_static(&[0xAA, 0xBB]))
+            .unwrap();
         assert_eq!(
             bad.verify_against_challenge(&fp),
             Err(crate::recode::DecodeError::FingerprintFailed)
@@ -594,7 +615,10 @@ mod tests {
         // The first K requests are the systematic sources (unit vectors) — no
         // GF combine to serve, no Gauss-Jordan to decode.
         for i in 0..k as u64 {
-            let wire = state.mint(&object, desc.generation_id, i, None).await.unwrap();
+            let wire = state
+                .mint(&object, desc.generation_id, i, None)
+                .await
+                .unwrap();
             let data = Data::decode(wire).unwrap();
             let (meta, _) = CodedMetadata::split(data.content().unwrap()).unwrap();
             assert_eq!(
@@ -604,7 +628,10 @@ mod tests {
             );
         }
         // Requests beyond K are repair combinations (still serve fine).
-        let wire = state.mint(&object, desc.generation_id, k as u64, None).await.unwrap();
+        let wire = state
+            .mint(&object, desc.generation_id, k as u64, None)
+            .await
+            .unwrap();
         let data = Data::decode(wire).unwrap();
         let (meta, _) = CodedMetadata::split(data.content().unwrap()).unwrap();
         assert_eq!(meta.vector.len(), k as usize);
@@ -618,22 +645,35 @@ mod tests {
         let (desc_none, sources) = descriptor(&object, crate::recode::RecodePolicy::None, None);
         let state = RecoderState::new();
         seed(&state, &object, &desc_none, &sources).await;
-        assert!(state.mint(&object, 7, 0, None).await.is_none(), "policy=none must not mint");
+        assert!(
+            state.mint(&object, 7, 0, None).await.is_none(),
+            "policy=none must not mint"
+        );
 
         // policy = open but kill switch off → never mints
         let (desc_open, sources2) = descriptor(&object, crate::recode::RecodePolicy::Open, None);
         let state2 = RecoderState::new();
         seed(&state2, &object, &desc_open, &sources2).await;
-        assert!(state2.mint(&object, 7, 0, None).await.is_some(), "enabled+open mints");
+        assert!(
+            state2.mint(&object, 7, 0, None).await.is_some(),
+            "enabled+open mints"
+        );
         state2.set_enabled(false);
-        assert!(state2.mint(&object, 7, 1, None).await.is_none(), "kill switch stops minting");
+        assert!(
+            state2.mint(&object, 7, 1, None).await.is_none(),
+            "kill switch stops minting"
+        );
     }
 
     #[tokio::test]
     async fn delegated_signing_authorizes_by_namespace() {
         let object: Name = "/alice/clip".parse().unwrap();
         let deleg: Name = "/site-a/recoders".parse().unwrap();
-        let (desc, sources) = descriptor(&object, crate::recode::RecodePolicy::Delegated, Some(deleg.clone()));
+        let (desc, sources) = descriptor(
+            &object,
+            crate::recode::RecodePolicy::Delegated,
+            Some(deleg.clone()),
+        );
 
         // Authorized recoder key under the delegation namespace.
         let key_name: Name = "/site-a/recoders/k1".parse().unwrap();
@@ -643,17 +683,29 @@ mod tests {
 
         let state = RecoderState::new();
         seed(&state, &object, &desc, &sources).await;
-        let wire = state.mint(&object, 7, 0, Some(&signer)).await.expect("mint signed");
+        let wire = state
+            .mint(&object, 7, 0, Some(&signer))
+            .await
+            .expect("mint signed");
         let data = Data::decode(wire).unwrap();
-        assert!(verify_delegated_recoder(&data, &desc, &pk), "authorized + valid sig accepted");
+        assert!(
+            verify_delegated_recoder(&data, &desc, &pk),
+            "authorized + valid sig accepted"
+        );
 
         // Out-of-namespace key → rejected on authorization even with a valid sig.
         let mut bad_desc = desc.clone();
         bad_desc.delegation = Some("/other/recoders".parse().unwrap());
-        assert!(!verify_delegated_recoder(&data, &bad_desc, &pk), "out-of-namespace rejected");
+        assert!(
+            !verify_delegated_recoder(&data, &bad_desc, &pk),
+            "out-of-namespace rejected"
+        );
 
         // Tampered public key → crypto fails.
-        assert!(!verify_delegated_recoder(&data, &desc, &[0u8; 32]), "bad key rejected");
+        assert!(
+            !verify_delegated_recoder(&data, &desc, &[0u8; 32]),
+            "bad key rejected"
+        );
     }
 
     #[tokio::test]
@@ -740,7 +792,10 @@ mod tests {
         });
         validator.cert_cache().insert(cert);
         assert!(
-            matches!(validator.validate_chain(&data).await, ValidationResult::Valid(_)),
+            matches!(
+                validator.validate_chain(&data).await,
+                ValidationResult::Valid(_)
+            ),
             "sanity: chain resolves"
         );
         assert!(verify_delegated_recoder_chained(&data, &desc, &validator).await);
@@ -768,7 +823,11 @@ mod tests {
         let recoder: Arc<dyn Signer> = Arc::new(recoder);
 
         // Producer issues a token for the recoder namespace; recoder mints+signs.
-        let token = issue_token(&producer, desc.generation_id, "/site-b/recoders".parse().unwrap());
+        let token = issue_token(
+            &producer,
+            desc.generation_id,
+            "/site-b/recoders".parse().unwrap(),
+        );
         let state = RecoderState::new();
         seed(&state, &object, &desc, &sources).await;
         let wire = state
@@ -783,10 +842,26 @@ mod tests {
         );
 
         // Token authorizing a different recoder namespace → rejected.
-        let wrong = issue_token(&producer, desc.generation_id, "/other/recoders".parse().unwrap());
-        assert!(!verify_token_recoder(&data, &desc, &wrong, &producer_pk, &recoder_pk));
+        let wrong = issue_token(
+            &producer,
+            desc.generation_id,
+            "/other/recoders".parse().unwrap(),
+        );
+        assert!(!verify_token_recoder(
+            &data,
+            &desc,
+            &wrong,
+            &producer_pk,
+            &recoder_pk
+        ));
 
         // Forged token (not the producer's key) → producer-signature check fails.
-        assert!(!verify_token_recoder(&data, &desc, &token, &[9u8; 32], &recoder_pk));
+        assert!(!verify_token_recoder(
+            &data,
+            &desc,
+            &token,
+            &[9u8; 32],
+            &recoder_pk
+        ));
     }
 }

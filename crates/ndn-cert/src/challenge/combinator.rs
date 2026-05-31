@@ -28,6 +28,35 @@ fn read_completed(state: &ChallengeState) -> Vec<bool> {
         .unwrap_or_default()
 }
 
+/// Per-sub challenge state carried across rounds. Initialized from each sub's
+/// `begin` so stateful subs (e.g. device-approval, which registers a pending
+/// request) are properly started, and updated when a sub returns `Pending`.
+fn read_sub_data(state: &ChallengeState, n: usize) -> Vec<serde_json::Value> {
+    let mut v: Vec<serde_json::Value> = state
+        .data
+        .get("sub_data")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.to_vec())
+        .unwrap_or_default();
+    if v.len() != n {
+        v = vec![serde_json::Value::Null; n];
+    }
+    v
+}
+
+/// Run each sub's `begin` to capture its initial per-sub state (and trigger any
+/// begin-time side effects, like submitting an approval request).
+async fn begin_subs(
+    subs: &[Box<dyn ChallengeHandler>],
+    req: &CertRequest,
+) -> Result<Vec<serde_json::Value>, CertError> {
+    let mut out = Vec::with_capacity(subs.len());
+    for sub in subs {
+        out.push(sub.begin(req).await?.data);
+    }
+    Ok(out)
+}
+
 /// Read the attestation leaves accumulated from subs satisfied in prior
 /// rounds. Malformed/absent state yields an empty list.
 fn read_leaves(state: &ChallengeState) -> Vec<ChallengeAttestation> {
@@ -38,7 +67,12 @@ fn read_leaves(state: &ChallengeState) -> Vec<ChallengeAttestation> {
         .unwrap_or_default()
 }
 
-fn write_progress(state: &mut ChallengeState, completed: &[bool], leaves: &[ChallengeAttestation]) {
+fn write_progress(
+    state: &mut ChallengeState,
+    completed: &[bool],
+    leaves: &[ChallengeAttestation],
+    sub_data: &[serde_json::Value],
+) {
     let completed_arr: Vec<serde_json::Value> = completed
         .iter()
         .map(|b| serde_json::Value::Bool(*b))
@@ -57,6 +91,10 @@ fn write_progress(state: &mut ChallengeState, completed: &[bool], leaves: &[Chal
     obj.insert(
         "leaves".to_string(),
         serde_json::to_value(leaves).unwrap_or(serde_json::Value::Null),
+    );
+    obj.insert(
+        "sub_data".to_string(),
+        serde_json::Value::Array(sub_data.to_vec()),
     );
 }
 
@@ -101,6 +139,7 @@ async fn threshold_round(
         completed = vec![false; subs.len()];
     }
     let mut leaves = read_leaves(state);
+    let mut sub_data = read_sub_data(state, subs.len());
 
     let idx = match pick_subchallenge_index(parameters, subs.len()) {
         Ok(i) => i,
@@ -109,7 +148,7 @@ async fn threshold_round(
     let sub = &subs[idx];
     let sub_state = ChallengeState {
         challenge_type: sub.challenge_type().to_string(),
-        data: serde_json::Value::Null,
+        data: sub_data[idx].clone(),
     };
 
     match sub.verify(&sub_state, parameters).await? {
@@ -129,7 +168,7 @@ async fn threshold_round(
                     challenge_type: label.to_string(),
                     data: serde_json::json!({}),
                 };
-                write_progress(&mut next_state, &completed, &leaves);
+                write_progress(&mut next_state, &completed, &leaves, &sub_data);
                 Ok(ChallengeOutcome::Pending {
                     status_message: format!(
                         "Sub-challenge {idx} approved; {remaining} more required"
@@ -147,13 +186,15 @@ async fn threshold_round(
             status_message,
             remaining_tries,
             remaining_time_secs,
-            next_state: _,
+            next_state: sub_next,
         } => {
+            // Persist the sub's evolving state so a later round resumes it.
+            sub_data[idx] = sub_next.data;
             let mut next_state = ChallengeState {
                 challenge_type: label.to_string(),
                 data: serde_json::json!({}),
             };
-            write_progress(&mut next_state, &completed, &leaves);
+            write_progress(&mut next_state, &completed, &leaves, &sub_data);
             Ok(ChallengeOutcome::Pending {
                 status_message: format!("sub {idx}: {status_message}"),
                 remaining_tries,
@@ -194,13 +235,14 @@ impl ChallengeHandler for AllOf {
 
     fn begin<'a>(
         &'a self,
-        _req: &'a CertRequest,
+        req: &'a CertRequest,
     ) -> Pin<Box<dyn Future<Output = Result<ChallengeState, CertError>> + Send + 'a>> {
         Box::pin(async move {
             let completed: Vec<bool> = vec![false; self.subs.len()];
+            let sub_data = begin_subs(&self.subs, req).await?;
             Ok(ChallengeState {
                 challenge_type: "all-of".to_string(),
-                data: serde_json::json!({ "completed": completed }),
+                data: serde_json::json!({ "completed": completed, "sub_data": sub_data }),
             })
         })
     }
@@ -230,7 +272,10 @@ pub struct NofM {
 impl NofM {
     /// `n` must be in `1..=subs.len()`.
     pub fn new(n: usize, subs: Vec<Box<dyn ChallengeHandler>>) -> Self {
-        assert!(!subs.is_empty(), "NofM must have at least one sub-challenge");
+        assert!(
+            !subs.is_empty(),
+            "NofM must have at least one sub-challenge"
+        );
         assert!(
             n >= 1 && n <= subs.len(),
             "NofM threshold {n} out of range 1..={}",
@@ -259,13 +304,14 @@ impl ChallengeHandler for NofM {
 
     fn begin<'a>(
         &'a self,
-        _req: &'a CertRequest,
+        req: &'a CertRequest,
     ) -> Pin<Box<dyn Future<Output = Result<ChallengeState, CertError>> + Send + 'a>> {
         Box::pin(async move {
             let completed: Vec<bool> = vec![false; self.subs.len()];
+            let sub_data = begin_subs(&self.subs, req).await?;
             Ok(ChallengeState {
                 challenge_type: "nofm".to_string(),
-                data: serde_json::json!({ "completed": completed }),
+                data: serde_json::json!({ "completed": completed, "sub_data": sub_data }),
             })
         })
     }
@@ -319,19 +365,20 @@ impl ChallengeHandler for AnyOf {
 
     fn begin<'a>(
         &'a self,
-        _req: &'a CertRequest,
+        req: &'a CertRequest,
     ) -> Pin<Box<dyn Future<Output = Result<ChallengeState, CertError>> + Send + 'a>> {
         Box::pin(async move {
+            let sub_data = begin_subs(&self.subs, req).await?;
             Ok(ChallengeState {
                 challenge_type: "any-of".to_string(),
-                data: serde_json::Value::Null,
+                data: serde_json::json!({ "sub_data": sub_data }),
             })
         })
     }
 
     fn verify<'a>(
         &'a self,
-        _state: &'a ChallengeState,
+        state: &'a ChallengeState,
         parameters: &'a serde_json::Map<String, serde_json::Value>,
     ) -> Pin<Box<dyn Future<Output = Result<ChallengeOutcome, CertError>> + Send + 'a>> {
         Box::pin(async move {
@@ -340,9 +387,10 @@ impl ChallengeHandler for AnyOf {
                 Err(o) => return Ok(o),
             };
             let sub = &self.subs[idx];
+            let sub_data = read_sub_data(state, self.subs.len());
             let sub_state = ChallengeState {
                 challenge_type: sub.challenge_type().to_string(),
-                data: serde_json::Value::Null,
+                data: sub_data[idx].clone(),
             };
             match sub.verify(&sub_state, parameters).await? {
                 // The winning sub's own attestation becomes the AnyOf leaf —
@@ -572,7 +620,13 @@ mod tests {
             other => panic!("expected Pending after 1 of 2, got {other:?}"),
         };
         let set = approved_set(c.verify(&next, &params("2")).await.unwrap());
-        assert_eq!(set.combinator, Combinator::NofM { required: 2, total: 3 });
+        assert_eq!(
+            set.combinator,
+            Combinator::NofM {
+                required: 2,
+                total: 3
+            }
+        );
         assert_eq!(set.leaves.len(), 2, "exactly the satisfied subs");
         assert_eq!(set.leaves[0].kind, "a");
         assert_eq!(set.leaves[1].kind, "c");
@@ -583,7 +637,13 @@ mod tests {
         let c = NofM::new(1, vec![approved("a"), approved("b")]);
         let state = c.begin(&dummy_request()).await.unwrap();
         let set = approved_set(c.verify(&state, &params("1")).await.unwrap());
-        assert_eq!(set.combinator, Combinator::NofM { required: 1, total: 2 });
+        assert_eq!(
+            set.combinator,
+            Combinator::NofM {
+                required: 1,
+                total: 2
+            }
+        );
         assert_eq!(set.leaves.len(), 1);
         assert_eq!(set.leaves[0].kind, "b");
     }

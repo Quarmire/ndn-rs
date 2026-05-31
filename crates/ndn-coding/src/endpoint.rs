@@ -171,7 +171,12 @@ impl CodedFetcher {
         Self { config }
     }
 
-    async fn send_index(&self, consumer: &Consumer, object: &Name, index: u16) -> Result<(), AppError> {
+    async fn send_index(
+        &self,
+        consumer: &Consumer,
+        object: &Name,
+        index: u16,
+    ) -> Result<(), AppError> {
         let wire = InterestBuilder::new(segment_name(object, index))
             .lifetime(self.config.lifetime)
             .must_be_fresh()

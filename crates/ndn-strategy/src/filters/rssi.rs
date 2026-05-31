@@ -63,7 +63,10 @@ mod tests {
     use std::sync::Arc;
 
     fn rssi(dbm: i8) -> LinkSignals {
-        LinkSignals { rssi_dbm: Some(dbm), ..Default::default() }
+        LinkSignals {
+            rssi_dbm: Some(dbm),
+            ..Default::default()
+        }
     }
 
     fn make_ctx<'a>(
@@ -125,7 +128,9 @@ mod tests {
         let result = filter.filter(&ctx, actions);
         assert_eq!(result.len(), 1);
         match &result[0] {
-            ForwardingAction::Forward(faces) => assert_eq!(faces.as_slice(), &[FaceId(1), FaceId(3)]),
+            ForwardingAction::Forward(faces) => {
+                assert_eq!(faces.as_slice(), &[FaceId(1), FaceId(3)])
+            }
             _ => panic!("expected Forward"),
         }
     }

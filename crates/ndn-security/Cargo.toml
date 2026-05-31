@@ -14,6 +14,7 @@ ndn-tlv       = { workspace = true, features = ["std"] }
 bytes         = { workspace = true, features = ["std"] }
 dashmap       = { workspace = true }
 thiserror     = { workspace = true }
+tracing       = { workspace = true }
 getrandom     = { workspace = true }
 web-time      = { workspace = true }
 # SQLite for the ndn-cxx-compatible pib-sqlite3 backend. `bundled` builds
@@ -36,6 +37,7 @@ p256-ecdsa    = { package = "p256", version = "0.13", default-features = false, 
 pkcs1         = { version = "0.7",  features = ["std", "alloc"] }
 sec1          = { version = "0.7",  default-features = false, features = ["std", "alloc", "der", "pem", "pkcs8"] }
 pkcs8         = { version = "0.10", default-features = false, features = ["std", "alloc", "encryption", "pem"] }
+pkcs5         = { version = "0.7",  default-features = false, features = ["alloc", "pbes2"] }
 sha2          = { workspace = true }
 # Symmetric crypto for SafeBag's PKCS#8-encrypted private key wrapping
 # (PBES2 / PBKDF2-HMAC-SHA256 / AES-256-CBC, matching what OpenSSL's

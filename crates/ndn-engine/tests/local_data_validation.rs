@@ -78,10 +78,7 @@ async fn consumer_receives_data(require_validation: bool) -> bool {
     let data = DataBuilder::new("/sec/data", b"payload").sign_digest_sha256();
     handle_b.send(data).await.expect("inject data");
 
-    let got = recv_timeout(&handle_a)
-        .await
-        .as_ref()
-        .is_some_and(is_data);
+    let got = recv_timeout(&handle_a).await.as_ref().is_some_and(is_data);
     shutdown.shutdown().await;
     got
 }

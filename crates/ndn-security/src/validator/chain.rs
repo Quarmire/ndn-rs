@@ -60,14 +60,15 @@ impl Validator {
             None => return ValidationResult::Invalid(TrustError::InvalidSignature),
         };
 
-        if !self
-            .schema
-            .read()
-            .expect("schema RwLock poisoned")
-            .allows(&data.name, &first_key)
-        {
+        // Dispatch to the context governing this name; the chain is checked
+        // against *its* schema (with the hierarchy floor) and terminates only
+        // at *its* anchors. An anchor held for another namespace cannot
+        // terminate this chain — the per-namespace skeleton-key fix.
+        let ctx = self.keyring.context_for(&data.name);
+        if !ctx.authorizes(&data.name, &first_key) {
             return ValidationResult::Invalid(TrustError::SchemaMismatch);
         }
+        let anchors = ctx.anchors();
 
         let now = now_ns();
         let mut chain_names: Vec<Name> = Vec::new();
@@ -88,7 +89,16 @@ impl Validator {
                 });
             }
 
-            if let Some(anchor) = self.trust_anchors.get(&current_key_name) {
+            // A chain that passes through a key revoked by the selected
+            // context is rejected — this is how an issuing-CA compromise is
+            // contained by a pulled context bump (no re-bootstrap).
+            if ctx.is_revoked(&current_key_name) {
+                return ValidationResult::Invalid(TrustError::Revoked {
+                    name: current_key_name.to_string(),
+                });
+            }
+
+            if let Some(anchor) = anchors.get(&current_key_name) {
                 if !anchor.is_valid_at(now) {
                     return ValidationResult::Invalid(TrustError::CertNotFound {
                         name: format!("expired trust anchor: {}", current_key_name),
@@ -237,8 +247,8 @@ impl Validator {
             // subsequent `resolve_cert(...).await`; fresh bindings per
             // rule since `NamePattern::matches` consumes them.
             {
-                let schema_guard = self.schema.read().expect("schema RwLock poisoned");
-                for r in schema_guard.rules() {
+                let schema = self.keyring.context_for(&current.name).schema_snapshot();
+                for r in schema.rules() {
                     let mut bindings = std::collections::HashMap::new();
                     let data_ok = r.data_pattern.matches(&current.name, &mut bindings);
                     let key_ok = data_ok && r.key_pattern.matches(&issuer, &mut bindings);

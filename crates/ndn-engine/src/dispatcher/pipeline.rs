@@ -109,10 +109,12 @@ impl PacketDispatcher {
     async fn process_packet_inner(&self, pkt: InboundPacket) {
         trace!(target: t::FWD_PIPELINE, face=%pkt.face_id, len=pkt.raw.len(), "pipeline: packet arrived");
         let meta = pkt.meta;
-        let ctx = match self
-            .decode
-            .decode_resolved(pkt.raw, pkt.face_id, pkt.arrival, meta.endpoint_id())
-        {
+        let ctx = match self.decode.decode_resolved(
+            pkt.raw,
+            pkt.face_id,
+            pkt.arrival,
+            meta.endpoint_id(),
+        ) {
             Action::Continue(ctx) => ctx,
             Action::Drop(DropReason::FragmentCollect) => {
                 trace!(target: t::FACE_LP, face=%pkt.face_id, "fragment collected, awaiting reassembly");
@@ -270,6 +272,11 @@ impl PacketDispatcher {
             _ => return,
         };
 
+        if !self.nacks_allowed_on_face(ctx.face_id) {
+            debug!(target: t::FWD_PIT, face=?ctx.face_id, "nack on multi-access/ad-hoc face, dropping");
+            return;
+        }
+
         let name = match &ctx.name {
             Some(n) => n.clone(),
             None => return,
@@ -325,7 +332,7 @@ impl PacketDispatcher {
             runtime: &self.strategy.runtime,
         };
 
-        let nack_reason = match nack.reason {
+        let nack_reason = match nack.reason.unwrap_or(ndn_packet::NackReason::NoRoute) {
             ndn_packet::NackReason::NoRoute => NackReason::NoRoute,
             ndn_packet::NackReason::Duplicate => NackReason::Duplicate,
             ndn_packet::NackReason::Congestion => NackReason::Congestion,
@@ -359,9 +366,13 @@ impl PacketDispatcher {
             ForwardingAction::Nack(_reason) => {
                 if let Some((_, entry)) = self.strategy.pit.remove(&token) {
                     let interest_wire = nack.interest.raw().clone();
-                    let packet_reason = nack.reason;
+                    let packet_reason = nack.reason.unwrap_or(ndn_packet::NackReason::NoRoute);
                     for face_id_raw in entry.in_record_faces() {
                         let face_id = FaceId(face_id_raw);
+                        if !self.nacks_allowed_on_face(face_id) {
+                            debug!(target: t::FWD_STRATEGY, face=%face_id, "nack propagation suppressed on multi-access/ad-hoc in-record face");
+                            continue;
+                        }
                         let intent = crate::engine::EgressIntent {
                             nack: Some(packet_reason),
                             ..Default::default()

@@ -72,7 +72,9 @@ fn descriptor_and_token_canonical_roundtrip() {
         symbol_size: 4,
         field: Field::Gf8,
         content_name: "/alice/clip/v=3".parse().unwrap(),
-        source_commitment: SourceCommitment::RowHashes(sources.iter().map(|r| row_hash(r)).collect()),
+        source_commitment: SourceCommitment::RowHashes(
+            sources.iter().map(|r| row_hash(r)).collect(),
+        ),
         recode: RecodePolicy::Open,
         delegation: None,
         fingerprint: None,

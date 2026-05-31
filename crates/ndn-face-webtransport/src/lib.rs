@@ -88,17 +88,13 @@ impl WebTransportListener {
 
         // SHA-256 of the leaf cert — a dialing peer pins this via
         // `ClientTls::CertHashes`, and browsers via `serverCertificateHashes`.
-        let leaf_cert_sha256 = identity
-            .certificate_chain()
-            .as_slice()
-            .first()
-            .map(|leaf| {
-                use sha2::{Digest, Sha256};
-                let digest = Sha256::digest(leaf.der());
-                let mut out = [0u8; 32];
-                out.copy_from_slice(&digest);
-                out
-            });
+        let leaf_cert_sha256 = identity.certificate_chain().as_slice().first().map(|leaf| {
+            use sha2::{Digest, Sha256};
+            let digest = Sha256::digest(leaf.der());
+            let mut out = [0u8; 32];
+            out.copy_from_slice(&digest);
+            out
+        });
 
         let config = ServerConfig::builder()
             .with_bind_address(addr)

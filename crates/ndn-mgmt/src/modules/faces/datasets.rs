@@ -151,8 +151,8 @@ pub(super) mod link_quality_tlv {
 
 /// Pure encoder for the link-quality dataset (testable without an engine).
 pub(super) fn encode_link_quality(entries: &[(u64, ndn_strategy::LinkSignals)]) -> bytes::Bytes {
-    use ndn_strategy::CongestionLevel;
     use link_quality_tlv as t;
+    use ndn_strategy::CongestionLevel;
 
     fn tlv(buf: &mut Vec<u8>, typ: u8, val: &[u8]) {
         buf.push(typ);

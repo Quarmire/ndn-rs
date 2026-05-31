@@ -651,7 +651,7 @@ mod tests {
     /// `from_lvs_binary` rejects schemas using user functions rather than
     /// loading them silently (fail-safe behaviour).
     #[test]
-    fn from_lvs_binary_rejects_user_functions() {
+    fn c16_from_lvs_binary_rejects_user_functions() {
         use crate::lvs::{LVS_VERSION, LvsError, type_number as tn};
         use bytes::BytesMut;
         use ndn_tlv::TlvWriter;

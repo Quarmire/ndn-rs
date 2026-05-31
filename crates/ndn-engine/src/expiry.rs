@@ -6,7 +6,7 @@ use ndn_discovery_core::DiscoveryProtocol;
 use ndn_runtime::Runtime;
 use tokio_util::sync::CancellationToken;
 
-use ndn_store::Pit;
+use ndn_store::{DeadNonceList, Pit};
 use ndn_transport::{FaceId, FaceKind, FacePersistency, FaceTable};
 
 use crate::Fib;
@@ -25,6 +25,7 @@ use std::sync::atomic::Ordering;
 )]
 pub async fn run_expiry_task(
     pit: Arc<Pit>,
+    dead_nonce_list: Option<Arc<DeadNonceList>>,
     face_states: Arc<DashMap<FaceId, FaceState>>,
     cancel: CancellationToken,
     runtime: Arc<dyn Runtime>,
@@ -36,7 +37,19 @@ pub async fn run_expiry_task(
             biased;            _ = cancel.cancelled() => break,
             _ = sleep => {
                 let now = now_ns();
-                let expired = pit.drain_expired(now);
+                let expired_entries = pit.drain_expired_entries(now);
+                let expired: Vec<_> = expired_entries
+                    .into_iter()
+                    .map(|(token, entry)| {
+                        crate::stages::pit::insert_dead_nonces(&dead_nonce_list, &entry);
+                        let faces: smallvec::SmallVec<[u64; 4]> =
+                            entry.in_records.iter().map(|r| r.face_id).collect();
+                        (token, faces)
+                    })
+                    .collect();
+                if let Some(dnl) = dead_nonce_list.as_ref() {
+                    dnl.purge_expired(now);
+                }
                 if !expired.is_empty() {
                     tracing::trace!(target: t::FWD_PIT, count = expired.len(), "PIT entries expired");
                     // Credit `NUnsatisfiedInterests` on every in-face whose
@@ -185,7 +198,13 @@ mod tests {
         let cancel = CancellationToken::new();
         let runtime = ndn_runtime::default_runtime();
         let face_states = Arc::new(DashMap::<FaceId, FaceState>::new());
-        let task = tokio::spawn(run_expiry_task(pit, face_states, cancel.clone(), runtime));
+        let task = tokio::spawn(run_expiry_task(
+            pit,
+            None,
+            face_states,
+            cancel.clone(),
+            runtime,
+        ));
         cancel.cancel();
         tokio::time::timeout(Duration::from_millis(200), task)
             .await
@@ -199,7 +218,13 @@ mod tests {
         let cancel = CancellationToken::new();
         let runtime = ndn_runtime::default_runtime();
         let face_states = Arc::new(DashMap::<FaceId, FaceState>::new());
-        let task = tokio::spawn(run_expiry_task(pit, face_states, cancel.clone(), runtime));
+        let task = tokio::spawn(run_expiry_task(
+            pit,
+            None,
+            face_states,
+            cancel.clone(),
+            runtime,
+        ));
         tokio::time::sleep(Duration::from_millis(5)).await;
         cancel.cancel();
         tokio::time::timeout(Duration::from_millis(200), task)

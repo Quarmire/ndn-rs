@@ -4,9 +4,9 @@
 //! Two gates protect route installation: (1) the active strategy for the
 //! announced prefix must be self-learning, and (2) the announcement must pass
 //! the engine's `Validator` (try_self_learn calls `validate` and installs only
-//! on `Valid`). This file pins both gates + the broadcast behavior. The default
-//! validator here accepts the DigestSha256 test announcement; a strict
-//! trust-anchor leg that *rejects* an untrusted announcement is a follow-up.
+//! on `Valid`). This file pins both gates, broadcast behavior, live use of the
+//! learned route, and fail-closed handling for tampered/untrusted
+//! announcements.
 
 use std::time::Duration;
 
@@ -70,7 +70,12 @@ fn use_self_learning(engine: &ndn_engine::ForwarderEngine) {
 async fn run_announcement_flow(
     self_learning: bool,
     pa: Bytes,
-) -> (ndn_engine::ForwarderEngine, ndn_engine::ShutdownHandle) {
+) -> (
+    ndn_engine::ForwarderEngine,
+    ndn_engine::ShutdownHandle,
+    InProcHandle,
+    InProcHandle,
+) {
     let (fc, hc) = InProcFace::new(FaceId(CONSUMER), 128);
     let (fnb, hnb) = InProcFace::new(FaceId(NEIGHBOR), 128);
     let (engine, shutdown) = EngineBuilder::new(EngineConfig::default())
@@ -97,7 +102,7 @@ async fn run_announcement_flow(
     hnb.send(wire).await.unwrap();
     let _ = recv_timeout(&hc).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
-    (engine, shutdown)
+    (engine, shutdown, hc, hnb)
 }
 
 fn learned_route_present(engine: &ndn_engine::ForwarderEngine) -> bool {
@@ -133,7 +138,8 @@ async fn untrusted_ed25519_pa(prefix: &str) -> Bytes {
 /// the announcing (neighbor) face.
 #[tokio::test]
 async fn validated_announcement_installs_route() {
-    let (engine, shutdown) = run_announcement_flow(true, pa_for("/learned")).await;
+    let (engine, shutdown, _consumer, _neighbor) =
+        run_announcement_flow(true, pa_for("/learned")).await;
     assert!(
         learned_route_present(&engine),
         "self-learning must install a /learned route toward the neighbor face"
@@ -141,11 +147,36 @@ async fn validated_announcement_installs_route() {
     shutdown.shutdown().await;
 }
 
+/// The learned route is not just visible in the FIB: a later Interest under the
+/// announced prefix must actually traverse the forwarding path to the
+/// announcing neighbor.
+#[tokio::test]
+async fn learned_route_forwards_followup_interest() {
+    let (engine, shutdown, consumer, neighbor) =
+        run_announcement_flow(true, pa_for("/learned")).await;
+    assert!(
+        learned_route_present(&engine),
+        "fixture must install the learned route before probing it"
+    );
+
+    let followup = InterestBuilder::new("/learned/item")
+        .lifetime(Duration::from_secs(2))
+        .build();
+    consumer.send(followup).await.unwrap();
+    let forwarded = recv_timeout(&neighbor)
+        .await
+        .expect("follow-up Interest must reach the announcing neighbor");
+    let interest = ndn_packet::Interest::decode(forwarded).expect("forwarded Interest decodes");
+    assert_eq!(interest.name.to_string(), "/learned/item");
+    shutdown.shutdown().await;
+}
+
 /// Strategy gate: when the active strategy is NOT self-learning, a
 /// PrefixAnnouncement is ignored — no route is installed.
 #[tokio::test]
 async fn non_self_learning_strategy_ignores_announcement() {
-    let (engine, shutdown) = run_announcement_flow(false, pa_for("/learned")).await;
+    let (engine, shutdown, _consumer, _neighbor) =
+        run_announcement_flow(false, pa_for("/learned")).await;
     assert!(
         !learned_route_present(&engine),
         "without the self-learning strategy, a PrefixAnnouncement installs no route"
@@ -160,7 +191,8 @@ async fn tampered_announcement_installs_no_route() {
     let mut pa = pa_for("/learned").to_vec();
     let n = pa.len();
     pa[n - 1] ^= 0xFF; // corrupt the trailing SignatureValue byte
-    let (engine, shutdown) = run_announcement_flow(true, Bytes::from(pa)).await;
+    let (engine, shutdown, _consumer, _neighbor) =
+        run_announcement_flow(true, Bytes::from(pa)).await;
     assert!(
         !learned_route_present(&engine),
         "a PrefixAnnouncement that fails validation must install no route"
@@ -173,7 +205,7 @@ async fn tampered_announcement_installs_no_route() {
 #[tokio::test]
 async fn untrusted_announcement_installs_no_route() {
     let pa = untrusted_ed25519_pa("/learned").await;
-    let (engine, shutdown) = run_announcement_flow(true, pa).await;
+    let (engine, shutdown, _consumer, _neighbor) = run_announcement_flow(true, pa).await;
     assert!(
         !learned_route_present(&engine),
         "a PrefixAnnouncement signed by an untrusted key must install no route"

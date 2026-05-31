@@ -67,7 +67,9 @@ fn descriptor(k: u16, symbol_size: u32, sources: &[Vec<u8>]) -> GenerationDescri
         symbol_size,
         field: Field::Gf8,
         content_name: "/bench/gen".parse().unwrap(),
-        source_commitment: SourceCommitment::RowHashes(sources.iter().map(|r| row_hash(r)).collect()),
+        source_commitment: SourceCommitment::RowHashes(
+            sources.iter().map(|r| row_hash(r)).collect(),
+        ),
         recode: RecodePolicy::Open,
         delegation: None,
         fingerprint: None,
@@ -131,7 +133,13 @@ fn arq_rounds(k: u16, p_permille: u64, rng: &mut Lcg) -> u32 {
 /// Scenario B — multicast source transmissions to serve `m` receivers.
 /// recode: broadcast fresh combinations; each receiver absorbs delivered
 /// innovative ones; stop when all `m` are decodable.
-fn recode_tx_multicast(k: u16, sources: &[Vec<u8>], m: usize, p_permille: u64, rng: &mut Lcg) -> u32 {
+fn recode_tx_multicast(
+    k: u16,
+    sources: &[Vec<u8>],
+    m: usize,
+    p_permille: u64,
+    rng: &mut Lcg,
+) -> u32 {
     let held: Vec<CodedPacket> = sources
         .iter()
         .enumerate()
@@ -196,7 +204,11 @@ fn rtt_vs_no_recode_tables() {
     let k: u16 = 16;
     let symbol_size = 64usize;
     let sources: Vec<Vec<u8>> = (0..k)
-        .map(|s| (0..symbol_size).map(|j| ((s as usize * 31 + j) & 0xff) as u8).collect())
+        .map(|s| {
+            (0..symbol_size)
+                .map(|j| ((s as usize * 31 + j) & 0xff) as u8)
+                .collect()
+        })
         .collect();
     let trials = 200u32;
 
@@ -219,13 +231,18 @@ fn rtt_vs_no_recode_tables() {
         }
         // Parallel-retry unicast: comparable within a small factor (no win).
         if p >= 300 {
-            assert!(rec <= arq * 1.3, "unicast recode ~ ARQ (rec {rec:.2}, arq {arq:.2})");
+            assert!(
+                rec <= arq * 1.3,
+                "unicast recode ~ ARQ (rec {rec:.2}, arq {arq:.2})"
+            );
         }
     }
 
     // ---- Scenario B: multicast source transmissions (the coding win).
     let m = 16usize;
-    eprintln!("\nScenario B — multicast source transmissions, M={m} receivers (K={k}, {trials} trials)");
+    eprintln!(
+        "\nScenario B — multicast source transmissions, M={m} receivers (K={k}, {trials} trials)"
+    );
     eprintln!("  loss%   recode    ARQ   ARQ/recode");
     eprintln!("  -----   ------   -----  ----------");
     let mut checked = false;
@@ -237,7 +254,13 @@ fn rtt_vs_no_recode_tables() {
             as_ += arq_tx_multicast(k, m, p, &mut rng) as u64;
         }
         let (rec, arq) = (rs as f64 / trials as f64, as_ as f64 / trials as f64);
-        eprintln!("  {:>4}    {:>6.1}   {:>5.1}   {:>5.2}x", p / 10, rec, arq, arq / rec.max(0.01));
+        eprintln!(
+            "  {:>4}    {:>6.1}   {:>5.1}   {:>5.2}x",
+            p / 10,
+            rec,
+            arq,
+            arq / rec.max(0.01)
+        );
         if p >= 200 {
             assert!(
                 rec < arq,

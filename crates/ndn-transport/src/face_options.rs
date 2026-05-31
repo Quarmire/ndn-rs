@@ -95,8 +95,12 @@ impl FaceOption {
 /// `NotSupportedByTransport` → 503, `Immutable` → 409, `OutOfRange` → 400.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FaceOptionError {
-    NotSupportedByTransport { option: &'static str },
-    Immutable { option: &'static str },
+    NotSupportedByTransport {
+        option: &'static str,
+    },
+    Immutable {
+        option: &'static str,
+    },
     OutOfRange {
         option: &'static str,
         reason: &'static str,

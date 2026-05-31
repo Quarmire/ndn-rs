@@ -21,8 +21,7 @@ fn general_status_dataset(engine: &ForwarderEngine) -> bytes::Bytes {
         .unwrap_or(0);
     let status = GeneralStatus {
         nfd_version: format!("ndn-rs {}", env!("CARGO_PKG_VERSION")),
-        // No engine start-time is tracked yet; report start == current (uptime 0).
-        start_timestamp_ms: now_ms,
+        start_timestamp_ms: engine.start_timestamp_ms(),
         current_timestamp_ms: now_ms,
         n_fib_entries: engine.fib().dump().len() as u64,
         n_pit_entries: engine.pit().len() as u64,

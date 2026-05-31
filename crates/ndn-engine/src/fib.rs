@@ -120,7 +120,10 @@ impl Fib {
         // engine-side get-then-insert here used to race).
         self.trie.rcu(|cur| {
             let mut t = FibTrie::clone(cur);
-            let mut nexthops = t.get(prefix).map(|e| e.nexthops.clone()).unwrap_or_default();
+            let mut nexthops = t
+                .get(prefix)
+                .map(|e| e.nexthops.clone())
+                .unwrap_or_default();
             nexthops.retain(|n| n.face_id != face_id);
             nexthops.push(FibNexthop { face_id, cost });
             t.insert(prefix, Arc::new(FibEntry { nexthops }));
@@ -148,7 +151,12 @@ impl Fib {
             if nexthops.is_empty() {
                 t.remove(prefix);
             } else {
-                t.insert(prefix, Arc::new(FibEntry { nexthops: nexthops.clone() }));
+                t.insert(
+                    prefix,
+                    Arc::new(FibEntry {
+                        nexthops: nexthops.clone(),
+                    }),
+                );
             }
             t
         });

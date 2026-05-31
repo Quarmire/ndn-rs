@@ -43,17 +43,17 @@ pub mod policy_block;
 pub mod scheme;
 pub mod types;
 
-pub use ciphertext::{AbeCiphertext, KgcRef, CIPHERTEXT_SCHEMA_VERSION};
+pub use ciphertext::{AbeCiphertext, CIPHERTEXT_SCHEMA_VERSION, KgcRef};
 pub use error::AbeError;
 pub use multi_authority::{
-    aw11_add_attr, aw11_authgen, aw11_decrypt, aw11_encrypt, aw11_global_setup, aw11_keygen,
-    Aw11GlobalKeyBytes, Aw11MasterKeyBytes, Aw11PubKeyBytes, Aw11UserKey,
+    Aw11GlobalKeyBytes, Aw11MasterKeyBytes, Aw11PubKeyBytes, Aw11UserKey, aw11_add_attr,
+    aw11_authgen, aw11_decrypt, aw11_encrypt, aw11_global_setup, aw11_keygen,
 };
 pub use policy::{AttributeRef, PolicyExpr};
-pub use policy_block::{PolicyBlockPayload, POLICY_BLOCK_SCHEMA_VERSION};
+pub use policy_block::{POLICY_BLOCK_SCHEMA_VERSION, PolicyBlockPayload};
 pub use scheme::{
-    bsw_decrypt, bsw_encrypt, bsw_keygen, bsw_setup, BswAttributeKeys, BswMasterParams,
-    BswMasterSecret,
+    BswAttributeKeys, BswMasterParams, BswMasterSecret, bsw_decrypt, bsw_encrypt, bsw_keygen,
+    bsw_setup,
 };
 
 use ndn_foundation_types::{Hash, Name};
@@ -100,7 +100,9 @@ pub fn decrypt(
         return Err(AbeError::UnsupportedScheme(ciphertext.scheme));
     }
     if ciphertext.schema_version != CIPHERTEXT_SCHEMA_VERSION {
-        return Err(AbeError::UnsupportedCiphertextVersion(ciphertext.schema_version));
+        return Err(AbeError::UnsupportedCiphertextVersion(
+            ciphertext.schema_version,
+        ));
     }
     bsw_decrypt(attribute_keys, &ciphertext.rabe_ciphertext_bytes)
 }
@@ -133,7 +135,10 @@ mod tests {
         let (kgc_name, hash, mp, ms) = setup_kgc("/hospital/kgc");
         let charlie_ak = bsw_keygen(&mp, &ms, &["role:nurse".into()]).unwrap();
         let ct = encrypt(&policy, b"secret", &(kgc_name, hash, mp)).unwrap();
-        assert!(matches!(decrypt(&ct, &charlie_ak), Err(AbeError::DecryptionFailed)));
+        assert!(matches!(
+            decrypt(&ct, &charlie_ak),
+            Err(AbeError::DecryptionFailed)
+        ));
         drop(ms);
     }
 
@@ -178,6 +183,9 @@ mod tests {
         let ak = bsw_keygen(&mp, &ms, &["a:b".into()]).unwrap();
         let mut ct = encrypt(&policy, b"x", &(kgc_name, hash, mp)).unwrap();
         ct.scheme = AbeSchemeId::LewkoWaters; // wrong scheme
-        assert!(matches!(decrypt(&ct, &ak), Err(AbeError::UnsupportedScheme(_))));
+        assert!(matches!(
+            decrypt(&ct, &ak),
+            Err(AbeError::UnsupportedScheme(_))
+        ));
     }
 }

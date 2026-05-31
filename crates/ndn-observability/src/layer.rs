@@ -149,9 +149,7 @@ where
 
     fn on_close(&self, id: Id, ctx: Context<'_, S>) {
         let span = ctx.span(&id).expect("span exists");
-        let state = span
-            .extensions_mut()
-            .remove::<OpenSpan>();
+        let state = span.extensions_mut().remove::<OpenSpan>();
         let Some(state) = state else { return };
         if !state.sampled {
             return;

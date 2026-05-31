@@ -38,7 +38,11 @@ fn empty_handles() -> MgmtHandles {
     }
 }
 
-async fn dispatch(handle: &InProcHandle, verb: &[u8], params: &ControlParameters) -> ControlResponse {
+async fn dispatch(
+    handle: &InProcHandle,
+    verb: &[u8],
+    params: &ControlParameters,
+) -> ControlResponse {
     let name = Name::root()
         .append(b"localhost")
         .append(b"nfd")
@@ -55,8 +59,14 @@ async fn dispatch(handle: &InProcHandle, verb: &[u8], params: &ControlParameters
         .await
         .expect("response within 2s")
         .expect("response not None");
-    ControlResponse::decode(Data::decode(wire).unwrap().content().cloned().unwrap_or_default())
-        .expect("ControlResponse decode")
+    ControlResponse::decode(
+        Data::decode(wire)
+            .unwrap()
+            .content()
+            .cloned()
+            .unwrap_or_default(),
+    )
+    .expect("ControlResponse decode")
 }
 
 #[tokio::test]
@@ -97,7 +107,11 @@ async fn cs_erase_removes_prefix_over_the_wire() {
     };
     let cr = dispatch(&app_handle, b"erase", &cp).await;
 
-    assert_eq!(cr.status_code, 200, "cs/erase must succeed: {:?}", cr.status_text);
+    assert_eq!(
+        cr.status_code, 200,
+        "cs/erase must succeed: {:?}",
+        cr.status_text
+    );
     assert_eq!(
         cr.body.and_then(|p| p.count),
         Some(2),

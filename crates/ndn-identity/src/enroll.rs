@@ -10,11 +10,18 @@ use crate::{error::IdentityError, identity::NdnIdentity};
 
 #[derive(Debug, Clone)]
 pub enum ChallengeParams {
-    Token { token: String },
+    Token {
+        token: String,
+    },
     Possession {
         cert_name: String,
         /// Ed25519 signature over the request_id bytes.
         signature: Vec<u8>,
+    },
+    /// Named custom challenge parameters.
+    Custom {
+        challenge_type: String,
+        parameters: serde_json::Map<String, serde_json::Value>,
     },
     /// Raw parameters for custom challenge types.
     Raw(serde_json::Map<String, serde_json::Value>),
@@ -25,6 +32,7 @@ impl ChallengeParams {
         match self {
             ChallengeParams::Token { .. } => "token",
             ChallengeParams::Possession { .. } => "possession",
+            ChallengeParams::Custom { challenge_type, .. } => challenge_type,
             ChallengeParams::Raw(_) => "raw",
         }
     }
@@ -51,6 +59,7 @@ impl ChallengeParams {
                 );
                 m
             }
+            ChallengeParams::Custom { parameters, .. } => parameters.clone(),
             ChallengeParams::Raw(map) => map.clone(),
         }
     }

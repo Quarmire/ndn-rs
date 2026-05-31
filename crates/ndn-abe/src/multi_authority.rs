@@ -16,9 +16,7 @@
 //! public key.
 
 use bytes::Bytes;
-use rabe::schemes::aw11::{
-    self, Aw11GlobalKey, Aw11MasterKey, Aw11PublicKey, Aw11SecretKey,
-};
+use rabe::schemes::aw11::{self, Aw11GlobalKey, Aw11MasterKey, Aw11PublicKey, Aw11SecretKey};
 use rabe::utils::policy::pest::PolicyLanguage;
 
 use crate::error::AbeError;
@@ -102,9 +100,13 @@ pub fn aw11_authgen(
     attrs: &[&str],
 ) -> Result<(Aw11PubKeyBytes, Aw11MasterKeyBytes), AbeError> {
     let gk = deserialize_gk(&global.0)?;
-    let (pk, mk) = aw11::authgen(&gk, attrs)
-        .ok_or_else(|| AbeError::SchemeError("aw11::authgen returned None (empty attrs?)".into()))?;
-    Ok((Aw11PubKeyBytes(serialize_pk(&pk)?), Aw11MasterKeyBytes(serialize_mk(&mk)?)))
+    let (pk, mk) = aw11::authgen(&gk, attrs).ok_or_else(|| {
+        AbeError::SchemeError("aw11::authgen returned None (empty attrs?)".into())
+    })?;
+    Ok((
+        Aw11PubKeyBytes(serialize_pk(&pk)?),
+        Aw11MasterKeyBytes(serialize_mk(&mk)?),
+    ))
 }
 
 /// Generate a user secret key from one authority's master key.
@@ -119,8 +121,8 @@ pub fn aw11_keygen(
 ) -> Result<Aw11UserKey, AbeError> {
     let gk = deserialize_gk(&global.0)?;
     let mk = deserialize_mk(&master.0)?;
-    let sk = aw11::keygen(&gk, &mk, gid, attrs)
-        .map_err(|e| AbeError::SchemeError(e.to_string()))?;
+    let sk =
+        aw11::keygen(&gk, &mk, gid, attrs).map_err(|e| AbeError::SchemeError(e.to_string()))?;
     Ok(Aw11UserKey(serialize_sk(&sk)?))
 }
 
@@ -159,8 +161,14 @@ pub fn aw11_encrypt(
         .collect::<Result<_, _>>()?;
     let pk_refs: Vec<&Aw11PublicKey> = pks.iter().collect();
 
-    let ct = aw11::encrypt(&gk, &pk_refs, policy_str, PolicyLanguage::HumanPolicy, plaintext)
-        .map_err(|e| AbeError::SchemeError(e.to_string()))?;
+    let ct = aw11::encrypt(
+        &gk,
+        &pk_refs,
+        policy_str,
+        PolicyLanguage::HumanPolicy,
+        plaintext,
+    )
+    .map_err(|e| AbeError::SchemeError(e.to_string()))?;
 
     bincode::serialize(&ct)
         .map(Bytes::from)
@@ -187,8 +195,10 @@ mod tests {
 
     fn setup_two_authorities() -> (
         Aw11GlobalKeyBytes,
-        Aw11PubKeyBytes, Aw11MasterKeyBytes,
-        Aw11PubKeyBytes, Aw11MasterKeyBytes,
+        Aw11PubKeyBytes,
+        Aw11MasterKeyBytes,
+        Aw11PubKeyBytes,
+        Aw11MasterKeyBytes,
     ) {
         let global = aw11_global_setup().unwrap();
         let (pk1, mk1) = aw11_authgen(&global, &["ROLE:DOCTOR", "ROLE:NURSE"]).unwrap();

@@ -282,6 +282,22 @@ mod tests {
         Interest::decode(w.finish()).unwrap()
     }
 
+    fn interest_can_be_prefix_fresh(components: &[&str]) -> Interest {
+        use ndn_packet::tlv_type;
+        use ndn_tlv::TlvWriter;
+        let mut w = TlvWriter::new();
+        w.write_nested(tlv_type::INTEREST, |w| {
+            w.write_nested(tlv_type::NAME, |w| {
+                for comp in components {
+                    w.write_tlv(tlv_type::NAME_COMPONENT, comp.as_bytes());
+                }
+            });
+            w.write_tlv(tlv_type::CAN_BE_PREFIX, &[]);
+            w.write_tlv(tlv_type::MUST_BE_FRESH, &[]);
+        });
+        Interest::decode(w.finish()).unwrap()
+    }
+
     #[tokio::test]
     async fn get_miss_returns_none() {
         let cs = LruCs::new(65536);
@@ -322,7 +338,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn must_be_fresh_rejects_stale_entry() {
+    async fn d04_must_be_fresh_rejects_stale_entry() {
         let cs = LruCs::new(65536);
         cs.insert(Bytes::from_static(b"x"), arc_name(&["a"]), meta_stale())
             .await;
@@ -330,7 +346,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn must_be_fresh_accepts_fresh_entry() {
+    async fn d04_must_be_fresh_accepts_fresh_entry() {
         let cs = LruCs::new(65536);
         cs.insert(Bytes::from_static(b"x"), arc_name(&["a"]), meta_fresh())
             .await;
@@ -338,12 +354,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_must_be_fresh_returns_stale_entry() {
+    async fn d04_no_must_be_fresh_returns_stale_entry() {
         let cs = LruCs::new(65536);
         cs.insert(Bytes::from_static(b"x"), arc_name(&["a"]), meta_stale())
             .await;
         // Without MustBeFresh the stale entry is still returned.
         assert!(cs.get(&interest(&["a"])).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn d04_can_be_prefix_must_be_fresh_rejects_stale_descendant() {
+        let cs = LruCs::new(65536);
+        cs.insert(
+            Bytes::from_static(b"v"),
+            arc_name(&["a", "b", "1"]),
+            meta_stale(),
+        )
+        .await;
+
+        assert!(
+            cs.get(&interest_can_be_prefix_fresh(&["a", "b"]))
+                .await
+                .is_none(),
+            "CanBePrefix selects the descendant, then MustBeFresh must reject it when stale"
+        );
+        assert!(
+            cs.get(&interest_can_be_prefix(&["a", "b"])).await.is_some(),
+            "the same stale descendant may satisfy a non-MustBeFresh Interest"
+        );
     }
 
     #[tokio::test]

@@ -92,11 +92,11 @@ async fn recoder_face_serves_innovative_combinations_through_engine() {
             break;
         }
         let name = naming::request_name(&object, generation_id, j);
-        let data = match tokio::time::timeout(Duration::from_millis(300), consumer.fetch(name)).await
-        {
-            Ok(Ok(d)) => d,
-            _ => continue,
-        };
+        let data =
+            match tokio::time::timeout(Duration::from_millis(300), consumer.fetch(name)).await {
+                Ok(Ok(d)) => d,
+                _ => continue,
+            };
         let Some(content) = data.content() else {
             continue;
         };
@@ -106,7 +106,10 @@ async fn recoder_face_serves_innovative_combinations_through_engine() {
         buf.absorb(&meta, row).ok();
     }
 
-    assert!(buf.is_decodable(), "consumer reached rank K via the recoder");
+    assert!(
+        buf.is_decodable(),
+        "consumer reached rank K via the recoder"
+    );
     let recovered = buf.decode().expect("decode + verify-on-decode");
     assert_eq!(recovered.as_ref(), payload.as_slice());
 

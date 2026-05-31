@@ -125,7 +125,7 @@ mod tests {
         let interest_wire = encode_interest(&n, None);
         let nack_wire = encode_nack(NackReason::NoRoute, &interest_wire);
         let nack = Nack::decode(nack_wire).unwrap();
-        assert_eq!(nack.reason, NackReason::NoRoute);
+        assert_eq!(nack.reason, Some(NackReason::NoRoute));
         assert_eq!(*nack.interest.name, n);
     }
 
@@ -136,7 +136,7 @@ mod tests {
         let interest_wire = encode_interest(&n, None);
         let nack_wire = encode_nack(NackReason::Congestion, &interest_wire);
         let nack = Nack::decode(nack_wire).unwrap();
-        assert_eq!(nack.reason, NackReason::Congestion);
+        assert_eq!(nack.reason, Some(NackReason::Congestion));
     }
 
     #[test]
@@ -202,7 +202,7 @@ mod tests {
         let nack_wire = encode_nack(NackReason::NoRoute, &interest_wire);
 
         let nack = Nack::decode(nack_wire.clone()).unwrap();
-        assert_eq!(nack.reason, NackReason::NoRoute);
+        assert_eq!(nack.reason, Some(NackReason::NoRoute));
 
         let needle = [0xFD, 0x03, 0x21, 0x01, 0x96];
         assert!(

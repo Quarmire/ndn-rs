@@ -194,7 +194,8 @@ impl FaceState {
 
     /// Set the [`require_data_validation`](Self::require_data_validation) policy.
     pub fn set_require_data_validation(&self, enabled: bool) {
-        self.require_data_validation.store(enabled, Ordering::Relaxed);
+        self.require_data_validation
+            .store(enabled, Ordering::Relaxed);
     }
 
     /// Raw NFD face-flags bitmap. Prefer the named accessors below.
@@ -244,10 +245,12 @@ impl FaceState {
 }
 
 pub struct EngineInner {
+    pub start_timestamp_ms: u64,
     pub fib: Arc<Fib>,
     pub rib: Arc<Rib>,
     pub routing: Arc<RoutingManager>,
     pub pit: Arc<Pit>,
+    pub dead_nonce_list: Arc<ndn_store::DeadNonceList>,
     pub cs: Arc<dyn ErasedContentStore>,
     pub face_table: Arc<FaceTable>,
     pub measurements: Arc<MeasurementsTable>,
@@ -291,6 +294,11 @@ pub struct ForwarderEngine {
 }
 
 impl ForwarderEngine {
+    /// Unix timestamp, in milliseconds, when this engine handle was built.
+    pub fn start_timestamp_ms(&self) -> u64 {
+        self.inner.start_timestamp_ms
+    }
+
     /// Instrument-tier surface — direct table access. Stable for in-tree
     /// consumers; hidden from default docs behind `experimental-instrument`.
     #[cfg_attr(not(feature = "experimental-instrument"), doc(hidden))]
@@ -319,6 +327,11 @@ impl ForwarderEngine {
     }
 
     #[cfg_attr(not(feature = "experimental-instrument"), doc(hidden))]
+    pub fn dead_nonce_list(&self) -> Arc<ndn_store::DeadNonceList> {
+        Arc::clone(&self.inner.dead_nonce_list)
+    }
+
+    #[cfg_attr(not(feature = "experimental-instrument"), doc(hidden))]
     pub fn cs(&self) -> Arc<dyn ErasedContentStore> {
         Arc::clone(&self.inner.cs)
     }
@@ -330,6 +343,17 @@ impl ForwarderEngine {
 
     pub fn validator(&self) -> Option<Arc<Validator>> {
         self.inner.validator.as_ref().map(Arc::clone)
+    }
+
+    /// The validator's [`Keyring`](ndn_security::Keyring) — the set of trust
+    /// contexts this engine dispatches validation against. Adopting a context
+    /// here makes Data under its namespace verifiable without rebuilding the
+    /// engine. `None` when no validator is configured.
+    pub fn keyring(&self) -> Option<Arc<ndn_security::Keyring>> {
+        self.inner
+            .validator
+            .as_ref()
+            .map(|v| Arc::clone(v.keyring()))
     }
 
     /// Reflexive-forwarding reverse-route table.
@@ -656,6 +680,13 @@ impl ForwarderEngine {
             state.set_require_data_validation(enabled);
         }
     }
+}
+
+pub(crate) fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Tracks fire-and-forget tasks spawned via the runtime abstraction so the

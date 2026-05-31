@@ -199,7 +199,14 @@ mod tests {
                     ..Default::default()
                 },
             ),
-            (9u64, LinkSignals { rssi_dbm: Some(-50), updated_ms: 7, ..Default::default() }),
+            (
+                9u64,
+                LinkSignals {
+                    rssi_dbm: Some(-50),
+                    updated_ms: 7,
+                    ..Default::default()
+                },
+            ),
         ];
         let wire = encode_link_quality(&entries);
 

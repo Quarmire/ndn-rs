@@ -18,7 +18,7 @@ use ndn_discovery_core::{DiscoveryProtocol, NeighborTable, NoDiscovery};
 use ndn_packet::Name;
 use ndn_runtime::{Runtime, default_runtime};
 use ndn_security::Validator;
-use ndn_store::{ErasedContentStore, LruCs, ObservableCs, Pit, StrategyTable};
+use ndn_store::{DeadNonceList, ErasedContentStore, LruCs, ObservableCs, Pit, StrategyTable};
 use ndn_strategy::{BestRouteStrategy, MeasurementsTable, SignalsTable};
 use ndn_transport::{Face, FaceTable};
 use tokio_util::sync::CancellationToken;
@@ -162,6 +162,7 @@ impl WasmEngineBuilder {
         let fib = Arc::new(Fib::new());
         let rib = Arc::new(Rib::new());
         let pit = Arc::new(Pit::new());
+        let dead_nonce_list = Arc::new(DeadNonceList::new());
         let base_cs: Arc<dyn ErasedContentStore> = self
             .cs
             .unwrap_or_else(|| Arc::new(LruCs::new(self.config.cs_capacity_bytes)));
@@ -182,12 +183,14 @@ impl WasmEngineBuilder {
 
         {
             let pit_clone = Arc::clone(&pit);
+            let dead_nonce_list_clone = Some(Arc::clone(&dead_nonce_list));
             let face_states_clone = Arc::clone(&face_states);
             let cancel_clone = cancel.clone();
             let runtime_clone = Arc::clone(&runtime);
             tasks.spawn(async move {
                 crate::expiry::run_expiry_task(
                     pit_clone,
+                    dead_nonce_list_clone,
                     face_states_clone,
                     cancel_clone,
                     runtime_clone,
@@ -257,10 +260,12 @@ impl WasmEngineBuilder {
         };
 
         let inner = Arc::new(EngineInner {
+            start_timestamp_ms: crate::engine::unix_time_ms(),
             fib: Arc::clone(&fib),
             rib: Arc::clone(&rib),
             routing: Arc::clone(&routing),
             pit: Arc::clone(&pit),
+            dead_nonce_list: Arc::clone(&dead_nonce_list),
             cs: Arc::clone(&cs),
             face_table: Arc::clone(&face_table),
             measurements: Arc::clone(&measurements),
@@ -297,6 +302,7 @@ impl WasmEngineBuilder {
             },
             pit_check: PitCheckStage {
                 pit: Arc::clone(&pit),
+                dead_nonce_list: Some(Arc::clone(&dead_nonce_list)),
                 replay_guard: replay_guard.clone(),
             },
             strategy: StrategyStage {
@@ -315,6 +321,7 @@ impl WasmEngineBuilder {
             },
             pit_match: PitMatchStage {
                 pit: Arc::clone(&pit),
+                dead_nonce_list: Some(Arc::clone(&dead_nonce_list)),
             },
             validation: ValidationStage::new(
                 validator.clone(),

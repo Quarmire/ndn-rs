@@ -109,11 +109,7 @@ impl LinkServiceFeature for TraceContextFeature {
         "trace-context"
     }
 
-    fn on_egress(
-        &self,
-        frame: &mut super::super::OutboundLpFrame,
-        _ctx: &super::super::EgressCtx,
-    ) {
+    fn on_egress(&self, frame: &mut super::super::OutboundLpFrame, _ctx: &super::super::EgressCtx) {
         // Per-face source has priority; fall back to the process-global.
         let source = match self.egress.read() {
             Ok(g) => g.as_ref().cloned(),
@@ -125,11 +121,7 @@ impl LinkServiceFeature for TraceContextFeature {
         frame.wire = splice_into_lp_wire(frame.wire.clone(), &tc);
     }
 
-    fn on_ingress(
-        &self,
-        frame: &super::super::InboundLpFrame,
-        _ctx: &super::super::IngressCtx,
-    ) {
+    fn on_ingress(&self, frame: &super::super::InboundLpFrame, _ctx: &super::super::IngressCtx) {
         let sink = match self.ingress.read() {
             Ok(g) => g.as_ref().cloned(),
             Err(_) => return,
@@ -146,13 +138,11 @@ impl LinkServiceFeature for TraceContextFeature {
 mod tests {
     use super::*;
     use crate::face::FaceId;
-    use crate::link_service::feature::{
-        EgressCtx, IngressCtx, InboundLpFrame, OutboundLpFrame,
-    };
+    use crate::link_service::feature::{EgressCtx, InboundLpFrame, IngressCtx, OutboundLpFrame};
     use bytes::Bytes;
     use ndn_packet::lp::{SpanId, TraceFlags, TraceId};
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn sample_ctx() -> TraceContext {
         TraceContext {

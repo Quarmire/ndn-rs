@@ -228,7 +228,6 @@ mod x86 {
         unsafe { avx2_inner(dst, src, coeff) }
     }
 
-
     #[target_feature(enable = "ssse3")]
     unsafe fn ssse3_inner(dst: &mut [u8], src: &[u8], coeff: u8) {
         use std::arch::x86_64::*;

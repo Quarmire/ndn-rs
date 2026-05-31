@@ -44,9 +44,9 @@ pub mod wasm_builder;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use builder::{EngineBuilder, EngineConfig};
-pub use dispatcher::DataPlane;
 pub use compose::ComposedStrategy;
 pub use discovery_context::EngineDiscoveryContext;
+pub use dispatcher::DataPlane;
 pub use engine::{FaceCounters, FaceState, ForwarderEngine, ShutdownHandle};
 pub use enricher::ContextEnricher;
 pub use fib::{Fib, FibEntry, FibNexthop};
