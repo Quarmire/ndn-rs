@@ -70,6 +70,13 @@ Each bucket collapses independently. For a single forwarder with one
 identity the grouping stays out of the way; it earns its keep once you
 attach more than one engine or hold more than one trust context.
 
+The bar across the top is the **Attach bar**, and it has two independent
+axes: the **Engine** you operate (which forwarder, on which socket) and the
+identity you're **Acting as**. They're separate on purpose — you can browse
+one engine while signing as a given identity, and switch either without
+disturbing the other. With one engine and one identity the bar reads as a
+single line; the second axis appears only when there's a choice to make.
+
 ## What the dashboard shows
 
 - **Faces** — every face the forwarder knows, with kind, address,
