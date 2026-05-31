@@ -21,8 +21,8 @@
   --font-sans: 'IBM Plex Sans','IBM Plex Sans Var',system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;
   --font-mono: 'IBM Plex Mono','SF Mono',ui-monospace,SFMono-Regular,Consolas,monospace;
 
-  /* editorial reading measure ≈ 70–75ch in Plex */
-  --content-max-width: 46rem;
+  /* editorial reading measure ≈ 75–80ch in Plex */
+  --content-max-width: 58rem;
 }
 
 /* dark — mapped from styles.rs :root (Carbon Gray 100 base) */
@@ -89,8 +89,8 @@ html { font-family: var(--font-sans); }
 .content { font-family: var(--font-sans); }
 .content main {
   max-width: var(--content-max-width);
-  line-height: 1.6;
-  font-size: 1.0625rem;            /* ~17px reading body */
+  line-height: 1.65;
+  font-size: 1.1875rem;            /* ~19px reading body */
 }
 .content h1, .content h2, .content h3,
 .content h4, .content h5, .content h6 {
