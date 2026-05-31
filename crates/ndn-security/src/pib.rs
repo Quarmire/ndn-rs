@@ -201,6 +201,66 @@ impl FilePib {
         Ok(cert)
     }
 
+    /// Read the stored private key as PKCS#8 `PrivateKeyInfo` DER. Handles
+    /// both the current `private.pkcs8.der` format and the legacy 32-byte
+    /// raw Ed25519 seed (re-encoded to PKCS#8 on the fly). The returned
+    /// bytes are the *unencrypted* secret — callers must not persist or log
+    /// them; [`Self::export_safebag`] wraps them under a passphrase.
+    pub fn export_pkcs8(&self, key_name: &Name) -> Result<Vec<u8>, PibError> {
+        let dir = self
+            .existing_key_dir(key_name)
+            .ok_or_else(|| PibError::KeyNotFound(name_to_uri(key_name)))?;
+        if let Ok(pkcs8) = std::fs::read(dir.join("private.pkcs8.der")) {
+            return Ok(pkcs8);
+        }
+        // Legacy 32-byte raw-Ed25519-seed format.
+        let seed_bytes = std::fs::read(dir.join("private.key"))
+            .map_err(|_| PibError::KeyNotFound(name_to_uri(key_name)))?;
+        if seed_bytes.len() != 32 {
+            return Err(PibError::Corrupt(
+                "private.key must be exactly 32 bytes (legacy Ed25519 seed)".into(),
+            ));
+        }
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&seed_bytes);
+        ndn_safebag::ed25519_seed_to_pkcs8(&seed)
+            .map_err(|e| PibError::Corrupt(format!("legacy seed → pkcs8: {e}")))
+    }
+
+    /// Export a stored identity as an ndn-cxx-compatible `SafeBag` (TLV
+    /// 0x80): a freshly self-signed certificate Data wrapping the public
+    /// key, alongside the PKCS#8 private key encrypted under `passphrase`
+    /// (PBES2 / PBKDF2-HMAC-SHA256 + AES-256-CBC, matching `ndnsec export`).
+    ///
+    /// Works for both Ed25519 and ECDSA-P256 keys — the algorithm is taken
+    /// from the stored PKCS#8 OID via [`Self::get_signer`]. The embedded
+    /// certificate is signed *now* with the key itself, so the SafeBag is a
+    /// self-contained, verifiable bundle even when the PIB only kept the
+    /// compact NDNC cert summary.
+    pub fn export_safebag(
+        &self,
+        key_name: &Name,
+        passphrase: &[u8],
+    ) -> Result<Vec<u8>, PibError> {
+        use ndn_safebag::SafeBag;
+        let pkcs8 = self.export_pkcs8(key_name)?;
+        let signer = self.get_signer(key_name)?;
+        let cert = self.get_cert(key_name)?;
+        // Re-issue a self-signed cert Data so the SafeBag carries a real,
+        // verifiable Data TLV (the on-disk NDNC summary drops the signature).
+        let cert_wire = futures::executor::block_on(crate::manager::encode_cert_data(
+            key_name,
+            &cert.public_key,
+            signer.as_ref(),
+            cert.valid_from,
+            cert.valid_until,
+        ))
+        .map_err(|e| PibError::Corrupt(format!("re-sign cert for export: {e}")))?;
+        let bag = SafeBag::encrypt(cert_wire, &pkcs8, passphrase)
+            .map_err(|e| PibError::Corrupt(format!("SafeBag encrypt: {e}")))?;
+        Ok(bag.encode().to_vec())
+    }
+
     pub fn get_cert(&self, key_name: &Name) -> Result<Certificate, PibError> {
         let dir = self
             .existing_key_dir(key_name)
