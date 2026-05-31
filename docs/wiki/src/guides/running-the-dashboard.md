@@ -77,12 +77,15 @@ one engine while signing as a given identity, and switch either without
 disturbing the other. With one engine and one identity the bar reads as a
 single line; the second axis appears only when there's a choice to make.
 
-Selecting a row opens a **detail inspector** on the right. Clicking a face in
-the Overview's Active Faces table shows its full detail — every counter, URI,
-scope, link type, and MTU; clicking a route in the FIB Routes table shows its
-nexthops, assigned strategy, and RIB origins/flags/expiration. None of that
-needs to widen the table. The inspector closes with its ✕, and on narrow
-screens it becomes a bottom sheet so the list above it stays visible.
+Selecting a row opens a **detail inspector** on the right. A face shows its
+full detail — every counter, URI, scope, link type, MTU, a throughput
+sparkline, and the routes that forward through it; a route shows its strategy,
+FIB nexthops, and RIB origins/flags/expiration. The inspector is also where you
+*act*: change a route's strategy, add or remove a specific nexthop, or click a
+nexthop face to jump straight to that face's detail (and back to a route from
+the face's "Routes via this face" list). None of that needs to widen the
+table. The inspector closes with its ✕, and on narrow screens it becomes a
+bottom sheet so the list above it stays visible.
 
 ## What the dashboard shows
 
