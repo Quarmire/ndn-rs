@@ -78,7 +78,8 @@ disturbing the other. With one engine and one identity the bar reads as a
 single line; the second axis appears only when there's a choice to make.
 
 Selecting a row opens a **detail inspector** on the right. A face shows its
-full detail — every counter, URI, scope, link type, MTU, a throughput
+full detail — every counter, URI, scope, link type, MTU, link-service flag
+status (local fields, LP reliability, congestion marking), a throughput
 sparkline, and the routes that forward through it; a route shows its strategy,
 FIB nexthops, and RIB origins/flags/expiration. The inspector is also where you
 *act*: change a route's strategy, add or remove a specific nexthop, or click a
