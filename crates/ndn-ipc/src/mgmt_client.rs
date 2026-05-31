@@ -357,6 +357,60 @@ impl MgmtClient {
         self.dataset(module::STATUS, b"shutdown").await
     }
 
+    /// Fetch one NFD-style notification event from
+    /// `/localhost/nfd/<module>/notifications`. With `seq = None` it requests
+    /// the latest event (`CanBePrefix`); with `Some(n)` it long-polls sequence
+    /// `n` — the producer holds the Interest until that event publishes (up to
+    /// its own budget). Returns `Ok(Some((seq, content)))` for an event,
+    /// `Ok(None)` if `timeout` elapsed with no event (re-issue the same seq),
+    /// or `Err` on a transport/decode failure. Mirrors
+    /// `daemon/mgmt/notification-stream.hpp` subscribers.
+    pub async fn notification(
+        &self,
+        module: &str,
+        seq: Option<u64>,
+        timeout: std::time::Duration,
+    ) -> Result<Option<(u64, Bytes)>, ForwarderError> {
+        let mut name = Name::from_components([
+            ndn_packet::NameComponent::generic(Bytes::from_static(b"localhost")),
+            ndn_packet::NameComponent::generic(Bytes::from_static(b"nfd")),
+            ndn_packet::NameComponent::generic(Bytes::copy_from_slice(module.as_bytes())),
+            ndn_packet::NameComponent::generic(Bytes::from_static(b"notifications")),
+        ]);
+        if let Some(s) = seq {
+            name = name.append_sequence_num(s);
+        }
+        let mut builder = InterestBuilder::new(name).must_be_fresh().lifetime(timeout);
+        if seq.is_none() {
+            builder = builder.can_be_prefix();
+        }
+        let interest_wire = builder.build();
+
+        let _guard = self.recv_lock.lock().await;
+        self.face
+            .send_bytes(ndn_packet::lp::encode_lp_packet(&interest_wire))
+            .await?;
+        let data_wire = match tokio::time::timeout(timeout, self.face.recv_bytes()).await {
+            Err(_) => return Ok(None),
+            Ok(r) => r.map(crate::forwarder_client::strip_lp)?,
+        };
+        let data =
+            ndn_packet::Data::decode(data_wire).map_err(|_| ForwarderError::MalformedResponse)?;
+        let got = data
+            .name
+            .components()
+            .last()
+            .filter(|c| c.typ == ndn_packet::tlv_type::SEQUENCE_NUM)
+            .map(|c| {
+                c.value
+                    .as_ref()
+                    .iter()
+                    .fold(0u64, |n, b| (n << 8) | u64::from(*b))
+            })
+            .ok_or(ForwarderError::MalformedResponse)?;
+        Ok(Some((got, data.content().cloned().unwrap_or_default())))
+    }
+
     /// Retrieve the running router configuration as TOML: `config/get`.
     pub async fn config_get(&self) -> Result<ControlResponse, ForwarderError> {
         self.dataset(module::CONFIG, verb::GET).await
