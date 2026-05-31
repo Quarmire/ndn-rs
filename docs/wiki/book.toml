@@ -19,5 +19,7 @@ additional-js = ["mermaid-init.js", "d3graph-init.js"]
 enable = true
 level = 1
 
-[preprocessor.mermaid]
-command = "mdbook-mermaid"
+# Mermaid is rendered client-side by mermaid-init.js (CDN mermaid@11 + ELK
+# layout + Carbon theming). The mdbook-mermaid preprocessor only duplicated
+# the fence detection and coupled the build to a matching mdbook version, so
+# it was removed. See .claude/notes/wiki/ for the investigation.

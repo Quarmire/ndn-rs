@@ -8,8 +8,10 @@ Content Store — are introduced as they appear.
 ## The state machine
 
 ```mermaid
+%% In stateDiagram-v2 a transition label ends at the first ':', so a
+%% literal '::' reparses and errors. #58; is the colon entity → 'Consumer::fetch'.
 stateDiagram-v2
-    [*] --> Expressed: app calls Consumer::fetch
+    [*] --> Expressed: app calls Consumer#58;#58;fetch
     Expressed --> InPIT: forwarder records pending
     InPIT --> Forwarded: strategy selects nexthop
     Forwarded --> Awaiting: face sends Interest

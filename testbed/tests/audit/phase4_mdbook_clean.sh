@@ -6,8 +6,9 @@
 #            `mdbook test` succeeds (every Rust code fence
 #            compiles against the workspace).
 #
-# Dependencies: mdbook + mdbook-mermaid in $PATH. The build picks
-#            up docs/wiki/book.toml.
+# Dependencies: mdbook in $PATH. The build picks up
+#            docs/wiki/book.toml. Mermaid is rendered client-side by
+#            mermaid-init.js, so no mdbook-mermaid preprocessor is needed.
 #
 # Exit codes:
 #   0 — PASS
