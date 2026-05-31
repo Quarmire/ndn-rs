@@ -2,6 +2,8 @@
 # Witness — Phase 4 §4.6 page-length budgets.
 #
 # Caps (line count, including blank lines and code blocks):
+#   start/       : 130   (kernel pages — narrative + one diagram)
+#   path/        : 90    (thin persona ramps)
 #   quickstart/  : 100
 #   concepts/    : 200
 #   api/         : 250
@@ -9,7 +11,8 @@
 #   operations/  : 150
 #   reference/   : 150
 #   releases/    : 200
-#   SUMMARY.md / README.md : 60
+#   README.md    : 60
+#   SUMMARY.md   : 80    (grew with the Start here + Your path sections)
 #
 # Exit codes:
 #   0 — PASS
@@ -20,7 +23,10 @@ cd "$REPO_ROOT"
 
 cap_for() {
     case "$1" in
-        docs/wiki/src/SUMMARY.md|docs/wiki/src/README.md) echo 60 ;;
+        docs/wiki/src/README.md)     echo 60 ;;
+        docs/wiki/src/SUMMARY.md)    echo 80 ;;
+        docs/wiki/src/start/*)       echo 130 ;;
+        docs/wiki/src/path/*)        echo 90 ;;
         docs/wiki/src/quickstart/*)  echo 100 ;;
         docs/wiki/src/concepts/*)    echo 200 ;;
         docs/wiki/src/api/*)         echo 250 ;;
