@@ -12,7 +12,7 @@ use std::time::SystemTime;
 use ndn_packet::{Data, Name};
 use ndn_security::{Certificate, NamePattern, TrustSchema};
 
-use crate::custodian::CustodianRef;
+use ndn_custodian::CustodianRef;
 
 mod fingerprint;
 mod identity_ref;
@@ -122,7 +122,7 @@ impl TrustContext {
         &self,
         name: &Name,
         content: &[u8],
-        custodians: &crate::custodian::CustodianRegistry,
+        custodians: &ndn_custodian::CustodianRegistry,
     ) -> Result<bytes::Bytes, TrustContextError> {
         let id = self
             .can_sign(name)

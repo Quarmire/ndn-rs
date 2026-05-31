@@ -6,10 +6,10 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use ndn_packet::Name;
 
+use crate::KeyId;
 use crate::custodian::{
     Custodian, CustodianError, CustodianRef, UnlockContext, UnwrappedKey, WrappedKey,
 };
-use crate::trust_context::KeyId;
 
 pub struct FobCustodian {
     fob_id: String,

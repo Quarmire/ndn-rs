@@ -8,10 +8,10 @@ mod imp {
     use bytes::Bytes;
     use ndn_packet::Name;
 
+    use crate::KeyId;
     use crate::custodian::{
         Custodian, CustodianError, CustodianRef, UnlockContext, UnwrappedKey, WrappedKey,
     };
-    use crate::trust_context::KeyId;
 
     #[derive(Default)]
     pub struct OsKeyringCustodian {

@@ -11,10 +11,10 @@ use dashmap::DashMap;
 use ndn_packet::Name;
 use ndn_security::{Ed25519Signer, Signer};
 
+use crate::KeyId;
 use crate::custodian::{
     Custodian, CustodianError, CustodianRef, UnlockContext, UnwrappedKey, WrappedKey,
 };
-use crate::trust_context::KeyId;
 
 #[derive(Default)]
 pub struct InPageCustodian {

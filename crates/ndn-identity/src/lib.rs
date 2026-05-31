@@ -10,7 +10,6 @@
 //! ```
 
 pub mod ca;
-pub mod custodian;
 pub mod device;
 pub mod device_approval_net;
 pub mod email;
@@ -21,12 +20,6 @@ pub mod renewal;
 pub mod trust_context;
 
 pub use ca::{CaApproveFeed, NdncertCa, NdncertCaBuilder};
-#[cfg(not(target_arch = "wasm32"))]
-pub use custodian::OsKeyringCustodian;
-pub use custodian::{
-    BrowserExtensionCustodian, Custodian, CustodianError, CustodianRef, CustodianRegistry,
-    FobCustodian, InPageCustodian, UnlockContext, UnwrappedKey, WrappedKey,
-};
 pub use device::{DeviceConfig, FactoryCredential, RenewalPolicy};
 pub use device_approval_net::{
     AllowAnyApprover, ApprovalFeed, ApprovalSink, ApproverAuthorizer, DEFAULT_APPROVAL_TIMEOUT,
@@ -39,6 +32,14 @@ pub use email::LoggingEmailSender;
 pub use enroll::{ChallengeParams, EnrollConfig};
 pub use error::IdentityError;
 pub use identity::NdnIdentity;
+// The Custodian trait + KeyId now live in `ndn-custodian` (wasm-safe). Re-export
+// them so existing `ndn_identity::Custodian` / `KeyId` paths keep working.
+#[cfg(not(target_arch = "wasm32"))]
+pub use ndn_custodian::OsKeyringCustodian;
+pub use ndn_custodian::{
+    BrowserExtensionCustodian, Custodian, CustodianError, CustodianRef, CustodianRegistry,
+    FobCustodian, InPageCustodian, UnlockContext, UnwrappedKey, WrappedKey,
+};
 pub use trust_context::{
     AdoptionProvenance, CapabilitySet, FaceIdRef, Fingerprint, IdentityLifetime, IdentityRef,
     KeyId, SharedTrustContext, SyncBundle, SyncBundleError, TrustContext, TrustContextError,

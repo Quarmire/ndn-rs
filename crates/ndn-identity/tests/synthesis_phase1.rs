@@ -7,10 +7,10 @@ use std::time::SystemTime;
 
 use bytes::Bytes;
 use ndn_identity::CustodianRef;
-use ndn_identity::custodian::{Custodian, CustodianRegistry, InPageCustodian, UnlockContext};
 use ndn_identity::trust_context::{
     AdoptionProvenance, CapabilitySet, IdentityLifetime, IdentityRef, KeyId, TrustContext,
 };
+use ndn_identity::{Custodian, CustodianRegistry, InPageCustodian, UnlockContext};
 use ndn_packet::{Name, NameComponent, SignatureType};
 use ndn_security::{
     Certificate, Ed25519Signer, Ed25519Verifier, NamePattern, PatternComponent, VerifyOutcome,
