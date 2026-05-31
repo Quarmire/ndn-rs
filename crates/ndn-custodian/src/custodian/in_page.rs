@@ -1,9 +1,12 @@
-//! In-page custodian — holds Ed25519 keys in process memory. The least-secure
-//! tier; only acceptable on a personal, trusted device. The dashboard surfaces
-//! a banner whenever this is the active custodian on an untrusted machine
-//! (Phase 5 + Phase 6).
+//! In-page custodian — holds in-process signing keys in memory. The
+//! least-secure tier; only acceptable on a personal, trusted device. The
+//! dashboard surfaces a banner whenever this is the active custodian on an
+//! untrusted machine (Phase 5 + Phase 6).
+//!
+//! Holds any [`Signer`] (not just a raw `Ed25519Signer`), so a key loaded from
+//! a `KeyChain` / decrypted SafeBag drops straight in.
 
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -18,7 +21,7 @@ use crate::custodian::{
 
 #[derive(Default)]
 pub struct InPageCustodian {
-    keys: DashMap<KeyId, Ed25519Signer>,
+    keys: DashMap<KeyId, Arc<dyn Signer>>,
     unlocked: RwLock<bool>,
 }
 
@@ -30,12 +33,19 @@ impl InPageCustodian {
         }
     }
 
+    /// Convenience for a freshly-generated Ed25519 key.
     pub fn insert(&self, key_id: KeyId, signer: Ed25519Signer) {
+        self.keys.insert(key_id, Arc::new(signer));
+    }
+
+    /// Hold an arbitrary in-process signer (e.g. a `KeyChain`'s signer).
+    pub fn insert_signer(&self, key_id: KeyId, signer: Arc<dyn Signer>) {
         self.keys.insert(key_id, signer);
     }
 
-    pub fn public_key(&self, key_id: &KeyId) -> Option<[u8; 32]> {
-        self.keys.get(key_id).map(|s| s.public_key_bytes())
+    /// The held key's public-key bytes, if the signer exposes them.
+    pub fn public_key(&self, key_id: &KeyId) -> Option<Bytes> {
+        self.keys.get(key_id).and_then(|s| s.public_key())
     }
 }
 
@@ -64,12 +74,16 @@ impl Custodian for InPageCustodian {
         _name: &Name,
         content: &[u8],
     ) -> Result<Bytes, CustodianError> {
+        // Clone the Arc out before awaiting — never hold a DashMap guard across
+        // an await point.
         let signer = self
             .keys
             .get(key_id)
-            .ok_or_else(|| CustodianError::UnknownKey(key_id.as_name().clone()))?;
+            .ok_or_else(|| CustodianError::UnknownKey(key_id.as_name().clone()))?
+            .clone();
         signer
-            .sign_sync(content)
+            .sign(content)
+            .await
             .map_err(|e| CustodianError::SignFailed(e.to_string()))
     }
 

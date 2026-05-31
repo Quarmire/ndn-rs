@@ -51,8 +51,42 @@ impl Ed25519Signer {
         Self::new(signing_key, key_name, None)
     }
 
+    /// Load from a PKCS#8 DER private key (the format a SafeBag or a FileTpm
+    /// stores). Lets a decrypted SafeBag key be deposited into a custodian.
+    pub fn from_pkcs8_der(pkcs8_der: &[u8], key_name: Name) -> Result<Self, TrustError> {
+        use ed25519_dalek::pkcs8::DecodePrivateKey;
+        let signing_key = ed25519_dalek::SigningKey::from_pkcs8_der(pkcs8_der)
+            .map_err(|e| TrustError::KeyStore(format!("ed25519 from_pkcs8_der: {e}")))?;
+        Ok(Self::new(signing_key, key_name, None))
+    }
+
+    /// PKCS#8 DER of this key. Round-trips with [`Self::from_pkcs8_der`].
+    pub fn to_pkcs8_der(&self) -> Result<Vec<u8>, TrustError> {
+        use ed25519_dalek::pkcs8::EncodePrivateKey;
+        Ok(self
+            .signing_key
+            .to_pkcs8_der()
+            .map_err(|e| TrustError::KeyStore(format!("ed25519 to_pkcs8_der: {e}")))?
+            .as_bytes()
+            .to_vec())
+    }
+
     pub fn public_key_bytes(&self) -> [u8; 32] {
         self.signing_key.verifying_key().to_bytes()
+    }
+}
+
+#[cfg(test)]
+mod ed25519_pkcs8_tests {
+    use super::*;
+
+    #[test]
+    fn pkcs8_round_trip_preserves_key() {
+        let name: Name = "/op/alice/KEY/k1".parse().unwrap();
+        let original = Ed25519Signer::from_seed(&[9u8; 32], name.clone());
+        let der = original.to_pkcs8_der().expect("encode pkcs8");
+        let loaded = Ed25519Signer::from_pkcs8_der(&der, name).expect("decode pkcs8");
+        assert_eq!(original.public_key_bytes(), loaded.public_key_bytes());
     }
 }
 
