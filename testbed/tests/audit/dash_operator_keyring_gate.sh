@@ -32,9 +32,18 @@ if ! grep -q 'operator_keyring::command_signer' "$DASH/src/app.rs"; then
     echo "FAIL: app.rs command client does not gate on operator_keyring" >&2
     exit 1
 fi
-# A real source must feed the keyring — SafeBag import deposits the Ed25519 key.
+# A real source must feed the keyring — SafeBag import deposits Ed25519/ECDSA.
 if ! grep -q 'operator_keyring::provision_ed25519_pkcs8' "$DASH/src/views/safebag_import.rs"; then
     echo "FAIL: SafeBag import does not feed the operator keyring" >&2
+    exit 1
+fi
+if ! grep -q 'operator_keyring::provision_ecdsa_p256_pkcs8' "$DASH/src/views/safebag_import.rs"; then
+    echo "FAIL: SafeBag import does not handle ECDSA keys" >&2
+    exit 1
+fi
+# The web command path must also sign through the keyring.
+if ! grep -q 'operator_keyring::command_signer' "$DASH/src/ws_mgmt.rs"; then
+    echo "FAIL: web WsMgmtClient command path does not sign through the keyring" >&2
     exit 1
 fi
 
