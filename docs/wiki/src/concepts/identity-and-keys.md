@@ -126,20 +126,54 @@ let keychain = KeyChain::open_at("/var/lib/myapp/pib.db").await?;
 
 ## SafeBag — exporting identities
 
-A `SafeBag` is a passphrase-encrypted bundle of an identity, its
-keys, and its certificates. The format is interoperable with
-ndnsec; the operator workflow is in
+A `SafeBag` is a passphrase-encrypted bundle of an identity's
+certificate and private key. The format is interoperable with
+`ndnsec`; the operator workflow is in
 [NDNCERT setup → invite tokens](../guides/ndncert-setup.md).
 
+The file-based PIB exports and imports the bundle directly:
+
 ```rust,ignore
-use ndn::KeyChain;
-# async fn run(keychain: &KeyChain) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-let bytes = keychain.export_safebag("/alice", b"passphrase").await?;
+use ndn_security::pib::FilePib;
+# fn run(cert_name: &ndn_packet::Name) -> Result<(), Box<dyn std::error::Error>> {
+let pib = FilePib::open("~/.ndn/pib")?;
+let bytes = pib.export_safebag(cert_name, b"passphrase")?;
 std::fs::write("alice.safebag", &bytes)?;
+
+// Receiving side — the embedded cert names the key:
+let dst = FilePib::new("~/.ndn/pib")?;
+dst.store_safebag(cert_name, &bytes, b"passphrase")?;
 # Ok(()) }
 ```
 
-The receiving side calls `keychain.import_safebag(&bytes, passphrase)`.
+### From the command line (`ndn-sec`)
+
+The same workflow is available without writing code. `ndn-sec`
+manages a file-based PIB and moves whole identities through the
+SafeBag wire for **both** supported signature types — Ed25519
+(ndn-rs-native) and ECDSA P-256 (interoperable with ndn-cxx / NFD
+and `ndnsec`):
+
+```bash
+# Generate a key (Ed25519 default; ECDSA for ndn-cxx interop).
+ndn-sec keygen /alice
+ndn-sec keygen /alice --type ecdsa
+
+# Export an identity as a SafeBag (base64 by default — paste/email-safe;
+# `--format raw` for binary). Prompts for the passphrase if --password
+# is omitted.
+ndn-sec export /alice -o alice.safebag
+
+# Import elsewhere. The file may be raw TLV or base64, and the key name
+# is read from the embedded certificate. `--anchor` also trusts it.
+ndn-sec import alice.safebag
+ndnsec import alice.safebag   # ndn-cxx accepts the ECDSA form too
+```
+
+The PIB location follows `--pib`, then `$NDN_PIB`, then `~/.ndn/pib`.
+The dashboard's Security view performs the same import/anchor
+operations over the management protocol, and its Settings view shows
+which PIB the connected forwarder uses.
 
 ## See also
 
