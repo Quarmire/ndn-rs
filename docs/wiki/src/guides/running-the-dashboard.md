@@ -66,9 +66,11 @@ the appliance from your identity from what you publish:
 - **Compose** — what you publish: the prefixes a local producer or client
   has registered on the attached engine.
 
-Each bucket collapses independently. For a single forwarder with one
-identity the grouping stays out of the way; it earns its keep once you
-attach more than one engine or hold more than one trust context.
+Each bucket collapses independently and shows a live count on its header —
+faces for Engine, distinct identities for Identity, published prefixes for
+Compose. For a single forwarder with one identity the grouping stays out of
+the way; it earns its keep once you attach more than one engine or hold more
+than one trust context.
 
 The bar across the top is the **Attach bar**, and it has two independent
 axes: the **Engine** you operate (which forwarder, on which socket) and the
