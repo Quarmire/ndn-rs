@@ -54,6 +54,22 @@ PIT/FIB/CS visible in the dashboard is the engine inside the tab.
 Useful for offline demos and for understanding the forwarder's
 behaviour without setting one up.
 
+## How it's organized
+
+The sidebar groups every panel under three top-level buckets, separating
+the appliance from your identity from what you publish:
+
+- **Engine** — the forwarder you operate: Overview, Strategy, Coding,
+  Rate Limit, Routing, Radio, Logs, Fleet, Tools.
+- **Identity** — who you are: Security (keys, anchors, trust schema) and
+  Session.
+- **Compose** — what you publish: the prefixes a local producer or client
+  has registered on the attached engine.
+
+Each bucket collapses independently. For a single forwarder with one
+identity the grouping stays out of the way; it earns its keep once you
+attach more than one engine or hold more than one trust context.
+
 ## What the dashboard shows
 
 - **Faces** — every face the forwarder knows, with kind, address,
