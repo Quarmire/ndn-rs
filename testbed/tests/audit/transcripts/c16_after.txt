@@ -1,6 +1,7 @@
-ok: LvsError::UserFunctionsNotSupported exists
-ok: from_lvs_binary returns UserFunctionsNotSupported
-ok: c16_from_lvs_binary_rejects_user_functions
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 251 filtered out; finished in 0.00s
 
-=== C.16 RESOLVED — from_lvs_binary fail-safe; user-fn schemas rejected ===
+
+=== C.16 RESOLVED — LVS user functions fail closed in parser, loader, and policy ===
 exit 0

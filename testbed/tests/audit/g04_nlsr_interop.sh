@@ -236,7 +236,12 @@ if [[ $CXX_SEES_RS -eq 0 ]]; then
 fi
 
 echo ""
-echo "=== G.04 PASS — NLSR ↔ C++ NLSR route convergence witnessed ==="
-echo "    ndn-fwd-nlsr : has ${NLSR_CXX_PREFIX}"
-echo "    nlsr-cxx     : has ${NDN_FWD_NLSR_PREFIX}"
+{
+    echo "=== G.04 PASS — NLSR ↔ C++ NLSR route convergence witnessed ==="
+    echo "    ndn-fwd-nlsr : has ${NLSR_CXX_PREFIX}"
+    echo "    nlsr-cxx     : has ${NDN_FWD_NLSR_PREFIX}"
+    echo "    convergence  : ${ELAPSED}s"
+    echo "    pcap         : ${PCAP_FILE}"
+} > "$TXT_FILE"
+cat "$TXT_FILE"
 exit 0

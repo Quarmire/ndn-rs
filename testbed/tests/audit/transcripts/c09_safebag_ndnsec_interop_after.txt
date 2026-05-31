@@ -1,0 +1,7 @@
+identity=/interop/safebag/rs
+cert=/interop/safebag/rs/KEY/rs-safebag/self/v=0
+out=/tmp/tmp.xHcmW8vNbu/rs.ndnkey
+verified cert=/interop/safebag/rs/KEY/rs-safebag/self/v=0
+input=/tmp/tmp.xHcmW8vNbu/cxx.ndnkey
+
+=== C.09 SafeBag PASS — ndn-rs export -> ndnsec import/export -> ndn-rs import verified ===

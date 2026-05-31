@@ -1,0 +1,5 @@
+=== G.04 PASS — NLSR ↔ C++ NLSR route convergence witnessed ===
+    ndn-fwd-nlsr : has /test/r1/data
+    nlsr-cxx     : has /test/r2/data
+    convergence  : 10s
+    pcap         : testbed/tests/audit/transcripts/g04_nlsr_interop_after.pcap

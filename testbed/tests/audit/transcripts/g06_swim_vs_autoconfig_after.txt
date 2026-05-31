@@ -1,0 +1,17 @@
+ok: SWIM types absent
+ok: NeighborProbeProtocol present
+ok: AutoConfigDiscovery present
+ok: AutoConfig hub-discovery Rust witnesses passed
+ok: reference ndn-autoconfig created hub face and autoconf routes on ndn-fwd
+Starting multicast discovery stage
+Stage multicast discovery failed: Error 500 when querying multi-access faces: Data Name has no segment number
+Starting guess from search domains stage
+Sending DNS query for SRV record for _ndn._udp
+Stage guess from search domains failed: SRV record cannot be parsed
+Starting NDN-FCH stage
+Stage NDN-FCH succeeded with udp://nfd:6363
+Connected to HUB udp4://172.30.0.11:6363
+Registered prefix /
+Registered prefix /localhop/nfd
+
+=== G.06 RESOLVED 2026-05-28 - SWIM removed; NDN AutoConfig unit + live reference-client witness pass ===

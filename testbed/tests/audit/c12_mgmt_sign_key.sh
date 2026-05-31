@@ -5,22 +5,82 @@
 # Finding:     docs/notes/spec-compliance-audit-2026-04-20.md § C.12
 # Severity:    BLOCKER for testbed NFD; BLOCKED-BY-INTEROP until this script exits 0
 # Spec ref:    NFD Developer Guide §7; NFD command-authenticator.cpp:122-207
-# Witness:     INTEROP-SCRIPT — starts testbed NFD with localhop_security,
-#              loads an Ed25519 identity, calls `ndn-ctl route add /test/prefix
-#              --identity /ndn/test/router1`, asserts StatusCode 200 and that
-#              the RIB shows the entry.
+# Witness:     RUST-UNIT + INTEROP-SCRIPT — first proves the key-backed
+#              MgmtClient signing policy emits a verifiable Ed25519 command
+#              Interest; then uses the Docker NFD service when available
+#              (or a host NFD fallback) to register a route with
+#              `ndn-ctl --identity`, asserting StatusCode 200 and that the
+#              RIB shows the entry.
 #
 # Exit codes:  0 PASS / 1 FAIL / 2 SKIP
 set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 
 # Prerequisites
-if ! command -v nfd >/dev/null 2>&1; then
-    echo "SKIP: 'nfd' not in PATH — install NFD from https://named-data.net/doc/NFD/" >&2
-    exit 2
-fi
 if ! command -v cargo >/dev/null 2>&1; then
     echo "SKIP: cargo missing" >&2
+    exit 2
+fi
+
+if cargo test -p ndn-ipc --lib --quiet c12_key_signer_ >/tmp/c12_key_unit.log 2>&1; then
+    echo "ok: key-backed command Interest behavioral tests"
+else
+    echo "FAIL: key-backed command Interest behavioral tests"
+    cat /tmp/c12_key_unit.log
+    exit 1
+fi
+
+COMPOSE="docker compose -f testbed/docker-compose.yml"
+if command -v docker >/dev/null 2>&1; then
+    PS_OUT=$($COMPOSE ps nfd testclient 2>/dev/null || true)
+    if [[ "$PS_OUT" == *"nfd"* && "$PS_OUT" == *"testclient"* && ( "$PS_OUT" == *"running"* || "$PS_OUT" == *"Up"* ) ]]; then
+        if DOCKER_OUT=$($COMPOSE exec -T testclient bash -lc '
+            set -euo pipefail
+            WORK=$(mktemp -d)
+            cleanup() { rm -rf "$WORK"; }
+            trap cleanup EXIT
+
+            ID="/ndn/test/router1"
+            PREFIX="/test/c12-docker-$(date +%s)-$$"
+            PIB="$WORK/pib"
+
+            ndn-ctl security init --name "$ID" --pib "$PIB" >/tmp/c12_key_init.out
+            ndn-ctl --socket /run/nfd/nfd.sock \
+                --identity "$ID" --pib "$PIB" \
+                route add "$PREFIX" --face 1 --cost 10 >/tmp/c12_key_add.out
+
+            echo "PREFIX=$PREFIX"
+            cat /tmp/c12_key_add.out
+        ' 2>&1); then
+            PREFIX=$(printf '%s\n' "$DOCKER_OUT" | sed -n 's/^PREFIX=//p' | tail -1)
+            RIB_LIST=""
+            for _ in $(seq 1 10); do
+                RIB_LIST=$($COMPOSE exec -T nfd nfdc route list 2>&1 || true)
+                [[ -n "$PREFIX" && "$RIB_LIST" == *"$PREFIX"* ]] && break
+                sleep 0.2
+            done
+            if [[ -z "$PREFIX" || "$RIB_LIST" != *"$PREFIX"* ]]; then
+                echo "FAIL: Docker NFD route was accepted but not observed in nfdc route list"
+                printf '%s\n' "$DOCKER_OUT"
+                printf '%s\n' "$RIB_LIST"
+                exit 1
+            fi
+
+            printf '%s\n' "$DOCKER_OUT"
+            echo "ok: NFD RIB shows $PREFIX"
+            echo
+            echo "=== C.12 RESOLVED (Docker NFD) — key-backed command Interest accepted by NFD ==="
+            exit 0
+        else
+            echo "FAIL: Docker NFD key-backed interop failed"
+            printf '%s\n' "$DOCKER_OUT"
+            exit 1
+        fi
+    fi
+fi
+
+if ! command -v nfd >/dev/null 2>&1; then
+    echo "SKIP: neither Docker testbed nor host 'nfd' available — unit witness passed" >&2
     exit 2
 fi
 
@@ -143,12 +203,13 @@ else
     exit 1
 fi
 
-# Verify RIB has the entry
-if "$NDN_CTL" --socket "$NDN_SOCK" route rib-list \
-        2>/tmp/c12_rib_list.txt | grep -q "/test/prefix"; then
+# Verify RIB has the entry.
+RIB_LIST=$("$NDN_CTL" --socket "$NDN_SOCK" route rib-list 2>/tmp/c12_rib_list.txt || true)
+if [[ "$RIB_LIST" == *"/test/prefix"* ]]; then
     echo "ok: RIB shows /test/prefix"
 else
     echo "FAIL: /test/prefix not in RIB"
+    printf '%s\n' "$RIB_LIST"
     cat /tmp/c12_rib_list.txt
     exit 1
 fi

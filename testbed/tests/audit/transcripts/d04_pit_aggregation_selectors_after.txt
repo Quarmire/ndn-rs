@@ -1,4 +1,4 @@
-=== D.04 AFTER FIX (2026-05-02) ===
+=== D.04 AFTER FIX (updated 2026-05-28) ===
 
 
 running 3 tests
@@ -8,16 +8,7 @@ test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 89 filtered out; fin
 
 === Witness: testbed/tests/audit/d04_pit_aggregation_selectors.sh ===
 ok: PIT key drops selectors; in-record carries originator selector
+ok: CS lookup applies MustBeFresh before satisfying from cache
 
-=== D.04 RESOLVED — PIT key is Name(+ForwardingHint) only; selectors per in-record ===
+=== D.04 RESOLVED - PIT selectors aggregate; MustBeFresh rejects stale CS hits ===
 EXIT: 0
-
-=== Full ndn-store --lib (regression sweep) ===
-.....
-test result: ok. 92 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.20s
-
-
-=== Full ndn-engine --lib (regression sweep) ===
-.........................................
-test result: ok. 41 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
-

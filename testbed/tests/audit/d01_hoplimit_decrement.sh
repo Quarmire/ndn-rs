@@ -15,13 +15,13 @@
 #                interop TCP:6364→ndn-fwd; ndn-fwd UDP→NFD; ndnpoke on NFD.
 #                Each test uses a unique probe name to prevent CS contamination.
 #
-#              Test A — HL=2 (/d01-probe-hl2):
-#                ndnpoke waits on NFD for /d01-probe-hl2.
+#              Test A — HL=2 (/d01-probe/hl2):
+#                ndnpoke waits on NFD for /d01-probe/hl2.
 #                ndnpeek (HL=2) → ndn-fwd decrements to 1 → NFD → ndnpoke.
 #                Data returned: HopLimit decrement does not kill reachability.
 #
-#              Test B — HL=1 (/d01-probe-hl1):
-#                ndnpoke waits on NFD for /d01-probe-hl1.
+#              Test B — HL=1 (/d01-probe/hl1):
+#                ndnpoke waits on NFD for /d01-probe/hl1.
 #                ndnpeek (HL=1) → ndn-fwd decrements to 0 → MUST NOT forward.
 #                ndnpoke never fires → timeout at interop.
 #
@@ -58,10 +58,10 @@ fi
 # ndnpoke runs as a background producer on NFD; ndnpeek from interop
 # connects to ndn-fwd TCP port 6364.
 #
-#   Test A (/d01-probe-hl2): Interest HL=2 → ndn-fwd decrements to 1 →
+#   Test A (/d01-probe/hl2): Interest HL=2 → ndn-fwd decrements to 1 →
 #   NFD forwards to ndnpoke → Data returned.
 #
-#   Test B (/d01-probe-hl1): Interest HL=1 → ndn-fwd decrements to 0 →
+#   Test B (/d01-probe/hl1): Interest HL=1 → ndn-fwd decrements to 0 →
 #   ndn-fwd MUST NOT forward (HopLimit exhausted) → ndnpoke never fires →
 #   timeout at interop.
 COMPOSE="docker compose -f testbed/docker-compose.yml"
@@ -91,13 +91,13 @@ else
 
     # Test A: HL=2 — ndnpoke waits on NFD; Interest traverses ndn-fwd (HL→1) → NFD → ndnpoke
     $COMPOSE exec -d interop bash -c \
-        'NDN_CLIENT_TRANSPORT=unix:///run/nfd/nfd.sock ndnpoke /d01-probe-hl2 <<< HopLimitProbe' \
+        'NDN_CLIENT_TRANSPORT=unix:///run/nfd/nfd.sock ndnpoke /d01-probe/hl2 <<< HopLimitProbe' \
         2>/dev/null || true
     sleep 1
 
     HL2=$($COMPOSE exec -T interop bash -c \
         'NDN_CLIENT_TRANSPORT=tcp4://172.30.0.10:6364 \
-         ndnpeek -p -H 2 -w 4000 /d01-probe-hl2 2>&1') || HL2="TIMEOUT"
+         ndnpeek -p -H 2 -w 4000 /d01-probe/hl2 2>&1') || HL2="TIMEOUT"
     if [ -z "$HL2" ] || [ "$HL2" = "TIMEOUT" ]; then
         echo "FAIL: INTEROP Test-A — HL=2 did not return Data (routing or HL decrement issue)"
         fail=1
@@ -107,13 +107,13 @@ else
 
     # Test B: HL=1 — ndn-fwd decrements to 0, MUST NOT forward; ndnpoke never fires
     $COMPOSE exec -d interop bash -c \
-        'NDN_CLIENT_TRANSPORT=unix:///run/nfd/nfd.sock ndnpoke /d01-probe-hl1 <<< HopLimitProbe' \
+        'NDN_CLIENT_TRANSPORT=unix:///run/nfd/nfd.sock ndnpoke /d01-probe/hl1 <<< HopLimitProbe' \
         2>/dev/null || true
     sleep 1
 
     HL1=$($COMPOSE exec -T interop bash -c \
         'NDN_CLIENT_TRANSPORT=tcp4://172.30.0.10:6364 \
-         ndnpeek -p -H 1 -w 3000 /d01-probe-hl1 2>&1') || HL1="TIMEOUT"
+         ndnpeek -p -H 1 -w 3000 /d01-probe/hl1 2>&1') || HL1="TIMEOUT"
     if [ -z "$HL1" ] || [ "$HL1" = "TIMEOUT" ]; then
         echo "ok: INTEROP Test-B — HL=1 timed out (ndn-fwd did not forward HL=0)"
     else

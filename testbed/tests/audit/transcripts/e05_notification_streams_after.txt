@@ -1,13 +1,6 @@
-=== E.05 AFTER FIX (2026-05-02) ===
+ok: NotificationStream reaches unit subscribers from publisher and event sources
+ok: live strategy-choice notification fetched from ndn-fwd
+ok: Data name /localhost/nfd/strategy-choice/notifications/seq=3
+ok: Content set prefix=/e05-live/strategy-1779944326 strategy=/localhost/nfd/strategy/best-route
 
-
-running 3 tests
-...
-test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 34 filtered out; finished in 0.00s
-
-
-=== Witness: testbed/tests/audit/e05_notification_streams.sh ===
-ok: NotificationStream publishes <prefix>/<seq> Data with payload
-
-=== E.05 RESOLVED 2026-05-02 (architecture); live nfdc events still BLOCKED-BY-INTEROP ===
-EXIT: 0
+=== E.05 RESOLVED 2026-05-28 (unit + live event-stream interop when Docker is running) ===

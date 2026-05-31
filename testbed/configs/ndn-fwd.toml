@@ -11,7 +11,12 @@ variant     = "lru"
 capacity_mb = 64
 
 [security]
-# No persistent identity in testbed; ephemeral key is auto-generated.
+# Persistent ECDSA-P256 identity for live management-response signing
+# witnesses. The PIB lives in /run/ndn-fwd so the interop container can
+# read the trust anchor from the shared socket volume.
+identity = "/testbed/ndn-fwd"
+pib_path = "/run/ndn-fwd/pib"
+auto_init = true
 profile = "disabled"
 
 # Management-command security: disable signing requirement in the testbed

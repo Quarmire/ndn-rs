@@ -26,7 +26,7 @@ directory is where that evidence lives.
 docker compose -f testbed/docker-compose.yml up -d --build
 
 # Interop tests (ndn-rs ↔ ndn-cxx ↔ NDNts through NFD/yanfd/ndn-fwd):
-docker compose -f testbed/docker-compose.yml exec testclient \
+docker compose -f testbed/docker-compose.yml exec interop \
     bash /testbed/tests/interop/run_all.sh
 
 # Compliance tests (same suites against all three forwarders):
@@ -37,6 +37,19 @@ docker compose -f testbed/docker-compose.yml exec testclient \
 docker compose -f testbed/docker-compose.yml exec testclient \
     bash /testbed/bench/run_all.sh
 ```
+
+On Docker Desktop machines with tighter VM memory or storage limits, build the
+heavy services sequentially instead of asking compose to compile every image at
+once:
+
+```bash
+NDN_TESTBED_BUILD_JOBS=2 testbed/tools/up-g06-low-memory.sh
+```
+
+That script sets `COMPOSE_PARALLEL_LIMIT=1`, caps C++/Rust build jobs inside
+the testbed Dockerfiles, builds `ndn-fwd` and `interop` one at a time, and then
+starts the G.06 services with `--no-build`. If Docker reports API 500s during
+large rebuilds, check available Docker disk first.
 
 Results are written into the `results/` named volume (timestamped
 `.txt` and `.json` files). Use `docker compose cp` to pull them
@@ -57,15 +70,17 @@ out.
                     ndn-net (172.30.0.0/24)
 ```
 
-Each forwarder's Unix socket is shared with `testclient` via a
-named Docker volume, so `ndn-peek --face-socket` / `nfdc` / `ndn-ctl`
-can drive any forwarder from the testclient.
+Each forwarder's Unix socket is shared into the tool containers via
+named Docker volumes. `testclient` drives ndn-rs CLI compliance checks,
+while `interop` carries reference peer tools such as `nfdc`, `ndnpeek`,
+`ndnpoke`, `ndnping`, NDNts `ndncat`, and ndn-rs witness helpers such as
+`ndn-mgmt-response-verify` and `ndn-mgmt-notification-fetch`.
 
 ## Suites
 
 | Path | What it does |
 |------|--------------|
-| `tests/interop/` | ndn-rs ↔ ndn-cxx ↔ NDNts through each forwarder. 8 scenarios. |
+| `tests/interop/` | ndn-rs ↔ ndn-cxx ↔ NDNts through each forwarder. 8 scenarios; the image smoke-checks peer CLIs such as `ndncat` at build time. |
 | `tests/compliance/` | 4 black-box compliance suites (basic forwarding, PIT aggregation, CS behaviour, mgmt protocol) run against all three forwarders. |
 | `tests/browser/` | Playwright tests for WebSocket / WASM / Web Bluetooth transports. |
 | `tests/audit/` | **New.** Per-audit-finding witness scripts. See the audit-to-test map below. |
@@ -87,7 +102,7 @@ corresponding fix lands.
 | A.09 Signed Interest signs placeholder, not real digest | ~~BLOCKER~~ **RESOLVED** 2026-05-01 | `tests/audit/a09_signed_interest_verify.sh` + ndn-packet unit test `interest_builder_sign_sync_signed_region_matches_extractor` | unit PASS; interop witness pending helper binary |
 | A.10 `DataBuilder::build()` emits forged DigestSha256 | MAJOR | `tests/audit/a10_databuilder_build_sig.sh` | pending |
 | A.12 Invented "bare Nack TLV" form | MAJOR | already exercised by interop tests (no separate witness) | — |
-| A.15 KeyLocator required/forbidden rules unenforced | MAJOR | `tests/audit/a15_keylocator_rules.sh` | pending |
+| A.15 KeyLocator required/forbidden rules unenforced | ~~MAJOR~~ **RESOLVED** 2026-05-27 | `tests/audit/a15_keylocator_rules.sh` | PASS |
 | A.17 BLAKE3 SignatureType codes 6/7 in reserved range | MAJOR | `tests/audit/a17_blake3_sigtype_rejected.sh` | pending |
 | B.01 NDNLPv2 reliability uses `Sequence` instead of `TxSequence` | BLOCKER | `tests/audit/b01_reliability_txsequence.sh` | FAIL (to be fixed) |
 | B.11 BLE face uses NDNLPv2 with no private framing | POSITIVE | `tests/browser/ws-transport.spec.ts` neighbour (manual BLE check outside harness) | PASS |
@@ -111,7 +126,7 @@ corresponding fix lands.
 | F.01 `udp4://` forced for IPv6 peers | MAJOR | `tests/audit/f01_ipv6_faceuri.sh` | FAIL |
 | F.03 FaceUri schemes incomplete | MAJOR | `tests/audit/f03_faceuri_schemes.sh` | FAIL |
 | G.03 PSync IBF not wire-compatible | BLOCKER | `tests/audit/g03_psync_interop.sh` | FAIL |
-| G.04 NLSR missing | MAJOR | n/a (feature absence, not witnessable as a wire test) | — |
+| G.04 NLSR route convergence | MAJOR | `tests/audit/g04_nlsr_interop.sh` | PASS |
 
 **Not an exhaustive list** — add new rows whenever the audit is
 updated or a new finding surfaces. A finding without a witness

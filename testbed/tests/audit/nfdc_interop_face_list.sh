@@ -13,18 +13,15 @@
 #              dataset, we know the NFD-canonical subset survives.
 #
 # Witness layout:
-#   - SKIP=2 when `nfdc` is not on PATH (no testbed install).  The
-#     scaffold lands so a Tier-6 commit cannot accidentally drop
-#     the cross-impl contract; bringing nfdc onto the testbed
-#     trips the script to a real assertion.
-#   - PASS=0 when nfdc successfully decodes the dataset returned
-#     by a running `ndn-fwd`.
+#   - PASS=0 when reference NFD's `nfdc` successfully decodes the
+#     dataset returned by a running `ndn-fwd`.
 #   - FAIL=1 when nfdc errors out on the wire.
+#   - SKIP=2 only when neither the Docker interop container nor a
+#     local `nfdc` + ndn-fwd socket is available.
 #
 # Reverify recipe:
-#   1. Install nfdc on the testbed (e.g. via the C++ NFD container).
-#   2. Run `ndn-fwd` listening on the standard mgmt socket.
-#   3. Run this script.
+#   1. `docker compose -f testbed/docker-compose.yml up -d ndn-fwd interop`
+#   2. Run this script.
 #
 # Exit codes:
 #   0 — PASS (nfdc decoded the FaceStatus dataset)
@@ -34,27 +31,54 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 cd "$REPO_ROOT"
 
-if ! command -v nfdc >/dev/null 2>&1; then
-    echo "SKIP: nfdc not on PATH — install the C++ NFD tools to enable this witness." >&2
-    exit 2
-fi
+run_nfdc_face_list() {
+    if command -v docker >/dev/null 2>&1; then
+        local compose="docker compose -f testbed/docker-compose.yml"
+        local services
+        services="$($compose ps --status running --services ndn-fwd interop 2>/dev/null || true)"
+        if [[ "$services" == *"ndn-fwd"* && "$services" == *"interop"* ]]; then
+            $compose exec -T interop bash -lc \
+                'NDN_CLIENT_TRANSPORT=unix:///run/ndn-fwd/ndn-fwd.sock nfdc face list' 2>&1
+            return
+        fi
+    fi
 
-# Verify ndn-fwd is reachable on the standard mgmt socket.
-SOCK="${NDN_SOCK:-/run/nfd/nfd.sock}"
-if [ ! -S "$SOCK" ]; then
-    echo "SKIP: $SOCK is not a Unix socket — start ndn-fwd before running this witness." >&2
-    exit 2
-fi
+    if ! command -v nfdc >/dev/null 2>&1; then
+        echo "SKIP: nfdc not on PATH and Docker interop is not running." >&2
+        return 2
+    fi
+
+    local sock="${NDN_SOCK:-/run/ndn-fwd/ndn-fwd.sock}"
+    if [ ! -S "$sock" ]; then
+        echo "SKIP: $sock is not a Unix socket — start ndn-fwd before running this witness." >&2
+        return 2
+    fi
+
+    NDN_CLIENT_TRANSPORT="unix://$sock" nfdc face list 2>&1
+}
 
 # nfdc `face list` exits non-zero on parse errors and prints to
 # stderr.  Run it and assert the output names at least one face id.
-out="$(nfdc face list 2>&1 || true)"
+set +e
+out="$(run_nfdc_face_list)"
+rc=$?
+set -e
+if [ "$rc" -eq 2 ]; then
+    echo "$out" >&2
+    exit 2
+fi
+if [ "$rc" -ne 0 ]; then
+    echo "FAIL: nfdc face list exited $rc" >&2
+    echo "$out" >&2
+    exit 1
+fi
 if [ -z "$out" ]; then
     echo "FAIL: nfdc face list produced no output" >&2
     exit 1
 fi
 if echo "$out" | grep -qE 'faceid='; then
     echo "PASS: nfdc face list decoded the ndn-rs FaceStatus dataset."
+    echo "$out" | sed -n '1,8p'
     exit 0
 else
     echo "FAIL: nfdc face list output did not contain 'faceid=' — wire shape suspected" >&2

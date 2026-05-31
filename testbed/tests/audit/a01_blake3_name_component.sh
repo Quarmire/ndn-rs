@@ -8,10 +8,8 @@
 #              "Types 0-31 are grandfathered as critical regardless of LSB.
 #              When decoding an unrecognized critical TLV-TYPE at the current
 #              decode position, decoding MUST abort."
-# Witnesses:   ndn-rs no longer defines or emits a TLV-TYPE 0x03 name
-#              component, so spec-conformant peers cannot reject what isn't
-#              produced. This is now a GREP-PROOF: the audit trips back to
-#              FAIL the moment any of the listed surface re-appears.
+# Witnesses:   RUST-UNIT — type 3 remains an opaque typed name component
+#              with no `blake3digest=` URI alternate or BLAKE3 semantics.
 #
 # Resolution:  the BLAKE3_DIGEST constant, the `NameComponent::blake3_digest`
 #              and `as_blake3_digest` helpers, the `Name::append_blake3_digest`
@@ -25,57 +23,13 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 cd "$REPO_ROOT"
 
-fail=0
-
-check() {
-    local label="$1"
-    local pattern="$2"
-    shift 2
-    local hits
-    hits=$(grep -rnE "$pattern" "$@" 2>/dev/null || true)
-    if [ -n "$hits" ]; then
-        echo "FAIL: $label"
-        echo "$hits"
-        fail=1
-    else
-        echo "ok: $label"
-    fi
-}
-
-# 1. The TLV-TYPE 0x03 constant must not exist in ndn-packet.
-check "no BLAKE3_DIGEST constant in ndn-packet" \
-    'BLAKE3_DIGEST' \
-    crates/ndn-packet/src/
-
-# 2. The Name component / helper / Display alt-form must not exist.
-check "no blake3_digest helpers in ndn-packet" \
-    'blake3_digest|blake3digest=|append_blake3_digest|as_blake3_digest|zone_root_from_hash|is_zone_root' \
-    crates/ndn-packet/src/
-
-# 3. The zone module and ZoneKey must not exist in ndn-security.
-check "no ZoneKey / zone module in ndn-security" \
-    'ZoneKey|crate::zone|pub mod zone\b|zone_root_from_pubkey|verify_zone_root|zone_root_to_did' \
-    crates/ndn-security/src/
-
-# 4. The zone-bound DID builder functions must not exist.
-check "no build_zone_did_document / build_zone_succession_document in ndn-security" \
-    'build_zone_did_document|build_zone_succession_document' \
-    crates/ndn-security/src/
-
-# 5. zone.rs file itself must be gone.
-if [ -e crates/ndn-security/src/zone.rs ]; then
-    echo "FAIL: crates/ndn-security/src/zone.rs still exists"
-    fail=1
-else
-    echo "ok: zone.rs deleted"
-fi
-
-if [ "$fail" -eq 0 ]; then
-    echo
-    echo "=== A.01 RESOLVED — no BLAKE3_DIGEST 0x03 surface in ndn-rs ==="
-    exit 0
-else
-    echo
-    echo "=== A.01 REGRESSION — BLAKE3_DIGEST 0x03 surface re-introduced ==="
+if ! cargo test -p ndn-packet --features std --lib --quiet a01_ >/tmp/a01_witness.log 2>&1; then
+    echo "FAIL: a01_ behavioral tests"
+    cat /tmp/a01_witness.log
     exit 1
+else
+    echo "ok: a01_ behavioral tests"
 fi
+
+echo
+echo "=== A.01 RESOLVED — TLV-TYPE 0x03 has no BLAKE3 name-component semantics ==="

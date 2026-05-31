@@ -43,6 +43,8 @@ services:
     build:
       context: ..
       dockerfile: binaries/ndn-fwd/Dockerfile
+      args:
+        BUILD_JOBS: "${NDN_TESTBED_BUILD_JOBS:-2}"
     container_name: ndn-fwd
     hostname: ndn-fwd
     networks:
@@ -118,6 +120,8 @@ services:
     build:
       context: ..
       dockerfile: testbed/Dockerfile.interop
+      args:
+        BUILD_JOBS: "${NDN_TESTBED_BUILD_JOBS:-2}"
     container_name: interop
     hostname: interop
     networks:
@@ -128,9 +132,13 @@ services:
         condition: service_healthy
       nfd:
         condition: service_healthy
+      yanfd:
+        condition: service_healthy
     volumes:
+      - ./results:/results
       - ndn-fwd-sock:/run/ndn-fwd:ro
       - nfd-sock:/run/nfd:ro
+      - yanfd-sock:/run/yanfd:ro
       - nfd-ndncert-sock:/run/nfd-ndncert:ro
       - ./tests:/testbed/tests:ro
     command: ["sleep", "infinity"]

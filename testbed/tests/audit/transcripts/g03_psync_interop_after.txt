@@ -1,4 +1,29 @@
-=== G.03 AFTER FIX (2026-05-01) ===
-=== G.03 RESOLVED (architecture) — IBF hash family is MurmurHash3 ===
+G.03 PSync Docker live interop witness
 
-EXIT: 0
+Command:
+  COUNT=5 TIMEOUT=45 testbed/tests/audit/g03_psync_interop.sh
+
+Result:
+  === G.03 PASS — Rust PSync consumer converged with C++ FullProducer ===
+
+Observed Rust consumer updates:
+  /ndn/audit/g03/user-0/%01#0
+  /ndn/audit/g03/user-2/%01#0
+  /ndn/audit/g03/user-1/%01#0
+  /ndn/audit/g03/user-3/%01#0
+  /ndn/audit/g03/user-4/%01#0
+
+Observed C++ producer publishes:
+  PUBLISH /ndn/audit/g03/user-0/1
+  PUBLISH /ndn/audit/g03/user-1/1
+  PUBLISH /ndn/audit/g03/user-2/1
+  PUBLISH /ndn/audit/g03/user-3/1
+  PUBLISH /ndn/audit/g03/user-4/1
+
+Notes:
+  The witness ran through the Docker compose path. The interop image contains
+  upstream C++ PSync, the deterministic `psync-deterministic-producer`
+  fixture, and ndn-rs `ndn-psync-consumer`; the script execs itself inside the
+  `interop` service and uses the shared NFD socket at `/run/nfd/nfd.sock`.
+  The witness requires five distinct deterministic update prefixes, not only
+  five output lines.

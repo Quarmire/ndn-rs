@@ -1,4 +1,8 @@
-=== E.04 AFTER FIX (2026-05-01) ===
-=== E.04 RESOLVED — status datasets are versioned + segmented + carry FinalBlockId ===
+=== E.04 AFTER LIVE INTEROP (2026-05-28) ===
+ok: RUST-UNIT — versioned+segmented datasets with FinalBlockId
+ok: INTEROP — Data name carries version+segment components
+ok: INTEROP — FinalBlockId present on dataset response
+
+=== E.04 RESOLVED — status datasets versioned+segmented+FinalBlockId (RUST-UNIT + INTEROP) ===
 
 EXIT: 0

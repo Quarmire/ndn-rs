@@ -1,7 +1,9 @@
-=== D.01 / I.09 AFTER FIX (2026-05-01) ===
+=== D.01 / I.09 AFTER LIVE INTEROP (2026-05-28) ===
 ok: ndn-packet helper (decrement_hop_limit)
 ok: ndn-engine decode stage
+ok: INTEROP Test-A — HL=2 reached NFD and Data returned
+ok: INTEROP Test-B — HL=1 timed out (ndn-fwd did not forward HL=0)
 
-=== D.01 / I.09 RESOLVED — HopLimit decremented on incoming pipeline ===
+=== D.01 / I.09 RESOLVED — HopLimit decremented on incoming pipeline (RUST-UNIT + INTEROP) ===
 
 EXIT: 0

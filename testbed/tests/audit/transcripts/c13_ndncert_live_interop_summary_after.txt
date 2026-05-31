@@ -1,0 +1,20 @@
+COMMAND: testbed/tests/audit/c13_ndncert_live_interop.sh
+DATE: 2026-05-28
+
+=== C.13 NDNCERT live CA interop witness ===
+nfd-ndncert healthy
+CA ready - /test/ndncert/CA registered with nfd-ndncert
+CA cert-fetch route ready - /test/ndncert/CA via face 259
+tshark capture started
+
+--- enrollment output ---
+NEW complete - request_id=43f0f5b2489fff03
+CHALLENGE trigger sent - challenge_status=Some("need-code")
+WAITING_FOR_PIN request_id=43f0f5b2489fff03
+enrollment complete - issued cert name: /test/ndncert/CA/requester/KEY/v=1779938121266/NDNCERT/v=1779938122262
+CERT_NAME=/test/ndncert/CA/requester/KEY/v=1779938121266/NDNCERT/v=1779938122262
+ISSUER=/test/ndncert/CA/KEY/LH%CA%8B{%AC%F5%05/self/v=1779938118819
+CERT_FETCHED=true
+ENROLL_OK
+
+=== C.13 PASS - NDNCERT live CA interop witnessed ===

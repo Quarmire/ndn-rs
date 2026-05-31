@@ -6,13 +6,17 @@ set -euo pipefail
 
 SOCK="${FWD_SOCK:-/run/ndn-fwd/ndn-fwd.sock}"
 LABEL="${FWD_LABEL:-fwd}"
-PREFIX="/testbed/compliance/cs-test"
+PREFIX="/testbed/compliance/cs-test/${LABEL}-$(date +%s)-$$"
 
 echo "[${LABEL}] cs_behavior: producing one Data packet"
 
-CONTENT="cs-test-$(date +%s)"
+CONTENT="cs-test-$(date +%s%N)"
 TMP_CONTENT=$(mktemp)
 TMP_PUT_LOG=$(mktemp)
+cleanup() {
+  rm -f "${TMP_CONTENT}" "${TMP_PUT_LOG}"
+}
+trap cleanup EXIT
 echo "${CONTENT}" > "${TMP_CONTENT}"
 
 # Redirect ndn-put's stderr to a log file so we can extract the exact Data name it served.
@@ -29,18 +33,21 @@ for i in $(seq 1 30); do
 done
 
 echo "[${LABEL}] cs_behavior: first fetch (populates CS)"
-OUT1=$(ndn-peek --face-socket "${SOCK}" --no-shm --can-be-prefix "${PREFIX}/obj" 2>&1 || echo "FAIL")
+OUT1=""
+for _ in $(seq 1 5); do
+  OUT1=$(ndn-peek --face-socket "${SOCK}" --no-shm --can-be-prefix "${PREFIX}/obj" 2>&1 || echo "FAIL")
+  echo "${OUT1}" | grep -qF "${CONTENT}" && break
+  sleep 0.2
+done
 
 echo "[${LABEL}] cs_behavior: killing producer"
 kill "${PUT_PID}" 2>/dev/null || true
 wait "${PUT_PID}" 2>/dev/null || true
-rm -f "${TMP_CONTENT}"
 sleep 0.2
 
 # Extract exact served Data name (e.g. /testbed/compliance/cs-test/obj/v=<ts>/0).
 # ndn-put stderr line: "ndn-put: served segment 0/0  /name/v=<ts>/0"
 SERVED_NAME=$(grep -m1 "served segment" "${TMP_PUT_LOG}" 2>/dev/null | awk '{print $NF}' || true)
-rm -f "${TMP_PUT_LOG}"
 
 echo "[${LABEL}] cs_behavior: second fetch (must come from CS)"
 if [ -n "${SERVED_NAME}" ]; then
@@ -54,6 +61,8 @@ fi
 if ! echo "${OUT1}" | grep -qF "${CONTENT}"; then
   echo "[${LABEL}] FAIL: cs_behavior — first fetch did not return expected content"
   echo "  First fetch: ${OUT1}"
+  echo "  ndn-put log:"
+  sed 's/^/    /' "${TMP_PUT_LOG}" 2>/dev/null || true
   exit 1
 fi
 

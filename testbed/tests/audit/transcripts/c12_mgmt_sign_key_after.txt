@@ -1,1 +1,14 @@
-SKIP: 'nfd' not in PATH — install NFD from https://named-data.net/doc/NFD/
+=== C.12 KEY-BACKED INTEROP WITNESS — AFTER FIX (2026-05-28) ===
+$ testbed/tests/audit/c12_mgmt_sign_key.sh
+ok: key-backed command Interest behavioral tests
+PREFIX=/test/c12-docker-1779936670-1283
+✓ 200 OK
+  name:      /test/c12-docker-1779936670-1283
+  face-id:   1
+  cost:      10
+  origin:    app (0)
+  flags:     child-inherit (0x1)
+ok: NFD RIB shows /test/c12-docker-1779936670-1283
+
+=== C.12 RESOLVED (Docker NFD) — key-backed command Interest accepted by NFD ===
+exit 0

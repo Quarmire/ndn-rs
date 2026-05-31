@@ -12,5 +12,5 @@ cargo test -p ndn-engine --test self_learning --quiet >/tmp/x06a.log 2>&1 || ok=
 cargo test -p ndn-packet --features std --lib prefix_announcement --quiet >/tmp/x06b.log 2>&1 || ok=0
 cargo test -p ndn-strategy --lib self_learning --quiet >/tmp/x06c.log 2>&1 || ok=0
 if [ "$ok" = 1 ]; then
-  echo "=== X.06 RESOLVED — self-learning: broadcast-on-no-route + validated PrefixAnnouncement route install ==="; exit 0
+  echo "=== X.06 RESOLVED — self-learning: broadcast-on-no-route + validated PrefixAnnouncement route install/use ==="; exit 0
 else echo "FAIL: self-learning"; tail -20 /tmp/x06a.log /tmp/x06b.log /tmp/x06c.log; exit 1; fi

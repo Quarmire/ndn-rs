@@ -1,6 +1,8 @@
-ok: send_interest uses sign_digest_sha256
-ok: dataset queries use send_unsigned_interest
-ok: sign_digest_sha256 is documented as NFD minimum
+=== C.12 DIGEST COMMAND-INTEREST WITNESS — AFTER FIX (2026-05-28) ===
+$ testbed/tests/audit/c12_mgmt_sign_digest.sh
+ok: DigestSha256 command Interest behavioral tests
+ok: listed c12_digest_sha256_signed_region_verifies
+ok: listed c12_digest_sha256_policy_produces_signed_interest
 
 === C.12 RESOLVED — MgmtClient signs command Interests with DigestSha256 ===
 exit 0

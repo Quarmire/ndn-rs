@@ -147,6 +147,28 @@ if [[ $CA_READY -eq 0 ]]; then
 fi
 echo "CA ready — $CA_PREFIX registered with nfd-ndncert"
 
+# ndncert-ca-server registers the command prefix `<ca-prefix>/CA`; issued
+# certificates are named under the requester identity, which is a strict
+# extension of `<ca-prefix>` in this fixture. Add a testbed static route for
+# the CA identity prefix to the same local app face so the final cert-fetch
+# Interest reaches ndncert-ca-server instead of getting a NoRoute Nack.
+CA_FACE_ID=$(docker exec nfd-ndncert \
+    env NDN_CLIENT_TRANSPORT=unix:///run/nfd-ndncert/nfd.sock \
+    nfdc fib 2>/dev/null \
+    | sed -nE "s|.*${CA_PREFIX}/CA .*faceid=([0-9]+).*|\\1|p" \
+    | head -1)
+if [[ -z "$CA_FACE_ID" ]]; then
+    echo "FAIL: could not find ndncert-ca application face for $CA_PREFIX/CA"
+    docker exec nfd-ndncert \
+        env NDN_CLIENT_TRANSPORT=unix:///run/nfd-ndncert/nfd.sock \
+        nfdc fib 2>&1 || true
+    exit 1
+fi
+docker exec nfd-ndncert \
+    env NDN_CLIENT_TRANSPORT=unix:///run/nfd-ndncert/nfd.sock \
+    nfdc route add "$CA_PREFIX" "$CA_FACE_ID" >/dev/null
+echo "CA cert-fetch route ready — $CA_PREFIX via face $CA_FACE_ID"
+
 start_pcap
 
 # ── Run enrollment ────────────────────────────────────────────────────────────
@@ -260,6 +282,12 @@ fi
 if ! grep -q "ENROLL_OK" "$ENROLL_LOG"; then
     echo ""
     echo "FAIL: ENROLL_OK not found in enrollment output"
+    exit 1
+fi
+
+if ! grep -q "CERT_FETCHED=true" "$ENROLL_LOG"; then
+    echo ""
+    echo "FAIL: issued certificate was not fetched and decoded"
     exit 1
 fi
 

@@ -9,13 +9,13 @@
 #              ndn-cxx security/verification-helpers.cpp:222-246
 #              dispatches via DigestAlgorithm derived from
 #              SignatureType.
-# Witnesses:   Three RUST-UNIT tests in `ndn-security`:
+# Witnesses:   RUST-UNIT tests in `ndn-security`:
+#                - c01_rsa_and_ecdsa_verifiers_are_wired
+#                  (RSA/ECDSA verifier dispatch reaches concrete crypto)
 #                - c02_hmac_signed_data_validates_through_dispatch
 #                  (HMAC-SHA-256 path; was hardwired to Ed25519)
 #                - c03_digest_sha256_data_validates_through_dispatch
 #                  (DigestSha256 reachable on basic validate path)
-#                - c01_rsa_and_ecdsa_return_unsupported_not_invalid
-#                  (RSA / ECDSA surface as Unsupported, not Invalid)
 #
 # The previous interop variant of this script (using ndnsec / ndnpeek)
 # is still useful for end-to-end verification with ndn-cxx-issued
@@ -31,7 +31,7 @@ if ! command -v cargo >/dev/null 2>&1; then echo "SKIP: cargo missing" >&2; exit
 
 fail=0
 for test_name in \
-    c01_rsa_and_ecdsa_return_unsupported_not_invalid \
+    c01_rsa_and_ecdsa_verifiers_are_wired \
     c02_hmac_signed_data_validates_through_dispatch \
     c03_digest_sha256_data_validates_through_dispatch
 do

@@ -1,0 +1,6 @@
+PASS: nfdc face list decoded the ndn-rs FaceStatus dataset.
+faceid=3 remote=internal://internal local= counters={in={0i 9d 0n 2923B} out={10i 0d 0n 1108B}} flags={local on-demand point-to-point}
+faceid=6 remote=internal://internal local= counters={in={0i 0d 0n 0B} out={0i 0d 0n 0B}} flags={local on-demand point-to-point}
+faceid=5 remote=internal://internal local= counters={in={0i 0d 0n 0B} out={0i 0d 0n 0B}} flags={local on-demand point-to-point}
+faceid=4 remote=internal://internal local= counters={in={0i 0d 0n 0B} out={0i 0d 0n 0B}} flags={local on-demand point-to-point}
+faceid=61 remote=internal://management local=unix:///run/ndn-fwd/ndn-fwd.sock counters={in={1i 0d 0n 43B} out={0i 0d 0n 0B}} flags={local on-demand point-to-point}

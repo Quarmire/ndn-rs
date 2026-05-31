@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# Witness test for audit finding N.06 — no Dead Nonce List, so loop
-# detection is bounded by per-PIT-entry `nonces_seen` and ends as soon
-# as the PIT entry is satisfied / erased.
+# Witness test for audit finding N.06 — Dead Nonce List loop detection
+# across PIT erasure.
 #
 # Finding:     docs/notes/spec-compliance-cross-reference-2026-05-01.md § N.06
 # Severity:    MAJOR (loop-detection coverage)
@@ -16,12 +15,8 @@
 #                - n06_purge_expired_drops_stale_only
 #                - n06_distinct_nonces_under_same_name_hash
 #                - n06_default_lifetime_matches_nfd
-#
-# Deferred:    Wiring the DNL into `Pit::remove` (push retiring nonces)
-#              and into the incoming-Interest pipeline (consult before
-#              PIT lookup, drop as loop on hit) is the engine-side
-#              follow-up. The data-structure side closes the Tier-2
-#              piece of the audit.
+#              RUST-UNIT in `ndn-engine::stages::pit`:
+#                - n06_dnl_rejects_nonce_after_satisfied_pit_entry_is_erased
 #
 # Exit codes:  0 PASS / 1 FAIL / 2 SKIP
 set -euo pipefail
@@ -38,13 +33,22 @@ else
     fail=1
 fi
 
+if cargo test -p ndn-engine --lib --quiet n06_ \
+        >/tmp/n06_engine_witness.log 2>&1; then
+    echo "ok: engine PIT pipeline consults DNL after PIT erasure"
+else
+    echo "FAIL: engine PIT pipeline does not consult DNL"
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo
-    echo "=== N.06 RESOLVED 2026-05-02 (data-structure; engine wire-up follow-up) ==="
+    echo "=== N.06 RESOLVED — Dead Nonce List wired into PIT loop detection ==="
     exit 0
 else
     echo
     echo "=== N.06 EXPECTED-FAIL — Dead Nonce List missing ==="
     [ -f /tmp/n06_witness.log ] && cat /tmp/n06_witness.log
+    [ -f /tmp/n06_engine_witness.log ] && cat /tmp/n06_engine_witness.log
     exit 1
 fi
