@@ -13,8 +13,10 @@
 
 pub mod custodian;
 mod key_id;
+mod signer;
 
 pub use key_id::KeyId;
+pub use signer::CustodianSigner;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use custodian::OsKeyringCustodian;
