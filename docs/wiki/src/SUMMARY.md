@@ -43,9 +43,6 @@
 - [Network coding (FEC)](./guides/network-coding.md)
 - [NDNCERT setup](./guides/ndncert-setup.md)
 - [Running the dashboard](./guides/running-the-dashboard.md)
-- [Dashboard next](./guides/dashboard-next.md)
-- [Dashboard next deployment](./guides/dashboard-next-deployment.md)
-- [Dashboard next cutover](./guides/dashboard-next-cutover.md)
 - [Self-hosting](./guides/self-hosting.md)
 
 # Operations
@@ -57,14 +54,11 @@
 
 # Reference
 
-- [Dashboard next visual language](./design/dashboard-next-visual-language.md)
 - [Face transports](./reference/face-transports.md)
 - [NDN over BLE — GATT profile](./reference/ndn-ble-gatt-profile.md)
 - [Management verbs](./reference/mgmt-verbs.md)
 - [Trust policies](./reference/trust-policies.md)
-- [Dashboard extension: network coding](./reference/extensions/coding.md)
-- [Dashboard extension: rate limit](./reference/extensions/rate-limit.md)
-- [Dashboard extension: compute](./reference/extensions/compute.md)
+- [Dashboard extensions](./reference/dashboard-extensions.md)
 - [Spec compliance](./reference/spec-compliance.md)
 
 # Releases
