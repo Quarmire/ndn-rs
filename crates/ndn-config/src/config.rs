@@ -1261,6 +1261,7 @@ pub struct TrustRuleConfig {
 /// Interests. Default is on; opt out only for local dev without a
 /// provisioned trust anchor.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct MgmtSecurityConfig {
     /// When `true` (default), DigestSha256-only or unsigned command
     /// Interests are rejected 403; key-backed signatures must pass the
@@ -1296,6 +1297,7 @@ impl Default for MgmtSecurityConfig {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SecurityConfig {
     /// Key and certificate must exist in the PIB unless `auto_init`.
     #[serde(default)]
@@ -1581,6 +1583,28 @@ file = "/var/log/ndn/router.log"
     fn example_file_parses() {
         let s = include_str!("../../../examples/ndn-fwd.example.toml");
         ForwarderConfig::from_str(s).expect("example config should parse");
+    }
+
+    #[test]
+    fn misplaced_security_keys_are_rejected() {
+        // A `[security.mgmt]` key placed under `[security]` is a common
+        // footgun — without deny_unknown_fields serde silently drops it,
+        // leaving the validator unconfigured. It must now error loudly.
+        let bad = "[security]\ntrust_anchor_pib = \"/etc/ndn/mgmt-pib\"\n";
+        let err = ForwarderConfig::from_str(bad).expect_err("misplaced key must error");
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("unknown field") || msg.contains("trust_anchor_pib"),
+            "expected an unknown-field error, got: {msg}"
+        );
+
+        // The same key in its correct home parses.
+        let good = "[security.mgmt]\ntrust_anchor_pib = \"/etc/ndn/mgmt-pib\"\n";
+        let cfg = ForwarderConfig::from_str(good).expect("correct placement parses");
+        assert_eq!(
+            cfg.security.mgmt.trust_anchor_pib.as_deref(),
+            Some("/etc/ndn/mgmt-pib")
+        );
     }
 
     #[test]
