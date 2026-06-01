@@ -65,6 +65,12 @@ impl FaceTable {
 
     pub fn insert_arc(&self, face: Arc<Face>) -> FaceId {
         let id = face.id();
+        // Keep the id allocator ahead of explicitly-inserted ids, so a later
+        // `alloc_id()` can never collide with a face inserted at a fixed id
+        // (e.g. the dioxus upstream WebTransport face at `FaceId(1)`, which
+        // would otherwise be overwritten by the first `alloc_id()` app face).
+        self.next_id
+            .fetch_max(id.0 + 1, std::sync::atomic::Ordering::Relaxed);
         #[cfg(not(target_arch = "wasm32"))]
         self.faces.insert(id, face);
         #[cfg(target_arch = "wasm32")]
