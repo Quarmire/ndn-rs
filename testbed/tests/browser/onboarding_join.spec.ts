@@ -34,14 +34,15 @@ import * as path from 'path';
 const REPO_ROOT = path.resolve(__dirname, '../../..');
 const NDN_FWD_BIN =
   process.env.NDN_FWD_BIN ?? path.join(REPO_ROOT, 'target', 'release', 'ndn-fwd');
+const WASM_BUNDLE = path.join(__dirname, 'fixture-page', 'sw-pkg', 'shared_engine_bg.wasm');
 
 const WT_PORT = 4443;
-// The CA serves NDNCERT at `<CA_CONFIG_PREFIX>/{INFO,NEW,CHALLENGE}`.
-const CA_CONFIG_PREFIX = '/demo/CA';
-// The `ca` arg to JoinClient.join() is the *identity* prefix; the enroll client
-// appends `/CA/NEW` to it (→ `/demo/CA/NEW`). Passing `/demo/CA` would double
-// the `CA` component and the CA would never answer.
-const CA_ARG = '/demo';
+// The CA's identity prefix. `[demo_ca].prefix` is the identity; NdncertCa
+// appends `/CA` itself and serves `/demo/CA/{INFO,NEW,CHALLENGE}`. The enroll
+// client likewise appends `/CA/NEW`, so both sides land on `/demo/CA/NEW`.
+// (Configuring `/demo/CA` would make the CA serve `/demo/CA/CA/NEW` and reject
+// the client's `/demo/CA/NEW` as an unrecognised Interest.)
+const CA_PREFIX = '/demo';
 const IDENTITY_PREFIX = '/demo/users';
 const TOKEN = process.env.JOIN_TOKEN ?? 'TEST_TOKEN_FOR_PLAYWRIGHT';
 
@@ -60,12 +61,12 @@ cert_source = { type = "self_signed_dev", hostnames = ["localhost", "127.0.0.1"]
 
 [demo_ca]
 enabled = true
-prefix = "${CA_CONFIG_PREFIX}"
-identity = "${CA_CONFIG_PREFIX}"
+prefix = "${CA_PREFIX}"
+identity = "${CA_PREFIX}"
 tokens = ["${TOKEN}"]
 
 [logging]
-level = "info,face.wt=debug,demo_ca=debug"
+level = "info"
 `;
 
 let fwdProc: ChildProcess | null = null;
@@ -114,17 +115,18 @@ test.afterAll(async () => {
   fs.rmSync(fwdConfigPath, { force: true });
 });
 
-// STATUS 2026-06-01: harness fully wired (spawns ndn-fwd, scrapes cert hash,
-// pins it via `?cert=`, correct `/demo` enroll prefix). Two real wasm bugs that
-// blocked this were fixed along the way: `AlalFeature::new` raw `Instant::now()`
-// (panicked in-browser) and `ndn-mgmt` notification raw `tokio::spawn`.
-// REMAINING BLOCKER: the in-browser WebTransport face opens the session
-// (forwarder logs `accepted session`) but no Interest bytes reach the forwarder
-// — a WT consumer/send-direction issue in `BrowserWebTransportFace`. Skipped
-// until that's fixed; flip `.skip` once the send path delivers.
+// STATUS 2026-06-01: PASSES end to end (NEW → CHALLENGE(token) → cert-fetch →
+// SafeBag → reload-restore). Getting here surfaced four real bugs, now fixed:
+//   - `AlalFeature::new` raw `Instant::now()` panicked in-browser;
+//   - `ndn-mgmt` notification raw `tokio::spawn` panicked in-browser;
+//   - `WasmEngineBuilder` never wired builder-added faces' I/O (no sender);
+//   - `FaceTable` id allocator collided with the fixed-id upstream face.
+// Runs when ndn-fwd (release) and the wasm bundle are built; skips cleanly
+// otherwise (CI brings ndn-fwd up out-of-band, per the dioxus_demo convention).
 test.describe('Critical-path #4 — onboarding-link join + reload-restore', () => {
-  test.skip('tab claims invite token, then reload restores from IdbPib', async ({ browser }) => {
+  test('tab claims invite token, then reload restores from IdbPib', async ({ browser }) => {
     test.skip(!fs.existsSync(NDN_FWD_BIN), `ndn-fwd binary not found at ${NDN_FWD_BIN}`);
+    test.skip(!fs.existsSync(WASM_BUNDLE), 'wasm bundle not built — run ./build-shared-engine.sh');
     test.skip(!certHashHex, 'forwarder did not log a cert hash');
 
     const HOST_URL = `https://127.0.0.1:${WT_PORT}/ndn?cert=${certHashHex}`;
@@ -146,7 +148,7 @@ test.describe('Critical-path #4 — onboarding-link join + reload-restore', () =
           const info = await j.join(env.host, env.ca, env.idp, env.token);
           return { cert_name: info.cert_name, restored: info.restored };
         },
-        { host: HOST_URL, ca: CA_ARG, idp: IDENTITY_PREFIX, token: TOKEN },
+        { host: HOST_URL, ca: CA_PREFIX, idp: IDENTITY_PREFIX, token: TOKEN },
       );
 
       expect(firstResult.restored).toBe(false);
