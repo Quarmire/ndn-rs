@@ -20,7 +20,10 @@ pub mod os_keyring;
 pub mod remote_signer;
 
 pub use browser_extension::BrowserExtensionCustodian;
-pub use remote_signer::{RemoteCustodian, RemoteSignRequest, RemoteSignerTransport};
+pub use remote_signer::{
+    ChannelRemoteSigner, RemoteCustodian, RemoteSignRequest, RemoteSignerTransport, SignerChannel,
+    WireSignRequest, WireSignResponse,
+};
 pub use in_page::InPageCustodian;
 #[cfg(not(target_arch = "wasm32"))]
 pub use os_keyring::OsKeyringCustodian;

@@ -10,10 +10,11 @@ edition = "2024"
 # of the native PIB store.
 ndn-security = { path = "../ndn-security", default-features = false }
 ndn-packet   = { workspace = true, features = ["std"] }
+ndn-tlv      = { workspace = true }
 bytes        = { workspace = true, features = ["std"] }
 async-trait  = { workspace = true }
 dashmap      = { workspace = true }
 thiserror    = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt", "macros"] }
+tokio = { workspace = true, features = ["rt", "macros", "sync"] }

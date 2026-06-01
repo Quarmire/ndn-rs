@@ -17,11 +17,18 @@
 //! Full design + protocol + security model:
 //! `.claude/notes/remote-fob-design-2026-06-01.md`.
 
+// `CustodianError` is intentionally large (it carries a `Name`); the type
+// already opts out of `large_enum_variant`, so the codec's fallible helpers
+// opt out of the matching `Result`-size lint for consistency.
+#![allow(clippy::result_large_err)]
+
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use ndn_packet::Name;
+use ndn_tlv::{TlvReader, TlvWriter};
 
 use crate::KeyId;
 use crate::custodian::{
@@ -120,10 +127,230 @@ impl Custodian for RemoteCustodian {
     }
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// Wire protocol — the contract the remote signer app implements.
+//
+// Carried as datachannel frames (a paired phone over a WebRTC datachannel, BLE,
+// …) and encoded as NDN TLV (via `ndn-tlv`) with application-specific extension
+// type codes. This is a **non-standard ndn-rs extension**, not an NDN
+// community spec.
+//
+// Only the bytes-to-sign (`region`) and a correlation id cross the wire. The
+// signer app renders *what it is signing* from `region` itself — it parses the
+// embedded command name and shows that for approval — so a compromised
+// dashboard cannot present a benign summary for malicious bytes. That parse is
+// the real MITM defence; a human "context" string supplied by the dashboard
+// would not be covered by the operator's signature, so it is advisory only and
+// never transmitted.
+
+/// Extension TLV type codes for the remote-signer protocol (non-standard).
+mod tlv {
+    pub const SIGN_REQUEST: u64 = 0x0640;
+    pub const SIGN_RESPONSE: u64 = 0x0642;
+    pub const REQ_ID: u64 = 0x0644;
+    pub const REGION: u64 = 0x0646;
+    pub const STATUS: u64 = 0x0648;
+    pub const SIGNATURE: u64 = 0x064A;
+}
+
+const STATUS_APPROVED: u8 = 1;
+const STATUS_DENIED: u8 = 0;
+
+fn wire_err(e: ndn_tlv::TlvError) -> CustodianError {
+    CustodianError::SignFailed(format!("malformed remote-signer frame: {e:?}"))
+}
+fn missing(field: &str) -> CustodianError {
+    CustodianError::SignFailed(format!("remote-signer frame missing {field}"))
+}
+fn decode_req_id(v: &[u8]) -> Result<u64, CustodianError> {
+    let arr: [u8; 8] = v
+        .try_into()
+        .map_err(|_| CustodianError::SignFailed("ReqId must be 8 bytes".into()))?;
+    Ok(u64::from_be_bytes(arr))
+}
+
+/// On-wire signing request the remote signer receives. `region` is the exact
+/// bytes to sign; `req_id` correlates the reply on a shared channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireSignRequest {
+    pub req_id: u64,
+    pub region: Bytes,
+}
+
+impl WireSignRequest {
+    /// Encode to a datachannel frame.
+    pub fn encode(&self) -> Bytes {
+        let mut w = TlvWriter::new();
+        w.write_nested(tlv::SIGN_REQUEST, |w| {
+            w.write_tlv(tlv::REQ_ID, &self.req_id.to_be_bytes());
+            w.write_tlv(tlv::REGION, &self.region);
+        });
+        w.finish()
+    }
+
+    /// Decode a datachannel frame. Unknown inner elements are ignored
+    /// (forward-compatible).
+    pub fn decode(wire: &[u8]) -> Result<Self, CustodianError> {
+        let mut r = TlvReader::new(Bytes::copy_from_slice(wire));
+        let (typ, body) = r.read_tlv().map_err(wire_err)?;
+        if typ != tlv::SIGN_REQUEST {
+            return Err(CustodianError::SignFailed(format!(
+                "unexpected message type {typ:#x}, want SignRequest"
+            )));
+        }
+        let (mut req_id, mut region) = (None, None);
+        let mut br = TlvReader::new(body);
+        while !br.is_empty() {
+            let (t, v) = br.read_tlv().map_err(wire_err)?;
+            match t {
+                tlv::REQ_ID => req_id = Some(decode_req_id(&v)?),
+                tlv::REGION => region = Some(v),
+                _ => {}
+            }
+        }
+        Ok(Self {
+            req_id: req_id.ok_or_else(|| missing("ReqId"))?,
+            region: region.ok_or_else(|| missing("Region"))?,
+        })
+    }
+}
+
+/// The remote signer's reply to a [`WireSignRequest`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WireSignResponse {
+    /// Operator approved; carries the signature over the request's `region`.
+    Approved { req_id: u64, signature: Bytes },
+    /// Operator declined, or the request could not be satisfied.
+    Denied { req_id: u64 },
+}
+
+impl WireSignResponse {
+    pub fn req_id(&self) -> u64 {
+        match self {
+            Self::Approved { req_id, .. } | Self::Denied { req_id } => *req_id,
+        }
+    }
+
+    /// Encode to a datachannel frame.
+    pub fn encode(&self) -> Bytes {
+        let mut w = TlvWriter::new();
+        w.write_nested(tlv::SIGN_RESPONSE, |w| match self {
+            Self::Approved { req_id, signature } => {
+                w.write_tlv(tlv::REQ_ID, &req_id.to_be_bytes());
+                w.write_tlv(tlv::STATUS, &[STATUS_APPROVED]);
+                w.write_tlv(tlv::SIGNATURE, signature);
+            }
+            Self::Denied { req_id } => {
+                w.write_tlv(tlv::REQ_ID, &req_id.to_be_bytes());
+                w.write_tlv(tlv::STATUS, &[STATUS_DENIED]);
+            }
+        });
+        w.finish()
+    }
+
+    /// Decode a datachannel frame.
+    pub fn decode(wire: &[u8]) -> Result<Self, CustodianError> {
+        let mut r = TlvReader::new(Bytes::copy_from_slice(wire));
+        let (typ, body) = r.read_tlv().map_err(wire_err)?;
+        if typ != tlv::SIGN_RESPONSE {
+            return Err(CustodianError::SignFailed(format!(
+                "unexpected message type {typ:#x}, want SignResponse"
+            )));
+        }
+        let (mut req_id, mut status, mut signature) = (None, None, None);
+        let mut br = TlvReader::new(body);
+        while !br.is_empty() {
+            let (t, v) = br.read_tlv().map_err(wire_err)?;
+            match t {
+                tlv::REQ_ID => req_id = Some(decode_req_id(&v)?),
+                tlv::STATUS => status = v.first().copied(),
+                tlv::SIGNATURE => signature = Some(v),
+                _ => {}
+            }
+        }
+        let req_id = req_id.ok_or_else(|| missing("ReqId"))?;
+        match status.ok_or_else(|| missing("Status"))? {
+            STATUS_APPROVED => Ok(Self::Approved {
+                req_id,
+                signature: signature.ok_or_else(|| missing("Signature"))?,
+            }),
+            STATUS_DENIED => Ok(Self::Denied { req_id }),
+            other => Err(CustodianError::SignFailed(format!("bad status byte {other}"))),
+        }
+    }
+}
+
+/// A bidirectional byte channel to the remote signer (a WebRTC datachannel, a
+/// BLE link, …). Mirrors `ndn_face_webrtc::RtcChannel`; concrete bindings live
+/// in their own transport crates so this crate stays dependency-light and
+/// wasm-safe.
+#[async_trait]
+pub trait SignerChannel: Send + Sync {
+    /// Send one protocol frame.
+    async fn send(&self, frame: Bytes) -> Result<(), CustodianError>;
+    /// Await the next protocol frame.
+    async fn recv(&self) -> Result<Bytes, CustodianError>;
+    /// Whether the channel is currently usable.
+    fn is_open(&self) -> bool;
+}
+
+/// A [`RemoteSignerTransport`] that frames the protocol over any
+/// [`SignerChannel`]. Requests are single-flight (one outstanding signature at
+/// a time): `Custodian::sign` is awaited sequentially per identity and the
+/// remote's per-use approval serialises it anyway. The response `req_id` is
+/// checked against the request to catch a desynchronised channel.
+pub struct ChannelRemoteSigner<C: SignerChannel> {
+    channel: C,
+    next_req_id: AtomicU64,
+}
+
+impl<C: SignerChannel> ChannelRemoteSigner<C> {
+    pub fn new(channel: C) -> Self {
+        Self {
+            channel,
+            next_req_id: AtomicU64::new(1),
+        }
+    }
+}
+
+#[async_trait]
+impl<C: SignerChannel + 'static> RemoteSignerTransport for ChannelRemoteSigner<C> {
+    async fn request_signature(&self, req: &RemoteSignRequest) -> Result<Bytes, CustodianError> {
+        let req_id = self.next_req_id.fetch_add(1, Ordering::Relaxed);
+        let frame = WireSignRequest {
+            req_id,
+            region: req.region.clone(),
+        }
+        .encode();
+        self.channel.send(frame).await?;
+        let resp = WireSignResponse::decode(&self.channel.recv().await?)?;
+        if resp.req_id() != req_id {
+            return Err(CustodianError::SignFailed(format!(
+                "response req_id {} != request {req_id} (channel desync)",
+                resp.req_id()
+            )));
+        }
+        match resp {
+            WireSignResponse::Approved { signature, .. } => Ok(signature),
+            WireSignResponse::Denied { .. } => Err(CustodianError::SignFailed(
+                "remote signer denied the request".into(),
+            )),
+        }
+    }
+
+    async fn is_reachable(&self) -> bool {
+        self.channel.is_open()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndn_security::{Ed25519Signer, Ed25519Verifier, Signer, VerifyOutcome};
+    use ndn_security::verifier::EcdsaSha256Verifier;
+    use ndn_security::{
+        EcdsaP256Signer, Ed25519Signer, Ed25519Verifier, Signer, VerifyOutcome, Verifier,
+    };
+    use tokio::sync::{Mutex, mpsc};
 
     /// A loopback remote signer: signs locally, standing in for the remote
     /// device so the delegation loop is testable without one.
@@ -196,5 +423,152 @@ mod tests {
             custodian.unlock(UnlockContext::default()).await,
             Err(CustodianError::Unavailable)
         ));
+    }
+
+    #[test]
+    fn wire_request_round_trips() {
+        let req = WireSignRequest {
+            req_id: 0x1_0000_0001,
+            region: Bytes::from_static(b"to-be-signed bytes"),
+        };
+        let decoded = WireSignRequest::decode(&req.encode()).expect("decode");
+        assert_eq!(decoded, req);
+    }
+
+    #[test]
+    fn wire_response_round_trips_both_outcomes() {
+        let approved = WireSignResponse::Approved {
+            req_id: 7,
+            signature: Bytes::from_static(b"\xde\xad\xbe\xef"),
+        };
+        assert_eq!(
+            WireSignResponse::decode(&approved.encode()).expect("decode approved"),
+            approved
+        );
+
+        let denied = WireSignResponse::Denied { req_id: 9 };
+        assert_eq!(
+            WireSignResponse::decode(&denied.encode()).expect("decode denied"),
+            denied
+        );
+    }
+
+    #[test]
+    fn decode_rejects_wrong_message_type() {
+        // A response frame decoded as a request must be rejected, not silently
+        // mis-parsed.
+        let resp = WireSignResponse::Denied { req_id: 1 }.encode();
+        assert!(WireSignRequest::decode(&resp).is_err());
+    }
+
+    /// An in-memory [`SignerChannel`] pair, standing in for the two ends of a
+    /// real datachannel so the framing + delegation loop is testable.
+    struct MpscChannel {
+        tx: mpsc::UnboundedSender<Bytes>,
+        rx: Mutex<mpsc::UnboundedReceiver<Bytes>>,
+    }
+
+    #[async_trait]
+    impl SignerChannel for MpscChannel {
+        async fn send(&self, frame: Bytes) -> Result<(), CustodianError> {
+            self.tx.send(frame).map_err(|_| CustodianError::Unavailable)
+        }
+        async fn recv(&self) -> Result<Bytes, CustodianError> {
+            self.rx
+                .lock()
+                .await
+                .recv()
+                .await
+                .ok_or(CustodianError::Unavailable)
+        }
+        fn is_open(&self) -> bool {
+            !self.tx.is_closed()
+        }
+    }
+
+    fn channel_pair() -> (MpscChannel, MpscChannel) {
+        let (a_tx, b_rx) = mpsc::unbounded_channel();
+        let (b_tx, a_rx) = mpsc::unbounded_channel();
+        (
+            MpscChannel {
+                tx: a_tx,
+                rx: Mutex::new(a_rx),
+            },
+            MpscChannel {
+                tx: b_tx,
+                rx: Mutex::new(b_rx),
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn channel_remote_signer_delegates_over_a_channel() {
+        let key: Name = "/op/phone/KEY/p1".parse().unwrap();
+        let phone = EcdsaP256Signer::from_seed(&[8u8; 32], key.clone()).unwrap();
+        let pk = phone.public_key().unwrap();
+
+        let (dash_end, fob_end) = channel_pair();
+
+        // Mock "phone": receive the request, sign its region, reply Approved.
+        tokio::spawn(async move {
+            let frame = fob_end.recv().await.expect("fob recv");
+            let req = WireSignRequest::decode(&frame).expect("decode request");
+            let sig = phone.sign_sync(&req.region).expect("phone signs");
+            fob_end
+                .send(
+                    WireSignResponse::Approved {
+                        req_id: req.req_id,
+                        signature: sig,
+                    }
+                    .encode(),
+                )
+                .await
+                .expect("fob send");
+        });
+
+        let transport = ChannelRemoteSigner::new(dash_end);
+        let custodian = RemoteCustodian::new(
+            Arc::new(transport),
+            CustodianRef::Fob {
+                fob_id: "phone-1".into(),
+            },
+        );
+
+        let region = b"signed mgmt command region";
+        let sig = custodian
+            .sign(&KeyId(key.clone()), &key, region)
+            .await
+            .expect("remote signs over the channel");
+        assert!(matches!(
+            EcdsaSha256Verifier.verify(region, &sig, &pk).await,
+            Ok(VerifyOutcome::Valid)
+        ));
+    }
+
+    #[tokio::test]
+    async fn channel_remote_signer_surfaces_denial() {
+        let (dash_end, fob_end) = channel_pair();
+
+        // Mock "phone" that declines every request.
+        tokio::spawn(async move {
+            let frame = fob_end.recv().await.expect("fob recv");
+            let req = WireSignRequest::decode(&frame).expect("decode request");
+            fob_end
+                .send(WireSignResponse::Denied { req_id: req.req_id }.encode())
+                .await
+                .expect("fob send");
+        });
+
+        let transport = ChannelRemoteSigner::new(dash_end);
+        let name: Name = "/op/phone/KEY/p1".parse().unwrap();
+        let err = transport
+            .request_signature(&RemoteSignRequest {
+                key_name: name.clone(),
+                region: Bytes::from_static(b"region"),
+                context: "test".into(),
+            })
+            .await
+            .expect_err("denial surfaces as an error");
+        assert!(matches!(err, CustodianError::SignFailed(_)));
     }
 }
