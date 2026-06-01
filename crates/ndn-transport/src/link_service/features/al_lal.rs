@@ -21,7 +21,12 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
-use std::time::Instant;
+
+// `web_time::Instant` is `std::time::Instant` on native and a `performance.now()`
+// shim on wasm32 — raw `std::time::Instant::now()` panics in the browser
+// ("time not implemented"), which broke wasm face setup (e.g. the dioxus
+// onboarding/join path).
+use web_time::Instant;
 
 use bytes::Bytes;
 use ndn_packet::lp::{TLV_AL_PRESENCE, extract_lp_header, splice_lp_header};
