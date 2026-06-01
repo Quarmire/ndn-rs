@@ -1,0 +1,66 @@
+# Onboarding loop — embedded NDNCERT CA reachable from a phone browser.
+#
+# Stands up ndn-fwd with:
+#   - an embedded NDNCERT CA (`[demo_ca]`) gated by a TOKEN challenge, and
+#   - a WebTransport listener the phone's browser dials over QUIC.
+#
+# The phone runs the wasm `JoinClient`: it opens a WebTransport face to
+# `https://<this-host>:4433/ndn?cert=<spki-hash>`, requests a cert from
+# `/demo/CA/{INFO,NEW,CHALLENGE}` presenting the token, and persists the
+# issued cert as a SafeBag in IndexedDB. The CA's self-signed root is
+# installed as a /localhop trust anchor at boot — no PIB file needed.
+#
+# The signaling relay is NOT involved in onboarding (it's only for the
+# WebRTC remote-signer path).
+#
+# NOTE: tokens are read once at startup — adding/rotating a token requires
+# restarting ndn-fwd (there is no runtime mint API yet).
+
+[engine]
+pipeline_threads     = 1
+cs_capacity_mb       = 16
+pipeline_channel_cap = 1024
+
+[cs]
+variant     = "lru"
+capacity_mb = 16
+
+[security]
+profile = "disabled"
+
+[security.mgmt]
+require_signed_commands = false
+
+# ── Embedded NDNCERT CA, token-gated ─────────────────────────────────────────
+# A non-empty `tokens` list selects the TokenChallenge (a single-use invite).
+# Replace the value below before exposing this anywhere real.
+[demo_ca]
+enabled  = true
+prefix   = "/demo/CA"
+identity = "/demo/CA"
+tokens   = ["change-me-one-time-invite"]
+
+# ── WebTransport listener the phone dials ────────────────────────────────────
+# `[::]:4433` is LAN-reachable (dual-stack). On boot, ndn-fwd logs the dial URL
+# including the cert SPKI hash:  https://<host>:4433/ndn?cert=<hex>
+# The phone uses that exact `?cert=` value (W3C serverCertificateHashes), so a
+# self-signed dev cert works without the phone trusting a CA chain.
+[listeners.webtransport]
+enabled     = true
+listen      = "[::]:4433"
+cert_source = { type = "self_signed_dev", hostnames = ["localhost", "127.0.0.1"] }
+
+# Native faces (handy for a `ndn-tools peek` sanity check from a laptop).
+[[face]]
+kind = "udp"
+bind = "0.0.0.0:6363"
+
+[[face]]
+kind = "tcp"
+bind = "0.0.0.0:6364"
+
+[management]
+face_socket = "/run/ndn-fwd/ndn-fwd.sock"
+
+[logging]
+level = "info,face.wt=debug,mgmt.security=debug"
