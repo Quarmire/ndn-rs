@@ -15,12 +15,12 @@ use ndn_packet::Name;
 use crate::KeyId;
 
 pub mod browser_extension;
-pub mod fob;
 pub mod in_page;
 pub mod os_keyring;
+pub mod remote_signer;
 
 pub use browser_extension::BrowserExtensionCustodian;
-pub use fob::{FobCustodian, FobSignRequest, FobTransport};
+pub use remote_signer::{RemoteCustodian, RemoteSignRequest, RemoteSignerTransport};
 pub use in_page::InPageCustodian;
 #[cfg(not(target_arch = "wasm32"))]
 pub use os_keyring::OsKeyringCustodian;
@@ -88,7 +88,7 @@ impl CustodianRef {
 
 /// Caller-provided unlock material. Custodians decide whether they need it.
 /// `InPageCustodian` ignores it; `OsKeyringCustodian` may use the secret as
-/// a passphrase; `FobCustodian` uses none — its unlock is the remote tap.
+/// a passphrase; `RemoteCustodian` uses none — its unlock is the remote tap.
 #[derive(Debug, Clone, Default)]
 pub struct UnlockContext {
     pub passphrase: Option<String>,

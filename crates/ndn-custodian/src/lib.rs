@@ -22,6 +22,6 @@ pub use signer::CustodianSigner;
 pub use custodian::OsKeyringCustodian;
 pub use custodian::{
     BrowserExtensionCustodian, Custodian, CustodianError, CustodianRef, CustodianRegistry,
-    FobCustodian, FobSignRequest, FobTransport, InPageCustodian, UnlockContext, UnwrappedKey,
-    WrappedKey,
+    InPageCustodian, RemoteCustodian, RemoteSignRequest, RemoteSignerTransport, UnlockContext,
+    UnwrappedKey, WrappedKey,
 };

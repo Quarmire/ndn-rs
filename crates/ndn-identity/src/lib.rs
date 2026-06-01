@@ -38,7 +38,7 @@ pub use identity::NdnIdentity;
 pub use ndn_custodian::OsKeyringCustodian;
 pub use ndn_custodian::{
     BrowserExtensionCustodian, Custodian, CustodianError, CustodianRef, CustodianRegistry,
-    FobCustodian, InPageCustodian, UnlockContext, UnwrappedKey, WrappedKey,
+    InPageCustodian, RemoteCustodian, UnlockContext, UnwrappedKey, WrappedKey,
 };
 pub use trust_context::{
     AdoptionProvenance, CapabilitySet, FaceIdRef, Fingerprint, IdentityLifetime, IdentityRef,
