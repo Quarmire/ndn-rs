@@ -20,7 +20,7 @@ pub mod in_page;
 pub mod os_keyring;
 
 pub use browser_extension::BrowserExtensionCustodian;
-pub use fob::FobCustodian;
+pub use fob::{FobCustodian, FobSignRequest, FobTransport};
 pub use in_page::InPageCustodian;
 #[cfg(not(target_arch = "wasm32"))]
 pub use os_keyring::OsKeyringCustodian;
