@@ -103,14 +103,52 @@ pub(super) fn security_identity_generate(
     }
 }
 
-pub(super) fn security_anchor_list(pib: &FilePib) -> ControlResponse {
-    let anchors = match pib.list_anchors() {
-        Ok(a) => a,
-        Err(e) => return ControlResponse::error(status::SERVER_ERROR, e.to_string()),
+/// List trust anchors across every store the forwarder trusts, tagged by
+/// `source`: the engine identity PIB (`engine`, used for Data validation),
+/// the management command validator (`mgmt`, from
+/// `[security.mgmt].trust_anchor_pib` — who may issue signed commands), and
+/// the localhop registration validator (`localhop`). Surfacing the `mgmt`
+/// set lets the dashboard show the operator anchor that authorizes its own
+/// commands, which otherwise lived only inside the command validator.
+pub(super) fn security_anchor_list(
+    pib: &FilePib,
+    config: &ndn_config::ForwarderConfig,
+) -> ControlResponse {
+    // (name, source); first source wins on duplicate names.
+    let mut entries: Vec<(String, &'static str)> = Vec::new();
+    let mut push = |names: Vec<ndn_packet::Name>, source: &'static str| {
+        for n in names {
+            let s = n.to_string();
+            if !entries.iter().any(|(name, _)| name == &s) {
+                entries.push((s, source));
+            }
+        }
     };
-    let mut text = format!("{} anchors\n", anchors.len());
-    for anchor_name in &anchors {
-        text.push_str(&format!("  name={}\n", anchor_name));
+
+    match pib.list_anchors() {
+        Ok(a) => push(a, "engine"),
+        Err(e) => return ControlResponse::error(status::SERVER_ERROR, e.to_string()),
+    }
+    // Management + localhop anchors live in separate PIBs the validators were
+    // built from; read them so the dashboard sees the full trust posture.
+    for (path, source) in [
+        (config.security.mgmt.trust_anchor_pib.as_deref(), "mgmt"),
+        (
+            config.security.mgmt.localhop_trust_anchor_pib.as_deref(),
+            "localhop",
+        ),
+    ] {
+        if let Some(p) = path
+            && let Ok(other) = FilePib::open(p)
+            && let Ok(names) = other.list_anchors()
+        {
+            push(names, source);
+        }
+    }
+
+    let mut text = format!("{} anchors\n", entries.len());
+    for (name, source) in &entries {
+        text.push_str(&format!("  name={name} source={source}\n"));
     }
     ControlResponse::ok_empty(text)
 }

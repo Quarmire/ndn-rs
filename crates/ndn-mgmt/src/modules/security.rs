@@ -82,7 +82,7 @@ async fn handle_security(
         v if v == verb::IDENTITY_LIST => security_identity_list(pib),
         v if v == verb::IDENTITY_GENERATE => security_identity_generate(params, pib),
         v if v == verb::IDENTITY_DID => security_identity_did(params, pib),
-        v if v == verb::ANCHOR_LIST => security_anchor_list(pib),
+        v if v == verb::ANCHOR_LIST => security_anchor_list(pib, config),
         v if v == verb::ANCHOR_ADD => security_anchor_add(params, engine, pib),
         v if v == verb::ANCHOR_REMOVE => security_anchor_remove(params, engine),
         v if v == verb::SAFEBAG_IMPORT => security_safebag_import(params, pib),
@@ -491,6 +491,56 @@ mod safebag_import_tests {
 
     fn key_name(s: &str) -> Name {
         Name::from_components([NameComponent::generic(Bytes::copy_from_slice(s.as_bytes()))])
+    }
+
+    #[test]
+    fn anchor_list_merges_engine_and_mgmt_sources() {
+        use ndn_security::Certificate;
+        use std::sync::Arc;
+
+        let mk = |n: &str| {
+            let name: Name = n.parse().unwrap();
+            Certificate {
+                name: Arc::new(name),
+                public_key: Bytes::from_static(&[1u8; 32]),
+                valid_from: 0,
+                valid_until: u64::MAX,
+                issuer: None,
+                signed_region: None,
+                sig_value: None,
+                sig_type: ndn_packet::SignatureType::SignatureEd25519,
+            }
+        };
+
+        let (_engine_dir, engine_pib) = pib();
+        let en: Name = "/lab/engine/KEY/k0/self/v=0".parse().unwrap();
+        engine_pib
+            .add_trust_anchor(&en, &mk("/lab/engine/KEY/k0/self/v=0"))
+            .unwrap();
+
+        let (mgmt_dir, mgmt_pib) = pib();
+        let mn: Name = "/op/alice/KEY/k0/self/v=0".parse().unwrap();
+        mgmt_pib
+            .add_trust_anchor(&mn, &mk("/op/alice/KEY/k0/self/v=0"))
+            .unwrap();
+
+        let mut config = ndn_config::ForwarderConfig::default();
+        config.security.mgmt.trust_anchor_pib =
+            Some(mgmt_dir.path().to_str().unwrap().to_string());
+
+        let cr = security_anchor_list(&engine_pib, &config);
+        assert!(
+            cr.status_text
+                .contains("name=/lab/engine/KEY/k0/self/v=0 source=engine"),
+            "{}",
+            cr.status_text
+        );
+        assert!(
+            cr.status_text
+                .contains("name=/op/alice/KEY/k0/self/v=0 source=mgmt"),
+            "{}",
+            cr.status_text
+        );
     }
 
     #[test]
