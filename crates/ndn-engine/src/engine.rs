@@ -299,6 +299,13 @@ impl ForwarderEngine {
         self.inner.start_timestamp_ms
     }
 
+    /// The portable task runtime (Tokio on native, `wasm-bindgen-futures` on
+    /// wasm). In-engine components that spawn background tasks must use this —
+    /// raw `tokio::spawn` panics in the browser.
+    pub fn runtime(&self) -> Arc<dyn Runtime> {
+        Arc::clone(&self.inner.runtime)
+    }
+
     /// Instrument-tier surface — direct table access. Stable for in-tree
     /// consumers; hidden from default docs behind `experimental-instrument`.
     #[cfg_attr(not(feature = "experimental-instrument"), doc(hidden))]

@@ -125,17 +125,22 @@ impl<T: NotificationEvent> NotificationStream<T> {
             .fib()
             .set_nexthops(&self.prefix, vec![FibNexthop { face_id, cost: 0 }]);
 
+        // Portable spawn: `tokio::spawn` panics in the browser (no Tokio
+        // reactor). The engine runtime is Tokio on native, `spawn_local` on wasm.
+        let rt = engine.runtime();
+        let serve_rt = Arc::clone(&rt);
         let stream = self;
         let task_cancel = cancel.clone();
-        tokio::spawn(async move {
-            stream.serve(handle, task_cancel).await;
-        });
+        rt.spawn(Box::pin(async move {
+            stream.serve(handle, task_cancel, serve_rt).await;
+        }));
     }
 
     async fn serve(
         self: Arc<Self>,
         handle: ndn_face_local::InProcHandle,
         cancel: CancellationToken,
+        rt: Arc<dyn ndn_engine::Runtime>,
     ) {
         use ndn_packet::Interest;
         let handle = Arc::new(handle);
@@ -156,9 +161,9 @@ impl<T: NotificationEvent> NotificationStream<T> {
             let stream = Arc::clone(&self);
             let h = Arc::clone(&handle);
             let cancel_child = cancel.child_token();
-            tokio::spawn(async move {
+            rt.spawn(Box::pin(async move {
                 serve_one(stream, h, requested_seq, cancel_child).await;
-            });
+            }));
         }
     }
 }
