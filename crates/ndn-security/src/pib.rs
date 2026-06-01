@@ -4,7 +4,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use thiserror::Error;
 
-use ndn_packet::{Name, NameComponent};
+use ndn_packet::Name;
 
 use crate::signer::{EcdsaP256Signer, Ed25519Signer};
 use crate::{Signer, TrustError, cert_cache::Certificate};
@@ -473,57 +473,24 @@ pub fn name_to_uri(name: &Name) -> String {
     if name.components().is_empty() {
         return "/".to_string();
     }
-    name.components()
-        .iter()
-        .map(|c| {
-            let mut s = String::from("/");
-            for &b in c.value.iter() {
-                if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
-                    s.push(b as char);
-                } else {
-                    s.push_str(&format!("%{:02X}", b));
-                }
-            }
-            s
-        })
-        .collect()
+    // Use the canonical NDN URI form so *typed* components (version,
+    // timestamp, segment, …) round-trip. The previous value-only encoding
+    // dropped the component type, so an anchor whose cert name carried a
+    // typed version (`…/self/v=0`) reloaded as a *generic* component and no
+    // longer matched the on-wire KeyLocator — signed commands then failed
+    // validation with "signing certificate not yet resolved".
+    name.to_string()
 }
 
 pub fn name_from_uri(uri: &str) -> Result<Name, PibError> {
     if uri == "/" || uri.is_empty() {
         return Ok(Name::root());
     }
-    let comps: Result<Vec<NameComponent>, PibError> = uri
-        .split('/')
-        .filter(|s| !s.is_empty())
-        .map(|seg| {
-            let mut bytes: Vec<u8> = Vec::new();
-            let seg = seg.as_bytes();
-            let mut i = 0;
-            while i < seg.len() {
-                if seg[i] == b'%' && i + 2 < seg.len() {
-                    let hi = hex_digit(seg[i + 1]).ok_or(PibError::InvalidName)?;
-                    let lo = hex_digit(seg[i + 2]).ok_or(PibError::InvalidName)?;
-                    bytes.push((hi << 4) | lo);
-                    i += 3;
-                } else {
-                    bytes.push(seg[i]);
-                    i += 1;
-                }
-            }
-            Ok(NameComponent::generic(Bytes::from(bytes)))
-        })
-        .collect();
-    Ok(Name::from_components(comps?))
-}
-
-fn hex_digit(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
+    // Canonical parse — the inverse of [`name_to_uri`]. Round-trips typed
+    // components so a reloaded anchor name equals the original (and the
+    // on-wire KeyLocator). Legacy value-only `name.uri` files (all-generic
+    // names) still parse identically.
+    uri.parse::<Name>().map_err(|_| PibError::InvalidName)
 }
 
 fn list_names_in(dir: &Path) -> Result<Vec<Name>, PibError> {
