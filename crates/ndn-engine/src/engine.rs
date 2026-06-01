@@ -464,7 +464,30 @@ impl ForwarderEngine {
         persistency: FacePersistency,
     ) {
         let face_id = face.id();
-        let scope = face.scope();
+        self.inner.face_table.insert(face);
+        let erased = self
+            .inner
+            .face_table
+            .get(face_id)
+            .expect("face was just inserted");
+        self.wire_face(erased, cancel, persistency);
+    }
+
+    /// Wire an already-composed, table-resident face: register its `FaceState`
+    /// and spawn its sender + reader tasks on the engine runtime. Shared by
+    /// [`Self::add_face_with_persistency`] (after it wraps a transport into a
+    /// `Face`) and `WasmEngineBuilder`, which inserts pre-composed `Arc<Face>`s
+    /// and must wire them the same way — without this, a builder-added face
+    /// (e.g. the dioxus upstream WebTransport face) sits in the table but can
+    /// neither send nor receive.
+    pub(crate) fn wire_face(
+        &self,
+        erased: Arc<ndn_transport::Face>,
+        cancel: CancellationToken,
+        persistency: FacePersistency,
+    ) {
+        let face_id = erased.id();
+        let scope = erased.scope();
         let congestion_policy = CongestionPolicy::default_for_scope(scope);
         let (send_tx, send_rx) = mpsc::channel(DEFAULT_SEND_QUEUE_CAP);
         let state = FaceState::new(
@@ -477,12 +500,6 @@ impl ForwarderEngine {
             state.set_require_data_validation(true);
         }
         self.inner.face_states.insert(face_id, state);
-        self.inner.face_table.insert(face);
-        let erased = self
-            .inner
-            .face_table
-            .get(face_id)
-            .expect("face was just inserted");
 
         // Inject the egress queue-depth closure into the LinkService's
         // CongestionMarkingFeature (no-op for PassthroughLinkService).

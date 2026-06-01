@@ -20,7 +20,7 @@ use ndn_runtime::{Runtime, default_runtime};
 use ndn_security::Validator;
 use ndn_store::{DeadNonceList, ErasedContentStore, LruCs, ObservableCs, Pit, StrategyTable};
 use ndn_strategy::{BestRouteStrategy, MeasurementsTable, SignalsTable};
-use ndn_transport::{Face, FaceTable};
+use ndn_transport::{Face, FacePersistency, FaceTable};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -171,8 +171,12 @@ impl WasmEngineBuilder {
         let measurements = Arc::new(MeasurementsTable::new());
         let signals = Arc::new(SignalsTable::new());
 
-        for face in self.pending_faces {
-            face_table.insert_arc(face);
+        // Insert builder-added faces into the table now (so the decode stage
+        // sees them); their per-face I/O tasks are wired after the engine
+        // handle exists, below.
+        let pending_faces = self.pending_faces;
+        for face in &pending_faces {
+            face_table.insert_arc(Arc::clone(face));
         }
 
         let cancel = CancellationToken::new();
@@ -381,6 +385,13 @@ impl WasmEngineBuilder {
         }
 
         let engine = ForwarderEngine { inner };
+        // Wire each builder-added face's I/O (FaceState + sender + reader); the
+        // insert_arc above only placed them in the table. Without this, a
+        // builder-added face (e.g. the dioxus upstream WebTransport face) can
+        // neither send nor receive.
+        for face in pending_faces {
+            engine.wire_face(face, cancel.child_token(), FacePersistency::Permanent);
+        }
         let handle = ShutdownHandle {
             cancel,
             tracker: tasks,
