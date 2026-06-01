@@ -151,6 +151,11 @@ mod tlv {
     pub const REGION: u64 = 0x0646;
     pub const STATUS: u64 = 0x0648;
     pub const SIGNATURE: u64 = 0x064A;
+    // Pairing handshake (the QR the phone scans).
+    pub const PAIRING_OFFER: u64 = 0x0650;
+    pub const DASHBOARD_PUBKEY: u64 = 0x0651;
+    pub const TRANSPORT_HINT: u64 = 0x0652;
+    pub const NONCE: u64 = 0x0653;
 }
 
 const STATUS_APPROVED: u8 = 1;
@@ -277,6 +282,65 @@ impl WireSignResponse {
             STATUS_DENIED => Ok(Self::Denied { req_id }),
             other => Err(CustodianError::SignFailed(format!("bad status byte {other}"))),
         }
+    }
+}
+
+/// The pairing offer the dashboard renders as a QR/NFC payload; the signer app
+/// scans it to learn where and how to connect back. TOFU — the operator
+/// compares the `dashboard_pubkey` fingerprint out-of-band once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairingOffer {
+    /// The dashboard's public key, so the signer can bind its reply to this
+    /// dashboard (and the operator can verify the fingerprint out-of-band).
+    pub dashboard_pubkey: Bytes,
+    /// How to reach the dashboard to pair — opaque to this crate; the WebRTC
+    /// transport fills it with the relay URL + rendezvous session id.
+    pub transport_hint: String,
+    /// Single-use random nonce binding this pairing session.
+    pub nonce: Bytes,
+}
+
+impl PairingOffer {
+    /// Encode for a QR / NFC payload.
+    pub fn encode(&self) -> Bytes {
+        let mut w = TlvWriter::new();
+        w.write_nested(tlv::PAIRING_OFFER, |w| {
+            w.write_tlv(tlv::DASHBOARD_PUBKEY, &self.dashboard_pubkey);
+            w.write_tlv(tlv::TRANSPORT_HINT, self.transport_hint.as_bytes());
+            w.write_tlv(tlv::NONCE, &self.nonce);
+        });
+        w.finish()
+    }
+
+    /// Decode a scanned QR / NFC payload.
+    pub fn decode(wire: &[u8]) -> Result<Self, CustodianError> {
+        let mut r = TlvReader::new(Bytes::copy_from_slice(wire));
+        let (typ, body) = r.read_tlv().map_err(wire_err)?;
+        if typ != tlv::PAIRING_OFFER {
+            return Err(CustodianError::SignFailed(format!(
+                "unexpected message type {typ:#x}, want PairingOffer"
+            )));
+        }
+        let (mut pubkey, mut hint, mut nonce) = (None, None, None);
+        let mut br = TlvReader::new(body);
+        while !br.is_empty() {
+            let (t, v) = br.read_tlv().map_err(wire_err)?;
+            match t {
+                tlv::DASHBOARD_PUBKEY => pubkey = Some(v),
+                tlv::TRANSPORT_HINT => {
+                    hint = Some(String::from_utf8(v.to_vec()).map_err(|_| {
+                        CustodianError::SignFailed("TransportHint is not UTF-8".into())
+                    })?)
+                }
+                tlv::NONCE => nonce = Some(v),
+                _ => {}
+            }
+        }
+        Ok(Self {
+            dashboard_pubkey: pubkey.ok_or_else(|| missing("DashboardPubKey"))?,
+            transport_hint: hint.ok_or_else(|| missing("TransportHint"))?,
+            nonce: nonce.ok_or_else(|| missing("Nonce"))?,
+        })
     }
 }
 
@@ -459,6 +523,17 @@ mod tests {
         // mis-parsed.
         let resp = WireSignResponse::Denied { req_id: 1 }.encode();
         assert!(WireSignRequest::decode(&resp).is_err());
+    }
+
+    #[test]
+    fn pairing_offer_round_trips() {
+        let offer = PairingOffer {
+            dashboard_pubkey: Bytes::from_static(b"dashboard-spki-der"),
+            transport_hint: "https://relay.example/ndn-fob#sess-42".into(),
+            nonce: Bytes::from_static(b"\x01\x02\x03\x04\x05\x06\x07\x08"),
+        };
+        let decoded = PairingOffer::decode(&offer.encode()).expect("decode offer");
+        assert_eq!(decoded, offer);
     }
 
     /// An in-memory [`SignerChannel`] pair, standing in for the two ends of a
