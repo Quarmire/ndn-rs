@@ -66,6 +66,9 @@ async fn handle_security(
         }
         v if v == verb::VALIDATION_STATS => return security_validation_stats(engine),
         v if v == verb::VALIDATE => return security_validate(params, engine).await,
+        // Anchor listing draws from the mgmt/localhop trust PIBs (config), so
+        // it works even when the forwarder has no [security] identity PIB.
+        v if v == verb::ANCHOR_LIST => return security_anchor_list(pib, config),
         _ => {}
     }
 
@@ -82,7 +85,6 @@ async fn handle_security(
         v if v == verb::IDENTITY_LIST => security_identity_list(pib),
         v if v == verb::IDENTITY_GENERATE => security_identity_generate(params, pib),
         v if v == verb::IDENTITY_DID => security_identity_did(params, pib),
-        v if v == verb::ANCHOR_LIST => security_anchor_list(pib, config),
         v if v == verb::ANCHOR_ADD => security_anchor_add(params, engine, pib),
         v if v == verb::ANCHOR_REMOVE => security_anchor_remove(params, engine),
         v if v == verb::SAFEBAG_IMPORT => security_safebag_import(params, pib),
@@ -528,7 +530,7 @@ mod safebag_import_tests {
         config.security.mgmt.trust_anchor_pib =
             Some(mgmt_dir.path().to_str().unwrap().to_string());
 
-        let cr = security_anchor_list(&engine_pib, &config);
+        let cr = security_anchor_list(Some(&engine_pib), &config);
         assert!(
             cr.status_text
                 .contains("name=/lab/engine/KEY/k0/self/v=0 source=engine"),
@@ -540,6 +542,17 @@ mod safebag_import_tests {
                 .contains("name=/op/alice/KEY/k0/self/v=0 source=mgmt"),
             "{}",
             cr.status_text
+        );
+
+        // Works with no engine identity PIB (forwarder with only
+        // [security.mgmt]) — the mgmt anchor still surfaces.
+        let cr_no_pib = security_anchor_list(None, &config);
+        assert!(
+            cr_no_pib
+                .status_text
+                .contains("name=/op/alice/KEY/k0/self/v=0 source=mgmt"),
+            "{}",
+            cr_no_pib.status_text
         );
     }
 

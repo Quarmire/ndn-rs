@@ -111,7 +111,7 @@ pub(super) fn security_identity_generate(
 /// set lets the dashboard show the operator anchor that authorizes its own
 /// commands, which otherwise lived only inside the command validator.
 pub(super) fn security_anchor_list(
-    pib: &FilePib,
+    pib: Option<&FilePib>,
     config: &ndn_config::ForwarderConfig,
 ) -> ControlResponse {
     // (name, source); first source wins on duplicate names.
@@ -125,9 +125,14 @@ pub(super) fn security_anchor_list(
         }
     };
 
-    match pib.list_anchors() {
-        Ok(a) => push(a, "engine"),
-        Err(e) => return ControlResponse::error(status::SERVER_ERROR, e.to_string()),
+    // The engine identity PIB is optional — a forwarder may run with only
+    // [security.mgmt] (no [security] identity), yet still trust an operator
+    // anchor for commands.
+    if let Some(pib) = pib {
+        match pib.list_anchors() {
+            Ok(a) => push(a, "engine"),
+            Err(e) => return ControlResponse::error(status::SERVER_ERROR, e.to_string()),
+        }
     }
     // Management + localhop anchors live in separate PIBs the validators were
     // built from; read them so the dashboard sees the full trust posture.

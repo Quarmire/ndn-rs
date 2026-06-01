@@ -110,8 +110,20 @@ pub(crate) fn is_public_dataset_verb(module: &[u8], verb: &[u8]) -> bool {
     if module == m::FACES && verb == v::LINK_QUALITY {
         return true;
     }
+    // Read-only security *inspection* datasets — trust posture an operator
+    // (or the dashboard) must see *before* a signing identity is configured,
+    // so they're served unsigned like the canonical `*/list` datasets. These
+    // expose only public material: anchor/cert/identity *names*, schema
+    // rules, validation counters, trust-path traces — never private keys or
+    // secrets. Mutations (`anchor-add`, `identity-generate`, `schema-set`,
+    // `policy-set`, …) stay signed.
     if module == m::SECURITY
-        && (verb == v::POLICY_GET || verb == v::VALIDATION_STATS || verb == v::VALIDATE)
+        && (verb == v::POLICY_GET
+            || verb == v::VALIDATION_STATS
+            || verb == v::VALIDATE
+            || verb == v::ANCHOR_LIST
+            || verb == v::IDENTITY_LIST
+            || verb == v::SCHEMA_LIST)
     {
         return true;
     }
