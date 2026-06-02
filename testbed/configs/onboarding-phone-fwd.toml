@@ -33,11 +33,14 @@ require_signed_commands = false
 
 # ── Embedded NDNCERT CA, token-gated ─────────────────────────────────────────
 # A non-empty `tokens` list selects the TokenChallenge (a single-use invite).
-# Replace the value below before exposing this anywhere real.
+# `prefix`/`identity` are the CA *identity* (`/demo`); NdncertCa appends `/CA`
+# itself and serves `/demo/CA/{INFO,NEW,CHALLENGE}` (the client appends `/CA/NEW`
+# too). Configuring `/demo/CA` here would make it serve `/demo/CA/CA/NEW` and
+# reject the client's `/demo/CA/NEW`. Replace the token before exposing this.
 [demo_ca]
 enabled  = true
-prefix   = "/demo/CA"
-identity = "/demo/CA"
+prefix   = "/demo"
+identity = "/demo"
 tokens   = ["change-me-one-time-invite"]
 
 # ── WebTransport listener the phone dials ────────────────────────────────────
