@@ -10,7 +10,8 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use ndn_packet::{Data, Name};
-use ndn_security::{Certificate, NamePattern, TrustSchema};
+use ndn_security::safe_data::TrustPath;
+use ndn_security::{Certificate, NamePattern, TrustSchema, ValidationResult, Validator};
 
 use ndn_custodian::CustodianRef;
 
@@ -136,12 +137,39 @@ impl TrustContext {
             .map_err(|e| TrustContextError::Custodian(e.to_string()))
     }
 
-    /// Verify `data` against this context's anchors + schema. Read-only;
-    /// does not touch the network. (Full chain-walk wiring lands when the
-    /// engine validator is rewired in Phase 2/3 — until then, this returns
-    /// `Rejected("verifier not yet bound")` so callers fail closed.)
-    pub fn verify(&self, _data: &Data) -> VerificationOutcome {
-        VerificationOutcome::Rejected("verifier not yet bound".into())
+    /// Verify `data` against this context's anchors + schema, returning the
+    /// anchor it chained to or a rejection reason. Read-only; does not touch the
+    /// network (resolution operates over the locally-known anchors).
+    ///
+    /// An adopted-only context (no anchors) rejects everything — there is
+    /// nothing to chain to, so it fails closed. A `DigestSha256`-only packet is
+    /// rejected as unauthenticated (integrity, not identity), consistent with
+    /// the consumer policy ([`Unverified::verify`](ndn_security::Unverified)).
+    pub async fn verify(&self, data: &Data) -> VerificationOutcome {
+        let validator = Validator::new(self.schema.clone());
+        for anchor in &self.anchors {
+            validator.add_trust_anchor(anchor.clone());
+        }
+        match validator.validate(data).await {
+            ValidationResult::Valid(safe) => match safe.trust_path() {
+                TrustPath::DigestSha256 => {
+                    VerificationOutcome::Rejected("DigestSha256: integrity, not identity".into())
+                }
+                TrustPath::CertChain(chain) => VerificationOutcome::Verified {
+                    anchor: chain
+                        .last()
+                        .cloned()
+                        .unwrap_or_else(|| data.name.as_ref().clone()),
+                },
+                TrustPath::LocalFace { .. } => VerificationOutcome::Verified {
+                    anchor: data.name.as_ref().clone(),
+                },
+            },
+            ValidationResult::Invalid(e) => VerificationOutcome::Rejected(e.to_string()),
+            ValidationResult::Pending => {
+                VerificationOutcome::Rejected("certificate chain not resolved".into())
+            }
+        }
     }
 
     /// Derive a sub-identity authorized for `scope`, with `lifetime`. The
@@ -293,6 +321,68 @@ mod tests {
         tc.identities.push(id);
         assert!(tc.can_sign(&n("/home/bob/alice/doc")).is_some());
         assert!(tc.can_sign(&n("/home/bob/charlie/doc")).is_none());
+    }
+
+    #[tokio::test]
+    async fn verify_accepts_authenticated_rejects_others() {
+        use ndn_packet::encode::DataBuilder;
+        use ndn_packet::{Data, SignatureType};
+        use ndn_security::{Ed25519Signer, SignWith};
+        use std::sync::Arc;
+
+        // A signing identity whose self-cert is this context's anchor.
+        let key = n("/ctx/dev/KEY/k1");
+        let signer = Ed25519Signer::from_seed(&[3u8; 32], key.clone());
+        let cert = Certificate {
+            name: Arc::new(key),
+            public_key: bytes::Bytes::copy_from_slice(&signer.public_key_bytes()),
+            valid_from: 0,
+            valid_until: u64::MAX,
+            issuer: None,
+            signed_region: None,
+            sig_value: None,
+            sig_type: SignatureType::SignatureEd25519,
+        };
+        let ctx = TrustContext::legacy_root(vec![cert]);
+
+        let signed = |s: &Ed25519Signer| {
+            Data::decode(
+                DataBuilder::new("/ctx/dev/thing", b"hi")
+                    .sign_with_sync(s)
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+
+        // Authenticated by the anchor key → Verified.
+        assert!(matches!(
+            ctx.verify(&signed(&signer)).await,
+            VerificationOutcome::Verified { .. }
+        ));
+
+        // DigestSha256 (integrity, not identity) → Rejected.
+        let digest = Data::decode(
+            DataBuilder::new("/ctx/dev/thing", b"hi").sign_digest_sha256(),
+        )
+        .unwrap();
+        assert!(matches!(
+            ctx.verify(&digest).await,
+            VerificationOutcome::Rejected(_)
+        ));
+
+        // A different (unknown) signer → Rejected.
+        let other = Ed25519Signer::from_seed(&[9u8; 32], n("/evil/KEY/k1"));
+        assert!(matches!(
+            ctx.verify(&signed(&other)).await,
+            VerificationOutcome::Rejected(_)
+        ));
+
+        // Adopted-only context (no anchors) fails closed.
+        let adopted = TrustContext::adopted(n("/home/bob"), SystemTime::now(), "t");
+        assert!(matches!(
+            adopted.verify(&signed(&signer)).await,
+            VerificationOutcome::Rejected(_)
+        ));
     }
 
     #[test]
