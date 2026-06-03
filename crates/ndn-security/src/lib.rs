@@ -37,6 +37,7 @@ pub mod sqlite_pib;
 pub mod trust;
 pub mod trust_context;
 pub mod trust_schema;
+pub mod unverified;
 pub mod validation_policy;
 pub mod validator;
 pub mod verifier;
@@ -56,6 +57,7 @@ pub use profile::SecurityProfile;
 pub use replay_guard::{KeyFingerprint, ReplayCheck, ReplayGuard};
 pub use safe_data::SafeData;
 pub use sign_ext::SignWith;
+pub use unverified::{Unverified, VerifyError};
 pub use signer::{
     Blake3KeyedSigner, Blake3Signer, EcdsaP256Signer, Ed25519Signer, HmacSha256Signer,
     SIGNATURE_TYPE_DIGEST_BLAKE3_KEYED, SIGNATURE_TYPE_DIGEST_BLAKE3_PLAIN, Signer,
