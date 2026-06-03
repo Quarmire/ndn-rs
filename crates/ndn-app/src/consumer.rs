@@ -14,7 +14,7 @@ use ndn_ipc::ForwarderClient;
 use ndn_packet::encode::InterestBuilder;
 use ndn_packet::lp::{LpPacket, is_lp_packet};
 use ndn_packet::{Data, MAX_PERSISTENT_LIFETIME_SECS, Name, SubscriptionRequest};
-use ndn_security::{SafeData, ValidationResult, Validator};
+use ndn_security::{SafeData, Unverified, ValidationResult, Validator};
 
 use crate::AppError;
 #[cfg(not(target_arch = "wasm32"))]
@@ -55,8 +55,12 @@ impl Consumer {
         }
     }
 
-    /// For hop limit, app parameters, or forwarding hints use
-    /// [`Self::fetch_with`].
+    /// Fetch a Data **without verifying it** — returns raw, unauthenticated
+    /// `Data`. Prefer [`fetch_verified`](Self::fetch_verified) (the safe path)
+    /// when you have a `Validator`, or [`fetch_unverified`](Self::fetch_unverified)
+    /// to make the lack of verification explicit. A raw `fetch` will be
+    /// deprecated once callers have migrated. For hop limit, app parameters, or
+    /// forwarding hints use [`Self::fetch_with`].
     pub async fn fetch(&mut self, name: impl Into<Name>) -> Result<Data, AppError> {
         let wire = InterestBuilder::new(name)
             .lifetime(DEFAULT_INTEREST_LIFETIME)
@@ -190,7 +194,9 @@ impl Consumer {
         Ok(sub)
     }
 
-    /// Returns `SafeData` on a passing `Validator`.
+    /// **The safe fetch.** Fetches and validates against `validator`, returning
+    /// [`SafeData`] only if the signature verifies and the trust schema accepts
+    /// it. This is the recommended default whenever a trust schema applies.
     pub async fn fetch_verified(
         &mut self,
         name: impl Into<Name>,
@@ -204,6 +210,18 @@ impl Consumer {
                 Err(AppError::Protocol("certificate chain not resolved".into()))
             }
         }
+    }
+
+    /// Fetch a Data wrapped in [`Unverified<Data>`], forcing the caller to
+    /// explicitly resolve it — `.verify(&validator)` for [`SafeData`] (the safe
+    /// path), or `.trust_unchecked()` to accept it without verification on
+    /// purpose (loud and greppable). The honest form of a raw [`fetch`](Self::fetch):
+    /// you can't accidentally use unauthenticated data.
+    pub async fn fetch_unverified(
+        &mut self,
+        name: impl Into<Name>,
+    ) -> Result<Unverified<Data>, AppError> {
+        Ok(Unverified::new(self.fetch(name).await?))
     }
 
     pub async fn get(&mut self, name: impl Into<Name>) -> Result<Bytes, AppError> {
