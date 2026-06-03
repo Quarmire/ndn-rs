@@ -82,3 +82,5 @@ libc             = { workspace = true }
 [dev-dependencies]
 tempfile         = "3"
 ndn-store        = { workspace = true }
+# IPC-seam witness (tests/ipc_seam.rs): a client rides a socketpair fd.
+ndn-ipc          = { workspace = true }

@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use ndn_engine::ForwarderEngine;
-use ndn_transport::FaceId;
+use ndn_transport::{FaceId, FaceKind};
 use tokio_util::sync::CancellationToken;
 
 /// Best-effort `SO_RCVBUF` bump (Unix). Failure is logged but non-fatal.
@@ -38,11 +38,28 @@ fn set_recv_buf_size(socket: &tokio::net::UdpSocket, size: usize) {
 #[cfg(not(unix))]
 fn set_recv_buf_size(_socket: &tokio::net::UdpSocket, _size: usize) {}
 
-/// Accept NDN face connections on `path` and register each as a dynamic face.
+/// Accept NDN face connections on `path` and register each as an
+/// operator-trusted `FaceKind::Management` face (the NFD management socket;
+/// trust is gated by `0600`/`0666` filesystem perms + signed-command auth).
 ///
 /// `path` is a Unix domain socket path on Unix (e.g. `/run/nfd/nfd.sock`)
 /// or a Named Pipe path on Windows (e.g. `\\.\pipe\ndn`).
 pub async fn run_face_listener(path: &str, engine: ForwarderEngine, cancel: CancellationToken) {
+    run_face_listener_as(path, FaceKind::Management, engine, cancel).await
+}
+
+/// Like [`run_face_listener`] but accepts each connection with an explicit
+/// [`FaceKind`]. A mobile UI/app listener (iOS App-Group UDS) should pass
+/// `FaceKind::App` so connecting clients do **not** inherit operator-level
+/// management trust — privileged verbs then go through signed-command auth, not
+/// face-kind. (`FaceKind::App` is `FaceScope::Local`, so `/localhost` prefixes
+/// stay reachable and congestion uses the app-face backpressure policy.)
+pub async fn run_face_listener_as(
+    path: &str,
+    kind: FaceKind,
+    engine: ForwarderEngine,
+    cancel: CancellationToken,
+) {
     let listener = match ndn_face_native::local::IpcListener::bind(path) {
         Ok(l) => l,
         Err(e) => {
@@ -51,13 +68,13 @@ pub async fn run_face_listener(path: &str, engine: ForwarderEngine, cancel: Canc
         }
     };
 
-    tracing::info!(target: "face.system", path = %listener.uri(), "NDN face listener ready");
+    tracing::info!(target: "face.system", path = %listener.uri(), ?kind, "NDN face listener ready");
 
     loop {
         let face_id = engine.faces().alloc_id();
         let face = tokio::select! {
             _ = cancel.cancelled() => break,
-            r = listener.accept(face_id) => match r {
+            r = listener.accept_as(face_id, kind) => match r {
                 Ok(f)  => f,
                 Err(e) => {
                     tracing::warn!(target: "face.system", error = %e, "face-listener: accept error");
@@ -66,7 +83,7 @@ pub async fn run_face_listener(path: &str, engine: ForwarderEngine, cancel: Canc
             },
         };
 
-        tracing::debug!(target: "face.system", face = %face_id, "face-listener: accepted management connection");
+        tracing::debug!(target: "face.system", face = %face_id, ?kind, "face-listener: accepted connection");
         // Per-connection child token isolates teardown to one peer.
         let conn_cancel = cancel.child_token();
         engine.add_face(face, conn_cancel);
@@ -74,6 +91,27 @@ pub async fn run_face_listener(path: &str, engine: ForwarderEngine, cancel: Canc
 
     listener.cleanup();
     tracing::info!(target: "face.system", "NDN face listener stopped");
+}
+
+/// Mount a single already-connected fd as a `FaceKind::App` face on `engine`,
+/// returning the allocated [`FaceId`].
+///
+/// Android has no `listen()` rendezvous for the UI↔tunnel seam — the foreground
+/// `VpnService` creates a `socketpair()` and hands one end to the UI Activity
+/// across Binder as a `ParcelFileDescriptor`. This is the fd analogue of
+/// [`run_face_listener_as`]'s accept loop: one pre-handed fd per bound client,
+/// mounted as a local app face (no operator trust). Unix only.
+#[cfg(unix)]
+pub fn mount_app_face_from_fd(
+    fd: std::os::fd::RawFd,
+    engine: &ForwarderEngine,
+    cancel: CancellationToken,
+) -> std::io::Result<FaceId> {
+    let face_id = engine.faces().alloc_id();
+    let face = ndn_face_native::local::ipc_face_from_raw_fd(face_id, FaceKind::App, fd)?;
+    engine.add_face(face, cancel);
+    tracing::debug!(target: "face.system", face = %face_id, "mounted app face from fd");
+    Ok(face_id)
 }
 
 /// Listen for incoming UDP datagrams on `bind_addr` and auto-create a

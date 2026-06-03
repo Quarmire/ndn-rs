@@ -142,6 +142,30 @@ impl ForwarderClient {
         })
     }
 
+    /// Build a client over an already-connected `SOCK_STREAM` fd instead of
+    /// dialing a socket path — the mobile counterpart to [`Self::connect`].
+    /// Android hands the UI one half of a `socketpair()` across Binder; the UI
+    /// adopts it here. Unix-only, and Unix data plane only (no SHM negotiation
+    /// over a handed fd — SHM is excluded on the mobile targets anyway).
+    #[cfg(unix)]
+    pub fn from_raw_fd(fd: std::os::fd::RawFd) -> Result<Self, ForwarderError> {
+        let control = Arc::new(ndn_face_native::local::ipc_face_from_raw_fd(
+            FaceId(0),
+            ndn_transport::FaceKind::Unix,
+            fd,
+        )?);
+        let mgmt = crate::mgmt_client::MgmtClient::from_face(Arc::clone(&control));
+        Ok(Self {
+            control,
+            mgmt,
+            recv_lock: Mutex::new(()),
+            transport: DataTransport::Unix,
+            cancel: CancellationToken::new(),
+            dead: Arc::new(AtomicBool::new(false)),
+            monitor_started: AtomicU8::new(0),
+        })
+    }
+
     #[cfg(all(
         unix,
         not(any(target_os = "android", target_os = "ios")),
