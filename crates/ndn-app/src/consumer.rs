@@ -55,12 +55,13 @@ impl Consumer {
         }
     }
 
-    /// Fetch a Data **without verifying it** — returns raw, unauthenticated
-    /// `Data`. Prefer [`fetch_verified`](Self::fetch_verified) (the safe path)
-    /// when you have a `Validator`, or [`fetch_unverified`](Self::fetch_unverified)
-    /// to make the lack of verification explicit. A raw `fetch` will be
-    /// deprecated once callers have migrated. For hop limit, app parameters, or
-    /// forwarding hints use [`Self::fetch_with`].
+    /// The low-level fetch: returns raw, **unverified** `Data`. It is the
+    /// primitive the verified surfaces and segment reassembly build on — in
+    /// application code reach for those instead:
+    /// [`fetch_verified`](Self::fetch_verified) (validates → `SafeData`) when you
+    /// have a `Validator`, or [`fetch_unverified`](Self::fetch_unverified) to make
+    /// the lack of verification explicit and force a choice. For hop limit, app
+    /// parameters, or forwarding hints use [`Self::fetch_with`].
     pub async fn fetch(&mut self, name: impl Into<Name>) -> Result<Data, AppError> {
         let wire = InterestBuilder::new(name)
             .lifetime(DEFAULT_INTEREST_LIFETIME)

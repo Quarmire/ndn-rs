@@ -52,8 +52,15 @@ async fn embedded_consumer_producer() {
             .await
     });
 
-    // 6. Consumer fetches data.
-    let data = consumer.fetch(prefix.clone()).await.expect("fetch");
+    // 6. Consumer fetches data. This is a forwarding test, not a trust test
+    //    (the producer's Data is unsigned), so the lack of verification is made
+    //    explicit via `trust_unchecked` rather than relying on the bare `fetch`.
+    //    A real app would use `fetch_verified` — see `secure_fetch.rs`.
+    let data = consumer
+        .fetch_unverified(prefix.clone())
+        .await
+        .expect("fetch")
+        .trust_unchecked();
     assert_eq!(*data.name, prefix);
     assert_eq!(
         data.content().map(|c| c.to_vec()),
@@ -107,7 +114,12 @@ async fn embedded_multiple_fetches() {
     // Fetch 5 times.
     for i in 0u32..5 {
         let name: Name = format!("/counter/{i}").parse().unwrap();
-        let data = consumer.fetch(name).await.expect("fetch");
+        // Unsigned producer (forwarding test): unverified-by-design, made explicit.
+        let data = consumer
+            .fetch_unverified(name)
+            .await
+            .expect("fetch")
+            .trust_unchecked();
         let content = data.content().unwrap();
         let val = u32::from_be_bytes(content[..4].try_into().unwrap());
         assert_eq!(val, i);
