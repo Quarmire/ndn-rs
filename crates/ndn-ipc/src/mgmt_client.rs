@@ -792,6 +792,40 @@ impl MgmtClient {
         self.send_interest(name).await
     }
 
+    /// Generic management exchange — the transport-agnostic seam a UI/engine
+    /// drives. Sends one `/localhost/nfd/<module>/<verb>` Interest and returns
+    /// the reply's `(status_code, status_text, raw_content)`.
+    ///
+    /// With `params` it's a **signed command** (ControlParameters in the name,
+    /// per the NFD signed-command convention the typed mutators use); without,
+    /// an **unsigned dataset** read. The control-vs-dataset distinction is
+    /// inferred from `params` because every dashboard mutation carries
+    /// parameters and every read does not. Status is read from a `ControlResponse`
+    /// when the content decodes as one, else synthesised as `200 OK` (datasets
+    /// whose content is concatenated TLV entries).
+    pub async fn send_cmd_raw(
+        &self,
+        module: &str,
+        verb: &str,
+        params: Option<&ControlParameters>,
+    ) -> Result<(u64, String, Bytes), ForwarderError> {
+        let interest_wire = match params {
+            Some(cp) => {
+                let name = command_name(module.as_bytes(), verb.as_bytes(), cp);
+                build_signed_interest_with_policy(&self.signing, name).await?
+            }
+            None => {
+                let name = dataset_name(module.as_bytes(), verb.as_bytes());
+                build_dataset_interest(name)
+            }
+        };
+        let content = self.send_content_bytes(interest_wire).await?;
+        match ControlResponse::decode(content.clone()) {
+            Ok(cr) => Ok((cr.status_code, cr.status_text, content)),
+            Err(_) => Ok((200, "OK".to_string(), content)),
+        }
+    }
+
     /// Send a command Interest with ControlParameters and decode the response.
     async fn command(
         &self,
