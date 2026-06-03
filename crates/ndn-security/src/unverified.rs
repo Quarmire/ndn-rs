@@ -19,6 +19,7 @@
 
 use ndn_packet::Data;
 
+use crate::safe_data::TrustPath;
 use crate::{SafeData, TrustError, ValidationResult, Validator};
 
 /// A value whose signature has **not** been verified. See the module docs for
@@ -41,6 +42,12 @@ pub enum VerifyError {
     /// The signing certificate chain is not yet resolved (async fetch pending).
     #[error("certificate chain not resolved")]
     Pending,
+    /// The packet verified only as `DigestSha256` — integrity, not identity. It
+    /// carries no authenticated signer, so [`verify`](Unverified::verify) rejects
+    /// it by default; use [`verify_allowing_digest`](Unverified::verify_allowing_digest)
+    /// to accept integrity-only data on purpose.
+    #[error("unauthenticated: DigestSha256 proves integrity, not identity")]
+    UnauthenticatedDigest,
 }
 
 impl<T> Unverified<T> {
@@ -65,11 +72,43 @@ impl<T> Unverified<T> {
 }
 
 impl Unverified<Data> {
-    /// Validate against `validator`, yielding [`SafeData`] on success. The safe
-    /// path out of `Unverified<Data>`.
+    /// Validate against `validator`, yielding [`SafeData`] for an
+    /// **authenticated** packet. The safe path out of `Unverified<Data>`.
+    ///
+    /// A packet that verifies only as `DigestSha256` (integrity, no identity) is
+    /// **rejected** with [`VerifyError::UnauthenticatedDigest`] — a valid digest
+    /// is not authentication. Use [`verify_allowing_digest`](Self::verify_allowing_digest)
+    /// to accept integrity-only data deliberately.
     pub async fn verify(self, validator: &Validator) -> Result<SafeData, VerifyError> {
+        self.verify_inner(validator, false).await
+    }
+
+    /// Like [`verify`](Self::verify) but also accepts a `DigestSha256`-only
+    /// packet (integrity without identity). Use only in local / integrity-only
+    /// contexts where an unauthenticated-but-intact packet is acceptable — never
+    /// for data crossing a trust boundary.
+    pub async fn verify_allowing_digest(
+        self,
+        validator: &Validator,
+    ) -> Result<SafeData, VerifyError> {
+        self.verify_inner(validator, true).await
+    }
+
+    async fn verify_inner(
+        self,
+        validator: &Validator,
+        allow_digest: bool,
+    ) -> Result<SafeData, VerifyError> {
         match validator.validate(&self.inner).await {
-            ValidationResult::Valid(safe) => Ok(*safe),
+            ValidationResult::Valid(safe) => {
+                // `validate` honestly labels the trust path; the *consumer*
+                // policy is that digest-only (integrity, not identity) is not
+                // "verified" by default.
+                if !allow_digest && matches!(safe.trust_path(), TrustPath::DigestSha256) {
+                    return Err(VerifyError::UnauthenticatedDigest);
+                }
+                Ok(*safe)
+            }
             ValidationResult::Invalid(e) => Err(VerifyError::Invalid(e)),
             ValidationResult::Pending => Err(VerifyError::Pending),
         }
@@ -104,23 +143,32 @@ mod tests {
         assert_eq!(d.name.to_string(), "/demo/thing");
     }
 
-    /// The safe path out: `verify` yields `SafeData` (the only non-bypass way to
-    /// a usable value). We use a DigestSha256 packet — which validates on
-    /// self-contained integrity — to avoid a cert+schema fixture here.
-    ///
-    /// FINDING for the safe-by-default foundation work: an *empty* `TrustSchema`
-    /// with no anchors accepts a DigestSha256 packet as `Valid`. DigestSha256
-    /// proves integrity, not identity, so an empty/permissive schema treating it
-    /// as verified is itself an authenticity footgun — track separately; it is a
-    /// `Validator` policy question, not this primitive's.
+    /// `verify` rejects a `DigestSha256`-only packet by default: a valid digest
+    /// is integrity, not authentication. (The `Validator` honestly reports the
+    /// `DigestSha256` trust path even against an empty schema; the *consumer*
+    /// policy here refuses to treat that as "verified".)
     #[tokio::test]
-    async fn verify_yields_safedata_on_the_safe_path() {
+    async fn verify_rejects_digest_only_by_default() {
+        let validator = Validator::new(TrustSchema::new());
+        let u = Unverified::new(sample_data()); // DigestSha256-signed
+        assert!(
+            matches!(
+                u.verify(&validator).await,
+                Err(VerifyError::UnauthenticatedDigest)
+            ),
+            "digest-only must not pass as authenticated by default"
+        );
+    }
+
+    /// The deliberate opt-out accepts integrity-only data and yields `SafeData`.
+    #[tokio::test]
+    async fn verify_allowing_digest_accepts_integrity_only() {
         let validator = Validator::new(TrustSchema::new());
         let u = Unverified::new(sample_data());
         let safe = u
-            .verify(&validator)
+            .verify_allowing_digest(&validator)
             .await
-            .expect("the safe path yields SafeData");
+            .expect("opt-in accepts integrity-only data");
         assert_eq!(safe.data().name.to_string(), "/demo/thing");
     }
 }

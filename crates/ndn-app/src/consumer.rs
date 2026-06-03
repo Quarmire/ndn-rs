@@ -14,7 +14,7 @@ use ndn_ipc::ForwarderClient;
 use ndn_packet::encode::InterestBuilder;
 use ndn_packet::lp::{LpPacket, is_lp_packet};
 use ndn_packet::{Data, MAX_PERSISTENT_LIFETIME_SECS, Name, SubscriptionRequest};
-use ndn_security::{SafeData, Unverified, ValidationResult, Validator};
+use ndn_security::{SafeData, Unverified, Validator};
 
 use crate::AppError;
 #[cfg(not(target_arch = "wasm32"))]
@@ -195,21 +195,22 @@ impl Consumer {
     }
 
     /// **The safe fetch.** Fetches and validates against `validator`, returning
-    /// [`SafeData`] only if the signature verifies and the trust schema accepts
-    /// it. This is the recommended default whenever a trust schema applies.
+    /// [`SafeData`] only for an *authenticated* packet. The recommended default
+    /// whenever a trust schema applies.
+    ///
+    /// A `DigestSha256`-only packet (integrity, not identity) is rejected — a
+    /// valid digest is not authentication. To accept integrity-only data on
+    /// purpose, use `fetch_unverified(name).await?.verify_allowing_digest(...)`.
     pub async fn fetch_verified(
         &mut self,
         name: impl Into<Name>,
         validator: &Validator,
     ) -> Result<SafeData, AppError> {
-        let data = self.fetch(name).await?;
-        match validator.validate(&data).await {
-            ValidationResult::Valid(safe) => Ok(*safe),
-            ValidationResult::Invalid(e) => Err(AppError::Protocol(e.to_string())),
-            ValidationResult::Pending => {
-                Err(AppError::Protocol("certificate chain not resolved".into()))
-            }
-        }
+        self.fetch_unverified(name)
+            .await?
+            .verify(validator)
+            .await
+            .map_err(|e| AppError::Protocol(e.to_string()))
     }
 
     /// Fetch a Data wrapped in [`Unverified<Data>`], forcing the caller to
