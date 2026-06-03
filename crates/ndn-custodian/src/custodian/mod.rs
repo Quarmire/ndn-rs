@@ -15,14 +15,16 @@ use ndn_packet::Name;
 use crate::KeyId;
 
 pub mod browser_extension;
+pub mod enclave;
 pub mod in_page;
 pub mod os_keyring;
 pub mod remote_signer;
 
 pub use browser_extension::BrowserExtensionCustodian;
+pub use enclave::{EnclaveBackend, EnclaveCustodian};
 pub use remote_signer::{
-    ChannelRemoteSigner, PairingOffer, RemoteCustodian, RemoteSignRequest, RemoteSignerTransport,
-    SignerChannel, WireSignRequest, WireSignResponse,
+    ApprovalGate, ChannelRemoteSigner, PairingOffer, RemoteCustodian, RemoteSignRequest,
+    RemoteSignerResponder, RemoteSignerTransport, SignerChannel, WireSignRequest, WireSignResponse,
 };
 pub use in_page::InPageCustodian;
 #[cfg(not(target_arch = "wasm32"))]

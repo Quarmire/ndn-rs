@@ -21,8 +21,8 @@ pub use signer::CustodianSigner;
 #[cfg(not(target_arch = "wasm32"))]
 pub use custodian::OsKeyringCustodian;
 pub use custodian::{
-    BrowserExtensionCustodian, ChannelRemoteSigner, Custodian, CustodianError, CustodianRef,
-    CustodianRegistry, InPageCustodian, PairingOffer, RemoteCustodian, RemoteSignRequest,
-    RemoteSignerTransport, SignerChannel, UnlockContext, UnwrappedKey, WireSignRequest,
-    WireSignResponse, WrappedKey,
+    ApprovalGate, BrowserExtensionCustodian, ChannelRemoteSigner, Custodian, CustodianError,
+    CustodianRef, CustodianRegistry, EnclaveBackend, EnclaveCustodian, InPageCustodian,
+    PairingOffer, RemoteCustodian, RemoteSignRequest, RemoteSignerResponder, RemoteSignerTransport,
+    SignerChannel, UnlockContext, UnwrappedKey, WireSignRequest, WireSignResponse, WrappedKey,
 };

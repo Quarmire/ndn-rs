@@ -407,6 +407,84 @@ impl<C: SignerChannel + 'static> RemoteSignerTransport for ChannelRemoteSigner<C
     }
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// Responder — the signer side (the phone/fob). The dashboard's
+// `ChannelRemoteSigner` is the requester; this is the device that holds the key
+// and gates each signature. Together they close the remote-signer loop.
+
+/// The signer-side approval gate. The platform implements it with a biometric
+/// prompt that renders *what* is being authorized — parsed from `region`
+/// itself, never from a caller-supplied string — so a compromised requester
+/// can't present benign text for malicious bytes. Returning `false` denies.
+#[async_trait]
+pub trait ApprovalGate: Send + Sync {
+    /// Decide whether to authorize signing `region`. Implementations show the
+    /// operator what `region` commits to and await their decision.
+    async fn approve(&self, region: &[u8]) -> bool;
+}
+
+/// Serves [`WireSignRequest`]s from a paired requester over a
+/// [`SignerChannel`]: decode → gate → sign → reply. This is the phone/fob side
+/// of the protocol; `signer` is typically backed by an enclave key
+/// ([`EnclaveCustodian`](crate::EnclaveCustodian) adapted through
+/// [`CustodianSigner`](crate::CustodianSigner)), so the private key never
+/// leaves secure hardware and every signature is biometric-gated by `gate`.
+pub struct RemoteSignerResponder<C: SignerChannel> {
+    channel: C,
+    signer: Arc<dyn ndn_security::Signer>,
+    gate: Arc<dyn ApprovalGate>,
+}
+
+impl<C: SignerChannel> RemoteSignerResponder<C> {
+    pub fn new(
+        channel: C,
+        signer: Arc<dyn ndn_security::Signer>,
+        gate: Arc<dyn ApprovalGate>,
+    ) -> Self {
+        Self {
+            channel,
+            signer,
+            gate,
+        }
+    }
+
+    /// Handle one request/response cycle. Returns the served `req_id`, or
+    /// `None` when the channel has closed (so a `serve` loop can stop). A denied
+    /// or failed signature still sends a `Denied` reply — the requester must
+    /// always get a correlated response.
+    pub async fn serve_one(&self) -> Result<Option<u64>, CustodianError> {
+        let frame = match self.channel.recv().await {
+            Ok(f) => f,
+            // Channel closed / unreachable: nothing left to serve.
+            Err(_) => return Ok(None),
+        };
+        let req = WireSignRequest::decode(&frame)?;
+
+        let response = if self.gate.approve(&req.region).await {
+            match self.signer.sign(&req.region).await {
+                Ok(signature) => WireSignResponse::Approved {
+                    req_id: req.req_id,
+                    signature,
+                },
+                // Couldn't produce the signature (enclave error, etc.) — deny
+                // rather than leave the requester hanging.
+                Err(_) => WireSignResponse::Denied { req_id: req.req_id },
+            }
+        } else {
+            WireSignResponse::Denied { req_id: req.req_id }
+        };
+
+        self.channel.send(response.encode()).await?;
+        Ok(Some(req.req_id))
+    }
+
+    /// Serve requests until the channel closes.
+    pub async fn serve(&self) -> Result<(), CustodianError> {
+        while self.serve_one().await?.is_some() {}
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -644,6 +722,121 @@ mod tests {
             })
             .await
             .expect_err("denial surfaces as an error");
+        assert!(matches!(err, CustodianError::SignFailed(_)));
+    }
+
+    /// Phase-3 acceptance: a phone with an enclave key serves the desktop's
+    /// remote-signer requests. Desktop (`ChannelRemoteSigner` → `RemoteCustodian`)
+    /// delegates a signature; the phone (`RemoteSignerResponder` over an
+    /// `EnclaveCustodian`-backed signer, gated by `ApprovalGate`) signs and
+    /// replies; the desktop's signature verifies against the enclave key — and
+    /// the private key never crosses the channel (only `region` and the sig do).
+    #[tokio::test]
+    async fn phone_enclave_responder_signs_for_desktop_under_approval() {
+        use crate::{CustodianSigner, EnclaveBackend, EnclaveCustodian, KeyId};
+        use ndn_packet::SignatureType;
+
+        // Phone enclave key (software stand-in for the Secure Enclave / StrongBox).
+        let key: Name = "/op/phone/KEY/enclave".parse().unwrap();
+        let sw = EcdsaP256Signer::from_seed(&[4u8; 32], key.clone()).unwrap();
+        let pk = sw.public_key().unwrap();
+
+        struct SwEnclave {
+            signer: EcdsaP256Signer,
+            pk: Bytes,
+        }
+        #[async_trait]
+        impl EnclaveBackend for SwEnclave {
+            fn public_key(&self) -> Bytes {
+                self.pk.clone()
+            }
+            async fn sign(&self, region: &[u8]) -> Result<Bytes, CustodianError> {
+                self.signer
+                    .sign_sync(region)
+                    .map_err(|e| CustodianError::SignFailed(e.to_string()))
+            }
+            fn is_available(&self) -> bool {
+                true
+            }
+        }
+
+        let enclave = Arc::new(EnclaveCustodian::new(
+            Arc::new(SwEnclave {
+                signer: sw,
+                pk: pk.clone(),
+            }),
+            "phone-1",
+        ));
+        let phone_signer: Arc<dyn Signer> = Arc::new(CustodianSigner::new(
+            enclave,
+            KeyId(key.clone()),
+            SignatureType::SignatureSha256WithEcdsa,
+            Some(pk.clone()),
+        ));
+
+        // The biometric prompt's "approve".
+        struct ApproveAll;
+        #[async_trait]
+        impl ApprovalGate for ApproveAll {
+            async fn approve(&self, _region: &[u8]) -> bool {
+                true
+            }
+        }
+
+        let (dash_end, fob_end) = channel_pair();
+        let responder = RemoteSignerResponder::new(fob_end, phone_signer, Arc::new(ApproveAll));
+        tokio::spawn(async move { responder.serve().await.ok() });
+
+        // Desktop uses the phone as its remote signer.
+        let custodian = RemoteCustodian::new(
+            Arc::new(ChannelRemoteSigner::new(dash_end)),
+            CustodianRef::Fob {
+                fob_id: "phone-1".into(),
+            },
+        );
+        let region = b"register /demo route under the operator key";
+        let sig = custodian
+            .sign(&KeyId(key.clone()), &key, region)
+            .await
+            .expect("phone signs for desktop");
+        assert!(matches!(
+            EcdsaSha256Verifier.verify(region, &sig, &pk).await,
+            Ok(VerifyOutcome::Valid)
+        ));
+    }
+
+    /// When the phone's operator declines the biometric prompt, the desktop's
+    /// `sign` fails — a denial is never a silent success.
+    #[tokio::test]
+    async fn phone_denial_surfaces_to_desktop() {
+        use crate::KeyId;
+
+        struct DenyAll;
+        #[async_trait]
+        impl ApprovalGate for DenyAll {
+            async fn approve(&self, _region: &[u8]) -> bool {
+                false
+            }
+        }
+
+        let key: Name = "/op/phone/KEY/enclave".parse().unwrap();
+        let signer: Arc<dyn Signer> =
+            Arc::new(EcdsaP256Signer::from_seed(&[6u8; 32], key.clone()).unwrap());
+
+        let (dash_end, fob_end) = channel_pair();
+        let responder = RemoteSignerResponder::new(fob_end, signer, Arc::new(DenyAll));
+        tokio::spawn(async move { responder.serve().await.ok() });
+
+        let custodian = RemoteCustodian::new(
+            Arc::new(ChannelRemoteSigner::new(dash_end)),
+            CustodianRef::Fob {
+                fob_id: "phone-1".into(),
+            },
+        );
+        let err = custodian
+            .sign(&KeyId(key.clone()), &key, b"region")
+            .await
+            .expect_err("a declined biometric prompt fails the signature");
         assert!(matches!(err, CustodianError::SignFailed(_)));
     }
 }
