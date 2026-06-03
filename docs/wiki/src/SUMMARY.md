@@ -51,6 +51,7 @@
 - [In-network compute](./guides/in-network-compute.md)
 - [Network coding (FEC)](./guides/network-coding.md)
 - [NDNCERT setup](./guides/ndncert-setup.md)
+- [Security pitfalls](./guides/security-pitfalls.md)
 - [Running the dashboard](./guides/running-the-dashboard.md)
 - [Self-hosting](./guides/self-hosting.md)
 

@@ -84,21 +84,27 @@ tokio::signal::ctrl_c().await?;
 A consumer that trusts `/alice`'s key and rejects anything else:
 
 ```rust,ignore
-use ndn::prelude::*;
-use ndn::{Consumer, ValidationPolicy, HierarchicalPolicy};
+use ndn::Consumer;
+use ndn_security::{Certificate, TrustSchema, Validator};
 
-# async fn fetch() -> anyhow::Result<()> {
-let policy = HierarchicalPolicy::anchor("/alice");
-let mut consumer = Consumer::connect("/tmp/ndn-fwd.sock").await?
-    .with_validation(policy);
+# async fn fetch(alice_cert: Certificate) -> anyhow::Result<()> {
+// Pin /alice's certificate as a trust anchor; accept only what chains to it.
+let validator = Validator::new(TrustSchema::hierarchical());
+validator.add_trust_anchor(alice_cert);
 
-let bytes = consumer.fetch_object("/alice/notes/2026-05-20/v=1").await?;
-println!("{}", String::from_utf8_lossy(&bytes));
+let mut consumer = Consumer::connect("/tmp/ndn-fwd.sock").await?;
+
+// `fetch_verified` returns `SafeData` only if the signature verifies and the
+// schema accepts it. Prefer it over the bare `fetch`, which returns unverified
+// `Data`. (Need to decide per call? `fetch_unverified` returns `Unverified<Data>`,
+// which forces an explicit `.verify(&validator)` or a loud `.trust_unchecked()`.)
+let safe = consumer.fetch_verified("/alice/notes/today", &validator).await?;
+println!("{}", String::from_utf8_lossy(safe.data().content().unwrap_or_default()));
 # Ok(()) }
 ```
 
-`HierarchicalPolicy::anchor("/alice")` says: accept `Data` under
-`/alice/...` if its signature chains up to a key under `/alice`.
+A hierarchical schema says: accept `Data` under `/alice/...` if its
+signature chains up to a key under `/alice`.
 
 ## Step 5 — Subscribe to a stream
 
