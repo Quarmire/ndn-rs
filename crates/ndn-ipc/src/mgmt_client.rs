@@ -225,7 +225,12 @@ impl MgmtClient {
     /// dashboard approver UI.
     pub async fn ca_list_approvals(&self) -> Result<Vec<(String, String, String)>, ForwarderError> {
         let bytes = self.dataset_raw(module::CA, verb::LIST_APPROVALS).await?;
-        Ok(decode_pending_approvals(&bytes))
+        // Decode through the shared `ndn-mgmt-wire` codec; map to the historical
+        // tuple shape this method's callers expect.
+        Ok(ndn_mgmt_wire::PendingApproval::decode_all(&bytes)
+            .into_iter()
+            .map(|a| (a.request_id, a.cert_name, a.description))
+            .collect())
     }
 
     /// `ca/approve`. Approves a pending device-approval request by id.
@@ -970,45 +975,6 @@ async fn build_signed_interest_with_policy(
                 .await
         }
     }
-}
-
-/// Decode the `ca/list-approvals` dataset. Mirrors the TLV layout in
-/// `crates/ndn-mgmt/src/modules/ca.rs::approvals_dataset`:
-///   PendingApproval (0xCA) { RequestId (0xCC), CertName (0xCE), [Description (0xD0)] }
-fn decode_pending_approvals(bytes: &[u8]) -> Vec<(String, String, String)> {
-    const TYPE_PENDING_APPROVAL: u64 = 0xCA;
-    const TYPE_REQUEST_ID: u64 = 0xCC;
-    const TYPE_CERT_NAME: u64 = 0xCE;
-    const TYPE_DESCRIPTION: u64 = 0xD0;
-    let mut out = Vec::new();
-    let mut reader = ndn_tlv::TlvReader::new(Bytes::copy_from_slice(bytes));
-    while !reader.is_empty() {
-        let Ok((typ, body)) = reader.read_tlv() else {
-            break;
-        };
-        if typ != TYPE_PENDING_APPROVAL {
-            continue;
-        }
-        let mut inner = ndn_tlv::TlvReader::new(body);
-        let mut id = String::new();
-        let mut cert = String::new();
-        let mut desc = String::new();
-        while !inner.is_empty() {
-            let Ok((t, v)) = inner.read_tlv() else {
-                break;
-            };
-            match t {
-                TYPE_REQUEST_ID => id = String::from_utf8_lossy(&v).into_owned(),
-                TYPE_CERT_NAME => cert = String::from_utf8_lossy(&v).into_owned(),
-                TYPE_DESCRIPTION => desc = String::from_utf8_lossy(&v).into_owned(),
-                _ => {}
-            }
-        }
-        if !id.is_empty() && !cert.is_empty() {
-            out.push((id, cert, desc));
-        }
-    }
-    out
 }
 
 #[cfg(test)]

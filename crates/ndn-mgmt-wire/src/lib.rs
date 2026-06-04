@@ -170,9 +170,110 @@ impl GeneralStatus {
     }
 }
 
+/// CA pending-approval dataset TLV-TYPE codes (`/localhost/nfd/ca/list-approvals`).
+///
+/// An ndn-rs extension (no NFD analogue), so codes sit in the application range.
+pub mod ca_tlv {
+    pub const PENDING_APPROVAL: u64 = 0xCA; // nested entry
+    pub const REQUEST_ID: u64 = 0xCC; // UTF-8 string
+    pub const CERT_NAME: u64 = 0xCE; // UTF-8 string
+    pub const DESCRIPTION: u64 = 0xD0; // UTF-8 string, optional
+}
+
+/// One row of the CA pending-approval queue. The single source of truth for
+/// this wire shape: the native engine (`ndn-mgmt`) encodes it, every client
+/// (`ndn-ipc`, the dashboard web build, `ndn-dashboard-core`) decodes it
+/// through here rather than re-deriving the TLV codes.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PendingApproval {
+    pub request_id: String,
+    pub cert_name: String,
+    pub description: String,
+}
+
+impl PendingApproval {
+    /// Encode a queue into the `ca/list-approvals` dataset body. `description`
+    /// is omitted when empty (decoders default it to `""`).
+    pub fn encode_all(rows: &[PendingApproval]) -> Bytes {
+        let mut w = TlvWriter::new();
+        for r in rows {
+            w.write_nested(ca_tlv::PENDING_APPROVAL, |inner| {
+                inner.write_tlv(ca_tlv::REQUEST_ID, r.request_id.as_bytes());
+                inner.write_tlv(ca_tlv::CERT_NAME, r.cert_name.as_bytes());
+                if !r.description.is_empty() {
+                    inner.write_tlv(ca_tlv::DESCRIPTION, r.description.as_bytes());
+                }
+            });
+        }
+        w.finish()
+    }
+
+    /// Decode the dataset body. Unknown top-level TLVs are skipped (evolvability);
+    /// an entry missing `request_id` or `cert_name` is dropped.
+    pub fn decode_all(bytes: &[u8]) -> alloc::vec::Vec<PendingApproval> {
+        let mut out = alloc::vec::Vec::new();
+        let mut reader = TlvReader::new(Bytes::copy_from_slice(bytes));
+        while !reader.is_empty() {
+            let Ok((typ, body)) = reader.read_tlv() else {
+                break;
+            };
+            if typ != ca_tlv::PENDING_APPROVAL {
+                continue;
+            }
+            let mut row = PendingApproval::default();
+            let mut inner = TlvReader::new(body);
+            while !inner.is_empty() {
+                let Ok((t, v)) = inner.read_tlv() else { break };
+                let s = String::from_utf8_lossy(&v).into_owned();
+                match t {
+                    ca_tlv::REQUEST_ID => row.request_id = s,
+                    ca_tlv::CERT_NAME => row.cert_name = s,
+                    ca_tlv::DESCRIPTION => row.description = s,
+                    _ => {}
+                }
+            }
+            if !row.request_id.is_empty() && !row.cert_name.is_empty() {
+                out.push(row);
+            }
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_approval_round_trips() {
+        let rows = alloc::vec![
+            PendingApproval {
+                request_id: "req-1".into(),
+                cert_name: "/ndn/alice/KEY/k/CA/v".into(),
+                description: "Touch ID".into(),
+            },
+            PendingApproval {
+                request_id: "req-2".into(),
+                cert_name: "/ndn/bob/KEY/k/CA/v".into(),
+                description: String::new(), // omitted on the wire
+            },
+        ];
+        let wire = PendingApproval::encode_all(&rows);
+        let back = PendingApproval::decode_all(&wire);
+        assert_eq!(back, rows);
+        // The first byte is the nested entry type.
+        assert_eq!(wire[0] as u64, ca_tlv::PENDING_APPROVAL);
+    }
+
+    #[test]
+    fn pending_approval_drops_incomplete_entries() {
+        // An entry with only a request id (no cert name) is dropped.
+        let mut w = TlvWriter::new();
+        w.write_nested(ca_tlv::PENDING_APPROVAL, |i| {
+            i.write_tlv(ca_tlv::REQUEST_ID, b"orphan");
+        });
+        assert!(PendingApproval::decode_all(&w.finish()).is_empty());
+    }
 
     #[test]
     fn round_trips() {

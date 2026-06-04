@@ -26,12 +26,7 @@ use ndn_config::{
 
 use crate::module::{MgmtContext, MgmtModule};
 use crate::{ApprovalMgmtBackend, MgmtResponse, PendingApprovalInfo};
-
-// Dataset TLV codes (ndn-rs application range; scoped to this Data content).
-const TYPE_PENDING_APPROVAL: u64 = 0xCA;
-const TYPE_REQUEST_ID: u64 = 0xCC;
-const TYPE_CERT_NAME: u64 = 0xCE;
-const TYPE_DESCRIPTION: u64 = 0xD0;
+use ndn_mgmt_wire::PendingApproval;
 
 fn handle_ca(
     verb_name: &[u8],
@@ -105,17 +100,17 @@ fn deny_handler(params: ControlParameters, handler: &dyn ApprovalMgmtBackend) ->
 }
 
 fn approvals_dataset(rows: &[PendingApprovalInfo]) -> bytes::Bytes {
-    let mut w = ndn_tlv::TlvWriter::new();
-    for info in rows {
-        w.write_nested(TYPE_PENDING_APPROVAL, |inner| {
-            inner.write_tlv(TYPE_REQUEST_ID, info.id.as_bytes());
-            inner.write_tlv(TYPE_CERT_NAME, info.cert_name.as_bytes());
-            if !info.description.is_empty() {
-                inner.write_tlv(TYPE_DESCRIPTION, info.description.as_bytes());
-            }
-        });
-    }
-    w.finish()
+    // Encode through the shared `ndn-mgmt-wire` codec so the engine and every
+    // client decode the same bytes by construction.
+    let wire: Vec<PendingApproval> = rows
+        .iter()
+        .map(|info| PendingApproval {
+            request_id: info.id.clone(),
+            cert_name: info.cert_name.clone(),
+            description: info.description.clone(),
+        })
+        .collect();
+    PendingApproval::encode_all(&wire)
 }
 
 pub(crate) struct CaModule;
@@ -236,16 +231,14 @@ mod ca_tests {
             MgmtResponse::Dataset(b) => b,
             _ => panic!("expected dataset"),
         };
-        let mut r = ndn_tlv::TlvReader::new(bytes);
-        let (t0, v0) = r.read_tlv().expect("first approval");
-        assert_eq!(t0, TYPE_PENDING_APPROVAL);
-        let mut ir = ndn_tlv::TlvReader::new(v0);
-        let (idt, idv) = ir.read_tlv().expect("request id");
-        assert_eq!(idt, TYPE_REQUEST_ID);
-        assert_eq!(idv.as_ref(), b"req-1");
-        let (t1, _) = r.read_tlv().expect("second approval");
-        assert_eq!(t1, TYPE_PENDING_APPROVAL);
-        assert!(r.is_empty());
+        // Decode through the shared codec — proves the engine's output is
+        // round-trippable by the same decoder every client uses.
+        let rows = PendingApproval::decode_all(&bytes);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].request_id, "req-1");
+        assert_eq!(rows[0].cert_name, "/lab/alice/devices/laptop");
+        assert_eq!(rows[1].request_id, "req-2");
+        assert_eq!(rows[1].description, ""); // empty omitted on the wire
     }
 
     #[test]
