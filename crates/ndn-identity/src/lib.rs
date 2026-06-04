@@ -12,6 +12,7 @@
 pub mod ca;
 pub mod delegation;
 pub mod device;
+pub mod signed_delegation;
 pub mod device_approval_net;
 pub mod email;
 pub mod enroll;
@@ -40,6 +41,7 @@ pub use identity::NdnIdentity;
 // The Custodian trait + KeyId now live in `ndn-custodian` (wasm-safe). Re-export
 // them so existing `ndn_identity::Custodian` / `KeyId` paths keep working.
 pub use delegation::{Delegation, DelegationError};
+pub use signed_delegation::SignedDelegation;
 pub use facade::Identity;
 #[cfg(not(target_arch = "wasm32"))]
 pub use ndn_custodian::OsKeyringCustodian;

@@ -39,7 +39,7 @@ use crate::transition::{
     AuthorityOutcome, DidDocumentRotation, KeyRecovery, KeyState, RecoveryProof, RecoverySignature,
     TransitionAuthority, TransitionProof,
 };
-use crate::{CapabilitySet, Delegation};
+use crate::{CapabilitySet, Delegation, SignedDelegation};
 
 /// A `KeyChain` with a managed lifecycle: enrollment, rotation, recovery, and
 /// delegation. Derefs to the underlying [`KeyChain`] for day-to-day signing and
@@ -267,6 +267,19 @@ impl Identity {
             subordinate: device,
             scope,
         }
+    }
+
+    /// Issue a **signed**, transmittable delegation granting `scope` to a
+    /// `device` namespace — the wire-ready form of [`add_device`](Self::add_device).
+    /// The device presents the returned [`SignedDelegation`] and any verifier
+    /// checks it against this principal's key. Fails if `device` is not under
+    /// the principal's namespace.
+    pub fn issue_delegation(
+        &self,
+        device: Name,
+        scope: CapabilitySet,
+    ) -> Result<SignedDelegation, IdentityError> {
+        SignedDelegation::issue(&self.keychain, device, scope)
     }
 
     // ---- accessors -----------------------------------------------------------
