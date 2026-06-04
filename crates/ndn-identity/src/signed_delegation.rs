@@ -15,10 +15,12 @@
 //! sits *alongside* the cert floor — the cert proves the device key is the
 //! principal's; this proves what the principal authorized it to do.
 
+use std::sync::Arc;
+
 use ndn_packet::{Name, SignatureType};
 use ndn_security::trust_schema::NamePattern;
 use ndn_security::verifier::verify_by_sig_type;
-use ndn_security::{KeyChain, VerifyOutcome};
+use ndn_security::{KeyChain, Signer, VerifyOutcome};
 
 use bytes::Bytes;
 
@@ -147,6 +149,61 @@ impl SignedDelegation {
             sig_type,
             sig_value,
         })
+    }
+}
+
+/// A subordinate device's signer, gated by a verified delegation grant — the
+/// **enforcement** half of the delegation loop. The principal issues a
+/// [`SignedDelegation`]; the device verifies it and wraps its own key here, so
+/// the device can only sign names the grant authorizes and refuses the rest.
+///
+/// The device signs with **its own** key; the grant says *what names* it may
+/// sign for, not *which key* signs. A verifier then ties the device key back to
+/// the principal through the cert chain (the cert-as-delegation floor) and this
+/// grant's explicit scope.
+pub struct DelegatedSigner {
+    signer: Arc<dyn Signer>,
+    grant: CapabilitySet,
+}
+
+impl DelegatedSigner {
+    /// Wrap `signer` with an already-verified `grant`.
+    pub fn new(signer: Arc<dyn Signer>, grant: CapabilitySet) -> Self {
+        Self { signer, grant }
+    }
+
+    /// Verify `delegation` against the principal's public key, then gate
+    /// `signer` by the granted scope. The one-step "I received a delegation,
+    /// now enforce it" path.
+    pub async fn from_delegation(
+        signer: Arc<dyn Signer>,
+        delegation: &SignedDelegation,
+        principal_public_key: &[u8],
+    ) -> Result<Self, DelegationError> {
+        let grant = delegation.verify(principal_public_key).await?;
+        Ok(Self::new(signer, grant))
+    }
+
+    /// The scope this signer is allowed to act within.
+    pub fn grant(&self) -> &CapabilitySet {
+        &self.grant
+    }
+
+    /// Whether the grant authorizes signing `name`.
+    pub fn may_sign(&self, name: &Name) -> bool {
+        self.grant.may_sign(name)
+    }
+
+    /// Sign `region` (the to-be-signed bytes of a Data named `name`) with the
+    /// device key — but only if the grant authorizes `name`. Refuses
+    /// out-of-scope names rather than producing an unauthorized signature.
+    pub async fn sign(&self, name: &Name, region: &[u8]) -> Result<Bytes, IdentityError> {
+        if !self.may_sign(name) {
+            return Err(IdentityError::Lifecycle(format!(
+                "delegation does not authorize signing {name}"
+            )));
+        }
+        Ok(self.signer.sign(region).await?)
     }
 }
 
@@ -330,5 +387,54 @@ mod tests {
             deleg.verify(&other_pubkey).await,
             Err(DelegationError::SignatureInvalid)
         ));
+    }
+
+    /// The full loop: principal issues → device verifies → device signs in
+    /// scope but is refused out of scope.
+    #[tokio::test]
+    async fn delegated_signer_enforces_scope() {
+        let (principal, principal_pubkey) = principal_keychain("/alice");
+        let deleg = SignedDelegation::issue(
+            &principal,
+            "/alice/device/phone".parse().unwrap(),
+            route_scope(),
+        )
+        .unwrap();
+
+        // The device holds its own key and accepts the verified grant.
+        let (device_kc, _) = principal_keychain("/alice/device/phone");
+        let device_signer = device_kc.signer().unwrap();
+        let ds = DelegatedSigner::from_delegation(device_signer, &deleg, &principal_pubkey)
+            .await
+            .expect("device accepts a valid delegation");
+
+        // In scope → signs (with the device key).
+        let in_scope: Name = "/alice/device/phone/data/1".parse().unwrap();
+        assert!(ds.may_sign(&in_scope));
+        let sig = ds.sign(&in_scope, b"region").await.expect("in-scope signs");
+        assert!(!sig.is_empty());
+
+        // Out of scope → refused, no signature produced.
+        let out: Name = "/alice/other/secret".parse().unwrap();
+        assert!(!ds.may_sign(&out));
+        assert!(ds.sign(&out, b"region").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn delegated_signer_rejects_a_tampered_delegation() {
+        let (principal, principal_pubkey) = principal_keychain("/alice");
+        let mut deleg = SignedDelegation::issue(
+            &principal,
+            "/alice/device/phone".parse().unwrap(),
+            route_scope(),
+        )
+        .unwrap();
+        deleg.scope.mgmt = true; // escalate after signing
+        let (device_kc, _) = principal_keychain("/alice/device/phone");
+        assert!(
+            DelegatedSigner::from_delegation(device_kc.signer().unwrap(), &deleg, &principal_pubkey)
+                .await
+                .is_err()
+        );
     }
 }

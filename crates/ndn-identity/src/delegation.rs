@@ -19,8 +19,6 @@
 //! `DelegationAtom` (capability, reversibility, sub-delegation) is a future
 //! mechanism behind this same frame, deferred per the §11 cross-reference.
 
-use std::collections::HashMap;
-
 use ndn_packet::Name;
 
 use ndn_security::verifier::verify_by_sig_type;
@@ -138,11 +136,7 @@ impl Delegation {
 
     /// Whether this delegation authorizes signing `name`.
     pub fn may_sign(&self, name: &Name) -> bool {
-        let mut bindings = HashMap::new();
-        self.scope.sign.iter().any(|pattern| {
-            bindings.clear();
-            pattern.matches(name, &mut bindings)
-        })
+        self.scope.may_sign(name)
     }
 
     /// Whether the subordinate may unwrap content keys on the principal's behalf.

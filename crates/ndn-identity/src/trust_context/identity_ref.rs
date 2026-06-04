@@ -40,3 +40,14 @@ pub struct CapabilitySet {
     pub enroll: bool,
     pub mgmt: bool,
 }
+
+impl CapabilitySet {
+    /// Whether any `sign` pattern in this set authorizes signing `name`.
+    pub fn may_sign(&self, name: &Name) -> bool {
+        let mut bindings = std::collections::HashMap::new();
+        self.sign.iter().any(|pattern| {
+            bindings.clear();
+            pattern.matches(name, &mut bindings)
+        })
+    }
+}
