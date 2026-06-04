@@ -19,12 +19,16 @@ pub mod enclave;
 pub mod in_page;
 pub mod os_keyring;
 pub mod remote_signer;
+pub mod scoped_signing;
 
 pub use browser_extension::BrowserExtensionCustodian;
 pub use enclave::{EnclaveBackend, EnclaveCustodian};
 pub use remote_signer::{
     ApprovalGate, ChannelRemoteSigner, PairingOffer, RemoteCustodian, RemoteSignRequest,
     RemoteSignerResponder, RemoteSignerTransport, SignerChannel, WireSignRequest, WireSignResponse,
+};
+pub use scoped_signing::{
+    ActionClass, Decision, ScopedApprovalGate, ScopedGrant, ScopedSigningPolicy,
 };
 pub use in_page::InPageCustodian;
 #[cfg(not(target_arch = "wasm32"))]
