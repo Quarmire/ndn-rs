@@ -373,6 +373,66 @@ impl Consumer {
     ) -> Result<ndn_security::SafeData, AppError> {
         self.fetch_verified(name, validator).await
     }
+
+    /// Decide trust **once** and get a consumer whose ordinary verbs are safe:
+    /// [`VerifiedConsumer::fetch`] returns [`SafeData`], not raw `Data`. This is
+    /// the recommended shape — configure a [`Validator`] up front (e.g.
+    /// `keychain.validator()`) and you cannot then accidentally use unverified
+    /// data. Drop back to the raw primitives with
+    /// [`VerifiedConsumer::unverified`] when you mean to.
+    pub fn verifying(self, validator: Validator) -> VerifiedConsumer {
+        VerifiedConsumer {
+            inner: self,
+            validator,
+        }
+    }
+}
+
+/// A [`Consumer`] that verifies every fetch against a pinned [`Validator`], so
+/// the short verbs (`fetch`, `get`) return [`SafeData`] instead of raw `Data`.
+/// Build one with [`Consumer::verifying`].
+///
+/// This is the safe path of least resistance: the obvious call is the verified
+/// one. The unverified primitives remain reachable via [`unverified`](Self::unverified)
+/// for the cases that genuinely need them (segment reassembly, deliberate
+/// integrity-only acceptance).
+pub struct VerifiedConsumer {
+    inner: Consumer,
+    validator: Validator,
+}
+
+impl VerifiedConsumer {
+    /// Fetch and verify against the pinned validator. Verification is not
+    /// optional here — you get [`SafeData`] or an error.
+    pub async fn fetch(&mut self, name: impl Into<Name>) -> Result<SafeData, AppError> {
+        self.inner.fetch_verified(name, &self.validator).await
+    }
+
+    /// Verified content bytes (the [`fetch`](Self::fetch) payload).
+    pub async fn get(&mut self, name: impl Into<Name>) -> Result<Bytes, AppError> {
+        let safe = self.fetch(name).await?;
+        safe.data()
+            .content()
+            .map(|b| Bytes::copy_from_slice(b))
+            .ok_or_else(|| AppError::Protocol("Data has no content".into()))
+    }
+
+    /// The validator this consumer verifies against.
+    pub fn validator(&self) -> &Validator {
+        &self.validator
+    }
+
+    /// Borrow the underlying raw [`Consumer`] for the unverified primitives
+    /// (`fetch_object`, `fetch_unverified`, …). Reaching for this is the
+    /// explicit "I am handling trust myself here" signal.
+    pub fn unverified(&mut self) -> &mut Consumer {
+        &mut self.inner
+    }
+
+    /// Drop the validator and recover the raw [`Consumer`].
+    pub fn into_inner(self) -> Consumer {
+        self.inner
+    }
 }
 
 /// LP-unwrap a received packet and decode it as `Data`, surfacing a Nack.

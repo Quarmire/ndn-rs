@@ -1,5 +1,5 @@
 //! Hub-archetype onboarding: stand up a network root, publish its
-//! [`TrustContext`] + [`BootstrapTicket`], and the clockless validity policy that
+//! [`SignedTrustContext`] + [`BootstrapTicket`], and the clockless validity policy that
 //! offline/embedded nodes degrade to.
 //!
 //! The home-hub is the local-gains-first archetype: one node is root + issuing
@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use ndn_packet::Name;
-use ndn_security::{Certificate, EnrollmentHint, SecurityManager, TrustContext, TrustError};
+use ndn_security::{Certificate, EnrollmentHint, SecurityManager, SignedTrustContext, TrustError};
 
 use crate::onboarding::BootstrapTicket;
 
@@ -21,7 +21,7 @@ pub struct HubInit {
     /// The self-signed network anchor certificate.
     pub anchor: Certificate,
     /// The published, versioned trust context (hierarchical, hub-default gate).
-    pub context: Arc<TrustContext>,
+    pub context: Arc<SignedTrustContext>,
     /// The out-of-band bootstrap ticket (QR / deep link).
     pub ticket: BootstrapTicket,
 }
@@ -53,7 +53,7 @@ pub fn init_hub(mgr: &SecurityManager, namespace: &Name) -> Result<HubInit, Trus
         .unwrap_or_default();
     let anchor = mgr.issue_self_signed(&anchor_key, pk, u64::MAX)?;
 
-    let context = TrustContext::hierarchical(namespace.clone())
+    let context = SignedTrustContext::hierarchical(namespace.clone())
         .with_version(1)
         .with_enrollment_hint(EnrollmentHint::hub_default());
     context.add_anchor(anchor.clone());

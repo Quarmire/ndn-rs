@@ -20,4 +20,6 @@ pub enum IdentityError {
     Renewal(String),
     #[error("not enrolled: call enroll() or provision() first")]
     NotEnrolled,
+    #[error("identity lifecycle error: {0}")]
+    Lifecycle(String),
 }

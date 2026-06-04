@@ -1,4 +1,4 @@
-//! [`TrustContext`] — an anchor-rooted namespace relationship.
+//! [`SignedTrustContext`] — an anchor-rooted namespace relationship.
 //!
 //! A node does not "join a network"; it adopts a *set* of trust contexts (a
 //! [`Keyring`](crate::Keyring)). Each context binds a `namespace` to the
@@ -25,9 +25,9 @@ use ndn_tlv::{TlvWriter, read_varu64};
 use crate::cert_cache::Certificate;
 use crate::trust_schema::{SchemaRule, TrustSchema};
 
-/// Errors from encoding/decoding a [`TrustContext`] wire object.
+/// Errors from encoding/decoding a [`SignedTrustContext`] wire object.
 #[derive(Debug, thiserror::Error)]
-pub enum TrustContextError {
+pub enum SignedTrustContextError {
     #[error("truncated TLV: {0}")]
     Truncated(&'static str),
     #[error("missing required field: {0}")]
@@ -42,8 +42,8 @@ pub enum TrustContextError {
     Schema(#[from] crate::lvs::LvsError),
     #[error("schema parse: {0}")]
     SchemaParse(#[from] crate::trust_schema::PatternParseError),
-    #[error("not a TrustContext (TLV-TYPE {0:#06x})")]
-    NotTrustContext(u64),
+    #[error("not a SignedTrustContext (TLV-TYPE {0:#06x})")]
+    NotSignedTrustContext(u64),
 }
 
 /// Which encoding the schema bytes use.
@@ -62,11 +62,11 @@ impl SchemaFormat {
             SchemaFormat::Lvs => tlv::SCHEMA_FORMAT_LVS,
         }
     }
-    fn from_code(c: u8) -> Result<Self, TrustContextError> {
+    fn from_code(c: u8) -> Result<Self, SignedTrustContextError> {
         match c {
             tlv::SCHEMA_FORMAT_NATIVE => Ok(SchemaFormat::NativeText),
             tlv::SCHEMA_FORMAT_LVS => Ok(SchemaFormat::Lvs),
-            other => Err(TrustContextError::UnsupportedSchemaFormat(other)),
+            other => Err(SignedTrustContextError::UnsupportedSchemaFormat(other)),
         }
     }
 }
@@ -87,13 +87,13 @@ impl SchemaBlob {
     }
 
     /// Build the runtime [`TrustSchema`] this blob describes.
-    fn to_schema(&self) -> Result<TrustSchema, TrustContextError> {
+    fn to_schema(&self) -> Result<TrustSchema, SignedTrustContextError> {
         match self.format {
             SchemaFormat::Lvs => Ok(TrustSchema::from_lvs_binary(&self.body)?),
             SchemaFormat::NativeText => {
                 let mut schema = TrustSchema::new();
                 for line in std::str::from_utf8(&self.body)
-                    .map_err(|_| TrustContextError::Truncated("schema body utf-8"))?
+                    .map_err(|_| SignedTrustContextError::Truncated("schema body utf-8"))?
                     .lines()
                 {
                     let line = line.trim();
@@ -164,7 +164,7 @@ impl EnrollmentHint {
 /// signing key's identity must be a prefix of the signed name — which is the
 /// authorization binding NFD never shipped (issue #2856), closing the
 /// skeleton-key gap by construction.
-pub struct TrustContext {
+pub struct SignedTrustContext {
     namespace: Name,
     anchors: Arc<DashMap<Arc<Name>, Certificate>>,
     schema: RwLock<TrustSchema>,
@@ -185,7 +185,7 @@ pub struct TrustContext {
     schema_blob: Option<SchemaBlob>,
 }
 
-impl TrustContext {
+impl SignedTrustContext {
     fn base(namespace: Name, schema: TrustSchema, enforce_hierarchy: bool) -> Self {
         Self {
             namespace,
@@ -214,7 +214,7 @@ impl TrustContext {
         tracing::warn!(
             target: "ndn::security",
             namespace = %namespace,
-            "TrustContext::accept_all — hierarchical authorization floor disabled \
+            "SignedTrustContext::accept_all — hierarchical authorization floor disabled \
              (any cert under an adopted anchor may sign any name in this context)"
         );
         Self::base(namespace, TrustSchema::accept_all(), false)
@@ -252,7 +252,7 @@ impl TrustContext {
     }
     /// Attach a schema blob to re-emit verbatim on [`encode_content`]
     /// (e.g. a published LVS binary), and adopt it as the runtime schema.
-    pub fn with_schema_blob(mut self, blob: SchemaBlob) -> Result<Self, TrustContextError> {
+    pub fn with_schema_blob(mut self, blob: SchemaBlob) -> Result<Self, SignedTrustContextError> {
         *self.schema.write().expect("schema RwLock poisoned") = blob.to_schema()?;
         self.schema_blob = Some(blob);
         Ok(self)
@@ -340,7 +340,7 @@ impl TrustContext {
     // ── wire codec ────────────────────────────────────────────────────────
 
     /// Encode this context as the `Content` of its NDN object: a single
-    /// `TrustContext` (`0x0410`) TLV. The version lives in the *name* (RDR),
+    /// `SignedTrustContext` (`0x0410`) TLV. The version lives in the *name* (RDR),
     /// not here. Anchors with no retained wire (test-only structs) are
     /// skipped.
     pub fn encode_content(&self) -> Bytes {
@@ -378,10 +378,10 @@ impl TrustContext {
     /// Decode a context from the `Content` bytes of its NDN object. The
     /// `version` must be supplied by the caller (it lives in the RDR name).
     /// Decoded contexts default to the hierarchical floor (N1).
-    pub fn decode_content(content: &[u8], version: u64) -> Result<Self, TrustContextError> {
+    pub fn decode_content(content: &[u8], version: u64) -> Result<Self, SignedTrustContextError> {
         let (t, value, _rest) = read_tlv(content)?;
         if t != tlv::TRUST_CONTEXT {
-            return Err(TrustContextError::NotTrustContext(t));
+            return Err(SignedTrustContextError::NotSignedTrustContext(t));
         }
 
         let mut namespace: Option<Name> = None;
@@ -399,7 +399,7 @@ impl TrustContext {
                 ndn_packet::tlv_type::NAME => {
                     namespace = Some(
                         Name::decode(Bytes::copy_from_slice(fval))
-                            .map_err(|e| TrustContextError::BadName(e.to_string()))?,
+                            .map_err(|e| SignedTrustContextError::BadName(e.to_string()))?,
                     );
                 }
                 tlv::ANCHOR_SET => {
@@ -413,9 +413,9 @@ impl TrustContext {
                         let mut dw = TlvWriter::new();
                         dw.write_tlv(ndn_packet::tlv_type::DATA, aval);
                         let data = Data::decode(dw.finish())
-                            .map_err(|e| TrustContextError::BadAnchor(e.to_string()))?;
+                            .map_err(|e| SignedTrustContextError::BadAnchor(e.to_string()))?;
                         let cert = Certificate::decode(&data)
-                            .map_err(|e| TrustContextError::BadAnchor(e.to_string()))?;
+                            .map_err(|e| SignedTrustContextError::BadAnchor(e.to_string()))?;
                         anchors.push(cert);
                     }
                 }
@@ -437,33 +437,33 @@ impl TrustContext {
                         }
                     }
                     schema_blob = Some(SchemaBlob {
-                        format: format.ok_or(TrustContextError::MissingField("SchemaFormat"))?,
-                        body: body.ok_or(TrustContextError::MissingField("SchemaBody"))?,
+                        format: format.ok_or(SignedTrustContextError::MissingField("SchemaFormat"))?,
+                        body: body.ok_or(SignedTrustContextError::MissingField("SchemaBody"))?,
                     });
                 }
                 tlv::CA_ENDPOINT => {
                     ca_endpoints.push(
                         Name::decode_from_tlv(Bytes::copy_from_slice(fval))
-                            .map_err(|e| TrustContextError::BadName(e.to_string()))?,
+                            .map_err(|e| SignedTrustContextError::BadName(e.to_string()))?,
                     );
                 }
                 tlv::ENROLLMENT_HINT => enrollment_hint = Some(EnrollmentHint::decode(fval)),
                 tlv::REVOCATION => {
                     revocations.push(
                         Name::decode_from_tlv(Bytes::copy_from_slice(fval))
-                            .map_err(|e| TrustContextError::BadName(e.to_string()))?,
+                            .map_err(|e| SignedTrustContextError::BadName(e.to_string()))?,
                     );
                 }
                 // Unknown critical sub-TLV → reject; unknown non-critical → skip.
                 other if is_critical(other) => {
-                    return Err(TrustContextError::Truncated("unknown critical sub-TLV"));
+                    return Err(SignedTrustContextError::Truncated("unknown critical sub-TLV"));
                 }
                 _ => {}
             }
         }
 
-        let namespace = namespace.ok_or(TrustContextError::MissingField("namespace"))?;
-        let blob = schema_blob.ok_or(TrustContextError::MissingField("TrustSchemaBlob"))?;
+        let namespace = namespace.ok_or(SignedTrustContextError::MissingField("namespace"))?;
+        let blob = schema_blob.ok_or(SignedTrustContextError::MissingField("TrustSchemaBlob"))?;
         let schema = blob.to_schema()?;
 
         let anchor_map: DashMap<Arc<Name>, Certificate> = DashMap::new();
@@ -504,9 +504,9 @@ impl TrustContext {
     }
 }
 
-impl std::fmt::Debug for TrustContext {
+impl std::fmt::Debug for SignedTrustContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TrustContext")
+        f.debug_struct("SignedTrustContext")
             .field("namespace", &self.namespace.to_string())
             .field("version", &self.version)
             .field("anchors", &self.anchors.len())
@@ -525,7 +525,7 @@ pub type SigningPair = (Name, Name);
 /// return the orphans, so a tighten can show "these identities would stop
 /// validating" and apply with a grace window instead of silently breaking
 /// working nodes.
-pub fn dryrun_orphans(candidate: &TrustContext, live: &[SigningPair]) -> Vec<SigningPair> {
+pub fn dryrun_orphans(candidate: &SignedTrustContext, live: &[SigningPair]) -> Vec<SigningPair> {
     live.iter()
         .filter(|(data, key)| !candidate.authorizes(data, key))
         .cloned()
@@ -538,16 +538,16 @@ fn is_critical(t: u64) -> bool {
 }
 
 /// Read one TLV; returns `(type, value, rest)`.
-fn read_tlv(input: &[u8]) -> Result<(u64, &[u8], &[u8]), TrustContextError> {
-    let (t, tn) = read_varu64(input).map_err(|_| TrustContextError::Truncated("TLV type"))?;
+fn read_tlv(input: &[u8]) -> Result<(u64, &[u8], &[u8]), SignedTrustContextError> {
+    let (t, tn) = read_varu64(input).map_err(|_| SignedTrustContextError::Truncated("TLV type"))?;
     let (l, ln) =
-        read_varu64(&input[tn..]).map_err(|_| TrustContextError::Truncated("TLV length"))?;
+        read_varu64(&input[tn..]).map_err(|_| SignedTrustContextError::Truncated("TLV length"))?;
     let header = tn + ln;
     let total = header
         .checked_add(l as usize)
-        .ok_or(TrustContextError::Truncated("length overflow"))?;
+        .ok_or(SignedTrustContextError::Truncated("length overflow"))?;
     if total > input.len() {
-        return Err(TrustContextError::Truncated("value"));
+        return Err(SignedTrustContextError::Truncated("value"));
     }
     Ok((t, &input[header..total], &input[total..]))
 }
@@ -597,7 +597,7 @@ mod tests {
 
     #[test]
     fn hierarchical_floor_blocks_outside_subtree() {
-        let ctx = TrustContext::hierarchical(n("/home/bob"));
+        let ctx = SignedTrustContext::hierarchical(n("/home/bob"));
         let key = n("/home/bob/alice/KEY/k1");
         assert!(ctx.authorizes(&n("/home/bob/alice/doc"), &key));
         assert!(ctx.authorizes(&n("/home/bob/alice/sub/deep/doc"), &key));
@@ -606,7 +606,7 @@ mod tests {
 
     #[test]
     fn accept_all_ignores_floor() {
-        let ctx = TrustContext::accept_all(n("/home/bob"));
+        let ctx = SignedTrustContext::accept_all(n("/home/bob"));
         let key = n("/home/bob/alice/KEY/k1");
         assert!(ctx.authorizes(&n("/home/bob/charlie/doc"), &key));
     }
@@ -618,7 +618,7 @@ mod tests {
             data_pattern: NamePattern(vec![PatternComponent::MultiCapture("_".into())]),
             key_pattern: NamePattern(vec![PatternComponent::MultiCapture("_".into())]),
         });
-        let ctx = TrustContext::ambient(schema, Arc::new(DashMap::new()));
+        let ctx = SignedTrustContext::ambient(schema, Arc::new(DashMap::new()));
         assert!(!ctx.enforces_hierarchy());
         assert!(ctx.authorizes(&n("/anything/at/all"), &n("/totally/unrelated/KEY/k")));
     }

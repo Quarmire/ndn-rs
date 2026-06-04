@@ -9,7 +9,7 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use ndn_cert::{BootstrapTicket, TokenStore, ValidityMode, adopt_with_tofu, init_hub};
 use ndn_packet::Name;
-use ndn_security::{SecurityManager, TrustContext, TrustSchema, Validator};
+use ndn_security::{SecurityManager, SignedTrustContext, TrustSchema, Validator};
 
 fn n(s: &str) -> Name {
     s.parse().unwrap()
@@ -38,7 +38,7 @@ fn ctx16_clockless_monotonic_version_and_single_use() {
     // …so it relies on monotonic context version (no clock involved).
     let v = validator();
     let mk = |ver: u64| {
-        let c = TrustContext::hierarchical(n("/home/bob")).with_version(ver);
+        let c = SignedTrustContext::hierarchical(n("/home/bob")).with_version(ver);
         Arc::new(c)
     };
     assert!(v.adopt_context(mk(2)), "v2 adopted");
@@ -62,7 +62,7 @@ fn ctx16_hub_init_roundtrips_through_tofu() {
 
     // Publish + re-fetch the context bytes.
     let content = hub.published_content();
-    let fetched = Arc::new(TrustContext::decode_content(&content, 1).unwrap());
+    let fetched = Arc::new(SignedTrustContext::decode_content(&content, 1).unwrap());
 
     // A fresh node parses the ticket and adopts under TOFU.
     let frag = hub.ticket.to_fragment();

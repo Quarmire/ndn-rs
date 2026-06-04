@@ -9,7 +9,7 @@ use dashmap::DashMap;
 use ndn_packet::encode::DataBuilder;
 use ndn_packet::{Data, Name};
 use ndn_security::{
-    Certificate, SecurityManager, TrustContext, TrustError, TrustSchema, ValidationResult,
+    Certificate, SecurityManager, SignedTrustContext, TrustError, TrustSchema, ValidationResult,
     Validator, dryrun_orphans,
 };
 
@@ -66,7 +66,7 @@ async fn ctx08_schema_loosen_no_retouch() {
 
     // v1: strict — only `/home/bob/admin/**` may be signed (guests excluded).
     let v1 = Arc::new(
-        TrustContext::accept_all(n("/home/bob")) // start permissive base…
+        SignedTrustContext::accept_all(n("/home/bob")) // start permissive base…
             .with_version(1),
     );
     // Tighten v1's schema to admin-only by replacing it.
@@ -91,7 +91,7 @@ async fn ctx08_schema_loosen_no_retouch() {
 
     // v2: loosen — hierarchical floor admits any in-subtree signer. Pull bumps
     // the version; existing /work/* etc. namespaces are untouched.
-    let v2 = Arc::new(TrustContext::hierarchical(n("/home/bob")).with_version(2));
+    let v2 = Arc::new(SignedTrustContext::hierarchical(n("/home/bob")).with_version(2));
     v2.add_anchor(anchor);
     assert!(
         validator.adopt_context(v2),
@@ -126,7 +126,7 @@ fn ctx09_schema_tighten_dryrun_reports_orphans() {
     ];
 
     // Candidate: tighten to admins only.
-    let candidate = TrustContext::hierarchical(n("/home/bob"));
+    let candidate = SignedTrustContext::hierarchical(n("/home/bob"));
     {
         let mut s = TrustSchema::new();
         s.add_rule(
@@ -162,7 +162,7 @@ async fn ctx10_anchor_rotation_bridged() {
 
     // During the window: node holds only the OLD anchor.
     let windowed = validator_over(&mgr);
-    let ctx_window = Arc::new(TrustContext::hierarchical(n("/home/bob")).with_version(1));
+    let ctx_window = Arc::new(SignedTrustContext::hierarchical(n("/home/bob")).with_version(1));
     ctx_window.add_anchor(old_anchor.clone());
     windowed.adopt_context(ctx_window);
     assert!(
@@ -177,7 +177,7 @@ async fn ctx10_anchor_rotation_bridged() {
     // Data still validates because the new root is now the anchor itself.
     let after = validator_over(&mgr);
     let new_anchor_cert = mgr.cert_cache().get(&Arc::new(new_root.clone())).unwrap();
-    let ctx_after = Arc::new(TrustContext::hierarchical(n("/home/bob")).with_version(2));
+    let ctx_after = Arc::new(SignedTrustContext::hierarchical(n("/home/bob")).with_version(2));
     ctx_after.add_anchor(new_anchor_cert);
     after.adopt_context(ctx_after);
     let data2 = sign_with(&mgr, "/home/bob/dev/telemetry", &leaf);
@@ -216,7 +216,7 @@ async fn ctx11_intermediate_compromise_recovery() {
     // Recovered context (v2): same root anchor, old CA revoked.
     let validator = validator_over(&mgr);
     let ctx = Arc::new(
-        TrustContext::hierarchical(n("/home/bob"))
+        SignedTrustContext::hierarchical(n("/home/bob"))
             .with_version(2)
             .with_revocation(old_ca.clone()),
     );

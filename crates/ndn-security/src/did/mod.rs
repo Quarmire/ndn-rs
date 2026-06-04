@@ -48,6 +48,7 @@ pub mod convert;
 pub mod document;
 pub mod encoding;
 pub mod metadata;
+pub mod proof;
 pub mod resolver;
 pub mod url;
 
@@ -64,5 +65,6 @@ pub use metadata::{
     DidDocumentMetadata, DidResolutionError, DidResolutionMetadata, DidResolutionOptions,
     DidResolutionResult,
 };
+pub use proof::{IdentityProof, RecoveryCommitment};
 pub use resolver::{DidError, DidResolver, KeyDidResolver, NdnDidResolver, UniversalResolver};
 pub use url::{DereferencedResource, DidUrl, deref_did_url, deref_did_url_or_document};

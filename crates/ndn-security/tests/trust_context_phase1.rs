@@ -1,4 +1,4 @@
-//! Phase 1 witnesses for the TrustContext keyring model.
+//! Phase 1 witnesses for the SignedTrustContext keyring model.
 //!
 //! Backs `testbed/tests/audit/ctx02a_*.sh` and `ctx02b_*.sh`. See
 //! `.claude/notes/trust-context/trust-context-model-2026-05-25.md` §15–§16.
@@ -16,7 +16,7 @@ use dashmap::DashMap;
 use ndn_packet::encode::DataBuilder;
 use ndn_packet::{Data, Name};
 use ndn_security::{
-    EnrollmentHint, SchemaBlob, SchemaFormat, SecurityManager, TrustContext, TrustSchema,
+    EnrollmentHint, SchemaBlob, SchemaFormat, SecurityManager, SignedTrustContext, TrustSchema,
     ValidationResult, Validator,
 };
 
@@ -71,8 +71,8 @@ fn validator_over(mgr: &SecurityManager) -> Validator {
     )
 }
 
-fn hier_context(namespace: &str, anchor: ndn_security::Certificate) -> Arc<TrustContext> {
-    let ctx = Arc::new(TrustContext::hierarchical(n(namespace)));
+fn hier_context(namespace: &str, anchor: ndn_security::Certificate) -> Arc<SignedTrustContext> {
+    let ctx = Arc::new(SignedTrustContext::hierarchical(n(namespace)));
     ctx.add_anchor(anchor);
     ctx
 }
@@ -204,7 +204,7 @@ async fn ctx02b_skeleton_key_no_sign_outside_subtree() {
     }
 }
 
-// ── Phase 2: TrustContext wire object + versioning ──────────────────────────
+// ── Phase 2: SignedTrustContext wire object + versioning ──────────────────────────
 
 /// CTX.07 (anti-rollback): the keyring refuses a strictly older context
 /// version for the same namespace; a newer or equal version is accepted.
@@ -215,13 +215,13 @@ async fn ctx07_context_version_monotonic() {
     let anchor = make_anchor(&mgr, &root);
 
     let validator = validator_over(&mgr);
-    let v2 = Arc::new(TrustContext::hierarchical(n("/home/bob")).with_version(2));
+    let v2 = Arc::new(SignedTrustContext::hierarchical(n("/home/bob")).with_version(2));
     v2.add_anchor(anchor.clone());
     assert!(validator.adopt_context(v2), "v2 must be adopted");
     assert_eq!(validator.keyring().version_of(&n("/home/bob")), Some(2));
 
     // Rollback to v1 is refused — the held context stays at v2.
-    let v1 = Arc::new(TrustContext::hierarchical(n("/home/bob")).with_version(1));
+    let v1 = Arc::new(SignedTrustContext::hierarchical(n("/home/bob")).with_version(1));
     v1.add_anchor(anchor.clone());
     assert!(
         !validator.adopt_context(v1),
@@ -230,7 +230,7 @@ async fn ctx07_context_version_monotonic() {
     assert_eq!(validator.keyring().version_of(&n("/home/bob")), Some(2));
 
     // A newer version is accepted.
-    let v3 = Arc::new(TrustContext::hierarchical(n("/home/bob")).with_version(3));
+    let v3 = Arc::new(SignedTrustContext::hierarchical(n("/home/bob")).with_version(3));
     v3.add_anchor(anchor);
     assert!(validator.adopt_context(v3), "newer version must be adopted");
     assert_eq!(validator.keyring().version_of(&n("/home/bob")), Some(3));
@@ -279,14 +279,14 @@ async fn ctx13_self_cert_rooted_context_validates() {
 #[test]
 fn ctx17_schema_roundtrips_as_stock_lvs() {
     let lvs = Bytes::from_static(NDND_LVS_MODEL);
-    let ctx = TrustContext::hierarchical(n("/a/blog"))
+    let ctx = SignedTrustContext::hierarchical(n("/a/blog"))
         .with_version(1)
         .with_enrollment_hint(EnrollmentHint::hub_default())
         .with_schema_blob(SchemaBlob::lvs(lvs.clone()))
         .expect("LVS schema imports");
 
     let content = ctx.encode_content();
-    let back = TrustContext::decode_content(&content, 1).expect("context decodes");
+    let back = SignedTrustContext::decode_content(&content, 1).expect("context decodes");
 
     // The runtime schema parsed back as an LVS model (interop preserved)…
     assert!(

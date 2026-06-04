@@ -400,7 +400,7 @@ fn approver_did_setup(
 #[tokio::test]
 async fn ndncert_ca_serve_with_feed_approves() {
     use ndn_cert::challenge::device_approval::DeviceApprovalChallenge;
-    use ndn_identity::{CaApproveFeed, NdnIdentity, NdncertCa, StaticTrustedApprovers};
+    use ndn_identity::{CaApproveFeed, Identity, NdncertCa, StaticTrustedApprovers};
 
     let approver_name = "/lab/alice/devices/phone";
     let (signer, resolver) = approver_did_setup(approver_name);
@@ -427,7 +427,7 @@ async fn ndncert_ca_serve_with_feed_approves() {
     let store = PendingApprovalStore::new();
     let request_id = store.submit("/lab/alice/devices/laptop", "");
 
-    let identity = NdnIdentity::ephemeral("/lab/ca").unwrap();
+    let identity = Identity::ephemeral("/lab/ca").unwrap();
     let ca = NdncertCa::builder()
         .name("/lab/ca")
         .unwrap()

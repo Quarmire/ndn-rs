@@ -6,7 +6,7 @@ use ndn_cert::EnrollmentSession;
 use ndn_packet::{Name, encode::InterestBuilder};
 use ndn_security::{SecurityManager, Signer};
 
-use crate::{error::IdentityError, identity::NdnIdentity};
+use crate::{error::IdentityError, facade::Identity};
 
 #[derive(Debug, Clone)]
 pub enum ChallengeParams {
@@ -77,7 +77,7 @@ pub struct EnrollConfig {
 
 /// Always errors with `Enrollment(...)` — use [`NdncertClient`] for the
 /// connected exchange.
-pub async fn run_enrollment(config: EnrollConfig) -> Result<NdnIdentity, IdentityError> {
+pub async fn run_enrollment(config: EnrollConfig) -> Result<Identity, IdentityError> {
     let manager = SecurityManager::new();
 
     let key_name = manager.generate_ed25519(config.name.clone())?;

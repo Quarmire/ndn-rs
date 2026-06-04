@@ -1,7 +1,7 @@
 //! `TrustContext` — portable identity bundle, decoupled from any one engine.
 //!
 //! The synthesis runtime object (`.claude/notes/trust-context/synthesis-engine-identity-namespaces-2026-05-25.md`
-//! §2). Composes the wire-canonical [`ndn_security::TrustContext`] (anchors,
+//! §2). Composes the wire-canonical [`ndn_security::SignedTrustContext`] (anchors,
 //! schema, version, CA endpoints) with the new identity-side metadata: held
 //! [`IdentityRef`]s, [`AdoptionProvenance`], optional sync namespace, and
 //! preferred publish-side [`ForwardingHint`] names.
@@ -40,7 +40,7 @@ pub enum TrustContextError {
     #[error("schema rejected ({data} ← {key})")]
     SchemaRejected { data: Name, key: Name },
     #[error("wire context error: {0}")]
-    Wire(#[from] ndn_security::TrustContextError),
+    Wire(#[from] ndn_security::SignedTrustContextError),
 }
 
 /// The result of `verify` — either OK with the chain that anchored the data,
@@ -277,7 +277,7 @@ fn pattern_matches(pat: &NamePattern, name: &Name) -> bool {
     i == comps.len()
 }
 
-fn pattern_under(prefix: &Name) -> NamePattern {
+pub(crate) fn pattern_under(prefix: &Name) -> NamePattern {
     use ndn_security::PatternComponent;
     let mut comps: Vec<PatternComponent> = prefix
         .components()
@@ -361,10 +361,8 @@ mod tests {
         ));
 
         // DigestSha256 (integrity, not identity) → Rejected.
-        let digest = Data::decode(
-            DataBuilder::new("/ctx/dev/thing", b"hi").sign_digest_sha256(),
-        )
-        .unwrap();
+        let digest =
+            Data::decode(DataBuilder::new("/ctx/dev/thing", b"hi").sign_digest_sha256()).unwrap();
         assert!(matches!(
             ctx.verify(&digest).await,
             VerificationOutcome::Rejected(_)

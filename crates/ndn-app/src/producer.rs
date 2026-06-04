@@ -13,6 +13,7 @@ use ndn_face_native::local::InProcHandle;
 use ndn_ipc::{ChunkedProducer, ForwarderClient};
 use ndn_packet::encode::DataBuilder;
 use ndn_packet::{Interest, Name};
+use ndn_security::{SignWith, Signer};
 use std::time::Duration;
 
 use crate::AppError;
@@ -29,13 +30,40 @@ const DEFAULT_SEGMENT_SIZE: usize = 8192;
 pub struct Producer {
     conn: Arc<dyn Connection>,
     prefix: Name,
+    signer: Option<Arc<dyn Signer>>,
 }
 
 impl Producer {
     /// Use the `connect` / `from_handle` shortcuts when the connection
     /// shape is fixed.
     pub fn new(conn: Arc<dyn Connection>, prefix: Name) -> Self {
-        Self { conn, prefix }
+        Self {
+            conn,
+            prefix,
+            signer: None,
+        }
+    }
+
+    /// Sign every reply with `signer` — the symmetric safe path. Configure a
+    /// signer once (e.g. `keychain.signer()?`) and
+    /// [`Responder::respond`](crate::Responder::respond) and
+    /// [`publish_object`](Self::publish_object) emit **signed** Data instead of a
+    /// bare `DigestSha256`. Without it the producer is unsigned-by-default
+    /// (integrity only) — fine for forwarding tests, not for authentic content.
+    pub fn with_signer(mut self, signer: Arc<dyn Signer>) -> Self {
+        self.signer = Some(signer);
+        self
+    }
+
+    /// Finish a `Data`: signed with the configured signer, or `DigestSha256` if
+    /// none is set.
+    fn finish_data(&self, builder: DataBuilder) -> Result<Bytes, AppError> {
+        match &self.signer {
+            Some(signer) => builder
+                .sign_with_sync(&**signer)
+                .map_err(|e| AppError::Protocol(e.to_string())),
+            None => Ok(builder.build()),
+        }
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -54,6 +82,7 @@ impl Producer {
         Ok(Self {
             conn: Arc::new(IpcConnection::new(client)),
             prefix,
+            signer: None,
         })
     }
 
@@ -62,6 +91,7 @@ impl Producer {
         Self {
             conn: Arc::new(InProcConnection::new(handle)),
             prefix,
+            signer: None,
         }
     }
 
@@ -84,7 +114,7 @@ impl Producer {
                 Err(_) => continue,
             };
 
-            let responder = Responder::new(Arc::clone(&self.conn), raw);
+            let responder = Responder::new(Arc::clone(&self.conn), raw, self.signer.clone());
             handler(interest, responder).await;
         }
         Ok(())
@@ -140,13 +170,14 @@ impl Producer {
                     c.typ == ndn_packet::tlv_type::KEYWORD && c.value == metadata_keyword.value
                 })
             {
-                let data = DataBuilder::new(
-                    prepared.metadata_data_name.clone(),
-                    &prepared.metadata_content,
-                )
-                .freshness(Duration::from_millis(1000))
-                .final_block_id_typed_seg(0)
-                .build();
+                let data = self.finish_data(
+                    DataBuilder::new(
+                        prepared.metadata_data_name.clone(),
+                        &prepared.metadata_content,
+                    )
+                    .freshness(Duration::from_millis(1000))
+                    .final_block_id_typed_seg(0),
+                )?;
                 self.conn.send(data).await?;
                 continue;
             }
@@ -160,13 +191,13 @@ impl Producer {
                     continue;
                 };
                 let seg_name = prepared.versioned_name.clone().append_segment(seg_idx_u64);
-                let data = if seg_idx_u64 == prepared.last_seg {
+                let builder = if seg_idx_u64 == prepared.last_seg {
                     DataBuilder::new(seg_name, payload.as_ref())
                         .final_block_id_typed_seg(prepared.last_seg)
-                        .build()
                 } else {
-                    DataBuilder::new(seg_name, payload.as_ref()).build()
+                    DataBuilder::new(seg_name, payload.as_ref())
                 };
+                let data = self.finish_data(builder)?;
                 self.conn.send(data).await?;
                 continue;
             }

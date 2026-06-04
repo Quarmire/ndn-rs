@@ -57,7 +57,6 @@ pub use profile::SecurityProfile;
 pub use replay_guard::{KeyFingerprint, ReplayCheck, ReplayGuard};
 pub use safe_data::SafeData;
 pub use sign_ext::SignWith;
-pub use unverified::{Unverified, VerifyError};
 pub use signer::{
     Blake3KeyedSigner, Blake3Signer, EcdsaP256Signer, Ed25519Signer, HmacSha256Signer,
     SIGNATURE_TYPE_DIGEST_BLAKE3_KEYED, SIGNATURE_TYPE_DIGEST_BLAKE3_PLAIN, Signer,
@@ -65,12 +64,13 @@ pub use signer::{
 pub use signing_info::{SignatureInfoOverrides, SignerSelection, SigningInfo};
 pub use trust::{InsecureTrust, LvsTrust, StaticTrust, TrustPolicy};
 pub use trust_context::{
-    EnrollmentHint, SchemaBlob, SchemaFormat, SigningPair, TrustContext, TrustContextError,
+    EnrollmentHint, SchemaBlob, SchemaFormat, SigningPair, SignedTrustContext, SignedTrustContextError,
     dryrun_orphans,
 };
 pub use trust_schema::{
     NamePattern, PatternComponent, PatternParseError, SchemaGate, SchemaRule, TrustSchema,
 };
+pub use unverified::{Unverified, VerifyError};
 pub use validation_policy::{
     AcceptAllPolicy, ChainedPolicy, ConfigChecker, ConfigPolicy, ConfigRule, HierarchicalPolicy,
     LvsPolicy, PolicyVerdict, ValidationPolicy,
@@ -85,7 +85,7 @@ pub use yubikey::{YubikeyKeyStore, YubikeySlot};
 
 pub use did::{
     DereferencedResource, DidController, DidDocument, DidDocumentMetadata, DidError,
-    DidResolutionResult, DidResolver, DidUrl, KeyDidResolver, NdnDidResolver, Service,
-    ServiceEndpoint, UniversalResolver, VerificationMethod, VerificationRef, cert_to_did_document,
-    deref_did_url, did_to_name, name_to_did,
+    DidResolutionResult, DidResolver, DidUrl, IdentityProof, KeyDidResolver, NdnDidResolver,
+    RecoveryCommitment, Service, ServiceEndpoint, UniversalResolver, VerificationMethod,
+    VerificationRef, cert_to_did_document, deref_did_url, did_to_name, name_to_did,
 };

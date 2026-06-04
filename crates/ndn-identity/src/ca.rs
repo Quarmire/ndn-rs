@@ -13,7 +13,7 @@ use ndn_packet::{Name, SignatureType};
 use ndn_security::{SecurityManager, Signer};
 use tracing::{debug, warn};
 
-use crate::{error::IdentityError, identity::NdnIdentity};
+use crate::{error::IdentityError, facade::Identity};
 
 pub struct NdncertCaBuilder {
     prefix: Option<Name>,
@@ -56,7 +56,7 @@ impl NdncertCaBuilder {
         self
     }
 
-    pub fn signing_identity(mut self, identity: &NdnIdentity) -> Self {
+    pub fn signing_identity(mut self, identity: &Identity) -> Self {
         self.identity = Some(identity.manager_arc());
         self
     }

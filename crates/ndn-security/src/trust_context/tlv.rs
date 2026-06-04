@@ -1,4 +1,4 @@
-//! TLV constants for the [`TrustContext`](super::TrustContext) wire object.
+//! TLV constants for the [`SignedTrustContext`](super::SignedTrustContext) wire object.
 //!
 //! Provisional block `0x0410–0x041F` in the app-defined range (`>= 0x0400`),
 //! above `ndn-packet`'s `REFLEXIVE_NAME = 0x0402` with `0x0403–0x040F` as

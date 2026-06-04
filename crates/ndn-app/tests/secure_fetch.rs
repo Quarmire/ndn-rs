@@ -88,3 +88,91 @@ async fn consumer_fetch_verified_yields_safedata() {
     shutdown.shutdown().await;
     let _ = producer_task.await;
 }
+
+/// The rustls-shaped safe path: decide trust once with `verifying(validator)`,
+/// then the short verb `fetch` returns `SafeData` — the obvious call is the safe
+/// one.
+#[tokio::test]
+async fn verifying_consumer_short_verb_returns_safedata() {
+    let producer_kc = KeyChain::ephemeral("/demo/bob").expect("keychain");
+    let signer = producer_kc.signer().expect("signer");
+
+    let (consumer_face, consumer_handle) = InProcFace::new(FaceId(1), 64);
+    let (producer_face, producer_handle) = InProcFace::new(FaceId(2), 64);
+    let (engine, shutdown) = EngineBuilder::new(EngineConfig::default())
+        .face(consumer_face)
+        .face(producer_face)
+        .build()
+        .await
+        .expect("engine build");
+    let prefix: Name = "/demo/bob".parse().unwrap();
+    engine.fib().add_nexthop(&prefix, FaceId(2), 0);
+
+    let producer = Producer::from_handle(producer_handle, prefix.clone());
+    let producer_task = tokio::spawn(async move {
+        producer
+            .serve(move |interest, responder| {
+                let name = (*interest.name).clone();
+                let signer = signer.clone();
+                async move {
+                    let wire = DataBuilder::new(name, b"signed")
+                        .sign_with_sync(&*signer)
+                        .expect("sign");
+                    responder.respond_bytes(wire).await.ok();
+                }
+            })
+            .await
+    });
+
+    // Configure the validator once; the short verb is now safe.
+    let mut consumer = Consumer::from_handle(consumer_handle).verifying(producer_kc.validator());
+    let safe = consumer.fetch("/demo/bob/thing").await.expect("verified");
+    assert_eq!(safe.data().content().map(|c| c.to_vec()), Some(b"signed".to_vec()));
+
+    drop(consumer);
+    drop(engine);
+    shutdown.shutdown().await;
+    let _ = producer_task.await;
+}
+
+/// The producer-side mirror: configure a signer once with `with_signer`, then
+/// the closure producer's short verb `respond` emits **signed** Data — no manual
+/// `DataBuilder::sign_with_sync`. The verifying consumer accepts it.
+#[tokio::test]
+async fn signing_producer_short_verb_respond_is_verified() {
+    let producer_kc = KeyChain::ephemeral("/demo/carol").expect("keychain");
+    let signer = producer_kc.signer().expect("signer");
+
+    let (consumer_face, consumer_handle) = InProcFace::new(FaceId(1), 64);
+    let (producer_face, producer_handle) = InProcFace::new(FaceId(2), 64);
+    let (engine, shutdown) = EngineBuilder::new(EngineConfig::default())
+        .face(consumer_face)
+        .face(producer_face)
+        .build()
+        .await
+        .expect("engine build");
+    let prefix: Name = "/demo/carol".parse().unwrap();
+    engine.fib().add_nexthop(&prefix, FaceId(2), 0);
+
+    // Signer configured once; `respond` signs from here on.
+    let producer = Producer::from_handle(producer_handle, prefix.clone()).with_signer(signer);
+    let producer_task = tokio::spawn(async move {
+        producer
+            .serve(|interest, responder| {
+                let name = (*interest.name).clone();
+                async move {
+                    responder.respond(name, b"dynamic".to_vec()).await.ok();
+                }
+            })
+            .await
+    });
+
+    let mut consumer = Consumer::from_handle(consumer_handle).verifying(producer_kc.validator());
+    let safe = consumer.fetch("/demo/carol/thing").await.expect("verified");
+    assert_eq!(safe.data().content().map(|c| c.to_vec()), Some(b"dynamic".to_vec()));
+
+    drop(consumer);
+    drop(engine);
+    shutdown.shutdown().await;
+    let _ = producer_task.await;
+}

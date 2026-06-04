@@ -11,7 +11,7 @@ use ndn_cert::{AdvertConfig, AnchorAdvert, BootstrapTicket, adopt_with_tofu};
 use ndn_packet::encode::DataBuilder;
 use ndn_packet::{Data, Name};
 use ndn_security::{
-    Certificate, SecurityManager, TrustContext, TrustSchema, ValidationResult, Validator,
+    Certificate, SecurityManager, SignedTrustContext, TrustSchema, ValidationResult, Validator,
 };
 
 fn n(s: &str) -> Name {
@@ -37,7 +37,7 @@ fn build_hub(namespace: &str) -> Hub {
         .unwrap();
     let anchor = mgr.issue_self_signed(&anchor_key, pk, u64::MAX).unwrap();
 
-    let ctx = TrustContext::hierarchical(n(namespace)).with_version(1);
+    let ctx = SignedTrustContext::hierarchical(n(namespace)).with_version(1);
     ctx.add_anchor(anchor.clone());
     let published = ctx.encode_content();
 
@@ -63,7 +63,7 @@ fn fresh_node() -> Validator {
 
 /// Make the consumer's cert cache see the context's anchors (a real fetch
 /// would carry them in the context Data; here we copy them across).
-fn seed_anchors(v: &Validator, ctx: &TrustContext) {
+fn seed_anchors(v: &Validator, ctx: &SignedTrustContext) {
     for r in ctx.anchors().iter() {
         v.cert_cache().insert(r.value().clone());
     }
@@ -83,7 +83,7 @@ async fn ctx01_adopt_to_verify_no_ca() {
     // ── Fresh node ──
     let parsed = BootstrapTicket::from_fragment(&fragment).unwrap();
     // "Fetch" the published context (in a deployment, RDR over a face).
-    let ctx = Arc::new(TrustContext::decode_content(&hub.published, 1).unwrap());
+    let ctx = Arc::new(SignedTrustContext::decode_content(&hub.published, 1).unwrap());
 
     let node = fresh_node();
     seed_anchors(&node, &ctx);
@@ -111,7 +111,7 @@ async fn ctx01_adopt_to_verify_no_ca() {
 #[test]
 fn ctx14_advert_hides_namespace_off_by_default() {
     let hub = build_hub("/home/bob");
-    let ctx = TrustContext::hierarchical(n("/home/bob"));
+    let ctx = SignedTrustContext::hierarchical(n("/home/bob"));
     ctx.add_anchor(hub.anchor.clone());
 
     let advert = AnchorAdvert::from_context(&ctx).expect("advert from anchored context");
@@ -154,7 +154,7 @@ fn ctx15_flooded_fake_advert_rejected() {
     let evil_anchor = attacker
         .issue_self_signed(&evil_key, evil_pk, u64::MAX)
         .unwrap();
-    let evil_ctx = Arc::new(TrustContext::hierarchical(n("/home/bob")));
+    let evil_ctx = Arc::new(SignedTrustContext::hierarchical(n("/home/bob")));
     evil_ctx.add_anchor(evil_anchor);
 
     let node = fresh_node();
@@ -173,7 +173,7 @@ fn ctx15_flooded_fake_advert_rejected() {
     );
 
     // The genuine context (matching fingerprint) is still adoptable.
-    let good = Arc::new(TrustContext::decode_content(&hub.published, 1).unwrap());
+    let good = Arc::new(SignedTrustContext::decode_content(&hub.published, 1).unwrap());
     assert!(adopt_with_tofu(node.keyring(), good, &trusted));
     assert_eq!(node.keyring().len(), 1);
 }

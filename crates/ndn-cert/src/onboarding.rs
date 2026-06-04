@@ -3,7 +3,7 @@
 //! privacy-preserving link-local [`AnchorAdvert`].
 //!
 //! A node does not "join a network" — it *adopts* an anchor-rooted
-//! [`TrustContext`]. The one irreducible bit a face cannot give for free is
+//! [`SignedTrustContext`]. The one irreducible bit a face cannot give for free is
 //! **root authenticity**. A [`BootstrapTicket`] (a QR / deep-link fragment,
 //! *not* an NDN wire packet) carries that bit: the namespace, the root
 //! anchor's **fingerprint** (a public hash, not a secret), an optional
@@ -17,7 +17,7 @@ use std::sync::Arc;
 use base64::Engine as _;
 use bytes::Bytes;
 use ndn_packet::{Name, NameComponent};
-use ndn_security::{Certificate, Keyring, TrustContext};
+use ndn_security::{Certificate, Keyring, SignedTrustContext};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -147,7 +147,7 @@ impl BootstrapTicket {
 /// Returns `true` if adopted.
 pub fn adopt_with_tofu(
     keyring: &Keyring,
-    ctx: Arc<TrustContext>,
+    ctx: Arc<SignedTrustContext>,
     ticket: &BootstrapTicket,
 ) -> bool {
     let Some(expected) = ticket.fingerprint() else {
@@ -192,7 +192,7 @@ pub struct AnchorAdvert {
 impl AnchorAdvert {
     /// Build an advert from a context's first anchor. Returns `None` for an
     /// anchorless context.
-    pub fn from_context(ctx: &TrustContext) -> Option<Self> {
+    pub fn from_context(ctx: &SignedTrustContext) -> Option<Self> {
         ctx.anchors().iter().next().map(|r| Self {
             fingerprint: anchor_fingerprint(r.value()),
         })

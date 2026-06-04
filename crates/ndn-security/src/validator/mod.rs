@@ -9,7 +9,7 @@ use ndn_packet::{Data, Interest, Name};
 use crate::cert_cache::Certificate;
 use crate::cert_fetcher::CertFetcher;
 use crate::keyring::Keyring;
-use crate::trust_context::TrustContext;
+use crate::trust_context::SignedTrustContext;
 use crate::trust_schema::SchemaRule;
 use crate::verifier::verify_by_sig_type;
 use crate::{CertCache, SafeData, TrustError, TrustSchema, VerifyOutcome};
@@ -85,7 +85,7 @@ pub enum InterestValidationOutcome {
 /// Validates Data packets against a [`Keyring`] of trust contexts and a
 /// certificate chain.
 ///
-/// Each packet is dispatched to the [`TrustContext`] selected by its name's
+/// Each packet is dispatched to the [`SignedTrustContext`] selected by its name's
 /// namespace (longest-prefix match); the packet is validated against *that*
 /// context's schema and anchors only — never "any anchor I hold." The default
 /// policy is deny: validation fails unless the selected context authorizes the
@@ -110,7 +110,7 @@ impl Validator {
     /// Create a validator with a private cert cache (no chain walking). The
     /// `schema` backs the ambient context.
     pub fn new(schema: TrustSchema) -> Self {
-        let ambient = Arc::new(TrustContext::ambient(schema, Arc::new(DashMap::new())));
+        let ambient = Arc::new(SignedTrustContext::ambient(schema, Arc::new(DashMap::new())));
         Self {
             keyring: Arc::new(Keyring::with_ambient(ambient)),
             cert_cache: Arc::new(CertCache::new()),
@@ -132,7 +132,7 @@ impl Validator {
         cert_fetcher: Option<Arc<CertFetcher>>,
         max_chain: usize,
     ) -> Self {
-        let ambient = Arc::new(TrustContext::ambient(schema, trust_anchors));
+        let ambient = Arc::new(SignedTrustContext::ambient(schema, trust_anchors));
         Self {
             keyring: Arc::new(Keyring::with_ambient(ambient)),
             cert_cache,
@@ -166,11 +166,11 @@ impl Validator {
         &self.keyring
     }
 
-    /// Adopt a named [`TrustContext`] into the keyring. Data under its
+    /// Adopt a named [`SignedTrustContext`] into the keyring. Data under its
     /// namespace is thereafter validated against its schema and anchors.
     /// Returns `false` if refused by the keyring's anti-rollback rule (a
     /// strictly older version than one already held).
-    pub fn adopt_context(&self, ctx: Arc<TrustContext>) -> bool {
+    pub fn adopt_context(&self, ctx: Arc<SignedTrustContext>) -> bool {
         self.keyring.adopt(ctx)
     }
 
@@ -196,7 +196,7 @@ impl Validator {
 
     /// Add an anchor to the ambient context (the flat-anchor compatibility
     /// path). Anchors for a *named* namespace belong on that context — see
-    /// [`adopt_context`](Self::adopt_context) / [`TrustContext::add_anchor`].
+    /// [`adopt_context`](Self::adopt_context) / [`SignedTrustContext::add_anchor`].
     pub fn add_trust_anchor(&self, cert: Certificate) -> bool {
         if !cert.is_valid_now() {
             return false;

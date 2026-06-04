@@ -237,11 +237,7 @@ impl FilePib {
     /// certificate is signed *now* with the key itself, so the SafeBag is a
     /// self-contained, verifiable bundle even when the PIB only kept the
     /// compact NDNC cert summary.
-    pub fn export_safebag(
-        &self,
-        key_name: &Name,
-        passphrase: &[u8],
-    ) -> Result<Vec<u8>, PibError> {
+    pub fn export_safebag(&self, key_name: &Name, passphrase: &[u8]) -> Result<Vec<u8>, PibError> {
         use ndn_safebag::SafeBag;
         let pkcs8 = self.export_pkcs8(key_name)?;
         let signer = self.get_signer(key_name)?;

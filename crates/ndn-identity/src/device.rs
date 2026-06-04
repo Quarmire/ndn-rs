@@ -8,7 +8,7 @@ use ndn_security::{KeyChain, SecurityManager};
 use crate::{
     enroll::{ChallengeParams, NdncertClient},
     error::IdentityError,
-    identity::NdnIdentity,
+    facade::Identity,
     renewal::start_renewal,
 };
 
@@ -50,7 +50,7 @@ pub struct DeviceConfig {
     pub delegate: Vec<Name>,
 }
 
-pub async fn run_provisioning(config: DeviceConfig) -> Result<NdnIdentity, IdentityError> {
+pub async fn run_provisioning(config: DeviceConfig) -> Result<Identity, IdentityError> {
     let ca_prefix = config
         .ca_prefix
         .clone()
@@ -107,7 +107,7 @@ pub async fn run_provisioning(config: DeviceConfig) -> Result<NdnIdentity, Ident
     };
 
     let keychain = KeyChain::from_parts(manager, config.namespace.clone(), key_name);
-    Ok(NdnIdentity::from_keychain(keychain, renewal))
+    Ok(Identity::from_keychain(keychain, renewal))
 }
 
 fn build_challenge(credential: &FactoryCredential, _key_name: &Name) -> ChallengeParams {

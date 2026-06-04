@@ -1,4 +1,4 @@
-//! [`Keyring`] — the set of [`TrustContext`]s a node holds.
+//! [`Keyring`] — the set of [`SignedTrustContext`]s a node holds.
 //!
 //! Adopting a context is additive and orthogonal: a node may hold
 //! `/home/bob`, `/work/acme`, and `/transit/city` at once, validating data
@@ -13,7 +13,7 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use ndn_packet::Name;
 
-use crate::trust_context::TrustContext;
+use crate::trust_context::SignedTrustContext;
 
 /// A node's set of adopted trust contexts plus an ambient fallback context.
 ///
@@ -23,12 +23,12 @@ use crate::trust_context::TrustContext;
 /// longest-prefix match.
 #[derive(Debug)]
 pub struct Keyring {
-    contexts: DashMap<Name, Arc<TrustContext>>,
-    ambient: Arc<TrustContext>,
+    contexts: DashMap<Name, Arc<SignedTrustContext>>,
+    ambient: Arc<SignedTrustContext>,
 }
 
 impl Keyring {
-    pub(crate) fn with_ambient(ambient: Arc<TrustContext>) -> Self {
+    pub(crate) fn with_ambient(ambient: Arc<SignedTrustContext>) -> Self {
         Self {
             contexts: DashMap::new(),
             ambient,
@@ -37,7 +37,7 @@ impl Keyring {
 
     /// The ambient (root-namespace) context — the validation target for names
     /// not covered by any adopted context.
-    pub fn ambient(&self) -> &Arc<TrustContext> {
+    pub fn ambient(&self) -> &Arc<SignedTrustContext> {
         &self.ambient
     }
 
@@ -47,7 +47,7 @@ impl Keyring {
     /// version currently held for the same namespace (a strictly older version
     /// is refused, so an attacker cannot serve a stale context to re-introduce
     /// a weakened schema or a revoked anchor). Returns `true` if adopted.
-    pub fn adopt(&self, ctx: Arc<TrustContext>) -> bool {
+    pub fn adopt(&self, ctx: Arc<SignedTrustContext>) -> bool {
         let ns = ctx.namespace().clone();
         if let Some(existing) = self.contexts.get(&ns)
             && ctx.version() < existing.version()
@@ -69,7 +69,7 @@ impl Keyring {
     }
 
     /// All adopted (non-ambient) contexts.
-    pub fn contexts(&self) -> Vec<Arc<TrustContext>> {
+    pub fn contexts(&self) -> Vec<Arc<SignedTrustContext>> {
         self.contexts
             .iter()
             .map(|r| Arc::clone(r.value()))
@@ -87,8 +87,8 @@ impl Keyring {
 
     /// Select the context governing `name`: the adopted context whose
     /// namespace is the longest prefix of `name`, else the ambient context.
-    pub fn context_for(&self, name: &Name) -> Arc<TrustContext> {
-        let mut best: Option<Arc<TrustContext>> = None;
+    pub fn context_for(&self, name: &Name) -> Arc<SignedTrustContext> {
+        let mut best: Option<Arc<SignedTrustContext>> = None;
         let mut best_len = 0usize;
         for r in self.contexts.iter() {
             let ns = r.key();
@@ -119,7 +119,7 @@ mod tests {
     }
 
     fn keyring() -> Keyring {
-        let ambient = Arc::new(TrustContext::accept_all(Name::root()));
+        let ambient = Arc::new(SignedTrustContext::accept_all(Name::root()));
         Keyring::with_ambient(ambient)
     }
 
@@ -133,9 +133,9 @@ mod tests {
     #[test]
     fn longest_prefix_match_wins() {
         let kr = keyring();
-        kr.adopt(Arc::new(TrustContext::hierarchical(n("/home"))));
-        kr.adopt(Arc::new(TrustContext::hierarchical(n("/home/bob"))));
-        kr.adopt(Arc::new(TrustContext::hierarchical(n("/work/acme"))));
+        kr.adopt(Arc::new(SignedTrustContext::hierarchical(n("/home"))));
+        kr.adopt(Arc::new(SignedTrustContext::hierarchical(n("/home/bob"))));
+        kr.adopt(Arc::new(SignedTrustContext::hierarchical(n("/work/acme"))));
 
         assert_eq!(
             kr.context_for(&n("/home/bob/doc")).namespace(),
@@ -156,7 +156,7 @@ mod tests {
     #[test]
     fn forget_removes_context() {
         let kr = keyring();
-        kr.adopt(Arc::new(TrustContext::hierarchical(n("/home/bob"))));
+        kr.adopt(Arc::new(SignedTrustContext::hierarchical(n("/home/bob"))));
         assert_eq!(kr.len(), 1);
         assert!(kr.forget(&n("/home/bob")));
         assert!(kr.is_empty());

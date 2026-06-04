@@ -1,0 +1,15 @@
+[package]
+name = "example-secure-fetch"
+version = "0.0.0"
+edition.workspace = true
+publish = false
+
+[dependencies]
+ndn-packet      = { workspace = true, features = ["std"] }
+ndn-security    = { workspace = true }
+ndn-transport   = { workspace = true }
+ndn-engine      = { workspace = true }
+ndn-face-native = { workspace = true }
+ndn-app         = { workspace = true }
+tokio           = { workspace = true, features = ["rt-multi-thread", "macros"] }
+anyhow          = { workspace = true }

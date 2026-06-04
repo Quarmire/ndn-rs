@@ -11,9 +11,12 @@
 //! ```no_run
 //! use ndn::prelude::*;
 //!
-//! # async fn run() -> Result<(), ndn::AppError> {
-//! let mut consumer = Consumer::connect("/run/nfd/nfd.sock").await?;
-//! let data = consumer.fetch("/example/data").await?;
+//! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+//! let keychain = KeyChain::ephemeral("/example")?;
+//! // Decide trust once with `verifying`; then `fetch` returns `SafeData` —
+//! // proof the signature checked out. (Bare `Consumer::fetch` is unverified.)
+//! let mut consumer = Consumer::connect("/run/nfd/nfd.sock").await?.verifying(keychain.validator());
+//! let safe = consumer.fetch("/example/data").await?;
 //! # Ok(()) }
 //! ```
 //!
@@ -28,19 +31,24 @@ pub use ndn_packet::encode::{DataBuilder, InterestBuilder};
 pub use ndn_packet::{Data, Interest, NackReason, Name, NameComponent};
 
 pub use ndn_security::{
-    AcceptAllPolicy, HierarchicalPolicy, InsecureTrust, LvsTrust, SignerSelection, SigningInfo,
-    StaticTrust, TrustPolicy, ValidationPolicy,
+    AcceptAllPolicy, HierarchicalPolicy, InsecureTrust, LvsTrust, SafeData, SignerSelection,
+    SigningInfo, StaticTrust, TrustPolicy, Unverified, ValidationPolicy, Validator,
 };
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use ndn_app::{
     AppError, Connection, Consumer, InProcConnection, IpcConnection, KeyChain, Producer, Query,
-    Queryable, Responder, Sample, Subscriber, SubscriberConfig,
+    Queryable, Responder, Sample, Subscriber, SubscriberConfig, VerifiedConsumer,
 };
 
 pub mod prelude {
     pub use crate::{Data, DataBuilder, Interest, InterestBuilder, Name};
+    // The safe-fetch types, so `verifying(...).fetch()` and `SafeData` are in
+    // reach without a separate `use ndn_security::...`.
+    pub use crate::{SafeData, Unverified, Validator};
 
     #[cfg(not(target_arch = "wasm32"))]
-    pub use crate::{AppError, Consumer, KeyChain, Producer, Query, Queryable, Subscriber};
+    pub use crate::{
+        AppError, Consumer, KeyChain, Producer, Query, Queryable, Subscriber, VerifiedConsumer,
+    };
 }

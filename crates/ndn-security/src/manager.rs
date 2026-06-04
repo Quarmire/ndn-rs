@@ -10,7 +10,7 @@ use crate::{
     key_store::MemKeyStore,
     keyring::Keyring,
     signer::{Ed25519Signer, Signer},
-    trust_context::TrustContext,
+    trust_context::SignedTrustContext,
 };
 
 /// Owns a key store, certificate cache, and a [`Keyring`] of trust contexts,
@@ -33,8 +33,8 @@ impl SecurityManager {
         // Ambient context starts with an empty (reject-all) schema and no
         // hierarchy floor; the engine sets the operative schema when it wires
         // this keyring into a validator. No warning is emitted (this is the
-        // dedicated ambient path, not `TrustContext::accept_all`).
-        let ambient = Arc::new(TrustContext::ambient(
+        // dedicated ambient path, not `SignedTrustContext::accept_all`).
+        let ambient = Arc::new(SignedTrustContext::ambient(
             TrustSchema::new(),
             Arc::new(dashmap::DashMap::new()),
         ));
