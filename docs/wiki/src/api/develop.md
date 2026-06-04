@@ -63,37 +63,43 @@ println!("got {} bytes", data.content().len());
 
 ```rust,ignore
 use ndn::prelude::*;
-use ndn::{KeyChain, Producer};
 
-# async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-let keychain = KeyChain::open_default().await?;
-let mut producer = Producer::connect("/tmp/ndn-fwd.sock", keychain).await?;
-producer.publish_object("/example/hello", b"hi".to_vec()).await?;
+# async fn run() -> Result<(), Box<dyn std::error::Error>> {
+let keychain = KeyChain::ephemeral("/example")?;
+// connect registers the prefix; with_signer makes published Data signed.
+let producer = Producer::connect("/tmp/ndn-fwd.sock", "/example")
+    .await?
+    .with_signer(keychain.signer()?);
+producer
+    .publish_object("/example/hello".parse()?, b"hi".to_vec().into(), 0)
+    .await?;
 # Ok(()) }
 ```
 
-- `publish_object(name, bytes)` signs and segments the object,
-  registers the prefix, and serves segments on demand.
-- The signing identity comes from the `KeyChain`'s default unless
-  the producer is configured with an explicit `SigningInfo`.
-- Re-publishing the same name replaces the served content; the
-  forwarder's cache is invalidated through `FreshnessPeriod`.
+- `publish_object(name, content, chunk_size)` segments and serves the
+  object — **signing** each segment with the configured signer, else
+  `DigestSha256`. `chunk_size == 0` uses the default.
+- `connect(socket, prefix)` registers the prefix; re-publishing the
+  same name replaces the content (`FreshnessPeriod` governs the cache).
 
 ## Responder
 
-A `Responder` is a closure-style producer. Use it when each Interest
-needs a dynamic reply rather than pre-published bytes.
+A `Responder` is the reply handle passed to `Producer::serve` — a
+closure-style producer for when each Interest needs a dynamic reply.
+With a signer configured, `respond` signs the reply.
 
 ```rust,ignore
 use ndn::prelude::*;
-use ndn::{KeyChain, Responder};
 
-# async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-let keychain = KeyChain::open_default().await?;
-let mut responder = Responder::connect("/tmp/ndn-fwd.sock", keychain).await?;
-
-responder.serve("/example/time", |_interest| async {
-    Ok(format!("{:?}", std::time::SystemTime::now()).into_bytes())
+# async fn run() -> Result<(), Box<dyn std::error::Error>> {
+let keychain = KeyChain::ephemeral("/example")?;
+let producer = Producer::connect("/tmp/ndn-fwd.sock", "/example/time")
+    .await?
+    .with_signer(keychain.signer()?);
+producer.serve(|interest, responder| async move {
+    let now = format!("{:?}", std::time::SystemTime::now());
+    // `respond` signs with the configured signer.
+    responder.respond((*interest.name).clone(), now.into_bytes()).await.ok();
 }).await?;
 # Ok(()) }
 ```
@@ -106,15 +112,12 @@ total order and yields `Sample` items.
 
 ```rust,ignore
 use ndn::prelude::*;
-use ndn::{Subscriber, SubscriberConfig};
+use ndn::Subscriber;
 
 # async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-let mut sub = Subscriber::connect(
-    "/tmp/ndn-fwd.sock",
-    SubscriberConfig::new("/svs/chatroom"),
-).await?;
-while let Some(sample) = sub.next().await {
-    println!("{}: {:?}", sample.publisher(), sample.content());
+let mut sub = Subscriber::connect("/tmp/ndn-fwd.sock", "/svs/chatroom").await?;
+while let Some(sample) = sub.recv().await {
+    println!("{}: {:?}", sample.publisher, sample.payload);
 }
 # Ok(()) }
 ```
@@ -160,16 +163,13 @@ embedding it is an Extend-tier or test-time concern.
 
 ```rust,ignore
 use ndn::prelude::*;
-use ndn::{KeyChain, SigningInfo};
 
-# async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-let mut keychain = KeyChain::open_default().await?;
-let identity = keychain.create_identity("/alice").await?;
-let _cert = identity.self_signed_cert();
-
-let info = SigningInfo::by_identity("/alice");
-let mut data = DataBuilder::new("/alice/notes/1").content(b"hi");
-keychain.sign(&mut data, &info).await?;
+# fn run() -> Result<(), Box<dyn std::error::Error>> {
+// A KeyChain is one identity; `ephemeral` / `open_or_create` generate its key
+// and self-signed cert.
+let keychain = KeyChain::ephemeral("/alice")?;
+// Sign a Data with that key → ready-to-send wire bytes.
+let wire = keychain.sign_data(DataBuilder::new("/alice/notes/1", b"hi"))?;
 # Ok(()) }
 ```
 

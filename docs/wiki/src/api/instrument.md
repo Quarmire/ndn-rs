@@ -64,17 +64,36 @@ use ndn_face_native::callback::TapFace;
 use ndn_engine::{EngineBuilder, EngineConfig};
 use ndn_transport::FaceId;
 
+# async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 let tap = TapFace::new(FaceId(99));
-let captured = tap.captured(); // Arc<Mutex<Vec<Bytes>>>
+// `.face()` consumes the transport, so grab a shared handle to the
+// capture buffer first:
+let buf = tap.capture_handle(); // Arc<Mutex<Vec<Bytes>>>
 let (_engine, _shutdown) = EngineBuilder::new(EngineConfig::default())
     .face(tap)
     .build()
     .await?;
 
-// Drive traffic, then read every wire packet the engine routed to FaceId(99):
-for bytes in captured.lock().unwrap().iter() {
+// Drive traffic, then read every wire packet the engine routed to FaceId(99).
+// The handle's `Mutex` is `tokio::sync::Mutex`, so the lock is `.await`ed:
+for bytes in buf.lock().await.iter() {
     // parse / inspect / log
 }
+# Ok(()) }
+```
+
+When the tap is not handed to the builder, drain the buffer in one
+shot with the async `captured()` method, which returns `Vec<Bytes>`
+and clears the tap:
+
+```rust,ignore
+# use ndn_face_native::callback::TapFace;
+# use ndn_transport::FaceId;
+# async fn run() {
+let tap = TapFace::new(FaceId(99));
+// ... drive traffic ...
+let packets: Vec<bytes::Bytes> = tap.captured().await;
+# }
 ```
 
 `TapFace` does not participate in forwarding: the engine sends to
@@ -89,46 +108,91 @@ With the feature enabled, the engine exposes its tables:
 
 ```rust,ignore
 use ndn_engine::{EngineBuilder, EngineConfig};
+use ndn_store::pit::{PitKeyDiscriminator, PitToken};
 # async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 let (engine, _shutdown) = EngineBuilder::new(EngineConfig::default())
     .build()
     .await?;
 
-// Snapshot of pit state at this instant:
-for entry in engine.pit().iter() {
-    println!("{} pending: {} in-records", entry.name(), entry.in_records().len());
+// FIB inspection. `dump()` returns a `Vec<(Name, Arc<FibEntry>)>`
+// snapshot of every installed prefix; `nexthops` is a field on
+// `FibEntry`, each carrying a `face_id` and a `cost`:
+for (name, entry) in engine.fib().dump() {
+    let faces: Vec<_> = entry.nexthops.iter().map(|n| n.face_id).collect();
+    println!("{name} -> {faces:?}");
 }
 
-// FIB inspection:
-for entry in engine.fib().iter() {
-    println!("{} -> {:?}", entry.name(), entry.nexthops());
-}
+// PIT inspection. The PIT is a sharded `DashMap` keyed by `PitToken`,
+// so there is no global iterator on the hot path. Read live size with
+// `len()`, and inspect a known name under a closure with
+// `with_named_entry` (which holds the shard lock for the call):
+println!("pending interests: {}", engine.pit().len());
+
+let name: ndn_packet::Name = "/probe".parse()?;
+engine.pit().with_named_entry(
+    &name,
+    PitKeyDiscriminator::Classical,
+    |entry| {
+        println!(
+            "{} has {} in-records",
+            entry.name,
+            entry.in_records.len(),
+        );
+    },
+);
 # Ok(()) }
 ```
 
-These accessors return read-only views by default. Mutating PIT
-state (e.g. injecting fake in-records) is filed for v0.1.x.
+These accessors expose live tables. The PIT closures
+(`with_entry`, `with_entry_mut`, `with_named_entry`) hold the
+relevant shard lock for the duration of the call, so keep the body
+short. Mutating PIT state for injection experiments (e.g. fabricating
+in-records) is filed for v0.1.x.
 
 ## CallbackFace
 
-`CallbackFace` builds a face whose send-path runs a Rust closure
-and whose recv-path is fed from outside. Use it to splice an
-external test harness into the engine's pipeline.
+`CallbackFace` builds a virtual face whose send-path runs an
+application callback: the engine routes an `Interest` to it, the
+callback returns `Some(Data)` to satisfy it or `None` to emit a
+`NoRoute` Nack. Use it when a function can directly produce `Data`
+for any name.
+
+The callback is async — it returns a
+`BoxFuture<'static, Option<Data>>`:
 
 ```rust,ignore
 use ndn_face_native::callback::CallbackFace;
+use ndn_packet::{Data, Interest};
 use ndn_transport::FaceId;
 
-let face = CallbackFace::new(FaceId(7), |bytes| {
-    println!("engine sent {} bytes", bytes.len());
+let face = CallbackFace::new(FaceId(7), |interest: Interest| {
+    Box::pin(async move {
+        // ... look up / synthesize Data for `interest.name` ...
+        None::<Data>
+    })
 });
-// face.feed(bytes) drives the recv path.
+```
+
+When the lookup is synchronous, `CallbackFace::from_fn` takes a
+plain `Fn(Interest) -> Option<Data>` and wraps it for you:
+
+```rust,ignore
+# use ndn_face_native::callback::CallbackFace;
+# use ndn_packet::{Data, Interest};
+# use ndn_transport::FaceId;
+let face = CallbackFace::from_fn(FaceId(7), |_interest: Interest| {
+    None::<Data>
+});
 ```
 
 ## Two-engine experiments
 
-A common Instrument-tier pattern is wiring two engines through a
-pair of in-process faces:
+A common Instrument-tier pattern is wiring two engines through
+in-process faces. `InProcFace::new(id, buffer)` returns a linked
+`(InProcFace, InProcHandle)`: the engine holds the face, and the
+handle drives the recv/send channels from the other side. (Use
+`InProcFace::new_kind` to stamp a non-default `FaceKind` on the
+engine side.)
 
 ```rust,ignore
 use ndn_face_native::local::InProcFace;
@@ -136,11 +200,18 @@ use ndn_engine::{EngineBuilder, EngineConfig};
 use ndn_transport::FaceId;
 
 # async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+// Each engine gets its own InProcFace; the test harness owns both
+// handles and shuttles wire bytes between them.
 let (face_a, handle_a) = InProcFace::new(FaceId(1), 64);
-let (face_b, _handle_b) = InProcFace::pair_with(&handle_a, FaceId(2), 64);
+let (face_b, handle_b) = InProcFace::new(FaceId(2), 64);
 
 let (_engine_a, _s_a) = EngineBuilder::new(EngineConfig::default()).face(face_a).build().await?;
 let (_engine_b, _s_b) = EngineBuilder::new(EngineConfig::default()).face(face_b).build().await?;
+
+// Forward whatever engine A emits into engine B (and vice-versa):
+while let Some(bytes) = handle_a.recv().await {
+    handle_b.send(bytes).await.ok();
+}
 # Ok(()) }
 ```
 

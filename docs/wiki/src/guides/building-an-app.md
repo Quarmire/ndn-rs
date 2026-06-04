@@ -25,55 +25,58 @@ Run a forwarder in another terminal (see
 use ndn::prelude::*;
 use ndn::KeyChain;
 
-# async fn run() -> anyhow::Result<()> {
-let mut keychain = KeyChain::open_default().await?;
-if keychain.identity("/alice").await.is_none() {
-    let id = keychain.create_identity("/alice").await?;
-    println!("created identity {}", id.name());
-}
+# fn run() -> anyhow::Result<()> {
+// Generates the key + self-signed cert for `/alice` on first run; reloads it
+// from the file-backed PIB on every run after.
+let keychain = KeyChain::open_or_create("/var/lib/ndn/pib".as_ref(), "/alice")?;
+println!("identity {}", keychain.name());
 # Ok(()) }
 ```
 
-Idempotent: rerunning the program reuses the existing identity from
-the PIB.
+Idempotent: a `KeyChain` *is* one identity, and `open_or_create` reuses the
+existing key from the PIB on reruns. (For a throwaway in-memory identity, use
+`KeyChain::ephemeral("/alice")`.)
 
 ## Step 2 — Publish a static note
 
 ```rust,ignore
 use ndn::prelude::*;
-use ndn::{KeyChain, Producer};
 
 # async fn publish(keychain: KeyChain) -> anyhow::Result<()> {
-let mut producer = Producer::connect("/tmp/ndn-fwd.sock", keychain).await?;
-producer.publish_object(
-    "/alice/notes/2026-05-20/v=1",
-    b"buy milk".to_vec(),
-).await?;
+let producer = Producer::connect("/tmp/ndn-fwd.sock", "/alice/notes")
+    .await?
+    .with_signer(keychain.signer()?);
+producer
+    .publish_object("/alice/notes/2026-05-20/v=1".parse()?, b"buy milk".to_vec().into(), 0)
+    .await?;
 # Ok(()) }
 ```
 
-`publish_object` signs the note with `/alice`'s default key,
-registers the prefix `/alice/notes` (the first two name components,
-the application name) with the forwarder, and serves the object on
+`connect` registers the prefix `/alice/notes`; `with_signer` makes
+`publish_object` **sign** each segment with `/alice`'s key (without it,
+the object would be `DigestSha256` only). The object is served on
 demand.
 
 ## Step 3 — Serve dynamic notes with `Responder`
 
-A `Responder` answers each Interest with a freshly-built `Data`.
-Useful when the content depends on the current time or on the
-Interest's selectors.
+`Producer::serve` answers each Interest with a freshly-built `Data` via
+a `Responder`. Useful when the content depends on the current time or
+the Interest's selectors. With a signer configured, `respond` signs.
 
 ```rust,ignore
 use ndn::prelude::*;
-use ndn::{KeyChain, Responder};
 
 # async fn serve(keychain: KeyChain) -> anyhow::Result<()> {
-let mut responder = Responder::connect("/tmp/ndn-fwd.sock", keychain).await?;
-responder.serve("/alice/clock", |_interest| async {
+let producer = Producer::connect("/tmp/ndn-fwd.sock", "/alice/clock")
+    .await?
+    .with_signer(keychain.signer()?);
+producer.serve(|interest, responder| async move {
     let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_secs();
-    Ok::<_, anyhow::Error>(format!("{now}").into_bytes())
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // `respond` signs the reply with the configured signer.
+    responder.respond((*interest.name).clone(), format!("{now}").into_bytes()).await.ok();
 }).await?;
 tokio::signal::ctrl_c().await?;
 # Ok(()) }
@@ -113,15 +116,12 @@ If `/alice` is one publisher in a multi-publisher feed, use
 
 ```rust,ignore
 use ndn::prelude::*;
-use ndn::{Subscriber, SubscriberConfig};
+use ndn::Subscriber;
 
 # async fn sub() -> anyhow::Result<()> {
-let mut sub = Subscriber::connect(
-    "/tmp/ndn-fwd.sock",
-    SubscriberConfig::new("/team/notes"),
-).await?;
-while let Some(sample) = sub.next().await {
-    println!("{}: {} bytes", sample.publisher(), sample.content().len());
+let mut sub = Subscriber::connect("/tmp/ndn-fwd.sock", "/team/notes").await?;
+while let Some(sample) = sub.recv().await {
+    println!("{}: {:?}", sample.publisher, sample.payload);
 }
 # Ok(()) }
 ```

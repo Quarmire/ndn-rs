@@ -1,178 +1,200 @@
 # Writing a strategy
 
 A forwarding strategy decides which face an Interest goes out on,
-when it retransmits, and how it reacts to NACKs and timeouts. This
+when it retransmits, and how it reacts to Nacks and timeouts. This
 guide walks through writing a third-party strategy, registering it,
 and pinning it under a prefix.
 
 The trait surface is [Extend tier → Strategy](../api/extend.md#strategy);
-the contract lives at `crates/ndn-strategy/src/strategy.rs:7`.
+the contract lives at `crates/ndn-strategy/src/strategy.rs:56`.
 
 ## When to write a strategy
 
 - Your protocol needs a forwarding rule the built-ins don't cover
   (e.g. weighted round-robin, latency-aware, energy-aware).
-- You're researching strategy behaviour and want a measurement
-  fixture under your control.
+- You're researching strategy behaviour and want a measurement fixture.
 - You're building a sandboxed strategy (WASM); see
   `crates/ndn-wasm-strategy/`.
 
 For everything else the built-ins (`BestRouteStrategy`,
 `MulticastStrategy`, `ComposedStrategy`) are usually correct.
 
+## The decision model
+
+A `Strategy` does **not** send Interests or mutate forwarding tables.
+It is a pure decision function: each method reads an immutable
+[`StrategyContext`] and *returns* one or more `ForwardingAction` values
+(`Forward`, `ForwardAfter`, `Nack`, `Suppress`, `Broadcast`) that the
+engine then executes. This keeps strategies side-effect-free and testable
+in isolation. `ForwardingAction` and `NackReason` live in `ndn-transport`
+(re-exported as `ndn_engine::pipeline`).
+
 ## The skeleton
 
 ```rust,ignore
-use ndn_strategy::{Strategy, StrategyContext, register_strategy};
-use ndn_packet::Interest;
+use std::sync::Arc;
+use smallvec::{SmallVec, smallvec};
+use ndn_packet::Name;
+use ndn_transport::{ForwardingAction, NackReason};
+use ndn_strategy::{ErasedStrategy, Strategy, StrategyContext, register_strategy};
 
-pub struct RandomNexthopStrategy;
+type Actions = SmallVec<[ForwardingAction; 2]>;
 
-#[async_trait::async_trait]
-impl Strategy for RandomNexthopStrategy {
-    fn name(&self) -> &'static str { "/strategy/random" }
+// macro args: a `static` ident, short name, behaviour version, and a
+// capture-free builder (the entry lives in a `static`).
+register_strategy!(
+    RANDOM_REG, b"random", 1,
+    || Arc::new(RandomNexthopStrategy::new()) as Arc<dyn ErasedStrategy>,
+);
 
-    async fn after_receive_interest(
-        &self,
-        ctx: &mut StrategyContext<'_>,
-        interest: &Interest,
-    ) {
-        let candidates = ctx.fib_lookup(interest.name());
-        if let Some(face) = candidates.random_nexthop() {
-            ctx.send_interest(face, interest).await;
-        }
-    }
+pub struct RandomNexthopStrategy {
+    name: Name, // /localhost/nfd/strategy/random
+    counter: std::sync::atomic::AtomicU64,
 }
 
-register_strategy!(RandomNexthopStrategy);
+impl Strategy for RandomNexthopStrategy {
+    // `&Name`, not `&'static str` — a strategy name is an NDN name.
+    fn name(&self) -> &Name { &self.name }
+
+    // Synchronous fast path; `Some(_)` short-circuits the async hooks.
+    fn decide(&self, ctx: &StrategyContext) -> Option<Actions> {
+        let nexthops = ctx.fib_entry?.nexthops_excluding(ctx.in_face); // split horizon
+        if nexthops.is_empty() {
+            return Some(smallvec![ForwardingAction::Nack(NackReason::NoRoute)]);
+        }
+        let i = self.counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as usize
+            % nexthops.len();
+        Some(smallvec![ForwardingAction::Forward(smallvec![nexthops[i].face_id])])
+    }
+
+    // Required. Implement the body when a decision must `.await`.
+    async fn after_receive_interest(&self, ctx: &StrategyContext<'_>) -> Actions {
+        self.decide(ctx).unwrap()
+    }
+
+    async fn after_receive_data(&self, _ctx: &StrategyContext<'_>) -> Actions {
+        SmallVec::new() // pipeline forwards Data to PIT in-records
+    }
+}
 ```
 
-`register_strategy!` uses `linkme` to put the strategy in a
-distributed slice. At engine startup the slice is read and each
-registered strategy is available for installation.
+`register_strategy!` collects entries at link time via `linkme` on native
+targets; the engine reads the slice at startup. On `wasm32` it defines a
+`pub static` and external crates call `ndn_strategy::registry::register`
+during engine setup.
 
 ## Methods you can implement
 
 | Method | When called | Default |
 |---|---|---|
-| `name()` | At registration | Required. |
-| `after_receive_interest(ctx, interest)` | Each incoming Interest on the matching prefix | Required. |
-| `after_receive_data(ctx, data, in_face)` | Each incoming Data | Forward to all in-records. |
-| `after_receive_nack(ctx, nack, in_face)` | NACK arrives | Forward NACK to all in-records. |
-| `before_satisfy_pending_interest(ctx, pit_entry, data)` | Just before a PIT entry is satisfied | No-op. |
-| `schedule(at, event)` (default) | Strategy wants to wake up later | Cancellable timer wired into the engine loop. |
+| `name(&self) -> &Name` | Registration / strategy-choice lookup | Required. |
+| `decide(&self, ctx)` | Synchronous fast path, before the async hooks | `None` (fall through). |
+| `after_receive_interest(&self, ctx)` | Each Interest on the matching prefix | Required. |
+| `after_receive_data(&self, ctx)` | Each incoming Data (bookkeeping / egress) | No actions. |
+| `on_interest_timeout(&self, ctx)` | A pending Interest times out | `Suppress`. |
+| `on_nack(&self, ctx, reason)` | A Nack arrives | `Suppress`. |
+| `schedule(&self, ctx, delay, callback)` | Run code later | Cancellable `ScheduledEvent`. |
 
-Full method list and contracts are on the `Strategy` trait docstring.
+Every hook takes `&self` and `&StrategyContext` — never `&mut`, and the
+Interest/Data are read off the context, not passed as arguments. Full
+contracts are on the `Strategy` trait docstring.
 
 ## Pinning under a prefix
 
 A strategy doesn't take over the whole forwarder; it owns a *prefix*.
-Operators pin a strategy under a prefix via the management protocol:
+Operators pin one via the `strategy-choice` management module — with
+`nfdc`-style tooling:
 
 ```sh
-ndn-ctl strategy set /research/random /strategy/random
+nfdc strategy set /research /localhost/nfd/strategy/random
 ```
 
-Multiple strategies coexist by namespace. The engine looks up the
-longest-prefix-match strategy for each Interest.
+The strategy name resolves through the registry by its short name
+(`random`), running the registered builder. Strategies coexist by
+namespace; the engine uses the longest-prefix match for each Interest.
 
 ## Using the StrategyContext
 
-`StrategyContext` is the strategy's view of the engine:
+`StrategyContext` is an *immutable* view of engine state. A strategy
+reads it and returns actions; it has no `send_*` methods. The fields:
 
-- `ctx.fib_lookup(name)` — candidate faces for a name.
-- `ctx.send_interest(face, interest)` — forward (records out-record).
-- `ctx.send_nack(face, reason)` — send a NACK.
-- `ctx.schedule(at, event)` — wake up at a future time with an event.
-- `ctx.measurements()` — read/write per-prefix measurement state.
+- `ctx.fib_entry: Option<&FibEntry>` — the matched FIB entry (`None` =
+  no route). Pick nexthops via `.nexthops` or
+  `.nexthops_excluding(ctx.in_face)` for split horizon.
+- `ctx.in_face: FaceId` — the face the packet arrived on.
+- `ctx.name: &Arc<Name>` — the packet name.
+- `ctx.pit_token`, `ctx.measurements` — PIT token, measurements table.
+- `ctx.signals`, `ctx.extensions` — cross-layer inputs (see below).
+- `ctx.runtime` — spawn/sleep handle backing `schedule()`.
 
-The full surface is in `crates/ndn-strategy/src/context.rs`.
+Forwarding is expressed by *returning* actions, not by calling the
+context. The full surface is in `crates/ndn-strategy/src/context.rs`.
 
 ## Cross-layer signals
 
 `ctx.signals` exposes external/environmental inputs — radio link quality
-(RSSI, SNR, congestion) and node state (GPS position, battery) — distinct from
-`ctx.measurements` (which are derived from observed traffic):
+(RSSI, SNR, congestion) and node state (GPS position, battery) — distinct
+from `ctx.measurements` (derived from observed traffic):
 
 ```rust,ignore
 // Prefer the nexthop with the strongest signal.
-let best = nexthops.iter().copied().max_by_key(|f| {
-    ctx.signals.link(*f).and_then(|l| l.rssi_dbm).unwrap_or(i8::MIN)
+let best = nexthops.iter().copied().max_by_key(|n| {
+    ctx.signals.link(n.face_id).and_then(|l| l.rssi_dbm).unwrap_or(i8::MIN)
 });
 ```
 
-Signals are *pushed* by **signal sources** (a background driver feeds a shared
-store), so reading them never blocks: register a source with
-`EngineBuilder::signal_source(...)` from `ndn-signal-sources` (radio metrics,
-GPS; pluggable hardware/mock backends).
-
-A measured strategy can share **one decision kernel across native and
-embedded**: write a pure `fn(&dyn SignalView<F>, nexthops, incoming, emit)` and
-call it from both the native `Strategy` adapter and the embedded sans-IO
-`Strategy`. `ndn-strategy-cclf` is the worked example.
-
-The taxonomy, trait contracts, units, and the read-only
-`/localhost/nfd/faces/link-quality` dataset are specified in
+Signals are *pushed* by **signal sources** (a background driver feeds a
+shared store), so reading them never blocks: register a source with
+`EngineBuilder::signal_source(...)` from `ndn-signal-sources` (radio
+metrics, GPS; pluggable hardware/mock backends). A measured strategy can
+share one decision kernel across native and embedded sans-IO targets;
+`ndn-strategy-cclf` is the worked example, with taxonomy and units in
 [`docs/signals.md`](https://github.com/Quarmire/ndn-rs/blob/main/docs/signals.md).
 
 ## Testing
 
-The in-process engine is the right testing fixture:
+The in-process engine is the right fixture; `EngineBuilder::strategy(...)`
+takes the strategy value directly and installs it as the default:
 
 ```rust,ignore
-use ndn_engine::{EngineBuilder, EngineConfig};
-use ndn_strategy::StrategyChoice;
-
-# async fn test() -> anyhow::Result<()> {
-let (engine, _shutdown) = EngineBuilder::new(EngineConfig::default())
-    .strategy(StrategyChoice::for_prefix("/research", "/strategy/random"))
+let (engine, shutdown) = EngineBuilder::new(EngineConfig::default())
+    .strategy(RandomNexthopStrategy::new())
     .build()
     .await?;
-// drive traffic, assert behaviour via engine.measurements() etc.
-# Ok(()) }
 ```
 
-The reference example at [`examples/strategy-custom/`](https://github.com/Quarmire/ndn-rs/tree/main/examples/strategy-custom)
-shows the end-to-end shape (engine wired with a custom strategy
-implementation).
+To pin under a *specific* prefix instead, install via the
+`strategy-choice` module at runtime (see Pinning, above). Because every
+hook is a pure function of `&StrategyContext`, you can also
+unit-test decision logic by constructing a `StrategyContext` with a
+hand-built `FibEntry` and asserting on the returned `ForwardingAction`s —
+the in-tree strategies' `#[cfg(test)]` modules do exactly this.
+[`examples/strategy-custom/`](https://github.com/Quarmire/ndn-rs/tree/main/examples/strategy-custom)
+shows the end-to-end shape.
 
 ## Built-in references
 
-Read these for working templates:
+- `crates/ndn-strategy/src/best_route.rs` — lowest-cost nexthop with
+  split horizon; `on_nack` retries the next-best nexthop.
+- `crates/ndn-strategy/src/multicast.rs` — fan out to every nexthop.
+- `crates/ndn-strategy/src/composed.rs` — chain a strategy with filters.
 
-- `crates/ndn-strategy/src/best_route.rs` — probe primary, fall
-  back to alternates on NACK/timeout. Demonstrates `schedule()`.
-- `crates/ndn-strategy/src/multicast.rs` — fan out to every
-  matching nexthop.
-- `crates/ndn-strategy/src/composed.rs` — chain strategies by
-  prefix.
-
-## WASM strategies
-
-A WASM strategy is compiled to `wasm32-unknown-unknown` and loaded
-at runtime via `ndn-wasm-strategy`. The same `Strategy` trait
-applies; the loader handles the host/guest boundary. See
-`crates/ndn-wasm-strategy/` for the host API and
-`examples/wasm-strategy/` for a guest example.
+A WASM strategy targets `wasm32-unknown-unknown` and loads at runtime via
+`ndn-wasm-strategy` (same `Strategy` trait); see `examples/wasm-strategy/`.
 
 ## Conventions
 
-- A strategy `name()` is itself an NDN name. The `/strategy/...`
-  prefix is by convention; nothing enforces it.
-- A strategy may hold state internal to the impl; the engine never
-  serialises it. Persist anything you need via `measurements()` or
-  an external store.
-- Strategies are `Send + Sync`. The engine may call methods
-  concurrently for different Interests.
+- A strategy `name()` is itself an NDN name; the registry keys on the
+  short component (`random`).
+- A strategy may hold internal state; the engine never serialises it.
+- Strategies are `Send + Sync`; hooks may be called concurrently.
 
 ## See also
 
-- [Extend tier → Strategy](../api/extend.md#strategy) — trait
-  inventory.
-- [Interest and Data lifecycle](../concepts/interest-data-lifecycle.md) —
-  what the strategy is in the middle of.
-- [Management verbs](../reference/mgmt-verbs.md) — `strategy set` /
-  `strategy unset` verbs.
-- [`examples/strategy-custom/`](https://github.com/Quarmire/ndn-rs/tree/main/examples/strategy-custom),
-  [`examples/strategy-composed/`](https://github.com/Quarmire/ndn-rs/tree/main/examples/strategy-composed),
-  [`examples/context-enricher/`](https://github.com/Quarmire/ndn-rs/tree/main/examples/context-enricher).
+- [Extend tier → Strategy](../api/extend.md#strategy) — trait inventory.
+- [Interest and Data lifecycle](../concepts/interest-data-lifecycle.md).
+- [Management verbs](../reference/mgmt-verbs.md) — `strategy set`/`unset`.
+- Examples:
+  [`strategy-custom`](https://github.com/Quarmire/ndn-rs/tree/main/examples/strategy-custom),
+  [`strategy-composed`](https://github.com/Quarmire/ndn-rs/tree/main/examples/strategy-composed),
+  [`context-enricher`](https://github.com/Quarmire/ndn-rs/tree/main/examples/context-enricher).

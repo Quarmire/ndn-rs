@@ -11,7 +11,7 @@ graph TB
         E[ForwarderEngine]
     end
     R[RoutingProtocol] -->|installs into| E
-    S[Strategy] -->|register_strategy!| E
+    S[Strategy] -->|EngineBuilder::strategy / register_strategy!| E
     F[Face = Transport + LinkService] -->|EngineBuilder::face| E
     D[DiscoveryProtocol] -->|installs into| E
     M[MgmtModule] -->|MgmtRouter| E
@@ -21,7 +21,7 @@ graph TB
 
 | Trait | Crate path | Purpose |
 |---|---|---|
-| `Strategy` + `StrategyContext` + `ScheduledEvent` | `ndn_strategy::strategy` (`crates/ndn-strategy/src/strategy.rs:7`) | Forwarding-strategy contract; `schedule()` for timers. |
+| `Strategy` + `StrategyContext` + `ScheduledEvent` | `ndn_strategy::strategy` (`crates/ndn-strategy/src/strategy.rs:56`) | Forwarding-strategy contract; returns `ForwardingAction`s, `schedule()` for timers. |
 | `register_strategy!` macro | `ndn_strategy::registry` | `linkme`-backed registry; strategies auto-register. |
 | `RoutingProtocol` + `RoutingHandle` | `ndn_engine::routing` (`crates/ndn-engine/src/routing.rs`) | Pluggable routing-plane; produces a typed `RoutingProtocolStatus`. |
 | `InstallableProtocol` + `PostBuildQueue` | `ndn_engine::installable` (`crates/ndn-engine/src/installable.rs`) | "Install yourself into an `EngineBuilder`" trait. |
@@ -38,36 +38,56 @@ graph TB
 
 ## Strategy {#strategy}
 
-A `Strategy` decides which face an Interest goes out on and when it
-retransmits. The contract lives at `crates/ndn-strategy/src/strategy.rs:7`.
+A `Strategy` is a pure decision function: each hook reads an immutable
+`StrategyContext` and *returns* `ForwardingAction` values for the engine
+to execute. It never sends packets or mutates tables itself. The
+contract lives at `crates/ndn-strategy/src/strategy.rs:56`.
 
 ```rust,ignore
-use ndn_strategy::{Strategy, StrategyContext, register_strategy};
-use ndn_packet::Interest;
+use std::sync::Arc;
+use smallvec::{SmallVec, smallvec};
 
-pub struct RandomNexthopStrategy;
+use ndn_packet::Name;
+use ndn_transport::{ForwardingAction, NackReason};
+use ndn_strategy::{ErasedStrategy, Strategy, StrategyContext, register_strategy};
 
-#[async_trait::async_trait]
+register_strategy!(
+    RANDOM_REG,
+    b"random",
+    1,
+    || Arc::new(RandomNexthopStrategy::new()) as Arc<dyn ErasedStrategy>,
+);
+
+pub struct RandomNexthopStrategy { name: Name }
+
 impl Strategy for RandomNexthopStrategy {
-    fn name(&self) -> &'static str { "/strategy/random" }
+    fn name(&self) -> &Name { &self.name }
 
-    async fn after_receive_interest(
-        &self,
-        ctx: &mut StrategyContext<'_>,
-        interest: &Interest,
-    ) {
-        if let Some(face) = ctx.fib_lookup(interest.name()).random_nexthop() {
-            ctx.send_interest(face, interest).await;
+    // Synchronous fast path; `Some(actions)` short-circuits the async hooks.
+    fn decide(&self, ctx: &StrategyContext) -> Option<SmallVec<[ForwardingAction; 2]>> {
+        let fib = ctx.fib_entry?;
+        match fib.nexthops_excluding(ctx.in_face).first() {
+            Some(nh) => Some(smallvec![ForwardingAction::Forward(smallvec![nh.face_id])]),
+            None => Some(smallvec![ForwardingAction::Nack(NackReason::NoRoute)]),
         }
     }
-}
 
-register_strategy!(RandomNexthopStrategy);
+    async fn after_receive_interest(
+        &self, ctx: &StrategyContext<'_>,
+    ) -> SmallVec<[ForwardingAction; 2]> { self.decide(ctx).unwrap() }
+
+    async fn after_receive_data(
+        &self, _ctx: &StrategyContext<'_>,
+    ) -> SmallVec<[ForwardingAction; 2]> { SmallVec::new() }
+}
 ```
 
-`register_strategy!` uses `linkme` to put the strategy into a
-distributed slice. The engine reads the slice at startup; no manual
-wiring is required.
+`name()` returns `&Name` (a strategy name is an NDN name). Hooks take
+`&self` and `&StrategyContext` — never `&mut`, and the Interest/Data are
+read off the context, not passed as arguments. `register_strategy!`
+collects entries at link time via `linkme` on native targets; the engine
+reads the slice at startup. `EngineBuilder::strategy(...)` installs one
+directly. Full walkthrough: [Writing a strategy](../guides/writing-a-strategy.md).
 
 In-tree references: `crates/ndn-strategy/src/best_route.rs`,
 `crates/ndn-strategy/src/multicast.rs`, and
@@ -129,22 +149,37 @@ a given module. The mgmt-router fans verbs out to modules based on
 the second name component.
 
 ```rust,ignore
-use ndn_mgmt::{MgmtModule, MgmtContext, MgmtRouter};
+use async_trait::async_trait;
+use ndn_config::{ControlParameters, ControlResponse, control_response::status};
+use ndn_mgmt::{MgmtModule, MgmtContext, MgmtResponse};
 
 pub struct MyModule;
 
-#[async_trait::async_trait]
+#[async_trait]
 impl MgmtModule for MyModule {
-    fn module(&self) -> &'static str { "my-module" }
+    // The wire module name (second name component), as a byte string.
+    fn name(&self) -> &'static [u8] { b"my-module" }
 
-    async fn handle(&self, ctx: &mut MgmtContext<'_>) -> ndn_mgmt::Result<()> {
-        match ctx.verb() {
-            "list" => ctx.reply_dataset(/* ... */).await,
-            _ => ctx.reply_control_error(404, "verb not found").await,
+    // The router has already validated the command name and authorisation;
+    // dispatch a verb to a response payload (Control or Dataset).
+    async fn dispatch(
+        &self,
+        verb: &[u8],
+        params: ControlParameters,
+        ctx: &MgmtContext<'_>,
+    ) -> MgmtResponse {
+        let _ = (params, ctx); // pull engine / source_face / handlers as needed
+        match verb {
+            b"list" => MgmtResponse::Dataset(/* encoded TLV dataset */ Default::default()),
+            _ => ControlResponse::error(status::NOT_FOUND, "unknown verb").into(),
         }
     }
 }
 ```
+
+`MgmtResponse` is `Control(Box<ControlResponse>)` or `Dataset(Bytes)`;
+`ControlResponse::ok`/`error` build the control variant and `.into()`
+wraps it. Register the module with `MgmtRouter::register(Arc::new(MyModule))`.
 
 In-tree references: each verb has its own module file at
 `crates/ndn-mgmt/src/modules/{faces,fib,rib,strategy,cs,forwarder_status,routing}.rs`.

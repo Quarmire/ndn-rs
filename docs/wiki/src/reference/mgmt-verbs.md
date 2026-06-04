@@ -124,14 +124,14 @@ Notification verbs (`events`) return an SVS-style stream of typed
 events. The Develop-tier consumer is `Subscriber`:
 
 ```rust,ignore
-use ndn::{Subscriber, SubscriberConfig};
+use ndn::Subscriber;
 # async fn run() -> anyhow::Result<()> {
 let mut sub = Subscriber::connect(
     "/tmp/ndn-fwd.sock",
-    SubscriberConfig::new("/localhost/ndn-fwd/faces/events"),
+    "/localhost/ndn-fwd/faces/events",
 ).await?;
-while let Some(sample) = sub.next().await {
-    println!("face event: {:?}", sample.content());
+while let Some(sample) = sub.recv().await {
+    println!("face event: {:?}", sample.payload);
 }
 # Ok(()) }
 ```

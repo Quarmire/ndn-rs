@@ -141,11 +141,35 @@ extension point used for cert metadata), so it is covered by the
 CA's signature and skipped cleanly by verifiers that don't read it.
 
 It is off by default — issued certs are byte-identical to the
-plain flow until you opt in:
+plain flow until you opt in. `CaConfig::new` takes the CA prefix,
+an info string, the default and maximum validity windows, the
+challenge handlers, and the pre-challenge namespace policy;
+`emit_attestations(true)` is a builder method on the result:
 
 ```rust,ignore
-let config = CaConfig::new(/* … */).emit_attestations(true);
+use std::time::Duration;
+use ndn_cert::ca::CaConfig;
+use ndn_cert::challenge::token::{TokenChallenge, TokenStore};
+use ndn_cert::policy::HierarchicalPolicy;
+
+# fn build() -> CaConfig {
+let prefix: ndn_packet::Name = "/lab/ca/CA".parse().unwrap();
+let config = CaConfig::new(
+    prefix,
+    "lab CA".to_string(),
+    Duration::from_secs(30 * 24 * 3600), // default validity
+    Duration::from_secs(90 * 24 * 3600), // max validity
+    vec![Box::new(TokenChallenge::new(TokenStore::new()))],
+    Box::new(HierarchicalPolicy),
+)
+.emit_attestations(true);
+# config
+# }
 ```
+
+`CaConfig::new` defaults the post-challenge `IssuancePolicy` to
+`AcceptAllIssuance`; set `config.issuance` afterward to install a
+stricter gate.
 
 With it enabled, a token-challenge cert carries a single-leaf set
 naming `token`. Composite challenges record one leaf per satisfied

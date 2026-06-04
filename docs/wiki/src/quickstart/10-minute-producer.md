@@ -13,17 +13,18 @@ A running forwarder at `/tmp/ndn-fwd.sock`. See
 
 ```rust,ignore
 use ndn::prelude::*;
-use ndn::{KeyChain, Producer};
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let keychain = KeyChain::open_default().await?;
-    let mut producer = Producer::connect("/tmp/ndn-fwd.sock", keychain).await?;
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let keychain = KeyChain::ephemeral("/example")?;
+    // connect registers the prefix; with_signer signs what we publish.
+    let producer = Producer::connect("/tmp/ndn-fwd.sock", "/example")
+        .await?
+        .with_signer(keychain.signer()?);
 
-    producer.publish_object(
-        "/example/hello",
-        b"hello, ndn".to_vec(),
-    ).await?;
+    producer
+        .publish_object("/example/hello".parse()?, b"hello, ndn".to_vec().into(), 0)
+        .await?;
 
     // Keep the process alive while the forwarder serves requests.
     tokio::signal::ctrl_c().await?;
@@ -31,60 +32,69 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 }
 ```
 
-`publish_object` is the RDR-shaped publish verb in
-`crates/ndn-app/src/producer.rs`. It signs the `Data` with the
-default identity from the `KeyChain`, registers the name prefix with
-the forwarder, and serves the segmented object on demand.
+`publish_object(name, content, chunk_size)` segments the object and
+serves it on demand, **signing** each segment with the configured
+signer (without `with_signer` it emits `DigestSha256` — integrity, not
+authorship). `chunk_size == 0` uses the default segment size.
 
-## The consumer
+## The consumer — verify what you fetch
+
+The producer signed its `Data`; the consumer's job is to **check that signature**
+against a trust anchor it has decided to pin. Verifying is not an optional extra
+step — it is how the consumer decides the data is authentic.
 
 ```rust,ignore
 use ndn::prelude::*;
-use ndn::Consumer;
+use ndn::{Consumer, KeyChain};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut consumer = Consumer::connect("/tmp/ndn-fwd.sock").await?;
-    let bytes = consumer.fetch_object("/example/hello").await?;
-    println!("{}", String::from_utf8_lossy(&bytes));
+
+    // Build a validator that pins the producer's certificate as a trust anchor.
+    // Across processes the anchor is distributed out-of-band — a cert file, a
+    // `did:ndn`, or NDNCERT enrollment; see "Identity and keys" below.
+    let keychain = KeyChain::ephemeral("/consumer")?;
+    keychain.add_trust_anchor(producer_cert); // the /example producer's anchor
+    let validator = keychain.validator();
+
+    // fetch_verified returns SafeData only if the signature checks out.
+    let safe = consumer.fetch_verified("/example/hello", &validator).await?;
+    println!("{}", String::from_utf8_lossy(safe.data().content().unwrap_or_default()));
     Ok(())
 }
 ```
 
-`fetch_object` reassembles segmented `Data` from RDR metadata. For a
-single packet, `fetch` is sufficient (see
-[Five-minute app](./5-minute-app.md)).
+`fetch_verified` returns [`SafeData`](../concepts/identity-and-keys.md) — proof
+the signature verified. The unauthenticated siblings `fetch` /  `fetch_object`
+return raw `Data`/bytes and **do not check the signature**; use them only when
+you are handling trust yourself (see
+[Security pitfalls](../guides/security-pitfalls.md)). For a complete, runnable
+signed-and-verified exchange in one file, see
+[`example-secure-fetch`](./5-minute-app.md).
 
 ## What happens on the wire
 
-1. Producer signs the `Data` and announces `/example/hello` to the
-   forwarder.
-2. Consumer expresses an Interest for `/example/hello`.
-3. Forwarder consults its FIB, finds the producer's face, forwards
-   the Interest.
-4. Producer hands back the `Data`. Forwarder caches it in the
-   Content Store and returns it to the consumer.
-5. Repeat consumer calls within the cache lifetime never reach the
-   producer.
-
-The cache + PIT/FIB story is in
+The producer signs the `Data` and announces `/example/hello`. The consumer's
+Interest is routed by the forwarder's FIB to the producer's face; the returned
+`Data` is cached in the Content Store, so repeat calls within the cache lifetime
+never reach the producer. The full PIT/FIB/CS story is in
 [Interest and Data lifecycle](../concepts/interest-data-lifecycle.md).
 
 ## Signing identities
 
-The `KeyChain::open_default` call uses the operating-system PIB
-(`~/.ndn/pib.db` by default). For first-run setup or temporary keys,
-see [Identity and keys](../concepts/identity-and-keys.md). The
-producer signs with the default identity unless overridden via
-`SigningInfo`.
+`KeyChain::ephemeral` keeps the key in memory (regenerated each run) — fine for a
+demo. For a persistent identity backed by a key file, use
+`KeyChain::open_or_create(path, name)`; for enrollment under a CA, see
+[Identity and keys](../concepts/identity-and-keys.md). The producer signs with the
+keychain's default identity unless overridden via `SigningInfo`.
 
 ## Next steps
 
-- **Trust on the consumer side** — verify the producer's signature
-  by configuring a `TrustPolicy`:
+- **Understand the trust decision** you made by pinning that anchor:
+  [Trust, first](../start/trust-first.md) and
   [Trust policies](../reference/trust-policies.md).
-- **Serve dynamic responses** instead of static bytes — use
-  `Responder` for closure-style producers:
-  [Develop tier → Responder](../api/develop.md#responder).
-- **Subscribe to a multi-publisher stream** with `Subscriber`
-  (SVS-style): [Develop tier → Subscriber](../api/develop.md#subscriber).
+- **Distribute anchors and enroll identities** instead of hard-coding a cert:
+  [Identity and keys](../concepts/identity-and-keys.md).
+- **Serve dynamic responses**, or **subscribe to a multi-publisher stream**:
+  [Develop tier → Responder / Subscriber](../api/develop.md#responder).

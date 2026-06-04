@@ -12,79 +12,74 @@ identities, signing info, and trust policies.
 use ndn::prelude::*;
 use ndn::KeyChain;
 
-# async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-let keychain = KeyChain::open_default().await?;
+# fn run() -> Result<(), Box<dyn std::error::Error>> {
+// In-memory, self-signed — tests and short-lived producers:
+let keychain = KeyChain::ephemeral("/com/example/alice")?;
+// Or file-backed, generated on first run and reloaded after:
+let keychain = KeyChain::open_or_create("/var/lib/ndn/pib".as_ref(), "/com/example/alice")?;
 # Ok(()) }
 ```
 
-`KeyChain::open_default()` opens the operating-system PIB (Personal
-Information Base) at `~/.ndn/pib.db` on native targets and an
-IndexedDB-backed PIB in the browser. The opened keychain knows the
-host's identities, their keys, and any certificates that have been
-imported.
-
-`KeyChain` lives at `crates/ndn-security/src/keychain.rs`. The
-Develop tier re-exports it as `ndn::KeyChain`.
+The opened keychain knows its identity, its signing key, and any
+trust anchors that have been added. `KeyChain` lives at
+`crates/ndn-security/src/keychain.rs`; the Develop tier re-exports it
+as `ndn::KeyChain`.
 
 ## Identities
 
-An identity is a name. Each identity owns one or more keys; one of
-those keys is the *default* and is used for signing unless an
-explicit selector overrides it.
+A `KeyChain` **is** one identity: a name, a signing key, and that key's
+certificate. To hold several identities, hold several keychains.
 
 ```rust,ignore
 # use ndn::prelude::*;
-# use ndn::KeyChain;
-# async fn run(keychain: &mut KeyChain) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-let identity = keychain.create_identity("/alice").await?;
-let key = identity.default_key();
-let cert = identity.self_signed_cert();
+# fn run() -> Result<(), Box<dyn std::error::Error>> {
+let keychain = KeyChain::ephemeral("/alice")?;
+let _name = keychain.name();          // /alice
+let _key_name = keychain.key_name();  // /alice/KEY/<key-id>
+let _signer = keychain.signer()?;     // signs with that key
 # Ok(()) }
 ```
 
-The on-disk shape: each identity gets a directory under the PIB;
-keys are stored as Ed25519 / ECDSA private keys; certificates are
-stored as `Data` packets under the standard NDN cert naming
-convention (`/<identity>/KEY/<key-id>/<issuer-id>/<version>`).
+The key is Ed25519 (or ECDSA via `KeyChain::ephemeral_ecdsa`); its
+certificate is a `Data` packet under the standard NDN naming convention
+(`/<identity>/KEY/<key-id>/<issuer-id>/<version>`). A file-backed
+keychain persists both in its PIB (see below).
 
 ## Certificates
 
-A certificate is a signed `Data` packet whose content is the
-identity's public key. Certificates carry a validity period and a
-key locator pointing to the issuer's key.
+A certificate is a signed `Data` packet whose content is the identity's
+public key, with a validity period and a key locator pointing to the
+issuer's key. A fresh keychain's cert is **self-signed** — it is its own
+trust anchor; a CA-issued cert chains to the CA instead.
 
-| Verb | Where |
+| Verb | API |
 |---|---|
-| Create a self-signed cert | `identity.self_signed_cert()` |
-| Import a cert (e.g. from NDNCERT enrollment) | `keychain.import_cert(&cert).await?` |
-| Issue a cert for another identity | `keychain.issue_cert(&other_key, ...).await?` |
-| Enroll via NDNCERT | See [NDNCERT setup](../guides/ndncert-setup.md). |
+| Sign with this identity | `keychain.signer()?` / `keychain.sign_data(builder)` |
+| Trust another identity's cert | `keychain.add_trust_anchor(cert)` |
+| Get a CA-issued cert | NDNCERT enrollment — `Identity::enroll(config)` |
+| Issue a cert for another key | `SecurityManager::certify(subject, pubkey, issuer, validity)` |
+| Operator workflow | [NDNCERT setup](../guides/ndncert-setup.md) |
 
 ## SigningInfo
 
-`SigningInfo` is the "sign me with X" descriptor. The `KeyChain`
-takes it; the producer takes it; the Responder takes it.
+`SigningInfo` is the "sign me with X" selector that `KeyChain::sign_packet`
+resolves before signing — useful when a keychain holds more than the
+default key, or to force digest-only.
 
 ```rust,ignore
-use ndn::SigningInfo;
+# use ndn::prelude::*;
+# fn run() -> Result<(), Box<dyn std::error::Error>> {
+let info = SigningInfo::identity("/alice".parse()?);           // by identity name
+let _info = SigningInfo::key("/alice/KEY/k1".parse()?);        // by specific key
+let _info = SigningInfo::digest_sha256();                      // integrity only, no key
 
-// Sign with /alice's default key:
-let info = SigningInfo::by_identity("/alice");
-
-// Sign with a specific key under /alice:
-let info = SigningInfo::by_key("/alice/KEY/...");
-
-// Sign with an explicit cert (key + cert metadata):
-let info = SigningInfo::by_cert(cert.name().clone());
-
-// SHA-256 digest only (no producer identity):
-let info = SigningInfo::sha256_digest();
+let keychain = KeyChain::ephemeral("/alice")?;
+let wire = keychain.sign_packet(DataBuilder::new("/alice/note", b"hi"), &info)?;
+# Ok(()) }
 ```
 
-A `SigningInfo` resolves to a `SignerSelection` inside the
-`KeyChain`. That extra step exists so `TrustPolicy` decisions are
-applied before the bytes are signed. See `crates/ndn-security/src/keychain.rs:143`
-for the resolution path.
+Under the hood a `SigningInfo` resolves to a `SignerSelection`
+(`KeyChain::resolve_selection`) before the bytes are signed.
 
 ## Trust policies
 
@@ -108,21 +103,17 @@ For a tabular catalog with rule examples: [Trust policies](../reference/trust-po
 
 ## PIB backends
 
-| Backend | Where it lives | Used by |
-|---|---|---|
-| `SqlitePib` | SQLite database at `~/.ndn/pib.db` | Native targets (Linux/macOS/Windows). |
-| `IdbPib` | IndexedDB origin store | Browser (`wasm32-unknown-unknown`). |
-| `MemPib` | In-process map | Tests; the `KeyChain::open_memory()` constructor. |
+The keychain's key and cert live in a PIB (Personal Information Base),
+chosen by the constructor:
 
-The default constructor picks the right backend for the build
-target. To override the path:
+| Constructor | Storage |
+|---|---|
+| `KeyChain::ephemeral(name)` | In-memory; nothing persisted. |
+| `KeyChain::open_or_create(path, name)` | File-backed PIB at `path`. |
 
-```rust,ignore
-use ndn::KeyChain;
-# async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-let keychain = KeyChain::open_at("/var/lib/myapp/pib.db").await?;
-# Ok(()) }
-```
+The lower-level PIB type is `ndn_security::pib::FilePib` (file-backed;
+native builds also carry a SQLite-backed `SqlitePib`). Use `FilePib`
+directly for the SafeBag import/export below.
 
 ## SafeBag — exporting identities
 
@@ -135,14 +126,14 @@ The file-based PIB exports and imports the bundle directly:
 
 ```rust,ignore
 use ndn_security::pib::FilePib;
-# fn run(cert_name: &ndn_packet::Name) -> Result<(), Box<dyn std::error::Error>> {
+# fn run(key_name: &ndn_packet::Name) -> Result<(), Box<dyn std::error::Error>> {
 let pib = FilePib::open("~/.ndn/pib")?;
-let bytes = pib.export_safebag(cert_name, b"passphrase")?;
+let bytes = pib.export_safebag(key_name, b"passphrase")?;
 std::fs::write("alice.safebag", &bytes)?;
 
 // Receiving side — the embedded cert names the key:
 let dst = FilePib::new("~/.ndn/pib")?;
-dst.store_safebag(cert_name, &bytes, b"passphrase")?;
+dst.store_safebag(key_name, &bytes, b"passphrase")?;
 # Ok(()) }
 ```
 
@@ -174,6 +165,20 @@ The PIB location follows `--pib`, then `$NDN_PIB`, then `~/.ndn/pib`.
 The dashboard's Security view performs the same import/anchor
 operations over the management protocol, and its Settings view shows
 which PIB the connected forwarder uses.
+
+## When you need more: `Identity`
+
+`KeyChain` is the atom — sign and verify; most code needs nothing
+else. When you need the identity *lifecycle* NDN leaves to
+applications, reach for `Identity` (in `ndn-identity`). It derefs to a
+`KeyChain` (signs and verifies identically) and adds **enrollment**
+under a CA, **rotation** (change the operational key under the prior
+key's authority), **recovery** (a pre-committed authority installs a
+new key if yours is lost), and **device delegation** — e.g.
+`Identity::create(KeyChain::ephemeral("/alice")?, recovery)?`. Creating
+a recoverable principal designates the recovery authority up front: by
+design you cannot silently make an unrecoverable identity.
+(`NdnIdentity` is a deprecated alias for `Identity`.)
 
 ## See also
 

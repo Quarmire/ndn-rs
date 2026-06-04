@@ -1,170 +1,150 @@
 # Trust policies
 
-The trust policy decides whether a signing key is allowed to sign a
-given name. ndn-rs splits this across two traits:
+The trust policy decides whether a signing key may sign a given name.
+ndn-rs splits this across two traits:
 
-- `TrustPolicy` — atomic verdict for one (key, name) pair.
-- `ValidationPolicy` — composition of `TrustPolicy`s with chaining
-  and override rules.
+- `TrustPolicy` — an operator handle: which `Signer` to use on egress
+  (`signer`), which `Validator` to apply on ingress (`validator`).
+- `ValidationPolicy` — the composable acceptance check: given a `Data`,
+  its key locator, and a chain-walk depth, return a `PolicyVerdict`
+  (`Allow`, `NeedCert`, or `Deny`).
 
-Implementations live in `crates/ndn-security/src/`. The
-Develop-tier re-exports are listed below.
-
-For the trait surface see
-[Extend tier → TrustPolicy / ValidationPolicy](../api/extend.md).
-For the `KeyChain`-side flow see
+Implementations live in `crates/ndn-security/src/`. See
+[Extend tier](../api/extend.md) and
 [Identity and keys](../concepts/identity-and-keys.md).
 
 ## Built-in policies
 
 | Policy | Source | Accepts | Use |
 |---|---|---|---|
-| `InsecureTrust` | `trust.rs` | Any signature. | Tests; never production. |
-| `StaticTrust` | `trust.rs` | Allowlist of key-locator names. | Closed groups, known signers. |
-| `LvsTrust` | `trust.rs` + `lvs/` | Light Versatile Schema rules. | Pattern-based deployments. |
-| `HierarchicalPolicy` | `validation_policy.rs` | Parent-name key signs child-name data. | Standard NDN trust shape. |
+| `InsecureTrust` | `trust.rs` | `DigestSha256`; validator accepts anything. | Tests; never production. |
+| `StaticTrust` | `trust.rs` | Fixed signer + hierarchical validator. | Closed groups, known signers. |
+| `LvsTrust` | `trust.rs` + `lvs.rs` | Light Versatile Schema rules. | Pattern-based deployments. |
+| `HierarchicalPolicy` | `validation_policy.rs` | Signing key's identity is a prefix of the data name. | Standard NDN trust shape. |
 | `AcceptAllPolicy` | `validation_policy.rs` | Skip validation entirely. | Migration / degraded mode. |
-| `ChainedPolicy` | `validation_policy.rs` | First policy that returns a verdict wins. | Composition. |
+| `ChainedPolicy` | `validation_policy.rs` | All members `Allow` (first `Deny`/`NeedCert` short-circuits). | Composition. |
 
 ## Hierarchical example
 
+Pin a `Validator` to turn a `Consumer` into a `VerifiedConsumer`, whose
+`fetch` returns `SafeData` (a failed chain walk errors instead):
+
 ```rust,ignore
 use ndn::prelude::*;
-use ndn::{HierarchicalPolicy, ValidationPolicy, Consumer};
+use ndn_security::{TrustSchema, Validator};
 
 # async fn run() -> anyhow::Result<()> {
-let policy = HierarchicalPolicy::anchor("/lab/ca")
-    .max_depth(4);
+let validator = Validator::new(TrustSchema::hierarchical());
 let mut consumer = Consumer::connect("/tmp/ndn-fwd.sock").await?
-    .with_validation(policy);
-let _data = consumer.fetch("/lab/alice/notes/2026-05-20").await?;
+    .verifying(validator);
+let _safe = consumer.fetch("/lab/alice/notes/2026-05-20").await?; // SafeData
 # Ok(()) }
 ```
 
-The validator walks the cert chain from the `Data`'s signature info
-up to a cert whose name is a prefix of `/lab/ca`. If the chain
-exceeds `max_depth` or breaks anywhere, the verdict is rejection.
-
 ## Static example
 
-```rust,ignore
-use ndn::{StaticTrust, ValidationPolicy};
-
-# fn build() -> StaticTrust {
-StaticTrust::new()
-    .allow_for_prefix("/lab/alice/", "/lab/alice/KEY/.../v=1")
-    .allow_for_prefix("/lab/bob/",   "/lab/bob/KEY/.../v=3")
-# }
-```
-
-`StaticTrust` matches a key-name suffix against an allowlist
-keyed by name prefix. No chain walking.
-
-## LVS example
-
-Light Versatile Schema rules read more like a config:
-
-```text
-#consumerSchema:
-    /lab/{user}/notes/{*} <= /lab/{user}/KEY/<key-id>
-    /lab/{user}/KEY/<key-id> <= /lab/ca/KEY/<key-id>
-```
-
-Compiled into an `LvsTrust`:
+`StaticTrust` is a `TrustPolicy` with a fixed signer and a hierarchical
+validator. Build from a `KeyChain` (carries its anchors) or a bare signer
+via `StaticTrust::new(..)`:
 
 ```rust,ignore
-use ndn::LvsTrust;
+use std::sync::Arc;
+use ndn::{KeyChain, StaticTrust, TrustPolicy};
 
-# fn build() -> anyhow::Result<LvsTrust> {
-let schema = std::fs::read_to_string("trust.lvs")?;
-let trust = LvsTrust::from_schema(&schema)?;
+# fn build() -> anyhow::Result<StaticTrust> {
+let keychain = Arc::new(KeyChain::ephemeral("/lab/alice")?);
+let trust = StaticTrust::from_keychain(keychain)?;
 # Ok(trust) }
 ```
 
-The LVS rule shape is in `crates/ndn-security/src/lvs/`.
+## LVS example
+
+A textual Light Versatile Schema is compiled to LVS binary form by an
+external compiler; `LvsModel::decode` reads it and `LvsTrust` wraps it
+with a signer (also `LvsTrust::from_keychain(model, keychain)`):
+
+```rust,ignore
+use std::sync::Arc;
+use ndn::LvsTrust;
+use ndn_security::LvsModel;
+
+# fn build() -> anyhow::Result<LvsTrust> {
+let bytes = std::fs::read("trust.tlv")?;       // compiled LVS model
+let model = Arc::new(LvsModel::decode(&bytes)?);
+let trust = LvsTrust::new(model, None);        // None ⇒ DigestSha256 egress
+# Ok(trust) }
+```
 
 ## Writing a custom policy
 
-Implement `TrustPolicy`:
+Custom acceptance logic implements `ValidationPolicy::check`, returning a
+boxed future of `PolicyVerdict` (`Allow` / `Deny(TrustError)` / `NeedCert(Name)`):
 
 ```rust,ignore
-use ndn_security::trust::{TrustPolicy, TrustVerdict};
-use ndn_packet::Name;
+use std::{future::Future, pin::Pin, sync::Arc};
+use ndn_packet::{Data, Name};
+use ndn_security::{ChainedPolicy, HierarchicalPolicy, PolicyVerdict, TrustError, ValidationPolicy};
 
 pub struct MyPolicy;
 
-impl TrustPolicy for MyPolicy {
-    fn check(&self, data_name: &Name, key_locator: &Name) -> TrustVerdict {
-        if data_name.starts_with("/lab") && key_locator.starts_with("/lab/ca") {
-            TrustVerdict::Accept
-        } else {
-            TrustVerdict::Reject("not under /lab".into())
-        }
+impl ValidationPolicy for MyPolicy {
+    fn check<'a>(
+        &'a self,
+        data: &'a Data,
+        key_locator: &'a Name,
+        _depth: usize,
+    ) -> Pin<Box<dyn Future<Output = PolicyVerdict> + Send + 'a>> {
+        Box::pin(async move {
+            let ok = data.name.has_prefix(&"/lab".parse().unwrap())
+                && key_locator.has_prefix(&"/lab/ca".parse().unwrap());
+            if ok {
+                PolicyVerdict::Allow
+            } else {
+                PolicyVerdict::Deny(TrustError::SchemaMismatch)
+            }
+        })
     }
 }
-```
 
-Compose into the validator:
-
-```rust,ignore
-use ndn::{ValidationPolicy, ChainedPolicy};
-
-let validation = ChainedPolicy::new()
-    .then(MyPolicy)
-    .then(HierarchicalPolicy::anchor("/lab/ca"));
+// ChainedPolicy: members run in order; first Deny/NeedCert short-circuits.
+let mut chain = ChainedPolicy::new(vec![Arc::new(MyPolicy) as Arc<dyn ValidationPolicy>]);
+chain.push(Arc::new(HierarchicalPolicy::new()));
 ```
 
 ## Where the policy runs
 
 | Location | What is checked |
 |---|---|
-| `KeyChain::sign(data, info)` | "Is this key permitted to sign this name?" (pre-sign guard) |
-| `Consumer::fetch(name)` returning `Data` | "Is this signature trustworthy for this name?" (validator) |
-| `Producer::publish_object` | Pre-sign guard via the supplied `KeyChain`. |
-| `Subscriber::next` | Validator (per `SubscriberConfig`). |
+| `KeyChain::sign` / `Producer::publish_object` | "May this key sign this name?" (pre-sign guard) |
+| `VerifiedConsumer::fetch(name)` returning `SafeData` | "Is this signature trustworthy for this name?" (validator) |
+| `Subscriber::recv` | Validator (per `SubscriberConfig`). |
 
 ## Trust contexts and onboarding
 
-A node does not "join a network"; it adopts a set of **trust contexts**
-(a `Keyring`). Each `TrustContext` binds a `namespace` to its own anchor
-set and schema. The validator dispatches each packet to the context
-selected by *its name's* namespace (longest-prefix match) and validates
-it only against that context's schema **and** anchors — trust held for
-one namespace never authorizes another. Hierarchical contexts (the
-default) also require the signing key's identity to be a prefix of the
-signed name.
+A node adopts a set of **trust contexts** (a `Keyring`). Each
+`SignedTrustContext` binds a `namespace` to its own anchors and schema, and
+the validator routes each packet to its namespace's context — no cross-talk.
 
 ```rust,ignore
-use ndn_security::{TrustContext, Validator, TrustSchema};
+use std::sync::Arc;
+use ndn_security::{Certificate, SignedTrustContext, TrustSchema, Validator};
 
+# fn wire(home_anchor: Certificate) -> anyhow::Result<()> {
 let validator = Validator::new(TrustSchema::hierarchical());
-let home = std::sync::Arc::new(TrustContext::hierarchical("/home/bob".parse()?));
-home.add_anchor(home_anchor_cert);
-validator.adopt_context(home); // data under /home/bob now validates against it
+let home = Arc::new(SignedTrustContext::hierarchical("/home/bob".parse()?));
+home.add_anchor(home_anchor);
+validator.adopt_context(home); // data under /home/bob validates against it
+# Ok(()) }
 ```
 
-Onboarding (in `ndn-cert`) splits into two unrelated operations:
-
-- **Adopt-to-verify** — acquire a context's anchor + schema to *verify*
-  data. Free, no CA. A `BootstrapTicket` (a QR / deep-link fragment carrying
-  the namespace and the root anchor *fingerprint*) seeds root
-  authenticity; `adopt_with_tofu` adopts a fetched context only if its
-  anchor matches that fingerprint — adoption is never automatic.
-- **Enroll-to-be-verified** — get a cert issued to *produce*. Gated by
-  NDNCERT challenges; the hub default is `token AND device-approval`,
-  and tokens are single-use, TTL-bounded, and name-scoped.
-
-`ndn-fwd init --profile hub --namespace /home/bob` stands up a root and
-prints a bootstrap ticket; `ndn-fwd adopt <ticket>` reports the fingerprint
-it will pin. Contexts are signed, versioned NDN objects
-(`/<ns>/32=trust-context/v=N`); a node refuses an older version
-(anti-rollback) and honours a context's revocation list.
+Onboarding (`ndn-cert`) splits into *adopt-to-verify* (anchor + schema to
+verify data; free, pinned by a `BootstrapTicket` fingerprint) and
+*enroll-to-be-verified* (a cert to produce, gated by NDNCERT challenges;
+see [NDNCERT setup](../guides/ndncert-setup.md)).
 
 ## See also
 
-- [Identity and keys](../concepts/identity-and-keys.md) — KeyChain
-  and SigningInfo.
-- [NDNCERT setup](../guides/ndncert-setup.md) — issuing the certs
-  these policies validate against.
+- [Identity and keys](../concepts/identity-and-keys.md) — KeyChain and SigningInfo.
+- [NDNCERT setup](../guides/ndncert-setup.md) — issuing the certs these policies validate.
 - [Extend tier](../api/extend.md) — implementing custom policies.
 - `crates/ndn-security/` — the implementation.
