@@ -12,6 +12,7 @@
 pub mod ca;
 pub mod delegation;
 pub mod device;
+pub mod recovery_bundle;
 pub mod signed_delegation;
 pub mod device_approval_net;
 pub mod email;

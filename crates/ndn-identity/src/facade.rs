@@ -304,6 +304,29 @@ impl Identity {
     pub fn is_recoverable(&self) -> bool {
         self.history.last().is_some_and(|p| p.recovery.is_some())
     }
+
+    /// Export the rotation history as a transmittable **recovery bundle** — the
+    /// bytes to back up (cloud / paper / another device). A fresh device loads
+    /// it via [`recover_from_bundle`](Self::recover_from_bundle) plus the
+    /// committed recovery key(s). The bundle carries no private keys, so it is
+    /// safe to store off-device; it authorizes nothing on its own.
+    pub fn export_recovery_bundle(&self) -> Vec<u8> {
+        crate::recovery_bundle::encode_history(&self.history)
+    }
+
+    /// Recover onto the `new` keychain from a backed-up `bundle`, authorized by
+    /// the committed recovery key(s) (`recovery_signers`). Decodes the history
+    /// then runs [`recover`](Self::recover) — the wire-transmitted counterpart
+    /// of taking a `Vec<IdentityProof>` directly.
+    pub async fn recover_from_bundle(
+        bundle: &[u8],
+        new: KeyChain,
+        recovery_signers: &[(usize, &dyn Signer)],
+    ) -> Result<Self, IdentityError> {
+        let history = crate::recovery_bundle::decode_history(bundle)
+            .map_err(|e| IdentityError::Lifecycle(format!("malformed recovery bundle: {e}")))?;
+        Self::recover(history, new, recovery_signers).await
+    }
 }
 
 impl std::fmt::Debug for Identity {
@@ -484,6 +507,41 @@ mod tests {
         )
         .await;
         assert!(matches!(err, Err(IdentityError::Lifecycle(_))));
+    }
+
+    #[tokio::test]
+    async fn recovery_survives_a_wire_bundle_round_trip() {
+        let (rk_pub, rk) = recovery_key(11);
+        let id = Identity::create(
+            KeyChain::ephemeral("/alice").unwrap(),
+            RecoveryCommitment::Key(rk_pub),
+        )
+        .unwrap();
+        assert!(id.is_recoverable());
+
+        // Back up to bytes, then recover on a "fresh device" from the bundle
+        // plus the committed recovery key alone.
+        let bundle = id.export_recovery_bundle();
+        let recovered = Identity::recover_from_bundle(
+            &bundle,
+            KeyChain::ephemeral("/alice").unwrap(),
+            &[(0, &rk)],
+        )
+        .await
+        .expect("recover from bundle");
+        assert_eq!(recovered.current_key_state().unwrap().seq, 1);
+        assert!(recovered.is_recoverable()); // the commitment carries forward
+
+        // A malformed bundle is refused, not panicked.
+        assert!(
+            Identity::recover_from_bundle(
+                &bundle[..bundle.len() / 2],
+                KeyChain::ephemeral("/alice").unwrap(),
+                &[(0, &rk)],
+            )
+            .await
+            .is_err()
+        );
     }
 
     #[test]
