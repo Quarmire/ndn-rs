@@ -10,7 +10,7 @@
 #   api/         : 250
 #   guides/      : 200
 #   operations/  : 150
-#   reference/   : 150
+#   reference/   : 200   (catalog pages — transport/profile/policy tables)
 #   releases/    : 200
 #   README.md    : 60
 #   SUMMARY.md   : 80    (grew with the Start here + Your path sections)
@@ -34,7 +34,7 @@ cap_for() {
         docs/wiki/src/api/*)         echo 250 ;;
         docs/wiki/src/guides/*)      echo 200 ;;
         docs/wiki/src/operations/*)  echo 150 ;;
-        docs/wiki/src/reference/*)   echo 150 ;;
+        docs/wiki/src/reference/*)   echo 200 ;;
         docs/wiki/src/releases/*)    echo 200 ;;
         *)                           echo 9999 ;;
     esac
