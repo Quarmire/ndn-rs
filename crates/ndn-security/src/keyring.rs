@@ -27,12 +27,28 @@ pub struct Keyring {
     ambient: Arc<SignedTrustContext>,
 }
 
+impl Default for Keyring {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Keyring {
     pub(crate) fn with_ambient(ambient: Arc<SignedTrustContext>) -> Self {
         Self {
             contexts: DashMap::new(),
             ambient,
         }
+    }
+
+    /// An empty keyring with a **deny-by-default** ambient: a hierarchical root
+    /// context with no anchors, so nothing validates until the holder adopts a
+    /// context. The right starting point for a participant ("trust only what
+    /// you join"), as opposed to the `Validator`-backed flat-anchor ambient.
+    pub fn new() -> Self {
+        Self::with_ambient(Arc::new(SignedTrustContext::hierarchical(
+            ndn_packet::Name::root(),
+        )))
     }
 
     /// The ambient (root-namespace) context — the validation target for names
