@@ -83,7 +83,40 @@ impl RecoveryCommitment {
             }
         }
     }
+
+    /// Decode the form [`encode_into`](Self::encode_into) produced.
+    fn decode_from(c: &mut Cursor<'_>) -> Result<Self, ProofDecodeError> {
+        match c.byte()? {
+            0 => Ok(Self::Key(c.array32()?)),
+            1 => {
+                let threshold = c.u64()? as usize;
+                let count = c.u64()? as usize;
+                let mut keys = Vec::with_capacity(count);
+                for _ in 0..count {
+                    keys.push(c.array32()?);
+                }
+                Ok(Self::Quorum { keys, threshold })
+            }
+            _ => Err(ProofDecodeError::Malformed),
+        }
+    }
 }
+
+/// A [`IdentityProof::decode`] failure — the wire was truncated, carried an
+/// unknown tag, or the embedded DID Document didn't parse.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProofDecodeError {
+    /// Truncated, mis-tagged, or otherwise unparseable.
+    Malformed,
+}
+
+impl core::fmt::Display for ProofDecodeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("malformed identity-proof wire")
+    }
+}
+
+impl std::error::Error for ProofDecodeError {}
 
 impl IdentityProof {
     /// The deterministic byte string the signature covers: the DID Document, the
@@ -119,5 +152,148 @@ impl IdentityProof {
         let mut hasher = Sha256::new();
         hasher.update(self.canonical_bytes());
         hasher.finalize().into()
+    }
+
+    /// Encode to a transmittable record: the [`canonical_bytes`](Self::canonical_bytes)
+    /// signed region, then the signature type and value. The chain of these is
+    /// what backs up a `did:ndn` history off-device (for recovery) or replicates
+    /// it over SVS — `canonical_bytes` alone omits the signature.
+    pub fn encode(&self) -> Bytes {
+        let mut out = self.canonical_bytes();
+        out.extend_from_slice(&self.sig_type.code().to_be_bytes());
+        out.extend_from_slice(&(self.sig_value.len() as u64).to_be_bytes());
+        out.extend_from_slice(&self.sig_value);
+        Bytes::from(out)
+    }
+
+    /// Decode a record produced by [`encode`](Self::encode). The fields are
+    /// re-parsed exactly as [`canonical_bytes`](Self::canonical_bytes) frames
+    /// them, so a successful decode round-trips. Still unverified — the caller
+    /// checks the chain (parent links + signatures) before trusting it.
+    pub fn decode(wire: &[u8]) -> Result<Self, ProofDecodeError> {
+        let mut c = Cursor { buf: wire, pos: 0 };
+        let document: DidDocument =
+            serde_json::from_slice(c.blob()?).map_err(|_| ProofDecodeError::Malformed)?;
+        let parent_ref = match c.byte()? {
+            0 => None,
+            1 => Some(c.array32()?),
+            _ => return Err(ProofDecodeError::Malformed),
+        };
+        let seq = c.u64()?;
+        let recovery = match c.byte()? {
+            0 => None,
+            1 => Some(RecoveryCommitment::decode_from(&mut c)?),
+            _ => return Err(ProofDecodeError::Malformed),
+        };
+        let sig_type = SignatureType::from_code(c.u64()?);
+        let sig_value = Bytes::copy_from_slice(c.blob()?);
+        Ok(Self {
+            document,
+            parent_ref,
+            seq,
+            recovery,
+            sig_value,
+            sig_type,
+        })
+    }
+}
+
+/// A read cursor over an [`IdentityProof::encode`] record. Every accessor
+/// bounds-checks and advances `pos`, returning [`ProofDecodeError::Malformed`]
+/// on truncation.
+struct Cursor<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8], ProofDecodeError> {
+        if self.pos + n > self.buf.len() {
+            return Err(ProofDecodeError::Malformed);
+        }
+        let out = &self.buf[self.pos..self.pos + n];
+        self.pos += n;
+        Ok(out)
+    }
+
+    fn byte(&mut self) -> Result<u8, ProofDecodeError> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u64(&mut self) -> Result<u64, ProofDecodeError> {
+        Ok(u64::from_be_bytes(self.take(8)?.try_into().unwrap()))
+    }
+
+    fn array32(&mut self) -> Result<[u8; 32], ProofDecodeError> {
+        Ok(self.take(32)?.try_into().unwrap())
+    }
+
+    fn blob(&mut self) -> Result<&'a [u8], ProofDecodeError> {
+        let len = self.u64()? as usize;
+        self.take(len)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_proof(
+        seq: u64,
+        recovery: Option<RecoveryCommitment>,
+        parent: Option<[u8; 32]>,
+    ) -> IdentityProof {
+        IdentityProof {
+            document: DidDocument::new_simple("did:ndn:/alice", "did:ndn:/alice#key-0", &[9u8; 32]),
+            parent_ref: parent,
+            seq,
+            recovery,
+            sig_value: Bytes::from_static(&[1, 2, 3, 4]),
+            sig_type: SignatureType::SignatureEd25519,
+        }
+    }
+
+    #[test]
+    fn wire_round_trips_with_quorum_recovery_and_parent() {
+        let commitment = RecoveryCommitment::Quorum {
+            keys: vec![[1u8; 32], [2u8; 32], [3u8; 32]],
+            threshold: 2,
+        };
+        let p = sample_proof(3, Some(commitment.clone()), Some([7u8; 32]));
+        let back = IdentityProof::decode(&p.encode()).expect("decode");
+
+        assert_eq!(back.seq, 3);
+        assert_eq!(back.parent_ref, Some([7u8; 32]));
+        assert_eq!(back.recovery, Some(commitment));
+        assert_eq!(back.sig_value, p.sig_value);
+        // The signature still binds: decoded canonical bytes match the original.
+        assert_eq!(back.canonical_bytes(), p.canonical_bytes());
+        assert_eq!(back.content_hash(), p.content_hash());
+    }
+
+    #[test]
+    fn genesis_with_single_key_recovery_round_trips() {
+        let p = sample_proof(0, Some(RecoveryCommitment::Key([5u8; 32])), None);
+        let back = IdentityProof::decode(&p.encode()).expect("decode");
+        assert_eq!(back.parent_ref, None);
+        assert_eq!(back.recovery, Some(RecoveryCommitment::Key([5u8; 32])));
+        assert_eq!(back.canonical_bytes(), p.canonical_bytes());
+    }
+
+    #[test]
+    fn no_recovery_round_trips() {
+        let p = sample_proof(1, None, Some([0u8; 32]));
+        let back = IdentityProof::decode(&p.encode()).expect("decode");
+        assert_eq!(back.recovery, None);
+        assert_eq!(back.canonical_bytes(), p.canonical_bytes());
+    }
+
+    #[test]
+    fn truncated_wire_is_malformed() {
+        let wire = sample_proof(1, None, None).encode();
+        assert!(matches!(
+            IdentityProof::decode(&wire[..wire.len() / 2]),
+            Err(ProofDecodeError::Malformed)
+        ));
     }
 }

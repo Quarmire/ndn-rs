@@ -65,6 +65,6 @@ pub use metadata::{
     DidDocumentMetadata, DidResolutionError, DidResolutionMetadata, DidResolutionOptions,
     DidResolutionResult,
 };
-pub use proof::{IdentityProof, RecoveryCommitment};
+pub use proof::{IdentityProof, ProofDecodeError, RecoveryCommitment};
 pub use resolver::{DidError, DidResolver, KeyDidResolver, NdnDidResolver, UniversalResolver};
 pub use url::{DereferencedResource, DidUrl, deref_did_url, deref_did_url_or_document};
