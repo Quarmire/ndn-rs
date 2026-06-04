@@ -709,4 +709,61 @@ mod tests {
             other => panic!("expected ChainCycle, got: {other:?}"),
         }
     }
+
+    /// A chain that is otherwise valid (good signatures, terminating at a held
+    /// anchor) is **rejected** when a key in it is revoked by the governing
+    /// context — the verifier auto-consults the context's revocation list at
+    /// every hop.
+    #[tokio::test]
+    async fn chain_walk_rejects_a_revoked_key() {
+        use crate::Keyring;
+        use crate::cert_cache::CertCache;
+        use crate::trust_context::SignedTrustContext;
+        use dashmap::DashMap;
+
+        // Anchor → /key cert → data signed by /key — the chain_walk_data_to_anchor
+        // shape, which validates Valid without a revocation.
+        let anchor_seed = [60u8; 32];
+        let anchor_name = name1("anchor");
+        let anchor_signer = Ed25519Signer::from_seed(&anchor_seed, anchor_name.clone());
+        let anchor_pk = ed25519_dalek::SigningKey::from_bytes(&anchor_seed)
+            .verifying_key()
+            .to_bytes();
+
+        let key_seed = [61u8; 32];
+        let key_name = name1("key");
+        let key_signer = Ed25519Signer::from_seed(&key_seed, key_name.clone());
+        let key_pk = ed25519_dalek::SigningKey::from_bytes(&key_seed)
+            .verifying_key()
+            .to_bytes();
+
+        let cert_wire = make_cert_data_packet(&key_name, &key_pk, &anchor_signer).await;
+        let cert = Certificate::decode(&Data::decode(cert_wire).unwrap()).unwrap();
+        let data = Data::decode(make_signed_data(&key_signer, "data", "key").await).unwrap();
+
+        // A context that holds the anchor but has revoked `/key`.
+        let ambient = SignedTrustContext::ambient(wildcard_schema(), Arc::new(DashMap::new()))
+            .with_revocation(key_name.clone());
+        ambient.add_anchor(Certificate {
+            name: Arc::new(anchor_name),
+            public_key: Bytes::copy_from_slice(&anchor_pk),
+            valid_from: 0,
+            valid_until: u64::MAX,
+            issuer: None,
+            signed_region: None,
+            sig_value: None,
+            sig_type: ndn_packet::SignatureType::SignatureEd25519,
+        });
+        let keyring = Arc::new(Keyring::with_ambient(Arc::new(ambient)));
+        let cert_cache = Arc::new(CertCache::new());
+        cert_cache.insert(cert);
+        let validator = Validator::with_keyring(keyring, cert_cache, None, 5);
+
+        match validator.validate_chain(&data).await {
+            ValidationResult::Invalid(TrustError::Revoked { name }) => {
+                assert_eq!(name, key_name.to_string());
+            }
+            other => panic!("expected Invalid(Revoked), got {other:?}"),
+        }
+    }
 }

@@ -250,4 +250,25 @@ mod tests {
             Err(RevocationError::Malformed)
         ));
     }
+
+    /// The full distribution loop: a verified self-revocation's `revoked` name
+    /// flows into a trust context (via a version bump), and a peer that adopts
+    /// the bumped context sees the key as revoked — which the validator's
+    /// chain walk then enforces (witnessed in ndn-security).
+    #[tokio::test]
+    async fn self_revocation_flows_into_a_context_revocation() {
+        use ndn_security::SignedTrustContext;
+
+        let (kc, pubkey) = keychain("/alice");
+        let rec = RevocationRecord::self_revoke(&kc, "compromised", 1).unwrap();
+        rec.verify(&pubkey).await.expect("self-revocation verifies");
+
+        // The context authority bumps the context with the revoked name; the
+        // bumped content is what a peer adopts.
+        let ctx = SignedTrustContext::hierarchical("/alice".parse().unwrap())
+            .with_revocation(rec.revoked.clone());
+        let adopted = SignedTrustContext::decode_content(&ctx.encode_content(), 2)
+            .expect("adopt the bumped context");
+        assert!(adopted.is_revoked(&rec.revoked));
+    }
 }
