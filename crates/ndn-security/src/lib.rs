@@ -64,8 +64,8 @@ pub use signer::{
 pub use signing_info::{SignatureInfoOverrides, SignerSelection, SigningInfo};
 pub use trust::{InsecureTrust, LvsTrust, StaticTrust, TrustPolicy};
 pub use trust_context::{
-    EnrollmentHint, SchemaBlob, SchemaFormat, SigningPair, SignedTrustContext, SignedTrustContextError,
-    dryrun_orphans,
+    EnrollmentHint, SchemaBlob, SchemaFormat, SignedTrustContext, SignedTrustContextError,
+    SigningPair, dryrun_orphans,
 };
 pub use trust_schema::{
     NamePattern, PatternComponent, PatternParseError, SchemaGate, SchemaRule, TrustSchema,

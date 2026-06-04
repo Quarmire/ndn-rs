@@ -437,7 +437,8 @@ impl SignedTrustContext {
                         }
                     }
                     schema_blob = Some(SchemaBlob {
-                        format: format.ok_or(SignedTrustContextError::MissingField("SchemaFormat"))?,
+                        format: format
+                            .ok_or(SignedTrustContextError::MissingField("SchemaFormat"))?,
                         body: body.ok_or(SignedTrustContextError::MissingField("SchemaBody"))?,
                     });
                 }
@@ -456,7 +457,9 @@ impl SignedTrustContext {
                 }
                 // Unknown critical sub-TLV → reject; unknown non-critical → skip.
                 other if is_critical(other) => {
-                    return Err(SignedTrustContextError::Truncated("unknown critical sub-TLV"));
+                    return Err(SignedTrustContextError::Truncated(
+                        "unknown critical sub-TLV",
+                    ));
                 }
                 _ => {}
             }

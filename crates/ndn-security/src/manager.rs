@@ -81,6 +81,16 @@ impl SecurityManager {
         Ok(key_name)
     }
 
+    /// Register an **externally-held** signer under `key_name` — e.g. a
+    /// `CustodianSigner` backed by the device enclave or a remote fob. The
+    /// private key never enters the key store; `get_signer_sync(key_name)`
+    /// returns this signer, so a [`KeyChain`](crate::KeyChain) (and an
+    /// `ndn_identity::Identity`) built over this manager signs *through* the
+    /// custodian. The seam for hardware/remote custody.
+    pub fn register_signer(&self, key_name: Name, signer: Arc<dyn Signer>) {
+        self.keys.add_arc(Arc::new(key_name), signer);
+    }
+
     /// Generate a fresh ECDSA-P256 signing key. Use this instead of
     /// [`generate_ed25519`](Self::generate_ed25519) when the identity
     /// must be verifiable by ndn-cxx tooling, which doesn't support

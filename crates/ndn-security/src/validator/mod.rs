@@ -110,7 +110,10 @@ impl Validator {
     /// Create a validator with a private cert cache (no chain walking). The
     /// `schema` backs the ambient context.
     pub fn new(schema: TrustSchema) -> Self {
-        let ambient = Arc::new(SignedTrustContext::ambient(schema, Arc::new(DashMap::new())));
+        let ambient = Arc::new(SignedTrustContext::ambient(
+            schema,
+            Arc::new(DashMap::new()),
+        ));
         Self {
             keyring: Arc::new(Keyring::with_ambient(ambient)),
             cert_cache: Arc::new(CertCache::new()),

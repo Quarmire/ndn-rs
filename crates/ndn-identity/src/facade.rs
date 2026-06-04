@@ -29,7 +29,9 @@ use bytes::Bytes;
 use ndn_packet::{Name, SignatureType};
 
 use ndn_security::did::{UniversalResolver, name_to_did};
-use ndn_security::{DidDocument, IdentityProof, KeyChain, RecoveryCommitment, Signer};
+use ndn_security::{
+    DidDocument, IdentityProof, KeyChain, RecoveryCommitment, SecurityManager, Signer,
+};
 
 use crate::error::IdentityError;
 use crate::renewal::RenewalHandle;
@@ -73,7 +75,10 @@ impl Identity {
     /// File-backed: generates a key + self-signed cert on first run, reloads it
     /// afterwards.
     pub fn open_or_create(path: &Path, name: impl AsRef<str>) -> Result<Self, IdentityError> {
-        Ok(Self::from_keychain(KeyChain::open_or_create(path, name)?, None))
+        Ok(Self::from_keychain(
+            KeyChain::open_or_create(path, name)?,
+            None,
+        ))
     }
 
     /// Run the NDNCERT INFO → NEW → CHALLENGE exchange and persist the issued
@@ -106,6 +111,29 @@ impl Identity {
         Ok(identity)
     }
 
+    /// Build an identity whose operational key is held **externally** — by a
+    /// `Custodian` (the phone enclave, a remote fob), passed as an
+    /// `Arc<dyn Signer>` (e.g. `ndn_custodian::CustodianSigner`). The signer is
+    /// registered under `key_name` so the identity signs and verifies like any
+    /// `KeyChain`, while the private key stays in its custodian and never enters
+    /// the key store. This is how a custodied/enclave-held key becomes an
+    /// `Identity` principal. Add the issued certificate as a trust anchor via
+    /// the returned identity's `add_trust_anchor` (deref to `KeyChain`).
+    ///
+    /// No `did:ndn` rotation history is created (a keychain-backed principal);
+    /// once the lifecycle traits can reach the custody layer, recovery/rotation
+    /// over a custodian-held key layer on top.
+    pub fn from_signer(
+        name: Name,
+        key_name: Name,
+        signer: Arc<dyn Signer>,
+    ) -> Result<Self, IdentityError> {
+        let mgr = SecurityManager::new();
+        mgr.register_signer(key_name.clone(), signer);
+        let keychain = KeyChain::from_parts(Arc::new(mgr), name, key_name);
+        Ok(Self::from_keychain(keychain, None))
+    }
+
     /// Wrap an existing keychain (with an optional renewal task).
     pub fn from_keychain(keychain: KeyChain, renewal: Option<RenewalHandle>) -> Self {
         Self {
@@ -131,10 +159,7 @@ impl Identity {
     /// creation** — the safe default. The keychain's identity is the principal
     /// namespace; its key self-signs the genesis key-state, which pre-commits
     /// `recovery` (the authority that can later recover the principal).
-    pub fn create(
-        keychain: KeyChain,
-        recovery: RecoveryCommitment,
-    ) -> Result<Self, IdentityError> {
+    pub fn create(keychain: KeyChain, recovery: RecoveryCommitment) -> Result<Self, IdentityError> {
         Self::genesis(keychain, Some(recovery))
     }
 
@@ -164,11 +189,9 @@ impl Identity {
     /// swap in `new` as the operational keychain. Requires an existing history
     /// (created via [`create`](Self::create)).
     pub async fn rotate(&mut self, new: KeyChain) -> Result<(), IdentityError> {
-        let current = self
-            .history
-            .last()
-            .cloned()
-            .ok_or_else(|| IdentityError::Lifecycle("rotate requires a created principal".into()))?;
+        let current = self.history.last().cloned().ok_or_else(|| {
+            IdentityError::Lifecycle("rotate requires a created principal".into())
+        })?;
         let did = name_to_did(self.keychain.name());
         let new_signer = new.signer()?;
         let cur_signer = self.keychain.signer()?;
@@ -180,7 +203,13 @@ impl Identity {
             current.recovery.clone(),
             cur_signer.as_ref(),
         )?;
-        authorize(&DidDocumentRotation, &current, &next, &TransitionProof::Intrinsic).await?;
+        authorize(
+            &DidDocumentRotation,
+            &current,
+            &next,
+            &TransitionProof::Intrinsic,
+        )
+        .await?;
         self.history.push(next);
         self.keychain = new;
         Ok(())
@@ -309,7 +338,11 @@ async fn authorize(
     proof: &TransitionProof,
 ) -> Result<(), IdentityError> {
     match authority
-        .authorizes(&KeyState::Did(prior.clone()), &KeyState::Did(next.clone()), proof)
+        .authorizes(
+            &KeyState::Did(prior.clone()),
+            &KeyState::Did(next.clone()),
+            proof,
+        )
         .await
     {
         AuthorityOutcome::Authorized => Ok(()),
@@ -328,6 +361,44 @@ mod tests {
     fn recovery_key(seed: u8) -> ([u8; 32], Ed25519Signer) {
         let s = Ed25519Signer::from_seed(&[seed; 32], "/recovery/KEY/r".parse().unwrap());
         (s.public_key_bytes(), s)
+    }
+
+    #[tokio::test]
+    async fn from_signer_routes_signing_through_a_custodian() {
+        use ndn_custodian::{Custodian, CustodianSigner, InPageCustodian, KeyId};
+        use ndn_security::verifier::verify_by_sig_type;
+        use ndn_security::{Ed25519Signer, Signer, VerifyOutcome};
+
+        // The key lives in a custodian (here a software in-page one; on a phone
+        // this is the Secure Enclave / StrongBox). It never enters the keystore.
+        let name: Name = "/phone/alice".parse().unwrap();
+        let key_name: Name = "/phone/alice/KEY/k1".parse().unwrap();
+        let inner = Ed25519Signer::from_seed(&[5u8; 32], key_name.clone());
+        let pubkey = inner.public_key();
+        let pubkey_bytes = inner.public_key_bytes();
+        let key_id = KeyId(key_name.clone());
+        let custodian = InPageCustodian::new();
+        custodian.insert(key_id.clone(), inner);
+        let custodian_signer: Arc<dyn Signer> = Arc::new(CustodianSigner::new(
+            Arc::new(custodian) as Arc<dyn Custodian>,
+            key_id,
+            SignatureType::SignatureEd25519,
+            pubkey,
+        ));
+
+        // It becomes an Identity that derefs to a KeyChain and signs through the
+        // custodian.
+        let id = Identity::from_signer(name.clone(), key_name.clone(), custodian_signer).unwrap();
+        assert_eq!(id.name(), &name);
+        assert_eq!(id.key_name(), &key_name);
+
+        let signer = id.signer().unwrap();
+        let region = b"a signed command";
+        let sig = signer.sign(region).await.unwrap();
+        assert!(matches!(
+            verify_by_sig_type(SignatureType::SignatureEd25519, region, &sig, &pubkey_bytes).await,
+            Ok(VerifyOutcome::Valid)
+        ));
     }
 
     #[test]
@@ -349,13 +420,17 @@ mod tests {
         assert_eq!(id.current_key_state().unwrap().seq, 0);
         assert!(id.is_recoverable());
 
-        id.rotate(KeyChain::ephemeral("/alice").unwrap()).await.unwrap();
+        id.rotate(KeyChain::ephemeral("/alice").unwrap())
+            .await
+            .unwrap();
         assert_eq!(id.current_key_state().unwrap().seq, 1);
         assert_eq!(id.history().len(), 2);
 
         // The whole history verifies as a rotation chain.
         let chain: Vec<KeyState> = id.history().iter().cloned().map(KeyState::Did).collect();
-        let head = crate::resolve_chain(&DidDocumentRotation, &chain).await.unwrap();
+        let head = crate::resolve_chain(&DidDocumentRotation, &chain)
+            .await
+            .unwrap();
         match head {
             KeyState::Did(p) => assert_eq!(p.seq, 1),
             _ => panic!("did head"),
@@ -365,22 +440,29 @@ mod tests {
     #[tokio::test]
     async fn recover_installs_a_new_key_via_the_committed_authority() {
         let (rk_pub, rk) = recovery_key(7);
-        let id =
-            Identity::create(KeyChain::ephemeral("/alice").unwrap(), RecoveryCommitment::Key(rk_pub))
-                .unwrap();
+        let id = Identity::create(
+            KeyChain::ephemeral("/alice").unwrap(),
+            RecoveryCommitment::Key(rk_pub),
+        )
+        .unwrap();
         let published = id.history().to_vec();
 
         // The committed recovery key authorizes a fresh operational keychain.
-        let recovered =
-            Identity::recover(published, KeyChain::ephemeral("/alice").unwrap(), &[(0, &rk)])
-                .await
-                .unwrap();
+        let recovered = Identity::recover(
+            published,
+            KeyChain::ephemeral("/alice").unwrap(),
+            &[(0, &rk)],
+        )
+        .await
+        .unwrap();
         assert_eq!(recovered.current_key_state().unwrap().seq, 1);
 
         // A stranger's key cannot recover.
-        let id2 =
-            Identity::create(KeyChain::ephemeral("/bob").unwrap(), RecoveryCommitment::Key(rk_pub))
-                .unwrap();
+        let id2 = Identity::create(
+            KeyChain::ephemeral("/bob").unwrap(),
+            RecoveryCommitment::Key(rk_pub),
+        )
+        .unwrap();
         let stranger = Ed25519Signer::from_seed(&[9; 32], "/evil/KEY/x".parse().unwrap());
         let err = Identity::recover(
             id2.history().to_vec(),
@@ -394,9 +476,11 @@ mod tests {
     #[test]
     fn add_device_scopes_a_grant_under_the_principal() {
         let (rk_pub, _) = recovery_key(7);
-        let id =
-            Identity::create(KeyChain::ephemeral("/alice").unwrap(), RecoveryCommitment::Key(rk_pub))
-                .unwrap();
+        let id = Identity::create(
+            KeyChain::ephemeral("/alice").unwrap(),
+            RecoveryCommitment::Key(rk_pub),
+        )
+        .unwrap();
         let scope = CapabilitySet {
             sign: vec![crate::trust_context::pattern_under(
                 &"/alice/device/phone".parse().unwrap(),
