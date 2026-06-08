@@ -53,6 +53,7 @@
 - [NDNCERT setup](./guides/ndncert-setup.md)
 - [Security pitfalls](./guides/security-pitfalls.md)
 - [Running the dashboard](./guides/running-the-dashboard.md)
+- [Remote-signer pairing](./guides/remote-signer-pairing.md)
 - [Self-hosting](./guides/self-hosting.md)
 
 # Operations
