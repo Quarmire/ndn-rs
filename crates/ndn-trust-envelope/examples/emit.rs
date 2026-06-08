@@ -29,6 +29,18 @@ fn main() {
             eprintln!("decoded kind={:?} -> {parsed:?}", parsed.kind());
             return;
         }
+        // Render a URI as a scannable QR SVG (testing the mobile scanner).
+        Some("qr") if args.len() == 3 => {
+            use qrcode::QrCode;
+            let code = QrCode::new(args[1].as_bytes()).unwrap_or_else(|e| die(&format!("qr: {e}")));
+            let svg = code
+                .render::<qrcode::render::svg::Color<'_>>()
+                .min_dimensions(420, 420)
+                .build();
+            fs::write(&args[2], svg).unwrap_or_else(|e| die(&format!("write {}: {e}", args[2])));
+            eprintln!("wrote QR to {}", args[2]);
+            return;
+        }
         _ => die(
             "usage: emit (bag <safebag-file> <key-name> | anchor <version> <content-file> | decode <uri>)",
         ),

@@ -9,3 +9,7 @@ ndn-tlv   = { workspace = true, default-features = false }
 bytes     = { workspace = true, features = ["std"] }
 base64    = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+# only for the `emit` helper's `qr` mode (renders a payload SVG for testing)
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
