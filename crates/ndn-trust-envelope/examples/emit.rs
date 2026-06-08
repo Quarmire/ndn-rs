@@ -23,6 +23,12 @@ fn main() {
             version: args[1].parse().unwrap_or_else(|_| die("version must be a number")),
             context_content: read_artifact(&args[2]),
         },
+        Some("invite") if args.len() == 4 || args.len() == 5 => TrustEnvelope::Invite {
+            ca_prefix: args[1].clone(),
+            identity_namespace: args[2].clone(),
+            token: args[3].clone(),
+            ttl_secs: args.get(4).and_then(|s| s.parse().ok()),
+        },
         // Round-trip check: parse a URI back and describe it.
         Some("decode") if args.len() == 2 => {
             let parsed = TrustEnvelope::from_uri(&args[1]).unwrap_or_else(|e| die(&format!("decode: {e}")));
@@ -42,7 +48,8 @@ fn main() {
             return;
         }
         _ => die(
-            "usage: emit (bag <safebag-file> <key-name> | anchor <version> <content-file> | decode <uri>)",
+            "usage: emit (bag <safebag-file> <key-name> | anchor <version> <content-file> | \
+             invite <ca-prefix> <identity> <token> [ttl-secs] | decode <uri>)",
         ),
     };
     println!("{}", env.to_uri());
