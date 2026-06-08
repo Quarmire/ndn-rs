@@ -99,7 +99,10 @@ pub struct Validator {
     pub(super) keyring: Arc<Keyring>,
     pub(super) cert_cache: Arc<CertCache>,
     pub(super) max_chain: usize,
-    pub(super) cert_fetcher: Option<Arc<CertFetcher>>,
+    /// Set-once so a fetcher can be attached after construction (e.g. the
+    /// forwarder builds the localhop validator before its engine exists, then
+    /// attaches an engine-backed fetcher via [`Self::set_cert_fetcher`]).
+    pub(super) cert_fetcher: std::sync::OnceLock<Arc<CertFetcher>>,
     /// Monotonic counters bumped on terminal `Valid` / `Invalid` results;
     /// `Pending` is not counted (re-validation bumps when the cert lands).
     pub(super) verified_total: AtomicU64,
@@ -118,7 +121,7 @@ impl Validator {
             keyring: Arc::new(Keyring::with_ambient(ambient)),
             cert_cache: Arc::new(CertCache::new()),
             max_chain: 5,
-            cert_fetcher: None,
+            cert_fetcher: std::sync::OnceLock::new(),
             verified_total: AtomicU64::new(0),
             rejected_total: AtomicU64::new(0),
         }
@@ -140,7 +143,13 @@ impl Validator {
             keyring: Arc::new(Keyring::with_ambient(ambient)),
             cert_cache,
             max_chain,
-            cert_fetcher,
+            cert_fetcher: {
+                let cell = std::sync::OnceLock::new();
+                if let Some(f) = cert_fetcher {
+                    let _ = cell.set(f);
+                }
+                cell
+            },
             verified_total: AtomicU64::new(0),
             rejected_total: AtomicU64::new(0),
         }
@@ -158,7 +167,13 @@ impl Validator {
             keyring,
             cert_cache,
             max_chain,
-            cert_fetcher,
+            cert_fetcher: {
+                let cell = std::sync::OnceLock::new();
+                if let Some(f) = cert_fetcher {
+                    let _ = cell.set(f);
+                }
+                cell
+            },
             verified_total: AtomicU64::new(0),
             rejected_total: AtomicU64::new(0),
         }
@@ -167,6 +182,22 @@ impl Validator {
     /// The keyring this validator dispatches against.
     pub fn keyring(&self) -> &Arc<Keyring> {
         &self.keyring
+    }
+
+    /// Whether this validator can fetch missing certificates over NDN. Command
+    /// authorisation uses this to pick the fetch-enabled chain walk
+    /// ([`Self::validate_interest_chain`]) over the cache-only
+    /// [`Self::validate_interest`].
+    pub fn has_cert_fetcher(&self) -> bool {
+        self.cert_fetcher.get().is_some()
+    }
+
+    /// Attach a certificate fetcher after construction (set-once). Returns
+    /// `Err` if a fetcher was already set. Lets the forwarder build the localhop
+    /// validator before its engine exists, then wire an engine-backed fetcher
+    /// once the engine is up.
+    pub fn set_cert_fetcher(&self, fetcher: Arc<CertFetcher>) -> Result<(), Arc<CertFetcher>> {
+        self.cert_fetcher.set(fetcher)
     }
 
     /// Adopt a named [`SignedTrustContext`] into the keyring. Data under its
@@ -195,6 +226,12 @@ impl Validator {
 
     pub fn cert_cache(&self) -> &CertCache {
         &self.cert_cache
+    }
+
+    /// The shared cert cache handle — pass to a [`CertFetcher`] so fetched certs
+    /// populate the same cache this validator reads.
+    pub fn cert_cache_arc(&self) -> Arc<CertCache> {
+        Arc::clone(&self.cert_cache)
     }
 
     /// Add an anchor to the ambient context (the flat-anchor compatibility

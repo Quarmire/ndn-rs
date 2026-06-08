@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use ndn_packet::{Data, Name, SignatureType};
+use ndn_packet::{Data, Interest, KeyLocator, Name, SignatureType};
 
 use crate::cert_cache::Certificate;
 use crate::safe_data::TrustPath;
@@ -9,8 +9,20 @@ use crate::verifier::verify_by_sig_type;
 use crate::{SafeData, TrustError, VerifyOutcome};
 
 use super::{
-    ChainTrace, ChainTraceStep, TraceFailure, TraceRuleApplied, ValidationResult, Validator, now_ns,
+    ChainTrace, ChainTraceStep, InterestValidationOutcome, TraceFailure, TraceRuleApplied,
+    ValidationResult, Validator, now_ns,
 };
+
+/// Outcome of [`Validator::walk_to_anchor`] — the shared chain-walk core used by
+/// both the Data and signed-Interest fetch-enabled validation paths.
+enum WalkOutcome {
+    /// The chain reached a trust anchor; carries the cert names walked.
+    Anchored(Vec<Name>),
+    /// A cert in the chain couldn't be resolved (cache miss + no/failed fetch).
+    Pending,
+    /// The chain is invalid (bad signature, schema mismatch, revoked, cycle, …).
+    Invalid(TrustError),
+}
 
 impl Validator {
     /// Validate by walking the full certificate chain.
@@ -60,13 +72,102 @@ impl Validator {
             None => return ValidationResult::Invalid(TrustError::InvalidSignature),
         };
 
-        // Dispatch to the context governing this name; the chain is checked
-        // against *its* schema (with the hierarchy floor) and terminates only
-        // at *its* anchors. An anchor held for another namespace cannot
-        // terminate this chain — the per-namespace skeleton-key fix.
-        let ctx = self.keyring.context_for(&data.name);
-        if !ctx.authorizes(&data.name, &first_key) {
-            return ValidationResult::Invalid(TrustError::SchemaMismatch);
+        // The chain is walked against the schema/anchors of the context
+        // governing this name (the per-namespace skeleton-key fix), with missing
+        // intermediates fetched via the `CertFetcher` if configured.
+        match self
+            .walk_to_anchor(
+                &data.name,
+                first_key,
+                data.signed_region(),
+                data.sig_value(),
+                sig_info.sig_type,
+            )
+            .await
+        {
+            WalkOutcome::Anchored(chain_names) => {
+                let safe = SafeData {
+                    inner: Data::decode(data.raw().clone()).unwrap(),
+                    trust_path: TrustPath::CertChain(chain_names),
+                    verified_at: now_ns(),
+                };
+                ValidationResult::Valid(Box::new(safe))
+            }
+            WalkOutcome::Pending => ValidationResult::Pending,
+            WalkOutcome::Invalid(e) => ValidationResult::Invalid(e),
+        }
+    }
+
+    /// Validate a **signed Interest** (e.g. an NFD command) by walking its
+    /// certificate chain to a trust anchor, fetching the signer's cert — and any
+    /// intermediates — via the [`CertFetcher`] if configured. Unlike
+    /// [`Validator::validate_interest`] (which trusts any cert already in the
+    /// cache), this verifies the signer cert actually chains to an anchor, so it
+    /// is safe to use with a network fetcher: an unknown self-signed key is
+    /// rejected rather than fetched-and-trusted.
+    pub async fn validate_interest_chain(&self, interest: &Interest) -> InterestValidationOutcome {
+        let Some(sig_info) = interest.sig_info() else {
+            return InterestValidationOutcome::Invalid(TrustError::InvalidSignature);
+        };
+        let Some(signed_region) = interest.signed_region() else {
+            return InterestValidationOutcome::Invalid(TrustError::InvalidSignature);
+        };
+        let Some(sig_value) = interest.sig_value() else {
+            return InterestValidationOutcome::Invalid(TrustError::InvalidSignature);
+        };
+
+        if sig_info.sig_type == SignatureType::DigestSha256 {
+            return match verify_by_sig_type(sig_info.sig_type, &signed_region, sig_value, &[]).await
+            {
+                Ok(VerifyOutcome::Valid) => InterestValidationOutcome::Valid,
+                Ok(VerifyOutcome::Invalid) => {
+                    InterestValidationOutcome::Invalid(TrustError::InvalidSignature)
+                }
+                Err(e) => InterestValidationOutcome::Invalid(e),
+            };
+        }
+
+        let first_key: Arc<Name> = match &sig_info.key_locator {
+            Some(KeyLocator::Name(n)) => Arc::new((**n).clone()),
+            Some(KeyLocator::KeyDigest(digest)) => match self.cert_cache.get_by_key_digest(digest) {
+                Some(cert) => Arc::clone(&cert.name),
+                None => return InterestValidationOutcome::Pending,
+            },
+            None => return InterestValidationOutcome::Invalid(TrustError::InvalidSignature),
+        };
+
+        match self
+            .walk_to_anchor(
+                &interest.name,
+                first_key,
+                &signed_region,
+                sig_value,
+                sig_info.sig_type,
+            )
+            .await
+        {
+            WalkOutcome::Anchored(_) => InterestValidationOutcome::Valid,
+            WalkOutcome::Pending => InterestValidationOutcome::Pending,
+            WalkOutcome::Invalid(e) => InterestValidationOutcome::Invalid(e),
+        }
+    }
+
+    /// Shared chain-walk core for the Data and signed-Interest paths: starting
+    /// from `(first_signed_region, first_sig_value)` signed by `first_key`, walk
+    /// cert → issuer until a trust anchor of the context governing
+    /// `context_name` terminates the chain. Missing certs are fetched via the
+    /// [`CertFetcher`] if configured (→ [`WalkOutcome::Pending`] on a miss).
+    async fn walk_to_anchor(
+        &self,
+        context_name: &Name,
+        first_key: Arc<Name>,
+        first_signed_region: &[u8],
+        first_sig_value: &[u8],
+        first_sig_type: SignatureType,
+    ) -> WalkOutcome {
+        let ctx = self.keyring.context_for(context_name);
+        if !ctx.authorizes(context_name, &first_key) {
+            return WalkOutcome::Invalid(TrustError::SchemaMismatch);
         }
         let anchors = ctx.anchors();
 
@@ -74,33 +175,33 @@ impl Validator {
         let mut chain_names: Vec<Name> = Vec::new();
         let mut seen: HashSet<Arc<Name>> = HashSet::new();
 
-        let mut current_signed_region: &[u8] = data.signed_region();
-        let mut current_sig_value: &[u8] = data.sig_value();
+        let mut current_signed_region: &[u8] = first_signed_region;
+        let mut current_sig_value: &[u8] = first_sig_value;
         let mut current_key_name: Arc<Name> = first_key;
-        let mut current_sig_type: SignatureType = sig_info.sig_type;
+        let mut current_sig_type: SignatureType = first_sig_type;
 
         let mut owned_signed_region: bytes::Bytes;
         let mut owned_sig_value: bytes::Bytes;
 
         for _depth in 0..self.max_chain {
             if !seen.insert(Arc::clone(&current_key_name)) {
-                return ValidationResult::Invalid(TrustError::ChainCycle {
+                return WalkOutcome::Invalid(TrustError::ChainCycle {
                     name: current_key_name.to_string(),
                 });
             }
 
-            // A chain that passes through a key revoked by the selected
-            // context is rejected — this is how an issuing-CA compromise is
-            // contained by a pulled context bump (no re-bootstrap).
+            // A chain that passes through a key revoked by the selected context
+            // is rejected — how an issuing-CA compromise is contained by a pulled
+            // context bump (no re-bootstrap).
             if ctx.is_revoked(&current_key_name) {
-                return ValidationResult::Invalid(TrustError::Revoked {
+                return WalkOutcome::Invalid(TrustError::Revoked {
                     name: current_key_name.to_string(),
                 });
             }
 
             if let Some(anchor) = anchors.get(&current_key_name) {
                 if !anchor.is_valid_at(now) {
-                    return ValidationResult::Invalid(TrustError::CertNotFound {
+                    return WalkOutcome::Invalid(TrustError::CertNotFound {
                         name: format!("expired trust anchor: {}", current_key_name),
                     });
                 }
@@ -114,27 +215,22 @@ impl Validator {
                 {
                     Ok(VerifyOutcome::Valid) => {
                         chain_names.push(current_key_name.as_ref().clone());
-                        let safe = SafeData {
-                            inner: Data::decode(data.raw().clone()).unwrap(),
-                            trust_path: crate::safe_data::TrustPath::CertChain(chain_names),
-                            verified_at: now,
-                        };
-                        ValidationResult::Valid(Box::new(safe))
+                        WalkOutcome::Anchored(chain_names)
                     }
                     Ok(VerifyOutcome::Invalid) => {
-                        ValidationResult::Invalid(TrustError::InvalidSignature)
+                        WalkOutcome::Invalid(TrustError::InvalidSignature)
                     }
-                    Err(e) => ValidationResult::Invalid(e),
+                    Err(e) => WalkOutcome::Invalid(e),
                 };
             }
 
             let cert = match self.resolve_cert(&current_key_name).await {
                 Some(c) => c,
-                None => return ValidationResult::Pending,
+                None => return WalkOutcome::Pending,
             };
 
             if !cert.is_valid_at(now) {
-                return ValidationResult::Invalid(TrustError::CertNotFound {
+                return WalkOutcome::Invalid(TrustError::CertNotFound {
                     name: format!("expired or not-yet-valid: {}", current_key_name),
                 });
             }
@@ -149,25 +245,25 @@ impl Validator {
             {
                 Ok(VerifyOutcome::Valid) => {}
                 Ok(VerifyOutcome::Invalid) => {
-                    return ValidationResult::Invalid(TrustError::InvalidSignature);
+                    return WalkOutcome::Invalid(TrustError::InvalidSignature);
                 }
-                Err(e) => return ValidationResult::Invalid(e),
+                Err(e) => return WalkOutcome::Invalid(e),
             }
 
             chain_names.push(current_key_name.as_ref().clone());
 
             let Some(issuer) = &cert.issuer else {
-                return ValidationResult::Invalid(TrustError::CertNotFound {
+                return WalkOutcome::Invalid(TrustError::CertNotFound {
                     name: format!("cert has no issuer: {}", cert.name),
                 });
             };
             let Some(sr) = &cert.signed_region else {
-                return ValidationResult::Invalid(TrustError::CertNotFound {
+                return WalkOutcome::Invalid(TrustError::CertNotFound {
                     name: format!("cert missing signed region: {}", cert.name),
                 });
             };
             let Some(sv) = &cert.sig_value else {
-                return ValidationResult::Invalid(TrustError::CertNotFound {
+                return WalkOutcome::Invalid(TrustError::CertNotFound {
                     name: format!("cert missing sig value: {}", cert.name),
                 });
             };
@@ -180,7 +276,7 @@ impl Validator {
             current_sig_type = cert.sig_type;
         }
 
-        ValidationResult::Invalid(TrustError::ChainTooDeep {
+        WalkOutcome::Invalid(TrustError::ChainTooDeep {
             limit: self.max_chain,
         })
     }
@@ -317,7 +413,7 @@ impl Validator {
         if let Some(cert) = self.cert_cache.get(name) {
             return Some(cert);
         }
-        if let Some(fetcher) = &self.cert_fetcher {
+        if let Some(fetcher) = self.cert_fetcher.get() {
             fetcher.fetch(name).await.ok()
         } else {
             None
@@ -486,6 +582,140 @@ mod tests {
             validator.validate_chain(&data).await,
             ValidationResult::Pending
         ));
+    }
+
+    /// Build a signed command Interest with `signer`, KeyLocator = `key_name`.
+    async fn make_signed_interest(signer: &Ed25519Signer, key_name: &Name, cmd: &str) -> Bytes {
+        use ndn_packet::encode::InterestBuilder;
+        let name: Name = cmd.parse().unwrap();
+        InterestBuilder::new(name)
+            .sign_fallible(signer.sig_type(), Some(key_name), |region: &[u8]| {
+                let region = Bytes::copy_from_slice(region);
+                async move { signer.sign(&region).await.map_err(|_| ()) }
+            })
+            .await
+            .expect("sign command interest")
+    }
+
+    fn anchor_cert(name: Name, pk: [u8; 32]) -> Certificate {
+        Certificate {
+            name: Arc::new(name),
+            public_key: Bytes::copy_from_slice(&pk),
+            valid_from: 0,
+            valid_until: u64::MAX,
+            issuer: None,
+            signed_region: None,
+            sig_value: None,
+            sig_type: ndn_packet::SignatureType::SignatureEd25519,
+        }
+    }
+
+    /// A signed command whose signer cert is *not* cached but *is* fetchable and
+    /// chains to a trust anchor validates via the [`CertFetcher`].
+    #[tokio::test]
+    async fn validate_interest_chain_fetches_signer_cert() {
+        use crate::cert_fetcher::{CertFetcher, FetchFn};
+        use ndn_packet::Interest;
+        use std::time::Duration;
+
+        let ca_seed = [30u8; 32];
+        let ca_name = name1("ca");
+        let ca_signer = Ed25519Signer::from_seed(&ca_seed, ca_name.clone());
+        let ca_pk = ed25519_dalek::SigningKey::from_bytes(&ca_seed)
+            .verifying_key()
+            .to_bytes();
+
+        let op_seed = [31u8; 32];
+        let op_key_name = Name::from_components([comp("op"), comp("KEY"), comp("k1")]);
+        let op_signer = Ed25519Signer::from_seed(&op_seed, op_key_name.clone());
+        let op_pk = ed25519_dalek::SigningKey::from_bytes(&op_seed)
+            .verifying_key()
+            .to_bytes();
+        // Operator cert signed by the CA, named exactly the KeyLocator name.
+        let op_cert_wire = make_cert_data_packet(&op_key_name, &op_pk, &ca_signer).await;
+        let cert_wire = op_cert_wire;
+
+        let interest_wire =
+            make_signed_interest(&op_signer, &op_key_name, "/localhop/nfd/rib/register").await;
+        let interest = Interest::decode(interest_wire).unwrap();
+
+        let validator = Validator::new(wildcard_schema());
+        validator.add_trust_anchor(anchor_cert(ca_name, ca_pk));
+
+        // Fetcher returns the operator cert; it is NOT pre-inserted into the cache.
+        let want = op_key_name.clone();
+        let fetch_fn: FetchFn = Arc::new(move |name: Name| {
+            let wire = cert_wire.clone();
+            let want = want.clone();
+            Box::pin(async move { (name == want).then(|| Data::decode(wire).unwrap()) })
+        });
+        let fetcher = Arc::new(CertFetcher::new(
+            validator.cert_cache_arc(),
+            fetch_fn,
+            Duration::from_secs(1),
+        ));
+        validator.set_cert_fetcher(fetcher).ok();
+
+        assert!(
+            matches!(
+                validator.validate_interest_chain(&interest).await,
+                crate::InterestValidationOutcome::Valid
+            ),
+            "command should validate after fetching the signer cert"
+        );
+    }
+
+    /// A fetched cert that does NOT chain to a trust anchor (self-signed) is
+    /// rejected — the fetcher resolves it, but the walk finds no anchor.
+    #[tokio::test]
+    async fn validate_interest_chain_rejects_untrusted_fetched_cert() {
+        use crate::cert_fetcher::{CertFetcher, FetchFn};
+        use ndn_packet::Interest;
+        use std::time::Duration;
+
+        let ca_seed = [40u8; 32];
+        let ca_name = name1("ca");
+        let ca_pk = ed25519_dalek::SigningKey::from_bytes(&ca_seed)
+            .verifying_key()
+            .to_bytes();
+
+        // Operator self-signs its own cert (issuer = itself, not the CA).
+        let op_seed = [41u8; 32];
+        let op_key_name = Name::from_components([comp("rogue"), comp("KEY"), comp("k1")]);
+        let op_signer = Ed25519Signer::from_seed(&op_seed, op_key_name.clone());
+        let op_pk = ed25519_dalek::SigningKey::from_bytes(&op_seed)
+            .verifying_key()
+            .to_bytes();
+        let op_cert_wire = make_cert_data_packet(&op_key_name, &op_pk, &op_signer).await;
+        let cert_wire = op_cert_wire;
+
+        let interest_wire =
+            make_signed_interest(&op_signer, &op_key_name, "/localhop/nfd/rib/register").await;
+        let interest = Interest::decode(interest_wire).unwrap();
+
+        let validator = Validator::new(wildcard_schema());
+        validator.add_trust_anchor(anchor_cert(ca_name, ca_pk)); // trusts the CA, not the rogue
+
+        let want = op_key_name.clone();
+        let fetch_fn: FetchFn = Arc::new(move |name: Name| {
+            let wire = cert_wire.clone();
+            let want = want.clone();
+            Box::pin(async move { (name == want).then(|| Data::decode(wire).unwrap()) })
+        });
+        let fetcher = Arc::new(CertFetcher::new(
+            validator.cert_cache_arc(),
+            fetch_fn,
+            Duration::from_secs(1),
+        ));
+        validator.set_cert_fetcher(fetcher).ok();
+
+        assert!(
+            !matches!(
+                validator.validate_interest_chain(&interest).await,
+                crate::InterestValidationOutcome::Valid
+            ),
+            "a self-signed cert that doesn't chain to an anchor must be rejected"
+        );
     }
 
     async fn make_signed_data_with_key_digest(
