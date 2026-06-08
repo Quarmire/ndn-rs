@@ -1,0 +1,11 @@
+[package]
+name = "ndn-trust-envelope"
+version = "0.1.0"
+edition = "2024"
+description = "Shared `ndn-trust://` onboarding/pairing envelope codec (issuer + mobile)."
+
+[dependencies]
+ndn-tlv   = { workspace = true, default-features = false }
+bytes     = { workspace = true, features = ["std"] }
+base64    = { workspace = true }
+thiserror = { workspace = true }
