@@ -482,6 +482,53 @@ pub struct LogInspector {
     pub apply_filter: Arc<dyn Fn(&str) + Send + Sync + 'static>,
 }
 
+/// Pull a `/localhop` registrant's certificate back over the reverse path
+/// (reflexive forwarding) and insert it into `validator`'s cache, so the
+/// subsequent signature chain-walk resolves without a network cert-fetch. The
+/// registrant serves its certificate as the *content* of the reverse-pull Data
+/// (named under the reflexive name `R`); we decode that content into a
+/// [`Certificate`](ndn_security::Certificate). Best-effort — every failure path
+/// leaves the cache untouched, so the validator falls back to its FIB fetcher.
+#[cfg(not(target_arch = "wasm32"))]
+async fn reflexive_prefetch_localhop_cert(
+    consumer: &mut ndn_app::Consumer,
+    interest: &Interest,
+    validator: &ndn_security::Validator,
+) {
+    use std::time::Duration;
+    let wrapper = match consumer
+        .pull_reflexive(interest, "cert", Duration::from_secs(3))
+        .await
+    {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::debug!(target: "security", error = %e,
+                "localhop: reflexive cert pull failed; falling back to FIB fetch");
+            return;
+        }
+    };
+    let Some(content) = wrapper.content() else {
+        return;
+    };
+    let cert_data = match ndn_packet::Data::decode(content.clone()) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::debug!(target: "security", error = %e,
+                "localhop: reflexive cert wrapper content is not a Data");
+            return;
+        }
+    };
+    match ndn_security::Certificate::decode(&cert_data) {
+        Ok(cert) => {
+            tracing::debug!(target: "security", name = %cert.name,
+                "localhop: cached registrant cert via reflexive pull");
+            validator.cert_cache_arc().insert(cert);
+        }
+        Err(e) => tracing::debug!(target: "security", error = %e,
+            "localhop: reflexive-pulled cert did not decode"),
+    }
+}
+
 /// Read Interests from the management `InProcHandle`, dispatch NFD
 /// commands through the [`MgmtRouter`], and write Data responses back.
 #[allow(clippy::too_many_arguments)]
@@ -500,6 +547,15 @@ pub async fn run_ndn_mgmt_handler(
 ) {
     let mut router = MgmtRouter::new();
     modules::register_builtins(&mut router);
+
+    // Side consumer for reflexive certificate pulls during `/localhop`
+    // authorization: when a remote node registers a prefix, it carries a
+    // reflexive name so we can pull its certificate back along the reverse path
+    // (rather than FIB-fetching it — which routes the requester's identity at the
+    // CA, not the requester, and times out). Created lazily on first use. Native
+    // only (localhop registration is a forwarder/gateway concern).
+    #[cfg(not(target_arch = "wasm32"))]
+    let mut reflexive_consumer: Option<ndn_app::Consumer> = None;
 
     loop {
         let tagged = tokio::select! {
@@ -587,6 +643,25 @@ pub async fn run_ndn_mgmt_handler(
                     ),
                 )
             };
+            // Reflexive cert distribution: a `/localhop` registrant attaches a
+            // reflexive name so we can pull its certificate back along the reverse
+            // path of the command Interest. Pre-cache it so the validator's
+            // chain-walk resolves locally — fast, and crucially it works *before*
+            // any route to the requester exists (the chicken-and-egg of remote
+            // registration: validating the registrant needs its cert, but routing
+            // to its cert would need the registration). Best-effort; on failure
+            // the validator falls back to its FIB-backed CertFetcher.
+            #[cfg(not(target_arch = "wasm32"))]
+            if is_localhop_command
+                && interest.reflexive_name().is_some()
+                && let Some(validator) = mgmt_handles.localhop_command_validator.as_deref()
+            {
+                let consumer = reflexive_consumer.get_or_insert_with(|| {
+                    use ndn_app::EngineAppExt;
+                    engine.app_consumer(cancel.child_token())
+                });
+                reflexive_prefetch_localhop_cert(consumer, &interest, validator).await;
+            }
             if let Err(reason) = authorize_command(
                 &interest,
                 active_validator,
