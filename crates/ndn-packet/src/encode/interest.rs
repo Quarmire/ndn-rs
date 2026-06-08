@@ -351,6 +351,18 @@ impl InterestBuilder {
                     }
                 });
             }
+            // Reflexive-forwarding name: an unsigned, mutable forwarding element
+            // (like ForwardingHint), so it rides in `body_fields` outside the
+            // signed region. Lets a *signed* command (e.g. `/localhop` register)
+            // still carry `R` so the gateway can fetch the requester's cert back
+            // along the reverse path. Same encoding as the unsigned `build()`.
+            if let Some(ref rname) = self.reflexive_name {
+                w.write_nested(tlv_type::REFLEXIVE_NAME, |w| {
+                    for comp in rname.components() {
+                        w.write_tlv(comp.typ, &comp.value);
+                    }
+                });
+            }
             w.write_tlv(tlv_type::NONCE, &next_nonce().to_be_bytes());
             write_nni(&mut w, tlv_type::INTEREST_LIFETIME, lifetime_ms);
             if let Some(h) = self.hop_limit {
@@ -933,6 +945,30 @@ mod tests {
         // Absent by default.
         let plain = Interest::decode(InterestBuilder::new("/x").build()).unwrap();
         assert!(plain.reflexive_name().is_none());
+    }
+
+    /// A *signed* Interest carries its reflexive name too (in the unsigned body
+    /// section, outside the signed region) — required so a signed `/localhop`
+    /// register can let the gateway pull the requester's cert back reflexively.
+    #[test]
+    fn signed_interest_carries_reflexive_name() {
+        let rname: Name = "/rfx/deadbeef".parse().unwrap();
+        let kl: Name = "/op/KEY/k1".parse().unwrap();
+        let wire = InterestBuilder::new("/localhop/nfd/rib/register")
+            .must_be_fresh()
+            .lifetime(Duration::from_secs(4))
+            .reflexive_name(rname.clone())
+            .app_parameters(b"params")
+            .sign_sync(SignatureType::SignatureEd25519, Some(&kl), |_region| {
+                Bytes::from_static(&[7u8; 64])
+            });
+        let interest = Interest::decode(wire).expect("decode signed interest");
+        assert!(interest.sig_info().is_some(), "still a signed Interest");
+        assert_eq!(
+            interest.reflexive_name().map(|n| n.to_string()).as_deref(),
+            Some("/rfx/deadbeef"),
+            "reflexive name survives signing",
+        );
     }
 
     /// `random_reflexive_name` yields distinct `/rfx/<16-byte>` names.

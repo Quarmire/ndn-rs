@@ -61,13 +61,34 @@ impl Consumer {
         forward: InterestBuilder,
         reflexive: ndn_packet::Name,
         timeout: Duration,
-        mut serve_reverse: F,
+        serve_reverse: F,
     ) -> Result<Data, AppError>
     where
         F: FnMut(Interest) -> Fut,
         Fut: Future<Output = Result<Bytes, AppError>>,
     {
         let wire = forward.reflexive_name(reflexive.clone()).build();
+        self.fetch_reflexive_wire(wire, reflexive, timeout, serve_reverse)
+            .await
+    }
+
+    /// As [`fetch_reflexive`](Self::fetch_reflexive), but the caller supplies the
+    /// fully-encoded forward Interest `wire` (which MUST already carry the
+    /// reflexive name `reflexive`). Use this when the forward Interest is a
+    /// *signed* command — e.g. a `/localhop/nfd/rib/register` whose signature
+    /// must cover a builder-built body — so the reflexive name still rides along
+    /// (in the unsigned body section) and the producer can pull back.
+    pub async fn fetch_reflexive_wire<F, Fut>(
+        &mut self,
+        wire: Bytes,
+        reflexive: ndn_packet::Name,
+        timeout: Duration,
+        mut serve_reverse: F,
+    ) -> Result<Data, AppError>
+    where
+        F: FnMut(Interest) -> Fut,
+        Fut: Future<Output = Result<Bytes, AppError>>,
+    {
         self.send_raw(wire).await?;
 
         let deadline = Instant::now() + timeout;
