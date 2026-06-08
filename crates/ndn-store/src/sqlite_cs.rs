@@ -58,9 +58,20 @@ impl SqliteCs {
     /// Open (or create) a persistent CS at `path` (a single SQLite file).
     pub fn open(path: impl AsRef<std::path::Path>, max_bytes: usize) -> rusqlite::Result<Self> {
         let conn = Connection::open(path)?;
-        // WAL + NORMAL: durable across process death, no fsync per write — the
-        // CS is a cache, an unflushed tail on power-loss is acceptable.
-        conn.pragma_update(None, "journal_mode", "WAL")?;
+        // Rollback journal (TRUNCATE), NOT WAL. The CS is single-process-
+        // exclusive (only the tunnel/`:vpn` engine opens it), so WAL's
+        // multi-reader concurrency is unused — and WAL's `-shm` mmap byte-range
+        // locks are fragile on Android internal storage after a SIGKILL (the OS
+        // kills the engine process without a graceful close, then service
+        // restart reopens). That path fails with POSIX EAGAIN and never
+        // recovers. A TRUNCATE rollback journal recovers cleanly on the next
+        // open with only a single main-db-file lock. `busy_timeout` rides out
+        // the brief contention while a dead handle's lock is still being
+        // reclaimed during the service restart. synchronous=NORMAL is durable
+        // across process death (only a true power-loss could lose the tail,
+        // acceptable for a cache).
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.pragma_update(None, "journal_mode", "TRUNCATE")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute(
             "CREATE TABLE IF NOT EXISTS cs (\
