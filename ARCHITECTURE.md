@@ -63,7 +63,7 @@ scope = spec   (flat under crates/)   NDN community specs implemented faithfully
   ndn-transport                 Transport + LinkService traits, Face struct
                                 (NFD-style split), FaceId, FaceTable,
                                 StreamFace, TlvCodec
-  ndn-store                     NameTrie, Fib, PIT, ContentStore (LruCs/ShardedCs/FjallCs), DeadNonceList
+  ndn-store                     NameTrie, Fib, PIT, ContentStore (LruCs/ShardedCs/FjallCs/SqliteCs), DeadNonceList
   ndn-safebag                   SafeBag (cert + PKCS#5-encrypted key) — wasm-buildable carve-out of safe_bag.rs
   ndn-face-native                     Feature-gated native face types (UDP, TCP, WebSocket, Unix, SHM,
                                 serial, ethernet, virtual; BLE central via `ble://` + peripheral
@@ -206,7 +206,7 @@ downstream in-records.
   ids before decode so overlapping fragment sequences from different senders do
   not collide.
 - **Dead Nonce List** — engine-owned `DeadNonceList` retaining `(name_hash, nonce)` fingerprints after PIT erasure; `PitCheckStage` consults it before aggregation, while `PitMatchStage` and the PIT expiry task insert retiring nonces.
-- **Content Store** — trait-based; `LruCs` (in-memory), `ShardedCs` (parallel), `FjallCs` (disk). Entries carry an absolute `stale_at` derived from `FreshnessPeriod`; `MustBeFresh` Interests miss stale entries at both the store and `CsLookupStage`, while non-`MustBeFresh` Interests may still use stale cached Data.
+- **Content Store** — trait-based; `LruCs` (in-memory), `ShardedCs` (parallel), `FjallCs` (disk, `fjall` feature), `SqliteCs` (disk, bundled SQLite, `sqlite-cs` feature — the Android backend, where fjall's directory lock is unsupported). The two disk backends share the same NDN-lexicographic key encoding (`cs_keycodec`) so `CanBePrefix` lookups are range scans. Entries carry an absolute `stale_at` derived from `FreshnessPeriod`; `MustBeFresh` Interests miss stale entries at both the store and `CsLookupStage`, while non-`MustBeFresh` Interests may still use stale cached Data.
 - **Unsolicited Data policy** — `DropAll` by default, with `AdmitLocal`, `AdmitNetwork`, and `AdmitAll` available for operators that want NFD-style opportunistic caching on shared media. Admitted unsolicited Data is cache-only and still must pass validation before CS insertion.
 - **Strategy Table** — name trie mapping prefixes to `Arc<dyn Strategy>`
 - **SubscriptionRequest** — `ndn-packet` sub-TLV (type `0x230`) inside `ApplicationParameters`; enables persistent Interests that survive multiple Data deliveries; degrades gracefully on unsigned or unvalidated Interests
