@@ -14,9 +14,10 @@ use bytes::Bytes;
 
 use ndn_packet::{Interest, Name};
 
+use crate::cs_keycodec::{
+    STALE_AT_LEN, decode_value, encode_value, key_to_name, name_to_key, now_ns,
+};
 use crate::{ContentStore, CsCapacity, CsEntry, CsMeta, InsertResult};
-
-const STALE_AT_LEN: usize = 8;
 
 /// Persistent CS. `max_bytes` bounds *logical* Data bytes (excludes LSM
 /// overhead); data survives process restarts.
@@ -87,113 +88,6 @@ impl FjallCs {
         }
         self.current_bytes.store(current, Ordering::Relaxed);
     }
-}
-
-fn name_to_key(name: &Name) -> Vec<u8> {
-    let mut key = Vec::new();
-    for comp in name.components() {
-        write_var(&mut key, comp.typ);
-        write_var(&mut key, comp.value.len() as u64);
-        key.extend_from_slice(&comp.value);
-    }
-    key
-}
-
-fn key_to_name(key: &[u8]) -> Option<Name> {
-    use ndn_packet::NameComponent;
-    let mut components = smallvec::SmallVec::<[NameComponent; 8]>::new();
-    let mut pos = 0;
-    while pos < key.len() {
-        let (typ, consumed) = read_var(&key[pos..])?;
-        pos += consumed;
-        let (len, consumed) = read_var(&key[pos..])?;
-        pos += consumed;
-        let len = len as usize;
-        if pos + len > key.len() {
-            return None;
-        }
-        components.push(NameComponent::new(
-            typ,
-            Bytes::copy_from_slice(&key[pos..pos + len]),
-        ));
-        pos += len;
-    }
-    Some(Name::from_components(components))
-}
-
-fn encode_value(stale_at: u64, data: &[u8]) -> Vec<u8> {
-    let mut v = Vec::with_capacity(STALE_AT_LEN + data.len());
-    v.extend_from_slice(&stale_at.to_be_bytes());
-    v.extend_from_slice(data);
-    v
-}
-
-fn decode_value(val: &[u8]) -> Option<(u64, Bytes)> {
-    if val.len() < STALE_AT_LEN {
-        return None;
-    }
-    let stale_at = u64::from_be_bytes(val[..STALE_AT_LEN].try_into().ok()?);
-    let data = Bytes::copy_from_slice(&val[STALE_AT_LEN..]);
-    Some((stale_at, data))
-}
-
-fn write_var(buf: &mut Vec<u8>, val: u64) {
-    if val < 253 {
-        buf.push(val as u8);
-    } else if val <= 0xFFFF {
-        buf.push(253);
-        buf.extend_from_slice(&(val as u16).to_be_bytes());
-    } else if val <= 0xFFFF_FFFF {
-        buf.push(254);
-        buf.extend_from_slice(&(val as u32).to_be_bytes());
-    } else {
-        buf.push(255);
-        buf.extend_from_slice(&val.to_be_bytes());
-    }
-}
-
-fn read_var(buf: &[u8]) -> Option<(u64, usize)> {
-    if buf.is_empty() {
-        return None;
-    }
-    match buf[0] {
-        v @ 0..=252 => Some((v as u64, 1)),
-        253 => {
-            if buf.len() < 3 {
-                return None;
-            }
-            Some((u16::from_be_bytes([buf[1], buf[2]]) as u64, 3))
-        }
-        254 => {
-            if buf.len() < 5 {
-                return None;
-            }
-            Some((
-                u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as u64,
-                5,
-            ))
-        }
-        _ => {
-            // 255
-            if buf.len() < 9 {
-                return None;
-            }
-            Some((
-                u64::from_be_bytes([
-                    buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8],
-                ]),
-                9,
-            ))
-        }
-    }
-}
-
-fn now_ns() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
 }
 
 impl ContentStore for FjallCs {

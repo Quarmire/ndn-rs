@@ -11,6 +11,10 @@ classification = "spec"
 [features]
 default = []
 fjall = ["dep:fjall"]
+## Persistent CS backed by bundled SQLite (`SqliteCs`). Used on Android, where
+## fjall's file lock is unsupported (`std::fs::File::try_lock` → `Unsupported`
+## on `target_os = "android"`). Self-contained — the C library is compiled in.
+sqlite-cs = ["dep:rusqlite"]
 
 [dependencies]
 ndn-fwd-core = { workspace = true }
@@ -35,6 +39,9 @@ web-time  = { workspace = true }
 ndn-packet = { workspace = true, features = ["std"] }
 ring       = { workspace = true }
 fjall      = { workspace = true, optional = true }
+# Bundled SQLite (the C amalgamation is compiled into the cdylib) — no system
+# libsqlite3 needed, so it links cleanly into the Android `.so`.
+rusqlite   = { version = "0.32", features = ["bundled"], optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 ndn-packet = { workspace = true, features = ["std-wasm"] }
