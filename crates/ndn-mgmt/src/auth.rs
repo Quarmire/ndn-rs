@@ -184,7 +184,17 @@ pub(crate) async fn authorize_command(
             .to_string());
     }
     use ndn_security::InterestValidationOutcome::*;
-    match validator.validate_interest(interest).await {
+    // A validator with a cert fetcher (e.g. the localhop validator) walks the
+    // chain to an anchor, fetching the signer's cert over NDN — so a remote node
+    // (an operator that enrolled against a CA the gateway trusts but whose cert
+    // isn't cached locally) can be authorised. Cache-only validators keep the
+    // backward-compatible path.
+    let outcome = if validator.has_cert_fetcher() {
+        validator.validate_interest_chain(interest).await
+    } else {
+        validator.validate_interest(interest).await
+    };
+    match outcome {
         Valid => {}
         Invalid(e) => return Err(format!("invalid command signature: {e}")),
         Pending => return Err("signing certificate not yet resolved".to_string()),
