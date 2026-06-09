@@ -12,6 +12,8 @@
 pub mod app_face;
 pub mod connection;
 pub mod consumer;
+// Client-side connection demux (serve + fetch concurrently over one connection).
+pub mod demux;
 pub mod engine_ext;
 pub mod error;
 pub mod producer;
@@ -31,6 +33,7 @@ pub use connection::{Connection, InProcConnection, LpInfo};
 // IpcConnection talks to an external `ndn-fwd` over a Unix socket (ndn-ipc).
 #[cfg(not(target_arch = "wasm32"))]
 pub use connection::IpcConnection;
+pub use demux::{DemuxConnection, ServeGuard};
 pub use consumer::{
     Consumer, DEFAULT_INTEREST_LIFETIME, DEFAULT_TIMEOUT, SubscribeOptions, Subscription,
     VerifiedConsumer,
