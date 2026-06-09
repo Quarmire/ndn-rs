@@ -7,8 +7,12 @@
 //! [`Consumer::fetch_object`](crate::Consumer::fetch_object) and
 //! [`Producer::publish_object`](crate::Producer::publish_object).
 
+use std::time::Duration;
+
 use bytes::{Bytes, BytesMut};
+use ndn_packet::encode::DataBuilder;
 use ndn_packet::{Name, NameComponent};
+use ndn_security::{SignWith, Signer};
 use ndn_tlv::{TlvReader, TlvWriter};
 
 use crate::AppError;
@@ -217,6 +221,66 @@ impl PreparedObject {
             last_seg,
             segments,
         }
+    }
+
+    /// Answer one RDR Interest against this prepared object: the
+    /// `<name>/32=metadata` discovery Data, or a `<name>/v=<ver>/seg=<n>`
+    /// segment, signed with `signer` (or `DigestSha256` if `None`). Returns
+    /// `Ok(None)` when `interest_name` matches neither — the caller drops it.
+    ///
+    /// This is the per-Interest core shared by the [`Producer::publish_object`]
+    /// serve loop and any demultiplexed serve (e.g. a node serving objects and
+    /// fetching on one connection), so neither re-implements the matching.
+    ///
+    /// [`Producer::publish_object`]: crate::Producer::publish_object
+    pub fn answer_interest(
+        &self,
+        interest_name: &Name,
+        signer: Option<&dyn Signer>,
+    ) -> Result<Option<Bytes>, AppError> {
+        let finish = |builder: DataBuilder| -> Result<Bytes, AppError> {
+            match signer {
+                Some(s) => builder
+                    .sign_with_sync(s)
+                    .map_err(|e| AppError::Protocol(e.to_string())),
+                None => Ok(builder.build()),
+            }
+        };
+
+        // Metadata discovery: an Interest under the object name carrying the
+        // `metadata` keyword component (CanBePrefix + MustBeFresh from the consumer).
+        let metadata_keyword = NameComponent::keyword(Bytes::from_static(METADATA_KEYWORD));
+        if interest_name.has_prefix(&self.object_name)
+            && interest_name
+                .components()
+                .iter()
+                .skip(self.object_name.len())
+                .any(|c| c.typ == ndn_packet::tlv_type::KEYWORD && c.value == metadata_keyword.value)
+        {
+            let builder = DataBuilder::new(self.metadata_data_name.clone(), &self.metadata_content)
+                .freshness(Duration::from_millis(1000))
+                .final_block_id_typed_seg(0);
+            return Ok(Some(finish(builder)?));
+        }
+
+        // Segment: `<name>/v=<ver>/seg=<n>`.
+        if interest_name.has_prefix(&self.versioned_name)
+            && let Some(last) = interest_name.components().last()
+            && let Some(seg_idx) = last.as_segment()
+        {
+            let Some(payload) = self.segments.get(seg_idx as usize) else {
+                return Ok(None);
+            };
+            let seg_name = self.versioned_name.clone().append_segment(seg_idx);
+            let builder = if seg_idx == self.last_seg {
+                DataBuilder::new(seg_name, payload.as_ref()).final_block_id_typed_seg(self.last_seg)
+            } else {
+                DataBuilder::new(seg_name, payload.as_ref())
+            };
+            return Ok(Some(finish(builder)?));
+        }
+
+        Ok(None)
     }
 }
 

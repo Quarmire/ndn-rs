@@ -13,8 +13,7 @@ use ndn_face_native::local::InProcHandle;
 use ndn_ipc::{ChunkedProducer, ForwarderClient};
 use ndn_packet::encode::DataBuilder;
 use ndn_packet::{Interest, Name};
-use ndn_security::{SignWith, Signer};
-use std::time::Duration;
+use ndn_security::Signer;
 
 use crate::AppError;
 #[cfg(not(target_arch = "wasm32"))]
@@ -53,17 +52,6 @@ impl Producer {
     pub fn with_signer(mut self, signer: Arc<dyn Signer>) -> Self {
         self.signer = Some(signer);
         self
-    }
-
-    /// Finish a `Data`: signed with the configured signer, or `DigestSha256` if
-    /// none is set.
-    fn finish_data(&self, builder: DataBuilder) -> Result<Bytes, AppError> {
-        match &self.signer {
-            Some(signer) => builder
-                .sign_with_sync(&**signer)
-                .map_err(|e| AppError::Protocol(e.to_string())),
-            None => Ok(builder.build()),
-        }
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -150,9 +138,7 @@ impl Producer {
             chunk_size
         };
         let prepared = crate::rdr::PreparedObject::build(name.clone(), content, seg_size);
-        let metadata_keyword = ndn_packet::NameComponent::keyword(bytes::Bytes::from_static(
-            crate::rdr::METADATA_KEYWORD,
-        ));
+        let signer = self.signer.as_deref();
 
         loop {
             let raw = match self.conn.recv().await {
@@ -163,43 +149,10 @@ impl Producer {
                 Ok(i) => i,
                 Err(_) => continue,
             };
-            let i_name: &Name = &interest.name;
-
-            if i_name.has_prefix(&name)
-                && i_name.components().iter().skip(name.len()).any(|c| {
-                    c.typ == ndn_packet::tlv_type::KEYWORD && c.value == metadata_keyword.value
-                })
-            {
-                let data = self.finish_data(
-                    DataBuilder::new(
-                        prepared.metadata_data_name.clone(),
-                        &prepared.metadata_content,
-                    )
-                    .freshness(Duration::from_millis(1000))
-                    .final_block_id_typed_seg(0),
-                )?;
+            // The metadata + segment matching/build/sign is shared with the
+            // demultiplexed serve path, so both stay in lockstep.
+            if let Some(data) = prepared.answer_interest(&interest.name, signer)? {
                 self.conn.send(data).await?;
-                continue;
-            }
-
-            if i_name.has_prefix(&prepared.versioned_name)
-                && let Some(last) = i_name.components().last()
-                && let Some(seg_idx_u64) = last.as_segment()
-            {
-                let seg_idx = seg_idx_u64 as usize;
-                let Some(payload) = prepared.segments.get(seg_idx) else {
-                    continue;
-                };
-                let seg_name = prepared.versioned_name.clone().append_segment(seg_idx_u64);
-                let builder = if seg_idx_u64 == prepared.last_seg {
-                    DataBuilder::new(seg_name, payload.as_ref())
-                        .final_block_id_typed_seg(prepared.last_seg)
-                } else {
-                    DataBuilder::new(seg_name, payload.as_ref())
-                };
-                let data = self.finish_data(builder)?;
-                self.conn.send(data).await?;
-                continue;
             }
         }
     }
