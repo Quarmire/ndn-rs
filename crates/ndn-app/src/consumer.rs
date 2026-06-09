@@ -17,6 +17,27 @@ use ndn_packet::{Data, MAX_PERSISTENT_LIFETIME_SECS, Name, SubscriptionRequest};
 use ndn_security::{SafeData, Unverified, Validator};
 
 use crate::AppError;
+
+/// Verify a fetched `Data` against `validator` (when present) and return its
+/// content bytes. With a validator the Data must authenticate (signature checked
+/// against the pinned anchor) or this errors; without one, content is taken
+/// as-is (integrity only). `None` when the Data carries no Content. The single
+/// choke point both the unverified and verified RDR object paths route through.
+async fn accept_content(
+    data: Data,
+    validator: Option<&Validator>,
+) -> Result<Option<Bytes>, AppError> {
+    match validator {
+        Some(v) => {
+            let safe = Unverified::new(data)
+                .verify(v)
+                .await
+                .map_err(|e| AppError::Protocol(e.to_string()))?;
+            Ok(safe.data().content().map(|b| Bytes::copy_from_slice(b)))
+        }
+        None => Ok(data.content().map(|b| Bytes::copy_from_slice(b))),
+    }
+}
 #[cfg(not(target_arch = "wasm32"))]
 use crate::connection::IpcConnection;
 use crate::connection::{Connection, InProcConnection, LpInfo};
@@ -279,8 +300,29 @@ impl Consumer {
     /// ndnd `std/object/client_consume.go:22`; pair with
     /// [`Producer::publish_object`](crate::Producer::publish_object).
     pub async fn fetch_object(&mut self, name: impl Into<Name>) -> Result<Bytes, AppError> {
-        let name = name.into();
+        self.fetch_object_inner(name.into(), None).await
+    }
 
+    /// Verified whole-object fetch — the **secure** RDR path: like
+    /// [`fetch_object`](Self::fetch_object) but the metadata discovery Data AND
+    /// every segment are verified against `validator` before their bytes are
+    /// accepted, so the entire reassembled object is *authenticated*, not merely
+    /// integrity-checked. Prefer [`VerifiedConsumer::fetch_object`] (the
+    /// least-resistance safe verb); this exists so the raw consumer can do a
+    /// verified object fetch too.
+    pub async fn fetch_object_verified(
+        &mut self,
+        name: impl Into<Name>,
+        validator: &Validator,
+    ) -> Result<Bytes, AppError> {
+        self.fetch_object_inner(name.into(), Some(validator)).await
+    }
+
+    async fn fetch_object_inner(
+        &mut self,
+        name: Name,
+        validator: Option<&Validator>,
+    ) -> Result<Bytes, AppError> {
         let metadata_interest = InterestBuilder::new(crate::rdr::metadata_name(&name))
             .can_be_prefix()
             .must_be_fresh()
@@ -289,37 +331,21 @@ impl Consumer {
         let meta_data = self
             .fetch_wire(metadata_interest, Duration::from_millis(1500))
             .await?;
-        let meta_content = meta_data
-            .content()
-            .map(|b| Bytes::copy_from_slice(b))
+        let meta_content = accept_content(meta_data, validator)
+            .await?
             .ok_or_else(|| AppError::Protocol("metadata Data has no Content".into()))?;
         let meta = crate::rdr::MetaData::decode(meta_content)?;
         let last_seg = meta
             .last_segment()
             .ok_or_else(|| AppError::Protocol("metadata FinalBlockID unparseable".into()))?;
 
-        if last_seg == 0 {
-            let seg = self.fetch(meta.versioned_name.append_segment(0)).await?;
-            return Ok(seg
-                .content()
-                .map(|b| Bytes::copy_from_slice(b))
-                .unwrap_or_default());
-        }
-
-        let mut chunks: Vec<Bytes> = Vec::with_capacity((last_seg as usize) + 1);
+        let mut out = bytes::BytesMut::new();
         for n in 0..=last_seg {
             let seg_name = meta.versioned_name.clone().append_segment(n);
             let data = self.fetch(seg_name).await?;
-            chunks.push(
-                data.content()
-                    .map(|b| Bytes::copy_from_slice(b))
-                    .unwrap_or_default(),
-            );
-        }
-        let total: usize = chunks.iter().map(|c| c.len()).sum();
-        let mut out = bytes::BytesMut::with_capacity(total);
-        for c in chunks {
-            out.extend_from_slice(&c);
+            if let Some(chunk) = accept_content(data, validator).await? {
+                out.extend_from_slice(&chunk);
+            }
         }
         Ok(out.freeze())
     }
@@ -415,6 +441,14 @@ impl VerifiedConsumer {
             .content()
             .map(|b| Bytes::copy_from_slice(b))
             .ok_or_else(|| AppError::Protocol("Data has no content".into()))
+    }
+
+    /// Verified whole-object fetch — the secure RDR path. The metadata discovery
+    /// Data and every segment are verified against the pinned validator before
+    /// reassembly, so you get the object's bytes only if the *whole* object
+    /// authenticates. The safe counterpart to [`Consumer::fetch_object`].
+    pub async fn fetch_object(&mut self, name: impl Into<Name>) -> Result<Bytes, AppError> {
+        self.inner.fetch_object_verified(name, &self.validator).await
     }
 
     /// The validator this consumer verifies against.
