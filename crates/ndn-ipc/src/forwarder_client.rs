@@ -54,6 +54,11 @@ enum DataTransport {
 pub struct ForwarderClient {
     control: Arc<IpcFace>,
     pub mgmt: crate::mgmt_client::MgmtClient,
+    /// Single-reader demux over `control` for the management+data seam
+    /// (`from_raw_fd`): `recv()` drains its data plane and `mgmt` reads through
+    /// it, so they don't race on the one fd. `None` for the connect paths, where
+    /// the data plane is a separate SHM face (or sequential Unix usage).
+    mux: Option<Arc<crate::face_mux::FaceMux>>,
     recv_lock: Mutex<()>,
     transport: DataTransport,
     /// Cancelled on control-face disconnect; propagates to SHM so
@@ -117,6 +122,7 @@ impl ForwarderClient {
                     return Ok(Self {
                         control,
                         mgmt,
+                        mux: None,
                         recv_lock: Mutex::new(()),
                         transport,
                         cancel,
@@ -134,6 +140,7 @@ impl ForwarderClient {
         Ok(Self {
             control,
             mgmt,
+            mux: None,
             recv_lock: Mutex::new(()),
             transport: DataTransport::Unix,
             cancel,
@@ -154,13 +161,21 @@ impl ForwarderClient {
             ndn_transport::FaceKind::Unix,
             fd,
         )?);
-        let mgmt = crate::mgmt_client::MgmtClient::from_face(Arc::clone(&control));
+        let cancel = CancellationToken::new();
+        // The seam multiplexes management + data over this one fd; a single-reader
+        // demux routes management responses to `mgmt` and the rest to `recv()` so
+        // they don't race. (Must be built in a runtime — callers adopt the fd
+        // inside `block_on`.)
+        let mux = crate::face_mux::FaceMux::new(Arc::clone(&control), cancel.child_token());
+        let mgmt =
+            crate::mgmt_client::MgmtClient::from_mux(Arc::clone(&control), Arc::clone(&mux));
         Ok(Self {
             control,
             mgmt,
+            mux: Some(mux),
             recv_lock: Mutex::new(()),
             transport: DataTransport::Unix,
-            cancel: CancellationToken::new(),
+            cancel,
             dead: Arc::new(AtomicBool::new(false)),
             monitor_started: AtomicU8::new(0),
         })
@@ -288,6 +303,11 @@ impl ForwarderClient {
 
     /// Returns `None` if the data channel is closed.
     pub async fn recv(&self) -> Option<Bytes> {
+        // Seam: the demux owns the single `control` reader and has already split
+        // management responses off; drain its data plane (LP already stripped).
+        if let Some(mux) = &self.mux {
+            return mux.recv().await;
+        }
         self.start_monitor_once();
         match &self.transport {
             #[cfg(all(

@@ -29,8 +29,26 @@ enum SigningPolicy {
 /// the key-backed path required by testbed NFD.
 pub struct MgmtClient {
     face: Arc<IpcFace>,
+    recv: MgmtRecv,
     recv_lock: Mutex<()>,
     signing: SigningPolicy,
+}
+
+/// How `MgmtClient` reads command responses. `Face` reads the face directly (a
+/// dedicated management connection). `Mux` registers the expected response with
+/// a [`FaceMux`](crate::face_mux::FaceMux) — used on the management+data seam,
+/// so a response is never swallowed by the data `recv`.
+enum MgmtRecv {
+    Face,
+    Mux(Arc<crate::face_mux::FaceMux>),
+}
+
+/// The response to a command Interest is a Data named under the command name;
+/// extract it so the demux can match the reply.
+fn expected_response_name(interest_wire: &Bytes) -> Result<Name, ForwarderError> {
+    ndn_packet::Interest::decode(interest_wire.clone())
+        .map(|i| (*i.name).clone())
+        .map_err(|_| ForwarderError::MalformedResponse)
 }
 
 impl MgmtClient {
@@ -40,6 +58,7 @@ impl MgmtClient {
         );
         Ok(Self {
             face,
+            recv: MgmtRecv::Face,
             recv_lock: Mutex::new(()),
             signing: SigningPolicy::DigestSha256,
         })
@@ -48,8 +67,66 @@ impl MgmtClient {
     pub fn from_face(face: Arc<IpcFace>) -> Self {
         Self {
             face,
+            recv: MgmtRecv::Face,
             recv_lock: Mutex::new(()),
             signing: SigningPolicy::DigestSha256,
+        }
+    }
+
+    /// Read responses through `mux` (the seam demux) instead of the face
+    /// directly, so they don't race the data plane on a shared fd.
+    pub(crate) fn from_mux(face: Arc<IpcFace>, mux: Arc<crate::face_mux::FaceMux>) -> Self {
+        Self {
+            face,
+            recv: MgmtRecv::Mux(mux),
+            recv_lock: Mutex::new(()),
+            signing: SigningPolicy::DigestSha256,
+        }
+    }
+
+    /// Send a raw (unwrapped) command Interest and return the LP-stripped
+    /// response Data wire. On the seam this registers the expected response with
+    /// the demux *before* sending, so the demux loop routes it back here.
+    async fn exchange(&self, interest_wire: &Bytes) -> Result<Bytes, ForwarderError> {
+        let lp = ndn_packet::lp::encode_lp_packet(interest_wire);
+        match &self.recv {
+            MgmtRecv::Face => {
+                self.face.send_bytes(lp).await?;
+                Ok(crate::forwarder_client::strip_lp(self.face.recv_bytes().await?))
+            }
+            MgmtRecv::Mux(mux) => {
+                let rx = mux.expect(expected_response_name(interest_wire)?);
+                self.face.send_bytes(lp).await?;
+                rx.await.map_err(|_| ForwarderError::MalformedResponse)
+            }
+        }
+    }
+
+    /// As [`exchange`](Self::exchange) but `Ok(None)` when `timeout` elapses with
+    /// no response (the notification long-poll).
+    async fn exchange_timeout(
+        &self,
+        interest_wire: &Bytes,
+        timeout: std::time::Duration,
+    ) -> Result<Option<Bytes>, ForwarderError> {
+        let lp = ndn_packet::lp::encode_lp_packet(interest_wire);
+        match &self.recv {
+            MgmtRecv::Face => {
+                self.face.send_bytes(lp).await?;
+                match tokio::time::timeout(timeout, self.face.recv_bytes()).await {
+                    Err(_) => Ok(None),
+                    Ok(r) => Ok(Some(crate::forwarder_client::strip_lp(r?))),
+                }
+            }
+            MgmtRecv::Mux(mux) => {
+                let rx = mux.expect(expected_response_name(interest_wire)?);
+                self.face.send_bytes(lp).await?;
+                match tokio::time::timeout(timeout, rx).await {
+                    Err(_) => Ok(None),
+                    Ok(Ok(d)) => Ok(Some(d)),
+                    Ok(Err(_)) => Ok(None),
+                }
+            }
         }
     }
 
@@ -389,12 +466,9 @@ impl MgmtClient {
         let interest_wire = builder.build();
 
         let _guard = self.recv_lock.lock().await;
-        self.face
-            .send_bytes(ndn_packet::lp::encode_lp_packet(&interest_wire))
-            .await?;
-        let data_wire = match tokio::time::timeout(timeout, self.face.recv_bytes()).await {
-            Err(_) => return Ok(None),
-            Ok(r) => r.map(crate::forwarder_client::strip_lp)?,
+        let data_wire = match self.exchange_timeout(&interest_wire, timeout).await? {
+            None => return Ok(None),
+            Some(w) => w,
         };
         let data =
             ndn_packet::Data::decode(data_wire).map_err(|_| ForwarderError::MalformedResponse)?;
@@ -872,19 +946,9 @@ impl MgmtClient {
 
     async fn send_content_bytes(&self, interest_wire: Bytes) -> Result<Bytes, ForwarderError> {
         let _guard = self.recv_lock.lock().await;
-
-        self.face
-            .send_bytes(ndn_packet::lp::encode_lp_packet(&interest_wire))
-            .await?;
-
-        let data_wire = self
-            .face
-            .recv_bytes()
-            .await
-            .map(crate::forwarder_client::strip_lp)?;
+        let data_wire = self.exchange(&interest_wire).await?;
         let data =
             ndn_packet::Data::decode(data_wire).map_err(|_| ForwarderError::MalformedResponse)?;
-
         let content = data.content().ok_or(ForwarderError::MalformedResponse)?;
         Ok(Bytes::copy_from_slice(content))
     }
@@ -918,24 +982,11 @@ impl MgmtClient {
     }
 
     async fn send_raw(&self, interest_wire: Bytes) -> Result<ControlResponse, ForwarderError> {
-        let interest_wire = interest_wire;
-
         let _guard = self.recv_lock.lock().await;
-
-        self.face
-            .send_bytes(ndn_packet::lp::encode_lp_packet(&interest_wire))
-            .await?;
-
-        let data_wire = self
-            .face
-            .recv_bytes()
-            .await
-            .map(crate::forwarder_client::strip_lp)?;
+        let data_wire = self.exchange(&interest_wire).await?;
         let data =
             ndn_packet::Data::decode(data_wire).map_err(|_| ForwarderError::MalformedResponse)?;
-
         let content = data.content().ok_or(ForwarderError::MalformedResponse)?;
-
         ControlResponse::decode(Bytes::copy_from_slice(content))
             .map_err(|_| ForwarderError::MalformedResponse)
     }
