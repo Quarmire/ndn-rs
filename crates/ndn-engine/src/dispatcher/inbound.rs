@@ -62,6 +62,11 @@ pub(crate) async fn run_face_reader(
                 | FaceKind::Management,
         );
 
+    // True when the reader stopped because the underlying connection failed
+    // (closed / recv error), as opposed to a deliberate `cancel` (suspend /
+    // shutdown). A dropped Persistent face is dead and gets cleaned up so a
+    // supervisor can re-dial it; a suspended one is retained for resume.
+    let mut errored = false;
     loop {
         let result = tokio::select! {
             biased;            _ = cancel.cancelled() => break,
@@ -113,6 +118,7 @@ pub(crate) async fn run_face_reader(
             }
             Err(FaceError::Closed) => {
                 debug!(target: t::FACE_SYSTEM, face=%face_id, "face closed");
+                errored = true;
                 break;
             }
             Err(e) => match persistency {
@@ -122,6 +128,7 @@ pub(crate) async fn run_face_reader(
                 }
                 _ => {
                     warn!(target: t::FACE_SYSTEM, face=%face_id, error=%e, "recv error, stopping");
+                    errored = true;
                     break;
                 }
             },
@@ -136,8 +143,28 @@ pub(crate) async fn run_face_reader(
     match kind {
         FaceKind::App | FaceKind::Internal => {}
         _ => match persistency {
-            FacePersistency::Persistent | FacePersistency::Permanent => {
-                debug!(target: t::FACE_SYSTEM, face=%face_id, ?persistency, "face reader stopped (face retained)");
+            FacePersistency::Permanent => {
+                debug!(target: t::FACE_SYSTEM, face=%face_id, "face reader stopped (permanent face retained)");
+            }
+            // Suspend/shutdown (cancel): retain the face + state + routes so
+            // `resume_network_faces` brings it back unchanged.
+            FacePersistency::Persistent if !errored => {
+                debug!(target: t::FACE_SYSTEM, face=%face_id, "persistent face reader stopped (retained for resume)");
+            }
+            // Connection dropped: the face is dead. Publish Down and drop it from
+            // the table so a supervisor (e.g. `ndn-mobile`'s peer dialer) can
+            // re-dial at the SAME id — but KEEP its FIB routes (Persistent means
+            // routes survive a drop), so the instant the re-dial succeeds the
+            // upstream is live again with no route churn.
+            FacePersistency::Persistent => {
+                if let Some(sink) = face_lifecycle_sink.as_ref() {
+                    sink.on_down(face_id);
+                }
+                if let Some((_, state)) = face_states.remove(&face_id) {
+                    state.cancel.cancel();
+                }
+                face_table.remove(face_id);
+                debug!(target: t::FACE_SYSTEM, face=%face_id, "persistent face dropped on connection loss (routes kept for re-dial)");
             }
             FacePersistency::OnDemand => {
                 discovery.on_face_down(face_id, &*discovery_ctx);
