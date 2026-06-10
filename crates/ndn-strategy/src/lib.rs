@@ -10,6 +10,7 @@ pub mod context;
 pub mod erased;
 pub mod filter;
 pub mod filters;
+pub mod measured;
 pub mod measurements;
 pub mod multicast;
 pub mod registry;
@@ -22,6 +23,7 @@ pub use context::{DataLocation, FibEntry, FibNexthop, PrevHopLocation, StrategyC
 pub use erased::ErasedStrategy;
 pub use filter::StrategyFilter;
 pub use filters::RssiFilter;
+pub use measured::MeasuredStrategy;
 pub use measurements::{MeasurementsEntry, MeasurementsTable};
 pub use multicast::MulticastStrategy;
 // Cross-layer signals: re-export the core taxonomy/traits + the native store.

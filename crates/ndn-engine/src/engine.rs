@@ -285,6 +285,11 @@ pub struct EngineInner {
     /// by `mount_management` after engine build (mgmt owns the notification
     /// stream lifecycle).
     pub(crate) face_lifecycle_sink: OnceLock<Arc<dyn ndn_transport::FaceLifecycleSink>>,
+    /// Producer regions for NDNLPv2 ForwardingHint stripping (shared with the
+    /// strategy stage). Mutable at runtime via [`ForwarderEngine::network_region`]
+    /// so a node can declare its own routable prefix as a producer region after
+    /// build (e.g. at discovery start).
+    pub(crate) network_region: Arc<crate::stages::strategy::NetworkRegionTable>,
 }
 
 /// Cloning gives another reference to the same running engine.
@@ -380,6 +385,15 @@ impl ForwarderEngine {
         Arc::clone(&self.inner.strategy_table)
     }
 
+    /// The NDNLPv2 ForwardingHint producer-region table (NFD
+    /// `NetworkRegionTable`). A node adds its own routable prefix here so a
+    /// hinted Interest that reaches it is stripped and forwarded by name to the
+    /// local producer. Mutable at runtime via [`NetworkRegionTable::add_region`].
+    #[cfg_attr(not(feature = "experimental-instrument"), doc(hidden))]
+    pub fn network_region(&self) -> Arc<crate::stages::strategy::NetworkRegionTable> {
+        Arc::clone(&self.inner.network_region)
+    }
+
     #[cfg_attr(not(feature = "experimental-instrument"), doc(hidden))]
     pub fn neighbors(&self) -> Arc<NeighborTable> {
         Arc::clone(&self.inner.neighbors)
@@ -455,6 +469,20 @@ impl ForwarderEngine {
         cancel: CancellationToken,
     ) {
         self.add_face_with_persistency(face, cancel, FacePersistency::OnDemand);
+    }
+
+    /// Remove a face and all routing that points at it: cancel its I/O task,
+    /// tear down RIB/FIB nexthops on it, and drop it from the face table. The
+    /// counterpart to [`Self::add_face`] for faces that come and go at runtime
+    /// (e.g. a Wi-Fi Aware NDP that the platform tears down). Idempotent.
+    #[cfg_attr(not(feature = "experimental-instrument"), doc(hidden))]
+    pub fn remove_face(&self, face_id: FaceId) {
+        if let Some((_, state)) = self.inner.face_states.remove(&face_id) {
+            state.cancel.cancel();
+        }
+        self.inner.rib.handle_face_down(face_id, &self.inner.fib);
+        self.inner.fib.remove_face(face_id);
+        self.inner.face_table.remove(face_id);
     }
 
     pub fn add_face_with_persistency<F: ndn_transport::Transport + 'static>(

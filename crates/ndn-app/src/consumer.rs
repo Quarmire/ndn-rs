@@ -48,6 +48,16 @@ pub const DEFAULT_INTEREST_LIFETIME: Duration = Duration::from_millis(4000);
 /// Interest lifetime to absorb forwarding and processing delay.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_millis(4500);
 
+/// Per-Interest attempts for whole-object (RDR) fetches. Each metadata-discovery
+/// and segment Interest is re-expressed up to this many times with back-off
+/// before the fetch fails. Lossy/high-latency faces (connectionless named-radio
+/// bearers — Wi-Fi Aware, BLE advertising) drop fragments and have multi-second
+/// round-trips; a single one-shot Interest fails far too easily there. On a
+/// healthy link the first attempt succeeds, so this costs nothing.
+const OBJECT_FETCH_ATTEMPTS: u32 = 4;
+/// Initial back-off between object-fetch retries (doubles each attempt).
+const OBJECT_FETCH_BACKOFF: Duration = Duration::from_millis(300);
+
 pub struct Consumer {
     conn: Arc<dyn Connection>,
 }
@@ -300,7 +310,7 @@ impl Consumer {
     /// ndnd `std/object/client_consume.go:22`; pair with
     /// [`Producer::publish_object`](crate::Producer::publish_object).
     pub async fn fetch_object(&mut self, name: impl Into<Name>) -> Result<Bytes, AppError> {
-        self.fetch_object_inner(name.into(), None).await
+        self.fetch_object_inner(name.into(), None, &[]).await
     }
 
     /// Verified whole-object fetch — the **secure** RDR path: like
@@ -315,21 +325,47 @@ impl Consumer {
         name: impl Into<Name>,
         validator: &Validator,
     ) -> Result<Bytes, AppError> {
-        self.fetch_object_inner(name.into(), Some(validator)).await
+        self.fetch_object_inner(name.into(), Some(validator), &[])
+            .await
+    }
+
+    /// Verified whole-object fetch steered by an NDNLPv2 **ForwardingHint** —
+    /// like [`fetch_object_verified`](Self::fetch_object_verified) but every
+    /// Interest (metadata discovery + each segment) carries `forwarding_hint`,
+    /// so content named under a non-routable producer prefix is forwarded toward
+    /// a routable delegation (e.g. `/ndn/node/<peerId>`) until it reaches the
+    /// producer's region, where the hint is stripped and the Interest forwarded
+    /// by name. The cross-peer fetch primitive for tap-to-share.
+    pub async fn fetch_object_verified_hinted(
+        &mut self,
+        name: impl Into<Name>,
+        validator: &Validator,
+        forwarding_hint: &[Name],
+    ) -> Result<Bytes, AppError> {
+        self.fetch_object_inner(name.into(), Some(validator), forwarding_hint)
+            .await
     }
 
     async fn fetch_object_inner(
         &mut self,
         name: Name,
         validator: Option<&Validator>,
+        forwarding_hint: &[Name],
     ) -> Result<Bytes, AppError> {
-        let metadata_interest = InterestBuilder::new(crate::rdr::metadata_name(&name))
-            .can_be_prefix()
-            .must_be_fresh()
-            .lifetime(Duration::from_millis(1000))
-            .build();
+        // Metadata discovery — generous lifetime + retries (it is the first and
+        // most failure-prone round-trip over a lossy radio). `CanBePrefix` +
+        // `MustBeFresh` rebuilt each attempt with a fresh nonce.
         let meta_data = self
-            .fetch_wire(metadata_interest, Duration::from_millis(1500))
+            .fetch_object_with_retry(|| {
+                let mut b = InterestBuilder::new(crate::rdr::metadata_name(&name))
+                    .can_be_prefix()
+                    .must_be_fresh()
+                    .lifetime(DEFAULT_INTEREST_LIFETIME);
+                if !forwarding_hint.is_empty() {
+                    b = b.forwarding_hint(forwarding_hint.to_vec());
+                }
+                b
+            })
             .await?;
         let meta_content = accept_content(meta_data, validator)
             .await?
@@ -342,12 +378,46 @@ impl Consumer {
         let mut out = bytes::BytesMut::new();
         for n in 0..=last_seg {
             let seg_name = meta.versioned_name.clone().append_segment(n);
-            let data = self.fetch(seg_name).await?;
+            let data = self
+                .fetch_object_with_retry(|| {
+                    let mut b =
+                        InterestBuilder::new(seg_name.clone()).lifetime(DEFAULT_INTEREST_LIFETIME);
+                    if !forwarding_hint.is_empty() {
+                        b = b.forwarding_hint(forwarding_hint.to_vec());
+                    }
+                    b
+                })
+                .await?;
             if let Some(chunk) = accept_content(data, validator).await? {
                 out.extend_from_slice(&chunk);
             }
         }
         Ok(out.freeze())
+    }
+
+    /// Issue an Interest built by `make` (rebuilt with a fresh nonce each try),
+    /// re-expressing on timeout/Nack up to [`OBJECT_FETCH_ATTEMPTS`] times with
+    /// exponential back-off. Resilience for the RDR fetch over lossy radios.
+    async fn fetch_object_with_retry(
+        &mut self,
+        mut make: impl FnMut() -> InterestBuilder,
+    ) -> Result<Data, AppError> {
+        let mut delay = OBJECT_FETCH_BACKOFF;
+        let mut last_err = AppError::Timeout;
+        for attempt in 0..OBJECT_FETCH_ATTEMPTS {
+            let (wire, timeout) = make().build_with_timeout();
+            match self.fetch_wire(wire, timeout).await {
+                Ok(data) => return Ok(data),
+                Err(e) => {
+                    last_err = e;
+                    if attempt + 1 < OBJECT_FETCH_ATTEMPTS {
+                        crate::rt::sleep(delay).await;
+                        delay *= 2;
+                    }
+                }
+            }
+        }
+        Err(last_err)
     }
 
     /// Companion to [`Producer::publish_large`]. Segment names are

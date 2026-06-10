@@ -423,6 +423,13 @@ impl EngineBuilder {
             self.discovery.unwrap_or_else(|| Arc::new(NoDiscovery));
         let neighbors = NeighborTable::new();
 
+        // Shared between the strategy stage (reads it for ForwardingHint
+        // stripping) and `EngineInner` (so a node can add its own producer
+        // region at runtime — see `ForwarderEngine::network_region`).
+        let network_region = Arc::new(crate::stages::strategy::NetworkRegionTable::new(
+            self.config.network_region.clone(),
+        ));
+
         let routing = Arc::new(RoutingManager::new(
             Arc::clone(&rib),
             Arc::clone(&fib),
@@ -455,6 +462,7 @@ impl EngineBuilder {
             discovery_ctx: OnceLock::new(),
             runtime: Arc::clone(&runtime),
             face_lifecycle_sink: OnceLock::new(),
+            network_region: Arc::clone(&network_region),
         });
 
         let discovery_ctx = EngineDiscoveryContext::new(
@@ -489,9 +497,7 @@ impl EngineBuilder {
                 face_table: Arc::clone(&face_table),
                 enrichers: self.enrichers,
                 runtime: Arc::clone(&runtime),
-                network_region: Arc::new(crate::stages::strategy::NetworkRegionTable::new(
-                    self.config.network_region.clone(),
-                )),
+                network_region: Arc::clone(&network_region),
             },
             pit_match: PitMatchStage {
                 pit: Arc::clone(&pit),

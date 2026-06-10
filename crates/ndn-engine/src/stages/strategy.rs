@@ -60,23 +60,41 @@ pub(crate) fn next_hop_override(
 /// Producer-region prefixes for NDNLPv2 ForwardingHint handling — the
 /// NFD `NetworkRegionTable`. Empty = this forwarder hosts no producer region,
 /// so a hinted Interest is always forwarded toward its hint.
+///
+/// Runtime-mutable: a mobile node learns its own producer region (its
+/// `/ndn/node/<id>` prefix) at discovery start rather than at build time, so a
+/// hinted Interest reaching it can be stripped and forwarded by name to the
+/// local producer. The lock is only taken when an Interest actually carries a
+/// forwarding hint (rare on the hot path).
 #[derive(Default)]
 pub struct NetworkRegionTable {
-    regions: Vec<Name>,
+    regions: std::sync::RwLock<Vec<Name>>,
 }
 
 impl NetworkRegionTable {
     pub fn new(regions: Vec<Name>) -> Self {
-        Self { regions }
+        Self {
+            regions: std::sync::RwLock::new(regions),
+        }
     }
 
     /// True if any delegation in the hint reaches (is a prefix of) a producer
     /// region — `NetworkRegionTable::isInProducerRegion`. At that point NFD
     /// strips the hint and forwards by the Interest name.
     pub fn is_in_producer_region(&self, hint: &[Arc<Name>]) -> bool {
-        self.regions
+        let regions = self.regions.read().unwrap();
+        regions
             .iter()
             .any(|region| hint.iter().any(|deleg| region.has_prefix(deleg)))
+    }
+
+    /// Add a producer region this forwarder hosts (idempotent). Used at runtime
+    /// when a node learns its own routable prefix (e.g. discovery start).
+    pub fn add_region(&self, region: Name) {
+        let mut regions = self.regions.write().unwrap();
+        if !regions.contains(&region) {
+            regions.push(region);
+        }
     }
 }
 
