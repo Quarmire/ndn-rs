@@ -44,7 +44,13 @@ pub enum SignedTrustContextError {
     SchemaParse(#[from] crate::trust_schema::PatternParseError),
     #[error("not a SignedTrustContext (TLV-TYPE {0:#06x})")]
     NotSignedTrustContext(u64),
+    #[error("signing into Data failed: {0}")]
+    Sign(String),
 }
+
+/// The RDR keyword component naming a published context: `/<ns>/32=trust-context`.
+/// Canonical home; `ndn-cert`'s onboarding re-exports this.
+pub const TRUST_CONTEXT_KEYWORD: &[u8] = b"trust-context";
 
 /// Which encoding the schema bytes use.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -397,6 +403,39 @@ impl SignedTrustContext {
         w.finish()
     }
 
+    /// The canonical versioned RDR name this context publishes at:
+    /// `/<namespace>/32=trust-context/v=<version>`.
+    pub fn rdr_name(&self) -> Name {
+        self.namespace
+            .clone()
+            .append_component(ndn_packet::NameComponent::keyword(Bytes::from_static(
+                TRUST_CONTEXT_KEYWORD,
+            )))
+            .append_version(self.version)
+    }
+
+    /// Construct → sign → serialize in one in-process step (NDF F10): wrap this
+    /// context's encoded Content into its signed NDN Data object at
+    /// [`rdr_name`](Self::rdr_name), ready to publish and to adopt remotely. No
+    /// subprocess. The remote consumer decodes with
+    /// [`decode_content`](Self::decode_content) (version from the RDR name) and
+    /// adopts via [`Keyring::adopt`](crate::Keyring::adopt) (anti-rollback).
+    ///
+    /// `signer` is any [`Signer`](crate::signer::Signer) — typically obtained
+    /// from a `SecurityManager`/`KeyChain` for the publishing identity.
+    pub fn sign_into_data(
+        &self,
+        signer: &dyn crate::signer::Signer,
+    ) -> Result<Data, SignedTrustContextError> {
+        let content = self.encode_content();
+        let wire = ndn_packet::encode::DataBuilder::new(self.rdr_name(), &content).sign_sync(
+            signer.sig_type(),
+            Some(signer.key_name()),
+            |region| signer.sign_sync(region).unwrap_or_default(),
+        );
+        Data::decode(wire).map_err(|e| SignedTrustContextError::Sign(e.to_string()))
+    }
+
     /// Decode a context from the `Content` bytes of its NDN object. The
     /// `version` must be supplied by the caller (it lives in the RDR name).
     /// Decoded contexts default to the hierarchical floor (N1).
@@ -696,5 +735,43 @@ mod tests {
         // The TLV code is even, so an old node that doesn't understand it skips
         // it rather than rejecting the whole context (NDN evolvability rule).
         assert_eq!(tlv::SOURCE_BUNDLE_HASH % 2, 0);
+    }
+
+    // ── F10: in-process authoring (construct → sign → serialize → adopt) ────
+
+    #[test]
+    fn sign_into_data_round_trips_and_adopts() {
+        use crate::Keyring;
+        use crate::signer::Ed25519Signer;
+
+        // Construct a context with the typed builder (no subprocess).
+        let ctx = SignedTrustContext::hierarchical(n("/home/bob")).with_version(3);
+
+        // Sign it into its wire Data with the publishing identity's signer.
+        let signer = Ed25519Signer::from_seed(&[9u8; 32], n("/home/bob/KEY/k1"));
+        let data = ctx.sign_into_data(&signer).expect("sign into data");
+
+        // The Data is named at the canonical RDR name:
+        // /home/bob/32=trust-context/v=3 (keyword component + version).
+        assert_eq!(*data.name, ctx.rdr_name());
+        let comps = ctx.rdr_name();
+        let comps = comps.components();
+        assert!(ctx.rdr_name().has_prefix(ctx.namespace()));
+        assert_eq!(comps[comps.len() - 2].typ, 0x20, "keyword component");
+        assert_eq!(comps[comps.len() - 2].value.as_ref(), TRUST_CONTEXT_KEYWORD);
+        assert_eq!(comps.last().unwrap().typ, 0x36, "version component");
+
+        // A remote consumer decodes the Content (version from the RDR name) and
+        // adopts it with anti-rollback.
+        let content = data.content().expect("has content");
+        let decoded = SignedTrustContext::decode_content(&content, ctx.version()).expect("decode");
+        assert_eq!(decoded.version(), 3);
+        assert_eq!(decoded.namespace(), ctx.namespace());
+
+        let keyring = Keyring::new();
+        assert!(keyring.adopt(Arc::new(decoded)), "first adoption succeeds");
+        // Anti-rollback: a lower version is refused.
+        let older = SignedTrustContext::hierarchical(n("/home/bob")).with_version(2);
+        assert!(!keyring.adopt(Arc::new(older)), "older version refused");
     }
 }

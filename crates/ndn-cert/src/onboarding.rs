@@ -24,7 +24,9 @@ use sha2::{Digest, Sha256};
 use crate::error::CertError;
 
 /// The RDR keyword component naming a published context: `/<ns>/32=trust-context`.
-pub const TRUST_CONTEXT_KEYWORD: &[u8] = b"trust-context";
+/// Canonical definition lives in `ndn-security` (the `SignedTrustContext`
+/// owner); re-exported here so there is one source of truth.
+pub const TRUST_CONTEXT_KEYWORD: &[u8] = ndn_security::trust_context::TRUST_CONTEXT_KEYWORD;
 /// The RDR metadata keyword (`32=metadata`).
 pub const METADATA_KEYWORD: &[u8] = b"metadata";
 
