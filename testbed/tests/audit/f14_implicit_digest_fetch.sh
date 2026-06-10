@@ -5,7 +5,12 @@
 # Finding:   ndf-vault/45-libraries/ndn-rs-feature-requests.md § F14
 # Severity:  MAJOR (NDF "any node serves it by content hash" model)
 # Spec ref:  NDN ImplicitSha256DigestComponent (TLV 0x01); CanBePrefix selector.
-# Witnesses: RUST-UNIT (ndn-store lru_cs + fjall_cs):
+# Witnesses: RUST-UNIT (ndn-foundation-types Name builder + ndn-store CS):
+#            consumer-API construction (F14-i):
+#              - append_implicit_digest_round_trips
+#                  Name::append_implicit_digest builds + round-trips the typed
+#                  ImplicitSha256DigestComponent (no hand-rolled name surgery)
+#            Content-Store resolution:
 #              - implicit_digest_lookup_matches
 #                  a digest-suffixed Interest hits cached Data when the SHA-256
 #                  of the stored Data equals the suffix
@@ -25,16 +30,22 @@ REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 cd "$REPO_ROOT"
 if ! command -v cargo >/dev/null 2>&1; then echo "SKIP: cargo missing" >&2; exit 2; fi
 
-if cargo test -p ndn-store --lib --quiet -- \
+ok=1
+if ! cargo test -p ndn-foundation-types --lib --quiet -- \
+        append_implicit_digest_round_trips >/tmp/f14_builder.log 2>&1; then
+    echo "=== F14-i FAIL — implicit-digest Name builder ==="; cat /tmp/f14_builder.log; ok=0
+fi
+if ! cargo test -p ndn-store --lib --quiet -- \
         implicit_digest_lookup_matches \
         implicit_digest_wrong_hash_misses \
         can_be_prefix_finds_longer_name \
         can_be_prefix_miss_for_unrelated_name \
         d04_can_be_prefix_must_be_fresh_rejects_stale_descendant \
         >/tmp/f14_witness.log 2>&1; then
-    echo "=== F14 PASS — implicit-digest CS lookup + CanBePrefix resolution hold ==="
+    echo "=== F14 FAIL — implicit-digest CS lookup / CanBePrefix ==="; cat /tmp/f14_witness.log; ok=0
+fi
+if [ "$ok" = 1 ]; then
+    echo "=== F14 PASS — digest Name builder + CS lookup + CanBePrefix resolution hold ==="
     exit 0
 fi
-echo "=== F14 FAIL ==="
-cat /tmp/f14_witness.log
 exit 1

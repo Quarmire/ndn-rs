@@ -245,6 +245,27 @@ impl Validator {
         self.keyring.ambient().add_anchor(cert)
     }
 
+    /// Bootstrap a trust anchor directly from a resolved [`DidDocument`]
+    /// (NDF F1 Tier 3): reconstruct the anchor [`Certificate`] from the
+    /// document's Ed25519 verification key and adopt it into the ambient
+    /// context, so a cross-stack consumer can root trust from a `did:ndn:*`
+    /// document without first fetching an NDN certificate. The anchor name is
+    /// derived from the document's `id`. Returns `false` if the `id` is not a
+    /// valid `did:ndn` or the document carries no recognised Ed25519 key.
+    ///
+    /// The caller resolves the document (e.g. via
+    /// [`UniversalResolver`](crate::did::UniversalResolver)); this method does
+    /// the document → anchor step so the Validator needs no resolver/async.
+    pub fn add_trust_anchor_from_did(&self, doc: &crate::did::DidDocument) -> bool {
+        let Ok(name) = crate::did::did_to_name(&doc.id) else {
+            return false;
+        };
+        match crate::did::did_document_to_trust_anchor(doc, Arc::new(name)) {
+            Some(cert) => self.add_trust_anchor(cert),
+            None => false,
+        }
+    }
+
     /// Whether `name` is an anchor in any held context (ambient included).
     pub fn is_trust_anchor(&self, name: &Name) -> bool {
         self.keyring.is_anchor(name)
@@ -679,6 +700,35 @@ mod tests {
             validator.validate(&data).await,
             ValidationResult::Invalid(_)
         ));
+    }
+
+    #[test]
+    fn add_trust_anchor_from_did_bootstraps_anchor() {
+        use crate::did::{cert_to_did_document, did_to_name};
+        let key_name: Name = "/com/acme/alice/KEY/v=1/self".parse().unwrap();
+        let cert = Certificate {
+            name: Arc::new(key_name),
+            public_key: Bytes::from(vec![7u8; 32]),
+            valid_from: 0,
+            valid_until: u64::MAX,
+            issuer: None,
+            signed_region: None,
+            sig_value: None,
+            sig_type: ndn_packet::SignatureType::SignatureEd25519,
+        };
+        let doc = cert_to_did_document(&cert, None);
+
+        // Positive: the document's Ed25519 key becomes an ambient anchor.
+        let validator = Validator::new(open_schema("data", "key"));
+        assert!(validator.add_trust_anchor_from_did(&doc));
+        let anchor_name = did_to_name(&doc.id).expect("doc.id is a did:ndn");
+        assert!(validator.is_trust_anchor(&anchor_name));
+
+        // Negative: a non-did:ndn id is rejected (no anchor installed).
+        let mut foreign = doc.clone();
+        foreign.id = "did:web:example.com".to_string();
+        let v2 = Validator::new(open_schema("data", "key"));
+        assert!(!v2.add_trust_anchor_from_did(&foreign));
     }
 
     #[test]

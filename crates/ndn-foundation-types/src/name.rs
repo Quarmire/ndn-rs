@@ -206,6 +206,19 @@ impl Name {
         self.append_component(NameComponent::version(v))
     }
 
+    /// Append an `ImplicitSha256DigestComponent` (TLV-TYPE `0x01`) — the
+    /// content hash that names a specific Data object exactly. This is the
+    /// supported consumer-API way to address a Block by content hash
+    /// (`<auth>/blocks/<hash>`, NDF F14 / D-40 track B) instead of
+    /// hand-constructing the typed component. The digest is the SHA-256 of the
+    /// Data's wire encoding ([`Data::implicit_digest`](../ndn_packet/struct.Data.html#method.implicit_digest)).
+    pub fn append_implicit_digest(self, digest: [u8; 32]) -> Self {
+        self.append_component(NameComponent::new(
+            tlv_type::IMPLICIT_SHA256,
+            Bytes::copy_from_slice(&digest),
+        ))
+    }
+
     pub fn append_timestamp(self, ts: u64) -> Self {
         self.append_component(NameComponent::timestamp(ts))
     }
@@ -436,5 +449,25 @@ impl core::fmt::Display for Name {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod implicit_digest_tests {
+    use super::*;
+
+    #[test]
+    fn append_implicit_digest_round_trips() {
+        let digest = [0x9au8; 32];
+        let name = Name::root().append("blocks").append_implicit_digest(digest);
+        let last = name.components().last().expect("has a last component");
+        assert_eq!(last.typ, tlv_type::IMPLICIT_SHA256);
+        assert_eq!(last.value.as_ref(), &digest[..]);
+
+        // Survives a wire round-trip and stays a digest component.
+        let decoded = Name::decode_from_tlv(name.encode_to_tlv()).expect("decode");
+        let dlast = decoded.components().last().unwrap();
+        assert_eq!(dlast.typ, tlv_type::IMPLICIT_SHA256);
+        assert_eq!(dlast.value.as_ref(), &digest[..]);
     }
 }
