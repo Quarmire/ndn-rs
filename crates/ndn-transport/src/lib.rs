@@ -19,6 +19,7 @@ pub mod face_pair_table;
 pub mod face_sink;
 pub mod face_table;
 pub mod forwarding;
+pub mod link_profile;
 pub mod link_service;
 pub mod mac_addr;
 pub mod raw_packet;
@@ -32,6 +33,7 @@ pub use ndn_packet::fragment::DEFAULT_UDP_MTU;
 
 pub use any_map::AnyMap;
 pub use congestion::CongestionController;
+pub use link_profile::LinkProfile;
 pub use face::{
     CongestionPolicy, Face, FaceAddr, FaceError, FaceId, FaceKind, FacePersistency, FaceScope,
     LinkType, ip_face_uri,
