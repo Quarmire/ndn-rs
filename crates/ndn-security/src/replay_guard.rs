@@ -367,4 +367,44 @@ mod tests {
         assert_eq!(g.check(&a), ReplayCheck::Fresh);
         assert_eq!(g.check(&b), ReplayCheck::Replay);
     }
+
+    /// A SignatureInfo with no KeyLocator (`None`) and a seq number: this lands
+    /// in the shared `DigestSha256` bucket — the mode NDF chain replication
+    /// uses, where one key is shared across devices.
+    fn si_shared_seq(s: u64) -> SignatureInfo {
+        SignatureInfo {
+            sig_type: SignatureType::DigestSha256,
+            key_locator: None,
+            sig_nonce: None,
+            sig_time: None,
+            sig_seq_num: Some(s),
+        }
+    }
+
+    #[test]
+    fn monotonic_false_shared_key_allows_out_of_order_seq() {
+        // NDF mode: a key shared across devices legitimately interleaves seq
+        // numbers, so monotonic=false must NOT block a lower seq — only an
+        // *exact* AND-match (same seq still in the LRU window) is a replay.
+        let g = ReplayGuard::new(16, false);
+        assert_eq!(g.check(&si_shared_seq(10)), ReplayCheck::Fresh);
+        assert_eq!(g.check(&si_shared_seq(11)), ReplayCheck::Fresh);
+        assert_eq!(
+            g.check(&si_shared_seq(5)),
+            ReplayCheck::Fresh,
+            "monotonic=false: a lower seq from another device on the shared key is legitimate"
+        );
+        // But the same seq, still in-window, is a replay (AND-semantics floor).
+        assert_eq!(g.check(&si_shared_seq(5)), ReplayCheck::Replay);
+        assert_eq!(g.check(&si_shared_seq(11)), ReplayCheck::Replay);
+    }
+
+    #[test]
+    fn monotonic_true_shared_key_blocks_lower_seq() {
+        // Contrast: with monotonic=true the same shared-key lower seq IS blocked
+        // — proving the mode is a real, selectable divergence, not a no-op.
+        let g = ReplayGuard::new(16, true);
+        assert_eq!(g.check(&si_shared_seq(10)), ReplayCheck::Fresh);
+        assert_eq!(g.check(&si_shared_seq(5)), ReplayCheck::Replay);
+    }
 }

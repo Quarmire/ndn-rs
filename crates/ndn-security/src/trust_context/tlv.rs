@@ -51,6 +51,13 @@ pub const ENROLLMENT_HINT: u64 = 0x0416;
 /// Revoked cert name / key digest, repeatable. Non-critical.
 pub const REVOCATION: u64 = 0x0418;
 
+/// Provenance hint: the SHA-256 implicit digest (32 bytes) of the source trust
+/// **bundle** this context was projected/compiled from, so a wire object is
+/// traceable back to the authoritative Block root of authority. Non-critical
+/// (even): a hint, not a rule — an old node skips it and still validates with
+/// the anchors + schema it understands. Filed as NDF feature request F9.
+pub const SOURCE_BUNDLE_HASH: u64 = 0x041A;
+
 /// `SchemaFormat` value: native ndn-rs text grammar (local authoring).
 pub const SCHEMA_FORMAT_NATIVE: u8 = 1;
 /// `SchemaFormat` value: stock LightVerSec binary (portable / published form).

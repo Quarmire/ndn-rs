@@ -107,6 +107,24 @@ C.16 follow-up. New rows should land here only when the finding has no concrete
 runtime behavior that can be exercised by Rust unit, integration, interop, or
 wire-capture witnesses.
 
+## NDF-relied-upon extensions (regression guards)
+
+These rows are **not** spec-compliance findings. They are deliberate ndn-rs
+extensions/divergences that NDF builds on (filed as ndn-rs feature requests F14
+and F16; see `ndf-rs` `ndn-rs-feature-requests.md`). Each witness *passes today*
+and exists to keep the relied-upon behavior from regressing unnoticed — per the
+README "Proof quality" note, a passing regression guard is valid evidence when
+paired with a behavioral (RUST-UNIT) witness, which these are. The divergences
+are also documented as intentional extensions in
+`docs/wiki/src/reference/spec-compliance.md`.
+
+| Entry | Witness test | Status | Behavior pinned | Last seen |
+|---------|------|--------|----|-|
+| F14 | `f14_implicit_digest_fetch.sh` | RESOLVED 2026-06-10 (RUST-UNIT) | Implicit-digest (`ImplicitSha256DigestComponent`) Content-Store lookup matches/mismatches, and CanBePrefix content-hash-suffix resolution respects MustBeFresh — the D-40 track-B `<auth>/blocks/<hash>` behaviors. | 2026-06-10 (rust-unit witness) |
+| F16(i) | `f16i_subscription_persistence.sh` | RESOLVED 2026-06-10 (RUST-UNIT) | SubscriptionRequest TLV 0x230 exact wire framing + per-InRecord persistence state with data-count budgets; persistent attach isolated from a classical PIT entry at the same name. | 2026-06-10 (rust-unit witness) |
+| F16(ii) | `f16ii_replay_guard_shared_key.sh` | RESOLVED 2026-06-10 (RUST-UNIT) | ReplayGuard AND-semantics (replay iff every shared anti-replay field agrees) plus the `monotonic=false` shared-key mode (one key across devices: out-of-order seq admitted, exact in-window repeat still rejected). | 2026-06-10 (rust-unit witness) |
+| F16(iii) | `f16iii_inner_tlv_hashing.sh` | RESOLVED 2026-06-10 (RUST-UNIT) | `ContentHashTarget::InnerTlvType(364)` delegated hashing: per-face selection of the inner TLV to hash, present→Some / absent→None, over the SHA-256 implicit-digest primitive. | 2026-06-10 (rust-unit witness) |
+
 ## RETRACTED 2026-05-01
 
 The following findings from the 2026-04-20 audit were **withdrawn**

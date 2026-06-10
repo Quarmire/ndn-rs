@@ -33,17 +33,42 @@ use crate::thunk::Thunk;
 
 /// Freshness stamped on transparent function results, bounding how long the
 /// Content Store memoizes them.
+///
+/// # Caching contract (when is a cached result authoritative vs. recompute)
+///
+/// A transparent result is named entirely by `(function, args)` (the
+/// invocation name), so a cached Data object **is** the authoritative answer
+/// for that name for as long as it is fresh. Concretely:
+///
+/// - **Within the freshness window** (`FreshnessPeriod > 0`, default here),
+///   any cache or downstream node MAY serve the stored result without
+///   recomputing — including satisfying a `MustBeFresh` Interest. The result
+///   is reconstructible by any party from the name alone, so re-serving it is
+///   indistinguishable from recomputing it.
+/// - **Past the window**, a `MustBeFresh` Interest no longer matches the stored
+///   copy and the request reaches the service, which recomputes. A non-fresh
+///   (`MustBeFresh = false`) Interest may still be satisfied from cache — the
+///   caller has opted into a possibly-stale answer.
+/// - **Opaque** results ([`Determinism::Opaque`]) are stamped non-fresh and
+///   name-disambiguated by a per-call nonce, so they are never authoritative
+///   for a *different* call and are always recomputed.
+///
+/// This is the rule NDF references a compute result from a Block by: the name
+/// is stable, and freshness — not the serving face — decides authority.
 pub const DEFAULT_TRANSPARENT_FRESHNESS: Duration = Duration::from_secs(4);
 
 /// Whether a function's result is determined solely by the invocation name.
 ///
-/// See the module-level determinism contract in the crate docs.
+/// See the module-level determinism contract in the crate docs and the
+/// caching contract on [`DEFAULT_TRANSPARENT_FRESHNESS`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Determinism {
-    /// Result depends only on the name → cacheable, PIT-aggregatable.
+    /// Result depends only on the name → cacheable, PIT-aggregatable, and
+    /// authoritative-while-fresh (any holder may re-serve it).
     Transparent,
     /// Result may vary per call → the client adds a trailing nonce component
-    /// and the result is non-fresh, so calls never alias.
+    /// and the result is non-fresh, so calls never alias and are always
+    /// recomputed rather than served from cache.
     Opaque,
 }
 

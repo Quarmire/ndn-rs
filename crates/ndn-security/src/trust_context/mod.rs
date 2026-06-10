@@ -183,6 +183,11 @@ pub struct SignedTrustContext {
     /// Schema bytes to re-emit verbatim on encode (preserves a published LVS
     /// blob exactly); `None` means derive from the runtime schema.
     schema_blob: Option<SchemaBlob>,
+    /// Provenance hint: SHA-256 implicit digest of the source trust **bundle**
+    /// (Block) this context was projected from, for wire-level traceability
+    /// back to the root of authority. Non-critical; `None` when unprojected
+    /// (locally authored). See [`tlv::SOURCE_BUNDLE_HASH`].
+    source_bundle_hash: Option<[u8; 32]>,
 }
 
 impl SignedTrustContext {
@@ -197,6 +202,7 @@ impl SignedTrustContext {
             enrollment_hint: None,
             revocations: Vec::new(),
             schema_blob: None,
+            source_bundle_hash: None,
         }
     }
 
@@ -257,6 +263,13 @@ impl SignedTrustContext {
         self.schema_blob = Some(blob);
         Ok(self)
     }
+    /// Record the source trust-bundle the context was projected from (its
+    /// SHA-256 implicit digest), emitted as a non-critical provenance hint so
+    /// auditors can walk the wire object back to its Block root of authority.
+    pub fn with_source_bundle_hash(mut self, digest: [u8; 32]) -> Self {
+        self.source_bundle_hash = Some(digest);
+        self
+    }
 
     // ── accessors ───────────────────────────────────────────────────────────
 
@@ -277,6 +290,11 @@ impl SignedTrustContext {
     }
     pub fn revocations(&self) -> &[Name] {
         &self.revocations
+    }
+    /// The source trust-bundle's SHA-256 implicit digest, if this context was
+    /// projected from one (the F9 provenance hint).
+    pub fn source_bundle_hash(&self) -> Option<&[u8; 32]> {
+        self.source_bundle_hash.as_ref()
     }
 
     /// Shared handle to this context's anchor set. The chain walk terminates
@@ -371,6 +389,10 @@ impl SignedTrustContext {
             for rev in &self.revocations {
                 w.write_tlv(tlv::REVOCATION, &rev.encode_to_tlv());
             }
+            // SourceBundleHash — non-critical provenance hint (F9).
+            if let Some(digest) = &self.source_bundle_hash {
+                w.write_tlv(tlv::SOURCE_BUNDLE_HASH, digest);
+            }
         });
         w.finish()
     }
@@ -390,6 +412,7 @@ impl SignedTrustContext {
         let mut ca_endpoints: Vec<Name> = Vec::new();
         let mut enrollment_hint: Option<EnrollmentHint> = None;
         let mut revocations: Vec<Name> = Vec::new();
+        let mut source_bundle_hash: Option<[u8; 32]> = None;
 
         let mut cur = value;
         while !cur.is_empty() {
@@ -449,6 +472,15 @@ impl SignedTrustContext {
                     );
                 }
                 tlv::ENROLLMENT_HINT => enrollment_hint = Some(EnrollmentHint::decode(fval)),
+                // Non-critical provenance hint (F9): a 32-byte SHA-256 digest.
+                // A malformed length fails the guard and falls through to the
+                // non-critical skip arm below — tolerate, don't reject; it is a
+                // hint, not a rule.
+                tlv::SOURCE_BUNDLE_HASH if fval.len() == 32 => {
+                    let mut h = [0u8; 32];
+                    h.copy_from_slice(fval);
+                    source_bundle_hash = Some(h);
+                }
                 tlv::REVOCATION => {
                     revocations.push(
                         Name::decode_from_tlv(Bytes::copy_from_slice(fval))
@@ -484,6 +516,7 @@ impl SignedTrustContext {
             enrollment_hint,
             revocations,
             schema_blob: Some(blob),
+            source_bundle_hash,
         })
     }
 
@@ -633,5 +666,35 @@ mod tests {
         assert_eq!(decoded, h);
         assert!(decoded.require_all);
         assert_eq!(decoded.challenges, vec!["token", "device-approval"]);
+    }
+
+    // ── F9: source-bundle provenance hint ──────────────────────────────────
+
+    #[test]
+    fn source_bundle_hash_roundtrips() {
+        let digest = [0x5au8; 32];
+        let ctx = SignedTrustContext::hierarchical(n("/home/bob"))
+            .with_version(7)
+            .with_source_bundle_hash(digest);
+        let wire = ctx.encode_content();
+        let decoded = SignedTrustContext::decode_content(&wire, 7).expect("decode");
+        assert_eq!(decoded.source_bundle_hash(), Some(&digest));
+    }
+
+    #[test]
+    fn source_bundle_hash_absent_is_none() {
+        // Old/unprojected contexts carry no hint; the field stays None and the
+        // object still decodes (the hint is additive, not required).
+        let ctx = SignedTrustContext::hierarchical(n("/home/bob")).with_version(1);
+        let wire = ctx.encode_content();
+        let decoded = SignedTrustContext::decode_content(&wire, 1).expect("decode");
+        assert_eq!(decoded.source_bundle_hash(), None);
+    }
+
+    #[test]
+    fn source_bundle_hash_is_non_critical() {
+        // The TLV code is even, so an old node that doesn't understand it skips
+        // it rather than rejecting the whole context (NDN evolvability rule).
+        assert_eq!(tlv::SOURCE_BUNDLE_HASH % 2, 0);
     }
 }
