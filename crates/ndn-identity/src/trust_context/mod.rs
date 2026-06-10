@@ -15,12 +15,14 @@ use ndn_security::{Certificate, NamePattern, TrustSchema, ValidationResult, Vali
 
 use ndn_custodian::CustodianRef;
 
+pub mod context_sync;
 mod fingerprint;
 mod identity_ref;
 mod provenance;
 mod sync;
 pub mod sync_tlv;
 
+pub use context_sync::{BundleFetcher, ContextSyncOutcome, process_update};
 pub use fingerprint::Fingerprint;
 pub use identity_ref::{CapabilitySet, IdentityLifetime, IdentityRef, KeyId};
 pub use provenance::{AdoptionProvenance, FaceIdRef};
