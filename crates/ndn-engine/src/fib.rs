@@ -126,6 +126,12 @@ impl Fib {
                 .unwrap_or_default();
             nexthops.retain(|n| n.face_id != face_id);
             nexthops.push(FibNexthop { face_id, cost });
+            // FIB invariant: nexthops are kept sorted by ascending cost, so
+            // `BestRouteStrategy` (which forwards on `nexthops.first()`) takes the
+            // cheapest face regardless of insertion order. Without this, adding a
+            // lower-cost nexthop after a higher-cost one (e.g. a NAN NDP face at
+            // cost 10 after the NAN-coordination face at cost 20) would be ignored.
+            nexthops.sort_by_key(|n| n.cost);
             t.insert(prefix, Arc::new(FibEntry { nexthops }));
             t
         });
@@ -151,12 +157,9 @@ impl Fib {
             if nexthops.is_empty() {
                 t.remove(prefix);
             } else {
-                t.insert(
-                    prefix,
-                    Arc::new(FibEntry {
-                        nexthops: nexthops.clone(),
-                    }),
-                );
+                let mut nexthops = nexthops.clone();
+                nexthops.sort_by_key(|n| n.cost); // FIB invariant: cost-sorted (see add_nexthop)
+                t.insert(prefix, Arc::new(FibEntry { nexthops }));
             }
             t
         });

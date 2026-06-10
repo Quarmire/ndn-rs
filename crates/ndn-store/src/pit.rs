@@ -70,9 +70,15 @@ impl NameHashes {
 
 /// A stable, cheaply-copyable reference to a PIT entry.
 ///
-/// Hash of `(Name, ForwardingHint)`. Selectors are *not* part of the key —
-/// they live on each [`InRecord`] so heterogeneous downstreams aggregate into
-/// a single entry. Mirrors NFD `daemon/table/pit-entry.cpp`.
+/// Hash of `(Name, discriminator)`. The **ForwardingHint is deliberately NOT in
+/// the key**: returning Data carries no hint, so it is matched by name alone —
+/// keying the entry on the hint would orphan a hinted Interest's Data at the
+/// node that strips the hint in its producer region (the Data, hint-less, would
+/// never find the hint-keyed entry). The hint is a forwarding-decision input
+/// (consulted from the Interest packet in the strategy stage), not an
+/// aggregation key. Selectors are also *not* part of the key — they live on each
+/// [`InRecord`] so heterogeneous downstreams aggregate into a single entry.
+/// Mirrors NFD `daemon/table/pit-entry.cpp` (keyed by name, not hint).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PitToken(pub u64);
 
@@ -104,13 +110,13 @@ impl PitToken {
         forwarding_hint: Option<&[Arc<Name>]>,
         disc: PitKeyDiscriminator,
     ) -> Self {
+        // The ForwardingHint is intentionally excluded from the key — see the
+        // `PitToken` doc comment. Returning Data has no hint, so it must match by
+        // name; including the hint here would drop a hinted Interest's Data at the
+        // hint-stripping (producer-region) node.
+        let _ = forwarding_hint;
         let mut h = DefaultHasher::new();
         name_hash.hash(&mut h);
-        if let Some(hints) = forwarding_hint {
-            for hint in hints {
-                hint.hash(&mut h);
-            }
-        }
         disc.hash(&mut h);
         PitToken(h.finish())
     }
