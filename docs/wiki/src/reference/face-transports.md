@@ -154,6 +154,17 @@ attached at runtime via `ndn-mobile` (`attach_wifi_aware` / `attach_ble`) or the
 `*_deliver_*` methods); nearby peers surface at the localhost dataset
 `/localhost/discovery/peers`.
 
+**Tap-to-share over these faces (extension).** To send a file to a tapped peer,
+an app serves an *offer board* (`NdnEngine`/`NdnClient::start_offer_board`): a
+certificate at `/ndn/node/<id>/cert` (the TOFU pin target) and a signed manifest
+at `/ndn/node/<id>/offers`, both reached over the per-peer route with no hint.
+Each offered file (`add_offer`) is a signed RDR object under the offerer's own
+identity, fetched by a peer with `fetch_object_verified_hinted(name,
+"/ndn/node/<peerId>")` — the `ForwardingHint` steers it to the peer, whose node
+strips the hint via its `NetworkRegionTable` (declared at discovery start) and
+serves it by name. See the *Connectionless named-radio faces* section of
+`ARCHITECTURE.md` for the full flow.
+
 ## Link service per face
 
 The default `LinkService` is `LpLinkService` (NDNLPv2 framing); the

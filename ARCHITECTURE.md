@@ -346,6 +346,40 @@ trust authority), and the end consumer verifies against a pinned cert.
 `NdnEngine::{nan_deliver_followup, ble_deliver_frame}` (radio → engine, since
 opaque handles aren't passable across the FFI).
 
+**Two-tier Wi-Fi Aware: coordination follow-ups + an NDP bulk path (extension).**
+The named-radio faces above are connectionless and small-frame (NAN follow-ups
+≤255 B, BLE advertisements ≤~245 B) — fine for presence, discovery, and small
+Interest/Data, but lossy for multi-fragment objects. The high-throughput tier is
+a **NAN NDP** (Network Data Path): a real IPv6 link-local Wi-Fi connection
+between two peers, over which the node runs UDP. The platform negotiates the NDP
+(`WifiAwareManager.requestNetwork` on Android), binds a UDP socket on the
+resulting network, and hands the bound socket's fd + the peer's address to
+`NdnEngine::attach_ndp_face` (fd-passing, like the seam's `mount_app_fd`). The
+engine adopts it as a [`UdpFace`](crates/ndn-face-native) and adds a UDP-cost
+(10) nexthop on the peer's `/ndn/node/<id>` prefix, so the measured best-route
+strategy (below) moves the peer's bulk traffic onto the reliable, fast NDP link
+while the connectionless coordination radios stay for discovery + fallback. The
+Rust seam (`NanBackend::request_ndp` → `NdpLink` → `UdpFace::from_socket`) is
+exercised by `crates/ndn-face-wifi-aware/tests/ndp_bulk.rs`; on Android the
+`NanRadio` runs the data-path negotiation (a node-id tiebreak picks the publisher
+as server/responder and the subscriber as client/initiator, per the Android
+Wi-Fi Aware guide). A NAN data path **tears down when idle**, so the engine runs
+a periodic **keepalive** on the NDP `UdpFace` to keep it warm; on a genuine loss
+the platform's `onLost` calls `NdnEngine::detach_ndp_face` →
+`ForwarderEngine::remove_face`, which drops the face and its FIB nexthops so
+routing falls back to the coordination radios (rather than black-holing the stale
+low-cost nexthop) until the NDP re-establishes.
+
+**Measured best-route (extension).** The per-peer `/ndn/node/<id>` routes use
+`MeasuredStrategy` rather than plain `BestRoute`: it ranks nexthops by a blend of
+the static [`LinkProfile`](crates/ndn-transport) cost *prior* and live signals —
+prefix-level EWMA RTT (`MeasurementsTable`) plus per-face `LinkSignals` (link
+RTT, throughput, congestion, retransmit rate, RSSI from the
+[signals](#cross-layer-signals) layer). With no samples yet it is identical to
+`BestRoute` (static cost only); as measurements accrue it shifts traffic toward
+the better-performing face — preferring a warm NDP, but moving off it if it
+degrades even though its static cost is lower.
+
 **Discovery conventions (extension).** Nearby-peer discovery is tiered:
 
 - **Tier-1 presence** — each node beacons a tiny `{id, label}` over its broadcast
@@ -361,6 +395,26 @@ opaque handles aren't passable across the FFI).
   `label`, `faces`, `rssi`, `age_ms`); a leaf fetches that name to render a
   "nearby" list. Trust (the operator cert) is resolved on demand when a peer is
   tapped — not carried per beacon.
+
+**Tap-to-share (extension).** Sharing a file to a tapped peer composes the
+routable node prefix with NDNLPv2 `ForwardingHint`, so content keeps an
+*identity-stable* name while still routing to a specific peer (`ndn-boltffi`'s
+*offer board*, served by the leaf over the seam):
+
+- **Rendezvous (routable).** The offerer serves its certificate at
+  `/ndn/node/<id>/cert` (the TOFU pin target) and a signed JSON **manifest** at
+  `/ndn/node/<id>/offers` (each entry: display name, MIME, size, and the file's
+  routable object name). Both sit under the node prefix, so the cost-aware
+  per-peer route reaches them with no hint.
+- **Content (identity-stable).** Each offered file is a signed RDR object under
+  the offerer's *own identity*, `/<identity>/file/<fileId>` — location-independent
+  (forward-compatible with a durable repo), not coupled to the node id.
+- **Steer + strip.** The consumer fetches a file with `ForwardingHint =
+  /ndn/node/<peerId>`. Forwarders route toward that delegation (the per-peer
+  route) until the Interest reaches the producer's node, which has declared
+  `/ndn/node/<id>` in its **`NetworkRegionTable`** (at discovery start) — there
+  the hint is stripped and the Interest forwarded by name to the local producer.
+  Verification is end-to-end against the pinned cert; the forwarder only relays.
 
 *Tracked refactor:* this presence table duplicates `ndn_discovery_core::NeighborTable`
 (which already tracks `node_name` + per-face reachability + a quality metric);
