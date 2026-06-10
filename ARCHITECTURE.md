@@ -344,10 +344,29 @@ trust authority), and the end consumer verifies against a pinned cert.
 `ndn-boltffi` exposes each radio as a two-way FFI seam: an app-implemented
 `NdnNanBackend` / `NdnBleBackend` (engine → radio: broadcast/publish) plus
 `NdnEngine::{nan_deliver_followup, ble_deliver_frame}` (radio → engine, since
-opaque handles aren't passable across the FFI). Nearby-peer **discovery** is
-served the NDN-native way at `/localhost/discovery/peers` (a localhost-scoped
-dataset a leaf app fetches), fed by `note_peer` from the radios' presence
-beacons; trust is resolved on demand when a peer is tapped, not per beacon.
+opaque handles aren't passable across the FFI).
+
+**Discovery conventions (extension).** Nearby-peer discovery is tiered:
+
+- **Tier-1 presence** — each node beacons a tiny `{id, label}` over its broadcast
+  faces (Wi-Fi Aware service-info, BLE advertisement). Wire form: UTF-8 `id`, a
+  `\n`, then UTF-8 `label`; neither contains a newline. `id` is a stable
+  per-device id, `label` a human name (e.g. the device model).
+- **Routable node prefix** — a peer with id `X` is reachable at `/ndn/node/X`.
+  Discovery installs a cost-aware route to it (see *cost-aware forwarding* above),
+  and a node's served content carries a `ForwardingHint` to its own
+  `/ndn/node/<id>` so it routes there over the best face.
+- **Peer dataset** — the node serves the observed-peer table the NDN-native way
+  at `/localhost/discovery/peers` (localhost-scoped JSON: `self` + `peers[]` with
+  `label`, `faces`, `rssi`, `age_ms`); a leaf fetches that name to render a
+  "nearby" list. Trust (the operator cert) is resolved on demand when a peer is
+  tapped — not carried per beacon.
+
+*Tracked refactor:* this presence table duplicates `ndn_discovery_core::NeighborTable`
+(which already tracks `node_name` + per-face reachability + a quality metric);
+the intended de-dup is to make the dataset a view over that one shared table,
+adding only the human label, and to install the discovery route via the general
+`DiscoveryProtocol`/`add_fib_entry` path rather than a mobile-specific helper.
 
 ## Task Topology
 
