@@ -115,6 +115,27 @@ The remaining shared-medium depth work is now optional transport breadth:
 Ethernet/BLE captures can extend the same invariants beyond the live UDP socket
 fixtures when those environments are available.
 
+## Intentional extensions (downstream-relied-upon divergences)
+
+A few ndn-rs behaviors deliberately extend or diverge from stock NFD/ndn-cxx.
+They are **intentional**, not findings, and downstream stacks (notably NDF)
+build on them, so each is pinned by a passing regression-guard witness in
+`testbed/tests/audit/` and tracked in `testbed/EXPECTED_FAILURES.md` under
+"NDF-relied-upon extensions". They are listed here so the divergence is part of
+the documented compliance surface rather than an untracked delta.
+
+| Extension | What diverges | Witness |
+|---|---|---|
+| Persistent Interest / SubscriptionRequest (TLV `0x230`) | A subscription Interest creates a persistent PIT entry with per-InRecord persistence state and a data-count budget, distinct from a classical one-shot entry at the same name. Stock NFD has no such TLV. | `f16i_subscription_persistence.sh` |
+| ReplayGuard `monotonic=false` shared-key mode | Signed-Interest replay protection uses AND-semantics (a replay only when *every* shared anti-replay field agrees), and supports a non-monotonic mode for a key shared across devices, where an out-of-order seq is legitimate but an exact in-window repeat is still rejected. | `f16ii_replay_guard_shared_key.sh` |
+| `ContentHashTarget::InnerTlvType` delegated hashing | A face may be configured to hash a specific inner TLV type (e.g. `364`) rather than the whole Content, so a delegating consumer can name/verify by that inner digest. | `f16iii_inner_tlv_hashing.sh` |
+| Implicit-digest fetch (`<auth>/blocks/<hash>`) | Content-Store lookup and CanBePrefix resolution by `ImplicitSha256DigestComponent`, supporting content-hash-addressed retrieval. (Standard NDN component, but pinned here as a relied-upon retrieval path.) | `f14_implicit_digest_fetch.sh` |
+
+The `SignedTrustContext` wire object also carries an optional non-critical
+provenance hint (`SOURCE_BUNDLE_HASH`, TLV `0x041A`) recording the SHA-256
+digest of the source trust bundle a context was projected from; old nodes skip
+it per the NDN evolvability rule.
+
 ## TLV codepoint allocations
 
 ndn-rs's TLV allocations split into three classes:
