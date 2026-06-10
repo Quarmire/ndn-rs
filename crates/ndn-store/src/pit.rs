@@ -209,6 +209,12 @@ pub struct PitEntry {
     /// checks it on wake and skips the redundant transmission. Inert for
     /// strategies that forward immediately.
     pub forward_cancelled: bool,
+    /// Set when an out-record was pruned because its upstream face was torn
+    /// down (F15 B2). A persistent subscription re-expressed into such an entry
+    /// re-forwards (re-establishes the upstream leg) instead of aggregate-
+    /// suppressing; cleared on that re-forward. Distinguishes a *lost* upstream
+    /// leg from one that simply hasn't forwarded yet.
+    pub upstream_lost: bool,
 }
 
 impl PitEntry {
@@ -223,6 +229,7 @@ impl PitEntry {
             expires_at: now + lifetime_ms * 1_000_000,
             persistent: None,
             forward_cancelled: false,
+            upstream_lost: false,
         }
     }
 
@@ -558,6 +565,12 @@ impl Pit {
     /// carries a SubscriptionId has its surviving budget **parked** in the
     /// orphan index (F15), so a re-expression on a new face reclaims it rather
     /// than restarting from the full credit.
+    ///
+    /// The dead face's **out**-records are also pruned from surviving entries
+    /// (F15 B2): a lingering out-record on a torn-down upstream face makes a
+    /// persistent entry look "already forwarded", so a re-expressed
+    /// subscription would aggregate-suppress instead of re-establishing the
+    /// upstream leg. Pruning it lets the re-express re-forward.
     pub fn remove_face(&self, face_id: u64) -> usize {
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -565,15 +578,17 @@ impl Pit {
             let mut to_prune = Vec::new();
 
             for entry in self.entries.iter() {
-                let all_on_face = entry.in_records.iter().all(|r| r.face_id == face_id);
-                let any_on_face = entry.in_records.iter().any(|r| r.face_id == face_id);
+                let any_in = entry.in_records.iter().any(|r| r.face_id == face_id);
+                let any_out = entry.out_records.iter().any(|r| r.face_id == face_id);
 
-                if any_on_face {
+                if any_in {
                     self.park_dying_records(entry.value(), face_id);
                 }
-                if all_on_face && !entry.in_records.is_empty() {
+                let all_in_on_face =
+                    !entry.in_records.is_empty() && entry.in_records.iter().all(|r| r.face_id == face_id);
+                if all_in_on_face {
                     to_remove.push(*entry.key());
-                } else if any_on_face {
+                } else if any_in || any_out {
                     to_prune.push(*entry.key());
                 }
             }
@@ -586,7 +601,12 @@ impl Pit {
 
             for token in &to_prune {
                 if let Some(mut entry) = self.entries.get_mut(token) {
+                    let lost_upstream = entry.out_records.iter().any(|r| r.face_id == face_id);
                     entry.in_records.retain(|r| r.face_id != face_id);
+                    entry.out_records.retain(|r| r.face_id != face_id);
+                    if lost_upstream {
+                        entry.upstream_lost = true;
+                    }
                 }
             }
 
@@ -599,15 +619,17 @@ impl Pit {
             let mut to_prune = Vec::new();
 
             for (token, entry) in entries.iter() {
-                let all_on_face = entry.in_records.iter().all(|r| r.face_id == face_id);
-                let any_on_face = entry.in_records.iter().any(|r| r.face_id == face_id);
+                let any_in = entry.in_records.iter().any(|r| r.face_id == face_id);
+                let any_out = entry.out_records.iter().any(|r| r.face_id == face_id);
 
-                if any_on_face {
+                if any_in {
                     self.park_dying_records(entry, face_id);
                 }
-                if all_on_face && !entry.in_records.is_empty() {
+                let all_in_on_face =
+                    !entry.in_records.is_empty() && entry.in_records.iter().all(|r| r.face_id == face_id);
+                if all_in_on_face {
                     to_remove.push(*token);
-                } else if any_on_face {
+                } else if any_in || any_out {
                     to_prune.push(*token);
                 }
             }
@@ -620,7 +642,12 @@ impl Pit {
 
             for token in &to_prune {
                 if let Some(entry) = entries.get_mut(token) {
+                    let lost_upstream = entry.out_records.iter().any(|r| r.face_id == face_id);
                     entry.in_records.retain(|r| r.face_id != face_id);
+                    entry.out_records.retain(|r| r.face_id != face_id);
+                    if lost_upstream {
+                        entry.upstream_lost = true;
+                    }
                 }
             }
 

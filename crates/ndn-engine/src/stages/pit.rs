@@ -124,6 +124,10 @@ impl PitCheckStage {
             Loop,
             Aggregated,
             Inserted,
+            /// A persistent subscription re-expressed into an entry whose
+            /// upstream out-record was torn down with its face (F15 B2): it must
+            /// re-forward to re-establish the upstream leg, not aggregate-suppress.
+            ReForward,
         }
         // Atomic check-and-insert: holding the per-shard write lock across
         // lookup and insert prevents two concurrent same-name Interests on
@@ -157,7 +161,18 @@ impl PitCheckStage {
                 {
                     entry.expires_at = ps.reap_at;
                 }
-                CheckResult::Aggregated
+                // F15 B2: a persistent subscription re-expressed into an entry
+                // whose upstream out-record was torn down with its face must
+                // re-forward to re-establish the upstream leg. The explicit
+                // `upstream_lost` flag distinguishes this from an entry that
+                // simply hasn't forwarded yet (don't re-forward those — they
+                // aggregate). Cleared here so exactly one re-express re-forwards.
+                if persistent.is_some() && entry.upstream_lost {
+                    entry.upstream_lost = false;
+                    CheckResult::ReForward
+                } else {
+                    CheckResult::Aggregated
+                }
             },
             || {
                 let mut entry = PitEntry::new(interest.name.clone(), now_ns, lifetime_ms);
@@ -191,6 +206,10 @@ impl PitCheckStage {
             }
             CheckResult::Inserted => {
                 trace!(target: t::FWD_PIT, face=%ctx.face_id, name=%interest.name, nonce, lifetime_ms, action="insert", "pit op");
+                Action::Continue(ctx)
+            }
+            CheckResult::ReForward => {
+                trace!(target: t::FWD_PIT, face=%ctx.face_id, name=%interest.name, nonce, action="subscription-reforward", "pit op");
                 Action::Continue(ctx)
             }
         }
@@ -1140,6 +1159,65 @@ mod persistent_tests {
         })
         .unwrap();
         assert_eq!(pit.orphan_count(), 0, "orphan consumed by the re-attach");
+    }
+
+    /// F15 B2: when an intermediate forwarder's *upstream* face dies, the
+    /// downstream subscription's PIT entry survives (downstream in-record is
+    /// alive) but its stale out-record is pruned; a re-expressed persistent
+    /// Interest then re-forwards to re-establish the upstream leg instead of
+    /// aggregate-suppressing.
+    #[test]
+    fn persistent_reexpress_reforwards_after_upstream_face_down() {
+        let pit = Arc::new(Pit::new());
+        let check = Arc::new(PitCheckStage {
+            pit: Arc::clone(&pit),
+            dead_nonce_list: None,
+            validator: Some(make_validator()),
+            replay_guard: None,
+        });
+        let name: Name = "/persistent/upstream".parse().unwrap();
+        let token = persistent_token(&name);
+
+        // Downstream subscriber installs the entry (in-record on face 1).
+        let wire = build_persistent_interest("/persistent/upstream", 10, 60);
+        assert!(matches!(run_check(&check, wire), Action::Continue(_)));
+
+        // Simulate the forwarder having sent the Interest upstream out face 2.
+        pit.with_entry_mut(&token, |e| e.add_out_record(2, 7, 0)).unwrap();
+
+        // A second subscriber re-expressing now would aggregate-suppress
+        // (upstream Interest still pending).
+        let wire_agg = build_persistent_interest("/persistent/upstream", 10, 60);
+        let mut ctx = PacketContext::new(wire_agg.clone(), FaceId(1), 0);
+        ctx.packet =
+            DecodedPacket::Interest(Box::new(ndn_packet::Interest::decode(wire_agg).unwrap()));
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        assert!(
+            matches!(rt.block_on(check.process(ctx)), Action::Drop(DropReason::Suppressed)),
+            "with a live upstream out-record, a re-express must aggregate"
+        );
+
+        // Upstream face 2 dies → its out-record is pruned (entry kept; the
+        // downstream in-record on face 1 survives).
+        pit.remove_face(2);
+        pit.with_entry(&token, |e| {
+            assert!(e.out_records.is_empty(), "stale upstream out-record pruned");
+            assert!(
+                e.in_records.iter().any(|r| r.face_id == 1),
+                "downstream in-record survives"
+            );
+        })
+        .expect("entry kept");
+
+        // Now a re-express must RE-FORWARD (Continue), not suppress.
+        let wire2 = build_persistent_interest("/persistent/upstream", 10, 60);
+        let mut ctx2 = PacketContext::new(wire2.clone(), FaceId(1), 0);
+        ctx2.packet =
+            DecodedPacket::Interest(Box::new(ndn_packet::Interest::decode(wire2).unwrap()));
+        assert!(
+            matches!(rt.block_on(check.process(ctx2)), Action::Continue(_)),
+            "re-express into an entry with no live upstream out-record must re-forward"
+        );
     }
 
     /// F15: without a SubscriptionId, a flapped subscription cannot be

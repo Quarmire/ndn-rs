@@ -10,14 +10,20 @@
 #     - subscription_id_round_trips
 #     - no_id_decodes_to_none_and_keeps_9_byte_value
 #     - over_long_id_is_rejected_to_classical
-#   ndn-engine (PIT re-attach): surviving budget is parked on face-down and
+#   ndn-engine (PIT re-attach, B1): surviving budget is parked on face-down and
 #     spliced back on re-expression with the same id; no id → no survival;
 #     expired orphans are not reclaimed.
 #     - persistent_subscription_reattaches_after_face_churn
 #     - persistent_subscription_without_id_does_not_park
 #     - expired_orphan_is_not_reclaimed
-#   ndn-app (consumer): one stable id is reused across re-expressions.
+#   ndn-engine (upstream re-establish, B2): on upstream face-down the stale
+#     out-record is pruned and a re-expressed subscription re-forwards instead
+#     of aggregate-suppressing.
+#     - persistent_reexpress_reforwards_after_upstream_face_down
+#   ndn-app (consumer): one stable id reused across re-expressions, and a
+#     staleness window re-expresses to recover an unseen upstream flap (B2).
 #     - subscription_id_is_stable_across_re_expression
+#     - recv_reexpresses_on_staleness
 #
 # Exit codes: 0 PASS / 1 FAIL / 2 SKIP
 set -euo pipefail
@@ -37,13 +43,15 @@ if ! cargo test -p ndn-engine --lib --quiet -- \
         persistent_subscription_reattaches_after_face_churn \
         persistent_subscription_without_id_does_not_park \
         expired_orphan_is_not_reclaimed \
+        persistent_reexpress_reforwards_after_upstream_face_down \
         >/tmp/f15_engine.log 2>&1; then
-    echo "=== F15 FAIL — PIT re-attach ==="; cat /tmp/f15_engine.log; ok=0
+    echo "=== F15 FAIL — PIT re-attach / re-forward ==="; cat /tmp/f15_engine.log; ok=0
 fi
 if ! cargo test -p ndn-app --lib --quiet -- \
         subscription_id_is_stable_across_re_expression \
+        recv_reexpresses_on_staleness \
         >/tmp/f15_app.log 2>&1; then
-    echo "=== F15 FAIL — consumer id stability ==="; cat /tmp/f15_app.log; ok=0
+    echo "=== F15 FAIL — consumer re-express ==="; cat /tmp/f15_app.log; ok=0
 fi
 
 if [ "$ok" = 1 ]; then

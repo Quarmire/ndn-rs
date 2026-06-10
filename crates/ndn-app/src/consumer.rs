@@ -565,6 +565,15 @@ pub struct SubscribeOptions {
     pub max_data_count: u32,
     /// Persistent PIT lifetime; capped at [`MAX_PERSISTENT_LIFETIME_SECS`].
     pub lifetime: Duration,
+    /// If no Data arrives within this window, the subscription re-expresses
+    /// itself (fresh signature, same [`SubscriptionId`]). This is the trigger
+    /// that recovers an upstream face flap the consumer cannot otherwise see
+    /// (F15): the re-express re-establishes the broken upstream leg and splices
+    /// the surviving budget. `None` disables it (re-express only on budget
+    /// exhaustion).
+    ///
+    /// [`SubscriptionId`]: ndn_packet::SubscriptionRequest
+    pub staleness: Option<Duration>,
 }
 
 impl Default for SubscribeOptions {
@@ -572,6 +581,7 @@ impl Default for SubscribeOptions {
         Self {
             max_data_count: 1024,
             lifetime: Duration::from_secs(600),
+            staleness: Some(Duration::from_secs(30)),
         }
     }
 }
@@ -644,14 +654,31 @@ impl Subscription {
     }
 
     /// Next streamed Data. Re-expresses the persistent Interest automatically
-    /// once the data-count budget is exhausted.
+    /// once the data-count budget is exhausted, and — when `opts.staleness` is
+    /// set — also if no Data arrives within that window, so the subscription
+    /// recovers an upstream face flap by re-establishing the broken leg with a
+    /// fresh re-express carrying the same SubscriptionId (F15).
     pub async fn recv(&mut self) -> Result<Data, AppError> {
-        if self.remaining == 0 {
-            self.express().await?;
+        loop {
+            if self.remaining == 0 {
+                self.express().await?;
+            }
+            let reply = match self.opts.staleness {
+                Some(window) => match crate::rt::timeout(window, self.conn.recv()).await {
+                    Ok(r) => r,
+                    // Silence past the staleness window: re-express (fresh
+                    // signature, same SubscriptionId) and keep waiting.
+                    Err(_elapsed) => {
+                        self.express().await?;
+                        continue;
+                    }
+                },
+                None => self.conn.recv().await,
+            };
+            let reply = reply.ok_or(AppError::Closed)?;
+            self.remaining = self.remaining.saturating_sub(1);
+            return decode_data_lp(reply);
         }
-        let reply = self.conn.recv().await.ok_or(AppError::Closed)?;
-        self.remaining = self.remaining.saturating_sub(1);
-        decode_data_lp(reply)
     }
 
     pub fn prefix(&self) -> &Name {
@@ -690,6 +717,7 @@ mod subscription_tests {
         let opts = SubscribeOptions {
             max_data_count: 256,
             lifetime: Duration::from_secs(120),
+            ..SubscribeOptions::default()
         };
         let id = fresh_subscription_id();
         let wire = build_persistent_interest(&prefix, &opts, &id);
@@ -728,11 +756,85 @@ mod subscription_tests {
         assert_ne!(fresh_subscription_id(), fresh_subscription_id());
     }
 
+    /// A `Connection` that swallows the first subscription Interest (recv hangs)
+    /// and only delivers Data once it has seen a *second* send — i.e. after the
+    /// subscription re-expresses on staleness.
+    struct StaleConn {
+        sends: std::sync::atomic::AtomicUsize,
+        data: Bytes,
+    }
+
+    #[async_trait::async_trait]
+    impl Connection for StaleConn {
+        async fn send(&self, _wire: Bytes) -> Result<(), AppError> {
+            self.sends
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        async fn recv(&self) -> Option<Bytes> {
+            if self.sends.load(std::sync::atomic::Ordering::SeqCst) >= 2 {
+                Some(self.data.clone())
+            } else {
+                // No Data on the first express → forces the staleness timeout.
+                std::future::pending().await
+            }
+        }
+        async fn register_prefix(&self, _prefix: &Name) -> Result<(), AppError> {
+            Ok(())
+        }
+    }
+
+    fn make_data_wire() -> Bytes {
+        use ndn_tlv::TlvWriter;
+        let nc = {
+            let mut w = TlvWriter::new();
+            w.write_tlv(0x08, b"s");
+            w.finish()
+        };
+        let name = {
+            let mut w = TlvWriter::new();
+            w.write_tlv(0x07, &nc);
+            w.finish()
+        };
+        let mut w = TlvWriter::new();
+        w.write_tlv(0x06, &name);
+        w.finish()
+    }
+
+    /// F15 B2 trigger: when no Data arrives within the staleness window, the
+    /// subscription re-expresses itself (re-establishing a flapped upstream
+    /// leg). One re-express is enough here to unblock delivery.
+    #[tokio::test]
+    async fn recv_reexpresses_on_staleness() {
+        let conn = Arc::new(StaleConn {
+            sends: std::sync::atomic::AtomicUsize::new(0),
+            data: make_data_wire(),
+        });
+        let mut sub = Subscription {
+            conn: conn.clone(),
+            prefix: Name::from("/s"),
+            opts: SubscribeOptions {
+                staleness: Some(Duration::from_millis(20)),
+                ..SubscribeOptions::default()
+            },
+            remaining: 0,
+            subscription_id: fresh_subscription_id(),
+        };
+        let data = sub.recv().await.expect("Data delivered after re-express");
+        assert!(data.name.to_string().contains('s'));
+        assert_eq!(
+            conn.sends.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "subscription must re-express exactly once on staleness"
+        );
+    }
+
     #[test]
     fn lifetime_capped_at_max() {
         let opts = SubscribeOptions {
             max_data_count: 1,
             lifetime: Duration::from_secs(100_000),
+            ..SubscribeOptions::default()
         };
         let wire = build_persistent_interest(&Name::from("/x"), &opts, &fresh_subscription_id());
         let interest = Interest::decode(wire).unwrap();
