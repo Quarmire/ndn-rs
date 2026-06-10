@@ -129,13 +129,20 @@ pub fn metadata_name(prefix: &Name) -> Name {
         .append_component(NameComponent::keyword(Bytes::from_static(METADATA_KEYWORD)))
 }
 
+/// Encode a NonNegativeInteger per the NDN packet spec: the width is **1, 2, 4,
+/// or 8 bytes** chosen by magnitude — *not* minimal-trimmed. A minimal encoding
+/// can emit 3/5/6/7 bytes, which a conforming decoder (incl. [`decode_nni`] and
+/// other NDN stacks) rejects as an invalid NNI length. This matches
+/// `ndn-foundation-types`' name-component integer encoding byte-for-byte, so a
+/// FinalBlockID segment number equals the corresponding segment name component.
 pub(crate) fn encode_nni_be(v: u64) -> Vec<u8> {
-    if v == 0 {
-        return vec![0x00];
+    let b = v.to_be_bytes();
+    match v {
+        0..=0xFF => b[7..].to_vec(),
+        0x100..=0xFFFF => b[6..].to_vec(),
+        0x1_0000..=0xFFFF_FFFF => b[4..].to_vec(),
+        _ => b.to_vec(),
     }
-    let bytes = v.to_be_bytes();
-    let first_nonzero = bytes.iter().position(|&b| b != 0).unwrap_or(7);
-    bytes[first_nonzero..].to_vec()
 }
 
 fn decode_nni_be(buf: &[u8]) -> u64 {
@@ -306,6 +313,47 @@ mod tests {
         assert_eq!(m2.last_segment(), Some(3));
         assert_eq!(m2.segment_size, Some(8192));
         assert_eq!(m2.size, Some(24000));
+    }
+
+    #[test]
+    fn nni_encodes_to_legal_widths() {
+        // NDN NonNegativeInteger must be 1/2/4/8 bytes — never minimal-trimmed.
+        for (v, w) in [
+            (0u64, 1usize),
+            (0xFF, 1),
+            (0x100, 2),
+            (0xFFFF, 2),
+            (0x1_0000, 4), // the regressing range: minimal would be 3 bytes
+            (0x12_3456, 4),
+            (0xFFFF_FFFF, 4),
+            (0x1_0000_0000, 8),
+        ] {
+            assert_eq!(encode_nni_be(v).len(), w, "NNI width for {v:#x}");
+        }
+        // Byte-identical to the name-component integer encoding, so a
+        // FinalBlockID segment number equals the segment name component.
+        let seg = Name::root().append_segment(0x12_3456);
+        assert_eq!(
+            encode_nni_be(0x12_3456),
+            seg.components().last().unwrap().value.as_ref()
+        );
+    }
+
+    #[test]
+    fn metadata_size_in_three_byte_range_round_trips() {
+        // Regression: a ~1.2 MB file's `size` minimal-encodes to 3 bytes, which
+        // the strict decoder rejected ("invalid NNI length: 3"). Must decode.
+        let fbi_nni = encode_nni_be(0);
+        let mut fbi = vec![0x32u8, fbi_nni.len() as u8];
+        fbi.extend_from_slice(&fbi_nni);
+        let m = MetaData {
+            versioned_name: "/f".parse::<Name>().unwrap().append_version(1),
+            final_block_id: Bytes::from(fbi),
+            segment_size: Some(8192),
+            size: Some(0x12_3456), // 1,193,046 bytes
+        };
+        let m2 = MetaData::decode(m.encode()).expect("3-byte-range size must decode");
+        assert_eq!(m2.size, Some(0x12_3456));
     }
 
     #[test]
