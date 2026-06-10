@@ -78,8 +78,9 @@ const OBJECT_FETCH_BACKOFF: Duration = Duration::from_millis(300);
 /// Number of segment Interests kept in flight while fetching a segmented
 /// object. Sequential fetch is RTT-bound (one round-trip per segment); a window
 /// turns throughput into `window / RTT * chunk`, the difference between ~30 s
-/// and a couple of seconds for a multi-MB object over a real radio.
-const FETCH_WINDOW: usize = 16;
+/// and a couple of seconds for a multi-MB object over a real radio. Sized for a
+/// high-bandwidth Wi-Fi (NDP) link, where a deeper window keeps the pipe full.
+const FETCH_WINDOW: usize = 32;
 /// Per-segment retransmit cap before a windowed fetch gives up.
 const SEG_MAX_ATTEMPTS: u32 = 6;
 /// How long to wait for *any* segment Data before retransmitting the in-flight
@@ -341,7 +342,7 @@ impl Consumer {
     /// ndnd `std/object/client_consume.go:22`; pair with
     /// [`Producer::publish_object`](crate::Producer::publish_object).
     pub async fn fetch_object(&mut self, name: impl Into<Name>) -> Result<Bytes, AppError> {
-        self.fetch_object_inner(name.into(), None, &[]).await
+        self.fetch_object_inner(name.into(), None, &[], |_, _| {}).await
     }
 
     /// Verified whole-object fetch — the **secure** RDR path: like
@@ -356,7 +357,7 @@ impl Consumer {
         name: impl Into<Name>,
         validator: &Validator,
     ) -> Result<Bytes, AppError> {
-        self.fetch_object_inner(name.into(), Some(validator), &[])
+        self.fetch_object_inner(name.into(), Some(validator), &[], |_, _| {})
             .await
     }
 
@@ -373,7 +374,21 @@ impl Consumer {
         validator: &Validator,
         forwarding_hint: &[Name],
     ) -> Result<Bytes, AppError> {
-        self.fetch_object_inner(name.into(), Some(validator), forwarding_hint)
+        self.fetch_object_inner(name.into(), Some(validator), forwarding_hint, |_, _| {})
+            .await
+    }
+
+    /// Whole-object fetch with progress: `on_progress(received, total)` is
+    /// called once with `(0, total)` as soon as the segment count is known, then
+    /// after each segment lands. Drives a download progress bar.
+    pub async fn fetch_object_verified_hinted_progress(
+        &mut self,
+        name: impl Into<Name>,
+        validator: &Validator,
+        forwarding_hint: &[Name],
+        on_progress: impl FnMut(u64, u64),
+    ) -> Result<Bytes, AppError> {
+        self.fetch_object_inner(name.into(), Some(validator), forwarding_hint, on_progress)
             .await
     }
 
@@ -382,6 +397,7 @@ impl Consumer {
         name: Name,
         validator: Option<&Validator>,
         forwarding_hint: &[Name],
+        on_progress: impl FnMut(u64, u64),
     ) -> Result<Bytes, AppError> {
         // Metadata discovery — generous lifetime + retries (it is the first and
         // most failure-prone round-trip over a lossy radio). `CanBePrefix` +
@@ -406,8 +422,14 @@ impl Consumer {
             .last_segment()
             .ok_or_else(|| AppError::Protocol("metadata FinalBlockID unparseable".into()))?;
 
-        self.fetch_segments_windowed(&meta.versioned_name, last_seg, validator, forwarding_hint)
-            .await
+        self.fetch_segments_windowed(
+            &meta.versioned_name,
+            last_seg,
+            validator,
+            forwarding_hint,
+            on_progress,
+        )
+        .await
     }
 
     /// Fetch segments `0..=last_seg` of `versioned` with a sliding window of
@@ -421,10 +443,12 @@ impl Consumer {
         last_seg: u64,
         validator: Option<&Validator>,
         forwarding_hint: &[Name],
+        mut on_progress: impl FnMut(u64, u64),
     ) -> Result<Bytes, AppError> {
         use std::collections::HashMap;
         let conn = Arc::clone(&self.conn);
         let total = last_seg + 1;
+        on_progress(0, total);
         let mut chunks: Vec<Option<Bytes>> = (0..total).map(|_| None).collect();
         let mut received: u64 = 0;
         let mut next_send: u64 = 0;
@@ -452,6 +476,7 @@ impl Consumer {
                             chunks[seg as usize] = Some(chunk);
                             received += 1;
                             inflight.remove(&seg);
+                            on_progress(received, total);
                         }
                     }
                     // Refill the window behind the segment we just retired.
