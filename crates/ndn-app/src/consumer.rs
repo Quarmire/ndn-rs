@@ -23,6 +23,23 @@ use crate::AppError;
 /// against the pinned anchor) or this errors; without one, content is taken
 /// as-is (integrity only). `None` when the Data carries no Content. The single
 /// choke point both the unverified and verified RDR object paths route through.
+/// Build and send one segment Interest for `versioned/seg=<seg>` (carrying the
+/// forwarding hint, if any) directly on the connection — used by the windowed
+/// segment-fetch pipeline.
+async fn send_segment_interest(
+    conn: &dyn Connection,
+    versioned: &Name,
+    seg: u64,
+    forwarding_hint: &[Name],
+) -> Result<(), AppError> {
+    let mut b =
+        InterestBuilder::new(versioned.clone().append_segment(seg)).lifetime(DEFAULT_INTEREST_LIFETIME);
+    if !forwarding_hint.is_empty() {
+        b = b.forwarding_hint(forwarding_hint.to_vec());
+    }
+    conn.send(b.build()).await
+}
+
 async fn accept_content(
     data: Data,
     validator: Option<&Validator>,
@@ -57,6 +74,19 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_millis(4500);
 const OBJECT_FETCH_ATTEMPTS: u32 = 4;
 /// Initial back-off between object-fetch retries (doubles each attempt).
 const OBJECT_FETCH_BACKOFF: Duration = Duration::from_millis(300);
+
+/// Number of segment Interests kept in flight while fetching a segmented
+/// object. Sequential fetch is RTT-bound (one round-trip per segment); a window
+/// turns throughput into `window / RTT * chunk`, the difference between ~30 s
+/// and a couple of seconds for a multi-MB object over a real radio.
+const FETCH_WINDOW: usize = 16;
+/// Per-segment retransmit cap before a windowed fetch gives up.
+const SEG_MAX_ATTEMPTS: u32 = 6;
+/// How long to wait for *any* segment Data before retransmitting the in-flight
+/// window. Shorter than the Interest lifetime so a dropped segment is re-sent
+/// promptly without stalling the whole transfer; on a healthy link Data arrives
+/// far sooner, so this never fires spuriously.
+const SEG_RECV_TIMEOUT: Duration = Duration::from_millis(1500);
 
 pub struct Consumer {
     conn: Arc<dyn Connection>,
@@ -376,22 +406,85 @@ impl Consumer {
             .last_segment()
             .ok_or_else(|| AppError::Protocol("metadata FinalBlockID unparseable".into()))?;
 
-        let mut out = bytes::BytesMut::new();
-        for n in 0..=last_seg {
-            let seg_name = meta.versioned_name.clone().append_segment(n);
-            let data = self
-                .fetch_object_with_retry(|| {
-                    let mut b =
-                        InterestBuilder::new(seg_name.clone()).lifetime(DEFAULT_INTEREST_LIFETIME);
-                    if !forwarding_hint.is_empty() {
-                        b = b.forwarding_hint(forwarding_hint.to_vec());
+        self.fetch_segments_windowed(&meta.versioned_name, last_seg, validator, forwarding_hint)
+            .await
+    }
+
+    /// Fetch segments `0..=last_seg` of `versioned` with a sliding window of
+    /// [`FETCH_WINDOW`] in-flight Interests, reassembling in order. Verifies
+    /// each segment (when `validator` is set), tolerates out-of-order arrival,
+    /// and retransmits the in-flight window on a stall ([`SEG_RECV_TIMEOUT`]).
+    /// This is the throughput fix over the old one-segment-per-round-trip loop.
+    async fn fetch_segments_windowed(
+        &self,
+        versioned: &Name,
+        last_seg: u64,
+        validator: Option<&Validator>,
+        forwarding_hint: &[Name],
+    ) -> Result<Bytes, AppError> {
+        use std::collections::HashMap;
+        let conn = Arc::clone(&self.conn);
+        let total = last_seg + 1;
+        let mut chunks: Vec<Option<Bytes>> = (0..total).map(|_| None).collect();
+        let mut received: u64 = 0;
+        let mut next_send: u64 = 0;
+        let mut inflight: HashMap<u64, u32> = HashMap::new(); // seg -> attempts
+
+        // Prime the window.
+        while next_send < total && inflight.len() < FETCH_WINDOW {
+            send_segment_interest(conn.as_ref(), versioned, next_send, forwarding_hint).await?;
+            inflight.insert(next_send, 1);
+            next_send += 1;
+        }
+
+        while received < total {
+            match crate::rt::timeout(SEG_RECV_TIMEOUT, conn.recv()).await {
+                Ok(Some(wire)) => {
+                    // Non-segment / Nack packets on the shared stream are
+                    // ignored; the retransmit path recovers any real loss.
+                    let Ok(data) = decode_data_lp(wire) else { continue };
+                    let Some(seg) = data.name.components().last().and_then(|c| c.as_segment())
+                    else {
+                        continue;
+                    };
+                    if seg < total && chunks[seg as usize].is_none() {
+                        if let Some(chunk) = accept_content(data, validator).await? {
+                            chunks[seg as usize] = Some(chunk);
+                            received += 1;
+                            inflight.remove(&seg);
+                        }
                     }
-                    b
-                })
-                .await?;
-            if let Some(chunk) = accept_content(data, validator).await? {
-                out.extend_from_slice(&chunk);
+                    // Refill the window behind the segment we just retired.
+                    while next_send < total && inflight.len() < FETCH_WINDOW {
+                        send_segment_interest(conn.as_ref(), versioned, next_send, forwarding_hint)
+                            .await?;
+                        inflight.insert(next_send, 1);
+                        next_send += 1;
+                    }
+                }
+                Ok(None) => return Err(AppError::Closed),
+                Err(_elapsed) => {
+                    // Stall: retransmit everything in flight (deduped by the
+                    // forwarder/CS; a late duplicate Data is ignored above).
+                    if inflight.is_empty() {
+                        return Err(AppError::Timeout);
+                    }
+                    for seg in inflight.keys().copied().collect::<Vec<_>>() {
+                        let att = inflight.get_mut(&seg).expect("seg in inflight");
+                        if *att >= SEG_MAX_ATTEMPTS {
+                            return Err(AppError::Timeout);
+                        }
+                        *att += 1;
+                        send_segment_interest(conn.as_ref(), versioned, seg, forwarding_hint)
+                            .await?;
+                    }
+                }
             }
+        }
+
+        let mut out = bytes::BytesMut::new();
+        for c in chunks {
+            out.extend_from_slice(&c.unwrap_or_default());
         }
         Ok(out.freeze())
     }
@@ -827,6 +920,87 @@ mod subscription_tests {
             2,
             "subscription must re-express exactly once on staleness"
         );
+    }
+
+    /// A `Connection` that answers a metadata Interest with an RDR `MetaData`
+    /// and each segment Interest with `[seg; 10]`, so a windowed fetch can be
+    /// driven without a real engine. Out-of-order tolerance is exercised by the
+    /// pipeline issuing many Interests before draining replies.
+    struct SegServer {
+        versioned: Name,
+        last_seg: u64,
+        metadata_name: Name,
+        q: std::sync::Mutex<std::collections::VecDeque<Bytes>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Connection for SegServer {
+        async fn send(&self, wire: Bytes) -> Result<(), AppError> {
+            use ndn_packet::encode::DataBuilder;
+            let interest =
+                Interest::decode(wire).map_err(|e| AppError::Protocol(e.to_string()))?;
+            let Some(last) = interest.name.components().last().cloned() else {
+                return Ok(());
+            };
+            if last.typ == 0x20 && last.value.as_ref() == b"metadata" {
+                let nni = crate::rdr::encode_nni_be(self.last_seg);
+                let mut fbi = vec![0x32u8, nni.len() as u8];
+                fbi.extend_from_slice(&nni);
+                let meta = crate::rdr::MetaData {
+                    versioned_name: self.versioned.clone(),
+                    final_block_id: Bytes::from(fbi),
+                    segment_size: Some(10),
+                    size: Some((self.last_seg + 1) * 10),
+                };
+                let data = DataBuilder::new(self.metadata_name.clone(), &meta.encode()).build();
+                self.q.lock().unwrap().push_back(data);
+            } else if let Some(seg) = last.as_segment()
+                && seg <= self.last_seg
+            {
+                let data = DataBuilder::new(
+                    self.versioned.clone().append_segment(seg),
+                    &vec![seg as u8; 10],
+                )
+                .build();
+                self.q.lock().unwrap().push_back(data);
+            }
+            Ok(())
+        }
+        async fn recv(&self) -> Option<Bytes> {
+            loop {
+                if let Some(d) = self.q.lock().unwrap().pop_front() {
+                    return Some(d);
+                }
+                tokio::task::yield_now().await;
+            }
+        }
+        async fn register_prefix(&self, _: &Name) -> Result<(), AppError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn windowed_fetch_reassembles_multi_segment_object() {
+        let object: Name = "/peer/file/f1".parse().unwrap();
+        let versioned = object.clone().append_version(7);
+        // 100 segments > FETCH_WINDOW, so the pipeline must slide and refill.
+        let server = Arc::new(SegServer {
+            versioned,
+            last_seg: 99,
+            metadata_name: crate::rdr::metadata_name(&object),
+            q: std::sync::Mutex::new(std::collections::VecDeque::new()),
+        });
+        let mut consumer = Consumer::new(server);
+        let bytes = consumer.fetch_object(object).await.expect("windowed fetch");
+        assert_eq!(bytes.len(), 1000, "100 segments x 10 bytes reassembled");
+        for i in 0..100u64 {
+            let s = i as usize * 10;
+            assert_eq!(
+                &bytes[s..s + 10],
+                &vec![i as u8; 10][..],
+                "segment {i} must land at the right offset (in-order reassembly)"
+            );
+        }
     }
 
     #[test]
