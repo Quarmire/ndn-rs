@@ -127,6 +127,33 @@ Some faces are constructed by application code rather than by listener config:
 - SharedWorker face — `crates/ndn-face-shared-worker/`.
   Mounted via the dashboard's browser-engine profile.
 
+## Connectionless named-radio faces — *extension*
+
+> These are ndn-rs extensions with no NDN community-spec basis; the wire is
+> ordinary NDNLPv2 over the radio's native broadcast primitive.
+
+A node — especially a phone — can carry NDN over **connectionless broadcast
+radios** with no AP, no pairing, and no host addresses (the NDN name is the
+only addressing). Each is `link_type() == AdHoc` with a small MTU, so the
+`LpLinkService` fragments NDN across the radio's frames automatically.
+
+| Face | Crate | Radio primitive | Notes |
+| --- | --- | --- | --- |
+| Wi-Fi Aware (NAN) | `crates/ndn-face-wifi-aware/` | NAN follow-up messages (255 B) | AP-less peer Wi-Fi; service pub/sub discovery; bulk over NDP (`request_ndp` → `UdpFace`). |
+| BLE advertising | `crates/ndn-face-ble-adv/` | BLE 5 extended advertisement (~245 B) | Near-universal; pairless broadcast; presence + small Interest/Data (bulk wants a connection face). |
+| 802.11 monitor | `crates/ndn-face-monitor-wifi/` | raw-injected 802.11 frames | Per-frame MCS, no association/ARQ. |
+
+The physical radio sits behind a **backend trait** (`NanBackend`, `AdvBackend`)
+with a hardware-free `Loopback*Bus` for tests, so the face is exercised without
+hardware; a platform supplies the radio by implementing the trait (Android JNI,
+BlueZ, an MCU). These faces are **not mutually exclusive** — a node holds a set
+of them at once and a mesh strategy fans Interests over all (see the
+*Face system* section of `ARCHITECTURE.md` in the repo root). On mobile they're
+attached at runtime via `ndn-mobile` (`attach_wifi_aware` / `attach_ble`) or the
+`ndn-boltffi` FFI seam (`NdnNanBackend` / `NdnBleBackend` + the engine's
+`*_deliver_*` methods); nearby peers surface at the localhost dataset
+`/localhost/discovery/peers`.
+
 ## Link service per face
 
 The default `LinkService` is `LpLinkService` (NDNLPv2 framing); the

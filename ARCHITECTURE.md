@@ -93,6 +93,11 @@ scope = extension   (flat under crates/)   Pragmatic engineering, no NDN spec ba
   ndn-face-shared-worker        Per-origin SharedWorker face (one engine across tabs)
   ndn-face-webble               Browser-side Web Bluetooth central face (dials NDN-BLE peripherals)
   ndn-face-monitor-wifi         802.11 monitor-mode raw-injection face (named-radio bearer; per-frame MCS, no association/ARQ)
+  ndn-face-wifi-aware           Connectionless Wi-Fi Aware (NAN) coordination face (AP-less peer Wi-Fi);
+                                NanBackend trait (platform radio) + LoopbackNanBus; follow-up MTU 255,
+                                NDP-for-bulk by `request_ndp` (UdpFace); service pub/sub → routes
+  ndn-face-ble-adv              Connectionless BLE advertising face (pairless broadcast, near-universal);
+                                AdvBackend trait + LoopbackAdvBus; NDNLPv2 (245 B ext-adv) or NDNts (1-byte) framing
   ndn-rtc-signaling-relay       HTTP rendezvous server for browser↔browser WebRTC
   ndn-sim                       SimFace, SimLink, topology builder, event tracer
   ndn-wasm                      In-browser simulation via wasm-bindgen
@@ -310,6 +315,39 @@ NFD clients ignoring kind > 4 see the lifecycle subset; ndn-rs clients
 References: [`docs/wiki/src/reference/face-transports.md`](docs/wiki/src/reference/face-transports.md)
 (operator catalog) and [`docs/wiki/src/guides/implementing-a-face.md`](docs/wiki/src/guides/implementing-a-face.md)
 (extension guide).
+
+### Connectionless named-radio faces & the multi-radio mobile node — *extension*
+
+A family of faces carry NDN over **connectionless broadcast radios** where the
+NDN *name* is the only addressing — no association, no pairing, no host
+addresses: `ndn-face-wifi-aware` (Wi-Fi Aware / NAN, AP-less peer Wi-Fi),
+`ndn-face-ble-adv` (BLE advertising, near-universal), `ndn-face-monitor-wifi`
+(802.11 injection). Each reports `link_type() == AdHoc` and a small
+`send_mtu`, so the `LpLinkService` fragments NDN across the radio's tiny frames
+automatically; per-frame RSSI is published to a `SignalStore` for measured
+strategies. The physical radio sits behind a **backend trait**
+(`NanBackend`, `AdvBackend`) with a hardware-free `Loopback*Bus` for host
+tests — the face logic is unit-tested without a radio, and a platform
+(Android JNI, BlueZ, an MCU) supplies the radio by implementing the trait.
+
+**Multi-radio is the default, not a mode.** A mobile node holds a *set* of
+these faces at once (multicast + NAN + BLE + an uplink); they are not mutually
+exclusive and fill each other's gaps (BLE everywhere + low power; Wi-Fi Aware
+high-throughput). `ndn-mobile`'s `attach_wifi_aware` / `attach_ble` add a radio
+at runtime (the radio is often only available after start), install a `/`
+default route, and switch the node to `MulticastStrategy` — a mesh peer can't
+know which radio reaches a given peer, so it fans every not-locally-served
+Interest over all of them. Trust stays end-to-end: producers sign, the
+forwarder *relays* (its data-path validation is permissive — it is not the
+trust authority), and the end consumer verifies against a pinned cert.
+
+`ndn-boltffi` exposes each radio as a two-way FFI seam: an app-implemented
+`NdnNanBackend` / `NdnBleBackend` (engine → radio: broadcast/publish) plus
+`NdnEngine::{nan_deliver_followup, ble_deliver_frame}` (radio → engine, since
+opaque handles aren't passable across the FFI). Nearby-peer **discovery** is
+served the NDN-native way at `/localhost/discovery/peers` (a localhost-scoped
+dataset a leaf app fetches), fed by `note_peer` from the radios' presence
+beacons; trust is resolved on demand when a peer is tapped, not per beacon.
 
 ## Task Topology
 
