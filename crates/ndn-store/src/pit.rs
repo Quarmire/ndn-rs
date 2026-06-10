@@ -147,6 +147,22 @@ pub struct PersistentState {
     pub data_count_remaining: u32,
     /// Absolute deadline (nanoseconds since UNIX_EPOCH).
     pub reap_at: u64,
+    /// Stable correlation handle (F15). When set, the surviving budget is
+    /// parked in the [`Pit`] orphan index if the in-record's face is torn
+    /// down, and spliced back when the subscription is re-expressed on a new
+    /// face carrying the same id. `None` → no survival (dies with the face).
+    pub subscription_id: Option<bytes::Bytes>,
+}
+
+/// Budget/deadline parked when a persistent in-record's face is removed, keyed
+/// by its [`PersistentState::subscription_id`]. A re-expression with the same
+/// id reclaims it via [`Pit::take_orphan`], so a face flap doesn't reset the
+/// subscription's credit. Bounded in time by `reap_at` (the reaper evicts
+/// expired orphans).
+#[derive(Clone, Debug)]
+pub struct OrphanedSubscription {
+    pub data_count_remaining: u32,
+    pub reap_at: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -319,6 +335,12 @@ pub struct Pit {
     entries: DashMap<PitToken, PitEntry>,
     #[cfg(target_arch = "wasm32")]
     entries: std::sync::Mutex<std::collections::HashMap<PitToken, PitEntry>>,
+    /// Surviving persistent-subscription budgets, parked when their face is
+    /// removed and reclaimed on re-expression (F15). Keyed by SubscriptionId.
+    #[cfg(not(target_arch = "wasm32"))]
+    orphans: DashMap<bytes::Bytes, OrphanedSubscription>,
+    #[cfg(target_arch = "wasm32")]
+    orphans: std::sync::Mutex<std::collections::HashMap<bytes::Bytes, OrphanedSubscription>>,
 }
 
 impl Pit {
@@ -328,14 +350,24 @@ impl Pit {
             entries: DashMap::new(),
             #[cfg(target_arch = "wasm32")]
             entries: std::sync::Mutex::new(std::collections::HashMap::new()),
+            #[cfg(not(target_arch = "wasm32"))]
+            orphans: DashMap::new(),
+            #[cfg(target_arch = "wasm32")]
+            orphans: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
     pub fn clear(&self) {
         #[cfg(not(target_arch = "wasm32"))]
-        self.entries.clear();
+        {
+            self.entries.clear();
+            self.orphans.clear();
+        }
         #[cfg(target_arch = "wasm32")]
-        self.entries.lock().unwrap().clear();
+        {
+            self.entries.lock().unwrap().clear();
+            self.orphans.lock().unwrap().clear();
+        }
     }
 
     pub fn insert(&self, token: PitToken, entry: PitEntry) {
@@ -521,6 +553,11 @@ impl Pit {
     /// Remove PIT entries whose only in-record face is `face_id`. Entries
     /// with other in-records are kept with the dead face's records pruned,
     /// so a disconnect doesn't suppress Interests from other consumers.
+    ///
+    /// Before dropping any in-record on the dead face, a persistent one that
+    /// carries a SubscriptionId has its surviving budget **parked** in the
+    /// orphan index (F15), so a re-expression on a new face reclaims it rather
+    /// than restarting from the full credit.
     pub fn remove_face(&self, face_id: u64) -> usize {
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -531,6 +568,9 @@ impl Pit {
                 let all_on_face = entry.in_records.iter().all(|r| r.face_id == face_id);
                 let any_on_face = entry.in_records.iter().any(|r| r.face_id == face_id);
 
+                if any_on_face {
+                    self.park_dying_records(entry.value(), face_id);
+                }
                 if all_on_face && !entry.in_records.is_empty() {
                     to_remove.push(*entry.key());
                 } else if any_on_face {
@@ -562,6 +602,9 @@ impl Pit {
                 let all_on_face = entry.in_records.iter().all(|r| r.face_id == face_id);
                 let any_on_face = entry.in_records.iter().any(|r| r.face_id == face_id);
 
+                if any_on_face {
+                    self.park_dying_records(entry, face_id);
+                }
                 if all_on_face && !entry.in_records.is_empty() {
                     to_remove.push(*token);
                 } else if any_on_face {
@@ -583,6 +626,84 @@ impl Pit {
 
             removed
         }
+    }
+
+    /// Park the surviving budget of any persistent, id-bearing in-record on
+    /// `face_id` into the orphan index (F15 re-attach).
+    fn park_dying_records(&self, entry: &PitEntry, face_id: u64) {
+        for r in &entry.in_records {
+            if r.face_id != face_id {
+                continue;
+            }
+            if let Some(ps) = &r.persistent
+                && let Some(id) = &ps.subscription_id
+            {
+                self.park_orphan(id.clone(), ps.data_count_remaining, ps.reap_at);
+            }
+        }
+    }
+
+    /// Park a surviving subscription budget under `id`. If an orphan already
+    /// exists for `id` (e.g. the same subscription aggregated on two now-dead
+    /// faces), keep the larger budget and the later deadline.
+    pub fn park_orphan(&self, id: bytes::Bytes, data_count_remaining: u32, reap_at: u64) {
+        if data_count_remaining == 0 {
+            return;
+        }
+        let merge = |existing: Option<&OrphanedSubscription>| OrphanedSubscription {
+            data_count_remaining: existing
+                .map(|e| e.data_count_remaining.max(data_count_remaining))
+                .unwrap_or(data_count_remaining),
+            reap_at: existing.map(|e| e.reap_at.max(reap_at)).unwrap_or(reap_at),
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let merged = merge(self.orphans.get(&id).as_deref());
+            self.orphans.insert(id, merged);
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let mut g = self.orphans.lock().unwrap();
+            let merged = merge(g.get(&id));
+            g.insert(id, merged);
+        }
+    }
+
+    /// Reclaim a parked subscription budget for `id`, if one exists and has not
+    /// passed its deadline. Removes it from the index (a budget is spliced onto
+    /// exactly one re-expression). Expired orphans are dropped, returning `None`.
+    pub fn take_orphan(&self, id: &bytes::Bytes, now_ns: u64) -> Option<OrphanedSubscription> {
+        #[cfg(not(target_arch = "wasm32"))]
+        let parked = self.orphans.remove(id).map(|(_, v)| v);
+        #[cfg(target_arch = "wasm32")]
+        let parked = self.orphans.lock().unwrap().remove(id);
+        parked.filter(|o| o.reap_at > now_ns)
+    }
+
+    /// Evict orphaned budgets whose deadline has passed. Returns the count
+    /// removed. Called from the periodic PIT reaper.
+    pub fn reap_orphans(&self, now_ns: u64) -> usize {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let before = self.orphans.len();
+            self.orphans.retain(|_, o| o.reap_at > now_ns);
+            before - self.orphans.len()
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let mut g = self.orphans.lock().unwrap();
+            let before = g.len();
+            g.retain(|_, o| o.reap_at > now_ns);
+            before - g.len()
+        }
+    }
+
+    /// Number of parked orphan budgets (diagnostics/tests).
+    pub fn orphan_count(&self) -> usize {
+        #[cfg(not(target_arch = "wasm32"))]
+        return self.orphans.len();
+        #[cfg(target_arch = "wasm32")]
+        return self.orphans.lock().unwrap().len();
     }
 }
 

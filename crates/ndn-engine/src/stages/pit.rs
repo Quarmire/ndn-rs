@@ -232,10 +232,28 @@ impl PitCheckStage {
         let state = if let Some(v) = &self.validator {
             match v.validate_interest(interest).await {
                 InterestValidationOutcome::Valid => {
-                    let reap_at = now_ns() + (sub_req.max_lifetime_secs as u64) * 1_000_000_000;
+                    let now = now_ns();
+                    let reap_at = now + (sub_req.max_lifetime_secs as u64) * 1_000_000_000;
+                    // Re-attach across face churn (F15): if this subscription
+                    // carries a SubscriptionId and a budget was parked when its
+                    // previous face was torn down, splice the *surviving* credit
+                    // back instead of resetting to the full request.
+                    let mut data_count_remaining = sub_req.max_data_count;
+                    if let Some(id) = &sub_req.subscription_id
+                        && let Some(orphan) = self.pit.take_orphan(id, now)
+                    {
+                        data_count_remaining = orphan.data_count_remaining;
+                        trace!(
+                            target: t::FWD_PIT,
+                            action = "subscription-reattach",
+                            remaining = data_count_remaining,
+                            "pit op"
+                        );
+                    }
                     Some(PersistentState {
-                        data_count_remaining: sub_req.max_data_count,
+                        data_count_remaining,
                         reap_at,
+                        subscription_id: sub_req.subscription_id.clone(),
                     })
                 }
                 // Invalid or Pending → degrade to classical (one-shot).
@@ -966,10 +984,20 @@ mod persistent_tests {
     }
 
     fn build_persistent_interest(name: &str, max_data: u32, max_lifetime: u32) -> Bytes {
+        build_persistent_interest_with_id(name, max_data, max_lifetime, None)
+    }
+
+    fn build_persistent_interest_with_id(
+        name: &str,
+        max_data: u32,
+        max_lifetime: u32,
+        subscription_id: Option<Bytes>,
+    ) -> Bytes {
         let sr = SubscriptionRequest {
             version: 1,
             max_data_count: max_data,
             max_lifetime_secs: max_lifetime,
+            subscription_id,
         };
         let ap_bytes = sr.encode();
         InterestBuilder::new(name)
@@ -1058,6 +1086,95 @@ mod persistent_tests {
             !pit.contains(&token),
             "entry must be reaped after credit exhausted"
         );
+    }
+
+    /// F15: a subscription that survives a face flap reclaims its *remaining*
+    /// budget on re-expression, instead of resetting to the full request.
+    #[test]
+    fn persistent_subscription_reattaches_after_face_churn() {
+        let pit = Arc::new(Pit::new());
+        let check = Arc::new(PitCheckStage {
+            pit: Arc::clone(&pit),
+            dead_nonce_list: None,
+            validator: Some(make_validator()),
+            replay_guard: None,
+        });
+        let match_stage = PitMatchStage {
+            pit: Arc::clone(&pit),
+            dead_nonce_list: None,
+        };
+
+        let name: Name = "/persistent/churn".parse().unwrap();
+        let id = Bytes::from_static(b"sub-xyz");
+        let token = persistent_token(&name);
+
+        // Subscribe with budget 5 (carrying a SubscriptionId), then consume 2
+        // Data → remaining 3.
+        let wire = build_persistent_interest_with_id("/persistent/churn", 5, 60, Some(id.clone()));
+        assert!(matches!(run_check(&check, wire), Action::Continue(_)));
+        for d in ["d1", "d2"] {
+            run_match(&match_stage, encode_data_unsigned(&name, d.as_bytes()));
+        }
+        pit.with_entry(&token, |e| {
+            assert_eq!(e.persistent.as_ref().unwrap().data_count_remaining, 3);
+        })
+        .unwrap();
+
+        // The subscriber's (sole) face is torn down: entry removed, surviving
+        // budget parked in the orphan index.
+        pit.remove_face(1);
+        assert!(!pit.contains(&token), "sole-consumer entry removed on face down");
+        assert_eq!(pit.orphan_count(), 1, "surviving budget parked");
+
+        // Re-express the *same* subscription on the reconnected face: the
+        // remaining 3 is spliced back, not reset to the full 5.
+        let wire2 =
+            build_persistent_interest_with_id("/persistent/churn", 5, 60, Some(id.clone()));
+        assert!(matches!(run_check(&check, wire2), Action::Continue(_)));
+        pit.with_entry(&token, |e| {
+            assert_eq!(
+                e.persistent.as_ref().unwrap().data_count_remaining,
+                3,
+                "re-attach splices surviving budget, not a fresh request"
+            );
+        })
+        .unwrap();
+        assert_eq!(pit.orphan_count(), 0, "orphan consumed by the re-attach");
+    }
+
+    /// F15: without a SubscriptionId, a flapped subscription cannot be
+    /// correlated — nothing is parked and a re-express starts fresh.
+    #[test]
+    fn persistent_subscription_without_id_does_not_park() {
+        let pit = Arc::new(Pit::new());
+        let check = Arc::new(PitCheckStage {
+            pit: Arc::clone(&pit),
+            dead_nonce_list: None,
+            validator: Some(make_validator()),
+            replay_guard: None,
+        });
+        let name: Name = "/persistent/noid".parse().unwrap();
+        let wire = build_persistent_interest("/persistent/noid", 5, 60); // id = None
+        assert!(matches!(run_check(&check, wire), Action::Continue(_)));
+        pit.remove_face(1);
+        assert!(!pit.contains(&persistent_token(&name)));
+        assert_eq!(pit.orphan_count(), 0, "no id → no survival");
+    }
+
+    /// F15: an orphan whose deadline has passed is not reclaimed (and the
+    /// reaper evicts it).
+    #[test]
+    fn expired_orphan_is_not_reclaimed() {
+        let pit = Pit::new();
+        let id = Bytes::from_static(b"old");
+        pit.park_orphan(id.clone(), 7, /* reap_at */ 100);
+        assert_eq!(pit.orphan_count(), 1);
+        // now_ns past the deadline → take returns None.
+        assert!(pit.take_orphan(&id, 200).is_none());
+        // A fresh park + reaper sweep evicts the expired one.
+        pit.park_orphan(id.clone(), 7, 100);
+        assert_eq!(pit.reap_orphans(200), 1);
+        assert_eq!(pit.orphan_count(), 0);
     }
 
     /// Invalid signature → entry installed non-persistently (classical
@@ -1187,6 +1304,7 @@ mod persistent_tests {
             version: 2, // wrong
             max_data_count: 10,
             max_lifetime_secs: 60,
+            subscription_id: None,
         };
         let ap_bytes = sr.encode();
         let wire = InterestBuilder::new("/persistent/v2")
@@ -1356,6 +1474,7 @@ mod persistent_tests {
             version: 1,
             max_data_count: 3,
             max_lifetime_secs: 60,
+            subscription_id: None,
         };
         let ap_bytes = sr.encode();
         let wire = InterestBuilder::new("/stream")
@@ -1478,6 +1597,7 @@ mod persistent_tests {
         entry.persistent = Some(PersistentState {
             data_count_remaining: 99,
             reap_at: 1, // 1 ns since epoch — already expired
+            subscription_id: None,
         });
         entry.expires_at = 1; // same value — drain_expired checks this field
         entry.add_in_record(1, 42, 1, None, Selector::default());

@@ -221,6 +221,7 @@ impl Consumer {
             prefix: prefix.into(),
             opts,
             remaining: 0,
+            subscription_id: fresh_subscription_id(),
         };
         sub.express().await?;
         Ok(sub)
@@ -583,6 +584,26 @@ pub struct Subscription {
     opts: SubscribeOptions,
     /// Data packets the current persistent Interest may still satisfy.
     remaining: u32,
+    /// Stable correlation handle reused on every re-expression so the
+    /// forwarder can splice surviving budget after a face flap (F15).
+    subscription_id: Bytes,
+}
+
+/// Mint a process-unique, stable SubscriptionId (16 bytes: start-timestamp ‖
+/// monotonic counter). It is a correlation handle, not a secret — uniqueness,
+/// not unpredictability, is what matters, so no CSPRNG dependency is needed.
+fn fresh_subscription_id() -> Bytes {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let t = web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let mut id = [0u8; 16];
+    id[0..8].copy_from_slice(&t.to_be_bytes());
+    id[8..16].copy_from_slice(&n.to_be_bytes());
+    Bytes::copy_from_slice(&id)
 }
 
 /// Build the persistent Interest wire for `prefix` carrying a
@@ -593,12 +614,13 @@ pub struct Subscription {
 /// a validated, signed subscription Interest — an unsigned one degrades to
 /// one-shot (`ndn-engine` `check_persistent`). DigestSha256 keys no identity; a
 /// trust-schema-bearing deployment can swap in a real signer.
-fn build_persistent_interest(prefix: &Name, opts: &SubscribeOptions) -> Bytes {
+fn build_persistent_interest(prefix: &Name, opts: &SubscribeOptions, subscription_id: &Bytes) -> Bytes {
     let secs = (opts.lifetime.as_secs() as u32).min(MAX_PERSISTENT_LIFETIME_SECS);
     let sr = SubscriptionRequest {
         version: 1,
         max_data_count: opts.max_data_count,
         max_lifetime_secs: secs,
+        subscription_id: Some(subscription_id.clone()),
     };
     InterestBuilder::new(prefix.clone())
         .can_be_prefix()
@@ -611,7 +633,11 @@ fn build_persistent_interest(prefix: &Name, opts: &SubscribeOptions) -> Bytes {
 impl Subscription {
     async fn express(&mut self) -> Result<(), AppError> {
         self.conn
-            .send(build_persistent_interest(&self.prefix, &self.opts))
+            .send(build_persistent_interest(
+                &self.prefix,
+                &self.opts,
+                &self.subscription_id,
+            ))
             .await?;
         self.remaining = self.opts.max_data_count.max(1);
         Ok(())
@@ -665,7 +691,8 @@ mod subscription_tests {
             max_data_count: 256,
             lifetime: Duration::from_secs(120),
         };
-        let wire = build_persistent_interest(&prefix, &opts);
+        let id = fresh_subscription_id();
+        let wire = build_persistent_interest(&prefix, &opts, &id);
         let interest = Interest::decode(wire).expect("valid interest");
 
         assert!(interest.name.has_prefix(&prefix));
@@ -675,6 +702,30 @@ mod subscription_tests {
         assert_eq!(sr.version, 1);
         assert_eq!(sr.max_data_count, 256);
         assert_eq!(sr.max_lifetime_secs, 120);
+        assert_eq!(sr.subscription_id.as_ref(), Some(&id), "id rides the wire");
+    }
+
+    #[test]
+    fn subscription_id_is_stable_across_re_expression() {
+        // The same Subscription reuses one id on every express() so the
+        // forwarder can correlate a re-attach after a face flap (F15).
+        let id = fresh_subscription_id();
+        let opts = SubscribeOptions::default();
+        let a = build_persistent_interest(&Name::from("/s"), &opts, &id);
+        let b = build_persistent_interest(&Name::from("/s"), &opts, &id);
+        let ida = SubscriptionRequest::find_in(Interest::decode(a).unwrap().app_parameters().unwrap())
+            .unwrap()
+            .subscription_id;
+        let idb = SubscriptionRequest::find_in(Interest::decode(b).unwrap().app_parameters().unwrap())
+            .unwrap()
+            .subscription_id;
+        assert_eq!(ida, idb);
+        assert_eq!(ida, Some(id));
+    }
+
+    #[test]
+    fn fresh_subscription_ids_are_unique() {
+        assert_ne!(fresh_subscription_id(), fresh_subscription_id());
     }
 
     #[test]
@@ -683,7 +734,7 @@ mod subscription_tests {
             max_data_count: 1,
             lifetime: Duration::from_secs(100_000),
         };
-        let wire = build_persistent_interest(&Name::from("/x"), &opts);
+        let wire = build_persistent_interest(&Name::from("/x"), &opts, &fresh_subscription_id());
         let interest = Interest::decode(wire).unwrap();
         let sr = SubscriptionRequest::find_in(interest.app_parameters().unwrap()).unwrap();
         assert_eq!(sr.max_lifetime_secs, MAX_PERSISTENT_LIFETIME_SECS);

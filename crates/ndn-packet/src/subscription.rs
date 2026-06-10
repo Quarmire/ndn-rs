@@ -9,21 +9,37 @@ pub const TLV_SUBSCRIPTION_REQUEST: u64 = 0x230;
 /// Maximum lifetime (seconds) the forwarder will honour for a persistent PIT entry.
 pub const MAX_PERSISTENT_LIFETIME_SECS: u32 = 3600;
 
-/// Wire payload for a persistent-Interest request: a 9-byte flat value
-/// (`version: u8`, `max_data_count: u32 BE`, `max_lifetime: u32 BE`) inside
-/// the `TLV_SUBSCRIPTION_REQUEST` TLV under `ApplicationParameters`. All
-/// three fields are mandatory; on parse failure the whole sub-TLV is
-/// ignored and the Interest is treated as a normal one.
+/// Maximum length of the optional [`SubscriptionRequest::subscription_id`].
+/// A correlation handle, not a key — a handful of random bytes is plenty.
+pub const MAX_SUBSCRIPTION_ID_LEN: usize = 32;
+
+/// Wire payload for a persistent-Interest request: a 9-byte flat header
+/// (`version: u8`, `max_data_count: u32 BE`, `max_lifetime: u32 BE`),
+/// optionally followed by a trailing **SubscriptionId** (up to
+/// [`MAX_SUBSCRIPTION_ID_LEN`] bytes), inside the `TLV_SUBSCRIPTION_REQUEST`
+/// TLV under `ApplicationParameters`. The three header fields are mandatory;
+/// on parse failure the whole sub-TLV is ignored and the Interest is treated
+/// as a normal one.
+///
+/// The SubscriptionId is a stable, client-chosen correlation handle (NOT a
+/// security identity): a consumer generates it once and reuses it on every
+/// re-expression of the same subscription, so a forwarder can recognize a
+/// subscription that survived a face flap and splice its remaining budget
+/// (NDF F15). Appending it keeps old 9-byte encoders decodable (id = `None`);
+/// an old forwarder meeting a new id-bearing request fails the length check
+/// and degrades to a classical Interest (the sub-TLV is non-critical).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubscriptionRequest {
     /// Wire-format version. Must be 1.
     pub version: u8,
     pub max_data_count: u32,
     pub max_lifetime_secs: u32,
+    /// Stable correlation handle for re-attach across face churn (F15).
+    pub subscription_id: Option<Bytes>,
 }
 
 impl SubscriptionRequest {
-    const WIRE_LEN: usize = 9;
+    const HEADER_LEN: usize = 9;
 
     /// Scan an `ApplicationParameters` value for a `SubscriptionRequest`
     /// sub-TLV. `None` means "no persistent request" — fall through to the
@@ -41,23 +57,39 @@ impl SubscriptionRequest {
 
     /// Encode as a self-contained TLV (type + length + value).
     pub fn encode(&self) -> Bytes {
-        let mut val = [0u8; Self::WIRE_LEN];
-        val[0] = self.version;
-        val[1..5].copy_from_slice(&self.max_data_count.to_be_bytes());
-        val[5..9].copy_from_slice(&self.max_lifetime_secs.to_be_bytes());
+        let mut val = Vec::with_capacity(Self::HEADER_LEN + MAX_SUBSCRIPTION_ID_LEN);
+        val.push(self.version);
+        val.extend_from_slice(&self.max_data_count.to_be_bytes());
+        val.extend_from_slice(&self.max_lifetime_secs.to_be_bytes());
+        if let Some(id) = &self.subscription_id {
+            // Defensive: never emit an id past the cap (a decoder would reject
+            // the whole sub-TLV and silently drop persistence).
+            val.extend_from_slice(&id[..id.len().min(MAX_SUBSCRIPTION_ID_LEN)]);
+        }
         let mut w = TlvWriter::new();
         w.write_tlv(TLV_SUBSCRIPTION_REQUEST, &val);
         w.finish()
     }
 
     fn decode_value(bytes: &Bytes) -> Option<Self> {
-        if bytes.len() != Self::WIRE_LEN {
+        // Header must be present; a trailing SubscriptionId is optional and
+        // bounded. An over-long value is rejected (→ classical) rather than
+        // truncated, so the two ends never disagree on the id.
+        if bytes.len() < Self::HEADER_LEN
+            || bytes.len() > Self::HEADER_LEN + MAX_SUBSCRIPTION_ID_LEN
+        {
             return None;
         }
+        let subscription_id = if bytes.len() > Self::HEADER_LEN {
+            Some(bytes.slice(Self::HEADER_LEN..))
+        } else {
+            None
+        };
         Some(Self {
             version: bytes[0],
             max_data_count: u32::from_be_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]),
             max_lifetime_secs: u32::from_be_bytes([bytes[5], bytes[6], bytes[7], bytes[8]]),
+            subscription_id,
         })
     }
 }
@@ -80,9 +112,54 @@ mod tests {
             version: 1,
             max_data_count: 100,
             max_lifetime_secs: 60,
+            subscription_id: None,
         };
         let recovered = round_trip(&sr).expect("should decode");
         assert_eq!(recovered, sr);
+    }
+
+    #[test]
+    fn subscription_id_round_trips() {
+        let sr = SubscriptionRequest {
+            version: 1,
+            max_data_count: 100,
+            max_lifetime_secs: 60,
+            subscription_id: Some(Bytes::from_static(b"sub-abc123")),
+        };
+        let recovered = round_trip(&sr).expect("should decode with id");
+        assert_eq!(recovered, sr);
+        assert_eq!(
+            recovered.subscription_id.as_deref(),
+            Some(&b"sub-abc123"[..])
+        );
+    }
+
+    #[test]
+    fn no_id_decodes_to_none_and_keeps_9_byte_value() {
+        // An old-style 9-byte value round-trips with id = None (back-compat).
+        let sr = SubscriptionRequest {
+            version: 1,
+            max_data_count: 7,
+            max_lifetime_secs: 9,
+            subscription_id: None,
+        };
+        let wire = sr.encode();
+        assert_eq!(wire[3], 9, "value length is exactly the 9-byte header");
+        assert_eq!(round_trip(&sr).unwrap().subscription_id, None);
+    }
+
+    #[test]
+    fn over_long_id_is_rejected_to_classical() {
+        // A value past header+MAX_SUBSCRIPTION_ID_LEN is dropped entirely
+        // (→ None → classical), so the two ends never disagree on the id.
+        let mut val = Vec::new();
+        val.push(1u8);
+        val.extend_from_slice(&100u32.to_be_bytes());
+        val.extend_from_slice(&60u32.to_be_bytes());
+        val.extend_from_slice(&[0xaa; MAX_SUBSCRIPTION_ID_LEN + 1]);
+        let mut w = TlvWriter::new();
+        w.write_tlv(TLV_SUBSCRIPTION_REQUEST, &val);
+        assert!(SubscriptionRequest::find_in(&w.finish()).is_none());
     }
 
     #[test]
@@ -106,6 +183,7 @@ mod tests {
             version: 1,
             max_data_count: 50,
             max_lifetime_secs: 120,
+            subscription_id: None,
         };
         let sr_encoded = sr.encode();
         // Prepend an unrelated non-critical sub-TLV
@@ -128,6 +206,7 @@ mod tests {
             version: 1,
             max_data_count: 0x0000_0064,    // 100
             max_lifetime_secs: 0x0000_003c, // 60
+            subscription_id: None,
         };
         let wire = sr.encode();
         // Expected: TLV-TYPE=0x230 (varint 0xfd 0x02 0x30), TLV-LEN=9,

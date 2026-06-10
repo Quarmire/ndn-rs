@@ -31,12 +31,19 @@ pub async fn run_expiry_task(
     runtime: Arc<dyn Runtime>,
 ) {
     let interval = Duration::from_millis(1);
+    // Orphaned subscription budgets (F15) carry minute-scale deadlines, so
+    // sweeping them on the 1ms PIT cadence is wasteful; throttle to ~1s.
+    let mut tick: u64 = 0;
     loop {
         let sleep = runtime.sleep(interval);
         tokio::select! {
             biased;            _ = cancel.cancelled() => break,
             _ = sleep => {
                 let now = now_ns();
+                tick = tick.wrapping_add(1);
+                if tick.is_multiple_of(1024) {
+                    pit.reap_orphans(now);
+                }
                 let expired_entries = pit.drain_expired_entries(now);
                 let expired: Vec<_> = expired_entries
                     .into_iter()
