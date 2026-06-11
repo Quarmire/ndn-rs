@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use smallvec::SmallVec;
-use tracing::trace;
+use tracing::{debug, trace};
 
 use crate::Fib;
 use crate::enricher::ContextEnricher;
@@ -169,6 +169,32 @@ impl StrategyStage {
         let fib_entry_arc = self.fib.lpm(&fib_name);
         let fib_entry_ref = fib_entry_arc.as_deref();
 
+        // DIAG (Wi-Fi Direct bulk path): which name the FIB is consulted with
+        // (hint-stripped at the producer region, or the hint delegation), and the
+        // candidate nexthops + their costs. Lets us see whether a hinted file
+        // Interest resolves to the fresh WifiDirect face or a stale/dead one.
+        if let DecodedPacket::Interest(i) = &ctx.packet {
+            let hint = i.forwarding_hint();
+            // No custom `target:` — use the module path so the Android logcat
+            // filter (`ndn_engine=debug`) actually emits these (the `t::*` targets
+            // are filtered out at the default `info` level).
+            debug!(
+                in_face = ctx.face_id.0,
+                %name,
+                fib_name = %fib_name,
+                hinted = hint.is_some(),
+                in_region = hint
+                    .map(|h| !h.is_empty() && self.network_region.is_in_producer_region(h))
+                    .unwrap_or(false),
+                nexthops = ?fib_entry_ref.map(|e| e
+                    .nexthops
+                    .iter()
+                    .map(|nh| (nh.face_id.0, nh.cost))
+                    .collect::<Vec<_>>()),
+                "diag.fwd: fib lookup"
+            );
+        }
+
         if let Some(e) = fib_entry_ref {
             trace!(target: t::FWD_FIB, face=%ctx.face_id, name=%name, matched=true, prefix=%name, nexthops=?e.nexthops.iter().map(|nh| (nh.face_id, nh.cost)).collect::<Vec<_>>(), "fib lookup");
         } else {
@@ -224,11 +250,20 @@ impl StrategyStage {
             runtime: &self.runtime,
         };
 
+        // Choose the strategy by the FIB-lookup name, not the raw Interest name:
+        // a forwarding-hinted Interest is routed toward its hint delegation, so it
+        // must use that namespace's strategy. Otherwise a hinted file Interest
+        // (`/ripple/<id>/file/...`, hint `/ndn/node/<peer>`) has no strategy entry
+        // for its own name and falls back to the root `MulticastStrategy`, which
+        // fans it over *every* nexthop (incl. dead radios) instead of the per-peer
+        // best-route that prefers the fast face. For non-hinted Interests
+        // `fib_name == name`, so this is a no-op. (NFD picks the strategy for the
+        // namespace being forwarded.)
         let strategy = self
             .strategy_table
-            .lpm(&name)
+            .lpm(&fib_name)
             .unwrap_or_else(|| Arc::clone(&self.default_strategy));
-        trace!(target: t::FWD_STRATEGY, face=%ctx.face_id, name=%name, strategy=%strategy.name(), "strategy invoked");
+        trace!(target: t::FWD_STRATEGY, face=%ctx.face_id, name=%name, fib_name=%fib_name, strategy=%strategy.name(), "strategy invoked");
 
         let actions = if let Some(a) = strategy.decide_sync(&sctx) {
             a
@@ -290,7 +325,15 @@ impl StrategyStage {
                     } else {
                         faces.iter().copied().collect()
                     };
+                    // DIAG: the faces this Interest actually egresses on (post-scope).
+                    debug!(
+                        in_face = ctx.face_id.0,
+                        %name,
+                        out_faces = ?effective_faces.iter().map(|f| f.0).collect::<Vec<_>>(),
+                        "diag.fwd: egress"
+                    );
                     if effective_faces.is_empty() {
+                        debug!(in_face = ctx.face_id.0, %name, "diag.fwd: NoRoute (no face survived scope)");
                         return Action::Nack(ctx, NackReason::NoRoute);
                     }
                     // Outgoing-Interest loop avoidance: record (face_id,
