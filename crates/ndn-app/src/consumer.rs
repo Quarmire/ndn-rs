@@ -78,9 +78,11 @@ const OBJECT_FETCH_BACKOFF: Duration = Duration::from_millis(300);
 /// Number of segment Interests kept in flight while fetching a segmented
 /// object. Sequential fetch is RTT-bound (one round-trip per segment); a window
 /// turns throughput into `window / RTT * chunk`, the difference between ~30 s
-/// and a couple of seconds for a multi-MB object over a real radio. (Held at the
-/// proven-good 16 while a window=32 + 16 KiB-chunk regression is investigated.)
-const FETCH_WINDOW: usize = 16;
+/// and a couple of seconds for a multi-MB object over a real radio. 32 at the
+/// proven 8 KiB chunk: the earlier window=32 regression was caused by the *16
+/// KiB chunk* (12 fragments/Data → loss), not the window itself — at 8 KiB (6
+/// fragments) a deeper window just keeps the NDP pipe fuller.
+const FETCH_WINDOW: usize = 32;
 /// Per-segment retransmit cap before a windowed fetch gives up.
 const SEG_MAX_ATTEMPTS: u32 = 6;
 /// How long to wait for *any* segment Data before retransmitting the in-flight
