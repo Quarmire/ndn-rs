@@ -401,12 +401,45 @@ impl Consumer {
         forwarding_hint: &[Name],
         on_progress: impl FnMut(u64, u64),
     ) -> Result<Bytes, AppError> {
-        // Metadata discovery — generous lifetime + retries (it is the first and
-        // most failure-prone round-trip over a lossy radio). `CanBePrefix` +
-        // `MustBeFresh` rebuilt each attempt with a fresh nonce.
+        let meta = self.fetch_metadata(&name, validator, forwarding_hint).await?;
+        let last_seg = meta
+            .last_segment()
+            .ok_or_else(|| AppError::Protocol("metadata FinalBlockID unparseable".into()))?;
+
+        // In-memory reassembly: the sink stashes each segment into `chunks`,
+        // joined in order once the window completes.
+        let total = last_seg + 1;
+        let mut chunks: Vec<Option<Bytes>> = (0..total).map(|_| None).collect();
+        self.fetch_segments_windowed(
+            &meta.versioned_name,
+            last_seg,
+            validator,
+            forwarding_hint,
+            on_progress,
+            |seg, bytes| {
+                chunks[seg as usize] = Some(bytes);
+                Ok(())
+            },
+        )
+        .await?;
+        let mut out = bytes::BytesMut::new();
+        for c in chunks {
+            out.extend_from_slice(&c.unwrap_or_default());
+        }
+        Ok(out.freeze())
+    }
+
+    /// Fetch + decode the object's RDR `<name>/32=metadata` (generous lifetime +
+    /// retries — the first and most failure-prone round-trip over a lossy radio).
+    async fn fetch_metadata(
+        &mut self,
+        name: &Name,
+        validator: Option<&Validator>,
+        forwarding_hint: &[Name],
+    ) -> Result<crate::rdr::MetaData, AppError> {
         let meta_data = self
             .fetch_object_with_retry(|| {
-                let mut b = InterestBuilder::new(crate::rdr::metadata_name(&name))
+                let mut b = InterestBuilder::new(crate::rdr::metadata_name(name))
                     .can_be_prefix()
                     .must_be_fresh()
                     .lifetime(DEFAULT_INTEREST_LIFETIME);
@@ -419,26 +452,54 @@ impl Consumer {
         let meta_content = accept_content(meta_data, validator)
             .await?
             .ok_or_else(|| AppError::Protocol("metadata Data has no Content".into()))?;
-        let meta = crate::rdr::MetaData::decode(meta_content)?;
+        crate::rdr::MetaData::decode(meta_content)
+    }
+
+    /// Like [`fetch_object_verified_hinted`](Self::fetch_object_verified_hinted)
+    /// but **streams** each verified segment to `file` at its byte offset
+    /// (positioned writes) as it arrives, so an arbitrarily large object is
+    /// received without ever holding it in memory. Returns the total bytes
+    /// written. `on_progress(received, total)` drives a download bar.
+    #[cfg(unix)]
+    pub async fn fetch_object_to_file_hinted_progress(
+        &mut self,
+        name: impl Into<Name>,
+        validator: &Validator,
+        forwarding_hint: &[Name],
+        file: &std::fs::File,
+        on_progress: impl FnMut(u64, u64),
+    ) -> Result<u64, AppError> {
+        use std::os::unix::fs::FileExt;
+        let name = name.into();
+        let meta = self
+            .fetch_metadata(&name, Some(validator), forwarding_hint)
+            .await?;
         let last_seg = meta
             .last_segment()
             .ok_or_else(|| AppError::Protocol("metadata FinalBlockID unparseable".into()))?;
-
+        let seg_size = meta.segment_size.unwrap_or(8192);
         self.fetch_segments_windowed(
             &meta.versioned_name,
             last_seg,
-            validator,
+            Some(validator),
             forwarding_hint,
             on_progress,
+            |seg, bytes| {
+                file.write_all_at(&bytes, seg * seg_size)
+                    .map_err(|e| AppError::Protocol(format!("write segment {seg}: {e}")))
+            },
         )
-        .await
+        .await?;
+        Ok(meta.size.unwrap_or(0))
     }
 
     /// Fetch segments `0..=last_seg` of `versioned` with a sliding window of
-    /// [`FETCH_WINDOW`] in-flight Interests, reassembling in order. Verifies
-    /// each segment (when `validator` is set), tolerates out-of-order arrival,
-    /// and retransmits the in-flight window on a stall ([`SEG_RECV_TIMEOUT`]).
-    /// This is the throughput fix over the old one-segment-per-round-trip loop.
+    /// [`FETCH_WINDOW`] in-flight Interests, handing each verified segment to
+    /// `sink` (which reassembles in memory or streams to disk). Verifies each
+    /// segment (when `validator` is set), tolerates out-of-order arrival, and
+    /// retransmits the in-flight window on a stall ([`SEG_RECV_TIMEOUT`]). The
+    /// windowed loop itself holds no payloads — only a per-segment `done` bitmap
+    /// — so a streaming `sink` keeps memory flat regardless of object size.
     async fn fetch_segments_windowed(
         &self,
         versioned: &Name,
@@ -446,12 +507,13 @@ impl Consumer {
         validator: Option<&Validator>,
         forwarding_hint: &[Name],
         mut on_progress: impl FnMut(u64, u64),
-    ) -> Result<Bytes, AppError> {
+        mut sink: impl FnMut(u64, Bytes) -> Result<(), AppError>,
+    ) -> Result<(), AppError> {
         use std::collections::HashMap;
         let conn = Arc::clone(&self.conn);
         let total = last_seg + 1;
         on_progress(0, total);
-        let mut chunks: Vec<Option<Bytes>> = (0..total).map(|_| None).collect();
+        let mut done: Vec<bool> = vec![false; total as usize];
         let mut received: u64 = 0;
         let mut next_send: u64 = 0;
         let mut inflight: HashMap<u64, u32> = HashMap::new(); // seg -> attempts
@@ -473,9 +535,10 @@ impl Consumer {
                     else {
                         continue;
                     };
-                    if seg < total && chunks[seg as usize].is_none() {
+                    if seg < total && !done[seg as usize] {
                         if let Some(chunk) = accept_content(data, validator).await? {
-                            chunks[seg as usize] = Some(chunk);
+                            sink(seg, chunk)?;
+                            done[seg as usize] = true;
                             received += 1;
                             inflight.remove(&seg);
                             on_progress(received, total);
@@ -508,12 +571,7 @@ impl Consumer {
                 }
             }
         }
-
-        let mut out = bytes::BytesMut::new();
-        for c in chunks {
-            out.extend_from_slice(&c.unwrap_or_default());
-        }
-        Ok(out.freeze())
+        Ok(())
     }
 
     /// Issue an Interest built by `make` (rebuilt with a fresh nonce each try),
@@ -1004,6 +1062,48 @@ mod subscription_tests {
         async fn register_prefix(&self, _: &Name) -> Result<(), AppError> {
             Ok(())
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn windowed_fetch_streams_to_file_at_offsets() {
+        use std::os::unix::fs::FileExt;
+        // 50 segments of 10 bytes, segment i = [i; 10]; stream them to a file at
+        // offset i*10 and verify the file is byte-correct (no in-memory buffer).
+        let object: Name = "/peer/file/f2".parse().unwrap();
+        let versioned = object.clone().append_version(9);
+        let server = Arc::new(SegServer {
+            versioned: versioned.clone(),
+            last_seg: 49,
+            metadata_name: crate::rdr::metadata_name(&object),
+            q: std::sync::Mutex::new(std::collections::VecDeque::new()),
+        });
+        let consumer = Consumer::new(server);
+
+        let path = std::env::temp_dir().join("ndn_recv_stream_test.bin");
+        let out = std::fs::File::create(&path).unwrap();
+        consumer
+            .fetch_segments_windowed(
+                &versioned,
+                49,
+                None,
+                &[],
+                |_, _| {},
+                |seg, bytes| {
+                    out.write_all_at(&bytes, seg * 10)
+                        .map_err(|e| AppError::Protocol(e.to_string()))
+                },
+            )
+            .await
+            .expect("streamed fetch");
+
+        let mut buf = vec![0u8; 500];
+        std::fs::File::open(&path).unwrap().read_exact_at(&mut buf, 0).unwrap();
+        for i in 0..50u64 {
+            let s = i as usize * 10;
+            assert_eq!(&buf[s..s + 10], &vec![i as u8; 10][..], "segment {i} at offset");
+        }
+        std::fs::remove_file(&path).ok();
     }
 
     #[tokio::test]
