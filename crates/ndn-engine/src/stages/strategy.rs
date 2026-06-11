@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use smallvec::SmallVec;
-use tracing::{debug, trace};
+use tracing::trace;
 
 use crate::Fib;
 use crate::enricher::ContextEnricher;
@@ -169,32 +169,6 @@ impl StrategyStage {
         let fib_entry_arc = self.fib.lpm(&fib_name);
         let fib_entry_ref = fib_entry_arc.as_deref();
 
-        // DIAG (Wi-Fi Direct bulk path): which name the FIB is consulted with
-        // (hint-stripped at the producer region, or the hint delegation), and the
-        // candidate nexthops + their costs. Lets us see whether a hinted file
-        // Interest resolves to the fresh WifiDirect face or a stale/dead one.
-        if let DecodedPacket::Interest(i) = &ctx.packet {
-            let hint = i.forwarding_hint();
-            // No custom `target:` — use the module path so the Android logcat
-            // filter (`ndn_engine=debug`) actually emits these (the `t::*` targets
-            // are filtered out at the default `info` level).
-            debug!(
-                in_face = ctx.face_id.0,
-                %name,
-                fib_name = %fib_name,
-                hinted = hint.is_some(),
-                in_region = hint
-                    .map(|h| !h.is_empty() && self.network_region.is_in_producer_region(h))
-                    .unwrap_or(false),
-                nexthops = ?fib_entry_ref.map(|e| e
-                    .nexthops
-                    .iter()
-                    .map(|nh| (nh.face_id.0, nh.cost))
-                    .collect::<Vec<_>>()),
-                "diag.fwd: fib lookup"
-            );
-        }
-
         if let Some(e) = fib_entry_ref {
             trace!(target: t::FWD_FIB, face=%ctx.face_id, name=%name, matched=true, prefix=%name, nexthops=?e.nexthops.iter().map(|nh| (nh.face_id, nh.cost)).collect::<Vec<_>>(), "fib lookup");
         } else {
@@ -325,15 +299,7 @@ impl StrategyStage {
                     } else {
                         faces.iter().copied().collect()
                     };
-                    // DIAG: the faces this Interest actually egresses on (post-scope).
-                    debug!(
-                        in_face = ctx.face_id.0,
-                        %name,
-                        out_faces = ?effective_faces.iter().map(|f| f.0).collect::<Vec<_>>(),
-                        "diag.fwd: egress"
-                    );
                     if effective_faces.is_empty() {
-                        debug!(in_face = ctx.face_id.0, %name, "diag.fwd: NoRoute (no face survived scope)");
                         return Action::Nack(ctx, NackReason::NoRoute);
                     }
                     // Outgoing-Interest loop avoidance: record (face_id,
