@@ -53,7 +53,13 @@ println!("got {} bytes", data.content().len());
 
 - `fetch(name)` expresses one Interest, returns one `Data`.
 - `fetch_object(name)` performs RDR discovery (`<name>/32=metadata`)
-  and reassembles segmented `Data`.
+  and reassembles segmented `Data`. Segments are fetched **pipelined** (a
+  sliding window of in-flight Interests, retransmitting on a stall), so
+  throughput is `window / RTT × chunk` rather than one round-trip per segment.
+- `fetch_object_to_file_hinted_progress(name, validator, hint, file, on_progress)`
+  **streams** each verified segment to a file at its byte offset as it arrives —
+  the object is never held in memory, so an arbitrarily large object is received
+  with flat memory. `on_progress(received, total)` drives a download bar.
 - `fetch_on(face_id, name)` pins the Interest to a face via
   `NextHopFaceId` — useful for measurement or multipath tests.
 - The Consumer applies the configured `ValidationPolicy` to every
@@ -79,6 +85,9 @@ producer
 - `publish_object(name, content, chunk_size)` segments and serves the
   object — **signing** each segment with the configured signer, else
   `DigestSha256`. `chunk_size == 0` uses the default.
+- `publish_object_from_file(name, file, size, chunk_size)` serves a **file-backed**
+  object: segments are read from the file on demand (positioned reads), so an
+  arbitrarily large file is published without ever loading it into memory.
 - `connect(socket, prefix)` registers the prefix; re-publishing the
   same name replaces the content (`FreshnessPeriod` governs the cache).
 
