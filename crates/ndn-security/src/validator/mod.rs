@@ -109,29 +109,6 @@ pub struct Validator {
     pub(super) rejected_total: AtomicU64,
 }
 
-impl Clone for Validator {
-    /// Cheap clone: keyring, cert cache, and cert fetcher are shared via `Arc`, so
-    /// every clone validates against the same trust state and shares the cert
-    /// cache (a cert fetched/cached by one clone is seen by all). Only the
-    /// per-instance stat counters start fresh. This lets a caller fan signature
-    /// verification across parallel tasks — each holding a clone — without
-    /// re-fetching or re-walking certs.
-    fn clone(&self) -> Self {
-        let cert_fetcher = std::sync::OnceLock::new();
-        if let Some(f) = self.cert_fetcher.get() {
-            let _ = cert_fetcher.set(Arc::clone(f));
-        }
-        Self {
-            keyring: Arc::clone(&self.keyring),
-            cert_cache: Arc::clone(&self.cert_cache),
-            max_chain: self.max_chain,
-            cert_fetcher,
-            verified_total: AtomicU64::new(self.verified_total.load(Ordering::Relaxed)),
-            rejected_total: AtomicU64::new(self.rejected_total.load(Ordering::Relaxed)),
-        }
-    }
-}
-
 impl Validator {
     /// Create a validator with a private cert cache (no chain walking). The
     /// `schema` backs the ambient context.
