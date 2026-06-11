@@ -372,6 +372,23 @@ impl LinkService for LpLinkService {
                 }
                 return Ok(());
             }
+            // If any wire overruns the transport MTU, route the whole burst
+            // through the per-wire `send` path, which re-fragments an oversize
+            // already-LP packet to fit (the batch fast-path below assumes every
+            // wire already fits one frame). Without this, an LP-framed packet
+            // larger than a small-frame radio's MTU — e.g. a signed offer-board
+            // segment over a Wi-Fi Aware follow-up — is shipped whole and the
+            // radio rejects it ("Message length longer than supported"). This is
+            // the egress path the engine actually uses (opportunistic batching),
+            // so the `send`-only fix did not cover it.
+            if let Some(mtu) = transport.send_mtu()
+                && wires.iter().any(|w| w.len() > mtu)
+            {
+                for wire in wires {
+                    self.send(transport, wire.clone(), source).await?;
+                }
+                return Ok(());
+            }
             let egress_ctx = EgressCtx::new(FaceId(transport.id().0), source);
             let mut out = Vec::with_capacity(wires.len());
             for wire in wires {
