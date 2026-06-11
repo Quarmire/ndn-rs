@@ -31,6 +31,8 @@ use ndn_packet::{Name, decode_nni, tlv_type};
 use ndn_tlv::{TlvReader, TlvWriter};
 use thiserror::Error;
 
+use crate::tlv::encode_nni;
+
 const T_SVS_DATA: u64 = 0xC9;
 const T_STATE_VECTOR: u64 = 0xCA;
 const T_SEQ_NO_ENTRIES: u64 = 0xD2;
@@ -323,18 +325,6 @@ fn decode_seq_no_entry(value: Bytes) -> Result<(u64, u64), SvsLocalError> {
         boot.ok_or(SvsLocalError::MissingField("BootstrapTime"))?,
         seq.ok_or(SvsLocalError::MissingField("SeqNo"))?,
     ))
-}
-
-fn encode_nni(value: u64) -> Vec<u8> {
-    if value <= 0xFF {
-        vec![value as u8]
-    } else if value <= 0xFFFF {
-        (value as u16).to_be_bytes().to_vec()
-    } else if value <= 0xFFFF_FFFF {
-        (value as u32).to_be_bytes().to_vec()
-    } else {
-        value.to_be_bytes().to_vec()
-    }
 }
 
 #[cfg(test)]
@@ -651,17 +641,6 @@ mod tests {
         assert_eq!(snaps[1].seq, 2);
     }
 
-    #[test]
-    fn encode_nni_widths() {
-        assert_eq!(encode_nni(0), vec![0x00]);
-        assert_eq!(encode_nni(0xFF), vec![0xFF]);
-        assert_eq!(encode_nni(0x100), vec![0x01, 0x00]);
-        assert_eq!(encode_nni(0xFFFF), vec![0xFF, 0xFF]);
-        assert_eq!(encode_nni(0x1_0000), vec![0x00, 0x01, 0x00, 0x00]);
-        assert_eq!(encode_nni(0xFFFF_FFFF), vec![0xFF, 0xFF, 0xFF, 0xFF]);
-        assert_eq!(
-            encode_nni(0x1_0000_0000),
-            vec![0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00],
-        );
-    }
+    // NNI width coverage now lives in the shared `crate::tlv` module
+    // (`tlv::tests::nni_widths`), the single home for the codec.
 }

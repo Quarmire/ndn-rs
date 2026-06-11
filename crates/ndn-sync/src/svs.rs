@@ -70,6 +70,14 @@ impl SvsNode {
             let Ok(name) = Name::from_str(node_str) else {
                 continue;
             };
+            // The node is authoritative for its own sequence number: a
+            // remote entry must never raise the local entry (gap #3,
+            // self-seq poisoning). Mirrors ndn-svs SVSyncCore, which
+            // skips the producer's own NodeID when merging a received
+            // state vector. `advance()` is the only path that moves it.
+            if name == self.local_name {
+                continue;
+            }
             let local_seq = map.entry(name.clone()).or_insert(0);
             if *remote_seq > *local_seq {
                 gaps.push((name.to_string(), *local_seq + 1, *remote_seq));
@@ -84,6 +92,10 @@ impl SvsNode {
         let mut gaps = Vec::new();
         let mut map = self.vector.write().await;
         for (name, remote_seq) in received {
+            // Authoritative-for-self guard, as in [`Self::merge`].
+            if *name == self.local_name {
+                continue;
+            }
             let local_seq = map.entry(name.clone()).or_insert(0);
             if *remote_seq > *local_seq {
                 gaps.push((name.clone(), *local_seq + 1, *remote_seq));
@@ -164,6 +176,20 @@ mod tests {
         let gaps = node.merge(&[(local_key, 0)]).await;
         assert!(gaps.is_empty());
         assert_eq!(node.local_seq().await, 1);
+    }
+
+    #[tokio::test]
+    async fn merge_rejects_remote_raising_local_seq() {
+        // gap #3: a peer claiming a high seq for *our* NodeID must not
+        // hijack our sequence space. `advance()` must still continue
+        // from the locally-known value, not the attacker's.
+        let node = SvsNode::new(&name("a"));
+        node.advance().await; // local seq = 1
+        let local_key = node.local_key().to_string();
+        let gaps = node.merge(&[(local_key, 9999)]).await;
+        assert!(gaps.is_empty(), "self entry must not produce a gap");
+        assert_eq!(node.local_seq().await, 1, "self seq must stay authoritative");
+        assert_eq!(node.advance().await, 2, "advance continues from local, not remote");
     }
 
     #[tokio::test]

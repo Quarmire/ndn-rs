@@ -19,6 +19,10 @@ fastrand   = "2"
 # zlib compression for PSync IBLT wire encoding (PSync/detail/util.cpp CompressionScheme::ZLIB).
 # Default `miniz_oxide` backend is pure-Rust → wasm-safe.
 flate2     = "1"
+# HMAC-SHA256 group-key signing/validation for Sync Interests
+# (ndn-svs SIGNER_TYPE_HMAC). Both are pure-Rust → wasm-safe.
+sha2       = { workspace = true }
+hmac       = "0.13"
 tracing    = { workspace = true }
 # Instant/SystemTime that work on both targets (std::time::*::now() panics on wasm32).
 web-time   = { workspace = true }
