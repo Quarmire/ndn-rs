@@ -228,6 +228,18 @@ impl SvSync {
     /// Name, sign (DigestSha256), store, and announce a new publication.
     /// Returns the assigned sequence number.
     pub async fn publish_data(&self, payload: &[u8]) -> Result<u64, SyncError> {
+        self.publish_data_with_mapping(payload, |_| None).await
+    }
+
+    /// Like [`Self::publish_data`], but `make_mapping` receives the
+    /// assigned sequence number and may return `MappingData` bytes to
+    /// piggyback in the triggered Sync Interest (used by Layer 2 to ride
+    /// the seq→name mapping; see [`crate::mapping`]).
+    pub async fn publish_data_with_mapping(
+        &self,
+        payload: &[u8],
+        make_mapping: impl FnOnce(u64) -> Option<Bytes>,
+    ) -> Result<u64, SyncError> {
         let seq = self.seq.fetch_add(1, Ordering::AcqRel) + 1;
         let name = svs_data_name(&self.node, &self.group, seq);
         let wire = DataBuilder::new(name.clone(), payload)
@@ -237,7 +249,10 @@ impl SvSync {
         // Advance the core in lockstep (this node is the sole publisher
         // for its own id, so the core's counter tracks `self.seq`) and
         // multicast the new state vector.
-        self.handle.publish(self.node.clone()).await?;
+        match make_mapping(seq) {
+            Some(mapping) => self.handle.publish_with_mapping(self.node.clone(), mapping).await?,
+            None => self.handle.publish(self.node.clone()).await?,
+        }
         Ok(seq)
     }
 
@@ -302,6 +317,14 @@ impl SvSync {
     /// Await the next [`SyncUpdate`] (a peer advanced).
     pub async fn recv_update(&mut self) -> Option<SyncUpdate> {
         self.handle.recv().await
+    }
+
+    /// Move the [`SyncUpdate`] stream out for an external dispatcher (e.g.
+    /// [`crate::pubsub::SvsPubSub`]). After this, [`Self::recv_update`]
+    /// yields nothing. Call before wrapping the `SvSync` in an `Arc`.
+    pub fn take_updates(&mut self) -> mpsc::Receiver<SyncUpdate> {
+        let (_dead_tx, dummy) = mpsc::channel(1);
+        std::mem::replace(&mut self.handle.rx, dummy)
     }
 
     /// This node's data prefix `<node>/<group>` (what it serves).

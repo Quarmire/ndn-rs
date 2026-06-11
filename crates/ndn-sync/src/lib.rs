@@ -40,6 +40,9 @@ mod tlv;
 /// Sync-Interest authentication: signer/validator traits + HMAC.
 pub mod security;
 
+/// SVS-PS mapping provider: seq→name table, query, and piggyback codec.
+pub mod mapping;
+
 pub mod protocol;
 
 pub mod svs;
@@ -55,6 +58,10 @@ pub mod svs_sync;
 /// top of the [`svs_sync`] notification core.
 pub mod svsync;
 
+/// Layer 2 — `SvsPubSub`: named publications + prefix subscriptions with
+/// mapping-based name resolution, on top of [`svsync`].
+pub mod pubsub;
+
 pub mod psync;
 
 pub mod psync_sync;
@@ -67,4 +74,6 @@ pub use svs_local::{
     encode_svs_data,
 };
 pub use svs_sync::{RetryPolicy, SvsConfig, fetch_with_retry, join_svs_group};
+pub use mapping::{MappingList, MappingProvider};
+pub use pubsub::{Publication, SvsPubSub};
 pub use svsync::{DataStore, MemoryStore, SvSync, SvSyncConfig, svs_data_name};
