@@ -370,6 +370,23 @@ the platform's `onLost` calls `NdnEngine::detach_ndp_face` →
 routing falls back to the coordination radios (rather than black-holing the stale
 low-cost nexthop) until the NDP re-establishes.
 
+**Wi-Fi Direct bulk upgrade (extension).** The NAN NDP is duty-cycled, so its
+throughput plateaus (~90 Mbps on Wi-Fi 5 hardware) — RTT-bound, not
+window-bound. The higher-ceiling tier is **Wi-Fi Direct**: discover over Wi-Fi
+Aware / BLE, then form a Wi-Fi P2P group (5 GHz) for bulk — the same
+discover-then-upgrade pattern as Quick Share / AirDrop. It stays data-centric:
+once the group forms it is just a multi-access IP subnet (the group owner runs
+DHCP on `192.168.49.0/24`), so the host-centric group-owner election lives
+*below* the Face. Above it, `FaceKind::WifiDirect` faces carry only names —
+a unicast [`UdpFace`](crates/ndn-face-native) for 1:1 bulk (full MCS rate;
+`LinkProfile` cost 8, preferred over the NDP/LAN UDP cost 10) attached via
+`attach_wifi_direct_face`, or a `MulticastUdpFace` for one-to-many over the
+group's broadcast domain (`MulticastStrategy` + PIT aggregation) via
+`attach_wifi_direct_multicast_face`. No new transport code — the existing UDP
+faces re-tagged to the real radio (`UdpFace::with_kind`). The same shape maps to
+a Wi-Fi SoftAP "portable router" and to Apple's Wi-Fi Aware framework on iOS
+(the same NAN standard behind `NanBackend`).
+
 **Measured best-route (extension).** The per-peer `/ndn/node/<id>` routes use
 `MeasuredStrategy` rather than plain `BestRoute`: it ranks nexthops by a blend of
 the static [`LinkProfile`](crates/ndn-transport) cost *prior* and live signals —

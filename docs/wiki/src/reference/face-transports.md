@@ -165,6 +165,31 @@ strips the hint via its `NetworkRegionTable` (declared at discovery start) and
 serves it by name. See the *Connectionless named-radio faces* section of
 `ARCHITECTURE.md` for the full flow.
 
+## Wi-Fi Direct bulk upgrade — *extension*
+
+The connectionless radios above are great for discovery and small control but
+are duty-cycled or small-MTU, so bulk transfer wants a real Wi-Fi link. The
+pattern (the same one Quick Share / AirDrop use) is **discover over Wi-Fi Aware
+/ BLE, then upgrade to Wi-Fi Direct for bulk**. Crucially this stays
+data-centric: once a Wi-Fi P2P group forms it is just a multi-access IP subnet
+(the group owner runs DHCP on `192.168.49.0/24`), so the host-centric
+group-owner election and DHCP live entirely *below* the Face. Above it there is
+no host — only `FaceKind::WifiDirect` faces carrying names:
+
+| Use | Face | Notes |
+| --- | --- | --- |
+| 1:1 bulk | `UdpFace::with_kind(WifiDirect)` (unicast) | Full Wi-Fi MCS rate (5 GHz); `LinkProfile` cost 8 so cost-aware forwarding prefers it over NDP/LAN UDP (10), Wi-Fi Aware (20), BLE (50). |
+| One-to-many | `MulticastUdpFace::with_kind(WifiDirect)` | Join `224.0.23.170:56363` on the group interface; `MulticastStrategy` + PIT aggregation give one-Interest-to-many, one-Data-to-many — the "seed a file to the room" path. Wi-Fi multicast is basic-rate/un-ACKed, so it is for coordination + Interests (and FEC-coded bulk), not raw 1:1 throughput. |
+
+No new crate or Cargo feature — these are the existing UDP faces re-tagged to
+the real radio. On mobile they attach via `ndn-mobile`
+(`attach_wifi_direct_face` / `attach_wifi_direct_multicast_face`) or the
+`ndn-boltffi` FFI (`attachWifiDirectFace` / `attachWifiDirectMulticastFace`),
+mirroring the Wi-Fi Aware NDP bulk path (`attach_ndp_face`). The same shape maps
+to a Wi-Fi **SoftAP** "portable router" (one node provides the medium; peers
+join and multicast by name) and to Apple's Wi-Fi Aware framework on iOS (the
+same NAN standard behind `NanBackend`).
+
 ## Link service per face
 
 The default `LinkService` is `LpLinkService` (NDNLPv2 framing); the
