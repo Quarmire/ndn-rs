@@ -89,6 +89,14 @@ const SEG_MAX_STALLS: u32 = 12;
 /// promptly without stalling the whole transfer; on a healthy link Data arrives
 /// far sooner, so this never fires spuriously.
 const SEG_RECV_TIMEOUT: Duration = Duration::from_millis(1500);
+/// Once the fetch is down to the tail (≤ this many segments still in flight), a
+/// single lost segment otherwise waits the full [`SEG_RECV_TIMEOUT`] before
+/// retransmit — and at ~95%+ that dead time dominates the whole transfer. Below
+/// this watermark, retransmit after the much shorter [`TAIL_STALL_TIMEOUT`] so
+/// the last leg completes promptly. The window is large during the bulk, so this
+/// only kicks in at the very end (no extra retransmits mid-transfer).
+const TAIL_INFLIGHT: usize = 8;
+const TAIL_STALL_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// Which congestion-control strategy the object-fetch pipeline runs — the shared
 /// [`ndn_transport::CongestionController`] variants. Default AIMD.
@@ -690,7 +698,14 @@ impl Consumer {
                     // has passed with no progress (the tick is much shorter than
                     // the stall timeout). Give up after SEG_MAX_STALLS *consecutive*
                     // no-progress stalls — any verified segment resets the count.
-                    if last_progress.elapsed() >= SEG_RECV_TIMEOUT {
+                    // At the tail (few segments left) retransmit far sooner so a
+                    // single lost last segment doesn't burn a full stall timeout.
+                    let stall_after = if inflight.len() <= TAIL_INFLIGHT {
+                        TAIL_STALL_TIMEOUT
+                    } else {
+                        SEG_RECV_TIMEOUT
+                    };
+                    if last_progress.elapsed() >= stall_after {
                         if inflight.is_empty() {
                             // Nothing awaiting Data: keep waiting if verifies are
                             // still running; otherwise we are genuinely stuck.
