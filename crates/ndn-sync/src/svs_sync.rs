@@ -65,21 +65,20 @@ use crate::rt::{self, Instant};
 use ndn_packet::Name;
 use ndn_packet::encode::InterestBuilder;
 
+use crate::dialect::WireDialect;
 use crate::protocol::{SyncHandle, SyncUpdate};
 use crate::security::{SyncSigner, SyncValidator};
-use crate::svs::SvsNode;
+use crate::svs::{StateEntry, SvsNode};
 
-// TLV codes per ndn-svs/ndn-svs/tlv.hpp.
-const TLV_STATE_VECTOR: u64 = 201;
-const TLV_SV_ENTRY: u64 = 202;
+// MappingData TLV codes per ndn-svs/ndn-svs/tlv.hpp (the piggyback
+// codec; the state-vector codec now lives in `crate::dialect`).
+/// Outer TLV-TYPE shared by both dialects' state vectors (v2
+/// `StateVector` 201, v3 `SvsData` 0xC9 — the same code).
+const TLV_STATE_VECTOR_OUTER: u64 = 201;
 const TLV_SV_SEQ_NO: u64 = 204;
 const TLV_MAPPING_DATA: u64 = 205;
 const TLV_MAPPING_ENTRY: u64 = 206;
 const TLV_NDN_NAME: u64 = 7;
-
-/// v2 Sync Interest name version (ndn-svs `core.cpp:351`
-/// `appendVersion(2)`). ndnd's v3 dialect uses 3.
-const SVS_SYNC_VERSION_V2: u64 = 2;
 
 /// Exponential back-off for gap-fetch Interests. Defaults to the
 /// ndnSVS reference: 4 retries, 1 s base, 2× factor.
@@ -146,6 +145,14 @@ pub struct SvsConfig {
     /// Not consumed by the SVS task itself; passed to [`fetch_with_retry`]
     /// by application-side gap fetchers.
     pub retry_policy: RetryPolicy,
+    /// Wire dialect: [`WireDialect::V2`] (ndn-svs, default) or
+    /// [`WireDialect::V3`] (ndnd, boot-timestamped). Selects the Sync
+    /// Interest name version and the state-vector codec.
+    pub dialect: WireDialect,
+    /// Bootstrap timestamp for this node (SVS v3): the startup time in ms
+    /// since the Unix epoch. Ignored by V2 (always 0). Set it for V3 so a
+    /// restart is distinguishable from the pre-restart sequence space.
+    pub local_boot: u64,
     /// Signs every outgoing Sync Interest. Defaults to
     /// [`Insecure`](crate::security::Insecure) (unsigned), the
     /// closed-link posture; set an
@@ -165,6 +172,8 @@ impl Default for SvsConfig {
             suppression_period: Duration::from_millis(200),
             channel_capacity: 256,
             retry_policy: RetryPolicy::default(),
+            dialect: WireDialect::default(),
+            local_boot: 0,
             signer: crate::security::default_signer(),
             validator: crate::security::default_validator(),
         }
@@ -213,7 +222,7 @@ async fn svs_task(
     config: SvsConfig,
     cancel: CancellationToken,
 ) {
-    let node = SvsNode::new(&local_name);
+    let node = SvsNode::with_boot(&local_name, config.local_boot);
     let local_key = node.local_key().to_string();
 
     let mut current_mapping: Option<Bytes> = None;
@@ -223,10 +232,11 @@ async fn svs_task(
     // Suppression state (ndn-svs `SVSyncCore`). When `suppressing` is set,
     // `next_send` is a *short* reply-to-stale deadline rather than the
     // steady periodic one, and `recorded` accumulates every peer vector
-    // seen during the window so the timer can check — at fire time —
-    // whether someone else already corrected the laggard.
+    // (keyed node → (boot, seq)) seen during the window so the timer can
+    // check — at fire time — whether someone else already corrected the
+    // laggard.
     let mut suppressing = false;
-    let mut recorded: HashMap<String, u64> = HashMap::new();
+    let mut recorded: HashMap<String, (u64, u64)> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -241,15 +251,23 @@ async fn svs_task(
                     // i.e. nobody else has announced our data yet.
                     suppressing = false;
                     let snapshot = node.snapshot().await;
-                    let recorded_sv: Vec<(String, u64)> =
-                        recorded.iter().map(|(k, v)| (k.clone(), *v)).collect();
+                    let recorded_sv: Vec<StateEntry> = recorded
+                        .iter()
+                        .filter_map(|(k, (b, s))| {
+                            k.parse::<Name>().ok().map(|name| StateEntry {
+                                name,
+                                boot: *b,
+                                seq: *s,
+                            })
+                        })
+                        .collect();
                     recorded.clear();
                     if !remote_covers_local(&snapshot, &recorded_sv) {
-                        send_sync_interest(&group, &node, &send, current_mapping.clone(), &config.signer).await;
+                        send_sync_interest(&group, &node, &send, current_mapping.clone(), &config.signer, config.dialect).await;
                     }
                     next_send = Instant::now() + jitter_interval(&config);
                 } else {
-                    send_sync_interest(&group, &node, &send, current_mapping.clone(), &config.signer).await;
+                    send_sync_interest(&group, &node, &send, current_mapping.clone(), &config.signer, config.dialect).await;
                     next_send = Instant::now() + jitter_interval(&config);
                 }
             }
@@ -262,7 +280,7 @@ async fn svs_task(
                     tracing::trace!(?reason, "svs: rejected inbound sync interest");
                     continue;
                 }
-                if let Some((remote_sv, peer_mappings)) = parse_sync_interest(&group, &raw) {
+                if let Some((remote_sv, peer_mappings)) = parse_sync_interest(&group, &raw, config.dialect) {
                     let snapshot = node.snapshot().await;
                     let covers_local = remote_covers_local(&snapshot, &remote_sv);
                     // The peer is missing data we already hold (we are ahead
@@ -320,7 +338,7 @@ async fn svs_task(
                 // suppression window and announce immediately.
                 suppressing = false;
                 recorded.clear();
-                send_sync_interest(&group, &node, &send, current_mapping.clone(), &config.signer).await;
+                send_sync_interest(&group, &node, &send, current_mapping.clone(), &config.signer, config.dialect).await;
                 next_send = Instant::now() + jitter_interval(&config);
             }
         }
@@ -342,25 +360,36 @@ fn suppression_delay(config: &SvsConfig) -> Duration {
     Duration::from_secs_f64(sampled)
 }
 
+/// Map a remote state vector to `node_uri → (boot, seq)`.
+fn remote_map(remote_sv: &[StateEntry]) -> HashMap<String, (u64, u64)> {
+    remote_sv
+        .iter()
+        .map(|e| (e.name.to_string(), (e.boot, e.seq)))
+        .collect()
+}
+
 /// True if local state is strictly ahead of `remote_sv` on at least one
 /// node — i.e. the peer is missing a publication we already hold.
+/// Comparison is `(boot, seq)` lexicographic so a peer that hasn't seen
+/// our reboot counts as behind.
 fn local_ahead_of_remote(
     local_snapshot: &[crate::svs::StateVectorEntry],
-    remote_sv: &[(String, u64)],
+    remote_sv: &[StateEntry],
 ) -> bool {
-    let remote_map: HashMap<&str, u64> = remote_sv.iter().map(|(k, v)| (k.as_str(), *v)).collect();
-    local_snapshot
-        .iter()
-        .any(|e| e.seq > remote_map.get(e.node.as_str()).copied().unwrap_or(0))
+    let remote = remote_map(remote_sv);
+    local_snapshot.iter().any(|e| {
+        let (rb, rs) = remote.get(&e.node).copied().unwrap_or((0, 0));
+        (e.boot, e.seq) > (rb, rs)
+    })
 }
 
 /// Merge a received vector into the suppression record, keeping the
-/// highest seq seen per node across the window.
-fn record_vector(recorded: &mut HashMap<String, u64>, remote_sv: &[(String, u64)]) {
-    for (node, seq) in remote_sv {
-        let slot = recorded.entry(node.clone()).or_insert(0);
-        if *seq > *slot {
-            *slot = *seq;
+/// highest `(boot, seq)` seen per node across the window.
+fn record_vector(recorded: &mut HashMap<String, (u64, u64)>, remote_sv: &[StateEntry]) {
+    for e in remote_sv {
+        let slot = recorded.entry(e.name.to_string()).or_insert((0, 0));
+        if (e.boot, e.seq) > *slot {
+            *slot = (e.boot, e.seq);
         }
     }
 }
@@ -374,9 +403,10 @@ async fn send_sync_interest(
     send: &mpsc::Sender<Bytes>,
     mapping: Option<Bytes>,
     signer: &Arc<dyn SyncSigner>,
+    dialect: WireDialect,
 ) {
-    let snapshot = node.snapshot().await;
-    let mut app_params = encode_state_vector(&snapshot);
+    let entries = node.state_entries().await;
+    let mut app_params = dialect.encode_state_vector(&entries).to_vec();
 
     if let Some(mapping_bytes) = mapping {
         let local_key = node.local_key();
@@ -386,7 +416,7 @@ async fn send_sync_interest(
         app_params.extend_from_slice(&mapping_tlv);
     }
 
-    let sync_name = group.clone().append_version(SVS_SYNC_VERSION_V2);
+    let sync_name = group.clone().append_version(dialect.sync_version());
     let builder = InterestBuilder::new(sync_name)
         .lifetime(Duration::from_millis(1000))
         .app_parameters(app_params);
@@ -399,16 +429,17 @@ fn jitter_interval(config: &SvsConfig) -> Duration {
     config.sync_interval + jitter
 }
 
-use crate::tlv::{decode_nni, encode_nni, read_tlv, write_tlv};
+use crate::tlv::{encode_nni, read_tlv, write_tlv};
 
 fn remote_covers_local(
     local_snapshot: &[crate::svs::StateVectorEntry],
-    remote_sv: &[(String, u64)],
+    remote_sv: &[StateEntry],
 ) -> bool {
-    let remote_map: HashMap<&str, u64> = remote_sv.iter().map(|(k, v)| (k.as_str(), *v)).collect();
-    local_snapshot
-        .iter()
-        .all(|e| remote_map.get(e.node.as_str()).copied().unwrap_or(0) >= e.seq)
+    let remote = remote_map(remote_sv);
+    local_snapshot.iter().all(|e| {
+        let (rb, rs) = remote.get(&e.node).copied().unwrap_or((0, 0));
+        (rb, rs) >= (e.boot, e.seq)
+    })
 }
 
 fn encode_name_tlv(name: &Name) -> Vec<u8> {
@@ -419,27 +450,6 @@ fn encode_name_tlv(name: &Name) -> Vec<u8> {
     let mut outer = BytesMut::new();
     write_tlv(&mut outer, TLV_NDN_NAME, &inner);
     outer.to_vec()
-}
-
-use crate::svs::StateVectorEntry;
-
-fn encode_state_vector(entries: &[StateVectorEntry]) -> Vec<u8> {
-    let mut sv_inner = BytesMut::new();
-    for e in entries {
-        let name: Name = e.node.parse().unwrap_or_else(|_| Name::root());
-        let name_bytes = encode_name_tlv(&name);
-        let seq_bytes = encode_nni(e.seq);
-
-        let mut entry_inner = BytesMut::new();
-        entry_inner.put_slice(&name_bytes);
-        write_tlv(&mut entry_inner, TLV_SV_SEQ_NO, &seq_bytes);
-
-        write_tlv(&mut sv_inner, TLV_SV_ENTRY, &entry_inner);
-    }
-
-    let mut buf = BytesMut::new();
-    write_tlv(&mut buf, TLV_STATE_VECTOR, &sv_inner);
-    buf.to_vec()
 }
 
 /// Single `MappingData` (0xCD) wrapping one `MappingEntry` (0xCE)
@@ -468,42 +478,6 @@ fn decode_name_key(name_tlv: &[u8]) -> Option<String> {
     }
     let name = Name::decode(Bytes::copy_from_slice(value)).ok()?;
     Some(name.to_string())
-}
-
-fn decode_state_vector(sv_tlv: &[u8]) -> Option<Vec<(String, u64)>> {
-    let (typ, mut body, _) = read_tlv(sv_tlv)?;
-    if typ != TLV_STATE_VECTOR {
-        return None;
-    }
-
-    let mut entries = Vec::new();
-    while !body.is_empty() {
-        let (entry_typ, mut entry_body, rest) = read_tlv(body)?;
-        body = rest;
-        if entry_typ != TLV_SV_ENTRY {
-            continue;
-        }
-
-        let (name_typ, name_val, after_name) = read_tlv(entry_body)?;
-        if name_typ != TLV_NDN_NAME {
-            continue;
-        }
-        let mut name_bytes = BytesMut::new();
-        write_tlv(&mut name_bytes, name_typ, name_val);
-        let Some(node_key) = decode_name_key(&name_bytes) else {
-            continue;
-        };
-
-        entry_body = after_name;
-
-        let (seq_typ, seq_val, _) = read_tlv(entry_body)?;
-        if seq_typ != TLV_SV_SEQ_NO {
-            continue;
-        }
-        entries.push((node_key, decode_nni(seq_val)));
-    }
-
-    Some(entries)
 }
 
 /// `MappingData` (0xCD) → `node_key → app_data`. `app_data` is
@@ -559,9 +533,13 @@ fn decode_mapping_data(md_tlv: &[u8]) -> HashMap<String, Bytes> {
 
 /// `(state_vector, mapping_map)` where `mapping_map` is empty when no
 /// MappingData TLV is present.
-type ParsedSyncInterest = (Vec<(String, u64)>, HashMap<String, Bytes>);
+type ParsedSyncInterest = (Vec<StateEntry>, HashMap<String, Bytes>);
 
-fn parse_sync_interest(group: &Name, raw: &[u8]) -> Option<ParsedSyncInterest> {
+fn parse_sync_interest(
+    group: &Name,
+    raw: &[u8],
+    dialect: WireDialect,
+) -> Option<ParsedSyncInterest> {
     let interest = ndn_packet::Interest::decode(Bytes::copy_from_slice(raw)).ok()?;
     let components = interest.name.components();
 
@@ -569,15 +547,17 @@ fn parse_sync_interest(group: &Name, raw: &[u8]) -> Option<ParsedSyncInterest> {
     if components.len() < group_len + 1 {
         return None;
     }
-    // The component after the group prefix must be the typed v2 version
-    // (ndn-svs `appendVersion(2)`), not a generic component.
-    if components[group_len].as_version() != Some(SVS_SYNC_VERSION_V2) {
+    // The component after the group prefix must be the typed version for
+    // this dialect (`v=2` for ndn-svs, `v=3` for ndnd), not a generic
+    // component — this is also what keeps the two dialects from
+    // mis-parsing each other's Interests.
+    if components[group_len].as_version() != Some(dialect.sync_version()) {
         return None;
     }
 
     let app_params = interest.app_parameters()?;
 
-    let mut sv: Option<Vec<(String, u64)>> = None;
+    let mut sv: Option<Vec<StateEntry>> = None;
     let mut mappings: HashMap<String, Bytes> = HashMap::new();
     let mut cursor: &[u8] = app_params;
 
@@ -589,11 +569,14 @@ fn parse_sync_interest(group: &Name, raw: &[u8]) -> Option<ParsedSyncInterest> {
         let full_tlv = &cursor[..consumed];
 
         match typ {
-            TLV_STATE_VECTOR => {
-                sv = decode_state_vector(full_tlv);
-            }
             TLV_MAPPING_DATA => {
                 mappings = decode_mapping_data(full_tlv);
+            }
+            // The state-vector outer type 0xC9 (201) is shared by both
+            // dialects (v2 StateVector / v3 SvsData); the dialect codec
+            // handles the differing inner shape.
+            TLV_STATE_VECTOR_OUTER => {
+                sv = dialect.decode_state_vector(&Bytes::copy_from_slice(full_tlv));
             }
             _ => {}
         }
@@ -607,44 +590,30 @@ fn parse_sync_interest(group: &Name, raw: &[u8]) -> Option<ParsedSyncInterest> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::svs::StateVectorEntry;
 
-    #[test]
-    fn state_vector_roundtrip() {
-        let entries = vec![
-            StateVectorEntry {
-                node: "/alice".to_string(),
-                seq: 5,
-            },
-            StateVectorEntry {
-                node: "/bob".to_string(),
-                seq: 12,
-            },
-        ];
-        let encoded = encode_state_vector(&entries);
-        let decoded = decode_state_vector(&encoded).expect("decode should succeed");
-        assert_eq!(decoded.len(), 2);
-        let alice = decoded.iter().find(|(k, _)| k == "/alice");
-        let bob = decoded.iter().find(|(k, _)| k == "/bob");
-        assert_eq!(alice.map(|(_, s)| *s), Some(5));
-        assert_eq!(bob.map(|(_, s)| *s), Some(12));
+    /// Default test dialect.
+    const V2: WireDialect = WireDialect::V2;
+
+    /// Build a remote state vector (boot = 0) from `(node, seq)` pairs.
+    fn sv(entries: &[(&str, u64)]) -> Vec<StateEntry> {
+        entries
+            .iter()
+            .map(|(n, s)| StateEntry {
+                name: n.parse().unwrap(),
+                boot: 0,
+                seq: *s,
+            })
+            .collect()
     }
 
-    #[test]
-    fn decode_empty_state_vector() {
-        let entries: Vec<StateVectorEntry> = vec![];
-        let encoded = encode_state_vector(&entries);
-        let decoded = decode_state_vector(&encoded).expect("decode empty sv");
-        assert!(decoded.is_empty());
-    }
-
-    #[test]
-    fn encode_uses_tlv_type_201() {
-        let entries = vec![StateVectorEntry {
-            node: "/n".to_string(),
-            seq: 1,
-        }];
-        let encoded = encode_state_vector(&entries);
-        assert_eq!(encoded[0], 0xC9, "StateVector type must be 201 (0xC9)");
+    /// Build a local snapshot entry (boot = 0).
+    fn local(node: &str, seq: u64) -> StateVectorEntry {
+        StateVectorEntry {
+            node: node.to_string(),
+            boot: 0,
+            seq,
+        }
     }
 
     #[test]
@@ -673,38 +642,20 @@ mod tests {
 
     #[test]
     fn remote_covers_local_true() {
-        let local = vec![
-            StateVectorEntry {
-                node: "/a".to_string(),
-                seq: 3,
-            },
-            StateVectorEntry {
-                node: "/b".to_string(),
-                seq: 1,
-            },
-        ];
-        let remote = vec![("/a".to_string(), 3u64), ("/b".to_string(), 5)];
-        assert!(remote_covers_local(&local, &remote));
+        let snap = vec![local("/a", 3), local("/b", 1)];
+        assert!(remote_covers_local(&snap, &sv(&[("/a", 3), ("/b", 5)])));
     }
 
     #[test]
     fn remote_covers_local_false_when_behind() {
-        let local = vec![StateVectorEntry {
-            node: "/a".to_string(),
-            seq: 5,
-        }];
-        let remote = vec![("/a".to_string(), 3u64)];
-        assert!(!remote_covers_local(&local, &remote));
+        let snap = vec![local("/a", 5)];
+        assert!(!remote_covers_local(&snap, &sv(&[("/a", 3)])));
     }
 
     #[test]
     fn remote_covers_local_false_when_missing_node() {
-        let local = vec![StateVectorEntry {
-            node: "/a".to_string(),
-            seq: 1,
-        }];
-        let remote: Vec<(String, u64)> = vec![];
-        assert!(!remote_covers_local(&local, &remote));
+        let snap = vec![local("/a", 1)];
+        assert!(!remote_covers_local(&snap, &sv(&[])));
     }
 
     #[tokio::test]
@@ -791,22 +742,17 @@ mod tests {
 
         let interest = ndn_packet::Interest::decode(raw).expect("decode interest");
         let ap = interest.app_parameters().expect("must have AppParameters");
-        let sv = decode_state_vector(ap).expect("must decode StateVector");
-        assert!(!sv.is_empty(), "state vector should contain local node");
+        let decoded = V2
+            .decode_state_vector(&Bytes::copy_from_slice(ap))
+            .expect("must decode StateVector");
+        assert!(!decoded.is_empty(), "state vector should contain local node");
     }
 
     /// Build a raw Sync Interest carrying `entries` as its state vector,
-    /// as a peer on the wire would send it.
+    /// as a v2 peer on the wire would send it.
     fn peer_sync_interest(group: &Name, entries: &[(&str, u64)]) -> Bytes {
-        let sv: Vec<StateVectorEntry> = entries
-            .iter()
-            .map(|(n, s)| StateVectorEntry {
-                node: n.to_string(),
-                seq: *s,
-            })
-            .collect();
-        let app_params = encode_state_vector(&sv);
-        InterestBuilder::new(group.clone().append_version(SVS_SYNC_VERSION_V2))
+        let app_params = V2.encode_state_vector(&sv(entries)).to_vec();
+        InterestBuilder::new(group.clone().append_version(V2.sync_version()))
             .lifetime(Duration::from_millis(1000))
             .app_parameters(app_params)
             .build()
@@ -819,7 +765,7 @@ mod tests {
     #[test]
     fn sync_interest_name_matches_ndn_svs_v2() {
         let group: Name = "/ndn/svs".parse().unwrap();
-        let name = group.clone().append_version(SVS_SYNC_VERSION_V2);
+        let name = group.clone().append_version(V2.sync_version());
 
         // Reconstruct the NAME TLV inner bytes and compare to the fixture.
         let mut inner = BytesMut::new();
@@ -844,26 +790,64 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn v3_dialect_drives_name_and_codec() {
+        // A node configured for V3 must emit `<group>/v=3` carrying a v3
+        // (boot-timestamped) state vector, parseable by a V3 peer and
+        // rejected by a V2 peer (version mismatch).
+        let (send_tx, mut send_rx) = mpsc::channel(16);
+        let (_recv_tx, recv_rx) = mpsc::channel(16);
+
+        let group: Name = "/app/v3".parse().unwrap();
+        let local: Name = "/app/v3/node".parse().unwrap();
+        let config = SvsConfig {
+            sync_interval: Duration::from_millis(10),
+            jitter_ms: 0,
+            dialect: WireDialect::V3,
+            local_boot: 1_700_000_000_000,
+            ..Default::default()
+        };
+
+        let _handle = join_svs_group(group.clone(), local, send_tx, recv_rx, config);
+
+        let raw = tokio::time::timeout(Duration::from_secs(2), send_rx.recv())
+            .await
+            .expect("timed out")
+            .expect("channel closed");
+
+        let interest = ndn_packet::Interest::decode(raw.clone()).expect("decode");
+        // Name version is v=3.
+        let gl = group.components().len();
+        assert_eq!(interest.name.components()[gl].as_version(), Some(3));
+
+        // A V3 peer parses it; the local entry carries our boot.
+        let (entries, _) = parse_sync_interest(&group, &raw, WireDialect::V3).expect("v3 parse");
+        let me = entries.iter().find(|e| e.name.to_string() == "/app/v3/node");
+        assert_eq!(me.map(|e| e.boot), Some(1_700_000_000_000));
+
+        // A V2 peer rejects it on the version component.
+        assert!(
+            parse_sync_interest(&group, &raw, WireDialect::V2).is_none(),
+            "v2 must not accept a v=3 Sync Interest"
+        );
+    }
+
     #[test]
     fn parser_rejects_legacy_generic_svs_component() {
         // A peer (or our own old code) appending a generic "svs"
         // component must no longer be accepted as a v2 Sync Interest.
         let group: Name = "/ndn/svs".parse().unwrap();
-        let sv = vec![StateVectorEntry {
-            node: "/ndn/svs/a".to_string(),
-            seq: 1,
-        }];
         let legacy = InterestBuilder::new(group.clone().append("svs"))
-            .app_parameters(encode_state_vector(&sv))
+            .app_parameters(V2.encode_state_vector(&sv(&[("/ndn/svs/a", 1)])).to_vec())
             .build();
         assert!(
-            parse_sync_interest(&group, &legacy).is_none(),
+            parse_sync_interest(&group, &legacy, V2).is_none(),
             "generic 'svs' component must be rejected"
         );
 
         let good = peer_sync_interest(&group, &[("/ndn/svs/a", 1)]);
         assert!(
-            parse_sync_interest(&group, &good).is_some(),
+            parse_sync_interest(&group, &good, V2).is_some(),
             "v=2 component must parse"
         );
     }
@@ -1013,14 +997,10 @@ mod tests {
         assert!(none.is_err(), "unsigned interest must not produce an update");
 
         // Correctly HMAC-signed peer Interest → accepted, update emitted.
-        let sv = vec![StateVectorEntry {
-            node: "/ndn/svs/peer".to_string(),
-            seq: 4,
-        }];
         let signed = key.sign(
-            InterestBuilder::new(group.clone().append_version(SVS_SYNC_VERSION_V2))
+            InterestBuilder::new(group.clone().append_version(V2.sync_version()))
                 .lifetime(Duration::from_millis(1000))
-                .app_parameters(encode_state_vector(&sv)),
+                .app_parameters(V2.encode_state_vector(&sv(&[("/ndn/svs/peer", 4)])).to_vec()),
         );
         recv_tx.send(signed).await.unwrap();
         let upd = tokio::time::timeout(Duration::from_secs(2), handle.recv())

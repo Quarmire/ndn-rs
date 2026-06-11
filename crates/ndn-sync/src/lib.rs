@@ -6,11 +6,13 @@
 //! protocol code runs natively, in the browser, and in a simulator):
 //!
 //! * **Layer 0 — notification core** ([`svs_sync`]): multicasts the state
-//!   vector in a Sync Interest named `<group>/v=2` (ndn-svs wire-compatible),
-//!   merges received vectors, and runs the two-state suppression FSM
-//!   (steady periodic ⇄ reply-to-stale). Sync Interests are authenticated
-//!   through the [`security`] [`SyncSigner`]/[`SyncValidator`] traits
-//!   (HMAC group key or `Insecure`).
+//!   vector in a Sync Interest whose name and codec are chosen by the
+//!   [`dialect`] ([`WireDialect::V2`] = ndn-svs `<group>/v=2`,
+//!   [`WireDialect::V3`] = ndnd `<group>/v=3` with boot timestamps),
+//!   merges received vectors with a boot-aware comparison, and runs the
+//!   two-state suppression FSM (steady periodic ⇄ reply-to-stale). Sync
+//!   Interests are authenticated through the [`security`]
+//!   [`SyncSigner`]/[`SyncValidator`] traits (HMAC group key or `Insecure`).
 //! * **Layer 1 — data plane** ([`svsync`]): adds a [`DataStore`],
 //!   canonical [`svs_data_name`] naming, [`SvSync::publish_data`]
 //!   (name→sign→store→advance), an Interest responder for the node's own
@@ -19,6 +21,8 @@
 //! Pure data structures live in [`svs`] / [`psync`] / [`svs_local`] (the
 //! SVS v3 boot-timestamp dialect); shared TLV/NNI codec in `tlv`.
 //!
+//! [`WireDialect::V2`]: dialect::WireDialect::V2
+//! [`WireDialect::V3`]: dialect::WireDialect::V3
 //! [`SyncSigner`]: security::SyncSigner
 //! [`SyncValidator`]: security::SyncValidator
 //! [`DataStore`]: svsync::DataStore
@@ -36,6 +40,9 @@ mod rt;
 
 /// Shared TLV / NonNegativeInteger codec for the SVS dialects.
 mod tlv;
+
+/// SVS wire-dialect selector (v2 / v3) + unified state-vector codec.
+pub mod dialect;
 
 /// Sync-Interest authentication: signer/validator traits + HMAC.
 pub mod security;
@@ -74,6 +81,7 @@ pub use svs_local::{
     encode_svs_data,
 };
 pub use svs_sync::{RetryPolicy, SvsConfig, fetch_with_retry, join_svs_group};
+pub use dialect::WireDialect;
 pub use mapping::{MappingList, MappingProvider};
 pub use pubsub::{Publication, SvsPubSub};
 pub use svsync::{DataStore, MemoryStore, SvSync, SvSyncConfig, svs_data_name};
