@@ -14,12 +14,18 @@ license.workspace = true
 classification = "extension"
 
 [features]
-default = ["endpoint"]
+default = ["endpoint", "mgmt"]
 # Ergonomic producer/consumer API (`CodedProducer`, `CodedFetcher`).
 # Pulls in `ndn-app`; turn it off for the pure FEC core (the
 # wasm32/embedded-minimal build that only wants codec + GF(2^8) +
 # encoder/decoder).
 endpoint = ["dep:ndn-app", "dep:ndn-transport", "dep:tokio"]
+# NFD management handler (`CodingMgmtHandler`) bridging the policy table to
+# `ndn-mgmt`'s `CodingHandler`. Pulls `ndn-mgmt` (→ `ndn-app` → the native
+# forwarder), so it's gated off for the pure-codec build that drives FEC over
+# its own transport (e.g. a raw radio face). On by default — existing
+# consumers are unaffected.
+mgmt = ["dep:ndn-mgmt"]
 # Enable AVX2/NEON SIMD path for GF(2^8) arithmetic. Off by default;
 # scalar path is the reference implementation.
 simd = []
@@ -66,7 +72,7 @@ ndn-foundation-types = { workspace = true }
 ndn-packet           = { workspace = true, features = ["std"] }
 ndn-tlv              = { workspace = true, features = ["std"] }
 ndn-store            = { workspace = true }
-ndn-mgmt             = { workspace = true }
+ndn-mgmt             = { workspace = true, optional = true }
 toml                 = "0.8"
 bytes                = { workspace = true, features = ["std"] }
 thiserror            = { workspace = true }

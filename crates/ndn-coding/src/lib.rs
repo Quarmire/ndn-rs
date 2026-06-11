@@ -88,6 +88,7 @@ pub mod endpoint;
 pub mod fec;
 pub mod field;
 pub mod metadata;
+#[cfg(feature = "mgmt")]
 pub mod mgmt;
 pub mod policy;
 #[cfg(feature = "f2-recode")]
@@ -104,6 +105,7 @@ pub use config::{CodingConfig, CodingPolicyConfig};
 pub use endpoint::{CodedFetcher, CodedProducer, FetchConfig};
 pub use fec::{Decoder, Encoder};
 pub use metadata::{FecMetadata, SegmentRole, prepend_metadata, split_metadata};
+#[cfg(feature = "mgmt")]
 pub use mgmt::{CodingMgmtHandler, CodingPolicyEntry};
 pub use policy::{CodingPolicy, CodingPolicyTable, FecPolicy, PolicyRole, SharedPolicyTable};
 pub use segmenter::{EmittedSegment, segment_payload};
