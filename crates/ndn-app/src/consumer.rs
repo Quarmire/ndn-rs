@@ -75,10 +75,15 @@ const OBJECT_FETCH_ATTEMPTS: u32 = 4;
 /// Initial back-off between object-fetch retries (doubles each attempt).
 const OBJECT_FETCH_BACKOFF: Duration = Duration::from_millis(300);
 
-/// Number of segment Interests kept in flight while fetching a segmented
-/// object. Sequential fetch is RTT-bound (one round-trip per segment); a window
-/// Per-segment retransmit cap before a windowed fetch gives up.
-const SEG_MAX_ATTEMPTS: u32 = 6;
+/// Consecutive *no-progress* stalls (each [`SEG_RECV_TIMEOUT`] long) before a
+/// windowed fetch gives up. Counts only stalls with zero new segments delivered
+/// — any arriving segment resets it — so a large transfer survives per-segment
+/// loss (a single stuck segment retransmits each stall but doesn't abort the
+/// whole object while others keep flowing), and only genuine silence
+/// (~`SEG_MAX_STALLS` × 1.5s) ends it. (Previously a per-segment retransmit cap
+/// aborted the whole object when ONE segment hit the cap — fatal for big files
+/// over a lossy radio where an 8 KB Data is several NDNLP fragments.)
+const SEG_MAX_STALLS: u32 = 12;
 /// How long to wait for *any* segment Data before retransmitting the in-flight
 /// window. Shorter than the Interest lifetime so a dropped segment is re-sent
 /// promptly without stalling the whole transfer; on a healthy link Data arrives
@@ -107,9 +112,17 @@ impl CongestionStrategy {
     }
 
     fn controller(self) -> ndn_transport::CongestionController {
+        // Cap the in-flight window. The controller default ceiling is 65536
+        // segments; over a fast link (Wi-Fi Direct ~1 Gbps) the window balloons,
+        // and because the stall path retransmits the WHOLE in-flight set, a large
+        // window turns one loss into a retransmit storm that thrashes the tail and
+        // starves the few missing segments — the file stalls at ~99%. A few
+        // hundred segments amply covers the path BDP (~1 Gbps × tens of ms ≈ a few
+        // MB), so cap it and keep retransmit bursts bounded.
+        const MAX_WINDOW: f64 = 512.0;
         match self {
-            Self::Aimd => ndn_transport::CongestionController::aimd(),
-            Self::Cubic => ndn_transport::CongestionController::cubic(),
+            Self::Aimd => ndn_transport::CongestionController::aimd().with_max_window(MAX_WINDOW),
+            Self::Cubic => ndn_transport::CongestionController::cubic().with_max_window(MAX_WINDOW),
         }
     }
 }
@@ -556,6 +569,7 @@ impl Consumer {
         on_progress(0, total);
         let mut done: Vec<bool> = vec![false; total as usize];
         let mut received: u64 = 0;
+        let mut stalls: u32 = 0; // consecutive no-progress stalls; reset on any new segment
         let mut next_send: u64 = 0;
         let mut inflight: HashMap<u64, u32> = HashMap::new(); // seg -> attempts
         // Self-tuning pipeline depth — the shared congestion controller (also
@@ -592,6 +606,7 @@ impl Consumer {
                         sink(seg, chunk)?;
                         done[seg as usize] = true;
                         received += 1;
+                        stalls = 0; // progress — reset the no-progress stall budget
                         inflight.remove(&seg);
                         // AIMD: a CongestionMark means back off early;
                         // otherwise an in-order delivery grows the window.
@@ -614,17 +629,20 @@ impl Consumer {
                 Err(_elapsed) => {
                     // Stall = loss: back off, then retransmit everything in
                     // flight (deduped by the forwarder/CS; a late duplicate Data
-                    // is ignored above).
+                    // is ignored above). Give up only after SEG_MAX_STALLS
+                    // *consecutive* no-progress stalls — any arriving segment
+                    // resets `stalls` — so a big transfer survives per-segment loss
+                    // and the tail keeps being retried as long as it makes headway.
                     cc.on_timeout();
                     if inflight.is_empty() {
                         return Err(AppError::Timeout);
                     }
+                    stalls += 1;
+                    if stalls >= SEG_MAX_STALLS {
+                        return Err(AppError::Timeout);
+                    }
                     for seg in inflight.keys().copied().collect::<Vec<_>>() {
-                        let att = inflight.get_mut(&seg).expect("seg in inflight");
-                        if *att >= SEG_MAX_ATTEMPTS {
-                            return Err(AppError::Timeout);
-                        }
-                        *att += 1;
+                        *inflight.get_mut(&seg).expect("seg in inflight") += 1;
                         send_segment_interest(conn.as_ref(), versioned, seg, forwarding_hint)
                             .await?;
                     }
