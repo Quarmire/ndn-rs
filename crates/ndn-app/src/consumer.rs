@@ -585,21 +585,22 @@ impl Consumer {
                     else {
                         continue;
                     };
-                    if seg < total && !done[seg as usize] {
-                        if let Some(chunk) = accept_content(data, validator).await? {
-                            sink(seg, chunk)?;
-                            done[seg as usize] = true;
-                            received += 1;
-                            inflight.remove(&seg);
-                            // AIMD: a CongestionMark means back off early;
-                            // otherwise an in-order delivery grows the window.
-                            if marked {
-                                cc.on_congestion_mark();
-                            } else {
-                                cc.on_data();
-                            }
-                            on_progress(received, total);
+                    if seg < total
+                        && !done[seg as usize]
+                        && let Some(chunk) = accept_content(data, validator).await?
+                    {
+                        sink(seg, chunk)?;
+                        done[seg as usize] = true;
+                        received += 1;
+                        inflight.remove(&seg);
+                        // AIMD: a CongestionMark means back off early;
+                        // otherwise an in-order delivery grows the window.
+                        if marked {
+                            cc.on_congestion_mark();
+                        } else {
+                            cc.on_data();
                         }
+                        on_progress(received, total);
                     }
                     // Refill up to the (possibly grown) congestion window.
                     while next_send < total && inflight.len() < limit(&cc) {

@@ -65,6 +65,15 @@ pub enum FaceKind {
     /// Wi-Fi Aware (NAN) connectionless coordination bearer — AP-less,
     /// association-less follow-up messages. `link_type() == AdHoc`.
     WifiAware,
+    /// Wi-Fi Direct (Wi-Fi P2P) link. Once the P2P group is formed it is just
+    /// a multi-access IP subnet (the group owner runs DHCP on `192.168.49.0/24`),
+    /// so the face is an ordinary [`UdpFace`](crate) (unicast bulk) or
+    /// `MulticastUdpFace` (one-to-many) over that interface — the host-centric
+    /// group-owner election stays *below* this Face. Named distinctly so a
+    /// cost-aware strategy can prefer this dedicated high-rate 5 GHz peer link
+    /// over the connectionless radios. `link_type()` is `MultiAccess`
+    /// (multicast face) or `PointToPoint` (unicast bulk face).
+    WifiDirect,
     Compute,
     Internal,
     Multicast,
@@ -104,6 +113,7 @@ impl FaceKind {
             | FaceKind::Bluetooth
             | FaceKind::Wfb
             | FaceKind::WifiAware
+            | FaceKind::WifiDirect
             | FaceKind::Multicast => ScopePolicy::AlwaysNonLocal,
             FaceKind::Udp
             | FaceKind::Tcp
@@ -134,6 +144,7 @@ impl FaceKind {
             | FaceKind::Bluetooth
             | FaceKind::Wfb
             | FaceKind::WifiAware
+            | FaceKind::WifiDirect
             | FaceKind::Multicast
             | FaceKind::WebSocket
             | FaceKind::WebTransport
@@ -161,6 +172,7 @@ impl core::fmt::Display for FaceKind {
             Self::Bluetooth => "bluetooth",
             Self::Wfb => "wfb",
             Self::WifiAware => "wifi-aware",
+            Self::WifiDirect => "wifi-direct",
             Self::Compute => "compute",
             Self::Internal => "internal",
             Self::Multicast => "multicast",
@@ -189,6 +201,7 @@ impl core::str::FromStr for FaceKind {
             "bluetooth" => Ok(Self::Bluetooth),
             "wfb" => Ok(Self::Wfb),
             "wifi-aware" => Ok(Self::WifiAware),
+            "wifi-direct" => Ok(Self::WifiDirect),
             "compute" => Ok(Self::Compute),
             "internal" => Ok(Self::Internal),
             "multicast" => Ok(Self::Multicast),

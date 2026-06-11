@@ -34,8 +34,9 @@ impl LinkProfile {
     pub fn default_cost(kind: FaceKind) -> u32 {
         match kind {
             FaceKind::Ethernet => 5,
-            FaceKind::Udp => 10, // LAN multicast / unicast
-            FaceKind::Tcp => 15, // uplink
+            FaceKind::WifiDirect => 8, // P2P group: dedicated high-rate 5 GHz peer link
+            FaceKind::Udp => 10,       // LAN multicast / unicast
+            FaceKind::Tcp => 15,       // uplink
             FaceKind::WifiAware => 20, // NAN follow-up: AP-less, mid throughput
             FaceKind::Bluetooth => 50, // BLE advertising: universal but slow
             _ => 30,
