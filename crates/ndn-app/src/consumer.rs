@@ -563,90 +563,34 @@ impl Consumer {
         mut on_progress: impl FnMut(u64, u64),
         mut sink: impl FnMut(u64, Bytes) -> Result<(), AppError>,
     ) -> Result<(), AppError> {
-        use std::collections::{HashMap, HashSet};
+        use std::collections::HashMap;
         let conn = Arc::clone(&self.conn);
         let total = last_seg + 1;
         on_progress(0, total);
-        // Share the validator across parallel verify tasks (cheap Arc-shared
-        // clone). Once the link is fast (Wi-Fi Direct), per-segment signature
-        // verification is the throughput bottleneck; fanning it across the
-        // runtime's worker threads — instead of awaiting each verify inline —
-        // keeps the receive pipeline full.
-        let validator: Option<Arc<Validator>> = validator.map(|v| Arc::new(v.clone()));
-        let versioned = versioned.clone();
-
         let mut done: Vec<bool> = vec![false; total as usize];
         let mut received: u64 = 0;
-        let mut stalls: u32 = 0; // consecutive no-progress stalls
+        let mut stalls: u32 = 0; // consecutive no-progress stalls; reset on any new segment
         let mut next_send: u64 = 0;
-        let mut inflight: HashMap<u64, u32> = HashMap::new(); // Interest sent, awaiting Data
-        let mut verifying: HashSet<u64> = HashSet::new(); // Data received, verify in flight
+        let mut inflight: HashMap<u64, u32> = HashMap::new(); // seg -> attempts
         // Self-tuning pipeline depth — the shared congestion controller (also
-        // used by ndn-iperf), per the consumer's chosen strategy.
+        // used by ndn-iperf), per the consumer's chosen strategy, so the fetch
+        // adapts to the path instead of a fixed window.
         let mut cc = self.cc_strategy.controller();
-        // The window bounds total outstanding work: Interests awaiting Data *plus*
-        // Data awaiting verification.
         let limit = |cc: &ndn_transport::CongestionController| (cc.window() as usize).max(1);
 
-        // Verified-segment results from the spawned verify tasks: (seg, content, marked).
-        type VResult = Result<(u64, Option<Bytes>, bool), AppError>;
-        let (vtx, mut vrx) = tokio::sync::mpsc::unbounded_channel::<VResult>();
-
-        // Prime the window.
-        while next_send < total && inflight.len() + verifying.len() < limit(&cc) {
-            send_segment_interest(conn.as_ref(), &versioned, next_send, forwarding_hint).await?;
+        // Prime the window to the initial cwnd.
+        while next_send < total && inflight.len() < limit(&cc) {
+            send_segment_interest(conn.as_ref(), versioned, next_send, forwarding_hint).await?;
             inflight.insert(next_send, 1);
             next_send += 1;
         }
 
-        // A short receive tick so completed verifications are drained (and the
-        // window refilled) promptly during a lull; under active transfer Data
-        // arrives far sooner, so this adds no latency. Stalls are tracked by wall
-        // time since the last progress, independent of the tick.
-        const RECV_TICK: Duration = Duration::from_millis(50);
-        let mut last_progress = crate::rt::Instant::now();
-
         while received < total {
-            // Drain finished verifications: write each verified segment and grow
-            // the window; re-request any whose Data carried no usable content.
-            while let Ok(res) = vrx.try_recv() {
-                let (seg, content, marked) = res?; // a verify error aborts (matches serial)
-                verifying.remove(&seg);
-                match content {
-                    Some(chunk) if (seg as usize) < done.len() && !done[seg as usize] => {
-                        sink(seg, chunk)?;
-                        done[seg as usize] = true;
-                        received += 1;
-                        last_progress = crate::rt::Instant::now();
-                        stalls = 0;
-                        if marked {
-                            cc.on_congestion_mark();
-                        } else {
-                            cc.on_data();
-                        }
-                        on_progress(received, total);
-                    }
-                    Some(_) => {} // duplicate of an already-done segment — ignore
-                    None => {
-                        // Data wasn't usable content; re-request the segment.
-                        inflight.insert(seg, 1);
-                        send_segment_interest(conn.as_ref(), &versioned, seg, forwarding_hint)
-                            .await?;
-                    }
-                }
-            }
-            if received >= total {
-                break;
-            }
-            // Refill the window up to the (possibly grown) cwnd.
-            while next_send < total && inflight.len() + verifying.len() < limit(&cc) {
-                send_segment_interest(conn.as_ref(), &versioned, next_send, forwarding_hint).await?;
-                inflight.insert(next_send, 1);
-                next_send += 1;
-            }
-
-            match crate::rt::timeout(RECV_TICK, conn.recv()).await {
+            match crate::rt::timeout(SEG_RECV_TIMEOUT, conn.recv()).await {
                 Ok(Some(wire)) => {
+                    // Peek the NDNLPv2 CongestionMark (early congestion signal)
+                    // before unwrapping. Non-segment / Nack packets are ignored;
+                    // the retransmit path recovers any real loss.
                     let marked = is_lp_packet(&wire)
                         && LpPacket::decode(wire.clone())
                             .is_ok_and(|lp| lp.congestion_mark.is_some());
@@ -655,52 +599,52 @@ impl Consumer {
                     else {
                         continue;
                     };
-                    if seg < total && !done[seg as usize] && !verifying.contains(&seg) {
+                    if seg < total
+                        && !done[seg as usize]
+                        && let Some(chunk) = accept_content(data, validator).await?
+                    {
+                        sink(seg, chunk)?;
+                        done[seg as usize] = true;
+                        received += 1;
+                        stalls = 0; // progress — reset the no-progress stall budget
                         inflight.remove(&seg);
-                        verifying.insert(seg);
-                        // Verify (the signature check) on a worker thread, in
-                        // parallel with the receive loop and the other verifies.
-                        let v = validator.clone();
-                        let tx = vtx.clone();
-                        crate::rt::spawn(async move {
-                            let res = accept_content(data, v.as_deref())
-                                .await
-                                .map(|content| (seg, content, marked));
-                            let _ = tx.send(res);
-                        });
+                        // AIMD: a CongestionMark means back off early;
+                        // otherwise an in-order delivery grows the window.
+                        if marked {
+                            cc.on_congestion_mark();
+                        } else {
+                            cc.on_data();
+                        }
+                        on_progress(received, total);
+                    }
+                    // Refill up to the (possibly grown) congestion window.
+                    while next_send < total && inflight.len() < limit(&cc) {
+                        send_segment_interest(conn.as_ref(), versioned, next_send, forwarding_hint)
+                            .await?;
+                        inflight.insert(next_send, 1);
+                        next_send += 1;
                     }
                 }
                 Ok(None) => return Err(AppError::Closed),
                 Err(_elapsed) => {
-                    // No Data this tick. Treat as loss only once enough wall time
-                    // has passed with no progress (the tick is much shorter than
-                    // the stall timeout). Give up after SEG_MAX_STALLS *consecutive*
-                    // no-progress stalls — any verified segment resets the count.
-                    if last_progress.elapsed() >= SEG_RECV_TIMEOUT {
-                        if inflight.is_empty() {
-                            // Nothing awaiting Data: keep waiting if verifies are
-                            // still running; otherwise we are genuinely stuck.
-                            if verifying.is_empty() {
-                                return Err(AppError::Timeout);
-                            }
-                        } else {
-                            cc.on_timeout();
-                            stalls += 1;
-                            if stalls >= SEG_MAX_STALLS {
-                                return Err(AppError::Timeout);
-                            }
-                            for seg in inflight.keys().copied().collect::<Vec<_>>() {
-                                *inflight.get_mut(&seg).expect("seg in inflight") += 1;
-                                send_segment_interest(
-                                    conn.as_ref(),
-                                    &versioned,
-                                    seg,
-                                    forwarding_hint,
-                                )
-                                .await?;
-                            }
-                            last_progress = crate::rt::Instant::now(); // reset after retransmit
-                        }
+                    // Stall = loss: back off, then retransmit everything in
+                    // flight (deduped by the forwarder/CS; a late duplicate Data
+                    // is ignored above). Give up only after SEG_MAX_STALLS
+                    // *consecutive* no-progress stalls — any arriving segment
+                    // resets `stalls` — so a big transfer survives per-segment loss
+                    // and the tail keeps being retried as long as it makes headway.
+                    cc.on_timeout();
+                    if inflight.is_empty() {
+                        return Err(AppError::Timeout);
+                    }
+                    stalls += 1;
+                    if stalls >= SEG_MAX_STALLS {
+                        return Err(AppError::Timeout);
+                    }
+                    for seg in inflight.keys().copied().collect::<Vec<_>>() {
+                        *inflight.get_mut(&seg).expect("seg in inflight") += 1;
+                        send_segment_interest(conn.as_ref(), versioned, seg, forwarding_hint)
+                            .await?;
                     }
                 }
             }
