@@ -273,7 +273,9 @@ impl Default for LpLinkService {
 
 impl LinkService for LpLinkService {
     /// Encodes Interest/Data in an `LpPacket`, fragmenting to the
-    /// transport's MTU. Already-LP input passes through unchanged.
+    /// transport's MTU. Already-LP input passes through unchanged unless it is a
+    /// *complete* packet that overruns the MTU, in which case its inner network
+    /// packet is re-fragmented to fit (dropping link-local headers).
     /// `source` is unused here: the in-proc tag-bag carries it for IPC faces,
     /// and the dispatcher attaches NDNLPv2 `IncomingFaceId` on LP egress when
     /// the face has LocalFields enabled (`FaceState.flags`).
@@ -289,6 +291,35 @@ impl LinkService for LpLinkService {
             // Fragment / LP-wrap, then run the feature pipeline on each
             // frame, then send.
             if ndn_packet::lp::is_lp_packet(&packet) {
+                // Re-fragment an already-LP-framed packet that exceeds the MTU.
+                // A dispatcher may hand us a *complete* LP packet (the network
+                // packet wrapped with link-local fields, e.g. IncomingFaceId);
+                // sending that whole past a small-frame radio (Wi-Fi Aware
+                // follow-up ~200 B, BLE advert ~245 B) overruns the frame and the
+                // radio silently drops it — exactly what stalled the offer-board
+                // fetch (a signed segment arrives framed and oversized). Split its
+                // inner network packet to the MTU instead. We re-fragment only a
+                // complete packet (not one that is already a fragment) and drop the
+                // link-local headers — the receiver re-derives them from the actual
+                // arrival face.
+                if let Some(mtu) = transport.send_mtu()
+                    && packet.len() > mtu
+                    && mtu > ndn_packet::fragment::FRAG_OVERHEAD
+                    && let Ok(lp) = ndn_packet::lp::LpPacket::decode(packet.clone())
+                    && lp.frag_count.unwrap_or(1) <= 1
+                    && let Some(inner) = lp.fragment.as_ref()
+                {
+                    let seq = self.fragment_seq.fetch_add(1, Ordering::Relaxed);
+                    let fragments = ndn_packet::fragment::fragment_packet(inner, mtu, seq);
+                    for frag in fragments {
+                        let mut frame = OutboundLpFrame::new(frag, true);
+                        for feature in &self.features {
+                            feature.on_egress(&mut frame, &egress_ctx);
+                        }
+                        transport.send_bytes(frame.wire).await?;
+                    }
+                    return Ok(());
+                }
                 let mut frame = OutboundLpFrame::new(packet, true);
                 for feature in &self.features {
                     feature.on_egress(&mut frame, &egress_ctx);
@@ -604,6 +635,42 @@ mod tests {
         let sent = capture.lock().unwrap();
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0], wrapped);
+    }
+
+    #[tokio::test]
+    async fn lp_link_service_refragments_oversize_already_lp() {
+        // A *complete* LP packet (network packet wrapped with link-local fields)
+        // bigger than the MTU must be re-fragmented, not sent whole — otherwise a
+        // small-frame radio silently drops the oversize frame.
+        let payload = vec![0u8; 4096];
+        let mut w = ndn_tlv::TlvWriter::new();
+        w.write_tlv(0x05, &payload);
+        let big = w.finish();
+        let wrapped = ndn_packet::lp::encode_lp_packet(&big);
+        assert!(ndn_packet::lp::is_lp_packet(&wrapped));
+        assert!(wrapped.len() > 1400, "wrapped packet should exceed the test MTU");
+
+        let capture = Arc::new(Mutex::new(Vec::new()));
+        let tx = CaptureTransport {
+            id: FaceId(5),
+            kind: FaceKind::Udp,
+            mtu: Some(1400),
+            sent: Arc::clone(&capture),
+        };
+        LpLinkService::new()
+            .send(&tx, wrapped.clone(), None)
+            .await
+            .unwrap();
+
+        let sent = capture.lock().unwrap();
+        assert!(
+            sent.len() > 1,
+            "oversize framed packet must re-fragment, not send whole"
+        );
+        for frag in sent.iter() {
+            assert!(frag.len() <= 1400, "re-fragment exceeds MTU");
+            assert!(ndn_packet::lp::is_lp_packet(frag));
+        }
     }
 
     #[test]
