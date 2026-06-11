@@ -17,7 +17,6 @@ use ndn_packet::{Data, MAX_PERSISTENT_LIFETIME_SECS, Name, SubscriptionRequest};
 use ndn_security::{SafeData, Unverified, Validator};
 
 use crate::AppError;
-use crate::pipeline::CongestionControl;
 
 /// Verify a fetched `Data` against `validator` (when present) and return its
 /// content bytes. With a validator the Data must authenticate (signature checked
@@ -488,11 +487,12 @@ impl Consumer {
         Ok(meta.size.unwrap_or(0))
     }
 
-    /// Fetch segments `0..=last_seg` of `versioned` over an **AIMD
-    /// congestion-controlled** pipeline ([`CongestionWindow`], the ndncatchunks
-    /// model): the in-flight window grows on each acked segment and shrinks on a
-    /// congestion signal (a stall/timeout or an NDNLPv2 `CongestionMark`), so it
-    /// self-tunes to the path instead of a fixed window. Each verified segment is
+    /// Fetch segments `0..=last_seg` of `versioned` over a
+    /// **congestion-controlled** pipeline driven by the shared
+    /// [`ndn_transport::CongestionController`] (AIMD; the same controller
+    /// ndn-iperf uses): the in-flight window grows on each acked segment and
+    /// shrinks on a congestion signal (a stall/timeout or an NDNLPv2
+    /// `CongestionMark`), so it self-tunes to the path instead of a fixed window. Each verified segment is
     /// handed to `sink` (reassemble in memory or stream to disk); out-of-order
     /// arrival is tolerated and a stall retransmits the in-flight set. The loop
     /// itself holds no payloads — only a per-segment `done` bitmap — so a
@@ -514,10 +514,13 @@ impl Consumer {
         let mut received: u64 = 0;
         let mut next_send: u64 = 0;
         let mut inflight: HashMap<u64, u32> = HashMap::new(); // seg -> attempts
-        let mut cwnd = crate::pipeline::AimdCongestionControl::new();
+        // Self-tuning pipeline depth — the shared AIMD controller (also used by
+        // ndn-iperf), so the fetch adapts to the path instead of a fixed window.
+        let mut cc = ndn_transport::CongestionController::aimd();
+        let limit = |cc: &ndn_transport::CongestionController| (cc.window() as usize).max(1);
 
         // Prime the window to the initial cwnd.
-        while next_send < total && inflight.len() < cwnd.window() {
+        while next_send < total && inflight.len() < limit(&cc) {
             send_segment_interest(conn.as_ref(), versioned, next_send, forwarding_hint).await?;
             inflight.insert(next_send, 1);
             next_send += 1;
@@ -543,17 +546,18 @@ impl Consumer {
                             done[seg as usize] = true;
                             received += 1;
                             inflight.remove(&seg);
-                            // AIMD: a mark means back off; otherwise grow.
+                            // AIMD: a CongestionMark means back off early;
+                            // otherwise an in-order delivery grows the window.
                             if marked {
-                                cwnd.on_congestion();
+                                cc.on_congestion_mark();
                             } else {
-                                cwnd.on_ack();
+                                cc.on_data();
                             }
                             on_progress(received, total);
                         }
                     }
                     // Refill up to the (possibly grown) congestion window.
-                    while next_send < total && inflight.len() < cwnd.window() {
+                    while next_send < total && inflight.len() < limit(&cc) {
                         send_segment_interest(conn.as_ref(), versioned, next_send, forwarding_hint)
                             .await?;
                         inflight.insert(next_send, 1);
@@ -562,10 +566,10 @@ impl Consumer {
                 }
                 Ok(None) => return Err(AppError::Closed),
                 Err(_elapsed) => {
-                    // Stall = loss: back off hard, then retransmit everything in
+                    // Stall = loss: back off, then retransmit everything in
                     // flight (deduped by the forwarder/CS; a late duplicate Data
                     // is ignored above).
-                    cwnd.on_congestion();
+                    cc.on_timeout();
                     if inflight.is_empty() {
                         return Err(AppError::Timeout);
                     }
