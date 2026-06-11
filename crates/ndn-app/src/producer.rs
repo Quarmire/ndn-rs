@@ -132,14 +132,42 @@ impl Producer {
         content: Bytes,
         chunk_size: usize,
     ) -> Result<(), AppError> {
-        let seg_size = if chunk_size == 0 {
+        let prepared = crate::rdr::PreparedObject::build(name, content, self.seg_size(chunk_size));
+        self.serve_object(prepared).await
+    }
+
+    /// File-backed RDR publish: like [`publish_object`](Self::publish_object)
+    /// but segments are read from `file` on demand (positioned reads), so an
+    /// arbitrarily large file is served without ever loading it into memory.
+    /// `size` is the file's length in bytes. Unix-only.
+    #[cfg(unix)]
+    pub async fn publish_object_from_file(
+        &self,
+        name: Name,
+        file: std::fs::File,
+        size: u64,
+        chunk_size: usize,
+    ) -> Result<(), AppError> {
+        let prepared =
+            crate::rdr::PreparedObject::build_from_file(name, file, size, self.seg_size(chunk_size));
+        self.serve_object(prepared).await
+    }
+
+    fn seg_size(&self, chunk_size: usize) -> usize {
+        if chunk_size == 0 {
             DEFAULT_SEGMENT_SIZE
         } else {
             chunk_size
-        };
-        let prepared = crate::rdr::PreparedObject::build(name.clone(), content, seg_size);
-        let signer = self.signer.as_deref();
+        }
+    }
 
+    /// Serve loop shared by the in-memory and file-backed object publishers:
+    /// answer each `<name>/32=metadata` / `<name>/v=<ver>/seg=<n>` Interest from
+    /// `prepared` until the connection closes. The metadata + segment
+    /// matching/build/sign lives in [`PreparedObject::answer_interest`], so this
+    /// and the demultiplexed serve path stay in lockstep.
+    async fn serve_object(&self, prepared: crate::rdr::PreparedObject) -> Result<(), AppError> {
+        let signer = self.signer.as_deref();
         loop {
             let raw = match self.conn.recv().await {
                 Some(b) => b,
@@ -149,8 +177,6 @@ impl Producer {
                 Ok(i) => i,
                 Err(_) => continue,
             };
-            // The metadata + segment matching/build/sign is shared with the
-            // demultiplexed serve path, so both stay in lockstep.
             if let Some(data) = prepared.answer_interest(&interest.name, signer)? {
                 self.conn.send(data).await?;
             }
