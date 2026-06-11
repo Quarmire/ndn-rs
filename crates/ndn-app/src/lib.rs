@@ -16,6 +16,7 @@ pub mod consumer;
 pub mod demux;
 pub mod engine_ext;
 pub mod error;
+pub mod pipeline;
 pub mod producer;
 pub mod queryable;
 pub mod rdr;

@@ -17,6 +17,7 @@ use ndn_packet::{Data, MAX_PERSISTENT_LIFETIME_SECS, Name, SubscriptionRequest};
 use ndn_security::{SafeData, Unverified, Validator};
 
 use crate::AppError;
+use crate::pipeline::CongestionControl;
 
 /// Verify a fetched `Data` against `validator` (when present) and return its
 /// content bytes. With a validator the Data must authenticate (signature checked
@@ -77,12 +78,6 @@ const OBJECT_FETCH_BACKOFF: Duration = Duration::from_millis(300);
 
 /// Number of segment Interests kept in flight while fetching a segmented
 /// object. Sequential fetch is RTT-bound (one round-trip per segment); a window
-/// turns throughput into `window / RTT * chunk`, the difference between ~30 s
-/// and a couple of seconds for a multi-MB object over a real radio. 32 at the
-/// proven 8 KiB chunk: the earlier window=32 regression was caused by the *16
-/// KiB chunk* (12 fragments/Data → loss), not the window itself — at 8 KiB (6
-/// fragments) a deeper window just keeps the NDP pipe fuller.
-const FETCH_WINDOW: usize = 32;
 /// Per-segment retransmit cap before a windowed fetch gives up.
 const SEG_MAX_ATTEMPTS: u32 = 6;
 /// How long to wait for *any* segment Data before retransmitting the in-flight
@@ -493,13 +488,15 @@ impl Consumer {
         Ok(meta.size.unwrap_or(0))
     }
 
-    /// Fetch segments `0..=last_seg` of `versioned` with a sliding window of
-    /// [`FETCH_WINDOW`] in-flight Interests, handing each verified segment to
-    /// `sink` (which reassembles in memory or streams to disk). Verifies each
-    /// segment (when `validator` is set), tolerates out-of-order arrival, and
-    /// retransmits the in-flight window on a stall ([`SEG_RECV_TIMEOUT`]). The
-    /// windowed loop itself holds no payloads — only a per-segment `done` bitmap
-    /// — so a streaming `sink` keeps memory flat regardless of object size.
+    /// Fetch segments `0..=last_seg` of `versioned` over an **AIMD
+    /// congestion-controlled** pipeline ([`CongestionWindow`], the ndncatchunks
+    /// model): the in-flight window grows on each acked segment and shrinks on a
+    /// congestion signal (a stall/timeout or an NDNLPv2 `CongestionMark`), so it
+    /// self-tunes to the path instead of a fixed window. Each verified segment is
+    /// handed to `sink` (reassemble in memory or stream to disk); out-of-order
+    /// arrival is tolerated and a stall retransmits the in-flight set. The loop
+    /// itself holds no payloads — only a per-segment `done` bitmap — so a
+    /// streaming `sink` keeps memory flat regardless of object size.
     async fn fetch_segments_windowed(
         &self,
         versioned: &Name,
@@ -517,9 +514,10 @@ impl Consumer {
         let mut received: u64 = 0;
         let mut next_send: u64 = 0;
         let mut inflight: HashMap<u64, u32> = HashMap::new(); // seg -> attempts
+        let mut cwnd = crate::pipeline::AimdCongestionControl::new();
 
-        // Prime the window.
-        while next_send < total && inflight.len() < FETCH_WINDOW {
+        // Prime the window to the initial cwnd.
+        while next_send < total && inflight.len() < cwnd.window() {
             send_segment_interest(conn.as_ref(), versioned, next_send, forwarding_hint).await?;
             inflight.insert(next_send, 1);
             next_send += 1;
@@ -528,8 +526,12 @@ impl Consumer {
         while received < total {
             match crate::rt::timeout(SEG_RECV_TIMEOUT, conn.recv()).await {
                 Ok(Some(wire)) => {
-                    // Non-segment / Nack packets on the shared stream are
-                    // ignored; the retransmit path recovers any real loss.
+                    // Peek the NDNLPv2 CongestionMark (early congestion signal)
+                    // before unwrapping. Non-segment / Nack packets are ignored;
+                    // the retransmit path recovers any real loss.
+                    let marked = is_lp_packet(&wire)
+                        && LpPacket::decode(wire.clone())
+                            .is_ok_and(|lp| lp.congestion_mark.is_some());
                     let Ok(data) = decode_data_lp(wire) else { continue };
                     let Some(seg) = data.name.components().last().and_then(|c| c.as_segment())
                     else {
@@ -541,11 +543,17 @@ impl Consumer {
                             done[seg as usize] = true;
                             received += 1;
                             inflight.remove(&seg);
+                            // AIMD: a mark means back off; otherwise grow.
+                            if marked {
+                                cwnd.on_congestion();
+                            } else {
+                                cwnd.on_ack();
+                            }
                             on_progress(received, total);
                         }
                     }
-                    // Refill the window behind the segment we just retired.
-                    while next_send < total && inflight.len() < FETCH_WINDOW {
+                    // Refill up to the (possibly grown) congestion window.
+                    while next_send < total && inflight.len() < cwnd.window() {
                         send_segment_interest(conn.as_ref(), versioned, next_send, forwarding_hint)
                             .await?;
                         inflight.insert(next_send, 1);
@@ -554,8 +562,10 @@ impl Consumer {
                 }
                 Ok(None) => return Err(AppError::Closed),
                 Err(_elapsed) => {
-                    // Stall: retransmit everything in flight (deduped by the
-                    // forwarder/CS; a late duplicate Data is ignored above).
+                    // Stall = loss: back off hard, then retransmit everything in
+                    // flight (deduped by the forwarder/CS; a late duplicate Data
+                    // is ignored above).
+                    cwnd.on_congestion();
                     if inflight.is_empty() {
                         return Err(AppError::Timeout);
                     }
