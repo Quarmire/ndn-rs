@@ -85,15 +85,63 @@ const SEG_MAX_ATTEMPTS: u32 = 6;
 /// far sooner, so this never fires spuriously.
 const SEG_RECV_TIMEOUT: Duration = Duration::from_millis(1500);
 
+/// Which congestion-control strategy the object-fetch pipeline runs — the shared
+/// [`ndn_transport::CongestionController`] variants. Default AIMD.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CongestionStrategy {
+    /// AIMD with slow-start (the ndncatchunks `aimd` model).
+    #[default]
+    Aimd,
+    /// CUBIC — more aggressive window growth on high bandwidth-delay paths.
+    Cubic,
+}
+
+impl CongestionStrategy {
+    /// Parse `"aimd"` / `"cubic"` (case-insensitive); `None` if unrecognized.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "aimd" => Some(Self::Aimd),
+            "cubic" => Some(Self::Cubic),
+            _ => None,
+        }
+    }
+
+    fn controller(self) -> ndn_transport::CongestionController {
+        match self {
+            Self::Aimd => ndn_transport::CongestionController::aimd(),
+            Self::Cubic => ndn_transport::CongestionController::cubic(),
+        }
+    }
+}
+
 pub struct Consumer {
     conn: Arc<dyn Connection>,
+    cc_strategy: CongestionStrategy,
 }
 
 impl Consumer {
     /// Use the `connect` / `from_handle` shortcuts when the connection
     /// shape is fixed; reach for this when wrapping a custom transport.
     pub fn new(conn: Arc<dyn Connection>) -> Self {
-        Self { conn }
+        Self {
+            conn,
+            cc_strategy: CongestionStrategy::default(),
+        }
+    }
+
+    /// Choose the congestion-control strategy for object fetches (default AIMD).
+    pub fn with_congestion_strategy(mut self, strategy: CongestionStrategy) -> Self {
+        self.cc_strategy = strategy;
+        self
+    }
+
+    /// Set the congestion-control strategy on an existing consumer.
+    pub fn set_congestion_strategy(&mut self, strategy: CongestionStrategy) {
+        self.cc_strategy = strategy;
+    }
+
+    pub fn congestion_strategy(&self) -> CongestionStrategy {
+        self.cc_strategy
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -101,16 +149,12 @@ impl Consumer {
         let client = ForwarderClient::connect(socket)
             .await
             .map_err(AppError::Connection)?;
-        Ok(Self {
-            conn: Arc::new(IpcConnection::new(client)),
-        })
+        Ok(Self::new(Arc::new(IpcConnection::new(client))))
     }
 
     /// In-process handle for an embedded engine.
     pub fn from_handle(handle: InProcHandle) -> Self {
-        Self {
-            conn: Arc::new(InProcConnection::new(handle)),
-        }
+        Self::new(Arc::new(InProcConnection::new(handle)))
     }
 
     /// The low-level fetch: returns raw, **unverified** `Data`. It is the
@@ -514,9 +558,10 @@ impl Consumer {
         let mut received: u64 = 0;
         let mut next_send: u64 = 0;
         let mut inflight: HashMap<u64, u32> = HashMap::new(); // seg -> attempts
-        // Self-tuning pipeline depth — the shared AIMD controller (also used by
-        // ndn-iperf), so the fetch adapts to the path instead of a fixed window.
-        let mut cc = ndn_transport::CongestionController::aimd();
+        // Self-tuning pipeline depth — the shared congestion controller (also
+        // used by ndn-iperf), per the consumer's chosen strategy, so the fetch
+        // adapts to the path instead of a fixed window.
+        let mut cc = self.cc_strategy.controller();
         let limit = |cc: &ndn_transport::CongestionController| (cc.window() as usize).max(1);
 
         // Prime the window to the initial cwnd.

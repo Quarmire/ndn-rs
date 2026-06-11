@@ -35,8 +35,8 @@ pub use connection::{Connection, InProcConnection, LpInfo};
 pub use connection::IpcConnection;
 pub use demux::{DemuxConnection, ServeGuard};
 pub use consumer::{
-    Consumer, DEFAULT_INTEREST_LIFETIME, DEFAULT_TIMEOUT, SubscribeOptions, Subscription,
-    VerifiedConsumer,
+    CongestionStrategy, Consumer, DEFAULT_INTEREST_LIFETIME, DEFAULT_TIMEOUT, SubscribeOptions,
+    Subscription, VerifiedConsumer,
 };
 pub use engine_ext::EngineAppExt;
 pub use error::AppError;
