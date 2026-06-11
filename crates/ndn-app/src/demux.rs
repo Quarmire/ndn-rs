@@ -133,7 +133,7 @@ impl DemuxConnection {
     pub fn serve_scoped<F, Fut>(self: &Arc<Self>, prefix: Name, handler: F) -> ServeGuard
     where
         F: Fn(Interest, Responder) -> Fut + Send + 'static,
-        Fut: Future<Output = ()> + Send,
+        Fut: Future<Output = ()> + Send + 'static,
     {
         let mut rx = self.register(prefix.clone());
         let me = Arc::clone(self);
@@ -143,7 +143,14 @@ impl DemuxConnection {
                     continue;
                 };
                 let responder = Responder::new(me.clone() as Arc<dyn Connection>, raw, None);
-                handler(interest, responder).await;
+                // Spawn each handler instead of awaiting it: serving a segmented
+                // object signs + responds to one Interest per call, and a serial
+                // loop caps producer throughput at one (sign + send) at a time —
+                // the bottleneck that starved the tail of a big file under the
+                // consumer's in-flight burst. Concurrent handlers parallelize the
+                // per-segment signing across cores and keep retransmits prompt.
+                // The consumer's window bounds how many run at once.
+                crate::rt::spawn(handler(interest, responder));
             }
         });
         ServeGuard {
