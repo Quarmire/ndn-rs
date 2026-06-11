@@ -174,20 +174,63 @@ pub struct PreparedObject {
     pub metadata_data_name: Name,
     pub metadata_content: Bytes,
     pub last_seg: u64,
-    pub segments: Vec<Bytes>,
+    /// Where segment payloads come from: a fully-in-memory slice list, or — for
+    /// large files — the file on disk read positionally per segment, so the
+    /// whole object is never resident in RAM.
+    source: SegmentSource,
+}
+
+/// Per-segment payload source for a [`PreparedObject`].
+enum SegmentSource {
+    /// All segments held in memory (small objects: cert, manifest, modest files).
+    Memory(Vec<Bytes>),
+    /// Read each segment from a file at its offset on demand (large files). Uses
+    /// positioned reads (`read_at`), so concurrent segment Interests need no
+    /// lock and the file is never fully loaded. Unix-only (Android target is).
+    #[cfg(all(not(target_arch = "wasm32"), unix))]
+    File(FileSource),
+}
+
+#[cfg(all(not(target_arch = "wasm32"), unix))]
+struct FileSource {
+    file: std::fs::File,
+    size: u64,
+    chunk: u64,
+    count: u64,
+}
+
+impl SegmentSource {
+    fn count(&self) -> u64 {
+        match self {
+            SegmentSource::Memory(v) => v.len() as u64,
+            #[cfg(all(not(target_arch = "wasm32"), unix))]
+            SegmentSource::File(f) => f.count,
+        }
+    }
+
+    fn read(&self, idx: u64) -> Option<Bytes> {
+        match self {
+            SegmentSource::Memory(v) => v.get(idx as usize).cloned(),
+            #[cfg(all(not(target_arch = "wasm32"), unix))]
+            SegmentSource::File(f) => {
+                use std::os::unix::fs::FileExt;
+                if idx >= f.count {
+                    return None;
+                }
+                let offset = idx * f.chunk;
+                let len = f.chunk.min(f.size - offset) as usize;
+                let mut buf = vec![0u8; len];
+                f.file.read_exact_at(&mut buf, offset).ok()?;
+                Some(Bytes::from(buf))
+            }
+        }
+    }
 }
 
 impl PreparedObject {
     /// Version is the current Unix millis.
     pub fn build(object_name: Name, content: Bytes, chunk_size: usize) -> Self {
-        // web_time::SystemTime delegates to std natively; on wasm32 it reads
-        // Date.now() instead of panicking like std::time::SystemTime::now().
-        let version = web_time::SystemTime::now()
-            .duration_since(web_time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(1);
-        let versioned_name = object_name.clone().append_version(version);
-
+        let size = content.len() as u64;
         let segments: Vec<Bytes> = if content.is_empty() {
             vec![Bytes::new()]
         } else {
@@ -200,7 +243,46 @@ impl PreparedObject {
             }
             acc
         };
-        let last_seg = (segments.len() as u64).saturating_sub(1);
+        Self::assemble(object_name, SegmentSource::Memory(segments), size, chunk_size)
+    }
+
+    /// File-backed prepared object: segments are read from `file` on demand, so
+    /// an arbitrarily large file is served without ever loading it into memory.
+    /// `size` is the file's length in bytes. Unix-only (positioned reads).
+    #[cfg(all(not(target_arch = "wasm32"), unix))]
+    pub fn build_from_file(
+        object_name: Name,
+        file: std::fs::File,
+        size: u64,
+        chunk_size: usize,
+    ) -> Self {
+        let chunk = chunk_size.max(1) as u64;
+        let count = if size == 0 { 1 } else { size.div_ceil(chunk) };
+        let source = SegmentSource::File(FileSource {
+            file,
+            size,
+            chunk,
+            count,
+        });
+        Self::assemble(object_name, source, size, chunk_size)
+    }
+
+    /// Shared assembly: derive the versioned name, FinalBlockID, and metadata
+    /// from the segment `source` (its count) and the total `size`.
+    fn assemble(
+        object_name: Name,
+        source: SegmentSource,
+        size: u64,
+        chunk_size: usize,
+    ) -> Self {
+        // web_time::SystemTime delegates to std natively; on wasm32 it reads
+        // Date.now() instead of panicking like std::time::SystemTime::now().
+        let version = web_time::SystemTime::now()
+            .duration_since(web_time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(1);
+        let versioned_name = object_name.clone().append_version(version);
+        let last_seg = source.count().saturating_sub(1);
 
         let mut fbi = BytesMut::with_capacity(2 + 8);
         let nni = encode_nni_be(last_seg);
@@ -210,7 +292,7 @@ impl PreparedObject {
             versioned_name: versioned_name.clone(),
             final_block_id: fbi.freeze(),
             segment_size: Some(chunk_size as u64),
-            size: Some(content.len() as u64),
+            size: Some(size),
         };
         let metadata_content = meta.encode();
 
@@ -226,8 +308,13 @@ impl PreparedObject {
             metadata_data_name,
             metadata_content,
             last_seg,
-            segments,
+            source,
         }
+    }
+
+    /// Number of segments this object serves.
+    pub fn segment_count(&self) -> u64 {
+        self.source.count()
     }
 
     /// Answer one RDR Interest against this prepared object: the
@@ -275,7 +362,7 @@ impl PreparedObject {
             && let Some(last) = interest_name.components().last()
             && let Some(seg_idx) = last.as_segment()
         {
-            let Some(payload) = self.segments.get(seg_idx as usize) else {
+            let Some(payload) = self.source.read(seg_idx) else {
                 return Ok(None);
             };
             let seg_name = self.versioned_name.clone().append_segment(seg_idx);
@@ -356,11 +443,39 @@ mod tests {
         assert_eq!(m2.size, Some(0x12_3456));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn file_backed_serves_correct_segment_bytes() {
+        use std::io::Write;
+        // 25 000 bytes → 4 segments at 8 KiB (last is short), distinct bytes so
+        // any offset error shows up.
+        let content: Vec<u8> = (0..25_000u32).map(|i| (i % 251) as u8).collect();
+        let path = std::env::temp_dir().join("ndn_rdr_filebacked_test.bin");
+        std::fs::File::create(&path).unwrap().write_all(&content).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+
+        let object: Name = "/obj".parse().unwrap();
+        let prep = PreparedObject::build_from_file(object, file, content.len() as u64, 8192);
+        assert_eq!(prep.segment_count(), 4);
+        assert_eq!(prep.last_seg, 3);
+
+        // Every segment served from disk equals the file's slice at that offset.
+        for i in 0..=prep.last_seg {
+            let seg_name = prep.versioned_name.clone().append_segment(i);
+            let wire = prep.answer_interest(&seg_name, None).unwrap().expect("segment served");
+            let data = ndn_packet::Data::decode(wire).unwrap();
+            let start = (i * 8192) as usize;
+            let end = (start + 8192).min(content.len());
+            assert_eq!(data.content().unwrap(), &content[start..end], "segment {i} bytes");
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
     #[test]
     fn prepared_object_segments_correctly() {
         let payload = Bytes::from(vec![0u8; 25_000]);
         let prep = PreparedObject::build("/obj".parse().unwrap(), payload, 8192);
-        assert_eq!(prep.segments.len(), 4);
+        assert_eq!(prep.segment_count(), 4);
         assert_eq!(prep.last_seg, 3);
         assert!(
             prep.versioned_name
