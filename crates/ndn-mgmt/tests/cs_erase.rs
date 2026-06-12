@@ -20,6 +20,7 @@ const APP_FACE_ID: FaceId = FaceId(7100);
 
 fn empty_handles() -> MgmtHandles {
     MgmtHandles {
+        extra_modules: Vec::new(),
         discovery_cfg: None,
         security_is_ephemeral: true,
         command_validator: None,

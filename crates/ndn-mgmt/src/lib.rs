@@ -177,6 +177,18 @@ pub fn mount_management(
     }
 }
 
+/// Build the mgmt router: the NFD-compatible built-in modules plus any
+/// host-supplied extension modules (e.g. `ndn_pipes::PipesModule`). Exposed so
+/// the wiring is testable without standing up the whole handler loop.
+pub fn build_mgmt_router(extra_modules: &[Arc<dyn MgmtModule>]) -> MgmtRouter {
+    let mut router = MgmtRouter::new();
+    modules::register_builtins(&mut router);
+    for m in extra_modules {
+        router.register(Arc::clone(m));
+    }
+    router
+}
+
 /// Build the `/localhost/nfd/<module>/notifications` prefix for a
 /// module name like `b"faces"` or `b"rib"`.
 pub fn notifications_prefix(module_name: &'static [u8]) -> Name {
@@ -189,6 +201,7 @@ pub fn notifications_prefix(module_name: &'static [u8]) -> Name {
 }
 
 /// Runtime handles for management of pluggable protocol components.
+#[derive(Default)]
 pub struct MgmtHandles {
     #[cfg(not(target_arch = "wasm32"))]
     pub discovery_cfg: Option<Arc<RwLock<DiscoveryConfig>>>,
@@ -219,6 +232,11 @@ pub struct MgmtHandles {
     /// Runtime-mutable mgmt-access policy.
     #[cfg(not(target_arch = "wasm32"))]
     pub runtime_policy: Option<Arc<RwLock<MgmtAccessPolicy>>>,
+    /// Extra, self-contained management modules to register alongside the
+    /// built-ins — e.g. an extension's read-only introspection module like
+    /// `ndn_pipes::PipesModule` (`/localhost/nfd/pipes/list`). Each carries its
+    /// own state and is registered as-is into the router.
+    pub extra_modules: Vec<Arc<dyn MgmtModule>>,
 }
 
 impl MgmtHandles {
@@ -545,8 +563,7 @@ pub async fn run_ndn_mgmt_handler(
     route_events: Arc<NotificationStream<RouteEvent>>,
     strategy_events: Arc<NotificationStream<StrategyEvent>>,
 ) {
-    let mut router = MgmtRouter::new();
-    modules::register_builtins(&mut router);
+    let router = build_mgmt_router(&mgmt_handles.extra_modules);
 
     // Side consumer for reflexive certificate pulls during `/localhop`
     // authorization: when a remote node registers a prefix, it carries a

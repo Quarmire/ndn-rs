@@ -38,6 +38,7 @@ async fn setup() -> (
         .expect("engine build");
     let cancel = CancellationToken::new();
     let handles = MgmtHandles {
+        extra_modules: Vec::new(),
         discovery_cfg: None,
         security_is_ephemeral: true,
         command_validator: None,

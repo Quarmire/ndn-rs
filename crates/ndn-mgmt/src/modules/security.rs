@@ -433,6 +433,7 @@ mod security_v1_handler_tests {
         }));
 
         let handles_runtime = MgmtHandles {
+            extra_modules: Vec::new(),
             discovery_cfg: None,
             security_is_ephemeral: true,
             command_validator: None,
@@ -452,6 +453,7 @@ mod security_v1_handler_tests {
         assert!(!handles_runtime.effective_require_signed_commands());
 
         let handles_static = MgmtHandles {
+            extra_modules: Vec::new(),
             runtime_policy: None,
             ..handles_runtime
         };
