@@ -1,0 +1,12 @@
+[package]
+name = "ndn-sealed-box"
+description = "An ephemeral-X25519 sealed box (ECDH + HKDF-SHA256 + AES-256-GCM): seal a secret to a recipient's public key so only its private half can open it. Shared by ndn-pipes (handshake) and ndn-compute (reflexive params)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+classification = "extension"
+
+[dependencies]
+ring = { workspace = true }

@@ -12,9 +12,10 @@ classification = "extension"
 # Sandboxed, fuel-metered WASM compute kernels via wasmtime. Off by default to
 # keep the base dependency surface light.
 wasm-exec = ["dep:wasmtime", "dep:anyhow"]
-# Confidential reflexive params: X25519 ECDH + HKDF-SHA256 + AES-256-GCM
-# "sealed box" over the reverse path, via ring.
-sealed-params = ["dep:ring"]
+# Confidential reflexive params: X25519 ECDH + HKDF-SHA256 + AES-256-GCM. The
+# "sealed box" is shared via ndn-sealed-box; ring still backs the per-request
+# session-key path (client/codec).
+sealed-params = ["dep:ring", "dep:ndn-sealed-box"]
 
 [dependencies]
 ndn-packet    = { workspace = true, features = ["std"] }
@@ -32,6 +33,7 @@ tokio-util    = { workspace = true }
 tracing       = { workspace = true }
 anyhow        = { workspace = true, optional = true }
 ring          = { workspace = true, optional = true }
+ndn-sealed-box = { workspace = true, optional = true }
 wasmtime      = { version = "31", default-features = false, features = ["cranelift", "runtime"], optional = true }
 
 [dev-dependencies]

@@ -2,37 +2,30 @@
 //! parameters a consumer sends back over the reverse path (D2) are encrypted
 //! and unreadable by on-path forwarders.
 //!
-//! Scheme (per request, forward-secret): X25519 ECDH between the node's
-//! ephemeral key and a fresh consumer ephemeral key → HKDF-SHA256 → a 256-bit
-//! AES-GCM key. The sealed blob is `consumer_pubkey(32) || nonce(12) ||
-//! AES-256-GCM(params)`.
+//! The sealed-box primitive lives in [`ndn_sealed_box`] (shared with ndn-pipes);
+//! this module is a thin wrapper that fixes the compute domain salt and keeps
+//! the `Result<_, SealError>` API the compute service uses.
 //!
-//! Handshake: the node generates a [`NodeKeypair`], puts `public` on the
-//! reverse Interest (so the consumer can derive the shared key), and later
+//! Handshake: the node generates a [`NodeKeypair`], puts `public` on the reverse
+//! Interest (so the consumer can derive the shared key), and later
 //! [`NodeKeypair::open`]s the blob the consumer returns.
 //!
 //! **Authenticity is out of scope here.** An unauthenticated ECDH is open to an
 //! active on-path attacker who rewrites the ephemeral keys (MITM). Pair this
 //! with the signed-D2 authorization leg
 //! ([`function_reflexive_authenticated`](crate::ComputeService::function_reflexive_authenticated))
-//! so the consumer's blob (and its ephemeral key) is signed — that binds the
-//! key exchange to an authenticated identity.
+//! so the consumer's blob (and its ephemeral key) is signed.
 
-use ring::aead;
-use ring::agreement::{self, EphemeralPrivateKey, UnparsedPublicKey};
-use ring::hkdf;
-use ring::rand::{SecureRandom, SystemRandom};
+use ndn_sealed_box::{OVERHEAD, Recipient};
 
-const HKDF_SALT: &[u8] = b"ndn-compute/reflexive-params/v1";
-const HKDF_INFO: &[u8] = b"aes-256-gcm-key";
-const PUB_LEN: usize = 32;
-const NONCE_LEN: usize = 12;
-const TAG_LEN: usize = 16;
+/// HKDF domain separation for compute's reflexive params (distinct from other
+/// users of the shared sealed box, e.g. ndn-pipes).
+const SALT: &[u8] = b"ndn-compute/reflexive-params/v1";
 
 /// Why a seal/open operation failed.
 #[derive(Debug, PartialEq, Eq)]
 pub enum SealError {
-    /// A `ring` cryptographic primitive failed (keygen, agreement, RNG).
+    /// A cryptographic primitive failed (keygen, agreement, RNG).
     Crypto,
     /// The sealed blob is too short to contain pubkey + nonce + tag.
     Malformed,
@@ -52,107 +45,37 @@ impl core::fmt::Display for SealError {
 
 impl std::error::Error for SealError {}
 
-struct Aes256KeyLen;
-impl hkdf::KeyType for Aes256KeyLen {
-    fn len(&self) -> usize {
-        32
-    }
-}
-
-fn derive_key(shared: &[u8]) -> [u8; 32] {
-    let prk = hkdf::Salt::new(hkdf::HKDF_SHA256, HKDF_SALT).extract(shared);
-    let okm = prk
-        .expand(&[HKDF_INFO], Aes256KeyLen)
-        .expect("hkdf expand for 32 bytes is infallible");
-    let mut out = [0u8; 32];
-    okm.fill(&mut out)
-        .expect("hkdf fill for 32 bytes is infallible");
-    out
-}
-
-/// The node's ephemeral X25519 keypair for one reflexive handshake. `public`
-/// is sent on the reverse Interest; the private half is consumed by
-/// [`Self::open`].
+/// The node's ephemeral X25519 keypair for one reflexive handshake. `public` is
+/// sent on the reverse Interest; the private half is consumed by [`Self::open`].
 pub struct NodeKeypair {
     /// The 32-byte X25519 public key to advertise on the reverse Interest.
-    pub public: [u8; PUB_LEN],
-    private: EphemeralPrivateKey,
+    pub public: [u8; 32],
+    recipient: Recipient,
 }
 
 impl NodeKeypair {
     /// Generate a fresh node keypair.
     pub fn generate() -> Result<Self, SealError> {
-        let rng = SystemRandom::new();
-        let private = EphemeralPrivateKey::generate(&agreement::X25519, &rng)
-            .map_err(|_| SealError::Crypto)?;
-        let pubk = private
-            .compute_public_key()
-            .map_err(|_| SealError::Crypto)?;
-        let mut public = [0u8; PUB_LEN];
-        public.copy_from_slice(pubk.as_ref());
-        Ok(Self { public, private })
+        let recipient = Recipient::generate().ok_or(SealError::Crypto)?;
+        Ok(Self {
+            public: recipient.public,
+            recipient,
+        })
     }
 
     /// Open a sealed blob produced by [`seal`] against this node's public key.
     pub fn open(self, blob: &[u8]) -> Result<Vec<u8>, SealError> {
-        if blob.len() < PUB_LEN + NONCE_LEN + TAG_LEN {
+        if blob.len() < OVERHEAD {
             return Err(SealError::Malformed);
         }
-        let consumer_pub = &blob[..PUB_LEN];
-        let nonce: [u8; NONCE_LEN] = blob[PUB_LEN..PUB_LEN + NONCE_LEN]
-            .try_into()
-            .map_err(|_| SealError::Malformed)?;
-        let ciphertext = &blob[PUB_LEN + NONCE_LEN..];
-
-        let peer = UnparsedPublicKey::new(&agreement::X25519, consumer_pub);
-        let key = agreement::agree_ephemeral(self.private, &peer, derive_key)
-            .map_err(|_| SealError::Crypto)?;
-
-        let unbound =
-            aead::UnboundKey::new(&aead::AES_256_GCM, &key).map_err(|_| SealError::Crypto)?;
-        let opening = aead::LessSafeKey::new(unbound);
-        let mut in_out = ciphertext.to_vec();
-        let plain = opening
-            .open_in_place(
-                aead::Nonce::assume_unique_for_key(nonce),
-                aead::Aad::empty(),
-                &mut in_out,
-            )
-            .map_err(|_| SealError::Decrypt)?;
-        Ok(plain.to_vec())
+        self.recipient.open(SALT, blob).ok_or(SealError::Decrypt)
     }
 }
 
 /// Seal `plaintext` for the node whose X25519 public key is `node_public`.
 /// Returns `consumer_pubkey(32) || nonce(12) || AES-256-GCM(plaintext)`.
 pub fn seal(node_public: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, SealError> {
-    let rng = SystemRandom::new();
-    let eph =
-        EphemeralPrivateKey::generate(&agreement::X25519, &rng).map_err(|_| SealError::Crypto)?;
-    let consumer_pub = eph.compute_public_key().map_err(|_| SealError::Crypto)?;
-
-    let peer = UnparsedPublicKey::new(&agreement::X25519, node_public);
-    let key = agreement::agree_ephemeral(eph, &peer, derive_key).map_err(|_| SealError::Crypto)?;
-
-    let mut nonce = [0u8; NONCE_LEN];
-    rng.fill(&mut nonce).map_err(|_| SealError::Crypto)?;
-
-    let unbound = aead::UnboundKey::new(&aead::AES_256_GCM, &key).map_err(|_| SealError::Crypto)?;
-    let sealing = aead::LessSafeKey::new(unbound);
-    let mut in_out = plaintext.to_vec();
-    sealing
-        .seal_in_place_append_tag(
-            aead::Nonce::assume_unique_for_key(nonce),
-            aead::Aad::empty(),
-            &mut in_out,
-        )
-        .map_err(|_| SealError::Crypto)?;
-
-    let mut blob = Vec::with_capacity(PUB_LEN + NONCE_LEN + in_out.len());
-    blob.extend_from_slice(consumer_pub.as_ref());
-    blob.extend_from_slice(&nonce);
-    blob.extend_from_slice(&in_out);
-    Ok(blob)
+    ndn_sealed_box::seal(SALT, node_public, plaintext).ok_or(SealError::Crypto)
 }
 
 #[cfg(test)]
