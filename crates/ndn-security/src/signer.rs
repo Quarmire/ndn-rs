@@ -74,6 +74,19 @@ impl Ed25519Signer {
     pub fn public_key_bytes(&self) -> [u8; 32] {
         self.signing_key.verifying_key().to_bytes()
     }
+
+    /// Generate a fresh key from the OS RNG.
+    pub fn generate(key_name: Name) -> Result<Self, TrustError> {
+        let mut seed = [0u8; 32];
+        getrandom::getrandom(&mut seed).map_err(|_| TrustError::KeyStore("rng failure".into()))?;
+        Ok(Self::from_seed(&seed, key_name))
+    }
+
+    /// Stamp `KeyLocator = cert_name` on produced signatures.
+    pub fn with_cert_name(mut self, cert_name: Name) -> Self {
+        self.cert_name = Some(cert_name);
+        self
+    }
 }
 
 #[cfg(test)]
