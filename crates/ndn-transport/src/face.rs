@@ -74,6 +74,15 @@ pub enum FaceKind {
     /// over the connectionless radios. `link_type()` is `MultiAccess`
     /// (multicast face) or `PointToPoint` (unicast bulk face).
     WifiDirect,
+    /// Transitional same-network bulk link: a direct unicast [`UdpFace`](crate)
+    /// to a peer's AP-assigned address, used when both devices sit on the same
+    /// Wi-Fi infrastructure and the connectionless radios are too small for bulk.
+    /// Deliberately NOT one of the node's "blessed" native faces — it rebuilds an
+    /// addressed path the way host-centric networking does, so it is honestly
+    /// named, off by default, and logged as a fallback. A stepping stone until
+    /// named-data wireless infrastructure (e.g. V-MAC) matures. `link_type()` is
+    /// `PointToPoint`.
+    InfraTunnel,
     Compute,
     Internal,
     Multicast,
@@ -120,6 +129,7 @@ impl FaceKind {
             | FaceKind::WebSocket
             | FaceKind::WebTransport
             | FaceKind::WebRtc
+            | FaceKind::InfraTunnel
             | FaceKind::Quic => ScopePolicy::ByRemoteAddress,
         }
     }
@@ -149,6 +159,7 @@ impl FaceKind {
             | FaceKind::WebSocket
             | FaceKind::WebTransport
             | FaceKind::WebRtc
+            | FaceKind::InfraTunnel
             | FaceKind::Quic => true,
         }
     }
@@ -173,6 +184,7 @@ impl core::fmt::Display for FaceKind {
             Self::Wfb => "wfb",
             Self::WifiAware => "wifi-aware",
             Self::WifiDirect => "wifi-direct",
+            Self::InfraTunnel => "infra-tunnel",
             Self::Compute => "compute",
             Self::Internal => "internal",
             Self::Multicast => "multicast",

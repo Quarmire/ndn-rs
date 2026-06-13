@@ -36,6 +36,7 @@ impl LinkProfile {
             FaceKind::Ethernet => 5,
             FaceKind::WifiDirect => 8, // P2P group: dedicated high-rate 5 GHz peer link
             FaceKind::Udp => 10,       // LAN multicast / unicast
+            FaceKind::InfraTunnel => 12, // same-AP unicast fallback: fast but transitional
             FaceKind::Tcp => 15,       // uplink
             FaceKind::WifiAware => 20, // NAN follow-up: AP-less, mid throughput
             FaceKind::Bluetooth => 50, // BLE advertising: universal but slow
