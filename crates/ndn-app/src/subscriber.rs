@@ -264,6 +264,9 @@ impl Subscriber {
         let cancel = tokio_util::sync::CancellationToken::new();
         let (sample_tx, sample_rx) = mpsc::channel(config.svs.channel_capacity);
 
+        // Retained for canonical `svs_data_name` reporting on each Sample.
+        let group_for_sample = group.clone();
+
         // Bridge channels between the Connection and the SvSync data plane.
         let (net_out_tx, mut net_out_rx) = mpsc::channel::<Bytes>(64);
         let (net_in_tx, net_in_rx) = mpsc::channel::<Bytes>(64);
@@ -334,9 +337,20 @@ impl Subscriber {
                     _ = task_cancel.cancelled() => break,
                     Some(update) = updates.recv() => {
                         for seq in update.low_seq..=update.high_seq {
-                            let data_name = update.name.clone().append_segment(seq);
+                            // Canonical ndn-svs publication name
+                            // `<node>/<group>/<seq>` (matches SvSync::publish_data
+                            // and ndn-svs `getDataName`), reassembling any
+                            // multi-segment object the producer published.
+                            let data_name = ndn_sync::svs_data_name(
+                                &update.name,
+                                &group_for_sample,
+                                seq,
+                            );
                             let payload = if auto_fetch {
-                                _svsync.fetch_name(&data_name).await
+                                _svsync
+                                    .fetch_publication(&update.name, seq)
+                                    .await
+                                    .map(|segs| Bytes::from(segs.concat()))
                             } else {
                                 None
                             };
@@ -454,9 +468,9 @@ mod tests {
             .send(peer_sync_interest(&group, publisher, 1))
             .expect("inject sync");
 
-        // The Subscriber should emit a fetch Interest for /grp/pub/seg=1;
-        // respond with the matching Data.
-        let want: Name = publisher.parse::<Name>().unwrap().append_segment(1);
+        // The Subscriber should emit a fetch Interest for the canonical
+        // publication name `<node>/<group>/<seq>`; respond with matching Data.
+        let want: Name = ndn_sync::svs_data_name(&publisher.parse().unwrap(), &group, 1);
         let respond = tokio::time::timeout(Duration::from_secs(3), async {
             loop {
                 let pkt = out_rx.recv().await.expect("subscriber output");
