@@ -108,6 +108,10 @@ fn rib_register(
         },
     );
     engine.rib().apply_to_fib(&name, &engine.fib());
+    // Readvertise locally-originated registrations into the routing plane so
+    // remote nodes can reach this prefix (NFD rib/readvertise; no-op unless a
+    // routing protocol installed a destination and `orig` is a local origin).
+    engine.rib().readvertise_announce(&name, orig);
 
     tracing::info!(target: "mgmt.rib", prefix = %name, face = face_id.0, cost, origin = orig, "rib/register");
 
@@ -145,6 +149,9 @@ fn rib_unregister(
         engine.rib().remove_nexthop(&name, face_id);
     }
     engine.rib().apply_to_fib(&name, &engine.fib());
+    // Withdraw from the routing plane once no local route for the prefix
+    // remains (the RIB checks; no-op if other local faces still serve it).
+    engine.rib().readvertise_withdraw(&name);
 
     tracing::info!(target: "mgmt.rib", prefix = %name, face = face_id.0, "rib/unregister");
 

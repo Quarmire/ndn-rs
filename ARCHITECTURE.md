@@ -530,6 +530,17 @@ The `RoutingProtocol` trait populates the RIB. Three implementations ship:
   tracked by the audit witnesses and
   [`testbed/EXPECTED_FAILURES.md`](testbed/EXPECTED_FAILURES.md).
 
+The RIB computes FIB entries with NFD-style **CHILD_INHERIT/CAPTURE
+inheritance** (`Rib::effective_nexthops`): a child prefix merges its own
+routes with `CHILD_INHERIT` routes from ancestors, unless it or a nearer
+ancestor `CAPTURE`s. **Readvertise** (`ndn-engine/src/readvertise.rs`,
+NFD `rib/readvertise`) closes the loop the other way: a locally-originated
+`rib/register` (app/client/static origin — never a routing-learned route, to
+avoid announce loops) is pushed to a `ReadvertiseDestination`. `NlsrProtocol`
+registers one and folds the readvertised prefixes into its own NameLSA,
+re-originating (bumped seq) on change so peers learn an app's prefix without
+manual config.
+
 The self-learning strategy broadcasts discovery Interests when no route exists.
 When Data returns with an LP `PrefixAnnouncement`, the engine validates the
 signed announcement, installs a PrefixAnnouncement-origin route toward the

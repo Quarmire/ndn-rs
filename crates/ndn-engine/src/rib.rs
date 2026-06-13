@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use web_time::Instant;
 
@@ -7,6 +8,7 @@ use ndn_packet::Name;
 use ndn_transport::FaceId;
 
 use crate::fib::{Fib, FibNexthop};
+use crate::readvertise::{ReadvertiseDestination, should_readvertise};
 
 #[derive(Clone, Debug)]
 pub struct RibRoute {
@@ -39,12 +41,58 @@ impl RibRoute {
 /// and are **not** tracked in the RIB.
 pub struct Rib {
     routes: DashMap<Name, Vec<RibRoute>>,
+    /// Optional readvertise sink. When set (by a routing protocol), locally-
+    /// originated registrations are announced into the routing plane so
+    /// remote nodes can reach the prefix (NFD `rib/readvertise`).
+    readvertise: RwLock<Option<Arc<dyn ReadvertiseDestination>>>,
 }
 
 impl Rib {
     pub fn new() -> Self {
         Self {
             routes: DashMap::new(),
+            readvertise: RwLock::new(None),
+        }
+    }
+
+    /// Install the readvertise destination (e.g. NLSR). Idempotent; the last
+    /// writer wins. A registered destination is fed by
+    /// [`Self::readvertise_announce`] / [`Self::readvertise_withdraw`].
+    pub fn set_readvertise_destination(&self, dest: Arc<dyn ReadvertiseDestination>) {
+        *self.readvertise.write().expect("readvertise lock poisoned") = Some(dest);
+    }
+
+    fn readvertise_dest(&self) -> Option<Arc<dyn ReadvertiseDestination>> {
+        self.readvertise.read().expect("readvertise lock poisoned").clone()
+    }
+
+    /// Announce `prefix` into the routing plane if `origin` is a locally-
+    /// originated registration (see [`should_readvertise`]) and a destination
+    /// is installed. A no-op otherwise — routing-learned routes never
+    /// readvertise (loop prevention).
+    pub fn readvertise_announce(&self, prefix: &Name, origin: u64) {
+        if should_readvertise(origin)
+            && let Some(dest) = self.readvertise_dest()
+        {
+            dest.advertise(prefix);
+        }
+    }
+
+    /// Withdraw `prefix` from the routing plane — but only once **no**
+    /// locally-originated route for it remains (a prefix served by several
+    /// local faces stays advertised until the last is gone, matching NFD).
+    /// Call after the route has been removed from the RIB.
+    pub fn readvertise_withdraw(&self, prefix: &Name) {
+        let Some(dest) = self.readvertise_dest() else {
+            return;
+        };
+        let still_local = self
+            .routes
+            .get(prefix)
+            .map(|rs| rs.iter().any(|r| should_readvertise(r.origin)))
+            .unwrap_or(false);
+        if !still_local {
+            dest.withdraw(prefix);
         }
     }
 
@@ -410,6 +458,53 @@ mod tests {
             vec![2],
             "without CHILD_INHERIT, /a's route is not pushed into /a/b"
         );
+    }
+
+    #[test]
+    fn readvertise_announces_local_only_and_withdraws_when_last_route_gone() {
+        use crate::readvertise::ReadvertiseDestination;
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct Recorder {
+            adv: Mutex<Vec<Name>>,
+            wd: Mutex<Vec<Name>>,
+        }
+        impl ReadvertiseDestination for Recorder {
+            fn advertise(&self, p: &Name) {
+                self.adv.lock().unwrap().push(p.clone());
+            }
+            fn withdraw(&self, p: &Name) {
+                self.wd.lock().unwrap().push(p.clone());
+            }
+        }
+
+        let rib = Rib::new();
+        let rec = Arc::new(Recorder::default());
+        rib.set_readvertise_destination(Arc::clone(&rec) as Arc<dyn ReadvertiseDestination>);
+
+        let p = nn("/app/svc");
+        // App registration (origin 0) → announced.
+        rib.add(&p, route(1, 0, 0));
+        rib.readvertise_announce(&p, 0);
+        // NLSR-learned (origin 128) → NOT announced (loop prevention).
+        rib.readvertise_announce(&nn("/learned"), 128);
+        assert_eq!(rec.adv.lock().unwrap().clone(), vec![p.clone()]);
+
+        // A second local face for the same prefix; removing the first must
+        // NOT withdraw (still served).
+        rib.add(&p, route(2, 0, 0));
+        rib.remove(&p, FaceId(1), 0);
+        rib.readvertise_withdraw(&p);
+        assert!(
+            rec.wd.lock().unwrap().is_empty(),
+            "prefix still served by face 2 — must not withdraw"
+        );
+
+        // Remove the last local route → withdraw fires.
+        rib.remove(&p, FaceId(2), 0);
+        rib.readvertise_withdraw(&p);
+        assert_eq!(rec.wd.lock().unwrap().clone(), vec![p]);
     }
 
     #[test]

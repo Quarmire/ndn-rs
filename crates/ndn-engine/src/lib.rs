@@ -33,6 +33,7 @@ pub mod pipeline;
 pub mod rate_limit_hook;
 pub mod reflexive;
 pub mod replay_guard_config;
+pub mod readvertise;
 pub mod rib;
 pub mod routing;
 #[cfg(not(target_arch = "wasm32"))]
@@ -57,6 +58,7 @@ pub use fib::{Fib, FibEntry, FibNexthop};
 #[cfg(not(target_arch = "wasm32"))]
 pub use installable::{InstallableProtocol, PostBuildQueue};
 pub use replay_guard_config::ReplayGuardConfig;
+pub use readvertise::{ReadvertiseDestination, ReadvertisedPrefixes, should_readvertise};
 pub use rib::{Rib, RibRoute};
 pub use routing::{
     ConfigError, ConfigUpdate, LsdbEntry, NeighborInfo, RoutingHandle, RoutingManager,
