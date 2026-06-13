@@ -213,11 +213,27 @@ impl StrategyStage {
             &built_extensions
         };
 
+        // Upstreams already forwarded to for this PIT entry (D.09). Empty on the
+        // first forward; populated when PitCheck re-forwards a retransmission,
+        // so the strategy picks an untried nexthop instead of the same one.
+        let tried_faces: SmallVec<[ndn_transport::FaceId; 4]> = ctx
+            .pit_token
+            .and_then(|tok| {
+                self.pit.with_entry(&tok, |e| {
+                    e.out_records
+                        .iter()
+                        .map(|r| ndn_transport::FaceId(r.face_id))
+                        .collect()
+                })
+            })
+            .unwrap_or_default();
+
         let sctx = StrategyContext {
             name: &name,
             in_face: ctx.face_id,
             fib_entry: strategy_fib.as_ref(),
             pit_token: ctx.pit_token,
+            tried_faces: &tried_faces,
             measurements: &self.measurements,
             signals: self.signals.as_ref(),
             extensions,

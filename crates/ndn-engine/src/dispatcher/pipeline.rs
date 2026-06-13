@@ -321,11 +321,22 @@ impl PacketDispatcher {
             &built_extensions
         };
 
+        // Upstreams already tried for this PIT entry — excluded from Nack
+        // failover so two mutually-nacking nexthops don't ping-pong (D.09).
+        let tried_faces: smallvec::SmallVec<[FaceId; 4]> = self
+            .strategy
+            .pit
+            .with_entry(&token, |e| {
+                e.out_records.iter().map(|r| FaceId(r.face_id)).collect()
+            })
+            .unwrap_or_default();
+
         let sctx = ndn_strategy::StrategyContext {
             name: &name,
             in_face: ctx.face_id,
             fib_entry: strategy_fib.as_ref(),
             pit_token: Some(token),
+            tried_faces: &tried_faces,
             measurements: &self.strategy.measurements,
             signals: self.strategy.signals.as_ref(),
             extensions,
@@ -349,7 +360,19 @@ impl PacketDispatcher {
         match action {
             ForwardingAction::Forward(faces) => {
                 let interest_wire = nack.interest.raw().clone();
+                // Record the failover send as an out-record so a subsequent
+                // Nack from this new upstream excludes it too (D.09).
+                let nonce = nack.interest.nonce();
+                let now = web_time::SystemTime::now()
+                    .duration_since(web_time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as u64;
                 for face_id in &faces {
+                    if let Some(nonce) = nonce {
+                        self.strategy
+                            .pit
+                            .with_entry_mut(&token, |e| e.add_out_record(face_id.0, nonce, now));
+                    }
                     if let Some(state) = self.face_states.get(face_id) {
                         state.counters.out_interests.fetch_add(1, Ordering::Relaxed);
                     }

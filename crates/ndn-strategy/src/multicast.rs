@@ -106,6 +106,7 @@ mod tests {
             in_face,
             fib_entry,
             pit_token: None,
+            tried_faces: &[],
             measurements,
             signals: &crate::NoSignals,
             extensions: &EMPTY,

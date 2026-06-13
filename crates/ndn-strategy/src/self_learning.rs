@@ -112,6 +112,7 @@ mod tests {
             in_face,
             fib_entry: fib,
             pit_token: None,
+            tried_faces: &[],
             measurements: m,
             signals: &crate::NoSignals,
             extensions: &EMPTY,

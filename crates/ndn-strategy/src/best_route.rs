@@ -57,7 +57,15 @@ impl Strategy for BestRouteStrategy {
         let Some(fib) = ctx.fib_entry else {
             return Some(smallvec![ForwardingAction::Nack(NackReason::NoRoute)]);
         };
-        let nexthops = fib.nexthops_excluding(ctx.in_face);
+        // Prefer an upstream not yet tried for this Interest (D.09 failover);
+        // fall back to any non-incoming nexthop for liveness once every
+        // nexthop has been tried (a retransmission should still be re-sent).
+        let untried = fib.nexthops_excluding_any(ctx.in_face, ctx.tried_faces);
+        let nexthops = if untried.is_empty() {
+            fib.nexthops_excluding(ctx.in_face)
+        } else {
+            untried
+        };
         match nexthops.first() {
             Some(nh) => Some(smallvec![ForwardingAction::Forward(smallvec![nh.face_id])]),
             None => Some(smallvec![ForwardingAction::Nack(NackReason::NoRoute)]),
@@ -83,9 +91,10 @@ impl Strategy for BestRouteStrategy {
     /// remain. Mirrors NFD `daemon/fw/best-route-strategy.cpp`
     /// `afterReceiveNack` → `processNack`.
     ///
-    /// Without per-PIT-entry out-records, two nexthops that mutually
-    /// nack can ping-pong; bounded in practice by HopLimit, PIT
-    /// lifetime, and nonce-based loop detection.
+    /// Tried-upstream exclusion (`ctx.tried_faces`, from the PIT entry's
+    /// out-records) closes the former ping-pong gap (D.09): a face already
+    /// forwarded to for this Interest is never retried, so two mutually-
+    /// nacking nexthops resolve to a downstream Nack instead of looping.
     async fn on_nack(
         &self,
         ctx: &StrategyContext<'_>,
@@ -94,7 +103,11 @@ impl Strategy for BestRouteStrategy {
         let Some(fib) = ctx.fib_entry else {
             return ForwardingAction::Nack(reason);
         };
-        let nexthops = fib.nexthops_excluding(ctx.in_face);
+        // Exclude the nacking upstream AND every upstream already tried for
+        // this PIT entry (D.09): retrying an already-tried face is exactly the
+        // mutual-Nack ping-pong. If no untried upstream remains, propagate the
+        // Nack downstream rather than loop.
+        let nexthops = fib.nexthops_excluding_any(ctx.in_face, ctx.tried_faces);
         match nexthops.first() {
             Some(nh) => ForwardingAction::Forward(smallvec![nh.face_id]),
             None => ForwardingAction::Nack(reason),
@@ -116,6 +129,16 @@ mod tests {
         fib_entry: Option<&'a FibEntry>,
         measurements: &'a MeasurementsTable,
     ) -> StrategyContext<'a> {
+        make_ctx_tried(name, in_face, fib_entry, measurements, &[])
+    }
+
+    fn make_ctx_tried<'a>(
+        name: &'a Arc<Name>,
+        in_face: FaceId,
+        fib_entry: Option<&'a FibEntry>,
+        measurements: &'a MeasurementsTable,
+        tried_faces: &'a [FaceId],
+    ) -> StrategyContext<'a> {
         static EMPTY: std::sync::LazyLock<ndn_transport::AnyMap> =
             std::sync::LazyLock::new(ndn_transport::AnyMap::new);
         static RUNTIME: std::sync::LazyLock<Arc<dyn ndn_runtime::Runtime>> =
@@ -125,6 +148,7 @@ mod tests {
             in_face,
             fib_entry,
             pit_token: None,
+            tried_faces,
             measurements,
             signals: &crate::NoSignals,
             extensions: &EMPTY,
@@ -257,6 +281,72 @@ mod tests {
             action,
             ForwardingAction::Nack(NackReason::Congestion)
         ));
+    }
+
+    /// D.09: a forward (decide) excludes already-tried upstreams, picking an
+    /// untried nexthop instead of re-sending to the same one.
+    #[tokio::test]
+    async fn decide_prefers_untried_upstream() {
+        let strategy = BestRouteStrategy::new();
+        let name = Arc::new(Name::root());
+        let measurements = MeasurementsTable::new();
+        let fib = FibEntry {
+            nexthops: vec![
+                FibNexthop { face_id: FaceId(2), cost: 10 },
+                FibNexthop { face_id: FaceId(3), cost: 20 },
+            ],
+        };
+        // Face 2 already tried → the lowest-cost UNTRIED nexthop (3) is chosen.
+        let tried = [FaceId(2)];
+        let ctx = make_ctx_tried(&name, FaceId(1), Some(&fib), &measurements, &tried);
+        let actions = strategy.after_receive_interest(&ctx).await;
+        match actions.as_slice() {
+            [ForwardingAction::Forward(faces)] => assert_eq!(faces.as_slice(), &[FaceId(3)]),
+            _ => panic!("expected Forward to the untried nexthop 3"),
+        }
+    }
+
+    /// D.09: when every nexthop has been tried, `decide` falls back to a
+    /// liveness re-send (a retransmission must still go somewhere).
+    #[tokio::test]
+    async fn decide_falls_back_to_resend_when_all_tried() {
+        let strategy = BestRouteStrategy::new();
+        let name = Arc::new(Name::root());
+        let measurements = MeasurementsTable::new();
+        let fib = FibEntry {
+            nexthops: vec![FibNexthop { face_id: FaceId(2), cost: 10 }],
+        };
+        let tried = [FaceId(2)];
+        let ctx = make_ctx_tried(&name, FaceId(1), Some(&fib), &measurements, &tried);
+        let actions = strategy.after_receive_interest(&ctx).await;
+        match actions.as_slice() {
+            [ForwardingAction::Forward(faces)] => assert_eq!(faces.as_slice(), &[FaceId(2)]),
+            _ => panic!("all-tried must re-send to nexthop 2 for liveness"),
+        }
+    }
+
+    /// D.09: on Nack, an already-tried upstream is NOT retried — with only one
+    /// FIB nexthop already tried, the Nack propagates (no ping-pong).
+    #[tokio::test]
+    async fn on_nack_does_not_retry_tried_upstream() {
+        let strategy = BestRouteStrategy::new();
+        let name = Arc::new(Name::root());
+        let measurements = MeasurementsTable::new();
+        let fib = FibEntry {
+            nexthops: vec![
+                FibNexthop { face_id: FaceId(2), cost: 10 },
+                FibNexthop { face_id: FaceId(3), cost: 20 },
+            ],
+        };
+        // Nack arrives from face 2; face 3 already tried → no untried upstream
+        // remains, so the Nack must propagate rather than ping-pong back to 3.
+        let tried = [FaceId(3)];
+        let ctx = make_ctx_tried(&name, FaceId(2), Some(&fib), &measurements, &tried);
+        let action = strategy.on_nack(&ctx, NackReason::NoRoute).await;
+        assert!(
+            matches!(action, ForwardingAction::Nack(NackReason::NoRoute)),
+            "both nexthops exhausted (one nacking, one already tried) → propagate"
+        );
     }
 
     #[test]

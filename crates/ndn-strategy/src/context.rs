@@ -39,6 +39,19 @@ impl FibEntry {
             .filter(|n| n.face_id != exclude)
             .collect()
     }
+
+    /// Split-horizon plus tried-upstream exclusion: drop `exclude` (the
+    /// incoming face) and every face in `tried` (upstreams this PIT entry
+    /// already forwarded to). Used for D.09 failover — pick an upstream not
+    /// yet tried for this Interest, so a Nack or retransmission moves to a
+    /// fresh path instead of ping-ponging between two mutually-nacking hops.
+    pub fn nexthops_excluding_any(&self, exclude: FaceId, tried: &[FaceId]) -> Vec<FibNexthop> {
+        self.nexthops
+            .iter()
+            .copied()
+            .filter(|n| n.face_id != exclude && !tried.contains(&n.face_id))
+            .collect()
+    }
 }
 
 /// Immutable view of engine state provided to strategy methods.
@@ -47,6 +60,11 @@ pub struct StrategyContext<'a> {
     pub in_face: FaceId,
     pub fib_entry: Option<&'a FibEntry>,
     pub pit_token: Option<PitToken>,
+    /// Upstreams this PIT entry already forwarded to (its out-record faces).
+    /// Empty on the first forward; populated when the strategy reconsiders an
+    /// Interest (Nack failover, retransmission re-forward) so it can pick an
+    /// untried nexthop. See [`FibEntry::nexthops_excluding_any`].
+    pub tried_faces: &'a [FaceId],
     pub measurements: &'a MeasurementsTable,
     /// External/environmental signals (RSSI, SNR, GPS, …) pushed by signal
     /// sources. The canonical cross-layer input surface — read via

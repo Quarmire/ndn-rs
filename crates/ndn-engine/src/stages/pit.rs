@@ -170,6 +170,17 @@ impl PitCheckStage {
                 if persistent.is_some() && entry.upstream_lost {
                     entry.upstream_lost = false;
                     CheckResult::ReForward
+                } else if persistent.is_none() && should_retx_reforward(entry, now_ns) {
+                    // Retransmission suppression (NFD RetxSuppression, D.09):
+                    // classical only — the persistent path keeps its own F15
+                    // re-forward semantics (`upstream_lost`) above. A fresh-nonce
+                    // classical Interest at a name already forwarded upstream is
+                    // a retransmission: within the suppression window it
+                    // aggregates (true duplicate); once that window since our
+                    // last upstream send elapses, let it re-forward so the
+                    // strategy can move to an untried upstream — driving failover
+                    // past a silently-lost upstream that never Nacks.
+                    CheckResult::ReForward
                 } else {
                     CheckResult::Aggregated
                 }
@@ -615,6 +626,26 @@ fn now_ns() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos() as u64
+}
+
+/// Minimum gap between forwarding the same Interest upstream again on a
+/// retransmission (NFD `RetxSuppressionExponential` initial interval, 10 ms).
+/// A retransmission arriving sooner is a true duplicate and aggregates;
+/// later, it is re-forwarded so the strategy can fail over to an untried
+/// upstream. Consumer retransmit timers are far longer (≥ hundreds of ms),
+/// so a genuine retransmission always clears this and a packet burst does not.
+const RETX_SUPPRESS_NS: u64 = 10_000_000;
+
+/// Whether a fresh-nonce Interest aggregating onto an existing entry should
+/// be re-forwarded: only if the entry was already forwarded upstream
+/// (`out_records` non-empty) and the suppression window since the most recent
+/// upstream send has elapsed.
+fn should_retx_reforward(entry: &PitEntry, now_ns: u64) -> bool {
+    let last_out = entry.out_records.iter().map(|r| r.sent_at).max();
+    match last_out {
+        Some(sent_at) => now_ns >= sent_at.saturating_add(RETX_SUPPRESS_NS),
+        None => false,
+    }
 }
 
 #[cfg(test)]
@@ -1685,5 +1716,99 @@ mod persistent_tests {
         let expired = pit.drain_expired(now_ns());
         assert!(!expired.is_empty(), "drain_expired must return the token");
         assert!(!pit.contains(&token), "entry must be gone after drain");
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod d09_retx_tests {
+    use super::*;
+    use ndn_packet::encode::InterestBuilder;
+    use ndn_packet::{Interest, Name, Selector};
+    use std::sync::Arc;
+
+    fn interest_ctx(wire: bytes::Bytes, face: FaceId) -> PacketContext {
+        let interest = Interest::decode(wire.clone()).unwrap();
+        let mut ctx = PacketContext::new(wire, face, 0);
+        ctx.packet = DecodedPacket::Interest(Box::new(interest));
+        ctx
+    }
+
+    /// Seed a PIT entry already forwarded upstream (out-record on face 2 at
+    /// `out_sent_at`), with an in-record nonce deliberately != `retx_nonce`
+    /// so the incoming retransmission is not flagged as a nonce loop.
+    fn seed_forwarded_entry(pit: &Pit, name: &Name, retx_nonce: u32, out_sent_at: u64) {
+        let token = PitToken::from_interest(name);
+        let now = now_ns();
+        let other = retx_nonce.wrapping_add(1);
+        let mut entry = PitEntry::new(Arc::new(name.clone()), now, 4000);
+        entry.add_in_record(1, other, now + 4_000_000_000, None, Selector::default());
+        entry.add_out_record(2, other, out_sent_at);
+        pit.insert(token, entry);
+    }
+
+    fn check_stage(pit: Arc<Pit>) -> PitCheckStage {
+        PitCheckStage {
+            pit,
+            dead_nonce_list: None,
+            validator: None,
+            replay_guard: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn retransmission_reforwards_after_suppression_window() {
+        let pit = Arc::new(Pit::new());
+        let check = check_stage(Arc::clone(&pit));
+        let name: Name = "/d09/retx/after".parse().unwrap();
+        let wire = InterestBuilder::new(name.clone()).build();
+        let nonce = Interest::decode(wire.clone()).unwrap().nonce().unwrap();
+        // Forwarded upstream 20 ms ago (> the 10 ms suppression window).
+        seed_forwarded_entry(&pit, &name, nonce, now_ns().saturating_sub(20_000_000));
+
+        let action = check.process(interest_ctx(wire, FaceId(1))).await;
+        assert!(
+            matches!(action, Action::Continue(_)),
+            "a retransmission past the suppression window must re-forward (D.09)"
+        );
+    }
+
+    #[tokio::test]
+    async fn retransmission_aggregates_within_suppression_window() {
+        let pit = Arc::new(Pit::new());
+        let check = check_stage(Arc::clone(&pit));
+        let name: Name = "/d09/retx/within".parse().unwrap();
+        let wire = InterestBuilder::new(name.clone()).build();
+        let nonce = Interest::decode(wire.clone()).unwrap().nonce().unwrap();
+        // Forwarded upstream just now (inside the 10 ms window).
+        seed_forwarded_entry(&pit, &name, nonce, now_ns());
+
+        let action = check.process(interest_ctx(wire, FaceId(1))).await;
+        assert!(
+            matches!(action, Action::Drop(DropReason::Suppressed)),
+            "a retransmission inside the suppression window must aggregate"
+        );
+    }
+
+    /// A fresh entry with no upstream out-record (never forwarded) must
+    /// aggregate a second arrival, not re-forward — the original is still in
+    /// flight through the strategy.
+    #[tokio::test]
+    async fn second_arrival_before_any_forward_aggregates() {
+        let pit = Arc::new(Pit::new());
+        let check = check_stage(Arc::clone(&pit));
+        let name: Name = "/d09/retx/inflight".parse().unwrap();
+        let token = PitToken::from_interest(&name);
+        let now = now_ns();
+        let mut entry = PitEntry::new(Arc::new(name.clone()), now, 4000);
+        entry.add_in_record(1, 7, now + 4_000_000_000, None, Selector::default());
+        // No out-record: not yet forwarded.
+        pit.insert(token, entry);
+
+        let wire = InterestBuilder::new(name.clone()).build();
+        let action = check.process(interest_ctx(wire, FaceId(2))).await;
+        assert!(
+            matches!(action, Action::Drop(DropReason::Suppressed)),
+            "with no upstream out-record yet, a second arrival must aggregate"
+        );
     }
 }

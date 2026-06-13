@@ -82,6 +82,7 @@ mod tests {
             in_face: FaceId(0),
             fib_entry: None,
             pit_token: None,
+            tried_faces: &[],
             measurements,
             signals,
             extensions,

@@ -185,6 +185,7 @@ mod tests {
             in_face: FaceId(0),
             fib_entry: Some(fib),
             pit_token: None,
+            tried_faces: &[],
             measurements,
             signals,
             extensions: ext,
