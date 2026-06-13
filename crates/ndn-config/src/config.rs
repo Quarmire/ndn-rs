@@ -1442,6 +1442,13 @@ pub struct DiscoveryTomlConfig {
     #[serde(default)]
     pub key_name: Option<String>,
 
+    /// PIB of trust anchors for verifying *peer* service records. Absent
+    /// ⇒ fail-closed: peer records are browseable but never auto-install
+    /// FIB routes. Each trusted peer's identity cert (or a shared CA the
+    /// peers chain to) goes here.
+    #[serde(default)]
+    pub trust_anchor_pib: Option<String>,
+
     /// `"udp"` (default), `"ether"`, or `"both"`. Ethernet needs
     /// CAP_NET_RAW.
     #[serde(default)]
