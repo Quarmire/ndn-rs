@@ -75,7 +75,7 @@ scope = spec   (flat under crates/)   NDN community specs implemented faithfully
   ndn-app                       Application API: Consumer, Producer, Subscriber
   ndn-ipc                       ForwarderClient, BlockingForwarderClient, chunked transfer
   ndn-discovery, ndn-discovery-core
-                                NDN AutoConfig, per-neighbor probe, SVS service discovery
+                                NDN AutoConfig, per-neighbor probe, NDNSD-style service discovery (announce + browse)
   ndn-routing                   StaticProtocol, DvrProtocol, NlsrProtocol
   ndn-sync                      Dataset sync: SVS (layered — notification core w/ suppression FSM + HMAC-signed Sync Interests + V2/V3 wire dialects → SvSync data plane w/ DataStore + windowed fetch/serve → SvsPubSub named pub/sub + MappingProvider late-join backfill), PSync
   ndn-did                       NDN-native Decentralised Identifiers (W3C DID + did:ndn method)

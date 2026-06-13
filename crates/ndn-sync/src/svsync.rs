@@ -1,11 +1,12 @@
 //! Layer 1 — `SvSync` data plane (gaps #4, #5, #8).
 //!
 //! Layer 0 ([`svs_sync`](crate::svs_sync)) is a notification bus: it tells
-//! you *that* a publisher advanced, but every consumer then re-implements
-//! naming, fetching, serving and storage (the crate's own
-//! `svs_gossip`/`subscriber` are evidence). This layer owns that, keeping
-//! the transport-agnostic `mpsc<Bytes>` boundary so it still runs in the
-//! browser, a simulator, or against real faces.
+//! you *that* a publisher advanced, but a point-to-point consumer then has
+//! to implement naming, fetching, serving and storage itself (ndn-app's
+//! `Subscriber` did, with a racy hand-rolled fetch, before it was ported
+//! onto this layer). This layer owns that, keeping the transport-agnostic
+//! `mpsc<Bytes>` boundary so it still runs in the browser, a simulator, or
+//! against real faces.
 //!
 //! * [`DataStore`] — pluggable storage; [`MemoryStore`] is the default.
 //! * [`svs_data_name`] — the canonical ndn-svs data name
