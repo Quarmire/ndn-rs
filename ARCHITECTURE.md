@@ -514,8 +514,14 @@ contained by a pulled context bump (no re-bootstrap).
 The `RoutingProtocol` trait populates the RIB. Three implementations ship:
 
 - **`StaticProtocol`** — TOML-configured static routes.
-- **`DvrProtocol`** — experimental distance-vector protocol (ndn-rs-specific; no
-  cross-implementation peer).
+- **`DvProtocol`** — ndn-dv distance-vector routing implemented to
+  [`ndnd/dv/SPEC.md`](https://github.com/named-data/ndnd) (reference impl: ndnd, Go;
+  *Distance-Vector Routing for Named Data Networking*, CoNEXT '24,
+  DOI `10.1145/3680121.3699885`). Documented divergences from ndnd in
+  `crates/ndn-routing/src/protocols/dv/mod.rs`. Trust modes: `insecure`
+  (default, ndnd-compatible), `static`, `lvs`. A live ndnd-dv interop
+  witness (mirroring G.04's shape) is not yet wired — the SPEC-compliance
+  claim currently has no cross-implementation leg.
 - **`NlsrProtocol`** — Named-data Link State Routing; implements the NDN testbed
   routing protocol. Runs `NeighborProbeProtocol` for liveness, PSync-based LSA flooding, and
   Dijkstra-based routing-table computation. Enabled via `[routing.nlsr]` in

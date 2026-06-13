@@ -50,23 +50,73 @@ pub struct MeasurementsEntry {
     pub last_updated: u64,
 }
 
+/// Upper bound on distinct prefixes a [`MeasurementsTable`] retains before
+/// evicting the least-recently-updated entry. Bounds memory on a
+/// public-facing forwarder: each unique Interest prefix would otherwise
+/// allocate a permanent entry (the per-prefix EWMA state). NFD's
+/// `table::Measurements` bounds lifetime per entry; we bound the table size
+/// since the strategy reads a snapshot, not a live-extended record.
+pub const DEFAULT_CAPACITY: usize = 16_384;
+
 /// Concurrent measurements table, one entry per name prefix.
 ///
-/// `DashMap` on native, `Mutex<HashMap>` on wasm32.
+/// `DashMap` on native, `Mutex<HashMap>` on wasm32. Bounded to `capacity`
+/// entries with least-recently-updated eviction (see [`DEFAULT_CAPACITY`]).
 pub struct MeasurementsTable {
     #[cfg(not(target_arch = "wasm32"))]
     entries: DashMap<Arc<Name>, MeasurementsEntry>,
     #[cfg(target_arch = "wasm32")]
     entries: std::sync::Mutex<HashMap<Arc<Name>, MeasurementsEntry>>,
+    capacity: usize,
 }
 
 impl MeasurementsTable {
     pub fn new() -> Self {
+        Self::with_capacity(DEFAULT_CAPACITY)
+    }
+
+    /// Construct with an explicit prefix capacity (LRU-by-update eviction).
+    pub fn with_capacity(capacity: usize) -> Self {
         Self {
             #[cfg(not(target_arch = "wasm32"))]
             entries: DashMap::new(),
             #[cfg(target_arch = "wasm32")]
             entries: std::sync::Mutex::new(HashMap::new()),
+            capacity: capacity.max(1),
+        }
+    }
+
+    /// Number of retained prefixes (test/introspection).
+    pub fn len(&self) -> usize {
+        #[cfg(not(target_arch = "wasm32"))]
+        return self.entries.len();
+        #[cfg(target_arch = "wasm32")]
+        return self.entries.lock().unwrap().len();
+    }
+
+    /// Whether the table is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Native: if inserting `incoming` would exceed `capacity`, drop the
+    /// entry with the smallest `last_updated`. The key is collected before
+    /// removal so no shard guard is held across `remove` (DashMap deadlock
+    /// safety).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn evict_if_full(&self, incoming: &Arc<Name>) {
+        if self.entries.len() < self.capacity || self.entries.contains_key(incoming) {
+            return;
+        }
+        let mut oldest: Option<(Arc<Name>, u64)> = None;
+        for r in self.entries.iter() {
+            let ts = r.value().last_updated;
+            if oldest.as_ref().is_none_or(|(_, t)| ts < *t) {
+                oldest = Some((Arc::clone(r.key()), ts));
+            }
+        }
+        if let Some((victim, _)) = oldest {
+            self.entries.remove(&victim);
         }
     }
 
@@ -80,6 +130,7 @@ impl MeasurementsTable {
     pub fn update_rtt(&self, name: Arc<Name>, face: FaceId, rtt_ns: f64) {
         #[cfg(not(target_arch = "wasm32"))]
         {
+            self.evict_if_full(&name);
             let mut entry = self.entries.entry(name).or_default();
             entry.rtt_per_face.entry(face).or_default().update(rtt_ns);
             entry.last_updated = now_ns();
@@ -87,6 +138,7 @@ impl MeasurementsTable {
         #[cfg(target_arch = "wasm32")]
         {
             let mut entries = self.entries.lock().unwrap();
+            evict_if_full_locked(&mut entries, &name, self.capacity);
             let entry = entries.entry(name).or_default();
             entry.rtt_per_face.entry(face).or_default().update(rtt_ns);
             entry.last_updated = now_ns();
@@ -114,6 +166,7 @@ impl MeasurementsTable {
         const ALPHA: f32 = 0.1;
         #[cfg(not(target_arch = "wasm32"))]
         {
+            self.evict_if_full(&name);
             let mut entry = self.entries.entry(name).or_default();
             let sample = if satisfied { 1.0f32 } else { 0.0 };
             entry.satisfaction_rate = (1.0 - ALPHA) * entry.satisfaction_rate + ALPHA * sample;
@@ -122,11 +175,31 @@ impl MeasurementsTable {
         #[cfg(target_arch = "wasm32")]
         {
             let mut entries = self.entries.lock().unwrap();
+            evict_if_full_locked(&mut entries, &name, self.capacity);
             let entry = entries.entry(name).or_default();
             let sample = if satisfied { 1.0f32 } else { 0.0 };
             entry.satisfaction_rate = (1.0 - ALPHA) * entry.satisfaction_rate + ALPHA * sample;
             entry.last_updated = now_ns();
         }
+    }
+}
+
+/// wasm32 eviction helper: drop the least-recently-updated entry when full.
+#[cfg(target_arch = "wasm32")]
+fn evict_if_full_locked(
+    entries: &mut HashMap<Arc<Name>, MeasurementsEntry>,
+    incoming: &Arc<Name>,
+    capacity: usize,
+) {
+    if entries.len() < capacity || entries.contains_key(incoming) {
+        return;
+    }
+    if let Some(victim) = entries
+        .iter()
+        .min_by_key(|(_, v)| v.last_updated)
+        .map(|(k, _)| Arc::clone(k))
+    {
+        entries.remove(&victim);
     }
 }
 
@@ -221,5 +294,41 @@ mod tests {
         let table = MeasurementsTable::default();
         let name = Arc::new(Name::root());
         assert!(table.get(&name).is_none());
+    }
+
+    #[test]
+    fn measurements_table_is_bounded_by_capacity() {
+        // Inserting many distinct prefixes must not grow the table without
+        // bound — the least-recently-updated entry is evicted at capacity.
+        let table = MeasurementsTable::with_capacity(8);
+        for i in 0..1000u32 {
+            let name = Arc::new(format!("/m/{i}").parse::<Name>().unwrap());
+            table.update_satisfaction(name, true);
+        }
+        assert!(
+            table.len() <= 8,
+            "table must stay within capacity, got {}",
+            table.len()
+        );
+    }
+
+    #[test]
+    fn measurements_table_eviction_keeps_recent() {
+        // An entry refreshed on every round stays the most-recently-updated,
+        // so LRU-by-update eviction must never drop it.
+        let table = MeasurementsTable::with_capacity(4);
+        let keep = Arc::new("/hot/prefix".parse::<Name>().unwrap());
+        table.update_satisfaction(Arc::clone(&keep), true);
+        for i in 0..50u32 {
+            let fill = Arc::new(format!("/cold/{i}").parse::<Name>().unwrap());
+            table.update_satisfaction(fill, true);
+            // Re-touch the hot prefix so it is newest going into the next round.
+            table.update_satisfaction(Arc::clone(&keep), true);
+        }
+        assert!(table.len() <= 4);
+        assert!(
+            table.get(&keep).is_some(),
+            "the continuously-refreshed entry must survive eviction"
+        );
     }
 }
