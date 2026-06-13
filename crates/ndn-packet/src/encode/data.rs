@@ -34,6 +34,7 @@ impl FastPathSizes {
         name: &Name,
         freshness: Option<Duration>,
         final_block_id: Option<&Bytes>,
+        content_type: Option<u64>,
         content: &[u8],
     ) -> Self {
         use ndn_tlv::varu64_size;
@@ -47,6 +48,11 @@ impl FastPathSizes {
 
         let mi_inner = {
             let mut s = 0usize;
+            // ContentType is the first MetaInfo field (§6.2).
+            if let Some(ct) = content_type {
+                let (_, nni_len) = super::nni(ct);
+                s += varu64_size(tlv_type::CONTENT_TYPE) + varu64_size(nni_len as u64) + nni_len;
+            }
             if let Some(f) = freshness {
                 let (_, nni_len) = super::nni(f.as_millis() as u64);
                 s +=
@@ -77,11 +83,13 @@ impl FastPathSizes {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_fields(
     buf: &mut BytesMut,
     name: &Name,
     freshness: Option<Duration>,
     final_block_id: Option<&Bytes>,
+    content_type: Option<u64>,
     content: &[u8],
     sz: &FastPathSizes,
 ) {
@@ -95,6 +103,12 @@ fn write_fields(
     if sz.mi_inner > 0 {
         put_vu(buf, tlv_type::META_INFO);
         put_vu(buf, sz.mi_inner as u64);
+        if let Some(ct) = content_type {
+            let (nni_buf, nni_len) = super::nni(ct);
+            put_vu(buf, tlv_type::CONTENT_TYPE);
+            put_vu(buf, nni_len as u64);
+            buf.put_slice(&nni_buf[..nni_len]);
+        }
         if let Some(f) = freshness {
             let (nni_buf, nni_len) = super::nni(f.as_millis() as u64);
             put_vu(buf, tlv_type::FRESHNESS_PERIOD);
@@ -124,6 +138,8 @@ pub struct DataBuilder {
     content: Vec<u8>,
     freshness: Option<Duration>,
     final_block_id: Option<Bytes>,
+    /// MetaInfo ContentType code; `None` omits the field (= Blob default).
+    content_type: Option<u64>,
 }
 
 impl DataBuilder {
@@ -133,11 +149,22 @@ impl DataBuilder {
             content: content.to_vec(),
             freshness: None,
             final_block_id: None,
+            content_type: None,
         }
     }
 
     pub fn freshness(mut self, d: Duration) -> Self {
         self.freshness = Some(d);
+        self
+    }
+
+    /// Set the MetaInfo `ContentType` (NDN Packet Format §6.2.1). Emitted
+    /// as the first MetaInfo field. Use e.g. `ContentType::Other(6)` to
+    /// mark a packet that *encapsulates* another Data (the ndn-svs
+    /// SVS-PS convention); the default (unset) is the Blob content type,
+    /// which is omitted from the wire.
+    pub fn content_type(mut self, ct: crate::meta_info::ContentType) -> Self {
+        self.content_type = Some(ct.code());
         self
     }
 
@@ -178,6 +205,7 @@ impl DataBuilder {
             &self.name,
             self.freshness,
             self.final_block_id.as_ref(),
+            self.content_type,
             &self.content,
         );
         let signed_size =
@@ -195,6 +223,7 @@ impl DataBuilder {
             &self.name,
             self.freshness,
             self.final_block_id.as_ref(),
+            self.content_type,
             &self.content,
             &sz,
         );
@@ -225,6 +254,7 @@ impl DataBuilder {
             &self.name,
             self.freshness,
             self.final_block_id.as_ref(),
+            self.content_type,
             &self.content,
         );
         let signed_size =
@@ -242,6 +272,7 @@ impl DataBuilder {
             &self.name,
             self.freshness,
             self.final_block_id.as_ref(),
+            self.content_type,
             &self.content,
             &sz,
         );
@@ -268,6 +299,7 @@ impl DataBuilder {
             &self.name,
             self.freshness,
             self.final_block_id.as_ref(),
+            self.content_type,
             &self.content,
         );
         let inner_size = sz.name_tlv + sz.metainfo_tlv + sz.content_tlv;
@@ -281,6 +313,7 @@ impl DataBuilder {
             &self.name,
             self.freshness,
             self.final_block_id.as_ref(),
+            self.content_type,
             &self.content,
             &sz,
         );
@@ -306,10 +339,14 @@ impl DataBuilder {
     {
         let mut inner = TlvWriter::new();
         write_name(&mut inner, &self.name);
-        if self.freshness.is_some() || self.final_block_id.is_some() {
+        if self.content_type.is_some() || self.freshness.is_some() || self.final_block_id.is_some() {
+            let content_type = self.content_type;
             let freshness = self.freshness;
             let fbi = self.final_block_id.as_deref();
             inner.write_nested(tlv_type::META_INFO, |w| {
+                if let Some(ct) = content_type {
+                    write_nni(w, tlv_type::CONTENT_TYPE, ct);
+                }
                 if let Some(f) = freshness {
                     write_nni(w, tlv_type::FRESHNESS_PERIOD, f.as_millis() as u64);
                 }
@@ -360,10 +397,14 @@ impl DataBuilder {
 
         let signed_start = w.len();
         write_name(&mut w, &self.name);
-        if self.freshness.is_some() || self.final_block_id.is_some() {
+        if self.content_type.is_some() || self.freshness.is_some() || self.final_block_id.is_some() {
+            let content_type = self.content_type;
             let freshness = self.freshness;
             let fbi = self.final_block_id.as_deref();
             w.write_nested(tlv_type::META_INFO, |w| {
+                if let Some(ct) = content_type {
+                    write_nni(w, tlv_type::CONTENT_TYPE, ct);
+                }
                 if let Some(f) = freshness {
                     write_nni(w, tlv_type::FRESHNESS_PERIOD, f.as_millis() as u64);
                 }
@@ -430,6 +471,47 @@ mod tests {
         let data = Data::decode(wire).unwrap();
         let mi = data.meta_info().expect("meta_info present");
         assert_eq!(mi.freshness_period, Some(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn data_builder_content_type_roundtrips() {
+        use crate::meta_info::ContentType;
+        // ContentType=6 (ndn-svs "encapsulated Data" marker), the first
+        // MetaInfo field, alongside freshness + FinalBlockId.
+        let wire = DataBuilder::new("/test", b"inner")
+            .content_type(ContentType::Other(6))
+            .freshness(Duration::from_secs(4))
+            .final_block_id_typed_seg(2)
+            .build();
+        let data = Data::decode(wire).unwrap();
+        let mi = data.meta_info().expect("meta_info present");
+        assert_eq!(mi.content_type, ContentType::Other(6));
+        assert_eq!(mi.freshness_period, Some(Duration::from_secs(4)));
+        assert!(mi.final_block_id.is_some());
+        assert_eq!(data.content().map(|b| b.as_ref()), Some(b"inner".as_ref()));
+    }
+
+    #[test]
+    fn content_type_alone_emits_metainfo() {
+        use crate::meta_info::ContentType;
+        // ContentType present but no freshness/FinalBlockId must still
+        // produce a MetaInfo block.
+        let wire = DataBuilder::new("/t", b"")
+            .content_type(ContentType::Other(6))
+            .build();
+        let data = Data::decode(wire).unwrap();
+        assert_eq!(
+            data.meta_info().map(|m| m.content_type),
+            Some(ContentType::Other(6))
+        );
+    }
+
+    #[test]
+    fn default_content_type_omits_metainfo() {
+        // No content_type set → Blob default → no MetaInfo on the wire.
+        let wire = DataBuilder::new("/t", b"x").build();
+        let data = Data::decode(wire).unwrap();
+        assert!(data.meta_info().is_none(), "Blob default must omit MetaInfo");
     }
 
     #[test]
