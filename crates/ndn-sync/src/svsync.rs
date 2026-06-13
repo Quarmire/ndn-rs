@@ -66,6 +66,14 @@ pub trait DataStore: Send + Sync {
     fn insert(&self, name: Name, wire: Bytes);
     /// Return the encoded Data previously stored under `name`.
     fn get(&self, name: &Name) -> Option<Bytes>;
+    /// Return the lexicographically-smallest stored Data whose name has
+    /// `prefix` as a prefix — the answer to a `CanBePrefix` Interest
+    /// (e.g. a seq-name Interest matching that seq's segment 0). The
+    /// default scans nothing; [`MemoryStore`] overrides it.
+    fn find_under(&self, prefix: &Name) -> Option<Bytes> {
+        let _ = prefix;
+        None
+    }
 }
 
 /// In-memory [`DataStore`]. The default; persistent stores (e.g. an
@@ -100,9 +108,19 @@ impl DataStore for MemoryStore {
     fn get(&self, name: &Name) -> Option<Bytes> {
         self.map.read().expect("MemoryStore poisoned").get(name).cloned()
     }
+
+    fn find_under(&self, prefix: &Name) -> Option<Bytes> {
+        let map = self.map.read().expect("MemoryStore poisoned");
+        map.iter()
+            .filter(|(name, _)| name.has_prefix(prefix))
+            .min_by(|(a, _), (b, _)| a.cmp(b))
+            .map(|(_, wire)| wire.clone())
+    }
 }
 
-type PendingMap = Arc<Mutex<HashMap<Name, oneshot::Sender<Bytes>>>>;
+/// A pending fetch: whether the Interest was `CanBePrefix` (so the reply
+/// name may extend the request name) and the delivery channel.
+type PendingMap = Arc<Mutex<HashMap<Name, (bool, oneshot::Sender<Bytes>)>>>;
 
 /// Tunables for the data plane on top of [`SvsConfig`].
 #[derive(Clone, Debug)]
@@ -115,6 +133,10 @@ pub struct SvSyncConfig {
     /// Max in-flight fetch Interests in [`SvSync::fetch_range`]
     /// (ndn-svs `Fetcher` window = 10).
     pub fetch_window: usize,
+    /// Max payload bytes per segment; a larger publication is split into
+    /// `<node>/<group>/<seq>/v=0/seg=i` segments (ndn-svs
+    /// `MAX_DATA_SIZE = 8000`).
+    pub max_segment_size: usize,
 }
 
 impl Default for SvSyncConfig {
@@ -124,6 +146,7 @@ impl Default for SvSyncConfig {
             data_freshness: Duration::from_secs(4),
             fetch_timeout: Duration::from_secs(4),
             fetch_window: 10,
+            max_segment_size: 8000,
         }
     }
 }
@@ -256,6 +279,113 @@ impl SvSync {
         Ok(seq)
     }
 
+    /// Publish a multi-segment object under one sequence number: each
+    /// `segments[i]` becomes outer Data named
+    /// `<node>/<group>/<seq>/v=0/seg=i` carrying a `FinalBlockId`
+    /// (ndn-svs `insertDataSegment`). `make_mapping` receives the seq for
+    /// the piggyback. Returns the assigned seq. A consumer fetches it with
+    /// [`Self::fetch_publication`].
+    pub async fn publish_segments_with_mapping(
+        &self,
+        segments: &[Vec<u8>],
+        make_mapping: impl FnOnce(u64) -> Option<Bytes>,
+    ) -> Result<u64, SyncError> {
+        let seq = self.seq.fetch_add(1, Ordering::AcqRel) + 1;
+        let base = svs_data_name(&self.node, &self.group, seq);
+        let last = segments.len().saturating_sub(1) as u64;
+        for (i, seg) in segments.iter().enumerate() {
+            let name = base.clone().append_version(0).append_segment(i as u64);
+            let wire = DataBuilder::new(name.clone(), seg)
+                .freshness(self.data_freshness)
+                .final_block_id_typed_seg(last)
+                .build();
+            self.store.insert(name, wire);
+        }
+        match make_mapping(seq) {
+            Some(mapping) => self.handle.publish_with_mapping(self.node.clone(), mapping).await?,
+            None => self.handle.publish(self.node.clone()).await?,
+        }
+        Ok(seq)
+    }
+
+    /// Fetch a publication's outer-segment contents in order. Fetches the
+    /// seq name with `CanBePrefix` so segment 0 answers whether the
+    /// publication is single (`<node>/<group>/<seq>`) or segmented
+    /// (`…/v=0/seg=0`); a `FinalBlockId` then drives the remaining
+    /// segment fetches (windowed). Returns one element for an unsegmented
+    /// publication. `None` if segment 0 can't be retrieved.
+    pub async fn fetch_publication(&self, node: &Name, seq: u64) -> Option<Vec<Bytes>> {
+        let seq_name = svs_data_name(node, &self.group, seq);
+        let first_wire = express_with_retry_cbp(
+            seq_name.clone(),
+            true,
+            &self.net_out,
+            &self.pending,
+            &self.retry,
+            self.fetch_timeout,
+        )
+        .await?;
+        let first = Data::decode(first_wire).ok()?;
+        let first_content = first.content().cloned().unwrap_or_default();
+
+        // Unsegmented: the reply is the bare seq name itself.
+        let seg_count = match first
+            .meta_info()
+            .and_then(|m| m.final_block_component())
+            .and_then(|r| r.ok())
+            .and_then(|c| c.as_segment())
+        {
+            Some(last) => last + 1,
+            None => return Some(vec![first_content]),
+        };
+        if seg_count <= 1 {
+            return Some(vec![first_content]);
+        }
+
+        // Segmented: collect seg 0 (in hand), fetch 1..last (windowed).
+        let base = seq_name.append_version(0);
+        let rest = self.fetch_segments(&base, 1, seg_count - 1).await;
+        let mut out = Vec::with_capacity(seg_count as usize);
+        out.push(first_content);
+        for seg in rest {
+            out.push(seg?);
+        }
+        Some(out)
+    }
+
+    /// Windowed fetch of explicit segments `base/seg=lo..=hi`.
+    async fn fetch_segments(&self, base: &Name, lo: u64, hi: u64) -> Vec<Option<Bytes>> {
+        let sem = Arc::new(Semaphore::new(self.fetch_window.max(1)));
+        let (res_tx, mut res_rx) = mpsc::channel::<(u64, Option<Bytes>)>((hi - lo + 1) as usize);
+        for s in lo..=hi {
+            let permit = Arc::clone(&sem).acquire_owned().await.expect("semaphore");
+            let name = base.clone().append_segment(s);
+            let net_out = self.net_out.clone();
+            let pending = Arc::clone(&self.pending);
+            let retry = self.retry.clone();
+            let timeout = self.fetch_timeout;
+            let res_tx = res_tx.clone();
+            rt::spawn(async move {
+                let _permit = permit;
+                let payload = express_with_retry(name, &net_out, &pending, &retry, timeout)
+                    .await
+                    .and_then(|wire| {
+                        Data::decode(wire)
+                            .ok()
+                            .map(|d| d.content().cloned().unwrap_or_default())
+                    });
+                let _ = res_tx.send((s, payload)).await;
+            });
+        }
+        drop(res_tx);
+        let mut out: Vec<(u64, Option<Bytes>)> = Vec::new();
+        while let Some(item) = res_rx.recv().await {
+            out.push(item);
+        }
+        out.sort_by_key(|(s, _)| *s);
+        out.into_iter().map(|(_, p)| p).collect()
+    }
+
     /// Fetch one publication's payload, with windowed-equivalent retry.
     pub async fn fetch(&self, node: &Name, seq: u64) -> Option<Bytes> {
         let name = svs_data_name(node, &self.group, seq);
@@ -377,8 +507,22 @@ fn spawn_demux(
                 0x06 => {
                     if let Ok(data) = Data::decode(raw.clone()) {
                         let name = (*data.name).clone();
-                        let waiter = pending.lock().await.remove(&name);
-                        if let Some(tx) = waiter {
+                        let waiter = {
+                            let mut p = pending.lock().await;
+                            // Exact match first; else a CanBePrefix waiter
+                            // whose request name is a prefix of this Data
+                            // name (a seq-name Interest answered by seg 0).
+                            if let Some(slot) = p.remove(&name) {
+                                Some(slot)
+                            } else {
+                                let key = p
+                                    .iter()
+                                    .find(|(k, (cbp, _))| *cbp && name.has_prefix(k))
+                                    .map(|(k, _)| k.clone());
+                                key.and_then(|k| p.remove(&k))
+                            }
+                        };
+                        if let Some((_, tx)) = waiter {
                             let _ = tx.send(raw);
                         }
                     }
@@ -394,10 +538,18 @@ fn spawn_demux(
                         && comps[group_len].as_version() == Some(2);
                     if is_sync {
                         let _ = core_in_tx.send(raw).await;
-                    } else if interest.name.has_prefix(&data_prefix)
-                        && let Some(wire) = store.get(&interest.name)
-                    {
-                        let _ = net_out.send(wire).await;
+                    } else if interest.name.has_prefix(&data_prefix) {
+                        // Exact name, else the CanBePrefix child (seg 0).
+                        let served = store.get(&interest.name).or_else(|| {
+                            interest
+                                .selectors()
+                                .can_be_prefix
+                                .then(|| store.find_under(&interest.name))
+                                .flatten()
+                        });
+                        if let Some(wire) = served {
+                            let _ = net_out.send(wire).await;
+                        }
                     }
                 }
                 _ => {}
@@ -407,21 +559,25 @@ fn spawn_demux(
 }
 
 /// One fetch attempt: register a waiter, express the Interest, await the
-/// Data (or time out).
+/// Data (or time out). `can_be_prefix` lets the reply name extend `name`
+/// (used to fetch a publication's segment 0 by its seq name).
 async fn express_once(
     name: Name,
+    can_be_prefix: bool,
     net_out: &mpsc::Sender<Bytes>,
     pending: &PendingMap,
     timeout: Duration,
 ) -> Option<Bytes> {
     let (tx, rx) = oneshot::channel();
-    pending.lock().await.insert(name.clone(), tx);
+    pending.lock().await.insert(name.clone(), (can_be_prefix, tx));
 
-    let interest = InterestBuilder::new(name.clone())
+    let mut builder = InterestBuilder::new(name.clone())
         .must_be_fresh()
-        .lifetime(timeout)
-        .build();
-    if net_out.send(interest).await.is_err() {
+        .lifetime(timeout);
+    if can_be_prefix {
+        builder = builder.can_be_prefix();
+    }
+    if net_out.send(builder.build()).await.is_err() {
         pending.lock().await.remove(&name);
         return None;
     }
@@ -443,9 +599,23 @@ async fn express_with_retry(
     retry: &RetryPolicy,
     timeout: Duration,
 ) -> Option<Bytes> {
+    express_with_retry_cbp(name, false, net_out, pending, retry, timeout).await
+}
+
+/// [`express_with_retry`] with an explicit `CanBePrefix` flag.
+async fn express_with_retry_cbp(
+    name: Name,
+    can_be_prefix: bool,
+    net_out: &mpsc::Sender<Bytes>,
+    pending: &PendingMap,
+    retry: &RetryPolicy,
+    timeout: Duration,
+) -> Option<Bytes> {
     let mut delay = retry.base_delay;
     for attempt in 0..=retry.max_retries {
-        if let Some(wire) = express_once(name.clone(), net_out, pending, timeout).await {
+        if let Some(wire) =
+            express_once(name.clone(), can_be_prefix, net_out, pending, timeout).await
+        {
             return Some(wire);
         }
         if attempt < retry.max_retries {
@@ -487,6 +657,61 @@ mod tests {
         assert_eq!(s.get(&name("/d/1")).as_deref(), Some(&b"wire"[..]));
         assert_eq!(s.get(&name("/d/2")), None);
         assert_eq!(s.len(), 1);
+    }
+
+    #[test]
+    fn find_under_returns_smallest_prefixed() {
+        // CanBePrefix on the seq name must resolve to segment 0.
+        let s = MemoryStore::new();
+        let seq = name("/n/g/5");
+        s.insert(seq.clone().append_version(0).append_segment(2), Bytes::from_static(b"s2"));
+        s.insert(seq.clone().append_version(0).append_segment(0), Bytes::from_static(b"s0"));
+        s.insert(seq.clone().append_version(0).append_segment(1), Bytes::from_static(b"s1"));
+        assert_eq!(s.find_under(&seq).as_deref(), Some(&b"s0"[..]));
+        // No prefixed entry → None.
+        assert_eq!(s.find_under(&name("/n/g/6")), None);
+    }
+
+    #[tokio::test]
+    async fn publish_segments_names_and_final_block() {
+        // publish_segments stores one Data per segment under
+        // <node>/<group>/<seq>/v=0/seg=i, each carrying FinalBlockId.
+        let group = name("/app/seg");
+        let node = name("/app/seg/n");
+        let (out_tx, _out_rx) = mpsc::channel::<Bytes>(256);
+        let (_in_tx, in_rx) = mpsc::channel::<Bytes>(256);
+        let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
+        let svs = SvSync::join(
+            group.clone(),
+            node.clone(),
+            Arc::clone(&store),
+            out_tx,
+            in_rx,
+            SvSyncConfig::default(),
+        );
+
+        let segs = vec![b"aaa".to_vec(), b"bbb".to_vec(), b"ccc".to_vec()];
+        let seq = svs
+            .publish_segments_with_mapping(&segs, |_| None)
+            .await
+            .expect("publish_segments");
+        assert_eq!(seq, 1);
+
+        let base = svs_data_name(&node, &group, seq).append_version(0);
+        for (i, expect) in segs.iter().enumerate() {
+            let wire = store
+                .get(&base.clone().append_segment(i as u64))
+                .unwrap_or_else(|| panic!("segment {i} stored"));
+            let data = Data::decode(wire).expect("decode segment");
+            assert_eq!(data.content().map(|c| c.as_ref()), Some(expect.as_slice()));
+            // FinalBlockId = seg=2 on every segment.
+            let fb = data
+                .meta_info()
+                .and_then(|m| m.final_block_component())
+                .and_then(|r| r.ok())
+                .and_then(|c| c.as_segment());
+            assert_eq!(fb, Some(2), "segment {i} FinalBlockId");
+        }
     }
 
     /// Two SvSync nodes wired through an in-memory broker: A publishes,

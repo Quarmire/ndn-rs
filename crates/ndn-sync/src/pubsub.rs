@@ -20,6 +20,15 @@
 //! `ContentType = Data`; ndn-rs detects encapsulation structurally, so
 //! the marker is an interop nicety, not required here.)
 //!
+//! Segmentation: a blob larger than
+//! [`SvSyncConfig::max_segment_size`](crate::svsync::SvSyncConfig) is
+//! split into inner `Data` segments named `<app>/v=0/seg=i` (each with a
+//! `FinalBlockId`), published as the outer segments of one seq via
+//! [`SvSync::publish_segments_with_mapping`]. The subscriber fetches the
+//! seq with `CanBePrefix` (so segment 0 answers whether it's a single or
+//! segmented publication) and reassembles — see
+//! [`SvSync::fetch_publication`].
+//!
 //! Wiring mirrors [`SvSync`]: hand [`SvsPubSub::join`] one outbound and
 //! one inbound `mpsc<Bytes>`. It interposes a thin demux that answers
 //! mapping queries and routes mapping-query replies, forwarding all other
@@ -29,7 +38,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
@@ -62,6 +71,7 @@ pub struct SvsPubSub {
     subs: SubList,
     seq: AtomicU64,
     fetch_timeout: std::time::Duration,
+    max_segment_size: usize,
     cancel: CancellationToken,
 }
 
@@ -121,6 +131,7 @@ impl SvsPubSub {
             subs: Arc::clone(&subs),
             seq: AtomicU64::new(0),
             fetch_timeout: config.fetch_timeout,
+            max_segment_size: config.max_segment_size.max(1),
             cancel: cancel.clone(),
         };
 
@@ -131,25 +142,52 @@ impl SvsPubSub {
     }
 
     /// Publish `blob` under the application name `app_name`. Returns the
-    /// assigned sequence number.
+    /// assigned sequence number. A blob larger than
+    /// [`SvSyncConfig::max_segment_size`](crate::svsync::SvSyncConfig) is
+    /// split into `<app_name>/v=0/seg=i` segments (one seq); the consumer
+    /// reassembles them transparently.
     pub async fn publish(&self, app_name: Name, blob: &[u8]) -> Result<u64, SyncError> {
-        // Inner Data: <app_name> → blob. This packet is the content of
-        // the outer per-seq SvSync publication.
-        let inner = DataBuilder::new(app_name.clone(), blob).build();
         let node = self.node.clone();
         let mappings = Arc::clone(&self.mappings);
         let app_for_map = app_name.clone();
+        let make_mapping = move |seq: u64| {
+            // Record locally and piggyback this publication's mapping.
+            mappings.insert(&node, seq, app_for_map.clone());
+            let mut list = MappingList::new(node.clone());
+            list.pairs.push((seq, app_for_map.clone()));
+            Some(list.encode())
+        };
 
-        let seq = self
-            .svsync
-            .publish_data_with_mapping(&inner, move |seq| {
-                // Record locally and piggyback this publication's mapping.
-                mappings.insert(&node, seq, app_for_map.clone());
-                let mut list = MappingList::new(node.clone());
-                list.pairs.push((seq, app_for_map.clone()));
-                Some(list.encode())
-            })
-            .await?;
+        let seq = if blob.len() <= self.max_segment_size {
+            // Single inner Data <app_name> → blob, encapsulated as the
+            // content of the outer per-seq publication.
+            let inner = DataBuilder::new(app_name.clone(), blob).build();
+            self.svsync
+                .publish_data_with_mapping(&inner, make_mapping)
+                .await?
+        } else {
+            // Segment: each chunk is an inner Data <app_name>/v=0/seg=i,
+            // and those inner wires are the outer segment contents.
+            let n = blob.len().div_ceil(self.max_segment_size);
+            let last = (n - 1) as u64;
+            let segments: Vec<Vec<u8>> = blob
+                .chunks(self.max_segment_size)
+                .enumerate()
+                .map(|(i, chunk)| {
+                    let seg_name = app_name
+                        .clone()
+                        .append_version(0)
+                        .append_segment(i as u64);
+                    DataBuilder::new(seg_name, chunk)
+                        .final_block_id_typed_seg(last)
+                        .build()
+                        .to_vec()
+                })
+                .collect();
+            self.svsync
+                .publish_segments_with_mapping(&segments, make_mapping)
+                .await?
+        };
         let _ = self.seq.fetch_add(1, Ordering::AcqRel);
         Ok(seq)
     }
@@ -237,13 +275,19 @@ impl SvsPubSub {
                         continue;
                     }
 
-                    // Fetch the outer seq data; its content is the inner
-                    // Data packet — decapsulate to the real payload.
-                    let Some(inner_wire) = svsync.fetch(&publisher, seq).await else {
+                    // Fetch the publication (1 segment for a small blob,
+                    // N for a large one). Each outer-segment content is an
+                    // inner Data packet; decapsulate and reassemble.
+                    let Some(outer_contents) = svsync.fetch_publication(&publisher, seq).await
+                    else {
                         continue;
                     };
-                    let Some(pubn) = decapsulate(&inner_wire) else {
+                    let Some(payload) = reassemble(&outer_contents) else {
                         continue;
+                    };
+                    let pubn = Publication {
+                        name: app_name.clone(),
+                        payload,
                     };
                     for tx in interested {
                         let _ = tx.send(pubn.clone()).await;
@@ -260,14 +304,22 @@ impl Drop for SvsPubSub {
     }
 }
 
-/// Decode the inner Data packet (a publication's content) into a
-/// [`Publication`].
-fn decapsulate(inner_wire: &Bytes) -> Option<Publication> {
-    let data = Data::decode(inner_wire.clone()).ok()?;
-    Some(Publication {
-        name: (*data.name).clone(),
-        payload: data.content().cloned().unwrap_or_default(),
-    })
+/// Decapsulate each outer-segment content (an inner `Data` packet) and
+/// concatenate their contents into the full publication payload. Returns
+/// `None` if any segment fails to decode as a `Data`.
+fn reassemble(outer_contents: &[Bytes]) -> Option<Bytes> {
+    if outer_contents.len() == 1 {
+        let data = Data::decode(outer_contents[0].clone()).ok()?;
+        return Some(data.content().cloned().unwrap_or_default());
+    }
+    let mut buf = BytesMut::new();
+    for oc in outer_contents {
+        let data = Data::decode(oc.clone()).ok()?;
+        if let Some(c) = data.content() {
+            buf.extend_from_slice(c);
+        }
+    }
+    Some(buf.freeze())
 }
 
 /// Express a `MAPPING/<seq>/<seq>` query and ingest the reply.
@@ -388,6 +440,10 @@ mod tests {
     }
 
     fn cfg() -> SvSyncConfig {
+        cfg_seg(8000)
+    }
+
+    fn cfg_seg(max_segment_size: usize) -> SvSyncConfig {
         SvSyncConfig {
             svs: crate::SvsConfig {
                 sync_interval: Duration::from_millis(50),
@@ -395,8 +451,71 @@ mod tests {
                 ..Default::default()
             },
             fetch_timeout: Duration::from_secs(2),
+            max_segment_size,
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn large_blob_segments_and_reassembles() {
+        // A blob far bigger than max_segment_size must split into many
+        // <app>/v=0/seg=i segments and reassemble byte-exact on the
+        // subscriber side.
+        let group = n("/app/big");
+        let pa = n("/app/big/prod");
+        let cb = n("/app/big/cons");
+
+        let (a_out_tx, a_out_rx) = mpsc::channel::<Bytes>(256);
+        let (a_in_tx, a_in_rx) = mpsc::channel::<Bytes>(256);
+        let (b_out_tx, b_out_rx) = mpsc::channel::<Bytes>(256);
+        let (b_in_tx, b_in_rx) = mpsc::channel::<Bytes>(256);
+        wire_broker(a_out_rx, b_in_tx);
+        wire_broker(b_out_rx, a_in_tx);
+
+        // 16-byte segments → a 1000-byte blob is 63 segments.
+        let producer = SvsPubSub::join(group.clone(), pa.clone(), a_out_tx, a_in_rx, cfg_seg(16));
+        let consumer = SvsPubSub::join(group.clone(), cb.clone(), b_out_tx, b_in_rx, cfg_seg(16));
+        let mut rx = consumer.subscribe(n("/files")).await;
+
+        let blob: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
+        producer
+            .publish(n("/files/big.bin"), &blob)
+            .await
+            .expect("publish large");
+
+        let got = tokio::time::timeout(Duration::from_secs(8), rx.recv())
+            .await
+            .expect("timed out")
+            .expect("publication");
+        assert_eq!(got.name, n("/files/big.bin"));
+        assert_eq!(got.payload.len(), blob.len(), "reassembled length");
+        assert_eq!(got.payload.as_ref(), blob.as_slice(), "byte-exact reassembly");
+    }
+
+    #[tokio::test]
+    async fn boundary_blob_exactly_one_segment() {
+        // A blob == max_segment_size stays single-segment (<= boundary).
+        let group = n("/app/edge");
+        let pa = n("/app/edge/p");
+        let cb = n("/app/edge/c");
+        let (a_out_tx, a_out_rx) = mpsc::channel::<Bytes>(256);
+        let (a_in_tx, a_in_rx) = mpsc::channel::<Bytes>(256);
+        let (b_out_tx, b_out_rx) = mpsc::channel::<Bytes>(256);
+        let (b_in_tx, b_in_rx) = mpsc::channel::<Bytes>(256);
+        wire_broker(a_out_rx, b_in_tx);
+        wire_broker(b_out_rx, a_in_tx);
+
+        let producer = SvsPubSub::join(group.clone(), pa, a_out_tx, a_in_rx, cfg_seg(32));
+        let consumer = SvsPubSub::join(group.clone(), cb, b_out_tx, b_in_rx, cfg_seg(32));
+        let mut rx = consumer.subscribe(n("/d")).await;
+
+        let blob = vec![7u8; 32];
+        producer.publish(n("/d/exact"), &blob).await.expect("publish");
+        let got = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timed out")
+            .expect("publication");
+        assert_eq!(got.payload, Bytes::from(blob));
     }
 
     #[tokio::test]
