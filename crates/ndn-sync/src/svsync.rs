@@ -374,7 +374,23 @@ impl SvSync {
     /// Unlike [`Self::fetch_publication`] (which returns decoded *content*),
     /// this keeps the signed wire so it can be re-served byte-for-byte.
     pub async fn ingest_publication(&self, node: &Name, seq: u64) -> usize {
-        let seq_name = svs_data_name(node, &self.group, seq);
+        self.ingest_from(svs_data_name(node, &self.group, seq)).await
+    }
+
+    /// Like [`Self::ingest_publication`] but for an arbitrary blob name (the
+    /// ndnd `BlobFetch`-by-name path). Fetches `name` and stores its raw
+    /// wire(s) so the node re-serves it.
+    pub async fn ingest_name(&self, name: &Name) -> usize {
+        self.ingest_from(name.clone()).await
+    }
+
+    async fn ingest_from(&self, seq_name: Name) -> usize {
+        // Resume / idempotence: if any Data under this publication is already
+        // stored (e.g. ingested before a restart, from a durable store), skip
+        // the re-fetch. The durable store *is* the resume state.
+        if self.store.find_under(&seq_name).is_some() {
+            return 0;
+        }
         let Some(first_wire) = express_with_retry_cbp(
             seq_name.clone(),
             true,
@@ -990,5 +1006,10 @@ mod tests {
         let wire = store_b.get(&data_name).expect("repo persisted the raw wire");
         let data = Data::decode(wire).expect("stored wire is a valid Data");
         assert_eq!(data.content().unwrap().as_ref(), b"durable-payload");
+
+        // Resume / idempotence: re-ingesting an already-stored publication is a
+        // no-op (no re-fetch) — the durable store is the resume state.
+        let again = svs_b.ingest_publication(&na, 1).await;
+        assert_eq!(again, 0, "already-stored publication must not be re-fetched");
     }
 }
