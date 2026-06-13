@@ -30,7 +30,151 @@ use ndn_packet::encode::{DataBuilder, InterestBuilder};
 use crate::murmur3::{N_HASHCHECK, murmur3_x86_32};
 use crate::protocol::{SyncHandle, SyncUpdate};
 use crate::psync::{Ibf, PSyncNode};
-use crate::rt;
+use crate::rt::{self, Instant};
+use crate::tlv::{decode_nni, encode_nni};
+
+/// Generic NameComponent TLV-TYPE (0x08) — the component a PSync `seq`
+/// rides in (`appendNumber`).
+const T_GENERIC: u64 = 0x08;
+
+/// Split a published/learned name into `(prefix, seq)` when it ends with a
+/// generic NonNegativeInteger component (the PSync `<prefix>/<seq>`
+/// convention, ndn-cxx `appendNumber`). `None` for an unversioned name.
+fn parse_prefix_seq(name: &Name) -> Option<(Name, u64)> {
+    let comps = name.components();
+    let last = comps.last()?;
+    if last.typ != T_GENERIC || !matches!(last.value.len(), 1 | 2 | 4 | 8) {
+        return None;
+    }
+    let seq = decode_nni(&last.value);
+    let prefix = Name::from_components(comps[..comps.len() - 1].iter().cloned());
+    Some((prefix, seq))
+}
+
+/// `prefix/<seq-as-generic-NNI>` — inverse of [`parse_prefix_seq`].
+fn append_seq(prefix: &Name, seq: u64) -> Name {
+    prefix.clone().append_component(ndn_packet::NameComponent::generic(Bytes::from(
+        encode_nni(seq),
+    )))
+}
+
+/// PSync `ProducerBase` (C++ `PSync/producer-base.cpp`): a **bounded**,
+/// latest-version set. For a versioned name `<prefix>/<seq>`, publishing
+/// or learning a newer seq erases `<prefix>/<oldSeq>` from the IBLT and
+/// inserts `<prefix>/<seq>` — so the set is bounded by the number of
+/// prefixes, not the total publication count (audit #1). The hash→name
+/// table makes every learned name relay-capable (audit #4): a node can
+/// answer a reconcile with names it learned from peers, not just its own.
+struct ProducerBase {
+    node: PSyncNode,
+    /// prefix (sans seq) → latest seq.
+    prefixes: HashMap<Name, u64>,
+    /// IBLT hash → the full `<prefix>/<seq>` name (relay-capable).
+    hash2name: HashMap<u32, Name>,
+    /// `<prefix>/<seq>` name → IBLT hash (for erase).
+    name2hash: HashMap<Name, u32>,
+    /// Optional per-name application mapping (in-process fast-path).
+    mappings: HashMap<u32, Bytes>,
+    /// Cumulative element count carried in the Sync Interest
+    /// (C++ `m_numOwnElements`; drives the decode-failure heuristic).
+    num_own_elements: u64,
+}
+
+impl ProducerBase {
+    fn new(ibf_count: usize) -> Self {
+        Self {
+            node: PSyncNode::new(ibf_count),
+            prefixes: HashMap::new(),
+            hash2name: HashMap::new(),
+            name2hash: HashMap::new(),
+            mappings: HashMap::new(),
+            num_own_elements: 0,
+        }
+    }
+
+    /// Insert/supersede a name. Returns `Some((reported_name, low, high))`
+    /// when the set actually advanced; `None` for a stale or duplicate
+    /// name. For a versioned name the old version is erased first.
+    fn apply(&mut self, name: &Name, mapping: Option<Bytes>) -> Option<(Name, u64, u64)> {
+        match parse_prefix_seq(name) {
+            Some((prefix, seq)) => {
+                let old = self.prefixes.get(&prefix).copied().unwrap_or(0);
+                if seq <= old {
+                    return None; // stale / duplicate
+                }
+                if old != 0 {
+                    let old_name = append_seq(&prefix, old);
+                    if let Some(h) = self.name2hash.remove(&old_name) {
+                        self.node.remove(h);
+                        self.hash2name.remove(&h);
+                        self.mappings.remove(&h);
+                    }
+                }
+                let h = hash_name(name);
+                self.node.insert(h);
+                self.hash2name.insert(h, name.clone());
+                self.name2hash.insert(name.clone(), h);
+                if let Some(m) = mapping {
+                    self.mappings.insert(h, m);
+                }
+                self.prefixes.insert(prefix, seq);
+                self.num_own_elements += seq - old;
+                Some((name.clone(), old + 1, seq))
+            }
+            None => {
+                // Unversioned name: insert once (no version churn).
+                let h = hash_name(name);
+                if self.node.contains(h) {
+                    return None;
+                }
+                self.node.insert(h);
+                self.hash2name.insert(h, name.clone());
+                self.name2hash.insert(name.clone(), h);
+                if let Some(m) = mapping {
+                    self.mappings.insert(h, m);
+                }
+                self.num_own_elements += 1;
+                Some((name.clone(), 0, 0))
+            }
+        }
+    }
+
+    fn names_for_hashes(&self, hashes: &std::collections::HashSet<u32>) -> Vec<Name> {
+        hashes
+            .iter()
+            .filter_map(|h| self.hash2name.get(h).cloned())
+            .collect()
+    }
+
+    /// The whole current set (decode-failure full-state response).
+    fn state_names(&self) -> Vec<Name> {
+        self.hash2name.values().cloned().collect()
+    }
+
+    fn build_ibf(&self) -> Ibf {
+        self.node.build_ibf()
+    }
+
+    fn reconcile(
+        &self,
+        peer: &Ibf,
+    ) -> Option<(std::collections::HashSet<u32>, std::collections::HashSet<u32>)> {
+        self.node.reconcile(peer)
+    }
+
+    fn mapping_for(&self, name: &Name) -> Option<Bytes> {
+        self.name2hash
+            .get(name)
+            .and_then(|h| self.mappings.get(h).cloned())
+    }
+}
+
+/// A held Sync Interest (no diff at receipt). Satisfied when a later
+/// publish/learn makes our set differ from `peer_ibf` (audit #3).
+struct PendingEntry {
+    peer_ibf: Ibf,
+    expires_at: Instant,
+}
 
 #[derive(Clone, Debug)]
 pub struct PSyncConfig {
@@ -103,6 +247,10 @@ pub fn join_psync_group(
     SyncHandle::new(update_rx, publish_tx, cancel)
 }
 
+/// How long a no-diff Sync Interest is held before expiry (≈ the Interest
+/// lifetime we emit). On a later publish/learn it's satisfied early.
+const PENDING_LIFETIME: Duration = Duration::from_millis(1100);
+
 async fn psync_task(
     group: Name,
     send: mpsc::Sender<Bytes>,
@@ -112,8 +260,8 @@ async fn psync_task(
     config: PSyncConfig,
     cancel: CancellationToken,
 ) {
-    let mut node = PSyncNode::new(config.ibf_count);
-    let mut name_map: HashMap<u32, (Name, Option<Bytes>)> = HashMap::new();
+    let mut pb = ProducerBase::new(config.ibf_count);
+    let mut pending: HashMap<Name, PendingEntry> = HashMap::new();
 
     loop {
         let jitter = Duration::from_millis(fastrand::u64(0..=config.jitter_ms));
@@ -123,108 +271,160 @@ async fn psync_task(
             _ = cancel.cancelled() => break,
 
             _ = rt::sleep(interval) => {
-                send_sync_interest(&group, &node, &send).await;
+                let now = Instant::now();
+                pending.retain(|_, e| e.expires_at > now);
+                send_sync_interest(&group, &pb, &send).await;
             }
 
             Some(inbound) = recv.recv() => {
                 let raw = inbound.bytes;
                 let reply = inbound.reply;
-                tracing::trace!(target: "sync.psync", len=raw.len(), first_byte=format_args!("{:02x}", raw.first().copied().unwrap_or(0)), reply=reply.is_some(), "psync: recv");
                 if raw.len() > 2 && raw[0] == 0x06 {
-                    match parse_sync_data_names(&raw) {
-                        Some(names) => {
-                            tracing::debug!(target: "sync.psync", count=names.len(), "psync: parsed Sync Data names");
-                            for name in names {
-                                let hash = hash_name(&name);
-                                if node.contains(hash) {
-                                    tracing::trace!(target: "sync.psync", %name, "psync: skip already-known Sync Data name");
-                                    continue;
-                                }
-                                node.insert(hash);
-                                let mapping = name_map.get(&hash).and_then(|(_, m)| m.clone());
-                                let seq_no = name
-                                    .components()
-                                    .last()
-                                    .and_then(|c| c.as_sequence_num())
-                                    .unwrap_or(0);
-                                tracing::debug!(target: "sync.psync", %name, has_mapping=mapping.is_some(), "psync: emit SyncUpdate");
-                                let update = SyncUpdate {
-                                    publisher: name.to_string(),
-                                    name: name.clone(),
-                                    low_seq: seq_no,
-                                    high_seq: seq_no,
-                                    mapping,
-                                };
-                                let _ = update_tx.send(update).await;
+                    // Sync Data: learn names (relay-capable, #4) and emit updates.
+                    if let Some(names) = parse_sync_data_names(&raw) {
+                        let mut advanced = false;
+                        for name in names {
+                            if let Some((rep_name, low, high)) = pb.apply(&name, None) {
+                                advanced = true;
+                                let mapping = pb.mapping_for(&name);
+                                let publisher = parse_prefix_seq(&name)
+                                    .map(|(p, _)| p.to_string())
+                                    .unwrap_or_else(|| name.to_string());
+                                let _ = update_tx
+                                    .send(SyncUpdate {
+                                        publisher,
+                                        name: rep_name,
+                                        low_seq: low,
+                                        high_seq: high,
+                                        mapping,
+                                    })
+                                    .await;
                             }
                         }
-                        None => tracing::debug!(target: "sync.psync", "psync: Sync Data parse failed"),
+                        // Learning new names may satisfy a peer's held Interest (#3/#4).
+                        if advanced {
+                            satisfy_pending(&mut pending, &pb, &send).await;
+                        }
                     }
                 } else if raw.len() > 2 && raw[0] == 0x05 {
-                    let parsed = parse_sync_interest(&group, &raw, config.ibf_count);
-                    let (interest_name_for_reply, names_to_send) = match &parsed {
-                        Some((peer_ibf, num_elems, interest_name)) => {
-                            tracing::debug!(target: "sync.psync", num_elems=*num_elems, %interest_name, "psync: parsed Sync Interest");
-                            match node.reconcile(peer_ibf) {
-                                Some((we_have, they_have)) => {
-                                    tracing::debug!(target: "sync.psync", we_have=we_have.len(), they_have=they_have.len(), "psync: reconcile result");
-                                    let names: Vec<Name> = we_have
-                                        .iter()
-                                        .filter_map(|&h| name_map.get(&h).map(|(n, _)| n.clone()))
-                                        .collect();
-                                    (Some(interest_name.clone()), names)
-                                }
-                                None => {
-                                    tracing::debug!(target: "sync.psync", "psync: reconcile returned None (IBF mismatch?)");
-                                    (Some(interest_name.clone()), Vec::new())
-                                }
-                            }
-                        }
-                        None => {
-                            tracing::debug!(target: "sync.psync", "psync: Sync Interest parse failed (IBF decode?)");
-                            (None, Vec::new())
-                        }
-                    };
-
-                    // CallbackFace direct-reply Interests must receive
-                    // *some* Data — otherwise the face returns NoRoute
-                    // Nack and the C++ PSync peer stops sending us
-                    // further Sync Interests. We send an empty
-                    // PSyncContent when there's no positive diff.
-                    if let Some(reply_tx) = reply {
-                        if let Some(interest_name) = interest_name_for_reply {
-                            tracing::debug!(target: "sync.psync", count=names_to_send.len(), "psync: direct-reply Sync Data");
-                            let data_bytes = encode_sync_data_names(&interest_name, &names_to_send);
-                            let _ = reply_tx.send(data_bytes);
-                        }
-                    } else if let (Some(interest_name), false) = (
-                        interest_name_for_reply,
-                        names_to_send.is_empty(),
-                    ) {
-                        tracing::debug!(target: "sync.psync", count=names_to_send.len(), "psync: sending Sync Data with names we_have");
-                        let data_bytes = encode_sync_data_names(&interest_name, &names_to_send);
-                        let _ = send.send(data_bytes).await;
-                    }
+                    handle_sync_interest(&group, &raw, &config, &pb, &mut pending, &send, reply).await;
                 }
             }
 
             Some((pub_name, mapping)) = publish_rx.recv() => {
-                let hash = hash_name(&pub_name);
-                node.insert(hash);
-                name_map.insert(hash, (pub_name, mapping));
-                send_sync_interest(&group, &node, &send).await;
+                if pb.apply(&pub_name, mapping).is_some() {
+                    satisfy_pending(&mut pending, &pb, &send).await;
+                    send_sync_interest(&group, &pb, &send).await;
+                }
             }
         }
     }
 }
 
-async fn send_sync_interest(group: &Name, node: &PSyncNode, send: &mpsc::Sender<Bytes>) {
-    let ibf = node.build_ibf();
+/// Reply to a Sync Interest per C++ `FullProducer::onSyncInterest`:
+/// positive diff ⇒ send those names; no diff ⇒ hold a pending entry
+/// (channel path) so a later publish satisfies it (#3); decode failure ⇒
+/// if we're not behind (`num_rcvd <= num_own`), send the entire state (#2).
+/// A direct-reply (CallbackFace) Interest can't be held, so it always gets
+/// an immediate Data (names or an empty PSyncContent).
+#[allow(clippy::too_many_arguments)]
+async fn handle_sync_interest(
+    group: &Name,
+    raw: &[u8],
+    config: &PSyncConfig,
+    pb: &ProducerBase,
+    pending: &mut HashMap<Name, PendingEntry>,
+    send: &mpsc::Sender<Bytes>,
+    reply: Option<oneshot::Sender<Bytes>>,
+) {
+    let Some((peer_ibf, num_elems, interest_name)) = parse_sync_interest(group, raw, config.ibf_count)
+    else {
+        return;
+    };
+
+    enum Action {
+        Send(Vec<Name>),
+        HoldPending(Ibf),
+        Nothing,
+    }
+
+    let action = match pb.reconcile(&peer_ibf) {
+        Some((we_have, they_have)) => {
+            let names = pb.names_for_hashes(&we_have);
+            if !names.is_empty() {
+                Action::Send(names)
+            } else if they_have.is_empty() {
+                Action::HoldPending(peer_ibf) // identical sets — hold until we advance
+            } else {
+                Action::Nothing // peer is ahead; nothing to offer
+            }
+        }
+        None => {
+            // Can't decode the difference. If we're not behind, dump the
+            // whole state so the peer resynchronises (#2).
+            if num_elems <= pb.num_own_elements {
+                Action::Send(pb.state_names())
+            } else {
+                Action::Nothing
+            }
+        }
+    };
+
+    match (action, reply) {
+        (Action::Send(names), Some(tx)) => {
+            let _ = tx.send(encode_sync_data_names(&interest_name, &names));
+        }
+        (Action::Send(names), None) => {
+            if !names.is_empty() {
+                let _ = send.send(encode_sync_data_names(&interest_name, &names)).await;
+            }
+        }
+        (Action::HoldPending(ibf), None) => {
+            pending.insert(
+                interest_name,
+                PendingEntry {
+                    peer_ibf: ibf,
+                    expires_at: Instant::now() + PENDING_LIFETIME,
+                },
+            );
+        }
+        // A synchronous direct-reply face can't be held; answer empty.
+        (Action::HoldPending(_) | Action::Nothing, Some(tx)) => {
+            let _ = tx.send(encode_sync_data_names(&interest_name, &[]));
+        }
+        (Action::Nothing, None) => {}
+    }
+}
+
+/// Walk held Sync Interests; satisfy any whose recomputed diff now yields
+/// names we can send (audit #3).
+async fn satisfy_pending(
+    pending: &mut HashMap<Name, PendingEntry>,
+    pb: &ProducerBase,
+    send: &mpsc::Sender<Bytes>,
+) {
+    let mut satisfied: Vec<Name> = Vec::new();
+    for (iname, entry) in pending.iter() {
+        if let Some((we_have, _)) = pb.reconcile(&entry.peer_ibf) {
+            let names = pb.names_for_hashes(&we_have);
+            if !names.is_empty() {
+                let _ = send.send(encode_sync_data_names(iname, &names)).await;
+                satisfied.push(iname.clone());
+            }
+        }
+    }
+    for iname in satisfied {
+        pending.remove(&iname);
+    }
+}
+
+async fn send_sync_interest(group: &Name, pb: &ProducerBase, send: &mpsc::Sender<Bytes>) {
+    let ibf = pb.build_ibf();
     let ibf_bytes = encode_ibf(&ibf);
     let sync_name = group
         .clone()
         .append(ibf_bytes.as_ref())
-        .append((node.len() as u64).to_be_bytes());
+        .append(pb.num_own_elements.to_be_bytes());
     // `CanBePrefix` is required because C++ PSync replies with
     // segmented Data named `<interest-name>/<version>/<seg=0>`.
     // `MustBeFresh` is required because that Data carries a 1 s
@@ -524,6 +724,128 @@ mod tests {
         let group: Name = "/test/psync".parse().unwrap();
         let handle = join_psync_group(group, send_tx, recv_rx, PSyncConfig::default());
         handle.leave();
+    }
+
+    // ---- ProducerBase: bounded set (#1) + relay (#4) -------------------
+
+    #[test]
+    fn producer_base_set_is_bounded_per_prefix() {
+        // 100 publications under one prefix ⇒ the IBLT holds exactly one
+        // element (the latest), not 100 — the fix for the "eventual brick".
+        let mut pb = ProducerBase::new(80);
+        let prefix: Name = "/ndn/nlsr/routerA/NAME".parse().unwrap();
+        for seq in 1..=100u64 {
+            pb.apply(&append_seq(&prefix, seq), None);
+        }
+        assert_eq!(pb.node.len(), 1, "bounded set holds only the latest version");
+        assert_eq!(pb.num_own_elements, 100, "cumulative count tracks every bump");
+        assert!(pb.name2hash.contains_key(&append_seq(&prefix, 100)));
+        assert!(
+            !pb.name2hash.contains_key(&append_seq(&prefix, 99)),
+            "old version must be erased"
+        );
+    }
+
+    #[test]
+    fn producer_base_rejects_stale_and_duplicate() {
+        let mut pb = ProducerBase::new(80);
+        let p: Name = "/a/b".parse().unwrap();
+        assert!(pb.apply(&append_seq(&p, 5), None).is_some());
+        assert!(pb.apply(&append_seq(&p, 3), None).is_none(), "older rejected");
+        assert!(pb.apply(&append_seq(&p, 5), None).is_none(), "same rejected");
+        let (_, low, high) = pb.apply(&append_seq(&p, 9), None).unwrap();
+        assert_eq!((low, high), (6, 9), "range = oldStored+1 ..= new");
+    }
+
+    #[test]
+    fn learned_names_are_relay_capable() {
+        // A node that LEARNS a name (never published it) can still offer it
+        // on reconcile — transitive propagation (#4).
+        let mut learner = ProducerBase::new(80);
+        let name = append_seq(&"/peer/x".parse().unwrap(), 7);
+        learner.apply(&name, None); // learned from a peer's Sync Data
+        let empty = ProducerBase::new(80);
+        let (we_have, _) = learner.reconcile(&empty.build_ibf()).expect("decode");
+        assert_eq!(
+            learner.names_for_hashes(&we_have),
+            vec![name],
+            "learned name must be offerable"
+        );
+    }
+
+    #[test]
+    fn unversioned_name_inserted_once() {
+        let mut pb = ProducerBase::new(80);
+        let n: Name = "/plain/name".parse().unwrap();
+        assert!(pb.apply(&n, None).is_some());
+        assert!(pb.apply(&n, None).is_none(), "duplicate plain name is a no-op");
+        assert_eq!(pb.node.len(), 1);
+    }
+
+    #[test]
+    fn parse_prefix_seq_roundtrips() {
+        let p: Name = "/ndn/nlsr/routerA/NAME".parse().unwrap();
+        let n = append_seq(&p, 42);
+        let (prefix, seq) = parse_prefix_seq(&n).expect("has trailing seq");
+        assert_eq!(prefix, p);
+        assert_eq!(seq, 42);
+        // A tail whose width isn't a legal NNI (1/2/4/8 bytes) ⇒ not a
+        // seq (3-byte "xyz"). ndn-cxx `appendNumber` only emits those
+        // widths, so NLSR/C++ versioned tails always parse.
+        assert!(parse_prefix_seq(&"/a/b/xyz".parse::<Name>().unwrap()).is_none());
+    }
+
+    // ---- 2-node end-to-end: publish → reconcile → learn ----------------
+
+    #[tokio::test]
+    async fn two_nodes_converge_and_stay_bounded() {
+        let group: Name = "/test/psync".parse().unwrap();
+        let cfg = PSyncConfig {
+            sync_interval: Duration::from_millis(40),
+            jitter_ms: 0,
+            ..Default::default()
+        };
+
+        let (a_out_tx, mut a_out_rx) = mpsc::channel::<Bytes>(256);
+        let (a_in_tx, a_in_rx) = mpsc::channel::<PSyncInbound>(256);
+        let (b_out_tx, mut b_out_rx) = mpsc::channel::<Bytes>(256);
+        let (b_in_tx, b_in_rx) = mpsc::channel::<PSyncInbound>(256);
+
+        // Broker: A.out → B.in, B.out → A.in.
+        let a_in_for_b = a_in_tx.clone();
+        tokio::spawn(async move {
+            while let Some(p) = b_out_rx.recv().await {
+                let _ = a_in_for_b.send(p.into()).await;
+            }
+        });
+        let b_in_for_a = b_in_tx.clone();
+        tokio::spawn(async move {
+            while let Some(p) = a_out_rx.recv().await {
+                let _ = b_in_for_a.send(p.into()).await;
+            }
+        });
+
+        let a = join_psync_group(group.clone(), a_out_tx, a_in_rx, cfg.clone());
+        let mut b = join_psync_group(group.clone(), b_out_tx, b_in_rx, cfg);
+
+        // A publishes /p under prefix many times (versioned); B must learn
+        // the latest, and A's set must stay bounded.
+        let prefix: Name = "/test/psync/p".parse().unwrap();
+        for seq in 1..=20u64 {
+            a.publish(append_seq(&prefix, seq)).await.expect("publish");
+            tokio::time::sleep(Duration::from_millis(3)).await;
+        }
+
+        // B receives at least one SyncUpdate naming /p (the latest version).
+        let update = tokio::time::timeout(Duration::from_secs(5), b.recv())
+            .await
+            .expect("timed out")
+            .expect("update");
+        assert!(
+            update.name.has_prefix(&prefix),
+            "B should learn a /test/psync/p version, got {}",
+            update.name
+        );
     }
 
     #[test]
