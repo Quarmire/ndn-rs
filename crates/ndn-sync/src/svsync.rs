@@ -35,6 +35,7 @@ use tokio::sync::{Mutex, Semaphore, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use ndn_packet::encode::{DataBuilder, InterestBuilder};
+use ndn_packet::meta_info::ContentType;
 use ndn_packet::{Data, Interest, Name, NameComponent};
 
 use crate::protocol::{SyncError, SyncHandle, SyncUpdate};
@@ -137,6 +138,11 @@ pub struct SvSyncConfig {
     /// `<node>/<group>/<seq>/v=0/seg=i` segments (ndn-svs
     /// `MAX_DATA_SIZE = 8000`).
     pub max_segment_size: usize,
+    /// `ContentType` stamped on published (outer) Data. `None` = Blob
+    /// (omitted). [`crate::pubsub::SvsPubSub`] sets `ContentType::Other(6)`
+    /// (ndn-svs `tlv::Data`) to mark that the content *encapsulates*
+    /// another Data packet.
+    pub content_type: Option<ContentType>,
 }
 
 impl Default for SvSyncConfig {
@@ -147,6 +153,7 @@ impl Default for SvSyncConfig {
             fetch_timeout: Duration::from_secs(4),
             fetch_window: 10,
             max_segment_size: 8000,
+            content_type: None,
         }
     }
 }
@@ -165,6 +172,7 @@ pub struct SvSync {
     fetch_timeout: Duration,
     fetch_window: usize,
     data_freshness: Duration,
+    content_type: Option<ContentType>,
     cancel: CancellationToken,
 }
 
@@ -244,7 +252,17 @@ impl SvSync {
             fetch_timeout: config.fetch_timeout,
             fetch_window: config.fetch_window,
             data_freshness: config.data_freshness,
+            content_type: config.content_type,
             cancel,
+        }
+    }
+
+    /// Apply the configured freshness + ContentType to a Data builder.
+    fn stamp(&self, builder: DataBuilder) -> DataBuilder {
+        let builder = builder.freshness(self.data_freshness);
+        match self.content_type {
+            Some(ct) => builder.content_type(ct),
+            None => builder,
         }
     }
 
@@ -265,9 +283,7 @@ impl SvSync {
     ) -> Result<u64, SyncError> {
         let seq = self.seq.fetch_add(1, Ordering::AcqRel) + 1;
         let name = svs_data_name(&self.node, &self.group, seq);
-        let wire = DataBuilder::new(name.clone(), payload)
-            .freshness(self.data_freshness)
-            .build();
+        let wire = self.stamp(DataBuilder::new(name.clone(), payload)).build();
         self.store.insert(name, wire);
         // Advance the core in lockstep (this node is the sole publisher
         // for its own id, so the core's counter tracks `self.seq`) and
@@ -295,8 +311,8 @@ impl SvSync {
         let last = segments.len().saturating_sub(1) as u64;
         for (i, seg) in segments.iter().enumerate() {
             let name = base.clone().append_version(0).append_segment(i as u64);
-            let wire = DataBuilder::new(name.clone(), seg)
-                .freshness(self.data_freshness)
+            let wire = self
+                .stamp(DataBuilder::new(name.clone(), seg))
                 .final_block_id_typed_seg(last)
                 .build();
             self.store.insert(name, wire);
@@ -720,6 +736,44 @@ mod tests {
                 .and_then(|c| c.as_segment());
             assert_eq!(fb, Some(2), "segment {i} FinalBlockId");
         }
+    }
+
+    #[tokio::test]
+    async fn content_type_stamped_on_outer_data() {
+        // With a configured ContentType, published (outer) Data carries it
+        // — the ndn-svs SVS-PS encapsulation marker.
+        let group = name("/app/ct");
+        let node = name("/app/ct/n");
+        let (out_tx, _out_rx) = mpsc::channel::<Bytes>(256);
+        let (_in_tx, in_rx) = mpsc::channel::<Bytes>(256);
+        let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
+        let config = SvSyncConfig {
+            content_type: Some(ContentType::Other(6)),
+            ..Default::default()
+        };
+        let svs = SvSync::join(group.clone(), node.clone(), Arc::clone(&store), out_tx, in_rx, config);
+
+        let seq = svs.publish_data(b"inner").await.expect("publish");
+        let wire = store.get(&svs_data_name(&node, &group, seq)).expect("stored");
+        let data = Data::decode(wire).expect("decode");
+        assert_eq!(
+            data.meta_info().map(|m| m.content_type),
+            Some(ContentType::Other(6)),
+            "outer Data must be marked ContentType=Data"
+        );
+
+        // Default config → Blob (no marker).
+        let (o2, _) = mpsc::channel::<Bytes>(256);
+        let (_i2tx, i2) = mpsc::channel::<Bytes>(256);
+        let store2: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
+        let svs2 = SvSync::join(group.clone(), node.clone(), Arc::clone(&store2), o2, i2, SvSyncConfig::default());
+        let seq2 = svs2.publish_data(b"plain").await.expect("publish");
+        let d2 = Data::decode(store2.get(&svs_data_name(&node, &group, seq2)).unwrap()).unwrap();
+        assert_eq!(
+            d2.meta_info().map(|m| m.content_type),
+            Some(ContentType::Blob),
+            "default publish stays Blob",
+        );
     }
 
     /// Two SvSync nodes wired through an in-memory broker: A publishes,

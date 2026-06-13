@@ -15,10 +15,11 @@
 //!
 //! Encapsulation: a publication is an inner `Data` packet named with the
 //! application name; that inner packet is the *content* of the outer
-//! per-seq SvSync Data. The consumer decapsulates by decoding the
-//! content back into a `Data`. (ndn-svs additionally marks the outer
-//! `ContentType = Data`; ndn-rs detects encapsulation structurally, so
-//! the marker is an interop nicety, not required here.)
+//! per-seq SvSync Data, which is marked `ContentType = Data`
+//! (`Other(6)`, ndn-svs `tlv::Data`) so an ndn-svs SVS-PS peer recognises
+//! the encapsulation. The consumer decapsulates by decoding the content
+//! back into a `Data` (structural, so it also works for peers that omit
+//! the marker).
 //!
 //! Segmentation: a blob larger than
 //! [`SvSyncConfig::max_segment_size`](crate::svsync::SvSyncConfig) is
@@ -94,13 +95,17 @@ impl SvsPubSub {
         let (svs_in_tx, svs_in_rx) = mpsc::channel::<Bytes>(256);
 
         let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
+        // Every outer publication encapsulates an inner Data, so mark it
+        // ContentType = Data (ndn-svs `tlv::Data` = 6) for SVS-PS interop.
+        let mut svs_config = config.clone();
+        svs_config.content_type = Some(ndn_packet::meta_info::ContentType::Other(6));
         let mut svsync_owned = SvSync::join(
             group.clone(),
             node.clone(),
             store,
             net_out.clone(),
             svs_in_rx,
-            config.clone(),
+            svs_config,
         );
         // Own the update stream before sharing the SvSync via Arc.
         let updates = svsync_owned.take_updates();
