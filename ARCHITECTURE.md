@@ -77,7 +77,7 @@ scope = spec   (flat under crates/)   NDN community specs implemented faithfully
   ndn-discovery, ndn-discovery-core
                                 NDN AutoConfig, per-neighbor probe, NDNSD-style service discovery (announce + browse)
   ndn-routing                   StaticProtocol, DvrProtocol, NlsrProtocol
-  ndn-sync                      Dataset sync: SVS (layered — notification core w/ suppression FSM + HMAC-signed Sync Interests + V2/V3 wire dialects → SvSync data plane w/ DataStore + windowed fetch/serve → SvsPubSub named pub/sub + MappingProvider late-join backfill), PSync
+  ndn-sync                      Dataset sync: SVS (layered — notification core w/ suppression FSM + HMAC-signed Sync Interests + V2/V3 wire dialects → SvSync data plane w/ DataStore + windowed fetch/serve → SvsPubSub named pub/sub + MappingProvider late-join backfill), PSync (Full: bounded versioned-prefix IBF set w/ relay-capable learned names; Partial: asymmetric PartialProducer + Bloom-filter subscription consumer; large replies segmented through a shared windowed-transfer module)
   ndn-did                       NDN-native Decentralised Identifiers (W3C DID + did:ndn method)
   ndn-cert                      NDNCERT 0.3 — INFO/NEW/CHALLENGE + IssuancePolicy hook + challenge attestations + BootstrapTicket/hub onboarding
   ndn-custodian                 Custodian trait (InPage/OsKeyring/Fob/BrowserExtension) + KeyId + CustodianSigner (Custodian→Signer adapter); wasm-safe (no PIB/sqlite) so dashboard/extension/mobile can use it

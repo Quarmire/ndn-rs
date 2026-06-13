@@ -73,8 +73,39 @@ the crate-internal `transfer` module **shared with the SVS Layer-1 fetcher**:
   concatenated contents, and parses the `PSyncContent`. A single-segment
   reply (the common case) is unchanged on the wire.
 
+## Partial Sync (audit #5) — `partial-producer.cpp` + `consumer.cpp`
+
+The asymmetric producer/subscriber variant, in `psync_partial.rs`
+(`join_psync_partial_producer` / `join_psync_partial_consumer`) over the
+wire-compatible Bloom filter in `psync_bloom.rs`.
+
+- **Bloom filter** (`detail/bloom-filter.cpp`): Arash Partow filter,
+  MurmurHash3-keyed over the Name TLV value. The optimal-parameter search,
+  128-entry predefined salt table, `(seed*0xA5A5A5A5)+1` mixing, and the
+  `appendToName` layout (`count`, `fpp*1000`, raw bit-table) are ported
+  byte-for-byte. Anchored on `tests/test-bloom-filter.cpp`:
+  `BloomFilter(100, 0.001)` ⇒ 10 hashes / 180-byte table, `count=100`,
+  `fpp=1`; loading those 180 bytes as `(200, 0.001)` (360-byte table) is
+  rejected (`psync_bloom::tests`).
+- **Hello** (`onHelloInterest`, l.82): `/<sync>/hello` ⇒ Data named
+  `/<sync>/hello/<IBF>` whose content is the full `<prefix>/<seq>` list. The
+  consumer (`onHelloData`, consumer.cpp l.156) emits updates for already-
+  published subscribed prefixes straight from this list.
+- **Sync** (`onSyncInterest`, l.108): `/<sync>/sync/<BF-count>/<BF-fpp>/
+  <BF-bits>/<IBF>`; the producer subtracts IBFs, filters the positive
+  difference through `bf.contains(name.getPrefix(-1))`, and replies
+  `…/<current-IBF>`. Empty result ⇒ the Interest is held in
+  `m_pendingEntries` and re-checked on every `publishName`
+  (`satisfyPendingSyncInterests`, l.211). Undecodable IBF diff ⇒ ndn-rs
+  replies with the whole subscribed-to set + a fresh IBF (resync) rather
+  than the C++ application Nack; the consumer catches up either way.
+
+Replies are segmented through the same `transfer` pipeline as Full Sync.
+`SyncHandle::subscribe(prefix)` is honored only in Partial mode (the Full
+producer/SVS return `SyncError::Unsupported`).
+
 ## Not yet implemented
 
-- Partial Sync (`partial-producer.cpp` + the Bloom-filter subscription
-  consumer, `detail/bloom-filter.cpp`).
-- Consumer-side Nack/retx beyond the periodic timer.
+- Consumer-side application-Nack content-type signalling (the resync-on-
+  undecodable path above is used instead) and explicit retx beyond the
+  periodic re-send.

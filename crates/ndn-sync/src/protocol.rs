@@ -37,6 +37,8 @@ pub enum SyncError {
     Disconnected,
     #[error("protocol error: {0}")]
     Protocol(String),
+    #[error("operation not supported by this sync protocol")]
+    Unsupported,
 }
 
 pub struct SyncHandle {
@@ -44,6 +46,11 @@ pub struct SyncHandle {
     pub rx: tokio::sync::mpsc::Receiver<SyncUpdate>,
     /// `(publication_name, optional_mapping_bytes)` into the group.
     pub tx: tokio::sync::mpsc::Sender<(Name, Option<Bytes>)>,
+    /// Prefix subscriptions — only wired in asymmetric protocols (PSync
+    /// Partial). `None` for symmetric protocols (SVS, PSync Full) where
+    /// every node tracks the whole set; [`SyncHandle::subscribe`] then
+    /// returns [`SyncError::Unsupported`].
+    subscribe_tx: Option<tokio::sync::mpsc::Sender<Name>>,
     cancel: tokio_util::sync::CancellationToken,
 }
 
@@ -53,7 +60,38 @@ impl SyncHandle {
         tx: tokio::sync::mpsc::Sender<(Name, Option<Bytes>)>,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Self {
-        Self { rx, tx, cancel }
+        Self {
+            rx,
+            tx,
+            subscribe_tx: None,
+            cancel,
+        }
+    }
+
+    /// Like [`SyncHandle::new`], but with a subscription channel — used by
+    /// the PSync Partial consumer so [`SyncHandle::subscribe`] is honored.
+    pub fn with_subscribe(
+        rx: tokio::sync::mpsc::Receiver<SyncUpdate>,
+        tx: tokio::sync::mpsc::Sender<(Name, Option<Bytes>)>,
+        subscribe_tx: tokio::sync::mpsc::Sender<Name>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Self {
+        Self {
+            rx,
+            tx,
+            subscribe_tx: Some(subscribe_tx),
+            cancel,
+        }
+    }
+
+    /// Subscribe to a producer prefix. Honored only by the PSync Partial
+    /// consumer (it adds the prefix to the Bloom-filter subscription set);
+    /// returns [`SyncError::Unsupported`] for symmetric protocols.
+    pub async fn subscribe(&self, prefix: Name) -> Result<(), SyncError> {
+        match &self.subscribe_tx {
+            Some(tx) => tx.send(prefix).await.map_err(|_| SyncError::Disconnected),
+            None => Err(SyncError::Unsupported),
+        }
     }
 
     /// Returns `None` when the group is closed.

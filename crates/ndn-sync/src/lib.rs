@@ -77,9 +77,21 @@ pub mod psync;
 
 pub mod psync_sync;
 
+/// Bloom filter wire-compatible with `PSync/detail/bloom-filter.cpp`,
+/// for Partial Sync subscription sets.
+pub mod psync_bloom;
+
+/// PSync Partial Sync: asymmetric `PartialProducer` + Bloom-filter
+/// subscription consumer.
+pub mod psync_partial;
+
 pub use protocol::{SyncError, SyncHandle, SyncUpdate};
 pub use security::{HmacKey, Insecure, Rejected, SyncSigner, SyncValidator};
 pub use psync_sync::{PSyncConfig, PSyncInbound, join_psync_group};
+pub use psync_bloom::{BloomError, BloomFilter};
+pub use psync_partial::{
+    PSyncPartialConfig, join_psync_partial_consumer, join_psync_partial_producer,
+};
 pub use svs_local::{
     NeighborAdvance, NeighborSnapshot, StateEntry, SvsLocal, SvsLocalError, decode_svs_data,
     encode_svs_data,

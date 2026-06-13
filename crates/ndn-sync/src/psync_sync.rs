@@ -41,7 +41,7 @@ const T_GENERIC: u64 = 0x08;
 /// Split a published/learned name into `(prefix, seq)` when it ends with a
 /// generic NonNegativeInteger component (the PSync `<prefix>/<seq>`
 /// convention, ndn-cxx `appendNumber`). `None` for an unversioned name.
-fn parse_prefix_seq(name: &Name) -> Option<(Name, u64)> {
+pub(crate) fn parse_prefix_seq(name: &Name) -> Option<(Name, u64)> {
     let comps = name.components();
     let last = comps.last()?;
     if last.typ != T_GENERIC || !matches!(last.value.len(), 1 | 2 | 4 | 8) {
@@ -53,7 +53,7 @@ fn parse_prefix_seq(name: &Name) -> Option<(Name, u64)> {
 }
 
 /// `prefix/<seq-as-generic-NNI>` — inverse of [`parse_prefix_seq`].
-fn append_seq(prefix: &Name, seq: u64) -> Name {
+pub(crate) fn append_seq(prefix: &Name, seq: u64) -> Name {
     prefix.clone().append_component(ndn_packet::NameComponent::generic(Bytes::from(
         encode_nni(seq),
     )))
@@ -66,7 +66,7 @@ fn append_seq(prefix: &Name, seq: u64) -> Name {
 /// prefixes, not the total publication count (audit #1). The hash→name
 /// table makes every learned name relay-capable (audit #4): a node can
 /// answer a reconcile with names it learned from peers, not just its own.
-struct ProducerBase {
+pub(crate) struct ProducerBase {
     node: PSyncNode,
     /// prefix (sans seq) → latest seq.
     prefixes: HashMap<Name, u64>,
@@ -78,11 +78,11 @@ struct ProducerBase {
     mappings: HashMap<u32, Bytes>,
     /// Cumulative element count carried in the Sync Interest
     /// (C++ `m_numOwnElements`; drives the decode-failure heuristic).
-    num_own_elements: u64,
+    pub(crate) num_own_elements: u64,
 }
 
 impl ProducerBase {
-    fn new(ibf_count: usize) -> Self {
+    pub(crate) fn new(ibf_count: usize) -> Self {
         Self {
             node: PSyncNode::new(ibf_count),
             prefixes: HashMap::new(),
@@ -96,7 +96,7 @@ impl ProducerBase {
     /// Insert/supersede a name. Returns `Some((reported_name, low, high))`
     /// when the set actually advanced; `None` for a stale or duplicate
     /// name. For a versioned name the old version is erased first.
-    fn apply(&mut self, name: &Name, mapping: Option<Bytes>) -> Option<(Name, u64, u64)> {
+    pub(crate) fn apply(&mut self, name: &Name, mapping: Option<Bytes>) -> Option<(Name, u64, u64)> {
         match parse_prefix_seq(name) {
             Some((prefix, seq)) => {
                 let old = self.prefixes.get(&prefix).copied().unwrap_or(0);
@@ -140,7 +140,7 @@ impl ProducerBase {
         }
     }
 
-    fn names_for_hashes(&self, hashes: &std::collections::HashSet<u32>) -> Vec<Name> {
+    pub(crate) fn names_for_hashes(&self, hashes: &std::collections::HashSet<u32>) -> Vec<Name> {
         hashes
             .iter()
             .filter_map(|h| self.hash2name.get(h).cloned())
@@ -148,22 +148,22 @@ impl ProducerBase {
     }
 
     /// The whole current set (decode-failure full-state response).
-    fn state_names(&self) -> Vec<Name> {
+    pub(crate) fn state_names(&self) -> Vec<Name> {
         self.hash2name.values().cloned().collect()
     }
 
-    fn build_ibf(&self) -> Ibf {
+    pub(crate) fn build_ibf(&self) -> Ibf {
         self.node.build_ibf()
     }
 
-    fn reconcile(
+    pub(crate) fn reconcile(
         &self,
         peer: &Ibf,
     ) -> Option<(std::collections::HashSet<u32>, std::collections::HashSet<u32>)> {
         self.node.reconcile(peer)
     }
 
-    fn mapping_for(&self, name: &Name) -> Option<Bytes> {
+    pub(crate) fn mapping_for(&self, name: &Name) -> Option<Bytes> {
         self.name2hash
             .get(name)
             .and_then(|h| self.mappings.get(h).cloned())
@@ -659,7 +659,7 @@ fn zlib_decompress(data: &[u8]) -> Option<Vec<u8>> {
 /// `PSyncContent` (0x80) wrapping concatenated Name TLVs, zlib-compressed
 /// to match C++ PSync's `CompressionScheme::DEFAULT == ZLIB`
 /// (`segment-publisher.cpp` + `util.cpp`).
-fn build_psync_content(names: &[Name]) -> Vec<u8> {
+pub(crate) fn build_psync_content(names: &[Name]) -> Vec<u8> {
     let mut inner = Vec::new();
     for name in names {
         inner.extend_from_slice(&name.encode_to_tlv());
@@ -724,7 +724,7 @@ fn parse_sync_data_names(raw: &[u8]) -> Option<Vec<Name>> {
 
 /// Parse a (possibly zlib-compressed) `PSyncContent` payload — the
 /// reassembled concatenation of segment contents — into Name TLVs.
-fn parse_psync_payload(payload: &Bytes) -> Option<Vec<Name>> {
+pub(crate) fn parse_psync_payload(payload: &Bytes) -> Option<Vec<Name>> {
     let content: Bytes = match zlib_decompress(payload) {
         Some(inflated) => Bytes::from(inflated),
         None => payload.clone(),
@@ -825,7 +825,7 @@ pub fn hash_name(name: &Name) -> u32 {
 
 /// Strips the outer `0x07` + length to mirror C++
 /// `name.wireEncode().value()`.
-fn name_wire_value(name: &Name) -> Bytes {
+pub(crate) fn name_wire_value(name: &Name) -> Bytes {
     let full = name.encode_to_tlv();
     let len_byte = full[1];
     let len_field_size: usize = if len_byte < 0xfd {
