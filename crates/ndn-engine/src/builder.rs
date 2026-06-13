@@ -102,6 +102,9 @@ pub struct EngineBuilder {
     security: Option<Arc<SecurityManager>>,
     enrichers: Vec<Arc<dyn ContextEnricher>>,
     signal_sources: Vec<Box<dyn ndn_signal_sources::SignalSource<ndn_transport::FaceId>>>,
+    /// Shared cross-layer signal store, created eagerly so faces can publish
+    /// into it (via `with_signal_sink`) before `build()`. See [`Self::signals`].
+    signals: Arc<SignalsTable>,
     cs: Option<Arc<dyn ErasedContentStore>>,
     admission: Option<Arc<dyn CsAdmissionPolicy>>,
     cs_observer: Option<Arc<dyn CsObserver>>,
@@ -127,6 +130,7 @@ impl EngineBuilder {
             security: None,
             enrichers: Vec::new(),
             signal_sources: Vec::new(),
+            signals: Arc::new(SignalsTable::new()),
             cs: None,
             admission: None,
             cs_observer: None,
@@ -303,6 +307,16 @@ impl EngineBuilder {
         self
     }
 
+    /// The shared cross-layer [`SignalsTable`] this engine will use, available
+    /// **before** `build()` so a face can publish into it. Hand it to a
+    /// signal-aware face (e.g. `MonitorWifiFace::with_signal_sink`) so the
+    /// face's per-frame radio readings (RSSI, rate) flow to the same store the
+    /// strategy reads via `StrategyContext::signals`. The returned `Arc` is the
+    /// exact store the built engine uses — no copy, no second table.
+    pub fn signals(&self) -> Arc<SignalsTable> {
+        Arc::clone(&self.signals)
+    }
+
     pub async fn build(mut self) -> Result<(ForwarderEngine, ShutdownHandle)> {
         let fib = Arc::new(Fib::new());
         let rib = Arc::new(Rib::new());
@@ -318,7 +332,7 @@ impl EngineBuilder {
         };
         let face_table = self.face_table;
         let measurements = Arc::new(MeasurementsTable::new());
-        let signals = Arc::new(SignalsTable::new());
+        let signals = self.signals;
 
         for add_face in self.faces {
             add_face(Arc::clone(&face_table));
@@ -755,6 +769,40 @@ mod tests {
         let _ = engine.pit();
         let _ = engine.faces();
         let _ = engine.cs();
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn signals_table_shared_between_builder_and_engine() {
+        use ndn_strategy::{LinkSignals, SignalStore, SignalView};
+
+        let builder = EngineBuilder::new(EngineConfig::default());
+        // A signal-aware face grabs the store *before* build and publishes into
+        // it (here we stand in for the face's per-frame RSSI/rate push).
+        let signals = builder.signals();
+        signals.set_link(
+            ndn_transport::FaceId(42),
+            LinkSignals {
+                rssi_dbm: Some(-58),
+                observed_tput_bps: Some(39_000_000),
+                updated_ms: 1,
+                ..Default::default()
+            },
+        );
+
+        let (engine, handle) = builder.build().await.unwrap();
+        // The strategy-facing store the engine built is the *same* table, so the
+        // pre-build reading is what a strategy sees via StrategyContext::signals.
+        assert!(
+            Arc::ptr_eq(&signals, &engine.signals()),
+            "builder.signals() must be the engine's live table"
+        );
+        let got = engine
+            .signals()
+            .link(ndn_transport::FaceId(42))
+            .expect("pre-build reading must be visible post-build");
+        assert_eq!(got.rssi_dbm, Some(-58));
+        assert_eq!(got.observed_tput_bps, Some(39_000_000));
         handle.shutdown().await;
     }
 

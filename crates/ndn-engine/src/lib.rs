@@ -48,6 +48,9 @@ pub use compose::ComposedStrategy;
 pub use discovery_context::EngineDiscoveryContext;
 pub use dispatcher::DataPlane;
 pub use engine::{FaceCounters, FaceState, ForwarderEngine, ShutdownHandle};
+// Cross-layer signal access for callers of `ForwarderEngine::signals()` /
+// `EngineBuilder::signals()` — the traits needed to read/write the store.
+pub use ndn_strategy::{LinkSignals, SignalStore, SignalView, SignalsTable};
 pub use ndn_runtime::{Runtime, Spawn};
 pub use enricher::ContextEnricher;
 pub use fib::{Fib, FibEntry, FibNexthop};
