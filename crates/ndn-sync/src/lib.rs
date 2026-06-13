@@ -41,6 +41,10 @@ mod rt;
 /// Shared TLV / NonNegativeInteger codec for the SVS dialects.
 mod tlv;
 
+/// Shared segmented transfer (chunk/finalize + windowed fetch) for SVS
+/// and PSync.
+pub mod transfer;
+
 /// SVS wire-dialect selector (v2 / v3) + unified state-vector codec.
 pub mod dialect;
 

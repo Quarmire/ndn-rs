@@ -15,13 +15,14 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
 use flate2::Compression;
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use ndn_packet::Name;
@@ -186,6 +187,10 @@ pub struct PSyncConfig {
     /// count is `ibf_count + ibf_count/2` rounded to a multiple of 3.
     pub ibf_count: usize,
     pub channel_capacity: usize,
+    /// Max `PSyncContent` bytes per Sync Data segment; a larger state
+    /// reply is split into `<interest>/<v>/seg=i` and served from a
+    /// segment store (C++ `SegmentPublisher`). Default 7000.
+    pub max_segment_size: usize,
 }
 
 /// Raw NDN Interest/Data TLV bytes for the PSync task. When `reply` is
@@ -213,6 +218,7 @@ impl Default for PSyncConfig {
             jitter_ms: 200,
             ibf_count: 80,
             channel_capacity: 256,
+            max_segment_size: 7000,
         }
     }
 }
@@ -251,6 +257,14 @@ pub fn join_psync_group(
 /// lifetime we emit). On a later publish/learn it's satisfied early.
 const PENDING_LIFETIME: Duration = Duration::from_millis(1100);
 
+/// Consumer-side correlator: a segment Interest name → the oneshot that the
+/// recv loop fulfils when its Data wire arrives. Shared with the spawned
+/// reassembly task so the loop never blocks waiting for its own segments.
+type SegPending = Arc<Mutex<HashMap<Name, oneshot::Sender<Bytes>>>>;
+
+/// Cap on the producer's served-segment store (bounded like the IBF set).
+const SEG_STORE_CAP: usize = 512;
+
 async fn psync_task(
     group: Name,
     send: mpsc::Sender<Bytes>,
@@ -262,6 +276,12 @@ async fn psync_task(
 ) {
     let mut pb = ProducerBase::new(config.ibf_count);
     let mut pending: HashMap<Name, PendingEntry> = HashMap::new();
+    // Producer: segments of large Sync Data we've sent, served on re-fetch.
+    let mut seg_store: HashMap<Name, Bytes> = HashMap::new();
+    // Consumer: in-flight segment fetches keyed by segment name.
+    let seg_pending: SegPending = Arc::new(Mutex::new(HashMap::new()));
+    // Reassembled multi-segment replies flow back here from spawned fetchers.
+    let (reasm_tx, mut reasm_rx) = mpsc::channel::<Vec<Name>>(64);
 
     loop {
         let jitter = Duration::from_millis(fastrand::u64(0..=config.jitter_ms));
@@ -276,48 +296,192 @@ async fn psync_task(
                 send_sync_interest(&group, &pb, &send).await;
             }
 
+            // A spawned reassembly finished: learn its names like any reply.
+            Some(names) = reasm_rx.recv() => {
+                apply_learned(&mut pb, &names, &update_tx, &mut pending, &send, &mut seg_store, &config).await;
+            }
+
             Some(inbound) = recv.recv() => {
                 let raw = inbound.bytes;
                 let reply = inbound.reply;
                 if raw.len() > 2 && raw[0] == 0x06 {
-                    // Sync Data: learn names (relay-capable, #4) and emit updates.
-                    if let Some(names) = parse_sync_data_names(&raw) {
-                        let mut advanced = false;
-                        for name in names {
-                            if let Some((rep_name, low, high)) = pb.apply(&name, None) {
-                                advanced = true;
-                                let mapping = pb.mapping_for(&name);
-                                let publisher = parse_prefix_seq(&name)
-                                    .map(|(p, _)| p.to_string())
-                                    .unwrap_or_else(|| name.to_string());
-                                let _ = update_tx
-                                    .send(SyncUpdate {
-                                        publisher,
-                                        name: rep_name,
-                                        low_seq: low,
-                                        high_seq: high,
-                                        mapping,
-                                    })
-                                    .await;
-                            }
+                    let Ok(data) = ndn_packet::Data::decode(raw.clone()) else { continue };
+                    // Is this the Data for an in-flight segment fetch (#6)?
+                    let waiter = seg_pending.lock().await.remove(data.name.as_ref());
+                    if let Some(tx) = waiter {
+                        let _ = tx.send(raw);
+                        continue;
+                    }
+                    // Otherwise it's a seg=0 Sync Data reply. If it's the head
+                    // of a multi-segment reply, fetch + reassemble the rest off
+                    // the loop (its segments arrive through this same recv path).
+                    match crate::transfer::final_block_segment(&data) {
+                        Some(last) if last > 0 => {
+                            spawn_reassembly(data, &send, &seg_pending, &config, reasm_tx.clone());
                         }
-                        // Learning new names may satisfy a peer's held Interest (#3/#4).
-                        if advanced {
-                            satisfy_pending(&mut pending, &pb, &send).await;
+                        _ => {
+                            if let Some(names) = parse_sync_data_names(&raw) {
+                                apply_learned(&mut pb, &names, &update_tx, &mut pending, &send, &mut seg_store, &config).await;
+                            }
                         }
                     }
                 } else if raw.len() > 2 && raw[0] == 0x05 {
-                    handle_sync_interest(&group, &raw, &config, &pb, &mut pending, &send, reply).await;
+                    // Producer: serve a stored segment (seg>=1) verbatim (#6).
+                    if let Ok(interest) = ndn_packet::Interest::decode(raw.clone())
+                        && let Some(wire) = seg_store.get(interest.name.as_ref()).cloned()
+                    {
+                        match reply {
+                            Some(tx) => { let _ = tx.send(wire); }
+                            None => { let _ = send.send(wire).await; }
+                        }
+                        continue;
+                    }
+                    handle_sync_interest(&group, &raw, &config, &pb, &mut pending, &send, &mut seg_store, reply).await;
                 }
             }
 
             Some((pub_name, mapping)) = publish_rx.recv() => {
                 if pb.apply(&pub_name, mapping).is_some() {
-                    satisfy_pending(&mut pending, &pb, &send).await;
+                    satisfy_pending(&mut pending, &pb, &send, &mut seg_store, &config).await;
                     send_sync_interest(&group, &pb, &send).await;
                 }
             }
         }
+    }
+}
+
+/// Apply names learned from a Sync Data reply (relay-capable, #4): advance
+/// the bounded set, emit a [`SyncUpdate`] per genuinely-new name, and let a
+/// resulting advance satisfy peers' held Interests (#3).
+#[allow(clippy::too_many_arguments)]
+async fn apply_learned(
+    pb: &mut ProducerBase,
+    names: &[Name],
+    update_tx: &mpsc::Sender<SyncUpdate>,
+    pending: &mut HashMap<Name, PendingEntry>,
+    send: &mpsc::Sender<Bytes>,
+    seg_store: &mut HashMap<Name, Bytes>,
+    config: &PSyncConfig,
+) {
+    let mut advanced = false;
+    for name in names {
+        if let Some((rep_name, low, high)) = pb.apply(name, None) {
+            advanced = true;
+            let mapping = pb.mapping_for(name);
+            let publisher = parse_prefix_seq(name)
+                .map(|(p, _)| p.to_string())
+                .unwrap_or_else(|| name.to_string());
+            let _ = update_tx
+                .send(SyncUpdate {
+                    publisher,
+                    name: rep_name,
+                    low_seq: low,
+                    high_seq: high,
+                    mapping,
+                })
+                .await;
+        }
+    }
+    if advanced {
+        satisfy_pending(pending, pb, send, seg_store, config).await;
+    }
+}
+
+/// Fetch segments `1..=last` of a multi-segment Sync Data and reassemble the
+/// full `PSyncContent` off the driver loop, sending the parsed names back
+/// through `reasm_tx`. Runs as its own task so the recv loop stays free to
+/// deliver the segment responses it depends on (via `seg_pending`).
+fn spawn_reassembly(
+    seg0: ndn_packet::Data,
+    send: &mpsc::Sender<Bytes>,
+    seg_pending: &SegPending,
+    config: &PSyncConfig,
+    reasm_tx: mpsc::Sender<Vec<Name>>,
+) {
+    let last = crate::transfer::final_block_segment(&seg0).unwrap_or(0);
+    // `base` is the reply name without its trailing `seg=0` component.
+    let base = strip_segment(seg0.name.as_ref());
+    let head = seg0.content().cloned().unwrap_or_default();
+    let express = seg_express(send.clone(), Arc::clone(seg_pending));
+    let window = config.ibf_count.clamp(1, 16);
+    rt::spawn(async move {
+        let rest = crate::transfer::windowed_fetch(&base, 1, last, window, express).await;
+        let mut full = head.to_vec();
+        for seg in rest {
+            match seg {
+                Some(content) => full.extend_from_slice(&content),
+                // A gap leaves the state unreassemblable; drop and retry next tick.
+                None => return,
+            }
+        }
+        if let Some(names) = parse_psync_payload(&Bytes::from(full)) {
+            let _ = reasm_tx.send(names).await;
+        }
+    });
+}
+
+/// Build an [`Express`](crate::transfer::Express) that emits a segment
+/// Interest on `send` and parks a oneshot in `pending` for the recv loop to
+/// fulfil, with a timeout fallback.
+fn seg_express(send: mpsc::Sender<Bytes>, pending: SegPending) -> crate::transfer::Express {
+    Arc::new(move |name: Name| {
+        let send = send.clone();
+        let pending = Arc::clone(&pending);
+        Box::pin(async move {
+            let (tx, rx) = oneshot::channel();
+            pending.lock().await.insert(name.clone(), tx);
+            let interest = InterestBuilder::new(name.clone())
+                .lifetime(Duration::from_secs(2))
+                .must_be_fresh()
+                .build();
+            if send.send(interest).await.is_err() {
+                pending.lock().await.remove(&name);
+                return None;
+            }
+            let res = tokio::select! {
+                r = rx => r.ok(),
+                _ = rt::sleep(Duration::from_secs(2)) => None,
+            };
+            pending.lock().await.remove(&name);
+            res
+        }) as crate::transfer::ExpressFut
+    })
+}
+
+/// Drop the trailing `seg=` component of a segmented Data name.
+fn strip_segment(name: &Name) -> Name {
+    let comps = name.components();
+    let end = if comps.last().map(|c| c.as_segment().is_some()).unwrap_or(false) {
+        comps.len().saturating_sub(1)
+    } else {
+        comps.len()
+    };
+    Name::from_components(comps[..end].iter().cloned())
+}
+
+/// Segment `names` into Sync Data, store every segment for re-fetch (bounded),
+/// and send `seg=0` now (#6). For a reply that fits one segment this is just
+/// "store seg=0, send seg=0" — identical wire to the pre-segmentation path
+/// apart from also retaining it for a `CanBePrefix` re-request.
+async fn send_state_segmented(
+    interest_name: &Name,
+    names: &[Name],
+    config: &PSyncConfig,
+    seg_store: &mut HashMap<Name, Bytes>,
+    send: &mpsc::Sender<Bytes>,
+) {
+    let segs = segment_sync_data(interest_name, names, config.max_segment_size);
+    if let Some((_, seg0)) = segs.first() {
+        let _ = send.send(seg0.clone()).await;
+    }
+    for (name, wire) in segs {
+        if seg_store.len() >= SEG_STORE_CAP
+            && !seg_store.contains_key(&name)
+            && let Some(victim) = seg_store.keys().next().cloned()
+        {
+            seg_store.remove(&victim);
+        }
+        seg_store.insert(name, wire);
     }
 }
 
@@ -335,6 +499,7 @@ async fn handle_sync_interest(
     pb: &ProducerBase,
     pending: &mut HashMap<Name, PendingEntry>,
     send: &mpsc::Sender<Bytes>,
+    seg_store: &mut HashMap<Name, Bytes>,
     reply: Option<oneshot::Sender<Bytes>>,
 ) {
     let Some((peer_ibf, num_elems, interest_name)) = parse_sync_interest(group, raw, config.ibf_count)
@@ -376,7 +541,9 @@ async fn handle_sync_interest(
         }
         (Action::Send(names), None) => {
             if !names.is_empty() {
-                let _ = send.send(encode_sync_data_names(&interest_name, &names)).await;
+                // Segment if the reply exceeds one MTU's worth (#6); stores the
+                // segments so a peer's `seg>=1` re-fetch is served.
+                send_state_segmented(&interest_name, &names, config, seg_store, send).await;
             }
         }
         (Action::HoldPending(ibf), None) => {
@@ -402,13 +569,15 @@ async fn satisfy_pending(
     pending: &mut HashMap<Name, PendingEntry>,
     pb: &ProducerBase,
     send: &mpsc::Sender<Bytes>,
+    seg_store: &mut HashMap<Name, Bytes>,
+    config: &PSyncConfig,
 ) {
     let mut satisfied: Vec<Name> = Vec::new();
     for (iname, entry) in pending.iter() {
         if let Some((we_have, _)) = pb.reconcile(&entry.peer_ibf) {
             let names = pb.names_for_hashes(&we_have);
             if !names.is_empty() {
-                let _ = send.send(encode_sync_data_names(iname, &names)).await;
+                send_state_segmented(iname, &names, config, seg_store, send).await;
                 satisfied.push(iname.clone());
             }
         }
@@ -487,42 +656,48 @@ fn zlib_decompress(data: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Content: `PSyncContent` TLV (0x80) wrapping concatenated Name
-/// TLVs. Data name: `<interest_name>/<version>/<seg=0>` (matches
-/// `PSync/PSync/segment-publisher.cpp:37`).
-fn encode_sync_data_names(interest_name: &Name, names: &[Name]) -> Bytes {
+/// `PSyncContent` (0x80) wrapping concatenated Name TLVs, zlib-compressed
+/// to match C++ PSync's `CompressionScheme::DEFAULT == ZLIB`
+/// (`segment-publisher.cpp` + `util.cpp`).
+fn build_psync_content(names: &[Name]) -> Vec<u8> {
     let mut inner = Vec::new();
     for name in names {
-        let tlv = name.encode_to_tlv();
-        inner.extend_from_slice(&tlv);
+        inner.extend_from_slice(&name.encode_to_tlv());
     }
-
     let mut psync_content = Vec::with_capacity(2 + inner.len());
     psync_content.push(0x80u8);
     write_tlv_varint(&mut psync_content, inner.len());
     psync_content.extend_from_slice(&inner);
+    zlib_compress(&psync_content)
+}
 
-    // Compress to match C++ PSync's CompressionScheme::DEFAULT == ZLIB
-    // (PSync/detail/segment-publisher.cpp + util.cpp).  The decoder also
-    // accepts uncompressed bytes via the inflate-then-fallback path, so this
-    // is safe for ndn-rs↔ndn-rs as well.
-    let content = zlib_compress(&psync_content);
+/// Single Sync Data `<interest_name>/<version>/seg=0` (no segmentation).
+/// Used for the in-process direct-reply (CallbackFace) path and tests.
+fn encode_sync_data_names(interest_name: &Name, names: &[Name]) -> Bytes {
+    segment_sync_data(interest_name, names, usize::MAX)
+        .into_iter()
+        .next()
+        .map(|(_, wire)| wire)
+        .unwrap_or_default()
+}
 
-    // Data name: <interest_name>/<version(µs)>/<seg=0>
-    // web_time::SystemTime delegates to std natively; reads Date.now() on wasm32.
+/// Segment a state reply into `<interest_name>/<version>/seg=i` Data via
+/// the shared [`crate::transfer::segment_blob`]. All segments share one
+/// `<version>` so a consumer can fetch the rest after seg=0.
+fn segment_sync_data(interest_name: &Name, names: &[Name], max_seg: usize) -> Vec<(Name, Bytes)> {
+    let content = build_psync_content(names);
+    // web_time::SystemTime delegates to std natively; Date.now() on wasm32.
     let version = web_time::SystemTime::now()
         .duration_since(web_time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_micros() as u64;
-    let data_name = interest_name
-        .clone()
-        .append_version(version)
-        .append_segment(0);
-
-    DataBuilder::new(data_name, &content)
-        .freshness(Duration::from_secs(1))
-        .final_block_id_typed_seg(0)
-        .sign_digest_sha256()
+    let base = interest_name.clone().append_version(version);
+    crate::transfer::segment_blob(&base, &content, max_seg, |name, chunk, last| {
+        DataBuilder::new(name.clone(), chunk)
+            .freshness(Duration::from_secs(1))
+            .final_block_id_typed_seg(last)
+            .sign_digest_sha256()
+    })
 }
 
 /// Write a TLV length field as a minimal varint (NDN TLV encoding).
@@ -544,11 +719,15 @@ fn write_tlv_varint(buf: &mut Vec<u8>, n: usize) {
 /// tried first.
 fn parse_sync_data_names(raw: &[u8]) -> Option<Vec<Name>> {
     let data = ndn_packet::Data::decode(Bytes::copy_from_slice(raw)).ok()?;
-    let content = data.content()?;
+    parse_psync_payload(data.content()?)
+}
 
-    let content: Bytes = match zlib_decompress(content) {
+/// Parse a (possibly zlib-compressed) `PSyncContent` payload — the
+/// reassembled concatenation of segment contents — into Name TLVs.
+fn parse_psync_payload(payload: &Bytes) -> Option<Vec<Name>> {
+    let content: Bytes = match zlib_decompress(payload) {
         Some(inflated) => Bytes::from(inflated),
-        None => content.clone(),
+        None => payload.clone(),
     };
 
     let name_cursor: Bytes = if !content.is_empty() && content[0] == 0x80 {
@@ -881,5 +1060,86 @@ mod tests {
         assert_eq!(decoded.len(), 2);
         assert_eq!(decoded[0].to_string(), "/ndn/nlsr/LSA/routerA/NAME");
         assert_eq!(decoded[1].to_string(), "/ndn/nlsr/LSA/routerB/ADJACENCY");
+    }
+
+    #[test]
+    fn segment_sync_data_splits_and_reassembles() {
+        let interest: Name = "/test/sync/ibf".parse().unwrap();
+        let names: Vec<Name> = (0..40)
+            .map(|i| format!("/ndn/site/router{i:03}/LSA/adjacency").parse().unwrap())
+            .collect();
+
+        // A tiny segment cap forces a multi-segment reply.
+        let segs = segment_sync_data(&interest, &names, 32);
+        assert!(segs.len() > 1, "40 names @ 32B must span >1 segment");
+
+        // Every segment shares one base (…/v=<version>) and carries the same
+        // FinalBlockId = last segment index.
+        let last = (segs.len() - 1) as u64;
+        for (i, (name, wire)) in segs.iter().enumerate() {
+            assert_eq!(*name, strip_segment(name).append_segment(i as u64));
+            let d = ndn_packet::Data::decode(wire.clone()).unwrap();
+            assert_eq!(crate::transfer::final_block_segment(&d), Some(last));
+        }
+
+        // Reassemble exactly as the consumer does: concatenate segment
+        // contents in order, then parse the PSyncContent.
+        let mut full = Vec::new();
+        for (_, wire) in &segs {
+            let d = ndn_packet::Data::decode(wire.clone()).unwrap();
+            full.extend_from_slice(d.content().unwrap());
+        }
+        let decoded = parse_psync_payload(&Bytes::from(full)).expect("reassemble");
+        assert_eq!(decoded, names);
+    }
+
+    #[tokio::test]
+    async fn two_nodes_converge_over_segmented_state() {
+        let group: Name = "/test/psync".parse().unwrap();
+        // Force segmentation: a handful of names already exceed 24 bytes.
+        let cfg = PSyncConfig {
+            sync_interval: Duration::from_millis(40),
+            jitter_ms: 0,
+            max_segment_size: 24,
+            ..Default::default()
+        };
+
+        let (a_out_tx, mut a_out_rx) = mpsc::channel::<Bytes>(256);
+        let (a_in_tx, a_in_rx) = mpsc::channel::<PSyncInbound>(256);
+        let (b_out_tx, mut b_out_rx) = mpsc::channel::<Bytes>(256);
+        let (b_in_tx, b_in_rx) = mpsc::channel::<PSyncInbound>(256);
+
+        let a_in_for_b = a_in_tx.clone();
+        tokio::spawn(async move {
+            while let Some(p) = b_out_rx.recv().await {
+                let _ = a_in_for_b.send(p.into()).await;
+            }
+        });
+        let b_in_for_a = b_in_tx.clone();
+        tokio::spawn(async move {
+            while let Some(p) = a_out_rx.recv().await {
+                let _ = b_in_for_a.send(p.into()).await;
+            }
+        });
+
+        let a = join_psync_group(group.clone(), a_out_tx, a_in_rx, cfg.clone());
+        let mut b = join_psync_group(group.clone(), b_out_tx, b_in_rx, cfg);
+
+        // A publishes many distinct prefixes so one reply spans many segments.
+        for i in 0..12u64 {
+            let prefix: Name = format!("/test/psync/router{i:02}/lsa").parse().unwrap();
+            a.publish(append_seq(&prefix, 1)).await.expect("publish");
+        }
+
+        // B must learn a name through the segment fetch + reassembly path.
+        let update = tokio::time::timeout(Duration::from_secs(8), b.recv())
+            .await
+            .expect("timed out waiting for segmented convergence")
+            .expect("update");
+        assert!(
+            update.name.has_prefix(&group),
+            "B should learn a /test/psync/* name via reassembly, got {}",
+            update.name
+        );
     }
 }

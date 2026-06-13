@@ -346,12 +346,7 @@ impl SvSync {
         let first_content = first.content().cloned().unwrap_or_default();
 
         // Unsegmented: the reply is the bare seq name itself.
-        let seg_count = match first
-            .meta_info()
-            .and_then(|m| m.final_block_component())
-            .and_then(|r| r.ok())
-            .and_then(|c| c.as_segment())
-        {
+        let seg_count = match crate::transfer::final_block_segment(&first) {
             Some(last) => last + 1,
             None => return Some(vec![first_content]),
         };
@@ -370,37 +365,29 @@ impl SvSync {
         Some(out)
     }
 
-    /// Windowed fetch of explicit segments `base/seg=lo..=hi`.
+    /// Windowed fetch of explicit segments `base/seg=lo..=hi`, via the
+    /// shared [`crate::transfer::windowed_fetch`].
     async fn fetch_segments(&self, base: &Name, lo: u64, hi: u64) -> Vec<Option<Bytes>> {
-        let sem = Arc::new(Semaphore::new(self.fetch_window.max(1)));
-        let (res_tx, mut res_rx) = mpsc::channel::<(u64, Option<Bytes>)>((hi - lo + 1) as usize);
-        for s in lo..=hi {
-            let permit = Arc::clone(&sem).acquire_owned().await.expect("semaphore");
-            let name = base.clone().append_segment(s);
-            let net_out = self.net_out.clone();
-            let pending = Arc::clone(&self.pending);
-            let retry = self.retry.clone();
-            let timeout = self.fetch_timeout;
-            let res_tx = res_tx.clone();
-            rt::spawn(async move {
-                let _permit = permit;
-                let payload = express_with_retry(name, &net_out, &pending, &retry, timeout)
-                    .await
-                    .and_then(|wire| {
-                        Data::decode(wire)
-                            .ok()
-                            .map(|d| d.content().cloned().unwrap_or_default())
-                    });
-                let _ = res_tx.send((s, payload)).await;
-            });
-        }
-        drop(res_tx);
-        let mut out: Vec<(u64, Option<Bytes>)> = Vec::new();
-        while let Some(item) = res_rx.recv().await {
-            out.push(item);
-        }
-        out.sort_by_key(|(s, _)| *s);
-        out.into_iter().map(|(_, p)| p).collect()
+        crate::transfer::windowed_fetch(base, lo, hi, self.fetch_window, self.segment_express())
+            .await
+    }
+
+    /// Build the [`crate::transfer::Express`] for segment fetches: the
+    /// data-plane's correlated, retrying fetcher captured into a boxed
+    /// closure.
+    fn segment_express(&self) -> crate::transfer::Express {
+        let net_out = self.net_out.clone();
+        let pending = Arc::clone(&self.pending);
+        let retry = self.retry.clone();
+        let timeout = self.fetch_timeout;
+        Arc::new(move |name: Name| {
+            let net_out = net_out.clone();
+            let pending = Arc::clone(&pending);
+            let retry = retry.clone();
+            Box::pin(async move {
+                express_with_retry(name, &net_out, &pending, &retry, timeout).await
+            }) as crate::transfer::ExpressFut
+        })
     }
 
     /// Fetch one publication's payload, with windowed-equivalent retry.

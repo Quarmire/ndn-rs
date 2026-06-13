@@ -55,10 +55,26 @@ received Sync Data names through `ProducerBase::apply`, populating
 `hash2name` so they are offerable (the prior code inserted only into the
 IBLT, never the name table).
 
+## Segmented Sync Data (audit #6) — `segment-publisher.cpp`
+
+`PSync/PSync/segment-publisher.cpp` `publish` (l.40): a State larger than
+`maxSegmentSize` (C++ default 8000) is split into Data named
+`<interest-name>/<version>/seg=<i>`, each carrying `FinalBlockId = seg=N-1`,
+held in an in-memory store and served on re-request. ndn-rs mirrors this in
+the crate-internal `transfer` module **shared with the SVS Layer-1 fetcher**:
+- producer: `segment_sync_data` → `transfer::segment_blob` chunks the
+  (zlib-compressed) `PSyncContent` at `PSyncConfig::max_segment_size`
+  (default 7000), `final_block_id_typed_seg`, signs `DigestSha256`; the
+  driver stores every segment (bounded `SEG_STORE_CAP`) and serves a peer's
+  `seg>=1` Interest verbatim.
+- consumer: a seg=0 reply with `FinalBlockId > 0` triggers
+  `transfer::windowed_fetch(base, 1..=last)` off the driver loop (so the loop
+  keeps delivering the segment responses it depends on), reassembles the
+  concatenated contents, and parses the `PSyncContent`. A single-segment
+  reply (the common case) is unchanged on the wire.
+
 ## Not yet implemented
 
-- Segmentation of large Sync Data (`segment-publisher.cpp`) — shared with
-  the SVS Layer-1 fetcher; emits/fetches only `seg=0` today.
 - Partial Sync (`partial-producer.cpp` + the Bloom-filter subscription
   consumer, `detail/bloom-filter.cpp`).
 - Consumer-side Nack/retx beyond the periodic timer.
