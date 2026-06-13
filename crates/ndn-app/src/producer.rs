@@ -1,6 +1,7 @@
 use std::future::Future;
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -112,6 +113,35 @@ impl Producer {
         &self.prefix
     }
 
+    /// Start a [`Router`] that dispatches Interests under this producer's
+    /// prefix to per-suffix handlers — the ndn-cxx `setInterestFilter`
+    /// affordance. Instead of one `serve` closure hand-matching sub-paths:
+    ///
+    /// ```ignore
+    /// producer
+    ///     .route("/config", |i, r| async move { /* serve /app/config */ })
+    ///     .route("/data",   |i, r| async move { /* serve /app/data/* */ })
+    ///     .serve()
+    ///     .await?;
+    /// ```
+    ///
+    /// Each `suffix` is matched as a name prefix relative to the producer
+    /// prefix; the longest (most specific) match wins. Suffixes are plain
+    /// component prefixes for now (NDN regex filters are a separate gap).
+    pub fn router(self) -> Router {
+        Router::new(self.conn, self.prefix, self.signer)
+    }
+
+    /// Shorthand for `self.router().route(suffix, handler)` so a producer can
+    /// be turned into a [`Router`] in one chained call.
+    pub fn route<F, Fut>(self, suffix: impl Into<Name>, handler: F) -> Router
+    where
+        F: Fn(Interest, Responder) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.router().route(suffix, handler)
+    }
+
     /// Send a pre-built Data wire without an Interest round-trip. Pairs with a
     /// consumer's persistent Interest ([`Consumer::subscribe`](crate::Consumer::subscribe)):
     /// the forwarder matches each pushed Data to the live persistent PIT entry
@@ -220,5 +250,172 @@ impl Producer {
             self.conn.send(data).await?;
         }
         Ok(())
+    }
+}
+
+type RouteFut = Pin<Box<dyn Future<Output = ()> + Send>>;
+type RouteHandler = Arc<dyn Fn(Interest, Responder) -> RouteFut + Send + Sync>;
+
+/// Dispatches Interests under a producer prefix to per-suffix handlers
+/// (ndn-cxx `setInterestFilter`). Build via [`Producer::router`] /
+/// [`Producer::route`], chain [`route`](Self::route), then [`serve`](Self::serve).
+pub struct Router {
+    conn: Arc<dyn Connection>,
+    prefix: Name,
+    signer: Option<Arc<dyn Signer>>,
+    /// `(full route name = prefix + suffix, handler)`.
+    routes: Vec<(Name, RouteHandler)>,
+    fallback: Option<RouteHandler>,
+}
+
+impl Router {
+    fn new(conn: Arc<dyn Connection>, prefix: Name, signer: Option<Arc<dyn Signer>>) -> Self {
+        Self {
+            conn,
+            prefix,
+            signer,
+            routes: Vec::new(),
+            fallback: None,
+        }
+    }
+
+    /// Register `handler` for Interests whose name has `prefix + suffix` as a
+    /// prefix. The longest matching suffix wins, so `/data/v2` is preferred
+    /// over `/data` for `/app/data/v2/...`.
+    pub fn route<F, Fut>(mut self, suffix: impl Into<Name>, handler: F) -> Self
+    where
+        F: Fn(Interest, Responder) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let full = append_components(&self.prefix, &suffix.into());
+        self.routes.push((
+            full,
+            Arc::new(move |i, r| Box::pin(handler(i, r)) as RouteFut),
+        ));
+        self
+    }
+
+    /// Handler for Interests under the producer prefix that no `route`
+    /// matched. Without one, unmatched Interests are dropped.
+    pub fn fallback<F, Fut>(mut self, handler: F) -> Self
+    where
+        F: Fn(Interest, Responder) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.fallback = Some(Arc::new(move |i, r| Box::pin(handler(i, r)) as RouteFut));
+        self
+    }
+
+    /// The most-specific matching handler for `name`, else the fallback.
+    fn match_handler(&self, name: &Name) -> Option<&RouteHandler> {
+        self.routes
+            .iter()
+            .filter(|(full, _)| name.has_prefix(full))
+            .max_by_key(|(full, _)| full.components().len())
+            .map(|(_, h)| h)
+            .or(self.fallback.as_ref())
+    }
+
+    /// Serve until the connection closes, dispatching each Interest to its
+    /// matched handler. The handler must answer via the [`Responder`]
+    /// (dropping it discards the Interest).
+    pub async fn serve(self) -> Result<(), AppError> {
+        loop {
+            let raw = match self.conn.recv().await {
+                Some(b) => b,
+                None => break,
+            };
+            let interest = match Interest::decode(raw.clone()) {
+                Ok(i) => i,
+                Err(_) => continue,
+            };
+            if let Some(handler) = self.match_handler(&interest.name) {
+                let responder =
+                    Responder::new(Arc::clone(&self.conn), raw, self.signer.clone());
+                handler(interest, responder).await;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `prefix` followed by every component of `suffix` (the suffix is treated
+/// as a relative component sequence, leading `/` ignored).
+fn append_components(prefix: &Name, suffix: &Name) -> Name {
+    let mut out = prefix.clone();
+    for c in suffix.components() {
+        out = out.append_component(c.clone());
+    }
+    out
+}
+
+#[cfg(test)]
+mod router_tests {
+    use super::*;
+    use ndn_packet::encode::InterestBuilder;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    /// A connection that replays a fixed Interest queue then closes, and
+    /// records nothing on send (handlers record via their own state).
+    struct QueueConn {
+        q: Mutex<VecDeque<Bytes>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Connection for QueueConn {
+        async fn send(&self, _wire: Bytes) -> Result<(), AppError> {
+            Ok(())
+        }
+        async fn recv(&self) -> Option<Bytes> {
+            self.q.lock().unwrap().pop_front()
+        }
+        async fn register_prefix(&self, _prefix: &Name) -> Result<(), AppError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn router_dispatches_by_longest_suffix_match() {
+        let prefix: Name = "/app".parse().unwrap();
+        let interests = VecDeque::from(vec![
+            InterestBuilder::new("/app/config".parse::<Name>().unwrap()).build(),
+            InterestBuilder::new("/app/data/v2/seg=0".parse::<Name>().unwrap()).build(),
+            InterestBuilder::new("/app/data/v1".parse::<Name>().unwrap()).build(),
+            InterestBuilder::new("/app/unmatched".parse::<Name>().unwrap()).build(),
+        ]);
+        let conn = Arc::new(QueueConn { q: Mutex::new(interests) });
+
+        let hits: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let tag = |label: &'static str, hits: Arc<Mutex<Vec<String>>>| {
+            move |i: Interest, _r: Responder| {
+                let hits = Arc::clone(&hits);
+                async move {
+                    hits.lock().unwrap().push(format!("{label}:{}", i.name));
+                }
+            }
+        };
+
+        Producer::new(conn, prefix)
+            .route("/config", tag("config", Arc::clone(&hits)))
+            // `/data` and the more specific `/data/v2` both registered: the
+            // longest match must win for `/app/data/v2/...`.
+            .route("/data", tag("data", Arc::clone(&hits)))
+            .route("/data/v2", tag("data-v2", Arc::clone(&hits)))
+            .fallback(tag("fallback", Arc::clone(&hits)))
+            .serve()
+            .await
+            .unwrap();
+
+        let hits = hits.lock().unwrap().clone();
+        assert_eq!(
+            hits,
+            vec![
+                "config:/app/config".to_string(),
+                "data-v2:/app/data/v2/seg=0".to_string(),
+                "data:/app/data/v1".to_string(),
+                "fallback:/app/unmatched".to_string(),
+            ]
+        );
     }
 }

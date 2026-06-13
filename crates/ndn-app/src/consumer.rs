@@ -49,7 +49,7 @@ async fn accept_content(
             let safe = Unverified::new(data)
                 .verify(v)
                 .await
-                .map_err(|e| AppError::Protocol(e.to_string()))?;
+                .map_err(|e| AppError::Unverified(e.to_string()))?;
             Ok(safe.data().content().map(|b| Bytes::copy_from_slice(b)))
         }
         None => Ok(data.content().map(|b| Bytes::copy_from_slice(b))),
@@ -327,7 +327,7 @@ impl Consumer {
             .await?
             .verify(validator)
             .await
-            .map_err(|e| AppError::Protocol(e.to_string()))
+            .map_err(|e| AppError::Unverified(e.to_string()))
     }
 
     /// Fetch a Data wrapped in [`Unverified<Data>`], forcing the caller to
@@ -466,6 +466,7 @@ impl Consumer {
             last_seg,
             validator,
             forwarding_hint,
+            |_| false,
             on_progress,
             |seg, bytes| {
                 chunks[seg as usize] = Some(bytes);
@@ -478,6 +479,61 @@ impl Consumer {
             out.extend_from_slice(&c.unwrap_or_default());
         }
         Ok(out.freeze())
+    }
+
+    /// Streaming whole-object fetch: each segment's bytes are handed to
+    /// `on_segment(seg_index, bytes)` as they arrive over the
+    /// congestion-controlled windowed pipeline, so memory stays flat
+    /// regardless of object size — the consumer counterpart to the producer's
+    /// [`publish_object_from_file`](crate::Producer::publish_object_from_file).
+    /// Cross-platform (no file/unix requirement).
+    ///
+    /// **Resume:** `already_have(seg)` returning `true` skips that segment (it
+    /// is neither re-requested nor delivered to `on_segment`), so a transfer
+    /// interrupted after persisting N segments continues from where it stopped
+    /// instead of restarting at segment 0. Pass `|_| false` for a fresh fetch.
+    ///
+    /// `validator` authenticates every segment when present (the verified
+    /// streaming path). Returns the object's producer-declared size in bytes
+    /// (0 if unadvertised).
+    pub async fn fetch_object_streaming(
+        &mut self,
+        name: impl Into<Name>,
+        validator: Option<&Validator>,
+        forwarding_hint: &[Name],
+        already_have: impl Fn(u64) -> bool,
+        on_progress: impl FnMut(u64, u64),
+        on_segment: impl FnMut(u64, Bytes) -> Result<(), AppError>,
+    ) -> Result<u64, AppError> {
+        let name = name.into();
+        let meta = self.fetch_metadata(&name, validator, forwarding_hint).await?;
+        let last_seg = meta
+            .last_segment()
+            .ok_or_else(|| AppError::Protocol("metadata FinalBlockID unparseable".into()))?;
+        self.fetch_segments_windowed(
+            &meta.versioned_name,
+            last_seg,
+            validator,
+            forwarding_hint,
+            already_have,
+            on_progress,
+            on_segment,
+        )
+        .await?;
+        Ok(meta.size.unwrap_or(0))
+    }
+
+    /// Simplest streaming fetch: hand each segment to `on_segment` as it
+    /// arrives — no validation, no resume. See
+    /// [`fetch_object_streaming`](Self::fetch_object_streaming) for the
+    /// verified / resumable form.
+    pub async fn fetch_object_into(
+        &mut self,
+        name: impl Into<Name>,
+        on_segment: impl FnMut(u64, Bytes) -> Result<(), AppError>,
+    ) -> Result<u64, AppError> {
+        self.fetch_object_streaming(name, None, &[], |_| false, |_, _| {}, on_segment)
+            .await
     }
 
     /// Fetch + decode the object's RDR `<name>/32=metadata` (generous lifetime +
@@ -534,6 +590,7 @@ impl Consumer {
             last_seg,
             Some(validator),
             forwarding_hint,
+            |_| false,
             on_progress,
             |seg, bytes| {
                 file.write_all_at(&bytes, seg * seg_size)
@@ -554,21 +611,26 @@ impl Consumer {
     /// arrival is tolerated and a stall retransmits the in-flight set. The loop
     /// itself holds no payloads — only a per-segment `done` bitmap — so a
     /// streaming `sink` keeps memory flat regardless of object size.
+    #[allow(clippy::too_many_arguments)]
     async fn fetch_segments_windowed(
         &self,
         versioned: &Name,
         last_seg: u64,
         validator: Option<&Validator>,
         forwarding_hint: &[Name],
+        already_have: impl Fn(u64) -> bool,
         mut on_progress: impl FnMut(u64, u64),
         mut sink: impl FnMut(u64, Bytes) -> Result<(), AppError>,
     ) -> Result<(), AppError> {
         use std::collections::HashMap;
         let conn = Arc::clone(&self.conn);
         let total = last_seg + 1;
-        on_progress(0, total);
-        let mut done: Vec<bool> = vec![false; total as usize];
-        let mut received: u64 = 0;
+        // Resume support: segments the caller already has are pre-marked done
+        // and never re-fetched, so an interrupted transfer continues instead of
+        // restarting at segment 0.
+        let mut done: Vec<bool> = (0..total).map(already_have).collect();
+        let mut received: u64 = done.iter().filter(|&&d| d).count() as u64;
+        on_progress(received, total);
         let mut stalls: u32 = 0; // consecutive no-progress stalls; reset on any new segment
         let mut next_send: u64 = 0;
         let mut inflight: HashMap<u64, u32> = HashMap::new(); // seg -> attempts
@@ -578,8 +640,12 @@ impl Consumer {
         let mut cc = self.cc_strategy.controller();
         let limit = |cc: &ndn_transport::CongestionController| (cc.window() as usize).max(1);
 
-        // Prime the window to the initial cwnd.
+        // Prime the window to the initial cwnd, skipping already-have segments.
         while next_send < total && inflight.len() < limit(&cc) {
+            if done[next_send as usize] {
+                next_send += 1;
+                continue;
+            }
             send_segment_interest(conn.as_ref(), versioned, next_send, forwarding_hint).await?;
             inflight.insert(next_send, 1);
             next_send += 1;
@@ -617,8 +683,13 @@ impl Consumer {
                         }
                         on_progress(received, total);
                     }
-                    // Refill up to the (possibly grown) congestion window.
+                    // Refill up to the (possibly grown) congestion window,
+                    // skipping already-have segments.
                     while next_send < total && inflight.len() < limit(&cc) {
+                        if done[next_send as usize] {
+                            next_send += 1;
+                            continue;
+                        }
                         send_segment_interest(conn.as_ref(), versioned, next_send, forwarding_hint)
                             .await?;
                         inflight.insert(next_send, 1);
@@ -967,6 +1038,25 @@ mod subscription_tests {
     use super::*;
     use ndn_packet::Interest;
 
+    /// A digest-only (no trusted identity) Data verified against a validator
+    /// must surface as `AppError::Unverified`, NOT `AppError::Protocol` — the
+    /// taxonomy distinction apps branch on (trust event vs malformed bytes).
+    #[tokio::test]
+    async fn verification_failure_is_unverified_not_protocol() {
+        use ndn_packet::encode::DataBuilder;
+        use ndn_security::{TrustSchema, Validator};
+
+        let wire = DataBuilder::new("/x/y".parse::<Name>().unwrap(), b"hi").build();
+        let data = Data::decode(wire).unwrap();
+        let validator = Validator::new(TrustSchema::new());
+
+        let err = accept_content(data, Some(&validator)).await.unwrap_err();
+        assert!(
+            matches!(err, AppError::Unverified(_)),
+            "expected Unverified, got {err:?}"
+        );
+    }
+
     #[test]
     fn persistent_interest_carries_subscription_request() {
         let prefix = Name::from("/vpn/downlink");
@@ -1166,6 +1256,7 @@ mod subscription_tests {
                 49,
                 None,
                 &[],
+                |_| false,
                 |_, _| {},
                 |seg, bytes| {
                     out.write_all_at(&bytes, seg * 10)
@@ -1206,6 +1297,78 @@ mod subscription_tests {
                 "segment {i} must land at the right offset (in-order reassembly)"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn fetch_object_into_streams_every_segment() {
+        let object: Name = "/peer/file/stream".parse().unwrap();
+        let versioned = object.clone().append_version(3);
+        let server = Arc::new(SegServer {
+            versioned,
+            last_seg: 49,
+            metadata_name: crate::rdr::metadata_name(&object),
+            q: std::sync::Mutex::new(std::collections::VecDeque::new()),
+        });
+        let mut consumer = Consumer::new(server);
+
+        let got: Arc<std::sync::Mutex<Vec<(u64, Vec<u8>)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&got);
+        let size = consumer
+            .fetch_object_into(object, move |seg, bytes| {
+                sink.lock().unwrap().push((seg, bytes.to_vec()));
+                Ok(())
+            })
+            .await
+            .expect("streaming fetch");
+        assert_eq!(size, 500, "declared size = 50 segments x 10 bytes");
+
+        let mut got = got.lock().unwrap().clone();
+        got.sort_by_key(|(s, _)| *s);
+        assert_eq!(got.len(), 50);
+        for (i, (seg, bytes)) in got.iter().enumerate() {
+            assert_eq!(*seg, i as u64);
+            assert_eq!(bytes, &vec![i as u8; 10]);
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_object_streaming_resumes_skipping_have_segments() {
+        let object: Name = "/peer/file/resume".parse().unwrap();
+        let versioned = object.clone().append_version(5);
+        let server = Arc::new(SegServer {
+            versioned,
+            last_seg: 49,
+            metadata_name: crate::rdr::metadata_name(&object),
+            q: std::sync::Mutex::new(std::collections::VecDeque::new()),
+        });
+        let mut consumer = Consumer::new(server);
+
+        // Pretend segments 0..25 were already persisted by an interrupted run.
+        let delivered: Arc<std::sync::Mutex<Vec<u64>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&delivered);
+        consumer
+            .fetch_object_streaming(
+                object,
+                None,
+                &[],
+                |seg| seg < 25,
+                |_, _| {},
+                move |seg, _bytes| {
+                    sink.lock().unwrap().push(seg);
+                    Ok(())
+                },
+            )
+            .await
+            .expect("resumed fetch");
+
+        let delivered = delivered.lock().unwrap().clone();
+        assert_eq!(delivered.len(), 25, "only the missing tail is fetched");
+        assert!(
+            delivered.iter().all(|&s| (25..50).contains(&s)),
+            "no already-have segment should be re-delivered: {delivered:?}"
+        );
     }
 
     #[test]

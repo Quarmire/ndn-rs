@@ -41,7 +41,7 @@ pub use consumer::{
 };
 pub use engine_ext::EngineAppExt;
 pub use error::AppError;
-pub use producer::Producer;
+pub use producer::{Producer, Router};
 pub use publisher::{Publisher, PublisherConfig};
 pub use queryable::{Query, Queryable};
 pub use reflexive::random_reflexive_name;
