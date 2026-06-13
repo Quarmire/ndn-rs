@@ -365,6 +365,86 @@ impl SvSync {
         Some(out)
     }
 
+    /// Fetch publication `seq` from `node` and **store every Data wire**
+    /// (seg=0 plus any further segments) into the [`DataStore`] under its own
+    /// name — so this node's demux re-serves the publication verbatim even
+    /// after the producer leaves. The repo ingestion primitive (the ndnd
+    /// `OnDataHook` equivalent). Returns the number of Data packets stored.
+    ///
+    /// Unlike [`Self::fetch_publication`] (which returns decoded *content*),
+    /// this keeps the signed wire so it can be re-served byte-for-byte.
+    pub async fn ingest_publication(&self, node: &Name, seq: u64) -> usize {
+        let seq_name = svs_data_name(node, &self.group, seq);
+        let Some(first_wire) = express_with_retry_cbp(
+            seq_name.clone(),
+            true,
+            &self.net_out,
+            &self.pending,
+            &self.retry,
+            self.fetch_timeout,
+        )
+        .await
+        else {
+            return 0;
+        };
+        let mut stored = 0;
+        self.store_wire(first_wire.clone());
+        stored += 1;
+
+        let Ok(first) = Data::decode(first_wire) else {
+            return stored;
+        };
+        let last = match crate::transfer::final_block_segment(&first) {
+            Some(l) => l,
+            None => return stored, // unsegmented publication
+        };
+        if last == 0 {
+            return stored;
+        }
+        // Segmented: drive a windowed fetch whose Express stores each raw wire
+        // as a side effect (the decoded content windowed_fetch returns is
+        // unused here).
+        let base = seq_name.append_version(0);
+        let _ = crate::transfer::windowed_fetch(
+            &base,
+            1,
+            last,
+            self.fetch_window,
+            self.ingesting_express(),
+        )
+        .await;
+        stored + last as usize
+    }
+
+    /// Store a Data wire under its own name (decoded from the wire). No-op if
+    /// the wire doesn't decode.
+    fn store_wire(&self, wire: Bytes) {
+        if let Ok(data) = Data::decode(wire.clone()) {
+            self.store.insert((*data.name).clone(), wire);
+        }
+    }
+
+    /// Like [`Self::segment_express`], but stores each fetched raw wire into
+    /// the [`DataStore`] before returning it — so a windowed fetch ingests as
+    /// it goes.
+    fn ingesting_express(&self) -> crate::transfer::Express {
+        let inner = self.segment_express();
+        let store = Arc::clone(&self.store);
+        Arc::new(move |name: Name| {
+            let inner = Arc::clone(&inner);
+            let store = Arc::clone(&store);
+            Box::pin(async move {
+                let wire = inner(name).await;
+                if let Some(w) = &wire
+                    && let Ok(data) = Data::decode(w.clone())
+                {
+                    store.insert((*data.name).clone(), w.clone());
+                }
+                wire
+            }) as crate::transfer::ExpressFut
+        })
+    }
+
     /// Windowed fetch of explicit segments `base/seg=lo..=hi`, via the
     /// shared [`crate::transfer::windowed_fetch`].
     async fn fetch_segments(&self, base: &Name, lo: u64, hi: u64) -> Vec<Option<Bytes>> {
@@ -839,5 +919,76 @@ mod tests {
         assert_eq!(range.len(), 2);
         assert_eq!(range[0].as_deref(), Some(&b"hello-1"[..]));
         assert_eq!(range[1].as_deref(), Some(&b"hello-2"[..]));
+    }
+
+    /// Repo ingestion: node B fetches A's publication and stores the **raw
+    /// signed wire** in its own store, so B can re-serve it by name (the basis
+    /// for a repo durably holding a group's data after the producer leaves).
+    #[tokio::test]
+    async fn ingest_publication_stores_raw_wire_for_reserve() {
+        let group = name("/repo/grp");
+        let na = name("/repo/grp/a");
+        let nb = name("/repo/grp/repo");
+
+        let (a_out_tx, mut a_out_rx) = mpsc::channel::<Bytes>(256);
+        let (a_in_tx, a_in_rx) = mpsc::channel::<Bytes>(256);
+        let (b_out_tx, mut b_out_rx) = mpsc::channel::<Bytes>(256);
+        let (b_in_tx, b_in_rx) = mpsc::channel::<Bytes>(256);
+
+        let a_in_for_b = a_in_tx.clone();
+        tokio::spawn(async move {
+            while let Some(p) = b_out_rx.recv().await {
+                let _ = a_in_for_b.send(p).await;
+            }
+        });
+        let b_in_for_a = b_in_tx.clone();
+        tokio::spawn(async move {
+            while let Some(p) = a_out_rx.recv().await {
+                let _ = b_in_for_a.send(p).await;
+            }
+        });
+
+        let cfg = SvSyncConfig {
+            svs: SvsConfig {
+                sync_interval: Duration::from_millis(50),
+                jitter_ms: 0,
+                ..Default::default()
+            },
+            fetch_timeout: Duration::from_secs(2),
+            ..Default::default()
+        };
+
+        let store_a: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
+        let svs_a = SvSync::join(group.clone(), na.clone(), store_a, a_out_tx, a_in_rx, cfg.clone());
+
+        // Keep a concrete handle to B's store so we can prove it serves later.
+        let store_b = Arc::new(MemoryStore::new());
+        let mut svs_b = SvSync::join(
+            group.clone(),
+            nb.clone(),
+            Arc::clone(&store_b) as Arc<dyn DataStore>,
+            b_out_tx,
+            b_in_rx,
+            cfg,
+        );
+
+        svs_a.publish_data(b"durable-payload").await.expect("publish");
+        // Wait until B has learned about A through sync.
+        tokio::time::timeout(Duration::from_secs(3), svs_b.recv_update())
+            .await
+            .expect("timed out")
+            .expect("update");
+
+        let stored = tokio::time::timeout(Duration::from_secs(3), svs_b.ingest_publication(&na, 1))
+            .await
+            .expect("ingest timed out");
+        assert!(stored >= 1, "at least the seg=0 wire is ingested");
+
+        // B's store now holds the raw wire under the canonical publication name
+        // and re-serves it byte-for-byte (producer no longer required).
+        let data_name = svs_data_name(&na, &group, 1);
+        let wire = store_b.get(&data_name).expect("repo persisted the raw wire");
+        let data = Data::decode(wire).expect("stored wire is a valid Data");
+        assert_eq!(data.content().unwrap().as_ref(), b"durable-payload");
     }
 }
