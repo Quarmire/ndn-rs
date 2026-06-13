@@ -388,9 +388,17 @@ impl SvSync {
 
     /// Fetch one publication's payload, with windowed-equivalent retry.
     pub async fn fetch(&self, node: &Name, seq: u64) -> Option<Bytes> {
-        let name = svs_data_name(node, &self.group, seq);
+        self.fetch_name(&svs_data_name(node, &self.group, seq)).await
+    }
+
+    /// Fetch an arbitrary exact Data name through the correlated fetcher
+    /// (retry/back-off, replies matched to Interests by name). Returns the
+    /// Data's content. For callers that name their data by a convention
+    /// other than [`svs_data_name`] but still want the data plane's
+    /// race-free fetch instead of a hand-rolled "read the next packet".
+    pub async fn fetch_name(&self, name: &Name) -> Option<Bytes> {
         let wire = express_with_retry(
-            name,
+            name.clone(),
             &self.net_out,
             &self.pending,
             &self.retry,
