@@ -100,4 +100,4 @@ pub use svs_sync::{RetryPolicy, SvsConfig, fetch_with_retry, join_svs_group};
 pub use dialect::WireDialect;
 pub use mapping::{MappingList, MappingProvider};
 pub use pubsub::{Publication, SvsPubSub};
-pub use svsync::{DataStore, MemoryStore, SvSync, SvSyncConfig, svs_data_name};
+pub use svsync::{DataStore, IngestValidator, MemoryStore, SvSync, SvSyncConfig, svs_data_name};

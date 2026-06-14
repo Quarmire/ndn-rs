@@ -174,8 +174,19 @@ pub struct SvSync {
     fetch_window: usize,
     data_freshness: Duration,
     content_type: Option<ContentType>,
+    /// Optional fail-closed gate applied to each fetched Data wire before it is
+    /// stored during ingestion (repo trust). `None` = accept all (the open /
+    /// testbed default). Returns `true` to accept.
+    ingest_validator: Option<IngestValidator>,
     cancel: CancellationToken,
 }
+
+/// Async predicate over a fetched Data wire — `true` accepts it for storage.
+/// Lets a repo gate ingestion on a trust check without coupling `ndn-sync` to
+/// any security crate: the caller supplies the closure (e.g. wrapping an
+/// `ndn_security::Validator`).
+pub type IngestValidator =
+    Arc<dyn Fn(Bytes) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>> + Send + Sync>;
 
 impl SvSync {
     /// Join `group` as `node`, serving and fetching Data through the
@@ -254,8 +265,17 @@ impl SvSync {
             fetch_window: config.fetch_window,
             data_freshness: config.data_freshness,
             content_type: config.content_type,
+            ingest_validator: None,
             cancel,
         }
+    }
+
+    /// Install a fail-closed ingestion gate: only Data wires for which
+    /// `validator` resolves `true` are stored during
+    /// [`ingest_publication`](Self::ingest_publication) / `ingest_name`. Call
+    /// before wrapping the `SvSync` in an `Arc`.
+    pub fn set_ingest_validator(&mut self, validator: IngestValidator) {
+        self.ingest_validator = Some(validator);
     }
 
     /// Apply the configured freshness + ContentType to a Data builder.
@@ -403,9 +423,11 @@ impl SvSync {
         else {
             return 0;
         };
-        let mut stored = 0;
-        self.store_wire(first_wire.clone());
-        stored += 1;
+        // seg=0 must validate (when a gate is set) or nothing is ingested.
+        if !self.validate_and_store(first_wire.clone()).await {
+            return 0;
+        }
+        let stored = 1;
 
         let Ok(first) = Data::decode(first_wire) else {
             return stored;
@@ -432,11 +454,20 @@ impl SvSync {
         stored + last as usize
     }
 
-    /// Store a Data wire under its own name (decoded from the wire). No-op if
-    /// the wire doesn't decode.
-    fn store_wire(&self, wire: Bytes) {
+    /// Gate a fetched wire on the ingest validator (fail-closed when set), then
+    /// store it under its own name. Returns `true` if stored. A wire that
+    /// fails validation or doesn't decode is dropped.
+    async fn validate_and_store(&self, wire: Bytes) -> bool {
+        if let Some(v) = &self.ingest_validator
+            && !v(wire.clone()).await
+        {
+            return false;
+        }
         if let Ok(data) = Data::decode(wire.clone()) {
             self.store.insert((*data.name).clone(), wire);
+            true
+        } else {
+            false
         }
     }
 
@@ -446,17 +477,23 @@ impl SvSync {
     fn ingesting_express(&self) -> crate::transfer::Express {
         let inner = self.segment_express();
         let store = Arc::clone(&self.store);
+        let validator = self.ingest_validator.clone();
         Arc::new(move |name: Name| {
             let inner = Arc::clone(&inner);
             let store = Arc::clone(&store);
+            let validator = validator.clone();
             Box::pin(async move {
-                let wire = inner(name).await;
-                if let Some(w) = &wire
-                    && let Ok(data) = Data::decode(w.clone())
+                let wire = inner(name).await?;
+                // Fail-closed gate, then store under the Data's own name.
+                if let Some(v) = &validator
+                    && !v(wire.clone()).await
                 {
-                    store.insert((*data.name).clone(), w.clone());
+                    return None;
                 }
-                wire
+                if let Ok(data) = Data::decode(wire.clone()) {
+                    store.insert((*data.name).clone(), wire.clone());
+                }
+                Some(wire)
             }) as crate::transfer::ExpressFut
         })
     }
@@ -1011,5 +1048,70 @@ mod tests {
         // no-op (no re-fetch) — the durable store is the resume state.
         let again = svs_b.ingest_publication(&na, 1).await;
         assert_eq!(again, 0, "already-stored publication must not be re-fetched");
+    }
+
+    /// Fail-closed trust: with an ingest validator that rejects everything,
+    /// nothing is stored — a repo must not durably hold data it can't verify.
+    #[tokio::test]
+    async fn ingest_validator_rejects_unverified_data() {
+        let group = name("/repo/grp");
+        let na = name("/repo/grp/a");
+        let nb = name("/repo/grp/repo");
+
+        let (a_out_tx, mut a_out_rx) = mpsc::channel::<Bytes>(256);
+        let (a_in_tx, a_in_rx) = mpsc::channel::<Bytes>(256);
+        let (b_out_tx, mut b_out_rx) = mpsc::channel::<Bytes>(256);
+        let (b_in_tx, b_in_rx) = mpsc::channel::<Bytes>(256);
+
+        let a_in_for_b = a_in_tx.clone();
+        tokio::spawn(async move {
+            while let Some(p) = b_out_rx.recv().await {
+                let _ = a_in_for_b.send(p).await;
+            }
+        });
+        let b_in_for_a = b_in_tx.clone();
+        tokio::spawn(async move {
+            while let Some(p) = a_out_rx.recv().await {
+                let _ = b_in_for_a.send(p).await;
+            }
+        });
+
+        let cfg = SvSyncConfig {
+            svs: SvsConfig { sync_interval: Duration::from_millis(50), jitter_ms: 0, ..Default::default() },
+            fetch_timeout: Duration::from_secs(2),
+            ..Default::default()
+        };
+
+        let store_a: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
+        let svs_a = SvSync::join(group.clone(), na.clone(), store_a, a_out_tx, a_in_rx, cfg.clone());
+
+        let store_b = Arc::new(MemoryStore::new());
+        let mut svs_b = SvSync::join(
+            group.clone(),
+            nb,
+            Arc::clone(&store_b) as Arc<dyn DataStore>,
+            b_out_tx,
+            b_in_rx,
+            cfg,
+        );
+        // Reject-all gate.
+        svs_b.set_ingest_validator(Arc::new(|_wire: Bytes| {
+            Box::pin(async { false }) as std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+        }));
+
+        svs_a.publish_data(b"unverified").await.expect("publish");
+        tokio::time::timeout(Duration::from_secs(3), svs_b.recv_update())
+            .await
+            .expect("timed out")
+            .expect("update");
+
+        let stored = tokio::time::timeout(Duration::from_secs(3), svs_b.ingest_publication(&na, 1))
+            .await
+            .expect("ingest timed out");
+        assert_eq!(stored, 0, "rejected Data must not be stored");
+        assert!(
+            store_b.get(&svs_data_name(&na, &group, 1)).is_none(),
+            "store must hold nothing the validator rejected"
+        );
     }
 }
