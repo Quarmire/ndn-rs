@@ -1,11 +1,16 @@
 //! [`SignWith`] — extension trait for ergonomic packet signing with a [`Signer`].
 
 use std::cell::RefCell;
+use std::future::Future;
+use std::pin::Pin;
 
 use bytes::Bytes;
 use ndn_packet::encode::{DataBuilder, InterestBuilder};
 
 use crate::{Signer, TrustError};
+
+/// Boxed signing future returned by [`SignWith::sign_with`].
+pub type SignFuture<'a> = Pin<Box<dyn Future<Output = Result<Bytes, TrustError>> + Send + 'a>>;
 
 /// Extension trait that adds a high-level `sign_with` method to packet builders.
 ///
@@ -35,6 +40,14 @@ pub trait SignWith: Sized {
     /// CPU-bound and have fast synchronous paths.
     fn sign_with_sync(self, signer: &dyn Signer) -> Result<Bytes, TrustError>;
 
+    /// Sign asynchronously — the path a remote / enclave / Anchor-delegated
+    /// signer needs (its `sign()` is an async round-trip; `sign_sync()` is
+    /// `unimplemented!()` for it). Use this on any serve path that may be
+    /// configured with a non-CPU-local signer.
+    fn sign_with<'a>(self, signer: &'a dyn Signer) -> SignFuture<'a>
+    where
+        Self: 'a;
+
     /// Sign with `DigestSha256` (integrity only, no key). Routes to the
     /// single-buffer fast path so the wire bytes are bit-identical to
     /// `DataBuilder::sign_digest_sha256` and
@@ -45,6 +58,21 @@ pub trait SignWith: Sized {
 impl SignWith for DataBuilder {
     fn sign_digest_sha256(self) -> Bytes {
         DataBuilder::sign_digest_sha256(self)
+    }
+
+    fn sign_with<'a>(self, signer: &'a dyn Signer) -> SignFuture<'a>
+    where
+        Self: 'a,
+    {
+        let sig_type = signer.sig_type();
+        let key_name = signer.key_name().clone();
+        Box::pin(async move {
+            self.sign_fallible(sig_type, Some(&key_name), |region| {
+                let owned = region.to_vec();
+                async move { signer.sign(&owned).await }
+            })
+            .await
+        })
     }
 
     fn sign_with_sync(self, signer: &dyn Signer) -> Result<Bytes, TrustError> {
@@ -71,6 +99,21 @@ impl SignWith for DataBuilder {
 impl SignWith for InterestBuilder {
     fn sign_digest_sha256(self) -> Bytes {
         InterestBuilder::sign_digest_sha256(self)
+    }
+
+    fn sign_with<'a>(self, signer: &'a dyn Signer) -> SignFuture<'a>
+    where
+        Self: 'a,
+    {
+        let sig_type = signer.sig_type();
+        let key_name = signer.key_name().clone();
+        Box::pin(async move {
+            self.sign_fallible(sig_type, Some(&key_name), |region| {
+                let owned = region.to_vec();
+                async move { signer.sign(&owned).await }
+            })
+            .await
+        })
     }
 
     fn sign_with_sync(self, signer: &dyn Signer) -> Result<Bytes, TrustError> {

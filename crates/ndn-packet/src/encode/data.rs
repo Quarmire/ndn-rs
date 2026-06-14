@@ -383,6 +383,65 @@ impl DataBuilder {
         w.finish()
     }
 
+    /// Like [`Self::sign`] but the signing callback is fallible — for a
+    /// remote/enclave/delegated signer whose async round-trip can fail. The
+    /// wire is byte-identical to [`Self::sign`] on success.
+    pub async fn sign_fallible<F, Fut, E>(
+        self,
+        sig_type: SignatureType,
+        key_locator: Option<&Name>,
+        sign_fn: F,
+    ) -> Result<Bytes, E>
+    where
+        F: FnOnce(&[u8]) -> Fut,
+        Fut: std::future::Future<Output = Result<Bytes, E>>,
+    {
+        let mut inner = TlvWriter::new();
+        write_name(&mut inner, &self.name);
+        if self.content_type.is_some() || self.freshness.is_some() || self.final_block_id.is_some() {
+            let content_type = self.content_type;
+            let freshness = self.freshness;
+            let fbi = self.final_block_id.as_deref();
+            inner.write_nested(tlv_type::META_INFO, |w| {
+                if let Some(ct) = content_type {
+                    write_nni(w, tlv_type::CONTENT_TYPE, ct);
+                }
+                if let Some(f) = freshness {
+                    write_nni(w, tlv_type::FRESHNESS_PERIOD, f.as_millis() as u64);
+                }
+                if let Some(fb) = fbi {
+                    w.write_tlv(tlv_type::FINAL_BLOCK_ID, fb);
+                }
+            });
+        }
+        inner.write_tlv(tlv_type::CONTENT, &self.content);
+        let inner_bytes = inner.finish();
+
+        let mut sig_info_writer = TlvWriter::new();
+        sig_info_writer.write_nested(tlv_type::SIGNATURE_INFO, |w| {
+            write_nni(w, tlv_type::SIGNATURE_TYPE, sig_type.code());
+            if let Some(kl_name) = key_locator {
+                w.write_nested(tlv_type::KEY_LOCATOR, |w| {
+                    write_name(w, kl_name);
+                });
+            }
+        });
+        let sig_info_bytes = sig_info_writer.finish();
+
+        let mut signed_region = Vec::with_capacity(inner_bytes.len() + sig_info_bytes.len());
+        signed_region.extend_from_slice(&inner_bytes);
+        signed_region.extend_from_slice(&sig_info_bytes);
+
+        let sig_value = sign_fn(&signed_region).await?;
+
+        let mut w = TlvWriter::new();
+        w.write_nested(tlv_type::DATA, |w| {
+            w.write_raw(&signed_region);
+            w.write_tlv(tlv_type::SIGNATURE_VALUE, &sig_value);
+        });
+        Ok(w.finish())
+    }
+
     pub fn sign_sync<F>(
         self,
         sig_type: SignatureType,

@@ -207,7 +207,7 @@ impl Producer {
                 Ok(i) => i,
                 Err(_) => continue,
             };
-            if let Some(data) = prepared.answer_interest(&interest.name, signer)? {
+            if let Some(data) = prepared.answer_interest(&interest.name, signer).await? {
                 self.conn.send(data).await?;
             }
         }

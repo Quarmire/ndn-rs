@@ -17,6 +17,26 @@ use ndn_tlv::{TlvReader, TlvWriter};
 
 use crate::AppError;
 
+/// Sign `builder` with `signer` asynchronously, or emit a bare `DigestSha256`
+/// when there is no signer. The async path lets a remote/enclave/delegated
+/// signer serve objects without the `sign_sync` panic.
+async fn sign_or_digest(
+    builder: DataBuilder,
+    signer: Option<&dyn Signer>,
+) -> Result<Bytes, AppError> {
+    match signer {
+        Some(s) => s_sign(builder, s).await,
+        None => Ok(builder.build()),
+    }
+}
+
+async fn s_sign(builder: DataBuilder, signer: &dyn Signer) -> Result<Bytes, AppError> {
+    builder
+        .sign_with(signer)
+        .await
+        .map_err(|e| AppError::Protocol(e.to_string()))
+}
+
 pub const METADATA_KEYWORD: &[u8] = b"metadata";
 
 const TLV_METADATA_NAME: u64 = 0x07;
@@ -327,20 +347,11 @@ impl PreparedObject {
     /// fetching on one connection), so neither re-implements the matching.
     ///
     /// [`Producer::publish_object`]: crate::Producer::publish_object
-    pub fn answer_interest(
+    pub async fn answer_interest(
         &self,
         interest_name: &Name,
         signer: Option<&dyn Signer>,
     ) -> Result<Option<Bytes>, AppError> {
-        let finish = |builder: DataBuilder| -> Result<Bytes, AppError> {
-            match signer {
-                Some(s) => builder
-                    .sign_with_sync(s)
-                    .map_err(|e| AppError::Protocol(e.to_string())),
-                None => Ok(builder.build()),
-            }
-        };
-
         // Metadata discovery: an Interest under the object name carrying the
         // `metadata` keyword component (CanBePrefix + MustBeFresh from the consumer).
         let metadata_keyword = NameComponent::keyword(Bytes::from_static(METADATA_KEYWORD));
@@ -354,7 +365,7 @@ impl PreparedObject {
             let builder = DataBuilder::new(self.metadata_data_name.clone(), &self.metadata_content)
                 .freshness(Duration::from_millis(1000))
                 .final_block_id_typed_seg(0);
-            return Ok(Some(finish(builder)?));
+            return Ok(Some(sign_or_digest(builder, signer).await?));
         }
 
         // Segment: `<name>/v=<ver>/seg=<n>`.
@@ -371,7 +382,7 @@ impl PreparedObject {
             } else {
                 DataBuilder::new(seg_name, payload.as_ref())
             };
-            return Ok(Some(finish(builder)?));
+            return Ok(Some(sign_or_digest(builder, signer).await?));
         }
 
         Ok(None)
@@ -444,8 +455,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn file_backed_serves_correct_segment_bytes() {
+    #[tokio::test]
+    async fn file_backed_serves_correct_segment_bytes() {
         use std::io::Write;
         // 25 000 bytes → 4 segments at 8 KiB (last is short), distinct bytes so
         // any offset error shows up.
@@ -462,7 +473,7 @@ mod tests {
         // Every segment served from disk equals the file's slice at that offset.
         for i in 0..=prep.last_seg {
             let seg_name = prep.versioned_name.clone().append_segment(i);
-            let wire = prep.answer_interest(&seg_name, None).unwrap().expect("segment served");
+            let wire = prep.answer_interest(&seg_name, None).await.unwrap().expect("segment served");
             let data = ndn_packet::Data::decode(wire).unwrap();
             let start = (i * 8192) as usize;
             let end = (start + 8192).min(content.len());
