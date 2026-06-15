@@ -198,6 +198,15 @@ pub struct PreparedObject {
     /// large files — the file on disk read positionally per segment, so the
     /// whole object is never resident in RAM.
     source: SegmentSource,
+    /// Signed segment Data, cached by segment index so a retransmitted Interest
+    /// is served from here instead of re-signing. Critical when the signer is a
+    /// remote/delegated one (each sign is a seam round-trip): without this, a big
+    /// file's retransmits re-sign every segment, pacing the whole transfer at the
+    /// signing rate. The signer is fixed for a `PreparedObject`'s serve lifetime,
+    /// so a cached Data stays valid.
+    seg_cache: std::sync::Mutex<std::collections::HashMap<u64, Bytes>>,
+    /// Signed metadata Data, cached likewise (the consumer may re-discover it).
+    meta_cache: std::sync::Mutex<Option<Bytes>>,
 }
 
 /// Per-segment payload source for a [`PreparedObject`].
@@ -209,6 +218,12 @@ enum SegmentSource {
     /// lock and the file is never fully loaded. Unix-only (Android target is).
     #[cfg(all(not(target_arch = "wasm32"), unix))]
     File(FileSource),
+    /// No payload — only the segment *count* is known. Serves correct RDR
+    /// metadata (version, FinalBlockID, size) while every segment read returns
+    /// `None`. For a producer-of-record whose segment content is supplied out of
+    /// band (e.g. an engine relay streaming + signing segments from a source),
+    /// so it owns naming/metadata without ever holding the bytes.
+    Phantom { count: u64 },
 }
 
 #[cfg(all(not(target_arch = "wasm32"), unix))]
@@ -225,12 +240,14 @@ impl SegmentSource {
             SegmentSource::Memory(v) => v.len() as u64,
             #[cfg(all(not(target_arch = "wasm32"), unix))]
             SegmentSource::File(f) => f.count,
+            SegmentSource::Phantom { count } => *count,
         }
     }
 
     fn read(&self, idx: u64) -> Option<Bytes> {
         match self {
             SegmentSource::Memory(v) => v.get(idx as usize).cloned(),
+            SegmentSource::Phantom { .. } => None,
             #[cfg(all(not(target_arch = "wasm32"), unix))]
             SegmentSource::File(f) => {
                 use std::os::unix::fs::FileExt;
@@ -287,6 +304,27 @@ impl PreparedObject {
         Self::assemble(object_name, source, size, chunk_size)
     }
 
+    /// Metadata-only prepared object: knows the segment count (from `size` /
+    /// `chunk_size`) so it serves correct RDR metadata, but holds no segment
+    /// content — every segment read returns `None`. For a producer-of-record
+    /// (e.g. an engine relay) that names + signs the object and serves its
+    /// metadata, while the segment bytes are supplied out of band (streamed from
+    /// a content source and signed on the fly). `versioned_name` is the segment
+    /// prefix the out-of-band producer must name its segments under.
+    pub fn build_metadata(object_name: Name, size: u64, chunk_size: usize) -> Self {
+        let chunk = if chunk_size == 0 {
+            8192
+        } else {
+            chunk_size
+        };
+        let count = if size == 0 {
+            1
+        } else {
+            size.div_ceil(chunk as u64)
+        };
+        Self::assemble(object_name, SegmentSource::Phantom { count }, size, chunk)
+    }
+
     /// Shared assembly: derive the versioned name, FinalBlockID, and metadata
     /// from the segment `source` (its count) and the total `size`.
     fn assemble(
@@ -329,6 +367,8 @@ impl PreparedObject {
             metadata_content,
             last_seg,
             source,
+            seg_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+            meta_cache: std::sync::Mutex::new(None),
         }
     }
 
@@ -362,10 +402,15 @@ impl PreparedObject {
                 .skip(self.object_name.len())
                 .any(|c| c.typ == ndn_packet::tlv_type::KEYWORD && c.value == metadata_keyword.value)
         {
+            if let Some(cached) = self.meta_cache.lock().unwrap().clone() {
+                return Ok(Some(cached));
+            }
             let builder = DataBuilder::new(self.metadata_data_name.clone(), &self.metadata_content)
                 .freshness(Duration::from_millis(1000))
                 .final_block_id_typed_seg(0);
-            return Ok(Some(sign_or_digest(builder, signer).await?));
+            let wire = sign_or_digest(builder, signer).await?;
+            *self.meta_cache.lock().unwrap() = Some(wire.clone());
+            return Ok(Some(wire));
         }
 
         // Segment: `<name>/v=<ver>/seg=<n>`.
@@ -373,6 +418,11 @@ impl PreparedObject {
             && let Some(last) = interest_name.components().last()
             && let Some(seg_idx) = last.as_segment()
         {
+            // Serve a previously-signed segment straight from cache — a
+            // retransmit must not re-sign (a seam round-trip for a remote signer).
+            if let Some(cached) = self.seg_cache.lock().unwrap().get(&seg_idx).cloned() {
+                return Ok(Some(cached));
+            }
             let Some(payload) = self.source.read(seg_idx) else {
                 return Ok(None);
             };
@@ -382,7 +432,9 @@ impl PreparedObject {
             } else {
                 DataBuilder::new(seg_name, payload.as_ref())
             };
-            return Ok(Some(sign_or_digest(builder, signer).await?));
+            let wire = sign_or_digest(builder, signer).await?;
+            self.seg_cache.lock().unwrap().insert(seg_idx, wire.clone());
+            return Ok(Some(wire));
         }
 
         Ok(None)

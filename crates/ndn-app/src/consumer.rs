@@ -83,12 +83,22 @@ const OBJECT_FETCH_BACKOFF: Duration = Duration::from_millis(300);
 /// (~`SEG_MAX_STALLS` × 1.5s) ends it. (Previously a per-segment retransmit cap
 /// aborted the whole object when ONE segment hit the cap — fatal for big files
 /// over a lossy radio where an 8 KB Data is several NDNLP fragments.)
-const SEG_MAX_STALLS: u32 = 12;
+// Give-up budget = SEG_MAX_STALLS × SEG_RECV_TIMEOUT of *consecutive* no-progress
+// time (any arriving segment resets it). Kept at ~18 s of tolerance so a brief
+// Wi-Fi hiccup mid-transfer is ridden out, not aborted: when the per-stall
+// timeout dropped 1500 ms → 400 ms (faster retransmit), this rose 12 → 45 to hold
+// the same wall-clock tolerance (45 × 400 ms ≈ 18 s).
+const SEG_MAX_STALLS: u32 = 45;
 /// How long to wait for *any* segment Data before retransmitting the in-flight
 /// window. Shorter than the Interest lifetime so a dropped segment is re-sent
 /// promptly without stalling the whole transfer; on a healthy link Data arrives
 /// far sooner, so this never fires spuriously.
-const SEG_RECV_TIMEOUT: Duration = Duration::from_millis(1500);
+// Loss-recovery floor: how long with NO segment arriving before the in-flight
+// set is retransmitted. 1500 ms made each loss event cost a full 1.5 s of dead
+// air (measured: 31 stalls ≈ 46 s of a 59 s transfer). Wi-Fi RTT (even with the
+// producer-side seam round-trip) is tens of ms, so a far tighter floor recovers
+// loss promptly; the bounded window keeps any spurious retransmit cheap.
+const SEG_RECV_TIMEOUT: Duration = Duration::from_millis(400);
 
 /// Which congestion-control strategy the object-fetch pipeline runs — the shared
 /// [`ndn_transport::CongestionController`] variants. Default AIMD.
@@ -112,17 +122,25 @@ impl CongestionStrategy {
     }
 
     fn controller(self) -> ndn_transport::CongestionController {
-        // Cap the in-flight window. The controller default ceiling is 65536
-        // segments; over a fast link (Wi-Fi Direct ~1 Gbps) the window balloons,
-        // and because the stall path retransmits the WHOLE in-flight set, a large
-        // window turns one loss into a retransmit storm that thrashes the tail and
-        // starves the few missing segments — the file stalls at ~99%. A few
-        // hundred segments amply covers the path BDP (~1 Gbps × tens of ms ≈ a few
-        // MB), so cap it and keep retransmit bursts bounded.
-        const MAX_WINDOW: f64 = 512.0;
+        // Window sizing for a lossy radio path (the InfraTunnel UDP face over
+        // Wi-Fi). The default is unbounded slow-start (ssthresh = f64::MAX), so
+        // the window grows +1/ack until it overruns the path — measured climbing
+        // to ~214 segments (≈1.7 MB in flight), far past a default UDP socket
+        // buffer (~256 KB ≈ 32×8 KB). The overrun drops a whole burst, and because
+        // the stall path retransmits the ENTIRE in-flight set, one loss becomes a
+        // retransmit storm (measured: 1567 retransmits + 31×1.5 s stalls for a
+        // 423-segment file). So: cap the window near the buffer's worth of
+        // segments, and set ssthresh = the cap so growth is gentle (congestion
+        // avoidance, +1/window) instead of an exponential overshoot. Bounds both
+        // the in-flight burst and the retransmit-on-stall set.
+        const MAX_WINDOW: f64 = 32.0;
         match self {
-            Self::Aimd => ndn_transport::CongestionController::aimd().with_max_window(MAX_WINDOW),
-            Self::Cubic => ndn_transport::CongestionController::cubic().with_max_window(MAX_WINDOW),
+            Self::Aimd => ndn_transport::CongestionController::aimd()
+                .with_max_window(MAX_WINDOW)
+                .with_ssthresh(MAX_WINDOW),
+            Self::Cubic => ndn_transport::CongestionController::cubic()
+                .with_max_window(MAX_WINDOW)
+                .with_ssthresh(MAX_WINDOW),
         }
     }
 }
@@ -632,6 +650,10 @@ impl Consumer {
         let mut received: u64 = done.iter().filter(|&&d| d).count() as u64;
         on_progress(received, total);
         let mut stalls: u32 = 0; // consecutive no-progress stalls; reset on any new segment
+        // Diagnostics: distinguish loss (high retransmits) from a stuck window.
+        let mut retransmits: u64 = 0;
+        let mut total_stalls: u64 = 0;
+        let mut max_window: usize = 0;
         let mut next_send: u64 = 0;
         let mut inflight: HashMap<u64, u32> = HashMap::new(); // seg -> attempts
         // Self-tuning pipeline depth — the shared congestion controller (also
@@ -685,6 +707,7 @@ impl Consumer {
                     }
                     // Refill up to the (possibly grown) congestion window,
                     // skipping already-have segments.
+                    max_window = max_window.max(limit(&cc));
                     while next_send < total && inflight.len() < limit(&cc) {
                         if done[next_send as usize] {
                             next_send += 1;
@@ -709,17 +732,24 @@ impl Consumer {
                         return Err(AppError::Timeout);
                     }
                     stalls += 1;
+                    total_stalls += 1;
                     if stalls >= SEG_MAX_STALLS {
                         return Err(AppError::Timeout);
                     }
                     for seg in inflight.keys().copied().collect::<Vec<_>>() {
                         *inflight.get_mut(&seg).expect("seg in inflight") += 1;
+                        retransmits += 1;
                         send_segment_interest(conn.as_ref(), versioned, seg, forwarding_hint)
                             .await?;
                     }
                 }
             }
         }
+        tracing::debug!(
+            target: "ndn_app::fetch",
+            total, retransmits, total_stalls, max_window,
+            "windowed fetch done (retransmits≈loss; max_window≈path capacity reached)"
+        );
         Ok(())
     }
 

@@ -22,27 +22,34 @@
 //! awaited), while serves are peeled off to their handlers. Only the serve side
 //! uses the new [`DemuxConnection::serve`] / [`DemuxConnection::serve_scoped`].
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, oneshot};
 
-use ndn_packet::lp::is_lp_packet;
-use ndn_packet::{Interest, Name};
+use ndn_packet::lp::{LpPacket, is_lp_packet};
+use ndn_packet::{Data, Interest, Name};
 
 use crate::connection::Connection;
 use crate::error::AppError;
 use crate::responder::Responder;
 
 type Serves = Arc<StdMutex<Vec<(Name, mpsc::UnboundedSender<Bytes>)>>>;
+/// Data waiters keyed by the exact Data name they await, so concurrent
+/// name-correlated fetches over one connection don't steal each other's replies.
+type Pending = Arc<StdMutex<HashMap<Name, oneshot::Sender<Bytes>>>>;
 
 /// A [`Connection`] that demultiplexes its inbound stream so a node can serve
 /// producers and run consumers over one underlying connection concurrently.
 pub struct DemuxConnection {
     inner: Arc<dyn Connection>,
     serves: Serves,
+    /// Outstanding name-correlated Data waiters (see [`Self::fetch_correlated`]).
+    pending: Pending,
     /// Non-serve packets (Data / Nacks / unmatched Interests) for [`Self::recv`].
     fallback: Mutex<mpsc::UnboundedReceiver<Bytes>>,
 }
@@ -62,26 +69,45 @@ fn route(serves: &Serves, pkt: &Bytes) -> Option<mpsc::UnboundedSender<Bytes>> {
         .map(|(_, tx)| tx.clone())
 }
 
+/// Decode the name of an inbound Data packet (unwrapping an NDNLP fragment if
+/// present). Returns `None` for non-Data (Nacks, Interests) — those fall back.
+fn data_name(pkt: &Bytes) -> Option<Name> {
+    let raw = if is_lp_packet(pkt) {
+        LpPacket::decode(pkt.clone()).ok()?.fragment?
+    } else {
+        pkt.clone()
+    };
+    Data::decode(raw).ok().map(|d| (*d.name).clone())
+}
+
+/// If `pkt` is a Data whose name matches a registered waiter, take that waiter's
+/// sender (removing it). Otherwise `None` so the packet falls back.
+fn route_data(pending: &Pending, pkt: &Bytes) -> Option<oneshot::Sender<Bytes>> {
+    let name = data_name(pkt)?;
+    pending.lock().unwrap().remove(&name)
+}
+
 impl DemuxConnection {
     /// Wrap `inner` and start the demux loop. The loop runs until `inner`'s
     /// `recv` returns `None` (the connection closed).
     pub fn new(inner: Arc<dyn Connection>) -> Arc<Self> {
         let (fb_tx, fb_rx) = mpsc::unbounded_channel();
         let serves: Serves = Arc::new(StdMutex::new(Vec::new()));
+        let pending: Pending = Arc::new(StdMutex::new(HashMap::new()));
         {
             let inner = Arc::clone(&inner);
             let serves = Arc::clone(&serves);
+            let pending = Arc::clone(&pending);
             crate::rt::spawn(async move {
                 while let Some(pkt) = inner.recv().await {
-                    match route(&serves, &pkt) {
-                        Some(tx) => {
-                            let _ = tx.send(pkt);
-                        }
-                        None => {
-                            if fb_tx.send(pkt).is_err() {
-                                break; // no DemuxConnection left to drain
-                            }
-                        }
+                    // Serve Interest → its handler; else a name-correlated Data
+                    // waiter if one is registered; else the fallback recv queue.
+                    if let Some(tx) = route(&serves, &pkt) {
+                        let _ = tx.send(pkt);
+                    } else if let Some(tx) = route_data(&pending, &pkt) {
+                        let _ = tx.send(pkt);
+                    } else if fb_tx.send(pkt).is_err() {
+                        break; // no DemuxConnection left to drain
                     }
                 }
             });
@@ -89,8 +115,35 @@ impl DemuxConnection {
         Arc::new(Self {
             inner,
             serves,
+            pending,
             fallback: Mutex::new(fb_rx),
         })
+    }
+
+    /// Send `wire` and await exactly the Data named `expected`, routed to this
+    /// caller by name so concurrent fetches over the one connection never steal
+    /// each other's replies (the bare `recv` FIFO does). `expected` is the full
+    /// Interest name including any `ParametersSha256Digest`, which the responder
+    /// echoes as the Data name. Returns the raw reply wire (Data, possibly NDNLP).
+    pub async fn fetch_correlated(
+        &self,
+        expected: Name,
+        wire: Bytes,
+        timeout: Duration,
+    ) -> Result<Bytes, AppError> {
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().unwrap().insert(expected.clone(), tx);
+        if let Err(e) = self.inner.send(wire).await {
+            self.pending.lock().unwrap().remove(&expected);
+            return Err(e);
+        }
+        match crate::rt::timeout(timeout, rx).await {
+            Ok(Ok(pkt)) => Ok(pkt),
+            _ => {
+                self.pending.lock().unwrap().remove(&expected);
+                Err(AppError::Timeout)
+            }
+        }
     }
 
     fn register(&self, prefix: Name) -> mpsc::UnboundedReceiver<Bytes> {

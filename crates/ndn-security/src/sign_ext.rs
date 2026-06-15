@@ -160,6 +160,24 @@ mod tests {
         assert_eq!(kl.to_string(), signer.key_name().to_string());
     }
 
+    #[tokio::test]
+    async fn data_sign_with_async_matches_sync() {
+        let seed = [7u8; 32];
+        let key_name: ndn_packet::Name = "/test/key".parse().unwrap();
+        let signer = Ed25519Signer::from_seed(&seed, key_name);
+        let sync_wire = DataBuilder::new("/test/data", b"payload")
+            .sign_with_sync(&signer)
+            .unwrap();
+        let async_wire = DataBuilder::new("/test/data", b"payload")
+            .sign_with(&signer)
+            .await
+            .unwrap();
+        assert_eq!(
+            sync_wire, async_wire,
+            "async sign_with must produce byte-identical wire to sign_with_sync"
+        );
+    }
+
     #[test]
     fn interest_sign_with_sync_roundtrip() {
         let seed = [42u8; 32];
