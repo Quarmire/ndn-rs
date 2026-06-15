@@ -418,6 +418,20 @@ impl EngineBuilder {
 
         let engine_validator = validator.clone();
 
+        // Persistent-attach (subscription Interest) validation is separate from
+        // data-path validation. A forwarder whose data validation is `Disabled`
+        // (it relays signed Data without holding every producer's cert) must
+        // still validate the signed *subscription* Interest to install
+        // persistence (one-Interest-many-Data) — otherwise streaming
+        // subscriptions degrade to one-shot. So `PitCheckStage` gets its own
+        // validator that defaults to accept-all when no data-path validator is
+        // configured. The subscription is signed and bounded by per-`InRecord`
+        // credit, lifetime/reap, and the replay guard, so accept-all here does
+        // not weaken the data trust decision (which the end consumer still makes).
+        let persistent_validator = validator
+            .clone()
+            .unwrap_or_else(|| Arc::new(Validator::new(TrustSchema::accept_all())));
+
         let replay_guard: Option<Arc<ReplayGuard>> = match self.replay_guard_override {
             Some(explicit) => explicit,
             None => {
@@ -498,7 +512,7 @@ impl EngineBuilder {
             pit_check: PitCheckStage {
                 pit: Arc::clone(&pit),
                 dead_nonce_list: Some(Arc::clone(&dead_nonce_list)),
-                validator: validator.clone(),
+                validator: Some(persistent_validator),
                 replay_guard: replay_guard.clone(),
             },
             strategy: StrategyStage {
