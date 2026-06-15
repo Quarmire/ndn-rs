@@ -122,25 +122,28 @@ impl CongestionStrategy {
     }
 
     fn controller(self) -> ndn_transport::CongestionController {
-        // Window sizing for a lossy radio path (the InfraTunnel UDP face over
-        // Wi-Fi). The default is unbounded slow-start (ssthresh = f64::MAX), so
-        // the window grows +1/ack until it overruns the path — measured climbing
-        // to ~214 segments (≈1.7 MB in flight), far past a default UDP socket
-        // buffer (~256 KB ≈ 32×8 KB). The overrun drops a whole burst, and because
-        // the stall path retransmits the ENTIRE in-flight set, one loss becomes a
-        // retransmit storm (measured: 1567 retransmits + 31×1.5 s stalls for a
-        // 423-segment file). So: cap the window near the buffer's worth of
-        // segments, and set ssthresh = the cap so growth is gentle (congestion
-        // avoidance, +1/window) instead of an exponential overshoot. Bounds both
-        // the in-flight burst and the retransmit-on-stall set.
-        const MAX_WINDOW: f64 = 32.0;
+        // Window sizing for the bulk fetch over the InfraTunnel UDP face. History:
+        // unbounded slow-start (ssthresh=f64::MAX) overshot to ~214 segments and
+        // burst-lost on 2.4 GHz with a serial per-segment producer (the old
+        // RemoteSigner serve), so it was clamped hard to 32. That regime is gone —
+        // bulk is now served off-seam from the engine CS (engine-signed, no
+        // per-segment round-trip), the UDP socket has a 4 MB SO_RCVBUF, and the
+        // path is a real Wi-Fi link. So the small clamp was the throughput ceiling
+        // (window/RTT). Open it up: a higher ceiling with a slow-start threshold
+        // partway, so AIMD ramps to ~128 quickly then grows gently in congestion
+        // avoidance toward the cap and backs off multiplicatively on real loss —
+        // adapting to the path instead of a fixed small window. `max_window`
+        // (256×8 KB = 2 MB in flight) stays within the engine CS that buffers the
+        // relay's ahead-of-demand segments.
+        const MAX_WINDOW: f64 = 48.0;
+        const SLOW_START_THRESH: f64 = 48.0;
         match self {
             Self::Aimd => ndn_transport::CongestionController::aimd()
                 .with_max_window(MAX_WINDOW)
-                .with_ssthresh(MAX_WINDOW),
+                .with_ssthresh(SLOW_START_THRESH),
             Self::Cubic => ndn_transport::CongestionController::cubic()
                 .with_max_window(MAX_WINDOW)
-                .with_ssthresh(MAX_WINDOW),
+                .with_ssthresh(SLOW_START_THRESH),
         }
     }
 }
