@@ -42,12 +42,12 @@ async fn send_segment_interest(
 
 async fn accept_content(
     data: Data,
-    validator: Option<&Validator>,
+    validator: Option<Arc<Validator>>,
 ) -> Result<Option<Bytes>, AppError> {
     match validator {
         Some(v) => {
             let safe = Unverified::new(data)
-                .verify(v)
+                .verify(&v)
                 .await
                 .map_err(|e| AppError::Unverified(e.to_string()))?;
             Ok(safe.data().content().map(|b| Bytes::copy_from_slice(b)))
@@ -429,7 +429,7 @@ impl Consumer {
     pub async fn fetch_object_verified(
         &mut self,
         name: impl Into<Name>,
-        validator: &Validator,
+        validator: Arc<Validator>,
     ) -> Result<Bytes, AppError> {
         self.fetch_object_inner(name.into(), Some(validator), &[], |_, _| {})
             .await
@@ -445,7 +445,7 @@ impl Consumer {
     pub async fn fetch_object_verified_hinted(
         &mut self,
         name: impl Into<Name>,
-        validator: &Validator,
+        validator: Arc<Validator>,
         forwarding_hint: &[Name],
     ) -> Result<Bytes, AppError> {
         self.fetch_object_inner(name.into(), Some(validator), forwarding_hint, |_, _| {})
@@ -458,7 +458,7 @@ impl Consumer {
     pub async fn fetch_object_verified_hinted_progress(
         &mut self,
         name: impl Into<Name>,
-        validator: &Validator,
+        validator: Arc<Validator>,
         forwarding_hint: &[Name],
         on_progress: impl FnMut(u64, u64),
     ) -> Result<Bytes, AppError> {
@@ -469,11 +469,13 @@ impl Consumer {
     async fn fetch_object_inner(
         &mut self,
         name: Name,
-        validator: Option<&Validator>,
+        validator: Option<Arc<Validator>>,
         forwarding_hint: &[Name],
         on_progress: impl FnMut(u64, u64),
     ) -> Result<Bytes, AppError> {
-        let meta = self.fetch_metadata(&name, validator, forwarding_hint).await?;
+        let meta = self
+            .fetch_metadata(&name, validator.clone(), forwarding_hint)
+            .await?;
         let last_seg = meta
             .last_segment()
             .ok_or_else(|| AppError::Protocol("metadata FinalBlockID unparseable".into()))?;
@@ -520,14 +522,16 @@ impl Consumer {
     pub async fn fetch_object_streaming(
         &mut self,
         name: impl Into<Name>,
-        validator: Option<&Validator>,
+        validator: Option<Arc<Validator>>,
         forwarding_hint: &[Name],
         already_have: impl Fn(u64) -> bool,
         on_progress: impl FnMut(u64, u64),
         on_segment: impl FnMut(u64, Bytes) -> Result<(), AppError>,
     ) -> Result<u64, AppError> {
         let name = name.into();
-        let meta = self.fetch_metadata(&name, validator, forwarding_hint).await?;
+        let meta = self
+            .fetch_metadata(&name, validator.clone(), forwarding_hint)
+            .await?;
         let last_seg = meta
             .last_segment()
             .ok_or_else(|| AppError::Protocol("metadata FinalBlockID unparseable".into()))?;
@@ -562,7 +566,7 @@ impl Consumer {
     async fn fetch_metadata(
         &mut self,
         name: &Name,
-        validator: Option<&Validator>,
+        validator: Option<Arc<Validator>>,
         forwarding_hint: &[Name],
     ) -> Result<crate::rdr::MetaData, AppError> {
         let meta_data = self
@@ -592,7 +596,7 @@ impl Consumer {
     pub async fn fetch_object_to_file_hinted_progress(
         &mut self,
         name: impl Into<Name>,
-        validator: &Validator,
+        validator: Arc<Validator>,
         forwarding_hint: &[Name],
         file: &std::fs::File,
         on_progress: impl FnMut(u64, u64),
@@ -600,7 +604,7 @@ impl Consumer {
         use std::os::unix::fs::FileExt;
         let name = name.into();
         let meta = self
-            .fetch_metadata(&name, Some(validator), forwarding_hint)
+            .fetch_metadata(&name, Some(validator.clone()), forwarding_hint)
             .await?;
         let last_seg = meta
             .last_segment()
@@ -637,13 +641,13 @@ impl Consumer {
         &self,
         versioned: &Name,
         last_seg: u64,
-        validator: Option<&Validator>,
+        validator: Option<Arc<Validator>>,
         forwarding_hint: &[Name],
         already_have: impl Fn(u64) -> bool,
         mut on_progress: impl FnMut(u64, u64),
         mut sink: impl FnMut(u64, Bytes) -> Result<(), AppError>,
     ) -> Result<(), AppError> {
-        use std::collections::HashMap;
+        use std::collections::{HashMap, HashSet};
         let conn = Arc::clone(&self.conn);
         let total = last_seg + 1;
         // Resume support: segments the caller already has are pre-marked done
@@ -657,8 +661,27 @@ impl Consumer {
         let mut retransmits: u64 = 0;
         let mut total_stalls: u64 = 0;
         let mut max_window: usize = 0;
+        // Per-step wall-clock accumulators. `verify` was the serial bottleneck on
+        // this recv loop — Ed25519 verification is CPU-bound and ran inline, so the
+        // loop couldn't drain the socket while verifying. We now offload each
+        // segment's verify to the runtime (across cores natively / concurrently on
+        // wasm) and only `sink` + the `done`/congestion bookkeeping stay on the
+        // loop. `recv_wait` is then the path floor; `sink` is the disk write.
+        let mut recv_wait = std::time::Duration::ZERO;
+        let mut sink_t = std::time::Duration::ZERO;
+        let mut max_outstanding: usize = 0;
+        let fetch_start = std::time::Instant::now();
         let mut next_send: u64 = 0;
         let mut inflight: HashMap<u64, u32> = HashMap::new(); // seg -> attempts
+        let mut verifying: HashSet<u64> = HashSet::new(); // recv'd, verify in flight
+        let mut outstanding: usize = 0;
+        // Cap the verify backlog (≈ held Data) regardless of how far recv races
+        // ahead of verify. In practice never hit — parallel verify outruns the
+        // radio — but it bounds memory if the path ever bursts.
+        const MAX_OUTSTANDING_VERIFY: usize = 256;
+        // Completed verifies report (seg, congestion_marked, verified-content).
+        type VerifyDone = (u64, bool, Result<Option<Bytes>, AppError>);
+        let (vtx, mut vrx) = tokio::sync::mpsc::unbounded_channel::<VerifyDone>();
         // Self-tuning pipeline depth — the shared congestion controller (also
         // used by ndn-iperf), per the consumer's chosen strategy, so the fetch
         // adapts to the path instead of a fixed window.
@@ -676,8 +699,58 @@ impl Consumer {
             next_send += 1;
         }
 
+        // Apply one completed verify: write the bytes, mark done, advance the
+        // congestion window. A verify *failure* fails the whole fetch — authenticity
+        // is not optional. (Macro, not a closure, so it can borrow the loop's locals
+        // mutably and `?`-return from the function.)
+        macro_rules! apply_verified {
+            ($seg:expr, $marked:expr, $res:expr) => {{
+                outstanding -= 1;
+                verifying.remove(&$seg);
+                let bytes = $res?.unwrap_or_default();
+                if !done[$seg as usize] {
+                    let s0 = std::time::Instant::now();
+                    sink($seg, bytes)?;
+                    sink_t += s0.elapsed();
+                    done[$seg as usize] = true;
+                    received += 1;
+                    stalls = 0; // progress — reset the no-progress stall budget
+                    if $marked {
+                        cc.on_congestion_mark();
+                    } else {
+                        cc.on_data();
+                    }
+                    on_progress(received, total);
+                }
+            }};
+        }
+
         while received < total {
-            match crate::rt::timeout(SEG_RECV_TIMEOUT, conn.recv()).await {
+            // Apply verifies that finished since the last turn (non-blocking), so
+            // `done`/`received` and the window advance promptly.
+            while let Ok((seg, marked, res)) = vrx.try_recv() {
+                apply_verified!(seg, marked, res);
+            }
+            if received >= total {
+                break;
+            }
+            // Refill the window. A segment in flight on the wire OR in verify is
+            // not re-requested (tracked by `inflight` / `verifying`).
+            max_window = max_window.max(limit(&cc));
+            while next_send < total && inflight.len() < limit(&cc) {
+                if done[next_send as usize] || verifying.contains(&next_send) {
+                    next_send += 1;
+                    continue;
+                }
+                send_segment_interest(conn.as_ref(), versioned, next_send, forwarding_hint).await?;
+                inflight.insert(next_send, 1);
+                next_send += 1;
+            }
+
+            let recv_t0 = std::time::Instant::now();
+            let recv_res = crate::rt::timeout(SEG_RECV_TIMEOUT, conn.recv()).await;
+            recv_wait += recv_t0.elapsed();
+            match recv_res {
                 Ok(Some(wire)) => {
                     // Peek the NDNLPv2 CongestionMark (early congestion signal)
                     // before unwrapping. Non-segment / Nack packets are ignored;
@@ -690,46 +763,47 @@ impl Consumer {
                     else {
                         continue;
                     };
-                    if seg < total
-                        && !done[seg as usize]
-                        && let Some(chunk) = accept_content(data, validator).await?
-                    {
-                        sink(seg, chunk)?;
-                        done[seg as usize] = true;
-                        received += 1;
-                        stalls = 0; // progress — reset the no-progress stall budget
+                    // A fresh, in-range segment is off the wire: take it out of the
+                    // in-flight set and hand verification to the runtime so the loop
+                    // can keep draining the socket. Duplicates (already done, or a
+                    // verify already in flight) are dropped.
+                    if seg < total && !done[seg as usize] && !verifying.contains(&seg) {
                         inflight.remove(&seg);
-                        // AIMD: a CongestionMark means back off early;
-                        // otherwise an in-order delivery grows the window.
-                        if marked {
-                            cc.on_congestion_mark();
-                        } else {
-                            cc.on_data();
+                        // Back-pressure: if the verify backlog is full, block on one
+                        // completion before queueing more, bounding held memory.
+                        if outstanding >= MAX_OUTSTANDING_VERIFY
+                            && let Some((s, m, r)) = vrx.recv().await
+                        {
+                            apply_verified!(s, m, r);
                         }
-                        on_progress(received, total);
-                    }
-                    // Refill up to the (possibly grown) congestion window,
-                    // skipping already-have segments.
-                    max_window = max_window.max(limit(&cc));
-                    while next_send < total && inflight.len() < limit(&cc) {
-                        if done[next_send as usize] {
-                            next_send += 1;
-                            continue;
-                        }
-                        send_segment_interest(conn.as_ref(), versioned, next_send, forwarding_hint)
-                            .await?;
-                        inflight.insert(next_send, 1);
-                        next_send += 1;
+                        verifying.insert(seg);
+                        outstanding += 1;
+                        max_outstanding = max_outstanding.max(outstanding);
+                        let v = validator.clone();
+                        let tx = vtx.clone();
+                        crate::rt::spawn(async move {
+                            let res = accept_content(data, v).await;
+                            let _ = tx.send((seg, marked, res));
+                        });
                     }
                 }
                 Ok(None) => return Err(AppError::Closed),
                 Err(_elapsed) => {
-                    // Stall = loss: back off, then retransmit everything in
-                    // flight (deduped by the forwarder/CS; a late duplicate Data
-                    // is ignored above). Give up only after SEG_MAX_STALLS
-                    // *consecutive* no-progress stalls — any arriving segment
-                    // resets `stalls` — so a big transfer survives per-segment loss
-                    // and the tail keeps being retried as long as it makes headway.
+                    // Nothing arrived this interval. If verifies are still in flight,
+                    // that's progress, not a stall — wait for the next completion
+                    // instead of retransmitting.
+                    if outstanding > 0 {
+                        if let Some((seg, marked, res)) = vrx.recv().await {
+                            apply_verified!(seg, marked, res);
+                        }
+                        continue;
+                    }
+                    // Genuine stall = loss: back off, then retransmit everything in
+                    // flight (deduped by the forwarder/CS; a late duplicate Data is
+                    // dropped above). Give up only after SEG_MAX_STALLS *consecutive*
+                    // no-progress stalls — any arriving segment resets `stalls` — so a
+                    // big transfer survives per-segment loss and the tail keeps being
+                    // retried as long as it makes headway.
                     cc.on_timeout();
                     if inflight.is_empty() {
                         return Err(AppError::Timeout);
@@ -748,10 +822,14 @@ impl Consumer {
                 }
             }
         }
+        let elapsed_ms = fetch_start.elapsed().as_millis() as u64;
         tracing::debug!(
             target: "ndn_app::fetch",
-            total, retransmits, total_stalls, max_window,
-            "windowed fetch done (retransmits≈loss; max_window≈path capacity reached)"
+            total, retransmits, total_stalls, max_window, max_outstanding,
+            elapsed_ms,
+            recv_wait_ms = recv_wait.as_millis() as u64,
+            sink_ms = sink_t.as_millis() as u64,
+            "windowed fetch done (verify off-loop across cores; recv_wait≈path floor)"
         );
         Ok(())
     }
@@ -840,7 +918,7 @@ impl Consumer {
     pub fn verifying(self, validator: Validator) -> VerifiedConsumer {
         VerifiedConsumer {
             inner: self,
-            validator,
+            validator: Arc::new(validator),
         }
     }
 }
@@ -855,7 +933,7 @@ impl Consumer {
 /// integrity-only acceptance).
 pub struct VerifiedConsumer {
     inner: Consumer,
-    validator: Validator,
+    validator: Arc<Validator>,
 }
 
 impl VerifiedConsumer {
@@ -863,6 +941,11 @@ impl VerifiedConsumer {
     /// optional here — you get [`SafeData`] or an error.
     pub async fn fetch(&mut self, name: impl Into<Name>) -> Result<SafeData, AppError> {
         self.inner.fetch_verified(name, &self.validator).await
+    }
+
+    /// The pinned validator as a shared handle (cheap to clone).
+    pub fn validator_arc(&self) -> Arc<Validator> {
+        Arc::clone(&self.validator)
     }
 
     /// Verified content bytes (the [`fetch`](Self::fetch) payload).
@@ -879,12 +962,14 @@ impl VerifiedConsumer {
     /// reassembly, so you get the object's bytes only if the *whole* object
     /// authenticates. The safe counterpart to [`Consumer::fetch_object`].
     pub async fn fetch_object(&mut self, name: impl Into<Name>) -> Result<Bytes, AppError> {
-        self.inner.fetch_object_verified(name, &self.validator).await
+        self.inner
+            .fetch_object_verified(name, Arc::clone(&self.validator))
+            .await
     }
 
     /// The validator this consumer verifies against.
     pub fn validator(&self) -> &Validator {
-        &self.validator
+        self.validator.as_ref()
     }
 
     /// Borrow the underlying raw [`Consumer`] for the unverified primitives
@@ -1081,9 +1166,9 @@ mod subscription_tests {
 
         let wire = DataBuilder::new("/x/y".parse::<Name>().unwrap(), b"hi").build();
         let data = Data::decode(wire).unwrap();
-        let validator = Validator::new(TrustSchema::new());
+        let validator = Arc::new(Validator::new(TrustSchema::new()));
 
-        let err = accept_content(data, Some(&validator)).await.unwrap_err();
+        let err = accept_content(data, Some(validator)).await.unwrap_err();
         assert!(
             matches!(err, AppError::Unverified(_)),
             "expected Unverified, got {err:?}"
