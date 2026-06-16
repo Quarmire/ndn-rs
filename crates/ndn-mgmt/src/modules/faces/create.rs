@@ -35,10 +35,6 @@ pub(super) async fn faces_create(
         return faces_create_idempotent(existing_id, uri, &params, engine);
     }
 
-    if let Some(shm_name) = uri.strip_prefix("shm://") {
-        return faces_create_shm(shm_name, params.mtu, source_face, engine);
-    }
-
     #[cfg(not(target_arch = "wasm32"))]
     {
         if let Some(addr_str) = uri.strip_prefix("udp4://") {
@@ -459,56 +455,3 @@ async fn faces_create_ble_central(
     }
 }
 
-#[cfg(all(unix, feature = "spsc-shm"))]
-fn faces_create_shm(
-    shm_name: &str,
-    mtu: Option<u64>,
-    source_face: Option<FaceId>,
-    engine: &ForwarderEngine,
-) -> ControlResponse {
-    let face_id = engine.faces().alloc_id();
-
-    let face_result = match mtu {
-        Some(m) => ndn_face::local::shm::spsc::SpscFace::create_for_mtu(
-            face_id, shm_name, m as usize,
-        ),
-        None => ndn_face::local::ShmFace::create(face_id, shm_name),
-    };
-    match face_result {
-        Ok(face) => {
-            let cancel = source_face
-                .and_then(|sf| engine.face_token(sf))
-                .map(|t| t.child_token())
-                .unwrap_or_default();
-            engine.add_face(face, cancel);
-            tracing::info!(target: "mgmt.face", face = face_id.0, shm = shm_name, mtu = ?mtu, "faces/create shm");
-
-            let echo = ControlParameters {
-                face_id: Some(face_id.0),
-                uri: Some(format!("shm://{shm_name}")),
-                mtu,
-                face_persistency: Some(face_persistency_code(FacePersistency::OnDemand)),
-                flags: face_flags(engine, face_id),
-                ..Default::default()
-            };
-            ControlResponse::ok("OK", echo)
-        }
-        Err(e) => {
-            tracing::warn!(target: "mgmt.face", error = %e, shm = shm_name, "faces/create shm failed");
-            ControlResponse::error(status::SERVER_ERROR, format!("SHM creation failed: {e}"))
-        }
-    }
-}
-
-#[cfg(not(all(unix, feature = "spsc-shm")))]
-fn faces_create_shm(
-    _shm_name: &str,
-    _mtu: Option<u64>,
-    _source_face: Option<FaceId>,
-    _engine: &ForwarderEngine,
-) -> ControlResponse {
-    ControlResponse::error(
-        status::SERVER_ERROR,
-        "SHM faces not supported on this platform",
-    )
-}

@@ -11,7 +11,6 @@ classification = "spec"
 [features]
 # Forwarded by binaries. Off by default — the library compiles standalone.
 yubikey-piv = ["ndn-security/yubikey-piv", "ndn-cert/yubikey-challenge"]
-spsc-shm    = ["ndn-face/spsc-shm"]
 # Enables the ether:// faces/create arm (unicast NDN-over-Ethernet).
 l2          = ["ndn-face/l2"]
 # Enables ble:// (central) and ble-peripheral:// (server) faces/create arms.

@@ -35,7 +35,7 @@ pub enum ForwarderError {
         feature = "spsc-shm"
     ))]
     #[error("SHM error: {0}")]
-    Shm(#[from] ndn_face::local::ShmError),
+    Shm(#[from] ndn_face_shm::ShmError),
 }
 
 enum DataTransport {
@@ -45,7 +45,7 @@ enum DataTransport {
         feature = "spsc-shm"
     ))]
     Shm {
-        handle: ndn_face::local::shm::spsc::SpscHandle,
+        handle: ndn_face_shm::spsc::SpscHandle,
         face_id: u64,
     },
     Unix,
@@ -198,7 +198,7 @@ impl ForwarderClient {
             .await?;
         let face_id = resp.face_id.ok_or(ForwarderError::MalformedResponse)?;
 
-        let mut handle = ndn_face::local::shm::spsc::SpscHandle::connect(shm_name)?;
+        let mut handle = ndn_face_shm::spsc::SpscHandle::connect(shm_name)?;
         handle.set_cancel(cancel);
 
         Ok(DataTransport::Shm { handle, face_id })

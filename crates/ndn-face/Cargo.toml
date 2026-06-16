@@ -13,7 +13,6 @@ license.workspace = true
 # udp-recvmmsg – batch UDP receive via recvmmsg (Linux). OFF by default —
 #               unsafe FFI, validate + benchmark on Linux before trusting.
 # local       – InProcFace/InProcHandle, IpcFace, UnixFace
-# spsc-shm    – ShmFace/ShmHandle zero-copy ring (implies local; Unix only,
 #               excluding Android/iOS)
 # l2          – Ethernet/WFB/BLE faces; platform cfg selects the right impl
 # bluetooth   – BleFace GATT stub (implies l2)
@@ -41,7 +40,6 @@ udp-recvmmsg = ["net"]
 # only the fragment burst of a single packet is batched (same peer, in order).
 udp-sendmmsg = ["net"]
 local     = []
-spsc-shm  = ["local"]
 l2        = []
 # AF_XDP kernel-bypass Ethernet I/O backend (Linux only). Pure-Rust aya (XDP
 # redirect program + XskMap) + xdpilone (UMEM/XSK rings). Implies l2 for the

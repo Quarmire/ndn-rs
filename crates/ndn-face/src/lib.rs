@@ -3,7 +3,7 @@
 //! | Module | Types | Feature |
 //! |--------|-------|---------|
 //! | [`net`] | [`UdpFace`], [`TcpFace`], [`MulticastUdpFace`] | `net` |
-//! | [`local`] | [`InProcFace`], [`InProcHandle`], [`ShmFace`], [`UnixFace`], [`IpcFace`] | `local` / `spsc-shm` |
+//! | [`local`] | [`InProcFace`], [`InProcHandle`], [`UnixFace`], [`IpcFace`] | `local` |
 //! | [`l2`] | [`NamedEtherFace`], [`MulticastEtherFace`], [`BleFace`], [`WfbFace`] | `l2` / `bluetooth` / `wfb` |
 //!
 //! Serial/UART faces moved to the `ndn-face-serial` extension crate.
@@ -54,13 +54,6 @@ pub use local::{InProcFace, InProcHandle, IpcFace, IpcListener, ipc_face_connect
 pub use local::{
     UnixFace, unix_face_connect, unix_face_from_stream, unix_management_face_from_stream,
 };
-
-#[cfg(all(
-    unix,
-    not(any(target_os = "android", target_os = "ios")),
-    feature = "spsc-shm"
-))]
-pub use local::{ShmError, ShmFace, ShmHandle};
 
 #[cfg(feature = "l2")]
 pub use l2::NDN_ETHERTYPE;
