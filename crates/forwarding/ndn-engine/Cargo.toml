@@ -51,7 +51,7 @@ anyhow        = { workspace = true }
 # pure-Rust signing + verification surface (`Validator`, `SecurityManager`,
 # `Signer`) builds for `wasm32-unknown-unknown`.  Native consumers re-
 # enable the default feature set via their own dep graphs; cargo unifies.
-ndn-security  = { path = "../ndn-security", default-features = false }
+ndn-security  = { path = "../../security/ndn-security", default-features = false }
 
 # Tokio's `rt-multi-thread` feature is unavailable on wasm32; the
 # engine uses the runtime-abstraction shim (ndn-runtime) on wasm and only

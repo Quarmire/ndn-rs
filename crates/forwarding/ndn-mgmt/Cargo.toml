@@ -34,8 +34,8 @@ ndn-strategy     = { workspace = true }
 # still pull the full feature set via their own workspace deps; cargo
 # unifies, so FilePib + sqlite-pib + yubikey-challenge remain available
 # on native builds.
-ndn-security     = { path = "../ndn-security", default-features = false }
-ndn-cert         = { path = "../ndn-cert",     default-features = false }
+ndn-security     = { path = "../../security/ndn-security", default-features = false }
+ndn-cert         = { path = "../../security/ndn-cert",     default-features = false }
 ndn-mgmt-wire    = { workspace = true }
 ndn-packet       = { workspace = true, features = ["std"] }
 ndn-tlv          = { workspace = true }

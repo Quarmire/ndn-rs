@@ -48,7 +48,7 @@ ndn-packet     = { workspace = true, features = ["std-wasm"] }
 # Direct path (not `workspace = true`) so `default-features = false` is allowed
 # — Cargo forbids overriding a workspace dep's default-features. Drops the
 # SQLite PIB (libsqlite3-sys), which can't build for wasm32. Mirrors ndn-engine.
-ndn-security   = { path = "../ndn-security", default-features = false }
+ndn-security   = { path = "../../security/ndn-security", default-features = false }
 ndn-face-local = { workspace = true }
 tokio          = { workspace = true, features = ["sync"] }
 futures        = { workspace = true }

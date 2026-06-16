@@ -29,7 +29,7 @@ ndn-packet   = { workspace = true, features = ["std"] }
 # Cargo's workspace-dep inheritance can't override `default-features`,
 # so pull `ndn-security` by path and explicitly drop its default
 # `sqlite-pib` feature (sqlite-bundled doesn't cross-compile to wasm32).
-ndn-security = { path = "../ndn-security", default-features = false }
+ndn-security = { path = "../../security/ndn-security", default-features = false }
 
 # Develop-tier application API lives in `ndn-app`, which pulls
 # `ndn-engine` + `ndn-face` + full Tokio. None of those build on
