@@ -136,14 +136,14 @@ impl Strategy for MeasuredStrategy {
         }
     }
 
-    async fn after_receive_interest(
+    fn after_receive_interest(
         &self,
         ctx: &StrategyContext<'_>,
     ) -> SmallVec<[ForwardingAction; 2]> {
         self.decide(ctx).unwrap()
     }
 
-    async fn after_receive_data(
+    fn after_receive_data(
         &self,
         _ctx: &StrategyContext<'_>,
     ) -> SmallVec<[ForwardingAction; 2]> {
@@ -152,7 +152,7 @@ impl Strategy for MeasuredStrategy {
 
     /// On Nack, retry on the next-best nexthop (the nacking `in_face` is already
     /// excluded by [`Self::ranked`]); propagate downstream if none remain.
-    async fn on_nack(
+    fn on_nack(
         &self,
         ctx: &StrategyContext<'_>,
         reason: NackReason,

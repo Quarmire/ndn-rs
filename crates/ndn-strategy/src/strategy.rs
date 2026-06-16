@@ -58,17 +58,21 @@ pub trait Strategy: Send + Sync + 'static {
     /// allocation on the hot path.
     fn name(&self) -> &Name;
 
-    /// Synchronous fast path. `Some(actions)` short-circuits async
-    /// dispatch; `None` falls through to [`Self::after_receive_interest`]
-    /// / [`Self::after_receive_data`].
+    /// Optional fast path mirroring [`Self::after_receive_interest`].
+    /// `Some(actions)` short-circuits; `None` falls through to
+    /// [`Self::after_receive_interest`]. (Both are synchronous now — see
+    /// the module note; this remains as a distinct cheap-check entry point.)
     fn decide(&self, _ctx: &StrategyContext) -> Option<smallvec::SmallVec<[ForwardingAction; 2]>> {
         None
     }
 
+    /// Sans-io: a synchronous decision returning [`ForwardingAction`]s for the
+    /// pipeline to execute. Implementations must not block or do I/O — defer
+    /// via [`Self::schedule`] or [`ForwardingAction::ForwardAfter`].
     fn after_receive_interest(
         &self,
         ctx: &StrategyContext,
-    ) -> impl std::future::Future<Output = smallvec::SmallVec<[ForwardingAction; 2]>> + Send;
+    ) -> smallvec::SmallVec<[ForwardingAction; 2]>;
 
     /// Hook for strategy bookkeeping (RTT samples, link-quality updates)
     /// and strategy-driven egress decisions on satisfying Data. Default
@@ -77,14 +81,11 @@ pub trait Strategy: Send + Sync + 'static {
     fn after_receive_data(
         &self,
         ctx: &StrategyContext,
-    ) -> impl std::future::Future<Output = smallvec::SmallVec<[ForwardingAction; 2]>> + Send;
+    ) -> smallvec::SmallVec<[ForwardingAction; 2]>;
 
     /// Default suppresses; override to retry on a different nexthop.
-    fn on_interest_timeout(
-        &self,
-        _ctx: &StrategyContext,
-    ) -> impl std::future::Future<Output = ForwardingAction> + Send {
-        async { ForwardingAction::Suppress }
+    fn on_interest_timeout(&self, _ctx: &StrategyContext) -> ForwardingAction {
+        ForwardingAction::Suppress
     }
 
     /// Default suppresses; override to retry on a different nexthop or
@@ -93,8 +94,8 @@ pub trait Strategy: Send + Sync + 'static {
         &self,
         _ctx: &StrategyContext,
         _reason: ndn_transport::NackReason,
-    ) -> impl std::future::Future<Output = ForwardingAction> + Send {
-        async { ForwardingAction::Suppress }
+    ) -> ForwardingAction {
+        ForwardingAction::Suppress
     }
 
     /// Schedule `callback` to run after `delay` on the engine

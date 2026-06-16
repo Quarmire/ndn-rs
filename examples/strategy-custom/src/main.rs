@@ -88,14 +88,14 @@ impl Strategy for RandomStrategy {
     }
 
     // Required by the trait but unreachable when `decide()` always returns Some.
-    async fn after_receive_interest(
+    fn after_receive_interest(
         &self,
         _ctx: &StrategyContext<'_>,
     ) -> SmallVec<[ForwardingAction; 2]> {
         unreachable!("decide() always returns Some")
     }
 
-    async fn after_receive_data(
+    fn after_receive_data(
         &self,
         _ctx: &StrategyContext<'_>,
     ) -> SmallVec<[ForwardingAction; 2]> {

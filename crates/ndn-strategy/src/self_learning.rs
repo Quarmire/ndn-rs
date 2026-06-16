@@ -73,14 +73,14 @@ impl Strategy for SelfLearningStrategy {
         }
     }
 
-    async fn after_receive_interest(
+    fn after_receive_interest(
         &self,
         ctx: &StrategyContext<'_>,
     ) -> SmallVec<[ForwardingAction; 2]> {
         self.decide(ctx).unwrap()
     }
 
-    async fn after_receive_data(
+    fn after_receive_data(
         &self,
         _ctx: &StrategyContext<'_>,
     ) -> SmallVec<[ForwardingAction; 2]> {
@@ -126,8 +126,7 @@ mod tests {
         let name = Arc::new(Name::root());
         let m = MeasurementsTable::new();
         let actions = s
-            .after_receive_interest(&ctx(&name, FaceId(1), None, &m))
-            .await;
+            .after_receive_interest(&ctx(&name, FaceId(1), None, &m));
         assert!(matches!(actions.as_slice(), [ForwardingAction::Broadcast]));
     }
 
@@ -143,8 +142,7 @@ mod tests {
             }],
         };
         let actions = s
-            .after_receive_interest(&ctx(&name, FaceId(1), Some(&fib), &m))
-            .await;
+            .after_receive_interest(&ctx(&name, FaceId(1), Some(&fib), &m));
         match actions.as_slice() {
             [ForwardingAction::Forward(faces)] => assert_eq!(faces.as_slice(), &[FaceId(2)]),
             _ => panic!("expected Forward to the learned nexthop"),

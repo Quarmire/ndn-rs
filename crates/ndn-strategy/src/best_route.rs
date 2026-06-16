@@ -72,14 +72,14 @@ impl Strategy for BestRouteStrategy {
         }
     }
 
-    async fn after_receive_interest(
+    fn after_receive_interest(
         &self,
         ctx: &StrategyContext<'_>,
     ) -> SmallVec<[ForwardingAction; 2]> {
         self.decide(ctx).unwrap()
     }
 
-    async fn after_receive_data(
+    fn after_receive_data(
         &self,
         _ctx: &StrategyContext<'_>,
     ) -> SmallVec<[ForwardingAction; 2]> {
@@ -95,7 +95,7 @@ impl Strategy for BestRouteStrategy {
     /// out-records) closes the former ping-pong gap (D.09): a face already
     /// forwarded to for this Interest is never retried, so two mutually-
     /// nacking nexthops resolve to a downstream Nack instead of looping.
-    async fn on_nack(
+    fn on_nack(
         &self,
         ctx: &StrategyContext<'_>,
         reason: ndn_transport::NackReason,
@@ -162,7 +162,7 @@ mod tests {
         let name = Arc::new(Name::root());
         let measurements = MeasurementsTable::new();
         let ctx = make_ctx(&name, FaceId(0), None, &measurements);
-        let actions = strategy.after_receive_interest(&ctx).await;
+        let actions = strategy.after_receive_interest(&ctx);
         assert!(matches!(
             actions.as_slice(),
             [ForwardingAction::Nack(NackReason::NoRoute)]
@@ -187,7 +187,7 @@ mod tests {
             ],
         };
         let ctx = make_ctx(&name, FaceId(1), Some(&fib), &measurements);
-        let actions = strategy.after_receive_interest(&ctx).await;
+        let actions = strategy.after_receive_interest(&ctx);
         if let [ForwardingAction::Forward(faces)] = actions.as_slice() {
             assert_eq!(faces[0], FaceId(2));
         } else {
@@ -207,7 +207,7 @@ mod tests {
             }],
         };
         let ctx = make_ctx(&name, FaceId(1), Some(&fib), &measurements);
-        let actions = strategy.after_receive_interest(&ctx).await;
+        let actions = strategy.after_receive_interest(&ctx);
         assert!(matches!(
             actions.as_slice(),
             [ForwardingAction::Nack(NackReason::NoRoute)]
@@ -220,7 +220,7 @@ mod tests {
         let name = Arc::new(Name::root());
         let measurements = MeasurementsTable::new();
         let ctx = make_ctx(&name, FaceId(0), None, &measurements);
-        let actions = strategy.after_receive_data(&ctx).await;
+        let actions = strategy.after_receive_data(&ctx);
         assert!(actions.is_empty());
     }
 
@@ -242,7 +242,7 @@ mod tests {
             ],
         };
         let ctx = make_ctx(&name, FaceId(2), Some(&fib), &measurements);
-        let action = strategy.on_nack(&ctx, NackReason::NoRoute).await;
+        let action = strategy.on_nack(&ctx, NackReason::NoRoute);
         match action {
             ForwardingAction::Forward(faces) => {
                 assert_eq!(faces.as_slice(), &[FaceId(3)]);
@@ -263,7 +263,7 @@ mod tests {
             }],
         };
         let ctx = make_ctx(&name, FaceId(7), Some(&fib), &measurements);
-        let action = strategy.on_nack(&ctx, NackReason::Duplicate).await;
+        let action = strategy.on_nack(&ctx, NackReason::Duplicate);
         assert!(
             matches!(action, ForwardingAction::Nack(NackReason::Duplicate)),
             "no other nexthop available — must propagate the Nack"
@@ -276,7 +276,7 @@ mod tests {
         let name = Arc::new(Name::root());
         let measurements = MeasurementsTable::new();
         let ctx = make_ctx(&name, FaceId(1), None, &measurements);
-        let action = strategy.on_nack(&ctx, NackReason::Congestion).await;
+        let action = strategy.on_nack(&ctx, NackReason::Congestion);
         assert!(matches!(
             action,
             ForwardingAction::Nack(NackReason::Congestion)
@@ -299,7 +299,7 @@ mod tests {
         // Face 2 already tried → the lowest-cost UNTRIED nexthop (3) is chosen.
         let tried = [FaceId(2)];
         let ctx = make_ctx_tried(&name, FaceId(1), Some(&fib), &measurements, &tried);
-        let actions = strategy.after_receive_interest(&ctx).await;
+        let actions = strategy.after_receive_interest(&ctx);
         match actions.as_slice() {
             [ForwardingAction::Forward(faces)] => assert_eq!(faces.as_slice(), &[FaceId(3)]),
             _ => panic!("expected Forward to the untried nexthop 3"),
@@ -318,7 +318,7 @@ mod tests {
         };
         let tried = [FaceId(2)];
         let ctx = make_ctx_tried(&name, FaceId(1), Some(&fib), &measurements, &tried);
-        let actions = strategy.after_receive_interest(&ctx).await;
+        let actions = strategy.after_receive_interest(&ctx);
         match actions.as_slice() {
             [ForwardingAction::Forward(faces)] => assert_eq!(faces.as_slice(), &[FaceId(2)]),
             _ => panic!("all-tried must re-send to nexthop 2 for liveness"),
@@ -342,7 +342,7 @@ mod tests {
         // remains, so the Nack must propagate rather than ping-pong back to 3.
         let tried = [FaceId(3)];
         let ctx = make_ctx_tried(&name, FaceId(2), Some(&fib), &measurements, &tried);
-        let action = strategy.on_nack(&ctx, NackReason::NoRoute).await;
+        let action = strategy.on_nack(&ctx, NackReason::NoRoute);
         assert!(
             matches!(action, ForwardingAction::Nack(NackReason::NoRoute)),
             "both nexthops exhausted (one nacking, one already tried) → propagate"

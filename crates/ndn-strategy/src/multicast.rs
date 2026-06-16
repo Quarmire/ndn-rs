@@ -68,14 +68,14 @@ impl Strategy for MulticastStrategy {
         Some(smallvec![ForwardingAction::Forward(faces)])
     }
 
-    async fn after_receive_interest(
+    fn after_receive_interest(
         &self,
         ctx: &StrategyContext<'_>,
     ) -> SmallVec<[ForwardingAction; 2]> {
         self.decide(ctx).unwrap()
     }
 
-    async fn after_receive_data(
+    fn after_receive_data(
         &self,
         _ctx: &StrategyContext<'_>,
     ) -> SmallVec<[ForwardingAction; 2]> {
@@ -120,7 +120,7 @@ mod tests {
         let name = Arc::new(Name::root());
         let m = MeasurementsTable::new();
         let ctx = make_ctx(&name, FaceId(0), None, &m);
-        let actions = s.after_receive_interest(&ctx).await;
+        let actions = s.after_receive_interest(&ctx);
         assert!(matches!(
             actions.as_slice(),
             [ForwardingAction::Nack(NackReason::NoRoute)]
@@ -149,7 +149,7 @@ mod tests {
             ],
         };
         let ctx = make_ctx(&name, FaceId(1), Some(&fib), &m);
-        let actions = s.after_receive_interest(&ctx).await;
+        let actions = s.after_receive_interest(&ctx);
         if let [ForwardingAction::Forward(faces)] = actions.as_slice() {
             assert_eq!(faces.len(), 2);
             assert!(faces.contains(&FaceId(2)));
@@ -172,7 +172,7 @@ mod tests {
             }],
         };
         let ctx = make_ctx(&name, FaceId(1), Some(&fib), &m);
-        let actions = s.after_receive_interest(&ctx).await;
+        let actions = s.after_receive_interest(&ctx);
         assert!(matches!(
             actions.as_slice(),
             [ForwardingAction::Nack(NackReason::NoRoute)]
@@ -185,7 +185,7 @@ mod tests {
         let name = Arc::new(Name::root());
         let m = MeasurementsTable::new();
         let ctx = make_ctx(&name, FaceId(0), None, &m);
-        assert!(s.after_receive_data(&ctx).await.is_empty());
+        assert!(s.after_receive_data(&ctx).is_empty());
     }
 
     #[test]

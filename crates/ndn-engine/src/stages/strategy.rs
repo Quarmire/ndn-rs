@@ -258,7 +258,7 @@ impl StrategyStage {
         let actions = if let Some(a) = strategy.decide_sync(&sctx) {
             a
         } else {
-            strategy.after_receive_interest_erased(&sctx).await
+            strategy.after_receive_interest_erased(&sctx)
         };
 
         // Self-learning discovery: expand `Broadcast` to every eligible face

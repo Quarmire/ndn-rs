@@ -1,5 +1,3 @@
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 
 use smallvec::SmallVec;
@@ -55,30 +53,21 @@ impl ErasedStrategy for ComposedStrategy {
         Some(self.apply_filters(ctx, actions))
     }
 
-    fn after_receive_interest_erased<'a>(
-        &'a self,
-        ctx: &'a StrategyContext<'a>,
-    ) -> Pin<Box<dyn Future<Output = SmallVec<[ForwardingAction; 2]>> + Send + 'a>> {
-        Box::pin(async move {
-            let actions = self.inner.after_receive_interest_erased(ctx).await;
-            self.apply_filters(ctx, actions)
-        })
+    fn after_receive_interest_erased(
+        &self,
+        ctx: &StrategyContext<'_>,
+    ) -> SmallVec<[ForwardingAction; 2]> {
+        let actions = self.inner.after_receive_interest_erased(ctx);
+        self.apply_filters(ctx, actions)
     }
 
-    fn on_nack_erased<'a>(
-        &'a self,
-        ctx: &'a StrategyContext<'a>,
-        reason: NackReason,
-    ) -> Pin<Box<dyn Future<Output = ForwardingAction> + Send + 'a>> {
-        Box::pin(async move {
-            let action = self.inner.on_nack_erased(ctx, reason).await;
-            let mut actions = SmallVec::new();
-            actions.push(action);
-            let filtered = self.apply_filters(ctx, actions);
-            filtered
-                .into_iter()
-                .next()
-                .unwrap_or(ForwardingAction::Suppress)
-        })
+    fn on_nack_erased(&self, ctx: &StrategyContext<'_>, reason: NackReason) -> ForwardingAction {
+        let action = self.inner.on_nack_erased(ctx, reason);
+        let mut actions = SmallVec::new();
+        actions.push(action);
+        self.apply_filters(ctx, actions)
+            .into_iter()
+            .next()
+            .unwrap_or(ForwardingAction::Suppress)
     }
 }

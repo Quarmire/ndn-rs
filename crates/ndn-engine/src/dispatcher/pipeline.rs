@@ -356,7 +356,7 @@ impl PacketDispatcher {
             .strategy_table
             .lpm(&name)
             .unwrap_or_else(|| Arc::clone(&self.strategy.default_strategy));
-        let action = strategy.on_nack_erased(&sctx, nack_reason).await;
+        let action = strategy.on_nack_erased(&sctx, nack_reason);
         match action {
             ForwardingAction::Forward(faces) => {
                 let interest_wire = nack.interest.raw().clone();
