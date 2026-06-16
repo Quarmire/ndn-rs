@@ -8,18 +8,14 @@ license.workspace = true
 [package.metadata.scope]
 classification = "spec"
 
-[features]
-default = ["spsc-shm"]
-spsc-shm = ["dep:ndn-face-shm"]
-
 [dependencies]
 ndn-packet     = { workspace = true, features = ["std"] }
 ndn-mgmt-wire  = { workspace = true }
 ndn-tlv        = { workspace = true, features = ["std"] }
 ndn-transport  = { workspace = true }
 ndn-face      = { workspace = true }
-ndn-face-shm  = { workspace = true, optional = true }
 ndn-security   = { workspace = true }
+async-trait    = { workspace = true }
 bytes         = { workspace = true, features = ["std"] }
 tokio          = { workspace = true, features = ["sync", "rt", "macros"] }
 tokio-util     = { workspace = true }

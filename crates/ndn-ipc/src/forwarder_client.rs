@@ -6,8 +6,10 @@
 //! instead — there's no separate forwarder daemon to connect to.
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -29,25 +31,72 @@ pub enum ForwarderError {
     MalformedResponse,
     #[error("signing failed: {0}")]
     SigningFailed(String),
-    #[cfg(all(
-        unix,
-        not(any(target_os = "android", target_os = "ios")),
-        feature = "spsc-shm"
-    ))]
-    #[error("SHM error: {0}")]
-    Shm(#[from] ndn_face_shm::ShmError),
+    /// An externally-registered data plane (e.g. the SHM ring in `ndn-ipc-shm`)
+    /// failed to set up or move bytes. Carries the impl's own error rendered as
+    /// text so this core crate need not know the data plane's error type.
+    #[error("data-plane error: {0}")]
+    DataPlane(String),
+}
+
+/// A pluggable client-side data plane for a [`ForwarderClient`].
+///
+/// The core crate ships only the Unix-socket data plane. Faster, non-standard
+/// data planes (the SHM ring in `ndn-ipc-shm`) live in their own crates and plug
+/// in here via [`register_data_plane_factory`] — that inversion keeps `ndn-ipc`
+/// (a spec crate) from ever depending on an extension face crate, so the two can
+/// live in independent repos. Object-safe + sans-io over the wire bytes.
+#[async_trait]
+pub trait DataPlane: Send + Sync {
+    /// Send one packet (already a bare NDN TLV; the data plane owns its framing).
+    async fn send(&self, pkt: Bytes) -> Result<(), ForwarderError>;
+    /// Send a batch; impls may coalesce wakeups. Default loops over [`send`].
+    async fn send_batch(&self, pkts: &[Bytes]) -> Result<(), ForwarderError> {
+        for pkt in pkts {
+            self.send(pkt.clone()).await?;
+        }
+        Ok(())
+    }
+    /// Receive the next packet, or `None` when the channel is closed.
+    async fn recv(&self) -> Option<Bytes>;
+    /// Router-side face id for this data plane — used for `rib/register` routing
+    /// and `faces/destroy` on close.
+    fn face_id(&self) -> u64;
+}
+
+/// Builds a [`DataPlane`] on demand during [`ForwarderClient::connect`].
+///
+/// Register the SHM factory once at process start with
+/// `ndn_ipc_shm::install()`; thereafter the standard `connect` paths attach the
+/// external data plane automatically, falling back to the Unix socket if it
+/// can't be set up. With no factory registered, every client is Unix-only.
+#[async_trait]
+pub trait DataPlaneFactory: Send + Sync {
+    /// Create the router-side face (via `mgmt`) and connect a data plane to it.
+    /// `cancel` is a child token fired on control-face disconnect.
+    async fn connect(
+        &self,
+        mgmt: &crate::mgmt_client::MgmtClient,
+        name: &str,
+        mtu: Option<usize>,
+        cancel: CancellationToken,
+    ) -> Result<Box<dyn DataPlane>, ForwarderError>;
+}
+
+static DATA_PLANE_FACTORY: OnceLock<Box<dyn DataPlaneFactory>> = OnceLock::new();
+
+/// Install the process-wide data-plane factory. Idempotent: the first call wins,
+/// later calls return `false` and are ignored. Called by `ndn_ipc_shm::install`.
+pub fn register_data_plane_factory(factory: Box<dyn DataPlaneFactory>) -> bool {
+    DATA_PLANE_FACTORY.set(factory).is_ok()
+}
+
+fn data_plane_factory() -> Option<&'static dyn DataPlaneFactory> {
+    DATA_PLANE_FACTORY.get().map(Box::as_ref)
 }
 
 enum DataTransport {
-    #[cfg(all(
-        unix,
-        not(any(target_os = "android", target_os = "ios")),
-        feature = "spsc-shm"
-    ))]
-    Shm {
-        handle: ndn_face_shm::spsc::SpscHandle,
-        face_id: u64,
-    },
+    /// An externally-registered fast data plane (e.g. SHM).
+    External(Box<dyn DataPlane>),
     Unix,
 }
 
@@ -110,28 +159,23 @@ impl ForwarderClient {
         let cancel = CancellationToken::new();
         let dead = Arc::new(AtomicBool::new(false));
 
-        #[cfg(all(
-            unix,
-            not(any(target_os = "android", target_os = "ios")),
-            feature = "spsc-shm"
-        ))]
-        if let Some(name) = shm_name {
-            match Self::setup_shm(&control, name, mtu, cancel.child_token()).await {
-                Ok(transport) => {
-                    let mgmt = crate::mgmt_client::MgmtClient::from_face(Arc::clone(&control));
+        if let (Some(name), Some(factory)) = (shm_name, data_plane_factory()) {
+            let mgmt = crate::mgmt_client::MgmtClient::from_face(Arc::clone(&control));
+            match factory.connect(&mgmt, name, mtu, cancel.child_token()).await {
+                Ok(dp) => {
                     return Ok(Self {
                         control,
                         mgmt,
                         mux: None,
                         recv_lock: Mutex::new(()),
-                        transport,
+                        transport: DataTransport::External(dp),
                         cancel,
                         dead,
                         monitor_started: AtomicU8::new(0),
                     });
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "SHM setup failed, falling back to Unix");
+                    tracing::warn!(error = %e, "data-plane setup failed, falling back to Unix");
                 }
             }
         }
@@ -181,29 +225,6 @@ impl ForwarderClient {
         })
     }
 
-    #[cfg(all(
-        unix,
-        not(any(target_os = "android", target_os = "ios")),
-        feature = "spsc-shm"
-    ))]
-    async fn setup_shm(
-        control: &Arc<IpcFace>,
-        shm_name: &str,
-        mtu: Option<usize>,
-        cancel: CancellationToken,
-    ) -> Result<DataTransport, ForwarderError> {
-        let mgmt = crate::mgmt_client::MgmtClient::from_face(Arc::clone(control));
-        let resp = mgmt
-            .face_create_with_mtu(&format!("shm://{shm_name}"), mtu.map(|m| m as u64))
-            .await?;
-        let face_id = resp.face_id.ok_or(ForwarderError::MalformedResponse)?;
-
-        let mut handle = ndn_face_shm::spsc::SpscHandle::connect(shm_name)?;
-        handle.set_cancel(cancel);
-
-        Ok(DataTransport::Shm { handle, face_id })
-    }
-
     /// `rib/register`. Routes to the SHM face when in SHM mode; in
     /// Unix mode `face_id = None` lets the router default to the
     /// requesting face (passing 0 would silently black-hole).
@@ -228,26 +249,16 @@ impl ForwarderClient {
     /// immediately rather than waiting for GC.
     pub async fn close(self) {
         self.cancel.cancel();
-        #[cfg(all(
-            unix,
-            not(any(target_os = "android", target_os = "ios")),
-            feature = "spsc-shm"
-        ))]
-        if let DataTransport::Shm { face_id, .. } = &self.transport {
-            let _ = self.mgmt.face_destroy(*face_id).await;
+        if let DataTransport::External(dp) = &self.transport {
+            let _ = self.mgmt.face_destroy(dp.face_id()).await;
         }
     }
 
     fn shm_face_id(&self) -> Option<u64> {
-        #[cfg(all(
-            unix,
-            not(any(target_os = "android", target_os = "ios")),
-            feature = "spsc-shm"
-        ))]
-        if let DataTransport::Shm { face_id, .. } = &self.transport {
-            return Some(*face_id);
+        match &self.transport {
+            DataTransport::External(dp) => Some(dp.face_id()),
+            DataTransport::Unix => None,
         }
-        None
     }
 
     /// Unix transport wraps `pkt` in a minimal NDNLPv2 LpPacket
@@ -256,14 +267,7 @@ impl ForwarderClient {
     /// LP — the engine handles framing.
     pub async fn send(&self, pkt: Bytes) -> Result<(), ForwarderError> {
         match &self.transport {
-            #[cfg(all(
-                unix,
-                not(any(target_os = "android", target_os = "ios")),
-                feature = "spsc-shm"
-            ))]
-            DataTransport::Shm { handle, .. } => {
-                handle.send_bytes(pkt).await.map_err(ForwarderError::Shm)
-            }
+            DataTransport::External(dp) => dp.send(pkt).await,
             DataTransport::Unix => {
                 let wire = encode_lp_packet(&pkt);
                 self.control
@@ -280,14 +284,7 @@ impl ForwarderClient {
             return Ok(());
         }
         match &self.transport {
-            #[cfg(all(
-                unix,
-                not(any(target_os = "android", target_os = "ios")),
-                feature = "spsc-shm"
-            ))]
-            DataTransport::Shm { handle, .. } => {
-                handle.send_batch(pkts).await.map_err(ForwarderError::Shm)
-            }
+            DataTransport::External(dp) => dp.send_batch(pkts).await,
             DataTransport::Unix => {
                 for pkt in pkts {
                     let wire = encode_lp_packet(pkt);
@@ -310,12 +307,7 @@ impl ForwarderClient {
         }
         self.start_monitor_once();
         match &self.transport {
-            #[cfg(all(
-                unix,
-                not(any(target_os = "android", target_os = "ios")),
-                feature = "spsc-shm"
-            ))]
-            DataTransport::Shm { handle, .. } => handle.recv_bytes().await,
+            DataTransport::External(dp) => dp.recv().await,
             DataTransport::Unix => {
                 let _guard = self.recv_lock.lock().await;
                 self.control.recv_bytes().await.ok().map(strip_lp)
@@ -334,12 +326,7 @@ impl ForwarderClient {
             return;
         }
 
-        #[cfg(all(
-            unix,
-            not(any(target_os = "android", target_os = "ios")),
-            feature = "spsc-shm"
-        ))]
-        if matches!(&self.transport, DataTransport::Shm { .. }) {
+        if matches!(&self.transport, DataTransport::External(_)) {
             let control = Arc::clone(&self.control);
             let cancel = self.cancel.clone();
             let dead = Arc::clone(&self.dead);
@@ -363,16 +350,10 @@ impl ForwarderClient {
         }
     }
 
+    /// True when an external fast data plane (e.g. SHM) is attached, rather than
+    /// the plain Unix-socket data plane.
     pub fn is_shm(&self) -> bool {
-        #[cfg(all(
-            unix,
-            not(any(target_os = "android", target_os = "ios")),
-            feature = "spsc-shm"
-        ))]
-        if matches!(&self.transport, DataTransport::Shm { .. }) {
-            return true;
-        }
-        false
+        matches!(&self.transport, DataTransport::External(_))
     }
 
     pub fn is_dead(&self) -> bool {

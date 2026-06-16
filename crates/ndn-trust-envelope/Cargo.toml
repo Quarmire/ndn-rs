@@ -13,3 +13,6 @@ thiserror = { workspace = true }
 [dev-dependencies]
 # only for the `emit` helper's `qr` mode (renders a payload SVG for testing)
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+
+[package.metadata.scope]
+classification = "extension"
