@@ -33,10 +33,6 @@ pub mod wfb;
 pub mod neighbor;
 pub mod radio;
 
-#[cfg(all(target_os = "linux", feature = "af-xdp"))]
-pub mod af_xdp;
-#[cfg(all(target_os = "linux", feature = "af-xdp"))]
-pub use af_xdp::AfXdpFace;
 
 #[cfg(target_os = "linux")]
 pub use af_packet::MacAddr;

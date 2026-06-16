@@ -40,11 +40,6 @@ udp-recvmmsg = ["net"]
 udp-sendmmsg = ["net"]
 local     = []
 l2        = []
-# AF_XDP kernel-bypass Ethernet I/O backend (Linux only). Pure-Rust aya (XDP
-# redirect program + XskMap) + xdpilone (UMEM/XSK rings). Implies l2 for the
-# shared Ethernet framing (EtherType 0x8624). See
-# `.claude/notes/afxdp-face-scope-2026-05-24.md`.
-af-xdp    = ["l2", "dep:aya", "dep:xdpilone"]
 # BLE peripheral (BleFace, Linux/macOS) + central (BleCentralFace,
 wfb       = ["l2"]
 
@@ -78,10 +73,6 @@ tokio             = { workspace = true, features = ["net"] }
 libc = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-# AF_XDP face (`af-xdp` feature). Pure-Rust: aya = XDP redirect prog + XskMap;
-# xdpilone = UMEM/XSK rings (deps: libc, spin — no libbpf/clang).
-aya = { version = "0.13", optional = true }
-xdpilone = { version = "1.3", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 

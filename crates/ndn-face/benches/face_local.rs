@@ -210,105 +210,10 @@ fn bench_unix_throughput(c: &mut Criterion) {
     }
 }
 
-// ─── SpscFace ─────────────────────────────────────────────────────────────────
-
-/// Round-trip latency over the SPSC SHM ring.
-///
-/// Includes two Unix-datagram wakeup round-trips (one per direction), which is
-/// why this matches `UnixFace` latency rather than `AppFace`.
-fn bench_spsc_latency(c: &mut Criterion) {
-    #[cfg(all(unix, feature = "spsc-shm"))]
-    {
-        use ndn_face::local::shm::spsc::{SpscFace, SpscHandle};
-
-        let rt = current_thread_rt();
-        let mut group = c.benchmark_group("spsc/latency");
-
-        for (&size, name) in [64_usize, 1_024, 8_192]
-            .iter()
-            .zip(["blt0", "blt1", "blt2"])
-        {
-            let pkt = make_pkt(size);
-            let (face, handle) = rt.block_on(async {
-                let face = SpscFace::create(FaceId(10), name).unwrap();
-                let handle = SpscHandle::connect(name).unwrap();
-                (face, handle)
-            });
-
-            group.bench_with_input(BenchmarkId::from_parameter(size), &pkt, |b, pkt| {
-                b.iter(|| {
-                    rt.block_on(async {
-                        handle.send_bytes(pkt.clone()).await.unwrap();
-                        face.recv_bytes().await.unwrap();
-                        face.send_bytes(pkt.clone()).await.unwrap();
-                        handle.recv_bytes().await.unwrap();
-                    });
-                });
-            });
-        }
-        group.finish();
-    }
-
-    #[cfg(not(all(unix, feature = "spsc-shm")))]
-    {
-        let _ = c;
-    }
-}
-
-/// Unidirectional throughput over the SPSC SHM ring.
-///
-/// `BATCH` is kept below the ring capacity (64 slots) so the producer never
-/// spins.  One wakeup datagram is sent per packet, which dominates cost.
-fn bench_spsc_throughput(c: &mut Criterion) {
-    #[cfg(all(unix, feature = "spsc-shm"))]
-    {
-        use ndn_face::local::shm::spsc::{DEFAULT_CAPACITY, SpscFace, SpscHandle};
-
-        let batch: u64 = (DEFAULT_CAPACITY as u64 / 2).max(1);
-        let rt = current_thread_rt();
-        let mut group = c.benchmark_group("spsc/throughput");
-        group.throughput(Throughput::Elements(batch));
-
-        for (&size, name) in [64_usize, 1_024, 8_192]
-            .iter()
-            .zip(["bth0", "bth1", "bth2"])
-        {
-            let pkt = make_pkt(size);
-            let (face, handle) = rt.block_on(async {
-                let face = SpscFace::create(FaceId(11), name).unwrap();
-                let handle = SpscHandle::connect(name).unwrap();
-                (face, handle)
-            });
-
-            group.bench_with_input(BenchmarkId::from_parameter(size), &pkt, |b, pkt| {
-                b.iter(|| {
-                    rt.block_on(async {
-                        for _ in 0..batch {
-                            handle.send_bytes(pkt.clone()).await.unwrap();
-                        }
-                        for _ in 0..batch {
-                            face.recv_bytes().await.unwrap();
-                        }
-                    });
-                });
-            });
-        }
-        group.finish();
-    }
-
-    #[cfg(not(all(unix, feature = "spsc-shm")))]
-    {
-        let _ = c;
-    }
-}
-
-// ─── Criterion wiring ─────────────────────────────────────────────────────────
-
 criterion_group!(
     appface_benches,
     bench_appface_latency,
     bench_appface_throughput
 );
 criterion_group!(unix_benches, bench_unix_latency, bench_unix_throughput);
-criterion_group!(spsc_benches, bench_spsc_latency, bench_spsc_throughput);
-criterion_main!(appface_benches, unix_benches, spsc_benches);
+criterion_main!(appface_benches, unix_benches);
