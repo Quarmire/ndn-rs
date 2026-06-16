@@ -1,0 +1,20 @@
+[package]
+name = "ndn-frame-io"
+description = "Backend-agnostic link-layer frame I/O for ndn-rs: the FrameIo trait, inject/capture frame types, on-air framing per FrameFormat, and reusable AF_PACKET + loopback backends. The substrate the radio faces (ndn-face-monitor-wifi) are built on."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+classification = "spec"
+
+[dependencies]
+ndn-transport = { workspace = true }
+bytes         = { workspace = true, features = ["std"] }
+async-trait   = { workspace = true }
+tokio         = { workspace = true, features = ["sync", "rt", "net", "time"] }
+
+# AF_PACKET raw-socket backend (Linux): monitor-mode inject/capture. The
+# loopback backend + the frame/radiotap codecs are platform-independent.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
