@@ -1,6 +1,7 @@
 use crate::ConfigError;
 use ndn_mgmt_wire::parse_cert_sha256_hex;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Top-level forwarder configuration loaded from TOML. See
 /// `examples/ndn-fwd.example.toml` for a fully-populated sample.
@@ -64,6 +65,14 @@ pub struct ForwarderConfig {
     /// node advertises so neighbors count it for density (A-LAL).
     #[serde(default)]
     pub cclf: CclfTomlConfig,
+
+    /// Generic config for EXTENSION subsystems that live outside the core
+    /// schema (their own crates/repos). Each `[extensions.<name>]` table is
+    /// handed to that extension verbatim; it deserializes its own slice via
+    /// [`Self::extension`]. Keeps ndn-config a CLOSED core schema — it never
+    /// needs to know a split-out subsystem's config shape.
+    #[serde(default)]
+    pub extensions: BTreeMap<String, toml::Value>,
 }
 
 /// CCLF presence configuration. See [`ForwarderConfig::cclf`].
@@ -685,6 +694,22 @@ impl ForwarderConfig {
     pub fn from_file(path: &std::path::Path) -> Result<Self, ConfigError> {
         let s = std::fs::read_to_string(path)?;
         s.parse()
+    }
+
+    /// Deserialize the `[extensions.<name>]` slice into an extension subsystem's
+    /// own config type. `Ok(None)` when the section is absent. This is the seam
+    /// that lets an out-of-core subsystem (its own crate/repo) own its config
+    /// schema while ndn-config stays a closed core schema — ndn-config hands
+    /// over the raw TOML and the extension parses it.
+    pub fn extension<T: serde::de::DeserializeOwned>(
+        &self,
+        name: &str,
+    ) -> Result<Option<T>, toml::de::Error> {
+        self.extensions
+            .get(name)
+            .cloned()
+            .map(toml::Value::try_into)
+            .transpose()
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -1475,6 +1500,36 @@ impl DiscoveryTomlConfig {
 mod tests {
     use super::*;
     use std::str::FromStr;
+
+    #[test]
+    fn extensions_passthrough_round_trips_a_subsystem_slice() {
+        #[derive(serde::Deserialize, PartialEq, Debug)]
+        struct MyRoutingCfg {
+            calc_interval_secs: u32,
+            neighbors: Vec<String>,
+        }
+        let cfg: ForwarderConfig = r#"
+            [extensions.my-routing]
+            calc_interval_secs = 15
+            neighbors = ["udp4://10.0.0.2:6363"]
+        "#
+        .parse()
+        .expect("parse");
+        // The core schema ignored the unknown subsystem; the extension reads its own slice.
+        let mine: MyRoutingCfg = cfg
+            .extension("my-routing")
+            .expect("deserialize")
+            .expect("present");
+        assert_eq!(
+            mine,
+            MyRoutingCfg {
+                calc_interval_secs: 15,
+                neighbors: vec!["udp4://10.0.0.2:6363".to_owned()],
+            }
+        );
+        // Absent extension → Ok(None).
+        assert!(cfg.extension::<MyRoutingCfg>("absent").unwrap().is_none());
+    }
 
     const SAMPLE_TOML: &str = r#"
 [engine]
