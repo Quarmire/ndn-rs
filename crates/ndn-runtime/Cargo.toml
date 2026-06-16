@@ -6,7 +6,9 @@ edition.workspace = true
 license.workspace = true
 
 [package.metadata.scope]
-classification = "extension"
+# Core async-runtime abstraction (Spawn/Sleep/Now): the spec engine + faces
+# depend on it so they need no cfg(wasm32). Part of the pure-library set.
+classification = "spec"
 
 [dependencies]
 # BoxFuture / LocalBoxFuture convenience types

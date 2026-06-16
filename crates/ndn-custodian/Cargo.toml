@@ -3,6 +3,11 @@ name = "ndn-custodian"
 version = "0.1.0"
 edition = "2024"
 
+[package.metadata.scope]
+# Identity stack: the wasm-safe key-custody trait/KeyId, depended on by
+# ndn-identity (spec). Part of the pure-library set.
+classification = "spec"
+
 [dependencies]
 # Declared by path (not inherited) so we can set default-features = false:
 # that drops ndn-security's `sqlite-pib` (rusqlite / C libsqlite3), keeping this

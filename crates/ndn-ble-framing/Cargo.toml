@@ -6,7 +6,10 @@ edition.workspace = true
 license.workspace = true
 
 [package.metadata.scope]
-classification = "extension"
+# Shared wire-framing codec depended on by ndn-face-native (spec), so it stays
+# in the library set like ndn-signals-core — the BLE *faces* move out, the shared
+# codec does not. (Latent cleanup: lift face-native's bluetooth module out too.)
+classification = "spec"
 
 [dependencies]
 # wasm-compatible (no tokio, no native-only deps) so the Web Bluetooth crate
