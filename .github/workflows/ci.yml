@@ -35,6 +35,17 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  dep-direction:
+    name: Dep-direction guard (spec set is closed)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Pure manifest parsing — no toolchain or build needed, so this fails fast
+      # if an edge from a spec crate into an extension/research/tooling crate
+      # sneaks in (the drift the repo split is meant to prevent).
+      - name: Run dep-direction guard
+        run: python3 testbed/dep-direction-guard.py
+
   core:
     name: Core (fmt / clippy / test / doc)
     runs-on: ubuntu-latest
