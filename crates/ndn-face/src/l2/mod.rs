@@ -1,10 +1,8 @@
-//! Layer-2 NDN faces: raw Ethernet (EtherType `0x8624`), Wifibroadcast NG,
-//! and Bluetooth LE.
+//! Layer-2 NDN faces: raw Ethernet (EtherType `0x8624`) and Wifibroadcast NG.
+//! (Bluetooth LE faces moved to the `ndn-face-bluetooth` extension crate.)
 //!
 //! - [`NamedEtherFace`] / [`MulticastEtherFace`] — unicast and multicast Ethernet
 //! - [`WfbFace`] — Wifibroadcast NG monitor-mode injection (Linux)
-//! - [`BleFace`] — NDNts `web-bluetooth-transport` GATT profile
-//!   (Linux/macOS, `bluetooth` feature)
 //! - [`RadioTable`] — link-metric registry for radio faces
 //!
 //! Backends: Linux `AF_PACKET`, macOS `PF_NDRV`, Windows Npcap. Mobile
@@ -30,13 +28,6 @@ pub mod multicast_ether;
 
 #[cfg(target_os = "linux")]
 pub mod wfb;
-
-// Peripheral (BleFace) is Linux/macOS; central (BleCentralFace) adds Windows.
-#[cfg(all(
-    any(target_os = "linux", target_os = "macos", target_os = "windows"),
-    feature = "bluetooth"
-))]
-pub mod bluetooth;
 
 #[cfg(target_os = "linux")]
 pub mod neighbor;
@@ -69,13 +60,6 @@ pub use multicast_ether::MulticastEtherFace;
 #[cfg(target_os = "linux")]
 pub use wfb::WfbFace;
 
-#[cfg(all(
-    any(target_os = "linux", target_os = "macos", target_os = "windows"),
-    feature = "bluetooth"
-))]
-pub use bluetooth::{BleCentralFace, BleFraming, NdntsReassembler};
-#[cfg(all(any(target_os = "linux", target_os = "macos"), feature = "bluetooth"))]
-pub use bluetooth::{BleFace, BleListener};
 
 #[cfg(target_os = "linux")]
 pub use neighbor::NeighborDiscovery;

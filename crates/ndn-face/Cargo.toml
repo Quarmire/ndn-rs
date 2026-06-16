@@ -15,7 +15,6 @@ license.workspace = true
 # local       – InProcFace/InProcHandle, IpcFace, UnixFace
 #               excluding Android/iOS)
 # l2          – Ethernet/WFB/BLE faces; platform cfg selects the right impl
-# bluetooth   – BleFace GATT stub (implies l2)
 # wfb         – WfbFace monitor-mode injection (implies l2; Linux only)
 
 [package.metadata.scope]
@@ -47,9 +46,6 @@ l2        = []
 # `.claude/notes/afxdp-face-scope-2026-05-24.md`.
 af-xdp    = ["l2", "dep:aya", "dep:xdpilone"]
 # BLE peripheral (BleFace, Linux/macOS) + central (BleCentralFace,
-# Linux/macOS/Windows). bluer covers Linux for both roles; btleplug covers
-# macOS/Windows central; objc2 covers macOS peripheral.
-bluetooth = ["l2", "dep:bluer", "dep:objc2", "dep:btleplug", "dep:uuid"]
 wfb       = ["l2"]
 
 [dependencies]
@@ -70,8 +66,6 @@ tracing       = { workspace = true }
 dashmap       = { workspace = true }
 
 # Optional deps gated by features
-# uuid parses the GATT profile UUID strings for the central backends.
-uuid              = { workspace = true, optional = true }
 
 # Native-only: tokio `net` pulls `mio` (no wasm32 support), and the WebSocket
 # face needs tokio-tungstenite. The net/websocket modules are gated off wasm.
@@ -84,22 +78,16 @@ tokio             = { workspace = true, features = ["net"] }
 libc = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-bluer = { workspace = true, optional = true }
 # AF_XDP face (`af-xdp` feature). Pure-Rust: aya = XDP redirect prog + XskMap;
 # xdpilone = UMEM/XSK rings (deps: libc, spin — no libbpf/clang).
 aya = { version = "0.13", optional = true }
 xdpilone = { version = "1.3", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-objc2 = { workspace = true, optional = true }
-# macOS BLE central via CoreBluetooth.
-btleplug = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 pcap        = { workspace = true }
 windows-sys = { workspace = true }
-# Windows BLE central via WinRT.
-btleplug = { workspace = true, optional = true }
 
 [dev-dependencies]
 ndn-tlv    = { workspace = true, features = ["std"] }

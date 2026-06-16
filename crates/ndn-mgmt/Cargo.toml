@@ -14,7 +14,6 @@ yubikey-piv = ["ndn-security/yubikey-piv", "ndn-cert/yubikey-challenge"]
 # Enables the ether:// faces/create arm (unicast NDN-over-Ethernet).
 l2          = ["ndn-face/l2"]
 # Enables ble:// (central) and ble-peripheral:// (server) faces/create arms.
-bluetooth   = ["ndn-face/bluetooth"]
 # Enables the wts:// faces/create arm (outbound WebTransport dial).
 
 [dependencies]

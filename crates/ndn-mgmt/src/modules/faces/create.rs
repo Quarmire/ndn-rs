@@ -60,24 +60,6 @@ pub(super) async fn faces_create(
         }
     }
 
-    // `ble://<name-or-address>[?opts]` dials a peripheral as a GATT central
-    // (Linux/macOS/Windows). The peripheral (GATT server) is NOT created here —
-    // it is an NFD-style listener configured via `[listeners.ble]` (see
-    // `ndn_face::l2::BleListener`). Any `?query` is split off the target; the
-    // params are a reserved extension point (e.g. `?adapter=hci0`).
-    #[cfg(all(not(target_arch = "wasm32"), feature = "bluetooth"))]
-    {
-        if let Some(rest) = uri.strip_prefix("ble://") {
-            let (target, query) = match rest.split_once('?') {
-                Some((t, q)) => (t, Some(q)),
-                None => (rest, None),
-            };
-            let framing = query.and_then(parse_ble_framing);
-            let adapter = query.and_then(|q| parse_ble_query(q, "adapter"));
-            return faces_create_ble_central(target, framing, adapter.as_deref(), engine).await;
-        }
-    }
-
     // Extension transports (`quic://`, `wts://`, …) the forwarder registered as
     // provisioners — `ndn-mgmt` constructs none of these itself, so it links no
     // extension face crate.
@@ -399,59 +381,4 @@ pub(super) fn parse_ether_uri(uri: &str) -> Result<(ndn_transport::MacAddr, Stri
     Ok((peer_mac, iface.to_owned()))
 }
 
-/// Parse `framing=ndnts|ndnlpv2` out of a `ble://` URI query string.
-#[cfg(all(not(target_arch = "wasm32"), feature = "bluetooth"))]
-fn parse_ble_framing(query: &str) -> Option<ndn_face::l2::BleFraming> {
-    let v = parse_ble_query(query, "framing")?;
-    match v.to_ascii_lowercase().as_str() {
-        "ndnts" => Some(ndn_face::l2::BleFraming::Ndnts),
-        "ndnlpv2" => Some(ndn_face::l2::BleFraming::Ndnlpv2),
-        _ => None,
-    }
-}
-
-/// Extract `key=value` from a `&`-separated query string.
-#[cfg(all(not(target_arch = "wasm32"), feature = "bluetooth"))]
-fn parse_ble_query(query: &str, key: &str) -> Option<String> {
-    query
-        .split('&')
-        .find_map(|kv| kv.strip_prefix(&format!("{key}=")))
-        .map(str::to_owned)
-}
-
-#[cfg(all(not(target_arch = "wasm32"), feature = "bluetooth"))]
-async fn faces_create_ble_central(
-    target: &str,
-    framing: Option<ndn_face::l2::BleFraming>,
-    adapter: Option<&str>,
-    engine: &ForwarderEngine,
-) -> ControlResponse {
-    let face_id = engine.faces().alloc_id();
-    match ndn_face::l2::BleCentralFace::connect(face_id, target, framing, adapter).await {
-        Ok(face) => {
-            let remote_uri = face
-                .remote_uri()
-                .unwrap_or_else(|| format!("ble://{target}"));
-            engine.add_face_with_persistency(
-                face,
-                CancellationToken::new(),
-                FacePersistency::Persistent,
-            );
-            tracing::info!(target: "mgmt.face", face = face_id.0, %target, "faces/create ble central");
-            let echo = ControlParameters {
-                face_id: Some(face_id.0),
-                uri: Some(remote_uri.clone()),
-                local_uri: Some(remote_uri),
-                face_persistency: Some(face_persistency_code(FacePersistency::Persistent)),
-                flags: face_flags(engine, face_id),
-                ..Default::default()
-            };
-            ControlResponse::ok("OK", echo)
-        }
-        Err(e) => {
-            tracing::warn!(target: "mgmt.face", error = %e, %target, "faces/create ble central failed");
-            ControlResponse::error(status::SERVER_ERROR, format!("BLE central failed: {e}"))
-        }
-    }
-}
 

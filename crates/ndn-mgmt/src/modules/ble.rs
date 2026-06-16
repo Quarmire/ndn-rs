@@ -1,6 +1,6 @@
 //! `/localhost/nfd/ble/{list, start, stop}` — BLE peripheral listener control
 //! and status. Backend is the host's [`crate::BleMgmtBackend`] (in `ndn-fwd`,
-//! over [`ndn_face::l2::BleListener`]). The central role is reached via
+//! over `ndn_face_bluetooth::BleListener`). The central role is reached via
 //! `faces/create ble://<addr>`, not this module.
 
 use std::sync::Arc;
