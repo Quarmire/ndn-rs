@@ -13,13 +13,9 @@ use std::sync::RwLock;
 use async_trait::async_trait;
 use ndn_mgmt_wire::ControlParameters;
 use ndn_engine::ForwarderEngine;
-#[cfg(not(target_arch = "wasm32"))]
-use ndn_packet::Name;
 use ndn_transport::FaceId;
 use tokio_util::sync::CancellationToken;
 
-#[cfg(not(target_arch = "wasm32"))]
-use ndn_discovery::{DiscoveryConfig, ServiceDiscoveryProtocol};
 #[cfg(not(target_arch = "wasm32"))]
 use ndn_security::FilePib;
 
@@ -123,13 +119,7 @@ pub struct MgmtContext<'a> {
     pub control_surfaces: &'a [Arc<dyn ndn_mgmt_wire::ControlSurface>],
     pub config: &'a dyn MgmtConfig,
     #[cfg(not(target_arch = "wasm32"))]
-    pub discovery_sd: Option<&'a ServiceDiscoveryProtocol>,
-    #[cfg(not(target_arch = "wasm32"))]
-    pub discovery_claimed: &'a [Name],
-    #[cfg(not(target_arch = "wasm32"))]
     pub pib: Option<&'a FilePib>,
-    #[cfg(not(target_arch = "wasm32"))]
-    pub discovery_cfg: Option<&'a Arc<RwLock<DiscoveryConfig>>>,
     pub security_is_ephemeral: bool,
     pub log_inspector: Option<&'a LogInspector>,
     pub coding_handler: Option<&'a Arc<dyn CodingHandler>>,

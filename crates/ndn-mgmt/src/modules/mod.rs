@@ -31,16 +31,16 @@ pub(crate) mod status;
 pub(crate) mod strategy;
 pub(crate) mod webtransport;
 
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) mod discovery;
+// `discovery` and `service` management modules moved to the `ndn-discovery`
+// crate (registered via `MgmtHandles::extra_modules`) so this core crate no
+// longer depends on the discovery extension. `neighbors` stays: its types live
+// in `ndn-discovery-core`.
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod neighbors;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod routing;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod security;
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) mod service;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use security::MgmtAccessPolicy;
@@ -68,9 +68,9 @@ pub fn register_builtins(router: &mut MgmtRouter) {
     #[cfg(not(target_arch = "wasm32"))]
     {
         router.register(Arc::new(routing::RoutingModule));
-        router.register(Arc::new(discovery::DiscoveryModule));
         router.register(Arc::new(neighbors::NeighborsModule));
-        router.register(Arc::new(service::ServiceModule));
         router.register(Arc::new(security::SecurityModule));
+        // discovery + service modules are registered by the host via
+        // MgmtHandles::extra_modules (they live in the ndn-discovery crate).
     }
 }

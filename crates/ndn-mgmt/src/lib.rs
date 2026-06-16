@@ -9,8 +9,6 @@ use std::sync::Arc;
 use std::sync::RwLock;
 
 use bytes::Bytes;
-#[cfg(not(target_arch = "wasm32"))]
-use ndn_discovery::{DiscoveryConfig, ServiceDiscoveryProtocol};
 use ndn_engine::ForwarderEngine;
 use ndn_face_local::InProcHandle;
 use ndn_packet::{Interest, Name, NameComponent};
@@ -51,6 +49,9 @@ pub use status_bridge::mount_routing_status;
 
 pub use auth::{COMMAND_SIG_TIME_TOLERANCE_MS, CommandReplayCache};
 pub use module::{CaInfo, MgmtConfig, MgmtContext, MgmtModule, MgmtRouter};
+// Re-exported for out-of-core mgmt modules (e.g. ndn-discovery's service module)
+// that enforce the same operator/reserved-name policy as the built-ins.
+pub use modules::common::{is_management_face, is_reserved_name};
 pub use modules::faces::{FaceEvent, FaceEventKind};
 pub use ndn_mgmt_wire::{ControlInfo, ControlStats, ControlSurface};
 pub use modules::faces::provision::{
@@ -126,8 +127,6 @@ impl ndn_transport::FaceLifecycleSink for NotificationFaceLifecycleSink {
 pub fn mount_management(
     engine: &ForwarderEngine,
     cancel: CancellationToken,
-    #[cfg(not(target_arch = "wasm32"))] discovery_sd: Option<Arc<ServiceDiscoveryProtocol>>,
-    #[cfg(not(target_arch = "wasm32"))] discovery_claimed: Vec<Name>,
     config: Arc<dyn crate::module::MgmtConfig>,
     #[cfg(not(target_arch = "wasm32"))] pib: Option<Arc<FilePib>>,
     handles: MgmtHandles,
@@ -165,10 +164,6 @@ pub fn mount_management(
             handle,
             engine,
             cancel,
-            #[cfg(not(target_arch = "wasm32"))]
-            discovery_sd,
-            #[cfg(not(target_arch = "wasm32"))]
-            discovery_claimed,
             config,
             #[cfg(not(target_arch = "wasm32"))]
             pib,
@@ -207,8 +202,6 @@ pub fn notifications_prefix(module_name: &'static [u8]) -> Name {
 /// Runtime handles for management of pluggable protocol components.
 #[derive(Default)]
 pub struct MgmtHandles {
-    #[cfg(not(target_arch = "wasm32"))]
-    pub discovery_cfg: Option<Arc<RwLock<DiscoveryConfig>>>,
     /// Whether the active signing identity is ephemeral (in-memory, not persisted).
     pub security_is_ephemeral: bool,
     /// Validator for signed command Interests.
@@ -566,8 +559,6 @@ pub async fn run_ndn_mgmt_handler(
     handle: InProcHandle,
     engine: ForwarderEngine,
     cancel: CancellationToken,
-    #[cfg(not(target_arch = "wasm32"))] discovery_sd: Option<Arc<ServiceDiscoveryProtocol>>,
-    #[cfg(not(target_arch = "wasm32"))] discovery_claimed: Vec<Name>,
     config: Arc<dyn crate::module::MgmtConfig>,
     #[cfg(not(target_arch = "wasm32"))] pib: Option<Arc<FilePib>>,
     mgmt_handles: MgmtHandles,
@@ -741,13 +732,7 @@ pub async fn run_ndn_mgmt_handler(
             control_surfaces: &mgmt_handles.control_surfaces,
             config: config.as_ref(),
             #[cfg(not(target_arch = "wasm32"))]
-            discovery_sd: discovery_sd.as_deref(),
-            #[cfg(not(target_arch = "wasm32"))]
-            discovery_claimed: &discovery_claimed,
-            #[cfg(not(target_arch = "wasm32"))]
             pib: pib.as_deref(),
-            #[cfg(not(target_arch = "wasm32"))]
-            discovery_cfg: mgmt_handles.discovery_cfg.as_ref(),
             security_is_ephemeral: mgmt_handles.security_is_ephemeral,
             log_inspector: mgmt_handles.log_inspector.as_deref(),
             coding_handler: mgmt_handles.coding_handler.as_ref(),

@@ -10,7 +10,7 @@ use ndn_transport::FaceId;
 /// Prefixes only operator (management) faces may register under.
 const RESERVED_PREFIXES: &[&str] = &["/ndn/local", "/localhost/nfd"];
 
-pub(crate) fn is_reserved_name(name: &Name) -> bool {
+pub fn is_reserved_name(name: &Name) -> bool {
     RESERVED_PREFIXES.iter().any(|r| {
         Name::from_str(r)
             .map(|p| name.has_prefix(&p) || *name == p)
@@ -20,7 +20,7 @@ pub(crate) fn is_reserved_name(name: &Name) -> bool {
 
 /// True for `FaceKind::Management` (operator socket) and for
 /// internally-generated commands (`source_face = None`).
-pub(crate) fn is_management_face(source_face: Option<FaceId>, engine: &ForwarderEngine) -> bool {
+pub fn is_management_face(source_face: Option<FaceId>, engine: &ForwarderEngine) -> bool {
     match source_face {
         None => true,
         Some(fid) => engine

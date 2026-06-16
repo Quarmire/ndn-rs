@@ -120,13 +120,7 @@ mod tests {
             control_surfaces: &[],
             config,
             #[cfg(not(target_arch = "wasm32"))]
-            discovery_sd: None,
-            #[cfg(not(target_arch = "wasm32"))]
-            discovery_claimed: &[],
-            #[cfg(not(target_arch = "wasm32"))]
             pib: None,
-            #[cfg(not(target_arch = "wasm32"))]
-            discovery_cfg: None,
             security_is_ephemeral: false,
             log_inspector: None,
             coding_handler: None,

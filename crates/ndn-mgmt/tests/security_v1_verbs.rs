@@ -52,7 +52,6 @@ async fn setup() -> (
         extra_modules: Vec::new(),
         face_provisioners: Vec::new(),
         control_surfaces: Vec::new(),
-        discovery_cfg: None,
         security_is_ephemeral: true,
         command_validator: None,
         localhop_command_validator: None,
@@ -71,8 +70,6 @@ async fn setup() -> (
     let fut = mount_management(
         &engine,
         cancel.clone(),
-        None,
-        Vec::new(),
         Arc::new(ndn_config::ForwarderConfig::default()),
         None,
         mgmt_handles,

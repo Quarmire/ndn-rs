@@ -58,11 +58,12 @@ getrandom        = { workspace = true }
 serde            = { workspace = true, features = ["derive"] }
 serde_json       = { workspace = true }
 
-# Native-only deps. ndn-discovery/ndn-routing both pull tokio's `net`
-# feature (mio), which does not build on wasm32.
+# Native-only deps. ndn-discovery-core pulls tokio's `net` feature (mio), which
+# does not build on wasm32. (Routing/discovery management modules have moved to
+# their own crates and register via `MgmtHandles::extra_modules`, so mgmt no
+# longer depends on ndn-routing/ndn-discovery — only on the shared core types.)
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-ndn-discovery    = { workspace = true, features = ["udp-hello"] }
-ndn-routing      = { workspace = true }
+ndn-discovery-core = { workspace = true }
 ndn-face        = { workspace = true }
 # Optional: the wts:// faces/create dialer (pulls the QUIC stack).
 # ndn-app powers the status_bridge.rs Producer mount (ARCH-6 / S11).

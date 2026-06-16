@@ -262,7 +262,7 @@ async fn udp_rx_loop(
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_nanos() as u64;
-                let meta = ndn_discovery::InboundMeta::udp(src);
+                let meta = ndn_discovery_core::InboundMeta::udp(src);
                 if engine.inject_packet(raw, face_id, arrival, meta).await.is_err() {
                     break;
                 }

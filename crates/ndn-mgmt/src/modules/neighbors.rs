@@ -8,7 +8,7 @@ use ndn_mgmt_wire::{
     control_response::status,
     nfd_command::{module, verb},
 };
-use ndn_discovery::NeighborState;
+use ndn_discovery_core::NeighborState;
 use ndn_engine::ForwarderEngine;
 
 use crate::MgmtResponse;
