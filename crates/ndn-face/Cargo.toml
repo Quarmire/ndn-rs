@@ -16,7 +16,6 @@ license.workspace = true
 # local       – InProcFace/InProcHandle, IpcFace, UnixFace
 # spsc-shm    – ShmFace/ShmHandle zero-copy ring (implies local; Unix only,
 #               excluding Android/iOS)
-# serial      – SerialFace with COBS framing (requires tokio-serial)
 # l2          – Ethernet/WFB/BLE faces; platform cfg selects the right impl
 # bluetooth   – BleFace GATT stub (implies l2)
 # wfb         – WfbFace monitor-mode injection (implies l2; Linux only)
@@ -46,7 +45,6 @@ websocket     = ["net", "dep:tokio-tungstenite"]
 websocket-tls = ["websocket", "dep:tokio-rustls", "dep:rcgen", "dep:rustls-pemfile"]
 local     = []
 spsc-shm  = ["local"]
-serial    = ["dep:tokio-serial"]
 l2        = []
 # AF_XDP kernel-bypass Ethernet I/O backend (Linux only). Pure-Rust aya (XDP
 # redirect program + XskMap) + xdpilone (UMEM/XSK rings). Implies l2 for the
@@ -80,7 +78,6 @@ dashmap       = { workspace = true }
 tokio-rustls      = { workspace = true, optional = true }
 rcgen             = { workspace = true, optional = true }
 rustls-pemfile    = { workspace = true, optional = true }
-tokio-serial      = { workspace = true, optional = true }
 # uuid parses the GATT profile UUID strings for the central backends.
 uuid              = { workspace = true, optional = true }
 

@@ -4,8 +4,9 @@
 //! |--------|-------|---------|
 //! | [`net`] | [`UdpFace`], [`TcpFace`], [`MulticastUdpFace`], [`WebSocketFace`] | `net` / `websocket` |
 //! | [`local`] | [`InProcFace`], [`InProcHandle`], [`ShmFace`], [`UnixFace`], [`IpcFace`] | `local` / `spsc-shm` |
-//! | [`serial`] | [`SerialFace`], [`CobsCodec`] | `serial` |
 //! | [`l2`] | [`NamedEtherFace`], [`MulticastEtherFace`], [`BleFace`], [`WfbFace`] | `l2` / `bluetooth` / `wfb` |
+//!
+//! Serial/UART faces moved to the `ndn-face-serial` extension crate.
 //! | [`callback`] | [`CallbackFace`] | *(always available)* |
 //!
 //! [`CallbackFace`] is the NDN virtual face pattern: an in-process face that
@@ -33,9 +34,6 @@ pub mod provision;
 
 #[cfg(feature = "local")]
 pub mod local;
-
-#[cfg(feature = "serial")]
-pub mod serial;
 
 #[cfg(feature = "l2")]
 pub mod l2;
@@ -65,13 +63,6 @@ pub use local::{
     feature = "spsc-shm"
 ))]
 pub use local::{ShmError, ShmFace, ShmHandle};
-
-#[cfg(feature = "serial")]
-pub use serial::SerialFace;
-#[cfg(feature = "serial")]
-pub use serial::cobs::CobsCodec;
-#[cfg(all(feature = "serial", feature = "serial"))]
-pub use serial::serial_face_open;
 
 #[cfg(feature = "l2")]
 pub use l2::NDN_ETHERTYPE;
