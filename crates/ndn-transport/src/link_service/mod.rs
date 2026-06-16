@@ -252,6 +252,14 @@ impl LpLinkService {
         &self.features
     }
 
+    /// Register a custom per-LP-frame feature on this link service (e.g. the
+    /// named-radio control plane). It runs in the egress/ingress pipeline and is
+    /// pumped by the engine's per-face tick alongside the built-in features.
+    pub fn with_extra_feature(mut self, feature: Arc<dyn LinkServiceFeature>) -> Self {
+        self.features.push(feature);
+        self
+    }
+
     pub fn reliability_feature(&self) -> &Arc<ReliabilityFeature> {
         &self.reliability_feature
     }
