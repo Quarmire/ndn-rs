@@ -6,6 +6,7 @@ mod create;
 mod datasets;
 mod events;
 mod update;
+pub mod provision;
 
 use async_trait::async_trait;
 
@@ -52,9 +53,10 @@ async fn handle_faces(
     params: ControlParameters,
     source_face: Option<FaceId>,
     engine: &ForwarderEngine,
+    provisioners: &[std::sync::Arc<dyn crate::FaceProvisioner>],
 ) -> VerbOutcome {
     match verb_name {
-        v if v == verb::CREATE => faces_create(params, source_face, engine).await.into(),
+        v if v == verb::CREATE => faces_create(params, source_face, engine, provisioners).await.into(),
         v if v == verb::UPDATE => {
             let (response, events) = faces_update(params, source_face, engine);
             VerbOutcome {
@@ -133,7 +135,8 @@ impl MgmtModule for FacesModule {
         params: ControlParameters,
         ctx: &MgmtContext<'_>,
     ) -> MgmtResponse {
-        let outcome = handle_faces(verb, params, ctx.source_face, ctx.engine).await;
+        let outcome =
+            handle_faces(verb, params, ctx.source_face, ctx.engine, ctx.face_provisioners).await;
         let VerbOutcome { response, events } = outcome;
 
         if let Some(stream) = ctx.face_events {

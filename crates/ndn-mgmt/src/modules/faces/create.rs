@@ -20,6 +20,7 @@ pub(super) async fn faces_create(
     params: ControlParameters,
     source_face: Option<FaceId>,
     engine: &ForwarderEngine,
+    provisioners: &[std::sync::Arc<dyn crate::FaceProvisioner>],
 ) -> ControlResponse {
     let uri = match &params.uri {
         Some(u) => u.clone(),
@@ -63,25 +64,6 @@ pub(super) async fn faces_create(
         }
     }
 
-    // `wts://host:port[?cert=<sha256hex>]` dials a WebTransport peer
-    // (forwarder-to-forwarder over QUIC/HTTP3). `?cert=` pins a self-signed
-    // peer's leaf cert; without it the OS trust store (WebPKI) is used.
-    #[cfg(all(not(target_arch = "wasm32"), feature = "webtransport"))]
-    {
-        if uri.starts_with("wts://") {
-            return faces_create_webtransport(&uri, engine).await;
-        }
-    }
-
-    // `quic://host:port?cert=<sha256hex>` dials a raw-QUIC backbone peer. The
-    // `?cert=` pin is required (no WebPKI path for the raw-QUIC dialer).
-    #[cfg(all(not(target_arch = "wasm32"), feature = "quic"))]
-    {
-        if uri.starts_with("quic://") {
-            return faces_create_quic(&uri, engine).await;
-        }
-    }
-
     // `ble://<name-or-address>[?opts]` dials a peripheral as a GATT central
     // (Linux/macOS/Windows). The peripheral (GATT server) is NOT created here —
     // it is an NFD-style listener configured via `[listeners.ble]` (see
@@ -97,6 +79,42 @@ pub(super) async fn faces_create(
             let framing = query.and_then(parse_ble_framing);
             let adapter = query.and_then(|q| parse_ble_query(q, "adapter"));
             return faces_create_ble_central(target, framing, adapter.as_deref(), engine).await;
+        }
+    }
+
+    // Extension transports (`quic://`, `wts://`, …) the forwarder registered as
+    // provisioners — `ndn-mgmt` constructs none of these itself, so it links no
+    // extension face crate.
+    for p in provisioners {
+        if p.handles(&uri) {
+            return match p
+                .provision(crate::ProvisionRequest {
+                    uri: &uri,
+                    params: &params,
+                    source_face,
+                    engine,
+                })
+                .await
+            {
+                Ok(pf) => {
+                    tracing::info!(target: "mgmt.face", face = pf.face_id.0, uri = %pf.remote_uri, "faces/create (provisioner)");
+                    let echo = ControlParameters {
+                        face_id: Some(pf.face_id.0),
+                        uri: Some(pf.remote_uri),
+                        local_uri: pf.local_uri,
+                        face_persistency: Some(face_persistency_code(pf.persistency)),
+                        flags: face_flags(engine, pf.face_id),
+                        ..Default::default()
+                    };
+                    ControlResponse::ok("OK", echo)
+                }
+                Err(crate::ProvisionError::BadParams(m)) => {
+                    ControlResponse::error(status::BAD_PARAMS, m)
+                }
+                Err(crate::ProvisionError::Server(m)) => {
+                    ControlResponse::error(status::SERVER_ERROR, m)
+                }
+            };
         }
     }
 
@@ -383,140 +401,6 @@ pub(super) fn parse_ether_uri(uri: &str) -> Result<(ndn_transport::MacAddr, Stri
         .parse()
         .map_err(|_| format!("invalid peer MAC '{mac_str}'"))?;
     Ok((peer_mac, iface.to_owned()))
-}
-
-/// Dial a `wts://host:port[?cert=<sha256hex>]` WebTransport peer.
-#[cfg(all(not(target_arch = "wasm32"), feature = "webtransport"))]
-async fn faces_create_webtransport(uri: &str, engine: &ForwarderEngine) -> ControlResponse {
-    use ndn_face_webtransport::WebTransportFace;
-    use ndn_transport::ClientTls;
-
-    let rest = uri.strip_prefix("wts://").unwrap_or(uri);
-    let (authority, query) = match rest.split_once('?') {
-        Some((a, q)) => (a, Some(q)),
-        None => (rest, None),
-    };
-
-    // `?cert=<sha256hex>` pins a self-signed peer; absence falls back to WebPKI.
-    let cert_hex = query.and_then(|q| {
-        q.split('&')
-            .find_map(|kv| kv.strip_prefix("cert="))
-            .map(str::to_owned)
-    });
-    let tls = match cert_hex {
-        Some(hex) => match ndn_mgmt_wire::parse_cert_sha256_hex(&hex) {
-            Some(h) => ClientTls::CertHashes(vec![h]),
-            None => {
-                return ControlResponse::error(
-                    status::BAD_PARAMS,
-                    format!("invalid cert hash (need 64 hex chars): {hex}"),
-                );
-            }
-        },
-        None => ClientTls::WebPki,
-    };
-
-    let face_id = engine.faces().alloc_id();
-    let url = format!("https://{authority}");
-    match WebTransportFace::connect(face_id, &url, tls).await {
-        Ok(face) => {
-            let local_uri = face.local_uri().unwrap_or_default();
-            let cancel = CancellationToken::new();
-            engine.add_face_with_persistency(face, cancel, FacePersistency::Persistent);
-            tracing::info!(target: "mgmt.face", face = face_id.0, remote = %authority, "faces/create wts");
-            let echo = ControlParameters {
-                face_id: Some(face_id.0),
-                uri: Some(format!("wts://{authority}")),
-                local_uri: Some(local_uri),
-                face_persistency: Some(face_persistency_code(FacePersistency::Persistent)),
-                flags: face_flags(engine, face_id),
-                ..Default::default()
-            };
-            ControlResponse::ok("OK", echo)
-        }
-        Err(e) => {
-            tracing::warn!(target: "mgmt.face", error = %e, remote = %authority, "faces/create wts failed");
-            ControlResponse::error(
-                status::SERVER_ERROR,
-                format!("WebTransport face creation failed: {e}"),
-            )
-        }
-    }
-}
-
-/// Dial a `quic://host:port?cert=<sha256hex>` (pin) or `quic://host:port?webpki`
-/// (validate against WebPKI roots) raw-QUIC peer.
-#[cfg(all(not(target_arch = "wasm32"), feature = "quic"))]
-async fn faces_create_quic(uri: &str, engine: &ForwarderEngine) -> ControlResponse {
-    use ndn_face_quic::QuicConnector;
-    use ndn_transport::ClientTls;
-
-    let rest = uri.strip_prefix("quic://").unwrap_or(uri);
-    let (authority, query) = match rest.split_once('?') {
-        Some((a, q)) => (a, Some(q)),
-        None => (rest, None),
-    };
-    let params: Vec<&str> = query.map(|q| q.split('&').collect()).unwrap_or_default();
-    let cert_hex = params.iter().find_map(|kv| kv.strip_prefix("cert="));
-    let webpki = params
-        .iter()
-        .any(|kv| *kv == "webpki" || *kv == "webpki=true");
-
-    let tls = if let Some(hex) = cert_hex {
-        match ndn_mgmt_wire::parse_cert_sha256_hex(hex) {
-            Some(h) => ClientTls::CertHashes(vec![h]),
-            None => {
-                return ControlResponse::error(
-                    status::BAD_PARAMS,
-                    format!("invalid cert hash (need 64 hex chars): {hex}"),
-                );
-            }
-        }
-    } else if webpki {
-        ClientTls::WebPki
-    } else {
-        return ControlResponse::error(
-            status::BAD_PARAMS,
-            "quic:// requires ?cert=<64 hex chars> (pin) or ?webpki",
-        );
-    };
-
-    let connector = match QuicConnector::new(tls) {
-        Ok(c) => c,
-        Err(e) => {
-            return ControlResponse::error(status::SERVER_ERROR, format!("QUIC connector: {e}"));
-        }
-    };
-    let face_id = engine.faces().alloc_id();
-    // The connector (endpoint) may drop after connect; the face's streams keep
-    // the connection and its I/O driver alive.
-    match connector.connect_authority(face_id, authority).await {
-        Ok(face) => {
-            let local_uri = face.local_uri().unwrap_or_default();
-            engine.add_face_with_persistency(
-                face,
-                CancellationToken::new(),
-                FacePersistency::Persistent,
-            );
-            tracing::info!(target: "mgmt.face", face = face_id.0, remote = %authority, "faces/create quic");
-            let echo = ControlParameters {
-                face_id: Some(face_id.0),
-                uri: Some(format!("quic://{authority}")),
-                local_uri: Some(local_uri),
-                face_persistency: Some(face_persistency_code(FacePersistency::Persistent)),
-                flags: face_flags(engine, face_id),
-                ..Default::default()
-            };
-            ControlResponse::ok("OK", echo)
-        }
-        Err(e) => {
-            tracing::warn!(target: "mgmt.face", error = %e, remote = %authority, "faces/create quic failed");
-            ControlResponse::error(
-                status::SERVER_ERROR,
-                format!("QUIC face creation failed: {e}"),
-            )
-        }
-    }
 }
 
 /// Parse `framing=ndnts|ndnlpv2` out of a `ble://` URI query string.

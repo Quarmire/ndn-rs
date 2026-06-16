@@ -50,6 +50,7 @@ async fn setup() -> (
     let cancel = CancellationToken::new();
     let mgmt_handles = MgmtHandles {
         extra_modules: Vec::new(),
+        face_provisioners: Vec::new(),
         discovery_cfg: None,
         security_is_ephemeral: true,
         command_validator: None,

@@ -437,6 +437,7 @@ mod security_v1_handler_tests {
 
         let handles_runtime = MgmtHandles {
             extra_modules: Vec::new(),
+            face_provisioners: Vec::new(),
             discovery_cfg: None,
             security_is_ephemeral: true,
             command_validator: None,
@@ -457,6 +458,7 @@ mod security_v1_handler_tests {
 
         let handles_static = MgmtHandles {
             extra_modules: Vec::new(),
+            face_provisioners: Vec::new(),
             runtime_policy: None,
             ..handles_runtime
         };

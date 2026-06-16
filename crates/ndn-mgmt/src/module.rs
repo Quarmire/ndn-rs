@@ -116,6 +116,9 @@ pub struct MgmtContext<'a> {
     pub engine: &'a ForwarderEngine,
     pub cancel: &'a CancellationToken,
     pub source_face: Option<FaceId>,
+    /// Extension-transport face builders the forwarder registered (quic://,
+    /// wts://, …). Empty in hosts that mount only the standard transports.
+    pub face_provisioners: &'a [Arc<dyn crate::FaceProvisioner>],
     pub config: &'a dyn MgmtConfig,
     #[cfg(not(target_arch = "wasm32"))]
     pub discovery_sd: Option<&'a ServiceDiscoveryProtocol>,
