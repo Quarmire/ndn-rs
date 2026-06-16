@@ -87,6 +87,7 @@ pub mod cope_mesh;
 pub mod endpoint;
 pub mod fec;
 pub mod field;
+pub mod link_fec;
 pub mod metadata;
 #[cfg(feature = "mgmt")]
 pub mod mgmt;
@@ -104,6 +105,7 @@ pub use config::{CodingConfig, CodingPolicyConfig};
 #[cfg(feature = "endpoint")]
 pub use endpoint::{CodedFetcher, CodedProducer, FetchConfig};
 pub use fec::{Decoder, Encoder};
+pub use link_fec::{LINK_FEC_MAGIC, LinkFecRx, LinkFecTx};
 pub use metadata::{FecMetadata, SegmentRole, prepend_metadata, split_metadata};
 #[cfg(feature = "mgmt")]
 pub use mgmt::{CodingMgmtHandler, CodingPolicyEntry};
