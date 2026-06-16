@@ -52,6 +52,7 @@ pub use status_bridge::mount_routing_status;
 pub use auth::{COMMAND_SIG_TIME_TOLERANCE_MS, CommandReplayCache};
 pub use module::{CaInfo, MgmtConfig, MgmtContext, MgmtModule, MgmtRouter};
 pub use modules::faces::{FaceEvent, FaceEventKind};
+pub use ndn_mgmt_wire::{ControlInfo, ControlStats, ControlSurface};
 pub use modules::faces::provision::{
     FaceProvisioner, ProvisionError, ProvisionRequest, ProvisionedFace,
 };
@@ -244,6 +245,10 @@ pub struct MgmtHandles {
     /// …). `ndn-mgmt` links no extension face crate; the forwarder registers
     /// these so `faces/create` can dial them. Empty = standard transports only.
     pub face_provisioners: Vec<Arc<dyn FaceProvisioner>>,
+    /// Pluggable introspection/control surfaces for out-of-core subsystems
+    /// (routing, discovery, custom strategies, ext faces). Served generically at
+    /// `/localhost/nfd/ext/…`. Empty = no extensions registered.
+    pub control_surfaces: Vec<Arc<dyn ndn_mgmt_wire::ControlSurface>>,
 }
 
 impl MgmtHandles {
@@ -733,6 +738,7 @@ pub async fn run_ndn_mgmt_handler(
             cancel: &cancel,
             source_face,
             face_provisioners: &mgmt_handles.face_provisioners,
+            control_surfaces: &mgmt_handles.control_surfaces,
             config: config.as_ref(),
             #[cfg(not(target_arch = "wasm32"))]
             discovery_sd: discovery_sd.as_deref(),

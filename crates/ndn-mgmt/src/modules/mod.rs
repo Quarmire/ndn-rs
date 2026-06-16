@@ -18,6 +18,7 @@ pub(crate) mod ca;
 pub(crate) mod coding;
 pub(crate) mod compute;
 pub(crate) mod config;
+pub(crate) mod ext;
 pub(crate) mod cs;
 pub(crate) mod faces;
 pub(crate) mod fib;
@@ -54,6 +55,7 @@ pub fn register_builtins(router: &mut MgmtRouter) {
     router.register(Arc::new(status::StatusModule));
     router.register(Arc::new(measurements::MeasurementsModule));
     router.register(Arc::new(config::ConfigModule));
+    router.register(Arc::new(ext::ExtModule));
     router.register(Arc::new(log::LogModule));
     router.register(Arc::new(coding::CodingModule));
     router.register(Arc::new(compute::ComputeModule));

@@ -117,6 +117,7 @@ mod tests {
             cancel,
             source_face: None,
             face_provisioners: &[],
+            control_surfaces: &[],
             config,
             #[cfg(not(target_arch = "wasm32"))]
             discovery_sd: None,

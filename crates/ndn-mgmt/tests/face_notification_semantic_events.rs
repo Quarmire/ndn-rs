@@ -43,6 +43,7 @@ async fn setup() -> TestEnv {
     let mgmt_handles = MgmtHandles {
         extra_modules: Vec::new(),
         face_provisioners: Vec::new(),
+        control_surfaces: Vec::new(),
         discovery_cfg: None,
         security_is_ephemeral: true,
         command_validator: None,

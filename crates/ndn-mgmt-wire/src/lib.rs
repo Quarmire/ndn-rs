@@ -24,11 +24,13 @@ use ndn_tlv::{TlvReader, TlvWriter};
 // the forwarder-TOML extension crate). ndn-config re-exports them for back-compat.
 pub mod control_parameters;
 pub mod control_response;
+pub mod control_surface;
 pub mod nfd_command;
 pub mod nfd_dataset;
 
 pub use control_parameters::ControlParameters;
 pub use control_response::ControlResponse;
+pub use control_surface::{ControlInfo, ControlStats, ControlSurface, render_pairs};
 pub use nfd_command::{ParsedCommand, command_name, dataset_name, parse_command_name};
 pub use nfd_dataset::{FaceStatus, FibEntry, NextHopRecord, RibEntry, Route, StrategyChoice};
 

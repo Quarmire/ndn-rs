@@ -43,6 +43,7 @@ fn ctx<'a>(
         cancel,
         source_face: None,
         face_provisioners: &[],
+        control_surfaces: &[],
         config,
         discovery_sd: None,
         discovery_claimed: &[],

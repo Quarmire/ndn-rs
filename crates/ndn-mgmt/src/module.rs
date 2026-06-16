@@ -119,6 +119,8 @@ pub struct MgmtContext<'a> {
     /// Extension-transport face builders the forwarder registered (quic://,
     /// wts://, …). Empty in hosts that mount only the standard transports.
     pub face_provisioners: &'a [Arc<dyn crate::FaceProvisioner>],
+    /// Out-of-core subsystem introspection/control surfaces (served at `ext/…`).
+    pub control_surfaces: &'a [Arc<dyn ndn_mgmt_wire::ControlSurface>],
     pub config: &'a dyn MgmtConfig,
     #[cfg(not(target_arch = "wasm32"))]
     pub discovery_sd: Option<&'a ServiceDiscoveryProtocol>,
