@@ -3,6 +3,7 @@
 //! code never needs `cfg(target_arch = "wasm32")` for time/spawn.
 
 use std::future::Future;
+use std::task::{Context, Poll};
 use std::{pin::Pin, sync::Arc, time::Duration};
 
 pub use web_time::Instant;
@@ -14,6 +15,52 @@ pub type BoxFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
 #[cfg(target_arch = "wasm32")]
 pub type BoxFuture = Pin<Box<dyn Future<Output = ()> + 'static>>;
+
+/// A runtime-agnostic handle to a spawned task that resolves when the task
+/// completes. Awaiting it is used for **ordered teardown** (e.g. waiting for a
+/// protocol's task to release its `Arc`s before a downstream flush); dropping it
+/// does **not** cancel the task. Replaces leaking a `tokio::task::JoinHandle`
+/// through portable trait surfaces. Wraps the platform's own (Send + Sync)
+/// completion handle so it can sit in shared engine state.
+#[cfg(not(target_arch = "wasm32"))]
+pub struct TaskHandle(tokio::task::JoinHandle<()>);
+
+#[cfg(target_arch = "wasm32")]
+pub struct TaskHandle(futures::channel::oneshot::Receiver<()>);
+
+impl Future for TaskHandle {
+    type Output = ();
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        Pin::new(&mut self.0).poll(cx).map(|_| ())
+    }
+}
+
+/// Spawn `fut` on the ambient default runtime, returning an awaitable
+/// [`TaskHandle`]. Native: a `tokio` task (must run inside a Tokio runtime).
+/// wasm: `spawn_local` + a oneshot completion signal.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn spawn_task(fut: BoxFuture) -> TaskHandle {
+    TaskHandle(tokio::spawn(fut))
+}
+
+/// Wrap an existing native `tokio` task handle — lets impl crates that already
+/// `tokio::spawn` internally hand back a runtime-agnostic [`TaskHandle`].
+#[cfg(not(target_arch = "wasm32"))]
+impl From<tokio::task::JoinHandle<()>> for TaskHandle {
+    fn from(jh: tokio::task::JoinHandle<()>) -> Self {
+        TaskHandle(jh)
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn spawn_task(fut: BoxFuture) -> TaskHandle {
+    let (tx, rx) = futures::channel::oneshot::channel::<()>();
+    wasm_bindgen_futures::spawn_local(async move {
+        fut.await;
+        let _ = tx.send(());
+    });
+    TaskHandle(rx)
+}
 
 pub trait Spawn: Send + Sync + 'static {
     fn spawn(&self, fut: BoxFuture);

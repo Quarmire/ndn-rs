@@ -4,7 +4,7 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use ndn_discovery_core::NeighborTable;
 use ndn_packet::Name;
-use tokio::task::JoinHandle;
+use ndn_runtime::TaskHandle;
 use tokio_util::sync::CancellationToken;
 
 use ndn_transport::FaceTable;
@@ -201,8 +201,10 @@ pub trait RoutingProtocol: Send + Sync + 'static {
     /// `ndn_config::control_parameters::origin`.
     fn origin(&self) -> u64;
 
-    /// Run until `cancel` is cancelled.
-    fn start(&self, handle: RoutingHandle, cancel: CancellationToken) -> JoinHandle<()>;
+    /// Run until `cancel` is cancelled. Returns an awaitable [`TaskHandle`]
+    /// (runtime-agnostic — no `tokio::task::JoinHandle` in the trait surface, so
+    /// this stays portable into a tokio-free `fwd-core`).
+    fn start(&self, handle: RoutingHandle, cancel: CancellationToken) -> TaskHandle;
 
     /// Operator-visible state. Default is an empty status with the origin.
     fn status(&self) -> RoutingProtocolStatus {
@@ -224,7 +226,7 @@ struct ProtocolHandle {
     cancel: CancellationToken,
     /// Awaited by `RoutingManager::disable` so any `Arc<…>` clones held by
     /// the protocol's task are released before the RIB flush runs.
-    task: JoinHandle<()>,
+    task: TaskHandle,
     /// Reachable so mgmt verbs can call `status()` on the running protocol.
     proto: Arc<dyn RoutingProtocol>,
 }
