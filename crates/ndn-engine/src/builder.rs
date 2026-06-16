@@ -101,7 +101,7 @@ pub struct EngineBuilder {
     strategy: Option<Arc<dyn ErasedStrategy>>,
     security: Option<Arc<SecurityManager>>,
     enrichers: Vec<Arc<dyn ContextEnricher>>,
-    signal_sources: Vec<Box<dyn ndn_signal_sources::SignalSource<ndn_transport::FaceId>>>,
+    signal_sources: Vec<Box<dyn ndn_signals_core::SignalSource<ndn_transport::FaceId>>>,
     /// Shared cross-layer signal store, created eagerly so faces can publish
     /// into it (via `with_signal_sink`) before `build()`. See [`Self::signals`].
     signals: Arc<SignalsTable>,
@@ -295,13 +295,13 @@ impl EngineBuilder {
         self
     }
 
-    /// Register a cross-layer [`SignalSource`](ndn_signal_sources::SignalSource)
+    /// Register a cross-layer [`SignalSource`](ndn_signals_core::SignalSource)
     /// (radio metrics, GPS, …). The engine spawns a background task that polls
     /// every registered source on its cadence and pushes readings into the
     /// shared `SignalsTable`, which strategies read via `StrategyContext::signals`.
     pub fn signal_source(
         mut self,
-        source: Box<dyn ndn_signal_sources::SignalSource<ndn_transport::FaceId>>,
+        source: Box<dyn ndn_signals_core::SignalSource<ndn_transport::FaceId>>,
     ) -> Self {
         self.signal_sources.push(source);
         self

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ndn_runtime::Runtime;
-use ndn_signal_sources::SignalSource;
+use ndn_signals_core::SignalSource;
 use ndn_strategy::SignalsTable;
 use ndn_transport::FaceId;
 use tokio_util::sync::CancellationToken;

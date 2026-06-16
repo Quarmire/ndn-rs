@@ -127,6 +127,23 @@ pub trait SignalStore<F: Copy + Eq>: SignalView<F> {
     fn set_neighbor(&self, face: F, signals: NodeSignals);
 }
 
+/// A periodic source of cross-layer signals. The driver loop calls [`Self::poll`]
+/// roughly every [`Self::interval`]; `now_ms` is a monotonic millisecond clock
+/// used to stamp readings for staleness.
+///
+/// The trait lives here in the core taxonomy (not in the `ndn-signal-sources`
+/// extension) so the **engine depends only on `ndn-signals-core`** — it accepts
+/// `Box<dyn SignalSource>`s but never the concrete source framework. Concrete
+/// sources (radio metrics, location, …) implement this in `ndn-signal-sources`.
+pub trait SignalSource<F: Copy + Eq>: Send + 'static {
+    /// Stable identifier (for logs / observability).
+    fn name(&self) -> &str;
+    /// Desired polling cadence. The driver may poll less often under load.
+    fn interval(&self) -> core::time::Duration;
+    /// Drain the backend and push the latest readings into `store`.
+    fn poll(&mut self, store: &dyn SignalStore<F>, now_ms: u32);
+}
+
 /// The zero-cost "no signals" view — the sibling of `NoCs`. Strategies that
 /// ignore signals are unaffected, and the engine passes `&NoSignals` by
 /// default, keeping no-signal forwarders byte-identical.

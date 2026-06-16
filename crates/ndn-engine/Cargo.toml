@@ -35,7 +35,7 @@ ndn-transport = { workspace = true }
 ndn-discovery-core = { workspace = true }
 ndn-store     = { workspace = true }
 ndn-strategy  = { workspace = true }
-ndn-signal-sources = { workspace = true }
+ndn-signals-core = { workspace = true }  # the SignalSource trait only (concrete sources are downstream)
 ndn-runtime   = { workspace = true }
 web-time      = { workspace = true }
 bytes         = { workspace = true, features = ["std"] }
