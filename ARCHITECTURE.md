@@ -65,9 +65,15 @@ scope = spec   (flat under crates/)   NDN community specs implemented faithfully
                                 StreamFace, TlvCodec
   ndn-store                     NameTrie, Fib, PIT, ContentStore (LruCs/ShardedCs/FjallCs/SqliteCs), DeadNonceList
   ndn-safebag                   SafeBag (cert + PKCS#5-encrypted key) — wasm-buildable carve-out of safe_bag.rs
-  ndn-face-native                     Feature-gated native face types (UDP, TCP, WebSocket, Unix, SHM,
-                                serial, ethernet, virtual; BLE central via `ble://` + peripheral
-                                via `[listeners.ble]`, NDNts web-bluetooth GATT profile)
+  ndn-face                      Standard face types (NFD/ndnd set): UDP, TCP, Unix,
+                                in-process/IPC, Ethernet (uni/multicast), callback/tap
+  ndn-frame-io                  Backend-agnostic link-layer frame I/O (FrameIo trait, FrameFormat
+                                framing, AF_PACKET + loopback backends) — substrate for the radio faces
+  ndn-face-serial               Serial/UART face (COBS framing) — extension
+  ndn-face-shm                  Zero-copy SPSC shared-memory IPC face (desktop Unix) — extension
+  ndn-face-websocket            WebSocket face (browser-reachable peering) — extension
+  ndn-face-bluetooth            BLE GATT central (`ble://`) + peripheral (`[listeners.ble]`) — extension
+  ndn-face-afxdp                AF_XDP kernel-bypass Ethernet backend (Linux) — extension
   ndn-face-webtransport         Server-side WebTransport listener (HTTP/3 + QUIC datagrams)
   ndn-strategy                  BestRoute, Multicast, ASF, composed strategies
   ndn-security                  KeyChain, Signer/Verifier, TrustSchema, Validator, SafeData, Keyring/TrustContext
@@ -176,7 +182,7 @@ examples/                       Documentation-grade examples (strategy, discover
 |---|---|---|
 | `Face` | ndn-transport | Async send/recv over any transport (`Transport` + `LinkService` composition; see [Face system](#face-system) below) |
 | `LinkServiceFeature` | ndn-transport | Per-LP-frame extension point — Reliability, CongestionMarking, TraceContext, IncomingFaceId, … |
-| `FaceSink` | ndn-transport | Seam between face *provisioning* (interface enumeration, auto-multicast, hotplug — `ndn-face-native::provision`) and the engine that owns the face table; implemented by `ForwarderEngine`, so any embedding engine reuses the same provisioner |
+| `FaceSink` | ndn-transport | Seam between face *provisioning* (interface enumeration, auto-multicast, hotplug — `ndn-face::provision`) and the engine that owns the face table; implemented by `ForwarderEngine`, so any embedding engine reuses the same provisioner |
 | `PipelineStage` | ndn-engine | Single processing step; returns `Action` |
 | `Strategy` | ndn-strategy | Forwarding decision per Interest |
 | `ContentStore` | ndn-store | Pluggable cache backend |
@@ -357,7 +363,7 @@ between two peers, over which the node runs UDP. The platform negotiates the NDP
 (`WifiAwareManager.requestNetwork` on Android), binds a UDP socket on the
 resulting network, and hands the bound socket's fd + the peer's address to
 `NdnEngine::attach_ndp_face` (fd-passing, like the seam's `mount_app_fd`). The
-engine adopts it as a [`UdpFace`](crates/ndn-face-native) and adds a UDP-cost
+engine adopts it as a [`UdpFace`](crates/ndn-face) and adds a UDP-cost
 (10) nexthop on the peer's `/ndn/node/<id>` prefix, so the measured best-route
 strategy (below) moves the peer's bulk traffic onto the reliable, fast NDP link
 while the connectionless coordination radios stay for discovery + fallback. The
@@ -380,7 +386,7 @@ discover-then-upgrade pattern as Quick Share / AirDrop. It stays data-centric:
 once the group forms it is just a multi-access IP subnet (the group owner runs
 DHCP on `192.168.49.0/24`), so the host-centric group-owner election lives
 *below* the Face. Above it, `FaceKind::WifiDirect` faces carry only names —
-a unicast [`UdpFace`](crates/ndn-face-native) for 1:1 bulk (full MCS rate;
+a unicast [`UdpFace`](crates/ndn-face) for 1:1 bulk (full MCS rate;
 `LinkProfile` cost 8, preferred over the NDP/LAN UDP cost 10) attached via
 `attach_wifi_direct_face`, or a `MulticastUdpFace` for one-to-many over the
 group's broadcast domain (`MulticastStrategy` + PIT aggregation) via

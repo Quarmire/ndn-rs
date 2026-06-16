@@ -150,7 +150,7 @@ implementations cover the typical deployments.
 use ndn::prelude::*;
 use ndn::{Consumer, InProcConnection};
 use ndn_engine::{EngineBuilder, EngineConfig};
-use ndn_face_native::local::InProcFace;
+use ndn_face::local::InProcFace;
 use ndn_transport::FaceId;
 
 # async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

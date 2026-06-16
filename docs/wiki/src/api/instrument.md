@@ -28,9 +28,9 @@ below).
 | `ForwarderEngine::fib()` / `rib()` / `pit()` / `cs()` / `strategy_table()` / `measurements()` / `routing()` / `discovery_ctx()` | `ndn_engine::engine` (`crates/ndn-engine/src/engine.rs`) | Direct table access. |
 | `ContextEnricher` | `ndn_engine::enricher` | Pipeline-stage hook for cross-layer enrichment. |
 | `observability::targets` | `ndn_engine::observability::targets` | Tracing target taxonomy. |
-| `InProcFace::new_kind` | `ndn_face_native::local::InProcFace` | Synthesize an in-process face with a custom `FaceKind`. |
-| `CallbackFace` | `ndn_face_native::callback::CallbackFace` | Virtual face whose send-path is a Rust callback. |
-| `TapFace` | `ndn_face_native::callback::TapFace` | Records every wire packet sent to it without participating in forwarding. |
+| `InProcFace::new_kind` | `ndn_face::local::InProcFace` | Synthesize an in-process face with a custom `FaceKind`. |
+| `CallbackFace` | `ndn_face::callback::CallbackFace` | Virtual face whose send-path is a Rust callback. |
+| `TapFace` | `ndn_face::callback::TapFace` | Records every wire packet sent to it without participating in forwarding. |
 
 
 ## Gating
@@ -38,7 +38,7 @@ below).
 Each carrier crate declares the feature:
 
 ```toml
-# crates/ndn-engine/Cargo.toml — and likewise for ndn-face-native
+# crates/ndn-engine/Cargo.toml — and likewise for ndn-face
 [features]
 experimental-instrument = []
 ```
@@ -52,7 +52,7 @@ To use the tier in your own crate:
 ```toml
 [dependencies]
 ndn-engine = { version = "0.1", features = ["experimental-instrument"] }
-ndn-face-native  = { version = "0.1", features = ["experimental-instrument"] }
+ndn-face  = { version = "0.1", features = ["experimental-instrument"] }
 ```
 
 ## TapFace
@@ -60,7 +60,7 @@ ndn-face-native  = { version = "0.1", features = ["experimental-instrument"] }
 `TapFace` is the workhorse for wire-packet tracing.
 
 ```rust,ignore
-use ndn_face_native::callback::TapFace;
+use ndn_face::callback::TapFace;
 use ndn_engine::{EngineBuilder, EngineConfig};
 use ndn_transport::FaceId;
 
@@ -87,7 +87,7 @@ shot with the async `captured()` method, which returns `Vec<Bytes>`
 and clears the tap:
 
 ```rust,ignore
-# use ndn_face_native::callback::TapFace;
+# use ndn_face::callback::TapFace;
 # use ndn_transport::FaceId;
 # async fn run() {
 let tap = TapFace::new(FaceId(99));
@@ -100,7 +100,7 @@ let packets: Vec<bytes::Bytes> = tap.captured().await;
 it, the bytes accumulate, and nothing is returned. Use it alongside
 real faces to record what the engine *would have* sent over them.
 
-In-tree reference: `crates/ndn-face-native/src/callback.rs`.
+In-tree reference: `crates/ndn-face/src/callback.rs`.
 
 ## Engine table access
 
@@ -161,7 +161,7 @@ The callback is async — it returns a
 `BoxFuture<'static, Option<Data>>`:
 
 ```rust,ignore
-use ndn_face_native::callback::CallbackFace;
+use ndn_face::callback::CallbackFace;
 use ndn_packet::{Data, Interest};
 use ndn_transport::FaceId;
 
@@ -177,7 +177,7 @@ When the lookup is synchronous, `CallbackFace::from_fn` takes a
 plain `Fn(Interest) -> Option<Data>` and wraps it for you:
 
 ```rust,ignore
-# use ndn_face_native::callback::CallbackFace;
+# use ndn_face::callback::CallbackFace;
 # use ndn_packet::{Data, Interest};
 # use ndn_transport::FaceId;
 let face = CallbackFace::from_fn(FaceId(7), |_interest: Interest| {
@@ -195,7 +195,7 @@ handle drives the recv/send channels from the other side. (Use
 engine side.)
 
 ```rust,ignore
-use ndn_face_native::local::InProcFace;
+use ndn_face::local::InProcFace;
 use ndn_engine::{EngineBuilder, EngineConfig};
 use ndn_transport::FaceId;
 

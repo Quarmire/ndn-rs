@@ -144,7 +144,7 @@ engine accepts a bare `Transport` and composes the `Face` for you:
 
 For a listening transport, run an accept loop and call `add_face` per
 connection. `IpcListener` in
-`crates/ndn-face-native/src/local/ipc.rs` is the in-tree pattern: its
+`crates/ndn-face/src/local/ipc.rs` is the in-tree pattern: its
 `accept(face_id)` returns one face per connection, which the owning
 task then wires in.
 
@@ -177,14 +177,14 @@ method there if the face is meant to run in-browser.
 
 | Face | Crate | Transport shape |
 |---|---|---|
-| UDP | `crates/ndn-face-native/src/net/udp.rs` | UDP socket per peer. |
-| TCP | `crates/ndn-face-native/src/net/tcp.rs` | TCP connection. |
-| IPC | `crates/ndn-face-native/src/local/ipc.rs` | Unix socket / named pipe. |
-| InProc | `crates/ndn-face-native/src/local/in_proc.rs` | In-process channel. |
-| Shm | `crates/ndn-face-native/src/local/shm.rs` | Shared-memory ring (spsc-shm). |
-| Ether | `crates/ndn-face-native/src/l2/ether.rs` | Raw Ethernet. |
-| Bluetooth | `crates/ndn-face-native/src/l2/bluetooth/mod.rs` | BLE L2CAP. |
-| Serial | `crates/ndn-face-native/src/serial/mod.rs` | UART. |
+| UDP | `crates/ndn-face/src/net/udp.rs` | UDP socket per peer. |
+| TCP | `crates/ndn-face/src/net/tcp.rs` | TCP connection. |
+| IPC | `crates/ndn-face/src/local/ipc.rs` | Unix socket / named pipe. |
+| InProc | `crates/ndn-face/src/local/in_proc.rs` | In-process channel. |
+| Shm | `crates/ndn-face-shm/src/spsc.rs` | Shared-memory ring (spsc-shm). |
+| Ether | `crates/ndn-face/src/l2/ether.rs` | Raw Ethernet. |
+| Bluetooth | `crates/ndn-face-bluetooth/src/lib.rs` | BLE L2CAP. |
+| Serial | `crates/ndn-face-serial/src/lib.rs` | UART. |
 | WebTransport | `crates/ndn-face-webtransport*` | QUIC datagrams. |
 | WebRTC | `crates/ndn-face-webrtc/` | Datachannel. |
 | SharedWorker | `crates/ndn-face-shared-worker/` | Per-origin engine sharing. |

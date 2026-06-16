@@ -152,8 +152,8 @@ MAY omit it.
 
 | Element | Location |
 |---|---|
-| Profile constants, listener, per-central faces | `crates/ndn-face-native/src/l2/bluetooth/` |
-| Framing codec + detection | `crates/ndn-face-native/src/l2/bluetooth/framing.rs` |
+| Profile constants, listener, per-central faces | `crates/ndn-face-bluetooth/src/` |
+| Framing codec + detection | `crates/ndn-face-bluetooth/src/framing.rs` |
 | Native central (Linux `bluer`, macOS/Windows `btleplug`) | `…/bluetooth/central/` |
 | Browser central (Web Bluetooth) | `crates/ndn-face-webble/` |
 
