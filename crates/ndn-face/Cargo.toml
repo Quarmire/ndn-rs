@@ -12,7 +12,6 @@ license.workspace = true
 # net         – UdpFace, TcpFace, MulticastUdpFace (requires tokio::net)
 # udp-recvmmsg – batch UDP receive via recvmmsg (Linux). OFF by default —
 #               unsafe FFI, validate + benchmark on Linux before trusting.
-# websocket   – WebSocketFace (implies net; requires tokio-tungstenite)
 # local       – InProcFace/InProcHandle, IpcFace, UnixFace
 # spsc-shm    – ShmFace/ShmHandle zero-copy ring (implies local; Unix only,
 #               excluding Android/iOS)
@@ -26,7 +25,7 @@ classification = "spec"
 [features]
 # `udp-recvmmsg` / `udp-sendmmsg` are default-on: both validated + benchmarked
 # on Linux (~1.68× recv, ~1.7× send) and no-ops on non-Linux.
-default = ["net", "websocket", "local", "udp-recvmmsg", "udp-sendmmsg"]
+default = ["net", "local", "udp-recvmmsg", "udp-sendmmsg"]
 # Phase 3 Instrument-tier surface — opts researchers into `CallbackFace`,
 # `TapFace`, and `InProcFace::new_kind` in `cargo doc` output. Items
 # remain `pub` so in-tree code (the engine, tests, dashboards) keeps
@@ -41,8 +40,6 @@ udp-recvmmsg = ["net"]
 # Batch UDP send via `sendmmsg` (Linux only). OFF by default — unsafe FFI;
 # only the fragment burst of a single packet is batched (same peer, in order).
 udp-sendmmsg = ["net"]
-websocket     = ["net", "dep:tokio-tungstenite"]
-websocket-tls = ["websocket", "dep:tokio-rustls", "dep:rcgen", "dep:rustls-pemfile"]
 local     = []
 spsc-shm  = ["local"]
 l2        = []
@@ -75,9 +72,6 @@ tracing       = { workspace = true }
 dashmap       = { workspace = true }
 
 # Optional deps gated by features
-tokio-rustls      = { workspace = true, optional = true }
-rcgen             = { workspace = true, optional = true }
-rustls-pemfile    = { workspace = true, optional = true }
 # uuid parses the GATT profile UUID strings for the central backends.
 uuid              = { workspace = true, optional = true }
 
@@ -85,7 +79,6 @@ uuid              = { workspace = true, optional = true }
 # face needs tokio-tungstenite. The net/websocket modules are gated off wasm.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio             = { workspace = true, features = ["net"] }
-tokio-tungstenite = { workspace = true, optional = true }
 
 # libc is always available on unix — used for interface enumeration (getifaddrs)
 # and L2 raw sockets (AF_PACKET on Linux, PF_NDRV on macOS).

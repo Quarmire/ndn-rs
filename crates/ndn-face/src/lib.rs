@@ -2,7 +2,7 @@
 //!
 //! | Module | Types | Feature |
 //! |--------|-------|---------|
-//! | [`net`] | [`UdpFace`], [`TcpFace`], [`MulticastUdpFace`], [`WebSocketFace`] | `net` / `websocket` |
+//! | [`net`] | [`UdpFace`], [`TcpFace`], [`MulticastUdpFace`] | `net` |
 //! | [`local`] | [`InProcFace`], [`InProcHandle`], [`ShmFace`], [`UnixFace`], [`IpcFace`] | `local` / `spsc-shm` |
 //! | [`l2`] | [`NamedEtherFace`], [`MulticastEtherFace`], [`BleFace`], [`WfbFace`] | `l2` / `bluetooth` / `wfb` |
 //!
@@ -46,8 +46,6 @@ pub use net::{
     tcp_face_connect, tcp_face_from_stream,
 };
 
-#[cfg(all(feature = "websocket", not(target_arch = "wasm32")))]
-pub use net::WebSocketFace;
 
 #[cfg(feature = "local")]
 pub use local::{InProcFace, InProcHandle, IpcFace, IpcListener, ipc_face_connect};
