@@ -1,8 +1,9 @@
-//! Layer-2 NDN faces: raw Ethernet (EtherType `0x8624`) and Wifibroadcast NG.
-//! (Bluetooth LE faces moved to the `ndn-face-bluetooth` extension crate.)
+//! Layer-2 NDN faces: raw Ethernet (EtherType `0x8624`).
+//!
+//! Wifibroadcast NG / 802.11 monitor-mode injection moved to the
+//! `ndn-face-monitor-wifi` crate; Bluetooth LE to `ndn-face-bluetooth`.
 //!
 //! - [`NamedEtherFace`] / [`MulticastEtherFace`] — unicast and multicast Ethernet
-//! - [`WfbFace`] — Wifibroadcast NG monitor-mode injection (Linux)
 //! - [`RadioTable`] — link-metric registry for radio faces
 //!
 //! Backends: Linux `AF_PACKET`, macOS `PF_NDRV`, Windows Npcap. Mobile
@@ -25,9 +26,6 @@ pub mod ether_macos;
 pub mod ether_windows;
 #[cfg(target_os = "linux")]
 pub mod multicast_ether;
-
-#[cfg(target_os = "linux")]
-pub mod wfb;
 
 #[cfg(target_os = "linux")]
 pub mod neighbor;
@@ -53,8 +51,6 @@ pub use ether_windows::MulticastEtherFace;
 #[cfg(target_os = "linux")]
 pub use multicast_ether::MulticastEtherFace;
 
-#[cfg(target_os = "linux")]
-pub use wfb::WfbFace;
 
 
 #[cfg(target_os = "linux")]

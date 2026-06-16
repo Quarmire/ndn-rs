@@ -15,7 +15,6 @@ license.workspace = true
 # local       – InProcFace/InProcHandle, IpcFace, UnixFace
 #               excluding Android/iOS)
 # l2          – Ethernet/WFB/BLE faces; platform cfg selects the right impl
-# wfb         – WfbFace monitor-mode injection (implies l2; Linux only)
 
 [package.metadata.scope]
 classification = "spec"
@@ -41,7 +40,6 @@ udp-sendmmsg = ["net"]
 local     = []
 l2        = []
 # BLE peripheral (BleFace, Linux/macOS) + central (BleCentralFace,
-wfb       = ["l2"]
 
 [dependencies]
 ndn-tlv       = { workspace = true }

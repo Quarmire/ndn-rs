@@ -4,7 +4,7 @@
 //! |--------|-------|---------|
 //! | [`net`] | [`UdpFace`], [`TcpFace`], [`MulticastUdpFace`] | `net` |
 //! | [`local`] | [`InProcFace`], [`InProcHandle`], [`UnixFace`], [`IpcFace`] | `local` |
-//! | [`l2`] | [`NamedEtherFace`], [`MulticastEtherFace`], [`WfbFace`] | `l2` / `wfb` |
+//! | [`l2`] | [`NamedEtherFace`], [`MulticastEtherFace`] | `l2` |
 //!
 //! Serial/UART faces moved to the `ndn-face-serial` extension crate.
 //! | [`callback`] | [`CallbackFace`] | *(always available)* |
@@ -62,7 +62,7 @@ pub use l2::{RadioFaceMetadata, RadioTable};
 
 #[cfg(all(feature = "l2", target_os = "linux"))]
 pub use l2::{
-    MacAddr, MulticastEtherFace, NamedEtherFace, NeighborDiscovery, WfbFace, get_interface_mac,
+    MacAddr, MulticastEtherFace, NamedEtherFace, NeighborDiscovery, get_interface_mac,
 };
 
 #[cfg(all(feature = "l2", target_os = "macos"))]
