@@ -14,4 +14,8 @@ default = []
 
 [dependencies]
 ndn-tlv = { workspace = true }
+ndn-foundation-types = { workspace = true }
 bytes   = { workspace = true }
+# Direct (not workspace-inherited) so we can set default-features = false for
+# no_std (thiserror 2 supports no_std without its std feature).
+thiserror = { version = "2", default-features = false }

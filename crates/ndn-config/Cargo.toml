@@ -9,6 +9,7 @@ license.workspace = true
 classification = "extension"
 
 [dependencies]
+ndn-mgmt-wire = { workspace = true }
 ndn-tlv       = { workspace = true, features = ["std"] }
 ndn-packet    = { workspace = true, features = ["std"] }
 tracing       = { workspace = true }

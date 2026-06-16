@@ -8,7 +8,7 @@
 use ndn_face_local::InProcHandle;
 use ndn_packet::{Name, encode::encode_data_unsigned};
 
-use ndn_config::ControlResponse;
+use ndn_mgmt_wire::ControlResponse;
 
 pub(crate) async fn send_response(
     handle: &InProcHandle,

@@ -38,15 +38,15 @@ fn handle_coding(
 
 fn parse_role(code: Option<u8>) -> Option<CodingRole> {
     match code? {
-        c if c == ndn_config::control_parameters::fec_role::PRODUCED => Some(CodingRole::Produced),
-        c if c == ndn_config::control_parameters::fec_role::CONSUMED => Some(CodingRole::Consumed),
+        c if c == ndn_mgmt_wire::control_parameters::fec_role::PRODUCED => Some(CodingRole::Produced),
+        c if c == ndn_mgmt_wire::control_parameters::fec_role::CONSUMED => Some(CodingRole::Consumed),
         _ => None,
     }
 }
 
 fn parse_field(code: Option<u8>) -> Option<CodingFieldId> {
-    match code.unwrap_or(ndn_config::control_parameters::fec_field::GF8) {
-        c if c == ndn_config::control_parameters::fec_field::GF8 => Some(CodingFieldId::Gf8),
+    match code.unwrap_or(ndn_mgmt_wire::control_parameters::fec_field::GF8) {
+        c if c == ndn_mgmt_wire::control_parameters::fec_field::GF8 => Some(CodingFieldId::Gf8),
         _ => None,
     }
 }
@@ -85,7 +85,7 @@ fn coding_set(params: ControlParameters, handler: &dyn CodingHandler) -> Control
         name: Some(prefix),
         fec_k: Some(k),
         fec_n: Some(n),
-        fec_field: Some(ndn_config::control_parameters::fec_field::GF8),
+        fec_field: Some(ndn_mgmt_wire::control_parameters::fec_field::GF8),
         fec_role: params.fec_role,
         ..Default::default()
     };
@@ -116,11 +116,11 @@ fn coding_list_dataset(handler: &dyn CodingHandler) -> bytes::Bytes {
     let mut buf = bytes::BytesMut::new();
     for (prefix, entry) in handler.list() {
         let role_code = match entry.role {
-            CodingRole::Produced => ndn_config::control_parameters::fec_role::PRODUCED,
-            CodingRole::Consumed => ndn_config::control_parameters::fec_role::CONSUMED,
+            CodingRole::Produced => ndn_mgmt_wire::control_parameters::fec_role::PRODUCED,
+            CodingRole::Consumed => ndn_mgmt_wire::control_parameters::fec_role::CONSUMED,
         };
         let field_code = match entry.field {
-            CodingFieldId::Gf8 => ndn_config::control_parameters::fec_field::GF8,
+            CodingFieldId::Gf8 => ndn_mgmt_wire::control_parameters::fec_field::GF8,
         };
         let cp = ControlParameters {
             name: Some(prefix),
@@ -155,7 +155,7 @@ impl MgmtModule for CodingModule {
 #[cfg(test)]
 mod coding_tests {
     use super::*;
-    use ndn_config::control_parameters::{fec_field as fr_fld, fec_role as fr_role};
+    use ndn_mgmt_wire::control_parameters::{fec_field as fr_fld, fec_role as fr_role};
     use std::sync::Mutex;
 
     struct StubHandler {
@@ -311,7 +311,7 @@ mod coding_tests {
     /// A wire-form command name parses back to the coding module/verb.
     #[test]
     fn coding_command_name_parses_into_module_coding() {
-        use ndn_config::nfd_command::{command_name, module, parse_command_name};
+        use ndn_mgmt_wire::nfd_command::{command_name, module, parse_command_name};
         let prefix: Name = "/alice/video".parse().unwrap();
         let params = set_params(&prefix, 16, 20, fr_role::PRODUCED);
         let cmd_name = command_name(module::CODING, verb::SET, &params);

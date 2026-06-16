@@ -3,7 +3,7 @@
 //! where `<ControlParameters>` is the full 0x68 TLV block embedded as
 //! a generic name component.
 use bytes::Bytes;
-use ndn_packet::{Name, NameComponent};
+use ndn_foundation_types::{Name, NameComponent};
 
 use crate::control_parameters::ControlParameters;
 
@@ -179,6 +179,7 @@ pub fn parse_command_name(name: &Name) -> Option<ParsedCommand> {
 
 #[cfg(test)]
 mod tests {
+    use alloc::borrow::ToOwned;
     use super::*;
 
     #[test]

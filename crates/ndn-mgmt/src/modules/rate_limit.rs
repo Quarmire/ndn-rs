@@ -43,10 +43,10 @@ fn handle_rate_limit(
 
 fn parse_rl_direction(code: Option<u8>) -> Option<RateLimitDirection> {
     match code? {
-        c if c == ndn_config::control_parameters::rl_direction::INBOUND => {
+        c if c == ndn_mgmt_wire::control_parameters::rl_direction::INBOUND => {
             Some(RateLimitDirection::Inbound)
         }
-        c if c == ndn_config::control_parameters::rl_direction::OUTBOUND => {
+        c if c == ndn_mgmt_wire::control_parameters::rl_direction::OUTBOUND => {
             Some(RateLimitDirection::Outbound)
         }
         _ => None,
@@ -55,13 +55,13 @@ fn parse_rl_direction(code: Option<u8>) -> Option<RateLimitDirection> {
 
 fn parse_rl_overflow(code: Option<u8>) -> Option<RateLimitOverflow> {
     match code? {
-        c if c == ndn_config::control_parameters::rl_overflow::NACK => {
+        c if c == ndn_mgmt_wire::control_parameters::rl_overflow::NACK => {
             Some(RateLimitOverflow::Nack)
         }
-        c if c == ndn_config::control_parameters::rl_overflow::DROP => {
+        c if c == ndn_mgmt_wire::control_parameters::rl_overflow::DROP => {
             Some(RateLimitOverflow::Drop)
         }
-        c if c == ndn_config::control_parameters::rl_overflow::QUEUE => {
+        c if c == ndn_mgmt_wire::control_parameters::rl_overflow::QUEUE => {
             Some(RateLimitOverflow::Queue)
         }
         _ => None,
@@ -70,16 +70,16 @@ fn parse_rl_overflow(code: Option<u8>) -> Option<RateLimitOverflow> {
 
 fn rl_direction_to_wire(d: RateLimitDirection) -> u8 {
     match d {
-        RateLimitDirection::Inbound => ndn_config::control_parameters::rl_direction::INBOUND,
-        RateLimitDirection::Outbound => ndn_config::control_parameters::rl_direction::OUTBOUND,
+        RateLimitDirection::Inbound => ndn_mgmt_wire::control_parameters::rl_direction::INBOUND,
+        RateLimitDirection::Outbound => ndn_mgmt_wire::control_parameters::rl_direction::OUTBOUND,
     }
 }
 
 fn rl_overflow_to_wire(o: RateLimitOverflow) -> u8 {
     match o {
-        RateLimitOverflow::Nack => ndn_config::control_parameters::rl_overflow::NACK,
-        RateLimitOverflow::Drop => ndn_config::control_parameters::rl_overflow::DROP,
-        RateLimitOverflow::Queue => ndn_config::control_parameters::rl_overflow::QUEUE,
+        RateLimitOverflow::Nack => ndn_mgmt_wire::control_parameters::rl_overflow::NACK,
+        RateLimitOverflow::Drop => ndn_mgmt_wire::control_parameters::rl_overflow::DROP,
+        RateLimitOverflow::Queue => ndn_mgmt_wire::control_parameters::rl_overflow::QUEUE,
     }
 }
 
@@ -212,7 +212,7 @@ impl MgmtModule for RateLimitModule {
 #[cfg(test)]
 mod rate_limit_tests {
     use super::*;
-    use ndn_config::control_parameters::{rl_direction as rd, rl_overflow as ro};
+    use ndn_mgmt_wire::control_parameters::{rl_direction as rd, rl_overflow as ro};
     use std::sync::Mutex;
 
     struct StubBackend {
@@ -361,7 +361,7 @@ mod rate_limit_tests {
 
     #[test]
     fn rate_limit_command_name_parses() {
-        use ndn_config::nfd_command::{command_name, module, parse_command_name};
+        use ndn_mgmt_wire::nfd_command::{command_name, module, parse_command_name};
         let prefix: Name = "/alice".parse().unwrap();
         let params = set_params(Some(7), Some(prefix.clone()));
         let cmd_name = command_name(module::RATE_LIMIT, verb::SET, &params);

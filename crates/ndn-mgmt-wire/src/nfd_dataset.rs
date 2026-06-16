@@ -4,8 +4,12 @@
 //! <https://redmine.named-data.net/projects/nfd/wiki/FibMgmt>,
 //! <https://redmine.named-data.net/projects/nfd/wiki/RibMgmt>,
 //! <https://redmine.named-data.net/projects/nfd/wiki/StrategyChoice>.
+use alloc::borrow::ToOwned;
+use alloc::string::String;
+use alloc::vec;
+use alloc::vec::Vec;
 use bytes::{Bytes, BytesMut};
-use ndn_packet::{Name, NameComponent};
+use ndn_foundation_types::{Name, NameComponent};
 use ndn_tlv::{TlvReader, TlvWriter};
 
 mod tlv {
@@ -260,8 +264,8 @@ impl FaceStatus {
             let (t, v) = inner.read_tlv().ok()?;
             match t {
                 tlv::FACE_ID => face_id = read_non_neg_int(&v)?,
-                tlv::URI => uri = std::str::from_utf8(&v).ok()?.to_owned(),
-                tlv::LOCAL_URI => local_uri = std::str::from_utf8(&v).ok()?.to_owned(),
+                tlv::URI => uri = core::str::from_utf8(&v).ok()?.to_owned(),
+                tlv::LOCAL_URI => local_uri = core::str::from_utf8(&v).ok()?.to_owned(),
                 tlv::FACE_SCOPE => face_scope = read_non_neg_int(&v)?,
                 tlv::FACE_PERSISTENCY => face_persistency = read_non_neg_int(&v)?,
                 tlv::LINK_TYPE => link_type = read_non_neg_int(&v)?,
@@ -296,7 +300,7 @@ impl FaceStatus {
                     while !feat_r.is_empty() {
                         let (ft, fv) = feat_r.read_tlv().ok()?;
                         if ft == tlv::FEATURE_NAME
-                            && let Ok(s) = std::str::from_utf8(&fv)
+                            && let Ok(s) = core::str::from_utf8(&fv)
                         {
                             feature_set.push(s.to_owned());
                         }
@@ -646,7 +650,7 @@ where
 mod tests {
     use super::*;
     use bytes::Bytes;
-    use ndn_packet::NameComponent;
+    use ndn_foundation_types::NameComponent;
 
     fn name(components: &[&[u8]]) -> Name {
         Name::from_components(

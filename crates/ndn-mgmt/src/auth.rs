@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 #[cfg(test)]
 use crate::wire::build_mgmt_response_wire;
-use ndn_config::ControlParameters;
+use ndn_mgmt_wire::ControlParameters;
 #[cfg(test)]
 use ndn_packet::Name;
 
@@ -67,7 +67,7 @@ pub(crate) fn check_sig_time(
 /// Extensions expose privileged surface (key generation, schema edits,
 /// route changes) and unconditionally require signed commands.
 pub(crate) fn is_extended_module(module: &[u8]) -> bool {
-    use ndn_config::nfd_command::module as m;
+    use ndn_mgmt_wire::nfd_command::module as m;
     let standard: [&[u8]; 6] = [m::FACES, m::FIB, m::RIB, m::CS, m::STRATEGY, m::STATUS];
     !standard.contains(&module)
 }
@@ -85,7 +85,7 @@ pub(crate) fn effective_require_signed(module: &[u8], require_signed_global: boo
 /// posture before any signing identity is configured. Writes
 /// (`policy-set`, etc.) stay gated.
 pub(crate) fn is_public_dataset_verb(module: &[u8], verb: &[u8]) -> bool {
-    use ndn_config::nfd_command::{module as m, verb as v};
+    use ndn_mgmt_wire::nfd_command::{module as m, verb as v};
     let standard: [&[u8]; 6] = [m::FACES, m::FIB, m::RIB, m::CS, m::STRATEGY, m::STATUS];
     if standard.contains(&module) && verb == v::LIST {
         return true;
@@ -539,7 +539,7 @@ mod e01_tests {
     /// either single location, and returns `None` when neither is present.
     #[test]
     fn status_general_is_a_public_unsigned_read() {
-        use ndn_config::nfd_command::module as m;
+        use ndn_mgmt_wire::nfd_command::module as m;
         // The ForwarderStatus dataset must be readable without signing, like
         // NFD — otherwise a secure-by-default forwarder rejects every client's
         // status read and the response decodes as "malformed".
@@ -654,7 +654,7 @@ mod e01_tests {
     /// else is an ndn-rs extension.
     #[test]
     fn e03_is_extended_module_classifies_correctly() {
-        use ndn_config::nfd_command::module as m;
+        use ndn_mgmt_wire::nfd_command::module as m;
         for std_mod in [m::FACES, m::FIB, m::RIB, m::CS, m::STRATEGY, m::STATUS] {
             assert!(
                 !is_extended_module(std_mod),
@@ -686,7 +686,7 @@ mod e01_tests {
     /// thresholds aids an attacker and is not discovery info.
     #[test]
     fn compute_list_public_but_policy_lists_signed() {
-        use ndn_config::nfd_command::{module as m, verb as v};
+        use ndn_mgmt_wire::nfd_command::{module as m, verb as v};
         assert!(
             is_public_dataset_verb(m::COMPUTE, v::LIST),
             "compute/list must be a public read"
@@ -707,7 +707,7 @@ mod e01_tests {
     /// operator left `require_signed_commands = false`.
     #[test]
     fn e03_effective_require_signed_forces_extended_modules() {
-        use ndn_config::nfd_command::module as m;
+        use ndn_mgmt_wire::nfd_command::module as m;
         assert!(!effective_require_signed(m::RIB, false));
         assert!(effective_require_signed(m::RIB, true));
         assert!(effective_require_signed(m::SECURITY, false));
@@ -719,7 +719,7 @@ mod e01_tests {
     /// the global `require_signed_commands` flag is `false`.
     #[tokio::test]
     async fn e03_unsigned_security_command_rejected_by_default() {
-        use ndn_config::nfd_command::module as m;
+        use ndn_mgmt_wire::nfd_command::module as m;
         let cmd_name: Name = "/localhost/nfd/security/identity-generate".parse().unwrap();
         let interest = Interest::decode(encode_interest(&cmd_name, None)).unwrap();
         let global_flag = false;

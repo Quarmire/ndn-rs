@@ -1,6 +1,10 @@
 //! ControlResponse (TLV 0x65) — HTTP-style result of a management
 //! command. Wire format:
 //! <https://redmine.named-data.net/projects/nfd/wiki/ControlCommand>.
+use alloc::borrow::ToOwned;
+use alloc::string::String;
+use alloc::vec;
+use alloc::vec::Vec;
 use bytes::Bytes;
 use ndn_tlv::{TlvReader, TlvWriter};
 
@@ -108,7 +112,7 @@ impl ControlResponse {
                 }
                 tlv::STATUS_TEXT => {
                     status_text = Some(
-                        std::str::from_utf8(&val)
+                        core::str::from_utf8(&val)
                             .map_err(|_| ControlResponseError::InvalidUtf8)?
                             .to_owned(),
                     );
@@ -177,7 +181,7 @@ fn read_non_neg_int(buf: &[u8]) -> Result<u64, ControlResponseError> {
 mod tests {
     use super::*;
     use crate::control_parameters::ControlParameters;
-    use ndn_packet::{Name, NameComponent};
+    use ndn_foundation_types::{Name, NameComponent};
 
     fn name(components: &[&[u8]]) -> Name {
         Name::from_components(

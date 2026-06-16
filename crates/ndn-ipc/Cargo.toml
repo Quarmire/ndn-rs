@@ -16,7 +16,6 @@ spsc-shm = ["ndn-face-native/spsc-shm"]
 ndn-packet     = { workspace = true, features = ["std"] }
 ndn-mgmt-wire  = { workspace = true }
 ndn-tlv        = { workspace = true, features = ["std"] }
-ndn-config     = { workspace = true }
 ndn-transport  = { workspace = true }
 ndn-face-native      = { workspace = true }
 ndn-security   = { workspace = true }

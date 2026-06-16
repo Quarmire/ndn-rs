@@ -23,25 +23,25 @@ async fn handle_routing(
         v if v == b"disable" => routing_disable(params, engine).await,
         v if v == verb::DVR_STATUS => routing_render(
             engine,
-            ndn_config::control_parameters::origin::DVR,
+            ndn_mgmt_wire::control_parameters::origin::DVR,
             "ndn-dv routing not running",
             |s| s.render_status("ndn-dv"),
         ),
         v if v == verb::NLSR_STATUS => routing_render(
             engine,
-            ndn_config::control_parameters::origin::NLSR,
+            ndn_mgmt_wire::control_parameters::origin::NLSR,
             "NLSR routing not running",
             |s| s.render_status("nlsr"),
         ),
         v if v == verb::NLSR_NEIGHBORS => routing_render(
             engine,
-            ndn_config::control_parameters::origin::NLSR,
+            ndn_mgmt_wire::control_parameters::origin::NLSR,
             "NLSR routing not running",
             |s| s.render_neighbors("nlsr"),
         ),
         v if v == verb::NLSR_LSDB => routing_render(
             engine,
-            ndn_config::control_parameters::origin::NLSR,
+            ndn_mgmt_wire::control_parameters::origin::NLSR,
             "NLSR routing not running",
             |s| s.render_lsdb("nlsr"),
         ),
@@ -55,7 +55,7 @@ async fn handle_routing(
 fn routing_dvr_config(engine: &ForwarderEngine, params: &ControlParameters) -> ControlResponse {
     use ndn_engine::ConfigUpdate;
 
-    let origin = ndn_config::control_parameters::origin::DVR;
+    let origin = ndn_mgmt_wire::control_parameters::origin::DVR;
     let Some(proto) = engine.routing().protocol(origin) else {
         return ControlResponse::error(status::NOT_FOUND, "DV routing not running");
     };
@@ -115,11 +115,11 @@ fn routing_list(engine: &ForwarderEngine) -> ControlResponse {
     sorted.sort_unstable();
     for origin in &sorted {
         let name = match *origin {
-            ndn_config::control_parameters::origin::DVR => "dvr",
-            ndn_config::control_parameters::origin::AUTOCONF => "autoconf",
-            ndn_config::control_parameters::origin::NLSR => "nlsr",
-            ndn_config::control_parameters::origin::PREFIX_ANN => "prefix-ann",
-            ndn_config::control_parameters::origin::STATIC => "static",
+            ndn_mgmt_wire::control_parameters::origin::DVR => "dvr",
+            ndn_mgmt_wire::control_parameters::origin::AUTOCONF => "autoconf",
+            ndn_mgmt_wire::control_parameters::origin::NLSR => "nlsr",
+            ndn_mgmt_wire::control_parameters::origin::PREFIX_ANN => "prefix-ann",
+            ndn_mgmt_wire::control_parameters::origin::STATIC => "static",
             _ => "custom",
         };
         text.push_str(&format!("  origin={origin} ({name})\n"));

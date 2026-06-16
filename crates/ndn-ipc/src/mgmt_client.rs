@@ -6,7 +6,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use tokio::sync::Mutex;
 
-use ndn_config::{
+use ndn_mgmt_wire::{
     ControlParameters, ControlResponse,
     nfd_command::{command_name, dataset_name, module, verb},
 };
@@ -175,17 +175,17 @@ impl MgmtClient {
     /// List all FIB routes: `fib/list`.
     ///
     /// Returns NFD TLV `FibEntry` dataset entries (per-spec wire format).
-    pub async fn route_list(&self) -> Result<Vec<ndn_config::FibEntry>, ForwarderError> {
+    pub async fn route_list(&self) -> Result<Vec<ndn_mgmt_wire::FibEntry>, ForwarderError> {
         let bytes = self.dataset_raw(module::FIB, verb::LIST).await?;
-        Ok(ndn_config::FibEntry::decode_all(&bytes))
+        Ok(ndn_mgmt_wire::FibEntry::decode_all(&bytes))
     }
 
     /// List all RIB routes: `rib/list`.
     ///
     /// Returns NFD TLV `RibEntry` dataset entries (per-spec wire format).
-    pub async fn rib_list(&self) -> Result<Vec<ndn_config::RibEntry>, ForwarderError> {
+    pub async fn rib_list(&self) -> Result<Vec<ndn_mgmt_wire::RibEntry>, ForwarderError> {
         let bytes = self.dataset_raw(module::RIB, verb::LIST).await?;
-        Ok(ndn_config::RibEntry::decode_all(&bytes))
+        Ok(ndn_mgmt_wire::RibEntry::decode_all(&bytes))
     }
 
     /// Create a face: `faces/create`.
@@ -240,9 +240,9 @@ impl MgmtClient {
     }
 
     /// `faces/list` decoded as NFD `FaceStatus` entries.
-    pub async fn face_list(&self) -> Result<Vec<ndn_config::FaceStatus>, ForwarderError> {
+    pub async fn face_list(&self) -> Result<Vec<ndn_mgmt_wire::FaceStatus>, ForwarderError> {
         let bytes = self.dataset_raw(module::FACES, verb::LIST).await?;
-        Ok(ndn_config::FaceStatus::decode_all(&bytes))
+        Ok(ndn_mgmt_wire::FaceStatus::decode_all(&bytes))
     }
 
     /// Set forwarding strategy for a prefix: `strategy-choice/set`.
@@ -269,9 +269,9 @@ impl MgmtClient {
     }
 
     /// `strategy-choice/list` decoded as NFD `StrategyChoice` entries.
-    pub async fn strategy_list(&self) -> Result<Vec<ndn_config::StrategyChoice>, ForwarderError> {
+    pub async fn strategy_list(&self) -> Result<Vec<ndn_mgmt_wire::StrategyChoice>, ForwarderError> {
         let bytes = self.dataset_raw(module::STRATEGY, verb::LIST).await?;
-        Ok(ndn_config::StrategyChoice::decode_all(&bytes))
+        Ok(ndn_mgmt_wire::StrategyChoice::decode_all(&bytes))
     }
 
     /// Content store info: `cs/info`.
@@ -748,7 +748,7 @@ impl MgmtClient {
             uri: Some(rule.to_owned()),
             ..Default::default()
         };
-        let name = ndn_config::command_name(module::SECURITY, verb::SCHEMA_RULE_ADD, &params);
+        let name = ndn_mgmt_wire::command_name(module::SECURITY, verb::SCHEMA_RULE_ADD, &params);
         self.send_interest(name).await
     }
 
@@ -762,7 +762,7 @@ impl MgmtClient {
             count: Some(index),
             ..Default::default()
         };
-        let name = ndn_config::command_name(module::SECURITY, verb::SCHEMA_RULE_REMOVE, &params);
+        let name = ndn_mgmt_wire::command_name(module::SECURITY, verb::SCHEMA_RULE_REMOVE, &params);
         self.send_interest(name).await
     }
 
@@ -777,7 +777,7 @@ impl MgmtClient {
             uri: Some(rules.to_owned()),
             ..Default::default()
         };
-        let name = ndn_config::command_name(module::SECURITY, verb::SCHEMA_SET, &params);
+        let name = ndn_mgmt_wire::command_name(module::SECURITY, verb::SCHEMA_SET, &params);
         self.send_interest(name).await
     }
 
@@ -1033,14 +1033,14 @@ mod tests {
     use std::sync::Arc;
 
     use bytes::Bytes;
-    use ndn_config::nfd_command::{command_name, dataset_name, module, verb};
+    use ndn_mgmt_wire::nfd_command::{command_name, dataset_name, module, verb};
     use ndn_packet::{SignatureType, encode::InterestBuilder};
     use ndn_security::{Ed25519Signer, Signer};
 
     use super::{SigningPolicy, build_dataset_interest, build_signed_interest_with_policy};
 
     fn rib_register_name() -> ndn_packet::Name {
-        let params = ndn_config::ControlParameters {
+        let params = ndn_mgmt_wire::ControlParameters {
             name: Some("/test/prefix".parse().unwrap()),
             face_id: Some(1),
             cost: Some(10),

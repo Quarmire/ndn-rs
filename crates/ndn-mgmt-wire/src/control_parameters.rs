@@ -3,8 +3,12 @@
 //! <https://redmine.named-data.net/projects/nfd/wiki/ControlCommand>.
 //! All fields are optional; the command determines which are required.
 //! Integers use NDN NonNegativeInteger (1/2/4/8-byte big-endian).
+use alloc::borrow::ToOwned;
+use alloc::string::String;
+use alloc::vec;
+use alloc::vec::Vec;
 use bytes::Bytes;
-use ndn_packet::{Name, NameComponent};
+use ndn_foundation_types::{Name, NameComponent};
 use ndn_tlv::{TlvReader, TlvWriter};
 
 pub mod tlv {
@@ -295,14 +299,14 @@ impl ControlParameters {
                 }
                 tlv::URI => {
                     params.uri = Some(
-                        std::str::from_utf8(&val)
+                        core::str::from_utf8(&val)
                             .map_err(|_| ControlParametersError::InvalidUtf8)?
                             .to_owned(),
                     );
                 }
                 tlv::LOCAL_URI => {
                     params.local_uri = Some(
-                        std::str::from_utf8(&val)
+                        core::str::from_utf8(&val)
                             .map_err(|_| ControlParametersError::InvalidUtf8)?
                             .to_owned(),
                     );
@@ -423,12 +427,12 @@ impl ControlParameters {
                                 .map_err(|_| ControlParametersError::MalformedTlv)?;
                             match t {
                                 tlv::OPTION_NAME => {
-                                    option = std::str::from_utf8(&v)
+                                    option = core::str::from_utf8(&v)
                                         .map_err(|_| ControlParametersError::InvalidUtf8)?
                                         .to_owned();
                                 }
                                 tlv::REFUSAL_REASON => {
-                                    reason = std::str::from_utf8(&v)
+                                    reason = core::str::from_utf8(&v)
                                         .map_err(|_| ControlParametersError::InvalidUtf8)?
                                         .to_owned();
                                 }

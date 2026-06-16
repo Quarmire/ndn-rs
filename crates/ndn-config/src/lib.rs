@@ -8,13 +8,20 @@
 #![allow(missing_docs)]
 
 pub mod config;
-pub mod control_parameters;
-pub mod control_response;
 pub mod error;
 pub mod mgmt;
-pub mod nfd_command;
-pub mod nfd_dataset;
 pub mod notifications;
+
+// The NFD management WIRE codecs (ControlParameters / ControlResponse / the
+// command + dataset formats) moved to ndn-mgmt-wire (spec), so the spec crates
+// that consume them depend on a spec crate, not this forwarder-TOML extension.
+// Re-exported here — modules and types — so existing `ndn_config::` consumers
+// keep compiling unchanged.
+pub use ndn_mgmt_wire::{control_parameters, control_response, nfd_command, nfd_dataset};
+pub use ndn_mgmt_wire::{
+    ControlParameters, ControlResponse, FaceStatus, FibEntry, NextHopRecord, ParsedCommand,
+    RibEntry, Route, StrategyChoice, command_name, dataset_name, parse_command_name,
+};
 
 pub use config::{
     AcmeTomlConfig, CertSourceConfig, ChallengeConfig, CsConfig, DemoCaConfig, DiscoveryTomlConfig,
@@ -25,9 +32,5 @@ pub use config::{
     TrustRuleConfig, WebRtcListenerConfig, WebTransportListenerConfig, WtIceServers, WtTurnServer,
     parse_cert_sha256_hex,
 };
-pub use control_parameters::ControlParameters;
-pub use control_response::ControlResponse;
 pub use error::ConfigError;
-pub use nfd_command::{ParsedCommand, command_name, dataset_name, parse_command_name};
-pub use nfd_dataset::{FaceStatus, FibEntry, NextHopRecord, RibEntry, Route, StrategyChoice};
 pub use notifications::NotificationStream;

@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::RwLock;
 
 use async_trait::async_trait;
-use ndn_config::ControlParameters;
+use ndn_mgmt_wire::ControlParameters;
 use ndn_engine::ForwarderEngine;
 #[cfg(not(target_arch = "wasm32"))]
 use ndn_packet::Name;
@@ -106,8 +106,8 @@ impl MgmtRouter {
     ) -> MgmtResponse {
         match self.modules.get(module) {
             Some(m) => m.dispatch(verb, params, ctx).await,
-            None => ndn_config::ControlResponse::error(
-                ndn_config::control_response::status::NOT_FOUND,
+            None => ndn_mgmt_wire::ControlResponse::error(
+                ndn_mgmt_wire::control_response::status::NOT_FOUND,
                 "unknown module",
             )
             .into(),

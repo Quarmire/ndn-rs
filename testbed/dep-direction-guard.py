@@ -32,15 +32,15 @@ SPEC = "spec"
 # this set fails the build, and an entry here that is no longer a violation also
 # fails (keep the list honest — shrink it as refactors land). `"crate -> dep"`.
 ALLOWLIST: dict[str, str] = {
-    # F-config-split-up: ndn-config conflates the NFD management-WIRE types (spec)
-    # with the forwarder/NLSR TOML (extension). Fix = move the 5 wire modules
-    # (control_parameters, control_response, nfd_command, nfd_dataset,
-    # notifications) into ndn-mgmt-wire (spec); these consumers then dep
-    # ndn-mgmt-wire. (ndn-routing also uses NlsrTomlConfig — a TOML tail that needs
-    # the parse to move to the NLSR binary.)
-    "ndn-ipc -> ndn-config": "F-config-split-up: move wire modules to ndn-mgmt-wire",
-    "ndn-mgmt -> ndn-config": "F-config-split-up: move wire modules to ndn-mgmt-wire",
-    "ndn-routing -> ndn-config": "F-config-split-up + move NlsrTomlConfig parse to the NLSR binary",
+    # F-config-split-up RESIDUAL (b2): the NFD management-WIRE codecs moved out of
+    # ndn-config into ndn-mgmt-wire (spec), so ndn-ipc / ndn-routing now dep only
+    # the wire crate and ndn-mgmt's wire usages do too. The one edge left is
+    # ndn-mgmt -> ndn-config for the *forwarder TOML* (`ForwarderConfig`,
+    # `parse_cert_sha256_hex`) that the mgmt command handlers read — an extension
+    # config tail, not a wire format. Cut by abstracting the config read behind a
+    # spec-side trait (or moving those handlers to the forwarder binary) before the
+    # split.
+    "ndn-mgmt -> ndn-config": "F-config-split-up residual (b2): ForwarderConfig read in mgmt handlers",
 }
 
 

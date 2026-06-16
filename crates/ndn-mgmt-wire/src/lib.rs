@@ -19,6 +19,19 @@ use alloc::string::String;
 use bytes::Bytes;
 use ndn_tlv::{TlvReader, TlvWriter};
 
+// NFD management WIRE codecs (moved here from ndn-config so the spec crates that
+// consume them — ndn-mgmt/ndn-ipc/ndn-routing — depend on this spec crate, not
+// the forwarder-TOML extension crate). ndn-config re-exports them for back-compat.
+pub mod control_parameters;
+pub mod control_response;
+pub mod nfd_command;
+pub mod nfd_dataset;
+
+pub use control_parameters::ControlParameters;
+pub use control_response::ControlResponse;
+pub use nfd_command::{ParsedCommand, command_name, dataset_name, parse_command_name};
+pub use nfd_dataset::{FaceStatus, FibEntry, NextHopRecord, RibEntry, Route, StrategyChoice};
+
 /// NFD ForwarderStatus TLV-TYPE codes (`tlv-nfd.hpp`).
 pub mod tlv {
     pub const NFD_VERSION: u64 = 128; // 0x80, UTF-8 string
