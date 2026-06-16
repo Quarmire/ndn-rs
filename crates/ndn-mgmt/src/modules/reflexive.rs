@@ -15,7 +15,7 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use ndn_config::{ControlParameters, ControlResponse, control_response::status};
+use ndn_mgmt_wire::{ControlParameters, ControlResponse, control_response::status};
 use ndn_engine::ForwarderEngine;
 
 use crate::MgmtResponse;
@@ -110,7 +110,7 @@ mod tests {
     fn ctx<'a>(
         engine: &'a ForwarderEngine,
         cancel: &'a CancellationToken,
-        config: &'a ndn_config::ForwarderConfig,
+        config: &'a dyn crate::MgmtConfig,
     ) -> MgmtContext<'a> {
         MgmtContext {
             engine,
@@ -148,7 +148,7 @@ mod tests {
             .await
             .unwrap();
         let cancel = CancellationToken::new();
-        let config = ndn_config::ForwarderConfig::default();
+        let config = crate::module::TestMgmtConfig::default();
         let m = ReflexiveModule;
 
         // disable → table reports disabled and refuses new routes.

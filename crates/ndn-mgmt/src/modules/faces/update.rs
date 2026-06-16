@@ -2,7 +2,7 @@
 //! persistency) and the refusal-reason / refused-response helpers shared
 //! with `faces/create`'s idempotent re-attach path.
 
-use ndn_config::{ControlParameters, ControlResponse, control_response::status};
+use ndn_mgmt_wire::{ControlParameters, ControlResponse, control_response::status};
 use ndn_engine::ForwarderEngine;
 use ndn_transport::{
     BIT_CONGESTION_MARKING, BIT_LOCAL_FIELDS, BIT_LP_RELIABILITY, FaceId, FaceKind, FaceOption,

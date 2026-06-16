@@ -3,19 +3,19 @@
 
 use base64::Engine as _;
 
-use ndn_config::{ControlParameters, ControlResponse, control_response::status};
+use ndn_mgmt_wire::{ControlParameters, ControlResponse, control_response::status};
 use ndn_engine::ForwarderEngine;
 use ndn_security::FilePib;
 
 pub(super) fn security_identity_status(
     engine: &ForwarderEngine,
-    config: &ndn_config::ForwarderConfig,
+    config: &dyn crate::MgmtConfig,
     is_ephemeral: bool,
 ) -> ControlResponse {
     // Prefer the configured identity name; otherwise derive from the
     // first trust-anchor in the SecurityManager.
-    let identity_name: String = if let Some(id) = &config.security.identity {
-        id.clone()
+    let identity_name: String = if let Some(id) = config.security_identity() {
+        id.to_owned()
     } else if let Some(mgr) = engine.security() {
         mgr.trust_anchor_names()
             .first()
@@ -33,9 +33,7 @@ pub(super) fn security_identity_status(
     };
 
     let pib_path = config
-        .security
-        .pib_path
-        .as_deref()
+        .pib_path()
         .map(str::to_owned)
         .unwrap_or_else(|| dirs_or_tmp_pib().display().to_string());
 
@@ -112,7 +110,7 @@ pub(super) fn security_identity_generate(
 /// commands, which otherwise lived only inside the command validator.
 pub(super) fn security_anchor_list(
     pib: Option<&FilePib>,
-    config: &ndn_config::ForwarderConfig,
+    config: &dyn crate::MgmtConfig,
 ) -> ControlResponse {
     // (name, source); first source wins on duplicate names.
     let mut entries: Vec<(String, &'static str)> = Vec::new();
@@ -137,9 +135,9 @@ pub(super) fn security_anchor_list(
     // Management + localhop anchors live in separate PIBs the validators were
     // built from; read them so the dashboard sees the full trust posture.
     for (path, source) in [
-        (config.security.mgmt.trust_anchor_pib.as_deref(), "mgmt"),
+        (config.mgmt_trust_anchor_pib(), "mgmt"),
         (
-            config.security.mgmt.localhop_trust_anchor_pib.as_deref(),
+            config.localhop_trust_anchor_pib(),
             "localhop",
         ),
     ] {

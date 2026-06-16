@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use web_time::Instant;
 
-use ndn_config::{
+use ndn_mgmt_wire::{
     ControlParameters, ControlResponse,
     control_parameters::{origin, route_flags},
     control_response::status,

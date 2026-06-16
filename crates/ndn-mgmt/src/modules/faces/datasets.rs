@@ -1,6 +1,6 @@
 //! `faces/list`, `faces/link-quality`, and `faces/counters` datasets.
 
-use ndn_config::{ControlResponse, nfd_dataset};
+use ndn_mgmt_wire::{ControlResponse, nfd_dataset};
 use ndn_engine::ForwarderEngine;
 use ndn_transport::{FaceKind, FacePersistency, FaceScope};
 

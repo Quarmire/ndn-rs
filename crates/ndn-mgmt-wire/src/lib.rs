@@ -32,6 +32,21 @@ pub use control_response::ControlResponse;
 pub use nfd_command::{ParsedCommand, command_name, dataset_name, parse_command_name};
 pub use nfd_dataset::{FaceStatus, FibEntry, NextHopRecord, RibEntry, Route, StrategyChoice};
 
+/// Parse a 64-char hex SHA-256 digest (e.g. a `FaceCreate` certificate-pin
+/// argument) into its 32 raw bytes. Returns `None` on the wrong length or a
+/// non-hex character. Lives here (not in the forwarder TOML crate) because it
+/// decodes a management *wire* argument.
+pub fn parse_cert_sha256_hex(hex: &str) -> Option<[u8; 32]> {
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
 /// NFD ForwarderStatus TLV-TYPE codes (`tlv-nfd.hpp`).
 pub mod tlv {
     pub const NFD_VERSION: u64 = 128; // 0x80, UTF-8 string

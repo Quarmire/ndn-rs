@@ -31,13 +31,92 @@ use crate::{
     StrategyEvent, WtCertStatusBackend,
 };
 
+/// The forwarder-config read surface the management handlers depend on.
+///
+/// `ndn-mgmt` is the spec-layer NFD management protocol; the forwarder TOML
+/// schema (`ndn_config::ForwarderConfig`) is an extension. Threading the
+/// concrete config through the handlers made the spec crate depend on the
+/// extension. This trait inverts that: the handlers read only what they need
+/// through `&dyn MgmtConfig`, and `ForwarderConfig` implements it downstream in
+/// `ndn-config`. The forwarder hands the engine an `Arc<dyn MgmtConfig>` when it
+/// mounts management.
+pub trait MgmtConfig: Send + Sync {
+    /// Serialize the running config to TOML — backs `/localhost/nfd/config/get`.
+    fn to_toml_string(&self) -> Result<String, String>;
+
+    /// `[security] identity` — the configured engine identity name, if any.
+    fn security_identity(&self) -> Option<&str>;
+    /// `[security] pib_path` — the engine identity PIB path, if configured.
+    fn pib_path(&self) -> Option<&str>;
+
+    /// `[security.mgmt] require_signed_commands`.
+    fn require_signed_commands(&self) -> bool;
+    /// `[security.mgmt] trust_anchor_pib` — the operator command anchor PIB path.
+    fn mgmt_trust_anchor_pib(&self) -> Option<&str>;
+    /// `[security.mgmt] localhop_trust_anchor_pib` — the localhop registration anchor PIB path.
+    fn localhop_trust_anchor_pib(&self) -> Option<&str>;
+
+    /// NDNCERT CA posture for `security/ca-info`; `None` when no CA is configured.
+    fn ca_info(&self) -> Option<CaInfo<'_>>;
+}
+
+/// NDNCERT CA configuration surfaced by `security/ca-info`. Borrows from the
+/// underlying [`MgmtConfig`].
+pub struct CaInfo<'a> {
+    pub prefix: &'a str,
+    pub info: &'a str,
+    pub max_validity_days: u32,
+    pub challenges: &'a [String],
+}
+
+/// Minimal [`MgmtConfig`] for the in-crate unit tests. The production
+/// implementor is `ndn_config::ForwarderConfig` (downstream, behind its `mgmt`
+/// feature), which the *integration* tests in `tests/` use. Unit tests can't:
+/// `ndn-config` is only a dev-dependency here and depends back on this crate, so
+/// its impl is for the lib build's trait, not the test-cfg build's — a stub
+/// avoids that mismatch.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct TestMgmtConfig {
+    pub require_signed_commands: bool,
+    pub mgmt_trust_anchor_pib: Option<String>,
+    pub localhop_trust_anchor_pib: Option<String>,
+    pub identity: Option<String>,
+    pub pib_path: Option<String>,
+}
+
+#[cfg(test)]
+impl MgmtConfig for TestMgmtConfig {
+    fn to_toml_string(&self) -> Result<String, String> {
+        Ok(String::new())
+    }
+    fn security_identity(&self) -> Option<&str> {
+        self.identity.as_deref()
+    }
+    fn pib_path(&self) -> Option<&str> {
+        self.pib_path.as_deref()
+    }
+    fn require_signed_commands(&self) -> bool {
+        self.require_signed_commands
+    }
+    fn mgmt_trust_anchor_pib(&self) -> Option<&str> {
+        self.mgmt_trust_anchor_pib.as_deref()
+    }
+    fn localhop_trust_anchor_pib(&self) -> Option<&str> {
+        self.localhop_trust_anchor_pib.as_deref()
+    }
+    fn ca_info(&self) -> Option<CaInfo<'_>> {
+        None
+    }
+}
+
 /// Per-Interest dispatch context. Threaded by the router into each
 /// [`MgmtModule::dispatch`] call; modules pull the fields they need.
 pub struct MgmtContext<'a> {
     pub engine: &'a ForwarderEngine,
     pub cancel: &'a CancellationToken,
     pub source_face: Option<FaceId>,
-    pub config: &'a ndn_config::ForwarderConfig,
+    pub config: &'a dyn MgmtConfig,
     #[cfg(not(target_arch = "wasm32"))]
     pub discovery_sd: Option<&'a ServiceDiscoveryProtocol>,
     #[cfg(not(target_arch = "wasm32"))]

@@ -41,7 +41,6 @@ ndn-strategy     = { workspace = true }
 # on native builds.
 ndn-security     = { path = "../ndn-security", default-features = false }
 ndn-cert         = { path = "../ndn-cert",     default-features = false }
-ndn-config       = { workspace = true }
 ndn-mgmt-wire    = { workspace = true }
 ndn-packet       = { workspace = true, features = ["std"] }
 ndn-tlv          = { workspace = true }
@@ -81,6 +80,10 @@ libc             = { workspace = true }
 
 [dev-dependencies]
 tempfile         = "3"
+# ndn-config is a dev-only dep now: ndn-mgmt`s handlers read it through the
+# `MgmtConfig` trait, and ndn-config (extension) implements that downstream.
+# Tests construct a real `ForwarderConfig`, so they enable its `mgmt` impl.
+ndn-config       = { workspace = true, features = ["mgmt"] }
 ndn-store        = { workspace = true }
 # IPC-seam witness (tests/ipc_seam.rs): a client rides a socketpair fd.
 ndn-ipc          = { workspace = true }

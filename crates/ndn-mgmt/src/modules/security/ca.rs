@@ -1,26 +1,25 @@
 //! `security/ca-*` — NDNCERT CA info / token issuance / enrollment.
 
-use ndn_config::{ControlParameters, ControlResponse, control_response::status};
+use ndn_mgmt_wire::{ControlParameters, ControlResponse, control_response::status};
 use ndn_engine::ForwarderEngine;
 use ndn_packet::Name;
 use ndn_security::FilePib;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 
-pub(super) fn security_ca_info(config: &ndn_config::ForwarderConfig) -> ControlResponse {
-    let sec = &config.security;
-    match &sec.ca_prefix {
+pub(super) fn security_ca_info(config: &dyn crate::MgmtConfig) -> ControlResponse {
+    match config.ca_info() {
         None => ControlResponse::error(
             status::NOT_FOUND,
             "no CA configured (set [security] ca_prefix in router TOML)",
         ),
-        Some(prefix) => {
+        Some(ca) => {
             let info = format!(
                 "ca_prefix={}\nca_info={}\nmax_validity_days={}\nchallenges={}\n",
-                prefix,
-                sec.ca_info,
-                sec.ca_max_validity_days,
-                sec.ca_challenges.join(","),
+                ca.prefix,
+                ca.info,
+                ca.max_validity_days,
+                ca.challenges.join(","),
             );
             ControlResponse::ok_empty(info)
         }

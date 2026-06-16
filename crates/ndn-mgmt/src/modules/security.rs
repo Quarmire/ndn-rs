@@ -12,7 +12,7 @@ use std::sync::{Arc, RwLock};
 use async_trait::async_trait;
 #[cfg(test)]
 use bytes::Bytes;
-use ndn_config::{
+use ndn_mgmt_wire::{
     ControlParameters, ControlResponse,
     control_response::status,
     nfd_command::{module, verb},
@@ -43,7 +43,7 @@ async fn handle_security(
     params: ControlParameters,
     pib: Option<&FilePib>,
     engine: &ForwarderEngine,
-    config: &ndn_config::ForwarderConfig,
+    config: &dyn crate::MgmtConfig,
     is_ephemeral: bool,
     runtime_policy: Option<&Arc<RwLock<MgmtAccessPolicy>>>,
 ) -> ControlResponse {
@@ -121,20 +121,20 @@ pub struct MgmtAccessPolicy {
 }
 
 impl MgmtAccessPolicy {
-    pub fn from_config(config: &ndn_config::ForwarderConfig) -> Self {
+    pub fn from_config(config: &dyn crate::MgmtConfig) -> Self {
         Self {
-            ephemeral_allowed: config.security.identity.is_none(),
-            localhop_disabled: config.security.mgmt.localhop_trust_anchor_pib.is_none(),
+            ephemeral_allowed: config.security_identity().is_none(),
+            localhop_disabled: config.localhop_trust_anchor_pib().is_none(),
             // Compiled-in floor for the `SignatureTime` replay window.
             replay_window_secs: 120,
-            require_signed_commands: config.security.mgmt.require_signed_commands,
-            validator_anchor: config.security.mgmt.trust_anchor_pib.clone(),
+            require_signed_commands: config.require_signed_commands(),
+            validator_anchor: config.mgmt_trust_anchor_pib().map(str::to_owned),
         }
     }
 }
 
 fn security_policy_get(
-    config: &ndn_config::ForwarderConfig,
+    config: &dyn crate::MgmtConfig,
     runtime_policy: Option<&Arc<RwLock<MgmtAccessPolicy>>>,
 ) -> ControlResponse {
     // Live runtime policy when wired; static config snapshot otherwise.
@@ -150,7 +150,7 @@ fn security_policy_get(
 
 fn security_policy_set(
     params: ControlParameters,
-    config: &ndn_config::ForwarderConfig,
+    config: &dyn crate::MgmtConfig,
     runtime_policy: Option<&Arc<RwLock<MgmtAccessPolicy>>>,
 ) -> ControlResponse {
     let body = match params.uri.as_deref() {
@@ -284,8 +284,11 @@ mod security_v1_handler_tests {
     //! auth-gated).
     use super::*;
 
-    fn empty_config() -> ndn_config::ForwarderConfig {
-        ndn_config::ForwarderConfig::default()
+    fn empty_config() -> crate::module::TestMgmtConfig {
+        crate::module::TestMgmtConfig {
+            require_signed_commands: true,
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -528,9 +531,10 @@ mod safebag_import_tests {
             .add_trust_anchor(&mn, &mk("/op/alice/KEY/k0/self/v=0"))
             .unwrap();
 
-        let mut config = ndn_config::ForwarderConfig::default();
-        config.security.mgmt.trust_anchor_pib =
-            Some(mgmt_dir.path().to_str().unwrap().to_string());
+        let config = crate::module::TestMgmtConfig {
+            mgmt_trust_anchor_pib: Some(mgmt_dir.path().to_str().unwrap().to_string()),
+            ..Default::default()
+        };
 
         let cr = security_anchor_list(Some(&engine_pib), &config);
         assert!(

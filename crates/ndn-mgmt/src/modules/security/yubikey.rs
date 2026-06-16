@@ -3,7 +3,7 @@
 #[cfg(feature = "yubikey-piv")]
 use base64::Engine as _;
 
-use ndn_config::{ControlParameters, ControlResponse, control_response::status};
+use ndn_mgmt_wire::{ControlParameters, ControlResponse, control_response::status};
 use ndn_security::FilePib;
 
 /// Detect a PC/SC-accessible YubiKey. Returns `status_text="present"`,

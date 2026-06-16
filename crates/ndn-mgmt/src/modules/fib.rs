@@ -2,7 +2,7 @@
 //! FIB manipulation (bypasses the RIB).
 
 use async_trait::async_trait;
-use ndn_config::{
+use ndn_mgmt_wire::{
     ControlParameters, ControlResponse,
     control_response::status,
     nfd_command::{module, verb},

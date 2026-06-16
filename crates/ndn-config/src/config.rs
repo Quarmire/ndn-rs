@@ -1,4 +1,5 @@
 use crate::ConfigError;
+use ndn_mgmt_wire::parse_cert_sha256_hex;
 use serde::{Deserialize, Serialize};
 
 /// Top-level forwarder configuration loaded from TOML. See
@@ -878,19 +879,6 @@ fn validate_face_config(face: &FaceConfig) -> Result<(), ConfigError> {
         FaceConfig::Unix { .. } | FaceConfig::EtherMulticast { .. } => {}
     }
     Ok(())
-}
-
-/// Parse a 64-char hex string into a 32-byte SHA-256 digest (WebTransport
-/// `serverCertificateHashes` / `WtClientTls::CertHashes`).
-pub fn parse_cert_sha256_hex(hex: &str) -> Option<[u8; 32]> {
-    if hex.len() != 64 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    for (i, byte) in out.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
-    }
-    Some(out)
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

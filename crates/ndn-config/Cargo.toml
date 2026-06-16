@@ -8,8 +8,16 @@ license.workspace = true
 [package.metadata.scope]
 classification = "extension"
 
+[features]
+# Provides `impl MgmtConfig for ForwarderConfig` so the forwarder can hand its
+# config to ndn-mgmt`s command handlers. Off by default: lean consumers that
+# only parse the TOML (e.g. mobile identity-only) do not pull the management
+# stack. The crates that mount management enable it.
+mgmt = ["dep:ndn-mgmt"]
+
 [dependencies]
 ndn-mgmt-wire = { workspace = true }
+ndn-mgmt      = { workspace = true, optional = true }
 ndn-tlv       = { workspace = true, features = ["std"] }
 ndn-packet    = { workspace = true, features = ["std"] }
 tracing       = { workspace = true }

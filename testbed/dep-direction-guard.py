@@ -31,17 +31,13 @@ SPEC = "spec"
 # yet cut. Reported as PENDING (exit 0) so CI stays usable; a NEW violation not in
 # this set fails the build, and an entry here that is no longer a violation also
 # fails (keep the list honest — shrink it as refactors land). `"crate -> dep"`.
-ALLOWLIST: dict[str, str] = {
-    # F-config-split-up RESIDUAL (b2): the NFD management-WIRE codecs moved out of
-    # ndn-config into ndn-mgmt-wire (spec), so ndn-ipc / ndn-routing now dep only
-    # the wire crate and ndn-mgmt's wire usages do too. The one edge left is
-    # ndn-mgmt -> ndn-config for the *forwarder TOML* (`ForwarderConfig`,
-    # `parse_cert_sha256_hex`) that the mgmt command handlers read — an extension
-    # config tail, not a wire format. Cut by abstracting the config read behind a
-    # spec-side trait (or moving those handlers to the forwarder binary) before the
-    # split.
-    "ndn-mgmt -> ndn-config": "F-config-split-up residual (b2): ForwarderConfig read in mgmt handlers",
-}
+# Empty: the spec library set is fully closed. The F-config-split-up edges
+# (ndn-ipc / ndn-routing / ndn-mgmt -> ndn-config) are all cut — wire codecs
+# moved to ndn-mgmt-wire, and ndn-mgmt now reads the forwarder config through the
+# `MgmtConfig` trait it defines, which ndn-config implements downstream
+# (extension -> spec). Add an entry here only for a real edge slated for a
+# scheduled refactor; a stale entry fails the build.
+ALLOWLIST: dict[str, str] = {}
 
 
 def repo_root() -> Path:

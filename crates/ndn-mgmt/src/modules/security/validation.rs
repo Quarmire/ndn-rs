@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use ndn_config::{ControlParameters, ControlResponse, control_response::status};
+use ndn_mgmt_wire::{ControlParameters, ControlResponse, control_response::status};
 use ndn_engine::ForwarderEngine;
 
 pub(super) fn security_validation_stats(engine: &ForwarderEngine) -> ControlResponse {

@@ -18,7 +18,7 @@ use ndn_packet::{Interest, Name, NameComponent};
 use ndn_security::FilePib;
 use tokio_util::sync::CancellationToken;
 
-use ndn_config::{
+use ndn_mgmt_wire::{
     ControlParameters, ControlResponse, control_response::status, nfd_command::parse_command_name,
 };
 
@@ -50,7 +50,7 @@ pub use ndnsd_adapter::{
 pub use status_bridge::mount_routing_status;
 
 pub use auth::{COMMAND_SIG_TIME_TOLERANCE_MS, CommandReplayCache};
-pub use module::{MgmtContext, MgmtModule, MgmtRouter};
+pub use module::{CaInfo, MgmtConfig, MgmtContext, MgmtModule, MgmtRouter};
 pub use modules::faces::{FaceEvent, FaceEventKind};
 pub use modules::rib::{RouteEvent, RouteEventKind};
 pub use modules::strategy::{StrategyEvent, StrategyEventKind};
@@ -124,7 +124,7 @@ pub fn mount_management(
     cancel: CancellationToken,
     #[cfg(not(target_arch = "wasm32"))] discovery_sd: Option<Arc<ServiceDiscoveryProtocol>>,
     #[cfg(not(target_arch = "wasm32"))] discovery_claimed: Vec<Name>,
-    config: Arc<ndn_config::ForwarderConfig>,
+    config: Arc<dyn crate::module::MgmtConfig>,
     #[cfg(not(target_arch = "wasm32"))] pib: Option<Arc<FilePib>>,
     handles: MgmtHandles,
 ) -> impl std::future::Future<Output = ()> + 'static {
@@ -556,7 +556,7 @@ pub async fn run_ndn_mgmt_handler(
     cancel: CancellationToken,
     #[cfg(not(target_arch = "wasm32"))] discovery_sd: Option<Arc<ServiceDiscoveryProtocol>>,
     #[cfg(not(target_arch = "wasm32"))] discovery_claimed: Vec<Name>,
-    config: Arc<ndn_config::ForwarderConfig>,
+    config: Arc<dyn crate::module::MgmtConfig>,
     #[cfg(not(target_arch = "wasm32"))] pib: Option<Arc<FilePib>>,
     mgmt_handles: MgmtHandles,
     face_events: Arc<NotificationStream<FaceEvent>>,
@@ -725,7 +725,7 @@ pub async fn run_ndn_mgmt_handler(
             engine: &engine,
             cancel: &cancel,
             source_face,
-            config: &config,
+            config: config.as_ref(),
             #[cfg(not(target_arch = "wasm32"))]
             discovery_sd: discovery_sd.as_deref(),
             #[cfg(not(target_arch = "wasm32"))]

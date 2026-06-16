@@ -8,6 +8,8 @@
 #![allow(missing_docs)]
 
 pub mod config;
+#[cfg(feature = "mgmt")]
+mod mgmt_config_impl;
 pub mod error;
 pub mod mgmt;
 pub mod notifications;
@@ -20,7 +22,8 @@ pub mod notifications;
 pub use ndn_mgmt_wire::{control_parameters, control_response, nfd_command, nfd_dataset};
 pub use ndn_mgmt_wire::{
     ControlParameters, ControlResponse, FaceStatus, FibEntry, NextHopRecord, ParsedCommand,
-    RibEntry, Route, StrategyChoice, command_name, dataset_name, parse_command_name,
+    RibEntry, Route, StrategyChoice, command_name, dataset_name, parse_cert_sha256_hex,
+    parse_command_name,
 };
 
 pub use config::{
@@ -30,7 +33,6 @@ pub use config::{
     ObservabilityTomlConfig, QuicListenerConfig, ReflexiveTomlConfig, RequireAttestationConfig,
     RouteConfig, RoutingTomlConfig, SecurityConfig, SelfSignedDevConfig, SmtpConfig,
     TrustRuleConfig, WebRtcListenerConfig, WebTransportListenerConfig, WtIceServers, WtTurnServer,
-    parse_cert_sha256_hex,
 };
 pub use error::ConfigError;
 pub use notifications::NotificationStream;

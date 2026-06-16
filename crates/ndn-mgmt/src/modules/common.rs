@@ -2,7 +2,7 @@
 
 use std::str::FromStr;
 
-use ndn_config::{ControlParameters, ControlResponse, control_response::status};
+use ndn_mgmt_wire::{ControlParameters, ControlResponse, control_response::status};
 use ndn_engine::ForwarderEngine;
 use ndn_packet::Name;
 use ndn_transport::FaceId;

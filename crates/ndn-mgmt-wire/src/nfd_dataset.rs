@@ -649,6 +649,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::string::ToString;
     use bytes::Bytes;
     use ndn_foundation_types::NameComponent;
 

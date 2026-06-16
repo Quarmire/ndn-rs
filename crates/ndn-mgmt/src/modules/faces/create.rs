@@ -1,7 +1,7 @@
 //! `faces/create` — URI-scheme dispatch and per-transport face dialing,
 //! plus idempotent re-attach of an existing face.
 
-use ndn_config::{ControlParameters, ControlResponse, control_response::status};
+use ndn_mgmt_wire::{ControlParameters, ControlResponse, control_response::status};
 use ndn_engine::ForwarderEngine;
 use ndn_transport::{
     BIT_CONGESTION_MARKING, BIT_LOCAL_FIELDS, BIT_LP_RELIABILITY, FaceId, FaceOption,
@@ -404,7 +404,7 @@ async fn faces_create_webtransport(uri: &str, engine: &ForwarderEngine) -> Contr
             .map(str::to_owned)
     });
     let tls = match cert_hex {
-        Some(hex) => match ndn_config::parse_cert_sha256_hex(&hex) {
+        Some(hex) => match ndn_mgmt_wire::parse_cert_sha256_hex(&hex) {
             Some(h) => ClientTls::CertHashes(vec![h]),
             None => {
                 return ControlResponse::error(
@@ -463,7 +463,7 @@ async fn faces_create_quic(uri: &str, engine: &ForwarderEngine) -> ControlRespon
         .any(|kv| *kv == "webpki" || *kv == "webpki=true");
 
     let tls = if let Some(hex) = cert_hex {
-        match ndn_config::parse_cert_sha256_hex(hex) {
+        match ndn_mgmt_wire::parse_cert_sha256_hex(hex) {
             Some(h) => ClientTls::CertHashes(vec![h]),
             None => {
                 return ControlResponse::error(
