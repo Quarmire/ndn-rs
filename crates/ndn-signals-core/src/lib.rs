@@ -57,6 +57,49 @@ pub struct LinkSignals {
     pub observed_tput_bps: Option<u32>,
     /// Monotonic millisecond stamp of the last update (staleness).
     pub updated_ms: u32,
+    /// Extension metrics beyond the common vocab above — published by radio
+    /// faces / the cognitive plane (e.g. `("mcs", 7.0)`, `("occupancy", 0.6)`,
+    /// `("residual_loss", 0.02)`, `("airtime", …)`) and read by measured
+    /// strategies. `&'static str` keys + a fixed inline array keep `LinkSignals`
+    /// `Copy` and dependency-free `no_std`; use [`Self::ext_set`]/[`Self::ext_get`]
+    /// rather than indexing. Needing more than [`MAX_EXT_SIGNALS`] slots is a
+    /// sign the metric belongs in the common vocab. Unused slots are `None`.
+    pub ext: [Option<(&'static str, f32)>; MAX_EXT_SIGNALS],
+}
+
+/// Inline extension-signal slot count (fixed so [`LinkSignals`] stays `Copy` +
+/// zero-dep `no_std`).
+pub const MAX_EXT_SIGNALS: usize = 4;
+
+impl LinkSignals {
+    /// Read an extension metric by key (e.g. `"mcs"`). `None` if unset.
+    pub fn ext_get(&self, key: &str) -> Option<f32> {
+        self.ext
+            .iter()
+            .flatten()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| *v)
+    }
+
+    /// Publish/overwrite an extension metric. Overwrites a matching key, else
+    /// fills the first free slot; silently drops if all [`MAX_EXT_SIGNALS`] slots
+    /// are taken (the cap is a design ceiling, not a runtime error path).
+    pub fn ext_set(&mut self, key: &'static str, value: f32) {
+        for slot in self.ext.iter_mut() {
+            if let Some((k, v)) = slot
+                && *k == key
+            {
+                *v = value;
+                return;
+            }
+        }
+        for slot in self.ext.iter_mut() {
+            if slot.is_none() {
+                *slot = Some((key, value));
+                return;
+            }
+        }
+    }
 }
 
 /// Fixed-point geographic position. Integer-only (no float, no trig) so it is
@@ -167,6 +210,30 @@ impl<F: Copy + Eq> SignalView<F> for NoSignals {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ext_signals_set_get_overwrite_and_cap() {
+        let mut s = LinkSignals::default();
+        assert_eq!(s.ext_get("mcs"), None);
+        s.ext_set("mcs", 7.0);
+        s.ext_set("occupancy", 0.6);
+        assert_eq!(s.ext_get("mcs"), Some(7.0));
+        assert_eq!(s.ext_get("occupancy"), Some(0.6));
+        // overwrite, not a new slot
+        s.ext_set("mcs", 5.0);
+        assert_eq!(s.ext_get("mcs"), Some(5.0));
+        assert_eq!(s.ext.iter().flatten().count(), 2);
+        // LinkSignals is still Copy (the slot is a fixed inline array).
+        let _copy = s;
+        assert_eq!(s.ext_get("mcs"), Some(5.0));
+        // cap: filling all slots then one more silently drops (no panic).
+        let mut full = LinkSignals::default();
+        for (i, k) in ["a", "b", "c", "d", "e"].iter().enumerate() {
+            full.ext_set(k, i as f32);
+        }
+        assert_eq!(full.ext.iter().flatten().count(), MAX_EXT_SIGNALS);
+        assert_eq!(full.ext_get("e"), None);
+    }
 
     #[test]
     fn no_signals_is_empty() {
