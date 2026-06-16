@@ -94,5 +94,5 @@ tokio        = { workspace = true, features = ["rt", "macros", "time"] }
 ndn-app      = { workspace = true }
 ndn-config   = { workspace = true }
 ndn-engine   = { workspace = true }
-ndn-face-native    = { workspace = true }
+ndn-face    = { workspace = true }
 ndn-transport = { workspace = true }

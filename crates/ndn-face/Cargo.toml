@@ -1,0 +1,127 @@
+[package]
+name = "ndn-face"
+description = "NDN face implementations: network (UDP/TCP/WS), local (in-process/SHM/Unix), serial (UART/COBS), and link-layer (Ethernet/BLE/WFB)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# ── Feature flags ────────────────────────────────────────────────────────────
+#
+# default = ["net", "websocket", "local"]
+#
+# net         – UdpFace, TcpFace, MulticastUdpFace (requires tokio::net)
+# udp-recvmmsg – batch UDP receive via recvmmsg (Linux). OFF by default —
+#               unsafe FFI, validate + benchmark on Linux before trusting.
+# websocket   – WebSocketFace (implies net; requires tokio-tungstenite)
+# local       – InProcFace/InProcHandle, IpcFace, UnixFace
+# spsc-shm    – ShmFace/ShmHandle zero-copy ring (implies local; Unix only,
+#               excluding Android/iOS)
+# serial      – SerialFace with COBS framing (requires tokio-serial)
+# l2          – Ethernet/WFB/BLE faces; platform cfg selects the right impl
+# bluetooth   – BleFace GATT stub (implies l2)
+# wfb         – WfbFace monitor-mode injection (implies l2; Linux only)
+
+[package.metadata.scope]
+classification = "spec"
+
+[features]
+# `udp-recvmmsg` / `udp-sendmmsg` are default-on: both validated + benchmarked
+# on Linux (~1.68× recv, ~1.7× send) and no-ops on non-Linux.
+default = ["net", "websocket", "local", "udp-recvmmsg", "udp-sendmmsg"]
+# Phase 3 Instrument-tier surface — opts researchers into `CallbackFace`,
+# `TapFace`, and `InProcFace::new_kind` in `cargo doc` output. Items
+# remain `pub` so in-tree code (the engine, tests, dashboards) keeps
+# compiling without the feature. See
+# 
+experimental-instrument = []
+net       = []
+# Batch UDP receive via `recvmmsg` (Linux only). OFF by default: the syscall
+# path is unsafe FFI and must be benchmarked + validated on Linux before it is
+# trusted in production. A no-op on non-Linux (single-datagram path is used).
+udp-recvmmsg = ["net"]
+# Batch UDP send via `sendmmsg` (Linux only). OFF by default — unsafe FFI;
+# only the fragment burst of a single packet is batched (same peer, in order).
+udp-sendmmsg = ["net"]
+websocket     = ["net", "dep:tokio-tungstenite"]
+websocket-tls = ["websocket", "dep:tokio-rustls", "dep:rcgen", "dep:rustls-pemfile"]
+local     = []
+spsc-shm  = ["local"]
+serial    = ["dep:tokio-serial"]
+l2        = []
+# AF_XDP kernel-bypass Ethernet I/O backend (Linux only). Pure-Rust aya (XDP
+# redirect program + XskMap) + xdpilone (UMEM/XSK rings). Implies l2 for the
+# shared Ethernet framing (EtherType 0x8624). See
+# `.claude/notes/afxdp-face-scope-2026-05-24.md`.
+af-xdp    = ["l2", "dep:aya", "dep:xdpilone"]
+# BLE peripheral (BleFace, Linux/macOS) + central (BleCentralFace,
+# Linux/macOS/Windows). bluer covers Linux for both roles; btleplug covers
+# macOS/Windows central; objc2 covers macOS peripheral.
+bluetooth = ["l2", "dep:bluer", "dep:objc2", "dep:btleplug", "dep:uuid"]
+wfb       = ["l2"]
+
+[dependencies]
+ndn-tlv       = { workspace = true }
+ndn-packet    = { workspace = true, features = ["std"] }
+ndn-transport  = { workspace = true }
+ndn-ble-framing = { workspace = true }
+ndn-face-local = { workspace = true }
+bytes         = { workspace = true, features = ["std"] }
+# `net` (and tokio-tungstenite) live in the non-wasm target block below:
+# tokio's `net` feature pulls `mio`, which does not build on wasm32. The
+# net/websocket face modules are native-only and gated off wasm in lib.rs.
+tokio         = { workspace = true, features = ["sync", "io-util", "rt", "macros", "time"] }
+tokio-util    = { workspace = true, features = ["codec"] }
+futures       = { workspace = true }
+thiserror     = { workspace = true }
+tracing       = { workspace = true }
+dashmap       = { workspace = true }
+
+# Optional deps gated by features
+tokio-rustls      = { workspace = true, optional = true }
+rcgen             = { workspace = true, optional = true }
+rustls-pemfile    = { workspace = true, optional = true }
+tokio-serial      = { workspace = true, optional = true }
+# uuid parses the GATT profile UUID strings for the central backends.
+uuid              = { workspace = true, optional = true }
+
+# Native-only: tokio `net` pulls `mio` (no wasm32 support), and the WebSocket
+# face needs tokio-tungstenite. The net/websocket modules are gated off wasm.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio             = { workspace = true, features = ["net"] }
+tokio-tungstenite = { workspace = true, optional = true }
+
+# libc is always available on unix — used for interface enumeration (getifaddrs)
+# and L2 raw sockets (AF_PACKET on Linux, PF_NDRV on macOS).
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+bluer = { workspace = true, optional = true }
+# AF_XDP face (`af-xdp` feature). Pure-Rust: aya = XDP redirect prog + XskMap;
+# xdpilone = UMEM/XSK rings (deps: libc, spin — no libbpf/clang).
+aya = { version = "0.13", optional = true }
+xdpilone = { version = "1.3", optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { workspace = true, optional = true }
+# macOS BLE central via CoreBluetooth.
+btleplug = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+pcap        = { workspace = true }
+windows-sys = { workspace = true }
+# Windows BLE central via WinRT.
+btleplug = { workspace = true, optional = true }
+
+[dev-dependencies]
+ndn-tlv    = { workspace = true, features = ["std"] }
+ndn-engine = { workspace = true }
+ndn-app    = { workspace = true }
+ndn-discovery-core = { workspace = true }
+tokio      = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "net", "time"] }
+criterion  = { workspace = true }
+
+[[bench]]
+name    = "face_local"
+harness = false
+path    = "benches/face_local.rs"

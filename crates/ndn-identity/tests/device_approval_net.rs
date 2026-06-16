@@ -8,7 +8,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use ndn_face_native::local::InProcFace;
+use ndn_face::local::InProcFace;
 use ndn_packet::Name;
 use ndn_transport::FaceId;
 

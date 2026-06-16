@@ -2,7 +2,7 @@
 //! (UnixFace) for control, optionally creates an SHM face for the
 //! data plane, registers prefixes via NFD `rib/{register,unregister}`,
 //! and shuttles packets. On Android / iOS use
-//! `ndn_engine::ForwarderEngine` with `ndn_face_native::local::AppFace`
+//! `ndn_engine::ForwarderEngine` with `ndn_face::local::AppFace`
 //! instead — there's no separate forwarder daemon to connect to.
 use std::path::Path;
 use std::sync::Arc;
@@ -12,7 +12,7 @@ use bytes::Bytes;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use ndn_face_native::local::IpcFace;
+use ndn_face::local::IpcFace;
 use ndn_packet::Name;
 use ndn_packet::lp::encode_lp_packet;
 use ndn_transport::{FaceId, Transport};
@@ -35,7 +35,7 @@ pub enum ForwarderError {
         feature = "spsc-shm"
     ))]
     #[error("SHM error: {0}")]
-    Shm(#[from] ndn_face_native::local::ShmError),
+    Shm(#[from] ndn_face::local::ShmError),
 }
 
 enum DataTransport {
@@ -45,7 +45,7 @@ enum DataTransport {
         feature = "spsc-shm"
     ))]
     Shm {
-        handle: ndn_face_native::local::shm::spsc::SpscHandle,
+        handle: ndn_face::local::shm::spsc::SpscHandle,
         face_id: u64,
     },
     Unix,
@@ -106,7 +106,7 @@ impl ForwarderClient {
         mtu: Option<usize>,
     ) -> Result<Self, ForwarderError> {
         let path = face_socket.as_ref().to_str().unwrap_or_default().to_owned();
-        let control = Arc::new(ndn_face_native::local::ipc_face_connect(FaceId(0), &path).await?);
+        let control = Arc::new(ndn_face::local::ipc_face_connect(FaceId(0), &path).await?);
         let cancel = CancellationToken::new();
         let dead = Arc::new(AtomicBool::new(false));
 
@@ -156,7 +156,7 @@ impl ForwarderClient {
     /// over a handed fd — SHM is excluded on the mobile targets anyway).
     #[cfg(unix)]
     pub fn from_raw_fd(fd: std::os::fd::RawFd) -> Result<Self, ForwarderError> {
-        let control = Arc::new(ndn_face_native::local::ipc_face_from_raw_fd(
+        let control = Arc::new(ndn_face::local::ipc_face_from_raw_fd(
             FaceId(0),
             ndn_transport::FaceKind::Unix,
             fd,
@@ -198,7 +198,7 @@ impl ForwarderClient {
             .await?;
         let face_id = resp.face_id.ok_or(ForwarderError::MalformedResponse)?;
 
-        let mut handle = ndn_face_native::local::shm::spsc::SpscHandle::connect(shm_name)?;
+        let mut handle = ndn_face::local::shm::spsc::SpscHandle::connect(shm_name)?;
         handle.set_cancel(cancel);
 
         Ok(DataTransport::Shm { handle, face_id })

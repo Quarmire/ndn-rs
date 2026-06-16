@@ -33,7 +33,7 @@ tracing              = { workspace = true }
 [dev-dependencies]
 tokio        = { workspace = true, features = ["rt", "macros", "time"] }
 ndn-app      = { workspace = true }
-ndn-face-native    = { workspace = true }
+ndn-face    = { workspace = true }
 ndn-packet   = { workspace = true, features = ["std"] }
 ndn-engine   = { workspace = true }
 ndn-transport = { workspace = true }

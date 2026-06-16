@@ -11,7 +11,7 @@
 //! - `fetch_unverified(name)` → `Unverified<Data>` — forces an explicit
 //!   `.verify(&validator)` (or a loud `.trust_unchecked()`); no silent `Data`.
 
-use ndn_face_native::local::InProcFace;
+use ndn_face::local::InProcFace;
 use ndn_packet::Name;
 use ndn_packet::encode::DataBuilder;
 use ndn_security::{KeyChain, SignWith};

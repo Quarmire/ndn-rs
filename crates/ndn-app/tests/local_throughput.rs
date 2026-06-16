@@ -7,7 +7,7 @@ use std::time::Instant;
 use bytes::Bytes;
 use ndn_app::{Consumer, EngineBuilder, Producer};
 use ndn_engine::EngineConfig;
-use ndn_face_native::local::InProcFace;
+use ndn_face::local::InProcFace;
 use ndn_packet::Name;
 use ndn_security::KeyChain;
 use ndn_transport::FaceId;
@@ -15,8 +15,8 @@ use ndn_transport::FaceId;
 const OBJ_SIZE: usize = 32 * 1024 * 1024;
 
 async fn rig() -> (
-    ndn_face_native::local::InProcHandle,
-    ndn_face_native::local::InProcHandle,
+    ndn_face::local::InProcHandle,
+    ndn_face::local::InProcHandle,
     impl Sized,
 ) {
     let (consumer_face, consumer_handle) = InProcFace::new(FaceId(1), 8192);

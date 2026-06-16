@@ -36,7 +36,7 @@ web-time       = { workspace = true }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 ndn-packet     = { workspace = true, features = ["std"] }
 ndn-security   = { workspace = true }
-ndn-face-native = { workspace = true }
+ndn-face = { workspace = true }
 ndn-ipc        = { workspace = true }
 tokio          = { workspace = true, features = ["sync", "rt", "time"] }
 

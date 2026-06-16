@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use ndn_face_native::local::InProcFace;
+use ndn_face::local::InProcFace;
 use ndn_packet::encode::{DataBuilder, InterestBuilder};
 use ndn_packet::{Data, Interest, Name, SignatureType};
 use ndn_transport::FaceId;

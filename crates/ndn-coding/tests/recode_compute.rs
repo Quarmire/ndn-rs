@@ -12,7 +12,7 @@ use bytes::Bytes;
 use ndn_app::{Consumer, EngineBuilder};
 use ndn_compute::ComputeService;
 use ndn_engine::EngineConfig;
-use ndn_face_native::local::InProcFace;
+use ndn_face::local::InProcFace;
 use ndn_packet::Name;
 
 use ndn_coding::policy::Field;

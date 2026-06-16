@@ -27,7 +27,7 @@ use bytes::Bytes;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use ndn_face_native::local::IpcFace;
+use ndn_face::local::IpcFace;
 use ndn_packet::{Data, Name};
 use ndn_transport::Transport;
 

@@ -328,7 +328,7 @@ pub struct BleStatus {
 
 /// Backend for the `ble` management module: controls the BLE peripheral
 /// listener and reports status. The spec crate owns the trait; the host
-/// (`ndn-fwd`) implements it over [`ndn_face_native::l2::BleListener`].
+/// (`ndn-fwd`) implements it over [`ndn_face::l2::BleListener`].
 #[async_trait::async_trait]
 pub trait BleMgmtBackend: Send + Sync {
     async fn status(&self) -> BleStatus;

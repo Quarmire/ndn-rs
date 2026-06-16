@@ -143,7 +143,7 @@ impl Subscriber {
     /// Convenience wrapper for an in-process engine handle.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn from_handle(
-        handle: ndn_face_native::local::InProcHandle,
+        handle: ndn_face::local::InProcHandle,
         group: Name,
         local_name: Name,
         config: SubscriberConfig,

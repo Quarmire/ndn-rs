@@ -1,0 +1,23 @@
+[package]
+name = "afxdp-redirect-ebpf"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "redirect"
+path = "src/main.rs"
+
+[dependencies]
+aya-ebpf = "0.1"
+
+[profile.dev]
+opt-level = 3
+debug = false
+overflow-checks = false
+
+[profile.release]
+opt-level = 3
+debug = false
+overflow-checks = false
+lto = true

@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
-use ndn_face_native::local::InProcFace;
+use ndn_face::local::InProcFace;
 use ndn_packet::Name;
 use ndn_packet::encode::DataBuilder;
 use ndn_transport::FaceId;

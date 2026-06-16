@@ -28,7 +28,7 @@ use ndn_engine::ForwarderEngine;
 #[cfg(target_arch = "wasm32")]
 use ndn_face_local::InProcFace;
 #[cfg(not(target_arch = "wasm32"))]
-use ndn_face_native::local::InProcFace;
+use ndn_face::local::InProcFace;
 use ndn_packet::Name;
 use tokio_util::sync::CancellationToken;
 

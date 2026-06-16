@@ -9,7 +9,7 @@ use bytes::Bytes;
 #[cfg(target_arch = "wasm32")]
 use ndn_face_local::InProcHandle;
 #[cfg(not(target_arch = "wasm32"))]
-use ndn_face_native::local::InProcHandle;
+use ndn_face::local::InProcHandle;
 #[cfg(not(target_arch = "wasm32"))]
 use ndn_ipc::{ChunkedProducer, ForwarderClient};
 use ndn_packet::encode::DataBuilder;

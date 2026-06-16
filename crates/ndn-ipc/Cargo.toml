@@ -10,14 +10,14 @@ classification = "spec"
 
 [features]
 default = ["spsc-shm"]
-spsc-shm = ["ndn-face-native/spsc-shm"]
+spsc-shm = ["ndn-face/spsc-shm"]
 
 [dependencies]
 ndn-packet     = { workspace = true, features = ["std"] }
 ndn-mgmt-wire  = { workspace = true }
 ndn-tlv        = { workspace = true, features = ["std"] }
 ndn-transport  = { workspace = true }
-ndn-face-native      = { workspace = true }
+ndn-face      = { workspace = true }
 ndn-security   = { workspace = true }
 bytes         = { workspace = true, features = ["std"] }
 tokio          = { workspace = true, features = ["sync", "rt", "macros"] }

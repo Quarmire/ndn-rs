@@ -22,7 +22,7 @@
 
 use ndn_app::{Consumer, EngineBuilder, Producer};
 use ndn_engine::EngineConfig;
-use ndn_face_native::local::InProcFace;
+use ndn_face::local::InProcFace;
 use ndn_packet::Name;
 use ndn_packet::encode::DataBuilder;
 use ndn_security::{KeyChain, SignWith};

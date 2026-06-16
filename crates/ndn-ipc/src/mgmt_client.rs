@@ -10,7 +10,7 @@ use ndn_mgmt_wire::{
     ControlParameters, ControlResponse,
     nfd_command::{command_name, dataset_name, module, verb},
 };
-use ndn_face_native::local::IpcFace;
+use ndn_face::local::IpcFace;
 use ndn_packet::{Name, encode::InterestBuilder};
 use ndn_security::Signer;
 use ndn_transport::{FaceId, Transport};
@@ -54,7 +54,7 @@ fn expected_response_name(interest_wire: &Bytes) -> Result<Name, ForwarderError>
 impl MgmtClient {
     pub async fn connect(face_socket: impl AsRef<str>) -> Result<Self, ForwarderError> {
         let face = Arc::new(
-            ndn_face_native::local::ipc_face_connect(FaceId(0), face_socket.as_ref()).await?,
+            ndn_face::local::ipc_face_connect(FaceId(0), face_socket.as_ref()).await?,
         );
         Ok(Self {
             face,

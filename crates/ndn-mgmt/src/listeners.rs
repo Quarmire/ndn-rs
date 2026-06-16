@@ -60,7 +60,7 @@ pub async fn run_face_listener_as(
     engine: ForwarderEngine,
     cancel: CancellationToken,
 ) {
-    let listener = match ndn_face_native::local::IpcListener::bind(path) {
+    let listener = match ndn_face::local::IpcListener::bind(path) {
         Ok(l) => l,
         Err(e) => {
             tracing::error!(target: "face.system", path = %path, error = %e, "face-listener: bind failed");
@@ -108,7 +108,7 @@ pub fn mount_app_face_from_fd(
     cancel: CancellationToken,
 ) -> std::io::Result<FaceId> {
     let face_id = engine.faces().alloc_id();
-    let face = ndn_face_native::local::ipc_face_from_raw_fd(face_id, FaceKind::App, fd)?;
+    let face = ndn_face::local::ipc_face_from_raw_fd(face_id, FaceKind::App, fd)?;
     engine.add_face(face, cancel);
     tracing::debug!(target: "face.system", face = %face_id, "mounted app face from fd");
     Ok(face_id)
@@ -161,7 +161,7 @@ pub async fn run_udp_listener(
         {
             let mut started = 0;
             for _ in 0..n {
-                match ndn_face_native::net::sockopt::bind_reuseport_udp(bind_addr) {
+                match ndn_face::net::sockopt::bind_reuseport_udp(bind_addr) {
                     Ok(std_sock) => {
                         if let Err(e) = std_sock.set_nonblocking(true) {
                             tracing::warn!(target: "face.udp", error=%e, "udp-listener: set_nonblocking failed");
@@ -247,7 +247,7 @@ async fn udp_rx_loop(
                     // socket. Inbound bytes come from the listener's
                     // demux via `inject_packet`, so no recv loop runs.
                     let face_id = engine.faces().alloc_id();
-                    let face = ndn_face_native::net::UdpFace::from_shared_socket(
+                    let face = ndn_face::net::UdpFace::from_shared_socket(
                         face_id, Arc::clone(&socket), src,
                     );
                     let peer_cancel = cancel.child_token();
@@ -304,7 +304,7 @@ pub async fn run_tcp_listener(
         };
 
         let face_id = engine.faces().alloc_id();
-        let face = ndn_face_native::net::tcp_face_from_stream(face_id, stream);
+        let face = ndn_face::net::tcp_face_from_stream(face_id, stream);
         let conn_cancel = cancel.child_token();
         engine.add_face(face, conn_cancel);
         tracing::info!(target: "face.tcp", face=%face_id, peer=%peer, "tcp-listener: accepted connection");
