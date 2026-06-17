@@ -36,7 +36,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use ndn_packet::Name;
 
-use crate::ApprovalGate;
+use crate::custodian::ApprovalGate;
 
 /// The class of action a sign request commits to, derived from the management
 /// module component of the signed region's leading Name.

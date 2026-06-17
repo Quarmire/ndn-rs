@@ -15,7 +15,7 @@
 
 use ndn_foundation_types::Name;
 
-use crate::AbeError;
+use crate::abe::AbeError;
 
 /// A parsed ABE policy expression.
 // The `Attribute` leaf carries a `Name` (large) while the operator variants

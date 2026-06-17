@@ -1,4 +1,4 @@
-//! [`CustodianSigner`] — adapts a [`Custodian`] into an `ndn_security::Signer`,
+//! [`CustodianSigner`] — adapts a [`Custodian`] into an `crate::Signer`,
 //! so a custodian can sign anywhere a `Signer` is expected (mgmt command
 //! Interests, Data). This is the seam that "routes signing through a custodian":
 //! `MgmtClient::with_signer(Arc::new(CustodianSigner::new(...)))` and every
@@ -16,9 +16,9 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use ndn_packet::{Name, SignatureType};
-use ndn_security::{Signer, TrustError};
+use crate::{Signer, TrustError};
 
-use crate::{Custodian, KeyId};
+use crate::custodian::{Custodian, KeyId};
 
 /// A [`Signer`] backed by a [`Custodian`] holding `key_id`.
 pub struct CustodianSigner {
@@ -95,8 +95,8 @@ impl Signer for CustodianSigner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::InPageCustodian;
-    use ndn_security::{Ed25519Signer, Ed25519Verifier, VerifyOutcome};
+    use crate::custodian::InPageCustodian;
+    use crate::{Ed25519Signer, Ed25519Verifier, VerifyOutcome};
 
     #[tokio::test]
     async fn custodian_signer_signs_and_verifies() {

@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use ndn_packet::Name;
 
-use crate::KeyId;
+use crate::custodian::KeyId;
 
 pub mod browser_extension;
 pub mod enclave;

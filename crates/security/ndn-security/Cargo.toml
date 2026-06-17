@@ -22,10 +22,9 @@ web-time      = { workspace = true }
 # matters for cross-compilation to Android, iOS, musl, and bare-metal.
 rusqlite      = { version = "0.32", features = ["bundled"], optional = true }
 ed25519-dalek = { workspace = true, features = ["pkcs8", "batch"] }
-# Shared crate for the SafeBag PKCS#8 round-trip helpers used by
-# FilePib's new algorithm-aware on-disk format.
-ndn-safebag   = { workspace = true }
-# `rand_core::OsRng` for ECDSA keygen — same RNG ndn-safebag uses.
+# SafeBag PKCS#8 round-trip helpers (the former ndn-safebag crate, now the
+# `safebag` module) back FilePib's algorithm-aware on-disk format.
+# `rand_core::OsRng` for ECDSA keygen — same RNG the safebag module uses.
 rand_core     = { version = "0.6", default-features = false, features = ["getrandom"] }
 blake3        = { workspace = true }
 # rustcrypto crates for ndn-cxx-compatible FileTpm + SafeBag.
@@ -57,6 +56,14 @@ tokio         = { workspace = true, features = ["sync", "time", "rt"] }
 # Requires pcscd and a connected YubiKey.
 yubikey = { version = "0.8", optional = true }
 
+# Attribute-Based Encryption for NDN content (feature: abe). Consolidated from
+# the former ndn-abe crate; off by default. Pulls the BN-254 pairing crate.
+ndn-foundation-types = { workspace = true, features = ["std"], optional = true }
+bincode = { workspace = true, optional = true }
+rabe    = { version = "0.4", features = ["serde"], optional = true }
+# Custody/key-locator layer (feature: custodian; was the ndn-custodian crate).
+async-trait = { workspace = true, optional = true }
+
 [features]
 default     = ["sqlite-pib"]
 yubikey-piv = ["dep:yubikey"]
@@ -65,6 +72,10 @@ yubikey-piv = ["dep:yubikey"]
 # rusqlite with the `bundled` feature so SQLite is built from source —
 # no system libsqlite3 required, identical behaviour on every target.
 sqlite-pib  = ["dep:rusqlite"]
+# Attribute-Based Encryption (was the ndn-abe crate). Off by default.
+abe         = ["dep:rabe", "dep:bincode", "dep:ndn-foundation-types"]
+# Custodian trait + KeyId (was the ndn-custodian crate). Off by default.
+custodian   = ["dep:async-trait"]
 
 [dev-dependencies]
 tokio      = { workspace = true, features = ["rt", "macros", "sync", "time"] }

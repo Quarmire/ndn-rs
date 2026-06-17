@@ -91,7 +91,7 @@ impl FilePib {
     pub fn generate_ed25519(&self, key_name: &Name) -> Result<Ed25519Signer, PibError> {
         let seed = random_seed();
         let signer = Ed25519Signer::from_seed(&seed, key_name.clone());
-        let pkcs8 = ndn_safebag::ed25519_seed_to_pkcs8(&seed)
+        let pkcs8 = crate::safebag::ed25519_seed_to_pkcs8(&seed)
             .map_err(|e| PibError::Corrupt(format!("ed25519 → pkcs8: {e}")))?;
         let dir = self.key_dir(key_name)?;
         std::fs::write(dir.join("private.pkcs8.der"), &pkcs8)?;
@@ -176,7 +176,7 @@ impl FilePib {
         passphrase: &[u8],
     ) -> Result<Certificate, PibError> {
         use ndn_packet::Data;
-        use ndn_safebag::SafeBag;
+        use crate::safebag::SafeBag;
         let bag = SafeBag::decode(safebag_wire)
             .map_err(|e| PibError::Corrupt(format!("SafeBag decode: {e}")))?;
         let pkcs8 = bag
@@ -223,7 +223,7 @@ impl FilePib {
         }
         let mut seed = [0u8; 32];
         seed.copy_from_slice(&seed_bytes);
-        ndn_safebag::ed25519_seed_to_pkcs8(&seed)
+        crate::safebag::ed25519_seed_to_pkcs8(&seed)
             .map_err(|e| PibError::Corrupt(format!("legacy seed → pkcs8: {e}")))
     }
 
@@ -238,7 +238,7 @@ impl FilePib {
     /// self-contained, verifiable bundle even when the PIB only kept the
     /// compact NDNC cert summary.
     pub fn export_safebag(&self, key_name: &Name, passphrase: &[u8]) -> Result<Vec<u8>, PibError> {
-        use ndn_safebag::SafeBag;
+        use crate::safebag::SafeBag;
         let pkcs8 = self.export_pkcs8(key_name)?;
         let signer = self.get_signer(key_name)?;
         let cert = self.get_cert(key_name)?;
@@ -348,7 +348,7 @@ fn signer_from_pkcs8(pkcs8: &[u8], key_name: &Name) -> Result<Arc<dyn Signer>, P
     match oid.as_str() {
         // Ed25519 OID (RFC 8410).
         "1.3.101.112" => {
-            let seed = ndn_safebag::pkcs8_to_ed25519_seed(pkcs8)
+            let seed = crate::safebag::pkcs8_to_ed25519_seed(pkcs8)
                 .map_err(|e| PibError::Corrupt(format!("pkcs8 → ed25519 seed: {e}")))?;
             Ok(Arc::new(Ed25519Signer::from_seed(&seed, key_name.clone())))
         }

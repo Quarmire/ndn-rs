@@ -9,8 +9,8 @@
 //! platform implements and the [`EnclaveCustodian`] that exposes it through the
 //! [`Custodian`] trait, so an enclave key slots into the `CustodianRegistry`
 //! and the security-tier UI like any other custodian — and, adapted through
-//! [`CustodianSigner`](crate::CustodianSigner), backs the
-//! [`RemoteSignerResponder`](crate::RemoteSignerResponder) so a phone can sign
+//! [`CustodianSigner`](crate::custodian::CustodianSigner), backs the
+//! [`RemoteSignerResponder`](crate::custodian::RemoteSignerResponder) so a phone can sign
 //! for another device under biometric.
 
 use std::sync::Arc;
@@ -19,8 +19,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use ndn_packet::Name;
 
-use crate::KeyId;
-use crate::custodian::{
+use crate::custodian::KeyId;
+use crate::custodian::custodian::{
     Custodian, CustodianError, CustodianRef, UnlockContext, UnwrappedKey, WrappedKey,
 };
 
@@ -118,8 +118,8 @@ impl Custodian for EnclaveCustodian {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndn_security::verifier::EcdsaSha256Verifier;
-    use ndn_security::{EcdsaP256Signer, Signer, VerifyOutcome, Verifier};
+    use crate::verifier::EcdsaSha256Verifier;
+    use crate::{EcdsaP256Signer, Signer, VerifyOutcome, Verifier};
 
     /// A software stand-in for the platform enclave: a P-256 key whose `sign`
     /// stands in for the biometric-gated Keystore / Secure-Enclave op.

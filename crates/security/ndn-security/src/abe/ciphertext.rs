@@ -22,8 +22,8 @@ use bytes::Bytes;
 use ndn_foundation_types::{Hash, Name, TlvCodecError, TlvDecode, TlvEncode, tlv_type};
 use ndn_tlv::{TlvReader, TlvWriter};
 
-use crate::AbeSchemeId;
-use crate::types::*;
+use crate::abe::AbeSchemeId;
+use crate::abe::types::*;
 
 /// Current schema version for `AbeCiphertext` encoding.
 pub const CIPHERTEXT_SCHEMA_VERSION: u16 = 1;

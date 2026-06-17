@@ -1,5 +1,5 @@
 //! [`KeyId`] — an opaque key locator. Lives here (rather than in
-//! `ndn-identity`) because the [`crate::Custodian`] trait signs *by* a `KeyId`,
+//! `ndn-identity`) because the [`crate::custodian::Custodian`] trait signs *by* a `KeyId`,
 //! so it is the more foundational of the two and breaks the custodian ↔
 //! trust-context dependency cycle.
 

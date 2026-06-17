@@ -47,8 +47,8 @@ pub use revocation::{RevocationError, RevocationRecord};
 pub use signed_delegation::{DelegatedSigner, SignedDelegation};
 pub use facade::Identity;
 #[cfg(not(target_arch = "wasm32"))]
-pub use ndn_custodian::OsKeyringCustodian;
-pub use ndn_custodian::{
+pub use ndn_security::custodian::OsKeyringCustodian;
+pub use ndn_security::custodian::{
     BrowserExtensionCustodian, Custodian, CustodianError, CustodianRef, CustodianRegistry,
     InPageCustodian, RemoteCustodian, UnlockContext, UnwrappedKey, WrappedKey,
 };

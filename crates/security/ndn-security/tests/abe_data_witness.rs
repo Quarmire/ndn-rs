@@ -1,3 +1,6 @@
+#![cfg(feature = "abe")]
+//! Recovered from the former ndn-abe crate; runs only with --features abe.
+
 //! Witness: an ABE ciphertext is a well-formed NDN-TLV container that survives
 //! being carried as the Content of a signed Data packet, and the policy gate
 //! holds end-to-end (satisfying attributes decrypt; non-satisfying fail) for
@@ -7,7 +10,7 @@
 //! crate cover the in-memory scheme round-trips). See
 //! `testbed/tests/audit/abe01_cpabe_policy_gate.sh`.
 
-use ndn_abe::{
+use ndn_security::abe::{
     AbeCiphertext, AbeSchemeId, CIPHERTEXT_SCHEMA_VERSION, aw11_authgen, aw11_decrypt,
     aw11_encrypt, aw11_global_setup, aw11_keygen, bsw_keygen, bsw_setup, decrypt, encrypt,
 };
@@ -30,7 +33,7 @@ fn through_signed_data(ct: &AbeCiphertext) -> AbeCiphertext {
 
 #[test]
 fn cpabe_ciphertext_rides_signed_data_and_policy_gates() {
-    let policy = ndn_abe::PolicyExpr::parse("dept:eng AND clearance:high").unwrap();
+    let policy = ndn_security::abe::PolicyExpr::parse("dept:eng AND clearance:high").unwrap();
     let kgc_name: Name = "/example/kgc".parse().unwrap();
     let (mp, ms) = bsw_setup().unwrap();
     let hash = Hash::of(&mp.public_key_bytes);
@@ -79,7 +82,7 @@ fn maabe_ciphertext_rides_signed_data_and_policy_gates() {
 
     // A user holding both grants decrypts.
     let ok = aw11_keygen(&global, &mk1, "alice", &["DEPT:ENG"]).unwrap();
-    let ok = ndn_abe::aw11_add_attr(&global, &mk2, "CLEARANCE:HIGH", &ok).unwrap();
+    let ok = ndn_security::abe::aw11_add_attr(&global, &mk2, "CLEARANCE:HIGH", &ok).unwrap();
     assert_eq!(
         aw11_decrypt(&global, &ok, &recovered.rabe_ciphertext_bytes).unwrap(),
         plaintext

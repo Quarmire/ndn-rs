@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::AbeSchemeId;
+use crate::abe::AbeSchemeId;
 
 /// Errors from the ABE layer.
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq, Serialize, Deserialize)]

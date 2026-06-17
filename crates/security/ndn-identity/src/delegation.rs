@@ -246,7 +246,7 @@ mod tests {
     #[test]
     fn from_derived_wires_identity_ref_into_the_frame() {
         use crate::TrustContext;
-        use ndn_custodian::CustodianRef;
+        use ndn_security::custodian::CustodianRef;
 
         let parent = IdentityRef {
             name: "/alice".parse().unwrap(),

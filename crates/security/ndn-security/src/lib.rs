@@ -11,6 +11,11 @@
 
 #![allow(missing_docs)]
 
+#[cfg(feature = "abe")]
+pub mod abe;
+#[cfg(feature = "custodian")]
+pub mod custodian;
+pub mod safebag;
 pub mod cert_cache;
 pub mod cert_fetcher;
 pub mod did;

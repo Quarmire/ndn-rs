@@ -84,15 +84,39 @@ pub fn name_group_uni(prefix: &[u8]) -> [u8; 6] {
 /// 802.11 address fields are filled from `frame.dst`/`frame.src` — for a
 /// name-grouped face these are name-derived (`name_group_mac`/`name_group_uni`),
 /// so no host identity appears on the wire.
+///
+/// The radiotap TX header carries the rate: a per-frame MCS for `RawNdn`, or a
+/// robust legacy rate for `EspNow` (1 Mbps on 2.4 GHz). The 802.11 frame itself
+/// is built by [`build_dot11`] — backends that supply their own rate header
+/// (e.g. the RTL88xx USB driver's TX descriptor) call that directly instead.
 pub fn build(format: FrameFormat, frame: &InjectFrame) -> Result<Vec<u8>, FaceError> {
-    let mut out = Vec::with_capacity(16 + 64 + frame.payload.len());
+    // Build the 802.11 frame first; this also runs the per-format validation
+    // (e.g. the ESP-NOW body cap), so a bad frame errors before the radiotap.
+    let dot11 = build_dot11(format, frame)?;
+    let mut out = Vec::with_capacity(16 + dot11.len());
+    match format {
+        // ESP-NOW rides a robust legacy rate (1 Mbps), not an MCS.
+        FrameFormat::EspNow { .. } => out.extend_from_slice(&radiotap::build_tx_legacy(2)),
+        // RawNdn (and anything else `build_dot11` accepts) carries a per-frame MCS.
+        _ => out.extend_from_slice(&radiotap::build_tx_header(
+            frame.mcs.index,
+            frame.mcs.short_gi,
+        )),
+    }
+    out.extend_from_slice(&dot11);
+    Ok(out)
+}
 
+/// Build just the **802.11 frame** for `frame` under `format` — the bytes that
+/// follow the radiotap header (or, for a hardware backend, its own TX
+/// descriptor). Factored out of [`build`] so the RTL88xx USB driver — which
+/// prepends a chip TX descriptor and sets the rate there, not via radiotap —
+/// shares the exact same on-air byte layout (notably the ESP-NOW vendor-action
+/// frame a stock `esp-wifi` peer keys on).
+pub fn build_dot11(format: FrameFormat, frame: &InjectFrame) -> Result<Vec<u8>, FaceError> {
+    let mut out = Vec::with_capacity(64 + frame.payload.len());
     match format {
         FrameFormat::RawNdn { ethertype } => {
-            out.extend_from_slice(&radiotap::build_tx_header(
-                frame.mcs.index,
-                frame.mcs.short_gi,
-            ));
             // 802.11 non-QoS data frame. addr1/addr3 = destination group (or
             // broadcast); addr2 = name-derived source. The NDN name is the
             // addressing — these fields are a name-keyed index, not host ids.
@@ -113,8 +137,6 @@ pub fn build(format: FrameFormat, frame: &InjectFrame) -> Result<Vec<u8>, FaceEr
                     "ESP-NOW body > 250 B — set a smaller face MTU",
                 )));
             }
-            // ESP-NOW rides a robust legacy rate (1 Mbps), not an MCS.
-            out.extend_from_slice(&radiotap::build_tx_legacy(2));
             // 802.11 vendor-specific Action frame (management subtype 13).
             // ESP-NOW requires addr1 = broadcast (its receivers key on it).
             out.extend_from_slice(&[0xd0, 0x00]); // FC: type=Mgmt, subtype=Action
@@ -155,6 +177,22 @@ pub fn parse(
 ) -> Option<CapturedFrame> {
     let info = radiotap::parse(buf)?;
     let body = buf.get(info.header_len..)?;
+    // radiotap RSSI/rate are the fallback when the caller has no out-of-band read.
+    parse_dot11(format, body, rssi.or(info.rssi_dbm), mcs.or(info.mcs_index))
+}
+
+/// Recover the NDN payload + transmitter address from a bare **802.11 frame**
+/// `body` (no radiotap) under `format`. `rssi`/`mcs` are passed through to the
+/// returned [`CapturedFrame`] as-is. The counterpart to [`build_dot11`]: a
+/// hardware backend that strips its own RX descriptor (and reads RSSI/rate from
+/// it) recovers the payload through this, sharing the format byte layout with
+/// the radiotap-based [`parse`].
+pub fn parse_dot11(
+    format: FrameFormat,
+    body: &[u8],
+    rssi: Option<i8>,
+    mcs: Option<u8>,
+) -> Option<CapturedFrame> {
     if body.len() < 2 {
         return None;
     }
@@ -185,8 +223,8 @@ pub fn parse(
                 payload: Bytes::copy_from_slice(&body[hdr_len + LLC_SNAP_LEN..]),
                 addr: Some(ta),
                 group: Some(group),
-                rssi_dbm: rssi.or(info.rssi_dbm),
-                mcs_index: mcs.or(info.mcs_index),
+                rssi_dbm: rssi,
+                mcs_index: mcs,
             })
         }
         FrameFormat::EspNow { oui } => {
@@ -222,8 +260,8 @@ pub fn parse(
                 payload: Bytes::copy_from_slice(payload),
                 addr: Some(ta),
                 group: Some(group),
-                rssi_dbm: rssi.or(info.rssi_dbm),
-                mcs_index: mcs.or(info.mcs_index),
+                rssi_dbm: rssi,
+                mcs_index: mcs,
             })
         }
         _ => None,

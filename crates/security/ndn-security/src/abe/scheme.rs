@@ -12,7 +12,7 @@ use rabe::schemes::bsw::{self, CpAbeCiphertext, CpAbeMasterKey, CpAbePublicKey, 
 use rabe::utils::policy::pest::PolicyLanguage;
 use tracing::instrument;
 
-use crate::{AbeError, PolicyExpr};
+use crate::abe::{AbeError, PolicyExpr};
 
 /// BSW master public parameters (the encryption/E-KEY material).
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -13,7 +13,7 @@ use ndn_packet::{Data, Name};
 use ndn_security::safe_data::TrustPath;
 use ndn_security::{Certificate, NamePattern, TrustSchema, ValidationResult, Validator};
 
-use ndn_custodian::CustodianRef;
+use ndn_security::custodian::CustodianRef;
 
 pub mod context_sync;
 mod fingerprint;
@@ -125,7 +125,7 @@ impl TrustContext {
         &self,
         name: &Name,
         content: &[u8],
-        custodians: &ndn_custodian::CustodianRegistry,
+        custodians: &ndn_security::custodian::CustodianRegistry,
     ) -> Result<bytes::Bytes, TrustContextError> {
         let id = self
             .can_sign(name)

@@ -12,10 +12,10 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use dashmap::DashMap;
 use ndn_packet::Name;
-use ndn_security::{Ed25519Signer, Signer};
+use crate::{Ed25519Signer, Signer};
 
-use crate::KeyId;
-use crate::custodian::{
+use crate::custodian::KeyId;
+use crate::custodian::custodian::{
     Custodian, CustodianError, CustodianRef, UnlockContext, UnwrappedKey, WrappedKey,
 };
 
@@ -99,7 +99,7 @@ impl Custodian for InPageCustodian {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndn_security::Ed25519Verifier;
+    use crate::Ed25519Verifier;
 
     fn fresh_signer(name: &str) -> (KeyId, Ed25519Signer) {
         let n: Name = name.parse().unwrap();
@@ -119,7 +119,7 @@ mod tests {
         let content = b"hello world";
         let sig = custodian.sign(&key_id, &name, content).await.unwrap();
         let outcome = Ed25519Verifier.verify_sync(content, &sig, &pk);
-        assert!(matches!(outcome, ndn_security::VerifyOutcome::Valid));
+        assert!(matches!(outcome, crate::VerifyOutcome::Valid));
     }
 
     #[tokio::test]

@@ -6,8 +6,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use ndn_packet::Name;
 
-use crate::KeyId;
-use crate::custodian::{
+use crate::custodian::KeyId;
+use crate::custodian::custodian::{
     Custodian, CustodianError, CustodianRef, UnlockContext, UnwrappedKey, WrappedKey,
 };
 

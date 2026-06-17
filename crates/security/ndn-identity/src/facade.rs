@@ -113,7 +113,7 @@ impl Identity {
 
     /// Build an identity whose operational key is held **externally** — by a
     /// `Custodian` (the phone enclave, a remote fob), passed as an
-    /// `Arc<dyn Signer>` (e.g. `ndn_custodian::CustodianSigner`). The signer is
+    /// `Arc<dyn Signer>` (e.g. `ndn_security::custodian::CustodianSigner`). The signer is
     /// registered under `key_name` so the identity signs and verifies like any
     /// `KeyChain`, while the private key stays in its custodian and never enters
     /// the key store. This is how a custodied/enclave-held key becomes an
@@ -401,7 +401,7 @@ mod tests {
 
     #[tokio::test]
     async fn from_signer_routes_signing_through_a_custodian() {
-        use ndn_custodian::{Custodian, CustodianSigner, InPageCustodian, KeyId};
+        use ndn_security::custodian::{Custodian, CustodianSigner, InPageCustodian, KeyId};
         use ndn_security::verifier::verify_by_sig_type;
         use ndn_security::{Ed25519Signer, Signer, VerifyOutcome};
 

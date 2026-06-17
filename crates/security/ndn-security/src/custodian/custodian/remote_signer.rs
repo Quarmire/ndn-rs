@@ -30,8 +30,8 @@ use bytes::Bytes;
 use ndn_packet::Name;
 use ndn_tlv::{TlvReader, TlvWriter};
 
-use crate::KeyId;
-use crate::custodian::{
+use crate::custodian::KeyId;
+use crate::custodian::custodian::{
     Custodian, CustodianError, CustodianRef, UnlockContext, UnwrappedKey, WrappedKey,
 };
 
@@ -426,19 +426,19 @@ pub trait ApprovalGate: Send + Sync {
 /// Serves [`WireSignRequest`]s from a paired requester over a
 /// [`SignerChannel`]: decode → gate → sign → reply. This is the phone/fob side
 /// of the protocol; `signer` is typically backed by an enclave key
-/// ([`EnclaveCustodian`](crate::EnclaveCustodian) adapted through
-/// [`CustodianSigner`](crate::CustodianSigner)), so the private key never
+/// ([`EnclaveCustodian`](crate::custodian::EnclaveCustodian) adapted through
+/// [`CustodianSigner`](crate::custodian::CustodianSigner)), so the private key never
 /// leaves secure hardware and every signature is biometric-gated by `gate`.
 pub struct RemoteSignerResponder<C: SignerChannel> {
     channel: C,
-    signer: Arc<dyn ndn_security::Signer>,
+    signer: Arc<dyn crate::Signer>,
     gate: Arc<dyn ApprovalGate>,
 }
 
 impl<C: SignerChannel> RemoteSignerResponder<C> {
     pub fn new(
         channel: C,
-        signer: Arc<dyn ndn_security::Signer>,
+        signer: Arc<dyn crate::Signer>,
         gate: Arc<dyn ApprovalGate>,
     ) -> Self {
         Self {
@@ -488,8 +488,8 @@ impl<C: SignerChannel> RemoteSignerResponder<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndn_security::verifier::EcdsaSha256Verifier;
-    use ndn_security::{
+    use crate::verifier::EcdsaSha256Verifier;
+    use crate::{
         EcdsaP256Signer, Ed25519Signer, Ed25519Verifier, Signer, VerifyOutcome, Verifier,
     };
     use tokio::sync::{Mutex, mpsc};
@@ -733,7 +733,7 @@ mod tests {
     /// the private key never crosses the channel (only `region` and the sig do).
     #[tokio::test]
     async fn phone_enclave_responder_signs_for_desktop_under_approval() {
-        use crate::{CustodianSigner, EnclaveBackend, EnclaveCustodian, KeyId};
+        use crate::custodian::{CustodianSigner, EnclaveBackend, EnclaveCustodian, KeyId};
         use ndn_packet::SignatureType;
 
         // Phone enclave key (software stand-in for the Secure Enclave / StrongBox).
@@ -809,7 +809,7 @@ mod tests {
     /// `sign` fails — a denial is never a silent success.
     #[tokio::test]
     async fn phone_denial_surfaces_to_desktop() {
-        use crate::KeyId;
+        use crate::custodian::KeyId;
 
         struct DenyAll;
         #[async_trait]

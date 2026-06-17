@@ -22,9 +22,9 @@ use bytes::Bytes;
 use ndn_foundation_types::{Hash, TlvCodecError, TlvDecode, TlvEncode};
 use ndn_tlv::{TlvReader, TlvWriter};
 
-use crate::AbeSchemeId;
-use crate::ciphertext::{KgcRef, read_name};
-use crate::types::*;
+use crate::abe::AbeSchemeId;
+use crate::abe::ciphertext::{KgcRef, read_name};
+use crate::abe::types::*;
 
 /// Current schema version for `PolicyBlockPayload` encoding.
 pub const POLICY_BLOCK_SCHEMA_VERSION: u16 = 1;

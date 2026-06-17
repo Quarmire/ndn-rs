@@ -6,10 +6,10 @@ use std::time::SystemTime;
 use ndn_packet::Name;
 use ndn_security::NamePattern;
 
-use ndn_custodian::CustodianRef;
+use ndn_security::custodian::CustodianRef;
 // `KeyId` now lives in `ndn-custodian` (the custodian signs by it). Re-export
 // so `trust_context::KeyId` and every existing path keeps resolving.
-pub use ndn_custodian::KeyId;
+pub use ndn_security::custodian::KeyId;
 
 #[derive(Debug, Clone)]
 pub struct IdentityRef {

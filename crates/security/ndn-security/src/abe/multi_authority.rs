@@ -19,7 +19,7 @@ use bytes::Bytes;
 use rabe::schemes::aw11::{self, Aw11GlobalKey, Aw11MasterKey, Aw11PublicKey, Aw11SecretKey};
 use rabe::utils::policy::pest::PolicyLanguage;
 
-use crate::error::AbeError;
+use crate::abe::error::AbeError;
 
 /// Serialized `Aw11GlobalKey` — shared across all authorities in a deployment.
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -3,7 +3,7 @@
 //! Numbers live in a non-critical extension range (260–280) and are allocated
 //! here in one place; never scatter literals. Per NDN Packet Format v0.3, odd
 //! types are critical and even types are non-critical. These ABE types sit
-//! inside the [`crate::AbeCiphertext`] envelope and are all even (non-critical
+//! inside the [`crate::abe::AbeCiphertext`] envelope and are all even (non-critical
 //! extensions): an unaware decoder skips the whole envelope rather than any
 //! single inner field.
 
