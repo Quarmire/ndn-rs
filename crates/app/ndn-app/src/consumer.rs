@@ -163,6 +163,13 @@ impl Consumer {
         }
     }
 
+    /// Begin a composable object fetch — the fluent replacement for the
+    /// `fetch_object*` family. Chain `.verify()` / `.hint()` / `.progress()` then
+    /// a terminal `.fetch()` / `.stream()` / `.to_file()`.
+    pub fn object(self, name: impl Into<Name>) -> crate::object::ObjectFetch {
+        crate::object::ObjectFetch::new(self, name.into())
+    }
+
     /// Choose the congestion-control strategy for object fetches (default AIMD).
     pub fn with_congestion_strategy(mut self, strategy: CongestionStrategy) -> Self {
         self.cc_strategy = strategy;

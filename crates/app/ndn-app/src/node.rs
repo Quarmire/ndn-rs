@@ -145,12 +145,17 @@ impl Node {
         self.consumer().verifying(validator)
     }
 
-    /// Fetch a (possibly segmented) RDR object, reassembled into bytes.
-    ///
-    /// Phase 2 will replace this with a composable `node.object(name)…fetch()`
-    /// builder (verify / hint / progress / to_file); this is the simple form.
+    /// Begin a composable object (RDR) fetch: `node.object(name).verify(v)
+    /// .hint(["/gw"]).progress(cb).fetch()`. Terminal verbs are `.fetch()`
+    /// (in memory), `.stream()` (per-segment), `.to_file()` (to disk).
+    pub fn object(&self, name: impl Into<Name>) -> crate::object::ObjectFetch {
+        self.consumer().object(name)
+    }
+
+    /// Fetch a (possibly segmented) RDR object, reassembled into bytes — the
+    /// shorthand for `node.object(name).fetch()`.
     pub async fn fetch_object(&self, name: impl Into<Name>) -> Result<Bytes, AppError> {
-        self.consumer().fetch_object(name).await
+        self.object(name).fetch().await
     }
 
     // ---- producer / responder side -----------------------------------------

@@ -16,6 +16,7 @@ pub mod consumer;
 pub mod demux;
 pub mod engine_ext;
 pub mod error;
+pub mod object;
 pub mod object_stream;
 pub mod producer;
 pub mod publisher;
@@ -42,6 +43,7 @@ pub use consumer::{
 };
 pub use engine_ext::EngineAppExt;
 pub use error::AppError;
+pub use object::ObjectFetch;
 pub use object_stream::serve_object_stream;
 pub use producer::{Producer, Router};
 pub use publisher::{Publisher, PublisherConfig};
