@@ -265,9 +265,18 @@ versioned grants and exposes live `grant`/`revoke` (each bumps the version and
 re-signs the affected `Grant`); `signed_grant` emits the current signed object;
 `verify_grant` validates it against the authority's anchor (fail closed). Witness
 `dynamic_policy` proves grant + revoke take effect on one live authority instance
-with no restart, and that an untrusted authority's grant is rejected. *Next:* wire
-`KpAuthority` issuance to read the current `PolicyAuthority` version, and add the
-config-reload / signed-command front-ends.
+with no restart, and that an untrusted authority's grant is rejected.
+
+**Loop closed:** `ndn-service::issue_decryption_key` (feature `issuance`) gates
+KP-ABE key issuance on the *current* `PolicyAuthority` grant — `PolicyAuthority`
+is the source of truth, `KpAuthority` is the key authority (its new
+`issue_with_policy` does keygen + sealing under an explicit policy, decoupled from
+its own grant table). A non-revoked granted principal gets a real key; an absent
+or revoked one fails closed; the policy is read live, so a grant/revoke needs no
+restart of either authority. Witness `issuance_loop`: a granted principal's key
+decrypts content under its policy, then a live revoke yields no key. *Next:* the
+config-reload / signed `/<scope>/policy/{grant,revoke}` command front-ends; the
+Tier-1 discovery-selection carrier; typed `Topic<T>` (Tier-2).
 
 ---
 
