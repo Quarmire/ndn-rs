@@ -477,6 +477,14 @@ Constraints on performance claims:
    container, `ndn-rpc` extracted from `ndn-compute`, `ndn-security::capability`.
 3. Extract NDNSF security invariants into witnesses (O4) — gate before crypto/
    collab.
-4. `ndn-nacabe` (NAC protocol) on the shared crypto.
+4. `ndn-nacabe` (NAC protocol) on the shared crypto. *In progress:* the sans-IO
+   core landed (`ndn-ext/crates/service/ndn-nacabe`) — the `CkData` object
+   (named, ABE-wrapped content key), the CP/KP producer→consumer CK-data flow
+   (`seal_cp`/`open_cp`, `seal_kp`/`open_kp`, fail-closed), and the NAC naming
+   (`PUBPARAMS`/`DKEY`/`CK`/`ENC-BY`, 6 witnesses, clippy-clean). **Remaining:**
+   the named exchanges over `ndn-app` — the attribute authority serving
+   `PUBPARAMS` and issuing `DKEY` (validating the requester cert, wrapping the
+   key to it) and the consumer `ParamFetcher` — gated by the O4 protocol-level
+   invariants (NSF-A1/A2/F1).
 5. Compat: `ndn-ndnsf` (four-phase + KP-ABE controller).
 6. v2: `ndn-service` (Tier-1 selection + Tier-2 collab, authority-as-signed-Data).
