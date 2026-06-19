@@ -1,0 +1,315 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core/ndn-foundation-types",
+    "crates/core/ndn-tlv",
+    "crates/core/ndn-packet",
+    "crates/forwarding/ndn-fwd-core",
+    "crates/core/ndn-crypto-core",
+    "crates/core/ndn-signals-core",
+    "crates/core/ndn-ble-framing",
+    "crates/core/ndn-mgmt-wire",
+    "crates/core/ndn-transport",
+    "crates/forwarding/ndn-store",
+    "crates/core/ndn-runtime",
+    "crates/faces/ndn-face-local",
+    "crates/faces/ndn-face",
+    "crates/core/ndn-frame-io",
+    "crates/forwarding/ndn-strategy",
+    "crates/security/ndn-security",
+    "crates/forwarding/ndn-engine",
+    "crates/app/ndn-app",
+    "crates/app/ndn-rs-prelude",
+    "crates/forwarding/ndn-ipc",
+    "crates/platform/ndn-config",
+    "crates/forwarding/ndn-discovery-core",
+    "crates/protocols/ndn-sync",
+    "crates/security/ndn-cert",
+    "crates/security/ndn-identity",
+    "crates/forwarding/ndn-mgmt",
+    "crates/platform/ndn-observability",
+    "crates/forwarding/ndn-ratelimit",
+    "crates/protocols/ndn-coding",
+    "examples/secure-fetch",
+    "examples/strategy-custom",
+    "examples/strategy-composed",
+    "examples/context-enricher",
+]
+default-members = [
+    "crates/core/ndn-foundation-types",
+    "crates/core/ndn-tlv",
+    "crates/core/ndn-packet",
+    "crates/forwarding/ndn-fwd-core",
+    "crates/core/ndn-crypto-core",
+    "crates/core/ndn-signals-core",
+    "crates/core/ndn-ble-framing",
+    "crates/core/ndn-mgmt-wire",
+    "crates/core/ndn-transport",
+    "crates/forwarding/ndn-store",
+    "crates/core/ndn-runtime",
+    "crates/faces/ndn-face-local",
+    "crates/faces/ndn-face",
+    "crates/core/ndn-frame-io",
+    "crates/forwarding/ndn-strategy",
+    "crates/security/ndn-security",
+    "crates/forwarding/ndn-engine",
+    "crates/app/ndn-app",
+    "crates/app/ndn-rs-prelude",
+    "crates/forwarding/ndn-ipc",
+    "crates/platform/ndn-config",
+    "crates/forwarding/ndn-discovery-core",
+    "crates/protocols/ndn-sync",
+    "crates/security/ndn-cert",
+    "crates/security/ndn-identity",
+    "crates/forwarding/ndn-mgmt",
+    "crates/platform/ndn-observability",
+    "crates/forwarding/ndn-ratelimit",
+    "crates/protocols/ndn-coding",
+    "examples/secure-fetch",
+    "examples/strategy-custom",
+    "examples/strategy-composed",
+    "examples/context-enricher",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["ndn-rs contributors"]
+license = "MIT OR Apache-2.0"
+
+[workspace.metadata.crane]
+name = "ndn-rs"
+
+[workspace.dependencies]
+# NDN workspace crates — grouped by subdirectory layer
+ndn-foundation-types = { path = "crates/core/ndn-foundation-types", default-features = false }
+ndn-tlv       = { path = "crates/core/ndn-tlv",       default-features = false }
+ndn-packet    = { path = "crates/core/ndn-packet",    default-features = false }
+ndn-fwd-core  = { path = "crates/forwarding/ndn-fwd-core",  default-features = false }
+ndn-crypto-core = { path = "crates/core/ndn-crypto-core" }
+ndn-sealed-box  = { path = "../ndn-ext/crates/compute/ndn-sealed-box" }
+ndn-signals-core = { path = "crates/core/ndn-signals-core", default-features = false }
+ndn-ble-framing = { path = "crates/core/ndn-ble-framing" }
+ndn-mgmt-wire = { path = "crates/core/ndn-mgmt-wire" }
+ndn-transport = { path = "crates/core/ndn-transport" }
+ndn-store     = { path = "crates/forwarding/ndn-store" }
+ndn-runtime   = { path = "crates/core/ndn-runtime" }
+ndn-pib-idb   = { path = "../ndn-fwd/crates/ndn-pib-idb" }
+ndn-trust-envelope = { path = "../ndn-ext/crates/onboarding/ndn-trust-envelope" }
+ndn-face-local        = { path = "crates/faces/ndn-face-local" }
+ndn-face             = { path = "crates/faces/ndn-face" }
+ndn-face-serial      = { path = "../ndn-ext/crates/faces/ndn-face-serial" }
+ndn-face-websocket   = { path = "../ndn-ext/crates/faces/ndn-face-websocket" }
+ndn-face-shm         = { path = "../ndn-ext/crates/faces/ndn-face-shm" }
+ndn-face-bluetooth   = { path = "../ndn-ext/crates/faces/ndn-face-bluetooth" }
+ndn-face-afxdp       = { path = "../ndn-ext/crates/faces/ndn-face-afxdp" }
+ndn-face-webtransport = { path = "../ndn-ext/crates/faces/ndn-face-webtransport" }
+ndn-face-quic         = { path = "../ndn-ext/crates/faces/ndn-face-quic" }
+ndn-face-webtransport-wasm = { path = "../ndn-ext/crates/faces/ndn-face-webtransport-wasm" }
+ndn-face-webrtc       = { path = "../ndn-ext/crates/faces/ndn-face-webrtc" }
+ndn-face-shared-worker = { path = "../ndn-ext/crates/faces/ndn-face-shared-worker" }
+ndn-face-webble       = { path = "../ndn-ext/crates/faces/ndn-face-webble" }
+ndn-face-ble-adv      = { path = "../ndn-ext/crates/faces/ndn-face-ble-adv" }
+ndn-face-wifi-aware   = { path = "../ndn-ext/crates/faces/ndn-face-wifi-aware" }
+ndn-frame-io          = { path = "crates/core/ndn-frame-io" }
+ndn-face-monitor-wifi = { path = "../ndn-ext/crates/faces/ndn-face-monitor-wifi" }
+ndn-pipes             = { path = "../ndn-ext/crates/pipes/ndn-pipes" }
+ndn-rtc-signaling-relay = { path = "../ndn-ext/crates/faces/ndn-rtc-signaling-relay" }
+ndn-acme              = { path = "../ndn-fwd/crates/ndn-acme" }
+ndn-strategy  = { path = "crates/forwarding/ndn-strategy" }
+ndn-security  = { path = "crates/security/ndn-security" }
+ndn-engine    = { path = "crates/forwarding/ndn-engine" }
+ndn-app       = { path = "crates/app/ndn-app" }
+ndn-rs-prelude = { path = "crates/app/ndn-rs-prelude" }
+ndn-web-attach = { path = "../ndn-ext/crates/bindings/ndn-web-attach" }
+ndn-ipc       = { path = "crates/forwarding/ndn-ipc" }
+ndn-ipc-shm   = { path = "../ndn-ext/crates/faces/ndn-ipc-shm" }
+ndn-config    = { path = "crates/platform/ndn-config" }
+ndn-dashboard-core = { path = "../ndn-fwd/crates/tooling/ndn-dashboard-core", default-features = false }
+ndn-discovery = { path = "../ndn-ext/crates/discovery/ndn-discovery",     default-features = false }
+ndn-discovery-core = { path = "crates/forwarding/ndn-discovery-core" }
+ndn-discovery-broadcast = { path = "../ndn-ext/crates/discovery/ndn-discovery-broadcast" }
+ndn-routing    = { path = "../ndn-ext/crates/routing/ndn-routing" }
+ndn-sync      = { path = "crates/protocols/ndn-sync" }
+ndn-repo      = { path = "../ndn-repo/crates/ndn-repo" }
+ndn-repo-cluster = { path = "../ndn-repo/crates/ndn-repo-cluster" }
+ndn-cert     = { path = "crates/security/ndn-cert" }
+ndn-identity = { path = "crates/security/ndn-identity" }
+ndn-mgmt     = { path = "crates/forwarding/ndn-mgmt" }
+ndn-observability = { path = "crates/platform/ndn-observability" }
+ndn-sim       = { path = "../ndn-sim/crates/ndn-sim" }
+ndn-wasm      = { path = "../ndn-ext/crates/bindings/ndn-wasm" }
+ndn-strategy-wasm = { path = "../ndn-ext/crates/strategies/ndn-strategy-wasm" }
+ndn-compute   = { path = "../ndn-ext/crates/compute/ndn-compute" }
+ndn-coding    = { path = "crates/protocols/ndn-coding" }
+ndn-radio-cognition = { path = "../ndn-ext/crates/faces/ndn-radio-cognition" }
+ndn-signal-sources = { path = "../ndn-ext/crates/faces/ndn-signal-sources" }
+ndn-strategy-cclf = { path = "../ndn-ext/crates/strategies/ndn-strategy-cclf", default-features = false }
+ndn-ratelimit = { path = "crates/forwarding/ndn-ratelimit" }
+ndn-embedded  = { path = "../ndn-embedded/crates/ndn-embedded" }
+ndn-mobile    = { path = "../ndn-mobile/crates/ndn-mobile" }
+ndn-tools-core = { path = "../ndn-fwd/crates/tooling/ndn-tools-core" }
+
+# Core async runtime — individual crates enable only the features they need
+tokio      = { version = "1", default-features = false }
+tokio-util = { version = "0.7.10", default-features = false }
+
+# Zero-copy byte buffers (no default features — crates opt in to bytes/std explicitly)
+bytes = { version = "1", default-features = false }
+
+# Embedded support
+heapless = "0.8"
+nb       = "1"
+
+# Concurrent data structures
+dashmap  = "6"
+smallvec = { version = "1", features = ["union"] }
+arc-swap = "1"
+
+# LRU cache
+lru = "0.12"
+
+# Structured logging
+tracing = "0.1"
+# tokio-console: runtime task inspector (opt-in; requires --cfg tokio_unstable)
+console-subscriber = "0.4"
+
+# Async combinators and stream/sink extension traits
+futures = "0.3"
+async-trait = "0.1"
+
+# Distributed slice for cross-crate static registration. Pure-Rust,
+# works on wasm32-unknown-unknown and bare-metal (per linkme README).
+# Used by ndn-strategy's StrategyRegistry so external strategy crates
+# can plug in without modifying ndn-mgmt.
+linkme = "0.3"
+
+# Error handling
+anyhow    = "1"
+thiserror = "2"
+libc = "0.2"
+
+# Serialization
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Compact binary (de)serialization for the rabe ABE crypto types behind
+# `ndn-abe`'s TLV ciphertext container. Pinned to the 1.x line.
+bincode    = "1"
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+
+# Cryptography
+ring          = "0.17"
+ed25519-dalek = "2"
+# `rayon` enables `Hasher::update_rayon` for multi-thread hashing of a
+# single large buffer. Useful only above ~128 KiB (rayon overhead beats
+# update at smaller sizes); ndn-rs uses it for bulk content publication
+# in producer apps and gates per-call on input size. Per-packet signing
+# never reaches the threshold and is unaffected.
+blake3        = { version = "1", features = ["rayon"] }
+# NDNCERT 0.3: ECDH (P-256), HKDF-SHA256, and AES-GCM-128.
+# Note: p256 and aes-gcm stay on the rustcrypto 0.10/0.13 release wave
+# until their 0.11/0.14 lines exit RC. sha2 + hkdf are on the newer wave
+# already — this works because the digest 0.11 trait family is wire-
+# compatible at runtime even when half the workspace still pulls
+# digest 0.10 transitively (the duplication is a few KB of code, not a
+# correctness issue, and p256 has no public API that touches digest).
+p256          = { version = "0.13", default-features = false, features = ["ecdh"] }
+aes-gcm       = { version = "0.10", features = ["alloc", "getrandom"] }
+hkdf          = "0.13"
+sha2          = "0.11"
+# RNG sourcing. `getrandom` 0.2 is what `aes-gcm`, `p256`, and most
+# rustcrypto crates pull transitively; pinning the workspace version
+# keeps a single resolution and lets us enable the `js` feature for
+# wasm32 in one place. The `js` feature is only meaningful on
+# wasm32-unknown-unknown — on every other target it's a no-op.
+getrandom     = { version = "0.2", default-features = false, features = ["std"] }
+# Drop-in `std::time::{SystemTime, Instant}` shim that works on
+# wasm32-unknown-unknown (reads `Date.now()` / `performance.now()`).
+# Native targets get the real `std::time` re-exported.
+web-time      = "1"
+
+# Serial port support
+tokio-serial = "5"
+
+# WebSocket support
+tokio-tungstenite = { version = "0.26" }
+
+# WebTransport (HTTP/3 + QUIC) — pure-Rust server, built on quinn.  Mirrors
+# ndnd's webtransport-go choice in fw/face/http3-listener.go.
+wtransport = { version = "0.7" }
+
+# ACME (RFC 8555) — used by ndn-acme to provision real certs for the
+# WebSocket-TLS face (issue #3) and the WebTransport listener (issue #14).
+instant-acme = { version = "0.7" }
+# DNS-01 challenge plumbing — Cloudflare HTTP API is the only impl shipped
+# in phase 2; rustls + reqwest are scoped to ndn-acme so the WT face crate
+# stays small.
+reqwest      = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# X.509 parsing — ndn-acme reads the leaf cert's notAfter to drive renewal
+# and the cert-status surface.
+x509-parser  = { version = "0.18" }
+
+# WebSocket TLS (server-side)
+tokio-rustls      = { version = "0.26", default-features = false, features = ["logging", "tls12", "ring"] }
+rcgen             = { version = "0.13", default-features = false, features = ["pem", "crypto", "ring"] }
+rustls-pemfile    = { version = "2" }
+
+# Logging subscriber (binaries only)
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+
+# Synchronization
+parking_lot = "0.12"
+
+# WebAssembly text format (examples)
+wat = "1"
+
+# Persistent storage
+fjall = "3"
+
+# Benchmarking
+criterion = { version = "0.5", features = ["html_reports"] }
+
+# Bluetooth LE GATT server (Linux/BlueZ, D-Bus)
+bluer = { version = "0.17", default-features = false, features = ["bluetoothd"] }
+
+# Bluetooth LE GATT server (macOS/iOS, CoreBluetooth via objc2)
+objc2                = { version = "0.5" }
+objc2-core-bluetooth = { version = "0.2" }
+objc2-foundation     = { version = "0.2" }
+
+# Bluetooth LE GATT *central* (macOS/Windows; CoreBluetooth / WinRT). Linux
+# central uses bluer instead. `uuid` parses the GATT profile UUID strings.
+btleplug = { version = "0.11" }
+uuid     = { version = "1" }
+
+# Raw packet capture (Windows Npcap / libpcap)
+pcap = "2"
+
+# Windows system APIs
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinSock",
+] }
+
+# ── Build profiles ─────────────────────────────────────────────────────────────
+
+# console: build ndn-fwd with tokio-console task inspector support.
+#
+# Note: `profile-rustflags` is not yet stable in Cargo; set the required
+# --cfg tokio_unstable via the environment instead:
+#
+#   RUSTFLAGS="--cfg tokio_unstable" cargo build -p ndn-fwd --features console --profile console
+#
+# The profile inherits dev settings; add debug symbols and disable
+# inlining to keep tokio-console task names readable.
+[profile.release]
+strip = "symbols"
+lto = "thin"
+codegen-units = 1
+
+[profile.console]
+inherits = "dev"
+debug = true
+opt-level = 0
