@@ -184,6 +184,19 @@ fn security_policy_set(
     };
     let runtime_writable = runtime_policy.is_some();
 
+    // SEC-1: refuse to *lower* the security posture at runtime. Turning
+    // `require_signed_commands` off would let subsequent commands run unsigned
+    // until restart — a one-way posture-lowering ratchet recorded only by a log
+    // line. Raising it (false → true) is allowed; disabling must be a deliberate
+    // on-disk config change + restart.
+    if current.require_signed_commands && !parsed.require_signed_commands {
+        return ControlResponse::error(
+            status::BAD_PARAMS,
+            "require_signed_commands cannot be disabled at runtime; \
+             change it in the config and restart",
+        );
+    }
+
     let mut applied = Vec::new();
     let mut pending = Vec::new();
 
