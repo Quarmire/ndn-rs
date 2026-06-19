@@ -28,8 +28,6 @@ members = [
     "crates/security/ndn-identity",
     "crates/forwarding/ndn-mgmt",
     "crates/platform/ndn-observability",
-    "crates/forwarding/ndn-ratelimit",
-    "crates/protocols/ndn-coding",
     "examples/secure-fetch",
     "examples/strategy-custom",
     "examples/strategy-composed",
@@ -63,8 +61,6 @@ default-members = [
     "crates/security/ndn-identity",
     "crates/forwarding/ndn-mgmt",
     "crates/platform/ndn-observability",
-    "crates/forwarding/ndn-ratelimit",
-    "crates/protocols/ndn-coding",
     "examples/secure-fetch",
     "examples/strategy-custom",
     "examples/strategy-composed",
@@ -87,68 +83,30 @@ ndn-tlv       = { path = "crates/core/ndn-tlv",       default-features = false }
 ndn-packet    = { path = "crates/core/ndn-packet",    default-features = false }
 ndn-fwd-core  = { path = "crates/forwarding/ndn-fwd-core",  default-features = false }
 ndn-crypto-core = { path = "crates/core/ndn-crypto-core" }
-ndn-sealed-box  = { path = "../ndn-ext/crates/compute/ndn-sealed-box" }
 ndn-signals-core = { path = "crates/core/ndn-signals-core", default-features = false }
 ndn-ble-framing = { path = "crates/core/ndn-ble-framing" }
 ndn-mgmt-wire = { path = "crates/core/ndn-mgmt-wire" }
 ndn-transport = { path = "crates/core/ndn-transport" }
 ndn-store     = { path = "crates/forwarding/ndn-store" }
 ndn-runtime   = { path = "crates/core/ndn-runtime" }
-ndn-pib-idb   = { path = "../ndn-fwd/crates/ndn-pib-idb" }
-ndn-trust-envelope = { path = "../ndn-ext/crates/onboarding/ndn-trust-envelope" }
 ndn-face-local        = { path = "crates/faces/ndn-face-local" }
 ndn-face             = { path = "crates/faces/ndn-face" }
-ndn-face-serial      = { path = "../ndn-ext/crates/faces/ndn-face-serial" }
-ndn-face-websocket   = { path = "../ndn-ext/crates/faces/ndn-face-websocket" }
-ndn-face-shm         = { path = "../ndn-ext/crates/faces/ndn-face-shm" }
-ndn-face-bluetooth   = { path = "../ndn-ext/crates/faces/ndn-face-bluetooth" }
-ndn-face-afxdp       = { path = "../ndn-ext/crates/faces/ndn-face-afxdp" }
-ndn-face-webtransport = { path = "../ndn-ext/crates/faces/ndn-face-webtransport" }
-ndn-face-quic         = { path = "../ndn-ext/crates/faces/ndn-face-quic" }
-ndn-face-webtransport-wasm = { path = "../ndn-ext/crates/faces/ndn-face-webtransport-wasm" }
-ndn-face-webrtc       = { path = "../ndn-ext/crates/faces/ndn-face-webrtc" }
-ndn-face-shared-worker = { path = "../ndn-ext/crates/faces/ndn-face-shared-worker" }
-ndn-face-webble       = { path = "../ndn-ext/crates/faces/ndn-face-webble" }
-ndn-face-ble-adv      = { path = "../ndn-ext/crates/faces/ndn-face-ble-adv" }
-ndn-face-wifi-aware   = { path = "../ndn-ext/crates/faces/ndn-face-wifi-aware" }
 ndn-frame-io          = { path = "crates/core/ndn-frame-io" }
-ndn-face-monitor-wifi = { path = "../ndn-ext/crates/faces/ndn-face-monitor-wifi" }
-ndn-pipes             = { path = "../ndn-ext/crates/pipes/ndn-pipes" }
-ndn-rtc-signaling-relay = { path = "../ndn-ext/crates/faces/ndn-rtc-signaling-relay" }
-ndn-acme              = { path = "../ndn-fwd/crates/ndn-acme" }
 ndn-strategy  = { path = "crates/forwarding/ndn-strategy" }
 ndn-security  = { path = "crates/security/ndn-security" }
 ndn-engine    = { path = "crates/forwarding/ndn-engine" }
 ndn-app       = { path = "crates/app/ndn-app" }
 ndn-rs-prelude = { path = "crates/app/ndn-rs-prelude" }
-ndn-web-attach = { path = "../ndn-ext/crates/bindings/ndn-web-attach" }
 ndn-ipc       = { path = "crates/forwarding/ndn-ipc" }
-ndn-ipc-shm   = { path = "../ndn-ext/crates/faces/ndn-ipc-shm" }
 ndn-config    = { path = "crates/platform/ndn-config" }
-ndn-dashboard-core = { path = "../ndn-fwd/crates/tooling/ndn-dashboard-core", default-features = false }
-ndn-discovery = { path = "../ndn-ext/crates/discovery/ndn-discovery",     default-features = false }
 ndn-discovery-core = { path = "crates/forwarding/ndn-discovery-core" }
-ndn-discovery-broadcast = { path = "../ndn-ext/crates/discovery/ndn-discovery-broadcast" }
-ndn-routing    = { path = "../ndn-ext/crates/routing/ndn-routing" }
 ndn-sync      = { path = "crates/protocols/ndn-sync" }
-ndn-repo      = { path = "../ndn-repo/crates/ndn-repo" }
-ndn-repo-cluster = { path = "../ndn-repo/crates/ndn-repo-cluster" }
 ndn-cert     = { path = "crates/security/ndn-cert" }
 ndn-identity = { path = "crates/security/ndn-identity" }
 ndn-mgmt     = { path = "crates/forwarding/ndn-mgmt" }
 ndn-observability = { path = "crates/platform/ndn-observability" }
-ndn-sim       = { path = "../ndn-sim/crates/ndn-sim" }
-ndn-wasm      = { path = "../ndn-ext/crates/bindings/ndn-wasm" }
-ndn-strategy-wasm = { path = "../ndn-ext/crates/strategies/ndn-strategy-wasm" }
-ndn-compute   = { path = "../ndn-ext/crates/compute/ndn-compute" }
 ndn-coding    = { path = "crates/protocols/ndn-coding" }
-ndn-radio-cognition = { path = "../ndn-ext/crates/faces/ndn-radio-cognition" }
-ndn-signal-sources = { path = "../ndn-ext/crates/faces/ndn-signal-sources" }
-ndn-strategy-cclf = { path = "../ndn-ext/crates/strategies/ndn-strategy-cclf", default-features = false }
 ndn-ratelimit = { path = "crates/forwarding/ndn-ratelimit" }
-ndn-embedded  = { path = "../ndn-embedded/crates/ndn-embedded" }
-ndn-mobile    = { path = "../ndn-mobile/crates/ndn-mobile" }
-ndn-tools-core = { path = "../ndn-fwd/crates/tooling/ndn-tools-core" }
 
 # Core async runtime — individual crates enable only the features they need
 tokio      = { version = "1", default-features = false }
