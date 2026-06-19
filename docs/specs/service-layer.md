@@ -504,9 +504,14 @@ Constraints on performance claims:
    + NSF-S1–S5, 7 witnesses), `names` (the V2 four-phase name builders), and
    `messages` (the four-phase message TLV taxonomy — Request/Ack/Selection/
    Response at types 128–131, faithful sub-field numbers, tolerant decode for
-   interop). The four-phase flow over SVS pub/sub (the `ServiceProvider`/
-   `ServiceUser` roles, wiring `ndn-nacabe`'s KP-ABE `ServiceController`)
-   follows.
+   interop), and `flow` (the sans-IO four-phase orchestration core: `ProviderEngine`
+   issues a single-use token on `on_request`→ACK and consumes it on
+   `on_selection`, running the handler and building the RESPONSE, **failing
+   closed** on a replayed/forged/expired token — the token-gated coordination).
+   **Remaining:** the async SVS pub/sub *driver* binding `flow` over
+   `SvsPubSub::publish`/`subscribe` (the `ServiceProvider`/`ServiceUser` loops),
+   and wiring `ndn-nacabe`'s KP-ABE `ServiceController` for access (closing the
+   last O4 gates NSF-A3/A4).
 6. v2: `ndn-service` (Tier-1 selection + Tier-2 collab, authority-as-signed-Data).
 
 ---
