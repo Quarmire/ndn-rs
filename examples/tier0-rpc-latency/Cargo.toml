@@ -1,0 +1,20 @@
+[package]
+name = "example-tier0-rpc-latency"
+version = "0.0.0"
+edition.workspace = true
+publish = false
+
+# Tier-0 RPC latency experiment: measures one signed-Interest -> signed+verified
+# Data round-trip to a *known* provider (no sync, no discovery), to ground the
+# v2 "invert the default" premise against NDNSF's published ~166 ms four-leg
+# sync-pub/sub floor. See the module docs in src/main.rs.
+
+[dependencies]
+ndn-packet      = { workspace = true, features = ["std"] }
+ndn-security    = { workspace = true }
+ndn-transport   = { workspace = true }
+ndn-engine      = { workspace = true }
+ndn-face        = { workspace = true }
+ndn-app         = { workspace = true }
+tokio           = { workspace = true, features = ["rt-multi-thread", "macros"] }
+anyhow          = { workspace = true }

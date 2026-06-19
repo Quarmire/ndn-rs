@@ -32,6 +32,7 @@ members = [
     "examples/strategy-custom",
     "examples/strategy-composed",
     "examples/context-enricher",
+    "examples/tier0-rpc-latency",
 ]
 default-members = [
     "crates/core/ndn-foundation-types",
