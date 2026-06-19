@@ -107,7 +107,7 @@ EXT (ndn-ext) — compat layer (faithful)
   crates/service/ndn-ndnsf                           NDNSF four-phase + roles + KP-ABE controller; provides NdnsfCarrier + SelectCarrier (§12)  [built + proven]
 
 EXT (ndn-ext) — v2 layer (alternative)
-  crates/service/ndn-service                         authority-as-signed-Data: PolicyAuthority + signed command front-end + policy→issuance bridge (§4.4); Tier-2 typed Topic<T> (§3.3); Tier-1 DiscoveryCarrier (§3.2) [BUILT]
+  crates/service/ndn-service                         authority-as-signed-Data: PolicyAuthority + signed command front-end + policy→issuance bridge (§4.4); Tier-2 Topic<T> + Session/ScopedTopic collaboration (§3.3); Tier-1 DiscoveryCarrier + ServiceDiscoveryDirectory (§3.2) [BUILT]
 ```
 
 `ndn-ndnsf` (compat) and `ndn-service` (v2) depend on the *same* shared
@@ -211,8 +211,20 @@ scopes are typed rather than string-keyed.
 (both use [`Frame`]; topics are the separate primitive the unary-only boundary
 reserves, §12.2). `Topic::publish(&T)` / `subscribe() -> Subscription<T>` (a stream
 that decodes each publication, skipping foreign/malformed ones). Witness
-`typed_topic` delivers a feed of a structured `Reading` between two nodes. Sessions,
-role/key scopes, and artifact provisioning build on this; *next* increments.
+`typed_topic` delivers a feed of a structured `Reading` between two nodes.
+
+**Collaboration built (composes the above):** `ndn-service::session::Session<R>` —
+a named scope over an SVS group with a shared **scope key**. Members collaborate
+over `ScopedTopic<T>`s whose payloads are sealed under that key (the
+`confidentiality` CK primitive, §6.1), so **membership is the scope key** — a node
+without it gets the sealed bytes but no plaintext. This is a confidential
+topic = a typed feed + CK sealing, scoped under the session name — composing the
+Tier-2 pieces, not a mega-primitive. The roster (role type `R`) is *typed*
+metadata (`admit`/`role_of`/`members`; roles are an enum, not string-keyed, §3.3).
+Witness `session_collab`: two members exchange a confidential `Order` feed while a
+non-member (different key) reads nothing. *Next* increments: role-scoped keys
+(per-role CK/ABE so a role gates which topics it reads), member key distribution
+(via `ndn-sealed-box`/ABE), and artifact provisioning.
 
 ---
 
