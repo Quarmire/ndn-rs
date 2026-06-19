@@ -8,3 +8,13 @@ testbed/results/
 docs/notes/
 meta_err.txt
 e.txt
+docs/abe.md
+docs/cclf.md
+docs/coding.md
+docs/compute.md
+docs/cross-device-approval.md
+docs/ndncert-attestations.md
+docs/signals.md
+docs/doctrine/
+docs/specs/fec-metadata.md
+docs/specs/spsc-shm-spec.md
