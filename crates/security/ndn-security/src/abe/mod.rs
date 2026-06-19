@@ -8,6 +8,16 @@
 //! per-recipient key-wrap (NAC) sit below it in `ndn-crypto-core`. ABE is for
 //! named-radio / broadcast fan-out where enumerating recipients does not scale.
 //!
+//! ## Security level (audit ABE-2)
+//!
+//! ABE is anchored on the `rabe` crate (0.4.x), a niche, lightly-maintained
+//! pairing library using the **BN-254** curve, whose effective security is
+//! ~100 bits — **below the 128-bit baseline** the ChaCha20-Poly1305 AEAD layer
+//! provides. Treat ABE as an opt-in tier whose confidentiality strength is
+//! weaker than the symmetric baseline, and keep `rabe` (and its transitive
+//! pairing crates) in `cargo audit` / `cargo deny` scope. Off by default
+//! (`abe` feature) and never wired into the embedded forwarder.
+//!
 //! Three schemes are wrapped, one per access-control topology:
 //! - [`bsw_setup`] / [`bsw_keygen`] / [`bsw_encrypt`] / [`bsw_decrypt`] —
 //!   Bethencourt-Sahai-Waters **CP-ABE** (single authority; producer sets the
