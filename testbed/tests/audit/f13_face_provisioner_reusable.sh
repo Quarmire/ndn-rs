@@ -13,14 +13,14 @@
 # Design:     A `FaceSink` seam in ndn-transport (the crate every engine shares)
 #             lets the provisioner add/remove faces without depending on a
 #             concrete engine. ForwarderEngine implements it; the provisioner
-#             lives in ndn-face-native (it owns the multicast faces + iface
+#             lives in ndn-face (it owns the multicast faces + iface
 #             watcher) and is generic over FaceSink.
 #
 # What this pins:
 #   1. FaceSink trait defined + exported in ndn-transport.
 #   2. ForwarderEngine implements FaceSink in ndn-engine.
-#   3. The reusable provisioner module exists in ndn-face-native...
-#   4. ...and is config-agnostic (ndn-face-native does not depend on ndn-config).
+#   3. The reusable provisioner module exists in ndn-face...
+#   4. ...and is config-agnostic (ndn-face does not depend on ndn-config).
 #   5. ndn-fwd's face_setup delegates to provision:: instead of inlining the
 #      watcher (the old inline netlink reactor is gone).
 #
@@ -44,15 +44,15 @@ check "FaceSink trait defined"  'pub trait FaceSink' crates/ndn-transport/src/fa
 check "FaceSink re-exported"    'pub use face_sink::FaceSink' crates/ndn-transport/src/lib.rs
 # (2) Engine implements it.
 check "ForwarderEngine impls FaceSink" 'impl ndn_transport::FaceSink for ForwarderEngine' crates/ndn-engine/src/engine.rs
-# (3) Reusable provisioner in ndn-face-native.
-check "provision module present" 'pub fn provision' crates/ndn-face-native/src/provision.rs
-check "hotplug watcher is reusable" 'pub fn spawn_hotplug_watcher' crates/ndn-face-native/src/provision.rs
+# (3) Reusable provisioner in ndn-face.
+check "provision module present" 'pub fn provision' crates/faces/ndn-face/src/provision.rs
+check "hotplug watcher is reusable" 'pub fn spawn_hotplug_watcher' crates/faces/ndn-face/src/provision.rs
 # (4) Config-agnostic.
-if grep -qE '^ndn-config' crates/ndn-face-native/Cargo.toml; then
-    echo "FAIL: ndn-face-native depends on ndn-config (provisioner not config-agnostic)"
+if grep -qE '^ndn-config' crates/faces/ndn-face/Cargo.toml; then
+    echo "FAIL: ndn-face depends on ndn-config (provisioner not config-agnostic)"
     fail=1
 else
-    echo "ok: ndn-face-native is config-agnostic (no ndn-config dep)"
+    echo "ok: ndn-face is config-agnostic (no ndn-config dep)"
 fi
 # (5) ndn-fwd delegates; the inline netlink reactor is gone.
 check  "face_setup delegates to provision::" 'ndn_face_native::provision::' binaries/ndn-fwd/src/face_setup.rs

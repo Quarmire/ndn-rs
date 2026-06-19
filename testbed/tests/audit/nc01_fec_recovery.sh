@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Witness test for F1 producer-side FEC recovery.
 #
-# Feature:     network-coding F1 — `crates/draft/ndn-coding`.
+# Feature:     network-coding F1 — `crates/protocols/ndn-coding`.
 # Spec ref:    RFC 9273 §3 (content coding); empirical anchor
 #              Xu/Li/Zhang 2018 "Reliable Content Delivery in Lossy
 #              NDN Based on Network Coding".

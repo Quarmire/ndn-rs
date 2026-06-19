@@ -6,7 +6,7 @@
 #
 # What this tests:
 #   Asserts that no SWIM artifacts remain in the ndn-discovery crate or its
-#   consumer crates (ndn-face-native, ndn-mobile).  The SWIM protocol family
+#   consumer crates (ndn-face, ndn-mobile).  The SWIM protocol family
 #   (HelloProtocol, DirectProbe, IndirectProbe, swim_*) must be absent.
 #
 # Reverify recipe:
@@ -27,7 +27,7 @@ fail=0
 check_absent() {
     local pattern="$1"
     local desc="$2"
-    local dirs="${3:-crates/ndn-discovery crates/ndn-face-native crates/ndn-mobile}"
+    local dirs="${3:-crates/ndn-discovery crates/faces/ndn-face crates/ndn-mobile}"
     if grep -rqE "$pattern" $dirs --include="*.rs" 2>/dev/null; then
         echo "FAIL: found $desc" | tee -a "$TRANSCRIPT"
         grep -rE "$pattern" $dirs --include="*.rs" -l 2>/dev/null | tee -a "$TRANSCRIPT"
@@ -59,12 +59,12 @@ else
     echo "ok: hello/ directory absent from ndn-discovery" | tee -a "$TRANSCRIPT"
 fi
 
-# Orphan ether_nd.rs in ndn-face-native must not exist.
-if [ -f "$REPO_ROOT/crates/ndn-face-native/src/l2/ether_nd.rs" ]; then
-    echo "FAIL: crates/ndn-face-native/src/l2/ether_nd.rs still exists" | tee -a "$TRANSCRIPT"
+# Orphan ether_nd.rs in ndn-face must not exist.
+if [ -f "$REPO_ROOT/crates/faces/ndn-face/src/l2/ether_nd.rs" ]; then
+    echo "FAIL: crates/faces/ndn-face/src/l2/ether_nd.rs still exists" | tee -a "$TRANSCRIPT"
     fail=1
 else
-    echo "ok: ndn-face-native/src/l2/ether_nd.rs absent" | tee -a "$TRANSCRIPT"
+    echo "ok: ndn-face/src/l2/ether_nd.rs absent" | tee -a "$TRANSCRIPT"
 fi
 
 if [ "$fail" -eq 0 ]; then

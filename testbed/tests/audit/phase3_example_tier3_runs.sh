@@ -8,7 +8,7 @@
 # Witnesses:
 #   (a) GREP-PROOF — `examples/tier3-instrument-tap/Cargo.toml`
 #       enables the `experimental-instrument` feature on `ndn-engine`
-#       and `ndn-face-native`.
+#       and `ndn-face`.
 #   (b) GREP-PROOF — `examples/tier3-instrument-tap/src/main.rs` uses
 #       `TapFace` and calls `tap.captured()`.
 #   (c) RUST-BUILD — the example builds.

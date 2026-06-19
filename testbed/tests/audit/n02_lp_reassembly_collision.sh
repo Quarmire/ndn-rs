@@ -18,7 +18,7 @@
 #                - n02_*decode*/reassembly tests
 #              prove FaceAddr-derived UDP/MAC endpoint ids feed the decode
 #              stage, so shared-medium senders do not alias at LP reassembly.
-#              LIVE-UDP in `ndn-face-native`:
+#              LIVE-UDP in `ndn-face`:
 #                - n02_live_udp_shared_medium_source_addrs_drive_reassembly
 #              sends colliding fragment sequences from two real UDP sockets
 #              into one shared-medium face and reassembles both by source.
@@ -46,7 +46,7 @@ else
     fail=1
 fi
 
-if cargo test -p ndn-face-native --test shared_medium_live --quiet \
+if cargo test -p ndn-face --test shared_medium_live --quiet \
         n02_live_udp_shared_medium_source_addrs_drive_reassembly \
         >>/tmp/n02_witness.log 2>&1; then
     echo "ok: live UDP shared-medium senders reassemble independently"

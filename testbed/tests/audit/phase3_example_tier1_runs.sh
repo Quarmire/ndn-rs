@@ -7,7 +7,7 @@
 # Witnesses:
 #   (a) GREP-PROOF — `examples/tier1-develop-5min/Cargo.toml` depends
 #       only on `ndn-rs-prelude`, `tokio`, and `anyhow` (no
-#       direct dep on `ndn-engine`, `ndn-face-native`, `ndn-strategy`, etc).
+#       direct dep on `ndn-engine`, `ndn-face`, `ndn-strategy`, etc).
 #   (b) GREP-PROOF — `examples/tier1-develop-5min/src/main.rs` does
 #       not `use ndn_engine::`, `use ndn_face_native::`, `use ndn_strategy::`,
 #       `use ndn_mgmt::`, or any other Extend / Instrument crate.
@@ -40,7 +40,7 @@ check_grep() {
 
 # (a) Cargo.toml only references ndn-rs-prelude (no Extend/Instrument crates).
 check_grep '^ndn-rs-prelude' "$CARGO" 'tier1 depends on ndn-rs-prelude'
-for forbidden in ndn-engine ndn-face-native ndn-strategy ndn-mgmt ndn-transport ndn-routing ndn-discovery ndn-runtime ndn-store ndn-face-local; do
+for forbidden in ndn-engine ndn-face ndn-strategy ndn-mgmt ndn-transport ndn-routing ndn-discovery ndn-runtime ndn-store ndn-face-local; do
     if grep -nE "^${forbidden}[[:space:]]*=" "$CARGO" >/dev/null 2>&1; then
         echo "FAIL: tier1 Cargo.toml lists $forbidden (must depend only on ndn-rs-prelude)" >&2
         grep -nE "^${forbidden}[[:space:]]*=" "$CARGO" >&2

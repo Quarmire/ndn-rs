@@ -36,7 +36,7 @@ EXIT: 0
 test result: ok. 216 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
 
-=== Downstream sanity (ndn-engine / ndn-face-native lib) ===
+=== Downstream sanity (ndn-engine / ndn-face lib) ===
 .....................................
 test result: ok. 37 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
 

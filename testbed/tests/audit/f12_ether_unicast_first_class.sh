@@ -32,7 +32,7 @@ cd "$REPO_ROOT"
 
 CFG="crates/ndn-config/src/config.rs"
 FACES="crates/ndn-mgmt/src/modules/faces.rs"
-L2_DIR="crates/ndn-face-native/src/l2"
+L2_DIR="crates/faces/ndn-face/src/l2"
 
 fail=0
 check() { # <description> <grep-args...>

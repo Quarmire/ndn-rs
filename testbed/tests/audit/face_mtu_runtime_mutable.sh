@@ -72,10 +72,10 @@ check_grep 'fn set_send_mtu' "$TRANSPORT" 'ErasedTransport::set_send_mtu'
 check_grep 'fn set_persistency' "$TRANSPORT" 'ErasedTransport::set_persistency'
 
 # (d) UdpFace overrides set_send_mtu (canonical runtime-mutable transport).
-check_grep 'fn set_send_mtu' crates/ndn-face-native/src/net 'UdpFace::set_send_mtu override'
+check_grep 'fn set_send_mtu' crates/faces/ndn-face/src/net 'UdpFace::set_send_mtu override'
 
 # (e) ShmFace declares Immutable for both setters.
-check_grep 'Immutable' crates/ndn-face-native/src/local 'ShmFace Immutable setter response'
+check_grep 'Immutable' crates/faces/ndn-face/src/local 'ShmFace Immutable setter response'
 
 # (f) RUST-UNIT exercising default-impl behaviour.
 if ! cargo test -p ndn-transport --lib mtu_default_errors_not_supported \

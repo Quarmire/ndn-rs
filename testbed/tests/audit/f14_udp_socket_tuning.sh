@@ -14,8 +14,8 @@
 #
 # Reverify recipe:
 #   bash testbed/tests/audit/f14_udp_socket_tuning.sh
-#   cargo test -p ndn-face-native --lib bind_enlarges_recv_buffer   # part A
-#   cargo check -p ndn-face-native --features udp-recvmmsg \
+#   cargo test -p ndn-face --lib bind_enlarges_recv_buffer   # part A
+#   cargo check -p ndn-face --features udp-recvmmsg \
 #       --target x86_64-unknown-linux-gnu                            # part B compiles
 #
 # Exit codes: 0 PASS / 1 FAIL
@@ -23,7 +23,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 cd "$REPO_ROOT"
 
-NF="crates/ndn-face-native"
+NF="crates/faces/ndn-face"
 fail=0
 check()  { local d="$1"; shift; if grep -qE "$@"; then echo "ok: $d"; else echo "FAIL: $d"; fail=1; fi; }
 

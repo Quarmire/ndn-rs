@@ -12,7 +12,7 @@
 #       a 2018 placeholder on crates.io); library name is `ndn` so
 #       callers still write `use ndn::Consumer;`.
 #   (b) GREP-PROOF — the lib.rs re-exports only Develop-tier symbols.
-#       No `ndn-engine`, `ndn-face-native`, `ndn-discovery*`, `ndn-routing`,
+#       No `ndn-engine`, `ndn-face`, `ndn-discovery*`, `ndn-routing`,
 #       `ndn-strategy`, `ndn-mgmt`, `ndn-transport`, `ndn-runtime`,
 #       `ndn-store` re-exports (those are Extend / Instrument).
 #   (c) RUST-UNIT  — `cargo build -p ndn-rs-prelude` (native) and
@@ -58,7 +58,7 @@ check_grep 'ndn-packet'   "$CARGO" 'ndn-packet dep'
 check_grep 'ndn-security' "$CARGO" 'ndn-security dep'
 check_grep 'ndn-app'      "$CARGO" 'ndn-app dep (native-only target)'
 
-for forbidden in ndn-engine ndn-face-native ndn-discovery ndn-routing \
+for forbidden in ndn-engine ndn-face ndn-discovery ndn-routing \
                  ndn-strategy ndn-mgmt ndn-transport ndn-runtime \
                  ndn-store ndn-tlv; do
     # Match the dep on a dependency line (starts with the crate name +

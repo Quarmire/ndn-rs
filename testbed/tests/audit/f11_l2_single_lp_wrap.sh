@@ -34,7 +34,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 cd "$REPO_ROOT"
 
-L2_DIR="crates/ndn-face-native/src/l2"
+L2_DIR="crates/faces/ndn-face/src/l2"
 # (file, must-define-send_mtu?)
 FILES=(
     "$L2_DIR/ether.rs"

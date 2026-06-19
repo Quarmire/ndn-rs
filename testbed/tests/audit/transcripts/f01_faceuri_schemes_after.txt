@@ -7,7 +7,7 @@ running 2 tests
 test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 38 filtered out; finished in 0.00s
 
 
---- ndn-face-native f06_* ---
+--- ndn-face f06_* ---
 
 running 2 tests
 ..
@@ -21,7 +21,7 @@ ok: WebSocket face emits wsclient/wsserver per direction
 === F.01 / F.03 / F.06 RESOLVED — FaceUri schemes match NFD registry ===
 EXIT: 0
 
-=== Full ndn-face-native --lib (regression sweep) ===
+=== Full ndn-face --lib (regression sweep) ===
 .......................................................
 test result: ok. 55 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.00s
 

@@ -15,7 +15,7 @@ cd "$REPO_ROOT"
 
 if cargo test -p ndn-engine --test broadcast_data_parity --quiet n09_ \
         >/tmp/n09_multiaccess_nack_policy.log 2>&1 \
-        && cargo test -p ndn-face-native --test shared_medium_live --quiet \
+        && cargo test -p ndn-face --test shared_medium_live --quiet \
             n09_live_udp_shared_medium_nack_is_ignored \
             >>/tmp/n09_multiaccess_nack_policy.log 2>&1; then
     cat /tmp/n09_multiaccess_nack_policy.log

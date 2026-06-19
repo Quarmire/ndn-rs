@@ -21,8 +21,8 @@ if [ ! -d "$CRATE" ]; then
     echo "FAIL: $CRATE does not exist (crate not promoted to extension scope)" >&2
     fail=1
 fi
-if [ -d crates/draft/ndn-compute ]; then
-    echo "FAIL: crates/draft/ndn-compute still present (move incomplete)" >&2
+if [ -d ../ndn-ext/crates/compute/ndn-compute ]; then
+    echo "FAIL: ../ndn-ext/crates/compute/ndn-compute still present (move incomplete)" >&2
     fail=1
 fi
 if ! grep -q 'classification = "extension"' "$CRATE/Cargo.toml" 2>/dev/null; then

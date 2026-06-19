@@ -9,6 +9,6 @@ ok: UdpNeighborDiscovery type absent
 ok: swim substring (case-insensitive) absent
 ok: hello_prefix scope constant absent
 ok: hello/ directory absent from ndn-discovery
-ok: ndn-face-native/src/l2/ether_nd.rs absent
+ok: ndn-face/src/l2/ether_nd.rs absent
 
 PASS: all SWIM artifacts removed
