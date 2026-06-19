@@ -104,7 +104,7 @@ EXT (ndn-ext) — shared service substrate
   crates/service/ndn-nacabe                          NAC protocol: AA serves PubParams/DKEY, ParamFetcher, CK-data naming  [NEW]
 
 EXT (ndn-ext) — compat layer (faithful)
-  crates/service/ndn-ndnsf                           NDNSF four-phase + roles + KP-ABE controller; provides NdnsfCarrier (§12)  [roles/driver built]
+  crates/service/ndn-ndnsf                           NDNSF four-phase + roles + KP-ABE controller; provides NdnsfCarrier + SelectCarrier (§12)  [built + proven]
 
 EXT (ndn-ext) — v2 layer (alternative)
   crates/service/ndn-service                         Tier-1 selection + Tier-2 collab; authority-as-signed-Data; scoped authorities; v2 carrier + typed Topic<T>  [NEW]
@@ -667,13 +667,17 @@ dynamic handlers run in the fuel-metered wasm sandbox (`ndn-compute`'s
 
 ## 12. Service trait and pluggable carriers (the v2 core)
 
-> Status: **seam built and proven** (2026-06-19). `ndn-service-core` (the traits)
-> and the Tier-0 `RpcCarrier` over `ndn-rpc` are landed, with a hand-written
-> rendering of the macro's output (`ndn-rpc/tests/carrier_proof.rs`) round-tripping
-> a typed two-op service over the carrier (+ fail-closed on unknown op/service).
-> Still to build: the `NdnsfCarrier`, the v2 carrier, the `#[ndn_service]` macro
-> (§11.2 mode 2), and `SelectCarrier` impls. This generalises the role surface
-> (§7.2, `ndn-ndnsf::roles`, built) into a transport-independent service
+> Status: **seam built and proven across two transports** (2026-06-19).
+> `ndn-service-core` (the traits) plus **two carriers** are landed and witnessed
+> with the *same* hand-written service definition (the macro's eventual output):
+> the Tier-0 `RpcCarrier` over `ndn-rpc` (`ndn-rpc/tests/carrier_proof.rs`) and the
+> four-phase `NdnsfCarrier` over the NDNSF driver
+> (`ndn-ndnsf/tests/ndnsf_carrier_proof.rs`) — one `EchoService` runs over both
+> unchanged. `NdnsfCarrier` also implements `SelectCarrier`, and the client's
+> `echo_select` is gated `where C: SelectCarrier` (compile-time depth-as-needed),
+> proven gathering every provider under `Strategy::All`. Still to build: the v2
+> carrier and the `#[ndn_service]` macro (§11.2 mode 2). This generalises the role
+> surface (§7.2, `ndn-ndnsf::roles`, built) into a transport-independent service
 > abstraction the compat layer **and** v2 **and** Tier-0 all share.
 
 ### 12.1 The seam: contract vs carrier
@@ -768,8 +772,10 @@ EXT (ndn-ext) — shared service substrate
 ```
 
 Carriers live with their transports: `RpcCarrier` in `ndn-rpc` (**built + proven**),
-`NdnsfCarrier` in `ndn-ndnsf` (wrapping `ServiceNode`, not built), the v2 carrier
-in `ndn-service` (not built). No duplication: `ndn-rpc` stays the Tier-0
+`NdnsfCarrier` in `ndn-ndnsf` (**built + proven**, over the four-phase driver via a
+new async `serve_provider_async` + `ProviderEngine::consume_selection` seam, also
+`SelectCarrier`), the v2 carrier in `ndn-service` (not built). No duplication:
+`ndn-rpc` stays the Tier-0
 mechanism; `ServiceNode` stays the four-phase engine; the carrier is the uniform
 façade over them.
 
