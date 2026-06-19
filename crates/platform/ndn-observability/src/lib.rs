@@ -31,6 +31,12 @@
 
 pub mod otlp;
 pub mod publisher;
+// Multi-radio testbed instrumentation (folded in from the former ndn-research
+// draft crate): per-flow statistics + a pipeline observer stage.
+pub mod flow_table;
+pub mod observer;
+pub use flow_table::FlowTable;
+pub use observer::FlowObserverStage;
 
 #[cfg(feature = "layer")]
 pub mod layer;

@@ -9,6 +9,7 @@ license.workspace = true
 classification = "spec"
 
 [dependencies]
+dashmap       = { workspace = true }
 ndn-engine    = { workspace = true }
 ndn-face-local = { workspace = true }
 ndn-packet    = { workspace = true, features = ["std"] }

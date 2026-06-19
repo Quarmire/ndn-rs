@@ -15,7 +15,7 @@ const DOT11_HDR_LEN: usize = 24;
 const DOT11_QOS_HDR_LEN: usize = 26;
 /// LLC/SNAP header preceding an EtherType-tagged payload in an 802.11 frame.
 const LLC_SNAP_LEN: usize = 8;
-pub(crate) const LLC_SNAP_PREFIX: [u8; 6] = [0xAA, 0xAA, 0x03, 0x00, 0x00, 0x00];
+pub const LLC_SNAP_PREFIX: [u8; 6] = [0xAA, 0xAA, 0x03, 0x00, 0x00, 0x00];
 
 // ── ESP-NOW vendor-action-frame constants ────────────────────────────────────
 // ESP-NOW is a vendor-specific 802.11 *Action* frame: a subset of raw
@@ -354,6 +354,25 @@ mod tests {
         assert_eq!(b[37], ESPNOW_TYPE);
         assert_eq!(b[38], ESPNOW_VERSION);
         assert_eq!(&b[39..41], b"hi", "ESP-NOW body");
+    }
+
+    /// The radiotap-free `build_dot11`/`parse_dot11` helpers (used by hardware
+    /// backends that carry the rate in their own TX/RX descriptor) round-trip,
+    /// and `build` is exactly `radiotap ++ build_dot11`.
+    #[test]
+    fn dot11_helpers_round_trip_and_compose_build() {
+        let fmt = FrameFormat::EspNow { oui: ESPNOW_OUI };
+        let f = frame(b"\x05\x05hello");
+        let dot11 = build_dot11(fmt, &f).unwrap();
+        // No radiotap prefix — starts at the 802.11 Action frame control.
+        assert_eq!(&dot11[0..2], &[0xd0, 0x00]);
+        let got = parse_dot11(fmt, &dot11, Some(-33), Some(7)).unwrap();
+        assert_eq!(got.payload.as_ref(), b"\x05\x05hello");
+        assert_eq!(got.addr, Some(SRC));
+        assert_eq!(got.rssi_dbm, Some(-33), "descriptor RSSI passes through");
+        assert_eq!(got.mcs_index, Some(7), "descriptor rate passes through");
+        // `build` == radiotap header ++ the same 802.11 frame.
+        assert!(build(fmt, &f).unwrap().ends_with(&dot11));
     }
 
     #[test]
