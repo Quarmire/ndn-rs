@@ -1631,7 +1631,7 @@ file = "/var/log/ndn/router.log"
 
     #[test]
     fn example_file_parses() {
-        let s = include_str!("../../../examples/ndn-fwd.example.toml");
+        let s = include_str!("../../../../deploy/ndn-fwd.example.toml");
         ForwarderConfig::from_str(s).expect("example config should parse");
     }
 

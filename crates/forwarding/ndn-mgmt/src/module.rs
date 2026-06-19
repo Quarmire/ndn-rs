@@ -37,8 +37,14 @@ use crate::{
 /// `ndn-config`. The forwarder hands the engine an `Arc<dyn MgmtConfig>` when it
 /// mounts management.
 pub trait MgmtConfig: Send + Sync {
-    /// Serialize the running config to TOML — backs `/localhost/nfd/config/get`.
-    fn to_toml_string(&self) -> Result<String, String>;
+    /// Serialize the running config to **redacted** TOML — backs
+    /// `/localhost/nfd/config/get`. Implementations MUST replace secret-bearing
+    /// fields (passwords, CA invite tokens, challenge PINs, SMTP/TURN
+    /// credentials, ACME API tokens, …) with a placeholder (audit CFG-1): the
+    /// response Data can be logged or cached, and those secrets authorise
+    /// issuance/impersonation for *other* parties, so a read verb must not
+    /// disclose them even to an authenticated operator.
+    fn redacted_toml(&self) -> Result<String, String>;
 
     /// `[security] identity` — the configured engine identity name, if any.
     fn security_identity(&self) -> Option<&str>;
@@ -83,7 +89,7 @@ pub(crate) struct TestMgmtConfig {
 
 #[cfg(test)]
 impl MgmtConfig for TestMgmtConfig {
-    fn to_toml_string(&self) -> Result<String, String> {
+    fn redacted_toml(&self) -> Result<String, String> {
         Ok(String::new())
     }
     fn security_identity(&self) -> Option<&str> {

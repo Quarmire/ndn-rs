@@ -18,7 +18,9 @@ fn handle_config(verb_name: &[u8], config: &dyn crate::MgmtConfig) -> ControlRes
 }
 
 fn config_get(config: &dyn crate::MgmtConfig) -> ControlResponse {
-    match config.to_toml_string() {
+    // Redacted: never disclose secrets (CA tokens, PINs, SMTP/TURN creds, ACME
+    // API tokens) over a read verb (audit CFG-1).
+    match config.redacted_toml() {
         Ok(toml) => ControlResponse::ok_empty(toml),
         Err(e) => ControlResponse::error(status::SERVER_ERROR, e.to_string()),
     }
