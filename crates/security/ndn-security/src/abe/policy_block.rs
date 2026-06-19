@@ -100,8 +100,12 @@ impl TlvDecode for PolicyBlockPayload {
         }
         let len = r.read_length()?;
         let disc_bytes = r.read_bytes(len)?;
-        let scheme = AbeSchemeId::from_wire_disc(disc_bytes[0])
-            .ok_or(TlvCodecError::UnrecognizedVariant(disc_bytes[0]))?;
+        // Length-0 scheme-id TLV must error, not panic on disc_bytes[0] (ABE-1).
+        let disc = *disc_bytes
+            .first()
+            .ok_or(TlvCodecError::MalformedField(ABE_SCHEME_ID_TYPE))?;
+        let scheme =
+            AbeSchemeId::from_wire_disc(disc).ok_or(TlvCodecError::UnrecognizedVariant(disc))?;
 
         // policy_source
         let typ = r.read_type()?;

@@ -167,8 +167,13 @@ impl TlvDecode for AbeCiphertext {
         }
         let len = r.read_length()?;
         let disc_bytes = r.read_bytes(len)?;
-        let scheme = AbeSchemeId::from_wire_disc(disc_bytes[0])
-            .ok_or(TlvCodecError::UnrecognizedVariant(disc_bytes[0]))?;
+        // A length-0 scheme-id TLV would index an empty slice and panic (audit
+        // ABE-1) — ABE content is consumer-decoded from attacker-supplied Data.
+        let disc = *disc_bytes
+            .first()
+            .ok_or(TlvCodecError::MalformedField(ABE_SCHEME_ID_TYPE))?;
+        let scheme =
+            AbeSchemeId::from_wire_disc(disc).ok_or(TlvCodecError::UnrecognizedVariant(disc))?;
 
         // policy_source
         let typ = r.read_type()?;
