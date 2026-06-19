@@ -107,7 +107,7 @@ EXT (ndn-ext) — compat layer (faithful)
   crates/service/ndn-ndnsf                           NDNSF four-phase + roles + KP-ABE controller; provides NdnsfCarrier + SelectCarrier (§12)  [built + proven]
 
 EXT (ndn-ext) — v2 layer (alternative)
-  crates/service/ndn-service                         authority-as-signed-Data: PolicyAuthority (dynamic versioned signed policy, §4.4) [STARTED]; then Tier-1 selection carrier + Tier-2 typed Topic<T>  [NEW]
+  crates/service/ndn-service                         authority-as-signed-Data: PolicyAuthority + signed command front-end + policy→issuance bridge (§4.4); Tier-2 typed Topic<T> (§3.3) [BUILT]; Tier-1 selection carrier [NEXT]
 ```
 
 `ndn-ndnsf` (compat) and `ndn-service` (v2) depend on the *same* shared
@@ -183,6 +183,14 @@ Session-scoped many-to-many: sessions, role/key scopes, topic pub/sub, artifact
 provisioning. This is genuinely many-to-many and stays on SVS pub/sub. Scope keys
 use the shared CK primitive (§6.1); topics are SVS-PS subscriptions; roles and
 scopes are typed rather than string-keyed.
+
+**Built:** the typed-topic primitive `ndn-service::topic::Topic<T>` — the *feed*
+(publish/subscribe of `T` over an SVS group), distinct from a service op's *call*
+(both use [`Frame`]; topics are the separate primitive the unary-only boundary
+reserves, §12.2). `Topic::publish(&T)` / `subscribe() -> Subscription<T>` (a stream
+that decodes each publication, skipping foreign/malformed ones). Witness
+`typed_topic` delivers a feed of a structured `Reading` between two nodes. Sessions,
+role/key scopes, and artifact provisioning build on this; *next* increments.
 
 ---
 
@@ -285,9 +293,9 @@ freshly signed grant (the new published version). This is the operator→authori
 input channel that *produces signed versions*, not a hidden-state mutator. Witness
 `signed_commands`: an authorized grant then revoke take effect with no restart; an
 unauthorized command is rejected and mutates nothing. *Next:* config-file reload
-as a second front-end; the Tier-1 discovery-selection carrier; typed `Topic<T>`
-(Tier-2 pub/sub — the separate primitive: a typed *feed* of `T`, vs. a service
-op's request/response *call*).
+as a second front-end; the Tier-1 discovery-selection carrier. (Typed `Topic<T>`,
+Tier-2 — the *feed* primitive vs. a service op's request/response *call* — is now
+built; see §3.3.)
 
 ---
 
