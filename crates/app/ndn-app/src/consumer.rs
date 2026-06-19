@@ -1337,7 +1337,7 @@ mod subscription_tests {
             {
                 let data = DataBuilder::new(
                     self.versioned.clone().append_segment(seg),
-                    &vec![seg as u8; 10],
+                    &[seg as u8; 10],
                 )
                 .build();
                 self.q.lock().unwrap().push_back(data);
@@ -1436,8 +1436,8 @@ mod subscription_tests {
         });
         let mut consumer = Consumer::new(server);
 
-        let got: Arc<std::sync::Mutex<Vec<(u64, Vec<u8>)>>> =
-            Arc::new(std::sync::Mutex::new(Vec::new()));
+        type Collected = Arc<std::sync::Mutex<Vec<(u64, Vec<u8>)>>>;
+        let got: Collected = Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = Arc::clone(&got);
         let size = consumer
             .fetch_object_into(object, move |seg, bytes| {

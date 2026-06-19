@@ -31,7 +31,7 @@
 //! let node = Node::connect("/run/nfd/nfd.sock").await?;
 //! // serve dynamic content (the "Responder" pattern, now first-class)
 //! let _guard = node.serve("/notes", |interest, reply| async move {
-//!     let _ = reply.respond(interest.name().clone(), "hello").await;
+//!     let _ = reply.respond((*interest.name).clone(), "hello").await;
 //! }).await?;
 //! // fetch on the same connection, concurrently
 //! let data = node.fetch("/peer/greeting").await?;
