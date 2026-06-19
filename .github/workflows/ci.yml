@@ -4,31 +4,17 @@ on:
   push:
     branches: [main]
     paths:
-      - ".github/workflows/ci.yml"
-      - "crates/foundation/**"
-      - "crates/engine/**"
-      - "crates/faces/**"
-      - "crates/protocols/**"
-      - "crates/sim/**"
-      - "crates/platform/**"
-      - "binaries/**"
-      - "tools/**"
+      - "crates/**"
+      - "testbed/**"
       - "Cargo.toml"
-      - "Cargo.lock"
+      - ".github/workflows/ci.yml"
   workflow_dispatch:
   pull_request:
     branches: [main]
     paths:
-      - "crates/foundation/**"
-      - "crates/engine/**"
-      - "crates/faces/**"
-      - "crates/protocols/**"
-      - "crates/sim/**"
-      - "crates/platform/**"
-      - "binaries/**"
-      - "tools/**"
+      - "crates/**"
+      - "testbed/**"
       - "Cargo.toml"
-      - "Cargo.lock"
       - ".github/workflows/ci.yml"
 
 env:
@@ -40,9 +26,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # Pure manifest parsing — no toolchain or build needed, so this fails fast
-      # if an edge from a spec crate into an extension/research/tooling crate
-      # sneaks in (the drift the repo split is meant to prevent).
+      # Pure manifest parsing — fails fast if a spec crate gains an edge into a
+      # non-spec crate. The cross-repo boundary is now structural, but this still
+      # guards the core library's internal closure.
       - name: Run dep-direction guard
         run: python3 testbed/dep-direction-guard.py
 
@@ -51,11 +37,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-
       - uses: actions/cache@v4
         with:
           path: |
@@ -65,82 +49,25 @@ jobs:
           key: ${{ runner.os }}-cargo-core-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-core-
 
-      # ndn-dashboard uses Dioxus desktop which requires WebKit2GTK on Linux.
-      - name: Install system dependencies (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libwebkit2gtk-4.1-dev \
-            libgtk-3-dev \
-            libsoup-3.0-dev \
-            libjavascriptcoregtk-4.1-dev \
-            libxdo-dev \
-            libssl-dev \
-            pkg-config
-
+      # ndn-rs is a pure-Rust library (no dashboard/webkit, SQLite is bundled),
+      # so no system packages are required.
       - name: Check formatting
         run: cargo fmt --all -- --check
-
       - name: Lint
-        run: >
-          cargo clippy
-          --workspace
-          --exclude ndn-strategy-wasm
-          --exclude ndn-research
-          --exclude ndn-compute
-          --exclude ndn-python
-          -- -D warnings
-
+        run: cargo clippy --workspace -- -D warnings
       - name: Test
-        run: >
-          cargo test
-          --workspace
-          --exclude ndn-strategy-wasm
-          --exclude ndn-research
-          --exclude ndn-compute
-          --exclude ndn-python
-
+        run: cargo test --workspace
       - name: Doc build
-        run: >
-          cargo doc
-          --workspace
-          --exclude ndn-strategy-wasm
-          --exclude ndn-research
-          --exclude ndn-compute
-          --exclude ndn-python
-          --no-deps
-
-      - name: ndn-dashboard glossary is exhaustive (EduGloss CI guard)
-        # Every `EduGloss { term: "X", ... }` callsite must have a
-        # matching `[[entries]]` block in glossary.toml.
-        run: cargo run -q -p dash-glossary -- check .
-
-      - name: ndn-dashboard ships zero authored JavaScript
-        # The dashboard is pure Rust → Dioxus (desktop webview / wasm).
-        # The only legitimate `document::eval` callers are in comments
-        # noting that we no longer use them. Any real call is a regression.
-        run: |
-          set -e
-          hits=$(grep -RIn 'document::eval' crates/tooling/ndn-dashboard/src \
-            | grep -v '^[^:]*:[0-9]*:\s*//' \
-            || true)
-          if [ -n "$hits" ]; then
-            echo "Found document::eval call sites in ndn-dashboard:"
-            echo "$hits"
-            exit 1
-          fi
+        run: cargo doc --workspace --no-deps
 
   wasm32:
-    name: WASM — wasm32-unknown-unknown check (foundation + runtime)
+    name: WASM — wasm32-unknown-unknown check (core crates)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
-
       - uses: actions/cache@v4
         with:
           path: |
@@ -149,8 +76,7 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-wasm32-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-wasm32-
-
-      - name: Check foundation crates for wasm32-unknown-unknown
+      - name: Check core crates for wasm32-unknown-unknown
         run: |
           cargo check -p ndn-foundation-types --target wasm32-unknown-unknown
           cargo check -p ndn-tlv             --target wasm32-unknown-unknown
@@ -161,15 +87,13 @@ jobs:
           cargo check -p ndn-runtime         --target wasm32-unknown-unknown
 
   riscv32imc:
-    name: Embedded — riscv32imc-unknown-none-elf build (no-CAS no_std chain)
+    name: Embedded — riscv32imc no_std core chain
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: riscv32imc-unknown-none-elf
-
       - uses: actions/cache@v4
         with:
           path: |
@@ -178,15 +102,12 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-riscv32imc-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-riscv32imc-
-
-      - name: Build no_std crates for riscv32imc-unknown-none-elf
-        # Mirrors testbed/tests/audit/embedded_riscv32imc_build.sh. The target
-        # has no atomic-CAS in hardware; `portable-atomic` feature swaps
-        # Arc/Bytes refcounting through portable-atomic-util, with the
-        # `unsafe-assume-single-core` polyfill chosen via rustflag.
+      - name: Build no_std core crates for riscv32imc-unknown-none-elf
+        # The no-CAS no_std foundation chain (foundation-types/tlv/packet). The
+        # full embedded build (ndn-embedded) lives in the ndn-embedded repo.
         env:
           RUSTFLAGS: --cfg=portable_atomic_unsafe_assume_single_core
         run: |
           cargo build --target riscv32imc-unknown-none-elf \
             --no-default-features --features portable-atomic \
-            -p ndn-foundation-types -p ndn-tlv -p ndn-packet -p ndn-embedded
+            -p ndn-foundation-types -p ndn-tlv -p ndn-packet
