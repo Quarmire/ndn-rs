@@ -98,7 +98,7 @@ CORE (ndn-rs) — shared primitives
 EXT (ndn-ext) — shared service substrate
   crates/service/ndn-service-core                    Service/Carrier/SelectCarrier/Dispatch/Frame traits (§12)  [built — traits]
   crates/service/ndn-service-macro                   #[ndn_service] proc-macro over ndn-service-core (§11.2/§12)        [built + proven over both carriers]
-  crates/service/ndn-rpc                             Tier-0 typed Interest/Data RPC; provides RpcCarrier (§12, proven)   [built]
+  crates/service/ndn-rpc                             Tier-0 typed Interest/Data RPC; RpcCarrier (loopback) + FaceRpcCarrier (engine-backed, feature `engine`) (§12)   [built]
   crates/compute/ndn-compute                         specialization of ndn-rpc ("the handler is a pure function")  [refactor onto ndn-rpc]
   crates/discovery/ndn-discovery::service_discovery  Tier-1 find/select               [exists; extend]
   crates/service/ndn-nacabe                          NAC protocol: AA serves PubParams/DKEY, ParamFetcher, CK-data naming  [NEW]
@@ -976,7 +976,18 @@ The `RpcCarrier` proof (`ndn-rpc/tests/carrier_proof.rs`) hand-writes the macro'
 output — a `Frame` request/response pair, a `Dispatch` routing two `OpId`s to a
 typed service impl, and a client generic over `C: Carrier` — and round-trips it
 over real `Interest`/`Data` through the `RpcRegistry`. It is an **in-process
-loopback** (invoke dispatches through the same registry serve mounted into); a
-face-backed `RpcCarrier` (Interest over a `Consumer`, registry served by a
-`Producer` on an engine) is the same impl wired to a transport, deferred — that
-engine plumbing is already witnessed in `ndn-nacabe`.
+loopback** (invoke dispatches through the same registry serve mounted into).
+
+**Face-backed carrier built** (`ndn-rpc::FaceRpcCarrier`, feature `engine`): the
+same `Carrier`/`HintedCarrier` contract, but I/O over a real engine/forwarder —
+`invoke` expresses the Interest over an `ndn-app` `Consumer` (the forwarder routes
+it via the FIB; the response Data returns through the PIT and caches in the
+Content Store), `serve` runs a `Producer`'s serve loop dispatching inbound
+Interests. Provider and consumer live behind **different faces** (separate
+processes/machines). `ndn-rpc` stays engine-agnostic by default; the face-backed
+variant is gated behind `engine`. Witness `face_carrier`: a `#[ndn_service]`
+`EchoClient` over `FaceRpcCarrier::client` calls a provider served via
+`FaceRpcCarrier::server` on a *different* face of a two-face engine — one real
+cross-face service call, routed by the forwarder, no shared registry. This turns
+the proven seam (macro client, `DiscoveryCarrier`, the PyO3 binding) into real
+distributed services unchanged, and is where forwarding hints actually route.
