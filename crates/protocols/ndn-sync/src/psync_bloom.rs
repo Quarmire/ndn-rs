@@ -22,6 +22,12 @@ use crate::tlv::{decode_nni, encode_nni};
 
 const BITS_PER_CHAR: usize = 8;
 
+/// Upper bound on a peer-supplied Bloom `projected_element_count` (audit
+/// PSYNC-1). Far above any realistic sync set; the frame-size cap already bounds
+/// the table the peer can send, so this is a clean early rejection of an
+/// inflated count rather than the sole defence.
+const MAX_BLOOM_COUNT: u32 = 1 << 20;
+
 /// A Bloom filter over NDN [`Name`]s, encodable into / decodable from a
 /// Sync Interest name (`count`, `fpp*1000`, raw-bit-table components).
 #[derive(Clone, Debug)]
@@ -59,15 +65,37 @@ impl BloomFilter {
         false_positive_probability: f64,
         bits: &[u8],
     ) -> Result<Self, BloomError> {
-        let mut bf = BloomFilter::new(projected_element_count, false_positive_probability);
-        if bits.len() != bf.bit_table.len() {
+        // Audit PSYNC-1: `count`/`fpp` come straight off the peer's Sync Interest
+        // name. Validate them and compute the expected table size WITHOUT
+        // allocating — `BloomFilter::new` would otherwise `vec![0u8; …]` sized by
+        // an attacker-supplied `count ≈ u32::MAX` (~500 MB) before any check.
+        if !(false_positive_probability.is_finite()
+            && false_positive_probability > 0.0
+            && false_positive_probability < 1.0)
+        {
+            return Err(BloomError::InvalidParams);
+        }
+        if projected_element_count == 0 || projected_element_count > MAX_BLOOM_COUNT {
+            return Err(BloomError::InvalidParams);
+        }
+        let (num_hashes, table_size) =
+            compute_optimal_parameters(projected_element_count, false_positive_probability);
+        let expected_bytes = (table_size as usize) / BITS_PER_CHAR;
+        // The peer's bit table is bounded by the received frame, so a mismatch
+        // here rejects an inflated `count` before we allocate `expected_bytes`.
+        if bits.len() != expected_bytes {
             return Err(BloomError::SizeMismatch {
-                expected: bf.bit_table.len(),
+                expected: expected_bytes,
                 got: bits.len(),
             });
         }
-        bf.bit_table = bits.to_vec();
-        Ok(bf)
+        Ok(BloomFilter {
+            salt: generate_salt(num_hashes),
+            bit_table: bits.to_vec(),
+            table_size,
+            projected_element_count,
+            false_positive_probability,
+        })
     }
 
     /// Insert a name (hashed over its TLV component bytes, as C++).
@@ -133,6 +161,8 @@ impl BloomFilter {
 pub enum BloomError {
     /// The bit-table byte count doesn't match the `(count, fpp)` params.
     SizeMismatch { expected: usize, got: usize },
+    /// The peer-supplied `(count, fpp)` parameters are out of range.
+    InvalidParams,
 }
 
 impl std::fmt::Display for BloomError {
@@ -140,6 +170,9 @@ impl std::fmt::Display for BloomError {
         match self {
             BloomError::SizeMismatch { expected, got } => {
                 write!(f, "bloom filter cannot be decoded: expected {expected} bytes, got {got}")
+            }
+            BloomError::InvalidParams => {
+                write!(f, "bloom filter cannot be decoded: count/fpp out of range")
             }
         }
     }
@@ -287,6 +320,26 @@ mod tests {
         let restored = BloomFilter::from_name_suffix(&comps[1..]).expect("decode");
         assert_eq!(restored.bit_table, bf.bit_table);
         assert!(restored.contains(&n("/memphis")));
+    }
+
+    #[test]
+    fn psync1_huge_count_rejected_without_allocating() {
+        // A peer-supplied count ≈ u32::MAX with a small bit table must be
+        // rejected (not allocate a ~500 MB table). Returns quickly.
+        let res = BloomFilter::from_bits(u32::MAX, 0.001, &[0u8; 4]);
+        assert!(matches!(
+            res,
+            Err(BloomError::InvalidParams) | Err(BloomError::SizeMismatch { .. })
+        ));
+        // Invalid fpp is rejected too.
+        assert!(matches!(
+            BloomFilter::from_bits(100, 0.0, &[0u8; 180]),
+            Err(BloomError::InvalidParams)
+        ));
+        assert!(matches!(
+            BloomFilter::from_bits(100, 1.5, &[0u8; 180]),
+            Err(BloomError::InvalidParams)
+        ));
     }
 
     #[test]

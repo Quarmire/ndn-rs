@@ -79,6 +79,12 @@ impl Default for PSyncPartialConfig {
 // Producer
 // ---------------------------------------------------------------------------
 
+/// Ceiling on held (unsatisfiable) sync Interests (audit PSYNC-2). The map is
+/// otherwise purged only on a timed sweep, so a flood of distinct sync Interests
+/// within the lifetime window grows it without bound — and each entry pins a
+/// BloomFilter + IBF. Mirrors the existing `seg_store` 1024 cap.
+const MAX_PENDING_SYNC_INTERESTS: usize = 1024;
+
 struct PartialPending {
     bf: BloomFilter,
     consumer_ibf: crate::psync::Ibf,
@@ -215,6 +221,17 @@ async fn serve_sync(
         Some(_) => {
             // Decodable but nothing the consumer subscribed to changed —
             // hold the Interest (long-lived) until a publish satisfies it.
+            // Cap the map (audit PSYNC-2): when full, evict the soonest-to-expire
+            // held Interest so a flood of distinct sync Interests can't grow it.
+            if pending.len() >= MAX_PENDING_SYNC_INTERESTS
+                && !pending.contains_key(interest_name)
+                && let Some(victim) = pending
+                    .iter()
+                    .min_by_key(|(_, e)| e.expires_at)
+                    .map(|(k, _)| k.clone())
+            {
+                pending.remove(&victim);
+            }
             pending.insert(
                 interest_name.clone(),
                 PartialPending {
