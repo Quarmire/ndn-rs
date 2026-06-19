@@ -104,6 +104,21 @@ pub fn encrypt(
     })
 }
 
+/// Upper bound on the opaque rabe ciphertext blob (audit ABE-3). `rabe`
+/// bincode-deserializes this blob *before* the pairing check, and bincode has no
+/// inherent length cap, so an attacker-controlled blob could over-allocate on a
+/// decoding node. ABE ciphertexts are far smaller than this.
+const MAX_RABE_BLOB: usize = 1 << 20;
+
+fn check_rabe_blob(ciphertext: &AbeCiphertext) -> Result<(), AbeError> {
+    if ciphertext.rabe_ciphertext_bytes.len() > MAX_RABE_BLOB {
+        return Err(AbeError::CiphertextMalformed(
+            "rabe ciphertext blob exceeds maximum size".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Decrypt a BSW ciphertext using consumer attribute keys.
 pub fn decrypt(
     ciphertext: &AbeCiphertext,
@@ -117,6 +132,7 @@ pub fn decrypt(
             ciphertext.schema_version,
         ));
     }
+    check_rabe_blob(ciphertext)?;
     bsw_decrypt(attribute_keys, &ciphertext.rabe_ciphertext_bytes)
 }
 
@@ -160,6 +176,7 @@ pub fn decrypt_kp(
             ciphertext.schema_version,
         ));
     }
+    check_rabe_blob(ciphertext)?;
     lsw_decrypt(policy_key, &ciphertext.rabe_ciphertext_bytes)
 }
 

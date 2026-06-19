@@ -107,7 +107,10 @@ impl SafeBag {
         let mut iv = [0u8; 16];
         rand_core::OsRng.fill_bytes(&mut salt);
         rand_core::OsRng.fill_bytes(&mut iv);
-        let params = pkcs5::pbes2::Parameters::pbkdf2_sha256_aes256cbc(2048, &salt, &iv)
+        // PBKDF2 iterations raised above the legacy 2048 default per modern
+        // guidance (audit SB-2); the count is embedded and read on import, so
+        // ndnsec/ndn-cxx interop is preserved.
+        let params = pkcs5::pbes2::Parameters::pbkdf2_sha256_aes256cbc(600_000, &salt, &iv)
             .map_err(|e| SafeBagError::Pkcs8(format!("pbes2 params: {e}")))?;
         let encrypted = pki
             .encrypt_with_params(params, password)
