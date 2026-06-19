@@ -107,7 +107,7 @@ EXT (ndn-ext) — compat layer (faithful)
   crates/service/ndn-ndnsf                           NDNSF four-phase + roles + KP-ABE controller; provides NdnsfCarrier + SelectCarrier (§12)  [built + proven]
 
 EXT (ndn-ext) — v2 layer (alternative)
-  crates/service/ndn-service                         Tier-1 selection + Tier-2 collab; authority-as-signed-Data; scoped authorities; v2 carrier + typed Topic<T>  [NEW]
+  crates/service/ndn-service                         authority-as-signed-Data: PolicyAuthority (dynamic versioned signed policy, §4.4) [STARTED]; then Tier-1 selection carrier + Tier-2 typed Topic<T>  [NEW]
 ```
 
 `ndn-ndnsf` (compat) and `ndn-service` (v2) depend on the *same* shared
@@ -234,6 +234,40 @@ delegation between authorities (where MA-ABE or cross-signing enters, §6).
 > authority (same signing key ⇒ interchangeable signed objects), not independent
 > authorities. This spec models that as replication of a single authority, and
 > independent-authority federation as a separate, explicit construct.
+
+### 4.4 Dynamic policy (built: `ndn-service::PolicyAuthority`)
+
+The compat layer's policy is effectively **static**: `ndn-ndnsf::policy` loads a
+TOML grant table into a `KpAuthority` at construction, with no `revoke` and no
+runtime input channel — changing policy means edit-file-and-restart. Dynamic
+policy is **desirable** (revocation is security-critical and cannot wait for a
+restart window; grant/revoke must not disrupt in-flight issuance or drop authority
+availability; principals churn), and the §4.1 doctrine gives the right shape
+*without* a daemon-state-mutating mgmt protocol:
+
+- **Policy is a versioned, signed dataset.** A grant is a signed Data object
+  `<scope>/policy/<principal>/v=N`. "Updating policy" = sign and publish a new
+  version; key issuance reads the current version, so changes take effect **live,
+  no restart**. The signed version history *is* the audit log, and a grant remains
+  validatable from a cache/peer if the authority is briefly offline.
+- **Revocation is honest.** A revoked grant publishes a `revoked` version, paired
+  with short validity / **epoch rotation** — because ABE keys are not individually
+  revocable once issued, real revocation is re-keying (the `confidentiality`
+  `EpochPolicy`/CK indirection, §6.1), not pull-based denial alone.
+- **mgmt + config are the operator→authority *input* channel** — useful, but as
+  the front-end that *produces new signed versions*, not a hidden-state mutator: a
+  config file + reload (declarative, matches NDNSF's `policy_file`) and/or a signed
+  `/<scope>/policy/{grant,revoke}` command Interest (programmatic/remote). Both
+  converge on "mutate → bump version → re-sign → republish".
+
+**Built:** `ndn-service::PolicyAuthority` (a scoped authority per §4.3) holds the
+versioned grants and exposes live `grant`/`revoke` (each bumps the version and
+re-signs the affected `Grant`); `signed_grant` emits the current signed object;
+`verify_grant` validates it against the authority's anchor (fail closed). Witness
+`dynamic_policy` proves grant + revoke take effect on one live authority instance
+with no restart, and that an untrusted authority's grant is rejected. *Next:* wire
+`KpAuthority` issuance to read the current `PolicyAuthority` version, and add the
+config-reload / signed-command front-ends.
 
 ---
 
