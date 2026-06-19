@@ -545,9 +545,14 @@ a bespoke profiler.
    **Policy-file model landed** (`policy`): a TOML `ServicePolicy`
    (providers/users + `allowed_services`) compiles each principal's services
    into the OR-join KP-ABE policy and grants it on the `KpAuthority`
-   (`apply_to`). **Remaining for full fidelity:** app-layer per-message trust
-   validation (the trust half of NSF-A3, complementary to `SvsPubSub` signing),
-   the unsigned-discovery posture (NSF-A4), and the F1/F2 callback/log runtime
+   (`apply_to`). **Per-message trust-validation mechanism landed** (`trust`):
+   `sign_message` (publish as signed Data) + `verify_message` (validate against
+   trust anchors and require the signer be under the message's expected sender,
+   fail closed) — the NDNSF `MessageValidator` analog, reusing the real
+   `ndn_security::Validator` (4 witnesses). **Remaining for full fidelity:**
+   thread `sign_message`/`verify_message` through every driver leg (cleaner
+   long-term home: `SvsPubSub`-level signing + the `IngestValidator` seam), the
+   unsigned-discovery posture (NSF-A4), and the F1/F2 callback/log runtime
    semantics.
 6. v2: `ndn-service` (Tier-1 selection + Tier-2 collab, authority-as-signed-Data).
 
