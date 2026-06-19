@@ -212,6 +212,16 @@ arises from discovery, not the inner unary carrier); no provider → fail closed
 shared callable + per-node hints and the carrier puts the selected hint on the
 shared-name Interest end to end.
 
+**Cross-node discovery wired end to end:** `cross_node_discovery` (ndn-service)
+runs **two separate** `ServiceDiscoveryProtocol` instances over a minimal host
+loop — the role `ndn-engine` plays in production: tick each protocol, supply a
+`DiscoveryContext` (neighbor table + `send_on`), and route `send_on` bytes to the
+peer's `on_inbound`. Node A advertises via the real `ServiceDiscoveryDirectory`;
+node B discovers it through the protocol's own tick-driven browse → rendezvous
+(not a shared instance), and B's directory returns A's record. This closes the
+earlier shared-instance caveat: the directory reads what the protocol learned
+*over the wire*.
+
 ### 3.3 Tier 2 — collaboration (`ndn-service`)
 
 Session-scoped many-to-many: sessions, role/key scopes, topic pub/sub, artifact
