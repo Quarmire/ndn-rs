@@ -3,7 +3,7 @@
 # the Validator must dispatch on SignatureType, not hardwire one
 # verifier.
 #
-# Finding:     docs/notes/spec-compliance-audit-2026-04-20.md § C.01
+# Finding:     testbed/EXPECTED_FAILURES.md § C.01
 # Severity:    BLOCKER
 # Spec ref:    NDN Packet Format v0.3 signature.html;
 #              ndn-cxx security/verification-helpers.cpp:222-246

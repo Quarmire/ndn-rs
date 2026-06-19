@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Witness recipe for audit finding G.04 — NLSR phase 0 skeleton in place.
 #
-# Finding:     docs/notes/spec-compliance-audit-2026-04-20.md § G.04
+# Finding:     testbed/EXPECTED_FAILURES.md § G.04
 # Severity:    MAJOR (skeleton only; full implementation tracked in
 #              docs/notes/nlsr-implementation-plan-2026-05-07.md)
 # Spec ref:    NLSR is the deployed NDN testbed routing protocol.

@@ -3,7 +3,7 @@
 # `KeyChain::sign_interest` hardcode `SignatureType::SignatureEd25519`
 # regardless of which `Signer` is actually wired in.
 #
-# Finding:     docs/notes/spec-compliance-audit-2026-04-20.md § C.06
+# Finding:     testbed/EXPECTED_FAILURES.md § C.06
 # Severity:    MAJOR
 # Spec ref:    NDN Packet Format v0.3 §6.3.2 — `SignatureType` MUST identify
 #              the algorithm used to compute `SignatureValue`. ndn-cxx derives

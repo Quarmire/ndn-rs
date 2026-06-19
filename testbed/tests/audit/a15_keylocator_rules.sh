@@ -2,7 +2,7 @@
 # Witness test for audit finding A.15 — KeyLocator presence/absence not
 # validated against SignatureType during SignatureInfo decode.
 #
-# Finding:     docs/notes/spec-compliance-audit-2026-04-20.md § A.15
+# Finding:     testbed/EXPECTED_FAILURES.md § A.15
 # Severity:    MAJOR
 # Spec ref:    NDN Packet Format v0.3 signature.html — KeyLocator table:
 #              DigestSha256 (0): KeyLocator forbidden.

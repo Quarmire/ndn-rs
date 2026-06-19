@@ -3,7 +3,7 @@
 # streams (`/localhost/nfd/<module>/notifications/<seq>`) are published
 # from live management events.
 #
-# Finding:     docs/notes/spec-compliance-audit-2026-04-20.md § E.05
+# Finding:     testbed/EXPECTED_FAILURES.md § E.05
 # Severity:    MAJOR (missing feature; subscriber-side parity with NFD)
 # Spec ref:    NFD `daemon/mgmt/face-manager.cpp:71`
 #              `m_postNotification = registerNotificationStream("events");`

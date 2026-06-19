@@ -3,7 +3,7 @@
 # verification use the same spec signed region after the
 # ParametersSha256DigestComponent is finalized.
 #
-# Finding:     docs/notes/spec-compliance-audit-2026-04-20.md § A.09
+# Finding:     testbed/EXPECTED_FAILURES.md § A.09
 # Severity:    BLOCKER (RESOLVED)
 # Spec ref:    NDN Packet Format v0.3 signed-interest.html — the signed
 #              region includes the Name without PSDC, InterestSignatureInfo,

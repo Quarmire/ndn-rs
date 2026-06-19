@@ -2,7 +2,7 @@
 # Witness test for audit finding C.17 — KeyChain::validator() uses
 # TrustSchema::hierarchical() as default, not accept_all().
 #
-# Finding:     docs/notes/spec-compliance-audit-2026-04-20.md § C.17
+# Finding:     testbed/EXPECTED_FAILURES.md § C.17
 # Severity:    MINOR (default API should be the safe choice)
 # Spec ref:    NFD Developer Guide §7 (trust anchors / validation policy);
 #              ndn-cxx/ndn-cxx/security/validation-policy-command-interest.hpp

@@ -2,7 +2,7 @@
 # Witness test for audit finding D.19 — PIT/FIB check-then-act race under
 # parallel pipeline (`pipeline_threads > 1`).
 #
-# Finding:     docs/notes/spec-compliance-audit-2026-04-20.md § D.19
+# Finding:     testbed/EXPECTED_FAILURES.md § D.19
 # Severity:    BLOCKER
 # Pre-fix bug:
 #   PitCheckStage::process did `with_entry_mut(...) → if None { insert(...) }`,

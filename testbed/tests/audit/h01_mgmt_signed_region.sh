@@ -3,7 +3,7 @@
 # the A.09 signed-region fix: the DigestSha256 sig_value must equal
 # SHA-256(signed_region) as reconstructed by Interest::signed_region().
 #
-# Finding:     docs/notes/spec-compliance-audit-2026-04-20.md § H.01
+# Finding:     testbed/EXPECTED_FAILURES.md § H.01
 # Severity:    BLOCKER (inherited from A.09)
 # Spec ref:    NDN Packet Format v0.3 signed-interest.html §5.3 — signed
 #              region = Name component TLVs (excl. PSDC) +

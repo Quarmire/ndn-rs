@@ -3,7 +3,7 @@
 # NDNLPv2 `PitToken` from the consumer's LP header, but the outbound
 # Data / Nack paths drop it instead of echoing it on the return wire.
 #
-# Finding:     docs/notes/spec-compliance-audit-2026-04-20.md § D.07
+# Finding:     testbed/EXPECTED_FAILURES.md § D.07
 # Severity:    MAJOR
 # Spec ref:    NDNLPv2 PitToken lifecycle. NFD `daemon/fw/forwarder.cpp:234`
 #              `data.setTag(interest.getTag<lp::PitToken>())`. The Nack

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Witness recipe for audit finding G.06 — EtherNeighborDiscovery wrapper.
 #
-# Finding:   docs/notes/spec-compliance-audit-2026-04-20.md § G.06
+# Finding:   testbed/EXPECTED_FAILURES.md § G.06
 # Severity:  RESOLVED 2026-05-08
 # Type:      RUST-UNIT
 #

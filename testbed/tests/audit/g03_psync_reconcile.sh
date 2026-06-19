@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Witness test for audit finding G.03 — PSync reconciliation correctness.
 #
-# Finding:     docs/notes/spec-compliance-audit-2026-04-20.md § G.03
+# Finding:     testbed/EXPECTED_FAILURES.md § G.03
 # Severity:    BLOCKER
 # Spec ref:    PSync/detail/iblt.cpp operator- (Eppstein peeling)
 # Witnesses:   Rust-only two-node reconciliation with N=5, N=20, and one

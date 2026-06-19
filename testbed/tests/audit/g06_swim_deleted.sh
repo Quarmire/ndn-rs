@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Witness recipe for audit finding G.06 — SWIM hello/ tree deleted.
 #
-# Finding:   docs/notes/spec-compliance-audit-2026-04-20.md § G.06
+# Finding:   testbed/EXPECTED_FAILURES.md § G.06
 # Type:      GREP-PROOF
 #
 # What this tests:

@@ -5,7 +5,7 @@
 # components, percent-escaping, …) end up as two separate state-vector
 # entries.
 #
-# Finding:     docs/notes/spec-compliance-audit-2026-04-20.md § G.02
+# Finding:     testbed/EXPECTED_FAILURES.md § G.02
 # Severity:    MAJOR (interop on typed-component NodeIDs)
 # Spec ref:    ndn-svs `common.hpp:41` `using NodeID = ndn::Name`;
 #              `version-vector.hpp:83` `std::map<NodeID, SeqNo>` —

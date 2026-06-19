@@ -2,7 +2,7 @@
 # Witness test for audit finding A.10 — `DataBuilder::build()` forges
 # `DigestSha256` by writing 32 zero bytes as the SignatureValue.
 #
-# Finding:     docs/notes/spec-compliance-audit-2026-04-20.md § A.10
+# Finding:     testbed/EXPECTED_FAILURES.md § A.10
 # Severity:    MAJOR
 # Spec ref:    NDN Packet Format v0.3 §6.3.2 "DigestSha256"; ndn-cxx
 #              `security/transform/digest-filter.cpp` (the only definition of

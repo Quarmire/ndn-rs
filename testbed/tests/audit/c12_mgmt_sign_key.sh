@@ -2,7 +2,7 @@
 # Interop witness for audit finding C.12 (testbed leg) — key-backed
 # command Interest accepted by NFD with rib.localhop_security.
 #
-# Finding:     docs/notes/spec-compliance-audit-2026-04-20.md § C.12
+# Finding:     testbed/EXPECTED_FAILURES.md § C.12
 # Severity:    BLOCKER for testbed NFD; BLOCKED-BY-INTEROP until this script exits 0
 # Spec ref:    NFD Developer Guide §7; NFD command-authenticator.cpp:122-207
 # Witness:     RUST-UNIT + INTEROP-SCRIPT — first proves the key-backed

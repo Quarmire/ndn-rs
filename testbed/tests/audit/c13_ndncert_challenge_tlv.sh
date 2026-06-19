@@ -3,7 +3,7 @@
 # parameters carried as JSON instead of TLV-encoded
 # ParameterKey/ParameterValue pairs.
 #
-# Finding:     docs/notes/spec-compliance-audit-2026-04-20.md § C.13
+# Finding:     testbed/EXPECTED_FAILURES.md § C.13
 # Severity:    BLOCKER
 # Spec ref:    NDNCERT 0.3 wiki §2.4.3 — CHALLENGE plaintext is a
 #              sequence of ParameterKey (0x85) / ParameterValue (0x87)

@@ -2,7 +2,7 @@
 # Witness test for audit finding C.12 — ndn-ctl (MgmtClient) command
 # Interests are signed with DigestSha256 InterestSignatureInfo.
 #
-# Finding:     docs/notes/spec-compliance-audit-2026-04-20.md § C.12
+# Finding:     testbed/EXPECTED_FAILURES.md § C.12
 # Severity:    MAJOR
 # Spec ref:    NFD Developer Guide §7 (RIB manager, command Interests);
 #              ndn-cxx/ndn-cxx/mgmt/nfd/controller.cpp:sendCommandInterest

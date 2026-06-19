@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Witness test for audit finding C.07 — cert naming.
 #
-# Finding:     docs/notes/spec-compliance-audit-2026-04-20.md § C.07
+# Finding:     testbed/EXPECTED_FAILURES.md § C.07
 # Severity:    BLOCKER
 # Spec ref:    ndn-cxx security/certificate.hpp:152-158
 #              MIN_CERT_NAME_LENGTH = 4; KEY_COMPONENT_OFFSET = -4.

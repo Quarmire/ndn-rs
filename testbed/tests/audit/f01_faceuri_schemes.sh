@@ -2,7 +2,7 @@
 # Witness test for audit findings F.01 / F.03 / F.06 — Face URI schemes
 # diverge from NFD's FaceUri registry.
 #
-# Finding:     docs/notes/spec-compliance-audit-2026-04-20.md § F.01 / F.03 / F.06
+# Finding:     testbed/EXPECTED_FAILURES.md § F.01 / F.03 / F.06
 # Severity:    MAJOR (mgmt FaceUri parsers reject malformed scheme strings)
 # Spec ref:    NFD `wiki/FaceUri` registry —
 #                udp4/udp6/tcp4/tcp6 (per IP family),

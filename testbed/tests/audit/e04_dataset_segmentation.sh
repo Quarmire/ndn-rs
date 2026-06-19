@@ -2,7 +2,7 @@
 # Witness test for audit finding E.04 — status datasets emitted as a
 # single Data instead of a versioned segment series.
 #
-# Finding:     docs/notes/spec-compliance-audit-2026-04-20.md § E.04
+# Finding:     testbed/EXPECTED_FAILURES.md § E.04
 # Severity:    BLOCKER
 # Spec ref:    ndn-cxx mgmt/dispatcher.cpp:282-297 +
 #              mgmt/status-dataset-context.cpp — segmented response with

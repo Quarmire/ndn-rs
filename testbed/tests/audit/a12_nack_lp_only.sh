@@ -3,7 +3,7 @@
 # invented "legacy bare Nack TLV (0x0320)" form that has no spec basis;
 # test helper build_nack emits this invented form.
 #
-# Finding:     docs/notes/spec-compliance-audit-2026-04-20.md § A.12, B.08
+# Finding:     testbed/EXPECTED_FAILURES.md § A.12, B.08
 # Severity:    MAJOR
 # Spec ref:    NDNLPv2 §3.5 — Nack is a per-hop header on an LpPacket
 #              carrying the Interest in its Fragment. 0x0320 is the Nack

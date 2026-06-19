@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Regression guard for D.12 dev-mode (validator_enabled = false).
 #
-# Finding:     docs/notes/spec-compliance-audit-2026-04-20.md § D.12
+# Finding:     testbed/EXPECTED_FAILURES.md § D.12
 # Severity:    RESOLVED 2026-05-08
 #
 # Confirms that the disabled-validator permissive path still sets

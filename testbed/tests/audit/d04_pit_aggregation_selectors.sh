@@ -4,7 +4,7 @@
 # but different selectors land in distinct PIT entries instead of
 # aggregating.
 #
-# Finding:     docs/notes/spec-compliance-audit-2026-04-20.md § D.04
+# Finding:     testbed/EXPECTED_FAILURES.md § D.04
 # Severity:    MAJOR (correctness — aggregation, freshness checks)
 # Spec ref:    NFD `daemon/table/pit-entry.cpp` `canMatch` — entry holds
 #              in-records (each with its own selectors); the key is the

@@ -3,7 +3,7 @@
 # macOS PF_NDRV, Windows Npcap) bind the NDN EtherType and multicast MAC
 # correctly.
 #
-# Finding:    docs/notes/spec-compliance-audit-2026-04-20.md § F.10
+# Finding:    testbed/EXPECTED_FAILURES.md § F.10
 # Severity:   RESOLVED 2026-05-19 (was MINOR-quality).
 # Type:       GREP-PROOF
 # Spec refs:  NFD source uses EtherType 0x8624 and multicast MAC

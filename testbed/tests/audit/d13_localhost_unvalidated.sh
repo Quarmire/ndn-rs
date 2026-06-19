@@ -3,7 +3,7 @@
 # blanket-skipped any `/localhost` Data, accepting forged
 # /localhost responses with no signature check.
 #
-# Finding:     docs/notes/spec-compliance-audit-2026-04-20.md § D.13
+# Finding:     testbed/EXPECTED_FAILURES.md § D.13
 # Severity:    MAJOR (security)
 # Spec ref:    NFD `daemon/mgmt/rib-manager.cpp:60,87,348-350`
 #              uses an explicit `m_localhostValidator` allowlist

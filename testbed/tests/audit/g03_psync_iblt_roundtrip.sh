@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Witness test for audit finding G.03 — PSync IBLT wire-format round-trip.
 #
-# Finding:     docs/notes/spec-compliance-audit-2026-04-20.md § G.03
+# Finding:     testbed/EXPECTED_FAILURES.md § G.03
 # Severity:    BLOCKER (BLOCKED-BY-INTEROP before this fix)
 # Spec ref:    PSync/detail/iblt.{hpp,cpp} — cell layout, hash seeds,
 #              sectioned table, zlib compression

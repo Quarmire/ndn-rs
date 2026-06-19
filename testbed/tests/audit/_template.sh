@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Witness test for audit finding <PHASE.NN> — <short title>.
 #
-# Finding:     see docs/notes/spec-compliance-audit-2026-04-20.md § <PHASE.NN>
+# Finding:     see testbed/EXPECTED_FAILURES.md § <PHASE.NN>
 # Severity:    BLOCKER | MAJOR | MINOR | DOCS
 # Spec ref:    <URL and clause>
 # Witnesses:   <one sentence: the specific wire event this script asserts>

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Witness test for audit finding G.03 — PSync live C++ interop.
 #
-# Finding:     docs/notes/spec-compliance-audit-2026-04-20.md § G.03
+# Finding:     testbed/EXPECTED_FAILURES.md § G.03
 # Severity:    BLOCKED-BY-INTEROP (this script discharges the marker when it exits 0)
 # Spec ref:    PSync/PSync/full-producer.{hpp,cpp}, consumer.{hpp,cpp}
 # Witnesses:   A C++ PSync FullProducer and a Rust Consumer converge on N

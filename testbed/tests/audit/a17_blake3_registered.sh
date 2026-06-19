@@ -3,7 +3,7 @@
 # documented as "experimental / pending assignment" when they are registered
 # on the NDN TLV registry (issue #12, closed).
 #
-# Finding:     docs/notes/spec-compliance-audit-2026-04-20.md § A.17
+# Finding:     testbed/EXPECTED_FAILURES.md § A.17
 # Severity:    MAJOR (was); reclassified DOCS after registration confirmed.
 # Spec ref:    NDN TLV SignatureType registry, issue #12 (closed);
 #              docs/wiki/src/reference/blake3-signature-spec.md §0.

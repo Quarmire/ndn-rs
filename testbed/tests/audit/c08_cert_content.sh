@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Witness test for audit finding C.08 — cert Content as DER SPKI.
 #
-# Finding:     docs/notes/spec-compliance-audit-2026-04-20.md § C.08
+# Finding:     testbed/EXPECTED_FAILURES.md § C.08
 # Severity:    BLOCKER
 # Spec ref:    ndn-cxx security/transform/public-key.cpp:101 (loadPkcs8)
 #              + RFC 8410 (Ed25519 SPKI).

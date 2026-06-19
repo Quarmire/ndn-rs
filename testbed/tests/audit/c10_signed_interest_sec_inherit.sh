@@ -2,7 +2,7 @@
 # Witness test for audit finding C.10 — ndn-security's signed Interest
 # path inherits the A.09 fix (signs over spec-correct two-range region).
 #
-# Finding:     docs/notes/spec-compliance-audit-2026-04-20.md § C.10
+# Finding:     testbed/EXPECTED_FAILURES.md § C.10
 # Severity:    BLOCKER (inherited A.09); RESOLVED with A.09
 # Spec ref:    signed-interest.html signed-region;
 #              ndn-cxx/ndn-cxx/interest.cpp:657-727 (extractSignedRanges,

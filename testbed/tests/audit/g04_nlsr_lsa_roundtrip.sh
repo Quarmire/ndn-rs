@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Witness recipe for G.04 partial — NLSR LSA TLV codec round-trip.
 #
-# Finding:     docs/notes/spec-compliance-audit-2026-04-20.md § G.04
+# Finding:     testbed/EXPECTED_FAILURES.md § G.04
 # Severity:    MAJOR (partial fix — LSA wire format only)
 # Spec ref:    NLSR/src/lsa/*.{hpp,cpp}, NLSR/tests/lsa/*.cpp
 #              TLV registry: NLSR/src/tlv-nlsr.hpp

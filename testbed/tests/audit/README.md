@@ -1,9 +1,11 @@
 # Audit Witness Tests
 
-One script per audit finding from
-[`docs/notes/spec-compliance-audit-2026-04-20.md`](../../../docs/notes/spec-compliance-audit-2026-04-20.md).
+One script per audit finding, tracked in
+[`testbed/EXPECTED_FAILURES.md`](../../EXPECTED_FAILURES.md) (the shipped tracker
+that maps each witness to its finding and expected outcome). The detailed
+internal master-audit note is not shipped in this repository.
 
-The audit lists each finding with a severity, a file-line
+The tracker lists each finding with a severity, a file-line
 citation, and a spec reference. Each finding that can be
 observed as a wire-level event has a matching script in this
 directory named `<phase><number>_<slug>.sh` (e.g. `a01_blake3_name_component.sh`

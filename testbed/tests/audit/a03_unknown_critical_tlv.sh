@@ -2,7 +2,7 @@
 # Witness test for audit findings A.03 / A.04 / N.04 — body-level decoders
 # silently skip unknown critical TLVs and do not enforce element ordering.
 #
-# Finding:     docs/notes/spec-compliance-audit-2026-04-20.md § A.03 / A.04
+# Finding:     testbed/EXPECTED_FAILURES.md § A.03 / A.04
 #              docs/notes/spec-compliance-cross-reference-2026-05-01.md § N.04
 # Severity:    MAJOR
 # Spec ref:    NDN Packet Format v0.3 `tlv.html` §"TLV-TYPE" — types 0..31 are

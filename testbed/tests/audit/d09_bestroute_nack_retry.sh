@@ -3,7 +3,7 @@
 # Nack-retry hook, so an Interest whose first upstream Nacks is dropped
 # instead of retried on another FIB nexthop.
 #
-# Finding:     docs/notes/spec-compliance-audit-2026-04-20.md § D.09
+# Finding:     testbed/EXPECTED_FAILURES.md § D.09
 # Severity:    MAJOR
 # Spec ref:    NFD `daemon/fw/best-route-strategy.cpp` `afterReceiveNack`
 #              → `processNack` switches upstreams when one returns Nack.

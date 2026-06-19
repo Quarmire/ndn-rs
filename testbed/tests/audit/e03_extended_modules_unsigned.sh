@@ -4,7 +4,7 @@
 # `measurements`, `config`, `log`) accept unsigned commands when the
 # operator-level `require_signed_commands` flag is `false`.
 #
-# Finding:     docs/notes/spec-compliance-audit-2026-04-20.md § E.03
+# Finding:     testbed/EXPECTED_FAILURES.md § E.03
 # Severity:    MAJOR (privilege escalation surface)
 # Spec ref:    NFD's canonical management surface only includes
 #              `faces`, `fib`, `rib`, `cs`, `strategy-choice`, `status`

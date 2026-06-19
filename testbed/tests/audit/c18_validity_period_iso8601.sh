@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Witness test for audit finding C.18 — ValidityPeriod ISO-8601 form.
 #
-# Finding:     docs/notes/spec-compliance-audit-2026-04-20.md § C.18
+# Finding:     testbed/EXPECTED_FAILURES.md § C.18
 # Severity:    BLOCKER
 # Spec ref:    ndn-cxx security/validity-period.cpp:29 (ISO_DATETIME_SIZE
 #              = 15) + util/time.cpp::toIsoString.

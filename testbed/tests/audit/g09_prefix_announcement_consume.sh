@@ -3,7 +3,7 @@
 # (TLV-TYPE 0x0350) header decoded by `LpPacket::decode` but never
 # surfaced into the engine pipeline for downstream consumers.
 #
-# Finding:     docs/notes/spec-compliance-audit-2026-04-20.md § G.09
+# Finding:     testbed/EXPECTED_FAILURES.md § G.09
 # Severity:    MAJOR
 # Spec ref:    NFD `daemon/fw/self-learning-strategy.cpp:122-245`
 #              reads `data.getTag<lp::PrefixAnnouncementTag>()` and

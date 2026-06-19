@@ -207,7 +207,7 @@ generated Nacks on multi-access/ad-hoc ingress faces, ignores incoming Nacks
 from shared-medium faces, and skips Nack propagation to shared-medium
 downstream in-records.
 
-`ValidationStage` sets `ctx.verified = true` on the valid path. `CsInsertStage` gates on `ctx.verified` — unverified Data is never cached. Local-face Data is trusted by the OS-level IPC credential and also sets `ctx.verified`. When `validator_enabled = false`, the validator is permissive and still sets `ctx.verified` so the CS admission invariant holds in dev mode.
+`ValidationStage` sets `ctx.verified = true` on the valid path. `CsInsertStage` gates on `ctx.verified` — unverified Data is never cached. Local-face Data is trusted by the OS-level IPC credential and also sets `ctx.verified`. When the validator is disabled or absent (`validator_enabled = false`, the wasm/dev path), `ValidationStage` is **fail-secure**: it leaves `ctx.verified = false`, so the Data still satisfies its pending Interest (it is forwarded) but is **never admitted to the Content Store**. This is stricter than NFD, which caches unverified Data. (The D.12 test `d12_disabled_validator_does_not_verify_network_data` pins this.)
 
 ## Core Data Structures
 
@@ -639,10 +639,8 @@ can run without a real browser.
 ## Design Docs
 
 Current user-facing docs live in [`docs/wiki/src/`](docs/wiki/src/).
-Pre-v0.1 design essays that were archived during the documentation
-rewrite live under `.claude/docs-archive-pre-v0.1.0/` and
-`.claude/wiki-archive-pre-v0.1.0/`; treat them as design history, not
-current behavior.
+Pre-v0.1 design essays and internal design doctrine are not shipped in
+this repository.
 
 | Document | Contents |
 |---|---|
@@ -650,8 +648,8 @@ current behavior.
 | [`docs/wiki/src/reference/spec-compliance.md`](docs/wiki/src/reference/spec-compliance.md) | Reader-facing map to audit witnesses and release blockers |
 | [`docs/wiki/src/releases/v0.1.0.md`](docs/wiki/src/releases/v0.1.0.md) | Candidate v0.1.0 stability boundary |
 | [`docs/specs/`](docs/specs/) | ndn-rs-specific wire specs and extension TLVs |
-| [`docs/compute.md`](docs/compute.md) | In-network compute: tiered API, determinism, wire spec |
-| [`docs/coding.md`](docs/coding.md) | Network coding: F1 FEC, CodedProducer/CodedFetcher, wire spec |
-| [`docs/abe.md`](docs/abe.md) | Attribute-based encryption extension notes |
-| [`docs/cclf.md`](docs/cclf.md) | CCLF strategy notes |
-| [`docs/doctrine/`](docs/doctrine/) | Design doctrine notes that are still intentionally retained |
+
+The in-network-compute, network-coding (FEC), and CCLF strategy subsystems
+live in the separate [`ndn-ext`](https://github.com/Quarmire/ndn-ext) repository
+and are documented there. Attribute-based encryption ships in this repository as
+the optional `abe` feature of `ndn-security` (see that crate's module docs).

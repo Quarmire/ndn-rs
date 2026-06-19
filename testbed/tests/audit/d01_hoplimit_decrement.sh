@@ -2,7 +2,7 @@
 # Witness test for audit findings D.01 / I.09 — HopLimit not decremented
 # on the incoming forwarder pipeline.
 #
-# Finding:     docs/notes/spec-compliance-audit-2026-04-20.md § D.01
+# Finding:     testbed/EXPECTED_FAILURES.md § D.01
 # Severity:    BLOCKER
 # Spec ref:    NFD `daemon/fw/forwarder.cpp:104-111`; ndnd
 #              `fw/fw/thread.go:190-195` — both decrement HopLimit on

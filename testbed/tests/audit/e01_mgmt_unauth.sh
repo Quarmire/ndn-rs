@@ -3,7 +3,7 @@
 # dispatched without signature verification, and the missing
 # Validator::validate_interest path.
 #
-# Finding:     docs/notes/spec-compliance-audit-2026-04-20.md § E.01 + § C.11
+# Finding:     testbed/EXPECTED_FAILURES.md § E.01 + § C.11
 # Severity:    BLOCKER (E.01) / MAJOR (C.11)
 # Spec ref:    NFD daemon/mgmt/command-authenticator.cpp:127,194,244;
 #              ndn-cxx mgmt/dispatcher.cpp:166-185;

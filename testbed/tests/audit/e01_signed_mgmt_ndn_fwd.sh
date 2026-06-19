@@ -2,7 +2,7 @@
 # Live interop witness for audit finding E.01 — default-on signed-command
 # enforcement in ndn-fwd with a real identity rig.
 #
-# Finding:     docs/notes/spec-compliance-audit-2026-04-20.md § E.01
+# Finding:     testbed/EXPECTED_FAILURES.md § E.01
 # Severity:    RESOLVED 2026-05-07 (testbed leg)
 # Spec ref:    NFD Developer Guide §7; NFD daemon/mgmt/command-authenticator.cpp
 # Witness:     INTEROP-SCRIPT — boots ndn-fwd with require_signed_commands=true

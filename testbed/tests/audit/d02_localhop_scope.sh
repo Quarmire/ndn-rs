@@ -2,7 +2,7 @@
 # Witness test for audit findings D.02 / I.11 — `/localhop` scope
 # unenforced.
 #
-# Finding:     docs/notes/spec-compliance-audit-2026-04-20.md § D.02
+# Finding:     testbed/EXPECTED_FAILURES.md § D.02
 # Severity:    MAJOR
 # Spec ref:    NFD `daemon/fw/scope-prefix.hpp:46-58` (LOCALHOP);
 #              `daemon/fw/algorithm.cpp:45-49` wouldViolateScope rule.

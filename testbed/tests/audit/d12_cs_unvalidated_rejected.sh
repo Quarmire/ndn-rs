@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Witness test for audit finding D.12 — ContentStore admits unvalidated Data.
 #
-# Finding:     docs/notes/spec-compliance-audit-2026-04-20.md § D.12
+# Finding:     testbed/EXPECTED_FAILURES.md § D.12
 # Severity:    MAJOR (RESOLVED 2026-05-08)
 # Spec ref:    NFD daemon/fw/forwarder.cpp:322,404 — CS insert follows PIT
 #              match; validation drives whether the packet reaches that point.

@@ -3,7 +3,7 @@
 # inherits the A.09 signed-region fix and the C.06 sig_type fix.
 # The signed region must be non-empty and the signature must verify.
 #
-# Finding:     docs/notes/spec-compliance-audit-2026-04-20.md § H.10
+# Finding:     testbed/EXPECTED_FAILURES.md § H.10
 # Severity:    BLOCKER (inherited from A.09 / C.06)
 # Spec ref:    NDN Packet Format v0.3 signed-interest.html §5.3 — signed
 #              region = Name component TLVs (excl. PSDC) +

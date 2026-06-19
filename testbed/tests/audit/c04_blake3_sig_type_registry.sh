@@ -2,7 +2,7 @@
 # Witness test for audit finding C.04 — BLAKE3 SignatureType codes 6/7
 # officially registered on the NDN TLV registry.
 #
-# Finding:     docs/notes/spec-compliance-audit-2026-04-20.md § C.04
+# Finding:     testbed/EXPECTED_FAILURES.md § C.04
 # Severity:    MAJOR (was); now DOCS
 # Spec ref:    NDN TLV SignatureType registry issue #12 (closed);
 #              ndn-cxx/ndn-cxx/security/impl/openssl-helper.hpp —

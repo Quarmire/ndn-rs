@@ -3,7 +3,7 @@
 # schemas that use user functions ($eq, $regex) instead of loading
 # them silently.
 #
-# Finding:     docs/notes/spec-compliance-audit-2026-04-20.md § C.16
+# Finding:     testbed/EXPECTED_FAILURES.md § C.16
 # Severity:    MAJOR (fail-unsafe by default)
 # Spec ref:    LightVerSec binary format (python-ndn docs);
 #              ndnd/std/security/trust_schema/lvs.go — user functions

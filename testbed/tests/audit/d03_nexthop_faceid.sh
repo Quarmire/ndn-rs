@@ -3,7 +3,7 @@
 # (NDNLPv2 0x0330) decoded into `ctx.tags` but never consulted by the
 # strategy stage.
 #
-# Finding:     docs/notes/spec-compliance-audit-2026-04-20.md § D.03
+# Finding:     testbed/EXPECTED_FAILURES.md § D.03
 # Severity:    MAJOR
 # Spec ref:    NFD `daemon/fw/forwarder.cpp:205-218` — when the
 #              `NextHopFaceIdTag` is present, `Forwarder::onContentStoreMiss`

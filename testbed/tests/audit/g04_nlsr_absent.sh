@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Witness recipe for audit finding G.04 — NLSR implemented in ndn-rs.
 #
-# Finding:     docs/notes/spec-compliance-audit-2026-04-20.md § G.04
+# Finding:     testbed/EXPECTED_FAILURES.md § G.04
 # Severity:    RESOLVED 2026-05-08
 # Spec ref:    NLSR is the deployed NDN testbed routing protocol.
 # Witness:     GREP-PROOF — passes when the NlsrProtocol surface exists

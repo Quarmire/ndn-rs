@@ -5,7 +5,7 @@
 # + reliably-tracked LP packet cannot represent both fields because the
 # encoder uses one slot for both purposes.
 #
-# Finding:     docs/notes/spec-compliance-audit-2026-04-20.md § B.01 + B.09
+# Finding:     testbed/EXPECTED_FAILURES.md § B.01 + B.09
 # Severity:    BLOCKER
 # Spec ref:    NDNLPv2 Link-Layer Reliability;
 #              ndn-cxx lp/tlv.hpp:39,51 (Sequence=81, TxSequence=840);

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Witness recipe for audit finding C.13 — NDNCERT 0.3 live CA interop.
 #
-# Finding:     docs/notes/spec-compliance-audit-2026-04-20.md § C.13
+# Finding:     testbed/EXPECTED_FAILURES.md § C.13
 # Severity:    BLOCKER / BLOCKED-BY-INTEROP (8 wire-format gaps now fixed)
 #
 # What this script tests:

@@ -2,7 +2,7 @@
 # Witness test for audit findings A.02 / A.21 —
 # `ParametersSha256DigestComponent` (PSDC) structural validation missing.
 #
-# Finding:     docs/notes/spec-compliance-audit-2026-04-20.md § A.02 / A.21
+# Finding:     testbed/EXPECTED_FAILURES.md § A.02 / A.21
 # Severity:    MAJOR
 # Spec ref:    NDN Packet Format v0.3 `name.html#parameters-digest-component`
 #              and `signed-interest.html`. ndn-cxx `interest.cpp:171-173,303,

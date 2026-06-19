@@ -2,7 +2,7 @@
 # Witness test for audit finding C.01 — RSA-SHA256 and ECDSA-SHA256
 # verifiers are implemented and wired into verify_by_sig_type.
 #
-# Finding:     docs/notes/spec-compliance-audit-2026-04-20.md § C.01
+# Finding:     testbed/EXPECTED_FAILURES.md § C.01
 # Severity:    MAJOR; RESOLVED 2026-05-07
 # Spec ref:    NDN Packet Format Spec §3 (SignatureType); ndn-cxx
 #              security/verification-helpers.cpp:222-246

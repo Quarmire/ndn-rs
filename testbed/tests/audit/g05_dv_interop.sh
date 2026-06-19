@@ -2,7 +2,7 @@
 # Witness recipe for audit finding G.05 — ndn-dv interop with ndnd's
 # `dv run` daemon (the reference implementation).
 #
-# Finding:     docs/notes/spec-compliance-audit-2026-04-20.md § G.05
+# Finding:     testbed/EXPECTED_FAILURES.md § G.05
 # Severity:    MAJOR / BLOCKED-BY-INTEROP
 # Spec:        ~/Documents/Dev/ndnd/dv/SPEC.md
 #

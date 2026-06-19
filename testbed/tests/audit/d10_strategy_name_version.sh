@@ -3,7 +3,7 @@
 # `VersionNameComponent` (TLV 0x36) suffix that NFD requires for
 # `nfdc strategy-choice set`.
 #
-# Finding:     docs/notes/spec-compliance-audit-2026-04-20.md § D.10 / E.06
+# Finding:     testbed/EXPECTED_FAILURES.md § D.10 / E.06
 # Severity:    MAJOR (D.10) / MINOR (E.06 alias)
 # Spec ref:    NFD `daemon/fw/best-route-strategy.cpp:56`
 #              `Name("/localhost/nfd/strategy/best-route").appendVersion(5)`;

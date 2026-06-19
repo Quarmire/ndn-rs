@@ -2,7 +2,7 @@
 # Witness test for audit finding C.14 — NDNCERT 0.3 `ErrorCode` variant
 # names diverge from the canonical wiki spec.
 #
-# Finding:     docs/notes/spec-compliance-audit-2026-04-20.md § C.14
+# Finding:     testbed/EXPECTED_FAILURES.md § C.14
 # Severity:    MAJOR (numeric codes correct; symbolic names wrong)
 # Spec ref:    NDNCERT 0.3 protocol wiki
 #              `github.com/named-data/ndncert/wiki/NDNCERT-Protocol-0.3`.

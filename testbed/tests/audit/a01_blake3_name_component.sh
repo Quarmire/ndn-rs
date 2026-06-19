@@ -2,7 +2,7 @@
 # Witness test for audit finding A.01 — `BLAKE3_DIGEST` TLV-TYPE 0x03
 # name-component squat.
 #
-# Finding:     docs/notes/spec-compliance-audit-2026-04-20.md § A.01
+# Finding:     testbed/EXPECTED_FAILURES.md § A.01
 # Severity:    BLOCKER (RESOLVED 2026-05-01)
 # Spec ref:    NDN Packet Format v0.3 types.html + tlv.html §"TLV-TYPE" —
 #              "Types 0-31 are grandfathered as critical regardless of LSB.

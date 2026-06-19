@@ -5,7 +5,7 @@
 # NOT present in the current implementation — making the gap mechanically
 # visible until the v0.2 spec-aligned implementation lands.
 #
-# Finding:    docs/notes/spec-compliance-audit-2026-04-20.md § G.05
+# Finding:    testbed/EXPECTED_FAILURES.md § G.05
 # Follow-up:  docs/notes/dvr-ndnd-alignment-NEXT.md (v0.2 implementation plan)
 # Severity:   MAJOR (revised 2026-05-19 from MINOR; current impl uses
 #             non-spec TLV codes 0xD0-0xD4 instead of the spec's 201/202/
