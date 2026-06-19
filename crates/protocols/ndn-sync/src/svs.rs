@@ -6,6 +6,25 @@ use ndn_packet::Name;
 
 pub use crate::svs_local::StateEntry;
 
+/// Ceiling on distinct producers tracked in the local state vector (audit
+/// SY-1). Under the accept-all default validator a peer can pack a Sync Interest
+/// with thousands of fabricated producer names; this bounds the map so it can't
+/// grow without limit. Generous — far above any realistic group size — and
+/// existing producers always update even at the cap.
+pub(crate) const MAX_TRACKED_PRODUCERS: usize = 16_384;
+
+/// Maximum publications a single `merge` will advertise as a gap for one
+/// producer (audit SY-2). A forged state-vector entry with `SeqNo = u64::MAX`
+/// would otherwise yield an unbounded `(1, u64::MAX)` fetch range. Catch-up to a
+/// legitimately-large seq still completes — it just proceeds in bounded chunks
+/// across successive sync rounds (the slot advances only to the clamped high).
+pub(crate) const MAX_GAP_SPAN: u64 = 1 << 16;
+
+/// Clamp a `[low, high]` fetch range so it spans at most [`MAX_GAP_SPAN`].
+fn clamp_gap_high(low: u64, high: u64) -> u64 {
+    high.min(low.saturating_add(MAX_GAP_SPAN - 1))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StateVectorEntry {
     /// URI rendering of the node's NDN name.
@@ -98,17 +117,29 @@ impl SvsNode {
             if entry.name == self.local_name {
                 continue;
             }
+            // SY-1: bound the number of tracked producers. A new producer is
+            // ignored once the cap is hit; producers we already track still
+            // advance, so a flood of fabricated names can't grow the map.
+            if !map.contains_key(&entry.name) && map.len() >= MAX_TRACKED_PRODUCERS {
+                continue;
+            }
             let slot = map.entry(entry.name.clone()).or_insert((0, 0));
             let (lb, ls) = *slot;
             if entry.boot > lb {
-                // Peer (re)started with a newer boot: fetch its whole run.
+                // Peer (re)started with a newer boot: fetch its whole run, but
+                // clamp the advertised span (SY-2) and advance the slot only to
+                // the clamped high so legit catch-up continues next round.
                 if entry.seq >= 1 {
-                    gaps.push((entry.name.to_string(), 1, entry.seq));
+                    let high = clamp_gap_high(1, entry.seq);
+                    gaps.push((entry.name.to_string(), 1, high));
+                    *slot = (entry.boot, high);
+                } else {
+                    *slot = (entry.boot, entry.seq);
                 }
-                *slot = (entry.boot, entry.seq);
             } else if entry.boot == lb && entry.seq > ls {
-                gaps.push((entry.name.to_string(), ls + 1, entry.seq));
-                slot.1 = entry.seq;
+                let high = clamp_gap_high(ls + 1, entry.seq);
+                gaps.push((entry.name.to_string(), ls + 1, high));
+                slot.1 = high;
             }
         }
         gaps
@@ -181,6 +212,29 @@ mod tests {
         assert_eq!(node.advance().await, 1);
         assert_eq!(node.advance().await, 2);
         assert_eq!(node.local_seq().await, 2);
+    }
+
+    #[tokio::test]
+    async fn sy2_forged_max_seq_yields_bounded_gap() {
+        let node = SvsNode::new(&name("a"));
+        let gaps = node.merge(&[e("/b", u64::MAX)]).await;
+        assert_eq!(gaps.len(), 1);
+        // The advertised range is clamped to MAX_GAP_SPAN, not (1, u64::MAX).
+        assert_eq!(gaps[0], ("/b".to_string(), 1, MAX_GAP_SPAN));
+        // Next round continues from the clamped high (incremental catch-up).
+        let gaps2 = node.merge(&[e("/b", u64::MAX)]).await;
+        assert_eq!(gaps2[0].1, MAX_GAP_SPAN + 1);
+    }
+
+    #[tokio::test]
+    async fn sy1_fabricated_producers_are_capped() {
+        let node = SvsNode::new(&name("a"));
+        let flood: Vec<StateEntry> = (0..(MAX_TRACKED_PRODUCERS + 500))
+            .map(|i| e(&format!("/p{i}"), 1))
+            .collect();
+        node.merge(&flood).await;
+        // local ("a") + at most MAX_TRACKED_PRODUCERS foreign producers.
+        assert!(node.snapshot().await.len() <= MAX_TRACKED_PRODUCERS + 1);
     }
 
     #[tokio::test]

@@ -63,10 +63,17 @@ impl WireDialect {
     /// Decode a state vector into `StateEntry`s. V2 entries carry
     /// `boot = 0`.
     pub fn decode_state_vector(self, bytes: &Bytes) -> Option<Vec<StateEntry>> {
-        match self {
+        let entries = match self {
             WireDialect::V2 => decode_v2(bytes),
             WireDialect::V3 => decode_svs_data(bytes).ok(),
+        }?;
+        // SY-1: reject an abusively large state vector up front, before it reaches
+        // `merge`. (Frame caps already bound a single Interest, so this is
+        // defence-in-depth.)
+        if entries.len() > crate::svs::MAX_TRACKED_PRODUCERS {
+            return None;
         }
+        Some(entries)
     }
 }
 
