@@ -539,11 +539,16 @@ a bespoke profiler.
    / `RandomSelection` / `AllSelected` (unit-witnessed multi-provider), and the
    driver's `select_and_call` collects ACKs over a window and honors the
    strategy (the plain `call` remains the single-provider `FirstResponding`
-   convenience). **Remaining for full fidelity:** the Targeted fast path
-   (`RequestMode::Targeted`, token-pool) and the policy-file model
-   (ProviderPolicy/UserPolicy → `KpAuthority` grants); plus app-layer per-message
-   trust validation (the trust half of NSF-A3) and the unsigned-discovery
-   posture (NSF-A4).
+   convenience). **Targeted fast path landed** (`bootstrap_targeted` issues a
+   token pool; `call_targeted` invokes a provider directly, REQUEST→RESPONSE, no
+   ACK/SELECTION; invalid token fails closed — `targeted_over_svs` witness).
+   **Policy-file model landed** (`policy`): a TOML `ServicePolicy`
+   (providers/users + `allowed_services`) compiles each principal's services
+   into the OR-join KP-ABE policy and grants it on the `KpAuthority`
+   (`apply_to`). **Remaining for full fidelity:** app-layer per-message trust
+   validation (the trust half of NSF-A3, complementary to `SvsPubSub` signing),
+   the unsigned-discovery posture (NSF-A4), and the F1/F2 callback/log runtime
+   semantics.
 6. v2: `ndn-service` (Tier-1 selection + Tier-2 collab, authority-as-signed-Data).
 
 ---
