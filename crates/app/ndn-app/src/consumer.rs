@@ -148,6 +148,9 @@ impl CongestionStrategy {
     }
 }
 
+/// Express Interests and fetch `Data`. Most apps use [`Node`](crate::Node)
+/// (`node.fetch` / `node.object`); reach for `Consumer` for a custom connection
+/// or congestion strategy.
 pub struct Consumer {
     conn: Arc<dyn Connection>,
     cc_strategy: CongestionStrategy,

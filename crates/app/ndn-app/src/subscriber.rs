@@ -54,6 +54,9 @@ impl Default for SubscriberConfig {
     }
 }
 
+/// A sync-group subscriber (SVS pub/sub). Most apps obtain one via
+/// [`Node::subscribe`](crate::Node::subscribe) rather than constructing it
+/// directly.
 pub struct Subscriber {
     sample_rx: mpsc::Receiver<Sample>,
     _cancel: tokio_util::sync::CancellationToken,

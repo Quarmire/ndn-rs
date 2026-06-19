@@ -27,6 +27,9 @@ use crate::responder::Responder;
 /// can't link ndn-ipc) shares the same value.
 const DEFAULT_SEGMENT_SIZE: usize = 8192;
 
+/// Register a prefix and serve `Data`. Most apps use [`Node`](crate::Node)
+/// (`node.serve` / `node.serve_object`); reach for `Producer` for signed
+/// serving or the lower-level serve loop.
 pub struct Producer {
     conn: Arc<dyn Connection>,
     prefix: Name,

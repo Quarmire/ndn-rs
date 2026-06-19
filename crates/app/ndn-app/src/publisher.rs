@@ -46,6 +46,9 @@ impl Default for PublisherConfig {
 /// A sync-group publisher. Holds the [`SvSync`](ndn_sync::SvSync) data plane
 /// alive (it serves subscribers' fetch Interests from the local store) and
 /// exposes [`put`](Self::put) to publish.
+///
+/// Most apps obtain one via [`Node::publish`](crate::Node::publish) rather than
+/// constructing it directly.
 pub struct Publisher {
     svsync: Arc<ndn_sync::SvSync>,
     local_name: Name,

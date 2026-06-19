@@ -6,18 +6,24 @@
 //! `ndn-strategy`, `ndn-face-native` directly.
 //!
 //! The crates.io package is `ndn-rs-prelude` but the library is named
-//! `ndn`, so user code writes `use ndn::Consumer;`.
+//! `ndn`, so user code writes `use ndn::Node;`.
+//!
+//! For most apps the one type to learn is [`Node`](ndn_app::Node): a single
+//! handle that exposes every pattern — `fetch` / `serve` / `object` / `publish`
+//! / `subscribe` / `query` — over one forwarder connection. The per-pattern
+//! types (`Consumer`, `Producer`, …) remain available as building blocks.
 //!
 //! ```no_run
 //! use ndn::prelude::*;
+//! use ndn::Node;
 //!
 //! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-//! let keychain = KeyChain::ephemeral("/example")?;
+//! let node = Node::connect("/run/nfd/nfd.sock").await?;
 //! // Decide trust once with `verifying`; then `fetch` returns `SafeData` —
-//! // proof the signature checked out. (Bare `Consumer::fetch` is unverified.)
-//! let mut consumer = Consumer::connect("/run/nfd/nfd.sock").await?.verifying(keychain.validator());
-//! let safe = consumer.fetch("/example/data").await?;
-//! # Ok(()) }
+//! // proof the signature checked out. (Bare `node.fetch` is unverified.)
+//! let keychain = KeyChain::ephemeral("/example")?;
+//! let safe = node.verifying(keychain.validator()).fetch("/example/data").await?;
+//! # let _ = safe; Ok(()) }
 //! ```
 //!
 //! On `wasm32-unknown-unknown` only the packet and security surface is

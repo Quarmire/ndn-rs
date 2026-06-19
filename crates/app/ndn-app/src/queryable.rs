@@ -32,6 +32,9 @@ impl Query {
     }
 }
 
+/// A request/reply responder: answer Interests under a prefix as an explicit
+/// stream of [`Query`] objects. Most apps obtain one via
+/// [`Node::query`](crate::Node::query) rather than constructing it directly.
 pub struct Queryable {
     conn: Arc<dyn Connection>,
     prefix: Name,
