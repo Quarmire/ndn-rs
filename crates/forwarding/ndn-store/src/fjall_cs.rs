@@ -21,6 +21,24 @@ use crate::{ContentStore, CsCapacity, CsEntry, CsMeta, InsertResult};
 
 /// Persistent CS. `max_bytes` bounds *logical* Data bytes (excludes LSM
 /// overhead); data survives process restarts.
+///
+/// **Known limitations vs [`SqliteCs`](crate::sqlite_cs::SqliteCs) (audit
+/// CS-1/CS-2/CS-3).** This backend trades eviction quality for LSM write
+/// throughput, and for production durability where cache quality matters the
+/// **SQLite backend is recommended** (it implements true LRU with race-free
+/// accounting under a single mutex):
+/// - **CS-1:** [`evict_to_fit`](Self::evict_to_fit) evicts in NDN key
+///   (lexicographic) order, not by recency — degenerate hit-rate, and a
+///   cache-pinning vector (an adversary holding valid signed Data with
+///   low-sorting names can keep hot, low-sorting entries as the eviction
+///   victims). Admission is still fail-secure, so only validated Data is
+///   cached, and memory stays bounded by `max_bytes`.
+/// - **CS-2:** byte/entry accounting uses plain atomics around a concurrent
+///   keyspace, so the byte cap can drift under concurrent insert to the same key.
+/// - **CS-3:** eviction full-scans the keyspace, so sustained insert at capacity
+///   is O(N) per insert.
+///
+/// A recency-indexed rewrite (matching `SqliteCs`) is tracked as follow-up.
 pub struct FjallCs {
     keyspace: fjall::Keyspace,
     // Held to keep the database open for `keyspace`'s lifetime; never read directly.

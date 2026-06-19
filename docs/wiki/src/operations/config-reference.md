@@ -37,6 +37,13 @@ Absent file → defaults from `ndn-config`.
 | `admission_policy` | `default` | `default` (PIT-bound) or `admit-all`. |
 | `unsolicited_policy` | `drop-all` | Caching of Data with no pending PIT entry: `drop-all`, `admit-local`, `admit-network`, `admit-all`. Use `admit-network` on a broadcast/ad-hoc bearer. |
 
+**Persistent backends (feature-gated).** For a CS that survives restarts, prefer
+the **SQLite backend** in production: it implements true LRU eviction with
+race-free byte/entry accounting. The fjall (LSM) backend currently evicts in NDN
+key order rather than by recency, its accounting can drift under concurrent
+insert, and eviction is O(N) per insert (a recency-indexed rewrite is tracked).
+In-memory `lru` / `sharded-lru` remain the default and are unaffected.
+
 ## `[mgmt]` — management plane
 
 | Key | Default | Use |
