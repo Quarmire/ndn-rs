@@ -619,8 +619,12 @@ A service is definable three ways, all over the same protocol:
 > - The closure handler is **sync `&Bytes -> Bytes`** — the real ceiling (typed
 >   `Req`/`Resp`, `async`, error returns, multi-method) is exactly the gap mode 2
 >   fills; mode 1 is the floor it builds on.
-> - A role **owns one `SvsPubSub`**; a node vending *several* services over one
->   engine wants a `ServiceNode` that mints roles sharing the group — a v2 item.
+> - A role owns one `SvsPubSub`; a node vending *several* services over one
+>   engine wants a `ServiceNode` that mints roles sharing the group. **Built**
+>   (`ServiceNode::provider`/`user` over one `Arc<SvsPubSub>`); this surfaced a
+>   latent driver gap — `serve_provider` did not filter by `serviceName`, so
+>   co-located services would cross-answer. Now the driver routes each REQUEST/
+>   SELECTION to the provider serving its service (witness `service_node_multi`).
 >
 > _TODO (add when mode 2/3 land): the same echo service as a `#[ndn_service]` trait
 > and a Python decorator, shown interoperating on the wire with mode 1._
@@ -648,7 +652,8 @@ dynamic handlers run in the fuel-metered wasm sandbox (`ndn-compute`'s
 ### 11.5 What exists vs planned
 
 - **Exists, tested:** the **role surface** (`ndn-ndnsf::roles` —
-  `ServiceProvider`/`ServiceUser`, mode 1, `roles_ergonomics` witness); typed
+  `ServiceProvider`/`ServiceUser` + `ServiceNode` for multi-service-per-engine,
+  mode 1, `roles_ergonomics` / `service_node_multi` witnesses); typed
   handler/registry (`ndn-rpc`, `ndn-compute`); KP-ABE policy backing
   (`ndn-nacabe::KpAuthority`); wasm sandbox (`ndn-compute`).
 - **Planned:** the `#[ndn_service]` proc-macro (mode 2, over the role surface);
