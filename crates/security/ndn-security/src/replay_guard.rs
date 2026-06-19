@@ -16,6 +16,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 #[cfg(not(target_arch = "wasm32"))]
@@ -119,6 +120,9 @@ struct KeyState {
     /// Monotonic floor for `sig_time`; any equal-or-lower timestamp is a
     /// replay if the policy is `Monotonic`.  Sticky.
     max_time: Option<u64>,
+    /// Monotonic access tick, for evicting the least-recently-used key when the
+    /// global key map hits its cap (audit D-3).
+    last_seen: u64,
 }
 
 impl KeyState {
@@ -127,6 +131,7 @@ impl KeyState {
             records: VecDeque::with_capacity(16),
             max_seq: None,
             max_time: None,
+            last_seen: 0,
         }
     }
 }
@@ -143,6 +148,14 @@ pub enum ReplayCheck {
     NoAntiReplayFields,
 }
 
+/// Default ceiling on the number of distinct signer keys tracked (audit D-3).
+/// `check` runs *before* signature verification, so an attacker can emit
+/// signed-*looking* Interests with distinct KeyLocators (no valid signature
+/// required) and mint a fresh `KeyState` per fingerprint, growing the map
+/// without bound. This caps it; legitimate forwarders rarely see this many
+/// distinct signers, and overflow evicts the least-recently-used key.
+pub const DEFAULT_MAX_KEYS: usize = 8192;
+
 /// Per-key replay guard with bounded LRU.
 pub struct ReplayGuard {
     #[cfg(not(target_arch = "wasm32"))]
@@ -151,6 +164,10 @@ pub struct ReplayGuard {
     keys: Mutex<HashMap<KeyFingerprint, KeyState>>,
     /// Maximum number of records retained per key (LRU bound).
     per_key_capacity: usize,
+    /// Maximum number of distinct signer keys tracked (global LRU bound).
+    max_keys: usize,
+    /// Monotonic access counter driving the global-key LRU eviction.
+    tick: AtomicU64,
     /// If true, monotonic sig_seq_num and sig_time are enforced across the
     /// LRU window.  Disable for testbed callers that issue out-of-order
     /// signed Interests legitimately.
@@ -159,14 +176,28 @@ pub struct ReplayGuard {
 
 impl ReplayGuard {
     pub fn new(per_key_capacity: usize, monotonic: bool) -> Self {
+        Self::with_capacities(per_key_capacity, DEFAULT_MAX_KEYS, monotonic)
+    }
+
+    pub fn with_capacities(per_key_capacity: usize, max_keys: usize, monotonic: bool) -> Self {
         Self {
             #[cfg(not(target_arch = "wasm32"))]
             keys: DashMap::new(),
             #[cfg(target_arch = "wasm32")]
             keys: Mutex::new(HashMap::new()),
             per_key_capacity: per_key_capacity.max(1),
+            max_keys: max_keys.max(1),
+            tick: AtomicU64::new(0),
             monotonic,
         }
+    }
+
+    /// Number of distinct signer keys currently tracked.
+    pub fn key_count(&self) -> usize {
+        #[cfg(not(target_arch = "wasm32"))]
+        return self.keys.len();
+        #[cfg(target_arch = "wasm32")]
+        return self.keys.lock().unwrap().len();
     }
 
     pub fn check(&self, sig_info: &SignatureInfo) -> ReplayCheck {
@@ -174,20 +205,47 @@ impl ReplayGuard {
             return ReplayCheck::NoAntiReplayFields;
         };
         let fp = KeyFingerprint::from_locator(sig_info.key_locator.as_ref());
+        let now_tick = self.tick.fetch_add(1, Ordering::Relaxed);
 
         #[cfg(not(target_arch = "wasm32"))]
-        let cell = self
-            .keys
-            .entry(fp)
-            .or_insert_with(|| Mutex::new(KeyState::new()));
+        let result = {
+            let cell = self
+                .keys
+                .entry(fp)
+                .or_insert_with(|| Mutex::new(KeyState::new()));
+            let mut state = cell.lock().expect("ReplayGuard mutex poisoned");
+            state.last_seen = now_tick;
+            self.check_state(&mut state, sig_info, record)
+        };
+
+        #[cfg(target_arch = "wasm32")]
+        let result = {
+            let mut keys = self.keys.lock().expect("ReplayGuard map mutex poisoned");
+            let state = keys.entry(fp).or_insert_with(KeyState::new);
+            state.last_seen = now_tick;
+            let r = self.check_state(state, sig_info, record);
+            if keys.len() > self.max_keys {
+                Self::evict_lru_keys(&mut keys, self.max_keys);
+            }
+            r
+        };
+
+        // Enforce the global key cap outside the per-entry lock (audit D-3).
         #[cfg(not(target_arch = "wasm32"))]
-        let mut state = cell.lock().expect("ReplayGuard mutex poisoned");
+        if self.keys.len() > self.max_keys {
+            self.enforce_key_cap();
+        }
 
-        #[cfg(target_arch = "wasm32")]
-        let mut keys = self.keys.lock().expect("ReplayGuard map mutex poisoned");
-        #[cfg(target_arch = "wasm32")]
-        let state = keys.entry(fp).or_insert_with(KeyState::new);
+        result
+    }
 
+    /// Core replay logic against an already-locked `KeyState`.
+    fn check_state(
+        &self,
+        state: &mut KeyState,
+        sig_info: &SignatureInfo,
+        record: NonceRecord,
+    ) -> ReplayCheck {
         if self.monotonic {
             if let (Some(prev), Some(now)) = (state.max_seq, sig_info.sig_seq_num)
                 && now <= prev
@@ -218,6 +276,46 @@ impl ReplayGuard {
         }
         state.records.push_back(record);
         ReplayCheck::Fresh
+    }
+
+    /// Evict least-recently-used keys down to 90% of `max_keys` (DashMap path).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn enforce_key_cap(&self) {
+        let len = self.keys.len();
+        if len <= self.max_keys {
+            return;
+        }
+        let target = self.max_keys - self.max_keys / 10;
+        let to_remove = len.saturating_sub(target);
+        let mut by_age: Vec<(u64, KeyFingerprint)> = self
+            .keys
+            .iter()
+            .map(|r| {
+                let ls = r.value().lock().map(|s| s.last_seen).unwrap_or(0);
+                (ls, r.key().clone())
+            })
+            .collect();
+        by_age.sort_unstable_by_key(|(t, _)| *t);
+        for (_, fp) in by_age.into_iter().take(to_remove) {
+            self.keys.remove(&fp);
+        }
+    }
+
+    /// Evict least-recently-used keys down to 90% of `max_keys` (wasm path).
+    #[cfg(target_arch = "wasm32")]
+    fn evict_lru_keys(keys: &mut HashMap<KeyFingerprint, KeyState>, max_keys: usize) {
+        let len = keys.len();
+        if len <= max_keys {
+            return;
+        }
+        let target = max_keys - max_keys / 10;
+        let to_remove = len.saturating_sub(target);
+        let mut by_age: Vec<(u64, KeyFingerprint)> =
+            keys.iter().map(|(k, s)| (s.last_seen, k.clone())).collect();
+        by_age.sort_unstable_by_key(|(t, _)| *t);
+        for (_, fp) in by_age.into_iter().take(to_remove) {
+            keys.remove(&fp);
+        }
     }
 
     pub fn forget_all(&self) {
@@ -397,6 +495,31 @@ mod tests {
         // But the same seq, still in-window, is a replay (AND-semantics floor).
         assert_eq!(g.check(&si_shared_seq(5)), ReplayCheck::Replay);
         assert_eq!(g.check(&si_shared_seq(11)), ReplayCheck::Replay);
+    }
+
+    #[test]
+    fn d3_distinct_keylocator_flood_is_bounded() {
+        // Pre-verification flood: signed-looking Interests with distinct
+        // KeyLocators must not grow the key map without bound.
+        let max_keys = 100;
+        let g = ReplayGuard::with_capacities(16, max_keys, false);
+        for i in 0..10_000u32 {
+            let si = SignatureInfo {
+                sig_type: SignatureType::SignatureEd25519,
+                key_locator: Some(KeyLocator::KeyDigest(Bytes::copy_from_slice(
+                    &i.to_be_bytes(),
+                ))),
+                sig_nonce: Some(Bytes::from_static(b"n")),
+                sig_time: None,
+                sig_seq_num: None,
+            };
+            g.check(&si);
+        }
+        assert!(
+            g.key_count() <= max_keys,
+            "key map grew past cap: {} > {max_keys}",
+            g.key_count()
+        );
     }
 
     #[test]
