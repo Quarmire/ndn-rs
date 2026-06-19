@@ -114,6 +114,17 @@ fn ndnts_frame(pkt: &[u8], max_payload: usize) -> Vec<Bytes> {
     out
 }
 
+/// Maximum bytes a single NDNts reassembly will buffer (audit BLE-1). A peer
+/// could otherwise declare a huge TLV length in its first fragment and stream
+/// continuation fragments to grow the buffer without bound. Well above any
+/// BLE-delivered NDN packet (≤ ~8800), low enough to bound memory.
+const MAX_REASSEMBLY_SIZE: usize = 16 * 1024;
+
+/// Maximum concurrent per-sender reassembly streams on a broadcast medium
+/// (audit BLE-3). Bounds a spoofed-BD_ADDR flood; far above any realistic count
+/// of simultaneously-fragmenting BLE peers.
+const MAX_SENDERS: usize = 256;
+
 /// Reassembles NDNts 1-byte-header fragments into complete TLV packets. One per
 /// peer, fed in arrival order. NDNLPv2 needs no equivalent — the engine
 /// pipeline's reassembly handles it.
@@ -139,6 +150,15 @@ impl NdntsReassembler {
         } else {
             // Unfragmented packet (no header byte).
             return Some(Bytes::copy_from_slice(fragment));
+        }
+        // BLE-1: abandon a partial that grows past — or already declares more
+        // than — MAX_REASSEMBLY_SIZE, so a peer can't exhaust memory by streaming
+        // toward a huge declared TLV length.
+        if self.buffer.len() > MAX_REASSEMBLY_SIZE || declared_exceeds(&self.buffer, MAX_REASSEMBLY_SIZE)
+        {
+            self.buffer.clear();
+            self.active = false;
+            return None;
         }
         let end = tlv_packet_end(&self.buffer)?;
         let pkt = Bytes::copy_from_slice(&self.buffer[..end]);
@@ -168,7 +188,7 @@ impl<K: Eq + Hash> Default for PerSenderReassembler<K> {
     }
 }
 
-impl<K: Eq + Hash> PerSenderReassembler<K> {
+impl<K: Eq + Hash + Clone> PerSenderReassembler<K> {
     pub fn new() -> Self {
         Self::default()
     }
@@ -176,6 +196,14 @@ impl<K: Eq + Hash> PerSenderReassembler<K> {
     /// Feed one frame heard from `sender`; returns a complete packet when one
     /// is ready for that sender.
     pub fn feed(&mut self, sender: K, fragment: &[u8]) -> Option<Bytes> {
+        // BLE-3: bound concurrent sender streams. A spoofed-BD_ADDR flood would
+        // otherwise grow the map without limit; drop one stream to make room.
+        if !self.streams.contains_key(&sender)
+            && self.streams.len() >= MAX_SENDERS
+            && let Some(victim) = self.streams.keys().next().cloned()
+        {
+            self.streams.remove(&victim);
+        }
         self.streams.entry(sender).or_default().feed(fragment)
     }
 
@@ -203,10 +231,36 @@ fn parse_varnumber(buf: &[u8]) -> Option<(u64, usize)> {
     }
 }
 
-fn tlv_packet_end(buf: &[u8]) -> Option<usize> {
+/// Declared total size of the TLV at the front of `buf`, if its type+length
+/// header is fully present. `None` while the header is still incomplete.
+fn tlv_declared_total(buf: &[u8]) -> Option<usize> {
     let (_, type_len) = parse_varnumber(buf)?;
     let (length, length_len) = parse_varnumber(buf.get(type_len..)?)?;
-    let total = type_len + length_len + length as usize;
+    // BLE-2: checked arithmetic so a near-u64::MAX declared length can't wrap.
+    type_len
+        .checked_add(length_len)?
+        .checked_add(usize::try_from(length).ok()?)
+}
+
+/// `true` if the front TLV declares a total larger than `max` (or overflows).
+fn declared_exceeds(buf: &[u8], max: usize) -> bool {
+    match tlv_declared_total(buf) {
+        Some(total) => total > max,
+        // Header parsed but the size arithmetic overflowed → definitely too big.
+        // Header not yet complete → not (yet) known to exceed; the buffer-length
+        // cap still applies.
+        None => {
+            // Distinguish "overflow" from "incomplete header": only the former
+            // means too-large. parse succeeded but checked_add returned None.
+            parse_varnumber(buf)
+                .and_then(|(_, t)| buf.get(t..).and_then(parse_varnumber).map(|_| true))
+                .unwrap_or(false)
+        }
+    }
+}
+
+fn tlv_packet_end(buf: &[u8]) -> Option<usize> {
+    let total = tlv_declared_total(buf)?;
     (buf.len() >= total).then_some(total)
 }
 
@@ -257,6 +311,41 @@ mod tests {
             }
         }
         assert_eq!(got.expect("reassembled"), bytes);
+    }
+
+    #[test]
+    fn ble1_oversize_declared_length_is_abandoned() {
+        // First fragment declares a ~1 GiB TLV via the 4-byte length form. The
+        // reassembler must abandon it immediately (return None, drop the
+        // partial) rather than waiting to buffer ~1 GiB of continuations.
+        let mut asm = NdntsReassembler::new();
+        // 0x80 = first-frag header byte; then 0x06 (Data), 254 (4-byte len), 1 GiB.
+        let first = [0x80, 0x06, 254, 0x40, 0x00, 0x00, 0x00];
+        assert!(asm.feed(&first).is_none());
+        assert!(asm.buffer.is_empty(), "oversize partial must be dropped");
+        // A subsequent legitimate fragmented packet still reassembles fine.
+        let bytes = big_tlv(200);
+        let frags = BleFraming::Ndnts.frame(&bytes, 64, &mut 0);
+        let mut got = None;
+        for f in &frags {
+            if let Some(p) = asm.feed(f) {
+                got = Some(p);
+            }
+        }
+        assert_eq!(got.expect("reassembled after abandon"), bytes);
+    }
+
+    #[test]
+    fn ble3_sender_map_is_capped() {
+        let mut asm: PerSenderReassembler<[u8; 6]> = PerSenderReassembler::new();
+        // A spoofed-BD_ADDR flood: each "sender" opens a partial stream.
+        for i in 0..(MAX_SENDERS + 500) as u32 {
+            let mut addr = [0u8; 6];
+            addr[..4].copy_from_slice(&i.to_be_bytes());
+            // First-frag header so a partial buffer is retained for this sender.
+            let _ = asm.feed(addr, &[0x80, 0x06, 253, 0x10, 0x00]);
+        }
+        assert!(asm.streams.len() <= MAX_SENDERS);
     }
 
     #[test]
