@@ -39,7 +39,7 @@ Status: ✅ runnable witness today · ⛔ gates a future layer (acceptance crite
 |---|---|---|---|
 | NSF-A1 | `PermissionResponse` Data is validated by the trust validator **before** it is decrypted or installed. | `ndn-nacabe::service`: the `ParamFetcher` validates the authority's response before use, and the authority validates the signed `DKEY` request before issuing. | ✅ `aa_paramfetcher_witness` (over-NDN) |
 | NSF-A2 | The signer identity of `PermissionResponse` matches the Permission-Controller identity encoded in the permission Interest path. | `ndn-nacabe::service`: the authority issues to the **validated signer's** identity (the request's `KeyLocator`), so a requester can only obtain its own key. | ✅ `aa_paramfetcher_witness` / `serve_cp` |
-| NSF-A3 | `ACK`/`COORDINATION`/`RESPONSE` pass trust validation **and** NAC-ABE authorization before their payloads affect runtime state. | `ndn-ndnsf` four-phase handlers. | ⛔ gates `ndn-ndnsf` |
+| NSF-A3 | `ACK`/`COORDINATION`/`RESPONSE` pass trust validation **and** NAC-ABE authorization before their payloads affect runtime state. | `ndn-ndnsf::access` NAC-seals payloads under the service's KP-ABE attributes; only a holder of a satisfying `ServiceController`-issued key decrypts (unauthorized fails closed). Trust-validation rides on `SvsPubSub`'s signed sync Data; app-layer per-message validation is a complementary refinement. | ✅ (NAC-ABE authorization) `secure_four_phase_over_svs` + `access` unit tests |
 | NSF-A4 | Permission-discovery Interests may be unsigned; the returned **Data** is the authenticated object. | `ndn-discovery`/`ndn-ndnsf` — matches NDN's data-centric trust. | ⛔ gates `ndn-ndnsf` |
 
 ### Token properties

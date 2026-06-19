@@ -529,8 +529,12 @@ a bespoke profiler.
    consumes a SELECTION). **Witnessed end-to-end over real SVS convergence**
    (`four_phase_over_svs`: two `SvsPubSub` nodes, broker-crossed medium, a full
    REQUEST→ACK→SELECTION→RESPONSE round-trip). Per-phase spans flow to OTLP/NDN
-   (§8.1). **Remaining for full fidelity:** wire `ndn-nacabe`'s KP-ABE
-   `ServiceController` + per-message trust validation into the driver (NSF-A3),
+   (§8.1). **KP-ABE access control wired** (`access`): the provider NAC-seals
+   payloads under the service's attributes and only a holder of a satisfying
+   `ServiceController`-issued key decrypts — unauthorized fails closed
+   (`secure_four_phase_over_svs` witness). This closes the NAC-ABE-authorization
+   half of NSF-A3. **Remaining for full fidelity:** app-layer per-message trust
+   validation (the trust half of NSF-A3, complementary to `SvsPubSub` signing)
    and the unsigned-discovery posture (NSF-A4).
 6. v2: `ndn-service` (Tier-1 selection + Tier-2 collab, authority-as-signed-Data).
 
