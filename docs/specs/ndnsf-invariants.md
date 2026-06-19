@@ -46,22 +46,22 @@ Status: ✅ runnable witness today · ⛔ gates a future layer (acceptance crite
 
 | ID | Invariant | Enforced in (ndn-rs) | Witness / status |
 |---|---|---|---|
-| NSF-T1 | `ProviderToken` is one-time use. | compat: `ndn-ndnsf` token consumption. v2: `ReplayGuard` on the signed request Interest. | ⛔ gates `ndn-ndnsf` (ReplayGuard precedent exists) |
-| NSF-T2 | `ProviderToken` expires after its pending-state TTL. | v2: capability `not_after`. compat: `ndn-ndnsf` TTL. | ✅ `nsf_t2_capability_expires_after_window` |
-| NSF-T3 | Replaying a token after successful coordination fails. | `ReplayGuard` + `ndn-ndnsf`. | ⛔ gates `ndn-ndnsf` |
-| NSF-T4 | Using an expired token fails. | capability validity window. | ✅ `nsf_t4_expired_capability_rejected` |
-| NSF-T5 | An unknown/random token fails. | capability: wrong grantee / bad signature (signature is the `Validator`'s job). | ✅ `nsf_t5_unknown_grantee_rejected` (binding); ⛔ signature path gates `ndn-ndnsf` |
-| NSF-T6 | A provider restart before coordination does not preserve pending token state unless an explicit, audited persistence mechanism exists. | `ndn-ndnsf` runtime (memory-local by default). | ⛔ gates `ndn-ndnsf` |
+| NSF-T1 | `ProviderToken` is one-time use. | `ndn-ndnsf::tokens` — `consume` removes the token. | ✅ `nsf_t1_t3_token_is_single_use` |
+| NSF-T2 | `ProviderToken` expires after its pending-state TTL. | `ndn-ndnsf::tokens` TTL; v2 capability `not_after`. | ✅ `nsf_t4_expired_token_rejected` + `nsf_t2_capability_expires_after_window` |
+| NSF-T3 | Replaying a token after successful coordination fails. | `ndn-ndnsf::tokens` — consumed tokens are gone. | ✅ `nsf_t1_t3_token_is_single_use` |
+| NSF-T4 | Using an expired token fails. | `ndn-ndnsf::tokens` TTL; capability window. | ✅ `nsf_t4_expired_token_rejected` |
+| NSF-T5 | An unknown/random token fails. | `ndn-ndnsf::tokens`; capability grantee binding. | ✅ `nsf_t5_unknown_token_rejected` (+ `nsf_t5_unknown_grantee_rejected`) |
+| NSF-T6 | A provider restart before coordination does not preserve pending token state unless an explicit, audited persistence mechanism exists. | `ndn-ndnsf::tokens` is memory-local. | ✅ `nsf_t6_restart_drops_pending_state` |
 
 ### State properties
 
 | ID | Invariant | Enforced in (ndn-rs) | Witness / status |
 |---|---|---|---|
-| NSF-S1 | `pendingRequests`/`pendingProviderTokens` are eventually cleaned. | `ndn-ndnsf` runtime (bounded-state, TTL cleanup). | ⛔ gates `ndn-ndnsf` |
-| NSF-S2 | Successful coordination removes provider pending state immediately. | `ndn-ndnsf`. | ⛔ gates `ndn-ndnsf` |
-| NSF-S3 | Timeout cleanup does not remove an active request before normal coordination can arrive. | `ndn-ndnsf`. | ⛔ gates `ndn-ndnsf` |
-| NSF-S4 | Cleanup firing after successful completion is a no-op. | `ndn-ndnsf`. | ⛔ gates `ndn-ndnsf` |
-| NSF-S5 | Repeated cleanup cycles do not grow pending state without bound. | `ndn-ndnsf` (engine has bounded-state precedents: PIT, `ReplayGuard` LRU). | ⛔ gates `ndn-ndnsf` |
+| NSF-S1 | `pendingRequests`/`pendingProviderTokens` are eventually cleaned. | `ndn-ndnsf::tokens` `cleanup_expired`. | ✅ `nsf_s1_cleanup_reaps_expired` |
+| NSF-S2 | Successful coordination removes provider pending state immediately. | `ndn-ndnsf::tokens` `consume` removes. | ✅ `nsf_s2_success_removes_pending_immediately` |
+| NSF-S3 | Timeout cleanup does not remove an active request before normal coordination can arrive. | `ndn-ndnsf::tokens` only reaps past-TTL entries. | ✅ `nsf_s3_cleanup_spares_active_tokens` |
+| NSF-S4 | Cleanup firing after successful completion is a no-op. | `ndn-ndnsf::tokens` cleanup is idempotent. | ✅ `nsf_s4_s5_cleanup_idempotent_and_bounded` |
+| NSF-S5 | Repeated cleanup cycles do not grow pending state without bound. | `ndn-ndnsf::tokens` cleanup is idempotent. | ✅ `nsf_s4_s5_cleanup_idempotent_and_bounded` |
 
 ### Failure properties
 
