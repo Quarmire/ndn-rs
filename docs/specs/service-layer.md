@@ -489,10 +489,14 @@ Constraints on performance claims:
      witnessed (issue→seal→open→unwrap-CK→decrypt-content for CP and KP;
      unenrolled fails closed; a DKEY sealed to one recipient won't open for
      another). 10 witnesses, clippy-clean.
-   - **Remaining:** the over-NDN serve/fetch shell — a Producer serving
-     `PUBPARAMS` and handling signed `DKEY` Interests (validating the request,
-     NSF-A1, and binding the verified signer identity to the advertised X25519
-     key, NSF-A2) + the consumer fetch loop. Thin `ndn-app` plumbing over the
-     landed core; gated by the O4 protocol-level invariants before it lands.
+   - **Over-NDN serve/fetch shell** (feature `service`): `serve_cp`/`serve_kp`
+     run the authority on an `ndn-app` Producer (serve `PUBPARAMS`; validate
+     signed `DKEY` Interests — NSF-A1 — and issue to the *validated signer's*
+     identity — NSF-A2 — failing closed otherwise); the `ParamFetcher` fetches
+     and verifies both. End-to-end witnessed over an in-proc engine
+     (`aa_paramfetcher_witness`): signed request → validated → key sealed to the
+     requester → decrypts NAC content. **Step 4 complete** (the F1/F2
+     failure-callback/log semantics are NDNSF-runtime concerns that land with
+     `ndn-ndnsf`).
 5. Compat: `ndn-ndnsf` (four-phase + KP-ABE controller).
 6. v2: `ndn-service` (Tier-1 selection + Tier-2 collab, authority-as-signed-Data).
