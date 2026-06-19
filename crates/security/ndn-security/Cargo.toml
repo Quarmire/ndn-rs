@@ -84,6 +84,8 @@ custodian   = ["dep:async-trait"]
 
 [dev-dependencies]
 tokio      = { workspace = true, features = ["rt", "macros", "sync", "time"] }
+ndn-packet = { workspace = true, features = ["std"] }
+bytes      = { workspace = true, features = ["std"] }
 tempfile   = "3"
 criterion  = { workspace = true }
 ndn-tlv    = { workspace = true, features = ["std"] }

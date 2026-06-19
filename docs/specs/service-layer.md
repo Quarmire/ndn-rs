@@ -454,9 +454,15 @@ Constraints on performance claims:
 - **O3 (v2 KP-ABE niche).** Decide, when the UAS roadmap is clearer, whether the
   v2 layer needs the authority to govern *decryption* (KP-ABE's only surviving
   niche once capabilities own invocation), or whether CP-ABE/AEAD suffice.
-- **O4 (security invariants).** Extract NDNSF's `SECURITY_INVARIANTS.md` /
-  `FINAL_SECURITY_AUDIT.md` into ndn-rs witness scripts **before** the
-  crypto/collab layers land, so the port preserves the audited properties.
+- **O4 (security invariants).** ✅ Extracted into
+  `docs/specs/ndnsf-invariants.md` — a traceable catalogue (20 invariants, stable
+  IDs, threat model, per-invariant ndn-rs enforcement mapping) **and the gate**:
+  `ndn-nacabe`/`ndn-ndnsf` MUST NOT land until the invariants mapped to them have
+  passing witnesses. The primitive-subset invariants (capability TTL/expiry/
+  binding, content-key fail-closed) are runnable today —
+  `ndn-security/tests/ndnsf_invariants_witness.rs` + the `nsf01_security_invariants.sh`
+  audit script (6 witnesses, passing). The protocol-level invariants are the
+  acceptance criteria for the layers that will enforce them.
 - **O5 (cross-impl convention).** Decide whether to publish the §5.1 RPC name
   scheme (and possibly the §5.2 container) as a narrow proposed NDN convention,
   kept separate from this ndn-rs architecture spec. The rest of this document is
