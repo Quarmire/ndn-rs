@@ -11,6 +11,10 @@ classification = "spec"
 [features]
 default = []
 blocking = ["tokio/rt"]
+# Typed objects: `node.object(n).fetch_as::<T>()` and `serve_object_typed(n, &T)`
+# (de)serialize Content as JSON via serde. Off by default — the byte API needs
+# no serde.
+serde = ["dep:serde", "dep:serde_json"]
 
 # Wasm-safe core (both targets). The Consumer/Producer/EngineAppExt client
 # surface builds for wasm32 so an in-browser embedded engine (WasmEngineBuilder)
@@ -30,6 +34,9 @@ async-trait    = { workspace = true }
 # Instant/SystemTime that work on both native (delegates to std) and wasm32
 # (JS clocks) — std::time::{Instant,SystemTime}::now() panic on wasm32.
 web-time       = { workspace = true }
+# Optional (feature `serde`): typed object (de)serialization as JSON.
+serde          = { workspace = true, optional = true }
+serde_json     = { workspace = true, optional = true }
 
 # Native-only: external-forwarder IPC (Unix socket), SVS sync, the SQLite PIB
 # (pulls libsqlite3-sys — never wasm-buildable), and the full tokio timer.

@@ -129,6 +129,16 @@ impl ObjectFetch {
             .await
     }
 
+    /// Fetch the whole object and deserialize it from JSON into `T` — the typed
+    /// counterpart to [`Node::serve_object_typed`](crate::Node::serve_object_typed).
+    /// All modifiers (`verify` / `hint` / `progress`) apply.
+    #[cfg(feature = "serde")]
+    pub async fn fetch_as<T: serde::de::DeserializeOwned>(self) -> Result<T, AppError> {
+        let bytes = self.fetch().await?;
+        serde_json::from_slice(&bytes)
+            .map_err(|e| AppError::Protocol(format!("object JSON decode: {e}")))
+    }
+
     /// Stream verified segments straight to `file` at their byte offsets
     /// (positioned writes), so an arbitrarily large object lands on disk without
     /// ever being held in memory. Returns total bytes written.

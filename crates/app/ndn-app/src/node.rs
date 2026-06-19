@@ -46,12 +46,14 @@ use crate::connection::Connection;
 use crate::consumer::{Consumer, VerifiedConsumer};
 use crate::demux::{DemuxConnection, ServeGuard};
 use crate::error::AppError;
+use crate::producer::Producer;
 use crate::publisher::{Publisher, PublisherConfig};
 use crate::queryable::Queryable;
 use crate::responder::Responder;
 use crate::subscriber::{Subscriber, SubscriberConfig};
 use ndn_packet::{Data, Interest, Name};
 use ndn_security::validator::Validator;
+use tokio_util::sync::CancellationToken;
 
 #[cfg(not(target_arch = "wasm32"))]
 use crate::connection::IpcConnection;
@@ -227,5 +229,95 @@ impl Node {
         let conn = self.dedicated().await?;
         conn.register_prefix(&prefix).await?;
         Ok(Queryable::from_connection(conn, prefix))
+    }
+
+    // ---- static object serving --------------------------------------------
+
+    /// Serve `content` as an RDR object under `name` (segmented, `<name>/v=…`),
+    /// answering metadata + segment Interests in the background until the
+    /// returned [`ObjectServeGuard`] is dropped. Runs on a dedicated connection
+    /// (the producer counterpart to the sync/query exception). The segments are
+    /// `DigestSha256` (unsigned); for signed serving build a [`Producer`] with a
+    /// signer from [`connection`](Self::connection).
+    pub async fn serve_object(
+        &self,
+        name: impl Into<Name>,
+        content: impl Into<Bytes>,
+    ) -> Result<ObjectServeGuard, AppError> {
+        let name = name.into();
+        let content = content.into();
+        let producer = self.object_producer(&name).await?;
+        Ok(Self::spawn_object(producer, move |p| async move {
+            p.publish_object(name, content, 0).await
+        }))
+    }
+
+    /// Serve a JSON-serialized `value` as an RDR object under `name` — the typed
+    /// counterpart to [`ObjectFetch::fetch_as`](crate::ObjectFetch::fetch_as).
+    #[cfg(feature = "serde")]
+    pub async fn serve_object_typed<T: serde::Serialize>(
+        &self,
+        name: impl Into<Name>,
+        value: &T,
+    ) -> Result<ObjectServeGuard, AppError> {
+        let bytes = serde_json::to_vec(value)
+            .map_err(|e| AppError::Protocol(format!("object JSON encode: {e}")))?;
+        self.serve_object(name, Bytes::from(bytes)).await
+    }
+
+    /// Serve a file as an RDR object under `name`, reading segments on demand
+    /// (positioned reads) so an arbitrarily large file is served without loading
+    /// it into memory. Unix only; runs until the guard is dropped.
+    #[cfg(all(unix, not(target_arch = "wasm32")))]
+    pub async fn serve_file(
+        &self,
+        name: impl Into<Name>,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<ObjectServeGuard, AppError> {
+        let name = name.into();
+        let file = std::fs::File::open(path)
+            .map_err(|e| AppError::Protocol(format!("open file to serve: {e}")))?;
+        let size = file
+            .metadata()
+            .map_err(|e| AppError::Protocol(format!("stat file to serve: {e}")))?
+            .len();
+        let producer = self.object_producer(&name).await?;
+        Ok(Self::spawn_object(producer, move |p| async move {
+            p.publish_object_from_file(name, file, size, 0).await
+        }))
+    }
+
+    /// Open a dedicated connection, register `name`, and bind a [`Producer`].
+    async fn object_producer(&self, name: &Name) -> Result<Producer, AppError> {
+        let conn = self.dedicated().await?;
+        conn.register_prefix(name).await?;
+        Ok(Producer::new(conn, name.clone()))
+    }
+
+    /// Spawn an object serve loop bound to a fresh cancellation token; the
+    /// returned guard cancels it on drop.
+    fn spawn_object<F, Fut>(producer: Producer, run: F) -> ObjectServeGuard
+    where
+        F: FnOnce(Producer) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<(), AppError>> + Send + 'static,
+    {
+        let cancel = CancellationToken::new();
+        let child = cancel.child_token();
+        crate::rt::spawn(async move {
+            let _ = child.run_until_cancelled(run(producer)).await;
+        });
+        ObjectServeGuard { _cancel: cancel }
+    }
+}
+
+/// Keeps a [`Node::serve_object`] (or [`serve_file`](Node::serve_file)) loop
+/// alive; dropping it stops serving.
+pub struct ObjectServeGuard {
+    _cancel: CancellationToken,
+}
+
+impl Drop for ObjectServeGuard {
+    fn drop(&mut self) {
+        self._cancel.cancel();
     }
 }
