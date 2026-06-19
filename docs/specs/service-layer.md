@@ -183,14 +183,21 @@ that discovers the provider set for a logical service via a `ProviderDirectory`
 (e.g. `RpcCarrier`). The discovery layer **adds multi-provider `SelectCarrier`**
 on top of a *unary* inner carrier (FirstResponding / All / Random over the
 discovered set; `serve` advertises `<node>/<service>` and serves it on `C`).
-`ProviderDirectory` is a seam: `MemoryDirectory` (in-process) proves the carrier;
-a production directory wraps `ServiceDiscoveryProtocol` — `all_records` for the
-set, `measurements` (`rtt_p50`) for fastest-first ranking — with its own
-service↔provider naming convention (a deliberate later decision; the carrier is
-directory-agnostic). Witness `discovery_carrier`: a `#[ndn_service]` Echo client
-runs over `DiscoveryCarrier<RpcCarrier>`; `invoke` picks the best provider,
-`echo_select(All)` gathers every discovered provider (proving `SelectCarrier`
-arises from discovery, not the inner unary carrier); no provider → fail closed.
+`ProviderDirectory` is a seam: `MemoryDirectory` (in-process) proves the carrier.
+The **production directory is built** — `ndn-service::sd_directory::ServiceDiscoveryDirectory`
+(feature `discovery`) wraps `ServiceDiscoveryProtocol`: `providers` reads
+`all_records` (filtered to those whose announced prefix has the service as a
+**suffix** — the convention is a node-scoped callable `<node>/<service>`, exactly
+what `DiscoveryCarrier::serve` advertises) and ranks best-first by `measurements`
+(`rtt_p50`/`last_rtt`); `advertise` calls `publish`. It is a read/advertise view —
+the cross-node browse/sync that populates `all_records` is driven by the host
+engine running the protocol as a `DiscoveryProtocol` plugin (witnessed in
+`ndn-discovery`). Witnesses: `discovery_carrier` (with `MemoryDirectory`) and
+`sd_directory` (with the real `ServiceDiscoveryDirectory`) both run a
+`#[ndn_service]` Echo client over `DiscoveryCarrier<RpcCarrier>` — `invoke` picks
+the best provider, `echo_select(All)` gathers every discovered provider (proving
+`SelectCarrier` arises from discovery, not the inner unary carrier); no provider →
+fail closed.
 
 ### 3.3 Tier 2 — collaboration (`ndn-service`)
 
