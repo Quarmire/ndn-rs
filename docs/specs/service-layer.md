@@ -245,9 +245,26 @@ derives a member's keyring (exactly the keys its role grants — role-scoped key
 `None` if the member's keyring lacks the scope (the role gate, enforced by key
 possession). Witness `role_scoped_keys`: a Commander (granted `control` +
 `telemetry`) reads both scopes; an Observer (granted `telemetry` only) reads
-telemetry and cannot even obtain a `control` topic. *Next:* member key
-distribution (how a member receives its scope keys — `ndn-sealed-box` per member
-or ABE by role), and artifact provisioning.
+telemetry and cannot even obtain a `control` topic.
+
+**Key distribution built:** `key_dist::provision_keyring(role, policy, all_keys,
+recipient_public)` seals exactly the role's scope keys to a member's X25519 key
+(`ndn-sealed-box`); `open_keyring(recipient, sealed)` recovers the member's
+`ScopeKeyring`. This connects the role→scope policy to a concrete member: the
+controller decides the role, this hands over the keys; only the member opens them.
+Witness `key_distribution`: an Observer receives only the `telemetry` key (a
+stranger cannot open the blob), and the recovered key opens content sealed by the
+genuine scope key.
+
+**Artifact provisioning built:** `session::ArtifactShare` (via `Session::artifacts`
+or `ScopedSession::artifacts(scope)`) shares named confidential objects in a
+session/scope — `provision(name, content)` publishes the object sealed under the
+scope key; `fetch(name)` awaits and opens it. An artifact is a one-shot
+`ScopedTopic<Bytes>`, so it reuses the sealing path; large artifacts ride
+`SvsPubSub`'s segmentation. Witness `artifacts`: a member provisions a 4 KB
+artifact (segmented) and another member fetches+opens it; a node lacking the scope
+key cannot obtain the artifact share (`artifacts(scope)` is `None`). *Next:* member
+key distribution is done; remaining Tier-2 items are app-level conventions.
 
 ---
 
@@ -349,8 +366,16 @@ any mutation, fail closed), applies it to the live authority, and returns the
 freshly signed grant (the new published version). This is the operator→authority
 input channel that *produces signed versions*, not a hidden-state mutator. Witness
 `signed_commands`: an authorized grant then revoke take effect with no restart; an
-unauthorized command is rejected and mutates nothing. *Next:* config-file reload
-as a second front-end; the Tier-1 discovery-selection carrier. (Typed `Topic<T>`,
+unauthorized command is rejected and mutates nothing.
+
+**Config-reload front-end built** (the declarative twin, feature `config`):
+`config::load_policy_toml` parses a TOML grant list; `config::reload(authority,
+desired)` diffs it against the live authority and applies the difference —
+(re)grant new/changed principals, revoke dropped ones — each bumping the version
+and re-signing (no restart), idempotent for an unchanged file. Same "mutate → bump
+version → re-sign" effect as a signed command, driven by an operator editing a
+file (NDNSF's `policy_file` workflow). Witness `config_reload`. *Next:*
+the Tier-1 discovery-selection carrier. (Typed `Topic<T>`,
 Tier-2 — the *feed* primitive vs. a service op's request/response *call* — is now
 built; see §3.3.)
 
