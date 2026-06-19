@@ -433,6 +433,7 @@ impl Consumer {
     /// integrity-checked. Prefer [`VerifiedConsumer::fetch_object`] (the
     /// least-resistance safe verb); this exists so the raw consumer can do a
     /// verified object fetch too.
+    #[deprecated(since = "0.1.0", note = "use `consumer.object(name).verify(v).fetch()`")]
     pub async fn fetch_object_verified(
         &mut self,
         name: impl Into<Name>,
@@ -449,6 +450,10 @@ impl Consumer {
     /// a routable delegation (e.g. `/ndn/node/<peerId>`) until it reaches the
     /// producer's region, where the hint is stripped and the Interest forwarded
     /// by name. The cross-peer fetch primitive for tap-to-share.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use `consumer.object(name).verify(v).hint([...]).fetch()`"
+    )]
     pub async fn fetch_object_verified_hinted(
         &mut self,
         name: impl Into<Name>,
@@ -462,6 +467,10 @@ impl Consumer {
     /// Whole-object fetch with progress: `on_progress(received, total)` is
     /// called once with `(0, total)` as soon as the segment count is known, then
     /// after each segment lands. Drives a download progress bar.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use `consumer.object(name).verify(v).hint([...]).progress(cb).fetch()`"
+    )]
     pub async fn fetch_object_verified_hinted_progress(
         &mut self,
         name: impl Into<Name>,
@@ -559,6 +568,7 @@ impl Consumer {
     /// arrives — no validation, no resume. See
     /// [`fetch_object_streaming`](Self::fetch_object_streaming) for the
     /// verified / resumable form.
+    #[deprecated(since = "0.1.0", note = "use `consumer.object(name).stream(|_| false, on_segment)`")]
     pub async fn fetch_object_into(
         &mut self,
         name: impl Into<Name>,
@@ -600,6 +610,10 @@ impl Consumer {
     /// received without ever holding it in memory. Returns the total bytes
     /// written. `on_progress(received, total)` drives a download bar.
     #[cfg(unix)]
+    #[deprecated(
+        since = "0.1.0",
+        note = "use `consumer.object(name).verify(v).hint([...]).progress(cb).to_file(&file)`"
+    )]
     pub async fn fetch_object_to_file_hinted_progress(
         &mut self,
         name: impl Into<Name>,
@@ -969,6 +983,7 @@ impl VerifiedConsumer {
     /// reassembly, so you get the object's bytes only if the *whole* object
     /// authenticates. The safe counterpart to [`Consumer::fetch_object`].
     pub async fn fetch_object(&mut self, name: impl Into<Name>) -> Result<Bytes, AppError> {
+        #[allow(deprecated)] // the builder consumes Consumer by value; &mut self here
         self.inner
             .fetch_object_verified(name, Arc::clone(&self.validator))
             .await
@@ -1425,6 +1440,7 @@ mod subscription_tests {
     }
 
     #[tokio::test]
+    #[allow(deprecated)] // exercises the deprecated fetch_object_into compat path
     async fn fetch_object_into_streams_every_segment() {
         let object: Name = "/peer/file/stream".parse().unwrap();
         let versioned = object.clone().append_version(3);

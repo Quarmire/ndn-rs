@@ -152,6 +152,7 @@ impl ObjectFetch {
         })?;
         let hint = std::mem::take(&mut self.hint);
         let progress = self.progress_or_noop();
+        #[allow(deprecated)] // this builder IS the replacement; it owns the impl path
         self.consumer
             .fetch_object_to_file_hinted_progress(self.name, validator, &hint, file, progress)
             .await
