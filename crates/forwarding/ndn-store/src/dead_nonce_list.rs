@@ -17,6 +17,14 @@ use dashmap::DashMap;
 /// [`DeadNonceList::with_lifetime`].
 pub const DEFAULT_DEAD_NONCE_LIFETIME: Duration = Duration::from_secs(6);
 
+/// Hard ceiling on DNL entries (audit D-1). The list is time-bounded, but
+/// without a capacity cap an Interest flood with unique `(name, nonce)` grows it
+/// to `rate × lifetime` between GC ticks (tens-to-hundreds of MB at high pps).
+/// NFD's DNL is capacity-bounded; this is the analogue. ~1M entries (≈ tens of
+/// MB) is far above any legitimate `rate × 6 s` working set (e.g. 100k pps →
+/// 600k) so it never evicts a live nonce under normal load.
+pub const DEFAULT_DEAD_NONCE_CAPACITY: usize = 1 << 20;
+
 /// A `(name_hash, nonce)` fingerprint. Names are hashed before reaching the
 /// DNL so the table key is fixed-size regardless of name length.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -40,6 +48,7 @@ pub struct DeadNonceList {
     #[cfg(target_arch = "wasm32")]
     entries: std::sync::Mutex<std::collections::HashMap<NonceFingerprint, u64>>,
     lifetime_ns: u64,
+    capacity: usize,
 }
 
 impl DeadNonceList {
@@ -48,13 +57,22 @@ impl DeadNonceList {
     }
 
     pub fn with_lifetime(lifetime: Duration) -> Self {
+        Self::with_lifetime_and_capacity(lifetime, DEFAULT_DEAD_NONCE_CAPACITY)
+    }
+
+    pub fn with_lifetime_and_capacity(lifetime: Duration, capacity: usize) -> Self {
         Self {
             #[cfg(not(target_arch = "wasm32"))]
             entries: DashMap::new(),
             #[cfg(target_arch = "wasm32")]
             entries: std::sync::Mutex::new(std::collections::HashMap::new()),
             lifetime_ns: lifetime.as_nanos() as u64,
+            capacity: capacity.max(1),
         }
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
     }
 
     pub fn lifetime_ns(&self) -> u64 {
@@ -72,6 +90,43 @@ impl DeadNonceList {
         #[cfg(target_arch = "wasm32")]
         {
             self.entries.lock().unwrap().insert(fp, expiry);
+        }
+        // Hard cap (audit D-1): drop expired first, then evict the
+        // soonest-to-expire down to 90% if a flood still has us over capacity.
+        if self.len() > self.capacity {
+            self.enforce_capacity(now_ns);
+        }
+    }
+
+    /// Bound the table to `capacity`: purge expired, then if still over, evict
+    /// the soonest-to-expire entries down to 90% of capacity so the next
+    /// enforcement is amortized over ~10% of capacity inserts.
+    fn enforce_capacity(&self, now_ns: u64) {
+        self.purge_expired(now_ns);
+        let len = self.len();
+        if len <= self.capacity {
+            return;
+        }
+        let target = self.capacity - self.capacity / 10;
+        let to_remove = len - target;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let mut by_expiry: Vec<(u64, NonceFingerprint)> =
+                self.entries.iter().map(|r| (*r.value(), *r.key())).collect();
+            by_expiry.sort_unstable_by_key(|(e, _)| *e);
+            for (_, fp) in by_expiry.into_iter().take(to_remove) {
+                self.entries.remove(&fp);
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let mut entries = self.entries.lock().unwrap();
+            let mut by_expiry: Vec<(u64, NonceFingerprint)> =
+                entries.iter().map(|(k, e)| (*e, *k)).collect();
+            by_expiry.sort_unstable_by_key(|(e, _)| *e);
+            for (_, fp) in by_expiry.into_iter().take(to_remove) {
+                entries.remove(&fp);
+            }
         }
     }
 
@@ -205,6 +260,26 @@ mod tests {
         assert!(dnl.contains(fp(0xCAFE, 100), now));
         assert!(dnl.contains(fp(0xCAFE, 200), now));
         assert!(!dnl.contains(fp(0xCAFE, 300), now));
+    }
+
+    #[test]
+    fn d1_capacity_cap_bounds_unique_nonce_flood() {
+        // Long lifetime so nothing expires; small capacity so the cap, not the
+        // clock, is what bounds the table under a unique-nonce flood.
+        let cap = 100;
+        let dnl = DeadNonceList::with_lifetime_and_capacity(Duration::from_secs(3600), cap);
+        let now = 1_000_000_000u64;
+        for i in 0..10_000u64 {
+            dnl.insert(fp(i, i as u32), now);
+        }
+        // Never exceeds the ceiling (eviction keeps it at/under capacity).
+        assert!(
+            dnl.len() <= cap,
+            "DNL grew past capacity: {} > {cap}",
+            dnl.len()
+        );
+        // The most-recently-inserted nonce is still present (we evict oldest).
+        assert!(dnl.contains(fp(9_999, 9_999), now));
     }
 
     #[test]
