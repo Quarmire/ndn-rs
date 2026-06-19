@@ -49,9 +49,13 @@ impl Validator {
             use sha2::{Digest, Sha256};
             let hash = Sha256::digest(data.signed_region());
             if hash.as_slice() == data.sig_value() {
+                // Re-decode of already-validated bytes is infallible; propagate
+                // instead of panicking in the security hot path (audit N-2).
+                let Ok(inner) = Data::decode(data.raw().clone()) else {
+                    return ValidationResult::Invalid(TrustError::InvalidSignature);
+                };
                 let safe = SafeData {
-                    inner: Data::decode(data.raw().clone())
-                        .expect("already decoded, re-decode cannot fail"),
+                    inner,
                     trust_path: TrustPath::DigestSha256,
                     verified_at: now_ns(),
                 };
@@ -86,8 +90,11 @@ impl Validator {
             .await
         {
             WalkOutcome::Anchored(chain_names) => {
+                let Ok(inner) = Data::decode(data.raw().clone()) else {
+                    return ValidationResult::Invalid(TrustError::InvalidSignature);
+                };
                 let safe = SafeData {
-                    inner: Data::decode(data.raw().clone()).unwrap(),
+                    inner,
                     trust_path: TrustPath::CertChain(chain_names),
                     verified_at: now_ns(),
                 };

@@ -338,8 +338,15 @@ impl Validator {
             .await
             {
                 Ok(VerifyOutcome::Valid) => {
+                    // Re-decode of already-validated bytes is infallible; treat the
+                    // impossible failure as invalid rather than panicking in the
+                    // security hot path (audit N-2). Data isn't Clone (OnceLock
+                    // fields), so it is rebuilt from its raw bytes.
+                    let Ok(inner) = Data::decode(data.raw().clone()) else {
+                        return ValidationResult::Invalid(TrustError::InvalidSignature);
+                    };
                     let safe = SafeData {
-                        inner: Data::decode(data.raw().clone()).unwrap(),
+                        inner,
                         trust_path: crate::safe_data::TrustPath::DigestSha256,
                         verified_at: now_ns(),
                     };
@@ -391,8 +398,11 @@ impl Validator {
         .await
         {
             Ok(VerifyOutcome::Valid) => {
+                let Ok(inner) = Data::decode(data.raw().clone()) else {
+                    return ValidationResult::Invalid(TrustError::InvalidSignature);
+                };
                 let safe = SafeData {
-                    inner: Data::decode(data.raw().clone()).unwrap(),
+                    inner,
                     trust_path: crate::safe_data::TrustPath::CertChain(vec![
                         key_name.as_ref().clone(),
                     ]),
