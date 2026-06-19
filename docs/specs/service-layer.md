@@ -96,9 +96,9 @@ CORE (ndn-rs) — shared primitives
   crates/security/ndn-security/src/capability        simple key-bound capability  [NEW module]
 
 EXT (ndn-ext) — shared service substrate
-  crates/service/ndn-service-core                    Service/Carrier/SelectCarrier/Dispatch traits + TLV framing (§12)  [NEW — ratified, not built]
+  crates/service/ndn-service-core                    Service/Carrier/SelectCarrier/Dispatch/Frame traits (§12)  [built — traits]
   crates/service/ndn-service-macro                   #[ndn_service] proc-macro over ndn-service-core (§11.2/§12)        [NEW — ratified, not built]
-  crates/service/ndn-rpc                             Tier-0 typed Interest/Data RPC; provides RpcCarrier   [NEW — extracted from ndn-compute]
+  crates/service/ndn-rpc                             Tier-0 typed Interest/Data RPC; provides RpcCarrier (§12, proven)   [built]
   crates/compute/ndn-compute                         specialization of ndn-rpc ("the handler is a pure function")  [refactor onto ndn-rpc]
   crates/discovery/ndn-discovery::service_discovery  Tier-1 find/select               [exists; extend]
   crates/service/ndn-nacabe                          NAC protocol: AA serves PubParams/DKEY, ParamFetcher, CK-data naming  [NEW]
@@ -667,11 +667,14 @@ dynamic handlers run in the fuel-metered wasm sandbox (`ndn-compute`'s
 
 ## 12. Service trait and pluggable carriers (the v2 core)
 
-> Status: **ratified design** (decided 2026-06-19), not yet built. This is the
-> foundation the `#[ndn_service]` macro (§11.2 mode 2) targets. It generalises the
-> role surface (§7.2, `ndn-ndnsf::roles`, built) into a transport-independent
-> service abstraction that the compat layer **and** v2 **and** Tier-0 all share —
-> so the macro is the v2 surface, not a throwaway NDNSF nicety.
+> Status: **seam built and proven** (2026-06-19). `ndn-service-core` (the traits)
+> and the Tier-0 `RpcCarrier` over `ndn-rpc` are landed, with a hand-written
+> rendering of the macro's output (`ndn-rpc/tests/carrier_proof.rs`) round-tripping
+> a typed two-op service over the carrier (+ fail-closed on unknown op/service).
+> Still to build: the `NdnsfCarrier`, the v2 carrier, the `#[ndn_service]` macro
+> (§11.2 mode 2), and `SelectCarrier` impls. This generalises the role surface
+> (§7.2, `ndn-ndnsf::roles`, built) into a transport-independent service
+> abstraction the compat layer **and** v2 **and** Tier-0 all share.
 
 ### 12.1 The seam: contract vs carrier
 
@@ -760,11 +763,21 @@ The traits and macro are **shared substrate**, depended on by both compat and v2
 
 ```
 EXT (ndn-ext) — shared service substrate
-  crates/service/ndn-service-core    Service/Carrier/SelectCarrier/Dispatch/Invocation/Response + TLV framing trait  [NEW]
-  crates/service/ndn-service-macro   the #[ndn_service] proc-macro (emits over ndn-service-core)                     [NEW]
+  crates/service/ndn-service-core    Service/Carrier/SelectCarrier/Dispatch/Invocation/Response + Frame trait  [built]
+  crates/service/ndn-service-macro   the #[ndn_service] proc-macro (emits over ndn-service-core)               [not built]
 ```
 
-Carriers live with their transports: `RpcCarrier` in `ndn-rpc`, `NdnsfCarrier` in
-`ndn-ndnsf` (wrapping `ServiceNode`), the v2 carrier in `ndn-service`. No
-duplication: `ndn-rpc` stays the Tier-0 mechanism; `ServiceNode` stays the
-four-phase engine; the carrier is the uniform façade over them.
+Carriers live with their transports: `RpcCarrier` in `ndn-rpc` (**built + proven**),
+`NdnsfCarrier` in `ndn-ndnsf` (wrapping `ServiceNode`, not built), the v2 carrier
+in `ndn-service` (not built). No duplication: `ndn-rpc` stays the Tier-0
+mechanism; `ServiceNode` stays the four-phase engine; the carrier is the uniform
+façade over them.
+
+The `RpcCarrier` proof (`ndn-rpc/tests/carrier_proof.rs`) hand-writes the macro's
+output — a `Frame` request/response pair, a `Dispatch` routing two `OpId`s to a
+typed service impl, and a client generic over `C: Carrier` — and round-trips it
+over real `Interest`/`Data` through the `RpcRegistry`. It is an **in-process
+loopback** (invoke dispatches through the same registry serve mounted into); a
+face-backed `RpcCarrier` (Interest over a `Consumer`, registry served by a
+`Producer` on an engine) is the same impl wired to a transport, deferred — that
+engine plumbing is already witnessed in `ndn-nacabe`.
