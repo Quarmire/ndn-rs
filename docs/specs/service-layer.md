@@ -522,11 +522,16 @@ a bespoke profiler.
    interop), and `flow` (the sans-IO four-phase orchestration core: `ProviderEngine`
    issues a single-use token on `on_request`→ACK and consumes it on
    `on_selection`, running the handler and building the RESPONSE, **failing
-   closed** on a replayed/forged/expired token — the token-gated coordination).
-   **Remaining:** the async SVS pub/sub *driver* binding `flow` over
-   `SvsPubSub::publish`/`subscribe` (the `ServiceProvider`/`ServiceUser` loops),
-   and wiring `ndn-nacabe`'s KP-ABE `ServiceController` for access (closing the
-   last O4 gates NSF-A3/A4).
+   closed** on a replayed/forged/expired token — the token-gated coordination),
+   and `driver` (feature-gated) — the async SVS pub/sub binding: `serve_provider`
+   + `call` run the four-phase flow over `SvsPubSub`, dispatching by the
+   `NDNSF/<phase>` name marker and routing by token (only the issuing provider
+   consumes a SELECTION). **Witnessed end-to-end over real SVS convergence**
+   (`four_phase_over_svs`: two `SvsPubSub` nodes, broker-crossed medium, a full
+   REQUEST→ACK→SELECTION→RESPONSE round-trip). Per-phase spans flow to OTLP/NDN
+   (§8.1). **Remaining for full fidelity:** wire `ndn-nacabe`'s KP-ABE
+   `ServiceController` + per-message trust validation into the driver (NSF-A3),
+   and the unsigned-discovery posture (NSF-A4).
 6. v2: `ndn-service` (Tier-1 selection + Tier-2 collab, authority-as-signed-Data).
 
 ---
