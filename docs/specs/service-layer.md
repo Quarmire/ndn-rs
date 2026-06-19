@@ -96,16 +96,18 @@ CORE (ndn-rs) — shared primitives
   crates/security/ndn-security/src/capability        simple key-bound capability  [NEW module]
 
 EXT (ndn-ext) — shared service substrate
-  crates/service/ndn-rpc                             Tier-0 typed Interest/Data RPC   [NEW — extracted from ndn-compute]
+  crates/service/ndn-service-core                    Service/Carrier/SelectCarrier/Dispatch traits + TLV framing (§12)  [NEW — ratified, not built]
+  crates/service/ndn-service-macro                   #[ndn_service] proc-macro over ndn-service-core (§11.2/§12)        [NEW — ratified, not built]
+  crates/service/ndn-rpc                             Tier-0 typed Interest/Data RPC; provides RpcCarrier   [NEW — extracted from ndn-compute]
   crates/compute/ndn-compute                         specialization of ndn-rpc ("the handler is a pure function")  [refactor onto ndn-rpc]
   crates/discovery/ndn-discovery::service_discovery  Tier-1 find/select               [exists; extend]
   crates/service/ndn-nacabe                          NAC protocol: AA serves PubParams/DKEY, ParamFetcher, CK-data naming  [NEW]
 
 EXT (ndn-ext) — compat layer (faithful)
-  crates/service/ndn-ndnsf                           NDNSF four-phase + roles + KP-ABE controller  [NEW]
+  crates/service/ndn-ndnsf                           NDNSF four-phase + roles + KP-ABE controller; provides NdnsfCarrier (§12)  [roles/driver built]
 
 EXT (ndn-ext) — v2 layer (alternative)
-  crates/service/ndn-service                         Tier-1 selection + Tier-2 collab; authority-as-signed-Data; scoped authorities  [NEW]
+  crates/service/ndn-service                         Tier-1 selection + Tier-2 collab; authority-as-signed-Data; scoped authorities; v2 carrier + typed Topic<T>  [NEW]
 ```
 
 `ndn-ndnsf` (compat) and `ndn-service` (v2) depend on the *same* shared
@@ -604,9 +606,10 @@ A service is definable three ways, all over the same protocol:
    request ids are auto-assigned; `.signed(signer, validator)` flips on NSF-A3
    message trust. See `ndn-ndnsf::roles` and the `roles_ergonomics` witness.
 2. **`#[ndn_service]` trait** (typed, multi-method, *planned*) — the macro emits the
-   message taxonomy, dispatch, name routing, and a typed client over the role
-   surface. This is the *service definition mechanism*: a trait is the IDL,
-   checked by the compiler.
+   message taxonomy, dispatch, and a typed client **generic over a `Carrier`**
+   (§12), so one definition runs over Tier-0, the NDNSF four-phase, or v2
+   unchanged. Unary operations only (topics are a separate primitive). This is the
+   *service definition mechanism*: a trait is the IDL, checked by the compiler.
 3. **PyO3 decorator / Kotlin-Swift** (*planned*) — `@provider.handler` (or the mobile
    equivalent) bound to the embedded engine via `ndn-python` / boltffi.
 
@@ -656,6 +659,112 @@ dynamic handlers run in the fuel-metered wasm sandbox (`ndn-compute`'s
   mode 1, `roles_ergonomics` / `service_node_multi` witnesses); typed
   handler/registry (`ndn-rpc`, `ndn-compute`); KP-ABE policy backing
   (`ndn-nacabe::KpAuthority`); wasm sandbox (`ndn-compute`).
-- **Planned:** the `#[ndn_service]` proc-macro (mode 2, over the role surface);
-  the PyO3/boltffi *service* surface (mode 3); the TOML policy parser; the
-  remaining worked examples above.
+- **Planned:** the `#[ndn_service]` proc-macro (mode 2, emitted over the
+  **carrier seam** of §12 — not over one transport); the PyO3/boltffi *service*
+  surface (mode 3); the TOML policy parser; the remaining worked examples above.
+
+---
+
+## 12. Service trait and pluggable carriers (the v2 core)
+
+> Status: **ratified design** (decided 2026-06-19), not yet built. This is the
+> foundation the `#[ndn_service]` macro (§11.2 mode 2) targets. It generalises the
+> role surface (§7.2, `ndn-ndnsf::roles`, built) into a transport-independent
+> service abstraction that the compat layer **and** v2 **and** Tier-0 all share —
+> so the macro is the v2 surface, not a throwaway NDNSF nicety.
+
+### 12.1 The seam: contract vs carrier
+
+Separate the **typed contract** (what the service *is*) from the **carrier** (how
+an invocation is *named, transported, multiplexed across providers, and trusted*).
+This is the split every durable RPC system keeps (tarpc/tonic/Cap'n Proto), and
+NDN makes it cleaner: a response is fundamentally a **named, signed, cacheable
+Data object**, so a "carrier" is really a naming + retrieval model — exactly what
+differs between NDNSF four-phase, Tier-0 Interest/Data, and v2.
+
+### 12.2 The primitive set (small and orthogonal — the anti-"do-everything" line)
+
+- **`Operation`** — one **unary** typed method `async fn op(Req) -> Result<Resp>`.
+  The *only* RPC primitive. Streaming/bidi is a **non-goal**: it is where RPC
+  systems rot, and it is expressible by composing topics.
+- **`Carrier`** — the pluggable backend; owns naming, transport, multiplicity, and
+  trust:
+  ```rust
+  trait Carrier {
+      // client: invoke `op` of `svc` with a request blob → a response.
+      async fn invoke(&self, svc: &ServiceId, op: &OpId, req: Bytes) -> Result<Response>;
+      // server: run a macro-generated Dispatch (decode op → typed handler) until closed.
+      async fn serve(&self, dispatch: Arc<dyn Dispatch>);
+  }
+  struct Response { producer: Name, payload: Bytes, /* freshness, … */ }
+  // server-side context the carrier hands each invocation:
+  struct Invocation { op: OpId, request: Bytes, requester: Option<Name> /* for access */ }
+  trait Dispatch { async fn dispatch(&self, inv: Invocation) -> Result<Bytes>; }
+  ```
+- **Selection is a carrier *refinement*, not a contract concern** —
+  `trait SelectCarrier: Carrier { async fn invoke_select(.., Strategy) -> Vec<Response>; }`.
+  The generated client always exposes `op(req) -> Resp`; it *also* exposes
+  `op_select(req, Strategy) -> Vec<(Name, Resp)>` **only where `C: SelectCarrier`**
+  (a per-method `where`-bound). Compile-time depth-as-needed: a Tier-0
+  known-provider carrier literally cannot call the multi-provider form.
+- **Topics (pub/sub) are a *separate* primitive** (typed `Topic<T>` over SVS), not
+  a trait member. Tier-2 collaboration = services **+** topics *composed*. This is
+  the boundary that keeps `#[ndn_service]` from drifting into gRPC.
+
+### 12.3 The three carriers (one definition, three backends)
+
+| Carrier | Backend | Multiplicity | `SelectCarrier`? |
+|---|---|---|---|
+| `RpcCarrier` | Tier-0 `ndn-rpc`: signed Interest → signed Data, 1 RTT; idempotent via the Content Store | one known provider | no |
+| `NdnsfCarrier` | NDNSF four-phase over `ndn-ndnsf::ServiceNode`/driver; token coordination; `TrustCtx` | many providers | yes (FirstResponding/Random/All) |
+| v2 carrier | `ndn-service` (Tier-1 selection / Tier-2 collab); authority-as-signed-Data | per pattern | per pattern |
+
+### 12.4 What the macro generates
+
+From a unary trait, `#[ndn_service]` emits: the per-op `Req`/`Resp` message types
+(TLV framing, §12.5), a type-erased `Dispatch` impl that routes an `OpId` to the
+right typed handler method, and a client `EchoClient<C: Carrier>` whose methods
+call `carrier.invoke`. The client is **generic over the carrier** — the same
+`Echo` definition runs over `RpcCarrier`, `NdnsfCarrier`, or the v2 carrier
+unchanged. The trait is the IDL, checked by the compiler.
+
+### 12.5 The three disciplines (these are the design, not decoration)
+
+1. **TLV framing with skippable unknown fields** — never positional encoding.
+   Services evolve by appending optional fields; old and new peers interoperate.
+   (Reuses the project's TLV convention; *not* bincode.)
+2. **Idempotency + dedup** — a carrier may retry or multicast, so operations are
+   contractually idempotent, and multi-provider carriers enforce once-only
+   execution (NDNSF's token model already does). Documented per service.
+3. **Secure by default** — a carrier is constructed *with* trust (a `TrustCtx` /
+   capability verifier); running unauthenticated requires an explicit
+   `.insecure()`. Large responses segment via the object/RDR path inside the
+   carrier; the contract is oblivious to packet size.
+
+### 12.6 Abuse analysis (eyes-open)
+
+- **The `Carrier` surface is make-or-break.** Bare-`Bytes` returns can't carry
+  provider identity (selection), freshness, or ABE-sealed payloads; hence
+  `Response`/`Invocation` are the minimal-but-richer shapes above. Getting this
+  context object right is the crux of the build.
+- **Carrier-semantics leakage** — a service assuming exactly-once over an
+  at-least-once carrier. Defense: the idempotency contract + token-enforced
+  once-only execution on multi-provider carriers.
+- **Scope creep** toward streaming/bidi. Defense: explicit non-goal; compose two
+  topics.
+
+### 12.7 Crate layout (extends §2.2; preserves "extract once")
+
+The traits and macro are **shared substrate**, depended on by both compat and v2
+(so compat never depends on v2):
+
+```
+EXT (ndn-ext) — shared service substrate
+  crates/service/ndn-service-core    Service/Carrier/SelectCarrier/Dispatch/Invocation/Response + TLV framing trait  [NEW]
+  crates/service/ndn-service-macro   the #[ndn_service] proc-macro (emits over ndn-service-core)                     [NEW]
+```
+
+Carriers live with their transports: `RpcCarrier` in `ndn-rpc`, `NdnsfCarrier` in
+`ndn-ndnsf` (wrapping `ServiceNode`), the v2 carrier in `ndn-service`. No
+duplication: `ndn-rpc` stays the Tier-0 mechanism; `ServiceNode` stays the
+four-phase engine; the carrier is the uniform façade over them.
