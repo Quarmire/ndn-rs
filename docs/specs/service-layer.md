@@ -533,9 +533,17 @@ a bespoke profiler.
    payloads under the service's attributes and only a holder of a satisfying
    `ServiceController`-issued key decrypts — unauthorized fails closed
    (`secure_four_phase_over_svs` witness). This closes the NAC-ABE-authorization
-   half of NSF-A3. **Remaining for full fidelity:** app-layer per-message trust
-   validation (the trust half of NSF-A3, complementary to `SvsPubSub` signing)
-   and the unsigned-discovery posture (NSF-A4).
+   half of NSF-A3. **Selection strategies + request modes landed:** the message
+   taxonomy now carries `strategy` (155), `request_mode` (189), and
+   `target_provider` (161); `flow::select_providers` implements `FirstResponding`
+   / `RandomSelection` / `AllSelected` (unit-witnessed multi-provider), and the
+   driver's `select_and_call` collects ACKs over a window and honors the
+   strategy (the plain `call` remains the single-provider `FirstResponding`
+   convenience). **Remaining for full fidelity:** the Targeted fast path
+   (`RequestMode::Targeted`, token-pool) and the policy-file model
+   (ProviderPolicy/UserPolicy → `KpAuthority` grants); plus app-layer per-message
+   trust validation (the trust half of NSF-A3) and the unsigned-discovery
+   posture (NSF-A4).
 6. v2: `ndn-service` (Tier-1 selection + Tier-2 collab, authority-as-signed-Data).
 
 ---
