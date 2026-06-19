@@ -78,7 +78,7 @@ scope = spec   (flat under crates/)   NDN community specs implemented faithfully
   ndn-strategy                  BestRoute, Multicast, ASF, composed strategies
   ndn-security                  KeyChain, Signer/Verifier, TrustSchema, Validator, SafeData, Keyring/TrustContext
   ndn-engine                    ForwarderEngine, EngineBuilder/WasmEngineBuilder, pipeline, task topology
-  ndn-app                       Application API: Consumer, Producer, Subscriber
+  ndn-app                       Application API: Node (unified entry: fetch/serve/object/publish/subscribe/query) over Consumer/Producer/Publisher/Subscriber/Queryable
   ndn-ipc                       ForwarderClient, BlockingForwarderClient, chunked transfer
   ndn-discovery, ndn-discovery-core
                                 NDN AutoConfig, per-neighbor probe, NDNSD-style service discovery (announce + browse)

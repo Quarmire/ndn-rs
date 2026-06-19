@@ -6,6 +6,13 @@ opaque. Everything below is a re-export of `ndn-app`, `ndn-packet`,
 and `ndn-security` from the `ndn-rs-prelude` crate (library name
 `ndn`).
 
+> **Start with `Node`.** For most apps the one type to learn is
+> [`Node`](./node-cookbook.md) — a single handle that exposes every pattern
+> (`fetch` / `serve` / `object` / `publish` / `subscribe` / `query`) over one
+> forwarder connection. The per-pattern types below (`Consumer`, `Producer`, …)
+> are the building blocks `Node` delegates to, reachable via `node.connection()`
+> when you need them.
+
 Package vs library: `Cargo.toml` carries `ndn-rs-prelude = "0.1"`;
 imports read `use ndn::Consumer;`. The split is recorded in
 `crates/ndn-rs-prelude/Cargo.toml`.
@@ -56,10 +63,12 @@ println!("got {} bytes", data.content().len());
   and reassembles segmented `Data`. Segments are fetched **pipelined** (a
   sliding window of in-flight Interests, retransmitting on a stall), so
   throughput is `window / RTT × chunk` rather than one round-trip per segment.
-- `fetch_object_to_file_hinted_progress(name, validator, hint, file, on_progress)`
-  **streams** each verified segment to a file at its byte offset as it arrives —
-  the object is never held in memory, so an arbitrarily large object is received
-  with flat memory. `on_progress(received, total)` drives a download bar.
+- `object(name)` returns a fluent builder — `object(name).verify(v).hint([..])
+  .progress(cb).to_file(&file)` **streams** each verified segment to a file at
+  its byte offset as it arrives, so an arbitrarily large object is received with
+  flat memory; `.fetch()` reassembles in memory, `.stream(..)` hands each segment
+  to a callback. See [The Node cookbook](./node-cookbook.md#fetch-an-object-rdr).
+  (The old `fetch_object_*` methods are deprecated in favour of this builder.)
 - `fetch_on(face_id, name)` pins the Interest to a face via
   `NextHopFaceId` — useful for measurement or multipath tests.
 - The Consumer applies the configured `ValidationPolicy` to every

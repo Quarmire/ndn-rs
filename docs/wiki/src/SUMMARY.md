@@ -39,6 +39,7 @@
 
 # API
 
+- [The Node cookbook](./api/node-cookbook.md)
 - [Develop tier](./api/develop.md)
 - [Extend tier](./api/extend.md)
 - [Instrument tier](./api/instrument.md)
