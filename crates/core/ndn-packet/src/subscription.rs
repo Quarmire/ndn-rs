@@ -1,3 +1,6 @@
+#[cfg(all(not(feature = "std"), not(target_arch = "wasm32")))]
+use alloc::vec::Vec;
+
 use bytes::Bytes;
 use ndn_tlv::{TlvReader, TlvWriter};
 
