@@ -65,6 +65,14 @@ impl Queryable {
         }
     }
 
+    /// Build a `Queryable` over an existing [`Connection`]. The caller must have
+    /// registered `prefix` with the forwarder first (the [`connect`](Self::connect)
+    /// path does this; [`Node::query`](crate::Node::query) does it before calling
+    /// this).
+    pub fn from_connection(conn: Arc<dyn Connection>, prefix: Name) -> Self {
+        Self { conn, prefix }
+    }
+
     pub fn prefix(&self) -> &Name {
         &self.prefix
     }

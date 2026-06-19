@@ -47,6 +47,8 @@ pub use producer::{Producer, Router};
 pub use publisher::{Publisher, PublisherConfig};
 pub use queryable::{Query, Queryable};
 pub use reflexive::random_reflexive_name;
+pub mod node;
+pub use node::Node;
 pub use responder::Responder;
 pub use security::KeyChain;
 pub use subscriber::{Sample, Subscriber, SubscriberConfig};

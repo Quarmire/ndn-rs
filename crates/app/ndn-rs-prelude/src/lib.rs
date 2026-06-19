@@ -37,8 +37,8 @@ pub use ndn_security::{
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use ndn_app::{
-    AppError, Connection, Consumer, InProcConnection, IpcConnection, KeyChain, Producer, Query,
-    Queryable, Responder, Sample, Subscriber, SubscriberConfig, VerifiedConsumer,
+    AppError, Connection, Consumer, InProcConnection, IpcConnection, KeyChain, Node, Producer,
+    Query, Queryable, Responder, Sample, Subscriber, SubscriberConfig, VerifiedConsumer,
 };
 
 pub mod prelude {
@@ -49,6 +49,7 @@ pub mod prelude {
 
     #[cfg(not(target_arch = "wasm32"))]
     pub use crate::{
-        AppError, Consumer, KeyChain, Producer, Query, Queryable, Subscriber, VerifiedConsumer,
+        AppError, Consumer, KeyChain, Node, Producer, Query, Queryable, Subscriber,
+        VerifiedConsumer,
     };
 }

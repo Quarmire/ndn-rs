@@ -31,4 +31,11 @@ pub enum AppError {
     /// `VerifyError` rendered for logging.
     #[error("data failed verification: {0}")]
     Unverified(String),
+    /// The operation needs a capability this handle doesn't have — e.g. a
+    /// [`Node`](crate::Node) built from a single pre-made connection can't open
+    /// the *dedicated* connection that sync (`publish`/`subscribe`) and the query
+    /// responder require. Use [`Node::connect`](crate::Node::connect) (which can
+    /// re-dial) or build the pattern type directly from [`Node::connection`].
+    #[error("unsupported on this handle: {0}")]
+    Unsupported(String),
 }
