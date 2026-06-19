@@ -136,6 +136,22 @@ provenance hint (`SOURCE_BUNDLE_HASH`, TLV `0x041A`) recording the SHA-256
 digest of the source trust bundle a context was projected from; old nodes skip
 it per the NDN evolvability rule.
 
+## Strictness divergences (stricter than ndn-cxx/NFD)
+
+| Area | ndn-rs behavior | References |
+|---|---|---|
+| **Non-minimal VAR-NUMBER** | `read_varu64` **rejects** a TLV-TYPE/TLV-LENGTH written in a longer-than-minimal form (`TlvError::NonMinimalVarNumber`). | ndn-cxx / NFD / NDNts decode such forms **leniently**. |
+
+This is **intentional**: a minimal-length VAR-NUMBER is the canonical wire form,
+and rejecting non-minimal encodings avoids two distinct wire representations of
+the same logical packet. The NDN Packet Format recommends minimal encoding, and
+the reference implementations *emit* minimal forms, so in practice interop is not
+affected — a conforming peer never sends a non-minimal length. ndn-rs likewise
+encodes minimally. The only one-directional risk is a hand-crafted or
+deliberately non-minimal encoder; a differential test against python-ndn / NDNts
+is tracked to confirm the references never emit non-minimal lengths in the wild.
+(Audit finding I-1.)
+
 ## TLV codepoint allocations
 
 ndn-rs's TLV allocations split into three classes:
