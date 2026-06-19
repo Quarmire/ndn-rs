@@ -174,6 +174,20 @@ impl PacketRing {
         let tp_mac = unsafe { (*hdr).tp_mac } as usize;
         let tp_snaplen = unsafe { (*hdr).tp_snaplen } as usize;
 
+        // ETH-1: the kernel guarantees tp_mac + tp_snaplen fits the frame for
+        // TPACKET_V2, but an unsafe slice built from header-supplied offsets
+        // must assert it. On violation, consume the frame and skip it rather
+        // than reading out of bounds.
+        if tp_mac
+            .checked_add(tp_snaplen)
+            .is_none_or(|end| end > RING_FRAME_SIZE as usize)
+        {
+            unsafe { write_tp_status(frame, libc::TP_STATUS_KERNEL) };
+            self.rx_head
+                .store((idx + 1) % self.rx_frame_nr, Ordering::Relaxed);
+            return None;
+        }
+
         let sll_offset = tpacket_align(std::mem::size_of::<libc::tpacket2_hdr>());
         let sll = unsafe { &*(frame.add(sll_offset) as *const libc::sockaddr_ll) };
         let src_mac = MacAddr({
@@ -193,6 +207,15 @@ impl PacketRing {
     }
 
     pub fn try_push_tx(&self, data: &[u8]) -> bool {
+        // ETH-2: the mmap TX frame is a fixed RING_FRAME_SIZE slot. The unsafe
+        // copy must not trust the caller's length — reject anything that would
+        // overflow the frame, even though the paired LP fragmenter clamps to the
+        // 1500 ether MTU upstream. (Latent OOB write made impossible here.)
+        match TX_DATA_OFFSET.checked_add(data.len()) {
+            Some(end) if end <= RING_FRAME_SIZE as usize => {}
+            _ => return false,
+        }
+
         let mut head = self.tx_head.lock().unwrap();
         let frame = self.tx_frame(*head);
 

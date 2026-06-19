@@ -14,8 +14,14 @@ use ndn_transport::{
 };
 
 /// Hard maximum UDP datagram payload (65535 − 8-byte UDP header − 20-byte
-/// minimum IPv4 header). `set_send_mtu` rejects larger values.
+/// minimum IPv4 header).
 const UDP_HARD_MAX: u64 = 65507;
+
+/// Receive-buffer size, and therefore the largest datagram this face can accept
+/// without truncation. `set_send_mtu` is capped to this (audit DG-1): advertising
+/// a send MTU larger than the receive buffer would let a peer send datagrams that
+/// are silently truncate-dropped on receipt.
+const UDP_RECV_BUF: usize = 9000;
 
 /// NDN transport over unicast UDP.
 ///
@@ -145,6 +151,13 @@ impl Transport for UdpFace {
                     reason: "udp-max-65507",
                 });
             }
+            // DG-1: never advertise a send MTU larger than the receive buffer,
+            // or peers' larger datagrams would be truncate-dropped here.
+            Some(n) if n > UDP_RECV_BUF as u64 => {
+                return Err(MtuError::OutOfRange {
+                    reason: "udp send MTU cannot exceed the receive buffer",
+                });
+            }
             Some(n) => n as usize,
         };
         self.mtu.store(new, Ordering::Relaxed);
@@ -208,7 +221,7 @@ impl UdpFace {
     /// `udp-recvmmsg` batch path is enabled on Linux).
     #[cfg(not(all(feature = "udp-recvmmsg", target_os = "linux")))]
     async fn recv_bytes_single(&self) -> Result<Bytes, FaceError> {
-        let mut buf = [0u8; 9000];
+        let mut buf = [0u8; UDP_RECV_BUF];
         loop {
             let (n, src) = self.socket.recv_from(&mut buf).await?;
             // Match on IP + port only, NOT the full `SocketAddr`: for an IPv6
