@@ -5,3 +5,6 @@ testbed/results/
 .claude/
 .claude
 /Cargo.lock
+docs/notes/
+meta_err.txt
+e.txt
