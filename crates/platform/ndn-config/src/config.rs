@@ -680,10 +680,12 @@ fn default_link_cost() -> f64 {
 impl std::str::FromStr for ForwarderConfig {
     type Err = ConfigError;
 
-    /// `${VAR}` references are expanded before deserialization; unknown
-    /// variables become empty strings.
+    /// `${VAR}` references are expanded before deserialization. An unset variable
+    /// or an unterminated `${` is a hard error (audit CFG-3): a silent empty
+    /// substitution could turn a security-relevant path (a cert/PIB path, a
+    /// listen address) into `""`.
     fn from_str(s: &str) -> Result<Self, ConfigError> {
-        let expanded = expand_env_vars(s);
+        let expanded = expand_env_vars(s)?;
         let cfg: ForwarderConfig = toml::from_str(&expanded)?;
         cfg.validate()?;
         Ok(cfg)
@@ -740,24 +742,41 @@ impl ForwarderConfig {
     }
 }
 
-fn expand_env_vars(s: &str) -> String {
+fn expand_env_vars(s: &str) -> Result<String, ConfigError> {
     let mut result = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     while let Some(ch) = chars.next() {
         if ch == '$' && chars.peek() == Some(&'{') {
-            chars.next();
-            let var_name: String = chars.by_ref().take_while(|&c| c != '}').collect();
+            chars.next(); // consume '{'
+            let mut var_name = String::new();
+            let mut closed = false;
+            for c in chars.by_ref() {
+                if c == '}' {
+                    closed = true;
+                    break;
+                }
+                var_name.push(c);
+            }
+            // Reject an unterminated `${...` instead of consuming to end-of-input.
+            if !closed {
+                return Err(ConfigError::Invalid(format!(
+                    "unterminated `${{` in config (variable `{var_name}` has no closing `}}`)"
+                )));
+            }
+            // Reject an unset variable instead of silently substituting "".
             match std::env::var(&var_name) {
                 Ok(val) => result.push_str(&val),
                 Err(_) => {
-                    tracing::warn!(var = %var_name, "unknown env var, replacing with empty string");
+                    return Err(ConfigError::Invalid(format!(
+                        "config references unset environment variable `${{{var_name}}}`"
+                    )));
                 }
             }
         } else {
             result.push(ch);
         }
     }
-    result
+    Ok(result)
 }
 
 fn validate_face_config(face: &FaceConfig) -> Result<(), ConfigError> {
@@ -1631,8 +1650,28 @@ file = "/var/log/ndn/router.log"
 
     #[test]
     fn example_file_parses() {
+        // The example is a deployment template referencing env-var placeholders;
+        // set them so expansion succeeds (unset vars now hard-error — CFG-3).
+        // SAFETY: single-threaded test; no concurrent env access.
+        unsafe {
+            std::env::set_var("CLOUDFLARE_API_TOKEN", "test-token");
+            std::env::set_var("CLOUDFLARE_ZONE_ID", "test-zone");
+        }
         let s = include_str!("../../../../deploy/ndn-fwd.example.toml");
         ForwarderConfig::from_str(s).expect("example config should parse");
+    }
+
+    #[test]
+    fn cfg3_unset_env_var_errors() {
+        // An unset ${VAR} must hard-error, not silently expand to "".
+        let toml = "listen = \"${DEFINITELY_UNSET_VAR_XYZ}\"\n";
+        assert!(ForwarderConfig::from_str(toml).is_err());
+    }
+
+    #[test]
+    fn cfg3_unterminated_env_var_errors() {
+        let toml = "listen = \"${OPEN_BUT_NEVER_CLOSED\"\n";
+        assert!(ForwarderConfig::from_str(toml).is_err());
     }
 
     #[test]
