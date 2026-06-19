@@ -136,7 +136,12 @@ impl Ed25519Verifier {
     pub fn verify_sync(&self, region: &[u8], sig_value: &[u8], public_key: &[u8]) -> VerifyOutcome {
         use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
 
-        let Ok(vk) = VerifyingKey::from_bytes(public_key.try_into().unwrap_or(&[0u8; 32])) else {
+        // Reject a wrong-length key outright rather than substituting a zero key
+        // (audit X-4) — matches the async `verify` path's InvalidKey behaviour.
+        let Ok(pk_bytes): Result<&[u8; 32], _> = public_key.try_into() else {
+            return VerifyOutcome::Invalid;
+        };
+        let Ok(vk) = VerifyingKey::from_bytes(pk_bytes) else {
             return VerifyOutcome::Invalid;
         };
 
@@ -265,7 +270,10 @@ impl Verifier for Blake3KeyedVerifier {
                 return Ok(VerifyOutcome::Invalid);
             };
             let hash = crate::signer::blake3_keyed_hash_auto(key, region);
-            if hash.as_bytes() == expected {
+            // Constant-time tag comparison for the keyed (MAC) path — `blake3::Hash`
+            // implements constant-time `==`, unlike the `[u8; 32]` array compare
+            // which short-circuits and leaks timing (audit C-1).
+            if hash == blake3::Hash::from_bytes(*expected) {
                 Ok(VerifyOutcome::Valid)
             } else {
                 Ok(VerifyOutcome::Invalid)
