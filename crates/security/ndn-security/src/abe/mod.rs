@@ -8,11 +8,16 @@
 //! per-recipient key-wrap (NAC) sit below it in `ndn-crypto-core`. ABE is for
 //! named-radio / broadcast fan-out where enumerating recipients does not scale.
 //!
-//! Two schemes are wrapped:
+//! Three schemes are wrapped, one per access-control topology:
 //! - [`bsw_setup`] / [`bsw_keygen`] / [`bsw_encrypt`] / [`bsw_decrypt`] —
-//!   Bethencourt-Sahai-Waters CP-ABE (single authority).
-//! - [`aw11_global_setup`] and friends — Lewko-Waters / AW11 MA-ABE
-//!   (multi-authority).
+//!   Bethencourt-Sahai-Waters **CP-ABE** (single authority; producer sets the
+//!   policy). For producer-owned content confidentiality.
+//! - [`lsw_setup`] / [`lsw_keygen`] / [`lsw_encrypt`] / [`lsw_decrypt`] —
+//!   Lewko-Sahai-Waters **KP-ABE** (single authority; the *key* carries the
+//!   policy, the *ciphertext* carries attributes). For centrally-governed access
+//!   — the model the faithful NDNSF `ServiceController` uses.
+//! - [`aw11_global_setup`] and friends — Lewko-Waters / AW11 **MA-ABE**
+//!   (multi-authority). For cross-domain federation.
 //!
 //! [`AbeCiphertext`] is the versioned NDN-TLV container that carries a
 //! scheme-produced ciphertext plus the policy string and KGC references; it
@@ -41,6 +46,7 @@ pub mod multi_authority;
 pub mod policy;
 pub mod policy_block;
 pub mod scheme;
+pub mod scheme_kp;
 pub mod types;
 
 pub use ciphertext::{AbeCiphertext, CIPHERTEXT_SCHEMA_VERSION, KgcRef};
@@ -55,6 +61,9 @@ pub use scheme::{
     BswAttributeKeys, BswMasterParams, BswMasterSecret, bsw_decrypt, bsw_encrypt, bsw_keygen,
     bsw_setup,
 };
+pub use scheme_kp::{
+    KpMasterParams, KpMasterSecret, KpPolicyKey, lsw_decrypt, lsw_encrypt, lsw_keygen, lsw_setup,
+};
 
 use ndn_foundation_types::{Hash, Name};
 
@@ -65,6 +74,9 @@ pub enum AbeSchemeId {
     BSW,
     /// Lewko-Waters / AW11 MA-ABE (multi-authority).
     LewkoWaters,
+    /// Lewko-Sahai-Waters KP-ABE (single-authority, key-policy). The inverse of
+    /// BSW: the key carries the policy, the ciphertext carries the attributes.
+    KpAbe,
 }
 
 /// Encrypt `plaintext` under `policy` using BSW CP-ABE (single-authority).
@@ -83,6 +95,7 @@ pub fn encrypt(
         schema_version: CIPHERTEXT_SCHEMA_VERSION,
         scheme: AbeSchemeId::BSW,
         policy_source: policy.to_canonical(),
+        attributes: vec![],
         kgc_refs: vec![KgcRef {
             kgc_did: kgc_name.clone(),
             master_params_hash: *params_hash,
@@ -107,10 +120,86 @@ pub fn decrypt(
     bsw_decrypt(attribute_keys, &ciphertext.rabe_ciphertext_bytes)
 }
 
+/// Encrypt `plaintext` tagged with `attributes` using LSW KP-ABE
+/// (single-authority, key-policy). The controller-issued key carries the policy;
+/// here the producer only tags the ciphertext with service attributes. This is
+/// the model the faithful NDNSF `ServiceController` uses.
+///
+/// `kgc_master` is `(kgc_name, master_params_hash, KpMasterParams)`; the name and
+/// hash are embedded so consumers can locate the authority to fetch their key.
+pub fn encrypt_kp(
+    attributes: &[String],
+    plaintext: &[u8],
+    kgc_master: &(Name, Hash, KpMasterParams),
+) -> Result<AbeCiphertext, AbeError> {
+    let (kgc_name, params_hash, mp) = kgc_master;
+    let rabe_ct_bytes = lsw_encrypt(mp, attributes, plaintext)?;
+    Ok(AbeCiphertext {
+        schema_version: CIPHERTEXT_SCHEMA_VERSION,
+        scheme: AbeSchemeId::KpAbe,
+        policy_source: String::new(),
+        attributes: attributes.to_vec(),
+        kgc_refs: vec![KgcRef {
+            kgc_did: kgc_name.clone(),
+            master_params_hash: *params_hash,
+        }],
+        rabe_ciphertext_bytes: rabe_ct_bytes,
+    })
+}
+
+/// Decrypt a KP-ABE ciphertext using a consumer's policy key.
+pub fn decrypt_kp(
+    ciphertext: &AbeCiphertext,
+    policy_key: &KpPolicyKey,
+) -> Result<Vec<u8>, AbeError> {
+    if ciphertext.scheme != AbeSchemeId::KpAbe {
+        return Err(AbeError::UnsupportedScheme(ciphertext.scheme));
+    }
+    if ciphertext.schema_version != CIPHERTEXT_SCHEMA_VERSION {
+        return Err(AbeError::UnsupportedCiphertextVersion(
+            ciphertext.schema_version,
+        ));
+    }
+    lsw_decrypt(policy_key, &ciphertext.rabe_ciphertext_bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use ndn_foundation_types::{TlvDecode, TlvEncode};
+
+    /// O2 spike: confirm `rabe` 0.4 exposes a usable **KP-ABE** scheme (`lsw`) —
+    /// the inverse of CP-ABE (the *key* carries the policy, the *ciphertext*
+    /// carries the attributes) — and that its ciphertext is serde/bincode
+    /// serializable (a pinnable wire). The faithful NDNSF `KpAttributeAuthority`
+    /// requires exactly this. If this passes, the KP-ABE wrapper can mirror the
+    /// existing BSW (CP-ABE) wrapper with the keygen/encrypt arguments swapped.
+    #[test]
+    fn lsw_kp_abe_round_trips_and_serializes() {
+        use rabe::schemes::lsw;
+        use rabe::utils::policy::pest::PolicyLanguage;
+
+        let (pk, msk) = lsw::setup();
+        let plaintext = b"content-key bytes under KP-ABE".to_vec();
+
+        // KP-ABE: the ciphertext is tagged with ATTRIBUTES...
+        let ct = lsw::encrypt(&pk, &["mavlink", "execute"], &plaintext).expect("kp encrypt");
+
+        // ...and the KEY carries the POLICY. A satisfied policy decrypts.
+        let sk_ok = lsw::keygen(&pk, &msk, r#""mavlink" or "camera""#, PolicyLanguage::HumanPolicy)
+            .expect("keygen ok");
+        assert_eq!(lsw::decrypt(&sk_ok, &ct).expect("decrypt ok"), plaintext);
+
+        // An unsatisfied policy fails (negative control).
+        let sk_no = lsw::keygen(&pk, &msk, r#""camera" and "admin""#, PolicyLanguage::HumanPolicy)
+            .expect("keygen no");
+        assert!(lsw::decrypt(&sk_no, &ct).is_err());
+
+        // Pinnable wire: bincode round-trip the ciphertext; it still decrypts.
+        let wire = bincode::serialize(&ct).expect("serialize");
+        let ct2: lsw::KpAbeCiphertext = bincode::deserialize(&wire).expect("deserialize");
+        assert_eq!(lsw::decrypt(&sk_ok, &ct2).expect("decrypt after wire"), plaintext);
+    }
 
     fn setup_kgc(name: &str) -> (Name, Hash, BswMasterParams, BswMasterSecret) {
         let kgc_name: Name = name.parse().unwrap();
@@ -127,6 +216,34 @@ mod tests {
         let ct = encrypt(&policy, b"patient record", &(kgc_name, hash, mp)).unwrap();
         let recovered = decrypt(&ct, &ak).unwrap();
         assert_eq!(recovered, b"patient record");
+    }
+
+    #[test]
+    fn kp_encrypt_decrypt_round_trip_through_container() {
+        // The NDNSF controller model: producer tags content with attributes; the
+        // controller issues a key whose policy is satisfied by them.
+        let (mp, ms) = lsw_setup().unwrap();
+        let kgc_name: Name = "/muas/controller".parse().unwrap();
+        let hash = Hash::of(&mp.public_key_bytes);
+        let attrs = vec!["service:mavlink".to_string(), "perm:execute".to_string()];
+
+        // `mp` is cloned into the encrypt tuple so it remains available for keygen.
+        let ct = encrypt_kp(&attrs, b"flight command", &(kgc_name, hash, mp.clone())).unwrap();
+        // The container records scheme + the inspectable attribute set.
+        assert_eq!(ct.scheme, AbeSchemeId::KpAbe);
+        assert_eq!(ct.attributes, attrs);
+        assert!(ct.policy_source.is_empty());
+
+        // Round-trip the container through TLV, then decrypt with a satisfied key.
+        let ct = AbeCiphertext::decode_from_bytes(ct.encode_to_bytes()).unwrap();
+        let policy = PolicyExpr::parse("service:mavlink OR service:camera").unwrap();
+        let key = lsw_keygen(&mp, &ms, &policy).unwrap();
+        assert_eq!(decrypt_kp(&ct, &key).unwrap(), b"flight command");
+
+        // A non-satisfying key is rejected through the typed path too.
+        let bad_policy = PolicyExpr::parse("service:camera AND perm:admin").unwrap();
+        let bad_key = lsw_keygen(&mp, &ms, &bad_policy).unwrap();
+        assert!(matches!(decrypt_kp(&ct, &bad_key), Err(AbeError::DecryptionFailed)));
     }
 
     #[test]

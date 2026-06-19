@@ -29,3 +29,7 @@ pub const ABE_POLICY_BLOCK_TYPE: u64 = 276;
 pub const ABE_AW11_GLOBAL_KEY_TYPE: u64 = 278;
 /// `Aw11PublicKey` bytes for one authority.
 pub const ABE_AW11_PUB_KEY_TYPE: u64 = 280;
+/// Envelope holding the ciphertext-side attribute set (KP-ABE).
+pub const ABE_ATTRIBUTES_TYPE: u64 = 282;
+/// One attribute string inside [`ABE_ATTRIBUTES_TYPE`].
+pub const ABE_ATTRIBUTE_TYPE: u64 = 284;

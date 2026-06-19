@@ -11,6 +11,9 @@ classification = "spec"
 [dependencies]
 ndn-packet    = { workspace = true, features = ["std"] }
 ndn-tlv       = { workspace = true, features = ["std"] }
+# Shared no_std AEAD baseline (ChaCha20-Poly1305 seal/open over a signed region);
+# the `confidentiality` (content-key) module delegates its AEAD to it.
+ndn-crypto-core = { workspace = true }
 bytes         = { workspace = true, features = ["std"] }
 dashmap       = { workspace = true }
 thiserror     = { workspace = true }
@@ -38,6 +41,8 @@ sec1          = { version = "0.7",  default-features = false, features = ["std",
 pkcs8         = { version = "0.10", default-features = false, features = ["std", "alloc", "encryption", "pem"] }
 pkcs5         = { version = "0.7",  default-features = false, features = ["alloc", "pbes2"] }
 sha2          = { workspace = true }
+# Zeroize content-key material on drop (the `confidentiality` module).
+zeroize       = { version = "1", features = ["derive"] }
 # Symmetric crypto for SafeBag's PKCS#8-encrypted private key wrapping
 # (PBES2 / PBKDF2-HMAC-SHA256 / AES-256-CBC, matching what OpenSSL's
 # PKCS8_encrypt produces by default on modern releases).

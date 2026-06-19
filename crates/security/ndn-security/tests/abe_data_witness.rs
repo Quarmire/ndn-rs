@@ -72,6 +72,7 @@ fn maabe_ciphertext_rides_signed_data_and_policy_gates() {
         schema_version: CIPHERTEXT_SCHEMA_VERSION,
         scheme: AbeSchemeId::LewkoWaters,
         policy_source: "/auth-a/dept:eng AND /auth-b/clearance:high".into(),
+        attributes: vec![],
         kgc_refs: vec![],
         rabe_ciphertext_bytes: blob,
     };

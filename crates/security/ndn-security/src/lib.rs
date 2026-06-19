@@ -13,6 +13,8 @@
 
 #[cfg(feature = "abe")]
 pub mod abe;
+pub mod capability;
+pub mod confidentiality;
 #[cfg(feature = "custodian")]
 pub mod custodian;
 pub mod safebag;
@@ -49,7 +51,11 @@ pub mod verifier;
 #[cfg(feature = "yubikey-piv")]
 pub mod yubikey;
 
+pub use capability::{Capability, CapabilityError};
 pub use cert_cache::{CertCache, Certificate};
+pub use confidentiality::{
+    ContentKey, EpochPolicy, RotatingKey, Sealed, unwrap_ck, wrap_ck,
+};
 pub use cert_fetcher::{CertFetcher, FetchFn};
 pub use error::TrustError;
 pub use key_store::{KeyAlgorithm, KeyStore, MemKeyStore};

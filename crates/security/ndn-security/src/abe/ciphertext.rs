@@ -26,7 +26,12 @@ use crate::abe::AbeSchemeId;
 use crate::abe::types::*;
 
 /// Current schema version for `AbeCiphertext` encoding.
-pub const CIPHERTEXT_SCHEMA_VERSION: u16 = 1;
+///
+/// v2 added the [`AbeCiphertext::attributes`] field for KP-ABE (the
+/// ciphertext-side attribute set). ABE ciphertext does not interoperate with the
+/// C++ NAC-ABE/openabe stack (see `docs/specs/service-layer.md` §7.3), so this is
+/// a self-owned format and the version bump has no external consumers.
+pub const CIPHERTEXT_SCHEMA_VERSION: u16 = 2;
 
 /// Versioned TLV container for an ABE ciphertext.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -35,11 +40,19 @@ pub struct AbeCiphertext {
     pub schema_version: u16,
     /// The ABE scheme that produced this ciphertext.
     pub scheme: AbeSchemeId,
-    /// The policy expression string (canonical form).
+    /// The **access selector**, scheme-dependent: for CP-ABE/MA-ABE the policy
+    /// expression (canonical form) the ciphertext enforces; for KP-ABE empty
+    /// (the policy lives in the key — see [`Self::attributes`]).
     pub policy_source: String,
+    /// The ciphertext-side **attribute set** for KP-ABE (empty for CP/MA, whose
+    /// selector is [`Self::policy_source`]). Carried in the container — not only
+    /// inside the opaque rabe blob — so it is inspectable without decrypting and
+    /// bindable as AEAD associated data.
+    pub attributes: Vec<String>,
     /// KGC references. Empty for inline single-authority tests.
     pub kgc_refs: Vec<KgcRef>,
-    /// bincode-serialized rabe ciphertext (`CpAbeCiphertext` or `Aw11Ciphertext`).
+    /// bincode-serialized rabe ciphertext (`CpAbeCiphertext`, `Aw11Ciphertext`,
+    /// or `KpAbeCiphertext`).
     pub rabe_ciphertext_bytes: Bytes,
 }
 
@@ -72,12 +85,14 @@ impl AbeSchemeId {
         match self {
             AbeSchemeId::BSW => 1,
             AbeSchemeId::LewkoWaters => 2,
+            AbeSchemeId::KpAbe => 3,
         }
     }
     pub(crate) const fn from_wire_disc(b: u8) -> Option<Self> {
         match b {
             1 => Some(AbeSchemeId::BSW),
             2 => Some(AbeSchemeId::LewkoWaters),
+            3 => Some(AbeSchemeId::KpAbe),
             _ => None,
         }
     }
@@ -98,6 +113,15 @@ impl TlvEncode for AbeCiphertext {
         // policy_source
         w.write_nested(ABE_POLICY_SOURCE_TYPE, |inner: &mut TlvWriter| {
             inner.write_raw(self.policy_source.as_bytes());
+        });
+
+        // attributes (KP-ABE ciphertext-side set; empty envelope for CP/MA)
+        w.write_nested(ABE_ATTRIBUTES_TYPE, |attrs_w: &mut TlvWriter| {
+            for attr in &self.attributes {
+                attrs_w.write_nested(ABE_ATTRIBUTE_TYPE, |aw: &mut TlvWriter| {
+                    aw.write_raw(attr.as_bytes());
+                });
+            }
         });
 
         // kgc_refs
@@ -158,6 +182,33 @@ impl TlvDecode for AbeCiphertext {
         let policy_bytes = r.read_bytes(len)?;
         let policy_source = String::from_utf8(policy_bytes.to_vec())
             .map_err(|_| TlvCodecError::MalformedField(ABE_POLICY_SOURCE_TYPE))?;
+
+        // attributes
+        let typ = r.read_type()?;
+        if typ != ABE_ATTRIBUTES_TYPE {
+            return Err(TlvCodecError::UnexpectedType {
+                expected: ABE_ATTRIBUTES_TYPE,
+                found: typ,
+            });
+        }
+        let attrs_len = r.read_length()?;
+        let mut attrs_r = r.scoped(attrs_len)?;
+        let mut attributes = Vec::new();
+        while !attrs_r.is_empty() {
+            let typ = attrs_r.read_type()?;
+            if typ != ABE_ATTRIBUTE_TYPE {
+                return Err(TlvCodecError::UnexpectedType {
+                    expected: ABE_ATTRIBUTE_TYPE,
+                    found: typ,
+                });
+            }
+            let alen = attrs_r.read_length()?;
+            let abytes = attrs_r.read_bytes(alen)?;
+            attributes.push(
+                String::from_utf8(abytes.to_vec())
+                    .map_err(|_| TlvCodecError::MalformedField(ABE_ATTRIBUTE_TYPE))?,
+            );
+        }
 
         // kgc_refs
         let typ = r.read_type()?;
@@ -220,6 +271,7 @@ impl TlvDecode for AbeCiphertext {
             schema_version,
             scheme,
             policy_source,
+            attributes,
             kgc_refs,
             rabe_ciphertext_bytes,
         })
@@ -235,6 +287,7 @@ mod tests {
             schema_version: CIPHERTEXT_SCHEMA_VERSION,
             scheme,
             policy_source: "role:doctor AND dept:cardiology".into(),
+            attributes: vec![],
             kgc_refs: vec![KgcRef {
                 kgc_did: "/hospital/kgc".parse().unwrap(),
                 master_params_hash: Hash::of(b"params"),
@@ -266,8 +319,26 @@ mod tests {
             schema_version: CIPHERTEXT_SCHEMA_VERSION,
             scheme: AbeSchemeId::BSW,
             policy_source: "x:y".into(),
+            attributes: vec![],
             kgc_refs: vec![],
             rabe_ciphertext_bytes: Bytes::from_static(b"blob"),
+        };
+        assert_eq!(ct, round_trip(ct.clone()));
+    }
+
+    #[test]
+    fn ciphertext_tlv_round_trip_kp_abe_with_attributes() {
+        // KP-ABE: empty policy_source, ciphertext-side attribute set populated.
+        let ct = AbeCiphertext {
+            schema_version: CIPHERTEXT_SCHEMA_VERSION,
+            scheme: AbeSchemeId::KpAbe,
+            policy_source: String::new(),
+            attributes: vec!["service:mavlink".into(), "perm:execute".into()],
+            kgc_refs: vec![KgcRef {
+                kgc_did: "/muas/controller".parse().unwrap(),
+                master_params_hash: Hash::of(b"kp-params"),
+            }],
+            rabe_ciphertext_bytes: Bytes::from_static(b"kp_blob"),
         };
         assert_eq!(ct, round_trip(ct.clone()));
     }
