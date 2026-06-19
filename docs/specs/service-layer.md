@@ -783,8 +783,19 @@ A service is definable three ways, all over the same protocol:
    `-> impl Future + Send` (RPITIT) so an implementor writes a plain `async fn`
    impl with no `#[async_trait]`. Unary operations only (topics are a separate
    primitive). The trait is the IDL, checked by the compiler.
-3. **PyO3 decorator / Kotlin-Swift** (*planned*) — `@provider.handler` (or the mobile
-   equivalent) bound to the embedded engine via `ndn-python` / boltffi.
+3. **PyO3 / Kotlin-Swift** (**built** — PyO3 in `ndn-python`) — the *dynamic*
+   counterpart to the macro. Both bindings wrap one untyped seam,
+   `ndn-service-core::ScriptDispatch` (op → `bytes→bytes` handlers); PyO3 wraps a
+   `PyObject`, boltffi a Kotlin/Swift callback, identically. The Python API is
+   `ServiceNode → provider(svc).handler(op, fn) / serve()` and `client(svc).call(op,
+   bytes)` — carriers and op-dispatch carry over from Rust; the compile-time typing
+   does not (Python is dynamic → `bytes→bytes`, as a scripting layer must). The
+   improvement over NDNSF's `@provider.handler` is the **embedded engine** (no
+   subprocess), not types. Built over the in-process Tier-0 carrier (blocking
+   bridge, GIL released around the call, re-acquired in the handler); real
+   cross-process networking awaits the face-backed carrier. Witness
+   `ndn-rpc/tests/script_dispatch` proves the untyped seam round-trips over a
+   carrier; `ndn-python` compiles the PyO3 classes (rlib, no Python needed).
 
 > What mode 1 taught us (feeds the v2 design / steps 5–6):
 > - The **stable/varying split** is the right decomposition and is what the macro
@@ -832,10 +843,14 @@ dynamic handlers run in the fuel-metered wasm sandbox (`ndn-compute`'s
   mode 1, `roles_ergonomics` / `service_node_multi` witnesses); typed
   handler/registry (`ndn-rpc`, `ndn-compute`); KP-ABE policy backing
   (`ndn-nacabe::KpAuthority`); wasm sandbox (`ndn-compute`); the **service seam**
-  (`ndn-service-core`) + two carriers (`RpcCarrier`, `NdnsfCarrier`); the
-  **`#[ndn_service]` macro** (`ndn-service-macro`, mode 2) over the carrier seam.
-- **Planned:** the PyO3/boltffi *service* surface (mode 3); the TOML policy
-  parser; the remaining worked examples above; the v2 carrier (`ndn-service`).
+  (`ndn-service-core`) + three carriers (`RpcCarrier`, `NdnsfCarrier`,
+  `DiscoveryCarrier`); the **`#[ndn_service]` macro** (`ndn-service-macro`, mode 2);
+  the **untyped scripting seam** (`ScriptDispatch`) + the **PyO3 service binding**
+  (`ndn-python`, mode 3); the v2 layer (`ndn-service`: dynamic policy + carriers +
+  Topic/Session/role-scoped keys + ABE-by-role distribution).
+- **Planned:** the boltffi (mobile) service binding (same `ScriptDispatch` seam,
+  Kotlin/Swift callback); the TOML policy parser superseded by `ndn-service::config`
+  reload; the remaining worked examples above.
 
 ---
 
