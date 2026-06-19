@@ -113,7 +113,13 @@ impl TlvDecodeStage {
             None => return Err(raw),
         };
         let fragment = raw.slice(hdr.frag_start..hdr.frag_end);
-        let base_seq = hdr.sequence - hdr.frag_index;
+        // `base_seq = sequence − frag_index` underflows on a forged fragment
+        // whose FragIndex exceeds its Sequence (audit W-2 call-site). Drop such
+        // a packet instead of panicking / wrapping to a near-u64::MAX base.
+        let base_seq = match hdr.sequence.checked_sub(hdr.frag_index) {
+            Some(b) => b,
+            None => return Ok(None),
+        };
         let mut rb = self.reassembly.entry(face_id).or_default();
         // `endpoint_id` (from the link-layer sender; 0 for unicast) keys
         // reassembly per-sender so concurrent fragmenting peers on a
@@ -350,7 +356,10 @@ impl TlvDecodeStage {
                 let mut rb = self.reassembly.entry(face_id).or_default();
                 let seq = sequence.unwrap_or(0);
                 let idx = frag_index.unwrap_or(0);
-                let base_seq = seq - idx;
+                // Guard the same underflow as the fast path (audit W-2).
+                let Some(base_seq) = seq.checked_sub(idx) else {
+                    return Action::Drop(DropReason::MalformedPacket);
+                };
                 rb.process(
                     ctx.endpoint_id,
                     base_seq,

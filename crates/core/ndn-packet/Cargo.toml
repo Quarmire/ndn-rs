@@ -48,6 +48,7 @@ getrandom = { workspace = true, features = ["js"] }
 [dev-dependencies]
 criterion = { workspace = true }
 ndn-tlv       = { workspace = true, features = ["std"] }
+bytes         = { workspace = true, features = ["std"] }
 
 [[bench]]
 name    = "name"

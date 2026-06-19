@@ -39,15 +39,26 @@ impl TlvReader {
     pub fn read_length(&mut self) -> Result<usize, TlvError> {
         let (v, n) = read_varu64(&self.buf[self.pos..])?;
         self.pos += n;
+        // A TLV-LENGTH can never exceed the bytes remaining for its value. This
+        // rejects an attacker-supplied huge length up front (W-1) and also makes
+        // the `v as usize` narrowing safe on 32-bit/wasm targets, since `v` is
+        // now bounded by `remaining()` which always fits a `usize`.
+        if v > self.remaining() as u64 {
+            return Err(TlvError::UnexpectedEof);
+        }
         Ok(v as usize)
     }
 
     pub fn read_bytes(&mut self, len: usize) -> Result<Bytes, TlvError> {
-        if self.pos + len > self.buf.len() {
+        // `checked_add` guards against `self.pos + len` overflowing (W-1): a
+        // wrapped sum could otherwise pass the bound check and then panic inside
+        // `Bytes::slice` on `begin > end`.
+        let end = self.pos.checked_add(len).ok_or(TlvError::UnexpectedEof)?;
+        if end > self.buf.len() {
             return Err(TlvError::UnexpectedEof);
         }
-        let slice = self.buf.slice(self.pos..self.pos + len);
-        self.pos += len;
+        let slice = self.buf.slice(self.pos..end);
+        self.pos = end;
         Ok(slice)
     }
 
@@ -71,10 +82,11 @@ impl TlvReader {
             return Err(TlvError::UnknownCriticalType(typ));
         }
         let len = self.read_length()?;
-        if self.pos + len > self.buf.len() {
+        let end = self.pos.checked_add(len).ok_or(TlvError::UnexpectedEof)?;
+        if end > self.buf.len() {
             return Err(TlvError::UnexpectedEof);
         }
-        self.pos += len;
+        self.pos = end;
         Ok(())
     }
 
@@ -264,5 +276,41 @@ mod tests {
         let raw = Bytes::from(vec![0x01, 0x02]);
         let mut r = TlvReader::new(raw);
         assert_eq!(r.read_bytes(10).unwrap_err(), TlvError::UnexpectedEof);
+    }
+
+    // --- W-1 regression: a near-u64::MAX length must error, never panic ------
+
+    #[test]
+    fn w1_huge_length_errors_not_panics() {
+        // TLV-TYPE=0x05, TLV-LENGTH = 9-byte form 0xFF + 8×0xFF = u64::MAX.
+        let raw = Bytes::from(vec![0x05, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+        let mut r = TlvReader::new(raw);
+        let _ = r.read_type().unwrap();
+        assert_eq!(r.read_length().unwrap_err(), TlvError::UnexpectedEof);
+    }
+
+    #[test]
+    fn w1_read_tlv_huge_length_errors() {
+        let raw = Bytes::from(vec![0x05, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+        let mut r = TlvReader::new(raw);
+        assert_eq!(r.read_tlv().unwrap_err(), TlvError::UnexpectedEof);
+    }
+
+    #[test]
+    fn w1_read_bytes_overflow_len_errors() {
+        // len near usize::MAX would overflow self.pos + len; must error.
+        let raw = Bytes::from(vec![0x08, 0x01, 0x42]);
+        let mut r = TlvReader::new(raw);
+        let _ = r.read_type().unwrap();
+        assert_eq!(r.read_bytes(usize::MAX).unwrap_err(), TlvError::UnexpectedEof);
+    }
+
+    #[test]
+    fn w1_skip_unknown_huge_length_errors() {
+        // Non-critical type (0x22) with a 9-byte u64::MAX length must error.
+        let raw = Bytes::from(vec![0x22, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+        let mut r = TlvReader::new(raw);
+        let typ = r.read_type().unwrap();
+        assert_eq!(r.skip_unknown(typ).unwrap_err(), TlvError::UnexpectedEof);
     }
 }

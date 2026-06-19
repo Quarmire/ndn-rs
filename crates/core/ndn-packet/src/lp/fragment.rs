@@ -15,43 +15,46 @@ pub fn extract_fragment(raw: &[u8]) -> Option<FragmentHeader> {
         return None;
     }
     let (_, type_len) = ndn_tlv::read_varu64(raw).ok()?;
-    let (outer_len, len_len) = ndn_tlv::read_varu64(&raw[type_len..]).ok()?;
-    let header_len = type_len + len_len;
-    let inner = raw.get(header_len..header_len + outer_len as usize)?;
+    let (outer_len, len_len) = ndn_tlv::read_varu64(raw.get(type_len..)?).ok()?;
+    // All offset arithmetic is `checked_*` + slice `.get()` (never `+` / `[..]`)
+    // so an attacker-controlled length near `u64::MAX` cannot overflow `usize`
+    // and panic the receive path (audit W-2, same class as W-1).
+    let header_len = type_len.checked_add(len_len)?;
+    let inner_end = header_len.checked_add(usize::try_from(outer_len).ok()?)?;
+    let inner = raw.get(header_len..inner_end)?;
 
-    let mut pos = 0;
+    let mut pos = 0usize;
     let mut sequence = None;
     let mut frag_index = None;
     let mut frag_count = None;
-    let mut frag_start = 0;
-    let mut frag_end = 0;
+    let mut frag_start = 0usize;
+    let mut frag_end = 0usize;
 
     while pos < inner.len() {
-        let (t, tn) = ndn_tlv::read_varu64(&inner[pos..]).ok()?;
-        pos += tn;
-        let (l, ln) = ndn_tlv::read_varu64(&inner[pos..]).ok()?;
-        pos += ln;
-        let l = l as usize;
-        if pos + l > inner.len() {
-            return None;
-        }
+        let (t, tn) = ndn_tlv::read_varu64(inner.get(pos..)?).ok()?;
+        pos = pos.checked_add(tn)?;
+        let (l, ln) = ndn_tlv::read_varu64(inner.get(pos..)?).ok()?;
+        pos = pos.checked_add(ln)?;
+        let l = usize::try_from(l).ok()?;
+        let end = pos.checked_add(l)?;
+        let val = inner.get(pos..end)?;
         match t {
-            0x51 => sequence = Some(decode_be_u64(&inner[pos..pos + l])),
-            0x52 => frag_index = Some(decode_be_u64(&inner[pos..pos + l])),
+            0x51 => sequence = Some(decode_be_u64(val)),
+            0x52 => frag_index = Some(decode_be_u64(val)),
             0x53 => {
-                let c = decode_be_u64(&inner[pos..pos + l]);
+                let c = decode_be_u64(val);
                 if c <= 1 {
                     return None;
                 }
                 frag_count = Some(c);
             }
             0x50 => {
-                frag_start = header_len + pos;
-                frag_end = frag_start + l;
+                frag_start = header_len.checked_add(pos)?;
+                frag_end = header_len.checked_add(end)?;
             }
             _ => {}
         }
-        pos += l;
+        pos = end;
     }
 
     Some(FragmentHeader {
@@ -73,34 +76,47 @@ pub fn extract_acks(raw: &[u8]) -> (Option<u64>, smallvec::SmallVec<[u64; 8]>) {
     let Some((_, type_len)) = ndn_tlv::read_varu64(raw).ok() else {
         return (tx_seq, acks);
     };
-    let Some((outer_len, len_len)) = ndn_tlv::read_varu64(&raw[type_len..]).ok() else {
+    let Some(after_type) = raw.get(type_len..) else {
         return (tx_seq, acks);
     };
-    let header_len = type_len + len_len;
-    let Some(inner) = raw.get(header_len..header_len + outer_len as usize) else {
+    let Some((outer_len, len_len)) = ndn_tlv::read_varu64(after_type).ok() else {
+        return (tx_seq, acks);
+    };
+    // Checked arithmetic + `.get()` throughout (audit W-2).
+    let Some(header_len) = type_len.checked_add(len_len) else {
+        return (tx_seq, acks);
+    };
+    let Some(inner_end) = usize::try_from(outer_len)
+        .ok()
+        .and_then(|o| header_len.checked_add(o))
+    else {
+        return (tx_seq, acks);
+    };
+    let Some(inner) = raw.get(header_len..inner_end) else {
         return (tx_seq, acks);
     };
 
-    let mut pos = 0;
+    let mut pos = 0usize;
     while pos < inner.len() {
-        let Some((t, tn)) = ndn_tlv::read_varu64(&inner[pos..]).ok() else {
+        let Some((t, tn)) = inner.get(pos..).and_then(|s| ndn_tlv::read_varu64(s).ok()) else {
             break;
         };
-        pos += tn;
-        let Some((l, ln)) = ndn_tlv::read_varu64(&inner[pos..]).ok() else {
+        let Some(np) = pos.checked_add(tn) else { break };
+        pos = np;
+        let Some((l, ln)) = inner.get(pos..).and_then(|s| ndn_tlv::read_varu64(s).ok()) else {
             break;
         };
-        pos += ln;
-        let l = l as usize;
-        if pos + l > inner.len() {
-            break;
-        }
+        let Some(np) = pos.checked_add(ln) else { break };
+        pos = np;
+        let Some(l) = usize::try_from(l).ok() else { break };
+        let Some(end) = pos.checked_add(l) else { break };
+        let Some(val) = inner.get(pos..end) else { break };
         match t {
-            0x0348 => tx_seq = Some(decode_be_u64(&inner[pos..pos + l])),
-            0x0344 => acks.push(decode_be_u64(&inner[pos..pos + l])),
+            0x0348 => tx_seq = Some(decode_be_u64(val)),
+            0x0344 => acks.push(decode_be_u64(val)),
             _ => {}
         }
-        pos += l;
+        pos = end;
     }
     (tx_seq, acks)
 }
@@ -195,6 +211,32 @@ mod tests {
         let (seq, acks) = extract_acks(&wire);
         assert_eq!(seq, None);
         assert_eq!(&acks[..], &[7, 8]);
+    }
+
+    // --- W-2 regression: malformed LP lengths must not panic ----------------
+
+    #[test]
+    fn extract_fragment_huge_outer_length_no_panic() {
+        // 0x64 (LpPacket) then a 9-byte u64::MAX outer length.
+        let raw = vec![0x64, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
+        assert!(extract_fragment(&raw).is_none());
+    }
+
+    #[test]
+    fn extract_fragment_huge_subtlv_length_no_panic() {
+        // Valid-ish outer, but an inner sub-TLV (0x51 Sequence) with a 9-byte
+        // u64::MAX length → the inner walk must reject, not panic.
+        let inner = vec![0x51, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
+        let mut raw = vec![0x64, inner.len() as u8];
+        raw.extend_from_slice(&inner);
+        assert!(extract_fragment(&raw).is_none());
+    }
+
+    #[test]
+    fn extract_acks_huge_length_no_panic() {
+        let raw = vec![0x64, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
+        let (seq, acks) = extract_acks(&raw);
+        assert!(seq.is_none() && acks.is_empty());
     }
 
     #[test]
