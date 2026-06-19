@@ -578,7 +578,13 @@ fn decode_lifetime(raw: &Bytes) -> Result<Option<Duration>, PacketError> {
     while !inner.is_empty() {
         let (typ, val) = inner.read_tlv()?;
         if typ == tlv_type::INTEREST_LIFETIME {
-            let ms = crate::decode_nni(&val)?;
+            // Clamp to the same 1-hour ceiling as persistent Interests (audit
+            // X-3): an unbounded lifetime sets a far-future PIT `expires_at`,
+            // and the PIT is time-reaped, so a huge value would pin an entry
+            // effectively forever. No classical Interest legitimately waits
+            // longer than this.
+            let max_ms = u64::from(crate::MAX_PERSISTENT_LIFETIME_SECS) * 1000;
+            let ms = crate::decode_nni(&val)?.min(max_ms);
             return Ok(Some(Duration::from_millis(ms)));
         }
     }

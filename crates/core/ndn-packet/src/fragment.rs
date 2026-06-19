@@ -20,14 +20,12 @@ pub const FRAG_OVERHEAD: usize = 50;
 
 /// Fragment a network-layer packet into NDNLPv2 LpPacket fragments.
 ///
-/// # Panics
-///
-/// Panics if `mtu` is too small to fit even the fragmentation overhead.
+/// A `mtu` smaller than [`FRAG_OVERHEAD`] clamps to a 1-byte payload rather than
+/// panicking (audit X-5) — real faces validate their MTU well above the overhead
+/// (e.g. `clamp_ether_mtu`), so this only guards a misconfiguration. The input
+/// packet is itself MTU-bounded, so the fragment count stays bounded too.
 pub fn fragment_packet(packet: &[u8], mtu: usize, base_seq: u64) -> Vec<Bytes> {
-    let payload_cap = mtu
-        .checked_sub(FRAG_OVERHEAD)
-        .expect("MTU too small for fragmentation overhead");
-    assert!(payload_cap > 0, "MTU too small");
+    let payload_cap = mtu.saturating_sub(FRAG_OVERHEAD).max(1);
 
     let frag_count = packet.len().div_ceil(payload_cap);
 
