@@ -438,6 +438,21 @@ Constraints on performance claims:
 - When a testbed exists, the comparison must run both stacks on the same medium;
   even then the numbers are supporting evidence, not the primary justification.
 
+### 8.1 Observability (latency, traceable)
+
+The service layer is instrumented with `tracing` spans at the latency boundaries
+— ABE keygen/wrap/unwrap (`ndn-security::abe`), DKEY issuance
+(`ndn-nacabe::authority`), the over-NDN `ParamFetcher` legs, and the four phase
+transitions (`ndn-ndnsf::flow` `on_request`/`on_selection`). These spans flow
+into `ndn-observability`'s OTLP-over-NDN pipeline (completed spans → OTLP Span
+protobufs served as Data; cross-router stitching via `TraceContextFeature`), so a
+service call yields an **OpenTelemetry waterfall** of exactly where time goes —
+the per-leg breakdown the structural thesis (one RTT vs four convergence legs)
+predicts, now measurable per deployment rather than asserted. Fail-closed
+rejections emit `warn` events for rate/anomaly metrics. This is research
+infrastructure: it makes latency and coordination behaviour visualizable without
+a bespoke profiler.
+
 ---
 
 ## 9. Open questions and testbed-dependent items
