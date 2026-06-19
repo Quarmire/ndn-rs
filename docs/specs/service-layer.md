@@ -118,15 +118,22 @@ primitives (`ndn-rpc`, `ndn-nacabe`, `ndn-sync`, `confidentiality`, `capability`
   (codec, synthetic face, client, registration, wire spec). `ndn-compute` becomes
   the specialization where the handler is a deterministic pure function. One RPC
   stack, two front-ends — no duplicated codec/face/client.
-  - *Status:* the generic Tier-0 core landed as `ndn-ext/crates/service/ndn-rpc`
-    — `RpcHandler (&Interest -> Data)` + LPM `RpcRegistry` + `RpcError` (4
-    witnesses, clippy-clean, workspace green). **Remaining (intended-temporary
-    overlap with `ndn-compute`'s registry until done):** migrate `ndn-compute`
-    onto it — rename its `compute()`→`handle()` and `ComputeFailed`/`BadArguments`
-    → `HandlerFailed`/`BadRequest`, re-export from `ndn-rpc`, delete its copy —
-    then lift the generic `codec`/synthetic-face/client out of `ndn-compute`,
-    leaving it a pure specialization. This is a careful refactor of a wire-spec'd
-    crate `ndn-fwd` depends on, sequenced in build-green increments.
+  - *Status:* **done for the dispatch core.** The generic Tier-0 core is
+    `ndn-ext/crates/service/ndn-rpc` — `RpcHandler (&Interest -> Data)` + LPM
+    `RpcRegistry` + `RpcError` (4 witnesses). `ndn-compute` now *consumes* it:
+    `registry.rs` deleted; `ComputeHandler`/`ComputeRegistry`/`ComputeError` are
+    aliases of the `ndn_rpc` types (compute's public vocabulary preserved);
+    `compute()`→`handle()`, `ComputeFailed`/`BadArguments`→`HandlerFailed`/
+    `BadRequest`. Behavior-preserving (all previously-passing compute tests pass;
+    one pre-existing sealed-params failure unrelated to this change). No
+    duplicated dispatch core.
+  - *Boundary note (corrected):* `codec` (`ArgComponent`/`ComputeArgs`/
+    `ComputeValue`) is the **typed-argument framing of the compute specialization**
+    and stays in `ndn-compute` — it is not generic RPC. The synthetic `ComputeFace`
+    is generic in spirit but pulls `ndn-engine`/`ndn-transport`; whether to lift a
+    serve-a-registry-over-a-face helper into `ndn-rpc` (vs. the engine-side serving
+    the v2 Tier-0 path will use) is a deliberate later decision, not a blind lift.
+    `ComputeClient` is mostly compute-specific (it frames typed args).
 - **D2.** The content-key (CK) primitive and the capability primitive are
   **modules in core `ndn-security`**, not separate crates: both are lightweight
   (AEAD + signatures, already its dependencies) and are genuinely core security
