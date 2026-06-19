@@ -763,7 +763,13 @@ pub async fn run_ndn_mgmt_handler(
                 .await
             }
             MgmtResponse::Dataset(bytes) => {
-                send_dataset(&handle, &interest.name, bytes).await;
+                send_dataset(
+                    &handle,
+                    &interest.name,
+                    bytes,
+                    mgmt_handles.command_response_signer.as_deref(),
+                )
+                .await;
             }
         }
     }

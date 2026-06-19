@@ -63,7 +63,12 @@ const MAX_DATASET_PAYLOAD_LEN: usize = 8000;
 /// `<interest>/v=<version>/seg=<n>`. The last segment carries
 /// `FinalBlockId = seg=<last>`. Mirrors ndn-cxx
 /// `mgmt/dispatcher.cpp` + `mgmt/status-dataset-context.cpp`.
-fn build_segmented_dataset(base_name: &Name, version: u64, content: &[u8]) -> Vec<bytes::Bytes> {
+fn build_segmented_dataset(
+    base_name: &Name,
+    version: u64,
+    content: &[u8],
+    signer: Option<&dyn ndn_security::Signer>,
+) -> Vec<bytes::Bytes> {
     use ndn_packet::encode::DataBuilder;
 
     let total = content.len();
@@ -89,7 +94,19 @@ fn build_segmented_dataset(base_name: &Name, version: u64, content: &[u8]) -> Ve
             if seg == last_seg {
                 builder = builder.final_block_id_typed_seg(last_seg as u64);
             }
-            builder.sign_digest_sha256()
+            // Audit M-1: sign each segment with the daemon signer when wired
+            // (NFD signs datasets with the daemon identity; schema-validating
+            // ndn-cxx clients reject the bare-digest variant). Fall back to
+            // DigestSha256 only when no signer is configured.
+            match signer {
+                Some(s) => {
+                    let key_name = s.cert_name().cloned().or_else(|| Some(s.key_name().clone()));
+                    builder.sign_sync(s.sig_type(), key_name.as_ref(), |region| {
+                        s.sign_sync(region).unwrap_or_default()
+                    })
+                }
+                None => builder.sign_digest_sha256(),
+            }
         })
         .collect()
 }
@@ -109,14 +126,19 @@ fn seg_to_nni(v: u64) -> Vec<u8> {
     }
 }
 
-pub(crate) async fn send_dataset(handle: &InProcHandle, name: &Name, content: bytes::Bytes) {
+pub(crate) async fn send_dataset(
+    handle: &InProcHandle,
+    name: &Name,
+    content: bytes::Bytes,
+    signer: Option<&dyn ndn_security::Signer>,
+) {
     // `web_time` proxies to `Date.now()` in the browser; `std::time` on
     // native. `std::time::SystemTime::now()` panics on wasm32.
     let version = web_time::SystemTime::now()
         .duration_since(web_time::SystemTime::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    for wire in build_segmented_dataset(name, version, &content) {
+    for wire in build_segmented_dataset(name, version, &content, signer) {
         if let Err(e) = handle.send(wire).await {
             tracing::warn!(target: "engine", error = %e, "nfd-mgmt: failed to send dataset segment");
             return;
@@ -136,7 +158,7 @@ mod e04_tests {
     fn e04_single_segment_response_carries_version_segment_and_final_block_id() {
         let base: Name = "/localhost/nfd/faces/list".parse().unwrap();
         let content = vec![0x42u8; 100];
-        let segments = build_segmented_dataset(&base, 17, &content);
+        let segments = build_segmented_dataset(&base, 17, &content, None);
 
         assert_eq!(segments.len(), 1, "small dataset must produce 1 segment");
 
@@ -160,7 +182,7 @@ mod e04_tests {
     fn e04_multi_segment_response_marks_only_last_segment_as_final() {
         let base: Name = "/localhost/nfd/rib/list".parse().unwrap();
         let content = vec![0xABu8; MAX_DATASET_PAYLOAD_LEN * 2 + 100];
-        let segments = build_segmented_dataset(&base, 42, &content);
+        let segments = build_segmented_dataset(&base, 42, &content, None);
 
         assert_eq!(segments.len(), 3, "expected 3 segments for 2.x payload");
 
