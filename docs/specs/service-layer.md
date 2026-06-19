@@ -394,7 +394,8 @@ NDNSF node at these layers.
 ### 7.2 Roles
 
 - `ServiceProvider` / `ServiceUser` — the four-phase RPC participants, over SVS
-  pub/sub (faithful), built on `ndn-rpc`'s codec and `ndn-sync`.
+  pub/sub (faithful), built on `ndn-rpc`'s codec and `ndn-sync` (`ndn-ndnsf::roles`,
+  wrapping the `driver`; see the ergonomic surface in §11.2 mode 1).
 - `ServiceController` — the attribute authority. NDNSF uses **KP-ABE**: the
   controller reads an identity→permissions policy, converts each identity's
   permissions into an OR-join attribute key-policy, and issues it
@@ -560,14 +561,15 @@ a bespoke profiler.
 
 ## 11. User-facing API and developer ergonomics
 
-> Status: **plan**, not yet built. The underlying *pieces* exist and are tested
-> (typed handler API in `ndn-rpc`/`ndn-compute`; KP-ABE policy backing in
+> Status: **partially built**. Mode 1 (the closure/role surface — `ServiceProvider`
+> / `ServiceUser`) is **landed and witnessed** (`ndn-ndnsf::roles`,
+> `roles_ergonomics` test). The underlying *pieces* for the rest exist and are
+> tested (typed handler API in `ndn-rpc`/`ndn-compute`; KP-ABE policy backing in
 > `ndn-nacabe`, O4-witnessed; the fuel-metered wasm sandbox in `ndn-compute`).
-> What this section specifies — the `#[ndn_service]` macro, the PyO3/boltffi
-> *service* surface, and the TOML policy parser — is a deliberate later phase
-> that wraps the finished protocol (steps 5–6), not a precursor to it.
-> **Worked examples are TODO and must be added as each piece lands** (a runnable
-> example crate per definition mode, mirroring `examples/secure-fetch`).
+> Still **planned**: the `#[ndn_service]` macro, the PyO3/boltffi *service*
+> surface, and the TOML policy parser — a deliberate later phase that wraps the
+> role surface, not a precursor to it. **Worked examples are added as each piece
+> lands** (the `roles_ergonomics` witness is the mode-1 worked example).
 
 ### 11.1 Stance: don't choose between codegen and scripting
 
@@ -595,17 +597,33 @@ both target one forwarder.
 
 A service is definable three ways, all over the same protocol:
 
-1. **Closures** (quickest) — `svc.handler(name, |req: Req| async { ... })`, the
-   typed analogue of NDNSF's decorator.
-2. **`#[ndn_service]` trait** (typed, multi-method) — the macro emits the message
-   taxonomy, dispatch, name routing, and a typed client. This is the *service
-   definition mechanism*: a trait is the IDL, checked by the compiler.
-3. **PyO3 decorator / Kotlin-Swift** — `@provider.handler` (or the mobile
+1. **Closures / roles** (quickest, **built**) — `ServiceProvider::new(..).serve(|coord, req| ..)`
+   and `ServiceUser::new(..).call(provider, payload)`, the typed analogue of
+   NDNSF's decorator. The role structs bundle the *stable* fields (pub/sub,
+   identity, service, group, `TrustCtx`) so a call supplies only what *varies*;
+   request ids are auto-assigned; `.signed(signer, validator)` flips on NSF-A3
+   message trust. See `ndn-ndnsf::roles` and the `roles_ergonomics` witness.
+2. **`#[ndn_service]` trait** (typed, multi-method, *planned*) — the macro emits the
+   message taxonomy, dispatch, name routing, and a typed client over the role
+   surface. This is the *service definition mechanism*: a trait is the IDL,
+   checked by the compiler.
+3. **PyO3 decorator / Kotlin-Swift** (*planned*) — `@provider.handler` (or the mobile
    equivalent) bound to the embedded engine via `ndn-python` / boltffi.
 
-> _TODO (add when built): a side-by-side worked example of the same echo service
-> in all three modes — closure, `#[ndn_service]` trait, and Python decorator —
-> showing they interoperate on the wire._
+> What mode 1 taught us (feeds the v2 design / steps 5–6):
+> - The **stable/varying split** is the right decomposition and is what the macro
+>   and bindings should wrap — they emit typed methods *over a role*, not over the
+>   raw driver.
+> - **Request-id management is protocol bookkeeping** the caller should never see;
+>   auto-assignment belongs in the surface, not the handler.
+> - The closure handler is **sync `&Bytes -> Bytes`** — the real ceiling (typed
+>   `Req`/`Resp`, `async`, error returns, multi-method) is exactly the gap mode 2
+>   fills; mode 1 is the floor it builds on.
+> - A role **owns one `SvsPubSub`**; a node vending *several* services over one
+>   engine wants a `ServiceNode` that mints roles sharing the group — a v2 item.
+>
+> _TODO (add when mode 2/3 land): the same echo service as a `#[ndn_service]` trait
+> and a Python decorator, shown interoperating on the wire with mode 1._
 
 ### 11.3 Service policy
 
@@ -629,7 +647,10 @@ dynamic handlers run in the fuel-metered wasm sandbox (`ndn-compute`'s
 
 ### 11.5 What exists vs planned
 
-- **Exists, tested:** typed handler/registry (`ndn-rpc`, `ndn-compute`); KP-ABE
-  policy backing (`ndn-nacabe::KpAuthority`); wasm sandbox (`ndn-compute`).
-- **Planned:** the `#[ndn_service]` proc-macro; the PyO3/boltffi *service*
-  surface; the TOML policy parser; the worked examples above.
+- **Exists, tested:** the **role surface** (`ndn-ndnsf::roles` —
+  `ServiceProvider`/`ServiceUser`, mode 1, `roles_ergonomics` witness); typed
+  handler/registry (`ndn-rpc`, `ndn-compute`); KP-ABE policy backing
+  (`ndn-nacabe::KpAuthority`); wasm sandbox (`ndn-compute`).
+- **Planned:** the `#[ndn_service]` proc-macro (mode 2, over the role surface);
+  the PyO3/boltffi *service* surface (mode 3); the TOML policy parser; the
+  remaining worked examples above.
