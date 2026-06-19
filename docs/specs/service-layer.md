@@ -274,9 +274,20 @@ is the source of truth, `KpAuthority` is the key authority (its new
 its own grant table). A non-revoked granted principal gets a real key; an absent
 or revoked one fails closed; the policy is read live, so a grant/revoke needs no
 restart of either authority. Witness `issuance_loop`: a granted principal's key
-decrypts content under its policy, then a live revoke yields no key. *Next:* the
-config-reload / signed `/<scope>/policy/{grant,revoke}` command front-ends; the
-Tier-1 discovery-selection carrier; typed `Topic<T>` (Tier-2).
+decrypts content under its policy, then a live revoke yields no key.
+
+**Command front-end built:** `ndn-service::command` — `grant_command` /
+`revoke_command` build signed `<scope>/policy/{grant,revoke}` command Interests
+(args in `ApplicationParameters`); `PolicyController::handle` validates the
+command (signature valid **and** signer under the admin prefix — authorize before
+any mutation, fail closed), applies it to the live authority, and returns the
+freshly signed grant (the new published version). This is the operator→authority
+input channel that *produces signed versions*, not a hidden-state mutator. Witness
+`signed_commands`: an authorized grant then revoke take effect with no restart; an
+unauthorized command is rejected and mutates nothing. *Next:* config-file reload
+as a second front-end; the Tier-1 discovery-selection carrier; typed `Topic<T>`
+(Tier-2 pub/sub — the separate primitive: a typed *feed* of `T`, vs. a service
+op's request/response *call*).
 
 ---
 
