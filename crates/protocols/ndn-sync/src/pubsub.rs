@@ -49,7 +49,9 @@ use ndn_packet::{Data, Interest, Name};
 use crate::mapping::{MappingList, MappingProvider};
 use crate::protocol::SyncError;
 use crate::rt;
-use crate::svsync::{DataStore, MemoryStore, SvSync, SvSyncConfig};
+use crate::svsync::{
+    DataStore, IngestValidator, MemoryStore, PublisherSigner, SvSync, SvSyncConfig,
+};
 
 /// A delivered publication: its application name and decapsulated payload.
 #[derive(Clone, Debug)]
@@ -86,6 +88,22 @@ impl SvsPubSub {
         net_in: mpsc::Receiver<Bytes>,
         config: SvSyncConfig,
     ) -> Self {
+        Self::join_secured(group, node, net_out, net_in, config, None, None)
+    }
+
+    /// Like [`SvsPubSub::join`], but configures the inner `SvSync` with a
+    /// [`PublisherSigner`] (sign outbound publications) and/or an
+    /// [`IngestValidator`] (validate inbound before delivery) — together they
+    /// give per-publication trust. Both `None` is exactly [`SvsPubSub::join`].
+    pub fn join_secured(
+        group: Name,
+        node: Name,
+        net_out: mpsc::Sender<Bytes>,
+        net_in: mpsc::Receiver<Bytes>,
+        config: SvSyncConfig,
+        signer: Option<PublisherSigner>,
+        ingest_validator: Option<IngestValidator>,
+    ) -> Self {
         let cancel = CancellationToken::new();
         let mappings = Arc::new(MappingProvider::new());
         let query_pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
@@ -107,6 +125,14 @@ impl SvsPubSub {
             svs_in_rx,
             svs_config,
         );
+        // Configure trust before sharing the SvSync via Arc (additive: both
+        // None reproduces the digest-signed, accept-all default).
+        if let Some(s) = signer {
+            svsync_owned.set_publisher_signer(s);
+        }
+        if let Some(v) = ingest_validator {
+            svsync_owned.set_ingest_validator(v);
+        }
         // Own the update stream before sharing the SvSync via Arc.
         let updates = svsync_owned.take_updates();
         let svsync = Arc::new(svsync_owned);

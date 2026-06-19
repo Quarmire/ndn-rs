@@ -178,6 +178,7 @@ pub struct SvSync {
     /// stored during ingestion (repo trust). `None` = accept all (the open /
     /// testbed default). Returns `true` to accept.
     ingest_validator: Option<IngestValidator>,
+    publisher_signer: Option<PublisherSigner>,
     cancel: CancellationToken,
 }
 
@@ -187,6 +188,27 @@ pub struct SvSync {
 /// `ndn_security::Validator`).
 pub type IngestValidator =
     Arc<dyn Fn(Bytes) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>> + Send + Sync>;
+
+/// A publisher's signing material for outbound publications, supplied as a
+/// closure so `ndn-sync` stays free of any security crate (mirrors
+/// [`IngestValidator`]). When set, published Data is signed with this instead of
+/// the default `DigestSha256`; signing the Data authenticates the publishing
+/// node and covers the encapsulated publication, so a receiver's
+/// [`IngestValidator`] can establish per-publication trust. `None` (the default)
+/// preserves the existing digest behaviour — purely additive.
+/// Signs a Data's signed region, returning the signature value (the closure
+/// inside a [`PublisherSigner`]).
+pub type SignFn = Arc<dyn Fn(&[u8]) -> Bytes + Send + Sync>;
+
+#[derive(Clone)]
+pub struct PublisherSigner {
+    /// Signature type to stamp (e.g. `SignatureEd25519`).
+    pub sig_type: ndn_packet::SignatureType,
+    /// The `KeyLocator` name — the publisher's key/identity.
+    pub key_locator: Name,
+    /// Signs the Data's signed region, returning the signature value.
+    pub sign: SignFn,
+}
 
 impl SvSync {
     /// Join `group` as `node`, serving and fetching Data through the
@@ -266,6 +288,7 @@ impl SvSync {
             data_freshness: config.data_freshness,
             content_type: config.content_type,
             ingest_validator: None,
+            publisher_signer: None,
             cancel,
         }
     }
@@ -276,6 +299,21 @@ impl SvSync {
     /// before wrapping the `SvSync` in an `Arc`.
     pub fn set_ingest_validator(&mut self, validator: IngestValidator) {
         self.ingest_validator = Some(validator);
+    }
+
+    /// Set the publisher signer used for outbound publications (default: none,
+    /// i.e. `DigestSha256`). Additive: leaving it unset preserves prior behaviour.
+    pub fn set_publisher_signer(&mut self, signer: PublisherSigner) {
+        self.publisher_signer = Some(signer);
+    }
+
+    /// Finalize a stamped builder: sign with [`PublisherSigner`] if set, else the
+    /// default `DigestSha256`.
+    fn sign_or_build(&self, builder: DataBuilder) -> Bytes {
+        match &self.publisher_signer {
+            Some(s) => builder.sign_sync(s.sig_type, Some(&s.key_locator), |region| (s.sign)(region)),
+            None => builder.build(),
+        }
     }
 
     /// Apply the configured freshness + ContentType to a Data builder.
@@ -304,7 +342,7 @@ impl SvSync {
     ) -> Result<u64, SyncError> {
         let seq = self.seq.fetch_add(1, Ordering::AcqRel) + 1;
         let name = svs_data_name(&self.node, &self.group, seq);
-        let wire = self.stamp(DataBuilder::new(name.clone(), payload)).build();
+        let wire = self.sign_or_build(self.stamp(DataBuilder::new(name.clone(), payload)));
         self.store.insert(name, wire);
         // Advance the core in lockstep (this node is the sole publisher
         // for its own id, so the core's counter tracks `self.seq`) and
@@ -332,10 +370,10 @@ impl SvSync {
         let last = segments.len().saturating_sub(1) as u64;
         for (i, seg) in segments.iter().enumerate() {
             let name = base.clone().append_version(0).append_segment(i as u64);
-            let wire = self
-                .stamp(DataBuilder::new(name.clone(), seg))
-                .final_block_id_typed_seg(last)
-                .build();
+            let wire = self.sign_or_build(
+                self.stamp(DataBuilder::new(name.clone(), seg))
+                    .final_block_id_typed_seg(last),
+            );
             self.store.insert(name, wire);
         }
         match make_mapping(seq) {
