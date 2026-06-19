@@ -15,7 +15,7 @@
 #                - c06_sign_interest_uses_signer_sigtype_hmac
 #              Each constructs a `KeyChain` with `HmacSha256Signer`, signs a
 #              Data / Interest, and asserts the decoded SignatureType is
-#              `SignatureHmacWithSha256` (TLV code 4). Today: both decode as
+#              `SignatureHmacWithSha256` (TLV code 4). Before the fix: both decode as
 #              `SignatureEd25519` (code 5) — wrong by 32-vs-64 byte length and
 #              by algorithm. After fix: tests pass.
 #

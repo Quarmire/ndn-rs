@@ -13,7 +13,7 @@
 #                - a10_databuilder_build_emits_real_sha256
 #              Builds a Data via `DataBuilder::build()`, decodes it, and
 #              asserts `sig_value() == SHA-256(signed_region())`.
-#              Today: assertion fails (32 zero bytes vs the real digest).
+#              Before the fix: assertion fails (32 zero bytes vs the real digest).
 #              After fix: passes — `build()` routes through the existing
 #              `sign_digest_sha256()` path which writes the actual digest.
 #

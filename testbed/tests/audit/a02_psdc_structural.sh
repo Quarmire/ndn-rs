@@ -15,7 +15,7 @@
 #                - a02_a21_decode_rejects_psdc_not_last
 #                - a02_decode_rejects_multiple_psdc
 #              Each builds a malformed wire and asserts `Interest::decode`
-#              returns `PacketError::MalformedPacket`. Today: all three
+#              returns `PacketError::MalformedPacket`. Before the fix: all three
 #              currently *accept* the malformed shapes (decode returns Ok),
 #              consistent with the `_ => {}` skip pattern at the body level
 #              and the explicit "no structural validation" comment at

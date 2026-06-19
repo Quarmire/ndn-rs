@@ -141,6 +141,12 @@ it per the NDN evolvability rule.
 | Area | ndn-rs behavior | References |
 |---|---|---|
 | **Non-minimal VAR-NUMBER** | `read_varu64` **rejects** a TLV-TYPE/TLV-LENGTH written in a longer-than-minimal form (`TlvError::NonMinimalVarNumber`). | ndn-cxx / NFD / NDNts decode such forms **leniently**. |
+| **NonNegativeInteger widths (LP/SVS)** | The core Interest/Data and management decoders enforce the NDN `{1,2,4,8}`-octet rule, but the LP (`decode_be_u64`) and SVS (`decode_nni`) integer decoders are currently **lenient** — they fold an off-width value into a `u64` (truncating `>8` bytes) rather than rejecting it. NFD rejects off-width LP integer fields. | NFD rejects; ndn-rs core/mgmt reject; ndn-rs LP/SVS accept. |
+
+The LP/SVS NNI-width leniency is a **known internal inconsistency** (audit I-2):
+the same rule is enforced in some decoders and not others. It is tracked to be
+made uniformly strict as part of consolidating the duplicated TLV/NNI codecs onto
+one `ndn-tlv` API (audit R-1).
 
 This is **intentional**: a minimal-length VAR-NUMBER is the canonical wire form,
 and rejecting non-minimal encodings avoids two distinct wire representations of

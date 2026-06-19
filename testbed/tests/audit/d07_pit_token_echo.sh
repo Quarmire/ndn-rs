@@ -13,7 +13,7 @@
 #                - d07_encode_lp_nack_omits_pit_token_when_absent
 #              RUST-UNIT in `ndn-engine`:
 #                - d07_pit_match_propagates_lp_token_to_out_tokens
-#              Today: `encode_lp_nack_with_pit_token` does not exist (the
+#              Before the fix: `encode_lp_nack_with_pit_token` does not exist (the
 #              one-arg `encode_lp_nack` is the only encoder), and
 #              `PacketContext.out_pit_tokens` does not exist (so
 #              `PitMatchStage` cannot propagate tokens). After fix: both

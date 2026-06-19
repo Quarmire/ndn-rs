@@ -25,7 +25,7 @@
 #                  - n04_meta_info_decode_accepts_unknown_non_critical_tlv (sanity)
 #                  - n04_sig_info_decode_rejects_unknown_critical_tlv
 #                  - n04_sig_info_decode_accepts_unknown_non_critical_tlv (sanity)
-#              Today: every "rejects" case decodes Ok. After the fix:
+#              Before the fix: every "rejects" case decodes Ok. After the fix:
 #              `Interest::decode` and `Data::decode` track a body-level
 #              `last_element` cursor and reject out-of-order or duplicate
 #              spec elements; every body-level decoder (Interest body, Data

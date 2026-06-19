@@ -79,6 +79,27 @@ the signed-Interest replay guard *are* capacity-bounded, but they do not bound
 the PIT itself. Treat a forwarder with no rate limiter on a public face the way
 you would treat a bare NFD with no face/strategy limits.
 
+## "Verified" in the Content Store includes DigestSha256
+
+The forwarder caches Data once `ctx.verified` is set, and a correct
+`DigestSha256` (a bare content hash, no signer) counts as verified for that
+*integrity* gate — the same as NFD, which caches DigestSha256 Data. This is
+**integrity, not authenticity**: it proves the bytes match the digest, not that
+any identity vouched for them. The application layer still refuses to treat
+DigestSha256 as authenticated (`Unverified::verify` rejects it by default). So
+read "only verified Data is cached/forwarded" as "*integrity*-checked at the
+engine; *authenticity* is the app's `verifying()` decision."
+
+## Browser trust uses the client wall-clock
+
+On `wasm32` the security timestamp source is `web-time`, i.e. `Date.now()` — a
+wall-clock the user can change. Certificate validity-window checks and the
+signed-Interest `SignatureTime` replay defence on an in-browser engine therefore
+trust the client clock. The cryptographic chain still verifies; but a user who
+moves their clock can affect validity-window and replay-window decisions. Don't
+rely on browser-side time for security-critical freshness; anchor those decisions
+on a trusted forwarder where it matters.
+
 ## See also
 
 - [Trust, first](../start/trust-first.md) — why a valid signature is not trust.
