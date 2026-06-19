@@ -475,7 +475,7 @@ async fn fetch_reassemble(
 
     let seg0 = recv_matching(recv, cancel, first, lifetime).await?;
     let data = Data::decode(seg0).ok()?;
-    let last = transfer::final_block_segment(&data).unwrap_or(0);
+    let last = transfer::final_block_segment_clamped(&data).unwrap_or(0);
     let base_with_version = drop_last(&data.name); // strip seg=0
     let mut full = data.content().cloned().unwrap_or_default().to_vec();
 

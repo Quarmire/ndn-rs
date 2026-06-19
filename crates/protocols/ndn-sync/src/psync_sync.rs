@@ -398,7 +398,7 @@ fn spawn_reassembly(
     config: &PSyncConfig,
     reasm_tx: mpsc::Sender<Vec<Name>>,
 ) {
-    let last = crate::transfer::final_block_segment(&seg0).unwrap_or(0);
+    let last = crate::transfer::final_block_segment_clamped(&seg0).unwrap_or(0);
     // `base` is the reply name without its trailing `seg=0` component.
     let base = strip_segment(seg0.name.as_ref());
     let head = seg0.content().cloned().unwrap_or_default();

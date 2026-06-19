@@ -35,6 +35,19 @@ pub fn final_block_segment(data: &Data) -> Option<u64> {
         .and_then(|c| c.as_segment())
 }
 
+/// Upper bound on segments a consumer will fetch from a peer-advertised
+/// `FinalBlockId` (audit PSYNC-3). A malicious or buggy producer advertising a
+/// huge `FinalBlockId` would otherwise drive the consumer to issue up to ~2⁶⁴
+/// segment Interests. ~1M segments (≈ multi-GiB objects at typical chunk sizes)
+/// is far above any legitimate sync publication.
+pub const MAX_FETCH_SEGMENTS: u64 = 1 << 20;
+
+/// Like [`final_block_segment`] but clamped to [`MAX_FETCH_SEGMENTS`], for the
+/// consumer fetch-loop bound.
+pub fn final_block_segment_clamped(data: &Data) -> Option<u64> {
+    final_block_segment(data).map(|last| last.min(MAX_FETCH_SEGMENTS))
+}
+
 /// Split `content` into ≤ `max_segment`-byte chunks named `base/seg=i`,
 /// each stamped with the last segment as `FinalBlockId` via `build`. The
 /// caller's `build(name, chunk, last_seg)` controls content-type +

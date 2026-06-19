@@ -404,7 +404,7 @@ impl SvSync {
         let first_content = first.content().cloned().unwrap_or_default();
 
         // Unsegmented: the reply is the bare seq name itself.
-        let seg_count = match crate::transfer::final_block_segment(&first) {
+        let seg_count = match crate::transfer::final_block_segment_clamped(&first) {
             Some(last) => last + 1,
             None => return Some(vec![first_content]),
         };
@@ -470,7 +470,7 @@ impl SvSync {
         let Ok(first) = Data::decode(first_wire) else {
             return stored;
         };
-        let last = match crate::transfer::final_block_segment(&first) {
+        let last = match crate::transfer::final_block_segment_clamped(&first) {
             Some(l) => l,
             None => return stored, // unsegmented publication
         };
