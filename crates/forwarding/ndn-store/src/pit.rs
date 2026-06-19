@@ -337,6 +337,18 @@ impl PitEntry {
 ///
 /// Backed by `DashMap` on native (sharded — no global lock on the hot path)
 /// and `Mutex<HashMap>` on `wasm32` (single-threaded).
+///
+/// **Capacity (audit D-2):** the PIT is intentionally *not* hard-capped, matching
+/// NFD — a fixed ceiling would have to drop or evict pending Interests, which
+/// breaks in-flight fetches and changes forwarding semantics. Reaping is purely
+/// time-based (`drain_expired`, keyed on `expires_at`), so under a spoofed-name
+/// Interest flood the table grows to roughly `rate × InterestLifetime`. **Flood
+/// protection is therefore a deployment responsibility:** install the
+/// (opt-in) `ndn-ratelimit` inbound hook for per-face/per-prefix admission
+/// control. Without it there is no PIT-exhaustion defence — the same posture as
+/// a bare NFD without face/strategy limits. The `orphans` map grows only from
+/// *validated* persistent-subscription Interests (lower risk) and is time-reaped.
+/// See also the `InterestLifetime` clamp, which bounds a single entry's lifetime.
 pub struct Pit {
     #[cfg(not(target_arch = "wasm32"))]
     entries: DashMap<PitToken, PitEntry>,

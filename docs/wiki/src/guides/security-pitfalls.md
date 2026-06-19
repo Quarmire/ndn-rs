@@ -65,6 +65,20 @@ These are different acts with different outcomes:
 If verification of incoming data fails, check that you adopted (have the anchor),
 not only that you enrolled.
 
+## Running an open forwarder without flood protection
+
+The Pending Interest Table is **not hard-capped** (the same as NFD): a fixed
+ceiling would have to drop in-flight Interests. Reaping is time-based, so a
+spoofed-name Interest flood from an untrusted face grows the PIT to roughly
+`rate × InterestLifetime` and can exhaust memory.
+
+If a forwarder accepts Interests from untrusted faces, **enable the `ndn-ratelimit`
+inbound hook** for per-face / per-prefix admission control — it is the
+PIT-exhaustion defence and is opt-in (off by default). The Dead Nonce List and
+the signed-Interest replay guard *are* capacity-bounded, but they do not bound
+the PIT itself. Treat a forwarder with no rate limiter on a public face the way
+you would treat a bare NFD with no face/strategy limits.
+
 ## See also
 
 - [Trust, first](../start/trust-first.md) — why a valid signature is not trust.
