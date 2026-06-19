@@ -508,3 +508,81 @@ Constraints on performance claims:
    `ServiceUser` roles, wiring `ndn-nacabe`'s KP-ABE `ServiceController`)
    follows.
 6. v2: `ndn-service` (Tier-1 selection + Tier-2 collab, authority-as-signed-Data).
+
+---
+
+## 11. User-facing API and developer ergonomics
+
+> Status: **plan**, not yet built. The underlying *pieces* exist and are tested
+> (typed handler API in `ndn-rpc`/`ndn-compute`; KP-ABE policy backing in
+> `ndn-nacabe`, O4-witnessed; the fuel-metered wasm sandbox in `ndn-compute`).
+> What this section specifies — the `#[ndn_service]` macro, the PyO3/boltffi
+> *service* surface, and the TOML policy parser — is a deliberate later phase
+> that wraps the finished protocol (steps 5–6), not a precursor to it.
+> **Worked examples are TODO and must be added as each piece lands** (a runnable
+> example crate per definition mode, mirroring `examples/secure-fetch`).
+
+### 11.1 Stance: don't choose between codegen and scripting
+
+The latest C++ NDNSF replaced its IDL **code generator** with a **Python
+interface** — a decorator-over-subprocess wrapper (`@provider.handler` driving
+the C++ binaries, with a `policy_file` for the controller). That trades a
+toolchain + stale-stub problem for runtime scripting, at the cost of static
+types and an extra process boundary.
+
+Rust lets us avoid the choice. A **proc-macro is an in-language code generator**
+(typed, no separate toolchain, no stub drift), and **PyO3/boltffi give the
+scripting front-end over the *embedded* engine** (no subprocess shuttle). The
+macro serves typed-native developers; the bindings serve scripting developers;
+both target one forwarder.
+
+| Axis | NDNSF | ndn-rs plan | Verdict |
+|---|---|---|---|
+| Handler definition | `@provider.handler` decorator (untyped `bytes→bytes`) | closure/trait handler, compile-time typed (shape of `ndn-rpc`/`ndn-compute`) | match + types |
+| Codegen | abandoned IDL generator | `#[ndn_service]` proc-macro on a trait → message types, dispatch, name routing, client stub | improve (typed, no toolchain/stub drift) |
+| Scripting | Python wrapper that spawns C++ | PyO3 (`ndn-python`) + boltffi (mobile) over the embedded engine | match + improve (no subprocess) |
+| Service policy | policy file → KP-ABE controller | same KP-ABE model (`ndn-nacabe::KpAuthority`, O4-witnessed), authored as TOML (`ndn-config` convention) or a typed `PolicyBuilder` | match workflow, improve backing |
+| Dynamic code | unsandboxed Python handlers | wasm sandbox (`ndn-compute` `wasm-exec`) for untrusted; native closures for trusted | improve (real isolation) |
+
+### 11.2 Three definition modes, one wire
+
+A service is definable three ways, all over the same protocol:
+
+1. **Closures** (quickest) — `svc.handler(name, |req: Req| async { ... })`, the
+   typed analogue of NDNSF's decorator.
+2. **`#[ndn_service]` trait** (typed, multi-method) — the macro emits the message
+   taxonomy, dispatch, name routing, and a typed client. This is the *service
+   definition mechanism*: a trait is the IDL, checked by the compiler.
+3. **PyO3 decorator / Kotlin-Swift** — `@provider.handler` (or the mobile
+   equivalent) bound to the embedded engine via `ndn-python` / boltffi.
+
+> _TODO (add when built): a side-by-side worked example of the same echo service
+> in all three modes — closure, `#[ndn_service]` trait, and Python decorator —
+> showing they interoperate on the wire._
+
+### 11.3 Service policy
+
+Access policy stays KP-ABE-backed (the `ServiceController` model already built
+and held to the O4 invariants): an identity→permissions mapping compiled to
+KP-ABE key-policies and issued by `ndn-nacabe`'s `KpAuthority`. Authoring is
+file-driven (a TOML policy in the `ndn-config` convention, matching NDNSF's
+`policy_file` workflow) or via a typed `PolicyBuilder`.
+
+> _TODO (add when built): a sample `policy.toml` and the equivalent
+> `PolicyBuilder` code, plus the controller wiring._
+
+### 11.4 Dynamic code
+
+Trusted handlers are native closures/trait methods. Untrusted or operator-supplied
+dynamic handlers run in the fuel-metered wasm sandbox (`ndn-compute`'s
+`wasm-exec`) — an improvement over NDNSF's unsandboxed Python business logic.
+
+> _TODO (add when built): a worked wasm-handler example (compile a kernel, register
+> it, invoke it under a fuel budget)._
+
+### 11.5 What exists vs planned
+
+- **Exists, tested:** typed handler/registry (`ndn-rpc`, `ndn-compute`); KP-ABE
+  policy backing (`ndn-nacabe::KpAuthority`); wasm sandbox (`ndn-compute`).
+- **Planned:** the `#[ndn_service]` proc-macro; the PyO3/boltffi *service*
+  surface; the TOML policy parser; the worked examples above.
