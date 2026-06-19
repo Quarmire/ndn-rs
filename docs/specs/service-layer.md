@@ -97,7 +97,7 @@ CORE (ndn-rs) — shared primitives
 
 EXT (ndn-ext) — shared service substrate
   crates/service/ndn-service-core                    Service/Carrier/SelectCarrier/Dispatch/Frame traits (§12)  [built — traits]
-  crates/service/ndn-service-macro                   #[ndn_service] proc-macro over ndn-service-core (§11.2/§12)        [NEW — ratified, not built]
+  crates/service/ndn-service-macro                   #[ndn_service] proc-macro over ndn-service-core (§11.2/§12)        [built + proven over both carriers]
   crates/service/ndn-rpc                             Tier-0 typed Interest/Data RPC; provides RpcCarrier (§12, proven)   [built]
   crates/compute/ndn-compute                         specialization of ndn-rpc ("the handler is a pure function")  [refactor onto ndn-rpc]
   crates/discovery/ndn-discovery::service_discovery  Tier-1 find/select               [exists; extend]
@@ -605,11 +605,13 @@ A service is definable three ways, all over the same protocol:
    identity, service, group, `TrustCtx`) so a call supplies only what *varies*;
    request ids are auto-assigned; `.signed(signer, validator)` flips on NSF-A3
    message trust. See `ndn-ndnsf::roles` and the `roles_ergonomics` witness.
-2. **`#[ndn_service]` trait** (typed, multi-method, *planned*) — the macro emits the
-   message taxonomy, dispatch, and a typed client **generic over a `Carrier`**
-   (§12), so one definition runs over Tier-0, the NDNSF four-phase, or v2
-   unchanged. Unary operations only (topics are a separate primitive). This is the
-   *service definition mechanism*: a trait is the IDL, checked by the compiler.
+2. **`#[ndn_service]` trait** (typed, multi-method, **built** — `ndn-service-macro`) —
+   the macro emits the per-op `Frame` message types, the `Dispatch`, and a typed
+   client **generic over a `Carrier`** (§12), so one definition runs over Tier-0,
+   the NDNSF four-phase, or v2 unchanged. It rewrites the trait's `async fn`s to
+   `-> impl Future + Send` (RPITIT) so an implementor writes a plain `async fn`
+   impl with no `#[async_trait]`. Unary operations only (topics are a separate
+   primitive). The trait is the IDL, checked by the compiler.
 3. **PyO3 decorator / Kotlin-Swift** (*planned*) — `@provider.handler` (or the mobile
    equivalent) bound to the embedded engine via `ndn-python` / boltffi.
 
@@ -658,10 +660,11 @@ dynamic handlers run in the fuel-metered wasm sandbox (`ndn-compute`'s
   `ServiceProvider`/`ServiceUser` + `ServiceNode` for multi-service-per-engine,
   mode 1, `roles_ergonomics` / `service_node_multi` witnesses); typed
   handler/registry (`ndn-rpc`, `ndn-compute`); KP-ABE policy backing
-  (`ndn-nacabe::KpAuthority`); wasm sandbox (`ndn-compute`).
-- **Planned:** the `#[ndn_service]` proc-macro (mode 2, emitted over the
-  **carrier seam** of §12 — not over one transport); the PyO3/boltffi *service*
-  surface (mode 3); the TOML policy parser; the remaining worked examples above.
+  (`ndn-nacabe::KpAuthority`); wasm sandbox (`ndn-compute`); the **service seam**
+  (`ndn-service-core`) + two carriers (`RpcCarrier`, `NdnsfCarrier`); the
+  **`#[ndn_service]` macro** (`ndn-service-macro`, mode 2) over the carrier seam.
+- **Planned:** the PyO3/boltffi *service* surface (mode 3); the TOML policy
+  parser; the remaining worked examples above; the v2 carrier (`ndn-service`).
 
 ---
 
@@ -675,10 +678,14 @@ dynamic handlers run in the fuel-metered wasm sandbox (`ndn-compute`'s
 > (`ndn-ndnsf/tests/ndnsf_carrier_proof.rs`) — one `EchoService` runs over both
 > unchanged. `NdnsfCarrier` also implements `SelectCarrier`, and the client's
 > `echo_select` is gated `where C: SelectCarrier` (compile-time depth-as-needed),
-> proven gathering every provider under `Strategy::All`. Still to build: the v2
-> carrier and the `#[ndn_service]` macro (§11.2 mode 2). This generalises the role
-> surface (§7.2, `ndn-ndnsf::roles`, built) into a transport-independent service
-> abstraction the compat layer **and** v2 **and** Tier-0 all share.
+> proven gathering every provider under `Strategy::All`. The **`#[ndn_service]`
+> macro** (`ndn-service-macro`) is also landed: it generates the `Frame` messages,
+> `Dispatch`, and a carrier-generic client from a unary trait, proven over *both*
+> carriers (`ndn-rpc/tests/macro_service.rs`, `ndn-ndnsf/tests/macro_over_ndnsf.rs`
+> incl. the generated `*_select`). Still to build: the v2 carrier. This
+> generalises the role surface (§7.2, `ndn-ndnsf::roles`, built) into a
+> transport-independent service abstraction the compat layer **and** v2 **and**
+> Tier-0 all share.
 
 ### 12.1 The seam: contract vs carrier
 
@@ -768,7 +775,7 @@ The traits and macro are **shared substrate**, depended on by both compat and v2
 ```
 EXT (ndn-ext) — shared service substrate
   crates/service/ndn-service-core    Service/Carrier/SelectCarrier/Dispatch/Invocation/Response + Frame trait  [built]
-  crates/service/ndn-service-macro   the #[ndn_service] proc-macro (emits over ndn-service-core)               [not built]
+  crates/service/ndn-service-macro   the #[ndn_service] proc-macro (emits over ndn-service-core)               [built + proven]
 ```
 
 Carriers live with their transports: `RpcCarrier` in `ndn-rpc` (**built + proven**),
