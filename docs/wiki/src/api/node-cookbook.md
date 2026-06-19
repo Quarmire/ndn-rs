@@ -24,9 +24,11 @@ let node = Node::connect("/run/nfd/nfd.sock").await?;
 available. A `Node::from_connection(conn)` built from a single pre-made
 connection serves `fetch` / `object` / `serve`, but the patterns that need their
 own stream (`publish` / `subscribe` / `query` / `serve_object`) return
-`AppError::Unsupported` — use [`connection()`](#escape-hatch) for those. (One
-connection multiplexes `fetch` and `serve` with no cross-talk; the sync and
-query patterns each get a dedicated connection to the same forwarder.)
+`AppError::Unsupported` — use [`connection()`](#escape-hatch) for those, or
+`Node::from_provider` with a `ConnectionProvider` that mints more streams (how
+the in-process `app_node` makes every pattern work). (One connection multiplexes
+`fetch` and `serve` with no cross-talk; the sync and query patterns each get a
+dedicated connection to the same forwarder.)
 
 ## Fetch one Data
 
@@ -163,9 +165,12 @@ let data = bob.fetch("/alice/greeting").await?;   // routes engine → FIB → a
 # let _ = data; Ok(()) }
 ```
 
-In-process nodes are `from_connection`-style, so the dedicated-stream patterns
-(`publish` / `subscribe` / `query` / `serve_object`) report `Unsupported`;
-`fetch` / `object` / `serve` cover the harness.
+`app_node` is a *full* node: the dedicated-stream patterns (`publish` /
+`subscribe` / `query` / `serve_object`) work too — each allocates a fresh app
+face on the engine. SVS sync fans out across faces only under a multicast
+strategy, so build the engine with
+`EngineBuilder::new(cfg).strategy(MulticastStrategy::new())` when two in-process
+nodes publish/subscribe to each other.
 
 ## Escape hatch {#escape-hatch}
 
