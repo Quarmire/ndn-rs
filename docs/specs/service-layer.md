@@ -257,14 +257,31 @@ possession). Witness `role_scoped_keys`: a Commander (granted `control` +
 `telemetry`) reads both scopes; an Observer (granted `telemetry` only) reads
 telemetry and cannot even obtain a `control` topic.
 
-**Key distribution built:** `key_dist::provision_keyring(role, policy, all_keys,
-recipient_public)` seals exactly the role's scope keys to a member's X25519 key
-(`ndn-sealed-box`); `open_keyring(recipient, sealed)` recovers the member's
-`ScopeKeyring`. This connects the role→scope policy to a concrete member: the
-controller decides the role, this hands over the keys; only the member opens them.
-Witness `key_distribution`: an Observer receives only the `telemetry` key (a
-stranger cannot open the blob), and the recovered key opens content sealed by the
-genuine scope key.
+**Key distribution — two backends behind the role-scoped-keys abstraction:**
+
+- **ABE-by-role** (`abe_dist`, feature `issuance`) — the primary, scalable,
+  data-centric mechanism, and the unification this layer aimed for. Each scope key
+  is **ABE-wrapped under its scope attribute** (`scope:<name>`) *once* —
+  `wrap_scope_keys(all, kgc_name, params)` yields one published, cacheable object
+  per scope. A member holds a single KP-ABE key whose policy is the OR of the
+  scopes its role grants (`RoleScopePolicy::key_policy_for(role)` → `scope:a OR
+  scope:b`), issued by the KP-ABE authority via the policy→issuance loop; it
+  assembles its `ScopeKeyring` with `unwrap_scope_keys(wrapped, key)`, opening
+  exactly the scopes its policy satisfies. The controller never enumerates members
+  — granting a role access to a scope is one ABE encryption, not O(members)
+  re-sealing. This is §6.1's "ABE-wrapped CK" applied to scope keys, on the same
+  KP-ABE `ServiceController` model as the rest of the confidentiality layer.
+  Witness `abe_role_keys`: one wrapped object per scope; a Commander key opens
+  `control`+`telemetry`, an Observer key only `telemetry`, `secret` stays sealed;
+  recovered keys are genuine.
+- **Sealed-box per member** (`key_dist`) — the simpler intermediary/alternative
+  for small or static groups (no ABE dependency): `provision_keyring(role, policy,
+  all_keys, recipient_public)` seals the role's scope keys to a member's X25519
+  key; `open_keyring(recipient, sealed)` recovers them. Witness `key_distribution`.
+  O(members) work; the controller must know each member's public key.
+
+Both yield the same `ScopeKeyring`; revocation is epoch rotation either way (ABE
+re-wraps one ciphertext per scope; sealed-box re-seals per remaining member).
 
 **Artifact provisioning built:** `session::ArtifactShare` (via `Session::artifacts`
 or `ScopedSession::artifacts(scope)`) shares named confidential objects in a
