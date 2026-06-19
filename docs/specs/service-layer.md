@@ -107,7 +107,7 @@ EXT (ndn-ext) — compat layer (faithful)
   crates/service/ndn-ndnsf                           NDNSF four-phase + roles + KP-ABE controller; provides NdnsfCarrier + SelectCarrier (§12)  [built + proven]
 
 EXT (ndn-ext) — v2 layer (alternative)
-  crates/service/ndn-service                         authority-as-signed-Data: PolicyAuthority + signed command front-end + policy→issuance bridge (§4.4); Tier-2 typed Topic<T> (§3.3) [BUILT]; Tier-1 selection carrier [NEXT]
+  crates/service/ndn-service                         authority-as-signed-Data: PolicyAuthority + signed command front-end + policy→issuance bridge (§4.4); Tier-2 typed Topic<T> (§3.3); Tier-1 DiscoveryCarrier (§3.2) [BUILT]
 ```
 
 `ndn-ndnsf` (compat) and `ndn-service` (v2) depend on the *same* shared
@@ -176,6 +176,21 @@ All, Random) yield a provider set; the call then drops to Tier 0. The forwarder'
 Measured strategy / SignalStore (RTT, congestion per face) MAY inform
 fastest-provider selection at the forwarding layer instead of an application-level
 ACK round-trip.
+
+**Built:** `ndn-service::discovery_carrier::DiscoveryCarrier<C>` — a `Carrier`
+that discovers the provider set for a logical service via a `ProviderDirectory`
+(Tier-1) and invokes the chosen provider(s) over an inner Tier-0 carrier `C`
+(e.g. `RpcCarrier`). The discovery layer **adds multi-provider `SelectCarrier`**
+on top of a *unary* inner carrier (FirstResponding / All / Random over the
+discovered set; `serve` advertises `<node>/<service>` and serves it on `C`).
+`ProviderDirectory` is a seam: `MemoryDirectory` (in-process) proves the carrier;
+a production directory wraps `ServiceDiscoveryProtocol` — `all_records` for the
+set, `measurements` (`rtt_p50`) for fastest-first ranking — with its own
+service↔provider naming convention (a deliberate later decision; the carrier is
+directory-agnostic). Witness `discovery_carrier`: a `#[ndn_service]` Echo client
+runs over `DiscoveryCarrier<RpcCarrier>`; `invoke` picks the best provider,
+`echo_select(All)` gathers every discovered provider (proving `SelectCarrier`
+arises from discovery, not the inner unary carrier); no provider → fail closed.
 
 ### 3.3 Tier 2 — collaboration (`ndn-service`)
 
