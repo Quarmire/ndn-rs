@@ -65,4 +65,7 @@ wasm-bindgen-futures = "0.4"
 
 [dev-dependencies]
 anyhow        = { workspace = true }
-tokio         = { workspace = true, features = ["rt", "macros"] }
+tokio         = { workspace = true, features = ["rt", "macros", "time"] }
+# Multicast forwarding so SVS sync Interests fan out across in-process faces
+# (the engine-backed Node publish/subscribe round-trip test).
+ndn-strategy  = { workspace = true }

@@ -40,6 +40,7 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use bytes::Bytes;
 
 use crate::connection::Connection;
@@ -58,13 +59,25 @@ use tokio_util::sync::CancellationToken;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::connection::IpcConnection;
 
+/// Supplies fresh dedicated [`Connection`]s to a [`Node`] on demand — one per
+/// pattern that needs its own stream (`publish` / `subscribe` / `query` /
+/// `serve_object`). [`Node::connect`] re-dials a socket internally;
+/// `EngineAppExt::app_node` allocates a new in-process engine face each time.
+/// Implement this to teach `Node` how to re-dial a custom transport.
+#[async_trait]
+pub trait ConnectionProvider: Send + Sync {
+    /// Open a new connection to the same forwarder / engine.
+    async fn open(&self) -> Result<Arc<dyn Connection>, AppError>;
+}
+
 /// How a [`Node`] obtains the *additional* dedicated connections that sync and
-/// query need. `Socket` can re-dial; `Pinned` was handed a single connection and
-/// cannot.
+/// query need. `Socket` re-dials, `Provider` mints, `Pinned` cannot.
 enum Connector {
     /// Re-dialable forwarder socket (the [`Node::connect`] path).
     #[cfg(not(target_arch = "wasm32"))]
     Socket(std::path::PathBuf),
+    /// Mints fresh connections on demand (e.g. new in-process engine faces).
+    Provider(Arc<dyn ConnectionProvider>),
     /// A single pre-made connection — no second stream available.
     Pinned,
 }
@@ -92,11 +105,27 @@ impl Node {
     /// Build a `Node` over any existing [`Connection`] (e.g. an in-process engine
     /// seam). `fetch`/`serve`/`object` work fully; `publish`/`subscribe`/`query`
     /// return [`AppError::Unsupported`] because they need a *separate* stream this
-    /// handle can't open — use [`connection`](Self::connection) for those.
+    /// handle can't open — use [`connection`](Self::connection) for those, or
+    /// [`from_provider`](Self::from_provider) if you can mint more connections.
     pub fn from_connection(conn: Arc<dyn Connection>) -> Self {
         Self {
             demux: DemuxConnection::new(conn),
             connector: Connector::Pinned,
+        }
+    }
+
+    /// Build a full `Node` whose `fetch`/`serve` run over `primary` and whose
+    /// dedicated patterns (`publish`/`subscribe`/`query`/`serve_object`) mint
+    /// fresh streams from `provider` — so every pattern is available without a
+    /// socket. `EngineAppExt::app_node` is the in-process constructor built on
+    /// this; implement [`ConnectionProvider`] to use it with a custom transport.
+    pub fn from_provider(
+        primary: Arc<dyn Connection>,
+        provider: Arc<dyn ConnectionProvider>,
+    ) -> Self {
+        Self {
+            demux: DemuxConnection::new(primary),
+            connector: Connector::Provider(provider),
         }
     }
 
@@ -114,6 +143,7 @@ impl Node {
         match &self.connector {
             #[cfg(not(target_arch = "wasm32"))]
             Connector::Socket(path) => Self::dial(path).await,
+            Connector::Provider(provider) => provider.open().await,
             Connector::Pinned => Err(AppError::Unsupported(
                 "this Node was built from a single connection; build the \
                  Publisher/Subscriber/Queryable directly from node.connection()"
@@ -193,13 +223,16 @@ impl Node {
         group: impl Into<Name>,
         local_name: impl Into<Name>,
     ) -> Result<Publisher, AppError> {
+        let group = group.into();
+        let local_name = local_name.into();
         let conn = self.dedicated().await?;
-        Publisher::from_connection(
-            conn,
-            group.into(),
-            local_name.into(),
-            PublisherConfig::default(),
-        )
+        // Receive peers' Sync Interests for the group, and let their fetch
+        // Interests reach this node's data (`<local_name>/<group>/<seq>`). The
+        // socket `Publisher::connect` registers these too; `from_connection`
+        // (sync) can't, so the embedder — here, `Node` — does it.
+        conn.register_prefix(&group).await?;
+        conn.register_prefix(&svs_data_prefix(&local_name, &group)).await?;
+        Publisher::from_connection(conn, group, local_name, PublisherConfig::default())
     }
 
     /// A [`Subscriber`] for dataset-sync group `group`, identified as
@@ -210,13 +243,12 @@ impl Node {
         group: impl Into<Name>,
         local_name: impl Into<Name>,
     ) -> Result<Subscriber, AppError> {
+        let group = group.into();
         let conn = self.dedicated().await?;
-        Subscriber::from_connection(
-            conn,
-            group.into(),
-            local_name.into(),
-            SubscriberConfig::default(),
-        )
+        // Receive peers' Sync Interests for the group (the subscriber fetches
+        // their data on demand, so only the group prefix needs a route here).
+        conn.register_prefix(&group).await?;
+        Subscriber::from_connection(conn, group, local_name.into(), SubscriberConfig::default())
     }
 
     // ---- query responder ---------------------------------------------------
@@ -320,4 +352,15 @@ impl Drop for ObjectServeGuard {
     fn drop(&mut self) {
         self._cancel.cancel();
     }
+}
+
+/// Where an SVS publisher's Data lives: `<local_name>/<group>/<seq>/…`. Routing
+/// fetch Interests to the publisher means registering `<local_name>/<group>`.
+/// Mirrors the derivation in `Publisher::connect`.
+fn svs_data_prefix(local_name: &Name, group: &Name) -> Name {
+    let mut p = local_name.clone();
+    for c in group.components() {
+        p = p.append_component(c.clone());
+    }
+    p
 }

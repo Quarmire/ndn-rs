@@ -39,6 +39,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::connection::{Connection, InProcConnection, LpInfo};
 use crate::error::AppError;
+use crate::node::ConnectionProvider;
 use crate::{Consumer, Node, Producer};
 
 /// Per-app in-process face buffer depth. Matches `MobileEngine`'s default.
@@ -78,11 +79,41 @@ pub trait EngineAppExt {
     /// # let _ = data; Ok(()) }
     /// ```
     ///
-    /// In-process nodes are [`from_connection`](Node::from_connection)-style, so
-    /// the *sync* patterns that need a separate dialed stream
-    /// (`publish`/`subscribe`/`query`/`serve_object`) return
-    /// [`AppError::Unsupported`]; `fetch` / `object` / `serve` cover the harness.
+    /// In-process nodes are full nodes: the dedicated-stream patterns
+    /// (`publish`/`subscribe`/`query`/`serve_object`) work too, each allocating
+    /// a fresh app face on this engine (tied to a child of `cancel`). No socket,
+    /// every pattern.
     fn app_node(&self, cancel: CancellationToken) -> Node;
+}
+
+/// Mints fresh in-process app faces on an embedded engine so a [`Node`] can open
+/// the dedicated connections that sync / query / object-serving need. Each face
+/// is tied to a child of the token passed to [`EngineAppExt::app_node`].
+struct EngineFaceProvider {
+    engine: ForwarderEngine,
+    cancel: CancellationToken,
+}
+
+impl EngineFaceProvider {
+    /// Allocate a new app face on the engine and wrap it in an
+    /// [`EngineConnection`] (whose `register_prefix` installs a FIB route to it).
+    fn spawn_face(&self) -> Arc<dyn Connection> {
+        let face_id = self.engine.faces().alloc_id();
+        let (face, handle) = InProcFace::new(face_id, APP_FACE_BUFFER);
+        self.engine.add_face(face, self.cancel.child_token());
+        Arc::new(EngineConnection {
+            inner: InProcConnection::new(handle),
+            fib: self.engine.fib(),
+            face_id,
+        })
+    }
+}
+
+#[async_trait]
+impl ConnectionProvider for EngineFaceProvider {
+    async fn open(&self) -> Result<Arc<dyn Connection>, AppError> {
+        Ok(self.spawn_face())
+    }
 }
 
 /// In-process [`Connection`] whose `register_prefix` installs a FIB route to its
@@ -132,14 +163,11 @@ impl EngineAppExt for ForwarderEngine {
     }
 
     fn app_node(&self, cancel: CancellationToken) -> Node {
-        let face_id = self.faces().alloc_id();
-        let (face, handle) = InProcFace::new(face_id, APP_FACE_BUFFER);
-        self.add_face(face, cancel);
-        let conn = EngineConnection {
-            inner: InProcConnection::new(handle),
-            fib: self.fib(),
-            face_id,
-        };
-        Node::from_connection(Arc::new(conn))
+        let provider = Arc::new(EngineFaceProvider {
+            engine: self.clone(),
+            cancel,
+        });
+        let primary = provider.spawn_face();
+        Node::from_provider(primary, provider)
     }
 }
