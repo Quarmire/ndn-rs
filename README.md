@@ -35,6 +35,8 @@ else in the ecosystem.
 | [ndn-embedded](https://github.com/Quarmire/ndn-embedded) | `no_std` embedded forwarder |
 | [ndn-repo](https://github.com/Quarmire/ndn-repo) | persistent named-data repository daemon |
 | [ndn-sim](https://github.com/Quarmire/ndn-sim) | simulator |
+| [ndn-anchor](https://github.com/Quarmire/ndn-anchor) | Anchor app (Android/iOS) — presence over NAN + BLE |
+| [ndn-ripple](https://github.com/Quarmire/ndn-ripple) | Ripple app (Android) — nearby peers |
 
 Cross-repo crates depend on `ndn-rs` by git tag.
 
