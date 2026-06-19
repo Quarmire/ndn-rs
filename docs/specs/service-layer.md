@@ -501,8 +501,10 @@ Constraints on performance claims:
 5. Compat: `ndn-ndnsf` (four-phase + KP-ABE controller). *In progress:* sans-IO
    core landed — `tokens` (the provider-token/pending-state machine: one-time
    consume, TTL expiry, idempotent bounded cleanup; closes O4 NSF-T1/T3/T4/T5/T6
-   + NSF-S1–S5, 7 witnesses) and `names` (the V2 four-phase name builders). The
-   message TLV taxonomy (Request/Ack/Selection/Response, types 128–131) and the
-   four-phase flow over SVS pub/sub (the `ServiceProvider`/`ServiceUser` roles,
-   wiring `ndn-nacabe`'s KP-ABE `ServiceController`) follow.
+   + NSF-S1–S5, 7 witnesses), `names` (the V2 four-phase name builders), and
+   `messages` (the four-phase message TLV taxonomy — Request/Ack/Selection/
+   Response at types 128–131, faithful sub-field numbers, tolerant decode for
+   interop). The four-phase flow over SVS pub/sub (the `ServiceProvider`/
+   `ServiceUser` roles, wiring `ndn-nacabe`'s KP-ABE `ServiceController`)
+   follows.
 6. v2: `ndn-service` (Tier-1 selection + Tier-2 collab, authority-as-signed-Data).
