@@ -235,9 +235,19 @@ topic = a typed feed + CK sealing, scoped under the session name — composing t
 Tier-2 pieces, not a mega-primitive. The roster (role type `R`) is *typed*
 metadata (`admit`/`role_of`/`members`; roles are an enum, not string-keyed, §3.3).
 Witness `session_collab`: two members exchange a confidential `Order` feed while a
-non-member (different key) reads nothing. *Next* increments: role-scoped keys
-(per-role CK/ABE so a role gates which topics it reads), member key distribution
-(via `ndn-sealed-box`/ABE), and artifact provisioning.
+non-member (different key) reads nothing.
+
+**Role-scoped keys built:** confidentiality is *per scope*, not one session-wide
+key. `session::ScopeKeyring` holds the scope keys a member possesses;
+`RoleScopePolicy<R>` is the role→scope access policy and `keyring_for(role, all)`
+derives a member's keyring (exactly the keys its role grants — role-scoped keys);
+`ScopedSession::topic(scope, sub)` yields a topic sealed under the scope key, or
+`None` if the member's keyring lacks the scope (the role gate, enforced by key
+possession). Witness `role_scoped_keys`: a Commander (granted `control` +
+`telemetry`) reads both scopes; an Observer (granted `telemetry` only) reads
+telemetry and cannot even obtain a `control` topic. *Next:* member key
+distribution (how a member receives its scope keys — `ndn-sealed-box` per member
+or ABE by role), and artifact provisioning.
 
 ---
 
