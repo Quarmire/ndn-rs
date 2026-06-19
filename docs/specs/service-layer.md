@@ -477,14 +477,22 @@ Constraints on performance claims:
    container, `ndn-rpc` extracted from `ndn-compute`, `ndn-security::capability`.
 3. Extract NDNSF security invariants into witnesses (O4) — gate before crypto/
    collab.
-4. `ndn-nacabe` (NAC protocol) on the shared crypto. *In progress:* the sans-IO
-   core landed (`ndn-ext/crates/service/ndn-nacabe`) — the `CkData` object
-   (named, ABE-wrapped content key), the CP/KP producer→consumer CK-data flow
-   (`seal_cp`/`open_cp`, `seal_kp`/`open_kp`, fail-closed), and the NAC naming
-   (`PUBPARAMS`/`DKEY`/`CK`/`ENC-BY`, 6 witnesses, clippy-clean). **Remaining:**
-   the named exchanges over `ndn-app` — the attribute authority serving
-   `PUBPARAMS` and issuing `DKEY` (validating the requester cert, wrapping the
-   key to it) and the consumer `ParamFetcher` — gated by the O4 protocol-level
-   invariants (NSF-A1/A2/F1).
+4. `ndn-nacabe` (NAC protocol) on the shared crypto. *In progress:*
+   - **CK-data core** (`CkData`, `seal_cp`/`open_cp`, `seal_kp`/`open_kp`,
+     fail-closed) + NAC naming (`PUBPARAMS`/`DKEY`/`CK`/`ENC-BY`).
+   - **Authority issuance + ParamFetcher key-recovery** (`authority`):
+     `CpAuthority`/`KpAuthority` hold the master secret + per-identity grants,
+     issue a decryption key for an authorized requester (**fails closed** for an
+     unenrolled one, NSF-A2/F5), and **seal** it to the requester's ephemeral
+     X25519 key via `ndn-sealed-box` (confidential delivery, NSF-F3); the
+     `ParamFetcher` side (`open_cp_dkey`/`open_kp_dkey`) opens it. End-to-end
+     witnessed (issue→seal→open→unwrap-CK→decrypt-content for CP and KP;
+     unenrolled fails closed; a DKEY sealed to one recipient won't open for
+     another). 10 witnesses, clippy-clean.
+   - **Remaining:** the over-NDN serve/fetch shell — a Producer serving
+     `PUBPARAMS` and handling signed `DKEY` Interests (validating the request,
+     NSF-A1, and binding the verified signer identity to the advertised X25519
+     key, NSF-A2) + the consumer fetch loop. Thin `ndn-app` plumbing over the
+     landed core; gated by the O4 protocol-level invariants before it lands.
 5. Compat: `ndn-ndnsf` (four-phase + KP-ABE controller).
 6. v2: `ndn-service` (Tier-1 selection + Tier-2 collab, authority-as-signed-Data).
