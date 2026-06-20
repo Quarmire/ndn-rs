@@ -37,6 +37,41 @@ serves it on demand, **signing** each segment with the configured
 signer (without `with_signer` it emits `DigestSha256` — integrity, not
 authorship). `chunk_size == 0` uses the default segment size.
 
+### Aggregated signing — one signature per object _(extension)_
+
+For larger objects, signing every segment is wasteful: a FLIC-style
+**manifest** signs the object **once**. `publish_object` uses
+`Aggregation::Auto`, which switches to a manifest for medium objects
+(roughly 8–256 segments) and stays per-segment for small ones. To choose
+explicitly:
+
+```rust,ignore
+use ndn::{Aggregation, PublishOptions};
+
+producer.publish_object_with(
+    "/example/big".parse()?,
+    content,
+    PublishOptions { chunk_size: 0, aggregation: Aggregation::Manifest },
+).await?;
+```
+
+How it works: the RDR `…/32=metadata` Data — already the single signed
+discovery object — carries the ordered per-segment SHA-256 hashes and is
+marked `ContentType::Manifest`. That one signature authenticates the whole
+object; segments are then served plain and authenticated by **hash-match**
+against the manifest. The manifest also doubles as a content listing.
+
+This is **transparent to the consumer**: `fetch_object` detects a manifest
+from the metadata and verifies segments by hash automatically — the code
+below is unchanged whether the object was per-segment-signed or aggregated.
+
+> The hash list is built in the same pass that segments the object, so the
+> per-segment commitments are essentially free on top of hashing the data
+> once. The current manifest is a single flat packet (objects beyond ~256
+> segments fall back to per-segment signing); nested-manifest DAGs for very
+> large files are a planned extension. This is an ndn-rs extension, not an
+> adopted NDN community wire spec.
+
 ## The consumer — verify what you fetch
 
 The producer signed its `Data`; the consumer's job is to **check that signature**
