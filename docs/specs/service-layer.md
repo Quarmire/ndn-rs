@@ -1036,9 +1036,11 @@ emit it. `ndn_service_core::publish` is exactly that half, and nothing else.
   reusing the stack's own `no_std` AEAD primitive (`ndn-crypto-core::seal_in_place`,
   the same cipher core `ndn-security`'s `ContentKey` is built on). The leaf *holds*
   the 32-byte scope key a gateway distributed (ABE-by-role / sealed-box, §6); it
-  never runs the distribution. The AEAD nonce is derived from the publication
-  sequence, so **no RNG is needed on the leaf** — at the cost that the sequence
-  must stay monotonic across reboots under a reused key (persist it, or rekey).
+  never runs the distribution. The AEAD nonce is `publisher_id ‖ seq` — a per-leaf
+  id (unique across leaves sharing the key) over a monotonic sequence — so **no RNG
+  is needed on the leaf** and leaves never collide nonces; the cost is that the
+  sequence must stay monotonic across reboots under a reused key (persist it, or
+  rekey on boot). `Publisher::sealed` requires the `publisher_id`.
   The wire envelope is **byte-aligned with `ContentKey`**: `nonce ‖ tag ‖
   ciphertext` (`Sealed::to_bytes`), with the nonce carried on the wire and the
   publication name (`Name::encode_to_tlv`) bound as AAD — so a gateway opens a
