@@ -1039,6 +1039,12 @@ emit it. `ndn_service_core::publish` is exactly that half, and nothing else.
   never runs the distribution. The AEAD nonce is derived from the publication
   sequence, so **no RNG is needed on the leaf** — at the cost that the sequence
   must stay monotonic across reboots under a reused key (persist it, or rekey).
+  The wire envelope is **byte-aligned with `ContentKey`**: `nonce ‖ tag ‖
+  ciphertext` (`Sealed::to_bytes`), with the nonce carried on the wire and the
+  publication name (`Name::encode_to_tlv`) bound as AAD — so a gateway opens a
+  leaf's publication directly with `Sealed::from_bytes` + `ContentKey::open`, and
+  the reverse (a gateway sealing command/config *to* a leaf) opens under `ScopeKey`.
+  Proven bidirectionally in `ndn-service/tests/leaf_seal_interop.rs`.
 
 ### 13.3 Honest boundaries
 
@@ -1051,10 +1057,11 @@ emit it. `ndn_service_core::publish` is exactly that half, and nothing else.
   standard requirement for **every** `no_std` crate on that target, not specific to
   this code. Our producer, `ndn-packet`, and `ndn-crypto-core` all compile for it;
   `bytes` is the gate. The classic Xtensa ESP32 needs the esp-rs fork toolchain.
-- **Seal envelope.** The cipher core is shared with the stack, but the envelope is
-  minimal (`ciphertext || 16-byte tag`, empty AAD). Byte-aligning it with
-  `ndn-security`'s `ContentKey` and binding the publication name as AAD is a tracked
-  hardening step.
+- **Seal envelope: aligned.** The envelope is byte-identical to `ndn-security`'s
+  `ContentKey` (`nonce ‖ tag ‖ ciphertext`, name bound as AAD), so leaf seals and
+  native opens interoperate both directions (`leaf_seal_interop.rs`). What remains
+  leaf-specific is *nonce derivation* (sequence, not RNG) — a choice the wire format
+  is agnostic to, since the nonce travels on the wire.
 - **Not a forwarder.** This is a *producer*, not the aspirational `ndn-embedded`
   constrained forwarder (`ndn-crypto-core`'s docs). A leaf emits named data and
   relies on a gateway for PIT/FIB/CS and sync; it does not forward.
