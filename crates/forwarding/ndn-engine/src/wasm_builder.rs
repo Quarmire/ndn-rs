@@ -275,6 +275,9 @@ impl WasmEngineBuilder {
             measurements: Arc::clone(&measurements),
             signals: Arc::clone(&signals),
             strategy_table: Arc::clone(&strategy_table),
+            // The browser engine has no configured network region (mutable at
+            // runtime via ForwarderEngine::network_region); start empty.
+            network_region: Arc::new(crate::stages::strategy::NetworkRegionTable::new(Vec::new())),
             validator: validator.clone(),
             replay_guard: replay_guard.clone(),
             pipeline_tx: OnceLock::new(),
