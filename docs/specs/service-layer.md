@@ -991,3 +991,70 @@ variant is gated behind `engine`. Witness `face_carrier`: a `#[ndn_service]`
 cross-face service call, routed by the forwarder, no shared registry. This turns
 the proven seam (macro client, `DiscoveryCarrier`, the PyO3 binding) into real
 distributed services unchanged, and is where forwarding hints actually route.
+
+## 13. Embedded leaf producer (`ndn_service_core::publish`)
+
+> Status: **built and cross-compiled to bare metal** (2026-06-20). The producer
+> lives in `ndn-service-core` behind `default-features = false`; proven on the host
+> (`ndn-service-core/examples/embedded_sensor.rs`, plus the `publish` module
+> doctest) and cross-compiled clean to **`thumbv7em-none-eabihf`** (ARM Cortex-M4F:
+> STM32F4 / nRF52) with `--no-default-features --features seal`.
+
+### 13.1 Why a leaf surface (the role split, realized)
+
+The full service surfaces (§3.2–§3.3) and `Topic<T>` assume an async runtime, an
+SVS sync group, and `std` — correct for a *capable* node, wrong for a sensor. But
+the role split this spec already draws (§4, §6: ABE/authorities/SVS on the
+gateway; symmetric scope keys on the leaf) means a constrained device only needs
+the **cheap half**: frame a typed value, name it, seal it with a symmetric key,
+emit it. `ndn_service_core::publish` is exactly that half, and nothing else.
+
+- **`no_std + alloc`.** `ndn-service-core` is `#![cfg_attr(not(feature = "std"),
+  no_std)]`: the message layer (`Frame`, `framing`, `ServiceError`, the
+  id/context types) and the producer are portable; the async carrier traits
+  (`Carrier`/`Dispatch`/`SelectCarrier`/`HintedCarrier`) and `ScriptDispatch` are
+  gated behind the default `std` feature. A leaf depends on **one** crate
+  (`ndn-service-core`, `default-features = false`) — not a separate publish crate.
+- **One message format, two scales.** A leaf frames with `#[derive(Frame)]`
+  (proc-macros run on the host, so the derive serves `no_std` targets too); the
+  gateway decodes with the *same* `Frame`. Leaf and node never disagree.
+
+### 13.2 The surface
+
+- `Publisher<T: Frame>` — a typed, append-only feed producer. `publish(value,
+  sink)` frames the value, names it `<topic>/seq=N` (the NDN sequence-number
+  convention, `Name::append_sequence_num`), hands it to the sink, and advances.
+  `build`/`advance` split the steps for callers that transmit themselves;
+  `starting_at` resumes the sequence across reboots.
+- `PublicationSink` — the platform's transmit seam (`deliver(&Publication)`), the
+  one trait a target implements over its link (ESP-NOW broadcast, a monitor-mode
+  802.11 frame, UART, or a UDP socket on a capable node). All I/O is behind it, so
+  the producer owns no executor and stays `no_std`.
+- `Publication { name, payload }` — the named, ready-to-transmit unit a downstream
+  gateway ingests into the full `Topic<T>` / SVS world.
+- `ScopeKey` (feature `seal`) — symmetric ChaCha20-Poly1305 confidentiality,
+  reusing the stack's own `no_std` AEAD primitive (`ndn-crypto-core::seal_in_place`,
+  the same cipher core `ndn-security`'s `ContentKey` is built on). The leaf *holds*
+  the 32-byte scope key a gateway distributed (ABE-by-role / sealed-box, §6); it
+  never runs the distribution. The AEAD nonce is derived from the publication
+  sequence, so **no RNG is needed on the leaf** — at the cost that the sequence
+  must stay monotonic across reboots under a reused key (persist it, or rekey).
+
+### 13.3 Honest boundaries
+
+- **ARM bare metal: clean.** `thumbv7em-none-eabihf` compiles the producer + seal
+  + the whole dependency chain (`ndn-packet`, `ndn-crypto-core`, `chacha20poly1305`)
+  with no `std`.
+- **ESP32-C3 (`riscv32imc`): one firmware-level flag.** The chip lacks hardware
+  atomic CAS, so `bytes` (via `portable-atomic`) needs a single-core CAS polyfill —
+  a `critical-section` implementation supplied by the *firmware* crate (esp-hal), a
+  standard requirement for **every** `no_std` crate on that target, not specific to
+  this code. Our producer, `ndn-packet`, and `ndn-crypto-core` all compile for it;
+  `bytes` is the gate. The classic Xtensa ESP32 needs the esp-rs fork toolchain.
+- **Seal envelope.** The cipher core is shared with the stack, but the envelope is
+  minimal (`ciphertext || 16-byte tag`, empty AAD). Byte-aligning it with
+  `ndn-security`'s `ContentKey` and binding the publication name as AAD is a tracked
+  hardening step.
+- **Not a forwarder.** This is a *producer*, not the aspirational `ndn-embedded`
+  constrained forwarder (`ndn-crypto-core`'s docs). A leaf emits named data and
+  relies on a gateway for PIT/FIB/CS and sync; it does not forward.
