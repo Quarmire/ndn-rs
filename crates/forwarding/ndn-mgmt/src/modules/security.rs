@@ -332,8 +332,9 @@ mod security_v1_handler_tests {
     #[test]
     fn policy_set_reports_pending_restart_for_changed_booleans() {
         // No runtime mutator wired → flipping a default-true boolean
-        // lands in `pending_restart`.
-        let posture = r#"{"ephemeral_allowed":true,"localhop_disabled":true,"replay_window_secs":120,"require_signed_commands":false,"validator_anchor":null}"#;
+        // lands in `pending_restart`. (Uses `localhop_disabled`, not
+        // `require_signed_commands`, which can no longer be down-flipped — SEC-1.)
+        let posture = r#"{"ephemeral_allowed":true,"localhop_disabled":false,"replay_window_secs":120,"require_signed_commands":true,"validator_anchor":null}"#;
         let resp = security_policy_set(
             ControlParameters {
                 uri: Some(posture.to_string()),
@@ -349,9 +350,26 @@ mod security_v1_handler_tests {
             .find_map(|l| l.strip_prefix("pending_restart="))
             .expect("pending_restart line");
         assert!(
-            pending_line.contains("require_signed_commands"),
-            "expected require_signed_commands in pending_restart; got {pending_line:?}"
+            pending_line.contains("localhop_disabled"),
+            "expected localhop_disabled in pending_restart; got {pending_line:?}"
         );
+    }
+
+    #[test]
+    fn policy_set_rejects_require_signed_down_flip() {
+        // SEC-1: turning require_signed_commands off at runtime is a one-way
+        // posture-lowering ratchet and must be rejected.
+        let posture = r#"{"ephemeral_allowed":true,"localhop_disabled":true,"replay_window_secs":120,"require_signed_commands":false,"validator_anchor":null}"#;
+        let resp = security_policy_set(
+            ControlParameters {
+                uri: Some(posture.to_string()),
+                ..Default::default()
+            },
+            &empty_config(),
+            None,
+        );
+        assert_eq!(resp.status_code, status::BAD_PARAMS);
+        assert!(resp.status_text.contains("cannot be disabled at runtime"));
     }
 
     #[test]
@@ -404,13 +422,15 @@ mod security_v1_handler_tests {
         let cfg = empty_config();
         let start = MgmtAccessPolicy::from_config(&cfg);
         assert!(
-            start.require_signed_commands,
-            "default config has require_signed_commands=true"
+            start.localhop_disabled,
+            "empty config has localhop_disabled=true (no localhop anchor)"
         );
         let lock = Arc::new(RwLock::new(start));
 
-        // Runtime-writable → lands in `applied`, not `pending_restart`.
-        let new = r#"{"ephemeral_allowed":true,"localhop_disabled":true,"replay_window_secs":120,"require_signed_commands":false,"validator_anchor":null}"#;
+        // Runtime-writable → lands in `applied`, not `pending_restart`. Flips
+        // `localhop_disabled` (keeping require_signed_commands=true — SEC-1
+        // forbids down-flipping that one).
+        let new = r#"{"ephemeral_allowed":true,"localhop_disabled":false,"replay_window_secs":120,"require_signed_commands":true,"validator_anchor":null}"#;
         let set_resp = security_policy_set(
             ControlParameters {
                 uri: Some(new.into()),
@@ -426,15 +446,15 @@ mod security_v1_handler_tests {
             .find_map(|l| l.strip_prefix("runtime_applied="))
             .expect("runtime_applied line");
         assert!(
-            applied_line.contains("require_signed_commands"),
-            "expected require_signed_commands in runtime_applied; got {applied_line:?}"
+            applied_line.contains("localhop_disabled"),
+            "expected localhop_disabled in runtime_applied; got {applied_line:?}"
         );
 
-        assert!(!lock.read().unwrap().require_signed_commands);
+        assert!(!lock.read().unwrap().localhop_disabled);
 
         let get_resp = security_policy_get(&cfg, Some(&lock));
         let parsed: MgmtAccessPolicy = serde_json::from_str(&get_resp.status_text).unwrap();
-        assert!(!parsed.require_signed_commands);
+        assert!(!parsed.localhop_disabled);
     }
 
     /// `effective_require_signed_commands` reads from `runtime_policy`
