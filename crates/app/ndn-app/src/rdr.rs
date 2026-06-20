@@ -43,6 +43,12 @@ const TLV_METADATA_NAME: u64 = 0x07;
 const TLV_METADATA_FINAL_BLOCK_ID: u64 = 0x1a;
 const TLV_METADATA_SEGMENT_SIZE: u64 = 0xf500;
 const TLV_METADATA_SIZE: u64 = 0xf502;
+/// FLIC-style aggregated-signing manifest: the ordered per-segment SHA-256
+/// hashes, concatenated (`32·N` bytes). Present ⇒ this metadata Data **is** the
+/// manifest root: one signature over the whole list authenticates every segment,
+/// which is then served plain (DigestSha256) and verified by hash-match. Absent
+/// ⇒ classic per-segment signing.
+const TLV_METADATA_SEGMENT_HASHES: u64 = 0xf504;
 
 /// `versioned_name` is the segment prefix (`<name>/v=<ver>`);
 /// `final_block_id` is the last-segment NameComponent's wire bytes
@@ -53,6 +59,9 @@ pub struct MetaData {
     pub final_block_id: Bytes,
     pub segment_size: Option<u64>,
     pub size: Option<u64>,
+    /// FLIC manifest: ordered per-segment SHA-256 hashes. `Some` ⇒ aggregated
+    /// signing (this Data is the signed manifest root); `None` ⇒ per-segment.
+    pub segment_hashes: Option<Vec<[u8; 32]>>,
 }
 
 impl Default for MetaData {
@@ -62,6 +71,7 @@ impl Default for MetaData {
             final_block_id: Bytes::new(),
             segment_size: None,
             size: None,
+            segment_hashes: None,
         }
     }
 }
@@ -80,6 +90,13 @@ impl MetaData {
             let nni = encode_nni_be(size);
             w.write_tlv(TLV_METADATA_SIZE, &nni);
         }
+        if let Some(hashes) = &self.segment_hashes {
+            let mut flat = Vec::with_capacity(hashes.len() * 32);
+            for h in hashes {
+                flat.extend_from_slice(h);
+            }
+            w.write_tlv(TLV_METADATA_SEGMENT_HASHES, &flat);
+        }
         w.finish()
     }
 
@@ -89,6 +106,7 @@ impl MetaData {
         let mut final_block_id = None;
         let mut segment_size = None;
         let mut size = None;
+        let mut segment_hashes = None;
         while !r.is_empty() {
             let (typ, value) = r
                 .read_tlv()
@@ -108,6 +126,24 @@ impl MetaData {
                 TLV_METADATA_SIZE => {
                     size = Some(decode_nni(&value)?);
                 }
+                TLV_METADATA_SEGMENT_HASHES => {
+                    if value.len() % 32 != 0 {
+                        return Err(AppError::Protocol(format!(
+                            "manifest segment-hashes length {} not a multiple of 32",
+                            value.len()
+                        )));
+                    }
+                    segment_hashes = Some(
+                        value
+                            .chunks_exact(32)
+                            .map(|c| {
+                                let mut h = [0u8; 32];
+                                h.copy_from_slice(c);
+                                h
+                            })
+                            .collect::<Vec<[u8; 32]>>(),
+                    );
+                }
                 _ => {}
             }
         }
@@ -120,6 +156,7 @@ impl MetaData {
             final_block_id,
             segment_size,
             size,
+            segment_hashes,
         })
     }
 
@@ -207,6 +244,18 @@ pub struct PreparedObject {
     seg_cache: std::sync::Mutex<std::collections::HashMap<u64, Bytes>>,
     /// Signed metadata Data, cached likewise (the consumer may re-discover it).
     meta_cache: std::sync::Mutex<Option<Bytes>>,
+    /// FLIC aggregated-signing mode: the metadata Data carries the per-segment
+    /// hash list and is signed once (the manifest root, `ContentType::Manifest`);
+    /// segments are served plain (DigestSha256), authenticated by hash-match.
+    aggregated: bool,
+}
+
+/// SHA-256 of a segment payload — the FLIC manifest leaf.
+pub(crate) fn sha256(bytes: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(bytes);
+    h.finalize().into()
 }
 
 /// Per-segment payload source for a [`PreparedObject`].
@@ -267,6 +316,17 @@ impl SegmentSource {
 impl PreparedObject {
     /// Version is the current Unix millis.
     pub fn build(object_name: Name, content: Bytes, chunk_size: usize) -> Self {
+        Self::build_with(object_name, content, chunk_size, false)
+    }
+
+    /// Like [`build`](Self::build) but emits a FLIC aggregated-signing manifest:
+    /// the metadata Data carries the per-segment hash list and is the single
+    /// signed root, and segments are served plain (verified by hash-match).
+    pub fn build_aggregated(object_name: Name, content: Bytes, chunk_size: usize) -> Self {
+        Self::build_with(object_name, content, chunk_size, true)
+    }
+
+    fn build_with(object_name: Name, content: Bytes, chunk_size: usize, aggregate: bool) -> Self {
         let size = content.len() as u64;
         let segments: Vec<Bytes> = if content.is_empty() {
             vec![Bytes::new()]
@@ -280,7 +340,13 @@ impl PreparedObject {
             }
             acc
         };
-        Self::assemble(object_name, SegmentSource::Memory(segments), size, chunk_size)
+        Self::assemble(
+            object_name,
+            SegmentSource::Memory(segments),
+            size,
+            chunk_size,
+            aggregate,
+        )
     }
 
     /// File-backed prepared object: segments are read from `file` on demand, so
@@ -301,7 +367,29 @@ impl PreparedObject {
             chunk,
             count,
         });
-        Self::assemble(object_name, source, size, chunk_size)
+        Self::assemble(object_name, source, size, chunk_size, false)
+    }
+
+    /// File-backed FLIC aggregated-signing publish: like
+    /// [`build_from_file`](Self::build_from_file) but the metadata is the signed
+    /// manifest root (per-segment hashes computed by one positional read pass)
+    /// and segments are served plain. Unix-only.
+    #[cfg(all(not(target_arch = "wasm32"), unix))]
+    pub fn build_from_file_aggregated(
+        object_name: Name,
+        file: std::fs::File,
+        size: u64,
+        chunk_size: usize,
+    ) -> Self {
+        let chunk = chunk_size.max(1) as u64;
+        let count = if size == 0 { 1 } else { size.div_ceil(chunk) };
+        let source = SegmentSource::File(FileSource {
+            file,
+            size,
+            chunk,
+            count,
+        });
+        Self::assemble(object_name, source, size, chunk_size, true)
     }
 
     /// Metadata-only prepared object: knows the segment count (from `size` /
@@ -322,16 +410,19 @@ impl PreparedObject {
         } else {
             size.div_ceil(chunk as u64)
         };
-        Self::assemble(object_name, SegmentSource::Phantom { count }, size, chunk)
+        Self::assemble(object_name, SegmentSource::Phantom { count }, size, chunk, false)
     }
 
     /// Shared assembly: derive the versioned name, FinalBlockID, and metadata
-    /// from the segment `source` (its count) and the total `size`.
+    /// from the segment `source` (its count) and the total `size`. When
+    /// `aggregate` is set, also hash every segment into a FLIC manifest carried
+    /// by the metadata (the single signed root).
     fn assemble(
         object_name: Name,
         source: SegmentSource,
         size: u64,
         chunk_size: usize,
+        aggregate: bool,
     ) -> Self {
         // web_time::SystemTime delegates to std natively; on wasm32 it reads
         // Date.now() instead of panicking like std::time::SystemTime::now().
@@ -340,7 +431,30 @@ impl PreparedObject {
             .map(|d| d.as_millis() as u64)
             .unwrap_or(1);
         let versioned_name = object_name.clone().append_version(version);
-        let last_seg = source.count().saturating_sub(1);
+        let count = source.count();
+        let last_seg = count.saturating_sub(1);
+
+        // FLIC manifest: hash every segment (one pass over the source). If any
+        // segment is unreadable (a Phantom metadata-only object), aggregation is
+        // not possible — fall back to per-segment signing rather than emit a
+        // partial manifest.
+        let segment_hashes: Option<Vec<[u8; 32]>> = if aggregate {
+            let mut hashes = Vec::with_capacity(count as usize);
+            let mut ok = true;
+            for i in 0..count {
+                match source.read(i) {
+                    Some(b) => hashes.push(sha256(&b)),
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            ok.then_some(hashes)
+        } else {
+            None
+        };
+        let aggregated = segment_hashes.is_some();
 
         let mut fbi = BytesMut::with_capacity(2 + 8);
         let nni = encode_nni_be(last_seg);
@@ -351,6 +465,7 @@ impl PreparedObject {
             final_block_id: fbi.freeze(),
             segment_size: Some(chunk_size as u64),
             size: Some(size),
+            segment_hashes,
         };
         let metadata_content = meta.encode();
 
@@ -369,7 +484,13 @@ impl PreparedObject {
             source,
             seg_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             meta_cache: std::sync::Mutex::new(None),
+            aggregated,
         }
+    }
+
+    /// Whether this object serves a FLIC aggregated-signing manifest.
+    pub fn is_aggregated(&self) -> bool {
+        self.aggregated
     }
 
     /// Number of segments this object serves.
@@ -405,9 +526,16 @@ impl PreparedObject {
             if let Some(cached) = self.meta_cache.lock().unwrap().clone() {
                 return Ok(Some(cached));
             }
-            let builder = DataBuilder::new(self.metadata_data_name.clone(), &self.metadata_content)
-                .freshness(Duration::from_millis(1000))
-                .final_block_id_typed_seg(0);
+            let mut builder =
+                DataBuilder::new(self.metadata_data_name.clone(), &self.metadata_content)
+                    .freshness(Duration::from_millis(1000))
+                    .final_block_id_typed_seg(0);
+            // In aggregated mode this metadata Data IS the FLIC manifest root —
+            // mark it so a fetcher (or any NDN stack) can tell it apart, and
+            // sign it once (the one signature covering the whole object).
+            if self.aggregated {
+                builder = builder.content_type(ndn_packet::meta_info::ContentType::Manifest);
+            }
             let wire = sign_or_digest(builder, signer).await?;
             *self.meta_cache.lock().unwrap() = Some(wire.clone());
             return Ok(Some(wire));
@@ -432,7 +560,11 @@ impl PreparedObject {
             } else {
                 DataBuilder::new(seg_name, payload.as_ref())
             };
-            let wire = sign_or_digest(builder, signer).await?;
+            // Aggregated (FLIC) segments are served plain (DigestSha256): the
+            // manifest's single signature authenticates them via hash-match, so
+            // per-segment signing would be redundant work. Per-segment mode signs.
+            let seg_signer = if self.aggregated { None } else { signer };
+            let wire = sign_or_digest(builder, seg_signer).await?;
             self.seg_cache.lock().unwrap().insert(seg_idx, wire.clone());
             return Ok(Some(wire));
         }
@@ -456,6 +588,7 @@ mod tests {
             final_block_id: Bytes::from(fbi),
             segment_size: Some(8192),
             size: Some(24000),
+            segment_hashes: None,
         };
         let wire = m.encode();
         let m2 = MetaData::decode(wire).unwrap();
@@ -501,6 +634,7 @@ mod tests {
             final_block_id: Bytes::from(fbi),
             segment_size: Some(8192),
             size: Some(0x12_3456), // 1,193,046 bytes
+            segment_hashes: None,
         };
         let m2 = MetaData::decode(m.encode()).expect("3-byte-range size must decode");
         assert_eq!(m2.size, Some(0x12_3456));
@@ -557,5 +691,87 @@ mod tests {
         let last = m.components().last().unwrap();
         assert_eq!(last.typ, ndn_packet::tlv_type::KEYWORD);
         assert_eq!(last.value.as_ref(), b"metadata");
+    }
+
+    #[test]
+    fn manifest_metadata_round_trips() {
+        let hashes = vec![[1u8; 32], [2u8; 32], [3u8; 32]];
+        let m = MetaData {
+            versioned_name: "/o".parse::<Name>().unwrap().append_version(7),
+            final_block_id: {
+                let nni = encode_nni_be(2);
+                let mut fbi = vec![0x32u8, nni.len() as u8];
+                fbi.extend_from_slice(&nni);
+                Bytes::from(fbi)
+            },
+            segment_size: Some(8192),
+            size: Some(20000),
+            segment_hashes: Some(hashes.clone()),
+        };
+        let m2 = MetaData::decode(m.encode()).unwrap();
+        assert_eq!(m2.segment_hashes, Some(hashes));
+    }
+
+    #[test]
+    fn manifest_decode_rejects_misaligned_hash_list() {
+        // 33 bytes is not a multiple of 32 → malformed manifest.
+        let mut w = TlvWriter::new();
+        w.write_raw(&"/o".parse::<Name>().unwrap().append_version(1).encode_to_tlv());
+        let nni = encode_nni_be(0);
+        let mut fbi = vec![0x32u8, nni.len() as u8];
+        fbi.extend_from_slice(&nni);
+        w.write_tlv(TLV_METADATA_FINAL_BLOCK_ID, &fbi);
+        w.write_tlv(TLV_METADATA_SEGMENT_HASHES, &[0u8; 33]);
+        assert!(MetaData::decode(w.finish()).is_err());
+    }
+
+    #[tokio::test]
+    async fn aggregated_object_serves_signed_manifest_and_plain_segments() {
+        use ndn_packet::Data;
+        use ndn_packet::meta_info::ContentType;
+
+        // 20 000 bytes at 4 KiB → 5 segments.
+        let content = Bytes::from((0..20_000u32).map(|i| (i & 0xff) as u8).collect::<Vec<_>>());
+        let object: Name = "/obj".parse().unwrap();
+        let prep = PreparedObject::build_aggregated(object.clone(), content.clone(), 4096);
+        assert!(prep.is_aggregated());
+        assert_eq!(prep.segment_count(), 5);
+
+        // Metadata Data == the FLIC manifest root: ContentType::Manifest + the
+        // per-segment hash list, length == segment count. (No signer here → the
+        // root is DigestSha256, but the manifest semantics are independent of
+        // who signs it.)
+        let meta_name = metadata_name(&object);
+        let meta_wire = prep
+            .answer_interest(&meta_name, None)
+            .await
+            .unwrap()
+            .expect("metadata served");
+        let meta_data = Data::decode(meta_wire).unwrap();
+        assert_eq!(
+            meta_data.meta_info().map(|m| m.content_type),
+            Some(ContentType::Manifest)
+        );
+        let meta = MetaData::decode(meta_data.content().cloned().unwrap()).unwrap();
+        let hashes = meta.segment_hashes.expect("manifest carries hashes");
+        assert_eq!(hashes.len(), 5);
+
+        // Each segment is served PLAIN (no per-segment signature) and its bytes
+        // hash to the manifest entry — authenticity rides the one root, not N sigs.
+        for i in 0..prep.segment_count() {
+            let seg_name = prep.versioned_name.clone().append_segment(i);
+            let wire = prep
+                .answer_interest(&seg_name, None)
+                .await
+                .unwrap()
+                .expect("segment served");
+            let data = Data::decode(wire).unwrap();
+            assert_eq!(sha256(data.content().unwrap()), hashes[i as usize]);
+        }
+
+        // Tamper detection: a flipped byte no longer matches its manifest hash.
+        let mut bad = content[0..4096].to_vec();
+        bad[0] ^= 0xff;
+        assert_ne!(sha256(&bad), hashes[0]);
     }
 }

@@ -31,6 +31,8 @@ tokio-util     = { workspace = true }
 tracing        = { workspace = true }
 thiserror      = { workspace = true }
 async-trait    = { workspace = true }
+# FLIC aggregated-signing manifest: per-segment SHA-256 leaves (wasm-safe).
+sha2          = { workspace = true }
 # Instant/SystemTime that work on both native (delegates to std) and wasm32
 # (JS clocks) — std::time::{Instant,SystemTime}::now() panic on wasm32.
 web-time       = { workspace = true }

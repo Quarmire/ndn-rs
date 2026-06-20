@@ -45,7 +45,7 @@ pub use engine_ext::EngineAppExt;
 pub use error::AppError;
 pub use object::ObjectFetch;
 pub use object_stream::serve_object_stream;
-pub use producer::{Producer, Router};
+pub use producer::{Aggregation, Producer, PublishOptions, Router};
 pub use publisher::{Publisher, PublisherConfig};
 pub use queryable::{Query, Queryable};
 pub use reflexive::random_reflexive_name;

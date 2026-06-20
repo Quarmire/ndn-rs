@@ -17,6 +17,7 @@ use ndn_packet::{Data, MAX_PERSISTENT_LIFETIME_SECS, Name, SubscriptionRequest};
 use ndn_security::{SafeData, Unverified, Validator};
 
 use crate::AppError;
+use crate::rdr::sha256;
 
 /// Verify a fetched `Data` against `validator` (when present) and return its
 /// content bytes. With a validator the Data must authenticate (signature checked
@@ -503,6 +504,45 @@ impl Consumer {
         // joined in order once the window completes.
         let total = last_seg + 1;
         let mut chunks: Vec<Option<Bytes>> = (0..total).map(|_| None).collect();
+
+        // FLIC manifest path: the (validated) metadata IS the signed manifest
+        // root, so segments are served plain and authenticated by hash-match
+        // against the listed SHA-256 — not by a per-segment signature. Pass no
+        // per-segment validator; the manifest's one signature is the anchor.
+        if let Some(hashes) = meta.segment_hashes.clone() {
+            if hashes.len() as u64 != total {
+                return Err(AppError::Protocol(format!(
+                    "manifest lists {} hashes but object has {} segments",
+                    hashes.len(),
+                    total
+                )));
+            }
+            self.fetch_segments_windowed(
+                &meta.versioned_name,
+                last_seg,
+                None,
+                forwarding_hint,
+                |_| false,
+                on_progress,
+                |seg, bytes| {
+                    let got = sha256(&bytes);
+                    if got != hashes[seg as usize] {
+                        return Err(AppError::Unverified(format!(
+                            "segment {seg} hash does not match manifest"
+                        )));
+                    }
+                    chunks[seg as usize] = Some(bytes);
+                    Ok(())
+                },
+            )
+            .await?;
+            let mut out = bytes::BytesMut::new();
+            for c in chunks {
+                out.extend_from_slice(&c.unwrap_or_default());
+            }
+            return Ok(out.freeze());
+        }
+
         self.fetch_segments_windowed(
             &meta.versioned_name,
             last_seg,
@@ -1347,6 +1387,7 @@ mod subscription_tests {
                     final_block_id: Bytes::from(fbi),
                     segment_size: Some(10),
                     size: Some((self.last_seg + 1) * 10),
+                    segment_hashes: None,
                 };
                 let data = DataBuilder::new(self.metadata_name.clone(), &meta.encode()).build();
                 self.q.lock().unwrap().push_back(data);

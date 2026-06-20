@@ -27,6 +27,44 @@ use crate::responder::Responder;
 /// can't link ndn-ipc) shares the same value.
 const DEFAULT_SEGMENT_SIZE: usize = 8192;
 
+/// `Aggregation::Auto` switches to a FLIC manifest at or above this segment
+/// count — below it, per-segment signing is lower-latency (one round trip, no
+/// separate manifest fetch) and the N→1 signature saving is marginal.
+const MANIFEST_AUTO_MIN_SEGMENTS: u64 = 8;
+/// Upper bound for a *flat* (single-packet) manifest: `N` SHA-256 hashes must
+/// fit one metadata Data (`32·N` bytes ≈ 8 KiB at N=256). Above this, `Auto`
+/// falls back to per-segment signing (nested-manifest DAGs are a follow-up) and
+/// logs it — no silent truncation. An explicit `Manifest` request above the cap
+/// still builds (a larger metadata Data), but see the note on packet size.
+const MANIFEST_FLAT_MAX_SEGMENTS: u64 = 256;
+
+/// How a multi-segment object's segments are authenticated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Aggregation {
+    /// Pick by object shape: a FLIC manifest for objects of
+    /// [`MANIFEST_AUTO_MIN_SEGMENTS`]..=[`MANIFEST_FLAT_MAX_SEGMENTS`] segments,
+    /// per-segment signing otherwise. The default — transparent to the consumer.
+    #[default]
+    Auto,
+    /// Always sign each segment individually (classic RDR).
+    PerSegment,
+    /// Always emit a FLIC aggregated-signing manifest: the metadata Data lists
+    /// the per-segment SHA-256 hashes and is the single signed root; segments
+    /// are served plain and verified by hash-match. Best for large objects,
+    /// repos/bundles, and low-power producers (one signature, not N), and the
+    /// manifest doubles as a listing.
+    Manifest,
+}
+
+/// Options for [`Producer::publish_object_with`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PublishOptions {
+    /// Segment size in bytes (`0` ⇒ [`DEFAULT_SEGMENT_SIZE`]).
+    pub chunk_size: usize,
+    /// Segment authentication strategy.
+    pub aggregation: Aggregation,
+}
+
 /// Register a prefix and serve `Data`. Most apps use [`Node`](crate::Node)
 /// (`node.serve` / `node.serve_object`); reach for `Producer` for signed
 /// serving or the lower-level serve loop.
@@ -165,7 +203,56 @@ impl Producer {
         content: Bytes,
         chunk_size: usize,
     ) -> Result<(), AppError> {
-        let prepared = crate::rdr::PreparedObject::build(name, content, self.seg_size(chunk_size));
+        self.publish_object_with(
+            name,
+            content,
+            PublishOptions {
+                chunk_size,
+                aggregation: Aggregation::Auto,
+            },
+        )
+        .await
+    }
+
+    /// RDR whole-object publish with an explicit [`Aggregation`] choice —
+    /// `PerSegment` (classic), `Manifest` (FLIC aggregated signing), or `Auto`
+    /// (manifest by object shape). The consumer fetch path handles either
+    /// transparently — a manifest object is just discovered as such from its
+    /// metadata.
+    pub async fn publish_object_with(
+        &self,
+        name: Name,
+        content: Bytes,
+        opts: PublishOptions,
+    ) -> Result<(), AppError> {
+        let seg = self.seg_size(opts.chunk_size);
+        let count = if content.is_empty() {
+            1
+        } else {
+            (content.len() as u64).div_ceil(seg as u64)
+        };
+        let aggregate = match opts.aggregation {
+            Aggregation::PerSegment => false,
+            Aggregation::Manifest => true,
+            Aggregation::Auto => {
+                if count > MANIFEST_FLAT_MAX_SEGMENTS {
+                    tracing::debug!(
+                        segments = count,
+                        cap = MANIFEST_FLAT_MAX_SEGMENTS,
+                        "object exceeds flat-manifest cap; using per-segment signing \
+                         (nested-manifest DAG not yet implemented)"
+                    );
+                    false
+                } else {
+                    count >= MANIFEST_AUTO_MIN_SEGMENTS
+                }
+            }
+        };
+        let prepared = if aggregate {
+            crate::rdr::PreparedObject::build_aggregated(name, content, seg)
+        } else {
+            crate::rdr::PreparedObject::build(name, content, seg)
+        };
         self.serve_object(prepared).await
     }
 
