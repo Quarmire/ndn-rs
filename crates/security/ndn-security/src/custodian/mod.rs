@@ -11,6 +11,9 @@
 //! `libsqlite3`). `ndn-identity` re-exports everything here, so existing
 //! `ndn_identity::Custodian` / `ndn_identity::KeyId` paths keep working.
 
+// The inner `custodian` module name mirrors the former `ndn-custodian` crate
+// layout that `ndn-identity` re-exports; the repetition is intentional.
+#[allow(clippy::module_inception)]
 pub mod custodian;
 mod key_id;
 mod signer;

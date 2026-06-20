@@ -1,0 +1,27 @@
+[package]
+name = "ndn-packet-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Self-contained workspace so this fuzz crate isn't pulled into the parent
+# ndn-rs workspace.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bytes = "1"
+
+[dependencies.ndn-packet]
+path = ".."
+features = ["std"]
+
+[[bin]]
+name = "decode"
+path = "fuzz_targets/decode.rs"
+test = false
+doc = false
+bench = false
