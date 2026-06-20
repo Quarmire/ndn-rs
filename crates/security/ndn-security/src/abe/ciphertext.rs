@@ -48,6 +48,13 @@ pub struct AbeCiphertext {
     /// selector is [`Self::policy_source`]). Carried in the container — not only
     /// inside the opaque rabe blob — so it is inspectable without decrypting and
     /// bindable as AEAD associated data.
+    ///
+    /// **Untrusted metadata (red-team SEC-28):** this list is *not* cryptographically
+    /// bound to the rabe ciphertext and is not re-checked against it on decrypt, so
+    /// an off-path edit (under whatever signature wraps the container) can rewrite it.
+    /// The true access gate is the rabe math — a key whose policy isn't satisfied by
+    /// the *real* embedded attributes still fails — so never gate a decision on this
+    /// field; treat it as a display/locator hint only.
     pub attributes: Vec<String>,
     /// KGC references. Empty for inline single-authority tests.
     pub kgc_refs: Vec<KgcRef>,

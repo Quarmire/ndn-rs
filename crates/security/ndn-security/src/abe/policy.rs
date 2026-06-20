@@ -54,6 +54,13 @@ impl AttributeRef {
 
 impl PolicyExpr {
     /// Parse a policy expression string.
+    ///
+    /// **Case (red-team SEC-29):** the operators `AND` / `OR` are case-insensitive,
+    /// but attribute keys and values are **case-sensitive** — `role:Admin` and
+    /// `role:admin` are distinct attributes. Do not assume operator-style folding
+    /// for attributes: a key minted for `service:Echo` will silently never match a
+    /// `service:echo` ciphertext. (An attribute literally named `and`/`or` is also
+    /// unrepresentable — it tokenizes as an operator.)
     pub fn parse(source: &str) -> Result<Self, AbeError> {
         let tokens = tokenize(source).map_err(AbeError::PolicyParse)?;
         let mut pos = 0usize;
