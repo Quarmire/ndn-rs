@@ -5,6 +5,23 @@ One script per audit finding, tracked in
 that maps each witness to its finding and expected outcome). The detailed
 internal master-audit note is not shipped in this repository.
 
+## Where the witnesses run (post-split)
+
+`run_all.sh` is runnable from a clean `ndn-rs` checkout, but the witness set
+spans two repos. Of the ~59 witnesses:
+
+- **~45 are pure-library witnesses** (`cargo test` against `ndn-packet`,
+  `ndn-security`, `ndn-engine`, `ndn-store`, `ndn-sync`, `ndn-mgmt`, …) and
+  **pass from a clean `ndn-rs` checkout**.
+- **~14 require the `ndn-fwd` binary and/or the interop Docker image**, which
+  were split out into the [`ndn-fwd`](https://github.com/Quarmire/ndn-fwd) repo.
+  Run from `ndn-rs` they report SKIP (missing `docker`/`nfd`/`ndnsec`) or FAIL
+  (`cargo … -p ndn-fwd` → "package did not match any packages"). These are
+  **environment/split artifacts, not regressions** — run them from the `ndn-fwd`
+  repo with the interop image. The list (ndn-fwd / docker / reference-binary
+  dependent): `e01`, `e03`, `e04`, `n10`, `n11`, `x07`, `c09`, `c12_*`, `c13`,
+  `d02`, `g03`, `g04`, `g06`.
+
 The tracker lists each finding with a severity, a file-line
 citation, and a spec reference. Each finding that can be
 observed as a wire-level event has a matching script in this
