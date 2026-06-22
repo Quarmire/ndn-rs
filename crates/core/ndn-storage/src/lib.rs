@@ -57,6 +57,12 @@ pub use sync::SyncMemoryBackend;
 #[cfg(feature = "std")]
 pub use sync::SyncAsAsync;
 
+// Embedded flash engine (generic over `embedded-storage::NorFlash`).
+#[cfg(feature = "flash")]
+mod flash;
+#[cfg(feature = "flash")]
+pub use flash::{FlashError, FlashLogBackend};
+
 /// One operation in an atomic [`Backend::write_batch`] / [`SyncBackend::write_batch`].
 #[derive(Clone, Debug)]
 pub enum WriteOp {
