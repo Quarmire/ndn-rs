@@ -9,21 +9,32 @@ license.workspace = true
 classification = "extension"
 
 [features]
-default = []
+default = ["std"]
+# The std surface: the async, object-safe `Backend` (boxed futures + tokio offload),
+# `MemoryBackend`, the `Instrumented` decorator. On by default — turning it OFF
+# (`--no-default-features`) gives a `no_std + alloc` crate with only the synchronous
+# `sync` API, for MCU targets (F21).
+std = ["bytes/std", "dep:async-trait", "dep:tracing"]
+# Synchronous, `no_std`-friendly `SyncBackend` + a fixed in-memory engine
+# (`SyncMemoryBackend`, alloc + `critical-section` mutex) — the embedded storage
+# floor (an MCU has no thread pool / no `std::sync`). On std it also bridges to the
+# async `Backend` via `SyncAsAsync`, so a sync engine composes with the named layer.
+sync = ["dep:critical-section"]
 # On-disk LSM backend (fjall). Off by default so wasm / in-memory builds stay lean.
 # Pulls tokio for the spawn_blocking offload (centralized in the adapter).
-fjall = ["dep:fjall", "dep:tokio"]
+fjall = ["std", "dep:fjall", "dep:tokio"]
 # Layer-1 name→wire store over any Backend (pulls Name/TLV; keeps the core Backend
 # domain-agnostic when off).
-named = ["dep:ndn-packet", "dep:ndn-tlv"]
+named = ["std", "dep:ndn-packet", "dep:ndn-tlv"]
 # On-disk B-tree backend (redb) with real ACID transactions — for transactional /
 # read-latency-sensitive models (e.g. NDF atomic multi-partition block writes).
-redb = ["dep:redb", "dep:tokio"]
+redb = ["std", "dep:redb", "dep:tokio"]
 
 [dependencies]
-bytes = { workspace = true, features = ["std"] }
-async-trait = { workspace = true }
-tracing = { workspace = true }
+bytes = { workspace = true, default-features = false }
+async-trait = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+critical-section = { version = "1", optional = true }
 fjall = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true, features = ["rt"] }
 ndn-packet = { workspace = true, optional = true, features = ["std"] }
@@ -32,3 +43,5 @@ redb = { version = "4", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+# A linkable critical-section impl so the `sync` engine's tests run on the host.
+critical-section = { version = "1", features = ["std"] }

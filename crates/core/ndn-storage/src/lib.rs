@@ -17,11 +17,47 @@
 //! sites are clean `.await`s with no boilerplate; a natively-async engine (S3) fits
 //! the same trait without a thread hop. Object-safety is via boxed futures
 //! (`async_trait`) — the boxing lands only on the durable tier, never the ring path.
+//!
+//! # The synchronous facet (F21)
+//!
+//! [`SyncBackend`] is the **local sync core**: `get`/`put`/`delete`/`scan_prefix` and a
+//! batch, all *synchronous*. fjall and redb are blocking underneath, so they implement
+//! it directly; the async [`Backend`] above is then a thin `spawn_blocking` wrapper over
+//! the same core (one source of truth). This is what lets a **synchronous** consumer —
+//! NDF's `BlockStore`, driven by the *pure* AC.12 verifier — use the store without
+//! threading `await` through pure logic or `block_on`-panicking inside an async context.
+//! Genuinely-async engines (an S3 cold tier) don't live *under* such a model; they
+//! belong at the `StoreRouter`/tier-resolver layer above it.
+//!
+//! ## `no_std` (embedded)
+//!
+//! `SyncBackend` is `no_std + alloc`. With `--no-default-features --features sync` the
+//! crate drops the async surface (which needs tokio/`std::sync`) and keeps the sync
+//! core plus the in-memory [`SyncMemoryBackend`] (a `critical-section` mutex) — the
+//! storage floor for an MCU. A flash engine (`sequential-storage`/`ekv` over
+//! `embedded-storage`) is just another `SyncBackend`. On `std`, [`SyncAsAsync`] bridges
+//! any `SyncBackend` into the async [`Backend`] so a sync engine composes with the
+//! named layer.
 
-use async_trait::async_trait;
+#![cfg_attr(not(feature = "std"), no_std)]
+
+extern crate alloc;
+
+use alloc::vec::Vec;
 use bytes::Bytes;
 
-/// One operation in an atomic [`Backend::write_batch`].
+#[cfg(feature = "std")]
+use async_trait::async_trait;
+
+// The synchronous core is always available (it underpins the async engines and the
+// embedded path); the in-memory engine + async bridge are feature-gated.
+pub use sync::SyncBackend;
+#[cfg(feature = "sync")]
+pub use sync::SyncMemoryBackend;
+#[cfg(feature = "std")]
+pub use sync::SyncAsAsync;
+
+/// One operation in an atomic [`Backend::write_batch`] / [`SyncBackend::write_batch`].
 #[derive(Clone, Debug)]
 pub enum WriteOp {
     Put(Vec<u8>, Bytes),
@@ -31,6 +67,7 @@ pub enum WriteOp {
 /// An ordered byte key→value store. Keys sort lexicographically, so a parent
 /// byte-prefix precedes all its descendants — making prefix/range scans the
 /// primitive for "CanBePrefix" lookups and "last-N under a name".
+#[cfg(feature = "std")]
 #[async_trait]
 pub trait Backend: Send + Sync {
     /// Fetch the value stored under `key`.
@@ -76,12 +113,14 @@ pub trait Backend: Send + Sync {
 
 /// In-memory [`Backend`] (a `BTreeMap` behind an `RwLock`). The default for tests,
 /// browser/wasm, and process-lifetime data. Its async methods complete immediately
-/// (no thread hop).
+/// (no thread hop). For `no_std`/embedded use [`SyncMemoryBackend`] instead.
+#[cfg(feature = "std")]
 #[derive(Default)]
 pub struct MemoryBackend {
     map: std::sync::RwLock<std::collections::BTreeMap<Vec<u8>, Bytes>>,
 }
 
+#[cfg(feature = "std")]
 impl MemoryBackend {
     pub fn new() -> Self {
         Self::default()
@@ -94,6 +133,7 @@ impl MemoryBackend {
     }
 }
 
+#[cfg(feature = "std")]
 #[async_trait]
 impl Backend for MemoryBackend {
     async fn get(&self, key: Vec<u8>) -> Option<Bytes> {
@@ -152,10 +192,12 @@ impl Backend for MemoryBackend {
 ///
 /// Because it sits at Layer 0 it instruments **every** consumer uniformly: the named
 /// surface path *and* NDF's direct `Backend` use.
+#[cfg(feature = "std")]
 pub struct Instrumented<B> {
     inner: B,
 }
 
+#[cfg(feature = "std")]
 impl<B: Backend> Instrumented<B> {
     pub fn new(inner: B) -> Self {
         Self { inner }
@@ -170,6 +212,7 @@ impl<B: Backend> Instrumented<B> {
     }
 }
 
+#[cfg(feature = "std")]
 #[async_trait]
 impl<B: Backend> Backend for Instrumented<B> {
     async fn get(&self, key: Vec<u8>) -> Option<Bytes> {
@@ -272,6 +315,198 @@ impl<B: Backend> Backend for Instrumented<B> {
     }
     fn name(&self) -> &'static str {
         self.inner.name()
+    }
+}
+
+/// The synchronous storage core (F21). Always available — `no_std + alloc`, no async,
+/// no tokio — so it can underpin both the async engines (which wrap it in
+/// `spawn_blocking`) and an embedded MCU (no thread pool, no `std::sync`).
+mod sync {
+    use super::{Bytes, Vec, WriteOp};
+
+    /// An ordered byte key→value store, **synchronous**. The local sync core: fjall
+    /// and redb implement this directly (they block underneath), and the async
+    /// [`Backend`](super::Backend) is a thin `spawn_blocking` wrapper over it. A
+    /// synchronous consumer (NDF's `BlockStore`, driven by the pure verifier) uses
+    /// this without any async runtime; an embedded engine implements the same trait.
+    ///
+    /// Keys are **borrowed** (`&[u8]`) — there is no thread-hop boundary to own them
+    /// across, so the sync core avoids the per-call allocation the async trait needs.
+    pub trait SyncBackend: Send + Sync {
+        /// Fetch the value stored under `key`.
+        fn get(&self, key: &[u8]) -> Option<Bytes>;
+        /// Store `value` under `key` (overwriting any existing value).
+        fn put(&self, key: &[u8], value: Bytes);
+        /// Remove `key` if present.
+        fn delete(&self, key: &[u8]);
+        /// `(key, value)` pairs whose key starts with `prefix`, ascending, at most
+        /// `limit` (0 = unlimited).
+        fn scan_prefix(&self, prefix: &[u8], limit: usize) -> Vec<(Bytes, Bytes)>;
+        /// Lexicographically-smallest `(key, value)` under `prefix` (a `CanBePrefix`
+        /// lookup). Default: first of [`scan_prefix`](Self::scan_prefix).
+        fn first_under(&self, prefix: &[u8]) -> Option<(Bytes, Bytes)> {
+            self.scan_prefix(prefix, 1).into_iter().next()
+        }
+        /// Apply `ops` as a group. Default: sequential, **not** atomic; engines with a
+        /// native batch override for atomicity.
+        fn write_batch(&self, ops: Vec<WriteOp>) {
+            for op in ops {
+                match op {
+                    WriteOp::Put(k, v) => self.put(&k, v),
+                    WriteOp::Delete(k) => self.delete(&k),
+                }
+            }
+        }
+        /// Short, low-cardinality engine label for telemetry.
+        fn name(&self) -> &'static str {
+            "sync-backend"
+        }
+    }
+
+    /// In-memory [`SyncBackend`] — a `BTreeMap` behind a mutex, no allocator beyond
+    /// `alloc`. The embedded storage floor (an MCU holds few items) and a sync
+    /// in-process store on std. The mutex is `std::sync::Mutex` on std and a
+    /// `critical-section` mutex on `no_std` (correct on a single-core MCU: it masks
+    /// interrupts rather than spinning). `const`-constructible for a `static`.
+    #[cfg(feature = "sync")]
+    pub struct SyncMemoryBackend {
+        #[cfg(feature = "std")]
+        map: std::sync::Mutex<alloc::collections::BTreeMap<Vec<u8>, Bytes>>,
+        #[cfg(not(feature = "std"))]
+        map: critical_section::Mutex<core::cell::RefCell<alloc::collections::BTreeMap<Vec<u8>, Bytes>>>,
+    }
+
+    #[cfg(feature = "sync")]
+    impl Default for SyncMemoryBackend {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    #[cfg(feature = "sync")]
+    impl SyncMemoryBackend {
+        pub const fn new() -> Self {
+            #[cfg(feature = "std")]
+            {
+                Self {
+                    map: std::sync::Mutex::new(alloc::collections::BTreeMap::new()),
+                }
+            }
+            #[cfg(not(feature = "std"))]
+            {
+                Self {
+                    map: critical_section::Mutex::new(core::cell::RefCell::new(
+                        alloc::collections::BTreeMap::new(),
+                    )),
+                }
+            }
+        }
+
+        /// Run `f` with `&mut` access to the map, under whichever mutex is configured.
+        fn with_map<R>(
+            &self,
+            f: impl FnOnce(&mut alloc::collections::BTreeMap<Vec<u8>, Bytes>) -> R,
+        ) -> R {
+            #[cfg(feature = "std")]
+            {
+                f(&mut self.map.lock().unwrap())
+            }
+            #[cfg(not(feature = "std"))]
+            {
+                critical_section::with(|cs| f(&mut self.map.borrow_ref_mut(cs)))
+            }
+        }
+    }
+
+    #[cfg(feature = "sync")]
+    impl SyncBackend for SyncMemoryBackend {
+        fn get(&self, key: &[u8]) -> Option<Bytes> {
+            self.with_map(|m| m.get(key).cloned())
+        }
+        fn put(&self, key: &[u8], value: Bytes) {
+            self.with_map(|m| m.insert(key.to_vec(), value));
+        }
+        fn delete(&self, key: &[u8]) {
+            self.with_map(|m| m.remove(key));
+        }
+        fn scan_prefix(&self, prefix: &[u8], limit: usize) -> Vec<(Bytes, Bytes)> {
+            self.with_map(|m| {
+                let mut out = Vec::new();
+                for (k, v) in m.range(prefix.to_vec()..) {
+                    if !k.starts_with(prefix) {
+                        break;
+                    }
+                    out.push((Bytes::copy_from_slice(k), v.clone()));
+                    if limit != 0 && out.len() >= limit {
+                        break;
+                    }
+                }
+                out
+            })
+        }
+        fn write_batch(&self, ops: Vec<WriteOp>) {
+            // Atomic: the whole group under one lock / critical section.
+            self.with_map(|m| {
+                for op in ops {
+                    match op {
+                        WriteOp::Put(k, v) => {
+                            m.insert(k, v);
+                        }
+                        WriteOp::Delete(k) => {
+                            m.remove(&k);
+                        }
+                    }
+                }
+            });
+        }
+        fn name(&self) -> &'static str {
+            "sync-memory"
+        }
+    }
+
+    /// Bridge any [`SyncBackend`] into the async [`Backend`](super::Backend) so a sync
+    /// engine (the embedded [`SyncMemoryBackend`]) composes with the async named layer /
+    /// `StoreRouter` on std. Calls run **inline** (the sync op completes within the
+    /// poll, no offload) — intended for *non-blocking* sync engines (in-memory). A
+    /// genuinely blocking engine on std should use a native async backend
+    /// (`FjallBackend`/`RedbBackend`), which offloads via `spawn_blocking` internally.
+    #[cfg(feature = "std")]
+    pub struct SyncAsAsync<S> {
+        inner: S,
+    }
+
+    #[cfg(feature = "std")]
+    impl<S: SyncBackend> SyncAsAsync<S> {
+        pub fn new(inner: S) -> Self {
+            Self { inner }
+        }
+        /// Borrow the wrapped sync backend (e.g. for direct synchronous access).
+        pub fn inner(&self) -> &S {
+            &self.inner
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[super::async_trait]
+    impl<S: SyncBackend> super::Backend for SyncAsAsync<S> {
+        async fn get(&self, key: Vec<u8>) -> Option<Bytes> {
+            self.inner.get(&key)
+        }
+        async fn put(&self, key: Vec<u8>, value: Bytes) {
+            self.inner.put(&key, value);
+        }
+        async fn delete(&self, key: Vec<u8>) {
+            self.inner.delete(&key);
+        }
+        async fn scan_prefix(&self, prefix: Vec<u8>, limit: usize) -> Vec<(Bytes, Bytes)> {
+            self.inner.scan_prefix(&prefix, limit)
+        }
+        async fn write_batch(&self, ops: Vec<WriteOp>) {
+            self.inner.write_batch(ops)
+        }
+        fn name(&self) -> &'static str {
+            self.inner.name()
+        }
     }
 }
 
@@ -546,15 +781,21 @@ pub use fjall_backend::{FjallBackend, FjallBatch, FjallDb};
 
 #[cfg(feature = "fjall")]
 mod fjall_backend {
-    use super::{Backend, Bytes, WriteOp, async_trait};
+    use super::{Backend, Bytes, SyncBackend, WriteOp, async_trait};
 
     /// On-disk [`Backend`] backed by [fjall](https://docs.rs/fjall) (an LSM
     /// key-value store). Persistent across restarts. The single fjall adapter every
-    /// model shares. Each blocking fjall op runs inside `spawn_blocking` so it never
-    /// stalls the async runtime — the offload is centralized here, not at call sites.
+    /// model shares.
+    ///
+    /// fjall is **synchronous** underneath, so this is fundamentally a [`SyncBackend`]
+    /// (the F21 sync core — usable directly by a synchronous consumer like NDF's
+    /// `BlockStore`, no async runtime needed). The async [`Backend`] impl is a thin
+    /// `spawn_blocking` wrapper over that same core, so an async caller never stalls
+    /// the runtime — one source of truth, two surfaces. Cheap to `clone` (handles are
+    /// `Arc`s), which is how the async wrapper moves it onto the blocking pool.
+    #[derive(Clone)]
     pub struct FjallBackend {
         keyspace: fjall::Keyspace,
-        #[allow(dead_code)]
         db: fjall::Database,
     }
 
@@ -572,65 +813,78 @@ mod fjall_backend {
         }
     }
 
+    // The sync core: direct (blocking) fjall calls, no offload.
+    impl SyncBackend for FjallBackend {
+        fn get(&self, key: &[u8]) -> Option<Bytes> {
+            self.keyspace
+                .get(key)
+                .ok()
+                .flatten()
+                .map(|s| Bytes::copy_from_slice(&s))
+        }
+        fn put(&self, key: &[u8], value: Bytes) {
+            let _ = self.keyspace.insert(key, value.as_ref());
+        }
+        fn delete(&self, key: &[u8]) {
+            let _ = self.keyspace.remove(key);
+        }
+        fn scan_prefix(&self, prefix: &[u8], limit: usize) -> Vec<(Bytes, Bytes)> {
+            let mut out = Vec::new();
+            for guard in self.keyspace.prefix(prefix) {
+                match guard.into_inner() {
+                    Ok((k, v)) => {
+                        out.push((Bytes::copy_from_slice(&k), Bytes::copy_from_slice(&v)));
+                        if limit != 0 && out.len() >= limit {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            out
+        }
+        fn write_batch(&self, ops: Vec<WriteOp>) {
+            let mut batch = self.db.batch(); // atomic across keyspaces
+            for op in ops {
+                match op {
+                    WriteOp::Put(k, v) => batch.insert(&self.keyspace, &k, v.as_ref()),
+                    WriteOp::Delete(k) => batch.remove(&self.keyspace, &k),
+                }
+            }
+            let _ = batch.commit();
+        }
+        fn name(&self) -> &'static str {
+            "fjall"
+        }
+    }
+
+    // The async surface: a thin `spawn_blocking` wrapper over the sync core.
     #[async_trait]
     impl Backend for FjallBackend {
         async fn get(&self, key: Vec<u8>) -> Option<Bytes> {
-            let ks = self.keyspace.clone();
-            tokio::task::spawn_blocking(move || {
-                ks.get(&key).ok().flatten().map(|s| Bytes::copy_from_slice(&s))
-            })
-            .await
-            .ok()
-            .flatten()
+            let this = self.clone();
+            tokio::task::spawn_blocking(move || SyncBackend::get(&this, &key))
+                .await
+                .ok()
+                .flatten()
         }
         async fn put(&self, key: Vec<u8>, value: Bytes) {
-            let ks = self.keyspace.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                let _ = ks.insert(&key, value.as_ref());
-            })
-            .await;
+            let this = self.clone();
+            let _ = tokio::task::spawn_blocking(move || SyncBackend::put(&this, &key, value)).await;
         }
         async fn delete(&self, key: Vec<u8>) {
-            let ks = self.keyspace.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                let _ = ks.remove(&key);
-            })
-            .await;
+            let this = self.clone();
+            let _ = tokio::task::spawn_blocking(move || SyncBackend::delete(&this, &key)).await;
         }
         async fn scan_prefix(&self, prefix: Vec<u8>, limit: usize) -> Vec<(Bytes, Bytes)> {
-            let ks = self.keyspace.clone();
-            tokio::task::spawn_blocking(move || {
-                let mut out = Vec::new();
-                for guard in ks.prefix(&prefix) {
-                    match guard.into_inner() {
-                        Ok((k, v)) => {
-                            out.push((Bytes::copy_from_slice(&k), Bytes::copy_from_slice(&v)));
-                            if limit != 0 && out.len() >= limit {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                }
-                out
-            })
-            .await
-            .unwrap_or_default()
+            let this = self.clone();
+            tokio::task::spawn_blocking(move || SyncBackend::scan_prefix(&this, &prefix, limit))
+                .await
+                .unwrap_or_default()
         }
         async fn write_batch(&self, ops: Vec<WriteOp>) {
-            let db = self.db.clone();
-            let ks = self.keyspace.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                let mut batch = db.batch(); // atomic across keyspaces
-                for op in ops {
-                    match op {
-                        WriteOp::Put(k, v) => batch.insert(&ks, &k, v.as_ref()),
-                        WriteOp::Delete(k) => batch.remove(&ks, &k),
-                    }
-                }
-                let _ = batch.commit();
-            })
-            .await;
+            let this = self.clone();
+            let _ = tokio::task::spawn_blocking(move || SyncBackend::write_batch(&this, ops)).await;
         }
         fn name(&self) -> &'static str {
             "fjall"
@@ -716,26 +970,31 @@ mod fjall_backend {
             self.ops.is_empty()
         }
         /// Commit every staged op as **one** atomic fjall batch (all partitions or
-        /// none). Errors surface a failed commit so the caller knows the group did not
-        /// land — the whole point of atomic block writes.
-        pub async fn commit(self) -> std::io::Result<()> {
+        /// none), **synchronously** — for a sync consumer (NDF's `BlockStore`, an
+        /// embedded node). Errors surface a failed commit so the caller knows the group
+        /// did not land — the whole point of atomic block writes.
+        pub fn commit_blocking(self) -> std::io::Result<()> {
             let FjallBatch { db, ops } = self;
             let n = ops.len();
-            tokio::task::spawn_blocking(move || {
-                let mut batch = db.batch(); // spans every partition of `db`
-                for (ks, op) in ops {
-                    match op {
-                        WriteOp::Put(k, v) => batch.insert(&ks, &k, v.as_ref()),
-                        WriteOp::Delete(k) => batch.remove(&ks, &k),
-                    }
+            let mut batch = db.batch(); // spans every partition of `db`
+            for (ks, op) in ops {
+                match op {
+                    WriteOp::Put(k, v) => batch.insert(&ks, &k, v.as_ref()),
+                    WriteOp::Delete(k) => batch.remove(&ks, &k),
                 }
-                batch.commit()
-            })
-            .await
-            .map_err(|e| std::io::Error::other(format!("fjall batch join: {e}")))?
-            .map_err(|e| std::io::Error::other(format!("fjall batch commit: {e}")))?;
+            }
+            batch
+                .commit()
+                .map_err(|e| std::io::Error::other(format!("fjall batch commit: {e}")))?;
             tracing::trace!(target: "ndn_storage", backend = "fjall", ops = n, "cross_partition_batch");
             Ok(())
+        }
+
+        /// Async commit — a `spawn_blocking` wrapper over [`commit_blocking`](Self::commit_blocking).
+        pub async fn commit(self) -> std::io::Result<()> {
+            tokio::task::spawn_blocking(move || self.commit_blocking())
+                .await
+                .map_err(|e| std::io::Error::other(format!("fjall batch join: {e}")))?
         }
     }
 }
@@ -745,7 +1004,7 @@ pub use redb_backend::{RedbBackend, RedbBatch, RedbDb};
 
 #[cfg(feature = "redb")]
 mod redb_backend {
-    use super::{Backend, Bytes, WriteOp, async_trait};
+    use super::{Backend, Bytes, SyncBackend, WriteOp, async_trait};
     use redb::ReadableDatabase; // brings `begin_read` into scope
     use std::sync::Arc;
 
@@ -759,9 +1018,12 @@ mod redb_backend {
 
     /// On-disk [`Backend`] backed by [redb](https://docs.rs/redb) — a pure-Rust
     /// embedded B-tree with **real ACID transactions**. Use it (over fjall) where
-    /// point-read latency or **atomic multi-key writes** matter — e.g. NDF's atomic
-    /// multi-partition block writes via [`write_batch`](Backend::write_batch), which
-    /// here is a single redb transaction. Blocking ops run in `spawn_blocking`.
+    /// point-read latency or **atomic multi-key writes** matter.
+    ///
+    /// redb is **synchronous** underneath, so this is a [`SyncBackend`] (the F21 sync
+    /// core); the async [`Backend`] is a thin `spawn_blocking` wrapper over it. Cheap
+    /// to `clone` (an `Arc` + the table name).
+    #[derive(Clone)]
     pub struct RedbBackend {
         db: Arc<redb::Database>,
         table: String,
@@ -793,61 +1055,47 @@ mod redb_backend {
         }
     }
 
-    #[async_trait]
-    impl Backend for RedbBackend {
-        async fn get(&self, key: Vec<u8>) -> Option<Bytes> {
-            let (db, name) = (self.db.clone(), self.table.clone());
-            tokio::task::spawn_blocking(move || {
-                let txn = db.begin_read().ok()?;
-                let t = txn.open_table(table(&name)).ok()?;
-                let g = t.get(key.as_slice()).ok()??;
-                Some(Bytes::copy_from_slice(g.value()))
-            })
-            .await
-            .ok()
-            .flatten()
+    // The sync core: direct (blocking) redb transactions, no offload.
+    impl SyncBackend for RedbBackend {
+        fn get(&self, key: &[u8]) -> Option<Bytes> {
+            let txn = self.db.begin_read().ok()?;
+            let t = txn.open_table(table(&self.table)).ok()?;
+            let g = t.get(key).ok()??;
+            Some(Bytes::copy_from_slice(g.value()))
         }
-        async fn put(&self, key: Vec<u8>, value: Bytes) {
-            self.write_batch(vec![WriteOp::Put(key, value)]).await;
+        fn put(&self, key: &[u8], value: Bytes) {
+            SyncBackend::write_batch(self, vec![WriteOp::Put(key.to_vec(), value)]);
         }
-        async fn delete(&self, key: Vec<u8>) {
-            self.write_batch(vec![WriteOp::Delete(key)]).await;
+        fn delete(&self, key: &[u8]) {
+            SyncBackend::write_batch(self, vec![WriteOp::Delete(key.to_vec())]);
         }
-        async fn scan_prefix(&self, prefix: Vec<u8>, limit: usize) -> Vec<(Bytes, Bytes)> {
-            let (db, name) = (self.db.clone(), self.table.clone());
-            tokio::task::spawn_blocking(move || {
-                let mut out = Vec::new();
-                let Ok(txn) = db.begin_read() else { return out };
-                let Ok(t) = txn.open_table(table(&name)) else {
-                    return out;
-                };
-                let Ok(iter) = t.range(prefix.as_slice()..) else {
-                    return out;
-                };
-                for item in iter {
-                    let Ok((k, v)) = item else { break };
-                    if !k.value().starts_with(&prefix) {
-                        break;
-                    }
-                    out.push((
-                        Bytes::copy_from_slice(k.value()),
-                        Bytes::copy_from_slice(v.value()),
-                    ));
-                    if limit != 0 && out.len() >= limit {
-                        break;
-                    }
+        fn scan_prefix(&self, prefix: &[u8], limit: usize) -> Vec<(Bytes, Bytes)> {
+            let mut out = Vec::new();
+            let Ok(txn) = self.db.begin_read() else { return out };
+            let Ok(t) = txn.open_table(table(&self.table)) else {
+                return out;
+            };
+            let Ok(iter) = t.range(prefix..) else { return out };
+            for item in iter {
+                let Ok((k, v)) = item else { break };
+                if !k.value().starts_with(prefix) {
+                    break;
                 }
-                out
-            })
-            .await
-            .unwrap_or_default()
+                out.push((
+                    Bytes::copy_from_slice(k.value()),
+                    Bytes::copy_from_slice(v.value()),
+                ));
+                if limit != 0 && out.len() >= limit {
+                    break;
+                }
+            }
+            out
         }
-        async fn write_batch(&self, ops: Vec<WriteOp>) {
-            let (db, name) = (self.db.clone(), self.table.clone());
-            let _ = tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
-                let txn = db.begin_write()?;
+        fn write_batch(&self, ops: Vec<WriteOp>) {
+            let _ = (|| -> Result<(), redb::Error> {
+                let txn = self.db.begin_write()?;
                 {
-                    let mut t = txn.open_table(table(&name))?;
+                    let mut t = txn.open_table(table(&self.table))?;
                     for op in ops {
                         match op {
                             WriteOp::Put(k, v) => {
@@ -861,8 +1109,40 @@ mod redb_backend {
                 } // table dropped before commit
                 txn.commit()?; // ACID: all ops or none
                 Ok(())
-            })
-            .await;
+            })();
+        }
+        fn name(&self) -> &'static str {
+            "redb"
+        }
+    }
+
+    // The async surface: a thin `spawn_blocking` wrapper over the sync core.
+    #[async_trait]
+    impl Backend for RedbBackend {
+        async fn get(&self, key: Vec<u8>) -> Option<Bytes> {
+            let this = self.clone();
+            tokio::task::spawn_blocking(move || SyncBackend::get(&this, &key))
+                .await
+                .ok()
+                .flatten()
+        }
+        async fn put(&self, key: Vec<u8>, value: Bytes) {
+            let this = self.clone();
+            let _ = tokio::task::spawn_blocking(move || SyncBackend::put(&this, &key, value)).await;
+        }
+        async fn delete(&self, key: Vec<u8>) {
+            let this = self.clone();
+            let _ = tokio::task::spawn_blocking(move || SyncBackend::delete(&this, &key)).await;
+        }
+        async fn scan_prefix(&self, prefix: Vec<u8>, limit: usize) -> Vec<(Bytes, Bytes)> {
+            let this = self.clone();
+            tokio::task::spawn_blocking(move || SyncBackend::scan_prefix(&this, &prefix, limit))
+                .await
+                .unwrap_or_default()
+        }
+        async fn write_batch(&self, ops: Vec<WriteOp>) {
+            let this = self.clone();
+            let _ = tokio::task::spawn_blocking(move || SyncBackend::write_batch(&this, ops)).await;
         }
         fn name(&self) -> &'static str {
             "redb"
@@ -941,11 +1221,12 @@ mod redb_backend {
             self.ops.is_empty()
         }
         /// Commit every staged op as one redb transaction spanning all touched tables
-        /// (all-or-nothing). Errors surface a failed commit.
-        pub async fn commit(self) -> std::io::Result<()> {
+        /// (all-or-nothing), **synchronously** — for a sync consumer. Errors surface a
+        /// failed commit.
+        pub fn commit_blocking(self) -> std::io::Result<()> {
             let RedbBatch { db, ops } = self;
             let n = ops.len();
-            tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
+            (|| -> Result<(), redb::Error> {
                 // Group by table so each is opened exactly once within the txn.
                 let mut by_table: std::collections::HashMap<String, Vec<WriteOp>> =
                     std::collections::HashMap::new();
@@ -969,17 +1250,22 @@ mod redb_backend {
                 }
                 txn.commit()?; // ACID across every table
                 Ok(())
-            })
-            .await
-            .map_err(|e| std::io::Error::other(format!("redb batch join: {e}")))?
+            })()
             .map_err(|e| std::io::Error::other(format!("redb batch commit: {e}")))?;
             tracing::trace!(target: "ndn_storage", backend = "redb", ops = n, "cross_partition_batch");
             Ok(())
         }
+
+        /// Async commit — a `spawn_blocking` wrapper over [`commit_blocking`](Self::commit_blocking).
+        pub async fn commit(self) -> std::io::Result<()> {
+            tokio::task::spawn_blocking(move || self.commit_blocking())
+                .await
+                .map_err(|e| std::io::Error::other(format!("redb batch join: {e}")))?
+        }
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
 
@@ -1146,11 +1432,13 @@ mod tests {
             let b = FjallBackend::open(&dir).unwrap();
             conformance(&b).await;
             batch_conformance(&b).await;
-            b.put(b"/persist".to_vec(), Bytes::from_static(b"survives")).await;
+            // UFCS: FjallBackend impls both Backend and SyncBackend, so a bare `.put`
+            // is ambiguous with both traits in scope.
+            Backend::put(&b, b"/persist".to_vec(), Bytes::from_static(b"survives")).await;
         }
         {
             let b = FjallBackend::open(&dir).unwrap();
-            assert_eq!(b.get(b"/persist".to_vec()).await.as_deref(), Some(&b"survives"[..]));
+            assert_eq!(Backend::get(&b, b"/persist".to_vec()).await.as_deref(), Some(&b"survives"[..]));
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1169,11 +1457,11 @@ mod tests {
             let b = RedbBackend::open(&path).unwrap();
             conformance(&b).await;
             batch_conformance(&b).await;
-            b.put(b"/persist".to_vec(), Bytes::from_static(b"survives")).await;
+            Backend::put(&b, b"/persist".to_vec(), Bytes::from_static(b"survives")).await;
         }
         {
             let b = RedbBackend::open(&path).unwrap();
-            assert_eq!(b.get(b"/persist".to_vec()).await.as_deref(), Some(&b"survives"[..]));
+            assert_eq!(Backend::get(&b, b"/persist".to_vec()).await.as_deref(), Some(&b"survives"[..]));
         }
         let _ = std::fs::remove_file(&path);
     }
@@ -1205,9 +1493,10 @@ mod tests {
                 .commit()
                 .await
                 .unwrap();
-            assert_eq!(headers.get(b"h1".to_vec()).await.as_deref(), Some(&b"H"[..]));
-            assert_eq!(payloads.get(b"p1".to_vec()).await.as_deref(), Some(&b"P"[..]));
-            assert_eq!(idx.get(b"n1".to_vec()).await.as_deref(), Some(&b"h1"[..]));
+            // UFCS to disambiguate the dual (Backend / SyncBackend) impls in scope.
+            assert_eq!(Backend::get(&headers, b"h1".to_vec()).await.as_deref(), Some(&b"H"[..]));
+            assert_eq!(Backend::get(&payloads, b"p1".to_vec()).await.as_deref(), Some(&b"P"[..]));
+            assert_eq!(Backend::get(&idx, b"n1".to_vec()).await.as_deref(), Some(&b"h1"[..]));
 
             // A cross-partition delete in one batch (e.g. retract a block).
             db.batch()
@@ -1216,15 +1505,15 @@ mod tests {
                 .commit()
                 .await
                 .unwrap();
-            assert!(headers.get(b"h1".to_vec()).await.is_none());
-            assert!(idx.get(b"n1".to_vec()).await.is_none());
-            assert_eq!(payloads.get(b"p1".to_vec()).await.as_deref(), Some(&b"P"[..]));
+            assert!(Backend::get(&headers, b"h1".to_vec()).await.is_none());
+            assert!(Backend::get(&idx, b"n1".to_vec()).await.is_none());
+            assert_eq!(Backend::get(&payloads, b"p1".to_vec()).await.as_deref(), Some(&b"P"[..]));
         }
         // Survives reopen.
         {
             let db = FjallDb::open(&dir).unwrap();
             let payloads = db.partition("payloads").unwrap();
-            assert_eq!(payloads.get(b"p1".to_vec()).await.as_deref(), Some(&b"P"[..]));
+            assert_eq!(Backend::get(&payloads, b"p1".to_vec()).await.as_deref(), Some(&b"P"[..]));
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1252,9 +1541,9 @@ mod tests {
                 .commit()
                 .await
                 .unwrap();
-            assert_eq!(headers.get(b"h1".to_vec()).await.as_deref(), Some(&b"H"[..]));
-            assert_eq!(payloads.get(b"p1".to_vec()).await.as_deref(), Some(&b"P"[..]));
-            assert_eq!(idx.get(b"n1".to_vec()).await.as_deref(), Some(&b"h1"[..]));
+            assert_eq!(Backend::get(&headers, b"h1".to_vec()).await.as_deref(), Some(&b"H"[..]));
+            assert_eq!(Backend::get(&payloads, b"p1".to_vec()).await.as_deref(), Some(&b"P"[..]));
+            assert_eq!(Backend::get(&idx, b"n1".to_vec()).await.as_deref(), Some(&b"h1"[..]));
 
             db.batch()
                 .remove(&headers, b"h1".to_vec())
@@ -1262,9 +1551,114 @@ mod tests {
                 .commit()
                 .await
                 .unwrap();
-            assert!(headers.get(b"h1".to_vec()).await.is_none());
-            assert_eq!(payloads.get(b"p1".to_vec()).await.as_deref(), Some(&b"P"[..]));
+            assert!(Backend::get(&headers, b"h1".to_vec()).await.is_none());
+            assert_eq!(Backend::get(&payloads, b"p1".to_vec()).await.as_deref(), Some(&b"P"[..]));
         }
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- F21: the synchronous facet ----
+
+    /// Drives a `SyncBackend` with no async runtime — exactly how NDF's sync
+    /// `BlockStore` / the pure verifier / an MCU consume it.
+    fn sync_conformance(b: &dyn SyncBackend) {
+        assert!(b.get(b"missing").is_none());
+        b.put(b"/a/b", Bytes::from_static(b"v-ab"));
+        b.put(b"/a/b/c", Bytes::from_static(b"v-abc"));
+        b.put(b"/a/d", Bytes::from_static(b"v-ad"));
+        b.put(b"/z", Bytes::from_static(b"v-z"));
+
+        assert_eq!(b.get(b"/a/b").as_deref(), Some(&b"v-ab"[..]));
+        assert_eq!(b.first_under(b"/a/b").unwrap().0.as_ref(), b"/a/b");
+        assert!(b.first_under(b"/nope").is_none());
+        let under: Vec<String> = b
+            .scan_prefix(b"/a", 0)
+            .into_iter()
+            .map(|(k, _)| String::from_utf8_lossy(&k).into_owned())
+            .collect();
+        assert_eq!(under, vec!["/a/b", "/a/b/c", "/a/d"]);
+        assert_eq!(b.scan_prefix(b"/a", 1).len(), 1);
+
+        // Atomic group (last-writer-wins ordering within the batch).
+        b.write_batch(vec![
+            WriteOp::Put(b"/k1".to_vec(), Bytes::from_static(b"v1")),
+            WriteOp::Delete(b"/a/b".to_vec()),
+        ]);
+        assert_eq!(b.get(b"/k1").as_deref(), Some(&b"v1"[..]));
+        assert!(b.get(b"/a/b").is_none());
+    }
+
+    #[cfg(feature = "sync")]
+    #[test]
+    fn sync_memory_backend_conformance() {
+        sync_conformance(&SyncMemoryBackend::new());
+    }
+
+    /// fjall is usable as the sync core with no Tokio runtime present (plain `#[test]`).
+    #[cfg(feature = "fjall")]
+    #[test]
+    fn fjall_sync_facet_conformance() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "ndn-storage-fjall-sync-{}-{}",
+            std::process::id(),
+            CTR.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        sync_conformance(&FjallBackend::open(&dir).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// fjall cross-partition atomic batch committed **synchronously** (the migration
+    /// path NDF's sync `BlockStore` takes).
+    #[cfg(feature = "fjall")]
+    #[test]
+    fn fjall_sync_cross_partition_batch() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "ndn-storage-fjall-syncbatch-{}-{}",
+            std::process::id(),
+            CTR.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = FjallDb::open(&dir).unwrap();
+        let headers = db.partition("headers").unwrap();
+        let payloads = db.partition("payloads").unwrap();
+        db.batch()
+            .insert(&headers, b"h1".to_vec(), Bytes::from_static(b"H"))
+            .insert(&payloads, b"p1".to_vec(), Bytes::from_static(b"P"))
+            .commit_blocking()
+            .unwrap();
+        assert_eq!(SyncBackend::get(&headers, b"h1").as_deref(), Some(&b"H"[..]));
+        assert_eq!(SyncBackend::get(&payloads, b"p1").as_deref(), Some(&b"P"[..]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "redb")]
+    #[test]
+    fn redb_sync_facet_conformance() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "ndn-storage-redb-sync-{}-{}.redb",
+            std::process::id(),
+            CTR.fetch_add(1, Ordering::Relaxed)
+        ));
+        sync_conformance(&RedbBackend::open(&path).unwrap());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `SyncAsAsync` bridges a sync engine into the async named layer (so an embedded
+    /// engine / the sync in-memory store composes with `NamedStore`/`StoreRouter`).
+    #[cfg(all(feature = "sync", feature = "named"))]
+    #[tokio::test]
+    async fn sync_backend_bridges_to_async_named_store() {
+        use ndn_packet::Name;
+        let store = NamedStore::new(SyncAsAsync::new(SyncMemoryBackend::new()));
+        let v0: Name = "/app/s/v=0".parse().unwrap();
+        store.insert(&v0, Bytes::from_static(b"f0")).await;
+        assert_eq!(store.get(&v0).await.as_deref(), Some(&b"f0"[..]));
     }
 }
