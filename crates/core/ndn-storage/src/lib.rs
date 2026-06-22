@@ -542,11 +542,11 @@ mod named {
 }
 
 #[cfg(feature = "fjall")]
-pub use fjall_backend::FjallBackend;
+pub use fjall_backend::{FjallBackend, FjallBatch, FjallDb};
 
 #[cfg(feature = "fjall")]
 mod fjall_backend {
-    use super::{Backend, Bytes, async_trait};
+    use super::{Backend, Bytes, WriteOp, async_trait};
 
     /// On-disk [`Backend`] backed by [fjall](https://docs.rs/fjall) (an LSM
     /// key-value store). Persistent across restarts. The single fjall adapter every
@@ -617,8 +617,7 @@ mod fjall_backend {
             .await
             .unwrap_or_default()
         }
-        async fn write_batch(&self, ops: Vec<super::WriteOp>) {
-            use super::WriteOp;
+        async fn write_batch(&self, ops: Vec<WriteOp>) {
             let db = self.db.clone();
             let ks = self.keyspace.clone();
             let _ = tokio::task::spawn_blocking(move || {
@@ -637,10 +636,112 @@ mod fjall_backend {
             "fjall"
         }
     }
+
+    /// A shared fjall [`Database`](fjall::Database) that opens **multiple partitions**
+    /// (LSM trees) over one on-disk keyspace and can commit a write batch **atomically
+    /// across them** — closing F22. Open N partitions as [`FjallBackend`]s that share
+    /// this db's transaction domain, then group their writes in one [`FjallBatch`]; a
+    /// crash leaves either all or none (e.g. NDF's ≥5-partition block `put`: headers,
+    /// payloads, idx_by_name/kind/parent). This surfaces fjall's native
+    /// `Database::batch()` cross-partition atomicity, bringing fjall to parity with
+    /// [`RedbDb`](super::RedbDb)'s cross-table transaction — the engine choice stays a
+    /// pure perf/feature tradeoff, never "pick fjall ⇒ lose atomicity".
+    ///
+    /// (Partitions opened via [`FjallBackend::open_keyspace`] each get their *own*
+    /// `Database`, so they **cannot** be batched together — use `FjallDb` when you need
+    /// multi-partition atomicity.)
+    pub struct FjallDb {
+        db: fjall::Database,
+    }
+
+    impl FjallDb {
+        /// Open (or create) the shared keyspace at `path`.
+        pub fn open(path: impl AsRef<std::path::Path>) -> fjall::Result<Self> {
+            Ok(Self {
+                db: fjall::Database::builder(path).open()?,
+            })
+        }
+
+        /// Open (or get) a named partition as a [`FjallBackend`] sharing this db — so
+        /// its writes can be committed atomically with sibling partitions' writes via
+        /// [`batch`](Self::batch). It is a fully-functional `Backend` on its own too.
+        pub fn partition(&self, name: &str) -> fjall::Result<FjallBackend> {
+            let keyspace = self.db.keyspace(name, fjall::KeyspaceCreateOptions::default)?;
+            Ok(FjallBackend {
+                keyspace,
+                db: self.db.clone(),
+            })
+        }
+
+        /// Begin a cross-partition atomic batch over this db's partitions.
+        pub fn batch(&self) -> FjallBatch {
+            FjallBatch {
+                db: self.db.clone(),
+                ops: Vec::new(),
+            }
+        }
+    }
+
+    /// A batch of writes spanning one or more [`FjallBackend`] partitions of a single
+    /// [`FjallDb`], committed **atomically** (all-or-nothing). The engine-layer
+    /// counterpart of the named [`Batch`](crate::Batch): an explicit partition per op,
+    /// for models (NDF's BlockStore) that own their key codec and span partitions.
+    /// Build then `commit().await`:
+    /// `db.batch().insert(&headers, k, v).insert(&payloads, k2, v2).commit().await?`.
+    #[must_use = "a FjallBatch does nothing until committed"]
+    pub struct FjallBatch {
+        db: fjall::Database,
+        ops: Vec<(fjall::Keyspace, WriteOp)>,
+    }
+
+    impl FjallBatch {
+        /// Stage an insert into `partition`.
+        pub fn insert(mut self, partition: &FjallBackend, key: Vec<u8>, value: Bytes) -> Self {
+            self.ops
+                .push((partition.keyspace.clone(), WriteOp::Put(key, value)));
+            self
+        }
+        /// Stage a delete from `partition`.
+        pub fn remove(mut self, partition: &FjallBackend, key: Vec<u8>) -> Self {
+            self.ops
+                .push((partition.keyspace.clone(), WriteOp::Delete(key)));
+            self
+        }
+        /// Number of staged ops.
+        pub fn len(&self) -> usize {
+            self.ops.len()
+        }
+        /// `true` if no ops are staged.
+        pub fn is_empty(&self) -> bool {
+            self.ops.is_empty()
+        }
+        /// Commit every staged op as **one** atomic fjall batch (all partitions or
+        /// none). Errors surface a failed commit so the caller knows the group did not
+        /// land — the whole point of atomic block writes.
+        pub async fn commit(self) -> std::io::Result<()> {
+            let FjallBatch { db, ops } = self;
+            let n = ops.len();
+            tokio::task::spawn_blocking(move || {
+                let mut batch = db.batch(); // spans every partition of `db`
+                for (ks, op) in ops {
+                    match op {
+                        WriteOp::Put(k, v) => batch.insert(&ks, &k, v.as_ref()),
+                        WriteOp::Delete(k) => batch.remove(&ks, &k),
+                    }
+                }
+                batch.commit()
+            })
+            .await
+            .map_err(|e| std::io::Error::other(format!("fjall batch join: {e}")))?
+            .map_err(|e| std::io::Error::other(format!("fjall batch commit: {e}")))?;
+            tracing::trace!(target: "ndn_storage", backend = "fjall", ops = n, "cross_partition_batch");
+            Ok(())
+        }
+    }
 }
 
 #[cfg(feature = "redb")]
-pub use redb_backend::RedbBackend;
+pub use redb_backend::{RedbBackend, RedbBatch, RedbDb};
 
 #[cfg(feature = "redb")]
 mod redb_backend {
@@ -765,6 +866,115 @@ mod redb_backend {
         }
         fn name(&self) -> &'static str {
             "redb"
+        }
+    }
+
+    /// A shared redb [`Database`](redb::Database) that opens **multiple tables** over
+    /// one file and can commit a write batch **atomically across them** — the redb
+    /// counterpart of [`FjallDb`](super::FjallDb), so cross-partition atomicity exists
+    /// on *both* engines (F22 parity). Open N tables as [`RedbBackend`]s sharing this
+    /// db, then group their writes in one [`RedbBatch`] = one redb `WriteTransaction`
+    /// spanning every table.
+    pub struct RedbDb {
+        db: Arc<redb::Database>,
+    }
+
+    impl RedbDb {
+        /// Open (or create) the shared database file at `path`.
+        pub fn open(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
+            let db = redb::Database::create(path).map_err(std::io::Error::other)?;
+            Ok(Self { db: Arc::new(db) })
+        }
+
+        /// Open (or get) a named table as a [`RedbBackend`] sharing this db — so its
+        /// writes can be committed atomically with sibling tables' writes via
+        /// [`batch`](Self::batch). A fully-functional `Backend` on its own too.
+        pub fn partition(&self, name: &str) -> std::io::Result<RedbBackend> {
+            let w = self.db.begin_write().map_err(std::io::Error::other)?;
+            {
+                w.open_table(table(name)).map_err(std::io::Error::other)?;
+            }
+            w.commit().map_err(std::io::Error::other)?;
+            Ok(RedbBackend {
+                db: self.db.clone(),
+                table: name.to_string(),
+            })
+        }
+
+        /// Begin a cross-table atomic batch over this db's tables.
+        pub fn batch(&self) -> RedbBatch {
+            RedbBatch {
+                db: self.db.clone(),
+                ops: Vec::new(),
+            }
+        }
+    }
+
+    /// A batch of writes spanning one or more [`RedbBackend`] tables of a single
+    /// [`RedbDb`], committed **atomically** in one `WriteTransaction`. The redb mirror
+    /// of [`FjallBatch`](super::FjallBatch).
+    #[must_use = "a RedbBatch does nothing until committed"]
+    pub struct RedbBatch {
+        db: Arc<redb::Database>,
+        ops: Vec<(String, WriteOp)>,
+    }
+
+    impl RedbBatch {
+        /// Stage an insert into `partition`.
+        pub fn insert(mut self, partition: &RedbBackend, key: Vec<u8>, value: Bytes) -> Self {
+            self.ops
+                .push((partition.table.clone(), WriteOp::Put(key, value)));
+            self
+        }
+        /// Stage a delete from `partition`.
+        pub fn remove(mut self, partition: &RedbBackend, key: Vec<u8>) -> Self {
+            self.ops
+                .push((partition.table.clone(), WriteOp::Delete(key)));
+            self
+        }
+        /// Number of staged ops.
+        pub fn len(&self) -> usize {
+            self.ops.len()
+        }
+        /// `true` if no ops are staged.
+        pub fn is_empty(&self) -> bool {
+            self.ops.is_empty()
+        }
+        /// Commit every staged op as one redb transaction spanning all touched tables
+        /// (all-or-nothing). Errors surface a failed commit.
+        pub async fn commit(self) -> std::io::Result<()> {
+            let RedbBatch { db, ops } = self;
+            let n = ops.len();
+            tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
+                // Group by table so each is opened exactly once within the txn.
+                let mut by_table: std::collections::HashMap<String, Vec<WriteOp>> =
+                    std::collections::HashMap::new();
+                for (t, op) in ops {
+                    by_table.entry(t).or_default().push(op);
+                }
+                let txn = db.begin_write()?;
+                for (tname, tops) in by_table {
+                    let mut t = txn.open_table(table(&tname))?;
+                    for op in tops {
+                        match op {
+                            WriteOp::Put(k, v) => {
+                                t.insert(k.as_slice(), v.as_ref())?;
+                            }
+                            WriteOp::Delete(k) => {
+                                t.remove(k.as_slice())?;
+                            }
+                        }
+                    }
+                    // `t` dropped here, before the next table / the commit.
+                }
+                txn.commit()?; // ACID across every table
+                Ok(())
+            })
+            .await
+            .map_err(|e| std::io::Error::other(format!("redb batch join: {e}")))?
+            .map_err(|e| std::io::Error::other(format!("redb batch commit: {e}")))?;
+            tracing::trace!(target: "ndn_storage", backend = "redb", ops = n, "cross_partition_batch");
+            Ok(())
         }
     }
 }
@@ -964,6 +1174,96 @@ mod tests {
         {
             let b = RedbBackend::open(&path).unwrap();
             assert_eq!(b.get(b"/persist".to_vec()).await.as_deref(), Some(&b"survives"[..]));
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// F22: a `FjallDb` opens multiple partitions sharing one transaction domain, and
+    /// a `FjallBatch` commits across them atomically (NDF's ≥5-partition block `put`).
+    #[cfg(feature = "fjall")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fjall_cross_partition_atomic_batch() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "ndn-storage-fjalldb-{}-{}",
+            std::process::id(),
+            CTR.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let db = FjallDb::open(&dir).unwrap();
+            let headers = db.partition("headers").unwrap();
+            let payloads = db.partition("payloads").unwrap();
+            let idx = db.partition("idx_by_name").unwrap();
+
+            // One block lands across three partitions atomically.
+            db.batch()
+                .insert(&headers, b"h1".to_vec(), Bytes::from_static(b"H"))
+                .insert(&payloads, b"p1".to_vec(), Bytes::from_static(b"P"))
+                .insert(&idx, b"n1".to_vec(), Bytes::from_static(b"h1"))
+                .commit()
+                .await
+                .unwrap();
+            assert_eq!(headers.get(b"h1".to_vec()).await.as_deref(), Some(&b"H"[..]));
+            assert_eq!(payloads.get(b"p1".to_vec()).await.as_deref(), Some(&b"P"[..]));
+            assert_eq!(idx.get(b"n1".to_vec()).await.as_deref(), Some(&b"h1"[..]));
+
+            // A cross-partition delete in one batch (e.g. retract a block).
+            db.batch()
+                .remove(&headers, b"h1".to_vec())
+                .remove(&idx, b"n1".to_vec())
+                .commit()
+                .await
+                .unwrap();
+            assert!(headers.get(b"h1".to_vec()).await.is_none());
+            assert!(idx.get(b"n1".to_vec()).await.is_none());
+            assert_eq!(payloads.get(b"p1".to_vec()).await.as_deref(), Some(&b"P"[..]));
+        }
+        // Survives reopen.
+        {
+            let db = FjallDb::open(&dir).unwrap();
+            let payloads = db.partition("payloads").unwrap();
+            assert_eq!(payloads.get(b"p1".to_vec()).await.as_deref(), Some(&b"P"[..]));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F22 parity: the same cross-table atomic batch on `RedbDb`.
+    #[cfg(feature = "redb")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn redb_cross_partition_atomic_batch() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "ndn-storage-redbdb-{}-{}.redb",
+            std::process::id(),
+            CTR.fetch_add(1, Ordering::Relaxed)
+        ));
+        {
+            let db = RedbDb::open(&path).unwrap();
+            let headers = db.partition("headers").unwrap();
+            let payloads = db.partition("payloads").unwrap();
+            let idx = db.partition("idx_by_name").unwrap();
+            db.batch()
+                .insert(&headers, b"h1".to_vec(), Bytes::from_static(b"H"))
+                .insert(&payloads, b"p1".to_vec(), Bytes::from_static(b"P"))
+                .insert(&idx, b"n1".to_vec(), Bytes::from_static(b"h1"))
+                .commit()
+                .await
+                .unwrap();
+            assert_eq!(headers.get(b"h1".to_vec()).await.as_deref(), Some(&b"H"[..]));
+            assert_eq!(payloads.get(b"p1".to_vec()).await.as_deref(), Some(&b"P"[..]));
+            assert_eq!(idx.get(b"n1".to_vec()).await.as_deref(), Some(&b"h1"[..]));
+
+            db.batch()
+                .remove(&headers, b"h1".to_vec())
+                .remove(&idx, b"n1".to_vec())
+                .commit()
+                .await
+                .unwrap();
+            assert!(headers.get(b"h1".to_vec()).await.is_none());
+            assert_eq!(payloads.get(b"p1".to_vec()).await.as_deref(), Some(&b"P"[..]));
         }
         let _ = std::fs::remove_file(&path);
     }
