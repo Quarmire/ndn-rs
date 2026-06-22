@@ -4,6 +4,7 @@ members = [
     "crates/core/ndn-foundation-types",
     "crates/core/ndn-tlv",
     "crates/core/ndn-packet",
+    "crates/core/ndn-storage",
     "crates/forwarding/ndn-fwd-core",
     "crates/core/ndn-crypto-core",
     "crates/core/ndn-signals-core",
@@ -38,6 +39,7 @@ default-members = [
     "crates/core/ndn-foundation-types",
     "crates/core/ndn-tlv",
     "crates/core/ndn-packet",
+    "crates/core/ndn-storage",
     "crates/forwarding/ndn-fwd-core",
     "crates/core/ndn-crypto-core",
     "crates/core/ndn-signals-core",
@@ -80,6 +82,7 @@ name = "ndn-rs"
 [workspace.dependencies]
 # NDN workspace crates — grouped by subdirectory layer
 ndn-foundation-types = { path = "crates/core/ndn-foundation-types", default-features = false }
+ndn-storage   = { path = "crates/core/ndn-storage" }
 ndn-tlv       = { path = "crates/core/ndn-tlv",       default-features = false }
 ndn-packet    = { path = "crates/core/ndn-packet",    default-features = false }
 ndn-fwd-core  = { path = "crates/forwarding/ndn-fwd-core",  default-features = false }

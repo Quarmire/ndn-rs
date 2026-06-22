@@ -1,0 +1,18 @@
+[package]
+name = "ndn-storage"
+description = "Pluggable storage engine: an ordered byte key→value Backend (in-memory + fjall LSM). The substrate the named-data Repo/CS, content-addressed stores, and NDF's BlockStore build on — one engine, many data models."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+classification = "extension"
+
+[features]
+default = []
+# On-disk LSM backend (fjall). Off by default so wasm / in-memory builds stay lean.
+fjall = ["dep:fjall"]
+
+[dependencies]
+bytes = { workspace = true, features = ["std"] }
+fjall = { workspace = true, optional = true }
