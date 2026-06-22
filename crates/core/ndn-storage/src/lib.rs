@@ -66,6 +66,12 @@ pub trait Backend: Send + Sync {
             }
         }
     }
+
+    /// Short, low-cardinality engine label (`"memory"` / `"fjall"` / `"redb"`) for
+    /// telemetry. Used by [`Instrumented`] as a span field; never on a hot path.
+    fn name(&self) -> &'static str {
+        "backend"
+    }
 }
 
 /// In-memory [`Backend`] (a `BTreeMap` behind an `RwLock`). The default for tests,
@@ -126,6 +132,146 @@ impl Backend for MemoryBackend {
                 }
             }
         }
+    }
+    fn name(&self) -> &'static str {
+        "memory"
+    }
+}
+
+/// A [`Backend`] **decorator** that emits a `tracing` span per operation — the
+/// observability seam for the storage tier. Wrapping is opt-in and zero-cost when
+/// absent (an unwrapped engine emits nothing): `Instrumented::new(FjallBackend::open(p)?)`.
+///
+/// It only uses the `tracing` *facade* — no exporter, no metrics crate, nothing
+/// wasm-hostile. A **binary** that wants OpenTelemetry adds `tracing-opentelemetry`
+/// plus an OTLP layer to its subscriber and every storage span exports to a collector
+/// with no change here (libraries emit spans; binaries own subscriber init). Spans:
+/// `ndn_storage.{get,put,delete,scan_prefix,first_under,write_batch}` at TRACE, with
+/// `backend`, key/prefix length, byte counts, hit/miss, op/result counts — let the
+/// OTel layer derive latency histograms from span durations.
+///
+/// Because it sits at Layer 0 it instruments **every** consumer uniformly: the named
+/// surface path *and* NDF's direct `Backend` use.
+pub struct Instrumented<B> {
+    inner: B,
+}
+
+impl<B: Backend> Instrumented<B> {
+    pub fn new(inner: B) -> Self {
+        Self { inner }
+    }
+    /// Borrow the wrapped engine.
+    pub fn inner(&self) -> &B {
+        &self.inner
+    }
+    /// Unwrap, dropping instrumentation.
+    pub fn into_inner(self) -> B {
+        self.inner
+    }
+}
+
+#[async_trait]
+impl<B: Backend> Backend for Instrumented<B> {
+    async fn get(&self, key: Vec<u8>) -> Option<Bytes> {
+        use tracing::{Instrument, field::Empty};
+        let span = tracing::trace_span!(
+            "ndn_storage.get",
+            backend = self.inner.name(),
+            key_len = key.len(),
+            hit = Empty,
+            bytes = Empty,
+        );
+        async {
+            let r = self.inner.get(key).await;
+            let s = tracing::Span::current();
+            s.record("hit", r.is_some());
+            if let Some(b) = &r {
+                s.record("bytes", b.len());
+            }
+            r
+        }
+        .instrument(span)
+        .await
+    }
+    async fn put(&self, key: Vec<u8>, value: Bytes) {
+        use tracing::Instrument;
+        let span = tracing::trace_span!(
+            "ndn_storage.put",
+            backend = self.inner.name(),
+            key_len = key.len(),
+            bytes = value.len(),
+        );
+        self.inner.put(key, value).instrument(span).await
+    }
+    async fn delete(&self, key: Vec<u8>) {
+        use tracing::Instrument;
+        let span = tracing::trace_span!(
+            "ndn_storage.delete",
+            backend = self.inner.name(),
+            key_len = key.len(),
+        );
+        self.inner.delete(key).instrument(span).await
+    }
+    async fn scan_prefix(&self, prefix: Vec<u8>, limit: usize) -> Vec<(Bytes, Bytes)> {
+        use tracing::{Instrument, field::Empty};
+        let span = tracing::trace_span!(
+            "ndn_storage.scan_prefix",
+            backend = self.inner.name(),
+            prefix_len = prefix.len(),
+            limit,
+            count = Empty,
+            bytes = Empty,
+        );
+        async {
+            let r = self.inner.scan_prefix(prefix, limit).await;
+            let s = tracing::Span::current();
+            s.record("count", r.len());
+            s.record("bytes", r.iter().map(|(_, v)| v.len()).sum::<usize>());
+            r
+        }
+        .instrument(span)
+        .await
+    }
+    async fn first_under(&self, prefix: Vec<u8>) -> Option<(Bytes, Bytes)> {
+        use tracing::{Instrument, field::Empty};
+        let span = tracing::trace_span!(
+            "ndn_storage.first_under",
+            backend = self.inner.name(),
+            prefix_len = prefix.len(),
+            hit = Empty,
+        );
+        async {
+            let r = self.inner.first_under(prefix).await;
+            tracing::Span::current().record("hit", r.is_some());
+            r
+        }
+        .instrument(span)
+        .await
+    }
+    async fn write_batch(&self, ops: Vec<WriteOp>) {
+        use tracing::Instrument;
+        let (mut puts, mut dels, mut bytes) = (0usize, 0usize, 0usize);
+        for op in &ops {
+            match op {
+                WriteOp::Put(_, v) => {
+                    puts += 1;
+                    bytes += v.len();
+                }
+                WriteOp::Delete(_) => dels += 1,
+            }
+        }
+        let span = tracing::trace_span!(
+            "ndn_storage.write_batch",
+            backend = self.inner.name(),
+            ops = ops.len(),
+            puts,
+            deletes = dels,
+            bytes,
+        );
+        self.inner.write_batch(ops).instrument(span).await
+    }
+    fn name(&self) -> &'static str {
+        self.inner.name()
     }
 }
 
@@ -473,7 +619,6 @@ mod fjall_backend {
         }
         async fn write_batch(&self, ops: Vec<super::WriteOp>) {
             use super::WriteOp;
-            let n = ops.len();
             let db = self.db.clone();
             let ks = self.keyspace.clone();
             let _ = tokio::task::spawn_blocking(move || {
@@ -487,7 +632,9 @@ mod fjall_backend {
                 let _ = batch.commit();
             })
             .await;
-            tracing::trace!(target: "ndn_storage", backend = "fjall", ops = n, "write_batch");
+        }
+        fn name(&self) -> &'static str {
+            "fjall"
         }
     }
 }
@@ -595,7 +742,6 @@ mod redb_backend {
             .unwrap_or_default()
         }
         async fn write_batch(&self, ops: Vec<WriteOp>) {
-            let n = ops.len();
             let (db, name) = (self.db.clone(), self.table.clone());
             let _ = tokio::task::spawn_blocking(move || -> Result<(), redb::Error> {
                 let txn = db.begin_write()?;
@@ -616,7 +762,9 @@ mod redb_backend {
                 Ok(())
             })
             .await;
-            tracing::trace!(target: "ndn_storage", backend = "redb", ops = n, "write_batch");
+        }
+        fn name(&self) -> &'static str {
+            "redb"
         }
     }
 }
@@ -671,6 +819,15 @@ mod tests {
     async fn memory_backend_conformance() {
         conformance(&MemoryBackend::new()).await;
         batch_conformance(&MemoryBackend::new()).await;
+    }
+
+    #[tokio::test]
+    async fn instrumented_delegates_transparently() {
+        // The telemetry decorator must be behaviorally identical to its inner engine.
+        let b = Instrumented::new(MemoryBackend::new());
+        conformance(&b).await;
+        batch_conformance(&Instrumented::new(MemoryBackend::new())).await;
+        assert_eq!(b.name(), "memory"); // label propagates from the inner engine
     }
 
     #[cfg(feature = "named")]
