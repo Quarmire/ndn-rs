@@ -1,6 +1,6 @@
 [package]
 name = "ndn-storage"
-description = "Pluggable storage engine: an ordered byte key→value Backend (in-memory + fjall LSM). The substrate the named-data Repo/CS, content-addressed stores, and NDF's BlockStore build on — one engine, many data models."
+description = "Pluggable async storage engine: an ordered byte key→value Backend (in-memory + fjall LSM). The substrate the named-data Repo/CS, content-addressed stores, and NDF's BlockStore build on — one engine, many data models."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -11,13 +11,19 @@ classification = "extension"
 [features]
 default = []
 # On-disk LSM backend (fjall). Off by default so wasm / in-memory builds stay lean.
-fjall = ["dep:fjall"]
+# Pulls tokio for the spawn_blocking offload (centralized in the adapter).
+fjall = ["dep:fjall", "dep:tokio"]
 # Layer-1 name→wire store over any Backend (pulls Name/TLV; keeps the core Backend
 # domain-agnostic when off).
 named = ["dep:ndn-packet", "dep:ndn-tlv"]
 
 [dependencies]
 bytes = { workspace = true, features = ["std"] }
+async-trait = { workspace = true }
 fjall = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true, features = ["rt"] }
 ndn-packet = { workspace = true, optional = true, features = ["std"] }
 ndn-tlv = { workspace = true, optional = true, features = ["std"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
