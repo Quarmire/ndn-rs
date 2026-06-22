@@ -51,6 +51,12 @@ pub mod tlv {
     pub const RL_OVERFLOW: u64 = 0xAA;
     pub const RL_QUEUE_MAX: u64 = 0xAC;
 
+    // SHM capability-scoped face (ndn-rs extension, `crates/faces/ndn-ipc-shm`).
+    // Client-minted one-time token presented on the control socket to receive
+    // the region/wakeup fds (`shm://` Option-A bootstrap). 0xAD–0xD7 is free of
+    // NFD and other ndn-rs ControlParameters assignments.
+    pub const SHM_CONTROL_TOKEN: u64 = 0xB0;
+
     pub const NAME: u64 = 0x07;
     pub const NAME_COMPONENT: u64 = 0x08;
 }
@@ -106,6 +112,10 @@ pub struct ControlParameters {
     pub face_persistency: Option<u64>,
     pub strategy: Option<Name>,
     pub mtu: Option<u64>,
+    /// `shm://` capability token (ndn-rs extension): a client-minted one-time
+    /// secret presented on the derived control socket to receive the region +
+    /// wakeup fds. 32 bytes in practice; validated by the consumer.
+    pub shm_control_token: Option<Bytes>,
     /// NFD `BaseCongestionMarkingInterval`, microseconds.
     pub base_cong_interval: Option<u64>,
     /// NFD `DefaultCongestionThreshold`, bytes.
@@ -193,6 +203,9 @@ impl ControlParameters {
         }
         if let Some(mtu) = self.mtu {
             write_non_neg_int(w, tlv::MTU, mtu);
+        }
+        if let Some(ref token) = self.shm_control_token {
+            w.write_tlv(tlv::SHM_CONTROL_TOKEN, token);
         }
         if let Some(v) = self.base_cong_interval {
             write_non_neg_int(w, tlv::BASE_CONG_INTERVAL, v);
@@ -341,6 +354,9 @@ impl ControlParameters {
                 }
                 tlv::MTU => {
                     params.mtu = Some(read_non_neg_int(&val)?);
+                }
+                tlv::SHM_CONTROL_TOKEN => {
+                    params.shm_control_token = Some(val);
                 }
                 tlv::BASE_CONG_INTERVAL => {
                     params.base_cong_interval = Some(read_non_neg_int(&val)?);
@@ -620,6 +636,7 @@ mod tests {
             face_persistency: Some(1),
             strategy: Some(name(&[b"ndn", b"strategy", b"multicast"])),
             mtu: Some(8800),
+            shm_control_token: Some(Bytes::from(vec![0x5Au8; 32])),
             base_cong_interval: Some(100_000),
             def_cong_threshold: Some(64 * 1024),
             capacity: Some(1024 * 1024),

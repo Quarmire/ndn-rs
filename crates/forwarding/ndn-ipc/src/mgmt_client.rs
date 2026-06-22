@@ -211,6 +211,25 @@ impl MgmtClient {
         self.command(module::FACES, verb::CREATE, &params).await
     }
 
+    /// Create a capability-scoped SHM face: `faces/create` carrying a client-
+    /// minted control token (ndn-rs `shm://` Option-A bootstrap). The router
+    /// uses the token to gate the fd handoff on the derived control socket; the
+    /// caller then connects to `control_socket_path(token)` to receive the fds.
+    pub async fn face_create_shm(
+        &self,
+        uri: &str,
+        mtu: Option<u64>,
+        token: bytes::Bytes,
+    ) -> Result<ControlParameters, ForwarderError> {
+        let params = ControlParameters {
+            uri: Some(uri.to_owned()),
+            mtu,
+            shm_control_token: Some(token),
+            ..Default::default()
+        };
+        self.command(module::FACES, verb::CREATE, &params).await
+    }
+
     /// Destroy a face: `faces/destroy`.
     pub async fn face_destroy(&self, face_id: u64) -> Result<ControlParameters, ForwarderError> {
         let params = ControlParameters {
