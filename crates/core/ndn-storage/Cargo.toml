@@ -16,14 +16,19 @@ fjall = ["dep:fjall", "dep:tokio"]
 # Layer-1 name→wire store over any Backend (pulls Name/TLV; keeps the core Backend
 # domain-agnostic when off).
 named = ["dep:ndn-packet", "dep:ndn-tlv"]
+# On-disk B-tree backend (redb) with real ACID transactions — for transactional /
+# read-latency-sensitive models (e.g. NDF atomic multi-partition block writes).
+redb = ["dep:redb", "dep:tokio"]
 
 [dependencies]
 bytes = { workspace = true, features = ["std"] }
 async-trait = { workspace = true }
+tracing = { workspace = true }
 fjall = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true, features = ["rt"] }
 ndn-packet = { workspace = true, optional = true, features = ["std"] }
 ndn-tlv = { workspace = true, optional = true, features = ["std"] }
+redb = { version = "4", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
