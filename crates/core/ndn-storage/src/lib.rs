@@ -98,7 +98,7 @@ impl Backend for MemoryBackend {
 }
 
 #[cfg(feature = "named")]
-pub use named::{NamedStore, name_key};
+pub use named::{NamedReadStore, NamedStore, NamedWriteStore, StoreRouter, name_key};
 
 /// Layer 1: a name→wire store over any [`Backend`] (the CS/Repo model). Keys are
 /// NDN component-TLVs, so a parent name is a byte-prefix of its descendants and
@@ -118,6 +118,99 @@ mod named {
             w.write_tlv(c.typ, &c.value);
         }
         w.finish().to_vec()
+    }
+
+    /// Object-safe **read** facet of a name→wire store — the narrow contract any
+    /// data model (the surface tier, NDF's BlockStore via `get_by_name`) exposes to
+    /// join the name-addressed data plane.
+    pub trait NamedReadStore: Send + Sync {
+        fn get(&self, name: &Name) -> Option<Bytes>;
+        fn find_under(&self, prefix: &Name) -> Option<Bytes>;
+        fn scan_under(&self, prefix: &Name, f: &mut dyn FnMut(&[u8], &[u8]) -> bool);
+    }
+
+    /// Object-safe **write** facet (write-behind retention).
+    pub trait NamedWriteStore: NamedReadStore {
+        fn insert(&self, name: &Name, wire: Bytes);
+    }
+
+    impl<B: Backend> NamedReadStore for NamedStore<B> {
+        fn get(&self, name: &Name) -> Option<Bytes> {
+            NamedStore::get(self, name)
+        }
+        fn find_under(&self, prefix: &Name) -> Option<Bytes> {
+            NamedStore::find_under(self, prefix)
+        }
+        fn scan_under(&self, prefix: &Name, f: &mut dyn FnMut(&[u8], &[u8]) -> bool) {
+            NamedStore::scan_under(self, prefix, f)
+        }
+    }
+
+    impl<B: Backend> NamedWriteStore for NamedStore<B> {
+        fn insert(&self, name: &Name, wire: Bytes) {
+            NamedStore::insert(self, name, wire)
+        }
+    }
+
+    use std::sync::Arc;
+
+    /// Layer 2: route names to **different stores by name prefix** — "different data,
+    /// different backend" (a hot fjall store for one namespace, an object-store for
+    /// big objects, NDF's BlockStore-facet for `/…/blocks/…`, etc.). Longest-prefix
+    /// match wins; an optional default catches the rest. Is itself a
+    /// `NamedReadStore`/`NamedWriteStore`, so it composes anywhere a single store does.
+    #[derive(Default)]
+    pub struct StoreRouter {
+        routes: Vec<(Vec<u8>, Arc<dyn NamedWriteStore>)>,
+        fallback: Option<Arc<dyn NamedWriteStore>>,
+    }
+
+    impl StoreRouter {
+        pub fn new() -> Self {
+            Self::default()
+        }
+        /// Route names under `prefix` to `store` (longest matching prefix wins).
+        pub fn route(mut self, prefix: &Name, store: Arc<dyn NamedWriteStore>) -> Self {
+            self.routes.push((name_key(prefix), store));
+            self
+        }
+        /// Store for names matching no route.
+        pub fn with_default(mut self, store: Arc<dyn NamedWriteStore>) -> Self {
+            self.fallback = Some(store);
+            self
+        }
+        fn pick(&self, name: &Name) -> Option<&Arc<dyn NamedWriteStore>> {
+            let key = name_key(name);
+            let mut best: Option<&(Vec<u8>, Arc<dyn NamedWriteStore>)> = None;
+            for r in &self.routes {
+                if key.starts_with(&r.0) && best.is_none_or(|b| r.0.len() > b.0.len()) {
+                    best = Some(r);
+                }
+            }
+            best.map(|r| &r.1).or(self.fallback.as_ref())
+        }
+    }
+
+    impl NamedReadStore for StoreRouter {
+        fn get(&self, name: &Name) -> Option<Bytes> {
+            self.pick(name)?.get(name)
+        }
+        fn find_under(&self, prefix: &Name) -> Option<Bytes> {
+            self.pick(prefix)?.find_under(prefix)
+        }
+        fn scan_under(&self, prefix: &Name, f: &mut dyn FnMut(&[u8], &[u8]) -> bool) {
+            if let Some(s) = self.pick(prefix) {
+                s.scan_under(prefix, f);
+            }
+        }
+    }
+
+    impl NamedWriteStore for StoreRouter {
+        fn insert(&self, name: &Name, wire: Bytes) {
+            if let Some(s) = self.pick(name) {
+                s.insert(name, wire);
+            }
+        }
     }
 
     /// Name → wire Data store over a pluggable [`Backend`]. `NamedStore<FjallBackend>`
@@ -305,6 +398,38 @@ mod tests {
         s.remove(&v0);
         assert!(s.get(&v0).is_none());
         assert_eq!(s.get(&v1).as_deref(), Some(&b"frame1"[..]));
+    }
+
+    #[cfg(feature = "named")]
+    #[test]
+    fn store_router_dispatches_by_prefix() {
+        use ndn_packet::Name;
+        use std::sync::Arc;
+        let a: Arc<dyn NamedWriteStore> = Arc::new(NamedStore::new(MemoryBackend::new()));
+        let b: Arc<dyn NamedWriteStore> = Arc::new(NamedStore::new(MemoryBackend::new()));
+        let d: Arc<dyn NamedWriteStore> = Arc::new(NamedStore::new(MemoryBackend::new()));
+        let router = StoreRouter::new()
+            .route(&"/a".parse::<Name>().unwrap(), a.clone())
+            .route(&"/b".parse::<Name>().unwrap(), b.clone())
+            .with_default(d.clone());
+
+        let na: Name = "/a/x".parse().unwrap();
+        let nb: Name = "/b/y".parse().unwrap();
+        let nc: Name = "/c/z".parse().unwrap();
+        router.insert(&na, Bytes::from_static(b"A"));
+        router.insert(&nb, Bytes::from_static(b"B"));
+        router.insert(&nc, Bytes::from_static(b"C"));
+
+        // Each landed in the right backend, and only there.
+        assert_eq!(a.get(&na).as_deref(), Some(&b"A"[..]));
+        assert!(b.get(&na).is_none());
+        assert_eq!(b.get(&nb).as_deref(), Some(&b"B"[..]));
+        assert_eq!(d.get(&nc).as_deref(), Some(&b"C"[..])); // default
+        assert!(a.get(&nc).is_none());
+
+        // Reads route the same way.
+        assert_eq!(router.get(&na).as_deref(), Some(&b"A"[..]));
+        assert_eq!(router.get(&nc).as_deref(), Some(&b"C"[..]));
     }
 
     #[cfg(feature = "fjall")]
