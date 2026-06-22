@@ -97,6 +97,71 @@ impl Backend for MemoryBackend {
     }
 }
 
+#[cfg(feature = "named")]
+pub use named::{NamedStore, name_key};
+
+/// Layer 1: a name→wire store over any [`Backend`] (the CS/Repo model). Keys are
+/// NDN component-TLVs, so a parent name is a byte-prefix of its descendants and
+/// `CanBePrefix` lookups are prefix scans.
+#[cfg(feature = "named")]
+mod named {
+    use super::{Backend, Bytes};
+    use ndn_packet::Name;
+
+    /// Encode a [`Name`] to a storage key: its component TLVs (the NAME value,
+    /// without the outer `0x07` header). NDN canonical component order is preserved
+    /// byte-for-byte, so `name_key(parent)` is a prefix of `name_key(child)`.
+    pub fn name_key(name: &Name) -> Vec<u8> {
+        use ndn_tlv::TlvWriter;
+        let mut w = TlvWriter::new();
+        for c in name.components() {
+            w.write_tlv(c.typ, &c.value);
+        }
+        w.finish().to_vec()
+    }
+
+    /// Name → wire Data store over a pluggable [`Backend`]. `NamedStore<FjallBackend>`
+    /// is a persistent repo; `NamedStore<MemoryBackend>` an in-process content store.
+    /// (Inherent API mirrors the legacy `DataStore` trait, so a bridge impl is a few
+    /// lines when unifying `ndn-repo`/`ndn-sync`.)
+    pub struct NamedStore<B> {
+        backend: B,
+    }
+
+    impl<B: Backend> NamedStore<B> {
+        pub fn new(backend: B) -> Self {
+            Self { backend }
+        }
+        /// The underlying engine (e.g. to share a DB across stores).
+        pub fn backend(&self) -> &B {
+            &self.backend
+        }
+        /// Store the encoded Data `wire` under `name`.
+        pub fn insert(&self, name: &Name, wire: Bytes) {
+            self.backend.put(&name_key(name), wire);
+        }
+        /// Fetch the Data wire stored under `name`.
+        pub fn get(&self, name: &Name) -> Option<Bytes> {
+            self.backend.get(&name_key(name))
+        }
+        /// Remove `name` if present.
+        pub fn remove(&self, name: &Name) {
+            self.backend.delete(&name_key(name));
+        }
+        /// The lexicographically-smallest stored Data whose name has `prefix` as a
+        /// prefix — the answer to a `CanBePrefix` Interest.
+        pub fn find_under(&self, prefix: &Name) -> Option<Bytes> {
+            self.backend.first_under(&name_key(prefix)).map(|(_k, v)| v)
+        }
+        /// Visit `(name_key, wire)` under `prefix` in ascending name order, until
+        /// `f` returns `false` — for "last-N"/range fetches (callers decode the key
+        /// to a Name if needed). Keys are component-TLVs, not a full NAME TLV.
+        pub fn scan_under(&self, prefix: &Name, f: &mut dyn FnMut(&[u8], &[u8]) -> bool) {
+            self.backend.scan_prefix(&name_key(prefix), f);
+        }
+    }
+}
+
 #[cfg(feature = "fjall")]
 pub use fjall_backend::FjallBackend;
 
@@ -208,6 +273,38 @@ mod tests {
     #[test]
     fn memory_backend_conformance() {
         conformance(&MemoryBackend::new());
+    }
+
+    #[cfg(feature = "named")]
+    #[test]
+    fn named_store_over_backend() {
+        use ndn_packet::Name;
+        let s = NamedStore::new(MemoryBackend::new());
+        let n: Name = "/app/surface".parse().unwrap();
+        let v0: Name = "/app/surface/v=0".parse().unwrap();
+        let v1: Name = "/app/surface/v=1".parse().unwrap();
+
+        s.insert(&v0, Bytes::from_static(b"frame0"));
+        s.insert(&v1, Bytes::from_static(b"frame1"));
+        assert_eq!(s.get(&v0).as_deref(), Some(&b"frame0"[..]));
+
+        // CanBePrefix: smallest under the surface prefix is v=0.
+        assert_eq!(s.find_under(&n).as_deref(), Some(&b"frame0"[..]));
+
+        // parent key is a byte-prefix of the child (range-scannable).
+        assert!(name_key(&v0).starts_with(&name_key(&n)));
+
+        // scan under the prefix yields both versions in order.
+        let mut count = 0;
+        s.scan_under(&n, &mut |_, _| {
+            count += 1;
+            true
+        });
+        assert_eq!(count, 2);
+
+        s.remove(&v0);
+        assert!(s.get(&v0).is_none());
+        assert_eq!(s.get(&v1).as_deref(), Some(&b"frame1"[..]));
     }
 
     #[cfg(feature = "fjall")]

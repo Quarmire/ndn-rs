@@ -12,7 +12,12 @@ classification = "extension"
 default = []
 # On-disk LSM backend (fjall). Off by default so wasm / in-memory builds stay lean.
 fjall = ["dep:fjall"]
+# Layer-1 name→wire store over any Backend (pulls Name/TLV; keeps the core Backend
+# domain-agnostic when off).
+named = ["dep:ndn-packet", "dep:ndn-tlv"]
 
 [dependencies]
 bytes = { workspace = true, features = ["std"] }
 fjall = { workspace = true, optional = true }
+ndn-packet = { workspace = true, optional = true, features = ["std"] }
+ndn-tlv = { workspace = true, optional = true, features = ["std"] }
