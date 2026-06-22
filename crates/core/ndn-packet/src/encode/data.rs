@@ -13,7 +13,7 @@ const SIGINFO_DIGEST_SHA256: [u8; 5] = [0x16, 0x03, 0x1B, 0x01, 0x00];
 const SIGINFO_DIGEST_BLAKE3: [u8; 5] = [0x16, 0x03, 0x1B, 0x01, 0x06];
 
 #[inline(always)]
-fn put_vu(buf: &mut BytesMut, v: u64) {
+fn put_vu<B: BufMut>(buf: &mut B, v: u64) {
     let mut tmp = [0u8; 9];
     let n = ndn_tlv::write_varu64(&mut tmp, v);
     buf.put_slice(&tmp[..n]);
@@ -84,8 +84,8 @@ impl FastPathSizes {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn write_fields(
-    buf: &mut BytesMut,
+fn write_fields<B: BufMut>(
+    buf: &mut B,
     name: &Name,
     freshness: Option<Duration>,
     final_block_id: Option<&Bytes>,
@@ -240,6 +240,87 @@ impl DataBuilder {
         debug_assert_eq!(buf.len(), header_size + inner_size, "total size mismatch");
 
         buf.freeze()
+    }
+
+    /// Exact wire size of the `DigestSha256` Data this builder would produce, so
+    /// a caller can reserve an exact buffer (e.g. an SHM ring slot) and encode
+    /// into it with **zero allocations** via [`encode_digest_sha256_into`].
+    ///
+    /// [`encode_digest_sha256_into`]: Self::encode_digest_sha256_into
+    #[cfg(feature = "std")]
+    pub fn encoded_len_digest_sha256(&self) -> usize {
+        use ndn_tlv::varu64_size;
+        const SIGVALUE: usize = 34;
+        let sz = FastPathSizes::compute(
+            &self.name,
+            self.freshness,
+            self.final_block_id.as_ref(),
+            self.content_type,
+            &self.content,
+        );
+        let inner_size =
+            sz.name_tlv + sz.metainfo_tlv + sz.content_tlv + SIGINFO_DIGEST_SHA256.len() + SIGVALUE;
+        varu64_size(tlv_type::DATA) + varu64_size(inner_size as u64) + inner_size
+    }
+
+    /// Encode the `DigestSha256` Data **directly into `out`** with zero
+    /// allocations (the producer floor — e.g. encode straight into an SHM ring
+    /// slot via `SpscFace::send_with`). Returns the number of bytes written.
+    /// `out` must be at least [`encoded_len_digest_sha256`] bytes. Byte-identical
+    /// to [`sign_digest_sha256`]/[`build`].
+    ///
+    /// [`encoded_len_digest_sha256`]: Self::encoded_len_digest_sha256
+    /// [`sign_digest_sha256`]: Self::sign_digest_sha256
+    /// [`build`]: Self::build
+    #[cfg(feature = "std")]
+    pub fn encode_digest_sha256_into(self, out: &mut [u8]) -> usize {
+        use ndn_tlv::varu64_size;
+        const SIGVALUE: usize = 34;
+
+        let sz = FastPathSizes::compute(
+            &self.name,
+            self.freshness,
+            self.final_block_id.as_ref(),
+            self.content_type,
+            &self.content,
+        );
+        let signed_size =
+            sz.name_tlv + sz.metainfo_tlv + sz.content_tlv + SIGINFO_DIGEST_SHA256.len();
+        let inner_size = signed_size + SIGVALUE;
+        let header_size = varu64_size(tlv_type::DATA) + varu64_size(inner_size as u64);
+        let total = header_size + inner_size;
+        assert!(
+            out.len() >= total,
+            "encode_digest_sha256_into: buffer too small ({} < {total})",
+            out.len(),
+        );
+
+        // `&mut [u8]` is a `BufMut` cursor — same writes as the single-buffer
+        // path, straight into the caller's slot (no BytesMut allocation).
+        {
+            let mut cur: &mut [u8] = &mut out[..total];
+            put_vu(&mut cur, tlv_type::DATA);
+            put_vu(&mut cur, inner_size as u64);
+            write_fields(
+                &mut cur,
+                &self.name,
+                self.freshness,
+                self.final_block_id.as_ref(),
+                self.content_type,
+                &self.content,
+                &sz,
+            );
+            cur.put_slice(&SIGINFO_DIGEST_SHA256);
+        }
+
+        // SignatureValue = SHA-256 over the signed region, written in place.
+        let signed_start = header_size;
+        let signed_end = header_size + signed_size;
+        let hash = sha2::Sha256::digest(&out[signed_start..signed_end]);
+        out[signed_end] = 0x17;
+        out[signed_end + 1] = 0x20;
+        out[signed_end + 2..signed_end + 34].copy_from_slice(hash.as_ref());
+        total
     }
 
     /// Single-buffer fast path using BLAKE3 (`DigestBlake3`, type code 6).
@@ -548,6 +629,37 @@ mod tests {
         assert_eq!(mi.freshness_period, Some(Duration::from_secs(4)));
         assert!(mi.final_block_id.is_some());
         assert_eq!(data.content().map(|b| b.as_ref()), Some(b"inner".as_ref()));
+    }
+
+    #[test]
+    fn encode_into_matches_build_byte_for_byte() {
+        use crate::meta_info::ContentType;
+        // Identical builders each call (DataBuilder isn't Clone); zip → pairs.
+        let mk = || -> Vec<DataBuilder> {
+            vec![
+                DataBuilder::new("/test", b"hello"),
+                DataBuilder::new("/a/b/c", b""),
+                DataBuilder::new("/x", &[0xABu8; 5000]),
+                DataBuilder::new("/t", b"inner")
+                    .content_type(ContentType::Other(6))
+                    .freshness(Duration::from_secs(4))
+                    .final_block_id_typed_seg(2),
+            ]
+        };
+        for (a, b) in mk().into_iter().zip(mk()) {
+            let expected = a.build(); // the allocating single-buffer path
+            let len = b.encoded_len_digest_sha256();
+            let mut buf = vec![0u8; len];
+            let n = b.encode_digest_sha256_into(&mut buf);
+            assert_eq!(n, len, "encode_into returned len");
+            assert_eq!(len, expected.len(), "encoded_len matches build() len");
+            assert_eq!(
+                &buf[..n],
+                &expected[..],
+                "encode_into must be byte-identical to build()"
+            );
+            Data::decode(Bytes::copy_from_slice(&buf[..n])).expect("encode_into output decodes");
+        }
     }
 
     #[test]
