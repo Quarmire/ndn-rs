@@ -89,6 +89,10 @@ pub struct PacketDispatcher {
     /// when `Some`, a returning Data carrying an NDNLP congestion mark bumps the
     /// face's mark count, which a background source decays into `LinkSignals.congestion`.
     pub congestion_feedback: Option<Arc<ndn_strategy::CongestionFeedback>>,
+    /// G3 PathControl handler (opt-in). `None` = zero cost (one untaken branch + a
+    /// name probe only when set); when `Some`, a `PathControl` Interest is handled
+    /// in-transit (FIB rewrite / pipe lifecycle) instead of normal forwarding.
+    pub path_control: Option<Arc<crate::path_control::PathControlHandler>>,
     /// Which data-plane runtime to spawn. Default `Shared`.
     pub data_plane: DataPlane,
 }

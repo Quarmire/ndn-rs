@@ -120,6 +120,9 @@ pub struct EngineBuilder {
     rate_limit_hook: Option<crate::rate_limit_hook::SharedRateLimitHook>,
     /// When set, build the G1 congestion-feedback bridge (marks → `LinkSignals.congestion`).
     congestion_feedback: Option<ndn_strategy::CongestionConfig>,
+    /// When true (or observers present), install the G3 PathControl handler.
+    path_control: bool,
+    path_control_observers: Vec<Arc<dyn crate::path_control::PathControlObserver>>,
 }
 
 impl EngineBuilder {
@@ -144,7 +147,30 @@ impl EngineBuilder {
             runtime: default_runtime(),
             rate_limit_hook: None,
             congestion_feedback: None,
+            path_control: false,
+            path_control_observers: Vec::new(),
         }
+    }
+
+    /// Enable the **G3 PathControl handler**: a `PathControl` Interest is processed
+    /// in-transit (MAP-Me producer-mobility redirect + pipe lifecycle) instead of
+    /// normal forwarding. Off by default (zero data-path cost). The engine's
+    /// [`validator`](Self::validator) authorizes the FIB mutation — configure one for
+    /// production (an unvalidated handler trusts any signer, a prefix-hijack risk).
+    pub fn with_producer_mobility(mut self) -> Self {
+        self.path_control = true;
+        self
+    }
+
+    /// Register a [`PathControlObserver`](crate::path_control::PathControlObserver) for
+    /// pipe/session-lifecycle ops (`Teardown`/`Refresh`); implies the handler is enabled.
+    pub fn path_control_observer(
+        mut self,
+        observer: Arc<dyn crate::path_control::PathControlObserver>,
+    ) -> Self {
+        self.path_control = true;
+        self.path_control_observers.push(observer);
+        self
     }
 
     /// Enable the **G1 congestion-feedback loop**: returning Data that carry an
@@ -514,7 +540,7 @@ impl EngineBuilder {
             signals: Arc::clone(&signals),
             strategy_table: Arc::clone(&strategy_table),
             security: self.security,
-            validator: engine_validator,
+            validator: engine_validator.clone(),
             replay_guard: replay_guard.clone(),
             pipeline_tx: OnceLock::new(),
             require_local_validation: self.config.require_local_validation,
@@ -534,6 +560,18 @@ impl EngineBuilder {
             cancel.child_token(),
         );
         let _ = inner.discovery_ctx.set(Arc::clone(&discovery_ctx));
+
+        // G3: the PathControl handler (opt-in). The engine's validator authorizes the
+        // in-transit FIB mutation; observers receive pipe-lifecycle ops.
+        let path_control = if self.path_control {
+            Some(Arc::new(crate::path_control::PathControlHandler::new(
+                Arc::clone(&fib),
+                engine_validator.clone(),
+                std::mem::take(&mut self.path_control_observers),
+            )))
+        } else {
+            None
+        };
 
         let dispatcher = PacketDispatcher {
             face_table: Arc::clone(&face_table),
@@ -586,6 +624,7 @@ impl EngineBuilder {
             reflexive: Arc::clone(&reflexive),
             rate_limit: self.rate_limit_hook.clone(),
             congestion_feedback: congestion_fb,
+            path_control,
             data_plane: self.config.data_plane,
         };
 

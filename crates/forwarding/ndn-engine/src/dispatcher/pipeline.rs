@@ -197,6 +197,26 @@ impl PacketDispatcher {
     }
 
     async fn interest_pipeline(&self, ctx: PacketContext) {
+        // G3 PathControl fast path (opt-in): a control Interest that mutates per-hop
+        // FIB/session state in transit and walks onward — not normal forwarding, so
+        // it bypasses CS/PIT/strategy entirely. `None` ⇒ one untaken branch.
+        if let Some(handler) = &self.path_control
+            && let DecodedPacket::Interest(i) = &ctx.packet
+            && let Some(pc) = ndn_pathcontrol::PathControl::parse(&i.name)
+        {
+            if let Some(faces) = handler.decide(&pc, i, ctx.face_id).await {
+                for face in faces {
+                    self.enqueue_send(
+                        face,
+                        ctx.raw_bytes.clone(),
+                        crate::engine::EgressIntent::default(),
+                    )
+                    .await;
+                }
+            }
+            return;
+        }
+
         let ctx = match self.cs_lookup.process(ctx).await {
             Action::Continue(ctx) => ctx,
             Action::Satisfy(ctx) => {
