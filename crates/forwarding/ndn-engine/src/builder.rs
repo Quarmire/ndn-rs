@@ -123,6 +123,10 @@ pub struct EngineBuilder {
     /// When true (or observers present), install the G3 PathControl handler.
     path_control: bool,
     path_control_observers: Vec<Arc<dyn crate::path_control::PathControlObserver>>,
+    /// Custom PathControl authorizer; defaults to a `ValidatorAuthorizer` over the
+    /// engine validator (MAP-Me prefix trust). A node serving pipes too supplies an
+    /// authorizer that routes by op (signature for Redirect, pipe-key for Teardown).
+    path_authorizer: Option<Arc<dyn crate::path_control::PathAuthorizer>>,
 }
 
 impl EngineBuilder {
@@ -149,6 +153,7 @@ impl EngineBuilder {
             congestion_feedback: None,
             path_control: false,
             path_control_observers: Vec::new(),
+            path_authorizer: None,
         }
     }
 
@@ -170,6 +175,18 @@ impl EngineBuilder {
     ) -> Self {
         self.path_control = true;
         self.path_control_observers.push(observer);
+        self
+    }
+
+    /// Override the PathControl authorizer (default: a `ValidatorAuthorizer` over the
+    /// engine validator). Supply a composite to serve both MAP-Me (signature) and pipe
+    /// (membership) trust roots on one node. Implies the handler is enabled.
+    pub fn path_authorizer(
+        mut self,
+        authorizer: Arc<dyn crate::path_control::PathAuthorizer>,
+    ) -> Self {
+        self.path_control = true;
+        self.path_authorizer = Some(authorizer);
         self
     }
 
@@ -561,12 +578,20 @@ impl EngineBuilder {
         );
         let _ = inner.discovery_ctx.set(Arc::clone(&discovery_ctx));
 
-        // G3: the PathControl handler (opt-in). The engine's validator authorizes the
-        // in-transit FIB mutation; observers receive pipe-lifecycle ops.
+        // G3: the PathControl handler (opt-in). Authorization defaults to a
+        // ValidatorAuthorizer over the engine validator (MAP-Me prefix trust); a
+        // custom authorizer (e.g. a composite that also gates pipe Teardown by pipe
+        // membership) overrides it. Observers receive pipe-lifecycle ops.
         let path_control = if self.path_control {
+            let authorizer = self.path_authorizer.take().or_else(|| {
+                engine_validator.clone().map(|v| {
+                    Arc::new(crate::path_control::ValidatorAuthorizer(v))
+                        as Arc<dyn crate::path_control::PathAuthorizer>
+                })
+            });
             Some(Arc::new(crate::path_control::PathControlHandler::new(
                 Arc::clone(&fib),
-                engine_validator.clone(),
+                authorizer,
                 std::mem::take(&mut self.path_control_observers),
             )))
         } else {

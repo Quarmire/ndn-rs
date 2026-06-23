@@ -16,12 +16,39 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use ndn_packet::{Interest, Name};
 use ndn_pathcontrol::{PathControl, PathOp, SeqStore};
 use ndn_security::{InterestValidationOutcome, Validator};
 use ndn_transport::FaceId;
 
 use crate::fib::{Fib, FibNexthop};
+
+/// Pluggable **authorization** for a PathControl message — the seam that lets one
+/// primitive carry two trust roots. MAP-Me's `Redirect` is authorized by the prefix's
+/// signature ([`ValidatorAuthorizer`]); a pipe's `Teardown` is authorized by pipe
+/// *membership* (the pipe key, verified by `ndn-pipes` — a different root entirely).
+/// A node running both supplies an authorizer that routes by [`PathControl::op`].
+/// Returning `false` drops the message (fail closed).
+#[async_trait]
+pub trait PathAuthorizer: Send + Sync {
+    async fn authorize(&self, pc: &PathControl, interest: &Interest) -> bool;
+}
+
+/// The MAP-Me authorizer: a PathControl is authorized iff its Interest signature
+/// verifies against the forwarder's prefix trust (only a key the prefix trusts may
+/// rewrite its routes). The producer-mobility default.
+pub struct ValidatorAuthorizer(pub Arc<Validator>);
+
+#[async_trait]
+impl PathAuthorizer for ValidatorAuthorizer {
+    async fn authorize(&self, _pc: &PathControl, interest: &Interest) -> bool {
+        matches!(
+            self.0.validate_interest(interest).await,
+            InterestValidationOutcome::Valid
+        )
+    }
+}
 
 /// A consumer of pipe/session-lifecycle PathControl ops. `ndn-pipes` implements this
 /// so a `Teardown`/`Refresh` walking the path closes or extends the live pipe, without
@@ -39,22 +66,22 @@ pub trait PathControlObserver: Send + Sync {
 pub struct PathControlHandler {
     fib: Arc<Fib>,
     seq: SeqStore,
-    /// Authorizes the in-transit state mutation. `None` skips verification (trusted /
+    /// Authorizes the in-transit state mutation. `None` skips authorization (trusted /
     /// test deployments only) — a production handler must be built with one.
-    validator: Option<Arc<Validator>>,
+    authorizer: Option<Arc<dyn PathAuthorizer>>,
     observers: Vec<Arc<dyn PathControlObserver>>,
 }
 
 impl PathControlHandler {
     pub fn new(
         fib: Arc<Fib>,
-        validator: Option<Arc<Validator>>,
+        authorizer: Option<Arc<dyn PathAuthorizer>>,
         observers: Vec<Arc<dyn PathControlObserver>>,
     ) -> Self {
         Self {
             fib,
             seq: SeqStore::new(),
-            validator,
+            authorizer,
             observers,
         }
     }
@@ -68,14 +95,12 @@ impl PathControlHandler {
         interest: &Interest,
         in_face: FaceId,
     ) -> Option<Vec<FaceId>> {
-        // (1) Authorize: only a signature the prefix trusts may rewrite its routes.
-        if let Some(v) = &self.validator
-            && !matches!(
-                v.validate_interest(interest).await,
-                InterestValidationOutcome::Valid
-            )
+        // (1) Authorize via the pluggable trust root (prefix signature for MAP-Me,
+        // pipe membership for a pipe teardown). Unauthorized control is dropped.
+        if let Some(auth) = &self.authorizer
+            && !auth.authorize(pc, interest).await
         {
-            return None; // unauthenticated control — drop (anti prefix-hijack)
+            return None; // unauthorized control — drop (anti prefix-hijack / rogue teardown)
         }
 
         // (2) Loop/staleness guard: only strictly-newer sequences proceed.

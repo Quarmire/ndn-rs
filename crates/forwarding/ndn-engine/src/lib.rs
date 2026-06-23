@@ -56,7 +56,9 @@ pub use ndn_strategy::{LinkSignals, SignalStore, SignalView, SignalsTable};
 pub use ndn_runtime::{Runtime, Spawn};
 pub use enricher::ContextEnricher;
 pub use fib::{Fib, FibEntry, FibNexthop};
-pub use path_control::{PathControlHandler, PathControlObserver};
+pub use path_control::{
+    PathAuthorizer, PathControlHandler, PathControlObserver, ValidatorAuthorizer,
+};
 #[cfg(not(target_arch = "wasm32"))]
 pub use installable::{InstallableProtocol, PostBuildQueue};
 pub use replay_guard_config::ReplayGuardConfig;

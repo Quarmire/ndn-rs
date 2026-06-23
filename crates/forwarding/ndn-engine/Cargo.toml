@@ -37,6 +37,7 @@ ndn-store     = { workspace = true }
 ndn-strategy  = { workspace = true }
 ndn-signals-core = { workspace = true }  # the SignalSource trait only (concrete sources are downstream)
 ndn-pathcontrol = { workspace = true }   # G3 PathControl primitive (forwarder hook)
+async-trait   = { workspace = true }     # object-safe PathAuthorizer
 ndn-runtime   = { workspace = true }
 web-time      = { workspace = true }
 bytes         = { workspace = true, features = ["std"] }

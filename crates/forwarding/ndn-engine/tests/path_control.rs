@@ -188,3 +188,77 @@ async fn stale_sequence_is_dropped() {
 
     shutdown.shutdown().await;
 }
+
+// --- The *second* consumer: a pipe Teardown authorized by pipe MEMBERSHIP (the pipe
+// key carried in app-params), not the prefix Validator. Proves PathControl's pluggable
+// authorizer hosts ndn-pipes' trust root through the same primitive — no thesis crypto
+// touched. (Per the thesis, pipes use teardown-and-rebuild, not re-anchor.) ---
+
+/// Mimics ndn-pipes' membership check: a Teardown is authorized iff it carries the
+/// pipe key in its ApplicationParameters (whoever holds the pipe key is a member).
+struct PipeKeyAuthorizer {
+    pipe_key: bytes::Bytes,
+}
+#[async_trait::async_trait]
+impl ndn_engine::PathAuthorizer for PipeKeyAuthorizer {
+    async fn authorize(&self, pc: &PathControl, interest: &ndn_packet::Interest) -> bool {
+        pc.op == PathOp::Teardown && interest.app_parameters() == Some(&self.pipe_key)
+    }
+}
+
+#[derive(Default)]
+struct RecordingObserver {
+    torn: std::sync::Mutex<Vec<Name>>,
+}
+impl ndn_engine::PathControlObserver for RecordingObserver {
+    fn on_teardown(&self, target: &Name) {
+        self.torn.lock().unwrap().push(target.clone());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pipe_teardown_authorized_by_membership_not_signature() {
+    use ndn_pathcontrol::PathControl as PC;
+    let target = n("/pipe/p1");
+    let pipe_key = bytes::Bytes::from_static(b"the-pipe-key");
+
+    let observer = Arc::new(RecordingObserver::default());
+    let (f_in, h_in) = InProcFace::new_kind(FaceId(NEW), 64, FaceKind::Tcp);
+    let (f_b, h_b) = InProcFace::new_kind(FaceId(OLD), 64, FaceKind::Tcp);
+    let (engine, shutdown) = EngineBuilder::new(EngineConfig::default())
+        .path_authorizer(Arc::new(PipeKeyAuthorizer {
+            pipe_key: pipe_key.clone(),
+        }))
+        .path_control_observer(observer.clone())
+        .face(f_in)
+        .face(f_b)
+        .build()
+        .await
+        .unwrap();
+    engine.fib().add_nexthop(&target, FaceId(OLD), 0);
+
+    // Build an *unsigned* Teardown carrying the pipe key (membership credential).
+    let teardown = |seq: u64, key: &[u8]| {
+        InterestBuilder::new(PC::new(target.clone(), PathOp::Teardown, seq).to_name())
+            .app_parameters(key.to_vec())
+            .build()
+    };
+
+    // Wrong key ⇒ not a member ⇒ ignored.
+    h_in.send(teardown(1, b"wrong-key")).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(fib_faces(&engine, &target).await, vec![FaceId(OLD)], "rogue teardown ignored");
+    assert!(observer.torn.lock().unwrap().is_empty());
+
+    // Right key ⇒ member ⇒ pipe state torn down + observer fired + propagated.
+    h_in.send(teardown(2, &pipe_key)).await.unwrap();
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(2) && fib_faces(&engine, &target).await != Vec::<FaceId>::new() {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(fib_faces(&engine, &target).await.is_empty(), "membership teardown clears the route");
+    assert_eq!(observer.torn.lock().unwrap().as_slice(), std::slice::from_ref(&target), "observer notified");
+    assert!(recv_timeout(&h_b).await.is_some(), "teardown propagates along the path");
+
+    shutdown.shutdown().await;
+}
