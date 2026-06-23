@@ -8,7 +8,19 @@ license.workspace = true
 [package.metadata.scope]
 classification = "extension"
 
+[features]
+default = []
+# The signed-emitter side (producer mobility / pipe endpoint): build signed
+# PathControl Interests. Pulls ndn-packet + ndn-security; the parse/forward side
+# stays crypto-agnostic without it.
+sign = ["dep:ndn-packet", "dep:ndn-security"]
+
 [dependencies]
 ndn-foundation-types = { workspace = true, features = ["std"] }
 bytes = { workspace = true, features = ["std"] }
 dashmap = { workspace = true }
+ndn-packet = { workspace = true, optional = true, features = ["std"] }
+ndn-security = { workspace = true, optional = true }
+
+[dev-dependencies]
+ndn-security = { workspace = true }

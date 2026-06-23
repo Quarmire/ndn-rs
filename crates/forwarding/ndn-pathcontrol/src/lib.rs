@@ -150,6 +150,68 @@ impl SeqStore {
     }
 }
 
+/// Signed-emitter side (feature `sign`): build the signed PathControl Interest a
+/// producer (mobility) or a pipe endpoint (lifecycle) sends out its face.
+#[cfg(feature = "sign")]
+pub mod emit {
+    use crate::{PathControl, PathOp};
+    use bytes::Bytes;
+    use ndn_foundation_types::Name;
+    use ndn_packet::encode::InterestBuilder;
+    use ndn_security::{SignWith, Signer, TrustError};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Emits signed PathControl messages for one `target`, with a monotonic per-emitter
+    /// sequence number. Hold one per moving prefix / live pipe; on a point-of-attachment
+    /// change (mobility) or a close/keepalive (pipe), call the matching method and send
+    /// the returned Interest wire out your (new) face — the network walks and applies it.
+    pub struct PathControlEmitter {
+        target: Name,
+        signer: Arc<dyn Signer>,
+        seq: AtomicU64,
+    }
+
+    impl PathControlEmitter {
+        pub fn new(target: Name, signer: Arc<dyn Signer>) -> Self {
+            Self {
+                target,
+                signer,
+                seq: AtomicU64::new(0),
+            }
+        }
+
+        /// Build a signed message for `op` with the next sequence number. The signature
+        /// (the producer's key, over the name that carries op+seq) is what authorizes
+        /// the in-transit state mutation at each forwarder.
+        pub fn emit(&self, op: PathOp) -> Result<Bytes, TrustError> {
+            let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
+            let pc = PathControl::new(self.target.clone(), op, seq);
+            InterestBuilder::new(pc.to_name())
+                .app_parameters(Vec::new())
+                .sign_with_sync(self.signer.as_ref())
+        }
+
+        /// MAP-Me Interest Update — emit on a point-of-attachment change.
+        pub fn redirect(&self) -> Result<Bytes, TrustError> {
+            self.emit(PathOp::Redirect)
+        }
+        /// Tear down the pipe/session along its path.
+        pub fn teardown(&self) -> Result<Bytes, TrustError> {
+            self.emit(PathOp::Teardown)
+        }
+        /// Extend the pipe/session soft state (keepalive).
+        pub fn refresh(&self) -> Result<Bytes, TrustError> {
+            self.emit(PathOp::Refresh)
+        }
+
+        /// The last sequence number emitted.
+        pub fn current_seq(&self) -> u64 {
+            self.seq.load(Ordering::Relaxed)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,6 +253,31 @@ mod tests {
             let pc = PathControl::new(n("/x"), op, 1);
             assert_eq!(PathControl::parse(&pc.to_name()).unwrap().op, op);
         }
+    }
+
+    #[cfg(feature = "sign")]
+    #[test]
+    fn emitter_builds_parseable_signed_messages_with_rising_seq() {
+        use crate::emit::PathControlEmitter;
+        use ndn_security::signer::Ed25519Signer;
+        use std::sync::Arc;
+
+        let signer = Ed25519Signer::from_seed(&[3u8; 32], n("/alice/KEY/k1"));
+        let em = PathControlEmitter::new(n("/alice/video"), Arc::new(signer));
+
+        let wire = em.redirect().expect("emit redirect");
+        let interest = ndn_packet::Interest::decode(wire).expect("decode");
+        assert!(interest.sig_info().is_some(), "the IU must be signed");
+        let pc = PathControl::parse(&interest.name).expect("parse emitted IU");
+        assert_eq!(pc.target, n("/alice/video"));
+        assert_eq!(pc.op, PathOp::Redirect);
+        assert_eq!(pc.seq, 1);
+
+        // Sequence rises per emit; ops map correctly.
+        let teardown = em.teardown().unwrap();
+        let pc2 = PathControl::parse(&ndn_packet::Interest::decode(teardown).unwrap().name).unwrap();
+        assert_eq!(pc2.op, PathOp::Teardown);
+        assert_eq!(pc2.seq, 2);
     }
 
     #[test]
