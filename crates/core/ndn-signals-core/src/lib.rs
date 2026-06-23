@@ -168,6 +168,19 @@ pub trait SignalStore<F: Copy + Eq>: SignalView<F> {
     fn set_link(&self, face: F, signals: LinkSignals);
     fn set_node(&self, signals: NodeSignals);
     fn set_neighbor(&self, face: F, signals: NodeSignals);
+
+    /// **Field-merge** one face's link signals: apply `f` to the current value
+    /// (default if none yet) and store the result. Unlike [`set_link`](Self::set_link)
+    /// — which replaces the whole struct — this lets one source update *its* field
+    /// (e.g. the congestion bridge writes `congestion`) without clobbering another
+    /// source's (`rssi_dbm`, `observed_rtt_ms`). The default is a non-atomic
+    /// get-modify-set (correct on a single-threaded embedded store); a concurrent
+    /// store should override it to apply `f` atomically under the per-key lock.
+    fn update_link(&self, face: F, f: &mut dyn FnMut(&mut LinkSignals)) {
+        let mut signals = self.link(face).unwrap_or_default();
+        f(&mut signals);
+        self.set_link(face, signals);
+    }
 }
 
 /// A periodic source of cross-layer signals. The driver loop calls [`Self::poll`]

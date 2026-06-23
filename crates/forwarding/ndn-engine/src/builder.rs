@@ -118,6 +118,8 @@ pub struct EngineBuilder {
     replay_guard_override: Option<Option<Arc<ReplayGuard>>>,
     runtime: Arc<dyn Runtime>,
     rate_limit_hook: Option<crate::rate_limit_hook::SharedRateLimitHook>,
+    /// When set, build the G1 congestion-feedback bridge (marks → `LinkSignals.congestion`).
+    congestion_feedback: Option<ndn_strategy::CongestionConfig>,
 }
 
 impl EngineBuilder {
@@ -141,7 +143,30 @@ impl EngineBuilder {
             replay_guard_override: None,
             runtime: default_runtime(),
             rate_limit_hook: None,
+            congestion_feedback: None,
         }
+    }
+
+    /// Enable the **G1 congestion-feedback loop**: returning Data that carry an
+    /// NDNLPv2 congestion mark are decayed into per-face
+    /// [`LinkSignals::congestion`](ndn_strategy::LinkSignals), which the
+    /// `congestion-aware` strategy reads to steer Interests off a congesting upstream.
+    /// Off by default (zero data-path cost). Pair with egress marking on the relevant
+    /// faces (`FaceOption::CongestionMarking(true)`) and the `congestion-aware`
+    /// strategy on the namespace to close the loop.
+    pub fn with_congestion_feedback(mut self) -> Self {
+        self.congestion_feedback = Some(ndn_strategy::CongestionConfig::default());
+        self
+    }
+
+    /// As [`with_congestion_feedback`](Self::with_congestion_feedback) with explicit
+    /// classification/decay tuning.
+    pub fn with_congestion_feedback_config(
+        mut self,
+        cfg: ndn_strategy::CongestionConfig,
+    ) -> Self {
+        self.congestion_feedback = Some(cfg);
+        self
     }
 
     /// Install a rate-limit hook consulted after `TlvDecodeStage` (inbound)
@@ -385,6 +410,16 @@ impl EngineBuilder {
             });
         }
 
+        // G1: build the congestion-feedback bridge (opt-in). The source is driven by
+        // the signal driver below; the feedback handle is given to the dispatcher.
+        let congestion_fb = if let Some(cfg) = self.congestion_feedback {
+            let (fb, source) = ndn_strategy::congestion_feedback(cfg);
+            self.signal_sources.push(Box::new(source));
+            Some(Arc::new(fb))
+        } else {
+            None
+        };
+
         if !self.signal_sources.is_empty() {
             let sources = std::mem::take(&mut self.signal_sources);
             let signals_clone = Arc::clone(&signals);
@@ -550,6 +585,7 @@ impl EngineBuilder {
             discovery_ctx: Arc::clone(&discovery_ctx),
             reflexive: Arc::clone(&reflexive),
             rate_limit: self.rate_limit_hook.clone(),
+            congestion_feedback: congestion_fb,
             data_plane: self.config.data_plane,
         };
 

@@ -134,6 +134,19 @@ impl SignalStore<FaceId> for SignalsTable {
             self.neighbor.lock().unwrap().insert(face, signals);
         }
     }
+
+    fn update_link(&self, face: FaceId, f: &mut dyn FnMut(&mut LinkSignals)) {
+        // Atomic field-merge under the per-key lock — so the congestion bridge and a
+        // RSSI source can update disjoint fields of the same face without clobbering.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            f(self.link.entry(face).or_default().value_mut());
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            f(self.link.lock().unwrap().entry(face).or_default());
+        }
+    }
 }
 
 #[cfg(test)]

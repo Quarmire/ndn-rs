@@ -6,6 +6,7 @@
 #![allow(missing_docs)]
 
 pub mod best_route;
+pub mod congestion;
 pub mod congestion_aware;
 pub mod context;
 pub mod erased;
@@ -20,6 +21,7 @@ pub mod signals;
 pub mod strategy;
 
 pub use best_route::BestRouteStrategy;
+pub use congestion::{CongestionConfig, CongestionFeedback, CongestionSource, congestion_feedback};
 pub use congestion_aware::CongestionAwareStrategy;
 pub use context::{DataLocation, FibEntry, FibNexthop, PrevHopLocation, StrategyContext};
 pub use erased::ErasedStrategy;

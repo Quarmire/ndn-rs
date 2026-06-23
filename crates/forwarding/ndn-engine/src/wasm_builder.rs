@@ -347,6 +347,9 @@ impl WasmEngineBuilder {
             discovery_ctx: Arc::clone(&discovery_ctx),
             reflexive: Arc::clone(&reflexive),
             rate_limit: self.rate_limit_hook.clone(),
+            // wasm drives no signal sources, so the congestion-feedback bridge (which
+            // decays via a polled source) has nothing to run it — not wired here.
+            congestion_feedback: None,
             // wasm is single-threaded: the partitioned runtime never applies.
             data_plane: crate::dispatcher::DataPlane::Shared,
         };

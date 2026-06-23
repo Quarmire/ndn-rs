@@ -85,6 +85,10 @@ pub struct PacketDispatcher {
     /// `None` is the zero-cost path: every probe site short-circuits on
     /// `Option::is_none`, so the per-packet cost is one untaken branch.
     pub rate_limit: Option<crate::rate_limit_hook::SharedRateLimitHook>,
+    /// G1 congestion-feedback bridge (opt-in). `None` = zero cost on the data path;
+    /// when `Some`, a returning Data carrying an NDNLP congestion mark bumps the
+    /// face's mark count, which a background source decays into `LinkSignals.congestion`.
+    pub congestion_feedback: Option<Arc<ndn_strategy::CongestionFeedback>>,
     /// Which data-plane runtime to spawn. Default `Shared`.
     pub data_plane: DataPlane,
 }

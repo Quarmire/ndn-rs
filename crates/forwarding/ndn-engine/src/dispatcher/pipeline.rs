@@ -418,6 +418,16 @@ impl PacketDispatcher {
     }
 
     async fn data_pipeline(&self, ctx: PacketContext) {
+        // G1 congestion bridge (opt-in; `None` ⇒ one untaken branch). A returning
+        // Data carrying an NDNLP congestion mark means the link it arrived over is
+        // congesting; record it for the per-face signal the strategy reads. Done
+        // before PIT match so a mark counts as link-level info regardless of routing.
+        if let Some(fb) = &self.congestion_feedback
+            && ctx.tags.get::<crate::stages::decode::CongestionMark>().is_some()
+        {
+            fb.observe(ctx.face_id);
+        }
+
         let ctx = match self.pit_match.process(ctx) {
             Action::Continue(ctx) => ctx,
             Action::Drop(r) => {
