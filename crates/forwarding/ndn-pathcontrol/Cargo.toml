@@ -1,0 +1,14 @@
+[package]
+name = "ndn-pathcontrol"
+description = "PathControl: a signed, sequence-numbered, loop-safe control Interest that walks a path mutating per-hop forwarding/session state. The shared primitive under MAP-Me producer mobility (redirect) and pipe lifecycle (teardown/refresh) — G3."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+classification = "extension"
+
+[dependencies]
+ndn-foundation-types = { workspace = true, features = ["std"] }
+bytes = { workspace = true, features = ["std"] }
+dashmap = { workspace = true }
