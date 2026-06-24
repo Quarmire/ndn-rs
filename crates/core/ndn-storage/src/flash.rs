@@ -35,7 +35,7 @@
 //! flash adds durability across power loss. For datasets that exceed RAM, a future
 //! offset-indexed variant would read values back from flash.
 
-use crate::{SyncBackend, WriteOp};
+use crate::{StorageError, StorageResult, SyncBackend, WriteOp};
 use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -66,6 +66,23 @@ pub enum FlashError {
     OutOfSpace,
     /// The underlying flash returned an error.
     Io,
+}
+
+impl core::fmt::Display for FlashError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let s = match self {
+            FlashError::Unformatted => "flash region is unformatted",
+            FlashError::OutOfSpace => "flash region out of space",
+            FlashError::Io => "flash I/O error",
+        };
+        f.write_str(s)
+    }
+}
+
+impl From<FlashError> for StorageError {
+    fn from(e: FlashError) -> Self {
+        StorageError::backend(e)
+    }
 }
 
 fn align_up(n: u32, a: u32) -> u32 {
@@ -350,20 +367,21 @@ impl<F: NorFlash> FlashState<F> {
     }
 
     /// Append then apply to the index (consistent: index updates only if flash wrote).
-    fn commit(&mut self, ops: Vec<WriteOp>) {
-        if self.append(&ops).is_ok() {
-            for op in ops {
-                match op {
-                    WriteOp::Put(k, v) => {
-                        self.index.insert(k, v);
-                    }
-                    WriteOp::Delete(k) => {
-                        self.index.remove(&k);
-                    }
+    /// On a flash failure the index is left unchanged and the error is returned (the
+    /// caller learns the write did not land — durability over silent drift).
+    fn commit(&mut self, ops: Vec<WriteOp>) -> Result<(), FlashError> {
+        self.append(&ops)?;
+        for op in ops {
+            match op {
+                WriteOp::Put(k, v) => {
+                    self.index.insert(k, v);
+                }
+                WriteOp::Delete(k) => {
+                    self.index.remove(&k);
                 }
             }
         }
-        // On flash failure the index is left unchanged (durability over silent drift).
+        Ok(())
     }
 }
 
@@ -454,17 +472,21 @@ impl<F: NorFlash> FlashLogBackend<F> {
 }
 
 impl<F: NorFlash + Send> SyncBackend for FlashLogBackend<F> {
-    fn get(&self, key: &[u8]) -> Option<Bytes> {
-        self.with(|s| s.index.get(key).cloned())
+    fn get(&self, key: &[u8]) -> StorageResult<Option<Bytes>> {
+        // The index is the authoritative RAM view (the log was replayed into it on
+        // mount); a lookup can't fail, so a miss is a genuine `Ok(None)`.
+        Ok(self.with(|s| s.index.get(key).cloned()))
     }
-    fn put(&self, key: &[u8], value: Bytes) {
-        self.with(|s| s.commit(vec![WriteOp::Put(key.to_vec(), value)]));
+    fn put(&self, key: &[u8], value: Bytes) -> StorageResult<()> {
+        self.with(|s| s.commit(vec![WriteOp::Put(key.to_vec(), value)]))?;
+        Ok(())
     }
-    fn delete(&self, key: &[u8]) {
-        self.with(|s| s.commit(vec![WriteOp::Delete(key.to_vec())]));
+    fn delete(&self, key: &[u8]) -> StorageResult<()> {
+        self.with(|s| s.commit(vec![WriteOp::Delete(key.to_vec())]))?;
+        Ok(())
     }
-    fn scan_prefix(&self, prefix: &[u8], limit: usize) -> Vec<(Bytes, Bytes)> {
-        self.with(|s| {
+    fn scan_prefix(&self, prefix: &[u8], limit: usize) -> StorageResult<Vec<(Bytes, Bytes)>> {
+        Ok(self.with(|s| {
             let mut out = Vec::new();
             for (k, v) in s.index.range(prefix.to_vec()..) {
                 if !k.starts_with(prefix) {
@@ -476,11 +498,12 @@ impl<F: NorFlash + Send> SyncBackend for FlashLogBackend<F> {
                 }
             }
             out
-        })
+        }))
     }
-    fn write_batch(&self, ops: Vec<WriteOp>) {
+    fn write_batch(&self, ops: Vec<WriteOp>) -> StorageResult<()> {
         // One framed flash record ⇒ power-loss-atomic across the whole group.
-        self.with(|s| s.commit(ops));
+        self.with(|s| s.commit(ops))?;
+        Ok(())
     }
     fn name(&self) -> &'static str {
         "flash"
@@ -553,19 +576,20 @@ mod tests {
     #[test]
     fn put_get_scan_delete_round_trip() {
         let f = FlashLogBackend::format(MockFlash::new(4096)).unwrap();
-        f.put(b"/a/b", Bytes::from_static(b"v-ab"));
-        f.put(b"/a/c", Bytes::from_static(b"v-ac"));
-        f.put(b"/z", Bytes::from_static(b"v-z"));
-        assert_eq!(f.get(b"/a/b").as_deref(), Some(&b"v-ab"[..]));
+        f.put(b"/a/b", Bytes::from_static(b"v-ab")).unwrap();
+        f.put(b"/a/c", Bytes::from_static(b"v-ac")).unwrap();
+        f.put(b"/z", Bytes::from_static(b"v-z")).unwrap();
+        assert_eq!(f.get(b"/a/b").unwrap().as_deref(), Some(&b"v-ab"[..]));
         let under: Vec<_> = f
             .scan_prefix(b"/a", 0)
+            .unwrap()
             .into_iter()
             .map(|(k, _)| k)
             .collect();
         assert_eq!(under, vec![Bytes::from_static(b"/a/b"), Bytes::from_static(b"/a/c")]);
-        f.delete(b"/a/b");
-        assert!(f.get(b"/a/b").is_none());
-        assert_eq!(f.get(b"/a/c").as_deref(), Some(&b"v-ac"[..]));
+        f.delete(b"/a/b").unwrap();
+        assert!(f.get(b"/a/b").unwrap().is_none());
+        assert_eq!(f.get(b"/a/c").unwrap().as_deref(), Some(&b"v-ac"[..]));
     }
 
     #[test]
@@ -573,19 +597,20 @@ mod tests {
         // Write, then snapshot the raw flash bytes (simulating a power cycle).
         let flash = {
             let f = FlashLogBackend::format(MockFlash::new(4096)).unwrap();
-            f.put(b"k1", Bytes::from_static(b"v1"));
+            f.put(b"k1", Bytes::from_static(b"v1")).unwrap();
             f.write_batch(vec![
                 WriteOp::Put(b"k2".to_vec(), Bytes::from_static(b"v2")),
                 WriteOp::Delete(b"k1".to_vec()),
-            ]);
+            ])
+            .unwrap();
             f.with(|s| MockFlash {
                 data: s.flash.data.clone(),
             })
         };
         // Remount the persisted bytes — the log replays into the index.
         let f = FlashLogBackend::mount(flash).unwrap();
-        assert!(f.get(b"k1").is_none(), "delete persisted");
-        assert_eq!(f.get(b"k2").as_deref(), Some(&b"v2"[..]), "batch put persisted");
+        assert!(f.get(b"k1").unwrap().is_none(), "delete persisted");
+        assert_eq!(f.get(b"k2").unwrap().as_deref(), Some(&b"v2"[..]), "batch put persisted");
     }
 
     #[test]
@@ -594,10 +619,10 @@ mod tests {
         // keep working (the live set is tiny).
         let f = FlashLogBackend::format(MockFlash::new(512)).unwrap();
         for i in 0..200u32 {
-            f.put(b"counter", Bytes::copy_from_slice(&i.to_le_bytes()));
+            f.put(b"counter", Bytes::copy_from_slice(&i.to_le_bytes())).unwrap();
         }
         assert_eq!(
-            f.get(b"counter").as_deref(),
+            f.get(b"counter").unwrap().as_deref(),
             Some(&199u32.to_le_bytes()[..]),
             "latest value survives many compactions"
         );
@@ -611,18 +636,18 @@ mod tests {
         let snapshot = {
             let f = FlashLogBackend::format(MockFlash::new(512)).unwrap();
             for i in 0..200u32 {
-                f.put(b"counter", Bytes::copy_from_slice(&i.to_le_bytes()));
+                f.put(b"counter", Bytes::copy_from_slice(&i.to_le_bytes())).unwrap();
             }
-            f.put(b"stable", Bytes::from_static(b"keep"));
+            f.put(b"stable", Bytes::from_static(b"keep")).unwrap();
             f.with(|s| s.flash.data.clone())
         };
         let f = FlashLogBackend::mount(MockFlash { data: snapshot }).unwrap();
         assert_eq!(
-            f.get(b"counter").as_deref(),
+            f.get(b"counter").unwrap().as_deref(),
             Some(&199u32.to_le_bytes()[..]),
             "remount lands on the latest generation"
         );
-        assert_eq!(f.get(b"stable").as_deref(), Some(&b"keep"[..]));
+        assert_eq!(f.get(b"stable").unwrap().as_deref(), Some(&b"keep"[..]));
     }
 
     #[test]
@@ -633,8 +658,8 @@ mod tests {
         // replaced by the half-written one.
         let snapshot = {
             let f = FlashLogBackend::format(MockFlash::new(512)).unwrap();
-            f.put(b"k1", Bytes::from_static(b"v1"));
-            f.put(b"k2", Bytes::from_static(b"v2"));
+            f.put(b"k1", Bytes::from_static(b"v1")).unwrap();
+            f.put(b"k2", Bytes::from_static(b"v2")).unwrap();
             f.with(|s| s.flash.data.clone())
         };
         // Forge an *uncommitted* compaction into half B: a record that would overwrite k1
@@ -652,11 +677,11 @@ mod tests {
 
         let f = FlashLogBackend::mount(MockFlash { data }).unwrap();
         assert_eq!(
-            f.get(b"k1").as_deref(),
+            f.get(b"k1").unwrap().as_deref(),
             Some(&b"v1"[..]),
             "the uncommitted half is ignored — k1 keeps its committed value"
         );
-        assert_eq!(f.get(b"k2").as_deref(), Some(&b"v2"[..]));
+        assert_eq!(f.get(b"k2").unwrap().as_deref(), Some(&b"v2"[..]));
     }
 
     #[test]

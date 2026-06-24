@@ -70,30 +70,63 @@ pub enum WriteOp {
     Delete(Vec<u8>),
 }
 
+/// A storage-engine failure. Returned by every fallible [`Backend`]/[`SyncBackend`]
+/// operation so a real engine error (disk I/O, a failed transaction, exhausted flash)
+/// is **surfaced** to the caller rather than silently collapsing into "miss" / "no-op".
+/// A genuine absence is `Ok(None)` — only an actual fault is `Err`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StorageError {
+    /// The underlying engine failed; carries its diagnostic message.
+    Backend(alloc::string::String),
+}
+
+impl StorageError {
+    /// Wrap an engine error (anything `Display`) as a [`StorageError::Backend`].
+    pub fn backend(e: impl core::fmt::Display) -> Self {
+        use alloc::string::ToString;
+        StorageError::Backend(e.to_string())
+    }
+}
+
+impl core::fmt::Display for StorageError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            StorageError::Backend(m) => write!(f, "storage backend error: {m}"),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for StorageError {}
+
+/// Result of a fallible storage operation.
+pub type StorageResult<T> = core::result::Result<T, StorageError>;
+
 /// An ordered byte key→value store. Keys sort lexicographically, so a parent
 /// byte-prefix precedes all its descendants — making prefix/range scans the
 /// primitive for "CanBePrefix" lookups and "last-N under a name".
 #[cfg(feature = "std")]
 #[async_trait]
 pub trait Backend: Send + Sync {
-    /// Fetch the value stored under `key`.
-    async fn get(&self, key: Vec<u8>) -> Option<Bytes>;
+    /// Fetch the value stored under `key`. `Ok(None)` is a genuine miss; `Err` is an
+    /// engine failure (the two are no longer conflated).
+    async fn get(&self, key: Vec<u8>) -> StorageResult<Option<Bytes>>;
 
     /// Store `value` under `key` (overwriting any existing value).
-    async fn put(&self, key: Vec<u8>, value: Bytes);
+    async fn put(&self, key: Vec<u8>, value: Bytes) -> StorageResult<()>;
 
     /// Remove `key` if present.
-    async fn delete(&self, key: Vec<u8>);
+    async fn delete(&self, key: Vec<u8>) -> StorageResult<()>;
 
     /// `(key, value)` pairs whose key starts with `prefix`, in ascending key order,
     /// at most `limit` (0 = unlimited). Owned, so the result moves cleanly across a
     /// `spawn_blocking` boundary.
-    async fn scan_prefix(&self, prefix: Vec<u8>, limit: usize) -> Vec<(Bytes, Bytes)>;
+    async fn scan_prefix(&self, prefix: Vec<u8>, limit: usize) -> StorageResult<Vec<(Bytes, Bytes)>>;
 
     /// The lexicographically-smallest `(key, value)` whose key starts with `prefix`
     /// (a `CanBePrefix` lookup). Default: first of [`scan_prefix`](Self::scan_prefix).
-    async fn first_under(&self, prefix: Vec<u8>) -> Option<(Bytes, Bytes)> {
-        self.scan_prefix(prefix, 1).await.into_iter().next()
+    async fn first_under(&self, prefix: Vec<u8>) -> StorageResult<Option<(Bytes, Bytes)>> {
+        Ok(self.scan_prefix(prefix, 1).await?.into_iter().next())
     }
 
     /// Apply all `ops` **atomically** (all-or-nothing) and amortize the durability
@@ -101,13 +134,14 @@ pub trait Backend: Send + Sync {
     /// engines with a native batch/transaction (`MemoryBackend`, `FjallBackend`,
     /// `RedbBackend`) override this for real atomicity. Also the efficient path for
     /// bulk/write-behind flushing.
-    async fn write_batch(&self, ops: Vec<WriteOp>) {
+    async fn write_batch(&self, ops: Vec<WriteOp>) -> StorageResult<()> {
         for op in ops {
             match op {
-                WriteOp::Put(k, v) => self.put(k, v).await,
-                WriteOp::Delete(k) => self.delete(k).await,
+                WriteOp::Put(k, v) => self.put(k, v).await?,
+                WriteOp::Delete(k) => self.delete(k).await?,
             }
         }
+        Ok(())
     }
 
     /// Short, low-cardinality engine label (`"memory"` / `"fjall"` / `"redb"`) for
@@ -142,16 +176,18 @@ impl MemoryBackend {
 #[cfg(feature = "std")]
 #[async_trait]
 impl Backend for MemoryBackend {
-    async fn get(&self, key: Vec<u8>) -> Option<Bytes> {
-        self.map.read().unwrap().get(&key).cloned()
+    async fn get(&self, key: Vec<u8>) -> StorageResult<Option<Bytes>> {
+        Ok(self.map.read().unwrap().get(&key).cloned())
     }
-    async fn put(&self, key: Vec<u8>, value: Bytes) {
+    async fn put(&self, key: Vec<u8>, value: Bytes) -> StorageResult<()> {
         self.map.write().unwrap().insert(key, value);
+        Ok(())
     }
-    async fn delete(&self, key: Vec<u8>) {
+    async fn delete(&self, key: Vec<u8>) -> StorageResult<()> {
         self.map.write().unwrap().remove(&key);
+        Ok(())
     }
-    async fn scan_prefix(&self, prefix: Vec<u8>, limit: usize) -> Vec<(Bytes, Bytes)> {
+    async fn scan_prefix(&self, prefix: Vec<u8>, limit: usize) -> StorageResult<Vec<(Bytes, Bytes)>> {
         let map = self.map.read().unwrap();
         let mut out = Vec::new();
         for (k, v) in map.range(prefix.clone()..) {
@@ -163,9 +199,9 @@ impl Backend for MemoryBackend {
                 break;
             }
         }
-        out
+        Ok(out)
     }
-    async fn write_batch(&self, ops: Vec<WriteOp>) {
+    async fn write_batch(&self, ops: Vec<WriteOp>) -> StorageResult<()> {
         // Atomic: one lock for the whole batch.
         let mut map = self.map.write().unwrap();
         for op in ops {
@@ -178,6 +214,7 @@ impl Backend for MemoryBackend {
                 }
             }
         }
+        Ok(())
     }
     fn name(&self) -> &'static str {
         "memory"
@@ -221,7 +258,7 @@ impl<B: Backend> Instrumented<B> {
 #[cfg(feature = "std")]
 #[async_trait]
 impl<B: Backend> Backend for Instrumented<B> {
-    async fn get(&self, key: Vec<u8>) -> Option<Bytes> {
+    async fn get(&self, key: Vec<u8>) -> StorageResult<Option<Bytes>> {
         use tracing::{Instrument, field::Empty};
         let span = tracing::trace_span!(
             "ndn_storage.get",
@@ -229,20 +266,28 @@ impl<B: Backend> Backend for Instrumented<B> {
             key_len = key.len(),
             hit = Empty,
             bytes = Empty,
+            error = Empty,
         );
         async {
             let r = self.inner.get(key).await;
             let s = tracing::Span::current();
-            s.record("hit", r.is_some());
-            if let Some(b) = &r {
-                s.record("bytes", b.len());
+            match &r {
+                Ok(v) => {
+                    s.record("hit", v.is_some());
+                    if let Some(b) = v {
+                        s.record("bytes", b.len());
+                    }
+                }
+                Err(e) => {
+                    s.record("error", tracing::field::display(e));
+                }
             }
             r
         }
         .instrument(span)
         .await
     }
-    async fn put(&self, key: Vec<u8>, value: Bytes) {
+    async fn put(&self, key: Vec<u8>, value: Bytes) -> StorageResult<()> {
         use tracing::Instrument;
         let span = tracing::trace_span!(
             "ndn_storage.put",
@@ -252,7 +297,7 @@ impl<B: Backend> Backend for Instrumented<B> {
         );
         self.inner.put(key, value).instrument(span).await
     }
-    async fn delete(&self, key: Vec<u8>) {
+    async fn delete(&self, key: Vec<u8>) -> StorageResult<()> {
         use tracing::Instrument;
         let span = tracing::trace_span!(
             "ndn_storage.delete",
@@ -261,7 +306,7 @@ impl<B: Backend> Backend for Instrumented<B> {
         );
         self.inner.delete(key).instrument(span).await
     }
-    async fn scan_prefix(&self, prefix: Vec<u8>, limit: usize) -> Vec<(Bytes, Bytes)> {
+    async fn scan_prefix(&self, prefix: Vec<u8>, limit: usize) -> StorageResult<Vec<(Bytes, Bytes)>> {
         use tracing::{Instrument, field::Empty};
         let span = tracing::trace_span!(
             "ndn_storage.scan_prefix",
@@ -270,18 +315,26 @@ impl<B: Backend> Backend for Instrumented<B> {
             limit,
             count = Empty,
             bytes = Empty,
+            error = Empty,
         );
         async {
             let r = self.inner.scan_prefix(prefix, limit).await;
             let s = tracing::Span::current();
-            s.record("count", r.len());
-            s.record("bytes", r.iter().map(|(_, v)| v.len()).sum::<usize>());
+            match &r {
+                Ok(rows) => {
+                    s.record("count", rows.len());
+                    s.record("bytes", rows.iter().map(|(_, v)| v.len()).sum::<usize>());
+                }
+                Err(e) => {
+                    s.record("error", tracing::field::display(e));
+                }
+            }
             r
         }
         .instrument(span)
         .await
     }
-    async fn first_under(&self, prefix: Vec<u8>) -> Option<(Bytes, Bytes)> {
+    async fn first_under(&self, prefix: Vec<u8>) -> StorageResult<Option<(Bytes, Bytes)>> {
         use tracing::{Instrument, field::Empty};
         let span = tracing::trace_span!(
             "ndn_storage.first_under",
@@ -291,13 +344,15 @@ impl<B: Backend> Backend for Instrumented<B> {
         );
         async {
             let r = self.inner.first_under(prefix).await;
-            tracing::Span::current().record("hit", r.is_some());
+            if let Ok(v) = &r {
+                tracing::Span::current().record("hit", v.is_some());
+            }
             r
         }
         .instrument(span)
         .await
     }
-    async fn write_batch(&self, ops: Vec<WriteOp>) {
+    async fn write_batch(&self, ops: Vec<WriteOp>) -> StorageResult<()> {
         use tracing::Instrument;
         let (mut puts, mut dels, mut bytes) = (0usize, 0usize, 0usize);
         for op in &ops {
@@ -338,30 +393,34 @@ mod sync {
     ///
     /// Keys are **borrowed** (`&[u8]`) — there is no thread-hop boundary to own them
     /// across, so the sync core avoids the per-call allocation the async trait needs.
+    use super::StorageResult;
+
     pub trait SyncBackend: Send + Sync {
-        /// Fetch the value stored under `key`.
-        fn get(&self, key: &[u8]) -> Option<Bytes>;
+        /// Fetch the value stored under `key`. `Ok(None)` is a genuine miss; `Err` is an
+        /// engine failure.
+        fn get(&self, key: &[u8]) -> StorageResult<Option<Bytes>>;
         /// Store `value` under `key` (overwriting any existing value).
-        fn put(&self, key: &[u8], value: Bytes);
+        fn put(&self, key: &[u8], value: Bytes) -> StorageResult<()>;
         /// Remove `key` if present.
-        fn delete(&self, key: &[u8]);
+        fn delete(&self, key: &[u8]) -> StorageResult<()>;
         /// `(key, value)` pairs whose key starts with `prefix`, ascending, at most
         /// `limit` (0 = unlimited).
-        fn scan_prefix(&self, prefix: &[u8], limit: usize) -> Vec<(Bytes, Bytes)>;
+        fn scan_prefix(&self, prefix: &[u8], limit: usize) -> StorageResult<Vec<(Bytes, Bytes)>>;
         /// Lexicographically-smallest `(key, value)` under `prefix` (a `CanBePrefix`
         /// lookup). Default: first of [`scan_prefix`](Self::scan_prefix).
-        fn first_under(&self, prefix: &[u8]) -> Option<(Bytes, Bytes)> {
-            self.scan_prefix(prefix, 1).into_iter().next()
+        fn first_under(&self, prefix: &[u8]) -> StorageResult<Option<(Bytes, Bytes)>> {
+            Ok(self.scan_prefix(prefix, 1)?.into_iter().next())
         }
         /// Apply `ops` as a group. Default: sequential, **not** atomic; engines with a
         /// native batch override for atomicity.
-        fn write_batch(&self, ops: Vec<WriteOp>) {
+        fn write_batch(&self, ops: Vec<WriteOp>) -> StorageResult<()> {
             for op in ops {
                 match op {
-                    WriteOp::Put(k, v) => self.put(&k, v),
-                    WriteOp::Delete(k) => self.delete(&k),
+                    WriteOp::Put(k, v) => self.put(&k, v)?,
+                    WriteOp::Delete(k) => self.delete(&k)?,
                 }
             }
+            Ok(())
         }
         /// Short, low-cardinality engine label for telemetry.
         fn name(&self) -> &'static str {
@@ -426,17 +485,19 @@ mod sync {
 
     #[cfg(feature = "sync")]
     impl SyncBackend for SyncMemoryBackend {
-        fn get(&self, key: &[u8]) -> Option<Bytes> {
-            self.with_map(|m| m.get(key).cloned())
+        fn get(&self, key: &[u8]) -> StorageResult<Option<Bytes>> {
+            Ok(self.with_map(|m| m.get(key).cloned()))
         }
-        fn put(&self, key: &[u8], value: Bytes) {
+        fn put(&self, key: &[u8], value: Bytes) -> StorageResult<()> {
             self.with_map(|m| m.insert(key.to_vec(), value));
+            Ok(())
         }
-        fn delete(&self, key: &[u8]) {
+        fn delete(&self, key: &[u8]) -> StorageResult<()> {
             self.with_map(|m| m.remove(key));
+            Ok(())
         }
-        fn scan_prefix(&self, prefix: &[u8], limit: usize) -> Vec<(Bytes, Bytes)> {
-            self.with_map(|m| {
+        fn scan_prefix(&self, prefix: &[u8], limit: usize) -> StorageResult<Vec<(Bytes, Bytes)>> {
+            Ok(self.with_map(|m| {
                 let mut out = Vec::new();
                 for (k, v) in m.range(prefix.to_vec()..) {
                     if !k.starts_with(prefix) {
@@ -448,9 +509,9 @@ mod sync {
                     }
                 }
                 out
-            })
+            }))
         }
-        fn write_batch(&self, ops: Vec<WriteOp>) {
+        fn write_batch(&self, ops: Vec<WriteOp>) -> StorageResult<()> {
             // Atomic: the whole group under one lock / critical section.
             self.with_map(|m| {
                 for op in ops {
@@ -464,6 +525,7 @@ mod sync {
                     }
                 }
             });
+            Ok(())
         }
         fn name(&self) -> &'static str {
             "sync-memory"
@@ -495,19 +557,19 @@ mod sync {
     #[cfg(feature = "std")]
     #[super::async_trait]
     impl<S: SyncBackend> super::Backend for SyncAsAsync<S> {
-        async fn get(&self, key: Vec<u8>) -> Option<Bytes> {
+        async fn get(&self, key: Vec<u8>) -> StorageResult<Option<Bytes>> {
             self.inner.get(&key)
         }
-        async fn put(&self, key: Vec<u8>, value: Bytes) {
-            self.inner.put(&key, value);
+        async fn put(&self, key: Vec<u8>, value: Bytes) -> StorageResult<()> {
+            self.inner.put(&key, value)
         }
-        async fn delete(&self, key: Vec<u8>) {
-            self.inner.delete(&key);
+        async fn delete(&self, key: Vec<u8>) -> StorageResult<()> {
+            self.inner.delete(&key)
         }
-        async fn scan_prefix(&self, prefix: Vec<u8>, limit: usize) -> Vec<(Bytes, Bytes)> {
+        async fn scan_prefix(&self, prefix: Vec<u8>, limit: usize) -> StorageResult<Vec<(Bytes, Bytes)>> {
             self.inner.scan_prefix(&prefix, limit)
         }
-        async fn write_batch(&self, ops: Vec<WriteOp>) {
+        async fn write_batch(&self, ops: Vec<WriteOp>) -> StorageResult<()> {
             self.inner.write_batch(ops)
         }
         fn name(&self) -> &'static str {
@@ -526,7 +588,7 @@ pub use named::{
 /// `CanBePrefix` lookups are prefix scans.
 #[cfg(feature = "named")]
 mod named {
-    use super::{Backend, Bytes, WriteOp, async_trait};
+    use super::{Backend, Bytes, StorageResult, WriteOp, async_trait};
     use ndn_packet::Name;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -576,8 +638,8 @@ mod named {
             self.ops.is_empty()
         }
         /// Apply every step atomically (per routed store) against `store`.
-        pub async fn commit(self, store: &dyn NamedWriteStore) {
-            store.write_batch(self.ops).await;
+        pub async fn commit(self, store: &dyn NamedWriteStore) -> StorageResult<()> {
+            store.write_batch(self.ops).await
         }
     }
 
@@ -598,25 +660,26 @@ mod named {
     /// the name-addressed data plane.
     #[async_trait]
     pub trait NamedReadStore: Send + Sync {
-        async fn get(&self, name: &Name) -> Option<Bytes>;
-        async fn find_under(&self, prefix: &Name) -> Option<Bytes>;
-        async fn scan_under(&self, prefix: &Name, limit: usize) -> Vec<(Bytes, Bytes)>;
+        async fn get(&self, name: &Name) -> StorageResult<Option<Bytes>>;
+        async fn find_under(&self, prefix: &Name) -> StorageResult<Option<Bytes>>;
+        async fn scan_under(&self, prefix: &Name, limit: usize) -> StorageResult<Vec<(Bytes, Bytes)>>;
     }
 
     /// Object-safe **write** facet (write-behind retention + eviction).
     #[async_trait]
     pub trait NamedWriteStore: NamedReadStore {
-        async fn insert(&self, name: &Name, wire: Bytes);
-        async fn remove(&self, name: &Name);
+        async fn insert(&self, name: &Name, wire: Bytes) -> StorageResult<()>;
+        async fn remove(&self, name: &Name) -> StorageResult<()>;
         /// Apply a group of [`NamedOp`]s. Default: sequential and **non-atomic**;
         /// concrete stores override to commit as one transaction.
-        async fn write_batch(&self, ops: Vec<NamedOp>) {
+        async fn write_batch(&self, ops: Vec<NamedOp>) -> StorageResult<()> {
             for op in ops {
                 match op {
-                    NamedOp::Insert(n, w) => self.insert(&n, w).await,
-                    NamedOp::Remove(n) => self.remove(&n).await,
+                    NamedOp::Insert(n, w) => self.insert(&n, w).await?,
+                    NamedOp::Remove(n) => self.remove(&n).await?,
                 }
             }
+            Ok(())
         }
     }
 
@@ -633,45 +696,45 @@ mod named {
         pub fn backend(&self) -> &B {
             &self.backend
         }
-        pub async fn insert(&self, name: &Name, wire: Bytes) {
-            self.backend.put(name_key(name), wire).await;
+        pub async fn insert(&self, name: &Name, wire: Bytes) -> StorageResult<()> {
+            self.backend.put(name_key(name), wire).await
         }
-        pub async fn get(&self, name: &Name) -> Option<Bytes> {
+        pub async fn get(&self, name: &Name) -> StorageResult<Option<Bytes>> {
             self.backend.get(name_key(name)).await
         }
-        pub async fn remove(&self, name: &Name) {
-            self.backend.delete(name_key(name)).await;
+        pub async fn remove(&self, name: &Name) -> StorageResult<()> {
+            self.backend.delete(name_key(name)).await
         }
-        pub async fn find_under(&self, prefix: &Name) -> Option<Bytes> {
-            self.backend.first_under(name_key(prefix)).await.map(|(_, v)| v)
+        pub async fn find_under(&self, prefix: &Name) -> StorageResult<Option<Bytes>> {
+            Ok(self.backend.first_under(name_key(prefix)).await?.map(|(_, v)| v))
         }
-        pub async fn scan_under(&self, prefix: &Name, limit: usize) -> Vec<(Bytes, Bytes)> {
+        pub async fn scan_under(&self, prefix: &Name, limit: usize) -> StorageResult<Vec<(Bytes, Bytes)>> {
             self.backend.scan_prefix(name_key(prefix), limit).await
         }
     }
 
     #[async_trait]
     impl<B: Backend> NamedReadStore for NamedStore<B> {
-        async fn get(&self, name: &Name) -> Option<Bytes> {
+        async fn get(&self, name: &Name) -> StorageResult<Option<Bytes>> {
             NamedStore::get(self, name).await
         }
-        async fn find_under(&self, prefix: &Name) -> Option<Bytes> {
+        async fn find_under(&self, prefix: &Name) -> StorageResult<Option<Bytes>> {
             NamedStore::find_under(self, prefix).await
         }
-        async fn scan_under(&self, prefix: &Name, limit: usize) -> Vec<(Bytes, Bytes)> {
+        async fn scan_under(&self, prefix: &Name, limit: usize) -> StorageResult<Vec<(Bytes, Bytes)>> {
             NamedStore::scan_under(self, prefix, limit).await
         }
     }
 
     #[async_trait]
     impl<B: Backend> NamedWriteStore for NamedStore<B> {
-        async fn insert(&self, name: &Name, wire: Bytes) {
+        async fn insert(&self, name: &Name, wire: Bytes) -> StorageResult<()> {
             NamedStore::insert(self, name, wire).await
         }
-        async fn remove(&self, name: &Name) {
+        async fn remove(&self, name: &Name) -> StorageResult<()> {
             NamedStore::remove(self, name).await
         }
-        async fn write_batch(&self, ops: Vec<NamedOp>) {
+        async fn write_batch(&self, ops: Vec<NamedOp>) -> StorageResult<()> {
             // Translate named ops → Layer-0 ops, commit atomically via the engine.
             let backend_ops = ops
                 .into_iter()
@@ -680,7 +743,7 @@ mod named {
                     NamedOp::Remove(n) => WriteOp::Delete(name_key(&n)),
                 })
                 .collect();
-            self.backend.write_batch(backend_ops).await;
+            self.backend.write_batch(backend_ops).await
         }
     }
 
@@ -734,39 +797,41 @@ mod named {
 
     #[async_trait]
     impl NamedReadStore for StoreRouter {
-        async fn get(&self, name: &Name) -> Option<Bytes> {
+        async fn get(&self, name: &Name) -> StorageResult<Option<Bytes>> {
             match self.pick(name) {
                 Some(s) => s.get(name).await,
-                None => None,
+                None => Ok(None),
             }
         }
-        async fn find_under(&self, prefix: &Name) -> Option<Bytes> {
+        async fn find_under(&self, prefix: &Name) -> StorageResult<Option<Bytes>> {
             match self.pick(prefix) {
                 Some(s) => s.find_under(prefix).await,
-                None => None,
+                None => Ok(None),
             }
         }
-        async fn scan_under(&self, prefix: &Name, limit: usize) -> Vec<(Bytes, Bytes)> {
+        async fn scan_under(&self, prefix: &Name, limit: usize) -> StorageResult<Vec<(Bytes, Bytes)>> {
             match self.pick(prefix) {
                 Some(s) => s.scan_under(prefix, limit).await,
-                None => Vec::new(),
+                None => Ok(Vec::new()),
             }
         }
     }
 
     #[async_trait]
     impl NamedWriteStore for StoreRouter {
-        async fn insert(&self, name: &Name, wire: Bytes) {
+        async fn insert(&self, name: &Name, wire: Bytes) -> StorageResult<()> {
             if let Some(s) = self.pick(name) {
-                s.insert(name, wire).await;
+                s.insert(name, wire).await?;
             }
+            Ok(())
         }
-        async fn remove(&self, name: &Name) {
+        async fn remove(&self, name: &Name) -> StorageResult<()> {
             if let Some(s) = self.pick(name) {
-                s.remove(name).await;
+                s.remove(name).await?;
             }
+            Ok(())
         }
-        async fn write_batch(&self, ops: Vec<NamedOp>) {
+        async fn write_batch(&self, ops: Vec<NamedOp>) -> StorageResult<()> {
             // Group ops by destination store; each store commits its group atomically.
             // (Cross-store atomicity is not offered — routes are independent engines.)
             let mut groups: HashMap<usize, Vec<NamedOp>> = HashMap::new();
@@ -776,8 +841,9 @@ mod named {
                 }
             }
             for (idx, group) in groups {
-                self.store_at(idx).write_batch(group).await;
+                self.store_at(idx).write_batch(group).await?;
             }
+            Ok(())
         }
     }
 }
@@ -787,7 +853,7 @@ pub use fjall_backend::{FjallBackend, FjallBatch, FjallDb};
 
 #[cfg(feature = "fjall")]
 mod fjall_backend {
-    use super::{Backend, Bytes, SyncBackend, WriteOp, async_trait};
+    use super::{Backend, Bytes, StorageError, StorageResult, SyncBackend, WriteOp, async_trait};
 
     /// On-disk [`Backend`] backed by [fjall](https://docs.rs/fjall) (an LSM
     /// key-value store). Persistent across restarts. The single fjall adapter every
@@ -821,35 +887,33 @@ mod fjall_backend {
 
     // The sync core: direct (blocking) fjall calls, no offload.
     impl SyncBackend for FjallBackend {
-        fn get(&self, key: &[u8]) -> Option<Bytes> {
+        fn get(&self, key: &[u8]) -> StorageResult<Option<Bytes>> {
+            // A real read error is surfaced (was previously collapsed into `None`).
+            let v = self.keyspace.get(key).map_err(StorageError::backend)?;
+            Ok(v.map(|s| Bytes::copy_from_slice(&s)))
+        }
+        fn put(&self, key: &[u8], value: Bytes) -> StorageResult<()> {
             self.keyspace
-                .get(key)
-                .ok()
-                .flatten()
-                .map(|s| Bytes::copy_from_slice(&s))
+                .insert(key, value.as_ref())
+                .map_err(StorageError::backend)
         }
-        fn put(&self, key: &[u8], value: Bytes) {
-            let _ = self.keyspace.insert(key, value.as_ref());
+        fn delete(&self, key: &[u8]) -> StorageResult<()> {
+            self.keyspace.remove(key).map_err(StorageError::backend)
         }
-        fn delete(&self, key: &[u8]) {
-            let _ = self.keyspace.remove(key);
-        }
-        fn scan_prefix(&self, prefix: &[u8], limit: usize) -> Vec<(Bytes, Bytes)> {
+        fn scan_prefix(&self, prefix: &[u8], limit: usize) -> StorageResult<Vec<(Bytes, Bytes)>> {
             let mut out = Vec::new();
             for guard in self.keyspace.prefix(prefix) {
-                match guard.into_inner() {
-                    Ok((k, v)) => {
-                        out.push((Bytes::copy_from_slice(&k), Bytes::copy_from_slice(&v)));
-                        if limit != 0 && out.len() >= limit {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
+                // An iteration error aborts the scan with the error (was `break` → a
+                // silently-truncated result indistinguishable from a real end).
+                let (k, v) = guard.into_inner().map_err(StorageError::backend)?;
+                out.push((Bytes::copy_from_slice(&k), Bytes::copy_from_slice(&v)));
+                if limit != 0 && out.len() >= limit {
+                    break;
                 }
             }
-            out
+            Ok(out)
         }
-        fn write_batch(&self, ops: Vec<WriteOp>) {
+        fn write_batch(&self, ops: Vec<WriteOp>) -> StorageResult<()> {
             let mut batch = self.db.batch(); // atomic across keyspaces
             for op in ops {
                 match op {
@@ -857,7 +921,7 @@ mod fjall_backend {
                     WriteOp::Delete(k) => batch.remove(&self.keyspace, &k),
                 }
             }
-            let _ = batch.commit();
+            batch.commit().map_err(StorageError::backend)
         }
         fn name(&self) -> &'static str {
             "fjall"
@@ -867,30 +931,35 @@ mod fjall_backend {
     // The async surface: a thin `spawn_blocking` wrapper over the sync core.
     #[async_trait]
     impl Backend for FjallBackend {
-        async fn get(&self, key: Vec<u8>) -> Option<Bytes> {
+        async fn get(&self, key: Vec<u8>) -> StorageResult<Option<Bytes>> {
             let this = self.clone();
             tokio::task::spawn_blocking(move || SyncBackend::get(&this, &key))
                 .await
-                .ok()
-                .flatten()
+                .map_err(StorageError::backend)?
         }
-        async fn put(&self, key: Vec<u8>, value: Bytes) {
+        async fn put(&self, key: Vec<u8>, value: Bytes) -> StorageResult<()> {
             let this = self.clone();
-            let _ = tokio::task::spawn_blocking(move || SyncBackend::put(&this, &key, value)).await;
+            tokio::task::spawn_blocking(move || SyncBackend::put(&this, &key, value))
+                .await
+                .map_err(StorageError::backend)?
         }
-        async fn delete(&self, key: Vec<u8>) {
+        async fn delete(&self, key: Vec<u8>) -> StorageResult<()> {
             let this = self.clone();
-            let _ = tokio::task::spawn_blocking(move || SyncBackend::delete(&this, &key)).await;
+            tokio::task::spawn_blocking(move || SyncBackend::delete(&this, &key))
+                .await
+                .map_err(StorageError::backend)?
         }
-        async fn scan_prefix(&self, prefix: Vec<u8>, limit: usize) -> Vec<(Bytes, Bytes)> {
+        async fn scan_prefix(&self, prefix: Vec<u8>, limit: usize) -> StorageResult<Vec<(Bytes, Bytes)>> {
             let this = self.clone();
             tokio::task::spawn_blocking(move || SyncBackend::scan_prefix(&this, &prefix, limit))
                 .await
-                .unwrap_or_default()
+                .map_err(StorageError::backend)?
         }
-        async fn write_batch(&self, ops: Vec<WriteOp>) {
+        async fn write_batch(&self, ops: Vec<WriteOp>) -> StorageResult<()> {
             let this = self.clone();
-            let _ = tokio::task::spawn_blocking(move || SyncBackend::write_batch(&this, ops)).await;
+            tokio::task::spawn_blocking(move || SyncBackend::write_batch(&this, ops))
+                .await
+                .map_err(StorageError::backend)?
         }
         fn name(&self) -> &'static str {
             "fjall"
@@ -1010,7 +1079,7 @@ pub use redb_backend::{RedbBackend, RedbBatch, RedbDb};
 
 #[cfg(feature = "redb")]
 mod redb_backend {
-    use super::{Backend, Bytes, SyncBackend, WriteOp, async_trait};
+    use super::{Backend, Bytes, StorageError, StorageResult, SyncBackend, WriteOp, async_trait};
     use redb::ReadableDatabase; // brings `begin_read` into scope
     use std::sync::Arc;
 
@@ -1063,27 +1132,32 @@ mod redb_backend {
 
     // The sync core: direct (blocking) redb transactions, no offload.
     impl SyncBackend for RedbBackend {
-        fn get(&self, key: &[u8]) -> Option<Bytes> {
-            let txn = self.db.begin_read().ok()?;
-            let t = txn.open_table(table(&self.table)).ok()?;
-            let g = t.get(key).ok()??;
-            Some(Bytes::copy_from_slice(g.value()))
+        fn get(&self, key: &[u8]) -> StorageResult<Option<Bytes>> {
+            // Each step's error is surfaced (was previously `.ok()?` → an error became a
+            // miss). A genuine absence is the inner `None`.
+            let txn = self.db.begin_read().map_err(StorageError::backend)?;
+            let t = txn
+                .open_table(table(&self.table))
+                .map_err(StorageError::backend)?;
+            let g = t.get(key).map_err(StorageError::backend)?;
+            Ok(g.map(|g| Bytes::copy_from_slice(g.value())))
         }
-        fn put(&self, key: &[u8], value: Bytes) {
-            SyncBackend::write_batch(self, vec![WriteOp::Put(key.to_vec(), value)]);
+        fn put(&self, key: &[u8], value: Bytes) -> StorageResult<()> {
+            SyncBackend::write_batch(self, vec![WriteOp::Put(key.to_vec(), value)])
         }
-        fn delete(&self, key: &[u8]) {
-            SyncBackend::write_batch(self, vec![WriteOp::Delete(key.to_vec())]);
+        fn delete(&self, key: &[u8]) -> StorageResult<()> {
+            SyncBackend::write_batch(self, vec![WriteOp::Delete(key.to_vec())])
         }
-        fn scan_prefix(&self, prefix: &[u8], limit: usize) -> Vec<(Bytes, Bytes)> {
+        fn scan_prefix(&self, prefix: &[u8], limit: usize) -> StorageResult<Vec<(Bytes, Bytes)>> {
             let mut out = Vec::new();
-            let Ok(txn) = self.db.begin_read() else { return out };
-            let Ok(t) = txn.open_table(table(&self.table)) else {
-                return out;
-            };
-            let Ok(iter) = t.range(prefix..) else { return out };
+            let txn = self.db.begin_read().map_err(StorageError::backend)?;
+            let t = txn
+                .open_table(table(&self.table))
+                .map_err(StorageError::backend)?;
+            let iter = t.range(prefix..).map_err(StorageError::backend)?;
             for item in iter {
-                let Ok((k, v)) = item else { break };
+                // A real iteration error aborts with the error (not a silent truncation).
+                let (k, v) = item.map_err(StorageError::backend)?;
                 if !k.value().starts_with(prefix) {
                     break;
                 }
@@ -1095,10 +1169,10 @@ mod redb_backend {
                     break;
                 }
             }
-            out
+            Ok(out)
         }
-        fn write_batch(&self, ops: Vec<WriteOp>) {
-            let _ = (|| -> Result<(), redb::Error> {
+        fn write_batch(&self, ops: Vec<WriteOp>) -> StorageResult<()> {
+            (|| -> Result<(), redb::Error> {
                 let txn = self.db.begin_write()?;
                 {
                     let mut t = txn.open_table(table(&self.table))?;
@@ -1115,7 +1189,8 @@ mod redb_backend {
                 } // table dropped before commit
                 txn.commit()?; // ACID: all ops or none
                 Ok(())
-            })();
+            })()
+            .map_err(StorageError::backend)
         }
         fn name(&self) -> &'static str {
             "redb"
@@ -1125,30 +1200,35 @@ mod redb_backend {
     // The async surface: a thin `spawn_blocking` wrapper over the sync core.
     #[async_trait]
     impl Backend for RedbBackend {
-        async fn get(&self, key: Vec<u8>) -> Option<Bytes> {
+        async fn get(&self, key: Vec<u8>) -> StorageResult<Option<Bytes>> {
             let this = self.clone();
             tokio::task::spawn_blocking(move || SyncBackend::get(&this, &key))
                 .await
-                .ok()
-                .flatten()
+                .map_err(StorageError::backend)?
         }
-        async fn put(&self, key: Vec<u8>, value: Bytes) {
+        async fn put(&self, key: Vec<u8>, value: Bytes) -> StorageResult<()> {
             let this = self.clone();
-            let _ = tokio::task::spawn_blocking(move || SyncBackend::put(&this, &key, value)).await;
+            tokio::task::spawn_blocking(move || SyncBackend::put(&this, &key, value))
+                .await
+                .map_err(StorageError::backend)?
         }
-        async fn delete(&self, key: Vec<u8>) {
+        async fn delete(&self, key: Vec<u8>) -> StorageResult<()> {
             let this = self.clone();
-            let _ = tokio::task::spawn_blocking(move || SyncBackend::delete(&this, &key)).await;
+            tokio::task::spawn_blocking(move || SyncBackend::delete(&this, &key))
+                .await
+                .map_err(StorageError::backend)?
         }
-        async fn scan_prefix(&self, prefix: Vec<u8>, limit: usize) -> Vec<(Bytes, Bytes)> {
+        async fn scan_prefix(&self, prefix: Vec<u8>, limit: usize) -> StorageResult<Vec<(Bytes, Bytes)>> {
             let this = self.clone();
             tokio::task::spawn_blocking(move || SyncBackend::scan_prefix(&this, &prefix, limit))
                 .await
-                .unwrap_or_default()
+                .map_err(StorageError::backend)?
         }
-        async fn write_batch(&self, ops: Vec<WriteOp>) {
+        async fn write_batch(&self, ops: Vec<WriteOp>) -> StorageResult<()> {
             let this = self.clone();
-            let _ = tokio::task::spawn_blocking(move || SyncBackend::write_batch(&this, ops)).await;
+            tokio::task::spawn_blocking(move || SyncBackend::write_batch(&this, ops))
+                .await
+                .map_err(StorageError::backend)?
         }
         fn name(&self) -> &'static str {
             "redb"
@@ -1276,45 +1356,47 @@ mod tests {
     use super::*;
 
     async fn conformance(b: &dyn Backend) {
-        assert!(b.get(b"missing".to_vec()).await.is_none());
-        b.put(b"/a/b".to_vec(), Bytes::from_static(b"v-ab")).await;
-        b.put(b"/a/b/c".to_vec(), Bytes::from_static(b"v-abc")).await;
-        b.put(b"/a/d".to_vec(), Bytes::from_static(b"v-ad")).await;
-        b.put(b"/z".to_vec(), Bytes::from_static(b"v-z")).await;
+        assert!(b.get(b"missing".to_vec()).await.unwrap().is_none());
+        b.put(b"/a/b".to_vec(), Bytes::from_static(b"v-ab")).await.unwrap();
+        b.put(b"/a/b/c".to_vec(), Bytes::from_static(b"v-abc")).await.unwrap();
+        b.put(b"/a/d".to_vec(), Bytes::from_static(b"v-ad")).await.unwrap();
+        b.put(b"/z".to_vec(), Bytes::from_static(b"v-z")).await.unwrap();
 
-        assert_eq!(b.get(b"/a/b".to_vec()).await.as_deref(), Some(&b"v-ab"[..]));
-        assert_eq!(b.first_under(b"/a/b".to_vec()).await.unwrap().0.as_ref(), b"/a/b");
-        assert_eq!(b.first_under(b"/a/d".to_vec()).await.unwrap().1.as_ref(), b"v-ad");
-        assert!(b.first_under(b"/nope".to_vec()).await.is_none());
+        assert_eq!(b.get(b"/a/b".to_vec()).await.unwrap().as_deref(), Some(&b"v-ab"[..]));
+        assert_eq!(b.first_under(b"/a/b".to_vec()).await.unwrap().unwrap().0.as_ref(), b"/a/b");
+        assert_eq!(b.first_under(b"/a/d".to_vec()).await.unwrap().unwrap().1.as_ref(), b"v-ad");
+        assert!(b.first_under(b"/nope".to_vec()).await.unwrap().is_none());
 
         let under: Vec<String> = b
             .scan_prefix(b"/a".to_vec(), 0)
             .await
+            .unwrap()
             .into_iter()
             .map(|(k, _)| String::from_utf8_lossy(&k).into_owned())
             .collect();
         assert_eq!(under, vec!["/a/b", "/a/b/c", "/a/d"]); // ascending, /z excluded
 
-        assert_eq!(b.scan_prefix(b"/a".to_vec(), 1).await.len(), 1); // limit
+        assert_eq!(b.scan_prefix(b"/a".to_vec(), 1).await.unwrap().len(), 1); // limit
 
-        b.delete(b"/a/b".to_vec()).await;
-        assert!(b.get(b"/a/b".to_vec()).await.is_none());
-        assert_eq!(b.get(b"/a/b/c".to_vec()).await.as_deref(), Some(&b"v-abc"[..]));
+        b.delete(b"/a/b".to_vec()).await.unwrap();
+        assert!(b.get(b"/a/b".to_vec()).await.unwrap().is_none());
+        assert_eq!(b.get(b"/a/b/c".to_vec()).await.unwrap().as_deref(), Some(&b"v-abc"[..]));
     }
 
     /// `write_batch` applies every op and is observable as a unit.
     async fn batch_conformance(b: &dyn Backend) {
-        b.put(b"/keep".to_vec(), Bytes::from_static(b"old")).await;
+        b.put(b"/keep".to_vec(), Bytes::from_static(b"old")).await.unwrap();
         b.write_batch(vec![
             WriteOp::Put(b"/k1".to_vec(), Bytes::from_static(b"v1")),
             WriteOp::Put(b"/k2".to_vec(), Bytes::from_static(b"v2")),
             WriteOp::Put(b"/keep".to_vec(), Bytes::from_static(b"new")),
             WriteOp::Delete(b"/keep".to_vec()), // last-writer-wins ordering within a batch
         ])
-        .await;
-        assert_eq!(b.get(b"/k1".to_vec()).await.as_deref(), Some(&b"v1"[..]));
-        assert_eq!(b.get(b"/k2".to_vec()).await.as_deref(), Some(&b"v2"[..]));
-        assert!(b.get(b"/keep".to_vec()).await.is_none()); // put-then-delete in order
+        .await
+        .unwrap();
+        assert_eq!(b.get(b"/k1".to_vec()).await.unwrap().as_deref(), Some(&b"v1"[..]));
+        assert_eq!(b.get(b"/k2".to_vec()).await.unwrap().as_deref(), Some(&b"v2"[..]));
+        assert!(b.get(b"/keep".to_vec()).await.unwrap().is_none()); // put-then-delete in order
     }
 
     #[tokio::test]
@@ -1340,7 +1422,7 @@ mod tests {
         let v0: Name = "/app/s/v=0".parse().unwrap();
         let v1: Name = "/app/s/v=1".parse().unwrap();
         let v2: Name = "/app/s/v=2".parse().unwrap();
-        s.insert(&v0, Bytes::from_static(b"f0")).await;
+        s.insert(&v0, Bytes::from_static(b"f0")).await.unwrap();
 
         // Builder: add two, evict the oldest — all in one commit.
         Batch::new()
@@ -1348,11 +1430,12 @@ mod tests {
             .insert(&v2, Bytes::from_static(b"f2"))
             .remove(&v0)
             .commit(&s)
-            .await;
+            .await
+            .unwrap();
 
-        assert!(s.get(&v0).await.is_none());
-        assert_eq!(s.get(&v1).await.as_deref(), Some(&b"f1"[..]));
-        assert_eq!(s.get(&v2).await.as_deref(), Some(&b"f2"[..]));
+        assert!(s.get(&v0).await.unwrap().is_none());
+        assert_eq!(s.get(&v1).await.unwrap().as_deref(), Some(&b"f1"[..]));
+        assert_eq!(s.get(&v2).await.unwrap().as_deref(), Some(&b"f2"[..]));
     }
 
     #[cfg(feature = "named")]
@@ -1372,11 +1455,12 @@ mod tests {
             .insert(&na, Bytes::from_static(b"A"))
             .insert(&nc, Bytes::from_static(b"C"))
             .commit(&router)
-            .await;
+            .await
+            .unwrap();
 
-        assert_eq!(a.get(&na).await.as_deref(), Some(&b"A"[..])); // routed
-        assert_eq!(d.get(&nc).await.as_deref(), Some(&b"C"[..])); // fallback group
-        assert!(a.get(&nc).await.is_none());
+        assert_eq!(a.get(&na).await.unwrap().as_deref(), Some(&b"A"[..])); // routed
+        assert_eq!(d.get(&nc).await.unwrap().as_deref(), Some(&b"C"[..])); // fallback group
+        assert!(a.get(&nc).await.unwrap().is_none());
     }
 
     #[cfg(feature = "named")]
@@ -1388,16 +1472,16 @@ mod tests {
         let v0: Name = "/app/surface/v=0".parse().unwrap();
         let v1: Name = "/app/surface/v=1".parse().unwrap();
 
-        s.insert(&v0, Bytes::from_static(b"frame0")).await;
-        s.insert(&v1, Bytes::from_static(b"frame1")).await;
-        assert_eq!(s.get(&v0).await.as_deref(), Some(&b"frame0"[..]));
-        assert_eq!(s.find_under(&n).await.as_deref(), Some(&b"frame0"[..]));
+        s.insert(&v0, Bytes::from_static(b"frame0")).await.unwrap();
+        s.insert(&v1, Bytes::from_static(b"frame1")).await.unwrap();
+        assert_eq!(s.get(&v0).await.unwrap().as_deref(), Some(&b"frame0"[..]));
+        assert_eq!(s.find_under(&n).await.unwrap().as_deref(), Some(&b"frame0"[..]));
         assert!(name_key(&v0).starts_with(&name_key(&n)));
-        assert_eq!(s.scan_under(&n, 0).await.len(), 2);
+        assert_eq!(s.scan_under(&n, 0).await.unwrap().len(), 2);
 
-        s.remove(&v0).await;
-        assert!(s.get(&v0).await.is_none());
-        assert_eq!(s.get(&v1).await.as_deref(), Some(&b"frame1"[..]));
+        s.remove(&v0).await.unwrap();
+        assert!(s.get(&v0).await.unwrap().is_none());
+        assert_eq!(s.get(&v1).await.unwrap().as_deref(), Some(&b"frame1"[..]));
     }
 
     #[cfg(feature = "named")]
@@ -1415,12 +1499,12 @@ mod tests {
 
         let na: Name = "/a/x".parse().unwrap();
         let nc: Name = "/c/z".parse().unwrap();
-        router.insert(&na, Bytes::from_static(b"A")).await;
-        router.insert(&nc, Bytes::from_static(b"C")).await;
-        assert_eq!(a.get(&na).await.as_deref(), Some(&b"A"[..]));
-        assert!(b.get(&na).await.is_none());
-        assert_eq!(d.get(&nc).await.as_deref(), Some(&b"C"[..])); // default
-        assert_eq!(router.get(&na).await.as_deref(), Some(&b"A"[..]));
+        router.insert(&na, Bytes::from_static(b"A")).await.unwrap();
+        router.insert(&nc, Bytes::from_static(b"C")).await.unwrap();
+        assert_eq!(a.get(&na).await.unwrap().as_deref(), Some(&b"A"[..]));
+        assert!(b.get(&na).await.unwrap().is_none());
+        assert_eq!(d.get(&nc).await.unwrap().as_deref(), Some(&b"C"[..])); // default
+        assert_eq!(router.get(&na).await.unwrap().as_deref(), Some(&b"A"[..]));
     }
 
     #[cfg(feature = "fjall")]
@@ -1440,11 +1524,11 @@ mod tests {
             batch_conformance(&b).await;
             // UFCS: FjallBackend impls both Backend and SyncBackend, so a bare `.put`
             // is ambiguous with both traits in scope.
-            Backend::put(&b, b"/persist".to_vec(), Bytes::from_static(b"survives")).await;
+            Backend::put(&b, b"/persist".to_vec(), Bytes::from_static(b"survives")).await.unwrap();
         }
         {
             let b = FjallBackend::open(&dir).unwrap();
-            assert_eq!(Backend::get(&b, b"/persist".to_vec()).await.as_deref(), Some(&b"survives"[..]));
+            assert_eq!(Backend::get(&b, b"/persist".to_vec()).await.unwrap().as_deref(), Some(&b"survives"[..]));
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1463,11 +1547,11 @@ mod tests {
             let b = RedbBackend::open(&path).unwrap();
             conformance(&b).await;
             batch_conformance(&b).await;
-            Backend::put(&b, b"/persist".to_vec(), Bytes::from_static(b"survives")).await;
+            Backend::put(&b, b"/persist".to_vec(), Bytes::from_static(b"survives")).await.unwrap();
         }
         {
             let b = RedbBackend::open(&path).unwrap();
-            assert_eq!(Backend::get(&b, b"/persist".to_vec()).await.as_deref(), Some(&b"survives"[..]));
+            assert_eq!(Backend::get(&b, b"/persist".to_vec()).await.unwrap().as_deref(), Some(&b"survives"[..]));
         }
         let _ = std::fs::remove_file(&path);
     }
@@ -1500,9 +1584,9 @@ mod tests {
                 .await
                 .unwrap();
             // UFCS to disambiguate the dual (Backend / SyncBackend) impls in scope.
-            assert_eq!(Backend::get(&headers, b"h1".to_vec()).await.as_deref(), Some(&b"H"[..]));
-            assert_eq!(Backend::get(&payloads, b"p1".to_vec()).await.as_deref(), Some(&b"P"[..]));
-            assert_eq!(Backend::get(&idx, b"n1".to_vec()).await.as_deref(), Some(&b"h1"[..]));
+            assert_eq!(Backend::get(&headers, b"h1".to_vec()).await.unwrap().as_deref(), Some(&b"H"[..]));
+            assert_eq!(Backend::get(&payloads, b"p1".to_vec()).await.unwrap().as_deref(), Some(&b"P"[..]));
+            assert_eq!(Backend::get(&idx, b"n1".to_vec()).await.unwrap().as_deref(), Some(&b"h1"[..]));
 
             // A cross-partition delete in one batch (e.g. retract a block).
             db.batch()
@@ -1511,15 +1595,15 @@ mod tests {
                 .commit()
                 .await
                 .unwrap();
-            assert!(Backend::get(&headers, b"h1".to_vec()).await.is_none());
-            assert!(Backend::get(&idx, b"n1".to_vec()).await.is_none());
-            assert_eq!(Backend::get(&payloads, b"p1".to_vec()).await.as_deref(), Some(&b"P"[..]));
+            assert!(Backend::get(&headers, b"h1".to_vec()).await.unwrap().is_none());
+            assert!(Backend::get(&idx, b"n1".to_vec()).await.unwrap().is_none());
+            assert_eq!(Backend::get(&payloads, b"p1".to_vec()).await.unwrap().as_deref(), Some(&b"P"[..]));
         }
         // Survives reopen.
         {
             let db = FjallDb::open(&dir).unwrap();
             let payloads = db.partition("payloads").unwrap();
-            assert_eq!(Backend::get(&payloads, b"p1".to_vec()).await.as_deref(), Some(&b"P"[..]));
+            assert_eq!(Backend::get(&payloads, b"p1".to_vec()).await.unwrap().as_deref(), Some(&b"P"[..]));
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1547,9 +1631,9 @@ mod tests {
                 .commit()
                 .await
                 .unwrap();
-            assert_eq!(Backend::get(&headers, b"h1".to_vec()).await.as_deref(), Some(&b"H"[..]));
-            assert_eq!(Backend::get(&payloads, b"p1".to_vec()).await.as_deref(), Some(&b"P"[..]));
-            assert_eq!(Backend::get(&idx, b"n1".to_vec()).await.as_deref(), Some(&b"h1"[..]));
+            assert_eq!(Backend::get(&headers, b"h1".to_vec()).await.unwrap().as_deref(), Some(&b"H"[..]));
+            assert_eq!(Backend::get(&payloads, b"p1".to_vec()).await.unwrap().as_deref(), Some(&b"P"[..]));
+            assert_eq!(Backend::get(&idx, b"n1".to_vec()).await.unwrap().as_deref(), Some(&b"h1"[..]));
 
             db.batch()
                 .remove(&headers, b"h1".to_vec())
@@ -1557,8 +1641,8 @@ mod tests {
                 .commit()
                 .await
                 .unwrap();
-            assert!(Backend::get(&headers, b"h1".to_vec()).await.is_none());
-            assert_eq!(Backend::get(&payloads, b"p1".to_vec()).await.as_deref(), Some(&b"P"[..]));
+            assert!(Backend::get(&headers, b"h1".to_vec()).await.unwrap().is_none());
+            assert_eq!(Backend::get(&payloads, b"p1".to_vec()).await.unwrap().as_deref(), Some(&b"P"[..]));
         }
         let _ = std::fs::remove_file(&path);
     }
@@ -1568,30 +1652,32 @@ mod tests {
     /// Drives a `SyncBackend` with no async runtime — exactly how NDF's sync
     /// `BlockStore` / the pure verifier / an MCU consume it.
     fn sync_conformance(b: &dyn SyncBackend) {
-        assert!(b.get(b"missing").is_none());
-        b.put(b"/a/b", Bytes::from_static(b"v-ab"));
-        b.put(b"/a/b/c", Bytes::from_static(b"v-abc"));
-        b.put(b"/a/d", Bytes::from_static(b"v-ad"));
-        b.put(b"/z", Bytes::from_static(b"v-z"));
+        assert!(b.get(b"missing").unwrap().is_none());
+        b.put(b"/a/b", Bytes::from_static(b"v-ab")).unwrap();
+        b.put(b"/a/b/c", Bytes::from_static(b"v-abc")).unwrap();
+        b.put(b"/a/d", Bytes::from_static(b"v-ad")).unwrap();
+        b.put(b"/z", Bytes::from_static(b"v-z")).unwrap();
 
-        assert_eq!(b.get(b"/a/b").as_deref(), Some(&b"v-ab"[..]));
-        assert_eq!(b.first_under(b"/a/b").unwrap().0.as_ref(), b"/a/b");
-        assert!(b.first_under(b"/nope").is_none());
+        assert_eq!(b.get(b"/a/b").unwrap().as_deref(), Some(&b"v-ab"[..]));
+        assert_eq!(b.first_under(b"/a/b").unwrap().unwrap().0.as_ref(), b"/a/b");
+        assert!(b.first_under(b"/nope").unwrap().is_none());
         let under: Vec<String> = b
             .scan_prefix(b"/a", 0)
+            .unwrap()
             .into_iter()
             .map(|(k, _)| String::from_utf8_lossy(&k).into_owned())
             .collect();
         assert_eq!(under, vec!["/a/b", "/a/b/c", "/a/d"]);
-        assert_eq!(b.scan_prefix(b"/a", 1).len(), 1);
+        assert_eq!(b.scan_prefix(b"/a", 1).unwrap().len(), 1);
 
         // Atomic group (last-writer-wins ordering within the batch).
         b.write_batch(vec![
             WriteOp::Put(b"/k1".to_vec(), Bytes::from_static(b"v1")),
             WriteOp::Delete(b"/a/b".to_vec()),
-        ]);
-        assert_eq!(b.get(b"/k1").as_deref(), Some(&b"v1"[..]));
-        assert!(b.get(b"/a/b").is_none());
+        ])
+        .unwrap();
+        assert_eq!(b.get(b"/k1").unwrap().as_deref(), Some(&b"v1"[..]));
+        assert!(b.get(b"/a/b").unwrap().is_none());
     }
 
     #[cfg(feature = "sync")]
@@ -1637,8 +1723,8 @@ mod tests {
             .insert(&payloads, b"p1".to_vec(), Bytes::from_static(b"P"))
             .commit_blocking()
             .unwrap();
-        assert_eq!(SyncBackend::get(&headers, b"h1").as_deref(), Some(&b"H"[..]));
-        assert_eq!(SyncBackend::get(&payloads, b"p1").as_deref(), Some(&b"P"[..]));
+        assert_eq!(SyncBackend::get(&headers, b"h1").unwrap().as_deref(), Some(&b"H"[..]));
+        assert_eq!(SyncBackend::get(&payloads, b"p1").unwrap().as_deref(), Some(&b"P"[..]));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1664,7 +1750,7 @@ mod tests {
         use ndn_packet::Name;
         let store = NamedStore::new(SyncAsAsync::new(SyncMemoryBackend::new()));
         let v0: Name = "/app/s/v=0".parse().unwrap();
-        store.insert(&v0, Bytes::from_static(b"f0")).await;
-        assert_eq!(store.get(&v0).await.as_deref(), Some(&b"f0"[..]));
+        store.insert(&v0, Bytes::from_static(b"f0")).await.unwrap();
+        assert_eq!(store.get(&v0).await.unwrap().as_deref(), Some(&b"f0"[..]));
     }
 }
