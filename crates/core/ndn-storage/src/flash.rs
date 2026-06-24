@@ -6,16 +6,30 @@
 //! `NorFlash` — so the engine is HW-independent and CI-testable against a mock flash,
 //! and only the flash driver is HW-specific.
 //!
-//! ## Design — RAM index + flash write-ahead log
+//! ## Design — RAM index + double-buffered flash write-ahead log
 //!
 //! The ordered index lives in RAM (a `BTreeMap`, so `scan_prefix` is ordered and
 //! efficient); flash is an **append-only log of records** for durability. Each write
 //! (a `put`/`delete`, or a whole `write_batch`) is **one** length-framed record with a
 //! validity footer — so a record is applied on replay only if it landed in full, giving
 //! **power-loss-atomic batches**. On mount the log is replayed into RAM; a torn tail
-//! (an interrupted final write) is dropped and the store self-heals (the next write
-//! compacts: erase the region, rewrite the whole index from RAM — no partial-sector
-//! erase, hence no corruption risk). Compaction also reclaims space when the log fills.
+//! (an interrupted final write) is dropped.
+//!
+//! ### Atomic compaction via two halves (A/B ping-pong)
+//!
+//! When the live log fills (or its tail is torn), the store **compacts**: it rewrites
+//! the whole live index as one fresh log. Compaction must be power-loss-atomic — if it
+//! erased the live region first (the naive single-region design), a power cut between the
+//! erase and the rewrite would destroy *all* data. So the region is split into two equal
+//! halves: compaction writes the fresh log into the **inactive** half and only switches
+//! over once it is fully committed. The active half is never touched until the new one is
+//! durable, so a power cut mid-compaction leaves the last committed state intact.
+//!
+//! The commit point is each half's **superblock, written last** (after its records),
+//! carrying a monotonic generation counter. On mount the store reads both superblocks and
+//! replays the valid half with the higher generation; a half whose superblock never
+//! landed (compaction interrupted before commit) is ignored, so mount falls back to the
+//! previous generation. Within the chosen half a torn record tail is still dropped.
 //!
 //! Values are held in RAM (matching the embedded floor — "an MCU holds few blocks");
 //! flash adds durability across power loss. For datasets that exceed RAM, a future
@@ -35,10 +49,12 @@ const OP_DEL: u8 = 2;
 const COMMIT_MAGIC: u32 = 0x4E44_4E46; // "NDNF"
 /// An erased NOR cell reads as all-ones; a `len` of `0xFFFF_FFFF` marks end-of-log.
 const ERASED: u32 = 0xFFFF_FFFF;
-/// Superblock magic at offset 0 — identifies an ndn-storage flash log, so `mount`
-/// refuses a blank or foreign region instead of clobbering it.
+/// Superblock magic at the start of each half — identifies an ndn-storage flash log, so
+/// `mount` refuses a blank or foreign region instead of clobbering it.
 const SUPER_MAGIC: u64 = 0x4E44_4E5F_464C_4F47; // "NDN_FLOG"
-const FORMAT_VERSION: u32 = 1;
+/// v2 = double-buffered (two halves, generation-tagged superblock written last). A v1
+/// (single-region) image has no per-half generation and is refused, not misread.
+const FORMAT_VERSION: u32 = 2;
 
 /// Error opening or operating a [`FlashLogBackend`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,20 +72,41 @@ fn align_up(n: u32, a: u32) -> u32 {
     n.div_ceil(a) * a
 }
 
+fn align_down(n: u32, a: u32) -> u32 {
+    (n / a) * a
+}
+
 struct FlashState<F> {
     flash: F,
     index: BTreeMap<Vec<u8>, Bytes>,
-    write_off: u32, // next free (erased) offset in the log
-    cap: u32,
+    /// Size of each of the two halves (ERASE_SIZE-aligned). The region is `[0, half_cap)`
+    /// = half A and `[half_cap, 2*half_cap)` = half B.
+    half_cap: u32,
+    /// Base offset of the **live** half (`0` or `half_cap`).
+    live_base: u32,
+    /// Generation of the live half — higher = newer; bumped each compaction.
+    generation: u32,
+    write_off: u32, // next free (erased) absolute offset in the live half
     /// The mounted tail was torn (or unverified) — append must compact before writing.
     dirty_tail: bool,
 }
 
 impl<F: NorFlash> FlashState<F> {
-    /// Byte length of the superblock (magic + version), rounded to the write unit; the
-    /// log begins here.
+    /// Byte length of the superblock (magic + version + generation), rounded to the write
+    /// unit; each half's log begins here.
     fn header_len() -> u32 {
-        align_up(12, F::WRITE_SIZE as u32)
+        align_up(16, F::WRITE_SIZE as u32)
+    }
+
+    /// Size of one half for a region of `cap` bytes — half the region, rounded *down* to
+    /// the erase unit so each half can be erased independently.
+    fn half_cap_for(cap: u32) -> u32 {
+        align_down(cap / 2, F::ERASE_SIZE as u32)
+    }
+
+    /// Base offset of the inactive half (the compaction target).
+    fn other_base(&self) -> u32 {
+        if self.live_base == 0 { self.half_cap } else { 0 }
     }
 
     fn read_u32(&mut self, off: u32) -> Result<u32, FlashError> {
@@ -78,18 +115,52 @@ impl<F: NorFlash> FlashState<F> {
         Ok(u32::from_le_bytes(b))
     }
 
-    /// Erase the region and lay down a fresh superblock; leaves the log empty.
-    fn write_superblock(&mut self) -> Result<(), FlashError> {
-        self.flash.erase(0, self.cap).map_err(|_| FlashError::Io)?;
-        let hlen = Self::header_len() as usize;
+    /// Read a half's superblock at `base`; `Some(generation)` if it carries our magic +
+    /// format version (i.e. a committed half), `None` otherwise (erased / foreign / older
+    /// format / interrupted-before-commit).
+    fn read_super(&mut self, base: u32) -> Result<Option<u32>, FlashError> {
+        let mut hdr = [0u8; 16];
+        self.flash.read(base, &mut hdr).map_err(|_| FlashError::Io)?;
+        let magic = u64::from_le_bytes(hdr[..8].try_into().unwrap());
+        let version = u32::from_le_bytes(hdr[8..12].try_into().unwrap());
+        if magic != SUPER_MAGIC || version != FORMAT_VERSION {
+            return Ok(None);
+        }
+        Ok(Some(u32::from_le_bytes(hdr[12..16].try_into().unwrap())))
+    }
+
+    /// True if generation `x` is strictly newer than `y`, wraparound-safe (the two halves
+    /// only ever hold consecutive generations).
+    fn newer(x: u32, y: u32) -> bool {
+        x != y && x.wrapping_sub(y) < 0x8000_0000
+    }
+
+    /// Rewrite one half as a fresh log: erase it, write `ops` as a single record, then —
+    /// **last, as the commit point** — write the superblock with `generation`. Because the
+    /// superblock lands only after the records, a power cut mid-rewrite leaves the half
+    /// without valid magic, so it's ignored on mount and the other (live) half stands.
+    /// Returns the new absolute `write_off` (end of the written record) on success.
+    fn write_half(&mut self, base: u32, generation: u32, ops: &[WriteOp]) -> Result<u32, FlashError> {
+        let hc = self.half_cap;
+        self.flash.erase(base, base + hc).map_err(|_| FlashError::Io)?;
+        let hlen = Self::header_len();
+        let mut off = base + hlen;
+        if !ops.is_empty() {
+            let rec = Self::encode_record(ops);
+            if off + rec.len() as u32 > base + hc {
+                return Err(FlashError::OutOfSpace);
+            }
+            self.flash.write(off, &rec).map_err(|_| FlashError::Io)?;
+            off += rec.len() as u32;
+        }
+        // Superblock LAST = the commit. Written into freshly-erased (all-ones) cells.
+        let hlen = hlen as usize;
         let mut hdr = vec![0xFFu8; hlen];
         hdr[..8].copy_from_slice(&SUPER_MAGIC.to_le_bytes());
         hdr[8..12].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
-        self.flash.write(0, &hdr).map_err(|_| FlashError::Io)?;
-        // Note: the in-RAM index is left untouched (compaction rewrites *from* it).
-        self.write_off = hlen as u32;
-        self.dirty_tail = false;
-        Ok(())
+        hdr[12..16].copy_from_slice(&generation.to_le_bytes());
+        self.flash.write(base, &hdr).map_err(|_| FlashError::Io)?;
+        Ok(off)
     }
 
     /// Serialize `ops` into a framed record: `len | payload | footer`, padded to the
@@ -161,34 +232,29 @@ impl<F: NorFlash> FlashState<F> {
         true
     }
 
-    /// Verify the superblock, then replay the log into the index; set
-    /// `write_off`/`dirty_tail`. Rejects a blank/foreign region as `Unformatted`.
-    fn mount(&mut self) -> Result<(), FlashError> {
+    /// Replay one half's record log into the index, starting after its superblock and
+    /// bounded by the half. Returns `(next free absolute offset, tail_was_torn)`. A torn
+    /// or corrupt record ends replay (its tail is dropped).
+    fn replay_half(&mut self, base: u32) -> Result<(u32, bool), FlashError> {
         let hlen = Self::header_len();
-        if self.cap < hlen + 8 {
-            return Err(FlashError::OutOfSpace);
-        }
-        let mut magicb = [0u8; 8];
-        self.flash.read(0, &mut magicb).map_err(|_| FlashError::Io)?;
-        if u64::from_le_bytes(magicb) != SUPER_MAGIC {
-            return Err(FlashError::Unformatted);
-        }
-        let mut off = hlen;
+        let end_cap = base + self.half_cap;
+        let mut off = base + hlen;
+        let mut dirty = false;
         loop {
-            if off + 8 > self.cap {
+            if off + 8 > end_cap {
                 break;
             }
             let len = self.read_u32(off)?;
             if len == ERASED {
                 break; // clean end of log
             }
-            // Bounds: header + payload + footer must fit.
+            // Bounds: header + payload + footer must fit in this half.
             let Some(end) = off.checked_add(8).and_then(|x| x.checked_add(len)) else {
-                self.dirty_tail = true;
+                dirty = true;
                 break;
             };
-            if end > self.cap {
-                self.dirty_tail = true;
+            if end > end_cap {
+                dirty = true;
                 break;
             }
             let mut buf = vec![0u8; len as usize + 4];
@@ -202,46 +268,77 @@ impl<F: NorFlash> FlashState<F> {
             if footer != (len ^ COMMIT_MAGIC)
                 || !Self::apply_payload(&buf[..len as usize], &mut self.index)
             {
-                self.dirty_tail = true; // torn / corrupt tail — drop it, self-heal on write
+                dirty = true; // torn / corrupt tail — drop it, self-heal on next write
                 break;
             }
             off += align_up(8 + len, F::WRITE_SIZE as u32);
         }
+        Ok((off, dirty))
+    }
+
+    /// Pick the valid half with the higher generation and replay it into the index; set
+    /// `live_base`/`generation`/`write_off`/`dirty_tail`. Rejects a region with no valid half as
+    /// `Unformatted`. A half whose compaction was interrupted before its superblock
+    /// committed has no valid magic, so it's skipped and the previous generation stands.
+    fn mount(&mut self) -> Result<(), FlashError> {
+        let hlen = Self::header_len();
+        if self.half_cap < hlen + 8 {
+            return Err(FlashError::OutOfSpace);
+        }
+        let a = self.read_super(0)?;
+        let b = self.read_super(self.half_cap)?;
+        let (base, generation) = match (a, b) {
+            (None, None) => return Err(FlashError::Unformatted),
+            (Some(g), None) => (0, g),
+            (None, Some(g)) => (self.half_cap, g),
+            (Some(ga), Some(gb)) => {
+                if Self::newer(ga, gb) {
+                    (0, ga)
+                } else {
+                    (self.half_cap, gb)
+                }
+            }
+        };
+        self.live_base = base;
+        self.generation = generation;
+        self.index.clear();
+        let (off, dirty) = self.replay_half(base)?;
         self.write_off = off;
+        self.dirty_tail = dirty;
         Ok(())
     }
 
-    /// Erase the region, re-lay the superblock, and rewrite the live index as one
-    /// fresh record (also reclaims superseded/tombstoned entries).
+    /// Compact: rewrite the live index as a fresh log into the **inactive** half with the
+    /// next generation, then switch the live half to it. The previously-live half is left
+    /// intact until it is itself overwritten by the *next* compaction, so this is atomic
+    /// against power loss — a crash before the new half commits leaves the old one live.
     fn compact(&mut self) -> Result<(), FlashError> {
         let ops: Vec<WriteOp> = self
             .index
             .iter()
             .map(|(k, v)| WriteOp::Put(k.clone(), v.clone()))
             .collect();
-        self.write_superblock()?; // erase + header; write_off = header_len
-        if ops.is_empty() {
-            return Ok(());
-        }
-        let rec = Self::encode_record(&ops);
-        if self.write_off + rec.len() as u32 > self.cap {
-            return Err(FlashError::OutOfSpace);
-        }
-        let at = self.write_off;
-        self.flash.write(at, &rec).map_err(|_| FlashError::Io)?;
-        self.write_off += rec.len() as u32;
+        let target = self.other_base();
+        let new_gen = self.generation.wrapping_add(1);
+        let new_off = self.write_half(target, new_gen, &ops)?;
+        // Commit: the new half is fully durable (superblock written last) — switch.
+        self.live_base = target;
+        self.generation = new_gen;
+        self.write_off = new_off;
+        self.dirty_tail = false;
         Ok(())
     }
 
-    /// Append one record for `ops`, compacting first if the tail is dirty or full.
+    /// Append one record for `ops`, compacting first if the tail is dirty or the live
+    /// half is full.
     fn append(&mut self, ops: &[WriteOp]) -> Result<(), FlashError> {
         let rec = Self::encode_record(ops);
         let need = rec.len() as u32;
-        if self.dirty_tail || self.write_off + need > self.cap {
+        if self.dirty_tail || self.write_off + need > self.live_base + self.half_cap {
             self.compact()?;
             // After compaction the log is rewritten from the index, so the *new* ops
             // still need appending (they are not yet in the index).
-            if self.write_off + need > self.cap {
+            if self.write_off + need > self.live_base + self.half_cap {
                 return Err(FlashError::OutOfSpace);
             }
         }
@@ -288,30 +385,44 @@ impl<F: NorFlash> FlashLogBackend<F> {
         let mut st = FlashState {
             flash,
             index: BTreeMap::new(),
+            half_cap: FlashState::<F>::half_cap_for(cap),
+            live_base: 0,
+            generation: 0,
             write_off: 0,
-            cap,
             dirty_tail: false,
         };
         st.mount()?;
         Ok(Self::wrap(st))
     }
 
-    /// Erase the region, lay a fresh superblock, and start an empty store (first-time
-    /// provisioning / reset).
+    /// Provision a fresh, empty store: erase both halves and lay down half A's superblock
+    /// (generation 0). First-time provisioning / reset.
     pub fn format(flash: F) -> Result<Self, FlashError> {
         let cap = flash.capacity() as u32;
+        let half_cap = FlashState::<F>::half_cap_for(cap);
         let hlen = FlashState::<F>::header_len();
-        if cap < hlen + 8 {
+        if half_cap < hlen + 8 {
             return Err(FlashError::OutOfSpace);
         }
         let mut st = FlashState {
             flash,
             index: BTreeMap::new(),
+            half_cap,
+            live_base: 0,
+            generation: 0,
             write_off: 0,
-            cap,
             dirty_tail: false,
         };
-        st.write_superblock()?;
+        // Erase the inactive half (so a stale/foreign image there can't masquerade as a
+        // newer generation), then lay down half A as the empty live half at generation 0.
+        st.flash
+            .erase(half_cap, half_cap + half_cap)
+            .map_err(|_| FlashError::Io)?;
+        let off = st.write_half(0, 0, &[])?;
+        st.live_base = 0;
+        st.generation = 0;
+        st.write_off = off;
+        st.dirty_tail = false;
         Ok(Self::wrap(st))
     }
 
@@ -490,6 +601,62 @@ mod tests {
             Some(&199u32.to_le_bytes()[..]),
             "latest value survives many compactions"
         );
+    }
+
+    #[test]
+    fn compaction_ping_pongs_and_remounts_to_latest() {
+        // Many overwrites force repeated compactions that ping-pong between the two
+        // halves; a clean power cycle (remount of the raw bytes) must land on the latest
+        // generation and recover the live set.
+        let snapshot = {
+            let f = FlashLogBackend::format(MockFlash::new(512)).unwrap();
+            for i in 0..200u32 {
+                f.put(b"counter", Bytes::copy_from_slice(&i.to_le_bytes()));
+            }
+            f.put(b"stable", Bytes::from_static(b"keep"));
+            f.with(|s| s.flash.data.clone())
+        };
+        let f = FlashLogBackend::mount(MockFlash { data: snapshot }).unwrap();
+        assert_eq!(
+            f.get(b"counter").as_deref(),
+            Some(&199u32.to_le_bytes()[..]),
+            "remount lands on the latest generation"
+        );
+        assert_eq!(f.get(b"stable").as_deref(), Some(&b"keep"[..]));
+    }
+
+    #[test]
+    fn interrupted_compaction_before_commit_is_ignored() {
+        // The atomicity guarantee: a compaction that wrote its records into the inactive
+        // half but was cut off *before* the superblock (the commit point) landed must be
+        // ignored on mount — the previous committed generation stands, no data is lost or
+        // replaced by the half-written one.
+        let snapshot = {
+            let f = FlashLogBackend::format(MockFlash::new(512)).unwrap();
+            f.put(b"k1", Bytes::from_static(b"v1"));
+            f.put(b"k2", Bytes::from_static(b"v2"));
+            f.with(|s| s.flash.data.clone())
+        };
+        // Forge an *uncommitted* compaction into half B: a record that would overwrite k1
+        // if wrongly trusted, with B's superblock left erased (no valid magic) — exactly
+        // the on-flash state after a power cut between the record write and the superblock.
+        let half_cap = FlashState::<MockFlash>::half_cap_for(512);
+        let hlen = FlashState::<MockFlash>::header_len();
+        let bogus = FlashState::<MockFlash>::encode_record(&[WriteOp::Put(
+            b"k1".to_vec(),
+            Bytes::from_static(b"WRONG"),
+        )]);
+        let mut data = snapshot;
+        let at = (half_cap + hlen) as usize;
+        data[at..at + bogus.len()].copy_from_slice(&bogus);
+
+        let f = FlashLogBackend::mount(MockFlash { data }).unwrap();
+        assert_eq!(
+            f.get(b"k1").as_deref(),
+            Some(&b"v1"[..]),
+            "the uncommitted half is ignored — k1 keeps its committed value"
+        );
+        assert_eq!(f.get(b"k2").as_deref(), Some(&b"v2"[..]));
     }
 
     #[test]
