@@ -14,15 +14,21 @@
 //! - [`PathOp::Teardown`] / [`PathOp::Refresh`]: notify registered
 //!   [`PathControlObserver`]s (e.g. `ndn-pipes`) and propagate along the current route.
 
-use std::sync::Arc;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use ndn_packet::Interest;
+use ndn_packet::{Interest, Name};
 use ndn_pathcontrol::{PathControl, PathOp, SeqStore};
 use ndn_security::{InterestValidationOutcome, Validator};
 use ndn_transport::FaceId;
 
-use crate::fib::{Fib, FibNexthop};
+use crate::fib::Fib;
+
+/// Number of sharded per-target locks (bounds memory vs an unbounded per-target map; a
+/// hash collision merely over-serializes two targets, which is harmless).
+const LOCK_SHARDS: usize = 64;
 
 /// Pluggable **authorization** for a PathControl message — the seam that lets one
 /// primitive carry two trust roots. MAP-Me's `Redirect` is authorized by the prefix's
@@ -50,6 +56,40 @@ impl PathAuthorizer for ValidatorAuthorizer {
     }
 }
 
+/// Accepts **every** PathControl — i.e. permits unauthenticated in-transit FIB rewrites.
+/// **Test / fully-trusted single-administrator deployments only.** There is deliberately
+/// no `Option<authorizer>` on the handler; an open relay must be spelled out via this type
+/// (and [`PathControlHandler::new_unauthenticated`]) so it can't be the default-looking path.
+pub struct AllowAllAuthorizer;
+
+#[async_trait]
+impl PathAuthorizer for AllowAllAuthorizer {
+    async fn authorize(&self, _pc: &PathControl, _interest: &Interest) -> bool {
+        true
+    }
+}
+
+/// Routes authorization **by op** so the two trust roots can't be crossed: a node that
+/// runs both mechanisms wraps its `Redirect` root (prefix `Validator`) and its lifecycle
+/// root (pipe membership) here, and `Redirect` can never be authorized by the membership
+/// root (or vice-versa). Use this instead of installing a single op-agnostic authorizer.
+pub struct OpRoutedAuthorizer {
+    /// Authorizes `Redirect` (MAP-Me FIB rewrite) — typically a [`ValidatorAuthorizer`].
+    pub redirect: Arc<dyn PathAuthorizer>,
+    /// Authorizes `Teardown` / `Refresh` (session lifecycle) — typically pipe membership.
+    pub lifecycle: Arc<dyn PathAuthorizer>,
+}
+
+#[async_trait]
+impl PathAuthorizer for OpRoutedAuthorizer {
+    async fn authorize(&self, pc: &PathControl, interest: &Interest) -> bool {
+        match pc.op {
+            PathOp::Redirect => self.redirect.authorize(pc, interest).await,
+            PathOp::Teardown | PathOp::Refresh => self.lifecycle.authorize(pc, interest).await,
+        }
+    }
+}
+
 /// A consumer of pipe/session-lifecycle PathControl ops. `ndn-pipes` implements this
 /// so a `Teardown`/`Refresh` walking the path closes or extends the live pipe, without
 /// the forwarder knowing what a pipe is. `params` are the message's
@@ -68,16 +108,22 @@ pub trait PathControlObserver: Send + Sync {
 pub struct PathControlHandler {
     fib: Arc<Fib>,
     seq: SeqStore,
-    /// Authorizes the in-transit state mutation. `None` skips authorization (trusted /
-    /// test deployments only) — a production handler must be built with one.
-    authorizer: Option<Arc<dyn PathAuthorizer>>,
+    /// Authorizes the in-transit state mutation — **non-optional**: there is no fail-open
+    /// path. An open relay must be built explicitly via [`new_unauthenticated`](Self::new_unauthenticated).
+    authorizer: Arc<dyn PathAuthorizer>,
     observers: Vec<Arc<dyn PathControlObserver>>,
+    /// Sharded per-target locks: the seq-admit and FIB write for one target run as a
+    /// single critical section (closes the TOCTOU where two admitted Redirects race their
+    /// FIB writes into the wrong order).
+    locks: Vec<Mutex<()>>,
 }
 
 impl PathControlHandler {
+    /// Build with an explicit authorizer (required). Pair with [`OpRoutedAuthorizer`] when
+    /// a node runs both MAP-Me and pipe lifecycle so each op uses its own trust root.
     pub fn new(
         fib: Arc<Fib>,
-        authorizer: Option<Arc<dyn PathAuthorizer>>,
+        authorizer: Arc<dyn PathAuthorizer>,
         observers: Vec<Arc<dyn PathControlObserver>>,
     ) -> Self {
         Self {
@@ -85,7 +131,25 @@ impl PathControlHandler {
             seq: SeqStore::new(),
             authorizer,
             observers,
+            locks: (0..LOCK_SHARDS).map(|_| Mutex::new(())).collect(),
         }
+    }
+
+    /// Build a handler that accepts **unauthenticated** PathControl (via
+    /// [`AllowAllAuthorizer`]). **Test / fully-trusted deployments only** — it permits any
+    /// peer to rewrite this node's FIB.
+    pub fn new_unauthenticated(
+        fib: Arc<Fib>,
+        observers: Vec<Arc<dyn PathControlObserver>>,
+    ) -> Self {
+        Self::new(fib, Arc::new(AllowAllAuthorizer), observers)
+    }
+
+    /// The sharded lock for `target` (hash → shard; collisions only over-serialize).
+    fn lock_for(&self, target: &Name) -> &Mutex<()> {
+        let mut h = DefaultHasher::new();
+        target.hash(&mut h);
+        &self.locks[(h.finish() as usize) % LOCK_SHARDS]
     }
 
     /// Verify, loop-guard, apply the op's per-hop state mutation, and return the faces
@@ -98,20 +162,24 @@ impl PathControlHandler {
         in_face: FaceId,
     ) -> Option<Vec<FaceId>> {
         // (1) Authorize via the pluggable trust root (prefix signature for MAP-Me,
-        // pipe membership for a pipe teardown). Unauthorized control is dropped.
-        if let Some(auth) = &self.authorizer
-            && !auth.authorize(pc, interest).await
-        {
+        // pipe membership for a pipe teardown). Unauthorized control is dropped. Done
+        // before taking the per-target lock since validation may be slow.
+        if !self.authorizer.authorize(pc, interest).await {
             return None; // unauthorized control — drop (anti prefix-hijack / rogue teardown)
         }
 
-        // (2) Loop/staleness guard: only strictly-newer sequences proceed.
-        if !self.seq.admit(&pc.target, pc.seq) {
+        // Serialize the admit→apply critical section per target so concurrent admitted
+        // messages can't reorder their FIB writes (no .await is held under this lock).
+        let _guard = self.lock_for(&pc.target).lock().unwrap();
+
+        // (2) Loop/staleness guard, keyed by (target, op) so independent mechanisms on the
+        // same prefix don't starve each other (see SeqStore docs).
+        if !self.seq.admit(&pc.target, pc.op, pc.seq) {
             return None;
         }
 
         // (3) The current next-hops point toward the *old* location — capture them
-        // (minus the arrival face) to propagate the walk before we overwrite.
+        // (minus the arrival face) to propagate the walk before we mutate.
         let old_faces: Vec<FaceId> = self
             .fib
             .lpm(&pc.target)
@@ -126,15 +194,13 @@ impl PathControlHandler {
 
         match pc.op {
             PathOp::Redirect => {
-                // Repoint the prefix back toward where the update arrived (the new
-                // location) — the MAP-Me trail step.
-                self.fib.set_nexthops(
-                    &pc.target,
-                    vec![FibNexthop {
-                        face_id: in_face,
-                        cost: 0,
-                    }],
-                );
+                // Add/update the arrival face as a next-hop toward the producer's new
+                // location (the MAP-Me trail step). We *merge* rather than replace the set
+                // so a prefix served by multiple producers/paths doesn't lose its
+                // alternatives on one IU; cost 0 reflects the IU's assertion that the
+                // producer is currently reachable this way (the strategy can still fail
+                // over to the retained alternatives).
+                self.fib.add_nexthop(&pc.target, in_face, 0);
             }
             PathOp::Teardown => {
                 // Observer-driven: the FIB isn't clobbered here (a pipe teardown is

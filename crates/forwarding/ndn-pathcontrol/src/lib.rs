@@ -30,6 +30,10 @@ use ndn_foundation_types::{Name, NameComponent};
 /// Keyword component value (`32=PC`) that marks a name as a PathControl message.
 pub const PATHCTL_KEYWORD: &[u8] = b"PC";
 
+/// NDN `ParametersSha256DigestComponent` TLV-TYPE (0x02) — the trailing name component a
+/// signed Interest appends; [`PathControl::parse`] anchors the marker relative to it.
+const PARAMS_SHA256_TYPE: u64 = 0x02;
+
 /// What a PathControl message asks each forwarder on the path to do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -84,15 +88,29 @@ impl PathControl {
     }
 
     /// Recognize + decode a PathControl from an Interest name. Returns `None` if the
-    /// `32=PC` keyword component is absent or the op/seq are malformed. Tolerates
-    /// trailing components after `seq` (e.g. a signed Interest's
-    /// `ParametersSha256DigestComponent`), so it parses the name *as signed*.
+    /// `32=PC` keyword component is absent or the op/seq are malformed.
+    ///
+    /// The marker is **position-anchored**: it must be the third-from-last component
+    /// (`…/PC/op/seq`), or the fourth-from-last when a signed Interest has appended a
+    /// trailing `ParametersSha256DigestComponent` (`…/PC/op/seq/Params`). This prevents an
+    /// ordinary application Interest that merely happens to carry a `32=PC` keyword
+    /// component somewhere in its name from being mis-intercepted as in-transit control
+    /// (a namespace-collision / control-DoS vector if the scan were unanchored).
     pub fn parse(name: &Name) -> Option<Self> {
         let comps = name.components();
-        // Find the keyword marker (type 32, value "PC").
-        let kw = comps.iter().position(|c| {
+        let n = comps.len();
+        let is_pc = |c: &NameComponent| {
             c.typ == NameComponent::keyword(Bytes::new()).typ && c.value.as_ref() == PATHCTL_KEYWORD
-        })?;
+        };
+        // Anchor: PC at n-3 (unsigned `to_name`), or n-4 with a trailing
+        // ParametersSha256DigestComponent (TLV-TYPE 0x02) as the last component (signed).
+        let kw = if n >= 3 && is_pc(&comps[n - 3]) {
+            n - 3
+        } else if n >= 4 && is_pc(&comps[n - 4]) && comps[n - 1].typ == PARAMS_SHA256_TYPE {
+            n - 4
+        } else {
+            return None;
+        };
         let op_comp = comps.get(kw + 1)?;
         let seq_comp = comps.get(kw + 2)?;
         // op: a single byte.
@@ -109,14 +127,20 @@ impl PathControl {
     }
 }
 
-/// Per-target last-seen sequence number — the **loop and staleness guard**. A
+/// Per-`(target, op)` last-seen sequence number — the **loop and staleness guard**. A
 /// PathControl is admitted (and forwarded onward) only if its `seq` is strictly newer
-/// than the last admitted one for the same target; a not-newer message has already
+/// than the last admitted one for the same `(target, op)`; a not-newer message has already
 /// been processed (a loop, a duplicate, or a stale move) and is dropped. This is what
 /// makes the path-walk terminate and survive concurrent/rapid moves.
+///
+/// The key includes the **op**, not just the target: independent mechanisms emit on the
+/// same prefix with independent sequence schemes (MAP-Me `Redirect` uses a per-emitter
+/// counter; pipe `Teardown` uses a wall-clock seq). Sharing one sequence space per target
+/// would let whichever ran first jam the other's later messages as "stale". Keying by
+/// `(target, op)` gives each op its own monotonic space so they can coexist on one name.
 #[derive(Default)]
 pub struct SeqStore {
-    seen: dashmap::DashMap<Name, u64>,
+    seen: dashmap::DashMap<(Name, u8), u64>,
 }
 
 impl SeqStore {
@@ -124,11 +148,11 @@ impl SeqStore {
         Self::default()
     }
 
-    /// Admit `seq` for `target` iff it is strictly newer than the last admitted one,
+    /// Admit `seq` for `(target, op)` iff it is strictly newer than the last admitted one,
     /// recording it. Returns `true` to process+forward, `false` to drop.
-    pub fn admit(&self, target: &Name, seq: u64) -> bool {
+    pub fn admit(&self, target: &Name, op: PathOp, seq: u64) -> bool {
         use dashmap::mapref::entry::Entry;
-        match self.seen.entry(target.clone()) {
+        match self.seen.entry((target.clone(), op as u8)) {
             Entry::Occupied(mut e) => {
                 if seq > *e.get() {
                     *e.get_mut() = seq;
@@ -144,9 +168,9 @@ impl SeqStore {
         }
     }
 
-    /// The last admitted sequence number for `target`, if any (diagnostics).
-    pub fn last(&self, target: &Name) -> Option<u64> {
-        self.seen.get(target).map(|r| *r)
+    /// The last admitted sequence number for `(target, op)`, if any (diagnostics).
+    pub fn last(&self, target: &Name, op: PathOp) -> Option<u64> {
+        self.seen.get(&(target.clone(), op as u8)).map(|r| *r)
     }
 }
 
@@ -284,13 +308,26 @@ mod tests {
     fn seq_store_admits_only_newer() {
         let store = SeqStore::new();
         let t = n("/alice/video");
-        assert!(store.admit(&t, 5), "first is admitted");
-        assert!(!store.admit(&t, 5), "equal is a duplicate/loop — dropped");
-        assert!(!store.admit(&t, 3), "older is stale — dropped");
-        assert!(store.admit(&t, 6), "newer is admitted");
-        assert_eq!(store.last(&t), Some(6));
+        let r = PathOp::Redirect;
+        assert!(store.admit(&t, r, 5), "first is admitted");
+        assert!(!store.admit(&t, r, 5), "equal is a duplicate/loop — dropped");
+        assert!(!store.admit(&t, r, 3), "older is stale — dropped");
+        assert!(store.admit(&t, r, 6), "newer is admitted");
+        assert_eq!(store.last(&t, r), Some(6));
         // Independent per target.
         let t2 = n("/bob/pipe");
-        assert!(store.admit(&t2, 1));
+        assert!(store.admit(&t2, r, 1));
+    }
+
+    #[test]
+    fn seq_store_keys_by_op_not_just_target() {
+        // MAP-Me (Redirect, counter) and pipe (Teardown, wall-clock) share a name but
+        // must not jam each other: each op has its own monotonic space.
+        let store = SeqStore::new();
+        let t = n("/site/thing");
+        assert!(store.admit(&t, PathOp::Teardown, 1_700_000_000_000), "wall-clock teardown");
+        assert!(store.admit(&t, PathOp::Redirect, 5), "small Redirect seq still admitted");
+        assert!(store.admit(&t, PathOp::Redirect, 6));
+        assert!(!store.admit(&t, PathOp::Teardown, 1_699_999_999_999), "older teardown dropped");
     }
 }

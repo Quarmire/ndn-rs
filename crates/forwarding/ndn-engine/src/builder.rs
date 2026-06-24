@@ -666,11 +666,28 @@ impl EngineBuilder {
                         as Arc<dyn crate::path_control::PathAuthorizer>
                 })
             });
-            Some(Arc::new(crate::path_control::PathControlHandler::new(
-                Arc::clone(&fib),
-                authorizer,
-                std::mem::take(&mut self.path_control_observers),
-            )))
+            match authorizer {
+                Some(authorizer) => Some(Arc::new(crate::path_control::PathControlHandler::new(
+                    Arc::clone(&fib),
+                    authorizer,
+                    std::mem::take(&mut self.path_control_observers),
+                ))),
+                // Fail closed: PathControl was requested but there is neither a custom
+                // authorizer nor an engine validator to derive one from. Do NOT install a
+                // no-auth handler (that would accept unauthenticated FIB rewrites);
+                // PathControl Interests then fall through to normal forwarding. For a
+                // deliberately open relay, build a PathControlHandler::new_unauthenticated
+                // and install it explicitly.
+                None => {
+                    tracing::warn!(
+                        target: t::SECURITY,
+                        "PathControl requested but no authorizer or engine validator is \
+                         configured; not installing the handler (fail-closed). Supply a \
+                         PathAuthorizer/validator, or new_unauthenticated() for a trusted relay."
+                    );
+                    None
+                }
+            }
         } else {
             None
         };

@@ -95,18 +95,16 @@ async fn redirect_iu_rewrites_fib_and_walks_the_trail() {
     // The producer moved: a signed Redirect IU arrives on the NEW face.
     h_new.send(signed_iu(&signer, &target, 1)).await.unwrap();
 
-    // FIB is repointed to the NEW face…
+    // The arrival (NEW) face is added as a next-hop toward the producer's new location…
     let start = Instant::now();
-    while start.elapsed() < Duration::from_secs(2) {
-        if fib_faces(&engine, &target).await == vec![FaceId(NEW)] {
-            break;
-        }
+    while start.elapsed() < Duration::from_secs(2)
+        && !fib_faces(&engine, &target).await.contains(&FaceId(NEW))
+    {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert_eq!(
-        fib_faces(&engine, &target).await,
-        vec![FaceId(NEW)],
-        "Redirect must repoint the prefix to the face the IU arrived on"
+    assert!(
+        fib_faces(&engine, &target).await.contains(&FaceId(NEW)),
+        "Redirect must add the face the IU arrived on as a next-hop"
     );
     // …and the IU is propagated down the old trail (out the OLD face).
     assert!(
@@ -114,6 +112,41 @@ async fn redirect_iu_rewrites_fib_and_walks_the_trail() {
         "the IU must walk on toward the previous attachment"
     );
 
+    shutdown.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn redirect_preserves_other_nexthops() {
+    // G3.5: a Redirect must MERGE (add the arrival face), not nuke the set — a prefix
+    // served by multiple producers/paths keeps its alternatives across an IU.
+    let key = n(KEY);
+    let signer = Ed25519Signer::from_seed(&[7u8; 32], key.clone());
+    let target = n("/alice/video");
+    let (f_new, h_new) = InProcFace::new_kind(FaceId(NEW), 64, FaceKind::Tcp);
+    let (f_old, _h_old) = InProcFace::new_kind(FaceId(OLD), 64, FaceKind::Tcp);
+    let (engine, shutdown) = EngineBuilder::new(EngineConfig::default())
+        .validator(Arc::new(validator_trusting(&signer, &key)))
+        .with_producer_mobility()
+        .face(f_new)
+        .face(f_old)
+        .build()
+        .await
+        .unwrap();
+    // Two existing paths (anycast / multipath) via OLD and NEW... seed only OLD here, plus
+    // a third face id that must survive.
+    engine.fib().add_nexthop(&target, FaceId(OLD), 0);
+    engine.fib().add_nexthop(&target, FaceId(99), 0);
+
+    h_new.send(signed_iu(&signer, &target, 1)).await.unwrap();
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(2)
+        && !fib_faces(&engine, &target).await.contains(&FaceId(NEW))
+    {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let faces = fib_faces(&engine, &target).await;
+    assert!(faces.contains(&FaceId(NEW)), "arrival face added");
+    assert!(faces.contains(&FaceId(99)), "an unrelated alternative path must survive the IU");
     shutdown.shutdown().await;
 }
 
@@ -167,23 +200,25 @@ async fn stale_sequence_is_dropped() {
         .unwrap();
     engine.fib().add_nexthop(&target, FaceId(OLD), 0);
 
-    // seq=5 redirects to NEW.
+    // seq=5 (Redirect) adds NEW and propagates down the trail (out OLD).
     h_new.send(signed_iu(&signer, &target, 5)).await.unwrap();
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(2)
-        && fib_faces(&engine, &target).await != vec![FaceId(NEW)]
+        && !fib_faces(&engine, &target).await.contains(&FaceId(NEW))
     {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert_eq!(fib_faces(&engine, &target).await, vec![FaceId(NEW)]);
+    assert!(fib_faces(&engine, &target).await.contains(&FaceId(NEW)));
+    // Drain the first IU's propagation out the OLD face.
+    let _ = recv_timeout(&h_old).await;
 
-    // A stale seq=3 arriving on the OLD face must NOT redirect back (loop guard).
-    h_old.send(signed_iu(&signer, &target, 3)).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(
-        fib_faces(&engine, &target).await,
-        vec![FaceId(NEW)],
-        "a stale (older) sequence must be dropped, leaving the FIB at the newer redirect"
+    // A stale seq=3 (same op) arriving on OLD is dropped by the loop guard — so it does
+    // NOT walk onward. (Under merge semantics the dropped vs admitted FIB look identical,
+    // so we observe the guard via propagation: a dropped message produces no walk.)
+    h_new.send(signed_iu(&signer, &target, 3)).await.unwrap();
+    assert!(
+        recv_timeout(&h_old).await.is_none(),
+        "a stale (older) sequence must be dropped and not propagate onward"
     );
 
     shutdown.shutdown().await;
