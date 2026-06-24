@@ -33,16 +33,14 @@ use ndn_packet::encode::DataBuilder;
 use ndn_packet::{Name, NameComponent};
 
 /// Keyword name component (`32=TRH`) marking an Interest as a traceroute probe whose hop
-/// limit expiry should draw a hop-identity reply (vs a normal silent drop).
-pub const TRACEROUTE_KEYWORD: &[u8] = b"TRH";
+/// limit expiry should draw a hop-identity reply (vs a normal silent drop). The wire value
+/// is the shared [`ndn_packet::traceroute_wire`] constant (single source of truth across
+/// the responder and the `ndn-traceroute` prober — G9.3).
+pub use ndn_packet::traceroute_wire::{HOP_IDENTITY_MAGIC, TRACEROUTE_KEYWORD};
 
 /// TLV-TYPE of a `ParametersSha256DigestComponent` — the only component that legitimately
 /// trails the marker on a *signed* probe.
 const PARAMS_SHA256_TYPE: u64 = 0x02;
-
-/// Magic prefix on a hop-identity reply's Content, so the prober tells an intermediate
-/// hop's identity reply apart from the destination producer's own answer.
-pub const HOP_IDENTITY_MAGIC: &[u8] = b"\xF0HOP";
 
 /// Whether `name` carries the traceroute probe marker (`32=TRH`) **in the anchored
 /// position**: the last component, or the second-to-last when the last is a

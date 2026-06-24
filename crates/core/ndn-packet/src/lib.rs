@@ -43,6 +43,19 @@ pub use subscription::{
     MAX_PERSISTENT_LIFETIME_SECS, SubscriptionRequest, TLV_SUBSCRIPTION_REQUEST,
 };
 
+/// The traceroute hop-identity **wire contract** (G9) — the single source of truth shared
+/// by the forwarder's responder (`ndn-engine`) and the `ndn-traceroute` prober
+/// (`ndn-tools-core`), so the two can't drift. Lives here (the shared wire crate both
+/// depend on) rather than being copy-pasted per repo.
+pub mod traceroute_wire {
+    /// Name-component value (`32=TRH` keyword) marking a probe whose hop-limit expiry should
+    /// draw a hop-identity reply instead of a silent drop.
+    pub const TRACEROUTE_KEYWORD: &[u8] = b"TRH";
+    /// Magic prefix on a hop-identity reply's Content, distinguishing an intermediate hop's
+    /// self-identification from the destination producer's own answer.
+    pub const HOP_IDENTITY_MAGIC: &[u8] = b"\xF0HOP";
+}
+
 /// True when a TLV-TYPE is *critical* per NDN Packet Format v0.3 `tlv.html`:
 /// types 0..31 are grandfathered as critical, otherwise odd is critical.
 /// Decoders MUST abort on an unrecognized critical TLV at any body level.
