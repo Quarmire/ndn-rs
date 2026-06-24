@@ -109,6 +109,10 @@ impl PacketDispatcher {
     async fn process_packet_inner(&self, pkt: InboundPacket) {
         trace!(target: t::FWD_PIPELINE, face=%pkt.face_id, len=pkt.raw.len(), "pipeline: packet arrived");
         let meta = pkt.meta;
+        let face_id = pkt.face_id;
+        // G9: keep the raw wire only when a hop responder is configured, so a hop-limited
+        // *trace probe* can be answered with this node's identity instead of dropped.
+        let trace_raw = self.traceroute_responder.as_ref().map(|_| pkt.raw.clone());
         let ctx = match self.decode.decode_resolved(
             pkt.raw,
             pkt.face_id,
@@ -118,6 +122,22 @@ impl PacketDispatcher {
             Action::Continue(ctx) => ctx,
             Action::Drop(DropReason::FragmentCollect) => {
                 trace!(target: t::FACE_LP, face=%pkt.face_id, "fragment collected, awaiting reassembly");
+                return;
+            }
+            Action::Drop(DropReason::HopLimitExceeded) => {
+                if let (Some(resp), Some(raw)) = (&self.traceroute_responder, trace_raw)
+                    && let Ok(interest) = ndn_packet::Interest::decode(raw)
+                    && crate::traceroute::is_trace_probe(&interest.name)
+                {
+                    // Reply with our identity out the in-face; the upstream hop's PIT
+                    // carries it back to the prober. (Distance-only probes are unmarked
+                    // and still drop below.)
+                    let reply = crate::traceroute::identity_reply(&interest.name, &resp.node_name);
+                    self.enqueue_send(face_id, reply, crate::engine::EgressIntent::default())
+                        .await;
+                    return;
+                }
+                debug!(target: t::FWD_PIPELINE, face=%pkt.face_id, "drop at decode (hop limit exceeded)");
                 return;
             }
             Action::Drop(r) => {

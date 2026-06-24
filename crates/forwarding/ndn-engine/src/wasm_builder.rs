@@ -355,6 +355,8 @@ impl WasmEngineBuilder {
             name_activity: None,
             // No egress QoS in the in-browser single-node engine.
             name_classifier: None,
+            // No traceroute responder in the in-browser single-node engine.
+            traceroute_responder: None,
             // PathControl (producer mobility) is a multi-forwarder concern; not wired
             // into the in-browser single-node engine.
             path_control: None,

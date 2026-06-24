@@ -101,6 +101,10 @@ pub struct PacketDispatcher {
     /// (and faces have no scheduler, so the FIFO default applies). When `Some`, outbound
     /// packets are classified by name and routed into the face's `PriorityScheduler`.
     pub name_classifier: Option<Arc<dyn crate::egress::EgressClassifier>>,
+    /// G9 traceroute hop responder (opt-in). `None` ⇒ hop-limited probes drop silently
+    /// (default); when `Some`, a marked trace probe whose HopLimit expires here is answered
+    /// with this node's identity.
+    pub traceroute_responder: Option<Arc<crate::traceroute::TracerouteResponder>>,
     /// Which data-plane runtime to spawn. Default `Shared`.
     pub data_plane: DataPlane,
 }

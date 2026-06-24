@@ -132,6 +132,8 @@ pub struct EngineBuilder {
     /// G4 egress QoS (opt-in): classifier + the per-face scheduler factory.
     egress_classifier: Option<Arc<dyn crate::egress::EgressClassifier>>,
     egress_factory: Option<crate::egress::EgressSchedulerFactory>,
+    /// G9 traceroute hop responder (opt-in).
+    traceroute_responder: Option<Arc<crate::traceroute::TracerouteResponder>>,
 }
 
 impl EngineBuilder {
@@ -159,6 +161,7 @@ impl EngineBuilder {
             name_activity: None,
             egress_classifier: None,
             egress_factory: None,
+            traceroute_responder: None,
             path_control: false,
             path_control_observers: Vec::new(),
             path_authorizer: None,
@@ -272,6 +275,16 @@ impl EngineBuilder {
             Arc::new(crate::egress::DeficitRoundRobinScheduler::new(quantum, capacity))
                 as Arc<dyn crate::egress::EgressScheduler>
         }));
+        self
+    }
+
+    /// Enable the G9 traceroute hop responder: a marked trace probe whose `HopLimit`
+    /// expires at this node is answered with `node_name` (so `ndn-traceroute --identify`
+    /// can name each hop) instead of being dropped silently. Off by default. The identity
+    /// is advisory (digest-signed), like IP traceroute.
+    pub fn with_traceroute_responder(mut self, node_name: ndn_packet::Name) -> Self {
+        self.traceroute_responder =
+            Some(Arc::new(crate::traceroute::TracerouteResponder::new(node_name)));
         self
     }
 
@@ -715,6 +728,7 @@ impl EngineBuilder {
             congestion_feedback: congestion_fb,
             name_activity: self.name_activity,
             name_classifier: self.egress_classifier,
+            traceroute_responder: self.traceroute_responder,
             path_control,
             data_plane: self.config.data_plane,
         };

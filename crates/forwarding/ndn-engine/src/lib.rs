@@ -22,6 +22,7 @@ pub mod builder;
 pub mod activity;
 pub mod compose;
 pub mod egress;
+pub mod traceroute;
 pub mod discovery_context;
 pub mod dispatcher;
 pub mod engine;
@@ -50,6 +51,7 @@ pub mod wasm_builder;
 pub use builder::{EngineBuilder, EngineConfig};
 pub use activity::NameActivityObserver;
 pub use compose::ComposedStrategy;
+pub use traceroute::TracerouteResponder;
 pub use egress::{
     DeficitRoundRobinScheduler, EgressClassifier, EgressScheduler, EgressSchedulerFactory,
     PrefixClassifier, PriorityScheduler, TrafficClass,
