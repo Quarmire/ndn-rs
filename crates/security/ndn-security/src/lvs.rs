@@ -24,6 +24,12 @@ use std::sync::Arc;
 use bytes::Bytes;
 use ndn_packet::{Name, NameComponent};
 
+/// Max `walk_inner` node visits per name (DoS guard for overlapping-pattern-edge schemas
+/// against a crafted name — bounds CPU + the per-step bindings clones).
+const MAX_WALK_STEPS: u32 = 100_000;
+/// Max terminal endings collected per name (further caps a pathological fan-out).
+const MAX_WALK_ENDINGS: usize = 256;
+
 /// LVS binary format version supported by this parser.
 ///
 /// Must match python-ndn's `binary.VERSION`. See the module docs for
@@ -377,10 +383,15 @@ impl LvsModel {
         }
         let start = self.start_id;
         let bindings: HashMap<u64, NameComponent> = HashMap::new();
-        self.walk_inner(start, name.components(), 0, bindings, registry, &mut out);
+        // `check_with` runs this on the Data/cert validation hot path with an
+        // attacker-influenced name, so cap total work: a schema with overlapping pattern
+        // edges branches ~k^depth, each step cloning the bindings map.
+        let mut budget = MAX_WALK_STEPS;
+        self.walk_inner(start, name.components(), 0, bindings, registry, &mut budget, &mut out);
         out
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn walk_inner(
         &self,
         node_id: u64,
@@ -388,8 +399,15 @@ impl LvsModel {
         depth: usize,
         bindings: HashMap<u64, NameComponent>,
         registry: &UserFnRegistry,
+        budget: &mut u32,
         out: &mut Vec<(u64, HashMap<u64, NameComponent>)>,
     ) {
+        // Bound the branching walk (DoS guard) — and stop once enough endings are found.
+        if *budget == 0 || out.len() >= MAX_WALK_ENDINGS {
+            return;
+        }
+        *budget -= 1;
+
         if depth == comps.len() {
             out.push((node_id, bindings));
             return;
@@ -402,21 +420,22 @@ impl LvsModel {
         // Per the spec: check ValueEdges for exact matches first.
         for ve in &node.value_edges {
             if &ve.value == comp {
-                self.walk_inner(ve.dest, comps, depth + 1, bindings.clone(), registry, out);
+                self.walk_inner(ve.dest, comps, depth + 1, bindings.clone(), registry, budget, out);
             }
         }
 
-        // Then PatternEdges. Per the spec: when multiple PatternEdges can
-        // match, the first one in the file should hit. We explore all
-        // matching edges so that alternative paths for the key-name walk
-        // still get considered, but we stop at the first successful
-        // terminal — matching the "first occurring" semantics is done by
-        // the caller (which picks out[0] if out is non-empty).
+        // Then PatternEdges. NOTE: this walk is **existential** — it explores every
+        // matching pattern edge and collects *all* reachable terminals; `check_with` then
+        // authorizes if ANY data ending pairs with ANY key ending under a sign constraint.
+        // This is more permissive than python-ndn's first-matching-edge rule: a schema with
+        // overlapping pattern edges that lead to different sign-constraint sets authorizes
+        // their union, so schema authors should avoid such overlaps. (The earlier comment
+        // claiming the caller picks `out[0]` was incorrect — there is no first-match cut.)
         for pe in &node.pattern_edges {
             if self.pattern_edge_matches(pe, comp, &bindings, registry) {
                 let mut new_bindings = bindings.clone();
                 new_bindings.insert(pe.tag, comp.clone());
-                self.walk_inner(pe.dest, comps, depth + 1, new_bindings, registry, out);
+                self.walk_inner(pe.dest, comps, depth + 1, new_bindings, registry, budget, out);
             }
         }
     }

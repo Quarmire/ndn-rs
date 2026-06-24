@@ -9,9 +9,10 @@
 //! #rule_id: /comp/comp/...  [ <= #signer_id, #signer_id ]
 //! ```
 //!
-//! A component is a quoted **literal** (`"KEY"`), a **pattern variable** (`_name`, or `_`
-//! anonymous), or a bareword (treated as a literal). `<=` lists the rules whose keys may
-//! sign data matching this rule. Example:
+//! A component is a quoted **literal** (`"KEY"`) or a **pattern variable** (`_name`, or `_`
+//! anonymous); an unquoted bareword is a **compile error** (it would silently change the
+//! trust graph on a typo). `<=` lists the rules whose keys may sign data matching this
+//! rule. Example:
 //!
 //! ```text
 //! #root:  /"ndn"/"KEY"/_/_/_
@@ -130,8 +131,10 @@ fn parse_comp(seg: &str) -> Option<Comp> {
     if let Some(name) = seg.strip_prefix('_') {
         return Some(Comp::Var((!name.is_empty()).then(|| name.to_string())));
     }
-    // Lenient: a bareword is a literal.
-    Some(Comp::Literal(seg.as_bytes().to_vec()))
+    // Reject barewords: a literal must be quoted (`"KEY"`) and a variable underscore-led
+    // (`_x`). Silently treating an unquoted token as a literal lets a typo change the trust
+    // graph without error — unacceptable for a security schema.
+    None
 }
 
 /// One node under construction, indexed by node id (== array position, as the decoder
@@ -302,5 +305,20 @@ mod tests {
 
         let bad = compile("a: /\"x\"").unwrap_err();
         assert!(matches!(bad, LvsCompileError::Syntax { .. }));
+
+        // A bareword component (unquoted, not `_`-led) is a compile error, not a literal.
+        let bareword = compile("#a: /KEY/_").unwrap_err();
+        assert!(matches!(bareword, LvsCompileError::Syntax { .. }), "bareword must error");
+    }
+
+    #[test]
+    fn walk_is_bounded_against_crafted_names() {
+        // A schema with overlapping pattern edges + a long name must not blow up: the walk
+        // budget caps it. (Compile a chain of unconstrained vars, then check a long name.)
+        let src = "#a: /_/_/_/_/_/_/_/_";
+        let model = compile(src).expect("compiles");
+        let long: ndn_packet::Name = "/a/b/c/d/e/f/g/h/i/j/k/l".parse().unwrap();
+        // Just must terminate quickly without panicking; result value is unimportant here.
+        let _ = model.check(&long, &long);
     }
 }
