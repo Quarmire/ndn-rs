@@ -61,7 +61,7 @@ pub use error::TrustError;
 pub use key_store::{KeyAlgorithm, KeyStore, MemKeyStore};
 pub use keychain::KeyChain;
 pub use keyring::Keyring;
-pub use lvs::{LvsError, LvsModel};
+pub use lvs::{LvsError, LvsModel, LvsUserFn, UserFnRegistry};
 pub use manager::{SecurityManager, encode_cert_data, encode_cert_data_with_description};
 pub use pib::{FilePib, PibError};
 pub use profile::SecurityProfile;

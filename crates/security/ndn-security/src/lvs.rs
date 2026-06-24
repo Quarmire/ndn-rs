@@ -18,7 +18,8 @@
 //!
 //! [`TrustSchema::from_lvs_binary`]: crate::TrustSchema::from_lvs_binary
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use ndn_packet::{Name, NameComponent};
@@ -169,6 +170,67 @@ pub struct LvsTagSymbol {
     pub ident: String,
 }
 
+/// A user-function handler (G8): given the matched name `component` and the resolved
+/// arguments (literal args + bound tag values, in declared order), decide whether the
+/// constraint is satisfied. Registered in a [`UserFnRegistry`] and dispatched by
+/// [`LvsModel::check_with`].
+pub type LvsUserFn = Arc<dyn Fn(&NameComponent, &[NameComponent]) -> bool + Send + Sync>;
+
+/// Maps LVS user-function ids (`$eq`, `$regex`, …) to handlers, turning a schema that
+/// uses them from fail-closed-rejected into enforceable. Unregistered functions still
+/// fail closed (never match), so an unknown `$fn` can't fail open. The default registry
+/// carries the built-in `$eq`; supply `$regex` / custom predicates via [`register`].
+///
+/// [`register`]: UserFnRegistry::register
+#[derive(Clone, Default)]
+pub struct UserFnRegistry {
+    fns: HashMap<String, LvsUserFn>,
+}
+
+impl std::fmt::Debug for UserFnRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut ids: Vec<&str> = self.fns.keys().map(String::as_str).collect();
+        ids.sort_unstable();
+        f.debug_struct("UserFnRegistry").field("fns", &ids).finish()
+    }
+}
+
+impl UserFnRegistry {
+    /// An empty registry — every user function fails closed (the pre-G8 behaviour).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A registry with the dependency-free built-in `$eq` (the component equals the
+    /// single argument). `$regex` and other predicates are caller-supplied via
+    /// [`register`](Self::register) so this core crate pulls no regex engine.
+    pub fn with_builtins() -> Self {
+        let mut r = Self::new();
+        r.register(
+            "$eq",
+            Arc::new(|comp: &NameComponent, args: &[NameComponent]| {
+                args.len() == 1 && &args[0] == comp
+            }),
+        );
+        r
+    }
+
+    /// Register (or replace) the handler for `fn_id` (e.g. `"$regex"`).
+    pub fn register(&mut self, fn_id: impl Into<String>, handler: LvsUserFn) -> &mut Self {
+        self.fns.insert(fn_id.into(), handler);
+        self
+    }
+
+    /// Whether `fn_id` has a handler.
+    pub fn covers(&self, fn_id: &str) -> bool {
+        self.fns.contains_key(fn_id)
+    }
+
+    fn get(&self, fn_id: &str) -> Option<&LvsUserFn> {
+        self.fns.get(fn_id)
+    }
+}
+
 impl LvsModel {
     /// Parse an LVS binary model from its TLV wire bytes.
     ///
@@ -281,18 +343,41 @@ impl LvsModel {
         self.uses_user_functions
     }
 
+    /// The set of user-function ids this schema references (e.g. `{"$eq", "$regex"}`).
+    /// A caller uses it to confirm a [`UserFnRegistry`] covers every function before
+    /// enforcing the schema, rather than silently fail-closing an unhandled one.
+    pub fn user_fn_ids(&self) -> HashSet<String> {
+        let mut ids = HashSet::new();
+        for node in &self.nodes {
+            for pe in &node.pattern_edges {
+                for cons in &pe.constraints {
+                    for opt in &cons.options {
+                        if let LvsConstraintOption::UserFn(call) = opt {
+                            ids.insert(call.fn_id.clone());
+                        }
+                    }
+                }
+            }
+        }
+        ids
+    }
+
     /// Walk the LVS graph for `name`, collecting the set of reachable
     /// `(node_id, bindings)` pairs where the walk has consumed all of
     /// `name`'s components. Multiple endings are possible because different
     /// pattern-edge choices can lead to different terminal nodes.
-    fn walk(&self, name: &Name) -> Vec<(u64, HashMap<u64, NameComponent>)> {
+    fn walk(
+        &self,
+        name: &Name,
+        registry: &UserFnRegistry,
+    ) -> Vec<(u64, HashMap<u64, NameComponent>)> {
         let mut out = Vec::new();
         if self.nodes.is_empty() {
             return out;
         }
         let start = self.start_id;
         let bindings: HashMap<u64, NameComponent> = HashMap::new();
-        self.walk_inner(start, name.components(), 0, bindings, &mut out);
+        self.walk_inner(start, name.components(), 0, bindings, registry, &mut out);
         out
     }
 
@@ -302,6 +387,7 @@ impl LvsModel {
         comps: &[NameComponent],
         depth: usize,
         bindings: HashMap<u64, NameComponent>,
+        registry: &UserFnRegistry,
         out: &mut Vec<(u64, HashMap<u64, NameComponent>)>,
     ) {
         if depth == comps.len() {
@@ -316,7 +402,7 @@ impl LvsModel {
         // Per the spec: check ValueEdges for exact matches first.
         for ve in &node.value_edges {
             if &ve.value == comp {
-                self.walk_inner(ve.dest, comps, depth + 1, bindings.clone(), out);
+                self.walk_inner(ve.dest, comps, depth + 1, bindings.clone(), registry, out);
             }
         }
 
@@ -327,10 +413,10 @@ impl LvsModel {
         // terminal — matching the "first occurring" semantics is done by
         // the caller (which picks out[0] if out is non-empty).
         for pe in &node.pattern_edges {
-            if self.pattern_edge_matches(pe, comp, &bindings) {
+            if self.pattern_edge_matches(pe, comp, &bindings, registry) {
                 let mut new_bindings = bindings.clone();
                 new_bindings.insert(pe.tag, comp.clone());
-                self.walk_inner(pe.dest, comps, depth + 1, new_bindings, out);
+                self.walk_inner(pe.dest, comps, depth + 1, new_bindings, registry, out);
             }
         }
     }
@@ -340,13 +426,14 @@ impl LvsModel {
         edge: &LvsPatternEdge,
         comp: &NameComponent,
         bindings: &HashMap<u64, NameComponent>,
+        registry: &UserFnRegistry,
     ) -> bool {
         // Every constraint must be satisfied (AND). If there are no
         // constraints, the edge always matches.
         edge.constraints.iter().all(|c| {
             c.options
                 .iter()
-                .any(|opt| self.option_matches(opt, comp, bindings))
+                .any(|opt| self.option_matches(opt, comp, bindings, registry))
         })
     }
 
@@ -355,12 +442,31 @@ impl LvsModel {
         opt: &LvsConstraintOption,
         comp: &NameComponent,
         bindings: &HashMap<u64, NameComponent>,
+        registry: &UserFnRegistry,
     ) -> bool {
         match opt {
             LvsConstraintOption::Value(v) => v == comp,
             LvsConstraintOption::Tag(t) => bindings.get(t).is_some_and(|prev| prev == comp),
-            // User functions are not dispatched in v0.1.0 — they never match.
-            LvsConstraintOption::UserFn(_) => false,
+            // Dispatch through the registry (G8). Resolve each argument — a literal
+            // value, or a tag's bound component — then call the handler. An unregistered
+            // function, or a tag argument not yet bound, fails closed (never matches), so
+            // user functions can't fail open.
+            LvsConstraintOption::UserFn(call) => {
+                let Some(handler) = registry.get(&call.fn_id) else {
+                    return false;
+                };
+                let mut args = Vec::with_capacity(call.args.len());
+                for a in &call.args {
+                    match a {
+                        LvsUserFnArg::Value(c) => args.push(c.clone()),
+                        LvsUserFnArg::Tag(t) => match bindings.get(t) {
+                            Some(c) => args.push(c.clone()),
+                            None => return false,
+                        },
+                    }
+                }
+                handler(comp, &args)
+            }
         }
     }
 
@@ -371,11 +477,23 @@ impl LvsModel {
     /// 2. `D` has at least one `SignConstraint`, and
     /// 3. `key_name` reaches a node whose id is listed in `D.sign_constraints`.
     pub fn check(&self, data_name: &Name, key_name: &Name) -> bool {
-        let data_endings = self.walk(data_name);
+        // No registry ⇒ user functions fail closed (the conservative default).
+        self.check_with(data_name, key_name, &UserFnRegistry::new())
+    }
+
+    /// As [`check`](Self::check), but dispatching the schema's user functions through
+    /// `registry` (G8). A function with no handler still fails closed.
+    pub fn check_with(
+        &self,
+        data_name: &Name,
+        key_name: &Name,
+        registry: &UserFnRegistry,
+    ) -> bool {
+        let data_endings = self.walk(data_name, registry);
         if data_endings.is_empty() {
             return false;
         }
-        let key_endings = self.walk(key_name);
+        let key_endings = self.walk(key_name, registry);
         if key_endings.is_empty() {
             return false;
         }
@@ -965,5 +1083,90 @@ mod tests {
             !model.check(&name(&["123"]), &name(&["123"])),
             "unsupported user functions must fail closed rather than matching as true"
         );
+    }
+
+    /// G8: a `$eq` user-function constraint is enforced when dispatched through a registry,
+    /// and still fails closed without one.
+    #[test]
+    fn user_fn_dispatch_enforces_eq() {
+        use type_number as tn;
+
+        let mut out = BytesMut::new();
+        write_uint_tlv(&mut out, tn::VERSION, LVS_VERSION);
+        write_uint_tlv(&mut out, tn::NODE_ID, 0); // start node
+        write_uint_tlv(&mut out, tn::NAMED_PATTERN_NUM, 2);
+
+        // Node 0: a $eq("doc") pattern edge → node 1 (data terminal), plus an
+        // unconstrained pattern edge → node 2 (the key terminal, matches anything).
+        {
+            let mut node = BytesMut::new();
+            write_uint_tlv(&mut node, tn::NODE_ID, 0);
+            {
+                let mut pe = BytesMut::new();
+                write_uint_tlv(&mut pe, tn::NODE_ID, 1);
+                write_uint_tlv(&mut pe, tn::PATTERN_TAG, 1);
+                let mut cons = BytesMut::new();
+                let mut opt = BytesMut::new();
+                let mut call = BytesMut::new();
+                write_tlv(&mut call, tn::USER_FN_ID, b"$eq");
+                let mut args = BytesMut::new();
+                write_component_value_tlv(&mut args, b"doc");
+                write_tlv(&mut call, tn::FN_ARGS, &args);
+                write_tlv(&mut opt, tn::USER_FN_CALL, &call);
+                write_tlv(&mut cons, tn::CONS_OPTION, &opt);
+                write_tlv(&mut pe, tn::CONSTRAINT, &cons);
+                write_tlv(&mut node, tn::PATTERN_EDGE, &pe);
+            }
+            {
+                let mut pe = BytesMut::new();
+                write_uint_tlv(&mut pe, tn::NODE_ID, 2);
+                write_uint_tlv(&mut pe, tn::PATTERN_TAG, 2);
+                write_tlv(&mut node, tn::PATTERN_EDGE, &pe);
+            }
+            write_tlv(&mut out, tn::NODE, &node);
+        }
+        // Node 1 (data terminal): may be signed by a key reaching node 2.
+        {
+            let mut node = BytesMut::new();
+            write_uint_tlv(&mut node, tn::NODE_ID, 1);
+            write_uint_tlv(&mut node, tn::KEY_NODE_ID, 2);
+            write_tlv(&mut out, tn::NODE, &node);
+        }
+        // Node 2 (key terminal).
+        {
+            let mut node = BytesMut::new();
+            write_uint_tlv(&mut node, tn::NODE_ID, 2);
+            write_tlv(&mut out, tn::NODE, &node);
+        }
+
+        let model = LvsModel::decode(&out).expect("decodes");
+        assert!(model.uses_user_functions());
+        assert_eq!(
+            model.user_fn_ids(),
+            ["$eq".to_string()].into_iter().collect::<HashSet<_>>()
+        );
+
+        let doc = name(&["doc"]);
+        let img = name(&["img"]);
+        let key = name(&["k"]);
+        let reg = UserFnRegistry::with_builtins();
+
+        // Dispatched: $eq("doc") authorizes /doc (signed by /k) but rejects /img.
+        assert!(model.check_with(&doc, &key, &reg), "$eq(doc) matches → authorized");
+        assert!(!model.check_with(&img, &key, &reg), "$eq(doc) rejects /img");
+        // Fail-closed without a handler: default check, and an empty registry.
+        assert!(!model.check(&doc, &key), "no registry ⇒ user fn fails closed");
+        assert!(!model.check_with(&doc, &key, &UserFnRegistry::new()));
+
+        // A custom predicate registers the same way (the seam $regex would use).
+        let mut custom = UserFnRegistry::new();
+        custom.register(
+            "$eq",
+            Arc::new(|comp: &NameComponent, args: &[NameComponent]| {
+                // case-insensitive "doc" — proves the handler, not the schema, decides.
+                args.len() == 1 && comp.value.eq_ignore_ascii_case(b"doc")
+            }),
+        );
+        assert!(model.check_with(&name(&["DOC"]), &key, &custom), "custom handler dispatched");
     }
 }

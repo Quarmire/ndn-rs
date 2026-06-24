@@ -2,7 +2,7 @@ use ndn_packet::{Name, NameComponent};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::lvs::{LvsError, LvsModel};
+use crate::lvs::{LvsError, LvsModel, UserFnRegistry};
 
 /// Error returned when a pattern or rule string cannot be parsed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -188,6 +188,10 @@ impl std::fmt::Display for SchemaRule {
 pub struct TrustSchema {
     rules: Vec<SchemaRule>,
     lvs: Option<Arc<LvsModel>>,
+    /// User-function handlers ($eq/$regex/…) for the LVS model (G8). Empty unless loaded
+    /// via [`from_lvs_binary_with_user_fns`](Self::from_lvs_binary_with_user_fns), so the
+    /// default path keeps fail-closing user functions.
+    user_fns: UserFnRegistry,
 }
 
 impl TrustSchema {
@@ -195,6 +199,7 @@ impl TrustSchema {
         Self {
             rules: Vec::new(),
             lvs: None,
+            user_fns: UserFnRegistry::new(),
         }
     }
 
@@ -218,6 +223,28 @@ impl TrustSchema {
         Ok(Self {
             rules: Vec::new(),
             lvs: Some(Arc::new(model)),
+            user_fns: UserFnRegistry::new(),
+        })
+    }
+
+    /// As [`from_lvs_binary`](Self::from_lvs_binary), but enforces a schema that uses
+    /// user functions by dispatching them through `registry` (G8). Returns
+    /// [`LvsError::UserFunctionsNotSupported`] only if the schema references a function
+    /// the registry does **not** cover — so an unhandled `$fn` still fails safe at load
+    /// rather than silently never-matching at check time.
+    pub fn from_lvs_binary_with_user_fns(
+        wire: &[u8],
+        registry: UserFnRegistry,
+    ) -> Result<Self, LvsError> {
+        let model = LvsModel::decode(wire)?;
+        if let Some(missing) = model.user_fn_ids().iter().find(|id| !registry.covers(id)) {
+            tracing::warn!(target: "ndn_security::lvs", fn_id = %missing, "LVS schema uses an unregistered user function");
+            return Err(LvsError::UserFunctionsNotSupported);
+        }
+        Ok(Self {
+            rules: Vec::new(),
+            lvs: Some(Arc::new(model)),
+            user_fns: registry,
         })
     }
 
@@ -225,13 +252,14 @@ impl TrustSchema {
         self.lvs.as_deref()
     }
 
-    /// Checks native rules first, then falls through to the LVS model.
+    /// Checks native rules first, then falls through to the LVS model (dispatching any
+    /// user functions through this schema's registry).
     pub fn allows(&self, data_name: &Name, key_name: &Name) -> bool {
         if self.rules.iter().any(|r| r.check(data_name, key_name)) {
             return true;
         }
         if let Some(lvs) = self.lvs.as_deref() {
-            return lvs.check(data_name, key_name);
+            return lvs.check_with(data_name, key_name, &self.user_fns);
         }
         false
     }
