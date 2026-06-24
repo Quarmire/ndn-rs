@@ -51,7 +51,8 @@ pub use builder::{EngineBuilder, EngineConfig};
 pub use activity::NameActivityObserver;
 pub use compose::ComposedStrategy;
 pub use egress::{
-    EgressClassifier, EgressScheduler, PrefixClassifier, PriorityScheduler, TrafficClass,
+    DeficitRoundRobinScheduler, EgressClassifier, EgressScheduler, EgressSchedulerFactory,
+    PrefixClassifier, PriorityScheduler, TrafficClass,
 };
 pub use discovery_context::EngineDiscoveryContext;
 pub use dispatcher::DataPlane;

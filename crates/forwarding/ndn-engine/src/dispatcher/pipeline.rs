@@ -409,10 +409,12 @@ impl PacketDispatcher {
                     }
                     // out_bytes is counted once, in the send loop, where the
                     // framed wire length is known.
-                    self.enqueue_send(
+                    self.enqueue_send_with_source(
                         *face_id,
                         interest_wire.clone(),
+                        FaceId::INVALID,
                         crate::engine::EgressIntent::default(),
+                        self.classify(Some(&name), true),
                     )
                     .await;
                 }

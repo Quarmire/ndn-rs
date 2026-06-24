@@ -129,9 +129,9 @@ pub struct EngineBuilder {
     path_authorizer: Option<Arc<dyn crate::path_control::PathAuthorizer>>,
     /// Opt-in data-plane name-activity observer (e.g. ndn-pipes' relay PUI monitor).
     name_activity: Option<Arc<dyn crate::activity::NameActivityObserver>>,
-    /// G4 egress QoS (opt-in): classifier + per-face scheduler capacity.
+    /// G4 egress QoS (opt-in): classifier + the per-face scheduler factory.
     egress_classifier: Option<Arc<dyn crate::egress::EgressClassifier>>,
-    egress_capacity: usize,
+    egress_factory: Option<crate::egress::EgressSchedulerFactory>,
 }
 
 impl EngineBuilder {
@@ -158,7 +158,7 @@ impl EngineBuilder {
             congestion_feedback: None,
             name_activity: None,
             egress_classifier: None,
-            egress_capacity: crate::engine::DEFAULT_SEND_QUEUE_CAP,
+            egress_factory: None,
             path_control: false,
             path_control_observers: Vec::new(),
             path_authorizer: None,
@@ -237,14 +237,41 @@ impl EngineBuilder {
     /// face a strict-priority [`PriorityScheduler`](crate::egress::PriorityScheduler) of
     /// `capacity` packets, so higher-priority classes transmit first. Off by default
     /// (FIFO per face, zero added cost). Orthogonal to G1 congestion feedback (order vs
-    /// rate/path).
+    /// rate/path). For starvation-free fairness instead, see
+    /// [`with_drr_egress`](Self::with_drr_egress).
     pub fn with_priority_egress(
         mut self,
         classifier: Arc<dyn crate::egress::EgressClassifier>,
         capacity: usize,
     ) -> Self {
+        let capacity = capacity.max(1);
         self.egress_classifier = Some(classifier);
-        self.egress_capacity = capacity.max(1);
+        self.egress_factory = Some(Arc::new(move || {
+            Arc::new(crate::egress::PriorityScheduler::new(capacity))
+                as Arc<dyn crate::egress::EgressScheduler>
+        }));
+        self
+    }
+
+    /// Enable G4 egress QoS with a **Deficit Round Robin** scheduler per face
+    /// ([`DeficitRoundRobinScheduler`](crate::egress::DeficitRoundRobinScheduler)):
+    /// starvation-free, byte-fair scheduling across classes (`quantum` bytes per class per
+    /// round, `capacity` packets total). Use this instead of
+    /// [`with_priority_egress`](Self::with_priority_egress) when low-priority classes must
+    /// keep making progress under sustained high-priority load. `quantum` should be ≥ one
+    /// MTU. Off by default.
+    pub fn with_drr_egress(
+        mut self,
+        classifier: Arc<dyn crate::egress::EgressClassifier>,
+        quantum: u64,
+        capacity: usize,
+    ) -> Self {
+        let capacity = capacity.max(1);
+        self.egress_classifier = Some(classifier);
+        self.egress_factory = Some(Arc::new(move || {
+            Arc::new(crate::egress::DeficitRoundRobinScheduler::new(quantum, capacity))
+                as Arc<dyn crate::egress::EgressScheduler>
+        }));
         self
     }
 
@@ -597,8 +624,7 @@ impl EngineBuilder {
             replay_guard: replay_guard.clone(),
             pipeline_tx: OnceLock::new(),
             require_local_validation: self.config.require_local_validation,
-            egress_classifier: self.egress_classifier.clone(),
-            egress_capacity: self.egress_capacity,
+            egress_factory: self.egress_factory,
             face_states: Arc::clone(&face_states),
             discovery: Arc::clone(&discovery),
             neighbors: Arc::clone(&neighbors),

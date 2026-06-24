@@ -60,3 +60,40 @@ async fn priority_egress_forwards_both_classes() {
     producer.await.unwrap();
     shutdown.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drr_egress_forwards() {
+    // The DRR scheduler path also forwards end to end (starvation-free fairness variant).
+    let (face_a, handle_a) = InProcFace::new(FaceId(A), 128);
+    let (face_b, handle_b) = InProcFace::new(FaceId(B), 128);
+
+    let classifier = Arc::new(PrefixClassifier::new(
+        vec![("/bulk".parse().unwrap(), TrafficClass(5))],
+        TrafficClass::DEFAULT,
+    ));
+
+    let (engine, shutdown) = EngineBuilder::new(EngineConfig::default())
+        .face(face_a)
+        .face(face_b)
+        .with_drr_egress(classifier, 1500, 256)
+        .build()
+        .await
+        .expect("engine build");
+    engine.fib().add_nexthop(&"/".parse().unwrap(), FaceId(B), 0);
+
+    let producer = tokio::spawn(async move {
+        let _i = handle_b.recv().await.expect("forwarded interest");
+        let data = DataBuilder::new("/bulk/seg=0", b"payload").sign_digest_sha256();
+        handle_b.send(data).await.expect("send data");
+    });
+
+    let interest = InterestBuilder::new("/bulk/seg=0").must_be_fresh().build();
+    handle_a.send(interest).await.expect("express interest");
+    let got = tokio::time::timeout(Duration::from_secs(2), handle_a.recv())
+        .await
+        .expect("Data timed out via the DRR egress");
+    assert!(got.is_some(), "Data returned through the DRR scheduler");
+
+    producer.await.unwrap();
+    shutdown.shutdown().await;
+}

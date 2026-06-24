@@ -100,6 +100,11 @@ pub trait EgressScheduler: Send + Sync {
     fn dropped(&self) -> u64;
 }
 
+/// Builds a fresh [`EgressScheduler`] for a face. One per face (each face owns its own
+/// queue), so the engine stores a factory rather than a shared scheduler.
+pub type EgressSchedulerFactory =
+    std::sync::Arc<dyn Fn() -> std::sync::Arc<dyn EgressScheduler> + Send + Sync>;
+
 /// A queued packet, ordered by `(class, seq)` so the heap yields the highest-priority
 /// class first and FIFO within a class.
 struct Pending {
@@ -222,6 +227,139 @@ impl EgressScheduler for PriorityScheduler {
     }
 }
 
+/// Number of traffic classes a [`DeficitRoundRobinScheduler`] serves (0..=7); a higher
+/// [`TrafficClass`] is clamped into this range. Eight covers DiffServ-style class sets.
+pub const DRR_CLASSES: usize = 8;
+
+/// **Deficit Round Robin** scheduler: starvation-free fairness across classes, the
+/// counterpoint to [`PriorityScheduler`] (whose strict priority can starve low classes
+/// under sustained high-class load). Each class accrues a byte `quantum` per round and is
+/// served up to its accumulated deficit, so every backlogged class makes progress and the
+/// long-run share is byte-fair. A single bounded total `capacity`; tail-drop on overflow.
+///
+/// `quantum` should be **≥ the largest expected packet** (e.g. one MTU): a quantum smaller
+/// than a packet still works but makes a class wait extra rounds to accumulate enough
+/// deficit, so a single `dequeue` may scan several rounds before it can release a packet.
+pub struct DeficitRoundRobinScheduler {
+    quantum: u64,
+    capacity: usize,
+    inner: Mutex<DrrInner>,
+    notify: Notify,
+    closed: AtomicBool,
+    dropped: AtomicU64,
+}
+
+struct DrrInner {
+    /// `(size, item)` FIFO per class.
+    queues: Vec<std::collections::VecDeque<(u64, EgressItem)>>,
+    /// Per-class accumulated byte credit.
+    deficit: Vec<u64>,
+    /// Round-robin cursor + whether this visit has been credited a quantum yet.
+    current: usize,
+    credited: bool,
+    len: usize,
+}
+
+impl DeficitRoundRobinScheduler {
+    /// A DRR scheduler with `quantum` bytes per class per round and at most `capacity`
+    /// packets queued across all classes.
+    pub fn new(quantum: u64, capacity: usize) -> Self {
+        Self {
+            quantum: quantum.max(1),
+            capacity: capacity.max(1),
+            inner: Mutex::new(DrrInner {
+                queues: (0..DRR_CLASSES).map(|_| std::collections::VecDeque::new()).collect(),
+                deficit: vec![0; DRR_CLASSES],
+                current: 0,
+                credited: false,
+                len: 0,
+            }),
+            notify: Notify::new(),
+            closed: AtomicBool::new(false),
+            dropped: AtomicU64::new(0),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl EgressScheduler for DeficitRoundRobinScheduler {
+    fn enqueue(&self, item: EgressItem, class: TrafficClass) -> bool {
+        {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.len >= self.capacity {
+                drop(inner);
+                self.dropped.fetch_add(1, AtomicOrdering::Relaxed);
+                return false;
+            }
+            let size = item.0.len() as u64;
+            let c = (class.0 as usize).min(DRR_CLASSES - 1);
+            inner.queues[c].push_back((size, item));
+            inner.len += 1;
+        }
+        self.notify.notify_one();
+        true
+    }
+
+    async fn dequeue(&self) -> Option<EgressItem> {
+        loop {
+            {
+                let mut inner = self.inner.lock().unwrap();
+                if inner.len > 0 {
+                    // DRR: round-robin over classes, crediting `quantum` once per visit,
+                    // releasing the head while the class's deficit covers it. Guaranteed
+                    // to return since `len > 0` (some class is backlogged and accrues
+                    // credit each round until its head fits).
+                    loop {
+                        let cur = inner.current;
+                        if inner.queues[cur].is_empty() {
+                            inner.deficit[cur] = 0; // left the active list
+                            inner.current = (cur + 1) % DRR_CLASSES;
+                            inner.credited = false;
+                            continue;
+                        }
+                        if !inner.credited {
+                            inner.deficit[cur] += self.quantum;
+                            inner.credited = true;
+                        }
+                        let head = inner.queues[cur].front().unwrap().0;
+                        if inner.deficit[cur] >= head {
+                            inner.deficit[cur] -= head;
+                            let (_, item) = inner.queues[cur].pop_front().unwrap();
+                            inner.len -= 1;
+                            return Some(item);
+                        } else {
+                            inner.current = (cur + 1) % DRR_CLASSES;
+                            inner.credited = false;
+                        }
+                    }
+                }
+            }
+            if self.closed.load(AtomicOrdering::Acquire) {
+                let inner = self.inner.lock().unwrap();
+                if inner.len == 0 {
+                    return None;
+                }
+                continue;
+            }
+            self.notify.notified().await;
+        }
+    }
+
+    fn close(&self) {
+        self.closed.store(true, AtomicOrdering::Release);
+        self.notify.notify_one();
+    }
+
+    fn depth(&self) -> (u64, u64) {
+        let inner = self.inner.lock().unwrap();
+        (inner.len as u64, self.capacity as u64)
+    }
+
+    fn dropped(&self) -> u64 {
+        self.dropped.load(AtomicOrdering::Relaxed)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,6 +423,40 @@ mod tests {
         assert!(!s.enqueue(item("c"), TrafficClass(0)), "third is tail-dropped");
         assert_eq!(s.depth(), (2, 2));
         assert_eq!(s.dropped(), 1);
+    }
+
+    #[tokio::test]
+    async fn drr_interleaves_classes_without_starvation() {
+        // Equal-size packets, quantum == packet size ⇒ DRR releases one per class per
+        // round: the low class (5) is interleaved with the high class (0), never starved
+        // behind it (contrast strict priority, which drains class 0 fully first).
+        let s = DeficitRoundRobinScheduler::new(4, 32);
+        for i in 0..3 {
+            assert!(s.enqueue(item(&format!("c0-{i}")), TrafficClass(0)));
+            assert!(s.enqueue(item(&format!("c5-{i}")), TrafficClass(5)));
+        }
+        let mut out = Vec::new();
+        for _ in 0..6 {
+            out.push(tag(&s.dequeue().await.unwrap()));
+        }
+        assert_eq!(out, vec!["c0-0", "c5-0", "c0-1", "c5-1", "c0-2", "c5-2"]);
+    }
+
+    #[tokio::test]
+    async fn drr_byte_fair_share_across_unequal_loads() {
+        // One class floods; another sends a little. DRR still serves both each round, so
+        // the light class's packets are not stuck at the tail behind the flood.
+        let s = DeficitRoundRobinScheduler::new(4, 64);
+        for i in 0..5 {
+            assert!(s.enqueue(item(&format!("hi-{i}")), TrafficClass(0)));
+        }
+        assert!(s.enqueue(item("lo-0"), TrafficClass(3)));
+        // First two dequeues: one from each active class (round-robin), proving the light
+        // class isn't starved behind the flood.
+        let first = tag(&s.dequeue().await.unwrap());
+        let second = tag(&s.dequeue().await.unwrap());
+        assert_eq!(first, "hi-0");
+        assert_eq!(second, "lo-0", "the light class is served the same round, not last");
     }
 
     #[tokio::test]

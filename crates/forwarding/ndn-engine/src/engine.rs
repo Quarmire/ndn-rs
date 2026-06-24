@@ -277,11 +277,10 @@ pub struct EngineInner {
     /// Force Data validation on Local faces as they are added (see
     /// `EngineConfig::require_local_validation`).
     pub(crate) require_local_validation: bool,
-    /// G4 egress QoS (opt-in). When set, every face gets a `PriorityScheduler` of
-    /// `egress_capacity` and the dispatcher classifies outbound packets with this
-    /// classifier. `None` ⇒ the FIFO default on every face.
-    pub(crate) egress_classifier: Option<Arc<dyn crate::egress::EgressClassifier>>,
-    pub(crate) egress_capacity: usize,
+    /// G4 egress QoS (opt-in): the per-face scheduler factory (strict-priority or DRR).
+    /// `None` ⇒ the FIFO default on every face. The matching classifier lives on the
+    /// dispatcher (`name_classifier`), which is where outbound packets are classified.
+    pub(crate) egress_factory: Option<crate::egress::EgressSchedulerFactory>,
     pub(crate) face_states: Arc<DashMap<FaceId, FaceState>>,
     pub discovery: Arc<dyn DiscoveryProtocol>,
     pub neighbors: Arc<NeighborTable>,
@@ -537,13 +536,11 @@ impl ForwarderEngine {
         if self.inner.require_local_validation && scope == ndn_transport::FaceScope::Local {
             state.set_require_data_validation(true);
         }
-        // G4: install a per-face egress scheduler when QoS is configured. The send loop
-        // (run_face_sender) reads `state.scheduler` and drains it instead of `send_rx`.
+        // G4: install a per-face egress scheduler when QoS is configured (the factory
+        // chooses strict-priority or DRR). The send loop (run_face_sender) reads
+        // `state.scheduler` and drains it instead of `send_rx`.
         let scheduler: Option<Arc<dyn crate::egress::EgressScheduler>> =
-            self.inner.egress_classifier.as_ref().map(|_| {
-                Arc::new(crate::egress::PriorityScheduler::new(self.inner.egress_capacity))
-                    as Arc<dyn crate::egress::EgressScheduler>
-            });
+            self.inner.egress_factory.as_ref().map(|f| f());
         state.scheduler = scheduler.clone();
         self.inner.face_states.insert(face_id, state);
 
