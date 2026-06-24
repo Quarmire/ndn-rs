@@ -546,8 +546,10 @@ impl ForwarderEngine {
 
         // Inject the egress queue-depth closure into the LinkService's
         // CongestionMarkingFeature (no-op for PassthroughLinkService). With a scheduler
-        // installed the backlog lives there (send_tx is a 1-deep handoff), so read its
-        // depth; otherwise read the mpsc's fill level.
+        // installed the backlog lives entirely in it — enqueue admits into the scheduler
+        // and the send loop drains it, so `send_tx`/`send_rx` are bypassed on the data
+        // path (not a 1-deep handoff) — so read the scheduler's depth; otherwise read the
+        // mpsc's fill level.
         {
             let depth_tx = send_tx.clone();
             let sched = scheduler.clone();
@@ -934,13 +936,23 @@ pub(crate) async fn run_face_sender(
                     // coalesce same-`source` runs into one `send_batch`, i.e. a
                     // single `sendmmsg` on UDP. Source grouping keeps the egress
                     // feature context (e.g. IncomingFaceId) correct per frame.
+                    //
+                    // Drain from whichever queue `first` came from: the scheduler when QoS
+                    // is installed (the raw `rx` is bypassed in that mode — enqueue feeds
+                    // the scheduler, not the channel — so draining `rx` here would always
+                    // be empty and silently collapse batching to one packet per syscall),
+                    // else the raw channel.
                     const MAX_DRAIN: usize = 64;
                     let lp = face.kind().uses_lp_framing();
                     let mut items = vec![first];
                     while items.len() < MAX_DRAIN {
-                        match rx.try_recv() {
-                            Ok(i) => items.push(i),
-                            Err(_) => break,
+                        let next = match scheduler.as_ref() {
+                            Some(s) => s.try_dequeue(),
+                            None => rx.try_recv().ok(),
+                        };
+                        match next {
+                            Some(i) => items.push(i),
+                            None => break,
                         }
                     }
                     let mut idx = 0;

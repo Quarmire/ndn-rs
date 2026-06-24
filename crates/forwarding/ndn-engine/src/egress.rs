@@ -22,8 +22,19 @@ use tokio::sync::Notify;
 
 use crate::engine::EgressItem;
 
+/// The number of canonical traffic classes (`0..NUM_TRAFFIC_CLASSES`). Eight covers
+/// DiffServ-style class sets. This is the **one class model** every scheduler shares: a
+/// [`TrafficClass`] above this range is clamped into the lowest-priority class identically
+/// by *both* schedulers (so a misconfigured class can't mean two different things on two
+/// engines).
+pub const NUM_TRAFFIC_CLASSES: usize = 8;
+
 /// A traffic class — the scheduling priority of a packet. **Lower is higher priority**
-/// (class 0 is served before class 1). Within a class, order is FIFO.
+/// (class 0 is served before class 1). Within a class, order is FIFO. The canonical range
+/// is `0..`[`NUM_TRAFFIC_CLASSES`]; a higher value is clamped (see [`clamped`]) to the
+/// lowest-priority class by every scheduler, so the class model is identical across them.
+///
+/// [`clamped`]: TrafficClass::clamped
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TrafficClass(pub u8);
 
@@ -31,6 +42,14 @@ impl TrafficClass {
     /// The default class for unclassified traffic (highest priority, so an unconfigured
     /// or fall-through packet is never starved behind classified bulk).
     pub const DEFAULT: TrafficClass = TrafficClass(0);
+
+    /// This class clamped into `0..`[`NUM_TRAFFIC_CLASSES`] — the shared mapping both
+    /// schedulers apply, so an out-of-range class behaves identically everywhere (it joins
+    /// the lowest-priority class rather than meaning 256 levels on one engine and 8 on
+    /// another).
+    pub fn clamped(self) -> u8 {
+        (self.0 as usize).min(NUM_TRAFFIC_CLASSES - 1) as u8
+    }
 }
 
 impl Default for TrafficClass {
@@ -88,6 +107,16 @@ pub trait EgressScheduler: Send + Sync {
     /// The next item to transmit, in scheduling order. Resolves when one is available;
     /// returns `None` once the scheduler is [`closed`](Self::close) and drained.
     async fn dequeue(&self) -> Option<EgressItem>;
+
+    /// **Non-blocking** next item in scheduling order: `Some` if one is immediately ready,
+    /// `None` if the queue is momentarily empty (does *not* signal close). This is how the
+    /// send loop coalesces a `sendmmsg` batch *out of the scheduler* — without it, batching
+    /// would have to read the bypassed raw channel (empty under QoS) and degrade to one
+    /// packet per syscall. Default returns `None` (a scheduler that can't peek simply
+    /// forgoes batching, still correct).
+    fn try_dequeue(&self) -> Option<EgressItem> {
+        None
+    }
 
     /// Mark the scheduler closed (face shutting down): pending items still drain, then
     /// [`dequeue`](Self::dequeue) returns `None`.
@@ -182,7 +211,9 @@ impl EgressScheduler for PriorityScheduler {
             let seq = inner.seq;
             inner.seq += 1;
             inner.heap.push(Pending {
-                class: class.0,
+                // Clamp identically to DRR so a class ≥ NUM_TRAFFIC_CLASSES means the same
+                // thing on both schedulers (the lowest-priority class), not 256 levels here.
+                class: TrafficClass(class.clamped()).0,
                 seq,
                 item,
             });
@@ -193,11 +224,8 @@ impl EgressScheduler for PriorityScheduler {
 
     async fn dequeue(&self) -> Option<EgressItem> {
         loop {
-            {
-                let mut inner = self.inner.lock().unwrap();
-                if let Some(p) = inner.heap.pop() {
-                    return Some(p.item);
-                }
+            if let Some(item) = self.try_dequeue() {
+                return Some(item);
             }
             if self.closed.load(AtomicOrdering::Acquire) {
                 // Re-check under no lock: closed + empty ⇒ done. (A racing enqueue before
@@ -210,6 +238,10 @@ impl EgressScheduler for PriorityScheduler {
             }
             self.notify.notified().await;
         }
+    }
+
+    fn try_dequeue(&self) -> Option<EgressItem> {
+        self.inner.lock().unwrap().heap.pop().map(|p| p.item)
     }
 
     fn close(&self) {
@@ -227,9 +259,10 @@ impl EgressScheduler for PriorityScheduler {
     }
 }
 
-/// Number of traffic classes a [`DeficitRoundRobinScheduler`] serves (0..=7); a higher
-/// [`TrafficClass`] is clamped into this range. Eight covers DiffServ-style class sets.
-pub const DRR_CLASSES: usize = 8;
+/// Number of traffic classes a [`DeficitRoundRobinScheduler`] serves — the shared
+/// [`NUM_TRAFFIC_CLASSES`]; a higher [`TrafficClass`] is clamped into this range
+/// identically to [`PriorityScheduler`] (see [`TrafficClass::clamped`]).
+pub const DRR_CLASSES: usize = NUM_TRAFFIC_CLASSES;
 
 /// **Deficit Round Robin** scheduler: starvation-free fairness across classes, the
 /// counterpoint to [`PriorityScheduler`] (whose strict priority can starve low classes
@@ -292,7 +325,7 @@ impl EgressScheduler for DeficitRoundRobinScheduler {
                 return false;
             }
             let size = item.0.len() as u64;
-            let c = (class.0 as usize).min(DRR_CLASSES - 1);
+            let c = class.clamped() as usize; // shared clamp — identical to PriorityScheduler
             inner.queues[c].push_back((size, item));
             inner.len += 1;
         }
@@ -302,37 +335,8 @@ impl EgressScheduler for DeficitRoundRobinScheduler {
 
     async fn dequeue(&self) -> Option<EgressItem> {
         loop {
-            {
-                let mut inner = self.inner.lock().unwrap();
-                if inner.len > 0 {
-                    // DRR: round-robin over classes, crediting `quantum` once per visit,
-                    // releasing the head while the class's deficit covers it. Guaranteed
-                    // to return since `len > 0` (some class is backlogged and accrues
-                    // credit each round until its head fits).
-                    loop {
-                        let cur = inner.current;
-                        if inner.queues[cur].is_empty() {
-                            inner.deficit[cur] = 0; // left the active list
-                            inner.current = (cur + 1) % DRR_CLASSES;
-                            inner.credited = false;
-                            continue;
-                        }
-                        if !inner.credited {
-                            inner.deficit[cur] += self.quantum;
-                            inner.credited = true;
-                        }
-                        let head = inner.queues[cur].front().unwrap().0;
-                        if inner.deficit[cur] >= head {
-                            inner.deficit[cur] -= head;
-                            let (_, item) = inner.queues[cur].pop_front().unwrap();
-                            inner.len -= 1;
-                            return Some(item);
-                        } else {
-                            inner.current = (cur + 1) % DRR_CLASSES;
-                            inner.credited = false;
-                        }
-                    }
-                }
+            if let Some(item) = self.try_dequeue() {
+                return Some(item);
             }
             if self.closed.load(AtomicOrdering::Acquire) {
                 let inner = self.inner.lock().unwrap();
@@ -342,6 +346,39 @@ impl EgressScheduler for DeficitRoundRobinScheduler {
                 continue;
             }
             self.notify.notified().await;
+        }
+    }
+
+    fn try_dequeue(&self) -> Option<EgressItem> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.len == 0 {
+            return None;
+        }
+        // DRR: round-robin over classes, crediting `quantum` once per visit, releasing the
+        // head while the class's deficit covers it. Guaranteed to return since `len > 0`
+        // (some class is backlogged and accrues credit each round until its head fits).
+        loop {
+            let cur = inner.current;
+            if inner.queues[cur].is_empty() {
+                inner.deficit[cur] = 0; // left the active list
+                inner.current = (cur + 1) % DRR_CLASSES;
+                inner.credited = false;
+                continue;
+            }
+            if !inner.credited {
+                inner.deficit[cur] += self.quantum;
+                inner.credited = true;
+            }
+            let head = inner.queues[cur].front().unwrap().0;
+            if inner.deficit[cur] >= head {
+                inner.deficit[cur] -= head;
+                let (_, item) = inner.queues[cur].pop_front().unwrap();
+                inner.len -= 1;
+                return Some(item);
+            } else {
+                inner.current = (cur + 1) % DRR_CLASSES;
+                inner.credited = false;
+            }
         }
     }
 
@@ -413,6 +450,41 @@ mod tests {
             out.push(tag(&s.dequeue().await.unwrap()));
         }
         assert_eq!(out, vec!["hi-1", "hi-2", "mid-1", "lo-1", "lo-2"]);
+    }
+
+    #[test]
+    fn try_dequeue_drains_priority_order_then_none() {
+        // try_dequeue (the batching path) yields the same strict-priority order as dequeue
+        // and returns None when momentarily empty — this is what lets the send loop
+        // coalesce a sendmmsg batch out of the scheduler under QoS.
+        let s = PriorityScheduler::new(16);
+        assert!(s.enqueue(item("lo"), TrafficClass(2)));
+        assert!(s.enqueue(item("hi"), TrafficClass(0)));
+        assert_eq!(tag(&s.try_dequeue().unwrap()), "hi");
+        assert_eq!(tag(&s.try_dequeue().unwrap()), "lo");
+        assert!(s.try_dequeue().is_none(), "empty ⇒ None (not a close signal)");
+    }
+
+    #[test]
+    fn out_of_range_class_clamps_identically_on_both_schedulers() {
+        // A class ≥ NUM_TRAFFIC_CLASSES must join the lowest-priority class on BOTH
+        // schedulers (one class model), not 256 levels on Priority and 8 on DRR.
+        assert_eq!(TrafficClass(200).clamped() as usize, NUM_TRAFFIC_CLASSES - 1);
+
+        // Priority: an out-of-range class is served after the in-range lowest class.
+        let p = PriorityScheduler::new(16);
+        assert!(p.enqueue(item("oob"), TrafficClass(200)));
+        assert!(p.enqueue(item("lowest"), TrafficClass((NUM_TRAFFIC_CLASSES - 1) as u8)));
+        assert!(p.enqueue(item("top"), TrafficClass(0)));
+        let order: Vec<String> = (0..3).map(|_| tag(&p.try_dequeue().unwrap())).collect();
+        // top first; oob and lowest share the same (clamped) class → FIFO between them.
+        assert_eq!(order, vec!["top", "oob", "lowest"]);
+
+        // DRR: the out-of-range class lands in the same bucket as the clamped max — it
+        // does not panic on an index past the array and is served, never dropped.
+        let d = DeficitRoundRobinScheduler::new(64, 16);
+        assert!(d.enqueue(item("oob"), TrafficClass(200)));
+        assert_eq!(tag(&d.try_dequeue().unwrap()), "oob");
     }
 
     #[tokio::test]
