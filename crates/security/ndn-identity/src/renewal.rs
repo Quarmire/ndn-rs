@@ -8,7 +8,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use ndn_packet::Name;
@@ -146,16 +146,21 @@ impl Drop for RenewalHandle {
     }
 }
 
+/// How often a `WhenPercentRemaining` policy re-checks the cert's remaining validity.
+const PERCENT_POLICY_CHECK_INTERVAL: Duration = Duration::from_secs(600);
+/// Default remaining-validity threshold (percent) that triggers renewal when a policy
+/// doesn't specify one.
+const DEFAULT_RENEW_THRESHOLD_PCT: u64 = 20;
+
 pub fn start_renewal(
     manager: Arc<SecurityManager>,
     key_name: Name,
     namespace: Name,
     policy: &RenewalPolicy,
     renewer: Option<Arc<dyn CertRenewer>>,
-    _storage: Option<PathBuf>,
 ) -> RenewalHandle {
     let check_interval = match policy {
-        RenewalPolicy::WhenPercentRemaining(_pct) => Duration::from_secs(600),
+        RenewalPolicy::WhenPercentRemaining(_pct) => PERCENT_POLICY_CHECK_INTERVAL,
         RenewalPolicy::Every(d) => *d,
         RenewalPolicy::Manual => {
             return RenewalHandle {
@@ -166,7 +171,7 @@ pub fn start_renewal(
 
     let percent = match policy {
         RenewalPolicy::WhenPercentRemaining(p) => *p as u64,
-        _ => 20,
+        _ => DEFAULT_RENEW_THRESHOLD_PCT,
     };
 
     let task = tokio::spawn(async move {
@@ -311,7 +316,6 @@ mod tests {
             Name::from_components([NameComponent::generic(bytes::Bytes::from_static(b"id"))]),
             &RenewalPolicy::Every(Duration::from_millis(30)),
             Some(renewer),
-            None,
         );
 
         // A few check intervals: the near-expiry cert trips renewal each time.

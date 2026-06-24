@@ -117,7 +117,6 @@ pub async fn run_provisioning(config: DeviceConfig) -> Result<Identity, Identity
             config.namespace.clone(),
             &policy.clone(),
             Some(renewer),
-            config.storage.clone(),
         )),
     };
 
