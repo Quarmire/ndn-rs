@@ -129,6 +129,9 @@ pub struct EngineBuilder {
     path_authorizer: Option<Arc<dyn crate::path_control::PathAuthorizer>>,
     /// Opt-in data-plane name-activity observer (e.g. ndn-pipes' relay PUI monitor).
     name_activity: Option<Arc<dyn crate::activity::NameActivityObserver>>,
+    /// G4 egress QoS (opt-in): classifier + per-face scheduler capacity.
+    egress_classifier: Option<Arc<dyn crate::egress::EgressClassifier>>,
+    egress_capacity: usize,
 }
 
 impl EngineBuilder {
@@ -154,6 +157,8 @@ impl EngineBuilder {
             rate_limit_hook: None,
             congestion_feedback: None,
             name_activity: None,
+            egress_classifier: None,
+            egress_capacity: crate::engine::DEFAULT_SEND_QUEUE_CAP,
             path_control: false,
             path_control_observers: Vec::new(),
             path_authorizer: None,
@@ -225,6 +230,21 @@ impl EngineBuilder {
         observer: Arc<dyn crate::activity::NameActivityObserver>,
     ) -> Self {
         self.name_activity = Some(observer);
+        self
+    }
+
+    /// Enable G4 egress QoS: classify outbound packets with `classifier` and give every
+    /// face a strict-priority [`PriorityScheduler`](crate::egress::PriorityScheduler) of
+    /// `capacity` packets, so higher-priority classes transmit first. Off by default
+    /// (FIFO per face, zero added cost). Orthogonal to G1 congestion feedback (order vs
+    /// rate/path).
+    pub fn with_priority_egress(
+        mut self,
+        classifier: Arc<dyn crate::egress::EgressClassifier>,
+        capacity: usize,
+    ) -> Self {
+        self.egress_classifier = Some(classifier);
+        self.egress_capacity = capacity.max(1);
         self
     }
 
@@ -577,6 +597,8 @@ impl EngineBuilder {
             replay_guard: replay_guard.clone(),
             pipeline_tx: OnceLock::new(),
             require_local_validation: self.config.require_local_validation,
+            egress_classifier: self.egress_classifier.clone(),
+            egress_capacity: self.egress_capacity,
             face_states: Arc::clone(&face_states),
             discovery: Arc::clone(&discovery),
             neighbors: Arc::clone(&neighbors),
@@ -666,6 +688,7 @@ impl EngineBuilder {
             rate_limit: self.rate_limit_hook.clone(),
             congestion_feedback: congestion_fb,
             name_activity: self.name_activity,
+            name_classifier: self.egress_classifier,
             path_control,
             data_plane: self.config.data_plane,
         };

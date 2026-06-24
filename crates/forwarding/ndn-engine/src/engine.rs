@@ -146,6 +146,10 @@ pub struct FaceState {
     /// queue's depth to emit LP `CongestionMark` TLVs); this is the
     /// **queue-full** fallback, not the queue-depth signal.
     pub congestion_policy: CongestionPolicy,
+    /// G4 egress scheduler (opt-in QoS). `None` ⇒ the FIFO default: enqueue goes straight
+    /// to `send_tx` and the send loop drains it, today's behavior. `Some` ⇒ enqueue
+    /// classifies into the scheduler and the send loop drains *it* in priority order.
+    pub scheduler: Option<Arc<dyn crate::egress::EgressScheduler>>,
     /// Set when the remote peer sends LP-wrapped packets (type 0x64). LP
     /// encoding is a per-link property determined by what the peer sends.
     pub uses_lp: AtomicBool,
@@ -181,6 +185,7 @@ impl FaceState {
             counters: FaceCounters::default(),
             send_tx,
             congestion_policy,
+            scheduler: None,
             uses_lp: AtomicBool::new(false),
             require_data_validation: AtomicBool::new(false),
             flags: AtomicU64::new(0),
@@ -272,6 +277,11 @@ pub struct EngineInner {
     /// Force Data validation on Local faces as they are added (see
     /// `EngineConfig::require_local_validation`).
     pub(crate) require_local_validation: bool,
+    /// G4 egress QoS (opt-in). When set, every face gets a `PriorityScheduler` of
+    /// `egress_capacity` and the dispatcher classifies outbound packets with this
+    /// classifier. `None` ⇒ the FIFO default on every face.
+    pub(crate) egress_classifier: Option<Arc<dyn crate::egress::EgressClassifier>>,
+    pub(crate) egress_capacity: usize,
     pub(crate) face_states: Arc<DashMap<FaceId, FaceState>>,
     pub discovery: Arc<dyn DiscoveryProtocol>,
     pub neighbors: Arc<NeighborTable>,
@@ -518,7 +528,7 @@ impl ForwarderEngine {
         let scope = erased.scope();
         let congestion_policy = CongestionPolicy::default_for_scope(scope);
         let (send_tx, send_rx) = mpsc::channel(DEFAULT_SEND_QUEUE_CAP);
-        let state = FaceState::new(
+        let mut state = FaceState::new(
             cancel.clone(),
             persistency,
             send_tx.clone(),
@@ -527,13 +537,27 @@ impl ForwarderEngine {
         if self.inner.require_local_validation && scope == ndn_transport::FaceScope::Local {
             state.set_require_data_validation(true);
         }
+        // G4: install a per-face egress scheduler when QoS is configured. The send loop
+        // (run_face_sender) reads `state.scheduler` and drains it instead of `send_rx`.
+        let scheduler: Option<Arc<dyn crate::egress::EgressScheduler>> =
+            self.inner.egress_classifier.as_ref().map(|_| {
+                Arc::new(crate::egress::PriorityScheduler::new(self.inner.egress_capacity))
+                    as Arc<dyn crate::egress::EgressScheduler>
+            });
+        state.scheduler = scheduler.clone();
         self.inner.face_states.insert(face_id, state);
 
         // Inject the egress queue-depth closure into the LinkService's
-        // CongestionMarkingFeature (no-op for PassthroughLinkService).
+        // CongestionMarkingFeature (no-op for PassthroughLinkService). With a scheduler
+        // installed the backlog lives there (send_tx is a 1-deep handoff), so read its
+        // depth; otherwise read the mpsc's fill level.
         {
             let depth_tx = send_tx.clone();
+            let sched = scheduler.clone();
             let queue_depth_fn: Arc<dyn Fn() -> u64 + Send + Sync> = Arc::new(move || {
+                if let Some(s) = &sched {
+                    return s.depth().0;
+                }
                 let max = depth_tx.max_capacity() as u64;
                 let avail = depth_tx.capacity() as u64;
                 max.saturating_sub(avail)
@@ -828,6 +852,11 @@ pub(crate) async fn run_face_sender(
         runtime,
         face_lifecycle_sink,
     } = ctx;
+    // G4: if this face has an egress scheduler installed, the send loop drains *it* (in
+    // priority order) instead of the raw `rx`. `None` ⇒ the FIFO default (drain `rx`).
+    let scheduler = face_states
+        .get(&face_id)
+        .and_then(|s| s.scheduler.clone());
     // NDNLPv2 reliability lives entirely in the per-face `ReliabilityFeature`
     // (runtime-mutable via `faces/update` / discovery enablement). The send arm
     // frames through it when enabled; the retx tick pumps its retransmissions
@@ -872,7 +901,12 @@ pub(crate) async fn run_face_sender(
         let retx_sleep = runtime.sleep(retx_tick_dur);
         tokio::select! {
             biased;            _ = cancel.cancelled() => break,
-            item = rx.recv() => {
+            item = async {
+                match scheduler.as_ref() {
+                    Some(s) => s.dequeue().await,
+                    None => rx.recv().await,
+                }
+            } => {
                 let first = match item {
                     Some(p) => p,
                     None => break,

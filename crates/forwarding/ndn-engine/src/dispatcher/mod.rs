@@ -97,6 +97,10 @@ pub struct PacketDispatcher {
     /// branch); when `Some`, every interest's name is offered to it before CS/PIT, so
     /// soft state that must follow real traffic (ndn-pipes' relay PUI monitor) can renew.
     pub name_activity: Option<Arc<dyn crate::activity::NameActivityObserver>>,
+    /// G4 egress classifier (opt-in). `None` ⇒ all traffic is `TrafficClass::DEFAULT`
+    /// (and faces have no scheduler, so the FIFO default applies). When `Some`, outbound
+    /// packets are classified by name and routed into the face's `PriorityScheduler`.
+    pub name_classifier: Option<Arc<dyn crate::egress::EgressClassifier>>,
     /// Which data-plane runtime to spawn. Default `Shared`.
     pub data_plane: DataPlane,
 }

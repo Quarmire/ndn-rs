@@ -39,9 +39,29 @@ impl PacketDispatcher {
         self.face_link_type(face_id) == LinkType::PointToPoint
     }
 
+    /// Classify an outbound packet into a [`TrafficClass`](crate::egress::TrafficClass).
+    /// `TrafficClass::DEFAULT` when no classifier is configured (the FIFO default path
+    /// ignores the class anyway).
+    pub(super) fn classify(
+        &self,
+        name: Option<&Name>,
+        is_interest: bool,
+    ) -> crate::egress::TrafficClass {
+        self.name_classifier
+            .as_ref()
+            .map(|c| c.classify(name, is_interest))
+            .unwrap_or_default()
+    }
+
     pub(super) async fn enqueue_send(&self, face_id: FaceId, payload: Bytes, intent: EgressIntent) {
-        self.enqueue_send_with_source(face_id, payload, FaceId::INVALID, intent)
-            .await;
+        self.enqueue_send_with_source(
+            face_id,
+            payload,
+            FaceId::INVALID,
+            intent,
+            crate::egress::TrafficClass::DEFAULT,
+        )
+        .await;
     }
 
     /// Push a **bare** `payload` + framing `intent` onto `face_id`'s outbound
@@ -55,11 +75,23 @@ impl PacketDispatcher {
         payload: Bytes,
         source: FaceId,
         intent: EgressIntent,
+        class: crate::egress::TrafficClass,
     ) {
         let Some(state) = self.face_states.get(&face_id) else {
             return;
         };
         let item = (payload, source, intent);
+        // G4: with a scheduler installed, admit into it (priority order); the congestion
+        // policy's queue-full handling is the scheduler's tail-drop. Otherwise the FIFO
+        // default below (the raw mpsc + Drop/Backpressure).
+        if let Some(scheduler) = &state.scheduler {
+            if !scheduler.enqueue(item, class) {
+                state.counters.out_drops.fetch_add(1, Ordering::Relaxed);
+                debug!(target: t::FACE_SYSTEM, face=%face_id,
+                       "egress scheduler queue full, dropping packet");
+            }
+            return;
+        }
         match state.congestion_policy {
             CongestionPolicy::Drop => match state.send_tx.try_send(item) {
                 Ok(()) => {}
@@ -158,6 +190,7 @@ impl PacketDispatcher {
                         ctx.raw_bytes.clone(),
                         ctx.face_id,
                         intent,
+                        self.classify(name_for_rl, true),
                     )
                     .await;
                 }
@@ -281,8 +314,14 @@ impl PacketDispatcher {
                     .in_satisfied_interests
                     .fetch_add(1, Ordering::Relaxed);
             }
-            self.enqueue_send(*face_id, data_bytes.clone(), intent)
-                .await;
+            self.enqueue_send_with_source(
+                *face_id,
+                data_bytes.clone(),
+                FaceId::INVALID,
+                intent,
+                self.classify(name_for_rl, false),
+            )
+            .await;
         }
     }
 }

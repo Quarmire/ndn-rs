@@ -282,6 +282,8 @@ impl WasmEngineBuilder {
             replay_guard: replay_guard.clone(),
             pipeline_tx: OnceLock::new(),
             require_local_validation: false,
+            egress_classifier: None,
+            egress_capacity: crate::engine::DEFAULT_SEND_QUEUE_CAP,
             face_states: Arc::clone(&face_states),
             discovery: Arc::clone(&discovery),
             neighbors: Arc::clone(&neighbors),
@@ -352,6 +354,8 @@ impl WasmEngineBuilder {
             congestion_feedback: None,
             // No data-plane name-activity observer in the in-browser single-node engine.
             name_activity: None,
+            // No egress QoS in the in-browser single-node engine.
+            name_classifier: None,
             // PathControl (producer mobility) is a multi-forwarder concern; not wired
             // into the in-browser single-node engine.
             path_control: None,
