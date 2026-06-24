@@ -211,8 +211,8 @@ struct RecordingObserver {
     torn: std::sync::Mutex<Vec<Name>>,
 }
 impl ndn_engine::PathControlObserver for RecordingObserver {
-    fn on_teardown(&self, target: &Name) {
-        self.torn.lock().unwrap().push(target.clone());
+    fn on_teardown(&self, pc: &PathControl, _params: &[u8]) {
+        self.torn.lock().unwrap().push(pc.target.clone());
     }
 }
 
@@ -250,14 +250,16 @@ async fn pipe_teardown_authorized_by_membership_not_signature() {
     assert_eq!(fib_faces(&engine, &target).await, vec![FaceId(OLD)], "rogue teardown ignored");
     assert!(observer.torn.lock().unwrap().is_empty());
 
-    // Right key ⇒ member ⇒ pipe state torn down + observer fired + propagated.
+    // Right key ⇒ member ⇒ observer fired (reaps model state) + propagated. The handler
+    // does NOT clobber the namespace FIB (pipe teardown is session state — the observer
+    // reaps the per-pipe state; a namespace may carry other pipes).
     h_in.send(teardown(2, &pipe_key)).await.unwrap();
     let start = Instant::now();
-    while start.elapsed() < Duration::from_secs(2) && fib_faces(&engine, &target).await != Vec::<FaceId>::new() {
+    while start.elapsed() < Duration::from_secs(2) && observer.torn.lock().unwrap().is_empty() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert!(fib_faces(&engine, &target).await.is_empty(), "membership teardown clears the route");
     assert_eq!(observer.torn.lock().unwrap().as_slice(), std::slice::from_ref(&target), "observer notified");
+    assert_eq!(fib_faces(&engine, &target).await, vec![FaceId(OLD)], "namespace FIB left intact");
     assert!(recv_timeout(&h_b).await.is_some(), "teardown propagates along the path");
 
     shutdown.shutdown().await;

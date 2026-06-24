@@ -17,7 +17,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use ndn_packet::{Interest, Name};
+use ndn_packet::Interest;
 use ndn_pathcontrol::{PathControl, PathOp, SeqStore};
 use ndn_security::{InterestValidationOutcome, Validator};
 use ndn_transport::FaceId;
@@ -52,12 +52,14 @@ impl PathAuthorizer for ValidatorAuthorizer {
 
 /// A consumer of pipe/session-lifecycle PathControl ops. `ndn-pipes` implements this
 /// so a `Teardown`/`Refresh` walking the path closes or extends the live pipe, without
-/// the forwarder knowing what a pipe is.
+/// the forwarder knowing what a pipe is. `params` are the message's
+/// ApplicationParameters (e.g. the pipe id + key), carrying the model-specific detail
+/// the observer needs; `pc.target` is the walked prefix (e.g. the namespace).
 pub trait PathControlObserver: Send + Sync {
-    /// A `Teardown` for `target` reached this hop.
-    fn on_teardown(&self, _target: &Name) {}
-    /// A `Refresh` (keepalive) for `target` reached this hop.
-    fn on_refresh(&self, _target: &Name) {}
+    /// A `Teardown` reached this hop.
+    fn on_teardown(&self, _pc: &PathControl, _params: &[u8]) {}
+    /// A `Refresh` (keepalive) reached this hop.
+    fn on_refresh(&self, _pc: &PathControl, _params: &[u8]) {}
 }
 
 /// Per-hop PathControl logic. Opt-in (installed via the engine builder); holds the FIB
@@ -135,14 +137,18 @@ impl PathControlHandler {
                 );
             }
             PathOp::Teardown => {
-                self.fib.set_nexthops(&pc.target, vec![]);
+                // Observer-driven: the FIB isn't clobbered here (a pipe teardown is
+                // session state, not a route — and a namespace may carry other pipes).
+                // The observer reaps the model-specific state for the id in `params`.
+                let params = interest.app_parameters().map(|b| b.as_ref()).unwrap_or(&[]);
                 for o in &self.observers {
-                    o.on_teardown(&pc.target);
+                    o.on_teardown(pc, params);
                 }
             }
             PathOp::Refresh => {
+                let params = interest.app_parameters().map(|b| b.as_ref()).unwrap_or(&[]);
                 for o in &self.observers {
-                    o.on_refresh(&pc.target);
+                    o.on_refresh(pc, params);
                 }
             }
         }
