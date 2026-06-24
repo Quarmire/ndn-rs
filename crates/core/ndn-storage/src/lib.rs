@@ -166,10 +166,10 @@ impl MemoryBackend {
         Self::default()
     }
     pub fn len(&self) -> usize {
-        self.map.read().unwrap().len()
+        self.map.read().unwrap_or_else(std::sync::PoisonError::into_inner).len()
     }
     pub fn is_empty(&self) -> bool {
-        self.map.read().unwrap().is_empty()
+        self.map.read().unwrap_or_else(std::sync::PoisonError::into_inner).is_empty()
     }
 }
 
@@ -177,18 +177,18 @@ impl MemoryBackend {
 #[async_trait]
 impl Backend for MemoryBackend {
     async fn get(&self, key: Vec<u8>) -> StorageResult<Option<Bytes>> {
-        Ok(self.map.read().unwrap().get(&key).cloned())
+        Ok(self.map.read().unwrap_or_else(std::sync::PoisonError::into_inner).get(&key).cloned())
     }
     async fn put(&self, key: Vec<u8>, value: Bytes) -> StorageResult<()> {
-        self.map.write().unwrap().insert(key, value);
+        self.map.write().unwrap_or_else(std::sync::PoisonError::into_inner).insert(key, value);
         Ok(())
     }
     async fn delete(&self, key: Vec<u8>) -> StorageResult<()> {
-        self.map.write().unwrap().remove(&key);
+        self.map.write().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&key);
         Ok(())
     }
     async fn scan_prefix(&self, prefix: Vec<u8>, limit: usize) -> StorageResult<Vec<(Bytes, Bytes)>> {
-        let map = self.map.read().unwrap();
+        let map = self.map.read().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut out = Vec::new();
         for (k, v) in map.range(prefix.clone()..) {
             if !k.starts_with(&prefix) {
@@ -203,7 +203,7 @@ impl Backend for MemoryBackend {
     }
     async fn write_batch(&self, ops: Vec<WriteOp>) -> StorageResult<()> {
         // Atomic: one lock for the whole batch.
-        let mut map = self.map.write().unwrap();
+        let mut map = self.map.write().unwrap_or_else(std::sync::PoisonError::into_inner);
         for op in ops {
             match op {
                 WriteOp::Put(k, v) => {
@@ -474,7 +474,7 @@ mod sync {
         ) -> R {
             #[cfg(feature = "std")]
             {
-                f(&mut self.map.lock().unwrap())
+                f(&mut self.map.lock().unwrap_or_else(std::sync::PoisonError::into_inner))
             }
             #[cfg(not(feature = "std"))]
             {
@@ -772,9 +772,14 @@ mod named {
         fn pick(&self, name: &Name) -> Option<&Arc<dyn NamedWriteStore>> {
             self.pick_idx(name).map(|i| self.store_at(i))
         }
-        /// Index of the routed store: a route index, or `usize::MAX` for the fallback.
-        /// Used to group batch ops by destination store without needing pointer identity.
-        fn pick_idx(&self, name: &Name) -> Option<usize> {
+        /// Which store a name routes to: a specific route, or the fallback. Returned (rather
+        /// than the `&Arc` directly) so batch ops can be grouped by destination via a plain
+        /// `Hash`/`Eq` key, no pointer identity.
+        ///
+        /// The match is a **linear scan** over the routes (longest-prefix wins) — fine for
+        /// the handful of routes a node configures; a trie would only matter at hundreds of
+        /// routes and is deferred.
+        fn pick_idx(&self, name: &Name) -> Option<RouteSel> {
             let key = name_key(name);
             let mut best: Option<usize> = None;
             let mut best_len = 0;
@@ -784,15 +789,25 @@ mod named {
                     best_len = r.0.len();
                 }
             }
-            best.or_else(|| self.fallback.as_ref().map(|_| usize::MAX))
+            best.map(RouteSel::Indexed)
+                .or_else(|| self.fallback.as_ref().map(|_| RouteSel::Fallback))
         }
-        fn store_at(&self, idx: usize) -> &Arc<dyn NamedWriteStore> {
-            if idx == usize::MAX {
-                self.fallback.as_ref().expect("fallback present for MAX idx")
-            } else {
-                &self.routes[idx].1
+        fn store_at(&self, sel: RouteSel) -> &Arc<dyn NamedWriteStore> {
+            match sel {
+                RouteSel::Fallback => {
+                    self.fallback.as_ref().expect("fallback present for RouteSel::Fallback")
+                }
+                RouteSel::Indexed(i) => &self.routes[i].1,
             }
         }
+    }
+
+    /// Which [`StoreRouter`] destination a name resolved to — a typed replacement for the
+    /// old `usize::MAX`-means-fallback sentinel. `Copy`/`Hash` so it keys a batch-grouping map.
+    #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+    enum RouteSel {
+        Indexed(usize),
+        Fallback,
     }
 
     #[async_trait]
@@ -834,14 +849,14 @@ mod named {
         async fn write_batch(&self, ops: Vec<NamedOp>) -> StorageResult<()> {
             // Group ops by destination store; each store commits its group atomically.
             // (Cross-store atomicity is not offered — routes are independent engines.)
-            let mut groups: HashMap<usize, Vec<NamedOp>> = HashMap::new();
+            let mut groups: HashMap<RouteSel, Vec<NamedOp>> = HashMap::new();
             for op in ops {
-                if let Some(idx) = self.pick_idx(op.name()) {
-                    groups.entry(idx).or_default().push(op);
+                if let Some(sel) = self.pick_idx(op.name()) {
+                    groups.entry(sel).or_default().push(op);
                 }
             }
-            for (idx, group) in groups {
-                self.store_at(idx).write_batch(group).await?;
+            for (sel, group) in groups {
+                self.store_at(sel).write_batch(group).await?;
             }
             Ok(())
         }
@@ -1094,6 +1109,13 @@ mod redb_backend {
     /// On-disk [`Backend`] backed by [redb](https://docs.rs/redb) — a pure-Rust
     /// embedded B-tree with **real ACID transactions**. Use it (over fjall) where
     /// point-read latency or **atomic multi-key writes** matter.
+    ///
+    /// ⚠️ **Write cost (G11S.3):** every single `put`/`delete` opens, commits, and *fsyncs*
+    /// a full write transaction — durable, but expensive per op. For bulk writes use
+    /// [`write_batch`](SyncBackend::write_batch) (one txn for the group) or [`RedbDb`] +
+    /// [`RedbBatch`] (one txn across tables); a hot single-op write loop will be
+    /// fsync-bound. (fjall's LSM amortizes writes and is the better choice for
+    /// write-heavy workloads.)
     ///
     /// redb is **synchronous** underneath, so this is a [`SyncBackend`] (the F21 sync
     /// core); the async [`Backend`] is a thin `spawn_blocking` wrapper over it. Cheap
