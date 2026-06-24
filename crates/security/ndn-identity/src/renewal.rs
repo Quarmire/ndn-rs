@@ -56,11 +56,27 @@ pub type ConsumerConnect = Arc<
 >;
 
 /// The built-in renewer: re-runs the NDNCERT flow (INFO → NEW → CHALLENGE → cert-fetch)
-/// against `ca_prefix` and installs the issued cert as a trust anchor.
+/// against `ca_prefix` and installs the issued cert into the validation cache.
 ///
-/// It re-uses the enrollment `challenge`; for production, renewal should present a
-/// **possession** challenge (re-proving with the current cert) rather than re-using a
-/// single-use factory token — supply a possession [`ChallengeParams`] here for that.
+/// ## Challenge suitability for *unattended* renewal
+///
+/// The renewer re-presents the configured `challenge` on every cycle, so that challenge
+/// must be **repeatable without human/operator action**:
+///
+/// - [`ChallengeParams::Token`] is a **single-use** secret (a factory/enrollment token).
+///   Re-presenting it will be **rejected by a real CA** — it is consumed on first use. It
+///   works only against a test CA that doesn't enforce single-use. The renewer **warns
+///   loudly** when configured this way (see [`renew`](Self::renew)).
+/// - [`ChallengeParams::Possession`] proves possession of the current cert's key. NDNCERT
+///   possession is a *live* exchange: the CA returns a nonce and the client signs **that
+///   nonce**. The static `signature` carried in [`ChallengeParams::Possession`] is **not**
+///   that live signature, so the variant as-is is also unsuitable for unattended renewal
+///   until the live-nonce possession round-trip is wired through `enroll` — the renewer
+///   warns for it too.
+///
+/// In short: today this renewer is correct against a test/lenient CA; a production-grade
+/// unattended renewer needs the live-nonce possession round added to the NDNCERT client.
+/// The warnings make that requirement loud rather than a silent production failure.
 pub struct NdncertRenewer {
     pub ca_prefix: Name,
     pub validity_secs: u64,
@@ -76,6 +92,23 @@ impl CertRenewer for NdncertRenewer {
         key_name: &Name,
         _namespace: &Name,
     ) -> Result<Name, RenewalError> {
+        // Loud gate: a challenge that can't be re-presented unattended will fail at a real
+        // CA. Surface it on every attempt rather than letting renewal silently never work.
+        match &self.challenge {
+            ChallengeParams::Token { .. } => warn!(
+                ca = %self.ca_prefix,
+                "NdncertRenewer is configured with a single-use Token challenge; a real CA \
+                 consumes it on first use, so unattended renewal will be REJECTED. Use a \
+                 repeatable (possession) challenge for production renewal."
+            ),
+            ChallengeParams::Possession { .. } => warn!(
+                ca = %self.ca_prefix,
+                "NdncertRenewer possession challenge carries a STATIC signature, not a \
+                 signature over the CA's live nonce; a real CA will reject it until the \
+                 live-nonce possession round-trip is wired through the NDNCERT client."
+            ),
+            _ => {}
+        }
         let signer = manager
             .get_signer_sync(key_name)
             .map_err(|_| RenewalError::NoSigner(Box::new(key_name.clone())))?;
