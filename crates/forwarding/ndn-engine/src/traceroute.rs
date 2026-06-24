@@ -15,6 +15,18 @@
 //! Identity here is **advisory** (digest-signed, like IP traceroute is unauthenticated) —
 //! it aids diagnosis, it is not a trust statement. Opt-in: a node without a responder keeps
 //! dropping hop-limited probes silently.
+//!
+//! ## Security: topology disclosure (deployment note)
+//!
+//! A node with a responder installed **discloses its name to any unauthenticated prober** —
+//! a marked hop-limited Interest from anyone draws this node's identity, so a walk of
+//! ramping hop limits maps the path's node names (the same exposure IP traceroute has). Two
+//! mitigations are built in: (1) it is **opt-in** (no responder ⇒ silent drop, as before),
+//! and (2) the probe marker is **position-anchored** (below), so an ordinary application
+//! Interest that merely contains a `32=TRH` component somewhere is *not* mistaken for a
+//! probe and answered. Operators who treat their topology as sensitive should leave the
+//! responder off on edge/untrusted-facing nodes, or gate it (e.g. only enable it inside an
+//! administrative trust zone).
 
 use bytes::Bytes;
 use ndn_packet::encode::DataBuilder;
@@ -24,16 +36,30 @@ use ndn_packet::{Name, NameComponent};
 /// limit expiry should draw a hop-identity reply (vs a normal silent drop).
 pub const TRACEROUTE_KEYWORD: &[u8] = b"TRH";
 
+/// TLV-TYPE of a `ParametersSha256DigestComponent` — the only component that legitimately
+/// trails the marker on a *signed* probe.
+const PARAMS_SHA256_TYPE: u64 = 0x02;
+
 /// Magic prefix on a hop-identity reply's Content, so the prober tells an intermediate
 /// hop's identity reply apart from the destination producer's own answer.
 pub const HOP_IDENTITY_MAGIC: &[u8] = b"\xF0HOP";
 
-/// Whether `name` carries the traceroute probe marker (`32=TRH`).
+/// Whether `name` carries the traceroute probe marker (`32=TRH`) **in the anchored
+/// position**: the last component, or the second-to-last when the last is a
+/// ParametersSha256Digest (a signed probe). Anchoring (rather than matching the keyword
+/// anywhere) stops an ordinary application Interest that happens to contain a `32=TRH`
+/// component from being intercepted and answered as a probe.
 pub fn is_trace_probe(name: &Name) -> bool {
     let kw_typ = NameComponent::keyword(Bytes::new()).typ;
-    name.components()
-        .iter()
-        .any(|c| c.typ == kw_typ && c.value.as_ref() == TRACEROUTE_KEYWORD)
+    let comps = name.components();
+    let is_marker =
+        |c: &NameComponent| c.typ == kw_typ && c.value.as_ref() == TRACEROUTE_KEYWORD;
+    let n = comps.len();
+    if n >= 1 && is_marker(&comps[n - 1]) {
+        return true;
+    }
+    // Signed probe: marker immediately before the ParametersSha256Digest tail.
+    n >= 2 && comps[n - 1].typ == PARAMS_SHA256_TYPE && is_marker(&comps[n - 2])
 }
 
 /// Build the hop-identity reply for `probe_name` from this `node_name`: a Data named like
@@ -80,6 +106,21 @@ mod tests {
             .append_component(NameComponent::keyword(Bytes::from_static(TRACEROUTE_KEYWORD)));
         assert!(is_trace_probe(&marked));
         assert!(!is_trace_probe(&probe), "an unmarked probe is a normal drop");
+
+        // Anchored: a `32=TRH` component buried mid-name (an ordinary app Interest that
+        // merely contains the keyword) is NOT treated as a probe.
+        let buried = probe
+            .clone()
+            .append_component(NameComponent::keyword(Bytes::from_static(TRACEROUTE_KEYWORD)))
+            .append("more")
+            .append("components");
+        assert!(!is_trace_probe(&buried), "a non-tail TRH marker must not match");
+
+        // A signed probe (marker immediately before a ParametersSha256Digest) still matches.
+        let signed = marked
+            .clone()
+            .append_component(NameComponent::new(PARAMS_SHA256_TYPE, Bytes::from_static(&[0u8; 32])));
+        assert!(is_trace_probe(&signed), "marker before the params tail matches");
 
         // A built marked Interest is recognized after a wire round-trip.
         let wire = InterestBuilder::new(marked.clone()).hop_limit(1).build();
