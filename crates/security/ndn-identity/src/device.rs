@@ -9,7 +9,7 @@ use crate::{
     enroll::{ChallengeParams, NdncertClient},
     error::IdentityError,
     facade::Identity,
-    renewal::start_renewal,
+    renewal::{CertRenewer, NdncertRenewer, start_renewal},
 };
 
 #[derive(Debug, Clone)]
@@ -87,13 +87,27 @@ pub async fn run_provisioning(config: DeviceConfig) -> Result<Identity, Identity
     }
 
     let consumer = ndn_app::Consumer::connect(socket).await?;
-    let mut client = NdncertClient::new(consumer, ca_prefix);
+    let mut client = NdncertClient::new(consumer, ca_prefix.clone());
 
     let cert = client
         .enroll(key_name.clone(), Arc::clone(&signer), 86400, challenge)
         .await?;
 
     manager.add_trust_anchor(cert);
+
+    // Auto-renewal re-runs the NDNCERT flow against the same CA over a fresh router
+    // connection. (For a single-use factory token the CA may reject the re-used challenge;
+    // a possession challenge is the production renewal path — see `NdncertRenewer`.)
+    let renewer: Arc<dyn CertRenewer> = Arc::new(NdncertRenewer {
+        ca_prefix,
+        validity_secs: 86400,
+        challenge: build_challenge(&config.factory_credential, &key_name),
+        connect: Arc::new(|| {
+            Box::pin(async {
+                ndn_app::Consumer::connect(std::path::Path::new("/run/ndn/router.sock")).await
+            })
+        }),
+    });
 
     let renewal = match &config.renewal {
         RenewalPolicy::Manual => None,
@@ -102,6 +116,7 @@ pub async fn run_provisioning(config: DeviceConfig) -> Result<Identity, Identity
             key_name.clone(),
             config.namespace.clone(),
             &policy.clone(),
+            Some(renewer),
             config.storage.clone(),
         )),
     };

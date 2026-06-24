@@ -1,14 +1,102 @@
-//! Background certificate-renewal task. Currently logs only — re-enrollment
-//! must be performed manually.
+//! Background certificate-renewal task (G10).
+//!
+//! The task watches a cert's remaining validity and, when it crosses the policy threshold,
+//! drives a pluggable [`CertRenewer`] to obtain + install a fresh certificate — no manual
+//! re-enrollment. [`NdncertRenewer`] is the built-in renewer: it re-runs the NDNCERT
+//! enrollment flow against the CA. A `None` renewer keeps the old behavior (log + ask the
+//! operator to re-enroll), so the seam is opt-in.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
+use async_trait::async_trait;
 use ndn_packet::Name;
 use ndn_security::SecurityManager;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use crate::device::RenewalPolicy;
+use crate::enroll::{ChallengeParams, NdncertClient};
+
+/// Obtains + installs a fresh certificate for an identity whose current cert is nearing
+/// expiry. The renewal task calls this; implementations talk to whatever issuer the
+/// deployment uses (NDNCERT via [`NdncertRenewer`], an internal CA, a test stub).
+#[async_trait]
+pub trait CertRenewer: Send + Sync {
+    /// Renew the certificate for `key_name` under `namespace`, installing it into
+    /// `manager`. Returns the issued cert's name on success.
+    async fn renew(
+        &self,
+        manager: &SecurityManager,
+        key_name: &Name,
+        namespace: &Name,
+    ) -> Result<Name, RenewalError>;
+}
+
+/// Why an automatic renewal attempt failed (the task logs it and retries next interval).
+#[derive(Debug, thiserror::Error)]
+pub enum RenewalError {
+    #[error("connecting to the router/CA: {0}")]
+    Connect(String),
+    #[error("no signer for key {0}")]
+    NoSigner(Box<Name>),
+    #[error("NDNCERT enrollment: {0}")]
+    Enrollment(Box<crate::IdentityError>),
+    #[error("{0}")]
+    Other(String),
+}
+
+/// Factory for a fresh [`Consumer`](ndn_app::Consumer) to reach the CA — a new connection
+/// per attempt, since enrollment consumes the consumer.
+pub type ConsumerConnect = Arc<
+    dyn Fn() -> Pin<Box<dyn Future<Output = Result<ndn_app::Consumer, ndn_app::AppError>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// The built-in renewer: re-runs the NDNCERT flow (INFO → NEW → CHALLENGE → cert-fetch)
+/// against `ca_prefix` and installs the issued cert as a trust anchor.
+///
+/// It re-uses the enrollment `challenge`; for production, renewal should present a
+/// **possession** challenge (re-proving with the current cert) rather than re-using a
+/// single-use factory token — supply a possession [`ChallengeParams`] here for that.
+pub struct NdncertRenewer {
+    pub ca_prefix: Name,
+    pub validity_secs: u64,
+    pub challenge: ChallengeParams,
+    pub connect: ConsumerConnect,
+}
+
+#[async_trait]
+impl CertRenewer for NdncertRenewer {
+    async fn renew(
+        &self,
+        manager: &SecurityManager,
+        key_name: &Name,
+        _namespace: &Name,
+    ) -> Result<Name, RenewalError> {
+        let signer = manager
+            .get_signer_sync(key_name)
+            .map_err(|_| RenewalError::NoSigner(Box::new(key_name.clone())))?;
+        let consumer = (self.connect)()
+            .await
+            .map_err(|e| RenewalError::Connect(e.to_string()))?;
+        let mut client = NdncertClient::new(consumer, self.ca_prefix.clone());
+        let cert = client
+            .enroll(
+                key_name.clone(),
+                signer,
+                self.validity_secs,
+                self.challenge.clone(),
+            )
+            .await
+            .map_err(|e| RenewalError::Enrollment(Box::new(e)))?;
+        let cert_name = (*cert.name).clone();
+        manager.add_trust_anchor(cert);
+        Ok(cert_name)
+    }
+}
 
 pub struct RenewalHandle {
     task: JoinHandle<()>,
@@ -25,6 +113,7 @@ pub fn start_renewal(
     key_name: Name,
     namespace: Name,
     policy: &RenewalPolicy,
+    renewer: Option<Arc<dyn CertRenewer>>,
     _storage: Option<PathBuf>,
 ) -> RenewalHandle {
     let check_interval = match policy {
@@ -46,16 +135,23 @@ pub fn start_renewal(
         loop {
             tokio::time::sleep(check_interval).await;
 
-            let should_renew = check_renewal_needed(&manager, &key_name, percent);
-            if should_renew {
-                info!(
+            if !check_renewal_needed(&manager, &key_name, percent) {
+                continue;
+            }
+            info!(identity = %namespace, "certificate approaching expiry, initiating renewal");
+            match &renewer {
+                Some(r) => match r.renew(&manager, &key_name, &namespace).await {
+                    Ok(cert) => info!(identity = %namespace, %cert, "certificate renewed"),
+                    Err(e) => warn!(
+                        identity = %namespace,
+                        error = %e,
+                        "automatic renewal failed; will retry next interval"
+                    ),
+                },
+                None => warn!(
                     identity = %namespace,
-                    "Certificate approaching expiry, initiating renewal"
-                );
-                warn!(
-                    identity = %namespace,
-                    "Automatic renewal not yet implemented; please re-enroll manually"
-                );
+                    "no CertRenewer configured; re-enroll manually or supply one"
+                ),
             }
         }
     });
@@ -83,4 +179,74 @@ fn check_renewal_needed(manager: &SecurityManager, key_name: &Name, threshold_pc
         return remaining_pct < threshold_pct;
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndn_packet::{NameComponent, SignatureType};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Records how many times it was asked to renew (no real CA needed).
+    struct CountingRenewer {
+        calls: Arc<AtomicU64>,
+    }
+
+    #[async_trait]
+    impl CertRenewer for CountingRenewer {
+        async fn renew(
+            &self,
+            _m: &SecurityManager,
+            key_name: &Name,
+            _ns: &Name,
+        ) -> Result<Name, RenewalError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(key_name.clone())
+        }
+    }
+
+    fn near_expiry_cert(key_name: &Name) -> ndn_security::Certificate {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        ndn_security::Certificate {
+            name: Arc::new(key_name.clone()),
+            public_key: bytes::Bytes::from_static(&[0u8; 32]),
+            // 99% elapsed: well under any sane threshold.
+            valid_from: now.saturating_sub(99),
+            valid_until: now.saturating_add(1),
+            issuer: None,
+            signed_region: None,
+            sig_value: None,
+            sig_type: SignatureType::SignatureEd25519,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn renewer_is_invoked_when_cert_nears_expiry() {
+        let manager = Arc::new(SecurityManager::new());
+        let key_name =
+            Name::from_components([NameComponent::generic(bytes::Bytes::from_static(b"k"))]);
+        manager.cert_cache().insert(near_expiry_cert(&key_name));
+
+        let calls = Arc::new(AtomicU64::new(0));
+        let renewer = Arc::new(CountingRenewer { calls: Arc::clone(&calls) });
+        let _handle = start_renewal(
+            manager,
+            key_name,
+            Name::from_components([NameComponent::generic(bytes::Bytes::from_static(b"id"))]),
+            &RenewalPolicy::Every(Duration::from_millis(30)),
+            Some(renewer),
+            None,
+        );
+
+        // A few check intervals: the near-expiry cert trips renewal each time.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(
+            calls.load(Ordering::Relaxed) >= 1,
+            "the renewer must be invoked for a near-expiry cert"
+        );
+    }
 }
