@@ -126,9 +126,25 @@ impl PathControlHandler {
         authorizer: Arc<dyn PathAuthorizer>,
         observers: Vec<Arc<dyn PathControlObserver>>,
     ) -> Self {
+        // Volatile sequence guard: correct within a process, but its replay floor resets on
+        // restart. Use [`new_with_seq_store`](Self::new_with_seq_store) with a persisted
+        // `SeqStore` where cross-reboot replay protection is required (G3.1).
+        Self::new_with_seq_store(fib, authorizer, observers, SeqStore::new())
+    }
+
+    /// Like [`new`](Self::new) but with a caller-supplied [`SeqStore`] — pass
+    /// `SeqStore::with_persistence(..)` so the loop/staleness guard's floor survives a
+    /// restart (closing the post-reboot replay window for captured signed messages without
+    /// depending on a clock).
+    pub fn new_with_seq_store(
+        fib: Arc<Fib>,
+        authorizer: Arc<dyn PathAuthorizer>,
+        observers: Vec<Arc<dyn PathControlObserver>>,
+        seq: SeqStore,
+    ) -> Self {
         Self {
             fib,
-            seq: SeqStore::new(),
+            seq,
             authorizer,
             observers,
             locks: (0..LOCK_SHARDS).map(|_| Mutex::new(())).collect(),

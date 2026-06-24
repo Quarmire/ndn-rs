@@ -138,21 +138,68 @@ impl PathControl {
 /// counter; pipe `Teardown` uses a wall-clock seq). Sharing one sequence space per target
 /// would let whichever ran first jam the other's later messages as "stale". Keying by
 /// `(target, op)` gives each op its own monotonic space so they can coexist on one name.
+///
+/// ## Durability across restarts (replay defense)
+///
+/// The guard is **clock-free**: a strictly-monotonic sequence is the only ordering it
+/// needs — it never reads a wall clock (a captured signed Redirect could otherwise be
+/// replayed with a forged time, and the system would have to *trust* that clock). But an
+/// in-memory-only floor resets to nothing on reboot, so a captured signed message could be
+/// replayed after a restart. Supply a [`SeqPersistence`] via [`with_persistence`] to make
+/// the per-`(target, op)` floor **durable**: it is reloaded on construction and updated on
+/// every admit, so a reboot does not reopen the replay window. (The producer side is
+/// expected to persist its own outgoing counter too — the standard MAP-Me requirement — so
+/// its post-reboot sequence keeps climbing rather than restarting under the floor.)
+///
+/// [`with_persistence`]: SeqStore::with_persistence
 #[derive(Default)]
 pub struct SeqStore {
     seen: dashmap::DashMap<(Name, u8), u64>,
+    /// Durable backing for the floor; `None` = volatile (in-memory only).
+    persist: Option<std::sync::Arc<dyn SeqPersistence>>,
+}
+
+/// Pluggable durability for the [`SeqStore`] floor — the clock-free way to keep the
+/// replay/staleness guard intact across a forwarder restart. An implementation persists
+/// each admitted `(target, op) → seq` and can reload the whole set on boot; back it with a
+/// file, [`ndn-storage`](https://docs.rs/ndn-storage), or any durable store. Keeping it a
+/// trait keeps `ndn-pathcontrol` free of a storage dependency and lets the embedder choose.
+pub trait SeqPersistence: Send + Sync {
+    /// Reload the persisted floor: `(target, op-discriminant, seq)` for every entry.
+    fn load(&self) -> Vec<(Name, u8, u64)>;
+    /// Durably record that `seq` is the new floor for `(target, op)`. Called only when a
+    /// message is admitted (a strictly-higher seq), i.e. once per real advance.
+    fn record(&self, target: &Name, op: u8, seq: u64);
 }
 
 impl SeqStore {
+    /// A **volatile** guard (in-memory only). Correct within a single process lifetime, but
+    /// its floor resets on restart — use [`with_persistence`](Self::with_persistence) where
+    /// cross-reboot replay protection matters.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// A guard backed by durable `persistence`: the floor is seeded from
+    /// [`SeqPersistence::load`] now and written through on every admit, so it survives a
+    /// restart (closing the post-reboot replay window) without depending on a clock.
+    pub fn with_persistence(persistence: std::sync::Arc<dyn SeqPersistence>) -> Self {
+        let seen = dashmap::DashMap::new();
+        for (target, op, seq) in persistence.load() {
+            seen.insert((target, op), seq);
+        }
+        Self {
+            seen,
+            persist: Some(persistence),
+        }
+    }
+
     /// Admit `seq` for `(target, op)` iff it is strictly newer than the last admitted one,
-    /// recording it. Returns `true` to process+forward, `false` to drop.
+    /// recording it (durably, if a [`SeqPersistence`] is installed). Returns `true` to
+    /// process+forward, `false` to drop.
     pub fn admit(&self, target: &Name, op: PathOp, seq: u64) -> bool {
         use dashmap::mapref::entry::Entry;
-        match self.seen.entry((target.clone(), op as u8)) {
+        let admitted = match self.seen.entry((target.clone(), op as u8)) {
             Entry::Occupied(mut e) => {
                 if seq > *e.get() {
                     *e.get_mut() = seq;
@@ -165,12 +212,53 @@ impl SeqStore {
                 e.insert(seq);
                 true
             }
+        };
+        if admitted && let Some(p) = &self.persist {
+            // Persist the advance so the floor survives a restart. (Done while not holding
+            // the dashmap entry guard — the entry borrow ends above.)
+            p.record(target, op as u8, seq);
         }
+        admitted
     }
 
     /// The last admitted sequence number for `(target, op)`, if any (diagnostics).
     pub fn last(&self, target: &Name, op: PathOp) -> Option<u64> {
         self.seen.get(&(target.clone(), op as u8)).map(|r| *r)
+    }
+}
+
+/// A **pluggable** source of *trusted* time, nanoseconds since the Unix epoch. The
+/// staleness guard is clock-free by default ([`SeqStore`]); this seam exists for the
+/// deployments that *do* have a trustworthy time source (a GNSS-disciplined clock, a
+/// roughtime/NTS service, a secure element) and want an absolute freshness bound on top of
+/// the monotonic sequence. There is deliberately **no** default implementation backed by
+/// the system wall clock — the core never reads a clock it cannot trust. `now_ns` returns
+/// `None` when trusted time is unavailable, in which case freshness checks defer entirely
+/// to the sequence guard.
+pub trait TrustedClock: Send + Sync {
+    /// Current trusted time in nanoseconds since the Unix epoch, or `None` if no trusted
+    /// time is currently available.
+    fn now_ns(&self) -> Option<u64>;
+}
+
+/// Decide whether a message carrying `sig_time` (signed time, ns since epoch; `None` if it
+/// carried none) is fresh enough under `clock`, within `max_skew_ns` either side.
+///
+/// Fail-*open to the sequence guard*, never to replay: if there is no trusted time
+/// (`clock.now_ns()` is `None`) or the message carried no signed time, this returns `true`
+/// and admittance is left to the monotonic [`SeqStore`] (the always-present defense). When
+/// trusted time *is* available and the message *is* timestamped, a `sig_time` outside the
+/// window is rejected — this is the only path that can reject on time, and only when time
+/// is trusted.
+pub fn within_freshness_window(
+    clock: &dyn TrustedClock,
+    sig_time: Option<u64>,
+    max_skew_ns: u64,
+) -> bool {
+    match (clock.now_ns(), sig_time) {
+        (Some(now), Some(ts)) => now.abs_diff(ts) <= max_skew_ns,
+        // No trusted time, or no signed time on the message → defer to the sequence guard.
+        _ => true,
     }
 }
 
@@ -329,5 +417,73 @@ mod tests {
         assert!(store.admit(&t, PathOp::Redirect, 5), "small Redirect seq still admitted");
         assert!(store.admit(&t, PathOp::Redirect, 6));
         assert!(!store.admit(&t, PathOp::Teardown, 1_699_999_999_999), "older teardown dropped");
+    }
+
+    /// G3.1: the floor must survive a "restart" — a captured signed message replayed after
+    /// reboot is rejected because the durable floor reloads, rather than resetting to nothing.
+    #[test]
+    fn seq_store_floor_survives_restart_via_persistence() {
+        use std::sync::{Arc, Mutex};
+
+        // A tiny in-memory stand-in for a durable store (a file / ndn-storage in production).
+        #[derive(Default)]
+        struct MemPersist(Mutex<Vec<(Name, u8, u64)>>);
+        impl SeqPersistence for MemPersist {
+            fn load(&self) -> Vec<(Name, u8, u64)> {
+                self.0.lock().unwrap().clone()
+            }
+            fn record(&self, target: &Name, op: u8, seq: u64) {
+                let mut v = self.0.lock().unwrap();
+                v.retain(|(t, o, _)| !(t == target && *o == op));
+                v.push((target.clone(), op, seq));
+            }
+        }
+
+        let disk = Arc::new(MemPersist::default());
+        let t = n("/alice/video");
+        let r = PathOp::Redirect;
+
+        // First boot: admit up to seq 9.
+        {
+            let store = SeqStore::with_persistence(disk.clone());
+            assert!(store.admit(&t, r, 7));
+            assert!(store.admit(&t, r, 9));
+        }
+        // Reboot: a fresh guard reloads the floor from the durable store.
+        let store = SeqStore::with_persistence(disk.clone());
+        assert_eq!(store.last(&t, r), Some(9), "floor reloaded across restart");
+        assert!(!store.admit(&t, r, 9), "a captured seq-9 replay is rejected post-reboot");
+        assert!(!store.admit(&t, r, 8), "an older capture is rejected too");
+        assert!(store.admit(&t, r, 10), "a genuinely newer message still advances");
+    }
+
+    /// The trusted-time seam is opt-in and fail-open-to-the-sequence-guard: no trusted
+    /// clock (or no signed time) ⇒ never rejects on time; a trusted clock ⇒ a stale
+    /// timestamp is rejected, a fresh one passes.
+    #[test]
+    fn freshness_window_defers_without_trusted_time_and_bounds_with_it() {
+        struct NoTime;
+        impl TrustedClock for NoTime {
+            fn now_ns(&self) -> Option<u64> {
+                None
+            }
+        }
+        struct FixedTime(u64);
+        impl TrustedClock for FixedTime {
+            fn now_ns(&self) -> Option<u64> {
+                Some(self.0)
+            }
+        }
+        let skew = 60_000_000_000; // 60 s
+        // No trusted time → defer (admit) regardless of the message's stamp.
+        assert!(within_freshness_window(&NoTime, Some(0), skew));
+        assert!(within_freshness_window(&NoTime, None, skew));
+        // Trusted time present: in-window passes, out-of-window (a replay) is rejected.
+        let now = 1_000_000_000_000u64;
+        assert!(within_freshness_window(&FixedTime(now), Some(now), skew));
+        assert!(within_freshness_window(&FixedTime(now), Some(now - skew), skew));
+        assert!(!within_freshness_window(&FixedTime(now), Some(now - skew - 1), skew));
+        // A message with no signed time defers to the sequence guard even under trusted time.
+        assert!(within_freshness_window(&FixedTime(now), None, skew));
     }
 }
