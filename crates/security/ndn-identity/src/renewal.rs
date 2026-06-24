@@ -93,7 +93,12 @@ impl CertRenewer for NdncertRenewer {
             .await
             .map_err(|e| RenewalError::Enrollment(Box::new(e)))?;
         let cert_name = (*cert.name).clone();
-        manager.add_trust_anchor(cert);
+        // Install the renewed leaf into the validation cert cache — NOT as a trust anchor.
+        // `add_trust_anchor` would promote every renewed end-entity cert to a
+        // chain-terminating root (and, since anchors are keyed by cert name and each
+        // renewal mints a new name, grow the anchor set unboundedly). The renewed cert
+        // chains to the CA that issued it; the node's anchors (the CA) are unchanged.
+        manager.cert_cache().insert(cert);
         Ok(cert_name)
     }
 }
@@ -132,21 +137,34 @@ pub fn start_renewal(
     };
 
     let task = tokio::spawn(async move {
+        let mut failures: u32 = 0;
         loop {
             tokio::time::sleep(check_interval).await;
 
             if !check_renewal_needed(&manager, &key_name, percent) {
+                failures = 0;
                 continue;
             }
             info!(identity = %namespace, "certificate approaching expiry, initiating renewal");
             match &renewer {
                 Some(r) => match r.renew(&manager, &key_name, &namespace).await {
-                    Ok(cert) => info!(identity = %namespace, %cert, "certificate renewed"),
-                    Err(e) => warn!(
-                        identity = %namespace,
-                        error = %e,
-                        "automatic renewal failed; will retry next interval"
-                    ),
+                    Ok(cert) => {
+                        failures = 0;
+                        info!(identity = %namespace, %cert, "certificate renewed");
+                    }
+                    Err(e) => {
+                        failures = failures.saturating_add(1);
+                        // Exponential backoff with jitter so a fleet that crosses the
+                        // threshold together doesn't retry against the CA in lockstep.
+                        let backoff = backoff_delay(check_interval, failures);
+                        warn!(
+                            identity = %namespace,
+                            error = %e,
+                            backoff_ms = backoff.as_millis() as u64,
+                            "automatic renewal failed; backing off before retry"
+                        );
+                        tokio::time::sleep(backoff).await;
+                    }
                 },
                 None => warn!(
                     identity = %namespace,
@@ -157,6 +175,27 @@ pub fn start_renewal(
     });
 
     RenewalHandle { task }
+}
+
+/// Backoff before the next renewal attempt after `failures` consecutive failures:
+/// exponential in `base` (capped at 1 h) plus up to ±50% jitter (decorrelates a fleet).
+fn backoff_delay(base: Duration, failures: u32) -> Duration {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    const CAP: Duration = Duration::from_secs(3600);
+    let exp = base.saturating_mul(1u32 << failures.min(6)); // base·2^min(failures,6)
+    let capped = exp.min(CAP);
+    // Cheap jitter from the wall clock (no RNG dep): ±50% of the capped delay.
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    let half = capped / 2;
+    let jitter = if half.is_zero() {
+        Duration::ZERO
+    } else {
+        Duration::from_nanos(nanos % (half.as_nanos().max(1) as u64))
+    };
+    capped.saturating_sub(half).saturating_add(jitter)
 }
 
 fn check_renewal_needed(manager: &SecurityManager, key_name: &Name, threshold_pct: u64) -> bool {
