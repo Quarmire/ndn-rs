@@ -43,6 +43,13 @@ impl TrafficClass {
     /// or fall-through packet is never starved behind classified bulk).
     pub const DEFAULT: TrafficClass = TrafficClass(0);
 
+    /// The lowest-priority class — **best effort** (G4.4). A classifier handling untrusted
+    /// or unknown names should map them here rather than to [`DEFAULT`](Self::DEFAULT), so
+    /// unclassified/unrecognized bulk can't claim top priority ahead of classified traffic.
+    /// (DEFAULT stays top-priority for the *no-classifier* case, where all traffic is one
+    /// class and relative priority is moot.)
+    pub const BEST_EFFORT: TrafficClass = TrafficClass((NUM_TRAFFIC_CLASSES - 1) as u8);
+
     /// This class clamped into `0..`[`NUM_TRAFFIC_CLASSES`] — the shared mapping both
     /// schedulers apply, so an out-of-range class behaves identically everywhere (it joins
     /// the lowest-priority class rather than meaning 256 levels on one engine and 8 on
@@ -75,6 +82,11 @@ pub struct PrefixClassifier {
 
 impl PrefixClassifier {
     /// Build from `(prefix, class)` rules and the fall-through `default` class.
+    ///
+    /// Choose `default` consciously (G4.4): a name matching no rule gets it, so for an
+    /// untrusted/unknown name prefer [`TrafficClass::BEST_EFFORT`] — otherwise unclassified
+    /// bulk shares whatever priority you pass (e.g. [`TrafficClass::DEFAULT`] = top), which
+    /// lets unrecognized traffic jump ahead of classified traffic.
     pub fn new(rules: Vec<(Name, TrafficClass)>, default: TrafficClass) -> Self {
         Self { rules, default }
     }
@@ -127,6 +139,16 @@ pub trait EgressScheduler: Send + Sync {
 
     /// Total packets dropped on a full queue.
     fn dropped(&self) -> u64;
+
+    /// Packets dropped on a full queue, **per traffic class** (G4.5) — so an operator can
+    /// see *which* class is shedding (a flooded best-effort class vs. a starved priority
+    /// one). Indexed by clamped class `0..`[`NUM_TRAFFIC_CLASSES`]; sums to [`dropped`].
+    /// Default returns all-zero for schedulers that don't break drops down by class.
+    ///
+    /// [`dropped`]: Self::dropped
+    fn dropped_by_class(&self) -> [u64; NUM_TRAFFIC_CLASSES] {
+        [0; NUM_TRAFFIC_CLASSES]
+    }
 }
 
 /// Builds a fresh [`EgressScheduler`] for a face. One per face (each face owns its own
@@ -174,7 +196,8 @@ pub struct PriorityScheduler {
     inner: Mutex<Inner>,
     notify: Notify,
     closed: AtomicBool,
-    dropped: AtomicU64,
+    /// Per-class tail-drop counters (G4.5); `dropped()` sums them.
+    dropped: [AtomicU64; NUM_TRAFFIC_CLASSES],
 }
 
 struct Inner {
@@ -193,7 +216,7 @@ impl PriorityScheduler {
             }),
             notify: Notify::new(),
             closed: AtomicBool::new(false),
-            dropped: AtomicU64::new(0),
+            dropped: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
 }
@@ -205,7 +228,7 @@ impl EgressScheduler for PriorityScheduler {
             let mut inner = self.inner.lock().unwrap();
             if inner.heap.len() >= self.capacity {
                 drop(inner);
-                self.dropped.fetch_add(1, AtomicOrdering::Relaxed);
+                self.dropped[class.clamped() as usize].fetch_add(1, AtomicOrdering::Relaxed);
                 return false;
             }
             let seq = inner.seq;
@@ -255,7 +278,11 @@ impl EgressScheduler for PriorityScheduler {
     }
 
     fn dropped(&self) -> u64 {
-        self.dropped.load(AtomicOrdering::Relaxed)
+        self.dropped.iter().map(|c| c.load(AtomicOrdering::Relaxed)).sum()
+    }
+
+    fn dropped_by_class(&self) -> [u64; NUM_TRAFFIC_CLASSES] {
+        std::array::from_fn(|i| self.dropped[i].load(AtomicOrdering::Relaxed))
     }
 }
 
@@ -279,7 +306,8 @@ pub struct DeficitRoundRobinScheduler {
     inner: Mutex<DrrInner>,
     notify: Notify,
     closed: AtomicBool,
-    dropped: AtomicU64,
+    /// Per-class tail-drop counters (G4.5); `dropped()` sums them.
+    dropped: [AtomicU64; NUM_TRAFFIC_CLASSES],
 }
 
 struct DrrInner {
@@ -309,7 +337,7 @@ impl DeficitRoundRobinScheduler {
             }),
             notify: Notify::new(),
             closed: AtomicBool::new(false),
-            dropped: AtomicU64::new(0),
+            dropped: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
 }
@@ -319,13 +347,18 @@ impl EgressScheduler for DeficitRoundRobinScheduler {
     fn enqueue(&self, item: EgressItem, class: TrafficClass) -> bool {
         {
             let mut inner = self.inner.lock().unwrap();
+            let c = class.clamped() as usize; // shared clamp — identical to PriorityScheduler
             if inner.len >= self.capacity {
                 drop(inner);
-                self.dropped.fetch_add(1, AtomicOrdering::Relaxed);
+                self.dropped[c].fetch_add(1, AtomicOrdering::Relaxed);
                 return false;
             }
+            // G4.6: deficit accounts the *payload* length here, not the post-framing wire
+            // size (LP headers added later in the send loop). For equal-ish frames the
+            // byte-fairness is unaffected; a class of many tiny frames is charged slightly
+            // less than its true wire cost. Accounting the framed size would require
+            // threading the framing into the scheduler — deferred as a minor refinement.
             let size = item.0.len() as u64;
-            let c = class.clamped() as usize; // shared clamp — identical to PriorityScheduler
             inner.queues[c].push_back((size, item));
             inner.len += 1;
         }
@@ -393,7 +426,11 @@ impl EgressScheduler for DeficitRoundRobinScheduler {
     }
 
     fn dropped(&self) -> u64 {
-        self.dropped.load(AtomicOrdering::Relaxed)
+        self.dropped.iter().map(|c| c.load(AtomicOrdering::Relaxed)).sum()
+    }
+
+    fn dropped_by_class(&self) -> [u64; NUM_TRAFFIC_CLASSES] {
+        std::array::from_fn(|i| self.dropped[i].load(AtomicOrdering::Relaxed))
     }
 }
 
@@ -495,6 +532,20 @@ mod tests {
         assert!(!s.enqueue(item("c"), TrafficClass(0)), "third is tail-dropped");
         assert_eq!(s.depth(), (2, 2));
         assert_eq!(s.dropped(), 1);
+    }
+
+    #[tokio::test]
+    async fn drops_are_counted_per_class() {
+        // G4.5: a full queue attributes each drop to its class, summing to the total.
+        let s = PriorityScheduler::new(1);
+        assert!(s.enqueue(item("hi"), TrafficClass(0)));
+        assert!(!s.enqueue(item("hi2"), TrafficClass(0)), "class 0 dropped");
+        assert!(!s.enqueue(item("lo"), TrafficClass(3)), "class 3 dropped");
+        let by_class = s.dropped_by_class();
+        assert_eq!(by_class[0], 1, "one drop on class 0");
+        assert_eq!(by_class[3], 1, "one drop on class 3");
+        assert_eq!(s.dropped(), 2, "total sums the per-class drops");
+        assert_eq!(TrafficClass::BEST_EFFORT.0 as usize, NUM_TRAFFIC_CLASSES - 1);
     }
 
     #[tokio::test]
