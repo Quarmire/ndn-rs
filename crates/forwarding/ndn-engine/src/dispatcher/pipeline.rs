@@ -217,6 +217,17 @@ impl PacketDispatcher {
             return;
         }
 
+        // Data-plane name-activity signal (opt-in): notify soft-state that must follow
+        // real traffic — e.g. ndn-pipes' relay PUI inactivity monitor, which renews a
+        // pipe while its namespace is still being fetched. `None` ⇒ one untaken branch.
+        // After the PathControl bypass (control Interests aren't data-plane use) and
+        // before CS/PIT (a cache hit still counts as demand).
+        if let Some(obs) = &self.name_activity
+            && let DecodedPacket::Interest(i) = &ctx.packet
+        {
+            obs.on_activity(&i.name);
+        }
+
         let ctx = match self.cs_lookup.process(ctx).await {
             Action::Continue(ctx) => ctx,
             Action::Satisfy(ctx) => {

@@ -350,6 +350,8 @@ impl WasmEngineBuilder {
             // wasm drives no signal sources, so the congestion-feedback bridge (which
             // decays via a polled source) has nothing to run it — not wired here.
             congestion_feedback: None,
+            // No data-plane name-activity observer in the in-browser single-node engine.
+            name_activity: None,
             // PathControl (producer mobility) is a multi-forwarder concern; not wired
             // into the in-browser single-node engine.
             path_control: None,

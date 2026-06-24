@@ -19,6 +19,7 @@
 // permissively.
 #[cfg(not(target_arch = "wasm32"))]
 pub mod builder;
+pub mod activity;
 pub mod compose;
 pub mod discovery_context;
 pub mod dispatcher;
@@ -46,6 +47,7 @@ pub mod wasm_builder;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use builder::{EngineBuilder, EngineConfig};
+pub use activity::NameActivityObserver;
 pub use compose::ComposedStrategy;
 pub use discovery_context::EngineDiscoveryContext;
 pub use dispatcher::DataPlane;

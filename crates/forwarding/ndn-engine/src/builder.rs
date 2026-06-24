@@ -127,6 +127,8 @@ pub struct EngineBuilder {
     /// engine validator (MAP-Me prefix trust). A node serving pipes too supplies an
     /// authorizer that routes by op (signature for Redirect, pipe-key for Teardown).
     path_authorizer: Option<Arc<dyn crate::path_control::PathAuthorizer>>,
+    /// Opt-in data-plane name-activity observer (e.g. ndn-pipes' relay PUI monitor).
+    name_activity: Option<Arc<dyn crate::activity::NameActivityObserver>>,
 }
 
 impl EngineBuilder {
@@ -151,6 +153,7 @@ impl EngineBuilder {
             runtime: default_runtime(),
             rate_limit_hook: None,
             congestion_feedback: None,
+            name_activity: None,
             path_control: false,
             path_control_observers: Vec::new(),
             path_authorizer: None,
@@ -209,6 +212,19 @@ impl EngineBuilder {
         cfg: ndn_strategy::CongestionConfig,
     ) -> Self {
         self.congestion_feedback = Some(cfg);
+        self
+    }
+
+    /// Register a [`NameActivityObserver`](crate::activity::NameActivityObserver): every
+    /// interest's name is offered to it (before CS/PIT), so soft state that must follow
+    /// real data-plane traffic can renew. Off by default (zero data-path cost). Used by
+    /// ndn-pipes to feed its relay PUI inactivity monitor, so an actively-fetched pipe is
+    /// not torn down while its namespace is still in use.
+    pub fn with_name_activity_observer(
+        mut self,
+        observer: Arc<dyn crate::activity::NameActivityObserver>,
+    ) -> Self {
+        self.name_activity = Some(observer);
         self
     }
 
@@ -649,6 +665,7 @@ impl EngineBuilder {
             reflexive: Arc::clone(&reflexive),
             rate_limit: self.rate_limit_hook.clone(),
             congestion_feedback: congestion_fb,
+            name_activity: self.name_activity,
             path_control,
             data_plane: self.config.data_plane,
         };

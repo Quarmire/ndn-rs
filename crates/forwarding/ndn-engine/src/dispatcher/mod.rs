@@ -93,6 +93,10 @@ pub struct PacketDispatcher {
     /// name probe only when set); when `Some`, a `PathControl` Interest is handled
     /// in-transit (FIB rewrite / pipe lifecycle) instead of normal forwarding.
     pub path_control: Option<Arc<crate::path_control::PathControlHandler>>,
+    /// Data-plane name-activity observer (opt-in). `None` = zero cost (one untaken
+    /// branch); when `Some`, every interest's name is offered to it before CS/PIT, so
+    /// soft state that must follow real traffic (ndn-pipes' relay PUI monitor) can renew.
+    pub name_activity: Option<Arc<dyn crate::activity::NameActivityObserver>>,
     /// Which data-plane runtime to spawn. Default `Shared`.
     pub data_plane: DataPlane,
 }
