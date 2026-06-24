@@ -42,10 +42,16 @@ register_strategy!(
     || Arc::new(CongestionAwareStrategy::new()) as Arc<dyn ErasedStrategy>,
 );
 
-/// Odd multiplier (Knuth) used to scatter the round-robin cursor across the
-/// cumulative-weight range, so consecutive Interests interleave across faces
-/// proportionally instead of arriving in per-face blocks.
-const SCATTER: u64 = 2654435761;
+/// Avalanche-mix the round-robin cursor before reducing mod the weight total, so
+/// consecutive Interests interleave across faces proportionally. A plain
+/// `cursor * odd_constant % total` only visits a subset of residues when the constant
+/// shares a factor with `total` (skewing the realized split); a full splitmix64 mix has
+/// no such structure, so the reduction is ~uniform for any `total`.
+fn scatter(mut z: u64) -> u64 {
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
 
 /// **Congestion-aware multipath** (PCON-flavoured): weighted load-spreading over
 /// FIB nexthops, biased away from congested faces. See the module docs.
@@ -81,14 +87,20 @@ impl CongestionAwareStrategy {
     fn score(&self, ctx: &StrategyContext<'_>, face_id: FaceId, static_cost: u32) -> i64 {
         let mut s = static_cost as i64;
 
+        // RTT penalty from a single source — the measured EWMA when available, else the
+        // bridged signal. (Adding both double-counts the RTT for any face that has both.)
+        let mut rtt_added = false;
         if let Some(entry) = ctx.measurements.get(ctx.name)
             && let Some(rtt) = entry.rtt_per_face.get(&face_id)
         {
             s += (rtt.srtt_ns / 1.0e7) as i64; // +1 per 10 ms EWMA RTT
+            rtt_added = true;
         }
 
         if let Some(sig) = ctx.signals.link(face_id) {
-            if let Some(rtt_ms) = sig.observed_rtt_ms {
+            if !rtt_added
+                && let Some(rtt_ms) = sig.observed_rtt_ms
+            {
                 s += (rtt_ms / 10.0) as i64;
             }
             if let Some(tput) = sig.observed_tput_bps {
@@ -150,11 +162,7 @@ impl CongestionAwareStrategy {
             [(f, _)] => Some(*f),
             _ => {
                 let total: u64 = cands.iter().map(|(_, w)| *w).sum();
-                let pos = self
-                    .cursor
-                    .fetch_add(1, Ordering::Relaxed)
-                    .wrapping_mul(SCATTER)
-                    % total;
+                let pos = scatter(self.cursor.fetch_add(1, Ordering::Relaxed)) % total;
                 let mut acc = 0u64;
                 for (f, w) in &cands {
                     acc += *w;
@@ -199,7 +207,9 @@ impl Strategy for CongestionAwareStrategy {
     }
 
     fn after_receive_interest(&self, ctx: &StrategyContext<'_>) -> SmallVec<[ForwardingAction; 2]> {
-        self.decide(ctx).unwrap()
+        // `decide` always returns Some today; fall back to "no action" (drop) rather than
+        // panic on the hot path if that ever changes.
+        self.decide(ctx).unwrap_or_default()
     }
 
     fn after_receive_data(&self, _ctx: &StrategyContext<'_>) -> SmallVec<[ForwardingAction; 2]> {
