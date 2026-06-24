@@ -21,6 +21,7 @@
 pub mod builder;
 pub mod activity;
 pub mod compose;
+pub mod egress;
 pub mod discovery_context;
 pub mod dispatcher;
 pub mod engine;
@@ -49,6 +50,9 @@ pub mod wasm_builder;
 pub use builder::{EngineBuilder, EngineConfig};
 pub use activity::NameActivityObserver;
 pub use compose::ComposedStrategy;
+pub use egress::{
+    EgressClassifier, EgressScheduler, PrefixClassifier, PriorityScheduler, TrafficClass,
+};
 pub use discovery_context::EngineDiscoveryContext;
 pub use dispatcher::DataPlane;
 pub use engine::{FaceCounters, FaceState, ForwarderEngine, ShutdownHandle};
