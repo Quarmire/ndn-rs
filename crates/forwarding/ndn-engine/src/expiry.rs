@@ -50,7 +50,7 @@ pub async fn run_expiry_task(
                 let expired: Vec<_> = expired_entries
                     .into_iter()
                     .map(|(token, entry)| {
-                        crate::stages::pit::insert_dead_nonces(&dead_nonce_list, &entry);
+                        crate::stages::pit::insert_dead_nonces(&dead_nonce_list, &entry, now);
                         let faces: smallvec::SmallVec<[u64; 4]> =
                             entry.in_records.iter().map(|r| r.face_id).collect();
                         (token, faces)
@@ -108,7 +108,7 @@ pub async fn run_rib_expiry_task(
                 }
                 // GC expired reflexive reverse-routes (W-RF-3). Lookup already
                 // treats expired routes as absent; this just frees memory.
-                let swept = reflexive.sweep();
+                let swept = reflexive.sweep(runtime.unix_nanos());
                 if swept > 0 {
                     tracing::debug!(target: t::ENGINE, count = swept, "reflexive routes expired");
                 }

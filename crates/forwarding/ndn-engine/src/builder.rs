@@ -1101,7 +1101,7 @@ mod tests {
 
         let mut found = None;
         for _ in 0..100 {
-            if let Some(f) = engine.reflexive().lookup(&rname) {
+            if let Some(f) = engine.reflexive().lookup(&rname, 0) {
                 found = Some(f);
                 break;
             }
@@ -1137,12 +1137,12 @@ mod tests {
             .build();
         inject(&engine, i1, consumer_id).await;
         for _ in 0..100 {
-            if engine.reflexive().lookup(&rname).is_some() {
+            if engine.reflexive().lookup(&rname, 0).is_some() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
-        assert_eq!(engine.reflexive().lookup(&rname), Some(consumer_id));
+        assert_eq!(engine.reflexive().lookup(&rname, 0), Some(consumer_id));
 
         // I2 named under R, from a different face, must be reverse-routed to the
         // consumer face.
@@ -1180,7 +1180,7 @@ mod tests {
             .build();
         inject(&engine, i1, consumer_id).await;
         for _ in 0..100 {
-            if engine.reflexive().lookup(&rname).is_some() {
+            if engine.reflexive().lookup(&rname, 0).is_some() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(2)).await;
@@ -1226,7 +1226,7 @@ mod tests {
             .build();
         inject(&engine, i1, consumer_id).await;
         for _ in 0..100 {
-            if engine.reflexive().lookup(&rname).is_some() {
+            if engine.reflexive().lookup(&rname, 0).is_some() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(2)).await;

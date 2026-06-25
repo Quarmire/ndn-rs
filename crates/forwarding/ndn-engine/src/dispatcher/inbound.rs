@@ -1,7 +1,5 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use web_time::SystemTime;
-use web_time::UNIX_EPOCH;
 
 use tokio::sync::mpsc;
 use tracing::{debug, trace, warn};
@@ -40,7 +38,7 @@ pub(crate) async fn run_face_reader(
         face_states,
         discovery,
         discovery_ctx,
-        runtime: _,
+        runtime,
         face_lifecycle_sink,
     } = ctx;
     let kind = face.kind();
@@ -78,10 +76,10 @@ pub(crate) async fn run_face_reader(
                 // Reliability Ack-consumption for socket faces runs inside
                 // `link_service.recv` (the feature's `on_ingress`).
 
-                let arrival = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos() as u64;
+                // Arrival is stamped via the runtime clock seam, so a virtual runtime makes
+                // socket-received packets deterministic too (the inject_packet path supplies
+                // arrival explicitly). (ndn-lab slice 0b.)
+                let arrival = runtime.unix_nanos();
                 if track_activity && let Some(state) = face_states.get(&face_id) {
                     state.last_activity.store(arrival, Ordering::Relaxed);
                 }

@@ -1,6 +1,4 @@
 use std::sync::Arc;
-use web_time::SystemTime;
-use web_time::UNIX_EPOCH;
 
 use tracing::trace;
 
@@ -69,10 +67,9 @@ impl CsInsertStage {
                 return Action::Satisfy(ctx);
             }
 
-            let now_ns = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos() as u64;
+            // The Data's freshness window starts at its arrival (deterministic under a
+            // virtual runtime), not a fresh wall-clock read. (ndn-lab slice 0b.)
+            let now_ns = ctx.arrival;
 
             let freshness_ms = data
                 .meta_info()

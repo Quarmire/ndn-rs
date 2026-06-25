@@ -1,7 +1,4 @@
 use std::sync::Arc;
-use web_time::SystemTime;
-use web_time::UNIX_EPOCH;
-
 use smallvec::SmallVec;
 use tracing::trace;
 
@@ -78,7 +75,10 @@ impl PitCheckStage {
             _ => unreachable!(),
         };
 
-        let now_ns = now_ns();
+        // The PIT deadline is anchored to the packet's arrival (already virtual under a
+        // simulation runtime, explicit via inject_packet), not a fresh wall-clock read —
+        // so expiry is deterministic. (ndn-lab slice 0b.)
+        let now_ns = ctx.arrival;
         let lifetime_ms = interest
             .lifetime()
             .map(|d| d.as_millis() as u64)
@@ -262,7 +262,7 @@ impl PitCheckStage {
         let state = if let Some(v) = &self.validator {
             match v.validate_interest(interest).await {
                 InterestValidationOutcome::Valid => {
-                    let now = now_ns();
+                    let now = ctx.arrival;
                     let reap_at = now + (sub_req.max_lifetime_secs as u64) * 1_000_000_000;
                     // Re-attach across face churn (F15): if this subscription
                     // carries a SubscriptionId and a budget was parked when its
@@ -388,6 +388,9 @@ impl PitMatchStage {
         let mut tokens: SmallVec<[Option<bytes::Bytes>; 4]> = SmallVec::new();
         let mut seen: SmallVec<[u64; 8]> = SmallVec::new();
         let mut fan_out: Vec<(u64, Vec<ndn_packet::lp::TraceId>)> = Vec::new();
+        // The Data's arrival is the time we stamp into the Dead-Nonce-List on consume
+        // (deterministic under a virtual runtime). (ndn-lab slice 0b.)
+        let arrival = ctx.arrival;
 
         // Exact-name entries: every in-record matches regardless of CanBePrefix.
         self.consume_entry(
@@ -397,6 +400,7 @@ impl PitMatchStage {
             &mut tokens,
             &mut seen,
             &mut fan_out,
+            arrival,
         );
         self.consume_entry(
             &token_classical,
@@ -405,9 +409,10 @@ impl PitMatchStage {
             &mut tokens,
             &mut seen,
             &mut fan_out,
+            arrival,
         );
         if let Some(alt) = stripped_token.as_ref() {
-            self.consume_entry(alt, false, &mut faces, &mut tokens, &mut seen, &mut fan_out);
+            self.consume_entry(alt, false, &mut faces, &mut tokens, &mut seen, &mut fan_out, arrival);
         }
 
         // CanBePrefix walk: at each shorter prefix only CanBePrefix in-records
@@ -418,7 +423,7 @@ impl PitMatchStage {
                 PitKeyDiscriminator::Classical,
             ] {
                 let tok = PitToken::from_name_hash_keyed(prefix_hash, None, disc);
-                self.consume_entry(&tok, true, &mut faces, &mut tokens, &mut seen, &mut fan_out);
+                self.consume_entry(&tok, true, &mut faces, &mut tokens, &mut seen, &mut fan_out, arrival);
             }
         }
 
@@ -448,6 +453,7 @@ impl PitMatchStage {
     /// are left untouched. Handles per-subscriber persistent-credit decrement
     /// and entry reaping. A no-op when no entry exists at `token`.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn consume_entry(
         &self,
         token: &PitToken,
@@ -456,6 +462,7 @@ impl PitMatchStage {
         tokens: &mut SmallVec<[Option<bytes::Bytes>; 4]>,
         seen: &mut SmallVec<[u64; 8]>,
         fan_out: &mut Vec<(u64, Vec<ndn_packet::lp::TraceId>)>,
+        now_ns: u64,
     ) {
         // Persistent-aware path: per-subscriber credit pools, survives until
         // exhausted (mirrors the classic persistent-Interest semantics).
@@ -523,7 +530,7 @@ impl PitMatchStage {
                 should_reap,
             }) => {
                 if should_reap && let Some((_, entry)) = self.pit.remove(token) {
-                    insert_dead_nonces(&self.dead_nonce_list, &entry);
+                    insert_dead_nonces(&self.dead_nonce_list, &entry, now_ns);
                 }
                 for (fid, tok) in f.into_iter().zip(t) {
                     if seen.contains(&fid.0) {
@@ -573,14 +580,14 @@ impl PitMatchStage {
                     fan_out.push((face_id, trace_ids));
                 }
                 if now_empty && let Some((_, entry)) = self.pit.remove(token) {
-                    insert_dead_nonces(&self.dead_nonce_list, &entry);
+                    insert_dead_nonces(&self.dead_nonce_list, &entry, now_ns);
                 }
             }
             return;
         }
         // Exact match: every in-record is satisfied; remove the entry.
         if let Some((_, entry)) = self.pit.remove(token) {
-            insert_dead_nonces(&self.dead_nonce_list, &entry);
+            insert_dead_nonces(&self.dead_nonce_list, &entry, now_ns);
             for r in entry.in_records.iter() {
                 if seen.contains(&r.face_id) {
                     continue;
@@ -594,13 +601,12 @@ impl PitMatchStage {
     }
 }
 
-pub(crate) fn insert_dead_nonces(dnl: &Option<Arc<DeadNonceList>>, entry: &PitEntry) {
+pub(crate) fn insert_dead_nonces(dnl: &Option<Arc<DeadNonceList>>, entry: &PitEntry, now: u64) {
     let Some(dnl) = dnl.as_ref() else {
         return;
     };
     let key_name = strip_digest_components(&entry.name);
     let name_hash = NameHashes::full_name_hash(&key_name);
-    let now = now_ns();
     for &nonce in &entry.nonces_seen {
         dnl.insert(NonceFingerprint::new(name_hash, nonce), now);
     }
@@ -621,7 +627,9 @@ fn strip_digest_components(name: &ndn_packet::Name) -> ndn_packet::Name {
     }
 }
 
+#[cfg(test)]
 fn now_ns() -> u64 {
+    use web_time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -1762,10 +1770,15 @@ mod d09_retx_tests {
         let name: Name = "/d09/retx/after".parse().unwrap();
         let wire = InterestBuilder::new(name.clone()).build();
         let nonce = Interest::decode(wire.clone()).unwrap().nonce().unwrap();
-        // Forwarded upstream 20 ms ago (> the 10 ms suppression window).
-        seed_forwarded_entry(&pit, &name, nonce, now_ns().saturating_sub(20_000_000));
+        // Virtual time: forwarded upstream at `base`; the retx arrives 20 ms later
+        // (> the 10 ms window). Time is explicit via `ctx.arrival` (ndn-lab slice 0b),
+        // so this is deterministic rather than relying on wall-clock elapsing.
+        let base = 1_000_000_000;
+        seed_forwarded_entry(&pit, &name, nonce, base);
+        let mut ctx = interest_ctx(wire, FaceId(1));
+        ctx.arrival = base + 20_000_000;
 
-        let action = check.process(interest_ctx(wire, FaceId(1))).await;
+        let action = check.process(ctx).await;
         assert!(
             matches!(action, Action::Continue(_)),
             "a retransmission past the suppression window must re-forward (D.09)"
@@ -1779,10 +1792,14 @@ mod d09_retx_tests {
         let name: Name = "/d09/retx/within".parse().unwrap();
         let wire = InterestBuilder::new(name.clone()).build();
         let nonce = Interest::decode(wire.clone()).unwrap().nonce().unwrap();
-        // Forwarded upstream just now (inside the 10 ms window).
-        seed_forwarded_entry(&pit, &name, nonce, now_ns());
+        // Virtual time: forwarded at `base`; the retx arrives 5 ms later (inside the
+        // 10 ms window) → aggregate. Deterministic via explicit `ctx.arrival`.
+        let base = 1_000_000_000;
+        seed_forwarded_entry(&pit, &name, nonce, base);
+        let mut ctx = interest_ctx(wire, FaceId(1));
+        ctx.arrival = base + 5_000_000;
 
-        let action = check.process(interest_ctx(wire, FaceId(1))).await;
+        let action = check.process(ctx).await;
         assert!(
             matches!(action, Action::Drop(DropReason::Suppressed)),
             "a retransmission inside the suppression window must aggregate"

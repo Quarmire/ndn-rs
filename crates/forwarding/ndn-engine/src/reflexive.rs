@@ -26,7 +26,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use dashmap::DashMap;
-use web_time::{SystemTime, UNIX_EPOCH};
 
 use ndn_packet::Name;
 use ndn_store::NameTrie;
@@ -95,12 +94,9 @@ pub struct ReflexiveTable {
     lookup_hits: AtomicU64,
 }
 
-fn now_ns() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64
-}
+// Time (epoch ns) is supplied by the caller — `ctx.arrival` on the data plane, the sweep
+// task's runtime clock in the background — so reverse-route expiry is deterministic under a
+// virtual runtime (no ambient wall-clock read here). (ndn-lab slice 0b.)
 
 impl ReflexiveTable {
     pub fn new(config: ReflexiveConfig) -> Self {
@@ -152,14 +148,20 @@ impl ReflexiveTable {
     /// forwarding is disabled, the per-face cap is hit (W-RF-4), or a different
     /// face already holds this name (W-RF-1 backward-only). Refreshing an
     /// existing route from the same face never counts against the cap.
-    pub fn install(&self, reflexive_name: &Name, face_id: FaceId, lifetime: Duration) -> bool {
+    pub fn install(
+        &self,
+        reflexive_name: &Name,
+        face_id: FaceId,
+        lifetime: Duration,
+        now_ns: u64,
+    ) -> bool {
         if !self.enabled.load(Ordering::Relaxed) {
             self.refused.fetch_add(1, Ordering::Relaxed);
             return false;
         }
         let max_lifetime = Duration::from_nanos(self.max_lifetime_ns.load(Ordering::Relaxed));
         let ttl = lifetime.min(max_lifetime);
-        let expiry_ns = now_ns().saturating_add(ttl.as_nanos() as u64);
+        let expiry_ns = now_ns.saturating_add(ttl.as_nanos() as u64);
 
         if let Some(existing) = self.routes.get(reflexive_name) {
             if existing.face_id != face_id {
@@ -193,9 +195,9 @@ impl ReflexiveTable {
     /// Longest-prefix-match `name` against the live reverse routes. Expired
     /// routes are treated as absent. Served even while disabled (graceful
     /// drain).
-    pub fn lookup(&self, name: &Name) -> Option<FaceId> {
+    pub fn lookup(&self, name: &Name, now_ns: u64) -> Option<FaceId> {
         let route = self.routes.lpm(name)?;
-        if route.expiry_ns <= now_ns() {
+        if route.expiry_ns <= now_ns {
             return None;
         }
         self.lookup_hits.fetch_add(1, Ordering::Relaxed);
@@ -224,9 +226,8 @@ impl ReflexiveTable {
         self.live.fetch_sub(removed, Ordering::Relaxed);
     }
 
-    /// Drop expired routes. Returns the number removed.
-    pub fn sweep(&self) -> usize {
-        let now = now_ns();
+    /// Drop expired routes (as of `now_ns`, epoch ns). Returns the number removed.
+    pub fn sweep(&self, now: u64) -> usize {
         let mut removed = 0;
         for (name, route) in self.routes.dump() {
             if route.expiry_ns <= now {
@@ -298,66 +299,66 @@ mod tests {
     #[test]
     fn install_then_lookup_lpm() {
         let t = ReflexiveTable::new(ReflexiveConfig::default());
-        assert!(t.install(&name("/rfx/abc"), FaceId(7), Duration::from_secs(4)));
-        assert_eq!(t.lookup(&name("/rfx/abc")), Some(FaceId(7)));
-        assert_eq!(t.lookup(&name("/rfx/abc/params")), Some(FaceId(7)));
-        assert_eq!(t.lookup(&name("/rfx/other")), None);
+        assert!(t.install(&name("/rfx/abc"), FaceId(7), Duration::from_secs(4), 0));
+        assert_eq!(t.lookup(&name("/rfx/abc"), 0), Some(FaceId(7)));
+        assert_eq!(t.lookup(&name("/rfx/abc/params"), 0), Some(FaceId(7)));
+        assert_eq!(t.lookup(&name("/rfx/other"), 0), None);
     }
 
     #[test]
     fn collision_from_different_face_refused() {
         let t = ReflexiveTable::new(ReflexiveConfig::default());
-        assert!(t.install(&name("/rfx/x"), FaceId(1), Duration::from_secs(4)));
-        assert!(!t.install(&name("/rfx/x"), FaceId(2), Duration::from_secs(4)));
-        assert_eq!(t.lookup(&name("/rfx/x")), Some(FaceId(1)));
+        assert!(t.install(&name("/rfx/x"), FaceId(1), Duration::from_secs(4), 0));
+        assert!(!t.install(&name("/rfx/x"), FaceId(2), Duration::from_secs(4), 0));
+        assert_eq!(t.lookup(&name("/rfx/x"), 0), Some(FaceId(1)));
     }
 
     #[test]
     fn expired_route_not_returned_and_swept() {
         let t = ReflexiveTable::new(ReflexiveConfig::default());
-        t.install(&name("/rfx/exp"), FaceId(3), Duration::from_nanos(0));
-        assert_eq!(t.lookup(&name("/rfx/exp")), None);
-        assert_eq!(t.sweep(), 1);
+        t.install(&name("/rfx/exp"), FaceId(3), Duration::from_nanos(0), 0);
+        assert_eq!(t.lookup(&name("/rfx/exp"), 0), None);
+        assert_eq!(t.sweep(0), 1);
         assert_eq!(t.route_count(FaceId(3)), 0);
     }
 
     #[test]
     fn lifetime_capped_by_config() {
         let t = ReflexiveTable::new(cfg(256, Duration::from_nanos(0)));
-        t.install(&name("/rfx/y"), FaceId(1), Duration::from_secs(3600));
-        assert_eq!(t.lookup(&name("/rfx/y")), None);
+        t.install(&name("/rfx/y"), FaceId(1), Duration::from_secs(3600), 0);
+        assert_eq!(t.lookup(&name("/rfx/y"), 0), None);
     }
 
     #[test]
     fn per_face_cap_refuses_excess() {
         let t = ReflexiveTable::new(cfg(2, Duration::from_secs(8)));
-        assert!(t.install(&name("/rfx/1"), FaceId(9), Duration::from_secs(4)));
-        assert!(t.install(&name("/rfx/2"), FaceId(9), Duration::from_secs(4)));
-        assert!(!t.install(&name("/rfx/3"), FaceId(9), Duration::from_secs(4)));
+        assert!(t.install(&name("/rfx/1"), FaceId(9), Duration::from_secs(4), 0));
+        assert!(t.install(&name("/rfx/2"), FaceId(9), Duration::from_secs(4), 0));
+        assert!(!t.install(&name("/rfx/3"), FaceId(9), Duration::from_secs(4), 0));
         assert_eq!(t.route_count(FaceId(9)), 2);
-        assert_eq!(t.lookup(&name("/rfx/3")), None);
+        assert_eq!(t.lookup(&name("/rfx/3"), 0), None);
     }
 
     #[test]
     fn remove_frees_cap_slot() {
         let t = ReflexiveTable::new(cfg(1, Duration::from_secs(8)));
-        assert!(t.install(&name("/rfx/a"), FaceId(1), Duration::from_secs(4)));
-        assert!(!t.install(&name("/rfx/b"), FaceId(1), Duration::from_secs(4)));
+        assert!(t.install(&name("/rfx/a"), FaceId(1), Duration::from_secs(4), 0));
+        assert!(!t.install(&name("/rfx/b"), FaceId(1), Duration::from_secs(4), 0));
         t.remove(&name("/rfx/a"));
         assert_eq!(t.route_count(FaceId(1)), 0);
-        assert!(t.install(&name("/rfx/b"), FaceId(1), Duration::from_secs(4)));
+        assert!(t.install(&name("/rfx/b"), FaceId(1), Duration::from_secs(4), 0));
     }
 
     #[test]
     fn remove_face_drops_all_its_routes() {
         let t = ReflexiveTable::new(ReflexiveConfig::default());
-        t.install(&name("/rfx/a"), FaceId(1), Duration::from_secs(4));
-        t.install(&name("/rfx/b"), FaceId(1), Duration::from_secs(4));
-        t.install(&name("/rfx/c"), FaceId(2), Duration::from_secs(4));
+        t.install(&name("/rfx/a"), FaceId(1), Duration::from_secs(4), 0);
+        t.install(&name("/rfx/b"), FaceId(1), Duration::from_secs(4), 0);
+        t.install(&name("/rfx/c"), FaceId(2), Duration::from_secs(4), 0);
         t.remove_face(FaceId(1));
-        assert_eq!(t.lookup(&name("/rfx/a")), None);
-        assert_eq!(t.lookup(&name("/rfx/b")), None);
-        assert_eq!(t.lookup(&name("/rfx/c")), Some(FaceId(2)));
+        assert_eq!(t.lookup(&name("/rfx/a"), 0), None);
+        assert_eq!(t.lookup(&name("/rfx/b"), 0), None);
+        assert_eq!(t.lookup(&name("/rfx/c"), 0), Some(FaceId(2)));
         assert_eq!(t.route_count(FaceId(1)), 0);
     }
 
@@ -365,10 +366,10 @@ mod tests {
     fn is_empty_tracks_live_routes() {
         let t = ReflexiveTable::new(ReflexiveConfig::default());
         assert!(t.is_empty());
-        t.install(&name("/rfx/a"), FaceId(1), Duration::from_secs(4));
-        t.install(&name("/rfx/b"), FaceId(1), Duration::from_secs(4));
+        t.install(&name("/rfx/a"), FaceId(1), Duration::from_secs(4), 0);
+        t.install(&name("/rfx/b"), FaceId(1), Duration::from_secs(4), 0);
         assert!(!t.is_empty());
-        t.install(&name("/rfx/a"), FaceId(1), Duration::from_secs(4));
+        t.install(&name("/rfx/a"), FaceId(1), Duration::from_secs(4), 0);
         t.remove(&name("/rfx/a"));
         assert!(!t.is_empty());
         t.remove(&name("/rfx/b"));
@@ -380,41 +381,41 @@ mod tests {
         // Graceful drain: an existing route is still looked up after disable,
         // but new installs are refused.
         let t = ReflexiveTable::new(ReflexiveConfig::default());
-        assert!(t.install(&name("/rfx/live"), FaceId(1), Duration::from_secs(4)));
+        assert!(t.install(&name("/rfx/live"), FaceId(1), Duration::from_secs(4), 0));
         t.set_enabled(false);
         assert!(!t.is_enabled());
-        assert!(!t.install(&name("/rfx/new"), FaceId(1), Duration::from_secs(4)));
-        assert_eq!(t.lookup(&name("/rfx/live")), Some(FaceId(1)));
+        assert!(!t.install(&name("/rfx/new"), FaceId(1), Duration::from_secs(4), 0));
+        assert_eq!(t.lookup(&name("/rfx/live"), 0), Some(FaceId(1)));
         t.set_enabled(true);
-        assert!(t.install(&name("/rfx/new"), FaceId(1), Duration::from_secs(4)));
+        assert!(t.install(&name("/rfx/new"), FaceId(1), Duration::from_secs(4), 0));
     }
 
     #[test]
     fn flush_clears_all_routes_immediately() {
         let t = ReflexiveTable::new(ReflexiveConfig::default());
-        t.install(&name("/rfx/a"), FaceId(1), Duration::from_secs(4));
-        t.install(&name("/rfx/b"), FaceId(2), Duration::from_secs(4));
+        t.install(&name("/rfx/a"), FaceId(1), Duration::from_secs(4), 0);
+        t.install(&name("/rfx/b"), FaceId(2), Duration::from_secs(4), 0);
         assert_eq!(t.flush(), 2);
         assert!(t.is_empty());
-        assert_eq!(t.lookup(&name("/rfx/a")), None);
+        assert_eq!(t.lookup(&name("/rfx/a"), 0), None);
         assert_eq!(t.route_count(FaceId(1)), 0);
     }
 
     #[test]
     fn runtime_cap_change_takes_effect() {
         let t = ReflexiveTable::new(cfg(1, Duration::from_secs(8)));
-        assert!(t.install(&name("/rfx/1"), FaceId(1), Duration::from_secs(4)));
-        assert!(!t.install(&name("/rfx/2"), FaceId(1), Duration::from_secs(4)));
+        assert!(t.install(&name("/rfx/1"), FaceId(1), Duration::from_secs(4), 0));
+        assert!(!t.install(&name("/rfx/2"), FaceId(1), Duration::from_secs(4), 0));
         t.set_max_per_face(2);
-        assert!(t.install(&name("/rfx/2"), FaceId(1), Duration::from_secs(4)));
+        assert!(t.install(&name("/rfx/2"), FaceId(1), Duration::from_secs(4), 0));
     }
 
     #[test]
     fn status_reports_counters() {
         let t = ReflexiveTable::new(cfg(1, Duration::from_secs(8)));
-        t.install(&name("/rfx/a"), FaceId(1), Duration::from_secs(4));
-        t.install(&name("/rfx/b"), FaceId(1), Duration::from_secs(4)); // refused (cap)
-        t.lookup(&name("/rfx/a"));
+        t.install(&name("/rfx/a"), FaceId(1), Duration::from_secs(4), 0);
+        t.install(&name("/rfx/b"), FaceId(1), Duration::from_secs(4), 0); // refused (cap)
+        t.lookup(&name("/rfx/a"), 0);
         let s = t.status();
         assert!(s.enabled);
         assert_eq!(s.max_per_face, 1);

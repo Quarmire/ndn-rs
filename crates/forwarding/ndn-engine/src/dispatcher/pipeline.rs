@@ -284,9 +284,10 @@ impl PacketDispatcher {
             && let Some(rname) = i.reflexive_name()
         {
             let lifetime = i.lifetime().unwrap_or(Duration::from_millis(4000));
+            // Anchor expiry to the packet's arrival (deterministic under a virtual runtime).
             if !self
                 .reflexive
-                .install(rname.as_ref(), ctx.face_id, lifetime)
+                .install(rname.as_ref(), ctx.face_id, lifetime, ctx.arrival)
             {
                 debug!(
                     target: t::FWD_PIPELINE,
@@ -304,7 +305,7 @@ impl PacketDispatcher {
         let reverse_face = if self.reflexive.is_empty() {
             None
         } else {
-            ctx.name.as_deref().and_then(|n| self.reflexive.lookup(n))
+            ctx.name.as_deref().and_then(|n| self.reflexive.lookup(n, ctx.arrival))
         };
         if let Some(rev_face) = reverse_face {
             trace!(target: t::FWD_PIPELINE, face=%ctx.face_id, rev_face=%rev_face, "reflexive: reverse routing");
