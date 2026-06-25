@@ -71,7 +71,25 @@ pub trait Sleep: Send + Sync + 'static {
 }
 
 pub trait Now: Send + Sync + 'static {
+    /// Monotonic instant (durations, timeouts, interval timing). Never goes backwards;
+    /// not comparable across processes.
     fn now(&self) -> Instant;
+
+    /// **Wall-clock** time as nanoseconds since the Unix epoch — the basis for absolute,
+    /// cross-node timestamps (PIT/Interest-lifetime deadlines, Data freshness, certificate
+    /// validity). Distinct from [`now`](Self::now), which is monotonic and process-local.
+    ///
+    /// The default reads the system clock, so production runtimes need not implement it. A
+    /// **virtual/simulation** runtime overrides this (and `now`/`sleep`) to return *logical*
+    /// time, which is what makes a simulated run deterministic and reproducible — every
+    /// engine time read flows through this one seam.
+    fn unix_nanos(&self) -> u64 {
+        use web_time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0)
+    }
 }
 
 pub trait Runtime: Spawn + Sleep + Now {}
@@ -135,4 +153,54 @@ pub fn default_runtime() -> Arc<dyn Runtime> {
     return Arc::new(TokioRuntime);
     #[cfg(target_arch = "wasm32")]
     return Arc::new(WasmRuntime);
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// The default `unix_nanos()` reads the system clock — production runtimes get it free.
+    #[test]
+    fn default_unix_nanos_reads_system_clock() {
+        let rt = TokioRuntime;
+        let a = rt.unix_nanos();
+        assert!(a > 1_600_000_000_000_000_000, "plausible epoch ns (post-2020)");
+    }
+
+    /// The seam a virtual/simulation runtime uses: override `unix_nanos`/`now`/`sleep` to
+    /// return *logical* time so every engine time read is deterministic. (Slice 0 lays this
+    /// seam; later slices supply a full virtual runtime + scheduler.) The clock state is a
+    /// shared `Arc<AtomicU64>` so the test can advance logical time the way a scheduler will.
+    #[test]
+    fn virtual_runtime_can_drive_logical_epoch_time() {
+        struct VirtualClock {
+            epoch_ns: Arc<AtomicU64>,
+        }
+        impl Spawn for VirtualClock {
+            fn spawn(&self, _fut: BoxFuture) {}
+        }
+        impl Sleep for VirtualClock {
+            fn sleep(&self, _dur: Duration) -> BoxFuture {
+                Box::pin(async {})
+            }
+        }
+        impl Now for VirtualClock {
+            fn now(&self) -> Instant {
+                Instant::now()
+            }
+            fn unix_nanos(&self) -> u64 {
+                self.epoch_ns.load(Ordering::Relaxed)
+            }
+        }
+        impl Runtime for VirtualClock {}
+
+        let clock = Arc::new(AtomicU64::new(1_000));
+        let rt: Arc<dyn Runtime> = Arc::new(VirtualClock { epoch_ns: clock.clone() });
+        assert_eq!(rt.unix_nanos(), 1_000, "logical epoch is whatever the sim sets");
+        // Advance logical time the way a scheduler will; the engine, reading only through
+        // this seam, follows deterministically.
+        clock.store(5_000, Ordering::Relaxed);
+        assert_eq!(rt.unix_nanos(), 5_000);
+    }
 }

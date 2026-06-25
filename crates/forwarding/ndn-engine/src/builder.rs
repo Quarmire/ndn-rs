@@ -791,7 +791,9 @@ impl EngineBuilder {
                         tokio::select! {
                             _ = cancel_clone.cancelled() => break,
                             _ = sleep => {
-                                d.on_tick(std::time::Instant::now(), &*ctx);
+                                // Monotonic instant via the runtime seam (a virtual runtime
+                                // drives discovery's interval timing deterministically).
+                                d.on_tick(runtime_for_tick.now(), &*ctx);
                             }
                         }
                     }

@@ -39,7 +39,9 @@ pub async fn run_expiry_task(
         tokio::select! {
             biased;            _ = cancel.cancelled() => break,
             _ = sleep => {
-                let now = now_ns();
+                // Wall-clock epoch ns via the runtime seam, so a virtual runtime drives PIT
+                // expiry deterministically (production default reads the system clock).
+                let now = runtime.unix_nanos();
                 tick = tick.wrapping_add(1);
                 if tick.is_multiple_of(1024) {
                     pit.reap_orphans(now);
@@ -140,7 +142,7 @@ pub async fn run_idle_face_task(
         tokio::select! {
             biased;            _ = cancel.cancelled() => break,
             _ = sleep => {
-                let now = now_ns();
+                let now = runtime.unix_nanos();
                 let mut expired = Vec::new();
 
                 for entry in face_states.iter() {
@@ -184,15 +186,6 @@ pub async fn run_idle_face_task(
             }
         }
     }
-}
-
-fn now_ns() -> u64 {
-    use web_time::SystemTime;
-    use web_time::UNIX_EPOCH;
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]
