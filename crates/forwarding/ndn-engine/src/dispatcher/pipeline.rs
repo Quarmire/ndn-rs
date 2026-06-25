@@ -415,10 +415,11 @@ impl PacketDispatcher {
                 // Record the failover send as an out-record so a subsequent
                 // Nack from this new upstream excludes it too (D.09).
                 let nonce = nack.interest.nonce();
-                let now = web_time::SystemTime::now()
-                    .duration_since(web_time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos() as u64;
+                // The failover out-record's sent_at must share the time base the retx
+                // suppressor compares against (`ctx.arrival`), so it's the Nack's arrival,
+                // not a fresh wall-clock read — deterministic under a virtual runtime.
+                // (ndn-lab slice 0c; fixes a 0b miss on the Nack path.)
+                let now = ctx.arrival;
                 for face_id in &faces {
                     if let Some(nonce) = nonce {
                         self.strategy
@@ -606,8 +607,9 @@ impl PacketDispatcher {
         };
         match validator.validate(&pa.data).await {
             ndn_security::ValidationResult::Valid(_) => {
-                // NFD ROUTE_ORIGIN_PREFIXANN = 130.
-                let expires_at = pa.expiration.map(|d| web_time::Instant::now() + d);
+                // NFD ROUTE_ORIGIN_PREFIXANN = 130. Monotonic deadline via the runtime
+                // (deterministic under a virtual runtime). (ndn-lab slice 0c.)
+                let expires_at = pa.expiration.map(|d| self.runtime.now() + d);
                 self.rib.add(
                     &pa.announced_prefix,
                     crate::rib::RibRoute {

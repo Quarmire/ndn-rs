@@ -182,6 +182,7 @@ mod tests {
             &"/rfx/q".parse().unwrap(),
             ndn_transport::FaceId(1),
             Duration::from_secs(4),
+            0,
         );
         assert!(!engine.reflexive().is_empty());
         m.dispatch(

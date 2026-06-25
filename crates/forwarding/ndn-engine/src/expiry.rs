@@ -99,7 +99,7 @@ pub async fn run_rib_expiry_task(
         tokio::select! {
             biased;            _ = cancel.cancelled() => break,
             _ = sleep => {
-                let affected = rib.drain_expired();
+                let affected = rib.drain_expired(runtime.now());
                 if !affected.is_empty() {
                     tracing::debug!(target: t::ENGINE, count = affected.len(), "RIB entries expired");
                     for prefix in &affected {

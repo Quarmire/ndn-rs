@@ -169,8 +169,9 @@ impl Rib {
         affected
     }
 
-    pub fn drain_expired(&self) -> Vec<Name> {
-        let now = Instant::now();
+    /// Remove routes expired as of `now` (monotonic, from the runtime — deterministic under
+    /// a virtual runtime). (ndn-lab slice 0c.)
+    pub fn drain_expired(&self, now: Instant) -> Vec<Name> {
         let mut affected = Vec::new();
         self.routes.retain(|name, routes| {
             let before = routes.len();
@@ -523,7 +524,7 @@ mod tests {
         );
         rib.add(&name("b"), route(2, 128, 10)); // permanent
 
-        let affected = rib.drain_expired();
+        let affected = rib.drain_expired(Instant::now());
         assert_eq!(affected.len(), 1);
         assert_eq!(rib.dump().len(), 1);
     }

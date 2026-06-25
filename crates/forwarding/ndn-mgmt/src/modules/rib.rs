@@ -93,9 +93,11 @@ fn rib_register(
     let cost = params.cost.unwrap_or(0) as u32;
     let orig = params.origin.unwrap_or(origin::APP);
     let flags = params.flags.unwrap_or(route_flags::CHILD_INHERIT);
+    // Monotonic deadline via the engine's runtime clock (deterministic under a virtual
+    // runtime; matches the RIB drain clock). (ndn-lab slice 0c.)
     let expires_at = params
         .expiration_period
-        .map(|ms| Instant::now() + Duration::from_millis(ms));
+        .map(|ms| engine.runtime().now() + Duration::from_millis(ms));
 
     engine.rib().add(
         &name,

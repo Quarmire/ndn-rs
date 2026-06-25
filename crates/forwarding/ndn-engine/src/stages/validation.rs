@@ -101,7 +101,7 @@ impl PendingQueue {
         }
     }
 
-    fn push(&mut self, ctx: PacketContext, needed_cert: Arc<Name>) {
+    fn push(&mut self, ctx: PacketContext, needed_cert: Arc<Name>, now: Instant) {
         let byte_size = ctx.raw_bytes.len();
 
         while self.entries.len() >= self.max_entries
@@ -117,14 +117,15 @@ impl PendingQueue {
         self.entries.push_back(PendingEntry {
             ctx,
             needed_cert,
-            deadline: Instant::now() + self.default_timeout,
+            // Monotonic deadline anchored to the runtime clock (deterministic under a
+            // virtual runtime). (ndn-lab slice 0c.)
+            deadline: now + self.default_timeout,
             byte_size,
         });
     }
 
-    fn drain_ready(&mut self, validator: &Validator) -> Vec<DrainResult> {
+    fn drain_ready(&mut self, validator: &Validator, now: Instant) -> Vec<DrainResult> {
         let mut results = Vec::new();
-        let now = Instant::now();
         let mut i = 0;
 
         while i < self.entries.len() {
@@ -222,7 +223,8 @@ impl ValidationStage {
                         }));
                     }
 
-                    self.pending.lock().await.push(ctx, cert_name);
+                    let now = self.runtime.now();
+                    self.pending.lock().await.push(ctx, cert_name, now);
                     Action::Drop(DropReason::ValidationFailed)
                 } else {
                     debug!(target: t::SECURITY, name=%data.name, "validation: pending but no key locator");
@@ -241,7 +243,8 @@ impl ValidationStage {
             return Vec::new();
         };
 
-        let results = self.pending.lock().await.drain_ready(validator);
+        let now = self.runtime.now();
+        let results = self.pending.lock().await.drain_ready(validator, now);
         let mut actions = Vec::with_capacity(results.len());
 
         for result in results {

@@ -235,6 +235,12 @@ impl DiscoveryContext for EngineDiscoveryContext {
     }
 
     fn now(&self) -> Instant {
-        Instant::now()
+        // Route discovery's clock through the engine runtime (deterministic under a virtual
+        // runtime); fall back to wall-clock only if the engine is being torn down.
+        // (ndn-lab slice 0c.)
+        self.inner
+            .upgrade()
+            .map(|i| i.runtime.now())
+            .unwrap_or_else(Instant::now)
     }
 }
