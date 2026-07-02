@@ -1,0 +1,25 @@
+[package]
+name = "ndn-radio-hal"
+description = "The data-plane radio HAL contract for ndn-rs: the bearer-agnostic TxIntent, the 802.11 McsDescriptor/policy resolution, the inject/capture frame types, and the FrameIo/WifiRadio traits the radio faces are built on. Pure types + traits, no I/O."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+classification = "spec"
+
+[dependencies]
+ndn-transport = { workspace = true }
+bytes         = { workspace = true, features = ["std"] }
+async-trait   = { workspace = true }
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+# docs.rs builds with every feature so the full API surface (incl. feature-
+# gated items) renders, and passes --cfg docsrs so `#[doc(cfg(...))]` shows the
+# feature each gated item needs.
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

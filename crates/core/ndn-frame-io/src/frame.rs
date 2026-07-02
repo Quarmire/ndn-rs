@@ -36,13 +36,9 @@ pub const ESPNOW_MAX_BODY: usize = 250;
 /// Espressif's OUI — the default for [`FrameFormat::EspNow`].
 pub const ESPNOW_OUI: [u8; 3] = [0x18, 0xfe, 0x34];
 
-/// The 802.11 broadcast address — the default destination when no name-group is
-/// configured (every monitor receiver keeps the frame).
-pub const BROADCAST: [u8; 6] = [0xff; 6];
-/// A locally-administered unicast default source. Monitor injection places no
-/// meaning on the source MAC (the NDN name is the addressing), but a well-formed
-/// 802.11 header needs one; this is `02:'N':'D':'N':00:01`, never a host MAC.
-pub const DEFAULT_SRC: [u8; 6] = [0x02, 0x4e, 0x44, 0x4e, 0x00, 0x01];
+/// The broadcast/default-source addresses now live in `ndn-radio-hal`; re-exported
+/// through the crate root so `frame::BROADCAST` / `frame::DEFAULT_SRC` still resolve.
+pub use crate::{BROADCAST, DEFAULT_SRC};
 
 /// FNV-1a (64-bit) — a fast, dependency-free, non-cryptographic hash. The group
 /// MAC is only a Bloom-style pre-filter hint; the full name + signature are

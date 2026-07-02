@@ -17,6 +17,7 @@ members = [
     "crates/faces/ndn-face-local",
     "crates/faces/ndn-face",
     "crates/core/ndn-frame-io",
+    "crates/core/ndn-radio-hal",
     "crates/forwarding/ndn-strategy",
     "crates/forwarding/ndn-pathcontrol",
     "crates/security/ndn-security",
@@ -53,6 +54,7 @@ default-members = [
     "crates/faces/ndn-face-local",
     "crates/faces/ndn-face",
     "crates/core/ndn-frame-io",
+    "crates/core/ndn-radio-hal",
     "crates/forwarding/ndn-strategy",
     "crates/forwarding/ndn-pathcontrol",
     "crates/security/ndn-security",
@@ -120,6 +122,7 @@ ndn-runtime   = { path = "crates/core/ndn-runtime" }
 ndn-face-local        = { path = "crates/faces/ndn-face-local" }
 ndn-face             = { path = "crates/faces/ndn-face" }
 ndn-frame-io          = { path = "crates/core/ndn-frame-io" }
+ndn-radio-hal         = { path = "crates/core/ndn-radio-hal" }
 ndn-strategy  = { path = "crates/forwarding/ndn-strategy" }
 ndn-pathcontrol = { path = "crates/forwarding/ndn-pathcontrol" }
 ndn-security  = { path = "crates/security/ndn-security" }

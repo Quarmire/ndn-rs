@@ -10,6 +10,7 @@ license.workspace = true
 classification = "spec"
 
 [dependencies]
+ndn-radio-hal = { workspace = true }
 ndn-transport = { workspace = true }
 bytes         = { workspace = true, features = ["std"] }
 async-trait   = { workspace = true }
