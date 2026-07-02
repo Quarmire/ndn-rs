@@ -197,3 +197,17 @@ impl crate::FrameIo for AfPacketBackend {
         }
     }
 }
+
+#[async_trait]
+impl crate::WifiRadio for AfPacketBackend {
+    async fn inject_at(
+        &self,
+        frame: InjectFrame,
+        mcs: crate::McsDescriptor,
+    ) -> Result<(), FaceError> {
+        // Build the radiotap header at the exact rate (kernel honours it) instead
+        // of resolving `frame.tx`, then reuse the raw send path.
+        let buf = crate::frame::build_at(self.format, &frame, mcs)?;
+        self.inject_raw(&buf).await
+    }
+}

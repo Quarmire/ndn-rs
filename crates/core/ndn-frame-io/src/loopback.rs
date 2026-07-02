@@ -68,19 +68,26 @@ pub struct LoopbackEndpoint {
     rx: Mutex<broadcast::Receiver<Arc<AirFrame>>>,
 }
 
+impl LoopbackEndpoint {
+    /// Put a frame on the simulated air at a resolved MCS index. No subscribers
+    /// is not an error on a broadcast medium (the frame is simply lost).
+    fn emit(&self, dst: [u8; 6], src: [u8; 6], payload: Bytes, mcs_index: u8) {
+        let _ = self.tx.send(Arc::new(AirFrame {
+            sender: self.node_id,
+            dst,
+            src,
+            payload,
+            mcs_index,
+        }));
+    }
+}
+
 #[async_trait]
 impl FrameIo for LoopbackEndpoint {
     async fn inject(&self, frame: InjectFrame) -> Result<(), FaceError> {
-        // No subscribers is not an error on a broadcast medium (nobody is
-        // listening — the frame is simply lost, like real injection).
-        let _ = self.tx.send(Arc::new(AirFrame {
-            sender: self.node_id,
-            dst: frame.dst,
-            src: frame.src,
-            payload: frame.payload,
-            mcs_index: crate::McsDescriptor::for_intent(&frame.tx, crate::MAX_RELIABLE_MCS, false)
-                .index,
-        }));
+        let idx =
+            crate::McsDescriptor::for_intent(&frame.tx, crate::MAX_RELIABLE_MCS, false).index;
+        self.emit(frame.dst, frame.src, frame.payload, idx);
         Ok(())
     }
 
@@ -107,10 +114,22 @@ impl FrameIo for LoopbackEndpoint {
     }
 }
 
+#[async_trait]
+impl crate::WifiRadio for LoopbackEndpoint {
+    async fn inject_at(
+        &self,
+        frame: InjectFrame,
+        mcs: crate::McsDescriptor,
+    ) -> Result<(), FaceError> {
+        self.emit(frame.dst, frame.src, frame.payload, mcs.index);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{McsDescriptor, TxIntent};
+    use crate::{McsDescriptor, TxIntent, WifiRadio};
     use crate::frame::{BROADCAST, DEFAULT_SRC};
 
     /// A distinctive non-broadcast group MAC (locally-administered multicast).
@@ -118,10 +137,10 @@ mod tests {
     /// A distinctive non-default source MAC (locally-administered unicast).
     const NODE_SRC: [u8; 6] = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
 
-    fn inj(payload: &[u8], dst: [u8; 6], src: [u8; 6], mcs_index: u8) -> InjectFrame {
+    fn inj(payload: &[u8], dst: [u8; 6], src: [u8; 6]) -> InjectFrame {
         InjectFrame {
             payload: Bytes::copy_from_slice(payload),
-            tx: TxIntent::wifi(McsDescriptor::ht(mcs_index)),
+            tx: TxIntent::CONSERVATIVE,
             dst,
             src,
         }
@@ -136,7 +155,7 @@ mod tests {
         let receiver = bus.endpoint(2, -73);
 
         sender
-            .inject(inj(b"\x05\x03abc", GROUP, NODE_SRC, 5))
+            .inject_at(inj(b"\x05\x03abc", GROUP, NODE_SRC), McsDescriptor::ht(5))
             .await
             .unwrap();
 
@@ -161,10 +180,10 @@ mod tests {
         let a = bus.endpoint(1, -50);
         let b = bus.endpoint(2, -50);
 
-        a.inject(inj(b"mine", BROADCAST, NODE_SRC, 1))
+        a.inject(inj(b"mine", BROADCAST, NODE_SRC))
             .await
             .unwrap();
-        b.inject(inj(b"yours", BROADCAST, DEFAULT_SRC, 1))
+        b.inject(inj(b"yours", BROADCAST, DEFAULT_SRC))
             .await
             .unwrap();
 
@@ -183,7 +202,7 @@ mod tests {
         let r3 = bus.endpoint(4, -62);
 
         sender
-            .inject(inj(b"hello", BROADCAST, DEFAULT_SRC, 3))
+            .inject_at(inj(b"hello", BROADCAST, DEFAULT_SRC), McsDescriptor::ht(3))
             .await
             .unwrap();
 
@@ -204,7 +223,7 @@ mod tests {
         let near = bus.endpoint(2, -40);
         let far = bus.endpoint(3, -90);
 
-        sender.inject(inj(b"x", GROUP, NODE_SRC, 2)).await.unwrap();
+        sender.inject(inj(b"x", GROUP, NODE_SRC)).await.unwrap();
 
         assert_eq!(near.recv_frame().await.unwrap().rssi_dbm, Some(-40));
         assert_eq!(far.recv_frame().await.unwrap().rssi_dbm, Some(-90));
@@ -219,10 +238,10 @@ mod tests {
         let s2 = bus.endpoint(2, 0);
         let s3 = bus.endpoint(3, 0);
 
-        s2.inject(inj(b"from-2", BROADCAST, DEFAULT_SRC, 1))
+        s2.inject(inj(b"from-2", BROADCAST, DEFAULT_SRC))
             .await
             .unwrap();
-        s3.inject(inj(b"from-3", BROADCAST, DEFAULT_SRC, 1))
+        s3.inject(inj(b"from-3", BROADCAST, DEFAULT_SRC))
             .await
             .unwrap();
 
@@ -243,7 +262,7 @@ mod tests {
         let bus = LoopbackMonitorBus::new();
         let lone = bus.endpoint(1, -50);
         // Nobody else subscribed; the send has only the sender's own receiver.
-        lone.inject(inj(b"lost", BROADCAST, DEFAULT_SRC, 0))
+        lone.inject(inj(b"lost", BROADCAST, DEFAULT_SRC))
             .await
             .expect("injection never fails on a broadcast medium");
     }
@@ -260,7 +279,7 @@ mod tests {
         // Overrun the 1024-slot channel without receiving, forcing a Lagged skip.
         for i in 0..1100u32 {
             sender
-                .inject(inj(&i.to_le_bytes(), BROADCAST, DEFAULT_SRC, 1))
+                .inject(inj(&i.to_le_bytes(), BROADCAST, DEFAULT_SRC))
                 .await
                 .unwrap();
         }
@@ -279,7 +298,7 @@ mod tests {
         let sender = bus.endpoint(1, -50);
         let receiver = bus.endpoint(2, -50);
         sender
-            .inject(inj(b"d", BROADCAST, DEFAULT_SRC, 1))
+            .inject(inj(b"d", BROADCAST, DEFAULT_SRC))
             .await
             .unwrap();
         assert_eq!(receiver.recv_frame().await.unwrap().payload.as_ref(), b"d");

@@ -140,12 +140,6 @@ pub struct TxIntent {
     pub reliability: Reliability,
     /// Who the frame is for — every receiver in range, or a name-group.
     pub reach: Reach,
-    /// An 802.11 rate the caller has already resolved for a WiFi bearer (fixed-
-    /// rate benches, and the adaptive / cognitive `MonitorWifiFace`). Abstract
-    /// callers and non-WiFi bearers leave this `None`; a WiFi backend then
-    /// resolves `reliability` via [`McsDescriptor::for_intent`]. Non-WiFi backends
-    /// ignore it — it is an opt-in WiFi pre-resolution, not the shape of the seam.
-    pub wifi: Option<McsDescriptor>,
 }
 
 /// The robustness objective of a [`TxIntent`].
@@ -178,22 +172,15 @@ impl TxIntent {
     pub const ROBUST: TxIntent = TxIntent {
         reliability: Reliability::MostRobust,
         reach: Reach::Broadcast,
-        wifi: None,
     };
     /// A widely-decodable balance broadcast.
     pub const CONSERVATIVE: TxIntent = TxIntent {
         reliability: Reliability::Balanced,
         reach: Reach::Broadcast,
-        wifi: None,
     };
     /// Broadcast at a stated reliability.
     pub const fn broadcast(reliability: Reliability) -> Self {
-        TxIntent { reliability, reach: Reach::Broadcast, wifi: None }
-    }
-    /// Pin an exact 802.11 rate (WiFi benches / the resolved `MonitorWifiFace`
-    /// rate). A WiFi-only escape hatch; other bearers ignore `wifi`.
-    pub const fn wifi(mcs: McsDescriptor) -> Self {
-        TxIntent { reliability: Reliability::Balanced, reach: Reach::Broadcast, wifi: Some(mcs) }
+        TxIntent { reliability, reach: Reach::Broadcast }
     }
 }
 
@@ -206,15 +193,13 @@ impl Default for TxIntent {
 impl McsDescriptor {
     /// Resolve a bearer-agnostic [`TxIntent`] to a concrete 802.11 rate for a
     /// radio that supports up to `max_index` (single-stream HT) and, if
-    /// `vht_cap`, 802.11ac. Honours an explicit `intent.wifi` pre-resolution;
-    /// otherwise maps the reliability axis: `MostRobust` → base rate with STBC +
-    /// LDPC diversity (ideal for un-ACKed broadcast), `Balanced` → a conservative
-    /// mid rate, `Throughput` → the top validated rate + short GI. This is the
-    /// 802.11 mapping of the transmit intent; another bearer maps it differently.
+    /// `vht_cap`, 802.11ac. Maps the reliability axis: `MostRobust` → base rate
+    /// with STBC + LDPC diversity (ideal for un-ACKed broadcast), `Balanced` → a
+    /// conservative mid rate, `Throughput` → the top validated rate + short GI.
+    /// This is the 802.11 mapping of the transmit intent; another bearer maps it
+    /// differently. An exact WiFi rate (fixed-rate benches, the cognitive face)
+    /// travels the [`WifiRadio::inject_at`] path instead — not on the seam.
     pub fn for_intent(intent: &TxIntent, max_index: u8, vht_cap: bool) -> McsDescriptor {
-        if let Some(m) = intent.wifi {
-            return m;
-        }
         match intent.reliability {
             Reliability::MostRobust => McsDescriptor::ht(0).with_stbc().with_ldpc(),
             Reliability::Balanced => McsDescriptor::CONSERVATIVE,
@@ -385,5 +370,20 @@ pub trait FrameIo: Send + Sync + 'static {
 /// Non-WiFi backends implement only FrameIo.
 #[async_trait]
 pub trait WifiRadio: FrameIo {
+    /// Inject one frame at an exact 802.11 rate.
     async fn inject_at(&self, frame: InjectFrame, mcs: McsDescriptor) -> Result<(), FaceError>;
+
+    /// Inject a batch, each frame with its own exact rate — the WiFi counterpart
+    /// of [`FrameIo::inject_batch`]. Backends that A-MSDU-bundle (the RTL8812EU)
+    /// override this to group runs that share dst/src/rate into one aggregate;
+    /// the default sends each via [`inject_at`](WifiRadio::inject_at).
+    async fn inject_batch_at(
+        &self,
+        frames: Vec<(InjectFrame, McsDescriptor)>,
+    ) -> Result<(), FaceError> {
+        for (f, mcs) in frames {
+            self.inject_at(f, mcs).await?;
+        }
+        Ok(())
+    }
 }

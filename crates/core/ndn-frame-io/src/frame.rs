@@ -86,6 +86,22 @@ pub fn name_group_uni(prefix: &[u8]) -> [u8; 6] {
 /// is built by [`build_dot11`] — backends that supply their own rate header
 /// (e.g. the RTL88xx USB driver's TX descriptor) call that directly instead.
 pub fn build(format: FrameFormat, frame: &InjectFrame) -> Result<Vec<u8>, FaceError> {
+    // Resolve the frame's intent to an 802.11 rate for the radiotap header (a
+    // conservative default capability is right for a header-only hint), then
+    // build. The exact-rate path ([`build_at`]) is used when a caller has already
+    // resolved a rate (the cognitive face, fixed-rate benches).
+    let mcs = crate::McsDescriptor::for_intent(&frame.tx, crate::MAX_RELIABLE_MCS, false);
+    build_at(format, frame, mcs)
+}
+
+/// Like [`build`], but at an explicit `mcs` — the radiotap TX header carries this
+/// exact rate instead of resolving `frame.tx`. The counterpart of
+/// [`WifiRadio::inject_at`](crate::WifiRadio::inject_at) for the AF_PACKET path.
+pub fn build_at(
+    format: FrameFormat,
+    frame: &InjectFrame,
+    mcs: crate::McsDescriptor,
+) -> Result<Vec<u8>, FaceError> {
     // Build the 802.11 frame first; this also runs the per-format validation
     // (e.g. the ESP-NOW body cap), so a bad frame errors before the radiotap.
     let dot11 = build_dot11(format, frame)?;
@@ -93,14 +109,7 @@ pub fn build(format: FrameFormat, frame: &InjectFrame) -> Result<Vec<u8>, FaceEr
     match format {
         // ESP-NOW rides a robust legacy rate (1 Mbps), not an MCS.
         FrameFormat::EspNow { .. } => out.extend_from_slice(&radiotap::build_tx_legacy(2)),
-        // RawNdn (and anything else `build_dot11` accepts) carries a per-frame
-        // rate: resolve the intent to an 802.11 MCS for the radiotap header. The
-        // kernel driver on the AF_PACKET path honours this; a resolution over a
-        // conservative default capability is right for a header-only hint.
-        _ => {
-            let mcs = crate::McsDescriptor::for_intent(&frame.tx, crate::MAX_RELIABLE_MCS, false);
-            out.extend_from_slice(&radiotap::build_tx_header(mcs.index, mcs.short_gi))
-        }
+        _ => out.extend_from_slice(&radiotap::build_tx_header(mcs.index, mcs.short_gi)),
     }
     out.extend_from_slice(&dot11);
     Ok(out)
