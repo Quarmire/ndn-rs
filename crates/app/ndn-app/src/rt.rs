@@ -85,7 +85,9 @@ pub async fn sleep(dur: Duration) {
 #[cfg(not(target_arch = "wasm32"))]
 pub async fn timeout<F: Future>(dur: Duration, fut: F) -> Result<F::Output, Elapsed> {
     match ambient::current() {
-        Some(rt) => ndn_runtime::timeout(&*rt, dur, fut).await.map_err(|_| Elapsed),
+        Some(rt) => ndn_runtime::timeout(&*rt, dur, fut)
+            .await
+            .map_err(|_| Elapsed),
         None => tokio::time::timeout(dur, fut).await.map_err(|_| Elapsed),
     }
 }

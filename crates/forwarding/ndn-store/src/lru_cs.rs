@@ -354,8 +354,12 @@ mod tests {
         let cs = LruCs::new(65536);
         // A cold lookup is a miss.
         assert!(cs.get(&interest(&["a", "b"])).await.is_none());
-        cs.insert(Bytes::from_static(b"data"), arc_name(&["a", "b"]), meta_fresh())
-            .await;
+        cs.insert(
+            Bytes::from_static(b"data"),
+            arc_name(&["a", "b"]),
+            meta_fresh(),
+        )
+        .await;
         // Two satisfying lookups.
         assert!(cs.get(&interest(&["a", "b"])).await.is_some());
         assert!(cs.get(&interest(&["a", "b"])).await.is_some());
