@@ -157,6 +157,10 @@ pub fn build_dot11(format: FrameFormat, frame: &InjectFrame) -> Result<Vec<u8>, 
             out.push(ESPNOW_VERSION);
             out.extend_from_slice(&frame.payload);
         }
+        FrameFormat::Raw80211 => {
+            // The payload IS the complete 802.11 frame; inject it verbatim.
+            out.extend_from_slice(&frame.payload);
+        }
         other => {
             return Err(FaceError::Io(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
@@ -258,6 +262,26 @@ pub fn parse_dot11(
             group.copy_from_slice(&body[4..10]); // addr1 (broadcast for ESP-NOW)
             Some(CapturedFrame {
                 payload: Bytes::copy_from_slice(payload),
+                addr: Some(ta),
+                group: Some(group),
+                rssi_dbm: rssi,
+                mcs_index: mcs,
+            })
+        }
+        FrameFormat::Raw80211 => {
+            // The whole 802.11 frame is the payload (the caller parses it). Still
+            // surface addr2 (TA) and addr1 (RA) from the fixed header offsets —
+            // management and data frames share the first 16 bytes — so signal
+            // plumbing and dedup work uniformly.
+            if body.len() < DOT11_HDR_LEN {
+                return None;
+            }
+            let mut ta = [0u8; 6];
+            ta.copy_from_slice(&body[10..16]);
+            let mut group = [0u8; 6];
+            group.copy_from_slice(&body[4..10]);
+            Some(CapturedFrame {
+                payload: Bytes::copy_from_slice(body),
                 addr: Some(ta),
                 group: Some(group),
                 rssi_dbm: rssi,
@@ -373,6 +397,40 @@ mod tests {
         assert_eq!(got.mcs_index, Some(7), "descriptor rate passes through");
         // `build` == radiotap header ++ the same 802.11 frame.
         assert!(build(fmt, &f).unwrap().ends_with(&dot11));
+    }
+
+    /// Raw80211 injects the payload verbatim (after radiotap) and recovers the
+    /// whole 802.11 frame on parse, with addr2/addr1 surfaced from the fixed
+    /// header — the path the userspace NAN stack uses for management frames.
+    #[test]
+    fn raw80211_passes_the_whole_frame_through() {
+        let fmt = FrameFormat::Raw80211;
+        // A fabricated NAN-beacon-shaped 802.11 frame: FC=80 00, dur, addr1..3, seq.
+        let mut frame_bytes = vec![0x80, 0x00, 0x00, 0x00];
+        frame_bytes.extend_from_slice(&BROADCAST); // addr1
+        frame_bytes.extend_from_slice(&SRC); // addr2
+        frame_bytes.extend_from_slice(&[0x50, 0x6F, 0x9A, 0x01, 0x00, 0x00]); // addr3
+        frame_bytes.extend_from_slice(&[0x00, 0x00]); // seq
+        frame_bytes.extend_from_slice(b"nan-attributes-here");
+
+        let inj = InjectFrame {
+            payload: Bytes::from(frame_bytes.clone()),
+            mcs: McsDescriptor::CONSERVATIVE,
+            dst: BROADCAST,
+            src: SRC,
+        };
+        // build_dot11 is the identity on the payload (no extra framing).
+        assert_eq!(build_dot11(fmt, &inj).unwrap(), frame_bytes);
+
+        let got = parse(fmt, &build(fmt, &inj).unwrap(), Some(-60), Some(0)).unwrap();
+        assert_eq!(
+            got.payload.as_ref(),
+            &frame_bytes[..],
+            "whole frame preserved"
+        );
+        assert_eq!(got.addr, Some(SRC), "addr2 surfaced");
+        assert_eq!(got.group, Some(BROADCAST), "addr1 surfaced");
+        assert_eq!(got.rssi_dbm, Some(-60));
     }
 
     #[test]

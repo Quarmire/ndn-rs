@@ -4,7 +4,7 @@
 //! backend injects [`InjectFrame`]s at a chosen [`McsDescriptor`] rate and
 //! yields [`CapturedFrame`]s; the [`frame`] module wraps/unwraps the NDN
 //! payload per [`FrameFormat`], and [`radiotap`] parses the RX header. Reusable
-//! backends live here: [`AfPacketBackend`] (Linux monitor mode) and the
+//! backends live here: `AfPacketBackend` (Linux monitor mode) and the
 //! format-agnostic [`LoopbackMonitorBus`] for tests. Device-specific drivers
 //! (e.g. the RTL8812 USB backend) live with their face crate and implement
 //! [`FrameIo`] against this surface.
@@ -47,7 +47,7 @@ pub const MONITOR_MTU: usize = 2296;
 pub const LEGACY_ETHER_MTU: usize = 1450;
 
 /// How an outbound NDN payload is wrapped into an on-air frame body (after the
-/// radiotap TX header). Selected per [`AfPacketBackend`]; the loopback bus is
+/// radiotap TX header). Selected per `AfPacketBackend`; the loopback bus is
 /// format-agnostic (it carries the payload directly).
 ///
 /// On-air, a monitor-mode receiver hears *all* of these — radiotap is a
@@ -68,6 +68,15 @@ pub enum FrameFormat {
     EspNow { oui: [u8; 3] },
     /// 802.11ah (HaLow) vendor action frame — sub-GHz, km-range. (Phase 3.)
     HaLowVendorAction,
+    /// **Raw 802.11 passthrough**: `InjectFrame.payload` is already a complete
+    /// 802.11 frame (from the management/data header onward), injected verbatim
+    /// after the radiotap TX header; on capture, the whole 802.11 frame is
+    /// returned as the payload. Unlike the other formats, this builds/parses *no*
+    /// body framing — the caller owns the entire frame. It is how the userspace
+    /// Wi-Fi Aware (NAN) stack injects management frames (beacons / Service
+    /// Discovery action frames), which are not data frames and so don't fit
+    /// [`RawNdn`](FrameFormat::RawNdn)'s LLC/SNAP data-frame shape.
+    Raw80211,
 }
 
 impl Default for FrameFormat {
