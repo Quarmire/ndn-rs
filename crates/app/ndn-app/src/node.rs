@@ -9,9 +9,9 @@
 //! - **`publish` / `subscribe`** — dataset sync (SVS/PSync) producer & consumer.
 //! - **`query`** — a [`Queryable`] responder stream.
 //!
-//! The per-pattern types ([`Consumer`], [`Producer`], [`Publisher`],
+//! The per-pattern types (`Consumer`, `Producer`, [`Publisher`],
 //! [`Subscriber`], [`Queryable`]) remain as lower-level building blocks reachable
-//! via [`Node::connection`]; `Node` is the polished surface most apps want.
+//! via `Node::connection`; `Node` is the polished surface most apps want.
 //!
 //! ### One connection, with one honest exception
 //!
@@ -153,7 +153,7 @@ impl Node {
     }
 
     /// The underlying multiplexed connection — the Tier-2 escape hatch for code
-    /// that needs the lower-level [`Consumer`]/[`Producer`] or raw send/recv.
+    /// that needs the lower-level `Consumer`/`Producer` or raw send/recv.
     pub fn connection(&self) -> Arc<dyn Connection> {
         Arc::clone(&self.demux) as Arc<dyn Connection>
     }
@@ -270,7 +270,7 @@ impl Node {
     /// answering metadata + segment Interests in the background until the
     /// returned [`ObjectServeGuard`] is dropped. Runs on a dedicated connection
     /// (the producer counterpart to the sync/query exception). The segments are
-    /// `DigestSha256` (unsigned); for signed serving build a [`Producer`] with a
+    /// `DigestSha256` (unsigned); for signed serving build a `Producer` with a
     /// signer from [`connection`](Self::connection).
     pub async fn serve_object(
         &self,
@@ -320,7 +320,7 @@ impl Node {
         }))
     }
 
-    /// Open a dedicated connection, register `name`, and bind a [`Producer`].
+    /// Open a dedicated connection, register `name`, and bind a `Producer`.
     async fn object_producer(&self, name: &Name) -> Result<Producer, AppError> {
         let conn = self.dedicated().await?;
         conn.register_prefix(name).await?;

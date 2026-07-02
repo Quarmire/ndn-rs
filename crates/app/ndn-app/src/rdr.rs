@@ -222,7 +222,7 @@ fn decode_nni(buf: &Bytes) -> Result<u64, AppError> {
     Ok(v)
 }
 
-/// Pre-segmented object so the [`Producer`](crate::Producer) serve
+/// Pre-segmented object so the `Producer`(crate::Producer) serve
 /// loop answers metadata and segment Interests without re-slicing.
 #[doc(hidden)]
 pub struct PreparedObject {

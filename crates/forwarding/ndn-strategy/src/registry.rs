@@ -1,7 +1,7 @@
 //! Cross-crate strategy registry.
 //!
 //! Each strategy crate registers a [`StrategyEntry`] via the
-//! [`register_strategy!`] macro; `ndn-mgmt::strategy_set` resolves names
+//! [`register_strategy!`](macro@crate::register_strategy) macro; `ndn-mgmt::strategy_set` resolves names
 //! through [`create_by_name`].
 //!
 //! On native targets entries are collected at link time via
@@ -9,7 +9,7 @@
 //! has no life-before-main and `linkme` is unsupported there, so the
 //! macro instead defines a plain `static` and entries are pushed into a
 //! runtime registry: in-crate built-ins are seeded lazily by
-//! [`registered`], and external wasm strategy crates call [`register`]
+//! [`registered`], and external wasm strategy crates call `register`
 //! explicitly during engine setup.
 
 use std::sync::Arc;
@@ -46,7 +46,7 @@ static STRATEGIES: std::sync::LazyLock<std::sync::Mutex<Vec<&'static StrategyEnt
 /// Register a strategy entry into the wasm runtime registry. Idempotent
 /// by `(name, version)`. Native targets collect entries at link time and
 /// do not expose this. External wasm strategy crates call this with the
-/// `static` defined by [`register_strategy!`] during engine setup.
+/// `static` defined by [`register_strategy!`](macro@crate::register_strategy) during engine setup.
 #[cfg(target_arch = "wasm32")]
 pub fn register(entry: &'static StrategyEntry) {
     let mut guard = STRATEGIES.lock().unwrap();
@@ -94,7 +94,7 @@ pub fn create_by_name_version(short_name: &[u8], version: u64) -> Option<Arc<dyn
 /// On native targets the entry is collected at link time. On `wasm32` it
 /// defines a `pub static`; in-crate built-ins are seeded automatically,
 /// but external wasm strategy crates must additionally call
-/// [`registry::register`](crate::registry::register) with the named
+/// `registry::register` with the named
 /// `static` during engine setup (wasm has no life-before-main).
 ///
 /// ```rust,ignore

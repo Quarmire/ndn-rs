@@ -42,7 +42,7 @@ const MANIFEST_FLAT_MAX_SEGMENTS: u64 = 256;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Aggregation {
     /// Pick by object shape: a FLIC manifest for objects of
-    /// [`MANIFEST_AUTO_MIN_SEGMENTS`]..=[`MANIFEST_FLAT_MAX_SEGMENTS`] segments,
+    /// `MANIFEST_AUTO_MIN_SEGMENTS`..=`MANIFEST_FLAT_MAX_SEGMENTS` segments,
     /// per-segment signing otherwise. The default — transparent to the consumer.
     #[default]
     Auto,
@@ -59,7 +59,7 @@ pub enum Aggregation {
 /// Options for [`Producer::publish_object_with`].
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PublishOptions {
-    /// Segment size in bytes (`0` ⇒ [`DEFAULT_SEGMENT_SIZE`]).
+    /// Segment size in bytes (`0` ⇒ `DEFAULT_SEGMENT_SIZE`).
     pub chunk_size: usize,
     /// Segment authentication strategy.
     pub aggregation: Aggregation,
@@ -160,8 +160,8 @@ impl Producer {
     ///
     /// ```ignore
     /// producer
-    ///     .route("/config", |i, r| async move { /* serve /app/config */ })
-    ///     .route("/data",   |i, r| async move { /* serve /app/data/* */ })
+    ///     .route("/config", |i, r| async move { /* serve config */ })
+    ///     .route("/data",   |i, r| async move { /* serve data */ })
     ///     .serve()
     ///     .await?;
     /// ```

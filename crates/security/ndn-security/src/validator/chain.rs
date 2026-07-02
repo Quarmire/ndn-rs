@@ -29,7 +29,7 @@ impl Validator {
     ///
     /// Verifies the Data's signature, then each intermediate cert against
     /// its issuer's key, until a trust anchor terminates the walk. Missing
-    /// certificates are fetched via the [`CertFetcher`] if configured.
+    /// certificates are fetched via the `CertFetcher` if configured.
     pub async fn validate_chain(&self, data: &Data) -> ValidationResult {
         let result = self.validate_chain_inner(data).await;
         match &result {
@@ -107,7 +107,7 @@ impl Validator {
 
     /// Validate a **signed Interest** (e.g. an NFD command) by walking its
     /// certificate chain to a trust anchor, fetching the signer's cert — and any
-    /// intermediates — via the [`CertFetcher`] if configured. Unlike
+    /// intermediates — via the `CertFetcher` if configured. Unlike
     /// [`Validator::validate_interest`] (which trusts any cert already in the
     /// cache), this verifies the signer cert actually chains to an anchor, so it
     /// is safe to use with a network fetcher: an unknown self-signed key is
@@ -165,7 +165,7 @@ impl Validator {
     /// from `(first_signed_region, first_sig_value)` signed by `first_key`, walk
     /// cert → issuer until a trust anchor of the context governing
     /// `context_name` terminates the chain. Missing certs are fetched via the
-    /// [`CertFetcher`] if configured (→ [`WalkOutcome::Pending`] on a miss).
+    /// `CertFetcher` if configured (→ [`WalkOutcome::Pending`] on a miss).
     async fn walk_to_anchor(
         &self,
         context_name: &Name,
@@ -620,7 +620,7 @@ mod tests {
     }
 
     /// A signed command whose signer cert is *not* cached but *is* fetchable and
-    /// chains to a trust anchor validates via the [`CertFetcher`].
+    /// chains to a trust anchor validates via the `CertFetcher`.
     #[tokio::test]
     async fn validate_interest_chain_fetches_signer_cert() {
         use crate::cert_fetcher::{CertFetcher, FetchFn};

@@ -1,4 +1,4 @@
-//! Blocking [`Consumer`](super::Consumer) / [`Producer`](super::Producer)
+//! Blocking `Consumer`(super::Consumer) / `Producer`(super::Producer)
 //! wrappers with private Tokio runtimes; mirrors the
 //! `reqwest::blocking` shape. Gated by the `blocking` feature.
 

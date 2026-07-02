@@ -3,7 +3,7 @@
 //! The engine's `faces()` / `fib()` accessors are deliberately low-level (a
 //! real forwarder needs them), so embedding an app means a multi-step ritual:
 //! allocate a face id, build an [`InProcFace`], add it, install a FIB route
-//! with the *matching* id, then wrap the handle in a [`Producer`]. This trait
+//! with the *matching* id, then wrap the handle in a `Producer`. This trait
 //! collapses that to one call and keeps face ids out of application code —
 //! callers work in prefixes, not plumbing.
 //!
@@ -48,12 +48,12 @@ const APP_FACE_BUFFER: usize = 256;
 /// In-process producer/consumer registration for an embedded engine.
 pub trait EngineAppExt {
     /// Allocate an in-process app face, install a FIB route for `prefix`, and
-    /// return a [`Producer`] bound to it. `cancel` ties the face's lifetime to
+    /// return a `Producer` bound to it. `cancel` ties the face's lifetime to
     /// the caller — pass a child of the engine's shutdown token so the face
     /// goes away on shutdown.
     fn register_producer(&self, prefix: impl Into<Name>, cancel: CancellationToken) -> Producer;
 
-    /// Allocate an in-process app face and return a [`Consumer`] over it.
+    /// Allocate an in-process app face and return a `Consumer` over it.
     /// No FIB route is installed (consumers originate Interests, they don't
     /// answer them).
     fn app_consumer(&self, cancel: CancellationToken) -> Consumer;

@@ -1,4 +1,4 @@
-//! Conversion between NDN [`Certificate`]s and [`DidDocument`]s.
+//! Conversion between NDN [`Certificate`]s and `DidDocument`s.
 //!
 //! An NDN certificate is structurally equivalent to a DID Document:
 //! the namespace IS the identifier, and the certificate's public key
@@ -28,7 +28,7 @@ const KEY_COMPONENT: &[u8] = b"KEY";
 /// [`TRUSTED_APPROVER_SERVICE_TYPE`]: crate::did::TRUSTED_APPROVER_SERVICE_TYPE
 pub const TRUSTED_APPROVERS_DESCRIPTION_KEY: &str = "ndn.trusted-approvers";
 
-/// Convert an NDN certificate to a W3C [`DidDocument`].
+/// Convert an NDN certificate to a W3C `DidDocument`.
 ///
 /// The certificate's `name` is expected to be a KEY name like
 /// `/com/acme/alice/KEY/v=123/self`. The identity DID is derived from
@@ -160,7 +160,7 @@ fn read_description_value(signed_region: &[u8], key: &str) -> Option<Bytes> {
     None
 }
 
-/// Attempt to reconstruct a trust anchor [`Certificate`] from a [`DidDocument`].
+/// Attempt to reconstruct a trust anchor [`Certificate`] from a `DidDocument`.
 ///
 /// Returns `None` if the document does not contain a recognised Ed25519 key.
 pub fn did_document_to_trust_anchor(doc: &DidDocument, name: Arc<Name>) -> Option<Certificate> {

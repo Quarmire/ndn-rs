@@ -38,7 +38,7 @@ impl CertFetcher {
 
     /// Fetch a certificate by name, deduplicating concurrent requests.
     ///
-    /// Panic-safe: if the leader's `do_fetch` panics, [`InFlightGuard`]
+    /// Panic-safe: if the leader's `do_fetch` panics, `InFlightGuard`
     /// removes the in-flight entry on unwind, all `Sender` clones drop, and
     /// any follower awaiting `rx.recv()` unblocks with `RecvError::Closed`
     /// mapped to `CertNotFound` instead of hanging.

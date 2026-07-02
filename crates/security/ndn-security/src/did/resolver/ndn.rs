@@ -6,7 +6,7 @@
 //! ## Wiring
 //!
 //! The resolver delegates the actual cert lookup to a shared
-//! [`CertFetcher`], the same machinery the [`Validator`] uses to
+//! `CertFetcher`, the same machinery the [`Validator`] uses to
 //! chase certificate chains. This buys two things the previous
 //! `NdnFetchFn` parallel did not provide:
 //!
@@ -45,14 +45,14 @@ use crate::{
 };
 
 /// Resolves `did:ndn` DIDs by sending NDN Interests through a
-/// shared [`CertFetcher`].
+/// shared `CertFetcher`.
 #[derive(Default, Clone)]
 pub struct NdnDidResolver {
     cert_fetcher: Option<Arc<CertFetcher>>,
 }
 
 impl NdnDidResolver {
-    /// Attach a [`CertFetcher`] for `did:ndn` resolution.
+    /// Attach a `CertFetcher` for `did:ndn` resolution.
     ///
     /// The same `Arc<CertFetcher>` should be shared with the
     /// `Validator` so chain walks and DID resolutions de-duplicate

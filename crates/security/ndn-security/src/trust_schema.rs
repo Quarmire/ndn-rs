@@ -181,7 +181,7 @@ impl std::fmt::Display for SchemaRule {
 ///
 /// Two independent rule sources are OR'd: native [`SchemaRule`]s authored
 /// in ndn-rs's text grammar, and an [`LvsModel`] imported via
-/// [`TrustSchema::from_lvs_binary`] from the binary TLV format used by
+/// `TrustSchema::from_lvs_binary` from the binary TLV format used by
 /// python-ndn, NDNts, and ndnd. [`TrustSchema::allows`] returns `true` if
 /// either source permits the `(data_name, key_name)` pair.
 #[derive(Clone, Debug, Default)]

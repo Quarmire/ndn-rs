@@ -3,8 +3,8 @@
 //! NFD's `GenericLinkService` consolidates. The transport ships raw bytes.
 //!
 //! [`default_link_service_for_kind`] picks [`PassthroughLinkService`] for
-//! [`FaceScope::Local`] kinds and [`LpLinkService`] for
-//! [`FaceScope::NonLocal`] kinds.
+//! `FaceScope::Local` kinds and [`LpLinkService`] for
+//! `FaceScope::NonLocal` kinds.
 //!
 //! ndn-rs adds [`LinkServiceFeature`] as the per-frame extension seam
 //! (fragmentation, reliability, congestion-marking, IncomingFaceId,
@@ -81,12 +81,12 @@ pub trait LinkService: Send + Sync + 'static {
     ) -> Pin<Box<dyn Future<Output = Result<(), FaceError>> + Send + 'a>>;
 
     /// Send a burst of already-framed wires (the NDNLPv2 fragments of one
-    /// packet) sharing one `source`. The default ships them through [`send`]
+    /// packet) sharing one `source`. The default ships them through `send`
     /// one at a time; a framing link service may override to apply the egress
     /// feature pipeline per frame and then hand the whole burst to
     /// [`ErasedTransport::send_batch`] for a single batched syscall.
     ///
-    /// [`send`]: LinkService::send
+    /// `send`: LinkService::send
     fn send_batch<'a>(
         &'a self,
         transport: &'a dyn ErasedTransport,
@@ -359,7 +359,7 @@ impl LinkService for LpLinkService {
         })
     }
 
-    /// Batched counterpart to [`send`](LpLinkService::send). The engine hands
+    /// Batched counterpart to `send`(LpLinkService::send). The engine hands
     /// us a packet's already-LP-framed fragments; we run the egress feature
     /// pipeline on each (exactly as the `is_lp_packet` branch of `send` does)
     /// and ship the whole burst with one [`ErasedTransport::send_batch`]. Falls
@@ -509,7 +509,7 @@ impl LinkService for LpLinkService {
 
 /// IPC kinds (bare TLV) get [`PassthroughLinkService`]; wire kinds get
 /// [`LpLinkService`] (NDNLPv2 framing) with reliability disabled. Keyed on the
-/// *framing* axis ([`FaceKind::uses_lp_framing`]), not [`FaceScope`]: a loopback
+/// *framing* axis ([`FaceKind::uses_lp_framing`]), not `FaceScope`: a loopback
 /// UDP/WebTransport face is `Local` scope yet still LP-framed.
 pub fn default_link_service_for_kind(kind: FaceKind) -> std::sync::Arc<dyn LinkService> {
     if kind.uses_lp_framing() {

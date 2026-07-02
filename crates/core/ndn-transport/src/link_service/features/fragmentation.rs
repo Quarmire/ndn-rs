@@ -1,5 +1,5 @@
 //! Fragmentation feature — inert marker. The actual fragmenter lives in
-//! [`super::super::LpLinkService::send`]; this exists so `feature_set`
+//! `super::super::LpLinkService::send`; this exists so `feature_set`
 //! FaceStatus lists "fragmentation".
 
 use super::super::LinkServiceFeature;

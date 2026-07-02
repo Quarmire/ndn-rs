@@ -2,7 +2,7 @@
 //!
 //! Mirrors the Linux/macOS faces on top of [`super::pcap_face::PcapSocket`].
 //! The local MAC is resolved via `GetAdaptersAddresses`; PcapSocket installs
-//! a BPF filter (`ether proto 0x8624`) and [`NamedEtherFace`] further filters
+//! a BPF filter (`ether proto 0x8624`) and `NamedEtherFace` further filters
 //! by source MAC in software. Both faces emit payload-only frames: the paired
 //! [`LpLinkService`](ndn_transport::LpLinkService) owns NDNLPv2 framing and
 //! fragmentation (gated on [`Transport::send_mtu`]).

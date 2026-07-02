@@ -4,7 +4,7 @@
 //! |--------|-------|---------|
 //! | [`net`] | [`UdpFace`], [`TcpFace`], [`MulticastUdpFace`] | `net` |
 //! | [`local`] | [`InProcFace`], [`InProcHandle`], [`UnixFace`], [`IpcFace`] | `local` |
-//! | [`l2`] | [`NamedEtherFace`], [`MulticastEtherFace`] | `l2` |
+//! | `l2` | `NamedEtherFace`, `MulticastEtherFace` | `l2` |
 //!
 //! Serial/UART faces moved to the `ndn-face-serial` extension crate.
 //! | [`callback`] | [`CallbackFace`] | *(always available)* |

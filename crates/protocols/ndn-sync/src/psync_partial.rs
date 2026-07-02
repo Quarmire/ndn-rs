@@ -19,7 +19,7 @@
 //!
 //! Both replies are segmented through the shared [`crate::transfer`]
 //! pipeline (so a large prefix list / update set spans `…/<v>/seg=i`), and
-//! the producer's IBF/name set is the same bounded [`ProducerBase`] the
+//! the producer's IBF/name set is the same bounded `ProducerBase` the
 //! Full producer uses.
 
 use std::collections::{HashMap, HashSet};

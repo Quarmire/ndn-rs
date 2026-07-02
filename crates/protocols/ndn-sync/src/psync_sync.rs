@@ -429,7 +429,7 @@ fn spawn_reassembly(
     });
 }
 
-/// Build an [`Express`](crate::transfer::Express) that emits a segment
+/// Build an `Express`(crate::transfer::Express) that emits a segment
 /// Interest on `send` and parks a oneshot in `pending` for the recv loop to
 /// fulfil, with a timeout fallback.
 fn seg_express(send: mpsc::Sender<Bytes>, pending: SegPending) -> crate::transfer::Express {

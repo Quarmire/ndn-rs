@@ -33,8 +33,8 @@ impl ChunkedProducer {
     }
 }
 
-/// Out-of-order safe: [`receive_segment`] inserts by index, then
-/// [`reassemble`] returns `Some(Bytes)` once every segment is present.
+/// Out-of-order safe: `receive_segment` inserts by index, then
+/// `reassemble` returns `Some(Bytes)` once every segment is present.
 pub struct ChunkedConsumer {
     prefix: Name,
     segment_count: usize,

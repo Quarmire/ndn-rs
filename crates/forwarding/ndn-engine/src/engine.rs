@@ -287,7 +287,7 @@ pub struct EngineInner {
     /// Reflexive-forwarding reverse routes (temporary, reverse-path routes
     /// installed from `REFLEXIVE_NAME` Interests).
     pub reflexive: Arc<crate::reflexive::ReflexiveTable>,
-    /// `OnceLock` breaks the EngineInner → Arc<ctx> → Weak<EngineInner> cycle.
+    /// `OnceLock` breaks the `EngineInner -> Arc<ctx> -> Weak<EngineInner>` cycle.
     pub(crate) discovery_ctx: OnceLock<Arc<EngineDiscoveryContext>>,
     pub(crate) runtime: Arc<dyn Runtime>,
     /// Optional sink observing per-face `Up` / `Down` transitions. Installed

@@ -228,7 +228,7 @@ impl Validator {
         &self.cert_cache
     }
 
-    /// The shared cert cache handle — pass to a [`CertFetcher`] so fetched certs
+    /// The shared cert cache handle — pass to a `CertFetcher` so fetched certs
     /// populate the same cache this validator reads.
     pub fn cert_cache_arc(&self) -> Arc<CertCache> {
         Arc::clone(&self.cert_cache)
@@ -245,7 +245,7 @@ impl Validator {
         self.keyring.ambient().add_anchor(cert)
     }
 
-    /// Bootstrap a trust anchor directly from a resolved [`DidDocument`]
+    /// Bootstrap a trust anchor directly from a resolved `DidDocument`
     /// (NDF F1 Tier 3): reconstruct the anchor [`Certificate`] from the
     /// document's Ed25519 verification key and adopt it into the ambient
     /// context, so a cross-stack consumer can root trust from a `did:ndn:*`

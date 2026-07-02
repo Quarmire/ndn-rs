@@ -4,7 +4,7 @@
 //! §2). Composes the wire-canonical [`ndn_security::SignedTrustContext`] (anchors,
 //! schema, version, CA endpoints) with the new identity-side metadata: held
 //! [`IdentityRef`]s, [`AdoptionProvenance`], optional sync namespace, and
-//! preferred publish-side [`ForwardingHint`] names.
+//! preferred publish-side `ForwardingHint` names.
 
 use std::sync::Arc;
 use std::time::SystemTime;

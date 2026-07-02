@@ -1,5 +1,5 @@
 //! Replay-guard configuration shared between native [`crate::EngineBuilder`]
-//! and wasm [`crate::WasmEngineBuilder`].
+//! and wasm `crate::WasmEngineBuilder`.
 
 /// Default is "enabled, capacity 64, non-monotonic" — the safe baseline for
 /// production engines. Callers whose signed-Interest emitters are strictly

@@ -1,4 +1,4 @@
-//! High-level NDN application API: [`Consumer`], [`Producer`],
+//! High-level NDN application API: `Consumer`, `Producer`,
 //! [`KeyChain`], and the RDR helpers `Consumer::fetch_object` /
 //! `Producer::publish_object` for whole-object name-versioned transfer.
 //!

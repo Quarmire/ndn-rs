@@ -1,5 +1,5 @@
 //! Shared key/value codec for the persistent content stores
-//! ([`FjallCs`](crate::FjallCs), [`SqliteCs`](crate::SqliteCs)).
+//! (`FjallCs`(crate::FjallCs), [`SqliteCs`](crate::SqliteCs)).
 //!
 //! Keys are the concatenated TLV encoding of name components (Name TLV value
 //! bytes, without the outer `0x07` wrapper) so NDN lexicographic ordering is

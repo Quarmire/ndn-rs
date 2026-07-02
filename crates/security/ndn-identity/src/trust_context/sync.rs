@@ -1,4 +1,4 @@
-//! [`SyncBundle`] — what a sibling device needs to mirror the verify-only
+//! `SyncBundle` — what a sibling device needs to mirror the verify-only
 //! side of a [`TrustContext`]. Phase 2's `ndn-sync::context_sync` module rides
 //! this payload over a per-context SVS group.
 //!

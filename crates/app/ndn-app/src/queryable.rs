@@ -1,5 +1,5 @@
 //! Register a prefix and answer incoming Interests explicitly via a
-//! stream of [`Query`] objects (Zenoh-shaped). [`Producer`](crate::Producer)
+//! stream of [`Query`] objects (Zenoh-shaped). `Producer`(crate::Producer)
 //! is the closure-style equivalent.
 
 #[cfg(not(target_arch = "wasm32"))]

@@ -1,113 +1,148 @@
-name: CI — core
+name: CI
+
+# PR gate: every job here is required, parallel, and cache-backed. The deep,
+# slow work (coverage, feature matrix, macOS, benches, fuzz) lives in
+# nightly.yml — this lane exists to give a correct signal in minutes.
+#
+# Toolchain: rust-toolchain.toml pins the version, components, and cross
+# targets; rustup auto-installs it on first cargo invocation, so jobs need no
+# explicit toolchain action (the MSRV job overrides deliberately).
 
 on:
   push:
     branches: [main]
-    paths:
-      - "crates/**"
-      - "testbed/**"
-      - "Cargo.toml"
-      - ".github/workflows/ci.yml"
-  workflow_dispatch:
   pull_request:
     branches: [main]
-    paths:
-      - "crates/**"
-      - "testbed/**"
-      - "Cargo.toml"
-      - ".github/workflows/ci.yml"
+  workflow_dispatch:
+
+# One run per ref; superseded PR pushes are cancelled. main never cancels —
+# its runs populate the shared build caches PRs restore from.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   CARGO_TERM_COLOR: always
+  # Escalate warnings — including the [workspace.lints] table — to errors at
+  # the gate. Registry deps are unaffected (cargo caps lints off-path).
+  RUSTFLAGS: -Dwarnings
 
 jobs:
-  dep-direction:
-    name: Dep-direction guard (spec set is closed)
+  lint:
+    name: fmt + clippy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # Pure manifest parsing — fails fast if a spec crate gains an edge into a
-      # non-spec crate. The cross-repo boundary is now structural, but this still
-      # guards the core library's internal closure.
-      - name: Run dep-direction guard
-        run: python3 testbed/dep-direction-guard.py
-
-  core:
-    name: Core (fmt / clippy / test / doc)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
         with:
-          components: rustfmt, clippy
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-core-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-core-
-
-      # ndn-rs is a pure-Rust library (no dashboard/webkit, SQLite is bundled),
-      # so no system packages are required.
-      - name: Check formatting
+          shared-key: lint
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: rustfmt
         run: cargo fmt --all -- --check
-      - name: Lint
-        run: cargo clippy --workspace -- -D warnings
-      - name: Test
-        run: cargo test --workspace
-      - name: Doc build
-        run: cargo doc --workspace --no-deps
+      - name: clippy (workspace, all targets)
+        run: cargo clippy --workspace --all-targets
+
+  test:
+    name: tests (nextest + doctests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: nextest (unit + integration)
+        run: cargo nextest run --workspace
+      - name: doctests (nextest does not run these)
+        run: cargo test --workspace --doc
+
+  docs:
+    name: rustdoc (broken links are errors)
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -Dwarnings
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: docs
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo doc --workspace --no-deps
+
+  msrv:
+    name: MSRV (1.90)
+    runs-on: ubuntu-latest
+    env:
+      # MSRV verifies "compiles on the oldest supported compiler", not "is
+      # warning-free there" — older rustc emits warnings newer ones don't.
+      RUSTFLAGS: ""
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: msrv
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: cargo check on rust-version
+        run: |
+          MSRV=$(cargo metadata --no-deps --format-version 1 |
+                 python3 -c "import json,sys; print(json.load(sys.stdin)['packages'][0]['rust_version'])")
+          echo "MSRV from Cargo.toml: $MSRV"
+          rustup toolchain install "$MSRV" --profile minimal
+          cargo "+$MSRV" check --workspace
 
   wasm32:
-    name: WASM — wasm32-unknown-unknown check (core crates)
+    name: wasm32-unknown-unknown (peer-target crates)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
         with:
-          targets: wasm32-unknown-unknown
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-wasm32-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-wasm32-
-      - name: Check core crates for wasm32-unknown-unknown
+          shared-key: wasm32
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # The verified wasm surface: the full forwarding chain up to and
+      # including the engine. ndn-sync / ndn-security / ndn-app reach wasm
+      # through sibling-repo feature paths and are not (yet) gated here.
+      - name: check wasm peer-target crates
         run: |
-          cargo check -p ndn-foundation-types --target wasm32-unknown-unknown
-          cargo check -p ndn-tlv             --target wasm32-unknown-unknown
-          cargo check -p ndn-packet          --target wasm32-unknown-unknown --no-default-features --features std-wasm
-          cargo check -p ndn-transport       --target wasm32-unknown-unknown
-          cargo check -p ndn-store           --target wasm32-unknown-unknown
-          cargo check -p ndn-strategy        --target wasm32-unknown-unknown
-          cargo check -p ndn-runtime         --target wasm32-unknown-unknown
+          cargo check --target wasm32-unknown-unknown \
+            -p ndn-foundation-types -p ndn-tlv -p ndn-transport -p ndn-store \
+            -p ndn-strategy -p ndn-runtime -p ndn-mgmt-wire -p ndn-fwd-core \
+            -p ndn-signals-core -p ndn-discovery-core -p ndn-engine
+          cargo check --target wasm32-unknown-unknown \
+            -p ndn-packet --no-default-features --features std-wasm
 
-  riscv32imc:
-    name: Embedded — riscv32imc no_std core chain
+  no_std:
+    name: riscv32imc (bare-metal no_std chain)
     runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "-Dwarnings --cfg=portable_atomic_unsafe_assume_single_core"
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
         with:
-          targets: riscv32imc-unknown-none-elf
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-riscv32imc-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-riscv32imc-
-      - name: Build no_std core crates for riscv32imc-unknown-none-elf
-        # The no-CAS no_std foundation chain (foundation-types/tlv/packet). The
-        # full embedded build (ndn-embedded) lives in the ndn-embedded repo.
-        env:
-          RUSTFLAGS: --cfg=portable_atomic_unsafe_assume_single_core
+          shared-key: no_std
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: build the no_std seed chain
         run: |
           cargo build --target riscv32imc-unknown-none-elf \
             --no-default-features --features portable-atomic \
             -p ndn-foundation-types -p ndn-tlv -p ndn-packet
+          cargo build --target riscv32imc-unknown-none-elf \
+            --no-default-features -p ndn-signals-core -p ndn-fwd-core
+
+  deny:
+    name: cargo-deny (advisories + licenses + sources)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  dep-direction:
+    name: dep-direction guard (spec set is closed)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 testbed/dep-direction-guard.py

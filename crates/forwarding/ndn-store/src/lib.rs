@@ -3,7 +3,7 @@
 //! packet-processing hot path.
 //!
 //! Key types: [`NameTrie`], [`Fib`], [`Pit`], [`ContentStore`] trait,
-//! [`LruCs`], [`ShardedCs`], [`FjallCs`] (`fjall` feature), `SqliteCs`
+//! [`LruCs`], [`ShardedCs`], `FjallCs` (`fjall` feature), `SqliteCs`
 //! (`sqlite-cs` feature — the Android persistent backend), [`NullCs`],
 //! [`ObservableCs`], [`StrategyTable`], [`CsAdmissionPolicy`].
 

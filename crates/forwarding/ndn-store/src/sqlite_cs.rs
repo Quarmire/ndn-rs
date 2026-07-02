@@ -5,10 +5,10 @@
 //! `std::fs::File::try_lock`, which returns `Unsupported` on
 //! `target_os = "android"` (and fjall maps that to a hard error). SQLite's own
 //! locking works there, and the `bundled` C amalgamation links cleanly into the
-//! JNI `.so`. On desktop the engine keeps using [`FjallCs`](crate::FjallCs).
+//! JNI `.so`. On desktop the engine keeps using `FjallCs`(crate::FjallCs).
 //!
 //! Schema — one row per Data packet, keyed by the same NDN-lexicographic name
-//! encoding [`FjallCs`](crate::FjallCs) uses (see [`crate::cs_keycodec`]) so
+//! encoding `FjallCs`(crate::FjallCs) uses (see [`crate::cs_keycodec`]) so
 //! `CanBePrefix` lookups are `BLOB` range scans:
 //!
 //! ```sql

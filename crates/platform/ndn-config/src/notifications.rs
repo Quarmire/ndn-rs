@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use bytes::Bytes;
 use ndn_packet::{Name, encode::DataBuilder};
 
-/// Each [`publish`] call increments the sequence counter and emits a
+/// Each `publish` call increments the sequence counter and emits a
 /// self-signed Data on `<prefix>/<seq>` with the event payload as
 /// Content.
 pub struct NotificationStream {

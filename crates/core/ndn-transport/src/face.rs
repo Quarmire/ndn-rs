@@ -136,7 +136,7 @@ impl FaceKind {
 
     /// Whether this kind frames packets with NDNLPv2 on the wire (the LP
     /// link-service) versus passing bare TLV (in-process / IPC kinds). This is
-    /// the *transport-type* axis, independent of [`FaceScope`]: a loopback UDP
+    /// the *transport-type* axis, independent of `FaceScope`: a loopback UDP
     /// face is `Local` scope but still LP-framed.
     pub fn uses_lp_framing(&self) -> bool {
         match self {
@@ -234,14 +234,14 @@ pub enum FaceScope {
     NonLocal,
 }
 
-/// How a [`FaceKind`]'s [`FaceScope`] is determined. NFD keeps locality
+/// How a [`FaceKind`]'s `FaceScope` is determined. NFD keeps locality
 /// (a property of the *remote endpoint*) separate from LP framing (a property
 /// of the *transport type*); this enum is the locality axis.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScopePolicy {
-    /// Always [`FaceScope::Local`] — same-host IPC (Unix, Shm, App, …).
+    /// Always `FaceScope::Local` — same-host IPC (Unix, Shm, App, …).
     AlwaysLocal,
-    /// Always [`FaceScope::NonLocal`] — L2 links / multicast with no IP
+    /// Always `FaceScope::NonLocal` — L2 links / multicast with no IP
     /// loopback notion (Ethernet, multicast, serial, Bluetooth, WiFi-direct).
     AlwaysNonLocal,
     /// Local iff the remote address is loopback; else NonLocal. IP / overlay
@@ -249,11 +249,11 @@ pub enum ScopePolicy {
     ByRemoteAddress,
 }
 
-/// Resolve a face's [`FaceScope`] from its kind and remote FaceUri.
+/// Resolve a face's `FaceScope` from its kind and remote FaceUri.
 ///
 /// For [`ScopePolicy::ByRemoteAddress`] kinds the remote host decides: a
-/// loopback (or `localhost`) remote is [`FaceScope::Local`], anything else —
-/// including an unknown/absent remote — is [`FaceScope::NonLocal`] (the safe
+/// loopback (or `localhost`) remote is `FaceScope::Local`, anything else —
+/// including an unknown/absent remote — is `FaceScope::NonLocal` (the safe
 /// default: never grant `/localhost` reach to an unidentified peer).
 pub fn resolve_scope(kind: FaceKind, remote_uri: Option<&str>) -> FaceScope {
     match kind.scope_policy() {
@@ -375,8 +375,8 @@ pub enum FaceError {
     Full,
 }
 
-/// A composed ([`Transport`](crate::transport::Transport) +
-/// [`LinkService`](crate::link_service::LinkService)) pair. The Transport
+/// A composed ([`Transport`] +
+/// [`LinkService`]) pair. The Transport
 /// owns wire-byte I/O; the LinkService owns NDNLPv2 framing, reliability,
 /// IncomingFaceId tagging, and congestion-mark handling.
 pub struct Face {

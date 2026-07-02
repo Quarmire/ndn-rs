@@ -1,6 +1,6 @@
 //! `/localhost/nfd/ca/list-approvals` — read-only introspection of the
 //! NDNCERT CA's pending device-approval requests. Backend is a
-//! [`PendingApprovalStore`](ndn_cert::challenge::device_approval::PendingApprovalStore)
+//! `PendingApprovalStore`(ndn_cert::challenge::device_approval::PendingApprovalStore)
 //! via the [`ApprovalMgmtBackend`] trait.
 //!
 //! List-only, like `compute`: approvals are created by the CHALLENGE flow and

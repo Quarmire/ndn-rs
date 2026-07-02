@@ -191,7 +191,7 @@ impl DidResolutionResult {
         }
     }
 
-    /// Extract the DID Document, mapping resolution errors to a [`DidError`].
+    /// Extract the DID Document, mapping resolution errors to a `DidError`.
     pub fn into_document(self) -> Result<DidDocument, super::resolver::DidError> {
         if let Some(doc) = self.did_document {
             return Ok(doc);

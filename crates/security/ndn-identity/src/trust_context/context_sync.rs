@@ -8,7 +8,7 @@
 //! # Layering
 //!
 //! The orchestrator lives here, in `ndn-identity`, because it composes three
-//! layers that already meet here: the [`SyncBundle`] wire codec (this crate),
+//! layers that already meet here: the `SyncBundle` wire codec (this crate),
 //! the SVS primitive ([`ndn_sync`]), and [`SignedTrustContext`] /
 //! [`Keyring`] adoption ([`ndn_security`]). `ndn-sync` stays free of any
 //! trust-context dependency (sync is the lower layer).
@@ -50,7 +50,7 @@ pub enum ContextSyncOutcome {
     Rejected { version: u64 },
     /// The bundle Data could not be fetched.
     FetchFailed,
-    /// The fetched Data was not a decodable [`SyncBundle`].
+    /// The fetched Data was not a decodable `SyncBundle`.
     DecodeFailed,
 }
 

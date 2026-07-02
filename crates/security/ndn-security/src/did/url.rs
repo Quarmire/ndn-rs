@@ -17,7 +17,7 @@
 //!
 //! # Dereferencing
 //!
-//! [`deref_did_url`] takes a parsed DID URL and a resolved [`DidDocument`]
+//! [`deref_did_url`] takes a parsed DID URL and a resolved `DidDocument`
 //! and returns the specific resource the URL identifies — a verification
 //! method, a service, or the full document (when no fragment).
 

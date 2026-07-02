@@ -17,7 +17,7 @@
 //! - **everything else** (Data, Nacks, unmatched Interests) → a fallback queue
 //!   that [`DemuxConnection`]'s own [`Connection::recv`] drains.
 //!
-//! So `DemuxConnection` *is* a [`Connection`]: existing [`Consumer`](crate::Consumer)
+//! So `DemuxConnection` *is* a [`Connection`]: existing `Consumer`(crate::Consumer)
 //! code fetches over it unchanged (it only ever sees the fallback — the Data it
 //! awaited), while serves are peeled off to their handlers. Only the serve side
 //! uses the new [`DemuxConnection::serve`] / [`DemuxConnection::serve_scoped`].

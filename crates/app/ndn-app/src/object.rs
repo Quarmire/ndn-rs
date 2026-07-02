@@ -2,7 +2,7 @@
 //!
 //! Replaces the `fetch_object` / `_verified` / `_verified_hinted` /
 //! `_verified_hinted_progress` / `_streaming` / `_into` /
-//! `_to_file_hinted_progress` method explosion on [`Consumer`] with a single
+//! `_to_file_hinted_progress` method explosion on `Consumer` with a single
 //! composable chain that reads top-to-bottom:
 //!
 //! ```no_run

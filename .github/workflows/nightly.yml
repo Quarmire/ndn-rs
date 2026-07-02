@@ -1,0 +1,86 @@
+name: Nightly
+
+# The deep lane: everything too slow or too broad for the PR gate. A red job
+# here is a real finding — file it or fix it; never let nightly rot.
+
+on:
+  schedule:
+    - cron: "17 8 * * *" # daily, 08:17 UTC
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  coverage:
+    name: coverage (llvm-cov + nextest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov,cargo-nextest
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: coverage
+      - name: run tests under coverage
+        run: cargo llvm-cov nextest --workspace --lcov --output-path lcov.info
+      - name: coverage summary
+        run: |
+          echo '## Coverage' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cargo llvm-cov report --summary-only >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lcov
+          path: lcov.info
+
+  feature-matrix:
+    name: feature matrix (cargo-hack, wire/API crates)
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -Dwarnings
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-hack
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: feature-matrix
+      # Every feature alone, plus no-default-features, on the crates whose
+      # feature surface the sibling repos actually exercise.
+      - name: each-feature check
+        run: |
+          cargo hack check --each-feature --no-dev-deps \
+            -p ndn-tlv -p ndn-packet -p ndn-storage -p ndn-store \
+            -p ndn-transport -p ndn-security -p ndn-sync -p ndn-app \
+            -p ndn-engine -p ndn-config
+
+  macos:
+    name: macOS tests (ndrv face, kqueue paths)
+    runs-on: macos-latest
+    env:
+      RUSTFLAGS: -Dwarnings
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos
+      - run: cargo nextest run --workspace
+
+  bench-smoke:
+    name: benches compile and run once
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: bench
+      # criterion's --test mode runs each bench exactly once: catches bench
+      # rot without paying for (or trusting) timing on shared runners.
+      - run: cargo bench --workspace -- --test

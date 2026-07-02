@@ -932,7 +932,7 @@ impl Consumer {
         Err(last_err)
     }
 
-    /// Companion to [`Producer::publish_large`]. Segment names are
+    /// Companion to `Producer::publish_large`. Segment names are
     /// generic NameComponents holding ASCII-decimal indices
     /// (`/prefix/0`, `/prefix/1`, …); `/prefix/0`'s `FinalBlockId`
     /// fixes the total count.
@@ -996,7 +996,7 @@ impl Consumer {
     }
 }
 
-/// A [`Consumer`] that verifies every fetch against a pinned [`Validator`], so
+/// A `Consumer` that verifies every fetch against a pinned [`Validator`], so
 /// the short verbs (`fetch`, `get`) return [`SafeData`] instead of raw `Data`.
 /// Build one with [`Consumer::verifying`].
 ///
@@ -1046,14 +1046,14 @@ impl VerifiedConsumer {
         self.validator.as_ref()
     }
 
-    /// Borrow the underlying raw [`Consumer`] for the unverified primitives
+    /// Borrow the underlying raw `Consumer` for the unverified primitives
     /// (`fetch_object`, `fetch_unverified`, …). Reaching for this is the
     /// explicit "I am handling trust myself here" signal.
     pub fn unverified(&mut self) -> &mut Consumer {
         &mut self.inner
     }
 
-    /// Drop the validator and recover the raw [`Consumer`].
+    /// Drop the validator and recover the raw `Consumer`.
     pub fn into_inner(self) -> Consumer {
         self.inner
     }

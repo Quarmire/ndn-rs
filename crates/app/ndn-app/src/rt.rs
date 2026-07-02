@@ -1,7 +1,7 @@
 //! Runtime-portable `sleep` / `timeout` and a monotonic `Instant`, so the
 //! consumer fetch path compiles and runs on both native (tokio) and wasm32
 //! (gloo-timers) without threading a `Runtime` handle through every
-//! [`Consumer`](crate::Consumer).
+//! `Consumer`(crate::Consumer).
 //!
 //! `tokio::time` panics on `wasm32-unknown-unknown` (it needs a timer wheel
 //! the browser can't provide), so the wasm path races the future against a

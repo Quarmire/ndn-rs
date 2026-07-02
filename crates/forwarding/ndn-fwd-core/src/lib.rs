@@ -2,8 +2,8 @@
 //!
 //! `ndn-fwd-core` is the **sans-IO seed** of the forwarder: the forwarding
 //! *rules* with no I/O, no async, no allocator, and no opinion about how the
-//! tables are stored. The native [`ndn-engine`] (async, `tokio`, `DashMap`)
-//! and the bare-metal [`ndn-embedded`] forwarder (sync, `heapless`) keep their
+//! tables are stored. The native `ndn-engine` (async, `tokio`, `DashMap`)
+//! and the bare-metal `ndn-embedded` forwarder (sync, `heapless`) keep their
 //! own table containers but call into the rules here, so a rule lives exactly
 //! once instead of being re-implemented — and drifting — on each side.
 //!

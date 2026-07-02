@@ -1,6 +1,6 @@
 //! Revocation record — a signed, transmittable statement that a key is dead.
 //!
-//! [`TrustContext`](ndn_security::TrustContext) already *enforces* revocation
+//! `TrustContext` already *enforces* revocation
 //! (`is_revoked` / `with_revocation` over a list of names); what was missing is
 //! the wire artifact that **distributes** one. A [`RevocationRecord`] is a
 //! signed statement — "key X is revoked as of T, because …" — that a verifier
@@ -85,7 +85,7 @@ impl RevocationRecord {
 
     /// Verify the signature against the signer's public key (resolved from
     /// `key_locator` through the caller's trust). On success the `revoked` name
-    /// may be fed into a [`TrustContext`](ndn_security::TrustContext)'s
+    /// may be fed into a `TrustContext`'s
     /// revocation list. Whether the signer is *authorized* to revoke a name
     /// other than its own is the caller's policy decision (see
     /// [`is_self_revocation`](Self::is_self_revocation)).

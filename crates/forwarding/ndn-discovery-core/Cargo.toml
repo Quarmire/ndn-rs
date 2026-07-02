@@ -15,6 +15,9 @@ ndn-packet    = { workspace = true, default-features = false }
 ndn-transport = { workspace = true }
 bytes         = { workspace = true, features = ["std"] }
 tracing       = { workspace = true }
+# std::time::Instant re-export on native; JS-clock-backed shim on wasm32.
+# This crate is the wasm-safe trait surface, so its clock type must be too.
+web-time      = { workspace = true }
 
 # `std` and `std-wasm` are mutually exclusive opt-ins for ndn-packet's
 # crypto path; ring (under `std`) does not build for wasm32-unknown-unknown.

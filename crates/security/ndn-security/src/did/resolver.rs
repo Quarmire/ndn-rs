@@ -128,9 +128,9 @@ impl UniversalResolver {
         }
     }
 
-    /// Convenience: resolve and return just the [`DidDocument`].
+    /// Convenience: resolve and return just the `DidDocument`.
     ///
-    /// Maps W3C resolution errors to [`DidError`] for simpler call sites.
+    /// Maps W3C resolution errors to `DidError` for simpler call sites.
     pub async fn resolve_document(&self, did: &str) -> Result<DidDocument, DidError> {
         self.resolve(did).await.into_document()
     }

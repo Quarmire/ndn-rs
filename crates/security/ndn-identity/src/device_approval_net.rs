@@ -1,6 +1,6 @@
 //! Cross-process NDNCERT device-approval over reflexive forwarding.
 //!
-//! Bridges the in-process [`PendingApprovalStore`] (which the CA's
+//! Bridges the in-process `PendingApprovalStore` (which the CA's
 //! `DeviceApprovalChallenge` reads) to a *remote* approver device, using the
 //! `ndn-app` reflexive seam. The approver never needs an inbound route: it
 //! advertises with a reflexive name, and the CA pulls the signed approval back
@@ -243,7 +243,7 @@ where
 /// called. Returns `Ok(true)` when an approval was recorded.
 ///
 /// Call this from the APPROVE-FEED producer's serve handler with a *side*
-/// [`Consumer`], then answer `approver_forward` to release the approver.
+/// `Consumer`, then answer `approver_forward` to release the approver.
 /// A request currently awaiting approval, as the feed sees it.
 #[derive(Debug, Clone)]
 pub struct PendingApproval {
@@ -252,7 +252,7 @@ pub struct PendingApproval {
 }
 
 /// Where the cross-device approval transport reads pending requests and records
-/// outcomes. ndncert's [`PendingApprovalStore`] implements it (adapter below).
+/// outcomes. ndncert's `PendingApprovalStore` implements it (adapter below).
 ///
 /// The transport functions are generic over this trait, so they don't depend on
 /// the concrete ndncert store — other capabilities (capability tokens, the

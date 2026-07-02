@@ -8,7 +8,7 @@
 //! The crates.io package is `ndn-rs-prelude` but the library is named
 //! `ndn`, so user code writes `use ndn::Node;`.
 //!
-//! For most apps the one type to learn is [`Node`](ndn_app::Node): a single
+//! For most apps the one type to learn is [`Node`]: a single
 //! handle that exposes every pattern — `fetch` / `serve` / `object` / `publish`
 //! / `subscribe` / `query` — over one forwarder connection. The per-pattern
 //! types (`Consumer`, `Producer`, …) remain available as building blocks.

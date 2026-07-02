@@ -3,7 +3,7 @@
 //! *Layer 0* of the storage stack: domain-agnostic ordered bytes, no NDN names and
 //! no blocks. Data-model layers build **on** a `Backend`:
 //!
-//! - the named-data store (name→wire CS/Repo) — [`NamedStore`] here / `ndn-repo`,
+//! - the named-data store (name→wire CS/Repo) — `NamedStore` here / `ndn-repo`,
 //! - a content-addressed blob store (CID→bytes) — for FLIC manifests / dedup,
 //! - NDF's `BlockStore` (content-addressed chains) — in `ndf-rs`.
 //!
@@ -33,7 +33,7 @@
 //!
 //! `SyncBackend` is `no_std + alloc`. With `--no-default-features --features sync` the
 //! crate drops the async surface (which needs tokio/`std::sync`) and keeps the sync
-//! core plus the in-memory [`SyncMemoryBackend`] (a `critical-section` mutex) — the
+//! core plus the in-memory `SyncMemoryBackend` (a `critical-section` mutex) — the
 //! storage floor for an MCU. A flash engine (`sequential-storage`/`ekv` over
 //! `embedded-storage`) is just another `SyncBackend`. On `std`, [`SyncAsAsync`] bridges
 //! any `SyncBackend` into the async [`Backend`] so a sync engine composes with the
@@ -157,7 +157,7 @@ pub trait Backend: Send + Sync {
 
 /// In-memory [`Backend`] (a `BTreeMap` behind an `RwLock`). The default for tests,
 /// browser/wasm, and process-lifetime data. Its async methods complete immediately
-/// (no thread hop). For `no_std`/embedded use [`SyncMemoryBackend`] instead.
+/// (no thread hop). For `no_std`/embedded use `SyncMemoryBackend` instead.
 #[cfg(feature = "std")]
 #[derive(Default)]
 pub struct MemoryBackend {
@@ -573,7 +573,7 @@ mod sync {
     }
 
     /// Bridge any [`SyncBackend`] into the async [`Backend`](super::Backend) so a sync
-    /// engine (the embedded [`SyncMemoryBackend`]) composes with the async named layer /
+    /// engine (the embedded `SyncMemoryBackend`) composes with the async named layer /
     /// `StoreRouter` on std. Calls run **inline** (the sync op completes within the
     /// poll, no offload) — intended for *non-blocking* sync engines (in-memory). A
     /// genuinely blocking engine on std should use a native async backend

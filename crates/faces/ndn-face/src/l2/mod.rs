@@ -3,7 +3,7 @@
 //! Wifibroadcast NG / 802.11 monitor-mode injection moved to the
 //! `ndn-face-monitor-wifi` crate; Bluetooth LE to `ndn-face-bluetooth`.
 //!
-//! - [`NamedEtherFace`] / [`MulticastEtherFace`] — unicast and multicast Ethernet
+//! - `NamedEtherFace` / `MulticastEtherFace` — unicast and multicast Ethernet
 //! - [`RadioTable`] — link-metric registry for radio faces
 //!
 //! Backends: Linux `AF_PACKET`, macOS `PF_NDRV`, Windows Npcap. Mobile

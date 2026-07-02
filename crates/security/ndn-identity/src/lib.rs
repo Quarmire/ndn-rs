@@ -37,7 +37,7 @@ pub use device_approval_net::{
 pub use email::LoggingEmailSender;
 pub use enroll::{ChallengeParams, EnrollConfig};
 pub use error::IdentityError;
-/// Deprecated alias for [`Identity`]; kept for one release.
+/// Deprecated alias for `Identity`; kept for one release.
 #[allow(deprecated)]
 pub use identity::NdnIdentity;
 // The Custodian trait + KeyId now live in `ndn-custodian` (wasm-safe). Re-export

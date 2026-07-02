@@ -1,6 +1,6 @@
 //! Device-approval challenge — a request is approved by another already-
 //! approved device under the same identity, via an in-process
-//! [`PendingApprovalStore`] the approver dashboard writes to.
+//! `PendingApprovalStore` the approver dashboard writes to.
 
 use std::{
     collections::HashMap,

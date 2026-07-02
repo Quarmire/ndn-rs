@@ -262,7 +262,7 @@ impl SignedTrustContext {
         self.revocations.push(name);
         self
     }
-    /// Attach a schema blob to re-emit verbatim on [`encode_content`]
+    /// Attach a schema blob to re-emit verbatim on `encode_content`
     /// (e.g. a published LVS binary), and adopt it as the runtime schema.
     pub fn with_schema_blob(mut self, blob: SchemaBlob) -> Result<Self, SignedTrustContextError> {
         *self.schema.write().expect("schema RwLock poisoned") = blob.to_schema()?;

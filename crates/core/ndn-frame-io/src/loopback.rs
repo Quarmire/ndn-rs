@@ -3,7 +3,7 @@
 //! Models the shared-medium, half-duplex (no self-hearing), fire-and-forget
 //! semantics of raw 802.11 injection — enough to exercise the face, NDNLPv2
 //! fragmentation/reassembly, and RSSI plumbing through a real engine without a
-//! radio. The radiotap/802.11 framing lives in [`AfPacketBackend`](crate);
+//! radio. The radiotap/802.11 framing lives in `AfPacketBackend`(crate);
 //! this bus carries the NDN payload directly, like the real air carries it
 //! once the headers are stripped.
 

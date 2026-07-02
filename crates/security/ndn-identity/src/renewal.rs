@@ -47,7 +47,7 @@ pub enum RenewalError {
     Other(String),
 }
 
-/// Factory for a fresh [`Consumer`](ndn_app::Consumer) to reach the CA — a new connection
+/// Factory for a fresh `Consumer`(ndn_app::Consumer) to reach the CA — a new connection
 /// per attempt, since enrollment consumes the consumer.
 pub type ConsumerConnect = Arc<
     dyn Fn() -> Pin<Box<dyn Future<Output = Result<ndn_app::Consumer, ndn_app::AppError>> + Send>>

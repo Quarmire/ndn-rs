@@ -20,7 +20,7 @@ pub struct Responder {
     conn: Arc<dyn Connection>,
     /// Needed to encode a valid Nack reply (NDNLPv2 §5.2).
     interest_wire: Bytes,
-    /// Set when the [`Producer`](crate::Producer) was configured with
+    /// Set when the `Producer`(crate::Producer) was configured with
     /// [`with_signer`](crate::Producer::with_signer); makes [`respond`](Self::respond)
     /// sign instead of emitting a bare digest.
     signer: Option<Arc<dyn Signer>>,

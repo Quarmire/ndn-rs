@@ -1,5 +1,5 @@
-//! Transport-agnostic packet pipe used by [`Consumer`] and
-//! [`Producer`]. [`InProcConnection`] talks to an embedded engine
+//! Transport-agnostic packet pipe used by `Consumer` and
+//! `Producer`. [`InProcConnection`] talks to an embedded engine
 //! through an [`InProcHandle`]; [`IpcConnection`] talks to an external
 //! `ndn-fwd` over Unix socket via [`ForwarderClient`].
 

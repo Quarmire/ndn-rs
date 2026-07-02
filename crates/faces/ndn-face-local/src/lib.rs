@@ -48,7 +48,7 @@ pub struct InProcFace {
 
 /// Application-side handle to an [`InProcFace`].
 ///
-/// Send Interests with [`send`][InProcHandle::send]; receive Data/Nacks with
+/// Send Interests with `send`[InProcHandle::send]; receive Data/Nacks with
 /// [`recv`][InProcHandle::recv]. The receiver is wrapped in a `Mutex` so
 /// `recv()` takes `&self`, enabling concurrent send/recv from different tasks.
 pub struct InProcHandle {

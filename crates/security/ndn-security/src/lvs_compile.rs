@@ -1,5 +1,5 @@
 //! Native textual **LightVerSec compiler** (G8 part 2): LVS source → the binary
-//! [`LvsModel`](crate::lvs::LvsModel), so a trust schema can be authored in-tree without
+//! [`LvsModel`], so a trust schema can be authored in-tree without
 //! python-ndn / NDNts `@ndn/lvs`.
 //!
 //! ## Grammar (the deployable core)

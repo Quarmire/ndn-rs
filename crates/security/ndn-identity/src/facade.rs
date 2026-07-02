@@ -1,4 +1,4 @@
-//! [`Identity`] — the one managed identity above [`KeyChain`].
+//! `Identity` — the one managed identity above [`KeyChain`].
 //!
 //! `KeyChain` (in `ndn-security`) is the atom: a key, a cert, trust anchors —
 //! sign and verify. It is the canonical NDN identity type and most code needs

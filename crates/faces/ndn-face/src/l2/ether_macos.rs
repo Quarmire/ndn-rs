@@ -1,7 +1,7 @@
 //! macOS Ethernet faces over `PF_NDRV` (raw Ethernet, EtherType 0x8624).
 //!
 //! Mirrors the Linux `AF_PACKET` faces on top of [`super::ndrv::NdrvSocket`].
-//! PF_NDRV has no per-source-MAC kernel filter, so [`NamedEtherFace`] drops
+//! PF_NDRV has no per-source-MAC kernel filter, so `NamedEtherFace` drops
 //! mismatched frames in software. Both faces emit payload-only frames: the
 //! paired [`LpLinkService`](ndn_transport::LpLinkService) owns NDNLPv2 framing
 //! and fragmentation (gated on [`Transport::send_mtu`]), matching the UDP and

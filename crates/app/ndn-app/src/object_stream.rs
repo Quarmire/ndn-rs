@@ -10,7 +10,7 @@
 //!
 //! The segments are emitted **raw** (`DigestSha256`, content only). Authenticity
 //! is applied downstream by the relay that re-publishes them under a routable,
-//! node-signed name ([`relay_object_stream`]): the key holder signs, the content
+//! node-signed name (`relay_object_stream`): the key holder signs, the content
 //! source does not. This keeps a leaf keyless while removing the per-segment
 //! RemoteSigner round-trip.
 //!

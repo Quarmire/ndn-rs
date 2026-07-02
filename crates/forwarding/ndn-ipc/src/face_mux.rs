@@ -91,7 +91,7 @@ impl FaceMux {
     }
 
     /// Register an expected management response named under `name`, returning the
-    /// receiver to await after [`send`](Self::send)ing the command. The demux
+    /// receiver to await after `send`(Self::send)ing the command. The demux
     /// loop delivers the matching (LP-stripped) Data wire.
     pub(crate) fn expect(&self, name: Name) -> oneshot::Receiver<Bytes> {
         let (tx, rx) = oneshot::channel();

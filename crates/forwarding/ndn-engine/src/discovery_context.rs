@@ -1,11 +1,12 @@
 //! `EngineDiscoveryContext` bridges discovery protocols to engine tables.
-//! Holds `Weak<EngineInner>` to break the EngineInner → Arc<ctx> cycle.
+//! Holds `Weak<EngineInner>` to break the `EngineInner -> Arc<ctx>` cycle.
 
 use std::sync::{Arc, Weak};
 // `DiscoveryProtocol` signs in std::time::Instant. `Instant::now()` panics
 // on wasm; the wasm engine uses `NoDiscovery` and never spawns the tick
 // task (see `wasm_builder.rs`).
-use std::time::Instant;
+// ndn_runtime::Instant == web_time::Instant: matches runtime.now() on wasm32 too.
+use ndn_runtime::Instant;
 
 use bytes::Bytes;
 use dashmap::DashMap;

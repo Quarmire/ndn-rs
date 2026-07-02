@@ -8,7 +8,7 @@
 //! installs a temporary reverse route `R -> incoming face`; the producer then
 //! Interests `R/<suffix>` and the engine routes it back along that path.
 //!
-//! Two roles, two helpers — both on [`Consumer`] (a producer pulls with a
+//! Two roles, two helpers — both on `Consumer` (a producer pulls with a
 //! side consumer face, mirroring `ndn-compute`'s `function_reflexive`):
 //!
 //! - [`Consumer::fetch_reflexive`] — the **advertiser**: send a forward
@@ -117,7 +117,7 @@ impl Consumer {
 
     /// Puller side. From a received `forward` Interest (which must carry a
     /// reflexive name `R`), Interest `R/<suffix>` back along the reverse path
-    /// and return the Data. Typically called from a [`Producer`](crate::Producer)
+    /// and return the Data. Typically called from a `Producer`(crate::Producer)
     /// serve handler using a *side* `Consumer` on the same connection (the
     /// serve face is busy receiving the forward Interest).
     pub async fn pull_reflexive(

@@ -3,7 +3,7 @@
 //! data plane, matching ndn-svs `SVSPubSub` so it composes with other
 //! implementations.
 //!
-//! A producer [`publish`](SvsPubSub::publish)es under an application name
+//! A producer `publish`(SvsPubSub::publish)es under an application name
 //! (`/sensors/temp/...`), unrelated to its node id; a consumer
 //! [`subscribe`](SvsPubSub::subscribe)s to a *prefix* and receives only
 //! matching publications. The bridge is the [`MappingProvider`]: each

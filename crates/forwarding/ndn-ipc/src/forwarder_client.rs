@@ -49,7 +49,7 @@ pub enum ForwarderError {
 pub trait DataPlane: Send + Sync {
     /// Send one packet (already a bare NDN TLV; the data plane owns its framing).
     async fn send(&self, pkt: Bytes) -> Result<(), ForwarderError>;
-    /// Send a batch; impls may coalesce wakeups. Default loops over [`send`].
+    /// Send a batch; impls may coalesce wakeups. Default loops over `send`.
     async fn send_batch(&self, pkts: &[Bytes]) -> Result<(), ForwarderError> {
         for pkt in pkts {
             self.send(pkt.clone()).await?;

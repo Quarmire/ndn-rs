@@ -106,7 +106,7 @@ async fn handle_security(
 /// Same shape `policy-get` returns and `policy-set` consumes.
 /// Forwarder-internal config; not a substrate chain entry.
 ///
-/// When [`MgmtHandles::runtime_policy`] is `Some`, the boolean fields
+/// When `MgmtHandles::runtime_policy` is `Some`, the boolean fields
 /// (`ephemeral_allowed`, `localhop_disabled`, `require_signed_commands`)
 /// are runtime-mutable through `policy-set`. `validator_anchor` and
 /// `replay_window_secs` are pinned by Validator construction /

@@ -145,7 +145,7 @@ impl Strategy for MeasuredStrategy {
     }
 
     /// On Nack, retry on the next-best nexthop (the nacking `in_face` is already
-    /// excluded by [`Self::ranked`]); propagate downstream if none remain.
+    /// excluded by `Self::ranked`); propagate downstream if none remain.
     fn on_nack(&self, ctx: &StrategyContext<'_>, reason: NackReason) -> ForwardingAction {
         match self.ranked(ctx).first() {
             Some(&face_id) => ForwardingAction::Forward(smallvec![face_id]),

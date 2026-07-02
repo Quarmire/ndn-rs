@@ -1,4 +1,4 @@
-//! [`NdncertCa`] wraps [`CaState`](ndn_cert::CaState) with an
+//! [`NdncertCa`] wraps [`CaState`] with an
 //! `ndn-app::Producer` registered under `/<prefix>/CA/*`.
 
 use std::sync::Arc;
@@ -141,7 +141,7 @@ pub struct NdncertCa {
 /// service — the cross-process device-approval transport
 /// ([`crate::device_approval_net`]).
 ///
-/// `store` **must** be the same [`PendingApprovalStore`] the CA's
+/// `store` **must** be the same `PendingApprovalStore` the CA's
 /// `DeviceApprovalChallenge` reads (so a networked approval flips the request
 /// the CHALLENGE round is polling). `producer` is registered for
 /// `/<prefix>/CA/APPROVE-FEED` on its own face — a longer prefix than the

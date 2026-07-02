@@ -10,13 +10,13 @@
 //! pattern edges are treated uniformly, matching python-ndn.
 //!
 //! `ConstraintOption::UserFnCall` is not dispatched;
-//! [`TrustSchema::from_lvs_binary`] returns
+//! `TrustSchema::from_lvs_binary` returns
 //! [`LvsError::UserFunctionsNotSupported`] when the decoded model uses any
 //! user function so loading is fail-closed. Only LVS binary version
 //! `0x00011000` is accepted; other versions yield
 //! [`LvsError::UnsupportedVersion`]. Import-only — no round-trip to wire.
 //!
-//! [`TrustSchema::from_lvs_binary`]: crate::TrustSchema::from_lvs_binary
+//! `TrustSchema::from_lvs_binary`: crate::TrustSchema::from_lvs_binary
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -81,7 +81,7 @@ pub enum LvsError {
     #[error("invalid UTF-8 in identifier")]
     BadIdentifier,
     /// The model uses `$eq`/`$regex` or other user functions that ndn-rs does
-    /// not yet dispatch. Loading such a schema via [`TrustSchema::from_lvs_binary`]
+    /// not yet dispatch. Loading such a schema via `TrustSchema::from_lvs_binary`
     /// is rejected to prevent fail-open behaviour. Use [`LvsModel::decode`]
     /// directly if you need to inspect or test a schema that contains user
     /// functions.
@@ -185,9 +185,9 @@ pub type LvsUserFn = Arc<dyn Fn(&NameComponent, &[NameComponent]) -> bool + Send
 /// Maps LVS user-function ids (`$eq`, `$regex`, …) to handlers, turning a schema that
 /// uses them from fail-closed-rejected into enforceable. Unregistered functions still
 /// fail closed (never match), so an unknown `$fn` can't fail open. The default registry
-/// carries the built-in `$eq`; supply `$regex` / custom predicates via [`register`].
+/// carries the built-in `$eq`; supply `$regex` / custom predicates via `register`.
 ///
-/// [`register`]: UserFnRegistry::register
+/// `register`: UserFnRegistry::register
 #[derive(Clone, Default)]
 pub struct UserFnRegistry {
     fns: HashMap<String, LvsUserFn>,
@@ -209,7 +209,7 @@ impl UserFnRegistry {
 
     /// A registry with the dependency-free built-in `$eq` (the component equals the
     /// single argument). `$regex` and other predicates are caller-supplied via
-    /// [`register`](Self::register) so this core crate pulls no regex engine.
+    /// `register`(Self::register) so this core crate pulls no regex engine.
     pub fn with_builtins() -> Self {
         let mut r = Self::new();
         r.register(

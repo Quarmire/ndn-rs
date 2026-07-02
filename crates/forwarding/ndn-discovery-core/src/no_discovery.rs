@@ -1,6 +1,8 @@
 //! Null-object discovery protocol.
 
-use std::time::Instant;
+// web-time: identical to std::time::Instant on native, JS-clock-backed on wasm32
+// (this crate is the wasm-safe trait surface — std::time::Instant panics there).
+use web_time::Instant;
 
 use bytes::Bytes;
 use ndn_packet::Name;

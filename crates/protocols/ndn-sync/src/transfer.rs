@@ -4,8 +4,8 @@
 //!
 //! Both sync protocols emit replies/publications that can exceed an MTU
 //! (a large SVS-PS blob; a PSync full-state dump). The producer side uses
-//! [`segment_blob`] to chunk + name + finalize; the consumer side uses
-//! [`windowed_fetch`] over an [`Express`] closure the caller supplies
+//! `segment_blob` to chunk + name + finalize; the consumer side uses
+//! `windowed_fetch` over an `Express` closure the caller supplies
 //! (SVS wires it to its data-plane correlator, PSync to its own). The
 //! `mpsc<Bytes>` boundary stays the caller's, so this runs natively, in
 //! the browser, or against real faces.

@@ -1,6 +1,3 @@
-#[cfg(not(feature = "std"))]
-use alloc::vec::Vec;
-
 use bytes::{BufMut, BytesMut};
 
 use crate::varu64_size;

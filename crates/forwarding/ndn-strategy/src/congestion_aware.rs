@@ -213,7 +213,7 @@ impl Strategy for CongestionAwareStrategy {
     }
 
     /// On Nack, fail over to the best untried upstream (the nacking `in_face` and
-    /// prior tries are excluded by [`Self::weighted`]); propagate if none remain.
+    /// prior tries are excluded by `Self::weighted`); propagate if none remain.
     fn on_nack(&self, ctx: &StrategyContext<'_>, reason: NackReason) -> ForwardingAction {
         match self.best(ctx) {
             Some(face_id) => ForwardingAction::Forward(smallvec![face_id]),

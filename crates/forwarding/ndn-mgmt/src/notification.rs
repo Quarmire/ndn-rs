@@ -8,7 +8,7 @@
 //! Interest until [`NotificationStream::publish`] raises seq to `N`.
 //!
 //! Recent events are kept in a bounded ring (default
-//! [`NOTIFICATION_RING_CAP`]) so a late subscriber can fetch a missed
+//! `NOTIFICATION_RING_CAP`) so a late subscriber can fetch a missed
 //! event without re-fetching the whole stream. Data is signed
 //! `DigestSha256` for v1; signed notifications are a follow-up.
 
