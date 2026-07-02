@@ -105,3 +105,182 @@ impl FrameIo for LoopbackEndpoint {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::McsDescriptor;
+    use crate::frame::{BROADCAST, DEFAULT_SRC};
+
+    /// A distinctive non-broadcast group MAC (locally-administered multicast).
+    const GROUP: [u8; 6] = [0x03, 0xaa, 0xbb, 0xcc, 0xdd, 0xee];
+    /// A distinctive non-default source MAC (locally-administered unicast).
+    const NODE_SRC: [u8; 6] = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
+
+    fn inj(payload: &[u8], dst: [u8; 6], src: [u8; 6], mcs_index: u8) -> InjectFrame {
+        InjectFrame {
+            payload: Bytes::copy_from_slice(payload),
+            mcs: McsDescriptor::ht(mcs_index),
+            dst,
+            src,
+        }
+    }
+
+    /// A frame injected on one endpoint is captured on another, and every
+    /// link-layer hint (src→addr, dst→group, sender MCS, observer RSSI) survives.
+    #[tokio::test]
+    async fn frame_reaches_other_endpoint_with_all_hints() {
+        let bus = LoopbackMonitorBus::new();
+        let sender = bus.endpoint(1, -10);
+        let receiver = bus.endpoint(2, -73);
+
+        sender
+            .inject(inj(b"\x05\x03abc", GROUP, NODE_SRC, 5))
+            .await
+            .unwrap();
+
+        let got = receiver.recv_frame().await.unwrap();
+        assert_eq!(got.payload.as_ref(), b"\x05\x03abc", "payload survives");
+        assert_eq!(got.addr, Some(NODE_SRC), "InjectFrame.src → captured addr");
+        assert_eq!(got.group, Some(GROUP), "InjectFrame.dst → captured group");
+        assert_eq!(got.mcs_index, Some(5), "sender MCS surfaced as RX rate");
+        assert_eq!(
+            got.rssi_dbm,
+            Some(-73),
+            "the receiver's own observed RSSI, not the sender's"
+        );
+    }
+
+    /// Half-duplex: a node never hears its own transmission. The sender injects
+    /// first, then a peer injects; the sender's next capture is the peer's frame,
+    /// with its own frame silently skipped (deterministic — both are queued).
+    #[tokio::test]
+    async fn endpoint_does_not_hear_itself() {
+        let bus = LoopbackMonitorBus::new();
+        let a = bus.endpoint(1, -50);
+        let b = bus.endpoint(2, -50);
+
+        a.inject(inj(b"mine", BROADCAST, NODE_SRC, 1))
+            .await
+            .unwrap();
+        b.inject(inj(b"yours", BROADCAST, DEFAULT_SRC, 1))
+            .await
+            .unwrap();
+
+        let got = a.recv_frame().await.unwrap();
+        assert_eq!(got.payload.as_ref(), b"yours", "own frame was skipped");
+    }
+
+    /// Broadcast semantics: one injection is delivered to every other endpoint on
+    /// the bus (each gets an independent copy at its own observed RSSI).
+    #[tokio::test]
+    async fn broadcast_reaches_all_other_endpoints() {
+        let bus = LoopbackMonitorBus::new();
+        let sender = bus.endpoint(1, 0);
+        let r1 = bus.endpoint(2, -60);
+        let r2 = bus.endpoint(3, -61);
+        let r3 = bus.endpoint(4, -62);
+
+        sender
+            .inject(inj(b"hello", BROADCAST, DEFAULT_SRC, 3))
+            .await
+            .unwrap();
+
+        for (r, rssi) in [(&r1, -60i8), (&r2, -61), (&r3, -62)] {
+            let got = r.recv_frame().await.unwrap();
+            assert_eq!(got.payload.as_ref(), b"hello");
+            assert_eq!(got.rssi_dbm, Some(rssi), "each observer sees its own RSSI");
+            assert_eq!(got.mcs_index, Some(3));
+        }
+    }
+
+    /// Two receivers configured with different observed RSSIs each report their
+    /// own value for the same on-air frame.
+    #[tokio::test]
+    async fn observed_rssi_is_per_endpoint() {
+        let bus = LoopbackMonitorBus::new();
+        let sender = bus.endpoint(1, 0);
+        let near = bus.endpoint(2, -40);
+        let far = bus.endpoint(3, -90);
+
+        sender.inject(inj(b"x", GROUP, NODE_SRC, 2)).await.unwrap();
+
+        assert_eq!(near.recv_frame().await.unwrap().rssi_dbm, Some(-40));
+        assert_eq!(far.recv_frame().await.unwrap().rssi_dbm, Some(-90));
+    }
+
+    /// Multiple senders on one bus: a single receiver captures both frames (order
+    /// preserved by the underlying broadcast queue).
+    #[tokio::test]
+    async fn receiver_captures_frames_from_multiple_senders() {
+        let bus = LoopbackMonitorBus::new();
+        let receiver = bus.endpoint(1, -55);
+        let s2 = bus.endpoint(2, 0);
+        let s3 = bus.endpoint(3, 0);
+
+        s2.inject(inj(b"from-2", BROADCAST, DEFAULT_SRC, 1))
+            .await
+            .unwrap();
+        s3.inject(inj(b"from-3", BROADCAST, DEFAULT_SRC, 1))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            receiver.recv_frame().await.unwrap().payload.as_ref(),
+            b"from-2"
+        );
+        assert_eq!(
+            receiver.recv_frame().await.unwrap().payload.as_ref(),
+            b"from-3"
+        );
+    }
+
+    /// Fire-and-forget: injecting with no other endpoint listening is not an
+    /// error (the frame is simply lost, like real broadcast injection).
+    #[tokio::test]
+    async fn inject_with_no_other_listeners_is_ok() {
+        let bus = LoopbackMonitorBus::new();
+        let lone = bus.endpoint(1, -50);
+        // Nobody else subscribed; the send has only the sender's own receiver.
+        lone.inject(inj(b"lost", BROADCAST, DEFAULT_SRC, 0))
+            .await
+            .expect("injection never fails on a broadcast medium");
+    }
+
+    /// Backpressure: a slow consumer that lets the 1024-deep broadcast queue
+    /// overflow keeps receiving (the lag is swallowed, the medium is lossy) —
+    /// `recv_frame` returns the oldest surviving frame rather than erroring.
+    #[tokio::test]
+    async fn slow_consumer_lags_without_error() {
+        let bus = LoopbackMonitorBus::new();
+        let receiver = bus.endpoint(1, -50);
+        let sender = bus.endpoint(2, -50);
+
+        // Overrun the 1024-slot channel without receiving, forcing a Lagged skip.
+        for i in 0..1100u32 {
+            sender
+                .inject(inj(&i.to_le_bytes(), BROADCAST, DEFAULT_SRC, 1))
+                .await
+                .unwrap();
+        }
+
+        let got = receiver
+            .recv_frame()
+            .await
+            .expect("lag is swallowed, not surfaced as an error");
+        assert_eq!(got.payload.len(), 4, "still a well-formed captured frame");
+    }
+
+    /// The `Default` bus behaves identically to `new()`.
+    #[tokio::test]
+    async fn default_bus_round_trips() {
+        let bus = LoopbackMonitorBus::default();
+        let sender = bus.endpoint(1, -50);
+        let receiver = bus.endpoint(2, -50);
+        sender
+            .inject(inj(b"d", BROADCAST, DEFAULT_SRC, 1))
+            .await
+            .unwrap();
+        assert_eq!(receiver.recv_frame().await.unwrap().payload.as_ref(), b"d");
+    }
+}

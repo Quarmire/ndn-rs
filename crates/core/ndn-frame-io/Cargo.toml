@@ -20,6 +20,13 @@ tokio         = { workspace = true, features = ["sync", "rt", "net", "time"] }
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 
+[dev-dependencies]
+# Property-based coverage of the on-air (de)framing invariants.
+proptest = { workspace = true }
+# `#[tokio::test]` for the async loopback-bus round-trips (adds `macros` to the
+# runtime the crate already depends on).
+tokio = { workspace = true, features = ["macros", "rt", "sync"] }
+
 [lints]
 workspace = true
 

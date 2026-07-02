@@ -336,3 +336,160 @@ pub trait FrameIo: Send + Sync + 'static {
     /// transmissions (half-duplex radio); the backend filters those.
     async fn recv_frame(&self) -> Result<CapturedFrame, FaceError>;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Build an `InjectFrame` from arbitrary parts (the MCS descriptor content is
+    /// irrelevant to (de)framing here — only `index` is surfaced by the radiotap
+    /// TX header, and the round-trip tests supply the RX MCS explicitly).
+    fn inject(payload: Vec<u8>, dst: [u8; 6], src: [u8; 6]) -> InjectFrame {
+        InjectFrame {
+            payload: Bytes::from(payload),
+            mcs: McsDescriptor::CONSERVATIVE,
+            dst,
+            src,
+        }
+    }
+
+    proptest! {
+        /// `RawNdn`: any payload + any ethertype/addresses builds, and
+        /// `parse(build(..))` recovers the payload, `src → addr`, `dst → group`,
+        /// and passes the RX RSSI/MCS through verbatim.
+        #[test]
+        fn raw_ndn_round_trips_arbitrary(
+            payload in prop::collection::vec(any::<u8>(), 0..2048),
+            ethertype in any::<u16>(),
+            dst in any::<[u8; 6]>(),
+            src in any::<[u8; 6]>(),
+            rssi in any::<i8>(),
+            mcs in any::<u8>(),
+        ) {
+            let fmt = FrameFormat::RawNdn { ethertype };
+            let f = inject(payload.clone(), dst, src);
+            let wire = frame::build(fmt, &f).expect("RawNdn always builds");
+            let got = frame::parse(fmt, &wire, Some(rssi), Some(mcs))
+                .expect("a freshly built RawNdn frame must parse");
+            prop_assert_eq!(got.payload.as_ref(), &payload[..]);
+            prop_assert_eq!(got.addr, Some(src));
+            prop_assert_eq!(got.group, Some(dst));
+            prop_assert_eq!(got.rssi_dbm, Some(rssi));
+            prop_assert_eq!(got.mcs_index, Some(mcs));
+        }
+
+        /// `EspNow`: any body ≤ 250 B + any OUI round-trips. ESP-NOW pins
+        /// `addr1` to broadcast (its receivers key on it), so the recovered group
+        /// is always broadcast, independent of the injected `dst`.
+        #[test]
+        fn espnow_round_trips_arbitrary(
+            payload in prop::collection::vec(any::<u8>(), 0..=ESPNOW_MAX_BODY),
+            oui in any::<[u8; 3]>(),
+            dst in any::<[u8; 6]>(),
+            src in any::<[u8; 6]>(),
+            rssi in any::<i8>(),
+            mcs in any::<u8>(),
+        ) {
+            let fmt = FrameFormat::EspNow { oui };
+            let f = inject(payload.clone(), dst, src);
+            let wire = frame::build(fmt, &f).expect("body ≤ 250 always builds");
+            let got = frame::parse(fmt, &wire, Some(rssi), Some(mcs))
+                .expect("a freshly built ESP-NOW frame must parse");
+            prop_assert_eq!(got.payload.as_ref(), &payload[..]);
+            prop_assert_eq!(got.addr, Some(src));
+            prop_assert_eq!(got.group, Some(BROADCAST), "ESP-NOW addr1 is broadcast");
+            prop_assert_eq!(got.rssi_dbm, Some(rssi));
+            prop_assert_eq!(got.mcs_index, Some(mcs));
+        }
+
+        /// `EspNow` rejects a body over the single-byte element-length ceiling.
+        #[test]
+        fn espnow_rejects_oversize_body(
+            payload in prop::collection::vec(any::<u8>(), (ESPNOW_MAX_BODY + 1)..(ESPNOW_MAX_BODY + 64)),
+        ) {
+            let fmt = FrameFormat::EspNow { oui: ESPNOW_OUI };
+            let f = inject(payload, BROADCAST, DEFAULT_SRC);
+            prop_assert!(frame::build(fmt, &f).is_err());
+        }
+
+        /// `Raw80211`: the payload IS the whole 802.11 frame — it survives byte
+        /// for byte, and `addr2`/`addr1` are surfaced from the fixed header
+        /// offsets (bytes 10..16 / 4..10) rather than from the InjectFrame.
+        #[test]
+        fn raw80211_round_trips_arbitrary(
+            frame_bytes in prop::collection::vec(any::<u8>(), 24..2048),
+            rssi in any::<i8>(),
+            mcs in any::<u8>(),
+        ) {
+            let fmt = FrameFormat::Raw80211;
+            // dst/src on the InjectFrame are ignored by Raw80211 (verbatim copy).
+            let f = inject(frame_bytes.clone(), BROADCAST, DEFAULT_SRC);
+            let wire = frame::build(fmt, &f).expect("Raw80211 always builds");
+            let got = frame::parse(fmt, &wire, Some(rssi), Some(mcs))
+                .expect("a ≥24-byte Raw80211 frame must parse");
+            prop_assert_eq!(got.payload.as_ref(), &frame_bytes[..], "verbatim");
+            let mut ta = [0u8; 6];
+            ta.copy_from_slice(&frame_bytes[10..16]);
+            let mut ra = [0u8; 6];
+            ra.copy_from_slice(&frame_bytes[4..10]);
+            prop_assert_eq!(got.addr, Some(ta), "addr2 from the frame body");
+            prop_assert_eq!(got.group, Some(ra), "addr1 from the frame body");
+            prop_assert_eq!(got.rssi_dbm, Some(rssi));
+            prop_assert_eq!(got.mcs_index, Some(mcs));
+        }
+
+        /// `mcs_for_rssi` is monotone non-decreasing in RSSI and never exceeds the
+        /// verified reliable ceiling.
+        #[test]
+        fn mcs_for_rssi_is_monotone_and_capped(a in any::<i8>(), b in any::<i8>()) {
+            let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+            prop_assert!(mcs_for_rssi(lo) <= mcs_for_rssi(hi), "stronger RSSI ⇒ ≥ MCS");
+            prop_assert!(mcs_for_rssi(a) <= MAX_RELIABLE_MCS);
+        }
+
+        /// `mcs_phy_rate_bps` is monotone non-decreasing across the modelled MCS
+        /// range and clamps everything above MCS7 to the top rate.
+        #[test]
+        fn mcs_phy_rate_is_monotone_and_clamps(a in 0u8..=7, b in 0u8..=7, high in 8u8..=255) {
+            let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+            prop_assert!(mcs_phy_rate_bps(lo) <= mcs_phy_rate_bps(hi));
+            prop_assert_eq!(mcs_phy_rate_bps(high), mcs_phy_rate_bps(7), "clamped above MCS7");
+        }
+    }
+
+    /// The buildable formats do not cross-parse each other's wire bytes.
+    #[test]
+    fn distinct_formats_do_not_cross_parse() {
+        let f = inject(b"payload".to_vec(), BROADCAST, DEFAULT_SRC);
+        let raw = FrameFormat::RawNdn { ethertype: 0x8624 };
+        let esp = FrameFormat::EspNow { oui: ESPNOW_OUI };
+        let raw_wire = frame::build(raw, &f).unwrap();
+        let esp_wire = frame::build(esp, &f).unwrap();
+        assert!(frame::parse(esp, &raw_wire, None, None).is_none());
+        assert!(frame::parse(raw, &esp_wire, None, None).is_none());
+    }
+
+    /// The unimplemented formats error at build time (never a panic).
+    #[test]
+    fn unimplemented_formats_error_not_panic() {
+        let f = inject(b"x".to_vec(), BROADCAST, DEFAULT_SRC);
+        assert!(frame::build(FrameFormat::Wfb, &f).is_err());
+        assert!(frame::build(FrameFormat::HaLowVendorAction, &f).is_err());
+    }
+
+    /// The `McsDescriptor` builder helpers set exactly the fields they name.
+    #[test]
+    fn mcs_descriptor_builders() {
+        assert_eq!(McsDescriptor::default(), McsDescriptor::CONSERVATIVE);
+        let ht = McsDescriptor::ht(5);
+        assert_eq!(ht.index, 5);
+        assert!(!ht.vht && ht.nss == 1 && !ht.stbc && !ht.ldpc);
+        let vht = McsDescriptor::vht(7);
+        assert!(vht.vht && vht.nss == 1);
+        let vht2 = McsDescriptor::vht_2ss(4);
+        assert!(vht2.vht && vht2.nss == 2);
+        let both = McsDescriptor::ht(3).with_stbc().with_ldpc();
+        assert!(both.stbc && both.ldpc);
+    }
+}

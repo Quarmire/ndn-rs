@@ -1,0 +1,33 @@
+[package]
+name = "ndn-frame-io-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Self-contained workspace so this fuzz crate isn't pulled into the parent
+# ndn-rs workspace.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bytes = "1"
+
+[dependencies.ndn-frame-io]
+path = ".."
+
+[[bin]]
+name = "radiotap"
+path = "fuzz_targets/radiotap.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dot11"
+path = "fuzz_targets/dot11.rs"
+test = false
+doc = false
+bench = false

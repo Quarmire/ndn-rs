@@ -115,6 +115,7 @@
 - [0003 · sans-IO seed crates for native + embedded](./inside/adr/0003-sans-io-seed-crates.md)
 - [0004 · Virtualize the clock for determinism](./inside/adr/0004-virtualize-the-clock.md)
 - [0005 · Retire the audit-witness suite for nextest](./inside/adr/0005-retire-audit-witness-suite.md)
+- [0006 · The radio foundation boundary](./inside/adr/0006-radio-foundation-boundary.md)
 
 # Releases
 
