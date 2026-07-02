@@ -1,5 +1,6 @@
 //! Runtime-portable `sleep` / `timeout` / `spawn` and a monotonic `Instant`, so the consumer
-//! fetch path runs on native (tokio), wasm32 (gloo-timers), **and** an injected [`Runtime`] — the
+//! fetch path runs on native (tokio), wasm32 (gloo-timers), **and** an injected
+//! [`Runtime`](ndn_runtime::Runtime) — the
 //! virtual / discrete-event kernels — without threading a handle through every
 //! [`Consumer`](crate::Consumer).
 //!
