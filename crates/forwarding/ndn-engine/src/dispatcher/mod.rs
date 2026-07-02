@@ -133,6 +133,7 @@ impl PacketDispatcher {
                         persistency,
                         send_tx,
                         congestion_policy,
+                        dispatcher.runtime.unix_nanos(),
                     );
                     dispatcher.face_states.insert(face_id, state);
                     let send_face = Arc::clone(&face);

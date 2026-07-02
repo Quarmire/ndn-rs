@@ -46,6 +46,17 @@ impl EngineDiscoveryContext {
             owned_routes: Arc::new(DashMap::new()),
         })
     }
+
+    /// Wall-clock (Unix nanoseconds) via the engine runtime, so face-creation
+    /// timestamps match the idle-reaper's clock under a virtual runtime.
+    /// Returns 0 if the engine is being torn down — a face stamped then would
+    /// be reaped immediately, which is correct during shutdown.
+    fn unix_nanos(&self) -> u64 {
+        self.inner
+            .upgrade()
+            .map(|i| i.runtime.unix_nanos())
+            .unwrap_or(0)
+    }
 }
 
 impl FaceLifecycleContext for EngineDiscoveryContext {
@@ -80,6 +91,7 @@ impl FaceLifecycleContext for EngineDiscoveryContext {
             FacePersistency::OnDemand,
             send_tx,
             congestion_policy,
+            self.unix_nanos(),
         );
         // Discovery UDP links use NDNLPv2 reliability. Enable the per-face
         // reliability feature (canonical TxSequence + Ack + retx, the same path

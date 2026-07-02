@@ -352,6 +352,7 @@ mod tests {
             FacePersistency::OnDemand,
             tx,
             policy,
+            0, // test helper: activity stamp is irrelevant here
         );
         (state, rx)
     }

@@ -168,20 +168,24 @@ pub struct FaceState {
 }
 
 impl FaceState {
+    /// Create face state stamped with `now_ns`, the current time in Unix
+    /// nanoseconds. Callers **must** source this from the engine runtime
+    /// (`runtime.unix_nanos()`), not the system clock directly: `last_activity`
+    /// is compared against `runtime.unix_nanos()` by the idle-face reaper
+    /// (`expiry.rs`), so under a virtual/simulation runtime a wall-clock stamp
+    /// here would make face expiry non-deterministic. This is the last
+    /// forwarding-path clock read that was routed through the seam (ndn-lab).
     pub fn new(
         cancel: CancellationToken,
         persistency: FacePersistency,
         send_tx: mpsc::Sender<EgressItem>,
         congestion_policy: CongestionPolicy,
+        now_ns: u64,
     ) -> Self {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
         Self {
             cancel,
             persistency,
-            last_activity: AtomicU64::new(now),
+            last_activity: AtomicU64::new(now_ns),
             counters: FaceCounters::default(),
             send_tx,
             congestion_policy,
@@ -240,12 +244,12 @@ impl FaceState {
         self.flags.load(Ordering::Relaxed) & BIT_CONGESTION_MARKING != 0
     }
 
-    pub fn touch(&self) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
-        self.last_activity.store(now, Ordering::Relaxed);
+    /// Record activity on this face at `now_ns` (Unix nanoseconds), refreshing
+    /// its idle-expiry deadline. As with [`FaceState::new`], `now_ns` must come
+    /// from `runtime.unix_nanos()` so the reaper's comparison stays on one
+    /// clock.
+    pub fn touch(&self, now_ns: u64) {
+        self.last_activity.store(now_ns, Ordering::Relaxed);
     }
 }
 
@@ -538,6 +542,7 @@ impl ForwarderEngine {
             persistency,
             send_tx.clone(),
             congestion_policy,
+            self.inner.runtime.unix_nanos(),
         );
         if self.inner.require_local_validation && scope == ndn_transport::FaceScope::Local {
             state.set_require_data_validation(true);
@@ -652,6 +657,7 @@ impl ForwarderEngine {
             FacePersistency::OnDemand,
             send_tx,
             congestion_policy,
+            self.inner.runtime.unix_nanos(),
         );
         self.inner.face_states.insert(face_id, state);
         self.inner.face_table.insert(face);

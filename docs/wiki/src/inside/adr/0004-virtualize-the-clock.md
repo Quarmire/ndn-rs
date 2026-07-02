@@ -51,7 +51,11 @@ take an injected `now`.
 
 ## Status note
 
-The seam is in place across the forwarding path, background tasks, the
-Nack-path out-records, and the discovery clock. A small number of
-`FaceState`-timestamp reads in the engine were the last direct clock reads and
-are being routed through the seam; see the polish work in the A+ series.
+The seam is complete across the forwarding path, background tasks, the
+Nack-path out-records, the discovery clock, and — as of the A+ polish pass —
+the `FaceState` activity timestamps that the idle-face reaper compares against.
+`FaceState::new`/`touch` now take a `now_ns` sourced from `runtime.unix_nanos()`
+at every call site, so face expiry is deterministic under a virtual runtime.
+The one remaining direct `SystemTime::now()` in the engine is `unix_time_ms()`,
+which stamps the *process* start time in `ForwarderStatus` — a genuine
+wall-clock value that should not be virtualized.
