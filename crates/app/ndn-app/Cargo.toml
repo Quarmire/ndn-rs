@@ -24,6 +24,8 @@ serde = ["dep:serde", "dep:serde_json"]
 ndn-tlv        = { workspace = true, features = ["std"] }
 ndn-engine     = { workspace = true }
 ndn-transport  = { workspace = true }
+# The Runtime seam: rt::* routes through an injected runtime (virtual / discrete-event) when set.
+ndn-runtime    = { workspace = true }
 # ndn-sync (SVS/PSync) builds for wasm32 too, so the Subscriber pub/sub API is
 # available in the browser.
 ndn-sync       = { workspace = true }
