@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 
 use ndn_packet::{Interest, Name};
 
-use crate::{ContentStore, CsCapacity, CsEntry, CsMeta, InsertResult, NameTrie};
+use crate::{ContentStore, CsCapacity, CsEntry, CsMeta, CsStats, InsertResult, NameTrie};
 
 /// In-memory LRU content store, bounded by total byte capacity. `get()` skips
 /// the Mutex via an atomic empty check so cache-cold paths are lock-free.
@@ -18,6 +18,11 @@ pub struct LruCs {
     /// NFD cs/config Admit/Serve toggles (default on).
     admit: AtomicBool,
     serve: AtomicBool,
+    /// Cumulative counters (like NFD `nCsHits`/`nCsMisses`) — reported via [`stats`](ContentStore::stats).
+    hits: AtomicU64,
+    misses: AtomicU64,
+    inserts: AtomicU64,
+    evictions: AtomicU64,
 }
 
 struct LruInner {
@@ -42,16 +47,20 @@ impl LruCs {
             entry_count: AtomicUsize::new(0),
             admit: AtomicBool::new(true),
             serve: AtomicBool::new(true),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            inserts: AtomicU64::new(0),
+            evictions: AtomicU64::new(0),
         }
     }
 
     pub fn is_empty(&self) -> bool {
         self.entry_count.load(Ordering::Relaxed) == 0
     }
-}
 
-impl ContentStore for LruCs {
-    async fn get(&self, interest: &Interest) -> Option<CsEntry> {
+    /// The cache lookup itself, returning the matching entry (if any). Hit/miss accounting lives in
+    /// [`get`](ContentStore::get) so every non-satisfying path is counted uniformly.
+    fn lookup(&self, interest: &Interest) -> Option<CsEntry> {
         // NFD cs/config Serve gate (Cs::findImpl): don't satisfy from cache
         // when serving is disabled.
         if !self.serve.load(Ordering::Relaxed) {
@@ -94,6 +103,20 @@ impl ContentStore for LruCs {
         }
         Some(entry)
     }
+}
+
+impl ContentStore for LruCs {
+    async fn get(&self, interest: &Interest) -> Option<CsEntry> {
+        // Count a hit whenever we satisfy from cache, a miss on every non-satisfying path
+        // (serve-disabled, empty, digest mismatch, stale, absent) — mirrors NFD nCsHits/nCsMisses.
+        let result = self.lookup(interest);
+        if result.is_some() {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.misses.fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
 
     async fn insert(&self, data: Bytes, name: Arc<Name>, meta: CsMeta) -> InsertResult {
         // NFD cs/config Admit gate (Cs::insert): admit no new Data when
@@ -117,6 +140,7 @@ impl ContentStore for LruCs {
                 inner.current_bytes = inner.current_bytes.saturating_sub(evicted.data.len());
                 inner.prefix_index.remove(&evicted_name);
                 self.entry_count.fetch_sub(1, Ordering::Relaxed);
+                self.evictions.fetch_add(1, Ordering::Relaxed);
             } else {
                 break;
             }
@@ -137,6 +161,8 @@ impl ContentStore for LruCs {
         if !was_present {
             self.entry_count.fetch_add(1, Ordering::Relaxed);
         }
+        // Count every admitted Data (new or replacement), like NFD's nCsEntries insert path.
+        self.inserts.fetch_add(1, Ordering::Relaxed);
         if was_present {
             InsertResult::Replaced
         } else {
@@ -196,6 +222,15 @@ impl ContentStore for LruCs {
 
     fn variant_name(&self) -> &str {
         "lru"
+    }
+
+    fn stats(&self) -> CsStats {
+        CsStats {
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+            inserts: self.inserts.load(Ordering::Relaxed),
+            evictions: self.evictions.load(Ordering::Relaxed),
+        }
     }
 
     async fn evict_prefix(&self, prefix: &Name, limit: Option<usize>) -> usize {
@@ -312,6 +347,22 @@ mod tests {
             .await;
         let entry = cs.get(&interest(&["a", "b"])).await.unwrap();
         assert_eq!(entry.data.as_ref(), b"data");
+    }
+
+    #[tokio::test]
+    async fn stats_track_hits_misses_and_inserts() {
+        let cs = LruCs::new(65536);
+        // A cold lookup is a miss.
+        assert!(cs.get(&interest(&["a", "b"])).await.is_none());
+        cs.insert(Bytes::from_static(b"data"), arc_name(&["a", "b"]), meta_fresh())
+            .await;
+        // Two satisfying lookups.
+        assert!(cs.get(&interest(&["a", "b"])).await.is_some());
+        assert!(cs.get(&interest(&["a", "b"])).await.is_some());
+        let s = cs.stats();
+        assert_eq!(s.inserts, 1, "one admitted Data");
+        assert_eq!(s.hits, 2, "two satisfying lookups");
+        assert_eq!(s.misses, 1, "one cold miss");
     }
 
     #[tokio::test]
