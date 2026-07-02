@@ -78,7 +78,8 @@ impl FrameIo for LoopbackEndpoint {
             dst: frame.dst,
             src: frame.src,
             payload: frame.payload,
-            mcs_index: frame.mcs.index,
+            mcs_index: crate::McsDescriptor::for_intent(&frame.tx, crate::MAX_RELIABLE_MCS, false)
+                .index,
         }));
         Ok(())
     }
@@ -109,7 +110,7 @@ impl FrameIo for LoopbackEndpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::McsDescriptor;
+    use crate::{McsDescriptor, TxIntent};
     use crate::frame::{BROADCAST, DEFAULT_SRC};
 
     /// A distinctive non-broadcast group MAC (locally-administered multicast).
@@ -120,7 +121,7 @@ mod tests {
     fn inj(payload: &[u8], dst: [u8; 6], src: [u8; 6], mcs_index: u8) -> InjectFrame {
         InjectFrame {
             payload: Bytes::copy_from_slice(payload),
-            mcs: McsDescriptor::ht(mcs_index),
+            tx: TxIntent::wifi(McsDescriptor::ht(mcs_index)),
             dst,
             src,
         }

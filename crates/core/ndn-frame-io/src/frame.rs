@@ -97,11 +97,14 @@ pub fn build(format: FrameFormat, frame: &InjectFrame) -> Result<Vec<u8>, FaceEr
     match format {
         // ESP-NOW rides a robust legacy rate (1 Mbps), not an MCS.
         FrameFormat::EspNow { .. } => out.extend_from_slice(&radiotap::build_tx_legacy(2)),
-        // RawNdn (and anything else `build_dot11` accepts) carries a per-frame MCS.
-        _ => out.extend_from_slice(&radiotap::build_tx_header(
-            frame.mcs.index,
-            frame.mcs.short_gi,
-        )),
+        // RawNdn (and anything else `build_dot11` accepts) carries a per-frame
+        // rate: resolve the intent to an 802.11 MCS for the radiotap header. The
+        // kernel driver on the AF_PACKET path honours this; a resolution over a
+        // conservative default capability is right for a header-only hint.
+        _ => {
+            let mcs = crate::McsDescriptor::for_intent(&frame.tx, crate::MAX_RELIABLE_MCS, false);
+            out.extend_from_slice(&radiotap::build_tx_header(mcs.index, mcs.short_gi))
+        }
     }
     out.extend_from_slice(&dot11);
     Ok(out)
@@ -295,14 +298,14 @@ pub fn parse_dot11(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::McsDescriptor;
+    use crate::TxIntent;
 
     const SRC: [u8; 6] = [0x02, 0x4e, 0x44, 0x4e, 0x00, 0x01];
 
     fn frame(payload: &[u8]) -> InjectFrame {
         InjectFrame {
             payload: Bytes::copy_from_slice(payload),
-            mcs: McsDescriptor::CONSERVATIVE,
+            tx: TxIntent::CONSERVATIVE,
             dst: BROADCAST,
             src: SRC,
         }
@@ -352,7 +355,7 @@ mod tests {
         let u = name_group_uni(b"/p");
         let f = InjectFrame {
             payload: Bytes::from_static(b"\x05\x01z"),
-            mcs: McsDescriptor::CONSERVATIVE,
+            tx: TxIntent::CONSERVATIVE,
             dst: g,
             src: u,
         };
@@ -415,7 +418,7 @@ mod tests {
 
         let inj = InjectFrame {
             payload: Bytes::from(frame_bytes.clone()),
-            mcs: McsDescriptor::CONSERVATIVE,
+            tx: TxIntent::CONSERVATIVE,
             dst: BROADCAST,
             src: SRC,
         };

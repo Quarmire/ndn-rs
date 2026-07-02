@@ -188,6 +188,106 @@ impl Default for McsDescriptor {
     }
 }
 
+/// What a transmit should *achieve*, independent of how a given PHY achieves it
+/// — the bearer-agnostic transmit contract carried on every [`InjectFrame`].
+/// 802.11 maps it to an MCS + coding ([`McsDescriptor::for_intent`]); a LoRa
+/// bearer would map it to a spreading factor, an SDR to its own waveform. On a
+/// broadcast, un-ACKed medium *reliability* is the primary axis — there is no
+/// per-receiver feedback to rate-adapt against, so the caller states intent and
+/// the backend (or the cognitive plane) resolves it for the hardware.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TxIntent {
+    /// The robustness objective — the axis that dominates on a no-ARQ broadcast.
+    pub reliability: Reliability,
+    /// Who the frame is for — every receiver in range, or a name-group.
+    pub reach: Reach,
+    /// An 802.11 rate the caller has already resolved for a WiFi bearer (fixed-
+    /// rate benches, and the adaptive / cognitive `MonitorWifiFace`). Abstract
+    /// callers and non-WiFi bearers leave this `None`; a WiFi backend then
+    /// resolves `reliability` via [`McsDescriptor::for_intent`]. Non-WiFi backends
+    /// ignore it — it is an opt-in WiFi pre-resolution, not the shape of the seam.
+    pub wifi: Option<McsDescriptor>,
+}
+
+/// The robustness objective of a [`TxIntent`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Reliability {
+    /// Maximum robustness — lowest-order modulation + strongest FEC + diversity
+    /// coding where the PHY offers it. Discovery, beacons, control: anything the
+    /// farthest / worst receiver must still decode. (802.11: base MCS + STBC + LDPC.)
+    MostRobust,
+    /// A widely-decodable balance — the default when there is no measured link.
+    #[default]
+    Balanced,
+    /// Favour throughput on a link known to be good (measured RSSI headroom).
+    Throughput,
+}
+
+/// Who a [`TxIntent`] is addressed to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Reach {
+    /// Every receiver in range; no per-receiver adaptation is possible.
+    #[default]
+    Broadcast,
+    /// A name-group; adaptation may target the group's worst member.
+    Group,
+}
+
+impl TxIntent {
+    /// Maximum-robustness broadcast — the discovery / beacon / control default,
+    /// and what a NAN or unmeasured face should use.
+    pub const ROBUST: TxIntent = TxIntent {
+        reliability: Reliability::MostRobust,
+        reach: Reach::Broadcast,
+        wifi: None,
+    };
+    /// A widely-decodable balance broadcast.
+    pub const CONSERVATIVE: TxIntent = TxIntent {
+        reliability: Reliability::Balanced,
+        reach: Reach::Broadcast,
+        wifi: None,
+    };
+    /// Broadcast at a stated reliability.
+    pub const fn broadcast(reliability: Reliability) -> Self {
+        TxIntent { reliability, reach: Reach::Broadcast, wifi: None }
+    }
+    /// Pin an exact 802.11 rate (WiFi benches / the resolved `MonitorWifiFace`
+    /// rate). A WiFi-only escape hatch; other bearers ignore `wifi`.
+    pub const fn wifi(mcs: McsDescriptor) -> Self {
+        TxIntent { reliability: Reliability::Balanced, reach: Reach::Broadcast, wifi: Some(mcs) }
+    }
+}
+
+impl Default for TxIntent {
+    fn default() -> Self {
+        TxIntent::CONSERVATIVE
+    }
+}
+
+impl McsDescriptor {
+    /// Resolve a bearer-agnostic [`TxIntent`] to a concrete 802.11 rate for a
+    /// radio that supports up to `max_index` (single-stream HT) and, if
+    /// `vht_cap`, 802.11ac. Honours an explicit `intent.wifi` pre-resolution;
+    /// otherwise maps the reliability axis: `MostRobust` → base rate with STBC +
+    /// LDPC diversity (ideal for un-ACKed broadcast), `Balanced` → a conservative
+    /// mid rate, `Throughput` → the top validated rate + short GI. This is the
+    /// 802.11 mapping of the transmit intent; another bearer maps it differently.
+    pub fn for_intent(intent: &TxIntent, max_index: u8, vht_cap: bool) -> McsDescriptor {
+        if let Some(m) = intent.wifi {
+            return m;
+        }
+        match intent.reliability {
+            Reliability::MostRobust => McsDescriptor::ht(0).with_stbc().with_ldpc(),
+            Reliability::Balanced => McsDescriptor::CONSERVATIVE,
+            Reliability::Throughput => {
+                let idx = max_index.min(MAX_RELIABLE_MCS);
+                let base = if vht_cap { McsDescriptor::vht(idx) } else { McsDescriptor::ht(idx) };
+                McsDescriptor { short_gi: true, ..base }
+            }
+        }
+    }
+}
+
 /// How the face picks the injection MCS for each frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum McsPolicy {
@@ -273,7 +373,10 @@ pub fn mcs_phy_rate_bps(mcs_index: u8) -> u32 {
 #[derive(Clone, Debug)]
 pub struct InjectFrame {
     pub payload: Bytes,
-    pub mcs: McsDescriptor,
+    /// What this transmit should achieve — a bearer-agnostic [`TxIntent`]. The
+    /// backend resolves it to its own PHY rate ([`McsDescriptor::for_intent`] for
+    /// 802.11); the seam itself no longer names an MCS.
+    pub tx: TxIntent,
     /// 802.11 destination (`addr1`/`addr3`): a name-group MAC or broadcast.
     pub dst: [u8; 6],
     /// 802.11 source (`addr2`): name-derived, or [`frame::DEFAULT_SRC`].
@@ -283,10 +386,10 @@ pub struct InjectFrame {
 impl InjectFrame {
     /// A broadcast frame from the default source — the addressing-agnostic case
     /// (every monitor receiver keeps it). Grouped faces fill `dst`/`src` instead.
-    pub fn broadcast(payload: Bytes, mcs: McsDescriptor) -> Self {
+    pub fn broadcast(payload: Bytes, tx: TxIntent) -> Self {
         Self {
             payload,
-            mcs,
+            tx,
             dst: frame::BROADCAST,
             src: frame::DEFAULT_SRC,
         }
@@ -316,11 +419,11 @@ pub struct CapturedFrame {
 /// task); `inject` may be called concurrently and must synchronise internally.
 #[async_trait]
 pub trait FrameIo: Send + Sync + 'static {
-    /// Transmit `frame.payload` on the medium at `frame.mcs`. Fire-and-forget,
+    /// Transmit `frame.payload` on the medium for `frame.tx`. Fire-and-forget,
     /// unacknowledged — like all broadcast injection.
     async fn inject(&self, frame: InjectFrame) -> Result<(), FaceError>;
 
-    /// Transmit a batch of frames, bundling runs that share dst/src/mcs into one
+    /// Transmit a batch of frames, bundling runs that share dst/src/tx into one
     /// **A-MSDU** (link-layer bundling — one PHY preamble for many NDN packets,
     /// no Block-Ack needed) where the backend supports it. The default sends each
     /// individually; the RTL8812EU backend overrides this with A-MSDU. Used by
@@ -348,7 +451,7 @@ mod tests {
     fn inject(payload: Vec<u8>, dst: [u8; 6], src: [u8; 6]) -> InjectFrame {
         InjectFrame {
             payload: Bytes::from(payload),
-            mcs: McsDescriptor::CONSERVATIVE,
+            tx: TxIntent::CONSERVATIVE,
             dst,
             src,
         }
