@@ -7,7 +7,9 @@ rust-version.workspace = true
 license.workspace = true
 
 [package.metadata.scope]
-classification = "extension"
+# spec: ndn-engine (spec) depends on this, and its own deps are all spec
+# (ndn-foundation-types, ndn-packet, ndn-security), so the library closure holds.
+classification = "spec"
 
 [features]
 default = []
