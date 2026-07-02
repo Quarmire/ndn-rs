@@ -4,6 +4,15 @@
 //! [`StrategyFilter`] composition seam for engine-builder use.
 
 #![allow(missing_docs)]
+// The built-in strategies register themselves through `register_strategy!`,
+// which expands to a `linkme::distributed_slice` element — a `link_section`
+// static that the `unsafe_code` lint flags. The macro itself carries NO
+// `#[allow(unsafe_code)]`, because that would be *incompatible* with a
+// downstream registrant crate that sets `#![forbid(unsafe_code)]`
+// (e.g. ndn-ext's ndn-strategy-cclf). So the allow lives here, at the crate
+// root of the crate that owns the built-ins, and does not leak into the macro
+// expansion. There is no hand-written `unsafe` in this crate.
+#![allow(unsafe_code)]
 
 pub mod best_route;
 pub mod congestion;

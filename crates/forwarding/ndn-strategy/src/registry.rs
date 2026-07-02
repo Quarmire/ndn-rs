@@ -27,10 +27,10 @@ pub struct StrategyEntry {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-// linkme collects entries in a dedicated link section, and `link_section`
-// counts as unsafe code — a deliberate scoped exception to the workspace
-// `deny(unsafe_code)` policy.
-#[allow(unsafe_code)]
+// linkme collects entries in a dedicated link section; the `unsafe_code`
+// allow for the resulting `link_section` static is at the crate root (see
+// lib.rs) so it covers both this declaration and the macro-generated elements
+// without leaking into downstream expansions.
 #[linkme::distributed_slice]
 pub static STRATEGIES: [StrategyEntry] = [..];
 
@@ -109,10 +109,12 @@ pub fn create_by_name_version(short_name: &[u8], version: u64) -> Option<Arc<dyn
 macro_rules! register_strategy {
     ($static_ident:ident, $name:expr, $version:expr, $build:expr $(,)?) => {
         #[cfg(not(target_arch = "wasm32"))]
-        // linkme emits a `link_section` static, which counts as unsafe code;
-        // carry the allow inside the expansion so registrant crates stay
-        // clean under a `deny(unsafe_code)` policy.
-        #[allow(unsafe_code)]
+        // NOTE: no `#[allow(unsafe_code)]` here. The element-form
+        // `distributed_slice` attribute does not emit a `link_section` static,
+        // so it does not trip the `unsafe_code` lint — and an `allow` here
+        // would be *incompatible* with a downstream crate that sets
+        // `#![forbid(unsafe_code)]` (e.g. ndn-ext's ndn-strategy-cclf). The
+        // one place that needs the allow is the slice *declaration* above.
         #[linkme::distributed_slice($crate::registry::STRATEGIES)]
         static $static_ident: $crate::registry::StrategyEntry = $crate::registry::StrategyEntry {
             name: $name,
