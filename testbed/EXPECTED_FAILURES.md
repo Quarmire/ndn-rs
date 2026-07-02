@@ -1,8 +1,18 @@
-# Expected Failures
+# Audit Ledger (frozen)
 
-Tests in `testbed/tests/audit/` are tagged here with their current
-expected outcome. Any PR that changes a row — especially flipping
-a test from `EXPECTED-FAIL` to `RESOLVED` — must attach the
+> **Frozen as of 2026-07-01.** The audit-witness script system this ledger
+> drove (`testbed/tests/audit/`, 290 scripts) was retired when `cargo nextest`
+> became the single source of truth for in-repo behavior: GREP-PROOF witnesses
+> asserted source text rather than behavior, and most `cargo test` wrappers
+> were made redundant by the Rust test suite itself. This file is preserved
+> verbatim below as the **historical record of every audit finding**, its
+> severity, and how it was resolved. Recorded evidence lives in
+> [`transcripts/`](transcripts/); the still-valuable external-interop and
+> cross-process witnesses live on in [`interop/`](interop/).
+
+Tests formerly in `testbed/tests/audit/` are tagged here with their
+expected outcome at freeze time. Any PR that changed a row — especially
+flipping a test from `EXPECTED-FAIL` to `RESOLVED` — attached the
 before/after transcripts to the PR description.
 
 ## Status legend

@@ -1,0 +1,28 @@
+# cargo-nextest configuration. Profiles:
+#   default — local dev: fast feedback, fail fast
+#   ci      — the PR gate: run everything, retry once (network/timer tests),
+#             archive junit for the run summary
+
+[profile.default]
+# Local runs stop early so the broken test is at the bottom of your terminal.
+fail-fast = true
+
+[profile.default.slow-timeout]
+# Surface hangs instead of waiting forever: warn at 60s, kill at 3x.
+period = "60s"
+terminate-after = 3
+
+[profile.ci]
+# The gate reports the full failure set, not just the first one.
+fail-fast = false
+# One retry absorbs scheduler jitter in the timing-sensitive convergence and
+# suppression-window tests without hiding a real regression (a test that
+# passes only on retry is reported as FLAKY in the run summary).
+retries = 1
+
+[profile.ci.slow-timeout]
+period = "120s"
+terminate-after = 2
+
+[profile.ci.junit]
+path = "junit.xml"

@@ -55,7 +55,7 @@ jobs:
           shared-key: test
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: nextest (unit + integration)
-        run: cargo nextest run --workspace
+        run: cargo nextest run --workspace --profile ci
       - name: doctests (nextest does not run these)
         run: cargo test --workspace --doc
 
