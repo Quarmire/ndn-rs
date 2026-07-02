@@ -119,6 +119,17 @@ fn decode_nonnegative_integer(bytes: &[u8]) -> u64 {
     val
 }
 
+/// Decode a value as a *canonical* NonNegativeInteger: 1/2/4/8 octets in the
+/// spec's minimal width. Returns `None` for any other byte string, so callers
+/// can preserve malformed values verbatim instead of silently rewriting them.
+fn canonical_nonneg_integer(bytes: &[u8]) -> Option<u64> {
+    if !matches!(bytes.len(), 1 | 2 | 4 | 8) {
+        return None;
+    }
+    let v = decode_nonnegative_integer(bytes);
+    (encode_nonneg_integer(v).as_ref() == bytes).then_some(v)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Name {
     pub(crate) components: SmallVec<[NameComponent; 8]>,
@@ -321,11 +332,12 @@ fn parse_component(part: &str) -> Result<NameComponent, NameError> {
         let typ: u64 = typ_str
             .parse()
             .map_err(|_| NameError("invalid typed-component TLV-TYPE"))?;
-        let decoded = percent_decode(val_str).map_err(|_| NameError("invalid percent-encoding"))?;
-        return Ok(NameComponent::new(typ, Bytes::from(decoded)));
+        return Ok(NameComponent::new(
+            typ,
+            Bytes::from(decode_uri_value(val_str)?),
+        ));
     }
-    let decoded = percent_decode(part).map_err(|_| NameError("invalid percent-encoding"))?;
-    Ok(NameComponent::generic(Bytes::from(decoded)))
+    Ok(NameComponent::generic(Bytes::from(decode_uri_value(part)?)))
 }
 
 impl FromStr for Name {
@@ -401,13 +413,44 @@ fn hex_digit(b: u8) -> Result<u8, ()> {
 
 fn percent_encode_component(f: &mut core::fmt::Formatter<'_>, value: &[u8]) -> core::fmt::Result {
     for &b in value {
-        if b.is_ascii_graphic() && b != b'/' && b != b'%' {
+        // NDN URI scheme (name.html): only the RFC 3986 unreserved set is
+        // emitted raw. Everything else — including '=', which would otherwise
+        // re-parse as a `<type>=` prefix — is percent-encoded.
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
             write!(f, "{}", b as char)?;
         } else {
             write!(f, "%{b:02X}")?;
         }
     }
     Ok(())
+}
+
+/// Render a component value with the NDN URI periods rule: a value that is
+/// empty or consists solely of periods gets three additional periods (so an
+/// empty value is `...`, a single `.` is `....`), disambiguating it from
+/// path-like text. Everything else percent-encodes normally.
+fn write_uri_value(f: &mut core::fmt::Formatter<'_>, value: &[u8]) -> core::fmt::Result {
+    if value.iter().all(|&b| b == b'.') {
+        for _ in 0..value.len() + 3 {
+            write!(f, ".")?;
+        }
+        Ok(())
+    } else {
+        percent_encode_component(f, value)
+    }
+}
+
+/// Parse a URI component value: percent-decode, then apply the periods rule
+/// in reverse (`...` → empty, `....` → `.`; one or two periods are illegal).
+fn decode_uri_value(s: &str) -> Result<Vec<u8>, NameError> {
+    let decoded = percent_decode(s).map_err(|_| NameError("invalid percent-encoding"))?;
+    if decoded.iter().all(|&b| b == b'.') {
+        if decoded.len() < 3 {
+            return Err(NameError("component of one or two periods is illegal"));
+        }
+        return Ok(decoded[3..].to_vec());
+    }
+    Ok(decoded)
 }
 
 impl core::fmt::Display for Name {
@@ -434,17 +477,34 @@ impl core::fmt::Display for Name {
                     write!(f, "keyword=")?;
                     percent_encode_component(f, &c.value)?;
                 }
-                tlv_type::SEGMENT => write!(f, "seg={}", decode_nonnegative_integer(&c.value))?,
-                tlv_type::BYTE_OFFSET => write!(f, "off={}", decode_nonnegative_integer(&c.value))?,
-                tlv_type::VERSION => write!(f, "v={}", decode_nonnegative_integer(&c.value))?,
-                tlv_type::TIMESTAMP => write!(f, "t={}", decode_nonnegative_integer(&c.value))?,
-                tlv_type::SEQUENCE_NUM => {
-                    write!(f, "seq={}", decode_nonnegative_integer(&c.value))?
-                }
-                tlv_type::GENERIC_NAME_COMPONENT => percent_encode_component(f, &c.value)?,
+                // The `seg=`/`off=`/`v=`/`t=`/`seq=` sugar is only correct for
+                // canonical NonNegativeInteger values; a malformed width must
+                // render as the raw `<type>=<escaped>` form or the bytes are
+                // silently rewritten on a render→parse round-trip.
+                tlv_type::SEGMENT
+                | tlv_type::BYTE_OFFSET
+                | tlv_type::VERSION
+                | tlv_type::TIMESTAMP
+                | tlv_type::SEQUENCE_NUM => match canonical_nonneg_integer(&c.value) {
+                    Some(n) => {
+                        let prefix = match c.typ {
+                            tlv_type::SEGMENT => "seg",
+                            tlv_type::BYTE_OFFSET => "off",
+                            tlv_type::VERSION => "v",
+                            tlv_type::TIMESTAMP => "t",
+                            _ => "seq",
+                        };
+                        write!(f, "{prefix}={n}")?;
+                    }
+                    None => {
+                        write!(f, "{}=", c.typ)?;
+                        write_uri_value(f, &c.value)?;
+                    }
+                },
+                tlv_type::GENERIC_NAME_COMPONENT => write_uri_value(f, &c.value)?,
                 _ => {
                     write!(f, "{}=", c.typ)?;
-                    percent_encode_component(f, &c.value)?;
+                    write_uri_value(f, &c.value)?;
                 }
             }
         }

@@ -50,6 +50,7 @@ getrandom = { workspace = true, features = ["js"] }
 criterion = { workspace = true }
 ndn-tlv       = { workspace = true, features = ["std"] }
 bytes         = { workspace = true, features = ["std"] }
+proptest      = { workspace = true }
 
 [[bench]]
 name    = "name"

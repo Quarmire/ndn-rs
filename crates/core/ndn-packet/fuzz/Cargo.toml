@@ -19,9 +19,36 @@ bytes = "1"
 path = ".."
 features = ["std"]
 
+[dependencies.ndn-tlv]
+path = "../../ndn-tlv"
+
+[dependencies.ndn-mgmt-wire]
+path = "../../ndn-mgmt-wire"
+
 [[bin]]
 name = "decode"
 path = "fuzz_targets/decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "name"
+path = "fuzz_targets/name.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tlv"
+path = "fuzz_targets/tlv.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mgmt_wire"
+path = "fuzz_targets/mgmt_wire.rs"
 test = false
 doc = false
 bench = false

@@ -252,6 +252,9 @@ fjall = "3"
 # Benchmarking
 criterion = { version = "0.5", features = ["html_reports"] }
 
+# Property-based testing (dev-dependency only)
+proptest = "1"
+
 # Bluetooth LE GATT server (Linux/BlueZ, D-Bus)
 bluer = { version = "0.17", default-features = false, features = ["bluetoothd"] }
 

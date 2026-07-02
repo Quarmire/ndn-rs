@@ -84,3 +84,32 @@ jobs:
       # criterion's --test mode runs each bench exactly once: catches bench
       # rot without paying for (or trusting) timing on shared runners.
       - run: cargo bench --workspace -- --test
+
+  fuzz:
+    name: fuzz smoke (libFuzzer, 4 wire targets)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly (libFuzzer needs -Z flags)
+        run: rustup toolchain install nightly --profile minimal
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: fuzz
+          workspaces: crates/core/ndn-packet/fuzz
+      # 5 minutes per target from the committed seed corpus. A crash fails
+      # the job and uploads the reproducer as an artifact.
+      - name: fuzz decode / name / tlv / mgmt_wire
+        working-directory: crates/core/ndn-packet
+        run: |
+          for t in decode name tlv mgmt_wire; do
+            cargo +nightly fuzz run "$t" "fuzz/seeds/$t" -- -max_total_time=300
+          done
+      - name: Upload crash reproducers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: crates/core/ndn-packet/fuzz/artifacts

@@ -21,5 +21,8 @@ bytes   = { workspace = true }
 # no_std (thiserror 2 supports no_std without its std feature).
 thiserror = { version = "2", default-features = false }
 
+[dev-dependencies]
+proptest = { workspace = true }
+
 [lints]
 workspace = true
