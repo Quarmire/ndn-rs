@@ -41,3 +41,4 @@ never renumber. Status is one of `Proposed`, `Accepted`, `Superseded by NNNN`.
 | [0004](./0004-virtualize-the-clock.md) | Virtualize the clock behind a runtime seam for determinism | Accepted |
 | [0005](./0005-retire-audit-witness-suite.md) | Retire the audit-witness scripts in favour of nextest | Accepted |
 | [0006](./0006-radio-foundation-boundary.md) | Draw the radio foundation boundary: backends + capability descriptors | Accepted |
+| [0007](./0007-named-time-crate-boundary.md) | Named-time crate boundary: no_std core, stamp types, provenance-as-type | Accepted |

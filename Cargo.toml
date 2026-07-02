@@ -8,6 +8,7 @@ members = [
     "crates/forwarding/ndn-fwd-core",
     "crates/core/ndn-crypto-core",
     "crates/core/ndn-signals-core",
+    "crates/core/ndn-time",
     "crates/core/ndn-ble-framing",
     "crates/core/ndn-mgmt-wire",
     "crates/core/ndn-transport",
@@ -66,6 +67,7 @@ default-members = [
     "crates/security/ndn-identity",
     "crates/forwarding/ndn-mgmt",
     "crates/platform/ndn-observability",
+    "crates/core/ndn-time",
     "examples/secure-fetch",
     "examples/strategy-custom",
     "examples/strategy-composed",
@@ -109,6 +111,7 @@ ndn-packet    = { path = "crates/core/ndn-packet",    default-features = false }
 ndn-fwd-core  = { path = "crates/forwarding/ndn-fwd-core",  default-features = false }
 ndn-crypto-core = { path = "crates/core/ndn-crypto-core" }
 ndn-signals-core = { path = "crates/core/ndn-signals-core", default-features = false }
+ndn-time      = { path = "crates/core/ndn-time", default-features = false }
 ndn-ble-framing = { path = "crates/core/ndn-ble-framing" }
 ndn-mgmt-wire = { path = "crates/core/ndn-mgmt-wire" }
 ndn-transport = { path = "crates/core/ndn-transport" }

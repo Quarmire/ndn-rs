@@ -13,6 +13,7 @@ below is interactive (drag to pan, scroll to zoom).
       { "id": "ndn-packet" },
       { "id": "ndn-crypto-core" },
       { "id": "ndn-signals-core" },
+      { "id": "ndn-time" },
       { "id": "ndn-runtime" }
     ]},
     { "label": "Store & transport", "nodes": [
@@ -108,8 +109,10 @@ dependency, so a new edge that would break the layering fails the build.
 ## The layers, briefly
 
 - **Foundation** is `no_std`: the TLV codec, packet types, shared name/hash
-  primitives, the no-alloc crypto core, the cross-layer signal taxonomy, and
-  the clock/runtime seam. Everything else builds on these.
+  primitives, the no-alloc crypto core, the cross-layer signal taxonomy, the
+  named-time core (`ndn-time` — uncertainty-bounded samples, the Marzullo
+  combiner, measurement provenance; see [ADR 0007](../adr/0007-named-time-crate-boundary.md)),
+  and the clock/runtime seam. Everything else builds on these.
 - **Store & transport** holds the three forwarding tables (`ndn-store`), the
   pluggable async KV backends (`ndn-storage`), the face/transport abstraction
   and NDNLPv2 link service (`ndn-transport`), the sans-IO forwarding rules
