@@ -96,6 +96,36 @@ pub trait Now: Send + Sync + 'static {
 
 pub trait Runtime: Spawn + Sleep + Now {}
 
+/// The deadline elapsed before the future completed (returned by [`timeout`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Elapsed;
+
+impl core::fmt::Display for Elapsed {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "operation timed out")
+    }
+}
+impl std::error::Error for Elapsed {}
+
+/// Run `fut` with a deadline measured on **the runtime's own clock** — so under a virtual /
+/// simulation runtime it's virtual time, not wall-clock. The executor-agnostic replacement for
+/// `tokio::time::timeout`: a race between `fut` and `rt.sleep(dur)`, so it runs on any executor
+/// (Tokio, the sim's discrete-event executor, wasm). Returns `Err(`[`Elapsed`]`)` if the deadline
+/// wins.
+pub async fn timeout<S, T, F>(rt: &S, dur: Duration, fut: F) -> Result<T, Elapsed>
+where
+    S: Sleep + ?Sized,
+    F: Future<Output = T>,
+{
+    use futures::future::{Either, select};
+    let sleep = rt.sleep(dur);
+    futures::pin_mut!(fut);
+    match select(fut, sleep).await {
+        Either::Left((value, _)) => Ok(value),
+        Either::Right(((), _)) => Err(Elapsed),
+    }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 pub struct TokioRuntime;
 
