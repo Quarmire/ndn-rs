@@ -26,8 +26,12 @@ async fn demux_serves_and_fetches_on_one_connection() {
         .build()
         .await
         .expect("engine build");
-    engine.fib().add_nexthop(&"/a".parse().unwrap(), FaceId(1), 0);
-    engine.fib().add_nexthop(&"/b".parse().unwrap(), FaceId(2), 0);
+    engine
+        .fib()
+        .add_nexthop(&"/a".parse().unwrap(), FaceId(1), 0);
+    engine
+        .fib()
+        .add_nexthop(&"/b".parse().unwrap(), FaceId(2), 0);
 
     let a = DemuxConnection::new(Arc::new(InProcConnection::new(handle_a)));
     let b = DemuxConnection::new(Arc::new(InProcConnection::new(handle_b)));
@@ -37,7 +41,9 @@ async fn demux_serves_and_fetches_on_one_connection() {
     let serve_a = tokio::spawn(async move {
         a_serve
             .serve("/a".parse().unwrap(), |interest, responder| async move {
-                let _ = responder.respond((*interest.name).clone(), Bytes::from_static(b"from-a")).await;
+                let _ = responder
+                    .respond((*interest.name).clone(), Bytes::from_static(b"from-a"))
+                    .await;
             })
             .await
     });
@@ -45,7 +51,9 @@ async fn demux_serves_and_fetches_on_one_connection() {
     let serve_b = tokio::spawn(async move {
         b_serve
             .serve("/b".parse().unwrap(), |interest, responder| async move {
-                let _ = responder.respond((*interest.name).clone(), Bytes::from_static(b"from-b")).await;
+                let _ = responder
+                    .respond((*interest.name).clone(), Bytes::from_static(b"from-b"))
+                    .await;
             })
             .await
     });
@@ -59,7 +67,10 @@ async fn demux_serves_and_fetches_on_one_connection() {
     let from_b = a_consumer.fetch("/b").await.expect("A fetches /b");
     let from_a = b_consumer.fetch("/a").await.expect("B fetches /a");
 
-    assert_eq!(from_b.content().map(|c| c.to_vec()), Some(b"from-b".to_vec()));
+    assert_eq!(
+        from_b.content().map(|c| c.to_vec()),
+        Some(b"from-b".to_vec())
+    );
     assert_eq!(
         from_a.content().map(|c| c.to_vec()),
         Some(b"from-a".to_vec()),

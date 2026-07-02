@@ -3,6 +3,7 @@ name = "ndn-observability"
 description = "NDN-native span publisher — encodes OTLP Span protobuf and serves it under a configurable NDN prefix"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [package.metadata.scope]
@@ -42,3 +43,6 @@ ndn-packet = { workspace = true, features = ["std"] }
 ndn-transport = { workspace = true }
 bytes = { workspace = true, features = ["std"] }
 tokio-util = { workspace = true, features = ["rt"] }
+
+[lints]
+workspace = true

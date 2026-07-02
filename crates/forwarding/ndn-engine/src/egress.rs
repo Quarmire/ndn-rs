@@ -278,7 +278,10 @@ impl EgressScheduler for PriorityScheduler {
     }
 
     fn dropped(&self) -> u64 {
-        self.dropped.iter().map(|c| c.load(AtomicOrdering::Relaxed)).sum()
+        self.dropped
+            .iter()
+            .map(|c| c.load(AtomicOrdering::Relaxed))
+            .sum()
     }
 
     fn dropped_by_class(&self) -> [u64; NUM_TRAFFIC_CLASSES] {
@@ -329,7 +332,9 @@ impl DeficitRoundRobinScheduler {
             quantum: quantum.max(1),
             capacity: capacity.max(1),
             inner: Mutex::new(DrrInner {
-                queues: (0..DRR_CLASSES).map(|_| std::collections::VecDeque::new()).collect(),
+                queues: (0..DRR_CLASSES)
+                    .map(|_| std::collections::VecDeque::new())
+                    .collect(),
                 deficit: vec![0; DRR_CLASSES],
                 current: 0,
                 credited: false,
@@ -426,7 +431,10 @@ impl EgressScheduler for DeficitRoundRobinScheduler {
     }
 
     fn dropped(&self) -> u64 {
-        self.dropped.iter().map(|c| c.load(AtomicOrdering::Relaxed)).sum()
+        self.dropped
+            .iter()
+            .map(|c| c.load(AtomicOrdering::Relaxed))
+            .sum()
     }
 
     fn dropped_by_class(&self) -> [u64; NUM_TRAFFIC_CLASSES] {
@@ -442,7 +450,11 @@ mod tests {
     use ndn_transport::FaceId;
 
     fn item(tag: &str) -> EgressItem {
-        (Bytes::from(tag.to_owned()), FaceId::INVALID, EgressIntent::default())
+        (
+            Bytes::from(tag.to_owned()),
+            FaceId::INVALID,
+            EgressIntent::default(),
+        )
     }
     fn tag(it: &EgressItem) -> String {
         String::from_utf8(it.0.to_vec()).unwrap()
@@ -468,7 +480,10 @@ mod tests {
             TrafficClass(2)
         );
         // No match ⇒ default; no name ⇒ default.
-        assert_eq!(c.classify(Some(&"/other".parse().unwrap()), true), TrafficClass(3));
+        assert_eq!(
+            c.classify(Some(&"/other".parse().unwrap()), true),
+            TrafficClass(3)
+        );
         assert_eq!(c.classify(None, false), TrafficClass(3));
     }
 
@@ -499,19 +514,28 @@ mod tests {
         assert!(s.enqueue(item("hi"), TrafficClass(0)));
         assert_eq!(tag(&s.try_dequeue().unwrap()), "hi");
         assert_eq!(tag(&s.try_dequeue().unwrap()), "lo");
-        assert!(s.try_dequeue().is_none(), "empty ⇒ None (not a close signal)");
+        assert!(
+            s.try_dequeue().is_none(),
+            "empty ⇒ None (not a close signal)"
+        );
     }
 
     #[test]
     fn out_of_range_class_clamps_identically_on_both_schedulers() {
         // A class ≥ NUM_TRAFFIC_CLASSES must join the lowest-priority class on BOTH
         // schedulers (one class model), not 256 levels on Priority and 8 on DRR.
-        assert_eq!(TrafficClass(200).clamped() as usize, NUM_TRAFFIC_CLASSES - 1);
+        assert_eq!(
+            TrafficClass(200).clamped() as usize,
+            NUM_TRAFFIC_CLASSES - 1
+        );
 
         // Priority: an out-of-range class is served after the in-range lowest class.
         let p = PriorityScheduler::new(16);
         assert!(p.enqueue(item("oob"), TrafficClass(200)));
-        assert!(p.enqueue(item("lowest"), TrafficClass((NUM_TRAFFIC_CLASSES - 1) as u8)));
+        assert!(p.enqueue(
+            item("lowest"),
+            TrafficClass((NUM_TRAFFIC_CLASSES - 1) as u8)
+        ));
         assert!(p.enqueue(item("top"), TrafficClass(0)));
         let order: Vec<String> = (0..3).map(|_| tag(&p.try_dequeue().unwrap())).collect();
         // top first; oob and lowest share the same (clamped) class → FIFO between them.
@@ -529,7 +553,10 @@ mod tests {
         let s = PriorityScheduler::new(2);
         assert!(s.enqueue(item("a"), TrafficClass(0)));
         assert!(s.enqueue(item("b"), TrafficClass(0)));
-        assert!(!s.enqueue(item("c"), TrafficClass(0)), "third is tail-dropped");
+        assert!(
+            !s.enqueue(item("c"), TrafficClass(0)),
+            "third is tail-dropped"
+        );
         assert_eq!(s.depth(), (2, 2));
         assert_eq!(s.dropped(), 1);
     }
@@ -545,7 +572,10 @@ mod tests {
         assert_eq!(by_class[0], 1, "one drop on class 0");
         assert_eq!(by_class[3], 1, "one drop on class 3");
         assert_eq!(s.dropped(), 2, "total sums the per-class drops");
-        assert_eq!(TrafficClass::BEST_EFFORT.0 as usize, NUM_TRAFFIC_CLASSES - 1);
+        assert_eq!(
+            TrafficClass::BEST_EFFORT.0 as usize,
+            NUM_TRAFFIC_CLASSES - 1
+        );
     }
 
     #[tokio::test]
@@ -579,7 +609,10 @@ mod tests {
         let first = tag(&s.dequeue().await.unwrap());
         let second = tag(&s.dequeue().await.unwrap());
         assert_eq!(first, "hi-0");
-        assert_eq!(second, "lo-0", "the light class is served the same round, not last");
+        assert_eq!(
+            second, "lo-0",
+            "the light class is served the same round, not last"
+        );
     }
 
     #[tokio::test]

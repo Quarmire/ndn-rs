@@ -8,10 +8,10 @@
 #![allow(missing_docs)]
 
 pub mod config;
-#[cfg(feature = "mgmt")]
-mod mgmt_config_impl;
 pub mod error;
 pub mod mgmt;
+#[cfg(feature = "mgmt")]
+mod mgmt_config_impl;
 pub mod notifications;
 
 // The NFD management WIRE codecs (ControlParameters / ControlResponse / the
@@ -19,12 +19,12 @@ pub mod notifications;
 // that consume them depend on a spec crate, not this forwarder-TOML extension.
 // Re-exported here — modules and types — so existing `ndn_config::` consumers
 // keep compiling unchanged.
-pub use ndn_mgmt_wire::{control_parameters, control_response, nfd_command, nfd_dataset};
 pub use ndn_mgmt_wire::{
     ControlParameters, ControlResponse, FaceStatus, FibEntry, NextHopRecord, ParsedCommand,
     RibEntry, Route, StrategyChoice, command_name, dataset_name, parse_cert_sha256_hex,
     parse_command_name,
 };
+pub use ndn_mgmt_wire::{control_parameters, control_response, nfd_command, nfd_dataset};
 
 pub use config::{
     AcmeTomlConfig, CertSourceConfig, ChallengeConfig, CsConfig, DemoCaConfig, DiscoveryTomlConfig,

@@ -27,6 +27,10 @@ pub struct StrategyEntry {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+// linkme collects entries in a dedicated link section, and `link_section`
+// counts as unsafe code — a deliberate scoped exception to the workspace
+// `deny(unsafe_code)` policy.
+#[allow(unsafe_code)]
 #[linkme::distributed_slice]
 pub static STRATEGIES: [StrategyEntry] = [..];
 
@@ -105,6 +109,10 @@ pub fn create_by_name_version(short_name: &[u8], version: u64) -> Option<Arc<dyn
 macro_rules! register_strategy {
     ($static_ident:ident, $name:expr, $version:expr, $build:expr $(,)?) => {
         #[cfg(not(target_arch = "wasm32"))]
+        // linkme emits a `link_section` static, which counts as unsafe code;
+        // carry the allow inside the expansion so registrant crates stay
+        // clean under a `deny(unsafe_code)` policy.
+        #[allow(unsafe_code)]
         #[linkme::distributed_slice($crate::registry::STRATEGIES)]
         static $static_ident: $crate::registry::StrategyEntry = $crate::registry::StrategyEntry {
             name: $name,

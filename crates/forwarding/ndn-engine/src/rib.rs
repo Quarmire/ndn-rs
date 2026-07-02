@@ -63,7 +63,10 @@ impl Rib {
     }
 
     fn readvertise_dest(&self) -> Option<Arc<dyn ReadvertiseDestination>> {
-        self.readvertise.read().expect("readvertise lock poisoned").clone()
+        self.readvertise
+            .read()
+            .expect("readvertise lock poisoned")
+            .clone()
     }
 
     /// Announce `prefix` into the routing plane if `origin` is a locally-

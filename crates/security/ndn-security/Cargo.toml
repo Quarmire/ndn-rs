@@ -3,6 +3,7 @@ name = "ndn-security"
 description = "NDN security: signing, verification, trust schema, and certificate management"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [package.metadata.scope]
@@ -94,3 +95,6 @@ rand       = "0.8"
 [[bench]]
 name    = "security"
 harness = false
+
+[lints]
+workspace = true

@@ -54,9 +54,11 @@ pub(crate) fn parse_prefix_seq(name: &Name) -> Option<(Name, u64)> {
 
 /// `prefix/<seq-as-generic-NNI>` — inverse of [`parse_prefix_seq`].
 pub(crate) fn append_seq(prefix: &Name, seq: u64) -> Name {
-    prefix.clone().append_component(ndn_packet::NameComponent::generic(Bytes::from(
-        encode_nni(seq),
-    )))
+    prefix
+        .clone()
+        .append_component(ndn_packet::NameComponent::generic(Bytes::from(encode_nni(
+            seq,
+        ))))
 }
 
 /// PSync `ProducerBase` (C++ `PSync/producer-base.cpp`): a **bounded**,
@@ -96,7 +98,11 @@ impl ProducerBase {
     /// Insert/supersede a name. Returns `Some((reported_name, low, high))`
     /// when the set actually advanced; `None` for a stale or duplicate
     /// name. For a versioned name the old version is erased first.
-    pub(crate) fn apply(&mut self, name: &Name, mapping: Option<Bytes>) -> Option<(Name, u64, u64)> {
+    pub(crate) fn apply(
+        &mut self,
+        name: &Name,
+        mapping: Option<Bytes>,
+    ) -> Option<(Name, u64, u64)> {
         match parse_prefix_seq(name) {
             Some((prefix, seq)) => {
                 let old = self.prefixes.get(&prefix).copied().unwrap_or(0);
@@ -159,7 +165,10 @@ impl ProducerBase {
     pub(crate) fn reconcile(
         &self,
         peer: &Ibf,
-    ) -> Option<(std::collections::HashSet<u32>, std::collections::HashSet<u32>)> {
+    ) -> Option<(
+        std::collections::HashSet<u32>,
+        std::collections::HashSet<u32>,
+    )> {
         self.node.reconcile(peer)
     }
 
@@ -451,7 +460,11 @@ fn seg_express(send: mpsc::Sender<Bytes>, pending: SegPending) -> crate::transfe
 /// Drop the trailing `seg=` component of a segmented Data name.
 fn strip_segment(name: &Name) -> Name {
     let comps = name.components();
-    let end = if comps.last().map(|c| c.as_segment().is_some()).unwrap_or(false) {
+    let end = if comps
+        .last()
+        .map(|c| c.as_segment().is_some())
+        .unwrap_or(false)
+    {
         comps.len().saturating_sub(1)
     } else {
         comps.len()
@@ -502,7 +515,8 @@ async fn handle_sync_interest(
     seg_store: &mut HashMap<Name, Bytes>,
     reply: Option<oneshot::Sender<Bytes>>,
 ) {
-    let Some((peer_ibf, num_elems, interest_name)) = parse_sync_interest(group, raw, config.ibf_count)
+    let Some((peer_ibf, num_elems, interest_name)) =
+        parse_sync_interest(group, raw, config.ibf_count)
     else {
         return;
     };
@@ -916,8 +930,15 @@ mod tests {
         for seq in 1..=100u64 {
             pb.apply(&append_seq(&prefix, seq), None);
         }
-        assert_eq!(pb.node.len(), 1, "bounded set holds only the latest version");
-        assert_eq!(pb.num_own_elements, 100, "cumulative count tracks every bump");
+        assert_eq!(
+            pb.node.len(),
+            1,
+            "bounded set holds only the latest version"
+        );
+        assert_eq!(
+            pb.num_own_elements, 100,
+            "cumulative count tracks every bump"
+        );
         assert!(pb.name2hash.contains_key(&append_seq(&prefix, 100)));
         assert!(
             !pb.name2hash.contains_key(&append_seq(&prefix, 99)),
@@ -930,8 +951,14 @@ mod tests {
         let mut pb = ProducerBase::new(80);
         let p: Name = "/a/b".parse().unwrap();
         assert!(pb.apply(&append_seq(&p, 5), None).is_some());
-        assert!(pb.apply(&append_seq(&p, 3), None).is_none(), "older rejected");
-        assert!(pb.apply(&append_seq(&p, 5), None).is_none(), "same rejected");
+        assert!(
+            pb.apply(&append_seq(&p, 3), None).is_none(),
+            "older rejected"
+        );
+        assert!(
+            pb.apply(&append_seq(&p, 5), None).is_none(),
+            "same rejected"
+        );
         let (_, low, high) = pb.apply(&append_seq(&p, 9), None).unwrap();
         assert_eq!((low, high), (6, 9), "range = oldStored+1 ..= new");
     }
@@ -957,7 +984,10 @@ mod tests {
         let mut pb = ProducerBase::new(80);
         let n: Name = "/plain/name".parse().unwrap();
         assert!(pb.apply(&n, None).is_some());
-        assert!(pb.apply(&n, None).is_none(), "duplicate plain name is a no-op");
+        assert!(
+            pb.apply(&n, None).is_none(),
+            "duplicate plain name is a no-op"
+        );
         assert_eq!(pb.node.len(), 1);
     }
 
@@ -1066,7 +1096,11 @@ mod tests {
     fn segment_sync_data_splits_and_reassembles() {
         let interest: Name = "/test/sync/ibf".parse().unwrap();
         let names: Vec<Name> = (0..40)
-            .map(|i| format!("/ndn/site/router{i:03}/LSA/adjacency").parse().unwrap())
+            .map(|i| {
+                format!("/ndn/site/router{i:03}/LSA/adjacency")
+                    .parse()
+                    .unwrap()
+            })
             .collect();
 
         // A tiny segment cap forces a multi-segment reply.

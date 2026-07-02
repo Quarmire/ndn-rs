@@ -420,7 +420,8 @@ impl DataBuilder {
     {
         let mut inner = TlvWriter::new();
         write_name(&mut inner, &self.name);
-        if self.content_type.is_some() || self.freshness.is_some() || self.final_block_id.is_some() {
+        if self.content_type.is_some() || self.freshness.is_some() || self.final_block_id.is_some()
+        {
             let content_type = self.content_type;
             let freshness = self.freshness;
             let fbi = self.final_block_id.as_deref();
@@ -479,7 +480,8 @@ impl DataBuilder {
     {
         let mut inner = TlvWriter::new();
         write_name(&mut inner, &self.name);
-        if self.content_type.is_some() || self.freshness.is_some() || self.final_block_id.is_some() {
+        if self.content_type.is_some() || self.freshness.is_some() || self.final_block_id.is_some()
+        {
             let content_type = self.content_type;
             let freshness = self.freshness;
             let fbi = self.final_block_id.as_deref();
@@ -537,7 +539,8 @@ impl DataBuilder {
 
         let signed_start = w.len();
         write_name(&mut w, &self.name);
-        if self.content_type.is_some() || self.freshness.is_some() || self.final_block_id.is_some() {
+        if self.content_type.is_some() || self.freshness.is_some() || self.final_block_id.is_some()
+        {
             let content_type = self.content_type;
             let freshness = self.freshness;
             let fbi = self.final_block_id.as_deref();
@@ -682,20 +685,18 @@ mod tests {
         // No content_type set → Blob default → no MetaInfo on the wire.
         let wire = DataBuilder::new("/t", b"x").build();
         let data = Data::decode(wire).unwrap();
-        assert!(data.meta_info().is_none(), "Blob default must omit MetaInfo");
+        assert!(
+            data.meta_info().is_none(),
+            "Blob default must omit MetaInfo"
+        );
     }
 
     #[test]
     fn data_builder_sign() {
         use std::pin::pin;
-        use std::task::{Context, Wake, Waker};
+        use std::task::{Context, Waker};
 
-        struct NoopWaker;
-        impl Wake for NoopWaker {
-            fn wake(self: std::sync::Arc<Self>) {}
-        }
-        let waker = Waker::from(std::sync::Arc::new(NoopWaker));
-        let mut cx = Context::from_waker(&waker);
+        let mut cx = Context::from_waker(Waker::noop());
 
         let key_name: Name = "/key/test".parse().unwrap();
         let fut = DataBuilder::new("/signed/data", b"payload")
@@ -734,7 +735,7 @@ mod tests {
     #[test]
     fn data_builder_sign_sync_matches_async() {
         use std::pin::pin;
-        use std::task::{Context, Wake, Waker};
+        use std::task::{Context, Waker};
 
         let key_name: Name = "/key/test".parse().unwrap();
         let sign_fn = |region: &[u8]| -> Bytes {
@@ -747,12 +748,7 @@ mod tests {
         };
 
         // Async path
-        struct NoopWaker;
-        impl Wake for NoopWaker {
-            fn wake(self: std::sync::Arc<Self>) {}
-        }
-        let waker = Waker::from(std::sync::Arc::new(NoopWaker));
-        let mut cx = Context::from_waker(&waker);
+        let mut cx = Context::from_waker(Waker::noop());
 
         let fut = DataBuilder::new("/signed/data", b"payload")
             .freshness(Duration::from_secs(10))
@@ -866,14 +862,9 @@ mod tests {
     #[test]
     fn wire_ed25519_sig_type() {
         use std::pin::pin;
-        use std::task::{Context, Wake, Waker};
+        use std::task::{Context, Waker};
 
-        struct NoopWaker;
-        impl Wake for NoopWaker {
-            fn wake(self: std::sync::Arc<Self>) {}
-        }
-        let waker = Waker::from(std::sync::Arc::new(NoopWaker));
-        let mut cx = Context::from_waker(&waker);
+        let mut cx = Context::from_waker(Waker::noop());
 
         let fut = DataBuilder::new("/A", b"X").sign(
             SignatureType::SignatureEd25519,

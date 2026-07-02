@@ -88,9 +88,12 @@ async fn main() -> anyhow::Result<()> {
                 let name = (*interest.name).clone();
                 let signer = signer.clone();
                 async move {
-                    let wire = DataBuilder::new(name, b"tier0-response-payload-64-bytes-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
-                        .sign_with_sync(&*signer)
-                        .expect("sign");
+                    let wire = DataBuilder::new(
+                        name,
+                        b"tier0-response-payload-64-bytes-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+                    )
+                    .sign_with_sync(&*signer)
+                    .expect("sign");
                     responder.respond_bytes(wire).await.ok();
                 }
             })
@@ -104,13 +107,18 @@ async fn main() -> anyhow::Result<()> {
     // Warm up: build the consumer connection, prime caches, JIT the path.
     for i in 0..WARMUP {
         let n: Name = format!("/svc/echo/warm/{i}").parse()?;
-        vc.fetch(n).await.map_err(|e| anyhow::anyhow!("warmup: {e}"))?;
+        vc.fetch(n)
+            .await
+            .map_err(|e| anyhow::anyhow!("warmup: {e}"))?;
     }
     let mut verified = Vec::with_capacity(iters);
     for i in 0..iters {
         let n: Name = format!("/svc/echo/v/{i}").parse()?;
         let t = Instant::now();
-        let _safe = vc.fetch(n).await.map_err(|e| anyhow::anyhow!("verified: {e}"))?;
+        let _safe = vc
+            .fetch(n)
+            .await
+            .map_err(|e| anyhow::anyhow!("verified: {e}"))?;
         verified.push(t.elapsed().as_nanos());
     }
 
@@ -119,7 +127,9 @@ async fn main() -> anyhow::Result<()> {
     let uc = vc.unverified();
     for i in 0..WARMUP {
         let n: Name = format!("/svc/echo/uwarm/{i}").parse()?;
-        uc.fetch(n).await.map_err(|e| anyhow::anyhow!("uwarmup: {e}"))?;
+        uc.fetch(n)
+            .await
+            .map_err(|e| anyhow::anyhow!("uwarmup: {e}"))?;
     }
     let mut unverified = Vec::with_capacity(iters);
     for i in 0..iters {

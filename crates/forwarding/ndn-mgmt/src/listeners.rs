@@ -13,6 +13,9 @@ use tokio_util::sync::CancellationToken;
 /// Effective ceiling: `net.core.rmem_max` on Linux (doubled by the
 /// kernel), `kern.ipc.maxsockbuf` on macOS. Not supported on Windows.
 #[cfg(unix)]
+// SAFETY-scoped exception to the workspace `deny(unsafe_code)`: a single
+// `setsockopt` FFI call on an owned, live fd.
+#[allow(unsafe_code)]
 fn set_recv_buf_size(socket: &tokio::net::UdpSocket, size: usize) {
     use std::os::fd::AsRawFd;
     let fd = socket.as_raw_fd();

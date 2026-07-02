@@ -2,6 +2,7 @@
 name = "example-tier0-rpc-latency"
 version = "0.0.0"
 edition.workspace = true
+rust-version.workspace = true
 publish = false
 
 # Tier-0 RPC latency experiment: measures one signed-Interest -> signed+verified
@@ -18,3 +19,6 @@ ndn-face        = { workspace = true }
 ndn-app         = { workspace = true }
 tokio           = { workspace = true, features = ["rt-multi-thread", "macros"] }
 anyhow          = { workspace = true }
+
+[lints]
+workspace = true

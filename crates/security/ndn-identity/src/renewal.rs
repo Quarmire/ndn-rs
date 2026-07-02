@@ -309,7 +309,9 @@ mod tests {
         manager.cert_cache().insert(near_expiry_cert(&key_name));
 
         let calls = Arc::new(AtomicU64::new(0));
-        let renewer = Arc::new(CountingRenewer { calls: Arc::clone(&calls) });
+        let renewer = Arc::new(CountingRenewer {
+            calls: Arc::clone(&calls),
+        });
         let _handle = start_renewal(
             manager,
             key_name,

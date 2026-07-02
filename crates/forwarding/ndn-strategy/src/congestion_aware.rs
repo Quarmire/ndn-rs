@@ -35,12 +35,10 @@ use ndn_transport::{FaceId, ForwardingAction, NackReason};
 
 use crate::{ErasedStrategy, Strategy, StrategyContext, register_strategy};
 
-register_strategy!(
-    CONGESTION_AWARE_REG,
-    b"congestion-aware",
-    1,
-    || Arc::new(CongestionAwareStrategy::new()) as Arc<dyn ErasedStrategy>,
-);
+register_strategy!(CONGESTION_AWARE_REG, b"congestion-aware", 1, || Arc::new(
+    CongestionAwareStrategy::new()
+)
+    as Arc<dyn ErasedStrategy>,);
 
 /// Avalanche-mix the round-robin cursor before reducing mod the weight total, so
 /// consecutive Interests interleave across faces proportionally. A plain
@@ -98,9 +96,7 @@ impl CongestionAwareStrategy {
         }
 
         if let Some(sig) = ctx.signals.link(face_id) {
-            if !rtt_added
-                && let Some(rtt_ms) = sig.observed_rtt_ms
-            {
+            if !rtt_added && let Some(rtt_ms) = sig.observed_rtt_ms {
                 s += (rtt_ms / 10.0) as i64;
             }
             if let Some(tput) = sig.observed_tput_bps {
@@ -273,7 +269,11 @@ mod tests {
     }
 
     /// Count picks per face over `n` Interests.
-    fn distribution(s: &CongestionAwareStrategy, ctx: &StrategyContext<'_>, n: usize) -> Vec<(FaceId, usize)> {
+    fn distribution(
+        s: &CongestionAwareStrategy,
+        ctx: &StrategyContext<'_>,
+        n: usize,
+    ) -> Vec<(FaceId, usize)> {
         let mut counts: std::collections::HashMap<FaceId, usize> = std::collections::HashMap::new();
         for _ in 0..n {
             if let Some(ForwardingAction::Forward(faces)) =
@@ -292,8 +292,14 @@ mod tests {
         let r = Rig::new();
         let fib = FibEntry {
             nexthops: vec![
-                FibNexthop { face_id: FaceId(1), cost: 10 },
-                FibNexthop { face_id: FaceId(2), cost: 10 },
+                FibNexthop {
+                    face_id: FaceId(1),
+                    cost: 10,
+                },
+                FibNexthop {
+                    face_id: FaceId(2),
+                    cost: 10,
+                },
             ],
         };
         let signals = SignalsTable::new();
@@ -315,8 +321,14 @@ mod tests {
         let r = Rig::new();
         let fib = FibEntry {
             nexthops: vec![
-                FibNexthop { face_id: FaceId(1), cost: 10 }, // clean
-                FibNexthop { face_id: FaceId(2), cost: 10 }, // congested
+                FibNexthop {
+                    face_id: FaceId(1),
+                    cost: 10,
+                }, // clean
+                FibNexthop {
+                    face_id: FaceId(2),
+                    cost: 10,
+                }, // congested
             ],
         };
         let signals = SignalsTable::new();
@@ -330,16 +342,35 @@ mod tests {
         let s = CongestionAwareStrategy::new();
         let ctx = ctx_with(&r.name, &fib, &signals, &r.measurements, &r.rt, &r.ext);
         let dist = distribution(&s, &ctx, 200);
-        let clean = dist.iter().find(|(f, _)| *f == FaceId(1)).map(|(_, c)| *c).unwrap_or(0);
-        let congested = dist.iter().find(|(f, _)| *f == FaceId(2)).map(|(_, c)| *c).unwrap_or(0);
-        assert!(clean > 180, "clean face should carry the bulk, got clean={clean} congested={congested}");
-        assert!(congested < 20, "congested face should get only a trickle, got {congested}");
+        let clean = dist
+            .iter()
+            .find(|(f, _)| *f == FaceId(1))
+            .map(|(_, c)| *c)
+            .unwrap_or(0);
+        let congested = dist
+            .iter()
+            .find(|(f, _)| *f == FaceId(2))
+            .map(|(_, c)| *c)
+            .unwrap_or(0);
+        assert!(
+            clean > 180,
+            "clean face should carry the bulk, got clean={clean} congested={congested}"
+        );
+        assert!(
+            congested < 20,
+            "congested face should get only a trickle, got {congested}"
+        );
     }
 
     #[test]
     fn single_viable_face_always_picked() {
         let r = Rig::new();
-        let fib = FibEntry { nexthops: vec![FibNexthop { face_id: FaceId(7), cost: 10 }] };
+        let fib = FibEntry {
+            nexthops: vec![FibNexthop {
+                face_id: FaceId(7),
+                cost: 10,
+            }],
+        };
         let signals = SignalsTable::new();
         let s = CongestionAwareStrategy::new();
         let ctx = ctx_with(&r.name, &fib, &signals, &r.measurements, &r.rt, &r.ext);
@@ -366,8 +397,14 @@ mod tests {
         let r = Rig::new();
         let fib = FibEntry {
             nexthops: vec![
-                FibNexthop { face_id: FaceId(1), cost: 10 },
-                FibNexthop { face_id: FaceId(2), cost: 20 },
+                FibNexthop {
+                    face_id: FaceId(1),
+                    cost: 10,
+                },
+                FibNexthop {
+                    face_id: FaceId(2),
+                    cost: 20,
+                },
             ],
         };
         let signals = SignalsTable::new();

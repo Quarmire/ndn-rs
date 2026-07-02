@@ -73,7 +73,10 @@ async fn marks_raise_then_decay_face_congestion() {
 
     // No further marks ⇒ the next window decays congestion back to clear.
     let cleared = wait_until(Duration::from_secs(2), || {
-        signals.link(FaceId(FACE_B)).and_then(|l| l.congestion).is_none()
+        signals
+            .link(FaceId(FACE_B))
+            .and_then(|l| l.congestion)
+            .is_none()
     })
     .await;
     assert!(cleared, "congestion must decay to clear once marks stop");

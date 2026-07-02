@@ -85,10 +85,17 @@ fn parse(source: &str) -> Result<Vec<Rule>, LvsCompileError> {
         if text.is_empty() {
             continue;
         }
-        let syntax = |msg: &str| LvsCompileError::Syntax { line, msg: msg.to_string() };
+        let syntax = |msg: &str| LvsCompileError::Syntax {
+            line,
+            msg: msg.to_string(),
+        };
 
-        let id_rest = text.strip_prefix('#').ok_or_else(|| syntax("rule must start with '#'"))?;
-        let (id, rest) = id_rest.split_once(':').ok_or_else(|| syntax("expected ':' after rule id"))?;
+        let id_rest = text
+            .strip_prefix('#')
+            .ok_or_else(|| syntax("rule must start with '#'"))?;
+        let (id, rest) = id_rest
+            .split_once(':')
+            .ok_or_else(|| syntax("expected ':' after rule id"))?;
         let id = id.trim().to_string();
         if id.is_empty() {
             return Err(syntax("empty rule id"));
@@ -109,7 +116,11 @@ fn parse(source: &str) -> Result<Vec<Rule>, LvsCompileError> {
         };
 
         let mut pattern = Vec::new();
-        for seg in pattern_str.split('/').map(str::trim).filter(|s| !s.is_empty()) {
+        for seg in pattern_str
+            .split('/')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             pattern.push(parse_comp(seg).ok_or_else(|| syntax("malformed component"))?);
         }
         if pattern.is_empty() {
@@ -118,7 +129,11 @@ fn parse(source: &str) -> Result<Vec<Rule>, LvsCompileError> {
         if rules.iter().any(|r| r.id == id) {
             return Err(LvsCompileError::DuplicateRule(id));
         }
-        rules.push(Rule { id, pattern, signers });
+        rules.push(Rule {
+            id,
+            pattern,
+            signers,
+        });
     }
     Ok(rules)
 }
@@ -141,10 +156,10 @@ fn parse_comp(seg: &str) -> Option<Comp> {
 /// requires).
 #[derive(Default)]
 struct NodeB {
-    value_edges: Vec<(Vec<u8>, u64)>,   // (literal bytes, dest id)
-    pattern_edges: Vec<u64>,            // dest id (tag assigned at emit by position)
-    pattern_tags: Vec<u64>,             // parallel to pattern_edges: the tag id
-    key_nodes: Vec<u64>,                // sign constraints (signer terminal node ids)
+    value_edges: Vec<(Vec<u8>, u64)>, // (literal bytes, dest id)
+    pattern_edges: Vec<u64>,          // dest id (tag assigned at emit by position)
+    pattern_tags: Vec<u64>,           // parallel to pattern_edges: the tag id
+    key_nodes: Vec<u64>,              // sign constraints (signer terminal node ids)
 }
 
 fn lower(rules: &[Rule]) -> Result<Vec<u8>, LvsCompileError> {
@@ -179,12 +194,13 @@ fn lower(rules: &[Rule]) -> Result<Vec<u8>, LvsCompileError> {
     for rule in rules {
         let data_node = terminal[rule.id.as_str()];
         for signer in &rule.signers {
-            let key_node = *terminal.get(signer.as_str()).ok_or_else(|| {
-                LvsCompileError::UnknownSigner {
-                    rule: rule.id.clone(),
-                    signer: signer.clone(),
-                }
-            })?;
+            let key_node =
+                *terminal
+                    .get(signer.as_str())
+                    .ok_or_else(|| LvsCompileError::UnknownSigner {
+                        rule: rule.id.clone(),
+                        signer: signer.clone(),
+                    })?;
             nodes[data_node as usize].key_nodes.push(key_node);
         }
     }
@@ -284,10 +300,16 @@ mod tests {
 
         // An admin cert is signed by the root key.
         let root_key = n("/site/KEY/r1");
-        assert!(model.check(&admin_key, &root_key), "root key may sign an admin cert");
+        assert!(
+            model.check(&admin_key, &root_key),
+            "root key may sign an admin cert"
+        );
 
         // A doc may NOT be signed by the root key directly (no such signing edge).
-        assert!(!model.check(&doc, &root_key), "root may not sign a doc directly");
+        assert!(
+            !model.check(&doc, &root_key),
+            "root may not sign a doc directly"
+        );
         // A name outside the schema is rejected.
         assert!(!model.check(&n("/other/thing"), &admin_key));
     }
@@ -308,7 +330,10 @@ mod tests {
 
         // A bareword component (unquoted, not `_`-led) is a compile error, not a literal.
         let bareword = compile("#a: /KEY/_").unwrap_err();
-        assert!(matches!(bareword, LvsCompileError::Syntax { .. }), "bareword must error");
+        assert!(
+            matches!(bareword, LvsCompileError::Syntax { .. }),
+            "bareword must error"
+        );
     }
 
     #[test]

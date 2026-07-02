@@ -387,7 +387,15 @@ impl LvsModel {
         // attacker-influenced name, so cap total work: a schema with overlapping pattern
         // edges branches ~k^depth, each step cloning the bindings map.
         let mut budget = MAX_WALK_STEPS;
-        self.walk_inner(start, name.components(), 0, bindings, registry, &mut budget, &mut out);
+        self.walk_inner(
+            start,
+            name.components(),
+            0,
+            bindings,
+            registry,
+            &mut budget,
+            &mut out,
+        );
         out
     }
 
@@ -420,7 +428,15 @@ impl LvsModel {
         // Per the spec: check ValueEdges for exact matches first.
         for ve in &node.value_edges {
             if &ve.value == comp {
-                self.walk_inner(ve.dest, comps, depth + 1, bindings.clone(), registry, budget, out);
+                self.walk_inner(
+                    ve.dest,
+                    comps,
+                    depth + 1,
+                    bindings.clone(),
+                    registry,
+                    budget,
+                    out,
+                );
             }
         }
 
@@ -435,7 +451,15 @@ impl LvsModel {
             if self.pattern_edge_matches(pe, comp, &bindings, registry) {
                 let mut new_bindings = bindings.clone();
                 new_bindings.insert(pe.tag, comp.clone());
-                self.walk_inner(pe.dest, comps, depth + 1, new_bindings, registry, budget, out);
+                self.walk_inner(
+                    pe.dest,
+                    comps,
+                    depth + 1,
+                    new_bindings,
+                    registry,
+                    budget,
+                    out,
+                );
             }
         }
     }
@@ -502,12 +526,7 @@ impl LvsModel {
 
     /// As [`check`](Self::check), but dispatching the schema's user functions through
     /// `registry` (G8). A function with no handler still fails closed.
-    pub fn check_with(
-        &self,
-        data_name: &Name,
-        key_name: &Name,
-        registry: &UserFnRegistry,
-    ) -> bool {
+    pub fn check_with(&self, data_name: &Name, key_name: &Name, registry: &UserFnRegistry) -> bool {
         let data_endings = self.walk(data_name, registry);
         if data_endings.is_empty() {
             return false;
@@ -1171,10 +1190,16 @@ mod tests {
         let reg = UserFnRegistry::with_builtins();
 
         // Dispatched: $eq("doc") authorizes /doc (signed by /k) but rejects /img.
-        assert!(model.check_with(&doc, &key, &reg), "$eq(doc) matches → authorized");
+        assert!(
+            model.check_with(&doc, &key, &reg),
+            "$eq(doc) matches → authorized"
+        );
         assert!(!model.check_with(&img, &key, &reg), "$eq(doc) rejects /img");
         // Fail-closed without a handler: default check, and an empty registry.
-        assert!(!model.check(&doc, &key), "no registry ⇒ user fn fails closed");
+        assert!(
+            !model.check(&doc, &key),
+            "no registry ⇒ user fn fails closed"
+        );
         assert!(!model.check_with(&doc, &key, &UserFnRegistry::new()));
 
         // A custom predicate registers the same way (the seam $regex would use).
@@ -1186,6 +1211,9 @@ mod tests {
                 args.len() == 1 && comp.value.eq_ignore_ascii_case(b"doc")
             }),
         );
-        assert!(model.check_with(&name(&["DOC"]), &key, &custom), "custom handler dispatched");
+        assert!(
+            model.check_with(&name(&["DOC"]), &key, &custom),
+            "custom handler dispatched"
+        );
     }
 }

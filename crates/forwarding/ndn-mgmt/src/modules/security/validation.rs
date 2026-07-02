@@ -3,8 +3,8 @@
 
 use std::sync::Arc;
 
-use ndn_mgmt_wire::{ControlParameters, ControlResponse, control_response::status};
 use ndn_engine::ForwarderEngine;
+use ndn_mgmt_wire::{ControlParameters, ControlResponse, control_response::status};
 
 pub(super) fn security_validation_stats(engine: &ForwarderEngine) -> ControlResponse {
     // Monotonic totals + probe timestamp; the dashboard computes

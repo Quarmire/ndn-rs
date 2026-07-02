@@ -73,17 +73,11 @@ impl Strategy for SelfLearningStrategy {
         }
     }
 
-    fn after_receive_interest(
-        &self,
-        ctx: &StrategyContext<'_>,
-    ) -> SmallVec<[ForwardingAction; 2]> {
+    fn after_receive_interest(&self, ctx: &StrategyContext<'_>) -> SmallVec<[ForwardingAction; 2]> {
         self.decide(ctx).unwrap()
     }
 
-    fn after_receive_data(
-        &self,
-        _ctx: &StrategyContext<'_>,
-    ) -> SmallVec<[ForwardingAction; 2]> {
+    fn after_receive_data(&self, _ctx: &StrategyContext<'_>) -> SmallVec<[ForwardingAction; 2]> {
         // Route learning from PrefixAnnouncements happens engine-side (the data
         // pipeline validates the announcement before installing).
         SmallVec::new()
@@ -125,8 +119,7 @@ mod tests {
         let s = SelfLearningStrategy::new();
         let name = Arc::new(Name::root());
         let m = MeasurementsTable::new();
-        let actions = s
-            .after_receive_interest(&ctx(&name, FaceId(1), None, &m));
+        let actions = s.after_receive_interest(&ctx(&name, FaceId(1), None, &m));
         assert!(matches!(actions.as_slice(), [ForwardingAction::Broadcast]));
     }
 
@@ -141,8 +134,7 @@ mod tests {
                 cost: 10,
             }],
         };
-        let actions = s
-            .after_receive_interest(&ctx(&name, FaceId(1), Some(&fib), &m));
+        let actions = s.after_receive_interest(&ctx(&name, FaceId(1), Some(&fib), &m));
         match actions.as_slice() {
             [ForwardingAction::Forward(faces)] => assert_eq!(faces.as_slice(), &[FaceId(2)]),
             _ => panic!("expected Forward to the learned nexthop"),

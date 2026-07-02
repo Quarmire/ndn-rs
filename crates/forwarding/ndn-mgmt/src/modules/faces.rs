@@ -5,17 +5,17 @@
 mod create;
 mod datasets;
 mod events;
-mod update;
 pub mod provision;
+mod update;
 
 use async_trait::async_trait;
 
+use ndn_engine::ForwarderEngine;
 use ndn_mgmt_wire::{
     ControlParameters, ControlResponse,
     control_response::status,
     nfd_command::{module, verb},
 };
-use ndn_engine::ForwarderEngine;
 use ndn_transport::FaceId;
 
 use super::common::is_management_face;
@@ -56,7 +56,9 @@ async fn handle_faces(
     provisioners: &[std::sync::Arc<dyn crate::FaceProvisioner>],
 ) -> VerbOutcome {
     match verb_name {
-        v if v == verb::CREATE => faces_create(params, source_face, engine, provisioners).await.into(),
+        v if v == verb::CREATE => faces_create(params, source_face, engine, provisioners)
+            .await
+            .into(),
         v if v == verb::UPDATE => {
             let (response, events) = faces_update(params, source_face, engine);
             VerbOutcome {
@@ -135,8 +137,14 @@ impl MgmtModule for FacesModule {
         params: ControlParameters,
         ctx: &MgmtContext<'_>,
     ) -> MgmtResponse {
-        let outcome =
-            handle_faces(verb, params, ctx.source_face, ctx.engine, ctx.face_provisioners).await;
+        let outcome = handle_faces(
+            verb,
+            params,
+            ctx.source_face,
+            ctx.engine,
+            ctx.face_provisioners,
+        )
+        .await;
         let VerbOutcome { response, events } = outcome;
 
         if let Some(stream) = ctx.face_events {

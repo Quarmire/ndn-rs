@@ -738,14 +738,9 @@ mod tests {
     #[test]
     fn interest_builder_sign_async_matches_sync_structure() {
         use std::pin::pin;
-        use std::task::{Context, Wake, Waker};
+        use std::task::{Context, Waker};
 
-        struct NoopWaker;
-        impl Wake for NoopWaker {
-            fn wake(self: std::sync::Arc<Self>) {}
-        }
-        let waker = Waker::from(std::sync::Arc::new(NoopWaker));
-        let mut cx = Context::from_waker(&waker);
+        let mut cx = Context::from_waker(Waker::noop());
 
         let fut = InterestBuilder::new("/test")
             .app_parameters(b"p".to_vec())

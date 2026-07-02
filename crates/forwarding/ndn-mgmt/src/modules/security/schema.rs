@@ -1,8 +1,8 @@
 //! `security/schema-*` — trust-schema rule management against the
 //! engine's validator.
 
-use ndn_mgmt_wire::{ControlParameters, ControlResponse, control_response::status};
 use ndn_engine::ForwarderEngine;
+use ndn_mgmt_wire::{ControlParameters, ControlResponse, control_response::status};
 use ndn_security::SchemaRule;
 
 /// Get the validator from the engine or return a 404 error.

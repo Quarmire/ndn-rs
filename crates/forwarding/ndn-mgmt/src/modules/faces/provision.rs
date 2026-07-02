@@ -53,8 +53,6 @@ pub trait FaceProvisioner: Send + Sync {
     fn handles(&self, uri: &str) -> bool;
 
     /// Build the face, register it with `req.engine`, and return its identity.
-    async fn provision(
-        &self,
-        req: ProvisionRequest<'_>,
-    ) -> Result<ProvisionedFace, ProvisionError>;
+    async fn provision(&self, req: ProvisionRequest<'_>)
+    -> Result<ProvisionedFace, ProvisionError>;
 }

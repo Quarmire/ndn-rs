@@ -213,19 +213,32 @@ mod tests {
         let ct = lsw::encrypt(&pk, &["mavlink", "execute"], &plaintext).expect("kp encrypt");
 
         // ...and the KEY carries the POLICY. A satisfied policy decrypts.
-        let sk_ok = lsw::keygen(&pk, &msk, r#""mavlink" or "camera""#, PolicyLanguage::HumanPolicy)
-            .expect("keygen ok");
+        let sk_ok = lsw::keygen(
+            &pk,
+            &msk,
+            r#""mavlink" or "camera""#,
+            PolicyLanguage::HumanPolicy,
+        )
+        .expect("keygen ok");
         assert_eq!(lsw::decrypt(&sk_ok, &ct).expect("decrypt ok"), plaintext);
 
         // An unsatisfied policy fails (negative control).
-        let sk_no = lsw::keygen(&pk, &msk, r#""camera" and "admin""#, PolicyLanguage::HumanPolicy)
-            .expect("keygen no");
+        let sk_no = lsw::keygen(
+            &pk,
+            &msk,
+            r#""camera" and "admin""#,
+            PolicyLanguage::HumanPolicy,
+        )
+        .expect("keygen no");
         assert!(lsw::decrypt(&sk_no, &ct).is_err());
 
         // Pinnable wire: bincode round-trip the ciphertext; it still decrypts.
         let wire = bincode::serialize(&ct).expect("serialize");
         let ct2: lsw::KpAbeCiphertext = bincode::deserialize(&wire).expect("deserialize");
-        assert_eq!(lsw::decrypt(&sk_ok, &ct2).expect("decrypt after wire"), plaintext);
+        assert_eq!(
+            lsw::decrypt(&sk_ok, &ct2).expect("decrypt after wire"),
+            plaintext
+        );
     }
 
     fn setup_kgc(name: &str) -> (Name, Hash, BswMasterParams, BswMasterSecret) {
@@ -270,7 +283,10 @@ mod tests {
         // A non-satisfying key is rejected through the typed path too.
         let bad_policy = PolicyExpr::parse("service:camera AND perm:admin").unwrap();
         let bad_key = lsw_keygen(&mp, &ms, &bad_policy).unwrap();
-        assert!(matches!(decrypt_kp(&ct, &bad_key), Err(AbeError::DecryptionFailed)));
+        assert!(matches!(
+            decrypt_kp(&ct, &bad_key),
+            Err(AbeError::DecryptionFailed)
+        ));
     }
 
     #[test]

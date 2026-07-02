@@ -3,6 +3,7 @@ name = "ndn-packet"
 description = "NDN packet types: Name, Interest, Data, Nack"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 # `std` is NOT enabled by default. Bare-metal / no_std targets use this crate
@@ -53,3 +54,6 @@ bytes         = { workspace = true, features = ["std"] }
 [[bench]]
 name    = "name"
 harness = false
+
+[lints]
+workspace = true

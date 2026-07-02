@@ -111,8 +111,11 @@ impl DeadNonceList {
         let to_remove = len - target;
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let mut by_expiry: Vec<(u64, NonceFingerprint)> =
-                self.entries.iter().map(|r| (*r.value(), *r.key())).collect();
+            let mut by_expiry: Vec<(u64, NonceFingerprint)> = self
+                .entries
+                .iter()
+                .map(|r| (*r.value(), *r.key()))
+                .collect();
             by_expiry.sort_unstable_by_key(|(e, _)| *e);
             for (_, fp) in by_expiry.into_iter().take(to_remove) {
                 self.entries.remove(&fp);

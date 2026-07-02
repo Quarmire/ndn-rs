@@ -596,8 +596,8 @@ impl Pit {
                 if any_in {
                     self.park_dying_records(entry.value(), face_id);
                 }
-                let all_in_on_face =
-                    !entry.in_records.is_empty() && entry.in_records.iter().all(|r| r.face_id == face_id);
+                let all_in_on_face = !entry.in_records.is_empty()
+                    && entry.in_records.iter().all(|r| r.face_id == face_id);
                 if all_in_on_face {
                     to_remove.push(*entry.key());
                 } else if any_in || any_out {
@@ -637,8 +637,8 @@ impl Pit {
                 if any_in {
                     self.park_dying_records(entry, face_id);
                 }
-                let all_in_on_face =
-                    !entry.in_records.is_empty() && entry.in_records.iter().all(|r| r.face_id == face_id);
+                let all_in_on_face = !entry.in_records.is_empty()
+                    && entry.in_records.iter().all(|r| r.face_id == face_id);
                 if all_in_on_face {
                     to_remove.push(*token);
                 } else if any_in || any_out {

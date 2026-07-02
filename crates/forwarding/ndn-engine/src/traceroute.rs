@@ -50,8 +50,7 @@ const PARAMS_SHA256_TYPE: u64 = 0x02;
 pub fn is_trace_probe(name: &Name) -> bool {
     let kw_typ = NameComponent::keyword(Bytes::new()).typ;
     let comps = name.components();
-    let is_marker =
-        |c: &NameComponent| c.typ == kw_typ && c.value.as_ref() == TRACEROUTE_KEYWORD;
+    let is_marker = |c: &NameComponent| c.typ == kw_typ && c.value.as_ref() == TRACEROUTE_KEYWORD;
     let n = comps.len();
     if n >= 1 && is_marker(&comps[n - 1]) {
         return true;
@@ -101,24 +100,38 @@ mod tests {
         let probe: Name = "/svc/ping/7".parse().unwrap();
         let marked = probe
             .clone()
-            .append_component(NameComponent::keyword(Bytes::from_static(TRACEROUTE_KEYWORD)));
+            .append_component(NameComponent::keyword(Bytes::from_static(
+                TRACEROUTE_KEYWORD,
+            )));
         assert!(is_trace_probe(&marked));
-        assert!(!is_trace_probe(&probe), "an unmarked probe is a normal drop");
+        assert!(
+            !is_trace_probe(&probe),
+            "an unmarked probe is a normal drop"
+        );
 
         // Anchored: a `32=TRH` component buried mid-name (an ordinary app Interest that
         // merely contains the keyword) is NOT treated as a probe.
         let buried = probe
             .clone()
-            .append_component(NameComponent::keyword(Bytes::from_static(TRACEROUTE_KEYWORD)))
+            .append_component(NameComponent::keyword(Bytes::from_static(
+                TRACEROUTE_KEYWORD,
+            )))
             .append("more")
             .append("components");
-        assert!(!is_trace_probe(&buried), "a non-tail TRH marker must not match");
+        assert!(
+            !is_trace_probe(&buried),
+            "a non-tail TRH marker must not match"
+        );
 
         // A signed probe (marker immediately before a ParametersSha256Digest) still matches.
-        let signed = marked
-            .clone()
-            .append_component(NameComponent::new(PARAMS_SHA256_TYPE, Bytes::from_static(&[0u8; 32])));
-        assert!(is_trace_probe(&signed), "marker before the params tail matches");
+        let signed = marked.clone().append_component(NameComponent::new(
+            PARAMS_SHA256_TYPE,
+            Bytes::from_static(&[0u8; 32]),
+        ));
+        assert!(
+            is_trace_probe(&signed),
+            "marker before the params tail matches"
+        );
 
         // A built marked Interest is recognized after a wire round-trip.
         let wire = InterestBuilder::new(marked.clone()).hop_limit(1).build();
@@ -130,7 +143,11 @@ mod tests {
         let data = ndn_packet::Data::decode(reply).unwrap();
         assert_eq!(*data.name, marked, "reply satisfies the probe name");
         let content = data.content().expect("reply has content");
-        assert_eq!(parse_identity(content), Some(node), "node identity recovered");
+        assert_eq!(
+            parse_identity(content),
+            Some(node),
+            "node identity recovered"
+        );
         // The producer's own answer (no magic) is not mistaken for a hop.
         assert!(parse_identity(b"\x00\x00\x00\x05").is_none());
     }

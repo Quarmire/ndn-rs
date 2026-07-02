@@ -231,7 +231,8 @@ impl Node {
         // socket `Publisher::connect` registers these too; `from_connection`
         // (sync) can't, so the embedder — here, `Node` — does it.
         conn.register_prefix(&group).await?;
-        conn.register_prefix(&svs_data_prefix(&local_name, &group)).await?;
+        conn.register_prefix(&svs_data_prefix(&local_name, &group))
+            .await?;
         Publisher::from_connection(conn, group, local_name, PublisherConfig::default())
     }
 

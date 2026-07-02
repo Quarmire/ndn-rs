@@ -176,15 +176,10 @@ async fn reflexive_cert_distribution_via_signed_wire() {
         });
     let cert_for_serve = cert_wire.clone();
     let d1 = advertiser
-        .fetch_reflexive_wire(
-            wire,
-            r,
-            Duration::from_secs(4),
-            move |reverse: Interest| {
-                let cert = cert_for_serve.clone();
-                async move { Ok(DataBuilder::new((*reverse.name).clone(), &cert).build()) }
-            },
-        )
+        .fetch_reflexive_wire(wire, r, Duration::from_secs(4), move |reverse: Interest| {
+            let cert = cert_for_serve.clone();
+            async move { Ok(DataBuilder::new((*reverse.name).clone(), &cert).build()) }
+        })
         .await
         .expect("forward Data should arrive after the reverse cert pull");
 

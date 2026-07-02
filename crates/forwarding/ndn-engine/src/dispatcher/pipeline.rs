@@ -305,7 +305,9 @@ impl PacketDispatcher {
         let reverse_face = if self.reflexive.is_empty() {
             None
         } else {
-            ctx.name.as_deref().and_then(|n| self.reflexive.lookup(n, ctx.arrival))
+            ctx.name
+                .as_deref()
+                .and_then(|n| self.reflexive.lookup(n, ctx.arrival))
         };
         if let Some(rev_face) = reverse_face {
             trace!(target: t::FWD_PIPELINE, face=%ctx.face_id, rev_face=%rev_face, "reflexive: reverse routing");
@@ -478,7 +480,10 @@ impl PacketDispatcher {
         // congesting; record it for the per-face signal the strategy reads. Done
         // before PIT match so a mark counts as link-level info regardless of routing.
         if let Some(fb) = &self.congestion_feedback
-            && ctx.tags.get::<crate::stages::decode::CongestionMark>().is_some()
+            && ctx
+                .tags
+                .get::<crate::stages::decode::CongestionMark>()
+                .is_some()
         {
             fb.observe(ctx.face_id);
         }

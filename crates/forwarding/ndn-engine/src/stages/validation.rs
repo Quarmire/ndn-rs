@@ -51,45 +51,6 @@ impl Default for PendingQueueConfig {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use bytes::Bytes;
-    use ndn_packet::{Data, SignatureType, encode::DataBuilder};
-    use ndn_security::{TrustSchema, Validator};
-    use ndn_transport::FaceId;
-
-    use super::*;
-
-    #[tokio::test]
-    async fn d13_localhost_data_with_bogus_digest_is_dropped() {
-        let validator = Arc::new(Validator::new(TrustSchema::accept_all()));
-        let validation = ValidationStage::new(
-            Some(validator),
-            None,
-            PendingQueueConfig::default(),
-            ndn_runtime::default_runtime(),
-        );
-
-        let wire = DataBuilder::new("/localhost/nfd/status/general", b"forged").sign_sync(
-            SignatureType::DigestSha256,
-            None,
-            |_| Bytes::from_static(&[0u8; 32]),
-        );
-        let data = Data::decode(wire.clone()).unwrap();
-        let mut ctx = PacketContext::new(wire, FaceId(1), 0);
-        ctx.name = Some(Arc::clone(&data.name));
-        ctx.packet = DecodedPacket::Data(Box::new(data));
-
-        let action = validation.process(ctx).await;
-        assert!(
-            matches!(action, Action::Drop(DropReason::ValidationFailed)),
-            "/localhost Data must go through validation instead of bypassing it"
-        );
-    }
-}
-
 impl PendingQueue {
     fn new(config: &PendingQueueConfig) -> Self {
         Self {
@@ -281,5 +242,44 @@ impl ValidationStage {
         }
 
         actions
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use bytes::Bytes;
+    use ndn_packet::{Data, SignatureType, encode::DataBuilder};
+    use ndn_security::{TrustSchema, Validator};
+    use ndn_transport::FaceId;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn d13_localhost_data_with_bogus_digest_is_dropped() {
+        let validator = Arc::new(Validator::new(TrustSchema::accept_all()));
+        let validation = ValidationStage::new(
+            Some(validator),
+            None,
+            PendingQueueConfig::default(),
+            ndn_runtime::default_runtime(),
+        );
+
+        let wire = DataBuilder::new("/localhost/nfd/status/general", b"forged").sign_sync(
+            SignatureType::DigestSha256,
+            None,
+            |_| Bytes::from_static(&[0u8; 32]),
+        );
+        let data = Data::decode(wire.clone()).unwrap();
+        let mut ctx = PacketContext::new(wire, FaceId(1), 0);
+        ctx.name = Some(Arc::clone(&data.name));
+        ctx.packet = DecodedPacket::Data(Box::new(data));
+
+        let action = validation.process(ctx).await;
+        assert!(
+            matches!(action, Action::Drop(DropReason::ValidationFailed)),
+            "/localhost Data must go through validation instead of bypassing it"
+        );
     }
 }

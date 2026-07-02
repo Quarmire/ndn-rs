@@ -31,7 +31,6 @@ pub mod multicast_ether;
 pub mod neighbor;
 pub mod radio;
 
-
 #[cfg(target_os = "linux")]
 pub use af_packet::MacAddr;
 #[cfg(target_os = "linux")]
@@ -50,8 +49,6 @@ pub use ether_macos::MulticastEtherFace;
 pub use ether_windows::MulticastEtherFace;
 #[cfg(target_os = "linux")]
 pub use multicast_ether::MulticastEtherFace;
-
-
 
 #[cfg(target_os = "linux")]
 pub use neighbor::NeighborDiscovery;

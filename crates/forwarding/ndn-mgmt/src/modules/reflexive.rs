@@ -15,8 +15,8 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use ndn_mgmt_wire::{ControlParameters, ControlResponse, control_response::status};
 use ndn_engine::ForwarderEngine;
+use ndn_mgmt_wire::{ControlParameters, ControlResponse, control_response::status};
 
 use crate::MgmtResponse;
 use crate::module::{MgmtContext, MgmtModule};

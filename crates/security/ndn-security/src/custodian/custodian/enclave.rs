@@ -119,7 +119,7 @@ impl Custodian for EnclaveCustodian {
 mod tests {
     use super::*;
     use crate::verifier::EcdsaSha256Verifier;
-    use crate::{EcdsaP256Signer, Signer, VerifyOutcome, Verifier};
+    use crate::{EcdsaP256Signer, Signer, Verifier, VerifyOutcome};
 
     /// A software stand-in for the platform enclave: a P-256 key whose `sign`
     /// stands in for the biometric-gated Keystore / Secure-Enclave op.

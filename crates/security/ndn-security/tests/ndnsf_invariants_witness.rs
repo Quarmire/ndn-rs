@@ -24,7 +24,10 @@ fn nsf_t2_capability_expires_after_window() {
     let signer = n("/muas/alice/KEY/k1");
     let op = n("/svc/mavlink/execute");
     assert_eq!(cap.authorizes(&signer, &op, 199), Ok(()));
-    assert_eq!(cap.authorizes(&signer, &op, 200), Err(CapabilityError::Expired));
+    assert_eq!(
+        cap.authorizes(&signer, &op, 200),
+        Err(CapabilityError::Expired)
+    );
 }
 
 /// NSF-T4 — "Using an expired token must fail." A capability whose window has
@@ -102,9 +105,10 @@ fn nsf_f4_malformed_payload_rejected_at_decode() {
 fn nsf_f5_primitives_fail_closed() {
     let cap = Capability::new(n("/muas/alice"), n("/svc/mavlink"), 100, 200);
     // Every dimension wrong: wrong principal, out-of-scope op, outside window.
-    assert!(cap
-        .authorizes(&n("/muas/mallory/KEY/k1"), &n("/svc/camera/capture"), 999)
-        .is_err());
+    assert!(
+        cap.authorizes(&n("/muas/mallory/KEY/k1"), &n("/svc/camera/capture"), 999)
+            .is_err()
+    );
 
     // No "accidental allow": a valid capability still refuses an out-of-scope op.
     assert_eq!(

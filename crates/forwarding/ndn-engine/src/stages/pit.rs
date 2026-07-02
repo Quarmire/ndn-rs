@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use smallvec::SmallVec;
+use std::sync::Arc;
 use tracing::trace;
 
 use crate::observability::targets as t;
@@ -412,7 +412,15 @@ impl PitMatchStage {
             arrival,
         );
         if let Some(alt) = stripped_token.as_ref() {
-            self.consume_entry(alt, false, &mut faces, &mut tokens, &mut seen, &mut fan_out, arrival);
+            self.consume_entry(
+                alt,
+                false,
+                &mut faces,
+                &mut tokens,
+                &mut seen,
+                &mut fan_out,
+                arrival,
+            );
         }
 
         // CanBePrefix walk: at each shorter prefix only CanBePrefix in-records
@@ -423,7 +431,15 @@ impl PitMatchStage {
                 PitKeyDiscriminator::Classical,
             ] {
                 let tok = PitToken::from_name_hash_keyed(prefix_hash, None, disc);
-                self.consume_entry(&tok, true, &mut faces, &mut tokens, &mut seen, &mut fan_out, arrival);
+                self.consume_entry(
+                    &tok,
+                    true,
+                    &mut faces,
+                    &mut tokens,
+                    &mut seen,
+                    &mut fan_out,
+                    arrival,
+                );
             }
         }
 
@@ -1181,13 +1197,15 @@ mod persistent_tests {
         // The subscriber's (sole) face is torn down: entry removed, surviving
         // budget parked in the orphan index.
         pit.remove_face(1);
-        assert!(!pit.contains(&token), "sole-consumer entry removed on face down");
+        assert!(
+            !pit.contains(&token),
+            "sole-consumer entry removed on face down"
+        );
         assert_eq!(pit.orphan_count(), 1, "surviving budget parked");
 
         // Re-express the *same* subscription on the reconnected face: the
         // remaining 3 is spliced back, not reset to the full 5.
-        let wire2 =
-            build_persistent_interest_with_id("/persistent/churn", 5, 60, Some(id.clone()));
+        let wire2 = build_persistent_interest_with_id("/persistent/churn", 5, 60, Some(id.clone()));
         assert!(matches!(run_check(&check, wire2), Action::Continue(_)));
         pit.with_entry(&token, |e| {
             assert_eq!(
@@ -1222,7 +1240,8 @@ mod persistent_tests {
         assert!(matches!(run_check(&check, wire), Action::Continue(_)));
 
         // Simulate the forwarder having sent the Interest upstream out face 2.
-        pit.with_entry_mut(&token, |e| e.add_out_record(2, 7, 0)).unwrap();
+        pit.with_entry_mut(&token, |e| e.add_out_record(2, 7, 0))
+            .unwrap();
 
         // A second subscriber re-expressing now would aggregate-suppress
         // (upstream Interest still pending).
@@ -1230,9 +1249,14 @@ mod persistent_tests {
         let mut ctx = PacketContext::new(wire_agg.clone(), FaceId(1), 0);
         ctx.packet =
             DecodedPacket::Interest(Box::new(ndn_packet::Interest::decode(wire_agg).unwrap()));
-        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
         assert!(
-            matches!(rt.block_on(check.process(ctx)), Action::Drop(DropReason::Suppressed)),
+            matches!(
+                rt.block_on(check.process(ctx)),
+                Action::Drop(DropReason::Suppressed)
+            ),
             "with a live upstream out-record, a re-express must aggregate"
         );
 

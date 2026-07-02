@@ -136,10 +136,9 @@ impl BloomFilter {
             .append_component(NameComponent::generic(Bytes::from(encode_nni(
                 self.projected_element_count as u64,
             ))));
-        let with_fpp =
-            with_count.append_component(NameComponent::generic(Bytes::from(encode_nni(
-                (self.false_positive_probability * 1000.0) as u64,
-            ))));
+        let with_fpp = with_count.append_component(NameComponent::generic(Bytes::from(
+            encode_nni((self.false_positive_probability * 1000.0) as u64),
+        )));
         with_fpp.append_component(NameComponent::generic(Bytes::from(self.bit_table.clone())))
     }
 
@@ -169,7 +168,10 @@ impl std::fmt::Display for BloomError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             BloomError::SizeMismatch { expected, got } => {
-                write!(f, "bloom filter cannot be decoded: expected {expected} bytes, got {got}")
+                write!(
+                    f,
+                    "bloom filter cannot be decoded: expected {expected} bytes, got {got}"
+                )
             }
             BloomError::InvalidParams => {
                 write!(f, "bloom filter cannot be decoded: count/fpp out of range")
@@ -349,7 +351,10 @@ mod tests {
         let bits = vec![0u8; bf.bit_table.len()];
         assert_eq!(
             BloomFilter::from_bits(200, 0.001, &bits).unwrap_err(),
-            BloomError::SizeMismatch { expected: 360, got: 180 },
+            BloomError::SizeMismatch {
+                expected: 360,
+                got: 180
+            },
         );
     }
 

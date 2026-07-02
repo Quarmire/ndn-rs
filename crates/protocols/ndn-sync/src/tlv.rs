@@ -132,7 +132,17 @@ mod tests {
 
     #[test]
     fn nni_roundtrip() {
-        for v in [0u64, 1, 0xFE, 0xFF, 0x100, 0xFFFF, 0x1_0000, u32::MAX as u64, u64::MAX] {
+        for v in [
+            0u64,
+            1,
+            0xFE,
+            0xFF,
+            0x100,
+            0xFFFF,
+            0x1_0000,
+            u32::MAX as u64,
+            u64::MAX,
+        ] {
             assert_eq!(decode_nni(&encode_nni(v)), v);
         }
     }

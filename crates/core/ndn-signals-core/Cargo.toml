@@ -3,6 +3,7 @@ name = "ndn-signals-core"
 description = "Canonical, runtime-agnostic cross-layer signal taxonomy + SignalView/SignalStore traits (sans-IO; shared by the native engine and the embedded forwarder)"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [package.metadata.scope]
@@ -15,3 +16,6 @@ classification = "spec"
 default = []
 
 [dependencies]
+
+[lints]
+workspace = true

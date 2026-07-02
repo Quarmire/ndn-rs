@@ -33,7 +33,6 @@ pub use ndn_packet::fragment::DEFAULT_UDP_MTU;
 
 pub use any_map::AnyMap;
 pub use congestion::CongestionController;
-pub use link_profile::LinkProfile;
 pub use face::{
     CongestionPolicy, Face, FaceAddr, FaceError, FaceId, FaceKind, FacePersistency, FaceScope,
     LinkType, ip_face_uri,
@@ -47,6 +46,7 @@ pub use face_pair_table::FacePairTable;
 pub use face_sink::FaceSink;
 pub use face_table::{FaceInfo, FaceTable};
 pub use forwarding::{ForwardingAction, NackReason};
+pub use link_profile::LinkProfile;
 pub use link_service::{
     LinkService, LinkServiceFrame, LpLinkService, PassthroughLinkService,
     default_link_service_for_kind,

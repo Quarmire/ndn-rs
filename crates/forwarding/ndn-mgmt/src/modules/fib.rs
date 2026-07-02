@@ -2,13 +2,13 @@
 //! FIB manipulation (bypasses the RIB).
 
 use async_trait::async_trait;
+use ndn_engine::ForwarderEngine;
 use ndn_mgmt_wire::{
     ControlParameters, ControlResponse,
     control_response::status,
     nfd_command::{module, verb},
     nfd_dataset,
 };
-use ndn_engine::ForwarderEngine;
 use ndn_transport::FaceId;
 
 use super::common::{is_management_face, is_reserved_name, resolve_face_id};

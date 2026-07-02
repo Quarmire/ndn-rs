@@ -108,7 +108,11 @@ impl DataStore for MemoryStore {
     }
 
     fn get(&self, name: &Name) -> Option<Bytes> {
-        self.map.read().expect("MemoryStore poisoned").get(name).cloned()
+        self.map
+            .read()
+            .expect("MemoryStore poisoned")
+            .get(name)
+            .cloned()
     }
 
     fn find_under(&self, prefix: &Name) -> Option<Bytes> {
@@ -186,8 +190,11 @@ pub struct SvSync {
 /// Lets a repo gate ingestion on a trust check without coupling `ndn-sync` to
 /// any security crate: the caller supplies the closure (e.g. wrapping an
 /// `ndn_security::Validator`).
-pub type IngestValidator =
-    Arc<dyn Fn(Bytes) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>> + Send + Sync>;
+pub type IngestValidator = Arc<
+    dyn Fn(Bytes) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+        + Send
+        + Sync,
+>;
 
 /// A publisher's signing material for outbound publications, supplied as a
 /// closure so `ndn-sync` stays free of any security crate (mirrors
@@ -311,7 +318,9 @@ impl SvSync {
     /// default `DigestSha256`.
     fn sign_or_build(&self, builder: DataBuilder) -> Bytes {
         match &self.publisher_signer {
-            Some(s) => builder.sign_sync(s.sig_type, Some(&s.key_locator), |region| (s.sign)(region)),
+            Some(s) => {
+                builder.sign_sync(s.sig_type, Some(&s.key_locator), |region| (s.sign)(region))
+            }
             None => builder.build(),
         }
     }
@@ -348,7 +357,11 @@ impl SvSync {
         // for its own id, so the core's counter tracks `self.seq`) and
         // multicast the new state vector.
         match make_mapping(seq) {
-            Some(mapping) => self.handle.publish_with_mapping(self.node.clone(), mapping).await?,
+            Some(mapping) => {
+                self.handle
+                    .publish_with_mapping(self.node.clone(), mapping)
+                    .await?
+            }
             None => self.handle.publish(self.node.clone()).await?,
         }
         Ok(seq)
@@ -377,7 +390,11 @@ impl SvSync {
             self.store.insert(name, wire);
         }
         match make_mapping(seq) {
-            Some(mapping) => self.handle.publish_with_mapping(self.node.clone(), mapping).await?,
+            Some(mapping) => {
+                self.handle
+                    .publish_with_mapping(self.node.clone(), mapping)
+                    .await?
+            }
             None => self.handle.publish(self.node.clone()).await?,
         }
         Ok(seq)
@@ -432,7 +449,8 @@ impl SvSync {
     /// Unlike [`Self::fetch_publication`] (which returns decoded *content*),
     /// this keeps the signed wire so it can be re-served byte-for-byte.
     pub async fn ingest_publication(&self, node: &Name, seq: u64) -> usize {
-        self.ingest_from(svs_data_name(node, &self.group, seq)).await
+        self.ingest_from(svs_data_name(node, &self.group, seq))
+            .await
     }
 
     /// Like [`Self::ingest_publication`] but for an arbitrary blob name (the
@@ -555,15 +573,16 @@ impl SvSync {
             let net_out = net_out.clone();
             let pending = Arc::clone(&pending);
             let retry = retry.clone();
-            Box::pin(async move {
-                express_with_retry(name, &net_out, &pending, &retry, timeout).await
-            }) as crate::transfer::ExpressFut
+            Box::pin(
+                async move { express_with_retry(name, &net_out, &pending, &retry, timeout).await },
+            ) as crate::transfer::ExpressFut
         })
     }
 
     /// Fetch one publication's payload, with windowed-equivalent retry.
     pub async fn fetch(&self, node: &Name, seq: u64) -> Option<Bytes> {
-        self.fetch_name(&svs_data_name(node, &self.group, seq)).await
+        self.fetch_name(&svs_data_name(node, &self.group, seq))
+            .await
     }
 
     /// Fetch an arbitrary exact Data name through the correlated fetcher
@@ -606,14 +625,13 @@ impl SvSync {
             let res_tx = res_tx.clone();
             rt::spawn(async move {
                 let _permit = permit;
-                let payload = match express_with_retry(name, &net_out, &pending, &retry, timeout)
-                    .await
-                {
-                    Some(wire) => Data::decode(wire)
-                        .ok()
-                        .map(|d| d.content().cloned().unwrap_or_default()),
-                    None => None,
-                };
+                let payload =
+                    match express_with_retry(name, &net_out, &pending, &retry, timeout).await {
+                        Some(wire) => Data::decode(wire)
+                            .ok()
+                            .map(|d| d.content().cloned().unwrap_or_default()),
+                        None => None,
+                    };
                 let _ = res_tx.send((seq, payload)).await;
             });
         }
@@ -752,7 +770,10 @@ async fn express_once(
     timeout: Duration,
 ) -> Option<Bytes> {
     let (tx, rx) = oneshot::channel();
-    pending.lock().await.insert(name.clone(), (can_be_prefix, tx));
+    pending
+        .lock()
+        .await
+        .insert(name.clone(), (can_be_prefix, tx));
 
     let mut builder = InterestBuilder::new(name.clone())
         .must_be_fresh()
@@ -847,9 +868,18 @@ mod tests {
         // CanBePrefix on the seq name must resolve to segment 0.
         let s = MemoryStore::new();
         let seq = name("/n/g/5");
-        s.insert(seq.clone().append_version(0).append_segment(2), Bytes::from_static(b"s2"));
-        s.insert(seq.clone().append_version(0).append_segment(0), Bytes::from_static(b"s0"));
-        s.insert(seq.clone().append_version(0).append_segment(1), Bytes::from_static(b"s1"));
+        s.insert(
+            seq.clone().append_version(0).append_segment(2),
+            Bytes::from_static(b"s2"),
+        );
+        s.insert(
+            seq.clone().append_version(0).append_segment(0),
+            Bytes::from_static(b"s0"),
+        );
+        s.insert(
+            seq.clone().append_version(0).append_segment(1),
+            Bytes::from_static(b"s1"),
+        );
         assert_eq!(s.find_under(&seq).as_deref(), Some(&b"s0"[..]));
         // No prefixed entry → None.
         assert_eq!(s.find_under(&name("/n/g/6")), None);
@@ -910,10 +940,19 @@ mod tests {
             content_type: Some(ContentType::Other(6)),
             ..Default::default()
         };
-        let svs = SvSync::join(group.clone(), node.clone(), Arc::clone(&store), out_tx, in_rx, config);
+        let svs = SvSync::join(
+            group.clone(),
+            node.clone(),
+            Arc::clone(&store),
+            out_tx,
+            in_rx,
+            config,
+        );
 
         let seq = svs.publish_data(b"inner").await.expect("publish");
-        let wire = store.get(&svs_data_name(&node, &group, seq)).expect("stored");
+        let wire = store
+            .get(&svs_data_name(&node, &group, seq))
+            .expect("stored");
         let data = Data::decode(wire).expect("decode");
         assert_eq!(
             data.meta_info().map(|m| m.content_type),
@@ -925,7 +964,14 @@ mod tests {
         let (o2, _) = mpsc::channel::<Bytes>(256);
         let (_i2tx, i2) = mpsc::channel::<Bytes>(256);
         let store2: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
-        let svs2 = SvSync::join(group.clone(), node.clone(), Arc::clone(&store2), o2, i2, SvSyncConfig::default());
+        let svs2 = SvSync::join(
+            group.clone(),
+            node.clone(),
+            Arc::clone(&store2),
+            o2,
+            i2,
+            SvSyncConfig::default(),
+        );
         let seq2 = svs2.publish_data(b"plain").await.expect("publish");
         let d2 = Data::decode(store2.get(&svs_data_name(&node, &group, seq2)).unwrap()).unwrap();
         assert_eq!(
@@ -1050,7 +1096,14 @@ mod tests {
         };
 
         let store_a: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
-        let svs_a = SvSync::join(group.clone(), na.clone(), store_a, a_out_tx, a_in_rx, cfg.clone());
+        let svs_a = SvSync::join(
+            group.clone(),
+            na.clone(),
+            store_a,
+            a_out_tx,
+            a_in_rx,
+            cfg.clone(),
+        );
 
         // Keep a concrete handle to B's store so we can prove it serves later.
         let store_b = Arc::new(MemoryStore::new());
@@ -1063,7 +1116,10 @@ mod tests {
             cfg,
         );
 
-        svs_a.publish_data(b"durable-payload").await.expect("publish");
+        svs_a
+            .publish_data(b"durable-payload")
+            .await
+            .expect("publish");
         // Wait until B has learned about A through sync.
         tokio::time::timeout(Duration::from_secs(3), svs_b.recv_update())
             .await
@@ -1078,14 +1134,19 @@ mod tests {
         // B's store now holds the raw wire under the canonical publication name
         // and re-serves it byte-for-byte (producer no longer required).
         let data_name = svs_data_name(&na, &group, 1);
-        let wire = store_b.get(&data_name).expect("repo persisted the raw wire");
+        let wire = store_b
+            .get(&data_name)
+            .expect("repo persisted the raw wire");
         let data = Data::decode(wire).expect("stored wire is a valid Data");
         assert_eq!(data.content().unwrap().as_ref(), b"durable-payload");
 
         // Resume / idempotence: re-ingesting an already-stored publication is a
         // no-op (no re-fetch) — the durable store is the resume state.
         let again = svs_b.ingest_publication(&na, 1).await;
-        assert_eq!(again, 0, "already-stored publication must not be re-fetched");
+        assert_eq!(
+            again, 0,
+            "already-stored publication must not be re-fetched"
+        );
     }
 
     /// Fail-closed trust: with an ingest validator that rejects everything,
@@ -1115,13 +1176,24 @@ mod tests {
         });
 
         let cfg = SvSyncConfig {
-            svs: SvsConfig { sync_interval: Duration::from_millis(50), jitter_ms: 0, ..Default::default() },
+            svs: SvsConfig {
+                sync_interval: Duration::from_millis(50),
+                jitter_ms: 0,
+                ..Default::default()
+            },
             fetch_timeout: Duration::from_secs(2),
             ..Default::default()
         };
 
         let store_a: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
-        let svs_a = SvSync::join(group.clone(), na.clone(), store_a, a_out_tx, a_in_rx, cfg.clone());
+        let svs_a = SvSync::join(
+            group.clone(),
+            na.clone(),
+            store_a,
+            a_out_tx,
+            a_in_rx,
+            cfg.clone(),
+        );
 
         let store_b = Arc::new(MemoryStore::new());
         let mut svs_b = SvSync::join(
@@ -1134,7 +1206,8 @@ mod tests {
         );
         // Reject-all gate.
         svs_b.set_ingest_validator(Arc::new(|_wire: Bytes| {
-            Box::pin(async { false }) as std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+            Box::pin(async { false })
+                as std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
         }));
 
         svs_a.publish_data(b"unverified").await.expect("publish");

@@ -3,6 +3,7 @@ name = "ndn-rs-prelude"
 description = "ndn-rs Develop-tier umbrella: curated re-exports of the application-author API surface."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [package.metadata.scope]
@@ -38,3 +39,6 @@ ndn-security = { path = "../../security/ndn-security", default-features = false 
 # path (Phase-4 wiki documents this split).
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 ndn-app = { workspace = true }
+
+[lints]
+workspace = true

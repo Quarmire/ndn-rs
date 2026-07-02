@@ -764,7 +764,7 @@ mod tests {
         // A remote consumer decodes the Content (version from the RDR name) and
         // adopts it with anti-rollback.
         let content = data.content().expect("has content");
-        let decoded = SignedTrustContext::decode_content(&content, ctx.version()).expect("decode");
+        let decoded = SignedTrustContext::decode_content(content, ctx.version()).expect("decode");
         assert_eq!(decoded.version(), 3);
         assert_eq!(decoded.namespace(), ctx.namespace());
 

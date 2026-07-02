@@ -5,10 +5,10 @@ use std::time::Duration;
 
 use bytes::Bytes;
 
-#[cfg(target_arch = "wasm32")]
-use ndn_face_local::InProcHandle;
 #[cfg(not(target_arch = "wasm32"))]
 use ndn_face::local::InProcHandle;
+#[cfg(target_arch = "wasm32")]
+use ndn_face_local::InProcHandle;
 #[cfg(not(target_arch = "wasm32"))]
 use ndn_ipc::ForwarderClient;
 use ndn_packet::encode::InterestBuilder;
@@ -33,8 +33,8 @@ async fn send_segment_interest(
     seg: u64,
     forwarding_hint: &[Name],
 ) -> Result<(), AppError> {
-    let mut b =
-        InterestBuilder::new(versioned.clone().append_segment(seg)).lifetime(DEFAULT_INTEREST_LIFETIME);
+    let mut b = InterestBuilder::new(versioned.clone().append_segment(seg))
+        .lifetime(DEFAULT_INTEREST_LIFETIME);
     if !forwarding_hint.is_empty() {
         b = b.forwarding_hint(forwarding_hint.to_vec());
     }
@@ -427,7 +427,8 @@ impl Consumer {
     /// ndnd `std/object/client_consume.go:22`; pair with
     /// [`Producer::publish_object`](crate::Producer::publish_object).
     pub async fn fetch_object(&mut self, name: impl Into<Name>) -> Result<Bytes, AppError> {
-        self.fetch_object_inner(name.into(), None, &[], |_, _| {}).await
+        self.fetch_object_inner(name.into(), None, &[], |_, _| {})
+            .await
     }
 
     /// Verified whole-object fetch — the **secure** RDR path: like
@@ -437,7 +438,10 @@ impl Consumer {
     /// integrity-checked. Prefer [`VerifiedConsumer::fetch_object`] (the
     /// least-resistance safe verb); this exists so the raw consumer can do a
     /// verified object fetch too.
-    #[deprecated(since = "0.1.0", note = "use `consumer.object(name).verify(v).fetch()`")]
+    #[deprecated(
+        since = "0.1.0",
+        note = "use `consumer.object(name).verify(v).fetch()`"
+    )]
     pub async fn fetch_object_verified(
         &mut self,
         name: impl Into<Name>,
@@ -611,7 +615,10 @@ impl Consumer {
     /// arrives — no validation, no resume. See
     /// [`fetch_object_streaming`](Self::fetch_object_streaming) for the
     /// verified / resumable form.
-    #[deprecated(since = "0.1.0", note = "use `consumer.object(name).stream(|_| false, on_segment)`")]
+    #[deprecated(
+        since = "0.1.0",
+        note = "use `consumer.object(name).stream(|_| false, on_segment)`"
+    )]
     pub async fn fetch_object_into(
         &mut self,
         name: impl Into<Name>,
@@ -822,7 +829,9 @@ impl Consumer {
                     let marked = is_lp_packet(&wire)
                         && LpPacket::decode(wire.clone())
                             .is_ok_and(|lp| lp.congestion_mark.is_some());
-                    let Ok(data) = decode_data_lp(wire) else { continue };
+                    let Ok(data) = decode_data_lp(wire) else {
+                        continue;
+                    };
                     let Some(seg) = data.name.components().last().and_then(|c| c.as_segment())
                     else {
                         continue;
@@ -1134,7 +1143,11 @@ fn fresh_subscription_id() -> Bytes {
 /// a validated, signed subscription Interest — an unsigned one degrades to
 /// one-shot (`ndn-engine` `check_persistent`). DigestSha256 keys no identity; a
 /// trust-schema-bearing deployment can swap in a real signer.
-fn build_persistent_interest(prefix: &Name, opts: &SubscribeOptions, subscription_id: &Bytes) -> Bytes {
+fn build_persistent_interest(
+    prefix: &Name,
+    opts: &SubscribeOptions,
+    subscription_id: &Bytes,
+) -> Bytes {
     let secs = (opts.lifetime.as_secs() as u32).min(MAX_PERSISTENT_LIFETIME_SECS);
     let sr = SubscriptionRequest {
         version: 1,
@@ -1270,12 +1283,14 @@ mod subscription_tests {
         let opts = SubscribeOptions::default();
         let a = build_persistent_interest(&Name::from("/s"), &opts, &id);
         let b = build_persistent_interest(&Name::from("/s"), &opts, &id);
-        let ida = SubscriptionRequest::find_in(Interest::decode(a).unwrap().app_parameters().unwrap())
-            .unwrap()
-            .subscription_id;
-        let idb = SubscriptionRequest::find_in(Interest::decode(b).unwrap().app_parameters().unwrap())
-            .unwrap()
-            .subscription_id;
+        let ida =
+            SubscriptionRequest::find_in(Interest::decode(a).unwrap().app_parameters().unwrap())
+                .unwrap()
+                .subscription_id;
+        let idb =
+            SubscriptionRequest::find_in(Interest::decode(b).unwrap().app_parameters().unwrap())
+                .unwrap()
+                .subscription_id;
         assert_eq!(ida, idb);
         assert_eq!(ida, Some(id));
     }
@@ -1296,8 +1311,7 @@ mod subscription_tests {
     #[async_trait::async_trait]
     impl Connection for StaleConn {
         async fn send(&self, _wire: Bytes) -> Result<(), AppError> {
-            self.sends
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.sends.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
         async fn recv(&self) -> Option<Bytes> {
@@ -1373,8 +1387,7 @@ mod subscription_tests {
     impl Connection for SegServer {
         async fn send(&self, wire: Bytes) -> Result<(), AppError> {
             use ndn_packet::encode::DataBuilder;
-            let interest =
-                Interest::decode(wire).map_err(|e| AppError::Protocol(e.to_string()))?;
+            let interest = Interest::decode(wire).map_err(|e| AppError::Protocol(e.to_string()))?;
             let Some(last) = interest.name.components().last().cloned() else {
                 return Ok(());
             };
@@ -1394,11 +1407,9 @@ mod subscription_tests {
             } else if let Some(seg) = last.as_segment()
                 && seg <= self.last_seg
             {
-                let data = DataBuilder::new(
-                    self.versioned.clone().append_segment(seg),
-                    &[seg as u8; 10],
-                )
-                .build();
+                let data =
+                    DataBuilder::new(self.versioned.clone().append_segment(seg), &[seg as u8; 10])
+                        .build();
                 self.q.lock().unwrap().push_back(data);
             }
             Ok(())
@@ -1451,10 +1462,17 @@ mod subscription_tests {
             .expect("streamed fetch");
 
         let mut buf = vec![0u8; 500];
-        std::fs::File::open(&path).unwrap().read_exact_at(&mut buf, 0).unwrap();
+        std::fs::File::open(&path)
+            .unwrap()
+            .read_exact_at(&mut buf, 0)
+            .unwrap();
         for i in 0..50u64 {
             let s = i as usize * 10;
-            assert_eq!(&buf[s..s + 10], &vec![i as u8; 10][..], "segment {i} at offset");
+            assert_eq!(
+                &buf[s..s + 10],
+                &vec![i as u8; 10][..],
+                "segment {i} at offset"
+            );
         }
         std::fs::remove_file(&path).ok();
     }

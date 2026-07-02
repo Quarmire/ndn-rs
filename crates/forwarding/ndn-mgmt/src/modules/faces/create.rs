@@ -1,8 +1,8 @@
 //! `faces/create` — URI-scheme dispatch and per-transport face dialing,
 //! plus idempotent re-attach of an existing face.
 
-use ndn_mgmt_wire::{ControlParameters, ControlResponse, control_response::status};
 use ndn_engine::ForwarderEngine;
+use ndn_mgmt_wire::{ControlParameters, ControlResponse, control_response::status};
 use ndn_transport::{
     BIT_CONGESTION_MARKING, BIT_LOCAL_FIELDS, BIT_LP_RELIABILITY, FaceId, FaceOption,
     FacePersistency,
@@ -380,5 +380,3 @@ pub(super) fn parse_ether_uri(uri: &str) -> Result<(ndn_transport::MacAddr, Stri
         .map_err(|_| format!("invalid peer MAC '{mac_str}'"))?;
     Ok((peer_mac, iface.to_owned()))
 }
-
-

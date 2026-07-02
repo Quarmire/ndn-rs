@@ -169,7 +169,7 @@ mod tests {
         let express: Express = Arc::new(|name: Name| {
             Box::pin(async move {
                 let seg = name.components().last().unwrap().as_segment().unwrap();
-                if seg % 2 == 0 {
+                if seg.is_multiple_of(2) {
                     Some(DataBuilder::new(name, format!("seg{seg}").as_bytes()).build())
                 } else {
                     None

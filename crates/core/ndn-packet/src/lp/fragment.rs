@@ -108,9 +108,13 @@ pub fn extract_acks(raw: &[u8]) -> (Option<u64>, smallvec::SmallVec<[u64; 8]>) {
         };
         let Some(np) = pos.checked_add(ln) else { break };
         pos = np;
-        let Some(l) = usize::try_from(l).ok() else { break };
+        let Some(l) = usize::try_from(l).ok() else {
+            break;
+        };
         let Some(end) = pos.checked_add(l) else { break };
-        let Some(val) = inner.get(pos..end) else { break };
+        let Some(val) = inner.get(pos..end) else {
+            break;
+        };
         match t {
             0x0348 => tx_seq = Some(decode_be_u64(val)),
             0x0344 => acks.push(decode_be_u64(val)),

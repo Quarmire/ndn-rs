@@ -33,10 +33,10 @@ pub mod wire;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod listeners;
 
-#[cfg(not(target_arch = "wasm32"))]
-pub use listeners::{run_face_listener, run_face_listener_as, run_tcp_listener, run_udp_listener};
 #[cfg(all(unix, not(target_arch = "wasm32")))]
 pub use listeners::mount_app_face_from_fd;
+#[cfg(not(target_arch = "wasm32"))]
+pub use listeners::{run_face_listener, run_face_listener_as, run_tcp_listener, run_udp_listener};
 #[cfg(not(target_arch = "wasm32"))]
 pub use modules::MgmtAccessPolicy;
 #[cfg(not(target_arch = "wasm32"))]
@@ -52,13 +52,13 @@ pub use module::{CaInfo, MgmtConfig, MgmtContext, MgmtModule, MgmtRouter};
 // Re-exported for out-of-core mgmt modules (e.g. ndn-discovery's service module)
 // that enforce the same operator/reserved-name policy as the built-ins.
 pub use modules::common::{is_management_face, is_reserved_name};
-pub use modules::faces::{FaceEvent, FaceEventKind};
-pub use ndn_mgmt_wire::{ControlInfo, ControlStats, ControlSurface};
 pub use modules::faces::provision::{
     FaceProvisioner, ProvisionError, ProvisionRequest, ProvisionedFace,
 };
+pub use modules::faces::{FaceEvent, FaceEventKind};
 pub use modules::rib::{RouteEvent, RouteEventKind};
 pub use modules::strategy::{StrategyEvent, StrategyEventKind};
+pub use ndn_mgmt_wire::{ControlInfo, ControlStats, ControlSurface};
 pub use notification::{NotificationEvent, NotificationStream};
 
 use auth::{

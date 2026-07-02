@@ -34,7 +34,9 @@ async fn priority_egress_forwards_both_classes() {
         .build()
         .await
         .expect("engine build");
-    engine.fib().add_nexthop(&"/".parse().unwrap(), FaceId(B), 0);
+    engine
+        .fib()
+        .add_nexthop(&"/".parse().unwrap(), FaceId(B), 0);
 
     // Producer side: answer each forwarded Interest with Data for the same name.
     let producer = tokio::spawn(async move {
@@ -54,7 +56,10 @@ async fn priority_egress_forwards_both_classes() {
         let got = tokio::time::timeout(Duration::from_secs(2), handle_a.recv())
             .await
             .unwrap_or_else(|_| panic!("Data for {name} timed out via the priority egress"));
-        assert!(got.is_some(), "Data for {name} returned through the scheduler");
+        assert!(
+            got.is_some(),
+            "Data for {name} returned through the scheduler"
+        );
     }
 
     producer.await.unwrap();
@@ -79,7 +84,9 @@ async fn drr_egress_forwards() {
         .build()
         .await
         .expect("engine build");
-    engine.fib().add_nexthop(&"/".parse().unwrap(), FaceId(B), 0);
+    engine
+        .fib()
+        .add_nexthop(&"/".parse().unwrap(), FaceId(B), 0);
 
     let producer = tokio::spawn(async move {
         let _i = handle_b.recv().await.expect("forwarded interest");

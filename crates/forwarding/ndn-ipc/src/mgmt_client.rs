@@ -6,11 +6,11 @@ use std::sync::Arc;
 use bytes::Bytes;
 use tokio::sync::Mutex;
 
+use ndn_face::local::IpcFace;
 use ndn_mgmt_wire::{
     ControlParameters, ControlResponse,
     nfd_command::{command_name, dataset_name, module, verb},
 };
-use ndn_face::local::IpcFace;
 use ndn_packet::{Name, encode::InterestBuilder};
 use ndn_security::Signer;
 use ndn_transport::{FaceId, Transport};
@@ -53,9 +53,8 @@ fn expected_response_name(interest_wire: &Bytes) -> Result<Name, ForwarderError>
 
 impl MgmtClient {
     pub async fn connect(face_socket: impl AsRef<str>) -> Result<Self, ForwarderError> {
-        let face = Arc::new(
-            ndn_face::local::ipc_face_connect(FaceId(0), face_socket.as_ref()).await?,
-        );
+        let face =
+            Arc::new(ndn_face::local::ipc_face_connect(FaceId(0), face_socket.as_ref()).await?);
         Ok(Self {
             face,
             recv: MgmtRecv::Face,
@@ -92,7 +91,9 @@ impl MgmtClient {
         match &self.recv {
             MgmtRecv::Face => {
                 self.face.send_bytes(lp).await?;
-                Ok(crate::forwarder_client::strip_lp(self.face.recv_bytes().await?))
+                Ok(crate::forwarder_client::strip_lp(
+                    self.face.recv_bytes().await?,
+                ))
             }
             MgmtRecv::Mux(mux) => {
                 let rx = mux.expect(expected_response_name(interest_wire)?);
@@ -288,7 +289,9 @@ impl MgmtClient {
     }
 
     /// `strategy-choice/list` decoded as NFD `StrategyChoice` entries.
-    pub async fn strategy_list(&self) -> Result<Vec<ndn_mgmt_wire::StrategyChoice>, ForwarderError> {
+    pub async fn strategy_list(
+        &self,
+    ) -> Result<Vec<ndn_mgmt_wire::StrategyChoice>, ForwarderError> {
         let bytes = self.dataset_raw(module::STRATEGY, verb::LIST).await?;
         Ok(ndn_mgmt_wire::StrategyChoice::decode_all(&bytes))
     }

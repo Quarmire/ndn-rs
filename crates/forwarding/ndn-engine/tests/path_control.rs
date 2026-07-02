@@ -60,7 +60,10 @@ fn signed_iu(signer: &Ed25519Signer, target: &Name, seq: u64) -> bytes::Bytes {
 }
 
 async fn recv_timeout(h: &InProcHandle) -> Option<bytes::Bytes> {
-    tokio::time::timeout(Duration::from_millis(500), h.recv()).await.ok().flatten()
+    tokio::time::timeout(Duration::from_millis(500), h.recv())
+        .await
+        .ok()
+        .flatten()
 }
 
 async fn fib_faces(engine: &ndn_engine::ForwarderEngine, target: &Name) -> Vec<FaceId> {
@@ -146,7 +149,10 @@ async fn redirect_preserves_other_nexthops() {
     }
     let faces = fib_faces(&engine, &target).await;
     assert!(faces.contains(&FaceId(NEW)), "arrival face added");
-    assert!(faces.contains(&FaceId(99)), "an unrelated alternative path must survive the IU");
+    assert!(
+        faces.contains(&FaceId(99)),
+        "an unrelated alternative path must survive the IU"
+    );
     shutdown.shutdown().await;
 }
 
@@ -282,7 +288,11 @@ async fn pipe_teardown_authorized_by_membership_not_signature() {
     // Wrong key ⇒ not a member ⇒ ignored.
     h_in.send(teardown(1, b"wrong-key")).await.unwrap();
     tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(fib_faces(&engine, &target).await, vec![FaceId(OLD)], "rogue teardown ignored");
+    assert_eq!(
+        fib_faces(&engine, &target).await,
+        vec![FaceId(OLD)],
+        "rogue teardown ignored"
+    );
     assert!(observer.torn.lock().unwrap().is_empty());
 
     // Right key ⇒ member ⇒ observer fired (reaps model state) + propagated. The handler
@@ -293,9 +303,20 @@ async fn pipe_teardown_authorized_by_membership_not_signature() {
     while start.elapsed() < Duration::from_secs(2) && observer.torn.lock().unwrap().is_empty() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert_eq!(observer.torn.lock().unwrap().as_slice(), std::slice::from_ref(&target), "observer notified");
-    assert_eq!(fib_faces(&engine, &target).await, vec![FaceId(OLD)], "namespace FIB left intact");
-    assert!(recv_timeout(&h_b).await.is_some(), "teardown propagates along the path");
+    assert_eq!(
+        observer.torn.lock().unwrap().as_slice(),
+        std::slice::from_ref(&target),
+        "observer notified"
+    );
+    assert_eq!(
+        fib_faces(&engine, &target).await,
+        vec![FaceId(OLD)],
+        "namespace FIB left intact"
+    );
+    assert!(
+        recv_timeout(&h_b).await.is_some(),
+        "teardown propagates along the path"
+    );
 
     shutdown.shutdown().await;
 }

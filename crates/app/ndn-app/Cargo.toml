@@ -3,6 +3,7 @@ name = "ndn-app"
 description = "NDN application API: Consumer, Producer, KeyChain, AppFace"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [package.metadata.scope]
@@ -71,3 +72,6 @@ tokio         = { workspace = true, features = ["rt", "macros", "time"] }
 # Multicast forwarding so SVS sync Interests fan out across in-process faces
 # (the engine-backed Node publish/subscribe round-trip test).
 ndn-strategy  = { workspace = true }
+
+[lints]
+workspace = true

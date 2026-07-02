@@ -35,7 +35,12 @@ async fn rig() -> (
 
 fn report(label: &str, elapsed: std::time::Duration) {
     let mbps = (OBJ_SIZE as f64 * 8.0) / elapsed.as_secs_f64() / 1e6;
-    eprintln!("{label}: {} MB in {:.3}s = {:.0} Mbps", OBJ_SIZE >> 20, elapsed.as_secs_f64(), mbps);
+    eprintln!(
+        "{label}: {} MB in {:.3}s = {:.0} Mbps",
+        OBJ_SIZE >> 20,
+        elapsed.as_secs_f64(),
+        mbps
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -69,7 +74,10 @@ async fn verified_with(kc: KeyChain, label: &str) {
 
     let mut consumer = Consumer::from_handle(consumer_handle).verifying(kc.validator());
     let started = Instant::now();
-    let got = consumer.fetch_object(prefix).await.expect("verified fetch_object");
+    let got = consumer
+        .fetch_object(prefix)
+        .await
+        .expect("verified fetch_object");
     report(label, started.elapsed());
     assert_eq!(got.len(), OBJ_SIZE);
 }
@@ -77,11 +85,19 @@ async fn verified_with(kc: KeyChain, label: &str) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "throughput measurement, run explicitly"]
 async fn verified_ed25519() {
-    verified_with(KeyChain::ephemeral("/obj").expect("keychain"), "verified Ed25519").await;
+    verified_with(
+        KeyChain::ephemeral("/obj").expect("keychain"),
+        "verified Ed25519",
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "throughput measurement, run explicitly"]
 async fn verified_ecdsa() {
-    verified_with(KeyChain::ephemeral_ecdsa("/obj").expect("keychain"), "verified ECDSA-P256 (mobile)").await;
+    verified_with(
+        KeyChain::ephemeral_ecdsa("/obj").expect("keychain"),
+        "verified ECDSA-P256 (mobile)",
+    )
+    .await;
 }

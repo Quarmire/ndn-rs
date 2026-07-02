@@ -136,10 +136,12 @@ impl Validator {
 
         let first_key: Arc<Name> = match &sig_info.key_locator {
             Some(KeyLocator::Name(n)) => Arc::new((**n).clone()),
-            Some(KeyLocator::KeyDigest(digest)) => match self.cert_cache.get_by_key_digest(digest) {
-                Some(cert) => Arc::clone(&cert.name),
-                None => return InterestValidationOutcome::Pending,
-            },
+            Some(KeyLocator::KeyDigest(digest)) => {
+                match self.cert_cache.get_by_key_digest(digest) {
+                    Some(cert) => Arc::clone(&cert.name),
+                    None => return InterestValidationOutcome::Pending,
+                }
+            }
             None => return InterestValidationOutcome::Invalid(TrustError::InvalidSignature),
         };
 

@@ -152,7 +152,10 @@ async fn await_convergence(
                     if i == j {
                         continue;
                     }
-                    let seen = per.and_then(|m| m.get(&nj.to_string())).copied().unwrap_or(0);
+                    let seen = per
+                        .and_then(|m| m.get(&nj.to_string()))
+                        .copied()
+                        .unwrap_or(0);
                     if seen < final_seq {
                         all = false;
                     }
@@ -191,8 +194,14 @@ async fn converges_under_loss_and_delay() {
     }));
     let partitioned = Arc::new(Mutex::new(vec![false; n]));
 
-    let (handles, names, learned) =
-        spawn_group(&group, n, fast_config(), Arc::clone(&shim), Arc::clone(&partitioned)).await;
+    let (handles, names, learned) = spawn_group(
+        &group,
+        n,
+        fast_config(),
+        Arc::clone(&shim),
+        Arc::clone(&partitioned),
+    )
+    .await;
 
     // Each node publishes `final_seq` times.
     for _ in 0..final_seq {
@@ -221,8 +230,14 @@ async fn converges_after_partition_heals() {
     // Split {0,1} | {2,3}.
     let partitioned = Arc::new(Mutex::new(vec![false, false, true, true]));
 
-    let (handles, names, learned) =
-        spawn_group(&group, n, fast_config(), Arc::clone(&shim), Arc::clone(&partitioned)).await;
+    let (handles, names, learned) = spawn_group(
+        &group,
+        n,
+        fast_config(),
+        Arc::clone(&shim),
+        Arc::clone(&partitioned),
+    )
+    .await;
 
     // Publish while partitioned — cross-partition updates cannot flow.
     for _ in 0..final_seq {

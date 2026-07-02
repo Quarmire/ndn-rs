@@ -12,12 +12,12 @@ use std::sync::{Arc, RwLock};
 use async_trait::async_trait;
 #[cfg(test)]
 use bytes::Bytes;
+use ndn_engine::ForwarderEngine;
 use ndn_mgmt_wire::{
     ControlParameters, ControlResponse,
     control_response::status,
     nfd_command::{module, verb},
 };
-use ndn_engine::ForwarderEngine;
 use ndn_security::FilePib;
 
 #[cfg(test)]

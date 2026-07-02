@@ -3,8 +3,8 @@
 
 use base64::Engine as _;
 
-use ndn_mgmt_wire::{ControlParameters, ControlResponse, control_response::status};
 use ndn_engine::ForwarderEngine;
+use ndn_mgmt_wire::{ControlParameters, ControlResponse, control_response::status};
 use ndn_security::FilePib;
 
 pub(super) fn security_identity_status(
@@ -136,10 +136,7 @@ pub(super) fn security_anchor_list(
     // built from; read them so the dashboard sees the full trust posture.
     for (path, source) in [
         (config.mgmt_trust_anchor_pib(), "mgmt"),
-        (
-            config.localhop_trust_anchor_pib(),
-            "localhop",
-        ),
+        (config.localhop_trust_anchor_pib(), "localhop"),
     ] {
         if let Some(p) = path
             && let Ok(other) = FilePib::open(p)

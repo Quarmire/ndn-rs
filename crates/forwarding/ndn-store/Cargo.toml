@@ -3,6 +3,7 @@ name = "ndn-store"
 description = "NDN forwarding tables: NameTrie, PIT, and ContentStore"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [package.metadata.scope]
@@ -66,3 +67,6 @@ harness = false
 name              = "fjall"
 harness           = false
 required-features = ["fjall"]
+
+[lints]
+workspace = true

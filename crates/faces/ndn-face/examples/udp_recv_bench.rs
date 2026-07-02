@@ -65,13 +65,8 @@ async fn main() {
     let received = Arc::new(AtomicU64::new(0));
     let r2 = received.clone();
     let recv_task = tokio::spawn(async move {
-        loop {
-            match face.recv_bytes().await {
-                Ok(_) => {
-                    r2.fetch_add(1, Ordering::Relaxed);
-                }
-                Err(_) => break,
-            }
+        while face.recv_bytes().await.is_ok() {
+            r2.fetch_add(1, Ordering::Relaxed);
         }
     });
 

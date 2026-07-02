@@ -47,8 +47,8 @@ pub fn decode_history(wire: &[u8]) -> Result<Vec<IdentityProof>, ProofDecodeErro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndn_security::did::{DidDocument, RecoveryCommitment};
     use ndn_packet::SignatureType;
+    use ndn_security::did::{DidDocument, RecoveryCommitment};
 
     fn proof(seq: u64, parent: Option<[u8; 32]>) -> IdentityProof {
         IdentityProof {

@@ -144,6 +144,9 @@ mod tests {
     }
 
     #[test]
+    // Pointer identity check needs raw pointer arithmetic; sole unsafe in this
+    // crate, test-only.
+    #[allow(unsafe_code)]
     fn read_tlv_zero_copy_same_allocation() {
         let raw = Bytes::from(vec![0x15, 0x03, 0xAA, 0xBB, 0xCC]);
         let ptr = raw.as_ptr();
@@ -283,7 +286,9 @@ mod tests {
     #[test]
     fn w1_huge_length_errors_not_panics() {
         // TLV-TYPE=0x05, TLV-LENGTH = 9-byte form 0xFF + 8×0xFF = u64::MAX.
-        let raw = Bytes::from(vec![0x05, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+        let raw = Bytes::from(vec![
+            0x05, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        ]);
         let mut r = TlvReader::new(raw);
         let _ = r.read_type().unwrap();
         assert_eq!(r.read_length().unwrap_err(), TlvError::UnexpectedEof);
@@ -291,7 +296,9 @@ mod tests {
 
     #[test]
     fn w1_read_tlv_huge_length_errors() {
-        let raw = Bytes::from(vec![0x05, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+        let raw = Bytes::from(vec![
+            0x05, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        ]);
         let mut r = TlvReader::new(raw);
         assert_eq!(r.read_tlv().unwrap_err(), TlvError::UnexpectedEof);
     }
@@ -302,13 +309,18 @@ mod tests {
         let raw = Bytes::from(vec![0x08, 0x01, 0x42]);
         let mut r = TlvReader::new(raw);
         let _ = r.read_type().unwrap();
-        assert_eq!(r.read_bytes(usize::MAX).unwrap_err(), TlvError::UnexpectedEof);
+        assert_eq!(
+            r.read_bytes(usize::MAX).unwrap_err(),
+            TlvError::UnexpectedEof
+        );
     }
 
     #[test]
     fn w1_skip_unknown_huge_length_errors() {
         // Non-critical type (0x22) with a 9-byte u64::MAX length must error.
-        let raw = Bytes::from(vec![0x22, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+        let raw = Bytes::from(vec![
+            0x22, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        ]);
         let mut r = TlvReader::new(raw);
         let typ = r.read_type().unwrap();
         assert_eq!(r.skip_unknown(typ).unwrap_err(), TlvError::UnexpectedEof);

@@ -101,7 +101,13 @@ impl SignedDelegation {
             _ => return Err(DelegationError::NotIssuedByPrincipal),
         }
         let region = self.canonical_bytes();
-        match verify_by_sig_type(self.sig_type, &region, &self.sig_value, principal_public_key).await
+        match verify_by_sig_type(
+            self.sig_type,
+            &region,
+            &self.sig_value,
+            principal_public_key,
+        )
+        .await
         {
             Ok(VerifyOutcome::Valid) => Ok(self.scope.clone()),
             _ => Err(DelegationError::SignatureInvalid),
@@ -322,12 +328,9 @@ mod tests {
     #[tokio::test]
     async fn issue_then_verify_returns_scope() {
         let (kc, pubkey) = principal_keychain("/alice");
-        let deleg = SignedDelegation::issue(
-            &kc,
-            "/alice/device/phone".parse().unwrap(),
-            route_scope(),
-        )
-        .expect("issue");
+        let deleg =
+            SignedDelegation::issue(&kc, "/alice/device/phone".parse().unwrap(), route_scope())
+                .expect("issue");
 
         let scope = deleg.verify(&pubkey).await.expect("verify");
         assert!(scope.unwrap_for);
@@ -373,7 +376,9 @@ mod tests {
     async fn out_of_namespace_is_refused_at_issue_and_verify() {
         let (kc, _pubkey) = principal_keychain("/alice");
         // A principal can't delegate outside its own namespace.
-        assert!(SignedDelegation::issue(&kc, "/bob/device/x".parse().unwrap(), route_scope()).is_err());
+        assert!(
+            SignedDelegation::issue(&kc, "/bob/device/x".parse().unwrap(), route_scope()).is_err()
+        );
     }
 
     #[tokio::test]
@@ -432,9 +437,13 @@ mod tests {
         deleg.scope.mgmt = true; // escalate after signing
         let (device_kc, _) = principal_keychain("/alice/device/phone");
         assert!(
-            DelegatedSigner::from_delegation(device_kc.signer().unwrap(), &deleg, &principal_pubkey)
-                .await
-                .is_err()
+            DelegatedSigner::from_delegation(
+                device_kc.signer().unwrap(),
+                &deleg,
+                &principal_pubkey
+            )
+            .await
+            .is_err()
         );
     }
 }

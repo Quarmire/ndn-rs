@@ -14,7 +14,11 @@ use ndn_security::KeyChain;
 use ndn_transport::FaceId;
 
 /// Spin a two-face in-proc engine routing `<prefix>` Interests to the producer.
-async fn rig() -> (ndn_face::local::InProcHandle, ndn_face::local::InProcHandle, impl Sized) {
+async fn rig() -> (
+    ndn_face::local::InProcHandle,
+    ndn_face::local::InProcHandle,
+    impl Sized,
+) {
     let (consumer_face, consumer_handle) = InProcFace::new(FaceId(1), 256);
     let (producer_face, producer_handle) = InProcFace::new(FaceId(2), 256);
     let (engine, shutdown) = EngineBuilder::new(EngineConfig::default())
@@ -44,7 +48,8 @@ async fn verified_fetch_object_accepts_signed_and_reassembles() {
     let producer = Producer::from_handle(producer_handle, prefix.clone()).with_signer(signer);
     let pub_payload = Bytes::from(payload.clone());
     let pub_prefix = prefix.clone();
-    let task = tokio::spawn(async move { producer.publish_object(pub_prefix, pub_payload, 8192).await });
+    let task =
+        tokio::spawn(async move { producer.publish_object(pub_prefix, pub_payload, 8192).await });
 
     let mut consumer = Consumer::from_handle(consumer_handle).verifying(kc.validator());
     let reassembled = consumer

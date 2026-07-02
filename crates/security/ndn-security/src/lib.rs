@@ -14,12 +14,11 @@
 #[cfg(feature = "abe")]
 pub mod abe;
 pub mod capability;
+pub mod cert_cache;
+pub mod cert_fetcher;
 pub mod confidentiality;
 #[cfg(feature = "custodian")]
 pub mod custodian;
-pub mod safebag;
-pub mod cert_cache;
-pub mod cert_fetcher;
 pub mod did;
 pub mod error;
 pub mod file_tpm;
@@ -36,6 +35,7 @@ pub mod profile;
 pub mod replay_guard;
 pub mod safe_bag;
 pub mod safe_data;
+pub mod safebag;
 pub mod sign_ext;
 pub mod signer;
 pub mod signing_info;
@@ -54,16 +54,16 @@ pub mod yubikey;
 
 pub use capability::{Capability, CapabilityError};
 pub use cert_cache::{CertCache, Certificate};
-pub use confidentiality::{
-    ContentKey, EpochPolicy, RotatingKey, Sealed, unwrap_ck, wrap_ck,
-};
 pub use cert_fetcher::{CertFetcher, FetchFn};
+pub use confidentiality::{ContentKey, EpochPolicy, RotatingKey, Sealed, unwrap_ck, wrap_ck};
 pub use error::TrustError;
 pub use key_store::{KeyAlgorithm, KeyStore, MemKeyStore};
 pub use keychain::KeyChain;
 pub use keyring::Keyring;
 pub use lvs::{LvsError, LvsModel, LvsUserFn, UserFnRegistry};
-pub use lvs_compile::{LvsCompileError, compile as compile_lvs, compile_to_binary as compile_lvs_to_binary};
+pub use lvs_compile::{
+    LvsCompileError, compile as compile_lvs, compile_to_binary as compile_lvs_to_binary,
+};
 pub use manager::{SecurityManager, encode_cert_data, encode_cert_data_with_description};
 pub use pib::{FilePib, PibError};
 pub use profile::SecurityProfile;

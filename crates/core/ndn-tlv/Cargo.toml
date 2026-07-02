@@ -3,6 +3,7 @@ name = "ndn-tlv"
 description = "NDN TLV encoding and decoding primitives"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 # `std` is enabled by default. Disable it to build for bare-metal targets
@@ -19,3 +20,6 @@ std     = ["bytes/std"]
 
 [dependencies]
 bytes = { workspace = true }
+
+[lints]
+workspace = true

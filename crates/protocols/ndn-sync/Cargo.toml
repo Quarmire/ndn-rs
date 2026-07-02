@@ -3,6 +3,7 @@ name = "ndn-sync"
 description = "NDN dataset synchronisation protocols: SVS, PSync"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [package.metadata.scope]
@@ -41,3 +42,6 @@ wasm-bindgen-futures = "0.4"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }
+
+[lints]
+workspace = true

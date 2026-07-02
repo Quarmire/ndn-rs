@@ -94,7 +94,9 @@ impl SvsNode {
     /// Increment the local sequence by 1 and return the new value.
     pub async fn advance(&self) -> u64 {
         let mut map = self.vector.write().await;
-        let entry = map.entry(self.local_name.clone()).or_insert((self.local_boot, 0));
+        let entry = map
+            .entry(self.local_name.clone())
+            .or_insert((self.local_boot, 0));
         entry.1 += 1;
         entry.1
     }
@@ -177,7 +179,12 @@ impl SvsNode {
         let Ok(name) = node_key.parse::<Name>() else {
             return 0;
         };
-        self.vector.read().await.get(&name).map(|(_, s)| *s).unwrap_or(0)
+        self.vector
+            .read()
+            .await
+            .get(&name)
+            .map(|(_, s)| *s)
+            .unwrap_or(0)
     }
 }
 
@@ -275,8 +282,16 @@ mod tests {
         let local_key = node.local_key();
         let gaps = node.merge(&[e(&local_key, 9999)]).await;
         assert!(gaps.is_empty(), "self entry must not produce a gap");
-        assert_eq!(node.local_seq().await, 1, "self seq must stay authoritative");
-        assert_eq!(node.advance().await, 2, "advance continues from local, not remote");
+        assert_eq!(
+            node.local_seq().await,
+            1,
+            "self seq must stay authoritative"
+        );
+        assert_eq!(
+            node.advance().await,
+            2,
+            "advance continues from local, not remote"
+        );
     }
 
     #[tokio::test]
@@ -305,13 +320,25 @@ mod tests {
         let node = SvsNode::new(&name("a"));
         let peer: Name = "/b".parse().unwrap();
         let _ = node
-            .merge(&[StateEntry { name: peer.clone(), boot: 100, seq: 9 }])
+            .merge(&[StateEntry {
+                name: peer.clone(),
+                boot: 100,
+                seq: 9,
+            }])
             .await;
         // Reboot: boot jumps, seq resets to 2.
         let gaps = node
-            .merge(&[StateEntry { name: peer.clone(), boot: 200, seq: 2 }])
+            .merge(&[StateEntry {
+                name: peer.clone(),
+                boot: 200,
+                seq: 2,
+            }])
             .await;
-        assert_eq!(gaps, vec![("/b".to_string(), 1, 2)], "reboot reopens [1, seq]");
+        assert_eq!(
+            gaps,
+            vec![("/b".to_string(), 1, 2)],
+            "reboot reopens [1, seq]"
+        );
         assert_eq!(node.seq_for("/b").await, 2);
     }
 
@@ -320,11 +347,19 @@ mod tests {
         let node = SvsNode::new(&name("a"));
         let peer: Name = "/b".parse().unwrap();
         let _ = node
-            .merge(&[StateEntry { name: peer.clone(), boot: 200, seq: 5 }])
+            .merge(&[StateEntry {
+                name: peer.clone(),
+                boot: 200,
+                seq: 5,
+            }])
             .await;
         // An older boot must not regress us.
         let gaps = node
-            .merge(&[StateEntry { name: peer.clone(), boot: 100, seq: 9 }])
+            .merge(&[StateEntry {
+                name: peer.clone(),
+                boot: 100,
+                seq: 9,
+            }])
             .await;
         assert!(gaps.is_empty(), "older boot is stale");
         assert_eq!(node.seq_for("/b").await, 5);

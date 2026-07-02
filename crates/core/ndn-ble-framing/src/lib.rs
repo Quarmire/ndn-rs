@@ -154,7 +154,8 @@ impl NdntsReassembler {
         // BLE-1: abandon a partial that grows past — or already declares more
         // than — MAX_REASSEMBLY_SIZE, so a peer can't exhaust memory by streaming
         // toward a huge declared TLV length.
-        if self.buffer.len() > MAX_REASSEMBLY_SIZE || declared_exceeds(&self.buffer, MAX_REASSEMBLY_SIZE)
+        if self.buffer.len() > MAX_REASSEMBLY_SIZE
+            || declared_exceeds(&self.buffer, MAX_REASSEMBLY_SIZE)
         {
             self.buffer.clear();
             self.active = false;

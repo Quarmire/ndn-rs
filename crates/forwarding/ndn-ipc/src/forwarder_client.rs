@@ -161,7 +161,10 @@ impl ForwarderClient {
 
         if let (Some(name), Some(factory)) = (shm_name, data_plane_factory()) {
             let mgmt = crate::mgmt_client::MgmtClient::from_face(Arc::clone(&control));
-            match factory.connect(&mgmt, name, mtu, cancel.child_token()).await {
+            match factory
+                .connect(&mgmt, name, mtu, cancel.child_token())
+                .await
+            {
                 Ok(dp) => {
                     return Ok(Self {
                         control,
@@ -211,8 +214,7 @@ impl ForwarderClient {
         // they don't race. (Must be built in a runtime — callers adopt the fd
         // inside `block_on`.)
         let mux = crate::face_mux::FaceMux::new(Arc::clone(&control), cancel.child_token());
-        let mgmt =
-            crate::mgmt_client::MgmtClient::from_mux(Arc::clone(&control), Arc::clone(&mux));
+        let mgmt = crate::mgmt_client::MgmtClient::from_mux(Arc::clone(&control), Arc::clone(&mux));
         Ok(Self {
             control,
             mgmt,

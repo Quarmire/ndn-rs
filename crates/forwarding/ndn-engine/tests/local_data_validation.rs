@@ -34,10 +34,10 @@ fn is_data(wire: &bytes::Bytes) -> bool {
     if wire.first() == Some(&T_DATA) {
         return true;
     }
-    if let Ok(lp) = LpPacket::decode(wire.clone()) {
-        if let Some(frag) = lp.fragment {
-            return frag.first() == Some(&T_DATA);
-        }
+    if let Ok(lp) = LpPacket::decode(wire.clone())
+        && let Some(frag) = lp.fragment
+    {
+        return frag.first() == Some(&T_DATA);
     }
     false
 }

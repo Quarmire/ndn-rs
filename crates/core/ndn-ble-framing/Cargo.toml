@@ -3,6 +3,7 @@ name = "ndn-ble-framing"
 description = "Shared BLE wire-framing codec for ndn-rs — NDNLPv2 and the NDNts/esp8266ndn 1-byte fragmentation header, with single- and per-sender reassembly"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [package.metadata.scope]
@@ -16,3 +17,6 @@ classification = "spec"
 # can share it with the native faces.
 ndn-packet = { workspace = true, features = ["std"] }
 bytes      = { workspace = true, features = ["std"] }
+
+[lints]
+workspace = true

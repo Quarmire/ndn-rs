@@ -81,7 +81,9 @@ impl PathControl {
         self.target
             .clone()
             .append_component(NameComponent::keyword(Bytes::from_static(PATHCTL_KEYWORD)))
-            .append_component(NameComponent::generic(Bytes::copy_from_slice(&[self.op as u8])))
+            .append_component(NameComponent::generic(Bytes::copy_from_slice(&[
+                self.op as u8
+            ])))
             .append_component(NameComponent::generic(Bytes::copy_from_slice(
                 &self.seq.to_be_bytes(),
             )))
@@ -387,7 +389,8 @@ mod tests {
 
         // Sequence rises per emit; ops map correctly.
         let teardown = em.teardown().unwrap();
-        let pc2 = PathControl::parse(&ndn_packet::Interest::decode(teardown).unwrap().name).unwrap();
+        let pc2 =
+            PathControl::parse(&ndn_packet::Interest::decode(teardown).unwrap().name).unwrap();
         assert_eq!(pc2.op, PathOp::Teardown);
         assert_eq!(pc2.seq, 2);
     }
@@ -398,7 +401,10 @@ mod tests {
         let t = n("/alice/video");
         let r = PathOp::Redirect;
         assert!(store.admit(&t, r, 5), "first is admitted");
-        assert!(!store.admit(&t, r, 5), "equal is a duplicate/loop — dropped");
+        assert!(
+            !store.admit(&t, r, 5),
+            "equal is a duplicate/loop — dropped"
+        );
         assert!(!store.admit(&t, r, 3), "older is stale — dropped");
         assert!(store.admit(&t, r, 6), "newer is admitted");
         assert_eq!(store.last(&t, r), Some(6));
@@ -413,10 +419,19 @@ mod tests {
         // must not jam each other: each op has its own monotonic space.
         let store = SeqStore::new();
         let t = n("/site/thing");
-        assert!(store.admit(&t, PathOp::Teardown, 1_700_000_000_000), "wall-clock teardown");
-        assert!(store.admit(&t, PathOp::Redirect, 5), "small Redirect seq still admitted");
+        assert!(
+            store.admit(&t, PathOp::Teardown, 1_700_000_000_000),
+            "wall-clock teardown"
+        );
+        assert!(
+            store.admit(&t, PathOp::Redirect, 5),
+            "small Redirect seq still admitted"
+        );
         assert!(store.admit(&t, PathOp::Redirect, 6));
-        assert!(!store.admit(&t, PathOp::Teardown, 1_699_999_999_999), "older teardown dropped");
+        assert!(
+            !store.admit(&t, PathOp::Teardown, 1_699_999_999_999),
+            "older teardown dropped"
+        );
     }
 
     /// G3.1: the floor must survive a "restart" — a captured signed message replayed after
@@ -452,9 +467,15 @@ mod tests {
         // Reboot: a fresh guard reloads the floor from the durable store.
         let store = SeqStore::with_persistence(disk.clone());
         assert_eq!(store.last(&t, r), Some(9), "floor reloaded across restart");
-        assert!(!store.admit(&t, r, 9), "a captured seq-9 replay is rejected post-reboot");
+        assert!(
+            !store.admit(&t, r, 9),
+            "a captured seq-9 replay is rejected post-reboot"
+        );
         assert!(!store.admit(&t, r, 8), "an older capture is rejected too");
-        assert!(store.admit(&t, r, 10), "a genuinely newer message still advances");
+        assert!(
+            store.admit(&t, r, 10),
+            "a genuinely newer message still advances"
+        );
     }
 
     /// The trusted-time seam is opt-in and fail-open-to-the-sequence-guard: no trusted
@@ -481,8 +502,16 @@ mod tests {
         // Trusted time present: in-window passes, out-of-window (a replay) is rejected.
         let now = 1_000_000_000_000u64;
         assert!(within_freshness_window(&FixedTime(now), Some(now), skew));
-        assert!(within_freshness_window(&FixedTime(now), Some(now - skew), skew));
-        assert!(!within_freshness_window(&FixedTime(now), Some(now - skew - 1), skew));
+        assert!(within_freshness_window(
+            &FixedTime(now),
+            Some(now - skew),
+            skew
+        ));
+        assert!(!within_freshness_window(
+            &FixedTime(now),
+            Some(now - skew - 1),
+            skew
+        ));
         // A message with no signed time defers to the sequence guard even under trusted time.
         assert!(within_freshness_window(&FixedTime(now), None, skew));
     }

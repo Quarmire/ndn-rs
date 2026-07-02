@@ -28,11 +28,19 @@ use tokio_util::sync::CancellationToken;
 /// A connected `AF_UNIX`/`SOCK_STREAM` pair — the in-test stand-in for the two
 /// fds Android's `VpnService` produces with `socketpair()` and splits across
 /// Binder.
+// Scoped exception to the workspace `deny(unsafe_code)`: one socketpair(2)
+// FFI call, return code checked below.
+#[allow(unsafe_code)]
 fn stream_socketpair() -> (RawFd, RawFd) {
     let mut fds = [0 as libc::c_int; 2];
     // SAFETY: standard socketpair(2); we check the return code.
     let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
-    assert_eq!(rc, 0, "socketpair() failed: {}", std::io::Error::last_os_error());
+    assert_eq!(
+        rc,
+        0,
+        "socketpair() failed: {}",
+        std::io::Error::last_os_error()
+    );
     (fds[0], fds[1])
 }
 

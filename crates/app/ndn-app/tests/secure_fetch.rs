@@ -127,7 +127,10 @@ async fn verifying_consumer_short_verb_returns_safedata() {
     // Configure the validator once; the short verb is now safe.
     let mut consumer = Consumer::from_handle(consumer_handle).verifying(producer_kc.validator());
     let safe = consumer.fetch("/demo/bob/thing").await.expect("verified");
-    assert_eq!(safe.data().content().map(|c| c.to_vec()), Some(b"signed".to_vec()));
+    assert_eq!(
+        safe.data().content().map(|c| c.to_vec()),
+        Some(b"signed".to_vec())
+    );
 
     drop(consumer);
     drop(engine);
@@ -169,7 +172,10 @@ async fn signing_producer_short_verb_respond_is_verified() {
 
     let mut consumer = Consumer::from_handle(consumer_handle).verifying(producer_kc.validator());
     let safe = consumer.fetch("/demo/carol/thing").await.expect("verified");
-    assert_eq!(safe.data().content().map(|c| c.to_vec()), Some(b"dynamic".to_vec()));
+    assert_eq!(
+        safe.data().content().map(|c| c.to_vec()),
+        Some(b"dynamic".to_vec())
+    );
 
     drop(consumer);
     drop(engine);

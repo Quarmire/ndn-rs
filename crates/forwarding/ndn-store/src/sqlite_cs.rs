@@ -20,9 +20,9 @@
 //! )
 //! ```
 
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 
 use bytes::Bytes;
 use rusqlite::Connection;
@@ -82,10 +82,7 @@ impl SqliteCs {
              )",
             [],
         )?;
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS cs_lru ON cs(last_access)",
-            [],
-        )?;
+        conn.execute("CREATE INDEX IF NOT EXISTS cs_lru ON cs(last_access)", [])?;
 
         let (count, bytes): (i64, i64) = conn.query_row(
             "SELECT COUNT(*), COALESCE(SUM(length(data)), 0) FROM cs",
@@ -141,11 +138,9 @@ impl SqliteCs {
     /// Fetch `(stale_at, data)` for an exact key, refreshing `last_access`.
     fn fetch_exact(&self, conn: &Connection, key: &[u8]) -> Option<(u64, Bytes)> {
         let row: Option<(i64, Vec<u8>)> = conn
-            .query_row(
-                "SELECT stale_at, data FROM cs WHERE key = ?1",
-                [key],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
+            .query_row("SELECT stale_at, data FROM cs WHERE key = ?1", [key], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
             .ok();
         let (stale_at, data) = row?;
         let _ = conn.execute(
@@ -489,10 +484,18 @@ mod tests {
     async fn can_be_prefix_returns_first_under_prefix() {
         let (_d, path) = tmp();
         let cs = SqliteCs::open(&path, 1 << 20).unwrap();
-        cs.insert(Bytes::from_static(b"1"), arc_name(&["p", "a"]), meta_fresh())
-            .await;
-        cs.insert(Bytes::from_static(b"2"), arc_name(&["p", "b"]), meta_fresh())
-            .await;
+        cs.insert(
+            Bytes::from_static(b"1"),
+            arc_name(&["p", "a"]),
+            meta_fresh(),
+        )
+        .await;
+        cs.insert(
+            Bytes::from_static(b"2"),
+            arc_name(&["p", "b"]),
+            meta_fresh(),
+        )
+        .await;
         let got = cs.get(&interest_can_be_prefix(&["p"])).await.unwrap();
         assert_eq!(got.name.components().len(), 2);
     }
@@ -520,8 +523,12 @@ mod tests {
         let (_d, path) = tmp();
         {
             let cs = SqliteCs::open(&path, 1 << 20).unwrap();
-            cs.insert(Bytes::from_static(b"persist"), arc_name(&["k"]), meta_fresh())
-                .await;
+            cs.insert(
+                Bytes::from_static(b"persist"),
+                arc_name(&["k"]),
+                meta_fresh(),
+            )
+            .await;
         }
         let cs = SqliteCs::open(&path, 1 << 20).unwrap();
         assert_eq!(cs.len(), 1);
@@ -533,10 +540,18 @@ mod tests {
     async fn evict_prefix_removes_subtree() {
         let (_d, path) = tmp();
         let cs = SqliteCs::open(&path, 1 << 20).unwrap();
-        cs.insert(Bytes::from_static(b"1"), arc_name(&["p", "a"]), meta_fresh())
-            .await;
-        cs.insert(Bytes::from_static(b"2"), arc_name(&["p", "b"]), meta_fresh())
-            .await;
+        cs.insert(
+            Bytes::from_static(b"1"),
+            arc_name(&["p", "a"]),
+            meta_fresh(),
+        )
+        .await;
+        cs.insert(
+            Bytes::from_static(b"2"),
+            arc_name(&["p", "b"]),
+            meta_fresh(),
+        )
+        .await;
         cs.insert(Bytes::from_static(b"3"), arc_name(&["q"]), meta_fresh())
             .await;
         assert_eq!(cs.evict_prefix(&arc_name(&["p"]), None).await, 2);

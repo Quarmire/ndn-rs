@@ -165,7 +165,10 @@ mod tests {
     fn default_unix_nanos_reads_system_clock() {
         let rt = TokioRuntime;
         let a = rt.unix_nanos();
-        assert!(a > 1_600_000_000_000_000_000, "plausible epoch ns (post-2020)");
+        assert!(
+            a > 1_600_000_000_000_000_000,
+            "plausible epoch ns (post-2020)"
+        );
     }
 
     /// The seam a virtual/simulation runtime uses: override `unix_nanos`/`now`/`sleep` to
@@ -196,8 +199,14 @@ mod tests {
         impl Runtime for VirtualClock {}
 
         let clock = Arc::new(AtomicU64::new(1_000));
-        let rt: Arc<dyn Runtime> = Arc::new(VirtualClock { epoch_ns: clock.clone() });
-        assert_eq!(rt.unix_nanos(), 1_000, "logical epoch is whatever the sim sets");
+        let rt: Arc<dyn Runtime> = Arc::new(VirtualClock {
+            epoch_ns: clock.clone(),
+        });
+        assert_eq!(
+            rt.unix_nanos(),
+            1_000,
+            "logical epoch is whatever the sim sets"
+        );
         // Advance logical time the way a scheduler will; the engine, reading only through
         // this seam, follows deterministically.
         clock.store(5_000, Ordering::Relaxed);

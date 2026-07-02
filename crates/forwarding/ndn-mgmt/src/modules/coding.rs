@@ -38,8 +38,12 @@ fn handle_coding(
 
 fn parse_role(code: Option<u8>) -> Option<CodingRole> {
     match code? {
-        c if c == ndn_mgmt_wire::control_parameters::fec_role::PRODUCED => Some(CodingRole::Produced),
-        c if c == ndn_mgmt_wire::control_parameters::fec_role::CONSUMED => Some(CodingRole::Consumed),
+        c if c == ndn_mgmt_wire::control_parameters::fec_role::PRODUCED => {
+            Some(CodingRole::Produced)
+        }
+        c if c == ndn_mgmt_wire::control_parameters::fec_role::CONSUMED => {
+            Some(CodingRole::Consumed)
+        }
         _ => None,
     }
 }

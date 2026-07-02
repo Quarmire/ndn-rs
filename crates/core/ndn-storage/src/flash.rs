@@ -123,7 +123,11 @@ impl<F: NorFlash> FlashState<F> {
 
     /// Base offset of the inactive half (the compaction target).
     fn other_base(&self) -> u32 {
-        if self.live_base == 0 { self.half_cap } else { 0 }
+        if self.live_base == 0 {
+            self.half_cap
+        } else {
+            0
+        }
     }
 
     fn read_u32(&mut self, off: u32) -> Result<u32, FlashError> {
@@ -137,7 +141,9 @@ impl<F: NorFlash> FlashState<F> {
     /// format / interrupted-before-commit).
     fn read_super(&mut self, base: u32) -> Result<Option<u32>, FlashError> {
         let mut hdr = [0u8; 16];
-        self.flash.read(base, &mut hdr).map_err(|_| FlashError::Io)?;
+        self.flash
+            .read(base, &mut hdr)
+            .map_err(|_| FlashError::Io)?;
         let magic = u64::from_le_bytes(hdr[..8].try_into().unwrap());
         let version = u32::from_le_bytes(hdr[8..12].try_into().unwrap());
         if magic != SUPER_MAGIC || version != FORMAT_VERSION {
@@ -157,9 +163,16 @@ impl<F: NorFlash> FlashState<F> {
     /// superblock lands only after the records, a power cut mid-rewrite leaves the half
     /// without valid magic, so it's ignored on mount and the other (live) half stands.
     /// Returns the new absolute `write_off` (end of the written record) on success.
-    fn write_half(&mut self, base: u32, generation: u32, ops: &[WriteOp]) -> Result<u32, FlashError> {
+    fn write_half(
+        &mut self,
+        base: u32,
+        generation: u32,
+        ops: &[WriteOp],
+    ) -> Result<u32, FlashError> {
         let hc = self.half_cap;
-        self.flash.erase(base, base + hc).map_err(|_| FlashError::Io)?;
+        self.flash
+            .erase(base, base + hc)
+            .map_err(|_| FlashError::Io)?;
         let hlen = Self::header_len();
         let mut off = base + hlen;
         if !ops.is_empty() {
@@ -275,7 +288,9 @@ impl<F: NorFlash> FlashState<F> {
                 break;
             }
             let mut buf = vec![0u8; len as usize + 4];
-            self.flash.read(off + 4, &mut buf).map_err(|_| FlashError::Io)?;
+            self.flash
+                .read(off + 4, &mut buf)
+                .map_err(|_| FlashError::Io)?;
             let footer = u32::from_le_bytes([
                 buf[len as usize],
                 buf[len as usize + 1],
@@ -513,9 +528,7 @@ impl<F: NorFlash + Send> SyncBackend for FlashLogBackend<F> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use embedded_storage::nor_flash::{
-        ErrorType, NorFlashError, NorFlashErrorKind, ReadNorFlash,
-    };
+    use embedded_storage::nor_flash::{ErrorType, NorFlashError, NorFlashErrorKind, ReadNorFlash};
 
     /// In-RAM mock NOR flash with realistic semantics: `write` can only clear bits
     /// (`&=`, so writing over un-erased cells corrupts — catching erase-before-write
@@ -586,7 +599,10 @@ mod tests {
             .into_iter()
             .map(|(k, _)| k)
             .collect();
-        assert_eq!(under, vec![Bytes::from_static(b"/a/b"), Bytes::from_static(b"/a/c")]);
+        assert_eq!(
+            under,
+            vec![Bytes::from_static(b"/a/b"), Bytes::from_static(b"/a/c")]
+        );
         f.delete(b"/a/b").unwrap();
         assert!(f.get(b"/a/b").unwrap().is_none());
         assert_eq!(f.get(b"/a/c").unwrap().as_deref(), Some(&b"v-ac"[..]));
@@ -610,7 +626,11 @@ mod tests {
         // Remount the persisted bytes — the log replays into the index.
         let f = FlashLogBackend::mount(flash).unwrap();
         assert!(f.get(b"k1").unwrap().is_none(), "delete persisted");
-        assert_eq!(f.get(b"k2").unwrap().as_deref(), Some(&b"v2"[..]), "batch put persisted");
+        assert_eq!(
+            f.get(b"k2").unwrap().as_deref(),
+            Some(&b"v2"[..]),
+            "batch put persisted"
+        );
     }
 
     #[test]
@@ -619,7 +639,8 @@ mod tests {
         // keep working (the live set is tiny).
         let f = FlashLogBackend::format(MockFlash::new(512)).unwrap();
         for i in 0..200u32 {
-            f.put(b"counter", Bytes::copy_from_slice(&i.to_le_bytes())).unwrap();
+            f.put(b"counter", Bytes::copy_from_slice(&i.to_le_bytes()))
+                .unwrap();
         }
         assert_eq!(
             f.get(b"counter").unwrap().as_deref(),
@@ -636,7 +657,8 @@ mod tests {
         let snapshot = {
             let f = FlashLogBackend::format(MockFlash::new(512)).unwrap();
             for i in 0..200u32 {
-                f.put(b"counter", Bytes::copy_from_slice(&i.to_le_bytes())).unwrap();
+                f.put(b"counter", Bytes::copy_from_slice(&i.to_le_bytes()))
+                    .unwrap();
             }
             f.put(b"stable", Bytes::from_static(b"keep")).unwrap();
             f.with(|s| s.flash.data.clone())

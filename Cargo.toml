@@ -70,13 +70,32 @@ default-members = [
     "examples/strategy-custom",
     "examples/strategy-composed",
     "examples/context-enricher",
+    "examples/tier0-rpc-latency",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+# MSRV. Floor is edition 2024 (1.85); the binding constraint is fjall's
+# declared rust-version (1.90). Verified in CI by the `msrv` job — bump
+# deliberately, and only with a matching CI run.
+rust-version = "1.90"
 authors = ["ndn-rs contributors"]
 license = "MIT OR Apache-2.0"
+
+# Single source of truth for lint policy — every member inherits via
+# `[lints] workspace = true`. CI escalates warn → error with -D warnings,
+# so "warn" here means "error at the gate, advisory while hacking".
+[workspace.lints.rust]
+# The protocol/forwarding core is unsafe-free by policy. Only the OS-I/O
+# leaf crates (ndn-face, ndn-frame-io) opt back in, with scoped allows at
+# the module or function that owns the raw-socket/FFI boundary.
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
 
 [workspace.metadata.crane]
 name = "ndn-rs"
@@ -112,8 +131,6 @@ ndn-cert     = { path = "crates/security/ndn-cert" }
 ndn-identity = { path = "crates/security/ndn-identity" }
 ndn-mgmt     = { path = "crates/forwarding/ndn-mgmt" }
 ndn-observability = { path = "crates/platform/ndn-observability" }
-ndn-coding    = { path = "crates/protocols/ndn-coding" }
-ndn-ratelimit = { path = "crates/forwarding/ndn-ratelimit" }
 
 # Core async runtime — individual crates enable only the features they need
 tokio      = { version = "1", default-features = false }

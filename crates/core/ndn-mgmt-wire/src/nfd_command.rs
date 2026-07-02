@@ -179,8 +179,8 @@ pub fn parse_command_name(name: &Name) -> Option<ParsedCommand> {
 
 #[cfg(test)]
 mod tests {
-    use alloc::borrow::ToOwned;
     use super::*;
+    use alloc::borrow::ToOwned;
 
     #[test]
     fn command_name_structure() {

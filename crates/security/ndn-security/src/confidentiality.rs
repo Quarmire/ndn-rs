@@ -291,7 +291,10 @@ mod tests {
         let ck = ContentKey::generate();
         let sealed = ck.seal(b"secret", b"/name/v1");
         // A mismatched AAD (e.g. a swapped name) must fail authentication.
-        assert_eq!(ck.open(&sealed, b"/name/v2"), Err(ConfidentialityError::OpenFailed));
+        assert_eq!(
+            ck.open(&sealed, b"/name/v2"),
+            Err(ConfidentialityError::OpenFailed)
+        );
     }
 
     #[test]
@@ -301,7 +304,10 @@ mod tests {
         let mut bad = sealed.ciphertext.to_vec();
         bad[0] ^= 0xff;
         sealed.ciphertext = Bytes::from(bad);
-        assert_eq!(ck.open(&sealed, b"aad"), Err(ConfidentialityError::OpenFailed));
+        assert_eq!(
+            ck.open(&sealed, b"aad"),
+            Err(ConfidentialityError::OpenFailed)
+        );
     }
 
     #[test]
@@ -309,7 +315,10 @@ mod tests {
         let ck = ContentKey::generate();
         let other = ContentKey::generate();
         let sealed = ck.seal(b"secret", b"aad");
-        assert_eq!(other.open(&sealed, b"aad"), Err(ConfidentialityError::OpenFailed));
+        assert_eq!(
+            other.open(&sealed, b"aad"),
+            Err(ConfidentialityError::OpenFailed)
+        );
     }
 
     #[test]
@@ -323,7 +332,10 @@ mod tests {
         let wrapped = wrap_ck(&kek, &ck, b"/ck-data/name");
         let recovered = unwrap_ck(&kek, &wrapped, b"/ck-data/name").unwrap();
         assert_eq!(recovered.expose(), ck.expose());
-        assert_eq!(recovered.open(&sealed, b"ctx").unwrap(), b"under the content key");
+        assert_eq!(
+            recovered.open(&sealed, b"ctx").unwrap(),
+            b"under the content key"
+        );
     }
 
     #[test]
@@ -352,7 +364,10 @@ mod tests {
 
     #[test]
     fn sealed_from_bytes_rejects_short_input() {
-        assert_eq!(Sealed::from_bytes(&[0u8; 10]), Err(ConfidentialityError::Malformed));
+        assert_eq!(
+            Sealed::from_bytes(&[0u8; 10]),
+            Err(ConfidentialityError::Malformed)
+        );
     }
 
     #[test]
@@ -368,7 +383,10 @@ mod tests {
 
     #[test]
     fn rotates_after_max_uses() {
-        let policy = EpochPolicy { max_age: Duration::from_secs(60), max_uses: 3 };
+        let policy = EpochPolicy {
+            max_age: Duration::from_secs(60),
+            max_uses: 3,
+        };
         let mut rk = RotatingKey::new(0, policy);
         let e0 = *rk.epoch_id();
         // 3 seals are allowed under the first epoch; the 4th triggers rotation.
@@ -382,7 +400,10 @@ mod tests {
 
     #[test]
     fn rotates_after_max_age() {
-        let policy = EpochPolicy { max_age: Duration::from_secs(60), max_uses: 10_000 };
+        let policy = EpochPolicy {
+            max_age: Duration::from_secs(60),
+            max_uses: 10_000,
+        };
         let mut rk = RotatingKey::new(0, policy);
         let e0 = *rk.epoch_id();
         let (e_before, _) = rk.seal(59, b"m", b""); // still within the window

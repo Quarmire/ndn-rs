@@ -3,6 +3,7 @@ name = "ndn-mgmt"
 description = "NFD-compatible NDN management dispatcher (modules: rib, faces, fib, cs, strategy-choice, status, neighbors, service, security, routing, discovery, log)"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [package.metadata.scope]
@@ -80,3 +81,6 @@ ndn-config       = { workspace = true, features = ["mgmt"] }
 ndn-store        = { workspace = true }
 # IPC-seam witness (tests/ipc_seam.rs): a client rides a socketpair fd.
 ndn-ipc          = { workspace = true }
+
+[lints]
+workspace = true

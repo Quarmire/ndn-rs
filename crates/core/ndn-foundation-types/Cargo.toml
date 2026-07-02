@@ -3,6 +3,7 @@ name = "ndn-foundation-types"
 description = "Shared foundation types: Name, Hash, KeyLocator, SignatureValue, TlvEncode/TlvDecode"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 # Feature flags:
@@ -21,3 +22,6 @@ ndn-tlv  = { workspace = true, default-features = false }
 bytes    = { version = "1", default-features = false }
 smallvec = { workspace = true }
 sha2     = { version = "0.11", optional = true, default-features = false, features = ["alloc"] }
+
+[lints]
+workspace = true

@@ -51,11 +51,11 @@ use async_trait::async_trait;
 
 // The synchronous core is always available (it underpins the async engines and the
 // embedded path); the in-memory engine + async bridge are feature-gated.
+#[cfg(feature = "std")]
+pub use sync::SyncAsAsync;
 pub use sync::SyncBackend;
 #[cfg(feature = "sync")]
 pub use sync::SyncMemoryBackend;
-#[cfg(feature = "std")]
-pub use sync::SyncAsAsync;
 
 // Embedded flash engine (generic over `embedded-storage::NorFlash`).
 #[cfg(feature = "flash")]
@@ -121,7 +121,11 @@ pub trait Backend: Send + Sync {
     /// `(key, value)` pairs whose key starts with `prefix`, in ascending key order,
     /// at most `limit` (0 = unlimited). Owned, so the result moves cleanly across a
     /// `spawn_blocking` boundary.
-    async fn scan_prefix(&self, prefix: Vec<u8>, limit: usize) -> StorageResult<Vec<(Bytes, Bytes)>>;
+    async fn scan_prefix(
+        &self,
+        prefix: Vec<u8>,
+        limit: usize,
+    ) -> StorageResult<Vec<(Bytes, Bytes)>>;
 
     /// The lexicographically-smallest `(key, value)` whose key starts with `prefix`
     /// (a `CanBePrefix` lookup). Default: first of [`scan_prefix`](Self::scan_prefix).
@@ -166,10 +170,16 @@ impl MemoryBackend {
         Self::default()
     }
     pub fn len(&self) -> usize {
-        self.map.read().unwrap_or_else(std::sync::PoisonError::into_inner).len()
+        self.map
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
     }
     pub fn is_empty(&self) -> bool {
-        self.map.read().unwrap_or_else(std::sync::PoisonError::into_inner).is_empty()
+        self.map
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
     }
 }
 
@@ -177,18 +187,36 @@ impl MemoryBackend {
 #[async_trait]
 impl Backend for MemoryBackend {
     async fn get(&self, key: Vec<u8>) -> StorageResult<Option<Bytes>> {
-        Ok(self.map.read().unwrap_or_else(std::sync::PoisonError::into_inner).get(&key).cloned())
+        Ok(self
+            .map
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+            .cloned())
     }
     async fn put(&self, key: Vec<u8>, value: Bytes) -> StorageResult<()> {
-        self.map.write().unwrap_or_else(std::sync::PoisonError::into_inner).insert(key, value);
+        self.map
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key, value);
         Ok(())
     }
     async fn delete(&self, key: Vec<u8>) -> StorageResult<()> {
-        self.map.write().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&key);
+        self.map
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&key);
         Ok(())
     }
-    async fn scan_prefix(&self, prefix: Vec<u8>, limit: usize) -> StorageResult<Vec<(Bytes, Bytes)>> {
-        let map = self.map.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+    async fn scan_prefix(
+        &self,
+        prefix: Vec<u8>,
+        limit: usize,
+    ) -> StorageResult<Vec<(Bytes, Bytes)>> {
+        let map = self
+            .map
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut out = Vec::new();
         for (k, v) in map.range(prefix.clone()..) {
             if !k.starts_with(&prefix) {
@@ -203,7 +231,10 @@ impl Backend for MemoryBackend {
     }
     async fn write_batch(&self, ops: Vec<WriteOp>) -> StorageResult<()> {
         // Atomic: one lock for the whole batch.
-        let mut map = self.map.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut map = self
+            .map
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         for op in ops {
             match op {
                 WriteOp::Put(k, v) => {
@@ -306,7 +337,11 @@ impl<B: Backend> Backend for Instrumented<B> {
         );
         self.inner.delete(key).instrument(span).await
     }
-    async fn scan_prefix(&self, prefix: Vec<u8>, limit: usize) -> StorageResult<Vec<(Bytes, Bytes)>> {
+    async fn scan_prefix(
+        &self,
+        prefix: Vec<u8>,
+        limit: usize,
+    ) -> StorageResult<Vec<(Bytes, Bytes)>> {
         use tracing::{Instrument, field::Empty};
         let span = tracing::trace_span!(
             "ndn_storage.scan_prefix",
@@ -438,7 +473,9 @@ mod sync {
         #[cfg(feature = "std")]
         map: std::sync::Mutex<alloc::collections::BTreeMap<Vec<u8>, Bytes>>,
         #[cfg(not(feature = "std"))]
-        map: critical_section::Mutex<core::cell::RefCell<alloc::collections::BTreeMap<Vec<u8>, Bytes>>>,
+        map: critical_section::Mutex<
+            core::cell::RefCell<alloc::collections::BTreeMap<Vec<u8>, Bytes>>,
+        >,
     }
 
     #[cfg(feature = "sync")]
@@ -474,7 +511,10 @@ mod sync {
         ) -> R {
             #[cfg(feature = "std")]
             {
-                f(&mut self.map.lock().unwrap_or_else(std::sync::PoisonError::into_inner))
+                f(&mut self
+                    .map
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner))
             }
             #[cfg(not(feature = "std"))]
             {
@@ -566,7 +606,11 @@ mod sync {
         async fn delete(&self, key: Vec<u8>) -> StorageResult<()> {
             self.inner.delete(&key)
         }
-        async fn scan_prefix(&self, prefix: Vec<u8>, limit: usize) -> StorageResult<Vec<(Bytes, Bytes)>> {
+        async fn scan_prefix(
+            &self,
+            prefix: Vec<u8>,
+            limit: usize,
+        ) -> StorageResult<Vec<(Bytes, Bytes)>> {
             self.inner.scan_prefix(&prefix, limit)
         }
         async fn write_batch(&self, ops: Vec<WriteOp>) -> StorageResult<()> {
@@ -662,7 +706,11 @@ mod named {
     pub trait NamedReadStore: Send + Sync {
         async fn get(&self, name: &Name) -> StorageResult<Option<Bytes>>;
         async fn find_under(&self, prefix: &Name) -> StorageResult<Option<Bytes>>;
-        async fn scan_under(&self, prefix: &Name, limit: usize) -> StorageResult<Vec<(Bytes, Bytes)>>;
+        async fn scan_under(
+            &self,
+            prefix: &Name,
+            limit: usize,
+        ) -> StorageResult<Vec<(Bytes, Bytes)>>;
     }
 
     /// Object-safe **write** facet (write-behind retention + eviction).
@@ -706,9 +754,17 @@ mod named {
             self.backend.delete(name_key(name)).await
         }
         pub async fn find_under(&self, prefix: &Name) -> StorageResult<Option<Bytes>> {
-            Ok(self.backend.first_under(name_key(prefix)).await?.map(|(_, v)| v))
+            Ok(self
+                .backend
+                .first_under(name_key(prefix))
+                .await?
+                .map(|(_, v)| v))
         }
-        pub async fn scan_under(&self, prefix: &Name, limit: usize) -> StorageResult<Vec<(Bytes, Bytes)>> {
+        pub async fn scan_under(
+            &self,
+            prefix: &Name,
+            limit: usize,
+        ) -> StorageResult<Vec<(Bytes, Bytes)>> {
             self.backend.scan_prefix(name_key(prefix), limit).await
         }
     }
@@ -721,7 +777,11 @@ mod named {
         async fn find_under(&self, prefix: &Name) -> StorageResult<Option<Bytes>> {
             NamedStore::find_under(self, prefix).await
         }
-        async fn scan_under(&self, prefix: &Name, limit: usize) -> StorageResult<Vec<(Bytes, Bytes)>> {
+        async fn scan_under(
+            &self,
+            prefix: &Name,
+            limit: usize,
+        ) -> StorageResult<Vec<(Bytes, Bytes)>> {
             NamedStore::scan_under(self, prefix, limit).await
         }
     }
@@ -794,9 +854,10 @@ mod named {
         }
         fn store_at(&self, sel: RouteSel) -> &Arc<dyn NamedWriteStore> {
             match sel {
-                RouteSel::Fallback => {
-                    self.fallback.as_ref().expect("fallback present for RouteSel::Fallback")
-                }
+                RouteSel::Fallback => self
+                    .fallback
+                    .as_ref()
+                    .expect("fallback present for RouteSel::Fallback"),
                 RouteSel::Indexed(i) => &self.routes[i].1,
             }
         }
@@ -824,7 +885,11 @@ mod named {
                 None => Ok(None),
             }
         }
-        async fn scan_under(&self, prefix: &Name, limit: usize) -> StorageResult<Vec<(Bytes, Bytes)>> {
+        async fn scan_under(
+            &self,
+            prefix: &Name,
+            limit: usize,
+        ) -> StorageResult<Vec<(Bytes, Bytes)>> {
             match self.pick(prefix) {
                 Some(s) => s.scan_under(prefix, limit).await,
                 None => Ok(Vec::new()),
@@ -964,7 +1029,11 @@ mod fjall_backend {
                 .await
                 .map_err(StorageError::backend)?
         }
-        async fn scan_prefix(&self, prefix: Vec<u8>, limit: usize) -> StorageResult<Vec<(Bytes, Bytes)>> {
+        async fn scan_prefix(
+            &self,
+            prefix: Vec<u8>,
+            limit: usize,
+        ) -> StorageResult<Vec<(Bytes, Bytes)>> {
             let this = self.clone();
             tokio::task::spawn_blocking(move || SyncBackend::scan_prefix(&this, &prefix, limit))
                 .await
@@ -1010,7 +1079,9 @@ mod fjall_backend {
         /// its writes can be committed atomically with sibling partitions' writes via
         /// [`batch`](Self::batch). It is a fully-functional `Backend` on its own too.
         pub fn partition(&self, name: &str) -> fjall::Result<FjallBackend> {
-            let keyspace = self.db.keyspace(name, fjall::KeyspaceCreateOptions::default)?;
+            let keyspace = self
+                .db
+                .keyspace(name, fjall::KeyspaceCreateOptions::default)?;
             Ok(FjallBackend {
                 keyspace,
                 db: self.db.clone(),
@@ -1142,7 +1213,8 @@ mod redb_backend {
             // Ensure the table exists (an empty write txn creates it).
             let w = db.begin_write().map_err(std::io::Error::other)?;
             {
-                w.open_table(table(table_name)).map_err(std::io::Error::other)?;
+                w.open_table(table(table_name))
+                    .map_err(std::io::Error::other)?;
             }
             w.commit().map_err(std::io::Error::other)?;
             Ok(Self {
@@ -1240,7 +1312,11 @@ mod redb_backend {
                 .await
                 .map_err(StorageError::backend)?
         }
-        async fn scan_prefix(&self, prefix: Vec<u8>, limit: usize) -> StorageResult<Vec<(Bytes, Bytes)>> {
+        async fn scan_prefix(
+            &self,
+            prefix: Vec<u8>,
+            limit: usize,
+        ) -> StorageResult<Vec<(Bytes, Bytes)>> {
             let this = self.clone();
             tokio::task::spawn_blocking(move || SyncBackend::scan_prefix(&this, &prefix, limit))
                 .await
@@ -1379,14 +1455,41 @@ mod tests {
 
     async fn conformance(b: &dyn Backend) {
         assert!(b.get(b"missing".to_vec()).await.unwrap().is_none());
-        b.put(b"/a/b".to_vec(), Bytes::from_static(b"v-ab")).await.unwrap();
-        b.put(b"/a/b/c".to_vec(), Bytes::from_static(b"v-abc")).await.unwrap();
-        b.put(b"/a/d".to_vec(), Bytes::from_static(b"v-ad")).await.unwrap();
-        b.put(b"/z".to_vec(), Bytes::from_static(b"v-z")).await.unwrap();
+        b.put(b"/a/b".to_vec(), Bytes::from_static(b"v-ab"))
+            .await
+            .unwrap();
+        b.put(b"/a/b/c".to_vec(), Bytes::from_static(b"v-abc"))
+            .await
+            .unwrap();
+        b.put(b"/a/d".to_vec(), Bytes::from_static(b"v-ad"))
+            .await
+            .unwrap();
+        b.put(b"/z".to_vec(), Bytes::from_static(b"v-z"))
+            .await
+            .unwrap();
 
-        assert_eq!(b.get(b"/a/b".to_vec()).await.unwrap().as_deref(), Some(&b"v-ab"[..]));
-        assert_eq!(b.first_under(b"/a/b".to_vec()).await.unwrap().unwrap().0.as_ref(), b"/a/b");
-        assert_eq!(b.first_under(b"/a/d".to_vec()).await.unwrap().unwrap().1.as_ref(), b"v-ad");
+        assert_eq!(
+            b.get(b"/a/b".to_vec()).await.unwrap().as_deref(),
+            Some(&b"v-ab"[..])
+        );
+        assert_eq!(
+            b.first_under(b"/a/b".to_vec())
+                .await
+                .unwrap()
+                .unwrap()
+                .0
+                .as_ref(),
+            b"/a/b"
+        );
+        assert_eq!(
+            b.first_under(b"/a/d".to_vec())
+                .await
+                .unwrap()
+                .unwrap()
+                .1
+                .as_ref(),
+            b"v-ad"
+        );
         assert!(b.first_under(b"/nope".to_vec()).await.unwrap().is_none());
 
         let under: Vec<String> = b
@@ -1402,12 +1505,17 @@ mod tests {
 
         b.delete(b"/a/b".to_vec()).await.unwrap();
         assert!(b.get(b"/a/b".to_vec()).await.unwrap().is_none());
-        assert_eq!(b.get(b"/a/b/c".to_vec()).await.unwrap().as_deref(), Some(&b"v-abc"[..]));
+        assert_eq!(
+            b.get(b"/a/b/c".to_vec()).await.unwrap().as_deref(),
+            Some(&b"v-abc"[..])
+        );
     }
 
     /// `write_batch` applies every op and is observable as a unit.
     async fn batch_conformance(b: &dyn Backend) {
-        b.put(b"/keep".to_vec(), Bytes::from_static(b"old")).await.unwrap();
+        b.put(b"/keep".to_vec(), Bytes::from_static(b"old"))
+            .await
+            .unwrap();
         b.write_batch(vec![
             WriteOp::Put(b"/k1".to_vec(), Bytes::from_static(b"v1")),
             WriteOp::Put(b"/k2".to_vec(), Bytes::from_static(b"v2")),
@@ -1416,8 +1524,14 @@ mod tests {
         ])
         .await
         .unwrap();
-        assert_eq!(b.get(b"/k1".to_vec()).await.unwrap().as_deref(), Some(&b"v1"[..]));
-        assert_eq!(b.get(b"/k2".to_vec()).await.unwrap().as_deref(), Some(&b"v2"[..]));
+        assert_eq!(
+            b.get(b"/k1".to_vec()).await.unwrap().as_deref(),
+            Some(&b"v1"[..])
+        );
+        assert_eq!(
+            b.get(b"/k2".to_vec()).await.unwrap().as_deref(),
+            Some(&b"v2"[..])
+        );
         assert!(b.get(b"/keep".to_vec()).await.unwrap().is_none()); // put-then-delete in order
     }
 
@@ -1497,7 +1611,10 @@ mod tests {
         s.insert(&v0, Bytes::from_static(b"frame0")).await.unwrap();
         s.insert(&v1, Bytes::from_static(b"frame1")).await.unwrap();
         assert_eq!(s.get(&v0).await.unwrap().as_deref(), Some(&b"frame0"[..]));
-        assert_eq!(s.find_under(&n).await.unwrap().as_deref(), Some(&b"frame0"[..]));
+        assert_eq!(
+            s.find_under(&n).await.unwrap().as_deref(),
+            Some(&b"frame0"[..])
+        );
         assert!(name_key(&v0).starts_with(&name_key(&n)));
         assert_eq!(s.scan_under(&n, 0).await.unwrap().len(), 2);
 
@@ -1546,11 +1663,19 @@ mod tests {
             batch_conformance(&b).await;
             // UFCS: FjallBackend impls both Backend and SyncBackend, so a bare `.put`
             // is ambiguous with both traits in scope.
-            Backend::put(&b, b"/persist".to_vec(), Bytes::from_static(b"survives")).await.unwrap();
+            Backend::put(&b, b"/persist".to_vec(), Bytes::from_static(b"survives"))
+                .await
+                .unwrap();
         }
         {
             let b = FjallBackend::open(&dir).unwrap();
-            assert_eq!(Backend::get(&b, b"/persist".to_vec()).await.unwrap().as_deref(), Some(&b"survives"[..]));
+            assert_eq!(
+                Backend::get(&b, b"/persist".to_vec())
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(&b"survives"[..])
+            );
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1569,11 +1694,19 @@ mod tests {
             let b = RedbBackend::open(&path).unwrap();
             conformance(&b).await;
             batch_conformance(&b).await;
-            Backend::put(&b, b"/persist".to_vec(), Bytes::from_static(b"survives")).await.unwrap();
+            Backend::put(&b, b"/persist".to_vec(), Bytes::from_static(b"survives"))
+                .await
+                .unwrap();
         }
         {
             let b = RedbBackend::open(&path).unwrap();
-            assert_eq!(Backend::get(&b, b"/persist".to_vec()).await.unwrap().as_deref(), Some(&b"survives"[..]));
+            assert_eq!(
+                Backend::get(&b, b"/persist".to_vec())
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(&b"survives"[..])
+            );
         }
         let _ = std::fs::remove_file(&path);
     }
@@ -1606,9 +1739,24 @@ mod tests {
                 .await
                 .unwrap();
             // UFCS to disambiguate the dual (Backend / SyncBackend) impls in scope.
-            assert_eq!(Backend::get(&headers, b"h1".to_vec()).await.unwrap().as_deref(), Some(&b"H"[..]));
-            assert_eq!(Backend::get(&payloads, b"p1".to_vec()).await.unwrap().as_deref(), Some(&b"P"[..]));
-            assert_eq!(Backend::get(&idx, b"n1".to_vec()).await.unwrap().as_deref(), Some(&b"h1"[..]));
+            assert_eq!(
+                Backend::get(&headers, b"h1".to_vec())
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(&b"H"[..])
+            );
+            assert_eq!(
+                Backend::get(&payloads, b"p1".to_vec())
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(&b"P"[..])
+            );
+            assert_eq!(
+                Backend::get(&idx, b"n1".to_vec()).await.unwrap().as_deref(),
+                Some(&b"h1"[..])
+            );
 
             // A cross-partition delete in one batch (e.g. retract a block).
             db.batch()
@@ -1617,15 +1765,32 @@ mod tests {
                 .commit()
                 .await
                 .unwrap();
-            assert!(Backend::get(&headers, b"h1".to_vec()).await.unwrap().is_none());
+            assert!(
+                Backend::get(&headers, b"h1".to_vec())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
             assert!(Backend::get(&idx, b"n1".to_vec()).await.unwrap().is_none());
-            assert_eq!(Backend::get(&payloads, b"p1".to_vec()).await.unwrap().as_deref(), Some(&b"P"[..]));
+            assert_eq!(
+                Backend::get(&payloads, b"p1".to_vec())
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(&b"P"[..])
+            );
         }
         // Survives reopen.
         {
             let db = FjallDb::open(&dir).unwrap();
             let payloads = db.partition("payloads").unwrap();
-            assert_eq!(Backend::get(&payloads, b"p1".to_vec()).await.unwrap().as_deref(), Some(&b"P"[..]));
+            assert_eq!(
+                Backend::get(&payloads, b"p1".to_vec())
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(&b"P"[..])
+            );
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1653,9 +1818,24 @@ mod tests {
                 .commit()
                 .await
                 .unwrap();
-            assert_eq!(Backend::get(&headers, b"h1".to_vec()).await.unwrap().as_deref(), Some(&b"H"[..]));
-            assert_eq!(Backend::get(&payloads, b"p1".to_vec()).await.unwrap().as_deref(), Some(&b"P"[..]));
-            assert_eq!(Backend::get(&idx, b"n1".to_vec()).await.unwrap().as_deref(), Some(&b"h1"[..]));
+            assert_eq!(
+                Backend::get(&headers, b"h1".to_vec())
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(&b"H"[..])
+            );
+            assert_eq!(
+                Backend::get(&payloads, b"p1".to_vec())
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(&b"P"[..])
+            );
+            assert_eq!(
+                Backend::get(&idx, b"n1".to_vec()).await.unwrap().as_deref(),
+                Some(&b"h1"[..])
+            );
 
             db.batch()
                 .remove(&headers, b"h1".to_vec())
@@ -1663,8 +1843,19 @@ mod tests {
                 .commit()
                 .await
                 .unwrap();
-            assert!(Backend::get(&headers, b"h1".to_vec()).await.unwrap().is_none());
-            assert_eq!(Backend::get(&payloads, b"p1".to_vec()).await.unwrap().as_deref(), Some(&b"P"[..]));
+            assert!(
+                Backend::get(&headers, b"h1".to_vec())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                Backend::get(&payloads, b"p1".to_vec())
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(&b"P"[..])
+            );
         }
         let _ = std::fs::remove_file(&path);
     }
@@ -1673,6 +1864,9 @@ mod tests {
 
     /// Drives a `SyncBackend` with no async runtime — exactly how NDF's sync
     /// `BlockStore` / the pure verifier / an MCU consume it.
+    // Callers are per-backend and feature-gated; gate the helper to match so
+    // a default-features build doesn't see it as dead code.
+    #[cfg(any(feature = "sync", feature = "fjall", feature = "redb"))]
     fn sync_conformance(b: &dyn SyncBackend) {
         assert!(b.get(b"missing").unwrap().is_none());
         b.put(b"/a/b", Bytes::from_static(b"v-ab")).unwrap();
@@ -1745,8 +1939,14 @@ mod tests {
             .insert(&payloads, b"p1".to_vec(), Bytes::from_static(b"P"))
             .commit_blocking()
             .unwrap();
-        assert_eq!(SyncBackend::get(&headers, b"h1").unwrap().as_deref(), Some(&b"H"[..]));
-        assert_eq!(SyncBackend::get(&payloads, b"p1").unwrap().as_deref(), Some(&b"P"[..]));
+        assert_eq!(
+            SyncBackend::get(&headers, b"h1").unwrap().as_deref(),
+            Some(&b"H"[..])
+        );
+        assert_eq!(
+            SyncBackend::get(&payloads, b"p1").unwrap().as_deref(),
+            Some(&b"P"[..])
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

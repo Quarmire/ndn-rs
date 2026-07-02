@@ -125,7 +125,14 @@ impl ObjectFetch {
         let hint = std::mem::take(&mut self.hint);
         let progress = self.progress_or_noop();
         self.consumer
-            .fetch_object_streaming(self.name, validator, &hint, already_have, progress, on_segment)
+            .fetch_object_streaming(
+                self.name,
+                validator,
+                &hint,
+                already_have,
+                progress,
+                on_segment,
+            )
             .await
     }
 

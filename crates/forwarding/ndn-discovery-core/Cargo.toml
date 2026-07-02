@@ -2,6 +2,7 @@
 name = "ndn-discovery-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 description = "Wasm-safe trait shapes for ndn-discovery (DiscoveryProtocol, NeighborTable, scope helpers)"
@@ -22,3 +23,6 @@ ndn-packet    = { workspace = true, features = ["std"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 ndn-packet    = { workspace = true, features = ["std-wasm"] }
+
+[lints]
+workspace = true

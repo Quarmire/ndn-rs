@@ -853,9 +853,7 @@ pub(crate) async fn run_face_sender(
     } = ctx;
     // G4: if this face has an egress scheduler installed, the send loop drains *it* (in
     // priority order) instead of the raw `rx`. `None` ⇒ the FIFO default (drain `rx`).
-    let scheduler = face_states
-        .get(&face_id)
-        .and_then(|s| s.scheduler.clone());
+    let scheduler = face_states.get(&face_id).and_then(|s| s.scheduler.clone());
     // NDNLPv2 reliability lives entirely in the per-face `ReliabilityFeature`
     // (runtime-mutable via `faces/update` / discovery enablement). The send arm
     // frames through it when enabled; the retx tick pumps its retransmissions

@@ -17,14 +17,13 @@
 // `ndn-security`, which doesn't build for wasm32 (ring + libsqlite3-sys).
 // `WasmEngineBuilder` is the wasm-side analog with `ValidationStage` stubbed
 // permissively.
+pub mod activity;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod builder;
-pub mod activity;
 pub mod compose;
-pub mod egress;
-pub mod traceroute;
 pub mod discovery_context;
 pub mod dispatcher;
+pub mod egress;
 pub mod engine;
 pub mod enricher;
 pub mod expiry;
@@ -35,43 +34,44 @@ pub mod observability;
 pub mod path_control;
 pub mod pipeline;
 pub mod rate_limit_hook;
+pub mod readvertise;
 pub mod reflexive;
 pub mod replay_guard_config;
-pub mod readvertise;
 pub mod rib;
 pub mod routing;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod signals_driver;
 pub mod stages;
+pub mod traceroute;
 pub mod unsolicited;
 #[cfg(target_arch = "wasm32")]
 pub mod wasm_builder;
 
+pub use activity::NameActivityObserver;
 #[cfg(not(target_arch = "wasm32"))]
 pub use builder::{EngineBuilder, EngineConfig};
-pub use activity::NameActivityObserver;
 pub use compose::ComposedStrategy;
-pub use traceroute::TracerouteResponder;
+pub use discovery_context::EngineDiscoveryContext;
+pub use dispatcher::DataPlane;
 pub use egress::{
     DeficitRoundRobinScheduler, EgressClassifier, EgressScheduler, EgressSchedulerFactory,
     PrefixClassifier, PriorityScheduler, TrafficClass,
 };
-pub use discovery_context::EngineDiscoveryContext;
-pub use dispatcher::DataPlane;
 pub use engine::{FaceCounters, FaceState, ForwarderEngine, ShutdownHandle};
+pub use traceroute::TracerouteResponder;
 // Cross-layer signal access for callers of `ForwarderEngine::signals()` /
 // `EngineBuilder::signals()` — the traits needed to read/write the store.
-pub use ndn_strategy::{LinkSignals, SignalStore, SignalView, SignalsTable};
-pub use ndn_runtime::{Runtime, Spawn};
 pub use enricher::ContextEnricher;
 pub use fib::{Fib, FibEntry, FibNexthop};
+#[cfg(not(target_arch = "wasm32"))]
+pub use installable::{InstallableProtocol, PostBuildQueue};
+pub use ndn_runtime::{Runtime, Spawn};
+pub use ndn_strategy::{LinkSignals, SignalStore, SignalView, SignalsTable};
 pub use path_control::{
     PathAuthorizer, PathControlHandler, PathControlObserver, ValidatorAuthorizer,
 };
-#[cfg(not(target_arch = "wasm32"))]
-pub use installable::{InstallableProtocol, PostBuildQueue};
-pub use replay_guard_config::ReplayGuardConfig;
 pub use readvertise::{ReadvertiseDestination, ReadvertisedPrefixes, should_readvertise};
+pub use replay_guard_config::ReplayGuardConfig;
 pub use rib::{Rib, RibRoute};
 pub use routing::{
     ConfigError, ConfigUpdate, LsdbEntry, NeighborInfo, RoutingHandle, RoutingManager,

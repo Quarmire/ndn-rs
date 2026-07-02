@@ -3,6 +3,7 @@ name = "ndn-runtime"
 description = "Platform-agnostic async runtime traits for ndn-rs: Spawn, Sleep, Now"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [package.metadata.scope]
@@ -26,3 +27,6 @@ tokio = { workspace = true, features = ["rt", "time"] }
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen-futures = "0.4"
 gloo-timers          = { version = "0.3", features = ["futures"] }
+
+[lints]
+workspace = true

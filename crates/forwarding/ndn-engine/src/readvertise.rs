@@ -61,7 +61,12 @@ impl ReadvertisedPrefixes {
 
     /// The current readvertised prefix set, in canonical name order.
     pub fn snapshot(&self) -> Vec<Name> {
-        self.set.lock().expect("readvertise set poisoned").iter().cloned().collect()
+        self.set
+            .lock()
+            .expect("readvertise set poisoned")
+            .iter()
+            .cloned()
+            .collect()
     }
 
     /// Resolve once the set changes (a prefix was added or removed). A
@@ -72,7 +77,10 @@ impl ReadvertisedPrefixes {
 
     /// Whether the set is empty (introspection/tests).
     pub fn is_empty(&self) -> bool {
-        self.set.lock().expect("readvertise set poisoned").is_empty()
+        self.set
+            .lock()
+            .expect("readvertise set poisoned")
+            .is_empty()
     }
 }
 

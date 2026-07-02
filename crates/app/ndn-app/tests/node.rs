@@ -27,7 +27,9 @@ async fn node_serve_and_fetch() {
 
     let _guard = alice
         .serve("/alice", |interest, reply| async move {
-            let _ = reply.respond((*interest.name).clone(), "hi from alice").await;
+            let _ = reply
+                .respond((*interest.name).clone(), "hi from alice")
+                .await;
         })
         .await
         .expect("serve");
@@ -94,7 +96,11 @@ async fn engine_node_serve_object_roundtrip() {
         .await
         .expect("serve_object");
 
-    let got = bob.object("/alice/blob").fetch().await.expect("fetch_object");
+    let got = bob
+        .object("/alice/blob")
+        .fetch()
+        .await
+        .expect("fetch_object");
     assert_eq!(got.len(), payload.len());
     assert_eq!(&got[..], &payload[..]);
 

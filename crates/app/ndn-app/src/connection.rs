@@ -9,10 +9,10 @@ use bytes::Bytes;
 // `InProcHandle` is the same type on both targets — `ndn-face-native` simply
 // re-exports it from `ndn-face-local`. The wasm path imports it directly so it
 // doesn't pull `ndn-face-native`'s OS-socket transports.
-#[cfg(target_arch = "wasm32")]
-use ndn_face_local::InProcHandle;
 #[cfg(not(target_arch = "wasm32"))]
 use ndn_face::local::InProcHandle;
+#[cfg(target_arch = "wasm32")]
+use ndn_face_local::InProcHandle;
 #[cfg(not(target_arch = "wasm32"))]
 use ndn_ipc::ForwarderClient;
 use ndn_packet::Name;

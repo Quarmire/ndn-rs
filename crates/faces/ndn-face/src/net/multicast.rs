@@ -221,9 +221,10 @@ mod tests {
 
         let expected = ndn_packet::lp::encode_lp_packet(&pkt);
 
-        match tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv_bytes()).await {
-            Ok(Ok(received)) => assert_eq!(received, expected),
-            _ => {}
+        if let Ok(Ok(received)) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv_bytes()).await
+        {
+            assert_eq!(received, expected)
         }
     }
 }

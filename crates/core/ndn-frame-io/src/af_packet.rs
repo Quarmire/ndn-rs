@@ -16,6 +16,10 @@
 //! **Compile-verified on Linux only.** The platform-neutral core (radiotap
 //! codec + loopback bus) is exercised by the crate's unit tests on every host.
 
+// Raw-socket FFI boundary — the one module in this crate allowed to use
+// `unsafe` under the workspace `deny(unsafe_code)` policy.
+#![allow(unsafe_code)]
+
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use async_trait::async_trait;
@@ -173,9 +177,8 @@ impl crate::FrameIo for AfPacketBackend {
             // re-registers with the edge-triggered epoll); a plain `recv` + manual
             // clear can wedge after the first packet on a busy monitor socket.
             let n = match guard.try_io(|_| {
-                let n = unsafe {
-                    libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0)
-                };
+                let n =
+                    unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
                 if n < 0 {
                     Err(std::io::Error::last_os_error())
                 } else {

@@ -44,14 +44,20 @@ fn ext_set(surfaces: &[Arc<dyn ControlSurface>], params: ControlParameters) -> C
     let spec = match params.uri.as_deref() {
         Some(s) if !s.is_empty() => s,
         _ => {
-            return ControlResponse::error(status::BAD_PARAMS, "Uri must be '<name> <key> <value>'");
+            return ControlResponse::error(
+                status::BAD_PARAMS,
+                "Uri must be '<name> <key> <value>'",
+            );
         }
     };
     let mut it = spec.splitn(3, ' ');
     let (name, key, value) = match (it.next(), it.next(), it.next()) {
         (Some(n), Some(k), Some(v)) => (n, k, v),
         _ => {
-            return ControlResponse::error(status::BAD_PARAMS, "Uri must be '<name> <key> <value>'");
+            return ControlResponse::error(
+                status::BAD_PARAMS,
+                "Uri must be '<name> <key> <value>'",
+            );
         }
     };
     match surfaces.iter().find(|s| s.name() == name) {

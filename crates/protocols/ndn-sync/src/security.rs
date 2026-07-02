@@ -105,8 +105,8 @@ impl HmacKey {
     }
 
     fn mac(&self, region: &[u8]) -> Bytes {
-        let mut m = HmacSha256::new_from_slice(&self.key)
-            .expect("HMAC accepts a key of any length");
+        let mut m =
+            HmacSha256::new_from_slice(&self.key).expect("HMAC accepts a key of any length");
         m.update(region);
         Bytes::copy_from_slice(&m.finalize().into_bytes())
     }
@@ -131,11 +131,12 @@ impl SyncValidator for HmacKey {
         }
         let region = interest.signed_region().ok_or(Rejected::Malformed)?;
         let sig = interest.sig_value().ok_or(Rejected::Unsigned)?;
-        let mut m = HmacSha256::new_from_slice(&self.key)
-            .expect("HMAC accepts a key of any length");
+        let mut m =
+            HmacSha256::new_from_slice(&self.key).expect("HMAC accepts a key of any length");
         m.update(&region);
         // `verify_slice` is constant-time.
-        m.verify_slice(sig.as_ref()).map_err(|_| Rejected::BadSignature)
+        m.verify_slice(sig.as_ref())
+            .map_err(|_| Rejected::BadSignature)
     }
 }
 

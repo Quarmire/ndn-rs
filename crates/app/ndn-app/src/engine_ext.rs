@@ -29,10 +29,10 @@ use bytes::Bytes;
 use ndn_engine::{Fib, ForwarderEngine};
 // Same `InProcFace` type on both targets; the wasm path imports it straight
 // from `ndn-face-local` to avoid `ndn-face-native`'s OS-socket transports.
-#[cfg(target_arch = "wasm32")]
-use ndn_face_local::InProcFace;
 #[cfg(not(target_arch = "wasm32"))]
 use ndn_face::local::InProcFace;
+#[cfg(target_arch = "wasm32")]
+use ndn_face_local::InProcFace;
 use ndn_packet::Name;
 use ndn_transport::FaceId;
 use tokio_util::sync::CancellationToken;

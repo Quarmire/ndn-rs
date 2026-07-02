@@ -136,27 +136,17 @@ impl Strategy for MeasuredStrategy {
         }
     }
 
-    fn after_receive_interest(
-        &self,
-        ctx: &StrategyContext<'_>,
-    ) -> SmallVec<[ForwardingAction; 2]> {
+    fn after_receive_interest(&self, ctx: &StrategyContext<'_>) -> SmallVec<[ForwardingAction; 2]> {
         self.decide(ctx).unwrap()
     }
 
-    fn after_receive_data(
-        &self,
-        _ctx: &StrategyContext<'_>,
-    ) -> SmallVec<[ForwardingAction; 2]> {
+    fn after_receive_data(&self, _ctx: &StrategyContext<'_>) -> SmallVec<[ForwardingAction; 2]> {
         SmallVec::new()
     }
 
     /// On Nack, retry on the next-best nexthop (the nacking `in_face` is already
     /// excluded by [`Self::ranked`]); propagate downstream if none remain.
-    fn on_nack(
-        &self,
-        ctx: &StrategyContext<'_>,
-        reason: NackReason,
-    ) -> ForwardingAction {
+    fn on_nack(&self, ctx: &StrategyContext<'_>, reason: NackReason) -> ForwardingAction {
         match self.ranked(ctx).first() {
             Some(&face_id) => ForwardingAction::Forward(smallvec![face_id]),
             None => ForwardingAction::Nack(reason),
@@ -199,9 +189,18 @@ mod tests {
         let name: Arc<Name> = Arc::new("/ndn/node/peer".parse().unwrap());
         let fib = FibEntry {
             nexthops: vec![
-                FibNexthop { face_id: FaceId(8), cost: 20 }, // NAN
-                FibNexthop { face_id: FaceId(11), cost: 10 }, // NDP
-                FibNexthop { face_id: FaceId(9), cost: 50 }, // BLE
+                FibNexthop {
+                    face_id: FaceId(8),
+                    cost: 20,
+                }, // NAN
+                FibNexthop {
+                    face_id: FaceId(11),
+                    cost: 10,
+                }, // NDP
+                FibNexthop {
+                    face_id: FaceId(9),
+                    cost: 50,
+                }, // BLE
             ],
         };
         let signals = SignalsTable::new();
@@ -209,7 +208,12 @@ mod tests {
         let rt: Arc<dyn ndn_runtime::Runtime> = ndn_runtime::default_runtime();
         let ext = ndn_transport::AnyMap::new();
         let s = MeasuredStrategy::new();
-        assert_eq!(s.ranked(&ctx_with(&name, &fib, &signals, &measurements, &rt, &ext)).first().copied(), Some(FaceId(11)));
+        assert_eq!(
+            s.ranked(&ctx_with(&name, &fib, &signals, &measurements, &rt, &ext))
+                .first()
+                .copied(),
+            Some(FaceId(11))
+        );
     }
 
     #[test]
@@ -219,8 +223,14 @@ mod tests {
         let name: Arc<Name> = Arc::new("/ndn/node/peer".parse().unwrap());
         let fib = FibEntry {
             nexthops: vec![
-                FibNexthop { face_id: FaceId(11), cost: 10 }, // NDP, degraded
-                FibNexthop { face_id: FaceId(9), cost: 50 },  // BLE, clean
+                FibNexthop {
+                    face_id: FaceId(11),
+                    cost: 10,
+                }, // NDP, degraded
+                FibNexthop {
+                    face_id: FaceId(9),
+                    cost: 50,
+                }, // BLE, clean
             ],
         };
         let signals = SignalsTable::new();
@@ -237,7 +247,9 @@ mod tests {
         let ext = ndn_transport::AnyMap::new();
         let s = MeasuredStrategy::new();
         assert_eq!(
-            s.ranked(&ctx_with(&name, &fib, &signals, &measurements, &rt, &ext)).first().copied(),
+            s.ranked(&ctx_with(&name, &fib, &signals, &measurements, &rt, &ext))
+                .first()
+                .copied(),
             Some(FaceId(9)),
             "a congested 800ms NDP should lose to a clean BLE despite lower static cost",
         );

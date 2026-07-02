@@ -21,11 +21,7 @@ pub trait ErasedStrategy: Send + Sync + 'static {
         ctx: &StrategyContext<'_>,
     ) -> SmallVec<[ForwardingAction; 2]>;
 
-    fn on_nack_erased(
-        &self,
-        ctx: &StrategyContext<'_>,
-        reason: NackReason,
-    ) -> ForwardingAction;
+    fn on_nack_erased(&self, ctx: &StrategyContext<'_>, reason: NackReason) -> ForwardingAction;
 }
 
 impl<S: Strategy> ErasedStrategy for S {
@@ -44,11 +40,7 @@ impl<S: Strategy> ErasedStrategy for S {
         self.after_receive_interest(ctx)
     }
 
-    fn on_nack_erased(
-        &self,
-        ctx: &StrategyContext<'_>,
-        reason: NackReason,
-    ) -> ForwardingAction {
+    fn on_nack_erased(&self, ctx: &StrategyContext<'_>, reason: NackReason) -> ForwardingAction {
         self.on_nack(ctx, reason)
     }
 }

@@ -280,7 +280,9 @@ impl WireSignResponse {
                 signature: signature.ok_or_else(|| missing("Signature"))?,
             }),
             STATUS_DENIED => Ok(Self::Denied { req_id }),
-            other => Err(CustodianError::SignFailed(format!("bad status byte {other}"))),
+            other => Err(CustodianError::SignFailed(format!(
+                "bad status byte {other}"
+            ))),
         }
     }
 }
@@ -436,11 +438,7 @@ pub struct RemoteSignerResponder<C: SignerChannel> {
 }
 
 impl<C: SignerChannel> RemoteSignerResponder<C> {
-    pub fn new(
-        channel: C,
-        signer: Arc<dyn crate::Signer>,
-        gate: Arc<dyn ApprovalGate>,
-    ) -> Self {
+    pub fn new(channel: C, signer: Arc<dyn crate::Signer>, gate: Arc<dyn ApprovalGate>) -> Self {
         Self {
             channel,
             signer,
@@ -489,9 +487,7 @@ impl<C: SignerChannel> RemoteSignerResponder<C> {
 mod tests {
     use super::*;
     use crate::verifier::EcdsaSha256Verifier;
-    use crate::{
-        EcdsaP256Signer, Ed25519Signer, Ed25519Verifier, Signer, VerifyOutcome, Verifier,
-    };
+    use crate::{EcdsaP256Signer, Ed25519Signer, Ed25519Verifier, Signer, Verifier, VerifyOutcome};
     use tokio::sync::{Mutex, mpsc};
 
     /// A loopback remote signer: signs locally, standing in for the remote
@@ -558,8 +554,12 @@ mod tests {
             signer: Ed25519Signer::from_seed(&[1u8; 32], name.clone()),
             reachable: false,
         });
-        let custodian =
-            RemoteCustodian::new(transport, CustodianRef::Remote { reachable_via: name });
+        let custodian = RemoteCustodian::new(
+            transport,
+            CustodianRef::Remote {
+                reachable_via: name,
+            },
+        );
         assert!(!custodian.is_available().await);
         assert!(matches!(
             custodian.unlock(UnlockContext::default()).await,

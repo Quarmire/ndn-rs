@@ -14,9 +14,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use crate::{Signer, TrustError};
 use bytes::Bytes;
 use ndn_packet::{Name, SignatureType};
-use crate::{Signer, TrustError};
 
 use crate::custodian::{Custodian, KeyId};
 

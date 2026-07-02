@@ -23,6 +23,9 @@ pub mod scoped_signing;
 
 pub use browser_extension::BrowserExtensionCustodian;
 pub use enclave::{EnclaveBackend, EnclaveCustodian};
+pub use in_page::InPageCustodian;
+#[cfg(not(target_arch = "wasm32"))]
+pub use os_keyring::OsKeyringCustodian;
 pub use remote_signer::{
     ApprovalGate, ChannelRemoteSigner, PairingOffer, RemoteCustodian, RemoteSignRequest,
     RemoteSignerResponder, RemoteSignerTransport, SignerChannel, WireSignRequest, WireSignResponse,
@@ -30,9 +33,6 @@ pub use remote_signer::{
 pub use scoped_signing::{
     ActionClass, Decision, ScopedApprovalGate, ScopedGrant, ScopedSigningPolicy,
 };
-pub use in_page::InPageCustodian;
-#[cfg(not(target_arch = "wasm32"))]
-pub use os_keyring::OsKeyringCustodian;
 
 #[derive(Debug, thiserror::Error)]
 #[allow(clippy::large_enum_variant)]

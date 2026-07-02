@@ -3,6 +3,7 @@ name = "ndn-frame-io"
 description = "Backend-agnostic link-layer frame I/O for ndn-rs: the FrameIo trait, inject/capture frame types, on-air framing per FrameFormat, and reusable AF_PACKET + loopback backends. The substrate the radio faces (ndn-face-monitor-wifi) are built on."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [package.metadata.scope]
@@ -18,3 +19,6 @@ tokio         = { workspace = true, features = ["sync", "rt", "net", "time"] }
 # loopback backend + the frame/radiotap codecs are platform-independent.
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
+
+[lints]
+workspace = true

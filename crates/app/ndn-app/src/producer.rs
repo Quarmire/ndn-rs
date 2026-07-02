@@ -6,10 +6,10 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
-#[cfg(target_arch = "wasm32")]
-use ndn_face_local::InProcHandle;
 #[cfg(not(target_arch = "wasm32"))]
 use ndn_face::local::InProcHandle;
+#[cfg(target_arch = "wasm32")]
+use ndn_face_local::InProcHandle;
 #[cfg(not(target_arch = "wasm32"))]
 use ndn_ipc::{ChunkedProducer, ForwarderClient};
 use ndn_packet::encode::DataBuilder;
@@ -268,8 +268,12 @@ impl Producer {
         size: u64,
         chunk_size: usize,
     ) -> Result<(), AppError> {
-        let prepared =
-            crate::rdr::PreparedObject::build_from_file(name, file, size, self.seg_size(chunk_size));
+        let prepared = crate::rdr::PreparedObject::build_from_file(
+            name,
+            file,
+            size,
+            self.seg_size(chunk_size),
+        );
         self.serve_object(prepared).await
     }
 
@@ -420,8 +424,7 @@ impl Router {
                 Err(_) => continue,
             };
             if let Some(handler) = self.match_handler(&interest.name) {
-                let responder =
-                    Responder::new(Arc::clone(&self.conn), raw, self.signer.clone());
+                let responder = Responder::new(Arc::clone(&self.conn), raw, self.signer.clone());
                 handler(interest, responder).await;
             }
         }
@@ -474,7 +477,9 @@ mod router_tests {
             InterestBuilder::new("/app/data/v1".parse::<Name>().unwrap()).build(),
             InterestBuilder::new("/app/unmatched".parse::<Name>().unwrap()).build(),
         ]);
-        let conn = Arc::new(QueueConn { q: Mutex::new(interests) });
+        let conn = Arc::new(QueueConn {
+            q: Mutex::new(interests),
+        });
 
         let hits: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let tag = |label: &'static str, hits: Arc<Mutex<Vec<String>>>| {

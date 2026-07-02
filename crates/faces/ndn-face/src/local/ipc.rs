@@ -87,7 +87,13 @@ pub fn ipc_face_from_raw_fd(
     let std_stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
     std_stream.set_nonblocking(true)?;
     let (r, w) = tokio::net::UnixStream::from_std(std_stream)?.into_split();
-    Ok(make_face(id, kind, format!("fd://{fd}"), Box::new(r), Box::new(w)))
+    Ok(make_face(
+        id,
+        kind,
+        format!("fd://{fd}"),
+        Box::new(r),
+        Box::new(w),
+    ))
 }
 
 #[cfg(unix)]

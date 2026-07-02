@@ -75,7 +75,12 @@ async fn extra_module_is_registered_and_routes() {
 
     // The extra module routes...
     let resp = router
-        .dispatch(b"teststub", b"ping", ControlParameters::default(), &ctx(&engine, &cancel, &config))
+        .dispatch(
+            b"teststub",
+            b"ping",
+            ControlParameters::default(),
+            &ctx(&engine, &cancel, &config),
+        )
         .await;
     match resp {
         MgmtResponse::Control(cr) => assert_eq!(cr.status_text, "pong", "extra module answered"),
@@ -85,13 +90,26 @@ async fn extra_module_is_registered_and_routes() {
     // ...and a built-in still routes (extras are additive, not a replacement).
     // `*/list` verbs answer with a Dataset, not a Control response.
     let faces = router
-        .dispatch(b"faces", b"list", ControlParameters::default(), &ctx(&engine, &cancel, &config))
+        .dispatch(
+            b"faces",
+            b"list",
+            ControlParameters::default(),
+            &ctx(&engine, &cancel, &config),
+        )
         .await;
-    assert!(matches!(faces, MgmtResponse::Dataset(_)), "built-in faces/list still routes");
+    assert!(
+        matches!(faces, MgmtResponse::Dataset(_)),
+        "built-in faces/list still routes"
+    );
 
     // An unregistered module is NOT_FOUND.
     let missing = router
-        .dispatch(b"nope", b"x", ControlParameters::default(), &ctx(&engine, &cancel, &config))
+        .dispatch(
+            b"nope",
+            b"x",
+            ControlParameters::default(),
+            &ctx(&engine, &cancel, &config),
+        )
         .await;
     match missing {
         MgmtResponse::Control(cr) => assert_eq!(cr.status_code, status::NOT_FOUND),

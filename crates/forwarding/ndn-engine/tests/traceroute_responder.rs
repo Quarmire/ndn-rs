@@ -51,7 +51,10 @@ async fn expired_trace_probe_draws_node_identity() {
         .build();
     handle.send(plain).await.unwrap();
     let silent = tokio::time::timeout(Duration::from_millis(300), handle.recv()).await;
-    assert!(silent.is_err(), "an unmarked hop-limited Interest must drop silently");
+    assert!(
+        silent.is_err(),
+        "an unmarked hop-limited Interest must drop silently"
+    );
 
     drop(engine);
     shutdown.shutdown().await;

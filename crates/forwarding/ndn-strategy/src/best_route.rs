@@ -72,17 +72,11 @@ impl Strategy for BestRouteStrategy {
         }
     }
 
-    fn after_receive_interest(
-        &self,
-        ctx: &StrategyContext<'_>,
-    ) -> SmallVec<[ForwardingAction; 2]> {
+    fn after_receive_interest(&self, ctx: &StrategyContext<'_>) -> SmallVec<[ForwardingAction; 2]> {
         self.decide(ctx).unwrap()
     }
 
-    fn after_receive_data(
-        &self,
-        _ctx: &StrategyContext<'_>,
-    ) -> SmallVec<[ForwardingAction; 2]> {
+    fn after_receive_data(&self, _ctx: &StrategyContext<'_>) -> SmallVec<[ForwardingAction; 2]> {
         SmallVec::new()
     }
 
@@ -292,8 +286,14 @@ mod tests {
         let measurements = MeasurementsTable::new();
         let fib = FibEntry {
             nexthops: vec![
-                FibNexthop { face_id: FaceId(2), cost: 10 },
-                FibNexthop { face_id: FaceId(3), cost: 20 },
+                FibNexthop {
+                    face_id: FaceId(2),
+                    cost: 10,
+                },
+                FibNexthop {
+                    face_id: FaceId(3),
+                    cost: 20,
+                },
             ],
         };
         // Face 2 already tried → the lowest-cost UNTRIED nexthop (3) is chosen.
@@ -314,7 +314,10 @@ mod tests {
         let name = Arc::new(Name::root());
         let measurements = MeasurementsTable::new();
         let fib = FibEntry {
-            nexthops: vec![FibNexthop { face_id: FaceId(2), cost: 10 }],
+            nexthops: vec![FibNexthop {
+                face_id: FaceId(2),
+                cost: 10,
+            }],
         };
         let tried = [FaceId(2)];
         let ctx = make_ctx_tried(&name, FaceId(1), Some(&fib), &measurements, &tried);
@@ -334,8 +337,14 @@ mod tests {
         let measurements = MeasurementsTable::new();
         let fib = FibEntry {
             nexthops: vec![
-                FibNexthop { face_id: FaceId(2), cost: 10 },
-                FibNexthop { face_id: FaceId(3), cost: 20 },
+                FibNexthop {
+                    face_id: FaceId(2),
+                    cost: 10,
+                },
+                FibNexthop {
+                    face_id: FaceId(3),
+                    cost: 20,
+                },
             ],
         };
         // Nack arrives from face 2; face 3 already tried → no untried upstream

@@ -1,0 +1,8 @@
+# Pinned dev/CI toolchain. This is the version every contributor and CI job
+# builds with; MSRV (the oldest supported consumer toolchain) is declared
+# separately as `rust-version` in Cargo.toml and verified by the `msrv` CI job.
+# Bump this deliberately — it changes what rustfmt/clippy enforce.
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]
+targets = ["wasm32-unknown-unknown", "riscv32imc-unknown-none-elf"]

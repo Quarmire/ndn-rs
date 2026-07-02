@@ -14,6 +14,10 @@
 //! to the pipeline as a normal FIB next-hop.
 
 #![allow(missing_docs)]
+// One of the two OS-I/O leaf crates permitted to use `unsafe` (the workspace
+// lint policy denies it everywhere else): raw sockets, sendmmsg/recvmmsg,
+// AF_PACKET/ndrv/pcap FFI all live here, behind safe wrappers.
+#![allow(unsafe_code)]
 
 pub mod callback;
 pub use callback::{CallbackFace, TapFace};
@@ -46,7 +50,6 @@ pub use net::{
     tcp_face_connect, tcp_face_from_stream,
 };
 
-
 #[cfg(feature = "local")]
 pub use local::{InProcFace, InProcHandle, IpcFace, IpcListener, ipc_face_connect};
 
@@ -61,9 +64,7 @@ pub use l2::NDN_ETHERTYPE;
 pub use l2::{RadioFaceMetadata, RadioTable};
 
 #[cfg(all(feature = "l2", target_os = "linux"))]
-pub use l2::{
-    MacAddr, MulticastEtherFace, NamedEtherFace, NeighborDiscovery, get_interface_mac,
-};
+pub use l2::{MacAddr, MulticastEtherFace, NamedEtherFace, NeighborDiscovery, get_interface_mac};
 
 #[cfg(all(feature = "l2", target_os = "macos"))]
 pub use l2::{MulticastEtherFace, NamedEtherFace};

@@ -100,7 +100,10 @@ fn build_segmented_dataset(
             // DigestSha256 only when no signer is configured.
             match signer {
                 Some(s) => {
-                    let key_name = s.cert_name().cloned().or_else(|| Some(s.key_name().clone()));
+                    let key_name = s
+                        .cert_name()
+                        .cloned()
+                        .or_else(|| Some(s.key_name().clone()));
                     builder.sign_sync(s.sig_type(), key_name.as_ref(), |region| {
                         s.sign_sync(region).unwrap_or_default()
                     })

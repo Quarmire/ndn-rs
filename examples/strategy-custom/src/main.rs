@@ -95,10 +95,7 @@ impl Strategy for RandomStrategy {
         unreachable!("decide() always returns Some")
     }
 
-    fn after_receive_data(
-        &self,
-        _ctx: &StrategyContext<'_>,
-    ) -> SmallVec<[ForwardingAction; 2]> {
+    fn after_receive_data(&self, _ctx: &StrategyContext<'_>) -> SmallVec<[ForwardingAction; 2]> {
         SmallVec::new()
     }
 }

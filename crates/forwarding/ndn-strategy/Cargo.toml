@@ -3,6 +3,7 @@ name = "ndn-strategy"
 description = "Built-in NDN forwarding strategies"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [package.metadata.scope]
@@ -29,3 +30,6 @@ ndn-packet = { workspace = true, features = ["std-wasm"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }
+
+[lints]
+workspace = true

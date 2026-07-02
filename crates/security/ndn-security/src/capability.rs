@@ -101,14 +101,18 @@ impl Capability {
         w.write_nested(TLV_CAPABILITY, |w| {
             // Names are written as their complete NAME TLV (type 7) inside a
             // typed envelope, mirroring the `abe` container's KgcRef pattern.
-            w.write_nested(TLV_CAP_GRANTEE, |w| w.write_raw(&self.grantee.encode_to_tlv()));
+            w.write_nested(TLV_CAP_GRANTEE, |w| {
+                w.write_raw(&self.grantee.encode_to_tlv())
+            });
             w.write_nested(TLV_CAP_OPERATION, |w| {
                 w.write_raw(&self.operation.encode_to_tlv())
             });
             w.write_nested(TLV_CAP_NOT_BEFORE, |w| {
                 w.write_raw(&self.not_before.to_be_bytes())
             });
-            w.write_nested(TLV_CAP_NOT_AFTER, |w| w.write_raw(&self.not_after.to_be_bytes()));
+            w.write_nested(TLV_CAP_NOT_AFTER, |w| {
+                w.write_raw(&self.not_after.to_be_bytes())
+            });
         });
         w.finish()
     }
@@ -222,7 +226,11 @@ mod tests {
         // Signer key under the grantee identity, op under the authorized prefix,
         // time inside the window.
         assert_eq!(
-            cap.authorizes(&name("/muas/alice/KEY/k1"), &name("/svc/mavlink/execute"), 150),
+            cap.authorizes(
+                &name("/muas/alice/KEY/k1"),
+                &name("/svc/mavlink/execute"),
+                150
+            ),
             Ok(())
         );
     }
@@ -231,7 +239,11 @@ mod tests {
     fn rejects_wrong_grantee() {
         let cap = sample();
         assert_eq!(
-            cap.authorizes(&name("/muas/bob/KEY/k1"), &name("/svc/mavlink/execute"), 150),
+            cap.authorizes(
+                &name("/muas/bob/KEY/k1"),
+                &name("/svc/mavlink/execute"),
+                150
+            ),
             Err(CapabilityError::NotGrantee)
         );
     }
@@ -240,7 +252,11 @@ mod tests {
     fn rejects_out_of_scope_operation() {
         let cap = sample();
         assert_eq!(
-            cap.authorizes(&name("/muas/alice/KEY/k1"), &name("/svc/camera/capture"), 150),
+            cap.authorizes(
+                &name("/muas/alice/KEY/k1"),
+                &name("/svc/camera/capture"),
+                150
+            ),
             Err(CapabilityError::OutOfScope)
         );
     }
@@ -250,9 +266,15 @@ mod tests {
         let cap = sample();
         let signer = name("/muas/alice/KEY/k1");
         let op = name("/svc/mavlink/execute");
-        assert_eq!(cap.authorizes(&signer, &op, 99), Err(CapabilityError::NotYetValid));
+        assert_eq!(
+            cap.authorizes(&signer, &op, 99),
+            Err(CapabilityError::NotYetValid)
+        );
         // not_after is exclusive: exactly at not_after is expired.
-        assert_eq!(cap.authorizes(&signer, &op, 200), Err(CapabilityError::Expired));
+        assert_eq!(
+            cap.authorizes(&signer, &op, 200),
+            Err(CapabilityError::Expired)
+        );
         assert_eq!(cap.authorizes(&signer, &op, 199), Ok(()));
     }
 
@@ -260,7 +282,10 @@ mod tests {
     fn grantee_may_be_an_exact_key_name() {
         // When grantee is a full key name, only that exact key matches.
         let cap = Capability::new(name("/muas/alice/KEY/k1"), name("/svc"), 0, 10);
-        assert_eq!(cap.authorizes(&name("/muas/alice/KEY/k1"), &name("/svc/x"), 5), Ok(()));
+        assert_eq!(
+            cap.authorizes(&name("/muas/alice/KEY/k1"), &name("/svc/x"), 5),
+            Ok(())
+        );
         assert_eq!(
             cap.authorizes(&name("/muas/alice/KEY/k2"), &name("/svc/x"), 5),
             Err(CapabilityError::NotGrantee)

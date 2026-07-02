@@ -745,7 +745,10 @@ mod tests {
         let decoded = V2
             .decode_state_vector(&Bytes::copy_from_slice(ap))
             .expect("must decode StateVector");
-        assert!(!decoded.is_empty(), "state vector should contain local node");
+        assert!(
+            !decoded.is_empty(),
+            "state vector should contain local node"
+        );
     }
 
     /// Build a raw Sync Interest carrying `entries` as its state vector,
@@ -822,7 +825,9 @@ mod tests {
 
         // A V3 peer parses it; the local entry carries our boot.
         let (entries, _) = parse_sync_interest(&group, &raw, WireDialect::V3).expect("v3 parse");
-        let me = entries.iter().find(|e| e.name.to_string() == "/app/v3/node");
+        let me = entries
+            .iter()
+            .find(|e| e.name.to_string() == "/app/v3/node");
         assert_eq!(me.map(|e| e.boot), Some(1_700_000_000_000));
 
         // A V2 peer rejects it on the version component.
@@ -964,7 +969,10 @@ mod tests {
             .expect("update");
 
         let expected: Name = peer.parse().unwrap();
-        assert_eq!(update.name, expected, "fetch name must be the publisher Name");
+        assert_eq!(
+            update.name, expected,
+            "fetch name must be the publisher Name"
+        );
         assert_eq!(
             update.name.components().len(),
             expected.components().len(),
@@ -994,13 +1002,19 @@ mod tests {
         let unsigned = peer_sync_interest(&group, &[("/ndn/svs/peer", 4)]);
         recv_tx.send(unsigned).await.unwrap();
         let none = tokio::time::timeout(Duration::from_millis(300), handle.recv()).await;
-        assert!(none.is_err(), "unsigned interest must not produce an update");
+        assert!(
+            none.is_err(),
+            "unsigned interest must not produce an update"
+        );
 
         // Correctly HMAC-signed peer Interest → accepted, update emitted.
         let signed = key.sign(
             InterestBuilder::new(group.clone().append_version(V2.sync_version()))
                 .lifetime(Duration::from_millis(1000))
-                .app_parameters(V2.encode_state_vector(&sv(&[("/ndn/svs/peer", 4)])).to_vec()),
+                .app_parameters(
+                    V2.encode_state_vector(&sv(&[("/ndn/svs/peer", 4)]))
+                        .to_vec(),
+                ),
         );
         recv_tx.send(signed).await.unwrap();
         let upd = tokio::time::timeout(Duration::from_secs(2), handle.recv())

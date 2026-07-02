@@ -3,6 +3,7 @@ name = "ndn-storage"
 description = "Pluggable async storage engine: an ordered byte key→value Backend (in-memory + fjall LSM). The substrate the named-data Repo/CS, content-addressed stores, and NDF's BlockStore build on — one engine, many data models."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [package.metadata.scope]
@@ -50,3 +51,6 @@ redb = { version = "4", optional = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 # A linkable critical-section impl so the `sync` engine's tests run on the host.
 critical-section = { version = "1", features = ["std"] }
+
+[lints]
+workspace = true

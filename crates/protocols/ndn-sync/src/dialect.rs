@@ -153,21 +153,47 @@ mod tests {
     #[test]
     fn v2_roundtrip_ignores_boot() {
         let entries = vec![
-            StateEntry { name: n("/a"), boot: 999, seq: 5 },
-            StateEntry { name: n("/b"), boot: 7, seq: 12 },
+            StateEntry {
+                name: n("/a"),
+                boot: 999,
+                seq: 5,
+            },
+            StateEntry {
+                name: n("/b"),
+                boot: 7,
+                seq: 12,
+            },
         ];
         let wire = WireDialect::V2.encode_state_vector(&entries);
         assert_eq!(wire[0], 0xC9, "V2 StateVector type 201");
         let decoded = WireDialect::V2.decode_state_vector(&wire).expect("decode");
         assert_eq!(decoded.len(), 2);
         // boot is not carried on the v2 wire → comes back 0.
-        assert_eq!(decoded[0], StateEntry { name: n("/a"), boot: 0, seq: 5 });
-        assert_eq!(decoded[1], StateEntry { name: n("/b"), boot: 0, seq: 12 });
+        assert_eq!(
+            decoded[0],
+            StateEntry {
+                name: n("/a"),
+                boot: 0,
+                seq: 5
+            }
+        );
+        assert_eq!(
+            decoded[1],
+            StateEntry {
+                name: n("/b"),
+                boot: 0,
+                seq: 12
+            }
+        );
     }
 
     #[test]
     fn v3_roundtrip_carries_boot() {
-        let entries = vec![StateEntry { name: n("/r"), boot: 12345, seq: 9 }];
+        let entries = vec![StateEntry {
+            name: n("/r"),
+            boot: 12345,
+            seq: 9,
+        }];
         let wire = WireDialect::V3.encode_state_vector(&entries);
         assert_eq!(wire[0], 0xC9, "V3 SvsData type 0xC9");
         let decoded = WireDialect::V3.decode_state_vector(&wire).expect("decode");
@@ -187,7 +213,15 @@ mod tests {
         // should fail to produce matching entries.
         let as_v3 = WireDialect::V3.decode_state_vector(&v2);
         assert!(
-            as_v3.is_none() || as_v3.as_deref() != Some(&[StateEntry { name: n("/x"), boot: 0, seq: 1 }][..]),
+            as_v3.is_none()
+                || as_v3.as_deref()
+                    != Some(
+                        &[StateEntry {
+                            name: n("/x"),
+                            boot: 0,
+                            seq: 1
+                        }][..]
+                    ),
             "v2 bytes must not round-trip through the v3 decoder"
         );
     }

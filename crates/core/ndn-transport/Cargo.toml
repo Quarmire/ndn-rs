@@ -3,6 +3,7 @@ name = "ndn-transport"
 description = "NDN Face trait, FaceId, FaceTable, RawPacket, TlvCodec, and FacePairTable"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [package.metadata.scope]
@@ -42,3 +43,6 @@ criterion = { workspace = true }
 [[bench]]
 name = "face_otel_overhead"
 harness = false
+
+[lints]
+workspace = true

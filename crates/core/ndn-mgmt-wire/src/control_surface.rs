@@ -68,6 +68,8 @@ pub trait ControlSurface: Send + Sync {
     /// value, immutable).
     fn set_option(&self, key: &str, value: &str) -> Result<(), String> {
         let _ = (key, value);
-        Err(String::from("read-only: this subsystem exposes no settable options"))
+        Err(String::from(
+            "read-only: this subsystem exposes no settable options",
+        ))
     }
 }

@@ -3,6 +3,7 @@ name = "ndn-mgmt-wire"
 description = "Shared no_std codec for NFD management wire formats (ForwarderStatus dataset), used byte-identically by the native engine and the embedded forwarder"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [package.metadata.scope]
@@ -19,3 +20,6 @@ bytes   = { workspace = true }
 # Direct (not workspace-inherited) so we can set default-features = false for
 # no_std (thiserror 2 supports no_std without its std feature).
 thiserror = { version = "2", default-features = false }
+
+[lints]
+workspace = true

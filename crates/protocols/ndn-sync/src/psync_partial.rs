@@ -34,7 +34,7 @@ use tokio_util::sync::CancellationToken;
 use crate::protocol::{SyncHandle, SyncUpdate};
 use crate::psync_bloom::BloomFilter;
 use crate::psync_sync::{
-    ProducerBase, PSyncInbound, build_psync_content, decode_ibf, encode_ibf, parse_prefix_seq,
+    PSyncInbound, ProducerBase, build_psync_content, decode_ibf, encode_ibf, parse_prefix_seq,
     parse_psync_payload,
 };
 use crate::rt;
@@ -215,7 +215,9 @@ async fn serve_sync(
     let names = filtered_difference(pb, &consumer_ibf, &bf);
     match names {
         Some(names) if !names.is_empty() => {
-            let base = interest_name.clone().append_component(current_ibf_component(pb));
+            let base = interest_name
+                .clone()
+                .append_component(current_ibf_component(pb));
             publish_segments(&base, &names, config, seg_store, send).await;
         }
         Some(_) => {
@@ -246,7 +248,9 @@ async fn serve_sync(
             // behind. Reply with the whole subscribed-to set + a fresh IBF
             // so it resynchronises (instead of a separate application Nack).
             let all = subscribed_state(pb, &bf);
-            let base = interest_name.clone().append_component(current_ibf_component(pb));
+            let base = interest_name
+                .clone()
+                .append_component(current_ibf_component(pb));
             publish_segments(&base, &all, config, seg_store, send).await;
         }
     }
@@ -336,8 +340,16 @@ pub fn join_psync_partial_consumer(
 
     let task_cancel = cancel.clone();
     rt::spawn(async move {
-        partial_consumer_task(sync_prefix, send, recv, subscribe_rx, update_tx, config, task_cancel)
-            .await;
+        partial_consumer_task(
+            sync_prefix,
+            send,
+            recv,
+            subscribe_rx,
+            update_tx,
+            config,
+            task_cancel,
+        )
+        .await;
     });
 
     SyncHandle::with_subscribe(update_rx, publish_tx, subscribe_tx, cancel)
@@ -395,7 +407,15 @@ async fn partial_consumer_task(
             // Hello bootstrap: learn the producer IBF and, since the hello
             // reply lists the whole set, immediately surface any already-
             // published updates for subscribed prefixes (C++ onHelloData).
-            match fetch_reassemble(&hello_name, &send, &mut recv, &cancel, config.interest_lifetime).await {
+            match fetch_reassemble(
+                &hello_name,
+                &send,
+                &mut recv,
+                &cancel,
+                config.interest_lifetime,
+            )
+            .await
+            {
                 Some((producer_base, content)) => {
                     current_ibf = ibf_value(&producer_base);
                     apply_state(&content, &subs, &mut prefixes, &update_tx).await;
@@ -409,7 +429,15 @@ async fn partial_consumer_task(
         let ibf_comp = NameComponent::generic(current_ibf.clone().unwrap());
         let sync_name = bf.append_to_name(&sync_base).append_component(ibf_comp);
 
-        match fetch_reassemble(&sync_name, &send, &mut recv, &cancel, config.interest_lifetime).await {
+        match fetch_reassemble(
+            &sync_name,
+            &send,
+            &mut recv,
+            &cancel,
+            config.interest_lifetime,
+        )
+        .await
+        {
             Some((producer_base, content)) => {
                 current_ibf = ibf_value(&producer_base);
                 apply_state(&content, &subs, &mut prefixes, &update_tx).await;
@@ -544,12 +572,17 @@ async fn publish_segments(
         .unwrap_or_default()
         .as_micros() as u64;
     let vbase = base.clone().append_version(version);
-    let segs = transfer::segment_blob(&vbase, &content, config.max_segment_size, |name, chunk, last| {
-        DataBuilder::new(name.clone(), chunk)
-            .freshness(Duration::from_secs(1))
-            .final_block_id_typed_seg(last)
-            .sign_digest_sha256()
-    });
+    let segs = transfer::segment_blob(
+        &vbase,
+        &content,
+        config.max_segment_size,
+        |name, chunk, last| {
+            DataBuilder::new(name.clone(), chunk)
+                .freshness(Duration::from_secs(1))
+                .final_block_id_typed_seg(last)
+                .sign_digest_sha256()
+        },
+    );
     if let Some((_, seg0)) = segs.first() {
         let _ = send.send(seg0.clone()).await;
     }
@@ -633,14 +666,22 @@ mod tests {
 
         let producer =
             join_psync_partial_producer(sync_prefix.clone(), p_out, p_in_rx, cfg.clone());
-        let mut consumer =
-            join_psync_partial_consumer(sync_prefix.clone(), c_out, c_in_rx, cfg);
+        let mut consumer = join_psync_partial_consumer(sync_prefix.clone(), c_out, c_in_rx, cfg);
 
         // Producer has two prefixes; consumer subscribes to only one.
-        producer.publish(append_seq(&n("/example/partial/alice"), 3)).await.unwrap();
-        producer.publish(append_seq(&n("/example/partial/bob"), 7)).await.unwrap();
+        producer
+            .publish(append_seq(&n("/example/partial/alice"), 3))
+            .await
+            .unwrap();
+        producer
+            .publish(append_seq(&n("/example/partial/bob"), 7))
+            .await
+            .unwrap();
 
-        consumer.subscribe(n("/example/partial/alice")).await.unwrap();
+        consumer
+            .subscribe(n("/example/partial/alice"))
+            .await
+            .unwrap();
 
         let update = tokio::time::timeout(Duration::from_secs(8), consumer.recv())
             .await
@@ -655,7 +696,10 @@ mod tests {
 
         // bob is not subscribed → never delivered.
         let bob = tokio::time::timeout(Duration::from_millis(600), consumer.recv()).await;
-        assert!(bob.is_err(), "bob must not be delivered to an alice-only consumer");
+        assert!(
+            bob.is_err(),
+            "bob must not be delivered to an alice-only consumer"
+        );
     }
 
     #[tokio::test]
@@ -690,7 +734,10 @@ mod tests {
         // consumer must learn it through its held (long-lived) sync Interest.
         consumer.subscribe(n("/example/live/sensor")).await.unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
-        producer.publish(append_seq(&n("/example/live/sensor"), 42)).await.unwrap();
+        producer
+            .publish(append_seq(&n("/example/live/sensor"), 42))
+            .await
+            .unwrap();
 
         let update = tokio::time::timeout(Duration::from_secs(8), consumer.recv())
             .await
@@ -702,7 +749,7 @@ mod tests {
 
     #[tokio::test]
     async fn subscribe_unsupported_on_full_psync() {
-        use crate::psync_sync::{join_psync_group, PSyncConfig};
+        use crate::psync_sync::{PSyncConfig, join_psync_group};
         let (out_tx, _out_rx) = mpsc::channel::<Bytes>(8);
         let (_in_tx, in_rx) = mpsc::channel::<PSyncInbound>(8);
         let h = join_psync_group(n("/g"), out_tx, in_rx, PSyncConfig::default());

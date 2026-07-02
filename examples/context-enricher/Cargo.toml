@@ -2,6 +2,7 @@
 name = "example-context-enricher"
 version = "0.0.0"
 edition.workspace = true
+rust-version.workspace = true
 publish = false
 
 [dependencies]
@@ -16,3 +17,6 @@ tokio         = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tracing       = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow        = { workspace = true }
+
+[lints]
+workspace = true

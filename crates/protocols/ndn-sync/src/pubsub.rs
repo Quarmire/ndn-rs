@@ -205,10 +205,7 @@ impl SvsPubSub {
                 .chunks(self.max_segment_size)
                 .enumerate()
                 .map(|(i, chunk)| {
-                    let seg_name = app_name
-                        .clone()
-                        .append_version(0)
-                        .append_segment(i as u64);
+                    let seg_name = app_name.clone().append_version(0).append_segment(i as u64);
                     DataBuilder::new(seg_name, chunk)
                         .final_block_id_typed_seg(last)
                         .build()
@@ -422,8 +419,8 @@ fn spawn_interpose(
                             MappingProvider::parse_query(&interest.name, &group)
                         {
                             let list = mappings.list_range(&node, low, high);
-                            let data = DataBuilder::new((*interest.name).clone(), &list.encode())
-                                .build();
+                            let data =
+                                DataBuilder::new((*interest.name).clone(), &list.encode()).build();
                             let _ = net_out.send(data).await;
                         }
                     } else {
@@ -457,10 +454,7 @@ mod tests {
         s.parse().unwrap()
     }
 
-    fn wire_broker(
-        mut from: mpsc::Receiver<Bytes>,
-        to: mpsc::Sender<Bytes>,
-    ) {
+    fn wire_broker(mut from: mpsc::Receiver<Bytes>, to: mpsc::Sender<Bytes>) {
         tokio::spawn(async move {
             while let Some(p) = from.recv().await {
                 if to.send(p).await.is_err() {
@@ -520,7 +514,11 @@ mod tests {
             .expect("publication");
         assert_eq!(got.name, n("/files/big.bin"));
         assert_eq!(got.payload.len(), blob.len(), "reassembled length");
-        assert_eq!(got.payload.as_ref(), blob.as_slice(), "byte-exact reassembly");
+        assert_eq!(
+            got.payload.as_ref(),
+            blob.as_slice(),
+            "byte-exact reassembly"
+        );
     }
 
     #[tokio::test]
@@ -541,7 +539,10 @@ mod tests {
         let mut rx = consumer.subscribe(n("/d")).await;
 
         let blob = vec![7u8; 32];
-        producer.publish(n("/d/exact"), &blob).await.expect("publish");
+        producer
+            .publish(n("/d/exact"), &blob)
+            .await
+            .expect("publish");
         let got = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
             .expect("timed out")

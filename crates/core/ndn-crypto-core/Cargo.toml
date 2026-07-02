@@ -3,6 +3,7 @@ name = "ndn-crypto-core"
 description = "Shared no_std NDN security core: Ed25519/SHA-256 over the signed region + signed-Data wire ops, used byte-identically by the native engine and the embedded forwarder"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [package.metadata.scope]
@@ -23,3 +24,6 @@ chacha20poly1305 = { version = "0.10", default-features = false }
 ndn-packet    = { workspace = true, features = ["std"] }
 bytes         = { workspace = true, features = ["std"] }
 ed25519-dalek = { version = "2" }
+
+[lints]
+workspace = true

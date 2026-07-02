@@ -175,8 +175,8 @@ impl FilePib {
         safebag_wire: &[u8],
         passphrase: &[u8],
     ) -> Result<Certificate, PibError> {
-        use ndn_packet::Data;
         use crate::safebag::SafeBag;
+        use ndn_packet::Data;
         let bag = SafeBag::decode(safebag_wire)
             .map_err(|e| PibError::Corrupt(format!("SafeBag decode: {e}")))?;
         let pkcs8 = bag

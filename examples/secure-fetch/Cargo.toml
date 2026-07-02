@@ -2,6 +2,7 @@
 name = "example-secure-fetch"
 version = "0.0.0"
 edition.workspace = true
+rust-version.workspace = true
 publish = false
 
 [dependencies]
@@ -13,3 +14,6 @@ ndn-face = { workspace = true }
 ndn-app         = { workspace = true }
 tokio           = { workspace = true, features = ["rt-multi-thread", "macros"] }
 anyhow          = { workspace = true }
+
+[lints]
+workspace = true

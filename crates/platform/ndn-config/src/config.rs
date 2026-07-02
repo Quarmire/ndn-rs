@@ -1649,6 +1649,9 @@ file = "/var/log/ndn/router.log"
     }
 
     #[test]
+    // `env::set_var` is unsafe in edition 2024; test-only exception to the
+    // workspace `deny(unsafe_code)`.
+    #[allow(unsafe_code)]
     fn example_file_parses() {
         // The example is a deployment template referencing env-var placeholders;
         // set them so expansion succeeds (unset vars now hard-error — CFG-3).

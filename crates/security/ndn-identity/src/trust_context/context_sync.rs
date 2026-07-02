@@ -210,7 +210,9 @@ mod tests {
         );
 
         let garbage = MapFetcher(Mutex::new(HashMap::from([(
-            Name::from("/x/_sync/v1/devices/d").append_segment(1).to_string(),
+            Name::from("/x/_sync/v1/devices/d")
+                .append_segment(1)
+                .to_string(),
             Bytes::from_static(b"not a bundle"),
         )])));
         assert_eq!(

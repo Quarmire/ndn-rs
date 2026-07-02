@@ -125,7 +125,12 @@ impl Publisher {
         local_name: Name,
         config: PublisherConfig,
     ) -> Result<Self, AppError> {
-        Self::run(Arc::new(InProcConnection::new(handle)), group, local_name, config)
+        Self::run(
+            Arc::new(InProcConnection::new(handle)),
+            group,
+            local_name,
+            config,
+        )
     }
 
     /// Convenience wrapper for an in-process engine handle (browser).
@@ -136,7 +141,12 @@ impl Publisher {
         local_name: Name,
         config: PublisherConfig,
     ) -> Result<Self, AppError> {
-        Self::run(Arc::new(InProcConnection::new(handle)), group, local_name, config)
+        Self::run(
+            Arc::new(InProcConnection::new(handle)),
+            group,
+            local_name,
+            config,
+        )
     }
 
     fn run(
@@ -278,14 +288,23 @@ mod tests {
         // P→S and S→P queues; each node sends on one, receives the other.
         let (p2s_tx, p2s_rx) = mpsc::unbounded_channel::<Bytes>();
         let (s2p_tx, s2p_rx) = mpsc::unbounded_channel::<Bytes>();
-        let pub_conn = Arc::new(LinkConn { out: p2s_tx, inn: Mutex::new(s2p_rx) });
-        let sub_conn = Arc::new(LinkConn { out: s2p_tx, inn: Mutex::new(p2s_rx) });
+        let pub_conn = Arc::new(LinkConn {
+            out: p2s_tx,
+            inn: Mutex::new(s2p_rx),
+        });
+        let sub_conn = Arc::new(LinkConn {
+            out: s2p_tx,
+            inn: Mutex::new(p2s_rx),
+        });
 
         let publisher = Publisher::from_connection(
             pub_conn,
             group.clone(),
             "/demo/room/sensor".parse().unwrap(),
-            PublisherConfig { svs: fast_svs(), ..Default::default() },
+            PublisherConfig {
+                svs: fast_svs(),
+                ..Default::default()
+            },
         )
         .expect("publisher");
 
@@ -321,21 +340,34 @@ mod tests {
         let group: Name = "/demo/files".parse().unwrap();
         let (p2s_tx, p2s_rx) = mpsc::unbounded_channel::<Bytes>();
         let (s2p_tx, s2p_rx) = mpsc::unbounded_channel::<Bytes>();
-        let pub_conn = Arc::new(LinkConn { out: p2s_tx, inn: Mutex::new(s2p_rx) });
-        let sub_conn = Arc::new(LinkConn { out: s2p_tx, inn: Mutex::new(p2s_rx) });
+        let pub_conn = Arc::new(LinkConn {
+            out: p2s_tx,
+            inn: Mutex::new(s2p_rx),
+        });
+        let sub_conn = Arc::new(LinkConn {
+            out: s2p_tx,
+            inn: Mutex::new(p2s_rx),
+        });
 
         let publisher = Publisher::from_connection(
             pub_conn,
             group.clone(),
             "/demo/files/src".parse().unwrap(),
-            PublisherConfig { svs: fast_svs(), ..Default::default() },
+            PublisherConfig {
+                svs: fast_svs(),
+                ..Default::default()
+            },
         )
         .expect("publisher");
         let mut subscriber = Subscriber::from_connection(
             sub_conn,
             group.clone(),
             "/demo/files/sink".parse().unwrap(),
-            SubscriberConfig { auto_fetch: true, fetch_timeout: Duration::from_secs(2), svs: fast_svs() },
+            SubscriberConfig {
+                auto_fetch: true,
+                fetch_timeout: Duration::from_secs(2),
+                svs: fast_svs(),
+            },
         )
         .expect("subscriber");
 

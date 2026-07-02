@@ -3,6 +3,7 @@ name = "ndn-face"
 description = "NDN face implementations: network (UDP/TCP/WS), local (in-process/SHM/Unix), serial (UART/COBS), and link-layer (Ethernet/BLE/WFB)"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 # ── Feature flags ────────────────────────────────────────────────────────────
@@ -90,3 +91,6 @@ criterion  = { workspace = true }
 name    = "face_local"
 harness = false
 path    = "benches/face_local.rs"
+
+[lints]
+workspace = true

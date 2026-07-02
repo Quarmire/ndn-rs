@@ -3,6 +3,7 @@ name = "ndn-identity"
 description = "NDN identity management: NdnIdentity lifecycle, NDNCERT enrollment, fleet zero-touch provisioning"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [package.metadata.scope]
@@ -33,3 +34,6 @@ tokio = { workspace = true, features = ["rt", "macros"] }
 ndn-engine    = { workspace = true }
 ndn-face     = { workspace = true }
 ndn-transport = { workspace = true }
+
+[lints]
+workspace = true

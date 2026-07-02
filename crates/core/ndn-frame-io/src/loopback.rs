@@ -14,7 +14,7 @@ use bytes::Bytes;
 use ndn_transport::FaceError;
 use tokio::sync::{Mutex, broadcast};
 
-use crate::{CapturedFrame, InjectFrame, FrameIo};
+use crate::{CapturedFrame, FrameIo, InjectFrame};
 
 #[derive(Clone)]
 struct AirFrame {

@@ -101,8 +101,7 @@ pub async fn serve_object_stream(
                     .and_then(SubscriptionRequest::find_in)
                 {
                     budget.add_permits(sr.max_data_count.max(1) as usize);
-                } else if let Ok(Some(wire)) =
-                    prepared.answer_interest(&interest.name, None).await
+                } else if let Ok(Some(wire)) = prepared.answer_interest(&interest.name, None).await
                 {
                     responder.respond_bytes(wire).await.ok();
                 }

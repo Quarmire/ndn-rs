@@ -178,13 +178,10 @@ impl ScopedApprovalGate {
     /// non-sensitive class, `Some(c)` narrows to `c`; `expires_at` is the hard
     /// ceiling the caller computed (e.g. `now + 15m`).
     pub fn grant(&self, action_filter: Option<ActionClass>, expires_at: SystemTime) {
-        self.policy
-            .lock()
-            .unwrap()
-            .grant(ScopedGrant {
-                expires_at,
-                action_filter,
-            });
+        self.policy.lock().unwrap().grant(ScopedGrant {
+            expires_at,
+            action_filter,
+        });
     }
 
     /// "Tap Stop" — revoke all grants; subsequent requests prompt again.
@@ -251,7 +248,10 @@ mod tests {
             ActionClass::classify(&region_for("/app/data/v1")),
             ActionClass::Other
         );
-        assert_eq!(ActionClass::classify(&[0xff, 0x00, 0x01]), ActionClass::Other);
+        assert_eq!(
+            ActionClass::classify(&[0xff, 0x00, 0x01]),
+            ActionClass::Other
+        );
     }
 
     #[test]
@@ -328,9 +328,16 @@ mod tests {
         assert_eq!(prompts.load(Ordering::SeqCst), 1);
 
         // Grant route edits for 15m → auto-approves without prompting.
-        gate.grant(Some(ActionClass::Route), SystemTime::now() + Duration::from_secs(900));
+        gate.grant(
+            Some(ActionClass::Route),
+            SystemTime::now() + Duration::from_secs(900),
+        );
         assert!(gate.approve(&region).await);
-        assert_eq!(prompts.load(Ordering::SeqCst), 1, "should not have prompted");
+        assert_eq!(
+            prompts.load(Ordering::SeqCst),
+            1,
+            "should not have prompted"
+        );
 
         // A sensitive command still prompts despite the grant.
         assert!(

@@ -673,7 +673,10 @@ mod tests {
         let big = w.finish();
         let wrapped = ndn_packet::lp::encode_lp_packet(&big);
         assert!(ndn_packet::lp::is_lp_packet(&wrapped));
-        assert!(wrapped.len() > 1400, "wrapped packet should exceed the test MTU");
+        assert!(
+            wrapped.len() > 1400,
+            "wrapped packet should exceed the test MTU"
+        );
 
         let capture = Arc::new(Mutex::new(Vec::new()));
         let tx = CaptureTransport {

@@ -3,6 +3,7 @@ name = "ndn-fwd-core"
 description = "Canonical, runtime-agnostic NDN forwarding rules (sans-IO seed shared by the native engine and the embedded forwarder)"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [package.metadata.scope]
@@ -16,3 +17,6 @@ alloc = []
 
 [dependencies]
 ndn-signals-core = { workspace = true }
+
+[lints]
+workspace = true

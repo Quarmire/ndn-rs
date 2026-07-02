@@ -215,10 +215,7 @@ impl EngineBuilder {
 
     /// As [`with_congestion_feedback`](Self::with_congestion_feedback) with explicit
     /// classification/decay tuning.
-    pub fn with_congestion_feedback_config(
-        mut self,
-        cfg: ndn_strategy::CongestionConfig,
-    ) -> Self {
+    pub fn with_congestion_feedback_config(mut self, cfg: ndn_strategy::CongestionConfig) -> Self {
         self.congestion_feedback = Some(cfg);
         self
     }
@@ -272,8 +269,9 @@ impl EngineBuilder {
         let capacity = capacity.max(1);
         self.egress_classifier = Some(classifier);
         self.egress_factory = Some(Arc::new(move || {
-            Arc::new(crate::egress::DeficitRoundRobinScheduler::new(quantum, capacity))
-                as Arc<dyn crate::egress::EgressScheduler>
+            Arc::new(crate::egress::DeficitRoundRobinScheduler::new(
+                quantum, capacity,
+            )) as Arc<dyn crate::egress::EgressScheduler>
         }));
         self
     }
@@ -283,8 +281,9 @@ impl EngineBuilder {
     /// can name each hop) instead of being dropped silently. Off by default. The identity
     /// is advisory (digest-signed), like IP traceroute.
     pub fn with_traceroute_responder(mut self, node_name: ndn_packet::Name) -> Self {
-        self.traceroute_responder =
-            Some(Arc::new(crate::traceroute::TracerouteResponder::new(node_name)));
+        self.traceroute_responder = Some(Arc::new(crate::traceroute::TracerouteResponder::new(
+            node_name,
+        )));
         self
     }
 

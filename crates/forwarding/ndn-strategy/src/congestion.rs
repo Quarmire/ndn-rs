@@ -20,6 +20,8 @@
 //!   timestamp, no hot-path cost.
 
 use std::sync::Arc;
+// Atomics back the native DashMap counters; the wasm arm uses Mutex<HashMap>.
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -92,7 +94,10 @@ impl CongestionFeedback {
             if let Some(c) = self.counts.get(&face) {
                 c.fetch_add(1, Ordering::Relaxed);
             } else {
-                self.counts.entry(face).or_default().fetch_add(1, Ordering::Relaxed);
+                self.counts
+                    .entry(face)
+                    .or_default()
+                    .fetch_add(1, Ordering::Relaxed);
             }
         }
         #[cfg(target_arch = "wasm32")]
@@ -148,7 +153,8 @@ impl SignalSource<FaceId> for CongestionSource {
             // re-created on the next mark. `remove_if` avoids losing a concurrent add.
             if marks == 0 {
                 #[cfg(not(target_arch = "wasm32"))]
-                self.counts.remove_if(&face, |_, c| c.load(Ordering::Relaxed) == 0);
+                self.counts
+                    .remove_if(&face, |_, c| c.load(Ordering::Relaxed) == 0);
                 #[cfg(target_arch = "wasm32")]
                 {
                     let mut g = self.counts.lock().unwrap();

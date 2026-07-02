@@ -19,11 +19,15 @@ pub trait Signer: Send + Sync + 'static {
 
     fn sign<'a>(&'a self, region: &'a [u8]) -> BoxFuture<'a, Result<Bytes, TrustError>>;
 
+    /// Synchronous signing for CPU-only signers. The default refuses rather
+    /// than panics: signers whose keys live behind an async boundary
+    /// (custodian, remote signer, hardware token) cannot sign synchronously,
+    /// and callers must be able to treat that as a recoverable error.
     fn sign_sync(&self, region: &[u8]) -> Result<Bytes, TrustError> {
         let _ = region;
-        unimplemented!(
-            "sign_sync not implemented for this signer — override if signing is CPU-only"
-        )
+        Err(TrustError::KeyStore(
+            "sign_sync unsupported: this signer signs asynchronously — use sign()".into(),
+        ))
     }
 }
 

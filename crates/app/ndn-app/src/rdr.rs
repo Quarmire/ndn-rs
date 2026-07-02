@@ -400,17 +400,19 @@ impl PreparedObject {
     /// a content source and signed on the fly). `versioned_name` is the segment
     /// prefix the out-of-band producer must name its segments under.
     pub fn build_metadata(object_name: Name, size: u64, chunk_size: usize) -> Self {
-        let chunk = if chunk_size == 0 {
-            8192
-        } else {
-            chunk_size
-        };
+        let chunk = if chunk_size == 0 { 8192 } else { chunk_size };
         let count = if size == 0 {
             1
         } else {
             size.div_ceil(chunk as u64)
         };
-        Self::assemble(object_name, SegmentSource::Phantom { count }, size, chunk, false)
+        Self::assemble(
+            object_name,
+            SegmentSource::Phantom { count },
+            size,
+            chunk,
+            false,
+        )
     }
 
     /// Shared assembly: derive the versioned name, FinalBlockID, and metadata
@@ -521,7 +523,9 @@ impl PreparedObject {
                 .components()
                 .iter()
                 .skip(self.object_name.len())
-                .any(|c| c.typ == ndn_packet::tlv_type::KEYWORD && c.value == metadata_keyword.value)
+                .any(|c| {
+                    c.typ == ndn_packet::tlv_type::KEYWORD && c.value == metadata_keyword.value
+                })
         {
             if let Some(cached) = self.meta_cache.lock().unwrap().clone() {
                 return Ok(Some(cached));
@@ -648,7 +652,10 @@ mod tests {
         // any offset error shows up.
         let content: Vec<u8> = (0..25_000u32).map(|i| (i % 251) as u8).collect();
         let path = std::env::temp_dir().join("ndn_rdr_filebacked_test.bin");
-        std::fs::File::create(&path).unwrap().write_all(&content).unwrap();
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&content)
+            .unwrap();
         let file = std::fs::File::open(&path).unwrap();
 
         let object: Name = "/obj".parse().unwrap();
@@ -659,11 +666,19 @@ mod tests {
         // Every segment served from disk equals the file's slice at that offset.
         for i in 0..=prep.last_seg {
             let seg_name = prep.versioned_name.clone().append_segment(i);
-            let wire = prep.answer_interest(&seg_name, None).await.unwrap().expect("segment served");
+            let wire = prep
+                .answer_interest(&seg_name, None)
+                .await
+                .unwrap()
+                .expect("segment served");
             let data = ndn_packet::Data::decode(wire).unwrap();
             let start = (i * 8192) as usize;
             let end = (start + 8192).min(content.len());
-            assert_eq!(data.content().unwrap(), &content[start..end], "segment {i} bytes");
+            assert_eq!(
+                data.content().unwrap(),
+                &content[start..end],
+                "segment {i} bytes"
+            );
         }
         std::fs::remove_file(&path).ok();
     }
@@ -716,7 +731,13 @@ mod tests {
     fn manifest_decode_rejects_misaligned_hash_list() {
         // 33 bytes is not a multiple of 32 → malformed manifest.
         let mut w = TlvWriter::new();
-        w.write_raw(&"/o".parse::<Name>().unwrap().append_version(1).encode_to_tlv());
+        w.write_raw(
+            &"/o"
+                .parse::<Name>()
+                .unwrap()
+                .append_version(1)
+                .encode_to_tlv(),
+        );
         let nni = encode_nni_be(0);
         let mut fbi = vec![0x32u8, nni.len() as u8];
         fbi.extend_from_slice(&nni);

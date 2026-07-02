@@ -1,7 +1,7 @@
 //! `faces/list`, `faces/link-quality`, and `faces/counters` datasets.
 
-use ndn_mgmt_wire::{ControlResponse, nfd_dataset};
 use ndn_engine::ForwarderEngine;
+use ndn_mgmt_wire::{ControlResponse, nfd_dataset};
 use ndn_transport::{FaceKind, FacePersistency, FaceScope};
 
 pub(super) fn faces_list_dataset(engine: &ForwarderEngine) -> bytes::Bytes {

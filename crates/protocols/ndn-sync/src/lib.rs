@@ -85,21 +85,21 @@ pub mod psync_bloom;
 /// subscription consumer.
 pub mod psync_partial;
 
+pub use dialect::WireDialect;
+pub use mapping::{MappingList, MappingProvider};
 pub use protocol::{SyncError, SyncHandle, SyncUpdate};
-pub use security::{HmacKey, Insecure, Rejected, SyncSigner, SyncValidator};
-pub use psync_sync::{PSyncConfig, PSyncInbound, join_psync_group};
 pub use psync_bloom::{BloomError, BloomFilter};
 pub use psync_partial::{
     PSyncPartialConfig, join_psync_partial_consumer, join_psync_partial_producer,
 };
+pub use psync_sync::{PSyncConfig, PSyncInbound, join_psync_group};
+pub use pubsub::{Publication, SvsPubSub};
+pub use security::{HmacKey, Insecure, Rejected, SyncSigner, SyncValidator};
 pub use svs_local::{
     NeighborAdvance, NeighborSnapshot, StateEntry, SvsLocal, SvsLocalError, decode_svs_data,
     encode_svs_data,
 };
 pub use svs_sync::{RetryPolicy, SvsConfig, fetch_with_retry, join_svs_group};
-pub use dialect::WireDialect;
-pub use mapping::{MappingList, MappingProvider};
-pub use pubsub::{Publication, SvsPubSub};
 pub use svsync::{
     DataStore, IngestValidator, MemoryStore, PublisherSigner, SvSync, SvSyncConfig, svs_data_name,
 };

@@ -3,6 +3,7 @@ name = "ndn-pathcontrol"
 description = "PathControl: a signed, sequence-numbered, loop-safe control Interest that walks a path mutating per-hop forwarding/session state. The shared primitive under MAP-Me producer mobility (redirect) and pipe lifecycle (teardown/refresh) — G3."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [package.metadata.scope]
@@ -24,3 +25,6 @@ ndn-security = { workspace = true, optional = true }
 
 [dev-dependencies]
 ndn-security = { workspace = true }
+
+[lints]
+workspace = true

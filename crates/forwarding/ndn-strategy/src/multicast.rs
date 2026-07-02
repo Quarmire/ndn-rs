@@ -68,17 +68,11 @@ impl Strategy for MulticastStrategy {
         Some(smallvec![ForwardingAction::Forward(faces)])
     }
 
-    fn after_receive_interest(
-        &self,
-        ctx: &StrategyContext<'_>,
-    ) -> SmallVec<[ForwardingAction; 2]> {
+    fn after_receive_interest(&self, ctx: &StrategyContext<'_>) -> SmallVec<[ForwardingAction; 2]> {
         self.decide(ctx).unwrap()
     }
 
-    fn after_receive_data(
-        &self,
-        _ctx: &StrategyContext<'_>,
-    ) -> SmallVec<[ForwardingAction; 2]> {
+    fn after_receive_data(&self, _ctx: &StrategyContext<'_>) -> SmallVec<[ForwardingAction; 2]> {
         SmallVec::new()
     }
 }
