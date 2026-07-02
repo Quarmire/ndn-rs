@@ -1,30 +1,49 @@
+//! Cursor-style decoder over a `Bytes` buffer of TLV elements.
+
 use bytes::Bytes;
 
 use crate::{TlvError, read_varu64};
 
 /// Zero-copy TLV reader. All returned slices share the input's allocation.
+///
+/// Holds the input `Bytes` and a read cursor; the `read_*` methods advance it
+/// left to right. Every returned value is a `Bytes` slice into the original
+/// buffer (a refcount bump, no copy), so parsed fields stay valid as long as
+/// any slice is held. Decoding is hardened against hostile input: non-minimal
+/// VAR-NUMBERs, out-of-range TLV-TYPEs, and lengths past the buffer end are all
+/// rejected rather than trusted (the W-1 bound).
 pub struct TlvReader {
     buf: Bytes,
     pos: usize,
 }
 
 impl TlvReader {
+    /// Create a reader positioned at the start of `buf`.
     pub fn new(buf: Bytes) -> Self {
         Self { buf, pos: 0 }
     }
 
+    /// Bytes left between the cursor and the end of the buffer.
     pub fn remaining(&self) -> usize {
         self.buf.len() - self.pos
     }
 
+    /// Whether the cursor has reached the end of the buffer (nothing left to
+    /// read).
     pub fn is_empty(&self) -> bool {
         self.pos >= self.buf.len()
     }
 
+    /// Current cursor offset from the start of the buffer, in bytes.
     pub fn position(&self) -> usize {
         self.pos
     }
 
+    /// Read and consume a TLV-TYPE, advancing the cursor past it.
+    ///
+    /// Enforces the spec's type range: the 9-byte VAR-NUMBER form is
+    /// LENGTH-only and a type must fit `u32` (NDN Packet Format v0.3 §2.0);
+    /// either violation yields [`TlvError::TypeOutOfRange`].
     pub fn read_type(&mut self) -> Result<u64, TlvError> {
         let (v, n) = read_varu64(&self.buf[self.pos..])?;
         // TLV-TYPE is restricted to VAR-NUMBER-1/3/5 and the u32 range
@@ -36,6 +55,12 @@ impl TlvReader {
         Ok(v)
     }
 
+    /// Read and consume a TLV-LENGTH, advancing the cursor past it.
+    ///
+    /// A length larger than [`remaining`](Self::remaining) is rejected up front
+    /// with [`TlvError::UnexpectedEof`], so a hostile length can never trigger
+    /// an over-read and the `u64`→`usize` narrowing is always safe on 32-bit
+    /// and wasm targets (the W-1 bound).
     pub fn read_length(&mut self) -> Result<usize, TlvError> {
         let (v, n) = read_varu64(&self.buf[self.pos..])?;
         self.pos += n;
@@ -49,6 +74,12 @@ impl TlvReader {
         Ok(v as usize)
     }
 
+    /// Consume exactly `len` bytes and return them as a zero-copy slice into
+    /// the underlying buffer.
+    ///
+    /// Errors with [`TlvError::UnexpectedEof`] if fewer than `len` bytes remain
+    /// (or if `pos + len` would overflow), never panicking on a truncated or
+    /// hostile input.
     pub fn read_bytes(&mut self, len: usize) -> Result<Bytes, TlvError> {
         // `checked_add` guards against `self.pos + len` overflowing (W-1): a
         // wrapped sum could otherwise pass the bound check and then panic inside
@@ -62,6 +93,12 @@ impl TlvReader {
         Ok(slice)
     }
 
+    /// Read one complete TLV element, returning its type and value.
+    ///
+    /// Equivalent to [`read_type`](Self::read_type) then
+    /// [`read_length`](Self::read_length) then
+    /// [`read_bytes`](Self::read_bytes); the value is a zero-copy slice. This is
+    /// the usual entry point for walking a sequence of sibling elements.
     pub fn read_tlv(&mut self) -> Result<(u64, Bytes), TlvError> {
         let typ = self.read_type()?;
         let len = self.read_length()?;
@@ -69,6 +106,11 @@ impl TlvReader {
         Ok((typ, val))
     }
 
+    /// Return the next TLV-TYPE without consuming it, so a decoder can branch on
+    /// the upcoming element before deciding to read it.
+    ///
+    /// Unlike [`read_type`](Self::read_type) this does not enforce the type
+    /// range; it reports the raw VAR-NUMBER at the cursor.
     pub fn peek_type(&self) -> Result<u64, TlvError> {
         let (v, _) = read_varu64(&self.buf[self.pos..])?;
         Ok(v)
@@ -90,11 +132,19 @@ impl TlvReader {
         Ok(())
     }
 
+    /// Consume `len` bytes and hand back a fresh reader scoped to just those
+    /// bytes, for descending into a nested TLV's value.
+    ///
+    /// The inner reader cannot see past the sub-element, so its
+    /// [`is_empty`](Self::is_empty) marks the end of the nested content while
+    /// this reader's cursor is left just after it.
     pub fn scoped(&mut self, len: usize) -> Result<TlvReader, TlvError> {
         let slice = self.read_bytes(len)?;
         Ok(TlvReader::new(slice))
     }
 
+    /// Zero-copy view of the not-yet-consumed remainder, without moving the
+    /// cursor. Useful for capturing the raw signed portion of a packet.
     pub fn as_bytes(&self) -> Bytes {
         self.buf.slice(self.pos..)
     }

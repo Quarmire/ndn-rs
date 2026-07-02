@@ -365,6 +365,12 @@ impl FacePersistency {
     }
 }
 
+/// Failure from a [`Face`] / [`Transport`] send or receive.
+///
+/// The variants imply different recovery: `Closed` means the link is gone and
+/// the face should be torn down; `Full` is transient back-pressure from a
+/// bounded send buffer (retry or drop the packet, but keep the face); `Io`
+/// wraps the underlying OS error.
 #[derive(Debug, Error)]
 pub enum FaceError {
     #[error("face closed")]

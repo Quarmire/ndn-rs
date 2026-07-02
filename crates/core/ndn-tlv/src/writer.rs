@@ -1,18 +1,29 @@
+//! Buffer-backed encoder that emits TLV elements in minimal wire form.
+
 use bytes::{BufMut, BytesMut};
 
 use crate::varu64_size;
 
+/// Append-only encoder that builds a TLV byte stream in a growable buffer.
+///
+/// Every type and length is written in minimal VAR-NUMBER form, so output is
+/// canonical and round-trips through [`TlvReader`](crate::TlvReader). Call
+/// [`finish`](Self::finish) to freeze the buffer into a shareable
+/// [`bytes::Bytes`].
 pub struct TlvWriter {
     buf: BytesMut,
 }
 
 impl TlvWriter {
+    /// Create an empty writer with no pre-allocated capacity.
     pub fn new() -> Self {
         Self {
             buf: BytesMut::new(),
         }
     }
 
+    /// Create an empty writer that has reserved room for `cap` bytes, avoiding
+    /// reallocations when the encoded size is known ahead of time.
     pub fn with_capacity(cap: usize) -> Self {
         Self {
             buf: BytesMut::with_capacity(cap),
@@ -25,13 +36,21 @@ impl TlvWriter {
         self.buf.put_slice(&tmp[..n]);
     }
 
+    /// Append a complete TLV element: `typ`, the length of `value`, then
+    /// `value`. Use this for leaf elements whose bytes are already in hand.
     pub fn write_tlv(&mut self, typ: u64, value: &[u8]) {
         self.write_varu64_inner(typ);
         self.write_varu64_inner(value.len() as u64);
         self.buf.put_slice(value);
     }
 
-    /// Encode a TLV whose value is produced by `f` against an inner writer.
+    /// Encode a TLV of type `typ` whose value is produced by `f` against a
+    /// temporary inner writer.
+    ///
+    /// The value is built first, so its TLV-LENGTH is measured and prefixed
+    /// automatically — the caller never has to know the nested size in advance.
+    /// This is the building block for encoding container elements such as Name
+    /// or the Interest/Data body.
     pub fn write_nested<F>(&mut self, typ: u64, f: F)
     where
         F: FnOnce(&mut TlvWriter),
@@ -45,26 +64,39 @@ impl TlvWriter {
         self.buf.put_slice(&inner_bytes);
     }
 
+    /// Append a bare VAR-NUMBER (no type or length prefix), for a naked integer
+    /// field such as a nested TLV-TYPE or a numeric component value.
     pub fn write_varu64(&mut self, value: u64) {
         self.write_varu64_inner(value);
     }
 
+    /// Append `data` verbatim, bypassing any framing. Use for splicing in
+    /// bytes that are already encoded, e.g. a pre-signed sub-element.
     pub fn write_raw(&mut self, data: &[u8]) {
         self.buf.put_slice(data);
     }
 
+    /// Borrow the encoded bytes from offset `start` to the current end.
+    ///
+    /// Pair with [`len`](Self::len) captured before writing a sub-element to
+    /// recover the exact bytes just emitted — e.g. to hash a
+    /// SignedInfo region without re-encoding it.
     pub fn slice_from(&self, start: usize) -> &[u8] {
         &self.buf[start..]
     }
 
+    /// Consume the writer and freeze its buffer into a cheaply cloneable
+    /// [`bytes::Bytes`] holding the complete encoding.
     pub fn finish(self) -> bytes::Bytes {
         self.buf.freeze()
     }
 
+    /// Number of bytes written so far.
     pub fn len(&self) -> usize {
         self.buf.len()
     }
 
+    /// Whether nothing has been written yet.
     pub fn is_empty(&self) -> bool {
         self.buf.is_empty()
     }
@@ -76,6 +108,11 @@ impl Default for TlvWriter {
     }
 }
 
+/// Encoded size in bytes of a TLV element with the given type and value length,
+/// without encoding it.
+///
+/// Equals `varu64_size(typ) + varu64_size(value_len) + value_len`; use it to
+/// pre-size a [`TlvWriter`] or compute a parent's TLV-LENGTH.
 pub fn tlv_size(typ: u64, value_len: usize) -> usize {
     varu64_size(typ) + varu64_size(value_len as u64) + value_len
 }

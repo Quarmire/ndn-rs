@@ -4,6 +4,7 @@
 //!
 //! `std` (default off) enables `bytes/std` and `Hash::of` via `sha2`.
 
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(not(feature = "std"), no_std)]
 #![allow(missing_docs)]
 

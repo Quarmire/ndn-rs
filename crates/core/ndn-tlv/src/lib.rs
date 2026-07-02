@@ -7,7 +7,8 @@
 //! `std` (default) enables `std` in `bytes`. Without it, an allocator is
 //! still required.
 
-#![allow(missing_docs)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
+#![deny(missing_docs)]
 #![cfg_attr(not(feature = "std"), no_std)]
 #[cfg(not(feature = "std"))]
 extern crate alloc;
@@ -82,6 +83,11 @@ pub fn write_varu64(buf: &mut [u8], value: u64) -> usize {
     }
 }
 
+/// Number of bytes [`write_varu64`] will emit for `value`, without encoding it.
+///
+/// Lets a caller size a buffer or pre-compute a TLV-LENGTH before writing. The
+/// boundaries follow the minimal VAR-NUMBER form (NDN Packet Format v0.3 §2.1):
+/// 1 byte for `< 253`, 3 for `< 2^16`, 5 for `< 2^32`, 9 otherwise.
 pub fn varu64_size(value: u64) -> usize {
     if value < 253 {
         1

@@ -30,6 +30,7 @@
 //! [`SvSync::publish_data`]: svsync::SvSync::publish_data
 //! [`SvSync::fetch_range`]: svsync::SvSync::fetch_range
 
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![allow(missing_docs)]
 
 /// MurmurHash3_x86_32 — the hash family used by PSync's IBF.

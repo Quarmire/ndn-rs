@@ -32,7 +32,12 @@ use crate::{
     },
 };
 
-/// Configuration for the forwarding engine.
+/// Tunable parameters for a [`ForwarderEngine`], consumed by [`EngineBuilder`].
+///
+/// Covers pipeline back-pressure (`pipeline_channel_cap`), Content Store size
+/// (`cs_capacity_bytes`), the pipeline worker count, and related policy. Prefer
+/// starting from [`EngineBuilder`] and overriding individual fields, so newly
+/// added fields keep their defaults rather than needing every caller updated.
 pub struct EngineConfig {
     pub pipeline_channel_cap: usize,
     pub cs_capacity_bytes: usize,
@@ -94,6 +99,12 @@ impl Default for EngineConfig {
     }
 }
 
+/// Staged constructor for a [`ForwarderEngine`].
+///
+/// Register faces, strategies, and the Content Store backend, then call
+/// [`build`](Self::build), which returns the running `ForwarderEngine` paired
+/// with its [`ShutdownHandle`]. Face constructors are deferred until the shared
+/// [`FaceTable`] exists, so faces and tables get wired up in the right order.
 pub struct EngineBuilder {
     config: EngineConfig,
     face_table: Arc<FaceTable>,

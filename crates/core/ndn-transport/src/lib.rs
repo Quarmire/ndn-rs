@@ -8,6 +8,7 @@
 //!
 //! `serde` (off) — derives `Serialize`/`Deserialize` on select types.
 
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![allow(missing_docs)]
 
 pub mod any_map;

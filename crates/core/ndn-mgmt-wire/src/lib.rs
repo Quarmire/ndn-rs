@@ -10,6 +10,7 @@
 //! `mgmt/nfd/forwarder-status.cpp` (wireEncode prepends in reverse, so the wire
 //! order is NfdVersion → … → NUnsatisfiedInterests).
 
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![no_std]
 #![forbid(unsafe_code)]
 

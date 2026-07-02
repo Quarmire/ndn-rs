@@ -37,3 +37,10 @@ ndn-transport = { workspace = true }
 
 [lints]
 workspace = true
+
+[package.metadata.docs.rs]
+# docs.rs builds with every feature so the full API surface (incl. feature-
+# gated items) renders, and passes --cfg docsrs so `#[doc(cfg(...))]` shows the
+# feature each gated item needs.
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

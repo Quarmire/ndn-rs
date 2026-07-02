@@ -130,6 +130,16 @@ fn canonical_nonneg_integer(bytes: &[u8]) -> Option<u64> {
     (encode_nonneg_integer(v).as_ref() == bytes).then_some(v)
 }
 
+/// A hierarchical NDN name: an ordered, possibly empty sequence of
+/// [`NameComponent`]s that identifies a piece of Data.
+///
+/// Names are the primary addressing primitive in NDN — an Interest carries the
+/// name (or prefix) it wants, and Data carries the name it answers to.
+/// Comparison is component-wise in canonical NDN order (see [`NameComponent`]),
+/// so names sort exactly the way a forwarder's longest-prefix match expects;
+/// the empty name is the routable root (`/`). The first few components are held
+/// inline to keep typical names off the heap, and the textual form is the
+/// familiar `/a/b/c` URI.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Name {
     pub(crate) components: SmallVec<[NameComponent; 8]>,

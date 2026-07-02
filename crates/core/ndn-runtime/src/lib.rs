@@ -2,6 +2,8 @@
 //! and `wasm-bindgen-futures` + `gloo-timers` (browser) so engine and face
 //! code never needs `cfg(target_arch = "wasm32")` for time/spawn.
 
+#![cfg_attr(docsrs, feature(doc_cfg))]
+
 use std::future::Future;
 use std::task::{Context, Poll};
 use std::{pin::Pin, sync::Arc, time::Duration};

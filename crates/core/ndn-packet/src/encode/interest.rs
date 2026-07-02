@@ -87,6 +87,12 @@ pub fn ensure_nonce(interest_wire: &Bytes) -> Bytes {
     w.finish()
 }
 
+/// Fluent builder that encodes an [`Interest`](crate::Interest) to wire bytes.
+///
+/// Start from a name, chain the optional fields (lifetime, `CanBePrefix`,
+/// `MustBeFresh`, application parameters, …), then call `build` for the encoded
+/// packet. Fields left unset are simply omitted from the wire form.
+///
 /// ```
 /// # use ndn_packet::encode::InterestBuilder;
 /// # use std::time::Duration;

@@ -7,6 +7,7 @@
 //! `InProcFace` + [`EngineBuilder`] and use
 //! `Consumer::from_handle` / `Producer::from_handle`.
 
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![allow(missing_docs)]
 
 pub mod app_face;
@@ -29,6 +30,7 @@ pub mod security;
 pub mod subscriber;
 
 #[cfg(all(feature = "blocking", not(target_arch = "wasm32")))]
+#[cfg_attr(docsrs, doc(cfg(feature = "blocking")))]
 pub mod blocking;
 
 pub use app_face::OutboundRequest;

@@ -9,15 +9,18 @@
 //! [`TrustSchema`], [`SafeData`], [`CertCache`], [`KeyStore`], and
 //! [`SecurityManager`] as the high-level facade.
 
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![allow(missing_docs)]
 
 #[cfg(feature = "abe")]
+#[cfg_attr(docsrs, doc(cfg(feature = "abe")))]
 pub mod abe;
 pub mod capability;
 pub mod cert_cache;
 pub mod cert_fetcher;
 pub mod confidentiality;
 #[cfg(feature = "custodian")]
+#[cfg_attr(docsrs, doc(cfg(feature = "custodian")))]
 pub mod custodian;
 pub mod did;
 pub mod error;
@@ -41,6 +44,7 @@ pub mod signer;
 pub mod signing_info;
 pub mod spki;
 #[cfg(feature = "sqlite-pib")]
+#[cfg_attr(docsrs, doc(cfg(feature = "sqlite-pib")))]
 pub mod sqlite_pib;
 pub mod trust;
 pub mod trust_context;
@@ -50,6 +54,7 @@ pub mod validation_policy;
 pub mod validator;
 pub mod verifier;
 #[cfg(feature = "yubikey-piv")]
+#[cfg_attr(docsrs, doc(cfg(feature = "yubikey-piv")))]
 pub mod yubikey;
 
 pub use capability::{Capability, CapabilityError};

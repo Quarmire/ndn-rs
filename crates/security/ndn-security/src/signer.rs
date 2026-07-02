@@ -7,6 +7,15 @@ use ndn_packet::{Name, SignatureType};
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+/// Produces the SignatureValue over a packet's signed region.
+///
+/// Abstracts over where the private key lives — an in-memory Ed25519 key, a
+/// file-backed TPM, a hardware token, or a remote custodian — so signing code
+/// stays key-agnostic. [`sign`](Self::sign) is async because a key may sit
+/// behind an I/O or IPC boundary; [`sign_sync`](Self::sign_sync) is an opt-in
+/// fast path that CPU-only signers may provide and that async-only signers
+/// refuse rather than block. A `Signer` also reports the [`SignatureType`] it
+/// emits and the key/cert names to advertise in the packet's KeyLocator.
 pub trait Signer: Send + Sync + 'static {
     fn sig_type(&self) -> SignatureType;
     fn key_name(&self) -> &Name;

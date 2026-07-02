@@ -9,6 +9,17 @@ use crate::{Name, PacketError, tlv_type};
 use ndn_foundation_types::KeyLocator;
 use ndn_tlv::TlvReader;
 
+/// The algorithm that produced a packet's signature (NDN Packet Format v0.3
+/// SignatureType).
+///
+/// Selects both how the SignatureValue is computed and how a verifier must
+/// check it — e.g. [`DigestSha256`](Self::DigestSha256) is an unkeyed integrity
+/// digest (no authentication), while the `SignatureSha256With*` and
+/// [`SignatureEd25519`](Self::SignatureEd25519) variants are public-key signed.
+/// Converts to/from the on-wire numeric code via [`code`](Self::code) /
+/// [`from_code`](Self::from_code); an unrecognized code round-trips through
+/// [`Other`](Self::Other) so a packet signed with a newer algorithm still
+/// decodes instead of failing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SignatureType {
     DigestSha256,

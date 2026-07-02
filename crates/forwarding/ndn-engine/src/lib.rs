@@ -11,6 +11,7 @@
 //!   strategy implementations with cross-layer enrichment.
 //! - [`ShutdownHandle`] — cooperative shutdown of all engine tasks.
 
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![allow(missing_docs)]
 
 // `EngineBuilder` pulls `SecurityProfile` / `TrustSchema` / `CertCache` from

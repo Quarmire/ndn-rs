@@ -7,6 +7,7 @@
 //! (`sqlite-cs` feature — the Android persistent backend), [`NullCs`],
 //! [`ObservableCs`], [`StrategyTable`], [`CsAdmissionPolicy`].
 
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![allow(missing_docs)]
 
 pub mod content_store;
@@ -16,12 +17,14 @@ pub(crate) mod cs_keycodec;
 pub mod dead_nonce_list;
 pub mod fib;
 #[cfg(any(feature = "fjall", test))]
+#[cfg_attr(docsrs, doc(cfg(feature = "fjall")))]
 pub mod fjall_cs;
 pub mod lru_cs;
 pub mod observable_cs;
 pub mod pit;
 pub mod sharded_cs;
 #[cfg(feature = "sqlite-cs")]
+#[cfg_attr(docsrs, doc(cfg(feature = "sqlite-cs")))]
 pub mod sqlite_cs;
 pub mod strategy_table;
 pub mod trie;
@@ -33,6 +36,7 @@ pub use content_store::{
 pub use dead_nonce_list::{DEFAULT_DEAD_NONCE_LIFETIME, DeadNonceList, NonceFingerprint};
 pub use fib::{Fib, FibEntry, FibNexthop};
 #[cfg(any(feature = "fjall", test))]
+#[cfg_attr(docsrs, doc(cfg(feature = "fjall")))]
 pub use fjall_cs::FjallCs;
 pub use lru_cs::LruCs;
 pub use observable_cs::{CsEvent, CsObserver, ObservableCs};
@@ -41,6 +45,7 @@ pub use pit::{
 };
 pub use sharded_cs::ShardedCs;
 #[cfg(feature = "sqlite-cs")]
+#[cfg_attr(docsrs, doc(cfg(feature = "sqlite-cs")))]
 pub use sqlite_cs::SqliteCs;
 pub use strategy_table::StrategyTable;
 pub use trie::NameTrie;

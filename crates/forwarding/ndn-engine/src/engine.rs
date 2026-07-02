@@ -301,7 +301,13 @@ pub struct EngineInner {
     pub(crate) network_region: Arc<crate::stages::strategy::NetworkRegionTable>,
 }
 
-/// Cloning gives another reference to the same running engine.
+/// Handle to a running NDN forwarding plane.
+///
+/// Owns the FIB, PIT, Content Store, face table, and the Tokio task set that
+/// drives packet processing. Built via [`EngineBuilder`](crate::EngineBuilder).
+/// Cheap to clone: every
+/// clone is another reference-counted handle to the *same* running engine, not
+/// a new instance — so all clones observe one shared set of tables and tasks.
 #[derive(Clone)]
 pub struct ForwarderEngine {
     pub(crate) inner: Arc<EngineInner>,
@@ -814,6 +820,12 @@ impl TaskTracker {
     }
 }
 
+/// Cooperative shutdown control for a running [`ForwarderEngine`].
+///
+/// Signals the engine's cancellation token and then waits on its task tracker
+/// so every pipeline, face, and background task drains before returning — an
+/// ordered teardown rather than an abrupt drop that could leave sockets or
+/// store writes half-finished.
 pub struct ShutdownHandle {
     pub(crate) cancel: CancellationToken,
     pub(crate) tracker: TaskTracker,

@@ -10,6 +10,14 @@ use super::{CachePolicyType, decode_be_u64};
 use crate::nack::{NackHeader, NackReason};
 use crate::tlv_type;
 
+/// A decoded NDNLPv2 link-layer packet (NDN Link Protocol v2).
+///
+/// Carries a network-layer packet (`fragment` — a whole Interest/Data, or one
+/// slice of a fragmented one) together with the hop-by-hop link fields that
+/// ride alongside it: a Nack header, congestion mark, fragmentation indices,
+/// reliability sequence/acks, PIT token, incoming/next-hop face ids, cache
+/// policy, and the A-LAL geo/identity extensions. Every field is optional
+/// because LP headers are à la carte — a bare fragment carries none of them.
 #[derive(Debug)]
 pub struct LpPacket {
     pub fragment: Option<Bytes>,

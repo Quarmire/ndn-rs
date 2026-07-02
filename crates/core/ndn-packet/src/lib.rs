@@ -4,6 +4,7 @@
 //! `std` (default) — enables `ring` signatures and fragment reassembly.
 //! Without it, an allocator is still required.
 
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![allow(missing_docs)]
 #![cfg_attr(all(not(feature = "std"), not(target_arch = "wasm32")), no_std)]
 #[cfg(all(not(feature = "std"), not(target_arch = "wasm32")))]
@@ -12,9 +13,11 @@ extern crate alloc;
 pub(crate) mod compat;
 pub mod data;
 #[cfg(feature = "std")]
+#[cfg_attr(docsrs, doc(cfg(feature = "std")))]
 pub mod encode;
 pub mod error;
 #[cfg(any(feature = "std", feature = "std-wasm"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "std-wasm"))))]
 pub mod fragment;
 pub mod interest;
 pub mod lp;
@@ -25,10 +28,12 @@ pub mod prefix_announcement;
 pub mod signature;
 pub mod subscription;
 #[cfg(any(feature = "std", feature = "std-wasm"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "std-wasm"))))]
 pub mod wire;
 
 pub use data::{ContentHashTarget, Data};
 #[cfg(feature = "std")]
+#[cfg_attr(docsrs, doc(cfg(feature = "std")))]
 pub use encode::random_reflexive_name;
 pub use error::PacketError;
 pub use interest::{Interest, Selector};

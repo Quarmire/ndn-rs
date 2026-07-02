@@ -47,6 +47,11 @@ pub(crate) fn lp_info_from_wire(wire: &Bytes) -> LpInfo {
     }
 }
 
+/// Transport-agnostic packet pipe between an app
+/// ([`Consumer`](crate::Consumer) / [`Producer`](crate::Producer)) and a
+/// forwarder — an embedded engine via [`InProcConnection`] or an external
+/// `ndn-fwd` over a Unix socket via [`IpcConnection`].
+///
 /// `&self` everywhere so `Arc<dyn Connection>` can be shared across
 /// concurrent send- and receive-half tasks.
 #[async_trait]

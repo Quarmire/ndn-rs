@@ -126,6 +126,13 @@ fn write_fields<B: BufMut>(
     buf.put_slice(content);
 }
 
+/// Fluent builder that encodes a [`Data`](crate::Data) packet to wire bytes.
+///
+/// Set the name and content, chain optional MetaInfo (freshness, content type,
+/// final block, …), then finish with `build` for a `DigestSha256` integrity
+/// digest or a `sign_*` method to attach a chosen signature over the signed
+/// region.
+///
 /// ```
 /// # use ndn_packet::encode::DataBuilder;
 /// # use std::time::Duration;
