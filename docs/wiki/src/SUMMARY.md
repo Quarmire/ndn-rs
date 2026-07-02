@@ -2,6 +2,10 @@
 
 [Introduction](./README.md)
 
+# Part I · Using ndn-rs
+
+---
+
 # Start here
 
 - [Why NDN is different](./start/why-ndn-is-different.md)
@@ -72,6 +76,45 @@
 - [Trust policies](./reference/trust-policies.md)
 - [Dashboard extensions](./reference/dashboard-extensions.md)
 - [Spec compliance](./reference/spec-compliance.md)
+
+# Part II · Inside ndn-rs
+
+---
+
+- [Start contributing](./inside/README.md)
+
+# Architecture
+
+- [The layer map](./inside/architecture/layer-map.md)
+- [The crate graph](./inside/architecture/crate-graph.md)
+- [The forwarding pipeline](./inside/architecture/forwarding-pipeline.md)
+- [The security model](./inside/architecture/security-model.md)
+- [The determinism seam](./inside/architecture/determinism-seam.md)
+- [sans-IO and no_std](./inside/architecture/sans-io-and-no-std.md)
+
+# Cookbooks
+
+- [Add a face transport](./inside/cookbook/add-a-face.md)
+- [Add a forwarding strategy](./inside/cookbook/add-a-strategy.md)
+- [Add a management module](./inside/cookbook/add-a-mgmt-module.md)
+- [Add a sync dialect](./inside/cookbook/add-a-sync-dialect.md)
+- [Add a storage backend](./inside/cookbook/add-a-storage-backend.md)
+
+# Working on ndn-rs
+
+- [The testing guide](./inside/testing.md)
+- [Spec conformance matrix](./inside/conformance-matrix.md)
+- [The cross-repo contract](./inside/cross-repo-contract.md)
+- [Contribution workflow](./inside/contributing.md)
+
+# Decision records
+
+- [About ADRs](./inside/adr/README.md)
+- [0001 · Real NDN wire format, not a dialect](./inside/adr/0001-real-ndn-wire-format.md)
+- [0002 · Type-enforced verification (SafeData)](./inside/adr/0002-type-enforced-verification.md)
+- [0003 · sans-IO seed crates for native + embedded](./inside/adr/0003-sans-io-seed-crates.md)
+- [0004 · Virtualize the clock for determinism](./inside/adr/0004-virtualize-the-clock.md)
+- [0005 · Retire the audit-witness suite for nextest](./inside/adr/0005-retire-audit-witness-suite.md)
 
 # Releases
 

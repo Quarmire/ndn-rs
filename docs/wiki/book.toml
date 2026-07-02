@@ -7,6 +7,15 @@ src = "src"
 [build]
 build-dir = "../../target/wiki"
 
+# Fail the build on any broken intra-book link or {{#include}} — this is what
+# keeps the docs honest as code moves. External HTTP links are NOT followed
+# (they are flaky and slow on a PR gate); the nightly lane checks those.
+# Requires the `mdbook-linkcheck` binary on PATH wherever `mdbook build` runs
+# (installed in both the CI `book` job and the wiki deploy).
+[output.linkcheck]
+follow-web-links = false
+warning-policy = "error"
+
 [output.html]
 default-theme = "navy"
 preferred-dark-theme = "navy"

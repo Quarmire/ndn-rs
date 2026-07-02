@@ -85,6 +85,20 @@ jobs:
       # rot without paying for (or trusting) timing on shared runners.
       - run: cargo bench --workspace -- --test
 
+  docs-links:
+    name: docs external link check (lychee)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The PR gate checks internal book links offline; this follows external
+      # HTTP links too (spec URLs, GitHub refs) — flaky on a PR gate, fine
+      # nightly. Failure is a warning surfaced in the summary, not a hard fail.
+      - name: lychee (docs + top-level markdown)
+        uses: lycheeverse/lychee-action@v2
+        with:
+          args: --no-progress "docs/**/*.md" "*.md"
+          fail: false
+
   fuzz:
     name: fuzz smoke (libFuzzer, 4 wire targets)
     runs-on: ubuntu-latest

@@ -23,7 +23,7 @@ For everything else the built-ins (`BestRouteStrategy`,
 
 A `Strategy` does **not** send Interests or mutate forwarding tables.
 It is a pure decision function: each method reads an immutable
-[`StrategyContext`] and *returns* one or more `ForwardingAction` values
+a `StrategyContext` and *returns* one or more `ForwardingAction` values
 (`Forward`, `ForwardAfter`, `Nack`, `Suppress`, `Broadcast`) that the
 engine then executes. This keeps strategies side-effect-free and testable
 in isolation. `ForwardingAction` and `NackReason` live in `ndn-transport`

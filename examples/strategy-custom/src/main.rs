@@ -52,6 +52,7 @@ impl RandomStrategy {
     }
 }
 
+// ANCHOR: impl
 impl Strategy for RandomStrategy {
     fn name(&self) -> &Name {
         &self.name
@@ -99,6 +100,7 @@ impl Strategy for RandomStrategy {
         SmallVec::new()
     }
 }
+// ANCHOR_END: impl
 
 // ─── Wire it up ──────────────────────────────────────────────────────────────
 
@@ -106,11 +108,13 @@ impl Strategy for RandomStrategy {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
+    // ANCHOR: register
     // Create an in-process engine with our custom strategy.
     let (_engine, shutdown) = EngineBuilder::new(EngineConfig::default())
         .strategy(RandomStrategy::new()) // <-- register custom strategy
         .build()
         .await?;
+    // ANCHOR_END: register
 
     tracing::info!("Engine started with RandomStrategy");
 
