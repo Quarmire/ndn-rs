@@ -34,6 +34,10 @@
 //!   The ratchet is fail-closed (soft withholds high-stakes actions, never
 //!   grants leniently) and its grants are append-only, which is what makes the
 //!   bootstrap terminate rather than deadlock.
+//! - **The best local clock self-elects** ([`election`]): clock quality becomes
+//!   the CCLF election weight, so the tightest clock beacons the anchor first
+//!   and worse clocks overhear and cancel — a local GPS out-elects a WAN NTP
+//!   uplink by construction, and losing a reference *is* yielding.
 //!
 //! See the contributor book's "named-time" material and ADR 0007 for the crate
 //! boundary (why the stamp types live here rather than in `ndn-frame-io`).
@@ -43,6 +47,7 @@
 
 pub mod capability;
 pub mod combine;
+pub mod election;
 pub mod interval;
 pub mod provenance;
 pub mod ratchet;
@@ -50,6 +55,7 @@ pub mod sample;
 pub mod stamp;
 
 pub use capability::{ClockCapability, Holdover, TimeSourceKind, Traceability};
+pub use election::{ElectionParams, anchor_weight};
 pub use interval::TimeInterval;
 pub use provenance::{Authenticity, KeyId, Measured, MeasurementProvenance};
 pub use ratchet::{Ratchet, WindowEnforcement};

@@ -3,6 +3,7 @@
 
 use ndn_time::capability::ClockCapability;
 use ndn_time::combine::marzullo;
+use ndn_time::election::{ElectionParams, anchor_weight};
 use ndn_time::interval::TimeInterval;
 use ndn_time::provenance::{
     Authenticity, KeyId, MeasurementProvenance, PathId, StakesFloor, admits,
@@ -65,6 +66,32 @@ proptest! {
         let h = ClockCapability::oscillator_tcxo().holdover;
         let e2 = e1.saturating_add(delta);
         prop_assert!(h.growth_ns(e1) <= h.growth_ns(e2));
+    }
+
+    // The anchor election weight is always a valid weight in [0, 1] and is
+    // monotone non-increasing in uncertainty (a looser clock never out-weights
+    // a tighter one of the same capability/stratum).
+    #[test]
+    fn anchor_weight_in_unit_range_and_monotone(
+        u1 in 0u64..10_000_000_000,
+        du in 0u64..10_000_000_000,
+        stratum in 0u8..8,
+    ) {
+        let caps = [
+            ClockCapability::gnss_disciplined(),
+            ClockCapability::oscillator_tcxo(),
+            ClockCapability::esp32_rc(),
+            ClockCapability::ntp_uplink(),
+        ];
+        let params = ElectionParams::default();
+        let u2 = u1.saturating_add(du); // looser
+        for cap in caps {
+            let w1 = anchor_weight(&cap, u1, stratum, &params);
+            let w2 = anchor_weight(&cap, u2, stratum, &params);
+            prop_assert!((0.0..=1.0).contains(&w1), "weight {w1} out of [0,1]");
+            prop_assert!((0.0..=1.0).contains(&w2));
+            prop_assert!(w2 <= w1, "looser uncertainty must not raise the weight");
+        }
     }
 }
 
