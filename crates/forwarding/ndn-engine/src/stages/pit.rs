@@ -86,12 +86,28 @@ impl PitCheckStage {
 
         let nonce = interest.nonce().unwrap_or(0);
 
-        // Universal strip-at-insert: a trailing PSDC (0x02) or implicit
-        // digest (0x01) is removed from the PIT key so wire-level digest
-        // components do not multiplex. Concurrent signed-Interest RPC at the
-        // same logical name must disambiguate via a request-id component.
-        // The replay guard above is the integrity floor that makes this safe.
-        let key_name: ndn_packet::Name = strip_digest_components(&interest.name);
+        // Strip a trailing digest component (PSDC 0x02 / implicit 0x01) from the
+        // PIT key ONLY for subscription-flavored Interests — those carrying a
+        // `SubscriptionRequest`, whether installed persistent or degraded to
+        // classical on failed validation. Their pushed Data is named at the
+        // logical name and must match a params-bearing standing Interest.
+        //
+        // Everything else keys on the FULL name, as the NDN spec and real NFD do:
+        // parameterized Interests that differ only in their PSDC — e.g. SVS sync
+        // Interests `/<group>/v=2/<psdc(SV)>`, one distinct wire Interest per
+        // state vector — must occupy distinct PIT entries, not multiplex into one
+        // and aggregate-suppress each other (which silently breaks SVS the moment
+        // a node both publishes and subscribes). The replay guard above is the
+        // integrity floor for the stripped case.
+        let subscription_flavored = interest
+            .app_parameters()
+            .and_then(ndn_packet::SubscriptionRequest::find_in)
+            .is_some();
+        let key_name: ndn_packet::Name = if subscription_flavored {
+            strip_digest_components(&interest.name)
+        } else {
+            (*interest.name).clone()
+        };
         let name_hash = NameHashes::full_name_hash(&key_name);
         // Persistent (SubscriptionRequest) Interests occupy a distinct PIT
         // entry from classical Interests at the same logical name.
@@ -621,7 +637,13 @@ pub(crate) fn insert_dead_nonces(dnl: &Option<Arc<DeadNonceList>>, entry: &PitEn
     let Some(dnl) = dnl.as_ref() else {
         return;
     };
-    let key_name = strip_digest_components(&entry.name);
+    // Mirror the insert-key rule: persistent entries are keyed on the stripped
+    // name, classical entries on the full name.
+    let key_name = if entry.persistent.is_some() {
+        strip_digest_components(&entry.name)
+    } else {
+        (*entry.name).clone()
+    };
     let name_hash = NameHashes::full_name_hash(&key_name);
     for &nonce in &entry.nonces_seen {
         dnl.insert(NonceFingerprint::new(name_hash, nonce), now);
