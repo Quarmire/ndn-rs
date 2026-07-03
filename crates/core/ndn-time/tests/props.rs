@@ -137,3 +137,61 @@ proptest! {
         prop_assert_eq!(admits(&provs, &StakesFloor::low()), !provs.is_empty());
     }
 }
+
+fn a_prov() -> MeasurementProvenance {
+    MeasurementProvenance {
+        distance_bounded: true, // deliberately true, so common_view forcing false is observable
+        replay_protected: true,
+        authenticity: Authenticity::AuthenticatedDomainPeer(KeyId(1)),
+        path: PathId(1),
+    }
+}
+
+proptest! {
+    // Two-way never panics on arbitrary timestamps (i128 intermediate, clamped).
+    #[test]
+    fn two_way_never_panics(t1 in any::<i64>(), t2 in any::<i64>(), t3 in any::<i64>(), t4 in any::<i64>()) {
+        let _ = ndn_time::measure::two_way(t1, t2, t3, t4, 100, 100, a_prov());
+    }
+
+    // On a symmetric path, two-way recovers the injected offset exactly. The
+    // four stamps are constructed from (offset, delay, turnaround): local reads
+    // true time, remote reads true + offset.
+    #[test]
+    fn two_way_recovers_symmetric_offset(
+        offset in -1_000_000_000i64..1_000_000_000,
+        delay in 0i64..100_000_000,
+        turn in 0i64..100_000_000,
+        base in -1_000_000_000i64..1_000_000_000,
+    ) {
+        let t1 = base;                          // local send (local clock == true)
+        let t2 = base + delay + offset;         // remote recv = (base+delay) + offset
+        let t3 = base + delay + turn + offset;  // remote send = above + turnaround
+        let t4 = base + 2 * delay + turn;       // local recv (local == true)
+        let r = ndn_time::measure::two_way(t1, t2, t3, t4, 0, 0, a_prov());
+        prop_assert_eq!(r.offset.value, offset);
+    }
+
+    // Common-view recovers A−B regardless of the emission time (the transmitter
+    // cancels), and always forces distance_bounded false.
+    #[test]
+    fn common_view_recovers_offset_and_forces_unbounded(
+        oa in -1_000_000i64..1_000_000,
+        ob in -1_000_000i64..1_000_000,
+        pa in 0u64..100_000,
+        pb in 0u64..100_000,
+        emit in -1_000_000_000i64..1_000_000_000,
+    ) {
+        // A reads true + oa, B reads true + ob; each stamps at emit + its prop.
+        let rx_a = emit + pa as i64 + oa;
+        let rx_b = emit + pb as i64 + ob;
+        let m = ndn_time::measure::common_view(
+            ndn_time::measure::RxObs { stamp_ns: rx_a, prop_ns: pa, prec_ns: 0 },
+            ndn_time::measure::RxObs { stamp_ns: rx_b, prop_ns: pb, prec_ns: 0 },
+            0,
+            a_prov(),
+        );
+        prop_assert_eq!(m.value, oa - ob, "offset A − B, transmitter cancels");
+        prop_assert!(!m.prov.distance_bounded, "a relay defeats common-view");
+    }
+}

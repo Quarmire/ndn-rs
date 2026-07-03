@@ -38,6 +38,11 @@
 //!   the CCLF election weight, so the tightest clock beacons the anchor first
 //!   and worse clocks overhear and cancel — a local GPS out-elects a WAN NTP
 //!   uplink by construction, and losing a reference *is* yielding.
+//! - **Offsets come from timestamps three ways** ([`measure`]): two-way (PTP
+//!   `t1..t4`), one-way (a stamped broadcast + modelled delay), and common-view
+//!   (two receivers of one event, cancelling the transmitter's clock). Each
+//!   yields a `Measured<i64>` offset whose uncertainty reflects the path — and
+//!   common-view is forced `distance_bounded = false` because a relay defeats it.
 //!
 //! See the contributor book's "named-time" material and ADR 0007 for the crate
 //! boundary (why the stamp types live here rather than in `ndn-frame-io`).
@@ -49,6 +54,7 @@ pub mod capability;
 pub mod combine;
 pub mod election;
 pub mod interval;
+pub mod measure;
 pub mod provenance;
 pub mod ratchet;
 pub mod sample;
@@ -57,6 +63,7 @@ pub mod stamp;
 pub use capability::{ClockCapability, Holdover, TimeSourceKind, Traceability};
 pub use election::{ElectionParams, anchor_weight};
 pub use interval::TimeInterval;
+pub use measure::{RxObs, TwoWay, common_view, offset_to_wall, one_way, two_way};
 pub use provenance::{Authenticity, KeyId, Measured, MeasurementProvenance};
 pub use ratchet::{Ratchet, WindowEnforcement};
 pub use sample::TimeSample;

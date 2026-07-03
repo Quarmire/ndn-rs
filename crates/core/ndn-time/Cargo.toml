@@ -15,6 +15,11 @@ classification = "spec"
 # sources (GNSS/RTC/NTP shims, the peer-derived source) live in the
 # `ndn-time-sources` extension crate, mirroring signals-core / signal-sources.
 default = []
+# `sim`: exposes the `measure::sim` clock/link model (SimClock/SimLink) so
+# downstream test code can drive the measurement math with injectable offset,
+# drift, and path asymmetry. Off by default (it is test scaffolding, not the
+# production surface); the crate's own tests enable it implicitly via `cfg(test)`.
+sim = []
 
 [dependencies]
 
