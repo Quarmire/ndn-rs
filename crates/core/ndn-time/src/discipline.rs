@@ -220,6 +220,11 @@ pub struct TimePolicy {
     /// Seconds over which a steerable clock nominally closes its offset — the
     /// `ns offset → ppb rate` constant (`rate = offset_ns / slew_time_const_s`).
     pub slew_time_const_s: i64,
+    /// Offset magnitude (ns) above which a steerable clock *steps* rather than
+    /// slews — the ntpd-style step threshold. A large correction (e.g. first
+    /// hearing a reference after bootstrap, or after a long holdover) is applied
+    /// at once; small ongoing corrections slew so wall consumers see no jump.
+    pub step_threshold_ns: u64,
     /// The admission floor the sample set must clear (threat-diversity).
     pub floor: StakesFloor,
 }
@@ -230,6 +235,7 @@ impl Default for TimePolicy {
             required_uncertainty_ns: 1_000_000, // 1 ms
             max_slew_ppb: 500,
             slew_time_const_s: 1,
+            step_threshold_ns: 1_000_000, // 1 ms
             floor: StakesFloor::high(),
         }
     }
@@ -306,8 +312,10 @@ impl TimePolicy {
 
     /// ACT — turn a [`Correction`] into a capability-gated [`Discipline`].
     ///
-    /// `has_prior_wall` is `false` only at bootstrap (no established wall yet),
-    /// which is the one time a step is used instead of a slew.
+    /// A steerable clock *steps* at bootstrap (no established wall) or whenever
+    /// the offset exceeds [`Self::step_threshold_ns`] — a large correction is
+    /// applied at once. Smaller ongoing corrections *slew* (bounded rate) so
+    /// wall consumers never see a jump.
     pub fn act(&self, c: &Correction, cap: &ClockCapability, has_prior_wall: bool) -> Discipline {
         if !c.admitted || c.uncertainty_ns > self.required_uncertainty_ns {
             return Discipline::Withhold {
@@ -320,13 +328,14 @@ impl TimePolicy {
                 correction_ns: c.offset_ns,
             };
         }
-        // Bootstrap: a one-time wall step. Monotonic consumers are unaffected.
-        if !has_prior_wall {
+        // Step at bootstrap, or on any offset too large to reasonably slew out.
+        if !has_prior_wall || c.offset_ns.unsigned_abs() > self.step_threshold_ns {
             return Discipline::Step {
                 correction_ns: c.offset_ns,
             };
         }
-        // Ongoing: slew. Rate closes the offset (sign) at a bounded magnitude.
+        // Ongoing small offset: slew. Rate closes the offset (sign) at a bounded
+        // magnitude so wall-reading consumers never see a step.
         let t = self.slew_time_const_s.max(1);
         let rate = (c.offset_ns / t).clamp(-self.max_slew_ppb, self.max_slew_ppb);
         Discipline::Slew { rate_ppb: rate }
@@ -461,6 +470,34 @@ mod tests {
             }
             other => panic!("ongoing should slew, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_large_offset_steps_even_after_bootstrap() {
+        // A correction well past the step threshold is applied at once, even
+        // with a prior wall — a slew-limited clock could never catch 8 ms.
+        let policy = TimePolicy::default(); // step_threshold = 1 ms
+        let cap = ClockCapability::oscillator_tcxo();
+        let big = Correction {
+            offset_ns: 8_000_000, // 8 ms, > 1 ms threshold
+            uncertainty_ns: 1_000,
+            freq_skew_ppb: None,
+            support: 2,
+            admitted: true,
+        };
+        match policy.act(&big, &cap, true) {
+            Discipline::Step { correction_ns } => assert_eq!(correction_ns, 8_000_000),
+            other => panic!("a large offset steps, got {other:?}"),
+        }
+        // Just under the threshold still slews.
+        let small = Correction {
+            offset_ns: 900_000, // 0.9 ms, < 1 ms
+            ..big
+        };
+        assert!(matches!(
+            policy.act(&small, &cap, true),
+            Discipline::Slew { .. }
+        ));
     }
 
     #[test]
