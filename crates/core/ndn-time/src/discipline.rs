@@ -24,16 +24,22 @@
 use crate::capability::ClockCapability;
 use crate::combine::marzullo;
 use crate::interval::TimeInterval;
-use crate::measure::offset_to_wall;
 use crate::provenance::{MAX_MEASUREMENTS, Measured, MeasurementProvenance, StakesFloor, admits};
 
-/// One peer's current offset observation, retained for the next discipline pass.
+/// One peer's current wall observation, retained for the next discipline pass.
+///
+/// The estimate is the peer's **absolute** wall belief (not an offset relative
+/// to our clock), so it survives our own clock steps unchanged; between passes
+/// its center is advanced by elapsed monotonic time and its uncertainty widened
+/// by holdover. Storing an offset instead would go stale the moment we step.
 #[derive(Clone, Copy, Debug)]
 pub struct PeerSample {
-    /// The measured offset `remote − local`, ns, with its provenance.
-    pub offset: Measured<i64>,
-    /// Local monotonic clock (ns) at capture — anchors holdover aging and the
-    /// skew regression (principle P3: monotonic, non-regressing, network-free).
+    /// The peer's wall estimate (Unix ns) at `captured_mono_ns`, with its
+    /// uncertainty and provenance.
+    pub wall: Measured<i64>,
+    /// Local monotonic clock (ns) at capture — anchors holdover aging, center
+    /// advance, and the skew regression (principle P3: monotonic, non-regressing,
+    /// network-free).
     pub captured_mono_ns: u64,
     /// The peer's clock capability, used to age its uncertainty by holdover.
     pub cap: ClockCapability,
@@ -264,17 +270,15 @@ impl TimePolicy {
 
         for slot in state.peers.iter() {
             let Some((_, s)) = slot else { continue };
-            // Age this sample's uncertainty by the holdover accrued since capture.
+            // Age the sample: advance its center by the elapsed monotonic time
+            // (the peer's clock ran on too), and widen its uncertainty by the
+            // holdover accrued since capture.
             let elapsed = now_mono_ns.saturating_sub(s.captured_mono_ns);
             let growth = s.cap.holdover.growth_ns(elapsed);
-            let self_consistent = s.offset.sigma_ns.saturating_add(growth);
-            let aged = Measured {
-                value: s.offset.value,
-                sigma_ns: self_consistent,
-                prov: s.offset.prov,
-            };
-            intervals[n] = offset_to_wall(&aged, local_wall_ns);
-            provs[n] = s.offset.prov;
+            let center = s.wall.value.saturating_add(elapsed as i64);
+            let sigma = s.wall.sigma_ns.saturating_add(growth);
+            intervals[n] = TimeInterval::new(center, sigma);
+            provs[n] = s.wall.prov;
             n += 1;
         }
 
@@ -363,10 +367,20 @@ mod tests {
         }
     }
 
-    fn sample(offset_ns: i64, sigma_ns: u64, mono: u64, prov: MeasurementProvenance) -> PeerSample {
+    /// The wall the tests discipline against; a sample's `offset_from_base_ns`
+    /// is added to it to form the peer's absolute wall, so a recovered
+    /// `correction.offset_ns` equals the intended offset.
+    const WALL_BASE: i64 = 1_000_000_000;
+
+    fn sample(
+        offset_from_base_ns: i64,
+        sigma_ns: u64,
+        mono: u64,
+        prov: MeasurementProvenance,
+    ) -> PeerSample {
         PeerSample {
-            offset: Measured {
-                value: offset_ns,
+            wall: Measured {
+                value: WALL_BASE + offset_from_base_ns,
                 sigma_ns,
                 prov,
             },

@@ -198,10 +198,10 @@ proptest! {
 
 use ndn_time::discipline::{PeerSample, TimePolicy, TimeState};
 
-fn peer_sample(offset_ns: i64, sigma_ns: u64, key: u64, path: u32) -> PeerSample {
+fn peer_sample(wall_ns: i64, sigma_ns: u64, key: u64, path: u32) -> PeerSample {
     PeerSample {
-        offset: Measured {
-            value: offset_ns,
+        wall: Measured {
+            value: wall_ns,
             sigma_ns,
             prov: MeasurementProvenance {
                 distance_bounded: false,
@@ -216,24 +216,24 @@ fn peer_sample(offset_ns: i64, sigma_ns: u64, key: u64, path: u32) -> PeerSample
 }
 
 proptest! {
-    // The discipline pass never panics on arbitrary offsets/uncertainties.
+    // The discipline pass never panics on arbitrary peer walls / uncertainties.
     #[test]
     fn discipline_never_panics(
-        offsets in prop::collection::vec(-1_000_000_000i64..1_000_000_000, 0..10),
+        walls in prop::collection::vec(-1_000_000_000i64..1_000_000_000, 0..10),
         sigma in 1u64..10_000_000,
         local_wall in -1_000_000_000i64..1_000_000_000,
         now_mono in 0u64..100_000_000_000,
     ) {
         let policy = TimePolicy::default();
         let mut st = TimeState::new();
-        for (i, &o) in offsets.iter().enumerate() {
-            st.ingest(i as u64, peer_sample(o, sigma, i as u64, i as u32));
+        for (i, &w) in walls.iter().enumerate() {
+            st.ingest(i as u64, peer_sample(w, sigma, i as u64, i as u32));
         }
         let _ = policy.discipline(&mut st, local_wall, now_mono);
     }
 
-    // A cluster of authenticated, path-diverse peers agreeing around a true
-    // offset yields an admitted fix whose interval contains that offset.
+    // A cluster of authenticated, path-diverse peers agreeing around a true wall
+    // yields an admitted fix whose interval contains that wall's implied offset.
     #[test]
     fn discipline_fix_contains_the_true_offset(
         true_offset in -100_000_000i64..100_000_000,
@@ -242,12 +242,14 @@ proptest! {
     ) {
         let policy = TimePolicy::default();
         let mut st = TimeState::new();
-        // Three peers within ±spread of the true offset, each ±50 µs — distinct
-        // keys and paths so the high floor's T1/T2 diversity is met.
+        // Three peers whose absolute walls sit within ±spread of (local_wall +
+        // true_offset), each ±50 µs — distinct keys and paths so the high floor's
+        // T1/T2 diversity is met. Captured at now_mono so no center advance.
         let sigma = 50_000u64;
-        st.ingest(1, peer_sample(true_offset - spread, sigma, 1, 1));
-        st.ingest(2, peer_sample(true_offset, sigma, 2, 2));
-        st.ingest(3, peer_sample(true_offset + spread, sigma, 3, 3));
+        let center = local_wall + true_offset;
+        st.ingest(1, peer_sample(center - spread, sigma, 1, 1));
+        st.ingest(2, peer_sample(center, sigma, 2, 2));
+        st.ingest(3, peer_sample(center + spread, sigma, 3, 3));
         let c = policy.discipline(&mut st, local_wall, 0);
         prop_assert!(c.admitted, "three distinct authed peers clear the floor");
         // The combined fix interval (offset ± uncertainty) must contain the truth.

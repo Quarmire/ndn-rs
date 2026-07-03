@@ -38,23 +38,21 @@ pub struct TimeBeacon {
 }
 
 impl TimeBeacon {
-    /// Convert into a [`PeerSample`] given our current local wall estimate.
+    /// Convert into a [`PeerSample`] the discipline loop can combine.
     ///
-    /// The offset (`remote − local`) is `peer_wall − local_wall`, so that the
-    /// discipline loop's `offset_to_wall` reconstructs exactly the peer's wall
-    /// interval; the sample carries the peer's uncertainty and our reception
-    /// provenance.
+    /// The sample carries the peer's **absolute** wall estimate (so it survives
+    /// our own clock steps), its uncertainty, and our reception provenance.
     ///
-    /// Note: this treats the beacon's stated wall as the peer's estimate "as
-    /// received". A beacon crosses a propagation delay; where that delay is
-    /// significant relative to the uncertainty, prefer the one-way path
+    /// Note: this treats the beacon's stated wall as the peer's estimate at the
+    /// captured monotonic instant; the loop then advances it by elapsed
+    /// monotonic time. A beacon crosses a propagation delay, so where that delay
+    /// is significant relative to the uncertainty, prefer the one-way path
     /// ([`crate::measure::one_way`]) over a stamped beacon, or widen `wall` by
     /// the delay before constructing the beacon.
-    pub fn into_peer_sample(&self, local_wall_ns: i64) -> PeerSample {
-        let offset = self.wall.center_ns.saturating_sub(local_wall_ns);
+    pub fn into_peer_sample(&self) -> PeerSample {
         PeerSample {
-            offset: Measured {
-                value: offset,
+            wall: Measured {
+                value: self.wall.center_ns,
                 sigma_ns: self.wall.radius_ns,
                 prov: self.prov,
             },
@@ -87,17 +85,11 @@ mod tests {
             captured_mono_ns: 42,
             prov: prov(),
         };
-        let s = beacon.into_peer_sample(1_700_000_000_000);
-        // offset = peer_wall − local_wall = +5 µs.
-        assert_eq!(s.offset.value, 5_000);
-        assert_eq!(s.offset.sigma_ns, 2_000, "peer uncertainty carried");
+        let s = beacon.into_peer_sample();
+        // The sample carries the peer's absolute wall, uncertainty, provenance.
+        assert_eq!(s.wall.value, 1_700_000_005_000);
+        assert_eq!(s.wall.sigma_ns, 2_000, "peer uncertainty carried");
         assert_eq!(s.captured_mono_ns, 42);
-        // The reception provenance flows into the sample for admission.
-        assert!(s.offset.prov.authenticity.is_authenticated());
-
-        // And offset_to_wall(sample, local_wall) reconstructs the peer's wall.
-        let iv = crate::measure::offset_to_wall(&s.offset, 1_700_000_000_000);
-        assert_eq!(iv.center_ns, 1_700_000_005_000);
-        assert_eq!(iv.radius_ns, 2_000);
+        assert!(s.wall.prov.authenticity.is_authenticated());
     }
 }
