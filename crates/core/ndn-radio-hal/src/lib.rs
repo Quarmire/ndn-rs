@@ -387,3 +387,269 @@ pub trait WifiRadio: FrameIo {
         Ok(())
     }
 }
+
+// ---------------------------------------------------------------------------
+// Radio control plane: the stateful-knob seam + the capability descriptor.
+// ---------------------------------------------------------------------------
+
+/// Channel bandwidth, uniform across backends. The numeric `code()` matches the
+/// cognition plane's `TxParams.bw` / `RadioCapability.max_bw` encoding and the
+/// RTL `ChannelBw` discriminants: `0=20, 1=40, 2=80, 3=10MHz, 4=5MHz`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Bandwidth {
+    /// 20 MHz (standard).
+    #[default]
+    Bw20,
+    /// 40 MHz.
+    Bw40,
+    /// 80 MHz (VHT).
+    Bw80,
+    /// 10 MHz narrowband (non-standard; longer range / lower rate).
+    Nb10,
+    /// 5 MHz narrowband.
+    Nb5,
+}
+
+impl Bandwidth {
+    /// Numeric code shared with `TxParams.bw` / `RadioCapability.max_bw`.
+    pub fn code(self) -> u8 {
+        match self {
+            Bandwidth::Bw20 => 0,
+            Bandwidth::Bw40 => 1,
+            Bandwidth::Bw80 => 2,
+            Bandwidth::Nb10 => 3,
+            Bandwidth::Nb5 => 4,
+        }
+    }
+
+    /// Inverse of [`code`](Self::code); unknown codes fall back to 20 MHz.
+    pub fn from_code(c: u8) -> Self {
+        match c {
+            1 => Bandwidth::Bw40,
+            2 => Bandwidth::Bw80,
+            3 => Bandwidth::Nb10,
+            4 => Bandwidth::Nb5,
+            _ => Bandwidth::Bw20,
+        }
+    }
+}
+
+/// The uniform stateful-knob surface every userspace radio backend exposes to
+/// the named-radio control plane. Implementors are wrapped behind a
+/// `RadioActuators` adapter (see `control.rs`) so a single generic actuator can
+/// drive any radio.
+///
+/// Only [`set_channel`](Self::set_channel) is required — a radio that cannot at
+/// least tune is not useful. The remaining knobs default to no-ops so a port can
+/// land RX/TX first and grow contention/power control later. Per-frame
+/// rate/STBC/LDPC/short-GI/NSS is NOT here; that travels with each
+/// [`InjectFrame`]`.mcs` on the data plane.
+pub trait RadioKnobs: Send + Sync {
+    /// Tune to `channel` at bandwidth `bw`. Returns an error if the radio cannot
+    /// reach that channel/width (e.g. a port that has only captured one channel).
+    fn set_channel(&self, channel: u8, bw: Bandwidth) -> Result<(), FaceError>;
+
+    /// Set the TXAGC reference index (a back-off below the regulatory ceiling;
+    /// never used to exceed it). Default: no-op (radio runs at its init power).
+    fn set_tx_power(&self, _idx: u32) -> Result<(), FaceError> {
+        Ok(())
+    }
+
+    /// Enable cyclic-shift diversity on the second chain (1-stream robustness via
+    /// antenna diversity). Default: no-op (not supported / single-chain).
+    fn set_tx_csd(&self, _on: bool) -> Result<(), FaceError> {
+        Ok(())
+    }
+
+    /// Ignore EDCCA so TX proceeds under channel contention. Default: no-op.
+    fn set_edcca_ignore(&self, _on: bool) -> Result<(), FaceError> {
+        Ok(())
+    }
+}
+
+/// RF band — the coarse range/penetration axis used for heterogeneous radio
+/// selection (sub-GHz reaches far / penetrates; 5/6 GHz is bulk; 60 GHz is dense).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Band {
+    Sub1GHz,
+    Band2_4GHz,
+    Band5GHz,
+    Band6GHz,
+    Band60GHz,
+}
+
+impl Band {
+    /// Relative range/penetration rank (higher = reaches further / penetrates more).
+    pub fn range_rank(self) -> u8 {
+        match self {
+            Band::Sub1GHz => 4,
+            Band::Band2_4GHz => 3,
+            Band::Band5GHz => 2,
+            Band::Band6GHz => 1,
+            Band::Band60GHz => 0,
+        }
+    }
+}
+
+/// What kind of radio this is — selects the regime and whether it can transmit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RadioKind {
+    /// Commodity Wi-Fi in monitor/injection mode (the load-bearing data radio).
+    WifiMonitor,
+    /// Sub-GHz long-range / low-rate (LoRa-class) — heterogeneous coordination/ambient.
+    Lora,
+    /// 802.11ah HaLow sub-GHz.
+    WifiHaLow,
+    /// Bluetooth LE broadcast face.
+    Ble,
+    /// Software-defined radio used **RX-only as a spectrum instrument** (the richest
+    /// `SenseSource`: real PSD/occupancy, interference ID, DFS radar detection,
+    /// a calibrated witness for our own TX). Not a data transmitter here — the
+    /// SDR-as-modem arc stays the frontier.
+    Sdr,
+    Other,
+}
+
+/// Whether a radio can afford to listen continuously — the axis that selects the
+/// rendezvous mode. A mains-powered monitor radio listens always; a battery
+/// sub-GHz node duty-cycles. This is *not* an 802.11 concept: it is the
+/// bearer-agnostic reason Discovery Windows exist (see `ndn-nan-core::rendezvous`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub enum TimingModel {
+    /// Continuous RX — no wake schedule needed; the rendezvous mode can be null
+    /// (always-on). Commodity Wi-Fi monitor radios, SDRs, mains-powered relays.
+    #[default]
+    AlwaysOn,
+    /// Duty-cycled RX to save power — needs a windowed rendezvous (a NAN-style
+    /// Discovery Window, a TSCH slotframe). Battery sub-GHz / IoT nodes.
+    DutyCycled,
+}
+
+/// Per-radio capability descriptor — the single switch between homogeneous
+/// (NDNPIPES: identical capabilities → channel assignment + spatial reuse) and
+/// heterogeneous (NDN-CRAHNs: divergent capabilities → object→radio mapping by
+/// fit) regimes. Generalizes the `LinkProfile` cost prior.
+///
+/// Carries both 802.11-flavoured rate caps (`max_mcs`/`max_nss`/`max_bw`, which a
+/// non-WiFi bearer sets to its own equivalents or zero) **and** the
+/// bearer-agnostic operational axes a cognitive plane needs to place work on a
+/// heterogeneous radio: its timing model, duty-cycle ceiling, on-air payload cap,
+/// and duplex. Those four are what let LoRa, an SDR, or a future PHY be *described*
+/// rather than special-cased.
+#[derive(Clone, Debug)]
+pub struct RadioCapability {
+    pub kind: RadioKind,
+    pub band: Band,
+    pub max_mcs: u8,
+    pub max_nss: u8,
+    /// Max channel-bandwidth code (0=20,1=40,2=80,3=10,4=5), matching `ChannelBw`.
+    pub max_bw: u8,
+    /// Channels this radio may use.
+    pub channels: Vec<u8>,
+    /// Max TX-power index (chip TXAGC scale) = the *calibrated/regulatory ceiling*.
+    /// The power knob backs off below this; it is never exceeded. This is also a
+    /// capability item peers can learn (reach class).
+    pub max_tx_power: u8,
+    /// Can retune quickly (fast FHSS-capable).
+    pub agile: bool,
+    /// RX-only — participates in sensing/reception, never selected for TX (e.g. SDR
+    /// sensor). Such radios still contribute to macrodiversity reception pooling.
+    pub rx_only: bool,
+    /// Whether the radio listens continuously or duty-cycles — selects the
+    /// rendezvous mode (always-on vs a windowed schedule).
+    pub timing: TimingModel,
+    /// Regulatory / policy ceiling on the fraction of airtime this radio may use
+    /// (`1.0` = unrestricted; LoRa sub-GHz is ~`0.01`). A broadcast rate planner
+    /// must respect it.
+    pub duty_cycle_max: f32,
+    /// Largest on-air payload one frame carries (bytes) — the fragmentation MTU
+    /// the link service targets (WiFi ~1500+, ESP-NOW 250, LoRa ~256).
+    pub max_payload: usize,
+    /// Half-duplex: cannot receive while transmitting (a node never hears its own
+    /// TX). True for essentially every single-antenna packet radio.
+    pub half_duplex: bool,
+}
+
+impl RadioCapability {
+    /// A commodity 5 GHz Wi-Fi monitor radio (our RTL8812EU/8822E data radio).
+    pub fn wifi_monitor_5ghz(channels: Vec<u8>) -> Self {
+        Self {
+            kind: RadioKind::WifiMonitor,
+            band: Band::Band5GHz,
+            max_mcs: 9,
+            max_nss: 2,
+            max_bw: 2,
+            channels,
+            max_tx_power: 63,
+            agile: true,
+            rx_only: false,
+            timing: TimingModel::AlwaysOn,
+            duty_cycle_max: 1.0,
+            max_payload: 1500,
+            half_duplex: true,
+        }
+    }
+
+    /// A 2.4 GHz Wi-Fi monitor radio — our MT7612U (mt76x2u, 2x2 11n on 2.4 GHz).
+    /// TX-capable in principle; today only channel 6 / 20 MHz is captured (the
+    /// `RadioKnobs` impl errors on other channels), so callers usually pass
+    /// `channels = vec![6]` and `max_bw` stays 0 until wider widths are ported.
+    pub fn wifi_monitor_2ghz(channels: Vec<u8>) -> Self {
+        Self {
+            kind: RadioKind::WifiMonitor,
+            band: Band::Band2_4GHz,
+            max_mcs: 7,
+            max_nss: 2,
+            max_bw: 0,
+            channels,
+            max_tx_power: 63,
+            agile: true,
+            rx_only: false,
+            timing: TimingModel::AlwaysOn,
+            duty_cycle_max: 1.0,
+            max_payload: 1500,
+            half_duplex: true,
+        }
+    }
+
+    /// A sub-GHz LoRa-class radio (long range, low rate).
+    pub fn lora(channels: Vec<u8>) -> Self {
+        Self {
+            kind: RadioKind::Lora,
+            band: Band::Sub1GHz,
+            max_mcs: 0,
+            max_nss: 1,
+            max_bw: 4,
+            channels,
+            max_tx_power: 63,
+            agile: false,
+            rx_only: false,
+            // Sub-GHz is duty-cycle-limited (~1%) and needs a windowed rendezvous;
+            // tiny frames, half-duplex.
+            timing: TimingModel::DutyCycled,
+            duty_cycle_max: 0.01,
+            max_payload: 256,
+            half_duplex: true,
+        }
+    }
+
+    /// An RX-only SDR spectrum sensor.
+    pub fn sdr_sensor(channels: Vec<u8>) -> Self {
+        Self {
+            kind: RadioKind::Sdr,
+            band: Band::Band5GHz,
+            max_mcs: 0,
+            max_nss: 0,
+            max_bw: 0,
+            channels,
+            max_tx_power: 0,
+            agile: true,
+            rx_only: true,
+            // A spectrum instrument: always listening, never transmits.
+            timing: TimingModel::AlwaysOn,
+            duty_cycle_max: 1.0,
+            max_payload: 0,
+            half_duplex: false,
+        }
+    }
+}
