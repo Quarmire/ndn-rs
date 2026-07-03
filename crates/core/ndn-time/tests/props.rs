@@ -6,7 +6,7 @@ use ndn_time::combine::marzullo;
 use ndn_time::election::{ElectionParams, anchor_weight};
 use ndn_time::interval::TimeInterval;
 use ndn_time::provenance::{
-    Authenticity, KeyId, MeasurementProvenance, PathId, StakesFloor, admits,
+    Authenticity, KeyId, Measured, MeasurementProvenance, PathId, StakesFloor, admits,
 };
 use proptest::prelude::*;
 
@@ -193,5 +193,67 @@ proptest! {
         );
         prop_assert_eq!(m.value, oa - ob, "offset A − B, transmitter cancels");
         prop_assert!(!m.prov.distance_bounded, "a relay defeats common-view");
+    }
+}
+
+use ndn_time::discipline::{PeerSample, TimePolicy, TimeState};
+
+fn peer_sample(offset_ns: i64, sigma_ns: u64, key: u64, path: u32) -> PeerSample {
+    PeerSample {
+        offset: Measured {
+            value: offset_ns,
+            sigma_ns,
+            prov: MeasurementProvenance {
+                distance_bounded: false,
+                replay_protected: true,
+                authenticity: Authenticity::AuthenticatedDomainPeer(KeyId(key)),
+                path: PathId(path),
+            },
+        },
+        captured_mono_ns: 0,
+        cap: ClockCapability::oscillator_tcxo(),
+    }
+}
+
+proptest! {
+    // The discipline pass never panics on arbitrary offsets/uncertainties.
+    #[test]
+    fn discipline_never_panics(
+        offsets in prop::collection::vec(-1_000_000_000i64..1_000_000_000, 0..10),
+        sigma in 1u64..10_000_000,
+        local_wall in -1_000_000_000i64..1_000_000_000,
+        now_mono in 0u64..100_000_000_000,
+    ) {
+        let policy = TimePolicy::default();
+        let mut st = TimeState::new();
+        for (i, &o) in offsets.iter().enumerate() {
+            st.ingest(i as u64, peer_sample(o, sigma, i as u64, i as u32));
+        }
+        let _ = policy.discipline(&mut st, local_wall, now_mono);
+    }
+
+    // A cluster of authenticated, path-diverse peers agreeing around a true
+    // offset yields an admitted fix whose interval contains that offset.
+    #[test]
+    fn discipline_fix_contains_the_true_offset(
+        true_offset in -100_000_000i64..100_000_000,
+        spread in 0i64..40_000,
+        local_wall in -1_000_000_000i64..1_000_000_000,
+    ) {
+        let policy = TimePolicy::default();
+        let mut st = TimeState::new();
+        // Three peers within ±spread of the true offset, each ±50 µs — distinct
+        // keys and paths so the high floor's T1/T2 diversity is met.
+        let sigma = 50_000u64;
+        st.ingest(1, peer_sample(true_offset - spread, sigma, 1, 1));
+        st.ingest(2, peer_sample(true_offset, sigma, 2, 2));
+        st.ingest(3, peer_sample(true_offset + spread, sigma, 3, 3));
+        let c = policy.discipline(&mut st, local_wall, 0);
+        prop_assert!(c.admitted, "three distinct authed peers clear the floor");
+        // The combined fix interval (offset ± uncertainty) must contain the truth.
+        let lo = c.offset_ns - c.uncertainty_ns as i64;
+        let hi = c.offset_ns + c.uncertainty_ns as i64;
+        prop_assert!(lo <= true_offset && true_offset <= hi,
+            "fix [{lo},{hi}] must contain true offset {true_offset}");
     }
 }

@@ -43,6 +43,10 @@
 //!   (two receivers of one event, cancelling the transmitter's clock). Each
 //!   yields a `Measured<i64>` offset whose uncertainty reflects the path — and
 //!   common-view is forced `distance_bounded = false` because a relay defeats it.
+//! - **One loop ties it together** ([`discipline`]): SENSE per-peer samples →
+//!   DECIDE (age by holdover, admit, Marzullo-combine, regress offset + frequency
+//!   skew) → ACT (a capability-gated slew/step/track, or a fail-closed withhold).
+//!   It only ever moves the *wall* estimate; the monotonic floor is untouched.
 //!
 //! See the contributor book's "named-time" material and ADR 0007 for the crate
 //! boundary (why the stamp types live here rather than in `ndn-frame-io`).
@@ -52,6 +56,7 @@
 
 pub mod capability;
 pub mod combine;
+pub mod discipline;
 pub mod election;
 pub mod interval;
 pub mod measure;
@@ -61,6 +66,7 @@ pub mod sample;
 pub mod stamp;
 
 pub use capability::{ClockCapability, Holdover, TimeSourceKind, Traceability};
+pub use discipline::{Correction, Discipline, PeerSample, TimePolicy, TimeState};
 pub use election::{ElectionParams, anchor_weight};
 pub use interval::TimeInterval;
 pub use measure::{RxObs, TwoWay, common_view, offset_to_wall, one_way, two_way};
