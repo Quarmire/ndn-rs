@@ -54,6 +54,7 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![deny(missing_docs)]
 
+pub mod beacon;
 pub mod capability;
 pub mod combine;
 pub mod discipline;
@@ -65,6 +66,7 @@ pub mod ratchet;
 pub mod sample;
 pub mod stamp;
 
+pub use beacon::TimeBeacon;
 pub use capability::{ClockCapability, Holdover, TimeSourceKind, Traceability};
 pub use discipline::{Correction, Discipline, PeerSample, TimePolicy, TimeState};
 pub use election::{ElectionParams, anchor_weight};
