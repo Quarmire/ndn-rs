@@ -24,6 +24,7 @@
 //! extraction never depends on understanding every field.
 
 /// Present-bitmap bit indices (subset we care about).
+const BIT_TSFT: u32 = 0;
 const BIT_RATE: u32 = 2;
 const BIT_DBM_ANTSIGNAL: u32 = 5;
 const BIT_TX_FLAGS: u32 = 15;
@@ -112,6 +113,11 @@ pub struct RadiotapInfo {
     pub mcs_index: Option<u8>,
     /// Legacy rate in 500 kbps units, if the `RATE` field was present.
     pub rate_500kbps: Option<u8>,
+    /// The 64-bit TSFT (MAC Timing Synchronization Function) counter latched by
+    /// the NIC at reception, if the header carried it. This is the hardware
+    /// receive timestamp named-time builds a [`LinkStamp`](ndn_radio_hal::LinkStamp)
+    /// from — ~1 µs resolution, latched before host software touches the frame.
+    pub tsft: Option<u64>,
     /// Offset where the 802.11 frame begins (== `it_len`).
     pub header_len: usize,
 }
@@ -193,6 +199,18 @@ pub fn parse(buf: &[u8]) -> Option<RadiotapInfo> {
             break;
         }
         match bit as u32 {
+            BIT_TSFT => {
+                info.tsft = Some(u64::from_le_bytes([
+                    buf[off],
+                    buf[off + 1],
+                    buf[off + 2],
+                    buf[off + 3],
+                    buf[off + 4],
+                    buf[off + 5],
+                    buf[off + 6],
+                    buf[off + 7],
+                ]));
+            }
             BIT_RATE => info.rate_500kbps = Some(buf[off]),
             BIT_DBM_ANTSIGNAL => info.rssi_dbm = Some(buf[off] as i8),
             BIT_MCS => info.mcs_index = Some(buf[off + 2]), // known, flags, index
@@ -261,6 +279,30 @@ mod tests {
         assert_eq!(info.rssi_dbm, Some(-67));
         assert_eq!(info.rate_500kbps, Some(0x02));
         assert_eq!(info.header_len, it_len as usize);
+    }
+
+    #[test]
+    fn parse_extracts_tsft() {
+        // A header carrying only TSFT (bit 0), an 8-byte counter aligned to 8.
+        let present: u32 = 1 << 0;
+        let tsft: u64 = 0x0123_4567_89ab_cdef;
+        let mut h = vec![0u8, 0]; // version, pad
+        let body = tsft.to_le_bytes(); // TSFT @ off 8 (already aligned)
+        let it_len = (8 + body.len()) as u16;
+        h.extend_from_slice(&it_len.to_le_bytes());
+        h.extend_from_slice(&present.to_le_bytes());
+        h.extend_from_slice(&body);
+
+        let info = parse(&h).expect("valid header");
+        assert_eq!(info.tsft, Some(tsft));
+        // A header without TSFT leaves it None.
+        let mut h2 = vec![0u8, 0];
+        let present2: u32 = 1 << 5; // DBM_ANTSIGNAL only
+        let it_len2 = 8u16 + 1;
+        h2.extend_from_slice(&it_len2.to_le_bytes());
+        h2.extend_from_slice(&present2.to_le_bytes());
+        h2.push((-50i8) as u8);
+        assert_eq!(parse(&h2).unwrap().tsft, None);
     }
 
     #[test]

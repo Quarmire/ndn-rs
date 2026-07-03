@@ -7,7 +7,9 @@
 use bytes::Bytes;
 use ndn_transport::FaceError;
 
-use crate::{CapturedFrame, FrameFormat, InjectFrame, radiotap};
+use crate::{
+    CapturedFrame, ClockDomainId, FrameFormat, InjectFrame, LatchPoint, LinkStamp, radiotap,
+};
 
 /// 802.11 non-QoS data frame header (FC + Duration + 3×addr + SeqCtrl).
 const DOT11_HDR_LEN: usize = 24;
@@ -186,24 +188,44 @@ pub fn parse(
     buf: &[u8],
     rssi: Option<i8>,
     mcs: Option<u8>,
+    domain: ClockDomainId,
 ) -> Option<CapturedFrame> {
     let info = radiotap::parse(buf)?;
     let body = buf.get(info.header_len..)?;
+    // If radiotap carried a TSFT, build a hardware receive stamp for it. The
+    // caller supplies the clock `domain` (a TSF counter is per-NIC); the latch
+    // is `MacDone` (~1 µs) and precision is clamped to that latch's floor.
+    let stamp = info.tsft.map(|raw| {
+        LinkStamp::new(
+            raw,
+            domain,
+            LatchPoint::MacDone.precision_floor_ns(),
+            LatchPoint::MacDone,
+        )
+    });
     // radiotap RSSI/rate are the fallback when the caller has no out-of-band read.
-    parse_dot11(format, body, rssi.or(info.rssi_dbm), mcs.or(info.mcs_index))
+    parse_dot11(
+        format,
+        body,
+        rssi.or(info.rssi_dbm),
+        mcs.or(info.mcs_index),
+        stamp,
+    )
 }
 
 /// Recover the NDN payload + transmitter address from a bare **802.11 frame**
-/// `body` (no radiotap) under `format`. `rssi`/`mcs` are passed through to the
-/// returned [`CapturedFrame`] as-is. The counterpart to [`build_dot11`]: a
-/// hardware backend that strips its own RX descriptor (and reads RSSI/rate from
-/// it) recovers the payload through this, sharing the format byte layout with
-/// the radiotap-based [`parse`].
+/// `body` (no radiotap) under `format`. `rssi`/`mcs`/`stamp` are passed through
+/// to the returned [`CapturedFrame`] as-is. The counterpart to [`build_dot11`]:
+/// a hardware backend that strips its own RX descriptor (reading RSSI/rate and
+/// latching a receive timestamp from it) recovers the payload through this,
+/// sharing the format byte layout with the radiotap-based [`parse`], which
+/// instead builds the `stamp` from radiotap TSFT.
 pub fn parse_dot11(
     format: FrameFormat,
     body: &[u8],
     rssi: Option<i8>,
     mcs: Option<u8>,
+    stamp: Option<LinkStamp>,
 ) -> Option<CapturedFrame> {
     if body.len() < 2 {
         return None;
@@ -237,6 +259,7 @@ pub fn parse_dot11(
                 group: Some(group),
                 rssi_dbm: rssi,
                 mcs_index: mcs,
+                stamp,
             })
         }
         FrameFormat::EspNow { oui } => {
@@ -274,6 +297,7 @@ pub fn parse_dot11(
                 group: Some(group),
                 rssi_dbm: rssi,
                 mcs_index: mcs,
+                stamp,
             })
         }
         FrameFormat::Raw80211 => {
@@ -294,6 +318,7 @@ pub fn parse_dot11(
                 group: Some(group),
                 rssi_dbm: rssi,
                 mcs_index: mcs,
+                stamp,
             })
         }
         _ => None,
@@ -320,7 +345,7 @@ mod tests {
     fn raw_ndn_round_trips() {
         let fmt = FrameFormat::RawNdn { ethertype: 0x8624 };
         let wire = build(fmt, &frame(b"\x05\x03interest")).unwrap();
-        let got = parse(fmt, &wire, Some(-50), Some(3)).unwrap();
+        let got = parse(fmt, &wire, Some(-50), Some(3), crate::ClockDomainId(0)).unwrap();
         assert_eq!(got.payload.as_ref(), b"\x05\x03interest");
         assert_eq!(got.addr, Some(SRC));
         assert_eq!(got.group, Some(BROADCAST));
@@ -328,11 +353,51 @@ mod tests {
     }
 
     #[test]
+    fn parse_populates_stamp_from_radiotap_tsft() {
+        let fmt = FrameFormat::RawNdn { ethertype: 0x8624 };
+        let dot11 = build_dot11(fmt, &frame(b"\x05\x03abc")).unwrap();
+        // Hand-build a radiotap header carrying only a TSFT (bit 0), then the
+        // 802.11 frame — the shape a monitor NIC delivers.
+        let tsft: u64 = 0xdead_beef_0000_0001;
+        let mut wire = vec![0u8, 0]; // version, pad
+        let present: u32 = 1 << 0;
+        let it_len = (8 + 8) as u16; // header + one 8-byte TSFT field
+        wire.extend_from_slice(&it_len.to_le_bytes());
+        wire.extend_from_slice(&present.to_le_bytes());
+        wire.extend_from_slice(&tsft.to_le_bytes());
+        wire.extend_from_slice(&dot11);
+
+        let domain = crate::ClockDomainId(42);
+        let stamp = parse(fmt, &wire, None, None, domain)
+            .unwrap()
+            .stamp
+            .expect("a TSFT header must yield a hardware stamp");
+        assert_eq!(stamp.raw, tsft, "raw counter preserved");
+        assert_eq!(stamp.domain, domain, "the NIC's clock domain is carried");
+        assert_eq!(stamp.latch, LatchPoint::MacDone);
+        assert_eq!(
+            stamp.precision_ns, 1_000,
+            "clamped to the MacDone ~1µs floor"
+        );
+
+        // A frame built with an ordinary TX radiotap header (no TSFT) is
+        // honestly unstamped.
+        let plain = build(fmt, &frame(b"\x05\x03abc")).unwrap();
+        assert!(
+            parse(fmt, &plain, None, None, domain)
+                .unwrap()
+                .stamp
+                .is_none(),
+            "no TSFT => no stamp"
+        );
+    }
+
+    #[test]
     fn espnow_round_trips() {
         let fmt = FrameFormat::EspNow { oui: ESPNOW_OUI };
         let payload = b"\x64\x0fNDN-LP-over-ESPNOW";
         let wire = build(fmt, &frame(payload)).unwrap();
-        let got = parse(fmt, &wire, Some(-40), None).unwrap();
+        let got = parse(fmt, &wire, Some(-40), None, crate::ClockDomainId(0)).unwrap();
         assert_eq!(got.payload.as_ref(), payload.as_slice());
         assert_eq!(got.addr, Some(SRC));
     }
@@ -364,7 +429,14 @@ mod tests {
             dst: g,
             src: u,
         };
-        let got = parse(fmt, &build(fmt, &f).unwrap(), None, None).unwrap();
+        let got = parse(
+            fmt,
+            &build(fmt, &f).unwrap(),
+            None,
+            None,
+            crate::ClockDomainId(0),
+        )
+        .unwrap();
         assert_eq!(got.group, Some(g), "addr1 carries the name-group MAC");
         assert_eq!(got.addr, Some(u), "addr2 is the name-derived source");
     }
@@ -398,7 +470,7 @@ mod tests {
         let dot11 = build_dot11(fmt, &f).unwrap();
         // No radiotap prefix — starts at the 802.11 Action frame control.
         assert_eq!(&dot11[0..2], &[0xd0, 0x00]);
-        let got = parse_dot11(fmt, &dot11, Some(-33), Some(7)).unwrap();
+        let got = parse_dot11(fmt, &dot11, Some(-33), Some(7), None).unwrap();
         assert_eq!(got.payload.as_ref(), b"\x05\x05hello");
         assert_eq!(got.addr, Some(SRC));
         assert_eq!(got.rssi_dbm, Some(-33), "descriptor RSSI passes through");
@@ -430,7 +502,14 @@ mod tests {
         // build_dot11 is the identity on the payload (no extra framing).
         assert_eq!(build_dot11(fmt, &inj).unwrap(), frame_bytes);
 
-        let got = parse(fmt, &build(fmt, &inj).unwrap(), Some(-60), Some(0)).unwrap();
+        let got = parse(
+            fmt,
+            &build(fmt, &inj).unwrap(),
+            Some(-60),
+            Some(0),
+            crate::ClockDomainId(0),
+        )
+        .unwrap();
         assert_eq!(
             got.payload.as_ref(),
             &frame_bytes[..],
@@ -452,8 +531,8 @@ mod tests {
         let raw = FrameFormat::RawNdn { ethertype: 0x8624 };
         let esp = FrameFormat::EspNow { oui: ESPNOW_OUI };
         let raw_wire = build(raw, &frame(b"x")).unwrap();
-        assert!(parse(esp, &raw_wire, None, None).is_none());
+        assert!(parse(esp, &raw_wire, None, None, crate::ClockDomainId(0)).is_none());
         let esp_wire = build(esp, &frame(b"x")).unwrap();
-        assert!(parse(raw, &esp_wire, None, None).is_none());
+        assert!(parse(raw, &esp_wire, None, None, crate::ClockDomainId(0)).is_none());
     }
 }

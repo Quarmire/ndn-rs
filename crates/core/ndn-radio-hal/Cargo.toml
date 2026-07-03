@@ -11,6 +11,11 @@ classification = "spec"
 
 [dependencies]
 ndn-transport = { workspace = true }
+# The link-timestamp vocabulary (LinkStamp/ClockDomainId/LatchPoint) lives in
+# the no_std named-time core; this std crate depends on it to put an
+# `Option<LinkStamp>` on CapturedFrame. Direction is std -> no_std (valid);
+# both crates are spec. See ADR 0007.
+ndn-time      = { workspace = true }
 bytes         = { workspace = true, features = ["std"] }
 async-trait   = { workspace = true }
 

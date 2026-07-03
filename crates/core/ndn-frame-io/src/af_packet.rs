@@ -191,7 +191,10 @@ impl crate::FrameIo for AfPacketBackend {
             };
             // A frame we can't decode (wrong format, foreign protocol) is
             // skipped, not an error — keep listening (readiness retained).
-            if let Some(frame) = crate::frame::parse(self.format, &buf[..n], None, None) {
+            // The TSFT clock domain is this NIC's — keyed by its ifindex, which
+            // is unique per interface on this host.
+            let domain = crate::ClockDomainId(self.ifindex as u32);
+            if let Some(frame) = crate::frame::parse(self.format, &buf[..n], None, None, domain) {
                 return Ok(frame);
             }
         }

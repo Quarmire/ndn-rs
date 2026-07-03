@@ -17,6 +17,11 @@ use bytes::Bytes;
 /// on `ndn-transport` directly.
 pub use ndn_transport::{FaceError, FaceId};
 
+/// Re-exported link-timestamp vocabulary (from the named-time core). A backend
+/// stamps a [`CapturedFrame`] with a [`LinkStamp`] carrying its clock domain and
+/// honest precision; the generic time layer consumes it. See ADR 0007.
+pub use ndn_time::{ClockDomainId, LatchPoint, LinkStamp};
+
 /// The 802.11 broadcast address — the default destination when no name-group is
 /// configured (every monitor receiver keeps the frame).
 pub const BROADCAST: [u8; 6] = [0xff; 6];
@@ -180,7 +185,10 @@ impl TxIntent {
     };
     /// Broadcast at a stated reliability.
     pub const fn broadcast(reliability: Reliability) -> Self {
-        TxIntent { reliability, reach: Reach::Broadcast }
+        TxIntent {
+            reliability,
+            reach: Reach::Broadcast,
+        }
     }
 }
 
@@ -205,8 +213,15 @@ impl McsDescriptor {
             Reliability::Balanced => McsDescriptor::CONSERVATIVE,
             Reliability::Throughput => {
                 let idx = max_index.min(MAX_RELIABLE_MCS);
-                let base = if vht_cap { McsDescriptor::vht(idx) } else { McsDescriptor::ht(idx) };
-                McsDescriptor { short_gi: true, ..base }
+                let base = if vht_cap {
+                    McsDescriptor::vht(idx)
+                } else {
+                    McsDescriptor::ht(idx)
+                };
+                McsDescriptor {
+                    short_gi: true,
+                    ..base
+                }
             }
         }
     }
@@ -336,6 +351,12 @@ pub struct CapturedFrame {
     pub rssi_dbm: Option<i8>,
     /// MCS index the frame was received at, if radiotap reported it.
     pub mcs_index: Option<u8>,
+    /// Hardware receive timestamp, if the backend latched one (radiotap TSFT on
+    /// a monitor NIC, a NIC PHC, an on-chip counter). Carries its clock domain
+    /// and honest precision; `None` when the backend has no hardware stamp (a
+    /// software-timestamped or loopback frame). This is the named-time "Cut 1"
+    /// seam — the input to time-transfer measurement.
+    pub stamp: Option<LinkStamp>,
 }
 
 /// The radio behind a `MonitorWifiFace`: inject a frame at a chosen rate, and

@@ -61,15 +61,17 @@ property can't be silently regressed into a false sense of safety).
 - **Positive:** the boundary with the radio foundation (ADR 0006) is clean:
   `LinkStamp` is one more `CapturedFrame` optional hint, and it carries an
   explicit clock domain so cross-domain stamps are never silently subtracted.
-- **Cost:** Cut 1 (`CapturedFrame.stamp`) is a *breaking* change to a
-  cross-repo type — the sibling repos that construct `CapturedFrame`
-  (monitor-wifi's `FrameIo` impls, ndn-sim) must be updated in lockstep, and
-  `cargo-semver-checks` + `build_all.sh` will flag it. It is therefore a
-  separate, deliberately-sequenced step, not folded into the core crate.
-- **Cost:** `ndn-frame-io` depending on `ndn-time` reads slightly
-  "backwards" (a low-level L2 crate depending on a time crate). It is
-  acceptable because `ndn-time` is a tiny `no_std` primitives-and-math crate
-  with no I/O, consumed by `ndn-frame-io` only for the stamp *vocabulary*.
+- **Landed:** Cut 1 (`CapturedFrame.stamp: Option<LinkStamp>`) is wired.
+  `CapturedFrame` lives in `ndn-radio-hal` (a later refactor moved the radio
+  contract there), so it is `ndn-radio-hal` that gained the `ndn-time`
+  dependency; the AF_PACKET receive path builds a `MacDone` stamp from radiotap
+  TSFT (keyed by the NIC's ifindex as its clock domain), and the loopback bus is
+  honestly `None`. In practice this was *non-breaking*: no sibling constructs
+  `CapturedFrame` (they only read its fields), so all consumers built unchanged.
+- **Cost:** `ndn-radio-hal` depending on `ndn-time` reads slightly "backwards"
+  (a link-layer contract crate depending on a time crate). It is acceptable
+  because `ndn-time` is a tiny `no_std` primitives-and-math crate with no I/O,
+  consumed only for the stamp *vocabulary*.
 
 ## Alternatives considered
 

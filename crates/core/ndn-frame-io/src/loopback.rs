@@ -85,8 +85,7 @@ impl LoopbackEndpoint {
 #[async_trait]
 impl FrameIo for LoopbackEndpoint {
     async fn inject(&self, frame: InjectFrame) -> Result<(), FaceError> {
-        let idx =
-            crate::McsDescriptor::for_intent(&frame.tx, crate::MAX_RELIABLE_MCS, false).index;
+        let idx = crate::McsDescriptor::for_intent(&frame.tx, crate::MAX_RELIABLE_MCS, false).index;
         self.emit(frame.dst, frame.src, frame.payload, idx);
         Ok(())
     }
@@ -102,6 +101,9 @@ impl FrameIo for LoopbackEndpoint {
                         group: Some(air.dst),
                         rssi_dbm: Some(self.observed_rssi_dbm),
                         mcs_index: Some(air.mcs_index),
+                        // The loopback bus is a format-agnostic in-memory test
+                        // double with no hardware clock — honestly unstamped.
+                        stamp: None,
                     });
                 }
                 // Own transmission — a radio does not hear itself.
@@ -129,8 +131,8 @@ impl crate::WifiRadio for LoopbackEndpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{McsDescriptor, TxIntent, WifiRadio};
     use crate::frame::{BROADCAST, DEFAULT_SRC};
+    use crate::{McsDescriptor, TxIntent, WifiRadio};
 
     /// A distinctive non-broadcast group MAC (locally-administered multicast).
     const GROUP: [u8; 6] = [0x03, 0xaa, 0xbb, 0xcc, 0xdd, 0xee];
@@ -180,9 +182,7 @@ mod tests {
         let a = bus.endpoint(1, -50);
         let b = bus.endpoint(2, -50);
 
-        a.inject(inj(b"mine", BROADCAST, NODE_SRC))
-            .await
-            .unwrap();
+        a.inject(inj(b"mine", BROADCAST, NODE_SRC)).await.unwrap();
         b.inject(inj(b"yours", BROADCAST, DEFAULT_SRC))
             .await
             .unwrap();

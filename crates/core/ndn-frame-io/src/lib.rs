@@ -16,9 +16,9 @@ pub mod radiotap;
 /// here so every existing `ndn_frame_io::X` path and internal `crate::X`
 /// reference still resolves unchanged.
 pub use ndn_radio_hal::{
-    BROADCAST, CapturedFrame, DEFAULT_SRC, FaceError, FaceId, FrameIo, InjectFrame,
-    MAX_RELIABLE_MCS, McsDescriptor, McsPolicy, Reach, Reliability, TxIntent, WifiRadio,
-    mcs_for_rssi, mcs_phy_rate_bps,
+    BROADCAST, CapturedFrame, ClockDomainId, DEFAULT_SRC, FaceError, FaceId, FrameIo, InjectFrame,
+    LatchPoint, LinkStamp, MAX_RELIABLE_MCS, McsDescriptor, McsPolicy, Reach, Reliability,
+    TxIntent, WifiRadio, mcs_for_rssi, mcs_phy_rate_bps,
 };
 
 pub use frame::{ESPNOW_MAX_BODY, ESPNOW_OUI, name_group_mac, name_group_uni};
@@ -120,7 +120,7 @@ mod tests {
             let fmt = FrameFormat::RawNdn { ethertype };
             let f = inject(payload.clone(), dst, src);
             let wire = frame::build(fmt, &f).expect("RawNdn always builds");
-            let got = frame::parse(fmt, &wire, Some(rssi), Some(mcs))
+            let got = frame::parse(fmt, &wire, Some(rssi), Some(mcs), crate::ClockDomainId(0))
                 .expect("a freshly built RawNdn frame must parse");
             prop_assert_eq!(got.payload.as_ref(), &payload[..]);
             prop_assert_eq!(got.addr, Some(src));
@@ -144,7 +144,7 @@ mod tests {
             let fmt = FrameFormat::EspNow { oui };
             let f = inject(payload.clone(), dst, src);
             let wire = frame::build(fmt, &f).expect("body ≤ 250 always builds");
-            let got = frame::parse(fmt, &wire, Some(rssi), Some(mcs))
+            let got = frame::parse(fmt, &wire, Some(rssi), Some(mcs), crate::ClockDomainId(0))
                 .expect("a freshly built ESP-NOW frame must parse");
             prop_assert_eq!(got.payload.as_ref(), &payload[..]);
             prop_assert_eq!(got.addr, Some(src));
@@ -176,7 +176,7 @@ mod tests {
             // dst/src on the InjectFrame are ignored by Raw80211 (verbatim copy).
             let f = inject(frame_bytes.clone(), BROADCAST, DEFAULT_SRC);
             let wire = frame::build(fmt, &f).expect("Raw80211 always builds");
-            let got = frame::parse(fmt, &wire, Some(rssi), Some(mcs))
+            let got = frame::parse(fmt, &wire, Some(rssi), Some(mcs), crate::ClockDomainId(0))
                 .expect("a ≥24-byte Raw80211 frame must parse");
             prop_assert_eq!(got.payload.as_ref(), &frame_bytes[..], "verbatim");
             let mut ta = [0u8; 6];
@@ -216,8 +216,8 @@ mod tests {
         let esp = FrameFormat::EspNow { oui: ESPNOW_OUI };
         let raw_wire = frame::build(raw, &f).unwrap();
         let esp_wire = frame::build(esp, &f).unwrap();
-        assert!(frame::parse(esp, &raw_wire, None, None).is_none());
-        assert!(frame::parse(raw, &esp_wire, None, None).is_none());
+        assert!(frame::parse(esp, &raw_wire, None, None, crate::ClockDomainId(0)).is_none());
+        assert!(frame::parse(raw, &esp_wire, None, None, crate::ClockDomainId(0)).is_none());
     }
 
     /// The unimplemented formats error at build time (never a panic).
