@@ -1,0 +1,3 @@
+name: C6-31-user-arity-2
+file: scripts/c6-31-user-arity-2.ndfs
+expect: compile-error

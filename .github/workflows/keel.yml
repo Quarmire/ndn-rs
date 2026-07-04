@@ -1,0 +1,79 @@
+# The Keel's own gate — C7 independence + kernel/matcher/bench conformance.
+#
+# C7 (ndf-two-cruxes, held "by construction" through the gauntlet): the spec
+# crates depend on NOTHING from the ndf-* application layer, and on no
+# external crates at all. "By construction" still gets a tripwire: this job
+# fails the moment a dependency edge appears.
+name: keel
+
+on:
+  push:
+    paths:
+      - "crates/core/ndn-manifest/**"
+      - "crates/core/ndn-render-contract/**"
+      - "crates/tools/ndn-bench/**"
+      - "examples/waterline-keel/**"
+      - "conformance/**"
+      - ".github/workflows/keel.yml"
+  pull_request:
+    paths:
+      - "crates/core/ndn-manifest/**"
+      - "crates/core/ndn-render-contract/**"
+      - "crates/tools/ndn-bench/**"
+      - "examples/waterline-keel/**"
+      - "conformance/**"
+      - ".github/workflows/keel.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check-independence:
+    name: C7 · spec crates depend on nothing
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: ndn-manifest has zero dependencies
+        run: |
+          set -euo pipefail
+          tree="$(cargo tree -p ndn-manifest --edges normal --prefix none)"
+          echo "$tree"
+          # The tree must be exactly one line: the crate itself.
+          [ "$(echo "$tree" | wc -l)" -eq 1 ] || { echo "::error::ndn-manifest grew a dependency (C7)"; exit 1; }
+      - name: ndn-render-contract depends only on ndn-manifest
+        run: |
+          set -euo pipefail
+          tree="$(cargo tree -p ndn-render-contract --edges normal --prefix none)"
+          echo "$tree"
+          [ "$(echo "$tree" | wc -l)" -eq 2 ] || { echo "::error::ndn-render-contract grew a dependency (C7)"; exit 1; }
+          echo "$tree" | tail -1 | grep -q '^ndn-manifest ' || { echo "::error::unexpected dependency"; exit 1; }
+      - name: no ndf-* crate anywhere under the spec crates
+        run: |
+          set -euo pipefail
+          ! cargo tree -p ndn-manifest -p ndn-render-contract --edges normal | grep -E '(^|\s)ndf-' \
+            || { echo "::error::an ndf-* crate reached the Keel (C7)"; exit 1; }
+      - name: no_std builds stand alone
+        run: |
+          cargo check -p ndn-manifest --no-default-features
+          cargo check -p ndn-render-contract --no-default-features
+
+  keel-tests:
+    name: kernel · matcher · bench
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: codec + kernel (M1/M2 gates)
+        run: cargo test -p ndn-manifest
+      - name: matcher (M3 gate — sword, launder, divergence, the bomb)
+        run: cargo test -p ndn-render-contract
+      - name: bench regressions (M4/M5 gates — apiary 0 err / 2 info)
+        run: cargo test -p ndn-bench
+      - name: conformance vectors
+        run: cargo run -p ndn-bench -- vectors conformance/vectors
+      - name: fixed point re-emits (L-12/R14)
+        run: cargo run -p ndn-bench -- freeze
+      - name: waterline-keel renders all four verdicts
+        run: cargo run -p waterline-keel

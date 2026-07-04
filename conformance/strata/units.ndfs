@@ -1,0 +1,15 @@
+# units — Ring-1 stratum (ndf-the-atelier; F28: the inventory the stranger needed)
+stratum units "Shared measurement units. Marker terms: a unit's identity is its hash; its doc line carries the human reading. Cited via @unit on measured fields."
+
+term unit "The @unit attribute key: which unit a value is denominated in."
+term kilogram "SI mass unit (kg)."
+term hertz "SI frequency unit (Hz)."
+term millilitre "One thousandth of a litre (mL)."
+term metre "SI length unit (m)."
+term millimetre "One thousandth of a metre (mm)."
+term degree-celsius "Temperature in degrees Celsius."
+term ntu "Nephelometric Turbidity Unit."
+term volt "SI electric-potential unit (V)."
+term watt "SI power unit (W)."
+term percent "Per one hundred, dimensionless (%)."
+term per-hundred "Per one hundred of the counted thing — e.g. 'per 100 bees' (F28: this doc line IS the reading; there is no per-100-bees term)."

@@ -1,0 +1,7 @@
+# L-11 — an attention-class intent with no sensitivity tag. Attention is a
+# capability you grant, not a channel you spam (riverwatch, the siren).
+contract loud-beeper "A beeper that forgot to declare how loud it is."
+
+use apiary as apiary
+
+express alarm.attention -> apiary:inspection

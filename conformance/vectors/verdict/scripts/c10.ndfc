@@ -1,0 +1,5 @@
+contract viewer "A plain-text viewer targeting base:t."
+
+use base as base
+
+express text.plain -> base:t

@@ -1,0 +1,7 @@
+# C9-07 — the sword: the express clause reaches t only through a lossy hop,
+# so the verdict demotes to Approximate with the loss declared (C9).
+name: C9-07-sword-mixed-chain
+dag: scripts/sword.ndfs scripts/sword-manifest.ndfm
+contract: scripts/sword.ndfc
+admit: sword
+expect: verdict series.window Approximate

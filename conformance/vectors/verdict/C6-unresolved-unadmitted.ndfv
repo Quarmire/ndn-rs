@@ -1,0 +1,7 @@
+# C6′ — admit NOTHING: the manifest's type term is defined by a vocabulary
+# this consumer has not admitted, so every offer over it is Unresolved.
+# Never a guess.
+name: C6-unresolved-unadmitted
+dag: scripts/base.ndfs scripts/c10-manifest.ndfm
+contract: scripts/c10.ndfc
+expect: verdict text.plain Unresolved

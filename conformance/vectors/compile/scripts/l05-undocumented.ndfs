@@ -1,0 +1,4 @@
+# L-05 — an undocumented PUBLIC term fails; self-description includes humans.
+stratum undoc "A stratum shipping an undocumented public term."
+
+term mystery

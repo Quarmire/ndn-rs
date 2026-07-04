@@ -1,0 +1,9 @@
+# L-15 — the round-5 wound, row 02: `queen : queen-status` uses the enum
+# parent bare. Fix-it: `queen : term-of queen-status` (F30).
+stratum bare-enum "The stranger's original mistake, preserved as a vector."
+
+enum queen-status "Queen evidence at inspection." { seen heard-only absent }
+
+record inspection "One hive inspection." {
+    queen : queen-status "Bare enum as a field type — L-15 fires."
+}

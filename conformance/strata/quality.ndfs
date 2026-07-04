@@ -1,0 +1,4 @@
+# quality — Ring-1 stratum (Riverwatch: the observation quality enum)
+stratum quality "Reading-quality grades for observational data. Consumed as term-of quality."
+
+enum quality "How much to trust a reading." { good suspect estimated sensor-fault }

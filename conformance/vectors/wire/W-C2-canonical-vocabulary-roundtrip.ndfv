@@ -1,0 +1,5 @@
+# The same vocabulary with cardinality One correctly omitted: canonical.
+name: W-C2-canonical-vocabulary-roundtrip
+bytes: 2012240176210d2401722c082706240166280101
+expect: roundtrip
+golden: c5d3815086d081ce0c8533c0373683226647ddc542dd5d854f19c2396c69e232

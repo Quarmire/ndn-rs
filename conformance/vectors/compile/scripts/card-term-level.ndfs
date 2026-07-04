@@ -1,0 +1,6 @@
+# Cardinality at TERM level — `justified-by : some hash` outside a record.
+# Cardinality belongs to fields (round 5, answer #5: "the field enforces");
+# rejected at parse with the record fix-it in the message.
+stratum card-misplaced "Cardinality outside a record."
+
+term justified-by : some hash "This must live inside a record."

@@ -1,0 +1,3 @@
+name: W-03-nonminimal-length
+bytes: 308000
+expect: reject NonMinimalVarint

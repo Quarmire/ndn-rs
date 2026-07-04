@@ -1,0 +1,6 @@
+# The M5 gate: the apiary regression compiles with ZERO errors (2 infos are
+# expected and allowed: L-10 on the maps-to, L-13 on @range).
+name: APIARY-round5-regression
+dag: ../../strata/units.ndfs ../../strata/loss.ndfs ../../strata/edge-kinds.ndfs ../../strata/constraints.ndfs
+file: ../../strata/apiary.ndfs
+expect: compile-ok

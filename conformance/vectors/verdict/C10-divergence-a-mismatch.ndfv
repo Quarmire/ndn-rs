@@ -1,0 +1,8 @@
+# C10, bundle A — the bridge is fetched but NOT admitted: for this consumer
+# the edge does not exist, and the clause is a plain mismatch (no Match at
+# all — the third silence: mismatch ≠ refusal ≠ unresolved).
+name: C10-divergence-a-mismatch
+dag: scripts/base.ndfs scripts/bridge.ndfs scripts/c10-manifest.ndfm
+contract: scripts/c10.ndfc
+admit: base
+expect: verdict text.plain Mismatch

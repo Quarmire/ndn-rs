@@ -1,0 +1,6 @@
+# P2-04 — structure in attribute position: attributes stay flat (L-04);
+# the fix-it is reification (pattern P2).
+stratum flatness "A stratum trying to nest a list inside an attribute."
+
+term tags "The @tags attribute key (this part is fine)."
+term photo : hash @tags = [ "queen" "brood" ] "A hive photo with nested attribute structure."

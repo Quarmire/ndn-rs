@@ -1,0 +1,12 @@
+# C9-07 fixture — "the sword": narrower · maps-to · narrower.
+stratum sword "The mixed chain: one lossy hop demotes everything after it."
+
+term m "The manifest's type term."
+term a "A broader category m narrows into."
+term b "The far side of the lossy translation."
+term t "The contract's target."
+term coarse "Loss: ordinal coarsening across the a→b translation."
+
+narrower-than m a
+maps-to a -> b @loss = coarse
+narrower-than b t

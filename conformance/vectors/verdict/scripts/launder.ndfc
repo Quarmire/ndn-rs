@@ -1,0 +1,5 @@
+contract card "A card renderer targeting launder:t."
+
+use launder as launder
+
+express value.latest -> launder:t

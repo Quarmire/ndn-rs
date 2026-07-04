@@ -1,0 +1,3 @@
+name: W-03b-nonminimal-type
+bytes: b00000
+expect: reject NonMinimalVarint

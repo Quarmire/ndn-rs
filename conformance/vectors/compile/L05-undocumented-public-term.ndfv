@@ -1,0 +1,3 @@
+name: L05-undocumented-public-term
+file: scripts/l05-undocumented.ndfs
+expect: compile-error L-05

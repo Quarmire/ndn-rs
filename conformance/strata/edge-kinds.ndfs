@@ -1,0 +1,14 @@
+# edge-kinds — Ring-1 stratum: instance edge kinds (Riverwatch L2; F31 idiom)
+stratum edge-kinds "Kinds for instance edges: typed relationships between described things. The matcher reads these as inert data; graph consumers drink them (L2)."
+
+term justified-by "The subject's claim is evidenced by the object (round 5: the co-op's treatment edge)."
+term is-derived-from "The subject was computed or raised from the object (the alert cites its observations)."
+term is-measured-by "The subject reading was produced by the object instrument/station."
+term is-calibrated-by "The subject's scale is anchored by the object calibration record."
+term is-input-of "The subject feeds the object's derivation."
+term is-status-of "The subject is housekeeping about the object."
+term is-part-of "Mereology: the subject belongs to the object."
+term concerns "The subject is about the object (an alert concerns a river reach)."
+term authorized-by "The subject's authority chain runs through the object."
+term downstream-of "Spatial: the subject sits downstream of the object; @w-km may carry the distance as a weight, not a position."
+term w-km "The @w-km attribute key: edge weight in kilometres (a hint renderers may ignore — Riverwatch: 'weights, not positions')."

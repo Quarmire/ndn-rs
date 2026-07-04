@@ -1,0 +1,7 @@
+# L-09 — maps-to without @loss: lossy translation must declare its loss (C9).
+stratum lossless-lie "A maps-to pretending it costs nothing."
+
+term fine "A fine-grained scale."
+term coarse "A coarse scale."
+
+maps-to fine -> coarse

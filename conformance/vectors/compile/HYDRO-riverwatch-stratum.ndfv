@@ -1,0 +1,5 @@
+# The Riverwatch stratum compiles clean on top of its Ring-1 imports.
+name: HYDRO-riverwatch-stratum
+dag: ../../strata/units.ndfs ../../strata/measured.ndfs ../../strata/quality.ndfs ../../strata/edge-kinds.ndfs
+file: ../../strata/hydro.ndfs
+expect: compile-ok

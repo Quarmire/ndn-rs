@@ -1,0 +1,7 @@
+# Critical unknown extension (odd tag 0x81) at document tail: DECODES (W-19),
+# is retained byte-exactly, and the decoded document is marked critical —
+# matching renders Unresolved over it (R12), but the wire round-trips.
+name: W-19-critical-extension-roundtrip
+bytes: 30654b200707070707070707070707070707070707070707070707070707070707070707311a4718796172642e6e6f7274682f686976652d61372f7363616c654d254b200101010101010101010101010101010101010101010101010101010101010101410178810104deadbeef
+expect: roundtrip
+golden: c5b1f71b52ab7b1438ef502d00d9437af1c8fe21dbe053624ad12ae2c83f04c0

@@ -1,0 +1,7 @@
+# C10, bundle B — same DAG, bridge admitted: Express, honestly divergent
+# from bundle A. Divergence is rendered, not hidden.
+name: C10-divergence-b-express
+dag: scripts/base.ndfs scripts/bridge.ndfs scripts/c10-manifest.ndfm
+contract: scripts/c10.ndfc
+admit: base bridge
+expect: verdict text.plain Express

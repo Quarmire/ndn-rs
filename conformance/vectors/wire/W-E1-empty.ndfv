@@ -1,0 +1,3 @@
+name: W-E1-empty
+bytes: 
+expect: reject NotADocument

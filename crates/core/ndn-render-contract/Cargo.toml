@@ -1,0 +1,24 @@
+[package]
+name = "ndn-render-contract"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "NDF render-contract model and matcher: Express / Approximate / Refuse / Unresolved over a frozen DAG (the Keel, upper half)"
+# [scope] = "spec" — pure calculus, no I/O, no policy (D-48: the calculus
+# contains no policy; C7: independence, CI-enforced — the ONLY dependency is
+# ndn-manifest, and no ndf-* crate may ever appear here).
+keywords = ["ndf", "ndn", "render-contract", "matcher", "spec"]
+categories = ["no-std", "encoding"]
+
+[features]
+default = []
+
+[dependencies]
+ndn-manifest = { path = "../ndn-manifest", default-features = false }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

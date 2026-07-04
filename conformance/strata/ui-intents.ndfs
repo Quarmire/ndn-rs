@@ -1,0 +1,7 @@
+# ui-intents — Ring-1 stratum: sensitivity grades for L-11
+stratum ui-intents "Sensitivity grades for actuation/capture/payment/attention intents (L-11: such intents must carry a tag). Attention is a capability you grant, not a channel you spam."
+
+term sensitivity "The @sensitivity attribute key on intents."
+term high "May interrupt, actuate, or spend; requires an authority chain at the lens (the siren's grade)."
+term medium "May notify; must not seize an exclusive output."
+term low "Ambient only; never interrupts."

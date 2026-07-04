@@ -1,0 +1,5 @@
+# A field writing cardinality One explicitly — defaults are OMITTED (R10);
+# writing one is a second spelling of the same document, so it rejects.
+name: W-C1-explicit-cardinality-one
+bytes: 201524017621102401722c0b27092401662801012f0100
+expect: reject NonCanonicalDefault

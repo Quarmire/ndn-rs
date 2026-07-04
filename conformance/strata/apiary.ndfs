@@ -1,0 +1,27 @@
+# apiary — the round-5 regression stratum, F28–F32 fixes applied.
+# GATE (M5): `ndn-bench lint` on this file must publish 0 err / 2 info
+# (1× L-10 admission preview on the maps-to, 1× L-13 constraint routing on @range).
+stratum apiary "Beekeeping co-op vocabulary — the stranger's stratum #20 with the graded fixes: term-of for the enum (F30), units:per-hundred (F28), loss:ordinal-coarsening (F28), the arrow on maps-to (F31 grading)."
+
+use units as units
+use loss as loss
+use edge-kinds as e
+use constraints as constraints
+
+enum queen-status "Queen evidence at inspection." { seen heard-only absent queen-cells-present }
+enum frame-content "What a frame slot holds." { brood honey pollen empty }
+
+term brood-pattern "Ordinal brood-pattern score, finer-grained than colony strength."
+term colony-strength "Coarse colony-strength grade used across yards."
+term treatment "A treatment event applied to a colony."
+
+record inspection "One hive inspection." {
+    queen : term-of queen-status "Queen evidence — consumed as term-of, never bare (F30/L-15 fix)."
+    slots : map-of(integer, term-of frame-content) @range = "1..10" "Frame slots by position; the 1..10 bound is validator business (L-13)."
+    justified-by : some hash "Evidence block refs — at least one, enforced by cardinality (the non-negotiable, carried)."
+    cell-coverage : list-of(list-of(decimal)) "Per-frame coverage grid — nesting built-ins is legal (round 2, C3t; guess #12)."
+    varroa-per-hundred : decimal @unit = units:per-hundred "Mite count per 100 bees (F28: per-hundred + this doc line, not a per-100-bees term)."
+}
+
+edge treatment e:justified-by inspection
+maps-to brood-pattern -> colony-strength @loss = loss:ordinal-coarsening

@@ -1,0 +1,7 @@
+# C9-08 — the launder: the lossless equivalence AFTER the lossy hop must not
+# restore Express. Fidelity is monotone non-increasing along chains.
+name: C9-08-launder-never-express
+dag: scripts/launder.ndfs scripts/launder-manifest.ndfm
+contract: scripts/launder.ndfc
+admit: launder
+expect: verdict value.latest Approximate

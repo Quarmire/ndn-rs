@@ -1,0 +1,3 @@
+name: W-22-varint-overflow
+bytes: 30ffffffffffffffffffffff
+expect: reject VarintOverflow
