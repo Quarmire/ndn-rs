@@ -118,6 +118,37 @@ not inferable) · `bool` → Boolean · `Hash`/`[u8;32]` → Hash ·
 `Vec<u8>` → Bytes (NOT a `many integer` — bytes are a primitive; the derive
 must special-case it before the `Vec<T>` rule fires).
 
+## Ruling F56 · skip and projection: three needs, three different answers
+
+The retirement of the hand-built vocabularies surfaced it concretely: a
+derived `SceneSnapshot` manifest describes ALL five fields, where the old
+hand-built slice described the two its lens wanted. "Derive the producer"
+and "describe what a lens needs" are not the same thing — and they must
+never become the same thing. The three cases:
+
+1. **Non-data fields** (caches, runtime handles, derived scratch) —
+   `#[field(skip)]`, ruled legitimate. Skip means "this is not part of what
+   I am," a statement about the producer's own identity. Skipped fields
+   contribute no term and no entry; the SCHEMA hash doesn't see them.
+2. **A lens wants a subset** — **nothing.** Extra fields are inert to the
+   matcher and free to the lens; Express does not mean "consumes every
+   field." The manifest describes the fact; each lens renders its facet.
+   Shaping a producer's description around a renderer's appetite is the
+   generalized form of the sin the tattoos forbid ("no manifest names a
+   renderer" extends to "no manifest is SHAPED by one"). A skip used for
+   this purpose is a design smell the derive cannot detect but reviewers
+   should.
+3. **The producer wants to publish a genuine subset-facet** (size,
+   audience) — **projection is an edge, not an attribute.** Publish a
+   projection record term (`scene-topology { nodes, links }`) in the
+   vocabulary and declare `narrower-than scene-snapshot scene-topology`:
+   every full snapshot Expresses wherever the projection is targeted,
+   because a full snapshot structurally IS a topology-plus. One manifest,
+   two reachable terms, zero copies — the calculus-native answer. (A
+   possible future sugar — `#[manifest(projection(…))]` emitting the term +
+   edge — waits for a lens that actually targets a subset term, per the
+   evidence rule.)
+
 ## Open, deliberately (not ruled — needs evidence)
 
 - **Rust enums.** Unit-variant enums map naturally to the kernel enum

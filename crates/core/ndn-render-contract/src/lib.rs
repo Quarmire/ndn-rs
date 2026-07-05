@@ -50,8 +50,8 @@ extern crate alloc;
 pub mod matcher;
 
 pub use matcher::{
-    contract_via, r#match, select, select_best, Budget, BudgetExceeded, Floor, LossPath, Match,
-    Missing, TrustFrontier, Verdict,
+    contract_via, r#match, select, select_best, select_best_for, Budget, BudgetExceeded, Floor,
+    LossPath, Match, Missing, TrustFrontier, Verdict,
 };
 
 /// Re-exported for consumers dispatching a Match: the inert renderer

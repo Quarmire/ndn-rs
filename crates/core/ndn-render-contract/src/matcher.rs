@@ -513,15 +513,27 @@ fn resolve_reach(
     }
 }
 
-/// Deterministic selection under a floor (F46). Filters to the floor, then
-/// orders by: verdict rank, loss-path length, contract hash, intent name.
-/// Byte-identical inputs give byte-identical selections, forever.
-pub fn select(mut matches: Vec<Match>, floor: Floor) -> Vec<Match> {
-    matches.retain(|m| match (&m.verdict, floor) {
+/// Does a verdict clear a floor? (Refuse and Unresolved clear none.)
+fn floor_admits(v: &Verdict, floor: Floor) -> bool {
+    match (v, floor) {
         (Verdict::Express, _) => true,
         (Verdict::Approximate(_), Floor::Approximate) => true,
         _ => false,
-    });
+    }
+}
+
+/// Deterministic selection under a floor (F46). Filters to the floor, then
+/// orders by: verdict rank, loss-path length, contract hash, intent name.
+/// Byte-identical inputs give byte-identical selections, forever.
+///
+/// Note on the second key (F57): loss-path LENGTH is a determinism key, not
+/// a severity claim — the calculus cannot rank loss meanings (one
+/// `visual-only` hop may cost a consumer more than two `precision-loss`
+/// hops). Severity is consumer policy over the DECLARED loss terms: filter
+/// `matches` by inspecting `LossPath` contents before selecting, and the
+/// selection stays deterministic over whatever survives your policy.
+pub fn select(mut matches: Vec<Match>, floor: Floor) -> Vec<Match> {
+    matches.retain(|m| floor_admits(&m.verdict, floor));
     matches.sort_by(|a, b| {
         a.verdict
             .rank()
@@ -536,6 +548,30 @@ pub fn select(mut matches: Vec<Match>, floor: Floor) -> Vec<Match> {
 /// The best match under a floor, if any.
 pub fn select_best(matches: Vec<Match>, floor: Floor) -> Option<Match> {
     select(matches, floor).into_iter().next()
+}
+
+/// Borrowing, intent-scoped selection — the actual consumer motion (F57).
+///
+/// Two first-user findings folded into one function: (a) real consumers
+/// select repeatedly over CACHED matcher output (resolve-once), so this
+/// borrows instead of taking ownership — no clone on the hot path; and
+/// (b) selection is per-intent — selecting across mixed intents
+/// type-checks and is silently wrong, so this owns the filter-by-intent
+/// step the way `contract_via` owns the walk-to-clause step. Ordering is
+/// identical to [`select`] (F46); `None` means "no offer clears this floor
+/// for this intent" — the honest answer a surface must branch on, never a
+/// best-effort substitute.
+pub fn select_best_for<'a>(matches: &'a [Match], intent: &str, floor: Floor) -> Option<&'a Match> {
+    matches
+        .iter()
+        .filter(|m| m.intent == intent && floor_admits(&m.verdict, floor))
+        .min_by(|a, b| {
+            a.verdict
+                .rank()
+                .cmp(&b.verdict.rank())
+                .then_with(|| a.verdict.loss_len().cmp(&b.verdict.loss_len()))
+                .then_with(|| a.contract.cmp(&b.contract))
+        })
 }
 
 /// Resolve the `Via` behind a Match — the one correct lookup every consumer

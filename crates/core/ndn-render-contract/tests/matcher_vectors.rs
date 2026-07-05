@@ -10,8 +10,8 @@
 use ndn_manifest::model::*;
 use ndn_manifest::{term_hash, FrozenDag, Hash};
 use ndn_render_contract::{
-    r#match, select, select_best, Budget, BudgetExceeded, Floor, Match, Missing, TrustFrontier,
-    Verdict,
+    r#match, select, select_best, select_best_for, Budget, BudgetExceeded, Floor, Match, Missing,
+    TrustFrontier, Verdict,
 };
 
 fn term(label: &str) -> Term {
@@ -334,6 +334,69 @@ fn the_bomb_completes_under_budget_and_starves_typed() {
         r#match(&dag, &[ch], &frontier, starved),
         Err(BudgetExceeded::Nodes)
     );
+}
+
+/// F46's second and third keys, walked (F57: "the corner I lit up the
+/// entrance to but didn't walk into"): two Approximate offers for ONE
+/// intent must tiebreak on loss-path LENGTH; equal lengths fall to
+/// contract-hash order — arbitrary but eternal.
+#[test]
+fn tiebreak_prefers_shorter_loss_path_then_contract_hash() {
+    let mut dag = FrozenDag::new();
+    let (m, u, x, y) = (th("m"), th("u"), th("x"), th("y"));
+    let (l1, l2, l3) = (th("loss-one"), th("loss-two"), th("loss-three"));
+    let vh = dag
+        .insert_document(&vocab(
+            "tie",
+            vec![
+                term("m"),
+                term("u"),
+                term("x"),
+                term("y"),
+                term("loss-one"),
+                term("loss-two"),
+                term("loss-three"),
+            ],
+            vec![
+                // one-hop lossy route to u
+                EdgeForm::MapsTo { from: m, to: u, loss: l1, attrs: Vec::new() },
+                // two-hop lossy route to y
+                EdgeForm::MapsTo { from: m, to: x, loss: l2, attrs: Vec::new() },
+                EdgeForm::MapsTo { from: x, to: y, loss: l3, attrs: Vec::new() },
+            ],
+        ))
+        .unwrap();
+    dag.insert_document(&manifest_of(m, "s")).unwrap();
+    // Two competing Approximate offers for the SAME intent, different loss
+    // depths…
+    let c_short = dag.insert_document(&express_contract("one-hop", "series.window", u)).unwrap();
+    let c_long = dag.insert_document(&express_contract("two-hop", "series.window", y)).unwrap();
+    // …and a third offer at the SAME depth as c_short (also targets u).
+    let c_dup = dag.insert_document(&express_contract("one-hop-b", "series.window", u)).unwrap();
+
+    let frontier = TrustFrontier::from_vocabularies([vh]);
+    let ms = r#match(&dag, &[c_short, c_long, c_dup], &frontier, Budget::generous()).unwrap();
+
+    // All three are Approximate — no Express exists, Floor::Express is None.
+    assert!(select_best_for(&ms, "series.window", Floor::Express).is_none());
+
+    // Second key: the 1-loss offers beat the 2-loss offer.
+    let best = select_best_for(&ms, "series.window", Floor::Approximate).expect("offers exist");
+    assert_eq!(best.verdict.loss_len(), 1, "shorter loss path wins the tiebreak");
+    assert_ne!(best.contract, c_long);
+
+    // Third key: between the two 1-loss offers, the smaller contract hash —
+    // arbitrary, deterministic, eternal.
+    let expected = if c_short <= c_dup { c_short } else { c_dup };
+    assert_eq!(best.contract, expected, "equal depth falls to contract-hash order");
+
+    // And the intent-scoping half of F57: a decoy intent with an Express
+    // offer must NOT leak into series.window's selection.
+    let c_decoy = dag.insert_document(&express_contract("decoy", "value.latest", m)).unwrap();
+    let ms2 = r#match(&dag, &[c_short, c_long, c_dup, c_decoy], &frontier, Budget::generous())
+        .unwrap();
+    let best2 = select_best_for(&ms2, "series.window", Floor::Approximate).expect("offers exist");
+    assert!(matches!(best2.verdict, Verdict::Approximate(_)), "decoy Express must not leak across intents");
 }
 
 /// Selection under a floor is deterministic (F46): verdict rank, loss-path

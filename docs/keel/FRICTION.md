@@ -219,6 +219,63 @@ emit order is a topological walk but identity bookkeeping is FREE (content addre
 Vec<u8> special-cases to Bytes before the Vec<T> rule. Left open on purpose: data-carrying enums,
 map fields — no real producer has needed them yet.]
 
+**F56 · Derive shipped; hand-built retired; the projection question ruled.**
+[found: #[derive(Manifest)] landed against both real producers (flat + nested), hand-built
+vocabularies deleted (~130 lines), SCHEMA pins as freeze-miniature, R13 round-trips green, NaN
+refusal tested, Law #1 seam held under refactor (render-side terms stayed hand-authored). The
+retirement made concrete: derived manifests describe the WHOLE struct, so "derive the producer"
+≠ "describe what a lens needs"]
+[ruled, full text in DERIVE.md §F56 — three needs, three answers: (1) non-data fields →
+#[field(skip)], a statement about the producer's own identity; (2) lens-wants-a-subset →
+NOTHING — inert extra fields are the design working, and shaping a producer's description around
+a renderer's appetite is the tattoos' sin generalized; (3) producer-publishes-a-facet →
+projection is an EDGE, not an attribute: publish the projection record term + narrower-than
+full→projection; every full manifest Expresses where the projection is targeted — one manifest,
+two reachable terms, zero copies. Projection sugar in the macro deferred until a lens targets a
+subset term (evidence rule).
+Next-step ruling: SECOND SURFACE before derive extensions — enums/maps wait for a needing
+producer by our own law, and a capability-constrained surface (CLI) creates the first real
+COMPETITION for an intent, exercising select/Floor — the one matcher muscle with zero real-world
+miles.]
+
+**F57 · select's first miles (N=3, CLI degrades honestly) — two findings adopted into the spec
+crate; the loss-severity question fenced.**
+[found: select/Floor got its first real consumer. Floor-as-filter and Option-as-honest-None both
+landed as designed. Two frictions, same shape as contract_via: (a) select takes Vec by value,
+fighting the resolve-once cache (clone per selection); (b) every consumer writes offers_for —
+selecting across mixed intents type-checks and is silently wrong]
+[adopted: `select_best_for(&[Match], intent, floor) -> Option<&Match>` in ndn-render-contract —
+borrowing (cache-friendly) and intent-scoped (owns the filter step the way contract_via owns the
+clause walk); F46 ordering shared with select() via one floor_admits predicate. Conformance now
+walks the tiebreak corner (tiebreak_prefers_shorter_loss_path_then_contract_hash: 1-loss beats
+2-loss; equal depth falls to contract hash — arbitrary but eternal; decoy-intent leak checked).
+FENCED, not adopted: ranking loss SEVERITY. Loss-path length is a determinism key, not a severity
+claim — the calculus cannot rank meanings (one visual-only hop may cost more than two
+precision-loss hops). Severity is consumer policy over the DECLARED loss terms: filter matches by
+LossPath contents before selecting. Stated in select's docs; no API added — the declared data
+already supports it.
+Next-step ruling: graphical surface (egui/browser) WITH the second Approximate offer folded in —
+a low-res/thumbnail lens through an extra maps-to is the natural second lossy offer, so the F46
+tiebreak gets its real miles inside the real surface instead of as a synthetic exercise.]
+
+**F58 · The Riverwatch sentence completes at N=3; one corner registered dark, on principle.**
+[found: one metric, three surfaces (SVG / thumbnail / ASCII), competing offers, declared losses
+(glyph-quantization vs resolution-decimation at EQUAL depth — the consumer explicitly refused to
+contrive depth-as-severity after the F57 fence), deterministic choice via all three F46 keys
+exercised on real surfaces, rendered to a page a human opens. select_best_for adopted; the
+offers_for bridge retired.]
+[registered dark, not forgotten: the SECOND key (shorter-loss-beats-longer inside a real
+selection) has conformance miles only — giving it surface miles requires a producer whose
+renderings genuinely traverse different lossy depths without that being a severity dodge.
+Prediction recorded so the future case is recognized when it arrives: the natural producer is a
+VOCABULARY MIGRATION — old-schema manifests reaching new-schema lenses through supersedes-era
+maps-to edges will create real depth competition organically, which means this corner and the
+F53(4) VERSIONING.md debt are likely the SAME future event. Light both from that one need; build
+neither from appetite.]
+
+
+
+
 
 
 
