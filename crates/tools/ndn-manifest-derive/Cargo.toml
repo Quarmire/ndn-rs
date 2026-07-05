@@ -1,0 +1,18 @@
+[package]
+name = "ndn-manifest-derive"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "#[derive(Manifest)] — describe a Rust struct as a Keel manifest (terms + vocabulary contribution + to_manifest). Tool tier; generated code calls ndn-manifest + ndn-manifest-describe, never the reverse (C7). Designed against real producers per docs/keel/DERIVE.md."
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"
+
+[lints]
+workspace = true
