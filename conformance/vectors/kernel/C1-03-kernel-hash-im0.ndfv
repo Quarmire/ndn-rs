@@ -1,0 +1,4 @@
+# C1-03 — H(IM₀), recorded at the 2026-07-04 freeze (D-K8).
+name: C1-03-kernel-hash-im0
+expect: kernel-hash IM0
+golden: 39cfe0fb02b0cd6333cef7320e48545ba1c60ada2ddf1daf2c559ab5d2aca85a

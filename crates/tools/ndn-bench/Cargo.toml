@@ -16,6 +16,7 @@ path = "src/main.rs"
 [dependencies]
 ndn-manifest = { path = "../../core/ndn-manifest", default-features = false }
 ndn-render-contract = { path = "../../core/ndn-render-contract", default-features = false }
+ndn-explain = { path = "../ndn-explain" }
 
 [lints]
 workspace = true

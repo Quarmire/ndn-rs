@@ -1,0 +1,8 @@
+# C3-03 — the default-refuse side of the floor: T₀ lists exactly two
+# intents; anything else over the same frame is refused BY ABSENCE — no
+# Match exists (the third silence, D-K9).
+name: C3-03-t0-unlisted-intent-absent
+kernel: trio
+dag: scripts/im0-frame.ndfm
+contract: @kernel-t0
+expect: verdict map.overlay Mismatch

@@ -11,3 +11,8 @@ pub mod freeze;
 pub mod lint;
 pub mod script;
 pub mod vectors;
+
+/// Re-export of the extracted trace helpers (F54): `ndn_bench::explain::*`
+/// keeps working, but consumers who only want traces should depend on
+/// `ndn-explain` directly.
+pub use ndn_explain as explain;

@@ -1,0 +1,12 @@
+# payloads — Ring-1 stratum: the C4 escape hatch, honestly labeled
+stratum payloads "Opaque payloads with declared media types. Escape is legal (C4); SILENT escape is not — a blob says what it is even when the calculus cannot read it."
+
+term media-type "The @media-type attribute key: an IANA media type as text."
+
+record blob "An opaque payload the calculus does not interpret: content hash, declared media type, size. Matched by identity or through T0 — never by peeking inside." {
+    content : hash "The payload block's content hash."
+    media-type : text "IANA media type (e.g. application/cbor)."
+    size : integer "Payload size in bytes."
+}
+
+term unknown-blob : opaque "A payload with NO declared media type — still legal (C4), reachable only by identity and the total floor."

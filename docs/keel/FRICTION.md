@@ -116,13 +116,13 @@ body is a hard reject (UnknownReservedType), because a length-skippable-anywhere
 two canonical spellings of the same nested structure exist. Vector W-19/W-19b (trailing decodes)
 vs W-R1b (nested rejects).]
 
-**F50 · Verdict vectors that need pinned kernel hashes cannot ship pre-freeze.**
-[found: T₀-over-IM₀ as a .ndfv wants H(IM₀) in its `admit:`/target lines; the pins do not exist
-until the first `freeze --pin` on a real toolchain (D-K8/F36)]
-[ruled: such vectors are hosted as Rust tests this round (matcher_vectors.rs::t0_expresses…) and
-the LEDGER records the hosting; after the first freeze they graduate to .ndfv with recorded
-goldens. Also under this entry: `->` requires surrounding spaces (labels contain `-`) — a
-grammar decision the corpus never had to make, GRAMMAR.md §choices.]
+**F50 · CLOSED — T₀ vectors graduated to .ndfv after the 2026-07-04 freeze.**
+[was: verdict vectors needing pinned kernel hashes could not ship pre-freeze; hosted in Rust]
+[closure: the pins exist (H(V₀.2)=568b9581…, H(IM₀)=39cfe0fb…, H(T₀)=a7ac0461…, recorded by
+`freeze --pin` on the first live run). The runner gained `kernel: trio` (seeds the trio from the
+LIVE encoder — no kernel bytes are ever baked into vector files, preserving D-K8) and
+`contract: @kernel-t0`; C3-01/02/03 now ship as .ndfv. Grammar rider from the original entry
+(`->` requires surrounding spaces) stands, GRAMMAR.md §choices.]
 
 **F51 · Identity matches bypass frontier admission — observed live, flagged for the maintainer.**
 [found: first waterline-keel run — a contract targeting the manifest's exact type-term hash
@@ -133,4 +133,92 @@ frontier — the total floor works with zero trust). Consequence stated plainly:
 SEMANTIC REACHABILITY (whose edges you believe), not hash equality; a consumer who wants to
 suppress offers over unadmitted-vocabulary manifests entirely does so at selection, not in the
 matcher. Top-5 question material alongside #3 (D-K4).]
+
+**F52 · The vector format grew four keys in the post-freeze closure pass — recorded, bounded.**
+[found: closing the C1/C3/L-07 shortfalls needed harness capabilities the F42 format lacked]
+[ruled: added `kernel: trio` (live-encoder trio seeding; petnames v0/im0/t0), `contract:
+@kernel-t0`, `expect: kernel-pinned`, `expect: kernel-hash <artifact>` (goldens recorded by the
+bench, D-K8 — the C1-02..04 goldens are the freeze's own output transcribed under that rule), and
+the L-07 two-run mutation check in the compile families. Deliberately NOT added, with reasons in
+the LEDGER: a `loss:` order-assertion key, a `budget:` key (budgets are API, not wire), and any
+key requiring baked kernel bytes inside vector files. Format keys are append-only from here;
+removing one would orphan shipped vectors.]
+
+**F53 · First-user review (ndn-lab session) — four findings, four dispositions.**
+[found: the first real consumer reviewed both crates + demo and hit four walls]
+[dispositions:
+(1) **Seam undersold** — CORRECT and fixed: both crate docs now open with "Where the built thing
+ends": the pipeline ends at verdict + inert Via; the render host (WASM sandbox, ViewBlock,
+capability grants, Surface Authority) is design-only; the Riverwatch surfaces are the design
+target, not a runnable path; the honest interim is matcher-driven selection + the consumer's own
+Via::Native registry.
+(2) **Authoring ergonomics are spec-grade, not producer-grade** — CORRECT, accepted as roadmap: a
+`ndn-manifest-derive` / typed-builder companion belongs in the TOOL tier (like ndn-bench: leans
+on the spec crates, never becomes their dependency — C7 unbroken). Not built this pass; a native
+Rust producer today either hand-builds (waterline-keel shows how, ~255 lines) or scripts through
+ndn-bench.
+(3) **Hash-soup DX / no match-explain** — CORRECT and fixed: `ndn_bench::explain` renders a Match
+against the DAG (labels, hop path, named losses, Missing prose). Presentation stays in the tool
+tier on purpose: a matcher that needed labels would be a matcher that could be lied to by labels.
+(4) **Versioning cookbook missing** — CORRECT, open debt: supersedes/L-07 are mechanical law, but
+the operational choreography (who re-issues manifests, live-stream subject migration, stale
+frontiers) is underived. Needs a docs/keel/VERSIONING.md written against a real consumer's
+migration — ndn-lab's vocabulary evolution is the natural forcing case; write it then, from
+evidence, not now, from imagination.]
+
+**F54 · First-slice findings (ndn-lab vertical slice: one metric, two lenses, C10 live) — five
+findings, five dispositions.**
+[found: the slice shipped — FabricGauges as manifest, sparkline + OTLP contracts,
+resolve-once/Sparks, bridge-as-stratum making Phase-B lossiness the named term
+otel-attribute-flattening — and produced five findings]
+[dispositions:
+(1) **Derive shape, from evidence** — accepted as the spec for `ndn-manifest-derive`: emit
+Handles (const term hashes) + a Vocabulary contribution + `to_manifest()`; declaration order is
+identity (R11) so the macro NEVER reorders; the derive stops at "describe the struct" — intents
+are contract-side knowledge and guessing them would cross the producer/lens tattoo. ONE
+CORRECTION to the finding: proc macros DO see `///` comments (they arrive as `#[doc = "…"]`
+attributes), so L-05 docs ride ordinary doc comments; `#[field(doc=…)]` is unnecessary. Derive
+deferred until a SECOND, structurally different struct exists (see ordering ruling below).
+(2) **explain's crate home** — CORRECT that a sim depending on the bench reads wrong; OVERRULED
+on the destination: not a feature on ndn-render-contract. The law: spec crates carry LAW, tool
+crates carry CONVENIENCE — law changes by ratification, display strings by taste, and
+feature-gating presentation into a spec crate puts wording under ratification discipline.
+Extracted to `crates/tools/ndn-explain` (micro-crate, zero transitive deps); ndn-bench re-exports
+it so existing paths keep working.
+(3) **contract_via** — CORRECT and adopted INTO the spec crate: it is lawful navigation over spec
+types (no strings, no policy), and the intent/target disambiguation (clause target == final path
+hop; author-order fallback when pathless) is exactly the fiddly-but-lawful logic one correct
+implementation should own. `Via` re-exported from ndn-render-contract.
+(4) **The three silences are invisible at the call site** — CORRECT and fixed: `r#match` docs now
+carry a "Reading the result" section distinguishing mismatch-silence (no Match; `.is_none()`)
+from Refuse (a Match saying no) from Unresolved (a Match naming what's missing).
+(5) **C7 as consumability** — adopted verbatim into the crate docs: zero transitive deps = zero
+version-collision surface = painless cross-workspace path deps; adding a dependency to a spec
+crate is a breaking change to consumers.
+Ordering ruling on next steps: topology slice BY HAND first (a nested/structured second type —
+scene snapshots exercise list-of/map-of/record where FabricGauges was flat u64s), derive second,
+designed against both real structs. A macro designed from one flat struct would overfit.]
+
+**F55 · Second-slice findings (topology, nested) — the two derive policies, ruled; one bug named.**
+[found: SceneSnapshot by hand surfaced five ⭑ points; two needed calculus rulings before any
+macro could hard-code them]
+[rulings, full spec in docs/keel/DERIVE.md:
+(A) **Option/Vec** — cardinality declares, list-ness encodes, One is bare: `Option<T>` is the
+kernel's `optional T` (hydro's turbidity field was already the precedent) with value `[]`/`[v]`;
+`Vec<T>` is `many T`. Presence flags rejected (a flag beside a slot = two sources of truth, R10);
+P2 reification rejected (P2 is for structure in ATTRIBUTE position — cardinality already solved
+optionality).
+(B) **Floats** — f64→Decimal is a LOSSY TRANSLATION, so the annotation is a loss declaration,
+not a knob: bare f64 = derive-time error; `#[field(decimal(places = N))]` mandatory; half-even
+then normalize; **NaN/inf → Err by default** (`nonfinite = absent` opt-in for optional fields
+only). The slice's "0 on refusal" is flagged as a BUG, not a pain point: encoding not-a-number
+as a number is a guess wearing a value's clothes — the one ⭑ to go fix.
+Also ruled into DERIVE.md: reordering = unintended supersession (an L-07 sin performed by a
+macro), countered by `const SCHEMA: Hash` + a pin test — the freeze pattern miniaturized; nested
+emit order is a topological walk but identity bookkeeping is FREE (content addressing dedups);
+Vec<u8> special-cases to Bytes before the Vec<T> rule. Left open on purpose: data-carrying enums,
+map fields — no real producer has needed them yet.]
+
+
+
 

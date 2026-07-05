@@ -1,0 +1,5 @@
+contract downstream "A lens speaking only vendor C's dialect."
+
+use vendor-c as vc
+
+express series.window -> vc:c

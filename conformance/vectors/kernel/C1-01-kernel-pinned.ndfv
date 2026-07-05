@@ -1,0 +1,4 @@
+# C1-01 — the fixed point holds: the trio computed by the live encoder
+# matches the pinned constants (R14). Fails loudly if run UNPINNED.
+name: C1-01-kernel-pinned
+expect: kernel-pinned

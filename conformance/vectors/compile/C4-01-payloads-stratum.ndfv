@@ -1,0 +1,5 @@
+# C4-01 — the escape hatch compiles: opaque payloads with declared media
+# types are first-class; escape is legal, silent escape is not.
+name: C4-01-payloads-stratum
+file: ../../strata/payloads.ndfs
+expect: compile-ok

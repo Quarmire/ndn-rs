@@ -1,0 +1,7 @@
+# C2-01 — reflection: the kernel is baked into the binary AND published as
+# data written in itself (D-49); byte-identical re-emission of the trio is
+# exactly what kernel-pinned verifies. One tower level is what the calculus
+# promises; this vector holds it (the C2 meta-tower beyond level one remains
+# ledgered shortfall).
+name: C2-01-kernel-in-kernel
+expect: kernel-pinned

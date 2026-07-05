@@ -12,6 +12,7 @@ on:
       - "crates/core/ndn-manifest/**"
       - "crates/core/ndn-render-contract/**"
       - "crates/tools/ndn-bench/**"
+      - "crates/tools/ndn-explain/**"
       - "examples/waterline-keel/**"
       - "conformance/**"
       - ".github/workflows/keel.yml"
@@ -20,6 +21,7 @@ on:
       - "crates/core/ndn-manifest/**"
       - "crates/core/ndn-render-contract/**"
       - "crates/tools/ndn-bench/**"
+      - "crates/tools/ndn-explain/**"
       - "examples/waterline-keel/**"
       - "conformance/**"
       - ".github/workflows/keel.yml"
@@ -70,7 +72,7 @@ jobs:
       - name: matcher (M3 gate — sword, launder, divergence, the bomb)
         run: cargo test -p ndn-render-contract
       - name: bench regressions (M4/M5 gates — apiary 0 err / 2 info)
-        run: cargo test -p ndn-bench
+        run: cargo test -p ndn-bench -p ndn-explain
       - name: conformance vectors
         run: cargo run -p ndn-bench -- vectors conformance/vectors
       - name: fixed point re-emits (L-12/R14)

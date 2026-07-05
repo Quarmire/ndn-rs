@@ -1,0 +1,6 @@
+# Exponent forms ("1e5") are outside the canonical decimal grammar and
+# reject — this vectors the CURRENT law without closing knob #6 (whether to
+# EVER admit exponents is deliberately open; today, reserved means reserved).
+name: W-11h-decimal-exponent-rejects
+bytes: 30674b200707070707070707070707070707070707070707070707070707070707070707311a4718796172642e6e6f7274682f686976652d61372f7363616c654d274b2001010101010101010101010101010101010101010101010101010101010101014403316535
+expect: reject NonCanonicalDecimal

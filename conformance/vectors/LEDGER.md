@@ -3,34 +3,39 @@
 The atelier's conformance table targets 252 vectors across the families
 below. **Rule: log shortfalls, never pad.** This ledger is the shortfall log.
 
+Updated after the closure pass following the 2026-07-04 freeze (the pins
+unblocked the kernel and C3 families; the harness gained `kernel: trio`,
+`@kernel-t0`, `kernel-pinned`/`kernel-hash`, and the L-07 two-run check).
+
 | family | target | shipped as `.ndfv` | hosted as Rust tests | shortfall / note |
 |---|---:|---:|---:|---|
-| C1 fixed point | 6 | 0 | 6 (`ndn-manifest` kernel tests: 32 terms, kernel-in-kernel, stability) | vectors want pinned hashes; ship after the first `freeze --pin` |
-| C2 reflection | 18 | 0 | 2 (kernel-describes-kernel) | meta-tower targets not yet authored |
-| C3 total floor | 9 | 1 (`REFUSE-declared-clause` witnesses identity-Express) | 2 (`t0_expresses_over_every_im0_manifest`) | T₀ vectors need IM₀ hashes → post-freeze |
-| C4 escape hatch | 12 | 0 | 1 (opaque in proptests) | opaque+media-type family not yet authored |
-| C5 acyclicity | 31 | 0 | 3 (DAG insert ordering, import closure) | cycle-attempt vectors want a multi-file lock harness |
-| C6/C6′ verdicts | 38 | 6 (`verdict/`) | 11 (`matcher_vectors.rs`, incl. the bomb ×3 budgets) | 21 short; the four verdicts + divergence + budget are each covered at least once |
+| C1 fixed point | 6 | 5 (`kernel/`: pinned + three trio-hash goldens recorded at the freeze; C2-01 doubles) | 6 (`ndn-manifest` kernel tests) | boot-refusal-on-mismatch vector needs a fault-injection harness |
+| C2 reflection | 18 | 1 (`C2-01-kernel-in-kernel`) | 2 (kernel-describes-kernel) | the meta-tower beyond level one remains unauthored — and level one is all the calculus promises |
+| C3 total floor | 9 | 4 (`C3-01/02` T₀ Express under EMPTY frontier — **graduated from Rust per F50**, `C3-03` default-refuse-by-absence, `REFUSE-declared-clause` identity witness) | 2 | opaque-frame media-type variants |
+| C4 escape hatch | 12 | 2 (`C4-01` payloads stratum, `C4-02` opaque identity Express) | 1 | silent-escape rejection variants |
+| C5 acyclicity | 31 | 0 | 3 (DAG insert ordering, import closure) | cycle-attempt vectors want a multi-file lock harness beyond L-02's self-import |
+| C6/C6′ verdicts | 38 | 7 (`verdict/` core four + divergence + severed chain) | 11 (incl. the bomb ×3 budgets) | budget-exhaustion as .ndfv needs a budget: key — deliberate omission, budgets are API not wire |
 | C7 independence | 4 | 0 | CI job (`check-independence`) | the property is a build fact, not a byte vector |
-| C8 matcher inertia | 26 | 2 (`C8-19`, apiary's inert `@range`) | 1 (instance edges ignored) | 23 short; selections-matched-without-evaluation vector wants a `.ndfm` selection fixture |
-| C9 fidelity | 17 | 2 (sword, launder) | 2 (same, in Rust) | vendorA→B→C 3-hop chain not yet authored |
-| C10 frontiers | 21 | 3 (divergence a/b, unresolved) | 2 | 18 short |
+| C8 matcher inertia | 26 | 3 (`C8-19` authoring reject, `C8-01` **selection matched without evaluation** — the gauntlet vector, apiary's inert `@range`) | 1 (instance edges ignored) | via-inertness vectors (wasm hash carried, never invoked) |
+| C9 fidelity | 17 | 4 (sword, launder, `C9-01` **vendorA→B→C two-loss chain**, `C9-02` severed-without-B) | 2 | loss-ORDER assertion needs a loss-path key in the format |
+| C10 frontiers | 21 | 4 (divergence a/b, unresolved, C9-02 doubles) | 2 | 17 short |
 | patterns P1–P5 | 32 | 2 (`P2-04`, `L15`) | 0 | pattern catalogue vectors largely unauthored |
-| wire (W-map) | 38 | 30 (`wire/`) | 14 (`wire_rejects.rs`, overlapping) | 8 short: multi-byte-varint boundary goldens, deep-nesting depth probes, decimal exponent forms (knob #6 is deliberately open — the campaign dodged decimal semantics and it wants its own vector page) |
-| **total** | **252** | **48** (first live run: 48 pass · 0 fail · 0 skip) | **~45** | **~159 net short** |
+| lints | — | 2 extra (`L07` **two-run mutation caught**, `L07b` supersedes-is-the-fix — formerly "harness doesn't exist") | 4 (bench regressions) | counted under their C-families above where they overlap |
+| wire (W-map) | 38 | 33 (`wire/` — incl. `W-V1/V2` multi-byte-varint boundaries and `W-11h` exponent-rejects, which vectors CURRENT law without closing knob #6) | 14 (`wire_rejects.rs`, overlapping) | 5 short: deep-nesting depth probes, name-grammar edge cases (name grammar itself is unruled — maintainer question) |
+| **total** | **252** | **67** | **~48** | **~137 net short** |
 
-Also not shipped this round, deliberately:
+Still not shipped, with reasons:
 
-- **Strata**: `locales`, `payloads`, and the demo strata `ember`, `acme`,
-  `bridge` (a verdict-family `bridge.ndfs` exists but is a fixture, not the
-  Ring-1 stratum). `hydro.*` is authored from riverwatch-manifest-contract,
-  which self-describes as **"corpus-shaped, not corpus-ratified"** — the
-  fixtures are test articles for that register entry, not ratifications of it.
-- **L-07 vectors**: mutation detection needs a pinned-then-edited two-run
-  harness; the lint exists, the vector harness for it doesn't yet.
-- **T₀-identity as `.ndfv`**: hosted in Rust
-  (`t0_expresses_over_every_im0_manifest`) because IM₀'s hash is unpinned
-  until the first freeze (D-K8) — see D-K9's note on vector hosting.
+- **Strata**: `ember`, `acme` demo strata — their term inventories appear on
+  NO provided page (F48); authoring them would be invention, not
+  transcription. `locales` and `payloads` ARE now shipped (this pass).
+  `hydro.*` remains a test article for a register entry that self-describes
+  as **"corpus-shaped, not corpus-ratified"** (riverwatch §XI).
+- **Loss-path ORDER as .ndfv**: the format would need a `loss:` assertion
+  key; hosted in Rust (`c9_07` asserts the exact loss vector) until the
+  format grows one deliberately.
+- **Budget exhaustion as .ndfv**: budgets are API surface, not wire surface;
+  hosted in Rust (the bomb ×3) by design, not by shortfall.
 
 Every skip prints as `skip` in `ndn-bench vectors` output; nothing here is
 counted as passed.

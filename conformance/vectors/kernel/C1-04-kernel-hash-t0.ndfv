@@ -1,0 +1,4 @@
+# C1-04 — H(T₀), recorded at the 2026-07-04 freeze (D-K8).
+name: C1-04-kernel-hash-t0
+expect: kernel-hash T0
+golden: a7ac046135c87046cb77c4b8a55ae55fa9ee65301f10223a236f8ccabf8aa3c6

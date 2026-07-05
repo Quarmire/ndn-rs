@@ -1,0 +1,6 @@
+# L-07b — the same edit with a supersedes line: versioning, not mutation.
+# Compiles clean (the supersedes itself rides as an L-07 info).
+name: L07b-supersedes-is-the-fix
+dag: scripts/l07-v1.ndfs
+file: scripts/l07-v3.ndfs
+expect: compile-ok

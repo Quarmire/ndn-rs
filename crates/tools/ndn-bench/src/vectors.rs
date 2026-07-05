@@ -32,11 +32,71 @@ use std::path::{Path, PathBuf};
 
 use ndn_manifest::canon::{decode_document, document_hash};
 use ndn_manifest::dag::FrozenDag;
+use ndn_manifest::kernel::{fixed_point, verify_fixed_point, FixedPointStatus};
 use ndn_render_contract::{r#match, Budget, TrustFrontier, Verdict};
 
 use crate::compile::{compile, Resolver};
 use crate::lint;
 use crate::script;
+
+/// Seed the kernel trio into a resolver (and optionally a DAG + petname
+/// map). The trio comes from the LIVE encoder (`fixed_point()`), so kernel
+/// vectors carry no baked bytes — the pins guard them instead (D-K8).
+fn seed_kernel(
+    rz: &mut Resolver,
+    dag: Option<&mut FrozenDag>,
+    pets: Option<&mut BTreeMap<String, ndn_manifest::Hash>>,
+) -> Result<ndn_manifest::Hash, String> {
+    let fp = fixed_point();
+    for (pet, bytes, hash) in
+        [("v0", &fp.v0_bytes, fp.v0_hash), ("im0", &fp.im0_bytes, fp.im0_hash)]
+    {
+        match decode_document(bytes) {
+            Ok(d) => {
+                if let ndn_manifest::model::Document::Vocabulary(voc) = d.doc {
+                    rz.add_vocabulary(pet, hash, voc);
+                }
+            }
+            Err(r) => return Err(format!("kernel {pet} failed decode: {}", r.code())),
+        }
+    }
+    if let Some(dag) = dag {
+        for bytes in [&fp.v0_bytes, &fp.im0_bytes, &fp.t0_bytes] {
+            dag.insert_bytes(bytes).map_err(|r| format!("kernel insert: {}", r.code()))?;
+        }
+    }
+    if let Some(pets) = pets {
+        pets.insert("v0".into(), fp.v0_hash);
+        pets.insert("im0".into(), fp.im0_hash);
+        pets.insert("t0".into(), fp.t0_hash);
+    }
+    Ok(fp.t0_hash)
+}
+
+/// L-07 detection for the vector harness: the two-run mutation check. The
+/// `dag:` scripts pin petnames first; if `file:` re-compiles a pinned
+/// stratum name to a DIFFERENT hash without a `supersedes` line, that is an
+/// in-place edit of published terms.
+fn l07_mutation(
+    prior: &BTreeMap<String, ndn_manifest::Hash>,
+    ast: &script::Script,
+    compiled_hash: &ndn_manifest::Hash,
+) -> Option<String> {
+    if let script::Script::Stratum(s) = ast {
+        if let Some(prev) = prior.get(&s.name) {
+            if prev != compiled_hash
+                && !s.items.iter().any(|i| matches!(i, script::Item::Supersedes { .. }))
+            {
+                return Some(format!(
+                    "[L-07] `{}` is already pinned at a different hash — editing published terms \
+                     compiles to version + supersedes; in-place mutation does not exist",
+                    s.name
+                ));
+            }
+        }
+    }
+    None
+}
 
 /// One parsed `.ndfv`.
 #[derive(Debug, Default)]
@@ -53,10 +113,14 @@ pub struct Vector {
     pub file: Option<String>,
     /// DAG scripts (verdict family).
     pub dag: Vec<String>,
-    /// Contract script (verdict family).
+    /// Contract script (verdict family), or `@kernel-t0` for the baked T₀.
     pub contract: Option<String>,
     /// Admitted petnames (verdict family).
     pub admit: Vec<String>,
+    /// Seed the kernel trio (V₀.2 · IM₀ · T₀) into the DAG/resolver first:
+    /// `kernel: trio`. Registers petnames `v0`, `im0`, `t0` (D-K8: the trio
+    /// comes from the live encoder, so these vectors need no baked bytes).
+    pub kernel: bool,
     /// The expectation line, split.
     pub expect: Vec<String>,
     /// Source path.
@@ -112,6 +176,7 @@ pub fn parse_vector(path: &Path) -> Result<Vector, String> {
             "dag" => v.dag = val.split_whitespace().map(String::from).collect(),
             "contract" => v.contract = Some(val.into()),
             "admit" => v.admit = val.split_whitespace().map(String::from).collect(),
+            "kernel" => v.kernel = true,
             "expect" => v.expect = val.split_whitespace().map(String::from).collect(),
             other => return Err(format!("{}: unknown key {other:?}", path.display())),
         }
@@ -179,6 +244,11 @@ pub fn run_vector(v: &Vector, record: bool) -> Outcome {
             let Some(file) = &v.file else { return Outcome::Fail(format!("{kind} needs `file:`")) };
             let base = v.path.parent().unwrap_or(Path::new("."));
             let mut rz = Resolver::default();
+            if v.kernel {
+                if let Err(e) = seed_kernel(&mut rz, None, None) {
+                    return Outcome::Fail(e);
+                }
+            }
             // Vector scripts may `use` each other: pre-compile every dag: line
             // in order into the resolver first.
             for dep in &v.dag {
@@ -186,13 +256,20 @@ pub fn run_vector(v: &Vector, record: bool) -> Outcome {
                     return Outcome::Fail(format!("dep {dep}: {e}"));
                 }
             }
+            // Snapshot the pins BEFORE compiling `file:` — the L-07 two-run
+            // mutation harness compares against this.
+            let prior_lock = rz.lock.clone();
             let result = compile_script_file(&base.join(file), &mut rz);
             match (kind, result) {
                 ("compile-ok", Ok(compiled)) => {
-                    // compile-ok also demands zero lint ERRORS.
+                    // compile-ok also demands zero lint ERRORS and no silent
+                    // in-place mutation of a pinned stratum (L-07).
                     let src = fs::read_to_string(base.join(file)).unwrap_or_default();
                     let ext = Path::new(file).extension().and_then(|e| e.to_str()).unwrap_or("");
                     if let Ok(ast) = script::parse(&src, ext) {
+                        if let Some(msg) = l07_mutation(&prior_lock, &ast, &compiled.hash) {
+                            return Outcome::Fail(format!("lint error: {msg}"));
+                        }
                         let diags = lint::lint(&ast, &compiled, &rz);
                         if let Some(e) = diags.iter().find(|d| d.severity == lint::Severity::Error) {
                             return Outcome::Fail(format!("lint error: {e}"));
@@ -210,11 +287,17 @@ pub fn run_vector(v: &Vector, record: bool) -> Outcome {
                     }
                 }
                 ("compile-error", Ok(compiled)) => {
-                    // Maybe the error is a lint error rather than a compile error.
+                    // Maybe the error is a lint error (or the L-07 two-run
+                    // mutation) rather than a compile error.
                     let want = v.expect.get(1).map(String::as_str).unwrap_or("");
                     let src = fs::read_to_string(base.join(file)).unwrap_or_default();
                     let ext = Path::new(file).extension().and_then(|e| e.to_str()).unwrap_or("");
                     if let Ok(ast) = script::parse(&src, ext) {
+                        if (want.is_empty() || want == "L-07")
+                            && l07_mutation(&prior_lock, &ast, &compiled.hash).is_some()
+                        {
+                            return Outcome::Pass;
+                        }
                         let diags = lint::lint(&ast, &compiled, &rz);
                         if diags
                             .iter()
@@ -239,6 +322,13 @@ pub fn run_vector(v: &Vector, record: bool) -> Outcome {
             let mut rz = Resolver::default();
             let mut dag = FrozenDag::new();
             let mut pets: BTreeMap<String, ndn_manifest::Hash> = BTreeMap::new();
+            let mut kernel_t0: Option<ndn_manifest::Hash> = None;
+            if v.kernel {
+                match seed_kernel(&mut rz, Some(&mut dag), Some(&mut pets)) {
+                    Ok(t0) => kernel_t0 = Some(t0),
+                    Err(e) => return Outcome::Fail(e),
+                }
+            }
             for dep in &v.dag {
                 match compile_script_file(&base.join(dep), &mut rz) {
                     Ok(c) => {
@@ -250,14 +340,21 @@ pub fn run_vector(v: &Vector, record: bool) -> Outcome {
                     Err(e) => return Outcome::Fail(format!("dag {dep}: {e}")),
                 }
             }
-            let ch = match compile_script_file(&base.join(contract_file), &mut rz) {
-                Ok(c) => {
-                    if dag.insert_bytes(&c.bytes).is_err() {
-                        return Outcome::Fail("contract bytes failed decode".into());
-                    }
-                    c.hash
+            let ch = if contract_file == "@kernel-t0" {
+                match kernel_t0 {
+                    Some(t0) => t0,
+                    None => return Outcome::Fail("`contract: @kernel-t0` requires `kernel: trio`".into()),
                 }
-                Err(e) => return Outcome::Fail(format!("contract: {e}")),
+            } else {
+                match compile_script_file(&base.join(contract_file), &mut rz) {
+                    Ok(c) => {
+                        if dag.insert_bytes(&c.bytes).is_err() {
+                            return Outcome::Fail("contract bytes failed decode".into());
+                        }
+                        c.hash
+                    }
+                    Err(e) => return Outcome::Fail(format!("contract: {e}")),
+                }
             };
             let mut frontier = TrustFrontier::new();
             for pet in &v.admit {
@@ -285,6 +382,38 @@ pub fn run_vector(v: &Vector, record: bool) -> Outcome {
                 Outcome::Pass
             } else {
                 Outcome::Fail(format!("expected {want}, got {got:?}"))
+            }
+        }
+        "kernel-pinned" => match verify_fixed_point() {
+            FixedPointStatus::Verified => Outcome::Pass,
+            FixedPointStatus::Unpinned => {
+                Outcome::Fail("kernel is UNPINNED — run `ndn-bench freeze --pin` first (D-K8)".into())
+            }
+            FixedPointStatus::Mismatch { which, .. } => {
+                Outcome::Fail(format!("pinned {which} disagrees with the computed kernel (R14)"))
+            }
+        },
+        "kernel-hash" => {
+            // expect: kernel-hash <V0.2|IM0|T0> — the computed trio hash must
+            // match the recorded golden; `--record` fills it (D-K8).
+            let Some(which) = v.expect.get(1) else {
+                return Outcome::Fail("kernel-hash needs V0.2, IM0, or T0".into());
+            };
+            let fp = fixed_point();
+            let h = match which.as_str() {
+                "V0.2" => fp.v0_hash,
+                "IM0" => fp.im0_hash,
+                "T0" => fp.t0_hash,
+                other => return Outcome::Fail(format!("unknown kernel artifact {other:?}")),
+            };
+            let got = hex(&h);
+            match (&v.golden, record) {
+                (Some(g), _) if *g == got => Outcome::Pass,
+                (Some(g), _) => Outcome::Fail(format!("golden mismatch: expected {g}, got {got}")),
+                (None, true) => Outcome::Recorded(got),
+                (None, false) => {
+                    Outcome::Fail("no golden recorded — run `ndn-bench vectors --record` once".into())
+                }
             }
         }
         other => Outcome::Skip(format!("unsupported expectation {other:?} — recorded in the ledger, never padded")),

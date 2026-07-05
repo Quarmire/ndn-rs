@@ -33,7 +33,7 @@ use alloc::vec::Vec;
 
 use ndn_manifest::dag::{FrozenDag, Resolution};
 use ndn_manifest::hash::Hash;
-use ndn_manifest::model::{Clause, Contract, Document, EdgeForm, Manifest, Subject};
+use ndn_manifest::model::{Clause, Contract, Document, EdgeForm, Manifest, Subject, Via};
 
 /// The per-consumer trust frontier (C10): which vocabularies' *edges* this
 /// consumer admits into reachability. Two readers with different frontiers
@@ -340,6 +340,29 @@ fn binds_admit(contract: &Contract, describes: &Subject) -> bool {
 ///
 /// Returns matches in deterministic order (manifest hash, contract hash,
 /// clause order). Budget exhaustion fails the whole call (D-K7).
+///
+/// # Reading the result: the three silences (C6′)
+///
+/// An intent can be missing from the returned matches for three DIFFERENT
+/// reasons, and only one of them produces a `Match` at all:
+///
+/// - **Mismatch** — the clause exists but its target is unreachable from
+///   the manifest's type under this frontier: **no Match is emitted**. At
+///   the call site this is `matches.iter().find(|m| m.intent == "x").is_none()`.
+///   This is NOT a refusal and NOT missing knowledge — the offer simply
+///   does not apply. (First-user trap, F54: withholding a bridge stratum
+///   makes an intent vanish from the results; that vanishing IS the
+///   verdictless answer.)
+/// - **Refuse** — an explicit `Clause::Refuse` yields a `Match` with
+///   `Verdict::Refuse`. Unlisted intents are refused by default *by
+///   absence* — they look like mismatch above, never inferred into a Match.
+/// - **Unresolved** — the DAG or frontier cannot answer (unfetched term,
+///   unadmitted vocabulary, missing import, critical extension): a `Match`
+///   with `Verdict::Unresolved(Missing)` names exactly what's absent.
+///
+/// Treat `None` as "this contract has nothing to say about that intent for
+/// this manifest", `Refuse` as "it says no", and `Unresolved` as "it cannot
+/// honestly answer yet".
 pub fn r#match(
     dag: &FrozenDag,
     contracts: &[Hash],
@@ -513,4 +536,39 @@ pub fn select(mut matches: Vec<Match>, floor: Floor) -> Vec<Match> {
 /// The best match under a floor, if any.
 pub fn select_best(matches: Vec<Match>, floor: Floor) -> Option<Match> {
     select(matches, floor).into_iter().next()
+}
+
+/// Resolve the `Via` behind a Match — the one correct lookup every consumer
+/// would otherwise reimplement (F54).
+///
+/// The Match deliberately does not carry the Via: it stays inert data in
+/// the contract (C8), referenced by hash like everything else. Dispatching
+/// it therefore means walking back to the emitting contract's clause. The
+/// fiddly part this helper owns: a contract may name the same intent in
+/// several clauses, so when the Match carries a path, the clause is
+/// disambiguated by its target being the path's FINAL hop; only when no
+/// path exists (Unresolved) does it fall back to the first intent-name
+/// match in author order. Refuse clauses carry no via and yield `None`.
+pub fn contract_via<'a>(dag: &'a FrozenDag, m: &Match) -> Option<&'a Via> {
+    let decoded = dag.get(&m.contract)?;
+    let Document::Contract(c) = &decoded.doc else { return None };
+    let want_target = m.path.last();
+    let mut fallback: Option<&'a Option<Via>> = None;
+    for clause in &c.clauses {
+        let (intent, target, via) = match clause {
+            Clause::Express { intent, target, via, .. }
+            | Clause::Approximate { intent, target, via, .. } => (intent, target, via),
+            Clause::Refuse { .. } => continue,
+        };
+        if intent.name != m.intent {
+            continue;
+        }
+        if want_target == Some(target) {
+            return via.as_ref();
+        }
+        if fallback.is_none() {
+            fallback = Some(via);
+        }
+    }
+    fallback.and_then(|v| v.as_ref())
 }

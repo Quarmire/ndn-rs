@@ -1,5 +1,19 @@
 //! ndn-manifest — the NDF calculus kernel, as a pure spec crate.
 //!
+//! # Where the built thing ends (read this first)
+//!
+//! **Ratified and tested here:** the calculus — documents, canonical bytes,
+//! the DAG, the kernel fixed point. Together with `ndn-render-contract`
+//! (the matcher), the pipeline ends at a **verdict plus an inert `Via`**.
+//! **Not built anywhere:** the render host — the runtime that turns
+//! `Express + Via::Wasm` into pixels (renderer sandbox, ViewBlock typing,
+//! capability grants, the Surface Authority). Those exist as design notes
+//! only. The Riverwatch essay's surfaces are the design target, not a
+//! runnable path; `examples/waterline-keel` proves the matcher and prints
+//! verdicts — it does not close the loop to output. Plan integrations
+//! accordingly: today's honest pattern is matcher-driven selection plus
+//! your own in-process renderer registry behind `Via::Native`.
+//!
 //! This crate is the bottom half of **the Keel**: the layer the Waterline
 //! suite stands on (the crate name stays unbranded on purpose — "the Keel"
 //! is the suite-facing layer name only). It holds:

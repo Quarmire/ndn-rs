@@ -1,0 +1,5 @@
+# L-07 fixture, run two: same stratum name, different content, NO
+# supersedes line — the in-place edit the lint exists to catch.
+stratum mutate "A stratum that will be edited in place by its careless author."
+
+term x "Version two — silently different."

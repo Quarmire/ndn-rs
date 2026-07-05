@@ -1,0 +1,6 @@
+# C3-02 — T₀'s second clause, same floor: text.plain over the same frame.
+name: C3-02-t0-text-plain-empty-frontier
+kernel: trio
+dag: scripts/im0-frame.ndfm
+contract: @kernel-t0
+expect: verdict text.plain Express

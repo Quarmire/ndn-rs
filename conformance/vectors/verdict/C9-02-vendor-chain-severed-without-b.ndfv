@@ -1,0 +1,8 @@
+# C9-02 — the same chain under a frontier that admits A and C but NOT B:
+# the middle vendor's edges do not exist for this consumer, so the chain is
+# severed — a plain mismatch, not a demotion (C10 gating C9).
+name: C9-02-vendor-chain-severed-without-b
+dag: scripts/vendor-a.ndfs scripts/vendor-b.ndfs scripts/vendor-c.ndfs scripts/vendor-manifest.ndfm
+contract: scripts/vendor.ndfc
+admit: vendor-a vendor-c
+expect: verdict series.window Mismatch

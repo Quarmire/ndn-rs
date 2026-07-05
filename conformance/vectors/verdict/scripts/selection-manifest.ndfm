@@ -1,0 +1,6 @@
+# C8-01 fixture — a selection AS a manifest: typed selections:selection,
+# carrying declared data. The matcher binds it like any other manifest and
+# never evaluates anything about it.
+manifest queen-alerts : selections:selection
+use selections as selections
+describes co-op/selections/queen-alerts

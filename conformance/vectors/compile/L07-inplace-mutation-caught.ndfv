@@ -1,0 +1,7 @@
+# L-07 — the two-run mutation harness (formerly ledgered as unbuilt): the
+# dag: line pins `mutate` at version one; file: recompiles the same name to
+# a different hash with no supersedes → in-place mutation, caught.
+name: L07-inplace-mutation-caught
+dag: scripts/l07-v1.ndfs
+file: scripts/l07-v2.ndfs
+expect: compile-error L-07
