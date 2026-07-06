@@ -1,5 +1,5 @@
 //! Batched UDP receive via Linux `recvmmsg(2)` — one syscall drains up to
-//! [`BATCH`] datagrams, amortising the per-packet syscall cost that dominates
+//! `BATCH` datagrams, amortising the per-packet syscall cost that dominates
 //! a busy forwarder's receive path.
 //!
 //! **Unvalidated on this machine.** This is unsafe FFI gated behind the
@@ -20,7 +20,7 @@ pub(crate) const BATCH: usize = 16;
 /// covering a jumbo frame / reassembled fragment).
 const BUFSZ: usize = 9000;
 
-/// One non-blocking `recvmmsg`. Returns up to [`BATCH`] `(payload, source)`
+/// One non-blocking `recvmmsg`. Returns up to `BATCH` `(payload, source)`
 /// pairs. A `WouldBlock` error means "no data ready" — the caller should await
 /// socket readiness and retry. The `fd` must be a live, non-blocking-capable
 /// UDP socket owned by the caller for the duration of the call.
@@ -38,12 +38,12 @@ pub(crate) fn recvmmsg_batch(fd: RawFd) -> std::io::Result<Vec<(Bytes, SocketAdd
         .map(|_| unsafe { std::mem::zeroed::<libc::mmsghdr>() })
         .collect();
 
-    for i in 0..BATCH {
+    for (i, msg) in msgs.iter_mut().enumerate() {
         iovecs[i] = libc::iovec {
             iov_base: bufs[i].as_mut_ptr().cast(),
             iov_len: BUFSZ,
         };
-        let hdr = &mut msgs[i].msg_hdr;
+        let hdr = &mut msg.msg_hdr;
         hdr.msg_iov = unsafe { iovecs.as_mut_ptr().add(i) };
         hdr.msg_iovlen = 1;
         hdr.msg_name = unsafe { addrs.as_mut_ptr().add(i) }.cast();
