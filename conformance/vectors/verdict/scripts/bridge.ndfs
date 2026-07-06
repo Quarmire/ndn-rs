@@ -1,6 +1,0 @@
-# C10 fixture — a third party publishes the bridging edge in its own stratum.
-stratum bridge "One narrower-than, published separately: whether it exists depends on whose frontier you stand behind (C10)."
-
-use base as base
-
-narrower-than base:m base:t

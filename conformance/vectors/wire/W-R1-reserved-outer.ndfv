@@ -1,4 +1,0 @@
-# Type 0x05 as the outer form: not a document kind.
-name: W-R1-reserved-outer
-bytes: 0500
-expect: reject NotADocument

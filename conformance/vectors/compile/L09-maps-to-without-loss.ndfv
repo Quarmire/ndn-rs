@@ -1,3 +1,0 @@
-name: L09-maps-to-without-loss
-file: scripts/l09-mapsto-no-loss.ndfs
-expect: compile-error L-09

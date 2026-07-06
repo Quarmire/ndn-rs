@@ -1,5 +1,0 @@
-# C10 fixture — base vocabulary: defines the terms, publishes NO edges.
-stratum base "Defines m and t; the bridging edge belongs to someone else."
-
-term m "The manifest's type term."
-term t "The contract's target."

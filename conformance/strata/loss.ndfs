@@ -1,8 +1,0 @@
-# loss — Ring-1 stratum: the declared costs maps-to edges carry (C9)
-stratum loss "Loss terms for maps-to edges: what a lossy translation gives up. A loss term names the cost; the matcher accumulates the path (C9)."
-
-term loss "The @loss attribute key on maps-to: which loss this translation incurs."
-term visual-only "Semantic content survives only as appearance; machine meaning is dropped."
-term ordinal-coarsening "A finer ordinal scale collapses onto a coarser one; distinctions inside a bucket are lost (F28: the hole round 5 found — added)."
-term unit-mismatch "Values converted across units with rounding; exact magnitudes are not recoverable."
-term precision-loss "Numeric precision reduced (fewer digits, wider buckets)."

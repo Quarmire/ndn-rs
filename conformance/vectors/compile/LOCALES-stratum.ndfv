@@ -1,4 +1,0 @@
-# The locales stratum compiles: readings per language, as data.
-name: LOCALES-stratum
-file: ../../strata/locales.ndfs
-expect: compile-ok

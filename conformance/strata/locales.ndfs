@@ -1,8 +1,0 @@
-# locales — Ring-1 stratum: human labels per language, as data
-stratum locales "Human labels in many languages. A term's identity is its hash; its readings are data ABOUT it — locales carry them per-language (F28's cousin: no term is ever minted just to hold a wording)."
-
-record translation "One term's label in one language." {
-    of : hash "The term being labeled."
-    lang : text "BCP-47 language tag (e.g. en, es-MX)."
-    label : text "The label in that language."
-}

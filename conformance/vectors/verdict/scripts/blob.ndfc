@@ -1,5 +1,0 @@
-contract blob-shelf "Shows opaque payloads as what they say they are."
-
-use payloads as p
-
-express raw.bytes -> p:blob

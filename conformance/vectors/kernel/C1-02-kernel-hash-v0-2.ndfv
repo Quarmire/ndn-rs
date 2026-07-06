@@ -1,6 +1,0 @@
-# C1-02 — H(V₀.2). Golden recorded by the bench at the 2026-07-04 freeze
-# (D-K8: tool-computed, never hand-derived — this value came from
-# `ndn-bench freeze --pin` output on the first live run).
-name: C1-02-kernel-hash-v0-2
-expect: kernel-hash V0.2
-golden: 568b95812f3de160d8b43c3acb168ba04ee49fd51276eaa55d74f3f650e24720

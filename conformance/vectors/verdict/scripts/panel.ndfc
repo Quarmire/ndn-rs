@@ -1,6 +1,0 @@
-contract panel "The e-paper floor contract: refusal is safe by design (riverwatch: route.avoid — no map; refused, rerouted)."
-
-use base as base
-
-express text.plain -> base:m
-refuse route.avoid

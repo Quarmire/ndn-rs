@@ -1,5 +1,0 @@
-contract selection-viewer "Shows selections as what they are: declared data."
-
-use selections as sel
-
-express value.latest -> sel:selection

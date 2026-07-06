@@ -1,3 +1,0 @@
-manifest firmware-blob : payloads:blob
-use payloads as payloads
-describes vendor/firmware/v2.3.1

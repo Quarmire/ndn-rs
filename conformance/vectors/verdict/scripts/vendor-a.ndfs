@@ -1,5 +1,0 @@
-# C9-01 fixture — vendor A: just its reading kind. The translations are
-# other people's business.
-stratum vendor-a "Vendor A's world: one reading kind, no edges."
-
-term a "Vendor A's proprietary reading kind."

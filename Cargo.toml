@@ -5,12 +5,6 @@ members = [
     "crates/core/ndn-tlv",
     "crates/core/ndn-packet",
     "crates/core/ndn-storage",
-    "crates/core/ndn-manifest",
-    "crates/core/ndn-render-contract",
-    "crates/tools/ndn-bench",
-    "crates/tools/ndn-explain",
-    "crates/tools/ndn-manifest-describe",
-    "crates/tools/ndn-manifest-derive",
     "crates/forwarding/ndn-fwd-core",
     "crates/core/ndn-crypto-core",
     "crates/core/ndn-signals-core",
@@ -43,19 +37,12 @@ members = [
     "examples/strategy-composed",
     "examples/context-enricher",
     "examples/tier0-rpc-latency",
-    "examples/waterline-keel",
 ]
 default-members = [
     "crates/core/ndn-foundation-types",
     "crates/core/ndn-tlv",
     "crates/core/ndn-packet",
     "crates/core/ndn-storage",
-    "crates/core/ndn-manifest",
-    "crates/core/ndn-render-contract",
-    "crates/tools/ndn-bench",
-    "crates/tools/ndn-explain",
-    "crates/tools/ndn-manifest-describe",
-    "crates/tools/ndn-manifest-derive",
     "crates/forwarding/ndn-fwd-core",
     "crates/core/ndn-crypto-core",
     "crates/core/ndn-signals-core",
@@ -88,7 +75,6 @@ default-members = [
     "examples/strategy-composed",
     "examples/context-enricher",
     "examples/tier0-rpc-latency",
-    "examples/waterline-keel",
 ]
 
 [workspace.package]
@@ -121,10 +107,6 @@ name = "ndn-rs"
 [workspace.dependencies]
 # NDN workspace crates — grouped by subdirectory layer
 ndn-foundation-types = { path = "crates/core/ndn-foundation-types", default-features = false }
-# The Keel — spec crates (D-48: below the waterline; C7: zero ndf-* deps,
-# CI-enforced by the check-independence job)
-ndn-manifest        = { path = "crates/core/ndn-manifest",        default-features = false }
-ndn-render-contract = { path = "crates/core/ndn-render-contract", default-features = false }
 ndn-storage   = { path = "crates/core/ndn-storage" }
 ndn-tlv       = { path = "crates/core/ndn-tlv",       default-features = false }
 ndn-packet    = { path = "crates/core/ndn-packet",    default-features = false }

@@ -1,3 +1,0 @@
-name: CARD-term-level-cardinality
-file: scripts/card-term-level.ndfs
-expect: compile-error

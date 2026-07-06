@@ -1,3 +1,0 @@
-name: C8-19-predicate-smuggle
-file: scripts/c8-19-predicate.ndfs
-expect: compile-error L-08

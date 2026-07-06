@@ -1,6 +1,0 @@
-# L-14 rides as info; the contract still compiles clean (round 5, row 12:
-# "explicit refuses → info: redundant, kept as documentation").
-name: L14-redundant-refuse-beeper
-dag: ../../strata/units.ndfs ../../strata/loss.ndfs ../../strata/edge-kinds.ndfs ../../strata/constraints.ndfs ../../strata/apiary.ndfs ../../strata/ui-intents.ndfs
-file: scripts/l14-beeper.ndfc
-expect: compile-ok

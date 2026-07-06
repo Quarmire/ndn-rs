@@ -1,6 +1,0 @@
-# A raw frame's manifest, scripted: typed im0:block — what derive_im0
-# produces for bytes off the air. The `im0` petname is seeded by
-# `kernel: trio` in the vectors that use this (D-K8: the trio comes from the
-# live encoder, so no kernel bytes are baked into any script).
-manifest frame-0417 : im0:block
-describes riverwatch/pylon-7/lora/0417

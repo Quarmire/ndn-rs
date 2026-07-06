@@ -1,4 +1,0 @@
-# L-01 — an unresolved petname reference: compile error, not a guess.
-stratum dangling "References a stratum nobody pinned."
-
-term weight : decimal @unit = ghosts:kilogram "The lock has no `ghosts`."

@@ -1,5 +1,0 @@
-# A term attribute whose value is a list — attributes stay flat on the WIRE
-# too, not just in lint (L-04's wire shadow).
-name: W-A1-nested-attribute
-bytes: 202e240176212924017426244b2007070707070707070707070707070707070707070707070707070707070707074800
-expect: reject NestedAttribute

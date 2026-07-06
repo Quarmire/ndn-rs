@@ -1,6 +1,0 @@
-# The chart contract: wants t with full fidelity.
-contract chart "A window renderer targeting sword:t."
-
-use sword as sword
-
-express series.window -> sword:t

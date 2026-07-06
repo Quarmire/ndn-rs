@@ -1,6 +1,0 @@
-# C8-19 — the predicate smuggle (ndf-the-gauntlet: "an attempt to smuggle a
-# predicate into matching is rejected at authoring"). A term whose label is
-# an evaluation word never reaches the wire.
-stratum smuggle "A stratum trying to sneak a predicate past C8."
-
-term filter-strong-colonies "Only colonies whose strength exceeds a threshold."

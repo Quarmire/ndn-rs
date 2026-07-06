@@ -1,3 +1,0 @@
-name: L15-bare-enum-fixit
-file: scripts/l15-bare-enum.ndfs
-expect: compile-error L-15

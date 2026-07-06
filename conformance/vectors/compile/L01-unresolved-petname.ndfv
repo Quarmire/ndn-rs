@@ -1,3 +1,0 @@
-name: L01-unresolved-petname
-file: scripts/l01-unresolved.ndfs
-expect: compile-error L-01

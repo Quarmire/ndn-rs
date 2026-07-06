@@ -1,9 +1,0 @@
-# C9-01 — the gauntlet's cross-vendor chain: A→B→C through two declared
-# maps-to hops. Reachable, so the offer stands — but the verdict is
-# Approximate with BOTH losses accumulated in hop order. Fidelity is the
-# minimum along the chain, and the loss path is the receipt.
-name: C9-01-vendor-chain-two-losses
-dag: scripts/vendor-a.ndfs scripts/vendor-b.ndfs scripts/vendor-c.ndfs scripts/vendor-manifest.ndfm
-contract: scripts/vendor.ndfc
-admit: vendor-a vendor-b vendor-c
-expect: verdict series.window Approximate

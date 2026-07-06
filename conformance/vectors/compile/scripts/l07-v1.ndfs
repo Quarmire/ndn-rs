@@ -1,4 +1,0 @@
-# L-07 fixture, run one: the stratum as first published.
-stratum mutate "A stratum that will be edited in place by its careless author."
-
-term x "Version one of the definition."

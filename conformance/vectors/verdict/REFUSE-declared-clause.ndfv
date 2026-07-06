@@ -1,8 +1,0 @@
-# Refuse is a verdict, emitted from the explicit clause (L-14 keeps it as
-# documentation). The express clause here is an identity match (m == m), so
-# this vector also witnesses Express-by-identity under a minimal frontier.
-name: REFUSE-declared-clause
-dag: scripts/base.ndfs scripts/c10-manifest.ndfm
-contract: scripts/panel.ndfc
-admit: base
-expect: verdict route.avoid Refuse

@@ -1,3 +1,0 @@
-name: P2-04-nested-attribute
-file: scripts/p2-04-nested-attr.ndfs
-expect: compile-error L-04

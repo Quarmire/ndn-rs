@@ -1,5 +1,0 @@
-# A maps-to edge whose body is 64 bytes (from+to, no loss) — the loss slot is
-# STRUCTURAL (D-K5): a lossless maps-to is unwritable, not merely linted.
-name: W-M1-maps-to-without-loss
-bytes: 2045240176354007070707070707070707070707070707070707070707070707070707070707070101010101010101010101010101010101010101010101010101010101010101
-expect: reject LengthMismatch

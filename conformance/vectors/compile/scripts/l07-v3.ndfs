@@ -1,9 +1,0 @@
-# L-07 fixture, the fix path: the same edit done RIGHT — a new version that
-# names its predecessor. The hash below is a placeholder for this vector's
-# purposes; the real authoring flow records the actual predecessor hash from
-# the lock (in-place mutation does not exist; supersession does).
-stratum mutate "A stratum that will be edited in place by its careless author."
-
-term x "Version two — properly versioned."
-
-supersedes 0000000000000000000000000000000000000000000000000000000000000000

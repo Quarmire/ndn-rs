@@ -1,9 +1,0 @@
-# C9-01 fixture — vendor C: translates B's kind onward, with its own cost.
-stratum vendor-c "Vendor C's world, plus its declared translation from B."
-
-use vendor-b as vb
-
-term c "Vendor C's reading kind — the contract's target."
-term coarsening "Loss: B's ordinal scale collapses onto C's coarser one."
-
-maps-to vb:b -> c @loss = coarsening

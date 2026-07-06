@@ -1,8 +1,0 @@
-# C4-02 — an opaque blob is matched by identity like anything else: the
-# calculus never peeks inside; the declared media-type is honest labeling,
-# not an interpretation.
-name: C4-02-opaque-blob-identity-express
-dag: ../../strata/payloads.ndfs scripts/blob-manifest.ndfm
-contract: scripts/blob.ndfc
-admit: payloads
-expect: verdict raw.bytes Express

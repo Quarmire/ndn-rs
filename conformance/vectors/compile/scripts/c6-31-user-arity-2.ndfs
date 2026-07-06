@@ -1,8 +1,0 @@
-# C6-31 — a user parametric with two type parameters. User parametrics are
-# arity-1; only the kernel's map-of is arity-2 (L-03, resolved by the
-# gauntlet's F6 with a distinction). Rejected at parse; no [rule] tag —
-# parse errors precede rule-tagged compilation.
-stratum arity "A user parametric trying to be map-of."
-
-term pair "A would-be arity-2 constructor."
-term uses-pair : pair(text, integer) "Two parameters on a user parametric."

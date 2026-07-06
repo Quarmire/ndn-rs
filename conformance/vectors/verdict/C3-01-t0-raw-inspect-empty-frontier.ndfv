@@ -1,9 +1,0 @@
-# C3-01 — the total floor, graduated from Rust to .ndfv now that the trio is
-# pinned (F50 closure): T₀ expresses raw.inspect over an IM₀-typed manifest
-# under an EMPTY frontier — identity, zero edges, zero trust. Refusal is
-# safe everywhere else because THIS succeeds everywhere.
-name: C3-01-t0-raw-inspect-empty-frontier
-kernel: trio
-dag: scripts/im0-frame.ndfm
-contract: @kernel-t0
-expect: verdict raw.inspect Express

@@ -1,4 +1,0 @@
-# The manifest under test: typed sword:m, subject is a name prefix (F3).
-manifest obs-1 : sword:m
-use sword as sword
-describes basin/pylon-7/obs

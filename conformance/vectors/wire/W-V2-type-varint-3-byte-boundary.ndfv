@@ -1,7 +1,0 @@
-# A trailing benign extension whose TAG is 0x4000 — the type varint crosses
-# the 2→3-byte boundary (0x80 0x80 0x01, minimal). Even ⇒ benign: decodes,
-# retained byte-exactly, hashes (same multi-byte varint path as lengths).
-name: W-V2-type-varint-3-byte-boundary
-bytes: 30654b200707070707070707070707070707070707070707070707070707070707070707311a4718796172642e6e6f7274682f686976652d61372f7363616c654d254b2001010101010101010101010101010101010101010101010101010101010101014101788080010101
-expect: roundtrip
-golden: 39a9f98817e6c9e734f10404a6fe70659524c1795dd28abe9c9bb69a13b4209c

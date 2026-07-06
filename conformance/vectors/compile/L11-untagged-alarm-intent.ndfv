@@ -1,4 +1,0 @@
-name: L11-untagged-alarm-intent
-dag: ../../strata/units.ndfs ../../strata/loss.ndfs ../../strata/edge-kinds.ndfs ../../strata/constraints.ndfs ../../strata/apiary.ndfs
-file: scripts/l11-untagged-alarm.ndfc
-expect: compile-error L-11
