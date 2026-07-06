@@ -21,11 +21,18 @@ use tokio::sync::{Semaphore, mpsc};
 use crate::rt;
 
 /// A spawnable "express one Interest, return its Data wire" future.
+#[cfg(not(target_arch = "wasm32"))]
 pub type ExpressFut = Pin<Box<dyn Future<Output = Option<Bytes>> + Send>>;
+// wasm32 is single-threaded; gloo timers are !Send, so drop the Send bound.
+#[cfg(target_arch = "wasm32")]
+pub type ExpressFut = Pin<Box<dyn Future<Output = Option<Bytes>>>>;
 
 /// Caller-supplied fetch primitive: given a segment name, return the Data
 /// wire (or `None` on timeout/failure). The caller owns retry/correlation.
+#[cfg(not(target_arch = "wasm32"))]
 pub type Express = Arc<dyn Fn(Name) -> ExpressFut + Send + Sync>;
+#[cfg(target_arch = "wasm32")]
+pub type Express = Arc<dyn Fn(Name) -> ExpressFut>;
 
 /// The `FinalBlockId` segment number of a Data, if it carries one.
 pub fn final_block_segment(data: &Data) -> Option<u64> {
