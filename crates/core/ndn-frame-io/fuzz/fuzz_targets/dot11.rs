@@ -42,6 +42,6 @@ fuzz_target!(|data: &[u8]| {
         FrameFormat::HaLowVendorAction,
         FrameFormat::Raw80211,
     ] {
-        let _ = parse_dot11(fmt, body, rssi, mcs);
+        let _ = parse_dot11(fmt, body, rssi, mcs, None);
     }
 });
