@@ -18,6 +18,9 @@ ignore = [
   # new/get/put/pop and never calls `LruCache::iter_mut`, so the unsound code
   # path is not exercised. Re-evaluate on the next `lru` release.
   "RUSTSEC-2026-0002",
+  # `Error::downcast_mut` unsoundness in a transitive dep (audit follow-up); no
+  # exploitation path exercised in-tree. Revisit when the upstream fix lands.
+  "RUSTSEC-2026-0190",
 ]
 
 [licenses]

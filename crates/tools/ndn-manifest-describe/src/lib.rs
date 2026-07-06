@@ -1,6 +1,6 @@
 //! ndn-manifest-describe — runtime support for `#[derive(Manifest)]`.
 //!
-//! The derive ([`ndn-manifest-derive`]) generates thin code that calls these
+//! The derive (`ndn-manifest-derive`) generates thin code that calls these
 //! helpers, so the parts that carry *judgment* — the lossy `f64 → Decimal`
 //! translation, the non-finite refusal, and the cardinality list-wrapping — are
 //! ordinary, unit-tested Rust rather than macro output you can't step through.
