@@ -54,11 +54,12 @@ jobs:
 
       - name: Generate API crate index from cargo metadata
         run: |
-          cargo metadata --no-deps --format-version 1 | python3 - <<'PY' > target/doc/index.html
+          cargo metadata --no-deps --format-version 1 > /tmp/ndn-meta.json
+          python3 - <<'PY' > target/doc/index.html
           import json, sys
           from collections import defaultdict
 
-          meta = json.load(sys.stdin)
+          meta = json.load(open("/tmp/ndn-meta.json"))
           GROUPS = {
               "crates/core": "Core",
               "crates/forwarding": "Forwarding",
