@@ -66,8 +66,8 @@ pub(crate) fn sendmmsg_batch(
     let mut msgs: Vec<libc::mmsghdr> = (0..wires.len())
         .map(|_| unsafe { std::mem::zeroed::<libc::mmsghdr>() })
         .collect();
-    for i in 0..wires.len() {
-        let hdr = &mut msgs[i].msg_hdr;
+    for (i, msg) in msgs.iter_mut().enumerate() {
+        let hdr = &mut msg.msg_hdr;
         hdr.msg_name = name_ptr;
         hdr.msg_namelen = addr_len;
         hdr.msg_iov = unsafe { iovecs.as_mut_ptr().add(i) };
