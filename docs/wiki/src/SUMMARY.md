@@ -109,7 +109,7 @@
 
 # Decision records
 
-- [About ADRs](./inside/adr/README.md)
+- [About ADRs](./inside/adr/index.md)
 - [0001 · Real NDN wire format, not a dialect](./inside/adr/0001-real-ndn-wire-format.md)
 - [0002 · Type-enforced verification (SafeData)](./inside/adr/0002-type-enforced-verification.md)
 - [0003 · sans-IO seed crates for native + embedded](./inside/adr/0003-sans-io-seed-crates.md)

@@ -31,7 +31,7 @@ built-in implementations are so you can read a working example.
 test), the [cross-repo contract](./cross-repo-contract.md) (the API the sibling
 repos depend on), and the [contribution workflow](./contributing.md).
 
-**[Decision records](./adr/README.md)** — short, immutable notes explaining
+**[Decision records](./adr/index.md)** — short, immutable notes explaining
 *why* a load-bearing decision was made, so the reasoning outlives the commit
 that made it.
 

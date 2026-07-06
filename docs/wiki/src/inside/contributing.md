@@ -121,7 +121,7 @@ determinism seam. If someone six months from now would ask "why is it built this
 way, and can I change it?", the answer belongs in an ADR, not a commit message.
 The existing records (real NDN wire format, type-enforced verification, the
 sans-IO seed crates, the virtualized clock, retiring the witness suite) are the
-model. See [about ADRs](./adr/README.md) for the format and index.
+model. See [about ADRs](./adr/index.md) for the format and index.
 
 ## Cross-repo care
 
@@ -136,4 +136,4 @@ safely.
 
 - [The testing guide](./testing.md) — layers, how to run, the philosophy.
 - [The cross-repo contract](./cross-repo-contract.md) — the public API the siblings consume.
-- [About ADRs](./adr/README.md) — when and how to record a decision.
+- [About ADRs](./adr/index.md) — when and how to record a decision.

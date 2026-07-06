@@ -102,7 +102,7 @@ Reading the table:
    crate is a minor bump, and the CI `semver` job will hold you to it.
 4. **Load-bearing decisions get an ADR.** If a contract change encodes a design
    decision the workspace now depends on, record it — see
-   [about ADRs](./adr/README.md) and [the contribution workflow](./contributing.md).
+   [about ADRs](./adr/index.md) and [the contribution workflow](./contributing.md).
 
 ## See also
 
