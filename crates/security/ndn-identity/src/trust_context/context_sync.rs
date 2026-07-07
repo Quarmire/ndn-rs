@@ -165,6 +165,7 @@ mod tests {
             low_seq: seq,
             high_seq: seq,
             mapping: None,
+            serving_party: None,
         }
     }
 

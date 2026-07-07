@@ -264,3 +264,49 @@ async fn converges_after_partition_heals() {
     assert!(ok, "group failed to converge after partition healed");
     drop(handles);
 }
+
+/// D-44 / N-3 two-phase commit, over a real (simple) wire: a node with `auto_ack = false` still
+/// receives gap updates via `merge_deferred`, and its `SyncHandle::ack` routes end-to-end to the SVS
+/// task (`node.ack`). Two nodes cross-linked by forwarding each other's out→in channels.
+#[tokio::test]
+async fn two_phase_node_receives_update_and_ack_routes() {
+    let group: Name = "/test/tp".parse().unwrap();
+    let a_name: Name = "/test/tp/a".parse().unwrap();
+    let b_name: Name = "/test/tp/b".parse().unwrap();
+
+    let (a_out_tx, mut a_out_rx) = mpsc::channel::<Bytes>(64);
+    let (a_in_tx, a_in_rx) = mpsc::channel::<Bytes>(64);
+    let (b_out_tx, mut b_out_rx) = mpsc::channel::<Bytes>(64);
+    let (b_in_tx, b_in_rx) = mpsc::channel::<Bytes>(64);
+
+    let a = join_svs_group(group.clone(), a_name.clone(), a_out_tx, a_in_rx, fast_config());
+    // B runs the two-phase (deferred) posture.
+    let mut b_cfg = fast_config();
+    b_cfg.auto_ack = false;
+    let mut b = join_svs_group(group.clone(), b_name.clone(), b_out_tx, b_in_rx, b_cfg);
+
+    // Cross-link: a.out → b.in and b.out → a.in.
+    tokio::spawn(async move {
+        while let Some(p) = a_out_rx.recv().await {
+            let _ = b_in_tx.send(p).await;
+        }
+    });
+    tokio::spawn(async move {
+        while let Some(p) = b_out_rx.recv().await {
+            let _ = a_in_tx.send(p).await;
+        }
+    });
+
+    // A publishes → B (deferred) must still surface the gap as a SyncUpdate.
+    a.publish(a_name.clone()).await.expect("publish");
+    let update = tokio::time::timeout(Duration::from_secs(3), b.recv())
+        .await
+        .expect("B must receive an update within 3s")
+        .expect("update stream open");
+    assert_eq!(update.high_seq, 1, "deferred merge still emits the gap");
+
+    // And B can ack it — the two-phase channel is wired end to end (handle → task → node.ack).
+    b.ack(&update.publisher, update.high_seq).await.expect("ack routes");
+    drop(a);
+    drop(b);
+}

@@ -110,6 +110,21 @@ impl SvsNode {
     /// even though the raw seq dropped — the v2 dialect always passes
     /// `boot = 0`, so this reduces to plain seq comparison there.
     pub async fn merge(&self, received: &[StateEntry]) -> Vec<(String, u64, u64)> {
+        self.merge_inner(received, true).await
+    }
+
+    /// Like [`merge`](Self::merge) but for **two-phase commit** (D-44 / N-3): gaps are detected and a
+    /// peer's *boot* is adopted (a restart is a fact, not content to validate), yet the tracked *seq*
+    /// is **not** advanced. The node keeps advertising the lower seq, so the gap stays visible until
+    /// the app calls [`ack`](Self::ack) for the seqs it has validated and stored. This is the
+    /// anti-poison half of the chain-replication contract: a delivered item the consumer *rejects*
+    /// (a fork, a bad signature) never silently marks the node caught-up. The eager
+    /// [`merge`](Self::merge) is the default; the SVS driver selects this when `auto_ack` is off.
+    pub async fn merge_deferred(&self, received: &[StateEntry]) -> Vec<(String, u64, u64)> {
+        self.merge_inner(received, false).await
+    }
+
+    async fn merge_inner(&self, received: &[StateEntry], advance: bool) -> Vec<(String, u64, u64)> {
         let mut gaps = Vec::new();
         let mut map = self.vector.write().await;
         for entry in received {
@@ -134,17 +149,42 @@ impl SvsNode {
                 if entry.seq >= 1 {
                     let high = clamp_gap_high(1, entry.seq);
                     gaps.push((entry.name.to_string(), 1, high));
-                    *slot = (entry.boot, high);
+                    // Adopt the new boot either way (restart detection is not gated on validation).
+                    // In deferred mode the seq stays 0 so the gap re-emits until acked.
+                    *slot = (entry.boot, if advance { high } else { 0 });
                 } else {
                     *slot = (entry.boot, entry.seq);
                 }
             } else if entry.boot == lb && entry.seq > ls {
                 let high = clamp_gap_high(ls + 1, entry.seq);
                 gaps.push((entry.name.to_string(), ls + 1, high));
-                slot.1 = high;
+                // Eager: advance now. Deferred: leave the seq at `ls`; `ack()` advances it once the
+                // app has validated + stored the fetched publication.
+                if advance {
+                    slot.1 = high;
+                }
             }
         }
         gaps
+    }
+
+    /// Two-phase commit (D-44 / N-3): raise the tracked seq for peer `node_key` to `seq` after the app
+    /// has validated and stored that publication. Only *raises* (never lowers); ignores the local
+    /// entry. Complements [`merge_deferred`](Self::merge_deferred) — together they let a consumer
+    /// reject a delivered item without poisoning convergence.
+    pub async fn ack(&self, node_key: &str, seq: u64) {
+        let Ok(name) = node_key.parse::<Name>() else { return };
+        if name == self.local_name {
+            return;
+        }
+        let mut map = self.vector.write().await;
+        if let Some(slot) = map.get_mut(&name) {
+            if seq > slot.1 {
+                slot.1 = seq;
+            }
+        } else if map.len() < MAX_TRACKED_PRODUCERS {
+            map.insert(name, (0, seq));
+        }
     }
 
     pub async fn snapshot(&self) -> Vec<StateVectorEntry> {
@@ -373,5 +413,42 @@ mod tests {
         let snap = node.snapshot().await;
         assert_eq!(snap.len(), 2, "local + one peer (no duplicates)");
         assert_eq!(node.seq_for("/v=3").await, 7);
+    }
+
+    // ── two-phase commit (D-44 / N-3) ──
+
+    #[tokio::test]
+    async fn merge_deferred_holds_gap_until_ack() {
+        let node = SvsNode::new(&name("local"));
+        // deferred merge detects the gap but does NOT advance our tracked seq
+        assert_eq!(node.merge_deferred(&[e("/a", 3)]).await, vec![("/a".to_string(), 1, 3)]);
+        // re-merging re-emits the SAME gap — it stays visible (no poison) until acked
+        assert_eq!(node.merge_deferred(&[e("/a", 3)]).await, vec![("/a".to_string(), 1, 3)]);
+        assert_eq!(node.seq_for("/a").await, 0, "deferred merge did not advance the vector");
+        // ack up to seq 3 → the gap no longer re-emits, and our vector now advertises seq 3
+        node.ack("/a", 3).await;
+        assert!(node.merge_deferred(&[e("/a", 3)]).await.is_empty(), "acked seqs stop re-emitting");
+        assert_eq!(node.seq_for("/a").await, 3);
+    }
+
+    #[tokio::test]
+    async fn auto_ack_merge_advances_eagerly_as_before() {
+        // The default eager path is byte-for-byte the legacy behaviour.
+        let node = SvsNode::new(&name("local"));
+        assert_eq!(node.merge(&[e("/a", 3)]).await, vec![("/a".to_string(), 1, 3)]);
+        assert!(node.merge(&[e("/a", 3)]).await.is_empty(), "eager merge already advanced");
+        assert_eq!(node.seq_for("/a").await, 3);
+    }
+
+    #[tokio::test]
+    async fn ack_only_raises_and_ignores_local() {
+        let node = SvsNode::new(&name("local"));
+        node.merge_deferred(&[e("/a", 5)]).await;
+        node.ack("/a", 3).await; // partial ack of a 5-deep gap
+        assert_eq!(node.seq_for("/a").await, 3);
+        node.ack("/a", 2).await; // a lower ack never lowers
+        assert_eq!(node.seq_for("/a").await, 3);
+        node.ack(&node.local_key(), 9).await; // acking self is ignored (only advance() moves local)
+        assert_eq!(node.local_seq().await, 0);
     }
 }

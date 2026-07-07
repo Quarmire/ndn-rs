@@ -17,6 +17,11 @@ pub struct SyncUpdate {
     /// ndnSVS `MappingData`. Application-defined; convention is a
     /// `Name` TLV (type 7) so the consumer can fast-path the fetch.
     pub mapping: Option<Bytes>,
+    /// Who is *serving* this data, when distinct from `publisher` (the author) — e.g. a relayer under
+    /// D-40 A.2 multi-relayer. **Advisory / provenance only; never consulted in validity** (a serving
+    /// party is not a data-identity dimension). `None` when the serving party is the publisher itself
+    /// or is unknown at the sync layer (the consumer fills it from the fetch face when it matters).
+    pub serving_party: Option<String>,
 }
 
 impl fmt::Display for SyncUpdate {
@@ -51,6 +56,10 @@ pub struct SyncHandle {
     /// every node tracks the whole set; [`SyncHandle::subscribe`] then
     /// returns [`SyncError::Unsupported`].
     subscribe_tx: Option<tokio::sync::mpsc::Sender<Name>>,
+    /// Two-phase-commit acks — `(publisher_key, seq)` the app has validated + stored (D-44 / N-3).
+    /// `None` under `auto_ack` (the SVS default) or for protocols without deferred merge; then
+    /// [`SyncHandle::ack`] is a no-op the caller can safely make unconditionally.
+    ack_tx: Option<tokio::sync::mpsc::Sender<(String, u64)>>,
     cancel: tokio_util::sync::CancellationToken,
 }
 
@@ -64,8 +73,15 @@ impl SyncHandle {
             rx,
             tx,
             subscribe_tx: None,
+            ack_tx: None,
             cancel,
         }
+    }
+
+    /// Attach a two-phase-commit ack channel (used by the SVS driver when `auto_ack` is off).
+    pub fn with_ack_channel(mut self, ack_tx: tokio::sync::mpsc::Sender<(String, u64)>) -> Self {
+        self.ack_tx = Some(ack_tx);
+        self
     }
 
     /// Like [`SyncHandle::new`], but with a subscription channel — used by
@@ -80,6 +96,7 @@ impl SyncHandle {
             rx,
             tx,
             subscribe_tx: Some(subscribe_tx),
+            ack_tx: None,
             cancel,
         }
     }
@@ -114,6 +131,17 @@ impl SyncHandle {
             .send((name, Some(mapping)))
             .await
             .map_err(|_| SyncError::Disconnected)
+    }
+
+    /// Two-phase commit (D-44 / N-3): tell the sync layer that publication `(publisher, seq)` has been
+    /// validated and stored, so it may now advance its state vector for it. Under `auto_ack` (the
+    /// default) merges advance eagerly and this is a no-op — so a consumer can call it unconditionally.
+    /// A rejected/held item is simply *not* acked, and its gap stays visible (no poison).
+    pub async fn ack(&self, publisher: &str, seq: u64) -> Result<(), SyncError> {
+        match &self.ack_tx {
+            Some(tx) => tx.send((publisher.to_string(), seq)).await.map_err(|_| SyncError::Disconnected),
+            None => Ok(()),
+        }
     }
 
     pub fn leave(self) {

@@ -387,6 +387,7 @@ async fn apply_learned(
                     low_seq: low,
                     high_seq: high,
                     mapping,
+                    serving_party: None,
                 })
                 .await;
         }

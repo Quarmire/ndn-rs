@@ -476,6 +476,7 @@ async fn apply_state(
                     low_seq: old + 1,
                     high_seq: seq,
                     mapping: None,
+                    serving_party: None,
                 })
                 .await;
         }

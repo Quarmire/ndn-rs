@@ -162,6 +162,13 @@ pub struct SvsConfig {
     /// [`Insecure`](crate::security::Insecure) (accept-all); pair it with
     /// the same key as [`Self::signer`] for an HMAC group.
     pub validator: Arc<dyn SyncValidator>,
+    /// **Two-phase commit (D-44 / N-3).** When `true` (**default**), a merged peer vector advances the
+    /// local state vector eagerly — the classic SVS behaviour. When `false`, merges are *deferred*:
+    /// gaps are emitted but the local seq is not advanced until the app calls [`SyncHandle::ack`] for
+    /// each `(publisher, seq)` it has validated and stored. Off is the posture for a validating
+    /// consumer (a chain-replication gate) that must be able to reject a delivered item without
+    /// poisoning convergence — a rejected item is simply never acked, and its gap stays visible.
+    pub auto_ack: bool,
 }
 
 impl Default for SvsConfig {
@@ -176,6 +183,7 @@ impl Default for SvsConfig {
             local_boot: 0,
             signer: crate::security::default_signer(),
             validator: crate::security::default_validator(),
+            auto_ack: true,
         }
     }
 }
@@ -192,6 +200,8 @@ pub fn join_svs_group(
     let cancel = CancellationToken::new();
     let (update_tx, update_rx) = mpsc::channel(config.channel_capacity);
     let (publish_tx, publish_rx) = mpsc::channel(64);
+    // Two-phase-commit acks (D-44 / N-3): the app's validated `(publisher, seq)` flow back to the task.
+    let (ack_tx, ack_rx) = mpsc::channel(64);
 
     let task_cancel = cancel.clone();
     rt::spawn(async move {
@@ -201,6 +211,7 @@ pub fn join_svs_group(
             send,
             recv,
             publish_rx,
+            ack_rx,
             update_tx,
             config,
             task_cancel,
@@ -208,7 +219,7 @@ pub fn join_svs_group(
         .await;
     });
 
-    SyncHandle::new(update_rx, publish_tx, cancel)
+    SyncHandle::new(update_rx, publish_tx, cancel).with_ack_channel(ack_tx)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -218,6 +229,7 @@ async fn svs_task(
     send: mpsc::Sender<Bytes>,
     mut recv: mpsc::Receiver<Bytes>,
     mut publish_rx: mpsc::Receiver<(Name, Option<Bytes>)>,
+    mut ack_rx: mpsc::Receiver<(String, u64)>,
     update_tx: mpsc::Sender<SyncUpdate>,
     config: SvsConfig,
     cancel: CancellationToken,
@@ -289,7 +301,13 @@ async fn svs_task(
                     // *different* entry — so test strict local-ahead directly.
                     let local_ahead = local_ahead_of_remote(&snapshot, &remote_sv);
 
-                    let gaps = node.merge(&remote_sv).await;
+                    // D-44 / N-3: eager merge (default) advances the vector now; deferred merge holds
+                    // advancement until the app acks each validated seq (so a rejected item can't poison).
+                    let gaps = if config.auto_ack {
+                        node.merge(&remote_sv).await
+                    } else {
+                        node.merge_deferred(&remote_sv).await
+                    };
                     for (peer_key, low, high) in gaps {
                         if peer_key == local_key { continue; }
                         let mapping = peer_mappings.get(&peer_key).cloned();
@@ -306,6 +324,9 @@ async fn svs_task(
                             low_seq: low,
                             high_seq: high,
                             mapping,
+                            // The sync layer only knows the advertiser; a distinct relayer (D-40 A.2)
+                            // is filled in by the consumer from the fetch face when it matters.
+                            serving_party: None,
                         };
                         let _ = update_tx.send(update).await;
                     }
@@ -340,6 +361,12 @@ async fn svs_task(
                 recorded.clear();
                 send_sync_interest(&group, &node, &send, current_mapping.clone(), &config.signer, config.dialect).await;
                 next_send = Instant::now() + jitter_interval(&config);
+            }
+
+            // D-44 / N-3 two-phase commit: the app validated + stored `(publisher, seq)` — advance the
+            // deferred state vector for it now. (A no-op under `auto_ack`, where merges already advanced.)
+            Some((key, seq)) = ack_rx.recv() => {
+                node.ack(&key, seq).await;
             }
         }
     }
