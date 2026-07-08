@@ -20,7 +20,7 @@ pub use ndn_transport::{FaceError, FaceId};
 /// Re-exported link-timestamp vocabulary (from the named-time core). A backend
 /// stamps a [`CapturedFrame`] with a [`LinkStamp`] carrying its clock domain and
 /// honest precision; the generic time layer consumes it. See ADR 0007.
-pub use ndn_time::{ClockDomainId, LatchPoint, LinkStamp};
+pub use ndn_time::{ClockDomainId, LatchPoint, LinkStamp, RadioClockKind, RadioTimeSource};
 
 /// The 802.11 broadcast address — the default destination when no name-group is
 /// configured (every monitor receiver keeps the frame).
@@ -485,6 +485,30 @@ pub trait RadioKnobs: Send + Sync {
     /// Ignore EDCCA so TX proceeds under channel contention. Default: no-op.
     fn set_edcca_ignore(&self, _on: bool) -> Result<(), FaceError> {
         Ok(())
+    }
+}
+
+/// A radio's named-time surface: which link clocks it exposes and how to read the readable
+/// ones. Implemented per backend so `ndn-time` can, uniformly across heterogeneous radios,
+/// learn the domain RX [`LinkStamp`]s live in, that clock's honest quality, and compute a
+/// frame's age via a read-now clock — without special-casing any backend.
+///
+/// Grounded in hardware reality: a radio may expose several link clocks of different quality
+/// (an always-on free-run per-frame RX stamp, a gated/beacon-resynced port TSF, a host
+/// software stamp). A backend enumerates them via [`RadioTimeSource`] rather than pretending
+/// to have one canonical TSF. Default impl reports nothing — a port that has not wired up its
+/// timekeeping yet is honest about having none.
+pub trait RadioTime: Send + Sync {
+    /// The link clocks this radio exposes, best-first (the per-frame RX-stamp clock first).
+    fn time_sources(&self) -> Vec<RadioTimeSource> {
+        Vec::new()
+    }
+
+    /// Read the current value of a `read_now` clock, selected by `domain`, if this radio has
+    /// one. Returns `Ok(None)` when the domain is unknown or the radio has only per-frame
+    /// stamps (no readable clock). The value is in that domain's raw ticks.
+    fn read_clock(&self, _domain: ClockDomainId) -> Result<Option<u64>, FaceError> {
+        Ok(None)
     }
 }
 
