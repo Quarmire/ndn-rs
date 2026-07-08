@@ -201,6 +201,14 @@ pub struct SvSyncConfig {
     /// (ndn-svs `tlv::Data`) to mark that the content *encapsulates*
     /// another Data packet.
     pub content_type: Option<ContentType>,
+    /// Serve data Interests for **any** name held in the store, not only this
+    /// node's own `<node>/<group>` prefix (default `false`). This is the repo /
+    /// [`HistoryServer`](crate::history::HistoryServer) serving scope (D-42): a
+    /// durable replica ingests other publishers' Data under *their* names and
+    /// must answer fetches for them. Default `false` keeps a normal publisher
+    /// serving only its own data. Serving is bandwidth/availability only — the
+    /// fetcher still re-verifies (D-44), so a wider scope grants no trust.
+    pub serve_all_stored: bool,
 }
 
 impl Default for SvSyncConfig {
@@ -212,6 +220,7 @@ impl Default for SvSyncConfig {
             fetch_window: 10,
             max_segment_size: 8000,
             content_type: None,
+            serve_all_stored: false,
         }
     }
 }
@@ -337,6 +346,7 @@ impl SvSync {
             Arc::clone(&pending),
             group.clone(),
             data_prefix.clone(),
+            config.serve_all_stored,
             cancel.clone(),
         );
 
@@ -765,6 +775,7 @@ fn spawn_demux(
     pending: PendingMap,
     group: Name,
     data_prefix: Name,
+    serve_all_stored: bool,
     cancel: CancellationToken,
 ) {
     let group_len = group.components().len();
@@ -816,8 +827,12 @@ fn spawn_demux(
                         && comps[group_len].as_version() == Some(2);
                     if is_sync {
                         let _ = core_in_tx.send(raw).await;
-                    } else if interest.name.has_prefix(&data_prefix) {
-                        // Exact name, else the CanBePrefix child (seg 0).
+                    } else if serve_all_stored || interest.name.has_prefix(&data_prefix) {
+                        // Serve from the store: our own data prefix always, and —
+                        // under the repo serving scope (D-42 `serve_all_stored`) —
+                        // any name we hold (a durable replica of other publishers).
+                        // Exact name, else the CanBePrefix child (seg 0). Serving is
+                        // availability only; the fetcher re-verifies (D-44).
                         let served = store.get(&interest.name).or_else(|| {
                             interest
                                 .selectors()
