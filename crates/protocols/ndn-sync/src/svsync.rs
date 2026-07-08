@@ -203,8 +203,8 @@ pub struct SvSyncConfig {
     pub content_type: Option<ContentType>,
     /// Serve data Interests for **any** name held in the store, not only this
     /// node's own `<node>/<group>` prefix (default `false`). This is the repo /
-    /// [`HistoryServer`](crate::history::HistoryServer) serving scope (D-42): a
-    /// durable replica ingests other publishers' Data under *their* names and
+    /// durable-replica serving scope (D-42), consumed by `ndn-repo`'s two-phase
+    /// mode: a replica ingests other publishers' Data under *their* names and
     /// must answer fetches for them. Default `false` keeps a normal publisher
     /// serving only its own data. Serving is bandwidth/availability only — the
     /// fetcher still re-verifies (D-44), so a wider scope grants no trust.

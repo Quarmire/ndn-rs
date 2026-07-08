@@ -74,11 +74,6 @@ pub mod svsync;
 /// mapping-based name resolution, on top of [`svsync`].
 pub mod pubsub;
 
-/// `HistoryServer` — a durable, publisher-independent history replica
-/// (ingest-everything + serve-from-store), the D-42 offline-serving mechanism
-/// composed from [`svsync`] pieces.
-pub mod history;
-
 /// Persistent [`svsync::DataStore`] over `ndn-storage`'s synchronous
 /// `SyncBackend` (fjall / redb / in-memory). Feature `persistent-store`.
 #[cfg(feature = "persistent-store")]
@@ -98,7 +93,6 @@ pub mod psync_bloom;
 pub mod psync_partial;
 
 pub use dialect::WireDialect;
-pub use history::{HistoryServer, HistoryServerConfig};
 pub use mapping::{MappingList, MappingProvider};
 pub use protocol::{ObservedState, SyncError, SyncHandle, SyncUpdate};
 pub use psync_bloom::{BloomError, BloomFilter};
