@@ -13,7 +13,7 @@ use ndn_face_local::InProcHandle;
 use ndn_ipc::ForwarderClient;
 use ndn_packet::encode::InterestBuilder;
 use ndn_packet::lp::{LpPacket, is_lp_packet};
-use ndn_packet::{Data, MAX_PERSISTENT_LIFETIME_SECS, Name, SubscriptionRequest};
+use ndn_packet::{Data, Interest, MAX_PERSISTENT_LIFETIME_SECS, Name, SubscriptionRequest};
 use ndn_security::{SafeData, Unverified, Validator};
 
 use crate::AppError;
@@ -249,29 +249,47 @@ impl Consumer {
     }
 
     /// `timeout` should be at least the Interest lifetime encoded in
-    /// `wire`. Returns [`AppError::Nacked`] on a forwarder Nack.
+    /// `wire`. Returns [`AppError::Nacked`] on a forwarder Nack **for this
+    /// Interest**.
+    ///
+    /// ## Pairing contract (NS-6a)
+    ///
+    /// One outstanding Interest per `Consumer`: `&mut self` keeps fetches serial. The reply is
+    /// paired to the sent Interest **by name** — exact, `CanBePrefix` descendant,
+    /// implicit-digest, or parameters-digest, the Content-Store match rules — never by arrival
+    /// order. Anything else landing on the face while waiting (typically a straggler reply to
+    /// an earlier fetch that timed out client-side while its Interest was still pending in the
+    /// PIT) is **discarded**, not mis-delivered: a late reply must never become the answer to
+    /// the next question. (The NS-6 field bug: arrival-order pairing let one reordered reply
+    /// silently shift every subsequent fetch by one, and downstream a stale reply acked a
+    /// fresh seq — a permanent hole.) Nacks are paired the same way, by the name of their
+    /// enclosed Interest. For multiple Interests in flight on one connection use a
+    /// name-correlated pump ([`DemuxConnection::fetch_correlated`](crate::DemuxConnection) or
+    /// the windowed object pipeline) rather than interleaving `fetch_wire` calls.
     pub async fn fetch_wire(&mut self, wire: Bytes, timeout: Duration) -> Result<Data, AppError> {
+        // The sent Interest's matching identity (name + CanBePrefix), decoded up front so a
+        // malformed wire fails loudly here instead of mispairing later.
+        let interest =
+            Interest::decode(wire.clone()).map_err(|e| AppError::Protocol(e.to_string()))?;
+        let expected = (*interest.name).clone();
+        let can_be_prefix = interest.selectors().can_be_prefix;
+
         self.conn.send(wire).await?;
 
-        let reply = crate::rt::timeout(timeout, self.conn.recv())
-            .await
-            .map_err(|_| AppError::Timeout)?
-            .ok_or(AppError::Closed)?;
-
-        if is_lp_packet(&reply)
-            && let Ok(lp) = LpPacket::decode(reply.clone())
-        {
-            if let Some(header) = lp.nack {
-                return Err(AppError::Nacked {
-                    reason: header.reason,
-                });
+        crate::rt::timeout(timeout, async {
+            loop {
+                let Some(reply) = self.conn.recv().await else {
+                    return Err(AppError::Closed);
+                };
+                match judge_reply(&expected, can_be_prefix, reply) {
+                    ReplyVerdict::Ours(data) => return Ok(*data),
+                    ReplyVerdict::Nacked(reason) => return Err(AppError::Nacked { reason }),
+                    ReplyVerdict::Straggler => continue,
+                }
             }
-            if let Some(fragment) = lp.fragment {
-                return Data::decode(fragment).map_err(|e| AppError::Protocol(e.to_string()));
-            }
-        }
-
-        Data::decode(reply).map_err(|e| AppError::Protocol(e.to_string()))
+        })
+        .await
+        .map_err(|_| AppError::Timeout)?
     }
 
     /// Like [`fetch`](Self::fetch) but also returns the received Data's
@@ -283,16 +301,27 @@ impl Consumer {
         &mut self,
         name: impl Into<Name>,
     ) -> Result<(Data, LpInfo), AppError> {
-        let wire = InterestBuilder::new(name)
+        let expected = name.into();
+        let wire = InterestBuilder::new(expected.clone())
             .lifetime(DEFAULT_INTEREST_LIFETIME)
             .build();
         self.conn.send(wire).await?;
-        let (reply, lp) = crate::rt::timeout(DEFAULT_TIMEOUT, self.conn.recv_with_meta())
-            .await
-            .map_err(|_| AppError::Timeout)?
-            .ok_or(AppError::Closed)?;
-        let data = decode_data_lp(reply)?;
-        Ok((data, lp))
+        // Same name-paired loop as `fetch_wire` (see its pairing contract): stragglers from
+        // earlier timed-out fetches are discarded, never returned as this fetch's answer.
+        crate::rt::timeout(DEFAULT_TIMEOUT, async {
+            loop {
+                let Some((reply, lp)) = self.conn.recv_with_meta().await else {
+                    return Err(AppError::Closed);
+                };
+                match judge_reply(&expected, false, reply) {
+                    ReplyVerdict::Ours(data) => return Ok((*data, lp)),
+                    ReplyVerdict::Nacked(reason) => return Err(AppError::Nacked { reason }),
+                    ReplyVerdict::Straggler => continue,
+                }
+            }
+        })
+        .await
+        .map_err(|_| AppError::Timeout)?
     }
 
     /// Send without awaiting a reply; pairs with [`Self::recv_data`]
@@ -1060,6 +1089,86 @@ impl VerifiedConsumer {
 }
 
 /// LP-unwrap a received packet and decode it as `Data`, surfacing a Nack.
+/// What one received frame is, relative to the Interest a fetch is waiting on.
+enum ReplyVerdict {
+    /// The Data that satisfies OUR Interest (name-matched).
+    Ours(Box<Data>),
+    /// A Nack whose enclosed Interest is OURS.
+    Nacked(Option<ndn_packet::NackReason>),
+    /// Not ours: a reply/Nack for some earlier, already-abandoned Interest (its client-side
+    /// wait expired while the PIT entry lived on), or junk. Discarded — mis-delivering it is
+    /// the NS-6 off-by-one.
+    Straggler,
+}
+
+/// Classify one frame off the consumer face against the Interest identified by
+/// `expected` (+ `can_be_prefix`). Nacks match by their enclosed Interest's name; an
+/// unattributable Nack (no decodable enclosed Interest) is treated as a straggler — failing
+/// slow (timeout) beats failing wrong.
+fn judge_reply(expected: &Name, can_be_prefix: bool, reply: Bytes) -> ReplyVerdict {
+    if is_lp_packet(&reply) {
+        let Ok(lp) = LpPacket::decode(reply) else {
+            return ReplyVerdict::Straggler;
+        };
+        if let Some(header) = lp.nack {
+            let ours = lp
+                .fragment
+                .and_then(|f| Interest::decode(f).ok())
+                .is_some_and(|i| *i.name == *expected);
+            return if ours {
+                ReplyVerdict::Nacked(header.reason)
+            } else {
+                tracing::debug!(%expected, "consumer: discarding straggler Nack");
+                ReplyVerdict::Straggler
+            };
+        }
+        let Some(fragment) = lp.fragment else {
+            return ReplyVerdict::Straggler; // an idle/ack-only LP frame
+        };
+        return judge_data(expected, can_be_prefix, fragment);
+    }
+    judge_data(expected, can_be_prefix, reply)
+}
+
+fn judge_data(expected: &Name, can_be_prefix: bool, wire: Bytes) -> ReplyVerdict {
+    let Ok(data) = Data::decode(wire) else {
+        return ReplyVerdict::Straggler;
+    };
+    if data_matches(expected, can_be_prefix, &data) {
+        ReplyVerdict::Ours(Box::new(data))
+    } else {
+        tracing::debug!(%expected, got = %data.name, "consumer: discarding straggler reply");
+        ReplyVerdict::Straggler
+    }
+}
+
+/// Does `data` satisfy an Interest for `expected` (+ `can_be_prefix`)? Mirrors the
+/// Content-Store match rules (`LruCs::lookup`): a trailing `ImplicitSha256Digest` component
+/// must verify against the Data wire; a trailing `ParametersSha256Digest` matches whether the
+/// responder echoed it into the Data name or answered the bare name; `CanBePrefix` accepts any
+/// descendant (or the name itself); otherwise exact equality.
+fn data_matches(expected: &Name, can_be_prefix: bool, data: &Data) -> bool {
+    let dname: &Name = &data.name;
+    let comps = expected.components();
+    let last_typ = comps.last().map(|c| c.typ);
+    if last_typ == Some(ndn_packet::tlv_type::IMPLICIT_SHA256) {
+        let bare = Name::from_components(comps[..comps.len() - 1].iter().cloned());
+        return *dname == bare
+            && comps.last().unwrap().value.as_ref() == data.implicit_digest().as_slice();
+    }
+    if last_typ == Some(ndn_packet::tlv_type::PARAMETERS_SHA256) {
+        if dname == expected {
+            return true;
+        }
+        let bare = Name::from_components(comps[..comps.len() - 1].iter().cloned());
+        return *dname == bare;
+    }
+    if can_be_prefix {
+        return dname.has_prefix(expected);
+    }
+    dname == expected
+}
+
 pub(crate) fn decode_data_lp(reply: Bytes) -> Result<Data, AppError> {
     if is_lp_packet(&reply)
         && let Ok(lp) = LpPacket::decode(reply.clone())
@@ -1585,5 +1694,130 @@ mod subscription_tests {
         let interest = Interest::decode(wire).unwrap();
         let sr = SubscriptionRequest::find_in(interest.app_parameters().unwrap()).unwrap();
         assert_eq!(sr.max_lifetime_secs, MAX_PERSISTENT_LIFETIME_SECS);
+    }
+}
+
+#[cfg(test)]
+mod fetch_pairing_tests {
+    //! NS-6a: `fetch_wire` pairs request→response BY NAME, never by arrival order. The field
+    //! bug: a late reply to an earlier client-side-timed-out fetch (its Interest still pending
+    //! in the PIT) landed as the next `recv()` and was returned as the answer to the NEXT
+    //! fetch — shifting every subsequent pairing by one, silently. These tests drive the
+    //! straggler cases directly; the end-to-end gate (a real held reply over a real fabric) is
+    //! ndn-sim's `tests/field_faults.rs::held_reply_shifts_arrival_order_pairing_by_one`.
+
+    use super::*;
+    use ndn_packet::encode::DataBuilder;
+    use ndn_packet::lp::encode_lp_nack;
+    use std::collections::VecDeque;
+
+    /// A `Connection` that replays a fixed inbound script, then pends forever.
+    struct ScriptedConn {
+        q: std::sync::Mutex<VecDeque<Bytes>>,
+    }
+
+    impl ScriptedConn {
+        fn new(frames: impl IntoIterator<Item = Bytes>) -> Arc<Self> {
+            Arc::new(Self {
+                q: std::sync::Mutex::new(frames.into_iter().collect()),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Connection for ScriptedConn {
+        async fn send(&self, _wire: Bytes) -> Result<(), AppError> {
+            Ok(())
+        }
+        async fn recv(&self) -> Option<Bytes> {
+            let next = self.q.lock().unwrap().pop_front();
+            match next {
+                Some(f) => Some(f),
+                None => std::future::pending().await,
+            }
+        }
+        async fn register_prefix(&self, _prefix: &Name) -> Result<(), AppError> {
+            Ok(())
+        }
+    }
+
+    fn data(name: &str) -> Bytes {
+        DataBuilder::new(name.parse::<Name>().unwrap(), name.as_bytes()).build()
+    }
+
+    fn interest(name: &str) -> Bytes {
+        InterestBuilder::new(name.parse::<Name>().unwrap())
+            .lifetime(Duration::from_secs(4))
+            .build()
+    }
+
+    /// THE STRAGGLER CASE: a late reply to a previous fetch arrives first; the current fetch
+    /// must skip it and return its OWN reply. (Pre-fix, this returned /x/1 as /x/2's answer.)
+    #[tokio::test]
+    async fn straggler_reply_is_discarded_not_mispaired() {
+        let conn = ScriptedConn::new([data("/x/1"), data("/x/2")]);
+        let mut c = Consumer::new(conn);
+        let got = c
+            .fetch_wire(interest("/x/2"), Duration::from_secs(1))
+            .await
+            .expect("the real reply follows the straggler");
+        assert_eq!(got.name.to_string(), "/x/2", "never the straggler");
+    }
+
+    /// Only a straggler arrives: the fetch must TIME OUT (fail slow), not return the wrong
+    /// packet (fail wrong).
+    #[tokio::test]
+    async fn straggler_only_times_out() {
+        let conn = ScriptedConn::new([data("/x/1")]);
+        let mut c = Consumer::new(conn);
+        let err = c
+            .fetch_wire(interest("/x/2"), Duration::from_millis(200))
+            .await
+            .expect_err("a mismatched reply is not an answer");
+        assert!(matches!(err, AppError::Timeout), "got {err:?}");
+    }
+
+    /// A Nack for a DEAD Interest (the straggler's) is discarded; the live fetch still gets
+    /// its own Data.
+    #[tokio::test]
+    async fn nack_for_a_dead_interest_is_discarded() {
+        let stale_nack = encode_lp_nack(ndn_packet::NackReason::NoRoute, &interest("/x/1"));
+        let conn = ScriptedConn::new([stale_nack, data("/x/2")]);
+        let mut c = Consumer::new(conn);
+        let got = c
+            .fetch_wire(interest("/x/2"), Duration::from_secs(1))
+            .await
+            .expect("the stale Nack must not kill this fetch");
+        assert_eq!(got.name.to_string(), "/x/2");
+    }
+
+    /// A Nack for THIS Interest still surfaces as `AppError::Nacked`.
+    #[tokio::test]
+    async fn nack_for_this_interest_surfaces() {
+        let nack = encode_lp_nack(ndn_packet::NackReason::NoRoute, &interest("/x/2"));
+        let conn = ScriptedConn::new([nack]);
+        let mut c = Consumer::new(conn);
+        let err = c
+            .fetch_wire(interest("/x/2"), Duration::from_secs(1))
+            .await
+            .expect_err("our own Nack is an answer");
+        assert!(matches!(err, AppError::Nacked { .. }), "got {err:?}");
+    }
+
+    /// `CanBePrefix` accepts a descendant (the segmented-publication shape,
+    /// `<name>/v=0/seg=0`) — but still discards an unrelated straggler first.
+    #[tokio::test]
+    async fn can_be_prefix_matches_descendants_only() {
+        let conn = ScriptedConn::new([data("/y/9"), data("/x/2/v=0/seg=0")]);
+        let mut c = Consumer::new(conn);
+        let wire = InterestBuilder::new("/x/2".parse::<Name>().unwrap())
+            .lifetime(Duration::from_secs(4))
+            .can_be_prefix()
+            .build();
+        let got = c
+            .fetch_wire(wire, Duration::from_secs(1))
+            .await
+            .expect("descendant satisfies CanBePrefix");
+        assert!(got.name.to_string().starts_with("/x/2"), "got {}", got.name);
     }
 }
