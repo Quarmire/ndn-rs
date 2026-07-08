@@ -76,7 +76,7 @@ pub use domain_map::DomainMap;
 pub use interval::TimeInterval;
 pub use link_clock::{RadioClockKind, RadioTimeSource};
 pub use measure::{RxObs, TwoWay, common_view, offset_to_wall, one_way, two_way};
-pub use provenance::{Authenticity, KeyId, Measured, MeasurementProvenance};
+pub use provenance::{Authenticity, KeyId, Measured, MeasurementProvenance, PathId};
 pub use ratchet::{Ratchet, WindowEnforcement};
 pub use sample::TimeSample;
 pub use stamp::{ClockDomainId, LatchPoint, LinkStamp};
