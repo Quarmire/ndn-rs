@@ -214,3 +214,15 @@ impl crate::WifiRadio for AfPacketBackend {
         self.inject_raw(&buf).await
     }
 }
+
+/// A monitor interface exposes the NIC's MAC TSF via radiotap TSFT (when the underlying driver
+/// reports it), keyed by ifindex — a free-run per-frame RX-stamp clock. There is no read-now
+/// clock over `AF_PACKET`, so `read_clock` stays the default `None`.
+impl crate::RadioTime for AfPacketBackend {
+    fn time_sources(&self) -> Vec<crate::RadioTimeSource> {
+        vec![crate::RadioTimeSource::free_run_rx_stamp(
+            crate::ClockDomainId(self.ifindex as u32),
+            1_000,
+        )]
+    }
+}

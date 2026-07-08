@@ -83,4 +83,20 @@ impl RadioTimeSource {
             read_now: true,
         }
     }
+
+    /// A host software clock (nanosecond, monotonic, always readable) used when the radio has no
+    /// hardware timestamp and the frame is stamped when the transport delivered it — the coarsest
+    /// latch, but honestly labelled. The domain is per host process (shared by all host-stamped
+    /// backends on it), not per device.
+    pub const fn host_recv(domain: ClockDomainId) -> Self {
+        Self {
+            kind: RadioClockKind::HostRecv,
+            domain,
+            latch: LatchPoint::HostRecv,
+            precision_ns: LatchPoint::HostRecv.precision_floor_ns(),
+            tick_ns: 1,
+            monotonic: true,
+            read_now: true,
+        }
+    }
 }
