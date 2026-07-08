@@ -66,7 +66,7 @@ use ndn_packet::Name;
 use ndn_packet::encode::InterestBuilder;
 
 use crate::dialect::WireDialect;
-use crate::protocol::{SyncHandle, SyncUpdate};
+use crate::protocol::{ObservedState, SyncHandle, SyncUpdate};
 use crate::security::{SyncSigner, SyncValidator};
 use crate::svs::{StateEntry, SvsNode};
 
@@ -209,8 +209,12 @@ pub fn join_svs_group(
     let (publish_tx, publish_rx) = mpsc::channel(64);
     // Two-phase-commit acks (D-44 / N-3): the app's validated `(publisher, seq)` flow back to the task.
     let (ack_tx, ack_rx) = mpsc::channel(64);
+    // Observed per-name high-water (N-9): the task records inbound advertisements
+    // into this; the handle exposes it read-only. A depth on the data, not a peer roster.
+    let observed = Arc::new(ObservedState::default());
 
     let task_cancel = cancel.clone();
+    let task_observed = Arc::clone(&observed);
     rt::spawn(async move {
         svs_task(
             group,
@@ -220,13 +224,16 @@ pub fn join_svs_group(
             publish_rx,
             ack_rx,
             update_tx,
+            task_observed,
             config,
             task_cancel,
         )
         .await;
     });
 
-    SyncHandle::new(update_rx, publish_tx, cancel).with_ack_channel(ack_tx)
+    SyncHandle::new(update_rx, publish_tx, cancel)
+        .with_ack_channel(ack_tx)
+        .with_observed(observed)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -238,6 +245,7 @@ async fn svs_task(
     mut publish_rx: mpsc::Receiver<(Name, Option<Bytes>)>,
     mut ack_rx: mpsc::Receiver<(String, u64)>,
     update_tx: mpsc::Sender<SyncUpdate>,
+    observed: Arc<ObservedState>,
     config: SvsConfig,
     cancel: CancellationToken,
 ) {
@@ -334,6 +342,15 @@ async fn svs_task(
                     continue;
                 }
                 if let Some((remote_sv, peer_mappings)) = parse_sync_interest(&group, &raw, config.dialect) {
+                    // N-9: record the observed per-name high-water from this
+                    // authenticated advertisement — every entry, INCLUDING one
+                    // naming us (the merge below drops self by authoritative-for-
+                    // self, so this is the only place a publisher sees the group's
+                    // carriage of its own data). Strictly observational: it never
+                    // feeds the merge/gap/fetch decisions that follow.
+                    for e in &remote_sv {
+                        observed.record(&e.name, e.boot, e.seq);
+                    }
                     let snapshot = node.snapshot().await;
                     let covers_local = remote_covers_local(&snapshot, &remote_sv);
                     // The peer is missing data we already hold (we are ahead
@@ -1254,5 +1271,87 @@ mod tests {
             }
         };
         assert_eq!(advertised, 5, "acked seq must be advertised (ack arm serviced)");
+    }
+
+    /// Poll the observed high-water for `name` until it reaches `want` (recording
+    /// is asynchronous in the task) or fail after a bounded wait.
+    async fn wait_observed(obs: &ObservedState, name: &Name, want: u64) {
+        for _ in 0..200 {
+            if obs.seq_for(name) == Some(want) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("observed {name} never reached {want}; got {:?}", obs.seq_for(name));
+    }
+
+    #[tokio::test]
+    async fn observed_records_high_water_by_name() {
+        // N-9: the observed accessor reports a per-NAME depth — highest seq any
+        // peer advertised — never regressing, and absent for a name never seen.
+        let (send_tx, _send_rx) = mpsc::channel(64);
+        let (recv_tx, recv_rx) = mpsc::channel(64);
+
+        let group: Name = "/test/svs".parse().unwrap();
+        let local: Name = "/test/svs/me".parse().unwrap();
+        let config = SvsConfig {
+            sync_interval: Duration::from_secs(60),
+            jitter_ms: 0,
+            auto_ack: false,
+            ..Default::default()
+        };
+        let handle = join_svs_group(group.clone(), local, send_tx, recv_rx, config);
+        let obs = handle.observed().expect("svs records observed high-water");
+
+        let pubn: Name = "/test/svs/pub".parse().unwrap();
+        recv_tx.send(peer_sync_interest(&group, &[("/test/svs/pub", 5)])).await.unwrap();
+        wait_observed(obs, &pubn, 5).await;
+        assert_eq!(obs.seq_for(&"/test/svs/never".parse().unwrap()), None, "unseen name absent");
+
+        // A lower advert then a higher one, in order: reaching 8 proves the
+        // interleaved 3 was processed and did NOT regress the high-water.
+        recv_tx.send(peer_sync_interest(&group, &[("/test/svs/pub", 3)])).await.unwrap();
+        recv_tx.send(peer_sync_interest(&group, &[("/test/svs/pub", 8)])).await.unwrap();
+        wait_observed(obs, &pubn, 8).await;
+    }
+
+    #[tokio::test]
+    async fn observed_captures_carriage_of_our_own_name() {
+        // N-9's load-bearing case: a peer advertising OUR OWN name means it has
+        // verified+stored our data — the "carried" signal. The authoritative
+        // merge drops self (authoritative-for-self), so `observed` is the only
+        // place it surfaces; and it must stay OUT of the authoritative advertised
+        // vector (a depth, never our real publish count).
+        let (send_tx, mut send_rx) = mpsc::channel(64);
+        let (recv_tx, recv_rx) = mpsc::channel(64);
+
+        let group: Name = "/test/svs".parse().unwrap();
+        let local: Name = "/test/svs/me".parse().unwrap();
+        let config = SvsConfig {
+            sync_interval: Duration::from_secs(60),
+            jitter_ms: 0,
+            auto_ack: false,
+            ..Default::default()
+        };
+        let handle = join_svs_group(group.clone(), local.clone(), send_tx, recv_rx, config);
+        let obs = handle.observed().expect("observed present");
+
+        // (60 s interval → no immediate periodic; the only send is the forced
+        // post-publish announce captured below.)
+        // Peer claims it has stored our data to seq 7.
+        recv_tx.send(peer_sync_interest(&group, &["/test/svs/me"].map(|n| (n, 7)))).await.unwrap();
+        wait_observed(obs, &local, 7).await;
+
+        // Our OWN authoritative publish count is independent: one publish
+        // advertises me@1 (our real count), NOT me@7 (the observation).
+        handle.publish(local.clone()).await.expect("publish");
+        let raw = tokio::time::timeout(Duration::from_secs(1), send_rx.recv())
+            .await
+            .expect("post-publish interest")
+            .expect("open");
+        let (sv, _) = parse_sync_interest(&group, &raw, V2).expect("parse");
+        let me_seq = sv.iter().find(|e| e.name == local).map(|e| e.seq);
+        assert_eq!(me_seq, Some(1), "authoritative advertised seq is our real publish count");
+        assert_eq!(obs.seq_for(&local), Some(7), "observation is a separate 'carried to 7' depth");
     }
 }

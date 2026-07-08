@@ -1,10 +1,74 @@
 //! Sync-protocol abstraction over SVS, PSync, etc. Consumers subscribe
 //! to a group prefix and the runtime picks the protocol.
 
+use std::collections::HashMap;
 use std::fmt;
+use std::sync::{Arc, RwLock};
 
 use bytes::Bytes;
 use ndn_packet::Name;
+
+/// Read-only, observational per-**name** high-water: the highest `(boot, seq)`
+/// any peer has advertised for a name, recorded from inbound Sync Interests.
+///
+/// Under two-phase commit (`auto_ack: false`) a peer's state vector advances a
+/// name only once it has *verified and stored* that publication, so this is the
+/// honest "carried" signal — "this named data has been verified+stored to seq X
+/// somewhere in the group." Because it is recorded WITHOUT the merge's
+/// authoritative-for-self guard, a publisher can read the group's carriage of
+/// its OWN name (which [`crate::svs::SvsNode::merge`] deliberately drops).
+///
+/// It is keyed by **name (data), never by peer/device.** An SVS Sync Interest
+/// carries no sender identity, and the substrate deliberately mints no
+/// who-has-what device roster (ndf-apps AD-9) — so this is a **depth on the
+/// data, not a count of hosts.** It is STRICTLY observational: never consulted
+/// in the validity or fetch path (mirrors `SyncUpdate::serving_party` / N-3).
+#[derive(Debug, Default)]
+pub struct ObservedState {
+    map: RwLock<HashMap<Name, (u64, u64)>>,
+}
+
+impl ObservedState {
+    /// Record one advertised `(name, boot, seq)`, keeping the highest
+    /// `(boot, seq)` seen (boot-major, matching the SVS ordering). Called by the
+    /// SVS task for every entry of every *authenticated* inbound Sync Interest —
+    /// including entries naming the local node.
+    pub(crate) fn record(&self, name: &Name, boot: u64, seq: u64) {
+        let mut map = self.map.write().expect("ObservedState poisoned");
+        let slot = map.entry(name.clone()).or_insert((0, 0));
+        if (boot, seq) > *slot {
+            *slot = (boot, seq);
+        }
+    }
+
+    /// Highest observed seq for `name` (boot ignored), or `None` if never
+    /// advertised — the "carried to seq X" depth for that named data.
+    pub fn seq_for(&self, name: &Name) -> Option<u64> {
+        self.map
+            .read()
+            .expect("ObservedState poisoned")
+            .get(name)
+            .map(|&(_, s)| s)
+    }
+
+    /// Highest observed `(boot, seq)` for `name`, or `None`.
+    pub fn get(&self, name: &Name) -> Option<(u64, u64)> {
+        self.map
+            .read()
+            .expect("ObservedState poisoned")
+            .get(name)
+            .copied()
+    }
+
+    /// Snapshot of every observed `(name, boot, seq)`, ordered by name for
+    /// stable output — the group's advertised high-water per name.
+    pub fn snapshot(&self) -> Vec<(Name, u64, u64)> {
+        let map = self.map.read().expect("ObservedState poisoned");
+        let mut out: Vec<_> = map.iter().map(|(n, &(b, s))| (n.clone(), b, s)).collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct SyncUpdate {
@@ -60,6 +124,10 @@ pub struct SyncHandle {
     /// `None` under `auto_ack` (the SVS default) or for protocols without deferred merge; then
     /// [`SyncHandle::ack`] is a no-op the caller can safely make unconditionally.
     ack_tx: Option<tokio::sync::mpsc::Sender<(String, u64)>>,
+    /// Observed per-name high-water (N-9), shared read-only with the SVS task
+    /// that records it. `None` for protocols that don't observe peer vectors
+    /// (PSync). Strictly observational — never on the validity/fetch path.
+    observed: Option<Arc<ObservedState>>,
     cancel: tokio_util::sync::CancellationToken,
 }
 
@@ -74,6 +142,7 @@ impl SyncHandle {
             tx,
             subscribe_tx: None,
             ack_tx: None,
+            observed: None,
             cancel,
         }
     }
@@ -82,6 +151,22 @@ impl SyncHandle {
     pub fn with_ack_channel(mut self, ack_tx: tokio::sync::mpsc::Sender<(String, u64)>) -> Self {
         self.ack_tx = Some(ack_tx);
         self
+    }
+
+    /// Attach the observed per-name high-water store (N-9; the SVS driver shares
+    /// the handle it records into). See [`ObservedState`] and [`Self::observed`].
+    pub fn with_observed(mut self, observed: Arc<ObservedState>) -> Self {
+        self.observed = Some(observed);
+        self
+    }
+
+    /// The read-only observed per-name high-water — the honest "carried" depth
+    /// ("this named data has been verified+stored to seq X somewhere in the
+    /// group", under `auto_ack: false`). `None` for protocols that don't record
+    /// it (PSync). A depth keyed by name, never a per-device roster (AD-9); see
+    /// [`ObservedState`].
+    pub fn observed(&self) -> Option<&ObservedState> {
+        self.observed.as_deref()
     }
 
     /// Like [`SyncHandle::new`], but with a subscription channel — used by
@@ -97,6 +182,7 @@ impl SyncHandle {
             tx,
             subscribe_tx: Some(subscribe_tx),
             ack_tx: None,
+            observed: None,
             cancel,
         }
     }

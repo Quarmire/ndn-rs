@@ -718,6 +718,23 @@ impl SvSync {
         std::mem::replace(&mut self.handle.rx, dummy)
     }
 
+    /// Borrow the two-phase [`SyncHandle`] (N-10). This is the seam a consumer
+    /// needs when it wants BOTH the Layer-1 data plane (fetch / ingest / serve /
+    /// store) AND two-phase acks — `handle.ack(publisher, seq)` after it has
+    /// validated and stored a fetched publication — instead of hand-wiring
+    /// [`join_svs_group`] plus its own fetcher (what `ChainReplicator` and the
+    /// `follow` loop each carried ~60 lines of). `&SyncHandle` covers the
+    /// `&self` verbs (`ack`, `publish`, `subscribe`) and the read-only
+    /// [`SyncHandle::observed`] depth accessor; take the update *stream* with
+    /// [`recv_update`](Self::recv_update) / [`take_updates`](Self::take_updates).
+    ///
+    /// `ack` is a no-op under `auto_ack` (the default), so a consumer can call it
+    /// unconditionally; it advances the deferred vector only when `auto_ack` is
+    /// off.
+    pub fn sync_handle(&self) -> &SyncHandle {
+        &self.handle
+    }
+
     /// This node's data prefix `<node>/<group>` (what it serves).
     pub fn data_prefix(&self) -> &Name {
         &self.data_prefix
@@ -1207,6 +1224,73 @@ mod tests {
             again, 0,
             "already-stored publication must not be re-fetched"
         );
+    }
+
+    /// N-10 + N-9 through the Layer-1 facade: a consumer reaches the two-phase
+    /// `SyncHandle` via `sync_handle()` (so it drops the Layer-0 hand-wiring),
+    /// `ack` is callable through it, and the observed per-name high-water flows
+    /// up — B sees A's advertised publications as a depth on A's name.
+    #[tokio::test]
+    async fn sync_handle_exposes_ack_and_observed() {
+        let group = name("/app/obs");
+        let na = name("/app/obs/a");
+        let nb = name("/app/obs/b");
+
+        let (a_out_tx, mut a_out_rx) = mpsc::channel::<Bytes>(256);
+        let (a_in_tx, a_in_rx) = mpsc::channel::<Bytes>(256);
+        let (b_out_tx, mut b_out_rx) = mpsc::channel::<Bytes>(256);
+        let (b_in_tx, b_in_rx) = mpsc::channel::<Bytes>(256);
+
+        let a_in_for_b = a_in_tx.clone();
+        tokio::spawn(async move {
+            while let Some(p) = b_out_rx.recv().await {
+                let _ = a_in_for_b.send(p).await;
+            }
+        });
+        let b_in_for_a = b_in_tx.clone();
+        tokio::spawn(async move {
+            while let Some(p) = a_out_rx.recv().await {
+                let _ = b_in_for_a.send(p).await;
+            }
+        });
+
+        // Two-phase (auto_ack:false) so `ack` and `observed` are meaningful.
+        let cfg = SvSyncConfig {
+            svs: SvsConfig {
+                sync_interval: Duration::from_millis(50),
+                jitter_ms: 0,
+                auto_ack: false,
+                ..Default::default()
+            },
+            fetch_timeout: Duration::from_secs(2),
+            ..Default::default()
+        };
+
+        let store_a: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
+        let svs_a = SvSync::join(group.clone(), na.clone(), store_a, a_out_tx, a_in_rx, cfg.clone());
+        let store_b: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
+        let svs_b = SvSync::join(group.clone(), nb, store_b, b_out_tx, b_in_rx, cfg);
+
+        svs_a.publish_data(b"one").await.expect("publish 1");
+        svs_a.publish_data(b"two").await.expect("publish 2");
+
+        // N-10: reach the handle through the facade; `ack` is callable.
+        let handle_b = svs_b.sync_handle();
+        handle_b.ack(&na.to_string(), 1).await.expect("ack via exposed handle");
+
+        // N-9: B observes A's advertised high-water as a per-name depth.
+        let obs = handle_b.observed().expect("SvSync surfaces observed high-water");
+        let mut got = None;
+        for _ in 0..200 {
+            if let Some(seq) = obs.seq_for(&na)
+                && seq >= 2
+            {
+                got = Some(seq);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(got, Some(2), "B observes A carried to seq 2 (a name-keyed depth)");
     }
 
     /// Fail-closed trust: with an ingest validator that rejects everything,

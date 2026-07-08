@@ -94,7 +94,7 @@ pub mod psync_partial;
 
 pub use dialect::WireDialect;
 pub use mapping::{MappingList, MappingProvider};
-pub use protocol::{SyncError, SyncHandle, SyncUpdate};
+pub use protocol::{ObservedState, SyncError, SyncHandle, SyncUpdate};
 pub use psync_bloom::{BloomError, BloomFilter};
 pub use psync_partial::{
     PSyncPartialConfig, join_psync_partial_consumer, join_psync_partial_producer,
