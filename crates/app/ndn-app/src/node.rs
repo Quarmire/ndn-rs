@@ -223,6 +223,23 @@ impl Node {
         group: impl Into<Name>,
         local_name: impl Into<Name>,
     ) -> Result<Publisher, AppError> {
+        self.publish_with_config(group, local_name, PublisherConfig::default())
+            .await
+    }
+
+    /// Like [`publish`](Self::publish) but with an explicit [`PublisherConfig`]
+    /// — notably `config.store`, the persistent-store seam (N-15): hand in a
+    /// store (e.g. `ndn_sync::BackendStore`, or any retained `DataStore`) that
+    /// outlives the process and the restarted publisher **serves its history
+    /// from it** — advertising the recovered seq and answering fetches from the
+    /// store — instead of an `O(history)` genesis-first re-announce (NS-8). The
+    /// store must outlive a single boot; share one instance across restarts.
+    pub async fn publish_with_config(
+        &self,
+        group: impl Into<Name>,
+        local_name: impl Into<Name>,
+        config: PublisherConfig,
+    ) -> Result<Publisher, AppError> {
         let group = group.into();
         let local_name = local_name.into();
         let conn = self.dedicated().await?;
@@ -233,7 +250,7 @@ impl Node {
         conn.register_prefix(&group).await?;
         conn.register_prefix(&svs_data_prefix(&local_name, &group))
             .await?;
-        Publisher::from_connection(conn, group, local_name, PublisherConfig::default())
+        Publisher::from_connection(conn, group, local_name, config)
     }
 
     /// A [`Subscriber`] for dataset-sync group `group`, identified as
