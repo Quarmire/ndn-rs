@@ -9,8 +9,11 @@
 //! (e.g. the RTL8812 USB backend) live with their face crate and implement
 //! [`FrameIo`] against this surface.
 
+pub mod event_id;
 pub mod frame;
 pub mod radiotap;
+
+pub use event_id::EventId;
 
 /// The data-plane radio-HAL contract now lives in `ndn-radio-hal`; re-exported
 /// here so every existing `ndn_frame_io::X` path and internal `crate::X`
@@ -18,8 +21,8 @@ pub mod radiotap;
 pub use ndn_radio_hal::{
     BROADCAST, CapturedFrame, ClockDomainId, DEFAULT_SRC, FaceError, FaceId, FrameIo, InjectFrame,
     CsiSupport, LatchPoint, LinkStamp, MAX_RELIABLE_MCS, McsDescriptor, McsPolicy, RadioCapability,
-    RadioClockKind, RadioProfile, RadioTime, RadioTimeSource, Reach, Reliability, TxIntent,
-    WifiRadio, mcs_for_rssi, mcs_phy_rate_bps,
+    RadioClockKind, RadioProfile, RadioTime, RadioTimeSource, Reach, Reliability, TxDiscipline,
+    TxIntent, WifiRadio, mcs_for_rssi, mcs_phy_rate_bps,
 };
 
 pub use frame::{ESPNOW_MAX_BODY, ESPNOW_OUI, name_group_mac, name_group_uni};

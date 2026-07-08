@@ -486,6 +486,37 @@ pub trait RadioKnobs: Send + Sync {
     fn set_edcca_ignore(&self, _on: bool) -> Result<(), FaceError> {
         Ok(())
     }
+
+    /// The transmit-timing discipline this radio can *promise* (named-time Cut 2) — the capability
+    /// beacon slots / the URLLC lane / TSCH-by-name read to know how tightly airtime is bounded.
+    /// Default [`TxDiscipline::BestEffort`]; a radio that can suppress CSMA backoff on owned
+    /// spectrum (EDCCA-ignore + single-frame injection) reports [`TxDiscipline::PromptBounded`].
+    fn tx_discipline(&self) -> TxDiscipline {
+        TxDiscipline::BestEffort
+    }
+}
+
+/// What the transmit path can *promise* about when a frame leaves the antenna — a named-time
+/// Cut-2 capability the protocol reads, never a chipset register. A beacon slot or the URLLC lane
+/// asks for a discipline and reads its bound; *how* a backend delivers it (EDCCA-ignore on owned
+/// spectrum, a hardware scheduled-TX engine) stays below this seam, exactly as an MCS stays below
+/// [`TxIntent`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TxDiscipline {
+    /// No timing promise — kernel Wi-Fi, or any congested medium where CSMA backoff is unbounded.
+    BestEffort,
+    /// The frame leaves within `max_delay_ns` of the request — what EDCCA-ignore + single-MPDU
+    /// injection deliver on owned spectrum (bounded contention).
+    PromptBounded {
+        /// Upper bound, ns, from request to on-air.
+        max_delay_ns: u64,
+    },
+    /// The frame leaves at a *scheduled instant*, accurate to `granularity_ns` — a PIO/optical face
+    /// or a future scheduled-TX radio (the `LatchPoint::ScheduledTx` class).
+    ScheduledAt {
+        /// Scheduling granularity, ns.
+        granularity_ns: u64,
+    },
 }
 
 /// A radio's named-time surface: which link clocks it exposes and how to read the readable

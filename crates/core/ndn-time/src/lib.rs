@@ -56,6 +56,7 @@
 
 pub mod beacon;
 pub mod capability;
+pub mod channel_obs;
 pub mod combine;
 pub mod discipline;
 pub mod domain_map;
@@ -70,6 +71,7 @@ pub mod stamp;
 
 pub use beacon::TimeBeacon;
 pub use capability::{ClockCapability, Holdover, TimeSourceKind, Traceability};
+pub use channel_obs::{ChannelObs, C_M_PER_S};
 pub use discipline::{Correction, Discipline, PeerSample, TimePolicy, TimeState};
 pub use election::{ElectionParams, anchor_weight};
 pub use domain_map::DomainMap;
