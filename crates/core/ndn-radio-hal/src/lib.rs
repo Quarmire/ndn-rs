@@ -579,6 +579,23 @@ pub enum TimingModel {
     DutyCycled,
 }
 
+/// Whether a radio exports channel-state information to the host, and at what granularity — the
+/// axis the named-time / sensing plane needs to know per port. Assessed on real hardware:
+/// commodity Realtek Wi-Fi is [`None`](Self::None) — its only on-chip CSI is compressed 802.11
+/// beamforming feedback (angles for TxBF on >=2-antenna parts, N/A on the 1x1 8733b), never a
+/// host-visible H-matrix. Full per-subcarrier CSI needs a CSI-tool NIC (Atheros/Intel) or an SDR.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum CsiSupport {
+    /// No host-visible channel state beyond the per-frame RSSI/MCS already on `CapturedFrame`.
+    #[default]
+    None,
+    /// Coarse per-path channel quality recoverable from the RX phystatus (RSSI, CFO, EVM) — a
+    /// sensing hint, not a full channel estimate.
+    Coarse,
+    /// Full per-subcarrier CSI (the H-matrix) — an SDR or a CSI-tool NIC.
+    PerSubcarrier,
+}
+
 /// Per-radio capability descriptor — the single switch between homogeneous
 /// (NDNPIPES: identical capabilities → channel assignment + spatial reuse) and
 /// heterogeneous (NDN-CRAHNs: divergent capabilities → object→radio mapping by
@@ -624,6 +641,8 @@ pub struct RadioCapability {
     /// Half-duplex: cannot receive while transmitting (a node never hears its own
     /// TX). True for essentially every single-antenna packet radio.
     pub half_duplex: bool,
+    /// Whether this radio exports channel-state information to the host (assessed per port).
+    pub csi: CsiSupport,
 }
 
 impl RadioCapability {
@@ -650,6 +669,7 @@ impl RadioCapability {
             duty_cycle_max: 1.0,
             max_payload: 1500,
             half_duplex: true,
+            csi: CsiSupport::None,
         }
     }
 
@@ -672,6 +692,7 @@ impl RadioCapability {
             duty_cycle_max: 1.0,
             max_payload: 1500,
             half_duplex: true,
+            csi: CsiSupport::None,
         }
     }
 
@@ -714,6 +735,7 @@ impl RadioCapability {
             duty_cycle_max: 0.01,
             max_payload: 256,
             half_duplex: true,
+            csi: CsiSupport::None,
         }
     }
 
@@ -734,6 +756,7 @@ impl RadioCapability {
             duty_cycle_max: 1.0,
             max_payload: 0,
             half_duplex: false,
+            csi: CsiSupport::PerSubcarrier,
         }
     }
 }

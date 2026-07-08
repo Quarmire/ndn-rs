@@ -17,7 +17,7 @@ pub mod radiotap;
 /// reference still resolves unchanged.
 pub use ndn_radio_hal::{
     BROADCAST, CapturedFrame, ClockDomainId, DEFAULT_SRC, FaceError, FaceId, FrameIo, InjectFrame,
-    LatchPoint, LinkStamp, MAX_RELIABLE_MCS, McsDescriptor, McsPolicy, RadioCapability,
+    CsiSupport, LatchPoint, LinkStamp, MAX_RELIABLE_MCS, McsDescriptor, McsPolicy, RadioCapability,
     RadioClockKind, RadioProfile, RadioTime, RadioTimeSource, Reach, Reliability, TxIntent,
     WifiRadio, mcs_for_rssi, mcs_phy_rate_bps,
 };
