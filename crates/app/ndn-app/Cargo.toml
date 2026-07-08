@@ -74,6 +74,9 @@ tokio         = { workspace = true, features = ["rt", "macros", "time"] }
 # Multicast forwarding so SVS sync Interests fan out across in-process faces
 # (the engine-backed Node publish/subscribe round-trip test).
 ndn-strategy  = { workspace = true }
+# BackendStore for the Publisher store-seam handoff test (N-15): the persistent
+# DataStore the seam exists to admit. Test-only; the default build is unchanged.
+ndn-sync      = { workspace = true, features = ["persistent-store"] }
 
 [lints]
 workspace = true

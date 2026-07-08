@@ -27,11 +27,34 @@ use crate::connection::IpcConnection;
 use crate::connection::{Connection, InProcConnection};
 use crate::rt;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct PublisherConfig {
     pub svs: ndn_sync::SvsConfig,
     /// FreshnessPeriod stamped on published Data. Default 4 s.
     pub data_freshness: Duration,
+    /// The [`DataStore`](ndn_sync::DataStore) holding this publisher's served history (N-15).
+    /// `None` (the default) = a fresh in-memory store per instance — RAM-only, so served
+    /// history evaporates on restart and continuity leans on re-announcing the whole history
+    /// (O(history) per boot). Inject a persistent store (e.g. `ndn_sync::BackendStore` over
+    /// fjall/redb, feature `persistent-store`) and a restarted publisher instead serves its
+    /// old publications from disk AND resumes its sequence space (`SvSync::join` recovers the
+    /// seq high-water mark from the store — N-13). Share one store across boots; never share
+    /// one store between two *concurrently live* publishers with the same node name (their
+    /// seq spaces would collide).
+    pub store: Option<Arc<dyn ndn_sync::DataStore>>,
+}
+
+impl std::fmt::Debug for PublisherConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PublisherConfig")
+            .field("svs", &self.svs)
+            .field("data_freshness", &self.data_freshness)
+            .field(
+                "store",
+                &self.store.as_ref().map(|_| "injected DataStore"),
+            )
+            .finish()
+    }
 }
 
 impl Default for PublisherConfig {
@@ -39,6 +62,7 @@ impl Default for PublisherConfig {
         Self {
             svs: ndn_sync::SvsConfig::default(),
             data_freshness: Duration::from_secs(4),
+            store: None,
         }
     }
 }
@@ -165,8 +189,14 @@ impl Publisher {
             data_freshness: config.data_freshness,
             ..Default::default()
         };
-        // A real store: the SvSync demux serves these Data to subscribers.
-        let store: Arc<dyn ndn_sync::DataStore> = Arc::new(ndn_sync::MemoryStore::new());
+        // The served-history store: injected (persistent across boots — the N-15 seam) or a
+        // fresh in-memory store, the unchanged default. `SvSync::join` recovers the seq
+        // high-water mark from whatever store it gets, so a handed-off store also resumes the
+        // publisher's sequence space.
+        let store: Arc<dyn ndn_sync::DataStore> = config
+            .store
+            .clone()
+            .unwrap_or_else(|| Arc::new(ndn_sync::MemoryStore::new()));
         let svsync = ndn_sync::SvSync::join(
             group,
             local_name.clone(),
@@ -380,5 +410,80 @@ mod tests {
             .expect("timed out")
             .expect("sample");
         assert_eq!(sample.payload.as_deref(), Some(&b"AAAABBBBCC"[..]));
+    }
+
+    /// N-15 GATE: the store seam. A publisher backed by an INJECTED persistent store
+    /// (`BackendStore` — ndn-sync's N-13 bridge; the sync-memory backend stands in for
+    /// fjall/redb, same `SyncBackend` path) is dropped — "the process exits" — and a NEW
+    /// instance over the SAME store then (a) serves the previous boot's publication to a real
+    /// fetch through its own demux (the served history survived the handoff; no store peek),
+    /// and (b) resumes the sequence space (`put` → seq 2, not a collision at 1 — the
+    /// `SvSync::join` seq recovery riding the seam). Default callers are untouched:
+    /// `store: None` keeps the per-instance `MemoryStore`, the path every other test in this
+    /// module exercises.
+    #[tokio::test]
+    async fn injected_store_survives_a_publisher_handoff() {
+        let group: Name = "/demo/persist".parse().unwrap();
+        let node: Name = "/demo/persist/writer".parse().unwrap();
+        let store: Arc<dyn ndn_sync::DataStore> = Arc::new(ndn_sync::BackendStore::memory());
+
+        // Boot 1: publish, then crash — the Publisher drops; only the store survives.
+        {
+            let (p2s_tx, _p2s_rx) = mpsc::unbounded_channel::<Bytes>();
+            let (_s2p_tx, s2p_rx) = mpsc::unbounded_channel::<Bytes>();
+            let conn = Arc::new(LinkConn {
+                out: p2s_tx,
+                inn: Mutex::new(s2p_rx),
+            });
+            let publisher = Publisher::from_connection(
+                conn,
+                group.clone(),
+                node.clone(),
+                PublisherConfig {
+                    svs: fast_svs(),
+                    store: Some(Arc::clone(&store)),
+                    ..Default::default()
+                },
+            )
+            .expect("boot-1 publisher");
+            assert_eq!(publisher.put(b"born-in-boot-1").await.expect("put"), 1);
+        }
+
+        // Boot 2: a fresh instance over the handed-off store, cross-wired to a consumer.
+        let (p2c_tx, p2c_rx) = mpsc::unbounded_channel::<Bytes>();
+        let (c2p_tx, c2p_rx) = mpsc::unbounded_channel::<Bytes>();
+        let pub_conn = Arc::new(LinkConn {
+            out: p2c_tx,
+            inn: Mutex::new(c2p_rx),
+        });
+        let consumer_conn = Arc::new(LinkConn {
+            out: c2p_tx,
+            inn: Mutex::new(p2c_rx),
+        });
+        let publisher = Publisher::from_connection(
+            pub_conn,
+            group.clone(),
+            node.clone(),
+            PublisherConfig {
+                svs: fast_svs(),
+                store: Some(Arc::clone(&store)),
+                ..Default::default()
+            },
+        )
+        .expect("boot-2 publisher");
+
+        // (a) The boot-1 publication is served by boot 2, from the handed-off store.
+        let mut consumer = crate::Consumer::new(consumer_conn);
+        let data = consumer
+            .fetch(ndn_sync::svs_data_name(&node, &group, 1))
+            .await
+            .expect("boot-1 publication served across the handoff");
+        assert_eq!(
+            data.content().map(|c| c.as_ref()),
+            Some(&b"born-in-boot-1"[..])
+        );
+
+        // (b) The sequence space resumed — no collision with the pre-restart name.
+        assert_eq!(publisher.put(b"born-in-boot-2").await.expect("put"), 2);
     }
 }
