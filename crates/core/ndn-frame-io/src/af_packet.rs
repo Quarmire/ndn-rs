@@ -37,6 +37,11 @@ pub struct AfPacketBackend {
     socket: AsyncFd<OwnedFd>,
     ifindex: i32,
     format: FrameFormat,
+    /// Advertised capability. `AF_PACKET` wraps an arbitrary kernel NIC, so this is not known
+    /// from the socket; a conservative placeholder by default, overridable with
+    /// [`with_capability`](Self::with_capability) by a caller that knows its NIC (or, in future,
+    /// auto-filled from an nl80211 `NL80211_CMD_GET_WIPHY` query).
+    capability: crate::RadioCapability,
 }
 
 impl AfPacketBackend {
@@ -94,7 +99,18 @@ impl AfPacketBackend {
             socket: AsyncFd::new(owned)?,
             ifindex: ifindex as i32,
             format,
+            // Placeholder until the caller overrides / an nl80211 query fills it in.
+            capability: crate::RadioCapability::wifi_monitor_5ghz(vec![
+                36, 40, 44, 48, 149, 153, 157, 161,
+            ]),
         })
+    }
+
+    /// Override the advertised [`RadioCapability`] — a caller that knows the wrapped NIC (its
+    /// band(s), rates, channels) supplies the real profile instead of the conservative default.
+    pub fn with_capability(mut self, capability: crate::RadioCapability) -> Self {
+        self.capability = capability;
+        self
     }
 }
 
@@ -227,11 +243,11 @@ impl crate::RadioTime for AfPacketBackend {
     }
 }
 
-/// `AF_PACKET` wraps an arbitrary kernel monitor NIC, so the real capability depends on the
-/// underlying hardware and is not knowable here. Report a conservative commodity 5 GHz Wi-Fi
-/// monitor profile as a placeholder — a caller that knows its NIC should override.
+/// Returns the capability set at construction ([`with_capability`](AfPacketBackend::with_capability))
+/// — a conservative 5 GHz placeholder by default, since `AF_PACKET` wraps an arbitrary NIC whose
+/// real profile isn't visible from the socket (future: fill from an nl80211 wiphy query).
 impl crate::RadioProfile for AfPacketBackend {
     fn capability(&self) -> crate::RadioCapability {
-        crate::RadioCapability::wifi_monitor_5ghz(vec![36, 40, 44, 48, 149, 153, 157, 161])
+        self.capability.clone()
     }
 }

@@ -593,7 +593,9 @@ pub enum TimingModel {
 #[derive(Clone, Debug)]
 pub struct RadioCapability {
     pub kind: RadioKind,
-    pub band: Band,
+    /// The RF band(s) this radio can operate on — several parts are dual-band (2.4 + 5 GHz),
+    /// so this is a set, not one band. Best-first for range is [`range_rank`](Self::range_rank).
+    pub bands: Vec<Band>,
     pub max_mcs: u8,
     pub max_nss: u8,
     /// Max channel-bandwidth code (0=20,1=40,2=80,3=10,4=5), matching `ChannelBw`.
@@ -625,11 +627,18 @@ pub struct RadioCapability {
 }
 
 impl RadioCapability {
+    /// The best (furthest-reaching / most-penetrating) band-rank this radio can use — the max
+    /// of [`Band::range_rank`] over its [`bands`](Self::bands). Used by the heterogeneous-radio
+    /// selection layer to rank a dual-band radio by its most capable band. 0 if bandless.
+    pub fn range_rank(&self) -> u8 {
+        self.bands.iter().map(|b| b.range_rank()).max().unwrap_or(0)
+    }
+
     /// A commodity 5 GHz Wi-Fi monitor radio (our RTL8812EU/8822E data radio).
     pub fn wifi_monitor_5ghz(channels: Vec<u8>) -> Self {
         Self {
             kind: RadioKind::WifiMonitor,
-            band: Band::Band5GHz,
+            bands: vec![Band::Band5GHz],
             max_mcs: 9,
             max_nss: 2,
             max_bw: 2,
@@ -651,7 +660,7 @@ impl RadioCapability {
     pub fn wifi_monitor_2ghz(channels: Vec<u8>) -> Self {
         Self {
             kind: RadioKind::WifiMonitor,
-            band: Band::Band2_4GHz,
+            bands: vec![Band::Band2_4GHz],
             max_mcs: 7,
             max_nss: 2,
             max_bw: 0,
@@ -691,7 +700,7 @@ impl RadioCapability {
     pub fn lora(channels: Vec<u8>) -> Self {
         Self {
             kind: RadioKind::Lora,
-            band: Band::Sub1GHz,
+            bands: vec![Band::Sub1GHz],
             max_mcs: 0,
             max_nss: 1,
             max_bw: 4,
@@ -712,7 +721,7 @@ impl RadioCapability {
     pub fn sdr_sensor(channels: Vec<u8>) -> Self {
         Self {
             kind: RadioKind::Sdr,
-            band: Band::Band5GHz,
+            bands: vec![Band::Band5GHz],
             max_mcs: 0,
             max_nss: 0,
             max_bw: 0,
