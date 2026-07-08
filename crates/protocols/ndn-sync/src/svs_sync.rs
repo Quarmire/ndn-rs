@@ -153,6 +153,12 @@ pub struct SvsConfig {
     /// since the Unix epoch. Ignored by V2 (always 0). Set it for V3 so a
     /// restart is distinguishable from the pre-restart sequence space.
     pub local_boot: u64,
+    /// Initial local sequence number (default 0). Set on restart so the node's
+    /// advertised state vector resumes after its last durable publication
+    /// instead of restarting at 0 (NS-8). [`crate::svsync::SvSync::join`]
+    /// derives it from the [`DataStore`](crate::svsync::DataStore); a bare
+    /// Layer-0 core normally leaves it 0.
+    pub local_seq: u64,
     /// Signs every outgoing Sync Interest. Defaults to
     /// [`Insecure`](crate::security::Insecure) (unsigned), the
     /// closed-link posture; set an
@@ -181,6 +187,7 @@ impl Default for SvsConfig {
             retry_policy: RetryPolicy::default(),
             dialect: WireDialect::default(),
             local_boot: 0,
+            local_seq: 0,
             signer: crate::security::default_signer(),
             validator: crate::security::default_validator(),
             auto_ack: true,
@@ -234,7 +241,7 @@ async fn svs_task(
     config: SvsConfig,
     cancel: CancellationToken,
 ) {
-    let node = SvsNode::with_boot(&local_name, config.local_boot);
+    let node = SvsNode::with_boot_seq(&local_name, config.local_boot, config.local_seq);
     let local_key = node.local_key().to_string();
 
     let mut current_mapping: Option<Bytes> = None;
@@ -250,9 +257,43 @@ async fn svs_task(
     let mut suppressing = false;
     let mut recorded: HashMap<String, (u64, u64)> = HashMap::new();
 
+    // Gap updates awaiting delivery on `update_tx`, coalesced per publisher
+    // (N-11 / NS-7). The select loop must **never** block on
+    // `update_tx.send(update).await`: while it is parked there, every other
+    // arm — `ack_rx`, `publish_rx`, `recv` — is unreachable, so a consumer
+    // that is itself blocked sending us an ack (two-phase / `auto_ack = false`)
+    // deadlocks against us, and a burst that re-advertises the whole unacked
+    // range each round fills the 256-deep channel and wedges permanently
+    // (~44 Blocks into a 400-Block catch-up in the field). Instead, gaps are
+    // buffered here and delivered from a dedicated `update_tx.reserve()` arm
+    // that only commits to a send once capacity exists. Coalescing per
+    // publisher bounds this to one entry per producer (≤ the tracked-producer
+    // cap): a re-advertised range just widens the pending `[low, high]`, and a
+    // dropped/late round is re-derived from the next Sync Interest.
+    let mut pending: HashMap<String, SyncUpdate> = HashMap::new();
+
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
+
+            // Drain one coalesced gap update as soon as the update channel has
+            // room. Guarded on `!pending.is_empty()` so the arm is disabled
+            // (and `reserve()` never polled) when there is nothing to deliver —
+            // no busy-loop. `reserve()` awaits capacity without blocking the
+            // other arms; an `Err` means the consumer dropped its receiver, so
+            // the group is gone and we exit.
+            permit = update_tx.reserve(), if !pending.is_empty() => {
+                match permit {
+                    Ok(permit) => {
+                        if let Some(key) = pending.keys().next().cloned()
+                            && let Some(update) = pending.remove(&key)
+                        {
+                            permit.send(update);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
 
             // Portable equivalent of `sleep_until(next_send)` — recomputed each
             // loop iteration, so a reset of `next_send` reschedules correctly.
@@ -328,7 +369,12 @@ async fn svs_task(
                             // is filled in by the consumer from the fetch face when it matters.
                             serving_party: None,
                         };
-                        let _ = update_tx.send(update).await;
+                        // Buffer instead of `update_tx.send(...).await` (N-11 /
+                        // NS-7): never park the select loop on delivery. The
+                        // dedicated `reserve()` arm drains this once the channel
+                        // has room; coalescing per publisher keeps a
+                        // re-advertised range from growing the buffer.
+                        coalesce_pending(&mut pending, update);
                     }
 
                     if local_ahead {
@@ -368,6 +414,33 @@ async fn svs_task(
             Some((key, seq)) = ack_rx.recv() => {
                 node.ack(&key, seq).await;
             }
+        }
+    }
+}
+
+/// Merge `update` into the per-publisher pending-delivery buffer (N-11 /
+/// NS-7). At most one entry per publisher: a re-advertised or widened range
+/// just extends the buffered `[low, high]` rather than queueing a second
+/// entry, so the buffer is bounded by the tracked-producer count no matter how
+/// often a burst re-advertises. `low` takes the smaller bound (never
+/// under-cover: an already-fetched seq is re-derived as an idempotent re-fetch,
+/// a missed one is a permanent hole); `high` takes the larger; the newest
+/// mapping / serving party wins.
+fn coalesce_pending(pending: &mut HashMap<String, SyncUpdate>, update: SyncUpdate) {
+    match pending.get_mut(&update.publisher) {
+        Some(existing) => {
+            existing.low_seq = existing.low_seq.min(update.low_seq);
+            existing.high_seq = existing.high_seq.max(update.high_seq);
+            existing.name = update.name;
+            if update.mapping.is_some() {
+                existing.mapping = update.mapping;
+            }
+            if update.serving_party.is_some() {
+                existing.serving_party = update.serving_party;
+            }
+        }
+        None => {
+            pending.insert(update.publisher.clone(), update);
         }
     }
 }
@@ -1099,5 +1172,87 @@ mod tests {
             cursor = rest;
         }
         assert!(found_mapping, "MappingData TLV not found in AppParameters");
+    }
+
+    #[tokio::test]
+    async fn burst_does_not_wedge_the_select_loop() {
+        // N-11 / NS-7 regression. The old code delivered gaps with
+        // `update_tx.send(update).await` *inside* the select loop; once the
+        // bounded update channel filled, that await parked the whole loop, so
+        // the timer, `recv`, and `ack_rx` arms all went unreachable — and a
+        // two-phase consumer blocked sending an ack deadlocked against it
+        // (~44 Blocks into a 400-Block catch-up in the field).
+        //
+        // With a capacity-1 update channel that we deliberately never drain, a
+        // burst of gap-producing Sync Interests must NOT freeze the task: it
+        // has to keep emitting periodic Sync Interests AND keep servicing acks
+        // while the update backlog is saturated.
+        let (send_tx, mut send_rx) = mpsc::channel(64);
+        let (recv_tx, recv_rx) = mpsc::channel(64);
+
+        let group: Name = "/test/svs".parse().unwrap();
+        let local: Name = "/test/svs/me".parse().unwrap();
+
+        let config = SvsConfig {
+            sync_interval: Duration::from_millis(30),
+            jitter_ms: 0,
+            channel_capacity: 1, // saturates after a single undrained update
+            auto_ack: false,     // deferred: the two-phase path that deadlocked
+            ..Default::default()
+        };
+
+        let handle = join_svs_group(group.clone(), local, send_tx, recv_rx, config);
+
+        // Drain the first (post-join) periodic interest so we start clean.
+        let _ = tokio::time::timeout(Duration::from_secs(1), send_rx.recv())
+            .await
+            .expect("first periodic interest")
+            .expect("channel open");
+
+        // Saturate the capacity-1 update channel without draining it: feed
+        // several distinct-publisher gaps. The first fills the channel, the
+        // rest coalesce into the pending buffer. Under the old blocking send,
+        // the second gap parked the select loop here forever.
+        for i in 0..8 {
+            let peer = format!("/test/svs/peer-{i}");
+            recv_tx
+                .send(peer_sync_interest(&group, &[(&peer, 5)]))
+                .await
+                .expect("feed peer interest");
+        }
+
+        // Liveness probe #1: periodic Sync Interests keep flowing even though
+        // the update backlog is full and undrained.
+        for _ in 0..3 {
+            let tick = tokio::time::timeout(Duration::from_millis(500), send_rx.recv()).await;
+            assert!(
+                matches!(tick, Ok(Some(_))),
+                "task wedged: no periodic Sync Interest while the update backlog is saturated"
+            );
+        }
+
+        // Liveness probe #2: the ack arm is still serviced under that same
+        // saturation. In deferred mode only `ack` advances the vector, so once
+        // peer-0 is acked to seq 5 the next periodic Sync Interest must
+        // advertise peer-0 at 5 — proving the task processed the ack rather
+        // than being frozen mid-`update_tx.send`.
+        handle
+            .ack("/test/svs/peer-0", 5)
+            .await
+            .expect("ack channel open");
+
+        let advertised = loop {
+            let raw = tokio::time::timeout(Duration::from_secs(1), send_rx.recv())
+                .await
+                .expect("periodic interest after ack (loop wedged?)")
+                .expect("channel open");
+            let (sv, _) = parse_sync_interest(&group, &raw, V2).expect("parse sync interest");
+            if let Some(e) = sv.iter().find(|e| e.name.to_string() == "/test/svs/peer-0")
+                && e.seq == 5
+            {
+                break e.seq;
+            }
+        };
+        assert_eq!(advertised, 5, "acked seq must be advertised (ack arm serviced)");
     }
 }

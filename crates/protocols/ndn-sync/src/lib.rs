@@ -74,6 +74,12 @@ pub mod svsync;
 /// mapping-based name resolution, on top of [`svsync`].
 pub mod pubsub;
 
+/// Persistent [`svsync::DataStore`] over `ndn-storage`'s synchronous
+/// `SyncBackend` (fjall / redb / in-memory). Feature `persistent-store`.
+#[cfg(feature = "persistent-store")]
+#[cfg_attr(docsrs, doc(cfg(feature = "persistent-store")))]
+pub mod store;
+
 pub mod psync;
 
 pub mod psync_sync;
@@ -104,3 +110,5 @@ pub use svs_sync::{RetryPolicy, SvsConfig, fetch_with_retry, join_svs_group};
 pub use svsync::{
     DataStore, IngestValidator, MemoryStore, PublisherSigner, SvSync, SvSyncConfig, svs_data_name,
 };
+#[cfg(feature = "persistent-store")]
+pub use store::BackendStore;

@@ -62,6 +62,33 @@ pub fn svs_data_name(node: &Name, group: &Name, seq: u64) -> Name {
     append_seq(name, seq)
 }
 
+/// Recover a publisher's last sequence number from a durable [`DataStore`] so a
+/// restarted node resumes its sequence space (NS-8). Scans the node's own
+/// `<node>/<group>` data prefix and takes the highest seq seen — the component
+/// immediately after the prefix, an NNI generic component per [`svs_data_name`]
+/// (a segmented publication `…/<seq>/v=0/seg=i` still carries `<seq>` there).
+/// Returns 0 for an empty or non-enumerable ([`MemoryStore`]-fresh) store,
+/// preserving the fresh-start behaviour.
+///
+/// Cost: one O(own-history) prefix scan at boot (it materialises the node's own
+/// publications), on the order of the reload pass a durable node already pays.
+/// A store that wants O(1) recovery can maintain a high-water-seq marker key and
+/// override [`DataStore::scan_under`]'s caller — left as a follow-up; correctness
+/// here does not depend on it.
+fn recover_seq(store: &dyn DataStore, data_prefix: &Name) -> u64 {
+    let seq_pos = data_prefix.components().len();
+    store
+        .scan_under(data_prefix, 0)
+        .iter()
+        .filter_map(|(name, _)| {
+            name.components()
+                .get(seq_pos)
+                .map(|c| crate::tlv::decode_nni(c.value.as_ref()))
+        })
+        .max()
+        .unwrap_or(0)
+}
+
 /// Pluggable storage for published Data, keyed by full Data name.
 pub trait DataStore: Send + Sync {
     /// Store the encoded Data `wire` under `name`.
@@ -75,6 +102,18 @@ pub trait DataStore: Send + Sync {
     fn find_under(&self, prefix: &Name) -> Option<Bytes> {
         let _ = prefix;
         None
+    }
+    /// Enumerate stored `(name, wire)` pairs whose name has `prefix` as a
+    /// prefix, in ascending name order, up to `limit` entries (`0` =
+    /// unlimited). Used for restart recovery — resuming a publisher's sequence
+    /// space from a durable store ([`SvSync::join`] scans its own data prefix)
+    /// — and for repo enumeration. The default returns nothing (a store that
+    /// can't enumerate need not implement it, and recovery then starts at seq
+    /// 0 as before); [`MemoryStore`] and the persistent `BackendStore`
+    /// override it.
+    fn scan_under(&self, prefix: &Name, limit: usize) -> Vec<(Name, Bytes)> {
+        let _ = (prefix, limit);
+        Vec::new()
     }
 }
 
@@ -121,6 +160,20 @@ impl DataStore for MemoryStore {
             .filter(|(name, _)| name.has_prefix(prefix))
             .min_by(|(a, _), (b, _)| a.cmp(b))
             .map(|(_, wire)| wire.clone())
+    }
+
+    fn scan_under(&self, prefix: &Name, limit: usize) -> Vec<(Name, Bytes)> {
+        let map = self.map.read().expect("MemoryStore poisoned");
+        let mut out: Vec<(Name, Bytes)> = map
+            .iter()
+            .filter(|(name, _)| name.has_prefix(prefix))
+            .map(|(name, wire)| (name.clone(), wire.clone()))
+            .collect();
+        out.sort_by(|(a, _), (b, _)| a.cmp(b));
+        if limit != 0 {
+            out.truncate(limit);
+        }
+        out
     }
 }
 
@@ -231,18 +284,32 @@ impl SvSync {
     ) -> Self {
         let cancel = CancellationToken::new();
 
+        let data_prefix = {
+            let mut p = node.clone();
+            for c in group.components() {
+                p = p.append_component(c.clone());
+            }
+            p
+        };
+
+        // Restart recovery (NS-8): resume this publisher's sequence space from a
+        // durable store so it continues after its last publication instead of
+        // re-issuing seq 1 (which would collide with — and be masked by — the
+        // pre-restart names a peer already holds). An empty / in-memory store
+        // yields 0, i.e. the unchanged fresh-start behaviour. The recovered seq
+        // must seed BOTH `SvSync.seq` (the data-name counter) and the Layer-0
+        // core's state vector (what it advertises), or the two desync and peers
+        // fetch a seq the data plane never named — hence `svs.local_seq` below.
+        let resume_seq = recover_seq(store.as_ref(), &data_prefix);
+        let mut svs_config = config.svs.clone();
+        svs_config.local_seq = resume_seq;
+
         // Core channels: the core's outbound Sync Interests, and the
         // inbound Sync Interests we demux to it.
         let (core_out_tx, mut core_out_rx) = mpsc::channel::<Bytes>(256);
         let (core_in_tx, core_in_rx) = mpsc::channel::<Bytes>(256);
 
-        let handle = join_svs_group(
-            group.clone(),
-            node.clone(),
-            core_out_tx,
-            core_in_rx,
-            config.svs.clone(),
-        );
+        let handle = join_svs_group(group.clone(), node.clone(), core_out_tx, core_in_rx, svs_config);
 
         // Forward the core's Sync Interests onto the shared outbound net.
         let net_out_fwd = net_out.clone();
@@ -259,13 +326,6 @@ impl SvSync {
             }
         });
 
-        let data_prefix = {
-            let mut p = node.clone();
-            for c in group.components() {
-                p = p.append_component(c.clone());
-            }
-            p
-        };
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
 
         // Demux loop: route inbound wire to the core / store / fetchers.
@@ -288,7 +348,7 @@ impl SvSync {
             handle,
             net_out,
             pending,
-            seq: AtomicU64::new(0),
+            seq: AtomicU64::new(resume_seq),
             retry: config.svs.retry_policy.clone(),
             fetch_timeout: config.fetch_timeout,
             fetch_window: config.fetch_window,

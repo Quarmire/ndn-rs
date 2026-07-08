@@ -53,10 +53,18 @@ pub struct SvsNode {
 
 impl SvsNode {
     /// Create a node with bootstrap timestamp `local_boot` (0 under the
-    /// v2 dialect, the startup time in ms under v3).
+    /// v2 dialect, the startup time in ms under v3) and initial local seq 0.
     pub fn with_boot(local_name: &Name, local_boot: u64) -> Self {
+        Self::with_boot_seq(local_name, local_boot, 0)
+    }
+
+    /// Like [`with_boot`](Self::with_boot) but seeds the local sequence number
+    /// to `local_seq` — for restart recovery, so the node advertises its
+    /// resumed sequence space rather than restarting at 0 (NS-8). Only the
+    /// local entry is seeded; peers are still learned from the wire.
+    pub fn with_boot_seq(local_name: &Name, local_boot: u64, local_seq: u64) -> Self {
         let mut map = HashMap::new();
-        map.insert(local_name.clone(), (local_boot, 0u64));
+        map.insert(local_name.clone(), (local_boot, local_seq));
         Self {
             local_name: local_name.clone(),
             local_boot,

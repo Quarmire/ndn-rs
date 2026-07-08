@@ -9,6 +9,19 @@ license.workspace = true
 [package.metadata.scope]
 classification = "spec"
 
+[features]
+default = []
+# Persistent SVS `DataStore` (`BackendStore`) over `ndn-storage`'s synchronous
+# `SyncBackend` core. fjall/redb are synchronous underneath (the async
+# `Backend` is a spawn_blocking wrapper we don't need), so this bridges without
+# changing the `DataStore` trait — no downstream `impl DataStore` breaks. Off by
+# default so the base crate stays dependency-light and wasm-safe; the in-memory
+# `SyncMemoryBackend` needs no extra deps, `store-fjall` / `store-redb` add the
+# on-disk engines (native only).
+persistent-store = ["dep:ndn-storage"]
+store-fjall = ["persistent-store", "ndn-storage/fjall"]
+store-redb = ["persistent-store", "ndn-storage/redb"]
+
 # Protocol logic is target-agnostic; only the driver loops' spawn/timer differ
 # (see src/rt.rs). The crate builds for wasm32 so SVS/PSync run in the browser.
 [dependencies]
@@ -27,6 +40,10 @@ hmac       = "0.13"
 tracing    = { workspace = true }
 # Instant/SystemTime that work on both targets (std::time::*::now() panics on wasm32).
 web-time   = { workspace = true }
+# Persistent `DataStore` backend (feature `persistent-store`). Only the sync
+# core + name→wire key mapping are pulled here; on-disk engines ride the
+# `store-fjall` / `store-redb` passthrough features.
+ndn-storage = { workspace = true, features = ["sync", "named"], optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 ndn-packet = { workspace = true, features = ["std"] }
