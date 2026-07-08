@@ -226,3 +226,12 @@ impl crate::RadioTime for AfPacketBackend {
         )]
     }
 }
+
+/// `AF_PACKET` wraps an arbitrary kernel monitor NIC, so the real capability depends on the
+/// underlying hardware and is not knowable here. Report a conservative commodity 5 GHz Wi-Fi
+/// monitor profile as a placeholder — a caller that knows its NIC should override.
+impl crate::RadioProfile for AfPacketBackend {
+    fn capability(&self) -> crate::RadioCapability {
+        crate::RadioCapability::wifi_monitor_5ghz(vec![36, 40, 44, 48, 149, 153, 157, 161])
+    }
+}

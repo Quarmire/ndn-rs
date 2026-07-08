@@ -512,6 +512,15 @@ pub trait RadioTime: Send + Sync {
     }
 }
 
+/// A radio's static capability profile — band, rates, channels, duty cycle, etc. Implemented
+/// per backend so the heterogeneous-radio selection layer reasons about every radio uniformly
+/// (which one to pick for a given reach/rate/airtime) instead of hard-coding per-driver
+/// knowledge. The companion to [`RadioTime`] (dynamic clocks) on the static-capability axis.
+pub trait RadioProfile: Send + Sync {
+    /// This radio's capability. Every radio declares one — there is no sensible default.
+    fn capability(&self) -> RadioCapability;
+}
+
 /// RF band — the coarse range/penetration axis used for heterogeneous radio
 /// selection (sub-GHz reaches far / penetrates; 5/6 GHz is bulk; 60 GHz is dense).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -654,6 +663,27 @@ impl RadioCapability {
             duty_cycle_max: 1.0,
             max_payload: 1500,
             half_duplex: true,
+        }
+    }
+
+    /// A single-chain (1x1) 5 GHz Wi-Fi monitor radio — the RTL8731BU (halmac_87xx, 1x1 11ac).
+    /// One spatial stream, so `max_nss = 1`; at 20 MHz the top reliable VHT-1SS rate is MCS8
+    /// (MCS9 needs >=40 MHz). (This part is dual-band; the single `band` field reports its
+    /// primary 5 GHz use — a known limitation of the one-band capability model.)
+    pub fn wifi_monitor_5ghz_1ss(channels: Vec<u8>) -> Self {
+        Self {
+            max_nss: 1,
+            max_mcs: 8,
+            ..Self::wifi_monitor_5ghz(channels)
+        }
+    }
+
+    /// A single-chain (1x1) 2.4 GHz Wi-Fi monitor radio — e.g. the RTL8720DN (BW16) serial
+    /// board: 1 stream, 11n MCS0-7, 20 MHz.
+    pub fn wifi_monitor_2ghz_1ss(channels: Vec<u8>) -> Self {
+        Self {
+            max_nss: 1,
+            ..Self::wifi_monitor_2ghz(channels)
         }
     }
 
