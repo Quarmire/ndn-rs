@@ -66,6 +66,10 @@ pub mod svs_local;
 
 pub mod svs_sync;
 
+/// Multiplexed SVS driver (AD-10 demux): one task/face/timer carries N groups,
+/// collapsing per-chain overhead from O(chains) to O(1) infrastructure.
+pub mod svs_multi;
+
 /// Layer 1 — `SvSync` data plane (DataStore + publish/fetch/serve) on
 /// top of the [`svs_sync`] notification core.
 pub mod svsync;
@@ -106,6 +110,7 @@ pub use svs_local::{
     NeighborAdvance, NeighborSnapshot, StateEntry, SvsLocal, SvsLocalError, decode_svs_data,
     encode_svs_data,
 };
+pub use svs_multi::{MultiSvs, spawn_multi_svs};
 pub use svs_sync::{RetryPolicy, SvsConfig, fetch_with_retry, join_svs_group};
 pub use svsync::{
     DataStore, IngestValidator, MemoryStore, PublisherSigner, SvSync, SvSyncConfig, svs_data_name,

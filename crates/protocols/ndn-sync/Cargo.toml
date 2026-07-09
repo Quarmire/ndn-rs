@@ -40,6 +40,9 @@ hmac       = "0.13"
 tracing    = { workspace = true }
 # Instant/SystemTime that work on both targets (std::time::*::now() panics on wasm32).
 web-time   = { workspace = true }
+# StreamMap: merge N groups' publish/ack channels into one multiplexed driver
+# task (the AD-10 demux). Pure-Rust → wasm-safe.
+tokio-stream = { version = "0.1", default-features = false }
 # Persistent `DataStore` backend (feature `persistent-store`). Only the sync
 # core + name→wire key mapping are pulled here; on-disk engines ride the
 # `store-fjall` / `store-redb` passthrough features.

@@ -286,6 +286,197 @@ pub fn join_svs_group(
         .with_observed(observed)
 }
 
+/// Per-group SVS state + the operations one Sync Interest / publish / ack / timer
+/// tick performs on it. This is the **single source of truth** for per-group SVS
+/// behaviour: both the single-group [`svs_task`] and the multiplexed driver
+/// ([`crate::svs_multi`]) drive their groups through these methods, so
+/// convergence, two-phase reject-without-poison, N-9 observation, and N-11
+/// coalescing behave identically whether a group runs on its own task or shares
+/// one with N others (the AD-10 invariant: multiplexing changes only *where* the
+/// work runs, never *what* a group does).
+pub(crate) struct GroupCore {
+    pub(crate) group: Name,
+    pub(crate) node: SvsNode,
+    pub(crate) local_key: String,
+    pub(crate) config: SvsConfig,
+    pub(crate) current_mapping: Option<Bytes>,
+    /// Suppression state (ndn-svs `SVSyncCore`). When set, `next_send` is a short
+    /// reply-to-stale deadline; `recorded` accumulates peer vectors seen in the
+    /// window so the timer can check whether someone else already corrected us.
+    pub(crate) suppressing: bool,
+    pub(crate) recorded: HashMap<String, (u64, u64)>,
+    /// When this group next wants to emit a Sync Interest (periodic or suppressed).
+    pub(crate) next_send: Instant,
+    /// Gap updates awaiting delivery, coalesced per publisher (N-11 / NS-7): a
+    /// re-advertised range widens the buffered `[low, high]` rather than queueing
+    /// a second entry, and delivery never blocks the driver.
+    pub(crate) pending: HashMap<String, SyncUpdate>,
+    pub(crate) update_tx: mpsc::Sender<SyncUpdate>,
+    /// Observed per-name high-water (N-9) — a read-only depth on the data.
+    pub(crate) observed: Arc<ObservedState>,
+}
+
+impl GroupCore {
+    pub(crate) fn new(
+        group: Name,
+        local_name: &Name,
+        config: SvsConfig,
+        update_tx: mpsc::Sender<SyncUpdate>,
+        observed: Arc<ObservedState>,
+    ) -> Self {
+        let node = SvsNode::with_boot_seq(local_name, config.local_boot, config.local_seq);
+        let local_key = node.local_key().to_string();
+        let next_send = Instant::now() + jitter_interval(&config);
+        Self {
+            group,
+            node,
+            local_key,
+            config,
+            current_mapping: None,
+            suppressing: false,
+            recorded: HashMap::new(),
+            next_send,
+            pending: HashMap::new(),
+            update_tx,
+            observed,
+        }
+    }
+
+    /// The group's `next_send` timer fired: emit the periodic or suppressed
+    /// catch-up Sync Interest and reschedule.
+    pub(crate) async fn on_timer(&mut self, send: &mpsc::Sender<Bytes>) {
+        if self.suppressing {
+            // Reply-to-stale: only emit if the union of vectors recorded during
+            // the window still does not cover us (nobody else corrected us).
+            self.suppressing = false;
+            let snapshot = self.node.snapshot().await;
+            let recorded_sv: Vec<StateEntry> = self
+                .recorded
+                .iter()
+                .filter_map(|(k, (b, s))| {
+                    k.parse::<Name>().ok().map(|name| StateEntry { name, boot: *b, seq: *s })
+                })
+                .collect();
+            self.recorded.clear();
+            if !remote_covers_local(&snapshot, &recorded_sv) {
+                self.emit(send).await;
+            }
+        } else {
+            self.emit(send).await;
+        }
+        self.next_send = Instant::now() + jitter_interval(&self.config);
+    }
+
+    async fn emit(&self, send: &mpsc::Sender<Bytes>) {
+        send_sync_interest(
+            &self.group,
+            &self.node,
+            send,
+            self.current_mapping.clone(),
+            &self.config.signer,
+            self.config.dialect,
+        )
+        .await;
+    }
+
+    /// An inbound Sync Interest addressed to THIS group: authenticate, record the
+    /// N-9 observation, merge (eager or deferred), buffer gaps, run the
+    /// suppression FSM. No cross-group state is touched — a poison here stays here.
+    pub(crate) async fn on_inbound(&mut self, raw: &Bytes, _send: &mpsc::Sender<Bytes>) {
+        // Authenticate before touching the state vector (gap #2). `Insecure` accepts all.
+        if let Err(reason) = self.config.validator.validate(raw) {
+            tracing::trace!(?reason, "svs: rejected inbound sync interest");
+            return;
+        }
+        let Some((remote_sv, peer_mappings)) =
+            parse_sync_interest(&self.group, raw, self.config.dialect)
+        else {
+            return;
+        };
+        // N-9: record observed per-name high-water from every authenticated entry
+        // (incl. one naming us, which the merge below drops). Strictly observational.
+        for e in &remote_sv {
+            self.observed.record(&e.name, e.boot, e.seq);
+        }
+        let snapshot = self.node.snapshot().await;
+        let covers_local = remote_covers_local(&snapshot, &remote_sv);
+        let local_ahead = local_ahead_of_remote(&snapshot, &remote_sv);
+        // D-44 / N-3: eager merge advances now; deferred holds until `ack` (a
+        // rejected item can't poison — and it can't poison ANOTHER group either,
+        // since each group has its own `node`/`pending`).
+        let gaps = if self.config.auto_ack {
+            self.node.merge(&remote_sv).await
+        } else {
+            self.node.merge_deferred(&remote_sv).await
+        };
+        for (peer_key, low, high) in gaps {
+            if peer_key == self.local_key {
+                continue;
+            }
+            let mapping = peer_mappings.get(&peer_key).cloned();
+            let fetch_name = peer_key
+                .parse::<Name>()
+                .unwrap_or_else(|_| self.group.clone().append(&peer_key));
+            let update = SyncUpdate {
+                publisher: peer_key.clone(),
+                name: fetch_name,
+                low_seq: low,
+                high_seq: high,
+                mapping,
+                serving_party: None,
+            };
+            coalesce_pending(&mut self.pending, update);
+        }
+        if local_ahead {
+            record_vector(&mut self.recorded, &remote_sv);
+            if !self.suppressing {
+                self.suppressing = true;
+                self.next_send = Instant::now() + suppression_delay(&self.config);
+            }
+        } else if covers_local {
+            self.suppressing = false;
+            self.recorded.clear();
+            self.next_send = Instant::now() + jitter_interval(&self.config);
+        }
+    }
+
+    /// A local publication: advance, drop suppression, announce immediately.
+    pub(crate) async fn on_publish(&mut self, mapping: Option<Bytes>, send: &mpsc::Sender<Bytes>) {
+        self.current_mapping = mapping;
+        self.node.advance().await;
+        self.suppressing = false;
+        self.recorded.clear();
+        self.emit(send).await;
+        self.next_send = Instant::now() + jitter_interval(&self.config);
+    }
+
+    /// Two-phase commit (D-44 / N-3): advance the deferred vector for a
+    /// validated+stored `(publisher, seq)`.
+    pub(crate) async fn on_ack(&mut self, key: &str, seq: u64) {
+        self.node.ack(key, seq).await;
+    }
+
+    /// Deliver buffered gaps without ever blocking (the multiplexed driver can't
+    /// afford a blocking send — it would stall every other group). `try_send`
+    /// keeps an undeliverable (full channel) entry in `pending` for the next
+    /// retry; a closed channel drops it (the consumer is gone). Returns `true`
+    /// while anything remains undelivered (so the driver can schedule a retry).
+    pub(crate) fn drain_pending_try(&mut self) -> bool {
+        use tokio::sync::mpsc::error::TrySendError;
+        let keys: Vec<String> = self.pending.keys().cloned().collect();
+        for k in keys {
+            let Some(update) = self.pending.get(&k).cloned() else { continue };
+            match self.update_tx.try_send(update) {
+                Ok(()) | Err(TrySendError::Closed(_)) => {
+                    self.pending.remove(&k);
+                }
+                Err(TrySendError::Full(_)) => {}
+            }
+        }
+        !self.pending.is_empty()
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn svs_task(
     group: Name,
@@ -299,191 +490,47 @@ async fn svs_task(
     config: SvsConfig,
     cancel: CancellationToken,
 ) {
-    let node = SvsNode::with_boot_seq(&local_name, config.local_boot, config.local_seq);
-    let local_key = node.local_key().to_string();
-
-    let mut current_mapping: Option<Bytes> = None;
-
-    let mut next_send = Instant::now() + jitter_interval(&config);
-
-    // Suppression state (ndn-svs `SVSyncCore`). When `suppressing` is set,
-    // `next_send` is a *short* reply-to-stale deadline rather than the
-    // steady periodic one, and `recorded` accumulates every peer vector
-    // (keyed node → (boot, seq)) seen during the window so the timer can
-    // check — at fire time — whether someone else already corrected the
-    // laggard.
-    let mut suppressing = false;
-    let mut recorded: HashMap<String, (u64, u64)> = HashMap::new();
-
-    // Gap updates awaiting delivery on `update_tx`, coalesced per publisher
-    // (N-11 / NS-7). The select loop must **never** block on
-    // `update_tx.send(update).await`: while it is parked there, every other
-    // arm — `ack_rx`, `publish_rx`, `recv` — is unreachable, so a consumer
-    // that is itself blocked sending us an ack (two-phase / `auto_ack = false`)
-    // deadlocks against us, and a burst that re-advertises the whole unacked
-    // range each round fills the 256-deep channel and wedges permanently
-    // (~44 Blocks into a 400-Block catch-up in the field). Instead, gaps are
-    // buffered here and delivered from a dedicated `update_tx.reserve()` arm
-    // that only commits to a send once capacity exists. Coalescing per
-    // publisher bounds this to one entry per producer (≤ the tracked-producer
-    // cap): a re-advertised range just widens the pending `[low, high]`, and a
-    // dropped/late round is re-derived from the next Sync Interest.
-    let mut pending: HashMap<String, SyncUpdate> = HashMap::new();
+    let mut gc = GroupCore::new(group, &local_name, config, update_tx, observed);
 
     loop {
+        // Deliver buffered gaps without blocking (N-11): a blocking send here
+        // would wedge the loop against a two-phase consumer. Anything the full
+        // channel refuses stays in `pending`; a short retry cap on the sleep
+        // re-attempts it promptly without a busy-loop.
+        let more = gc.drain_pending_try();
+        let now = Instant::now();
+        let mut wake = gc.next_send;
+        if more {
+            wake = wake.min(now + PENDING_RETRY);
+        }
+
         tokio::select! {
             _ = cancel.cancelled() => break,
 
-            // Drain one coalesced gap update as soon as the update channel has
-            // room. Guarded on `!pending.is_empty()` so the arm is disabled
-            // (and `reserve()` never polled) when there is nothing to deliver —
-            // no busy-loop. `reserve()` awaits capacity without blocking the
-            // other arms; an `Err` means the consumer dropped its receiver, so
-            // the group is gone and we exit.
-            permit = update_tx.reserve(), if !pending.is_empty() => {
-                match permit {
-                    Ok(permit) => {
-                        if let Some(key) = pending.keys().next().cloned()
-                            && let Some(update) = pending.remove(&key)
-                        {
-                            permit.send(update);
-                        }
-                    }
-                    Err(_) => break,
+            // Portable `sleep_until(wake)`. On wake, emit only if the *periodic*
+            // deadline is actually due — a shorter pending-retry wake just loops
+            // back to re-drain.
+            _ = rt::sleep(wake.saturating_duration_since(now)) => {
+                if gc.next_send <= Instant::now() {
+                    gc.on_timer(&send).await;
                 }
             }
 
-            // Portable equivalent of `sleep_until(next_send)` — recomputed each
-            // loop iteration, so a reset of `next_send` reschedules correctly.
-            _ = rt::sleep(next_send.saturating_duration_since(Instant::now())) => {
-                if suppressing {
-                    // Reply-to-stale: only emit if the union of vectors
-                    // recorded during the window still does not cover us —
-                    // i.e. nobody else has announced our data yet.
-                    suppressing = false;
-                    let snapshot = node.snapshot().await;
-                    let recorded_sv: Vec<StateEntry> = recorded
-                        .iter()
-                        .filter_map(|(k, (b, s))| {
-                            k.parse::<Name>().ok().map(|name| StateEntry {
-                                name,
-                                boot: *b,
-                                seq: *s,
-                            })
-                        })
-                        .collect();
-                    recorded.clear();
-                    if !remote_covers_local(&snapshot, &recorded_sv) {
-                        send_sync_interest(&group, &node, &send, current_mapping.clone(), &config.signer, config.dialect).await;
-                    }
-                    next_send = Instant::now() + jitter_interval(&config);
-                } else {
-                    send_sync_interest(&group, &node, &send, current_mapping.clone(), &config.signer, config.dialect).await;
-                    next_send = Instant::now() + jitter_interval(&config);
-                }
-            }
-
-            Some(raw) = recv.recv() => {
-                // Authenticate before touching the state vector — an
-                // unsigned/forged Interest must never reach `merge`
-                // (gap #2). `Insecure` accepts everything.
-                if let Err(reason) = config.validator.validate(&raw) {
-                    tracing::trace!(?reason, "svs: rejected inbound sync interest");
-                    continue;
-                }
-                if let Some((remote_sv, peer_mappings)) = parse_sync_interest(&group, &raw, config.dialect) {
-                    // N-9: record the observed per-name high-water from this
-                    // authenticated advertisement — every entry, INCLUDING one
-                    // naming us (the merge below drops self by authoritative-for-
-                    // self, so this is the only place a publisher sees the group's
-                    // carriage of its own data). Strictly observational: it never
-                    // feeds the merge/gap/fetch decisions that follow.
-                    for e in &remote_sv {
-                        observed.record(&e.name, e.boot, e.seq);
-                    }
-                    let snapshot = node.snapshot().await;
-                    let covers_local = remote_covers_local(&snapshot, &remote_sv);
-                    // The peer is missing data we already hold (we are ahead
-                    // on at least one entry). `covers_local == false` is
-                    // necessary but not sufficient — they could be ahead on a
-                    // *different* entry — so test strict local-ahead directly.
-                    let local_ahead = local_ahead_of_remote(&snapshot, &remote_sv);
-
-                    // D-44 / N-3: eager merge (default) advances the vector now; deferred merge holds
-                    // advancement until the app acks each validated seq (so a rejected item can't poison).
-                    let gaps = if config.auto_ack {
-                        node.merge(&remote_sv).await
-                    } else {
-                        node.merge_deferred(&remote_sv).await
-                    };
-                    for (peer_key, low, high) in gaps {
-                        if peer_key == local_key { continue; }
-                        let mapping = peer_mappings.get(&peer_key).cloned();
-                        // `peer_key` is the publisher's full NDN name rendered
-                        // as a URI; parse it back into a component-wise Name so
-                        // consumers can append a segment/seq to form a real
-                        // fetch prefix (not one opaque component holding "/a").
-                        let fetch_name = peer_key
-                            .parse::<Name>()
-                            .unwrap_or_else(|_| group.clone().append(&peer_key));
-                        let update = SyncUpdate {
-                            publisher: peer_key.clone(),
-                            name: fetch_name,
-                            low_seq: low,
-                            high_seq: high,
-                            mapping,
-                            // The sync layer only knows the advertiser; a distinct relayer (D-40 A.2)
-                            // is filled in by the consumer from the fetch face when it matters.
-                            serving_party: None,
-                        };
-                        // Buffer instead of `update_tx.send(...).await` (N-11 /
-                        // NS-7): never park the select loop on delivery. The
-                        // dedicated `reserve()` arm drains this once the channel
-                        // has room; coalescing per publisher keeps a
-                        // re-advertised range from growing the buffer.
-                        coalesce_pending(&mut pending, update);
-                    }
-
-                    if local_ahead {
-                        // Schedule (or extend) a suppressed catch-up reply.
-                        record_vector(&mut recorded, &remote_sv);
-                        if !suppressing {
-                            suppressing = true;
-                            next_send = Instant::now() + suppression_delay(&config);
-                        }
-                    } else if covers_local {
-                        // Peer is at least as new as us: steady-state
-                        // suppression — defer our next periodic Interest.
-                        suppressing = false;
-                        recorded.clear();
-                        next_send = Instant::now() + jitter_interval(&config);
-                    }
-                    // else: incomparable with no local-ahead entry (we were
-                    // strictly behind); we merged and will fetch — stay on the
-                    // existing schedule.
-                }
-            }
+            Some(raw) = recv.recv() => { gc.on_inbound(&raw, &send).await; }
 
             Some((pub_name, mapping)) = publish_rx.recv() => {
-                current_mapping = mapping;
-                node.advance().await;
                 let _ = pub_name;
-                // A fresh local publication is authoritative: leave any
-                // suppression window and announce immediately.
-                suppressing = false;
-                recorded.clear();
-                send_sync_interest(&group, &node, &send, current_mapping.clone(), &config.signer, config.dialect).await;
-                next_send = Instant::now() + jitter_interval(&config);
+                gc.on_publish(mapping, &send).await;
             }
 
-            // D-44 / N-3 two-phase commit: the app validated + stored `(publisher, seq)` — advance the
-            // deferred state vector for it now. (A no-op under `auto_ack`, where merges already advanced.)
-            Some((key, seq)) = ack_rx.recv() => {
-                node.ack(&key, seq).await;
-            }
+            Some((key, seq)) = ack_rx.recv() => { gc.on_ack(&key, seq).await; }
         }
     }
 }
+
+/// How long the driver waits before re-attempting a gap update the consumer's
+/// (full) channel refused — short enough to feel prompt, long enough not to spin.
+pub(crate) const PENDING_RETRY: Duration = Duration::from_millis(5);
 
 /// Merge `update` into the per-publisher pending-delivery buffer (N-11 /
 /// NS-7). At most one entry per publisher: a re-advertised or widened range
