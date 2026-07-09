@@ -32,7 +32,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
-use tokio::sync::{Mutex, Semaphore, mpsc, oneshot};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use ndn_packet::encode::{DataBuilder, InterestBuilder};
@@ -678,41 +678,17 @@ impl SvSync {
     /// flight. Returns payloads in sequence order; a `None` entry is a
     /// publication that could not be retrieved within the retry budget.
     pub async fn fetch_range(&self, node: &Name, low: u64, high: u64) -> Vec<Option<Bytes>> {
-        if high < low {
-            return Vec::new();
-        }
-        let sem = Arc::new(Semaphore::new(self.fetch_window.max(1)));
-        let (res_tx, mut res_rx) = mpsc::channel::<(u64, Option<Bytes>)>((high - low + 1) as usize);
-
-        for seq in low..=high {
-            // Acquire before spawning → at most `fetch_window` in flight.
-            let permit = Arc::clone(&sem).acquire_owned().await.expect("semaphore");
-            let name = svs_data_name(node, &self.group, seq);
-            let net_out = self.net_out.clone();
-            let pending = Arc::clone(&self.pending);
-            let retry = self.retry.clone();
-            let timeout = self.fetch_timeout;
-            let res_tx = res_tx.clone();
-            rt::spawn(async move {
-                let _permit = permit;
-                let payload =
-                    match express_with_retry(name, &net_out, &pending, &retry, timeout).await {
-                        Some(wire) => Data::decode(wire)
-                            .ok()
-                            .map(|d| d.content().cloned().unwrap_or_default()),
-                        None => None,
-                    };
-                let _ = res_tx.send((seq, payload)).await;
-            });
-        }
-        drop(res_tx);
-
-        let mut out: Vec<(u64, Option<Bytes>)> = Vec::with_capacity((high - low + 1) as usize);
-        while let Some(item) = res_rx.recv().await {
-            out.push(item);
-        }
-        out.sort_by_key(|(s, _)| *s);
-        out.into_iter().map(|(_, p)| p).collect()
+        crate::transfer::windowed_fetch_wires(
+            low,
+            high,
+            self.fetch_window,
+            |seq| svs_data_name(node, &self.group, seq),
+            self.segment_express(),
+        )
+        .await
+        .into_iter()
+        .map(|w| w.and_then(crate::transfer::wire_content))
+        .collect()
     }
 
     /// Await the next [`SyncUpdate`] (a peer advanced).

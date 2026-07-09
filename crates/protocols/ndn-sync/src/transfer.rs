@@ -87,15 +87,25 @@ where
         .collect()
 }
 
-/// Fetch `base/seg=lo ..= hi` with up to `window` Interests in flight,
-/// returning each segment's Data **content** in segment order (`None` =
-/// that segment couldn't be fetched). Concurrency is bounded by a
-/// semaphore — pass 100 segments and only `window` run at once.
-pub async fn windowed_fetch(
-    base: &Name,
+/// The windowed pipeline itself, generalized over naming: fetch `name_of(i)`
+/// for `i ∈ lo..=hi` with up to `window` Interests in flight, returning each
+/// reply's raw Data **wire** in index order (`None` = that index couldn't be
+/// fetched). Concurrency is bounded by a semaphore — pass 100 indices and only
+/// `window` run at once.
+///
+/// This is the one pipeline every windowed fetch in this crate rides
+/// ([`windowed_fetch`] names by segment; `SvSync::fetch_range` names by
+/// [`svs_data_name`](crate::svsync::svs_data_name)). It returns wires, not
+/// decoded content, so a caller that must pair each reply to the index it asked
+/// for — e.g. a chain catch-up feeding an **in-order** admission gate — can
+/// decode and name-check every reply itself: with N Interests outstanding,
+/// out-of-order arrival is exactly where a stale reply could mispair, and
+/// nothing here may absorb the evidence.
+pub async fn windowed_fetch_wires(
     lo: u64,
     hi: u64,
     window: usize,
+    name_of: impl Fn(u64) -> Name,
     express: Express,
 ) -> Vec<Option<Bytes>> {
     if hi < lo {
@@ -106,26 +116,46 @@ pub async fn windowed_fetch(
     for s in lo..=hi {
         // Acquire before spawning → at most `window` in flight.
         let permit = Arc::clone(&sem).acquire_owned().await.expect("semaphore");
-        let name = base.clone().append_segment(s);
+        let name = name_of(s);
         let express = Arc::clone(&express);
         let tx = tx.clone();
         rt::spawn(async move {
             let _permit = permit;
-            let content = express(name).await.and_then(|wire| {
-                Data::decode(wire)
-                    .ok()
-                    .map(|d| d.content().cloned().unwrap_or_default())
-            });
-            let _ = tx.send((s, content)).await;
+            let wire = express(name).await;
+            let _ = tx.send((s, wire)).await;
         });
     }
     drop(tx);
-    let mut out: Vec<(u64, Option<Bytes>)> = Vec::new();
+    let mut out: Vec<(u64, Option<Bytes>)> = Vec::with_capacity((hi - lo + 1) as usize);
     while let Some(item) = rx.recv().await {
         out.push(item);
     }
     out.sort_by_key(|(s, _)| *s);
-    out.into_iter().map(|(_, p)| p).collect()
+    out.into_iter().map(|(_, w)| w).collect()
+}
+
+/// Decode a fetched Data wire to its content (empty content = empty bytes).
+pub(crate) fn wire_content(wire: Bytes) -> Option<Bytes> {
+    Data::decode(wire)
+        .ok()
+        .map(|d| d.content().cloned().unwrap_or_default())
+}
+
+/// Fetch `base/seg=lo ..= hi` with up to `window` Interests in flight,
+/// returning each segment's Data **content** in segment order (`None` =
+/// that segment couldn't be fetched). Rides [`windowed_fetch_wires`].
+pub async fn windowed_fetch(
+    base: &Name,
+    lo: u64,
+    hi: u64,
+    window: usize,
+    express: Express,
+) -> Vec<Option<Bytes>> {
+    windowed_fetch_wires(lo, hi, window, |s| base.clone().append_segment(s), express)
+        .await
+        .into_iter()
+        .map(|w| w.and_then(wire_content))
+        .collect()
 }
 
 #[cfg(test)]
@@ -167,6 +197,36 @@ mod tests {
                 .build()
         });
         assert_eq!(segs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn windowed_fetch_wires_orders_by_index_under_reversed_arrival() {
+        // Arbitrary (non-segment) naming; later indices answer FASTER than earlier
+        // ones, so arrival order is fully reversed — the returned vec must still be
+        // index-ordered, and each slot must carry the wire of ITS index's name.
+        let express: Express = Arc::new(|name: Name| {
+            Box::pin(async move {
+                let idx: u64 = name.to_string().rsplit('/').next().unwrap().parse().unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(50 - 10 * idx)).await;
+                if idx == 2 {
+                    None // one hole
+                } else {
+                    Some(DataBuilder::new(name, format!("pub{idx}").as_bytes()).build())
+                }
+            })
+        });
+        let out =
+            windowed_fetch_wires(0, 4, 8, |i| n(&format!("/chain/A/{i}")), express).await;
+        assert_eq!(out.len(), 5);
+        for (i, slot) in out.iter().enumerate() {
+            if i == 2 {
+                assert!(slot.is_none(), "the hole stays a hole at its own index");
+                continue;
+            }
+            let d = Data::decode(slot.clone().unwrap()).unwrap();
+            assert_eq!(*d.name, n(&format!("/chain/A/{i}")), "slot {i} carries its own reply");
+            assert_eq!(d.content().unwrap(), format!("pub{i}").as_bytes());
+        }
     }
 
     #[tokio::test]

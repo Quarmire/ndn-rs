@@ -158,6 +158,14 @@ impl Node {
         Arc::clone(&self.demux) as Arc<dyn Connection>
     }
 
+    /// The demultiplexer itself, un-erased — for
+    /// [`DemuxConnection::fetch_correlated`]: N Interests in flight over this
+    /// node's one connection, each reply routed to its waiter **by name** (the
+    /// windowed catch-up shape; a bare `Consumer` is one-outstanding by design).
+    pub fn demux(&self) -> Arc<DemuxConnection> {
+        Arc::clone(&self.demux)
+    }
+
     fn consumer(&self) -> Consumer {
         Consumer::new(self.connection())
     }
