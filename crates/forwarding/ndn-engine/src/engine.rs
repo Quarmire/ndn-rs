@@ -846,6 +846,18 @@ impl ShutdownHandle {
         self.cancel.cancel();
         self.tracker.join_all().await;
     }
+
+    /// Run the engine for the rest of the process's life: consume the handle, giving up
+    /// cooperative shutdown. The named replacement for the `std::mem::forget(shutdown)` idiom —
+    /// same effect, but it reads as intent instead of a leak workaround. Teardown then happens
+    /// at process exit (sockets close abruptly), which is exactly what a daemon or demo that
+    /// never shuts down early wants.
+    pub fn detach(self) {
+        // Deliberate: the cancellation token and task-drain receivers must outlive every
+        // engine task, i.e. the whole process. (Dropping them is inert today — tokens don't
+        // cancel on drop — but `detach()` pins the contract, not the implementation detail.)
+        std::mem::forget(self);
+    }
 }
 
 /// Per-face outbound send task, preserving per-face ordering (critical for
