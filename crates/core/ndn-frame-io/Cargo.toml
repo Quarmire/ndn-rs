@@ -12,6 +12,7 @@ classification = "spec"
 [dependencies]
 ndn-radio-hal = { workspace = true }
 ndn-transport = { workspace = true }
+ndn-time      = { workspace = true }
 bytes         = { workspace = true, features = ["std"] }
 async-trait   = { workspace = true }
 tokio         = { workspace = true, features = ["sync", "rt", "net", "time"] }

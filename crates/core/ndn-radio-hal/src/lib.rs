@@ -543,6 +543,56 @@ pub trait RadioTime: Send + Sync {
     }
 }
 
+/// A face's named-time service profile (design §15) — **trait-derived, not a static table**.
+///
+/// Rather than a per-driver lookup of "what can this radio do for time," the profile is
+/// *computed* from the capability traits a backend already implements: its [`RadioTime`] link
+/// clocks and its [`RadioTime`]/[`RadioKnobs::tx_discipline`] transmit discipline. A new radio
+/// gains a correct time profile the moment it reports its clocks and discipline — nothing here
+/// needs editing. The timekeeper reads this to decide what a face may contribute: whether it can
+/// source common-view (needs a shared-counter RX stamp), how tightly it stamps arrivals, and how
+/// bounded its transmit timing is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FaceTimeProfile {
+    /// The best (tightest, best-first) link clock the face exposes, or `None` if it stamps
+    /// nothing. A per-frame [`RadioClockKind::FreeRunRxStamp`] beats a gated [`RadioClockKind::PortTsf`]
+    /// beats a [`RadioClockKind::HostRecv`] software stamp.
+    pub best_clock: Option<RadioClockKind>,
+    /// The precision (ns) of that best clock's stamps, or `None` if the face stamps nothing. This
+    /// is the floor on any offset uncertainty the face can produce (design §9 self-consistency).
+    pub stamp_precision_ns: Option<u32>,
+    /// The transmit-timing discipline the face can promise (Cut 2).
+    pub tx_discipline: TxDiscipline,
+    /// Whether the face can contribute common-view observations: it needs a per-frame RX stamp on a
+    /// stable shared counter (a [`RadioClockKind::FreeRunRxStamp`]), so two receivers' stamps of one
+    /// event are differenced meaningfully. A host-recv-only face cannot (its stamp jitter swamps the
+    /// inter-receiver offset).
+    pub can_common_view: bool,
+}
+
+impl FaceTimeProfile {
+    /// Derive the profile from a radio's time surface and transmit discipline (design §15). Pass
+    /// the backend's own [`RadioTime`] and the [`TxDiscipline`] it promises. `time_sources()` is
+    /// best-first, so the head is the best clock.
+    pub fn derive(time: &dyn RadioTime, tx_discipline: TxDiscipline) -> Self {
+        let sources = time.time_sources();
+        let best = sources.first();
+        let best_clock = best.map(|s| s.kind);
+        let stamp_precision_ns = best.map(|s| s.precision_ns);
+        // Common-view needs a per-frame RX stamp on a shared free-running counter; a gated TSF or a
+        // host stamp does not qualify (design §M3 / measure::common_view).
+        let can_common_view = sources
+            .iter()
+            .any(|s| s.kind == RadioClockKind::FreeRunRxStamp);
+        Self {
+            best_clock,
+            stamp_precision_ns,
+            tx_discipline,
+            can_common_view,
+        }
+    }
+}
+
 /// A radio's static capability profile — band, rates, channels, duty cycle, etc. Implemented
 /// per backend so the heterogeneous-radio selection layer reasons about every radio uniformly
 /// (which one to pick for a given reach/rate/airtime) instead of hard-coding per-driver

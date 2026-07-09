@@ -22,6 +22,7 @@
 //!   to one receiver), so the result's provenance is forced `distance_bounded =
 //!   false` regardless of what the caller passed — safety by construction.
 
+use crate::channel_obs::C_M_PER_S;
 use crate::interval::TimeInterval;
 use crate::provenance::{Measured, MeasurementProvenance};
 
@@ -75,6 +76,35 @@ pub fn two_way(
         rtt_ns: rtt,
         mean_path_delay_ns: mean_path,
     }
+}
+
+/// T1 distance bound from a rapid challenge–response, measured on the **local clock alone** —
+/// the primitive that justifies setting [`MeasurementProvenance::distance_bounded`].
+///
+/// Unlike [`two_way`]'s `rtt_ns` — which nets out the remote's *self-reported* turnaround
+/// (`t2`,`t3`), so a dishonest prover can shrink it to feign proximity — this uses only the
+/// verifier's own send/receive stamps `t1_local_ns`,`t4_local_ns` and a **protocol-fixed**
+/// `turnaround_floor_ns`: the least time the prover could possibly answer in, a constant the
+/// verifier trusts, never a value the prover transmits. The prover can only answer *slower* than
+/// the floor, and a relay/wormhole only *adds* propagation, so the implied one-way distance is a
+/// sound **upper bound** — an emitter cannot forge being *closer* than it is. Returns `true` iff
+/// that bound is within `max_plausible_m`, i.e. the emitter is provably local and the sample clears
+/// the T1 floor ([`crate::provenance::T1Requirement`]).
+///
+/// `max_plausible_m` is the deployment's largest physically-credible emitter distance (link range
+/// plus margin); a bound beyond it means added delay — a relay — and the sample is *not* bounded.
+pub fn distance_bounded(
+    t1_local_ns: i64,
+    t4_local_ns: i64,
+    turnaround_floor_ns: u64,
+    max_plausible_m: f64,
+) -> bool {
+    // Elapsed on the local clock only; the true prover turnaround is at least the floor, so
+    // subtracting the floor keeps the path RTT an over-estimate (upper bound stays sound).
+    let elapsed = (t4_local_ns as i128 - t1_local_ns as i128).max(0) as u64;
+    let path_rtt = elapsed.saturating_sub(turnaround_floor_ns);
+    let one_way_m = C_M_PER_S * (path_rtt as f64) * 0.5e-9;
+    one_way_m <= max_plausible_m
 }
 
 /// M2 — one-way offset from a stamped broadcast.
@@ -318,6 +348,34 @@ mod tests {
             !m.prov.distance_bounded,
             "common-view can't bound distance (T1)"
         );
+    }
+
+    #[test]
+    fn distance_bound_passes_when_local_and_fails_a_relay() {
+        // 100 m link, ~300 ns one-way → ~667 ns round trip; 500 ns turnaround floor.
+        let floor = 500;
+        let rtt_100m = (2.0 * 100.0 / C_M_PER_S / 1e-9) as i64; // ns
+        let t1 = 1_000_000;
+        let t4_local = t1 + floor as i64 + rtt_100m;
+        // Within a 300 m plausible bound → provably local.
+        assert!(distance_bounded(t1, t4_local, floor, 300.0));
+        // A relay adds ~10 µs of tunnel delay → the implied distance blows past 300 m.
+        let t4_relayed = t4_local + 10_000;
+        assert!(!distance_bounded(t1, t4_relayed, floor, 300.0));
+    }
+
+    #[test]
+    fn distance_bound_cannot_be_forged_closer_by_shrinking_turnaround() {
+        // The prover cannot answer faster than the floor, so the verifier subtracts only the
+        // trusted floor — a prover that "claims" a smaller turnaround has no timestamp here to lie
+        // with. A genuinely local emitter within the floor+path passes; nothing the prover sends
+        // enters the computation.
+        let floor = 1_000;
+        let t1 = 0;
+        let t4 = t1 + floor as i64 + 300; // ~45 m of path
+        assert!(distance_bounded(t1, t4, floor, 100.0));
+        // If the round trip is entirely floor (co-located), distance is ~0 — still local.
+        assert!(distance_bounded(t1, t1 + floor as i64, floor, 1.0));
     }
 
     #[test]

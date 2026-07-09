@@ -9,10 +9,12 @@
 //! (e.g. the RTL8812 USB backend) live with their face crate and implement
 //! [`FrameIo`] against this surface.
 
+pub mod common_view_pool;
 pub mod event_id;
 pub mod frame;
 pub mod radiotap;
 
+pub use common_view_pool::{CommonViewPool, InterReceiverOffset, ReceiverId};
 pub use event_id::EventId;
 
 /// The data-plane radio-HAL contract now lives in `ndn-radio-hal`; re-exported
