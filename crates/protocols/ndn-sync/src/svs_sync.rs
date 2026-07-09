@@ -195,6 +195,56 @@ impl Default for SvsConfig {
     }
 }
 
+/// Named-environment presets. [`Default`] carries the ndnSVS reference tuning (30 s interval,
+/// ±3 s jitter) — lab values that every deployed app ends up discovering and overriding by
+/// hand. Pick the environment instead of reverse-engineering the constants; every other field
+/// stays at the default, and struct-update syntax layers app-specific overrides on top:
+///
+/// ```
+/// # use ndn_sync::SvsConfig;
+/// let cfg = SvsConfig { auto_ack: false, ..SvsConfig::lan() };
+/// ```
+impl SvsConfig {
+    /// Local network / localhost: sub-millisecond RTT, loss is rare, convergence should feel
+    /// immediate. Tight periodic (1 s ± 100 ms) and a short suppression window (50 ms) — a
+    /// laggard is corrected in tens of milliseconds, and the steady-state cost (≈ one Sync
+    /// Interest per second per group) is nothing on a LAN.
+    pub fn lan() -> Self {
+        Self {
+            sync_interval: Duration::from_secs(1),
+            jitter_ms: 100,
+            suppression_period: Duration::from_millis(50),
+            ..Self::default()
+        }
+    }
+
+    /// Internet paths: tens-to-hundreds of ms RTT, transient loss, links worth not chattering
+    /// on. Slower periodic (15 s ± 2 s) and a wide suppression window (500 ms) so one member's
+    /// catch-up reply has time to silence the rest of the group across real latency spreads.
+    pub fn wan() -> Self {
+        Self {
+            sync_interval: Duration::from_secs(15),
+            jitter_ms: 2000,
+            suppression_period: Duration::from_millis(500),
+            ..Self::default()
+        }
+    }
+
+    /// Deterministic simulation (ndn-sim's `VirtualKernel` and friends): fast periodic
+    /// (500 ms) with **zero** interval jitter, so runs replay identically and tests converge
+    /// in a few virtual seconds. The suppression delay keeps its default mean — it is
+    /// exponentially drawn from the thread-local `fastrand` RNG, so a test that wants full
+    /// schedule reproducibility seeds that (`fastrand::seed(..)`), as the ndn-sim harnesses
+    /// do. Virtual time makes the tight cadence free.
+    pub fn sim() -> Self {
+        Self {
+            sync_interval: Duration::from_millis(500),
+            jitter_ms: 0,
+            ..Self::default()
+        }
+    }
+}
+
 /// Spawn the SVS background task: periodic Sync Interests, merge of
 /// incoming vectors, and gap [`SyncUpdate`]s on the returned handle.
 pub fn join_svs_group(
@@ -711,6 +761,45 @@ mod tests {
 
     /// Default test dialect.
     const V2: WireDialect = WireDialect::V2;
+
+    /// The named-environment presets carry sensible per-environment tunings and change
+    /// nothing else — an app picks an environment instead of reverse-engineering the
+    /// reference constants.
+    #[test]
+    fn environment_presets_carry_sane_tunings() {
+        let (lan, wan, sim) = (SvsConfig::lan(), SvsConfig::wan(), SvsConfig::sim());
+        let dflt = SvsConfig::default();
+
+        // The orderings that define the environments.
+        assert!(lan.sync_interval < wan.sync_interval, "lan is tighter than wan");
+        assert!(sim.sync_interval <= lan.sync_interval, "sim is at least as tight as lan");
+        assert!(wan.sync_interval <= dflt.sync_interval, "wan stays under the lab default");
+        assert!(
+            lan.suppression_period < wan.suppression_period,
+            "wan gives catch-up replies room across real latency spreads"
+        );
+        assert_eq!(sim.jitter_ms, 0, "sim is deterministic: no interval jitter");
+
+        // Internal coherence: jitter and suppression stay well inside the periodic interval.
+        for (tag, c) in [("lan", &lan), ("wan", &wan), ("sim", &sim), ("default", &dflt)] {
+            assert!(
+                Duration::from_millis(c.jitter_ms) < c.sync_interval,
+                "{tag}: jitter must not swamp the interval"
+            );
+            assert!(
+                c.suppression_period < c.sync_interval,
+                "{tag}: suppression must resolve before the next periodic round"
+            );
+        }
+
+        // Presets are tuning-only: posture and plumbing stay at the defaults.
+        for c in [&lan, &wan, &sim] {
+            assert!(c.auto_ack, "presets do not flip the commit posture");
+            assert_eq!(c.channel_capacity, dflt.channel_capacity);
+            assert_eq!(c.local_boot, 0);
+            assert_eq!(c.local_seq, 0);
+        }
+    }
 
     /// Build a remote state vector (boot = 0) from `(node, seq)` pairs.
     fn sv(entries: &[(&str, u64)]) -> Vec<StateEntry> {
