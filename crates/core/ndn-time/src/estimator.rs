@@ -240,6 +240,7 @@ impl CoupledEstimator {
 
     /// EKF scalar-measurement update: innovation `z − h_pred`, gain `K = P Hᵀ / (H P Hᵀ + r)`,
     /// `x += K·innov`, `P −= K (H P)`. Scalar innovation covariance → no matrix inversion.
+    #[allow(clippy::needless_range_loop)] // matrix-vector math indexing several arrays in lockstep
     fn update_scalar(&mut self, h: &[f64; N], h_pred: f64, z: f64, r: f64) {
         // PHt = P·Hᵀ  (P symmetric)
         let mut pht = [0.0; N];
