@@ -74,6 +74,8 @@ ndn-packet    = { workspace = true, features = ["std-wasm"] }
 tokio         = { workspace = true, features = ["sync", "macros", "rt"] }
 
 [dev-dependencies]
+# Captures the FIB shadow diagnostic in tests/fib_shadow_diagnostic.rs.
+tracing-subscriber = { workspace = true, features = ["fmt", "env-filter"] }
 criterion     = { workspace = true }
 ndn-strategy  = { workspace = true }
 ndn-security  = { workspace = true }

@@ -39,13 +39,17 @@ struct FibTrie {
 
 impl FibTrie {
     fn lpm(&self, name: &Name) -> Option<Arc<FibEntry>> {
-        let mut best = self.entry.clone();
+        self.lpm_with_depth(name).map(|(_, e)| e)
+    }
+
+    fn lpm_with_depth(&self, name: &Name) -> Option<(usize, Arc<FibEntry>)> {
+        let mut best = self.entry.clone().map(|e| (0, e));
         let mut node = self;
-        for comp in name.components() {
+        for (i, comp) in name.components().iter().enumerate() {
             match node.children.get(comp) {
                 Some(child) => {
-                    if child.entry.is_some() {
-                        best = child.entry.clone();
+                    if let Some(e) = &child.entry {
+                        best = Some((i + 1, Arc::clone(e)));
                     }
                     node = child;
                 }
@@ -112,6 +116,18 @@ impl Fib {
 
     pub fn lpm(&self, name: &Name) -> Option<Arc<FibEntry>> {
         self.trie.load().lpm(name)
+    }
+
+    /// LPM returning the matched entry AND the matched prefix depth (component count of
+    /// the winning trie node). The diagnostic seam for the silent-shadow bug class: LPM
+    /// returns exactly ONE entry, so a route and a registration at different prefix
+    /// lengths never merge — whichever is longer silently wins, and cost cannot save
+    /// the loser because it is discarded before the strategy ever runs. Making the
+    /// MATCHED prefix visible (not just the queried name) is what turns "zero packets,
+    /// no error" into a one-line diagnosis. Depth-only — the hot path pays no
+    /// allocation; render the prefix only when a trace subscriber is enabled.
+    pub fn lpm_with_depth(&self, name: &Name) -> Option<(usize, Arc<FibEntry>)> {
+        self.trie.load().lpm_with_depth(name)
     }
 
     pub fn add_nexthop(&self, prefix: &Name, face_id: FaceId, cost: u32) {

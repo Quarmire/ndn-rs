@@ -166,13 +166,27 @@ impl StrategyStage {
         // ForwardingHint: FIB lookup may target the hint's delegation rather
         // than the Interest name (the PIT still keys on the Interest name).
         let fib_name = self.fib_lookup_name(&ctx, &name);
-        let fib_entry_arc = self.fib.lpm(&fib_name);
+        let fib_lookup = self.fib.lpm_with_depth(&fib_name);
+        let fib_entry_arc = fib_lookup.as_ref().map(|(_, e)| Arc::clone(e));
         let fib_entry_ref = fib_entry_arc.as_deref();
 
-        if let Some(e) = fib_entry_ref {
-            trace!(target: t::FWD_FIB, face=%ctx.face_id, name=%name, matched=true, prefix=%name, nexthops=?e.nexthops.iter().map(|nh| (nh.face_id, nh.cost)).collect::<Vec<_>>(), "fib lookup");
+        // The longest-prefix-match diagnostic (skyfall FIELD-REPORT-2 SS2): the event names
+        // the MATCHED ENTRY'S prefix, not the queried name — LPM returns exactly one entry,
+        // so a coarse route and an exact registration at different lengths never merge, and
+        // the loser vanishes silently ("zero packets, no error"). With this event, the
+        // shadow is one line: the face you expected is absent from the matched entry's
+        // nexthops, and `matched_prefix` tells you which entry actually won.
+        if let Some((depth, e)) = &fib_lookup {
+            if tracing::enabled!(target: t::FWD_FIB, tracing::Level::TRACE) {
+                let matched_prefix =
+                    ndn_packet::Name::from_components(fib_name.components().iter().take(*depth).cloned());
+                trace!(target: t::FWD_FIB, face=%ctx.face_id, name=%name, matched=true,
+                    matched_prefix=%matched_prefix, matched_depth=*depth,
+                    nexthops=?e.nexthops.iter().map(|nh| (nh.face_id, nh.cost)).collect::<Vec<_>>(),
+                    "fib lookup: Interest matched THIS entry; an expected face missing from these nexthops sits on a shadowed entry");
+            }
         } else {
-            trace!(target: t::FWD_FIB, face=%ctx.face_id, name=%name, matched=false, prefix=%name, "fib lookup");
+            trace!(target: t::FWD_FIB, face=%ctx.face_id, name=%name, matched=false, "fib lookup: no entry");
         }
 
         let strategy_fib: Option<ndn_strategy::FibEntry> =
