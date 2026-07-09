@@ -84,6 +84,22 @@ pub(crate) fn read_tlv(cursor: &[u8]) -> Option<(u64, &[u8], &[u8])> {
 }
 
 /// Read one TLV var-number from the front of `cursor`.
+///
+/// **Deliberately lenient on decode (F28, RULED accept-and-document):** the
+/// `0xFD`/`0xFE`/`0xFF` arms accept any 2/4/8-byte value without a minimal-width
+/// check, so a non-minimal alias (e.g. `0xFD 0x00 0x05` for `5`) decodes to its
+/// value rather than being rejected. This is **intentional parity with the NDN
+/// reference decoders** ndn-sync shares this SVS wire with — ndn-cxx
+/// `readVarNumber` and ndnd `ReadTLNum` are both lenient the same way (all three
+/// encoders emit minimal; none reject non-minimal on decode). Making this reader
+/// stricter than the reference would only move the divergence, not close a
+/// gap that is network-wide by nature.
+///
+/// Canonicity that NDF needs is enforced **above the waterline**, at the NDF
+/// Block layer's own strict header decoder — not here, in the shared sync wire.
+/// The normative question ("must NDN-TLV decoders reject non-minimal
+/// VAR-NUMBER?") is a spec-level clarification, not an ndn-sync bug. Full
+/// package: `docs/specs/f28-non-minimal-varnum-decode.md`.
 pub(crate) fn read_varnumber(cursor: &[u8]) -> Option<(u64, &[u8])> {
     let (&first, rest) = cursor.split_first()?;
     match first {

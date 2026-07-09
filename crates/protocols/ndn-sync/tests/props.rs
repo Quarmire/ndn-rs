@@ -114,21 +114,22 @@ proptest! {
     /// 0xFD/0xFE/0xFF arms accept any 2/4/8-byte value with no minimality check), so it accepts
     /// the alias — un-ignore this to see it go RED against the current decoder.
     ///
-    /// **Do NOT un-ignore as a silent regression gate.** Verified against source (2026-07-09):
-    /// the reference decoders ndn-sync shares this wire with are BOTH lenient too — ndn-cxx
-    /// `readVarNumber` (`encoding/tlv.hpp`) and ndnd `ReadTLNum` (`std/encoding/primitives.go`)
-    /// accept non-minimal VarNums with no check. ndn-sync MATCHES them; it is not the outlier, and
-    /// all three decode the same bytes to the same value (a canonicity gap, not an interop
-    /// divergence). Tightening ndn-sync alone would FORK the de-facto contract. Low severity (no
-    /// panic, no unbounded work — the SY-1/SY-2 caps still hold). The full interop matrix, severity,
-    /// options and recommendation (accept-and-document + raise a spec clarification, do not tighten
-    /// unilaterally) are in `docs/specs/f28-non-minimal-varnum-decode.md`. This repro stays
-    /// red-capable-on-demand for the maintainer; promote it to a live gate only after an
-    /// ecosystem-coordinated strict-decode decision.
+    /// **RULED (b) accept-and-document (2026-07-09): stays `#[ignore]`d; do NOT tighten
+    /// `read_varnumber`.** Verified against source: the reference decoders ndn-sync shares this SVS
+    /// wire with are BOTH lenient too — ndn-cxx `readVarNumber` (`encoding/tlv.hpp`) and ndnd
+    /// `ReadTLNum` (`std/encoding/primitives.go`) accept non-minimal VarNums with no check. ndn-sync
+    /// MATCHES them; all three decode the same bytes to the same value (a canonicity gap, not an
+    /// interop divergence). A unilateral strict receiver would only RELOCATE the inconsistency
+    /// (strict nodes drop what lenient nodes process), and canonicity is enforced above the
+    /// waterline at the NDF Block layer, not in this shared sync decoder. Low severity (no panic,
+    /// no unbounded work — the SY-1/SY-2 caps hold). Full matrix, ruling, and the upstream
+    /// spec-clarification draft: `docs/specs/f28-non-minimal-varnum-decode.md`. This repro is the
+    /// regression gate the day (if ever) the spec mandates strict — un-ignoring it is then a
+    /// one-line change made IN COMPANY with ndn-cxx/ndnd, never alone.
     #[test]
-    #[ignore = "F28 CANONICITY GAP: ndn-sync read_varnumber accepts non-minimal VarNum — but so do \
-                ndn-cxx and ndnd (verified); tightening alone forks interop. Maintainer decision \
-                package: docs/specs/f28-non-minimal-varnum-decode.md"]
+    #[ignore = "F28 RULED (b) accept-and-document: read_varnumber is lenient by design (parity with \
+                ndn-cxx/ndnd, both verified lenient); canonicity is enforced above at the NDF Block \
+                layer. Do not tighten unilaterally. Package: docs/specs/f28-non-minimal-varnum-decode.md"]
     fn svs_non_minimal_outer_length_is_rejected(entries in arb_entries()) {
         prop_assume!(!entries.is_empty());
         let canonical = WireDialect::V2.encode_state_vector(&entries);
