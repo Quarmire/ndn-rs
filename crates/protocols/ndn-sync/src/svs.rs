@@ -11,7 +11,7 @@ pub use crate::svs_local::StateEntry;
 /// with thousands of fabricated producer names; this bounds the map so it can't
 /// grow without limit. Generous — far above any realistic group size — and
 /// existing producers always update even at the cap.
-pub(crate) const MAX_TRACKED_PRODUCERS: usize = 16_384;
+pub const MAX_TRACKED_PRODUCERS: usize = 16_384;
 
 /// Maximum publications a single `merge` will advertise as a gap for one
 /// producer (audit SY-2). A forged state-vector entry with `SeqNo = u64::MAX`

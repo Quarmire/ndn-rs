@@ -6,6 +6,7 @@ use bytes::Bytes;
 use ndn_packet::{Name, NameComponent};
 use ndn_sync::psync::Ibf;
 use ndn_sync::psync_sync::{decode_ibf, encode_ibf};
+use ndn_sync::svs::MAX_TRACKED_PRODUCERS;
 use ndn_sync::{StateEntry, WireDialect, decode_svs_data};
 use proptest::prelude::*;
 
@@ -78,6 +79,64 @@ proptest! {
             let _ = WireDialect::V2.decode_state_vector(&raw);
             let _ = WireDialect::V3.decode_state_vector(&raw);
             let _ = decode_svs_data(&raw);
+        }
+    }
+
+    /// CANONICAL REJECTION (adversary bench, FIELD-REPORT-2 §7(b)): an oversized state vector —
+    /// more producers than SY-1's `MAX_TRACKED_PRODUCERS` cap — must be REJECTED at decode
+    /// (`None`), before it can reach `merge` and force unbounded per-peer state. Red-capable:
+    /// without the SY-1 clamp the decoder would accept it. (The no-panic + roundtrip halves are
+    /// the properties above; this is the "non-canonical → clean reject, never an accept" half.)
+    #[test]
+    fn svs_oversized_vector_is_rejected(extra in 1usize..64) {
+        // One valid entry per producer, `MAX + extra` of them — over the cap by construction.
+        let n = MAX_TRACKED_PRODUCERS + extra;
+        let entries: Vec<StateEntry> = (0..n)
+            .map(|i| StateEntry {
+                name: format!("/n/{i}").parse().unwrap(),
+                boot: 0,
+                seq: 1,
+            })
+            .collect();
+        for dialect in [WireDialect::V2, WireDialect::V3] {
+            let wire = dialect.encode_state_vector(&entries);
+            prop_assert!(
+                dialect.decode_state_vector(&wire).is_none(),
+                "an over-cap state vector ({n} > {MAX_TRACKED_PRODUCERS}) must be rejected, \
+                 not accepted into unbounded per-peer state ({dialect:?})"
+            );
+        }
+    }
+
+    /// CANONICAL REJECTION — a **fuzzer FINDING**, not yet a guarantee. A non-minimal VarNum
+    /// length on the outer state-vector TLV *should* be rejected (NDN TLV is canonical; ndn-cxx
+    /// rejects it), but `crate::tlv::read_varnumber` is a LENIENT reader (its 0xFD/0xFE/0xFF arms
+    /// accept any 2/4/8-byte value with no minimality check), so the decoder accepts the alias.
+    /// Low-severity (no panic, no unbounded work — the SY-1 cap still holds) but a canonicity /
+    /// interop deviation. `#[ignore]`d because hardening `read_varnumber` is a wire decoder change
+    /// with ndn-svs/ndnd interop implications — a maintainer call, ledgered as an ndn-rs ask.
+    /// Un-ignore this to turn it into the regression gate once the reader is made strict.
+    #[test]
+    #[ignore = "FINDING: ndn-sync read_varnumber is lenient (accepts non-minimal VarNum); \
+                hardening is wire-interop-sensitive — ledgered as an ndn-rs ask"]
+    fn svs_non_minimal_outer_length_is_rejected(entries in arb_entries()) {
+        prop_assume!(!entries.is_empty());
+        let canonical = WireDialect::V2.encode_state_vector(&entries);
+        // Canonical layout: [TYPE=0xC9][len: minimal VarNum][value…]. Rewrite the length as a
+        // non-minimal 3-byte form (0xFD hi lo) of the SAME value — an alias the strict reader
+        // must refuse.
+        let body_len = (canonical.len() - 2) as u16; // 1 type byte + 1 minimal len byte
+        if canonical.len() >= 2 && canonical[1] < 0xFD && body_len as usize == canonical[1] as usize {
+            let mut aliased = Vec::with_capacity(canonical.len() + 2);
+            aliased.push(canonical[0]); // type
+            aliased.push(0xFD); // 2-byte-length marker
+            aliased.extend_from_slice(&body_len.to_be_bytes()); // non-minimal length
+            aliased.extend_from_slice(&canonical[2..]); // value
+            let raw = Bytes::from(aliased);
+            prop_assert!(
+                WireDialect::V2.decode_state_vector(&raw).is_none(),
+                "a non-minimal VarNum length is an alias and must be rejected"
+            );
         }
     }
 
