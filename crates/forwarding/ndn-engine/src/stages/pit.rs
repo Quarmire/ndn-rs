@@ -160,6 +160,18 @@ impl PitCheckStage {
                     return CheckResult::Loop;
                 }
                 let expires_at = now_ns + lifetime_ms * 1_000_000;
+                // NS-11 (with the always-re-forward below): a persistent re-express
+                // from a face REPLACES that face's prior standing in-record rather
+                // than accumulating a second one — so the subscriber's credit pool
+                // RESETS to the fresh budget in lockstep with the freshly-inserted
+                // upstream hop. Without this, the survivor keeps its depleted pool
+                // while the reaped hop re-inserts at full budget, so the pools stay
+                // desynced and the flow dies at the *second* boundary (~2× budget)
+                // even though the re-express re-forwarded. Same-face only — a
+                // distinct subscriber (other face) keeps its own pool.
+                if persistent.is_some() {
+                    entry.in_records.retain(|r| r.face_id != ctx.face_id.0);
+                }
                 // Each aggregated persistent subscriber owns its own
                 // `PersistentState` (own credit, own deadline). Mixing
                 // regimes inside one entry is prevented by the discriminator.
@@ -177,16 +189,28 @@ impl PitCheckStage {
                 {
                     entry.expires_at = ps.reap_at;
                 }
-                // F15 B2: a persistent subscription re-expressed into an entry
-                // whose upstream out-record was torn down with its face must
-                // re-forward to re-establish the upstream leg. The explicit
-                // `upstream_lost` flag distinguishes this from an entry that
-                // simply hasn't forwarded yet (don't re-forward those — they
-                // aggregate). Cleared here so exactly one re-express re-forwards.
-                if persistent.is_some() && entry.upstream_lost {
+                // NS-11: a persistent (subscription-flavored) re-express is an
+                // idempotent STANDING request — it must reach EVERY hop, so it
+                // ALWAYS re-forwards; it must never aggregate-suppress at a
+                // surviving upstream. Per-hop `data_count_remaining` pools desync
+                // on a single lost Data (the hop behind the loss exhausts and reaps
+                // its entry while the hop in front keeps leftover credit). The old
+                // rule only re-forwarded on `upstream_lost` (face teardown, F15),
+                // so a re-express AGGREGATED at the survivor — refreshing its credit
+                // while the reaped hop behind stayed unreachable — and the flow died
+                // permanently at ~2× the SubscriptionRequest budget. Always
+                // re-forwarding both revives the reaped hop AND renews every hop's
+                // budget in lockstep from the re-express's fresh `PersistentState`,
+                // re-syncing the pools (which detection-based recovery cannot do).
+                // Data is not amplified: a re-forward refreshes the shared
+                // out-record and per-subscriber budgets; one stream still multicasts
+                // down the shared PIT. Gated on the subscription flavor only —
+                // classical Interests keep NFD aggregation / retx-suppression below.
+                // `upstream_lost` (face teardown) is subsumed and cleared.
+                if persistent.is_some() {
                     entry.upstream_lost = false;
                     CheckResult::ReForward
-                } else if persistent.is_none() && should_retx_reforward(entry, now_ns) {
+                } else if should_retx_reforward(entry, now_ns) {
                     // Retransmission suppression (NFD RetxSuppression, D.09):
                     // classical only — the persistent path keeps its own F15
                     // re-forward semantics (`upstream_lost`) above. A fresh-nonce
@@ -1265,8 +1289,9 @@ mod persistent_tests {
         pit.with_entry_mut(&token, |e| e.add_out_record(2, 7, 0))
             .unwrap();
 
-        // A second subscriber re-expressing now would aggregate-suppress
-        // (upstream Interest still pending).
+        // NS-11: a persistent re-express ALWAYS re-forwards — even with a live
+        // upstream out-record — so a hop reaped by budget death behind a Data loss
+        // is always revived (the old rule aggregated here, which was the bug).
         let wire_agg = build_persistent_interest("/persistent/upstream", 10, 60);
         let mut ctx = PacketContext::new(wire_agg.clone(), FaceId(1), 0);
         ctx.packet =
@@ -1275,15 +1300,13 @@ mod persistent_tests {
             .build()
             .unwrap();
         assert!(
-            matches!(
-                rt.block_on(check.process(ctx)),
-                Action::Drop(DropReason::Suppressed)
-            ),
-            "with a live upstream out-record, a re-express must aggregate"
+            matches!(rt.block_on(check.process(ctx)), Action::Continue(_)),
+            "NS-11: a persistent re-express re-forwards even with a live upstream out-record"
         );
 
         // Upstream face 2 dies → its out-record is pruned (entry kept; the
-        // downstream in-record on face 1 survives).
+        // downstream in-record on face 1 survives). Face-teardown pruning is
+        // independent of the re-forward decision and still holds.
         pit.remove_face(2);
         pit.with_entry(&token, |e| {
             assert!(e.out_records.is_empty(), "stale upstream out-record pruned");
@@ -1481,13 +1504,15 @@ mod persistent_tests {
         );
     }
 
-    /// Same-name marker-bearing re-issue → aggregated into one PersistentAttach
-    /// entry; each in-record carries its own per-subscriber credit pool.
-    /// Marker-bearing and non-marker Interests at the same logical name
-    /// occupy *distinct* entries by the PIT-key discriminator — see
+    /// Same-name marker-bearing re-issue → **re-forwards** (NS-11: a standing
+    /// subscription must reach every hop, never aggregate-suppress) while each
+    /// in-record keeps its own per-subscriber credit pool, and both subscribers
+    /// still share one PIT entry (so the Data multicasts down one shared path).
+    /// Marker-bearing and non-marker Interests at the same logical name occupy
+    /// *distinct* entries by the PIT-key discriminator — see
     /// `persistent_and_classical_same_name_isolated`.
     #[test]
-    fn persistent_reissue_aggregates_without_revalidation() {
+    fn persistent_reissue_reforwards_keeping_own_credit() {
         let pit = Arc::new(Pit::new());
         let check = Arc::new(PitCheckStage {
             pit: Arc::clone(&pit),
@@ -1514,8 +1539,11 @@ mod persistent_tests {
             .unwrap();
         let a2 = rt.block_on(check.process(ctx2));
         assert!(
-            matches!(a2, Action::Drop(DropReason::Suppressed)),
-            "same-name marker re-issue must be aggregated (Suppressed)"
+            matches!(a2, Action::Continue(_)),
+            "NS-11: a subscription re-issue must RE-FORWARD (a standing request reaches every hop), \
+             not aggregate-suppress. The Data still multicasts down the shared PIT to BOTH \
+             in-records, so distinct subscribers are not amplified — only the redundant upstream \
+             suppression (the bug) is removed."
         );
 
         let agg_name: Name = "/persistent/agg".parse().unwrap();
