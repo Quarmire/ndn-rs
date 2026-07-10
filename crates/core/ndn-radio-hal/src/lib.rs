@@ -482,8 +482,29 @@ pub trait RadioKnobs: Send + Sync {
         Ok(())
     }
 
-    /// Ignore EDCCA so TX proceeds under channel contention. Default: no-op.
+    /// Ignore EDCCA / listen-before-talk so TX proceeds under channel contention. Default: no-op.
+    /// (A LoRa radio maps this to its LBT toggle.)
     fn set_edcca_ignore(&self, _on: bool) -> Result<(), FaceError> {
+        Ok(())
+    }
+
+    /// Set the LoRa **spreading factor** (7–12) — the sub-GHz reach/rate dial, the direct analogue
+    /// of Wi-Fi MCS: each step up trades throughput for link budget (≈ doubling airtime, ≈ +2.5 dB
+    /// sensitivity). No-op default; only a [`RadioKind::Lora`] radio acts on it. Cognition drives
+    /// this the way it drives MCS — down for close/bulk, up for far/urgent.
+    fn set_spreading_factor(&self, _sf: u8) -> Result<(), FaceError> {
+        Ok(())
+    }
+
+    /// Set the LoRa **coding rate** (`1`=4/5 … `4`=4/8) — a robustness/FEC dial (more coding = more
+    /// resilience to interference, at the cost of airtime). No-op default.
+    fn set_coding_rate(&self, _cr: u8) -> Result<(), FaceError> {
+        Ok(())
+    }
+
+    /// Set the LoRa channel **bandwidth in kHz** (125 / 250 / 500) — a rate/range axis orthogonal to
+    /// spreading factor (wider = faster but noisier / shorter). No-op default.
+    fn set_bandwidth_khz(&self, _khz: u32) -> Result<(), FaceError> {
         Ok(())
     }
 
