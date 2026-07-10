@@ -703,22 +703,37 @@ pub enum CsiSupport {
 /// heterogeneous (NDN-CRAHNs: divergent capabilities → object→radio mapping by
 /// fit) regimes. Generalizes the `LinkProfile` cost prior.
 ///
-/// Carries both 802.11-flavoured rate caps (`max_mcs`/`max_nss`/`max_bw`, which a
-/// non-WiFi bearer sets to its own equivalents or zero) **and** the
-/// bearer-agnostic operational axes a cognitive plane needs to place work on a
-/// heterogeneous radio: its timing model, duty-cycle ceiling, on-air payload cap,
-/// and duplex. Those four are what let LoRa, an SDR, or a future PHY be *described*
-/// rather than special-cased.
+/// A radio's peak-rate ceiling, keyed by bearer — the static-capability peer of the actuator-side
+/// `RateParams`. A consumer reads the rate/reach tradeoff through [`RadioCapability::rate_rank`]
+/// (bearer-agnostic) and the Wi-Fi ceilings through the typed accessors; no bearer's rate model is
+/// baked into the capability's fields (LoRa has no `max_mcs`, Wi-Fi no spreading factor).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RateCapability {
+    /// No transmit-rate ceiling — an RX-only sensor, or a single-fixed-rate bearer.
+    None,
+    /// Wi-Fi 802.11: max MCS index, spatial streams, and channel-bandwidth code (0=20…4=5).
+    Wifi { max_mcs: u8, max_nss: u8, max_bw: u8 },
+    /// LoRa sub-GHz: the spreading-factor span (the reach↔rate range; lower SF = faster).
+    Lora { min_sf: u8, max_sf: u8 },
+}
+
+/// Carries the bearer-specific rate ceiling ([`RateCapability`], read via [`rate_rank`] and the
+/// typed accessors) **and** the bearer-agnostic operational axes a cognitive plane needs to place
+/// work on a heterogeneous radio: its timing model, duty-cycle ceiling, on-air payload cap, and
+/// duplex. Those are what let LoRa, an SDR, or a future PHY be *described* rather than special-cased.
+///
+/// [`rate_rank`]: RadioCapability::rate_rank
 #[derive(Clone, Debug)]
 pub struct RadioCapability {
     pub kind: RadioKind,
     /// The RF band(s) this radio can operate on — several parts are dual-band (2.4 + 5 GHz),
     /// so this is a set, not one band. Best-first for range is [`range_rank`](Self::range_rank).
     pub bands: Vec<Band>,
-    pub max_mcs: u8,
-    pub max_nss: u8,
-    /// Max channel-bandwidth code (0=20,1=40,2=80,3=10,4=5), matching `ChannelBw`.
-    pub max_bw: u8,
+    /// Bearer-specific peak-rate ceiling. Read the rate/reach tradeoff via
+    /// [`rate_rank`](Self::rate_rank); the Wi-Fi ceilings via [`max_mcs`](Self::max_mcs) /
+    /// [`max_nss`](Self::max_nss) / [`max_bw`](Self::max_bw); the LoRa span via
+    /// [`sf_range`](Self::sf_range).
+    pub rate: RateCapability,
     /// Channels this radio may use.
     pub channels: Vec<u8>,
     /// Max TX-power index (chip TXAGC scale) = the *calibrated/regulatory ceiling*.
@@ -755,14 +770,62 @@ impl RadioCapability {
         self.bands.iter().map(|b| b.range_rank()).max().unwrap_or(0)
     }
 
+    /// Bearer-agnostic peak-throughput rank in `[0, 1]` — the *rate* axis of the reach/rate
+    /// heterogeneous-selection tradeoff, comparable across Wi-Fi, LoRa, and future PHYs. Wi-Fi
+    /// scales with MCS + spatial streams; LoRa is orders of magnitude slower so it lands near zero
+    /// (a lower min SF nudges it up); a rate-less radio (SDR sensor) is zero.
+    pub fn rate_rank(&self) -> f32 {
+        match self.rate {
+            RateCapability::Wifi {
+                max_mcs, max_nss, ..
+            } => (max_mcs as f32 / 9.0 + (max_nss.saturating_sub(1)) as f32 / 3.0) / 2.0,
+            RateCapability::Lora { min_sf, .. } => (12u8.saturating_sub(min_sf)) as f32 / 100.0,
+            RateCapability::None => 0.0,
+        }
+    }
+
+    /// Wi-Fi max MCS index (0 for a non-Wi-Fi radio).
+    pub fn max_mcs(&self) -> u8 {
+        match self.rate {
+            RateCapability::Wifi { max_mcs, .. } => max_mcs,
+            _ => 0,
+        }
+    }
+
+    /// Wi-Fi max spatial streams (1 for a non-Wi-Fi radio).
+    pub fn max_nss(&self) -> u8 {
+        match self.rate {
+            RateCapability::Wifi { max_nss, .. } => max_nss,
+            _ => 1,
+        }
+    }
+
+    /// Wi-Fi max channel-bandwidth code (0 = 20 MHz, for a non-Wi-Fi radio too).
+    pub fn max_bw(&self) -> u8 {
+        match self.rate {
+            RateCapability::Wifi { max_bw, .. } => max_bw,
+            _ => 0,
+        }
+    }
+
+    /// LoRa spreading-factor span `(min, max)`, or `None` for a non-LoRa radio.
+    pub fn sf_range(&self) -> Option<(u8, u8)> {
+        match self.rate {
+            RateCapability::Lora { min_sf, max_sf } => Some((min_sf, max_sf)),
+            _ => None,
+        }
+    }
+
     /// A commodity 5 GHz Wi-Fi monitor radio (our RTL8812EU/8822E data radio).
     pub fn wifi_monitor_5ghz(channels: Vec<u8>) -> Self {
         Self {
             kind: RadioKind::WifiMonitor,
             bands: vec![Band::Band5GHz],
-            max_mcs: 9,
-            max_nss: 2,
-            max_bw: 2,
+            rate: RateCapability::Wifi {
+                max_mcs: 9,
+                max_nss: 2,
+                max_bw: 2,
+            },
             channels,
             max_tx_power: 63,
             agile: true,
@@ -783,9 +846,11 @@ impl RadioCapability {
         Self {
             kind: RadioKind::WifiMonitor,
             bands: vec![Band::Band2_4GHz],
-            max_mcs: 7,
-            max_nss: 2,
-            max_bw: 0,
+            rate: RateCapability::Wifi {
+                max_mcs: 7,
+                max_nss: 2,
+                max_bw: 0,
+            },
             channels,
             max_tx_power: 63,
             agile: true,
@@ -804,8 +869,11 @@ impl RadioCapability {
     /// primary 5 GHz use — a known limitation of the one-band capability model.)
     pub fn wifi_monitor_5ghz_1ss(channels: Vec<u8>) -> Self {
         Self {
-            max_nss: 1,
-            max_mcs: 8,
+            rate: RateCapability::Wifi {
+                max_mcs: 8,
+                max_nss: 1,
+                max_bw: 2,
+            },
             ..Self::wifi_monitor_5ghz(channels)
         }
     }
@@ -814,7 +882,11 @@ impl RadioCapability {
     /// board: 1 stream, 11n MCS0-7, 20 MHz.
     pub fn wifi_monitor_2ghz_1ss(channels: Vec<u8>) -> Self {
         Self {
-            max_nss: 1,
+            rate: RateCapability::Wifi {
+                max_mcs: 7,
+                max_nss: 1,
+                max_bw: 0,
+            },
             ..Self::wifi_monitor_2ghz(channels)
         }
     }
@@ -824,9 +896,11 @@ impl RadioCapability {
         Self {
             kind: RadioKind::Lora,
             bands: vec![Band::Sub1GHz],
-            max_mcs: 0,
-            max_nss: 1,
-            max_bw: 4,
+            // SX126x spreading-factor span 7–12 (the reach↔rate range).
+            rate: RateCapability::Lora {
+                min_sf: 7,
+                max_sf: 12,
+            },
             channels,
             max_tx_power: 63,
             agile: false,
@@ -846,9 +920,7 @@ impl RadioCapability {
         Self {
             kind: RadioKind::Sdr,
             bands: vec![Band::Band5GHz],
-            max_mcs: 0,
-            max_nss: 0,
-            max_bw: 0,
+            rate: RateCapability::None, // RX-only instrument — no transmit rate
             channels,
             max_tx_power: 0,
             agile: true,
