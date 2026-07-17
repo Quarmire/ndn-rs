@@ -6,6 +6,36 @@
 //! [`Producer::connect`] over a Unix socket, or embed via
 //! `InProcFace` + [`EngineBuilder`] and use
 //! `Consumer::from_handle` / `Producer::from_handle`.
+//!
+//! # Serving a name
+//!
+//! To **answer Interests for a prefix**, reach for the high-level serve API —
+//! not a raw face recv/send loop. Registering a prefix, decoding each Interest,
+//! matching it, signing the reply, and pushing wire bytes back is exactly what
+//! these types already do:
+//!
+//! - [`Producer`] — register a prefix and serve `Data`. [`Producer::serve`]
+//!   runs the accept loop and hands each Interest to your handler with a
+//!   [`Responder`]; the handler calls [`Responder::respond`] /
+//!   [`Responder::respond_bytes`] (with the producer's [`KeyChain`] signer) or
+//!   [`Responder::nack`]. For whole-object, name-versioned transfer use
+//!   [`Producer::publish_object`] (RDR: segmentation, versioning, and a
+//!   metadata/manifest packet, fetched by [`Consumer::fetch_object`]).
+//! - [`Responder`] — the single-use reply builder passed to each handler; reply
+//!   or nack exactly once (dropping it silently discards the Interest).
+//! - [`Publisher`] — a long-lived, push-style producer for streaming / repeated
+//!   publication under one prefix.
+//! - [`serve_object_stream`] — serve an append-only object stream (sequential
+//!   segments) that consumers follow live.
+//! - [`Node`] — the unified entry point when an app both serves and fetches over
+//!   one connection: `node.serve` / `node.serve_object` wrap the above with
+//!   NDN-native verbs. Most apps start here; drop to [`Producer`] for explicit
+//!   signed serving or a custom accept loop.
+//!
+//! Prefer these over hand-rolling the low-level [`app_face`] recv/send loop:
+//! that layer exists for transports and bespoke framing, not for everyday name
+//! serving, and re-implementing the decode/match/sign/reply cycle on top of it
+//! is how the same bugs get reinvented.
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![allow(missing_docs)]
