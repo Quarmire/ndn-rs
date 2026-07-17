@@ -437,6 +437,53 @@ impl SvSync {
         Ok(seq)
     }
 
+    /// Re-advertise an already-signed Data wire under this node's id **without
+    /// re-signing** — the sidecar/mirror path for a constrained producer. The
+    /// shape is: an embedded producer signs its Data and hands the finished wire
+    /// to a std sidecar over its bearer; the sidecar joined the group *as* the
+    /// producer (`SvSync::join(group, producer_node, …)`) and calls this, so
+    /// group peers Follow the producer without the producer running SVS.
+    ///
+    /// `wire` must be decodable [`Data`] whose name is exactly
+    /// [`svs_data_name`]`(node, group, next_seq)`, where `next_seq` is this
+    /// node's next **contiguous** seq (SVS seq spaces are gap-free). Wrong
+    /// node/group, undecodable wire, `seq == 0`, or a non-contiguous seq yield a
+    /// typed [`SyncError::Protocol`] and the state vector does **not** advance.
+    /// On success the signed wire is stored byte-for-byte (signature intact) and
+    /// the core is advanced by exactly one; returns the claimed seq.
+    pub async fn publish_presigned(&self, wire: Bytes) -> Result<u64, SyncError> {
+        let data = Data::decode(wire.clone())
+            .map_err(|e| SyncError::Protocol(format!("presigned wire is not decodable Data: {e}")))?;
+        let name = &*data.name;
+        let seq_pos = self.node.components().len() + self.group.components().len();
+        let seq = name
+            .components()
+            .get(seq_pos)
+            .map(|c| crate::tlv::decode_nni(c.value.as_ref()))
+            .filter(|&s| s > 0)
+            .ok_or_else(|| SyncError::Protocol(format!("presigned Data name {name} carries no seq")))?;
+        let expected = svs_data_name(&self.node, &self.group, seq);
+        if *name != expected {
+            return Err(SyncError::Protocol(format!(
+                "presigned Data name {name} != expected {expected}"
+            )));
+        }
+        // Claim exactly this seq iff it is the next contiguous one → keeps
+        // `self.seq` and the core's per-node counter in lockstep (one publish =
+        // one increment), the same invariant `publish_data` maintains.
+        self.seq
+            .compare_exchange(seq - 1, seq, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|have| {
+                SyncError::Protocol(format!(
+                    "presigned seq {seq} is not contiguous (next is {})",
+                    have + 1
+                ))
+            })?;
+        self.store.insert(expected, wire);
+        self.handle.publish(self.node.clone()).await?;
+        Ok(seq)
+    }
+
     /// Publish a multi-segment object under one sequence number: each
     /// `segments[i]` becomes outer Data named
     /// `<node>/<group>/<seq>/v=0/seg=i` carrying a `FinalBlockId`
@@ -1359,5 +1406,71 @@ mod tests {
             store_b.get(&svs_data_name(&na, &group, 1)).is_none(),
             "store must hold nothing the validator rejected"
         );
+    }
+
+    /// Sidecar mirror path: a std SvSync joined *as* a constrained producer
+    /// re-advertises that producer's already-signed Data verbatim via
+    /// `publish_presigned`, advancing the vector by exactly one — without
+    /// re-signing. Proves acceptance + byte-identity + one-step advance, and
+    /// that wrong-name and non-contiguous inputs are rejected without advancing.
+    #[tokio::test]
+    async fn publish_presigned_mirrors_signed_wire_and_advances_once() {
+        let group = name("/edge/grp");
+        // The sidecar joins the group AS the constrained producer's node id.
+        let device = name("/edge/grp/dev");
+
+        let (out_tx, _out_rx) = mpsc::channel::<Bytes>(256);
+        let (_in_tx, in_rx) = mpsc::channel::<Bytes>(256);
+        let store = Arc::new(MemoryStore::new());
+        let svs = SvSync::join(
+            group.clone(),
+            device.clone(),
+            Arc::clone(&store) as Arc<dyn DataStore>,
+            out_tx,
+            in_rx,
+            SvSyncConfig::default(),
+        );
+
+        // The device signs its own Data (here: a plain digest build — this
+        // method never inspects the signature) named at the device's seq 1.
+        let n1 = svs_data_name(&device, &group, 1);
+        let presigned: Bytes = DataBuilder::new(n1.clone(), b"from-device").build();
+
+        // (2 first, red-capably) A wrong-node name must be rejected and NOT
+        // advance the vector.
+        let wrong_node = svs_data_name(&name("/edge/grp/other"), &group, 1);
+        let wrong_wire: Bytes = DataBuilder::new(wrong_node, b"impostor").build();
+        let err = svs
+            .publish_presigned(wrong_wire)
+            .await
+            .expect_err("wrong node id must be rejected");
+        assert!(matches!(err, SyncError::Protocol(_)), "typed rejection");
+
+        // (3) A non-contiguous seq (2 when next is 1) must be rejected and NOT
+        // advance.
+        let n2 = svs_data_name(&device, &group, 2);
+        let ahead: Bytes = DataBuilder::new(n2, b"too-far").build();
+        let err = svs
+            .publish_presigned(ahead)
+            .await
+            .expect_err("non-contiguous seq must be rejected");
+        assert!(matches!(err, SyncError::Protocol(_)), "typed rejection");
+
+        // (1) The contiguous, correctly-named presigned wire is accepted (still
+        // seq 1 after the two rejected attempts — proving neither advanced it).
+        let seq = svs
+            .publish_presigned(presigned.clone())
+            .await
+            .expect("presigned seq 1 accepted");
+        assert_eq!(seq, 1);
+
+        // Stored wire is BYTE-IDENTICAL to the producer's signed input.
+        let stored = store.get(&n1).expect("mirror stored the wire");
+        assert_eq!(stored, presigned, "signature preserved byte-for-byte");
+
+        // The vector advanced by exactly one: the sidecar's own next real
+        // publication takes seq 2 (the observable `publish_data` uses).
+        let next = svs.publish_data(b"sidecar-native").await.expect("publish 2");
+        assert_eq!(next, 2, "vector advanced by exactly one presigned mirror");
     }
 }
