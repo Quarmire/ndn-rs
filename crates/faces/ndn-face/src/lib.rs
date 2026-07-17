@@ -60,7 +60,7 @@ pub use ndn_packet::fragment::DEFAULT_UDP_MTU;
 #[cfg(all(feature = "net", not(target_arch = "wasm32")))]
 pub use net::{
     LpReliability, MulticastUdpFace, ReliabilityConfig, RtoStrategy, TcpFace, UdpFace,
-    tcp_face_connect, tcp_face_from_stream,
+    UdpFaceFactory, tcp_face_connect, tcp_face_from_stream,
 };
 
 #[cfg(feature = "local")]

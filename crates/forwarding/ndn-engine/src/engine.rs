@@ -303,6 +303,11 @@ pub struct EngineInner {
     /// so a node can declare its own routable prefix as a producer region after
     /// build (e.g. at discovery start).
     pub(crate) network_region: Arc<crate::stages::strategy::NetworkRegionTable>,
+    /// Registered [`FaceFactory`](ndn_transport::FaceFactory)s for data-driven
+    /// face construction (see [`ForwarderEngine::add_face_of_kind`]). Looked up
+    /// by [`FaceKind`](ndn_transport::FaceKind) at add time; empty unless the
+    /// builder registered any.
+    pub(crate) face_factories: Vec<Arc<dyn ndn_transport::FaceFactory>>,
 }
 
 /// Handle to a running NDN forwarding plane.
@@ -502,6 +507,59 @@ impl ForwarderEngine {
         self.inner.rib.handle_face_down(face_id, &self.inner.fib);
         self.inner.fib.remove_face(face_id);
         self.inner.face_table.remove(face_id);
+    }
+
+    /// Build and add a face from a **data record**: look up the registered
+    /// [`FaceFactory`](ndn_transport::FaceFactory) for `kind`, have it construct
+    /// the face from `params`, and wire it into the running plane. Returns the
+    /// new [`FaceId`].
+    ///
+    /// This is the data-driven counterpart to [`add_face`](Self::add_face)
+    /// (which takes an already-built transport): a connectivity resolver holding
+    /// `(record.kind, record.params)` calls `add_face_of_kind(kind, &params, ..)`
+    /// with no per-kind `match` and no coupling to bearer crates. Register the
+    /// factories via [`EngineBuilder::face_factory`](crate::EngineBuilder::face_factory).
+    ///
+    /// Errors: `FaceError::Io(ErrorKind::Unsupported)` when no factory is
+    /// registered for `kind`; otherwise whatever the factory returns for
+    /// malformed params or a bind/dial failure. The face is added with
+    /// [`FacePersistency::OnDemand`].
+    pub async fn add_face_of_kind(
+        &self,
+        kind: ndn_transport::FaceKind,
+        params: &ndn_transport::FaceParams,
+        cancel: CancellationToken,
+    ) -> Result<FaceId, ndn_transport::FaceError> {
+        // Last registration for a kind wins: search newest-first.
+        let factory = self
+            .inner
+            .face_factories
+            .iter()
+            .rev()
+            .find(|f| f.kind() == kind)
+            .ok_or_else(|| {
+                ndn_transport::FaceError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    format!("no FaceFactory registered for kind {kind}"),
+                ))
+            })?;
+
+        // Engine owns id allocation (monotonic, never recycled) — the factory
+        // receives the id rather than minting its own.
+        let id = self.inner.face_table.alloc_id();
+        let transport = factory.create(id, params).await?;
+
+        let erased: Arc<dyn ndn_transport::ErasedTransport> = Arc::from(transport);
+        let link_service = ndn_transport::default_link_service_for_kind(kind);
+        let face = ndn_transport::Face::from_parts(erased, link_service);
+        let face_id = self.inner.face_table.insert_arc(Arc::new(face));
+        let wired = self
+            .inner
+            .face_table
+            .get(face_id)
+            .expect("face was just inserted");
+        self.wire_face(wired, cancel, FacePersistency::OnDemand);
+        Ok(face_id)
     }
 
     pub fn add_face_with_persistency<F: ndn_transport::Transport + 'static>(

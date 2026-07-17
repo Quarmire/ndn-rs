@@ -9,6 +9,7 @@
 
 #![allow(missing_docs)]
 
+pub mod factory;
 pub mod multicast;
 #[cfg(all(feature = "udp-recvmmsg", target_os = "linux"))]
 pub mod recvmmsg;
@@ -22,6 +23,7 @@ pub mod reliability {
     pub use ndn_transport::reliability::{LpReliability, ReliabilityConfig, RtoStrategy};
 }
 
+pub use factory::UdpFaceFactory;
 pub use multicast::MulticastUdpFace;
 pub use ndn_packet::fragment::DEFAULT_UDP_MTU;
 pub use reliability::{LpReliability, ReliabilityConfig, RtoStrategy};

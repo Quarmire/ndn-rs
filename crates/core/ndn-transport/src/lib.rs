@@ -15,6 +15,7 @@ pub mod any_map;
 pub mod congestion;
 pub mod face;
 pub mod face_event;
+pub mod face_factory;
 pub mod face_options;
 pub mod face_pair_table;
 pub mod face_sink;
@@ -39,6 +40,7 @@ pub use face::{
     LinkType, ip_face_uri,
 };
 pub use face_event::{FaceEvent, FaceLifecycleSink};
+pub use face_factory::{FaceFactory, FaceParams};
 pub use face_options::{
     BIT_CONGESTION_MARKING, BIT_LOCAL_FIELDS, BIT_LP_RELIABILITY, FaceOption, FaceOptionError,
     FaceOptions, NFD_FLAG_BITS,

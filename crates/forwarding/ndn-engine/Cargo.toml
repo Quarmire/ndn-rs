@@ -86,6 +86,10 @@ sha2          = { workspace = true }
 ndn-face-local = { workspace = true }
 ndn-fwd-core   = { workspace = true }
 ndn-pathcontrol = { workspace = true }
+# FaceFactory seam end-to-end: the reference UdpFaceFactory + a real UDP peer
+# in tests/face_factory.rs. `net` gives the test tokio::net::UdpSocket.
+ndn-face       = { workspace = true }
+tokio          = { workspace = true, features = ["net", "macros", "rt-multi-thread", "time"] }
 
 [[bench]]
 name    = "pipeline"

@@ -290,6 +290,9 @@ impl WasmEngineBuilder {
             discovery_ctx: OnceLock::new(),
             runtime: Arc::clone(&runtime),
             face_lifecycle_sink: OnceLock::new(),
+            // The wasm builder does not expose FaceFactory registration
+            // (browser faces are added pre-composed); start empty.
+            face_factories: Vec::new(),
         });
 
         let discovery_ctx = EngineDiscoveryContext::new(

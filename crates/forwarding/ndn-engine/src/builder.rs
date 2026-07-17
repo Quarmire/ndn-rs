@@ -145,6 +145,11 @@ pub struct EngineBuilder {
     egress_factory: Option<crate::egress::EgressSchedulerFactory>,
     /// G9 traceroute hop responder (opt-in).
     traceroute_responder: Option<Arc<crate::traceroute::TracerouteResponder>>,
+    /// Registered [`FaceFactory`](ndn_transport::FaceFactory)s, keyed at
+    /// lookup time by [`FaceKind`](ndn_transport::FaceKind). Lets a
+    /// connectivity resolver build faces from `(kind, params)` data via
+    /// [`ForwarderEngine::add_face_of_kind`]. Last registration for a kind wins.
+    face_factories: Vec<Arc<dyn ndn_transport::FaceFactory>>,
 }
 
 impl EngineBuilder {
@@ -176,7 +181,18 @@ impl EngineBuilder {
             path_control: false,
             path_control_observers: Vec::new(),
             path_authorizer: None,
+            face_factories: Vec::new(),
         }
+    }
+
+    /// Register a [`FaceFactory`](ndn_transport::FaceFactory) so faces of its
+    /// [`FaceKind`](ndn_transport::FaceKind) can later be built from a data
+    /// record — a config row, a discovered-neighbor entry — via
+    /// [`ForwarderEngine::add_face_of_kind`], with no per-kind code at the call
+    /// site. The last factory registered for a given kind wins.
+    pub fn face_factory(mut self, factory: Arc<dyn ndn_transport::FaceFactory>) -> Self {
+        self.face_factories.push(factory);
+        self
     }
 
     /// Enable the **G3 PathControl handler**: a `PathControl` Interest is processed
@@ -656,6 +672,7 @@ impl EngineBuilder {
             runtime: Arc::clone(&runtime),
             face_lifecycle_sink: OnceLock::new(),
             network_region: Arc::clone(&network_region),
+            face_factories: std::mem::take(&mut self.face_factories),
         });
 
         let discovery_ctx = EngineDiscoveryContext::new(
