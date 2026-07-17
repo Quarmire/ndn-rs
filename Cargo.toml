@@ -27,6 +27,7 @@ members = [
     "crates/forwarding/ndn-ipc",
     "crates/platform/ndn-config",
     "crates/forwarding/ndn-discovery-core",
+    "crates/protocols/ndn-svs-core",
     "crates/protocols/ndn-sync",
     "crates/security/ndn-cert",
     "crates/security/ndn-identity",
@@ -64,6 +65,7 @@ default-members = [
     "crates/forwarding/ndn-ipc",
     "crates/platform/ndn-config",
     "crates/forwarding/ndn-discovery-core",
+    "crates/protocols/ndn-svs-core",
     "crates/protocols/ndn-sync",
     "crates/security/ndn-cert",
     "crates/security/ndn-identity",
@@ -132,6 +134,7 @@ ndn-rs-prelude = { path = "crates/app/ndn-rs-prelude" }
 ndn-ipc       = { path = "crates/forwarding/ndn-ipc" }
 ndn-config    = { path = "crates/platform/ndn-config" }
 ndn-discovery-core = { path = "crates/forwarding/ndn-discovery-core" }
+ndn-svs-core  = { path = "crates/protocols/ndn-svs-core" }
 ndn-sync      = { path = "crates/protocols/ndn-sync" }
 ndn-cert     = { path = "crates/security/ndn-cert" }
 ndn-identity = { path = "crates/security/ndn-identity" }

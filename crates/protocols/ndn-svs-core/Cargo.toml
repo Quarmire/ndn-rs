@@ -1,0 +1,43 @@
+[package]
+name = "ndn-svs-core"
+description = "no_std State Vector Sync core: state-vector logic + SVS wire codec, no async, no std"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+classification = "spec"
+
+# The SVS state-vector CORE is pure integer/map/bytes logic. It carries no
+# executor and no lock — its collection is a plain `alloc::collections::BTreeMap`
+# and its methods are synchronous. ndn-sync re-wraps `SvsCore` in a
+# `tokio::sync::RwLock` to recover its historical async API; a constrained device
+# drives `SvsCore` directly, computing/advancing a state vector with neither std
+# nor tokio.
+[features]
+default = []
+# Bring in std (nothing in this crate needs it, but downstreams may want the
+# `std`-flavoured builds of the transitive deps under one switch).
+std = ["ndn-packet/std", "ndn-tlv/std", "bytes/std"]
+# Route `bytes::Bytes` / `Arc` refcounting through `portable-atomic` for no_std
+# targets that lack native atomic CAS (riscv32imc, thumbv6m, ...). Targets with
+# hardware atomics (riscv32imac, thumbv7m, ...) need neither this nor a polyfill.
+portable-atomic = ["ndn-packet/portable-atomic"]
+
+[dependencies]
+ndn-packet = { workspace = true, default-features = false }
+ndn-tlv    = { workspace = true, default-features = false }
+bytes      = { workspace = true, default-features = false }
+# Declared directly (not inherited): the workspace `thiserror` is a bare
+# version string, so `default-features = false` can't override it via
+# inheritance. no_std needs default (std) off — the derive then targets
+# `core::error::Error` (stable since 1.81; MSRV here is 1.90).
+thiserror  = { version = "2", default-features = false }
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

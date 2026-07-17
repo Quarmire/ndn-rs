@@ -1,54 +1,45 @@
-use std::collections::HashMap;
+//! `SvsNode` — the async, `tokio::sync::RwLock`-guarded face of the SVS state
+//! vector. All the state-vector *logic* (advance, boot-aware merge, gap
+//! detection, the SY-1/SY-2 clamps) now lives in the no_std
+//! [`ndn_svs_core::SvsCore`]; this type is the thin re-wrap that restores
+//! ndn-sync's historical async API. Every method is `async` only because it
+//! awaits the lock, then delegates to the synchronous core — the same reason
+//! it was `async` before the extraction. The public surface (method names,
+//! signatures, `StateEntry` / `StateVectorEntry` / `MAX_TRACKED_PRODUCERS`
+//! re-exports) is unchanged, so no caller and no wire byte moved.
 
 use tokio::sync::RwLock;
 
 use ndn_packet::Name;
 
-pub use crate::svs_local::StateEntry;
+pub use ndn_svs_core::{MAX_TRACKED_PRODUCERS, StateVectorEntry, SvsCore};
+// `StateEntry` continues to be reachable as `crate::svs::StateEntry` (its
+// canonical home moved to the core crate's codec module).
+pub use ndn_svs_core::StateEntry;
+// SY-2 gap span — only the async `svs.rs` tests below reference it (it was
+// `pub(crate)`, never part of ndn-sync's public API), so gate it to test builds
+// to stay warning-clean under `-D warnings`.
+#[cfg(test)]
+use ndn_svs_core::MAX_GAP_SPAN;
 
-/// Ceiling on distinct producers tracked in the local state vector (audit
-/// SY-1). Under the accept-all default validator a peer can pack a Sync Interest
-/// with thousands of fabricated producer names; this bounds the map so it can't
-/// grow without limit. Generous — far above any realistic group size — and
-/// existing producers always update even at the cap.
-pub const MAX_TRACKED_PRODUCERS: usize = 16_384;
-
-/// Maximum publications a single `merge` will advertise as a gap for one
-/// producer (audit SY-2). A forged state-vector entry with `SeqNo = u64::MAX`
-/// would otherwise yield an unbounded `(1, u64::MAX)` fetch range. Catch-up to a
-/// legitimately-large seq still completes — it just proceeds in bounded chunks
-/// across successive sync rounds (the slot advances only to the clamped high).
-pub(crate) const MAX_GAP_SPAN: u64 = 1 << 16;
-
-/// Clamp a `[low, high]` fetch range so it spans at most [`MAX_GAP_SPAN`].
-fn clamp_gap_high(low: u64, high: u64) -> u64 {
-    high.min(low.saturating_add(MAX_GAP_SPAN - 1))
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StateVectorEntry {
-    /// URI rendering of the node's NDN name.
-    pub node: String,
-    /// Bootstrap timestamp (SVS v3); 0 under the v2 dialect.
-    pub boot: u64,
-    pub seq: u64,
-}
-
-/// State Vector Sync.
+/// State Vector Sync — async wrapper.
 ///
-/// Each node maintains a `Name → highest-seq` map per peer; an incoming
-/// peer seq higher than the local entry is recorded as a gap to fetch.
-/// Keys are component-wise canonical `Name` values (mirrors ndn-svs
-/// `common.hpp:41` `using NodeID = ndn::Name` /
+/// Each node maintains a `Name → highest-seq` map per peer (inside
+/// [`SvsCore`]); an incoming peer seq higher than the local entry is recorded
+/// as a gap to fetch. Keys are component-wise canonical `Name` values (mirrors
+/// ndn-svs `common.hpp:41` `using NodeID = ndn::Name` /
 /// `version-vector.hpp:83`); two NodeIDs with identical wire bytes but
-/// different `Display` renderings aggregate into one entry. The
-/// `String`-keyed methods (`merge`, `local_key`, `snapshot`, `seq_for`)
-/// parse `String → Name` at the boundary so callers see the same
-/// canonicalisation.
+/// different `Display` renderings aggregate into one entry. The `String`-keyed
+/// methods (`merge`, `local_key`, `snapshot`, `seq_for`) parse `String → Name`
+/// at the boundary so callers see the same canonicalisation.
+///
+/// `local_name` / `local_boot` are mirrored out of the lock so the
+/// synchronous accessors ([`Self::local_name`], [`Self::local_boot`],
+/// [`Self::local_key`]) keep their non-`async` signatures.
 pub struct SvsNode {
     local_name: Name,
     local_boot: u64,
-    vector: RwLock<HashMap<Name, (u64, u64)>>,
+    core: RwLock<SvsCore>,
 }
 
 impl SvsNode {
@@ -63,12 +54,10 @@ impl SvsNode {
     /// resumed sequence space rather than restarting at 0 (NS-8). Only the
     /// local entry is seeded; peers are still learned from the wire.
     pub fn with_boot_seq(local_name: &Name, local_boot: u64, local_seq: u64) -> Self {
-        let mut map = HashMap::new();
-        map.insert(local_name.clone(), (local_boot, local_seq));
         Self {
             local_name: local_name.clone(),
             local_boot,
-            vector: RwLock::new(map),
+            core: RwLock::new(SvsCore::with_boot_seq(local_name, local_boot, local_seq)),
         }
     }
 
@@ -91,22 +80,12 @@ impl SvsNode {
     }
 
     pub async fn local_seq(&self) -> u64 {
-        self.vector
-            .read()
-            .await
-            .get(&self.local_name)
-            .map(|(_, s)| *s)
-            .unwrap_or(0)
+        self.core.read().await.local_seq()
     }
 
     /// Increment the local sequence by 1 and return the new value.
     pub async fn advance(&self) -> u64 {
-        let mut map = self.vector.write().await;
-        let entry = map
-            .entry(self.local_name.clone())
-            .or_insert((self.local_boot, 0));
-        entry.1 += 1;
-        entry.1
+        self.core.write().await.advance()
     }
 
     /// Merge received state-vector entries, returning
@@ -118,7 +97,7 @@ impl SvsNode {
     /// even though the raw seq dropped — the v2 dialect always passes
     /// `boot = 0`, so this reduces to plain seq comparison there.
     pub async fn merge(&self, received: &[StateEntry]) -> Vec<(String, u64, u64)> {
-        self.merge_inner(received, true).await
+        self.core.write().await.merge(received)
     }
 
     /// Like [`merge`](Self::merge) but for **two-phase commit** (D-44 / N-3): gaps are detected and a
@@ -129,51 +108,7 @@ impl SvsNode {
     /// (a fork, a bad signature) never silently marks the node caught-up. The eager
     /// [`merge`](Self::merge) is the default; the SVS driver selects this when `auto_ack` is off.
     pub async fn merge_deferred(&self, received: &[StateEntry]) -> Vec<(String, u64, u64)> {
-        self.merge_inner(received, false).await
-    }
-
-    async fn merge_inner(&self, received: &[StateEntry], advance: bool) -> Vec<(String, u64, u64)> {
-        let mut gaps = Vec::new();
-        let mut map = self.vector.write().await;
-        for entry in received {
-            // Authoritative-for-self guard: a remote entry must never
-            // raise our own (boot, seq) (gap #3, self-seq poisoning).
-            // Only `advance()` moves it.
-            if entry.name == self.local_name {
-                continue;
-            }
-            // SY-1: bound the number of tracked producers. A new producer is
-            // ignored once the cap is hit; producers we already track still
-            // advance, so a flood of fabricated names can't grow the map.
-            if !map.contains_key(&entry.name) && map.len() >= MAX_TRACKED_PRODUCERS {
-                continue;
-            }
-            let slot = map.entry(entry.name.clone()).or_insert((0, 0));
-            let (lb, ls) = *slot;
-            if entry.boot > lb {
-                // Peer (re)started with a newer boot: fetch its whole run, but
-                // clamp the advertised span (SY-2) and advance the slot only to
-                // the clamped high so legit catch-up continues next round.
-                if entry.seq >= 1 {
-                    let high = clamp_gap_high(1, entry.seq);
-                    gaps.push((entry.name.to_string(), 1, high));
-                    // Adopt the new boot either way (restart detection is not gated on validation).
-                    // In deferred mode the seq stays 0 so the gap re-emits until acked.
-                    *slot = (entry.boot, if advance { high } else { 0 });
-                } else {
-                    *slot = (entry.boot, entry.seq);
-                }
-            } else if entry.boot == lb && entry.seq > ls {
-                let high = clamp_gap_high(ls + 1, entry.seq);
-                gaps.push((entry.name.to_string(), ls + 1, high));
-                // Eager: advance now. Deferred: leave the seq at `ls`; `ack()` advances it once the
-                // app has validated + stored the fetched publication.
-                if advance {
-                    slot.1 = high;
-                }
-            }
-        }
-        gaps
+        self.core.write().await.merge_deferred(received)
     }
 
     /// Two-phase commit (D-44 / N-3): raise the tracked seq for peer `node_key` to `seq` after the app
@@ -181,58 +116,21 @@ impl SvsNode {
     /// entry. Complements [`merge_deferred`](Self::merge_deferred) — together they let a consumer
     /// reject a delivered item without poisoning convergence.
     pub async fn ack(&self, node_key: &str, seq: u64) {
-        let Ok(name) = node_key.parse::<Name>() else { return };
-        if name == self.local_name {
-            return;
-        }
-        let mut map = self.vector.write().await;
-        if let Some(slot) = map.get_mut(&name) {
-            if seq > slot.1 {
-                slot.1 = seq;
-            }
-        } else if map.len() < MAX_TRACKED_PRODUCERS {
-            map.insert(name, (0, seq));
-        }
+        self.core.write().await.ack(node_key, seq)
     }
 
     pub async fn snapshot(&self) -> Vec<StateVectorEntry> {
-        self.vector
-            .read()
-            .await
-            .iter()
-            .map(|(k, &(boot, seq))| StateVectorEntry {
-                node: k.to_string(),
-                boot,
-                seq,
-            })
-            .collect()
+        self.core.read().await.snapshot()
     }
 
     /// State vector as [`StateEntry`]s (parsed names) for the wire codec.
     pub async fn state_entries(&self) -> Vec<StateEntry> {
-        self.vector
-            .read()
-            .await
-            .iter()
-            .map(|(k, &(boot, seq))| StateEntry {
-                name: k.clone(),
-                boot,
-                seq,
-            })
-            .collect()
+        self.core.read().await.state_entries()
     }
 
     /// Returns 0 for unknown keys.
     pub async fn seq_for(&self, node_key: &str) -> u64 {
-        let Ok(name) = node_key.parse::<Name>() else {
-            return 0;
-        };
-        self.vector
-            .read()
-            .await
-            .get(&name)
-            .map(|(_, s)| *s)
-            .unwrap_or(0)
+        self.core.read().await.seq_for(node_key)
     }
 }
 

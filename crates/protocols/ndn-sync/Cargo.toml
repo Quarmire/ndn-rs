@@ -25,6 +25,12 @@ store-redb = ["persistent-store", "ndn-storage/redb"]
 # Protocol logic is target-agnostic; only the driver loops' spawn/timer differ
 # (see src/rt.rs). The crate builds for wasm32 so SVS/PSync run in the browser.
 [dependencies]
+# The no_std State Vector Sync core: state-vector logic (`SvsCore`) + SVS wire
+# codec, with neither async nor std. ndn-sync re-wraps it — `SvsNode` puts
+# `SvsCore` behind a `tokio::sync::RwLock` to recover its async API, `SvsLocal`
+# keeps its std lock and delegates the codec/transition. `std` here just flips
+# the shared transitive deps (ndn-packet/ndn-tlv/bytes) to their std builds.
+ndn-svs-core = { workspace = true, features = ["std"] }
 ndn-tlv    = { workspace = true, features = ["std"] }
 bytes         = { workspace = true, features = ["std"] }
 tokio-util = { workspace = true }
