@@ -358,16 +358,40 @@ opaque handles aren't passable across the FFI).
 
 > **The premise of this section was refuted on 2026-07-16.** The "lossy for
 > multi-fragment objects" claim below was measured on our own stack, and the loss
-> was two bugs in it: `MONITOR_MTU` was 2296 — it subtracted LLC/SNAP from the
-> 802.11 2304-octet ceiling but forgot the 24-byte MAC header, so every full-MTU
-> fragment went on air at 2328 B and the radio silently dropped it (ndn-rs
-> `e81c9922`); and the RTL8812AU had no RX pump, so a bulk-IN read was in flight
-> only *during* a `recv_frame` call and back-to-back fragments landed with nothing
-> draining the FIFO (ndn-ext `7d65d80`). With both fixed, name-addressed broadcast
-> carries multi-fragment objects: 800/1400 B → 12/12, 4000 B → 9/12, 16000 B (8
-> fragments) → 3/12, where every row from 2200 B up had been 0/12 in four prior
-> runs. The raw radio was always blameless — 2200/2260/2300 B deliver 100% and
-> 2312 B never arrives, which is the 802.11 ceiling behaving correctly.
+> was **four** bugs in it — two in the radio path and two in the fragmentation
+> path that made the bench itself lie:
+>
+> 1. `MONITOR_MTU` was 2296 — it subtracted LLC/SNAP from the 802.11 2304-octet
+>    ceiling but forgot the 24-byte MAC header, so every full-MTU fragment went on
+>    air at 2328 B and the radio silently dropped it (ndn-rs `e81c9922`).
+> 2. The RTL8812AU had no RX pump: a bulk-IN read was in flight only *during* a
+>    `recv_frame` call, so back-to-back fragments landed with nothing draining the
+>    FIFO (ndn-ext `7d65d80`).
+> 3. `LpLinkService::send` advanced its fragment sequence counter by 1 per
+>    *packet*, though an `n`-fragment packet consumes `n` sequences — so
+>    consecutive packets overlapped in sequence space. NDNLPv2 requires `Sequence`
+>    to be unique per link and `LpReliability` Acks reference it, so acks were
+>    ambiguous.
+> 4. The `monitor_roundtrip` bench keyed reassembly on the **raw** LP sequence
+>    instead of `sequence - frag_index`. Combined with (3), fragments of
+>    *different* objects collided on one key and completed groups that were never
+>    sent: packets stitched out of two objects, which decode fine and were counted
+>    as delivered. Every multi-fragment number this bench ever printed was
+>    therefore fiction — in both directions. See
+>    `ndn-packet/tests/reassembly_key.rs`.
+>
+> With all four fixed, name-addressed broadcast **does** carry multi-fragment
+> objects. Measured between two OPis at -52 dBm, 3 runs per cell, producer MTU
+> verified from its own log, delivery out of 30: 1400 B → 29/30, 2200 B → 29/30,
+> 4000 B (2 fragments) → 29/30, 8000 B (4) → 22/30, 16000 B (8) → 17/30. Fitted
+> per-frame p ~= 0.93-0.98. The raw radio was always blameless — 2200/2260/2300 B
+> deliver 100% and 2312 B never arrives, which is the 802.11 ceiling behaving
+> correctly.
+>
+> An earlier revision of this note cited "800/1400 B → 12/12, 4000 B → 9/12,
+> 16000 B → 3/12" from the pre-fix bench. Those numbers were products of bugs (3)
+> and (4) and are withdrawn; the conclusion they were offered for survives, on
+> better evidence.
 >
 > So multi-fragment loss is **not** intrinsic to connectionless small-frame faces,
 > and this section is no longer the reason to build an NDP tier. NDP is retained,

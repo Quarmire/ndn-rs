@@ -215,6 +215,29 @@ pub struct LpLinkService {
 }
 
 impl LpLinkService {
+    /// Reserve the sequence numbers one fragmented packet will consume, returning
+    /// its `base_seq`.
+    ///
+    /// [`fragment_packet`](ndn_packet::fragment::fragment_packet) stamps
+    /// `base_seq + i` on fragment `i`, so an `n`-fragment packet uses `n`
+    /// sequences — not one. Advancing the counter by 1 per packet (which this did
+    /// until 2026-07-16) makes the next packet reuse the sequences the previous
+    /// one is still using: fragment `i` of packet A and fragment `0` of packet B
+    /// both go out stamped `base+i`.
+    ///
+    /// NDNLPv2 §3.2 requires `Sequence` to be unique per link, and `LpReliability`
+    /// Acks/TxSequence *are* those numbers — duplicates make an ack ambiguous
+    /// about which fragment it acknowledges. Reassembly-by-base happens to
+    /// separate the groups anyway, which is why this stayed latent and unnoticed;
+    /// a receiver keying on the raw sequence instead silently stitches the two
+    /// packets into one that still decodes. See
+    /// `ndn-packet/tests/reassembly_key.rs`.
+    fn reserve_fragment_seqs(&self, packet_len: usize, mtu: usize) -> u64 {
+        let payload_cap = mtu.saturating_sub(ndn_packet::fragment::FRAG_OVERHEAD).max(1);
+        let n = packet_len.div_ceil(payload_cap).max(1) as u64;
+        self.fragment_seq.fetch_add(n, Ordering::Relaxed)
+    }
+
     pub fn new() -> Self {
         let set = features::default_features_for_network_face();
         Self {
@@ -317,7 +340,7 @@ impl LinkService for LpLinkService {
                     && lp.frag_count.unwrap_or(1) <= 1
                     && let Some(inner) = lp.fragment.as_ref()
                 {
-                    let seq = self.fragment_seq.fetch_add(1, Ordering::Relaxed);
+                    let seq = self.reserve_fragment_seqs(inner.len(), mtu);
                     let fragments = ndn_packet::fragment::fragment_packet(inner, mtu, seq);
                     for frag in fragments {
                         let mut frame = OutboundLpFrame::new(frag, true);
@@ -336,7 +359,7 @@ impl LinkService for LpLinkService {
             }
             match transport.send_mtu() {
                 Some(mtu) if packet.len() + 4 > mtu => {
-                    let seq = self.fragment_seq.fetch_add(1, Ordering::Relaxed);
+                    let seq = self.reserve_fragment_seqs(packet.len(), mtu);
                     let fragments = ndn_packet::fragment::fragment_packet(&packet, mtu, seq);
                     for frag in fragments {
                         let mut frame = OutboundLpFrame::new(frag, true);
