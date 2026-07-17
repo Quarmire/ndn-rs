@@ -113,7 +113,8 @@ pub use svs_local::{
 pub use svs_multi::{MultiSvs, spawn_multi_svs};
 pub use svs_sync::{RetryPolicy, SvsConfig, fetch_with_retry, join_svs_group};
 pub use svsync::{
-    DataStore, IngestValidator, MemoryStore, PublisherSigner, SvSync, SvSyncConfig, svs_data_name,
+    DataStore, IngestValidator, MAX_NDN_PACKET_SIZE, MAX_PUBLISHABLE_CONTENT, MemoryStore,
+    PublisherSigner, SvSync, SvSyncConfig, svs_data_name,
 };
 #[cfg(feature = "persistent-store")]
 pub use store::BackendStore;

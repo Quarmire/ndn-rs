@@ -50,7 +50,8 @@ use crate::mapping::{MappingList, MappingProvider};
 use crate::protocol::SyncError;
 use crate::rt;
 use crate::svsync::{
-    DataStore, IngestValidator, MemoryStore, PublisherSigner, SvSync, SvSyncConfig,
+    DATA_OVERHEAD_RESERVE, DataStore, IngestValidator, MAX_NDN_PACKET_SIZE, MemoryStore,
+    PublisherSigner, SvSync, SvSyncConfig,
 };
 
 /// A delivered publication: its application name and decapsulated payload.
@@ -74,7 +75,12 @@ pub struct SvsPubSub {
     subs: SubList,
     seq: AtomicU64,
     fetch_timeout: std::time::Duration,
-    max_segment_size: usize,
+    /// Effective per-chunk budget for the blob. Bounded below the raw
+    /// `max_segment_size` because each chunk is DOUBLE-encapsulated: it becomes
+    /// the content of an inner Data whose wire then becomes the content of the
+    /// outer per-seq Data. Reserving one Data's overhead for EACH layer
+    /// (`2 * DATA_OVERHEAD_RESERVE`) keeps the outer wire ≤ `MAX_NDN_PACKET_SIZE`.
+    segment_budget: usize,
     cancel: CancellationToken,
 }
 
@@ -162,7 +168,14 @@ impl SvsPubSub {
             subs: Arc::clone(&subs),
             seq: AtomicU64::new(0),
             fetch_timeout: config.fetch_timeout,
-            max_segment_size: config.max_segment_size.max(1),
+            // Clamp the configured segment size to the double-encapsulation
+            // ceiling: a chunk of this many bytes → inner Data ≤ chunk +
+            // reserve ≤ MAX_PUBLISHABLE_CONTENT (passes SvSync's Fix-1 guard on
+            // the inner-wire publish) → outer Data ≤ MAX_NDN_PACKET_SIZE.
+            segment_budget: config
+                .max_segment_size
+                .max(1)
+                .min(MAX_NDN_PACKET_SIZE - 2 * DATA_OVERHEAD_RESERVE),
             cancel: cancel.clone(),
         };
 
@@ -189,7 +202,7 @@ impl SvsPubSub {
             Some(list.encode())
         };
 
-        let seq = if blob.len() <= self.max_segment_size {
+        let seq = if blob.len() <= self.segment_budget {
             // Single inner Data <app_name> → blob, encapsulated as the
             // content of the outer per-seq publication.
             let inner = DataBuilder::new(app_name.clone(), blob).build();
@@ -199,10 +212,10 @@ impl SvsPubSub {
         } else {
             // Segment: each chunk is an inner Data <app_name>/v=0/seg=i,
             // and those inner wires are the outer segment contents.
-            let n = blob.len().div_ceil(self.max_segment_size);
+            let n = blob.len().div_ceil(self.segment_budget);
             let last = (n - 1) as u64;
             let segments: Vec<Vec<u8>> = blob
-                .chunks(self.max_segment_size)
+                .chunks(self.segment_budget)
                 .enumerate()
                 .map(|(i, chunk)| {
                     let seg_name = app_name.clone().append_version(0).append_segment(i as u64);
@@ -519,6 +532,104 @@ mod tests {
             blob.as_slice(),
             "byte-exact reassembly"
         );
+    }
+
+    /// Fix 2: a blob in the "danger band" — larger than the double-encap
+    /// budget (7200) but ≤ the raw `max_segment_size` (8000), which previously
+    /// went single-Data and overflowed the outer packet — now SEGMENTS, and
+    /// EVERY produced outer Data wire is ≤ `MAX_NDN_PACKET_SIZE`. A large blob
+    /// is checked the same way.
+    #[tokio::test]
+    async fn danger_band_blob_segments_and_every_outer_data_within_packet_limit() {
+        use crate::svsync::MAX_NDN_PACKET_SIZE;
+
+        let group = n("/app/band");
+        let pa = n("/app/band/p");
+
+        let (a_out_tx, _a_out_rx) = mpsc::channel::<Bytes>(256);
+        let (_a_in_tx, a_in_rx) = mpsc::channel::<Bytes>(256);
+        // Default max_segment_size = 8000 (the raw, pre-fix threshold).
+        let producer = SvsPubSub::join(group.clone(), pa.clone(), a_out_tx, a_in_rx, cfg());
+
+        let data_prefix = producer.data_prefix().clone();
+        let store = Arc::clone(producer.svsync.store());
+
+        // 7900 B: > 7200 double-encap budget, ≤ 8000 raw threshold. Pre-fix this
+        // produced ONE outer Data over the packet limit; now it must segment.
+        let blob: Vec<u8> = (0..7900u32).map(|i| (i % 251) as u8).collect();
+        let seq = producer
+            .publish(n("/band/mid.bin"), &blob)
+            .await
+            .expect("publish danger-band blob");
+        assert_eq!(seq, 1, "outer seq advanced exactly once");
+
+        let stored = store.scan_under(&data_prefix, 0);
+        // Segmented: more than one Data under seq 1 (…/<seq>/v=0/seg=i).
+        let for_seq1: Vec<_> = stored
+            .iter()
+            .filter(|(name, _)| name.has_prefix(&crate::svsync::svs_data_name(&pa, &group, 1)))
+            .collect();
+        assert!(
+            for_seq1.len() > 1,
+            "danger-band blob must segment (got {} outer Data)",
+            for_seq1.len()
+        );
+        for (name, wire) in &for_seq1 {
+            assert!(
+                wire.len() <= MAX_NDN_PACKET_SIZE,
+                "outer Data {name} is {} B, over the {} B packet limit",
+                wire.len(),
+                MAX_NDN_PACKET_SIZE
+            );
+        }
+
+        // A large blob: every outer Data (across all its segments) also fits.
+        let big: Vec<u8> = (0..30_000u32).map(|i| (i % 251) as u8).collect();
+        let seq2 = producer
+            .publish(n("/band/big.bin"), &big)
+            .await
+            .expect("publish large blob");
+        assert_eq!(seq2, 2);
+        let stored2 = store.scan_under(&crate::svsync::svs_data_name(&pa, &group, 2), 0);
+        assert!(stored2.len() > 1, "30 KB blob must span multiple segments");
+        for (name, wire) in &stored2 {
+            assert!(
+                wire.len() <= MAX_NDN_PACKET_SIZE,
+                "outer Data {name} is {} B, over the {} B packet limit",
+                wire.len(),
+                MAX_NDN_PACKET_SIZE
+            );
+        }
+    }
+
+    /// Fix-2 regression: a normal small publish still round-trips through
+    /// publish → encapsulate → fetch → decapsulate → reassemble unchanged.
+    #[tokio::test]
+    async fn small_publish_roundtrips_after_fix() {
+        let group = n("/app/reg");
+        let pa = n("/app/reg/p");
+        let cb = n("/app/reg/c");
+        let (a_out_tx, a_out_rx) = mpsc::channel::<Bytes>(256);
+        let (a_in_tx, a_in_rx) = mpsc::channel::<Bytes>(256);
+        let (b_out_tx, b_out_rx) = mpsc::channel::<Bytes>(256);
+        let (b_in_tx, b_in_rx) = mpsc::channel::<Bytes>(256);
+        wire_broker(a_out_rx, b_in_tx);
+        wire_broker(b_out_rx, a_in_tx);
+
+        let producer = SvsPubSub::join(group.clone(), pa, a_out_tx, a_in_rx, cfg());
+        let consumer = SvsPubSub::join(group.clone(), cb, b_out_tx, b_in_rx, cfg());
+        let mut rx = consumer.subscribe(n("/m")).await;
+
+        producer
+            .publish(n("/m/hello"), b"payload-42")
+            .await
+            .expect("publish small");
+        let got = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timed out")
+            .expect("publication");
+        assert_eq!(got.name, n("/m/hello"));
+        assert_eq!(got.payload.as_ref(), b"payload-42");
     }
 
     #[tokio::test]

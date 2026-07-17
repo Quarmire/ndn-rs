@@ -44,6 +44,30 @@ use crate::rt;
 use crate::svs_sync::{RetryPolicy, SvsConfig, join_svs_group};
 use crate::tlv::encode_nni;
 
+/// The NDN TLV single-Data wire limit: the largest a single Data packet may be
+/// and still traverse a bare face (ndn-cxx `MAX_NDN_PACKET_SIZE`). A Data whose
+/// full wire exceeds this is undeliverable over a plain face — it must be
+/// segmented instead. ndn-packet / ndn-tlv define no such ceiling, so it is
+/// pinned here where publications are named, sized, and stored.
+pub const MAX_NDN_PACKET_SIZE: usize = 8800;
+
+/// A conservative upper bound on the non-content bytes of ONE Data packet: the
+/// Data + Content TLV headers, MetaInfo, SignatureInfo, SignatureValue, and a
+/// generous name allowance. Assumes node/group/app name prefixes stay under
+/// ~400 B (true for NDF names) and is generous versus a `DigestSha256` or
+/// ed25519 Data. Subtracted from [`MAX_NDN_PACKET_SIZE`] to bound how much
+/// *content* a single deliverable Data may carry. Crate-visible so
+/// [`crate::pubsub`] can reserve for BOTH the inner and outer Data of its
+/// double encapsulation.
+pub(crate) const DATA_OVERHEAD_RESERVE: usize = 800;
+
+/// The maximum content of a single (outer) Data that still fits a deliverable
+/// packet: [`MAX_NDN_PACKET_SIZE`] minus one Data's [`DATA_OVERHEAD_RESERVE`]
+/// (= 8000 B). A publication whose content exceeds this must be segmented; the
+/// publish guards reject an oversize single Data rather than silently producing
+/// an undeliverable packet.
+pub const MAX_PUBLISHABLE_CONTENT: usize = MAX_NDN_PACKET_SIZE - DATA_OVERHEAD_RESERVE;
+
 /// Append a sequence number as a generic name component holding its
 /// NonNegativeInteger encoding — ndn-cxx `Name::appendNumber`, the form
 /// ndn-svs uses for the trailing seq of a data name.
@@ -419,6 +443,18 @@ impl SvSync {
         payload: &[u8],
         make_mapping: impl FnOnce(u64) -> Option<Bytes>,
     ) -> Result<u64, SyncError> {
+        // Size guard BEFORE claiming the seq: a content-oversize publication
+        // would build an outer Data past the deliverable packet limit. Reject
+        // it before `fetch_add` so no seq is consumed — a rejected publish must
+        // leave the sequence space gap-free (a claimed-then-abandoned seq would
+        // be a permanent hole peers can never fill, poisoning the producer).
+        if payload.len() > MAX_PUBLISHABLE_CONTENT {
+            return Err(SyncError::Protocol(format!(
+                "publication content {} B exceeds the deliverable single-Data limit {} B — segment it",
+                payload.len(),
+                MAX_PUBLISHABLE_CONTENT
+            )));
+        }
         let seq = self.seq.fetch_add(1, Ordering::AcqRel) + 1;
         let name = svs_data_name(&self.node, &self.group, seq);
         let wire = self.sign_or_build(self.stamp(DataBuilder::new(name.clone(), payload)));
@@ -454,6 +490,17 @@ impl SvSync {
     pub async fn publish_presigned(&self, wire: Bytes) -> Result<u64, SyncError> {
         let data = Data::decode(wire.clone())
             .map_err(|e| SyncError::Protocol(format!("presigned wire is not decodable Data: {e}")))?;
+        // Size guard BEFORE the CAS: `wire` is already the final outer Data, so
+        // check the EXACT wire against the full packet limit. Rejecting here
+        // (before `compare_exchange`) claims no seq — the sequence space stays
+        // gap-free, mirroring the other two publish paths.
+        if wire.len() > MAX_NDN_PACKET_SIZE {
+            return Err(SyncError::Protocol(format!(
+                "presigned wire {} B exceeds the {} B NDN packet limit",
+                wire.len(),
+                MAX_NDN_PACKET_SIZE
+            )));
+        }
         let name = &*data.name;
         let seq_pos = self.node.components().len() + self.group.components().len();
         let seq = name
@@ -495,6 +542,16 @@ impl SvSync {
         segments: &[Vec<u8>],
         make_mapping: impl FnOnce(u64) -> Option<Bytes>,
     ) -> Result<u64, SyncError> {
+        // Size guard BEFORE claiming the seq (same gap-free invariant as
+        // `publish_data_with_mapping`): every segment becomes the content of one
+        // outer Data, so any over-limit segment yields an undeliverable packet.
+        if let Some(offending) = segments.iter().find(|s| s.len() > MAX_PUBLISHABLE_CONTENT) {
+            return Err(SyncError::Protocol(format!(
+                "segment content {} B exceeds the deliverable single-Data limit {} B — split it smaller",
+                offending.len(),
+                MAX_PUBLISHABLE_CONTENT
+            )));
+        }
         let seq = self.seq.fetch_add(1, Ordering::AcqRel) + 1;
         let base = svs_data_name(&self.node, &self.group, seq);
         let last = segments.len().saturating_sub(1) as u64;
@@ -998,6 +1055,83 @@ mod tests {
         assert_eq!(s.find_under(&seq).as_deref(), Some(&b"s0"[..]));
         // No prefixed entry → None.
         assert_eq!(s.find_under(&name("/n/g/6")), None);
+    }
+
+    /// Fix 1, gap-free proof: an oversize single `publish_data` is rejected
+    /// with a `Protocol` error and consumes NO seq — so the very next (small)
+    /// publish still lands at seq 1, proving the sequence space stayed
+    /// contiguous. Claiming-then-abandoning a seq would leave a permanent hole
+    /// that poisons the producer; this is the regression guard against that.
+    #[tokio::test]
+    async fn oversize_single_publish_rejected_without_consuming_seq() {
+        let group = name("/app/big");
+        let node = name("/app/big/n");
+        let (out_tx, _out_rx) = mpsc::channel::<Bytes>(256);
+        let (_in_tx, in_rx) = mpsc::channel::<Bytes>(256);
+        let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
+        let svs = SvSync::join(
+            group.clone(),
+            node.clone(),
+            Arc::clone(&store),
+            out_tx,
+            in_rx,
+            SvSyncConfig::default(),
+        );
+
+        let oversize = vec![0u8; MAX_PUBLISHABLE_CONTENT + 1];
+        let err = svs
+            .publish_data(&oversize)
+            .await
+            .expect_err("content over the single-Data limit must be rejected");
+        assert!(matches!(err, SyncError::Protocol(_)), "typed Protocol rejection");
+        assert!(store.get(&svs_data_name(&node, &group, 1)).is_none());
+
+        // The rejected call consumed NO seq: the next valid publish is seq 1,
+        // i.e. the sequence space is gap-free and contiguous.
+        let seq = svs.publish_data(b"small").await.expect("small publish");
+        assert_eq!(seq, 1, "rejected oversize publish must not have taken a seq");
+    }
+
+    /// Fix 1 (presigned path), gap-free proof: an oversize presigned wire is
+    /// rejected before the CAS, consuming no seq — a valid in-limit presigned
+    /// seq-1 wire then still succeeds at seq 1.
+    #[tokio::test]
+    async fn oversize_presigned_rejected_without_consuming_seq() {
+        let group = name("/edge/big");
+        let device = name("/edge/big/dev");
+        let (out_tx, _out_rx) = mpsc::channel::<Bytes>(256);
+        let (_in_tx, in_rx) = mpsc::channel::<Bytes>(256);
+        let store = Arc::new(MemoryStore::new());
+        let svs = SvSync::join(
+            group.clone(),
+            device.clone(),
+            Arc::clone(&store) as Arc<dyn DataStore>,
+            out_tx,
+            in_rx,
+            SvSyncConfig::default(),
+        );
+
+        // A correctly-named seq-1 wire whose payload pushes the full outer wire
+        // past MAX_NDN_PACKET_SIZE.
+        let n1 = svs_data_name(&device, &group, 1);
+        let fat_payload = vec![0u8; MAX_NDN_PACKET_SIZE];
+        let oversize_wire: Bytes = DataBuilder::new(n1.clone(), &fat_payload).build();
+        assert!(oversize_wire.len() > MAX_NDN_PACKET_SIZE, "wire is over the packet limit");
+        let err = svs
+            .publish_presigned(oversize_wire)
+            .await
+            .expect_err("presigned wire over the packet limit must be rejected");
+        assert!(matches!(err, SyncError::Protocol(_)), "typed Protocol rejection");
+        assert!(store.get(&n1).is_none(), "rejected wire must not be stored");
+
+        // No seq was consumed: a valid in-limit seq-1 presigned wire succeeds.
+        let small_wire: Bytes = DataBuilder::new(n1.clone(), b"ok").build();
+        let seq = svs
+            .publish_presigned(small_wire.clone())
+            .await
+            .expect("in-limit presigned seq 1 accepted");
+        assert_eq!(seq, 1, "rejected oversize presigned must not have taken seq 1");
+        assert_eq!(store.get(&n1), Some(small_wire));
     }
 
     #[tokio::test]
