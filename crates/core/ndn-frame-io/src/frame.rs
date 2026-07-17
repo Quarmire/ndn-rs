@@ -111,6 +111,8 @@ pub fn build_at(
     match format {
         // ESP-NOW rides a robust legacy rate (1 Mbps), not an MCS.
         FrameFormat::EspNow { .. } => out.extend_from_slice(&radiotap::build_tx_legacy(2)),
+        // S1G/HaLow: no 11n/ac MCS — the on-chip MAC picks the sub-GHz rate.
+        FrameFormat::RawNdnS1g { .. } => out.extend_from_slice(&radiotap::build_tx_s1g()),
         _ => out.extend_from_slice(&radiotap::build_tx_header(mcs.index, mcs.short_gi)),
     }
     out.extend_from_slice(&dot11);
@@ -126,7 +128,9 @@ pub fn build_at(
 pub fn build_dot11(format: FrameFormat, frame: &InjectFrame) -> Result<Vec<u8>, FaceError> {
     let mut out = Vec::with_capacity(64 + frame.payload.len());
     match format {
-        FrameFormat::RawNdn { ethertype } => {
+        // RawNdn and RawNdnS1g share the exact data-frame body; they differ only
+        // in the radiotap TX rate header chosen in `build_at`.
+        FrameFormat::RawNdn { ethertype } | FrameFormat::RawNdnS1g { ethertype } => {
             // 802.11 non-QoS data frame. addr1/addr3 = destination group (or
             // broadcast); addr2 = name-derived source. The NDN name is the
             // addressing — these fields are a name-keyed index, not host ids.
@@ -233,7 +237,7 @@ pub fn parse_dot11(
     let fc0 = body[0];
 
     match format {
-        FrameFormat::RawNdn { ethertype } => {
+        FrameFormat::RawNdn { ethertype } | FrameFormat::RawNdnS1g { ethertype } => {
             if (fc0 >> 2) & 0x03 != 0x02 {
                 return None; // not a data frame
             }

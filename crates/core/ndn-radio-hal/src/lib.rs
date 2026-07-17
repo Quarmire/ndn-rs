@@ -891,6 +891,36 @@ impl RadioCapability {
         }
     }
 
+    /// A Wi-Fi HaLow (802.11ah / S1G) monitor radio — our Newracom NRC7292 on
+    /// the sub-GHz band. Same 802.11-family framing and monitor-injection model
+    /// as the 2.4/5 GHz backends (so it pools uniformly), but on the ~900 MHz S1G
+    /// PHY: narrow channels, single stream, and a longer link budget for range.
+    /// `channels` are the driver's US alias numbers (e.g. 161 = 925 MHz). The
+    /// NRC7292 supports S1G MCS 0–10; rate is set by the on-chip MAC, so the
+    /// injection radiotap names no MCS ([`FrameFormat::RawNdnS1g`]).
+    pub fn wifi_halow_s1g(channels: Vec<u8>) -> Self {
+        Self {
+            kind: RadioKind::WifiMonitor,
+            bands: vec![Band::Sub1GHz],
+            rate: RateCapability::Wifi {
+                max_mcs: 10, // S1G MCS0–10 (MCS10 = 1 MHz-only rep-coded BPSK)
+                max_nss: 1,
+                max_bw: 0, // 1/2/4 MHz S1G widths; we run the base 1 MHz-equiv slot
+            },
+            channels,
+            max_tx_power: 63,
+            agile: true,
+            rx_only: false,
+            // S1G is a licence-exempt sub-GHz band but, unlike the LoRa ISM path,
+            // 802.11ah uses CSMA/CA (listen-before-talk), not a hard duty cycle.
+            timing: TimingModel::AlwaysOn,
+            duty_cycle_max: 1.0,
+            max_payload: 1500,
+            half_duplex: true,
+            csi: CsiSupport::None,
+        }
+    }
+
     /// A sub-GHz LoRa-class radio (long range, low rate).
     pub fn lora(channels: Vec<u8>) -> Self {
         Self {

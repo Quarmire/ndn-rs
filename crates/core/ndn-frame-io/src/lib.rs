@@ -83,6 +83,16 @@ pub enum FrameFormat {
     /// 802.11 data frame + LLC/SNAP carrying `ethertype`, then the NDN payload.
     /// Our peers' native format.
     RawNdn { ethertype: u16 },
+    /// The same named-data frame as [`RawNdn`](FrameFormat::RawNdn) — 802.11 data
+    /// frame + LLC/SNAP + NDN payload — transmitted on an **802.11ah
+    /// (S1G / Wi-Fi HaLow)** sub-GHz radio. The only difference from `RawNdn` is
+    /// the radiotap TX header: S1G names no 11n/ac MCS (the on-chip MAC picks the
+    /// sub-GHz rate), so this selects [`radiotap::build_tx_s1g`]. Body build and
+    /// RX parse are byte-identical to `RawNdn`, so a HaLow radio pools uniformly
+    /// with the 2.4/5 GHz backends: same [`FrameIo`] data plane, same face. Our
+    /// own traffic still rides an NDN data frame (doctrine) — this is that frame
+    /// on a sub-GHz PHY, not a host-addressed interop format.
+    RawNdnS1g { ethertype: u16 },
     /// wfb-ng frame layout — interop with OpenIPC / FPV chipsets. (Phase 3.)
     Wfb,
     /// ESP-NOW vendor action frame (`oui` = vendor OUI) — interop with ESP32s

@@ -104,6 +104,29 @@ pub fn build_tx_legacy(rate_500kbps: u8) -> [u8; TX_LEGACY_HEADER_LEN] {
     h
 }
 
+/// Total length of the S1G TX header produced by [`build_tx_s1g`].
+pub const TX_S1G_HEADER_LEN: usize = 10;
+
+/// Build a radiotap **TX** header for **802.11ah (S1G / Wi-Fi HaLow)** injection.
+///
+/// S1G is a different PHY: its rate is not an 11n/ac MCS index and the on-chip
+/// MAC (e.g. the Newracom NRC7292) sets the sub-GHz rate itself. So this header
+/// names **no** rate — it carries only `TX_FLAGS = NOACK` (broadcast injection,
+/// no ACK to wait for). Naming an HT MCS here would be semantically wrong for an
+/// S1G frame; leaving rate unset lets the firmware transmit at its configured
+/// S1G rate. Verified on-air: an NRC7292 in monitor mode injects a frame carried
+/// by this header and a second NRC7292 receives it.
+///
+/// Layout: `TX_FLAGS` (bit 15, 2-byte aligned at offset 8), nothing else.
+pub fn build_tx_s1g() -> [u8; TX_S1G_HEADER_LEN] {
+    let present: u32 = 1 << BIT_TX_FLAGS;
+    let mut h = [0u8; TX_S1G_HEADER_LEN];
+    h[2..4].copy_from_slice(&(TX_S1G_HEADER_LEN as u16).to_le_bytes());
+    h[4..8].copy_from_slice(&present.to_le_bytes());
+    h[8..10].copy_from_slice(&TX_FLAG_NOACK.to_le_bytes()); // TX_FLAGS @ offset 8
+    h
+}
+
 /// What we extract from a captured frame's radiotap header.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RadiotapInfo {
