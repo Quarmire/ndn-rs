@@ -372,6 +372,7 @@ impl FacePersistency {
 /// bounded send buffer (retry or drop the packet, but keep the face); `Io`
 /// wraps the underlying OS error.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum FaceError {
     #[error("face closed")]
     Closed,
@@ -379,6 +380,11 @@ pub enum FaceError {
     Io(#[from] std::io::Error),
     #[error("send buffer full")]
     Full,
+    /// No [`FaceFactory`](crate::FaceFactory) was registered for the requested
+    /// [`FaceKind`] — a data-driven `add_face_of_kind` names a bearer this node
+    /// cannot stand up. Distinct from an I/O failure of a bearer it *can* build.
+    #[error("no face factory registered for kind {0}")]
+    NoFactory(FaceKind),
 }
 
 /// A composed ([`Transport`] +

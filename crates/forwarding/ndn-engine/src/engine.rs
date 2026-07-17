@@ -520,7 +520,7 @@ impl ForwarderEngine {
     /// with no per-kind `match` and no coupling to bearer crates. Register the
     /// factories via [`EngineBuilder::face_factory`](crate::EngineBuilder::face_factory).
     ///
-    /// Errors: `FaceError::Io(ErrorKind::Unsupported)` when no factory is
+    /// Errors: `FaceError::NoFactory(kind)` when no factory is
     /// registered for `kind`; otherwise whatever the factory returns for
     /// malformed params or a bind/dial failure. The face is added with
     /// [`FacePersistency::OnDemand`].
@@ -537,12 +537,7 @@ impl ForwarderEngine {
             .iter()
             .rev()
             .find(|f| f.kind() == kind)
-            .ok_or_else(|| {
-                ndn_transport::FaceError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    format!("no FaceFactory registered for kind {kind}"),
-                ))
-            })?;
+            .ok_or(ndn_transport::FaceError::NoFactory(kind))?;
 
         // Engine owns id allocation (monotonic, never recycled) — the factory
         // receives the id rather than minting its own.

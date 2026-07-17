@@ -72,8 +72,8 @@ async fn add_face_of_kind_builds_a_live_udp_face_that_carries_a_packet() {
     shutdown.shutdown().await;
 }
 
-/// No factory registered for the requested kind → a typed error
-/// (`FaceError::Io(ErrorKind::Unsupported)`), not a panic or a silent no-op.
+/// No factory registered for the requested kind → the typed
+/// `FaceError::NoFactory(kind)`, not a panic or a silent no-op.
 #[tokio::test]
 async fn add_face_of_kind_errors_when_no_factory_registered() {
     let (engine, shutdown) = EngineBuilder::new(EngineConfig::default())
@@ -89,8 +89,8 @@ async fn add_face_of_kind_errors_when_no_factory_registered() {
         .add_face_of_kind(FaceKind::Tcp, &params, cancel)
         .await
     {
-        Err(FaceError::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::Unsupported),
-        Err(other) => panic!("expected Io(Unsupported), got {other:?}"),
+        Err(FaceError::NoFactory(kind)) => assert_eq!(kind, FaceKind::Tcp),
+        Err(other) => panic!("expected NoFactory(Tcp), got {other:?}"),
         Ok(_) => panic!("expected an error when no Tcp factory is registered"),
     }
 
