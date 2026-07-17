@@ -135,6 +135,21 @@ pub trait Transport: Send + Sync + 'static {
         self.send_bytes(wire)
     }
 
+    /// Send framed wire bytes to a specific link-layer peer. The default
+    /// **ignores `addr`** and delegates to [`send_bytes`](Transport::send_bytes),
+    /// so point-to-point transports (UDP unicast, TCP, Unix, InProc) need do
+    /// nothing. Shared-medium transports that can address an individual peer
+    /// (`MulticastUdpFace`, the L2 multicast Ether faces) should override this
+    /// to unicast the reply back to `addr` — the counterpart of the source
+    /// returned by [`recv_bytes_with_addr`](Transport::recv_bytes_with_addr).
+    fn send_bytes_to(
+        &self,
+        _addr: FaceAddr,
+        wire: Bytes,
+    ) -> impl Future<Output = Result<(), FaceError>> + Send {
+        self.send_bytes(wire)
+    }
+
     /// Override the effective send MTU at runtime.
     /// `Some(n)` clamps to the transport's hard maximum; `None` reverts
     /// to the default. Returns the effective MTU (`None` for streams).
@@ -169,6 +184,12 @@ pub trait ErasedTransport: Send + Sync + 'static {
         &self,
         wire: Bytes,
         source: FaceId,
+    ) -> Pin<Box<dyn Future<Output = Result<(), FaceError>> + Send + '_>>;
+
+    fn send_bytes_to(
+        &self,
+        addr: FaceAddr,
+        wire: Bytes,
     ) -> Pin<Box<dyn Future<Output = Result<(), FaceError>> + Send + '_>>;
 
     fn send_batch<'a>(
@@ -219,6 +240,14 @@ impl<T: Transport> ErasedTransport for T {
         source: FaceId,
     ) -> Pin<Box<dyn Future<Output = Result<(), FaceError>> + Send + '_>> {
         Box::pin(Transport::send_bytes_with_source(self, wire, source))
+    }
+
+    fn send_bytes_to(
+        &self,
+        addr: FaceAddr,
+        wire: Bytes,
+    ) -> Pin<Box<dyn Future<Output = Result<(), FaceError>> + Send + '_>> {
+        Box::pin(Transport::send_bytes_to(self, addr, wire))
     }
 
     fn send_batch<'a>(

@@ -1,5 +1,11 @@
 //! IP-based NDN face transports: [`UdpFace`], [`MulticastUdpFace`], and
 //! [`TcpFace`]. (WebSocket moved to the `ndn-face-websocket` extension crate.)
+//!
+//! For the NFD-style listener that binds a port, demuxes datagrams by source,
+//! and replies to each source (built on [`udp::UdpFace::from_shared_socket`]),
+//! see `ndn_mgmt::run_udp_listener` — it is engine-coupled and lives in the
+//! management crate, not here (`ndn-mgmt` depends on `ndn-face`, so a re-export
+//! would be a dependency cycle).
 
 #![allow(missing_docs)]
 

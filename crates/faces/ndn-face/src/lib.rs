@@ -3,6 +3,7 @@
 //! | Module | Types | Feature |
 //! |--------|-------|---------|
 //! | [`net`] | [`UdpFace`], [`TcpFace`], [`MulticastUdpFace`] | `net` |
+//! | [`net`] listener | reply-to-source UDP → [`UdpFace::from_shared_socket`] | `net` |
 //! | [`local`] | [`InProcFace`], [`InProcHandle`], [`UnixFace`], [`IpcFace`] | `local` |
 //! | `l2` | `NamedEtherFace`, `MulticastEtherFace` | `l2` |
 //!
@@ -12,6 +13,18 @@
 //! [`CallbackFace`] is the NDN virtual face pattern: an in-process face that
 //! satisfies Interests via an application-provided async callback, appearing
 //! to the pipeline as a normal FIB next-hop.
+//!
+//! ## NFD-style "bind a port, reply to source" UDP face
+//!
+//! The reusable, engine-free primitive lives here:
+//! [`UdpFace::from_shared_socket`] builds a send-only face that shares one
+//! listener socket and directs every reply back to the datagram's source
+//! address (so a consumer on an ephemeral port — not 6363 — still receives its
+//! Data). The demux loop that binds the port, allocates a face per source, and
+//! injects into the forwarder is engine-coupled glue, so it canonically lives
+//! one layer up in the management crate: `ndn_mgmt::run_udp_listener`. It is not
+//! re-exported here because `ndn-mgmt` already depends on `ndn-face` (that would
+//! be a dependency cycle).
 
 #![allow(missing_docs)]
 // One of the two OS-I/O leaf crates permitted to use `unsafe` (the workspace
