@@ -18,7 +18,33 @@ Core NDN packet types and their TLV wire-format codec. Fields are decoded lazily
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `std` | on | Enables `ring`-backed signatures and NDNLPv2 fragment reassembly. Disable for `no_std` targets. |
+| `std` | off (opt-in) | Enables the `encode` / `wire` / `fragment` modules and `sha2` / `blake3` hashing helpers. Leave off for `no_std` targets. |
+| `portable-atomic` | off | Routes `bytes::Bytes` / `Arc` refcounting through `portable-atomic` for `no_std` targets without hardware atomic CAS (`riscv32imc`, `thumbv6m`, …). |
+
+## no_std
+
+`ndn-packet` builds `#![no_std]` out of the box — `std` is **not** a default
+feature (`default = []`). An allocator is required (`extern crate alloc`).
+`Name` / `Interest` / `Data` and the NDNLPv2 `LpPacket` codec
+(`LpPacket::decode`, `encode_lp_packet`, both re-exported at the crate root) are
+all available without `std`.
+
+```toml
+# Bare-metal / embedded: keep std off (the default).
+ndn-packet = { version = "...", default-features = false }
+
+# Hosted build that also wants the encode/wire/fragment modules + hashing:
+ndn-packet = { version = "...", features = ["std"] }
+```
+
+Targets without hardware atomic CAS (e.g. `riscv32imc`, `thumbv6m`) additionally
+need the `portable-atomic` feature, and the final binary must select a CAS
+polyfill (typically `--cfg portable_atomic_unsafe_assume_single_core` on a
+uniprocessor MCU):
+
+```toml
+ndn-packet = { version = "...", default-features = false, features = ["portable-atomic"] }
+```
 
 ## Usage
 

@@ -1,8 +1,9 @@
 //! NDN packet types and wire-format codec. Fields decode lazily via `OnceLock`
 //! so fast-path operations (e.g. Content Store hits) skip unused fields.
 //!
-//! `std` (default) — enables `ring` signatures and fragment reassembly.
-//! Without it, an allocator is still required.
+//! Builds `#![no_std]` by default (`std` is opt-in, not a default feature);
+//! the `std` feature adds the `encode` / `wire` / `fragment` modules and hashing
+//! helpers. Either way an allocator is required.
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![allow(missing_docs)]
@@ -37,7 +38,7 @@ pub use data::{ContentHashTarget, Data};
 pub use encode::random_reflexive_name;
 pub use error::PacketError;
 pub use interest::{Interest, Selector};
-pub use lp::{CachePolicyType, LpHeaders};
+pub use lp::{CachePolicyType, LpHeaders, LpPacket, encode_lp_packet};
 pub use meta_info::MetaInfo;
 pub use nack::{Nack, NackHeader, NackReason};
 pub use name::{Name, NameComponent};
