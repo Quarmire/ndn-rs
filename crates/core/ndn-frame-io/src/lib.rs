@@ -37,16 +37,33 @@ mod af_packet;
 #[cfg(target_os = "linux")]
 pub use af_packet::AfPacketBackend;
 
-/// Usable injected-frame payload budget, sized to the **single 802.11 MSDU
-/// ceiling**: an 802.11 MSDU is at most 2304 octets, and the backend spends 8
-/// of those on the LLC/SNAP header that precedes our payload, leaving 2296.
-/// One injected frame therefore carries one ~2296-byte LP frame without any
+/// Usable injected-frame payload budget, sized to the **single 802.11 frame
+/// ceiling** (2304 octets) minus everything the backend puts in front of our
+/// payload:
+///
+/// ```text
+///   2304  the ceiling the radio enforces on the injected frame
+///  -  24  802.11 MAC header (fc · dur · addr1 · addr2 · addr3 · seq)
+///  -   8  LLC/SNAP
+///  = 2272
+/// ```
+///
+/// One injected frame therefore carries one 2272-byte LP frame without any
 /// aggregation — the cheapest way to cut fragments-per-object (and thus the
 /// multi-fragment loss an unACKed broadcast suffers) before reaching for
-/// A-MSDU. Tunable per face via `MonitorWifiFace::with_mtu`; bigger frames
-/// also raise per-frame loss at a given MCS, so the sweet spot is empirical
-/// (see the `monitor_roundtrip` goodput bench).
-pub const MONITOR_MTU: usize = 2296;
+/// A-MSDU. Tunable per face via `MonitorWifiFace::with_mtu`; bigger frames also
+/// raise per-frame loss at a given MCS, so the sweet spot is empirical (see the
+/// `monitor_roundtrip` goodput bench).
+///
+/// **This was 2296, and it silently broke every fragmented object.** That budget
+/// subtracted the LLC/SNAP but not the 24-byte MAC header, so a full-MTU LP frame
+/// went on air as `2296 + 8 + 24 = 2328` — over the ceiling, dropped by the radio,
+/// with no error surfaced anywhere. An object small enough for one short frame was
+/// fine; anything that fragmented emitted full-size fragments and lost every one,
+/// so the failure looked like "multi-fragment objects are lossy" rather than
+/// "our MTU is 24 bytes too big". Measured on an RTL8812AU (`size_fork` probe):
+/// frames of 2200/2260/2300 B deliver 100%; frames of 2312 B and up never arrive.
+pub const MONITOR_MTU: usize = 2272;
 
 /// The legacy ~1500-byte-Ethernet-ish MTU used before the single-MSDU bump,
 /// kept as a named baseline for the goodput A/B (`with_mtu(LEGACY_ETHER_MTU)`).
