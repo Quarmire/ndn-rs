@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::Bytes;
 use ndn_packet::Name;
-use ndn_transport::{FaceError, FaceId, FaceKind, LinkType, MtuError, Transport};
+use ndn_transport::{FaceAddr, FaceError, FaceId, FaceKind, LinkType, MtuError, Transport};
 
 use ndn_transport::MacAddr;
 
@@ -172,6 +172,21 @@ impl Transport for MulticastEtherFace {
     /// NDNLPv2 header on the wire.
     async fn send_bytes(&self, pkt: Bytes) -> Result<(), FaceError> {
         self.socket.send_to_mcast(&pkt).await.map_err(FaceError::Io)
+    }
+
+    /// Reply-to-source: unicast `pkt` to the specific peer MAC surfaced via
+    /// [`FaceAddr::Ether`] (the same `send_to` unicast path
+    /// [`NamedEtherFace`] uses) instead of the NDN multicast group. A non-
+    /// `Ether` `FaceAddr` cannot come from this socket, so it falls back to the
+    /// multicast send.
+    async fn send_bytes_to(&self, addr: FaceAddr, pkt: Bytes) -> Result<(), FaceError> {
+        let FaceAddr::Ether(mac) = addr else {
+            return self.send_bytes(pkt).await;
+        };
+        self.socket
+            .send_to(&pkt, &MacAddr(mac))
+            .await
+            .map_err(FaceError::Io)
     }
 }
 

@@ -158,6 +158,36 @@ impl Transport for MulticastEtherFace {
         }
 
         let dst = make_sockaddr_ll(self.ifindex, &NDN_ETHER_MCAST_MAC, NDN_ETHERTYPE);
+        self.tx_to(dst)
+    }
+
+    /// Reply-to-source: unicast `pkt` to the specific peer MAC that a prior
+    /// [`recv_bytes_with_addr`](Transport::recv_bytes_with_addr) surfaced via
+    /// [`FaceAddr::Ether`], instead of sending to the NDN multicast group.
+    /// Mirrors [`send_bytes`](Self::send_bytes) (same TX-ring push then
+    /// `sendto`); only the destination `sockaddr_ll` differs. A non-`Ether`
+    /// `FaceAddr` cannot come from this socket, so it falls back to multicast.
+    async fn send_bytes_to(&self, addr: FaceAddr, pkt: Bytes) -> Result<(), FaceError> {
+        let FaceAddr::Ether(mac) = addr else {
+            return self.send_bytes(pkt).await;
+        };
+        loop {
+            if self.ring.try_push_tx(&pkt) {
+                break;
+            }
+            let mut guard = self.socket.writable().await?;
+            guard.clear_ready();
+        }
+        let dst = make_sockaddr_ll(self.ifindex, &MacAddr(mac), NDN_ETHERTYPE);
+        self.tx_to(dst)
+    }
+}
+
+impl MulticastEtherFace {
+    /// Flush the already-queued TX frame to `dst` (shared egress syscall for
+    /// [`send_bytes`](MulticastEtherFace::send_bytes) and its unicast
+    /// reply-to-source counterpart).
+    fn tx_to(&self, dst: libc::sockaddr_ll) -> Result<(), FaceError> {
         let fd = self.socket.get_ref().as_raw_fd();
         let ret = unsafe {
             libc::sendto(

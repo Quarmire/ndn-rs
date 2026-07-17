@@ -157,6 +157,27 @@ impl Transport for MulticastUdpFace {
             Err(e) => Err(e.into()),
         }
     }
+
+    /// Reply-to-source: unicast `wire` back to the specific UDP peer that a
+    /// prior [`recv_bytes_with_addr`](Transport::recv_bytes_with_addr) surfaced
+    /// via [`FaceAddr::Udp`], instead of re-broadcasting to the group. Mirrors
+    /// [`send_bytes`](Self::send_bytes) exactly (same `try_send_to` → async
+    /// fallback), only the destination differs; the payload is already
+    /// LP-framed by the paired `LpLinkService`. A non-`Udp` `FaceAddr` cannot
+    /// come from this socket, so it falls back to the multicast group send.
+    async fn send_bytes_to(&self, addr: FaceAddr, wire: Bytes) -> Result<(), FaceError> {
+        let FaceAddr::Udp(peer) = addr else {
+            return self.send_bytes(wire).await;
+        };
+        match self.socket.try_send_to(&wire, peer) {
+            Ok(_) => Ok(()),
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                self.socket.send_to(&wire, peer).await?;
+                Ok(())
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -189,6 +210,58 @@ mod tests {
         assert_eq!(face.id(), FaceId(3));
         assert_eq!(face.kind(), FaceKind::Multicast);
         assert_eq!(face.dest(), dest);
+    }
+
+    /// Reply-to-source round-trip. Pure loopback **unicast** — no multicast
+    /// join or multicast loop-back (which the sandbox blocks with os error 49),
+    /// so it runs everywhere: B unicasts to A; A learns B's addr via
+    /// `recv_bytes_with_addr`; A `send_bytes_to` that addr and the reply lands
+    /// on B — proving the override targets the peer, not the group `dest`.
+    #[tokio::test]
+    async fn reply_to_source_unicasts_to_peer() {
+        let sock_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sock_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr_a = sock_a.local_addr().unwrap();
+        let addr_b = sock_b.local_addr().unwrap();
+
+        // A deliberately-bogus group `dest`: send_bytes_to must NOT use it.
+        let group: SocketAddr = "224.0.23.170:56363".parse().unwrap();
+        let face_a = MulticastUdpFace::with_socket(FaceId(0), sock_a, group);
+
+        // B unicasts a "request" to A.
+        let req = Bytes::from_static(b"\x05\x03ndn");
+        sock_b.send_to(&req, addr_a).await.unwrap();
+
+        // A receives it and learns B's source address.
+        let (got, src) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            face_a.recv_bytes_with_addr(),
+        )
+        .await
+        .expect("recv timed out")
+        .expect("recv failed");
+        assert_eq!(got, req);
+        let src = src.expect("multicast face surfaces the UDP source addr");
+        match src {
+            FaceAddr::Udp(sa) => assert_eq!(sa, addr_b),
+            other => panic!("expected Udp source, got {other:?}"),
+        }
+
+        // A replies to source: the reply must arrive at B (the peer), not the
+        // multicast group `dest`.
+        let reply = Bytes::from_static(b"\x06\x04data");
+        face_a.send_bytes_to(src, reply.clone()).await.unwrap();
+
+        let mut buf = [0u8; 64];
+        let (n, from) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            sock_b.recv_from(&mut buf),
+        )
+        .await
+        .expect("reply timed out")
+        .expect("reply recv failed");
+        assert_eq!(&buf[..n], &reply[..]);
+        assert_eq!(from, addr_a);
     }
 
     /// Skipped in sandboxed CI where multicast join or loop-back is blocked.

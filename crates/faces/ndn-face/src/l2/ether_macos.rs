@@ -178,6 +178,22 @@ impl Transport for MulticastEtherFace {
     async fn send_bytes(&self, pkt: Bytes) -> Result<(), FaceError> {
         self.socket.send_to_mcast(&pkt).await.map_err(FaceError::Io)
     }
+
+    /// Reply-to-source: unicast `pkt` to the specific peer MAC that a prior
+    /// [`recv_bytes_with_addr`](Transport::recv_bytes_with_addr) surfaced via
+    /// [`FaceAddr::Ether`], instead of sending to the NDN multicast group —
+    /// the same `NdrvSocket::send_to` unicast path [`NamedEtherFace`] uses. A
+    /// non-`Ether` `FaceAddr` cannot come from this socket, so it falls back
+    /// to the multicast send.
+    async fn send_bytes_to(&self, addr: FaceAddr, pkt: Bytes) -> Result<(), FaceError> {
+        let FaceAddr::Ether(mac) = addr else {
+            return self.send_bytes(pkt).await;
+        };
+        self.socket
+            .send_to(&pkt, &MacAddr(mac))
+            .await
+            .map_err(FaceError::Io)
+    }
 }
 
 #[cfg(test)]
