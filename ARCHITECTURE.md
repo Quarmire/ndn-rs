@@ -355,6 +355,31 @@ trust authority), and the end consumer verifies against a pinned cert.
 opaque handles aren't passable across the FFI).
 
 **Two-tier Wi-Fi Aware: coordination follow-ups + an NDP bulk path (extension).**
+
+> **The premise of this section was refuted on 2026-07-16.** The "lossy for
+> multi-fragment objects" claim below was measured on our own stack, and the loss
+> was two bugs in it: `MONITOR_MTU` was 2296 — it subtracted LLC/SNAP from the
+> 802.11 2304-octet ceiling but forgot the 24-byte MAC header, so every full-MTU
+> fragment went on air at 2328 B and the radio silently dropped it (ndn-rs
+> `e81c9922`); and the RTL8812AU had no RX pump, so a bulk-IN read was in flight
+> only *during* a `recv_frame` call and back-to-back fragments landed with nothing
+> draining the FIFO (ndn-ext `7d65d80`). With both fixed, name-addressed broadcast
+> carries multi-fragment objects: 800/1400 B → 12/12, 4000 B → 9/12, 16000 B (8
+> fragments) → 3/12, where every row from 2200 B up had been 0/12 in four prior
+> runs. The raw radio was always blameless — 2200/2260/2300 B deliver 100% and
+> 2312 B never arrives, which is the 802.11 ceiling behaving correctly.
+>
+> So multi-fragment loss is **not** intrinsic to connectionless small-frame faces,
+> and this section is no longer the reason to build an NDP tier. NDP is retained,
+> but as an **interop bearer** — the way we talk to a stock Wi-Fi Aware device,
+> which speaks IPv6/UDP and nothing else. Our own traffic rides
+> `FrameFormat::RawNdn`, where the NDN name is the addressing. The argument, and
+> why host-addressed transport under a named-data stack is a regression rather
+> than a tier, is in
+> `ndn-ext/crates/faces/ndn-face-wifi-aware/docs/NAMED_RADIO_COURSE_CORRECTION.md`.
+> The description below is accurate about what was built; treat its *justification*
+> as history.
+
 The named-radio faces above are connectionless and small-frame (NAN follow-ups
 ≤255 B, BLE advertisements ≤~245 B) — fine for presence, discovery, and small
 Interest/Data, but lossy for multi-fragment objects. The high-throughput tier is
