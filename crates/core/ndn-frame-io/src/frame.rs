@@ -42,40 +42,143 @@ pub const ESPNOW_OUI: [u8; 3] = [0x18, 0xfe, 0x34];
 /// through the crate root so `frame::BROADCAST` / `frame::DEFAULT_SRC` still resolve.
 pub use crate::{BROADCAST, DEFAULT_SRC};
 
-/// FNV-1a (64-bit) — a fast, dependency-free, non-cryptographic hash. The group
-/// MAC is only a Bloom-style pre-filter hint; the full name + signature are
-/// authoritative after decode, so collision resistance is not required.
-fn fnv1a(data: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in data {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+/// **SipHash-2-4** (Aumasson & Bernstein) — a fast *keyed* PRF, vendored (no dep)
+/// and shared with the FHSS rendezvous (`HopSchedule`). Keyed because the
+/// name-group hash is the compiled form of a **public** name: an unkeyed hash lets
+/// any outsider compute (or cheaply collide) a victim's group hash and flood its
+/// receive filter. Under a private trust domain's secret key the group hash is
+/// unforgeable and unlinkable to outsiders; under the well-known [`OPEN_GROUP_KEY`]
+/// it is a strong public hash giving an open receiver set. (This is not the last
+/// line of DoS defence — that is PIT-gated verification + rate-limiting; keying just
+/// raises the bar for *outsiders* targeting a private group's pre-parse filter.)
+pub fn siphash24(key: &[u8; 16], data: &[u8]) -> u64 {
+    let k0 = u64::from_le_bytes(key[0..8].try_into().unwrap());
+    let k1 = u64::from_le_bytes(key[8..16].try_into().unwrap());
+    let mut v0 = 0x736f_6d65_7073_6575 ^ k0;
+    let mut v1 = 0x646f_7261_6e64_6f6d ^ k1;
+    let mut v2 = 0x6c79_6765_6e65_7261 ^ k0;
+    let mut v3 = 0x7465_6462_7974_6573 ^ k1;
+    macro_rules! round {
+        () => {{
+            v0 = v0.wrapping_add(v1);
+            v1 = v1.rotate_left(13);
+            v1 ^= v0;
+            v0 = v0.rotate_left(32);
+            v2 = v2.wrapping_add(v3);
+            v3 = v3.rotate_left(16);
+            v3 ^= v2;
+            v0 = v0.wrapping_add(v3);
+            v3 = v3.rotate_left(21);
+            v3 ^= v0;
+            v2 = v2.wrapping_add(v1);
+            v1 = v1.rotate_left(17);
+            v1 ^= v2;
+            v2 = v2.rotate_left(32);
+        }};
     }
-    h
+    let mut chunks = data.chunks_exact(8);
+    for c in &mut chunks {
+        let m = u64::from_le_bytes(c.try_into().unwrap());
+        v3 ^= m;
+        round!();
+        round!();
+        v0 ^= m;
+    }
+    let mut last = (data.len() as u64 & 0xff) << 56;
+    for (i, &b) in chunks.remainder().iter().enumerate() {
+        last |= (b as u64) << (8 * i);
+    }
+    v3 ^= last;
+    round!();
+    round!();
+    v0 ^= last;
+    v2 ^= 0xff;
+    round!();
+    round!();
+    round!();
+    round!();
+    v0 ^ v1 ^ v2 ^ v3
 }
 
-/// A **multicast** MAC derived from a name prefix — *"the prefix is the group
-/// address."* A receiver interested in `prefix` can program its NIC's
-/// multicast filter (or a software pre-filter) to this address and hardware-
-/// drop everything else, making the medium's broadcast nature selective by
-/// name. The first octet sets the I/G (group) and U/L (locally-administered)
-/// bits; the low 46 bits carry `fnv1a(prefix)`.
-pub fn name_group_mac(prefix: &[u8]) -> [u8; 6] {
-    let h = fnv1a(prefix).to_be_bytes();
-    let mut m = [h[0], h[1], h[2], h[3], h[4], h[5]];
-    m[0] = (m[0] & 0xFC) | 0x03; // I/G = 1 (group), U/L = 1 (local)
+/// A trust-context key for name-group hashing (see [`siphash24`]). The well-known
+/// [`OPEN_GROUP_KEY`] gives an open receiver set (anyone computes the hash and
+/// filters/joins); a shared secret scopes a group to a trust domain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GroupKey(pub [u8; 16]);
+
+/// The well-known key for open/public namespaces — an open receiver set.
+pub const OPEN_GROUP_KEY: GroupKey = GroupKey(*b"ndn/open-group!!");
+
+/// Set the I/G + U/L bits of a locally-administered address body: `group=true`
+/// → multicast (`0x03`), `false` → unicast (`0x02`).
+fn tag_local(mut m: [u8; 6], group: bool) -> [u8; 6] {
+    m[0] = (m[0] & 0xFC) | if group { 0x03 } else { 0x02 };
     m
 }
 
-/// A **unicast** locally-administered MAC derived from a name prefix, used as
-/// the source/transmitter address so the 802.11 `addr2` is name-derived rather
-/// than a host id. Because every fragment of a prefix's traffic shares it, the
-/// reassembly stream key the face reports upward is name-keyed, not host-keyed.
-pub fn name_group_uni(prefix: &[u8]) -> [u8; 6] {
-    let h = fnv1a(prefix).to_be_bytes();
-    let mut m = [h[0], h[1], h[2], h[3], h[4], h[5]];
-    m[0] = (m[0] & 0xFC) | 0x02; // I/G = 0 (unicast), U/L = 1 (local)
-    m
+/// A **multicast** MAC derived from a name — *"the name is the group address."* A
+/// receiver interested in it programs its NIC's address filter (or a software
+/// pre-filter) to this and the hardware drops everything else (measured: chip-level
+/// filtering gives the MAC-filter CPU profile, see the mac-addressing-doctrine). The
+/// first octet sets I/G (group) + U/L (local); the low 46 bits carry the keyed hash.
+///
+/// This is the **flat** full-name form (no prefix aggregation) — right for a leaf
+/// consumer or a producer's own group. When a *relay* must match a whole family of
+/// names under a routable prefix, use [`name_group`] + [`prefix_key`] instead.
+///
+/// The group MAC is a Bloom-style pre-filter; the full name + signature are
+/// authoritative after decode, so a hash collision only wastes a wake, never
+/// mis-delivers.
+pub fn name_group_mac(name: &[u8]) -> [u8; 6] {
+    let h = siphash24(&OPEN_GROUP_KEY.0, name).to_be_bytes();
+    tag_local([h[0], h[1], h[2], h[3], h[4], h[5]], true)
+}
+
+/// The **unicast** locally-administered form of [`name_group_mac`] (same hash body,
+/// I/G clear) — used where a unicast addr1 is wanted (e.g. the exact-match chip
+/// filter, or a name-derived source when an ephemeral nonce is not in use).
+pub fn name_group_uni(name: &[u8]) -> [u8; 6] {
+    let h = siphash24(&OPEN_GROUP_KEY.0, name).to_be_bytes();
+    tag_local([h[0], h[1], h[2], h[3], h[4], h[5]], false)
+}
+
+/// **Prefix-aggregating** name-group address: the 46-bit hash split
+/// `H(routable_prefix)` (high 24 bits, structural bits aside) ‖ `H(full_name)` (low
+/// 24 bits), both keyed by the trust context. A **FIB relay** filters coarsely on the
+/// high bits ([`prefix_key`]) — matching *every* name under the prefix, so one filter
+/// entry aggregates a family (the IP-prefix-match trick). A **consumer/PIT** compares
+/// the full width for the exact name. Generation/block IDs are *not* here — they live
+/// in the coding metadata, scoped by the already-identified name (`FecMetadata`), so
+/// they need no global collision resistance.
+///
+/// `routable_prefix` is the prefix a FIB routes on (a naming convention fixes its
+/// boundary); `full_name` is the whole name. Collision cost is a wasted wake caught by
+/// the name check above the hash — the hash accelerates, the name authorises.
+///
+/// **Entropy tradeoff (be aware):** within one routable prefix, names are
+/// discriminated only by the low 24 bits (the suffix hash) — a 24-bit birthday bound,
+/// ~4096 names/prefix before a likely collision. That is fine for a *filter* (a
+/// collision wastes a wake, never mis-delivers) but a producer of a huge *flat*
+/// namespace that needs full 46-bit discrimination and no aggregation should use
+/// [`name_group_mac`] instead.
+pub fn name_group(key: &GroupKey, routable_prefix: &[u8], full_name: &[u8], group: bool) -> [u8; 6] {
+    let ph = siphash24(&key.0, routable_prefix);
+    let nh = siphash24(&key.0, full_name);
+    tag_local(
+        [(ph >> 16) as u8, (ph >> 8) as u8, ph as u8, (nh >> 16) as u8, (nh >> 8) as u8, nh as u8],
+        group,
+    )
+}
+
+/// The coarse **prefix-match key** of a [`name_group`] address: zero the low 3 bytes
+/// (the full-name hash), keeping only the routable-prefix hash. A FIB relay registers
+/// `prefix_key(name_group(key, P, P, g))` and matches any frame whose `prefix_key`
+/// equals it — one entry covers the whole prefix family.
+pub fn prefix_key(mut addr: [u8; 6]) -> [u8; 6] {
+    addr[3] = 0;
+    addr[4] = 0;
+    addr[5] = 0;
+    addr
 }
 
 /// Build `radiotap ++ 802.11 ++ <format body>` for one injected frame. The
@@ -418,6 +521,75 @@ mod tests {
         let u = name_group_uni(b"/sensors/temp");
         assert_eq!(u[0] & 0x03, 0x02, "unicast + local");
         assert_eq!(u[1..], a[1..], "same hash body, differ only in I/G bit");
+    }
+
+    /// SipHash-2-4 correctness against the reference vector (Aumasson & Bernstein):
+    /// key = 00..0f, data = 00..0e (15 bytes) → 0xa129ca6149be45e5. Verifies the
+    /// vendored primitive rather than trusting it.
+    #[test]
+    fn siphash24_reference_vector() {
+        let key: [u8; 16] = core::array::from_fn(|i| i as u8);
+        let data: [u8; 15] = core::array::from_fn(|i| i as u8);
+        assert_eq!(siphash24(&key, &data), 0xa129_ca61_49be_45e5);
+    }
+
+    /// Keying: the SAME name under different trust-context keys yields different
+    /// group hashes — an outsider without the key cannot compute (nor cheaply target)
+    /// a private group's pre-parse filter.
+    #[test]
+    fn keying_hides_a_private_group_from_outsiders() {
+        let secret = GroupKey(*b"trust-domain-42!");
+        let open = name_group(&OPEN_GROUP_KEY, b"/x", b"/x/y", true);
+        let priv_ = name_group(&secret, b"/x", b"/x/y", true);
+        assert_ne!(open, priv_, "same name, different key → different group hash");
+        assert_eq!(priv_, name_group(&secret, b"/x", b"/x/y", true), "deterministic under a key");
+    }
+
+    /// Prefix aggregation: every name under one routable prefix shares the coarse
+    /// prefix-match key (a FIB relay matches the family with one entry), yet the full
+    /// addresses are distinct (a consumer/PIT distinguishes the exact names).
+    #[test]
+    fn prefix_key_aggregates_a_family_but_full_addr_is_distinct() {
+        let k = &OPEN_GROUP_KEY;
+        let a = name_group(k, b"/x", b"/x/a", true);
+        let b = name_group(k, b"/x", b"/x/b", true);
+        let other = name_group(k, b"/z", b"/z/a", true);
+        assert_eq!(prefix_key(a), prefix_key(b), "same routable prefix → same coarse key");
+        assert_ne!(prefix_key(a), prefix_key(other), "different prefix → different coarse key");
+        assert_ne!(a, b, "distinct full names → distinct full addresses (fine PIT match)");
+    }
+
+    /// Collision behaviour, stated honestly. The **flat** full-name hash
+    /// ([`name_group_mac`]) uses all 46 bits, so 20k distinct names collide
+    /// essentially never (birthday ~ n²/2⁴⁷ ≈ 3e-6). The **split** [`name_group`]
+    /// trades entropy for aggregation: names under *one* routable prefix are
+    /// discriminated only by the low 24 bits (the suffix hash), a 24-bit birthday
+    /// bound (~4096 names/prefix before a likely collision). Both are fine for a
+    /// *filter* — a collision only wastes a wake, since the full name + signature
+    /// above the hash are authoritative — but a producer of a huge flat namespace
+    /// should use `name_group_mac` (46-bit), and only relays that need family-match
+    /// use the split.
+    #[test]
+    fn collision_behaviour_flat_46bit_vs_split_24bit_within_prefix() {
+        use std::collections::HashSet;
+        let n = 20_000;
+
+        // Flat full-name hash: 46 bits → no collisions among 20k distinct names.
+        let flat: HashSet<_> = (0..n).map(|i| name_group_mac(format!("/app/{i}/data").as_bytes())).collect();
+        assert_eq!(flat.len(), n, "flat 46-bit hash: no collisions among {n} names");
+
+        // Split under DIFFERENT prefixes: the full 46 bits vary → no collisions.
+        let k = &OPEN_GROUP_KEY;
+        let across: HashSet<_> =
+            (0..n).map(|i| name_group(k, format!("/p{i}").as_bytes(), format!("/p{i}/d").as_bytes(), true)).collect();
+        assert_eq!(across.len(), n, "split across distinct prefixes: no collisions");
+
+        // Split WITHIN one prefix: only the low 24 bits discriminate, so 20k names DO
+        // collide at the 24-bit birthday rate — the documented aggregation tradeoff.
+        let within: HashSet<_> =
+            (0..n).map(|i| name_group(k, b"/app", format!("/app/{i}").as_bytes(), true)).collect();
+        assert!(within.len() < n, "split within one prefix: 24-bit discrimination collides (expected)");
+        assert!(within.len() > n * 99 / 100, "…but only a handful ({}/{n} unique)", within.len());
     }
 
     /// A name-grouped frame round-trips with the group MAC in addr1 and the

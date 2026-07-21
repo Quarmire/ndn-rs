@@ -27,7 +27,10 @@ pub use ndn_radio_hal::{
     TxIntent, WifiRadio, mcs_for_rssi, mcs_phy_rate_bps,
 };
 
-pub use frame::{ESPNOW_MAX_BODY, ESPNOW_OUI, name_group_mac, name_group_uni};
+pub use frame::{
+    ESPNOW_MAX_BODY, ESPNOW_OUI, GroupKey, OPEN_GROUP_KEY, name_group, name_group_mac,
+    name_group_uni, prefix_key, siphash24,
+};
 
 mod loopback;
 pub use loopback::{LoopbackEndpoint, LoopbackMonitorBus};
