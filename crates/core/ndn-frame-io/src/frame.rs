@@ -123,22 +123,24 @@ fn tag_local(mut m: [u8; 6], group: bool) -> [u8; 6] {
 /// first octet sets I/G (group) + U/L (local); the low 46 bits carry the keyed hash.
 ///
 /// This is the **flat** full-name form (no prefix aggregation) — right for a leaf
-/// consumer or a producer's own group. When a *relay* must match a whole family of
-/// names under a routable prefix, use [`name_group`] + [`prefix_key`] instead.
+/// consumer, a producer's own group, or a face bound to one routable prefix (every
+/// frame shares this prefix-group address). When a *relay* must match a whole family
+/// of names by masking, use [`name_group`] + [`prefix_key`] instead.
 ///
-/// The group MAC is a Bloom-style pre-filter; the full name + signature are
-/// authoritative after decode, so a hash collision only wastes a wake, never
-/// mis-delivers.
-pub fn name_group_mac(name: &[u8]) -> [u8; 6] {
-    let h = siphash24(&OPEN_GROUP_KEY.0, name).to_be_bytes();
+/// Keyed by the trust context (`key`): [`OPEN_GROUP_KEY`] for a public/open receiver
+/// set, a shared secret for a private domain. The group MAC is a Bloom-style
+/// pre-filter; the full name + signature are authoritative after decode, so a hash
+/// collision only wastes a wake, never mis-delivers.
+pub fn name_group_mac(key: &GroupKey, name: &[u8]) -> [u8; 6] {
+    let h = siphash24(&key.0, name).to_be_bytes();
     tag_local([h[0], h[1], h[2], h[3], h[4], h[5]], true)
 }
 
 /// The **unicast** locally-administered form of [`name_group_mac`] (same hash body,
 /// I/G clear) — used where a unicast addr1 is wanted (e.g. the exact-match chip
 /// filter, or a name-derived source when an ephemeral nonce is not in use).
-pub fn name_group_uni(name: &[u8]) -> [u8; 6] {
-    let h = siphash24(&OPEN_GROUP_KEY.0, name).to_be_bytes();
+pub fn name_group_uni(key: &GroupKey, name: &[u8]) -> [u8; 6] {
+    let h = siphash24(&key.0, name).to_be_bytes();
     tag_local([h[0], h[1], h[2], h[3], h[4], h[5]], false)
 }
 
@@ -513,12 +515,12 @@ mod tests {
     /// distinct prefixes → distinct addresses, deterministic.
     #[test]
     fn name_group_mac_is_local_multicast_and_distinct() {
-        let a = name_group_mac(b"/sensors/temp");
-        let b = name_group_mac(b"/sensors/humidity");
+        let a = name_group_mac(&OPEN_GROUP_KEY, b"/sensors/temp");
+        let b = name_group_mac(&OPEN_GROUP_KEY, b"/sensors/humidity");
         assert_eq!(a[0] & 0x03, 0x03, "I/G (group) + U/L (local) bits set");
         assert_ne!(a, b, "distinct prefixes → distinct group MACs");
-        assert_eq!(a, name_group_mac(b"/sensors/temp"), "deterministic");
-        let u = name_group_uni(b"/sensors/temp");
+        assert_eq!(a, name_group_mac(&OPEN_GROUP_KEY, b"/sensors/temp"), "deterministic");
+        let u = name_group_uni(&OPEN_GROUP_KEY, b"/sensors/temp");
         assert_eq!(u[0] & 0x03, 0x02, "unicast + local");
         assert_eq!(u[1..], a[1..], "same hash body, differ only in I/G bit");
     }
@@ -575,7 +577,7 @@ mod tests {
         let n = 20_000;
 
         // Flat full-name hash: 46 bits → no collisions among 20k distinct names.
-        let flat: HashSet<_> = (0..n).map(|i| name_group_mac(format!("/app/{i}/data").as_bytes())).collect();
+        let flat: HashSet<_> = (0..n).map(|i| name_group_mac(&OPEN_GROUP_KEY, format!("/app/{i}/data").as_bytes())).collect();
         assert_eq!(flat.len(), n, "flat 46-bit hash: no collisions among {n} names");
 
         // Split under DIFFERENT prefixes: the full 46 bits vary → no collisions.
@@ -597,8 +599,8 @@ mod tests {
     #[test]
     fn name_group_addressing_round_trips() {
         let fmt = FrameFormat::RawNdn { ethertype: 0x8624 };
-        let g = name_group_mac(b"/p");
-        let u = name_group_uni(b"/p");
+        let g = name_group_mac(&OPEN_GROUP_KEY, b"/p");
+        let u = name_group_uni(&OPEN_GROUP_KEY, b"/p");
         let f = InjectFrame {
             payload: Bytes::from_static(b"\x05\x01z"),
             tx: TxIntent::CONSERVATIVE,
