@@ -515,6 +515,18 @@ pub trait RadioKnobs: Send + Sync {
     fn tx_discipline(&self) -> TxDiscipline {
         TxDiscipline::BestEffort
     }
+
+    /// Read a **frame-free occupancy counter**: a free-running hardware count of
+    /// channel activity the radio maintains without the host decoding frames
+    /// (#30). Two reads across a window, differenced, give a frames/s rate the
+    /// cognition plane maps to channel-busy% (`ChannelOccupancy::from_activity`
+    /// in `ndn-radio-cognition`). Returns `Ok(None)` by default — a radio that
+    /// can't sense occupancy this way is honest about it, and the sampler skips
+    /// it. On the 8812au this is `REG_RXERR_RPT` (`0x0664`), validated to track
+    /// the decoded-frame rate ~1:1.
+    fn read_channel_activity(&self) -> Result<Option<u16>, FaceError> {
+        Ok(None)
+    }
 }
 
 /// What the transmit path can *promise* about when a frame leaves the antenna — a named-time
