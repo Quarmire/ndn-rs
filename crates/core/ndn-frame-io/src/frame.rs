@@ -224,6 +224,76 @@ pub fn build_at(
     Ok(out)
 }
 
+/// Build one **A-MSDU** frame for the AF_PACKET monitor path: radiotap (per
+/// `format`/`mcs`) ++ a single QoS-Data MPDU carrying `msdus` as A-MSDU
+/// subframes under one PHY preamble and one FCS. The link-layer bundling
+/// actuator — one preamble amortized over many NDN packets, the bigger win at
+/// S1G where preambles are long and rates low. All subframes ride one MPDU
+/// (addr1/RA = addr3 = `ra`, addr2/TA = `ta`); each subframe carries its own
+/// DA/SA, so a broadcast face collapses to one A-MSDU. The caller bounds the
+/// aggregate size (S1G caps the max MPDU per bandwidth). Byte layout matches the
+/// RTL/MT USB backends' `build_amsdu_body` (they prepend a chip TX descriptor
+/// instead of radiotap); the RX side de-aggregates via [`parse_dot11`], which
+/// already handles QoS-Data for RawNdn/RawNdnS1g. Only RawNdn/RawNdnS1g support
+/// A-MSDU.
+pub fn build_amsdu(
+    format: FrameFormat,
+    ra: [u8; 6],
+    ta: [u8; 6],
+    msdus: &[([u8; 6], [u8; 6], Bytes)],
+    seq: u16,
+    mcs: crate::McsDescriptor,
+) -> Result<Vec<u8>, FaceError> {
+    let ethertype = match format {
+        FrameFormat::RawNdn { ethertype } | FrameFormat::RawNdnS1g { ethertype } => ethertype,
+        other => {
+            return Err(FaceError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("A-MSDU unsupported for frame format {other:?}"),
+            )));
+        }
+    };
+    if msdus.is_empty() {
+        return Err(FaceError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "A-MSDU needs at least one MSDU",
+        )));
+    }
+    let mut out = Vec::with_capacity(
+        16 + DOT11_QOS_HDR_LEN + msdus.iter().map(|(_, _, p)| 32 + p.len()).sum::<usize>(),
+    );
+    // Radiotap TX header — identical rate choice to `build_at`.
+    match format {
+        FrameFormat::RawNdnS1g { .. } => out.extend_from_slice(&radiotap::build_tx_s1g()),
+        _ => out.extend_from_slice(&radiotap::build_tx_header(mcs.index, mcs.short_gi)),
+    }
+    // QoS-Data MPDU header (26 B): FC subtype 8 (QoS Data); A-MSDU-present in QoS Ctrl.
+    out.extend_from_slice(&[0x88, 0x00]); // FC: type=Data, subtype=QoS Data
+    out.extend_from_slice(&[0x00, 0x00]); // Duration
+    out.extend_from_slice(&ra); // addr1 (RA)
+    out.extend_from_slice(&ta); // addr2 (TA)
+    out.extend_from_slice(&ra); // addr3 (BSSID)
+    out.extend_from_slice(&((seq & 0x0fff) << 4).to_le_bytes()); // SeqCtrl
+    out.extend_from_slice(&[0x80, 0x00]); // QoS Ctrl: A-MSDU Present (bit 7), TID 0
+    let last = msdus.len() - 1;
+    for (i, (da, sa, payload)) in msdus.iter().enumerate() {
+        let msdu_len = LLC_SNAP_LEN + payload.len(); // LLC/SNAP + payload
+        out.extend_from_slice(da); // subframe DA
+        out.extend_from_slice(sa); // subframe SA
+        out.extend_from_slice(&(msdu_len as u16).to_be_bytes()); // Length (big-endian)
+        out.extend_from_slice(&LLC_SNAP_PREFIX);
+        out.extend_from_slice(&ethertype.to_be_bytes());
+        out.extend_from_slice(payload);
+        if i != last {
+            // Pad every subframe but the last to a 4-byte boundary.
+            let sub_len = 14 + msdu_len; // DA+SA+Len + MSDU
+            let pad = (4 - (sub_len % 4)) % 4;
+            out.extend(std::iter::repeat_n(0u8, pad));
+        }
+    }
+    Ok(out)
+}
+
 /// Build just the **802.11 frame** for `frame` under `format` — the bytes that
 /// follow the radiotap header (or, for a hardware backend, its own TX
 /// descriptor). Factored out of [`build`] so the RTL88xx USB driver — which

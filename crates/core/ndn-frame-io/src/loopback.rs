@@ -50,6 +50,7 @@ impl LoopbackMonitorBus {
             observed_rssi_dbm,
             tx: self.tx.clone(),
             rx: Mutex::new(self.tx.subscribe()),
+            cur_mcs: std::sync::Mutex::new(None),
         }
     }
 }
@@ -66,6 +67,9 @@ pub struct LoopbackEndpoint {
     observed_rssi_dbm: i8,
     tx: broadcast::Sender<Arc<AirFrame>>,
     rx: Mutex<broadcast::Receiver<Arc<AirFrame>>>,
+    /// Current transmit rate as state ([`FrameIo::set_rate`]); the emitted frame
+    /// carries this index, so a test can observe the rate that reached the air.
+    cur_mcs: std::sync::Mutex<Option<crate::McsDescriptor>>,
 }
 
 impl LoopbackEndpoint {
@@ -85,8 +89,21 @@ impl LoopbackEndpoint {
 #[async_trait]
 impl FrameIo for LoopbackEndpoint {
     async fn inject(&self, frame: InjectFrame) -> Result<(), FaceError> {
-        let idx = crate::McsDescriptor::for_intent(&frame.tx, crate::MAX_RELIABLE_MCS, false).index;
+        // Rate is state: emit at the set MCS if present, else resolve the intent.
+        let idx = self
+            .cur_mcs
+            .lock()
+            .unwrap()
+            .map(|m| m.index)
+            .unwrap_or_else(|| {
+                crate::McsDescriptor::for_intent(&frame.tx, crate::MAX_RELIABLE_MCS, false).index
+            });
         self.emit(frame.dst, frame.src, frame.payload, idx);
+        Ok(())
+    }
+
+    fn set_rate(&self, mcs: crate::McsDescriptor) -> Result<(), FaceError> {
+        *self.cur_mcs.lock().unwrap() = Some(mcs);
         Ok(())
     }
 
@@ -116,23 +133,14 @@ impl FrameIo for LoopbackEndpoint {
     }
 }
 
-#[async_trait]
-impl crate::WifiRadio for LoopbackEndpoint {
-    async fn inject_at(
-        &self,
-        frame: InjectFrame,
-        mcs: crate::McsDescriptor,
-    ) -> Result<(), FaceError> {
-        self.emit(frame.dst, frame.src, frame.payload, mcs.index);
-        Ok(())
-    }
-}
+// Marker only: `inject_at` is the derived HAL default (`set_rate` + `inject`).
+impl crate::WifiRadio for LoopbackEndpoint {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::frame::{BROADCAST, DEFAULT_SRC};
-    use crate::{McsDescriptor, TxIntent, WifiRadio};
+    use crate::{FrameIo, McsDescriptor, TxIntent, WifiRadio};
 
     /// A distinctive non-broadcast group MAC (locally-administered multicast).
     const GROUP: [u8; 6] = [0x03, 0xaa, 0xbb, 0xcc, 0xdd, 0xee];
@@ -170,6 +178,26 @@ mod tests {
             got.rssi_dbm,
             Some(-73),
             "the receiver's own observed RSSI, not the sender's"
+        );
+    }
+
+    /// Rate as bearer state: `set_rate` then a plain `inject` (no per-frame MCS) puts
+    /// the set rate on the air — the native path that retired `inject_at` from the
+    /// driver. `inject_at` is now just sugar for exactly this.
+    #[tokio::test]
+    async fn set_rate_makes_plain_inject_use_it() {
+        let bus = LoopbackMonitorBus::new();
+        let sender = bus.endpoint(1, -10);
+        let receiver = bus.endpoint(2, -70);
+
+        sender.set_rate(McsDescriptor::ht(7)).unwrap();
+        sender.inject(inj(b"hi", GROUP, NODE_SRC)).await.unwrap();
+
+        let got = receiver.recv_frame().await.unwrap();
+        assert_eq!(
+            got.mcs_index,
+            Some(7),
+            "a plain inject transmits at the state rate set by set_rate"
         );
     }
 

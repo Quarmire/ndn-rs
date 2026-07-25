@@ -26,7 +26,7 @@ use async_trait::async_trait;
 use ndn_transport::FaceError;
 use tokio::io::unix::AsyncFd;
 
-use crate::{CapturedFrame, FrameFormat, InjectFrame};
+use crate::{CapturedFrame, FrameFormat, FrameIo, InjectFrame};
 
 const ETH_P_ALL: u16 = 0x0003;
 
@@ -42,6 +42,9 @@ pub struct AfPacketBackend {
     /// [`with_capability`](Self::with_capability) by a caller that knows its NIC (or, in future,
     /// auto-filled from an nl80211 `NL80211_CMD_GET_WIPHY` query).
     capability: crate::RadioCapability,
+    /// Current transmit rate as state ([`crate::FrameIo::set_rate`]); `None` ⇒ the
+    /// radiotap header resolves the frame's intent. Retires per-frame `inject_at`.
+    cur_mcs: std::sync::Mutex<Option<crate::McsDescriptor>>,
 }
 
 impl AfPacketBackend {
@@ -103,6 +106,7 @@ impl AfPacketBackend {
             capability: crate::RadioCapability::wifi_monitor_5ghz(vec![
                 36, 40, 44, 48, 149, 153, 157, 161,
             ]),
+            cur_mcs: std::sync::Mutex::new(None),
         })
     }
 
@@ -152,7 +156,12 @@ impl AfPacketBackend {
 #[async_trait]
 impl crate::FrameIo for AfPacketBackend {
     async fn inject(&self, frame: InjectFrame) -> Result<(), FaceError> {
-        let buf = crate::frame::build(self.format, &frame)?;
+        // Rate is state: build the radiotap header at the set MCS if present (the
+        // kernel honours it), else resolve the frame's intent.
+        let buf = match *self.cur_mcs.lock().unwrap() {
+            Some(mcs) => crate::frame::build_at(self.format, &frame, mcs)?,
+            None => crate::frame::build(self.format, &frame)?,
+        };
 
         let mut dst: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
         dst.sll_family = libc::AF_PACKET as u16;
@@ -182,6 +191,11 @@ impl crate::FrameIo for AfPacketBackend {
             }
             return Err(FaceError::Io(err));
         }
+    }
+
+    fn set_rate(&self, mcs: crate::McsDescriptor) -> Result<(), FaceError> {
+        *self.cur_mcs.lock().unwrap() = Some(mcs);
+        Ok(())
     }
 
     async fn recv_frame(&self) -> Result<CapturedFrame, FaceError> {
@@ -217,17 +231,84 @@ impl crate::FrameIo for AfPacketBackend {
     }
 }
 
+/// Conservative A-MSDU body cap (bytes, excluding radiotap + MPDU header). The
+/// classic 802.11 small A-MSDU limit — safe across S1G bandwidths (at 1 MHz the
+/// max PSDU is small, so keep aggregates modest); the cognition plane's
+/// `amsdu_msdus` bounds the count on top of this. Tunable once per-STA S1G
+/// max-A-MSDU-length is queried.
+const MAX_AMSDU_BODY: usize = 3839;
+
 #[async_trait]
 impl crate::WifiRadio for AfPacketBackend {
-    async fn inject_at(
+    /// A-MSDU-aggregate the batch — the actuator the face-level
+    /// [`with_amsdu_batching`](../../../ndn_face_monitor_wifi/index.html) batcher
+    /// drives (it calls `inject_batch_at`). One QoS-Data MPDU per destination
+    /// (RA), greedily packed up to [`MAX_AMSDU_BODY`], all at the batch's rate:
+    /// one PHY preamble for many NDN packets (the big lever at S1G). Each MSDU
+    /// stays an independent NDN packet the receiver de-aggregates via
+    /// [`parse_dot11`](crate::frame::parse_dot11), so PIT/FIB semantics are
+    /// untouched. Non-`RawNdn`/`RawNdnS1g` formats fall back to the derived
+    /// default (individual injection).
+    async fn inject_batch_at(
         &self,
-        frame: InjectFrame,
-        mcs: crate::McsDescriptor,
+        frames: Vec<(InjectFrame, crate::McsDescriptor)>,
     ) -> Result<(), FaceError> {
-        // Build the radiotap header at the exact rate (kernel honours it) instead
-        // of resolving `frame.tx`, then reuse the raw send path.
-        let buf = crate::frame::build_at(self.format, &frame, mcs)?;
-        self.inject_raw(&buf).await
+        match self.format {
+            FrameFormat::RawNdn { .. } | FrameFormat::RawNdnS1g { .. } => {}
+            _ => {
+                for (f, mcs) in frames {
+                    self.set_rate(mcs)?;
+                    self.inject(f).await?;
+                }
+                return Ok(());
+            }
+        }
+        if frames.is_empty() {
+            return Ok(());
+        }
+        // One A-MSDU carries one MPDU rate; the batcher groups a run at one MCS.
+        let mcs = frames[0].1;
+        self.set_rate(mcs)?;
+
+        // Group by RA (dst) preserving first-seen order — a broadcast face is one
+        // group; split-addressed faces get one A-MSDU per destination (a single
+        // MPDU has one RA, though each subframe still carries its own DA/SA).
+        let mut order: Vec<[u8; 6]> = Vec::new();
+        let mut groups: std::collections::HashMap<[u8; 6], Vec<([u8; 6], [u8; 6], bytes::Bytes)>> =
+            std::collections::HashMap::new();
+        for (f, _) in frames {
+            let g = groups.entry(f.dst).or_default();
+            if g.is_empty() {
+                order.push(f.dst);
+            }
+            g.push((f.dst, f.src, f.payload));
+        }
+
+        for ra in order {
+            let msdus = groups.remove(&ra).unwrap();
+            let ta = msdus[0].1;
+            // Greedily pack MSDUs into A-MSDUs bounded by MAX_AMSDU_BODY.
+            let mut batch: Vec<([u8; 6], [u8; 6], bytes::Bytes)> = Vec::new();
+            let mut acc = 0usize;
+            for m in msdus {
+                // Subframe on-air size: DA+SA+Len (14) + LLC/SNAP+ethertype (8) +
+                // payload, 4-byte aligned.
+                let sub = (14 + 8 + m.2.len() + 3) & !3;
+                if !batch.is_empty() && acc + sub > MAX_AMSDU_BODY {
+                    let buf = crate::frame::build_amsdu(self.format, ra, ta, &batch, 0, mcs)?;
+                    self.inject_raw(&buf).await?;
+                    batch.clear();
+                    acc = 0;
+                }
+                acc += sub;
+                batch.push(m);
+            }
+            if !batch.is_empty() {
+                let buf = crate::frame::build_amsdu(self.format, ra, ta, &batch, 0, mcs)?;
+                self.inject_raw(&buf).await?;
+            }
+        }
+        Ok(())
     }
 }
 

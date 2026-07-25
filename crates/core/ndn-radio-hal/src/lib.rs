@@ -383,27 +383,44 @@ pub trait FrameIo: Send + Sync + 'static {
     /// Await the next frame captured on the medium. A node never hears its own
     /// transmissions (half-duplex radio); the backend filters those.
     async fn recv_frame(&self) -> Result<CapturedFrame, FaceError>;
+
+    /// Set the radio's current transmit rate as **state** — the exact 802.11 rate
+    /// every subsequent [`inject`](Self::inject) transmits at, until changed. This is
+    /// how the cognitive control plane actuates rate: one call, not a per-frame
+    /// argument (*"rate is bearer state"*). The default is a no-op — a bearer that
+    /// resolves [`InjectFrame::tx`] itself (LoRa/BLE) ignores it. A Wi-Fi backend
+    /// stores it and its `inject` uses it, falling back to intent resolution before
+    /// the first `set_rate`. Cheap and non-blocking (a stored value, no I/O).
+    fn set_rate(&self, mcs: McsDescriptor) -> Result<(), FaceError> {
+        let _ = mcs;
+        Ok(())
+    }
 }
 
-/// A WiFi radio: inject at an EXACT 802.11 rate, overriding intent
-/// resolution. For fixed-rate benches and the adaptive/cognitive
-/// MonitorWifiFace, which have already resolved a concrete McsDescriptor.
-/// Non-WiFi backends implement only FrameIo.
+/// A Wi-Fi radio. Historically this added a per-frame exact-rate `inject_at`; that
+/// is now **derived**, not a driver responsibility — [`inject_at`](Self::inject_at)
+/// defaults to [`set_rate`](FrameIo::set_rate) + [`inject`](FrameIo::inject), so the
+/// rate lives as bearer state and a driver implements only [`FrameIo`]. The trait
+/// remains a marker (a `dyn WifiRadio` names "a Wi-Fi radio") and ergonomic sugar for
+/// fixed-rate benches; the cognitive hot path calls `set_rate` + `inject` directly.
 #[async_trait]
 pub trait WifiRadio: FrameIo {
-    /// Inject one frame at an exact 802.11 rate.
-    async fn inject_at(&self, frame: InjectFrame, mcs: McsDescriptor) -> Result<(), FaceError>;
+    /// Inject one frame at an exact rate = `set_rate` then `inject`. Derived; a driver
+    /// need not (and should not) override it.
+    async fn inject_at(&self, frame: InjectFrame, mcs: McsDescriptor) -> Result<(), FaceError> {
+        self.set_rate(mcs)?;
+        self.inject(frame).await
+    }
 
-    /// Inject a batch, each frame with its own exact rate — the WiFi counterpart
-    /// of [`FrameIo::inject_batch`]. Backends that A-MSDU-bundle (the RTL8812EU)
-    /// override this to group runs that share dst/src/rate into one aggregate;
-    /// the default sends each via [`inject_at`](WifiRadio::inject_at).
+    /// A batch, each frame at its own exact rate — derived the same way. For A-MSDU
+    /// bundling, `set_rate` once and use [`FrameIo::inject_batch`] instead.
     async fn inject_batch_at(
         &self,
         frames: Vec<(InjectFrame, McsDescriptor)>,
     ) -> Result<(), FaceError> {
         for (f, mcs) in frames {
-            self.inject_at(f, mcs).await?;
+            self.set_rate(mcs)?;
+            self.inject(f).await?;
         }
         Ok(())
     }
@@ -472,8 +489,31 @@ pub trait RadioKnobs: Send + Sync {
 
     /// Set the TXAGC reference index (a back-off below the regulatory ceiling;
     /// never used to exceed it). Default: no-op (radio runs at its init power).
+    ///
+    /// This is an **opaque, chip-specific, nonlinear** scale: index N on one part
+    /// is not index N on another, and equal index steps are not equal dB steps.
+    /// Prefer [`set_tx_power_dbm`](Self::set_tx_power_dbm) when the radio
+    /// advertises a [`RadioCapability::tx_power_dbm`] range.
     fn set_tx_power(&self, _idx: u32) -> Result<(), FaceError> {
         Ok(())
+    }
+
+    /// Set TX power on the **absolute dBm scale**, returning the power actually
+    /// applied (which may be clamped below `dbm` by a regulatory/BCF table in the
+    /// driver or firmware — always believe the returned value, not the request).
+    ///
+    /// This is the portable power knob: unlike [`set_tx_power`](Self::set_tx_power)
+    /// it means the same thing on every bearer, so cognition can reason in link
+    /// budget (dB of margin) rather than in chip register units. A radio advertises
+    /// support via [`RadioCapability::tx_power_dbm`]; the two knobs are alternatives,
+    /// and a backend implements whichever its hardware actually exposes.
+    ///
+    /// Default: `Unsupported`, so a caller can fall back to the index scale.
+    fn set_tx_power_dbm(&self, _dbm: i8) -> Result<i8, FaceError> {
+        Err(FaceError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "radio exposes no absolute dBm TX-power control",
+        )))
     }
 
     /// Enable cyclic-shift diversity on the second chain (1-stream robustness via
@@ -751,7 +791,21 @@ pub struct RadioCapability {
     /// Max TX-power index (chip TXAGC scale) = the *calibrated/regulatory ceiling*.
     /// The power knob backs off below this; it is never exceeded. This is also a
     /// capability item peers can learn (reach class).
+    ///
+    /// Opaque and nonlinear — see [`tx_power_dbm`](Self::tx_power_dbm) for the
+    /// portable alternative, which is preferred whenever the radio offers it.
     pub max_tx_power: u8,
+    /// Absolute TX-power control range in dBm, when the radio exposes one
+    /// ([`RadioKnobs::set_tx_power_dbm`]). `None` = index-only control via
+    /// [`max_tx_power`](Self::max_tx_power).
+    ///
+    /// This is the bearer-portable power axis: dBm means the same thing on an
+    /// 802.11ah chip, a LoRa modem, and a BLE part, so a planner can budget link
+    /// margin in dB instead of guessing at chip register units. Populate it only
+    /// when the numbers are real (a driver knob or nl80211 that reports the
+    /// applied value) — a fabricated range is worse than `None`, because the
+    /// planner will believe it.
+    pub tx_power_dbm: Option<DbmRange>,
     /// Can retune quickly (fast FHSS-capable).
     pub agile: bool,
     /// RX-only — participates in sensing/reception, never selected for TX (e.g. SDR
@@ -774,7 +828,59 @@ pub struct RadioCapability {
     pub csi: CsiSupport,
 }
 
+/// The span of absolute TX powers a radio can actually be commanded to, in dBm.
+///
+/// Bearer-agnostic by construction: it carries no chip, driver, or PHY concept —
+/// only the two numbers a link-budget calculation needs. A Wi-Fi part, a LoRa
+/// modem, and a HaLow chip all describe themselves the same way here.
+///
+/// `max` is the *commandable* ceiling, which is not necessarily what the radiates:
+/// firmware and regulatory tables clamp further, which is why
+/// [`RadioKnobs::set_tx_power_dbm`] returns the applied value rather than `()`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DbmRange {
+    /// Lowest commandable power (dBm).
+    pub min: i8,
+    /// Highest commandable power (dBm) — the ceiling cognition backs off *from*.
+    pub max: i8,
+}
+
+impl DbmRange {
+    /// A range, normalised so `min <= max` even if handed to us reversed.
+    pub fn new(min: i8, max: i8) -> Self {
+        if min <= max {
+            Self { min, max }
+        } else {
+            Self { min: max, max: min }
+        }
+    }
+
+    /// Clamp a requested power into this range. Callers still treat the value
+    /// returned by the actuator as authoritative — this only avoids commanding
+    /// something the radio has already told us it cannot do.
+    pub fn clamp(&self, dbm: i8) -> i8 {
+        dbm.clamp(self.min, self.max)
+    }
+
+    /// Total control span in dB — how much link budget this knob can trade.
+    pub fn span_db(&self) -> u8 {
+        (self.max as i16 - self.min as i16).unsigned_abs() as u8
+    }
+}
+
 impl RadioCapability {
+    /// Declare that this radio has absolute dBm power control over `range`.
+    ///
+    /// Deliberately a builder rather than a constructor argument: the honest
+    /// source of a dBm range is whatever *found* the control at runtime (a probed
+    /// driver knob, an nl80211 query), not a table compiled into a capability
+    /// preset. The presets therefore leave it `None` and the layer that discovers
+    /// the knob attaches the range it actually observed.
+    pub fn with_tx_power_dbm(mut self, range: DbmRange) -> Self {
+        self.tx_power_dbm = Some(range);
+        self
+    }
+
     /// The best (furthest-reaching / most-penetrating) band-rank this radio can use — the max
     /// of [`Band::range_rank`] over its [`bands`](Self::bands). Used by the heterogeneous-radio
     /// selection layer to rank a dual-band radio by its most capable band. 0 if bandless.
@@ -840,6 +946,7 @@ impl RadioCapability {
             },
             channels,
             max_tx_power: 63,
+            tx_power_dbm: None,
             agile: true,
             rx_only: false,
             timing: TimingModel::AlwaysOn,
@@ -865,6 +972,7 @@ impl RadioCapability {
             },
             channels,
             max_tx_power: 63,
+            tx_power_dbm: None,
             agile: true,
             rx_only: false,
             timing: TimingModel::AlwaysOn,
@@ -921,6 +1029,7 @@ impl RadioCapability {
             },
             channels,
             max_tx_power: 63,
+            tx_power_dbm: None,
             agile: true,
             rx_only: false,
             // S1G is a licence-exempt sub-GHz band but, unlike the LoRa ISM path,
@@ -945,6 +1054,9 @@ impl RadioCapability {
             },
             channels,
             max_tx_power: 63,
+            // SX126x PA span (the backend clamps to this and sends CMD_SET_PWR): absolute dBm, so the
+            // policy backs off from the ceiling for spatial reuse just like on the Wi-Fi path.
+            tx_power_dbm: Some(DbmRange::new(10, 22)),
             agile: false,
             rx_only: false,
             // Sub-GHz is duty-cycle-limited (~1%) and needs a windowed rendezvous;
@@ -965,6 +1077,7 @@ impl RadioCapability {
             rate: RateCapability::None, // RX-only instrument — no transmit rate
             channels,
             max_tx_power: 0,
+            tx_power_dbm: None,
             agile: true,
             rx_only: true,
             // A spectrum instrument: always listening, never transmits.
