@@ -28,8 +28,8 @@ pub use ndn_radio_hal::{
 };
 
 pub use frame::{
-    ESPNOW_MAX_BODY, ESPNOW_OUI, GroupKey, OPEN_GROUP_KEY, name_group, name_group_mac,
-    name_group_uni, prefix_key, siphash24,
+    EphemeralSource, ESPNOW_MAX_BODY, ESPNOW_OUI, GroupKey, OPEN_GROUP_KEY, name_group,
+    name_group_mac, name_group_uni, prefix_key, siphash24,
 };
 
 mod loopback;

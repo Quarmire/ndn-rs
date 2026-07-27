@@ -183,6 +183,46 @@ pub fn prefix_key(mut addr: [u8; 6]) -> [u8; 6] {
     addr
 }
 
+/// An **ephemeral, per-boot, rotating source tag** — the source-field value the named-radio doctrine
+/// (mac-addressing-doctrine §2) calls for. It is a locally-administered, *individual* 6-byte address
+/// with **no routing meaning**: randomized once per boot (from a caller-supplied `boot_seed`) and
+/// rotated on a schedule to bound linkability. It is **not** a host identity — the doctrine forbids
+/// keying any routing/forwarding state on it. Its only jobs are per-frame RSSI attribution (a
+/// per-neighbour `SignalStore` key), per-source DoS rate-limiting, and disambiguating two producers
+/// emitting under one prefix at once.
+///
+/// The nonce for a given instant is `SipHash(boot_seed, rotation_epoch)` truncated to the low 46
+/// bits, with the first octet forced to U/L=local, I/G=individual — so it stays inert to real
+/// networks and can never be mistaken for a manufacturer-assigned host MAC.
+#[derive(Clone, Copy, Debug)]
+pub struct EphemeralSource {
+    boot_seed: u64,
+    rotation_period_ms: u64,
+}
+
+impl EphemeralSource {
+    /// `boot_seed` should be drawn from a per-boot entropy source by the caller (time ⊕ pid ⊕ face,
+    /// or an RNG). `rotation_period_ms` is how long one nonce stays stable; `0` disables rotation
+    /// (one fixed nonce for the whole boot — still per-boot random, just not rotating).
+    pub const fn new(boot_seed: u64, rotation_period_ms: u64) -> Self {
+        Self { boot_seed, rotation_period_ms }
+    }
+
+    /// The source address in effect at `now_ms`. Frames within one rotation period share it (so a
+    /// receiver can attribute their RSSI to one neighbour); it changes across periods and boots.
+    pub fn current(&self, now_ms: u64) -> [u8; 6] {
+        let epoch =
+            if self.rotation_period_ms == 0 { 0 } else { now_ms / self.rotation_period_ms };
+        let mut key = [0u8; 16];
+        key[..8].copy_from_slice(&self.boot_seed.to_le_bytes());
+        let h = siphash24(&key, &epoch.to_le_bytes()).to_le_bytes();
+        // Low 46 bits into the address body; force U/L=local (0x02) + I/G=individual (clear 0x01).
+        let mut m = [h[0], h[1], h[2], h[3], h[4], h[5]];
+        m[0] = (m[0] & 0xFC) | 0x02;
+        m
+    }
+}
+
 /// Build `radiotap ++ 802.11 ++ <format body>` for one injected frame. The
 /// 802.11 address fields are filled from `frame.dst`/`frame.src` — for a
 /// name-grouped face these are name-derived (`name_group_mac`/`name_group_uni`),
@@ -593,6 +633,26 @@ mod tests {
         let u = name_group_uni(&OPEN_GROUP_KEY, b"/sensors/temp");
         assert_eq!(u[0] & 0x03, 0x02, "unicast + local");
         assert_eq!(u[1..], a[1..], "same hash body, differ only in I/G bit");
+    }
+
+    /// §2 doctrine: the ephemeral source nonce is a locally-administered *individual* tag (U/L=local,
+    /// I/G=individual), never a host MAC; it is stable within a rotation period, rotates across
+    /// periods, and differs across boots — so it can attribute per-frame RSSI without being an identity.
+    #[test]
+    fn ephemeral_source_is_local_individual_and_rotates() {
+        let src = EphemeralSource::new(0xDEAD_BEEF, 1000); // 1 s rotation
+        let a = src.current(0);
+        // Locally administered (not a vendor MAC) + individual (a source, not multicast).
+        assert_eq!(a[0] & 0x02, 0x02, "U/L local bit set — not a globally-unique host MAC");
+        assert_eq!(a[0] & 0x01, 0x00, "I/G individual bit clear — a source address");
+        // Stable within a period; rotates across periods.
+        assert_eq!(a, src.current(999), "stable within one rotation period");
+        assert_ne!(a, src.current(1000), "rotates into the next period");
+        // Different boot seed → different nonce (per-boot randomness, no persistent identity).
+        assert_ne!(a, EphemeralSource::new(0x1234_5678, 1000).current(0), "differs across boots");
+        // No rotation when the period is 0 (still per-boot random, just fixed for the boot).
+        let fixed = EphemeralSource::new(7, 0);
+        assert_eq!(fixed.current(0), fixed.current(1_000_000), "period 0 → one nonce for the boot");
     }
 
     /// SipHash-2-4 correctness against the reference vector (Aumasson & Bernstein):

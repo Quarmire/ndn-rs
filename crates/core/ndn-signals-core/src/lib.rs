@@ -158,6 +158,15 @@ pub trait SignalView<F: Copy + Eq> {
     fn node(&self) -> NodeSignals;
     /// A neighbor's node signals reachable via `face`, if learned.
     fn neighbor(&self, face: F) -> Option<NodeSignals>;
+
+    /// Link signals attributed to one **neighbour**, keyed by its ephemeral source tag (the
+    /// per-boot rotating nonce a named-radio bearer stamps in the 802.11 source field —
+    /// mac-addressing-doctrine §2), rather than to the *face* the frame arrived on. This is the
+    /// per-neighbour RSSI map the doctrine needs (CCLF density, macro-diversity) in place of an
+    /// ambient per-face scalar. Bearers that carry no such tag return `None` (the default).
+    fn source_link(&self, _src: [u8; 6]) -> Option<LinkSignals> {
+        None
+    }
 }
 
 /// Push side of a signal store. Sources call `set_*` to publish the latest
@@ -168,6 +177,12 @@ pub trait SignalStore<F: Copy + Eq>: SignalView<F> {
     fn set_link(&self, face: F, signals: LinkSignals);
     fn set_node(&self, signals: NodeSignals);
     fn set_neighbor(&self, face: F, signals: NodeSignals);
+
+    /// Publish link signals attributed to a **neighbour** by its ephemeral source tag (the per-boot
+    /// rotating nonce in the 802.11 source field — mac-addressing-doctrine §2). A named-radio RX path
+    /// calls this per captured frame so RSSI becomes a per-neighbour map, not an ambient per-face
+    /// scalar. The default is a no-op, so stores that do not track neighbours are unaffected.
+    fn set_source_link(&self, _src: [u8; 6], _signals: LinkSignals) {}
 
     /// **Field-merge** one face's link signals: apply `f` to the current value
     /// (default if none yet) and store the result. Unlike [`set_link`](Self::set_link)
