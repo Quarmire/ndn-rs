@@ -167,6 +167,14 @@ pub trait SignalView<F: Copy + Eq> {
     fn source_link(&self, _src: [u8; 6]) -> Option<LinkSignals> {
         None
     }
+
+    /// Count distinct **neighbours** heard within `fresh_within_ms` of `now_ms`, keyed by their
+    /// ephemeral source tag (§2) — the per-frame *density* the nonce map exists to provide: every
+    /// neighbour that put a frame on air, not just those that sent a reception report. CCLF's density
+    /// term reads it. Bearers without per-source attribution return `0` (the default).
+    fn neighbour_count(&self, _fresh_within_ms: u64, _now_ms: u64) -> usize {
+        0
+    }
 }
 
 /// Push side of a signal store. Sources call `set_*` to publish the latest
