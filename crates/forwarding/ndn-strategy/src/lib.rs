@@ -21,6 +21,7 @@ pub mod context;
 pub mod erased;
 pub mod filter;
 pub mod filters;
+pub mod broadcast;
 pub mod measured;
 pub mod measurements;
 pub mod multicast;
@@ -30,6 +31,7 @@ pub mod signals;
 pub mod strategy;
 
 pub use best_route::BestRouteStrategy;
+pub use broadcast::BroadcastStrategy;
 pub use congestion::{CongestionConfig, CongestionFeedback, CongestionSource, congestion_feedback};
 pub use congestion_aware::CongestionAwareStrategy;
 pub use context::{DataLocation, FibEntry, FibNexthop, PrevHopLocation, StrategyContext};
