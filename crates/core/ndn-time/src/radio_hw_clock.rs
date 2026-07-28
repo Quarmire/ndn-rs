@@ -64,6 +64,18 @@ impl RadioHwClock {
         Self { offset: None, domain: None, period: period as i64 }
     }
 
+    /// A **common-view** clock: disciplined via [`on_raw`](Self::on_raw) to a *shared reference*
+    /// timeline carried in a received time-beacon (a clock-master's monotonic µs), rather than to the
+    /// local RX counter. Non-wrapping (the reference is a full-width 64-bit µs count), so `now` reads
+    /// the master's timeline — every node disciplining to the **same** beacon converges to it, so their
+    /// epochs agree with no infrastructure clock (GPS-common-view style, radio-native). The master
+    /// feeds its own reference; slaves feed the received one. Precision is bounded by the master's
+    /// build→air TX latency (a hardware TX timestamp or an external shared-beacon common-view tightens
+    /// it to the RX-stamp floor — a refinement); adequate for ms-scale data-frame slots.
+    pub fn common_view() -> Self {
+        Self::with_period(0)
+    }
+
     /// Re-phase from a hardware `stamp` captured at `host_now` (µs); returns the disciplined hardware
     /// time. The first stamp locks the domain; later stamps from a *different* domain are ignored and
     /// this returns the extrapolated `now()` instead of re-phasing on foreign counter units.
@@ -176,6 +188,22 @@ mod tests {
         let off = c.offset_us().unwrap();
         assert!(off.abs() < RXTSF_PERIOD_US / 2, "offset {off} should be centered, not a full wrap");
         assert_eq!(hw, (host as i64 + off) as u64);
+    }
+
+    #[test]
+    fn common_view_aligns_two_nodes_to_one_reference() {
+        // A master's reference timeline (monotonic µs) conveyed by a beacon; two slaves discipline to
+        // it at different local host times. Both then read the SAME reference → their epochs agree.
+        let mut a = RadioHwClock::common_view();
+        let mut b = RadioHwClock::common_view();
+        // Master reference reads 1_000_000 µs. Slave A hears it when its host clock = 40; slave B when
+        // its host clock = 900 (independent local clocks).
+        a.on_raw(1_000_000, 40);
+        b.on_raw(1_000_000, 900);
+        // 500 µs of local host time later on each, both read ≈ reference + 500 — aligned to each other.
+        assert_eq!(a.now(540), 1_000_500);
+        assert_eq!(b.now(1_400), 1_000_500);
+        // Same slot from a shared SlotSchedule → same owner decision, the whole point.
     }
 
     #[test]
