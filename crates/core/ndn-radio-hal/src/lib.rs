@@ -395,6 +395,17 @@ pub trait FrameIo: Send + Sync + 'static {
         let _ = mcs;
         Ok(())
     }
+
+    /// The latest **mesh common-view** observation `(peer_tsf, our_rxtsfl, count, bssid)` from a
+    /// neighbour's hardware-TSF-stamped timing beacon (#74): the transmitter's hardware TSF from the
+    /// beacon body, paired with our hardware RX stamp of the same on-air event, restricted to *mesh*
+    /// transmitters (a locally-administered BSSID — our ephemeral nonces, not infrastructure APs).
+    /// `count` increments per observation so a consumer can poll for a fresh one. Disciplining a clock
+    /// to `peer_tsf − our_rxtsfl` gives self-contained sub-µs common-view. Default `None` — only a
+    /// backend that latches a hardware RX TSF and parses beacon timestamps returns anything.
+    fn mesh_common_view(&self) -> Option<(u64, u64, u64, [u8; 6])> {
+        None
+    }
 }
 
 /// A Wi-Fi radio. Historically this added a per-frame exact-rate `inject_at`; that
