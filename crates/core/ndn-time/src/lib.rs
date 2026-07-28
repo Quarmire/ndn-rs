@@ -84,7 +84,7 @@ pub use link_clock::{RadioClockKind, RadioTimeSource};
 pub use measure::{
     RxObs, TwoWay, common_view, distance_bounded, offset_to_wall, one_way, two_way,
 };
-pub use network_time::{NetworkTime, RefBelief};
+pub use network_time::{NetworkTime, REF_BELIEF_BYTES, RefBelief};
 pub use provenance::{Authenticity, KeyId, Measured, MeasurementProvenance, PathId};
 pub use radio_hw_clock::{RXTSF_PERIOD_US, RadioHwClock};
 pub use ratchet::{Ratchet, WindowEnforcement};

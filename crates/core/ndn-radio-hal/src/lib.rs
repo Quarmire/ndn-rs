@@ -396,16 +396,32 @@ pub trait FrameIo: Send + Sync + 'static {
         Ok(())
     }
 
-    /// The latest **mesh common-view** observation `(peer_tsf, our_rxtsfl, count, bssid)` from a
-    /// neighbour's hardware-TSF-stamped timing beacon (#74): the transmitter's hardware TSF from the
-    /// beacon body, paired with our hardware RX stamp of the same on-air event, restricted to *mesh*
-    /// transmitters (a locally-administered BSSID — our ephemeral nonces, not infrastructure APs).
-    /// `count` increments per observation so a consumer can poll for a fresh one. Disciplining a clock
-    /// to `peer_tsf − our_rxtsfl` gives self-contained sub-µs common-view. Default `None` — only a
-    /// backend that latches a hardware RX TSF and parses beacon timestamps returns anything.
-    fn mesh_common_view(&self) -> Option<(u64, u64, u64, [u8; 6])> {
+    /// The latest **mesh common-view** observation from a neighbour's hardware-TSF-stamped timing beacon
+    /// (#74/#75): the transmitter's hardware TSF from the beacon body, paired with our hardware RX stamp
+    /// of the same on-air event, restricted to *mesh* transmitters (a locally-administered BSSID — our
+    /// ephemeral nonces, not infrastructure APs), plus the emitter's advertised network-time belief if
+    /// the beacon carried one (for multi-hop composition). `count` increments per observation so a
+    /// consumer can poll for a fresh one. Default `None` — only a backend that latches a hardware RX TSF
+    /// and parses beacon timestamps returns anything.
+    fn mesh_common_view(&self) -> Option<MeshCv> {
         None
     }
+}
+
+/// A mesh common-view observation (see [`FrameIo::mesh_common_view`]).
+#[derive(Clone, Copy, Debug)]
+pub struct MeshCv {
+    /// The transmitter's hardware TSF (µs) from the beacon body.
+    pub peer_tsf: u64,
+    /// Our hardware RX stamp (RXTSFL, µs) of that same on-air frame.
+    pub our_rxtsfl: u64,
+    /// Increments per observation — poll to detect a fresh one.
+    pub count: u64,
+    /// The transmitter's BSSID (its ephemeral nonce; locally administered).
+    pub bssid: [u8; 6],
+    /// The transmitter's advertised network-time belief (#75), if the beacon carried one after its
+    /// timestamp. `None` for a bare #74 beacon → the receiver treats the transmitter as a stratum-0 ref.
+    pub belief: Option<ndn_time::RefBelief>,
 }
 
 /// A Wi-Fi radio. Historically this added a per-frame exact-rate `inject_at`; that

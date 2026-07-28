@@ -34,6 +34,33 @@ pub struct RefBelief {
     pub offset_to_ref: i64,
 }
 
+/// The on-wire size of a serialized [`RefBelief`] — what a timing beacon appends after its hardware
+/// timestamp so the next hop can compose off it (`ref_id` 8 + `stratum` 1 + `offset_to_ref` 8).
+pub const REF_BELIEF_BYTES: usize = 17;
+
+impl RefBelief {
+    /// Serialize for a timing beacon (little-endian): `ref_id ‖ stratum ‖ offset_to_ref`.
+    pub fn to_beacon_bytes(&self) -> [u8; REF_BELIEF_BYTES] {
+        let mut b = [0u8; REF_BELIEF_BYTES];
+        b[0..8].copy_from_slice(&self.ref_id.to_le_bytes());
+        b[8] = self.stratum;
+        b[9..17].copy_from_slice(&self.offset_to_ref.to_le_bytes());
+        b
+    }
+
+    /// Parse from a timing beacon body (the bytes after the hardware timestamp). `None` if too short.
+    pub fn from_beacon_bytes(b: &[u8]) -> Option<Self> {
+        if b.len() < REF_BELIEF_BYTES {
+            return None;
+        }
+        Some(Self {
+            ref_id: u64::from_le_bytes(b[0..8].try_into().ok()?),
+            stratum: b[8],
+            offset_to_ref: i64::from_le_bytes(b[9..17].try_into().ok()?),
+        })
+    }
+}
+
 /// The multi-hop network-time state for one node.
 #[derive(Clone, Copy, Debug)]
 pub struct NetworkTime {
