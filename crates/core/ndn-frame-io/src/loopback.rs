@@ -23,6 +23,8 @@ struct AirFrame {
     /// — name-derived for a grouped face, broadcast/default otherwise.
     dst: [u8; 6],
     src: [u8; 6],
+    /// 802.11 `addr3` (the ephemeral nonce under the Tier-0 layout), if the injector set it.
+    addr3: Option<[u8; 6]>,
     payload: Bytes,
     /// MCS the sender injected at — surfaced to receivers as the captured MCS,
     /// mirroring radiotap reporting the RX rate.
@@ -75,11 +77,12 @@ pub struct LoopbackEndpoint {
 impl LoopbackEndpoint {
     /// Put a frame on the simulated air at a resolved MCS index. No subscribers
     /// is not an error on a broadcast medium (the frame is simply lost).
-    fn emit(&self, dst: [u8; 6], src: [u8; 6], payload: Bytes, mcs_index: u8) {
+    fn emit(&self, dst: [u8; 6], src: [u8; 6], addr3: Option<[u8; 6]>, payload: Bytes, mcs_index: u8) {
         let _ = self.tx.send(Arc::new(AirFrame {
             sender: self.node_id,
             dst,
             src,
+            addr3,
             payload,
             mcs_index,
         }));
@@ -98,7 +101,7 @@ impl FrameIo for LoopbackEndpoint {
             .unwrap_or_else(|| {
                 crate::McsDescriptor::for_intent(&frame.tx, crate::MAX_RELIABLE_MCS, false).index
             });
-        self.emit(frame.dst, frame.src, frame.payload, idx);
+        self.emit(frame.dst, frame.src, frame.addr3, frame.payload, idx);
         Ok(())
     }
 
@@ -116,6 +119,7 @@ impl FrameIo for LoopbackEndpoint {
                         payload: air.payload.clone(),
                         addr: Some(air.src),
                         group: Some(air.dst),
+                        addr3: air.addr3,
                         rssi_dbm: Some(self.observed_rssi_dbm),
                         mcs_index: Some(air.mcs_index),
                         // The loopback bus is a format-agnostic in-memory test
@@ -153,6 +157,7 @@ mod tests {
             tx: TxIntent::CONSERVATIVE,
             dst,
             src,
+            addr3: None,
         }
     }
 

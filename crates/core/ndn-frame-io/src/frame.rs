@@ -109,80 +109,6 @@ pub struct GroupKey(pub [u8; 16]);
 /// The well-known key for open/public namespaces — an open receiver set.
 pub const OPEN_GROUP_KEY: GroupKey = GroupKey(*b"ndn/open-group!!");
 
-/// Set the I/G + U/L bits of a locally-administered address body: `group=true`
-/// → multicast (`0x03`), `false` → unicast (`0x02`).
-fn tag_local(mut m: [u8; 6], group: bool) -> [u8; 6] {
-    m[0] = (m[0] & 0xFC) | if group { 0x03 } else { 0x02 };
-    m
-}
-
-/// A **multicast** MAC derived from a name — *"the name is the group address."* A
-/// receiver interested in it programs its NIC's address filter (or a software
-/// pre-filter) to this and the hardware drops everything else (measured: chip-level
-/// filtering gives the MAC-filter CPU profile, see the mac-addressing-doctrine). The
-/// first octet sets I/G (group) + U/L (local); the low 46 bits carry the keyed hash.
-///
-/// This is the **flat** full-name form (no prefix aggregation) — right for a leaf
-/// consumer, a producer's own group, or a face bound to one routable prefix (every
-/// frame shares this prefix-group address). When a *relay* must match a whole family
-/// of names by masking, use [`name_group`] + [`prefix_key`] instead.
-///
-/// Keyed by the trust context (`key`): [`OPEN_GROUP_KEY`] for a public/open receiver
-/// set, a shared secret for a private domain. The group MAC is a Bloom-style
-/// pre-filter; the full name + signature are authoritative after decode, so a hash
-/// collision only wastes a wake, never mis-delivers.
-pub fn name_group_mac(key: &GroupKey, name: &[u8]) -> [u8; 6] {
-    let h = siphash24(&key.0, name).to_be_bytes();
-    tag_local([h[0], h[1], h[2], h[3], h[4], h[5]], true)
-}
-
-/// The **unicast** locally-administered form of [`name_group_mac`] (same hash body,
-/// I/G clear) — used where a unicast addr1 is wanted (e.g. the exact-match chip
-/// filter, or a name-derived source when an ephemeral nonce is not in use).
-pub fn name_group_uni(key: &GroupKey, name: &[u8]) -> [u8; 6] {
-    let h = siphash24(&key.0, name).to_be_bytes();
-    tag_local([h[0], h[1], h[2], h[3], h[4], h[5]], false)
-}
-
-/// **Prefix-aggregating** name-group address: the 46-bit hash split
-/// `H(routable_prefix)` (high 24 bits, structural bits aside) ‖ `H(full_name)` (low
-/// 24 bits), both keyed by the trust context. A **FIB relay** filters coarsely on the
-/// high bits ([`prefix_key`]) — matching *every* name under the prefix, so one filter
-/// entry aggregates a family (the IP-prefix-match trick). A **consumer/PIT** compares
-/// the full width for the exact name. Generation/block IDs are *not* here — they live
-/// in the coding metadata, scoped by the already-identified name (`FecMetadata`), so
-/// they need no global collision resistance.
-///
-/// `routable_prefix` is the prefix a FIB routes on (a naming convention fixes its
-/// boundary); `full_name` is the whole name. Collision cost is a wasted wake caught by
-/// the name check above the hash — the hash accelerates, the name authorises.
-///
-/// **Entropy tradeoff (be aware):** within one routable prefix, names are
-/// discriminated only by the low 24 bits (the suffix hash) — a 24-bit birthday bound,
-/// ~4096 names/prefix before a likely collision. That is fine for a *filter* (a
-/// collision wastes a wake, never mis-delivers) but a producer of a huge *flat*
-/// namespace that needs full 46-bit discrimination and no aggregation should use
-/// [`name_group_mac`] instead.
-pub fn name_group(key: &GroupKey, routable_prefix: &[u8], full_name: &[u8], group: bool) -> [u8; 6] {
-    let ph = siphash24(&key.0, routable_prefix);
-    let nh = siphash24(&key.0, full_name);
-    tag_local(
-        [(ph >> 16) as u8, (ph >> 8) as u8, ph as u8, (nh >> 16) as u8, (nh >> 8) as u8, nh as u8],
-        group,
-    )
-}
-
-/// The coarse **prefix-match key** of a [`name_group`] address: zero the low 3 bytes
-/// (the full-name hash), keeping only the routable-prefix hash. A FIB relay registers
-/// `prefix_key(name_group(key, P, P, g))` and matches any frame whose `prefix_key`
-/// equals it — one entry covers the whole prefix family.
-pub fn prefix_key(mut addr: [u8; 6]) -> [u8; 6] {
-    addr[3] = 0;
-    addr[4] = 0;
-    addr[5] = 0;
-    addr
-}
-
 /// An **ephemeral, per-boot, rotating source tag** — the source-field value the named-radio doctrine
 /// (mac-addressing-doctrine §2) calls for. It is a locally-administered, *individual* 6-byte address
 /// with **no routing meaning**: randomized once per boot (from a caller-supplied `boot_seed`) and
@@ -224,9 +150,9 @@ impl EphemeralSource {
 }
 
 /// Build `radiotap ++ 802.11 ++ <format body>` for one injected frame. The
-/// 802.11 address fields are filled from `frame.dst`/`frame.src` — for a
-/// name-grouped face these are name-derived (`name_group_mac`/`name_group_uni`),
-/// so no host identity appears on the wire.
+/// 802.11 address fields are filled from `frame.dst`/`frame.src`/`frame.addr3` — under the
+/// Tier-0 layout `addr1 ‖ addr2` are the name's prefix-set filter and `addr3` the ephemeral
+/// nonce, so no host identity appears on the wire.
 ///
 /// The radiotap TX header carries the rate: a per-frame MCS for `RawNdn`, or a
 /// robust legacy rate for `EspNow` (1 Mbps on 2.4 GHz). The 802.11 frame itself
@@ -351,9 +277,12 @@ pub fn build_dot11(format: FrameFormat, frame: &InjectFrame) -> Result<Vec<u8>, 
             // addressing — these fields are a name-keyed index, not host ids.
             out.extend_from_slice(&[0x08, 0x00]); // FC: type=Data, subtype=0
             out.extend_from_slice(&[0x00, 0x00]); // Duration
-            out.extend_from_slice(&frame.dst); // addr1 (RA/DA) = group/broadcast
-            out.extend_from_slice(&frame.src); // addr2 (TA/SA) = name-derived
-            out.extend_from_slice(&frame.dst); // addr3 (BSSID) = group/broadcast
+            out.extend_from_slice(&frame.dst); // addr1 (RA/DA) = group / Tier-0 filter hi
+            out.extend_from_slice(&frame.src); // addr2 (TA/SA) = name-derived / filter lo
+            // addr3: the ephemeral source nonce when addr1‖addr2 is a Tier-0 filter, else
+            // the legacy BSSID slot (a copy of dst). Nothing on the RX path reads addr3 for
+            // the legacy layout, so the fallback is byte-compatible with prior deployments.
+            out.extend_from_slice(&frame.addr3.unwrap_or(frame.dst)); // addr3 (BSSID / nonce)
             out.extend_from_slice(&[0x00, 0x00]); // SeqCtrl
             out.extend_from_slice(&LLC_SNAP_PREFIX);
             out.extend_from_slice(&ethertype.to_be_bytes());
@@ -472,10 +401,18 @@ pub fn parse_dot11(
             ta.copy_from_slice(&body[10..16]);
             let mut group = [0u8; 6];
             group.copy_from_slice(&body[4..10]); // addr1 (RA/DA)
+            // addr3 (BSSID slot): the sender's ephemeral nonce under the Tier-0 layout, where
+            // addr1‖addr2 is the prefix-set filter and so cannot also carry the source.
+            let addr3 = body.get(16..22).map(|s| {
+                let mut a = [0u8; 6];
+                a.copy_from_slice(s);
+                a
+            });
             Some(CapturedFrame {
                 payload: Bytes::copy_from_slice(&body[hdr_len + LLC_SNAP_LEN..]),
                 addr: Some(ta),
                 group: Some(group),
+                addr3,
                 rssi_dbm: rssi,
                 mcs_index: mcs,
                 stamp,
@@ -514,6 +451,7 @@ pub fn parse_dot11(
                 payload: Bytes::copy_from_slice(payload),
                 addr: Some(ta),
                 group: Some(group),
+                addr3: None, // ESP-NOW addr3 is broadcast, not a nonce
                 rssi_dbm: rssi,
                 mcs_index: mcs,
                 stamp,
@@ -531,10 +469,16 @@ pub fn parse_dot11(
             ta.copy_from_slice(&body[10..16]);
             let mut group = [0u8; 6];
             group.copy_from_slice(&body[4..10]);
+            let addr3 = body.get(16..22).map(|s| {
+                let mut a = [0u8; 6];
+                a.copy_from_slice(s);
+                a
+            });
             Some(CapturedFrame {
                 payload: Bytes::copy_from_slice(body),
                 addr: Some(ta),
                 group: Some(group),
+                addr3,
                 rssi_dbm: rssi,
                 mcs_index: mcs,
                 stamp,
@@ -557,6 +501,7 @@ mod tests {
             tx: TxIntent::CONSERVATIVE,
             dst: BROADCAST,
             src: SRC,
+            addr3: None,
         }
     }
 
@@ -621,20 +566,6 @@ mod tests {
         assert_eq!(got.addr, Some(SRC));
     }
 
-    /// Group MAC: name-derived multicast (I/G+U/L set), unicast source variant,
-    /// distinct prefixes → distinct addresses, deterministic.
-    #[test]
-    fn name_group_mac_is_local_multicast_and_distinct() {
-        let a = name_group_mac(&OPEN_GROUP_KEY, b"/sensors/temp");
-        let b = name_group_mac(&OPEN_GROUP_KEY, b"/sensors/humidity");
-        assert_eq!(a[0] & 0x03, 0x03, "I/G (group) + U/L (local) bits set");
-        assert_ne!(a, b, "distinct prefixes → distinct group MACs");
-        assert_eq!(a, name_group_mac(&OPEN_GROUP_KEY, b"/sensors/temp"), "deterministic");
-        let u = name_group_uni(&OPEN_GROUP_KEY, b"/sensors/temp");
-        assert_eq!(u[0] & 0x03, 0x02, "unicast + local");
-        assert_eq!(u[1..], a[1..], "same hash body, differ only in I/G bit");
-    }
-
     /// §2 doctrine: the ephemeral source nonce is a locally-administered *individual* tag (U/L=local,
     /// I/G=individual), never a host MAC; it is stable within a rotation period, rotates across
     /// periods, and differs across boots — so it can attribute per-frame RSSI without being an identity.
@@ -663,90 +594,6 @@ mod tests {
         let key: [u8; 16] = core::array::from_fn(|i| i as u8);
         let data: [u8; 15] = core::array::from_fn(|i| i as u8);
         assert_eq!(siphash24(&key, &data), 0xa129_ca61_49be_45e5);
-    }
-
-    /// Keying: the SAME name under different trust-context keys yields different
-    /// group hashes — an outsider without the key cannot compute (nor cheaply target)
-    /// a private group's pre-parse filter.
-    #[test]
-    fn keying_hides_a_private_group_from_outsiders() {
-        let secret = GroupKey(*b"trust-domain-42!");
-        let open = name_group(&OPEN_GROUP_KEY, b"/x", b"/x/y", true);
-        let priv_ = name_group(&secret, b"/x", b"/x/y", true);
-        assert_ne!(open, priv_, "same name, different key → different group hash");
-        assert_eq!(priv_, name_group(&secret, b"/x", b"/x/y", true), "deterministic under a key");
-    }
-
-    /// Prefix aggregation: every name under one routable prefix shares the coarse
-    /// prefix-match key (a FIB relay matches the family with one entry), yet the full
-    /// addresses are distinct (a consumer/PIT distinguishes the exact names).
-    #[test]
-    fn prefix_key_aggregates_a_family_but_full_addr_is_distinct() {
-        let k = &OPEN_GROUP_KEY;
-        let a = name_group(k, b"/x", b"/x/a", true);
-        let b = name_group(k, b"/x", b"/x/b", true);
-        let other = name_group(k, b"/z", b"/z/a", true);
-        assert_eq!(prefix_key(a), prefix_key(b), "same routable prefix → same coarse key");
-        assert_ne!(prefix_key(a), prefix_key(other), "different prefix → different coarse key");
-        assert_ne!(a, b, "distinct full names → distinct full addresses (fine PIT match)");
-    }
-
-    /// Collision behaviour, stated honestly. The **flat** full-name hash
-    /// ([`name_group_mac`]) uses all 46 bits, so 20k distinct names collide
-    /// essentially never (birthday ~ n²/2⁴⁷ ≈ 3e-6). The **split** [`name_group`]
-    /// trades entropy for aggregation: names under *one* routable prefix are
-    /// discriminated only by the low 24 bits (the suffix hash), a 24-bit birthday
-    /// bound (~4096 names/prefix before a likely collision). Both are fine for a
-    /// *filter* — a collision only wastes a wake, since the full name + signature
-    /// above the hash are authoritative — but a producer of a huge flat namespace
-    /// should use `name_group_mac` (46-bit), and only relays that need family-match
-    /// use the split.
-    #[test]
-    fn collision_behaviour_flat_46bit_vs_split_24bit_within_prefix() {
-        use std::collections::HashSet;
-        let n = 20_000;
-
-        // Flat full-name hash: 46 bits → no collisions among 20k distinct names.
-        let flat: HashSet<_> = (0..n).map(|i| name_group_mac(&OPEN_GROUP_KEY, format!("/app/{i}/data").as_bytes())).collect();
-        assert_eq!(flat.len(), n, "flat 46-bit hash: no collisions among {n} names");
-
-        // Split under DIFFERENT prefixes: the full 46 bits vary → no collisions.
-        let k = &OPEN_GROUP_KEY;
-        let across: HashSet<_> =
-            (0..n).map(|i| name_group(k, format!("/p{i}").as_bytes(), format!("/p{i}/d").as_bytes(), true)).collect();
-        assert_eq!(across.len(), n, "split across distinct prefixes: no collisions");
-
-        // Split WITHIN one prefix: only the low 24 bits discriminate, so 20k names DO
-        // collide at the 24-bit birthday rate — the documented aggregation tradeoff.
-        let within: HashSet<_> =
-            (0..n).map(|i| name_group(k, b"/app", format!("/app/{i}").as_bytes(), true)).collect();
-        assert!(within.len() < n, "split within one prefix: 24-bit discrimination collides (expected)");
-        assert!(within.len() > n * 99 / 100, "…but only a handful ({}/{n} unique)", within.len());
-    }
-
-    /// A name-grouped frame round-trips with the group MAC in addr1 and the
-    /// name-derived unicast source in addr2.
-    #[test]
-    fn name_group_addressing_round_trips() {
-        let fmt = FrameFormat::RawNdn { ethertype: 0x8624 };
-        let g = name_group_mac(&OPEN_GROUP_KEY, b"/p");
-        let u = name_group_uni(&OPEN_GROUP_KEY, b"/p");
-        let f = InjectFrame {
-            payload: Bytes::from_static(b"\x05\x01z"),
-            tx: TxIntent::CONSERVATIVE,
-            dst: g,
-            src: u,
-        };
-        let got = parse(
-            fmt,
-            &build(fmt, &f).unwrap(),
-            None,
-            None,
-            crate::ClockDomainId(0),
-        )
-        .unwrap();
-        assert_eq!(got.group, Some(g), "addr1 carries the name-group MAC");
-        assert_eq!(got.addr, Some(u), "addr2 is the name-derived source");
     }
 
     /// The injected bytes after radiotap must be a well-formed ESP-NOW vendor
@@ -806,6 +653,7 @@ mod tests {
             tx: TxIntent::CONSERVATIVE,
             dst: BROADCAST,
             src: SRC,
+            addr3: None,
         };
         // build_dot11 is the identity on the payload (no extra framing).
         assert_eq!(build_dot11(fmt, &inj).unwrap(), frame_bytes);

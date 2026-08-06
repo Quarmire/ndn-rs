@@ -25,7 +25,9 @@ pub fn get_ifindex(fd: RawFd, iface: &str) -> std::io::Result<i32> {
             name_bytes.len(),
         );
     }
-    if unsafe { libc::ioctl(fd, libc::SIOCGIFINDEX as libc::c_ulong, &mut ifr) } == -1 {
+    // `ioctl`'s request arg is `c_ulong` on glibc but `c_int` on musl — `as _`
+    // infers the target-correct type so this cross-compiles for both.
+    if unsafe { libc::ioctl(fd, libc::SIOCGIFINDEX as _, &mut ifr) } == -1 {
         return Err(std::io::Error::last_os_error());
     }
     Ok(unsafe { ifr.ifr_ifru.ifru_ifindex })
@@ -307,7 +309,8 @@ pub fn get_interface_mac(iface: &str) -> std::io::Result<MacAddr> {
     let name_ptr = ifr.ifr_name.as_mut_ptr() as *mut u8;
     unsafe { std::ptr::copy_nonoverlapping(name_bytes.as_ptr(), name_ptr, copy_len) };
 
-    let ret = unsafe { libc::ioctl(fd.as_raw_fd(), libc::SIOCGIFHWADDR, &mut ifr as *mut _) };
+    let ret =
+        unsafe { libc::ioctl(fd.as_raw_fd(), libc::SIOCGIFHWADDR as _, &mut ifr as *mut _) };
     if ret == -1 {
         return Err(std::io::Error::last_os_error());
     }

@@ -438,9 +438,9 @@ impl LinkService for LpLinkService {
         transport: &'a dyn ErasedTransport,
     ) -> Pin<Box<dyn Future<Output = Result<LinkServiceFrame, FaceError>> + Send + 'a>> {
         Box::pin(async move {
-            let (wire, addr) = transport.recv_bytes_with_addr().await?;
+            let (wire, addr, radio_id) = transport.recv_bytes_with_meta().await?;
             let ingress_ctx = IngressCtx::new(FaceId(transport.id().0));
-            let inbound = InboundLpFrame::with_addr(wire.clone(), addr.clone());
+            let inbound = InboundLpFrame::with_meta(wire.clone(), addr.clone(), radio_id);
             for feature in &self.features {
                 feature.on_ingress(&inbound, &ingress_ctx);
             }

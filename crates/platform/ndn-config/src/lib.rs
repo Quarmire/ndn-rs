@@ -30,8 +30,9 @@ pub use config::{
     AcmeTomlConfig, CertSourceConfig, ChallengeConfig, CsConfig, DemoCaConfig, DiscoveryTomlConfig,
     EngineConfig, FaceConfig, FaceKind, ForwarderConfig, ListenersConfig, LoggingConfig,
     ManagementConfig, MgmtSecurityConfig, NlsrNeighborConfig, NlsrTomlConfig,
-    ObservabilityTomlConfig, QuicListenerConfig, ReflexiveTomlConfig, RequireAttestationConfig,
-    RouteConfig, RoutingTomlConfig, SecurityConfig, SelfSignedDevConfig, SmtpConfig,
+    ObservabilityTomlConfig, QuicListenerConfig, RadioDeviceConfig, ReflexiveTomlConfig,
+    RequireAttestationConfig, RouteConfig, RoutingTomlConfig, SecurityConfig, SelfSignedDevConfig,
+    SmtpConfig,
     TrustRuleConfig, WebRtcListenerConfig, WebTransportListenerConfig, WtIceServers, WtTurnServer,
 };
 pub use error::ConfigError;

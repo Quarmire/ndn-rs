@@ -306,8 +306,8 @@ pub fn mcs_phy_rate_bps(mcs_index: u8) -> u32 {
 }
 
 /// One frame as injected: the (LP-framed) NDN payload, the PHY rate, and the
-/// 802.11 destination/source addresses. For a name-grouped face `dst`/`src` are
-/// name-derived (`ndn_frame_io::frame::name_group_mac`/`name_group_uni`); otherwise
+/// 802.11 address fields. Under the Tier-0 layout `dst`/`src` are the two halves of the
+/// name's prefix-set filter (`addr1 ‖ addr2`) and `addr3` the ephemeral nonce; otherwise
 /// broadcast + the default source. Never a host MAC.
 #[derive(Clone, Debug)]
 pub struct InjectFrame {
@@ -316,10 +316,16 @@ pub struct InjectFrame {
     /// backend resolves it to its own PHY rate ([`McsDescriptor::for_intent`] for
     /// 802.11); the seam itself no longer names an MCS.
     pub tx: TxIntent,
-    /// 802.11 destination (`addr1`/`addr3`): a name-group MAC or broadcast.
+    /// 802.11 destination (`addr1`): a name-group MAC, a Tier-0 prefix-set filter's
+    /// high half, or broadcast.
     pub dst: [u8; 6],
-    /// 802.11 source (`addr2`): name-derived, or [`DEFAULT_SRC`].
+    /// 802.11 source (`addr2`): name-derived, a Tier-0 filter's low half, or [`DEFAULT_SRC`].
     pub src: [u8; 6],
+    /// 802.11 `addr3`. `None` ⇒ the legacy layout (`addr3 = dst`, the BSSID slot). `Some`
+    /// carries the **ephemeral source nonce** when `addr1 ‖ addr2` is a Tier-0 prefix-set
+    /// filter (which consumes the source field), preserving per-transmitter RSSI keying
+    /// (mac-addressing-doctrine §2). Never a host MAC.
+    pub addr3: Option<[u8; 6]>,
 }
 
 impl InjectFrame {
@@ -331,6 +337,7 @@ impl InjectFrame {
             tx,
             dst: BROADCAST,
             src: DEFAULT_SRC,
+            addr3: None,
         }
     }
 }
@@ -345,8 +352,14 @@ pub struct CapturedFrame {
     /// host MAC. Reported upward as the (host-free) reassembly stream key.
     pub addr: Option<[u8; 6]>,
     /// Destination group (`addr1`) — the name-group MAC or broadcast. Used for
-    /// the receive-side name pre-filter.
+    /// the receive-side name pre-filter. Under Tier-0 this is the prefix-set filter's
+    /// high half (`addr1`); the low half is [`addr`](Self::addr) (`addr2`), so
+    /// `group ‖ addr` reconstruct the 12-byte filter.
     pub group: Option<[u8; 6]>,
+    /// 802.11 `addr3` as received. Under the Tier-0 layout this is the sender's ephemeral
+    /// source nonce (`addr1 ‖ addr2` being the prefix-set filter); `None` if the backend
+    /// did not surface it (the legacy layout duplicates `dst` here, carrying no new info).
+    pub addr3: Option<[u8; 6]>,
     /// Per-frame RSSI in dBm from radiotap, if measured.
     pub rssi_dbm: Option<i8>,
     /// MCS index the frame was received at, if radiotap reported it.

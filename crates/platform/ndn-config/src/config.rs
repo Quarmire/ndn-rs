@@ -920,6 +920,26 @@ fn validate_face_config(face: &FaceConfig) -> Result<(), ConfigError> {
             // program is used); a path, if given, just overrides it.
             let _ = (io, bpf_object);
         }
+        FaceConfig::Radio { radios } => {
+            if radios.is_empty() {
+                return Err(ConfigError::Invalid(
+                    "radio face must declare at least one radio capability".into(),
+                ));
+            }
+            for r in radios {
+                if r.driver.is_empty() {
+                    return Err(ConfigError::Invalid(
+                        "radio capability driver must not be empty".into(),
+                    ));
+                }
+                if matches!(r.driver.as_str(), "af-packet" | "halow") && r.interface.is_none() {
+                    return Err(ConfigError::Invalid(format!(
+                        "radio driver {:?} requires an interface",
+                        r.driver
+                    )));
+                }
+            }
+        }
         FaceConfig::Unix { .. } | FaceConfig::EtherMulticast { .. } => {}
     }
     Ok(())
@@ -1137,6 +1157,38 @@ pub enum FaceConfig {
         #[serde(default, rename = "bpf-object")]
         bpf_object: Option<String>,
     },
+    /// **The wireless medium as one face.** Unlike every other kind — each a link
+    /// to one peer — a radio face is the shared broadcast neighbourhood, and a node
+    /// reaches it through one or more *radio capabilities* (`radios`). Adding a
+    /// second radio is an added capability on the *same* face, never a new face:
+    /// RX unions across all radios and TX fans out (diversity on a broadcast
+    /// medium); the cognitive control plane decides per-frame rate/power and, with
+    /// >1 radio, which carry each transmission. Requires `ndn-fwd` built with the
+    /// `radio` feature; USB Wi-Fi drivers additionally need `radio-libusb` (Linux).
+    Radio {
+        /// The radio capabilities bound into this medium (≥1).
+        radios: Vec<RadioDeviceConfig>,
+    },
+}
+
+/// One radio capability bound into a [`FaceConfig::Radio`] medium.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RadioDeviceConfig {
+    /// Driver backend selecting how frames reach the air:
+    /// - `"rtl8822e"` / `"rtl8812au"` — userspace USB Wi-Fi (needs `radio-libusb`, Linux),
+    /// - `"af-packet"` — a kernel monitor-mode interface (Linux; set `interface`),
+    /// - `"halow"` — an 802.11ah/S1G monitor interface (Linux; set `interface`).
+    pub driver: String,
+    /// Channel to tune (driver-interpreted; e.g. `149` for 5 GHz Wi-Fi). Optional
+    /// for `af-packet`, where the interface is pre-tuned out of band.
+    #[serde(default)]
+    pub channel: Option<u8>,
+    /// Monitor-mode interface name for `af-packet` / `halow` (e.g. `"halow0"`).
+    #[serde(default)]
+    pub interface: Option<String>,
+    /// Optional initial TX-power index (driver-specific; 0..=0x3f for Realtek).
+    #[serde(default, rename = "tx-power")]
+    pub tx_power: Option<u8>,
 }
 
 fn default_baud() -> u32 {
@@ -1586,6 +1638,65 @@ key  = "/sensor/<node>/KEY/<id>"
 level = "debug"
 file = "/var/log/ndn/router.log"
 "#;
+
+    #[test]
+    fn parse_radio_medium_face_with_multiple_capabilities() {
+        // One `kind="radio"` medium face reached through TWO radio capabilities —
+        // a 5 GHz USB Wi-Fi radio and a sub-GHz HaLow monitor — on the *same* face.
+        let toml = r#"
+[[face]]
+kind = "radio"
+
+[[face.radios]]
+driver = "rtl8822e"
+channel = 149
+tx-power = 40
+
+[[face.radios]]
+driver = "halow"
+interface = "halow0"
+channel = 161
+"#;
+        let cfg = ForwarderConfig::from_str(toml).unwrap();
+        assert_eq!(cfg.faces.len(), 1, "one medium face");
+        match &cfg.faces[0] {
+            FaceConfig::Radio { radios } => {
+                assert_eq!(radios.len(), 2, "two capabilities on the one medium face");
+                assert_eq!(radios[0].driver, "rtl8822e");
+                assert_eq!(radios[0].channel, Some(149));
+                assert_eq!(radios[0].tx_power, Some(40));
+                assert_eq!(radios[1].driver, "halow");
+                assert_eq!(radios[1].interface.as_deref(), Some("halow0"));
+            }
+            other => panic!("expected a radio face, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn radio_face_validation_rejects_empty_and_interfaceless() {
+        // A medium with no radios is meaningless.
+        assert!(validate_face_config(&FaceConfig::Radio { radios: vec![] }).is_err());
+        // af-packet / halow bearers need an interface.
+        let no_iface = FaceConfig::Radio {
+            radios: vec![RadioDeviceConfig {
+                driver: "af-packet".into(),
+                channel: Some(149),
+                interface: None,
+                tx_power: None,
+            }],
+        };
+        assert!(validate_face_config(&no_iface).is_err());
+        // A USB radio needs no interface — valid.
+        let usb = FaceConfig::Radio {
+            radios: vec![RadioDeviceConfig {
+                driver: "rtl8822e".into(),
+                channel: Some(149),
+                interface: None,
+                tx_power: None,
+            }],
+        };
+        assert!(validate_face_config(&usb).is_ok());
+    }
 
     #[test]
     fn parse_sample_config() {

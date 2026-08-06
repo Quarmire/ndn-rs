@@ -1,4 +1,6 @@
 use super::decode_be_u64;
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
 
 pub struct FragmentHeader {
     pub sequence: u64,
@@ -64,6 +66,101 @@ pub fn extract_fragment(raw: &[u8]) -> Option<FragmentHeader> {
         frag_start,
         frag_end,
     })
+}
+
+/// The NDN packet kind + name peeked from an LP frame — the cheap classification a
+/// forwarding-plane feature (QoS / cognition demand) uses to key per-name policy
+/// without a full packet decode. Component slices borrow the input wire.
+pub struct PeekedName<'a> {
+    /// `true` = Interest (`0x05`), `false` = Data (`0x06`).
+    pub is_interest: bool,
+    /// Name components, in order, borrowed from the wire (root name → empty).
+    pub components: Vec<&'a [u8]>,
+}
+
+/// Peek the NDN packet kind + name from an LP frame **without a full decode** — the
+/// hook a forwarding-plane observer uses to classify per-name QoS/demand on the fast
+/// path. Handles an LP packet (`0x64`) carrying an unfragmented packet *or* the first
+/// fragment of a fragmented one (the name lives in fragment 0), and a bare NDN wire
+/// (`0x05`/`0x06`). Returns `None` for a continuation fragment (index > 0, no name),
+/// an LP frame with no Fragment (control-only), an unrecognised head, or any
+/// malformed length. Panic-free (all offsets checked) and allocation-light.
+pub fn peek_lp_name(lp_wire: &[u8]) -> Option<PeekedName<'_>> {
+    let pkt = ndn_packet_bytes(lp_wire)?;
+    let (ptype, tn) = ndn_tlv::read_varu64(pkt).ok()?;
+    let is_interest = match ptype {
+        0x05 => true,
+        0x06 => false,
+        _ => return None,
+    };
+    let (_plen, ln) = ndn_tlv::read_varu64(pkt.get(tn..)?).ok()?;
+    let body = pkt.get(tn.checked_add(ln)?..)?;
+    // The first inner TLV of an Interest/Data is always the Name (0x07).
+    let (ntype, ntn) = ndn_tlv::read_varu64(body).ok()?;
+    if ntype != 0x07 {
+        return None;
+    }
+    let (nlen, nln) = ndn_tlv::read_varu64(body.get(ntn..)?).ok()?;
+    let name_start = ntn.checked_add(nln)?;
+    let name_val =
+        body.get(name_start..name_start.checked_add(usize::try_from(nlen).ok()?)?)?;
+    let mut components = Vec::new();
+    let mut pos = 0usize;
+    while pos < name_val.len() {
+        let (_ct, ctn) = ndn_tlv::read_varu64(name_val.get(pos..)?).ok()?;
+        pos = pos.checked_add(ctn)?;
+        let (cl, cln) = ndn_tlv::read_varu64(name_val.get(pos..)?).ok()?;
+        pos = pos.checked_add(cln)?;
+        let end = pos.checked_add(usize::try_from(cl).ok()?)?;
+        components.push(name_val.get(pos..end)?);
+        pos = end;
+    }
+    Some(PeekedName {
+        is_interest,
+        components,
+    })
+}
+
+/// The NDN-packet byte slice within an LP frame: the Fragment (`0x50`) payload of an
+/// LP packet (fragment 0 only — else `None`), or the whole wire if it is already a
+/// bare NDN packet (`0x05`/`0x06`). `None` for anything else.
+///
+/// Public so integrations that peeked the name with [`peek_lp_name`] and matched a
+/// self-contained (single-fragment) control Data — e.g. a reception report on
+/// `/localhop/radio/report/*` — can pull its NDN wire and `Data::decode` the Content
+/// without reassembling through the forwarder.
+pub fn lp_ndn_packet_bytes(lp_wire: &[u8]) -> Option<&[u8]> {
+    ndn_packet_bytes(lp_wire)
+}
+
+fn ndn_packet_bytes(lp_wire: &[u8]) -> Option<&[u8]> {
+    match lp_wire.first() {
+        Some(0x05 | 0x06) => Some(lp_wire),
+        Some(0x64) => {
+            let (_t, tn) = ndn_tlv::read_varu64(lp_wire).ok()?;
+            let (olen, ln) = ndn_tlv::read_varu64(lp_wire.get(tn..)?).ok()?;
+            let hstart = tn.checked_add(ln)?;
+            let inner = lp_wire.get(hstart..hstart.checked_add(usize::try_from(olen).ok()?)?)?;
+            let mut pos = 0usize;
+            let mut frag = None;
+            while pos < inner.len() {
+                let (t, tn) = ndn_tlv::read_varu64(inner.get(pos..)?).ok()?;
+                pos = pos.checked_add(tn)?;
+                let (l, ln) = ndn_tlv::read_varu64(inner.get(pos..)?).ok()?;
+                pos = pos.checked_add(ln)?;
+                let end = pos.checked_add(usize::try_from(l).ok()?)?;
+                let val = inner.get(pos..end)?;
+                match t {
+                    0x52 if decode_be_u64(val) != 0 => return None, // continuation fragment
+                    0x50 => frag = Some(val),
+                    _ => {}
+                }
+                pos = end;
+            }
+            frag
+        }
+        _ => None,
+    }
 }
 
 pub fn extract_acks(raw: &[u8]) -> (Option<u64>, smallvec::SmallVec<[u64; 8]>) {
@@ -169,6 +266,53 @@ mod tests {
         let interest_wire = encode_interest(&n, None);
         let lp_wire = encode_lp_packet(&interest_wire);
         assert!(extract_fragment(&lp_wire).is_none());
+    }
+
+    #[test]
+    fn peek_lp_name_reads_kind_and_components() {
+        let n = name(&[b"radio-demo", b"ping", b"42"]);
+        let interest_wire = encode_interest(&n, None);
+        // Unfragmented LP-wrapped Interest.
+        let lp = encode_lp_packet(&interest_wire);
+        let p = peek_lp_name(&lp).expect("peek LP");
+        assert!(p.is_interest);
+        assert_eq!(p.components, vec![&b"radio-demo"[..], b"ping", b"42"]);
+        // Bare NDN wire (no LP wrapper) also works.
+        let p2 = peek_lp_name(&interest_wire).expect("peek bare");
+        assert!(p2.is_interest);
+        assert_eq!(p2.components, vec![&b"radio-demo"[..], b"ping", b"42"]);
+    }
+
+    #[test]
+    fn peek_lp_name_first_fragment_has_name_continuation_does_not() {
+        let n = name(&[b"obj", b"v1"]);
+        let interest_wire = encode_interest(&n, None);
+        let mk = |idx: u8| {
+            let mut w = TlvWriter::new();
+            w.write_nested(crate::tlv_type::LP_PACKET, |w| {
+                w.write_tlv(crate::tlv_type::LP_SEQUENCE, &7u64.to_be_bytes());
+                w.write_tlv(crate::tlv_type::LP_FRAG_INDEX, &[idx]);
+                w.write_tlv(crate::tlv_type::LP_FRAG_COUNT, &[2]);
+                w.write_tlv(crate::tlv_type::LP_FRAGMENT, &interest_wire);
+            });
+            w.finish()
+        };
+        // Fragment 0 carries the name.
+        let f0 = mk(0);
+        let p = peek_lp_name(&f0).expect("frag 0 peek");
+        assert_eq!(p.components, vec![&b"obj"[..], b"v1"]);
+        // A continuation fragment (index > 0) has no name at the head → None.
+        let f1 = mk(1);
+        assert!(peek_lp_name(&f1).is_none());
+    }
+
+    #[test]
+    fn peek_lp_name_none_for_control_only_and_garbage() {
+        // Control-only LP frame (pure ACKs, no Fragment).
+        assert!(peek_lp_name(&encode_lp_acks(&[1, 2, 3])).is_none());
+        // Garbage / non-NDN head.
+        assert!(peek_lp_name(&[0xff, 0x00, 0x01]).is_none());
+        assert!(peek_lp_name(&[]).is_none());
     }
 
     #[test]

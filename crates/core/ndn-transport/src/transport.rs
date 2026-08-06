@@ -124,6 +124,16 @@ pub trait Transport: Send + Sync + 'static {
         async { self.recv_bytes().await.map(|b| (b, None)) }
     }
 
+    /// Receive payload + sender address + an opaque **local bearer tag**: for a
+    /// multi-radio broadcast medium, which of this face's radios received the frame
+    /// (`RadioId.0`). Lets a link-service feature attribute per-radio state (e.g. a
+    /// reception report's RSSI) to the actual receiving radio. Default: no tag.
+    fn recv_bytes_with_meta(
+        &self,
+    ) -> impl Future<Output = Result<(Bytes, Option<FaceAddr>, Option<u16>), FaceError>> + Send {
+        async { self.recv_bytes_with_addr().await.map(|(b, a)| (b, a, None)) }
+    }
+
     /// Send wire bytes plus an in-process originating face id. Only
     /// in-process transports override; wire-level transports drop `source`
     /// (LP-encoded `IncomingFaceId` is the wire counterpart).
@@ -203,6 +213,15 @@ pub trait ErasedTransport: Send + Sync + 'static {
         &self,
     ) -> Pin<Box<dyn Future<Output = Result<(Bytes, Option<FaceAddr>), FaceError>> + Send + '_>>;
 
+    #[allow(clippy::type_complexity)]
+    fn recv_bytes_with_meta(
+        &self,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<(Bytes, Option<FaceAddr>, Option<u16>), FaceError>> + Send + '_>,
+    > {
+        Box::pin(async move { self.recv_bytes_with_addr().await.map(|(b, a)| (b, a, None)) })
+    }
+
     fn set_send_mtu(&self, mtu: Option<u64>) -> Result<Option<u64>, MtuError>;
     fn set_persistency(&self, persistency: FacePersistency) -> Result<(), PersistencyError>;
 }
@@ -266,6 +285,14 @@ impl<T: Transport> ErasedTransport for T {
     ) -> Pin<Box<dyn Future<Output = Result<(Bytes, Option<FaceAddr>), FaceError>> + Send + '_>>
     {
         Box::pin(Transport::recv_bytes_with_addr(self))
+    }
+
+    fn recv_bytes_with_meta(
+        &self,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<(Bytes, Option<FaceAddr>, Option<u16>), FaceError>> + Send + '_>,
+    > {
+        Box::pin(Transport::recv_bytes_with_meta(self))
     }
 
     fn set_send_mtu(&self, mtu: Option<u64>) -> Result<Option<u64>, MtuError> {

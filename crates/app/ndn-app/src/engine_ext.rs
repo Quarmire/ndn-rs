@@ -58,6 +58,15 @@ pub trait EngineAppExt {
     /// answer them).
     fn app_consumer(&self, cancel: CancellationToken) -> Consumer;
 
+    /// Allocate an in-process app face and return a raw [`Connection`] over it,
+    /// whose `register_prefix` installs a FIB route to this face. This is the
+    /// building block *below* [`app_node`](Self::app_node): an embedder that
+    /// drives its own protocol loop over a bare bidirectional packet channel
+    /// (e.g. binding an `SvsPubSub` group to a real engine) pumps this
+    /// connection's `send`/`recv` directly, rather than going through the
+    /// demultiplexed fetch/serve surface. The face is tied to `cancel`.
+    fn app_face(&self, cancel: CancellationToken) -> Arc<dyn Connection>;
+
     /// Allocate an in-process app face and return a [`Node`] over it — the
     /// unified surface for embedding and for test harnesses. The node's
     /// `register_prefix` (so `serve` / `serve_object`) installs a FIB route to
@@ -160,6 +169,17 @@ impl EngineAppExt for ForwarderEngine {
         let (face, handle) = InProcFace::new(face_id, APP_FACE_BUFFER);
         self.add_face(face, cancel);
         Consumer::from_handle(handle)
+    }
+
+    fn app_face(&self, cancel: CancellationToken) -> Arc<dyn Connection> {
+        let face_id = self.faces().alloc_id();
+        let (face, handle) = InProcFace::new(face_id, APP_FACE_BUFFER);
+        self.add_face(face, cancel);
+        Arc::new(EngineConnection {
+            inner: InProcConnection::new(handle),
+            fib: self.fib(),
+            face_id,
+        })
     }
 
     fn app_node(&self, cancel: CancellationToken) -> Node {

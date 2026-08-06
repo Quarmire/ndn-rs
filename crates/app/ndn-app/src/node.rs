@@ -52,8 +52,10 @@ use crate::publisher::{Publisher, PublisherConfig};
 use crate::queryable::Queryable;
 use crate::responder::Responder;
 use crate::subscriber::{Subscriber, SubscriberConfig};
+use ndn_packet::encode::DataBuilder;
 use ndn_packet::{Data, Interest, Name};
 use ndn_security::validator::Validator;
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -218,6 +220,55 @@ impl Node {
         let prefix = prefix.into();
         self.demux.register_prefix(&prefix).await?;
         Ok(self.demux.serve_scoped(prefix, handler))
+    }
+
+    /// Serve a **latest-wins** value under `name`: every matching Interest is
+    /// answered with the current value from `latest` (a
+    /// [`watch::Receiver`](tokio::sync::watch::Receiver)), published with
+    /// `FreshnessPeriod = 0`. Because a freshness-0 Data is stale on arrival in
+    /// any Content Store, a **`MustBeFresh`** consumer is *never* satisfied by a
+    /// superseded cached copy — its Interest always reaches this producer and
+    /// gets the freshest value. Update the value by `send`ing on the paired
+    /// [`watch::Sender`](tokio::sync::watch::Sender); the next fetch observes it.
+    ///
+    /// This is the "latest value only" pattern — telemetry, status/heartbeat,
+    /// a coordination or capability beacon, the newest video keyframe name, a
+    /// queue head — where a stale reading is worse than none. It replaces the
+    /// hand-rolled *freshness-0 + `MustBeFresh`* Content-Store dance each such
+    /// stream would otherwise repeat. Replies are `DigestSha256` (integrity, not
+    /// authorship); for signed latest-value serving build a [`Producer`] with a
+    /// signer from [`connection`](Self::connection). Serving stops when the
+    /// returned [`ServeGuard`] is dropped.
+    ///
+    /// ```no_run
+    /// # use ndn_app::Node;
+    /// # use bytes::Bytes;
+    /// # async fn run(node: Node) -> Result<(), Box<dyn std::error::Error>> {
+    /// let (tx, rx) = tokio::sync::watch::channel(Bytes::from_static(b"init"));
+    /// let _guard = node.serve_latest("/muas/telemetry", rx).await?;
+    /// tx.send(Bytes::from_static(b"alt=1360.5"))?; // consumers now see this
+    /// # Ok(()) }
+    /// ```
+    pub async fn serve_latest(
+        &self,
+        name: impl Into<Name>,
+        latest: watch::Receiver<Bytes>,
+    ) -> Result<ServeGuard, AppError> {
+        let name = name.into();
+        self.demux.register_prefix(&name).await?;
+        Ok(self.demux.serve_scoped(name, move |interest, responder| {
+            // Snapshot the freshest value at the moment this Interest arrives.
+            let value = latest.borrow().clone();
+            async move {
+                // FreshnessPeriod = 0 ⇒ the CS marks the reply stale on arrival,
+                // so a MustBeFresh Interest never matches an older cached value
+                // and is re-forwarded here to be answered with the latest.
+                let wire = DataBuilder::new((*interest.name).clone(), &value)
+                    .freshness(std::time::Duration::ZERO)
+                    .sign_digest_sha256();
+                let _ = responder.respond_bytes(wire).await;
+            }
+        }))
     }
 
     // ---- sync (SVS/PSync) --------------------------------------------------

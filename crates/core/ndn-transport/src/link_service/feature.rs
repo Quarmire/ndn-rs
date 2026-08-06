@@ -41,6 +41,10 @@ pub struct InboundLpFrame {
     pub source_face_tag: Option<FaceId>,
     pub congestion_mark: Option<u64>,
     pub prefix_announcement: Option<Bytes>,
+    /// Opaque local bearer tag: on a multi-radio broadcast medium, which of the
+    /// face's radios received this frame (`RadioId.0`). `None` for single-bearer
+    /// transports. Lets a feature attribute per-radio state to the actual receiver.
+    pub radio_id: Option<u16>,
 }
 
 impl InboundLpFrame {
@@ -51,6 +55,7 @@ impl InboundLpFrame {
             source_face_tag: None,
             congestion_mark: None,
             prefix_announcement: None,
+            radio_id: None,
         }
     }
 
@@ -61,6 +66,18 @@ impl InboundLpFrame {
             source_face_tag: None,
             congestion_mark: None,
             prefix_announcement: None,
+            radio_id: None,
+        }
+    }
+
+    pub fn with_meta(wire: Bytes, addr: Option<FaceAddr>, radio_id: Option<u16>) -> Self {
+        Self {
+            wire,
+            addr,
+            source_face_tag: None,
+            congestion_mark: None,
+            prefix_announcement: None,
+            radio_id,
         }
     }
 }

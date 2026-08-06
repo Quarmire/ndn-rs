@@ -557,6 +557,28 @@ impl ForwarderEngine {
         Ok(face_id)
     }
 
+    /// Add an **already-composed** [`Face`](ndn_transport::Face) — a transport paired
+    /// with an explicit link service, e.g. an `LpLinkService` carrying an extra
+    /// `LinkServiceFeature`. The public [`add_face`](Self::add_face) wraps a bare
+    /// transport with the *default* link service for its kind, so a caller that needs a
+    /// custom feature (like the named-radio cognition observing forwarding events)
+    /// composes the face itself and adds it here. Returns the assigned [`FaceId`].
+    pub fn add_composed_face(
+        &self,
+        face: ndn_transport::Face,
+        cancel: CancellationToken,
+        persistency: FacePersistency,
+    ) -> FaceId {
+        let face_id = self.inner.face_table.insert_arc(Arc::new(face));
+        let wired = self
+            .inner
+            .face_table
+            .get(face_id)
+            .expect("face was just inserted");
+        self.wire_face(wired, cancel, persistency);
+        face_id
+    }
+
     pub fn add_face_with_persistency<F: ndn_transport::Transport + 'static>(
         &self,
         face: F,

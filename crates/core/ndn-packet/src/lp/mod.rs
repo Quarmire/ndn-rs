@@ -14,7 +14,9 @@ pub use encode::{
     encode_lp_acks, encode_lp_nack, encode_lp_nack_with_pit_token, encode_lp_packet,
     encode_lp_reliable, encode_lp_with_headers,
 };
-pub use fragment::{FragmentHeader, extract_acks, extract_fragment};
+pub use fragment::{
+    FragmentHeader, PeekedName, extract_acks, extract_fragment, lp_ndn_packet_bytes, peek_lp_name,
+};
 pub use trace_context::{SpanId, TLV_TRACE_CONTEXT, TraceContext, TraceFlags, TraceId};
 #[cfg(feature = "std")]
 pub use trace_context::{extract_from_lp_wire, splice_into_lp_wire};
