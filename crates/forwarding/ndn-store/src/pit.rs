@@ -349,7 +349,28 @@ impl PitEntry {
 /// a bare NFD without face/strategy limits. The `orphans` map grows only from
 /// *validated* persistent-subscription Interests (lower risk) and is time-reaped.
 /// See also the `InterestLifetime` clamp, which bounds a single entry's lifetime.
+/// Receives PIT lifecycle events, so a pre-parse name filter can mirror the PIT.
+///
+/// Mirrors [`crate::observable_cs::CsObserver`] in shape and in contract: **implementations must be
+/// non-blocking**, because this is invoked inline on the forwarding path.
+///
+/// The consumer is `ndn-ext`'s Tier-1 BF-PIT (#92). A mirror that drifts from the real PIT does not
+/// merely lose efficiency — a stale BF-PIT **drops Data the node is waiting for**, which presents as
+/// packet loss and a retransmission rather than as a bug. That is why the hook is here, on the table
+/// itself, rather than left to callers to remember at each mutation site.
+pub trait PitObserver: Send + Sync + 'static {
+    /// An entry was created. Called **before** the entry is stored: the Data can be in flight
+    /// already, and a filter that learns of the entry after it is live has a window in which it
+    /// rejects the very reply the PIT is waiting for.
+    fn on_pit_insert(&self, name: &Name);
+    /// An entry left the table — satisfied, expired, discarded, or dropped with its face.
+    fn on_pit_remove(&self, name: &Name);
+}
+
 pub struct Pit {
+    /// Optional mirror feed (#92). `None` on every node that does not run a pre-parse name filter,
+    /// which is the default.
+    observer: Option<std::sync::Arc<dyn PitObserver>>,
     #[cfg(not(target_arch = "wasm32"))]
     entries: DashMap<PitToken, PitEntry>,
     #[cfg(target_arch = "wasm32")]
@@ -365,6 +386,7 @@ pub struct Pit {
 impl Pit {
     pub fn new() -> Self {
         Self {
+            observer: None,
             #[cfg(not(target_arch = "wasm32"))]
             entries: DashMap::new(),
             #[cfg(target_arch = "wasm32")]
@@ -389,7 +411,28 @@ impl Pit {
         }
     }
 
+    /// Attach a [`PitObserver`]. Takes `&mut self` so it can only be set during construction, before
+    /// the table is shared — an observer swapped in mid-flight would miss the entries already present
+    /// and then under-report their removals, corrupting a counting filter.
+    pub fn set_observer(&mut self, observer: std::sync::Arc<dyn PitObserver>) {
+        self.observer = Some(observer);
+    }
+
+    fn notify_insert(&self, entry: &PitEntry) {
+        if let Some(o) = self.observer.as_ref() {
+            o.on_pit_insert(&entry.name);
+        }
+    }
+
+    fn notify_remove(&self, entry: &PitEntry) {
+        if let Some(o) = self.observer.as_ref() {
+            o.on_pit_remove(&entry.name);
+        }
+    }
+
     pub fn insert(&self, token: PitToken, entry: PitEntry) {
+        // Notify BEFORE storing: see `PitObserver::on_pit_insert`.
+        self.notify_insert(&entry);
         #[cfg(not(target_arch = "wasm32"))]
         {
             self.entries.insert(token, entry);
@@ -493,14 +536,21 @@ impl Pit {
 
     pub fn remove(&self, token: &PitToken) -> Option<(PitToken, PitEntry)> {
         #[cfg(not(target_arch = "wasm32"))]
-        return self.entries.remove(token);
+        let out = self.entries.remove(token);
         #[cfg(target_arch = "wasm32")]
-        return self
+        let out = self
             .entries
             .lock()
             .unwrap()
             .remove(token)
             .map(|v| (*token, v));
+        // Only report a removal that actually removed. Decrementing a counting Bloom filter for an
+        // entry that was never inserted underflows a counter, and a CBF cannot detect or recover
+        // from that — the bit is wrong from then on.
+        if let Some((_, e)) = out.as_ref() {
+            self.notify_remove(e);
+        }
+        out
     }
 
     /// Drain expired PIT entries with their full entry state. Forwarders use
@@ -518,6 +568,10 @@ impl Pit {
             let mut out: Vec<(PitToken, PitEntry)> = Vec::with_capacity(expired.len());
             for token in &expired {
                 if let Some((_, entry)) = self.entries.remove(token) {
+                    // Expiry is a removal like any other. Missing it here would leave the mirror
+                    // claiming entries that timed out — a slow leak that only shows up as a rising
+                    // false-positive rate, never as an error.
+                    self.notify_remove(&entry);
                     out.push((*token, entry));
                 }
             }
@@ -534,6 +588,8 @@ impl Pit {
             let mut out: Vec<(PitToken, PitEntry)> = Vec::with_capacity(expired.len());
             for token in &expired {
                 if let Some(entry) = entries.remove(token) {
+                    // Same notification as the native path — the mirror must not drift by target.
+                    self.notify_remove(&entry);
                     out.push((*token, entry));
                 }
             }
@@ -608,7 +664,9 @@ impl Pit {
             let removed = to_remove.len();
 
             for token in &to_remove {
-                self.entries.remove(token);
+                if let Some((_, entry)) = self.entries.remove(token) {
+                    self.notify_remove(&entry);
+                }
             }
 
             for token in &to_prune {
@@ -649,7 +707,9 @@ impl Pit {
             let removed = to_remove.len();
 
             for token in &to_remove {
-                entries.remove(token);
+                if let Some(entry) = entries.remove(token) {
+                    self.notify_remove(&entry);
+                }
             }
 
             for token in &to_prune {
