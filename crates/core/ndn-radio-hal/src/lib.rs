@@ -1129,3 +1129,41 @@ impl RadioCapability {
         }
     }
 }
+
+/// **A fully-capable named-data radio handle** (#78).
+///
+/// Lives here, beside the traits it aggregates, rather than in `ndn-radio-drivers` — a driver crate
+/// constructs one and a face crate consumes one, and neither should have to depend on the other to
+/// name the type. (My first attempt put it in the drivers crate, which made `RadioBearer::from_open`
+/// require an optional dependency the face only has under a feature flag. Wrong layer.)
+///
+/// The problem it solves: a standardized opener that returns only `Arc<dyn FrameIo>` drops
+/// `RadioKnobs`, `RadioTime` and `RadioProfile`, so any caller wanting control or timing must bypass
+/// it and name a concrete backend — reintroducing the very leak the opener exists to close.
+///
+/// **Four `Option`s rather than a `trait NamedRadio: FrameIo + RadioKnobs + RadioTime +
+/// RadioProfile`.** The supertrait reads better and is wrong for this hardware: the capability matrix
+/// is genuinely ragged (MT7612U has no `RadioTime`/`RadioProfile`; RTL8821CU has only `FrameIo`), so
+/// a supertrait forces stubs that return plausible nonsense. A `None` meaning "this radio genuinely
+/// cannot" is worth more than an `Ok(())` that lies — this codebase has a name for the latter, and a
+/// tracker full of it.
+pub struct OpenRadio {
+    /// Bearer-agnostic data plane. Always present — it is what "a radio" means here.
+    pub io: std::sync::Arc<dyn FrameIo>,
+    /// Channel / TX power / contention control.
+    pub knobs: Option<std::sync::Arc<dyn RadioKnobs>>,
+    /// Hardware timestamping and the TSF common-view clock.
+    pub time: Option<std::sync::Arc<dyn RadioTime>>,
+    /// Declared capability + calibration, for the cognition layer.
+    pub profile: Option<std::sync::Arc<dyn RadioProfile>>,
+}
+
+impl OpenRadio {
+    /// The data plane alone, for callers that genuinely only send and receive.
+    ///
+    /// **Not a migration shim.** A caller reaching for this because it is convenient is starting the
+    /// capability leak over again; reach for it only when the narrowing is the actual intent.
+    pub fn io(&self) -> std::sync::Arc<dyn FrameIo> {
+        std::sync::Arc::clone(&self.io)
+    }
+}
