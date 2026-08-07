@@ -393,6 +393,31 @@ pub trait FrameIo: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Inject one frame at an exact rate = [`set_rate`](Self::set_rate) then
+    /// [`inject`](Self::inject). Derived; a driver need not (and should not) override it.
+    async fn inject_at(&self, frame: InjectFrame, mcs: McsDescriptor) -> Result<(), FaceError> {
+        self.set_rate(mcs)?;
+        self.inject(frame).await
+    }
+
+    /// A batch, each frame at its own exact rate. **Overridable, and overridden**: the AF_PACKET
+    /// backend implements this as real A-MSDU aggregation (one QoS-Data MPDU per RA, greedily
+    /// packed) — the big airtime lever at S1G. So call this method rather than looping `set_rate` +
+    /// `inject` yourself, or you get the default body and the aggregation silently disappears.
+    ///
+    /// It lives on `FrameIo` (not `WifiRadio`) precisely because faces hold `Arc<dyn FrameIo>`;
+    /// see the note on [`WifiRadio`].
+    async fn inject_batch_at(
+        &self,
+        frames: Vec<(InjectFrame, McsDescriptor)>,
+    ) -> Result<(), FaceError> {
+        for (f, mcs) in frames {
+            self.set_rate(mcs)?;
+            self.inject(f).await?;
+        }
+        Ok(())
+    }
+
     /// Await the next frame captured on the medium. A node never hears its own
     /// transmissions (half-duplex radio); the backend filters those.
     async fn recv_frame(&self) -> Result<CapturedFrame, FaceError>;
@@ -437,34 +462,19 @@ pub struct MeshCv {
     pub belief: Option<ndn_time::RefBelief>,
 }
 
-/// A Wi-Fi radio. Historically this added a per-frame exact-rate `inject_at`; that
-/// is now **derived**, not a driver responsibility — [`inject_at`](Self::inject_at)
-/// defaults to [`set_rate`](FrameIo::set_rate) + [`inject`](FrameIo::inject), so the
-/// rate lives as bearer state and a driver implements only [`FrameIo`]. The trait
-/// remains a marker (a `dyn WifiRadio` names "a Wi-Fi radio") and ergonomic sugar for
-/// fixed-rate benches; the cognitive hot path calls `set_rate` + `inject` directly.
+/// A Wi-Fi radio — now a pure marker: a `dyn WifiRadio` names "a Wi-Fi radio" and nothing more.
+/// Every method it once carried has moved onto [`FrameIo`], and every implementation in the
+/// workspace is an empty `impl WifiRadio for X {}`. See #83 for retiring it.
+///
+/// `inject_at` / `inject_batch_at` used to live here, which was a latent trap: a face holding
+/// `Arc<dyn FrameIo>` could not reach them, so it would silently get a hand-rolled copy of the
+/// *default* body and miss [`AfPacketBackend`]'s A-MSDU-aggregating override. That is exactly what
+/// happened in #82 part 1 and is why they are on `FrameIo` now — the object-safe seam a face
+/// actually holds must be the one that carries the overridable behaviour.
+///
+/// [`AfPacketBackend`]: https://docs.rs/ndn-frame-io
 #[async_trait]
-pub trait WifiRadio: FrameIo {
-    /// Inject one frame at an exact rate = `set_rate` then `inject`. Derived; a driver
-    /// need not (and should not) override it.
-    async fn inject_at(&self, frame: InjectFrame, mcs: McsDescriptor) -> Result<(), FaceError> {
-        self.set_rate(mcs)?;
-        self.inject(frame).await
-    }
-
-    /// A batch, each frame at its own exact rate — derived the same way. For A-MSDU
-    /// bundling, `set_rate` once and use [`FrameIo::inject_batch`] instead.
-    async fn inject_batch_at(
-        &self,
-        frames: Vec<(InjectFrame, McsDescriptor)>,
-    ) -> Result<(), FaceError> {
-        for (f, mcs) in frames {
-            self.set_rate(mcs)?;
-            self.inject(f).await?;
-        }
-        Ok(())
-    }
-}
+pub trait WifiRadio: FrameIo {}
 
 // ---------------------------------------------------------------------------
 // Radio control plane: the stateful-knob seam + the capability descriptor.

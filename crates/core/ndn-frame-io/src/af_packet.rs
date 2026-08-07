@@ -198,6 +198,27 @@ impl crate::FrameIo for AfPacketBackend {
         Ok(())
     }
 
+    /// A-MSDU-aggregate a batch that carries **no per-frame rate**, by pinning it to the rate
+    /// already set as bearer state — then it is the same aggregation as
+    /// [`inject_batch_at`](Self::inject_batch_at).
+    ///
+    /// Both spellings exist because the two faces model rate differently: `MonitorWifiFace` resolves
+    /// an MCS per frame and calls `inject_batch_at`, while `RadioMediumFace` holds rate as state in
+    /// the bearer and sends `TxIntent`s, so it can only offer bare frames. Without this, moving
+    /// A-MSDU down to the medium would have silently lost the aggregation on exactly the backend
+    /// (AF_PACKET/S1G) where it matters most — the same class of quiet loss #82 part 2 fixed one
+    /// layer up. Falls back to individual injection when no rate has been set yet.
+    async fn inject_batch(&self, frames: Vec<InjectFrame>) -> Result<(), FaceError> {
+        let Some(mcs) = *self.cur_mcs.lock().unwrap() else {
+            for f in frames {
+                self.inject(f).await?;
+            }
+            return Ok(());
+        };
+        self.inject_batch_at(frames.into_iter().map(|f| (f, mcs)).collect())
+            .await
+    }
+
     async fn recv_frame(&self) -> Result<CapturedFrame, FaceError> {
         let mut buf = [0u8; 4096];
         loop {
@@ -229,17 +250,7 @@ impl crate::FrameIo for AfPacketBackend {
             }
         }
     }
-}
 
-/// Conservative A-MSDU body cap (bytes, excluding radiotap + MPDU header). The
-/// classic 802.11 small A-MSDU limit — safe across S1G bandwidths (at 1 MHz the
-/// max PSDU is small, so keep aggregates modest); the cognition plane's
-/// `amsdu_msdus` bounds the count on top of this. Tunable once per-STA S1G
-/// max-A-MSDU-length is queried.
-const MAX_AMSDU_BODY: usize = 3839;
-
-#[async_trait]
-impl crate::WifiRadio for AfPacketBackend {
     /// A-MSDU-aggregate the batch — the actuator the face-level
     /// [`with_amsdu_batching`](../../../ndn_face_monitor_wifi/index.html) batcher
     /// drives (it calls `inject_batch_at`). One QoS-Data MPDU per destination
@@ -249,6 +260,13 @@ impl crate::WifiRadio for AfPacketBackend {
     /// [`parse_dot11`](crate::frame::parse_dot11), so PIT/FIB semantics are
     /// untouched. Non-`RawNdn`/`RawNdnS1g` formats fall back to the derived
     /// default (individual injection).
+    ///
+    /// **This override is the whole feature**, and it is reachable only through the trait object.
+    /// It sat on `impl WifiRadio` until #82 part 2; when the face moved to `Arc<dyn FrameIo>` it
+    /// became unreachable, and a caller that reimplements the default body instead — as #82 part 1
+    /// did — loses the aggregation with no error and no log. It lives on `FrameIo` now for that
+    /// reason. `ndn-face-monitor-wifi`'s `amsdu_batching_dispatches_to_the_backend_override` test
+    /// guards the call.
     async fn inject_batch_at(
         &self,
         frames: Vec<(InjectFrame, crate::McsDescriptor)>,
@@ -311,6 +329,16 @@ impl crate::WifiRadio for AfPacketBackend {
         Ok(())
     }
 }
+
+/// Conservative A-MSDU body cap (bytes, excluding radiotap + MPDU header). The
+/// classic 802.11 small A-MSDU limit — safe across S1G bandwidths (at 1 MHz the
+/// max PSDU is small, so keep aggregates modest); the cognition plane's
+/// `amsdu_msdus` bounds the count on top of this. Tunable once per-STA S1G
+/// max-A-MSDU-length is queried.
+const MAX_AMSDU_BODY: usize = 3839;
+
+#[async_trait]
+impl crate::WifiRadio for AfPacketBackend {}
 
 /// A monitor interface exposes the NIC's MAC TSF via radiotap TSFT (when the underlying driver
 /// reports it), keyed by ifindex — a free-run per-frame RX-stamp clock. There is no read-now
