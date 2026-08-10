@@ -825,7 +825,10 @@ pub enum RateCapability {
 /// duplex. Those are what let LoRa, an SDR, or a future PHY be *described* rather than special-cased.
 ///
 /// [`rate_rank`]: RadioCapability::rate_rank
-#[derive(Clone, Debug)]
+// `PartialEq` so a caller's asserted capability can be checked against the radio's declared one
+// (`RadioBearer::effective_cap`) — an assertion that is never compared to the hardware is how
+// `agile` became decorative.
+#[derive(Clone, Debug, PartialEq)]
 pub struct RadioCapability {
     pub kind: RadioKind,
     /// The RF band(s) this radio can operate on — several parts are dual-band (2.4 + 5 GHz),
