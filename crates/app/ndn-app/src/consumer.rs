@@ -13,7 +13,9 @@ use ndn_face_local::InProcHandle;
 use ndn_ipc::ForwarderClient;
 use ndn_packet::encode::InterestBuilder;
 use ndn_packet::lp::{LpPacket, is_lp_packet};
-use ndn_packet::{Data, Interest, MAX_PERSISTENT_LIFETIME_SECS, Name, SubscriptionRequest};
+use ndn_packet::{
+    Data, Interest, MAX_PERSISTENT_LIFETIME_SECS, Name, PacketError, SubscriptionRequest,
+};
 use ndn_security::{SafeData, Unverified, Validator};
 
 use crate::AppError;
@@ -269,8 +271,19 @@ impl Consumer {
     pub async fn fetch_wire(&mut self, wire: Bytes, timeout: Duration) -> Result<Data, AppError> {
         // The sent Interest's matching identity (name + CanBePrefix), decoded up front so a
         // malformed wire fails loudly here instead of mispairing later.
-        let interest =
-            Interest::decode(wire.clone()).map_err(|e| AppError::Protocol(e.to_string()))?;
+        //
+        // **Look inside an LP wrapper first.** `InterestBuilder::pin_face` — what
+        // [`fetch_with_on`](Self::fetch_with_on) calls to steer an Interest out one face — encodes
+        // NextHopFaceId, an NDNLPv2 field, so the wire it builds is an `LpPacket` (0x64) carrying
+        // the Interest as its fragment. Decoding that as a bare Interest fails with
+        // `UnknownPacketType(0x64)`, and because this runs *before* `conn.send`, the `?` returned
+        // early and **nothing was ever transmitted** — `fetch_with_on` could not work for any
+        // caller. Found through NLSR's Hello tests, whose neighbours stayed Inactive because every
+        // Hello Interest died on this line.
+        //
+        // Only the pairing identity is unwrapped; `wire` is sent unchanged, because the LP header
+        // is exactly what tells the forwarder which face to use.
+        let interest = interest_identity(&wire).map_err(|e| AppError::Protocol(e.to_string()))?;
         let expected = (*interest.name).clone();
         let can_be_prefix = interest.selectors().can_be_prefix;
 
@@ -1101,6 +1114,26 @@ enum ReplyVerdict {
     Straggler,
 }
 
+/// The Interest identity of an outbound wire, whether it is bare or LP-wrapped.
+///
+/// The mirror of [`judge_reply`]'s LP handling on the send side. A builder that sets any NDNLPv2
+/// local field — today `pin_face` (NextHopFaceId), and anything added later — emits an `LpPacket`
+/// whose fragment is the Interest, so a bare `Interest::decode` on the built wire is wrong for a
+/// growing set of perfectly valid Interests. Unwrapping here keeps that a detail of encoding rather
+/// than something every caller of `fetch_wire` has to know.
+///
+/// An LP frame that carries no fragment is a protocol error for this path: there is no Interest to
+/// pair a reply against, so failing here beats sending something that can never be answered.
+fn interest_identity(wire: &Bytes) -> Result<Interest, PacketError> {
+    if is_lp_packet(wire) {
+        let lp = LpPacket::decode(wire.clone())?;
+        // 0x64 = LpPacket, per `ndn_packet::lp::is_lp_packet`; there is no exported constant.
+        let fragment = lp.fragment.ok_or(PacketError::UnknownPacketType(0x64))?;
+        return Interest::decode(fragment);
+    }
+    Interest::decode(wire.clone())
+}
+
 /// Classify one frame off the consumer face against the Interest identified by
 /// `expected` (+ `can_be_prefix`). Nacks match by their enclosed Interest's name; an
 /// unattributable Nack (no decodable enclosed Interest) is treated as a straggler — failing
@@ -1359,6 +1392,95 @@ mod subscription_tests {
         assert!(
             matches!(err, AppError::Unverified(_)),
             "expected Unverified, got {err:?}"
+        );
+    }
+
+    /// **A face-pinned Interest must actually reach the wire.** `pin_face` sets NextHopFaceId, an
+    /// NDNLPv2 field, so the built wire is an `LpPacket` (0x64) wrapping the Interest. `fetch_wire`
+    /// decoded that as a bare Interest *before* `conn.send`, so every `fetch_with_on` call returned
+    /// `Protocol("unknown packet type 0x64")` having transmitted **nothing** — the method was inert
+    /// for every caller. It surfaced three layers away, as NLSR Hello neighbours stuck `Inactive`.
+    ///
+    /// This asserts on the seam — that the connection was handed a frame and that a reply pairs —
+    /// not on the helper that unwraps the LP. A first draft of this test called `interest_identity`
+    /// directly and **passed against the defect**, because the bug is which decode `fetch_wire`
+    /// calls, not whether a correct decode exists.
+    #[tokio::test]
+    async fn fetch_with_on_transmits_a_face_pinned_interest() {
+        use crate::Connection;
+        use ndn_packet::encode::DataBuilder;
+        use std::sync::Mutex as StdMutex;
+
+        /// Records what it was asked to send, and answers with a Data under the sent name.
+        struct SpyConn {
+            sent: StdMutex<Vec<Bytes>>,
+            inbox: StdMutex<Vec<Bytes>>,
+        }
+
+        #[async_trait::async_trait]
+        impl Connection for SpyConn {
+            async fn send(&self, wire: Bytes) -> Result<(), AppError> {
+                self.sent.lock().unwrap().push(wire.clone());
+                // Reply as a forwarder would: unwrap LP, answer the enclosed Interest.
+                let inner = if is_lp_packet(&wire) {
+                    LpPacket::decode(wire.clone())
+                        .ok()
+                        .and_then(|lp| lp.fragment)
+                        .unwrap_or(wire)
+                } else {
+                    wire
+                };
+                if let Ok(i) = Interest::decode(inner) {
+                    let reply = DataBuilder::new((*i.name).clone(), b"INFO").build();
+                    self.inbox.lock().unwrap().push(reply);
+                }
+                Ok(())
+            }
+            async fn recv(&self) -> Option<Bytes> {
+                loop {
+                    if let Some(b) = self.inbox.lock().unwrap().pop() {
+                        return Some(b);
+                    }
+                    crate::rt::sleep(Duration::from_millis(1)).await;
+                }
+            }
+            async fn register_prefix(&self, _prefix: &Name) -> Result<(), AppError> {
+                Ok(())
+            }
+        }
+
+        let conn = Arc::new(SpyConn {
+            sent: StdMutex::new(Vec::new()),
+            inbox: StdMutex::new(Vec::new()),
+        });
+        let mut consumer = Consumer::new(conn.clone() as Arc<dyn Connection>);
+        let name: Name = "/ndn/test/B/nlsr/INFO".parse().unwrap();
+
+        let got = consumer
+            .fetch_with_on(
+                ndn_transport::FaceId(42),
+                InterestBuilder::new(name.clone())
+                    .lifetime(Duration::from_secs(1))
+                    .must_be_fresh()
+                    .can_be_prefix(),
+            )
+            .await;
+
+        let sent = conn.sent.lock().unwrap().clone();
+        assert_eq!(
+            sent.len(),
+            1,
+            "fetch_with_on must transmit; sending nothing at all was the defect (result: {:?})",
+            got.as_ref().map(|_| "Ok").map_err(|e| e.to_string())
+        );
+        assert!(
+            is_lp_packet(&sent[0]),
+            "and it must go out still LP-wrapped — the header is what pins the face"
+        );
+        assert_eq!(
+            *got.expect("a matching Data must pair back").name,
+            name,
+            "the reply pairs against the name inside the wrapper"
         );
     }
 
