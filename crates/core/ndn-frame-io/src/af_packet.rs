@@ -338,7 +338,6 @@ impl crate::FrameIo for AfPacketBackend {
 const MAX_AMSDU_BODY: usize = 3839;
 
 #[async_trait]
-impl crate::WifiRadio for AfPacketBackend {}
 
 /// A monitor interface exposes the NIC's MAC TSF via radiotap TSFT (when the underlying driver
 /// reports it), keyed by ifindex — a free-run per-frame RX-stamp clock. There is no read-now

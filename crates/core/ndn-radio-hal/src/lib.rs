@@ -462,19 +462,20 @@ pub struct MeshCv {
     pub belief: Option<ndn_time::RefBelief>,
 }
 
-/// A Wi-Fi radio — now a pure marker: a `dyn WifiRadio` names "a Wi-Fi radio" and nothing more.
-/// Every method it once carried has moved onto [`FrameIo`], and every implementation in the
-/// workspace is an empty `impl WifiRadio for X {}`. See #83 for retiring it.
-///
-/// `inject_at` / `inject_batch_at` used to live here, which was a latent trap: a face holding
-/// `Arc<dyn FrameIo>` could not reach them, so it would silently get a hand-rolled copy of the
-/// *default* body and miss [`AfPacketBackend`]'s A-MSDU-aggregating override. That is exactly what
-/// happened in #82 part 1 and is why they are on `FrameIo` now — the object-safe seam a face
-/// actually holds must be the one that carries the overridable behaviour.
-///
-/// [`AfPacketBackend`]: https://docs.rs/ndn-frame-io
-#[async_trait]
-pub trait WifiRadio: FrameIo {}
+// **`WifiRadio` was removed here** (#83). It had become `pub trait WifiRadio: FrameIo {}` — an
+// empty marker with an empty impl on every backend, naming "a Wi-Fi radio" and constraining
+// nothing. A marker that constrains nothing cannot be violated, so it carried no guarantee; it only
+// split the world into radios a `dyn WifiRadio` caller could accept and radios it could not, which
+// is a restriction with no compensating meaning.
+//
+// It emptied out because of a real trap: `inject_at`/`inject_batch_at` used to live on it, and a
+// face holding `Arc<dyn FrameIo>` could not reach them, so it silently got a hand-rolled copy of
+// the *default* body and missed `AfPacketBackend`'s A-MSDU-aggregating override (#82 part 1). The
+// fix was to move them onto `FrameIo` — the object-safe seam a face actually holds must be the one
+// carrying the overridable behaviour — which left this trait with nothing.
+//
+// "This is a Wi-Fi radio" is now answered by `RadioCapability::kind`, which is data the cognition
+// layer can read, rather than a type-level assertion nothing checks.
 
 // ---------------------------------------------------------------------------
 // Radio control plane: the stateful-knob seam + the capability descriptor.

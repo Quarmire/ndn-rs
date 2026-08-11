@@ -138,13 +138,12 @@ impl FrameIo for LoopbackEndpoint {
 }
 
 // Marker only: `inject_at` is the derived HAL default (`set_rate` + `inject`).
-impl crate::WifiRadio for LoopbackEndpoint {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::frame::{BROADCAST, DEFAULT_SRC};
-    use crate::{FrameIo, McsDescriptor, TxIntent, WifiRadio};
+    use crate::{FrameIo, McsDescriptor, TxIntent};
 
     /// A distinctive non-broadcast group MAC (locally-administered multicast).
     const GROUP: [u8; 6] = [0x03, 0xaa, 0xbb, 0xcc, 0xdd, 0xee];
