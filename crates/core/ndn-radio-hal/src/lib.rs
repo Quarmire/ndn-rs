@@ -212,7 +212,18 @@ impl McsDescriptor {
             Reliability::MostRobust => McsDescriptor::ht(0).with_stbc().with_ldpc(),
             Reliability::Balanced => McsDescriptor::CONSERVATIVE,
             Reliability::Throughput => {
-                let idx = max_index.min(MAX_RELIABLE_MCS);
+                // **The ceiling is the caller's, clamped only by what the MODE structurally allows**
+                // (#83). This used to be `max_index.min(MAX_RELIABLE_MCS)`, and `MAX_RELIABLE_MCS`
+                // is a figure validated on one chip (the RTL8812EU) — so every radio's own declared
+                // `RateCapability::Wifi { max_mcs }` was silently overridden by a different part's
+                // calibration. The mt7612 declares 9 and was being given 7.
+                //
+                // What legitimately belongs here is the *standard's* structural limit, which is not
+                // a per-chip fact: single-stream HT tops out at MCS7, single-stream VHT at MCS8
+                // (MCS9 needs >=40 MHz). Without this, de-globalising the ceiling would let a
+                // caller declaring 9 request MCS9 as an HT rate, which is not a rate that exists.
+                let mode_ceiling = if vht_cap { 8 } else { 7 };
+                let idx = max_index.min(mode_ceiling);
                 let base = if vht_cap {
                     McsDescriptor::vht(idx)
                 } else {
@@ -245,7 +256,14 @@ impl Default for McsPolicy {
     }
 }
 
-/// Highest MCS the userspace RTL8812EU driver is *validated* to deliver today.
+/// Highest MCS the userspace **RTL8812EU** driver is *validated* to deliver today.
+///
+/// **This is one chip's calibration, and is not a workspace-wide ceiling** (#83). It used to be
+/// applied inside [`McsDescriptor::for_intent`] to every radio, silently overriding each part's own
+/// declared [`RateCapability::Wifi`] `max_mcs` — the mt7612 declares 9 and was handed 7. It now
+/// serves only as the conservative default where no capability is in hand: the radiotap
+/// header-only hint in `frame::build`, and the loopback bus. Anywhere a `RadioCapability` exists,
+/// use [`RadioCapability::max_mcs`] instead.
 ///
 /// The PA is non-linear at the BPSK/QPSK operating power, so 16-QAM and up
 /// (MCS3+) smear (bad EVM) unless backed off. `calibrate_tx_power` now writes a
@@ -986,6 +1004,23 @@ impl RadioCapability {
         }
     }
 
+    /// **The rate this radio should use for an observed RSSI** — [`mcs_for_rssi`] clamped to *this*
+    /// radio's declared ceiling, not to another chip's calibration (#83).
+    ///
+    /// The free [`mcs_for_rssi`] is a monotone heuristic over 11n receiver-sensitivity thresholds
+    /// and knows nothing about which part is transmitting. Every radio in this workspace declares a
+    /// different ceiling (mt7612 9, the 1SS Realteks 8, the RTL8812EU's validated 7), and the
+    /// adaptive policy has to respect the one it is actually driving.
+    ///
+    /// `None` for a radio with no Wi-Fi rate ceiling (LoRa, an RX-only sensor) — asking for an MCS
+    /// there is a category error, not a number to guess at.
+    pub fn mcs_for_rssi(&self, rssi_dbm: i8) -> Option<u8> {
+        match self.rate {
+            RateCapability::Wifi { max_mcs, .. } => Some(mcs_for_rssi(rssi_dbm).min(max_mcs)),
+            _ => None,
+        }
+    }
+
     /// **Can this radio usefully hop on a `dwell_us` dwell?** — the question `agile: bool` was
     /// pretending to answer without reference to a dwell.
     ///
@@ -1203,5 +1238,61 @@ impl OpenRadio {
     /// capability leak over again; reach for it only when the narrowing is the actual intent.
     pub fn io(&self) -> std::sync::Arc<dyn FrameIo> {
         std::sync::Arc::clone(&self.io)
+    }
+}
+
+/// **A radio's declared rate ceiling must be the one that governs it** (#83).
+///
+/// `McsDescriptor::for_intent` clamped every radio to `MAX_RELIABLE_MCS`, a figure validated on the
+/// RTL8812EU — so each part's own `RateCapability::Wifi { max_mcs }` was declared and then silently
+/// overridden by a different chip's calibration. This is the same shape as the `agile` defect: a
+/// per-chip fact asserted globally.
+///
+/// The clamp was load-bearing in one respect, which is why removing it needed care rather than
+/// deletion: single-stream HT has no MCS above 7, so a radio declaring 9 would otherwise have been
+/// handed a rate that does not exist. That limit is the *standard's*, not a chip's, and stays.
+#[cfg(test)]
+mod ceiling_tests {
+    use super::*;
+
+    #[test]
+    fn a_radios_own_ceiling_governs_its_rate_not_another_chips_calibration() {
+        let throughput =
+            TxIntent { reliability: Reliability::Throughput, reach: Reach::Broadcast };
+
+        // The mt7612 declares MCS9 and is VHT-capable. It was being handed 7 — two rates below what
+        // it advertises — because of a constant calibrated on a Realtek part.
+        let mt = RadioCapability::wifi_monitor_5ghz(vec![36]);
+        assert_eq!(mt.max_mcs(), 9, "fixture: this constructor declares 9");
+        let d = McsDescriptor::for_intent(&throughput, mt.max_mcs(), true);
+        assert_eq!(d.index, 8, "VHT 1SS tops at MCS8 (9 needs >=40 MHz), NOT at the 8812EU's 7");
+        assert!(d.vht);
+
+        // Without VHT the structural HT limit still binds — this is the part of the old clamp that
+        // was doing real work, and it is a property of 802.11, not of any chip.
+        let d = McsDescriptor::for_intent(&throughput, 9, false);
+        assert_eq!(d.index, 7, "single-stream HT has no rate above MCS7");
+        assert!(!d.vht);
+
+        // A part that genuinely validates lower keeps its lower ceiling: the capability is
+        // authoritative in both directions, which is the whole point of de-globalising it.
+        let d = McsDescriptor::for_intent(&throughput, 4, true);
+        assert_eq!(d.index, 4, "a conservative radio must not be pushed up to the mode ceiling");
+
+        // Robust/Balanced are rate-class decisions, not ceiling decisions, and are unaffected.
+        let robust = TxIntent { reliability: Reliability::MostRobust, reach: Reach::Broadcast };
+        assert_eq!(McsDescriptor::for_intent(&robust, 9, true).index, 0);
+    }
+
+    #[test]
+    fn adaptive_rate_is_capped_per_radio() {
+        // A strong signal asks for MCS7; a radio that declares 4 must still get 4.
+        let mut cap = RadioCapability::wifi_monitor_5ghz(vec![36]);
+        cap.rate = RateCapability::Wifi { max_mcs: 4, max_nss: 1, max_bw: 0 };
+        assert_eq!(cap.mcs_for_rssi(-40), Some(4), "clamped to this radio's ceiling");
+        assert_eq!(cap.mcs_for_rssi(-90), Some(0), "and a weak link still drops to the floor");
+
+        // Asking a LoRa radio for an MCS is a category error, not a number to guess at.
+        assert_eq!(RadioCapability::lora(vec![0]).mcs_for_rssi(-40), None);
     }
 }
