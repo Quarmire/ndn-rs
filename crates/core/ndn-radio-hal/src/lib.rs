@@ -768,21 +768,6 @@ pub enum RadioKind {
     Other,
 }
 
-/// Whether a radio can afford to listen continuously — the axis that selects the
-/// rendezvous mode. A mains-powered monitor radio listens always; a battery
-/// sub-GHz node duty-cycles. This is *not* an 802.11 concept: it is the
-/// bearer-agnostic reason Discovery Windows exist (see `ndn-nan-core::rendezvous`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
-pub enum TimingModel {
-    /// Continuous RX — no wake schedule needed; the rendezvous mode can be null
-    /// (always-on). Commodity Wi-Fi monitor radios, SDRs, mains-powered relays.
-    #[default]
-    AlwaysOn,
-    /// Duty-cycled RX to save power — needs a windowed rendezvous (a NAN-style
-    /// Discovery Window, a TSCH slotframe). Battery sub-GHz / IoT nodes.
-    DutyCycled,
-}
-
 /// Whether a radio exports channel-state information to the host, and at what granularity — the
 /// axis the named-time / sensing plane needs to know per port. Assessed on real hardware:
 /// commodity Realtek Wi-Fi is [`None`](Self::None) — its only on-chip CSI is compressed 802.11
@@ -878,9 +863,16 @@ pub struct RadioCapability {
     /// RX-only — participates in sensing/reception, never selected for TX (e.g. SDR
     /// sensor). Such radios still contribute to macrodiversity reception pooling.
     pub rx_only: bool,
-    /// Whether the radio listens continuously or duty-cycles — selects the
-    /// rendezvous mode (always-on vs a windowed schedule).
-    pub timing: TimingModel,
+    // **No `timing: TimingModel` here, deliberately** (#90). It carried AlwaysOn/DutyCycled,
+    // had zero readers, and was *false* where it mattered: LoRa was marked `DutyCycled` while our
+    // firmware sits in continuous RX. It also restated, badly, a constraint this struct already
+    // expresses correctly — `duty_cycle_max` below is the regulatory TX-airtime ceiling, is
+    // genuinely consumed by the planner, and is what actually limits LoRa. Two different concepts
+    // (RX wake schedule vs TX airtime budget) had been collapsed into one, and the collapsed one
+    // was wrong.
+    //
+    // When a radio that really duty-cycles its receiver exists (#100's wake-up radio, a BLE or
+    // ESP32 backend), reintroduce it as something a rendezvous layer *reads* — not as a label.
     /// Regulatory / policy ceiling on the fraction of airtime this radio may use
     /// (`1.0` = unrestricted; LoRa sub-GHz is ~`0.01`). A broadcast rate planner
     /// must respect it.
@@ -1039,7 +1031,6 @@ impl RadioCapability {
             tx_power_dbm: None,
             retune_us: Some(16_000), // measured: set_channel is a ~16 ms blocking call (#97)
             rx_only: false,
-            timing: TimingModel::AlwaysOn,
             duty_cycle_max: 1.0,
             max_payload: 1500,
             half_duplex: true,
@@ -1065,7 +1056,6 @@ impl RadioCapability {
             tx_power_dbm: None,
             retune_us: Some(16_000), // measured: set_channel is a ~16 ms blocking call (#97)
             rx_only: false,
-            timing: TimingModel::AlwaysOn,
             duty_cycle_max: 1.0,
             max_payload: 1500,
             half_duplex: true,
@@ -1124,7 +1114,6 @@ impl RadioCapability {
             rx_only: false,
             // S1G is a licence-exempt sub-GHz band but, unlike the LoRa ISM path,
             // 802.11ah uses CSMA/CA (listen-before-talk), not a hard duty cycle.
-            timing: TimingModel::AlwaysOn,
             duty_cycle_max: 1.0,
             max_payload: 1500,
             half_duplex: true,
@@ -1151,7 +1140,6 @@ impl RadioCapability {
             rx_only: false,
             // Sub-GHz is duty-cycle-limited (~1%) and needs a windowed rendezvous;
             // tiny frames, half-duplex.
-            timing: TimingModel::DutyCycled,
             duty_cycle_max: 0.01,
             max_payload: 256,
             half_duplex: true,
@@ -1171,7 +1159,6 @@ impl RadioCapability {
             retune_us: None, // not measured
             rx_only: true,
             // A spectrum instrument: always listening, never transmits.
-            timing: TimingModel::AlwaysOn,
             duty_cycle_max: 1.0,
             max_payload: 0,
             half_duplex: false,
