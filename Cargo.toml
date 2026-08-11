@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/core/ndn-env",
     "crates/core/ndn-foundation-types",
     "crates/core/ndn-tlv",
     "crates/core/ndn-packet",
