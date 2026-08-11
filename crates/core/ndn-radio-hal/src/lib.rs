@@ -859,8 +859,22 @@ pub struct RadioCapability {
     /// applied value) — a fabricated range is worse than `None`, because the
     /// planner will believe it.
     pub tx_power_dbm: Option<DbmRange>,
-    /// Can retune quickly (fast FHSS-capable).
-    pub agile: bool,
+    /// **Measured** cost of changing channel, microseconds. `None` = never measured.
+    ///
+    /// This replaces a `agile: bool` ("can retune quickly") that was consumed by nothing and, worse,
+    /// was *backwards*: it read `true` on every Wi-Fi monitor radio — the parts whose `set_channel`
+    /// is a ~16 ms blocking call — and `false` on LoRa. A planner that had believed it would have
+    /// chosen exactly the wrong radio to hop.
+    ///
+    /// A number rather than a flag because "agile" is not a property of the radio, it is a relation
+    /// between the radio and the dwell you intend to use: 16 ms is nothing against a 10 s dwell and
+    /// fatal against a 20 ms slot. [`can_hop`](Self::can_hop) is that comparison, and is the only
+    /// honest way to answer the question the boolean was pretending to.
+    ///
+    /// Populate only from a real measurement, per the same rule as
+    /// [`tx_power_dbm`](Self::tx_power_dbm): an invented figure is worse than `None`, because
+    /// downstream code will believe it.
+    pub retune_us: Option<u32>,
     /// RX-only — participates in sensing/reception, never selected for TX (e.g. SDR
     /// sensor). Such radios still contribute to macrodiversity reception pooling.
     pub rx_only: bool,
@@ -979,6 +993,29 @@ impl RadioCapability {
         }
     }
 
+    /// **Can this radio usefully hop on a `dwell_us` dwell?** — the question `agile: bool` was
+    /// pretending to answer without reference to a dwell.
+    ///
+    /// `None` when [`retune_us`](Self::retune_us) has never been measured: an unmeasured radio
+    /// yields "I cannot say", never a guess. Callers decide what to do with that — a planner should
+    /// treat it as "do not hop" and a bring-up tool as "go measure it".
+    ///
+    /// The threshold is a quarter of the dwell. Retuning is dead air: at 1/4 the schedule spends a
+    /// fifth of its life deaf, which is already a poor trade, and the ~16 ms Wi-Fi figure against a
+    /// 20 ms slot is 80% — the incompatibility recorded in #97, now enforced rather than commented.
+    pub fn can_hop(&self, dwell_us: u64) -> Option<bool> {
+        let retune = u64::from(self.retune_us?);
+        Some(retune.saturating_mul(4) <= dwell_us)
+    }
+
+    /// Fraction of a `dwell_us` dwell lost to retuning (`0.0`–`1.0`), or `None` if unmeasured.
+    /// The honest cost line for a hop plan: multiply through to see what FHSS is charging.
+    pub fn retune_overhead(&self, dwell_us: u64) -> Option<f32> {
+        let retune = f64::from(self.retune_us?);
+        let dwell = dwell_us.max(1) as f64;
+        Some((retune / dwell).min(1.0) as f32)
+    }
+
     /// LoRa spreading-factor span `(min, max)`, or `None` for a non-LoRa radio.
     pub fn sf_range(&self) -> Option<(u8, u8)> {
         match self.rate {
@@ -1000,7 +1037,7 @@ impl RadioCapability {
             channels,
             max_tx_power: 63,
             tx_power_dbm: None,
-            agile: true,
+            retune_us: Some(16_000), // measured: set_channel is a ~16 ms blocking call (#97)
             rx_only: false,
             timing: TimingModel::AlwaysOn,
             duty_cycle_max: 1.0,
@@ -1026,7 +1063,7 @@ impl RadioCapability {
             channels,
             max_tx_power: 63,
             tx_power_dbm: None,
-            agile: true,
+            retune_us: Some(16_000), // measured: set_channel is a ~16 ms blocking call (#97)
             rx_only: false,
             timing: TimingModel::AlwaysOn,
             duty_cycle_max: 1.0,
@@ -1083,7 +1120,7 @@ impl RadioCapability {
             channels,
             max_tx_power: 63,
             tx_power_dbm: None,
-            agile: true,
+            retune_us: None, // not measured on the MM6108/NRC7292
             rx_only: false,
             // S1G is a licence-exempt sub-GHz band but, unlike the LoRa ISM path,
             // 802.11ah uses CSMA/CA (listen-before-talk), not a hard duty cycle.
@@ -1110,7 +1147,7 @@ impl RadioCapability {
             // SX126x PA span (the backend clamps to this and sends CMD_SET_PWR): absolute dBm, so the
             // policy backs off from the ceiling for spatial reuse just like on the Wi-Fi path.
             tx_power_dbm: Some(DbmRange::new(10, 22)),
-            agile: false,
+            retune_us: None, // SetRfFrequency is fast, but we have not measured it
             rx_only: false,
             // Sub-GHz is duty-cycle-limited (~1%) and needs a windowed rendezvous;
             // tiny frames, half-duplex.
@@ -1131,7 +1168,7 @@ impl RadioCapability {
             channels,
             max_tx_power: 0,
             tx_power_dbm: None,
-            agile: true,
+            retune_us: None, // not measured
             rx_only: true,
             // A spectrum instrument: always listening, never transmits.
             timing: TimingModel::AlwaysOn,
