@@ -65,6 +65,8 @@ pub const KNOWN: &[Var] = &[
     cfg("NDN_SCHED_NODE_ID", "id for the network-reference election (lowest wins)"),
     cfg("NDN_SCHED_GROUP_DEPTH", "name components hashed into a scheduling group"),
     cfg("NDN_SCHED_CLAIM", "enable claiming an idle slot (CCLF election)"),
+    cfg("NDN_SCHED_LEASE", "max base slots one lease may hold (#93); 1 = the measured single-slot hold"),
+    cfg("NDN_SCHED_RESERVE", "reserve every Nth slot as a latency lane (#93); 0 = none, the measured default"),
     dbg_("NDN_SCHED_CLAIM_UNKNOWN", "claim slots whose owner was never heard — DEFEATS #94's hidden-terminal guard"),
     // ---- face / link ----
     cfg("NDN_NAME", "face name prefix"),
