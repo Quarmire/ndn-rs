@@ -86,7 +86,7 @@ pub const KNOWN: &[Var] = &[
     // ---- radio selection / rate / power (operational) ----
     cfg("NDN_USB_INDEX", "which USB radio to open when several share a host"),
     cfg("NDN_RADIO_TX_RATE", "TX rate code (4 = legacy 6M, the broadcast-safe choice)"),
-    cfg("NDN_RADIO_TXPWR", "TX power index"),
+    cfg("NDN_RADIO_TXPWR", "TXAGC index 0..63 — read natively ONLY by the 8821c bring-up; campaign tools apply it via RadioKnobs::set_tx_power (a81a/8812au honor the knob, not the var)"),
     cfg("NDN_TX_PWR", "TX power (LoRa)"),
     cfg("NDN_RADIO_LDPC", "enable LDPC FEC"),
     cfg("NDN_RADIO_STBC", "enable space-time block coding"),
