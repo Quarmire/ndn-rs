@@ -1189,6 +1189,19 @@ pub struct RadioDeviceConfig {
     /// Optional initial TX-power index (driver-specific; 0..=0x3f for Realtek).
     #[serde(default, rename = "tx-power")]
     pub tx_power: Option<u8>,
+    /// **Which physical device**, when the driver could bind several — a backend-agnostic selector
+    /// each driver interprets in its own terms, so the config schema bakes in no one bus. The radio
+    /// is just a backend behind this string:
+    /// - Realtek USB (`rtl8822e` / `rtl8812au`): a USB selector — `"1-1.4"` (a stable bus\:port,
+    ///   matching the Linux sysfs device path and surviving reboots), or `"#<n>"` (enumeration index,
+    ///   simpler but not stable across reboots/hotplug).
+    /// - serial backends: a device path (e.g. `"/dev/ttyACM0"`).
+    ///
+    /// `af-packet` / `halow` select by netdev name via [`interface`](Self::interface) instead. Unset
+    /// ⇒ the driver's default (the first device it finds). The main use: a host with two identical
+    /// dongles pins the spare here and leaves the kernel link on the other.
+    #[serde(default)]
+    pub address: Option<String>,
 }
 
 fn default_baud() -> u32 {
@@ -1683,6 +1696,7 @@ channel = 161
                 channel: Some(149),
                 interface: None,
                 tx_power: None,
+                address: None,
             }],
         };
         assert!(validate_face_config(&no_iface).is_err());
@@ -1693,6 +1707,7 @@ channel = 161
                 channel: Some(149),
                 interface: None,
                 tx_power: None,
+                address: None,
             }],
         };
         assert!(validate_face_config(&usb).is_ok());

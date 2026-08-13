@@ -63,7 +63,10 @@ pub const KNOWN: &[Var] = &[
     cfg("NDN_SCHED_CLOCK", "clock source: wall | cv | hw — also sets the slot guard band"),
     cfg("NDN_SCHED_MASTER", "this node broadcasts the time beacon"),
     cfg("NDN_SCHED_NODE_ID", "id for the network-reference election (lowest wins)"),
-    cfg("NDN_SCHED_GROUP_DEPTH", "name components hashed into a scheduling group"),
+    // NDN_SCHED_GROUP_DEPTH was DELETED (P1, 2026-08-12): a per-node env var deciding a shared
+    // slot map was the same hazard as a hand-edited slot width. Grouping now comes from the
+    // registered-prefix table. Deliberately NOT listed here — a node still setting it gets the
+    // Unrecognised warning, which is exactly the migration signal it needs.
     cfg("NDN_SCHED_CLAIM", "enable claiming an idle slot (CCLF election)"),
     cfg("NDN_SCHED_LEASE", "max base slots one lease may hold (#93); 1 = the measured single-slot hold"),
     cfg("NDN_SCHED_RESERVE", "reserve every Nth slot as a latency lane (#93); 0 = none, the measured default"),
