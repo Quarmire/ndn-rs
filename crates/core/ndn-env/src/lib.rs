@@ -71,6 +71,7 @@ pub const KNOWN: &[Var] = &[
     cfg("NDN_SCHED_LEASE", "max base slots one lease may hold (#93); 1 = the measured single-slot hold"),
     cfg("NDN_SCHED_RESERVE", "reserve every Nth slot as a latency lane (#93); 0 = none, the measured default"),
     dbg_("NDN_SCHED_CLAIM_UNKNOWN", "claim slots whose owner was never heard — DEFEATS #94's hidden-terminal guard"),
+    dbg_("NDN_SCHED_DEAF_SRC", "claim-C topology instrument: hex nonce prefix this node is artificially deaf to (software hearing matrix — hiddenness is not achievable electronically at bench range)"),
     // ---- face / link ----
     cfg("NDN_NAME", "face name prefix"),
     cfg("NDN_PORT", "unicast port"),
