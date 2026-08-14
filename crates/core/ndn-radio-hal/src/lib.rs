@@ -996,6 +996,24 @@ impl RadioCapability {
         }
     }
 
+    /// Clamp the Wi-Fi rate ceilings to declared per-radio maxima (config `max-mcs` / `max-nss`).
+    /// Each argument is an optional cap that can only *lower* the existing ceiling; `None` leaves it.
+    /// A no-op on non-Wi-Fi radios. Lets an operator pin a radio — e.g. an af-packet TX to
+    /// single-stream ≤ MCS 7 — declaratively and statically, independent of (and before) any
+    /// neighbour's advertised RX capability. The cognition policy already reads these ceilings, so
+    /// the cap takes effect with no further plumbing.
+    pub fn with_wifi_caps(mut self, max_mcs: Option<u8>, max_nss: Option<u8>) -> Self {
+        if let RateCapability::Wifi { max_mcs: m, max_nss: n, .. } = &mut self.rate {
+            if let Some(cap) = max_mcs {
+                *m = (*m).min(cap);
+            }
+            if let Some(cap) = max_nss {
+                *n = (*n).min(cap).max(1);
+            }
+        }
+        self
+    }
+
     /// Wi-Fi max channel-bandwidth code (0 = 20 MHz, for a non-Wi-Fi radio too).
     pub fn max_bw(&self) -> u8 {
         match self.rate {

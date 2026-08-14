@@ -1202,6 +1202,16 @@ pub struct RadioDeviceConfig {
     /// dongles pins the spare here and leaves the kernel link on the other.
     #[serde(default)]
     pub address: Option<String>,
+    /// Optional **static** Wi-Fi rate ceilings for this radio, clamping the driver's own capability
+    /// (they can only *lower* it). `max-mcs` caps the HT/VHT MCS index (0..=9), `max-nss` the spatial
+    /// stream count (1 or 2). Cognition reads these as the radio's ceiling, so they cap the *transmit*
+    /// rate declaratively — e.g. pin an `af-packet` TX to single-stream ≤ MCS 7 for a peer known to
+    /// have one RX chain, independent of (and before) that peer's advertised reception report. Unset
+    /// ⇒ the driver default. (The dynamic worst-overheard-receiver cap still applies on top.)
+    #[serde(default, rename = "max-mcs")]
+    pub max_mcs: Option<u8>,
+    #[serde(default, rename = "max-nss")]
+    pub max_nss: Option<u8>,
 }
 
 fn default_baud() -> u32 {
@@ -1697,6 +1707,8 @@ channel = 161
                 interface: None,
                 tx_power: None,
                 address: None,
+                max_mcs: None,
+                max_nss: None,
             }],
         };
         assert!(validate_face_config(&no_iface).is_err());
@@ -1708,6 +1720,8 @@ channel = 161
                 interface: None,
                 tx_power: None,
                 address: None,
+                max_mcs: None,
+                max_nss: None,
             }],
         };
         assert!(validate_face_config(&usb).is_ok());
