@@ -5,6 +5,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+# P1 compile-cost: tests/*.rs are modules of the single `suite` test binary
+# (see [[test]] below), not thirteen auto-discovered binaries to link.
+autotests = false
 
 [package.metadata.scope]
 classification = "spec"
@@ -81,6 +84,10 @@ ndn-config       = { workspace = true, features = ["mgmt"] }
 ndn-store        = { workspace = true }
 # IPC-seam witness (tests/ipc_seam.rs): a client rides a socketpair fd.
 ndn-ipc          = { workspace = true }
+
+[[test]]
+name = "suite"
+path = "tests/suite.rs"
 
 [lints]
 workspace = true
