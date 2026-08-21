@@ -149,10 +149,6 @@ tokio-util = { version = "0.7.10", default-features = false }
 # Zero-copy byte buffers (no default features — crates opt in to bytes/std explicitly)
 bytes = { version = "1", default-features = false }
 
-# Embedded support
-heapless = "0.8"
-nb       = "1"
-
 # Concurrent data structures
 dashmap  = "6"
 smallvec = { version = "1", features = ["union"] }
@@ -163,8 +159,6 @@ lru = "0.12"
 
 # Structured logging
 tracing = "0.1"
-# tokio-console: runtime task inspector (opt-in; requires --cfg tokio_unstable)
-console-subscriber = "0.4"
 
 # Async combinators and stream/sink extension traits
 futures = "0.3"
@@ -220,41 +214,11 @@ getrandom     = { version = "0.2", default-features = false, features = ["std"] 
 # Native targets get the real `std::time` re-exported.
 web-time      = "1"
 
-# Serial port support
-tokio-serial = "5"
-
-# WebSocket support
-tokio-tungstenite = { version = "0.26" }
-
-# WebTransport (HTTP/3 + QUIC) — pure-Rust server, built on quinn.  Mirrors
-# ndnd's webtransport-go choice in fw/face/http3-listener.go.
-wtransport = { version = "0.7" }
-
-# ACME (RFC 8555) — used by ndn-acme to provision real certs for the
-# WebSocket-TLS face (issue #3) and the WebTransport listener (issue #14).
-instant-acme = { version = "0.7" }
-# DNS-01 challenge plumbing — Cloudflare HTTP API is the only impl shipped
-# in phase 2; rustls + reqwest are scoped to ndn-acme so the WT face crate
-# stays small.
-reqwest      = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
-# X.509 parsing — ndn-acme reads the leaf cert's notAfter to drive renewal
-# and the cert-status surface.
-x509-parser  = { version = "0.18" }
-
-# WebSocket TLS (server-side)
-tokio-rustls      = { version = "0.26", default-features = false, features = ["logging", "tls12", "ring"] }
-rcgen             = { version = "0.13", default-features = false, features = ["pem", "crypto", "ring"] }
-rustls-pemfile    = { version = "2" }
-
 # Logging subscriber (binaries only)
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-
 # Synchronization
 parking_lot = "0.12"
-
-# WebAssembly text format (examples)
-wat = "1"
 
 # Persistent storage
 fjall = "3"
@@ -264,19 +228,6 @@ criterion = { version = "0.5", features = ["html_reports"] }
 
 # Property-based testing (dev-dependency only)
 proptest = "1"
-
-# Bluetooth LE GATT server (Linux/BlueZ, D-Bus)
-bluer = { version = "0.17", default-features = false, features = ["bluetoothd"] }
-
-# Bluetooth LE GATT server (macOS/iOS, CoreBluetooth via objc2)
-objc2                = { version = "0.5" }
-objc2-core-bluetooth = { version = "0.2" }
-objc2-foundation     = { version = "0.2" }
-
-# Bluetooth LE GATT *central* (macOS/Windows; CoreBluetooth / WinRT). Linux
-# central uses bluer instead. `uuid` parses the GATT profile UUID strings.
-btleplug = { version = "0.11" }
-uuid     = { version = "1" }
 
 # Raw packet capture (Windows Npcap / libpcap)
 pcap = "2"
