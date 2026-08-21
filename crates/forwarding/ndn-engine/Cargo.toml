@@ -5,6 +5,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+# P1 compile-cost: tests/*.rs are modules of the single `suite` test binary
+# (see [[test]] below), not seventeen auto-discovered binaries to link.
+autotests = false
 
 [package.metadata.scope]
 classification = "spec"
@@ -90,6 +93,10 @@ ndn-pathcontrol = { workspace = true }
 # in tests/face_factory.rs. `net` gives the test tokio::net::UdpSocket.
 ndn-face       = { workspace = true }
 tokio          = { workspace = true, features = ["net", "macros", "rt-multi-thread", "time"] }
+
+[[test]]
+name = "suite"
+path = "tests/suite.rs"
 
 [[bench]]
 name    = "pipeline"

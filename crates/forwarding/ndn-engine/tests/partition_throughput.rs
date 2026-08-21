@@ -14,7 +14,7 @@
 //! box (NOT macOS/loopback for absolute numbers):
 //!
 //!   cargo test -p ndn-engine --features partitioned-fwd --release \
-//!     --test partition_throughput -- --ignored --nocapture
+//!     --test suite -- --ignored partition_throughput --nocapture
 //!
 //! Env: DURATION_MS=3000 WINDOW=512 SIZE=8192 WORKERS_LIST=1,2,4,8 VALIDATE=1
 #![cfg(feature = "partitioned-fwd")]
