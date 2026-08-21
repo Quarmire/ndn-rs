@@ -40,7 +40,11 @@ members = [
     "examples/context-enricher",
     "examples/tier0-rpc-latency",
 ]
+# Plain `cargo build` narrows to the library crates: every member except
+# the examples/* binaries. Examples stay in `members` so `--workspace`
+# (CI) still compiles them.
 default-members = [
+    "crates/core/ndn-env",
     "crates/core/ndn-foundation-types",
     "crates/core/ndn-tlv",
     "crates/core/ndn-packet",
@@ -48,6 +52,7 @@ default-members = [
     "crates/forwarding/ndn-fwd-core",
     "crates/core/ndn-crypto-core",
     "crates/core/ndn-signals-core",
+    "crates/core/ndn-time",
     "crates/core/ndn-ble-framing",
     "crates/core/ndn-mgmt-wire",
     "crates/core/ndn-transport",
@@ -72,12 +77,6 @@ default-members = [
     "crates/security/ndn-identity",
     "crates/forwarding/ndn-mgmt",
     "crates/platform/ndn-observability",
-    "crates/core/ndn-time",
-    "examples/secure-fetch",
-    "examples/strategy-custom",
-    "examples/strategy-composed",
-    "examples/context-enricher",
-    "examples/tier0-rpc-latency",
 ]
 
 [workspace.package]
