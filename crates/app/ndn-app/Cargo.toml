@@ -5,6 +5,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+# P1 compile-cost: tests/*.rs are modules of the single `suite` test binary
+# (see [[test]] below), not eleven auto-discovered binaries to link.
+autotests = false
 
 [package.metadata.scope]
 classification = "spec"
@@ -77,6 +80,10 @@ ndn-strategy  = { workspace = true }
 # BackendStore for the Publisher store-seam handoff test (N-15): the persistent
 # DataStore the seam exists to admit. Test-only; the default build is unchanged.
 ndn-sync      = { workspace = true, features = ["persistent-store"] }
+
+[[test]]
+name = "suite"
+path = "tests/suite.rs"
 
 [lints]
 workspace = true

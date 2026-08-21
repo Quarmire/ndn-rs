@@ -1,6 +1,6 @@
 //! In-process fetch throughput — no radio, no socketpair seam, just engine +
 //! Consumer. A slow result here indicts the fetch path itself, not the link.
-//!   cargo test -p ndn-app --test local_throughput -- --nocapture --ignored
+//!   cargo test -p ndn-app --test suite -- --ignored local_throughput --nocapture
 
 use std::time::Instant;
 
