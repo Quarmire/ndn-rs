@@ -117,6 +117,7 @@
 - [0005 · Retire the audit-witness suite for nextest](./inside/adr/0005-retire-audit-witness-suite.md)
 - [0006 · The radio foundation boundary](./inside/adr/0006-radio-foundation-boundary.md)
 - [0007 · The named-time crate boundary](./inside/adr/0007-named-time-crate-boundary.md)
+- [0008 · Crate naming and grouping conventions](./inside/adr/0008-naming-conventions.md)
 
 # Releases
 
