@@ -81,6 +81,28 @@ Status: ✅ runnable witness today · ⛔ gates a future layer (acceptance crite
 - The default pending-token TTL is long enough for normal ACK collection/selection (NSF-T2/S3).
 - The ABE library reports validation/decryption failures **without mutating** NDNSF state (NSF-F3) — in ndn-rs, `ndn-security::abe`/`confidentiality` are pure transforms, so this holds by construction.
 
+## 2026-08 wire refresh (compact SELECTION) — invariant notes
+
+The compact (unified V2) SELECTION replaces the plaintext token in the shared
+selection payload with a provider-bound **token-proof hash**
+(`messages::selection_token_proof_hash`). The T/S invariants carry over
+unchanged to the proof-hash consume path (`PendingProviderTokens::consume_where`
+/ `ProviderEngine::consume_selection_compact`), witnessed by:
+
+| Invariant | Compact-path witness |
+|---|---|
+| NSF-T1/T3 single-use, replay fails | ✅ `flow::tests::compact_selection_happy_path_and_replay` |
+| NSF-T5 unknown (forged/empty hash) fails closed, nothing consumed | ✅ `flow::tests::compact_selection_empty_or_forged_hash_fails_closed` |
+| SEC-03 requester binding (a hash cannot be redeemed by another verified identity, and the failed attempt does not burn the token) | ✅ `flow::tests::compact_selection_wrong_requester_cannot_redeem` |
+| Inbound legacy shape still served (upstream accept-old-emit-new posture) | ✅ `tests/compact_selection_compat.rs::legacy_selection_shape_still_accepted` |
+| Spec-044 negative ACK: no token issued, nothing pending, user early-stops | ✅ `tests/compact_selection_compat.rs::negative_ack_early_stops_call` |
+
+Strengthening over the audited baseline: the plaintext provider token no longer
+crosses the shared medium at selection time — it travels only in the issuing
+ACK (whose payload the full-security configuration NAC-seals) and is thereafter
+proven by hash. This narrows the read-the-token exposure that SEC-03 previously
+only made unredeemable; it does not remove the ACK leg.
+
 ## Known limitations (carried over)
 
 - Test-only instrumentation counters are not production metrics.

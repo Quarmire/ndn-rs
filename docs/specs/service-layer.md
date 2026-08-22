@@ -587,6 +587,55 @@ ABE-encrypted *content* is exchanged only between same-implementation peers. Ful
 ciphertext interop would require an feature-gated `libopenabe` FFI backend; it is
 **out of scope** per the protocol-level-interop decision.
 
+### 7.4 Upstream baseline and the 2026-08 wire refresh
+
+The port originally tracked upstream by feature-shape (~June 2026, unpinned).
+The 2026-08 divergence audit re-based it against upstream **`5e9e7aa`
+(2026-08-12)**; the wire deltas and their resolutions:
+
+- **Compact (unified V2) SELECTION** — upstream's 2026-06-07 change (12 days
+  before our port burst; we ported from a stale tree): one selection publication
+  per request, `SelectionProviderEntry` (TLV `0xF503`) per **selected** provider,
+  each carrying a provider-bound **token-proof hash** (SHA-256 over
+  `"SELECTION" ‖ requesterURI ‖ providerURI ‖ serviceURI ‖ token`, uppercase
+  hex) instead of the plaintext token. **Adopted**: `ndnsf-rs` emits the compact
+  shape and accepts the legacy per-provider shape inbound (same posture as
+  upstream). The proof hash hardens the four-phase itself: the plaintext token
+  no longer crosses the shared medium at selection time, so a group member can
+  no longer lift a token from a broadcast SELECTION (it already couldn't redeem
+  one, SEC-03 — now it can't even read one).
+- **Negative ACK** (upstream spec 044) — `status=false` + reason code on the
+  ACK `ErrorInfo` field; recommended vocabulary in `messages::reason`.
+  **Adopted**: provider sheds with `QUEUE_FULL` at its pending cap (previously a
+  silent drop); a `call` to a known provider early-stops on its negative ACK.
+- **V1 invocation protocol removed upstream** (spec 086) — no impact; the port
+  was V2-only from day one.
+- **Typed ACK envelopes v2** (spec 090) — payload-metadata level, not consumed
+  by the port. If ACK capability metadata (`ProviderCapabilityHint`) is ever
+  read for selection ranking, speak **v2 only** — upstream's mixed-reader grace
+  ends **2026-12-31**.
+- **Interop caveats** (unchanged in kind): request ids must be single name
+  components (upstream parses the id as the final component), and proof-hash
+  interop requires name URIs that render identically on both stacks
+  (unreserved-character components; see `selection_token_proof_hash` docs).
+
+### 7.5 Upstream features deliberately not adopted (2026-08 audit)
+
+Recorded so future syncs don't re-litigate; revisit only on new evidence.
+
+| Upstream mechanism | Why not |
+|---|---|
+| Coordination envelope / advisory coordinator (spec 049/048) | Upstream deleted it themselves after it failed its retention gate (spec 087). |
+| `DeploymentControlMessage` family (TLVs `0xF610–0xF635`) | DI-placement machinery; optional TLVs our tolerant decode skips. Adopt only if DI parity ever becomes a goal. |
+| Durable selection txn store (encrypted WAL, 2026-08) | Three weeks old and churning; inverts NSF-T6 (pending state is memory-local — an audited invariant on both sides until July). Watch for a stability window. |
+| DistributedRepo / DistributedInference / UAV apps | Applications on the framework, not the framework. The Repo *contract* (exact-packet store, manifests) stays on the watch list for `ndn-repo`. |
+| Certificate bootstrap challenge (spec 045) | Our stack has its own trust bootstrap (`ndn-security`/`ndn-cert`); the RSA-wrapped challenge matters only for interop with a C++ controller. |
+
+What **was** adopted from the same audit, on our terms (Track B): the
+execution-lease primitive (upstream spec 085) and the stream-session state
+engine with FEC via `ndn-coding` (upstream specs 057/089) — see their crates'
+docs.
+
 ---
 
 ## 8. Performance
