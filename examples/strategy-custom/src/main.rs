@@ -22,10 +22,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::Result;
 use smallvec::{SmallVec, smallvec};
 
-use ndn_engine::pipeline::{ForwardingAction, NackReason};
-use ndn_engine::{EngineBuilder, EngineConfig};
-use ndn_packet::Name;
-use ndn_strategy::{Strategy, StrategyContext};
+use ndn::engine::pipeline::{ForwardingAction, NackReason};
+use ndn::strategy::{Strategy, StrategyContext};
+use ndn::{EngineBuilder, EngineConfig, Name};
 
 // ─── Custom strategy implementation ──────────────────────────────────────────
 
@@ -42,10 +41,10 @@ impl RandomStrategy {
     fn new() -> Self {
         Self {
             name: Name::from_components(vec![
-                ndn_packet::NameComponent::generic(bytes::Bytes::from_static(b"localhost")),
-                ndn_packet::NameComponent::generic(bytes::Bytes::from_static(b"nfd")),
-                ndn_packet::NameComponent::generic(bytes::Bytes::from_static(b"strategy")),
-                ndn_packet::NameComponent::generic(bytes::Bytes::from_static(b"random")),
+                ndn::NameComponent::generic(bytes::Bytes::from_static(b"localhost")),
+                ndn::NameComponent::generic(bytes::Bytes::from_static(b"nfd")),
+                ndn::NameComponent::generic(bytes::Bytes::from_static(b"strategy")),
+                ndn::NameComponent::generic(bytes::Bytes::from_static(b"random")),
             ]),
             counter: AtomicU64::new(0),
         }

@@ -30,9 +30,10 @@ use std::sync::Arc;
 use anyhow::Result;
 use dashmap::DashMap;
 
-use ndn_engine::{ContextEnricher, EngineBuilder, EngineConfig};
-use ndn_strategy::FibEntry;
-use ndn_transport::{AnyMap, FaceId};
+use ndn::engine::ContextEnricher;
+use ndn::strategy::FibEntry;
+use ndn::transport::AnyMap;
+use ndn::{EngineBuilder, EngineConfig, FaceId};
 
 // ─── Step 1: Define a DTO (Data Transfer Object) ────────────────────────────
 //

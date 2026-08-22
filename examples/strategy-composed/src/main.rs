@@ -26,12 +26,11 @@ use std::sync::Arc;
 use anyhow::Result;
 use smallvec::SmallVec;
 
-use ndn_engine::pipeline::ForwardingAction;
-use ndn_engine::stages::ErasedStrategy;
-use ndn_engine::{ComposedStrategy, EngineBuilder, EngineConfig};
-use ndn_packet::Name;
-use ndn_strategy::{BestRouteStrategy, RssiFilter, StrategyContext, StrategyFilter};
-use ndn_transport::FaceId;
+use ndn::engine::ComposedStrategy;
+use ndn::engine::pipeline::ForwardingAction;
+use ndn::engine::stages::ErasedStrategy;
+use ndn::strategy::{BestRouteStrategy, RssiFilter, StrategyContext, StrategyFilter};
+use ndn::{EngineBuilder, EngineConfig, FaceId, Name};
 
 // ─── Custom filter: LatencyFilter ────────────────────────────────────────────
 

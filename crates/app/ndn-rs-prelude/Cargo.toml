@@ -47,6 +47,14 @@ ndn-security = { path = "../../security/ndn-security", default-features = false 
 # above passes it back through for apps that opt in.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 ndn-app = { path = "../ndn-app", default-features = false }
+# The rest of the application-facing stack, re-exported as `ndn::engine`,
+# `ndn::strategy`, `ndn::transport`, `ndn::face_local` so an app (and the
+# in-tree examples) needs only this one dependency. All are already in
+# ndn-app's own graph except ndn-face-local, which is tiny.
+ndn-engine     = { workspace = true }
+ndn-strategy   = { workspace = true }
+ndn-transport  = { workspace = true }
+ndn-face-local = { workspace = true }
 
 [lints]
 workspace = true

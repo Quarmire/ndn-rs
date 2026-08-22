@@ -6,10 +6,9 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
-ndn-packet    = { workspace = true, features = ["std"] }
-ndn-transport = { workspace = true }
-ndn-strategy  = { workspace = true }
-ndn-engine    = { workspace = true }
+# The one NDN dependency: the `ndn` umbrella (package `ndn-rs-prelude`)
+# covers the reach-in surface too — `use ndn::engine::ComposedStrategy;`.
+ndn-rs-prelude = { workspace = true }
 smallvec      = { workspace = true }
 tokio         = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tracing       = { workspace = true }

@@ -6,12 +6,9 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
-ndn-packet      = { workspace = true, features = ["std"] }
-ndn-security    = { workspace = true }
-ndn-transport   = { workspace = true }
-ndn-engine      = { workspace = true }
-ndn-face = { workspace = true }
-ndn-app         = { workspace = true }
+# The one NDN dependency: the `ndn` umbrella (package `ndn-rs-prelude`)
+# re-exports the whole application surface — `use ndn::{Consumer, KeyChain};`.
+ndn-rs-prelude  = { workspace = true }
 tokio           = { workspace = true, features = ["rt-multi-thread", "macros"] }
 anyhow          = { workspace = true }
 

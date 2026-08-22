@@ -9,10 +9,10 @@
 //! against a trust anchor it has pinned. That check is the whole point of NDN
 //! over IP — so this first example *does* it, rather than leaving it for later.
 //!
-//! The payoff type is [`SafeData`](ndn_security::SafeData): you can only obtain
+//! The payoff type is [`SafeData`](ndn::SafeData): you can only obtain
 //! one by verifying, so "did I check this?" is answered by the compiler, not by
 //! convention. The unverified surface ([`Consumer::fetch_unverified`]) hands back
-//! an [`Unverified<Data>`](ndn_security::Unverified) that forces an explicit
+//! an [`Unverified<Data>`](ndn::Unverified) that forces an explicit
 //! `.verify(...)` or a loud, greppable `.trust_unchecked()` — there is no silent
 //! path to a usable packet.
 //!
@@ -20,13 +20,10 @@
 //! is one file; talking to a standalone `ndn-fwd` is covered by the
 //! "Ten-minute producer" quickstart in the wiki.
 
-use ndn_app::{Consumer, EngineBuilder, Producer};
-use ndn_engine::EngineConfig;
-use ndn_face::local::InProcFace;
-use ndn_packet::Name;
-use ndn_packet::encode::DataBuilder;
-use ndn_security::{KeyChain, SignWith};
-use ndn_transport::FaceId;
+use ndn::face_local::InProcFace;
+use ndn::{
+    Consumer, DataBuilder, EngineBuilder, EngineConfig, FaceId, KeyChain, Name, Producer, SignWith,
+};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
