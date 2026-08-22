@@ -1,7 +1,6 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/core/ndn-env",
     "crates/core/ndn-foundation-types",
     "crates/core/ndn-tlv",
     "crates/core/ndn-packet",
@@ -17,8 +16,6 @@ members = [
     "crates/core/ndn-runtime",
     "crates/faces/ndn-face-local",
     "crates/faces/ndn-face",
-    "crates/core/ndn-frame-io",
-    "crates/core/ndn-radio-hal",
     "crates/forwarding/ndn-strategy",
     "crates/forwarding/ndn-pathcontrol",
     "crates/security/ndn-security",
@@ -44,7 +41,6 @@ members = [
 # the examples/* binaries. Examples stay in `members` so `--workspace`
 # (CI) still compiles them.
 default-members = [
-    "crates/core/ndn-env",
     "crates/core/ndn-foundation-types",
     "crates/core/ndn-tlv",
     "crates/core/ndn-packet",
@@ -60,8 +56,6 @@ default-members = [
     "crates/core/ndn-runtime",
     "crates/faces/ndn-face-local",
     "crates/faces/ndn-face",
-    "crates/core/ndn-frame-io",
-    "crates/core/ndn-radio-hal",
     "crates/forwarding/ndn-strategy",
     "crates/forwarding/ndn-pathcontrol",
     "crates/security/ndn-security",
@@ -94,8 +88,9 @@ license = "MIT OR Apache-2.0"
 # so "warn" here means "error at the gate, advisory while hacking".
 [workspace.lints.rust]
 # The protocol/forwarding core is unsafe-free by policy. Only the OS-I/O
-# leaf crates (ndn-face, ndn-frame-io) opt back in, with scoped allows at
-# the module or function that owns the raw-socket/FFI boundary.
+# leaf crate (ndn-face) opts back in, with scoped allows at the module or
+# function that owns the raw-socket/FFI boundary. (ndn-frame-io moved to
+# ndn-radio-drivers in P2/D5 and carries the same policy there.)
 unsafe_code = "deny"
 
 [workspace.lints.clippy]
@@ -123,8 +118,6 @@ ndn-store     = { path = "crates/forwarding/ndn-store" }
 ndn-runtime   = { path = "crates/core/ndn-runtime" }
 ndn-face-local        = { path = "crates/faces/ndn-face-local" }
 ndn-face             = { path = "crates/faces/ndn-face" }
-ndn-frame-io          = { path = "crates/core/ndn-frame-io" }
-ndn-radio-hal         = { path = "crates/core/ndn-radio-hal" }
 ndn-strategy  = { path = "crates/forwarding/ndn-strategy" }
 ndn-pathcontrol = { path = "crates/forwarding/ndn-pathcontrol" }
 ndn-security  = { path = "crates/security/ndn-security" }

@@ -114,20 +114,14 @@ jobs:
           shared-key: fuzz
           workspaces: |
             crates/core/ndn-packet/fuzz
-            crates/core/ndn-frame-io/fuzz
       # 5 minutes per target from the committed seed corpus. A crash fails
-      # the job and uploads the reproducer as an artifact.
+      # the job and uploads the reproducer as an artifact. (The radiotap/dot11
+      # on-air parser targets moved to ndn-radio-drivers with ndn-frame-io in
+      # P2/D5.)
       - name: fuzz decode / name / tlv / mgmt_wire
         working-directory: crates/core/ndn-packet
         run: |
           for t in decode name tlv mgmt_wire; do
-            cargo +nightly fuzz run "$t" "fuzz/seeds/$t" -- -max_total_time=300
-          done
-      # The L2/radio-frame on-air parsers: radiotap RX header + per-format 802.11.
-      - name: fuzz radiotap / dot11
-        working-directory: crates/core/ndn-frame-io
-        run: |
-          for t in radiotap dot11; do
             cargo +nightly fuzz run "$t" "fuzz/seeds/$t" -- -max_total_time=300
           done
       - name: Upload crash reproducers
@@ -137,4 +131,3 @@ jobs:
           name: fuzz-artifacts
           path: |
             crates/core/ndn-packet/fuzz/artifacts
-            crates/core/ndn-frame-io/fuzz/artifacts
