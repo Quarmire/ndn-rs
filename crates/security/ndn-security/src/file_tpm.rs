@@ -257,7 +257,7 @@ impl FileTpm {
         }
     }
 
-    /// Export `key_name` as a [`crate::safe_bag::SafeBag`] bundled with
+    /// Export `key_name` as a [`crate::safebag::SafeBag`] bundled with
     /// `certificate`. The on-disk key is converted to PKCS#8 then
     /// encrypted via PBES2 + PBKDF2-HMAC-SHA256 + AES-256-CBC; the
     /// resulting `EncryptedPrivateKeyInfo` is wire-compatible with
@@ -271,32 +271,32 @@ impl FileTpm {
         key_name: &Name,
         certificate: Bytes,
         password: &[u8],
-    ) -> Result<crate::safe_bag::SafeBag, crate::safe_bag::SafeBagError> {
+    ) -> Result<crate::safebag::SafeBag, crate::safebag::SafeBagError> {
         let (kind, der) = self.load_raw(key_name)?;
         let pkcs8_der: Vec<u8> = match kind {
-            TpmKeyKind::Rsa => crate::safe_bag::rsa_pkcs1_to_pkcs8(&der)?,
-            TpmKeyKind::EcdsaP256 => crate::safe_bag::ec_sec1_to_pkcs8(&der)?,
+            TpmKeyKind::Rsa => crate::safebag::rsa_pkcs1_to_pkcs8(&der)?,
+            TpmKeyKind::EcdsaP256 => crate::safebag::ec_sec1_to_pkcs8(&der)?,
             TpmKeyKind::Ed25519 => der,
         };
-        crate::safe_bag::SafeBag::encrypt(certificate, &pkcs8_der, password)
+        crate::safebag::SafeBag::encrypt(certificate, &pkcs8_der, password)
     }
 
-    /// Import a [`crate::safe_bag::SafeBag`] as a stored private key
+    /// Import a [`crate::safebag::SafeBag`] as a stored private key
     /// under `key_name`. Decrypts the `EncryptedPrivateKeyInfo` with
     /// `password`, dispatches on the PKCS#8 algorithm OID, converts to
     /// the FileTpm on-disk form, and writes it. Returns the cert Data
     /// wire bytes; persisting the cert is the PIB's responsibility.
     pub fn import_from_safebag(
         &self,
-        safebag: &crate::safe_bag::SafeBag,
+        safebag: &crate::safebag::SafeBag,
         key_name: &Name,
         password: &[u8],
-    ) -> Result<Bytes, crate::safe_bag::SafeBagError> {
+    ) -> Result<Bytes, crate::safebag::SafeBagError> {
         let pkcs8_der = safebag.decrypt_key(password)?;
-        let kind = crate::safe_bag::detect_pkcs8_algorithm(&pkcs8_der)?;
+        let kind = crate::safebag::detect_pkcs8_algorithm(&pkcs8_der)?;
         let on_disk: Vec<u8> = match kind {
-            TpmKeyKind::Rsa => crate::safe_bag::rsa_pkcs8_to_pkcs1(&pkcs8_der)?,
-            TpmKeyKind::EcdsaP256 => crate::safe_bag::ec_pkcs8_to_sec1(&pkcs8_der)?,
+            TpmKeyKind::Rsa => crate::safebag::rsa_pkcs8_to_pkcs1(&pkcs8_der)?,
+            TpmKeyKind::EcdsaP256 => crate::safebag::ec_pkcs8_to_sec1(&pkcs8_der)?,
             TpmKeyKind::Ed25519 => pkcs8_der,
         };
         self.save_raw(key_name, kind, &on_disk)?;
@@ -691,7 +691,7 @@ mod tests {
 
         let sb = tpm_a.export_to_safebag(&kn, fake_cert_bytes(), pw).unwrap();
         let wire = sb.encode();
-        let sb2 = crate::safe_bag::SafeBag::decode(&wire).unwrap();
+        let sb2 = crate::safebag::SafeBag::decode(&wire).unwrap();
         let cert_back = tpm_b.import_from_safebag(&sb2, &kn, pw).unwrap();
         assert_eq!(cert_back, fake_cert_bytes());
 
@@ -722,7 +722,7 @@ mod tests {
         // Export → wire → decode → import.
         let sb = tpm_a.export_to_safebag(&kn, fake_cert_bytes(), pw).unwrap();
         let wire = sb.encode();
-        let sb2 = crate::safe_bag::SafeBag::decode(&wire).unwrap();
+        let sb2 = crate::safebag::SafeBag::decode(&wire).unwrap();
         tpm_b.import_from_safebag(&sb2, &kn, pw).unwrap();
 
         // ECDSA is non-deterministic so signatures won't byte-match;
@@ -764,7 +764,7 @@ mod tests {
 
         let sb = tpm_a.export_to_safebag(&kn, fake_cert_bytes(), pw).unwrap();
         let wire = sb.encode();
-        let sb2 = crate::safe_bag::SafeBag::decode(&wire).unwrap();
+        let sb2 = crate::safebag::SafeBag::decode(&wire).unwrap();
         tpm_b.import_from_safebag(&sb2, &kn, pw).unwrap();
 
         // RSA PKCS#1 v1.5 signing is deterministic — the imported key
@@ -792,7 +792,7 @@ mod tests {
             .unwrap();
 
         match tpm_b.import_from_safebag(&sb, &kn, b"wrong") {
-            Err(crate::safe_bag::SafeBagError::Pkcs8(_)) => {}
+            Err(crate::safebag::SafeBagError::Pkcs8(_)) => {}
             other => panic!("expected Pkcs8 decrypt error, got {other:?}"),
         }
     }

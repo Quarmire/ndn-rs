@@ -36,7 +36,12 @@ pub mod manager;
 pub mod pib;
 pub mod profile;
 pub mod replay_guard;
-pub mod safe_bag;
+/// Deprecated alias of [`safebag`] — the duplicate SafeBag codecs were
+/// merged (P2). New code should import from [`safebag`]; this alias only
+/// keeps existing `ndn_security::safe_bag::*` paths compiling.
+pub mod safe_bag {
+    pub use crate::safebag::*;
+}
 pub mod safe_data;
 pub mod safebag;
 pub mod sign_ext;
