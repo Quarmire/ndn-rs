@@ -1,0 +1,17 @@
+[package]
+name = "example-hello-node"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+# The one NDN dependency: the `ndn` umbrella (package `ndn-rs-prelude`).
+ndn-rs-prelude = { workspace = true }
+tokio          = { workspace = true, features = ["rt-multi-thread", "macros"] }
+# CancellationToken ties the in-process app faces to the engine's lifetime.
+tokio-util     = { workspace = true }
+anyhow         = { workspace = true }
+
+[lints]
+workspace = true

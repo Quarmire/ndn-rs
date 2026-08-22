@@ -31,6 +31,7 @@ members = [
     "crates/security/ndn-identity",
     "crates/forwarding/ndn-mgmt",
     "crates/platform/ndn-observability",
+    "examples/hello-node",
     "examples/secure-fetch",
     "examples/strategy-custom",
     "examples/strategy-composed",
