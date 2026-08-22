@@ -13,9 +13,15 @@ and `ndn-security` from the `ndn-rs-prelude` crate (library name
 > are the building blocks `Node` delegates to, reachable via `node.connection()`
 > when you need them.
 
-Package vs library: `Cargo.toml` carries `ndn-rs-prelude = "0.1"`;
-imports read `use ndn::Consumer;`. The split is recorded in
-`crates/app/ndn-rs-prelude/Cargo.toml`.
+Package vs library: the package is not on crates.io; `Cargo.toml` carries
+
+```toml
+ndn = { package = "ndn-rs-prelude", git = "https://github.com/Quarmire/ndn-rs", tag = "v0.1.0-alpha.3" }
+```
+
+(or a `path` dependency on `../ndn-rs/crates/app/ndn-rs-prelude` inside the
+ndn-workspace checkout) and imports read `use ndn::Consumer;`. The split is
+recorded in `crates/app/ndn-rs-prelude/Cargo.toml`.
 
 ## Inventory
 

@@ -1,11 +1,17 @@
 # Config reference
 
-`ndn-fwd.toml` configures the forwarder. The shipped example is
-`examples/ndn-fwd.example.toml` — every option with
-its default in a comment.
+> **STALE (2026-08-21).** This page predates the forwarder's move to the
+> sibling repo [ndn-fwd](https://github.com/Quarmire/ndn-fwd) and the
+> newer config subsystems (fec, rate limits, radio, listeners,
+> `[extensions.*]`). The current truth is the annotated default config
+> shipped with the forwarder — `binaries/ndn-fwd/ndn-fwd.default.toml`
+> in the ndn-fwd repo — read its comments first, and treat any conflict
+> with this page as this page being wrong. The schema itself lives in
+> `crates/platform/ndn-config` (ndn-rs).
 
-This page lists the option groups; consult `examples/ndn-fwd.example.toml`
-for the full set with defaults.
+`ndn-fwd.toml` configures the forwarder. Options below are the older core
+groups; consult `ndn-fwd/binaries/ndn-fwd/ndn-fwd.default.toml` for the
+current set with defaults.
 
 ## File location
 
@@ -136,8 +142,8 @@ Per project memory `project_dashboard_multi_forwarder`.
 
 ## See also
 
-- `examples/ndn-fwd.example.toml` — the source of truth; every key with
-  defaults and inline comments.
+- `ndn-fwd/binaries/ndn-fwd/ndn-fwd.default.toml` (sibling repo ndn-fwd) —
+  the source of truth; annotated defaults with inline comments.
 - [ndn-fwd](./ndn-fwd.md) — operator workflows.
 - [Face transports](../reference/face-transports.md) — per-face
   configuration shapes.
