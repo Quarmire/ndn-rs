@@ -195,6 +195,11 @@ jobs:
       # so build the book and validate internal links offline with lychee instead.
       # --offline skips external URLs (the nightly lane checks those); --root-dir
       # resolves the theme's root-relative links (e.g. the 404 page's home link).
+      # Every `crates/...` path a wiki page mentions must exist in this repo
+      # (sibling-repo references must be written repo-prefixed, e.g.
+      # `ndn-ext/crates/faces/...`, which the checker exempts).
+      - name: Check wiki crate-path references
+        run: python3 tools/check_wiki_paths.py
       - name: Build wiki
         run: mdbook build docs/wiki
       - name: Check internal links (lychee, offline)
