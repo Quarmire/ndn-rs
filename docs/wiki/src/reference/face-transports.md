@@ -9,25 +9,25 @@ for writing a new transport see [Implementing a face](../guides/implementing-a-f
 
 | Kind | Crate | `[[face]] kind` | Typical use |
 |---|---|---|---|
-| UDP | `crates/ndn-face/src/net/udp.rs` | `udp` | NDN-over-UDP across hosts. |
-| TCP | `crates/ndn-face/src/net/tcp.rs` | `tcp` | NDN-over-TCP across hosts (firewall-friendlier). |
-| Multicast UDP | `crates/ndn-face/src/net/multicast.rs` | `multicast` | Link-local neighbour discovery (group `224.0.23.170`); auto-created per interface via `[face_system.udp] auto_multicast`. |
-| Unix socket | `crates/ndn-face/src/local/unix.rs` | `unix` | App-to-forwarder IPC. |
-| In-process | `crates/ndn-face/src/local/in_proc.rs` | (programmatic) | Embedded engine, tests. |
-| Shared memory | `crates/ndn-face-shm/src/spsc.rs` | `shm` | High-throughput per-host IPC (feature `spsc-shm`). |
-| Ethernet unicast | `crates/ndn-face/src/l2/ether.rs` | `ether` (TOML) or `faces/create ether://[<mac>]/<iface>` | Point-to-point link to a known peer MAC. EtherType `0x8624`; requires `CAP_NET_RAW`/root. |
-| Ethernet multicast | `crates/ndn-face/src/l2/multicast_ether.rs` | `ether-multicast` | Group `01:00:5e:00:17:aa`; auto-created per interface via `[face_system.ether] auto_multicast` (Linux). |
-| 802.11 monitor-mode | `crates/ndn-face-monitor-wifi/` | `wfb` | Connectionless raw 802.11 injection (named-radio): `MonitorWifiFace` over a `FrameIo` backend (`ndn-frame-io`). |
-| Bluetooth LE — central | `crates/ndn-face-bluetooth/src/central/` | `ble://<name-or-addr>` (via `faces/create`) | Dial a peripheral as GATT client (Linux/macOS/Windows). |
-| Bluetooth LE — peripheral | `crates/ndn-face-bluetooth/src/lib.rs` | `[listeners.ble]` | GATT server; advertises the NDN service (Linux/macOS). |
-| Serial (UART) | `crates/ndn-face-serial/src/lib.rs` | `serial` | Embedded / microcontroller. |
-| WebSocket | `crates/ndn-face-websocket/` | `ws` | Browser-to-forwarder over WebSocket. |
-| WebTransport | `crates/ndn-face-webtransport/`; wasm: `crates/ndn-face-webtransport-wasm/` | `[listeners.webtransport]`; dial via `[[face]] kind = "web-transport"` or `faces/create wts://…` | Browser↔forwarder and forwarder↔forwarder (NAT-traversing) over QUIC datagrams; oversized packets are NDNLPv2-fragmented to `maxDatagramSize` (interoperates with NDNts `H3Transport`). |
-| QUIC | `crates/ndn-face-quic/` | `[listeners.quic]`; dial via `[[face]] kind = "quic"` or `faces/create quic://…` | Forwarder-to-forwarder backbone over raw QUIC (TLS 1.3, **connection migration**, 0-RTT); one reliable bidi stream of NDN TLV. No HTTP/3 layer (does not reach browsers). |
-| WebRTC datachannel | `crates/ndn-face-webrtc/` | `webrtc` | Browser ↔ browser, browser ↔ relay. |
-| SharedWorker | `crates/ndn-face-shared-worker/` | (programmatic) | Per-origin engine sharing across tabs. |
-| Callback / Tap | `crates/ndn-face/src/callback.rs` | (Instrument tier) | Researcher: virtual face whose send-path is a closure. |
-| BoltFFI | `crates/ndn-boltffi/` | (programmatic) | FFI bridge for non-Rust hosts. |
+| UDP | `crates/faces/ndn-face/src/net/udp.rs` | `udp` | NDN-over-UDP across hosts. |
+| TCP | `crates/faces/ndn-face/src/net/tcp.rs` | `tcp` | NDN-over-TCP across hosts (firewall-friendlier). |
+| Multicast UDP | `crates/faces/ndn-face/src/net/multicast.rs` | `multicast` | Link-local neighbour discovery (group `224.0.23.170`); auto-created per interface via `[face_system.udp] auto_multicast`. |
+| Unix socket | `crates/faces/ndn-face/src/local/unix.rs` | `unix` | App-to-forwarder IPC. |
+| In-process | `crates/faces/ndn-face-local/src/lib.rs` | (programmatic) | Embedded engine, tests. |
+| Shared memory | `ndn-ext/crates/faces/ndn-face-shm/src/spsc.rs` | `shm` | High-throughput per-host IPC (feature `spsc-shm`). |
+| Ethernet unicast | `crates/faces/ndn-face/src/l2/ether.rs` | `ether` (TOML) or `faces/create ether://[<mac>]/<iface>` | Point-to-point link to a known peer MAC. EtherType `0x8624`; requires `CAP_NET_RAW`/root. |
+| Ethernet multicast | `crates/faces/ndn-face/src/l2/multicast_ether.rs` | `ether-multicast` | Group `01:00:5e:00:17:aa`; auto-created per interface via `[face_system.ether] auto_multicast` (Linux). |
+| 802.11 monitor-mode | `ndn-ext/crates/faces/ndn-face-monitor-wifi/` | `wfb` | Connectionless raw 802.11 injection (named-radio): `MonitorWifiFace` over a `FrameIo` backend (`ndn-frame-io`). |
+| Bluetooth LE — central | `ndn-ext/crates/faces/ndn-face-bluetooth/src/central/` | `ble://<name-or-addr>` (via `faces/create`) | Dial a peripheral as GATT client (Linux/macOS/Windows). |
+| Bluetooth LE — peripheral | `ndn-ext/crates/faces/ndn-face-bluetooth/src/lib.rs` | `[listeners.ble]` | GATT server; advertises the NDN service (Linux/macOS). |
+| Serial (UART) | `ndn-ext/crates/faces/ndn-face-serial/src/lib.rs` | `serial` | Embedded / microcontroller. |
+| WebSocket | `ndn-ext/crates/faces/ndn-face-websocket/` | `ws` | Browser-to-forwarder over WebSocket. |
+| WebTransport | `ndn-ext/crates/faces/ndn-face-webtransport/`; wasm: `ndn-ext/crates/faces/ndn-face-webtransport-wasm/` | `[listeners.webtransport]`; dial via `[[face]] kind = "web-transport"` or `faces/create wts://…` | Browser↔forwarder and forwarder↔forwarder (NAT-traversing) over QUIC datagrams; oversized packets are NDNLPv2-fragmented to `maxDatagramSize` (interoperates with NDNts `H3Transport`). |
+| QUIC | `ndn-ext/crates/faces/ndn-face-quic/` | `[listeners.quic]`; dial via `[[face]] kind = "quic"` or `faces/create quic://…` | Forwarder-to-forwarder backbone over raw QUIC (TLS 1.3, **connection migration**, 0-RTT); one reliable bidi stream of NDN TLV. No HTTP/3 layer (does not reach browsers). |
+| WebRTC datachannel | `ndn-ext/crates/faces/ndn-face-webrtc/` | `webrtc` | Browser ↔ browser, browser ↔ relay. |
+| SharedWorker | `ndn-ext/crates/faces/ndn-face-shared-worker/` | (programmatic) | Per-origin engine sharing across tabs. |
+| Callback / Tap | `crates/faces/ndn-face/src/callback.rs` | (Instrument tier) | Researcher: virtual face whose send-path is a closure. |
+| BoltFFI | `ndn-mobile/crates/ndn-boltffi/` | (programmatic) | FFI bridge for non-Rust hosts. |
 
 ## Configuration shape
 
@@ -124,7 +124,7 @@ Some faces are constructed by application code rather than by listener config:
   [Develop tier → embedded engine](../api/develop.md#embedded-engine).
 - `CallbackFace` / `TapFace` — Instrument tier. See
   [Instrument tier](../api/instrument.md).
-- SharedWorker face — `crates/ndn-face-shared-worker/`.
+- SharedWorker face — `ndn-ext/crates/faces/ndn-face-shared-worker/`.
   Mounted via the dashboard's browser-engine profile.
 
 ## Connectionless named-radio faces — *extension*
@@ -139,9 +139,9 @@ only addressing). Each is `link_type() == AdHoc` with a small MTU, so the
 
 | Face | Crate | Radio primitive | Notes |
 | --- | --- | --- | --- |
-| Wi-Fi Aware (NAN) | `crates/ndn-face-wifi-aware/` | NAN follow-up messages (255 B) | AP-less peer Wi-Fi; service pub/sub discovery; bulk over NDP (`request_ndp` → `UdpFace`). |
-| BLE advertising | `crates/ndn-face-ble-adv/` | BLE 5 extended advertisement (~245 B) | Near-universal; pairless broadcast; presence + small Interest/Data (bulk wants a connection face). |
-| 802.11 monitor | `crates/ndn-face-monitor-wifi/` | raw-injected 802.11 frames | Per-frame MCS, no association/ARQ. |
+| Wi-Fi Aware (NAN) | `ndn-ext/crates/faces/ndn-face-wifi-aware/` | NAN follow-up messages (255 B) | AP-less peer Wi-Fi; service pub/sub discovery; bulk over NDP (`request_ndp` → `UdpFace`). |
+| BLE advertising | `ndn-ext/crates/faces/ndn-face-ble-adv/` | BLE 5 extended advertisement (~245 B) | Near-universal; pairless broadcast; presence + small Interest/Data (bulk wants a connection face). |
+| 802.11 monitor | `ndn-ext/crates/faces/ndn-face-monitor-wifi/` | raw-injected 802.11 frames | Per-frame MCS, no association/ARQ. |
 
 The physical radio sits behind a **backend trait** (`NanBackend`, `AdvBackend`)
 with a hardware-free `Loopback*Bus` for tests, so the face is exercised without
@@ -195,7 +195,7 @@ same NAN standard behind `NanBackend`).
 The default `LinkService` is `LpLinkService` (NDNLPv2 framing); the
 high-throughput exceptions use `PassthroughLinkService` — `InProcFace` always,
 and `ShmFace` by default (switch it to `LpLinkService` for cross-host wire
-compatibility). See `crates/ndn-transport/src/link_service.rs` for the trait.
+compatibility). See `crates/core/ndn-transport/src/link_service/` for the trait.
 
 ## Per-face NDNLPv2 local fields
 
@@ -236,4 +236,4 @@ own faces.
   guide.
 - [Config reference](../operations/config-reference.md) — every
   `[[face]]` listener key.
-- `crates/ndn-transport/` — the trait surface.
+- `crates/core/ndn-transport/` — the trait surface.

@@ -42,7 +42,7 @@ graph LR
 
 ## Writing the transport
 
-`Transport` is defined in `crates/ndn-transport/src/transport.rs`.
+`Transport` is defined in `crates/core/ndn-transport/src/transport.rs`.
 Send and receive return `impl Future` (write them as `async fn`);
 the trait is **not** `#[async_trait]`. Both `send_bytes` and
 `recv_bytes` take `&self` — `send_bytes` may be called concurrently
@@ -112,7 +112,7 @@ it; `Face::new` lets you choose explicitly.
 ## Assembling the face
 
 `Face::new(transport: Arc<dyn ErasedTransport>, link_service: Arc<dyn
-LinkService>)` (`crates/ndn-transport/src/face.rs:367`) composes the
+LinkService>)` (`crates/core/ndn-transport/src/face.rs:367`) composes the
 two halves. `ErasedTransport` is the object-safe view of `Transport`,
 auto-implemented for every `Transport`, so any concrete transport
 becomes `Arc<dyn ErasedTransport>` just by wrapping it in `Arc`:
@@ -144,7 +144,7 @@ engine accepts a bare `Transport` and composes the `Face` for you:
 
 For a listening transport, run an accept loop and call `add_face` per
 connection. `IpcListener` in
-`crates/ndn-face/src/local/ipc.rs` is the in-tree pattern: its
+`crates/faces/ndn-face/src/local/ipc.rs` is the in-tree pattern: its
 `accept(face_id)` returns one face per connection, which the owning
 task then wires in.
 
@@ -177,23 +177,23 @@ method there if the face is meant to run in-browser.
 
 | Face | Crate | Transport shape |
 |---|---|---|
-| UDP | `crates/ndn-face/src/net/udp.rs` | UDP socket per peer. |
-| TCP | `crates/ndn-face/src/net/tcp.rs` | TCP connection. |
-| IPC | `crates/ndn-face/src/local/ipc.rs` | Unix socket / named pipe. |
-| InProc | `crates/ndn-face/src/local/in_proc.rs` | In-process channel. |
-| Shm | `crates/ndn-face-shm/src/spsc.rs` | Shared-memory ring (spsc-shm). |
-| Ether | `crates/ndn-face/src/l2/ether.rs` | Raw Ethernet. |
-| Bluetooth | `crates/ndn-face-bluetooth/src/lib.rs` | BLE L2CAP. |
-| Serial | `crates/ndn-face-serial/src/lib.rs` | UART. |
-| WebTransport | `crates/ndn-face-webtransport*` | QUIC datagrams. |
-| WebRTC | `crates/ndn-face-webrtc/` | Datachannel. |
-| SharedWorker | `crates/ndn-face-shared-worker/` | Per-origin engine sharing. |
-| BoltFFI | `crates/ndn-boltffi/` | FFI bridge. |
+| UDP | `crates/faces/ndn-face/src/net/udp.rs` | UDP socket per peer. |
+| TCP | `crates/faces/ndn-face/src/net/tcp.rs` | TCP connection. |
+| IPC | `crates/faces/ndn-face/src/local/ipc.rs` | Unix socket / named pipe. |
+| InProc | `crates/faces/ndn-face-local/src/lib.rs` | In-process channel. |
+| Shm | `ndn-ext/crates/faces/ndn-face-shm/src/spsc.rs` | Shared-memory ring (spsc-shm). |
+| Ether | `crates/faces/ndn-face/src/l2/ether.rs` | Raw Ethernet. |
+| Bluetooth | `ndn-ext/crates/faces/ndn-face-bluetooth/src/lib.rs` | BLE L2CAP. |
+| Serial | `ndn-ext/crates/faces/ndn-face-serial/src/lib.rs` | UART. |
+| WebTransport | `ndn-ext/crates/faces/ndn-face-webtransport*` | QUIC datagrams. |
+| WebRTC | `ndn-ext/crates/faces/ndn-face-webrtc/` | Datachannel. |
+| SharedWorker | `ndn-ext/crates/faces/ndn-face-shared-worker/` | Per-origin engine sharing. |
+| BoltFFI | `ndn-mobile/crates/ndn-boltffi/` | FFI bridge. |
 
 ## See also
 
 - [Extend tier → Face](../api/extend.md#face) — trait inventory.
 - [Face transports](../reference/face-transports.md) — catalog with
   feature flags and use cases.
-- `crates/ndn-transport/` — `Transport`, `LinkService`, and
+- `crates/core/ndn-transport/` — `Transport`, `LinkService`, and
   `Face` definitions.

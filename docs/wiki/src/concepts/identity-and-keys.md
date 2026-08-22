@@ -22,7 +22,7 @@ let keychain = KeyChain::open_or_create("/var/lib/ndn/pib".as_ref(), "/com/examp
 
 The opened keychain knows its identity, its signing key, and any
 trust anchors that have been added. `KeyChain` lives at
-`crates/ndn-security/src/keychain.rs`; the Develop tier re-exports it
+`crates/security/ndn-security/src/keychain.rs`; the Develop tier re-exports it
 as `ndn::KeyChain`.
 
 ## Identities
@@ -188,5 +188,5 @@ design you cannot silently make an unrecoverable identity.
   catalog with rule shapes.
 - [Develop tier → KeyChain](../api/develop.md#keychain) — full API
   surface.
-- `crates/ndn-security/` — implementation; the trait surfaces
+- `crates/security/ndn-security/` — implementation; the trait surfaces
   are in `trust.rs`, `validation_policy.rs`, `keychain.rs`.

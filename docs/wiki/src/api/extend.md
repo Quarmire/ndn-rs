@@ -21,17 +21,17 @@ graph TB
 
 | Trait | Crate path | Purpose |
 |---|---|---|
-| `Strategy` + `StrategyContext` + `ScheduledEvent` | `ndn_strategy::strategy` (`crates/ndn-strategy/src/strategy.rs:56`) | Forwarding-strategy contract; returns `ForwardingAction`s, `schedule()` for timers. |
+| `Strategy` + `StrategyContext` + `ScheduledEvent` | `ndn_strategy::strategy` (`crates/forwarding/ndn-strategy/src/strategy.rs:56`) | Forwarding-strategy contract; returns `ForwardingAction`s, `schedule()` for timers. |
 | `register_strategy!` macro | `ndn_strategy::registry` | `linkme`-backed registry; strategies auto-register. |
-| `RoutingProtocol` + `RoutingHandle` | `ndn_engine::routing` (`crates/ndn-engine/src/routing.rs`) | Pluggable routing-plane; produces a typed `RoutingProtocolStatus`. |
-| `InstallableProtocol` + `PostBuildQueue` | `ndn_engine::installable` (`crates/ndn-engine/src/installable.rs`) | "Install yourself into an `EngineBuilder`" trait. |
-| `Transport` | `ndn_transport::transport` (`crates/ndn-transport/src/transport.rs`) | Raw byte send/recv. |
+| `RoutingProtocol` + `RoutingHandle` | `ndn_engine::routing` (`crates/forwarding/ndn-engine/src/routing.rs`) | Pluggable routing-plane; produces a typed `RoutingProtocolStatus`. |
+| `InstallableProtocol` + `PostBuildQueue` | `ndn_engine::installable` (`crates/forwarding/ndn-engine/src/installable.rs`) | "Install yourself into an `EngineBuilder`" trait. |
+| `Transport` | `ndn_transport::transport` (`crates/core/ndn-transport/src/transport.rs`) | Raw byte send/recv. |
 | `LinkService` + `LinkServiceFrame` | `ndn_transport::link_service` | NDNLPv2 framing, IncomingFaceId, congestion-mark policy. |
-| `Face` = `Transport` + `LinkService` | `ndn_transport::face` (`crates/ndn-transport/src/face.rs:298`) | The composition the engine sees. |
-| `DiscoveryProtocol` (+ contexts) | `ndn_discovery_core` (`crates/ndn-discovery-core/src/`) | Neighbor discovery contract. |
-| `MgmtModule` + `MgmtContext` + `MgmtRouter` | `ndn_mgmt::module` (`crates/ndn-mgmt/src/module.rs`) | Per-module management verb authorship. |
+| `Face` = `Transport` + `LinkService` | `ndn_transport::face` (`crates/core/ndn-transport/src/face.rs:298`) | The composition the engine sees. |
+| `DiscoveryProtocol` (+ contexts) | `ndn_discovery_core` (`crates/forwarding/ndn-discovery-core/src/`) | Neighbor discovery contract. |
+| `MgmtModule` + `MgmtContext` + `MgmtRouter` | `ndn_mgmt::module` (`crates/forwarding/ndn-mgmt/src/module.rs`) | Per-module management verb authorship. |
 | `NotificationStream` | `ndn_mgmt::notification` | Async notification dataset publisher. |
-| `TrustPolicy` | `ndn_security::trust` (`crates/ndn-security/src/trust.rs`) | "Should this signing key be trusted for this name?" |
+| `TrustPolicy` | `ndn_security::trust` (`crates/security/ndn-security/src/trust.rs`) | "Should this signing key be trusted for this name?" |
 | `ValidationPolicy` | `ndn_security::validation_policy` | Pluggable verdict chain. |
 | `Signer` / `Verifier` | `ndn_security::{signer, verifier}` | Crypto primitives. |
 
@@ -41,7 +41,7 @@ graph TB
 A `Strategy` is a pure decision function: each hook reads an immutable
 `StrategyContext` and *returns* `ForwardingAction` values for the engine
 to execute. It never sends packets or mutates tables itself. The
-contract lives at `crates/ndn-strategy/src/strategy.rs:56`.
+contract lives at `crates/forwarding/ndn-strategy/src/strategy.rs:56`.
 
 ```rust,ignore
 use std::sync::Arc;
@@ -89,8 +89,8 @@ collects entries at link time via `linkme` on native targets; the engine
 reads the slice at startup. `EngineBuilder::strategy(...)` installs one
 directly. Full walkthrough: [Writing a strategy](../guides/writing-a-strategy.md).
 
-In-tree references: `crates/ndn-strategy/src/best_route.rs`,
-`crates/ndn-strategy/src/multicast.rs`, and
+In-tree references: `crates/forwarding/ndn-strategy/src/best_route.rs`,
+`crates/forwarding/ndn-strategy/src/multicast.rs`, and
 [`examples/strategy-custom/`](https://github.com/Quarmire/ndn-rs/tree/main/examples/strategy-custom).
 
 ## RoutingProtocol {#routingprotocol}
@@ -99,14 +99,15 @@ A `RoutingProtocol` produces FIB updates. It also reports a typed
 `RoutingProtocolStatus` so the management plane can describe state
 without parsing free-form strings.
 
-In-tree references: `crates/ndn-routing/src/protocols/static.rs`
+References (in the sibling repo ndn-ext):
+`ndn-ext/crates/routing/ndn-routing/src/protocols/static.rs`
 (static FIB), `…/nlsr/protocol.rs` (link-state),
 `…/dv/...` (distance vector). The DV implementation uses the
 typed status codes 201/202/204/206/208/210/301.
 
 To install a routing protocol into an engine, implement
 `InstallableProtocol`. `EngineBuilder::install(protocol)` then wires
-it through. See `crates/ndn-engine/src/installable.rs`.
+it through. See `crates/forwarding/ndn-engine/src/installable.rs`.
 
 ## Face {#face}
 
@@ -130,7 +131,8 @@ Twelve face transports ship in-tree; the catalog is in
 [Face transports](../reference/face-transports.md). To add a new
 transport, implement `Transport` and pick a link service.
 
-In-tree references: `crates/ndn-face/src/{net,local,l2,serial}/`.
+In-tree references: `crates/faces/ndn-face/src/{net,local,l2}/`. (The serial
+face moved to the sibling repo ndn-ext: `ndn-ext/crates/faces/ndn-face-serial/`.)
 
 ## DiscoveryProtocol
 
@@ -138,9 +140,9 @@ A `DiscoveryProtocol` brings neighbors to the routing plane. It owns
 discovery state, exposes a `NeighborContext`, and may react to face
 up/down via `FaceLifecycleContext`.
 
-In-tree references: `crates/ndn-discovery-core/src/no_discovery.rs`
-(zero-discovery default), the autoconf path in
-`crates/ndn-discovery/src/`.
+In-tree reference: `crates/forwarding/ndn-discovery-core/src/no_discovery.rs`
+(zero-discovery default). The autoconf path lives in the sibling repo
+ndn-ext: `ndn-ext/crates/discovery/ndn-discovery/src/`.
 
 ## MgmtModule
 
@@ -182,7 +184,7 @@ impl MgmtModule for MyModule {
 wraps it. Register the module with `MgmtRouter::register(Arc::new(MyModule))`.
 
 In-tree references: each verb has its own module file at
-`crates/ndn-mgmt/src/modules/{faces,fib,rib,strategy,cs,forwarder_status,routing}.rs`.
+`crates/forwarding/ndn-mgmt/src/modules/{faces,fib,rib,strategy,cs,forwarder_status,routing}.rs`.
 The verb catalog itself is in [Management verbs](../reference/mgmt-verbs.md).
 
 ## Trust and validation
@@ -193,8 +195,8 @@ before accepting a verified `Data`. `ValidationPolicy` chains
 verdicts so a deployment can compose hierarchical + LVS + custom
 overrides.
 
-In-tree references: `crates/ndn-security/src/trust.rs`,
-`crates/ndn-security/src/validation_policy.rs`.
+In-tree references: `crates/security/ndn-security/src/trust.rs`,
+`crates/security/ndn-security/src/validation_policy.rs`.
 Concrete policies and the LVS rule schema: [Trust policies](../reference/trust-policies.md).
 
 ## Conventions

@@ -5,7 +5,8 @@ Data instead of stored Data. A named function runs at the node, and its
 result is injected back into the pipeline — so it caches in the Content
 Store and aggregates in the PIT exactly like fetched content.
 
-The API lives in `ndn-compute` (`crates/ndn-compute`). It is
+The API lives in `ndn-compute`, in the sibling repo ndn-ext
+(`ndn-ext/crates/compute/ndn-compute`). It is
 layered: reach for a richer entry point only when you need it.
 
 | Tier | Entry point | Use |

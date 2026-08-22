@@ -2,7 +2,7 @@
 
 > **Status:** ndn-rs-proprietary, experimental TLV range.
 > **TLV-TYPE:** `0x230` (inside `ApplicationParameters`).
-> **Reference impl:** [`crates/ndn-packet/src/subscription.rs`](../../crates/ndn-packet/src/subscription.rs).
+> **Reference impl:** [`crates/core/ndn-packet/src/subscription.rs`](../../crates/core/ndn-packet/src/subscription.rs).
 
 A nested TLV inside `ApplicationParameters` that promotes a normal
 Interest into a **persistent Interest**: a PIT entry that may satisfy
@@ -102,10 +102,10 @@ guarantee that makes the extension safe to deploy unilaterally.
 
 ## Implementation status
 
-- **Codec:** complete (`crates/ndn-packet/src/subscription.rs`).
+- **Codec:** complete (`crates/core/ndn-packet/src/subscription.rs`).
 - **PIT substrate:** persistent-entry semantics implemented in
-  `crates/ndn-store/src/pit.rs`; replay-guard cooperation in
-  `crates/ndn-security/`.
+  `crates/forwarding/ndn-store/src/pit.rs`; replay-guard cooperation in
+  `crates/security/ndn-security/`.
 - **Replay-guard lifetime cap:** capped at `MAX_PERSISTENT_LIFETIME_SECS`
   (one hour); cannot be raised without a code change. Operators who
   need longer lifetimes are expected to re-express the subscription.

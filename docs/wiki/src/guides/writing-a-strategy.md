@@ -6,7 +6,7 @@ guide walks through writing a third-party strategy, registering it,
 and pinning it under a prefix.
 
 The trait surface is [Extend tier → Strategy](../api/extend.md#strategy);
-the contract lives at `crates/ndn-strategy/src/strategy.rs:56`.
+the contract lives at `crates/forwarding/ndn-strategy/src/strategy.rs:56`.
 
 ## When to write a strategy
 
@@ -14,7 +14,7 @@ the contract lives at `crates/ndn-strategy/src/strategy.rs:56`.
   (e.g. weighted round-robin, latency-aware, energy-aware).
 - You're researching strategy behaviour and want a measurement fixture.
 - You're building a sandboxed strategy (WASM); see
-  `crates/ndn-wasm-strategy/`.
+  `ndn-ext/crates/strategies/ndn-strategy-wasm/`.
 
 For everything else the built-ins (`BestRouteStrategy`,
 `MulticastStrategy`, `ComposedStrategy`) are usually correct.
@@ -128,7 +128,7 @@ reads it and returns actions; it has no `send_*` methods. The fields:
 - `ctx.runtime` — spawn/sleep handle backing `schedule()`.
 
 Forwarding is expressed by *returning* actions, not by calling the
-context. The full surface is in `crates/ndn-strategy/src/context.rs`.
+context. The full surface is in `crates/forwarding/ndn-strategy/src/context.rs`.
 
 ## Cross-layer signals
 
@@ -174,10 +174,10 @@ shows the end-to-end shape.
 
 ## Built-in references
 
-- `crates/ndn-strategy/src/best_route.rs` — lowest-cost nexthop with
+- `crates/forwarding/ndn-strategy/src/best_route.rs` — lowest-cost nexthop with
   split horizon; `on_nack` retries the next-best nexthop.
-- `crates/ndn-strategy/src/multicast.rs` — fan out to every nexthop.
-- `crates/ndn-strategy/src/composed.rs` — chain a strategy with filters.
+- `crates/forwarding/ndn-strategy/src/multicast.rs` — fan out to every nexthop.
+- `crates/forwarding/ndn-strategy/src/filter.rs` — chain a strategy with filters.
 
 A WASM strategy targets `wasm32-unknown-unknown` and loads at runtime via
 `ndn-wasm-strategy` (same `Strategy` trait); see `examples/wasm-strategy/`.

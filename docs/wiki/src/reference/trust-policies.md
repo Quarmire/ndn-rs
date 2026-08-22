@@ -9,7 +9,7 @@ ndn-rs splits this across two traits:
   its key locator, and a chain-walk depth, return a `PolicyVerdict`
   (`Allow`, `NeedCert`, or `Deny`).
 
-Implementations live in `crates/ndn-security/src/`. See
+Implementations live in `crates/security/ndn-security/src/`. See
 [Extend tier](../api/extend.md) and
 [Identity and keys](../concepts/identity-and-keys.md).
 
@@ -147,4 +147,4 @@ see [NDNCERT setup](../guides/ndncert-setup.md)).
 - [Identity and keys](../concepts/identity-and-keys.md) — KeyChain and SigningInfo.
 - [NDNCERT setup](../guides/ndncert-setup.md) — issuing the certs these policies validate.
 - [Extend tier](../api/extend.md) — implementing custom policies.
-- `crates/ndn-security/` — the implementation.
+- `crates/security/ndn-security/` — the implementation.

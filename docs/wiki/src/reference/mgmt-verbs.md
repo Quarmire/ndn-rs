@@ -10,7 +10,7 @@ For runtime use see `ndn-ctl` in [ndn-fwd](../operations/ndn-fwd.md).
 ## Module catalogue
 
 One module per row; one file per module under
-`crates/ndn-mgmt/src/modules/`.
+`crates/forwarding/ndn-mgmt/src/modules/`.
 
 | Module | File | What it owns |
 |---|---|---|
@@ -30,7 +30,7 @@ One module per row; one file per module under
 | `neighbors` | `modules/neighbors.rs` | Neighbour table (joins discovery info with face state). |
 | `service` | `modules/service.rs` | Service lifecycle (drain, shutdown). |
 
-The catalogue tracks `crates/ndn-mgmt/src/modules/mod.rs` —
+The catalogue tracks `crates/forwarding/ndn-mgmt/src/modules/mod.rs` —
 add a module there, it appears here.
 
 ## Verb shape
@@ -142,4 +142,4 @@ while let Some(sample) = sub.recv().await {
 - [ndn-fwd](../operations/ndn-fwd.md) — `ndn-ctl` operator CLI.
 - [Running the dashboard](../guides/running-the-dashboard.md) —
   graphical mgmt consumer.
-- `crates/ndn-mgmt/src/modules/` — implementation.
+- `crates/forwarding/ndn-mgmt/src/modules/` — implementation.

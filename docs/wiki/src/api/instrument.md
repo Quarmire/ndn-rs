@@ -25,7 +25,7 @@ below).
 
 | Item | Crate path | Purpose |
 |---|---|---|
-| `ForwarderEngine::fib()` / `rib()` / `pit()` / `cs()` / `strategy_table()` / `measurements()` / `routing()` / `discovery_ctx()` | `ndn_engine::engine` (`crates/ndn-engine/src/engine.rs`) | Direct table access. |
+| `ForwarderEngine::fib()` / `rib()` / `pit()` / `cs()` / `strategy_table()` / `measurements()` / `routing()` / `discovery_ctx()` | `ndn_engine::engine` (`crates/forwarding/ndn-engine/src/engine.rs`) | Direct table access. |
 | `ContextEnricher` | `ndn_engine::enricher` | Pipeline-stage hook for cross-layer enrichment. |
 | `observability::targets` | `ndn_engine::observability::targets` | Tracing target taxonomy. |
 | `InProcFace::new_kind` | `ndn_face::local::InProcFace` | Synthesize an in-process face with a custom `FaceKind`. |
@@ -38,7 +38,7 @@ below).
 Each carrier crate declares the feature:
 
 ```toml
-# crates/ndn-engine/Cargo.toml — and likewise for ndn-face
+# crates/forwarding/ndn-engine/Cargo.toml — and likewise for ndn-face
 [features]
 experimental-instrument = []
 ```
@@ -100,7 +100,7 @@ let packets: Vec<bytes::Bytes> = tap.captured().await;
 it, the bytes accumulate, and nothing is returned. Use it alongside
 real faces to record what the engine *would have* sent over them.
 
-In-tree reference: `crates/ndn-face/src/callback.rs`.
+In-tree reference: `crates/faces/ndn-face/src/callback.rs`.
 
 ## Engine table access
 

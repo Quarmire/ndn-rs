@@ -16,9 +16,11 @@ NDN-RS models Named Data Networking as **composable async pipelines with trait-b
 ## Scope policy
 
 Every crate in the workspace has one of the scope buckets recorded
-in each crate's `Cargo.toml` `[package.metadata.scope]` field. `spec`
-and `extension` crates live flat under `crates/`; `tooling/` and
-`draft/` remain as subdirectories:
+in each crate's `Cargo.toml` `[package.metadata.scope]` field. Scope
+is orthogonal to directory layout: crates are grouped **by role**
+under `crates/` (`core/`, `forwarding/`, `faces/`, `security/`,
+`app/`, `platform/`, `protocols/` — see the
+[layer map](docs/wiki/src/inside/architecture/layer-map.md)):
 
 - **`spec`** — implements an authoritative NDN community spec
   (Packet Format v0.3, NFD architecture, NDNCERT 0.3, did:ndn,
@@ -48,15 +50,25 @@ ship in the repository without carrying the same SemVer promise.
 
 ## Crate Map
 
-Crates are organised by **scope**, recorded per crate in
-`[package.metadata.scope] classification` (all crates live flat under
-`crates/`; the former `spec/` and `extension/` directories were removed).
+Crates carry a **scope**, recorded per crate in
+`[package.metadata.scope] classification`; on disk they are grouped by
+role under `crates/{core,forwarding,faces,security,app,platform,protocols}/`.
 The dependency-direction rule still holds: `draft` → `tooling` →
 `extension` → `spec`. A `spec`-scope crate may not depend on anything to
 its right.
 
+> **Note (2026-08-21).** The map below is the *conceptual* inventory of
+> the whole NDN stack and predates the multi-repo split: many crates
+> listed here now live in sibling repos (`ndn-ext` — faces, routing,
+> discovery, compute, coding, strategies, service stack; `ndn-fwd` — the
+> forwarder binaries and operator CLIs; `ndn-sim`, `ndn-repo`,
+> `ndn-embedded`, `ndn-mobile`, `ndn-dashboard`, `ndn-radio-drivers`).
+> Only the crates under this repo's grouped `crates/` tree ship from
+> ndn-rs; the workspace-level `STATE.md` (one level up, in the
+> ndn-workspace checkout) is the authoritative repo inventory.
+
 ```
-scope = spec   (flat under crates/)   NDN community specs implemented faithfully
+scope = spec        NDN community specs implemented faithfully
   ndn-tlv                       TlvReader, TlvWriter, varu64 — no_std
   ndn-foundation-types          Name, NameComponent, canonical Ord — shared with downstream NDN-stack crates
   ndn-packet                    Interest, Data, Nack (Packet Format v0.3) — lazy decode, no_std
@@ -91,7 +103,7 @@ scope = spec   (flat under crates/)   NDN community specs implemented faithfully
   ndn-custodian                 Custodian trait (InPage/OsKeyring/Fob/BrowserExtension) + KeyId + CustodianSigner (Custodian→Signer adapter); wasm-safe (no PIB/sqlite) so dashboard/extension/mobile can use it
   ndn-identity                  Bridges KeyChain + DID + NDNCERT; re-exports ndn-custodian
 
-scope = extension   (flat under crates/)   Pragmatic engineering, no NDN spec basis
+scope = extension   Pragmatic engineering, no NDN spec basis
   ndn-runtime                   Spawn/Sleep/Now trait abstraction; TokioRuntime / WasmRuntime
   ndn-acme                      ACME (RFC 8555) DNS-01 for the WT listener
   ndn-config                    TOML config + NFD management protocol
@@ -148,14 +160,14 @@ scope = extension   (flat under crates/)   Pragmatic engineering, no NDN spec ba
                                 confidentiality tier above the ndn-crypto-core
                                 AEAD baseline; producer / capable-node only
 
-crates/tooling/                 Operator-facing tools and shared tool libs
+tooling (sibling repos)         Operator-facing tools and shared tool libs
   ndn-tools-core                Embeddable tool logic (ping, iperf, peek, put)
   dioxus-demo                   In-browser demo (TransitHost/Peer + JoinClient + SharedClient)
 
-crates/draft/                   Author-led, no stability promise
+draft (sibling repos)           Author-led, no stability promise
   ndn-research                  FlowObserverStage, FlowTable, ChannelManager (nl80211)
 
-binaries/ (flat)                Standalone executables
+binaries/ (sibling repo ndn-fwd)  Standalone executables
   ndn-fwd                       The forwarder (NFD-comparable; TOML config, management socket)
   ndn-fwd-tokens                Invite-token mint + QR codes for onboarding-link UX
 binaries/tooling/               Operator CLIs
@@ -412,12 +424,12 @@ between two peers, over which the node runs UDP. The platform negotiates the NDP
 (`WifiAwareManager.requestNetwork` on Android), binds a UDP socket on the
 resulting network, and hands the bound socket's fd + the peer's address to
 `NdnEngine::attach_ndp_face` (fd-passing, like the seam's `mount_app_fd`). The
-engine adopts it as a [`UdpFace`](crates/ndn-face) and adds a UDP-cost
+engine adopts it as a [`UdpFace`](crates/faces/ndn-face) and adds a UDP-cost
 (10) nexthop on the peer's `/ndn/node/<id>` prefix, so the measured best-route
 strategy (below) moves the peer's bulk traffic onto the reliable, fast NDP link
 while the connectionless coordination radios stay for discovery + fallback. The
 Rust seam (`NanBackend::request_ndp` → `NdpLink` → `UdpFace::from_socket`) is
-exercised by `crates/ndn-face-wifi-aware/tests/ndp_bulk.rs`; on Android the
+exercised by `ndn-ext/crates/faces/ndn-face-wifi-aware/tests/ndp_bulk.rs`; on Android the
 `NanRadio` runs the data-path negotiation (a node-id tiebreak picks the publisher
 as server/responder and the subscriber as client/initiator, per the Android
 Wi-Fi Aware guide). A NAN data path **tears down when idle**, so the engine runs
@@ -435,7 +447,7 @@ discover-then-upgrade pattern as Quick Share / AirDrop. It stays data-centric:
 once the group forms it is just a multi-access IP subnet (the group owner runs
 DHCP on `192.168.49.0/24`), so the host-centric group-owner election lives
 *below* the Face. Above it, `FaceKind::WifiDirect` faces carry only names —
-a unicast [`UdpFace`](crates/ndn-face) for 1:1 bulk (full MCS rate;
+a unicast [`UdpFace`](crates/faces/ndn-face) for 1:1 bulk (full MCS rate;
 `LinkProfile` cost 8, preferred over the NDP/LAN UDP cost 10) attached via
 `attach_wifi_direct_face`, or a `MulticastUdpFace` for one-to-many over the
 group's broadcast domain (`MulticastStrategy` + PIT aggregation) via
@@ -446,7 +458,7 @@ a Wi-Fi SoftAP "portable router" and to Apple's Wi-Fi Aware framework on iOS
 
 **Measured best-route (extension).** The per-peer `/ndn/node/<id>` routes use
 `MeasuredStrategy` rather than plain `BestRoute`: it ranks nexthops by a blend of
-the static [`LinkProfile`](crates/ndn-transport) cost *prior* and live signals —
+the static [`LinkProfile`](crates/core/ndn-transport) cost *prior* and live signals —
 prefix-level EWMA RTT (`MeasurementsTable`) plus per-face `LinkSignals` (link
 RTT, throughput, congestion, retransmit rate, RSSI from the
 [signals](#cross-layer-signals) layer). With no samples yet it is identical to
@@ -575,7 +587,7 @@ The `RoutingProtocol` trait populates the RIB. Three implementations ship:
   [`ndnd/dv/SPEC.md`](https://github.com/named-data/ndnd) (reference impl: ndnd, Go;
   *Distance-Vector Routing for Named Data Networking*, CoNEXT '24,
   DOI `10.1145/3680121.3699885`). Documented divergences from ndnd in
-  `crates/ndn-routing/src/protocols/dv/mod.rs`. Trust modes: `insecure`
+  `ndn-ext/crates/routing/ndn-routing/src/protocols/dv/mod.rs`. Trust modes: `insecure`
   (default, ndnd-compatible), `static`, `lvs`. A live ndnd-dv interop
   witness (mirroring G.04's shape) is not yet wired — the SPEC-compliance
   claim currently has no cross-implementation leg.
@@ -615,11 +627,12 @@ OTel backends — Interest by trace_id / span_id. PIT aggregation, CS caching,
 NAC, and per-span signing all apply at no extra cost.
 
 The publisher lives in
-[`crates/ndn-observability/`](crates/ndn-observability/); the
+[`crates/platform/ndn-observability/`](crates/platform/ndn-observability/); the
 `tracing::Subscriber` Layer is attached during
-[`init_tracing`](binaries/ndn-fwd/src/tracing_init.rs) when
+`init_tracing` (in the sibling repo ndn-fwd:
+`ndn-fwd/binaries/ndn-fwd/src/tracing_init.rs`) when
 `[observability] publish_to_ndn = true` in the forwarder TOML. Cross-router
-trace stitching uses the [`TraceContext` LP TLV](crates/ndn-packet/src/lp/trace_context.rs)
+trace stitching uses the [`TraceContext` LP TLV](crates/core/ndn-packet/src/lp/trace_context.rs)
 (type `0x520`, 33-byte value matching the W3C trace-context binary form
 plus an 8-byte single-hop timestamp); see
 [`docs/wiki/src/operations/logging.md`](docs/wiki/src/operations/logging.md)
@@ -656,23 +669,25 @@ Testbed CI runs on push to `testbed/**` and weekly via cron
 ## Browser target
 
 The engine compiles to `wasm32-unknown-unknown` via the
-[`ndn-runtime`](crates/ndn-runtime/) `Spawn`/`Sleep`/`Now` trait
+[`ndn-runtime`](crates/core/ndn-runtime/) `Spawn`/`Sleep`/`Now` trait
 abstraction. The wasm-safe trait
 shapes used by the engine — `DiscoveryProtocol`, `DiscoveryContext`,
 `NeighborTable`, scope helpers — live in
-[`crates/ndn-discovery-core/`](crates/ndn-discovery-core/);
-[`ndn-discovery`](crates/ndn-discovery/) re-exports them and adds
+[`crates/forwarding/ndn-discovery-core/`](crates/forwarding/ndn-discovery-core/);
+`ndn-discovery` (in the sibling repo ndn-ext:
+`ndn-ext/crates/discovery/ndn-discovery/`) re-exports them and adds
 the native-only protocols (autoconfig, gossip, ether-ND, probe,
 service-discovery). On wasm `ndn-engine` drops `ndn-security` (pulls
 `ring`) entirely and substitutes a permissive [`ValidationStage`
-stub](crates/ndn-engine/src/stages/validation_stub.rs); the
-[`builder`](crates/ndn-engine/src/builder.rs) is also
+stub](crates/forwarding/ndn-engine/src/stages/validation.rs)
+(`ValidationStage::disabled`); the
+[`builder`](crates/forwarding/ndn-engine/src/builder.rs) is also
 non-wasm-only, so wasm callers construct `ForwarderEngine`
 programmatically.
 
 The browser-side
 WebTransport client face lives in
-[`crates/ndn-face-webtransport-wasm/`](crates/ndn-face-webtransport-wasm/);
+the sibling repo ndn-ext (`ndn-ext/crates/faces/ndn-face-webtransport-wasm/`);
 the face catalog [`docs/wiki/src/reference/face-transports.md`](docs/wiki/src/reference/face-transports.md)
 summarises the WebTransport variants. The crate compiles
 on both targets — wasm32 uses `xwt-web` (`web-sys::WebTransport`), other
@@ -683,7 +698,7 @@ can run without a real browser.
 
 | Demo | Crate | Notes |
 | --- | --- | --- |
-| In-browser ndn-rs (Dioxus + WebTransport) | [`crates/tooling/dioxus-demo/`](crates/tooling/dioxus-demo/) | Phase 7: full `ForwarderEngine` (PIT, FIB, CS, dispatcher, pipeline) running in the browser via [`WasmEngineBuilder`](crates/ndn-engine/src/wasm_builder.rs) — same code path as native `ndn-fwd` modulo `ValidationStage::disabled`. Tab-side `BrowserWebTransportFace`; SharedWorker hosts the engine. Pure Rust→WASM. Witnesses: `testbed/tests/browser/{dioxus_demo,sharedworker_cache_hit}_*.spec.ts`. This remains outside the v0.1.0 stable boundary unless promoted by release notes. |
+| In-browser ndn-rs (Dioxus + WebTransport) | the sibling repo ndn-dashboard (`ndn-dashboard/crates/dioxus-demo/`) | Phase 7: full `ForwarderEngine` (PIT, FIB, CS, dispatcher, pipeline) running in the browser via [`WasmEngineBuilder`](crates/forwarding/ndn-engine/src/wasm_builder.rs) — same code path as native `ndn-fwd` modulo `ValidationStage::disabled`. Tab-side `BrowserWebTransportFace`; SharedWorker hosts the engine. Pure Rust→WASM. Witnesses: `testbed/tests/browser/{dioxus_demo,sharedworker_cache_hit}_*.spec.ts`. This remains outside the v0.1.0 stable boundary unless promoted by release notes. |
 
 ## Design Docs
 

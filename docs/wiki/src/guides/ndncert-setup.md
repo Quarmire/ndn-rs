@@ -6,7 +6,7 @@ proof-of-possession); on success the CA signs and returns the cert.
 This guide covers running an NDNCERT CA, joining as a user, and the
 invite-token flow.
 
-The implementation lives in `crates/ndn-cert/`. The CA binary
+The implementation lives in `crates/security/ndn-cert/`. The CA binary
 is `binaries/tooling/enroll-ndncert/`. Tokens are managed by
 `binaries/ndn-fwd-tokens/`.
 
@@ -32,7 +32,7 @@ What this does:
 
 The CA's `IssuancePolicy` decides whether an authenticated
 applicant gets a cert. See
-`crates/ndn-cert/src/issuance_policy.rs`. The default is
+`crates/security/ndn-cert/src/policy.rs`. The default is
 `AcceptAllIssuance` — fine for lab deployments, not for production.
 
 ## Join as a user
@@ -92,7 +92,7 @@ single-use or TTL-bounded.
 | `email` | Receives a mail token | Public deployments (with an SMTP-aware adapter). |
 | `acme-dns01` | Wins an ACME DNS-01 challenge | Domain-bound names; see `testbed/tests/audit/acme_dns01.sh`. |
 
-The challenge surface is in `crates/ndn-cert/src/challenge/`.
+The challenge surface is in `crates/security/ndn-cert/src/challenge/`.
 Client-side enrollment uses `ndn_identity::NdncertClient`; standard token and
 possession challenges have typed helpers, and named custom challenges can pass
 their challenge identifier plus structured parameters through the same
@@ -106,7 +106,7 @@ The post-challenge gate. An `IssuancePolicy` impl returns:
 - `Reject(reason)` — refuse, with a human-readable reason.
 - `Defer(callback)` — out-of-band hold (admin approval, etc.).
 
-Built-ins in `crates/ndn-cert/src/issuance_policy.rs`:
+Built-ins in `crates/security/ndn-cert/src/policy.rs`:
 `AcceptAllIssuance` (default), `NamespacePolicy`,
 `ChallengeHandler` (three-stage seam recorded in
 `project_f7_issuance_policy`).
@@ -129,8 +129,10 @@ Run as a system service via the docker-compose stack — see
 ## Renewal
 
 A holder of `cert-N` proves possession of its key to obtain
-`cert-N+1`. The Producer can be configured to auto-renew before
-expiry; see `crates/ndn-cert/src/auto_renew.rs`.
+`cert-N+1`. The background renewal task watches a cert's remaining
+validity and re-runs enrollment before expiry; see
+`crates/security/ndn-identity/src/renewal.rs` (`start_renewal` +
+`NdncertRenewer`).
 
 ## Challenge attestations
 
@@ -183,7 +185,7 @@ renders the leaves, and `security/validate` returns them under
 
 The wire shape and the per-handler evidence each leaf carries are
 documented in `docs/ndncert-attestations.md`; see
-`crates/ndn-cert/src/attestation.rs` for the types.
+`crates/security/ndn-cert/src/attestation.rs` for the types.
 
 ## See also
 
@@ -193,4 +195,4 @@ documented in `docs/ndncert-attestations.md`; see
   consumer checks against the cert chain.
 - [Self-hosting](./self-hosting.md) — running CA and forwarder as
   containers.
-- `crates/ndn-cert/` — implementation and protocol shape.
+- `crates/security/ndn-cert/` — implementation and protocol shape.

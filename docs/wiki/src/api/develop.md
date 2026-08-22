@@ -15,7 +15,7 @@ and `ndn-security` from the `ndn-rs-prelude` crate (library name
 
 Package vs library: `Cargo.toml` carries `ndn-rs-prelude = "0.1"`;
 imports read `use ndn::Consumer;`. The split is recorded in
-`crates/ndn-rs-prelude/Cargo.toml`.
+`crates/app/ndn-rs-prelude/Cargo.toml`.
 
 ## Inventory
 
@@ -31,9 +31,9 @@ graph LR
 
 | Re-export | Source | What it does |
 |---|---|---|
-| `Consumer` | `ndn_app::Consumer` (`crates/ndn-app/src/consumer.rs`) | Express Interests; fetch a single `Data` or a segmented object. |
-| `Producer` | `ndn_app::Producer` (`crates/ndn-app/src/producer.rs`) | Register a prefix; serve `Data` on demand. |
-| `Responder` | `ndn_app::Responder` (`crates/ndn-app/src/responder.rs`) | Callback-style producer (one closure → one `Data`). |
+| `Consumer` | `ndn_app::Consumer` (`crates/app/ndn-app/src/consumer.rs`) | Express Interests; fetch a single `Data` or a segmented object. |
+| `Producer` | `ndn_app::Producer` (`crates/app/ndn-app/src/producer.rs`) | Register a prefix; serve `Data` on demand. |
+| `Responder` | `ndn_app::Responder` (`crates/app/ndn-app/src/responder.rs`) | Callback-style producer (one closure → one `Data`). |
 | `Subscriber`, `SubscriberConfig`, `Sample` | `ndn_app::subscriber` | SVS-style multi-publisher stream subscription. |
 | `Queryable`, `Query` | `ndn_app::queryable` | Request/reply primitive (one Interest → one Data). |
 | `KeyChain` | `ndn_security::KeyChain` | Identity / key / cert management; entry point for signing. |
@@ -173,7 +173,7 @@ let _ = consumer.fetch("/example/hello").await?;
 # Ok(()) }
 ```
 
-`EngineBuilder` is in `crates/ndn-engine/`. The umbrella does
+`EngineBuilder` is in `crates/forwarding/ndn-engine/`. The umbrella does
 not re-export it: the Develop tier treats the engine as opaque, and
 embedding it is an Extend-tier or test-time concern.
 
