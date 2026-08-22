@@ -13,7 +13,13 @@ autotests = false
 classification = "spec"
 
 [features]
-default = []
+# `sqlite-pib` stays default-on so every existing native consumer keeps the
+# ndn-cxx-compatible SQLite PIB without flag changes. It is a *named* feature
+# (not implied by the raw dep) so sqlite-free consumers — ndn-rs-prelude in
+# particular — can opt out with `default-features = false` and not have cargo
+# feature-unification silently re-enable libsqlite3-sys behind their back.
+default = ["sqlite-pib"]
+sqlite-pib = ["ndn-security/sqlite-pib"]
 blocking = ["tokio/rt"]
 # Typed objects: `node.object(n).fetch_as::<T>()` and `serve_object_typed(n, &T)`
 # (de)serialize Content as JSON via serde. Off by default — the byte API needs
@@ -46,11 +52,16 @@ web-time       = { workspace = true }
 serde          = { workspace = true, optional = true }
 serde_json     = { workspace = true, optional = true }
 
-# Native-only: external-forwarder IPC (Unix socket), SVS sync, the SQLite PIB
-# (pulls libsqlite3-sys — never wasm-buildable), and the full tokio timer.
+# Native-only: external-forwarder IPC (Unix socket), SVS sync, and the full
+# tokio timer. The SQLite PIB (libsqlite3-sys — never wasm-buildable) rides on
+# this crate's own `sqlite-pib` feature (default-on), not on the raw dep, so
+# `default-features = false` consumers get a sqlite-free build.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 ndn-packet     = { workspace = true, features = ["std"] }
-ndn-security   = { workspace = true }
+# Direct path (not `workspace = true`) so `default-features = false` is allowed
+# — Cargo forbids overriding a workspace dep's default-features. The default
+# `sqlite-pib` is re-enabled through this crate's feature of the same name.
+ndn-security   = { path = "../../security/ndn-security", default-features = false }
 ndn-face = { workspace = true }
 ndn-ipc        = { workspace = true }
 tokio          = { workspace = true, features = ["sync", "rt", "time"] }

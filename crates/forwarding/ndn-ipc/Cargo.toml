@@ -15,7 +15,12 @@ ndn-mgmt-wire  = { workspace = true }
 ndn-tlv        = { workspace = true, features = ["std"] }
 ndn-transport  = { workspace = true }
 ndn-face      = { workspace = true }
-ndn-security   = { workspace = true }
+# Only the signing/verification surface is used — never the SQLite PIB — so
+# drop `sqlite-pib` (direct path: Cargo forbids overriding a workspace dep's
+# default-features). Keeps libsqlite3-sys out of sqlite-free consumers
+# (ndn-rs-prelude); native apps that want the SQLite PIB get it via
+# ndn-app's default `sqlite-pib` feature.
+ndn-security   = { path = "../../security/ndn-security", default-features = false }
 async-trait    = { workspace = true }
 bytes         = { workspace = true, features = ["std"] }
 tokio          = { workspace = true, features = ["sync", "rt", "macros"] }

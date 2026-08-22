@@ -20,12 +20,16 @@ path = "src/lib.rs"
 
 [features]
 default = []
+# Opt back into the ndn-cxx-compatible SQLite PIB (libsqlite3-sys, bundled).
+# Off by default so the umbrella stays sqlite-free and wasm-buildable;
+# native apps that want `ndn_security::sqlite_pib` enable this passthrough.
+sqlite-pib = ["ndn-app/sqlite-pib"]
 
 [dependencies]
 # Wasm-safe core: packet types + builders + security primitives.
 # `ndn-security` is pulled without its default `sqlite-pib` feature so
 # the umbrella builds for wasm32-unknown-unknown. Callers that need
-# the SQLite-backed PIB depend on `ndn-security` directly.
+# the SQLite-backed PIB enable this crate's `sqlite-pib` feature.
 ndn-packet   = { workspace = true, features = ["std"] }
 # Cargo's workspace-dep inheritance can't override `default-features`,
 # so pull `ndn-security` by path and explicitly drop its default
@@ -37,8 +41,12 @@ ndn-security = { path = "../../security/ndn-security", default-features = false 
 # wasm32 today; the umbrella exposes them on native only. Wasm
 # callers use `ndn-engine::WasmEngineBuilder` for the embedded-engine
 # path (Phase-4 wiki documents this split).
+# `default-features = false` drops ndn-app's default `sqlite-pib` (its only
+# default feature) so cargo feature-unification cannot re-enable
+# libsqlite3-sys behind this umbrella's back; the `sqlite-pib` feature
+# above passes it back through for apps that opt in.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-ndn-app = { workspace = true }
+ndn-app = { path = "../ndn-app", default-features = false }
 
 [lints]
 workspace = true
