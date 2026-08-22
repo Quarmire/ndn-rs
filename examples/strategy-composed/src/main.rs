@@ -114,8 +114,10 @@ async fn main() -> Result<()> {
     // 4. If all faces are filtered out, fall through to Nack
     //
     // Cross-layer data (RSSI, RTT) is pushed by signal sources registered
-    // via EngineBuilder::signal_source() and read through ctx.signals.
-    // See `ndn-signal-sources` and docs/signals.md.
+    // via EngineBuilder::signal_source() and read through ctx.signals. The
+    // SignalSource trait lives in `ndn-signals-core`; concrete sources live
+    // with their subsystems (radio metrics in the `ndn-radio-drivers` repo,
+    // extension faces in `ndn-ext`).
 
     shutdown.shutdown().await;
     Ok(())

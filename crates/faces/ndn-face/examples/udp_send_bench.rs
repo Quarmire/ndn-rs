@@ -3,9 +3,9 @@
 //! Build twice to compare `sendmmsg` against per-datagram `send_to`:
 //!
 //! ```text
-//! cargo build -p ndn-face-native --release --no-default-features --features net \
+//! cargo build -p ndn-face --release --no-default-features --features net \
 //!   --example udp_send_bench                                            # single send
-//! cargo build -p ndn-face-native --release --no-default-features \
+//! cargo build -p ndn-face --release --no-default-features \
 //!   --features net,udp-sendmmsg --example udp_send_bench                # sendmmsg
 //! ./target/release/examples/udp_send_bench [secs] [batch] [payload_bytes]
 //! ```

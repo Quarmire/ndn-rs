@@ -5,7 +5,9 @@ use ndn_transport::AnyMap;
 /// `StrategyStage` calls every enricher before each strategy invocation.
 ///
 /// Note: for known cross-layer signals (RSSI, SNR, GPS, …) prefer the typed
-/// signal subsystem — implement a `SignalSource` (`ndn-signal-sources`) and
+/// signal subsystem — implement a `SignalSource` (the trait is in
+/// `ndn-signals-core`; concrete sources live with their subsystems — radio
+/// metrics in the `ndn-radio-drivers` repo, extension faces in `ndn-ext`) and
 /// read `ctx.signals`. Enrichers are for experimental / one-off DTOs that
 /// don't fit the [`ndn_signals_core`] taxonomy.
 ///

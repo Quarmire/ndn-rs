@@ -2,7 +2,7 @@
 //! **extension** face crates.
 //!
 //! The standard transports (UDP/TCP/Ethernet/BLE/SHM) are built inline in
-//! [`super::create`] over `ndn-face-native` (a spec crate). The extension
+//! [`super::create`] over `ndn-face` (a spec crate). The extension
 //! transports — raw QUIC (`quic://`) and WebTransport (`wts://`) — live in their
 //! own crates outside the library closure, so `ndn-mgmt` must not construct them
 //! directly. Instead the forwarder registers a [`FaceProvisioner`] per extension

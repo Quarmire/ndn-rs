@@ -210,10 +210,11 @@ pub trait SignalStore<F: Copy + Eq>: SignalView<F> {
 /// roughly every [`Self::interval`]; `now_ms` is a monotonic millisecond clock
 /// used to stamp readings for staleness.
 ///
-/// The trait lives here in the core taxonomy (not in the `ndn-signal-sources`
-/// extension) so the **engine depends only on `ndn-signals-core`** — it accepts
-/// `Box<dyn SignalSource>`s but never the concrete source framework. Concrete
-/// sources (radio metrics, location, …) implement this in `ndn-signal-sources`.
+/// The trait lives here in the core taxonomy so the **engine depends only on
+/// `ndn-signals-core`** — it accepts `Box<dyn SignalSource>`s but never a
+/// concrete source framework. Concrete sources live with their subsystems:
+/// radio metrics with the radio drivers (the `ndn-radio-drivers` repo) and
+/// link/face-level sources with the extension faces (the `ndn-ext` repo).
 pub trait SignalSource<F: Copy + Eq>: Send + 'static {
     /// Stable identifier (for logs / observability).
     fn name(&self) -> &str;

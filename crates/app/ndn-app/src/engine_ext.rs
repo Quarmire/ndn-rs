@@ -8,7 +8,7 @@
 //! callers work in prefixes, not plumbing.
 //!
 //! Lives in `ndn-app` rather than `ndn-engine` because `InProcFace` is a
-//! concrete face (in `ndn-face-native`) layered above the core engine; pulling it
+//! concrete face (in `ndn-face`) layered above the core engine; pulling it
 //! into `ndn-engine` would invert the dependency.
 //!
 //! ```no_run
@@ -28,7 +28,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use ndn_engine::{Fib, ForwarderEngine};
 // Same `InProcFace` type on both targets; the wasm path imports it straight
-// from `ndn-face-local` to avoid `ndn-face-native`'s OS-socket transports.
+// from `ndn-face-local` to avoid `ndn-face`'s OS-socket transports.
 #[cfg(not(target_arch = "wasm32"))]
 use ndn_face::local::InProcFace;
 #[cfg(target_arch = "wasm32")]

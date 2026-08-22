@@ -39,6 +39,7 @@ pub mod replay_guard;
 /// Deprecated alias of [`safebag`] — the duplicate SafeBag codecs were
 /// merged (P2). New code should import from [`safebag`]; this alias only
 /// keeps existing `ndn_security::safe_bag::*` paths compiling.
+#[deprecated(note = "use ndn_security::safebag")]
 pub mod safe_bag {
     pub use crate::safebag::*;
 }

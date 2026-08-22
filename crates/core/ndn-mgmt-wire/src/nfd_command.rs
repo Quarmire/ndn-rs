@@ -31,7 +31,7 @@ pub mod module {
     pub const RATE_LIMIT: &[u8] = b"rate-limit";
     /// `crates/ndn-compute` — read-only function introspection.
     pub const COMPUTE: &[u8] = b"compute";
-    /// BLE peripheral listener control + status (`ndn-face-native` bluetooth).
+    /// BLE peripheral listener control + status (`ndn-face` bluetooth).
     pub const BLE: &[u8] = b"ble";
     /// NDNCERT CA introspection — read-only pending device-approvals.
     pub const CA: &[u8] = b"ca";

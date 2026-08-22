@@ -1,7 +1,7 @@
 //! [`FaceSink`] — the seam between face *provisioning* (interface enumeration,
 //! auto-multicast, hotplug) and the *engine* that owns the face table.
 //!
-//! Provisioning logic lives in `ndn-face-native` (it owns the concrete
+//! Provisioning logic lives in `ndn-face` (it owns the concrete
 //! multicast faces and the OS interface watcher) but must add faces to, and
 //! remove them from, whatever engine is hosting it. Rather than couple the
 //! provisioner to a concrete `ForwarderEngine`, it is written against this

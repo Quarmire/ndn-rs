@@ -6,9 +6,9 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 
-// `InProcHandle` is the same type on both targets — `ndn-face-native` simply
+// `InProcHandle` is the same type on both targets — `ndn-face` simply
 // re-exports it from `ndn-face-local`. The wasm path imports it directly so it
-// doesn't pull `ndn-face-native`'s OS-socket transports.
+// doesn't pull `ndn-face`'s OS-socket transports.
 #[cfg(not(target_arch = "wasm32"))]
 use ndn_face::local::InProcHandle;
 #[cfg(target_arch = "wasm32")]

@@ -7,7 +7,7 @@
 
 // `in_proc` lives in the standalone `ndn-face-local` crate so wasm32
 // consumers can depend on the channel-based face without pulling in
-// `ndn-face-native`'s OS-socket transports.
+// `ndn-face`'s OS-socket transports.
 pub use ndn_face_local as in_proc;
 pub mod ipc;
 
