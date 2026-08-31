@@ -60,8 +60,8 @@ pub mod channel_obs;
 pub mod combine;
 pub mod discipline;
 pub mod domain_map;
-pub mod estimator;
 pub mod election;
+pub mod estimator;
 pub mod interval;
 pub mod link_clock;
 pub mod measure;
@@ -74,16 +74,17 @@ pub mod stamp;
 
 pub use beacon::TimeBeacon;
 pub use capability::{ClockCapability, Holdover, TimeSourceKind, Traceability};
-pub use channel_obs::{ChannelObs, C_M_PER_S};
+pub use channel_obs::{C_M_PER_S, ChannelObs};
 pub use discipline::{Correction, Discipline, PeerSample, TimePolicy, TimeState};
-pub use election::{ElectionParams, anchor_weight};
 pub use domain_map::DomainMap;
+pub use election::{ElectionParams, anchor_weight};
 pub use estimator::CoupledEstimator;
 pub use interval::TimeInterval;
-pub use link_clock::{RadioClockKind, RadioTimeSource};
-pub use measure::{
-    RxObs, TwoWay, common_view, distance_bounded, offset_to_wall, one_way, two_way,
+pub use link_clock::{
+    ClockReference, ClockReferenceKind, RadioClockKind, RadioTimeSource, RateMeasurement,
+    RateWitness,
 };
+pub use measure::{RxObs, TwoWay, common_view, distance_bounded, offset_to_wall, one_way, two_way};
 pub use network_time::{NetworkTime, REF_BELIEF_BYTES, RefBelief};
 pub use provenance::{Authenticity, KeyId, Measured, MeasurementProvenance, PathId};
 pub use radio_hw_clock::{RXTSF_PERIOD_US, RadioHwClock};
