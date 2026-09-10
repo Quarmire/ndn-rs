@@ -224,12 +224,12 @@ impl Node {
 
     /// Serve a **latest-wins** value under `name`: every matching Interest is
     /// answered with the current value from `latest` (a
-    /// [`watch::Receiver`](tokio::sync::watch::Receiver)), published with
+    /// [`watch::Receiver`]), published with
     /// `FreshnessPeriod = 0`. Because a freshness-0 Data is stale on arrival in
     /// any Content Store, a **`MustBeFresh`** consumer is *never* satisfied by a
     /// superseded cached copy — its Interest always reaches this producer and
     /// gets the freshest value. Update the value by `send`ing on the paired
-    /// [`watch::Sender`](tokio::sync::watch::Sender); the next fetch observes it.
+    /// [`watch::Sender`]; the next fetch observes it.
     ///
     /// This is the "latest value only" pattern — telemetry, status/heartbeat,
     /// a coordination or capability beacon, the newest video keyframe name, a

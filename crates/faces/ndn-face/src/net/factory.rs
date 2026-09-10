@@ -22,7 +22,7 @@ const DEFAULT_LOCAL_BIND: &str = "0.0.0.0:0";
 ///
 /// Reads the peer from [`FaceParams::remote`] (a `SocketAddr` string, e.g.
 /// `192.0.2.1:6363`) and an optional `local` bind address from
-/// `params.opt("local")` (default [`DEFAULT_LOCAL_BIND`]), then binds a
+/// `params.opt("local")` (default `DEFAULT_LOCAL_BIND`), then binds a
 /// [`UdpFace`]. Malformed params surface as
 /// `FaceError::Io(ErrorKind::InvalidInput)`; a bind failure surfaces as the
 /// underlying `FaceError::Io`.

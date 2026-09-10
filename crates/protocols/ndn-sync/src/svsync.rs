@@ -63,7 +63,7 @@ pub const MAX_NDN_PACKET_SIZE: usize = 8800;
 pub(crate) const DATA_OVERHEAD_RESERVE: usize = 800;
 
 /// The maximum content of a single (outer) Data that still fits a deliverable
-/// packet: [`MAX_NDN_PACKET_SIZE`] minus one Data's [`DATA_OVERHEAD_RESERVE`]
+/// packet: [`MAX_NDN_PACKET_SIZE`] minus one Data's `DATA_OVERHEAD_RESERVE`
 /// (= 8000 B). A publication whose content exceeds this must be segmented; the
 /// publish guards reject an oversize single Data rather than silently producing
 /// an undeliverable packet.

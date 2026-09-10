@@ -5,9 +5,9 @@
 //! following 100 chains then runs hundreds of timers and tasks. This driver
 //! collapses that to **O(1) infrastructure**: a single task over a single
 //! `mpsc<Bytes>` face pair, with a single shared timer that services every
-//! group by its own cadence, plus **O(chains) lightweight [`GroupCore`] state**.
+//! group by its own cadence, plus **O(chains) lightweight `GroupCore` state**.
 //!
-//! Each group is driven through the exact same [`GroupCore`] operations the
+//! Each group is driven through the exact same `GroupCore` operations the
 //! single-group task uses — so convergence, two-phase reject-without-poison
 //! (D-44), N-9 observation, and N-11 coalescing are **identical per group**, and
 //! **no group's state touches another's** (each has its own `SvsNode`, pending

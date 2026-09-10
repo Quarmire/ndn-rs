@@ -1,5 +1,5 @@
 //! The coupled time-and-shape estimator (named-time **§14**) — the consumer of Cut 3
-//! [`ChannelObs`](crate::ChannelObs).
+//! [`ChannelObs`].
 //!
 //! Sync, ranging, and kinematics are not three problems but one: the time-of-flight term in a
 //! one-way time transfer *is* `range / c`, so a clock offset and a distance are entangled in the
