@@ -78,7 +78,11 @@ impl MultiSvs {
     pub async fn join(&self, group: Name, config: SvsConfig) -> Option<SyncHandle> {
         let (reply, rx) = oneshot::channel();
         self.control_tx
-            .send(MultiControl::Join { group, config: Box::new(config), reply })
+            .send(MultiControl::Join {
+                group,
+                config: Box::new(config),
+                reply,
+            })
             .await
             .ok()?;
         rx.await.ok().flatten()
@@ -247,7 +251,11 @@ mod tests {
     use crate::SvsConfig;
 
     fn cfg() -> SvsConfig {
-        SvsConfig { sync_interval: Duration::from_millis(30), jitter_ms: 0, ..Default::default() }
+        SvsConfig {
+            sync_interval: Duration::from_millis(30),
+            jitter_ms: 0,
+            ..Default::default()
+        }
     }
 
     fn cfg_two_phase(cap: usize) -> SvsConfig {
@@ -261,16 +269,28 @@ mod tests {
     }
 
     /// Bridge two multiplexed drivers A<->B over in-memory channels.
-    fn brokered() -> (mpsc::Sender<Bytes>, mpsc::Receiver<Bytes>, mpsc::Sender<Bytes>, mpsc::Receiver<Bytes>)
-    {
+    fn brokered() -> (
+        mpsc::Sender<Bytes>,
+        mpsc::Receiver<Bytes>,
+        mpsc::Sender<Bytes>,
+        mpsc::Receiver<Bytes>,
+    ) {
         let (a_send, mut a_send_rx) = mpsc::channel::<Bytes>(4096);
         let (a_in, a_recv) = mpsc::channel::<Bytes>(4096);
         let (b_send, mut b_send_rx) = mpsc::channel::<Bytes>(4096);
         let (b_in, b_recv) = mpsc::channel::<Bytes>(4096);
         let a_in2 = a_in.clone();
-        tokio::spawn(async move { while let Some(p) = b_send_rx.recv().await { let _ = a_in2.send(p).await; } });
+        tokio::spawn(async move {
+            while let Some(p) = b_send_rx.recv().await {
+                let _ = a_in2.send(p).await;
+            }
+        });
         let b_in2 = b_in.clone();
-        tokio::spawn(async move { while let Some(p) = a_send_rx.recv().await { let _ = b_in2.send(p).await; } });
+        tokio::spawn(async move {
+            while let Some(p) = a_send_rx.recv().await {
+                let _ = b_in2.send(p).await;
+            }
+        });
         (a_send, a_recv, b_send, b_recv)
     }
 

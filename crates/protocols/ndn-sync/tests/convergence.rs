@@ -279,7 +279,13 @@ async fn two_phase_node_receives_update_and_ack_routes() {
     let (b_out_tx, mut b_out_rx) = mpsc::channel::<Bytes>(64);
     let (b_in_tx, b_in_rx) = mpsc::channel::<Bytes>(64);
 
-    let a = join_svs_group(group.clone(), a_name.clone(), a_out_tx, a_in_rx, fast_config());
+    let a = join_svs_group(
+        group.clone(),
+        a_name.clone(),
+        a_out_tx,
+        a_in_rx,
+        fast_config(),
+    );
     // B runs the two-phase (deferred) posture.
     let mut b_cfg = fast_config();
     b_cfg.auto_ack = false;
@@ -306,7 +312,9 @@ async fn two_phase_node_receives_update_and_ack_routes() {
     assert_eq!(update.high_seq, 1, "deferred merge still emits the gap");
 
     // And B can ack it — the two-phase channel is wired end to end (handle → task → node.ack).
-    b.ack(&update.publisher, update.high_seq).await.expect("ack routes");
+    b.ack(&update.publisher, update.high_seq)
+        .await
+        .expect("ack routes");
     drop(a);
     drop(b);
 }

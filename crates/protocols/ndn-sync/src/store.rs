@@ -138,7 +138,15 @@ mod tests {
         // find_under is the CanBePrefix lookup → lexicographically smallest.
         assert_eq!(store.find_under(&n("/a/g")).as_deref(), Some(&b"one"[..]));
 
-        let under: Vec<Name> = store.scan_under(&n("/a/g"), 0).into_iter().map(|(k, _)| k).collect();
-        assert_eq!(under, vec![n("/a/g/1"), n("/a/g/2")], "scan is prefix-scoped and ordered");
+        let under: Vec<Name> = store
+            .scan_under(&n("/a/g"), 0)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(
+            under,
+            vec![n("/a/g/1"), n("/a/g/2")],
+            "scan is prefix-scoped and ordered"
+        );
     }
 }

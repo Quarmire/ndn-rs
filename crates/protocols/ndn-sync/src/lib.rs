@@ -106,6 +106,8 @@ pub use psync_partial::{
 pub use psync_sync::{PSyncConfig, PSyncInbound, join_psync_group};
 pub use pubsub::{Publication, SvsPubSub};
 pub use security::{HmacKey, Insecure, Rejected, SyncSigner, SyncValidator};
+#[cfg(feature = "persistent-store")]
+pub use store::BackendStore;
 pub use svs_local::{
     NeighborAdvance, NeighborSnapshot, StateEntry, SvsLocal, SvsLocalError, decode_svs_data,
     encode_svs_data,
@@ -116,5 +118,3 @@ pub use svsync::{
     DataStore, IngestValidator, MAX_NDN_PACKET_SIZE, MAX_PUBLISHABLE_CONTENT, MemoryStore,
     PublisherSigner, SvSync, SvSyncConfig, svs_data_name,
 };
-#[cfg(feature = "persistent-store")]
-pub use store::BackendStore;

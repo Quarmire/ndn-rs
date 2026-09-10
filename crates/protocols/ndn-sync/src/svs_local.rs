@@ -22,9 +22,10 @@
 //! when `local_boot >= in_boot && local_seq >= in_seq`; otherwise the
 //! local view advances and the caller should fetch.
 
+use portable_atomic::AtomicU64;
 use std::collections::HashMap;
 use std::sync::RwLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
 use ndn_packet::Name;

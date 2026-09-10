@@ -327,13 +327,26 @@ mod tests {
     async fn merge_deferred_holds_gap_until_ack() {
         let node = SvsNode::new(&name("local"));
         // deferred merge detects the gap but does NOT advance our tracked seq
-        assert_eq!(node.merge_deferred(&[e("/a", 3)]).await, vec![("/a".to_string(), 1, 3)]);
+        assert_eq!(
+            node.merge_deferred(&[e("/a", 3)]).await,
+            vec![("/a".to_string(), 1, 3)]
+        );
         // re-merging re-emits the SAME gap — it stays visible (no poison) until acked
-        assert_eq!(node.merge_deferred(&[e("/a", 3)]).await, vec![("/a".to_string(), 1, 3)]);
-        assert_eq!(node.seq_for("/a").await, 0, "deferred merge did not advance the vector");
+        assert_eq!(
+            node.merge_deferred(&[e("/a", 3)]).await,
+            vec![("/a".to_string(), 1, 3)]
+        );
+        assert_eq!(
+            node.seq_for("/a").await,
+            0,
+            "deferred merge did not advance the vector"
+        );
         // ack up to seq 3 → the gap no longer re-emits, and our vector now advertises seq 3
         node.ack("/a", 3).await;
-        assert!(node.merge_deferred(&[e("/a", 3)]).await.is_empty(), "acked seqs stop re-emitting");
+        assert!(
+            node.merge_deferred(&[e("/a", 3)]).await.is_empty(),
+            "acked seqs stop re-emitting"
+        );
         assert_eq!(node.seq_for("/a").await, 3);
     }
 
@@ -341,8 +354,14 @@ mod tests {
     async fn auto_ack_merge_advances_eagerly_as_before() {
         // The default eager path is byte-for-byte the legacy behaviour.
         let node = SvsNode::new(&name("local"));
-        assert_eq!(node.merge(&[e("/a", 3)]).await, vec![("/a".to_string(), 1, 3)]);
-        assert!(node.merge(&[e("/a", 3)]).await.is_empty(), "eager merge already advanced");
+        assert_eq!(
+            node.merge(&[e("/a", 3)]).await,
+            vec![("/a".to_string(), 1, 3)]
+        );
+        assert!(
+            node.merge(&[e("/a", 3)]).await.is_empty(),
+            "eager merge already advanced"
+        );
         assert_eq!(node.seq_for("/a").await, 3);
     }
 

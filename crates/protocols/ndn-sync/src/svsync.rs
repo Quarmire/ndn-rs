@@ -26,9 +26,10 @@
 //! Interests to the core, data Interests under our prefix to the store,
 //! Data to the matching pending fetch.
 
+use portable_atomic::AtomicU64;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -342,7 +343,13 @@ impl SvSync {
         let (core_out_tx, mut core_out_rx) = mpsc::channel::<Bytes>(256);
         let (core_in_tx, core_in_rx) = mpsc::channel::<Bytes>(256);
 
-        let handle = join_svs_group(group.clone(), node.clone(), core_out_tx, core_in_rx, svs_config);
+        let handle = join_svs_group(
+            group.clone(),
+            node.clone(),
+            core_out_tx,
+            core_in_rx,
+            svs_config,
+        );
 
         // Forward the core's Sync Interests onto the shared outbound net.
         let net_out_fwd = net_out.clone();
@@ -488,8 +495,9 @@ impl SvSync {
     /// On success the signed wire is stored byte-for-byte (signature intact) and
     /// the core is advanced by exactly one; returns the claimed seq.
     pub async fn publish_presigned(&self, wire: Bytes) -> Result<u64, SyncError> {
-        let data = Data::decode(wire.clone())
-            .map_err(|e| SyncError::Protocol(format!("presigned wire is not decodable Data: {e}")))?;
+        let data = Data::decode(wire.clone()).map_err(|e| {
+            SyncError::Protocol(format!("presigned wire is not decodable Data: {e}"))
+        })?;
         // Size guard BEFORE the CAS: `wire` is already the final outer Data, so
         // check the EXACT wire against the full packet limit. Rejecting here
         // (before `compare_exchange`) claims no seq — the sequence space stays
@@ -508,7 +516,9 @@ impl SvSync {
             .get(seq_pos)
             .map(|c| crate::tlv::decode_nni(c.value.as_ref()))
             .filter(|&s| s > 0)
-            .ok_or_else(|| SyncError::Protocol(format!("presigned Data name {name} carries no seq")))?;
+            .ok_or_else(|| {
+                SyncError::Protocol(format!("presigned Data name {name} carries no seq"))
+            })?;
         let expected = svs_data_name(&self.node, &self.group, seq);
         if *name != expected {
             return Err(SyncError::Protocol(format!(
@@ -1083,13 +1093,19 @@ mod tests {
             .publish_data(&oversize)
             .await
             .expect_err("content over the single-Data limit must be rejected");
-        assert!(matches!(err, SyncError::Protocol(_)), "typed Protocol rejection");
+        assert!(
+            matches!(err, SyncError::Protocol(_)),
+            "typed Protocol rejection"
+        );
         assert!(store.get(&svs_data_name(&node, &group, 1)).is_none());
 
         // The rejected call consumed NO seq: the next valid publish is seq 1,
         // i.e. the sequence space is gap-free and contiguous.
         let seq = svs.publish_data(b"small").await.expect("small publish");
-        assert_eq!(seq, 1, "rejected oversize publish must not have taken a seq");
+        assert_eq!(
+            seq, 1,
+            "rejected oversize publish must not have taken a seq"
+        );
     }
 
     /// Fix 1 (presigned path), gap-free proof: an oversize presigned wire is
@@ -1116,12 +1132,18 @@ mod tests {
         let n1 = svs_data_name(&device, &group, 1);
         let fat_payload = vec![0u8; MAX_NDN_PACKET_SIZE];
         let oversize_wire: Bytes = DataBuilder::new(n1.clone(), &fat_payload).build();
-        assert!(oversize_wire.len() > MAX_NDN_PACKET_SIZE, "wire is over the packet limit");
+        assert!(
+            oversize_wire.len() > MAX_NDN_PACKET_SIZE,
+            "wire is over the packet limit"
+        );
         let err = svs
             .publish_presigned(oversize_wire)
             .await
             .expect_err("presigned wire over the packet limit must be rejected");
-        assert!(matches!(err, SyncError::Protocol(_)), "typed Protocol rejection");
+        assert!(
+            matches!(err, SyncError::Protocol(_)),
+            "typed Protocol rejection"
+        );
         assert!(store.get(&n1).is_none(), "rejected wire must not be stored");
 
         // No seq was consumed: a valid in-limit seq-1 presigned wire succeeds.
@@ -1130,7 +1152,10 @@ mod tests {
             .publish_presigned(small_wire.clone())
             .await
             .expect("in-limit presigned seq 1 accepted");
-        assert_eq!(seq, 1, "rejected oversize presigned must not have taken seq 1");
+        assert_eq!(
+            seq, 1,
+            "rejected oversize presigned must not have taken seq 1"
+        );
         assert_eq!(store.get(&n1), Some(small_wire));
     }
 
@@ -1439,7 +1464,14 @@ mod tests {
         };
 
         let store_a: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
-        let svs_a = SvSync::join(group.clone(), na.clone(), store_a, a_out_tx, a_in_rx, cfg.clone());
+        let svs_a = SvSync::join(
+            group.clone(),
+            na.clone(),
+            store_a,
+            a_out_tx,
+            a_in_rx,
+            cfg.clone(),
+        );
         let store_b: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
         let svs_b = SvSync::join(group.clone(), nb, store_b, b_out_tx, b_in_rx, cfg);
 
@@ -1448,10 +1480,15 @@ mod tests {
 
         // N-10: reach the handle through the facade; `ack` is callable.
         let handle_b = svs_b.sync_handle();
-        handle_b.ack(&na.to_string(), 1).await.expect("ack via exposed handle");
+        handle_b
+            .ack(&na.to_string(), 1)
+            .await
+            .expect("ack via exposed handle");
 
         // N-9: B observes A's advertised high-water as a per-name depth.
-        let obs = handle_b.observed().expect("SvSync surfaces observed high-water");
+        let obs = handle_b
+            .observed()
+            .expect("SvSync surfaces observed high-water");
         let mut got = None;
         for _ in 0..200 {
             if let Some(seq) = obs.seq_for(&na)
@@ -1462,7 +1499,11 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert_eq!(got, Some(2), "B observes A carried to seq 2 (a name-keyed depth)");
+        assert_eq!(
+            got,
+            Some(2),
+            "B observes A carried to seq 2 (a name-keyed depth)"
+        );
     }
 
     /// Fail-closed trust: with an ingest validator that rejects everything,
@@ -1604,7 +1645,10 @@ mod tests {
 
         // The vector advanced by exactly one: the sidecar's own next real
         // publication takes seq 2 (the observable `publish_data` uses).
-        let next = svs.publish_data(b"sidecar-native").await.expect("publish 2");
+        let next = svs
+            .publish_data(b"sidecar-native")
+            .await
+            .expect("publish 2");
         assert_eq!(next, 2, "vector advanced by exactly one presigned mirror");
     }
 }

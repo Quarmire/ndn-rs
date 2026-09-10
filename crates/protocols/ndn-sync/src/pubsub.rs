@@ -35,9 +35,10 @@
 //! mapping queries and routes mapping-query replies, forwarding all other
 //! traffic to the wrapped `SvSync`.
 
+use portable_atomic::AtomicU64;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 
 use bytes::{Bytes, BytesMut};
 use tokio::sync::{Mutex, mpsc, oneshot};

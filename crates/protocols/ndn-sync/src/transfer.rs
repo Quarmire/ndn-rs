@@ -206,7 +206,13 @@ mod tests {
         // index-ordered, and each slot must carry the wire of ITS index's name.
         let express: Express = Arc::new(|name: Name| {
             Box::pin(async move {
-                let idx: u64 = name.to_string().rsplit('/').next().unwrap().parse().unwrap();
+                let idx: u64 = name
+                    .to_string()
+                    .rsplit('/')
+                    .next()
+                    .unwrap()
+                    .parse()
+                    .unwrap();
                 tokio::time::sleep(std::time::Duration::from_millis(50 - 10 * idx)).await;
                 if idx == 2 {
                     None // one hole
@@ -215,8 +221,7 @@ mod tests {
                 }
             })
         });
-        let out =
-            windowed_fetch_wires(0, 4, 8, |i| n(&format!("/chain/A/{i}")), express).await;
+        let out = windowed_fetch_wires(0, 4, 8, |i| n(&format!("/chain/A/{i}")), express).await;
         assert_eq!(out.len(), 5);
         for (i, slot) in out.iter().enumerate() {
             if i == 2 {
@@ -224,7 +229,11 @@ mod tests {
                 continue;
             }
             let d = Data::decode(slot.clone().unwrap()).unwrap();
-            assert_eq!(*d.name, n(&format!("/chain/A/{i}")), "slot {i} carries its own reply");
+            assert_eq!(
+                *d.name,
+                n(&format!("/chain/A/{i}")),
+                "slot {i} carries its own reply"
+            );
             assert_eq!(d.content().unwrap(), format!("pub{i}").as_bytes());
         }
     }

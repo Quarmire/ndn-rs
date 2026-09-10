@@ -56,14 +56,7 @@ async fn restart_resumes_seq_from_durable_store() {
     {
         let (out, _out_rx) = mpsc::channel(256);
         let (_in_tx, in_rx) = mpsc::channel(256);
-        let svs = SvSync::join(
-            group,
-            node.clone(),
-            Arc::clone(&store),
-            out,
-            in_rx,
-            cfg(),
-        );
+        let svs = SvSync::join(group, node.clone(), Arc::clone(&store), out, in_rx, cfg());
         for i in 1..=3 {
             let seq = svs
                 .publish_data(format!("v{i}").as_bytes())
@@ -73,7 +66,11 @@ async fn restart_resumes_seq_from_durable_store() {
         }
     }
     // The durable store holds seq 1..=3.
-    assert!(store.get(&svs_data_name(&node, &"/repo/grp".parse().unwrap(), 3)).is_some());
+    assert!(
+        store
+            .get(&svs_data_name(&node, &"/repo/grp".parse().unwrap(), 3))
+            .is_some()
+    );
 
     // Boot 2 over the SAME store.
     let group2: ndn_packet::Name = "/repo/grp".parse().unwrap();
@@ -98,7 +95,10 @@ async fn restart_resumes_seq_from_durable_store() {
         .publish_data(b"v4-after-restart")
         .await
         .expect("publish after restart");
-    assert_eq!(next, 4, "restart resumed the seq space from the durable store");
+    assert_eq!(
+        next, 4,
+        "restart resumed the seq space from the durable store"
+    );
 
     let old = store
         .get(&svs_data_name(&node, &group2, 1))

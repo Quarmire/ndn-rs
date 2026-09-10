@@ -354,7 +354,11 @@ impl GroupCore {
                 .recorded
                 .iter()
                 .filter_map(|(k, (b, s))| {
-                    k.parse::<Name>().ok().map(|name| StateEntry { name, boot: *b, seq: *s })
+                    k.parse::<Name>().ok().map(|name| StateEntry {
+                        name,
+                        boot: *b,
+                        seq: *s,
+                    })
                 })
                 .collect();
             self.recorded.clear();
@@ -465,7 +469,9 @@ impl GroupCore {
         use tokio::sync::mpsc::error::TrySendError;
         let keys: Vec<String> = self.pending.keys().cloned().collect();
         for k in keys {
-            let Some(update) = self.pending.get(&k).cloned() else { continue };
+            let Some(update) = self.pending.get(&k).cloned() else {
+                continue;
+            };
             match self.update_tx.try_send(update) {
                 Ok(()) | Err(TrySendError::Closed(_)) => {
                     self.pending.remove(&k);
@@ -818,9 +824,18 @@ mod tests {
         let dflt = SvsConfig::default();
 
         // The orderings that define the environments.
-        assert!(lan.sync_interval < wan.sync_interval, "lan is tighter than wan");
-        assert!(sim.sync_interval <= lan.sync_interval, "sim is at least as tight as lan");
-        assert!(wan.sync_interval <= dflt.sync_interval, "wan stays under the lab default");
+        assert!(
+            lan.sync_interval < wan.sync_interval,
+            "lan is tighter than wan"
+        );
+        assert!(
+            sim.sync_interval <= lan.sync_interval,
+            "sim is at least as tight as lan"
+        );
+        assert!(
+            wan.sync_interval <= dflt.sync_interval,
+            "wan stays under the lab default"
+        );
         assert!(
             lan.suppression_period < wan.suppression_period,
             "wan gives catch-up replies room across real latency spreads"
@@ -828,7 +843,12 @@ mod tests {
         assert_eq!(sim.jitter_ms, 0, "sim is deterministic: no interval jitter");
 
         // Internal coherence: jitter and suppression stay well inside the periodic interval.
-        for (tag, c) in [("lan", &lan), ("wan", &wan), ("sim", &sim), ("default", &dflt)] {
+        for (tag, c) in [
+            ("lan", &lan),
+            ("wan", &wan),
+            ("sim", &sim),
+            ("default", &dflt),
+        ] {
             assert!(
                 Duration::from_millis(c.jitter_ms) < c.sync_interval,
                 "{tag}: jitter must not swamp the interval"
@@ -1406,7 +1426,10 @@ mod tests {
                 break e.seq;
             }
         };
-        assert_eq!(advertised, 5, "acked seq must be advertised (ack arm serviced)");
+        assert_eq!(
+            advertised, 5,
+            "acked seq must be advertised (ack arm serviced)"
+        );
     }
 
     /// Poll the observed high-water for `name` until it reaches `want` (recording
@@ -1418,7 +1441,10 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        panic!("observed {name} never reached {want}; got {:?}", obs.seq_for(name));
+        panic!(
+            "observed {name} never reached {want}; got {:?}",
+            obs.seq_for(name)
+        );
     }
 
     #[tokio::test]
@@ -1440,14 +1466,27 @@ mod tests {
         let obs = handle.observed().expect("svs records observed high-water");
 
         let pubn: Name = "/test/svs/pub".parse().unwrap();
-        recv_tx.send(peer_sync_interest(&group, &[("/test/svs/pub", 5)])).await.unwrap();
+        recv_tx
+            .send(peer_sync_interest(&group, &[("/test/svs/pub", 5)]))
+            .await
+            .unwrap();
         wait_observed(obs, &pubn, 5).await;
-        assert_eq!(obs.seq_for(&"/test/svs/never".parse().unwrap()), None, "unseen name absent");
+        assert_eq!(
+            obs.seq_for(&"/test/svs/never".parse().unwrap()),
+            None,
+            "unseen name absent"
+        );
 
         // A lower advert then a higher one, in order: reaching 8 proves the
         // interleaved 3 was processed and did NOT regress the high-water.
-        recv_tx.send(peer_sync_interest(&group, &[("/test/svs/pub", 3)])).await.unwrap();
-        recv_tx.send(peer_sync_interest(&group, &[("/test/svs/pub", 8)])).await.unwrap();
+        recv_tx
+            .send(peer_sync_interest(&group, &[("/test/svs/pub", 3)]))
+            .await
+            .unwrap();
+        recv_tx
+            .send(peer_sync_interest(&group, &[("/test/svs/pub", 8)]))
+            .await
+            .unwrap();
         wait_observed(obs, &pubn, 8).await;
     }
 
@@ -1475,7 +1514,13 @@ mod tests {
         // (60 s interval → no immediate periodic; the only send is the forced
         // post-publish announce captured below.)
         // Peer claims it has stored our data to seq 7.
-        recv_tx.send(peer_sync_interest(&group, &["/test/svs/me"].map(|n| (n, 7)))).await.unwrap();
+        recv_tx
+            .send(peer_sync_interest(
+                &group,
+                &["/test/svs/me"].map(|n| (n, 7)),
+            ))
+            .await
+            .unwrap();
         wait_observed(obs, &local, 7).await;
 
         // Our OWN authoritative publish count is independent: one publish
@@ -1487,7 +1532,15 @@ mod tests {
             .expect("open");
         let (sv, _) = parse_sync_interest(&group, &raw, V2).expect("parse");
         let me_seq = sv.iter().find(|e| e.name == local).map(|e| e.seq);
-        assert_eq!(me_seq, Some(1), "authoritative advertised seq is our real publish count");
-        assert_eq!(obs.seq_for(&local), Some(7), "observation is a separate 'carried to 7' depth");
+        assert_eq!(
+            me_seq,
+            Some(1),
+            "authoritative advertised seq is our real publish count"
+        );
+        assert_eq!(
+            obs.seq_for(&local),
+            Some(7),
+            "observation is a separate 'carried to 7' depth"
+        );
     }
 }

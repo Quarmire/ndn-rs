@@ -225,7 +225,10 @@ impl SyncHandle {
     /// A rejected/held item is simply *not* acked, and its gap stays visible (no poison).
     pub async fn ack(&self, publisher: &str, seq: u64) -> Result<(), SyncError> {
         match &self.ack_tx {
-            Some(tx) => tx.send((publisher.to_string(), seq)).await.map_err(|_| SyncError::Disconnected),
+            Some(tx) => tx
+                .send((publisher.to_string(), seq))
+                .await
+                .map_err(|_| SyncError::Disconnected),
             None => Ok(()),
         }
     }
