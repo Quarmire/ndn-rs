@@ -17,9 +17,12 @@ use crate::tlv_type;
 use crate::{Name, PacketError, SignatureInfo};
 use ndn_tlv::TlvReader;
 
+/// The Interest selectors that constrain which Data may satisfy it.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Selector {
+    /// `CanBePrefix`: the name may match a Data name of which it is a prefix.
     pub can_be_prefix: bool,
+    /// `MustBeFresh`: only Data still within its `FreshnessPeriod` may satisfy it.
     pub must_be_fresh: bool,
 }
 
@@ -42,6 +45,8 @@ pub struct Interest {
 }
 
 impl Interest {
+    /// Builds an Interest carrying only `name`; all other fields stay absent
+    /// until set on encode.
     pub fn new(name: Name) -> Self {
         Self {
             raw: Bytes::new(),
@@ -58,6 +63,9 @@ impl Interest {
         }
     }
 
+    /// Decodes an Interest from its on-wire TLV form, validating the packet
+    /// structure (non-empty name, body ordering, and ParametersSha256 rules).
+    /// Field bodies stay lazily decoded — see the accessors.
     pub fn decode(raw: Bytes) -> Result<Self, PacketError> {
         let mut reader = TlvReader::new(raw.clone());
         let (typ, value) = reader.read_tlv()?;
@@ -98,23 +106,27 @@ impl Interest {
         })
     }
 
+    /// The Interest [`Selector`]s (`CanBePrefix` / `MustBeFresh`); defaults if absent.
     pub fn selectors(&self) -> &Selector {
         self.selectors
             .get_or_init(|| decode_selectors(&self.raw).unwrap_or_default())
     }
 
+    /// The Interest `Nonce`, if present.
     pub fn nonce(&self) -> Option<u32> {
         *self
             .nonce
             .get_or_init(|| decode_nonce(&self.raw).ok().flatten())
     }
 
+    /// The `InterestLifetime`, if present.
     pub fn lifetime(&self) -> Option<Duration> {
         *self
             .lifetime
             .get_or_init(|| decode_lifetime(&self.raw).ok().flatten())
     }
 
+    /// The `ApplicationParameters` TLV value, if present.
     pub fn app_parameters(&self) -> Option<&Bytes> {
         self.app_params
             .get_or_init(|| decode_app_params(&self.raw).ok().flatten())
@@ -151,12 +163,14 @@ impl Interest {
             .get_or_init(|| decode_hop_limit(&self.raw).ok().flatten())
     }
 
+    /// The `InterestSignatureInfo` of a Signed Interest, if present.
     pub fn sig_info(&self) -> Option<&SignatureInfo> {
         self.sig_info
             .get_or_init(|| decode_interest_sig_info(&self.raw).ok().flatten())
             .as_ref()
     }
 
+    /// The `InterestSignatureValue` of a Signed Interest, if present.
     pub fn sig_value(&self) -> Option<&Bytes> {
         self.sig_value
             .get_or_init(|| decode_interest_sig_value(&self.raw).ok().flatten())
@@ -172,6 +186,7 @@ impl Interest {
         compute_interest_signed_region(&self.raw).ok().flatten()
     }
 
+    /// The full on-wire Interest bytes (empty for an unencoded [`Interest::new`]).
     pub fn raw(&self) -> &Bytes {
         &self.raw
     }

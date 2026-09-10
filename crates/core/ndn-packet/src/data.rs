@@ -47,6 +47,9 @@ pub struct Data {
 }
 
 impl Data {
+    /// Decodes a Data packet from its on-wire TLV form, validating the packet
+    /// structure and locating the signed range and SignatureValue. Field bodies
+    /// stay lazily decoded — see the accessors.
     pub fn decode(raw: Bytes) -> Result<Self, PacketError> {
         let mut reader = TlvReader::new(raw.clone());
         let (typ, value) = reader.read_tlv()?;
@@ -100,10 +103,12 @@ impl Data {
         })
     }
 
+    /// The signed byte range (Name through SignatureInfo) covered by the signature.
     pub fn signed_region(&self) -> &[u8] {
         &self.raw[self.signed_start..self.signed_end]
     }
 
+    /// The raw `SignatureValue` bytes; empty when the packet carries no signature.
     pub fn sig_value(&self) -> &[u8] {
         if self.sig_value_start == 0 || self.sig_value_end == 0 {
             return &[];
@@ -120,6 +125,7 @@ impl Data {
         }
     }
 
+    /// The full on-wire Data bytes.
     pub fn raw(&self) -> &Bytes {
         &self.raw
     }
@@ -186,18 +192,21 @@ impl Data {
         }
     }
 
+    /// The `Content` TLV value, if present.
     pub fn content(&self) -> Option<&Bytes> {
         self.content
             .get_or_init(|| decode_content(&self.raw).ok().flatten())
             .as_ref()
     }
 
+    /// The `MetaInfo` element, if present.
     pub fn meta_info(&self) -> Option<&MetaInfo> {
         self.meta_info
             .get_or_init(|| decode_meta_info(&self.raw).ok().flatten())
             .as_ref()
     }
 
+    /// The `SignatureInfo` element, if present.
     pub fn sig_info(&self) -> Option<&SignatureInfo> {
         self.sig_info
             .get_or_init(|| decode_sig_info(&self.raw).ok().flatten())
