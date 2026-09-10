@@ -26,7 +26,9 @@ async fn main() -> anyhow::Result<()> {
 
     let _guard = alice
         .serve("/hello", |interest, reply| async move {
-            let _ = reply.respond((*interest.name).clone(), "hello from ndn-rs").await;
+            let _ = reply
+                .respond((*interest.name).clone(), "hello from ndn-rs")
+                .await;
         })
         .await?;
 

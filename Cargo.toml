@@ -103,6 +103,7 @@ unimplemented = "warn"
 name = "ndn-rs"
 
 [workspace.dependencies]
+portable-atomic = { version = "1.11", default-features = false, features = ["fallback", "std"] }
 # NDN workspace crates — grouped by subdirectory layer
 ndn-foundation-types = { path = "crates/core/ndn-foundation-types", default-features = false }
 ndn-storage   = { path = "crates/core/ndn-storage" }

@@ -6,6 +6,7 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+portable-atomic = { workspace = true }
 # The one NDN dependency: the `ndn` umbrella (package `ndn-rs-prelude`)
 # covers the reach-in surface too — `use ndn::strategy::Strategy;`.
 ndn-rs-prelude = { workspace = true }
