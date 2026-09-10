@@ -102,8 +102,7 @@ pub fn peek_lp_name(lp_wire: &[u8]) -> Option<PeekedName<'_>> {
     }
     let (nlen, nln) = ndn_tlv::read_varu64(body.get(ntn..)?).ok()?;
     let name_start = ntn.checked_add(nln)?;
-    let name_val =
-        body.get(name_start..name_start.checked_add(usize::try_from(nlen).ok()?)?)?;
+    let name_val = body.get(name_start..name_start.checked_add(usize::try_from(nlen).ok()?)?)?;
     let mut components = Vec::new();
     let mut pos = 0usize;
     while pos < name_val.len() {

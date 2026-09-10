@@ -5,7 +5,8 @@
 //! - `on_ingress` feeds inbound LP bytes so Acks consume tracked entries.
 //! - `take_retransmissions` pulls retx wires and bumps `n_lp_resent_packets`.
 
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
+use portable_atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;

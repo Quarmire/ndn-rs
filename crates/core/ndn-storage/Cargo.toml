@@ -36,6 +36,7 @@ named = ["std", "dep:ndn-packet", "dep:ndn-tlv"]
 redb = ["std", "dep:redb", "dep:tokio"]
 
 [dependencies]
+portable-atomic = { workspace = true }
 bytes = { workspace = true, default-features = false }
 async-trait = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }

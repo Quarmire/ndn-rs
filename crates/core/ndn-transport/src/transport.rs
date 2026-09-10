@@ -130,7 +130,8 @@ pub trait Transport: Send + Sync + 'static {
     /// reception report's RSSI) to the actual receiving radio. Default: no tag.
     fn recv_bytes_with_meta(
         &self,
-    ) -> impl Future<Output = Result<(Bytes, Option<FaceAddr>, Option<u16>), FaceError>> + Send {
+    ) -> impl Future<Output = Result<(Bytes, Option<FaceAddr>, Option<u16>), FaceError>> + Send
+    {
         async { self.recv_bytes_with_addr().await.map(|(b, a)| (b, a, None)) }
     }
 
@@ -217,7 +218,11 @@ pub trait ErasedTransport: Send + Sync + 'static {
     fn recv_bytes_with_meta(
         &self,
     ) -> Pin<
-        Box<dyn Future<Output = Result<(Bytes, Option<FaceAddr>, Option<u16>), FaceError>> + Send + '_>,
+        Box<
+            dyn Future<Output = Result<(Bytes, Option<FaceAddr>, Option<u16>), FaceError>>
+                + Send
+                + '_,
+        >,
     > {
         Box::pin(async move { self.recv_bytes_with_addr().await.map(|(b, a)| (b, a, None)) })
     }
@@ -290,7 +295,11 @@ impl<T: Transport> ErasedTransport for T {
     fn recv_bytes_with_meta(
         &self,
     ) -> Pin<
-        Box<dyn Future<Output = Result<(Bytes, Option<FaceAddr>, Option<u16>), FaceError>> + Send + '_>,
+        Box<
+            dyn Future<Output = Result<(Bytes, Option<FaceAddr>, Option<u16>), FaceError>>
+                + Send
+                + '_,
+        >,
     > {
         Box::pin(Transport::recv_bytes_with_meta(self))
     }

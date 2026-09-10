@@ -7,8 +7,9 @@
 //! depth in items; this keeps the feature free of an `ndn-engine` dep
 //! and wasm-portable.
 
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
+use portable_atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 
 use bytes::{Bytes, BytesMut};
@@ -226,7 +227,7 @@ mod tests {
     use super::*;
     use crate::FaceId;
     use ndn_packet::lp::{LpPacket, encode_lp_packet};
-    use std::sync::atomic::AtomicU64;
+    use portable_atomic::AtomicU64;
 
     fn bare_interest() -> Bytes {
         use ndn_tlv::TlvWriter;

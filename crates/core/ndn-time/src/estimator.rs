@@ -28,7 +28,7 @@
 //!
 //! [`position_stddev`]: CoupledEstimator::position_stddev
 
-use crate::channel_obs::{ChannelObs, C_M_PER_S};
+use crate::channel_obs::{C_M_PER_S, ChannelObs};
 
 /// State dimension: `[px, py, pz, vx, vy, vz, offset, skew]`.
 const N: usize = 8;
@@ -167,7 +167,9 @@ impl CoupledEstimator {
         if r < 1e-6 || carrier_hz <= 0.0 {
             return false;
         }
-        let pv = self.x[PX] * self.x[VX] + self.x[PX + 1] * self.x[VX + 1] + self.x[PX + 2] * self.x[VX + 2];
+        let pv = self.x[PX] * self.x[VX]
+            + self.x[PX + 1] * self.x[VX + 1]
+            + self.x[PX + 2] * self.x[VX + 2];
         let rr = pv / r; // range-rate
         let k_fc = -carrier_hz / C_M_PER_S;
         let h_pred = k_fc * rr;
@@ -226,7 +228,11 @@ impl CoupledEstimator {
     }
     /// The current range estimate `‖p‖` (m).
     pub fn range(&self) -> f64 {
-        sqrt(self.x[PX] * self.x[PX] + self.x[PX + 1] * self.x[PX + 1] + self.x[PX + 2] * self.x[PX + 2])
+        sqrt(
+            self.x[PX] * self.x[PX]
+                + self.x[PX + 1] * self.x[PX + 1]
+                + self.x[PX + 2] * self.x[PX + 2],
+        )
     }
     /// The 1-σ position uncertainty (m), `√tr(P_pos)` — the observability readout. It stays large
     /// when the geometry/motion leaves position unobservable (§14), and shrinks as fixes accrue.
@@ -398,7 +404,11 @@ mod tests {
             e.observe_owd(t.owd(), 20e-9); // one-way time ±20 ns
         }
         // Range is observable and locks on:
-        assert!((e.range() - t.range()).abs() < 3.0, "range err {}", (e.range() - t.range()).abs());
+        assert!(
+            (e.range() - t.range()).abs() < 3.0,
+            "range err {}",
+            (e.range() - t.range()).abs()
+        );
         // The coupling did its job: with range resolving the path delay, the clock offset is pinned
         // far below the 0.3 ms init error, and its uncertainty collapsed.
         assert!(
@@ -406,9 +416,16 @@ mod tests {
             "offset err {} s",
             (e.clock_offset() - t.b).abs()
         );
-        assert!(e.offset_stddev() < off_std0 / 100.0, "clock uncertainty barely shrank");
+        assert!(
+            e.offset_stddev() < off_std0 / 100.0,
+            "clock uncertainty barely shrank"
+        );
         // Skew (from the offset drifting across the run) is recovered to within a few ppb.
-        assert!((e.clock_skew() - t.d).abs() < 5e-9, "skew err {}", (e.clock_skew() - t.d).abs());
+        assert!(
+            (e.clock_skew() - t.d).abs() < 5e-9,
+            "skew err {}",
+            (e.clock_skew() - t.d).abs()
+        );
     }
 
     #[test]

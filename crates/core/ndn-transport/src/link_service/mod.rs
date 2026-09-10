@@ -12,10 +12,11 @@
 //! `GenericLinkService`.
 
 use bytes::Bytes;
+use portable_atomic::AtomicU64;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 
 use crate::face::{FaceAddr, FaceError, FaceId, FaceKind};
 use crate::face_options::{FaceOption, FaceOptionError, FaceOptions};
@@ -233,7 +234,9 @@ impl LpLinkService {
     /// packets into one that still decodes. See
     /// `ndn-packet/tests/reassembly_key.rs`.
     fn reserve_fragment_seqs(&self, packet_len: usize, mtu: usize) -> u64 {
-        let payload_cap = mtu.saturating_sub(ndn_packet::fragment::FRAG_OVERHEAD).max(1);
+        let payload_cap = mtu
+            .saturating_sub(ndn_packet::fragment::FRAG_OVERHEAD)
+            .max(1);
         let n = packet_len.div_ceil(payload_cap).max(1) as u64;
         self.fragment_seq.fetch_add(n, Ordering::Relaxed)
     }

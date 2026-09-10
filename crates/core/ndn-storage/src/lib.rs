@@ -1649,7 +1649,8 @@ mod tests {
     #[cfg(feature = "fjall")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fjall_backend_conformance_and_persistence() {
-        use std::sync::atomic::{AtomicU64, Ordering};
+        use portable_atomic::AtomicU64;
+        use std::sync::atomic::Ordering;
         static CTR: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
             "ndn-storage-test-{}-{}",
@@ -1683,7 +1684,8 @@ mod tests {
     #[cfg(feature = "redb")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn redb_backend_conformance_and_persistence() {
-        use std::sync::atomic::{AtomicU64, Ordering};
+        use portable_atomic::AtomicU64;
+        use std::sync::atomic::Ordering;
         static CTR: AtomicU64 = AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
             "ndn-storage-redb-{}-{}.redb",
@@ -1716,7 +1718,8 @@ mod tests {
     #[cfg(feature = "fjall")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fjall_cross_partition_atomic_batch() {
-        use std::sync::atomic::{AtomicU64, Ordering};
+        use portable_atomic::AtomicU64;
+        use std::sync::atomic::Ordering;
         static CTR: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
             "ndn-storage-fjalldb-{}-{}",
@@ -1799,7 +1802,8 @@ mod tests {
     #[cfg(feature = "redb")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn redb_cross_partition_atomic_batch() {
-        use std::sync::atomic::{AtomicU64, Ordering};
+        use portable_atomic::AtomicU64;
+        use std::sync::atomic::Ordering;
         static CTR: AtomicU64 = AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
             "ndn-storage-redbdb-{}-{}.redb",
@@ -1906,7 +1910,8 @@ mod tests {
     #[cfg(feature = "fjall")]
     #[test]
     fn fjall_sync_facet_conformance() {
-        use std::sync::atomic::{AtomicU64, Ordering};
+        use portable_atomic::AtomicU64;
+        use std::sync::atomic::Ordering;
         static CTR: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
             "ndn-storage-fjall-sync-{}-{}",
@@ -1923,7 +1928,8 @@ mod tests {
     #[cfg(feature = "fjall")]
     #[test]
     fn fjall_sync_cross_partition_batch() {
-        use std::sync::atomic::{AtomicU64, Ordering};
+        use portable_atomic::AtomicU64;
+        use std::sync::atomic::Ordering;
         static CTR: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
             "ndn-storage-fjall-syncbatch-{}-{}",
@@ -1953,7 +1959,8 @@ mod tests {
     #[cfg(feature = "redb")]
     #[test]
     fn redb_sync_facet_conformance() {
-        use std::sync::atomic::{AtomicU64, Ordering};
+        use portable_atomic::AtomicU64;
+        use std::sync::atomic::Ordering;
         static CTR: AtomicU64 = AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
             "ndn-storage-redb-sync-{}-{}.redb",

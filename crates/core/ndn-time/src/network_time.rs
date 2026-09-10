@@ -71,7 +71,14 @@ pub struct NetworkTime {
 impl NetworkTime {
     /// A node that starts as its own reference (stratum 0), until it hears a lower-id one.
     pub fn new(my_id: u64) -> Self {
-        Self { my_id, best: RefBelief { ref_id: my_id, stratum: 0, offset_to_ref: 0 } }
+        Self {
+            my_id,
+            best: RefBelief {
+                ref_id: my_id,
+                stratum: 0,
+                offset_to_ref: 0,
+            },
+        }
     }
 
     /// Ingest a neighbour's advertised belief plus the **measured hardware offset to that neighbour**
@@ -131,16 +138,34 @@ mod tests {
     // A line A(1) — B(2) — C(3): A is the lowest id, so all converge to A, C via B (2 hops).
     #[test]
     fn line_converges_to_the_lowest_id_reference() {
-        let (mut a, mut b, mut c) = (NetworkTime::new(1), NetworkTime::new(2), NetworkTime::new(3));
+        let (mut a, mut b, mut c) = (
+            NetworkTime::new(1),
+            NetworkTime::new(2),
+            NetworkTime::new(3),
+        );
         // A is alone → its own reference.
         assert!(a.is_reference());
         // B hears A. Say B's hardware offset to A is +1000 µs (A_tsf − B_rxtsfl).
         assert!(b.observe(1000, a.belief()));
-        assert_eq!(b.belief(), RefBelief { ref_id: 1, stratum: 1, offset_to_ref: 1000 });
+        assert_eq!(
+            b.belief(),
+            RefBelief {
+                ref_id: 1,
+                stratum: 1,
+                offset_to_ref: 1000
+            }
+        );
         assert!(!b.is_reference());
         // C hears B (C's hw offset to B = +2000). C composes to A via B: 2 hops, offset 2000 + 1000.
         assert!(c.observe(2000, b.belief()));
-        assert_eq!(c.belief(), RefBelief { ref_id: 1, stratum: 2, offset_to_ref: 3000 });
+        assert_eq!(
+            c.belief(),
+            RefBelief {
+                ref_id: 1,
+                stratum: 2,
+                offset_to_ref: 3000
+            }
+        );
         // C's network time = C_local + 3000 ≈ A's timeline (2 hops of composition).
         assert_eq!(c.offset_to_ref(), 3000);
     }
@@ -149,11 +174,32 @@ mod tests {
     fn prefers_shorter_path_and_ignores_children() {
         let mut c = NetworkTime::new(3);
         // C hears B(ref A, stratum 1, off 1000) via hw offset 2000 → stratum 2.
-        c.observe(2000, RefBelief { ref_id: 1, stratum: 1, offset_to_ref: 1000 });
+        c.observe(
+            2000,
+            RefBelief {
+                ref_id: 1,
+                stratum: 1,
+                offset_to_ref: 1000,
+            },
+        );
         assert_eq!(c.belief().stratum, 2);
         // C also hears A directly (ref A, stratum 0, off 0) via hw offset 500 → stratum 1, strictly better.
-        assert!(c.observe(500, RefBelief { ref_id: 1, stratum: 0, offset_to_ref: 0 }));
-        assert_eq!(c.belief(), RefBelief { ref_id: 1, stratum: 1, offset_to_ref: 500 });
+        assert!(c.observe(
+            500,
+            RefBelief {
+                ref_id: 1,
+                stratum: 0,
+                offset_to_ref: 0
+            }
+        ));
+        assert_eq!(
+            c.belief(),
+            RefBelief {
+                ref_id: 1,
+                stratum: 1,
+                offset_to_ref: 500
+            }
+        );
         // A hearing C advertise A-as-ref must NOT adopt C as parent (loop / child).
         let mut a = NetworkTime::new(1);
         assert!(!a.observe(-500, c.belief()));
@@ -164,7 +210,14 @@ mod tests {
     fn a_higher_id_neighbour_does_not_displace_our_reference() {
         let mut a = NetworkTime::new(1);
         // A hears B(2) advertising itself → A keeps itself (lower id).
-        assert!(!a.observe(1000, RefBelief { ref_id: 2, stratum: 0, offset_to_ref: 0 }));
+        assert!(!a.observe(
+            1000,
+            RefBelief {
+                ref_id: 2,
+                stratum: 0,
+                offset_to_ref: 0
+            }
+        ));
         assert!(a.is_reference());
     }
 }

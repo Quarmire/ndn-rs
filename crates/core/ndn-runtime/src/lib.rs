@@ -190,7 +190,8 @@ pub fn default_runtime() -> Arc<dyn Runtime> {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use portable_atomic::AtomicU64;
+    use std::sync::atomic::Ordering;
 
     /// The default `unix_nanos()` reads the system clock — production runtimes get it free.
     #[test]

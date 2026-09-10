@@ -48,7 +48,11 @@ impl Default for RadioHwClock {
     /// The Realtek free-run RX TSF default (32-bit µs). Use [`RadioHwClock::with_period`] for a
     /// wider counter.
     fn default() -> Self {
-        Self { offset: None, domain: None, period: RXTSF_PERIOD_US }
+        Self {
+            offset: None,
+            domain: None,
+            period: RXTSF_PERIOD_US,
+        }
     }
 }
 
@@ -61,7 +65,11 @@ impl RadioHwClock {
     /// A clock for a counter with an explicit wrap `period` (counter units). Pass `0` for a
     /// full-width 64-bit counter that is not unwrapped.
     pub fn with_period(period: u64) -> Self {
-        Self { offset: None, domain: None, period: period as i64 }
+        Self {
+            offset: None,
+            domain: None,
+            period: period as i64,
+        }
     }
 
     /// A **common-view** clock: disciplined via [`on_raw`](Self::on_raw) to a *shared reference*
@@ -153,7 +161,12 @@ mod tests {
     use crate::stamp::LatchPoint;
 
     fn stamp(raw: u64, domain: u32) -> LinkStamp {
-        LinkStamp { raw, domain: ClockDomainId(domain), precision_ns: 1000, latch: LatchPoint::MacDone }
+        LinkStamp {
+            raw,
+            domain: ClockDomainId(domain),
+            precision_ns: 1000,
+            latch: LatchPoint::MacDone,
+        }
     }
 
     #[test]
@@ -186,7 +199,10 @@ mod tests {
         let hw = c.on_stamp(&stamp(raw, 1), host);
         // disciplined hw time stays near the host clock (small negative offset), not 5 wraps off.
         let off = c.offset_us().unwrap();
-        assert!(off.abs() < RXTSF_PERIOD_US / 2, "offset {off} should be centered, not a full wrap");
+        assert!(
+            off.abs() < RXTSF_PERIOD_US / 2,
+            "offset {off} should be centered, not a full wrap"
+        );
         assert_eq!(hw, (host as i64 + off) as u64);
     }
 
@@ -213,7 +229,11 @@ mod tests {
         let off = c.offset_us();
         // a stamp from a different radio's counter must not re-phase this single-radio clock.
         c.on_stamp(&stamp(42, 2), 600);
-        assert_eq!(c.offset_us(), off, "foreign-domain stamp corrupted the offset");
+        assert_eq!(
+            c.offset_us(),
+            off,
+            "foreign-domain stamp corrupted the offset"
+        );
         assert_eq!(c.domain(), Some(ClockDomainId(1)));
     }
 }

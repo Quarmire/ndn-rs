@@ -21,7 +21,7 @@ pub struct FaceTable {
     faces: DashMap<FaceId, Arc<Face>>,
     #[cfg(target_arch = "wasm32")]
     faces: Mutex<std::collections::HashMap<FaceId, Arc<Face>>>,
-    next_id: std::sync::atomic::AtomicU64,
+    next_id: portable_atomic::AtomicU64,
 }
 
 /// Snapshot of a face's metadata.
@@ -40,7 +40,7 @@ impl FaceTable {
             faces: DashMap::new(),
             #[cfg(target_arch = "wasm32")]
             faces: Mutex::new(std::collections::HashMap::new()),
-            next_id: std::sync::atomic::AtomicU64::new(1),
+            next_id: portable_atomic::AtomicU64::new(1),
         }
     }
 

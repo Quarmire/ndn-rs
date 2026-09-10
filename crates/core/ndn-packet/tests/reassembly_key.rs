@@ -18,10 +18,7 @@ use std::time::Duration;
 
 /// Reassemble `fragments` the way a caller does, keyed by `key_of(sequence,
 /// frag_index)`. Returns the recovered packet, if any.
-fn reassemble_with(
-    fragments: &[Bytes],
-    key_of: fn(u64, u64) -> u64,
-) -> Option<Bytes> {
+fn reassemble_with(fragments: &[Bytes], key_of: fn(u64, u64) -> u64) -> Option<Bytes> {
     let mut rb = ReassemblyBuffer::new(Duration::from_secs(2));
     let mut out = None;
     for f in fragments {
@@ -99,7 +96,13 @@ fn overlapping_sequences_assemble_a_frankenstein_packet() {
     let mut recovered = Vec::new();
     for f in fa.iter().chain(fb.iter()) {
         let h = extract_fragment(f).unwrap();
-        if let Some(pkt) = rb.process(0, h.sequence - h.frag_index, h.frag_index, h.frag_count, f.slice(h.frag_start..h.frag_end)) {
+        if let Some(pkt) = rb.process(
+            0,
+            h.sequence - h.frag_index,
+            h.frag_index,
+            h.frag_count,
+            f.slice(h.frag_start..h.frag_end),
+        ) {
             recovered.push(pkt);
         }
     }
@@ -113,7 +116,13 @@ fn overlapping_sequences_assemble_a_frankenstein_packet() {
     let mut mixed = Vec::new();
     for f in fa.iter().chain(fb.iter()) {
         let h = extract_fragment(f).unwrap();
-        if let Some(pkt) = rb.process(0, h.sequence, h.frag_index, h.frag_count, f.slice(h.frag_start..h.frag_end)) {
+        if let Some(pkt) = rb.process(
+            0,
+            h.sequence,
+            h.frag_index,
+            h.frag_count,
+            f.slice(h.frag_start..h.frag_end),
+        ) {
             mixed.push(pkt);
         }
     }

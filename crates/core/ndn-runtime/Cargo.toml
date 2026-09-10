@@ -12,6 +12,7 @@ license.workspace = true
 classification = "spec"
 
 [dependencies]
+portable-atomic = { workspace = true }
 # BoxFuture / LocalBoxFuture convenience types
 futures = { workspace = true }
 # web-time provides Instant/SystemTime on both native (delegates to std) and

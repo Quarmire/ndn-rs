@@ -19,7 +19,8 @@
 //! `CclfStrategy` installs the global ingress sink (→ its neighbor table) and
 //! the app installs the global presence source (the node's Name).
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use portable_atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
 // `web_time::Instant` is `std::time::Instant` on native and a `performance.now()`
