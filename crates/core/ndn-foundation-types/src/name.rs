@@ -12,6 +12,7 @@ use ndn_tlv::{TlvReader, TlvWriter};
 
 use crate::tlv_type;
 
+/// Error returned when a name or component fails to decode or validate.
 #[derive(Debug, PartialEq, Eq)]
 pub struct NameError(pub &'static str);
 
@@ -29,7 +30,9 @@ impl core::error::Error for NameError {}
 /// then TLV-LENGTH (shorter is smaller), then TLV-VALUE byte-by-byte.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct NameComponent {
+    /// TLV-TYPE of the component (e.g. `GenericNameComponent`, `SegmentNameComponent`).
     pub typ: u64,
+    /// TLV-VALUE bytes of the component.
     pub value: Bytes,
 }
 
@@ -49,10 +52,12 @@ impl Ord for NameComponent {
 }
 
 impl NameComponent {
+    /// Builds a component from an explicit TLV type and value.
     pub fn new(typ: u64, value: Bytes) -> Self {
         Self { typ, value }
     }
 
+    /// A `GenericNameComponent` holding arbitrary bytes.
     pub fn generic(value: Bytes) -> Self {
         Self {
             typ: tlv_type::GENERIC_NAME_COMPONENT,
@@ -60,42 +65,52 @@ impl NameComponent {
         }
     }
 
+    /// A `KeywordNameComponent`.
     pub fn keyword(value: Bytes) -> Self {
         Self::new(tlv_type::KEYWORD, value)
     }
 
+    /// A `ByteOffsetNameComponent` encoding `offset` as a NonNegativeInteger.
     pub fn byte_offset(offset: u64) -> Self {
         Self::new(tlv_type::BYTE_OFFSET, encode_nonneg_integer(offset))
     }
 
+    /// A `VersionNameComponent` encoding `v` as a NonNegativeInteger.
     pub fn version(v: u64) -> Self {
         Self::new(tlv_type::VERSION, encode_nonneg_integer(v))
     }
 
+    /// A `TimestampNameComponent` encoding `ts` as a NonNegativeInteger.
     pub fn timestamp(ts: u64) -> Self {
         Self::new(tlv_type::TIMESTAMP, encode_nonneg_integer(ts))
     }
 
+    /// A `SequenceNumNameComponent` encoding `seq` as a NonNegativeInteger.
     pub fn sequence_num(seq: u64) -> Self {
         Self::new(tlv_type::SEQUENCE_NUM, encode_nonneg_integer(seq))
     }
 
+    /// The segment number, or `None` if this is not a `SegmentNameComponent`.
     pub fn as_segment(&self) -> Option<u64> {
         (self.typ == tlv_type::SEGMENT).then(|| decode_nonnegative_integer(&self.value))
     }
 
+    /// The byte offset, or `None` if this is not a `ByteOffsetNameComponent`.
     pub fn as_byte_offset(&self) -> Option<u64> {
         (self.typ == tlv_type::BYTE_OFFSET).then(|| decode_nonnegative_integer(&self.value))
     }
 
+    /// The version, or `None` if this is not a `VersionNameComponent`.
     pub fn as_version(&self) -> Option<u64> {
         (self.typ == tlv_type::VERSION).then(|| decode_nonnegative_integer(&self.value))
     }
 
+    /// The timestamp, or `None` if this is not a `TimestampNameComponent`.
     pub fn as_timestamp(&self) -> Option<u64> {
         (self.typ == tlv_type::TIMESTAMP).then(|| decode_nonnegative_integer(&self.value))
     }
 
+    /// The sequence number, or `None` if this is not a `SequenceNumNameComponent`.
     pub fn as_sequence_num(&self) -> Option<u64> {
         (self.typ == tlv_type::SEQUENCE_NUM).then(|| decode_nonnegative_integer(&self.value))
     }
@@ -158,30 +173,36 @@ impl Ord for Name {
 }
 
 impl Name {
+    /// The empty (root) name, `/`.
     pub fn root() -> Self {
         Self {
             components: SmallVec::new(),
         }
     }
 
+    /// Builds a name from an iterator of components.
     pub fn from_components(components: impl IntoIterator<Item = NameComponent>) -> Self {
         Self {
             components: components.into_iter().collect(),
         }
     }
 
+    /// The name's components in order.
     pub fn components(&self) -> &[NameComponent] {
         &self.components
     }
 
+    /// The number of components in the name.
     pub fn len(&self) -> usize {
         self.components.len()
     }
 
+    /// Whether this is the root name (no components).
     pub fn is_empty(&self) -> bool {
         self.components.is_empty()
     }
 
+    /// Whether `prefix` is a prefix of (or equal to) this name.
     pub fn has_prefix(&self, prefix: &Name) -> bool {
         if prefix.len() > self.len() {
             return false;
@@ -203,6 +224,7 @@ impl Name {
         Ok(Self { components })
     }
 
+    /// Appends a `GenericNameComponent` holding `value`.
     pub fn append(mut self, value: impl AsRef<[u8]>) -> Self {
         self.components
             .push(NameComponent::generic(Bytes::copy_from_slice(
@@ -211,11 +233,13 @@ impl Name {
         self
     }
 
+    /// Appends an explicit component.
     pub fn append_component(mut self, comp: NameComponent) -> Self {
         self.components.push(comp);
         self
     }
 
+    /// Appends a `SegmentNameComponent`.
     pub fn append_segment(self, seg: u64) -> Self {
         self.append_component(NameComponent::new(
             tlv_type::SEGMENT,
@@ -223,6 +247,7 @@ impl Name {
         ))
     }
 
+    /// Appends a `VersionNameComponent`.
     pub fn append_version(self, v: u64) -> Self {
         self.append_component(NameComponent::version(v))
     }
@@ -240,14 +265,17 @@ impl Name {
         ))
     }
 
+    /// Appends a `TimestampNameComponent`.
     pub fn append_timestamp(self, ts: u64) -> Self {
         self.append_component(NameComponent::timestamp(ts))
     }
 
+    /// Appends a `SequenceNumNameComponent`.
     pub fn append_sequence_num(self, seq: u64) -> Self {
         self.append_component(NameComponent::sequence_num(seq))
     }
 
+    /// Appends a `ByteOffsetNameComponent`.
     pub fn append_byte_offset(self, off: u64) -> Self {
         self.append_component(NameComponent::byte_offset(off))
     }
