@@ -45,7 +45,8 @@ impl FaceFactory for UdpFaceFactory {
         &'a self,
         id: FaceId,
         params: &'a FaceParams,
-    ) -> Pin<Box<dyn Future<Output = Result<Box<dyn ErasedTransport>, FaceError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Box<dyn ErasedTransport>, FaceError>> + Send + 'a>>
+    {
         Box::pin(async move {
             let remote = params
                 .remote
@@ -77,7 +78,10 @@ mod tests {
     #[tokio::test]
     async fn create_requires_remote() {
         // `Box<dyn ErasedTransport>` is not Debug, so match rather than unwrap_err.
-        match UdpFaceFactory.create(FaceId(0), &FaceParams::default()).await {
+        match UdpFaceFactory
+            .create(FaceId(0), &FaceParams::default())
+            .await
+        {
             Err(FaceError::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput),
             Err(other) => panic!("expected InvalidInput, got {other:?}"),
             Ok(_) => panic!("expected an error when remote is absent"),

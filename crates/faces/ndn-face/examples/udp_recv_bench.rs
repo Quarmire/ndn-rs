@@ -13,9 +13,10 @@
 //! drains in the window. Received PPS = the receive path's ceiling (excess is
 //! dropped by the kernel once SO_RCVBUF — capped by net.core.rmem_max — fills).
 
+use portable_atomic::AtomicU64;
 use std::net::UdpSocket;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use ndn_face::net::UdpFace;

@@ -309,8 +309,7 @@ pub fn get_interface_mac(iface: &str) -> std::io::Result<MacAddr> {
     let name_ptr = ifr.ifr_name.as_mut_ptr() as *mut u8;
     unsafe { std::ptr::copy_nonoverlapping(name_bytes.as_ptr(), name_ptr, copy_len) };
 
-    let ret =
-        unsafe { libc::ioctl(fd.as_raw_fd(), libc::SIOCGIFHWADDR as _, &mut ifr as *mut _) };
+    let ret = unsafe { libc::ioctl(fd.as_raw_fd(), libc::SIOCGIFHWADDR as _, &mut ifr as *mut _) };
     if ret == -1 {
         return Err(std::io::Error::last_os_error());
     }

@@ -50,7 +50,8 @@ mod tests {
     }
 
     fn temp_socket_path() -> PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
+        use portable_atomic::AtomicU64;
+        use std::sync::atomic::Ordering;
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         std::env::temp_dir().join(format!(
             "ndn_unix_test_{}_{}.sock",

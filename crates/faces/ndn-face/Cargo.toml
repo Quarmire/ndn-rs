@@ -43,6 +43,7 @@ l2        = []
 # BLE peripheral (BleFace, Linux/macOS) + central (BleCentralFace,
 
 [dependencies]
+portable-atomic = { workspace = true }
 ndn-tlv       = { workspace = true }
 ndn-packet    = { workspace = true, features = ["std"] }
 ndn-transport  = { workspace = true }
