@@ -30,6 +30,7 @@ serde = ["dep:serde", "dep:serde_json"]
 # surface builds for wasm32 so an in-browser embedded engine (WasmEngineBuilder)
 # gets the same app API as native — see ndn-web-attach's in-page tier.
 [dependencies]
+portable-atomic = { workspace = true }
 ndn-tlv        = { workspace = true, features = ["std"] }
 ndn-engine     = { workspace = true }
 ndn-transport  = { workspace = true }

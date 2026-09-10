@@ -29,9 +29,10 @@ async fn detached_engine_keeps_forwarding() {
         .await
         .expect("serve");
 
-    let data = bob.fetch("/alice/greeting").await.expect(
-        "a detached engine must keep forwarding — detach() may not tear anything down",
-    );
+    let data = bob
+        .fetch("/alice/greeting")
+        .await
+        .expect("a detached engine must keep forwarding — detach() may not tear anything down");
     assert_eq!(
         data.content().map(|c| c.as_ref()),
         Some(&b"hi"[..]),

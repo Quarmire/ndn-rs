@@ -49,10 +49,7 @@ impl std::fmt::Debug for PublisherConfig {
         f.debug_struct("PublisherConfig")
             .field("svs", &self.svs)
             .field("data_freshness", &self.data_freshness)
-            .field(
-                "store",
-                &self.store.as_ref().map(|_| "injected DataStore"),
-            )
+            .field("store", &self.store.as_ref().map(|_| "injected DataStore"))
             .finish()
     }
 }

@@ -1264,7 +1264,8 @@ pub struct Subscription {
 /// monotonic counter). It is a correlation handle, not a secret — uniqueness,
 /// not unpredictability, is what matters, so no CSPRNG dependency is needed.
 fn fresh_subscription_id() -> Bytes {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use portable_atomic::AtomicU64;
+    use std::sync::atomic::Ordering;
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let t = web_time::SystemTime::now()
