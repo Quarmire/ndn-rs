@@ -5,6 +5,10 @@
 [advisories]
 # Each ignore is a reviewed decision (audit P-4), not a blanket suppression.
 ignore = [
+  # lru 0.12.x `LruCache::pop()` use-after-free IF the stored value's Drop panics.
+  # Pulled transitively (v0.12.5); ndn-rs stores only plain Copy/POD cache values whose
+  # Drop cannot panic, so the unsound path is not reachable. Re-evaluate on a fixed lru.
+  "RUSTSEC-2026-0253",
   # rsa "Marvin Attack" — a timing side-channel in RSA *decryption*. ndn-rs uses
   # the `rsa` crate only for signature signing/verification; there is no RSA
   # decryption oracle anywhere in the codebase, so the attack surface is not

@@ -21,6 +21,7 @@
 
 use std::sync::Arc;
 // Atomics back the native DashMap counters; the wasm arm uses Mutex<HashMap>.
+#[cfg(not(target_arch = "wasm32"))]
 use portable_atomic::AtomicU64;
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::atomic::Ordering;
