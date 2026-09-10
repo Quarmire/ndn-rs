@@ -10,6 +10,7 @@ license.workspace = true
 classification = "spec"
 
 [dependencies]
+portable-atomic = { workspace = true }
 dashmap       = { workspace = true }
 ndn-engine    = { workspace = true }
 ndn-face-local = { workspace = true }

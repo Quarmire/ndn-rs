@@ -32,8 +32,8 @@ pub use config::{
     ManagementConfig, MgmtSecurityConfig, NlsrNeighborConfig, NlsrTomlConfig,
     ObservabilityTomlConfig, QuicListenerConfig, RadioDeviceConfig, ReflexiveTomlConfig,
     RequireAttestationConfig, RouteConfig, RoutingTomlConfig, SecurityConfig, SelfSignedDevConfig,
-    SmtpConfig,
-    TrustRuleConfig, WebRtcListenerConfig, WebTransportListenerConfig, WtIceServers, WtTurnServer,
+    SmtpConfig, TrustRuleConfig, WebRtcListenerConfig, WebTransportListenerConfig, WtIceServers,
+    WtTurnServer,
 };
 pub use error::ConfigError;
 pub use notifications::NotificationStream;

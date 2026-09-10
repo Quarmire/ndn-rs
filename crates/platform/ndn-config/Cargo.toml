@@ -17,6 +17,7 @@ classification = "extension"
 mgmt = ["dep:ndn-mgmt"]
 
 [dependencies]
+portable-atomic = { workspace = true }
 ndn-mgmt-wire = { workspace = true }
 ndn-mgmt      = { workspace = true, optional = true }
 ndn-tlv       = { workspace = true, features = ["std"] }

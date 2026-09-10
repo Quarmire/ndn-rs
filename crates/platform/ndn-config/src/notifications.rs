@@ -7,7 +7,8 @@
 //! Publishing primitive only; wiring to event sources lives in the
 //! management dispatcher.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use portable_atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
 use ndn_packet::{Name, encode::DataBuilder};
