@@ -19,8 +19,9 @@
 //! Env: DURATION_MS=3000 WINDOW=512 SIZE=8192 WORKERS_LIST=1,2,4,8 VALIDATE=1
 #![cfg(feature = "partitioned-fwd")]
 
+use portable_atomic::AtomicU64;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use ndn_engine::{DataPlane, EngineBuilder, EngineConfig};

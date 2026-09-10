@@ -137,6 +137,15 @@ pub(crate) fn is_public_dataset_verb(module: &[u8], verb: &[u8]) -> bool {
     if module == m::COMPUTE && verb == v::LIST {
         return true;
     }
+    // `ext/list` renders the generic `ControlSurface` introspection datasets
+    // (caps/options/stats) of loaded out-of-core subsystems — e.g. the
+    // named-radio cognition telemetry (decided channel/rate/power/fec). It is
+    // read-only discovery with no secrets, symmetric with `compute/list` and the
+    // canonical `*/list` reads, so a dashboard can observe cognition before any
+    // signing identity exists. `ext/set` (option mutation) stays gated.
+    if module == b"ext" && verb == v::LIST {
+        return true;
+    }
     false
 }
 
@@ -701,6 +710,22 @@ mod e01_tests {
         );
         // And a write verb on compute is never a public read.
         assert!(!is_public_dataset_verb(m::COMPUTE, v::REGISTER));
+    }
+
+    #[test]
+    fn ext_list_public_but_ext_set_signed() {
+        use ndn_mgmt_wire::nfd_command::verb as v;
+        // ext/list renders read-only ControlSurface introspection (e.g. radio
+        // cognition telemetry) — public so a dashboard can observe it unsigned.
+        assert!(
+            is_public_dataset_verb(b"ext", v::LIST),
+            "ext/list must be a public read (generic subsystem introspection)"
+        );
+        // ext/set mutates a subsystem option — must stay gated.
+        assert!(
+            !is_public_dataset_verb(b"ext", b"set"),
+            "ext/set must stay signed (option mutation)"
+        );
     }
 
     /// Extended modules always require signed commands even when the

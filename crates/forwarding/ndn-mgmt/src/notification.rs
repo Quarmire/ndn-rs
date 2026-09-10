@@ -12,10 +12,11 @@
 //! event without re-fetching the whole stream. Data is signed
 //! `DigestSha256` for v1; signed notifications are a follow-up.
 
+use portable_atomic::AtomicU64;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
 use ndn_engine::ForwarderEngine;

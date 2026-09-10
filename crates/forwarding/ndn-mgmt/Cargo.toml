@@ -21,6 +21,7 @@ l2          = ["ndn-face/l2"]
 # Enables the wts:// faces/create arm (outbound WebTransport dial).
 
 [dependencies]
+portable-atomic = { workspace = true }
 # Portable deps — build on every target including wasm32-unknown-unknown.
 ndn-engine       = { workspace = true }
 ndn-face-local   = { workspace = true }

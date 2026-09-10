@@ -243,9 +243,19 @@ async fn udp_rx_loop(
                 tracing::debug!(target: "face.udp", src=%src, len=n, "udp-listener: recv packet");
                 let raw = bytes::Bytes::copy_from_slice(&buf[..n]);
 
-                let face_id = if let Some(&id) = peers.get(&src) {
+                // A cached mapping may point at a face the engine's idle
+                // reaper has since removed — injecting under a dead FaceId is
+                // a silent blackhole. Verify liveness and re-create if gone.
+                let cached = peers
+                    .get(&src)
+                    .copied()
+                    .filter(|id| engine.face_states().contains_key(id));
+                let face_id = if let Some(id) = cached {
                     id
                 } else {
+                    if let Some(stale) = peers.remove(&src) {
+                        tracing::info!(target: "face.udp", face=%stale, peer=%src, "udp-listener: cached face gone, re-creating");
+                    }
                     // New peer: send-only UdpFace sharing the listener
                     // socket. Inbound bytes come from the listener's
                     // demux via `inject_packet`, so no recv loop runs.

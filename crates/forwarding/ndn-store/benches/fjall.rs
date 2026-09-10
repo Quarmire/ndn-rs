@@ -2,8 +2,9 @@ use bytes::Bytes;
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use ndn_packet::{Name, NameComponent};
 use ndn_store::{ContentStore, CsMeta, FjallCs};
+use portable_atomic::AtomicU64;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 
 fn data_wire(name: &Name) -> Bytes {
     Bytes::copy_from_slice(name.to_string().as_bytes())

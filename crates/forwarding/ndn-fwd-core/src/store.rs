@@ -162,7 +162,8 @@ impl<P: PitStore, O: NameTableObserver> PitStore for ObservedPit<P, O> {
         // call even returns. Notifying after would leave a window in which the entry exists in the
         // PIT but the filter still rejects its Data.
         self.observer.on_pit_insert(components);
-        self.inner.record_pending(components, incoming_face, nonce, lifetime_ms, created_ms);
+        self.inner
+            .record_pending(components, incoming_face, nonce, lifetime_ms, created_ms);
     }
 
     fn satisfy(&mut self, components: &[&[u8]], send_to: impl FnMut(Self::Face)) -> bool {

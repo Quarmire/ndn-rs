@@ -96,7 +96,10 @@ async fn a_shadowed_route_is_named_by_the_diagnostic() {
 
     // The silent half (the failure mode as skyfall lived it): the app face received the
     // Interest, the peer face received NOTHING — and no error anywhere.
-    assert!(recv_timeout(&ha).await.is_some(), "the longer entry's face gets the Interest");
+    assert!(
+        recv_timeout(&ha).await.is_some(),
+        "the longer entry's face gets the Interest"
+    );
     assert!(
         recv_timeout(&hp).await.is_none(),
         "the shadowed route's face silently gets nothing — this is the bug class"
@@ -107,7 +110,9 @@ async fn a_shadowed_route_is_named_by_the_diagnostic() {
     let line = text
         .lines()
         .find(|l| l.contains("matched_prefix"))
-        .unwrap_or_else(|| panic!("no diagnostic event emitted — the shadow stays invisible:\n{text}"));
+        .unwrap_or_else(|| {
+            panic!("no diagnostic event emitted — the shadow stays invisible:\n{text}")
+        });
     assert!(
         line.contains("matched_prefix=/svc/data"),
         "the diagnostic names the WINNING entry (not the queried name): {line}"

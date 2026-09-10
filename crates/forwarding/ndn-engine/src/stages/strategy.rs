@@ -178,8 +178,9 @@ impl StrategyStage {
         // nexthops, and `matched_prefix` tells you which entry actually won.
         if let Some((depth, e)) = &fib_lookup {
             if tracing::enabled!(target: t::FWD_FIB, tracing::Level::TRACE) {
-                let matched_prefix =
-                    ndn_packet::Name::from_components(fib_name.components().iter().take(*depth).cloned());
+                let matched_prefix = ndn_packet::Name::from_components(
+                    fib_name.components().iter().take(*depth).cloned(),
+                );
                 trace!(target: t::FWD_FIB, face=%ctx.face_id, name=%name, matched=true,
                     matched_prefix=%matched_prefix, matched_depth=*depth,
                     nexthops=?e.nexthops.iter().map(|nh| (nh.face_id, nh.cost)).collect::<Vec<_>>(),

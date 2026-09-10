@@ -1,6 +1,7 @@
+use portable_atomic::AtomicU64;
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use ndn_runtime::Runtime;
@@ -202,7 +203,10 @@ impl ValidationStage {
         // ndn-rs validates everything, including /localhost mgmt responses
         // (signed with DigestSha256). NFD reaches the same effect via an
         // explicit `m_localhostValidator` allowlist.
-        let result = validator.validate_chain(data).instrument(span.clone()).await;
+        let result = validator
+            .validate_chain(data)
+            .instrument(span.clone())
+            .await;
         span.record("elapsed_us", started.elapsed().as_micros() as u64);
         match result {
             ValidationResult::Valid(_safe) => {

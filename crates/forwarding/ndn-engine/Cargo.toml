@@ -34,6 +34,7 @@ experimental-instrument = []
 partitioned-fwd = []
 
 [dependencies]
+portable-atomic = { workspace = true }
 ndn-packet    = { workspace = true, default-features = false }
 ndn-transport = { workspace = true }
 ndn-discovery-core = { workspace = true }

@@ -1,4 +1,5 @@
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use portable_atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
@@ -33,13 +34,15 @@ struct LruInner {
 
 impl LruCs {
     pub fn new(capacity_bytes: usize) -> Self {
-        use std::num::NonZeroUsize;
-        // Entry limit set to `capacity_bytes` so the byte-based eviction loop
-        // always fires first (every Data packet is at least 1 byte).
-        let max_entries = NonZeroUsize::new(capacity_bytes.max(1)).unwrap();
+        // Unbounded entry count: the byte-based eviction loop is the real
+        // bound (it fires before any entry limit could — every Data packet is
+        // at least 1 byte). A bounded `LruCache::new(capacity_bytes)` would
+        // preallocate a hash table sized for `capacity_bytes` ENTRIES up
+        // front (~1.2 GB for the 64 MB default), which aborts on 32-bit
+        // targets like the MT7621.
         Self {
             inner: Mutex::new(LruInner {
-                cache: LruCache::new(max_entries),
+                cache: LruCache::unbounded(),
                 prefix_index: NameTrie::new(),
                 current_bytes: 0,
             }),

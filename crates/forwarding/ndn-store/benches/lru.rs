@@ -4,8 +4,9 @@ use criterion::{
 };
 use ndn_packet::Name;
 use ndn_store::{ContentStore, CsMeta, InsertResult, LruCs};
+use portable_atomic::AtomicU64;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 
 fn data_wire(name: &Name) -> Bytes {
     Bytes::copy_from_slice(name.to_string().as_bytes())

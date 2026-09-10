@@ -273,8 +273,9 @@ pub mod emit {
     use ndn_foundation_types::Name;
     use ndn_packet::encode::InterestBuilder;
     use ndn_security::{SignWith, Signer, TrustError};
+    use portable_atomic::AtomicU64;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::Ordering;
 
     /// Emits signed PathControl messages for one `target`, with a monotonic per-emitter
     /// sequence number. Hold one per moving prefix / live pipe; on a point-of-attachment

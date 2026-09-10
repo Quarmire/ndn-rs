@@ -43,7 +43,9 @@ impl BroadcastStrategy {
     }
 
     pub fn new() -> Self {
-        Self { name: Self::strategy_name() }
+        Self {
+            name: Self::strategy_name(),
+        }
     }
 }
 
@@ -127,11 +129,19 @@ mod tests {
         let s = BroadcastStrategy::new();
         let name = Arc::new(Name::root());
         let m = MeasurementsTable::new();
-        let fib = FibEntry { nexthops: vec![FibNexthop { face_id: FaceId(1), cost: 0 }] };
+        let fib = FibEntry {
+            nexthops: vec![FibNexthop {
+                face_id: FaceId(1),
+                cost: 0,
+            }],
+        };
         // Interest arrived on the ONLY nexthop face (the radio face) — multicast would Nack; we forward.
         let ctx = make_ctx(&name, FaceId(1), Some(&fib), &m);
         if let [ForwardingAction::Forward(faces)] = s.after_receive_interest(&ctx).as_slice() {
-            assert!(faces.contains(&FaceId(1)), "must re-broadcast on the arrival radio face");
+            assert!(
+                faces.contains(&FaceId(1)),
+                "must re-broadcast on the arrival radio face"
+            );
         } else {
             panic!("expected Forward on the incoming face, not a Nack");
         }

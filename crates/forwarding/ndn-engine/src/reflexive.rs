@@ -21,8 +21,9 @@
 //! - **W-RF-4 per-face cap.** Installs beyond `max_per_face` are refused.
 //! - **W-RF-6 monotonic face identity.** Routes store a [`FaceId`], never recycled.
 
+use portable_atomic::AtomicU64;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use dashmap::DashMap;

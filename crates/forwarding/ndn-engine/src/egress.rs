@@ -12,10 +12,11 @@
 //! The FIFO default is the *absence* of a scheduler: a face with no scheduler configured
 //! keeps its single mpsc, byte-for-byte today's behavior and zero added cost.
 
+use portable_atomic::AtomicU64;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 use ndn_packet::Name;
 use tokio::sync::Notify;

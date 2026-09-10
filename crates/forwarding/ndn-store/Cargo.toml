@@ -18,6 +18,7 @@ fjall = ["dep:fjall"]
 sqlite-cs = ["dep:rusqlite"]
 
 [dependencies]
+portable-atomic = { workspace = true }
 ndn-fwd-core = { workspace = true }
 bytes    = { workspace = true, features = ["std"] }
 smallvec = { workspace = true }
