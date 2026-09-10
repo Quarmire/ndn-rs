@@ -175,8 +175,7 @@ impl SvsPubSub {
             // the inner-wire publish) → outer Data ≤ MAX_NDN_PACKET_SIZE.
             segment_budget: config
                 .max_segment_size
-                .max(1)
-                .min(MAX_NDN_PACKET_SIZE - 2 * DATA_OVERHEAD_RESERVE),
+                .clamp(1, MAX_NDN_PACKET_SIZE - 2 * DATA_OVERHEAD_RESERVE),
             cancel: cancel.clone(),
         };
 

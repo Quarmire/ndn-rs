@@ -133,7 +133,7 @@ fn overlapping_sequences_assemble_a_frankenstein_packet() {
     );
     let franken = &mixed[0];
     assert!(
-        franken.iter().any(|&x| x == 0xAA) && franken.iter().any(|&x| x == 0xBB),
+        franken.contains(&0xAA) && franken.contains(&0xBB),
         "the assembled packet is stitched from BOTH packets: {} 0xAA bytes, {} 0xBB bytes",
         franken.iter().filter(|&&x| x == 0xAA).count(),
         franken.iter().filter(|&&x| x == 0xBB).count(),

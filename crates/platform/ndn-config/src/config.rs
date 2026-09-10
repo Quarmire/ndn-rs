@@ -1164,7 +1164,7 @@ pub enum FaceConfig {
     /// RX unions across all radios and TX fans out (diversity on a broadcast
     /// medium); the cognitive control plane decides per-frame rate/power and, with
     /// >1 radio, which carry each transmission. Requires `ndn-fwd` built with the
-    /// `radio` feature; USB Wi-Fi drivers additionally need `radio-libusb` (Linux).
+    /// > `radio` feature; USB Wi-Fi drivers additionally need `radio-libusb` (Linux).
     Radio {
         /// The radio capabilities bound into this medium (≥1).
         radios: Vec<RadioDeviceConfig>,

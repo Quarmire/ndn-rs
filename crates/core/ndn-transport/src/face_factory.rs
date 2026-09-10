@@ -81,6 +81,9 @@ pub trait FaceFactory: Send + Sync {
     /// [`FaceError`] when `params` are malformed for this kind or the
     /// underlying bind/dial fails (bad-params conventionally surface as
     /// `FaceError::Io(ErrorKind::InvalidInput)`).
+    // A boxed, lifetime-bound future is the object-safe async return shape; a type alias would
+    // need the same lifetime generic and read no clearer.
+    #[allow(clippy::type_complexity)]
     fn create<'a>(
         &'a self,
         id: FaceId,

@@ -138,7 +138,7 @@ mod tests {
     // A line A(1) — B(2) — C(3): A is the lowest id, so all converge to A, C via B (2 hops).
     #[test]
     fn line_converges_to_the_lowest_id_reference() {
-        let (mut a, mut b, mut c) = (
+        let (a, mut b, mut c) = (
             NetworkTime::new(1),
             NetworkTime::new(2),
             NetworkTime::new(3),
