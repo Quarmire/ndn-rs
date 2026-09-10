@@ -22,8 +22,9 @@
 // opt out of the matching `Result`-size lint for consistency.
 #![allow(clippy::result_large_err)]
 
+use portable_atomic::AtomicU64;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 
 use async_trait::async_trait;
 use bytes::Bytes;

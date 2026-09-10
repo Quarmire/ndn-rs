@@ -262,7 +262,8 @@ fn check_renewal_needed(manager: &SecurityManager, key_name: &Name, threshold_pc
 mod tests {
     use super::*;
     use ndn_packet::{NameComponent, SignatureType};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use portable_atomic::AtomicU64;
+    use std::sync::atomic::Ordering;
 
     /// Records how many times it was asked to renew (no real CA needed).
     struct CountingRenewer {

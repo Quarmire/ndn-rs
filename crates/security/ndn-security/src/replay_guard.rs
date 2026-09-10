@@ -14,9 +14,10 @@
 //! A random 64-bit nonce uniquely identifies a signed Interest; time and seq
 //! are coarse supplementary fields that must not trigger rejection on their own.
 
+use portable_atomic::AtomicU64;
 use std::collections::VecDeque;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
 #[cfg(not(target_arch = "wasm32"))]
