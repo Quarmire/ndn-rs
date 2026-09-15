@@ -411,6 +411,55 @@ mod tests {
     }
 
     #[test]
+    fn static_config_routes_survive_a_later_app_registration() {
+        // Regression: a forwarder that installs its `[[route]]` config entries
+        // straight into the FIB loses every one of them the moment an
+        // application registers the same prefix, because `apply_to_fib` writes
+        // the RIB-computed set with `Fib::set_nexthops`, which REPLACES the
+        // entry. On a 3-drone fleet that left /muas with a single nexthop out
+        // of three, so per-node service Interests reached only one drone.
+        //
+        // Config routes must therefore be RIB routes (origin STATIC, as
+        // `nfdc route add` uses) so they merge with the app's registration
+        // instead of being clobbered by it.
+        let rib = Rib::new();
+        let fib = Fib::new();
+        // three peer faces from config, same prefix
+        for face in [1u64, 2, 3] {
+            rib.add(
+                &nn("/muas"),
+                RibRoute {
+                    face_id: FaceId(face),
+                    origin: 255, // origin::STATIC
+                    cost: 100,
+                    flags: 0,
+                    expires_at: None,
+                },
+            );
+        }
+        rib.apply_to_fib(&nn("/muas"), &fib);
+        assert_eq!(faces_at(&fib, "/muas"), vec![1, 2, 3]);
+
+        // the local application now registers the SAME prefix (origin APP)
+        rib.add(
+            &nn("/muas"),
+            RibRoute {
+                face_id: FaceId(9),
+                origin: 0, // origin::APP
+                cost: 0,
+                flags: 0,
+                expires_at: None,
+            },
+        );
+        rib.apply_to_fib(&nn("/muas"), &fib);
+        assert_eq!(
+            faces_at(&fib, "/muas"),
+            vec![1, 2, 3, 9],
+            "app registration must MERGE with the static config routes, not replace them"
+        );
+    }
+
+    #[test]
     fn child_inherit_propagates_to_descendant_rib_entry() {
         const CHILD_INHERIT: u64 = 1;
         let rib = Rib::new();
