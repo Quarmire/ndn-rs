@@ -287,12 +287,31 @@ fn validate_psdc_structure(name: &Name, has_app_params: bool) -> Result<(), Pack
         ));
     }
 
-    if psdc_count == 1 && last_psdc_idx != comps.len() - 1 {
-        return Err(PacketError::MalformedPacket(
-            "ParametersSha256DigestComponent must be the last component of the Interest Name"
-                .into(),
-        ));
-    }
+    // NOT enforced here: "the PSDC must be the LAST name component".
+    //
+    // Placement is a producer/consumer construction rule. Enforcing it at
+    // DECODE makes a forwarder reject the whole packet, and a forwarder must
+    // be name-agnostic — it cannot know what an application's naming means.
+    // ndn-cxx/NFD decode such an Interest and forward it, so rejecting it is
+    // a pure interop regression against the reference implementation.
+    //
+    // Field-measured 2026-09-15 (miniMUAS): NDNSF's certificate-bootstrap
+    // Interest carries a 0x02-typed component that is not final. NFD forwarded
+    // it and the controller answered; ndn-fwd logged
+    //   decode: malformed Interest
+    //   error = ParametersSha256DigestComponent must be the last component
+    //   drop at decode reason=MalformedPacket
+    // so EVERY NDNSF service call (bootstrap, video/control, sensor/capture,
+    // in both targeted and two-phase mode) timed out on the ndn-fwd cell,
+    // while plain Data fetches were unaffected — the packet never reached the
+    // forwarding pipeline at all. Reproduced single-host inside a mount+net
+    // namespace with a private /run/nfd, controller and agent on one
+    // forwarder, no network: ndn-fwd timed out, NFD answered.
+    //
+    // The two checks above stay: more than one PSDC is genuinely ambiguous,
+    // and ApplicationParameters with no PSDC is genuinely unverifiable.
+    // Digest POSITION is validated where the digest is actually used.
+    let _ = last_psdc_idx;
 
     Ok(())
 }
@@ -951,7 +970,22 @@ mod tests {
     /// A `ParametersSha256DigestComponent` in the Name MUST be the last
     /// component.
     #[test]
-    fn a02_a21_decode_rejects_psdc_not_last() {
+    fn a02_a21_decode_accepts_psdc_not_last_like_ndn_cxx() {
+        // Position of the PSDC is NOT enforced at decode, because the
+        // reference implementation does not enforce it either.
+        // ndn-cxx `interest.cpp` wireDecode rejects only digestIndex == -2
+        // ("Name has more than one ParametersSha256DigestComponent"); a PSDC
+        // at a non-final index decodes fine, and isParametersDigestValid()
+        // finds it wherever it sits. The earlier claim that rejecting it
+        // "mirrors ndn-cxx" was wrong.
+        //
+        // It is also actively harmful: a forwarder must be name-agnostic, and
+        // dropping the packet at decode means it never reaches the pipeline.
+        // Field 2026-09-15 (miniMUAS): NDNSF's certificate-bootstrap Interest
+        // has a non-final 0x02 component. NFD forwarded it and the controller
+        // answered; ndn-fwd logged "drop at decode reason=MalformedPacket", so
+        // EVERY NDNSF service call timed out on the ndn-fwd fabric while plain
+        // Data fetches were fine.
         let mut w = TlvWriter::new();
         w.write_nested(tlv_type::INTEREST, |w| {
             w.write_nested(tlv_type::NAME, |w| {
@@ -961,12 +995,38 @@ mod tests {
             w.write_tlv(tlv_type::APP_PARAMETERS, b"hello");
         });
         let raw = w.finish();
-        let err = Interest::decode(raw)
-            .expect_err("Interest with PSDC anywhere but the last position must be rejected");
-        match err {
-            PacketError::MalformedPacket(_) => {}
-            other => panic!("expected MalformedPacket, got {other:?}"),
-        }
+        Interest::decode(raw).expect("a non-final PSDC must decode, as ndn-cxx does");
+    }
+
+    #[test]
+    fn a02_decode_still_rejects_two_psdc_and_appparams_without_psdc() {
+        // The two checks that DO mirror ndn-cxx stay: more than one PSDC is
+        // ambiguous (ndn-cxx digestIndex == -2), and ApplicationParameters
+        // with no PSDC is unverifiable.
+        let mut w = TlvWriter::new();
+        w.write_nested(tlv_type::INTEREST, |w| {
+            w.write_nested(tlv_type::NAME, |w| {
+                w.write_tlv(tlv_type::PARAMETERS_SHA256, &[0u8; 32]);
+                w.write_tlv(tlv_type::PARAMETERS_SHA256, &[1u8; 32]);
+            });
+            w.write_tlv(tlv_type::APP_PARAMETERS, b"hello");
+        });
+        assert!(matches!(
+            Interest::decode(w.finish()).expect_err("two PSDCs must be rejected"),
+            PacketError::MalformedPacket(_)
+        ));
+
+        let mut w = TlvWriter::new();
+        w.write_nested(tlv_type::INTEREST, |w| {
+            w.write_nested(tlv_type::NAME, |w| {
+                w.write_tlv(tlv_type::NAME_COMPONENT, b"a");
+            });
+            w.write_tlv(tlv_type::APP_PARAMETERS, b"hello");
+        });
+        assert!(matches!(
+            Interest::decode(w.finish()).expect_err("AppParams without PSDC must be rejected"),
+            PacketError::MalformedPacket(_)
+        ));
     }
 
     /// More than one `ParametersSha256DigestComponent` in a Name is malformed.
