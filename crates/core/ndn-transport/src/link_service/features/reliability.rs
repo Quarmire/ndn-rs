@@ -16,7 +16,23 @@ use super::super::feature::{
 };
 use crate::reliability::{LpReliability, ReliabilityConfig};
 
-const DEFAULT_RELIABILITY_MTU: usize = 8800;
+/// LP fragmentation threshold.
+///
+/// 1452 — NOT the 8800 max NDN packet size. LpReliability fragments precisely
+/// so the layer below never has to, and on any datagram transport (UDP) an
+/// 8800-byte frame is simply handed to IP, which fragments it and loses the
+/// WHOLE datagram if any fragment is dropped. Measured on a 3-drone Wi-Fi
+/// fleet carrying video: 210705 reassemblies required, 51444 reassembled ok —
+/// a 76% IP-reassembly failure rate, with 868k fragments created. Small Data
+/// (telemetry) was unaffected; everything larger than the path MTU (video)
+/// collapsed, which is exactly the size-dependent failure that looks like a
+/// lossy link and is not one.
+///
+/// 1452 matches what NFD's peer faces are configured with on the same fleet
+/// (`nfdc face create … mtu 1452`) and leaves room for IP+UDP headers inside a
+/// 1500-byte path. Stream transports (TCP/Unix) only see slightly more LP
+/// framing, which is harmless.
+const DEFAULT_RELIABILITY_MTU: usize = 1452;
 
 /// Per-feature reliability state. Constructed disabled; flipping the
 /// switch does not lose unacked entries.
