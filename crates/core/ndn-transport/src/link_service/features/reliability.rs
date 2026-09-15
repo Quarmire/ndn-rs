@@ -87,11 +87,12 @@ impl ReliabilityFeature {
 
     /// Standalone Ack frame for received reliable frames not yet piggybacked,
     /// pumped on the retx tick alongside [`Self::take_retransmissions`]. `None`
-    /// when disabled or nothing to Ack.
+    /// when there is nothing to Ack.
+    ///
+    /// NOT gated on `is_enabled`: see [`Self::on_ingress`]. Acking is a
+    /// receiver-side duty owed to whoever sent us a TxSequence, independent of
+    /// whether WE transmit reliably.
     pub fn take_acks(&self) -> Option<Bytes> {
-        if !self.is_enabled() {
-            return None;
-        }
         self.state.lock().unwrap().flush_acks()
     }
 
@@ -100,9 +101,6 @@ impl ReliabilityFeature {
     /// path, which does not run the LinkService feature pipeline; the socket
     /// recv path drives the same state via [`LinkServiceFeature::on_ingress`].
     pub fn note_receive(&self, raw: &[u8]) {
-        if !self.is_enabled() {
-            return;
-        }
         self.state.lock().unwrap().on_receive(raw);
     }
 }
@@ -124,10 +122,25 @@ impl LinkServiceFeature for ReliabilityFeature {
     /// pipeline only for `on_ingress` (Ack consumption on socket faces).
     fn on_egress(&self, _frame: &mut OutboundLpFrame, _ctx: &EgressCtx) {}
 
+    /// Consume inbound Acks and queue Acks for inbound reliable frames —
+    /// **regardless of `is_enabled`**.
+    ///
+    /// LpReliability is UNIDIRECTIONAL: the sender opts in by attaching a
+    /// TxSequence, and a receiver that implements the feature owes it an Ack.
+    /// Gating ingress on our own transmit-side setting made a one-sided
+    /// configuration fail catastrophically instead of merely being one-sided:
+    /// a face with reliability off silently dropped every peer TxSequence, so
+    /// the peer never got an Ack and retransmitted EVERY packet at its RTO,
+    /// which never adapted (no Ack, no RTT sample). Measured on a 3-drone
+    /// fleet: the GCS's peer face sat at the initial 1 s RTO having resent
+    /// 4217 of 4257 Interests (99%), against a drone whose own face had
+    /// adapted to 200 ms and resent 2.3%. The link was not lossy; the two ends
+    /// simply disagreed about who had the feature on.
+    ///
+    /// Sending is still opt-in: `frame` and `take_retransmissions` stay gated,
+    /// so a disabled face never attaches a TxSequence or retransmits its own
+    /// traffic. It only answers.
     fn on_ingress(&self, frame: &InboundLpFrame, _ctx: &IngressCtx) {
-        if !self.is_enabled() {
-            return;
-        }
         let mut s = self.state.lock().unwrap();
         s.on_receive(&frame.wire);
     }
@@ -138,6 +151,49 @@ pub type SharedReliabilityFeature = Arc<ReliabilityFeature>;
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn disabled_receiver_still_acks_a_reliable_sender() {
+        // LpReliability is unidirectional. A receiver with its own transmit
+        // side OFF must still Ack what it is sent, or the sender never gets an
+        // Ack, never takes an RTT sample, keeps its initial RTO and
+        // retransmits everything forever. Field-measured: 4217/4257 (99%) of
+        // Interests resent at a stuck 1 s RTO across a link that was not lossy.
+        let sender = ReliabilityFeature::new();
+        sender.set_enabled(true);
+        let receiver = ReliabilityFeature::new();
+        // receiver deliberately left DISABLED
+
+        let wires = sender.frame(b"hello");
+        assert!(!wires.is_empty(), "enabled sender frames reliably");
+
+        // receiver must queue an Ack even though it is disabled
+        receiver.note_receive(&wires[0]);
+        let ack = receiver
+            .take_acks()
+            .expect("a disabled receiver still owes the sender an Ack");
+
+        // and that Ack must clear the sender's unacked entry, so nothing is
+        // due for retransmission
+        sender.note_receive(&ack);
+        assert!(
+            sender.take_retransmissions().is_empty(),
+            "Ack from a disabled receiver must clear the sender's backlog"
+        );
+    }
+
+    #[test]
+    fn disabled_face_still_does_not_transmit_reliably() {
+        // The other half of the contract: answering is unconditional, but
+        // sending reliably stays opt-in.
+        let f = ReliabilityFeature::new();
+        assert!(f.frame(b"x").is_empty(), "disabled face must not frame reliably");
+        assert!(
+            f.take_retransmissions().is_empty(),
+            "disabled face must not retransmit its own traffic"
+        );
+    }
+
     use super::*;
     use crate::reliability::{ReliabilityConfig, RtoStrategy};
     use std::thread;
@@ -189,6 +245,9 @@ mod tests {
 
     #[test]
     fn reliability_feature_disabled_is_inert() {
+        // "Inert" now means inert as a SENDER. A disabled face still Acks what
+        // it receives (see disabled_receiver_still_acks_a_reliable_sender); it
+        // just never frames or retransmits its own traffic.
         let f = ReliabilityFeature::new();
         // Disabled: `frame` returns nothing and tracks nothing.
         assert!(f.frame(&bare_interest()).is_empty());
