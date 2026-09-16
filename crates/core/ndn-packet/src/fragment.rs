@@ -91,6 +91,15 @@ pub struct ReassemblyStats {
     pub timed_out: u64,
     /// Fragments belonging to a group that later timed out — wasted airtime.
     pub fragments_wasted: u64,
+    /// Fragments the buffer REFUSED to store (malformed `FragCount`, index
+    /// out of range, or a `FragCount` disagreeing with the group already
+    /// held). The link layer has already Acked these, so the sender believes
+    /// they arrived and will never retransmit them — their whole group is
+    /// then unrecoverable.
+    pub fragments_rejected: u64,
+    /// Partial groups discarded to stay under `MAX_PENDING_PACKETS`. Same
+    /// hazard: every fragment already Acked is now unrecoverable.
+    pub groups_evicted: u64,
 }
 
 pub struct ReassemblyBuffer {
@@ -132,12 +141,14 @@ impl ReassemblyBuffer {
         // `FragCount = u32::MAX` would otherwise trigger a `usize::MAX`-sized
         // `vec![None; count]` below.
         if frag_count == 0 || frag_count > MAX_FRAGMENTS {
+            self.stats.fragments_rejected += 1;
             return None;
         }
         let count = frag_count as usize;
         let idx = frag_index as usize;
 
         if idx >= count {
+            self.stats.fragments_rejected += 1;
             return None;
         }
 
@@ -153,7 +164,10 @@ impl ReassemblyBuffer {
                     .min_by_key(|(_, v)| v.created)
                     .map(|(k, _)| *k)
             {
-                self.pending.remove(&oldest_key);
+                if let Some(dropped) = self.pending.remove(&oldest_key) {
+                    self.stats.groups_evicted += 1;
+                    self.stats.fragments_wasted += dropped.received as u64;
+                }
             }
         }
         let entry = self.pending.entry(key).or_insert_with(|| Pending {
@@ -164,6 +178,7 @@ impl ReassemblyBuffer {
         });
 
         if entry.frag_count != count || idx >= entry.frag_count {
+            self.stats.fragments_rejected += 1;
             return None;
         }
 

@@ -41,7 +41,7 @@ mod tlv {
     pub const N_UNSATISFIED_INTERESTS: u64 = 0x9a;
 
     // ndn-rs-specific FaceStatus extensions in project-private
-    // 0xDA..=0xE7. NFD clients ignore unknown non-critical codes, so
+    // 0xDA..=0xE9. NFD clients ignore unknown non-critical codes, so
     // these are additive on the wire.
     pub const N_LP_ACKS_RECEIVED: u64 = 0xda;
     pub const N_LP_RESENT_PACKETS: u64 = 0xdb;
@@ -59,6 +59,11 @@ mod tlv {
     pub const N_REASM_FRAGMENTS_WASTED: u64 = 0xe6;
     /// Frames dropped from the retransmit buffer by the `max_unacked` cap.
     pub const N_LP_UNACKED_EVICTIONS: u64 = 0xe7;
+    /// Fragments the reassembler refused to store after the link layer Acked
+    /// them — unrecoverable, the sender will never retransmit.
+    pub const N_REASM_FRAGMENTS_REJECTED: u64 = 0xe8;
+    /// Partial groups discarded under memory pressure. Same hazard.
+    pub const N_REASM_GROUPS_EVICTED: u64 = 0xe9;
 
     pub const ENTRY: u64 = 0x80;
     pub const NEXT_HOP_RECORD: u64 = 0x81;
@@ -180,6 +185,10 @@ pub struct FaceStatus {
     /// Frames dropped from the retransmit buffer by the `max_unacked` cap:
     /// silent loss no retransmission will ever repair.
     pub n_lp_unacked_evictions: Option<u64>,
+    /// Fragments rejected by the reassembler AFTER being Acked.
+    pub n_reasm_fragments_rejected: Option<u64>,
+    /// Partial groups evicted under memory pressure.
+    pub n_reasm_groups_evicted: Option<u64>,
 }
 
 impl FaceStatus {
@@ -257,6 +266,12 @@ impl FaceStatus {
             if let Some(v) = self.n_lp_unacked_evictions {
                 write_non_neg_int(w, tlv::N_LP_UNACKED_EVICTIONS, v);
             }
+            if let Some(v) = self.n_reasm_fragments_rejected {
+                write_non_neg_int(w, tlv::N_REASM_FRAGMENTS_REJECTED, v);
+            }
+            if let Some(v) = self.n_reasm_groups_evicted {
+                write_non_neg_int(w, tlv::N_REASM_GROUPS_EVICTED, v);
+            }
         });
         w.finish()
     }
@@ -304,6 +319,8 @@ impl FaceStatus {
         let mut n_reasm_timed_out = None;
         let mut n_reasm_fragments_wasted = None;
         let mut n_lp_unacked_evictions = None;
+        let mut n_reasm_fragments_rejected = None;
+        let mut n_reasm_groups_evicted = None;
 
         while !inner.is_empty() {
             let (t, v) = inner.read_tlv().ok()?;
@@ -361,6 +378,12 @@ impl FaceStatus {
                 tlv::N_LP_UNACKED_EVICTIONS => {
                     n_lp_unacked_evictions = read_non_neg_int(&v)
                 }
+                tlv::N_REASM_FRAGMENTS_REJECTED => {
+                    n_reasm_fragments_rejected = read_non_neg_int(&v)
+                }
+                tlv::N_REASM_GROUPS_EVICTED => {
+                    n_reasm_groups_evicted = read_non_neg_int(&v)
+                }
                 _ => {}
             }
         }
@@ -399,6 +422,8 @@ impl FaceStatus {
             n_reasm_timed_out,
             n_reasm_fragments_wasted,
             n_lp_unacked_evictions,
+            n_reasm_fragments_rejected,
+            n_reasm_groups_evicted,
         })
     }
 
@@ -930,6 +955,8 @@ mod tests {
             n_reasm_timed_out: Some(18),
             n_reasm_fragments_wasted: Some(19),
             n_lp_unacked_evictions: Some(20),
+            n_reasm_fragments_rejected: Some(21),
+            n_reasm_groups_evicted: Some(22),
         };
         let encoded = fs.encode();
         let mut buf = encoded.as_ref();
@@ -948,6 +975,8 @@ mod tests {
         assert_eq!(decoded.n_reasm_timed_out, Some(18));
         assert_eq!(decoded.n_reasm_fragments_wasted, Some(19));
         assert_eq!(decoded.n_lp_unacked_evictions, Some(20));
+        assert_eq!(decoded.n_reasm_fragments_rejected, Some(21));
+        assert_eq!(decoded.n_reasm_groups_evicted, Some(22));
         assert_eq!(decoded.face_id, 42);
         assert_eq!(decoded.flags, 0b110);
     }

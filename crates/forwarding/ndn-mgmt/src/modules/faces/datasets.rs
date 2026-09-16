@@ -105,14 +105,18 @@ pub(super) fn faces_list_dataset(engine: &ForwarderEngine) -> bytes::Bytes {
             n_reasm_completed,
             n_reasm_timed_out,
             n_reasm_fragments_wasted,
+            n_reasm_fragments_rejected,
+            n_reasm_groups_evicted,
         ) = match reasm {
             Some(r) => (
                 Some(r.fragments_in),
                 Some(r.completed),
                 Some(r.timed_out),
                 Some(r.fragments_wasted),
+                Some(r.fragments_rejected),
+                Some(r.groups_evicted),
             ),
-            None => (None, None, None, None),
+            None => (None, None, None, None, None, None),
         };
 
         let (n_congestion_marks_sent, n_congestion_marks_received) = match congestion_counters {
@@ -154,6 +158,8 @@ pub(super) fn faces_list_dataset(engine: &ForwarderEngine) -> bytes::Bytes {
             n_reasm_timed_out,
             n_reasm_fragments_wasted,
             n_lp_unacked_evictions,
+            n_reasm_fragments_rejected,
+            n_reasm_groups_evicted,
         };
         buf.extend_from_slice(&fs.encode());
     }
