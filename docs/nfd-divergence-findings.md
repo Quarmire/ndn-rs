@@ -296,13 +296,24 @@ separating the two emptiness checks; `nacks=0` on every peer face confirms it
 on hardware. Guard: `all_upstreams_suppressed_sends_nothing_not_noroute`.
 *Changing what feeds a condition changes what the condition means.*
 
-**Attempt 2 — telemetry regression, cause not established.** With the NoRoute
-fix in place: video 7.9-8.0 fps (baseline range), `nacks=0`, iuas-01 and
-wuas-01 telemetry clean at 3.18-3.26/s — but **iuas-02 at 2.59-2.67/s with 5
-gaps>2 s in BOTH runs**, against 3.31/s and zero gaps before suppression.
-Reproducible, one node only, agent healthy (`NRestarts=0`). Reverted: a
-degraded flight-critical telemetry path is not an acceptable price for a
-change whose benefit is currently unmeasurable.
+**Attempt 2 — reverted on a MIS-ATTRIBUTION (corrected).** With the NoRoute
+fix in place: video 7.9-8.0 fps (baseline range), `nacks=0` on every peer
+face, iuas-01 and wuas-01 telemetry clean — but iuas-02 at 2.59-2.67/s with
+5 gaps>2 s in both runs. I attributed that to suppression and reverted.
+
+**That attribution was wrong.** After the revert the SAME degradation
+appeared on a DIFFERENT node — wuas-01 at 2.57/s with 6 gaps, iuas-02
+recovered to 3.11/s — and a further run showed wuas-01 at 2.99/s with 2 gaps
+while the other two were clean. The gapping wanders between nodes and does
+not follow the build, so it is an ambient fleet/RF condition, not the change.
+Two same-build runs agreeing is NOT sufficient evidence on this fleet when
+the comparison baseline came from a different time window; only an A/B in the
+same window would have settled it.
+
+The revert still stands, for a different and weaker reason: suppression's
+benefit is unmeasurable at current loss rates, so there is no case for
+carrying an unvalidated forwarding change on the fleet. It was not shown to
+be harmful.
 
 **A fidelity bug found while reasoning about it, still unfixed.** NFD grows
 the per-entry window once per FORWARD DECISION (`decidePerPitEntry`); this
