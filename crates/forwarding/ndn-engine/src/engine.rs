@@ -1079,8 +1079,28 @@ pub(crate) async fn run_face_sender(
         }
     };
 
+    // Fixed-deadline tick, NOT a fresh timer per iteration.
+    //
+    // `select!` is `biased` with egress polled before the tick, so recreating
+    // the sleep each pass let any packet reset it: the tick then fired only in
+    // an idle gap >= `retx_tick_dur` and was starved exactly when the link was
+    // busy — i.e. when recovery matters. Measured consequence on the fleet:
+    // Acks flushed only in lulls, so RTT samples were too sparse for the RTO to
+    // converge (faces sat at the 1 s initial value), and retransmission latency
+    // was not RTO-bounded but "time until the next lull" — multi-second stalls
+    // that an in-order stream turns into bursts. NFD has no such coupling: its
+    // LpReliability timers are scheduled independently of egress activity.
+    //
+    // Holding an absolute deadline makes the tick fire on schedule no matter
+    // how busy egress is; a pass consumed by egress just shortens the next
+    // sleep instead of restarting it.
+    let tick_nanos = retx_tick_dur.as_nanos() as u64;
+    let mut next_tick = runtime.unix_nanos().saturating_add(tick_nanos);
     loop {
-        let retx_sleep = runtime.sleep(retx_tick_dur);
+        let until = std::time::Duration::from_nanos(
+            next_tick.saturating_sub(runtime.unix_nanos()),
+        );
+        let retx_sleep = runtime.sleep(until);
         tokio::select! {
             biased;            _ = cancel.cancelled() => break,
             item = async {
@@ -1157,6 +1177,7 @@ pub(crate) async fn run_face_sender(
             },
             _ = retx_sleep, if lp_reliability_feature.is_some()
                 || a_lal_feature.as_ref().is_some_and(|a| a.is_beacon_enabled()) => {
+                next_tick = runtime.unix_nanos().saturating_add(tick_nanos);
                 // Pump the reliability feature's retransmissions and standalone
                 // Acks onto the egress path. Both are empty when disabled.
                 if let Some(feature) = lp_reliability_feature.as_ref() {
