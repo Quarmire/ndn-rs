@@ -145,6 +145,15 @@ pub struct LpReliability {
     /// Frames evicted from `unacked` by the `max_unacked` cap before they
     /// were Acked or retried to exhaustion — silent, unrecoverable loss.
     unacked_evictions: u64,
+    /// TxSequences seen recently, for duplicate-frame suppression, with the
+    /// time each was first seen. Aged out after one RTO — long enough to
+    /// cover a retransmission, short enough to stay small.
+    recent_recv: HashMap<u64, Instant>,
+    /// `recent_recv` keys in arrival order, so ageing is O(expired).
+    recent_recv_order: VecDeque<u64>,
+    /// Inbound frames dropped as duplicates (a peer retransmission whose
+    /// original already arrived).
+    duplicate_frames: u64,
 }
 
 fn initial_rto_for(strategy: &RtoStrategy) -> u64 {
@@ -179,6 +188,9 @@ impl LpReliability {
             rto_strategy: config.rto_strategy,
             rto_expirations: 0,
             unacked_evictions: 0,
+            recent_recv: HashMap::new(),
+            recent_recv_order: VecDeque::new(),
+            duplicate_frames: 0,
         }
     }
 
@@ -287,11 +299,54 @@ impl LpReliability {
         self.mtu = mtu;
     }
 
-    pub fn on_receive(&mut self, raw: &[u8]) {
+    /// Consume a peer's Acks and queue an Ack for a received reliable frame.
+    ///
+    /// Returns `true` when this frame is a DUPLICATE — a peer retransmission
+    /// whose original already arrived — and the caller must drop it without
+    /// reassembling or forwarding it.
+    ///
+    /// Mirrors NFD `LpReliability::processIncomingPacket`, which tracks
+    /// recently-received frames and returns `!isDuplicate` so
+    /// `GenericLinkService::decodeFragment` can return early. Without this the
+    /// duplicate travels up the pipeline, where the PIT sees an Interest whose
+    /// nonce it has already recorded and misreads a link-layer retransmission
+    /// as a FORWARDING LOOP — dropping it and cancelling any pending forward
+    /// for that entry.
+    ///
+    /// Keyed on `TxSequence`, not `Sequence`: `check_retransmit` resends
+    /// `entry.wire` byte-for-byte, so the TxSequence is stable across
+    /// retransmissions here, and unlike `Sequence` it is present on
+    /// single-fragment frames too (`on_send` omits frag fields when
+    /// `frag_count == 1`). NFD must key on `Sequence` only because it
+    /// re-stamps a fresh TxSequence when it retransmits.
+    ///
+    /// The Ack is queued BEFORE the duplicate verdict, exactly as NFD does:
+    /// the peer retransmitted because it never got our Ack, so staying silent
+    /// would make it retransmit again.
+    pub fn on_receive(&mut self, raw: &[u8]) -> bool {
         let (tx_seq, acks) = extract_acks(raw);
 
+        let mut is_duplicate = false;
         if let Some(seq) = tx_seq {
             self.pending_acks.push_back(seq);
+
+            let now = Instant::now();
+            let rto = std::time::Duration::from_micros(self.rto_us);
+            while let Some(&front) = self.recent_recv_order.front() {
+                match self.recent_recv.get(&front) {
+                    Some(&seen) if now.duration_since(seen) > rto => {
+                        self.recent_recv.remove(&front);
+                        self.recent_recv_order.pop_front();
+                    }
+                    _ => break,
+                }
+            }
+            if self.recent_recv.insert(seq, now).is_some() {
+                is_duplicate = true;
+                self.duplicate_frames += 1;
+            } else {
+                self.recent_recv_order.push_back(seq);
+            }
         }
 
         let now = Instant::now();
@@ -304,6 +359,13 @@ impl LpReliability {
                 }
             }
         }
+        is_duplicate
+    }
+
+    /// Inbound frames dropped as peer retransmissions of an already-received
+    /// frame.
+    pub fn duplicate_frames(&self) -> u64 {
+        self.duplicate_frames
     }
 
     /// Returns wire packets due for retransmission.
@@ -728,5 +790,74 @@ mod tests {
             rel.on_send(&small_packet());
         }
         assert!(rel.unacked_count() <= MAX_UNACKED);
+    }
+}
+
+#[cfg(test)]
+mod duplicate_suppression_tests {
+    use super::*;
+
+    fn reliable_frame(tx_seq: u64) -> Bytes {
+        encode_lp_reliable(&[0x05, 0x03, 0x07, 0x01, 0xAA], tx_seq, None, &[])
+    }
+
+    /// A peer retransmission must be reported as a DUPLICATE so the caller
+    /// drops it before reassembly/forwarding — but must still be Acked.
+    ///
+    /// Without the drop, the duplicate reaches the PIT, which sees an Interest
+    /// whose nonce it already holds and misreads a link-layer retransmission as
+    /// a forwarding loop (NFD suppresses it in
+    /// `LpReliability::processIncomingPacket`). Without the Ack, the peer never
+    /// learns we have it and retransmits again.
+    #[test]
+    fn a_retransmitted_frame_is_reported_duplicate_but_still_acked() {
+        let mut rel = LpReliability::new(1400);
+        const TX: u64 = 77;
+
+        assert!(!rel.on_receive(&reliable_frame(TX)), "first arrival is not a duplicate");
+        assert!(rel.on_receive(&reliable_frame(TX)), "retransmission must be flagged duplicate");
+        assert!(rel.on_receive(&reliable_frame(TX)), "and stay flagged while in the window");
+        assert_eq!(rel.duplicate_frames(), 2);
+
+        // Every arrival queued an Ack, duplicates included.
+        let acks = rel.flush_acks().expect("Acks queued");
+        let (_tx, list) = extract_acks(&acks);
+        assert_eq!(
+            list.iter().filter(|&&a| a == TX).count(),
+            3,
+            "each arrival, duplicate or not, owes the peer an Ack"
+        );
+    }
+
+    /// Distinct frames must not be mistaken for each other.
+    #[test]
+    fn distinct_txsequences_are_not_duplicates() {
+        let mut rel = LpReliability::new(1400);
+        for tx in 0..50u64 {
+            assert!(!rel.on_receive(&reliable_frame(tx)), "tx={tx} is first-seen");
+        }
+        assert_eq!(rel.duplicate_frames(), 0);
+    }
+
+    /// The dedup window is bounded: entries age out after one RTO, so a long
+    /// flow cannot grow it without limit.
+    #[test]
+    fn dedup_window_ages_out_and_stays_bounded() {
+        let mut rel = LpReliability::from_config(
+            1400,
+            ReliabilityConfig {
+                rto_strategy: RtoStrategy::Fixed { rto_us: 1 },
+                ..Default::default()
+            },
+        );
+        for tx in 0..200u64 {
+            rel.on_receive(&reliable_frame(tx));
+            std::thread::sleep(std::time::Duration::from_micros(2));
+        }
+        assert!(
+            rel.recent_recv.len() < 200,
+            "window must age out (holding {})",
+            rel.recent_recv.len()
+        );
     }
 }

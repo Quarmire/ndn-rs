@@ -468,9 +468,15 @@ impl LinkService for LpLinkService {
         transport: &'a dyn ErasedTransport,
     ) -> Pin<Box<dyn Future<Output = Result<LinkServiceFrame, FaceError>> + Send + 'a>> {
         Box::pin(async move {
+            // Loops so a duplicate frame is consumed and the next real one is
+            // awaited, rather than surfacing a frame the caller must re-drop.
+            let (wire, addr) = loop {
             let (wire, addr, radio_id) = transport.recv_bytes_with_meta().await?;
             let ingress_ctx = IngressCtx::new(FaceId(transport.id().0));
             let inbound = InboundLpFrame::with_meta(wire.clone(), addr.clone(), radio_id);
+            // Driven here, not via the feature pipeline, because the duplicate
+            // verdict decides whether this frame may continue at all.
+            let is_duplicate = self.reliability_feature.note_receive(&wire);
             for feature in &self.features {
                 feature.on_ingress(&inbound, &ingress_ctx);
             }
@@ -494,6 +500,16 @@ impl LinkService for LpLinkService {
             if let Some(ack) = self.reliability_feature.take_acks() {
                 let _ = transport.send_bytes(ack).await;
             }
+            // Duplicate: the Ack above still went out (the peer retransmitted
+            // because it never got the first one), but the frame must NOT
+            // reach reassembly or forwarding — upstream the PIT would see an
+            // Interest whose nonce it already holds and misread this
+            // link-layer retransmission as a forwarding loop.
+            if is_duplicate {
+                continue;
+            }
+            break (wire, addr);
+            };
             Ok(LinkServiceFrame::with_addr(wire, addr))
         })
     }

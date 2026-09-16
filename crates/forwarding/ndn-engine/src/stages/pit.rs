@@ -25,6 +25,9 @@ pub const MAX_PERSISTENT_LIFETIME_SECS: u32 = ndn_packet::MAX_PERSISTENT_LIFETIM
 /// - else → create a new entry, set `ctx.pit_token`, continue
 pub struct PitCheckStage {
     pub pit: Arc<Pit>,
+    /// Needed to read the ingress face's link type: a duplicate nonce means
+    /// something different on a point-to-point link than on a multi-access one.
+    pub face_table: Arc<ndn_transport::FaceTable>,
     pub dead_nonce_list: Option<Arc<DeadNonceList>>,
     #[cfg(not(target_arch = "wasm32"))]
     pub validator: Option<Arc<Validator>>,
@@ -136,6 +139,12 @@ impl PitCheckStage {
             }
         }
 
+        let is_point_to_point = self
+            .face_table
+            .get(ctx.face_id)
+            .map(|f| f.link_type() == ndn_transport::LinkType::PointToPoint)
+            .unwrap_or(false);
+
         enum CheckResult {
             Loop,
             Aggregated,
@@ -152,12 +161,36 @@ impl PitCheckStage {
             token,
             |entry| {
                 if entry.nonces_seen.contains(&nonce) {
-                    // Overhear-cancel (CCLF): a duplicate nonce means a neighbor
-                    // is forwarding this very Interest instance. If we have a
-                    // scheduled forward pending (timer election), cancel it —
-                    // a peer already won. Inert for immediate-forward strategies.
-                    entry.forward_cancelled = true;
-                    return CheckResult::Loop;
+                    // NFD parity (`onIncomingInterest` + `findDuplicateNonce`):
+                    // on a POINT-TO-POINT link a duplicate nonce arriving from
+                    // the SAME face is a RETRANSMISSION, not a loop — NFD masks
+                    // off `DUPLICATE_NONCE_IN_SAME` for that link type and lets
+                    // the Interest reach the strategy, which is the whole reason
+                    // `RetxSuppressionExponential::decidePerUpstream` exists.
+                    // A loop needs a distinct path, so it shows up as the same
+                    // nonce from a DIFFERENT face; on a multi-access bearer the
+                    // face is shared by many peers, so that inference does not
+                    // hold and any duplicate stays a loop.
+                    //
+                    // Treating a retransmission as a loop is not merely a missed
+                    // forward: it also sets `forward_cancelled`, tearing down a
+                    // pending scheduled forward for an Interest that is still
+                    // outstanding. Paired with the link layer now suppressing
+                    // duplicate frames, this is belt-and-braces — a retransmitted
+                    // frame should no longer reach here at all.
+                    let same_face_retx = is_point_to_point
+                        && entry
+                            .in_records
+                            .iter()
+                            .any(|r| r.face_id == ctx.face_id.0 && r.nonce == nonce);
+                    if !same_face_retx {
+                        // Overhear-cancel (CCLF): a duplicate nonce means a neighbor
+                        // is forwarding this very Interest instance. If we have a
+                        // scheduled forward pending (timer election), cancel it —
+                        // a peer already won. Inert for immediate-forward strategies.
+                        entry.forward_cancelled = true;
+                        return CheckResult::Loop;
+                    }
                 }
                 let expires_at = now_ns + lifetime_ms * 1_000_000;
                 // NS-11 (with the always-re-forward below): a persistent re-express
@@ -973,6 +1006,7 @@ mod n06_dead_nonce_engine_tests {
         let dnl = Arc::new(DeadNonceList::new());
         let check = PitCheckStage {
             pit: Arc::clone(&pit),
+            face_table: Arc::new(ndn_transport::FaceTable::new()),
             dead_nonce_list: Some(Arc::clone(&dnl)),
             validator: None,
             replay_guard: None,
@@ -1013,6 +1047,7 @@ mod d19_tests {
         let pit = Arc::new(Pit::new());
         let stage = Arc::new(PitCheckStage {
             pit: Arc::clone(&pit),
+            face_table: Arc::new(ndn_transport::FaceTable::new()),
             dead_nonce_list: None,
             #[cfg(not(target_arch = "wasm32"))]
             validator: None,
@@ -1147,6 +1182,7 @@ mod persistent_tests {
         let pit = Arc::new(Pit::new());
         let check = Arc::new(PitCheckStage {
             pit: Arc::clone(&pit),
+            face_table: Arc::new(ndn_transport::FaceTable::new()),
             dead_nonce_list: None,
             validator: Some(make_validator()),
             replay_guard: None,
@@ -1215,6 +1251,7 @@ mod persistent_tests {
         let pit = Arc::new(Pit::new());
         let check = Arc::new(PitCheckStage {
             pit: Arc::clone(&pit),
+            face_table: Arc::new(ndn_transport::FaceTable::new()),
             dead_nonce_list: None,
             validator: Some(make_validator()),
             replay_guard: None,
@@ -1274,6 +1311,7 @@ mod persistent_tests {
         let pit = Arc::new(Pit::new());
         let check = Arc::new(PitCheckStage {
             pit: Arc::clone(&pit),
+            face_table: Arc::new(ndn_transport::FaceTable::new()),
             dead_nonce_list: None,
             validator: Some(make_validator()),
             replay_guard: None,
@@ -1335,6 +1373,7 @@ mod persistent_tests {
         let pit = Arc::new(Pit::new());
         let check = Arc::new(PitCheckStage {
             pit: Arc::clone(&pit),
+            face_table: Arc::new(ndn_transport::FaceTable::new()),
             dead_nonce_list: None,
             validator: Some(make_validator()),
             replay_guard: None,
@@ -1375,6 +1414,7 @@ mod persistent_tests {
         // Use a validator that verifies the sig; a corrupted sig returns Invalid.
         let check = Arc::new(PitCheckStage {
             pit: Arc::clone(&pit),
+            face_table: Arc::new(ndn_transport::FaceTable::new()),
             dead_nonce_list: None,
             validator: Some(make_validator()),
             replay_guard: None,
@@ -1423,6 +1463,7 @@ mod persistent_tests {
         let pit = Arc::new(Pit::new());
         let check = Arc::new(PitCheckStage {
             pit: Arc::clone(&pit),
+            face_table: Arc::new(ndn_transport::FaceTable::new()),
             dead_nonce_list: None,
             validator: Some(make_validator()),
             replay_guard: None,
@@ -1442,6 +1483,7 @@ mod persistent_tests {
         let pit = Arc::new(Pit::new());
         let check = Arc::new(PitCheckStage {
             pit: Arc::clone(&pit),
+            face_table: Arc::new(ndn_transport::FaceTable::new()),
             dead_nonce_list: None,
             validator: Some(make_validator()),
             replay_guard: None,
@@ -1461,6 +1503,7 @@ mod persistent_tests {
         let pit = Arc::new(Pit::new());
         let check = Arc::new(PitCheckStage {
             pit: Arc::clone(&pit),
+            face_table: Arc::new(ndn_transport::FaceTable::new()),
             dead_nonce_list: None,
             validator: Some(make_validator()),
             replay_guard: None,
@@ -1481,6 +1524,7 @@ mod persistent_tests {
         let pit = Arc::new(Pit::new());
         let check = Arc::new(PitCheckStage {
             pit: Arc::clone(&pit),
+            face_table: Arc::new(ndn_transport::FaceTable::new()),
             dead_nonce_list: None,
             validator: Some(make_validator()),
             replay_guard: None,
@@ -1516,6 +1560,7 @@ mod persistent_tests {
         let pit = Arc::new(Pit::new());
         let check = Arc::new(PitCheckStage {
             pit: Arc::clone(&pit),
+            face_table: Arc::new(ndn_transport::FaceTable::new()),
             dead_nonce_list: None,
             validator: Some(make_validator()),
             replay_guard: None,
@@ -1571,6 +1616,7 @@ mod persistent_tests {
         let pit = Arc::new(Pit::new());
         let check = Arc::new(PitCheckStage {
             pit: Arc::clone(&pit),
+            face_table: Arc::new(ndn_transport::FaceTable::new()),
             dead_nonce_list: None,
             validator: Some(make_validator()),
             replay_guard: None,
@@ -1615,6 +1661,7 @@ mod persistent_tests {
         let pit = Arc::new(Pit::new());
         let check = Arc::new(PitCheckStage {
             pit: Arc::clone(&pit),
+            face_table: Arc::new(ndn_transport::FaceTable::new()),
             dead_nonce_list: None,
             validator: None,
             replay_guard: None,
@@ -1651,6 +1698,7 @@ mod persistent_tests {
         let pit = Arc::new(Pit::new());
         let check = Arc::new(PitCheckStage {
             pit: Arc::clone(&pit),
+            face_table: Arc::new(ndn_transport::FaceTable::new()),
             dead_nonce_list: None,
             validator: Some(make_validator()),
             replay_guard: None,
@@ -1725,6 +1773,7 @@ mod persistent_tests {
         let pit = Arc::new(Pit::new());
         let check = Arc::new(PitCheckStage {
             pit: Arc::clone(&pit),
+            face_table: Arc::new(ndn_transport::FaceTable::new()),
             dead_nonce_list: None,
             validator: Some(make_validator()),
             replay_guard: None,
@@ -1831,6 +1880,7 @@ mod d09_retx_tests {
     fn check_stage(pit: Arc<Pit>) -> PitCheckStage {
         PitCheckStage {
             pit,
+            face_table: Arc::new(ndn_transport::FaceTable::new()),
             dead_nonce_list: None,
             validator: None,
             replay_guard: None,

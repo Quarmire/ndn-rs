@@ -170,8 +170,14 @@ impl ReliabilityFeature {
     /// reliable frames queue an Ack. For the discovery `inject_packet` recv
     /// path, which does not run the LinkService feature pipeline; the socket
     /// recv path drives the same state via [`LinkServiceFeature::on_ingress`].
-    pub fn note_receive(&self, raw: &[u8]) {
-        self.state.lock().unwrap().on_receive(raw);
+    pub fn note_receive(&self, raw: &[u8]) -> bool {
+        self.state.lock().unwrap().on_receive(raw)
+    }
+
+    /// Inbound frames dropped as peer retransmissions of an already-received
+    /// frame (see `LpReliability::on_receive`).
+    pub fn n_lp_duplicate_frames(&self) -> u64 {
+        self.state.lock().unwrap().duplicate_frames()
     }
 }
 
@@ -210,9 +216,11 @@ impl LinkServiceFeature for ReliabilityFeature {
     /// Sending is still opt-in: `frame` and `take_retransmissions` stay gated,
     /// so a disabled face never attaches a TxSequence or retransmits its own
     /// traffic. It only answers.
-    fn on_ingress(&self, frame: &InboundLpFrame, _ctx: &IngressCtx) {
-        let mut s = self.state.lock().unwrap();
-        s.on_receive(&frame.wire);
+    fn on_ingress(&self, _frame: &InboundLpFrame, _ctx: &IngressCtx) {
+        // No-op: `LpLinkService::recv` calls `note_receive` directly, because
+        // it must ACT on the duplicate verdict (drop the frame) and this
+        // trait method cannot return one. Driving it from both places would
+        // double-count Acks and duplicates.
     }
 }
 

@@ -313,6 +313,7 @@ impl WasmEngineBuilder {
             },
             pit_check: PitCheckStage {
                 pit: Arc::clone(&pit),
+                face_table: Arc::clone(&face_table),
                 dead_nonce_list: Some(Arc::clone(&dead_nonce_list)),
                 replay_guard: replay_guard.clone(),
             },
