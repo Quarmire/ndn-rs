@@ -474,6 +474,26 @@ impl LinkService for LpLinkService {
             for feature in &self.features {
                 feature.on_ingress(&inbound, &ingress_ctx);
             }
+            // Ack on receipt, not on the retransmit tick.
+            //
+            // An Ack parked until the next tick puts a floor under the peer's
+            // RTT sample, and therefore under its RTO: with a 50 ms pump the
+            // peer cannot measure anything faster than ~25 ms average, so its
+            // RTO can never track a 1-2 ms mesh. Worse, the two are a trap for
+            // each other — lowering the RTO below the tick (tried on the fleet:
+            // Quic's ~4.5 ms against a 10 ms pump) makes the sender retransmit
+            // BEFORE an Ack is physically possible, which manifested as NDNSF
+            // service calls timing out wholesale, not merely as wasted airtime.
+            // Acking here removes the floor so the RTO estimator can track the
+            // real link.
+            //
+            // `take_acks` drains ALL pending Acks into one frame, so a burst of
+            // fragments arriving back-to-back costs one Ack frame, not one per
+            // fragment. Self-gating: a peer that never sends a TxSequence
+            // queues nothing and this is a single uncontended lock check.
+            if let Some(ack) = self.reliability_feature.take_acks() {
+                let _ = transport.send_bytes(ack).await;
+            }
             Ok(LinkServiceFrame::with_addr(wire, addr))
         })
     }
@@ -840,6 +860,75 @@ mod fragment_reliability_tests {
         async fn recv_bytes(&self) -> Result<Bytes, FaceError> {
             Err(FaceError::Closed)
         }
+    }
+
+    struct OneFrame {
+        frame: std::sync::Mutex<Option<Bytes>>,
+        sent: Arc<Mutex<Vec<Bytes>>>,
+    }
+    impl Transport for OneFrame {
+        fn id(&self) -> FaceId {
+            FaceId(11)
+        }
+        fn kind(&self) -> FaceKind {
+            FaceKind::Udp
+        }
+        fn send_mtu(&self) -> Option<usize> {
+            Some(1452)
+        }
+        async fn send_bytes(&self, wire: Bytes) -> Result<(), FaceError> {
+            self.sent.lock().unwrap().push(wire);
+            Ok(())
+        }
+        async fn recv_bytes(&self) -> Result<Bytes, FaceError> {
+            match self.frame.lock().unwrap().take() {
+                Some(f) => Ok(f),
+                None => Err(FaceError::Closed),
+            }
+        }
+    }
+
+    /// A received reliable frame must be Acked on RECEIPT, not parked until
+    /// the next retransmit tick.
+    ///
+    /// A deferred Ack puts a floor under the peer's RTT sample and therefore
+    /// under its RTO, so the RTO can never track a 1-2 ms mesh; and lowering
+    /// the RTO below the tick instead makes the peer retransmit before an Ack
+    /// is physically possible (measured on the fleet as NDNSF service calls
+    /// timing out wholesale).
+    #[tokio::test]
+    async fn a_received_reliable_frame_is_acked_on_receipt_without_a_tick() {
+        const PEER_TX_SEQ: u64 = 4242;
+        let inbound = ndn_packet::lp::encode_lp_reliable(&[0x05, 0x01, 0xAB], PEER_TX_SEQ, None, &[]);
+
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let tx = OneFrame {
+            frame: std::sync::Mutex::new(Some(inbound)),
+            sent: Arc::clone(&sent),
+        };
+        let svc = LpLinkService::new();
+
+        let _ = svc.recv(&tx).await.expect("frame delivers");
+
+        // No tick has run: take_retransmissions/the retx pump were never called.
+        let wires = sent.lock().unwrap().clone();
+        assert_eq!(
+            wires.len(),
+            1,
+            "exactly one Ack frame must be emitted on receipt (got {})",
+            wires.len()
+        );
+        let (_tx_seq, acks) = ndn_packet::lp::extract_acks(&wires[0]);
+        assert!(
+            acks.contains(&PEER_TX_SEQ),
+            "the Ack must reference the peer's TxSequence {PEER_TX_SEQ}, got {acks:?}"
+        );
+
+        // And it was consumed, so the tick has nothing left to send.
+        assert!(
+            svc.reliability_feature.take_acks().is_none(),
+            "Ack must not be queued a second time for the tick"
+        );
     }
 
     /// Every fragment of an over-MTU packet MUST carry a `TxSequence`.
