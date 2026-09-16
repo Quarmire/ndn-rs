@@ -280,3 +280,43 @@ would bite during a lossy burst or with a more aggressive consumer.
 Left unimplemented deliberately: a faithful port needs per-(entry, upstream)
 backoff state and a `StrategyContext` addition, i.e. a strategy-API change
 that wants hardware validation rather than an append to a long session.
+
+## Retx suppression: implemented, reverted from the fleet, NOT validated
+
+`RetxSuppressionExponential` is ported (ndn-rs `a1021b7b`, NoRoute fix
+`0156f643`) and unit-tested, but it is **reverted on the fleet** and should
+not be redeployed without bench work. Two attempts, two problems:
+
+**Attempt 1 — outage (my bug).** The suppressed-upstream filter fed the
+strategy's existing `faces.is_empty()` branch, which meant "the FIB has no
+usable nexthop" and answers `Nack(NoRoute)`. So a moment when every upstream
+sat inside its 10 ms window told the consumer the name was unreachable.
+Video ZERO, telemetry gapping on all three airframes, immediately. Fixed by
+separating the two emptiness checks; `nacks=0` on every peer face confirms it
+on hardware. Guard: `all_upstreams_suppressed_sends_nothing_not_noroute`.
+*Changing what feeds a condition changes what the condition means.*
+
+**Attempt 2 — telemetry regression, cause not established.** With the NoRoute
+fix in place: video 7.9-8.0 fps (baseline range), `nacks=0`, iuas-01 and
+wuas-01 telemetry clean at 3.18-3.26/s — but **iuas-02 at 2.59-2.67/s with 5
+gaps>2 s in BOTH runs**, against 3.31/s and zero gaps before suppression.
+Reproducible, one node only, agent healthy (`NRestarts=0`). Reverted: a
+degraded flight-critical telemetry path is not an acceptable price for a
+change whose benefit is currently unmeasurable.
+
+**A fidelity bug found while reasoning about it, still unfixed.** NFD grows
+the per-entry window once per FORWARD DECISION (`decidePerPitEntry`); this
+port grows it inside `add_out_record`, which multicast calls once per
+upstream — so a 3-nexthop fan-out grows the window 2^3 per Interest instead
+of 2x, pinning it at the 250 ms cap almost immediately. That only affects
+best-route entries (multicast reads the fixed per-upstream window), so it is
+not obviously the iuas-02 cause, but it is wrong and would have to be fixed
+before any retry.
+
+**Honest status of the benefit:** never demonstrated. At current loss rates
+(`resent` 25-52 per 180 s) the fleet cannot show an improvement from
+suppression — only the absence of harm. The case for it is conformance with
+NFD and behaviour under lossy bursts, not measured gain. Next attempt belongs
+on the two-node netns bench with induced loss (`/tmp/bench.sh` on
+minidronesys-04), where retransmission rates can be driven high enough for
+the effect to be visible at all.
