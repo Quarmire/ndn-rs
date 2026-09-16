@@ -223,3 +223,60 @@ second-preimage is 2^64. Not reachable by accident or by an attacker.
 
 Left as designed. Recorded here only so the next reader does not re-derive
 the same false alarm.
+
+## Round 3 — guided by the audit ledger
+
+`testbed/EXPECTED_FAILURES.md` is frozen with **zero open rows**, and its
+coverage (A/B/C/D/E/F/G/N/X series, each with a witness) is genuinely broad.
+Worth noting what that implies: every defect found in this session — the dead
+`wifi()` profile, the egress-reset timer, tick-bound Acks, missing duplicate
+suppression, `purge_expired` never on a timer — is a **runtime/wiring**
+defect, not a spec-conformance one. A conformance matrix cannot catch them,
+which is why they survived an otherwise rigorous audit. Hunt the seams, not
+the spec.
+
+### Checked clean this round
+- `CongestionMarkingFeature` defaults to disabled; NFD's
+  `allowCongestionMarking` also defaults to **false**. Match, not a gap.
+- `set_base_cong_interval` is reachable in production via the `faces/update`
+  `FaceOption` path (not test-only).
+- Protocol constants re-confirmed: InterestLifetime 4 s, DNL 6 s, HopLimit
+  decrement + drop-at-0, `/localhost` ingress scope, CS serve/admit,
+  MustBeFresh, CanBePrefix, ImplicitSha256Digest verified against cached wire.
+
+### OPEN — no retransmission suppression in any strategy
+NFD gates every upstream through `RetxSuppressionExponential`
+(`daemon/fw/retx-suppression-exponential.hpp`, default 10 ms initial, x2,
+250 ms max) in BOTH `best-route` and `multicast`:
+
+```cpp
+auto suppressResult = m_retxSuppression->decidePerUpstream(*pitEntry, outFace);
+if (suppressResult == RetxSuppressionResult::SUPPRESS) { continue; }
+```
+
+ndn-rs has no equivalent. `MulticastStrategy` is stateless
+(`struct MulticastStrategy { name }`) and `decide` returns every nexthop
+excluding the in-face, unconditionally. `best_route` prefers an untried
+upstream but explicitly falls back to re-sending ("a retransmission should
+still be re-sent") with no time gate.
+
+**The state needed is already there**: `OutRecord` carries `sent_at: u64`.
+What is missing is the gate — and a way for a strategy to see it, since
+`StrategyContext` currently exposes `tried_faces` but no send timestamps.
+
+**Disclosure — this gap is now more reachable because of a fix in this
+session.** Before the point-to-point same-face nonce exemption (round 1,
+item 5), a retransmitted Interest was dropped at the PIT as a loop and never
+reached the strategy at all. It now does. NFD pairs that exemption with
+suppression; ndn-rs currently has the exemption without it, so on a shared
+medium each consumer retransmission fans out to every nexthop with no
+backoff — the same airtime-amplification shape chased earlier in this
+session.
+
+Not biting on the fleet today (post-fix: `resent` 140 -> 25-52, 100%
+fragment completion, ~10 fps), because the retransmission rate is low. It
+would bite during a lossy burst or with a more aggressive consumer.
+
+Left unimplemented deliberately: a faithful port needs per-(entry, upstream)
+backoff state and a `StrategyContext` addition, i.e. a strategy-API change
+that wants hardware validation rather than an append to a long session.
