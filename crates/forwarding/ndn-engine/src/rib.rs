@@ -460,6 +460,34 @@ mod tests {
     }
 
     #[test]
+    fn static_config_routes_must_reach_a_descendant_the_app_registered() {
+        // A config route is useless to real traffic unless it CHILD_INHERITs.
+        // Applications register descendants (ndn-svs registers the sync group
+        // /muas/v2/group); LPM then stops at that descendant, and without
+        // CHILD_INHERIT the parent's peer nexthop never reaches it — the
+        // Interest is dropped `reason=NoRoute`. Measured in a two-node netns
+        // reproducer: SVS sync Interests NoRoute'd on BOTH nodes, so every
+        // NDNSF service call (which rides SVS pub/sub) timed out while /muas
+        // itself had a perfectly good nexthop. `nfdc route add` defaults to
+        // CHILD_INHERIT, which is why NFD was unaffected.
+        const CHILD_INHERIT: u64 = 1;
+        let rib = Rib::new();
+        let fib = Fib::new();
+        // config route toward the peer, as ndn-fwd installs from [[route]]
+        rib.add(&nn("/muas"), flagged(1, 100, CHILD_INHERIT));
+        // the application registers the SVS sync group on its local face
+        rib.add(&nn("/muas/v2/group"), flagged(9, 0, 0));
+        rib.apply_to_fib(&nn("/muas"), &fib);
+        rib.apply_to_fib(&nn("/muas/v2/group"), &fib);
+
+        assert_eq!(
+            faces_at(&fib, "/muas/v2/group"),
+            vec![1, 9],
+            "the sync group must reach the PEER (1) as well as the local app (9)"
+        );
+    }
+
+    #[test]
     fn child_inherit_propagates_to_descendant_rib_entry() {
         const CHILD_INHERIT: u64 = 1;
         let rib = Rib::new();
