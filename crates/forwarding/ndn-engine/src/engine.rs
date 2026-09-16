@@ -286,6 +286,10 @@ pub struct EngineInner {
     /// `None` ⇒ the FIFO default on every face. The matching classifier lives on the
     /// dispatcher (`name_classifier`), which is where outbound packets are classified.
     pub(crate) egress_factory: Option<crate::egress::EgressSchedulerFactory>,
+    /// Shared handle to the decode stage's per-face reassembly table, so
+    /// `faces/list` can report multi-fragment delivery counters and the
+    /// sweeper can expire stale groups on a timer.
+    pub(crate) reassembly: Arc<DashMap<FaceId, ndn_packet::fragment::ReassemblyBuffer>>,
     pub(crate) face_states: Arc<DashMap<FaceId, FaceState>>,
     pub discovery: Arc<dyn DiscoveryProtocol>,
     pub neighbors: Arc<NeighborTable>,
@@ -812,6 +816,38 @@ impl ForwarderEngine {
             .face_states
             .get(&face_id)
             .map(|r| r.cancel.clone())
+    }
+
+    /// Per-face NDNLPv2 reassembly counters, for `faces/list`.
+    ///
+    /// Multi-fragment delivery is all-or-nothing: a packet needing N fragments
+    /// only completes when every index arrives, so on a lossy link completion
+    /// falls as (1-p)^N while single-fragment traffic is barely touched. That
+    /// asymmetry is invisible in the byte/packet counters, which is why these
+    /// are surfaced separately.
+    pub fn reassembly_stats(
+        &self,
+        face_id: FaceId,
+    ) -> Option<ndn_packet::fragment::ReassemblyStats> {
+        self.inner.reassembly.get(&face_id).map(|b| b.stats())
+    }
+
+    /// Expire reassembly groups past their timeout across every face.
+    ///
+    /// Returns the number of groups discarded. `ReassemblyBuffer::process`
+    /// only purges when the per-face table is FULL
+    /// (`MAX_PENDING_PACKETS`), so without a periodic sweep the timeout is
+    /// effectively inert: abandoned groups from lost fragments sit until the
+    /// table fills, and the `timed_out` / `fragments_wasted` counters stay at
+    /// zero however much traffic is actually being abandoned.
+    pub fn purge_expired_reassembly(&self) -> u64 {
+        let mut purged = 0u64;
+        for mut entry in self.inner.reassembly.iter_mut() {
+            let before = entry.stats().timed_out;
+            entry.purge_expired();
+            purged += entry.stats().timed_out - before;
+        }
+        purged
     }
 
     pub fn face_states(&self) -> Arc<DashMap<FaceId, FaceState>> {

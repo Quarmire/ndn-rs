@@ -94,6 +94,24 @@ pub(super) fn faces_list_dataset(engine: &ForwarderEngine) -> bytes::Bytes {
             Some((resent, rto)) => (Some(resent), Some(rto)),
             None => (None, None),
         };
+        // Per-face NDNLPv2 reassembly counters (engine-side: the buffer lives in
+        // the dispatcher's decode stage, not the LinkService).
+        let reasm = engine.reassembly_stats(info.id);
+        let (
+            n_reasm_fragments_in,
+            n_reasm_completed,
+            n_reasm_timed_out,
+            n_reasm_fragments_wasted,
+        ) = match reasm {
+            Some(r) => (
+                Some(r.fragments_in),
+                Some(r.completed),
+                Some(r.timed_out),
+                Some(r.fragments_wasted),
+            ),
+            None => (None, None, None, None),
+        };
+
         let (n_congestion_marks_sent, n_congestion_marks_received) = match congestion_counters {
             Some((sent, recv)) => (Some(sent), Some(recv)),
             None => (None, None),
@@ -128,6 +146,10 @@ pub(super) fn faces_list_dataset(engine: &ForwarderEngine) -> bytes::Bytes {
             effective_mtu,
             feature_set,
             rto_micros,
+            n_reasm_fragments_in,
+            n_reasm_completed,
+            n_reasm_timed_out,
+            n_reasm_fragments_wasted,
         };
         buf.extend_from_slice(&fs.encode());
     }

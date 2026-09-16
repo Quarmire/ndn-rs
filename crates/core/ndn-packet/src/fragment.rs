@@ -12,7 +12,13 @@ use ndn_tlv::TlvWriter;
 use crate::tlv_type;
 
 pub const DEFAULT_UDP_MTU: usize = 1400;
-const DEFAULT_REASSEMBLY_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a partial reassembly group may sit before it is discarded.
+///
+/// Also the sweep interval used by the forwarder's reassembly sweeper — see
+/// `Engine::purge_expired_reassembly`. `process` purges only when a face's
+/// table is full, so something must call `purge_expired` on a timer for this
+/// timeout to mean anything.
+pub const DEFAULT_REASSEMBLY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// LpPacket TLV envelope + Sequence(8) + FragIndex(max 4) + FragCount(max 4)
 /// + Fragment TLV header. Conservative estimate.
@@ -412,6 +418,64 @@ mod tests {
 
         buf.purge_expired();
         assert_eq!(buf.pending_count(), 0);
+    }
+
+    /// `process` does NOT sweep on its own — only when the table is FULL.
+    ///
+    /// So an abandoned group (a lost fragment means its siblings never
+    /// complete) sits indefinitely, and `timed_out` / `fragments_wasted` stay
+    /// at zero however much traffic is being abandoned. That makes the
+    /// counters actively misleading without a periodic sweeper, which is why
+    /// the forwarder runs one (`Engine::purge_expired_reassembly`). Pin the
+    /// gap so nobody "optimises" the sweeper away.
+    #[test]
+    fn process_alone_never_expires_a_stale_group() {
+        let data: Vec<u8> = (0..3000).map(|i| (i % 256) as u8).collect();
+        let frags = fragment_packet(&data, 200, 1);
+
+        let mut buf = ReassemblyBuffer::new(Duration::from_millis(0));
+        let lp = crate::lp::LpPacket::decode(frags[0].clone()).unwrap();
+        let got = buf.process(
+            0,
+            base_seq(&lp),
+            lp.frag_index.unwrap(),
+            lp.frag_count.unwrap(),
+            lp.fragment.unwrap(),
+        );
+        assert!(got.is_none(), "one fragment of many cannot complete");
+
+        // Feed an unrelated group. The table is nowhere near
+        // MAX_PENDING_PACKETS, so the full-table purge path never runs.
+        let other = fragment_packet(&data, 200, 10_000);
+        let lp2 = crate::lp::LpPacket::decode(other[0].clone()).unwrap();
+        buf.process(
+            0,
+            base_seq(&lp2),
+            lp2.frag_index.unwrap(),
+            lp2.frag_count.unwrap(),
+            lp2.fragment.unwrap(),
+        );
+
+        assert_eq!(
+            buf.pending_count(),
+            2,
+            "both groups still held: process() does not sweep"
+        );
+        assert_eq!(
+            buf.stats().timed_out,
+            0,
+            "timed_out stays 0 without a sweep -- the timeout is inert"
+        );
+
+        // Only an explicit sweep expires them and moves the counters.
+        buf.purge_expired();
+        assert_eq!(buf.pending_count(), 0);
+        assert_eq!(buf.stats().timed_out, 2, "both groups counted as timed out");
+        assert_eq!(
+            buf.stats().fragments_wasted,
+            2,
+            "one received fragment per abandoned group is wasted airtime"
+        );
     }
 
     #[test]

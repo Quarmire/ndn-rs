@@ -41,7 +41,7 @@ mod tlv {
     pub const N_UNSATISFIED_INTERESTS: u64 = 0x9a;
 
     // ndn-rs-specific FaceStatus extensions in project-private
-    // 0xDA..=0xE2. NFD clients ignore unknown non-critical codes, so
+    // 0xDA..=0xE6. NFD clients ignore unknown non-critical codes, so
     // these are additive on the wire.
     pub const N_LP_ACKS_RECEIVED: u64 = 0xda;
     pub const N_LP_RESENT_PACKETS: u64 = 0xdb;
@@ -52,6 +52,11 @@ mod tlv {
     pub const FEATURE_SET: u64 = 0xe0;
     pub const FEATURE_NAME: u64 = 0xe1;
     pub const RTO_MICROS: u64 = 0xe2;
+    // NDNLPv2 reassembly counters (ndn-rs-local, additive).
+    pub const N_REASM_FRAGMENTS_IN: u64 = 0xe3;
+    pub const N_REASM_COMPLETED: u64 = 0xe4;
+    pub const N_REASM_TIMED_OUT: u64 = 0xe5;
+    pub const N_REASM_FRAGMENTS_WASTED: u64 = 0xe6;
 
     pub const ENTRY: u64 = 0x80;
     pub const NEXT_HOP_RECORD: u64 = 0x81;
@@ -155,6 +160,21 @@ pub struct FaceStatus {
     /// Reliability RTO in microseconds; `None` when the face has no
     /// reliability feature.
     pub rto_micros: Option<u64>,
+
+    // NDNLPv2 reassembly counters. Multi-fragment delivery is all-or-nothing:
+    // a packet needing N fragments completes only when every index arrives, so
+    // on a lossy link completion falls as (1-p)^N while single-fragment
+    // traffic is barely touched. That asymmetry is invisible in the byte and
+    // packet counters above, which is the whole reason these exist.
+    // `None` = the face has never reassembled anything.
+    /// Fragments accepted into a group (index not already held).
+    pub n_reasm_fragments_in: Option<u64>,
+    /// Groups handed up complete.
+    pub n_reasm_completed: Option<u64>,
+    /// Groups discarded by the sweeper before completing.
+    pub n_reasm_timed_out: Option<u64>,
+    /// Fragments belonging to a group that later timed out — wasted airtime.
+    pub n_reasm_fragments_wasted: Option<u64>,
 }
 
 impl FaceStatus {
@@ -217,6 +237,18 @@ impl FaceStatus {
             if let Some(v) = self.rto_micros {
                 write_non_neg_int(w, tlv::RTO_MICROS, v);
             }
+            if let Some(v) = self.n_reasm_fragments_in {
+                write_non_neg_int(w, tlv::N_REASM_FRAGMENTS_IN, v);
+            }
+            if let Some(v) = self.n_reasm_completed {
+                write_non_neg_int(w, tlv::N_REASM_COMPLETED, v);
+            }
+            if let Some(v) = self.n_reasm_timed_out {
+                write_non_neg_int(w, tlv::N_REASM_TIMED_OUT, v);
+            }
+            if let Some(v) = self.n_reasm_fragments_wasted {
+                write_non_neg_int(w, tlv::N_REASM_FRAGMENTS_WASTED, v);
+            }
         });
         w.finish()
     }
@@ -259,6 +291,10 @@ impl FaceStatus {
         let mut effective_mtu = None;
         let mut feature_set: Vec<String> = Vec::new();
         let mut rto_micros = None;
+        let mut n_reasm_fragments_in = None;
+        let mut n_reasm_completed = None;
+        let mut n_reasm_timed_out = None;
+        let mut n_reasm_fragments_wasted = None;
 
         while !inner.is_empty() {
             let (t, v) = inner.read_tlv().ok()?;
@@ -307,6 +343,12 @@ impl FaceStatus {
                     }
                 }
                 tlv::RTO_MICROS => rto_micros = read_non_neg_int(&v),
+                tlv::N_REASM_FRAGMENTS_IN => n_reasm_fragments_in = read_non_neg_int(&v),
+                tlv::N_REASM_COMPLETED => n_reasm_completed = read_non_neg_int(&v),
+                tlv::N_REASM_TIMED_OUT => n_reasm_timed_out = read_non_neg_int(&v),
+                tlv::N_REASM_FRAGMENTS_WASTED => {
+                    n_reasm_fragments_wasted = read_non_neg_int(&v)
+                }
                 _ => {}
             }
         }
@@ -340,6 +382,10 @@ impl FaceStatus {
             effective_mtu,
             feature_set,
             rto_micros,
+            n_reasm_fragments_in,
+            n_reasm_completed,
+            n_reasm_timed_out,
+            n_reasm_fragments_wasted,
         })
     }
 
@@ -866,6 +912,10 @@ mod tests {
                 "congestion-marking".to_owned(),
             ],
             rto_micros: Some(420),
+            n_reasm_fragments_in: Some(16),
+            n_reasm_completed: Some(17),
+            n_reasm_timed_out: Some(18),
+            n_reasm_fragments_wasted: Some(19),
         };
         let encoded = fs.encode();
         let mut buf = encoded.as_ref();
@@ -879,6 +929,10 @@ mod tests {
         assert_eq!(decoded.effective_mtu, Some(8500));
         assert_eq!(decoded.feature_set, fs.feature_set);
         assert_eq!(decoded.rto_micros, Some(420));
+        assert_eq!(decoded.n_reasm_fragments_in, Some(16));
+        assert_eq!(decoded.n_reasm_completed, Some(17));
+        assert_eq!(decoded.n_reasm_timed_out, Some(18));
+        assert_eq!(decoded.n_reasm_fragments_wasted, Some(19));
         assert_eq!(decoded.face_id, 42);
         assert_eq!(decoded.flags, 0b110);
     }

@@ -646,8 +646,14 @@ impl EngineBuilder {
             cancel.clone(),
         ));
 
+        // Shared with the dispatcher's TlvDecodeStage so `faces/list` can read
+        // per-face reassembly counters and the sweeper can expire stale groups.
+        let reassembly: Arc<dashmap::DashMap<ndn_transport::FaceId, ndn_packet::fragment::ReassemblyBuffer>> =
+            Arc::new(dashmap::DashMap::new());
+
         let inner = Arc::new(EngineInner {
             start_timestamp_ms: crate::engine::unix_time_ms(),
+            reassembly: Arc::clone(&reassembly),
             fib: Arc::clone(&fib),
             rib: Arc::clone(&rib),
             routing: Arc::clone(&routing),
@@ -724,7 +730,11 @@ impl EngineBuilder {
             face_states: Arc::clone(&face_states),
             rib: Arc::clone(&rib),
             runtime: Arc::clone(&runtime),
-            decode: TlvDecodeStage::new(Arc::clone(&face_table), Arc::clone(&face_states)),
+            decode: TlvDecodeStage::with_reassembly(
+                Arc::clone(&face_table),
+                Arc::clone(&face_states),
+                Arc::clone(&reassembly),
+            ),
             cs_lookup: CsLookupStage {
                 cs: Arc::clone(&cs),
             },
@@ -780,6 +790,34 @@ impl EngineBuilder {
         let pipeline_tx = dispatcher.spawn(cancel.clone(), &mut tasks);
 
         let _ = inner.pipeline_tx.set(pipeline_tx);
+
+        // Reassembly sweeper.
+        //
+        // `ReassemblyBuffer::process` only purges when a face's table is FULL
+        // (`MAX_PENDING_PACKETS` = 1024), so without this the timeout is
+        // effectively inert: groups abandoned because a fragment was lost sit
+        // until the table fills, and `timed_out` / `fragments_wasted` read zero
+        // no matter how much traffic is actually being abandoned. Sweeping on
+        // the timeout interval bounds the dwell and makes the counters mean
+        // what they say.
+        {
+            let reassembly_clone = Arc::clone(&reassembly);
+            let cancel_clone = cancel.clone();
+            let runtime_clone = Arc::clone(&runtime);
+            let sweep = ndn_packet::fragment::DEFAULT_REASSEMBLY_TIMEOUT;
+            tasks.spawn(async move {
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = cancel_clone.cancelled() => break,
+                        _ = runtime_clone.sleep(sweep) => {}
+                    }
+                    for mut entry in reassembly_clone.iter_mut() {
+                        entry.purge_expired();
+                    }
+                }
+            });
+        }
 
         {
             let face_states_clone = Arc::clone(&face_states);

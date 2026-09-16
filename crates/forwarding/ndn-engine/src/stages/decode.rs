@@ -50,7 +50,7 @@ pub struct PrefixAnnouncement(pub Bytes);
 /// `DecodedPacket::Nack`). Enforces `/localhost` scope at ingress.
 pub struct TlvDecodeStage {
     pub face_table: Arc<FaceTable>,
-    pub(crate) reassembly: DashMap<FaceId, ReassemblyBuffer>,
+    pub(crate) reassembly: Arc<DashMap<FaceId, ReassemblyBuffer>>,
     /// Per-face ingress option overrides. Missing entries fall back to
     /// `FaceOptions::default_for_kind` (local computes, network skips).
     face_options: DashMap<FaceId, FaceOptions>,
@@ -64,12 +64,32 @@ impl TlvDecodeStage {
         face_table: Arc<FaceTable>,
         face_states: Arc<DashMap<FaceId, crate::engine::FaceState>>,
     ) -> Self {
+        Self::with_reassembly(face_table, face_states, Arc::new(DashMap::new()))
+    }
+
+    /// Like [`Self::new`] but sharing the reassembly table with the caller.
+    ///
+    /// The engine keeps a handle so `faces/list` can report per-face
+    /// multi-fragment delivery counters, and so a background sweeper can run
+    /// [`ReassemblyBuffer::purge_expired`] on a timer. Without the shared
+    /// handle the table is unreachable: the dispatcher owning this stage is
+    /// moved into its spawned tasks.
+    pub fn with_reassembly(
+        face_table: Arc<FaceTable>,
+        face_states: Arc<DashMap<FaceId, crate::engine::FaceState>>,
+        reassembly: Arc<DashMap<FaceId, ReassemblyBuffer>>,
+    ) -> Self {
         Self {
             face_table,
-            reassembly: DashMap::new(),
+            reassembly,
             face_options: DashMap::new(),
             face_states,
         }
+    }
+
+    /// Shared handle to the per-face reassembly table.
+    pub fn reassembly_map(&self) -> Arc<DashMap<FaceId, ReassemblyBuffer>> {
+        Arc::clone(&self.reassembly)
     }
 
     /// Whether the ingress face opted into NDNLPv2 LocalFields. Gates
