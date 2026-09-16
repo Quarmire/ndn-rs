@@ -253,6 +253,45 @@ impl LpLinkService {
         }
     }
 
+    /// Fragment `payload` to `mtu` for egress, giving every fragment a
+    /// `TxSequence` so a lost fragment is retransmitted.
+    ///
+    /// An N-fragment packet dies if ANY fragment is lost and no layer below can
+    /// repair it, so unprotected fragmentation amplifies loss: p per-frame
+    /// becomes 1-(1-p)^N per-packet, unrecoverable. This previously used bare
+    /// `fragment_packet`, which stamps Sequence/FragIndex/FragCount but no
+    /// `TxSequence` -- the receiver could reassemble but the sender had nothing
+    /// to retransmit. Measured on Wi-Fi: 5% frame loss -> 26% packet loss, 0%
+    /// recovered, which stalled NDNSF stream mapping blocks and collapsed live
+    /// video to 1.5 fps against NFD's 9.6.
+    ///
+    /// Falls back to unprotected fragments only when the face has no
+    /// reliability feature at all.
+    fn fragment_for_egress(
+        &self,
+        payload: &[u8],
+        mtu: usize,
+        egress_ctx: &EgressCtx,
+    ) -> Vec<Bytes> {
+        let wires = self.reliability_feature.frame_fragments(payload, mtu);
+        if !wires.is_empty() {
+            return wires;
+        }
+        // No reliability state produced frames (empty payload): preserve the
+        // original unprotected path so behaviour is unchanged.
+        let seq = self.reserve_fragment_seqs(payload.len(), mtu);
+        ndn_packet::fragment::fragment_packet(payload, mtu, seq)
+            .into_iter()
+            .map(|frag| {
+                let mut frame = OutboundLpFrame::new(frag, true);
+                for feature in &self.features {
+                    feature.on_egress(&mut frame, egress_ctx);
+                }
+                frame.wire
+            })
+            .collect()
+    }
+
     pub fn with_reliability(reliability: ReliabilityConfig) -> Self {
         let set = features::default_features_for_network_face();
         let reliability_feature = Arc::new(ReliabilityFeature::with_config(reliability.clone()));
@@ -343,14 +382,8 @@ impl LinkService for LpLinkService {
                     && lp.frag_count.unwrap_or(1) <= 1
                     && let Some(inner) = lp.fragment.as_ref()
                 {
-                    let seq = self.reserve_fragment_seqs(inner.len(), mtu);
-                    let fragments = ndn_packet::fragment::fragment_packet(inner, mtu, seq);
-                    for frag in fragments {
-                        let mut frame = OutboundLpFrame::new(frag, true);
-                        for feature in &self.features {
-                            feature.on_egress(&mut frame, &egress_ctx);
-                        }
-                        transport.send_bytes(frame.wire).await?;
+                    for wire in self.fragment_for_egress(inner, mtu, &egress_ctx) {
+                        transport.send_bytes(wire).await?;
                     }
                     return Ok(());
                 }
@@ -362,14 +395,8 @@ impl LinkService for LpLinkService {
             }
             match transport.send_mtu() {
                 Some(mtu) if packet.len() + 4 > mtu => {
-                    let seq = self.reserve_fragment_seqs(packet.len(), mtu);
-                    let fragments = ndn_packet::fragment::fragment_packet(&packet, mtu, seq);
-                    for frag in fragments {
-                        let mut frame = OutboundLpFrame::new(frag, true);
-                        for feature in &self.features {
-                            feature.on_egress(&mut frame, &egress_ctx);
-                        }
-                        transport.send_bytes(frame.wire).await?;
+                    for wire in self.fragment_for_egress(&packet, mtu, &egress_ctx) {
+                        transport.send_bytes(wire).await?;
                     }
                     Ok(())
                 }
@@ -779,5 +806,91 @@ mod tests {
                 "{kind:?} is an IPC kind → PassthroughLinkService"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod fragment_reliability_tests {
+    use super::*;
+    use crate::face::{FaceError, FaceId, FaceKind};
+    use crate::transport::Transport;
+    use bytes::Bytes;
+    use std::sync::{Arc, Mutex};
+
+    struct Cap {
+        mtu: Option<usize>,
+        sent: Arc<Mutex<Vec<Bytes>>>,
+    }
+    impl Transport for Cap {
+        fn id(&self) -> FaceId {
+            FaceId(9)
+        }
+        fn kind(&self) -> FaceKind {
+            FaceKind::Udp
+        }
+        fn send_mtu(&self) -> Option<usize> {
+            self.mtu
+        }
+        async fn send_bytes(&self, wire: Bytes) -> Result<(), FaceError> {
+            self.sent.lock().unwrap().push(wire);
+            Ok(())
+        }
+        async fn recv_bytes(&self) -> Result<Bytes, FaceError> {
+            Err(FaceError::Closed)
+        }
+    }
+
+    /// Every fragment of an over-MTU packet MUST carry a `TxSequence`.
+    ///
+    /// Without one the sender has nothing to retransmit, so a single lost
+    /// fragment destroys the whole packet permanently. On the miniMUAS Wi-Fi
+    /// fleet that turned ~5% frame loss into 26% unrecoverable packet loss and
+    /// collapsed live video to 1.5 fps (NFD: 9.6). Regression guard for the
+    /// `fragment_packet`-without-TxSequence egress path.
+    #[tokio::test]
+    async fn fragments_carry_txsequence_and_are_retransmittable() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let tx = Cap {
+            mtu: Some(200),
+            sent: Arc::clone(&sent),
+        };
+        let svc = LpLinkService::new();
+
+        // A packet several times the MTU -> must fragment.
+        let mut w = ndn_tlv::TlvWriter::new();
+        w.write_tlv(0x05, &vec![0xAB; 900]);
+        let pkt = w.finish();
+
+        svc.send(&tx, pkt, None).await.unwrap();
+
+        let wires = sent.lock().unwrap().clone();
+        assert!(
+            wires.len() > 1,
+            "packet far above MTU must fragment (got {} wire(s))",
+            wires.len()
+        );
+
+        for (i, wire) in wires.iter().enumerate() {
+            let lp = ndn_packet::lp::LpPacket::decode(wire.clone())
+                .unwrap_or_else(|_| panic!("fragment {i} must decode as an LpPacket"));
+            assert!(
+                lp.frag_count.unwrap_or(1) > 1,
+                "fragment {i} must carry FragCount > 1"
+            );
+            assert!(
+                lp.tx_sequence.is_some(),
+                "fragment {i} of {} carries NO TxSequence -- a lost fragment \
+                 could never be retransmitted",
+                wires.len()
+            );
+        }
+
+        // Nothing has been Acked, so every fragment is still owed a
+        // retransmission once the RTO expires.
+        assert_eq!(
+            svc.reliability_feature.unacked_count(),
+            wires.len(),
+            "every fragment must be tracked for retransmission"
+        );
     }
 }
