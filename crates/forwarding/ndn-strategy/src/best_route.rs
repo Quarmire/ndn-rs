@@ -57,6 +57,13 @@ impl Strategy for BestRouteStrategy {
         let Some(fib) = ctx.fib_entry else {
             return Some(smallvec![ForwardingAction::Nack(NackReason::NoRoute)]);
         };
+        // NFD best-route-strategy.cpp: a retransmission arriving inside the
+        // entry's exponential suppression window is dropped, not forwarded.
+        // Checked before nexthop selection so a suppressed retransmission does
+        // not consume an untried upstream.
+        if ctx.entry_retx_suppressed {
+            return Some(SmallVec::new());
+        }
         // Prefer an upstream not yet tried for this Interest (D.09 failover);
         // fall back to any non-incoming nexthop for liveness once every
         // nexthop has been tried (a retransmission should still be re-sent).
@@ -143,6 +150,8 @@ mod tests {
             fib_entry,
             pit_token: None,
             tried_faces,
+            suppressed_faces: &[],
+            entry_retx_suppressed: false,
             measurements,
             signals: &crate::NoSignals,
             extensions: &EMPTY,

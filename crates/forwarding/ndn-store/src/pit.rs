@@ -184,6 +184,12 @@ pub struct InRecord {
     pub trace_ids: SmallVec<[TraceId; 1]>,
 }
 
+/// NFD `RetxSuppressionExponential` defaults
+/// (`daemon/fw/retx-suppression-exponential.hpp`).
+pub const RETX_SUPPRESS_INITIAL_NS: u64 = 10_000_000; // 10 ms
+pub const RETX_SUPPRESS_MAX_NS: u64 = 250_000_000; // 250 ms
+pub const RETX_SUPPRESS_MULTIPLIER: u64 = 2;
+
 #[derive(Clone, Debug)]
 pub struct OutRecord {
     pub face_id: u64,
@@ -193,6 +199,11 @@ pub struct OutRecord {
 
 pub struct PitEntry {
     pub name: Arc<Name>,
+    /// Per-entry retransmission-suppression window (NFD
+    /// `decidePerPitEntry`): grows x`RETX_SUPPRESS_MULTIPLIER` on each
+    /// forward, capped at `RETX_SUPPRESS_MAX_NS`. 0 = not yet set, treated as
+    /// `RETX_SUPPRESS_INITIAL_NS`.
+    pub retx_suppress_interval_ns: u64,
     pub in_records: Vec<InRecord>,
     pub out_records: Vec<OutRecord>,
     pub nonces_seen: SmallVec<[u32; 4]>,
@@ -221,6 +232,7 @@ impl PitEntry {
     pub fn new(name: Arc<Name>, now: u64, lifetime_ms: u64) -> Self {
         Self {
             name,
+            retx_suppress_interval_ns: 0,
             in_records: Vec::new(),
             out_records: Vec::new(),
             nonces_seen: SmallVec::new(),
@@ -320,12 +332,65 @@ impl PitEntry {
         self.persistent.is_some() || self.in_records.iter().any(|r| r.persistent.is_some())
     }
 
+    /// Insert or RENEW the out-record for `face_id` (NFD
+    /// `pit::Entry::insertOrUpdateOutRecord`), and grow the entry's
+    /// retransmission-suppression window.
+    ///
+    /// Previously this always pushed, so every retransmission to the same
+    /// upstream appended another record: the vector grew without bound on a
+    /// retransmitting flow, `tried_faces` reported duplicates, and there was no
+    /// single "last renewed" time per upstream for suppression to read.
     pub fn add_out_record(&mut self, face_id: u64, nonce: u32, sent_at: u64) {
-        self.out_records.push(OutRecord {
-            face_id,
-            last_nonce: nonce,
-            sent_at,
-        });
+        match self.out_records.iter_mut().find(|r| r.face_id == face_id) {
+            Some(existing) => {
+                existing.last_nonce = nonce;
+                existing.sent_at = sent_at;
+            }
+            None => self.out_records.push(OutRecord {
+                face_id,
+                last_nonce: nonce,
+                sent_at,
+            }),
+        }
+        // NFD grows the window only on a FORWARD verdict; this is that moment.
+        let cur = if self.retx_suppress_interval_ns == 0 {
+            RETX_SUPPRESS_INITIAL_NS
+        } else {
+            self.retx_suppress_interval_ns
+        };
+        self.retx_suppress_interval_ns =
+            cur.saturating_mul(RETX_SUPPRESS_MULTIPLIER).min(RETX_SUPPRESS_MAX_NS);
+    }
+
+    /// Upstreams whose last transmission is inside the per-upstream
+    /// suppression window (NFD `decidePerUpstream`, used by `multicast`).
+    ///
+    /// Fixed `RETX_SUPPRESS_INITIAL_NS` window: NFD inserts the interval on the
+    /// out-record but never grows it on this path — only `decidePerPitEntry`
+    /// grows. An upstream with no out-record is NEW and never suppressed.
+    pub fn suppressed_upstreams(&self, now_ns: u64) -> SmallVec<[u64; 4]> {
+        self.out_records
+            .iter()
+            .filter(|r| now_ns.saturating_sub(r.sent_at) < RETX_SUPPRESS_INITIAL_NS)
+            .map(|r| r.face_id)
+            .collect()
+    }
+
+    /// Whether this whole entry is inside its suppression window (NFD
+    /// `decidePerPitEntry`, used by `best-route`). Read-only: the window grows
+    /// in `add_out_record`, i.e. when a forward actually happens.
+    ///
+    /// An entry with no out-records is NEW and never suppressed.
+    pub fn entry_retx_suppressed(&self, now_ns: u64) -> bool {
+        let Some(last_out) = self.out_records.iter().map(|r| r.sent_at).max() else {
+            return false;
+        };
+        let interval = if self.retx_suppress_interval_ns == 0 {
+            RETX_SUPPRESS_INITIAL_NS
+        } else {
+            self.retx_suppress_interval_ns
+        };
+        now_ns.saturating_sub(last_out) < interval
     }
 
     pub fn in_record_faces(&self) -> impl Iterator<Item = u64> + '_ {
@@ -1065,5 +1130,78 @@ mod tests {
             Some(true),
             "overhear must set the cancel flag the ForwardAfter task reads"
         );
+    }
+}
+
+#[cfg(test)]
+mod retx_suppression_tests {
+    use super::*;
+
+    fn entry() -> PitEntry {
+        PitEntry::new(Arc::new(Name::from_components(Vec::<NameComponent>::new())), 0, 4000)
+    }
+
+    /// An upstream never sent this Interest is NEW — never suppressed.
+    #[test]
+    fn a_new_upstream_is_never_suppressed() {
+        let e = entry();
+        assert!(e.suppressed_upstreams(0).is_empty());
+        assert!(!e.entry_retx_suppressed(0), "an entry with no out-records is NEW");
+    }
+
+    /// Per-upstream (NFD `decidePerUpstream`, used by multicast) is a FIXED
+    /// window — NFD inserts the interval on the out-record but never grows it
+    /// there, so repeated retransmissions keep the same 10 ms gate.
+    #[test]
+    fn per_upstream_window_is_fixed_not_exponential() {
+        let mut e = entry();
+        e.add_out_record(7, 1, 0);
+        assert_eq!(e.suppressed_upstreams(0).as_slice(), &[7], "inside the window");
+        assert!(
+            e.suppressed_upstreams(RETX_SUPPRESS_INITIAL_NS).is_empty(),
+            "at the window edge it is forwardable again"
+        );
+
+        // A second forward must not widen the per-upstream gate.
+        e.add_out_record(7, 2, RETX_SUPPRESS_INITIAL_NS);
+        assert!(
+            e.suppressed_upstreams(RETX_SUPPRESS_INITIAL_NS * 2).is_empty(),
+            "per-upstream window must stay at the initial interval"
+        );
+    }
+
+    /// Per-entry (NFD `decidePerPitEntry`, used by best-route) grows x2 per
+    /// forward, capped at the max.
+    #[test]
+    fn per_entry_window_grows_exponentially_and_caps() {
+        let mut e = entry();
+        e.add_out_record(1, 1, 0);
+        assert_eq!(e.retx_suppress_interval_ns, RETX_SUPPRESS_INITIAL_NS * 2);
+        assert!(e.entry_retx_suppressed(RETX_SUPPRESS_INITIAL_NS));
+
+        for _ in 0..20 {
+            e.add_out_record(1, 1, 0);
+        }
+        assert_eq!(
+            e.retx_suppress_interval_ns, RETX_SUPPRESS_MAX_NS,
+            "growth must cap at NFD's max interval"
+        );
+        assert!(!e.entry_retx_suppressed(RETX_SUPPRESS_MAX_NS));
+    }
+
+    /// `add_out_record` RENEWS rather than appending.
+    ///
+    /// It previously always pushed, so a retransmitting flow grew the vector
+    /// without bound, `tried_faces` reported the same upstream repeatedly, and
+    /// there was no single "last renewed" per upstream for suppression to read.
+    #[test]
+    fn add_out_record_renews_in_place() {
+        let mut e = entry();
+        e.add_out_record(3, 10, 100);
+        e.add_out_record(3, 11, 500);
+        e.add_out_record(4, 12, 600);
+        assert_eq!(e.out_records.len(), 2, "one record per upstream, renewed");
+        let r3 = e.out_records.iter().find(|r| r.face_id == 3).unwrap();
+        assert_eq!((r3.last_nonce, r3.sent_at), (11, 500), "renewed, not stale");
     }
 }

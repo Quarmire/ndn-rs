@@ -83,6 +83,8 @@ mod tests {
             fib_entry: None,
             pit_token: None,
             tried_faces: &[],
+            suppressed_faces: &[],
+            entry_retx_suppressed: false,
             measurements,
             signals,
             extensions,

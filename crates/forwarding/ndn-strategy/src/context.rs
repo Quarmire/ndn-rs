@@ -65,6 +65,16 @@ pub struct StrategyContext<'a> {
     /// Interest (Nack failover, retransmission re-forward) so it can pick an
     /// untried nexthop. See [`FibEntry::nexthops_excluding_any`].
     pub tried_faces: &'a [FaceId],
+    /// Upstreams inside their per-upstream retransmission-suppression window
+    /// (NFD `RetxSuppressionExponential::decidePerUpstream`). A fan-out
+    /// strategy must skip these: without the gate every consumer
+    /// retransmission is re-sent to every nexthop with no backoff, which on a
+    /// shared medium is pure airtime amplification.
+    pub suppressed_faces: &'a [FaceId],
+    /// Whether the whole PIT entry is inside its suppression window (NFD
+    /// `decidePerPitEntry`, exponential: 10 ms x2 up to 250 ms). A
+    /// single-upstream strategy should forward nothing while this holds.
+    pub entry_retx_suppressed: bool,
     pub measurements: &'a MeasurementsTable,
     /// External/environmental signals (RSSI, SNR, GPS, …) pushed by signal
     /// sources. The canonical cross-layer input surface — read via

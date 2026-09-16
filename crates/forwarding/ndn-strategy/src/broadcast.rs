@@ -104,6 +104,8 @@ mod tests {
             fib_entry,
             pit_token: None,
             tried_faces: &[],
+            suppressed_faces: &[],
+            entry_retx_suppressed: false,
             measurements,
             signals: &crate::NoSignals,
             extensions: &EMPTY,

@@ -243,12 +243,34 @@ impl StrategyStage {
             })
             .unwrap_or_default();
 
+        // Retransmission suppression state, read from the same PIT entry as
+        // `tried_faces` (NFD RetxSuppressionExponential). Read-only here: the
+        // per-entry window grows in `add_out_record`, i.e. when a forward
+        // actually happens, so merely consulting a strategy never advances it.
+        let now_ns = self.runtime.unix_nanos();
+        let (suppressed_faces, entry_retx_suppressed) = ctx
+            .pit_token
+            .and_then(|tok| {
+                self.pit.with_entry(&tok, |e| {
+                    (
+                        e.suppressed_upstreams(now_ns)
+                            .into_iter()
+                            .map(ndn_transport::FaceId)
+                            .collect::<SmallVec<[ndn_transport::FaceId; 4]>>(),
+                        e.entry_retx_suppressed(now_ns),
+                    )
+                })
+            })
+            .unwrap_or_default();
+
         let sctx = StrategyContext {
             name: &name,
             in_face: ctx.face_id,
             fib_entry: strategy_fib.as_ref(),
             pit_token: ctx.pit_token,
             tried_faces: &tried_faces,
+            suppressed_faces: &suppressed_faces,
+            entry_retx_suppressed,
             measurements: &self.measurements,
             signals: self.signals.as_ref(),
             extensions,

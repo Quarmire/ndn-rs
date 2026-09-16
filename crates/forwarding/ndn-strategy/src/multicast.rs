@@ -57,10 +57,14 @@ impl Strategy for MulticastStrategy {
         let Some(fib) = ctx.fib_entry else {
             return Some(smallvec![ForwardingAction::Nack(NackReason::NoRoute)]);
         };
+        // NFD multicast-strategy.cpp gates each upstream through
+        // `decidePerUpstream`; an upstream that was sent this Interest within
+        // the window is skipped, not re-sent.
         let faces: SmallVec<[FaceId; 4]> = fib
             .nexthops_excluding(ctx.in_face)
             .into_iter()
             .map(|n| n.face_id)
+            .filter(|f| !ctx.suppressed_faces.contains(f))
             .collect();
         if faces.is_empty() {
             return Some(smallvec![ForwardingAction::Nack(NackReason::NoRoute)]);
@@ -101,6 +105,8 @@ mod tests {
             fib_entry,
             pit_token: None,
             tried_faces: &[],
+            suppressed_faces: &[],
+            entry_retx_suppressed: false,
             measurements,
             signals: &crate::NoSignals,
             extensions: &EMPTY,

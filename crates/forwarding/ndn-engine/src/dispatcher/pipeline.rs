@@ -385,12 +385,32 @@ impl PacketDispatcher {
             })
             .unwrap_or_default();
 
+        // Same retransmission-suppression read as StrategyStage (NFD
+        // RetxSuppressionExponential); this is the Nack-failover path, which
+        // must honour the same gate or a Nack storm re-forwards unthrottled.
+        let now_ns = self.strategy.runtime.unix_nanos();
+        let (suppressed_faces, entry_retx_suppressed) = self
+            .strategy
+            .pit
+            .with_entry(&token, |e| {
+                (
+                    e.suppressed_upstreams(now_ns)
+                        .into_iter()
+                        .map(FaceId)
+                        .collect::<smallvec::SmallVec<[FaceId; 4]>>(),
+                    e.entry_retx_suppressed(now_ns),
+                )
+            })
+            .unwrap_or_default();
+
         let sctx = ndn_strategy::StrategyContext {
             name: &name,
             in_face: ctx.face_id,
             fib_entry: strategy_fib.as_ref(),
             pit_token: Some(token),
             tried_faces: &tried_faces,
+            suppressed_faces: &suppressed_faces,
+            entry_retx_suppressed,
             measurements: &self.strategy.measurements,
             signals: self.strategy.signals.as_ref(),
             extensions,

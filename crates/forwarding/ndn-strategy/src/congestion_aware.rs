@@ -245,6 +245,8 @@ mod tests {
             fib_entry: Some(fib),
             pit_token: None,
             tried_faces: &[],
+            suppressed_faces: &[],
+            entry_retx_suppressed: false,
             measurements,
             signals,
             extensions: ext,
