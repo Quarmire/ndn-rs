@@ -301,14 +301,27 @@ fix in place: video 7.9-8.0 fps (baseline range), `nacks=0` on every peer
 face, iuas-01 and wuas-01 telemetry clean — but iuas-02 at 2.59-2.67/s with
 5 gaps>2 s in both runs. I attributed that to suppression and reverted.
 
-**That attribution was wrong.** After the revert the SAME degradation
-appeared on a DIFFERENT node — wuas-01 at 2.57/s with 6 gaps, iuas-02
-recovered to 3.11/s — and a further run showed wuas-01 at 2.99/s with 2 gaps
-while the other two were clean. The gapping wanders between nodes and does
-not follow the build, so it is an ambient fleet/RF condition, not the change.
-Two same-build runs agreeing is NOT sufficient evidence on this fleet when
-the comparison baseline came from a different time window; only an A/B in the
-same window would have settled it.
+**That attribution was wrong — and so were my next two.** Corrected in full:
+
+1. I blamed suppression. After the revert the same gapping appeared on a
+   DIFFERENT node (wuas-01 2.57/s, 6 gaps) while iuas-02 recovered, so it did
+   not follow the change.
+2. I then called it stack-specific, on a same-window A/B: NFD clean on all
+   three, ndn-fwd gapping. But the ndn-fwd samples were taken minutes after
+   deploys and the NFD sample after things had settled — the A/B was
+   confounded by exactly the variable it was meant to control.
+3. On the SAME binary (a070c93e, verified by store path) a later run showed
+   all three airframes at 3.21-3.25/s with ZERO gaps, and a further one the
+   same.
+
+The gapping was **transient deploy churn** — four deploys and many service
+restarts in quick succession — not suppression, not ndn-fwd, not RF. Same
+binary, clean before and clean after.
+
+The standing rule, now paid for three times in one session: after a fabric
+switch or service restart this fleet needs to settle, and a measurement taken
+inside that window is worthless — including as one arm of an A/B. Wait, then
+measure, then compare arms taken under the same conditions.
 
 The revert still stands, for a different and weaker reason: suppression's
 benefit is unmeasurable at current loss rates, so there is no case for
