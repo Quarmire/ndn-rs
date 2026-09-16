@@ -57,17 +57,32 @@ impl Strategy for MulticastStrategy {
         let Some(fib) = ctx.fib_entry else {
             return Some(smallvec![ForwardingAction::Nack(NackReason::NoRoute)]);
         };
-        // NFD multicast-strategy.cpp gates each upstream through
-        // `decidePerUpstream`; an upstream that was sent this Interest within
-        // the window is skipped, not re-sent.
-        let faces: SmallVec<[FaceId; 4]> = fib
+        let candidates: SmallVec<[FaceId; 4]> = fib
             .nexthops_excluding(ctx.in_face)
             .into_iter()
             .map(|n| n.face_id)
+            .collect();
+        // Genuinely nowhere to send: that is NoRoute.
+        if candidates.is_empty() {
+            return Some(smallvec![ForwardingAction::Nack(NackReason::NoRoute)]);
+        }
+        // NFD multicast-strategy.cpp gates each upstream through
+        // `decidePerUpstream`; an upstream sent this Interest within the
+        // window is skipped, not re-sent.
+        let faces: SmallVec<[FaceId; 4]> = candidates
+            .into_iter()
             .filter(|f| !ctx.suppressed_faces.contains(f))
             .collect();
+        // ALL upstreams merely suppressed is NOT NoRoute — it means "not
+        // now". NFD `continue`s past a SUPPRESS verdict and sends nothing,
+        // leaving the PIT entry pending. Answering NoRoute here tells the
+        // consumer the name is unreachable and kills the stream: measured on
+        // the fleet as video dropping to ZERO and telemetry gapping the moment
+        // suppression went live, because the emptiness check below originally
+        // meant "the FIB has no nexthop" and the filter silently changed what
+        // empty means.
         if faces.is_empty() {
-            return Some(smallvec![ForwardingAction::Nack(NackReason::NoRoute)]);
+            return Some(SmallVec::new());
         }
         Some(smallvec![ForwardingAction::Forward(faces)])
     }
@@ -112,6 +127,51 @@ mod tests {
             extensions: &EMPTY,
             runtime: &RUNTIME,
         }
+    }
+
+    /// All upstreams suppressed must send NOTHING — never a NoRoute Nack.
+    ///
+    /// NoRoute tells the consumer the name is unreachable and ends the fetch;
+    /// suppression only means "not this instant" (NFD `continue`s past a
+    /// SUPPRESS verdict). Regression guard for a live outage: reusing the
+    /// existing `faces.is_empty()` NoRoute branch after filtering suppressed
+    /// upstreams took fleet video to zero and gapped telemetry.
+    #[tokio::test]
+    async fn all_upstreams_suppressed_sends_nothing_not_noroute() {
+        let s = MulticastStrategy::new();
+        let name = Arc::new(Name::root());
+        let m = MeasurementsTable::new();
+        let fib = FibEntry {
+            nexthops: vec![
+                FibNexthop { face_id: FaceId(1), cost: 1 },
+                FibNexthop { face_id: FaceId(2), cost: 1 },
+            ],
+        };
+        let suppressed = [FaceId(1), FaceId(2)];
+        let mut ctx = make_ctx(&name, FaceId(9), Some(&fib), &m);
+        ctx.suppressed_faces = &suppressed;
+
+        let actions = s.decide(&ctx).expect("a verdict");
+        assert!(
+            !actions.iter().any(|a| matches!(a, ForwardingAction::Nack(_))),
+            "suppression must never answer Nack"
+        );
+        assert!(actions.is_empty(), "nothing is sent while every upstream is suppressed");
+    }
+
+    /// A genuinely empty nexthop set is still NoRoute.
+    #[tokio::test]
+    async fn no_nexthops_at_all_still_answers_noroute() {
+        let s = MulticastStrategy::new();
+        let name = Arc::new(Name::root());
+        let m = MeasurementsTable::new();
+        let fib = FibEntry { nexthops: vec![] };
+        let ctx = make_ctx(&name, FaceId(9), Some(&fib), &m);
+        let actions = s.decide(&ctx).expect("a verdict");
+        assert!(
+            actions.iter().any(|a| matches!(a, ForwardingAction::Nack(NackReason::NoRoute))),
+            "an empty nexthop set is genuinely NoRoute"
+        );
     }
 
     #[tokio::test]
@@ -198,3 +258,4 @@ mod tests {
         assert_eq!(last.value.as_ref(), &[5u8]);
     }
 }
+
