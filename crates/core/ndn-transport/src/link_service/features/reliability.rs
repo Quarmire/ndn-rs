@@ -18,21 +18,22 @@ use crate::reliability::{LpReliability, ReliabilityConfig};
 
 /// LP fragmentation threshold.
 ///
-/// 1452 — NOT the 8800 max NDN packet size. LpReliability fragments precisely
-/// so the layer below never has to, and on any datagram transport (UDP) an
-/// 8800-byte frame is simply handed to IP, which fragments it and loses the
-/// WHOLE datagram if any fragment is dropped. Measured on a 3-drone Wi-Fi
-/// fleet carrying video: 210705 reassemblies required, 51444 reassembled ok —
-/// a 76% IP-reassembly failure rate, with 868k fragments created. Small Data
-/// (telemetry) was unaffected; everything larger than the path MTU (video)
-/// collapsed, which is exactly the size-dependent failure that looks like a
-/// lossy link and is not one.
+/// 8800 — the max NDN packet size, i.e. effectively "do not fragment here".
 ///
-/// 1452 matches what NFD's peer faces are configured with on the same fleet
-/// (`nfdc face create … mtu 1452`) and leaves room for IP+UDP headers inside a
-/// 1500-byte path. Stream transports (TCP/Unix) only see slightly more LP
-/// framing, which is harmless.
-const DEFAULT_RELIABILITY_MTU: usize = 1452;
+/// This was briefly lowered to 1452 to stop UDP faces handing oversized
+/// datagrams to IP (measured 76% IP-reassembly failure on a Wi-Fi fleet). That
+/// was the wrong place to fix it: the threshold is GLOBAL, so it also applied
+/// to the local unix app socket, where fragmentation is meaningless (a stream
+/// transport the kernel already segments) and actively harmful — the
+/// application's reader desynchronised and every agent crash-looped on
+/// `Expecting LpPacket element, but TLV has type 140`.
+///
+/// A datagram-only fragmentation limit has to be attached to the FACE, not to
+/// this shared constant. Until that exists, keep the safe default: a stream
+/// face is never corrupted, and the two defects that actually broke NDNSF on
+/// this fabric were the PSDC decode rejection and config routes missing
+/// CHILD_INHERIT, neither of which is about MTU.
+const DEFAULT_RELIABILITY_MTU: usize = 8800;
 
 /// Per-feature reliability state. Constructed disabled; flipping the
 /// switch does not lose unacked entries.
