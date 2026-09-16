@@ -32,6 +32,7 @@ use ndn_security::SecurityManager;
 use ndn_security::Validator;
 use ndn_store::{ErasedContentStore, Pit, PitToken, StrategyTable};
 use ndn_strategy::{MeasurementsTable, SignalsTable};
+use ndn_transport::FaceKind;
 use ndn_transport::{
     BIT_CONGESTION_MARKING, BIT_LOCAL_FIELDS, BIT_LP_RELIABILITY, CongestionPolicy, FaceId,
     FacePersistency, FaceTable, NFD_FLAG_BITS,
@@ -964,6 +965,27 @@ pub(crate) async fn run_face_sender(
     // frames through it when enabled; the retx tick pumps its retransmissions
     // and Acks. `take_*` are empty when disabled, so the tick is cheap.
     let lp_reliability_feature = face.link_service.reliability_feature_handle();
+    // Fragment below the path MTU on DATAGRAM faces only.
+    //
+    // A UDP face that hands an 8800-byte frame to IP makes IP fragment it, and
+    // losing any one fragment destroys the whole Data — LpReliability cannot
+    // retransmit the missing piece because it never owned the split. Measured
+    // on a Wi-Fi fleet carrying video: 210705 reassemblies required / 51444 ok
+    // = 76% IP-reassembly FAILURE, 868k fragments; telemetry (one datagram)
+    // was fine while video (~6.7 KB Data) collapsed. On a LOSSLESS link the
+    // same IP fragmentation is harmless, which is why a veth reproducer showed
+    // 10 fps and the radio link showed 0.1 fps.
+    //
+    // Stream faces (Unix/TCP) must NOT be fragmented here: the kernel already
+    // segments them, and fragmenting corrupted application framing — every
+    // agent crash-looped on "Expecting LpPacket element, but TLV has type 140"
+    // when this was applied globally.
+    if let Some(feature) = lp_reliability_feature.as_ref() {
+        const DATAGRAM_FRAGMENT_MTU: usize = 1452; // matches NFD's peer faces
+        if matches!(face.kind(), FaceKind::Udp) {
+            feature.set_mtu(DATAGRAM_FRAGMENT_MTU);
+        }
+    }
     // A-LAL idle-fallback beacon (CCLF): the tick emits a beacon on a face that
     // has been silent for the configured interval. Disabled unless a beacon is
     // installed, so the tick stays cheap.

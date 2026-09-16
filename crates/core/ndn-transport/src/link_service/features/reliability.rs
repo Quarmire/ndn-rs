@@ -57,6 +57,12 @@ impl ReliabilityFeature {
         }
     }
 
+    /// Fragmentation threshold for this face. See `LpReliability::set_mtu`.
+    /// Applied by the engine when a face is wired, from the face's own kind.
+    pub fn set_mtu(&self, mtu: usize) {
+        self.state.lock().unwrap().set_mtu(mtu);
+    }
+
     pub fn is_enabled(&self) -> bool {
         self.enabled.load(Ordering::Acquire)
     }

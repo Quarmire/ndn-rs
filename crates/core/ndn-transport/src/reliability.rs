@@ -246,6 +246,17 @@ impl LpReliability {
         wires
     }
 
+    /// Lower (or raise) the fragmentation threshold for this face.
+    ///
+    /// Set per-FACE, not globally: a datagram transport must fragment below
+    /// the path MTU so the layer under it never does (a lost IP fragment
+    /// destroys the whole Data and LpReliability cannot retransmit just the
+    /// missing piece), while a stream transport must NOT fragment — the kernel
+    /// already segments it, and fragmenting there corrupts application framing.
+    pub fn set_mtu(&mut self, mtu: usize) {
+        self.mtu = mtu;
+    }
+
     pub fn on_receive(&mut self, raw: &[u8]) {
         let (tx_seq, acks) = extract_acks(raw);
 
