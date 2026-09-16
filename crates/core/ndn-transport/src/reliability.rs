@@ -101,7 +101,7 @@ impl ReliabilityConfig {
     /// governs, it is simply no longer clamped 100x above the true RTT.
     pub fn wifi() -> Self {
         Self {
-            rto_strategy: RtoStrategy::Quic,
+            rto_strategy: RtoStrategy::Rfc6298,
             max_retries: 3,
             max_unacked: 512,
             max_retx_per_tick: 16,
@@ -664,45 +664,60 @@ mod tests {
         assert!(wifi.config().max_retries > eth.config().max_retries);
     }
 
-    /// On a local mesh RTT the wifi profile must NOT pin its RTO at the
-    /// RFC6298 floor.
+    /// On a local-mesh RTT, RFC6298 pins at its floor while Quic tracks the
+    /// link — a ~40x difference in how fast a loss can be recovered.
     ///
-    /// A predictive stream delivers in cursor order, so every recovery
-    /// head-of-line-blocks the frames behind it; at the 200 ms RFC6298 floor
-    /// that stall is 100x the real RTT and the released backlog arrives as a
-    /// burst. Measured on the fleet as exactly `rto=200000µs` — the clamp, not
-    /// an estimate.
+    /// RFC6298's 100 ms granularity and 200 ms floor are WAN-TCP numbers; this
+    /// fleet's mesh runs ~1-2 ms RTT, and `rto=200000µs` was read straight off
+    /// a live face — the clamp binding, not an estimate. Because a predictive
+    /// stream delivers in cursor order, each recovery head-of-line-blocks the
+    /// frames behind it for that whole window.
+    ///
+    /// `wifi()` deliberately still selects RFC6298. Quic was tried on the
+    /// fleet (3ae75e41) and had to be reverted: its ~4.5 ms RTO undercut the
+    /// Ack delay of the day, so the sender retransmitted before an Ack was
+    /// physically possible. Acking on receipt removes that floor, but the
+    /// estimator must be shown to actually converge on hardware before the
+    /// profile switches. This test pins the MEASURED difference so the
+    /// motivation survives the deferral.
     #[test]
-    fn wifi_rto_tracks_a_local_mesh_rtt_instead_of_the_rfc6298_floor() {
+    fn rfc6298_pins_at_its_floor_on_a_mesh_rtt_where_quic_tracks_the_link() {
         const MESH_RTT_US: f64 = 1_500.0; // ~1.5 ms, measured on the fleet
 
-        let mut wifi = LpReliability::from_config(1400, ReliabilityConfig::wifi());
+        let base = ReliabilityConfig::wifi();
         let mut rfc = LpReliability::from_config(
             1400,
             ReliabilityConfig {
                 rto_strategy: RtoStrategy::Rfc6298,
-                ..ReliabilityConfig::wifi()
+                ..base.clone()
+            },
+        );
+        let mut quic = LpReliability::from_config(
+            1400,
+            ReliabilityConfig {
+                rto_strategy: RtoStrategy::Quic,
+                ..base
             },
         );
         for _ in 0..20 {
-            wifi.update_rto(MESH_RTT_US);
             rfc.update_rto(MESH_RTT_US);
+            quic.update_rto(MESH_RTT_US);
         }
 
         assert_eq!(
             rfc.rto_us(),
             RFC6298_MIN_RTO_US,
-            "RFC6298 pins at its 200 ms floor on a 1.5 ms link -- the bug"
+            "RFC6298 pins at its 200 ms floor on a 1.5 ms link"
         );
         assert!(
-            wifi.rto_us() < 50_000,
-            "wifi RTO must track the link, not a WAN floor (got {} µs)",
-            wifi.rto_us()
+            quic.rto_us() < 50_000,
+            "Quic must track the link, not a WAN floor (got {} µs)",
+            quic.rto_us()
         );
         assert!(
-            wifi.rto_us() >= MESH_RTT_US as u64,
+            quic.rto_us() >= MESH_RTT_US as u64,
             "but must still cover the RTT (got {} µs)",
-            wifi.rto_us()
+            quic.rto_us()
         );
     }
 

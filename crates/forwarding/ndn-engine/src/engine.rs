@@ -1045,11 +1045,7 @@ pub(crate) async fn run_face_sender(
     // faces (the ones that fragment, where a single lost fragment kills a whole
     // group) get a 10 ms pump; everything else keeps 50 ms, since stream faces
     // do not fragment and their kernel already retransmits.
-    let retx_tick_dur = if matches!(face.kind(), FaceKind::Udp) {
-        std::time::Duration::from_millis(10)
-    } else {
-        std::time::Duration::from_millis(50)
-    };
+    let retx_tick_dur = std::time::Duration::from_millis(50);
 
     let handle_send_error = |e: ndn_transport::FaceError| -> bool {
         match persistency {
