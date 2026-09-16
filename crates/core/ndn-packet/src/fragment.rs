@@ -68,6 +68,25 @@ pub const MAX_FRAGMENTS: u64 = 400;
 /// `purge_expired` ticks.
 pub const MAX_PENDING_PACKETS: usize = 1024;
 
+/// Counters for diagnosing multi-fragment delivery on a lossy link.
+///
+/// A packet that needs N fragments is all-or-nothing at this layer: the group
+/// is only handed up once every index has arrived, so on a lossy link the
+/// completion rate falls roughly as (1-p)^N while single-fragment traffic is
+/// barely touched. That asymmetry is invisible in aggregate byte counters and
+/// is exactly what these expose.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ReassemblyStats {
+    /// Fragments accepted into a group (index not already held).
+    pub fragments_in: u64,
+    /// Groups handed up complete.
+    pub completed: u64,
+    /// Groups discarded by `purge_expired` before completing.
+    pub timed_out: u64,
+    /// Fragments belonging to a group that later timed out — wasted airtime.
+    pub fragments_wasted: u64,
+}
+
 pub struct ReassemblyBuffer {
     /// Keyed by `(endpoint_id, seq)`. Multi-access faces (UDP multicast,
     /// Ethernet, BLE multicast) must pass distinct endpoint identifiers per
@@ -75,6 +94,7 @@ pub struct ReassemblyBuffer {
     /// Unicast faces pass `0`. Mirrors NFD's `(EndpointId, Sequence)` key.
     pending: HashMap<(u64, u64), Pending>,
     timeout: Duration,
+    stats: ReassemblyStats,
 }
 
 impl ReassemblyBuffer {
@@ -82,7 +102,13 @@ impl ReassemblyBuffer {
         Self {
             pending: HashMap::new(),
             timeout,
+            stats: ReassemblyStats::default(),
         }
+    }
+
+    /// Snapshot of the multi-fragment delivery counters.
+    pub fn stats(&self) -> ReassemblyStats {
+        self.stats
     }
 
     /// Returns `Some(complete_packet)` when all fragments have arrived.
@@ -137,10 +163,12 @@ impl ReassemblyBuffer {
 
         if entry.fragments[idx].is_none() {
             entry.received += 1;
+            self.stats.fragments_in += 1;
         }
         entry.fragments[idx] = Some(fragment);
 
         if entry.received == entry.frag_count {
+            self.stats.completed += 1;
             let entry = self.pending.remove(&key).unwrap();
             let total_len: usize = entry
                 .fragments
@@ -159,7 +187,18 @@ impl ReassemblyBuffer {
 
     pub fn purge_expired(&mut self) {
         let timeout = self.timeout;
-        self.pending.retain(|_, v| v.created.elapsed() < timeout);
+        let mut timed_out = 0u64;
+        let mut wasted = 0u64;
+        self.pending.retain(|_, v| {
+            let live = v.created.elapsed() < timeout;
+            if !live {
+                timed_out += 1;
+                wasted += v.received as u64;
+            }
+            live
+        });
+        self.stats.timed_out += timed_out;
+        self.stats.fragments_wasted += wasted;
     }
 
     pub fn pending_count(&self) -> usize {

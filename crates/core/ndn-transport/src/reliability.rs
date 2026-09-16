@@ -201,8 +201,15 @@ impl LpReliability {
         }
 
         let frag_count = pkt.len().div_ceil(payload_cap);
+        // Reserve a CONSECUTIVE block: NDNLPv2 Sequence increments per
+        // fragment, and the receiver recovers the group key as
+        // `Sequence - FragIndex` (see the engine's decode stage, and NFD's
+        // LpReassembler). Emitting one Sequence for the whole packet put every
+        // fragment in a DIFFERENT reassembly group -- key `net_seq - i` -- so a
+        // multi-fragment packet could never complete: each fragment sat alone
+        // until the 5 s timeout swept it.
         let net_seq = self.next_seq;
-        self.next_seq += 1;
+        self.next_seq += frag_count as u64;
 
         let mut wires = Vec::with_capacity(frag_count);
         for i in 0..frag_count {
@@ -213,7 +220,7 @@ impl LpReliability {
             self.next_tx_seq += 1;
 
             let frag_info = if frag_count > 1 {
-                Some((net_seq, i as u64, frag_count as u64))
+                Some((net_seq + i as u64, i as u64, frag_count as u64))
             } else {
                 None
             };
@@ -363,6 +370,50 @@ impl LpReliability {
 
 #[cfg(test)]
 mod tests {
+
+    /// A fragmented packet emitted by `on_send` must REASSEMBLE at the
+    /// receiver, using the receiver's real key derivation.
+    ///
+    /// The engine's decode stage recovers the group as `Sequence - FragIndex`
+    /// (NDNLPv2: Sequence increments per fragment). Emitting a single Sequence
+    /// for the whole packet keyed every fragment differently, so multi-fragment
+    /// packets never completed — each fragment sat alone until the 5 s timeout.
+    /// Single-fragment traffic took the fast path and was unaffected, which is
+    /// why this presented as "video dies, telemetry is fine" on a lossy link
+    /// and was invisible on a lossless one.
+    #[test]
+    fn fragmented_send_reassembles_at_the_receiver() {
+        use ndn_packet::fragment::ReassemblyBuffer;
+        use ndn_packet::lp::extract_fragment;
+
+        let mut r = LpReliability::new(300); // small MTU -> several fragments
+        let payload: Vec<u8> = (0..2000u32).map(|x| (x % 251) as u8).collect();
+        let wires = r.on_send(&payload);
+        assert!(wires.len() > 1, "payload must actually fragment");
+
+        let mut rb = ReassemblyBuffer::default();
+        let mut done = None;
+        for w in &wires {
+            let h = extract_fragment(w).expect("fragment header present");
+            // exactly how the engine's decode stage keys the group
+            let base = h
+                .sequence
+                .checked_sub(h.frag_index)
+                .expect("Sequence must be >= FragIndex");
+            if let Some(pkt) = rb.process(
+                0,
+                base,
+                h.frag_index,
+                h.frag_count,
+                Bytes::copy_from_slice(&w[h.frag_start..h.frag_end]),
+            ) {
+                done = Some(pkt);
+            }
+        }
+        let got = done.expect("fragments must reassemble into one packet");
+        assert_eq!(&got[..], &payload[..], "reassembled payload must match");
+    }
+
     use super::*;
 
     fn small_packet() -> Vec<u8> {
