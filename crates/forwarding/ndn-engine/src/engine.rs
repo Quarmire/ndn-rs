@@ -65,6 +65,13 @@ pub struct FaceCounters {
     /// Packets dropped because the outbound queue was full (Drop policy or
     /// Backpressure deadline exceeded).
     pub out_drops: AtomicU64,
+    /// Inbound packets dropped because the forwarding pipeline's channel was
+    /// full. The counterpart to `out_drops`, which existed while this did
+    /// not: a saturated pipeline silently discarded received packets behind
+    /// nothing but a debug log, so the loss was indistinguishable from radio
+    /// loss. NFD has no analogue because it forwards inline with no inbound
+    /// queue — the queue is ours, so the accounting has to be too.
+    pub in_drops: AtomicU64,
     /// Total nanoseconds the engine spent blocked on `send().await` for this
     /// face (Backpressure policy only). High values indicate slow consumers.
     pub out_blocked_ns: AtomicU64,

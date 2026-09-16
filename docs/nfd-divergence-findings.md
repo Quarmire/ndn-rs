@@ -168,3 +168,61 @@ See `rfc6298_pins_at_its_floor_on_a_mesh_rtt_where_quic_tracks_the_link`.
 - **Pick a counter only the suspected mechanism can move.** "Does `rto` leave
   its initial value" settled item 2 in one reading; aggregate throughput would
   not have.
+
+## Round 2 — systematic sweep of the async seams
+
+The six items above were all in the link-service / reliability / reassembly
+timing layer. That is not a coincidence: it is the part of the stack with **no
+NFD design to copy**, because NFD is single-threaded and event-loop driven
+while this is tokio. The well-known protocol constants are all correct
+(InterestLifetime default 4 s, DeadNonceList 6 s, HopLimit decrement + drop at
+0, /localhost ingress scope, CS serve/admit gates, MustBeFresh, CanBePrefix,
+ImplicitSha256Digest verification against cached wire bytes). So this sweep
+targeted the seams instead.
+
+### Clean: the timer-reset class does not recur
+Finding 2 (a `select!` timer recreated each iteration, reset by a competing
+work branch) was checked against every `loop { … select! { … sleep … } }` in
+the workspace. The other four — validation `drain_pending`, the discovery
+tick, PIT expiry, RIB expiry — each have only `cancel` + `sleep` branches,
+with no work branch to reset the timer. The bug was unique to the per-face
+send loop. No further instances.
+
+### Fixed: inbound pipeline drops were uncounted
+`out_drops` existed; there was no `in_drops`. When the forwarding pipeline's
+channel filled, `run_face_reader` discarded the packet behind a `debug!` and
+nothing else, so the loss was indistinguishable from radio loss at every
+level above it. NFD has no analogue because it forwards inline with no
+inbound queue — the queue is ours, so the accounting has to be too. Added
+`FaceCounters::in_drops`.
+
+### OPEN — PIT is keyed by an unverified 64-bit hash
+`PitToken::from_name_hash_keyed` derives the PIT key from
+`DefaultHasher(name_hash, discriminator)`, and the Data match path
+(`PitMatchStage::consume_entry`) resolves purely by that token. `PitEntry`
+stores `name: Arc<Name>`, but **it is never compared to the arriving Data's
+name.** NFD keys its PIT by the actual Name via the nametree and applies
+`Interest::matchesData` on every match.
+
+Consequence of a token collision: Data for name A satisfies a pending
+Interest for name B, and the consumer is handed the wrong object under the
+right name.
+
+Honest risk assessment — this is hardening, not an open hole:
+- accidental collision ≈ N/2^64 per insert; at 10^4 entries that is ~5e-12/s.
+  Effectively never.
+- a targeted second-preimage against a victim's specific pending name is
+  2^64 work. Infeasible.
+- an attacker-chosen colliding PAIR is only 2^32 offline (and
+  `DefaultHasher::new()` uses a FIXED key, so it is reproducible off-box),
+  but exploiting it still requires the victim to express Interest for one of
+  the attacker's two names — little practical leverage.
+
+Recommended fix, mirroring `Interest::matchesData`: before consuming an
+entry, require that `entry.name` can actually satisfy the Data — equal after
+digest handling, or a proper prefix when the in-record set `CanBePrefix`.
+The name is already in hand, so the cost is one comparison on the Data path.
+Deliberately NOT applied here: the check has to cover both the persistent and
+classical consumption paths, and it sits on the Data hot path — it wants a
+change made with test coverage in front of it, not appended to a long
+session.

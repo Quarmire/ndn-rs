@@ -109,6 +109,9 @@ pub(crate) async fn run_face_reader(
                 }) {
                     Ok(()) => {}
                     Err(mpsc::error::TrySendError::Full(_)) => {
+                        if let Some(state) = face_states.get(&face_id) {
+                            state.counters.in_drops.fetch_add(1, Ordering::Relaxed);
+                        }
                         debug!(target: t::FWD_PIPELINE, face=%face_id, "pipeline full, dropping inbound packet");
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => break,
