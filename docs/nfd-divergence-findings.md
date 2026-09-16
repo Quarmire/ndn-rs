@@ -196,33 +196,30 @@ level above it. NFD has no analogue because it forwards inline with no
 inbound queue — the queue is ours, so the accounting has to be too. Added
 `FaceCounters::in_drops`.
 
-### OPEN — PIT is keyed by an unverified 64-bit hash
-`PitToken::from_name_hash_keyed` derives the PIT key from
-`DefaultHasher(name_hash, discriminator)`, and the Data match path
-(`PitMatchStage::consume_entry`) resolves purely by that token. `PitEntry`
-stores `name: Arc<Name>`, but **it is never compared to the arriving Data's
-name.** NFD keys its PIT by the actual Name via the nametree and applies
-`Interest::matchesData` on every match.
+### NOT A FINDING — PIT keyed by a 64-bit name hash (corrected)
 
-Consequence of a token collision: Data for name A satisfies a pending
-Interest for name B, and the consumer is handed the wrong object under the
-right name.
+An earlier revision of this document listed the hash-keyed PIT as an open
+divergence. That framing was wrong on both counts and is retracted here.
 
-Honest risk assessment — this is hardening, not an open hole:
-- accidental collision ≈ N/2^64 per insert; at 10^4 entries that is ~5e-12/s.
-  Effectively never.
-- a targeted second-preimage against a victim's specific pending name is
-  2^64 work. Infeasible.
-- an attacker-chosen colliding PAIR is only 2^32 offline (and
-  `DefaultHasher::new()` uses a FIXED key, so it is reproducible off-box),
-  but exploiting it still requires the victim to express Interest for one of
-  the attacker's two names — little practical leverage.
+**It is documented design, not an oversight.** `docs/wiki/.../forwarding-pipeline.md`
+lists the PIT key as "`PitToken` (name-hash + discriminator)"; the `PitToken`
+doc comment sets out precisely what is excluded from the key (ForwardingHint,
+selectors) and why, mirroring NFD's keying by name rather than hint; and the
+DeadNonceList likewise keys on `(name_hash, nonce)` fingerprints. Hashed
+identity keys are a consistent, witnessed choice across the tables, bought for
+a `DashMap<u64, _>` on the forwarding hot path instead of a nametree walk.
 
-Recommended fix, mirroring `Interest::matchesData`: before consuming an
-entry, require that `entry.name` can actually satisfy the Data — equal after
-digest handling, or a proper prefix when the in-record set `CanBePrefix`.
-The name is already in hand, so the cost is one comparison on the Data path.
-Deliberately NOT applied here: the check has to cover both the persistent and
-classical consumption paths, and it sits on the Data hot path — it wants a
-change made with test coverage in front of it, not appended to a long
-session.
+**The consequence was overstated.** The claim was that a collision hands a
+consumer "the wrong object under the right name". It cannot: Data carries its
+own name, and the receiving application matches it against its pending
+Interest (`Interest::matchesData` in ndn-cxx). A collision therefore
+misdelivers a correctly-named Data to a face that did not ask for it, and the
+app drops it as unsolicited. The narrower real risk is that `should_reap`
+removes the shared entry and takes the colliding Interest's in-records with
+it, turning that Interest into a timeout rather than a satisfied fetch.
+
+**Probability**: ~N/2^64 per insert; ~5e-12/s at 10^4 entries. A targeted
+second-preimage is 2^64. Not reachable by accident or by an attacker.
+
+Left as designed. Recorded here only so the next reader does not re-derive
+the same false alarm.
