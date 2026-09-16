@@ -1020,6 +1020,15 @@ pub(crate) async fn run_face_sender(
         const DATAGRAM_FRAGMENT_MTU: usize = 1452; // matches NFD's peer faces
         if matches!(face.kind(), FaceKind::Udp) {
             feature.set_mtu(DATAGRAM_FRAGMENT_MTU);
+            // A fragmenting datagram face needs the lossy-link retry profile.
+            // `LpLinkService::new()` hands every face
+            // `ReliabilityConfig::default()` — max_retries 1 — so the tuned
+            // `wifi()` profile (retries 3, unacked 512, retx/tick 16) was
+            // dead code, referenced only from a unit test. NFD's LpReliability
+            // defaults to 3 retries; giving up after one on a link that
+            // fragments every multi-KB packet means a single unlucky fragment
+            // kills its whole group with no second chance.
+            feature.apply_config(ndn_transport::reliability::ReliabilityConfig::wifi());
         }
     }
     // A-LAL idle-fallback beacon (CCLF): the tick emits a beacon on a face that

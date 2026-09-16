@@ -90,10 +90,13 @@ pub(super) fn faces_list_dataset(engine: &ForwarderEngine) -> bytes::Bytes {
             reliability_counters = face.link_service.reliability_counters();
             congestion_counters = face.link_service.congestion_counters();
         }
-        let (n_lp_resent_packets, rto_micros) = match reliability_counters {
-            Some((resent, rto)) => (Some(resent), Some(rto)),
-            None => (None, None),
-        };
+        let (n_lp_resent_packets, rto_micros, n_lp_rto_expirations, n_lp_unacked_evictions) =
+            match reliability_counters {
+                Some((resent, rto, expired, evicted)) => {
+                    (Some(resent), Some(rto), Some(expired), Some(evicted))
+                }
+                None => (None, None, None, None),
+            };
         // Per-face NDNLPv2 reassembly counters (engine-side: the buffer lives in
         // the dispatcher's decode stage, not the LinkService).
         let reasm = engine.reassembly_stats(info.id);
@@ -140,7 +143,7 @@ pub(super) fn faces_list_dataset(engine: &ForwarderEngine) -> bytes::Bytes {
             flags: face_flags,
             n_lp_acks_received: None,
             n_lp_resent_packets,
-            n_lp_rto_expirations: None,
+            n_lp_rto_expirations,
             n_congestion_marks_sent,
             n_congestion_marks_received,
             effective_mtu,
@@ -150,6 +153,7 @@ pub(super) fn faces_list_dataset(engine: &ForwarderEngine) -> bytes::Bytes {
             n_reasm_completed,
             n_reasm_timed_out,
             n_reasm_fragments_wasted,
+            n_lp_unacked_evictions,
         };
         buf.extend_from_slice(&fs.encode());
     }

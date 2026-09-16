@@ -125,6 +125,14 @@ pub struct LpReliability {
     max_unacked: usize,
     max_retx_per_tick: usize,
     rto_strategy: RtoStrategy,
+    /// Frames abandoned after `max_retries` retransmissions without an Ack.
+    /// Each one is a packet the peer can never reassemble: if it was a
+    /// fragment, its whole group is dead and every sibling already sent is
+    /// wasted airtime.
+    rto_expirations: u64,
+    /// Frames evicted from `unacked` by the `max_unacked` cap before they
+    /// were Acked or retried to exhaustion — silent, unrecoverable loss.
+    unacked_evictions: u64,
 }
 
 fn initial_rto_for(strategy: &RtoStrategy) -> u64 {
@@ -157,6 +165,8 @@ impl LpReliability {
             max_unacked: config.max_unacked,
             max_retx_per_tick: config.max_retx_per_tick,
             rto_strategy: config.rto_strategy,
+            rto_expirations: 0,
+            unacked_evictions: 0,
         }
     }
 
@@ -231,6 +241,7 @@ impl LpReliability {
             while self.unacked.len() >= self.max_unacked {
                 if let Some(&oldest_seq) = self.unacked.keys().min() {
                     self.unacked.remove(&oldest_seq);
+                    self.unacked_evictions += 1;
                 } else {
                     break;
                 }
@@ -302,6 +313,7 @@ impl LpReliability {
 
         for seq in expired {
             self.unacked.remove(&seq);
+            self.rto_expirations += 1;
         }
 
         let mut wires = Vec::with_capacity(retx.len().min(self.max_retx_per_tick));
@@ -328,6 +340,17 @@ impl LpReliability {
     pub fn unacked_count(&self) -> usize {
         self.unacked.len()
     }
+
+    /// Frames given up on after `max_retries` (see `rto_expirations`).
+    pub fn rto_expirations(&self) -> u64 {
+        self.rto_expirations
+    }
+
+    /// Frames dropped from the retransmit buffer by the `max_unacked` cap.
+    pub fn unacked_evictions(&self) -> u64 {
+        self.unacked_evictions
+    }
+
 
     pub fn rto_us(&self) -> u64 {
         self.rto_us

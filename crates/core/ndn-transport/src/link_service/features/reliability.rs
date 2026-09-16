@@ -77,6 +77,25 @@ impl ReliabilityFeature {
         self.state.lock().unwrap().unacked_count()
     }
 
+    /// Frames abandoned after `max_retries` without an Ack. Non-zero means
+    /// the sender GAVE UP: for a fragment, its whole group is dead and every
+    /// sibling already on the wire is wasted airtime.
+    pub fn n_lp_rto_expirations(&self) -> u64 {
+        self.state.lock().unwrap().rto_expirations()
+    }
+
+    /// Frames dropped from the retransmit buffer by the `max_unacked` cap —
+    /// silent loss that no retransmission will ever repair.
+    pub fn n_lp_unacked_evictions(&self) -> u64 {
+        self.state.lock().unwrap().unacked_evictions()
+    }
+
+    /// Apply a link-appropriate retry profile (e.g. `ReliabilityConfig::wifi`).
+    /// The engine calls this once the face's kind is known.
+    pub fn apply_config(&self, cfg: crate::reliability::ReliabilityConfig) {
+        self.state.lock().unwrap().apply_config(cfg);
+    }
+
     pub fn n_lp_resent_packets(&self) -> u64 {
         self.n_lp_resent_packets.load(Ordering::Relaxed)
     }
