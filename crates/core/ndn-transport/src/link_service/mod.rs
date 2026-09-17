@@ -500,6 +500,14 @@ impl LinkService for LpLinkService {
             if let Some(ack) = self.reliability_feature.take_acks() {
                 let _ = transport.send_bytes(ack).await;
             }
+            // Fast retransmit: those Acks may have revealed, by arriving ahead
+            // of older TxSequences, that an earlier frame is gone. Send those
+            // repairs from here rather than leaving them for the retransmit
+            // tick, so recovery costs roughly an RTT instead of an RTO -- the
+            // RFC 6298 floor alone is 200 ms. NFD repairs on this same path.
+            for wire in self.reliability_feature.take_fast_retransmits() {
+                let _ = transport.send_bytes(wire).await;
+            }
             // Duplicate: the Ack above still went out (the peer retransmitted
             // because it never got the first one), but the frame must NOT
             // reach reassembly or forwarding — upstream the PIT would see an

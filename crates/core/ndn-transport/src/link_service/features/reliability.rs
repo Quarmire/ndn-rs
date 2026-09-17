@@ -174,6 +174,17 @@ impl ReliabilityFeature {
         self.state.lock().unwrap().on_receive(raw)
     }
 
+    /// Frames that ack ordering has declared lost, ready to resend immediately
+    /// (see `LpReliability::take_fast_retransmits`).
+    pub fn take_fast_retransmits(&self) -> Vec<Bytes> {
+        self.state.lock().unwrap().take_fast_retransmits()
+    }
+
+    /// Frames resent early by the fast-retransmit path.
+    pub fn n_lp_fast_retx(&self) -> u64 {
+        self.state.lock().unwrap().fast_retx()
+    }
+
     /// Inbound frames dropped as peer retransmissions of an already-received
     /// frame (see `LpReliability::on_receive`).
     pub fn n_lp_duplicate_frames(&self) -> u64 {

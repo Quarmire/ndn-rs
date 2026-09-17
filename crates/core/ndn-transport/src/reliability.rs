@@ -15,6 +15,10 @@ const DEFAULT_MAX_RETRIES: u8 = 1;
 const MAX_RETX_PER_TICK: usize = 8;
 /// Cap unacked map to bound lingering retx after high-throughput flows end.
 const MAX_UNACKED: usize = 256;
+/// Acks for greater TxSequences after which an unacked frame is declared lost
+/// without waiting for its RTO. NFD's `LpReliability::Options::
+/// seqNumLossThreshold`, same default of 3 (the 3-duplicate-ack analogue).
+const SEQ_NUM_LOSS_THRESHOLD: u32 = 3;
 
 const RFC6298_INITIAL_RTO_US: u64 = 1_000_000;
 const RFC6298_MIN_RTO_US: u64 = 200_000;
@@ -115,6 +119,10 @@ struct UnackedEntry {
     last_sent: Instant,
     retx_count: u8,
     is_retx: bool,
+    /// Acks seen for TxSequences greater than this entry's. At
+    /// `SEQ_NUM_LOSS_THRESHOLD` the frame is declared lost immediately rather
+    /// than waiting out its RTO (NFD's `UnackedFrag::nGreaterSeqAcks`).
+    n_greater_seq_acks: u32,
 }
 
 /// Per-face NDNLPv2 reliability state.
@@ -154,6 +162,11 @@ pub struct LpReliability {
     /// fragment, its whole group is dead and every sibling already sent is
     /// wasted airtime.
     rto_expirations: u64,
+    /// TxSequences that ack ordering has declared lost, awaiting
+    /// [`Self::take_fast_retransmits`].
+    fast_retx_candidates: Vec<u64>,
+    /// Count of frames resent by the fast-retransmit path.
+    fast_retx: u64,
     /// Frames evicted from `unacked` by the `max_unacked` cap before they
     /// were Acked or retried to exhaustion — silent, unrecoverable loss.
     unacked_evictions: u64,
@@ -199,6 +212,8 @@ impl LpReliability {
             max_retx_per_tick: config.max_retx_per_tick,
             rto_strategy: config.rto_strategy,
             rto_expirations: 0,
+            fast_retx_candidates: Vec::new(),
+            fast_retx: 0,
             unacked_evictions: 0,
             recent_recv: HashMap::new(),
             recent_recv_order: VecDeque::new(),
@@ -289,6 +304,7 @@ impl LpReliability {
                     last_sent: now,
                     retx_count: 0,
                     is_retx: false,
+                    n_greater_seq_acks: 0,
                 },
             );
 
@@ -361,6 +377,27 @@ impl LpReliability {
 
         let now = Instant::now();
         for ack_seq in acks {
+            // Fast retransmit, mirroring NFD's findLostLpPackets(): every frame
+            // still unacked BELOW the acked TxSequence has had a later frame
+            // arrive ahead of it. Once SEQ_NUM_LOSS_THRESHOLD such acks have
+            // gone by, treat it as lost now instead of waiting out the RTO.
+            //
+            // This matters far more than it looks. The RFC 6298 floor is 200 ms,
+            // so without it EVERY loss costs at least 200 ms to even attempt a
+            // repair, while NFD repairs in roughly one RTT (single-digit ms on
+            // wifi). Aggregate throughput hides this -- the same frames are
+            // resent either way -- but a sequential consumer like a video stream
+            // sees it directly as a stall.
+            //
+            // Only frames below the ack are eligible: `unacked` is ordered by
+            // TxSequence, so that is the range below `ack_seq`.
+            for (&seq, entry) in self.unacked.range_mut(..ack_seq) {
+                entry.n_greater_seq_acks += 1;
+                if entry.n_greater_seq_acks == SEQ_NUM_LOSS_THRESHOLD {
+                    self.fast_retx_candidates.push(seq);
+                }
+            }
+
             if let Some(entry) = self.unacked.remove(&ack_seq) {
                 // Karn: only measure RTT on non-retransmitted packets.
                 if !entry.is_retx {
@@ -370,6 +407,49 @@ impl LpReliability {
             }
         }
         is_duplicate
+    }
+
+    /// Wires for frames that ack ordering has declared lost, ready to send now.
+    ///
+    /// Kept separate from [`Self::check_retransmit`] so the caller can flush
+    /// these on the receive path -- the same place it flushes Acks -- instead of
+    /// waiting for the next retransmit tick. Retransmitting reuses the frame's
+    /// TxSequence (see [`Self::on_receive`] on why this port keys duplicate
+    /// suppression on TxSequence where NFD re-stamps it), so Karn's check still
+    /// excludes these from RTT sampling via `is_retx`.
+    pub fn take_fast_retransmits(&mut self) -> Vec<Bytes> {
+        if self.fast_retx_candidates.is_empty() {
+            return Vec::new();
+        }
+        let now = Instant::now();
+        let candidates = std::mem::take(&mut self.fast_retx_candidates);
+        let mut wires = Vec::with_capacity(candidates.len());
+        for seq in candidates {
+            let give_up = match self.unacked.get_mut(&seq) {
+                // Already acked or evicted between detection and now.
+                None => continue,
+                Some(entry) if entry.retx_count >= self.max_retries => true,
+                Some(entry) => {
+                    entry.last_sent = now;
+                    entry.retx_count += 1;
+                    entry.is_retx = true;
+                    entry.n_greater_seq_acks = 0;
+                    wires.push(entry.wire.clone());
+                    self.fast_retx += 1;
+                    false
+                }
+            };
+            if give_up {
+                self.unacked.remove(&seq);
+                self.rto_expirations += 1;
+            }
+        }
+        wires
+    }
+
+    /// Frames retransmitted early because acks for later TxSequences arrived.
+    pub fn fast_retx(&self) -> u64 {
+        self.fast_retx
     }
 
     /// Inbound frames dropped as peer retransmissions of an already-received
@@ -601,6 +681,51 @@ mod tests {
         let retx = rel.check_retransmit();
         assert_eq!(retx.len(), 1);
         assert_eq!(rel.unacked_count(), 1);
+    }
+
+    /// A gap is repaired from ack ORDERING, without waiting out the RTO.
+    ///
+    /// The sender emits frames 0..5 and the receiver acks 1, 2, 3 -- frame 0 was
+    /// lost. Three acks for greater TxSequences is NFD's
+    /// `seqNumLossThreshold`, so frame 0 must become resendable immediately.
+    /// The RTO here is the RFC 6298 floor (200 ms) and the test never sleeps, so
+    /// nothing but fast retransmit can produce a wire.
+    #[test]
+    fn ack_ordering_repairs_a_gap_without_waiting_for_the_rto() {
+        let mut rel = LpReliability::from_config(1400, ReliabilityConfig::default());
+
+        let mut sent = Vec::new();
+        for _ in 0..5 {
+            sent.push(rel.on_send(&small_packet())[0].clone());
+        }
+        assert_eq!(rel.unacked_count(), 5);
+
+        // Nothing is overdue: the RTO floor is 200 ms and no time has passed.
+        assert!(
+            rel.check_retransmit().is_empty(),
+            "precondition: the RTO path must not be what repairs this"
+        );
+
+        // Receiver got 1, 2 and 3 but never 0.
+        let mut receiver = LpReliability::new(1400);
+        for wire in &sent[1..4] {
+            receiver.on_receive(wire);
+        }
+        let acks = receiver.flush_acks().expect("receiver must ack what it got");
+        rel.on_receive(&acks);
+
+        let repairs = rel.take_fast_retransmits();
+        let seqs: Vec<Option<u64>> = repairs.iter().map(|w| extract_acks(w).0).collect();
+        assert_eq!(
+            seqs,
+            vec![Some(0)],
+            "only the frame below the acked TxSequences is declared lost"
+        );
+        assert_eq!(rel.fast_retx(), 1);
+
+        // Frame 4 was never acked either, but nothing arrived after it, so
+        // there is no evidence it was lost -- it waits for its RTO.
+        assert_eq!(rel.unacked_count(), 2, "frames 0 and 4 remain unacked");
     }
 
     /// Under a backlog, `check_retransmit` repairs the OLDEST losses first.
