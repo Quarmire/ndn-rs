@@ -344,3 +344,79 @@ NFD and behaviour under lossy bursts, not measured gain. Next attempt belongs
 on the two-node netns bench with induced loss (`/tmp/bench.sh` on
 minidronesys-04), where retransmission rates can be driven high enough for
 the effect to be visible at all.
+
+---
+
+## Round 4 — why ndn-fwd is less smooth than NFD
+
+Framing: at comparable aggregate bitrate (3799 vs 4478 kbps, NFD ~18% ahead),
+ndn-fwd's 3-stream video was *markedly choppier* — worst frame gap 6.00 s vs
+2.62 s, 32 stutters vs 4. A gap that shows up in the latency tail but barely
+in throughput is a specific signature: the same repairs happen, they just
+happen late. Both findings below have that shape, and both were found by
+reading NFD's `daemon/face/lp-reliability.cpp` against
+`ndn-transport/src/reliability.rs`.
+
+### 4.1 No fast retransmit — every loss cost at least an RTO (200 ms)
+
+**NFD does not wait for the RTO to repair a loss.** `findLostLpPackets()`
+(lp-reliability.cpp:245) counts, for each unacked frame, how many Acks for
+*greater* TxSequences have gone by. At `Options::seqNumLossThreshold` — 3,
+the 3-duplicate-ack analogue — the frame is declared lost and resent
+immediately, from the receive path.
+
+ndn-fwd had exactly one repair trigger: RTO expiry in `check_retransmit`. The
+RFC 6298 floor is `RFC6298_MIN_RTO_US = 200_000`. So on a link whose RTT is
+single-digit milliseconds, *every* lost frame waited 200 ms before a repair
+was even attempted — 50-100x NFD's repair latency.
+
+Aggregate throughput hides this completely: the same frames get retransmitted
+either way. A sequential consumer does not hide it at all. A predictive NDNSF
+stream delivers in cursor order, so one late repair stalls everything behind
+it, and a handful of losses compound into the multi-second gaps measured.
+
+Fixed by porting the mechanism: `UnackedEntry::n_greater_seq_acks`,
+`SEQ_NUM_LOSS_THRESHOLD = 3`, and `take_fast_retransmits()` flushed from the
+receive path next to the Ack flush, so recovery costs about an RTT rather
+than a retransmit tick.
+
+**Deliberate divergence retained:** NFD re-stamps a fresh TxSequence on every
+retransmission (`assignTxSequence`, lp-reliability.cpp:316) and therefore
+keys duplicate suppression on `Sequence`. This port keeps the TxSequence
+stable and keys duplicate suppression on it instead (documented on
+`on_receive`). Fast retransmit works either way; Karn's check still excludes
+retransmits from RTT sampling via `is_retx`. Reassigning TxSequence per
+retransmission remains an open divergence.
+
+### 4.2 Retransmission picked an arbitrary subset, not the oldest
+
+`check_retransmit` resends at most `max_retx_per_tick` frames per tick (16 on
+the wifi profile). `unacked` was a `HashMap`, so when more frames were overdue
+than the cap allowed, *which* ones got repaired was hash order — and an
+individual lost fragment could be skipped tick after tick while others were
+repaired repeatedly. NFD walks an ordered `std::map` and repairs oldest-first.
+
+Same signature again: the retransmit *rate* is identical, so throughput barely
+moves; the per-frame recovery latency grows a long tail. Fixed by making
+`unacked` a `BTreeMap`, which also turns the `max_unacked` eviction from an
+O(n) `keys().min()` scan into `pop_first()`.
+
+The regression test is not vacuous — against the old map it repaired frames
+`[1, 7, 6]` where it should have repaired `[0, 1, 2]`.
+
+### 4.3 Not a defect: piggybacked Ack cap
+
+`on_send` attaches at most `MAX_PIGGYBACKED_ACKS = 16`, which looked like it
+might silently drop Acks and provoke spurious retransmissions. It does not —
+`drain(..len.min(16))` leaves the remainder queued for the next outgoing
+frame or for `flush_acks`. Checked and cleared.
+
+### 4.4 Status
+
+Both fixes are unit-tested and pinned to the fleet on branch
+`fleet-transport-fixes` (a070c93e + these two commits only). They are
+deliberately NOT shipped from `main`, which also carries the unvalidated
+RetxSuppressionExponential port — shipping both together would make the
+smoothness result unattributable, which is the mistake §3 already paid for.
+
+Hardware validation of the smoothness claim is still outstanding.
