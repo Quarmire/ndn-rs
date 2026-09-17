@@ -540,3 +540,67 @@ this session were also producer-side limits: a 7 KB frame cap and a 15 fps
 clamp. Before building any theory from face counters, read the producer's
 error log. A forwarder cannot deliver what was never published, and the
 application says so plainly in its own journal.
+
+---
+
+## Round 7 — the rollback A/B, and where the remaining gap actually is
+
+### 7.1 The §4 transport fixes: mechanism validated, application effect nil
+
+Arm A (a070c93e + oldest-first repair + fast retransmit + an inert counter)
+against Arm B (a070c93e), both on the ndn-fwd cell, same producer (miniMUAS
+db7a4c3 with the FEC fix), 150 s settle, 90 s 3-stream sample:
+
+| | Arm B (rollback) | Arm A (fixed) |
+|---|---|---|
+| aggregate | 30.6 fps / 3867 kbps | 31.1 fps / 3837 kbps |
+| stutters >1 s | 8 | 6 |
+
+Indistinguishable. But the counters show the repair mechanism completely
+changed:
+
+| face | B `resent` | A `resent` | A `fast-retx` | `gave-up` B→A |
+|---|---|---|---|---|
+| iuas-01 | 133 | 4 | 303 | 1 → 0 |
+| wuas-01 | 538 | 13 | 797 | 3 → 1 |
+| iuas-02 | 602 | 33 | 883 | 34 → 8 |
+
+~97% of repairs moved off the RTO path (>=200 ms floor) onto ack ordering
+(~1 RTT), and unrecoverable losses fell 4x on the worst face. So the fix does
+exactly what it was written to do; the link simply has too little loss for it
+to matter end-to-end — reassembly completion was 99.6-100% in BOTH arms.
+
+Correct conclusion: a conformance and robustness improvement, not a throughput
+or smoothness fix. Demonstrating its benefit needs induced loss (the netns
+bench), and `fast-retx=` now exists to measure it.
+
+### 7.2 NFD's lead is real, and it is NOT in the network
+
+Matched protocol, working producer, same 90 s sample:
+
+| | ndn-fwd B | ndn-fwd A | NFD |
+|---|---|---|---|
+| aggregate fps | 30.6 | 31.1 | **40.7** |
+| aggregate kbps | 3867 | 3837 | **5021** |
+| p95 gap | 0.29-0.35 s | 0.30-0.31 s | **0.12-0.17 s** |
+
+NFD is ~31% ahead at roughly half the tail, repeatably (ndn-fwd measured at
+31.1 / 28.0 / 29.2 fps across three runs).
+
+The frames are not lost in flight: reassembly completion 99.6-100%, `gave-up`
+<= 8, `evicted` 0. Counting what the producer actually published on node-01 —
+4496 Data over 75 s, ~5.65 chunks/frame — gives ~10.6 fps published against
+10.6 fps received. **The missing frames were never produced.** The same
+producer reaches 13.1-14.2 fps under NFD.
+
+The video publish loop is self-paced (`delay = 1/fps - cycle`), so a slower
+push path directly lowers the achieved frame rate. That points at the cost of
+handing a Data packet to ndn-fwd over the local unix face, relative to NFD —
+not at anything on the wire. `agent.video.slow_frame` did not fire because its
+threshold is 400 ms (2.5 fps) while the effect is tens of ms per frame; a
+finer producer-side timing probe is the next step.
+
+Caveat on method: the handoff delta in this run was unusable (it reported more
+Data arriving than published — the local-face sum includes non-video traffic,
+and the run was backlog-contaminated, `first_frame=-3.0s`). The conclusion
+above rests on the chunk-rate arithmetic, not on that delta.
