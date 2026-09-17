@@ -420,3 +420,74 @@ RetxSuppressionExponential port — shipping both together would make the
 smoothness result unattributable, which is the mistake §3 already paid for.
 
 Hardware validation of the smoothness claim is still outstanding.
+
+---
+
+## Round 5 — the round-4 fixes did NOT close the gap, and what the counters say
+
+**The prediction in §4 was wrong.** Both fixes are real and correct, but a
+controlled A/B on hardware (640px q50 15fps, 3 streams, 90 s, 150 s settle
+after the fabric switch, two samples per stack) shows the gap essentially
+intact:
+
+| sample A, 3 streams | ndn-fwd (patched) | NFD |
+|---|---|---|
+| aggregate fps | 24.8 | 41.5 |
+| aggregate kbps | 2834 | 4835 |
+| stutters >1 s | 33 | 7 |
+| p95 gap | 0.35-0.58 s | 0.14-0.16 s |
+| p50 gap | 0.01-0.02 s | 0.04-0.06 s |
+
+Sample B is discarded on both arms: `first_frame` went negative and iuas-02
+reported 40 fps against a 15 fps request, i.e. the consumer was draining
+backlog from sample A. A 40 s quiet gap does NOT stop the streams — they must
+be stopped explicitly, and only runs with positive `first_frame` are usable.
+
+Note the shape: ndn-fwd's **p50 is as good as or better than NFD's** while p95
+and max are 3-4x worse. This is not general slowness.
+
+### 5.1 The real divergence: ndn-fwd does not share capacity between streams
+
+Matched 90 s runs, identical settings, Data delivered per drone at the GCS:
+
+| drone | NFD | ndn-fwd |
+|---|---|---|
+| iuas-01 | 5226 (30.4 MB) | 6756 (32.4 MB) |
+| wuas-01 | 4167 (21.9 MB) | **968 (1.0 MB)** |
+| iuas-02 | 2965 (11.8 MB) | 3988 (12.0 MB) |
+
+NFD holds the three within ~1.8x. ndn-fwd gives wuas-01 **1/22nd** of what NFD
+gives it, while serving the other two slightly BETTER than NFD. Interests sent
+were near-identical on both stacks (~14.5k per face), so the consumer asked
+equally — ndn-fwd simply did not deliver.
+
+It is erratic rather than a fixed victim: in an earlier ndn-fwd sample
+wuas-01 was healthy (688 frames) and in the next it collapsed (256). NFD's
+split was stable across every run. So the defect is unstable sharing, not a
+deterministic starvation of one prefix.
+
+This explains the aggregate throughput gap far better than repair latency
+does, and it is where the next investigation belongs. The per-face egress loop
+in `engine.rs` cannot be the cause — it is one task per face — so the
+candidates are upstream of it: how Data reaches each face's queue, and the
+sending node's own forwarder (minidronesys-02 delivered 968 Data under
+ndn-fwd against 4167 under NFD, from a producer NFD proves capable).
+
+### 5.2 Loss is small but its unrecoverable tail is not
+
+Per-face on the GCS over 90 s under ndn-fwd:
+`resent` 19/49/165, `gave-up` 0/1/**25**, reassembly groups timed out 25/3/11,
+completion 99.6%/96.4%/99.6%.
+
+Every face reports `rto=200000us` — the RFC 6298 floor, never adapted down. So
+each retry ladder is 200/400/600 ms before give-up. A `gave-up` or a timed-out
+reassembly group is a Data packet that never arrives, and a sequential
+predictive stream stalls everything behind it. That is a plausible p95/max
+mechanism, but at these volumes it cannot account for a 1.7x throughput gap.
+
+### 5.3 Instrumentation gap, now closed
+
+The fast-retransmit path counted its repairs but never exposed them, so
+`ndn-ctl` showed only an aggregate `resent` and there was no way to tell
+whether ack-ordering repair fires at all. Added TLV 0xEA, rendered as
+`fast-retx=`. Whether §4.1 does anything on this fleet is still unmeasured.
