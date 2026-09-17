@@ -491,3 +491,52 @@ The fast-retransmit path counted its repairs but never exposed them, so
 `ndn-ctl` showed only an aggregate `resent` and there was no way to tell
 whether ack-ordering repair fires at all. Added TLV 0xEA, rendered as
 `fast-retx=`. Whether §4.1 does anything on this fleet is still unmeasured.
+
+---
+
+## Round 6 — §5.1 RETRACTED: it was the producer, not the forwarder
+
+**§5.1 ("ndn-fwd does not share capacity between streams") is wrong and is
+withdrawn.** The evidence was a matched pair of runs in which wuas-01 received
+1.0 MB under ndn-fwd against 21.9 MB under NFD. wuas-01's node was not being
+starved by the forwarder — its PRODUCER was failing to publish. Every push was
+rejected with:
+
+    "flush group exceeds configured FEC source capacity"
+
+The cause was in miniMUAS, introduced earlier the same day. Segmenting frames
+across Data packets made one `flush()` bind N chunks, while BOTH declarations
+of the stream's geometry stayed sized per FRAME: `_build_fec(source_items=
+group_frames)` = 1, and `SampleClassProfile("video", 1, 1)`. Any frame needing
+more than one chunk overflowed its group and never published.
+
+Why it survived so long as a "forwarder" finding: the failure is
+**scene-dependent**. A flat scene fits in one chunk and works; a busy scene
+needs several and fails. So it presents as an intermittent, per-vehicle,
+per-run fault — exactly the "erratic, not a fixed victim" pattern §5.1 cites as
+evidence of unstable sharing. Telemetry and the NDN plane stay perfectly
+healthy throughout, which points suspicion at scheduling rather than the
+application.
+
+After the fix (miniMUAS db7a4c3), on the SAME NFD cell:
+
+| | before fix | after fix |
+|---|---|---|
+| aggregate | 36.5 fps / 4543 kbps | **42.2 fps / 5242 kbps** |
+| stutters >1 s | 15 | **1** |
+| per-stream frames | 1098 / 1064 / 903 | 768 / 758 / 767 (within 1.3%) |
+
+Near-perfect fairness, and NFD's own numbers improved — the bug was
+suppressing both stacks. Nothing here was ever evidence about either forwarder.
+
+**Consequence for every other measurement in §4 and §5:** all of them ran at
+640px or above through this bug, on whichever vehicles had busy scenes. The
+ladder, the controlled A/B, and the NFD-vs-ndn-fwd comparison are all
+contaminated and none of their numbers should be cited. The comparison is
+UNMEASURED, not decided.
+
+**Method lesson, the third instance today.** Two earlier "forwarder ceilings"
+this session were also producer-side limits: a 7 KB frame cap and a 15 fps
+clamp. Before building any theory from face counters, read the producer's
+error log. A forwarder cannot deliver what was never published, and the
+application says so plainly in its own journal.
