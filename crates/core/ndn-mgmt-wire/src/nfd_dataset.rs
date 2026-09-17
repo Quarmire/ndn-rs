@@ -41,7 +41,7 @@ mod tlv {
     pub const N_UNSATISFIED_INTERESTS: u64 = 0x9a;
 
     // ndn-rs-specific FaceStatus extensions in project-private
-    // 0xDA..=0xE9. NFD clients ignore unknown non-critical codes, so
+    // 0xDA..=0xEA. NFD clients ignore unknown non-critical codes, so
     // these are additive on the wire.
     pub const N_LP_ACKS_RECEIVED: u64 = 0xda;
     pub const N_LP_RESENT_PACKETS: u64 = 0xdb;
@@ -64,6 +64,11 @@ mod tlv {
     pub const N_REASM_FRAGMENTS_REJECTED: u64 = 0xe8;
     /// Partial groups discarded under memory pressure. Same hazard.
     pub const N_REASM_GROUPS_EVICTED: u64 = 0xe9;
+    /// Frames resent EARLY by the fast-retransmit path (ack ordering) rather
+    /// than by RTO expiry. Without this split, `resent` cannot answer whether
+    /// ack-ordering repair fires at all -- the question that matters on a link
+    /// whose RTO is pinned at the 200 ms RFC 6298 floor.
+    pub const N_LP_FAST_RETX: u64 = 0xea;
 
     pub const ENTRY: u64 = 0x80;
     pub const NEXT_HOP_RECORD: u64 = 0x81;
@@ -185,6 +190,8 @@ pub struct FaceStatus {
     /// Frames dropped from the retransmit buffer by the `max_unacked` cap:
     /// silent loss no retransmission will ever repair.
     pub n_lp_unacked_evictions: Option<u64>,
+    /// Frames resent early by ack ordering (see [`tlv::N_LP_FAST_RETX`]).
+    pub n_lp_fast_retx: Option<u64>,
     /// Fragments rejected by the reassembler AFTER being Acked.
     pub n_reasm_fragments_rejected: Option<u64>,
     /// Partial groups evicted under memory pressure.
@@ -263,6 +270,9 @@ impl FaceStatus {
             if let Some(v) = self.n_reasm_fragments_wasted {
                 write_non_neg_int(w, tlv::N_REASM_FRAGMENTS_WASTED, v);
             }
+            if let Some(v) = self.n_lp_fast_retx {
+                write_non_neg_int(w, tlv::N_LP_FAST_RETX, v);
+            }
             if let Some(v) = self.n_lp_unacked_evictions {
                 write_non_neg_int(w, tlv::N_LP_UNACKED_EVICTIONS, v);
             }
@@ -319,6 +329,7 @@ impl FaceStatus {
         let mut n_reasm_timed_out = None;
         let mut n_reasm_fragments_wasted = None;
         let mut n_lp_unacked_evictions = None;
+        let mut n_lp_fast_retx = None;
         let mut n_reasm_fragments_rejected = None;
         let mut n_reasm_groups_evicted = None;
 
@@ -351,6 +362,7 @@ impl FaceStatus {
                 tlv::FLAGS => flags = read_non_neg_int(&v)?,
                 tlv::N_LP_ACKS_RECEIVED => n_lp_acks_received = read_non_neg_int(&v),
                 tlv::N_LP_RESENT_PACKETS => n_lp_resent_packets = read_non_neg_int(&v),
+                tlv::N_LP_FAST_RETX => n_lp_fast_retx = read_non_neg_int(&v),
                 tlv::N_LP_RTO_EXPIRATIONS => n_lp_rto_expirations = read_non_neg_int(&v),
                 tlv::N_CONGESTION_MARKS_SENT => n_congestion_marks_sent = read_non_neg_int(&v),
                 tlv::N_CONGESTION_MARKS_RECEIVED => {
@@ -422,6 +434,7 @@ impl FaceStatus {
             n_reasm_timed_out,
             n_reasm_fragments_wasted,
             n_lp_unacked_evictions,
+            n_lp_fast_retx,
             n_reasm_fragments_rejected,
             n_reasm_groups_evicted,
         })
@@ -955,6 +968,7 @@ mod tests {
             n_reasm_timed_out: Some(18),
             n_reasm_fragments_wasted: Some(19),
             n_lp_unacked_evictions: Some(20),
+            n_lp_fast_retx: Some(9),
             n_reasm_fragments_rejected: Some(21),
             n_reasm_groups_evicted: Some(22),
         };
@@ -964,6 +978,7 @@ mod tests {
         assert!(buf.is_empty());
         assert_eq!(decoded.n_lp_acks_received, Some(11));
         assert_eq!(decoded.n_lp_resent_packets, Some(12));
+        assert_eq!(decoded.n_lp_fast_retx, Some(9));
         assert_eq!(decoded.n_lp_rto_expirations, Some(13));
         assert_eq!(decoded.n_congestion_marks_sent, Some(14));
         assert_eq!(decoded.n_congestion_marks_received, Some(15));

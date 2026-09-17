@@ -134,8 +134,9 @@ pub trait LinkService: Send + Sync + 'static {
     }
 
     /// `(n_lp_resent_packets, rto_micros, n_lp_rto_expirations,
-    /// n_lp_unacked_evictions)` if a `ReliabilityFeature` is present.
-    fn reliability_counters(&self) -> Option<(u64, u64, u64, u64)> {
+    /// n_lp_unacked_evictions, n_lp_fast_retx)` if a `ReliabilityFeature` is
+    /// present.
+    fn reliability_counters(&self) -> Option<(u64, u64, u64, u64, u64)> {
         None
     }
 
@@ -577,12 +578,13 @@ impl LinkService for LpLinkService {
         self.features.iter().map(|f| f.name()).collect()
     }
 
-    fn reliability_counters(&self) -> Option<(u64, u64, u64, u64)> {
+    fn reliability_counters(&self) -> Option<(u64, u64, u64, u64, u64)> {
         Some((
             self.reliability_feature.n_lp_resent_packets(),
             self.reliability_feature.rto_micros(),
             self.reliability_feature.n_lp_rto_expirations(),
             self.reliability_feature.n_lp_unacked_evictions(),
+            self.reliability_feature.n_lp_fast_retx(),
         ))
     }
 
