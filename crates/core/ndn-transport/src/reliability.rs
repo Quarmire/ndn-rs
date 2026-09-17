@@ -1,7 +1,7 @@
 //! NDNLPv2 per-hop reliability. Synchronous state machine; methods return
 //! wire-ready packets and callers handle I/O.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use bytes::Bytes;
 use web_time::Instant;
@@ -126,7 +126,19 @@ pub struct LpReliability {
     /// receiver Acks reference these.
     next_tx_seq: u64,
     /// Keyed by TxSequence.
-    unacked: HashMap<u64, UnackedEntry>,
+    /// Unacknowledged frames, keyed by TxSequence.
+    ///
+    /// ORDERED on purpose. `check_retransmit` retransmits at most
+    /// `max_retx_per_tick` frames per tick, so the iteration order decides WHICH
+    /// losses get repaired first when there is a backlog. NFD walks an ordered
+    /// `std::map` and so repairs oldest-first; a HashMap here picked an
+    /// arbitrary subset each tick, letting an individual lost fragment be
+    /// skipped tick after tick. That does not cost much aggregate throughput --
+    /// the same number of frames are retransmitted either way -- but it puts a
+    /// long tail on per-frame recovery latency, which is what a video consumer
+    /// sees as a stall. Ordering also makes the `max_unacked` eviction below
+    /// O(log n) instead of an O(n) `keys().min()` scan.
+    unacked: BTreeMap<u64, UnackedEntry>,
     pending_acks: VecDeque<u64>,
     srtt_us: f64,
     rttvar_us: f64,
@@ -175,7 +187,7 @@ impl LpReliability {
         Self {
             next_seq: 0,
             next_tx_seq: 0,
-            unacked: HashMap::new(),
+            unacked: BTreeMap::new(),
             pending_acks: VecDeque::new(),
             srtt_us: 0.0,
             rttvar_us: 0.0,
@@ -263,12 +275,10 @@ impl LpReliability {
             let wire = encode_lp_reliable(chunk, tx_seq, frag_info, frag_acks);
 
             while self.unacked.len() >= self.max_unacked {
-                if let Some(&oldest_seq) = self.unacked.keys().min() {
-                    self.unacked.remove(&oldest_seq);
-                    self.unacked_evictions += 1;
-                } else {
+                if self.unacked.pop_first().is_none() {
                     break;
                 }
+                self.unacked_evictions += 1;
             }
 
             self.unacked.insert(
@@ -591,6 +601,43 @@ mod tests {
         let retx = rel.check_retransmit();
         assert_eq!(retx.len(), 1);
         assert_eq!(rel.unacked_count(), 1);
+    }
+
+    /// Under a backlog, `check_retransmit` repairs the OLDEST losses first.
+    ///
+    /// `max_retx_per_tick` caps how many frames a tick may resend, so when more
+    /// frames are overdue than the cap allows, the choice of which ones matters.
+    /// NFD walks an ordered map and repairs oldest-first; an unordered map here
+    /// picked an arbitrary subset each tick, so an individual lost fragment
+    /// could be skipped repeatedly and recover arbitrarily late. Aggregate
+    /// throughput barely moves -- the per-frame latency tail is what grows.
+    #[test]
+    fn retransmit_repairs_oldest_first() {
+        let mut rel = LpReliability::from_config(
+            1400,
+            ReliabilityConfig {
+                max_retx_per_tick: 3,
+                ..fast_rto_config()
+            },
+        );
+
+        // Ten unacked frames, TxSequence 0..10, none of them acked.
+        for _ in 0..10 {
+            rel.on_send(&small_packet());
+        }
+        assert_eq!(rel.unacked_count(), 10);
+
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        let retx = rel.check_retransmit();
+        assert_eq!(retx.len(), 3, "the per-tick cap still applies");
+
+        let seqs: Vec<Option<u64>> = retx.iter().map(|w| extract_acks(w).0).collect();
+        assert_eq!(
+            seqs,
+            vec![Some(0), Some(1), Some(2)],
+            "the three oldest unacked frames are the ones repaired"
+        );
     }
 
     #[test]
