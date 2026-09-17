@@ -333,8 +333,10 @@ impl PitEntry {
     }
 
     /// Insert or RENEW the out-record for `face_id` (NFD
-    /// `pit::Entry::insertOrUpdateOutRecord`), and grow the entry's
-    /// retransmission-suppression window.
+    /// `pit::Entry::insertOrUpdateOutRecord`).
+    ///
+    /// Does NOT touch the suppression window -- that is per forwarding
+    /// DECISION, see [`Self::note_forward_decision`].
     ///
     /// Previously this always pushed, so every retransmission to the same
     /// upstream appended another record: the vector grew without bound on a
@@ -352,7 +354,18 @@ impl PitEntry {
                 sent_at,
             }),
         }
-        // NFD grows the window only on a FORWARD verdict; this is that moment.
+    }
+
+    /// Grow the per-entry suppression window by one FORWARD verdict (NFD
+    /// `decidePerPitEntry`'s `pi->suppressionInterval *= m_multiplier`).
+    ///
+    /// Call this ONCE per forwarding decision, not once per upstream. NFD grows
+    /// on the decision because `decidePerPitEntry` takes the PIT entry, not a
+    /// face. Growing it inside `add_out_record` instead -- which multicast calls
+    /// per nexthop -- made a 3-nexthop fan-out grow the window 2^3 per Interest
+    /// rather than 2x, pinning it at the 250 ms cap after two Interests and
+    /// suppressing retransmissions that NFD would have forwarded.
+    pub fn note_forward_decision(&mut self) {
         let cur = if self.retx_suppress_interval_ns == 0 {
             RETX_SUPPRESS_INITIAL_NS
         } else {
@@ -378,7 +391,7 @@ impl PitEntry {
 
     /// Whether this whole entry is inside its suppression window (NFD
     /// `decidePerPitEntry`, used by `best-route`). Read-only: the window grows
-    /// in `add_out_record`, i.e. when a forward actually happens.
+    /// in [`Self::note_forward_decision`], once per forward.
     ///
     /// An entry with no out-records is NEW and never suppressed.
     pub fn entry_retx_suppressed(&self, now_ns: u64) -> bool {
@@ -1164,6 +1177,7 @@ mod retx_suppression_tests {
 
         // A second forward must not widen the per-upstream gate.
         e.add_out_record(7, 2, RETX_SUPPRESS_INITIAL_NS);
+        e.note_forward_decision();
         assert!(
             e.suppressed_upstreams(RETX_SUPPRESS_INITIAL_NS * 2).is_empty(),
             "per-upstream window must stay at the initial interval"
@@ -1176,17 +1190,38 @@ mod retx_suppression_tests {
     fn per_entry_window_grows_exponentially_and_caps() {
         let mut e = entry();
         e.add_out_record(1, 1, 0);
+        e.note_forward_decision();
         assert_eq!(e.retx_suppress_interval_ns, RETX_SUPPRESS_INITIAL_NS * 2);
         assert!(e.entry_retx_suppressed(RETX_SUPPRESS_INITIAL_NS));
 
         for _ in 0..20 {
-            e.add_out_record(1, 1, 0);
+            e.note_forward_decision();
         }
         assert_eq!(
             e.retx_suppress_interval_ns, RETX_SUPPRESS_MAX_NS,
             "growth must cap at NFD's max interval"
         );
         assert!(!e.entry_retx_suppressed(RETX_SUPPRESS_MAX_NS));
+    }
+
+    /// Fanning out to N upstreams is ONE forward decision, not N.
+    ///
+    /// NFD's `decidePerPitEntry` takes the PIT entry and grows the window once
+    /// per decision. Growing per upstream instead made a 3-nexthop multicast
+    /// fan-out grow it 2^3 per Interest, so it hit the 250 ms cap after two
+    /// Interests and suppressed retransmissions NFD would have forwarded.
+    #[test]
+    fn fan_out_to_many_upstreams_is_one_window_growth() {
+        let mut e = entry();
+        for face in 1..=3 {
+            e.add_out_record(face, 1, 0);
+        }
+        e.note_forward_decision();
+        assert_eq!(
+            e.retx_suppress_interval_ns,
+            RETX_SUPPRESS_INITIAL_NS * 2,
+            "three upstreams, one decision, one doubling"
+        );
     }
 
     /// `add_out_record` RENEWS rather than appending.

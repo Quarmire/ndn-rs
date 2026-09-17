@@ -387,6 +387,14 @@ impl StrategyStage {
                     if surviving_faces.is_empty() {
                         return Action::Drop(DropReason::Suppressed);
                     }
+                    // One forward DECISION -> one growth of the per-entry
+                    // suppression window, however many upstreams it fans out to
+                    // (NFD's decidePerPitEntry takes the entry, not a face).
+                    if let Some(token) = pit_token {
+                        self.pit.with_entry_mut(&token, |entry| {
+                            entry.note_forward_decision();
+                        });
+                    }
                     ctx.out_faces.extend_from_slice(&surviving_faces);
                     let out = ctx.out_faces.clone();
                     return Action::Send(ctx, out);
