@@ -340,6 +340,17 @@ impl UdpFace {
                 Ok(batch) => {
                     let mut q = self.rx.lock().unwrap();
                     for (payload, src) in batch {
+                        // A connected socket is filtered by the KERNEL, which
+                        // need not fill in the source address because it is
+                        // implied. Comparing it then rejects every datagram:
+                        // the face goes silent while the link is perfectly
+                        // healthy. (Observed as fleet telemetry collapsing from
+                        // ~3.3/s to ~0.4/s after connected faces were
+                        // introduced.) `recv_bytes_single` has the same rule.
+                        if self.connected {
+                            q.push_back(payload);
+                            continue;
+                        }
                         // Canonicalize: a dual-stack socket reports IPv4 peers as
                         // IPv4-mapped IPv6 (see `recv_bytes_single`).
                         if src.ip().to_canonical() == self.peer.ip().to_canonical()
