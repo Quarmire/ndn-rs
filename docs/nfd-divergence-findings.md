@@ -652,3 +652,52 @@ Caveat: the NFD timing sample came from a run whose video was partly degraded
 one. The push/flush medians are nearly identical across both despite that
 difference in load, which is consistent with fixed per-packet cost, but a
 matched-health repeat would firm it up.
+
+---
+
+## Round 9 — at the FABRIC level, ndn-fwd is ~2.7x FASTER than NFD
+
+Every comparison in rounds 1-8 was measured through the miniMUAS video path.
+`tools/fabric-bench` removes the application entirely: `ndn-iperf` with
+`--sign-mode none` touches no keychain, no ABE, no NDNSF and no agent. Three
+concurrent flows, 20 s, 8192 B Data, 150 s settle after each fleet-wide cell
+switch, run in BOTH stack orderings to control for ordering:
+
+| aggregate Mbps | ndn-fwd first | NFD first | mean |
+|---|---|---|---|
+| ndn-fwd | 75.02 | 67.75 | **71.4** |
+| NFD | 25.12 | 27.32 | **26.2** |
+
+**ndn-fwd sustains ~2.7x NFD's throughput**, reproduced in both orderings,
+each stack self-consistent across runs. The forwarders' own Data counters
+corroborate independently (client in_data delta 24333 vs 11176). Unloaded RTT
+is equivalent (~4.3-4.6 ms avg, 0% loss on both).
+
+This **inverts** the video-path result, where NFD led by ~31% (40.7 vs 31.1 fps
+aggregate). Both are real, and together they localise the problem: ndn-fwd's
+raw forwarding capacity is roughly triple NFD's on this link, so its video
+deficit **cannot be a forwarding-throughput problem**. It has to come from an
+interaction between ndn-fwd and how NDNSF drives it — the request pattern, the
+local face under a stream of small signed Data, or predictive-stream Interest
+pipelining — not from the forwarder's ability to move packets.
+
+Scale worth keeping in view: the fabric carries ~71 Mbps while the video path
+tops out near 5 Mbps. The wireless link was never the constraint, which
+independently supports the producer-side findings of rounds 7-8 (the per-packet
+KeyChain, and NDNSF re-verifying the producer's own signature on every push).
+
+### 9.1 Fairness: inconclusive, earlier claim withdrawn
+
+Run 1 showed ndn-fwd with a tighter per-flow spread (1.37x vs 2.2x); run 2
+showed them equivalent (2.5x vs 2.6x). Two samples, contradictory. No fairness
+difference is claimed in either direction. This also closes out the retracted
+§5.1 "ndn-fwd starves streams": that was a producer bug, and there is no
+positive evidence of a fairness defect at the fabric level either.
+
+### 9.2 Loaded latency
+
+Both stacks queue deeply under three saturating flows -- p50 rises from ~4 ms
+unloaded to 38-170 ms, p95 to 480-880 ms, consistent with the AIMD window
+driving deep buffers. ndn-fwd was lower in run 1 (p50 38-41 ms vs NFD's
+151-170 ms) but this was not separately confirmed in run 2 and should not be
+cited without a repeat.
