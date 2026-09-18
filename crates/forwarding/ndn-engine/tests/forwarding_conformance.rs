@@ -166,6 +166,88 @@ async fn native_data_satisfies_pit_to_consumer() {
     shutdown.shutdown().await;
 }
 
+/// A Content Store hit must not leave a PIT entry behind.
+///
+/// The CS is consulted AFTER PIT aggregation (matching NFD), so by the time a
+/// hit is detected the entry is already installed. If it is not erased, every
+/// later Interest for that name aggregates onto an entry nothing will ever
+/// satisfy and the consumer stalls until the lifetime expires — a far worse
+/// failure than the redundant lookups the ordering removes.
+#[tokio::test]
+async fn cs_hit_after_pit_insert_leaves_no_pit_entry() {
+    let (face_a, handle_a) = InProcFace::new(FaceId(FACE_A), 128);
+    let (face_b, handle_b) = InProcFace::new(FaceId(FACE_B), 128);
+    let (engine, shutdown) = EngineBuilder::new(EngineConfig {
+        cs_admit_unverified: true,
+        ..EngineConfig::default()
+    })
+    .face(face_a)
+    .face(face_b)
+    .build()
+    .await
+    .expect("engine build");
+
+    let prefix: Name = "/cshit".parse().unwrap();
+    engine.fib().add_nexthop(&prefix, FaceId(FACE_B), 0);
+
+    // Populate the cache the ordinary way: Interest out, Data back.
+    handle_a
+        .send(
+            InterestBuilder::new("/cshit/one")
+                .lifetime(Duration::from_secs(2))
+                .build(),
+        )
+        .await
+        .expect("inject interest");
+    let _ = recv_timeout(&handle_b).await;
+    handle_b
+        .send(
+            // A positive FreshnessPeriod is required: DefaultAdmissionPolicy
+            // refuses FreshnessPeriod=0 Data, so without this the Data is
+            // never cached and the test would assert against an empty store.
+            DataBuilder::new("/cshit/one", b"cached")
+                .freshness(Duration::from_secs(60))
+                .sign_digest_sha256(),
+        )
+        .await
+        .expect("inject data");
+    let _ = recv_timeout(&handle_a).await;
+
+    let pit_after_fetch = engine.pit().len();
+
+    // Second Interest for the same name: served from cache, and the producer
+    // must NOT see it again.
+    handle_a
+        .send(
+            InterestBuilder::new("/cshit/one")
+                .lifetime(Duration::from_secs(2))
+                .build(),
+        )
+        .await
+        .expect("inject second interest");
+    // Nothing may reach the producer: the cache answers it.
+    assert!(
+        recv_timeout(&handle_b).await.is_none(),
+        "a cached name must not be forwarded upstream again"
+    );
+    assert!(
+        recv_timeout(&handle_a)
+            .await
+            .as_ref()
+            .is_some_and(is_forwarded_data),
+        "second Interest must be answered from the Content Store"
+    );
+
+    assert_eq!(
+        engine.pit().len(),
+        pit_after_fetch,
+        "a CS hit must erase the PIT entry it installed, or later Interests \
+         aggregate onto an entry nothing will satisfy"
+    );
+
+    shutdown.shutdown().await;
+}
+
 /// Data path: a Data with no pending Interest is unsolicited — dropped, not
 /// delivered. The native mirror of `decide_data` → `Unsolicited`.
 #[tokio::test]
