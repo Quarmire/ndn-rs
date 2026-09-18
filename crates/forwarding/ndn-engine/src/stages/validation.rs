@@ -171,9 +171,17 @@ impl ValidationStage {
 
     pub async fn process(&self, mut ctx: PacketContext) -> Action {
         let Some(validator) = &self.validator else {
-            // No validator: default-deny. Leave `ctx.verified = false` so
-            // `CsInsertStage` skips admission; the Data still forwards
-            // through PIT-match (downstream consumers validate themselves).
+            // No validator configured: this Data was never SUBJECT to
+            // validation, which is not the same as having failed it. Say so
+            // explicitly so downstream stages can tell the two apart.
+            //
+            // `verified` stays false -- nothing checked the signature -- but
+            // `CsInsertStage` may still admit, matching NFD: a forwarder does
+            // not validate, and the consumer validates for itself (which is
+            // exactly what the previous comment here argued, while the code
+            // did the opposite). Treating the two as one silently disabled the
+            // Content Store whenever `[security] profile = "disabled"`.
+            ctx.validation_not_configured = true;
             return Action::Satisfy(ctx);
         };
 

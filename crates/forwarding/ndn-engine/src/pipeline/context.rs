@@ -36,7 +36,17 @@ pub struct PacketContext {
     /// reassembly per-sender on a multi-access face. `0` = unicast / no source.
     pub endpoint_id: u64,
     pub cs_hit: bool,
+    /// Signature was CHECKED and passed. Never set when a validator is
+    /// configured and the check fails.
     pub verified: bool,
+    /// No validator is configured, so this Data was never SUBJECT to
+    /// validation. Distinct from `verified == false`, which also covers "a
+    /// validator ran and rejected it". Conflating the two made
+    /// `CsInsertStage` refuse every network packet whenever
+    /// `[security] profile = "disabled"`, silently disabling the Content
+    /// Store: measured 0.17% hit rate and 37 retained entries against NFD's
+    /// 7.33% and 12033 on the same workload.
+    pub validation_not_configured: bool,
     /// Set by `PitMatchStage` when an incoming Data matched no PIT entry. Such
     /// Data is never forwarded (`out_faces` stays empty); whether it is cached
     /// is decided by the engine's `UnsolicitedDataPolicy`.
@@ -60,6 +70,7 @@ impl PacketContext {
             endpoint_id: 0,
             cs_hit: false,
             verified: false,
+            validation_not_configured: false,
             unsolicited: false,
             arrival,
             tags: AnyMap::new(),

@@ -38,6 +38,20 @@ impl CsLookupStage {
 pub struct CsInsertStage {
     pub cs: Arc<dyn ErasedContentStore>,
     pub admission: Arc<dyn CsAdmissionPolicy>,
+    /// Admit Data that was never SUBJECT to validation (no validator
+    /// configured). Default `false`, which keeps the documented fail-secure
+    /// invariant: with no validator, nothing network-sourced is cached, and
+    /// ndn-rs is deliberately stricter than NFD (ARCHITECTURE.md, D.12).
+    ///
+    /// Opting in trades that strictness for a working cache. It is the right
+    /// trade only where trust is enforced above the forwarder — the miniMUAS
+    /// fleet runs `[security] profile = "disabled"` precisely because NDNSF
+    /// and NAC-ABE validate at the application layer — and there the coupling
+    /// costs real capacity: measured 0.17% CS hit rate with 37 retained
+    /// entries, against NFD's 7.33% and 12033 on the identical workload.
+    ///
+    /// This never admits Data a validator RAN and REJECTED, at any setting.
+    pub admit_unverified: bool,
 }
 
 impl CsInsertStage {
@@ -48,8 +62,12 @@ impl CsInsertStage {
             // Only verified Data enters the CS; unverified bytes could poison
             // downstream consumers. `ctx.verified` is set by ValidationStage
             // or by the local-face trusted-bypass in the pipeline.
-            if !ctx.verified {
-                trace!(target: t::FWD_CS, name=%data.name, "cs-insert: unverified Data, skipping");
+            // Admit when the signature was checked and passed, or when
+            // nothing was ever checked AND the operator has opted in. Data
+            // that a validator ran and rejected is never admitted.
+            let unvalidated_ok = ctx.validation_not_configured && self.admit_unverified;
+            if !ctx.verified && !unvalidated_ok {
+                trace!(target: t::FWD_CS, name=%data.name, "cs-insert: not admitted (unverified)");
                 return Action::Satisfy(ctx);
             }
 
@@ -123,6 +141,7 @@ mod tests {
         let stage = CsInsertStage {
             cs: Arc::clone(&cs) as Arc<dyn ndn_store::ErasedContentStore>,
             admission: Arc::new(AdmitAllPolicy),
+            admit_unverified: false,
         };
         (stage, cs)
     }
@@ -183,6 +202,9 @@ mod tests {
         );
     }
 
+    /// A validator RAN and rejected this Data, so it must not be cached.
+    /// `validation_not_configured` stays false, which is what separates this
+    /// from the "no validator at all" case below.
     #[tokio::test]
     async fn d12_cs_rejects_unverified_ctx() {
         let (stage, cs) = make_insert_stage();
@@ -192,7 +214,61 @@ mod tests {
         let name: Name = "/test/d12/unverified".parse().unwrap();
         assert!(
             cs.get_erased(&Interest::new(name)).await.is_none(),
-            "CS must not admit Data with ctx.verified=false (D.12)"
+            "CS must not admit Data a validator rejected (D.12)"
+        );
+    }
+
+    /// With NO validator configured the Data was never subject to validation,
+    /// and the CS must still admit it -- NFD caches network Data regardless,
+    /// and the consumer validates for itself.
+    ///
+    /// Regression guard for a measured outage: `[security] profile =
+    /// "disabled"` meant no validator, which left `verified = false`, which
+    /// made this stage refuse every network packet. The Content Store was
+    /// silently dead -- 0.17% hit rate and 37 retained entries, against NFD's
+    /// 7.33% and 12033 on the identical workload.
+    #[tokio::test]
+    async fn cs_still_refuses_unvalidated_data_by_default() {
+        let (stage, cs) = make_insert_stage();
+        let mut ctx = make_ctx_with_freshness("/test/cs/unvalidated-default", false);
+        ctx.validation_not_configured = true;
+        stage.process(ctx).await;
+
+        let name: Name = "/test/cs/unvalidated-default".parse().unwrap();
+        assert!(
+            cs.get_erased(&Interest::new(name)).await.is_none(),
+            "fail-secure is the DEFAULT: no opt-in, no caching of unvalidated Data"
+        );
+    }
+
+    #[tokio::test]
+    async fn cs_admits_unvalidated_data_when_opted_in() {
+        let (mut stage, cs) = make_insert_stage();
+        stage.admit_unverified = true;
+        let mut ctx = make_ctx_with_freshness("/test/cs/unvalidated-optin", false);
+        ctx.validation_not_configured = true;
+        stage.process(ctx).await;
+
+        let name: Name = "/test/cs/unvalidated-optin".parse().unwrap();
+        assert!(
+            cs.get_erased(&Interest::new(name)).await.is_some(),
+            "with admit_unverified the CS caches Data no validator ever checked"
+        );
+    }
+
+    /// The opt-in must NOT extend to Data a validator ran and rejected.
+    #[tokio::test]
+    async fn opt_in_never_admits_validator_rejected_data() {
+        let (mut stage, cs) = make_insert_stage();
+        stage.admit_unverified = true;
+        let ctx = make_ctx_with_freshness("/test/cs/rejected", false);
+        // validation_not_configured stays false: a validator ran and said no.
+        stage.process(ctx).await;
+
+        let name: Name = "/test/cs/rejected".parse().unwrap();
+        assert!(
+            cs.get_erased(&Interest::new(name)).await.is_none(),
+            "admit_unverified must never cache Data a validator rejected"
         );
     }
 

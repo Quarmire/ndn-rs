@@ -219,7 +219,11 @@ generated Nacks on multi-access/ad-hoc ingress faces, ignores incoming Nacks
 from shared-medium faces, and skips Nack propagation to shared-medium
 downstream in-records.
 
-`ValidationStage` sets `ctx.verified = true` on the valid path. `CsInsertStage` gates on `ctx.verified` — unverified Data is never cached. Local-face Data is trusted by the OS-level IPC credential and also sets `ctx.verified`. When the validator is disabled or absent (`validator_enabled = false`, the wasm/dev path), `ValidationStage` is **fail-secure**: it leaves `ctx.verified = false`, so the Data still satisfies its pending Interest (it is forwarded) but is **never admitted to the Content Store**. This is stricter than NFD, which caches unverified Data. (The D.12 test `d12_disabled_validator_does_not_verify_network_data` pins this.)
+`ValidationStage` sets `ctx.verified = true` on the valid path. `CsInsertStage` gates on `ctx.verified` — unverified Data is never cached. Local-face Data is trusted by the OS-level IPC credential and also sets `ctx.verified`. When the validator is disabled or absent (`validator_enabled = false`, the wasm/dev path), `ValidationStage` sets `ctx.validation_not_configured = true` and leaves `ctx.verified = false`. The default remains **fail-secure**: the Data satisfies its pending Interest (it is forwarded) but is **never admitted to the Content Store**. This is stricter than NFD, which caches unverified Data. (The D.12 test `d12_disabled_validator_does_not_verify_network_data` pins the default.)
+
+`[cs] admit_unverified = true` opts out of that strictness, admitting Data that no validator ever checked. `validation_not_configured` is what makes this safe to express: it distinguishes "nothing checked this" from "a validator ran and rejected it", and **rejected Data is never cached at any setting**.
+
+The opt-in exists because the coupling has a real cost where trust is enforced above the forwarder. On a fleet running `[security] profile = "disabled"` (NDNSF/NAC-ABE validate at the application layer), the Content Store admitted nothing at all: a measured **0.17% hit rate with 37 retained entries, against NFD's 7.33% and 12033 entries** on the identical workload. Deployments that do validate at the forwarder should leave the default alone.
 
 ## Core Data Structures
 

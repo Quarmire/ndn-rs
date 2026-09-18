@@ -962,6 +962,20 @@ pub struct CsConfig {
     /// broadcast/ad-hoc bearer where overhearing peers' Data is the point.
     #[serde(default = "default_unsolicited_policy")]
     pub unsolicited_policy: String,
+    /// Cache Data that no validator ever checked, i.e. when `[security]
+    /// profile = "disabled"` leaves nothing to validate with.
+    ///
+    /// Default `false` preserves ndn-rs's fail-secure invariant, which is
+    /// deliberately stricter than NFD: with no validator, network Data is
+    /// forwarded but never cached (ARCHITECTURE.md, test D.12).
+    ///
+    /// Set `true` ONLY where trust is enforced above the forwarder. The cost
+    /// of leaving it false in that situation is a Content Store that admits
+    /// nothing: measured 0.17% hit rate and 37 retained entries against NFD's
+    /// 7.33% and 12033 on the same workload. Data that a validator ran and
+    /// REJECTED is never cached at either setting.
+    #[serde(default)]
+    pub admit_unverified: bool,
 }
 
 fn default_cs_variant() -> String {
@@ -985,6 +999,7 @@ impl Default for CsConfig {
             shards: None,
             admission_policy: default_admission_policy(),
             unsolicited_policy: default_unsolicited_policy(),
+            admit_unverified: false,
         }
     }
 }

@@ -41,6 +41,11 @@ use crate::{
 pub struct EngineConfig {
     pub pipeline_channel_cap: usize,
     pub cs_capacity_bytes: usize,
+    /// Cache Data that no validator ever checked (see
+    /// `CsInsertStage::admit_unverified`). Default `false` keeps the
+    /// fail-secure invariant; set it only where trust is enforced above the
+    /// forwarder.
+    pub cs_admit_unverified: bool,
     /// Number of parallel pipeline processing threads.
     ///
     /// - `0` (default): auto-detect from available CPU parallelism.
@@ -88,6 +93,7 @@ impl Default for EngineConfig {
         Self {
             pipeline_channel_cap: 4096,
             cs_capacity_bytes: 64 * 1024 * 1024,
+            cs_admit_unverified: false,
             pipeline_threads: 0,
             replay_guard: ReplayGuardConfig::default(),
             reflexive: crate::reflexive::ReflexiveConfig::default(),
@@ -772,6 +778,7 @@ impl EngineBuilder {
                 admission: self
                     .admission
                     .unwrap_or_else(|| Arc::new(ndn_store::DefaultAdmissionPolicy)),
+                admit_unverified: self.config.cs_admit_unverified,
             },
             unsolicited_policy: self.config.unsolicited_data,
             channel_cap: self.config.pipeline_channel_cap,
