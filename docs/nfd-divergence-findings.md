@@ -701,3 +701,72 @@ unloaded to 38-170 ms, p95 to 480-880 ms, consistent with the AIMD window
 driving deep buffers. ndn-fwd was lower in run 1 (p50 38-41 ms vs NFD's
 151-170 ms) but this was not separately confirmed in run 2 and should not be
 cited without a repeat.
+
+---
+
+## Round 10 — it is NOT multicast; it is the Content Store
+
+Round 9 measured ndn-fwd 2.7x faster than NFD with `ndn-iperf`, while video
+showed NFD 31% ahead. The obvious suspect was the STRATEGY: iperf ran under
+`/fabricbench` -> `/` -> **best-route**, while NDNSF video lives under `/muas`
+-> **multicast**, and every node's RIB has `/muas` -> every peer, so each
+Interest floods the mesh and is contained only by duplicate-nonce suppression.
+
+Tested directly: same harness, same load, same nodes, back to back, only the
+prefix (and therefore the strategy) changed.
+
+**The reported throughput under multicast is not a link measurement.** NFD
+reported 2008-2362 Mbps on a ~70 Mbps link. Bracketing the run with the GCS's
+wireless face counters showed only 4900 Data packets actually arrived — ~99%
+of the "throughput" was served from NFD's Content Store at memory speed.
+ndn-fwd's reported figures, by contrast, match its wire counters (67.3 Mbps
+reported vs ~72.7 computed; 56.5 vs ~59.3).
+
+Comparing on **wireless Data packets received**, the honest metric:
+
+| | best-route | multicast | penalty |
+|---|---|---|---|
+| ndn-fwd | 22198 | 18085 | **-19%** |
+| NFD | 11996 | 4900 | **-59%** |
+
+**The multicast hypothesis is rejected.** ndn-fwd is hurt LESS by multicast
+than NFD, and moves more packets in both strategies (1.85x best-route, 3.7x
+multicast). NDNSF's use of multicast is not where ndn-fwd loses.
+
+### 10.1 The divergence that is real: Content Store retention
+
+Under identical video load: NFD reached `nCsEntries=9723`; ndn-fwd stayed
+between 18 and 228 entries — a ~40x difference in what the cache retains, with
+a 64 MB capacity that should hold ~10000 six-KB chunks.
+
+One mechanism is proven empirically. `ndn-iperf` publishes with
+`FreshnessPeriod=0` by default. ndn-fwd's `DefaultAdmissionPolicy` refuses to
+cache it:
+
+```rust
+/// Admit only Data with a positive `FreshnessPeriod`. Matches NFD's default
+/// `admit` policy: caching `FreshnessPeriod=0` Data churns evictions ...
+```
+
+That comment is **factually wrong about NFD**, and the 2008 Mbps cache-served
+result is the proof: NFD cached the freshness-0 Data and served it. So NFD
+caches Data that ndn-fwd discards outright.
+
+Why this matters for NDNSF specifically: its pattern re-requests Data.
+Prefetch runs ahead of production, Interests retransmit on a 500 ms lifetime,
+and FEC recovery re-fetches. On NFD those repeats are cache hits costing no
+airtime; on ndn-fwd they go back over the wireless link. That is consistent
+with ndn-fwd being faster on the wire yet slower end to end.
+
+### 10.2 Open, and the measurement needed
+
+Video Data carries `freshness_ms=300`, which ndn-fwd's policy DOES admit, so
+the freshness-0 rule alone does not explain ndn-fwd holding only ~200 entries
+under sustained video (~255 chunks/s for 90 s). Lookup rejects stale entries
+only when `MustBeFresh` is set, and eviction is byte-based LRU, so neither
+explains it either. Not yet isolated.
+
+Neither forwarder exposes CS hit/miss counters through `status`, so the direct
+measurement — the cache hit RATE under video on each stack — could not be
+taken. Exposing `nCsHits`/`nCsMisses` (LruCs already tracks both internally)
+is the next step, and would settle how much of NDNSF's demand is repeat demand.
