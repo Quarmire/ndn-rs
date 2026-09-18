@@ -199,7 +199,13 @@ pub async fn run_udp_listener(
     }
 
     // Single-socket path.
-    let socket = match tokio::net::UdpSocket::bind(bind_addr).await {
+    //
+    // Bind with SO_REUSEPORT even for one socket. Configured peer faces bind
+    // the SAME port (symmetric source port keeps one face per neighbour, see
+    // `UdpFace::bind_connected`), and SO_REUSEPORT only permits sharing when
+    // EVERY socket on the port sets it — a plain bind here makes those faces
+    // fail with EADDRINUSE and the node comes up with no peer faces at all.
+    let socket = match bind_reuseport_socket(bind_addr) {
         Ok(s) => {
             // Default OS buffer (~212 KB on Linux) is too small for
             // fragment bursts at high window sizes and causes drops.
@@ -213,6 +219,33 @@ pub async fn run_udp_listener(
     };
     tracing::info!(target: "face.udp", addr=%socket.local_addr().unwrap_or(bind_addr), "UDP listener ready");
     udp_rx_loop(socket, engine, cancel).await;
+}
+
+/// Bind the listener with `SO_REUSEPORT` so per-peer connected faces can share
+/// the port, falling back to a plain bind where the option is unavailable
+/// (non-unix): there, peers keep private ephemeral-port sockets as before.
+fn bind_reuseport_socket(
+    addr: std::net::SocketAddr,
+) -> std::io::Result<tokio::net::UdpSocket> {
+    #[cfg(unix)]
+    {
+        match ndn_face::net::sockopt::bind_reuseport_udp(addr) {
+            Ok(std_sock) => {
+                std_sock.set_nonblocking(true)?;
+                return tokio::net::UdpSocket::from_std(std_sock);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "face.udp", addr=%addr, error=%e,
+                    "udp-listener: SO_REUSEPORT bind failed, falling back to plain bind \
+                     (configured peer faces will not be able to share this port)"
+                );
+            }
+        }
+    }
+    let std_sock = std::net::UdpSocket::bind(addr)?;
+    std_sock.set_nonblocking(true)?;
+    tokio::net::UdpSocket::from_std(std_sock)
 }
 
 /// One UDP receive loop: demux datagrams by source address into send-only

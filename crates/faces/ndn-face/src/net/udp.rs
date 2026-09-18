@@ -35,6 +35,9 @@ pub struct UdpFace {
     id: FaceId,
     socket: Arc<UdpSocket>,
     peer: SocketAddr,
+    /// Socket is `connect()`ed to `peer`, so sends use `send` and the kernel
+    /// delivers only this peer's datagrams here. See [`Self::bind_connected`].
+    connected: bool,
     mtu: AtomicUsize,
     /// Reported [`FaceKind`] — `Udp` by default. A caller can re-tag the face
     /// (e.g. [`FaceKind::WifiDirect`] for a unicast bulk link over a Wi-Fi P2P
@@ -69,6 +72,7 @@ impl UdpFace {
             id,
             socket: Arc::new(socket),
             peer,
+            connected: false,
             mtu: AtomicUsize::new(DEFAULT_UDP_MTU),
             kind: FaceKind::Udp,
             #[cfg(all(feature = "udp-recvmmsg", target_os = "linux"))]
@@ -81,6 +85,7 @@ impl UdpFace {
             id,
             socket: Arc::new(socket),
             peer,
+            connected: false,
             mtu: AtomicUsize::new(DEFAULT_UDP_MTU),
             kind: FaceKind::Udp,
             #[cfg(all(feature = "udp-recvmmsg", target_os = "linux"))]
@@ -90,11 +95,66 @@ impl UdpFace {
 
     /// Share an existing socket (e.g. the UDP listener socket) so replies go
     /// out from the same port; `recv` filters by `peer` address.
+    /// Bind to `local_port` on the interface that routes to `peer`, with
+    /// `SO_REUSEADDR`/`SO_REUSEPORT` so it can share the port with the
+    /// listener, and `connect()` to `peer`.
+    ///
+    /// Two properties follow, and both are needed to keep ONE face per
+    /// neighbour:
+    ///
+    /// * **Symmetric source port.** Datagrams leave from `local_port` (6363),
+    ///   so the peer recognises them as coming from the face it already has
+    ///   instead of minting an on-demand face for an ephemeral port. A peer
+    ///   split across two faces defeats `nexthops_excluding(in_face)`, and
+    ///   Interests get forwarded back to their origin — measured as 12 wire
+    ///   copies per Interest against NFD's 9.
+    /// * **4-tuple delivery.** A connected socket outscores the wildcard
+    ///   listener bound to the same port, so this peer's datagrams arrive
+    ///   here. Verified on the target platform: with both sockets bound to one
+    ///   port, the peer's datagram was delivered to the connected socket.
+    ///
+    /// `connect()` was previously avoided over a claim that a connected UDP
+    /// socket wedges permanently in `EPIPE` after an ICMP port-unreachable.
+    /// Measured on Linux aarch64 and macOS, that does not happen: the error is
+    /// one-shot per ICMP (`ECONNREFUSED` on alternate sends) and the socket
+    /// keeps working. The engine classifies those as transient and keeps the
+    /// face, so a neighbour restarting its forwarder no longer costs a route.
+    #[cfg(unix)]
+    pub async fn bind_connected(
+        local_port: u16,
+        peer: SocketAddr,
+        id: FaceId,
+    ) -> std::io::Result<Self> {
+        // Bind the specific local address that routes to `peer`: a wildcard
+        // bind would collide with the listener rather than sit beside it.
+        let local = resolve_local_addr(peer, local_port)?;
+        let std_sock = super::sockopt::bind_reuseport_udp(local)?;
+        std_sock.set_nonblocking(true)?;
+        let socket = UdpSocket::from_std(std_sock)?;
+        socket.connect(peer).await?;
+        super::sockopt::tune_datagram_socket(&socket, "udp");
+        trace!(
+            target: "face.udp", face=%id, local=%local, peer=%peer,
+            "udp: bound connected face (symmetric port)"
+        );
+        Ok(Self {
+            id,
+            socket: Arc::new(socket),
+            peer,
+            connected: true,
+            mtu: AtomicUsize::new(DEFAULT_UDP_MTU),
+            kind: FaceKind::Udp,
+            #[cfg(all(feature = "udp-recvmmsg", target_os = "linux"))]
+            rx: std::sync::Mutex::new(std::collections::VecDeque::new()),
+        })
+    }
+
     pub fn from_shared_socket(id: FaceId, socket: Arc<UdpSocket>, peer: SocketAddr) -> Self {
         Self {
             id,
             socket,
             peer,
+            connected: false,
             mtu: AtomicUsize::new(DEFAULT_UDP_MTU),
             kind: FaceKind::Udp,
             #[cfg(all(feature = "udp-recvmmsg", target_os = "linux"))]
@@ -181,6 +241,18 @@ impl Transport for UdpFace {
     }
 
     async fn send_bytes(&self, wire: Bytes) -> Result<(), FaceError> {
+        // A connected socket must use `send`: passing an address to a
+        // connected UDP socket is rejected with EISCONN on some platforms.
+        if self.connected {
+            return match self.socket.try_send(&wire) {
+                Ok(_) => Ok(()),
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    self.socket.send(&wire).await?;
+                    Ok(())
+                }
+                Err(e) => Err(e.into()),
+            };
+        }
         match self.socket.try_send_to(&wire, self.peer) {
             Ok(_) => Ok(()),
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -222,6 +294,13 @@ impl UdpFace {
     #[cfg(not(all(feature = "udp-recvmmsg", target_os = "linux")))]
     async fn recv_bytes_single(&self) -> Result<Bytes, FaceError> {
         let mut buf = [0u8; UDP_RECV_BUF];
+        // Connected: the kernel already filters to this peer, so no source
+        // comparison is needed (and none of the canonicalisation caveats
+        // below apply).
+        if self.connected {
+            let n = self.socket.recv(&mut buf).await?;
+            return Ok(Bytes::copy_from_slice(&buf[..n]));
+        }
         loop {
             let (n, src) = self.socket.recv_from(&mut buf).await?;
             // Match on IP + port only, NOT the full `SocketAddr`: for an IPv6

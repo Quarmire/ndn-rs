@@ -1055,6 +1055,29 @@ pub(crate) async fn run_face_sender(
     let retx_tick_dur = std::time::Duration::from_millis(50);
 
     let handle_send_error = |e: ndn_transport::FaceError| -> bool {
+        // ICMP-derived errors say "the peer is unreachable right now", not
+        // "this face is broken". A connected UDP socket surfaces
+        // ECONNREFUSED for as long as the peer's port is closed — which is
+        // exactly what a neighbour restarting its forwarder looks like — and
+        // the socket recovers by itself the moment the peer returns (verified
+        // on Linux aarch64 and macOS: the error alternates one-shot per ICMP
+        // and the same socket keeps working afterwards).
+        //
+        // Tearing the face down here would turn every peer restart into a lost
+        // route, which is why a connected socket previously looked unusable.
+        if let ndn_transport::FaceError::Io(io) = &e {
+            use std::io::ErrorKind::*;
+            if matches!(
+                io.kind(),
+                ConnectionRefused | HostUnreachable | NetworkUnreachable | NetworkDown
+            ) {
+                tracing::debug!(
+                    target: t::FACE_SYSTEM, face=%face_id, error=%e,
+                    "transient unreachability on send, keeping the face"
+                );
+                return false;
+            }
+        }
         match persistency {
             FacePersistency::Permanent => {
                 tracing::warn!(target: t::FACE_SYSTEM, face=%face_id, error=%e, "send error on permanent face, continuing");
