@@ -770,3 +770,71 @@ Neither forwarder exposes CS hit/miss counters through `status`, so the direct
 measurement — the cache hit RATE under video on each stack — could not be
 taken. Exposing `nCsHits`/`nCsMisses` (LruCs already tracks both internally)
 is the next step, and would settle how much of NDNSF's demand is repeat demand.
+
+---
+
+## Round 14 — the real bug: CanBePrefix+MustBeFresh picked a random stale version
+
+Found by capturing packets instead of reading counters. Forty seconds of
+`ndndump -v` showed what six rounds of counter analysis could not:
+
+```
+.13 > .11/.12/.14  INTEREST: /muas/v2/wuas-01/telemetry/live?CanBePrefix&MustBeFresh&Nonce=357d53f1
+.11 > .13/.14/.12  DATA:     /muas/v2/wuas-01/telemetry/live/v=1789769525402/seg=0
+```
+
+Three facts no counter could reveal:
+1. **Every** telemetry Interest is `CanBePrefix` + `MustBeFresh`.
+2. The Data name is **versioned**, so it is strictly longer than the Interest
+   name — every hit requires a prefix match against a versioned descendant.
+3. A **peer** (.11) answers for wuas-01's telemetry from its own cache. That is
+   what NFD's cache hits actually are.
+
+### 14.1 The defect
+
+`LruCs::lookup` took `first_descendant` for a CanBePrefix Interest, then
+applied MustBeFresh to that single entry and returned a miss if it was stale,
+**never examining any other descendant**. The trie's `children` is a `HashMap`,
+so "first" is arbitrary.
+
+A `LatestPublisher` mints a new version per publication, so each prefix
+accumulates many versioned descendants of which exactly one is fresh. The
+probability of answering was ~1/N — and **caching more made it worse**, which
+is why admitting 13033 entries instead of 37 moved the hit rate not at all.
+That inversion is the clue I kept failing to explain.
+
+### 14.2 Measured effect (same telemetry workload, ndn-fwd)
+
+| | before | after | NFD |
+|---|---|---|---|
+| absolute hits | 87 | **1015** | 1096 |
+| lookups | 14385 | **1730** | 14670 |
+| hit rate | 0.60% | **58.67%** | 7.47% |
+
+Lookups collapsed 8x because a hit is satisfied locally: the Interest is never
+forwarded, never re-flooded across the mesh, never retransmitted. The fix
+removes the Interest amplification as a side effect.
+
+Correctness holds — the fix returns the *freshest admissible* descendant, and
+stale-only prefixes still miss (witness D.04 passes unmodified). Freshness is
+confirmed end to end: telemetry runs at the full ~3.3/s publish rate with ZERO
+gaps > 2 s, where stale hits would have shown as a collapsed sample rate.
+
+### 14.3 Fleet-level consequences
+
+- **Telemetry: FLIGHT-READY** for the first time in this investigation
+  (3.25/3.27/3.33 per second, no gaps), up from 1.18-2.87/s with 5-10 s gaps.
+- **Video control timeouts resolved.** Those service calls are themselves
+  CanBePrefix+MustBeFresh fetches, starved by the same broken lookup and the
+  congestion it caused. Video restored: 30.4 fps / 3830 kbps aggregate.
+
+### 14.4 Still open
+
+NFD remains ahead on video throughput (40.8 fps / 4898 kbps vs 30.4 / 3830).
+The cache bug was real and large but is not the whole gap.
+
+**Method note.** Six rounds inferred mechanisms from aggregate counters —
+lookups, hits, entries, throughput — and six were wrong. The counters could
+never have exposed this: a lookup that picks a random stale sibling and gives
+up looks exactly like "a miss". The packet capture showed the selectors and
+the versioned name structure in under a minute.
