@@ -838,3 +838,101 @@ lookups, hits, entries, throughput — and six were wrong. The counters could
 never have exposed this: a lookup that picks a random stale sibling and gives
 up looks exactly like "a miss". The packet capture showed the selectors and
 the versioned name structure in under a minute.
+
+---
+
+## Round 15 — ROOT CAUSE of the stack gap: ephemeral local port defeats loop prevention
+
+Matched A/B under current conditions, with a packet capture on each arm:
+
+| | ndn-fwd | NFD |
+|---|---|---|
+| video | 30.9 fps / 3887 kbps | **41.4 fps / 5066 kbps** |
+| packets on the medium | **2866/s** | 2115/s |
+| Interests | 133594 | 96044 |
+| idle/ack | 62573 | 39481 |
+| Interest:Data | 62.9:1 | 51.5:1 |
+
+**ndn-fwd puts 35% more packets on a shared wireless medium while delivering
+25% less video.** Unique Interests are nearly identical (11138 vs 10797), so
+this is not extra demand — it is extra *copies* of the same Interests.
+
+### 15.1 The copy count is quantised, which localises it exactly
+
+| copies per Interest | ndn-fwd | NFD |
+|---|---|---|
+| mode | **12** (82% of nonces) | **9** (87%) |
+| mean | 11.99 | 8.90 |
+
+Exactly **3 extra copies**. With 4 nodes in full mesh, 9 = origin's 3 sends +
+one clean re-forward round (3 peers x 2 others). The 3 extra are one additional
+transmission per peer — and the capture shows precisely what they are:
+
+```
+NFD      .13 > .11/.12/.14         origin
+         .11 > .12,.14             re-forward, EXCLUDES .13
+         .12 > .11,.14             EXCLUDES .13
+         .14 > .11,.12             EXCLUDES .13          = 9
+
+ndn-fwd  .13 > .14                 origin
+         .14 > .12,.11,.13   <-- sends it BACK to .13
+         .12 > .14,.11,.13   <-- back to .13
+         .11 > .12,.14,.13   <-- back to .13             = 12
+```
+
+**ndn-fwd forwards the Interest back to the node it came from.**
+
+### 15.2 Why, in one line of code
+
+`ndn-fwd/binaries/ndn-fwd/src/face_setup.rs`:
+
+```rust
+let local: std::net::SocketAddr = if peer.is_ipv4() {
+    "0.0.0.0:0".parse().unwrap()      // ephemeral local port
+```
+
+Every configured `[[face]] remote = "192.168.1.x:6363"` binds an **ephemeral**
+local port. Observed on the GCS:
+
+```
+persistent OUT: faceid=2  remote=192.168.1.11:6363   local=192.168.1.13:58437
+on-demand  IN:  faceid=29 remote=192.168.1.11:40759  local=0.0.0.0:6363
+```
+
+So each peer occupies TWO face objects. An Interest from `.11` arrives on the
+on-demand face (29); the `/muas` FIB nexthops are the persistent faces
+(2, 3, 4); `nexthops_excluding(in_face=29)` excludes nothing from that set; the
+Interest goes back out face 2 to `.11`.
+
+NFD binds symmetrically (`local=udp4://192.168.1.13:6363`), so a peer's packet
+matches the *existing* persistent face, `in_face` IS the face to that peer, and
+exclusion works.
+
+### 15.3 Impact and fix options
+
++33% Interest copies on a shared medium => +35% packets => ~30% less airtime
+for video Data, which is the measured throughput gap. It also explains the
+inflated idle/ack count: more frames to acknowledge.
+
+1. **Symmetric port bind** (matches NFD). Bind pre-connected UDP faces to
+   `:6363`. Needs `sockopt::bind_reuseport_udp` (already exists) since the
+   listener holds `0.0.0.0:6363`, and the socket should be `connect()`ed so
+   Linux prefers the 4-tuple match over the wildcard listener. Also requires
+   the inbound demux to map a packet from `<ip>:6363` onto the existing
+   persistent face instead of minting an on-demand one.
+2. **Endpoint-based exclusion** in the strategy: exclude nexthops whose face
+   remote IP equals the ingress face's remote IP — "never send an Interest back
+   to the node it came from". Smaller and local to `multicast.rs`, but needs
+   face-table access in the strategy, and conflates two forwarders sharing one
+   host.
+
+(1) is the correct architectural fix; (2) is the safer immediate mitigation.
+Neither is implemented — this is a forwarding-semantics change and the session
+had already destabilised the fleet once.
+
+### 15.4 Method
+
+Six rounds of counter-level inference produced six wrong mechanisms. The
+answer came from `ndndump -v`: tracking ONE nonce across the mesh showed the
+extra copies going back to the originator, and the face table then showed why
+in a single line of setup code. **Capture packets before theorising.**
