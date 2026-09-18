@@ -604,3 +604,51 @@ Caveat on method: the handoff delta in this run was unusable (it reported more
 Data arriving than published — the local-face sum includes non-video traffic,
 and the run was backlog-contaminated, `first_frame=-3.0s`). The conclusion
 above rests on the chunk-rate arithmetic, not on that delta.
+
+---
+
+## Round 8 — the local-face handoff costs the SAME on both stacks
+
+§7.2 proposed that NFD's throughput lead came from a cheaper handoff of Data to
+the local face, since the video publish loop is self-paced and a slower handoff
+lowers the frame rate directly. Measured directly (timing `stream.push()` per
+Data packet and `stream.flush()` per frame in the producer, signing excluded,
+90-100 s 3-stream runs on each cell):
+
+| p50 | ndn-fwd | NFD |
+|---|---|---|
+| push, node-02 | 1917 us | 1916 us |
+| push, node-04 | 2154 us | 2070 us |
+| flush, node-02 | 11073 us | 11256 us |
+| flush, node-04 | 12411 us | 12188 us |
+
+The threshold for the hypothesis to hold was +4 ms/push or +23 ms/flush.
+Observed: +0.08 ms and +0.2 ms, and on node-02 ndn-fwd is marginally FASTER.
+**Hypothesis rejected.** The handoff is not where ndn-fwd loses. Its throughput
+deficit versus NFD remains unexplained.
+
+### 8.1 What the measurement found instead: a ~23 ms/frame publish tax
+
+~2 ms per push and ~11-12 ms per flush, on BOTH stacks. At ~5.65 chunks/frame
+that is ~23 ms of publish-path cost per frame against a 69 ms budget at 15 fps
+-- a third of the frame period, before capture or encode. It is load- and
+stack-insensitive, which points at fixed per-packet work.
+
+`LiveStreamPublisher::publishSignedData` (Stream.cpp) calls
+`verifyPredictiveSourceSignature` on EVERY push, which does
+`getIdentity -> getKey -> getCertificate` against the PIB and then a full
+`verifySignature`. So the producer signs a packet and NDNSF immediately
+verifies the signature it just created, at roughly 5x the cost of creating it
+(signing is 0.39 ms since the KeyChain-caching fix), with keychain access on
+the hot path.
+
+Same defect class as the per-call `ndn::KeyChain` in the Python binding fixed
+earlier -- keychain work repeated per packet on a hot path -- but in NDNSF's
+core rather than its wrapper. This is now the dominant producer-side cost and
+is worth far more than the forwarder difference being chased.
+
+Caveat: the NFD timing sample came from a run whose video was partly degraded
+(one vehicle at 6.6 fps, another at zero), the ndn-fwd sample from a healthy
+one. The push/flush medians are nearly identical across both despite that
+difference in load, which is consistent with fixed per-packet cost, but a
+matched-health repeat would firm it up.
