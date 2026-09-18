@@ -26,6 +26,8 @@ fn general_status_dataset(engine: &ForwarderEngine) -> bytes::Bytes {
         n_fib_entries: engine.fib().dump().len() as u64,
         n_pit_entries: engine.pit().len() as u64,
         n_cs_entries: engine.cs().len() as u64,
+        n_cs_hits: engine.cs().stats().hits,
+        n_cs_misses: engine.cs().stats().misses,
         ..Default::default()
     };
     status.encode()

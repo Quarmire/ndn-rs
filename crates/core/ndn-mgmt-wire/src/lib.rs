@@ -68,6 +68,18 @@ pub mod tlv {
     pub const N_OUT_NACKS: u64 = 152; // 0x98
     pub const N_SATISFIED_INTERESTS: u64 = 153; // 0x99
     pub const N_UNSATISFIED_INTERESTS: u64 = 154; // 0x9a
+
+    // ndn-rs extensions, project-private range (NFD clients ignore unknown
+    // non-critical codes, so these are additive on the wire).
+    //
+    // NFD reports these two in its separate CsInfo dataset
+    // (/localhost/nfd/cs/info, NHits=129 NMisses=130). Carrying them on the
+    // general status instead is a deliberate shortcut: it makes the cache hit
+    // RATE observable without standing up a whole dataset, which is what was
+    // needed to answer whether a workload's demand is repeat demand. A
+    // conformant CsInfo module remains the right long-term home.
+    pub const N_CS_HITS: u64 = 208; // 0xd0
+    pub const N_CS_MISSES: u64 = 209; // 0xd1
 }
 
 /// NFD ForwarderStatus (general status dataset). All numeric fields are
@@ -90,6 +102,11 @@ pub struct GeneralStatus {
     pub n_out_nacks: u64,
     pub n_satisfied_interests: u64,
     pub n_unsatisfied_interests: u64,
+    /// Content Store lookups satisfied from cache.
+    pub n_cs_hits: u64,
+    /// Content Store lookups that fell through (absent, stale under
+    /// MustBeFresh, digest mismatch, or serving disabled).
+    pub n_cs_misses: u64,
 }
 
 /// Decode failure: a required field was missing or a count was malformed.
@@ -153,6 +170,8 @@ impl GeneralStatus {
         nni(tlv::N_OUT_NACKS, self.n_out_nacks);
         nni(tlv::N_SATISFIED_INTERESTS, self.n_satisfied_interests);
         nni(tlv::N_UNSATISFIED_INTERESTS, self.n_unsatisfied_interests);
+        nni(tlv::N_CS_HITS, self.n_cs_hits);
+        nni(tlv::N_CS_MISSES, self.n_cs_misses);
         w.finish()
     }
 
@@ -180,6 +199,8 @@ impl GeneralStatus {
                         tlv::N_PIT_ENTRIES => s.n_pit_entries = v,
                         tlv::N_MEASUREMENTS_ENTRIES => s.n_measurements_entries = v,
                         tlv::N_CS_ENTRIES => s.n_cs_entries = v,
+                        tlv::N_CS_HITS => s.n_cs_hits = v,
+                        tlv::N_CS_MISSES => s.n_cs_misses = v,
                         tlv::N_IN_INTERESTS => s.n_in_interests = v,
                         tlv::N_IN_DATA => s.n_in_data = v,
                         tlv::N_IN_NACKS => s.n_in_nacks = v,
@@ -315,6 +336,8 @@ mod tests {
             n_fib_entries: 3,
             n_pit_entries: 1,
             n_cs_entries: 2,
+            n_cs_hits: 41,
+            n_cs_misses: 59,
             n_in_interests: 10,
             n_out_data: 9,
             n_satisfied_interests: 9,
