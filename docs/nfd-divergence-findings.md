@@ -936,3 +936,73 @@ Six rounds of counter-level inference produced six wrong mechanisms. The
 answer came from `ndndump -v`: tracking ONE nonce across the mesh showed the
 extra copies going back to the originator, and the face table then showed why
 in a single line of setup code. **Capture packets before theorising.**
+
+---
+
+## Round 16 — the permanent fix: symmetric port + connected peer sockets
+
+§15 identified the root cause (ephemeral local port splits each peer across two
+face objects, so `nexthops_excluding(in_face)` misses one and Interests are
+forwarded back to their origin) and shipped a mitigation. This is the repair.
+
+Peer faces now bind the listener's port with `SO_REUSEADDR`/`SO_REUSEPORT` and
+`connect()` to the peer. Symmetric source port means the neighbour recognises
+the face it already has; the connected 4-tuple outscores the wildcard listener
+so the peer's datagrams land on that face. Per-peer RX parallelism and socket
+buffers are preserved.
+
+**Verified on all four nodes:** exactly 3 UDP faces per node, one per peer,
+every one `local=…:6363`, zero on-demand duplicates, zero bind errors.
+
+### 16.1 Three things that had to be disproved or fixed, each by measurement
+
+1. **The `EPIPE` warning that blocked this route is false.** `UdpFace`
+   documented a connected UDP socket as wedging permanently after an ICMP
+   port-unreachable. Measured against a real peer on Linux aarch64 AND macOS:
+   `['ok','ECONNREFUSED','ok','ECONNREFUSED',…]` — one-shot per ICMP, and
+   re-pointing the same socket at a live port succeeds. Not permanent on
+   either platform.
+2. **Those `ECONNREFUSED`s were the real hazard.** `handle_send_error` closes a
+   face on any send error, so a neighbour restarting its forwarder would cost a
+   route. ICMP-derived errors are now transient (logged, face kept) — correct
+   independently of this change.
+3. **The listener bound without `SO_REUSEPORT`.** Peer faces would have failed
+   with `EADDRINUSE` and nodes would have come up with NO fabric. Caught by
+   binding `:6363` beside the live forwarder BEFORE deploying.
+
+### 16.2 A bug this introduced, and how it was caught
+
+`udp-recvmmsg` is a DEFAULT feature, so Linux runs `recv_bytes_batched`, not
+`recv_bytes_single`. Only the latter was patched. The batched path compares each
+datagram's source against the peer — but a connected socket is filtered by the
+kernel, which need not populate that source, so every datagram was dropped and
+faces went silent on healthy links. Fleet telemetry fell from ~3.3/s to ~0.42/s.
+
+The face-table check looked perfect throughout; only the traffic check exposed
+it. **Patch the path that executes, not the path you happened to read.**
+
+### 16.3 Measured effect, with its confound stated
+
+| | before | after |
+|---|---|---|
+| copies per Interest | mean 11.99, mode 12 | **mean 2.37, max 4** |
+| NFD reference | mean 8.90, mode 9 | — |
+
+**Not a like-for-like comparison.** The "before" ran under 3-stream video
+(2866 pkt/s); video is currently broken by an unrelated control-timeout fault,
+so the "after" ran at 55 pkt/s. Fewer concurrent Interests means less flooding
+overlap, and some of the drop belongs to the lighter load. The structural claim
+that stands on its own is the face table: one face per peer, which is what made
+the return-to-origin forwarding possible.
+
+### 16.4 Open
+
+* **Video control times out fleet-wide** — predates the socket work (first seen
+  after an `admission_policy=admit-all` experiment was reverted, and not
+  restored by rolling back to the known-good build). Blocks any matched
+  throughput comparison against NFD.
+* **iuas-02 telemetry sits at ~1.0/s** where iuas-01 runs 3.27/s clean. Its
+  agent is healthy (0 errors, 36 routes, 3 faces). Node-04 also logs
+  `morse_spi_probe failed`, so this may be hardware rather than forwarding.
+* Nacks are fleet-wide (12-84 per face) on every node including healthy ones,
+  so they are not the cause of the above.
