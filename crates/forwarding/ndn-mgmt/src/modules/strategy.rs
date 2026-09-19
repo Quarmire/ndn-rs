@@ -69,7 +69,7 @@ fn handle_strategy(
 /// Instantiate a strategy by its NFD-style name via
 /// [`ndn_strategy::registry`]. Built-ins register at static-init time;
 /// external crates plug in via `ndn_strategy::register_strategy!`.
-fn create_strategy_by_name(name: &Name) -> Option<Arc<dyn ErasedStrategy>> {
+pub fn create_strategy_by_name(name: &Name) -> Option<Arc<dyn ErasedStrategy>> {
     let comps = name.components();
     let (short_name, version) = if comps.len() >= 4
         && comps[0].value.as_ref() == b"localhost"

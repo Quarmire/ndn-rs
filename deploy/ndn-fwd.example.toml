@@ -88,6 +88,24 @@ enabled        = true
 signaling_url  = "http://localhost:8888"
 session_ids    = ["public-rendezvous"]
 
+# ── Strategy choices ──────────────────────────────────────────────────────────
+# Zero or more [[strategy]] entries pre-load the strategy table at startup,
+# exactly as `ndn-ctl strategy set` would. Prefixes not listed inherit the
+# nearest enclosing choice, defaulting to best-route at `/`.
+#
+# Declare a strategy here rather than applying it from a post-start script:
+# the strategy table lives only in memory, so a script-applied choice is lost
+# on every forwarder restart — silently, and while [[route]] entries survive.
+# A prefix that must reach ALL nexthops (sync-group fan-out, for example) then
+# quietly reverts to a single best-route nexthop.
+
+# [[strategy]]
+# prefix = "/muas"
+# Fully qualified, optionally with a /v=N version, or the bare registry short
+# name ("multicast"). An unknown name is logged as an error and the prefix is
+# left on the default strategy.
+# strategy = "/localhost/nfd/strategy/multicast"
+
 # ── Management ────────────────────────────────────────────────────────────────
 
 [management]

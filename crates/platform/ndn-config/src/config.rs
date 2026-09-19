@@ -16,6 +16,15 @@ pub struct ForwarderConfig {
     #[serde(default, rename = "route")]
     pub routes: Vec<RouteConfig>,
 
+    /// Boot-time strategy choices. Strategy selection is otherwise only
+    /// reachable over the management socket, so a forwarder restart silently
+    /// reverts every prefix to the default strategy while `[[route]]` entries
+    /// survive — a fleet that configures multicast out-of-band loses it on
+    /// every restart with no error anywhere. Declaring them here keeps the
+    /// strategy table part of the forwarder's own config, like routes.
+    #[serde(default, rename = "strategy")]
+    pub strategies: Vec<StrategyConfig>,
+
     #[serde(default)]
     pub management: ManagementConfig,
 
@@ -1343,6 +1352,17 @@ fn default_cost() -> u32 {
     10
 }
 
+/// One `[[strategy]]` entry: the forwarding strategy to install for a name
+/// prefix at startup, equivalent to a `strategy-choice/set` command.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct StrategyConfig {
+    pub prefix: String,
+    /// NFD-style strategy name, either fully qualified
+    /// (`/localhost/nfd/strategy/multicast`, optionally with a `/v=N`
+    /// version) or the bare registry short name (`multicast`).
+    pub strategy: String,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ManagementConfig {
     /// Unix domain socket (or Named Pipe on Windows) for app/tool faces.
@@ -1801,6 +1821,32 @@ channel = 161
         let toml = "[[route]]\nprefix = \"/x\"\nface = 0\n";
         let cfg = ForwarderConfig::from_str(toml).unwrap();
         assert_eq!(cfg.routes[0].cost, 10);
+    }
+
+    #[test]
+    fn strategy_choices_parse() {
+        // Boot-time strategy choices must round-trip from TOML; the fleet
+        // regression they exist to prevent is a restart silently dropping
+        // /muas back to best-route while [[route]] entries survive.
+        let toml = concat!(
+            "[[strategy]]\nprefix = \"/muas\"\n",
+            "strategy = \"/localhost/nfd/strategy/multicast\"\n",
+            "[[strategy]]\nprefix = \"/x\"\nstrategy = \"multicast\"\n",
+        );
+        let cfg = ForwarderConfig::from_str(toml).unwrap();
+        assert_eq!(cfg.strategies.len(), 2);
+        assert_eq!(cfg.strategies[0].prefix, "/muas");
+        assert_eq!(
+            cfg.strategies[0].strategy,
+            "/localhost/nfd/strategy/multicast"
+        );
+        assert_eq!(cfg.strategies[1].strategy, "multicast");
+    }
+
+    #[test]
+    fn strategy_section_is_optional() {
+        let cfg = ForwarderConfig::from_str("[[route]]\nprefix = \"/x\"\nface = 0\n").unwrap();
+        assert!(cfg.strategies.is_empty());
     }
 
     #[test]

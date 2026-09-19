@@ -57,7 +57,7 @@ pub use modules::faces::provision::{
 };
 pub use modules::faces::{FaceEvent, FaceEventKind};
 pub use modules::rib::{RouteEvent, RouteEventKind};
-pub use modules::strategy::{StrategyEvent, StrategyEventKind};
+pub use modules::strategy::{StrategyEvent, StrategyEventKind, create_strategy_by_name};
 pub use ndn_mgmt_wire::{ControlInfo, ControlStats, ControlSurface};
 pub use notification::{NotificationEvent, NotificationStream};
 
