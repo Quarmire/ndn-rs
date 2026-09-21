@@ -391,7 +391,32 @@ impl LpReliability {
             //
             // Only frames below the ack are eligible: `unacked` is ordered by
             // TxSequence, so that is the range below `ack_seq`.
+            // A frame is only EVIDENCE of loss once it has had a fair chance
+            // to be acked. One network packet fragments into several LP frames
+            // sent back-to-back, so acks for its siblings arrive within
+            // microseconds of each other and in no guaranteed order. Counting
+            // those against a frame declares it lost while it is still in
+            // flight, and the "repair" is pure waste: it spends airtime on a
+            // medium that is already the binding constraint, which makes the
+            // congestion it is reacting to worse.
+            //
+            // Measured on the fleet at heavy video load: the GCS received 9023
+            // duplicate frames from iuas-01 against 13968 Data in the same
+            // window, i.e. roughly HALF of all fast retransmits were spurious
+            // and ~13% of fragments were transmitted twice for nothing.
+            //
+            // So require a frame to have been outstanding for at least one
+            // smoothed RTT before ack ordering may condemn it. Genuine loss is
+            // still caught -- the frame simply waits one RTT longer than the
+            // sibling acks that used to convict it instantly. Before the first
+            // RTT sample srtt is 0 and this is a no-op, matching the old
+            // behaviour on a cold face.
+            let loss_grace_us = self.srtt_us as u64;
             for (&seq, entry) in self.unacked.range_mut(..ack_seq) {
+                let outstanding_us = now.duration_since(entry.first_sent).as_micros() as u64;
+                if loss_grace_us > 0 && outstanding_us < loss_grace_us {
+                    continue;
+                }
                 entry.n_greater_seq_acks += 1;
                 if entry.n_greater_seq_acks == SEQ_NUM_LOSS_THRESHOLD {
                     self.fast_retx_candidates.push(seq);
