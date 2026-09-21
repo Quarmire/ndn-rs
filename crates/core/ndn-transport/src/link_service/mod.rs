@@ -136,7 +136,7 @@ pub trait LinkService: Send + Sync + 'static {
     /// `(n_lp_resent_packets, rto_micros, n_lp_rto_expirations,
     /// n_lp_unacked_evictions, n_lp_fast_retx)` if a `ReliabilityFeature` is
     /// present.
-    fn reliability_counters(&self) -> Option<(u64, u64, u64, u64, u64, u64)> {
+    fn reliability_counters(&self) -> Option<(u64, u64, u64, u64, u64, u64, u64, u64)> {
         None
     }
 
@@ -578,7 +578,7 @@ impl LinkService for LpLinkService {
         self.features.iter().map(|f| f.name()).collect()
     }
 
-    fn reliability_counters(&self) -> Option<(u64, u64, u64, u64, u64, u64)> {
+    fn reliability_counters(&self) -> Option<(u64, u64, u64, u64, u64, u64, u64, u64)> {
         Some((
             self.reliability_feature.n_lp_resent_packets(),
             self.reliability_feature.rto_micros(),
@@ -590,6 +590,8 @@ impl LinkService for LpLinkService {
             // only consumed airtime. Without it, fast-retx alone cannot
             // distinguish a lossy link from a too-eager loss detector.
             self.reliability_feature.n_lp_duplicate_frames(),
+            self.reliability_feature.n_lp_acks_sent(),
+            self.reliability_feature.n_lp_acks_received(),
         ))
     }
 

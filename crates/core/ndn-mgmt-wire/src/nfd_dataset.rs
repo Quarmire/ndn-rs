@@ -72,6 +72,12 @@ mod tlv {
     /// Inbound LP frames dropped as duplicates — a peer retransmission
     /// whose original had already arrived, i.e. SPURIOUS retransmission.
     pub const N_LP_DUPLICATE_FRAMES: u64 = 0xeb;
+    /// Ack entries this face handed to the wire. Read against the PEER's
+    /// N_LP_ACKS_RECEIVED: a shortfall means ack-bearing frames are being
+    /// lost, and each lost frame takes up to MAX_PIGGYBACKED_ACKS acks with
+    /// it, so the sender sees only a later batch and condemns everything
+    /// below it.
+    pub const N_LP_ACKS_SENT: u64 = 0xec;
 
     pub const ENTRY: u64 = 0x80;
     pub const NEXT_HOP_RECORD: u64 = 0x81;
@@ -200,6 +206,8 @@ pub struct FaceStatus {
     /// `n_lp_fast_retx`: retransmits that show up here as duplicates were
     /// not repairing loss, they were wasting airtime.
     pub n_lp_duplicate_frames: Option<u64>,
+    /// See [`tlv::N_LP_ACKS_SENT`].
+    pub n_lp_acks_sent: Option<u64>,
     /// Fragments rejected by the reassembler AFTER being Acked.
     pub n_reasm_fragments_rejected: Option<u64>,
     /// Partial groups evicted under memory pressure.
@@ -284,6 +292,9 @@ impl FaceStatus {
             if let Some(v) = self.n_lp_duplicate_frames {
                 write_non_neg_int(w, tlv::N_LP_DUPLICATE_FRAMES, v);
             }
+            if let Some(v) = self.n_lp_acks_sent {
+                write_non_neg_int(w, tlv::N_LP_ACKS_SENT, v);
+            }
             if let Some(v) = self.n_lp_unacked_evictions {
                 write_non_neg_int(w, tlv::N_LP_UNACKED_EVICTIONS, v);
             }
@@ -342,6 +353,7 @@ impl FaceStatus {
         let mut n_lp_unacked_evictions = None;
         let mut n_lp_fast_retx = None;
         let mut n_lp_duplicate_frames = None;
+        let mut n_lp_acks_sent = None;
         let mut n_reasm_fragments_rejected = None;
         let mut n_reasm_groups_evicted = None;
 
@@ -376,6 +388,7 @@ impl FaceStatus {
                 tlv::N_LP_RESENT_PACKETS => n_lp_resent_packets = read_non_neg_int(&v),
                 tlv::N_LP_FAST_RETX => n_lp_fast_retx = read_non_neg_int(&v),
                 tlv::N_LP_DUPLICATE_FRAMES => n_lp_duplicate_frames = read_non_neg_int(&v),
+                tlv::N_LP_ACKS_SENT => n_lp_acks_sent = read_non_neg_int(&v),
                 tlv::N_LP_RTO_EXPIRATIONS => n_lp_rto_expirations = read_non_neg_int(&v),
                 tlv::N_CONGESTION_MARKS_SENT => n_congestion_marks_sent = read_non_neg_int(&v),
                 tlv::N_CONGESTION_MARKS_RECEIVED => {
@@ -449,6 +462,7 @@ impl FaceStatus {
             n_lp_unacked_evictions,
             n_lp_fast_retx,
             n_lp_duplicate_frames,
+            n_lp_acks_sent,
             n_reasm_fragments_rejected,
             n_reasm_groups_evicted,
         })
@@ -984,6 +998,7 @@ mod tests {
             n_lp_unacked_evictions: Some(20),
             n_lp_fast_retx: Some(9),
             n_lp_duplicate_frames: Some(11),
+            n_lp_acks_sent: Some(12),
             n_reasm_fragments_rejected: Some(21),
             n_reasm_groups_evicted: Some(22),
         };

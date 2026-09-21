@@ -187,6 +187,17 @@ impl ReliabilityFeature {
 
     /// Inbound frames dropped as peer retransmissions of an already-received
     /// frame (see `LpReliability::on_receive`).
+    /// Ack entries handed to the wire. Read against the PEER's
+    /// `n_lp_acks_received`: a shortfall means ack-bearing frames are being
+    /// lost, which makes the sender condemn everything below the next batch.
+    pub fn n_lp_acks_sent(&self) -> u64 {
+        self.state.lock().unwrap().acks_sent()
+    }
+
+    pub fn n_lp_acks_received(&self) -> u64 {
+        self.state.lock().unwrap().acks_received()
+    }
+
     pub fn n_lp_duplicate_frames(&self) -> u64 {
         self.state.lock().unwrap().duplicate_frames()
     }

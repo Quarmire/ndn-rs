@@ -179,6 +179,14 @@ pub struct LpReliability {
     /// Inbound frames dropped as duplicates (a peer retransmission whose
     /// original already arrived).
     duplicate_frames: u64,
+    /// Ack entries handed to the wire (piggybacked on a data frame or flushed
+    /// as a standalone Ack). Compare against the PEER's `acks_received`: each
+    /// batch rides ONE frame, so losing that frame loses up to
+    /// `MAX_PIGGYBACKED_ACKS` acks at once, and the sender then sees only the
+    /// later batch and condemns everything below it.
+    acks_sent: u64,
+    /// Ack entries extracted from inbound frames.
+    acks_received: u64,
 }
 
 fn initial_rto_for(strategy: &RtoStrategy) -> u64 {
@@ -218,6 +226,8 @@ impl LpReliability {
             recent_recv: HashMap::new(),
             recent_recv_order: VecDeque::new(),
             duplicate_frames: 0,
+            acks_sent: 0,
+            acks_received: 0,
         }
     }
 
@@ -250,6 +260,7 @@ impl LpReliability {
             .pending_acks
             .drain(..self.pending_acks.len().min(MAX_PIGGYBACKED_ACKS))
             .collect();
+        self.acks_sent += acks.len() as u64;
 
         let ack_overhead = acks.len() * 10;
         let payload_cap = self
@@ -351,6 +362,7 @@ impl LpReliability {
     /// would make it retransmit again.
     pub fn on_receive(&mut self, raw: &[u8]) -> bool {
         let (tx_seq, acks) = extract_acks(raw);
+        self.acks_received += acks.len() as u64;
 
         let mut is_duplicate = false;
         if let Some(seq) = tx_seq {
@@ -468,6 +480,19 @@ impl LpReliability {
     }
 
     /// Frames retransmitted early because acks for later TxSequences arrived.
+    pub fn acks_sent(&self) -> u64 {
+        self.acks_sent
+    }
+
+    pub fn acks_received(&self) -> u64 {
+        self.acks_received
+    }
+
+    /// Ack entries still queued, waiting for an outgoing frame to ride.
+    pub fn acks_pending(&self) -> usize {
+        self.pending_acks.len()
+    }
+
     pub fn fast_retx(&self) -> u64 {
         self.fast_retx
     }
@@ -518,6 +543,7 @@ impl LpReliability {
             return None;
         }
         let acks: Vec<u64> = self.pending_acks.drain(..).collect();
+        self.acks_sent += acks.len() as u64;
         Some(encode_lp_acks(&acks))
     }
 

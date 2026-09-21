@@ -97,16 +97,20 @@ pub(super) fn faces_list_dataset(engine: &ForwarderEngine) -> bytes::Bytes {
             n_lp_unacked_evictions,
             n_lp_fast_retx,
             n_lp_duplicate_frames,
+            n_lp_acks_sent,
+            n_lp_acks_received,
         ) = match reliability_counters {
-            Some((resent, rto, expired, evicted, fast, dup)) => (
+            Some((resent, rto, expired, evicted, fast, dup, asent, arecv)) => (
                 Some(resent),
                 Some(rto),
                 Some(expired),
                 Some(evicted),
                 Some(fast),
                 Some(dup),
+                Some(asent),
+                Some(arecv),
             ),
-            None => (None, None, None, None, None, None),
+            None => (None, None, None, None, None, None, None, None),
         };
         // Per-face NDNLPv2 reassembly counters (engine-side: the buffer lives in
         // the dispatcher's decode stage, not the LinkService).
@@ -156,7 +160,7 @@ pub(super) fn faces_list_dataset(engine: &ForwarderEngine) -> bytes::Bytes {
             n_satisfied_interests,
             n_unsatisfied_interests,
             flags: face_flags,
-            n_lp_acks_received: None,
+            n_lp_acks_received,
             n_lp_resent_packets,
             n_lp_rto_expirations,
             n_congestion_marks_sent,
@@ -171,6 +175,7 @@ pub(super) fn faces_list_dataset(engine: &ForwarderEngine) -> bytes::Bytes {
             n_lp_unacked_evictions,
             n_lp_fast_retx,
             n_lp_duplicate_frames,
+            n_lp_acks_sent,
             n_reasm_fragments_rejected,
             n_reasm_groups_evicted,
         };
