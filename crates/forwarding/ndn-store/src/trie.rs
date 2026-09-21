@@ -109,6 +109,18 @@ impl<V: Clone + Send + Sync + 'static> NameTrie<V> {
     }
 
     pub fn remove(&self, name: &Name) {
+        // Remember the path so empty nodes can be pruned on the way back up.
+        //
+        // This used to clear `entry` and stop, leaving the node itself in its
+        // parent's `children` map forever. Every name ever inserted then
+        // leaked its whole chain of nodes, even after the value was removed --
+        // and for the Content Store's prefix index that is one chain per
+        // unique Data name. A live video stream mints a fresh name per chunk,
+        // so on a 3-airframe fleet the forwarder grew ~1-1.5 GB/day and hit
+        // hard memory exhaustion in about three days (2.9 GB RSS on a 3.7 GB
+        // node with no swap), while the CS itself sat correctly at its 64 MB
+        // cap -- the entry count plateaued and RSS kept climbing to 45x it.
+        let mut path: Vec<(Arc<RwLock<TrieNode<V>>>, NameComponent)> = Vec::new();
         let mut current = Arc::clone(&self.root);
         for component in name.components() {
             let child = {
@@ -117,11 +129,55 @@ impl<V: Clone + Send + Sync + 'static> NameTrie<V> {
             };
             match child {
                 None => return,
-                Some(c) => current = c,
+                Some(c) => {
+                    path.push((Arc::clone(&current), component.clone()));
+                    current = c;
+                }
             }
         }
-        let mut node = current.write().unwrap();
-        node.entry = None;
+        {
+            let mut node = current.write().unwrap();
+            node.entry = None;
+            if !node.children.is_empty() {
+                // Still needed as an interior node on some other name's path.
+                return;
+            }
+        }
+        drop(current);
+        // Walk back up dropping nodes that now hold neither a value nor any
+        // children. Stop at the first one that is still needed. Locks are
+        // always taken parent-then-child here, the same order every descent
+        // uses, so this cannot deadlock against a concurrent lookup; a reader
+        // already holding an Arc to a pruned node keeps it alive and simply
+        // finds nothing.
+        for (parent, component) in path.into_iter().rev() {
+            let mut parent_node = parent.write().unwrap();
+            let prunable = match parent_node.children.get(&component) {
+                Some(child) => match child.try_read() {
+                    Ok(c) => c.entry.is_none() && c.children.is_empty(),
+                    // Somebody is working in that subtree; leave it.
+                    Err(_) => false,
+                },
+                None => false,
+            };
+            if !prunable {
+                break;
+            }
+            parent_node.children.remove(&component);
+        }
+    }
+
+    /// Total nodes currently allocated, excluding the root.
+    ///
+    /// Exists so the "remove leaves the node behind" regression is observable:
+    /// entry counts alone cannot see it, which is why it grew unbounded in the
+    /// field for days while every other table looked correct.
+    pub fn node_count(&self) -> usize {
+        fn count<V>(node: &Arc<RwLock<TrieNode<V>>>) -> usize {
+            let n = node.read().unwrap();
+            n.children.values().map(|c| 1 + count(c)).sum()
+        }
+        count(&self.root)
     }
 
     pub fn dump(&self) -> Vec<(Name, V)> {
@@ -224,6 +280,54 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use ndn_packet::{Name, NameComponent};
+
+    #[test]
+    fn remove_prunes_empty_nodes_instead_of_leaking_them() {
+        // The field failure this guards: `remove` cleared the value but left
+        // the node in its parent's children map, so every unique name ever
+        // inserted leaked its whole chain. The Content Store's prefix index
+        // sees one unique name per video chunk, so the forwarder grew
+        // ~1-1.5 GB/day and exhausted a 3.7 GB node in ~3 days while the CS
+        // entry count sat correctly at its cap.
+        let trie: NameTrie<u32> = NameTrie::new();
+        assert_eq!(trie.node_count(), 0);
+
+        // Churn distinct names the way a live stream mints cursors.
+        for i in 0..500u32 {
+            let n = name(&["muas", "v2", "iuas-01", "video", &i.to_string()]);
+            trie.insert(&n, i);
+            trie.remove(&n);
+        }
+        // Every one was removed, so nothing may remain allocated.
+        assert_eq!(
+            trie.node_count(),
+            0,
+            "removed names left trie nodes behind — this is the unbounded leak"
+        );
+    }
+
+    #[test]
+    fn remove_keeps_nodes_that_are_still_needed() {
+        let trie: NameTrie<u32> = NameTrie::new();
+        let parent = name(&["a", "b"]);
+        let child = name(&["a", "b", "c"]);
+        trie.insert(&parent, 1);
+        trie.insert(&child, 2);
+
+        // Removing the child must not disturb the parent's entry.
+        trie.remove(&child);
+        assert_eq!(trie.get(&parent), Some(1));
+        assert_eq!(trie.get(&child), None);
+
+        // Removing a prefix that still has descendants must keep the path.
+        trie.insert(&child, 3);
+        trie.remove(&parent);
+        assert_eq!(trie.get(&child), Some(3));
+        assert_eq!(trie.get(&parent), None);
+
+        trie.remove(&child);
+        assert_eq!(trie.node_count(), 0);
+    }
 
     fn name(components: &[&str]) -> Name {
         Name::from_components(
