@@ -96,15 +96,17 @@ pub(super) fn faces_list_dataset(engine: &ForwarderEngine) -> bytes::Bytes {
             n_lp_rto_expirations,
             n_lp_unacked_evictions,
             n_lp_fast_retx,
+            n_lp_duplicate_frames,
         ) = match reliability_counters {
-            Some((resent, rto, expired, evicted, fast)) => (
+            Some((resent, rto, expired, evicted, fast, dup)) => (
                 Some(resent),
                 Some(rto),
                 Some(expired),
                 Some(evicted),
                 Some(fast),
+                Some(dup),
             ),
-            None => (None, None, None, None, None),
+            None => (None, None, None, None, None, None),
         };
         // Per-face NDNLPv2 reassembly counters (engine-side: the buffer lives in
         // the dispatcher's decode stage, not the LinkService).
@@ -168,6 +170,7 @@ pub(super) fn faces_list_dataset(engine: &ForwarderEngine) -> bytes::Bytes {
             n_reasm_fragments_wasted,
             n_lp_unacked_evictions,
             n_lp_fast_retx,
+            n_lp_duplicate_frames,
             n_reasm_fragments_rejected,
             n_reasm_groups_evicted,
         };
