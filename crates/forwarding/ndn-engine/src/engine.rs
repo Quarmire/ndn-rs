@@ -1052,7 +1052,29 @@ pub(crate) async fn run_face_sender(
     // faces (the ones that fragment, where a single lost fragment kills a whole
     // group) get a 10 ms pump; everything else keeps 50 ms, since stream faces
     // do not fragment and their kernel already retransmits.
-    let retx_tick_dur = std::time::Duration::from_millis(50);
+    // Two cadences on one timer, matching NFD's LpReliability.
+    //
+    // NFD flushes pending Acks on `idleAckTimerPeriod` = 5 ms and runs
+    // retransmission off the per-fragment RTO. We had BOTH bound to this one
+    // 50 ms tick, so an Ack could sit 10x longer than NFD's before going out.
+    //
+    // That delay is what manufactures the retransmit storm. Acks accumulate
+    // while they wait and up to MAX_PIGGYBACKED_ACKS=16 then ride a single
+    // frame, and the receiver's loss detector adds +1 per acked TxSequence --
+    // so ONE late-arriving batch adds +16 to a frame that merely arrived out
+    // of order and blows past seqNumLossThreshold=3 instantly, while that
+    // frame's own Ack is still queued behind the others.
+    //
+    // Measured on the fleet before this change: acks deliver at 99.8%, yet
+    // ~20% of fragments were fast-retransmitted and ~46% of those were
+    // spurious (the GCS logged 6795 duplicates against 14850 retransmits in
+    // 120 s). So the acks were not being LOST, they were being BATCHED.
+    //
+    // Tick at NFD's 5 ms and flush Acks every tick; pump retransmissions every
+    // RETX_TICKS-th tick so the retransmission cadence is unchanged at 50 ms.
+    let ack_tick_dur = std::time::Duration::from_millis(5);
+    const RETX_TICKS: u32 = 10;
+    let retx_tick_dur = ack_tick_dur;
 
     let handle_send_error = |e: ndn_transport::FaceError| -> bool {
         // ICMP-derived errors say "the peer is unreachable right now", not
@@ -1122,6 +1144,7 @@ pub(crate) async fn run_face_sender(
     // sleep instead of restarting it.
     let tick_nanos = retx_tick_dur.as_nanos() as u64;
     let mut next_tick = runtime.unix_nanos().saturating_add(tick_nanos);
+    let mut tick_count: u32 = 0;
     loop {
         let until = std::time::Duration::from_nanos(
             next_tick.saturating_sub(runtime.unix_nanos()),
@@ -1206,14 +1229,19 @@ pub(crate) async fn run_face_sender(
                 next_tick = runtime.unix_nanos().saturating_add(tick_nanos);
                 // Pump the reliability feature's retransmissions and standalone
                 // Acks onto the egress path. Both are empty when disabled.
+                tick_count = tick_count.wrapping_add(1);
                 if let Some(feature) = lp_reliability_feature.as_ref() {
-                    for wire in feature.take_retransmissions() {
-                        if let Err(e) = face.send_bytes(wire).await
-                            && handle_send_error(e)
-                        {
-                            return;
+                    // Retransmissions keep the original 50 ms cadence.
+                    if tick_count % RETX_TICKS == 0 {
+                        for wire in feature.take_retransmissions() {
+                            if let Err(e) = face.send_bytes(wire).await
+                                && handle_send_error(e)
+                            {
+                                return;
+                            }
                         }
                     }
+                    // Acks go out every tick (5 ms), as NFD does.
                     if let Some(ack) = feature.take_acks() {
                         let _ = face.send_bytes(ack).await;
                     }
