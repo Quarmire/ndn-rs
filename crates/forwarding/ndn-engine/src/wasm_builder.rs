@@ -263,8 +263,15 @@ impl WasmEngineBuilder {
             }
         };
 
+        // Shared with the decode stage, as in the native builder, so
+        // reassembly_stats / purge_expired_reassembly see the live buffers.
+        let reassembly: Arc<
+            dashmap::DashMap<ndn_transport::FaceId, ndn_packet::fragment::ReassemblyBuffer>,
+        > = Arc::new(dashmap::DashMap::new());
+
         let inner = Arc::new(EngineInner {
             start_timestamp_ms: crate::engine::unix_time_ms(),
+            reassembly: Arc::clone(&reassembly),
             fib: Arc::clone(&fib),
             rib: Arc::clone(&rib),
             routing: Arc::clone(&routing),
@@ -307,7 +314,15 @@ impl WasmEngineBuilder {
             face_states: Arc::clone(&face_states),
             rib: Arc::clone(&rib),
             runtime: Arc::clone(&runtime),
-            decode: TlvDecodeStage::new(Arc::clone(&face_table), Arc::clone(&face_states)),
+            decode: TlvDecodeStage::with_reassembly(
+                Arc::clone(&face_table),
+                Arc::clone(&face_states),
+                Arc::clone(&reassembly),
+            )
+            .with_reassembly_clock({
+                let runtime = Arc::clone(&runtime);
+                Arc::new(move || runtime.now())
+            }),
             cs_lookup: CsLookupStage {
                 cs: Arc::clone(&cs),
             },
@@ -344,6 +359,8 @@ impl WasmEngineBuilder {
             cs_insert: CsInsertStage {
                 cs: Arc::clone(&cs),
                 admission: Arc::new(ndn_store::DefaultAdmissionPolicy),
+                // EngineConfig's default; the browser engine exposes no opt-in.
+                admit_unverified: false,
             },
             unsolicited_policy: self.config.unsolicited_data,
             channel_cap: self.config.pipeline_channel_cap,
