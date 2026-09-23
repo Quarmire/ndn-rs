@@ -15,11 +15,23 @@ classification = "extension"
 # only parse the TOML (e.g. mobile identity-only) do not pull the management
 # stack. The crates that mount management enable it.
 mgmt = ["dep:ndn-mgmt"]
+# `boot`: apply a `ForwarderConfig` to a live engine (`EngineConfig`, Data-path
+# validation + CS admission, `[[route]]` into the RIB, `[[strategy]]` into the
+# strategy table). The one implementation shared by the forwarder binary and
+# the simulator, so a simulated node boots exactly like a deployed one. Adds no
+# crates beyond what `mgmt` pulls (via ndn-mgmt: ndn-engine, ndn-security,
+# ndn-store).
+boot = ["dep:ndn-mgmt", "dep:ndn-engine", "dep:ndn-security", "dep:ndn-store"]
 
 [dependencies]
 portable-atomic = { workspace = true }
 ndn-mgmt-wire = { workspace = true }
 ndn-mgmt      = { workspace = true, optional = true }
+ndn-engine    = { workspace = true, optional = true }
+# Path dep so `default-features = false` sticks (as in ndn-mgmt): boot needs
+# only `SecurityProfile` / `SchemaRule`, not the sqlite PIB.
+ndn-security  = { path = "../../security/ndn-security", default-features = false, optional = true }
+ndn-store     = { workspace = true, optional = true }
 ndn-tlv       = { workspace = true, features = ["std"] }
 ndn-packet    = { workspace = true, features = ["std"] }
 tracing       = { workspace = true }

@@ -1463,9 +1463,9 @@ pub struct SecurityConfig {
 
     /// `"default"` (full chain validation), `"accept-signed"` (signature
     /// only, no chain walk), or `"disabled"` (no validation; implies
-    /// `validator_enabled = false`). Default `"default"`; when the
-    /// `[security]` block is absent entirely the router falls back to
-    /// `AcceptSigned`.
+    /// `validator_enabled = false`). Default `"default"` when the `[security]`
+    /// table is present. When it is absent entirely, `SecurityConfig::default()`
+    /// applies, whose `validator_enabled` is `false`: Data is NOT validated.
     #[serde(default = "default_security_profile")]
     pub profile: String,
 

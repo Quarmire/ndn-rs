@@ -7,6 +7,9 @@
 
 #![allow(missing_docs)]
 
+// `ndn_engine::EngineConfig` / `EngineBuilder` are native-only.
+#[cfg(all(feature = "boot", not(target_arch = "wasm32")))]
+pub mod boot;
 pub mod config;
 pub mod error;
 pub mod mgmt;
@@ -32,8 +35,8 @@ pub use config::{
     ManagementConfig, MgmtSecurityConfig, NlsrNeighborConfig, NlsrTomlConfig,
     ObservabilityTomlConfig, QuicListenerConfig, RadioDeviceConfig, ReflexiveTomlConfig,
     RequireAttestationConfig, RouteConfig, RoutingTomlConfig, SecurityConfig, SelfSignedDevConfig,
-    SmtpConfig, TrustRuleConfig, WebRtcListenerConfig, WebTransportListenerConfig, WtIceServers,
-    WtTurnServer,
+    SmtpConfig, StrategyConfig, TrustRuleConfig, WebRtcListenerConfig, WebTransportListenerConfig,
+    WtIceServers, WtTurnServer,
 };
 pub use error::ConfigError;
 pub use notifications::NotificationStream;
