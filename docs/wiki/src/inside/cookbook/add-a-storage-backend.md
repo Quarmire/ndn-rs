@@ -29,9 +29,10 @@ use ndn_store::{ContentStore, CsCapacity, CsEntry, CsMeta, InsertResult};
 pub struct MyCs { /* ... */ }
 
 impl ContentStore for MyCs {
-    async fn get(&self, interest: &Interest) -> Option<CsEntry> {
-        // Match by name; honour MustBeFresh, CanBePrefix, and a trailing
-        // ImplicitSha256DigestComponent. Return None on a miss.
+    async fn get(&self, interest: &Interest, now_ns: u64) -> Option<CsEntry> {
+        // Match by name; honour MustBeFresh (fresh iff `now_ns < stale_at`),
+        // CanBePrefix, and a trailing ImplicitSha256DigestComponent. Return
+        // None on a miss.
         todo!()
     }
 
@@ -54,6 +55,10 @@ Key contracts:
   original bytes with no re-encoding. `CsEntry::is_fresh(now_ns)` implements the
   freshness predicate; `CsMeta::stale_at` is the nanosecond deadline derived from
   the Data's `FreshnessPeriod`.
+- **Judge freshness only against `now_ns`.** `get`'s `now_ns` and `insert`'s
+  `stale_at` both come from the engine's runtime clock (the packet's arrival
+  time). A store that compares against the system clock instead breaks
+  freshness under a simulated runtime, where the two clocks disagree.
 - **`insert` returns `InsertResult`** — `Inserted`, `Replaced`, or `Skipped`.
 - **The CS does not verify signatures.** Validation happens earlier on the return
   path (see the pipeline). A CS that re-verifies would double-pay.

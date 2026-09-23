@@ -15,7 +15,7 @@ use bytes::Bytes;
 use ndn_packet::{Interest, Name};
 
 use crate::cs_keycodec::{
-    STALE_AT_LEN, decode_value, encode_value, key_to_name, name_to_key, now_ns,
+    STALE_AT_LEN, decode_stale_at, decode_value, encode_value, key_to_name, name_to_key,
 };
 use crate::{ContentStore, CsCapacity, CsEntry, CsMeta, InsertResult};
 
@@ -109,7 +109,7 @@ impl FjallCs {
 }
 
 impl ContentStore for FjallCs {
-    async fn get(&self, interest: &Interest) -> Option<CsEntry> {
+    async fn get(&self, interest: &Interest, now_ns: u64) -> Option<CsEntry> {
         if self.entry_count.load(Ordering::Relaxed) == 0 {
             return None;
         }
@@ -135,22 +135,32 @@ impl ContentStore for FjallCs {
                 name: Arc::new(data_name),
             }
         } else if interest.selectors().can_be_prefix {
+            // The freshest descendant (latest `stale_at`; ties to the later
+            // key), as `LruCs` answers — an arbitrary one misses MustBeFresh
+            // whenever a stale version happens to come first (see
+            // `fresh_index`). This scans every descendant on each CanBePrefix
+            // lookup: FjallCs keeps no in-memory index because it must answer
+            // straight from disk after a restart, so the cost grows with the
+            // versions cached under one prefix: ~64 ns each, ~0.8 ms at the
+            // 13k of Round 14 (`benches/fjall.rs`). Only the winner's Data is
+            // copied out. The fleet's CS is `LruCs` (one walk, ~150 ns).
             let prefix_key = name_to_key(&interest.name);
-            let mut found = None;
+            let mut best = None;
             for guard in self.keyspace.prefix(&prefix_key) {
                 if let Ok((key, val)) = guard.into_inner()
-                    && let Some((stale_at, data)) = decode_value(&val)
-                    && let Some(name) = key_to_name(&key)
+                    && let Some(stale_at) = decode_stale_at(&val)
+                    && best.as_ref().is_none_or(|(s, _, _)| stale_at >= *s)
                 {
-                    found = Some(CsEntry {
-                        data,
-                        stale_at,
-                        name: Arc::new(name),
-                    });
-                    break;
+                    best = Some((stale_at, key, val));
                 }
             }
-            found?
+            let (_, key, val) = best?;
+            let (stale_at, data) = decode_value(&val)?;
+            CsEntry {
+                data,
+                stale_at,
+                name: Arc::new(key_to_name(&key)?),
+            }
         } else {
             let key = name_to_key(&interest.name);
             let slice = self.keyspace.get(&key).ok()??;
@@ -162,7 +172,7 @@ impl ContentStore for FjallCs {
             }
         };
 
-        if interest.selectors().must_be_fresh && !entry.is_fresh(now_ns()) {
+        if interest.selectors().must_be_fresh && !entry.is_fresh(now_ns) {
             return None;
         }
         Some(entry)
@@ -265,6 +275,10 @@ mod tests {
     use super::*;
     use ndn_packet::{Interest, Name, NameComponent};
 
+    /// Lookup time for entries stamped always-fresh (`u64::MAX`) or already
+    /// stale (`0`); any instant strictly between the two.
+    const NOW: u64 = 1_000_000_000;
+
     fn arc_name(components: &[&str]) -> Arc<Name> {
         Arc::new(Name::from_components(components.iter().map(|s| {
             NameComponent::generic(Bytes::copy_from_slice(s.as_bytes()))
@@ -344,7 +358,7 @@ mod tests {
     #[tokio::test]
     async fn get_miss_returns_none() {
         let cs = open_temp_cs(65536);
-        assert!(cs.get(&interest(&["a"])).await.is_none());
+        assert!(cs.get(&interest(&["a"]), NOW).await.is_none());
     }
 
     #[tokio::test]
@@ -353,7 +367,7 @@ mod tests {
         let name = arc_name(&["a", "b"]);
         cs.insert(Bytes::from_static(b"data"), name.clone(), meta_fresh())
             .await;
-        let entry = cs.get(&interest(&["a", "b"])).await.unwrap();
+        let entry = cs.get(&interest(&["a", "b"]), NOW).await.unwrap();
         assert_eq!(entry.data.as_ref(), b"data");
     }
 
@@ -376,7 +390,7 @@ mod tests {
             .insert(Bytes::from_static(b"new"), name.clone(), meta_fresh())
             .await;
         assert_eq!(r, InsertResult::Replaced);
-        let entry = cs.get(&interest(&["a"])).await.unwrap();
+        let entry = cs.get(&interest(&["a"]), NOW).await.unwrap();
         assert_eq!(entry.data.as_ref(), b"new");
     }
 
@@ -385,7 +399,7 @@ mod tests {
         let cs = open_temp_cs(65536);
         cs.insert(Bytes::from_static(b"x"), arc_name(&["a"]), meta_stale())
             .await;
-        assert!(cs.get(&interest_fresh(&["a"])).await.is_none());
+        assert!(cs.get(&interest_fresh(&["a"]), NOW).await.is_none());
     }
 
     #[tokio::test]
@@ -393,7 +407,7 @@ mod tests {
         let cs = open_temp_cs(65536);
         cs.insert(Bytes::from_static(b"x"), arc_name(&["a"]), meta_fresh())
             .await;
-        assert!(cs.get(&interest_fresh(&["a"])).await.is_some());
+        assert!(cs.get(&interest_fresh(&["a"]), NOW).await.is_some());
     }
 
     #[tokio::test]
@@ -401,7 +415,12 @@ mod tests {
         let cs = open_temp_cs(65536);
         cs.insert(Bytes::from_static(b"x"), arc_name(&["a"]), meta_stale())
             .await;
-        assert!(cs.get(&interest(&["a"])).await.is_some());
+        assert!(cs.get(&interest(&["a"]), NOW).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn only_the_fresh_version_answers_latest() {
+        crate::cs_conformance::only_the_fresh_version_answers_latest(&open_temp_cs(1 << 20)).await;
     }
 
     #[tokio::test]
@@ -413,7 +432,7 @@ mod tests {
             meta_fresh(),
         )
         .await;
-        let entry = cs.get(&interest_can_be_prefix(&["a", "b"])).await;
+        let entry = cs.get(&interest_can_be_prefix(&["a", "b"]), NOW).await;
         assert!(entry.is_some());
     }
 
@@ -426,7 +445,11 @@ mod tests {
             meta_fresh(),
         )
         .await;
-        assert!(cs.get(&interest_can_be_prefix(&["a", "b"])).await.is_none());
+        assert!(
+            cs.get(&interest_can_be_prefix(&["a", "b"]), NOW)
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -437,7 +460,7 @@ mod tests {
             .await;
         let removed = cs.evict(&name).await;
         assert!(removed);
-        assert!(cs.get(&interest(&["a"])).await.is_none());
+        assert!(cs.get(&interest(&["a"]), NOW).await.is_none());
     }
 
     #[tokio::test]
@@ -456,8 +479,8 @@ mod tests {
         // Third insert evicts earliest key-order entry.
         cs.insert(Bytes::from(vec![0u8; 10]), arc_name(&["c"]), meta_fresh())
             .await;
-        assert!(cs.get(&interest(&["a"])).await.is_none());
-        assert!(cs.get(&interest(&["c"])).await.is_some());
+        assert!(cs.get(&interest(&["a"]), NOW).await.is_none());
+        assert!(cs.get(&interest(&["c"]), NOW).await.is_some());
     }
 
     #[tokio::test]
@@ -475,7 +498,7 @@ mod tests {
             value: Bytes::copy_from_slice(digest.as_ref()),
         });
         let i = Interest::new(Name::from_components(comps));
-        let entry = cs.get(&i).await.expect("implicit digest hit");
+        let entry = cs.get(&i, NOW).await.expect("implicit digest hit");
         assert_eq!(entry.data.as_ref(), b"wire-format-data");
     }
 
@@ -490,7 +513,7 @@ mod tests {
             value: Bytes::from_static(&[0u8; 32]),
         });
         let i = Interest::new(Name::from_components(comps));
-        assert!(cs.get(&i).await.is_none());
+        assert!(cs.get(&i, NOW).await.is_none());
     }
 
     #[tokio::test]
@@ -555,7 +578,7 @@ mod tests {
         let evicted = cs.evict_prefix(&name_ab, None).await;
         assert_eq!(evicted, 2);
         assert_eq!(cs.len(), 1);
-        assert!(cs.get(&interest(&["x", "y"])).await.is_some());
+        assert!(cs.get(&interest(&["x", "y"]), NOW).await.is_some());
     }
 
     #[tokio::test]
@@ -603,7 +626,7 @@ mod tests {
         // Reopen from the same path.
         let cs = FjallCs::open(dir.path(), 65536).unwrap();
         assert_eq!(cs.len(), 1);
-        let entry = cs.get(&interest(&["a"])).await.unwrap();
+        let entry = cs.get(&interest(&["a"]), NOW).await.unwrap();
         assert_eq!(entry.data.as_ref(), b"persistent");
     }
 }

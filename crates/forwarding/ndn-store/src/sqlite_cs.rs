@@ -30,7 +30,7 @@ use sha2::{Digest, Sha256};
 
 use ndn_packet::{Interest, Name};
 
-use crate::cs_keycodec::{name_to_key, now_ns, prefix_upper_bound};
+use crate::cs_keycodec::{name_to_key, prefix_upper_bound};
 use crate::{ContentStore, CsCapacity, CsEntry, CsMeta, InsertResult};
 
 /// Persistent CS backed by bundled SQLite. `max_bytes` bounds *logical* Data
@@ -52,6 +52,18 @@ fn to_i64(v: u64) -> i64 {
 #[inline]
 fn from_i64(v: i64) -> u64 {
     v as u64
+}
+
+/// Wall-clock stamp for `last_access`. Recency is this store's own eviction
+/// bookkeeping and must stay ordered across process restarts (rows persist),
+/// so it keeps the system clock; freshness never reads it — `get` judges
+/// `stale_at` against the caller's time.
+fn recency_ns() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
 }
 
 impl SqliteCs {
@@ -145,14 +157,14 @@ impl SqliteCs {
         let (stale_at, data) = row?;
         let _ = conn.execute(
             "UPDATE cs SET last_access = ?1 WHERE key = ?2",
-            rusqlite::params![to_i64(now_ns()), key],
+            rusqlite::params![to_i64(recency_ns()), key],
         );
         Some((from_i64(stale_at), Bytes::from(data)))
     }
 }
 
 impl ContentStore for SqliteCs {
-    async fn get(&self, interest: &Interest) -> Option<CsEntry> {
+    async fn get(&self, interest: &Interest, now_ns: u64) -> Option<CsEntry> {
         if self.entry_count.load(Ordering::Relaxed) == 0 {
             return None;
         }
@@ -178,36 +190,38 @@ impl ContentStore for SqliteCs {
                 name: Arc::new(data_name),
             }
         } else if interest.selectors().can_be_prefix {
+            // The freshest descendant (latest `stale_at`; ties to the later
+            // key), as `LruCs` answers — the first row in name order misses
+            // MustBeFresh whenever an older, stale version sorts first (see
+            // `fresh_index`). `stale_at` is a bit-cast u64, so `stale_at < 0`
+            // (>= 2^63, e.g. the never-stale `u64::MAX`) ranks above every
+            // non-negative value. SQLite walks the key range once keeping only
+            // the top row (LIMIT 1) and copies no `data` out for the losers;
+            // only the winner is fetched.
             let prefix_key = name_to_key(&interest.name);
-            // First row (BLOB order = NDN lexicographic order) under the prefix.
-            let found: Option<(Vec<u8>, i64, Vec<u8>)> = match prefix_upper_bound(&prefix_key) {
+            let key: Vec<u8> = match prefix_upper_bound(&prefix_key) {
                 Some(upper) => conn
                     .query_row(
-                        "SELECT key, stale_at, data FROM cs \
-                         WHERE key >= ?1 AND key < ?2 ORDER BY key ASC LIMIT 1",
+                        "SELECT key FROM cs WHERE key >= ?1 AND key < ?2 \
+                         ORDER BY stale_at < 0 DESC, stale_at DESC, key DESC LIMIT 1",
                         rusqlite::params![prefix_key.as_slice(), upper.as_slice()],
-                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                        |r| r.get(0),
                     )
-                    .ok(),
+                    .ok()?,
                 None => conn
                     .query_row(
-                        "SELECT key, stale_at, data FROM cs \
-                         WHERE key >= ?1 ORDER BY key ASC LIMIT 1",
+                        "SELECT key FROM cs WHERE key >= ?1 \
+                         ORDER BY stale_at < 0 DESC, stale_at DESC, key DESC LIMIT 1",
                         [prefix_key.as_slice()],
-                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                        |r| r.get(0),
                     )
-                    .ok(),
+                    .ok()?,
             };
-            let (key, stale_at, data) = found?;
-            let name = crate::cs_keycodec::key_to_name(&key)?;
-            let _ = conn.execute(
-                "UPDATE cs SET last_access = ?1 WHERE key = ?2",
-                rusqlite::params![to_i64(now_ns()), key.as_slice()],
-            );
+            let (stale_at, data) = self.fetch_exact(&conn, &key)?;
             CsEntry {
-                data: Bytes::from(data),
-                stale_at: from_i64(stale_at),
-                name: Arc::new(name),
+                data,
+                stale_at,
+                name: Arc::new(crate::cs_keycodec::key_to_name(&key)?),
             }
         } else {
             let key = name_to_key(&interest.name);
@@ -219,7 +233,7 @@ impl ContentStore for SqliteCs {
             }
         };
 
-        if interest.selectors().must_be_fresh && !entry.is_fresh(now_ns()) {
+        if interest.selectors().must_be_fresh && !entry.is_fresh(now_ns) {
             return None;
         }
         Some(entry)
@@ -255,7 +269,7 @@ impl ContentStore for SqliteCs {
                 key.as_slice(),
                 to_i64(meta.stale_at),
                 data.as_ref(),
-                to_i64(now_ns())
+                to_i64(recency_ns())
             ],
         );
         if res.is_err() {
@@ -387,6 +401,10 @@ mod tests {
     use ndn_packet::{Interest, Name, NameComponent};
     use ndn_tlv::TlvWriter;
 
+    /// Lookup time for entries stamped always-fresh (`u64::MAX`) or already
+    /// stale (`0`); any instant strictly between the two.
+    const NOW: u64 = 1_000_000_000;
+
     fn arc_name(components: &[&str]) -> Arc<Name> {
         Arc::new(Name::from_components(components.iter().map(|s| {
             NameComponent::generic(Bytes::copy_from_slice(s.as_bytes()))
@@ -439,6 +457,13 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn only_the_fresh_version_answers_latest() {
+        let (_d, path) = tmp();
+        let cs = SqliteCs::open(&path, 1 << 20).unwrap();
+        crate::cs_conformance::only_the_fresh_version_answers_latest(&cs).await;
+    }
+
+    #[tokio::test]
     async fn insert_then_exact_get() {
         let (_d, path) = tmp();
         let cs = SqliteCs::open(&path, 1 << 20).unwrap();
@@ -448,7 +473,7 @@ mod tests {
             cs.insert(data.clone(), name.clone(), meta_fresh()).await,
             InsertResult::Inserted
         );
-        let got = cs.get(&interest(&["a", "b"])).await.unwrap();
+        let got = cs.get(&interest(&["a", "b"]), NOW).await.unwrap();
         assert_eq!(got.data, data);
         assert_eq!(cs.len(), 1);
         assert_eq!(cs.current_bytes(), 5);
@@ -476,8 +501,8 @@ mod tests {
         let cs = SqliteCs::open(&path, 1 << 20).unwrap();
         cs.insert(Bytes::from_static(b"v"), arc_name(&["s"]), meta_stale())
             .await;
-        assert!(cs.get(&interest(&["s"])).await.is_some());
-        assert!(cs.get(&interest_fresh(&["s"])).await.is_none());
+        assert!(cs.get(&interest(&["s"]), NOW).await.is_some());
+        assert!(cs.get(&interest_fresh(&["s"]), NOW).await.is_none());
     }
 
     #[tokio::test]
@@ -496,7 +521,7 @@ mod tests {
             meta_fresh(),
         )
         .await;
-        let got = cs.get(&interest_can_be_prefix(&["p"])).await.unwrap();
+        let got = cs.get(&interest_can_be_prefix(&["p"]), NOW).await.unwrap();
         assert_eq!(got.name.components().len(), 2);
     }
 
@@ -510,12 +535,12 @@ mod tests {
         cs.insert(Bytes::from_static(b"bbbb"), arc_name(&["b"]), meta_fresh())
             .await;
         // Touch "a" so "b" is the LRU victim.
-        let _ = cs.get(&interest(&["a"])).await;
+        let _ = cs.get(&interest(&["a"]), NOW).await;
         cs.insert(Bytes::from_static(b"cccc"), arc_name(&["c"]), meta_fresh())
             .await;
         assert!(cs.current_bytes() <= 10);
-        assert!(cs.get(&interest(&["a"])).await.is_some());
-        assert!(cs.get(&interest(&["b"])).await.is_none());
+        assert!(cs.get(&interest(&["a"]), NOW).await.is_some());
+        assert!(cs.get(&interest(&["b"]), NOW).await.is_none());
     }
 
     #[tokio::test]
@@ -533,7 +558,7 @@ mod tests {
         let cs = SqliteCs::open(&path, 1 << 20).unwrap();
         assert_eq!(cs.len(), 1);
         assert_eq!(cs.current_bytes(), 7);
-        assert!(cs.get(&interest(&["k"])).await.is_some());
+        assert!(cs.get(&interest(&["k"]), NOW).await.is_some());
     }
 
     #[tokio::test]
@@ -556,6 +581,6 @@ mod tests {
             .await;
         assert_eq!(cs.evict_prefix(&arc_name(&["p"]), None).await, 2);
         assert_eq!(cs.len(), 1);
-        assert!(cs.get(&interest(&["q"])).await.is_some());
+        assert!(cs.get(&interest(&["q"]), NOW).await.is_some());
     }
 }

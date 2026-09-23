@@ -78,9 +78,10 @@ impl ErasedContentStore for ObservableCs {
     fn get_erased<'a>(
         &'a self,
         interest: &'a Interest,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<CsEntry>> + Send + 'a>> {
+        now_ns: u64,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Option<CsEntry>> + Send + 'a>> {
         Box::pin(async move {
-            let result = self.inner.get_erased(interest).await;
+            let result = self.inner.get_erased(interest, now_ns).await;
             let name = Arc::clone(&interest.name);
             if result.is_some() {
                 self.counters.hits.fetch_add(1, Ordering::Relaxed);
@@ -189,6 +190,9 @@ mod tests {
     use ndn_packet::NameComponent;
     use std::sync::atomic::AtomicUsize;
 
+    /// Lookup time; the lookups here do not ask for MustBeFresh.
+    const NOW: u64 = 1_000_000_000;
+
     fn arc_name(components: &[&str]) -> Arc<Name> {
         Arc::new(Name::from_components(components.iter().map(|s| {
             NameComponent::generic(Bytes::copy_from_slice(s.as_bytes()))
@@ -238,7 +242,7 @@ mod tests {
         let inner: Arc<dyn ErasedContentStore> = Arc::new(LruCs::new(65536));
         let cs = ObservableCs::new(inner, Some(Arc::clone(&observer) as _));
 
-        cs.get_erased(&interest(&["a"])).await;
+        cs.get_erased(&interest(&["a"]), NOW).await;
         assert_eq!(observer.misses.load(Ordering::Relaxed), 1);
 
         cs.insert_erased(
@@ -247,7 +251,7 @@ mod tests {
             CsMeta { stale_at: u64::MAX },
         )
         .await;
-        cs.get_erased(&interest(&["a"])).await;
+        cs.get_erased(&interest(&["a"]), NOW).await;
         assert_eq!(observer.hits.load(Ordering::Relaxed), 1);
         assert_eq!(observer.inserts.load(Ordering::Relaxed), 1);
     }
@@ -262,8 +266,8 @@ mod tests {
             CsMeta { stale_at: u64::MAX },
         )
         .await;
-        cs.get_erased(&interest(&["a"])).await;
-        cs.get_erased(&interest(&["b"])).await;
+        cs.get_erased(&interest(&["a"]), NOW).await;
+        cs.get_erased(&interest(&["b"]), NOW).await;
 
         let stats = cs.stats();
         assert_eq!(stats.inserts, 1);

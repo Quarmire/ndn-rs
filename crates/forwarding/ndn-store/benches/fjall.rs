@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use ndn_packet::{Name, NameComponent};
+use ndn_packet::Name;
 use ndn_store::{ContentStore, CsMeta, FjallCs};
 use portable_atomic::AtomicU64;
 use std::sync::Arc;
@@ -9,6 +9,9 @@ use std::sync::atomic::Ordering;
 fn data_wire(name: &Name) -> Bytes {
     Bytes::copy_from_slice(name.to_string().as_bytes())
 }
+
+/// Lookup time: entries are stamped `far_future()`, so any earlier instant.
+const NOW: u64 = 0;
 
 fn far_future() -> u64 {
     u64::MAX
@@ -58,7 +61,7 @@ fn bench_fjall(c: &mut Criterion) {
 
     group.bench_function("get_hit", |b| {
         b.iter(|| {
-            let result = rt.block_on(cs_rw.get(&hit_interest));
+            let result = rt.block_on(cs_rw.get(&hit_interest, NOW));
             debug_assert!(result.is_some());
             result
         });
@@ -66,8 +69,45 @@ fn bench_fjall(c: &mut Criterion) {
 
     group.bench_function("get_miss", |b| {
         b.iter(|| {
-            let result = rt.block_on(cs_rw.get(&miss_interest));
+            let result = rt.block_on(cs_rw.get(&miss_interest, NOW));
             debug_assert!(result.is_none());
+            result
+        });
+    });
+
+    // ── get_latest_of_1000_versions ──────────────────────────────────────────
+    //
+    // CanBePrefix+MustBeFresh over 1000 cached versions of one prefix, only
+    // the newest fresh. FjallCs keeps no in-memory index, so each lookup scans
+    // every version's `stale_at`: this grows linearly with the version count,
+    // unlike LruCs's `get_latest_of_13k_versions`.
+    // Measured 2026-09-22 (M4 Pro, `--quick`): 64 µs, ~64 ns per version, so
+    // ~0.8 ms per lookup at the ~13k versions of nfd-divergence-findings
+    // Round 14 (LruCs: ~150 ns).
+    const VERSIONS: u64 = 1_000;
+    let dir_versions = tempfile::tempdir().unwrap();
+    let cs_versions = FjallCs::open(dir_versions.path(), 1 << 20).unwrap();
+    for v in 1..=VERSIONS {
+        let name: Arc<Name> = Arc::new(format!("/fjall/live/v={v}/seg=0").parse().unwrap());
+        // Looked up at VERSIONS - 1 below: only v = VERSIONS is still fresh.
+        rt.block_on(cs_versions.insert(
+            data_wire(&name),
+            Arc::clone(&name),
+            CsMeta { stale_at: v },
+        ));
+    }
+    let latest = {
+        use ndn_packet::encode::InterestBuilder;
+        let wire = InterestBuilder::new("/fjall/live")
+            .can_be_prefix()
+            .must_be_fresh()
+            .build();
+        ndn_packet::Interest::decode(wire).unwrap()
+    };
+    group.bench_function("get_latest_of_1000_versions", |b| {
+        b.iter(|| {
+            let result = rt.block_on(cs_versions.get(&latest, VERSIONS - 1));
+            debug_assert!(result.is_some());
             result
         });
     });

@@ -75,12 +75,17 @@ pub(crate) fn encode_value(stale_at: u64, data: &[u8]) -> Vec<u8> {
 
 #[cfg_attr(not(feature = "fjall"), allow(dead_code))]
 pub(crate) fn decode_value(val: &[u8]) -> Option<(u64, Bytes)> {
-    if val.len() < STALE_AT_LEN {
-        return None;
-    }
-    let stale_at = u64::from_be_bytes(val[..STALE_AT_LEN].try_into().ok()?);
+    let stale_at = decode_stale_at(val)?;
     let data = Bytes::copy_from_slice(&val[STALE_AT_LEN..]);
     Some((stale_at, data))
+}
+
+/// Just the `stale_at` of a stored value, without copying its Data out.
+#[cfg_attr(not(feature = "fjall"), allow(dead_code))]
+pub(crate) fn decode_stale_at(val: &[u8]) -> Option<u64> {
+    Some(u64::from_be_bytes(
+        val.get(..STALE_AT_LEN)?.try_into().ok()?,
+    ))
 }
 
 pub(crate) fn write_var(buf: &mut Vec<u8>, val: u64) {
@@ -132,12 +137,4 @@ pub(crate) fn read_var(buf: &[u8]) -> Option<(u64, usize)> {
             ))
         }
     }
-}
-
-pub(crate) fn now_ns() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
 }

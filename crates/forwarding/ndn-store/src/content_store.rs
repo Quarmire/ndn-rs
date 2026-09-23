@@ -10,7 +10,8 @@ use ndn_packet::{Interest, Name};
 #[derive(Clone, Debug)]
 pub struct CsEntry {
     pub data: Bytes,
-    /// Nanoseconds since Unix epoch, derived from `FreshnessPeriod`.
+    /// Unix-epoch nanoseconds, on the caller's clock, after which the entry
+    /// no longer satisfies `MustBeFresh` (arrival + `FreshnessPeriod`).
     pub stale_at: u64,
     pub name: Arc<Name>,
 }
@@ -56,8 +57,18 @@ pub struct CsStats {
 
 /// Content store interface. Methods are `async` so persistent (disk-backed)
 /// implementations are supported; in-memory ones complete synchronously.
+///
+/// Freshness is never judged on a store's own clock. `get` is told the lookup
+/// time and compares it with the `stale_at` its caller stamped at insert, so
+/// both sides of the comparison come from ONE clock — the engine runtime's
+/// (`ctx.arrival`). Reading the system clock here instead made the two sides
+/// disagree under a simulated runtime: `stale_at` was virtual time, the lookup
+/// was wall time, so FreshnessPeriod stopped meaning what the producer set.
 pub trait ContentStore: Send + Sync + 'static {
-    fn get(&self, interest: &Interest) -> impl Future<Output = Option<CsEntry>> + Send;
+    /// Look up a Data satisfying `interest` at time `now_ns` (Unix-epoch ns,
+    /// the same time base as [`CsMeta::stale_at`]).
+    fn get(&self, interest: &Interest, now_ns: u64)
+    -> impl Future<Output = Option<CsEntry>> + Send;
 
     /// Insert a Data packet. Callers must supply well-formed, signed Data —
     /// the CS does not re-verify signatures.
@@ -122,6 +133,7 @@ pub trait ErasedContentStore: Send + Sync + 'static {
     fn get_erased<'a>(
         &'a self,
         interest: &'a Interest,
+        now_ns: u64,
     ) -> Pin<Box<dyn Future<Output = Option<CsEntry>> + Send + 'a>>;
 
     fn insert_erased(
@@ -159,8 +171,9 @@ impl<T: ContentStore> ErasedContentStore for T {
     fn get_erased<'a>(
         &'a self,
         interest: &'a Interest,
+        now_ns: u64,
     ) -> Pin<Box<dyn Future<Output = Option<CsEntry>> + Send + 'a>> {
-        Box::pin(self.get(interest))
+        Box::pin(self.get(interest, now_ns))
     }
 
     fn insert_erased(
@@ -261,7 +274,7 @@ impl CsAdmissionPolicy for AdmitAllPolicy {
 pub struct NullCs;
 
 impl ContentStore for NullCs {
-    async fn get(&self, _: &Interest) -> Option<CsEntry> {
+    async fn get(&self, _: &Interest, _: u64) -> Option<CsEntry> {
         None
     }
     async fn insert(&self, _: Bytes, _: Arc<Name>, _: CsMeta) -> InsertResult {

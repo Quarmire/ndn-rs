@@ -10,6 +10,9 @@ fn data_wire(name: &Name) -> Bytes {
     Bytes::copy_from_slice(name.to_string().as_bytes())
 }
 
+/// Lookup time: entries are stamped `far_future()`, so any earlier instant.
+const NOW: u64 = 0;
+
 fn far_future() -> u64 {
     u64::MAX
 }
@@ -57,7 +60,7 @@ fn bench_sharded(c: &mut Criterion) {
             &shard_count,
             |b, _| {
                 b.iter(|| {
-                    let result = rt.block_on(cs.get(&hit_interest));
+                    let result = rt.block_on(cs.get(&hit_interest, NOW));
                     debug_assert!(result.is_some());
                     result
                 });

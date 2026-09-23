@@ -47,9 +47,9 @@ impl<C: ContentStore> ShardedCs<C> {
 }
 
 impl<C: ContentStore> ContentStore for ShardedCs<C> {
-    async fn get(&self, interest: &Interest) -> Option<CsEntry> {
+    async fn get(&self, interest: &Interest, now_ns: u64) -> Option<CsEntry> {
         let idx = self.shard_for(&interest.name);
-        self.shards[idx].get(interest).await
+        self.shards[idx].get(interest, now_ns).await
     }
 
     async fn insert(&self, data: Bytes, name: Arc<Name>, meta: CsMeta) -> InsertResult {
@@ -110,6 +110,9 @@ mod tests {
     use crate::LruCs;
     use ndn_packet::NameComponent;
 
+    /// Lookup time; entries are stamped always-fresh (`u64::MAX`).
+    const NOW: u64 = 1_000_000_000;
+
     fn arc_name(components: &[&str]) -> Arc<Name> {
         Arc::new(Name::from_components(components.iter().map(|s| {
             NameComponent::generic(Bytes::copy_from_slice(s.as_bytes()))
@@ -152,14 +155,17 @@ mod tests {
         let name = arc_name(&["edu", "ucla", "data"]);
         cs.insert(Bytes::from_static(b"payload"), name.clone(), meta_fresh())
             .await;
-        let entry = cs.get(&interest(&["edu", "ucla", "data"])).await.unwrap();
+        let entry = cs
+            .get(&interest(&["edu", "ucla", "data"]), NOW)
+            .await
+            .unwrap();
         assert_eq!(entry.data.as_ref(), b"payload");
     }
 
     #[tokio::test]
     async fn miss_returns_none() {
         let cs = make_sharded(2, 65536);
-        assert!(cs.get(&interest(&["x"])).await.is_none());
+        assert!(cs.get(&interest(&["x"]), NOW).await.is_none());
     }
 
     #[tokio::test]
@@ -177,8 +183,8 @@ mod tests {
             meta_fresh(),
         )
         .await;
-        assert!(cs.get(&interest(&["a", "1"])).await.is_some());
-        assert!(cs.get(&interest(&["a", "2"])).await.is_some());
+        assert!(cs.get(&interest(&["a", "1"]), NOW).await.is_some());
+        assert!(cs.get(&interest(&["a", "2"]), NOW).await.is_some());
     }
 
     #[tokio::test]
@@ -188,7 +194,7 @@ mod tests {
         cs.insert(Bytes::from_static(b"v"), name.clone(), meta_fresh())
             .await;
         assert!(cs.evict(&name).await);
-        assert!(cs.get(&interest(&["b", "1"])).await.is_none());
+        assert!(cs.get(&interest(&["b", "1"]), NOW).await.is_none());
     }
 
     #[tokio::test]
@@ -202,6 +208,6 @@ mod tests {
         let cs = make_sharded(1, 65536);
         cs.insert(Bytes::from_static(b"data"), arc_name(&["a"]), meta_fresh())
             .await;
-        assert!(cs.get(&interest(&["a"])).await.is_some());
+        assert!(cs.get(&interest(&["a"]), NOW).await.is_some());
     }
 }
