@@ -820,6 +820,13 @@ stale-only prefixes still miss (witness D.04 passes unmodified). Freshness is
 confirmed end to end: telemetry runs at the full ~3.3/s publish rate with ZERO
 gaps > 2 s, where stale hits would have shown as a collapsed sample rate.
 
+**Provenance (2026-09-22).** The fix measured above was never committed; it
+was re-implemented from this description. `LruCs` answers from
+`ndn-store/src/fresh_index.rs` (each trie node tracks its subtree's freshest
+entry, so the lookup is one walk down the name, not a scan of ~13k versions);
+`FjallCs`/`SqliteCs` pick the freshest in their key range. Witnessed on all
+three by `cs_conformance::only_the_fresh_version_answers_latest`.
+
 ### 14.3 Fleet-level consequences
 
 - **Telemetry: FLIGHT-READY** for the first time in this investigation
@@ -1006,3 +1013,76 @@ the return-to-origin forwarding possible.
   `morse_spi_probe failed`, so this may be hardware rather than forwarding.
 * Nacks are fleet-wide (12-84 per face) on every node including healthy ones,
   so they are not the cause of the above.
+
+---
+
+## Round 17 — found in simulation, now that the sim runs the fleet's code path
+
+Until this round ndn-sim linked nodes with in-process `Internal` faces (no
+NDNLPv2, local scope), bypassed ndn-fwd's config startup, and let the CS, LP
+and SVS timers read the wall clock while the sim advanced virtual time. None of
+rounds 1-16's bugs could appear there. ndn-sim now defaults node links to the
+production UDP profile (LP reliability on, `Permanent`), boots nodes from
+ndn-fwd TOML through `ndn_config::boot` (the functions ndn-fwd itself calls),
+models each node's UDP socket demux (a peer face binds as
+`ndn_config::boot::udp_peer_binding`, the one decision ndn-fwd also realises;
+a listener mints an on-demand face for a source no face matches), and
+`tests/fleet.rs` replays the fleet: four forwarders on a lossy shared
+channel. Each of these bugs, when reintroduced, fails one of its assertions: LP
+re-condemnation, config strategies not applied, a CanBePrefix+MustBeFresh CS
+lookup that doesn't return the freshest version, and §15's ephemeral peer port
+(two faces per neighbour; with the §15 same-node check in the strategy also
+removed, the sim's capture shows the fleet's 12 wire copies per Interest, 9
+with the symmetric binding). These defects were found and fixed in ndn-rs:
+
+| Defect | Evidence | Fix |
+|---|---|---|
+| A retransmitted LP frame keeps its TxSequence, so acks for frames sent *before* the resend re-condemned it: one loss became `max_retries` resends plus a give-up for a frame the peer had received | throwaway repro: 3 copies, 2 duplicates, gave-up=1 for one loss | `UnackedEntry::evidence_floor`: only acks for frames sent after the latest copy count (NFD re-stamps TxSequence for the same effect) |
+| Receiver dedup window of one RTO was shorter than the peer's resend (its RTO + up to one pump tick), so duplicates escaped and reached the PIT | per-frame LP trace: 67 of 130 duplicates escaped at gaps of ~244 ms | dedup window 2×RTO (reliability.rs `on_receive`) |
+| LP MTU 1452 vs UdpFace `send_mtu` 1400: a 1401-1452 B frame took LpLinkService's re-fragment branch and its TxSequence was never on the wire, so it was only ever "repaired" by RTO | 1290 B telemetry: TxSequence 0 (1407 B) orphaned, RTO resent twice | LP MTU capped at `transport.send_mtu()` (engine.rs `run_face_sender`), as NFD fragments at `Transport::getMtu()` |
+| Equal-cost nexthop order came from `HashMap` iteration, so WHICH `/muas` peer best-route used changed on every forwarder restart | seeded fleet run not reproducible | RIB emits nexthops in RIB order (rib.rs `effective_nexthops`) |
+| ndn-sync compared a wall-clock `Instant` against a deadline it slept to on tokio's clock; under a paused clock the periodic Sync Interest was never sent, starving re-advertisement on lossy links | bisected to 7bee1514; ndn-sim CI red since 2026-07-06 | `ndn_sync::rt::Instant` is tokio's clock natively |
+| CS freshness, LP RTO/dedup, congestion marking and reassembly timeout read the wall clock, not the engine Runtime | virtual-time runs never aged Data; LP timing host-speed dependent | all take the engine's Runtime clock (production unchanged: its clock is wall time) |
+| `[[strategy]] strategy = "multicast"` (the documented short form) was rejected, and a malformed prefix silently became `/` | boot tests | bare names resolve to `/localhost/nfd/strategy/<name>`; bad prefixes are logged and skipped |
+
+Fixed, and reproduced first: under `[security] profile = "default"` or
+`"accept-signed"`, forwarded Data signed by a peer whose certificate was not
+already cached was dropped after the pending-cert timeout. The engine builder
+gave `default` a no-op CertFetcher (its comment said "the router wires a real
+one"; nothing did) and `accept-signed` none, so no certificate Interest ever
+left the forwarder. `ndn-sim/crates/ndn-sim/tests/data_path_security.rs` boots
+`gcs` <-udp-> `relay` <-udp-> `uav` from ndn-fwd configs, `uav` signs telemetry
+with an Ed25519 key and serves its cert: on the old builder the consumer got
+nothing and the cert was never requested; the engine-level twin
+(`ndn-engine/tests/data_path_cert_fetch.rs`) logged `validation: DROPPED —
+cert fetch timed out` 4 s after `pending, queuing`. Four changes:
+
+* The engine fetches the certificates its Data path needs, for every profile
+  that validates (ndn-engine `cert_fetch.rs`): an Interest for the KeyLocator
+  name from an internal face, through the FIB like any other Interest; the
+  answering cert is validated on arrival. The fetch runs off the pipeline (the
+  validator holds no fetcher), since awaiting it in the pipeline would block on
+  the very cert Data it waits for. ndn-fwd's localhop validator uses the same
+  fetcher (`ForwarderEngine::cert_fetcher`), replacing its own.
+* A KeyLocator naming a KEY (`/<id>/KEY/<key-id>`, as ndn-cxx producers emit)
+  is fetched with CanBePrefix + MustBeFresh, as ndn-cxx's
+  CertificateFetcherFromNetwork does; the cert cache and the anchor lookup
+  answer to a certificate's KEY name as well as its full name
+  (`/<id>/KEY/<key-id>/<issuer>/<version>`). A full cert name is fetched exactly.
+* `accept-signed` now means what its docs say, "signature only, no chain walk":
+  the signature must verify against the signer's cert, whoever issued it. It
+  used to walk to an anchor with a one-hop limit, which dropped any Data not
+  signed directly by one of the node's own anchors. `default` always walks to
+  an anchor; with none (no SecurityManager) it fails closed for key-signed Data.
+* A self-signed cert verifies against the key it carries instead of waiting on
+  a fetch for itself (it parked behind its own fetch until both timed out);
+  under `default` a self-signed cert that is not an anchor is rejected at once.
+
+A sim node now gets its SecurityManager the way ndn-fwd does:
+`ndn_config::boot::load_identity` (`[security] identity` and the PIB's anchors)
+or, with no identity, `boot::ephemeral_identity` (a fresh key that is its own
+only anchor, so `default` drops everyone else's key-signed Data). ndn-fwd calls
+both. The fleet runs `profile = "disabled"` and is unaffected.
+`ndn-fwd/testbed/configs/ndn-fwd-dv.toml` has `profile = "accept_signed"`
+(underscore), which is not a recognised value, so that config silently gets
+full `default` validation.
