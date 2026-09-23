@@ -90,28 +90,15 @@ pub(super) fn faces_list_dataset(engine: &ForwarderEngine) -> bytes::Bytes {
             reliability_counters = face.link_service.reliability_counters();
             congestion_counters = face.link_service.congestion_counters();
         }
-        let (
-            n_lp_resent_packets,
-            rto_micros,
-            n_lp_rto_expirations,
-            n_lp_unacked_evictions,
-            n_lp_fast_retx,
-            n_lp_duplicate_frames,
-            n_lp_acks_sent,
-            n_lp_acks_received,
-        ) = match reliability_counters {
-            Some((resent, rto, expired, evicted, fast, dup, asent, arecv)) => (
-                Some(resent),
-                Some(rto),
-                Some(expired),
-                Some(evicted),
-                Some(fast),
-                Some(dup),
-                Some(asent),
-                Some(arecv),
-            ),
-            None => (None, None, None, None, None, None, None, None),
-        };
+        let r = reliability_counters;
+        let n_lp_resent_packets = r.map(|r| r.resent_packets);
+        let rto_micros = r.map(|r| r.rto_micros);
+        let n_lp_rto_expirations = r.map(|r| r.rto_expirations);
+        let n_lp_unacked_evictions = r.map(|r| r.unacked_evictions);
+        let n_lp_fast_retx = r.map(|r| r.fast_retx);
+        let n_lp_duplicate_frames = r.map(|r| r.duplicate_frames);
+        let n_lp_acks_sent = r.map(|r| r.acks_sent);
+        let n_lp_acks_received = r.map(|r| r.acks_received);
         // Per-face NDNLPv2 reassembly counters (engine-side: the buffer lives in
         // the dispatcher's decode stage, not the LinkService).
         let reasm = engine.reassembly_stats(info.id);

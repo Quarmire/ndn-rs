@@ -44,6 +44,10 @@ pub struct CongestionMarkingFeature {
     /// without dropping below; `None` means currently below.
     above_threshold_since: Mutex<Option<Instant>>,
     queue_depth_fn: Mutex<QueueDepthFn>,
+    /// Time source for the marking interval; the engine wires its runtime
+    /// (see [`Self::set_clock`]) so the interval elapses in virtual time under
+    /// a simulated runtime rather than in however much host time passed.
+    clock: Mutex<Arc<dyn ndn_runtime::Now>>,
     n_lp_congestion_marked: AtomicU64,
 }
 
@@ -56,6 +60,7 @@ impl CongestionMarkingFeature {
             def_cong_threshold: AtomicU64::new(DEFAULT_DEF_CONG_THRESHOLD),
             above_threshold_since: Mutex::new(None),
             queue_depth_fn: Mutex::new(inert),
+            clock: Mutex::new(crate::reliability::wall_clock()),
             n_lp_congestion_marked: AtomicU64::new(0),
         }
     }
@@ -89,6 +94,13 @@ impl CongestionMarkingFeature {
 
     pub fn set_queue_depth_fn(&self, f: QueueDepthFn) {
         *self.queue_depth_fn.lock().unwrap() = f;
+    }
+
+    /// Read time from `clock` from now on. An above-threshold episode stamped
+    /// on the previous clock is dropped rather than compared across clocks.
+    pub fn set_clock(&self, clock: Arc<dyn ndn_runtime::Now>) {
+        *self.clock.lock().unwrap() = clock;
+        *self.above_threshold_since.lock().unwrap() = None;
     }
 
     pub fn n_lp_congestion_marked(&self) -> u64 {
@@ -141,7 +153,8 @@ impl LinkServiceFeature for CongestionMarkingFeature {
             return;
         }
         let depth = (self.queue_depth_fn.lock().unwrap())();
-        if !self.should_mark_now(depth, Instant::now()) {
+        let now = self.clock.lock().unwrap().now();
+        if !self.should_mark_now(depth, now) {
             return;
         }
         if let Some(new_wire) = splice_congestion_mark(&frame.wire, CONGESTION_MARK_VALUE) {

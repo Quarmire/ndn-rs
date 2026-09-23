@@ -63,6 +63,13 @@ impl ReliabilityFeature {
         self.state.lock().unwrap().set_mtu(mtu);
     }
 
+    /// Time source for RTO, RTT and the duplicate window. See
+    /// `LpReliability::set_clock`; the engine passes its runtime when the face
+    /// is wired.
+    pub fn set_clock(&self, clock: Arc<dyn ndn_runtime::Now>) {
+        self.state.lock().unwrap().set_clock(clock);
+    }
+
     pub fn is_enabled(&self) -> bool {
         self.enabled.load(Ordering::Acquire)
     }
@@ -287,7 +294,10 @@ mod tests {
         // The other half of the contract: answering is unconditional, but
         // sending reliably stays opt-in.
         let f = ReliabilityFeature::new();
-        assert!(f.frame(b"x").is_empty(), "disabled face must not frame reliably");
+        assert!(
+            f.frame(b"x").is_empty(),
+            "disabled face must not frame reliably"
+        );
         assert!(
             f.take_retransmissions().is_empty(),
             "disabled face must not retransmit its own traffic"

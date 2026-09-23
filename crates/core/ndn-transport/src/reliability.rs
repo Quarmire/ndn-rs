@@ -2,8 +2,10 @@
 //! wire-ready packets and callers handle I/O.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::Arc;
 
 use bytes::Bytes;
+use ndn_runtime::Now;
 use web_time::Instant;
 
 use ndn_packet::fragment::FRAG_OVERHEAD;
@@ -31,6 +33,21 @@ const QUIC_INITIAL_RTO_US: u64 = 333_000;
 const QUIC_MIN_RTO_US: u64 = 1_000;
 const QUIC_MAX_RTO_US: u64 = 4_000_000;
 const QUIC_GRANULARITY_US: u64 = 1_000;
+
+/// The system clock: what [`LpReliability`] and the congestion-marking feature
+/// read until the engine wires the face to its runtime (`set_clock`).
+/// Production runtimes read this same clock, so there the swap changes nothing.
+struct WallClock;
+
+impl Now for WallClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+}
+
+pub(crate) fn wall_clock() -> Arc<dyn Now> {
+    Arc::new(WallClock)
+}
 
 /// RTO computation strategy.
 ///
@@ -123,6 +140,16 @@ struct UnackedEntry {
     /// `SEQ_NUM_LOSS_THRESHOLD` the frame is declared lost immediately rather
     /// than waiting out its RTO (NFD's `UnackedFrag::nGreaterSeqAcks`).
     n_greater_seq_acks: u32,
+    /// Lowest TxSequence whose Ack counts toward `n_greater_seq_acks`: the
+    /// first TxSequence assigned AFTER this copy went out.
+    ///
+    /// Retransmission reuses the frame's TxSequence (see [`LpReliability::on_receive`]),
+    /// so without this floor the Acks for every frame sent between the
+    /// original and the retransmission -- still in flight when the
+    /// retransmission leaves -- would count against the new copy and condemn
+    /// it again before it could possibly have been acked. NFD gets the same
+    /// effect by re-stamping a fresh TxSequence on each retransmission.
+    evidence_floor: u64,
 }
 
 /// Per-face NDNLPv2 reliability state.
@@ -171,8 +198,9 @@ pub struct LpReliability {
     /// were Acked or retried to exhaustion — silent, unrecoverable loss.
     unacked_evictions: u64,
     /// TxSequences seen recently, for duplicate-frame suppression, with the
-    /// time each was first seen. Aged out after one RTO — long enough to
-    /// cover a retransmission, short enough to stay small.
+    /// time each was last seen. Aged out after two RTOs (see `on_receive`) —
+    /// long enough to cover the peer's retransmission, short enough to stay
+    /// small.
     recent_recv: HashMap<u64, Instant>,
     /// `recent_recv` keys in arrival order, so ageing is O(expired).
     recent_recv_order: VecDeque<u64>,
@@ -187,6 +215,14 @@ pub struct LpReliability {
     acks_sent: u64,
     /// Ack entries extracted from inbound frames.
     acks_received: u64,
+    /// Time source for send stamps, RTT samples, RTO expiry and the duplicate
+    /// window. The engine wires every face to its `Runtime` clock (see
+    /// [`Self::set_clock`]). Read from the host clock instead, a simulated link
+    /// sampled RTTs of host scheduling rather than of the modelled link, and
+    /// retransmission and give-up depended on how fast the simulator ran:
+    /// the engine's retx tick fires on virtual time, but "has this frame's RTO
+    /// elapsed?" was answered in wall time.
+    clock: Arc<dyn Now>,
 }
 
 fn initial_rto_for(strategy: &RtoStrategy) -> u64 {
@@ -228,6 +264,7 @@ impl LpReliability {
             duplicate_frames: 0,
             acks_sent: 0,
             acks_received: 0,
+            clock: wall_clock(),
         }
     }
 
@@ -242,6 +279,21 @@ impl LpReliability {
         self.rto_strategy = config.rto_strategy;
     }
 
+    /// Read time from `clock` from now on (the engine passes its runtime).
+    /// Stamps already taken on the previous clock mean nothing on the new one,
+    /// so they are re-taken as "now": nothing ages across the switch.
+    pub fn set_clock(&mut self, clock: Arc<dyn Now>) {
+        let now = clock.now();
+        for entry in self.unacked.values_mut() {
+            entry.first_sent = now;
+            entry.last_sent = now;
+        }
+        for seen in self.recent_recv.values_mut() {
+            *seen = now;
+        }
+        self.clock = clock;
+    }
+
     pub fn config(&self) -> ReliabilityConfig {
         ReliabilityConfig {
             rto_strategy: self.rto_strategy.clone(),
@@ -254,7 +306,7 @@ impl LpReliability {
     /// Fragment if needed, assign TxSequences, piggyback pending Acks,
     /// buffer for retransmit. Returns wire-ready LpPackets.
     pub fn on_send(&mut self, pkt: &[u8]) -> Vec<Bytes> {
-        let now = Instant::now();
+        let now = self.clock.now();
 
         let acks: Vec<u64> = self
             .pending_acks
@@ -316,6 +368,7 @@ impl LpReliability {
                     retx_count: 0,
                     is_retx: false,
                     n_greater_seq_acks: 0,
+                    evidence_floor: tx_seq + 1,
                 },
             );
 
@@ -368,11 +421,22 @@ impl LpReliability {
         if let Some(seq) = tx_seq {
             self.pending_acks.push_back(seq);
 
-            let now = Instant::now();
-            let rto = std::time::Duration::from_micros(self.rto_us);
+            let now = self.clock.now();
+            // Two RTOs, not one. The peer resends a frame whose Ack it lost one of
+            // ITS RTOs after that copy left, on its next retransmit-pump tick (up
+            // to 50 ms later), so with both ends at the same RTO (a ~ms link pins
+            // both at the 200 ms floor) the copy lands just past a one-RTO window.
+            // Measured on the sim fleet: 65 of 93 RTO-driven duplicates slipped
+            // past it into reassembly and the PIT, and `duplicate_frames` read
+            // under half the true count. NFD (`LpReliability::
+            // processIncomingPacket`) keys its window on Sequence and ages it by
+            // its own RTO estimate too, but tests for the duplicate BEFORE ageing
+            // and resends on a per-frame RTO timer, so it misses a copy only when
+            // other traffic arrived in between.
+            let window = 2 * std::time::Duration::from_micros(self.rto_us);
             while let Some(&front) = self.recent_recv_order.front() {
                 match self.recent_recv.get(&front) {
-                    Some(&seen) if now.duration_since(seen) > rto => {
+                    Some(&seen) if now.duration_since(seen) > window => {
                         self.recent_recv.remove(&front);
                         self.recent_recv_order.pop_front();
                     }
@@ -387,7 +451,7 @@ impl LpReliability {
             }
         }
 
-        let now = Instant::now();
+        let now = self.clock.now();
         for ack_seq in acks {
             // Fast retransmit, mirroring NFD's findLostLpPackets(): every frame
             // still unacked BELOW the acked TxSequence has had a later frame
@@ -402,28 +466,16 @@ impl LpReliability {
             // sees it directly as a stall.
             //
             // Only frames below the ack are eligible: `unacked` is ordered by
-            // TxSequence, so that is the range below `ack_seq`.
-            // A frame is only EVIDENCE of loss once it has had a fair chance
-            // to be acked. One network packet fragments into several LP frames
-            // sent back-to-back, so acks for its siblings arrive within
-            // microseconds of each other and in no guaranteed order. Counting
-            // those against a frame declares it lost while it is still in
-            // flight, and the "repair" is pure waste: it spends airtime on a
-            // medium that is already the binding constraint, which makes the
-            // congestion it is reacting to worse.
-            //
-            // Measured on the fleet at heavy video load: the GCS received 9023
-            // duplicate frames from iuas-01 against 13968 Data in the same
-            // window, i.e. roughly HALF of all fast retransmits were spurious
-            // and ~13% of fragments were transmitted twice for nothing.
-            //
-            // So require a frame to have been outstanding for at least one
-            // smoothed RTT before ack ordering may condemn it. Genuine loss is
-            // still caught -- the frame simply waits one RTT longer than the
-            // sibling acks that used to convict it instantly. Before the first
-            // RTT sample srtt is 0 and this is a no-op, matching the old
-            // behaviour on a cold face.
+            // TxSequence, so that is the range below `ack_seq`. And only an ack
+            // for a frame sent AFTER the entry's latest copy is evidence --
+            // see `UnackedEntry::evidence_floor`. Counting the in-flight acks
+            // of earlier frames against a retransmission turned one loss into
+            // `max_retries` back-to-back resends, all but the first spurious,
+            // and then a give-up for a frame the peer had received.
             for (&seq, entry) in self.unacked.range_mut(..ack_seq) {
+                if ack_seq < entry.evidence_floor {
+                    continue;
+                }
                 entry.n_greater_seq_acks += 1;
                 if entry.n_greater_seq_acks == SEQ_NUM_LOSS_THRESHOLD {
                     self.fast_retx_candidates.push(seq);
@@ -453,7 +505,8 @@ impl LpReliability {
         if self.fast_retx_candidates.is_empty() {
             return Vec::new();
         }
-        let now = Instant::now();
+        let now = self.clock.now();
+        let next_tx_seq = self.next_tx_seq;
         let candidates = std::mem::take(&mut self.fast_retx_candidates);
         let mut wires = Vec::with_capacity(candidates.len());
         for seq in candidates {
@@ -466,6 +519,7 @@ impl LpReliability {
                     entry.retx_count += 1;
                     entry.is_retx = true;
                     entry.n_greater_seq_acks = 0;
+                    entry.evidence_floor = next_tx_seq;
                     wires.push(entry.wire.clone());
                     self.fast_retx += 1;
                     false
@@ -505,7 +559,7 @@ impl LpReliability {
 
     /// Returns wire packets due for retransmission.
     pub fn check_retransmit(&mut self) -> Vec<Bytes> {
-        let now = Instant::now();
+        let now = self.clock.now();
         let rto = std::time::Duration::from_micros(self.rto_us);
         let mut retx = Vec::new();
         let mut expired = Vec::new();
@@ -525,12 +579,15 @@ impl LpReliability {
             self.rto_expirations += 1;
         }
 
+        let next_tx_seq = self.next_tx_seq;
         let mut wires = Vec::with_capacity(retx.len().min(self.max_retx_per_tick));
         for seq in retx.into_iter().take(self.max_retx_per_tick) {
             if let Some(entry) = self.unacked.get_mut(&seq) {
                 entry.last_sent = now;
                 entry.retx_count += 1;
                 entry.is_retx = true;
+                entry.n_greater_seq_acks = 0;
+                entry.evidence_floor = next_tx_seq;
                 wires.push(entry.wire.clone());
             }
         }
@@ -560,7 +617,6 @@ impl LpReliability {
     pub fn unacked_evictions(&self) -> u64 {
         self.unacked_evictions
     }
-
 
     pub fn rto_us(&self) -> u64 {
         self.rto_us
@@ -757,7 +813,9 @@ mod tests {
         for wire in &sent[1..4] {
             receiver.on_receive(wire);
         }
-        let acks = receiver.flush_acks().expect("receiver must ack what it got");
+        let acks = receiver
+            .flush_acks()
+            .expect("receiver must ack what it got");
         rel.on_receive(&acks);
 
         let repairs = rel.take_fast_retransmits();
@@ -772,6 +830,80 @@ mod tests {
         // Frame 4 was never acked either, but nothing arrived after it, so
         // there is no evidence it was lost -- it waits for its RTO.
         assert_eq!(rel.unacked_count(), 2, "frames 0 and 4 remain unacked");
+    }
+
+    /// Sends 16 frames, loses frame 0, and delivers 1..=15 with each Ack
+    /// returned on its own. Returns the fast retransmissions the sender emitted
+    /// while those Acks -- all for frames sent BEFORE any retransmission --
+    /// were arriving.
+    fn lose_frame_zero_with_a_window_in_flight(
+        tx: &mut LpReliability,
+        rx: &mut LpReliability,
+    ) -> Vec<Bytes> {
+        let sent: Vec<Bytes> = (0..16)
+            .map(|_| tx.on_send(&small_packet())[0].clone())
+            .collect();
+        let mut repairs = Vec::new();
+        for wire in &sent[1..] {
+            rx.on_receive(wire);
+            tx.on_receive(&rx.flush_acks().unwrap());
+            repairs.extend(tx.take_fast_retransmits());
+        }
+        repairs
+    }
+
+    /// One loss costs exactly one retransmission, however many Acks for
+    /// earlier frames are still in flight when it leaves.
+    ///
+    /// Retransmission reuses the TxSequence, so every in-flight Ack for frames
+    /// 4..=15 is for a HIGHER TxSequence than the resent copy. Counting those
+    /// re-condemned the copy every third Ack: one loss became `max_retries`
+    /// resends, the peer dropped all but the first as duplicates, and the
+    /// sender then gave up on a frame the peer had received.
+    #[test]
+    fn a_retransmission_is_not_condemned_by_acks_for_earlier_frames() {
+        let mut tx = LpReliability::from_config(1400, ReliabilityConfig::wifi());
+        let mut rx = LpReliability::new(1400);
+
+        let repairs = lose_frame_zero_with_a_window_in_flight(&mut tx, &mut rx);
+        let seqs: Vec<Option<u64>> = repairs.iter().map(|w| extract_acks(w).0).collect();
+        assert_eq!(seqs, vec![Some(0)], "frame 0 is resent exactly once");
+
+        assert!(!rx.on_receive(&repairs[0]), "the copy is not a duplicate");
+        tx.on_receive(&rx.flush_acks().unwrap());
+        assert_eq!(rx.duplicate_frames(), 0);
+        assert_eq!(
+            tx.rto_expirations(),
+            0,
+            "a delivered frame is never given up"
+        );
+        assert_eq!(tx.unacked_count(), 0);
+    }
+
+    /// The evidence floor only discounts Acks for frames sent BEFORE the copy:
+    /// a retransmission that is itself lost is still repaired by ack ordering
+    /// once frames sent after it are acked.
+    #[test]
+    fn a_lost_retransmission_is_repaired_by_acks_for_later_frames() {
+        let mut tx = LpReliability::from_config(1400, ReliabilityConfig::wifi());
+        let mut rx = LpReliability::new(1400);
+
+        let repairs = lose_frame_zero_with_a_window_in_flight(&mut tx, &mut rx);
+        assert_eq!(repairs.len(), 1);
+
+        // The copy is lost too; three frames sent after it get through.
+        for _ in 0..3 {
+            let wire = tx.on_send(&small_packet())[0].clone();
+            rx.on_receive(&wire);
+        }
+        tx.on_receive(&rx.flush_acks().unwrap());
+
+        let again: Vec<Option<u64>> = tx
+            .take_fast_retransmits()
+            .iter()
+            .map(|w| extract_acks(w).0)
+            .collect();
+        assert_eq!(again, vec![Some(0)]);
     }
 
     /// Under a backlog, `check_retransmit` repairs the OLDEST losses first.
@@ -1009,6 +1141,66 @@ mod tests {
         }
         assert!(rel.unacked_count() <= MAX_UNACKED);
     }
+
+    /// A clock that moves only when told to.
+    struct ManualClock {
+        base: Instant,
+        offset_us: std::sync::atomic::AtomicU64,
+    }
+
+    impl ManualClock {
+        fn advance_ms(&self, ms: u64) {
+            self.offset_us
+                .fetch_add(ms * 1_000, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    impl Now for ManualClock {
+        fn now(&self) -> Instant {
+            self.base
+                + std::time::Duration::from_micros(
+                    self.offset_us.load(std::sync::atomic::Ordering::Relaxed),
+                )
+        }
+    }
+
+    /// RTO expiry, retransmission and give-up follow the injected clock alone:
+    /// the clock jumps, no wall time passes, and the frame is resent exactly
+    /// when its RTO has elapsed on that clock — which is what lets a simulated
+    /// link retransmit on virtual time instead of on how fast the host ran.
+    #[test]
+    fn rto_expiry_follows_the_injected_clock() {
+        let clock = Arc::new(ManualClock {
+            base: Instant::now(),
+            offset_us: std::sync::atomic::AtomicU64::new(0),
+        });
+        let mut rel = LpReliability::from_config(
+            1400,
+            ReliabilityConfig {
+                rto_strategy: RtoStrategy::Fixed { rto_us: 200_000 },
+                max_retries: 1,
+                ..Default::default()
+            },
+        );
+        rel.set_clock(Arc::clone(&clock) as Arc<dyn Now>);
+        rel.on_send(&small_packet());
+
+        clock.advance_ms(199);
+        assert!(rel.check_retransmit().is_empty(), "RTO not yet elapsed");
+        clock.advance_ms(1);
+        assert_eq!(rel.check_retransmit().len(), 1, "resent once RTO elapses");
+        assert!(
+            rel.check_retransmit().is_empty(),
+            "the resend restarts its RTO"
+        );
+        clock.advance_ms(200);
+        assert!(
+            rel.check_retransmit().is_empty(),
+            "retries exhausted: give up"
+        );
+        assert_eq!(rel.rto_expirations(), 1);
+        assert_eq!(rel.unacked_count(), 0);
+    }
 }
 
 #[cfg(test)]
@@ -1032,9 +1224,18 @@ mod duplicate_suppression_tests {
         let mut rel = LpReliability::new(1400);
         const TX: u64 = 77;
 
-        assert!(!rel.on_receive(&reliable_frame(TX)), "first arrival is not a duplicate");
-        assert!(rel.on_receive(&reliable_frame(TX)), "retransmission must be flagged duplicate");
-        assert!(rel.on_receive(&reliable_frame(TX)), "and stay flagged while in the window");
+        assert!(
+            !rel.on_receive(&reliable_frame(TX)),
+            "first arrival is not a duplicate"
+        );
+        assert!(
+            rel.on_receive(&reliable_frame(TX)),
+            "retransmission must be flagged duplicate"
+        );
+        assert!(
+            rel.on_receive(&reliable_frame(TX)),
+            "and stay flagged while in the window"
+        );
         assert_eq!(rel.duplicate_frames(), 2);
 
         // Every arrival queued an Ack, duplicates included.
@@ -1052,12 +1253,57 @@ mod duplicate_suppression_tests {
     fn distinct_txsequences_are_not_duplicates() {
         let mut rel = LpReliability::new(1400);
         for tx in 0..50u64 {
-            assert!(!rel.on_receive(&reliable_frame(tx)), "tx={tx} is first-seen");
+            assert!(
+                !rel.on_receive(&reliable_frame(tx)),
+                "tx={tx} is first-seen"
+            );
         }
         assert_eq!(rel.duplicate_frames(), 0);
     }
 
-    /// The dedup window is bounded: entries age out after one RTO, so a long
+    /// The peer resends a frame whose Ack it lost one of its RTOs later, on its
+    /// next retransmit tick — so the copy lands a little MORE than one RTO after
+    /// the original. It must still be caught: with both ends at the 200 ms RTO
+    /// floor, a one-RTO window let it through to reassembly and the PIT as new.
+    #[test]
+    fn a_retransmission_one_peer_rto_later_is_still_a_duplicate() {
+        struct StepClock {
+            base: Instant,
+            offset_ms: std::sync::atomic::AtomicU64,
+        }
+        impl Now for StepClock {
+            fn now(&self) -> Instant {
+                self.base
+                    + std::time::Duration::from_millis(
+                        self.offset_ms.load(std::sync::atomic::Ordering::Relaxed),
+                    )
+            }
+        }
+        let clock = Arc::new(StepClock {
+            base: Instant::now(),
+            offset_ms: std::sync::atomic::AtomicU64::new(0),
+        });
+        let mut rel = LpReliability::from_config(
+            1400,
+            ReliabilityConfig {
+                rto_strategy: RtoStrategy::Fixed { rto_us: 200_000 },
+                ..Default::default()
+            },
+        );
+        rel.set_clock(Arc::clone(&clock) as Arc<dyn Now>);
+
+        assert!(!rel.on_receive(&reliable_frame(9)));
+        // Peer RTO (200 ms, same as ours) plus one 50 ms retransmit-pump tick.
+        clock
+            .offset_ms
+            .store(250, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            rel.on_receive(&reliable_frame(9)),
+            "the peer's RTO retransmission must be recognised as a duplicate"
+        );
+    }
+
+    /// The dedup window is bounded: entries age out after two RTOs, so a long
     /// flow cannot grow it without limit.
     #[test]
     fn dedup_window_ages_out_and_stays_bounded() {
