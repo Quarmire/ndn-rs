@@ -371,8 +371,9 @@ impl PitEntry {
         } else {
             self.retx_suppress_interval_ns
         };
-        self.retx_suppress_interval_ns =
-            cur.saturating_mul(RETX_SUPPRESS_MULTIPLIER).min(RETX_SUPPRESS_MAX_NS);
+        self.retx_suppress_interval_ns = cur
+            .saturating_mul(RETX_SUPPRESS_MULTIPLIER)
+            .min(RETX_SUPPRESS_MAX_NS);
     }
 
     /// Upstreams whose last transmission is inside the per-upstream
@@ -1151,7 +1152,11 @@ mod retx_suppression_tests {
     use super::*;
 
     fn entry() -> PitEntry {
-        PitEntry::new(Arc::new(Name::from_components(Vec::<NameComponent>::new())), 0, 4000)
+        PitEntry::new(
+            Arc::new(Name::from_components(Vec::<NameComponent>::new())),
+            0,
+            4000,
+        )
     }
 
     /// An upstream never sent this Interest is NEW — never suppressed.
@@ -1159,7 +1164,10 @@ mod retx_suppression_tests {
     fn a_new_upstream_is_never_suppressed() {
         let e = entry();
         assert!(e.suppressed_upstreams(0).is_empty());
-        assert!(!e.entry_retx_suppressed(0), "an entry with no out-records is NEW");
+        assert!(
+            !e.entry_retx_suppressed(0),
+            "an entry with no out-records is NEW"
+        );
     }
 
     /// Per-upstream (NFD `decidePerUpstream`, used by multicast) is a FIXED
@@ -1169,7 +1177,11 @@ mod retx_suppression_tests {
     fn per_upstream_window_is_fixed_not_exponential() {
         let mut e = entry();
         e.add_out_record(7, 1, 0);
-        assert_eq!(e.suppressed_upstreams(0).as_slice(), &[7], "inside the window");
+        assert_eq!(
+            e.suppressed_upstreams(0).as_slice(),
+            &[7],
+            "inside the window"
+        );
         assert!(
             e.suppressed_upstreams(RETX_SUPPRESS_INITIAL_NS).is_empty(),
             "at the window edge it is forwardable again"
@@ -1179,7 +1191,8 @@ mod retx_suppression_tests {
         e.add_out_record(7, 2, RETX_SUPPRESS_INITIAL_NS);
         e.note_forward_decision();
         assert!(
-            e.suppressed_upstreams(RETX_SUPPRESS_INITIAL_NS * 2).is_empty(),
+            e.suppressed_upstreams(RETX_SUPPRESS_INITIAL_NS * 2)
+                .is_empty(),
             "per-upstream window must stay at the initial interval"
         );
     }

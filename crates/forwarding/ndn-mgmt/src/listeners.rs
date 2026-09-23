@@ -224,9 +224,7 @@ pub async fn run_udp_listener(
 /// Bind the listener with `SO_REUSEPORT` so per-peer connected faces can share
 /// the port, falling back to a plain bind where the option is unavailable
 /// (non-unix): there, peers keep private ephemeral-port sockets as before.
-fn bind_reuseport_socket(
-    addr: std::net::SocketAddr,
-) -> std::io::Result<tokio::net::UdpSocket> {
+fn bind_reuseport_socket(addr: std::net::SocketAddr) -> std::io::Result<tokio::net::UdpSocket> {
     #[cfg(unix)]
     {
         match ndn_face::net::sockopt::bind_reuseport_udp(addr) {

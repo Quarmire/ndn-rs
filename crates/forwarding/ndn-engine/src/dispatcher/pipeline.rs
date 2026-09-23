@@ -296,7 +296,6 @@ impl PacketDispatcher {
             }
         };
 
-
         // Reflexive forwarding: an Interest carrying a REFLEXIVE_NAME installs a
         // temporary reverse route `name -> incoming face` (W-RF-1: only ever the
         // incoming face), bounded by the Interest lifetime (W-RF-3). A later

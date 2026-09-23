@@ -112,7 +112,10 @@ impl NetworkRegionTable {
 /// Measured consequence on the fleet: 12 wire copies per Interest against NFD's
 /// 9 — the 3 extra being exactly the returns to the originator — which put 35%
 /// more packets on a shared medium and cost ~30% of video throughput.
-fn peer_host(face_table: &ndn_transport::FaceTable, face_id: ndn_transport::FaceId) -> Option<String> {
+fn peer_host(
+    face_table: &ndn_transport::FaceTable,
+    face_id: ndn_transport::FaceId,
+) -> Option<String> {
     let uri = face_table.get(face_id)?.remote_uri()?;
     // strip scheme
     Some(host_of_remote_uri(&uri).to_string())
@@ -489,7 +492,9 @@ fn host_of_remote_uri(uri: &str) -> &str {
     if let Some(end) = after_scheme.find(']') {
         &after_scheme[..=end]
     } else {
-        after_scheme.rsplit_once(':').map_or(after_scheme, |(h, _)| h)
+        after_scheme
+            .rsplit_once(':')
+            .map_or(after_scheme, |(h, _)| h)
     }
 }
 
