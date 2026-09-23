@@ -199,14 +199,14 @@ pub struct FaceStatus {
     /// Frames dropped from the retransmit buffer by the `max_unacked` cap:
     /// silent loss no retransmission will ever repair.
     pub n_lp_unacked_evictions: Option<u64>,
-    /// Frames resent early by ack ordering (see [`tlv::N_LP_FAST_RETX`]).
+    /// Frames resent early by ack ordering (TLV `N_LP_FAST_RETX`).
     pub n_lp_fast_retx: Option<u64>,
-    /// Inbound frames dropped as duplicates (see
-    /// [`tlv::N_LP_DUPLICATE_FRAMES`]). Read together with
-    /// `n_lp_fast_retx`: retransmits that show up here as duplicates were
-    /// not repairing loss, they were wasting airtime.
+    /// Inbound frames dropped as duplicates (TLV `N_LP_DUPLICATE_FRAMES`).
+    /// Read together with `n_lp_fast_retx`: retransmits that show up here as
+    /// duplicates were not repairing loss, they were wasting airtime.
     pub n_lp_duplicate_frames: Option<u64>,
-    /// See [`tlv::N_LP_ACKS_SENT`].
+    /// Ack entries handed to the wire (TLV `N_LP_ACKS_SENT`); compare with the
+    /// peer's `n_lp_acks_received` for the ack delivery ratio.
     pub n_lp_acks_sent: Option<u64>,
     /// Fragments rejected by the reassembler AFTER being Acked.
     pub n_reasm_fragments_rejected: Option<u64>,
@@ -410,18 +410,12 @@ impl FaceStatus {
                 tlv::N_REASM_FRAGMENTS_IN => n_reasm_fragments_in = read_non_neg_int(&v),
                 tlv::N_REASM_COMPLETED => n_reasm_completed = read_non_neg_int(&v),
                 tlv::N_REASM_TIMED_OUT => n_reasm_timed_out = read_non_neg_int(&v),
-                tlv::N_REASM_FRAGMENTS_WASTED => {
-                    n_reasm_fragments_wasted = read_non_neg_int(&v)
-                }
-                tlv::N_LP_UNACKED_EVICTIONS => {
-                    n_lp_unacked_evictions = read_non_neg_int(&v)
-                }
+                tlv::N_REASM_FRAGMENTS_WASTED => n_reasm_fragments_wasted = read_non_neg_int(&v),
+                tlv::N_LP_UNACKED_EVICTIONS => n_lp_unacked_evictions = read_non_neg_int(&v),
                 tlv::N_REASM_FRAGMENTS_REJECTED => {
                     n_reasm_fragments_rejected = read_non_neg_int(&v)
                 }
-                tlv::N_REASM_GROUPS_EVICTED => {
-                    n_reasm_groups_evicted = read_non_neg_int(&v)
-                }
+                tlv::N_REASM_GROUPS_EVICTED => n_reasm_groups_evicted = read_non_neg_int(&v),
                 _ => {}
             }
         }
