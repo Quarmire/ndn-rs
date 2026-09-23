@@ -3,6 +3,7 @@
 //! `FragCount`, and reassembles them on the receive side.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 use web_time::Instant;
 
@@ -102,6 +103,18 @@ pub struct ReassemblyStats {
     pub groups_evicted: u64,
 }
 
+/// Time source for reassembly timeouts. The forwarder passes its runtime clock
+/// (`ndn_runtime::Now::now`) so partial groups age in the engine's time —
+/// virtual time under a simulated runtime. With the host clock, a simulation
+/// that ran slower than [`DEFAULT_REASSEMBLY_TIMEOUT`] of wall time purged
+/// groups that were live in simulated time, so whether a fragmented packet
+/// arrived depended on how fast the host ran.
+pub type ReassemblyClock = Arc<dyn Fn() -> Instant + Send + Sync>;
+
+fn wall_clock() -> ReassemblyClock {
+    Arc::new(Instant::now)
+}
+
 pub struct ReassemblyBuffer {
     /// Keyed by `(endpoint_id, seq)`. Multi-access faces (UDP multicast,
     /// Ethernet, BLE multicast) must pass distinct endpoint identifiers per
@@ -110,15 +123,24 @@ pub struct ReassemblyBuffer {
     pending: HashMap<(u64, u64), Pending>,
     timeout: Duration,
     stats: ReassemblyStats,
+    clock: ReassemblyClock,
 }
 
 impl ReassemblyBuffer {
+    /// A buffer timed on the system clock; see [`Self::with_clock`].
     pub fn new(timeout: Duration) -> Self {
         Self {
             pending: HashMap::new(),
             timeout,
             stats: ReassemblyStats::default(),
+            clock: wall_clock(),
         }
+    }
+
+    /// Time group creation and expiry on `clock` instead of the system clock.
+    pub fn with_clock(mut self, clock: ReassemblyClock) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// Snapshot of the multi-fragment delivery counters.
@@ -163,18 +185,17 @@ impl ReassemblyBuffer {
                     .iter()
                     .min_by_key(|(_, v)| v.created)
                     .map(|(k, _)| *k)
+                && let Some(dropped) = self.pending.remove(&oldest_key)
             {
-                if let Some(dropped) = self.pending.remove(&oldest_key) {
-                    self.stats.groups_evicted += 1;
-                    self.stats.fragments_wasted += dropped.received as u64;
-                }
+                self.stats.groups_evicted += 1;
+                self.stats.fragments_wasted += dropped.received as u64;
             }
         }
         let entry = self.pending.entry(key).or_insert_with(|| Pending {
             fragments: vec![None; count],
             frag_count: count,
             received: 0,
-            created: Instant::now(),
+            created: (self.clock)(),
         });
 
         if entry.frag_count != count || idx >= entry.frag_count {
@@ -208,10 +229,11 @@ impl ReassemblyBuffer {
 
     pub fn purge_expired(&mut self) {
         let timeout = self.timeout;
+        let now = (self.clock)();
         let mut timed_out = 0u64;
         let mut wasted = 0u64;
         self.pending.retain(|_, v| {
-            let live = v.created.elapsed() < timeout;
+            let live = now.saturating_duration_since(v.created) < timeout;
             if !live {
                 timed_out += 1;
                 wasted += v.received as u64;
@@ -433,6 +455,39 @@ mod tests {
 
         buf.purge_expired();
         assert_eq!(buf.pending_count(), 0);
+    }
+
+    /// A partial group expires when the injected clock says the timeout has
+    /// passed, and not before — no wall time passes in this test. The engine
+    /// injects its runtime clock, so under a simulator groups age in virtual
+    /// time rather than in however long the host took.
+    #[test]
+    fn expiry_follows_the_injected_clock() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let base = Instant::now();
+        let offset_ms = Arc::new(AtomicU64::new(0));
+        let clock: ReassemblyClock = {
+            let offset_ms = Arc::clone(&offset_ms);
+            Arc::new(move || base + Duration::from_millis(offset_ms.load(Ordering::Relaxed)))
+        };
+        let mut buf = ReassemblyBuffer::new(Duration::from_secs(5)).with_clock(clock);
+        let frags = fragment_packet(&[7u8; 3000], 200, 1);
+        let lp = crate::lp::LpPacket::decode(frags[0].clone()).unwrap();
+        buf.process(
+            0,
+            base_seq(&lp),
+            lp.frag_index.unwrap(),
+            lp.frag_count.unwrap(),
+            lp.fragment.unwrap(),
+        );
+
+        offset_ms.store(4_999, Ordering::Relaxed);
+        buf.purge_expired();
+        assert_eq!(buf.pending_count(), 1, "still inside the timeout");
+        offset_ms.store(5_000, Ordering::Relaxed);
+        buf.purge_expired();
+        assert_eq!(buf.pending_count(), 0, "timed out on the injected clock");
+        assert_eq!(buf.stats().timed_out, 1);
     }
 
     /// `process` does NOT sweep on its own — only when the table is FULL.
