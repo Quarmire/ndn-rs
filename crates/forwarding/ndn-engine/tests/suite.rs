@@ -13,6 +13,8 @@
 mod broadcast_data_parity;
 #[path = "congestion_feedback.rs"]
 mod congestion_feedback;
+#[path = "data_path_cert_fetch.rs"]
+mod data_path_cert_fetch;
 #[path = "egress_scheduler.rs"]
 mod egress_scheduler;
 #[path = "face_factory.rs"]

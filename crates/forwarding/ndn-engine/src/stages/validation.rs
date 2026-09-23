@@ -26,8 +26,23 @@ pub struct ValidationStats {
 use crate::observability::targets as t;
 
 use crate::pipeline::{Action, DecodedPacket, DropReason, PacketContext};
-use ndn_packet::Name;
+use ndn_packet::{Data, Name};
 use ndn_security::{CertFetcher, ValidationResult, Validator};
+
+/// How far [`ValidationStage`] follows a Data packet's certificate chain.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ChainWalk {
+    /// Certificate → issuer until a trust anchor terminates the chain
+    /// (`SecurityProfile::Default` / `Custom`).
+    #[default]
+    ToAnchor,
+    /// The signature must verify against the signer's own certificate, whoever
+    /// issued it -- `SecurityProfile::AcceptSigned`, documented as "signature
+    /// only, no chain walk". Walking to an anchor instead made accept-signed a
+    /// stricter `default` that dropped every Data not signed directly by one of
+    /// the node's own anchors.
+    SignerOnly,
+}
 
 struct PendingEntry {
     ctx: PacketContext,
@@ -131,6 +146,7 @@ impl PendingQueue {
 pub struct ValidationStage {
     pub validator: Option<Arc<Validator>>,
     pub cert_fetcher: Option<Arc<CertFetcher>>,
+    walk: ChainWalk,
     pending: Arc<Mutex<PendingQueue>>,
     pub runtime: Arc<dyn Runtime>,
     stats: Arc<ValidationStats>,
@@ -146,6 +162,7 @@ impl ValidationStage {
         Self {
             validator,
             cert_fetcher,
+            walk: ChainWalk::default(),
             pending: Arc::new(Mutex::new(PendingQueue::new(&config))),
             runtime,
             stats: Arc::new(ValidationStats::default()),
@@ -156,11 +173,25 @@ impl ValidationStage {
         Self {
             validator: None,
             cert_fetcher: None,
+            walk: ChainWalk::default(),
             pending: Arc::new(Mutex::new(
                 PendingQueue::new(&PendingQueueConfig::default()),
             )),
             runtime: ndn_runtime::default_runtime(),
             stats: Arc::new(ValidationStats::default()),
+        }
+    }
+
+    /// Check forwarded Data only as far as `walk` says (default: to an anchor).
+    pub fn with_chain_walk(mut self, walk: ChainWalk) -> Self {
+        self.walk = walk;
+        self
+    }
+
+    async fn check(&self, validator: &Validator, data: &Data) -> ValidationResult {
+        match self.walk {
+            ChainWalk::ToAnchor => validator.validate_chain(data).await,
+            ChainWalk::SignerOnly => validator.validate(data).await,
         }
     }
 
@@ -211,10 +242,7 @@ impl ValidationStage {
         // ndn-rs validates everything, including /localhost mgmt responses
         // (signed with DigestSha256). NFD reaches the same effect via an
         // explicit `m_localhostValidator` allowlist.
-        let result = validator
-            .validate_chain(data)
-            .instrument(span.clone())
-            .await;
+        let result = self.check(validator, data).instrument(span.clone()).await;
         span.record("elapsed_us", started.elapsed().as_micros() as u64);
         match result {
             ValidationResult::Valid(_safe) => {
@@ -285,7 +313,7 @@ impl ValidationStage {
                             continue;
                         }
                     };
-                    match validator.validate_chain(data).await {
+                    match self.check(validator, data).await {
                         ValidationResult::Valid(_) => {
                             self.stats.valid.fetch_add(1, Ordering::Relaxed);
                             trace!(target: t::SECURITY, name=%data.name, "validation: re-validated after cert fetch");

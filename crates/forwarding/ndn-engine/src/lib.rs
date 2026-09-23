@@ -21,6 +21,8 @@
 pub mod activity;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod builder;
+#[cfg(not(target_arch = "wasm32"))]
+mod cert_fetch;
 pub mod compose;
 pub mod discovery_context;
 pub mod dispatcher;

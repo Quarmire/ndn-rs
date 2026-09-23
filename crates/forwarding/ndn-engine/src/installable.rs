@@ -93,8 +93,11 @@ impl PostBuildQueue {
                 }
                 PostBuildAction::SeedNeighbor { peer, face_id } => {
                     let mut entry = ndn_discovery_core::neighbor::NeighborEntry::new(peer);
+                    // Runtime clock, not `Instant::now()`: discovery ages this
+                    // against `runtime.now()`, which is virtual time under a
+                    // simulated runtime.
                     entry.state = ndn_discovery_core::neighbor::NeighborState::Established {
-                        last_seen: std::time::Instant::now(),
+                        last_seen: engine.runtime().now(),
                     };
                     entry.faces.push((
                         face_id,

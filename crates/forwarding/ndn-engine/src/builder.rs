@@ -8,7 +8,7 @@ use tracing::Instrument as _;
 
 use ndn_packet::Name;
 use ndn_security::{
-    CertFetcher, ReplayGuard, SchemaRule, SecurityManager, SecurityProfile, TrustSchema, Validator,
+    ReplayGuard, SchemaRule, SecurityManager, SecurityProfile, TrustSchema, Validator,
 };
 use ndn_store::{
     CsAdmissionPolicy, CsObserver, DeadNonceList, ErasedContentStore, LruCs, ObservableCs, Pit,
@@ -28,7 +28,7 @@ use crate::{
     routing::{RoutingManager, RoutingProtocol},
     stages::{
         CsInsertStage, CsLookupStage, ErasedStrategy, PitCheckStage, PitMatchStage, StrategyStage,
-        TlvDecodeStage, ValidationStage,
+        TlvDecodeStage, ValidationStage, validation::ChainWalk,
     },
 };
 
@@ -593,8 +593,11 @@ impl EngineBuilder {
         let strategy_table = Arc::new(StrategyTable::<dyn ErasedStrategy>::new());
         strategy_table.insert(&Name::root(), Arc::clone(&default_strategy));
 
-        let (validator, cert_fetcher) =
-            resolve_security_profile(self.security_profile, &self.security);
+        let (validator, chain_walk) =
+            match resolve_security_profile(self.security_profile, &self.security) {
+                Some((v, walk)) => (Some(v), walk),
+                None => (None, ChainWalk::default()),
+            };
 
         if let Some(v) = &validator {
             for rule in self.schema_rules {
@@ -654,8 +657,9 @@ impl EngineBuilder {
 
         // Shared with the dispatcher's TlvDecodeStage so `faces/list` can read
         // per-face reassembly counters and the sweeper can expire stale groups.
-        let reassembly: Arc<dashmap::DashMap<ndn_transport::FaceId, ndn_packet::fragment::ReassemblyBuffer>> =
-            Arc::new(dashmap::DashMap::new());
+        let reassembly: Arc<
+            dashmap::DashMap<ndn_transport::FaceId, ndn_packet::fragment::ReassemblyBuffer>,
+        > = Arc::new(dashmap::DashMap::new());
 
         let inner = Arc::new(EngineInner {
             start_timestamp_ms: crate::engine::unix_time_ms(),
@@ -740,7 +744,13 @@ impl EngineBuilder {
                 Arc::clone(&face_table),
                 Arc::clone(&face_states),
                 Arc::clone(&reassembly),
-            ),
+            )
+            // Partial groups age on the runtime clock, like the sweeper that
+            // expires them (which already sleeps on the runtime).
+            .with_reassembly_clock({
+                let runtime = Arc::clone(&runtime);
+                Arc::new(move || runtime.now())
+            }),
             cs_lookup: CsLookupStage {
                 cs: Arc::clone(&cs),
             },
@@ -767,12 +777,24 @@ impl EngineBuilder {
                 pit: Arc::clone(&pit),
                 dead_nonce_list: Some(Arc::clone(&dead_nonce_list)),
             },
+            // The engine fetches the certificates its own Data path needs, for
+            // every profile that validates: before this, `default` got a no-op
+            // fetcher and `accept-signed` none, so forwarded Data whose signer's
+            // cert was not already cached was parked and dropped when the
+            // pending timeout expired (docs/nfd-divergence-findings.md, Round 17).
             validation: ValidationStage::new(
-                validator,
-                cert_fetcher,
+                validator.clone(),
+                validator.as_ref().map(|v| {
+                    crate::cert_fetch::engine_cert_fetcher(
+                        Arc::downgrade(&inner),
+                        v.cert_cache_arc(),
+                        cancel.child_token(),
+                    )
+                }),
                 crate::stages::validation::PendingQueueConfig::default(),
                 Arc::clone(&runtime),
-            ),
+            )
+            .with_chain_walk(chain_walk),
             cs_insert: CsInsertStage {
                 cs: Arc::clone(&cs),
                 admission: self
@@ -892,16 +914,21 @@ impl EngineBuilder {
     }
 }
 
+/// The Data-path validator a profile selects, and how far it walks chains.
+///
+/// The validator gets no `CertFetcher` of its own: its chain walk runs inside
+/// the pipeline, where awaiting a network fetch would block the pipeline on the
+/// certificate Data it has to forward to finish that fetch. `build` hands the
+/// validation stage an engine-backed fetcher instead (see `cert_fetch`), which
+/// fetches off the pipeline and re-validates parked Data when the cert lands.
 fn resolve_security_profile(
     profile: SecurityProfile,
     security: &Option<Arc<SecurityManager>>,
-) -> (Option<Arc<Validator>>, Option<Arc<CertFetcher>>) {
-    use std::time::Duration;
-
+) -> Option<(Arc<Validator>, ChainWalk)> {
     match profile {
-        SecurityProfile::Disabled => (None, None),
+        SecurityProfile::Disabled => None,
 
-        SecurityProfile::Custom(v) => (Some(v), None),
+        SecurityProfile::Custom(v) => Some((v, ChainWalk::ToAnchor)),
 
         SecurityProfile::AcceptSigned => {
             let validator = if let Some(mgr) = security {
@@ -919,19 +946,22 @@ fn resolve_security_profile(
             } else {
                 Arc::new(Validator::new(TrustSchema::accept_all()))
             };
-            (Some(validator), None)
+            Some((validator, ChainWalk::SignerOnly))
         }
 
         SecurityProfile::Default => {
             let Some(mgr) = security else {
+                // Still a chain walk: a config asking for full validation must
+                // never quietly become signature-only. With no anchors it fails
+                // closed for key-signed Data; DigestSha256 Data still validates.
                 tracing::info!(target: t::SECURITY,
-                    "No SecurityManager configured; using AcceptSigned validation \
-                     (DigestSha256 or stronger required, hierarchy not enforced). \
-                     Configure a [security] block with trust anchors for full \
-                     hierarchical validation."
+                    "No SecurityManager configured: profile \"default\" has no trust \
+                     anchors, so only DigestSha256 Data validates and key-signed Data \
+                     is dropped. Configure a [security] identity whose PIB holds trust \
+                     anchors, or profile = \"accept-signed\"."
                 );
                 let validator = Arc::new(Validator::new(TrustSchema::accept_all()));
-                return (Some(validator), None);
+                return Some((validator, ChainWalk::ToAnchor));
             };
 
             // Share the manager's keyring (its ambient context holds the
@@ -941,24 +971,13 @@ fn resolve_security_profile(
             mgr.keyring()
                 .ambient()
                 .set_schema(TrustSchema::hierarchical());
-            let cert_cache = mgr.cert_cache_arc();
-
-            // No-op FetchFn placeholder; the router wires a real one via
-            // AppFace after engine construction.
-            let fetcher = Arc::new(CertFetcher::new(
-                Arc::clone(&cert_cache),
-                Arc::new(|_name| Box::pin(async { None })),
-                Duration::from_secs(4),
-            ));
-
             let validator = Arc::new(Validator::with_keyring(
                 Arc::clone(mgr.keyring()),
-                cert_cache,
-                Some(Arc::clone(&fetcher)),
+                mgr.cert_cache_arc(),
+                None,
                 5,
             ));
-
-            (Some(validator), Some(fetcher))
+            Some((validator, ChainWalk::ToAnchor))
         }
     }
 }

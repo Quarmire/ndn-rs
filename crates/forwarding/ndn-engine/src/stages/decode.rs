@@ -7,7 +7,7 @@ use tracing::trace;
 use crate::observability::targets as t;
 use crate::pipeline::{Action, DecodedPacket, DropReason, PacketContext};
 use ndn_packet::ContentHashTarget;
-use ndn_packet::fragment::ReassemblyBuffer;
+use ndn_packet::fragment::{ReassemblyBuffer, ReassemblyClock};
 use ndn_packet::lp::{LpPacket, extract_fragment, is_lp_packet};
 use ndn_packet::wire::ensure_nonce;
 use ndn_packet::{Data, Interest, Nack, Name, tlv_type};
@@ -57,6 +57,9 @@ pub struct TlvDecodeStage {
     /// Engine face state, read to gate privileged ingress local fields
     /// (NextHopFaceId) on the ingress face's `LocalFields` option.
     face_states: Arc<DashMap<FaceId, crate::engine::FaceState>>,
+    /// Clock for the per-face reassembly buffers this stage creates; `None`
+    /// keeps them on the system clock. The engine sets its runtime clock.
+    reassembly_clock: Option<ReassemblyClock>,
 }
 
 impl TlvDecodeStage {
@@ -84,6 +87,23 @@ impl TlvDecodeStage {
             reassembly,
             face_options: DashMap::new(),
             face_states,
+            reassembly_clock: None,
+        }
+    }
+
+    /// Time reassembly timeouts on `clock` (the engine passes its runtime),
+    /// so a partial group ages in the same time the rest of the engine runs
+    /// in — virtual time under a simulated runtime.
+    pub fn with_reassembly_clock(mut self, clock: ReassemblyClock) -> Self {
+        self.reassembly_clock = Some(clock);
+        self
+    }
+
+    fn new_reassembly_buffer(&self) -> ReassemblyBuffer {
+        let buffer = ReassemblyBuffer::default();
+        match &self.reassembly_clock {
+            Some(clock) => buffer.with_clock(Arc::clone(clock)),
+            None => buffer,
         }
     }
 
@@ -140,7 +160,10 @@ impl TlvDecodeStage {
             Some(b) => b,
             None => return Ok(None),
         };
-        let mut rb = self.reassembly.entry(face_id).or_default();
+        let mut rb = self
+            .reassembly
+            .entry(face_id)
+            .or_insert_with(|| self.new_reassembly_buffer());
         // `endpoint_id` (from the link-layer sender; 0 for unicast) keys
         // reassembly per-sender so concurrent fragmenting peers on a
         // multi-access face don't alias overlapping sequences.
@@ -373,7 +396,10 @@ impl TlvDecodeStage {
         if is_fragmented {
             let face_id = ctx.face_id;
             let complete = {
-                let mut rb = self.reassembly.entry(face_id).or_default();
+                let mut rb = self
+                    .reassembly
+                    .entry(face_id)
+                    .or_insert_with(|| self.new_reassembly_buffer());
                 let seq = sequence.unwrap_or(0);
                 let idx = frag_index.unwrap_or(0);
                 // Guard the same underflow as the fast path (audit W-2).

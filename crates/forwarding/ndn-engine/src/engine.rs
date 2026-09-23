@@ -1003,6 +1003,13 @@ pub(crate) async fn run_face_sender(
     // G4: if this face has an egress scheduler installed, the send loop drains *it* (in
     // priority order) instead of the raw `rx`. `None` ⇒ the FIFO default (drain `rx`).
     let scheduler = face_states.get(&face_id).and_then(|s| s.scheduler.clone());
+    // LP reliability (RTT samples, RTO expiry, duplicate window) and congestion
+    // marking time themselves on the engine's runtime, like everything else in
+    // the engine. The retx tick below already sleeps on the runtime; with the
+    // features on the host clock, a simulated link's RTO elapsed in however
+    // much wall time the simulator took, not in virtual time.
+    face.link_service
+        .wire_clock(Arc::clone(&runtime) as Arc<dyn ndn_runtime::Now>);
     // NDNLPv2 reliability lives entirely in the per-face `ReliabilityFeature`
     // (runtime-mutable via `faces/update` / discovery enablement). The send arm
     // frames through it when enabled; the retx tick pumps its retransmissions
@@ -1026,7 +1033,19 @@ pub(crate) async fn run_face_sender(
     if let Some(feature) = lp_reliability_feature.as_ref() {
         const DATAGRAM_FRAGMENT_MTU: usize = 1452; // matches NFD's peer faces
         if matches!(face.kind(), FaceKind::Udp) {
-            feature.set_mtu(DATAGRAM_FRAGMENT_MTU);
+            // Never above what the transport itself sends (`UdpFace` advertises
+            // 1400). A reliable frame of 1401-1452 B otherwise hit
+            // `LpLinkService::send`'s re-fragment branch, which re-framed its
+            // payload under fresh TxSequences and left the original TxSequence
+            // tracked but never on the wire: RTO "retransmitted" it by
+            // re-fragmenting again (whole extra copies of the packet, invisible
+            // to LP dedup) and then gave it up. NFD's GenericLinkService
+            // fragments at `Transport::getMtu()`, so the two never disagree.
+            let mtu = face
+                .transport
+                .send_mtu()
+                .map_or(DATAGRAM_FRAGMENT_MTU, |m| m.min(DATAGRAM_FRAGMENT_MTU));
+            feature.set_mtu(mtu);
             // A fragmenting datagram face needs the lossy-link retry profile.
             // `LpLinkService::new()` hands every face
             // `ReliabilityConfig::default()` — max_retries 1 — so the tuned
@@ -1146,9 +1165,7 @@ pub(crate) async fn run_face_sender(
     let mut next_tick = runtime.unix_nanos().saturating_add(tick_nanos);
     let mut tick_count: u32 = 0;
     loop {
-        let until = std::time::Duration::from_nanos(
-            next_tick.saturating_sub(runtime.unix_nanos()),
-        );
+        let until = std::time::Duration::from_nanos(next_tick.saturating_sub(runtime.unix_nanos()));
         let retx_sleep = runtime.sleep(until);
         tokio::select! {
             biased;            _ = cancel.cancelled() => break,
@@ -1232,7 +1249,7 @@ pub(crate) async fn run_face_sender(
                 tick_count = tick_count.wrapping_add(1);
                 if let Some(feature) = lp_reliability_feature.as_ref() {
                     // Retransmissions keep the original 50 ms cadence.
-                    if tick_count % RETX_TICKS == 0 {
+                    if tick_count.is_multiple_of(RETX_TICKS) {
                         for wire in feature.take_retransmissions() {
                             if let Err(e) = face.send_bytes(wire).await
                                 && handle_send_error(e)
