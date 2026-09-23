@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use web_time::Instant;
@@ -194,6 +193,14 @@ impl Rib {
     /// `CAPTURE`, which blocks inheritance from above it. Per face, an own
     /// route takes precedence over an inherited one. (Pure-inheritance to
     /// unregistered prefixes is handled by FIB longest-prefix match.)
+    ///
+    /// Nexthops come out in RIB order — own routes as they were added, then
+    /// inherited ones nearest ancestor first — and the FIB's stable cost sort
+    /// keeps that order among equal costs. It used to come from iterating two
+    /// `HashMap`s, whose order is randomised per process: with the fleet's
+    /// three `/muas` peers all at cost 10, WHICH peer best-route forwards to
+    /// (`nexthops.first()`) changed from one forwarder restart to the next,
+    /// and a seeded simulation of the same config was not reproducible.
     fn effective_nexthops(&self, prefix: &Name) -> Vec<FibNexthop> {
         // Route-flag bits (ndn_config::control_parameters::route_flags;
         // ndn-cxx nfd-constants.hpp): CHILD_INHERIT=1, CAPTURE=2.
@@ -203,22 +210,27 @@ impl Rib {
         let Some(own_entry) = self.routes.get(prefix) else {
             return Vec::new();
         };
-        // Best own cost per face (ties → lowest origin), and whether this
-        // prefix captures (blocks inheriting from ancestors).
-        let mut best_own: HashMap<FaceId, (u32, u64)> = HashMap::new();
+        // Best own cost per face (ties → lowest origin), in RIB order, and
+        // whether this prefix captures (blocks inheriting from ancestors).
+        // Linear scans: a prefix carries a handful of routes.
+        let mut own: Vec<(FaceId, u32, u64)> = Vec::new();
         let mut own_captures = false;
         for r in own_entry.iter() {
             own_captures |= r.flags & CAPTURE != 0;
-            let e = best_own.entry(r.face_id).or_insert((u32::MAX, u64::MAX));
-            if r.cost < e.0 || (r.cost == e.0 && r.origin < e.1) {
-                *e = (r.cost, r.origin);
+            match own.iter_mut().find(|(face, _, _)| *face == r.face_id) {
+                Some(e) => {
+                    if r.cost < e.1 || (r.cost == e.1 && r.origin < e.2) {
+                        (e.1, e.2) = (r.cost, r.origin);
+                    }
+                }
+                None => own.push((r.face_id, r.cost, r.origin)),
             }
         }
         drop(own_entry);
 
         // Inherited: walk strict ancestors nearest→farthest, collecting
         // CHILD_INHERIT routes; stop after a capturing ancestor.
-        let mut best_inh: HashMap<FaceId, u32> = HashMap::new();
+        let mut inherited: Vec<(FaceId, u32)> = Vec::new();
         if !own_captures {
             for n in (0..prefix.len()).rev() {
                 let anc = Name::from_components(prefix.components()[..n].iter().cloned());
@@ -229,9 +241,9 @@ impl Rib {
                 for r in routes.iter() {
                     anc_captures |= r.flags & CAPTURE != 0;
                     if r.flags & CHILD_INHERIT != 0 {
-                        let e = best_inh.entry(r.face_id).or_insert(u32::MAX);
-                        if r.cost < *e {
-                            *e = r.cost;
+                        match inherited.iter_mut().find(|(face, _)| *face == r.face_id) {
+                            Some(e) => e.1 = e.1.min(r.cost),
+                            None => inherited.push((r.face_id, r.cost)),
                         }
                     }
                 }
@@ -241,18 +253,16 @@ impl Rib {
             }
         }
 
-        let mut nexthops: Vec<FibNexthop> = best_own
+        let mut nexthops: Vec<FibNexthop> = own
             .iter()
-            .map(|(face_id, (cost, _))| FibNexthop {
-                face_id: *face_id,
-                cost: *cost,
-            })
+            .map(|&(face_id, cost, _)| FibNexthop { face_id, cost })
             .collect();
-        for (face_id, cost) in best_inh {
-            if !best_own.contains_key(&face_id) {
-                nexthops.push(FibNexthop { face_id, cost });
-            }
-        }
+        nexthops.extend(
+            inherited
+                .into_iter()
+                .filter(|(face, _)| !own.iter().any(|o| o.0 == *face))
+                .map(|(face_id, cost)| FibNexthop { face_id, cost }),
+        );
         nexthops
     }
 
@@ -408,6 +418,36 @@ mod tests {
             .unwrap_or_default();
         v.sort_unstable();
         v
+    }
+
+    /// Equal-cost nexthops keep RIB order (own routes as added, then
+    /// inherited), so best-route's choice among equal-cost peers is the same
+    /// on every forwarder start and every seeded simulation run. The order
+    /// used to come from `HashMap` iteration, randomised per process.
+    #[test]
+    fn equal_cost_nexthops_keep_rib_order() {
+        const CHILD_INHERIT: u64 = 1;
+        let rib = Rib::new();
+        let fib = Fib::new();
+        let peers = [7u64, 2, 9, 4, 1, 8, 3, 6];
+        for face in peers {
+            rib.add(&nn("/muas"), flagged(face, 10, CHILD_INHERIT));
+        }
+        rib.add(&nn("/muas/v2/group"), flagged(5, 10, 0));
+        rib.apply_to_fib(&nn("/muas"), &fib);
+
+        let order = |name: &str| -> Vec<u64> {
+            let entry = fib.lpm(&nn(name)).unwrap();
+            entry.nexthops.iter().map(|h| h.face_id.0).collect()
+        };
+        assert_eq!(order("/muas/node"), peers);
+        let mut group = vec![5];
+        group.extend(peers);
+        assert_eq!(
+            order("/muas/v2/group"),
+            group,
+            "own route first, then the inherited peers in RIB order"
+        );
     }
 
     #[test]
