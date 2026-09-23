@@ -3,14 +3,14 @@ use std::sync::Arc;
 
 use ndn_packet::{Data, Interest, KeyLocator, Name, SignatureType};
 
-use crate::cert_cache::Certificate;
+use crate::cert_cache::{Certificate, locator_names_cert};
 use crate::safe_data::TrustPath;
 use crate::verifier::verify_by_sig_type;
 use crate::{SafeData, TrustError, VerifyOutcome};
 
 use super::{
     ChainTrace, ChainTraceStep, InterestValidationOutcome, TraceFailure, TraceRuleApplied,
-    ValidationResult, Validator, now_ns,
+    ValidationResult, Validator, now_ns, own_certificate,
 };
 
 /// Outcome of [`Validator::walk_to_anchor`] — the shared chain-walk core used by
@@ -79,10 +79,12 @@ impl Validator {
         // The chain is walked against the schema/anchors of the context
         // governing this name (the per-namespace skeleton-key fix), with missing
         // intermediates fetched via the `CertFetcher` if configured.
+        let own_cert = own_certificate(data, &first_key);
         match self
             .walk_to_anchor(
                 &data.name,
                 first_key,
+                own_cert,
                 data.signed_region(),
                 data.sig_value(),
                 sig_info.sig_type,
@@ -149,6 +151,7 @@ impl Validator {
             .walk_to_anchor(
                 &interest.name,
                 first_key,
+                None,
                 &signed_region,
                 sig_value,
                 sig_info.sig_type,
@@ -164,12 +167,15 @@ impl Validator {
     /// Shared chain-walk core for the Data and signed-Interest paths: starting
     /// from `(first_signed_region, first_sig_value)` signed by `first_key`, walk
     /// cert → issuer until a trust anchor of the context governing
-    /// `context_name` terminates the chain. Missing certs are fetched via the
+    /// `context_name` terminates the chain. `first_cert` is the signer's
+    /// certificate when the packet carries it itself (a self-signed
+    /// certificate, see [`own_certificate`]). Missing certs are fetched via the
     /// `CertFetcher` if configured (→ [`WalkOutcome::Pending`] on a miss).
     async fn walk_to_anchor(
         &self,
         context_name: &Name,
         first_key: Arc<Name>,
+        mut first_cert: Option<Certificate>,
         first_signed_region: &[u8],
         first_sig_value: &[u8],
         first_sig_type: SignatureType,
@@ -208,7 +214,18 @@ impl Validator {
                 });
             }
 
-            if let Some(anchor) = anchors.get(&current_key_name) {
+            // An anchor answers to its KEY name as well as its certificate name
+            // (ndn-cxx KeyLocators name the key), as the cert cache does.
+            let anchor = anchors
+                .get(&current_key_name)
+                .map(|a| a.clone())
+                .or_else(|| {
+                    anchors
+                        .iter()
+                        .find(|a| locator_names_cert(&current_key_name, a.key()))
+                        .map(|a| a.value().clone())
+                });
+            if let Some(anchor) = anchor {
                 if !anchor.is_valid_at(now) {
                     return WalkOutcome::Invalid(TrustError::CertNotFound {
                         name: format!("expired trust anchor: {}", current_key_name),
@@ -233,9 +250,12 @@ impl Validator {
                 };
             }
 
-            let cert = match self.resolve_cert(&current_key_name).await {
+            let cert = match first_cert.take() {
                 Some(c) => c,
-                None => return WalkOutcome::Pending,
+                None => match self.resolve_cert(&current_key_name).await {
+                    Some(c) => c,
+                    None => return WalkOutcome::Pending,
+                },
             };
 
             if !cert.is_valid_at(now) {
@@ -591,6 +611,108 @@ mod tests {
             validator.validate_chain(&data).await,
             ValidationResult::Pending
         ));
+    }
+
+    /// A self-signed certificate carries its own verifying key, so validating it
+    /// never waits on the cache or a fetch for that key: a forwarder that fetched
+    /// a root cert while resolving a chain would otherwise hold it pending behind
+    /// its own fetch. Signature-only validation accepts it; the chain walk rejects
+    /// it outright unless it is an anchor (it signs itself -- a cycle), and accepts
+    /// it when it is one.
+    #[tokio::test]
+    async fn self_signed_cert_resolves_its_own_key() {
+        let seed = [23u8; 32];
+        let root = name1("root");
+        let signer = Ed25519Signer::from_seed(&seed, root.clone());
+        let pk = ed25519_dalek::SigningKey::from_bytes(&seed)
+            .verifying_key()
+            .to_bytes();
+        let cert = Data::decode(make_cert_data_packet(&root, &pk, &signer).await).unwrap();
+
+        let validator = Validator::new(wildcard_schema());
+        assert!(
+            matches!(validator.validate(&cert).await, ValidationResult::Valid(_)),
+            "signature-only: a self-signed cert verifies against the key it carries"
+        );
+        assert!(
+            matches!(
+                validator.validate_chain(&cert).await,
+                ValidationResult::Invalid(TrustError::ChainCycle { .. })
+            ),
+            "chain walk: a self-signed cert that is not an anchor is untrusted, not pending"
+        );
+
+        validator.add_trust_anchor(anchor_cert(root, pk));
+        assert!(matches!(
+            validator.validate_chain(&cert).await,
+            ValidationResult::Valid(_)
+        ));
+
+        let mut forged = cert.raw().to_vec();
+        *forged.last_mut().unwrap() ^= 0xFF;
+        let forged = Data::decode(Bytes::from(forged)).unwrap();
+        assert!(matches!(
+            Validator::new(wildcard_schema()).validate(&forged).await,
+            ValidationResult::Invalid(TrustError::InvalidSignature)
+        ));
+    }
+
+    /// ndn-cxx names: KeyLocators name the KEY (`/p/KEY/k`), certificates carry
+    /// two more components (`/p/KEY/k/<issuer>/<version>`). A cached cert and an
+    /// anchor must both answer to their KEY name, and a self-signed cert whose
+    /// KeyLocator names its KEY still carries its own verifying key.
+    #[tokio::test]
+    async fn key_name_locators_resolve_certs_and_anchors() {
+        use crate::SignWith;
+        use ndn_packet::encode::DataBuilder;
+
+        let root = Ed25519Signer::from_seed(&[24; 32], "/root/KEY/r".parse().unwrap());
+        let root_pk = root.public_key().unwrap();
+        let root_cert = Data::decode(
+            crate::manager::encode_cert_data(
+                &"/root/KEY/r/self/v1".parse().unwrap(),
+                &root_pk,
+                &root,
+                0,
+                u64::MAX,
+            )
+            .await
+            .unwrap(),
+        )
+        .unwrap();
+        let key = Ed25519Signer::from_seed(&[25; 32], "/p/KEY/k".parse().unwrap());
+        let key_cert = crate::manager::encode_cert_data(
+            &"/p/KEY/k/root/v1".parse().unwrap(),
+            &key.public_key().unwrap(),
+            &root,
+            0,
+            u64::MAX,
+        )
+        .await
+        .unwrap();
+        let data = Data::decode(
+            DataBuilder::new("/p/data".parse::<Name>().unwrap(), b"x")
+                .sign_with_sync(&key)
+                .unwrap(),
+        )
+        .unwrap();
+
+        let validator = Validator::new(wildcard_schema());
+        assert!(
+            matches!(
+                validator.validate(&root_cert).await,
+                ValidationResult::Valid(_)
+            ),
+            "a self-signed cert located by its KEY name verifies against its own key"
+        );
+        validator.add_trust_anchor(Certificate::decode(&root_cert).unwrap());
+        validator
+            .cert_cache()
+            .insert(Certificate::decode(&Data::decode(key_cert).unwrap()).unwrap());
+        match validator.validate_chain(&data).await {
+            ValidationResult::Valid(_) => {}
+            other => panic!("KEY-name chain to a KEY-name anchor must validate, got {other:?}"),
+        }
     }
 
     /// Build a signed command Interest with `signer`, KeyLocator = `key_name`.

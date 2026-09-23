@@ -380,7 +380,11 @@ impl Validator {
             return ValidationResult::Invalid(TrustError::SchemaMismatch);
         }
 
-        let Some(cert) = self.cert_cache.get(&key_name) else {
+        let Some(cert) = self
+            .cert_cache
+            .get(&key_name)
+            .or_else(|| own_certificate(data, &key_name))
+        else {
             return ValidationResult::Pending;
         };
 
@@ -488,6 +492,24 @@ impl Validator {
             Err(e) => InterestValidationOutcome::Invalid(e),
         }
     }
+}
+
+/// The certificate a **self-signed** certificate Data carries for its own
+/// signature: its KeyLocator names the packet itself (or the KEY it
+/// certifies) and its Content is the verifying key. Resolving that key through
+/// the cert cache or a fetch would wait on the very packet being validated -- a
+/// forwarder that fetched a root certificate while resolving a chain parked it
+/// in its pending queue behind its own fetch until both timed out. Trust in the
+/// key is a separate question: the chain walk still rejects a self-signed
+/// certificate that is not an anchor (it signs itself: a cycle).
+pub(super) fn own_certificate(data: &Data, key_name: &Name) -> Option<Certificate> {
+    let is_cert = data
+        .meta_info()
+        .is_some_and(|m| m.content_type == ndn_packet::meta_info::ContentType::Key);
+    if !is_cert || !crate::cert_cache::locator_names_cert(key_name, &data.name) {
+        return None;
+    }
+    Certificate::decode(data).ok()
 }
 
 pub(crate) fn now_ns() -> u64 {

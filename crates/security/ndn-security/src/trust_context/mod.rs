@@ -318,8 +318,12 @@ impl SignedTrustContext {
         true
     }
 
+    /// Whether `name` -- a certificate name or the KEY name it certifies --
+    /// designates one of this context's anchors.
     pub fn is_anchor(&self, name: &Name) -> bool {
-        self.anchors.iter().any(|r| r.key().as_ref() == name)
+        self.anchors
+            .iter()
+            .any(|r| crate::cert_cache::locator_names_cert(name, r.key()))
     }
 
     /// Whether `name` is listed as revoked in this context.

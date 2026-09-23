@@ -119,12 +119,46 @@ fn decode_validity_period(signed_region: &[u8]) -> (u64, u64) {
     (0, u64::MAX)
 }
 
-/// In-memory certificate cache, indexed by both certificate name and
-/// SHA-256 of the public key. Both indices are populated on `insert` so
-/// callers resolving a `KeyLocator::Name` or `KeyLocator::KeyDigest` hit
+/// The KEY name a certificate name certifies: `/<id>/KEY/<key-id>` for a
+/// certificate named `/<id>/KEY/<key-id>/<issuer-id>/<version>` (NDN
+/// Certificate Format v2); `None` for any other shape.
+///
+/// A KeyLocator may name either. ndn-cxx producers put the KEY name there, so
+/// the certificate that answers it -- found with `CanBePrefix` -- is named two
+/// components longer than the name the validator looks it up by.
+pub fn key_name_of(cert_name: &Name) -> Option<Name> {
+    let comps = cert_name.components();
+    let key_len = comps.len().checked_sub(2)?;
+    (key_len >= 2 && is_key_marker(&comps[key_len - 2]))
+        .then(|| Name::from_components(comps[..key_len].iter().cloned()))
+}
+
+/// Whether `name` is a KEY name, `/<id>/KEY/<key-id>`, rather than a
+/// certificate name: fetching its certificate needs `CanBePrefix`.
+pub fn is_key_name(name: &Name) -> bool {
+    let comps = name.components();
+    comps.len() >= 2 && is_key_marker(&comps[comps.len() - 2])
+}
+
+fn is_key_marker(c: &ndn_packet::NameComponent) -> bool {
+    c.typ == ndn_packet::tlv_type::NAME_COMPONENT && c.value.as_ref() == b"KEY"
+}
+
+/// Whether a KeyLocator naming `locator` designates the certificate
+/// `cert_name`: its exact name, or its KEY name.
+pub fn locator_names_cert(locator: &Name, cert_name: &Name) -> bool {
+    locator == cert_name || key_name_of(cert_name).is_some_and(|k| k == *locator)
+}
+
+/// In-memory certificate cache, indexed by certificate name, by the KEY name
+/// it certifies (see [`key_name_of`]), and by SHA-256 of the public key. All
+/// indices are populated on `insert` so callers resolving a
+/// `KeyLocator::Name` (certificate or KEY name) or `KeyLocator::KeyDigest` hit
 /// the same entries.
 pub struct CertCache {
     local: DashMap<Arc<Name>, Certificate>,
+    /// KEY name → name of the certificate last inserted for that key.
+    by_key: DashMap<Arc<Name>, Arc<Name>>,
     by_digest: DashMap<[u8; 32], Arc<Name>>,
 }
 
@@ -132,12 +166,18 @@ impl CertCache {
     pub fn new() -> Self {
         Self {
             local: DashMap::new(),
+            by_key: DashMap::new(),
             by_digest: DashMap::new(),
         }
     }
 
-    pub fn get(&self, key_name: &Arc<Name>) -> Option<Certificate> {
-        self.local.get(key_name).map(|r| r.clone())
+    /// The certificate named `name`, or else the one certifying the KEY `name`.
+    pub fn get(&self, name: &Arc<Name>) -> Option<Certificate> {
+        if let Some(cert) = self.local.get(name) {
+            return Some(cert.clone());
+        }
+        let cert_name = self.by_key.get(name)?.clone();
+        self.local.get(&cert_name).map(|r| r.clone())
     }
 
     /// Look up a certificate by the SHA-256 of its public key. Only matches
@@ -154,6 +194,9 @@ impl CertCache {
         let digest = Sha256::digest(&cert.public_key);
         let digest_arr: [u8; 32] = digest.into();
         self.by_digest.insert(digest_arr, Arc::clone(&cert.name));
+        if let Some(key) = key_name_of(&cert.name) {
+            self.by_key.insert(Arc::new(key), Arc::clone(&cert.name));
+        }
         self.local.insert(Arc::clone(&cert.name), cert);
     }
 }
