@@ -186,6 +186,7 @@ fn bench_pit_check(c: &mut Criterion) {
                 dead_nonce_list: None,
                 validator: None,
                 replay_guard: None,
+                face_table: Arc::new(ndn_transport::FaceTable::new()),
             };
             let mut c = ctx(wire.clone());
             let interest = ndn_packet::Interest::decode(wire.clone()).unwrap();
@@ -204,6 +205,7 @@ fn bench_pit_check(c: &mut Criterion) {
             dead_nonce_list: None,
             validator: None,
             replay_guard: None,
+            face_table: Arc::new(ndn_transport::FaceTable::new()),
         };
 
         // Seed the PIT with one entry.
@@ -336,6 +338,8 @@ fn bench_cs_insert(c: &mut Criterion) {
         let stage = CsInsertStage {
             cs: Arc::clone(&cs) as Arc<dyn ErasedContentStore>,
             admission: Arc::new(ndn_store::AdmitAllPolicy),
+            // The bench Data is unsigned; admit it so every call measures a real insert.
+            admit_unverified: true,
         };
         let wire = data_wire(4);
         // Pre-insert once so every bench call is a Replaced (not Inserted) operation.
@@ -365,6 +369,7 @@ fn bench_cs_insert(c: &mut Criterion) {
         let stage = CsInsertStage {
             cs: Arc::clone(&cs) as Arc<dyn ErasedContentStore>,
             admission: Arc::new(ndn_store::AdmitAllPolicy),
+            admit_unverified: true,
         };
 
         b.iter(|| {
@@ -494,6 +499,7 @@ fn bench_interest_pipeline(c: &mut Criterion) {
                 #[cfg(not(target_arch = "wasm32"))]
                 validator: None,
                 replay_guard: None,
+                face_table: Arc::new(ndn_transport::FaceTable::new()),
             };
 
             b.iter(|| {
@@ -596,6 +602,7 @@ fn bench_data_pipeline(c: &mut Criterion) {
                 let cs_insert = CsInsertStage {
                     cs: Arc::clone(&cs) as Arc<dyn ErasedContentStore>,
                     admission: Arc::new(ndn_store::AdmitAllPolicy),
+                    admit_unverified: true,
                 };
 
                 b.iter(|| {
