@@ -511,35 +511,41 @@ impl LinkService for LpLinkService {
                 for feature in &self.features {
                     feature.on_ingress(&inbound, &ingress_ctx);
                 }
-                // Ack on receipt, not on the retransmit tick.
+                // Do NOT Ack here. `note_receive` queued the Ack; it rides the
+                // next outgoing frame to this peer (`LpReliability::on_send`
+                // piggybacks it) or, failing one, goes out with every other
+                // pending Ack in one standalone packet on the engine's 5 ms
+                // idle-Ack tick -- NFD's `idleAckTimerPeriod`.
                 //
-                // An Ack parked until the next tick puts a floor under the peer's
-                // RTT sample, and therefore under its RTO: with a 50 ms pump the
-                // peer cannot measure anything faster than ~25 ms average, so its
-                // RTO can never track a 1-2 ms mesh. Worse, the two are a trap for
-                // each other — lowering the RTO below the tick (tried on the fleet:
-                // Quic's ~4.5 ms against a 10 ms pump) makes the sender retransmit
-                // BEFORE an Ack is physically possible, which manifested as NDNSF
-                // service calls timing out wholesale, not merely as wasted airtime.
-                // Acking here removes the floor so the RTO estimator can track the
-                // real link.
+                // This used to flush on every received frame, to take the old
+                // 50 ms pump's ~25 ms average delay out of the peer's RTT sample
+                // (and so out of its RTO). But a frame-at-a-time receive loop
+                // means `pending_acks` never holds more than one entry: every
+                // Ack left alone in its own datagram and nothing was left to
+                // piggyback. Measured on the miniMUAS fleet (3x640p20 video,
+                // 40 s, GCS capture): ndn-rs sent 35523 Ack-only packets
+                // carrying 1.00 Ack each and piggybacked 23; NFD sent 2573
+                // carrying 5.08 each and piggybacked 4719 (4.45 each). GCS->
+                // vehicle datagrams ran 3.6x NFD's, total airtime 2489 vs 1595
+                // datagrams/s, and the contention pushed vehicle->GCS loss to
+                // 7.2% (NFD 1.2%) -- 139 telemetry items needed an LP
+                // retransmission (NFD 17), each costing ~200-260 ms of RTO.
                 //
-                // `take_acks` drains ALL pending Acks into one frame, so a burst of
-                // fragments arriving back-to-back costs one Ack frame, not one per
-                // fragment. Self-gating: a peer that never sends a TxSequence
-                // queues nothing and this is a single uncontended lock check.
-                if let Some(ack) = self.reliability_feature.take_acks() {
-                    let _ = transport.send_bytes(ack).await;
-                }
-                // Fast retransmit: those Acks may have revealed, by arriving ahead
-                // of older TxSequences, that an earlier frame is gone. Send those
-                // repairs from here rather than leaving them for the retransmit
-                // tick, so recovery costs roughly an RTT instead of an RTO -- the
-                // RFC 6298 floor alone is 200 ms. NFD repairs on this same path.
+                // The 5 ms tick keeps the RTT floor the per-receive flush was
+                // removing small: an un-piggybacked Ack waits at most 5 ms
+                // (~2.5 ms mean), against the 50 ms pump that motivated it, and
+                // a piggybacked one waits for nothing.
+                //
+                // Fast retransmit: the Acks this frame carried may have revealed,
+                // by arriving ahead of older TxSequences, that an earlier frame is
+                // gone. Send those repairs from here rather than leaving them for
+                // the retransmit tick, so recovery costs roughly an RTT instead
+                // of an RTO -- the RFC 6298 floor alone is 200 ms. NFD repairs on
+                // this same path.
                 for wire in self.reliability_feature.take_fast_retransmits() {
                     let _ = transport.send_bytes(wire).await;
                 }
-                // Duplicate: the Ack above still went out (the peer retransmitted
+                // Duplicate: its Ack is still queued (the peer retransmitted
                 // because it never got the first one), but the frame must NOT
                 // reach reassembly or forwarding — upstream the PIT would see an
                 // Interest whose nonce it already holds and misread this
@@ -931,11 +937,20 @@ mod fragment_reliability_tests {
         }
     }
 
-    struct OneFrame {
-        frame: std::sync::Mutex<Option<Bytes>>,
+    /// Feeds `recv` from a queue of inbound frames; records what is sent.
+    struct Inbound {
+        frames: Mutex<std::collections::VecDeque<Bytes>>,
         sent: Arc<Mutex<Vec<Bytes>>>,
     }
-    impl Transport for OneFrame {
+    impl Inbound {
+        fn new(frames: impl IntoIterator<Item = Bytes>) -> Self {
+            Self {
+                frames: Mutex::new(frames.into_iter().collect()),
+                sent: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+    impl Transport for Inbound {
         fn id(&self) -> FaceId {
             FaceId(11)
         }
@@ -950,54 +965,89 @@ mod fragment_reliability_tests {
             Ok(())
         }
         async fn recv_bytes(&self) -> Result<Bytes, FaceError> {
-            match self.frame.lock().unwrap().take() {
+            match self.frames.lock().unwrap().pop_front() {
                 Some(f) => Ok(f),
                 None => Err(FaceError::Closed),
             }
         }
     }
 
-    /// A received reliable frame must be Acked on RECEIPT, not parked until
-    /// the next retransmit tick.
+    const PEER_TX_SEQ: u64 = 4242;
+    const BURST: u64 = 8;
+
+    /// `BURST` reliable frames from the peer, TxSequences `PEER_TX_SEQ..`.
+    fn peer_burst() -> Vec<Bytes> {
+        (0..BURST)
+            .map(|i| {
+                ndn_packet::lp::encode_lp_reliable(&[0x05, 0x01, 0xAB], PEER_TX_SEQ + i, None, &[])
+            })
+            .collect()
+    }
+
+    fn peer_seqs() -> Vec<u64> {
+        (PEER_TX_SEQ..PEER_TX_SEQ + BURST).collect()
+    }
+
+    /// A burst of received reliable frames is acknowledged by ONE Ack packet
+    /// on the idle-Ack tick, not by one Ack packet per frame on receipt.
     ///
-    /// A deferred Ack puts a floor under the peer's RTT sample and therefore
-    /// under its RTO, so the RTO can never track a 1-2 ms mesh; and lowering
-    /// the RTO below the tick instead makes the peer retransmit before an Ack
-    /// is physically possible (measured on the fleet as NDNSF service calls
-    /// timing out wholesale).
+    /// Acking on receipt left every Ack alone in its own datagram: on the
+    /// miniMUAS fleet ndn-rs sent 35523 Ack-only packets carrying 1.00 Ack
+    /// each where NFD sent 2573 carrying 5.08, and the extra airtime pushed
+    /// uplink loss from 1.2% to 7.2%.
     #[tokio::test]
-    async fn a_received_reliable_frame_is_acked_on_receipt_without_a_tick() {
-        const PEER_TX_SEQ: u64 = 4242;
-        let inbound =
-            ndn_packet::lp::encode_lp_reliable(&[0x05, 0x01, 0xAB], PEER_TX_SEQ, None, &[]);
-
-        let sent = Arc::new(Mutex::new(Vec::new()));
-        let tx = OneFrame {
-            frame: std::sync::Mutex::new(Some(inbound)),
-            sent: Arc::clone(&sent),
-        };
+    async fn a_received_burst_is_acked_by_one_packet_on_the_tick() {
+        let tx = Inbound::new(peer_burst());
         let svc = LpLinkService::new();
-
-        let _ = svc.recv(&tx).await.expect("frame delivers");
-
-        // No tick has run: take_retransmissions/the retx pump were never called.
-        let wires = sent.lock().unwrap().clone();
-        assert_eq!(
-            wires.len(),
-            1,
-            "exactly one Ack frame must be emitted on receipt (got {})",
-            wires.len()
-        );
-        let (_tx_seq, acks) = ndn_packet::lp::extract_acks(&wires[0]);
+        for _ in 0..BURST {
+            svc.recv(&tx).await.expect("frame delivers");
+        }
         assert!(
-            acks.contains(&PEER_TX_SEQ),
-            "the Ack must reference the peer's TxSequence {PEER_TX_SEQ}, got {acks:?}"
+            tx.sent.lock().unwrap().is_empty(),
+            "receiving must not emit Ack packets; got {}",
+            tx.sent.lock().unwrap().len()
         );
 
-        // And it was consumed, so the tick has nothing left to send.
+        // The engine's 5 ms tick drains `take_acks` until `None`.
+        let ack = svc.reliability_feature.take_acks().expect("Acks queued");
+        assert_eq!(
+            ndn_packet::lp::extract_acks(&ack).1.as_slice(),
+            &peer_seqs()[..],
+            "one Ack packet must carry every Ack of the burst"
+        );
+        assert!(svc.reliability_feature.take_acks().is_none());
+    }
+
+    /// An outgoing frame after receipt carries the pending Acks piggybacked,
+    /// through the forwarder's reliable send path (`ReliabilityFeature::frame`
+    /// then `send_batch`), leaving nothing for the tick to send standalone.
+    #[tokio::test]
+    async fn an_outgoing_frame_piggybacks_the_pending_acks() {
+        let tx = Inbound::new(peer_burst());
+        let svc = LpLinkService::new();
+        svc.reliability_feature.set_enabled(true);
+        svc.reliability_feature.set_mtu(1452);
+        for _ in 0..BURST {
+            svc.recv(&tx).await.expect("frame delivers");
+        }
+
+        let mut w = ndn_tlv::TlvWriter::new();
+        w.write_tlv(0x05, &[0xAB; 100]);
+        let wires = svc.reliability_feature.frame(&w.finish());
+        svc.send_batch(&tx, &wires, None).await.unwrap();
+
+        let sent = tx.sent.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1, "one data frame, no standalone Ack");
+        let (tx_seq, acks) = ndn_packet::lp::extract_acks(&sent[0]);
+        assert!(tx_seq.is_some(), "the data frame is itself reliable");
+        assert_eq!(
+            acks.as_slice(),
+            &peer_seqs()[..],
+            "Acks ride the data frame"
+        );
         assert!(
             svc.reliability_feature.take_acks().is_none(),
-            "Ack must not be queued a second time for the tick"
+            "piggybacked Acks must not be sent again on the tick"
         );
     }
 

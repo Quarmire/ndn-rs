@@ -1065,12 +1065,8 @@ pub(crate) async fn run_face_sender(
     // Retransmit / Ack pump interval. This bounds BOTH how fast a lost frame
     // can be resent AND how long a standalone Ack waits — and a late Ack
     // inflates the peer's RTT sample, which inflates its RTO, so an oversized
-    // tick feeds back into slower recovery. At 50 ms it dominated a local mesh
-    // whose RTT is ~1-2 ms: with a predictive stream delivering in cursor
-    // order, each stall head-of-line-blocks the frames behind it. Datagram
-    // faces (the ones that fragment, where a single lost fragment kills a whole
-    // group) get a 10 ms pump; everything else keeps 50 ms, since stream faces
-    // do not fragment and their kernel already retransmits.
+    // tick feeds back into slower recovery.
+    //
     // Two cadences on one timer, matching NFD's LpReliability.
     //
     // NFD flushes pending Acks on `idleAckTimerPeriod` = 5 ms and runs
@@ -1258,8 +1254,12 @@ pub(crate) async fn run_face_sender(
                             }
                         }
                     }
-                    // Acks go out every tick (5 ms), as NFD does.
-                    if let Some(ack) = feature.take_acks() {
+                    // Acks no outgoing frame has piggybacked go out every tick
+                    // (5 ms, NFD's idleAckTimerPeriod), all of them batched into
+                    // as few packets as the MTU allows -- normally one. The recv
+                    // path no longer Acks per frame; this tick and `on_send`'s
+                    // piggybacking are the only Ack emitters.
+                    while let Some(ack) = feature.take_acks() {
                         let _ = face.send_bytes(ack).await;
                     }
                 }

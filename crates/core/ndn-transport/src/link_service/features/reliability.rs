@@ -162,9 +162,10 @@ impl ReliabilityFeature {
         s.on_send(payload)
     }
 
-    /// Standalone Ack frame for received reliable frames not yet piggybacked,
-    /// pumped on the retx tick alongside [`Self::take_retransmissions`]. `None`
-    /// when there is nothing to Ack.
+    /// Standalone Ack frame for received reliable frames that no outgoing
+    /// frame has piggybacked yet, pumped on the engine's 5 ms idle-Ack tick
+    /// (NFD's `idleAckTimerPeriod`). Carries as many pending Acks as fit in
+    /// the MTU; call until `None` to drain them all.
     ///
     /// NOT gated on `is_enabled`: see [`Self::on_ingress`]. Acking is a
     /// receiver-side duty owed to whoever sent us a TxSequence, independent of
