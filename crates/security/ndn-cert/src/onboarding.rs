@@ -4,7 +4,7 @@
 //! fetching of the published context, and the privacy-preserving link-local
 //! [`AnchorAdvert`].
 //!
-//! A node does not "join a network" — it *adopts* an anchor-rooted
+//! A node does not "join a network" — it *adopts* a namespace's anchor-rooted
 //! [`SignedTrustContext`]. The one irreducible bit a face cannot give for free is
 //! **root authenticity**. An out-of-band `ndn-trust://anchor/…` link
 //! (`ndn_trust_envelope::TrustEnvelope::Anchor`, a QR / deep link, *not* an NDN
@@ -90,8 +90,8 @@ pub enum AdoptError {
     SignerNotAnchor(String),
     #[error(
         "context signer {0} does not have the expected fingerprint from the invite/QR: this is \
-         not the network the link names (check the code you scanned, and that this node's \
-         route for the namespace leads to that network)"
+         not the namespace the link names (check the code you scanned, and that this node's \
+         route for the namespace leads to a node serving that namespace's context)"
     )]
     FingerprintMismatch(String),
     #[error("no anchor of the context has the expected fingerprint from the invite/QR")]
@@ -103,8 +103,8 @@ pub enum AdoptError {
     #[error("refused: context version {offered} is older than the held version {held}")]
     Rollback { offered: u64, held: u64 },
     #[error(
-        "refused: the network offered context version {offered}, older than version {required} \
-         named by the invite/QR (an outdated or replayed context); retry once the network \
+        "refused: the fetched context is version {offered}, older than version {required} \
+         named by the invite/QR (an outdated or replayed context); retry once the namespace \
          serves version {required} or newer, or use an anchor link with the context inline"
     )]
     Downgrade { offered: u64, required: u64 },
@@ -113,16 +113,16 @@ pub enum AdoptError {
     #[error("not a readable trust link: {0}")]
     BadLink(String),
     #[error(
-        "the anchor link carries no {0}; ask the network's owner for a new invite/QR \
+        "the anchor link carries no {0}; ask the namespace's owner for a new invite/QR \
          (`ndn-fwd init` prints one as anchor_uri)"
     )]
     LinkMissing(&'static str),
     #[error("anchor link carries an invalid namespace {0:?}")]
     BadNamespace(String),
     #[error(
-        "the anchor link carries only a fingerprint, so the context has to be fetched from \
-         the network: that needs the running daemon with a route toward the network \
-         (start ndn-fwd and retry), or use an anchor link with the context inline"
+        "the anchor link carries only a fingerprint, so the context has to be fetched over \
+         NDN: that needs the running daemon with a link and a route toward a node serving \
+         the context (start ndn-fwd and retry), or use an anchor link with the context inline"
     )]
     InlineContextRequired,
     #[error(
@@ -132,7 +132,7 @@ pub enum AdoptError {
     UnsignedLegacyContext,
     #[error(
         "could not fetch the trust context of {namespace}: {source}. Check that this node \
-         has a route for {namespace} toward a node that holds the network's context \
+         has a route for {namespace} toward a node that holds the namespace's context \
          (`ndn-ctl route add {namespace} --face <face-id>`), or use an anchor link with the \
          context inline"
     )]
@@ -142,12 +142,12 @@ pub enum AdoptError {
         source: FetchContextError,
     },
     #[error(
-        "the network answered with a trust context for {namespace} that this node refused \
-         ({reason}): it is not the network the link names. This node's route for {namespace} \
-         leads to another network or to an impersonator — check the route \
+        "the reply for {namespace} carried a trust context that this node refused \
+         ({reason}): it is not the namespace the link names. This node's route for {namespace} \
+         leads to another namespace's node or to an impersonator — check the route \
          (`ndn-ctl route list`) and that you scanned the right code"
     )]
-    WrongNetwork { namespace: String, reason: String },
+    WrongContext { namespace: String, reason: String },
     #[error("{0}")]
     InProgress(#[from] ExpectContextError),
 }
@@ -223,9 +223,9 @@ pub fn adopt_with_tofu(
 /// What an `ndn-trust://anchor` link asks a device to adopt.
 #[derive(Debug)]
 pub struct AnchorLink {
-    /// The namespace the network roots.
+    /// The namespace the anchor roots.
     pub namespace: Name,
-    /// SHA-256 of the network root's public key ([`anchor_fingerprint`]).
+    /// SHA-256 of the namespace root's public key ([`anchor_fingerprint`]).
     pub expected_fingerprint: [u8; 32],
     /// The context version the link names: a fetched context older than this
     /// is refused ([`AdoptError::Downgrade`]).
@@ -300,7 +300,7 @@ impl AnchorLink {
 /// [`adopt_with_tofu`] driven by a scanned anchor envelope: the envelope must
 /// name a namespace and expected fingerprint and carry the signed context
 /// inline (offline adoption). Fingerprint-only envelopes
-/// ([`AdoptError::InlineContextRequired`]) need the network:
+/// ([`AdoptError::InlineContextRequired`]) need a fetch over NDN:
 /// [`adopt_anchor_link`]. Unsigned legacy content
 /// ([`AdoptError::UnsignedLegacyContext`]) is refused.
 /// Returns the adopted context and its signed Data (for persistence).
@@ -325,11 +325,11 @@ pub struct LinkAdoption {
     pub context: Arc<SignedTrustContext>,
     /// The signed Data exactly as received (what to persist and publish).
     pub data: Data,
-    /// Whether it was fetched from the network (else it came inline).
+    /// Whether it was fetched over NDN (else it came inline).
     pub fetched: bool,
 }
 
-/// Adopt the network an anchor link names into `keyring`.
+/// Adopt the namespace an anchor link names into `keyring`.
 ///
 /// - Context inline: verify it against the link (namespace, expected
 ///   fingerprint, version) and adopt; no network.
@@ -378,7 +378,7 @@ where
     let outcome = expectation.map(|e| e.finish()).unwrap_or_default();
     let data = fetched.map_err(|source| match outcome.refused.clone() {
         // Something answered, and this node's forwarder dropped it: say why.
-        Some(reason) => AdoptError::WrongNetwork {
+        Some(reason) => AdoptError::WrongContext {
             namespace: link.namespace.to_string(),
             reason,
         },
@@ -494,7 +494,7 @@ pub enum FetchContextError {
 /// checked once, at the one place that decides trust.
 ///
 /// The metadata is an unauthenticated pointer and needs no signature check
-/// here: the joiner holds nothing but a fingerprint, so it could not verify
+/// here: the adopter holds nothing but a fingerprint, so it could not verify
 /// one anyway. The pointer is confined to `<ns>/32=trust-context/v=<N>`, so
 /// a forged one can only point at (a) a forged or foreign context, which
 /// fails the expected-fingerprint check; (b) an older genuine version, which
@@ -589,7 +589,7 @@ pub fn context_pointer(namespace: &Name, content: &Bytes) -> Result<Name, FetchC
 /// Whether a node advertises its contexts on the link by default.
 ///
 /// **Off by default** (N3 privacy): silent adopt/consume is the norm; only a
-/// hub/rendezvous opts in. A passive listener of a non-advertising node sees
+/// root device or relay opts in. A passive listener of a non-advertising node sees
 /// nothing.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AdvertConfig {
@@ -709,28 +709,28 @@ mod tests {
         (asked, data(named, content))
     }
 
-    fn hub(ns: &str) -> crate::hub::HubInit {
-        crate::hub::init_hub(&ndn_security::SecurityManager::new(), &n(ns)).unwrap()
+    fn root_dev(ns: &str) -> crate::namespace::NamespaceInit {
+        crate::namespace::init_namespace(&ndn_security::SecurityManager::new(), &n(ns)).unwrap()
     }
 
     #[test]
     fn fetched_context_is_the_asked_namespace_and_passes_tofu() {
         let ns = n("/home/bob");
-        let hub = hub("/home/bob");
-        let versioned = hub.context.rdr_name();
+        let root_dev = root_dev("/home/bob");
+        let versioned = root_dev.context.rdr_name();
         let mut net = FakeNet::new(vec![
             metadata(&ns, &versioned.encode_to_tlv()),
-            (versioned.clone(), hub.context_data.raw().clone()),
+            (versioned.clone(), root_dev.context_data.raw().clone()),
         ]);
 
         let fetched = futures::executor::block_on(fetch_context(&mut net, &ns)).unwrap();
-        assert_eq!(fetched.raw(), hub.context_data.raw());
+        assert_eq!(fetched.raw(), root_dev.context_data.raw());
         let discovery = net.sent[0].selectors();
         assert!(discovery.can_be_prefix && discovery.must_be_fresh);
         assert_eq!(*net.sent[1].name, versioned);
 
         let keyring = Keyring::new();
-        let fp = anchor_fingerprint(&hub.anchor);
+        let fp = anchor_fingerprint(&root_dev.anchor);
         let ctx = adopt_with_tofu(&keyring, &fetched, &ns, &fp).unwrap();
         assert_eq!(ctx.namespace(), &ns);
     }
@@ -738,7 +738,7 @@ mod tests {
     #[test]
     fn forged_or_malformed_metadata_is_refused_before_any_context_fetch() {
         let ns = n("/home/bob");
-        let eve = hub("/home/eve");
+        let eve = root_dev("/home/eve");
         let foreign_pointers = [
             eve.context.rdr_name(),                     // another namespace's context
             n("/home/bob/32=trust-context"),            // no version
@@ -786,8 +786,8 @@ mod tests {
     #[test]
     fn context_reply_under_another_name_is_refused() {
         let ns = n("/home/bob");
-        let bob = hub("/home/bob");
-        let eve = hub("/home/eve");
+        let bob = root_dev("/home/bob");
+        let eve = root_dev("/home/eve");
         let versioned = bob.context.rdr_name();
         // The announced name answered with eve's (validly signed) context.
         let mut net = FakeNet::new(vec![
@@ -803,8 +803,8 @@ mod tests {
     #[test]
     fn forged_context_at_the_right_name_fails_the_expected_fingerprint() {
         let ns = n("/home/bob");
-        let genuine = hub("/home/bob");
-        let forged = hub("/home/bob");
+        let genuine = root_dev("/home/bob");
+        let forged = root_dev("/home/bob");
         let versioned = forged.context.rdr_name();
         let mut net = FakeNet::new(vec![
             metadata(&ns, &versioned.encode_to_tlv()),
@@ -843,8 +843,8 @@ mod tests {
     #[test]
     fn forwarder_admits_only_the_expected_context_while_expected() {
         let ns = n("/home/bob");
-        let genuine = hub("/home/bob");
-        let forged = hub("/home/bob");
+        let genuine = root_dev("/home/bob");
+        let forged = root_dev("/home/bob");
         let v = forwarder();
         let before = verdict(&v, &genuine.context_data);
         let forged_before = verdict(&v, &forged.context_data);
@@ -867,7 +867,7 @@ mod tests {
                 other => panic!("expected context not admitted: {other:?}"),
             }
             // Other names are untouched by the expectation.
-            let other = hub("/home/alice");
+            let other = root_dev("/home/alice");
             assert!(same_kind(
                 &verdict(&v, &other.context_data),
                 &verdict(&forwarder(), &other.context_data)
@@ -903,12 +903,12 @@ mod tests {
         }
     }
 
-    fn serving(hub: &crate::hub::HubInit) -> FakeNet {
-        let ns = hub.context.namespace().clone();
-        let versioned = hub.context.rdr_name();
+    fn serving(root_dev: &crate::namespace::NamespaceInit) -> FakeNet {
+        let ns = root_dev.context.namespace().clone();
+        let versioned = root_dev.context.rdr_name();
         FakeNet::new(vec![
             metadata(&ns, &versioned.encode_to_tlv()),
-            (versioned, hub.context_data.raw().clone()),
+            (versioned, root_dev.context_data.raw().clone()),
         ])
     }
 
@@ -923,7 +923,7 @@ mod tests {
 
     #[test]
     fn fingerprint_only_link_adopts_through_a_validating_forwarder() {
-        let genuine = hub("/home/bob");
+        let genuine = root_dev("/home/bob");
         let fp = anchor_fingerprint(&genuine.anchor);
         let v = forwarder();
         let keyring = Keyring::new();
@@ -953,9 +953,9 @@ mod tests {
     /// it comes through a validating forwarder, a non-validating one, or
     /// inline.
     #[test]
-    fn forged_network_is_never_admitted_or_adopted() {
-        let genuine = hub("/home/bob");
-        let forged = hub("/home/bob");
+    fn forged_context_is_never_admitted_or_adopted() {
+        let genuine = root_dev("/home/bob");
+        let forged = root_dev("/home/bob");
         let fp = anchor_fingerprint(&genuine.anchor);
         let keyring = Keyring::new();
 
@@ -970,7 +970,7 @@ mod tests {
             &mut through_forwarder,
             &link("/home/bob", fp, None),
         ));
-        assert!(matches!(res, Err(AdoptError::WrongNetwork { .. })), "{res:?}");
+        assert!(matches!(res, Err(AdoptError::WrongContext { .. })), "{res:?}");
 
         let mut direct = serving(&forged);
         let res = futures::executor::block_on(adopt_anchor_link(
@@ -998,7 +998,7 @@ mod tests {
     /// Invariant: a fetched version below the link's version is refused.
     #[test]
     fn fetched_version_below_the_links_is_refused() {
-        let genuine = hub("/home/bob");
+        let genuine = root_dev("/home/bob");
         let fp = anchor_fingerprint(&genuine.anchor);
         let keyring = Keyring::new();
         let v = forwarder();

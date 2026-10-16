@@ -52,11 +52,12 @@ pub struct ForwarderConfig {
     #[serde(default)]
     pub listeners: ListenersConfig,
 
-    /// Opt-in in-process NDNCERT CA. Production deployments run a real
-    /// CA out-of-process and configure
-    /// `[security.mgmt] localhop_trust_anchor_pib` against its PIB.
+    /// Opt-in in-process NDNCERT CA for the namespace whose root this node's
+    /// PIB holds (`[ca]`; `ndn-fwd init` writes its identity). A CA can also
+    /// run out-of-process, with `[security.mgmt] localhop_trust_anchor_pib`
+    /// pointing at its PIB.
     #[serde(default)]
-    pub demo_ca: DemoCaConfig,
+    pub ca: CaTomlConfig,
 
     /// NDN-native span publisher. Spans served under `ndn_prefix` as
     /// OTLP `Span` protobufs (OTLP wire format inside Data content).
@@ -162,26 +163,26 @@ fn default_observability_sample() -> f64 {
 ///
 /// By default the CA signs with the identity `identity` loaded from the node's
 /// PIB (`[security] pib_path`): its key and its `ca/ca-cert.data` certificate
-/// (issued by the hub root) are written by `ndn-fwd init --profile hub`.
+/// (issued by the namespace root) are written by `ndn-fwd init --namespace <ns>`.
 /// Issued certs and revocations persist under `<pib_path>/ca/`. With
 /// `ephemeral = true` the CA instead mints a throwaway self-signed key at
 /// every start (demo only: certs it issued stop verifying after a restart).
 ///
 /// The CA refuses to start with no challenge configured: list them under
-/// `[[demo_ca.challenge]]` (or the legacy `tokens`). `nop` (auto-approve) is
+/// `[[ca.challenge]]` (or the legacy `tokens`). `nop` (auto-approve) is
 /// only offered when listed explicitly.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct DemoCaConfig {
+pub struct CaTomlConfig {
     #[serde(default)]
     pub enabled: bool,
     /// CA namespace, e.g. `/home/bob`. The CA appends `/CA` itself and serves
     /// `/<prefix>/CA/...` (NDNCERT convention; clients append `/CA` too), so
     /// this must not end in `CA`.
-    #[serde(default = "DemoCaConfig::default_prefix")]
+    #[serde(default = "CaTomlConfig::default_prefix")]
     pub prefix: String,
     /// CA signing identity, conventionally `<prefix>/CA`. Loaded from the PIB
     /// unless `ephemeral`.
-    #[serde(default = "DemoCaConfig::default_identity")]
+    #[serde(default = "CaTomlConfig::default_identity")]
     pub identity: String,
     /// Mint a throwaway self-signed CA key at startup instead of loading
     /// `identity` from the PIB. Demo only; logged as a warning.
@@ -192,7 +193,7 @@ pub struct DemoCaConfig {
     #[serde(default)]
     pub tokens: Vec<String>,
     /// Explicit challenge set — the CA offers exactly these. Serialized as
-    /// `[[demo_ca.challenge]]` array-of-tables.
+    /// `[[ca.challenge]]` array-of-tables.
     #[serde(default, rename = "challenge")]
     pub challenges: Vec<ChallengeConfig>,
     /// Embed a challenge attestation (how the challenge was satisfied) in each
@@ -212,7 +213,7 @@ pub struct DemoCaConfig {
     /// renewal will allow shorter lifetimes. Devices enrolling by invite
     /// request 90 days; a shorter setting caps them, and `ndn-fwd enroll`
     /// reports the expiry the CA issued.
-    #[serde(default = "DemoCaConfig::default_cert_validity_days")]
+    #[serde(default = "CaTomlConfig::default_cert_validity_days")]
     pub cert_validity_days: u32,
 }
 
@@ -276,7 +277,7 @@ impl SmtpConfig {
 }
 
 /// Declarative form of `ndn_cert::RequireAttestationKind` (see
-/// [`DemoCaConfig::require_attestation`]).
+/// [`CaTomlConfig::require_attestation`]).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RequireAttestationConfig {
     /// Subject-name prefix the rule applies to (e.g. `/high-trust`).
@@ -288,7 +289,7 @@ pub struct RequireAttestationConfig {
     pub require_signed: bool,
 }
 
-impl DemoCaConfig {
+impl CaTomlConfig {
     fn default_prefix() -> String {
         "/demo".to_string()
     }
@@ -302,7 +303,7 @@ impl DemoCaConfig {
     }
 }
 
-impl Default for DemoCaConfig {
+impl Default for CaTomlConfig {
     fn default() -> Self {
         Self {
             enabled: false,
@@ -744,10 +745,30 @@ impl std::str::FromStr for ForwarderConfig {
     /// listen address) into `""`.
     fn from_str(s: &str) -> Result<Self, ConfigError> {
         let expanded = expand_env_vars(s)?;
+        reject_legacy_sections(&expanded)?;
         let cfg: ForwarderConfig = toml::from_str(&expanded)?;
         cfg.validate()?;
         Ok(cfg)
     }
+}
+
+/// Refuse sections that were renamed, rather than silently ignoring them (an
+/// unknown section deserializes to nothing, which would leave the CA off).
+fn reject_legacy_sections(toml_src: &str) -> Result<(), ConfigError> {
+    if !toml_src.contains("demo_ca") {
+        return Ok(());
+    }
+    let table: toml::Table = toml::from_str(toml_src)?;
+    if table.contains_key("demo_ca") {
+        return Err(ConfigError::Invalid(
+            "the `[demo_ca]` section was renamed to `[ca]` (it is the namespace's PIB-backed \
+             CA, not a demo): rename `[demo_ca]` to `[ca]` and `[[demo_ca.challenge]]` / \
+             `[demo_ca.require_attestation]` to `[[ca.challenge]]` / \
+             `[ca.require_attestation]`; the keys are unchanged"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 impl ForwarderConfig {
@@ -1557,7 +1578,7 @@ pub struct SecurityConfig {
     pub mgmt: MgmtSecurityConfig,
 
     /// Publish every trust context stored in `<pib_path>/contexts/` (the
-    /// node's own hub context included) by name over RDR:
+    /// node's own namespace context included) by name over RDR:
     /// `/<ns>/32=trust-context/32=metadata` → the newest version's name,
     /// `/<ns>/32=trust-context/v=<N>` → the stored signed Data verbatim.
     /// Contexts are public (anchors, schema, CA endpoints); default `true`.
@@ -1723,6 +1744,17 @@ impl DiscoveryTomlConfig {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn legacy_demo_ca_section_is_refused_with_rename_hint() {
+        for src in ["[demo_ca]\nenabled = true\n", "[[demo_ca.challenge]]\nkind = \"nop\"\n"] {
+            let err = src.parse::<ForwarderConfig>().unwrap_err().to_string();
+            assert!(err.contains("renamed to `[ca]`"), "{err}");
+        }
+        let cfg: ForwarderConfig = "[ca]\nenabled = true\n".parse().unwrap();
+        assert!(cfg.ca.enabled);
+    }
+
     use super::*;
     use std::str::FromStr;
 

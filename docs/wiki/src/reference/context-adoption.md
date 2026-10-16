@@ -1,17 +1,20 @@
-# Adopting a network (`ndn-fwd adopt`)
+# Adopting a namespace's trust context (`ndn-fwd adopt`)
 
-A device joins a personal network by **adopting** its signed trust context.
-It starts from an `ndn-trust://anchor` link (a QR code or a pasted URI) that
-carries the network's namespace, the **expected fingerprint** (SHA-256 of the
-network root's public key) and the context version, and optionally the signed
+A device does not join a network: it **adopts** a namespace's signed trust
+context, after which it accepts Data under `/<ns>` signed by keys chaining to
+the namespace root, under the namespace's schema. Adopting forms no link and
+adds no route (design: `docs/specs/personal-namespace.md`
+§9). It starts from an `ndn-trust://anchor` link (a QR code or a pasted URI)
+that carries the namespace, the **expected fingerprint** (SHA-256 of the
+namespace root's public key) and the context version, and optionally the signed
 context itself.
 
 | Link form | Size | How the context arrives |
 |---|---|---|
 | `anchor_uri` (inline) | ~2.8 kB | inside the link |
-| `anchor_uri_fp` (fingerprint only) | ~125 B | fetched by name from the network |
+| `anchor_uri_fp` (fingerprint only) | ~125 B | fetched by name over this node's links and routes |
 
-`ndn-fwd init --profile hub` prints both.
+`ndn-fwd init --namespace <ns>` prints both.
 
 ## What is checked
 
@@ -36,7 +39,7 @@ While an adoption runs, the adopter registers an **expectation**
 (`Validator::expect_context`). Only a Data named
 `<namespace>/32=trust-context/v=<N>` is affected: it is admitted iff checks
 1–3 hold (trust path `ExpectedContext`), and dropped otherwise — so a forged
-network's context never leaves the device's forwarder. Every other name, and
+context never leaves the device's forwarder. Every other name, and
 every name while no expectation is live, is validated exactly as before. The
 expectation ends when the adoption returns, or at its deadline (30 s); an
 expired one admits nothing. The forwarder keeps what it admitted, so the
@@ -61,9 +64,9 @@ The daemon:
    devices can fetch it from this one.
 
 The command is answered from a task of its own, so a slow fetch does not stall
-other management clients. Refusals say why and what to do: no route toward the
-network, the network answered with a context the forwarder refused (wrong
-fingerprint: another network or an impersonator), a downgrade, a link without
+other management clients. Refusals say why and what to do: no route toward a
+node serving the context, a reply carrying a context the forwarder refused
+(wrong fingerprint: another namespace or an impersonator), a downgrade, a link without
 namespace or fingerprint.
 
 Without a running daemon, an inline link is verified and stored in the PIB
@@ -89,21 +92,22 @@ is `ndn_mgmt::auth::authorize_trust_admin`; trust-changing verbs are listed in
 ## Usage
 
 ```sh
-# hub
-ndn-fwd init --profile hub --namespace /home/bob --device laptop --pib ~/.ndn/pib
-ndn-fwd -c hub.toml
-# device (its config routes /home/bob toward the hub)
+# root device
+ndn-fwd init --namespace /home/bob --device laptop --pib ~/.ndn/pib
+ndn-fwd -c root.toml
+# device (its config has a link to the root device or a relay, and a route
+# for /home/bob over it — adoption does not create either)
 ndn-fwd -c device.toml
 ndn-fwd adopt 'ndn-trust://anchor/_QRwS_…' -c device.toml
 #   namespace            = /home/bob
 #   expected_fingerprint = 2637…1d00
-#   source               = fetched from the network
+#   source               = fetched by name
 #   stored               = …/contexts/2f686f6d652f626f62.tc
 #   published            = true
 ```
 
 Apps with an embedded engine (ndn-mobile) call the same function:
-`NdnEngine::join_context_link(link_uri)`.
+`NdnEngine::adopt_context_link(link_uri)`.
 
 ## Code
 

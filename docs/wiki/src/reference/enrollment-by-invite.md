@@ -30,7 +30,7 @@ admin's approval. A role-carrying token (`member-…`, `guest-…`) must match
 the invite's role (checked locally), and the CA refuses any request outside
 the token's scope.
 
-A device name holds one certified key at a time. The hub CA (`RolePolicy`)
+A device name holds one certified key at a time. The namespace CA (`RolePolicy`)
 refuses to certify a key for `/<ns>/<role>/<device>` while it holds a valid,
 unrevoked certificate it issued for that name to another key, unless an admin
 approves the new key (`device-approval`). So a member token cannot be used to
@@ -39,7 +39,7 @@ before running the token challenge, so a refused request does not redeem the
 token: enroll again under another `--device` name, or revoke the old
 certificate first. Certifying the same key again is not refused.
 
-Certificates last 90 days: the hub CA issues `[demo_ca] cert_validity_days`
+Certificates last 90 days: the namespace CA issues `[ca] cert_validity_days`
 (default 90) and the device asks for 90. A CA set to fewer days caps the
 certificate, and the enroll output states the expiry it issued. Renewal is not
 built yet; once it is, lifetimes can be shorter.
@@ -52,7 +52,7 @@ built yet; once it is, lifetimes can be shorter.
 | 2 | daemon mgmt | trust-admin gate: the peer credentials must be the daemon's user, root, or a `[security] trust_admin_groups` member |
 | 3 | daemon | refuses if its PIB already holds a valid certificate in `/<ns>` (unless `--force`) |
 | 4 | daemon | generates `/<ns>/<role>/<device>/KEY/<16 hex>` (Ed25519) in its PIB |
-| 5 | daemon → hub | context not held: RDR metadata + context fetch; the forwarder admits only the expected context |
+| 5 | daemon → root device or relay | context not held: RDR metadata + context fetch; the forwarder admits only the expected context |
 | 6 | daemon → CA | `/<ns>/CA/NEW` and `/<ns>/CA/CHALLENGE/<id>` signed Interests (device key), token challenge; replies signed by `/<ns>/CA/KEY/…`, validated by the device's forwarder under the adopted context |
 | 7 | daemon → CA | fetches the issued certificate and the CA's certificate; checks the certificate certifies the device key, is valid now, and chains to the root under the context's schema |
 | 8 | daemon | stores `cert.data` (signed Data, as issued) and the summary beside the key, then sets the PIB's default identity — the last step |
@@ -99,7 +99,7 @@ trusted keys must trust the new key, as they would after a restart.
 | already holds a certificate in `/<ns>` | 409 | lists it; `--force` with another `--device` enrolls another key, the old one stays valid until revoked |
 | the CA already certified this device name to another key | 409 | the certificate holding it; choose another `--device`, revoke that certificate first, or have an admin approve the device. The token is not redeemed |
 | held context from another root | 403 | the two fingerprints |
-| no route / no answer | 504 | the device needs a face and a route for `/<ns>` toward a forwarder that serves it |
+| no route / no answer | 504 | the device needs a link and a route for `/<ns>` toward a forwarder that serves it (an invite carries no host, so enrolling never creates them) |
 | token spent, expired or out of scope | 403 | the CA's reason; ask for a new invite |
 | unauthorized local user | 403 | who may enroll and how to grant it |
 

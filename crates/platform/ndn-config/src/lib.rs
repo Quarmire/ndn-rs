@@ -27,7 +27,7 @@ pub use ndn_mgmt_wire::{
 pub use ndn_mgmt_wire::{control_parameters, control_response, nfd_command, nfd_dataset};
 
 pub use config::{
-    AcmeTomlConfig, CertSourceConfig, ChallengeConfig, CsConfig, DemoCaConfig, DiscoveryTomlConfig,
+    AcmeTomlConfig, CertSourceConfig, ChallengeConfig, CsConfig, CaTomlConfig, DiscoveryTomlConfig,
     EngineConfig, FaceConfig, FaceKind, ForwarderConfig, ListenersConfig, LoggingConfig,
     ManagementConfig, MgmtSecurityConfig, NlsrNeighborConfig, NlsrTomlConfig,
     ObservabilityTomlConfig, QuicListenerConfig, RadioDeviceConfig, ReflexiveTomlConfig,

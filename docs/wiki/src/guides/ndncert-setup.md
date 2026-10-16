@@ -3,7 +3,7 @@
 NDNCERT automates certificate issuance: an applicant requests a
 certificate under some name; a CA challenges them (token, e-mail,
 proof-of-possession); on success the CA signs and returns the cert.
-This guide covers running an NDNCERT CA, joining as a user, and the
+This guide covers running an NDNCERT CA, enrolling as a user, and the
 invite-token flow.
 
 The implementation lives in `crates/security/ndn-cert/`. The CA binary
@@ -35,15 +35,17 @@ applicant gets a cert. See
 `crates/security/ndn-cert/src/policy.rs`. The default is
 `AcceptAllIssuance` — fine for lab deployments, not for production.
 
-## Join as a user
+## Enroll as a user
+
+With an invite link (`ndn-trust://invite/…`) from the CA's operator, the
+running daemon enrolls the node:
 
 ```sh
-cargo run -p enroll-ndncert -- join \
-    --ca /lab/ca \
-    --identity /lab/alice \
-    --challenge token \
-    --token <TOKEN>
+ndn-fwd enroll <invite-link> --device alice
 ```
+
+For a bare CA with a PIN challenge, `enroll-ndncert --face-socket <sock>
+--ca-prefix /lab/ca --name /lab/alice [--pin <PIN>]` runs the same exchange.
 
 Walkthrough:
 
@@ -52,7 +54,7 @@ Walkthrough:
 3. CA replies with a session ID and a challenge list.
 4. Send CHALLENGE with the token.
 5. CA verifies the token, signs the cert, returns it.
-6. Joiner imports the cert into its `KeyChain` and persists the
+6. The enrollee imports the cert into its `KeyChain` and persists the
    identity as a `SafeBag`.
 
 The resulting `SafeBag` is spec-canonical and importable via
@@ -60,9 +62,9 @@ The resulting `SafeBag` is spec-canonical and importable via
 
 ## Invite tokens
 
-Tokens turn the joiner-side step into a copy-paste flow. The
-operator generates a token, hands it (QR or paste) to the joiner,
-and the joiner runs `enroll-ndncert join`.
+Tokens turn the enrollee-side step into a copy-paste flow. The
+operator generates a token, hands it (QR or paste) to the enrollee as an
+invite, and the enrollee runs `ndn-fwd enroll <invite-link>`.
 
 Generate a token:
 
@@ -85,7 +87,7 @@ single-use or TTL-bounded.
 
 ## Challenge types
 
-| Challenge | Joiner proves | Use |
+| Challenge | Applicant proves | Use |
 |---|---|---|
 | `token` | Possession of a one-time secret | Operator-issued invites. |
 | `proof-of-possession` | Holds a private key for a previously-issued cert | Renewal. |
@@ -110,16 +112,16 @@ The post-challenge gate. An `IssuancePolicy` impl returns:
 
 Built-ins in `crates/security/ndn-cert/src/policy.rs`:
 `AcceptAllIssuance` (default), `RequireAttestationKind` (names under a
-prefix need a given challenge leaf) and `RolePolicy` (the personal-network
+prefix need a given challenge leaf) and `RolePolicy` (the namespace
 role layout, below), behind the pre-challenge `NamespacePolicy` and the
 `ChallengeHandler` (three-stage seam recorded in
 `project_f7_issuance_policy`).
 
-### Roles in a personal network
+### Roles in a namespace
 
-A hub network `/<ns>` names every device `/<ns>/<role>/<device>` with role
-`admin`, `member`, `node` (super node) or `guest`
-(`ndn_cert::roles`; design: `docs/specs/personal-network-pairing.md`).
+A namespace `/<ns>` created by `ndn-fwd init` names every device
+`/<ns>/<role>/<device>` with role `admin`, `member`, `node` (a relay) or `guest`
+(`ndn_cert::roles`; design: `docs/specs/personal-namespace.md`).
 `RolePolicy::new(ns)` issues only device keys `/<ns>/<role>/<device>/KEY/<id>`
 and only when the satisfied challenge fits the role:
 
@@ -143,10 +145,10 @@ token presented with it is not redeemed.
 
 ## Configuration
 
-`ndn-fwd` embeds a CA through its `[demo_ca]` section (full key list in the
-[configuration reference](../operations/config-reference.md)). On a hub,
-`ndn-fwd init --profile hub --namespace /<ns>` writes the root anchor, a
-`/<ns>/CA` signing identity certified by it, and the primary device's admin
+`ndn-fwd` embeds a CA through its `[ca]` section (full key list in the
+[configuration reference](../operations/config-reference.md)). On the root
+device, `ndn-fwd init --namespace /<ns>` writes the root anchor, a
+`/<ns>/CA` signing identity certified by it, and the root device's admin
 identity `/<ns>/admin/<device>` (`--device` names it; default: the host name,
 sanitized) certified by the CA into the node PIB, stores the root-signed
 trust context carrying the generated role schema, and prints the
@@ -154,20 +156,20 @@ trust context carrying the generated role schema, and prints the
 device identity. The CA loads its identity, so the certs it issues chain to
 the same root across restarts, and it persists issued certs, revocations and
 redeemed tokens (hashed) under `<pib_path>/ca/`. A PIB-backed `/<ns>/CA`
-certified by the hub root issues under `RolePolicy::new(/<ns>)` (combined with
+certified by the namespace root issues under `RolePolicy::new(/<ns>)` (combined with
 `require_attestation` when that is set too):
 
 ```toml
-[demo_ca]
+[ca]
 enabled  = true
 prefix   = "/home/bob"      # serves /home/bob/CA/{INFO,NEW,CHALLENGE}
 identity = "/home/bob/CA"   # signing identity loaded from the PIB
 
-[[demo_ca.challenge]]
+[[ca.challenge]]
 kind   = "token"
 tokens = ["member-<hex>", "guest-<hex>"]   # from ndn-fwd-tokens new --role …
 
-[[demo_ca.challenge]]
+[[ca.challenge]]
 kind = "device-approval"     # approve via /localhost/nfd/ca/approve
 ```
 
@@ -175,7 +177,7 @@ Invite tokens carry their role: `ndn-fwd-tokens new --ca /home/bob --namespace
 /home/bob --role member|guest` (default `member`) mints `member-<hex>` /
 `guest-<hex>`, and the CA scopes such a token to `/<ns>/<role>`, so it cannot
 certify another role. `--role admin` (and `node`) is refused: those
-certificates need an admin's device approval, and a hub CA refuses to start
+certificates need an admin's device approval, and a namespace CA refuses to start
 with an `admin-…` or `node-…` token in its config. Tokens without a role
 prefix are scoped to `/<ns>/member`. Because every token is scoped, a request
 for a name the token cannot certify is refused before the token is spent.

@@ -207,16 +207,16 @@ mod tests {
     fn stored_context_reads_back_byte_identical_and_damage_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let ns: Name = "/home/bob".parse().unwrap();
-        let hub = crate::hub::init_hub(&ndn_security::SecurityManager::new(), &ns).unwrap();
-        let path = persist_context(dir.path(), &hub.context, &hub.context_data).unwrap();
+        let root_dev = crate::namespace::init_namespace(&ndn_security::SecurityManager::new(), &ns).unwrap();
+        let path = persist_context(dir.path(), &root_dev.context, &root_dev.context_data).unwrap();
 
         let stored = read_stored_contexts(dir.path()).unwrap();
         assert_eq!(stored.len(), 1);
         let (ctx, data) = stored[0].1.as_ref().unwrap();
-        assert_eq!(data.raw(), hub.context_data.raw());
+        assert_eq!(data.raw(), root_dev.context_data.raw());
         assert_eq!(ctx.namespace(), &ns);
 
-        let mut wire = hub.context_data.raw().to_vec();
+        let mut wire = root_dev.context_data.raw().to_vec();
         let last = wire.len() - 1;
         wire[last] ^= 0xff; // flip a signature byte
         std::fs::write(&path, &wire).unwrap();

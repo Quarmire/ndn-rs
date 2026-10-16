@@ -2,7 +2,7 @@
 //! `token AND device-approval` approval gate.
 //!
 //! Backs `testbed/tests/audit/ctx0{3,4,5,6}_*.sh`. See
-//! `docs/specs/personal-network-pairing.md`.
+//! `docs/specs/personal-namespace.md`.
 
 use std::time::Duration;
 

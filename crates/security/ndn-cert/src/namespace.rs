@@ -1,16 +1,16 @@
-//! Hub-archetype onboarding: stand up a network root, publish its
+//! Namespace creation on the root device: mint a namespace's root key, publish its
 //! [`SignedTrustContext`] (signed by the root) + an `ndn-trust://anchor`
 //! [`TrustEnvelope`], and the clockless validity policy that offline/embedded
 //! nodes degrade to.
 //!
-//! The home-hub is the local-gains-first archetype: one node is root + issuing
-//! CA + rendezvous. Peers overhear or scan a QR, adopt the context (free), and
-//! — only if they want to *produce* — enroll behind `token AND device-approval`.
-//! The context carries the generated personal-network schema
-//! ([`crate::roles::network_schema`]) and makes it authoritative, so names
-//! carry roles: `/<ns>/<role>/<device>` (`docs/specs/personal-network-pairing.md`
-//! §2, §4). [`init_hub_in_pib`] is the persistent form `ndn-fwd init --profile
-//! hub` runs: root key, CA identity, the primary device's admin identity and
+//! The root device holds the namespace root and runs its issuing CA. Other
+//! devices scan a QR (or overhear an advert), adopt the context (free), and —
+//! only if they want to *produce* — enroll behind `token AND device-approval`.
+//! The context carries the generated namespace schema
+//! ([`crate::roles::namespace_schema`]) and makes it authoritative, so names
+//! carry roles: `/<ns>/<role>/<device>` (`docs/specs/personal-namespace.md`
+//! §2, §4). [`init_namespace_in_pib`] is the persistent form `ndn-fwd init`
+//! runs: root key, CA identity, the primary device's admin identity and
 //! the signed context all land in the node's PIB (same document, §6).
 
 use std::path::{Path, PathBuf};
@@ -26,30 +26,30 @@ use ndn_trust_envelope::TrustEnvelope;
 use crate::ca::serialize_cert;
 use crate::context_store::{ContextStoreError, context_file_path, persist_context};
 use crate::onboarding::anchor_fingerprint;
-use crate::roles::{Role, RoleError, device_identity, network_schema, validate_namespace};
+use crate::roles::{Role, RoleError, device_identity, namespace_schema, validate_namespace};
 
-/// Directory (under the PIB root) holding the hub's certificate Data wires
+/// Directory (under the PIB root) holding the root device's certificate Data wires
 /// (CA, root anchor, primary device) and the CA's persistent state.
 pub const CA_DIR: &str = "ca";
-/// The CA signing cert (issued by the hub root), as raw signed Data TLV.
+/// The CA signing cert (issued by the namespace root), as raw signed Data TLV.
 pub const CA_CERT_FILE: &str = "ca-cert.data";
-/// The hub root's self-signed anchor cert, as raw signed Data TLV.
+/// The namespace root's self-signed anchor cert, as raw signed Data TLV.
 pub const ANCHOR_CERT_FILE: &str = "anchor-cert.data";
 /// The primary device's admin cert (issued by the CA), as raw signed Data
 /// TLV. The PIB keeps only a summary of it, without the CA's signature.
 pub const DEVICE_CERT_FILE: &str = "device-cert.data";
-/// Lifetime of the CA signing cert minted by [`init_hub_in_pib`] (10 years).
+/// Lifetime of the CA signing cert minted by [`init_namespace_in_pib`] (10 years).
 pub const CA_CERT_VALIDITY_MS: u64 = 10 * 365 * 24 * 3600 * 1000;
-/// Lifetime of the primary device's cert minted by [`init_hub_in_pib`]: a day
+/// Lifetime of the primary device's cert minted by [`init_namespace_in_pib`]: a day
 /// short of the CA's, so it ends inside the issuer's validity.
 pub const DEVICE_CERT_VALIDITY_MS: u64 = CA_CERT_VALIDITY_MS - 24 * 3600 * 1000;
 
-/// The hub root key name: `<namespace>/KEY/root`.
+/// The namespace root key name: `<namespace>/KEY/root`.
 pub fn root_key_name(namespace: &Name) -> Name {
     namespace.clone().append("KEY").append("root")
 }
 
-/// The hub CA signing key name: `<namespace>/CA/KEY/ca` (identity `<ns>/CA`).
+/// The namespace CA signing key name: `<namespace>/CA/KEY/ca` (identity `<ns>/CA`).
 pub fn ca_key_name(namespace: &Name) -> Name {
     namespace.clone().append("CA").append("KEY").append("ca")
 }
@@ -59,14 +59,14 @@ pub fn device_key_name(device_identity: &Name) -> Name {
     device_identity.clone().append("KEY").append("device")
 }
 
-/// Result of initializing a hub.
-pub struct HubInit {
-    /// The network anchor's key name (`<namespace>/KEY/root`).
+/// Result of initializing a namespace on its root device.
+pub struct NamespaceInit {
+    /// The namespace anchor's key name (`<namespace>/KEY/root`).
     pub anchor_key: Name,
-    /// The self-signed network anchor certificate.
+    /// The self-signed namespace anchor certificate.
     pub anchor: Certificate,
-    /// The published, versioned trust context (generated personal-network
-    /// schema, authoritative; hub-default enrollment gate).
+    /// The published, versioned trust context (generated namespace
+    /// schema, authoritative; default `token AND device-approval` enrollment gate).
     pub context: Arc<SignedTrustContext>,
     /// The context as signed NDN Data at [`SignedTrustContext::rdr_name`],
     /// signed by the root anchor — what is published and what adopters verify.
@@ -77,7 +77,7 @@ pub struct HubInit {
     pub envelope: TrustEnvelope,
 }
 
-impl HubInit {
+impl NamespaceInit {
     /// The context `Content` to publish at
     /// [`SignedTrustContext::rdr_name`].
     pub fn published_content(&self) -> bytes::Bytes {
@@ -85,40 +85,43 @@ impl HubInit {
     }
 }
 
-/// Initialize a hub rooted at `namespace`: generate a signing key in `mgr`,
-/// self-sign the network anchor, build a context carrying the generated
-/// personal-network schema ([`network_schema`], authoritative) with the hub
+/// Initialize the namespace `namespace`: generate a signing key in `mgr`,
+/// self-sign the namespace anchor, build a context carrying the generated
+/// namespace schema ([`namespace_schema`], authoritative) with the default
 /// enrollment gate (`token AND device-approval`), sign it into Data with the
 /// anchor, and mint an anchor envelope committing to the anchor fingerprint.
 ///
 /// The default deployment keeps the *root* offline and runs a delegated
 /// context-signer online; this in-process helper signs directly for the
-/// self-contained case (tests, single-box hubs). The signing key never leaves
-/// `mgr`, and is lost with it — use [`init_hub_in_pib`] for a hub that must
-/// survive a restart.
-pub fn init_hub(mgr: &SecurityManager, namespace: &Name) -> Result<HubInit, HubInitError> {
+/// self-contained case (tests, single-box root devices). The signing key never leaves
+/// `mgr`, and is lost with it — use [`init_namespace_in_pib`] for a namespace that
+/// must survive a restart.
+pub fn init_namespace(
+    mgr: &SecurityManager,
+    namespace: &Name,
+) -> Result<NamespaceInit, NamespaceInitError> {
     validate_namespace(namespace)?;
     let anchor_key = root_key_name(namespace);
     mgr.generate_ed25519(anchor_key)?;
-    build_hub(mgr, namespace, None)
+    build_namespace(mgr, namespace, None)
 }
 
-/// Build the hub around the root key `root_key_name(namespace)` already held
+/// Build the namespace around the root key `root_key_name(namespace)` already held
 /// by `mgr`.
-fn build_hub(
+fn build_namespace(
     mgr: &SecurityManager,
     namespace: &Name,
     ca_endpoint: Option<Name>,
-) -> Result<HubInit, HubInitError> {
+) -> Result<NamespaceInit, NamespaceInitError> {
     let anchor_key = root_key_name(namespace);
     let signer = mgr.get_signer_sync(&anchor_key)?;
     let pk = signer.public_key().unwrap_or_default();
     let anchor = mgr.issue_self_signed(&anchor_key, pk, u64::MAX)?;
 
-    let schema = network_schema(namespace)?;
+    let schema = namespace_schema(namespace)?;
     let mut context = SignedTrustContext::hierarchical(namespace.clone())
         .with_version(1)
-        .with_enrollment_hint(EnrollmentHint::hub_default())
+        .with_enrollment_hint(EnrollmentHint::namespace_default())
         .with_schema_blobs(schema.blobs())?
         .schema_authoritative();
     if let Some(ca) = ca_endpoint {
@@ -135,7 +138,7 @@ fn build_hub(
         context_data: Some(context_data.raw().clone()),
         context_content: None,
     };
-    Ok(HubInit {
+    Ok(NamespaceInit {
         anchor_key,
         anchor,
         context,
@@ -144,13 +147,13 @@ fn build_hub(
     })
 }
 
-/// A hub initialized into a node's PIB by [`init_hub_in_pib`].
-pub struct PersistedHub {
-    /// The root, context and envelope (as [`init_hub`]).
-    pub hub: HubInit,
+/// A namespace initialized into its root device's PIB by [`init_namespace_in_pib`].
+pub struct PersistedNamespace {
+    /// The root, context and envelope (as [`init_namespace`]).
+    pub init: NamespaceInit,
     /// The CA signing key name (`<ns>/CA/KEY/ca`).
     pub ca_key: Name,
-    /// The CA signing cert, issued by the hub root.
+    /// The CA signing cert, issued by the namespace root.
     pub ca_cert: Certificate,
     /// The primary device's own identity (`<ns>/admin/<device>`), for the
     /// forwarder's `[security] identity`.
@@ -170,9 +173,9 @@ pub struct PersistedHub {
     pub device_cert_path: PathBuf,
 }
 
-/// Why [`init_hub_in_pib`] failed.
+/// Why [`init_namespace_in_pib`] failed.
 #[derive(Debug, thiserror::Error)]
-pub enum HubInitError {
+pub enum NamespaceInitError {
     #[error(
         "{namespace} is already initialized in {pib} ({what} exists); refusing to replace \
          its root — re-run with force to mint a new root (every adopter must then re-adopt)"
@@ -200,8 +203,8 @@ pub enum HubInitError {
     Store(#[from] ContextStoreError),
 }
 
-/// Persistent hub init: the [`init_hub`] flow with every secret and artefact
-/// written to `pib` so the hub survives restarts —
+/// Persistent namespace init: the [`init_namespace`] flow with every secret and
+/// artefact written to `pib` so the root device survives restarts —
 ///
 /// - root key `<ns>/KEY/root` (+ its cert, registered as a PIB trust anchor);
 /// - CA signing identity `<ns>/CA` (key `<ns>/CA/KEY/ca`) with a cert issued
@@ -211,19 +214,19 @@ pub enum HubInitError {
 ///   forwarder loads it with `[security] identity` instead of falling back to
 ///   an ephemeral key; its signed cert Data is `<pib>/ca/device-cert.data`;
 /// - the root-signed context (generated schema, advertising the CA endpoint
-///   `<ns>/CA`) in the node's adopted-context store, so the hub validates its
+///   `<ns>/CA`) in the node's adopted-context store, so the root device validates its
 ///   own namespace.
 ///
 /// `device` must pass [`crate::roles::validate_device_name`]. An existing
 /// root, CA key, device key or stored context for `namespace` is never
 /// silently replaced: without `force` this fails with
-/// [`HubInitError::AlreadyInitialized`].
-pub fn init_hub_in_pib(
+/// [`NamespaceInitError::AlreadyInitialized`].
+pub fn init_namespace_in_pib(
     pib: &FilePib,
     namespace: &Name,
     device: &str,
     force: bool,
-) -> Result<PersistedHub, HubInitError> {
+) -> Result<PersistedNamespace, NamespaceInitError> {
     validate_namespace(namespace)?;
     let anchor_key = root_key_name(namespace);
     let ca_key = ca_key_name(namespace);
@@ -243,7 +246,7 @@ pub fn init_hub_in_pib(
     };
     if let Some(what) = existing {
         if !force {
-            return Err(HubInitError::AlreadyInitialized {
+            return Err(NamespaceInitError::AlreadyInitialized {
                 namespace: namespace.to_string(),
                 pib: pib.root().display().to_string(),
                 what,
@@ -259,9 +262,9 @@ pub fn init_hub_in_pib(
     // manager for the signing steps below.
     let mgr = SecurityManager::new();
     mgr.install_signer(pib.generate_ed25519(&anchor_key)?);
-    let hub = build_hub(&mgr, namespace, Some(namespace.clone().append("CA")))?;
-    pib.store_cert(&anchor_key, &hub.anchor)?;
-    pib.add_trust_anchor(&anchor_key, &hub.anchor)?;
+    let init = build_namespace(&mgr, namespace, Some(namespace.clone().append("CA")))?;
+    pib.store_cert(&anchor_key, &init.anchor)?;
+    pib.add_trust_anchor(&anchor_key, &init.anchor)?;
 
     // The CA is certified by the root; the primary device by the CA, as the
     // schema's chain requires of every device.
@@ -273,21 +276,21 @@ pub fn init_hub_in_pib(
     let ca_dir = pib.root().join(CA_DIR);
     let io = |path: &Path| {
         let path = path.to_path_buf();
-        move |source| HubInitError::Io { path, source }
+        move |source| NamespaceInitError::Io { path, source }
     };
     std::fs::create_dir_all(&ca_dir).map_err(io(&ca_dir))?;
     let ca_cert_path = ca_dir.join(CA_CERT_FILE);
     std::fs::write(&ca_cert_path, serialize_cert(&ca_cert)).map_err(io(&ca_cert_path))?;
     let anchor_cert_path = ca_dir.join(ANCHOR_CERT_FILE);
-    std::fs::write(&anchor_cert_path, serialize_cert(&hub.anchor))
+    std::fs::write(&anchor_cert_path, serialize_cert(&init.anchor))
         .map_err(io(&anchor_cert_path))?;
     let device_cert_path = ca_dir.join(DEVICE_CERT_FILE);
     std::fs::write(&device_cert_path, serialize_cert(&device_cert))
         .map_err(io(&device_cert_path))?;
 
-    let context_path = persist_context(pib.root(), &hub.context, &hub.context_data)?;
-    Ok(PersistedHub {
-        hub,
+    let context_path = persist_context(pib.root(), &init.context, &init.context_data)?;
+    Ok(PersistedNamespace {
+        init,
         ca_key,
         ca_cert,
         device_identity,
@@ -308,7 +311,7 @@ fn certify_new_key(
     key: &Name,
     issuer: &Name,
     validity_ms: u64,
-) -> Result<Certificate, HubInitError> {
+) -> Result<Certificate, NamespaceInitError> {
     let signer = pib.generate_ed25519(key)?;
     let pk = ndn_security::Signer::public_key(&signer).unwrap_or_default();
     let cert = futures::executor::block_on(mgr.certify(key, pk, issuer, validity_ms))?;
@@ -354,26 +357,26 @@ mod tests {
     }
 
     #[test]
-    fn init_hub_builds_anchored_gated_context() {
+    fn init_namespace_builds_anchored_gated_context() {
         let mgr = SecurityManager::new();
-        let hub = init_hub(&mgr, &n("/home/bob")).unwrap();
-        assert_eq!(hub.anchor_key, n("/home/bob/KEY/root"));
-        assert_eq!(hub.context.namespace(), &n("/home/bob"));
-        assert_eq!(hub.context.version(), 1);
+        let init = init_namespace(&mgr, &n("/home/bob")).unwrap();
+        assert_eq!(init.anchor_key, n("/home/bob/KEY/root"));
+        assert_eq!(init.context.namespace(), &n("/home/bob"));
+        assert_eq!(init.context.version(), 1);
         // The generated schema governs alone (no hierarchy floor) and is
         // carried as LVS plus native rules.
-        assert!(!hub.context.enforces_hierarchy());
-        let schemas = hub.context.published_schemas();
+        assert!(!init.context.enforces_hierarchy());
+        let schemas = init.context.published_schemas();
         assert_eq!(schemas.len(), 2);
         assert_eq!(schemas[0].format, ndn_security::SchemaFormat::Lvs);
-        assert_eq!(schemas[0].body.as_ref(), network_schema(&n("/home/bob")).unwrap().lvs_binary);
-        assert!(hub.context.authorizes(&n("/home/bob/CA/KEY/ca"), &hub.anchor_key));
-        assert!(!hub.context.authorizes(&n("/home/bob/anything"), &hub.anchor_key));
+        assert_eq!(schemas[0].body.as_ref(), namespace_schema(&n("/home/bob")).unwrap().lvs_binary);
+        assert!(init.context.authorizes(&n("/home/bob/CA/KEY/ca"), &init.anchor_key));
+        assert!(!init.context.authorizes(&n("/home/bob/anything"), &init.anchor_key));
         assert_eq!(
-            hub.context.enrollment_hint(),
-            Some(&EnrollmentHint::hub_default())
+            init.context.enrollment_hint(),
+            Some(&EnrollmentHint::namespace_default())
         );
-        assert!(hub.context.is_anchor(&hub.anchor_key));
+        assert!(init.context.is_anchor(&init.anchor_key));
         // The envelope commits to the anchor we just minted, with the context
         // inline as root-signed Data (no unsigned content).
         let TrustEnvelope::Anchor {
@@ -382,20 +385,20 @@ mod tests {
             version,
             context_data,
             context_content,
-        } = &hub.envelope
+        } = &init.envelope
         else {
-            panic!("init_hub must yield an anchor envelope");
+            panic!("init_namespace must yield an anchor envelope");
         };
         assert_eq!(namespace.as_deref(), Some("/home/bob"));
-        assert_eq!(*fingerprint, Some(anchor_fingerprint(&hub.anchor)));
+        assert_eq!(*fingerprint, Some(anchor_fingerprint(&init.anchor)));
         assert_eq!(*version, Some(1));
-        assert_eq!(context_data.as_ref(), Some(hub.context_data.raw()));
+        assert_eq!(context_data.as_ref(), Some(init.context_data.raw()));
         assert_eq!(*context_content, None);
-        assert_eq!(*hub.context_data.name, hub.context.rdr_name());
-        assert_eq!(hub.context_data.content(), Some(&hub.published_content()));
+        assert_eq!(*init.context_data.name, init.context.rdr_name());
+        assert_eq!(init.context_data.content(), Some(&init.published_content()));
         // …and it verifies under that very anchor.
-        let (_, signer) = crate::onboarding::open_signed_context(&hub.context_data).unwrap();
-        assert_eq!(signer.name, hub.anchor.name);
+        let (_, signer) = crate::onboarding::open_signed_context(&init.context_data).unwrap();
+        assert_eq!(signer.name, init.anchor.name);
     }
 
     fn root_public_key(pib: &FilePib, ns: &Name) -> bytes::Bytes {
@@ -409,16 +412,16 @@ mod tests {
     /// context must outlive the process (they used to live in a dropped
     /// in-memory manager), and a re-run must not silently replace the root.
     #[test]
-    fn init_hub_in_pib_persists_root_ca_and_context() {
+    fn init_namespace_in_pib_persists_root_ca_and_context() {
         let dir = tempfile::tempdir().unwrap();
         let pib = FilePib::new(dir.path()).unwrap();
         let ns = n("/home/bob");
-        let out = init_hub_in_pib(&pib, &ns, "laptop", false).unwrap();
+        let out = init_namespace_in_pib(&pib, &ns, "laptop", false).unwrap();
 
         // Root key + cert + anchor are in the PIB.
         let root = root_key_name(&ns);
-        assert_eq!(root_public_key(&pib, &ns), out.hub.anchor.public_key);
-        assert_eq!(pib.get_cert(&root).unwrap().public_key, out.hub.anchor.public_key);
+        assert_eq!(root_public_key(&pib, &ns), out.init.anchor.public_key);
+        assert_eq!(pib.get_cert(&root).unwrap().public_key, out.init.anchor.public_key);
         assert!(pib.list_anchors().unwrap().contains(&root));
 
         // CA identity: key in the PIB, cert issued (and signed) by the root.
@@ -432,17 +435,17 @@ mod tests {
             ca_data.sig_info().unwrap().sig_type,
             ca_data.signed_region(),
             ca_data.sig_value(),
-            &out.hub.anchor.public_key,
+            &out.init.anchor.public_key,
         ))
         .unwrap();
         assert_eq!(outcome, ndn_security::VerifyOutcome::Valid);
         assert!(out.anchor_cert_path.exists());
 
         // The signed context is stored, names the CA, and re-loads verified.
-        assert_eq!(out.hub.context.ca_endpoints(), &[n("/home/bob/CA")]);
+        assert_eq!(out.init.context.ca_endpoints(), &[n("/home/bob/CA")]);
         // The inline envelope still fits one QR code (version 40, byte mode,
         // low error correction: 2953 bytes) for a typical namespace.
-        let uri = out.hub.envelope.to_uri();
+        let uri = out.init.envelope.to_uri();
         assert!(uri.len() <= 2953, "anchor envelope is {} bytes", uri.len());
         let keyring = ndn_security::Keyring::new();
         let loaded = crate::context_store::load_persisted_contexts(dir.path(), &keyring).unwrap();
@@ -455,11 +458,11 @@ mod tests {
     /// The primary device gets its own admin identity `<ns>/admin/<device>`,
     /// certified by the CA (not the root), loadable by `from_pib`.
     #[test]
-    fn init_hub_in_pib_mints_loadable_admin_device_identity() {
+    fn init_namespace_in_pib_mints_loadable_admin_device_identity() {
         let dir = tempfile::tempdir().unwrap();
         let pib = FilePib::new(dir.path()).unwrap();
         let ns = n("/home/bob");
-        let out = init_hub_in_pib(&pib, &ns, "laptop", false).unwrap();
+        let out = init_namespace_in_pib(&pib, &ns, "laptop", false).unwrap();
         let root = root_key_name(&ns);
 
         assert_eq!(out.device_identity, n("/home/bob/admin/laptop"));
@@ -496,52 +499,52 @@ mod tests {
     }
 
     #[test]
-    fn init_hub_in_pib_rejects_invalid_device_names_and_namespaces() {
+    fn init_namespace_in_pib_rejects_invalid_device_names_and_namespaces() {
         let dir = tempfile::tempdir().unwrap();
         let pib = FilePib::new(dir.path()).unwrap();
         let ns = n("/home/bob");
         for bad in ["", "KEY", "CA", "admin", "guest", "a/b", "-x"] {
-            let err = init_hub_in_pib(&pib, &ns, bad, false)
+            let err = init_namespace_in_pib(&pib, &ns, bad, false)
                 .err()
                 .expect("invalid device name must be refused");
             assert!(
-                matches!(err, HubInitError::Role(RoleError::InvalidDevice { .. })),
+                matches!(err, NamespaceInitError::Role(RoleError::InvalidDevice { .. })),
                 "{bad:?}: {err}"
             );
         }
-        let err = init_hub_in_pib(&pib, &n("/"), "laptop", false).err().unwrap();
-        assert!(matches!(err, HubInitError::Role(RoleError::InvalidNamespace { .. })));
+        let err = init_namespace_in_pib(&pib, &n("/"), "laptop", false).err().unwrap();
+        assert!(matches!(err, NamespaceInitError::Role(RoleError::InvalidNamespace { .. })));
         assert!(pib.list_keys().unwrap().is_empty(), "nothing written");
     }
 
     #[test]
-    fn init_hub_in_pib_refuses_to_replace_root_without_force() {
+    fn init_namespace_in_pib_refuses_to_replace_root_without_force() {
         let dir = tempfile::tempdir().unwrap();
         let pib = FilePib::new(dir.path()).unwrap();
         let ns = n("/home/bob");
-        let first = init_hub_in_pib(&pib, &ns, "laptop", false).unwrap();
+        let first = init_namespace_in_pib(&pib, &ns, "laptop", false).unwrap();
         let root_before = root_public_key(&pib, &ns);
 
-        let err = init_hub_in_pib(&pib, &ns, "laptop", false)
+        let err = init_namespace_in_pib(&pib, &ns, "laptop", false)
             .err()
             .expect("re-init must fail");
-        assert!(matches!(err, HubInitError::AlreadyInitialized { .. }), "{err}");
+        assert!(matches!(err, NamespaceInitError::AlreadyInitialized { .. }), "{err}");
         assert_eq!(root_public_key(&pib, &ns), root_before, "root untouched");
 
         // With force a fresh root replaces it (and the stored context follows).
-        let second = init_hub_in_pib(&pib, &ns, "laptop", true).unwrap();
+        let second = init_namespace_in_pib(&pib, &ns, "laptop", true).unwrap();
         assert_ne!(second.device_cert.public_key, first.device_cert.public_key);
         assert_ne!(root_public_key(&pib, &ns), root_before);
         assert_ne!(
-            anchor_fingerprint(&second.hub.anchor),
-            anchor_fingerprint(&first.hub.anchor)
+            anchor_fingerprint(&second.init.anchor),
+            anchor_fingerprint(&first.init.anchor)
         );
         let keyring = ndn_security::Keyring::new();
         let loaded = crate::context_store::load_persisted_contexts(dir.path(), &keyring).unwrap();
         assert_eq!(loaded.len(), 1);
         let ctx = loaded[0].1.as_ref().unwrap();
         let fps: Vec<_> = ctx.anchors().iter().map(|r| anchor_fingerprint(r.value())).collect();
-        assert_eq!(fps, vec![anchor_fingerprint(&second.hub.anchor)]);
+        assert_eq!(fps, vec![anchor_fingerprint(&second.init.anchor)]);
     }
 
     /// Sign `name` with `key` held by `mgr`.
@@ -555,18 +558,18 @@ mod tests {
         Data::decode(wire).unwrap()
     }
 
-    /// End to end through a validator whose keyring is loaded from the hub's
+    /// End to end through a validator whose keyring is loaded from the root device's
     /// PIB: the generated schema admits the role layout's signing chains and
     /// refuses what the roles forbid — on every certificate hop, so a device
     /// cannot self-issue a key, least of all an admin one.
     #[tokio::test]
-    async fn hub_context_validates_role_chains_on_every_hop() {
+    async fn namespace_context_validates_role_chains_on_every_hop() {
         use ndn_security::{CertCache, TrustSchema, ValidationResult, Validator};
 
         let dir = tempfile::tempdir().unwrap();
         let pib = FilePib::new(dir.path()).unwrap();
         let ns = n("/home/bob");
-        let out = init_hub_in_pib(&pib, &ns, "laptop", false).unwrap();
+        let out = init_namespace_in_pib(&pib, &ns, "laptop", false).unwrap();
         let v = Validator::with_chain(
             TrustSchema::new(),
             Arc::new(CertCache::new()),

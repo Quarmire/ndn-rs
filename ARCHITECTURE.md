@@ -97,7 +97,7 @@ scope = spec        NDN community specs implemented faithfully
   ndn-sync                      Dataset sync: SVS (layered — notification core w/ suppression FSM + HMAC-signed Sync Interests + V2/V3 wire dialects → SvSync data plane w/ DataStore + windowed fetch/serve → SvsPubSub named pub/sub + MappingProvider late-join backfill), PSync (Full: bounded versioned-prefix IBF set w/ relay-capable learned names; Partial: asymmetric PartialProducer + Bloom-filter subscription consumer; large replies segmented through a shared windowed-transfer module)
   ndn-repo                      Persistent named-data repository (third-party durable custody, network-layer/app-agnostic), runnable as the `ndn-repo` daemon (`--features bin`, Unix-socket IPC). RepoCmd wire codec byte-compatible with ndnd (SyncJoin/SyncLeave/BlobFetch); RepoService demuxes a forwarder connection into command handling (reply RepoCmdRes), store serving (answers for a whole joined group), and per-group SVS ingestion. Pluggable DataStore — MemoryStore (ndn-sync) or on-disk FjallStore; `SvSync::ingest_publication`/`ingest_name` store raw wires (resume-aware: skip already-stored). **Fail-closed trust**: `Repo::with_validator` gates ingestion on an `ndn_security::Validator`, so the repo never durably re-serves data it can't authenticate. Distributed replication/failover (cf. a-thieme/repo) is a layer above.
   ndn-repo-cluster              Distributed coordination layer above ndn-repo (cf. a-thieme/repo features). Fully decentralised: nodes gossip heartbeats + job claims over an SVS coordination group and fold them into an identical, converging ClusterState; each runs the same deterministic, capacity-aware placement (lowest-utilisation live nodes are designated to reach replication_factor; excess claimants beyond the lowest-util keepers shed). A node failing → missed heartbeats → its claims stop counting → a survivor re-replicates. Pure coord core + TLV msg codec + ClusterNode tick/observe driver; multi-node simulation proves convergence + failover. Not a wire standard — composes above the ndnd-compatible single-node repo.
-  ndn-cert                      NDNCERT 0.3 — INFO/NEW/CHALLENGE + IssuancePolicy hook + challenge attestations + hub onboarding (TOFU adopt)
+  ndn-cert                      NDNCERT 0.3 — INFO/NEW/CHALLENGE + IssuancePolicy hook + challenge attestations + namespace init / adopt (TOFU) / invite enrollment
   ndn-trust-envelope            `ndn-trust://` onboarding/pairing envelope codec (anchor/invite/delegation/recovery/bag/capability); one format for QR, deep link, and `.ndntrust` file
   ndn-identity                  Identity lifecycle over KeyChain + DID + NDNCERT (enroll, delegate, renew, revoke, recover); re-exports ndn-security's custodian types
 
@@ -160,7 +160,7 @@ scope = extension   Pragmatic engineering, no NDN spec basis
 
 tooling (sibling repos)         Operator-facing tools and shared tool libs
   ndn-tools-core                Embeddable tool logic (ping, iperf, peek, put)
-  dioxus-demo                   In-browser demo (TransitHost/Peer + JoinClient + SharedClient)
+  dioxus-demo                   In-browser demo (TransitHost/Peer + EnrollClient + SharedClient)
 
 draft (sibling repos)           Author-led, no stability promise
   ndn-research                  FlowObserverStage, FlowTable, ChannelManager (nl80211)
@@ -586,13 +586,13 @@ public key) and, inline, the context's **signed** Data (`sign_into_data`).
 pinned fingerprint, so a tampered context (e.g. a widened schema riding a
 genuine anchor) is refused — adoption is never automatic, and unsigned legacy
 content is adopted only through the explicit `adopt_unsigned_legacy_with_tofu`
-opt-in. `ndn-fwd init --profile hub` (`ndn_cert::init_hub_in_pib`) keeps the
-root key, the CA identity `<ns>/CA` (root-certified), the primary device's
+opt-in. `ndn-fwd init --namespace <ns>` (`ndn_cert::init_namespace_in_pib`) keeps the
+root key, the CA identity `<ns>/CA` (root-certified), the root device's
 CA-certified admin identity `<ns>/admin/<device>` and the root-signed context
 in the node's PIB; adopted contexts persist as `<pib>/contexts/<hex(ns)>.tc`
 (signed Data) and the forwarder re-verifies and loads them into its keyring at
-startup. The hub context carries the generated personal-network schema
-(`ndn_cert::roles::network_schema`: names carry roles, `<ns>/<role>/<device>`)
+startup. The namespace's context carries the generated namespace schema
+(`ndn_cert::roles::namespace_schema`: names carry roles, `<ns>/<role>/<device>`)
 as an LVS blob plus a native-text blob, OR'd (a context may carry several
 `TrustSchemaBlob`s, at most one LVS), and is **schema-authoritative**
 (`SignedTrustContext::schema_authoritative`, flag TLV `0x041C`): no hierarchy

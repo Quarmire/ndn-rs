@@ -24,9 +24,9 @@ fn n(s: &str) -> Name {
     s.parse().unwrap()
 }
 
-/// A `/home/bob` hub: a self-signed anchor + a published context, both as the
+/// A `/home/bob` root device: a self-signed anchor + a published context, both as the
 /// root-signed Data and (legacy) as bare unsigned content.
-struct Hub {
+struct RootDevice {
     mgr: SecurityManager,
     anchor_key: Name,
     anchor: Certificate,
@@ -34,7 +34,7 @@ struct Hub {
     published_data: Data,
 }
 
-fn build_hub(namespace: &str) -> Hub {
+fn build_namespace(namespace: &str) -> RootDevice {
     let mgr = SecurityManager::new();
     let anchor_key = n(&format!("{namespace}/KEY/root"));
     mgr.generate_ed25519(anchor_key.clone()).unwrap();
@@ -47,7 +47,7 @@ fn build_hub(namespace: &str) -> Hub {
     let published = ctx.encode_content();
     let published_data = ctx.sign_into_data(signer.as_ref()).unwrap();
 
-    Hub {
+    RootDevice {
         mgr,
         anchor_key,
         anchor,
@@ -81,13 +81,13 @@ fn seed_anchors(v: &Validator, ctx: &SignedTrustContext) {
 /// Bob-signed Data — with **no** CA interaction.
 #[tokio::test]
 async fn ctx01_adopt_to_verify_no_ca() {
-    let hub = build_hub("/home/bob");
+    let root_dev = build_namespace("/home/bob");
 
     // Bob hands out a by-reference anchor envelope (QR) committing to the
     // anchor fingerprint.
     let uri = TrustEnvelope::Anchor {
         namespace: Some("/home/bob".into()),
-        fingerprint: Some(anchor_fingerprint(&hub.anchor)),
+        fingerprint: Some(anchor_fingerprint(&root_dev.anchor)),
         version: None,
         context_data: None,
         context_content: None,
@@ -105,15 +105,15 @@ async fn ctx01_adopt_to_verify_no_ca() {
     };
     // "Fetch" the published, root-signed context (in a deployment, RDR over a face).
     let node = fresh_node();
-    let ctx = adopt_with_tofu(node.keyring(), &hub.published_data, &n(&ns), &fp)
+    let ctx = adopt_with_tofu(node.keyring(), &root_dev.published_data, &n(&ns), &fp)
         .expect("context signed by the pinned anchor must be adopted");
     seed_anchors(&node, &ctx);
 
     // Verify a Bob-signed Data — no CA was ever contacted.
-    let signer = hub.mgr.get_signer_sync(&hub.anchor_key).unwrap();
+    let signer = root_dev.mgr.get_signer_sync(&root_dev.anchor_key).unwrap();
     let wire = DataBuilder::new("/home/bob/note", b"hello").sign_sync(
         signer.sig_type(),
-        Some(&hub.anchor_key),
+        Some(&root_dev.anchor_key),
         |r| signer.sign_sync(r).unwrap_or_default(),
     );
     let data = Data::decode(wire).unwrap();
@@ -127,9 +127,9 @@ async fn ctx01_adopt_to_verify_no_ca() {
 /// fingerprint, never the namespace; advertising is off by default.
 #[test]
 fn ctx14_advert_hides_namespace_off_by_default() {
-    let hub = build_hub("/home/bob");
+    let root_dev = build_namespace("/home/bob");
     let ctx = SignedTrustContext::hierarchical(n("/home/bob"));
-    ctx.add_anchor(hub.anchor.clone());
+    ctx.add_anchor(root_dev.anchor.clone());
 
     let advert = AnchorAdvert::from_context(&ctx).expect("advert from anchored context");
     let wire = advert.encode();
@@ -147,7 +147,7 @@ fn ctx14_advert_hides_namespace_off_by_default() {
         AnchorAdvert::advert_prefix().to_string(),
         "/localhop/trust-context"
     );
-    // Advertising is opt-in: off unless a hub explicitly enables it.
+    // Advertising is opt-in: off unless a root device explicitly enables it.
     assert!(!AdvertConfig::default().enabled);
 }
 
@@ -155,10 +155,10 @@ fn ctx14_advert_hides_namespace_off_by_default() {
 /// enter the keyring without a TOFU fingerprint match.
 #[test]
 fn ctx15_flooded_fake_advert_rejected() {
-    let hub = build_hub("/home/bob");
+    let root_dev = build_namespace("/home/bob");
     // The node trusts Bob's real fingerprint (from a scanned anchor envelope).
     let bob = n("/home/bob");
-    let trusted = anchor_fingerprint(&hub.anchor);
+    let trusted = anchor_fingerprint(&root_dev.anchor);
 
     // An attacker floods a context for /home/bob rooted at — and signed by —
     // THEIR own anchor.
@@ -193,7 +193,7 @@ fn ctx15_flooded_fake_advert_rejected() {
     );
 
     // The genuine context (matching fingerprint) is still adoptable.
-    adopt_with_tofu(node.keyring(), &hub.published_data, &bob, &trusted).unwrap();
+    adopt_with_tofu(node.keyring(), &root_dev.published_data, &bob, &trusted).unwrap();
     assert_eq!(node.keyring().len(), 1);
 }
 
@@ -202,26 +202,26 @@ fn ctx15_flooded_fake_advert_rejected() {
 /// though its anchor matches the pin: the signature no longer covers it.
 #[test]
 fn tampered_context_keeping_the_anchor_is_refused() {
-    let hub = build_hub("/home/bob");
+    let root_dev = build_namespace("/home/bob");
     let bob = n("/home/bob");
-    let trusted = anchor_fingerprint(&hub.anchor);
+    let trusted = anchor_fingerprint(&root_dev.anchor);
 
     let weakened = SignedTrustContext::accept_all(bob.clone()).with_version(1);
-    weakened.add_anchor(hub.anchor.clone());
-    assert_ne!(weakened.encode_content(), hub.published, "schema really changed");
+    weakened.add_anchor(root_dev.anchor.clone());
+    assert_ne!(weakened.encode_content(), root_dev.published, "schema really changed");
 
     // (a) the genuine signature replayed over the weakened content…
-    let genuine_sig = hub.published_data.sig_value().to_vec();
+    let genuine_sig = root_dev.published_data.sig_value().to_vec();
     let replayed = Data::decode(
         DataBuilder::new(weakened.rdr_name(), &weakened.encode_content()).sign_sync(
             SignatureType::SignatureEd25519,
-            Some(&hub.anchor_key),
+            Some(&root_dev.anchor_key),
             |_| bytes::Bytes::from(genuine_sig.clone()),
         ),
     )
     .unwrap();
     // (b) …or the weakened content re-signed by another key claiming the root.
-    let forger = ndn_security::Ed25519Signer::from_seed(&[9u8; 32], hub.anchor_key.clone());
+    let forger = ndn_security::Ed25519Signer::from_seed(&[9u8; 32], root_dev.anchor_key.clone());
     let resigned = weakened.sign_into_data(&forger).unwrap();
 
     let node = fresh_node();
@@ -240,18 +240,18 @@ fn tampered_context_keeping_the_anchor_is_refused() {
 /// A pin for the wrong root, or the wrong namespace, refuses a genuine context.
 #[test]
 fn wrong_fingerprint_or_namespace_is_refused() {
-    let hub = build_hub("/home/bob");
+    let root_dev = build_namespace("/home/bob");
     let keyring = Keyring::new();
     assert!(matches!(
-        adopt_with_tofu(&keyring, &hub.published_data, &n("/home/bob"), &[0u8; 32]),
+        adopt_with_tofu(&keyring, &root_dev.published_data, &n("/home/bob"), &[0u8; 32]),
         Err(AdoptError::FingerprintMismatch(_))
     ));
     assert!(matches!(
         adopt_with_tofu(
             &keyring,
-            &hub.published_data,
+            &root_dev.published_data,
             &n("/home/alice"),
-            &anchor_fingerprint(&hub.anchor)
+            &anchor_fingerprint(&root_dev.anchor)
         ),
         Err(AdoptError::NamespaceMismatch { .. })
     ));
@@ -263,8 +263,8 @@ fn wrong_fingerprint_or_namespace_is_refused() {
 /// form needs the explicit legacy opt-in.
 #[test]
 fn envelope_adoption_requires_a_signed_inline_context() {
-    let hub = build_hub("/home/bob");
-    let fp = anchor_fingerprint(&hub.anchor);
+    let root_dev = build_namespace("/home/bob");
+    let fp = anchor_fingerprint(&root_dev.anchor);
     let anchor = |data: Option<&Data>, content: Option<&bytes::Bytes>| TrustEnvelope::Anchor {
         namespace: Some("/home/bob".into()),
         fingerprint: Some(fp),
@@ -275,7 +275,7 @@ fn envelope_adoption_requires_a_signed_inline_context() {
     let keyring = Keyring::new();
 
     assert!(matches!(
-        adopt_anchor_envelope(&keyring, &anchor(None, Some(&hub.published))),
+        adopt_anchor_envelope(&keyring, &anchor(None, Some(&root_dev.published))),
         Err(AdoptError::UnsignedLegacyContext)
     ));
     assert!(matches!(
@@ -284,15 +284,15 @@ fn envelope_adoption_requires_a_signed_inline_context() {
     ));
     assert!(keyring.is_empty(), "nothing adopted by default");
 
-    let uri = anchor(Some(&hub.published_data), None).to_uri();
+    let uri = anchor(Some(&root_dev.published_data), None).to_uri();
     let (ctx, data) =
         adopt_anchor_envelope(&keyring, &TrustEnvelope::from_uri(&uri).unwrap()).unwrap();
     assert_eq!(ctx.namespace(), &n("/home/bob"));
-    assert_eq!(data.raw(), hub.published_data.raw());
+    assert_eq!(data.raw(), root_dev.published_data.raw());
 
     // The explicit, unverified legacy path still exists for operators who opt in.
     let legacy = Keyring::new();
-    let ctx = SignedTrustContext::decode_content(&hub.published, 1).unwrap();
+    let ctx = SignedTrustContext::decode_content(&root_dev.published, 1).unwrap();
     adopt_unsigned_legacy_with_tofu(&legacy, ctx, &n("/home/bob"), &fp).unwrap();
     assert_eq!(legacy.version_of(&n("/home/bob")), Some(1));
 }

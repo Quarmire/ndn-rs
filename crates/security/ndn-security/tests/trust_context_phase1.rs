@@ -281,7 +281,7 @@ fn ctx17_schema_roundtrips_as_stock_lvs() {
     let lvs = Bytes::from_static(NDND_LVS_MODEL);
     let ctx = SignedTrustContext::hierarchical(n("/a/blog"))
         .with_version(1)
-        .with_enrollment_hint(EnrollmentHint::hub_default())
+        .with_enrollment_hint(EnrollmentHint::namespace_default())
         .with_schema_blob(SchemaBlob::lvs(lvs.clone()))
         .expect("LVS schema imports");
 
@@ -303,5 +303,5 @@ fn ctx17_schema_roundtrips_as_stock_lvs() {
         "LVS binary must round-trip byte-for-byte"
     );
     assert_eq!(back.namespace(), &n("/a/blog"));
-    assert_eq!(back.enrollment_hint(), Some(&EnrollmentHint::hub_default()));
+    assert_eq!(back.enrollment_hint(), Some(&EnrollmentHint::namespace_default()));
 }

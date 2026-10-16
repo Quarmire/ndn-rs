@@ -166,9 +166,10 @@ pub struct EnrollmentHint {
 }
 
 impl EnrollmentHint {
-    /// The hub default: `token AND device-approval` — a leaked QR token alone
-    /// yields no cert without an admin tap.
-    pub fn hub_default() -> Self {
+    /// The default enrollment gate `ndn-fwd init` puts on a namespace:
+    /// `token AND device-approval` — a leaked QR token alone yields no cert
+    /// without an admin tap.
+    pub fn namespace_default() -> Self {
         Self {
             challenges: vec!["token".into(), "device-approval".into()],
             require_all: true,
@@ -327,7 +328,7 @@ impl SignedTrustContext {
     /// signature), and say so on the wire ([`tlv::SCHEMA_AUTHORITATIVE`]) so
     /// adopters do the same. Only for schemas that bind every signer to the
     /// names it may sign, certificates included (the generated
-    /// personal-network schema): its cross-identity grants (admins approving
+    /// namespace schema): its cross-identity grants (admins approving
     /// enrollments, members writing a shared namespace) are exactly what the
     /// floor forbids.
     pub fn schema_authoritative(mut self) -> Self {
@@ -968,7 +969,7 @@ mod tests {
 
     #[test]
     fn enrollment_hint_roundtrips() {
-        let h = EnrollmentHint::hub_default();
+        let h = EnrollmentHint::namespace_default();
         let decoded = EnrollmentHint::decode(&h.encode());
         assert_eq!(decoded, h);
         assert!(decoded.require_all);

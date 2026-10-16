@@ -108,7 +108,11 @@ cost = 100        # optional
 | `serve_contexts` | `true` | Publish every trust context in `<pib_path>/contexts/` by name over RDR: `/<ns>/32=trust-context/32=metadata` names the stored version, `/<ns>/32=trust-context/v=<N>` returns the stored signed Data verbatim. Read at startup. See [Trust-context publication](../reference/trust-context-publication.md). |
 | `trust_admin_groups` | `[]` | Unix groups whose members may change this node's trust (`security/context-adopt`) over the local management socket. The daemon's own user and root are always allowed; everyone else is refused. Membership is checked against the caller's kernel-reported socket credentials (primary gid, the group's member list, and on Linux the caller's supplementary groups). Read at startup. |
 
-## `[demo_ca]` — embedded NDNCERT CA
+## `[ca]` — embedded NDNCERT CA
+
+This section was called `[demo_ca]` before; a config that still has a
+`[demo_ca]` section is refused at startup with a message to rename it to `[ca]`
+(keys unchanged).
 
 Off by default; `enabled = true` runs an in-process CA serving
 `/<prefix>/CA/{INFO,NEW,CHALLENGE/<id>,REVOKE}` and cert-fetch for the certs
@@ -120,22 +124,22 @@ it issued. See [NDNCERT setup](../guides/ndncert-setup.md).
 | `prefix` | `/demo` | CA namespace. The CA appends `/CA` itself (as do clients); a prefix ending in `/CA` is rejected at startup. |
 | `identity` | `/demo/CA` | CA signing identity, loaded from the node PIB (`[security] pib_path`). |
 | `ephemeral` | `false` | Mint a throwaway self-signed CA key at every start instead of loading `identity` (demo only; warned). |
-| `tokens` | `[]` | Legacy: non-empty selects a token challenge (ignored when `challenge` is set). A token `member-…` / `guest-…` (as `ndn-fwd-tokens new --role` mints them) is scoped to `<network>/<role>`. |
+| `tokens` | `[]` | Legacy: non-empty selects a token challenge (ignored when `challenge` is set). A token `member-…` / `guest-…` (as `ndn-fwd-tokens new --role` mints them) is scoped to `<namespace>/<role>`. |
 | `emit_attestations` | `false` | Embed a challenge attestation in each issued cert. |
 | `cert_validity_days` | `90` | Lifetime of the certificates the CA issues, in days; also the maximum it advertises in INFO. Devices enrolling by invite ask for 90; a lower value caps them and `ndn-fwd enroll` prints the expiry issued. 90 keeps an enrolled device valid while certificate renewal is not built; renewal will allow shorter lifetimes. `0` is refused at startup. |
 
 Without `ephemeral`, the CA loads its key from the PIB and its certificate
-(issued by the hub root) from `<pib_path>/ca/ca-cert.data`; the root's anchor
+(issued by the namespace root) from `<pib_path>/ca/ca-cert.data`; the root's anchor
 certificate is `<pib_path>/ca/anchor-cert.data` or a PIB trust anchor. `ndn-fwd
-init --profile hub` writes all three. Startup fails if they are missing,
+init --namespace <ns>` writes all three. Startup fails if they are missing,
 mismatched, or the CA cert is not signed by the root. Issued certs,
 revocations and redeemed one-time tokens (SHA-256 hashes only) persist under
 `<pib_path>/ca/{issued,revoked,redeemed-tokens}/`: issued certs are served
 again after a restart, revoked ones are not, and a token redeemed before a
 restart stays refused even while it is still listed in the config.
 
-`ndn-fwd init --profile hub --namespace /<ns> [--device <name>]` also mints
-the primary device's admin identity `/<ns>/admin/<device>` (default device
+`ndn-fwd init --namespace /<ns> [--device <name>]` (run on the root device)
+also mints the root device's admin identity `/<ns>/admin/<device>` (default device
 name: the host name, lowercased, first label, disallowed characters as `-`;
 `KEY`, `CA` and the role words are refused; key
 `/<ns>/admin/<device>/KEY/device`, cert issued by the CA, signed copy at
@@ -145,24 +149,24 @@ carrying the generated role schema (`ndn-fwd schema show`), and prints the
 (`identity = "/<ns>/admin/<device>"`, `pib_path = "<pib>"`); without them the
 forwarder falls back to an ephemeral key. Init never edits config files.
 
-A PIB-backed CA whose identity is `/<ns>/CA`, certified by the hub root
-`/<ns>/KEY/…`, serves the personal network `/<ns>`: it issues only device keys
+A PIB-backed CA whose identity is `/<ns>/CA`, certified by the namespace root
+`/<ns>/KEY/…`, serves the namespace `/<ns>`: it issues only device keys
 `/<ns>/<role>/<device>/KEY/<id>` (role `admin`, `member`, `node`, `guest`);
 `admin` and `node` certs need a `device-approval`, tokens admit members and —
 when guest-scoped — guests (`ndn_cert::RolePolicy`; see
-[NDNCERT setup](../guides/ndncert-setup.md#roles-in-a-personal-network)). A
+[NDNCERT setup](../guides/ndncert-setup.md#roles-in-a-namespace)). A
 device name holds one certified key at a time: a new key for a name that holds
 a valid, unrevoked certificate is refused (before the token is redeemed) until
 that certificate is revoked, unless the new key comes with a `device-approval`.
 An ephemeral CA keeps issuing any challenge-passing name.
 
-`[[demo_ca.challenge]]` — explicit challenge set (replaces the `tokens`
+`[[ca.challenge]]` — explicit challenge set (replaces the `tokens`
 shortcut). Each entry has `kind = "nop"|"token"|"pin"|"email"|"device-approval"`.
 The CA refuses to start with no challenge configured; `nop` (auto-approve
 every request) is only offered when listed explicitly.
 
 ```toml
-[[demo_ca.challenge]]
+[[ca.challenge]]
 kind = "email"
 ttl_secs = 300
 smtp = { host = "smtp.example.com", port = 587, from = "ca@example.com", starttls = true }
@@ -175,8 +179,8 @@ request until it is approved or denied over mgmt
 `<id>:<reason>`) or an approver device sends a signed approval to
 `/<prefix>/CA/APPROVE-FEED` that validates against the node's trust contexts;
 all three share one pending-approval store.
-`[demo_ca.require_attestation]` (`prefix`/`kind`/`require_signed`) gates
-issuance on a challenge attestation (on a hub CA, on top of the role layout).
+`[ca.require_attestation]` (`prefix`/`kind`/`require_signed`) gates
+issuance on a challenge attestation (on a namespace CA, on top of the role layout).
 `possession`/`yubikey` are wired in code.
 
 ## `[log]` — log filter

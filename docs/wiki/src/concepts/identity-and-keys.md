@@ -120,7 +120,7 @@ the default native PIB. A PIB can hold several identities. `open_or_create`,
 requested identity's key, i.e. any key whose name starts with
 `/<identity>/KEY/`. That covers every naming form in use:
 `/KEY/<key-id>/self/v=0` (`ndn-sec keygen`), `/KEY/self` (`auto_init`),
-`/KEY/root` (hub root) and `/KEY/<key-id>`. When an identity has several
+`/KEY/root` (namespace root) and `/KEY/<key-id>`. When an identity has several
 keys, `FilePib::default_key` picks the one whose valid certificate was
 issued most recently, falling back to name order. Use `FilePib` directly
 for the SafeBag import/export below; SafeBag is also the portable way to
@@ -203,7 +203,7 @@ design you cannot silently make an unrecoverable identity.
 
 ## See also
 
-- [NDNCERT setup](../guides/ndncert-setup.md) — operator and joiner
+- [NDNCERT setup](../guides/ndncert-setup.md) — operator and enrollee
   workflow for automated certificate issuance.
 - [Trust policies](../reference/trust-policies.md) — concrete policy
   catalog with rule shapes.

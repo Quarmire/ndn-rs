@@ -1,5 +1,5 @@
 //! A device identity `/<ns>/<role>/<device>` holds one certified key at a
-//! time on a hub CA (`RolePolicy`): an invite token never certifies a key
+//! time on a namespace CA (`RolePolicy`): an invite token never certifies a key
 //! under a name the CA already certified to another key, so a token cannot
 //! take over an enrolled device's name. Only revoking the old certificate or
 //! an admin's device approval lets a new key have the name.
@@ -14,7 +14,7 @@ use ndn_cert::challenge::device_approval::{DeviceApprovalChallenge, PendingAppro
 use ndn_cert::{
     CaExchange, CertError, HierarchicalPolicy, InviteEnrollError, InviteLink, RevokeStatus,
     RolePolicy, TokenChallenge, TokenStore, adopt_with_tofu, anchor_fingerprint, ca_key_name,
-    enroll_with_invite, init_hub, new_device_key_name,
+    enroll_with_invite, init_namespace, new_device_key_name,
 };
 use ndn_packet::encode::DataBuilder;
 use ndn_packet::{Data, Interest, Name};
@@ -60,23 +60,23 @@ impl CaExchange for CaWire {
     }
 }
 
-struct Hub {
+struct RootDevice {
     wire: CaWire,
     keyring: Arc<Keyring>,
     fingerprint: [u8; 32],
     approvals: PendingApprovalStore,
 }
 
-/// A hub CA for `/home/bob` issuing by role, offering a `token` challenge
+/// A namespace CA for `/home/bob` issuing by role, offering a `token` challenge
 /// (the given member tokens) and a `device-approval` challenge; plus a
-/// device keyring that holds the hub's trust context.
-async fn hub(tokens: &[&str]) -> Hub {
+/// device keyring that holds the root device's trust context.
+async fn root_dev(tokens: &[&str]) -> RootDevice {
     let mgr = SecurityManager::new();
-    let hub = init_hub(&mgr, &ns()).unwrap();
+    let root_dev = init_namespace(&mgr, &ns()).unwrap();
     let ca_key = ca_key_name(&ns());
     mgr.generate_ed25519(ca_key.clone()).unwrap();
     let ca_pub = mgr.get_signer_sync(&ca_key).unwrap().public_key().unwrap();
-    mgr.certify(&ca_key, ca_pub, &hub.anchor_key, 3_650 * 86_400 * 1_000)
+    mgr.certify(&ca_key, ca_pub, &root_dev.anchor_key, 3_650 * 86_400 * 1_000)
         .await
         .unwrap();
     let store = TokenStore::new();
@@ -90,7 +90,7 @@ async fn hub(tokens: &[&str]) -> Hub {
     ];
     let mut config = CaConfig::new(
         ns(),
-        "hub CA".to_string(),
+        "namespace CA".to_string(),
         Duration::from_secs(90 * 86_400),
         Duration::from_secs(90 * 86_400),
         challenges,
@@ -99,11 +99,11 @@ async fn hub(tokens: &[&str]) -> Hub {
     .with_signing_key(ca_key);
     config.issuance = Box::new(RolePolicy::new(ns()));
 
-    let context = Data::decode(hub.context_data.raw().clone()).unwrap();
-    let fingerprint = anchor_fingerprint(&hub.anchor);
+    let context = Data::decode(root_dev.context_data.raw().clone()).unwrap();
+    let fingerprint = anchor_fingerprint(&root_dev.anchor);
     let keyring = Arc::new(Keyring::new());
     adopt_with_tofu(&keyring, &context, &ns(), &fingerprint).unwrap();
-    Hub {
+    RootDevice {
         wire: CaWire(Arc::new(CaState::new(config, Arc::new(mgr)))),
         keyring,
         fingerprint,
@@ -122,7 +122,7 @@ fn key(device: &str, seed: u8) -> Arc<dyn Signer> {
 
 /// Enroll `key` with a member invite carrying `token`.
 async fn enroll(
-    hub: &Hub,
+    root_dev: &RootDevice,
     token: &str,
     key: Arc<dyn Signer>,
 ) -> Result<Certificate, InviteEnrollError> {
@@ -131,14 +131,14 @@ async fn enroll(
         identity_namespace: "/home/bob/member".into(),
         token: token.into(),
         ttl_secs: None,
-        anchor_fingerprint: Some(hub.fingerprint),
+        anchor_fingerprint: Some(root_dev.fingerprint),
     }
     .to_uri();
     let invite = InviteLink::from_uri(&uri).unwrap();
     enroll_with_invite(
-        &hub.keyring,
+        &root_dev.keyring,
         None,
-        &mut hub.wire.clone(),
+        &mut root_dev.wire.clone(),
         &invite,
         key,
         ndn_cert::INVITE_CERT_VALIDITY_SECS,
@@ -153,23 +153,23 @@ async fn enroll(
 /// request spends nothing: its token still enrolls under another name.
 #[tokio::test]
 async fn a_token_never_certifies_a_second_key_for_a_device_name() {
-    let hub = hub(&["member-1", "member-2", "member-3", "member-4", "member-5"]).await;
-    enroll(&hub, "member-1", key("phone", 1))
+    let root_dev = root_dev(&["member-1", "member-2", "member-3", "member-4", "member-5"]).await;
+    enroll(&root_dev, "member-1", key("phone", 1))
         .await
         .expect("first key for phone");
 
-    let taken = enroll(&hub, "member-2", key("phone", 2)).await;
+    let taken = enroll(&root_dev, "member-2", key("phone", 2)).await;
     assert!(
         matches!(taken, Err(InviteEnrollError::NameRefused(_))),
         "{taken:?}"
     );
-    enroll(&hub, "member-2", key("tablet", 2))
+    enroll(&root_dev, "member-2", key("tablet", 2))
         .await
         .expect("the refused request did not spend its token");
 
     let (a, b) = tokio::join!(
-        enroll(&hub, "member-3", key("laptop", 3)),
-        enroll(&hub, "member-4", key("laptop", 4)),
+        enroll(&root_dev, "member-3", key("laptop", 3)),
+        enroll(&root_dev, "member-4", key("laptop", 4)),
     );
     assert_eq!(
         [&a, &b].iter().filter(|r| r.is_ok()).count(),
@@ -181,7 +181,7 @@ async fn a_token_never_certifies_a_second_key_for_a_device_name() {
     } else {
         key("laptop", 3)
     };
-    let again = enroll(&hub, "member-5", loser).await;
+    let again = enroll(&root_dev, "member-5", loser).await;
     assert!(
         matches!(again, Err(InviteEnrollError::NameRefused(_))),
         "{again:?}"
@@ -192,15 +192,15 @@ async fn a_token_never_certifies_a_second_key_for_a_device_name() {
 /// key for it; while it is valid, only an admin's device approval does.
 #[tokio::test]
 async fn revocation_or_admin_approval_lets_a_new_key_have_the_name() {
-    let hub = hub(&["member-1", "member-2", "member-3"]).await;
+    let root_dev = root_dev(&["member-1", "member-2", "member-3"]).await;
     let old = key("phone", 1);
-    let cert = enroll(&hub, "member-1", Arc::clone(&old)).await.unwrap();
+    let cert = enroll(&root_dev, "member-1", Arc::clone(&old)).await.unwrap();
 
     // An admin approves a new key for the held name.
     let approved = key("phone", 2);
-    let approvals = hub.approvals.clone();
+    let approvals = root_dev.approvals.clone();
     let approved_cert = ndn_cert::client::enroll(
-        &mut hub.wire.clone(),
+        &mut root_dev.wire.clone(),
         &ns(),
         Arc::clone(&approved),
         86_400,
@@ -218,18 +218,18 @@ async fn revocation_or_admin_approval_lets_a_new_key_have_the_name() {
     .expect("an admin's approval certifies a new key for a held name");
 
     // A token does not, until every valid certificate for it is revoked.
-    let taken = enroll(&hub, "member-2", key("phone", 3)).await;
+    let taken = enroll(&root_dev, "member-2", key("phone", 3)).await;
     assert!(
         matches!(taken, Err(InviteEnrollError::NameRefused(_))),
         "{taken:?}"
     );
     for (cert_name, holder) in [(cert.name.as_ref().clone(), old), (approved_cert, approved)] {
-        let revoked = ndn_cert::client::revoke(&mut hub.wire.clone(), &ns(), &cert_name, holder)
+        let revoked = ndn_cert::client::revoke(&mut root_dev.wire.clone(), &ns(), &cert_name, holder)
             .await
             .unwrap();
         assert_eq!(revoked, RevokeStatus::Revoked);
     }
-    enroll(&hub, "member-3", key("phone", 3))
+    enroll(&root_dev, "member-3", key("phone", 3))
         .await
         .expect("a token certifies a new key once the name's certificates are revoked");
 }

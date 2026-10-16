@@ -44,8 +44,8 @@ use crate::error::CertError;
 use crate::onboarding::{AdoptError, AnchorLink, LinkAdoption, adopt_anchor_link, anchor_fingerprint};
 use crate::roles::{Role, RoleError, token_role, validate_device_name, validate_namespace};
 
-/// Certificate lifetime a device asks for: 90 days, the lifetime a hub CA
-/// issues by default (`[demo_ca] cert_validity_days`). A CA configured for
+/// Certificate lifetime a device asks for: 90 days, the lifetime a namespace CA
+/// issues by default (`[ca] cert_validity_days`). A CA configured for
 /// less issues less; the issued certificate's validity period is the actual
 /// expiry. Renewal (not built yet) will allow shorter lifetimes.
 pub const INVITE_CERT_VALIDITY_SECS: u64 = 90 * 24 * 3600;
@@ -81,7 +81,7 @@ impl InviteLink {
     /// Read an invite envelope. Refuses anything a token can never certify:
     /// an identity namespace that is not `/<ns>/member` or `/<ns>/guest`, and
     /// a token whose role differs from it (a token without a role prefix is
-    /// scoped by a hub CA to members).
+    /// scoped by a namespace CA to members).
     pub fn from_envelope(envelope: &TrustEnvelope) -> Result<Self, InviteEnrollError> {
         let TrustEnvelope::Invite {
             ca_prefix,
@@ -296,7 +296,7 @@ impl InviteEnrollError {
                 namespace,
                 detail: source.to_string(),
             },
-            AdoptError::WrongNetwork { reason, .. } => {
+            AdoptError::WrongContext { reason, .. } => {
                 Self::ContextFromDifferentRoot { namespace, reason }
             }
             e @ (AdoptError::FingerprintMismatch(_) | AdoptError::NoExpectedAnchor) => {

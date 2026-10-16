@@ -814,7 +814,7 @@ mod tests {
 
     /// Every key naming form already persisted in FilePibs loads for its
     /// identity: `ndn-sec keygen`'s cert-named `/KEY/<kid>/self/v=0`,
-    /// `auto_init`'s `/KEY/self`, the hub's `/KEY/root`, and `/KEY/<kid>`.
+    /// `auto_init`'s `/KEY/self`, a namespace root's `/KEY/root`, and `/KEY/<kid>`.
     #[test]
     fn every_key_naming_form_loads_for_its_identity() {
         for (identity, legacy_key) in [

@@ -1,8 +1,31 @@
-# Personal network pairing — design
+# Personal namespace: trust, enrollment and links — design
 
-Status: **draft for review**. Scope: how an owner sets up, grows, repairs and
-shares a personal NDN network. Every flow is defined headless (CLI + mobile FFI)
-first; the TUI is a thin skin over the same calls.
+Status: **draft for review**. Scope: how an owner creates, grows, repairs and
+shares a personal NDN namespace. Every flow is defined headless (CLI + mobile
+FFI) first; the TUI is a thin skin over the same calls.
+
+There is no "network" to "join". A device **adopts** the namespace's trust
+context (it accepts Data under `/<ns>` signed by keys chaining to the
+namespace root, under the namespace's schema) and, to produce, **enrolls**
+(gets a certificate for its key under `/<ns>/<role>/<device>` from the
+namespace's CA). Reaching other devices is a separate matter: forwarders form
+**links** (faces) to other forwarders, a **relay** is a forwarder at a
+reachable address others link to, and **routes** say which prefixes go over
+which links (§9).
+
+Terms used throughout:
+
+| Term | Meaning |
+|---|---|
+| namespace | a name prefix `/<ns>` owned by a root key |
+| root device | the device that creates the namespace's root and CA (`ndn-fwd init`) |
+| trust context | the root-signed statement of the namespace's anchors and rules |
+| adopt | accept a namespace's trust context (`ndn-fwd adopt`) |
+| enroll | obtain a certificate under the namespace (`ndn-fwd enroll`) |
+| invite | a one-time token plus a pointer to the trust context |
+| link | a face between two forwarders |
+| relay | a forwarder at a reachable address others link to (role `node`) |
+| route | which prefixes go over which links |
 
 ## 1. Principles
 
@@ -12,7 +35,7 @@ first; the TUI is a thin skin over the same calls.
    format, where they keep copies), the system offers every supported option
    and the owner picks. No option is pre-selected by the library.
 3. **One root of authority.** The owner's root key signs the trust context.
-   Everything else — CA, admins, members, super nodes — holds a delegated key
+   Everything else — CA, admins, members, relays — holds a delegated key
    whose authority the root can withdraw by bumping the context.
 4. **Names carry roles.** Authorization is expressed in names so the trust
    schema can check it without new mechanism. Owners never write the schema;
@@ -25,16 +48,16 @@ first; the TUI is a thin skin over the same calls.
 
 | Actor | Name | Key | Lives on | Online? |
 |---|---|---|---|---|
-| Root | `/<ns>/KEY/root` | Ed25519, root-signed self cert | primary device (owner's choice of store) + recovery kit | rarely needed |
-| CA | `/<ns>/CA` | delegated, cert issued by root | super node (preferred) or primary device | always, if on super node |
+| Root | `/<ns>/KEY/root` | Ed25519, root-signed self cert | root device (owner's choice of store) + recovery kit | rarely needed |
+| CA | `/<ns>/CA` | delegated, cert issued by root | relay (preferred) or root device | always, if on a relay |
 | Admin device | `/<ns>/admin/<device>` | per device, cert issued by CA | owner's devices marked admin | sometimes |
 | Member device | `/<ns>/member/<device>` | per device, cert issued by CA | everything else | sometimes |
-| Super node | `/<ns>/node/<name>` | per node, cert issued by CA | VPS / home server; QUIC listener; relay | always |
+| Relay | `/<ns>/node/<name>` | per relay, cert issued by CA | VPS / home server at a reachable address (QUIC listener) | always |
 | Guest | `/<ns>/guest/<who>` | guest's key, short-lived cert | friend's device | — |
 
-The primary device is the first admin. Root key storage options on it (owner
-picks): OS keyring / secure enclave custodian, YubiKey PIV, or a `FilePib`
-directory. A super node never holds the root.
+The root device (the primary device) is the first admin. Root key storage
+options on it (owner picks): OS keyring / secure enclave custodian, YubiKey
+PIV, or a `FilePib` directory. A relay never holds the root.
 
 ## 3. Wire objects (all exist today unless marked NEW)
 
@@ -58,7 +81,7 @@ directory. A super node never holds the root.
 
 Produced from the role layout; carried in the context as LVS binary (portable
 to ndnd/NDNts/python-ndn) with a native-text twin for the rules LVS cannot
-express (**have**: `ndn_cert::roles::network_schema`, emitted by `init`).
+express (**have**: `ndn_cert::roles::namespace_schema`, emitted by `init`).
 
 ```
 /<ns>/KEY/<k>, /<ns>/32=trust-context/<v>  signed by  /<ns>/KEY/<k>        (root)
@@ -91,14 +114,14 @@ Hand-written schemas remain possible (native rules or LVS text via
 Each flow lists steps, what is stored where, failure handling, and status
 (**have** = implemented, **gap** = to build).
 
-### F1 Set up a network (primary device)
-1. `ndn-fwd init --profile hub --namespace /<ns> [--device <name>]` → root, CA,
+### F1 Create a namespace (root device)
+1. `ndn-fwd init --namespace /<ns> [--device <name>]` → root, CA,
    the primary device as `/<ns>/admin/<dev>` (CA-certified; device name
    defaults to the sanitized host name), root-signed context carrying the
    generated schema, all in the PIB (**have**).
 2. Recovery kit offered immediately (F7). The owner may decline; the UI keeps
    reminding until one exists.
-3. Optional: delegate the CA to a super node (F3).
+3. Optional: delegate the CA to a relay (F3).
 
 ### F2 Add a device
 - **By invite (token):** an admin creates an invite (`ndn-fwd-tokens new
@@ -121,23 +144,22 @@ Each flow lists steps, what is stored where, failure handling, and status
   and approves on an admin device (**have** in daemon; **gap**: approve from a
   remote admin device, not only the CA host's mgmt socket).
 - Role: the device enrolls as `/<ns>/<role>/<dev>`; issuing an admin (or
-  super node) cert requires an admin approval, never a token alone; tokens
+  relay) cert requires an admin approval, never a token alone; tokens
   admit members, and guests only when guest-scoped (**have**:
-  `ndn_cert::RolePolicy`, the default for a hub CA in `[demo_ca]`).
+  `ndn_cert::RolePolicy`, the default for the namespace CA in `[ca]`).
 - One key per device name: the CA refuses a new key for `/<ns>/<role>/<dev>`
   while a valid certificate it issued for that name to another key is
   unrevoked, unless an admin approves the new key; the refusal comes before
   the token is redeemed (**have**: `IssuancePolicy::single_key_identity`).
-- Lifetime: hub certificates last 90 days (`[demo_ca] cert_validity_days`),
+- Lifetime: certificates from the namespace CA last 90 days (`[ca] cert_validity_days`),
   the lifetime a device requests, until renewal (F10) allows shorter ones.
 
-### F3 Delegate the CA to a super node
-1. Super node generates `/<ns>/CA` key locally; produces a cert request.
-2. Primary device signs it with the root (QR/file round trip, or over NDN
+### F3 Delegate the CA to a relay
+1. The relay generates `/<ns>/CA` key locally; produces a cert request.
+2. The root device signs it with the root (QR/file round trip, or over NDN
    while paired) and bumps the context with the new CA endpoint.
-3. Super node starts `[demo_ca]` from its PIB (**have**: PIB-backed CA).
-Gap: the request/sign round trip and config naming (`[ca]` instead of
-`[demo_ca]` once this path is the norm).
+3. The relay starts `[ca]` from its PIB (**have**: PIB-backed CA).
+Gap: the request/sign round trip.
 
 ### F4 Lose a member device
 1. Any admin: `devices revoke <name>` → CA REVOKE (immediate at the CA, cert no
@@ -148,13 +170,13 @@ Gap: the request/sign round trip and config naming (`[ca]` instead of
 
 ### F5 Lose an admin device
 As F4, plus: pending approvals signed by that device are refused after the
-bump. If it was the primary device, continue with F8.
+bump. If it was the root device, continue with F8.
 
-### F6 Super node compromised
+### F6 Relay compromised
 1. Root bump: revoke `/<ns>/CA` cert and the node cert, add a new CA endpoint.
 2. Devices keep their certs (issued before compromise) unless the owner
    chooses to re-enroll everything; the UI asks.
-3. QUIC pins for that super node are dropped from peers' configs.
+3. QUIC pins for that relay are dropped from the links peers configure to it.
 
 ### F7 Create a recovery kit
 The owner chooses one or more formats; all are supported equally:
@@ -165,14 +187,14 @@ The owner chooses one or more formats; all are supported equally:
 - **Hardware** — a second YubiKey holding a root copy, where the owner's
   hardware allows import.
 Each kit also carries the public context name and fingerprint so restoration
-can find and verify the network. Kits never leave the device unencrypted
+can find and verify the namespace. Kits never leave the device unencrypted
 except as the owner-chosen word list.
 
-### F8 Restore after losing the primary device
+### F8 Restore after losing the root device
 1. New device: `recover <kit>` → root key restored into the chosen store.
-2. Root bump: revoke the lost primary device's admin cert; the new device
+2. Root bump: revoke the lost root device's admin cert; the new device
    enrolls itself as admin.
-3. Everything else keeps working; no re-pairing of other devices.
+3. Everything else keeps working; no other device re-adopts or re-enrolls.
 
 ### F9 Share with a friend (scoped, time-limited)
 1. Admin issues a guest cert `/<ns>/guest/<who>` with short validity, plus a
@@ -188,9 +210,11 @@ Device keys renew through NDNCERT renewal (`ndn_identity::start_renewal`,
 both roots for one version, then drops the old one (**gap**).
 
 ### F11 Travel / carrier-grade NAT
-Devices always dial out to a super node (QUIC, or WebTransport from browsers
-and restrictive networks); the super node forwards. Nothing in pairing
-depends on inbound reachability.
+Devices dial out to a relay (a configured link over QUIC, or WebTransport from
+browsers and restrictive networks) and route `/<ns>` over that link; the relay
+forwards. Adoption and enrollment do not depend on inbound reachability, but
+they do need that link and route whenever the context or the CA is not on the
+local segment (§9).
 
 ## 6. Storage layout (per node PIB directory)
 
@@ -209,7 +233,7 @@ $XDG_STATE_HOME/ndn-fwd/tls/   persistent self-signed listener certs
 ## 7. Build order
 
 1. Generated schema + role naming in `init` and enrollment (F1, F2 roles) — **have**.
-2. `join` (fetch-by-fingerprint + adopt + enroll) and remote admin approval (F2).
+2. `adopt` by fingerprint + `enroll` by invite (**have**) and remote admin approval (F2).
 3. `devices list|revoke` + context bump/publish (F4, F5).
 4. Recovery kit formats + `recover` (F7, F8).
 5. CA delegation round trip (F3), then F6 tooling.
@@ -223,3 +247,34 @@ Admission policy is the CA's challenge configuration, chosen by the owner,
 not fixed by the design: token-only, approval-only, or token AND approval for
 members. Admin certificates always require an admin approval. Recovery kit
 formats (§F7) and root key storage (§2) are likewise the owner's choice.
+
+## 9. Links, relays and routes vs trust and enrollment
+
+Two separate planes, configured separately:
+
+- **Host-centric: links, relays, routes.** A link is a face between two
+  forwarders (`[[face]]`, `ndn-ctl face create`); it names a host and port.
+  A relay is a forwarder at a reachable address (a VPS, a home server with a
+  forwarded port) that other forwarders link to. A route (`[[route]]`,
+  `ndn-ctl route add`) says which prefixes go over which links. None of this
+  knows about namespaces' keys: a link carries any Interest the routes send
+  it.
+- **Data-centric: trust and enrollment.** Adopting a trust context decides
+  which signed Data under `/<ns>` this node accepts; enrolling gives this
+  node's key a certificate under `/<ns>/<role>/<device>`. Both are statements
+  about names and keys, not about hosts; they work over whatever links and
+  routes exist, or over none (an inline anchor link needs no fetch).
+
+Consequences:
+
+- **A link never forms from an invite or an anchor link.** Neither carries a
+  host: an invite holds a CA prefix, a namespace, a token and a fingerprint;
+  an anchor link holds a namespace, a fingerprint, a version and optionally
+  the signed context. Adopting or enrolling adds no face and no route.
+- On one segment, multicast/discovery faces usually reach the root device
+  already, so a fingerprint-only adoption or an enrollment just works.
+- **Across NATs or the internet**, a device needs a configured link to a
+  relay and a route for `/<ns>` (and the CA prefix) over it before a
+  fingerprint-only adoption or an enrollment can reach the context or the
+  CA. The relay itself only forwards; it need not hold the CA (F3 is
+  optional) and never holds the root.

@@ -13,8 +13,8 @@ pub mod client;
 pub mod context_store;
 pub mod ecdh;
 pub mod error;
-pub mod hub;
 pub mod invite;
+pub mod namespace;
 pub mod onboarding;
 pub mod policy;
 pub mod protocol;
@@ -42,9 +42,9 @@ pub use context_store::{
     ContextStoreError, adopt_envelope_into_store, context_file_path, load_persisted_contexts,
     persist_context, read_stored_contexts,
 };
-pub use hub::{
-    HubInit, HubInitError, PersistedHub, ValidityMode, ca_key_name, device_key_name, init_hub,
-    init_hub_in_pib, root_key_name,
+pub use namespace::{
+    NamespaceInit, NamespaceInitError, PersistedNamespace, ValidityMode, ca_key_name,
+    device_key_name, init_namespace, init_namespace_in_pib, root_key_name,
 };
 pub use invite::{
     INVITE_CERT_VALIDITY_SECS, InviteEnrollError, InviteEnrollFailure, InviteEnrollment,
@@ -61,7 +61,7 @@ pub use policy::{
     IssuancePolicy, NamespacePolicy, PolicyDecision, RequireAttestationKind, RolePolicy,
     SingleKeyIdentity,
 };
-pub use roles::{NetworkSchema, Role, RoleError, network_schema};
+pub use roles::{NamespaceSchema, Role, RoleError, namespace_schema};
 pub use protocol::{
     CaProfile, CertRequest, ChallengeRequest, ChallengeResponse, ChallengeStatus, ErrorCode,
     NewResponse, ProbeResponse, RevokeRequest, RevokeResponse, RevokeStatus,

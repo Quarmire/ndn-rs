@@ -8,7 +8,7 @@ no trust by itself: the fetched Data is adopted only through
 fingerprint pins.
 
 Contexts are public — anchors, schema, CA endpoints, revocations — so
-publishing them leaks nothing a member of the network could not already show.
+publishing them leaks nothing a device of the namespace could not already show.
 
 ## Names and packets
 
@@ -20,7 +20,7 @@ that exact name.
 | Interest | Answer | Signed by |
 |---|---|---|
 | `/<ns>/32=trust-context/32=metadata` (CanBePrefix, MustBeFresh) | metadata Data `/<ns>/32=trust-context/32=metadata/v=<N>/seg=0`; Content = the Name `/<ns>/32=trust-context/v=<N>` only; FreshnessPeriod 1 s | DigestSha256 |
-| `/<ns>/32=trust-context/v=<N>` (exact) | the stored context Data, byte for byte as adopted | the network root (`/<ns>/KEY/…`), as signed at `init` |
+| `/<ns>/32=trust-context/v=<N>` (exact) | the stored context Data, byte for byte as adopted | the namespace root (`/<ns>/KEY/…`), as signed at `init` |
 | anything else under `/<ns>/32=trust-context` (another version, …) | Nack `NoRoute` | — |
 
 The metadata Content carries no segment fields: a context is one Data packet.
@@ -31,7 +31,7 @@ segmented-object form (with `FinalBlockID` and sizes).
 
 The metadata is an unauthenticated pointer, on purpose:
 
-- The joiner holds only a fingerprint and could not check a node signature.
+- The adopter holds only a fingerprint and could not check a node signature.
 - `fetch_context` accepts a pointer only of the form
   `/<asked ns>/32=trust-context/v=<N>`. A forged pointer can then only name a
   forged or foreign context (refused by the fingerprint pin), an older genuine
@@ -51,7 +51,7 @@ The metadata is an unauthenticated pointer, on purpose:
 ```rust,ignore
 use ndn_cert::{adopt_with_tofu, fetch_context, CaExchange};
 
-# async fn join(exchange: &mut impl CaExchange, keyring: &ndn_security::Keyring,
+# async fn adopt(exchange: &mut impl CaExchange, keyring: &ndn_security::Keyring,
 #               fingerprint: [u8; 32]) -> anyhow::Result<()> {
 let ns: ndn_packet::Name = "/home/bob".parse()?;
 // Name-checked, not yet trusted.
@@ -72,15 +72,15 @@ reply whose name differs from the pointer. It never verifies a signature;
 ## Serving (`ndn-fwd`)
 
 At startup the daemon reads every context in `<pib_path>/contexts/` (its own
-hub context from `ndn-fwd init` and those added by `ndn-fwd adopt`),
+namespace's context from `ndn-fwd init` and those added by `ndn-fwd adopt`),
 re-verifies each against its own anchors, and serves the ones that pass from
 one in-process face with one FIB entry `/<ns>/32=trust-context` per context.
-That entry is more specific than a `[demo_ca]` entry `/<ns>`, so both coexist.
+That entry is more specific than a `[ca]` entry `/<ns>`, so both coexist.
 A file that fails verification is logged and not published. The store keeps
 one file — the newest adopted version — per namespace.
 
 The store is read at startup. A context the running daemon adopts
-(`ndn-fwd adopt`, see [Adopting a network](./context-adoption.md)) is added to
+(`ndn-fwd adopt`, see [Adopting a trust context](./context-adoption.md)) is added to
 the published set at once, replacing an older version of its namespace.
 
 ```toml
@@ -94,12 +94,12 @@ the store reader is `ndn_cert::read_stored_contexts`.
 ## Trying it
 
 ```sh
-ndn-fwd init --profile hub --namespace /home/bob --device laptop --pib /tmp/hub/pib
-# prints anchor_fp and the [security] lines; put them in hub.toml, then
-ndn-fwd --config hub.toml
-ndn-peek --face-socket <hub socket> --can-be-prefix -m /home/bob/32=trust-context/32=metadata
+ndn-fwd init --namespace /home/bob --device laptop --pib /tmp/root/pib
+# prints anchor_fp and the [security] lines; put them in root.toml, then
+ndn-fwd --config root.toml
+ndn-peek --face-socket <root device socket> --can-be-prefix -m /home/bob/32=trust-context/32=metadata
 #   name: /home/bob/keyword=trust-context/keyword=metadata/v=1/seg=0  sig-type: DigestSha256
-ndn-peek --face-socket <hub socket> -m /home/bob/32=trust-context/v=1
+ndn-peek --face-socket <root device socket> -m /home/bob/32=trust-context/v=1
 #   name: /home/bob/keyword=trust-context/v=1  sig-type: SignatureEd25519  key: /home/bob/KEY/root
 ```
 
@@ -110,7 +110,7 @@ context for `/<ns>` cannot anchor the root-signed context Data, so on its own
 it drops it (the DigestSha256 metadata passes). While an adoption runs, the
 adopter registers an *expectation* with that forwarder's validator, which then
 admits exactly the context signed by the anchor with the expected fingerprint
-and drops any other — see [Adopting a network](./context-adoption.md).
+and drops any other — see [Adopting a trust context](./context-adoption.md).
 
 ## See also
 

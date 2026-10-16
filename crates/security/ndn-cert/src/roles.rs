@@ -1,10 +1,10 @@
-//! Personal-network role layout and its generated trust schema
-//! (`docs/specs/personal-network-pairing.md` §2, §4).
+//! Namespace role layout and its generated trust schema
+//! (`docs/specs/personal-namespace.md` §2, §4).
 //!
-//! Every device of a network rooted at `/<ns>` is named
+//! Every device of a namespace rooted at `/<ns>` is named
 //! `/<ns>/<role>/<device>` with keys `/<ns>/<role>/<device>/KEY/<id>`, where
-//! the role is one of `admin`, `member`, `node` (super node) or `guest`.
-//! Authorization lives in these names, so [`network_schema`] can derive the
+//! the role is one of `admin`, `member`, `node` (relay) or `guest`.
+//! Authorization lives in these names, so [`namespace_schema`] can derive the
 //! whole trust schema from the namespace:
 //!
 //! ```text
@@ -47,14 +47,14 @@ use std::str::FromStr;
 use ndn_packet::{Name, NameComponent};
 use ndn_security::{LvsCompileError, SchemaBlob, compile_lvs_to_binary};
 
-/// One of the four roles a device holds in a personal network.
+/// One of the four roles a device holds in a namespace.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Role {
     /// The owner's devices allowed to approve enrollments.
     Admin,
     /// Every other device of the owner's.
     Member,
-    /// A super node (VPS / home server, QUIC listener, relay).
+    /// A relay (VPS / home server, QUIC listener, relay).
     Node,
     /// A friend's device, short-lived.
     Guest,
@@ -111,7 +111,7 @@ pub enum RoleError {
     UnknownRole(String),
     #[error("invalid device name {name:?}: {reason}")]
     InvalidDevice { name: String, reason: &'static str },
-    #[error("namespace {namespace} cannot root a personal network: {reason}")]
+    #[error("namespace {namespace} cannot root a namespace: {reason}")]
     InvalidNamespace {
         namespace: String,
         reason: &'static str,
@@ -183,7 +183,7 @@ pub fn sanitize_device_name(host: &str) -> Option<String> {
     validate_device_name(&out).is_ok().then_some(out)
 }
 
-/// Check that `namespace` can root a personal network and its generated
+/// Check that `namespace` can root a namespace and its generated
 /// schema: at least one component, each a generic component of URI-unreserved
 /// ASCII (so it reads the same in LVS and native rule text) and not `KEY`.
 pub fn validate_namespace(namespace: &Name) -> Result<(), RoleError> {
@@ -302,11 +302,11 @@ pub fn token_role(token: &str) -> Option<Role> {
     Role::from_str(role).ok()
 }
 
-/// The generated personal-network schema for one namespace (see the module
+/// The generated namespace schema for one namespace (see the module
 /// docs): LVS for the fixed-shape rules, native text for the rest; the trust
 /// context carries both, OR'd.
 #[derive(Clone, Debug)]
-pub struct NetworkSchema {
+pub struct NamespaceSchema {
     /// LVS source in the in-tree compiler's syntax.
     pub lvs_source: String,
     /// [`lvs_source`](Self::lvs_source) compiled to the LVS binary.
@@ -316,7 +316,7 @@ pub struct NetworkSchema {
     pub native_rules: String,
 }
 
-impl NetworkSchema {
+impl NamespaceSchema {
     /// The context's schema blobs: the LVS binary, then the native rules.
     pub fn blobs(&self) -> Vec<SchemaBlob> {
         vec![
@@ -326,8 +326,8 @@ impl NetworkSchema {
     }
 }
 
-/// Generate the personal-network trust schema for `namespace` (§4).
-pub fn network_schema(namespace: &Name) -> Result<NetworkSchema, RoleError> {
+/// Generate the namespace trust schema for `namespace` (§4).
+pub fn namespace_schema(namespace: &Name) -> Result<NamespaceSchema, RoleError> {
     validate_namespace(namespace)?;
     let lvs_ns: String = namespace
         .components()
@@ -341,7 +341,7 @@ pub fn network_schema(namespace: &Name) -> Result<NetworkSchema, RoleError> {
     // Only `_device` is a named pattern: the key id, version and request id
     // stay anonymous (`_`), which spares the envelope a tag symbol for each.
     let mut lvs = format!(
-        "// Generated personal-network trust schema for {ns}. Signers are key names.\n\
+        "// Generated namespace trust schema for {ns}. Signers are key names.\n\
          #root: {lvs_ns}/\"KEY\"/_ <= #root\n\
          #context: {lvs_ns}/\"32=trust-context\"/_ <= #root\n\
          #ca: {lvs_ns}/\"CA\"/\"KEY\"/_ <= #root\n"
@@ -372,7 +372,7 @@ pub fn network_schema(namespace: &Name) -> Result<NetworkSchema, RoleError> {
     }
 
     let lvs_binary = compile_lvs_to_binary(&lvs)?;
-    Ok(NetworkSchema {
+    Ok(NamespaceSchema {
         lvs_source: lvs,
         lvs_binary,
         native_rules: native,
@@ -526,7 +526,7 @@ mod tests {
     /// The schema, as adopters evaluate it: the generated blobs in an
     /// authoritative context.
     fn context() -> SignedTrustContext {
-        let schema = network_schema(&n("/home/bob")).unwrap();
+        let schema = namespace_schema(&n("/home/bob")).unwrap();
         SignedTrustContext::hierarchical(n("/home/bob"))
             .with_schema_blobs(schema.blobs())
             .unwrap()
@@ -657,14 +657,14 @@ mod tests {
 
     #[test]
     fn generated_schema_is_lvs_plus_native_and_round_trips() {
-        let schema = network_schema(&n("/home/bob")).unwrap();
+        let schema = namespace_schema(&n("/home/bob")).unwrap();
         let model = ndn_security::LvsModel::decode(&schema.lvs_binary).unwrap();
         // The rendered binary names every rule of the source.
         let text = model.to_text();
         for rule in ["#root:", "#context:", "#ca:", "#guest:", "#approve_node:"] {
             assert!(text.contains(rule), "{rule} missing from:\n{text}");
         }
-        assert!(network_schema(&n("/")).is_err());
+        assert!(namespace_schema(&n("/")).is_err());
 
         // Published and re-decoded, the context keeps both blobs and the verdicts.
         let ctx = context();

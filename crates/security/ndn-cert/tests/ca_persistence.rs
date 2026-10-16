@@ -25,10 +25,10 @@ fn ca_key() -> Name {
     "/home/bob/CA/KEY/ca".parse().unwrap()
 }
 
-/// What a hub's PIB holds, rebuilt from fixed seeds so two calls model one
+/// What a root device's PIB holds, rebuilt from fixed seeds so two calls model one
 /// node across a restart: the root as the only trust anchor and the CA key
 /// with a certificate issued by the root.
-async fn hub_manager() -> (Arc<SecurityManager>, Certificate) {
+async fn root_manager() -> (Arc<SecurityManager>, Certificate) {
     let mgr = SecurityManager::new();
     mgr.generate_ed25519_from_seed(root_key(), &ROOT_SEED).unwrap();
     let root_pub = mgr.get_signer_sync(&root_key()).unwrap().public_key().unwrap();
@@ -47,7 +47,7 @@ fn config() -> CaConfig {
     let challenges: Vec<Box<dyn ChallengeHandler>> = vec![Box::new(NopChallenge::new())];
     CaConfig::new(
         "/home/bob".parse().unwrap(),
-        "hub CA".to_string(),
+        "namespace CA".to_string(),
         Duration::from_secs(86_400),
         Duration::from_secs(7 * 86_400),
         challenges,
@@ -122,7 +122,7 @@ async fn signed_by(data: &Data, signer_cert: &Certificate) -> bool {
 /// its configured, root-certified key and advertise that cert in INFO.
 #[tokio::test]
 async fn configured_signing_key_signs_issued_certs_not_first_anchor() {
-    let (mgr, ca_cert) = hub_manager().await;
+    let (mgr, ca_cert) = root_manager().await;
     let ca = Arc::new(CaState::new(config(), mgr));
 
     let issued = enroll(&ca, "phone", 0x33).await;
@@ -141,7 +141,7 @@ async fn configured_signing_key_signs_issued_certs_not_first_anchor() {
 async fn restarted_ca_serves_old_certs_and_chains_to_same_root() {
     let dir = tempfile::tempdir().unwrap();
 
-    let (mgr, ca_cert_1) = hub_manager().await;
+    let (mgr, ca_cert_1) = root_manager().await;
     let store: Arc<dyn CaStore> = Arc::new(FileCaStore::open(dir.path()).unwrap());
     let ca = Arc::new(CaState::with_store(config(), mgr, store).unwrap());
     let first = enroll(&ca, "laptop", 0x44).await;
@@ -149,7 +149,7 @@ async fn restarted_ca_serves_old_certs_and_chains_to_same_root() {
     drop(ca);
 
     // Restart: same keys (same PIB), fresh process state, same store dir.
-    let (mgr, ca_cert_2) = hub_manager().await;
+    let (mgr, ca_cert_2) = root_manager().await;
     let root = mgr.trust_anchor(&root_key()).unwrap();
     let store: Arc<dyn CaStore> = Arc::new(FileCaStore::open(dir.path()).unwrap());
     let ca = Arc::new(CaState::with_store(config(), mgr, store).unwrap());
@@ -181,7 +181,7 @@ async fn revocations_survive_restart() {
         .record_revoked(revoked)
         .unwrap();
 
-    let (mgr, _) = hub_manager().await;
+    let (mgr, _) = root_manager().await;
     let store: Arc<dyn CaStore> = Arc::new(FileCaStore::open(dir.path()).unwrap());
     let ca = CaState::with_store(config(), mgr, store).unwrap();
     assert!(ca.is_revoked(revoked));

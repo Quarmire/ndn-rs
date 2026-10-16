@@ -64,7 +64,7 @@ pub const SOURCE_BUNDLE_HASH: u64 = 0x041A;
 /// (`keyLocator.isPrefixOf(name)`) on top of it, and every certificate hop of
 /// a chain walk is checked against it (as LVS validation does). Set by
 /// contexts whose schema binds every signer to the names it may sign,
-/// certificates included (the generated personal-network schema), and
+/// certificates included (the generated namespace schema), and
 /// deliberately grants cross-identity signing (admins approving enrollments,
 /// members writing `/<ns>/shared`). Non-critical (even): an old node skips it
 /// and keeps the floor.

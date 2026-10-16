@@ -248,8 +248,8 @@ impl IssuancePolicy for RequireAttestationKind {
 /// token's scope in its attestation leaf.
 pub const TOKEN_SCOPE_EVIDENCE: &str = "scope";
 
-/// Role-enforcing issuance for a personal network rooted at `namespace`
-/// (`docs/specs/personal-network-pairing.md` §2, §8). Issues only for device
+/// Role-enforcing issuance for a namespace rooted at `namespace`
+/// (`docs/specs/personal-namespace.md` §2, §8). Issues only for device
 /// keys `/<ns>/<role>/<device>/KEY/<id>…` ([`crate::roles`]), and only when
 /// the satisfied challenge is strong enough for the role:
 ///

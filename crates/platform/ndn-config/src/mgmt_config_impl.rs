@@ -100,9 +100,9 @@ mod cfg1_tests {
         let mut v: toml::Value = toml::from_str(
             r#"
 listen = "/run/x.sock"
-[demo_ca]
+[ca]
 tokens = ["invite-secret"]
-[demo_ca.challenge]
+[ca.challenge]
 pin = "1234"
 [smtp]
 username = "u@example.com"

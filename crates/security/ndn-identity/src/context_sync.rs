@@ -197,7 +197,7 @@ mod tests {
         ));
         let published = SignedTrustContext::hierarchical("/home/bob".parse().unwrap())
             .with_ca_endpoint("/home/bob/CA".parse().unwrap())
-            .with_enrollment_hint(EnrollmentHint::hub_default())
+            .with_enrollment_hint(EnrollmentHint::namespace_default())
             .with_revocation(revoked.clone())
             .with_schema_blob(SchemaBlob::lvs(lvs.clone()))
             .expect("LVS schema imports");
@@ -213,7 +213,7 @@ mod tests {
         assert_eq!(held.version(), 7);
         assert!(held.is_revoked(&revoked), "revocation survives sync");
         assert_eq!(held.ca_endpoints(), published.ca_endpoints());
-        assert_eq!(held.enrollment_hint(), Some(&EnrollmentHint::hub_default()));
+        assert_eq!(held.enrollment_hint(), Some(&EnrollmentHint::namespace_default()));
         let schemas = held.published_schemas();
         assert_eq!(schemas.len(), 1);
         assert_eq!(schemas[0].format, SchemaFormat::Lvs);
