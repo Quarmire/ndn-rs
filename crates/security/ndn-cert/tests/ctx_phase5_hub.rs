@@ -9,7 +9,7 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use ndn_cert::{
     TokenStore, ValidityMode, adopt_anchor_envelope, adopt_envelope_into_store,
-    adopt_with_tofu, init_hub, init_hub_in_pib, load_persisted_contexts, root_key_name,
+    adopt_with_tofu, init_hub, init_hub_in_pib, load_persisted_contexts,
 };
 use ndn_packet::encode::DataBuilder;
 use ndn_packet::{Data, Name};
@@ -105,9 +105,9 @@ fn signed(mgr: &SecurityManager, key_name: &Name, name: &str) -> Data {
 
 /// Pairing-path acceptance: `ndn-fwd init` (persisted hub) → envelope →
 /// `ndn-fwd adopt` (TOFU + persist on another node) → a fresh keyring loaded
-/// from that node's disk validates Data signed under the context (by the root
-/// and through a root-issued member cert). An edited stored context is
-/// refused on load.
+/// from that node's disk validates, under the generated schema, the CA cert
+/// (signed by the root) and Data a member signs under its own name through a
+/// CA-issued cert. An edited stored context is refused on load.
 #[tokio::test]
 async fn init_envelope_adopt_persists_and_validates_after_reload() {
     let hub_dir = tempfile::tempdir().unwrap();
@@ -115,7 +115,7 @@ async fn init_envelope_adopt_persists_and_validates_after_reload() {
     let ns = n("/home/bob");
 
     let hub_pib = FilePib::new(hub_dir.path()).unwrap();
-    let hub = init_hub_in_pib(&hub_pib, &ns, ndn_cert::hub::DEFAULT_NODE_NAME, false).unwrap();
+    let hub = init_hub_in_pib(&hub_pib, &ns, "laptop", false).unwrap();
     let uri = hub.hub.envelope.to_uri();
 
     // The adopting node only ever sees the scanned URI.
@@ -124,20 +124,20 @@ async fn init_envelope_adopt_persists_and_validates_after_reload() {
     assert_eq!(ctx.namespace(), &ns);
     assert!(path.starts_with(node_dir.path().join("contexts")));
 
-    // Data signed by the root (loaded back from the hub's PIB), and by a
-    // member whose cert the root issued.
-    let root = root_key_name(&ns);
+    // The CA cert as published (signed by the root), and Data signed by a
+    // member whose cert the CA (loaded back from the hub's PIB) issued.
     let hub_mgr = SecurityManager::new();
-    hub_mgr.register_signer(root.clone(), hub_pib.get_signer(&root).unwrap());
-    let member = n("/home/bob/phone/KEY/k1");
+    hub_mgr.register_signer(hub.ca_key.clone(), hub_pib.get_signer(&hub.ca_key).unwrap());
+    let member = n("/home/bob/member/phone/KEY/k1");
     hub_mgr.generate_ed25519(member.clone()).unwrap();
     let member_pk = hub_mgr.get_signer_sync(&member).unwrap().public_key().unwrap();
     let member_cert = hub_mgr
-        .certify(&member, member_pk, &root, 3_600_000)
+        .certify(&member, member_pk, &hub.ca_key, 3_600_000)
         .await
         .unwrap();
-    let by_root = signed(&hub_mgr, &root, "/home/bob/note");
-    let by_member = signed(&hub_mgr, &member, "/home/bob/phone/msg");
+    let ca_cert = Data::decode(bytes::Bytes::from(std::fs::read(&hub.ca_cert_path).unwrap()))
+        .unwrap();
+    let by_member = signed(&hub_mgr, &member, "/home/bob/member/phone/msg");
 
     // "Restart": a brand-new validator whose keyring is filled from disk.
     let v = validator();
@@ -146,7 +146,8 @@ async fn init_envelope_adopt_persists_and_validates_after_reload() {
     assert_eq!(loaded.len(), 1);
     assert!(loaded[0].1.is_ok(), "{:?}", loaded[0].1.as_ref().err());
     v.cert_cache().insert(member_cert);
-    assert!(matches!(v.validate_chain(&by_root).await, ValidationResult::Valid(_)));
+    v.cert_cache().insert(hub.ca_cert.clone());
+    assert!(matches!(v.validate_chain(&ca_cert).await, ValidationResult::Valid(_)));
     assert!(matches!(v.validate_chain(&by_member).await, ValidationResult::Valid(_)));
 
     // Re-adopting the same envelope keeps working (same version, idempotent).

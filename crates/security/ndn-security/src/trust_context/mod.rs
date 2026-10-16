@@ -46,6 +46,8 @@ pub enum SignedTrustContextError {
     NotSignedTrustContext(u64),
     #[error("signing into Data failed: {0}")]
     Sign(String),
+    #[error("more than one LVS schema blob (a context carries at most one)")]
+    MultipleLvsSchemas,
 }
 
 /// The RDR keyword component naming a published context: `/<ns>/32=trust-context`.
@@ -92,6 +94,14 @@ impl SchemaBlob {
         }
     }
 
+    /// Native-text rules, one `<data pattern> => <key pattern>` per line.
+    pub fn native_text(text: impl Into<String>) -> Self {
+        Self {
+            format: SchemaFormat::NativeText,
+            body: Bytes::from(text.into().into_bytes()),
+        }
+    }
+
     /// Build the runtime [`TrustSchema`] this blob describes.
     fn to_schema(&self) -> Result<TrustSchema, SignedTrustContextError> {
         match self.format {
@@ -111,6 +121,35 @@ impl SchemaBlob {
                 Ok(schema)
             }
         }
+    }
+}
+
+/// The runtime schema for a set of blobs: their OR.
+fn schema_of(blobs: &[SchemaBlob]) -> Result<TrustSchema, SignedTrustContextError> {
+    let mut schema = TrustSchema::new();
+    for blob in blobs {
+        if !schema.merge(blob.to_schema()?) {
+            return Err(SignedTrustContextError::MultipleLvsSchemas);
+        }
+    }
+    Ok(schema)
+}
+
+/// What [`SignedTrustContext::explain`] found for a `(data, key)` pair.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContextExplanation {
+    /// The hierarchy floor's verdict (the key's identity is a prefix of the
+    /// data name), or `None` when the context does not enforce one.
+    pub hierarchy_floor: Option<bool>,
+    /// The schema rule that admits the pair (rendered), or `None` if none does.
+    pub rule: Option<String>,
+}
+
+impl ContextExplanation {
+    /// Whether the context authorizes the pair — always equal to
+    /// [`SignedTrustContext::authorizes`].
+    pub fn allowed(&self) -> bool {
+        self.hierarchy_floor != Some(false) && self.rule.is_some()
     }
 }
 
@@ -186,9 +225,13 @@ pub struct SignedTrustContext {
     enrollment_hint: Option<EnrollmentHint>,
     /// Dead anchors/intermediates by cert name or key digest.
     revocations: Vec<Name>,
-    /// Schema bytes to re-emit verbatim on encode (preserves a published LVS
-    /// blob exactly); `None` means derive from the runtime schema.
-    schema_blob: Option<SchemaBlob>,
+    /// Schema blobs to re-emit verbatim on encode (preserves a published LVS
+    /// blob exactly), OR'd into the runtime schema; empty means derive a
+    /// native-text blob from the runtime schema.
+    schema_blobs: Vec<SchemaBlob>,
+    /// Emit [`tlv::SCHEMA_AUTHORITATIVE`]: the schema governs alone, without
+    /// the hierarchy floor (see [`schema_authoritative`](Self::schema_authoritative)).
+    schema_authoritative: bool,
     /// Provenance hint: SHA-256 implicit digest of the source trust **bundle**
     /// (Block) this context was projected from, for wire-level traceability
     /// back to the root of authority. Non-critical; `None` when unprojected
@@ -207,7 +250,8 @@ impl SignedTrustContext {
             ca_endpoints: Vec::new(),
             enrollment_hint: None,
             revocations: Vec::new(),
-            schema_blob: None,
+            schema_blobs: Vec::new(),
+            schema_authoritative: false,
             source_bundle_hash: None,
         }
     }
@@ -264,10 +308,32 @@ impl SignedTrustContext {
     }
     /// Attach a schema blob to re-emit verbatim on `encode_content`
     /// (e.g. a published LVS binary), and adopt it as the runtime schema.
-    pub fn with_schema_blob(mut self, blob: SchemaBlob) -> Result<Self, SignedTrustContextError> {
-        *self.schema.write().expect("schema RwLock poisoned") = blob.to_schema()?;
-        self.schema_blob = Some(blob);
+    pub fn with_schema_blob(self, blob: SchemaBlob) -> Result<Self, SignedTrustContextError> {
+        self.with_schema_blobs(vec![blob])
+    }
+    /// As [`with_schema_blob`](Self::with_schema_blob) for several blobs whose
+    /// OR is the runtime schema — at most one LVS binary, plus native-text
+    /// rules for what LVS cannot express.
+    pub fn with_schema_blobs(
+        mut self,
+        blobs: Vec<SchemaBlob>,
+    ) -> Result<Self, SignedTrustContextError> {
+        *self.schema.write().expect("schema RwLock poisoned") = schema_of(&blobs)?;
+        self.schema_blobs = blobs;
         Ok(self)
+    }
+    /// Make the schema authoritative: drop the hierarchy floor, evaluate the
+    /// schema on every certificate hop of a chain walk (not only the first
+    /// signature), and say so on the wire ([`tlv::SCHEMA_AUTHORITATIVE`]) so
+    /// adopters do the same. Only for schemas that bind every signer to the
+    /// names it may sign, certificates included (the generated
+    /// personal-network schema): its cross-identity grants (admins approving
+    /// enrollments, members writing a shared namespace) are exactly what the
+    /// floor forbids.
+    pub fn schema_authoritative(mut self) -> Self {
+        self.enforce_hierarchy = false;
+        self.schema_authoritative = true;
+        self
     }
     /// Record the source trust-bundle the context was projected from (its
     /// SHA-256 implicit digest), emitted as a non-critical provenance hint so
@@ -287,6 +353,12 @@ impl SignedTrustContext {
     }
     pub fn enforces_hierarchy(&self) -> bool {
         self.enforce_hierarchy
+    }
+    /// Whether the schema is authoritative (see
+    /// [`schema_authoritative`](Self::schema_authoritative)): no floor, and
+    /// every certificate hop is checked against it.
+    pub fn schema_is_authoritative(&self) -> bool {
+        self.schema_authoritative
     }
     pub fn ca_endpoints(&self) -> &[Name] {
         &self.ca_endpoints
@@ -335,11 +407,11 @@ impl SignedTrustContext {
         self.schema.read().expect("schema RwLock poisoned").clone()
     }
 
-    /// The schema in the form it will publish on the wire — the retained blob
-    /// (e.g. a stock-LVS binary) verbatim, else a native-text rendering of the
-    /// current rules.
-    pub fn published_schema(&self) -> SchemaBlob {
-        self.schema_blob_or_derive()
+    /// The schema in the form it will publish on the wire — the retained
+    /// blobs (e.g. a stock-LVS binary) verbatim, else a native-text rendering
+    /// of the current rules.
+    pub fn published_schemas(&self) -> Vec<SchemaBlob> {
+        self.schema_blobs_or_derive()
     }
 
     pub(crate) fn with_schema_mut<R>(&self, f: impl FnOnce(&mut TrustSchema) -> R) -> R {
@@ -361,6 +433,21 @@ impl SignedTrustContext {
             .allows(data_name, key_name)
     }
 
+    /// Why [`authorizes`](Self::authorizes) decides as it does for
+    /// `(data_name, key_name)`: the hierarchy floor's verdict (if enforced)
+    /// and the schema rule that admits the pair. For inspection tooling;
+    /// [`ContextExplanation::allowed`] equals `authorizes`.
+    pub fn explain(&self, data_name: &Name, key_name: &Name) -> ContextExplanation {
+        let hierarchy_floor = self
+            .enforce_hierarchy
+            .then(|| data_name.has_prefix(&key_identity(key_name)));
+        let schema = self.schema.read().expect("schema RwLock poisoned");
+        ContextExplanation {
+            hierarchy_floor,
+            rule: schema.explain(data_name, key_name).map(|m| m.to_string()),
+        }
+    }
+
     // ── wire codec ────────────────────────────────────────────────────────
 
     /// Encode this context as the `Content` of its NDN object: a single
@@ -368,7 +455,7 @@ impl SignedTrustContext {
     /// not here. Anchors with no retained wire (test-only structs) are
     /// skipped.
     pub fn encode_content(&self) -> Bytes {
-        let blob = self.schema_blob_or_derive();
+        let blobs = self.schema_blobs_or_derive();
         let mut w = TlvWriter::new();
         w.write_nested(tlv::TRUST_CONTEXT, |w| {
             // namespace — a plain Name (0x07), no dedicated code.
@@ -381,11 +468,16 @@ impl SignedTrustContext {
                     }
                 }
             });
-            // TrustSchemaBlob — format + body.
-            w.write_nested(tlv::TRUST_SCHEMA_BLOB, |w| {
-                w.write_tlv(tlv::SCHEMA_FORMAT, &[blob.format.code()]);
-                w.write_tlv(tlv::SCHEMA_BODY, &blob.body);
-            });
+            // TrustSchemaBlob(s) — format + body; their OR is the schema.
+            for blob in &blobs {
+                w.write_nested(tlv::TRUST_SCHEMA_BLOB, |w| {
+                    w.write_tlv(tlv::SCHEMA_FORMAT, &[blob.format.code()]);
+                    w.write_tlv(tlv::SCHEMA_BODY, &blob.body);
+                });
+            }
+            if self.schema_authoritative {
+                w.write_tlv(tlv::SCHEMA_AUTHORITATIVE, &[]);
+            }
             for ca in &self.ca_endpoints {
                 w.write_tlv(tlv::CA_ENDPOINT, &ca.encode_to_tlv());
             }
@@ -438,7 +530,8 @@ impl SignedTrustContext {
 
     /// Decode a context from the `Content` bytes of its NDN object. The
     /// `version` must be supplied by the caller (it lives in the RDR name).
-    /// Decoded contexts default to the hierarchical floor (N1).
+    /// Decoded contexts keep the hierarchical floor (N1) unless they carry
+    /// [`tlv::SCHEMA_AUTHORITATIVE`].
     pub fn decode_content(content: &[u8], version: u64) -> Result<Self, SignedTrustContextError> {
         let (t, value, _rest) = read_tlv(content)?;
         if t != tlv::TRUST_CONTEXT {
@@ -447,7 +540,8 @@ impl SignedTrustContext {
 
         let mut namespace: Option<Name> = None;
         let mut anchors: Vec<Certificate> = Vec::new();
-        let mut schema_blob: Option<SchemaBlob> = None;
+        let mut schema_blobs: Vec<SchemaBlob> = Vec::new();
+        let mut schema_authoritative = false;
         let mut ca_endpoints: Vec<Name> = Vec::new();
         let mut enrollment_hint: Option<EnrollmentHint> = None;
         let mut revocations: Vec<Name> = Vec::new();
@@ -498,12 +592,13 @@ impl SignedTrustContext {
                             _ => {}
                         }
                     }
-                    schema_blob = Some(SchemaBlob {
+                    schema_blobs.push(SchemaBlob {
                         format: format
                             .ok_or(SignedTrustContextError::MissingField("SchemaFormat"))?,
                         body: body.ok_or(SignedTrustContextError::MissingField("SchemaBody"))?,
                     });
                 }
+                tlv::SCHEMA_AUTHORITATIVE => schema_authoritative = true,
                 tlv::CA_ENDPOINT => {
                     ca_endpoints.push(
                         Name::decode_from_tlv(Bytes::copy_from_slice(fval))
@@ -537,8 +632,10 @@ impl SignedTrustContext {
         }
 
         let namespace = namespace.ok_or(SignedTrustContextError::MissingField("namespace"))?;
-        let blob = schema_blob.ok_or(SignedTrustContextError::MissingField("TrustSchemaBlob"))?;
-        let schema = blob.to_schema()?;
+        if schema_blobs.is_empty() {
+            return Err(SignedTrustContextError::MissingField("TrustSchemaBlob"));
+        }
+        let schema = schema_of(&schema_blobs)?;
 
         let anchor_map: DashMap<Arc<Name>, Certificate> = DashMap::new();
         for cert in anchors {
@@ -549,21 +646,22 @@ impl SignedTrustContext {
             namespace,
             anchors: Arc::new(anchor_map),
             schema: RwLock::new(schema),
-            enforce_hierarchy: true,
+            enforce_hierarchy: !schema_authoritative,
             version,
             ca_endpoints,
             enrollment_hint,
             revocations,
-            schema_blob: Some(blob),
+            schema_blobs,
+            schema_authoritative,
             source_bundle_hash,
         })
     }
 
-    /// The schema blob to emit: the retained one, else a native-text rendering
-    /// of the current rules.
-    fn schema_blob_or_derive(&self) -> SchemaBlob {
-        if let Some(blob) = &self.schema_blob {
-            return blob.clone();
+    /// The schema blobs to emit: the retained ones, else a native-text
+    /// rendering of the current rules.
+    fn schema_blobs_or_derive(&self) -> Vec<SchemaBlob> {
+        if !self.schema_blobs.is_empty() {
+            return self.schema_blobs.clone();
         }
         let schema = self.schema.read().expect("schema RwLock poisoned");
         let text = schema
@@ -572,10 +670,7 @@ impl SignedTrustContext {
             .map(|r| r.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        SchemaBlob {
-            format: SchemaFormat::NativeText,
-            body: Bytes::from(text.into_bytes()),
-        }
+        vec![SchemaBlob::native_text(text)]
     }
 }
 
@@ -684,6 +779,68 @@ mod tests {
         let ctx = SignedTrustContext::accept_all(n("/home/bob"));
         let key = n("/home/bob/alice/KEY/k1");
         assert!(ctx.authorizes(&n("/home/bob/charlie/doc"), &key));
+    }
+
+    /// An authoritative context carrying an LVS blob and a native-text blob
+    /// round-trips both blobs and the floor-off flag; the runtime schema is
+    /// their OR; `explain` agrees with `authorizes`. Without the flag the
+    /// decoded context keeps the floor.
+    #[test]
+    fn authoritative_multi_blob_schema_roundtrips() {
+        let lvs = crate::lvs_compile::compile_to_binary(
+            "#root: /\"home\"/\"bob\"/\"KEY\"/_k\n\
+             #ca: /\"home\"/\"bob\"/\"CA\"/\"KEY\"/_k <= #root",
+        )
+        .unwrap();
+        let native = "/home/bob/shared/<**d> => /home/bob/admin/<dev>/KEY/<**k>";
+        let blobs = vec![SchemaBlob::lvs(lvs.clone()), SchemaBlob::native_text(native)];
+        let ctx = SignedTrustContext::hierarchical(n("/home/bob"))
+            .with_schema_blobs(blobs.clone())
+            .unwrap()
+            .schema_authoritative();
+        let back = SignedTrustContext::decode_content(&ctx.encode_content(), 1).unwrap();
+        assert!(!back.enforces_hierarchy());
+        let published = back.published_schemas();
+        assert_eq!(published.len(), 2);
+        assert_eq!(published[0].body, lvs);
+        assert_eq!(published[1].body.as_ref(), native.as_bytes());
+
+        let admin = n("/home/bob/admin/laptop/KEY/k1");
+        let cases = [
+            (n("/home/bob/CA/KEY/ca"), n("/home/bob/KEY/root"), true),
+            (n("/home/bob/shared/notes"), admin.clone(), true),
+            (n("/home/bob/CA/KEY/ca"), admin.clone(), false),
+        ];
+        for (data, key, allowed) in &cases {
+            assert_eq!(back.authorizes(data, key), *allowed, "{data} by {key}");
+            let why = back.explain(data, key);
+            assert_eq!(why.allowed(), *allowed, "{data} by {key}");
+            assert_eq!(why.hierarchy_floor, None);
+        }
+        assert!(
+            back.explain(&cases[1].0, &admin)
+                .rule
+                .unwrap()
+                .starts_with("native rule 0:")
+        );
+
+        // The same blobs without the flag: the floor is back and blocks the
+        // cross-identity grant.
+        let plain = SignedTrustContext::hierarchical(n("/home/bob"))
+            .with_schema_blobs(blobs)
+            .unwrap();
+        let back = SignedTrustContext::decode_content(&plain.encode_content(), 1).unwrap();
+        assert!(back.enforces_hierarchy());
+        assert!(!back.authorizes(&n("/home/bob/shared/notes"), &admin));
+        assert_eq!(
+            back.explain(&n("/home/bob/shared/notes"), &admin).hierarchy_floor,
+            Some(false)
+        );
+
+        // Two LVS blobs are refused.
+        let two = SignedTrustContext::hierarchical(n("/home/bob"))
+            .with_schema_blobs(vec![SchemaBlob::lvs(lvs.clone()), SchemaBlob::lvs(lvs)]);
+        assert!(matches!(two, Err(SignedTrustContextError::MultipleLvsSchemas)));
     }
 
     #[test]

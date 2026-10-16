@@ -6,9 +6,12 @@
 //! The home-hub is the local-gains-first archetype: one node is root + issuing
 //! CA + rendezvous. Peers overhear or scan a QR, adopt the context (free), and
 //! — only if they want to *produce* — enroll behind `token AND device-approval`.
-//! [`init_hub_in_pib`] is the persistent form `ndn-fwd init --profile hub`
-//! runs: root key, CA identity, the hub node's own identity and the signed
-//! context all land in the node's PIB. See
+//! The context carries the generated personal-network schema
+//! ([`crate::roles::network_schema`]) and makes it authoritative, so names
+//! carry roles: `/<ns>/<role>/<device>` (`docs/specs/personal-network-pairing.md`
+//! §2, §4). [`init_hub_in_pib`] is the persistent form `ndn-fwd init --profile
+//! hub` runs: root key, CA identity, the primary device's admin identity and
+//! the signed context all land in the node's PIB. See
 //! `.claude/notes/trust-context/trust-context-model-2026-05-25.md` §9, §16.
 
 use std::path::{Path, PathBuf};
@@ -17,30 +20,30 @@ use std::sync::Arc;
 use ndn_packet::{Data, Name};
 use ndn_security::{
     Certificate, EnrollmentHint, FilePib, PibError, SecurityManager, SignedTrustContext,
-    TrustError,
+    SignedTrustContextError, TrustError,
 };
 use ndn_trust_envelope::TrustEnvelope;
 
 use crate::ca::serialize_cert;
 use crate::context_store::{ContextStoreError, context_file_path, persist_context};
 use crate::onboarding::anchor_fingerprint;
+use crate::roles::{Role, RoleError, device_identity, network_schema, validate_namespace};
 
 /// Directory (under the PIB root) holding the hub's certificate Data wires
-/// (CA, root anchor, node identity) and the CA's persistent state.
+/// (CA, root anchor, primary device) and the CA's persistent state.
 pub const CA_DIR: &str = "ca";
 /// The CA signing cert (issued by the hub root), as raw signed Data TLV.
 pub const CA_CERT_FILE: &str = "ca-cert.data";
 /// The hub root's self-signed anchor cert, as raw signed Data TLV.
 pub const ANCHOR_CERT_FILE: &str = "anchor-cert.data";
-/// The hub node's identity cert (issued by the hub root), as raw signed Data
-/// TLV. The PIB keeps only a summary of it, without the root's signature.
-pub const NODE_CERT_FILE: &str = "node-cert.data";
+/// The primary device's admin cert (issued by the CA), as raw signed Data
+/// TLV. The PIB keeps only a summary of it, without the CA's signature.
+pub const DEVICE_CERT_FILE: &str = "device-cert.data";
 /// Lifetime of the CA signing cert minted by [`init_hub_in_pib`] (10 years).
 pub const CA_CERT_VALIDITY_MS: u64 = 10 * 365 * 24 * 3600 * 1000;
-/// Lifetime of the hub node's identity cert minted by [`init_hub_in_pib`].
-pub const NODE_CERT_VALIDITY_MS: u64 = CA_CERT_VALIDITY_MS;
-/// Default node-name component: the hub node's identity is `<ns>/hub`.
-pub const DEFAULT_NODE_NAME: &str = "hub";
+/// Lifetime of the primary device's cert minted by [`init_hub_in_pib`]: a day
+/// short of the CA's, so it ends inside the issuer's validity.
+pub const DEVICE_CERT_VALIDITY_MS: u64 = CA_CERT_VALIDITY_MS - 24 * 3600 * 1000;
 
 /// The hub root key name: `<namespace>/KEY/root`.
 pub fn root_key_name(namespace: &Name) -> Name {
@@ -52,19 +55,9 @@ pub fn ca_key_name(namespace: &Name) -> Name {
     namespace.clone().append("CA").append("KEY").append("ca")
 }
 
-/// The hub node's identity `<namespace>/<node_name>`, the forwarder's
-/// `[security] identity`. `node_name` is one name component other than `KEY`
-/// (whose keys would count as the namespace's own) and `CA` (the CA identity).
-pub fn node_identity_name(namespace: &Name, node_name: &str) -> Result<Name, HubInitError> {
-    if node_name.is_empty() || node_name.contains('/') || matches!(node_name, "KEY" | "CA") {
-        return Err(HubInitError::InvalidNodeName(node_name.to_string()));
-    }
-    Ok(namespace.clone().append(node_name))
-}
-
-/// The hub node's signing key name: `<node identity>/KEY/node`.
-pub fn node_key_name(node_identity: &Name) -> Name {
-    node_identity.clone().append("KEY").append("node")
+/// The primary device's signing key name: `<device identity>/KEY/device`.
+pub fn device_key_name(device_identity: &Name) -> Name {
+    device_identity.clone().append("KEY").append("device")
 }
 
 /// Result of initializing a hub.
@@ -73,7 +66,8 @@ pub struct HubInit {
     pub anchor_key: Name,
     /// The self-signed network anchor certificate.
     pub anchor: Certificate,
-    /// The published, versioned trust context (hierarchical, hub-default gate).
+    /// The published, versioned trust context (generated personal-network
+    /// schema, authoritative; hub-default enrollment gate).
     pub context: Arc<SignedTrustContext>,
     /// The context as signed NDN Data at [`SignedTrustContext::rdr_name`],
     /// signed by the root anchor — what is published and what adopters verify.
@@ -93,17 +87,18 @@ impl HubInit {
 }
 
 /// Initialize a hub rooted at `namespace`: generate a signing key in `mgr`,
-/// self-sign the network anchor, build a hierarchical context (the
-/// skeleton-key-safe default) with the hub enrollment gate
-/// (`token AND device-approval`), sign it into Data with the anchor, and mint
-/// an anchor envelope committing to the anchor fingerprint.
+/// self-sign the network anchor, build a context carrying the generated
+/// personal-network schema ([`network_schema`], authoritative) with the hub
+/// enrollment gate (`token AND device-approval`), sign it into Data with the
+/// anchor, and mint an anchor envelope committing to the anchor fingerprint.
 ///
 /// The default deployment keeps the *root* offline and runs a delegated
 /// context-signer online; this in-process helper signs directly for the
 /// self-contained case (tests, single-box hubs). The signing key never leaves
 /// `mgr`, and is lost with it — use [`init_hub_in_pib`] for a hub that must
 /// survive a restart.
-pub fn init_hub(mgr: &SecurityManager, namespace: &Name) -> Result<HubInit, TrustError> {
+pub fn init_hub(mgr: &SecurityManager, namespace: &Name) -> Result<HubInit, HubInitError> {
+    validate_namespace(namespace)?;
     let anchor_key = root_key_name(namespace);
     mgr.generate_ed25519(anchor_key)?;
     build_hub(mgr, namespace, None)
@@ -115,22 +110,23 @@ fn build_hub(
     mgr: &SecurityManager,
     namespace: &Name,
     ca_endpoint: Option<Name>,
-) -> Result<HubInit, TrustError> {
+) -> Result<HubInit, HubInitError> {
     let anchor_key = root_key_name(namespace);
     let signer = mgr.get_signer_sync(&anchor_key)?;
     let pk = signer.public_key().unwrap_or_default();
     let anchor = mgr.issue_self_signed(&anchor_key, pk, u64::MAX)?;
 
+    let schema = network_schema(namespace)?;
     let mut context = SignedTrustContext::hierarchical(namespace.clone())
         .with_version(1)
-        .with_enrollment_hint(EnrollmentHint::hub_default());
+        .with_enrollment_hint(EnrollmentHint::hub_default())
+        .with_schema_blobs(schema.blobs())?
+        .schema_authoritative();
     if let Some(ca) = ca_endpoint {
         context = context.with_ca_endpoint(ca);
     }
     context.add_anchor(anchor.clone());
-    let context_data = context
-        .sign_into_data(signer.as_ref())
-        .map_err(|e| TrustError::KeyStore(format!("sign trust context: {e}")))?;
+    let context_data = context.sign_into_data(signer.as_ref())?;
     let context = Arc::new(context);
 
     let envelope = TrustEnvelope::Anchor {
@@ -157,21 +153,22 @@ pub struct PersistedHub {
     pub ca_key: Name,
     /// The CA signing cert, issued by the hub root.
     pub ca_cert: Certificate,
-    /// The hub node's own identity (`<ns>/<node_name>`), for the forwarder's
-    /// `[security] identity`.
-    pub node_identity: Name,
-    /// The node's signing key (`<node identity>/KEY/node`), in the PIB.
-    pub node_key: Name,
-    /// The node's identity cert, issued by the hub root.
-    pub node_cert: Certificate,
+    /// The primary device's own identity (`<ns>/admin/<device>`), for the
+    /// forwarder's `[security] identity`.
+    pub device_identity: Name,
+    /// The device's signing key (`<device identity>/KEY/device`), in the PIB.
+    pub device_key: Name,
+    /// The device's admin cert, issued by the CA (the schema's device-key
+    /// rule: device keys are certified by `<ns>/CA`, the CA by the root).
+    pub device_cert: Certificate,
     /// Where the signed context was stored (the node's adopted-context store).
     pub context_path: PathBuf,
     /// `<pib>/ca/ca-cert.data`.
     pub ca_cert_path: PathBuf,
     /// `<pib>/ca/anchor-cert.data`.
     pub anchor_cert_path: PathBuf,
-    /// `<pib>/ca/node-cert.data`.
-    pub node_cert_path: PathBuf,
+    /// `<pib>/ca/device-cert.data`.
+    pub device_cert_path: PathBuf,
 }
 
 /// Why [`init_hub_in_pib`] failed.
@@ -186,13 +183,13 @@ pub enum HubInitError {
         pib: String,
         what: String,
     },
-    #[error(
-        "invalid node name {0:?}: it must be one name component other than `KEY` and `CA`, \
-         e.g. `hub`"
-    )]
-    InvalidNodeName(String),
+    /// The namespace or the device name does not fit the role layout.
+    #[error(transparent)]
+    Role(#[from] RoleError),
     #[error(transparent)]
     Trust(#[from] TrustError),
+    #[error("trust context: {0}")]
+    Context(#[from] SignedTrustContextError),
     #[error(transparent)]
     Pib(#[from] PibError),
     #[error("I/O on {path}: {source}")]
@@ -210,33 +207,36 @@ pub enum HubInitError {
 /// - root key `<ns>/KEY/root` (+ its cert, registered as a PIB trust anchor);
 /// - CA signing identity `<ns>/CA` (key `<ns>/CA/KEY/ca`) with a cert issued
 ///   by the root, plus both certs as signed Data in `<pib>/ca/`;
-/// - the hub node's own identity `<ns>/<node_name>` (key
-///   `<ns>/<node_name>/KEY/node`) with a cert issued by the root, so the
+/// - the primary device's admin identity `<ns>/admin/<device>` (key
+///   `<ns>/admin/<device>/KEY/device`) with a cert issued by the CA, so the
 ///   forwarder loads it with `[security] identity` instead of falling back to
-///   an ephemeral key; its signed cert Data is `<pib>/ca/node-cert.data`;
-/// - the root-signed context (advertising the CA endpoint `<ns>/CA`) in the
-///   node's adopted-context store, so the hub validates its own namespace.
+///   an ephemeral key; its signed cert Data is `<pib>/ca/device-cert.data`;
+/// - the root-signed context (generated schema, advertising the CA endpoint
+///   `<ns>/CA`) in the node's adopted-context store, so the hub validates its
+///   own namespace.
 ///
-/// An existing root, CA key, node key or stored context for `namespace` is
-/// never silently replaced: without `force` this fails with
+/// `device` must pass [`crate::roles::validate_device_name`]. An existing
+/// root, CA key, device key or stored context for `namespace` is never
+/// silently replaced: without `force` this fails with
 /// [`HubInitError::AlreadyInitialized`].
 pub fn init_hub_in_pib(
     pib: &FilePib,
     namespace: &Name,
-    node_name: &str,
+    device: &str,
     force: bool,
 ) -> Result<PersistedHub, HubInitError> {
+    validate_namespace(namespace)?;
     let anchor_key = root_key_name(namespace);
     let ca_key = ca_key_name(namespace);
-    let node_identity = node_identity_name(namespace, node_name)?;
-    let node_key = node_key_name(&node_identity);
+    let device_identity = device_identity(namespace, Role::Admin, device)?;
+    let device_key = device_key_name(&device_identity);
     let context_path = context_file_path(pib.root(), namespace);
     let existing = if pib.get_signer(&anchor_key).is_ok() {
         Some(format!("root key {anchor_key}"))
     } else if pib.get_signer(&ca_key).is_ok() {
         Some(format!("CA key {ca_key}"))
-    } else if pib.get_signer(&node_key).is_ok() {
-        Some(format!("node key {node_key}"))
+    } else if pib.get_signer(&device_key).is_ok() {
+        Some(format!("device key {device_key}"))
     } else if context_path.exists() {
         Some(format!("trust context {}", context_path.display()))
     } else {
@@ -252,7 +252,7 @@ pub fn init_hub_in_pib(
         }
         pib.delete_key(&anchor_key)?;
         pib.delete_key(&ca_key)?;
-        pib.delete_key(&node_key)?;
+        pib.delete_key(&device_key)?;
         pib.remove_trust_anchor(&anchor_key)?;
     }
 
@@ -264,10 +264,12 @@ pub fn init_hub_in_pib(
     pib.store_cert(&anchor_key, &hub.anchor)?;
     pib.add_trust_anchor(&anchor_key, &hub.anchor)?;
 
-    // CA signing identity and the hub node's identity, both certified by
-    // the root.
+    // The CA is certified by the root; the primary device by the CA, as the
+    // schema's chain requires of every device.
     let ca_cert = certify_new_key(pib, &mgr, &ca_key, &anchor_key, CA_CERT_VALIDITY_MS)?;
-    let node_cert = certify_new_key(pib, &mgr, &node_key, &anchor_key, NODE_CERT_VALIDITY_MS)?;
+    mgr.register_signer(ca_key.clone(), pib.get_signer(&ca_key)?);
+    let device_cert =
+        certify_new_key(pib, &mgr, &device_key, &ca_key, DEVICE_CERT_VALIDITY_MS)?;
 
     let ca_dir = pib.root().join(CA_DIR);
     let io = |path: &Path| {
@@ -280,21 +282,22 @@ pub fn init_hub_in_pib(
     let anchor_cert_path = ca_dir.join(ANCHOR_CERT_FILE);
     std::fs::write(&anchor_cert_path, serialize_cert(&hub.anchor))
         .map_err(io(&anchor_cert_path))?;
-    let node_cert_path = ca_dir.join(NODE_CERT_FILE);
-    std::fs::write(&node_cert_path, serialize_cert(&node_cert)).map_err(io(&node_cert_path))?;
+    let device_cert_path = ca_dir.join(DEVICE_CERT_FILE);
+    std::fs::write(&device_cert_path, serialize_cert(&device_cert))
+        .map_err(io(&device_cert_path))?;
 
     let context_path = persist_context(pib.root(), &hub.context, &hub.context_data)?;
     Ok(PersistedHub {
         hub,
         ca_key,
         ca_cert,
-        node_identity,
-        node_key,
-        node_cert,
+        device_identity,
+        device_key,
+        device_cert,
         context_path,
         ca_cert_path,
         anchor_cert_path,
-        node_cert_path,
+        device_cert_path,
     })
 }
 
@@ -358,7 +361,15 @@ mod tests {
         assert_eq!(hub.anchor_key, n("/home/bob/KEY/root"));
         assert_eq!(hub.context.namespace(), &n("/home/bob"));
         assert_eq!(hub.context.version(), 1);
-        assert!(hub.context.enforces_hierarchy());
+        // The generated schema governs alone (no hierarchy floor) and is
+        // carried as LVS plus native rules.
+        assert!(!hub.context.enforces_hierarchy());
+        let schemas = hub.context.published_schemas();
+        assert_eq!(schemas.len(), 2);
+        assert_eq!(schemas[0].format, ndn_security::SchemaFormat::Lvs);
+        assert_eq!(schemas[0].body.as_ref(), network_schema(&n("/home/bob")).unwrap().lvs_binary);
+        assert!(hub.context.authorizes(&n("/home/bob/CA/KEY/ca"), &hub.anchor_key));
+        assert!(!hub.context.authorizes(&n("/home/bob/anything"), &hub.anchor_key));
         assert_eq!(
             hub.context.enrollment_hint(),
             Some(&EnrollmentHint::hub_default())
@@ -403,7 +414,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pib = FilePib::new(dir.path()).unwrap();
         let ns = n("/home/bob");
-        let out = init_hub_in_pib(&pib, &ns, DEFAULT_NODE_NAME, false).unwrap();
+        let out = init_hub_in_pib(&pib, &ns, "laptop", false).unwrap();
 
         // Root key + cert + anchor are in the PIB.
         let root = root_key_name(&ns);
@@ -430,6 +441,10 @@ mod tests {
 
         // The signed context is stored, names the CA, and re-loads verified.
         assert_eq!(out.hub.context.ca_endpoints(), &[n("/home/bob/CA")]);
+        // The inline envelope still fits one QR code (version 40, byte mode,
+        // low error correction: 2953 bytes) for a typical namespace.
+        let uri = out.hub.envelope.to_uri();
+        assert!(uri.len() <= 2953, "anchor envelope is {} bytes", uri.len());
         let keyring = ndn_security::Keyring::new();
         let loaded = crate::context_store::load_persisted_contexts(dir.path(), &keyring).unwrap();
         assert_eq!(loaded.len(), 1);
@@ -438,57 +453,65 @@ mod tests {
         assert_eq!(keyring.version_of(&ns), Some(1));
     }
 
-    /// `ndn-fwd init` regression: the hub node had no identity of its own in
-    /// the PIB, so the forwarder fell back to an ephemeral key. Init now mints
-    /// `<ns>/<node-name>` with a root-issued cert that `from_pib` loads.
+    /// The primary device gets its own admin identity `<ns>/admin/<device>`,
+    /// certified by the CA (not the root), loadable by `from_pib`.
     #[test]
-    fn init_hub_in_pib_mints_loadable_node_identity() {
+    fn init_hub_in_pib_mints_loadable_admin_device_identity() {
         let dir = tempfile::tempdir().unwrap();
         let pib = FilePib::new(dir.path()).unwrap();
         let ns = n("/home/bob");
-        let out = init_hub_in_pib(&pib, &ns, DEFAULT_NODE_NAME, false).unwrap();
+        let out = init_hub_in_pib(&pib, &ns, "laptop", false).unwrap();
         let root = root_key_name(&ns);
 
-        assert_eq!(out.node_identity, n("/home/bob/hub"));
-        assert_eq!(out.node_key, n("/home/bob/hub/KEY/node"));
-        assert_eq!(out.node_cert.issuer.as_deref(), Some(&root));
-        assert!(out.node_cert.is_valid_now());
-        // The persisted signed cert chains to the root anchor.
-        let node_wire = std::fs::read(&out.node_cert_path).unwrap();
-        let node_data = Data::decode(bytes::Bytes::from(node_wire)).unwrap();
-        assert_eq!(*node_data.name, out.node_key);
+        assert_eq!(out.device_identity, n("/home/bob/admin/laptop"));
+        assert_eq!(out.device_key, n("/home/bob/admin/laptop/KEY/device"));
+        assert_eq!(out.device_cert.issuer.as_deref(), Some(&out.ca_key));
+        assert!(out.device_cert.is_valid_now());
+        assert!(out.device_cert.valid_until <= out.ca_cert.valid_until);
+        // The persisted signed cert is signed by the CA key.
+        let wire = std::fs::read(&out.device_cert_path).unwrap();
+        let data = Data::decode(bytes::Bytes::from(wire)).unwrap();
+        assert_eq!(*data.name, out.device_key);
         let outcome = futures::executor::block_on(ndn_security::verifier::verify_by_sig_type(
-            node_data.sig_info().unwrap().sig_type,
-            node_data.signed_region(),
-            node_data.sig_value(),
-            &out.hub.anchor.public_key,
+            data.sig_info().unwrap().sig_type,
+            data.signed_region(),
+            data.sig_value(),
+            &out.ca_cert.public_key,
         ))
         .unwrap();
         assert_eq!(outcome, ndn_security::VerifyOutcome::Valid);
 
-        // A restarted forwarder with `[security] identity = /home/bob/hub`
+        // A restarted forwarder with `[security] identity = /home/bob/admin/laptop`
         // loads exactly this key, its cert and the root anchor.
         let reopened = FilePib::open(dir.path()).unwrap();
-        let mgr = SecurityManager::from_pib(&reopened, &out.node_identity).unwrap();
-        assert_eq!(mgr.identity_key_name(&out.node_identity), Some(out.node_key.clone()));
-        let signer = mgr.get_signer_sync(&out.node_key).unwrap();
-        assert_eq!(signer.public_key().unwrap(), out.node_cert.public_key);
+        let mgr = SecurityManager::from_pib(&reopened, &out.device_identity).unwrap();
+        assert_eq!(
+            mgr.identity_key_name(&out.device_identity),
+            Some(out.device_key.clone())
+        );
+        let signer = mgr.get_signer_sync(&out.device_key).unwrap();
+        assert_eq!(signer.public_key().unwrap(), out.device_cert.public_key);
         assert!(mgr.trust_anchor(&root).is_some());
         // …and the namespace's own identity still resolves to the root.
         assert_eq!(reopened.default_key(&ns).unwrap(), Some(root));
     }
 
     #[test]
-    fn init_hub_in_pib_rejects_node_names_that_collide() {
+    fn init_hub_in_pib_rejects_invalid_device_names_and_namespaces() {
         let dir = tempfile::tempdir().unwrap();
         let pib = FilePib::new(dir.path()).unwrap();
         let ns = n("/home/bob");
-        for bad in ["", "KEY", "CA", "a/b"] {
+        for bad in ["", "KEY", "CA", "admin", "guest", "a/b", "-x"] {
             let err = init_hub_in_pib(&pib, &ns, bad, false)
                 .err()
-                .expect("colliding node name must be refused");
-            assert!(matches!(err, HubInitError::InvalidNodeName(_)), "{bad:?}: {err}");
+                .expect("invalid device name must be refused");
+            assert!(
+                matches!(err, HubInitError::Role(RoleError::InvalidDevice { .. })),
+                "{bad:?}: {err}"
+            );
         }
+        let err = init_hub_in_pib(&pib, &n("/"), "laptop", false).err().unwrap();
+        assert!(matches!(err, HubInitError::Role(RoleError::InvalidNamespace { .. })));
         assert!(pib.list_keys().unwrap().is_empty(), "nothing written");
     }
 
@@ -497,18 +520,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pib = FilePib::new(dir.path()).unwrap();
         let ns = n("/home/bob");
-        let first = init_hub_in_pib(&pib, &ns, DEFAULT_NODE_NAME, false).unwrap();
+        let first = init_hub_in_pib(&pib, &ns, "laptop", false).unwrap();
         let root_before = root_public_key(&pib, &ns);
 
-        let err = init_hub_in_pib(&pib, &ns, DEFAULT_NODE_NAME, false)
+        let err = init_hub_in_pib(&pib, &ns, "laptop", false)
             .err()
             .expect("re-init must fail");
         assert!(matches!(err, HubInitError::AlreadyInitialized { .. }), "{err}");
         assert_eq!(root_public_key(&pib, &ns), root_before, "root untouched");
 
         // With force a fresh root replaces it (and the stored context follows).
-        let second = init_hub_in_pib(&pib, &ns, DEFAULT_NODE_NAME, true).unwrap();
-        assert_ne!(second.node_cert.public_key, first.node_cert.public_key);
+        let second = init_hub_in_pib(&pib, &ns, "laptop", true).unwrap();
+        assert_ne!(second.device_cert.public_key, first.device_cert.public_key);
         assert_ne!(root_public_key(&pib, &ns), root_before);
         assert_ne!(
             anchor_fingerprint(&second.hub.anchor),
@@ -520,6 +543,76 @@ mod tests {
         let ctx = loaded[0].1.as_ref().unwrap();
         let fps: Vec<_> = ctx.anchors().iter().map(|r| anchor_fingerprint(r.value())).collect();
         assert_eq!(fps, vec![anchor_fingerprint(&second.hub.anchor)]);
+    }
+
+    /// Sign `name` with `key` held by `mgr`.
+    fn signed(mgr: &SecurityManager, key: &Name, name: &str) -> Data {
+        let signer = mgr.get_signer_sync(key).unwrap();
+        let wire = ndn_packet::encode::DataBuilder::new(n(name), b"x").sign_sync(
+            signer.sig_type(),
+            Some(key),
+            |r| signer.sign_sync(r).unwrap_or_default(),
+        );
+        Data::decode(wire).unwrap()
+    }
+
+    /// End to end through a validator whose keyring is loaded from the hub's
+    /// PIB: the generated schema admits the role layout's signing chains and
+    /// refuses what the roles forbid — on every certificate hop, so a device
+    /// cannot self-issue a key, least of all an admin one.
+    #[tokio::test]
+    async fn hub_context_validates_role_chains_on_every_hop() {
+        use ndn_security::{CertCache, TrustSchema, ValidationResult, Validator};
+
+        let dir = tempfile::tempdir().unwrap();
+        let pib = FilePib::new(dir.path()).unwrap();
+        let ns = n("/home/bob");
+        let out = init_hub_in_pib(&pib, &ns, "laptop", false).unwrap();
+        let v = Validator::with_chain(
+            TrustSchema::new(),
+            Arc::new(CertCache::new()),
+            Arc::new(dashmap::DashMap::new()),
+            None,
+            5,
+        );
+        crate::context_store::load_persisted_contexts(dir.path(), v.keyring()).unwrap();
+        v.cert_cache().insert(out.ca_cert.clone());
+        v.cert_cache().insert(out.device_cert.clone());
+
+        let mgr = SecurityManager::new();
+        mgr.register_signer(out.device_key.clone(), pib.get_signer(&out.device_key).unwrap());
+        mgr.register_signer(out.ca_key.clone(), pib.get_signer(&out.ca_key).unwrap());
+        // A member enrolled through the CA.
+        let member = n("/home/bob/member/phone/KEY/k1");
+        mgr.generate_ed25519(member.clone()).unwrap();
+        let pk = mgr.get_signer_sync(&member).unwrap().public_key().unwrap();
+        let cert = mgr.certify(&member, pk, &out.ca_key, 3_600_000).await.unwrap();
+        v.cert_cache().insert(cert);
+        // The member self-issues an "admin" key.
+        let forged = n("/home/bob/admin/phone/KEY/k1");
+        mgr.generate_ed25519(forged.clone()).unwrap();
+        let pk = mgr.get_signer_sync(&forged).unwrap().public_key().unwrap();
+        let cert = mgr.certify(&forged, pk, &member, 3_600_000).await.unwrap();
+        v.cert_cache().insert(cert);
+
+        let valid = |r: &ValidationResult| matches!(r, ValidationResult::Valid(_));
+        let approval = "/home/bob/member/tablet/KEY/k1/ndncert-approve/req-1";
+        let admin = &out.device_key;
+        for (key, name, ok) in [
+            (admin, "/home/bob/admin/laptop/status", true),
+            (admin, approval, true),
+            (&member, "/home/bob/shared/list", true),
+            (&member, "/home/bob/member/phone/notes", true),
+            (&member, approval, false),
+            (&member, "/home/bob/admin/laptop/status", false),
+            (&forged, approval, false),
+        ] {
+            let result = v.validate_chain(&signed(&mgr, key, name)).await;
+            assert_eq!(valid(&result), ok, "{name} by {key}: {result:?}");
+        }
+        // The CA cert itself validates as Data under the context.
+        let ca_data = Data::decode(bytes::Bytes::from(serialize_cert(&out.ca_cert))).unwrap();
+        assert!(valid(&v.validate_chain(&ca_data).await));
     }
 
     #[test]

@@ -527,13 +527,26 @@ impl LvsModel {
     /// As [`check`](Self::check), but dispatching the schema's user functions through
     /// `registry` (G8). A function with no handler still fails closed.
     pub fn check_with(&self, data_name: &Name, key_name: &Name, registry: &UserFnRegistry) -> bool {
+        self.matching_pair(data_name, key_name, registry).is_some()
+    }
+
+    /// The `(data node, key node)` sign constraint [`check_with`](Self::check_with)
+    /// accepts `(data_name, key_name)` on, or `None` when it rejects the pair. Same
+    /// evaluation as `check_with`; inspection tools render the nodes with
+    /// [`node_label`](Self::node_label) / [`node_pattern`](Self::node_pattern).
+    pub fn matching_pair(
+        &self,
+        data_name: &Name,
+        key_name: &Name,
+        registry: &UserFnRegistry,
+    ) -> Option<(u64, u64)> {
         let data_endings = self.walk(data_name, registry);
         if data_endings.is_empty() {
-            return false;
+            return None;
         }
         let key_endings = self.walk(key_name, registry);
         if key_endings.is_empty() {
-            return false;
+            return None;
         }
         for (data_node_id, _data_bindings) in &data_endings {
             let Some(node) = self.nodes.get(*data_node_id as usize) else {
@@ -544,12 +557,144 @@ impl LvsModel {
             }
             for (key_node_id, _) in &key_endings {
                 if node.sign_constraints.contains(key_node_id) {
-                    return true;
+                    return Some((*data_node_id, *key_node_id));
                 }
             }
         }
-        false
+        None
     }
+
+    /// `#<rule name>` for node `id` when the binary names it (the in-tree compiler
+    /// names every rule's terminal node), else `#n<id>`.
+    pub fn node_label(&self, id: u64) -> String {
+        match self
+            .nodes
+            .get(id as usize)
+            .and_then(|n| n.rule_names.first())
+        {
+            Some(name) => format!("#{}", name.strip_prefix('#').unwrap_or(name)),
+            None => format!("#n{id}"),
+        }
+    }
+
+    /// The name pattern from the start node to node `id`, in the in-tree LVS source
+    /// syntax (`/"KEY"/_tag`; pattern-edge constraints as `&{…}`), or `None` when `id`
+    /// is unreachable from the start node.
+    pub fn node_pattern(&self, id: u64) -> Option<String> {
+        self.patterns_from_start().remove(&id)
+    }
+
+    /// Render the whole model as LVS source text: one `#rule: pattern [<= #signer, …]`
+    /// line per named, signed or signing node, in node order. For a model compiled
+    /// in-tree, compiling the rendered text yields an equivalent model.
+    pub fn to_text(&self) -> String {
+        let patterns = self.patterns_from_start();
+        let signers: HashSet<u64> = self
+            .nodes
+            .iter()
+            .flat_map(|n| n.sign_constraints.iter().copied())
+            .collect();
+        let mut out = String::new();
+        for node in &self.nodes {
+            if node.rule_names.is_empty()
+                && node.sign_constraints.is_empty()
+                && !signers.contains(&node.id)
+            {
+                continue;
+            }
+            let Some(pattern) = patterns.get(&node.id) else {
+                continue;
+            };
+            out.push_str(&self.node_label(node.id));
+            out.push_str(": ");
+            out.push_str(pattern);
+            if !node.sign_constraints.is_empty() {
+                let keys: Vec<String> = node
+                    .sign_constraints
+                    .iter()
+                    .map(|k| self.node_label(*k))
+                    .collect();
+                out.push_str(" <= ");
+                out.push_str(&keys.join(", "));
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// Pattern text for every node reachable from the start node (breadth-first;
+    /// a node reachable along several paths keeps the first).
+    fn patterns_from_start(&self) -> HashMap<u64, String> {
+        let mut out: HashMap<u64, String> = HashMap::new();
+        if self.nodes.is_empty() {
+            return out;
+        }
+        let mut queue = std::collections::VecDeque::from([(self.start_id, String::new())]);
+        while let Some((id, path)) = queue.pop_front() {
+            if out.contains_key(&id) {
+                continue;
+            }
+            let Some(node) = self.nodes.get(id as usize) else {
+                continue;
+            };
+            for ve in &node.value_edges {
+                queue.push_back((ve.dest, format!("{path}/\"{}\"", component_uri(&ve.value))));
+            }
+            for pe in &node.pattern_edges {
+                let mut seg = format!("{path}/{}", self.tag_text(pe.tag));
+                if !pe.constraints.is_empty() {
+                    let cnf: Vec<String> = pe
+                        .constraints
+                        .iter()
+                        .map(|c| {
+                            c.options
+                                .iter()
+                                .map(|o| self.option_text(o))
+                                .collect::<Vec<_>>()
+                                .join("|")
+                        })
+                        .collect();
+                    seg.push_str(&format!("&{{{}}}", cnf.join(", ")));
+                }
+                queue.push_back((pe.dest, seg));
+            }
+            out.insert(id, if path.is_empty() { "/".into() } else { path });
+        }
+        out
+    }
+
+    /// `_<ident>` for a named pattern tag, `_` for an anonymous one.
+    fn tag_text(&self, tag: u64) -> String {
+        match self.tag_symbols.iter().find(|s| s.tag == tag) {
+            Some(s) => format!("_{}", s.ident.strip_prefix('_').unwrap_or(&s.ident)),
+            None => "_".into(),
+        }
+    }
+
+    fn option_text(&self, opt: &LvsConstraintOption) -> String {
+        match opt {
+            LvsConstraintOption::Value(v) => format!("\"{}\"", component_uri(v)),
+            LvsConstraintOption::Tag(t) => self.tag_text(*t),
+            LvsConstraintOption::UserFn(call) => {
+                let args: Vec<String> = call
+                    .args
+                    .iter()
+                    .map(|a| match a {
+                        LvsUserFnArg::Value(v) => format!("\"{}\"", component_uri(v)),
+                        LvsUserFnArg::Tag(t) => self.tag_text(*t),
+                    })
+                    .collect();
+                format!("{}({})", call.fn_id, args.join(", "))
+            }
+        }
+    }
+}
+
+/// A component in NDN URI form (`KEY`, `v=3`, `32=trust-context`…), without the
+/// leading `/`.
+fn component_uri(c: &NameComponent) -> String {
+    let uri = Name::from_components([c.clone()]).to_string();
+    uri.strip_prefix('/').unwrap_or(&uri).to_string()
 }
 
 impl LvsNode {

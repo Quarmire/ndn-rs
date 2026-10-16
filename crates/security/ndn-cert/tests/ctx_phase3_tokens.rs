@@ -119,9 +119,24 @@ async fn ctx05_scoped_token_enforced() {
         other => panic!("out-of-scope must be denied, got {other:?}"),
     }
 
-    // Inside scope → approved.
+    // Inside scope → approved, and the attestation records the scope so an
+    // issuance policy can tell what kind of invite admitted the request.
     let inside = verify_token(&ch, "/home/bob/guests/phone", "guest-invite").await;
     assert!(is_approved(&inside), "in-scope request must be approved");
+    let ChallengeOutcome::Approved {
+        attestation: Some(set),
+    } = &inside
+    else {
+        panic!("a scoped token must attest its scope, got {inside:?}");
+    };
+    assert_eq!(set.leaves[0].kind, "token");
+    assert_eq!(
+        set.leaves[0]
+            .evidence
+            .get(ndn_cert::policy::TOKEN_SCOPE_EVIDENCE)
+            .and_then(|v| v.as_str()),
+        Some("/home/bob/guests")
+    );
 }
 
 /// Scope is enforced even when the token is a *sub* of a combinator: the

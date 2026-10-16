@@ -17,6 +17,7 @@ pub mod hub;
 pub mod onboarding;
 pub mod policy;
 pub mod protocol;
+pub mod roles;
 pub mod store;
 pub mod tlv;
 
@@ -41,8 +42,8 @@ pub use context_store::{
     persist_context,
 };
 pub use hub::{
-    HubInit, HubInitError, PersistedHub, ValidityMode, ca_key_name, init_hub, init_hub_in_pib,
-    node_identity_name, node_key_name, root_key_name,
+    HubInit, HubInitError, PersistedHub, ValidityMode, ca_key_name, device_key_name, init_hub,
+    init_hub_in_pib, root_key_name,
 };
 pub use onboarding::{
     AdoptError, AdvertConfig, AnchorAdvert, adopt_anchor_envelope, adopt_unsigned_legacy_with_tofu,
@@ -50,8 +51,9 @@ pub use onboarding::{
 };
 pub use policy::{
     AcceptAllIssuance, DelegationPolicy, HierarchicalPolicy, IssuanceContext, IssuanceDecision,
-    IssuancePolicy, NamespacePolicy, PolicyDecision, RequireAttestationKind,
+    IssuancePolicy, NamespacePolicy, PolicyDecision, RequireAttestationKind, RolePolicy,
 };
+pub use roles::{NetworkSchema, Role, RoleError, network_schema};
 pub use protocol::{
     CaProfile, CertRequest, ChallengeRequest, ChallengeResponse, ChallengeStatus, ErrorCode,
     NewResponse, ProbeResponse, RevokeRequest, RevokeResponse, RevokeStatus,

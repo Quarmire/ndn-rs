@@ -109,21 +109,45 @@ The post-challenge gate. An `IssuancePolicy` impl returns:
 - `Defer(callback)` — out-of-band hold (admin approval, etc.).
 
 Built-ins in `crates/security/ndn-cert/src/policy.rs`:
-`AcceptAllIssuance` (default), `NamespacePolicy`,
+`AcceptAllIssuance` (default), `RequireAttestationKind` (names under a
+prefix need a given challenge leaf) and `RolePolicy` (the personal-network
+role layout, below), behind the pre-challenge `NamespacePolicy` and the
 `ChallengeHandler` (three-stage seam recorded in
 `project_f7_issuance_policy`).
+
+### Roles in a personal network
+
+A hub network `/<ns>` names every device `/<ns>/<role>/<device>` with role
+`admin`, `member`, `node` (super node) or `guest`
+(`ndn_cert::roles`; design: `docs/specs/personal-network-pairing.md`).
+`RolePolicy::new(ns)` issues only device keys `/<ns>/<role>/<device>/KEY/<id>`
+and only when the satisfied challenge fits the role:
+
+| Role | Issued on |
+|---|---|
+| `admin`, `node` | an admin's `device-approval` (alone, or a leaf of `token AND device-approval`) — never a token alone |
+| `member` | a `device-approval`, or an invite token that is unscoped or scoped inside `/<ns>/member` |
+| `guest` | a `device-approval`, or an invite token scoped inside `/<ns>/guest` |
+
+Other challenges (pin, email, nop) admit no role. A scoped token records its
+scope in its attestation leaf (evidence `scope`), which is how the policy tells
+a guest invite from a member invite.
 
 ## Configuration
 
 `ndn-fwd` embeds a CA through its `[demo_ca]` section (full key list in the
 [configuration reference](../operations/config-reference.md)). On a hub,
-`ndn-fwd init --profile hub` writes the root anchor, a `/<ns>/CA` signing
-identity certified by it, and the hub node's own identity `/<ns>/hub`
-(`--node-name` picks another last component) into the node PIB, and prints
-the `[security]` lines (`identity`, `pib_path`) that make the forwarder load
-the node identity. The CA loads its identity, so the certs it issues chain to
+`ndn-fwd init --profile hub --namespace /<ns>` writes the root anchor, a
+`/<ns>/CA` signing identity certified by it, and the primary device's admin
+identity `/<ns>/admin/<device>` (`--device` names it; default: the host name,
+sanitized) certified by the CA into the node PIB, stores the root-signed
+trust context carrying the generated role schema, and prints the
+`[security]` lines (`identity`, `pib_path`) that make the forwarder load the
+device identity. The CA loads its identity, so the certs it issues chain to
 the same root across restarts, and it persists issued certs, revocations and
-redeemed tokens (hashed) under `<pib_path>/ca/`:
+redeemed tokens (hashed) under `<pib_path>/ca/`. A PIB-backed `/<ns>/CA`
+certified by the hub root issues under `RolePolicy::new(/<ns>)` (combined with
+`require_attestation` when that is set too):
 
 ```toml
 [demo_ca]
@@ -133,15 +157,38 @@ identity = "/home/bob/CA"   # signing identity loaded from the PIB
 
 [[demo_ca.challenge]]
 kind   = "token"
-tokens = ["<one-time invite>"]
+tokens = ["member-<hex>", "guest-<hex>"]   # from ndn-fwd-tokens new --role …
 
 [[demo_ca.challenge]]
 kind = "device-approval"     # approve via /localhost/nfd/ca/approve
 ```
 
+Invite tokens carry their role: `ndn-fwd-tokens new --ca /home/bob --namespace
+/home/bob --role member|guest` (default `member`) mints `member-<hex>` /
+`guest-<hex>`, and the CA scopes such a token to `/<ns>/<role>`, so it cannot
+certify another role. `--role admin` (and `node`) is refused: those
+certificates need an admin's device approval. Tokens without a role prefix stay
+unscoped (members only, under `RolePolicy`).
+
 A CA with no challenge refuses to start; `kind = "nop"` (auto-approve) must be
 listed explicitly. `ephemeral = true` replaces the PIB identity with a
-throwaway self-signed key for demos.
+throwaway self-signed key for demos; an ephemeral CA keeps issuing any
+challenge-passing name under its prefix (no `RolePolicy`).
+
+### Inspecting the schema
+
+`ndn-fwd schema show [--pib <dir>] [--namespace <ns>]` prints the adopted
+context's schema: the LVS binary decoded back to LVS rules (with rule names),
+then the native rules OR'd with it. `ndn-fwd schema explain <data-name>
+<key-name>` says whether the key may sign the name under the context
+governing it, and which rule decides (exit status 1 on deny):
+
+```text
+$ ndn-fwd schema explain /home/bob/member/tablet/KEY/k1/ndncert-approve/req-1 \
+      /home/bob/admin/laptop/KEY/device --pib ~/.ndn/pib
+rule           = LVS rule #approve_member: /"home"/"bob"/"member"/_device/"KEY"/_/"ndncert-approve"/_ <= #admin: /"home"/"bob"/"admin"/_device/"KEY"/_
+verdict        = allow
+```
 
 `/<prefix>/CA/REVOKE` revokes a cert this CA issued
 (`ndn_cert::client::revoke`): the request carries a signature over the cert

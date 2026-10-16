@@ -214,9 +214,10 @@ mod tests {
         assert!(held.is_revoked(&revoked), "revocation survives sync");
         assert_eq!(held.ca_endpoints(), published.ca_endpoints());
         assert_eq!(held.enrollment_hint(), Some(&EnrollmentHint::hub_default()));
-        let schema = held.published_schema();
-        assert_eq!(schema.format, SchemaFormat::Lvs);
-        assert_eq!(schema.body, lvs, "LVS blob travels byte-for-byte");
+        let schemas = held.published_schemas();
+        assert_eq!(schemas.len(), 1);
+        assert_eq!(schemas[0].format, SchemaFormat::Lvs);
+        assert_eq!(schemas[0].body, lvs, "LVS blob travels byte-for-byte");
     }
 
     #[tokio::test]

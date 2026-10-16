@@ -222,6 +222,111 @@ impl IssuancePolicy for RequireAttestationKind {
     }
 }
 
+/// Evidence key under which [`crate::TokenChallenge`] records a scoped
+/// token's scope in its attestation leaf.
+pub const TOKEN_SCOPE_EVIDENCE: &str = "scope";
+
+/// Role-enforcing issuance for a personal network rooted at `namespace`
+/// (`docs/specs/personal-network-pairing.md` §2, §8). Issues only for device
+/// keys `/<ns>/<role>/<device>/KEY/<id>…` ([`crate::roles`]), and only when
+/// the satisfied challenge is strong enough for the role:
+///
+/// - an admin's **device approval** (`device-approval`, alone or as a leaf of
+///   a combinator such as `token AND device-approval`) admits any role;
+/// - an invite **token** admits a `member` when it is unscoped or scoped
+///   inside `/<ns>/member`, and a `guest` only when scoped inside
+///   `/<ns>/guest` (`ndn-fwd-tokens new --role guest`);
+/// - `admin` and `node` certificates are never issued on a token alone;
+/// - other challenges (pin, email, nop, …) admit no role.
+pub struct RolePolicy {
+    namespace: Name,
+}
+
+impl RolePolicy {
+    pub fn new(namespace: Name) -> Self {
+        Self { namespace }
+    }
+
+    pub fn namespace(&self) -> &Name {
+        &self.namespace
+    }
+}
+
+/// The satisfied leaves of kind `kind`. A single-challenge set is only
+/// believed when the CA ran that very challenge.
+fn satisfied<'a>(
+    ctx: &'a IssuanceContext<'_>,
+    kind: &'a str,
+) -> impl Iterator<Item = &'a crate::attestation::ChallengeAttestation> + 'a {
+    let leaves = ctx.attestation.map(|s| s.leaves.as_slice()).unwrap_or(&[]);
+    let single = ctx
+        .attestation
+        .is_some_and(|s| s.combinator == crate::attestation::Combinator::Single);
+    leaves
+        .iter()
+        .filter(move |l| l.kind == kind && (!single || ctx.challenge_type == kind))
+}
+
+impl IssuancePolicy for RolePolicy {
+    fn decide(&self, ctx: &IssuanceContext<'_>) -> IssuanceDecision {
+        use crate::roles::{Role, parse_device_key, role_prefix};
+
+        let issue = IssuanceDecision::Issue {
+            validity: ctx.default_validity,
+        };
+        let Some(device) = ctx
+            .cert_request
+            .name
+            .parse::<Name>()
+            .ok()
+            .and_then(|name| parse_device_key(&self.namespace, &name))
+        else {
+            return IssuanceDecision::Deny(format!(
+                "{} is not a device key {}/<role>/<device>/KEY/<id> \
+                 (role admin, member, node or guest)",
+                ctx.cert_request.name, self.namespace
+            ));
+        };
+        if satisfied(ctx, "device-approval").next().is_some() {
+            return issue;
+        }
+        let role = device.role;
+        if matches!(role, Role::Admin | Role::Node) {
+            return IssuanceDecision::Deny(format!(
+                "{role} certificates require an admin's device approval \
+                 (the device-approval challenge); a token alone never issues one"
+            ));
+        }
+        let role_scope = role_prefix(&self.namespace, role);
+        let token_admits = satisfied(ctx, "token").any(|leaf| {
+            let scope = leaf
+                .evidence
+                .get(TOKEN_SCOPE_EVIDENCE)
+                .and_then(|v| v.as_str())
+                .map(|s| s.parse::<Name>());
+            match scope {
+                None => role == Role::Member,
+                Some(Ok(scope)) => scope.has_prefix(&role_scope),
+                Some(Err(_)) => false,
+            }
+        });
+        if token_admits {
+            return issue;
+        }
+        IssuanceDecision::Deny(match role {
+            Role::Guest => format!(
+                "guest certificates need a guest-scoped invite token (scoped to {role_scope}) \
+                 or an admin's device approval"
+            ),
+            _ => format!(
+                "member certificates need a member invite token or an admin's device approval \
+                 (challenge {} admits no role)",
+                ctx.challenge_type
+            ),
+        })
+    }
+}
+
 fn strip_key_suffix(name: &Name) -> Name {
     let comps = name.components();
     let key_pos = comps
@@ -431,5 +536,93 @@ mod issuance_tests {
             policy.decide(&ctx_att(&r, "device-approval", &ca, Some(&signed))),
             IssuanceDecision::Issue { .. }
         ));
+    }
+
+    fn issued(policy: &RolePolicy, name: &str, kind: &str, att: Option<&AttestationSet>) -> bool {
+        let r = req(name);
+        let ca = "/home/bob".parse::<Name>().unwrap();
+        matches!(
+            policy.decide(&ctx_att(&r, kind, &ca, att)),
+            IssuanceDecision::Issue { .. }
+        )
+    }
+
+    fn token_leaf(scope: Option<&str>) -> ChallengeAttestation {
+        let leaf = ChallengeAttestation::of_kind("token");
+        match scope {
+            Some(s) => leaf.with_evidence(TOKEN_SCOPE_EVIDENCE, serde_json::json!(s)),
+            None => leaf,
+        }
+    }
+
+    /// Admin (and node) certificates need a device approval — alone or as a
+    /// leaf of `token AND device-approval` — never a token alone.
+    #[test]
+    fn role_policy_admin_and_node_need_device_approval() {
+        let policy = RolePolicy::new("/home/bob".parse().unwrap());
+        let approval = AttestationSet::single(ChallengeAttestation::of_kind("device-approval"));
+        let token = AttestationSet::single(token_leaf(None));
+        let both = AttestationSet::new(
+            crate::attestation::Combinator::AllOf,
+            vec![token_leaf(None), ChallengeAttestation::of_kind("device-approval")],
+        );
+        for who in ["/home/bob/admin/desk/KEY/k1", "/home/bob/node/vps/KEY/k1"] {
+            assert!(!issued(&policy, who, "token", Some(&token)), "{who} by token");
+            assert!(issued(&policy, who, "device-approval", Some(&approval)), "{who}");
+            assert!(issued(&policy, who, "all-of", Some(&both)), "{who} by token+approval");
+            // A single-challenge leaf the CA did not run is not believed.
+            assert!(!issued(&policy, who, "token", Some(&approval)), "{who}: forged leaf");
+            // Approval-less composites do not qualify either.
+            let tokens_only = AttestationSet::new(
+                crate::attestation::Combinator::AllOf,
+                vec![token_leaf(None), ChallengeAttestation::of_kind("pin")],
+            );
+            assert!(!issued(&policy, who, "all-of", Some(&tokens_only)), "{who}");
+        }
+    }
+
+    /// Tokens admit members (unscoped or member-scoped) and guests only when
+    /// guest-scoped; other challenges admit no role.
+    #[test]
+    fn role_policy_tokens_admit_members_and_scoped_guests() {
+        let policy = RolePolicy::new("/home/bob".parse().unwrap());
+        let member = "/home/bob/member/phone/KEY/k1";
+        let guest = "/home/bob/guest/alice/KEY/k1";
+        let unscoped = AttestationSet::single(token_leaf(None));
+        let member_scoped = AttestationSet::single(token_leaf(Some("/home/bob/member")));
+        let guest_scoped = AttestationSet::single(token_leaf(Some("/home/bob/guest")));
+
+        assert!(issued(&policy, member, "token", Some(&unscoped)));
+        assert!(issued(&policy, member, "token", Some(&member_scoped)));
+        assert!(!issued(&policy, member, "token", Some(&guest_scoped)));
+        assert!(!issued(&policy, guest, "token", Some(&unscoped)));
+        assert!(!issued(&policy, guest, "token", Some(&member_scoped)));
+        assert!(issued(&policy, guest, "token", Some(&guest_scoped)));
+        let approval = AttestationSet::single(ChallengeAttestation::of_kind("device-approval"));
+        assert!(issued(&policy, guest, "device-approval", Some(&approval)));
+
+        let pin = AttestationSet::single(ChallengeAttestation::of_kind("pin"));
+        assert!(!issued(&policy, member, "pin", Some(&pin)));
+        assert!(!issued(&policy, member, "nop", None));
+    }
+
+    #[test]
+    fn role_policy_issues_only_role_layout_device_keys() {
+        let policy = RolePolicy::new("/home/bob".parse().unwrap());
+        let approval = AttestationSet::single(ChallengeAttestation::of_kind("device-approval"));
+        for name in [
+            "/home/bob/laptop/KEY/k1",
+            "/home/bob/CA/KEY/ca2",
+            "/home/bob/KEY/root2",
+            "/home/bob/member/phone",
+            "/home/bob/member/admin/KEY/k1",
+            "/home/alice/member/phone/KEY/k1",
+            "not a name",
+        ] {
+            assert!(
+                !issued(&policy, name, "device-approval", Some(&approval)),
+                "{name} must not be issued"
+            );
+        }
     }
 }

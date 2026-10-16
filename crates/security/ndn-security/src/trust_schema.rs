@@ -26,6 +26,10 @@ pub enum PatternComponent {
     Capture(Arc<str>),
     /// Binds one or more trailing components to a named variable.
     MultiCapture(Arc<str>),
+    /// Matches exactly one component that is **not** this literal (binds
+    /// nothing). Lets a rule cover "anything under `/x/<id>` except its
+    /// `KEY` subtree", which only a certificate issuer may sign.
+    Except(NameComponent),
 }
 
 /// A name pattern with named capture groups; used to express rules like
@@ -34,7 +38,8 @@ pub enum PatternComponent {
 ///
 /// Text format: `/`-separated components; `/literal` is a literal,
 /// `/<var>` captures one component, `/<**var>` captures all remaining
-/// components (must be last).
+/// components (must be last), `/<!literal>` matches one component other than
+/// `literal`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NamePattern(pub Vec<PatternComponent>);
 
@@ -69,6 +74,10 @@ impl NamePattern {
                         return Err(PatternParseError::MultiCaptureNotLast);
                     }
                     components.push(PatternComponent::MultiCapture(Arc::from(multi_var)));
+                } else if let Some(excluded) = var.strip_prefix('!') {
+                    components.push(PatternComponent::Except(NameComponent::generic(
+                        bytes::Bytes::copy_from_slice(excluded.as_bytes()),
+                    )));
                 } else {
                     components.push(PatternComponent::Capture(Arc::from(var)));
                 }
@@ -111,6 +120,12 @@ impl NamePattern {
                 }
                 PatternComponent::MultiCapture(_var) => {
                     name_idx = components.len();
+                }
+                PatternComponent::Except(c) => {
+                    if name_idx >= components.len() || &components[name_idx] == c {
+                        return false;
+                    }
+                    name_idx += 1;
                 }
             }
         }
@@ -164,6 +179,9 @@ impl std::fmt::Display for NamePattern {
                 }
                 PatternComponent::MultiCapture(var) => {
                     write!(f, "<**{var}>")?;
+                }
+                PatternComponent::Except(nc) => {
+                    write!(f, "<!{}>", String::from_utf8_lossy(&nc.value))?;
                 }
             }
         }
@@ -264,6 +282,44 @@ impl TrustSchema {
         false
     }
 
+    /// Which rule admits `(data_name, key_name)`, evaluated exactly as
+    /// [`allows`](Self::allows) (native rules first, then the LVS model):
+    /// `Some` iff `allows` returns `true`. For inspection tooling
+    /// (`ndn-fwd schema explain`); validation uses `allows`.
+    pub fn explain(&self, data_name: &Name, key_name: &Name) -> Option<SchemaMatch<'_>> {
+        if let Some((index, rule)) = self
+            .rules
+            .iter()
+            .enumerate()
+            .find(|(_, r)| r.check(data_name, key_name))
+        {
+            return Some(SchemaMatch::Native { index, rule });
+        }
+        let model = self.lvs.as_deref()?;
+        let (data_node, key_node) = model.matching_pair(data_name, key_name, &self.user_fns)?;
+        Some(SchemaMatch::Lvs {
+            model,
+            data_node,
+            key_node,
+        })
+    }
+
+    /// OR `other` into this schema: its native rules are appended and its LVS
+    /// model (with its user-function registry) is adopted. Returns `false` —
+    /// leaving `self` unchanged — when both carry an LVS model, since one
+    /// schema holds at most one.
+    pub fn merge(&mut self, other: TrustSchema) -> bool {
+        if self.lvs.is_some() && other.lvs.is_some() {
+            return false;
+        }
+        self.rules.extend(other.rules);
+        if other.lvs.is_some() {
+            self.lvs = other.lvs;
+            self.user_fns = other.user_fns;
+        }
+        true
+    }
+
     /// Reusable, general schema-driven authorization gate; see [`SchemaGate`].
     pub fn gate(self: &Arc<Self>) -> SchemaGate {
         SchemaGate {
@@ -314,6 +370,41 @@ impl TrustSchema {
             ]),
         });
         schema
+    }
+}
+
+/// The rule of a [`TrustSchema`] that admitted a `(data, key)` pair — see
+/// [`TrustSchema::explain`]. `Display` renders it readably.
+#[derive(Clone, Copy, Debug)]
+pub enum SchemaMatch<'a> {
+    /// The native rule at `index` in [`TrustSchema::rules`].
+    Native { index: usize, rule: &'a SchemaRule },
+    /// The LVS sign constraint from `data_node` (reached by the data name)
+    /// to `key_node` (reached by the key name).
+    Lvs {
+        model: &'a LvsModel,
+        data_node: u64,
+        key_node: u64,
+    },
+}
+
+impl std::fmt::Display for SchemaMatch<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SchemaMatch::Native { index, rule } => write!(f, "native rule {index}: {rule}"),
+            SchemaMatch::Lvs {
+                model,
+                data_node,
+                key_node,
+            } => write!(
+                f,
+                "LVS rule {}: {} <= {}: {}",
+                model.node_label(*data_node),
+                model.node_pattern(*data_node).unwrap_or_default(),
+                model.node_label(*key_node),
+                model.node_pattern(*key_node).unwrap_or_default(),
+            ),
+        }
     }
 }
 
@@ -369,6 +460,65 @@ mod tests {
     }
     fn name(components: &[&'static str]) -> Name {
         Name::from_components(components.iter().map(|s| comp(s)))
+    }
+
+    fn n(s: &str) -> Name {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn except_matches_one_component_other_than_the_literal() {
+        let rule = SchemaRule::parse("/net/<dev>/<!KEY>/<**rest> => /net/<dev>/KEY/<**k>").unwrap();
+        assert_eq!(
+            rule.to_string(),
+            "/net/<dev>/<!KEY>/<**rest> => /net/<dev>/KEY/<**k>",
+            "Display round-trips the grammar"
+        );
+        assert!(rule.check(&n("/net/phone/photos/1"), &n("/net/phone/KEY/k1")));
+        assert!(rule.check(&n("/net/phone/x"), &n("/net/phone/KEY/k1")));
+        // The KEY subtree is excluded, and the excluded slot is not optional.
+        assert!(!rule.check(&n("/net/phone/KEY/k2"), &n("/net/phone/KEY/k1")));
+        assert!(!rule.check(&n("/net/phone"), &n("/net/phone/KEY/k1")));
+    }
+
+    #[test]
+    fn explain_agrees_with_allows_and_names_the_rule() {
+        let mut schema = TrustSchema::new();
+        schema.add_rule(SchemaRule::parse("/a/<x> => /a/KEY/<k>").unwrap());
+        schema.add_rule(SchemaRule::parse("/b/<x> => /b/KEY/<k>").unwrap());
+        let lvs = crate::lvs_compile::compile_to_binary(
+            "#root: /\"c\"/\"KEY\"/_k\n#doc: /\"c\"/_d <= #root",
+        )
+        .unwrap();
+        assert!(schema.merge(TrustSchema::from_lvs_binary(&lvs).unwrap()));
+
+        let cases = [
+            ("/b/1", "/b/KEY/k", true),
+            ("/c/1", "/c/KEY/k", true),
+            ("/a/1", "/b/KEY/k", false),
+            ("/c/1", "/a/KEY/k", false),
+        ];
+        for (data, key, allowed) in cases {
+            let (data, key) = (n(data), n(key));
+            assert_eq!(schema.allows(&data, &key), allowed, "{data} by {key}");
+            assert_eq!(schema.explain(&data, &key).is_some(), allowed, "{data} by {key}");
+        }
+        let native = schema.explain(&n("/b/1"), &n("/b/KEY/k")).unwrap();
+        assert!(matches!(native, SchemaMatch::Native { index: 1, .. }));
+        assert_eq!(native.to_string(), "native rule 1: /b/<x> => /b/KEY/<k>");
+        let lvs = schema.explain(&n("/c/1"), &n("/c/KEY/k")).unwrap();
+        assert_eq!(
+            lvs.to_string(),
+            "LVS rule #doc: /\"c\"/_d <= #root: /\"c\"/\"KEY\"/_k"
+        );
+
+        // A second LVS model cannot be merged in.
+        let again = TrustSchema::from_lvs_binary(
+            &crate::lvs_compile::compile_to_binary("#a: /\"x\"").unwrap(),
+        )
+        .unwrap();
+        assert!(!schema.merge(again));
+        assert_eq!(schema.rules().len(), 2, "a refused merge leaves the schema unchanged");
     }
 
     #[test]

@@ -294,7 +294,9 @@ fn ctx17_schema_roundtrips_as_stock_lvs() {
         "decoded schema must be an LVS model"
     );
     // …and the published blob is the *identical* stock-LVS byte sequence.
-    let published = back.published_schema();
+    let published = back.published_schemas();
+    assert_eq!(published.len(), 1);
+    let published = &published[0];
     assert_eq!(published.format, SchemaFormat::Lvs);
     assert_eq!(
         published.body, lvs,

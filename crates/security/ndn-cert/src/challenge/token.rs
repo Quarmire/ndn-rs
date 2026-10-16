@@ -12,7 +12,11 @@
 //!   CA restarts even while it is still listed in the configuration.
 //! - **TTL** — an expired token is rejected (and reaped) at challenge time.
 //! - **Name scope** — a token authorizes a cert only under a constrained name
-//!   prefix; a request for a name outside the scope is rejected.
+//!   prefix; a request for a name outside the scope is rejected. A redeemed
+//!   scoped token's attestation leaf records the scope (evidence
+//!   [`TOKEN_SCOPE_EVIDENCE`](crate::policy::TOKEN_SCOPE_EVIDENCE)), so an
+//!   issuance policy such as [`RolePolicy`](crate::RolePolicy) can tell a
+//!   guest invite from a member invite.
 
 use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 
@@ -20,8 +24,10 @@ use dashmap::{DashMap, DashSet};
 use ndn_packet::Name;
 
 use crate::{
+    attestation::{AttestationSet, ChallengeAttestation},
     challenge::{ChallengeHandler, ChallengeOutcome, ChallengeState},
     error::CertError,
+    policy::TOKEN_SCOPE_EVIDENCE,
     protocol::CertRequest,
     store::CaStore,
 };
@@ -144,6 +150,11 @@ impl TokenStore {
         self.check_and_consume(token, Some(request_name))
     }
 
+    /// The name scope of the live token `token`, if it has one.
+    pub fn scope_of(&self, token: &str) -> Option<Name> {
+        self.tokens.get(token).and_then(|m| m.scope.clone())
+    }
+
     fn check_and_consume(&self, token: &str, request_name: Option<&Name>) -> TokenCheck {
         let Some(meta) = self.tokens.get(token).map(|r| r.value().clone()) else {
             return TokenCheck::NotFound;
@@ -240,13 +251,21 @@ impl ChallengeHandler for TokenChallenge {
             // (e.g. invoked as a combinator sub where the name isn't threaded),
             // fall back to single-use + TTL only — the CA's NamespacePolicy
             // still gates the prefix.
+            let scope = self.store.scope_of(&t);
             let check = match &request_name {
                 Some(name) => self.store.consume_for(&t, name),
                 None if self.store.consume(&t) => TokenCheck::Ok,
                 None => TokenCheck::NotFound,
             };
             match check {
-                TokenCheck::Ok => Ok(ChallengeOutcome::Approved { attestation: None }),
+                TokenCheck::Ok => Ok(ChallengeOutcome::Approved {
+                    attestation: scope.map(|scope| {
+                        AttestationSet::single(ChallengeAttestation::of_kind("token").with_evidence(
+                            TOKEN_SCOPE_EVIDENCE,
+                            serde_json::Value::String(scope.to_string()),
+                        ))
+                    }),
+                }),
                 TokenCheck::Expired => Ok(ChallengeOutcome::Denied("token expired".to_string())),
                 TokenCheck::OutOfScope(scope) => Ok(ChallengeOutcome::Denied(format!(
                     "token is scoped to {scope}; requested name is outside it"

@@ -33,6 +33,9 @@ pub const TRUST_CONTEXT: u64 = 0x0410;
 pub const ANCHOR_SET: u64 = 0x0411;
 
 /// Trust schema, carrying [`SCHEMA_FORMAT`] + [`SCHEMA_BODY`]. Critical.
+/// Repeatable: the runtime schema is the OR of every blob (at most one LVS
+/// binary plus native-text rules for what LVS cannot express). An older node
+/// that keeps only one blob authorizes less, never more.
 pub const TRUST_SCHEMA_BLOB: u64 = 0x0413;
 
 /// CA enrollment endpoint, a `Name` (`0x07`), repeatable. Non-critical
@@ -57,6 +60,16 @@ pub const REVOCATION: u64 = 0x0418;
 /// (even): a hint, not a rule — an old node skips it and still validates with
 /// the anchors + schema it understands. Filed as NDF feature request F9.
 pub const SOURCE_BUNDLE_HASH: u64 = 0x041A;
+
+/// Empty flag: the schema is **authoritative** — no hierarchy floor
+/// (`keyLocator.isPrefixOf(name)`) on top of it, and every certificate hop of
+/// a chain walk is checked against it (as LVS validation does). Set by
+/// contexts whose schema binds every signer to the names it may sign,
+/// certificates included (the generated personal-network schema), and
+/// deliberately grants cross-identity signing (admins approving enrollments,
+/// members writing `/<ns>/shared`). Non-critical (even): an old node skips it
+/// and keeps the floor.
+pub const SCHEMA_AUTHORITATIVE: u64 = 0x041C;
 
 /// `SchemaFormat` value: native ndn-rs text grammar (local authoring).
 pub const SCHEMA_FORMAT_NATIVE: u8 = 1;

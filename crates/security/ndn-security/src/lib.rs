@@ -78,11 +78,12 @@ pub use signer::{
 };
 pub use signing_info::{SignatureInfoOverrides, SignerSelection, SigningInfo};
 pub use trust_context::{
-    EnrollmentHint, SchemaBlob, SchemaFormat, SignedTrustContext, SignedTrustContextError,
-    SigningPair, dryrun_orphans,
+    ContextExplanation, EnrollmentHint, SchemaBlob, SchemaFormat, SignedTrustContext,
+    SignedTrustContextError, SigningPair, dryrun_orphans,
 };
 pub use trust_schema::{
-    NamePattern, PatternComponent, PatternParseError, SchemaGate, SchemaRule, TrustSchema,
+    NamePattern, PatternComponent, PatternParseError, SchemaGate, SchemaMatch, SchemaRule,
+    TrustSchema,
 };
 pub use unverified::{Unverified, VerifyError};
 pub use validator::{InterestValidationOutcome, ValidationResult, Validator};

@@ -296,6 +296,12 @@ impl Validator {
                     name: format!("cert has no issuer: {}", cert.name),
                 });
             };
+            // An authoritative schema governs every certificate hop, as LVS
+            // validation does: e.g. a device key is accepted only when the CA
+            // certified it, not when another device self-issued it.
+            if ctx.schema_is_authoritative() && !ctx.authorizes(&cert.name, issuer) {
+                return WalkOutcome::Invalid(TrustError::SchemaMismatch);
+            }
             let Some(sr) = &cert.signed_region else {
                 return WalkOutcome::Invalid(TrustError::CertNotFound {
                     name: format!("cert missing signed region: {}", cert.name),

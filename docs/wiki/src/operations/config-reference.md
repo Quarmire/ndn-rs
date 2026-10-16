@@ -113,7 +113,7 @@ it issued. See [NDNCERT setup](../guides/ndncert-setup.md).
 | `prefix` | `/demo` | CA namespace. The CA appends `/CA` itself (as do clients); a prefix ending in `/CA` is rejected at startup. |
 | `identity` | `/demo/CA` | CA signing identity, loaded from the node PIB (`[security] pib_path`). |
 | `ephemeral` | `false` | Mint a throwaway self-signed CA key at every start instead of loading `identity` (demo only; warned). |
-| `tokens` | `[]` | Legacy: non-empty selects a token challenge (ignored when `challenge` is set). |
+| `tokens` | `[]` | Legacy: non-empty selects a token challenge (ignored when `challenge` is set). A token `member-…` / `guest-…` (as `ndn-fwd-tokens new --role` mints them) is scoped to `<network>/<role>`. |
 | `emit_attestations` | `false` | Embed a challenge attestation in each issued cert. |
 
 Without `ephemeral`, the CA loads its key from the PIB and its certificate
@@ -126,12 +126,24 @@ revocations and redeemed one-time tokens (SHA-256 hashes only) persist under
 again after a restart, revoked ones are not, and a token redeemed before a
 restart stays refused even while it is still listed in the config.
 
-`ndn-fwd init --profile hub --namespace /<ns> [--node-name <name>]` also mints
-the hub node's own identity `/<ns>/<name>` (default `hub`; key
-`/<ns>/<name>/KEY/node`, cert issued by the root, signed copy at
-`<pib_path>/ca/node-cert.data`) and prints the `[security]` lines that load
-it (`identity = "/<ns>/<name>"`, `pib_path = "<pib>"`); without them the
+`ndn-fwd init --profile hub --namespace /<ns> [--device <name>]` also mints
+the primary device's admin identity `/<ns>/admin/<device>` (default device
+name: the host name, lowercased, first label, disallowed characters as `-`;
+`KEY`, `CA` and the role words are refused; key
+`/<ns>/admin/<device>/KEY/device`, cert issued by the CA, signed copy at
+`<pib_path>/ca/device-cert.data`), stores the root-signed trust context
+carrying the generated role schema (`ndn-fwd schema show`), and prints the
+`[security]` lines that load the device identity
+(`identity = "/<ns>/admin/<device>"`, `pib_path = "<pib>"`); without them the
 forwarder falls back to an ephemeral key. Init never edits config files.
+
+A PIB-backed CA whose identity is `/<ns>/CA`, certified by the hub root
+`/<ns>/KEY/…`, serves the personal network `/<ns>`: it issues only device keys
+`/<ns>/<role>/<device>/KEY/<id>` (role `admin`, `member`, `node`, `guest`);
+`admin` and `node` certs need a `device-approval`, tokens admit members and —
+when guest-scoped — guests (`ndn_cert::RolePolicy`; see
+[NDNCERT setup](../guides/ndncert-setup.md#roles-in-a-personal-network)). An
+ephemeral CA keeps issuing any challenge-passing name.
 
 `[[demo_ca.challenge]]` — explicit challenge set (replaces the `tokens`
 shortcut). Each entry has `kind = "nop"|"token"|"pin"|"email"|"device-approval"`.
@@ -153,7 +165,8 @@ request until it is approved or denied over mgmt
 `/<prefix>/CA/APPROVE-FEED` that validates against the node's trust contexts;
 all three share one pending-approval store.
 `[demo_ca.require_attestation]` (`prefix`/`kind`/`require_signed`) gates
-issuance on a challenge attestation. `possession`/`yubikey` are wired in code.
+issuance on a challenge attestation (on a hub CA, on top of the role layout).
+`possession`/`yubikey` are wired in code.
 
 ## `[log]` — log filter
 

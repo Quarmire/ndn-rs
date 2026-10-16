@@ -11,7 +11,9 @@
 //!
 //! A component is a quoted **literal** (`"KEY"`) or a **pattern variable** (`_name`, or `_`
 //! anonymous); an unquoted bareword is a **compile error** (it would silently change the
-//! trust graph on a typo). `<=` lists the rules whose keys may sign data matching this
+//! trust graph on a typo). A literal is one name component in NDN URI form, as in
+//! python-ndn: `"KEY"` is generic, `"32=trust-context"` a keyword component, `"v=1"` a
+//! version. `<=` lists the rules whose keys may sign data matching this
 //! rule. Example:
 //!
 //! ```text
@@ -20,10 +22,13 @@
 //! #doc:   /"ndn"/_site/"doc"/_name/"KEY"/_/_/_  <= #admin
 //! ```
 //!
-//! Each rule lowers to a chain of nodes from the shared start: a literal is a value edge,
-//! a variable a pattern edge. Signing relations become the data node's key-node
-//! constraints. The result round-trips through [`LvsModel::decode`], so the evaluator and
-//! the user-function dispatch seam (`$eq`, …) apply unchanged.
+//! Each rule lowers to a chain of nodes from the shared start: a literal is a value edge
+//! (shared between rules with the same literal prefix), a variable a pattern edge (never
+//! shared). Signing relations become the data node's key-node
+//! constraints, and each rule's terminal node carries the rule id as its rule name
+//! (so [`LvsModel::to_text`] and `explain` can say which rule matched). The result
+//! round-trips through [`LvsModel::decode`], so the evaluator and the user-function
+//! dispatch seam (`$eq`, …) apply unchanged.
 //!
 //! **Deferred** (compile errors / not yet lowered): inline constraints (`& {...}` /
 //! `$eq(...)` in source — the *runtime* supports user functions, the compiler doesn't emit
@@ -31,6 +36,7 @@
 //! cross-pattern tag equality. These are additive; the core hierarchical schema compiles.
 
 use bytes::BytesMut;
+use ndn_packet::{Name, NameComponent};
 use ndn_tlv::TlvWriter;
 
 use crate::lvs::{LVS_VERSION, LvsError, LvsModel, type_number as tn};
@@ -51,7 +57,7 @@ pub enum LvsCompileError {
 
 /// One parsed component of a rule's name pattern.
 enum Comp {
-    Literal(Vec<u8>),
+    Literal(NameComponent),
     /// A pattern variable; `Some(name)` is captured (a tag symbol), `None` is anonymous.
     Var(Option<String>),
 }
@@ -141,7 +147,13 @@ fn parse(source: &str) -> Result<Vec<Rule>, LvsCompileError> {
 fn parse_comp(seg: &str) -> Option<Comp> {
     if let Some(inner) = seg.strip_prefix('"') {
         let lit = inner.strip_suffix('"')?;
-        return Some(Comp::Literal(lit.as_bytes().to_vec()));
+        // Exactly one component in NDN URI form (`"a/b"` cannot occur: patterns are split
+        // on `/` first).
+        let name: Name = format!("/{lit}").parse().ok()?;
+        let [comp] = name.components() else {
+            return None;
+        };
+        return Some(Comp::Literal(comp.clone()));
     }
     if let Some(name) = seg.strip_prefix('_') {
         return Some(Comp::Var((!name.is_empty()).then(|| name.to_string())));
@@ -156,10 +168,11 @@ fn parse_comp(seg: &str) -> Option<Comp> {
 /// requires).
 #[derive(Default)]
 struct NodeB {
-    value_edges: Vec<(Vec<u8>, u64)>, // (literal bytes, dest id)
-    pattern_edges: Vec<u64>,          // dest id (tag assigned at emit by position)
-    pattern_tags: Vec<u64>,           // parallel to pattern_edges: the tag id
-    key_nodes: Vec<u64>,              // sign constraints (signer terminal node ids)
+    rule_names: Vec<String>,
+    value_edges: Vec<(NameComponent, u64)>, // (literal component, dest id)
+    pattern_edges: Vec<u64>,                // dest id (tag assigned at emit by position)
+    pattern_tags: Vec<u64>,                 // parallel to pattern_edges: the tag id
+    key_nodes: Vec<u64>,                    // sign constraints (signer terminal node ids)
 }
 
 fn lower(rules: &[Rule]) -> Result<Vec<u8>, LvsCompileError> {
@@ -168,10 +181,23 @@ fn lower(rules: &[Rule]) -> Result<Vec<u8>, LvsCompileError> {
     let mut next_tag: u64 = 0;
     let mut tag_symbols: Vec<(u64, String)> = Vec::new(); // named pattern vars
 
-    // Pass 1: one linear chain per rule from the shared start node.
+    // Pass 1: one chain per rule from the shared start node. Literal steps are
+    // shared between rules (a trie: `/"ns"/"KEY"` and `/"ns"/"CA"` share the
+    // `"ns"` node), which keeps the binary small without changing what any name
+    // reaches; variable steps are never shared, so every pattern variable keeps
+    // its own tag.
     for rule in rules {
         let mut cur = 0u64;
         for comp in &rule.pattern {
+            if let Comp::Literal(v) = comp
+                && let Some((_, dest)) = nodes[cur as usize]
+                    .value_edges
+                    .iter()
+                    .find(|(existing, _)| existing == v)
+            {
+                cur = *dest;
+                continue;
+            }
             let dest = nodes.len() as u64;
             nodes.push(NodeB::default());
             match comp {
@@ -188,6 +214,7 @@ fn lower(rules: &[Rule]) -> Result<Vec<u8>, LvsCompileError> {
             cur = dest;
         }
         terminal.insert(rule.id.as_str(), cur);
+        nodes[cur as usize].rule_names.push(rule.id.clone());
     }
 
     // Pass 2: resolve signing relations to the signer rules' terminal nodes.
@@ -217,6 +244,9 @@ fn emit(nodes: &[NodeB], tag_count: u64, tag_symbols: &[(u64, String)]) -> Vec<u
     for (id, node) in nodes.iter().enumerate() {
         let mut nb = BytesMut::new();
         write_uint(&mut nb, tn::NODE_ID, id as u64);
+        for rule in &node.rule_names {
+            write_tlv(&mut nb, tn::IDENTIFIER, rule.as_bytes());
+        }
         for (value, dest) in &node.value_edges {
             let mut ve = BytesMut::new();
             write_uint(&mut ve, tn::NODE_ID, *dest);
@@ -264,13 +294,11 @@ fn write_uint(buf: &mut BytesMut, typ: u64, value: u64) {
     write_tlv(buf, typ, &be);
 }
 
-/// `COMPONENT_VALUE` wraps a full GenericNameComponent TLV (`0x08 len value`).
-fn write_component_value(buf: &mut BytesMut, value: &[u8]) {
-    let mut nc = Vec::with_capacity(2 + value.len());
-    nc.push(0x08);
-    nc.push(value.len() as u8);
-    nc.extend_from_slice(value);
-    write_tlv(buf, tn::COMPONENT_VALUE, &nc);
+/// `COMPONENT_VALUE` wraps a full NameComponent TLV (`type len value`).
+fn write_component_value(buf: &mut BytesMut, value: &NameComponent) {
+    let mut nc = TlvWriter::new();
+    nc.write_tlv(value.typ, &value.value);
+    write_tlv(buf, tn::COMPONENT_VALUE, &nc.finish());
 }
 
 #[cfg(test)]
@@ -334,6 +362,44 @@ mod tests {
             matches!(bareword, LvsCompileError::Syntax { .. }),
             "bareword must error"
         );
+    }
+
+    #[test]
+    fn literals_are_uri_components_and_rules_are_named() {
+        let src = r#"
+            #root: /"net"/"KEY"/_k
+            #ctx:  /"net"/"32=trust-context"/_v <= #root
+        "#;
+        let model = compile(src).expect("compiles");
+        let root = n("/net/KEY/r");
+        // The keyword literal matches the typed RDR component, not a generic lookalike.
+        let ctx = Name::from_components([
+            NameComponent::generic(bytes::Bytes::from_static(b"net")),
+            NameComponent::keyword(bytes::Bytes::from_static(b"trust-context")),
+            NameComponent::version(1),
+        ]);
+        assert!(model.check(&ctx, &root));
+        assert!(!model.check(&n("/net/trust-context/v=1"), &root));
+
+        let (data_node, key_node) = model
+            .matching_pair(&ctx, &root, &crate::lvs::UserFnRegistry::new())
+            .unwrap();
+        assert_eq!(model.node_label(data_node), "#ctx");
+        assert_eq!(model.node_label(key_node), "#root");
+        assert_eq!(
+            model.node_pattern(data_node).as_deref(),
+            Some("/\"net\"/\"keyword=trust-context\"/_v")
+        );
+
+        // The rendered text is source the compiler accepts, with the same verdicts.
+        let text = model.to_text();
+        assert_eq!(
+            text,
+            "#root: /\"net\"/\"KEY\"/_k\n#ctx: /\"net\"/\"keyword=trust-context\"/_v <= #root\n"
+        );
+        let again = compile(&text).expect("rendered text recompiles");
+        assert!(again.check(&ctx, &root));
+        assert!(!again.check(&root, &root));
     }
 
     #[test]

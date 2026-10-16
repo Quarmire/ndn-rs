@@ -587,14 +587,21 @@ pinned fingerprint, so a tampered context (e.g. a widened schema riding a
 genuine anchor) is refused — adoption is never automatic, and unsigned legacy
 content is adopted only through the explicit `adopt_unsigned_legacy_with_tofu`
 opt-in. `ndn-fwd init --profile hub` (`ndn_cert::init_hub_in_pib`) keeps the
-root key, the CA identity `<ns>/CA`, the hub node's own root-certified
-identity `<ns>/<node-name>` and the root-signed context in the node's
-PIB; adopted contexts persist as `<pib>/contexts/<hex(ns)>.tc` (signed Data)
-and the forwarder re-verifies and loads them into its keyring at startup. The chain walk
+root key, the CA identity `<ns>/CA` (root-certified), the primary device's
+CA-certified admin identity `<ns>/admin/<device>` and the root-signed context
+in the node's PIB; adopted contexts persist as `<pib>/contexts/<hex(ns)>.tc`
+(signed Data) and the forwarder re-verifies and loads them into its keyring at
+startup. The hub context carries the generated personal-network schema
+(`ndn_cert::roles::network_schema`: names carry roles, `<ns>/<role>/<device>`)
+as an LVS blob plus a native-text blob, OR'd (a context may carry several
+`TrustSchemaBlob`s, at most one LVS), and is **schema-authoritative**
+(`SignedTrustContext::schema_authoritative`, flag TLV `0x041C`): no hierarchy
+floor, and the chain walk checks the schema on every certificate hop, not only
+the first signature. The chain walk
 also honours a context's `revocations`, so an issuing-CA compromise is
 contained by a pulled context bump (no re-bootstrap). Fleet nodes receive those
 bumps via `ndn_identity::context_sync`, which carries the context's own
-`encode_content()` bytes over SVS (revocations, enrollment hint and schema blob
+`encode_content()` bytes over SVS (revocations, enrollment hint and schema blobs
 verbatim) and adopts them into the `Keyring`.
 
 ## Routing

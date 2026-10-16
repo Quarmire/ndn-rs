@@ -52,20 +52,34 @@ directory. A super node never holds the root.
 ## 4. Generated trust schema
 
 Produced from the role layout; carried in the context as LVS binary (portable
-to ndnd/NDNts/python-ndn) with a native-text twin for inspection.
+to ndnd/NDNts/python-ndn) with a native-text twin for the rules LVS cannot
+express (**have**: `ndn_cert::roles::network_schema`, emitted by `init`).
 
 ```
-/<ns>/CA/KEY/<k>                     signed by  /<ns>/KEY/root
+/<ns>/KEY/<k>, /<ns>/32=trust-context/<v>  signed by  /<ns>/KEY/<k>        (root)
+/<ns>/CA/KEY/<k>                     signed by  /<ns>/KEY/<k>           (the root)
 /<ns>/<role>/<dev>/KEY/<k>           signed by  /<ns>/CA/KEY/<k>        role ∈ {admin, member, node, guest}
-/<ns>/<role>/<dev>/<**data>          signed by  /<ns>/<role>/<dev>/KEY/<k>   (devices publish under their own name)
-<CA cert>/ndncert-approve/<id>       signed by  /<ns>/admin/<dev>/KEY/<k>    (only admins approve)
+/<ns>/<role>/<dev>/<**data>          signed by  /<ns>/<role>/<dev>/KEY/<k>   (devices publish under their own name, never under their KEY subtree)
+/<ns>/CA/<**data>                    signed by  /<ns>/CA/KEY/<k>        (CA service data: INFO, NEW, …)
+<requested key>/ndncert-approve/<id> signed by  /<ns>/admin/<dev>/KEY/<k>    (only admins approve; the name is the requester's key name, which binds the approval to that request)
 /<ns>/shared/<**data>                signed by  /<ns>/{admin,member}/<dev>/KEY/<k>
 ```
 
-A tool (`ndn-fwd schema show|explain <data-name> <key-name>`) renders the
-schema and answers "would this be accepted, and by which rule". Hand-written
-schemas remain possible (native rules or LVS text via `compile_lvs`); the
-generated one is the default.
+The fixed-shape rows (root, context, CA and device keys, approvals) are LVS.
+The `<**data>` rows are native rules OR'd with it: LVS patterns are
+fixed-length, and "the device's own key" needs data/key tag equality, which the
+in-tree compiler does not lower nor the evaluator check. Signers are key names
+(`…/KEY/<k>`), as ndn-rs signs and names certificates. The context is
+*schema-authoritative*: no hierarchy floor (approvals and `shared` are
+cross-identity by design) and the schema is checked on every certificate hop,
+so a device cannot self-issue keys. For a short namespace the inline anchor
+envelope still fits one QR code (≤ 2953 bytes); long namespaces exceed it until
+fingerprint-pointer envelopes land (F2 **gap**).
+
+A tool (`ndn-fwd schema show|explain <data-name> <key-name>`, **have**)
+renders the schema and answers "would this be accepted, and by which rule".
+Hand-written schemas remain possible (native rules or LVS text via
+`compile_lvs`); the generated one is the default.
 
 ## 5. Flows
 
@@ -73,16 +87,19 @@ Each flow lists steps, what is stored where, failure handling, and status
 (**have** = implemented, **gap** = to build).
 
 ### F1 Set up a network (primary device)
-1. `ndn-fwd init --profile hub --namespace /<ns>` → root, CA, node identity,
-   root-signed context in the PIB (**have**). Gap: emit the generated schema
-   instead of `hierarchical`; record the primary device as `/<ns>/admin/<dev>`.
+1. `ndn-fwd init --profile hub --namespace /<ns> [--device <name>]` → root, CA,
+   the primary device as `/<ns>/admin/<dev>` (CA-certified; device name
+   defaults to the sanitized host name), root-signed context carrying the
+   generated schema, all in the PIB (**have**).
 2. Recovery kit offered immediately (F7). The owner may decline; the UI keeps
    reminding until one exists.
 3. Optional: delegate the CA to a super node (F3).
 
 ### F2 Add a device
-- **By invite (token):** an admin creates an invite (`ndn-fwd-tokens new`,
-  **have**) → QR/link carries CA prefix, namespace, token, anchor pin. New
+- **By invite (token):** an admin creates an invite (`ndn-fwd-tokens new
+  --role member|guest`, **have**; the token carries its role and the CA
+  scopes it to `/<ns>/<role>`) → QR/link carries CA prefix, namespace, token,
+  anchor pin. New
   device: `join <invite>` = fetch the context by name, check it against the
   pin, adopt, enroll with the token (**gap**: single `join` command/FFI call;
   fetch-by-fingerprint).
@@ -90,8 +107,10 @@ Each flow lists steps, what is stored where, failure handling, and status
   `device-approval`; an admin sees the pending request (`ca list-approvals`)
   and approves on an admin device (**have** in daemon; **gap**: approve from a
   remote admin device, not only the CA host's mgmt socket).
-- Role: invite/approval states `member` or `admin`; issuing an admin cert
-  requires an admin approval, never a token alone.
+- Role: the device enrolls as `/<ns>/<role>/<dev>`; issuing an admin (or
+  super node) cert requires an admin approval, never a token alone; tokens
+  admit members, and guests only when guest-scoped (**have**:
+  `ndn_cert::RolePolicy`, the default for a hub CA in `[demo_ca]`).
 
 ### F3 Delegate the CA to a super node
 1. Super node generates `/<ns>/CA` key locally; produces a cert request.
@@ -166,7 +185,7 @@ $XDG_STATE_HOME/ndn-fwd/tls/   persistent self-signed listener certs
 
 ## 7. Build order
 
-1. Generated schema + role naming in `init` and enrollment (F1, F2 roles).
+1. Generated schema + role naming in `init` and enrollment (F1, F2 roles) — **have**.
 2. `join` (fetch-by-fingerprint + adopt + enroll) and remote admin approval (F2).
 3. `devices list|revoke` + context bump/publish (F4, F5).
 4. Recovery kit formats + `recover` (F7, F8).
