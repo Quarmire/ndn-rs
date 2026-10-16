@@ -39,7 +39,10 @@ directory. A super node never holds the root.
 
 - **Trust context** — `SignedTrustContext`, root-signed Data at
   `/<ns>/32=trust-context/v=N`: anchors, schema, CA endpoints, revocations.
-  Distributed by envelope (first contact) and `context_sync` (updates).
+  Distributed by envelope (first contact), by name over RDR (any `ndn-fwd`
+  publishes the contexts in its store, **have**: see
+  `docs/wiki/src/reference/trust-context-publication.md`) and `context_sync`
+  (updates).
 - **Envelope** — `ndn-trust://` (`ndn-trust-envelope`): `anchor` (signed
   context or fingerprint pointer), `invite` (CA prefix + namespace + token +
   anchor pin), `capability`, `delegation`, `recovery`, `bag`.
@@ -101,8 +104,12 @@ Each flow lists steps, what is stored where, failure handling, and status
   scopes it to `/<ns>/<role>`) → QR/link carries CA prefix, namespace, token,
   anchor pin. New
   device: `join <invite>` = fetch the context by name, check it against the
-  pin, adopt, enroll with the token (**gap**: single `join` command/FFI call;
-  fetch-by-fingerprint).
+  pin, adopt, enroll with the token (**have**: fetch by name,
+  `ndn_cert::fetch_context` + `adopt_with_tofu`, served by `ndn-fwd`;
+  **gap**: fingerprint-only envelope adoption (`adopt` CLI/FFI), a joiner's
+  own validating forwarder passing the not-yet-trusted context Data, the
+  daemon picking up a newly adopted context without a restart, and the
+  single `join` command/FFI call).
 - **By approval:** new device scans the anchor QR, requests enrollment with
   `device-approval`; an admin sees the pending request (`ca list-approvals`)
   and approves on an admin device (**have** in daemon; **gap**: approve from a
@@ -177,7 +184,8 @@ depends on inbound reachability.
 
 ```
 <pib>/                FilePib keys + certs (default); ndnsec-compat may read ~/.ndn
-<pib>/contexts/*.tc   adopted signed contexts (loaded at startup, re-verified)
+<pib>/contexts/*.tc   adopted signed contexts (loaded at startup, re-verified,
+                      published by name unless [security] serve_contexts = false)
 <pib>/ca/             CA cert, anchor cert, node cert, issued/, revoked/,
                       redeemed-tokens/   (CA hosts only)
 $XDG_STATE_HOME/ndn-fwd/tls/   persistent self-signed listener certs

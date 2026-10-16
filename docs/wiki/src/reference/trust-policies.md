@@ -115,7 +115,10 @@ Onboarding (`ndn-cert`) splits into *adopt-to-verify* (anchor + schema to
 verify data; free, pinned by the anchor fingerprint in an `ndn-trust://anchor`
 envelope) and
 *enroll-to-be-verified* (a cert to produce, gated by NDNCERT challenges;
-see [NDNCERT setup](../guides/ndncert-setup.md)).
+see [NDNCERT setup](../guides/ndncert-setup.md)). A node publishes the
+contexts it holds by name, so a device holding only the fingerprint can fetch
+one and adopt it; see
+[Trust-context publication](./trust-context-publication.md).
 
 ## See also
 

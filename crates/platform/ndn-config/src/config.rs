@@ -1473,7 +1473,7 @@ impl Default for MgmtSecurityConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SecurityConfig {
     /// Identity name (e.g. `/home/bob/router`); its signing key is the one
@@ -1541,6 +1541,43 @@ pub struct SecurityConfig {
 
     #[serde(default)]
     pub mgmt: MgmtSecurityConfig,
+
+    /// Publish every trust context stored in `<pib_path>/contexts/` (the
+    /// node's own hub context included) by name over RDR:
+    /// `/<ns>/32=trust-context/32=metadata` → the newest version's name,
+    /// `/<ns>/32=trust-context/v=<N>` → the stored signed Data verbatim.
+    /// Contexts are public (anchors, schema, CA endpoints); default `true`.
+    #[serde(default = "default_serve_contexts")]
+    pub serve_contexts: bool,
+}
+
+fn default_serve_contexts() -> bool {
+    true
+}
+
+/// An absent `[security]` block: zero values, except `serve_contexts`, which
+/// defaults on as it does in TOML.
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            identity: None,
+            pib_path: None,
+            trust_anchor: None,
+            require_signed: false,
+            auto_init: false,
+            profile: String::new(),
+            validator_enabled: false,
+            ca_prefix: None,
+            ca_info: String::new(),
+            ca_max_validity_days: 0,
+            ca_challenges: Vec::new(),
+            rules: Vec::new(),
+            pib_type: String::new(),
+            ephemeral_prefix: None,
+            mgmt: MgmtSecurityConfig::default(),
+            serve_contexts: default_serve_contexts(),
+        }
+    }
 }
 
 fn default_pib_type() -> String {

@@ -101,6 +101,12 @@ cost = 100        # optional
 | `discovery_transport` | `udp` | `udp`, `ether`, `both`. |
 | `interval_ms` | `5000` | HELLO interval. |
 
+## `[security]` — trust-context publication
+
+| Key | Default | Use |
+|---|---|---|
+| `serve_contexts` | `true` | Publish every trust context in `<pib_path>/contexts/` by name over RDR: `/<ns>/32=trust-context/32=metadata` names the stored version, `/<ns>/32=trust-context/v=<N>` returns the stored signed Data verbatim. Read at startup. See [Trust-context publication](../reference/trust-context-publication.md). |
+
 ## `[demo_ca]` — embedded NDNCERT CA
 
 Off by default; `enabled = true` runs an in-process CA serving

@@ -89,6 +89,24 @@ pub fn load_persisted_contexts(
     pib_root: &Path,
     keyring: &Keyring,
 ) -> Result<Vec<(PathBuf, Result<Arc<SignedTrustContext>, ContextStoreError>)>, ContextStoreError> {
+    Ok(read_stored_contexts(pib_root)?
+        .into_iter()
+        .map(|(path, stored)| {
+            let result = stored.and_then(|(ctx, _data)| Ok(adopt_into(keyring, ctx)?));
+            (path, result)
+        })
+        .collect())
+}
+
+/// Read and re-verify every stored context under `pib_root` without adopting
+/// it: one entry per `*.tc` file (sorted by path) with the decoded context and
+/// its signed Data exactly as stored, or why that file was refused. A missing
+/// store directory yields an empty list. This is what a node publishes
+/// (byte-identical Data, never re-signed).
+pub fn read_stored_contexts(
+    pib_root: &Path,
+) -> Result<Vec<(PathBuf, Result<(SignedTrustContext, Data), ContextStoreError>)>, ContextStoreError>
+{
     let dir = pib_root.join(CONTEXTS_DIR);
     let entries = match std::fs::read_dir(&dir) {
         Ok(entries) => entries,
@@ -103,17 +121,16 @@ pub fn load_persisted_contexts(
     Ok(paths
         .into_iter()
         .map(|path| {
-            let result = load_one(pib_root, &path, keyring);
+            let result = read_one(pib_root, &path);
             (path, result)
         })
         .collect())
 }
 
-fn load_one(
+fn read_one(
     pib_root: &Path,
     path: &Path,
-    keyring: &Keyring,
-) -> Result<Arc<SignedTrustContext>, ContextStoreError> {
+) -> Result<(SignedTrustContext, Data), ContextStoreError> {
     let wire = std::fs::read(path).map_err(|source| ContextStoreError::Io {
         path: path.to_path_buf(),
         source,
@@ -124,8 +141,8 @@ fn load_one(
     })?;
     // Re-verify against the context's own anchors (the out-of-band pin was
     // checked on first adoption), and check the file is stored under its own
-    // namespace *before* touching the keyring, so a context copied over
-    // another namespace's file is refused.
+    // namespace *before* anyone trusts or publishes it, so a context copied
+    // over another namespace's file is refused.
     let (ctx, _signer) = open_signed_context(&data)?;
     if context_file_path(pib_root, ctx.namespace()) != path {
         return Err(ContextStoreError::Misfiled {
@@ -133,7 +150,7 @@ fn load_one(
             namespace: ctx.namespace().to_string(),
         });
     }
-    Ok(adopt_into(keyring, ctx)?)
+    Ok((ctx, data))
 }
 
 /// `ndn-fwd adopt`'s one-shot: TOFU-adopt the context carried inline by an
@@ -181,5 +198,34 @@ mod tests {
                 .is_empty()
         );
         assert!(keyring.is_empty());
+    }
+
+    /// What a node publishes is exactly the stored signed Data; a damaged file
+    /// is refused with a reason, not published.
+    #[test]
+    fn stored_context_reads_back_byte_identical_and_damage_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let ns: Name = "/home/bob".parse().unwrap();
+        let hub = crate::hub::init_hub(&ndn_security::SecurityManager::new(), &ns).unwrap();
+        let path = persist_context(dir.path(), &hub.context, &hub.context_data).unwrap();
+
+        let stored = read_stored_contexts(dir.path()).unwrap();
+        assert_eq!(stored.len(), 1);
+        let (ctx, data) = stored[0].1.as_ref().unwrap();
+        assert_eq!(data.raw(), hub.context_data.raw());
+        assert_eq!(ctx.namespace(), &ns);
+
+        let mut wire = hub.context_data.raw().to_vec();
+        let last = wire.len() - 1;
+        wire[last] ^= 0xff; // flip a signature byte
+        std::fs::write(&path, &wire).unwrap();
+        let stored = read_stored_contexts(dir.path()).unwrap();
+        assert!(matches!(
+            stored[0].1,
+            Err(ContextStoreError::Adopt(AdoptError::BadSignature(_)))
+        ));
+        std::fs::write(&path, &wire[..wire.len() / 2]).unwrap();
+        let stored = read_stored_contexts(dir.path()).unwrap();
+        assert!(matches!(stored[0].1, Err(ContextStoreError::BadData { .. })));
     }
 }

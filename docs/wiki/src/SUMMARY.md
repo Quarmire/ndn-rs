@@ -74,6 +74,7 @@
 - [NDN over BLE — GATT profile](./reference/ndn-ble-gatt-profile.md)
 - [Management verbs](./reference/mgmt-verbs.md)
 - [Trust policies](./reference/trust-policies.md)
+- [Trust-context publication (RDR)](./reference/trust-context-publication.md)
 - [Dashboard extensions](./reference/dashboard-extensions.md)
 - [Spec compliance](./reference/spec-compliance.md)
 

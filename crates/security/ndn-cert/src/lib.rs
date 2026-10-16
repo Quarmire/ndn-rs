@@ -39,15 +39,16 @@ pub use ecdh::{EcdhKeypair, SessionKey};
 pub use error::CertError;
 pub use context_store::{
     ContextStoreError, adopt_envelope_into_store, context_file_path, load_persisted_contexts,
-    persist_context,
+    persist_context, read_stored_contexts,
 };
 pub use hub::{
     HubInit, HubInitError, PersistedHub, ValidityMode, ca_key_name, device_key_name, init_hub,
     init_hub_in_pib, root_key_name,
 };
 pub use onboarding::{
-    AdoptError, AdvertConfig, AnchorAdvert, adopt_anchor_envelope, adopt_unsigned_legacy_with_tofu,
-    adopt_with_tofu, anchor_fingerprint, open_signed_context, rdr_metadata_name,
+    AdoptError, AdvertConfig, AnchorAdvert, FetchContextError, adopt_anchor_envelope,
+    adopt_unsigned_legacy_with_tofu, adopt_with_tofu, anchor_fingerprint, context_pointer,
+    fetch_context, open_signed_context, rdr_metadata_name, rdr_prefix,
 };
 pub use policy::{
     AcceptAllIssuance, DelegationPolicy, HierarchicalPolicy, IssuanceContext, IssuanceDecision,

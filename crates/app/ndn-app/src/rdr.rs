@@ -50,13 +50,16 @@ const TLV_METADATA_SIZE: u64 = 0xf502;
 /// ⇒ classic per-segment signing.
 const TLV_METADATA_SEGMENT_HASHES: u64 = 0xf504;
 
-/// `versioned_name` is the segment prefix (`<name>/v=<ver>`);
-/// `final_block_id` is the last-segment NameComponent's wire bytes
-/// (typically `0x32 <len> <NNI>`).
+/// RDR metadata content. Per the spec the only required field is the
+/// versioned Name (`<name>/v=<ver>`): a single-Data object (e.g. a signed
+/// trust context) is announced Name-only and the consumer fetches that exact
+/// name. Segmented objects add `final_block_id` — the last-segment
+/// NameComponent's wire bytes (typically `0x32 <len> <NNI>`) — and the
+/// optional size fields.
 #[derive(Clone, Debug)]
 pub struct MetaData {
     pub versioned_name: Name,
-    pub final_block_id: Bytes,
+    pub final_block_id: Option<Bytes>,
     pub segment_size: Option<u64>,
     pub size: Option<u64>,
     /// FLIC manifest: ordered per-segment SHA-256 hashes. `Some` ⇒ aggregated
@@ -68,7 +71,7 @@ impl Default for MetaData {
     fn default() -> Self {
         Self {
             versioned_name: Name::root(),
-            final_block_id: Bytes::new(),
+            final_block_id: None,
             segment_size: None,
             size: None,
             segment_hashes: None,
@@ -79,9 +82,12 @@ impl Default for MetaData {
 impl MetaData {
     pub fn encode(&self) -> Bytes {
         let name_tlv = self.versioned_name.encode_to_tlv();
-        let mut w = TlvWriter::with_capacity(64 + name_tlv.len() + self.final_block_id.len());
+        let fbi_len = self.final_block_id.as_ref().map_or(0, |f| f.len());
+        let mut w = TlvWriter::with_capacity(64 + name_tlv.len() + fbi_len);
         w.write_raw(&name_tlv);
-        w.write_tlv(TLV_METADATA_FINAL_BLOCK_ID, &self.final_block_id);
+        if let Some(fbi) = &self.final_block_id {
+            w.write_tlv(TLV_METADATA_FINAL_BLOCK_ID, fbi);
+        }
         if let Some(seg_size) = self.segment_size {
             let nni = encode_nni_be(seg_size);
             w.write_tlv(TLV_METADATA_SEGMENT_SIZE, &nni);
@@ -149,8 +155,6 @@ impl MetaData {
         }
         let versioned_name =
             versioned_name.ok_or_else(|| AppError::Protocol("metadata missing Name".into()))?;
-        let final_block_id = final_block_id
-            .ok_or_else(|| AppError::Protocol("metadata missing FinalBlockID".into()))?;
         Ok(Self {
             versioned_name,
             final_block_id,
@@ -161,10 +165,10 @@ impl MetaData {
     }
 
     /// Recognises `SegmentNameComponent` (0x32 + NNI) and generic
-    /// `NameComponent` (0x08 + ASCII-decimal); `None` on malformed
-    /// FinalBlockID.
+    /// `NameComponent` (0x08 + ASCII-decimal); `None` when FinalBlockID is
+    /// absent (Name-only metadata) or malformed.
     pub fn last_segment(&self) -> Option<u64> {
-        let fbi = self.final_block_id.as_ref();
+        let fbi = self.final_block_id.as_deref()?;
         if fbi.len() < 2 {
             return None;
         }
@@ -464,7 +468,7 @@ impl PreparedObject {
         fbi.extend_from_slice(&nni);
         let meta = MetaData {
             versioned_name: versioned_name.clone(),
-            final_block_id: fbi.freeze(),
+            final_block_id: Some(fbi.freeze()),
             segment_size: Some(chunk_size as u64),
             size: Some(size),
             segment_hashes,
@@ -589,7 +593,7 @@ mod tests {
         fbi.extend_from_slice(&fbi_nni);
         let m = MetaData {
             versioned_name: versioned.clone(),
-            final_block_id: Bytes::from(fbi),
+            final_block_id: Some(Bytes::from(fbi)),
             segment_size: Some(8192),
             size: Some(24000),
             segment_hashes: None,
@@ -600,6 +604,37 @@ mod tests {
         assert_eq!(m2.last_segment(), Some(3));
         assert_eq!(m2.segment_size, Some(8192));
         assert_eq!(m2.size, Some(24000));
+    }
+
+    /// RDR spec form for a single-Data object: content is just the versioned
+    /// Name. Encode must not emit a FinalBlockID and decode must accept it.
+    #[test]
+    fn name_only_metadata_roundtrip() {
+        let versioned: Name = "/home/bob/32=trust-context"
+            .parse::<Name>()
+            .unwrap()
+            .append_version(3);
+        let m = MetaData {
+            versioned_name: versioned.clone(),
+            ..MetaData::default()
+        };
+        let wire = m.encode();
+        assert_eq!(wire, versioned.encode_to_tlv(), "content is exactly the Name TLV");
+        let m2 = MetaData::decode(wire).unwrap();
+        assert_eq!(m2.versioned_name, versioned);
+        assert_eq!(m2.final_block_id, None);
+        assert_eq!(m2.last_segment(), None);
+        assert_eq!(m2.segment_size, None);
+        assert_eq!(m2.size, None);
+    }
+
+    #[test]
+    fn metadata_without_name_is_refused() {
+        let mut w = TlvWriter::new();
+        w.write_tlv(TLV_METADATA_SIZE, &encode_nni_be(5));
+        assert!(MetaData::decode(w.finish()).is_err());
+        assert!(MetaData::decode(Bytes::new()).is_err());
+        assert!(MetaData::decode(Bytes::from_static(&[0x07, 0x05, 0x08])).is_err());
     }
 
     #[test]
@@ -635,7 +670,7 @@ mod tests {
         fbi.extend_from_slice(&fbi_nni);
         let m = MetaData {
             versioned_name: "/f".parse::<Name>().unwrap().append_version(1),
-            final_block_id: Bytes::from(fbi),
+            final_block_id: Some(Bytes::from(fbi)),
             segment_size: Some(8192),
             size: Some(0x12_3456), // 1,193,046 bytes
             segment_hashes: None,
@@ -717,7 +752,7 @@ mod tests {
                 let nni = encode_nni_be(2);
                 let mut fbi = vec![0x32u8, nni.len() as u8];
                 fbi.extend_from_slice(&nni);
-                Bytes::from(fbi)
+                Some(Bytes::from(fbi))
             },
             segment_size: Some(8192),
             size: Some(20000),

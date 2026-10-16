@@ -544,7 +544,7 @@ impl Consumer {
             .await?;
         let last_seg = meta
             .last_segment()
-            .ok_or_else(|| AppError::Protocol("metadata FinalBlockID unparseable".into()))?;
+            .ok_or_else(|| AppError::Protocol("metadata FinalBlockID missing or unparseable".into()))?;
 
         // In-memory reassembly: the sink stashes each segment into `chunks`,
         // joined in order once the window completes.
@@ -639,7 +639,7 @@ impl Consumer {
             .await?;
         let last_seg = meta
             .last_segment()
-            .ok_or_else(|| AppError::Protocol("metadata FinalBlockID unparseable".into()))?;
+            .ok_or_else(|| AppError::Protocol("metadata FinalBlockID missing or unparseable".into()))?;
         self.fetch_segments_windowed(
             &meta.versioned_name,
             last_seg,
@@ -721,7 +721,7 @@ impl Consumer {
             .await?;
         let last_seg = meta
             .last_segment()
-            .ok_or_else(|| AppError::Protocol("metadata FinalBlockID unparseable".into()))?;
+            .ok_or_else(|| AppError::Protocol("metadata FinalBlockID missing or unparseable".into()))?;
         let seg_size = meta.segment_size.unwrap_or(8192);
         self.fetch_segments_windowed(
             &meta.versioned_name,
@@ -1629,7 +1629,7 @@ mod subscription_tests {
                 fbi.extend_from_slice(&nni);
                 let meta = crate::rdr::MetaData {
                     versioned_name: self.versioned.clone(),
-                    final_block_id: Bytes::from(fbi),
+                    final_block_id: Some(Bytes::from(fbi)),
                     segment_size: Some(10),
                     size: Some((self.last_seg + 1) * 10),
                     segment_hashes: None,
