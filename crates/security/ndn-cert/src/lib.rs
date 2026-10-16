@@ -14,6 +14,7 @@ pub mod context_store;
 pub mod ecdh;
 pub mod error;
 pub mod hub;
+pub mod invite;
 pub mod onboarding;
 pub mod policy;
 pub mod protocol;
@@ -44,6 +45,10 @@ pub use context_store::{
 pub use hub::{
     HubInit, HubInitError, PersistedHub, ValidityMode, ca_key_name, device_key_name, init_hub,
     init_hub_in_pib, root_key_name,
+};
+pub use invite::{
+    INVITE_CERT_VALIDITY_SECS, InviteEnrollError, InviteEnrollFailure, InviteEnrollment,
+    InviteLink, IssuedCertificate, enroll_with_invite, ensure_invite_context, new_device_key_name,
 };
 pub use onboarding::{
     AdoptError, AdvertConfig, AnchorAdvert, AnchorLink, CONTEXT_EXPECTATION_TTL,

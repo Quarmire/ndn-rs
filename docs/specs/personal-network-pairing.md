@@ -102,20 +102,20 @@ Each flow lists steps, what is stored where, failure handling, and status
 
 ### F2 Add a device
 - **By invite (token):** an admin creates an invite (`ndn-fwd-tokens new
-  --role member|guest`, **have**; the token carries its role and the CA
-  scopes it to `/<ns>/<role>`) → QR/link carries CA prefix, namespace, token,
-  expected fingerprint. New
-  device: `join <invite>` = fetch the context by name, check it against the
-  expected fingerprint, adopt, enroll with the token (**have**: fetch by
-  name, `ndn_cert::fetch_context`, served by `ndn-fwd`; adoption from a
-  fingerprint-only link by the running daemon, `ndn-fwd adopt` /
-  `security/context-adopt` / `ndn_identity::adopt_anchor_link_via_engine`,
-  with the joiner's forwarder admitting only the expected context while it
-  runs, the version floor from the link, and the daemon trusting, storing and
-  publishing it at once — see `docs/wiki/src/reference/context-adoption.md`;
-  authorized by the management socket's peer credentials
-  (`[security] trust_admin_groups`); **gap**: the single `join`
-  command/FFI call that adopts and enrolls).
+  --role member|guest --anchor-fp <fp>`, **have**; the token carries its role
+  and the CA scopes it to `/<ns>/<role>`) → QR/link carries CA prefix,
+  namespace, token, expected root fingerprint. New device: `ndn-fwd enroll
+  <invite> [--device <name>]` = adopt the trust context by namespace +
+  expected fingerprint if not held (no version floor: an invite names none),
+  generate the device key in the daemon's PIB, enroll with the token, check
+  the issued certificate's chain to the root, store it and make the identity
+  the PIB's default (loaded at start unless `[security] identity` names
+  another), and switch the running daemon's signer (**have**:
+  `ndn_cert::enroll_with_invite`, `ndn_identity::enroll_with_invite_via_engine`,
+  `security/enroll` gated like `security/context-adopt` by the management
+  socket's peer credentials, mobile `NdnEngine::enroll_with_invite` — see
+  `docs/wiki/src/reference/enrollment-by-invite.md`; adoption from a
+  fingerprint-only link: `docs/wiki/src/reference/context-adoption.md`).
 - **By approval:** new device scans the anchor QR, requests enrollment with
   `device-approval`; an admin sees the pending request (`ca list-approvals`)
   and approves on an admin device (**have** in daemon; **gap**: approve from a
@@ -190,6 +190,9 @@ depends on inbound reachability.
 
 ```
 <pib>/                FilePib keys + certs (default); ndnsec-compat may read ~/.ndn
+<pib>/keys/*/cert.data  issued certificate Data, as the CA returned it
+<pib>/default-identity  identity loaded when [security] identity is unset
+                      (set by `ndn-fwd enroll`)
 <pib>/contexts/*.tc   adopted signed contexts (loaded at startup, re-verified,
                       published by name unless [security] serve_contexts = false)
 <pib>/ca/             CA cert, anchor cert, node cert, issued/, revoked/,

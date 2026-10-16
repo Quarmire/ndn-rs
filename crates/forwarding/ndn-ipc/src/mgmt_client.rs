@@ -683,9 +683,9 @@ impl MgmtClient {
         self.dataset(module::SECURITY, verb::CA_REQUESTS).await
     }
 
-    /// `security/context-adopt`: ask the daemon to adopt the network the
-    /// `ndn-trust://anchor` link names (it may fetch the context over the
-    /// network). The command Interest lives `timeout`, and so does the wait;
+    /// `security/context-adopt`: ask the daemon to adopt the trust context
+    /// the `ndn-trust://anchor` link names (it may fetch the context by
+    /// name). The command Interest lives `timeout`, and so does the wait;
     /// the daemon answers within it. Success carries
     /// `ndn_mgmt::AdoptedContextInfo` as JSON in `status_text`; a refusal's
     /// `status_text` says why and what to do instead.
@@ -698,7 +698,44 @@ impl MgmtClient {
             uri: Some(link_uri.to_owned()),
             ..Default::default()
         };
-        let name = command_name(module::SECURITY, verb::CONTEXT_ADOPT, &params);
+        self.deferred_command(verb::CONTEXT_ADOPT, &params, timeout)
+            .await
+    }
+
+    /// `security/enroll`: ask the daemon to enroll `identity`
+    /// (`/<ns>/<role>/<device>`) with the CA the `ndn-trust://invite` link
+    /// names — the daemon generates the key in its PIB, adopts the trust
+    /// context if needed, redeems the token and makes the certified identity
+    /// its default. `force`: enroll although this node already holds a
+    /// certificate in the namespace. The command Interest lives `timeout`,
+    /// and so does the wait. Success carries `ndn_mgmt::EnrollOutcome` as
+    /// JSON in `status_text`; a refusal's `status_text` says why and what to
+    /// do instead.
+    pub async fn security_enroll(
+        &self,
+        invite_uri: &str,
+        identity: &ndn_packet::Name,
+        force: bool,
+        timeout: std::time::Duration,
+    ) -> Result<ControlResponse, ForwarderError> {
+        let params = ControlParameters {
+            uri: Some(invite_uri.to_owned()),
+            name: Some(identity.clone()),
+            flags: force.then_some(verb::ENROLL_FORCE),
+            ..Default::default()
+        };
+        self.deferred_command(verb::ENROLL, &params, timeout).await
+    }
+
+    /// A `security/<verb>` command the daemon answers only after network
+    /// round trips: the Interest lives `timeout` and the wait is as long.
+    async fn deferred_command(
+        &self,
+        verb: &[u8],
+        params: &ControlParameters,
+        timeout: std::time::Duration,
+    ) -> Result<ControlResponse, ForwarderError> {
+        let name = command_name(module::SECURITY, verb, params);
         let interest_wire =
             build_signed_interest_with_lifetime(&self.signing, name, Some(timeout)).await?;
         let _guard = self.recv_lock.lock().await;

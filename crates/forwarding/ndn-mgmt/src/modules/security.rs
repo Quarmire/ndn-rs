@@ -46,6 +46,7 @@ async fn handle_security(
     config: &dyn crate::MgmtConfig,
     is_ephemeral: bool,
     runtime_policy: Option<&Arc<RwLock<MgmtAccessPolicy>>>,
+    signing: Option<crate::SigningIdentityInfo>,
 ) -> ControlResponse {
     // Verbs that don't need the PIB.
     match verb_name {
@@ -58,7 +59,7 @@ async fn handle_security(
         v if v == verb::SCHEMA_LIST => return security_schema_list(engine),
         v if v == verb::SCHEMA_SET => return security_schema_set(params, engine),
         v if v == verb::IDENTITY_STATUS => {
-            return security_identity_status(engine, config, is_ephemeral);
+            return security_identity_status(engine, config, is_ephemeral, signing);
         }
         v if v == verb::POLICY_GET => return security_policy_get(config, runtime_policy),
         v if v == verb::POLICY_SET => {
@@ -279,6 +280,9 @@ impl MgmtModule for SecurityModule {
         if verb == verb::CONTEXT_ADOPT {
             return security_context_adopt(params, ctx.trust_context_handler);
         }
+        if verb == verb::ENROLL {
+            return security_enroll(params, ctx.trust_context_handler);
+        }
         handle_security(
             verb,
             params,
@@ -287,6 +291,8 @@ impl MgmtModule for SecurityModule {
             ctx.config,
             ctx.security_is_ephemeral,
             ctx.runtime_policy,
+            ctx.trust_context_handler
+                .and_then(|backend| backend.signing_identity()),
         )
         .await
         .into()
@@ -300,7 +306,7 @@ impl MgmtModule for SecurityModule {
 /// Success: `200` with [`crate::AdoptedContextInfo`] as JSON status text.
 fn security_context_adopt(
     params: ControlParameters,
-    backend: Option<&Arc<dyn crate::TrustContextMgmtBackend>>,
+    backend: Option<&Arc<dyn crate::TrustAdminMgmtBackend>>,
 ) -> MgmtResponse {
     let Some(backend) = backend else {
         return ControlResponse::error(
@@ -324,6 +330,59 @@ fn security_context_adopt(
     MgmtResponse::Deferred(Box::pin(async move {
         match backend.adopt(link).await {
             Ok(info) => match serde_json::to_string(&info) {
+                Ok(json) => ControlResponse::ok_empty(json),
+                Err(e) => ControlResponse::error(status::SERVER_ERROR, format!("encode: {e}")),
+            },
+            Err(refusal) => ControlResponse::error(refusal.status_code, refusal.reason),
+        }
+    }))
+}
+
+/// `security/enroll`: enroll the identity in `ControlParameters.name` with the
+/// CA the `ndn-trust://invite` link in `ControlParameters.uri` names
+/// ([`verb::ENROLL_FORCE`] in `Flags`: although already enrolled). Already
+/// authorized by the trust-admin peer-credential gate. Answered deferred: it
+/// takes several round trips to the CA. Success: `200` with
+/// [`crate::EnrollOutcome`] as JSON status text.
+fn security_enroll(
+    params: ControlParameters,
+    backend: Option<&Arc<dyn crate::TrustAdminMgmtBackend>>,
+) -> MgmtResponse {
+    let Some(backend) = backend else {
+        return ControlResponse::error(
+            status::NOT_FOUND,
+            "this node does not enroll at runtime: run `ndn-fwd enroll` against an ndn-fwd \
+             daemon",
+        )
+        .into();
+    };
+    let invite_uri = match params.uri {
+        Some(uri) if !uri.trim().is_empty() => uri,
+        _ => {
+            return ControlResponse::error(
+                status::BAD_PARAMS,
+                "enroll needs the ndn-trust://invite link in Uri",
+            )
+            .into();
+        }
+    };
+    let Some(identity) = params.name else {
+        return ControlResponse::error(
+            status::BAD_PARAMS,
+            "enroll needs the identity to enroll (/<namespace>/<role>/<device>) in Name",
+        )
+        .into();
+    };
+    let force = params.flags.unwrap_or(0) & verb::ENROLL_FORCE != 0;
+    let backend = Arc::clone(backend);
+    MgmtResponse::Deferred(Box::pin(async move {
+        let request = crate::EnrollRequest {
+            invite_uri,
+            identity,
+            force,
+        };
+        match backend.enroll(request).await {
+            Ok(outcome) => match serde_json::to_string(&outcome) {
                 Ok(json) => ControlResponse::ok_empty(json),
                 Err(e) => ControlResponse::error(status::SERVER_ERROR, format!("encode: {e}")),
             },
@@ -560,39 +619,66 @@ mod security_v1_handler_tests {
         assert_eq!(set_resp.status_code, status::OK);
     }
 
-    /// Invariant: a context-adopt command without a link, or on a host with
-    /// no adoption backend, is refused without reaching any backend.
+    /// Invariant: a trust-admin command without its link (or identity), or
+    /// on a host with no trust-admin backend, is refused without reaching any
+    /// backend.
     #[test]
-    fn context_adopt_without_link_or_backend_is_refused() {
+    fn trust_admin_verbs_without_parameters_or_backend_are_refused() {
         struct Unreachable;
         #[async_trait]
-        impl crate::TrustContextMgmtBackend for Unreachable {
+        impl crate::TrustAdminMgmtBackend for Unreachable {
             async fn adopt(
                 &self,
                 _: String,
-            ) -> Result<crate::AdoptedContextInfo, crate::AdoptRefusal> {
+            ) -> Result<crate::AdoptedContextInfo, crate::TrustRefusal> {
+                panic!("the backend must not be called");
+            }
+            async fn enroll(
+                &self,
+                _: crate::EnrollRequest,
+            ) -> Result<crate::EnrollOutcome, crate::TrustRefusal> {
                 panic!("the backend must not be called");
             }
         }
-        let backend: Arc<dyn crate::TrustContextMgmtBackend> = Arc::new(Unreachable);
+        let refused = |resp: MgmtResponse| match resp {
+            MgmtResponse::Control(cr) => cr.status_code,
+            _ => panic!("expected an immediate refusal"),
+        };
+        let backend: Arc<dyn crate::TrustAdminMgmtBackend> = Arc::new(Unreachable);
+        let identity: ndn_packet::Name = "/home/bob/member/phone".parse().unwrap();
         for uri in [None, Some(String::new()), Some("   ".to_string())] {
             let params = ControlParameters {
-                uri,
+                uri: uri.clone(),
                 ..Default::default()
             };
-            match security_context_adopt(params, Some(&backend)) {
-                MgmtResponse::Control(cr) => assert_eq!(cr.status_code, status::BAD_PARAMS),
-                _ => panic!("expected an immediate refusal"),
-            }
+            assert_eq!(
+                refused(security_context_adopt(params, Some(&backend))),
+                status::BAD_PARAMS
+            );
+            let params = ControlParameters {
+                uri,
+                name: Some(identity.clone()),
+                ..Default::default()
+            };
+            assert_eq!(refused(security_enroll(params, Some(&backend))), status::BAD_PARAMS);
         }
+        let no_identity = ControlParameters {
+            uri: Some("ndn-trust://invite/x".into()),
+            ..Default::default()
+        };
+        assert_eq!(refused(security_enroll(no_identity, Some(&backend))), status::BAD_PARAMS);
+
         let params = ControlParameters {
             uri: Some("ndn-trust://anchor/x".into()),
             ..Default::default()
         };
-        match security_context_adopt(params, None) {
-            MgmtResponse::Control(cr) => assert_eq!(cr.status_code, status::NOT_FOUND),
-            _ => panic!("expected an immediate refusal"),
-        }
+        assert_eq!(refused(security_context_adopt(params, None)), status::NOT_FOUND);
+        let params = ControlParameters {
+            uri: Some("ndn-trust://invite/x".into()),
+            name: Some(identity),
+            ..Default::default()
+        };
+        assert_eq!(refused(security_enroll(params, None)), status::NOT_FOUND);
     }
 }
 

@@ -76,6 +76,7 @@
 - [Trust policies](./reference/trust-policies.md)
 - [Trust-context publication (RDR)](./reference/trust-context-publication.md)
 - [Adopting a network (`ndn-fwd adopt`)](./reference/context-adoption.md)
+- [Enrolling with an invite (`ndn-fwd enroll`)](./reference/enrollment-by-invite.md)
 - [Dashboard extensions](./reference/dashboard-extensions.md)
 - [Spec compliance](./reference/spec-compliance.md)
 

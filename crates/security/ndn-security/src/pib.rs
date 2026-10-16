@@ -41,9 +41,12 @@ impl From<PibError> for TrustError {
 ///     private.key           # Legacy 32-byte raw Ed25519 seed — read
 ///                           # path kept for back-compat
 ///     cert.ndnc             # NDNC-format certificate (optional)
+///     cert.data             # the issued certificate as signed Data, as the
+///                           # CA returned it (optional; `store_issued_cert`)
 ///   anchors/<sha256>/
 ///     name.uri
 ///     cert.ndnc
+///   default-identity        # the node's default identity, NDN URI (optional)
 /// ```
 ///
 /// Key directories use SHA-256 of the canonical name bytes to avoid
@@ -299,6 +302,67 @@ impl FilePib {
         decode_cert(Arc::new(key_name.clone()), &data)
     }
 
+    /// Store the certificate a CA issued for `key_name` exactly as received
+    /// (`cert_data`, the signed Certificate v2 Data), next to the NDNC summary
+    /// [`store_cert`](Self::store_cert) writes — the summary drops the issuer's
+    /// signature and the full certificate name, which revoking it later needs.
+    /// The key must already be in the PIB and the certificate must name it.
+    pub fn store_issued_cert(&self, key_name: &Name, cert_data: &[u8]) -> Result<Certificate, PibError> {
+        let dir = self
+            .existing_key_dir(key_name)
+            .ok_or_else(|| PibError::KeyNotFound(name_to_uri(key_name)))?;
+        let data = ndn_packet::Data::decode(Bytes::copy_from_slice(cert_data))
+            .map_err(|e| PibError::Corrupt(format!("issued cert Data: {e:?}")))?;
+        let cert = Certificate::decode(&data)
+            .map_err(|e| PibError::Corrupt(format!("issued cert: {e}")))?;
+        if !cert.name.has_prefix(key_name) {
+            return Err(PibError::Corrupt(format!(
+                "certificate {} is not a certificate of key {}",
+                cert.name, key_name
+            )));
+        }
+        std::fs::write(dir.join("cert.data"), cert_data)?;
+        std::fs::write(dir.join("cert.ndnc"), encode_cert(&cert))?;
+        Ok(cert)
+    }
+
+    /// The issued certificate Data stored by
+    /// [`store_issued_cert`](Self::store_issued_cert), `None` if none was.
+    pub fn get_issued_cert(&self, key_name: &Name) -> Result<Option<Bytes>, PibError> {
+        let Some(dir) = self.existing_key_dir(key_name) else {
+            return Ok(None);
+        };
+        match std::fs::read(dir.join("cert.data")) {
+            Ok(wire) => Ok(Some(Bytes::from(wire))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(PibError::Io(e)),
+        }
+    }
+
+    /// Make `identity` the PIB's default identity — the one a node loads when
+    /// its configuration names none. The PIB must hold a key of `identity`.
+    /// The record is replaced atomically (write, then rename), so a reader
+    /// sees the old default or the new one, never a partial name.
+    pub fn set_default_identity(&self, identity: &Name) -> Result<(), PibError> {
+        if self.identity_keys(identity)?.is_empty() {
+            return Err(PibError::KeyNotFound(name_to_uri(identity)));
+        }
+        let tmp = self.root.join(".default-identity.tmp");
+        std::fs::write(&tmp, name_to_uri(identity))?;
+        std::fs::rename(&tmp, self.root.join(DEFAULT_IDENTITY_FILE))?;
+        Ok(())
+    }
+
+    /// The PIB's default identity ([`set_default_identity`](Self::set_default_identity)),
+    /// `None` when none was set.
+    pub fn get_default_identity(&self) -> Result<Option<Name>, PibError> {
+        match std::fs::read_to_string(self.root.join(DEFAULT_IDENTITY_FILE)) {
+            Ok(uri) => name_from_uri(uri.trim()).map(Some),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(PibError::Io(e)),
+        }
+    }
+
     pub fn add_trust_anchor(&self, key_name: &Name, cert: &Certificate) -> Result<(), PibError> {
         if !cert.is_valid_now() {
             return Err(PibError::Corrupt(format!(
@@ -367,6 +431,8 @@ impl FilePib {
     }
 }
 
+/// `<pib>/default-identity`: the default identity's NDN URI.
+const DEFAULT_IDENTITY_FILE: &str = "default-identity";
 const NDNC_MAGIC: &[u8; 4] = b"NDNC";
 const NDNC_VERSION_V1: u8 = 1;
 const NDNC_VERSION_V2: u8 = 2;
@@ -876,5 +942,58 @@ mod tests {
             bare.generate_ed25519(&n(k)).unwrap();
         }
         assert_eq!(bare.default_key(&n("/x")).unwrap(), Some(n("/x/KEY/a")));
+    }
+
+    /// The default identity names an identity the PIB holds a key for, reads
+    /// back after reopening, and is replaced (not appended) when changed.
+    #[test]
+    fn default_identity_needs_a_key_and_persists() {
+        let n = |s: &str| s.parse::<Name>().unwrap();
+        let (dir, pib) = tmp_pib();
+        assert_eq!(pib.get_default_identity().unwrap(), None);
+        assert!(matches!(
+            pib.set_default_identity(&n("/home/bob/member/phone")),
+            Err(PibError::KeyNotFound(_))
+        ));
+        assert_eq!(pib.get_default_identity().unwrap(), None);
+
+        pib.generate_ed25519(&n("/home/bob/member/phone/KEY/a")).unwrap();
+        pib.generate_ed25519(&n("/home/bob/guest/phone/KEY/b")).unwrap();
+        pib.set_default_identity(&n("/home/bob/member/phone")).unwrap();
+        pib.set_default_identity(&n("/home/bob/guest/phone")).unwrap();
+        let reopened = FilePib::open(dir.path()).unwrap();
+        assert_eq!(
+            reopened.get_default_identity().unwrap(),
+            Some(n("/home/bob/guest/phone"))
+        );
+    }
+
+    /// An issued certificate is stored verbatim beside its key, and only for
+    /// the key it certifies.
+    #[test]
+    fn issued_cert_is_stored_verbatim_for_its_key_only() {
+        let n = |s: &str| s.parse::<Name>().unwrap();
+        let (_dir, pib) = tmp_pib();
+        let key = n("/home/bob/member/phone/KEY/a");
+        let other = n("/home/bob/member/tablet/KEY/b");
+        let signer = pib.generate_ed25519(&key).unwrap();
+        pib.generate_ed25519(&other).unwrap();
+        let wire = futures::executor::block_on(crate::manager::encode_cert_data(
+            &key,
+            &signer.public_key().unwrap(),
+            &signer,
+            now_ns(),
+            now_ns() + 3_600_000_000_000,
+        ))
+        .unwrap();
+
+        assert!(pib.store_issued_cert(&other, &wire).is_err());
+        assert_eq!(pib.get_issued_cert(&other).unwrap(), None);
+        assert!(pib.store_issued_cert(&n("/nobody/KEY/x"), &wire).is_err());
+        assert!(pib.store_issued_cert(&key, b"not a data packet").is_err());
+
+        let cert = pib.store_issued_cert(&key, &wire).unwrap();
+        assert_eq!(pib.get_issued_cert(&key).unwrap(), Some(wire));
+        assert_eq!(pib.get_cert(&key).unwrap().public_key, cert.public_key);
     }
 }

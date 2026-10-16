@@ -120,6 +120,17 @@ pub mod verb {
     /// name when the link carries only the expected fingerprint). Authorized
     /// by the peer credentials of the local management socket.
     pub const CONTEXT_ADOPT: &[u8] = b"context-adopt";
+    /// `security/enroll` — enroll this node with the CA an `ndn-trust://invite`
+    /// link (in `ControlParameters.uri`) names: the daemon generates the key
+    /// for the identity in `ControlParameters.name` (`/<ns>/<role>/<device>`)
+    /// in its own PIB, adopts the namespace's trust context if needed, redeems
+    /// the invite's token and makes the certified identity its default.
+    /// [`ENROLL_FORCE`] in `Flags` enrolls a new key although the node already
+    /// holds a certificate in that namespace. Authorized like
+    /// [`CONTEXT_ADOPT`].
+    pub const ENROLL: &[u8] = b"enroll";
+    /// `security/enroll` flag bit: enroll although already enrolled.
+    pub const ENROLL_FORCE: u64 = 1;
 }
 
 /// `/localhost/nfd/<module>/<verb>/<full-0x68-TLV>`.

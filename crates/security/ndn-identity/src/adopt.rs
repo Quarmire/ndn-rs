@@ -10,23 +10,12 @@
 //! forged one — instead of dropping it for lack of an anchor.
 
 use bytes::Bytes;
-use ndn_app::{Consumer, EngineAppExt, ForwarderEngine};
+use ndn_app::ForwarderEngine;
 use ndn_cert::{AdoptError, AnchorLink, CaExchange, CertError, LinkAdoption};
 use ndn_packet::Data;
 use ndn_security::Keyring;
-use tokio_util::sync::CancellationToken;
 
-/// A [`CaExchange`] over an engine app consumer.
-struct EngineExchange(Consumer);
-
-impl CaExchange for EngineExchange {
-    async fn express(&mut self, interest: Bytes) -> Result<Data, CertError> {
-        self.0
-            .fetch_wire(interest, ndn_app::DEFAULT_TIMEOUT)
-            .await
-            .map_err(|e| CertError::Transport(e.to_string()))
-    }
-}
+use crate::engine_exchange::EngineExchange;
 
 /// Adopt the network `link` names into `keyring`, fetching the context
 /// through `engine` when the link carries only a fingerprint (see
@@ -43,9 +32,7 @@ pub async fn adopt_anchor_link_via_engine(
         return ndn_cert::adopt_anchor_link(keyring, None, &mut NoNetwork, link).await;
     }
     let validator = engine.validator();
-    let face_cancel = CancellationToken::new();
-    let _teardown = face_cancel.clone().drop_guard();
-    let mut exchange = EngineExchange(engine.app_consumer(face_cancel));
+    let mut exchange = EngineExchange::new(engine);
     ndn_cert::adopt_anchor_link(keyring, validator.as_deref(), &mut exchange, link).await
 }
 

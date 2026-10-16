@@ -16,9 +16,11 @@ pub mod delegation;
 pub mod device;
 pub mod device_approval_net;
 pub mod email;
+mod engine_exchange;
 pub mod enroll;
 pub mod error;
 pub mod facade;
+pub mod invite;
 pub mod identity_ref;
 pub mod recovery_bundle;
 pub mod renewal;
@@ -27,6 +29,7 @@ pub mod signed_delegation;
 pub mod transition;
 
 pub use adopt::adopt_anchor_link_via_engine;
+pub use invite::enroll_with_invite_via_engine;
 pub use ca::{NdncertCa, NdncertCaBuilder};
 pub use device::{DeviceConfig, FactoryCredential, RenewalPolicy};
 pub use device_approval_net::{

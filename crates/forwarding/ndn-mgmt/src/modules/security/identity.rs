@@ -7,29 +7,34 @@ use ndn_engine::ForwarderEngine;
 use ndn_mgmt_wire::{ControlParameters, ControlResponse, control_response::status};
 use ndn_security::FilePib;
 
+/// `identity=<id> is_ephemeral=<bool> pib_path=<dir>[ key=<key>]`. With a
+/// trust-admin backend tracking the key the node signs with (it can change at
+/// runtime through `security/enroll`), that key and its identity are
+/// reported; otherwise the configured identity, else the first trust anchor's.
 pub(super) fn security_identity_status(
     engine: &ForwarderEngine,
     config: &dyn crate::MgmtConfig,
     is_ephemeral: bool,
+    signing: Option<crate::SigningIdentityInfo>,
 ) -> ControlResponse {
-    // Prefer the configured identity name; otherwise derive from the
-    // first trust-anchor in the SecurityManager.
-    let identity_name: String = if let Some(id) = config.security_identity() {
-        id.to_owned()
+    let identity_of = |key: String| match key.find("/KEY/") {
+        Some(pos) => key[..pos].to_string(),
+        None => key,
+    };
+    let (identity_name, is_ephemeral, key) = if let Some(signing) = signing {
+        let key = signing.key.to_string();
+        (identity_of(key.clone()), signing.ephemeral, Some(key))
+    } else if let Some(id) = config.security_identity() {
+        (id.to_owned(), is_ephemeral, None)
     } else if let Some(mgr) = engine.security() {
-        mgr.trust_anchor_names()
+        let name = mgr
+            .trust_anchor_names()
             .first()
-            .map(|n| {
-                let s = n.to_string();
-                if let Some(pos) = s.find("/KEY/") {
-                    s[..pos].to_string()
-                } else {
-                    s
-                }
-            })
-            .unwrap_or_else(|| "(none)".to_string())
+            .map(|n| identity_of(n.to_string()))
+            .unwrap_or_else(|| "(none)".to_string());
+        (name, is_ephemeral, None)
     } else {
-        "(none)".to_string()
+        ("(none)".to_string(), is_ephemeral, None)
     };
 
     let pib_path = config
@@ -37,8 +42,10 @@ pub(super) fn security_identity_status(
         .map(str::to_owned)
         .unwrap_or_else(|| dirs_or_tmp_pib().display().to_string());
 
-    let text =
-        format!("identity={identity_name} is_ephemeral={is_ephemeral} pib_path={pib_path}\n");
+    let key = key.map(|k| format!(" key={k}")).unwrap_or_default();
+    let text = format!(
+        "identity={identity_name} is_ephemeral={is_ephemeral} pib_path={pib_path}{key}\n"
+    );
     ControlResponse::ok_empty(text)
 }
 

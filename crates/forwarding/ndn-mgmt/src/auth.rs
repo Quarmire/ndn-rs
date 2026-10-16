@@ -128,6 +128,7 @@ pub(crate) fn is_public_dataset_verb(module: &[u8], verb: &[u8]) -> bool {
             || verb == v::VALIDATE
             || verb == v::ANCHOR_LIST
             || verb == v::IDENTITY_LIST
+            || verb == v::IDENTITY_STATUS
             || verb == v::SCHEMA_LIST)
     {
         return true;
@@ -248,14 +249,20 @@ pub(crate) async fn authorize_command(
     Ok(())
 }
 
-/// `(module, verb)` pairs that change this node's trust (anchors, schema,
-/// network context). Beyond the signed-command gate they require the caller
-/// to be a local trust administrator — see [`authorize_trust_admin`]. Add
-/// every future trust-mutating verb here.
-const TRUST_ADMIN_VERBS: &[(&[u8], &[u8])] = &[(
-    ndn_mgmt_wire::nfd_command::module::SECURITY,
-    ndn_mgmt_wire::nfd_command::verb::CONTEXT_ADOPT,
-)];
+/// `(module, verb)` pairs that change this node's trust or signing identity
+/// (adopting a trust context, enrolling). Beyond the signed-command gate they
+/// require the caller to be a local trust administrator — see
+/// [`authorize_trust_admin`]. Add every future trust-mutating verb here.
+const TRUST_ADMIN_VERBS: &[(&[u8], &[u8])] = &[
+    (
+        ndn_mgmt_wire::nfd_command::module::SECURITY,
+        ndn_mgmt_wire::nfd_command::verb::CONTEXT_ADOPT,
+    ),
+    (
+        ndn_mgmt_wire::nfd_command::module::SECURITY,
+        ndn_mgmt_wire::nfd_command::verb::ENROLL,
+    ),
+];
 
 /// `true` when `module/verb` changes this node's trust and must pass
 /// [`authorize_trust_admin`].
@@ -516,6 +523,8 @@ mod trust_admin_tests {
     #[test]
     fn trust_admin_verb_table() {
         assert!(is_trust_admin_verb(b"security", b"context-adopt"));
+        assert!(is_trust_admin_verb(b"security", b"enroll"));
+        assert!(!is_trust_admin_verb(b"security", b"ca-enroll"));
         assert!(!is_trust_admin_verb(b"security", b"anchor-list"));
         assert!(!is_trust_admin_verb(b"faces", b"context-adopt"));
     }

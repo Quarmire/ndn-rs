@@ -230,9 +230,10 @@ pub struct MgmtHandles {
     pub ble_handler: Option<Arc<dyn BleMgmtBackend>>,
     /// Read-only pending device-approval backend (`ca` module).
     pub approval_handler: Option<Arc<dyn ApprovalMgmtBackend>>,
-    /// Network adoption backend (`security/context-adopt`). None: the verb
-    /// answers that this host does not adopt networks at runtime.
-    pub trust_context_handler: Option<Arc<dyn TrustContextMgmtBackend>>,
+    /// Trust-admin backend (`security/context-adopt`, `security/enroll`, and
+    /// the live signing identity `security/identity-status` reports). None:
+    /// those verbs answer that this host does not change its trust at runtime.
+    pub trust_context_handler: Option<Arc<dyn TrustAdminMgmtBackend>>,
     /// Read-only WebTransport TLS cert-status backend (`webtransport` module).
     pub webtransport_status_handler: Option<Arc<dyn WtCertStatusBackend>>,
     /// Runtime-mutable mgmt-access policy.
@@ -426,24 +427,99 @@ pub struct AdoptedContextInfo {
     pub published: bool,
 }
 
-/// Why `security/context-adopt` adopted nothing: a status code (`400` bad
-/// link, `403` refused by a trust check, `409` an adoption already running,
-/// `504` the network did not deliver, `500` local failure) and a reason that
-/// says what to do instead.
+/// Why a trust-admin verb (`security/context-adopt`, `security/enroll`)
+/// changed nothing: a status code (`400` bad link or parameters, `403`
+/// refused by a trust check or the CA, `409` conflicting state or another
+/// such command running, `504` the network did not deliver, `500` local
+/// failure) and a reason that says what to do instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AdoptRefusal {
+pub struct TrustRefusal {
     pub status_code: u64,
     pub reason: String,
 }
 
-/// Backend for `security/context-adopt`: adopt the network an
-/// `ndn-trust://anchor` link names into the running node. The spec crate
-/// owns the trait; the forwarder (`ndn-fwd`) implements it over its engine,
-/// keyring, context store and context publisher. Authorization happens before
-/// the backend is called (the trust-admin peer-credential gate).
+/// What `security/enroll` asks: enroll `identity` (`/<ns>/<role>/<device>`)
+/// with the CA the `ndn-trust://invite` link names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnrollRequest {
+    pub invite_uri: String,
+    pub identity: Name,
+    /// Enroll a new key although this node already holds a certificate in
+    /// the namespace (the old one stays valid until revoked).
+    pub force: bool,
+}
+
+/// The answer to `security/enroll`, JSON in the ControlResponse status text,
+/// tagged by `state`. A token enrollment completes in one exchange
+/// (`enrolled`); enrollment by an admin's approval will answer `pending`
+/// with a request to poll — the reason this is an enum.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "state", rename_all = "kebab-case")]
+pub enum EnrollOutcome {
+    Enrolled(EnrolledInfo),
+}
+
+/// A completed `security/enroll`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EnrolledInfo {
+    /// The enrolled identity, `/<ns>/<role>/<device>`.
+    pub identity: String,
+    /// The certified key, `<identity>/KEY/<id>`; generated in the node's PIB.
+    pub key: String,
+    /// The issued certificate's name.
+    pub certificate: String,
+    /// The key that signed the certificate (the CA's).
+    pub issuer: String,
+    /// Certificate validity end, ISO 8601 (UTC).
+    pub valid_until: String,
+    /// The trust context adopted on the way; `None` when it was already held.
+    pub adopted_context: Option<AdoptedContextInfo>,
+    /// The PIB directory holding the key and certificate.
+    pub pib: String,
+    /// The node's identity before this enrollment, if any.
+    pub previous_identity: Option<String>,
+    /// Whether the running node signs with the new key now (management
+    /// responses, discovery records). `false` when `[security] identity` in
+    /// its config names another identity, which keeps precedence.
+    pub signing_now: bool,
+    /// What changes only at the next start, and why (empty: nothing).
+    pub at_next_start: Vec<String>,
+    /// Certificates in this namespace this node held before a `force`
+    /// enrollment: still valid until revoked.
+    pub still_valid: Vec<String>,
+}
+
+/// The key the node currently signs its own packets with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SigningIdentityInfo {
+    pub key: Name,
+    /// An in-memory key minted at startup (not persisted).
+    pub ephemeral: bool,
+}
+
+/// Backend for the trust-admin verbs: adopt a trust context
+/// (`security/context-adopt`), enroll with an invite (`security/enroll`),
+/// and report the identity the node signs with now. The spec crate owns the
+/// trait; the forwarder (`ndn-fwd`) implements it over its engine, keyring,
+/// PIB, context store and publisher. Authorization happens before a verb
+/// reaches the backend (the trust-admin peer-credential gate).
 #[async_trait::async_trait]
-pub trait TrustContextMgmtBackend: Send + Sync {
-    async fn adopt(&self, link_uri: String) -> Result<AdoptedContextInfo, AdoptRefusal>;
+pub trait TrustAdminMgmtBackend: Send + Sync {
+    async fn adopt(&self, link_uri: String) -> Result<AdoptedContextInfo, TrustRefusal>;
+
+    async fn enroll(&self, request: EnrollRequest) -> Result<EnrollOutcome, TrustRefusal> {
+        let _ = request;
+        Err(TrustRefusal {
+            status_code: ndn_mgmt_wire::control_response::status::NOT_FOUND,
+            reason: "this node does not enroll at runtime".to_owned(),
+        })
+    }
+
+    /// The key the node signs with now, if the backend tracks it (it can
+    /// change at runtime through `security/enroll`).
+    fn signing_identity(&self) -> Option<SigningIdentityInfo> {
+        None
+    }
 }
 
 /// Whether a function's result is determined solely by its invocation
