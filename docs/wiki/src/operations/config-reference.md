@@ -122,6 +122,7 @@ it issued. See [NDNCERT setup](../guides/ndncert-setup.md).
 | `ephemeral` | `false` | Mint a throwaway self-signed CA key at every start instead of loading `identity` (demo only; warned). |
 | `tokens` | `[]` | Legacy: non-empty selects a token challenge (ignored when `challenge` is set). A token `member-…` / `guest-…` (as `ndn-fwd-tokens new --role` mints them) is scoped to `<network>/<role>`. |
 | `emit_attestations` | `false` | Embed a challenge attestation in each issued cert. |
+| `cert_validity_days` | `90` | Lifetime of the certificates the CA issues, in days; also the maximum it advertises in INFO. Devices enrolling by invite ask for 90; a lower value caps them and `ndn-fwd enroll` prints the expiry issued. 90 keeps an enrolled device valid while certificate renewal is not built; renewal will allow shorter lifetimes. `0` is refused at startup. |
 
 Without `ephemeral`, the CA loads its key from the PIB and its certificate
 (issued by the hub root) from `<pib_path>/ca/ca-cert.data`; the root's anchor
@@ -149,8 +150,11 @@ A PIB-backed CA whose identity is `/<ns>/CA`, certified by the hub root
 `/<ns>/<role>/<device>/KEY/<id>` (role `admin`, `member`, `node`, `guest`);
 `admin` and `node` certs need a `device-approval`, tokens admit members and —
 when guest-scoped — guests (`ndn_cert::RolePolicy`; see
-[NDNCERT setup](../guides/ndncert-setup.md#roles-in-a-personal-network)). An
-ephemeral CA keeps issuing any challenge-passing name.
+[NDNCERT setup](../guides/ndncert-setup.md#roles-in-a-personal-network)). A
+device name holds one certified key at a time: a new key for a name that holds
+a valid, unrevoked certificate is refused (before the token is redeemed) until
+that certificate is revoked, unless the new key comes with a `device-approval`.
+An ephemeral CA keeps issuing any challenge-passing name.
 
 `[[demo_ca.challenge]]` — explicit challenge set (replaces the `tokens`
 shortcut). Each entry has `kind = "nop"|"token"|"pin"|"email"|"device-approval"`.

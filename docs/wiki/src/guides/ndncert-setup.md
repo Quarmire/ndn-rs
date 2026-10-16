@@ -133,6 +133,14 @@ Other challenges (pin, email, nop) admit no role. A scoped token records its
 scope in its attestation leaf (evidence `scope`), which is how the policy tells
 a guest invite from a member invite.
 
+A device identity holds one certified key at a time
+(`IssuancePolicy::single_key_identity`): the CA refuses a new key for
+`/<ns>/<role>/<device>` while a valid certificate it issued for that name to
+another key is unrevoked, unless the satisfied challenge carries a
+`device-approval` leaf. A request that only a `device-approval` could admit is
+refused before its challenge runs (NDNCERT error 5, NameNotAllowed), so a
+token presented with it is not redeemed.
+
 ## Configuration
 
 `ndn-fwd` embeds a CA through its `[demo_ca]` section (full key list in the

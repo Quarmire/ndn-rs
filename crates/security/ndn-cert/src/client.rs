@@ -234,6 +234,11 @@ impl EnrollmentSession {
                 let reason = resp
                     .error_info
                     .unwrap_or_else(|| "challenge denied".to_string());
+                // NameNotAllowed: the CA refuses the name itself, whatever
+                // the challenge proves.
+                if resp.error_code == Some(crate::protocol::ErrorCode::NameNotAllowed.into()) {
+                    return Err(CertError::PolicyDenied(reason));
+                }
                 Err(CertError::ChallengeFailed(reason))
             }
             // STATUS_CHALLENGE (CA awaits requester) and STATUS_PENDING

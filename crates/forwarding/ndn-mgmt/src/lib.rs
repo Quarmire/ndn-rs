@@ -218,8 +218,10 @@ pub struct MgmtHandles {
     pub require_signed_commands: bool,
     /// Sliding `SignatureTime` window per signer for replay defence.
     pub command_replay_cache: Option<CommandReplayCache>,
-    /// Signer for control-response Data packets.
-    pub command_response_signer: Option<Arc<dyn ndn_security::Signer>>,
+    /// Signer for control-response Data packets: the node's current key,
+    /// which may change while it runs. Each response is signed with one
+    /// snapshot ([`response_signer`](Self::response_signer)).
+    pub command_response_signer: Option<Arc<ndn_security::ActiveSigner>>,
     /// Host-owned log ring + filter reload hook for the `log` module.
     pub log_inspector: Option<Arc<LogInspector>>,
     pub coding_handler: Option<Arc<dyn CodingHandler>>,
@@ -273,6 +275,11 @@ impl MgmtHandles {
             return g.localhop_disabled;
         }
         self.localhop_command_validator.is_none()
+    }
+
+    /// One snapshot of the response signer, for signing one response.
+    pub fn response_signer(&self) -> Option<Arc<dyn ndn_security::Signer>> {
+        self.command_response_signer.as_ref().map(|s| s.current())
     }
 }
 
@@ -472,6 +479,11 @@ pub struct EnrolledInfo {
     pub issuer: String,
     /// Certificate validity end, ISO 8601 (UTC).
     pub valid_until: String,
+    /// The issued certificate's lifetime in seconds: shorter than
+    /// `requested_validity_secs` when the CA caps lifetimes below the request.
+    pub validity_secs: u64,
+    /// The lifetime the node asked the CA for, in seconds.
+    pub requested_validity_secs: u64,
     /// The trust context adopted on the way; `None` when it was already held.
     pub adopted_context: Option<AdoptedContextInfo>,
     /// The PIB directory holding the key and certificate.
@@ -736,7 +748,7 @@ pub async fn run_ndn_mgmt_handler(
                     &handle,
                     &interest.name,
                     &resp,
-                    mgmt_handles.command_response_signer.as_deref(),
+                    mgmt_handles.response_signer().as_deref(),
                 )
                 .await;
                 continue;
@@ -780,7 +792,7 @@ pub async fn run_ndn_mgmt_handler(
                     &handle,
                     &interest.name,
                     &resp,
-                    mgmt_handles.command_response_signer.as_deref(),
+                    mgmt_handles.response_signer().as_deref(),
                 )
                 .await;
                 continue;
@@ -798,7 +810,7 @@ pub async fn run_ndn_mgmt_handler(
                             &handle,
                             &interest.name,
                             &resp,
-                            mgmt_handles.command_response_signer.as_deref(),
+                            mgmt_handles.response_signer().as_deref(),
                         )
                         .await;
                         continue;
@@ -845,7 +857,7 @@ pub async fn run_ndn_mgmt_handler(
                     &handle,
                     &interest.name,
                     &resp,
-                    mgmt_handles.command_response_signer.as_deref(),
+                    mgmt_handles.response_signer().as_deref(),
                 )
                 .await;
                 continue;
@@ -867,7 +879,7 @@ pub async fn run_ndn_mgmt_handler(
                     &handle,
                     &interest.name,
                     &resp,
-                    mgmt_handles.command_response_signer.as_deref(),
+                    mgmt_handles.response_signer().as_deref(),
                 )
                 .await;
                 continue;
@@ -909,7 +921,7 @@ pub async fn run_ndn_mgmt_handler(
                     &handle,
                     &interest.name,
                     &cr,
-                    mgmt_handles.command_response_signer.as_deref(),
+                    mgmt_handles.response_signer().as_deref(),
                 )
                 .await
             }
@@ -918,7 +930,7 @@ pub async fn run_ndn_mgmt_handler(
                     &handle,
                     &interest.name,
                     bytes,
-                    mgmt_handles.command_response_signer.as_deref(),
+                    mgmt_handles.response_signer().as_deref(),
                 )
                 .await;
             }
@@ -928,6 +940,9 @@ pub async fn run_ndn_mgmt_handler(
                 let signer = mgmt_handles.command_response_signer.clone();
                 let answer = async move {
                     let cr = pending.await;
+                    // Signed by the key current when the answer is ready
+                    // (an enrollment may have just switched it).
+                    let signer = signer.map(|s| s.current());
                     send_response(&handle, &name, &cr, signer.as_deref()).await;
                 };
                 #[cfg(not(target_arch = "wasm32"))]

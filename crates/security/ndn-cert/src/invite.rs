@@ -44,9 +44,11 @@ use crate::error::CertError;
 use crate::onboarding::{AdoptError, AnchorLink, LinkAdoption, adopt_anchor_link, anchor_fingerprint};
 use crate::roles::{Role, RoleError, token_role, validate_device_name, validate_namespace};
 
-/// Certificate lifetime a device asks for; the CA clamps it to its own
-/// maximum. Renewal (`ndn_identity::start_renewal`) keeps it current.
-pub const INVITE_CERT_VALIDITY_SECS: u64 = 365 * 24 * 3600;
+/// Certificate lifetime a device asks for: 90 days, the lifetime a hub CA
+/// issues by default (`[demo_ca] cert_validity_days`). A CA configured for
+/// less issues less; the issued certificate's validity period is the actual
+/// expiry. Renewal (not built yet) will allow shorter lifetimes.
+pub const INVITE_CERT_VALIDITY_SECS: u64 = 90 * 24 * 3600;
 
 /// What an `ndn-trust://invite` link asks a device to do: enroll a key under
 /// [`identity_prefix`](Self::identity_prefix) with the CA at
@@ -253,6 +255,11 @@ pub enum InviteEnrollError {
     TokenRefused(String),
     #[error("the CA refused the request: {0}")]
     CaRefused(String),
+    #[error(
+        "the CA refused this device name: {0}. Enroll under another device name (--device), \
+         revoke that certificate first, or have an admin approve this device"
+    )]
+    NameRefused(String),
     #[error("the CA did not complete the token challenge: {0}")]
     ChallengeIncomplete(String),
     #[error("signing the request with the device key failed: {0}")]
@@ -274,6 +281,7 @@ impl InviteEnrollError {
                 detail,
             },
             CertError::ChallengeFailed(reason) => Self::TokenRefused(reason),
+            CertError::PolicyDenied(reason) => Self::NameRefused(reason),
             CertError::ChallengePending(status) => Self::ChallengeIncomplete(status),
             CertError::Security(e) => Self::Signing(e.to_string()),
             other => Self::CaRefused(other.to_string()),

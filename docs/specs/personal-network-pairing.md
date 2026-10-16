@@ -124,6 +124,12 @@ Each flow lists steps, what is stored where, failure handling, and status
   super node) cert requires an admin approval, never a token alone; tokens
   admit members, and guests only when guest-scoped (**have**:
   `ndn_cert::RolePolicy`, the default for a hub CA in `[demo_ca]`).
+- One key per device name: the CA refuses a new key for `/<ns>/<role>/<dev>`
+  while a valid certificate it issued for that name to another key is
+  unrevoked, unless an admin approves the new key; the refusal comes before
+  the token is redeemed (**have**: `IssuancePolicy::single_key_identity`).
+- Lifetime: hub certificates last 90 days (`[demo_ca] cert_validity_days`),
+  the lifetime a device requests, until renewal (F10) allows shorter ones.
 
 ### F3 Delegate the CA to a super node
 1. Super node generates `/<ns>/CA` key locally; produces a cert request.

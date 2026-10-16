@@ -18,6 +18,8 @@ ndn-tlv       = { workspace = true, features = ["std"] }
 ndn-crypto-core = { workspace = true }
 bytes         = { workspace = true, features = ["std"] }
 dashmap       = { workspace = true }
+# `ActiveSigner`: the node's current signing key, swapped atomically.
+arc-swap      = { workspace = true }
 thiserror     = { workspace = true }
 tracing       = { workspace = true }
 getrandom     = { workspace = true }

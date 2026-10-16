@@ -148,6 +148,28 @@ pub enum IssuanceDecision {
 /// before the CA mints the cert.
 pub trait IssuancePolicy: Send + Sync {
     fn decide(&self, ctx: &IssuanceContext<'_>) -> IssuanceDecision;
+
+    /// The identity the key `key_name` would be certified under, when this
+    /// policy holds that identity to one certified key at a time. The CA
+    /// then refuses to certify a new key under an identity that already
+    /// holds a valid certificate it issued for another key, until that
+    /// certificate is revoked — unless the satisfied challenge carries a
+    /// leaf of [`SingleKeyIdentity::unless_attested`] (an admin approved the
+    /// new key). `None` (the default): an identity may hold any number of
+    /// certified keys.
+    fn single_key_identity(&self, _key_name: &Name) -> Option<SingleKeyIdentity> {
+        None
+    }
+}
+
+/// An identity that may hold one certified key at a time (see
+/// [`IssuancePolicy::single_key_identity`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SingleKeyIdentity {
+    pub identity: Name,
+    /// The challenge kind whose satisfied leaf lets a new key be certified
+    /// while the identity's current certificate is still valid.
+    pub unless_attested: &'static str,
 }
 
 /// Issues every challenge-passing request at `default_validity`.
@@ -237,7 +259,13 @@ pub const TOKEN_SCOPE_EVIDENCE: &str = "scope";
 ///   inside `/<ns>/member`, and a `guest` only when scoped inside
 ///   `/<ns>/guest` (`ndn-fwd-tokens new --role guest`);
 /// - `admin` and `node` certificates are never issued on a token alone;
-/// - other challenges (pin, email, nop, …) admit no role.
+/// - other challenges (pin, email, nop, …) admit no role;
+/// - a device identity `/<ns>/<role>/<device>` holds one certified key at a
+///   time ([`single_key_identity`](IssuancePolicy::single_key_identity)): a
+///   token never certifies a new key under a name already certified to
+///   another key, so it cannot be used to take over an enrolled device's
+///   name; that needs the old certificate revoked first or an admin's
+///   device approval.
 pub struct RolePolicy {
     namespace: Name,
 }
@@ -252,6 +280,9 @@ impl RolePolicy {
     }
 }
 
+/// The challenge kind through which an admin approves a device.
+const DEVICE_APPROVAL: &str = "device-approval";
+
 /// The satisfied leaves of kind `kind`. A single-challenge set is only
 /// believed when the CA ran that very challenge.
 fn satisfied<'a>(
@@ -265,6 +296,11 @@ fn satisfied<'a>(
     leaves
         .iter()
         .filter(move |l| l.kind == kind && (!single || ctx.challenge_type == kind))
+}
+
+/// Whether the satisfied challenge carries a believed leaf of `kind`.
+pub(crate) fn attested(ctx: &IssuanceContext<'_>, kind: &str) -> bool {
+    satisfied(ctx, kind).next().is_some()
 }
 
 impl IssuancePolicy for RolePolicy {
@@ -287,7 +323,7 @@ impl IssuancePolicy for RolePolicy {
                 ctx.cert_request.name, self.namespace
             ));
         };
-        if satisfied(ctx, "device-approval").next().is_some() {
+        if attested(ctx, DEVICE_APPROVAL) {
             return issue;
         }
         let role = device.role;
@@ -323,6 +359,15 @@ impl IssuancePolicy for RolePolicy {
                  (challenge {} admits no role)",
                 ctx.challenge_type
             ),
+        })
+    }
+
+    fn single_key_identity(&self, key_name: &Name) -> Option<SingleKeyIdentity> {
+        crate::roles::parse_device_key(&self.namespace, key_name)?;
+        let identity_len = self.namespace.len() + 2;
+        Some(SingleKeyIdentity {
+            identity: Name::from_components(key_name.components()[..identity_len].iter().cloned()),
+            unless_attested: DEVICE_APPROVAL,
         })
     }
 }

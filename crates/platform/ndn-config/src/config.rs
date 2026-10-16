@@ -206,6 +206,14 @@ pub struct DemoCaConfig {
     /// is constructed by the CA wiring (`ndn-config` stays free of `ndn-cert`).
     #[serde(default)]
     pub require_attestation: Option<RequireAttestationConfig>,
+    /// Lifetime, in days, of the certificates this CA issues (also the
+    /// maximum it advertises in INFO). Default 90: until certificate renewal
+    /// is built, an enrolled device must stay valid between enrollments;
+    /// renewal will allow shorter lifetimes. Devices enrolling by invite
+    /// request 90 days; a shorter setting caps them, and `ndn-fwd enroll`
+    /// reports the expiry the CA issued.
+    #[serde(default = "DemoCaConfig::default_cert_validity_days")]
+    pub cert_validity_days: u32,
 }
 
 /// One NDNCERT challenge the CA offers. Flat (`kind` + per-kind fields) for
@@ -287,6 +295,11 @@ impl DemoCaConfig {
     fn default_identity() -> String {
         "/demo/CA".to_string()
     }
+    /// See [`cert_validity_days`](Self::cert_validity_days).
+    pub const DEFAULT_CERT_VALIDITY_DAYS: u32 = 90;
+    fn default_cert_validity_days() -> u32 {
+        Self::DEFAULT_CERT_VALIDITY_DAYS
+    }
 }
 
 impl Default for DemoCaConfig {
@@ -300,6 +313,7 @@ impl Default for DemoCaConfig {
             challenges: Vec::new(),
             emit_attestations: false,
             require_attestation: None,
+            cert_validity_days: Self::DEFAULT_CERT_VALIDITY_DAYS,
         }
     }
 }

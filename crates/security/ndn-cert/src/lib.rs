@@ -59,6 +59,7 @@ pub use onboarding::{
 pub use policy::{
     AcceptAllIssuance, DelegationPolicy, HierarchicalPolicy, IssuanceContext, IssuanceDecision,
     IssuancePolicy, NamespacePolicy, PolicyDecision, RequireAttestationKind, RolePolicy,
+    SingleKeyIdentity,
 };
 pub use roles::{NetworkSchema, Role, RoleError, network_schema};
 pub use protocol::{

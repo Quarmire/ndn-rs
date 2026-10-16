@@ -18,9 +18,9 @@ use crate::{
     store::CaStore,
     policy::{
         AcceptAllIssuance, IssuanceContext, IssuanceDecision, IssuancePolicy, NamespacePolicy,
-        PolicyDecision,
+        PolicyDecision, SingleKeyIdentity, attested,
     },
-    protocol::CertRequest,
+    protocol::{CertRequest, ErrorCode},
     tlv::{
         CaProfileTlv, ChallengeResponseTlv, NewRequestTlv, NewResponseTlv, ProbeResponseTlv,
         REVOKE_STATUS_NOT_FOUND, REVOKE_STATUS_REVOKED, REVOKE_STATUS_UNAUTHORIZED,
@@ -112,6 +112,9 @@ pub struct CaState {
     /// Durable backing for `served_certs` / `revoked`; `None` keeps both
     /// in memory only.
     store: Option<Arc<dyn CaStore>>,
+    /// Held from the single-key check to recording the issued cert, so two
+    /// requests for one identity cannot both pass the check.
+    issuing: tokio::sync::Mutex<()>,
 }
 
 impl CaState {
@@ -125,6 +128,7 @@ impl CaState {
             revoked: DashSet::new(),
             served_certs: DashMap::new(),
             store: None,
+            issuing: tokio::sync::Mutex::new(()),
         };
         state.serve_own_certificate();
         state
@@ -168,6 +172,36 @@ impl CaState {
 
     pub fn is_revoked(&self, cert_name: &str) -> bool {
         self.revoked.contains(cert_name)
+    }
+
+    /// A valid, unrevoked certificate this CA issued under `identity` for a
+    /// key other than `public_key`.
+    fn certified_to_other_key(
+        &self,
+        identity: &ndn_packet::Name,
+        public_key: &[u8],
+    ) -> Option<Certificate> {
+        let key_prefix = format!("{identity}/KEY/");
+        self.served_certs.iter().find_map(|entry| {
+            if !entry.key().starts_with(&key_prefix) || self.is_revoked(entry.key()) {
+                return None;
+            }
+            let cert = deserialize_cert(entry.value())?;
+            (cert.is_valid_now() && cert.public_key.as_ref() != public_key).then_some(cert)
+        })
+    }
+
+    /// When the policy holds `req`'s identity to one key
+    /// ([`IssuancePolicy::single_key_identity`]) and another key holds a
+    /// valid, unrevoked certificate for it: the rule and that certificate.
+    fn identity_taken(&self, req: &CertRequest) -> Option<(SingleKeyIdentity, Certificate)> {
+        let key_name: ndn_packet::Name = req.name.parse().ok()?;
+        let rule = self.config.issuance.single_key_identity(&key_name)?;
+        let public_key = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(&req.public_key)
+            .ok()?;
+        let held = self.certified_to_other_key(&rule.identity, &public_key)?;
+        Some((rule, held))
     }
 
     /// Wire of an issued cert for cert-fetch; `None` once it is revoked.
@@ -415,6 +449,27 @@ impl CaState {
                 CertError::InvalidRequest(format!("unsupported challenge type: {challenge_type}"))
             })?;
 
+        // A request the single-key rule refuses whatever this challenge
+        // proves is refused before the challenge runs, so it spends nothing:
+        // a one-time token stays redeemable under another name.
+        if let Some((rule, held)) = self.identity_taken(&cert_request)
+            && !handler.can_attest(rule.unless_attested)
+        {
+            self.pending.remove(request_id);
+            let response = refused(
+                ErrorCode::NameNotAllowed,
+                identity_taken_reason(
+                    &rule,
+                    &held,
+                    &format!(
+                        "refused before the `{challenge_type}` challenge ran, so nothing was \
+                         redeemed"
+                    ),
+                ),
+            );
+            return session_key.seal_envelope(&response.encode(), &request_id_bytes, &mut enc_iv);
+        }
+
         let state = match existing_state {
             Some(s) => s,
             None => {
@@ -492,36 +547,29 @@ impl CaState {
                 };
                 match self.config.issuance.decide(&issuance_ctx) {
                     IssuanceDecision::Issue { validity } => {
-                        let attestation_ad = if self.config.emit_attestations {
-                            attestation_set.encode_additional_description()
-                        } else {
-                            None
-                        };
-                        let cert = self
-                            .issue_certificate_with_validity(
-                                &pending.cert_request,
-                                validity,
-                                attestation_ad.as_deref(),
-                            )
-                            .await?;
-                        let cert_name_str = cert.name.to_string();
-                        let cert_bytes = serialize_cert(&cert);
-
-                        // Persist before serving: a cert the CA cannot durably
-                        // serve after a restart is not issued.
-                        if let Some(store) = &self.store {
-                            store.record_issued(&cert_name_str, &cert_bytes)?;
-                        }
-                        self.served_certs.insert(cert_name_str.clone(), cert_bytes);
-
-                        ChallengeResponseTlv {
-                            status: STATUS_SUCCESS,
-                            challenge_status: None,
-                            remaining_tries: None,
-                            remaining_time_secs: None,
-                            issued_cert_name: Some(cert_name_str),
-                            error_code: None,
-                            error_info: None,
+                        // Check and record under one lock: of two requests
+                        // for one identity, only the first is certified.
+                        let _issuing = self.issuing.lock().await;
+                        match self.identity_taken(&pending.cert_request) {
+                            Some((rule, held))
+                                if !attested(&issuance_ctx, rule.unless_attested) =>
+                            {
+                                refused(
+                                    ErrorCode::NameNotAllowed,
+                                    identity_taken_reason(
+                                        &rule,
+                                        &held,
+                                        &format!(
+                                            "the `{challenge_type}` challenge was met first, so \
+                                             a one-time token it used is spent"
+                                        ),
+                                    ),
+                                )
+                            }
+                            _ => {
+                                self.issue(&pending.cert_request, validity, &attestation_set)
+                                    .await?
+                            }
                         }
                     }
                     IssuanceDecision::Deny(reason) => ChallengeResponseTlv {
@@ -616,6 +664,42 @@ impl CaState {
         self.revoked.insert(cert_uri);
         self.manager.cert_cache().remove(&cert_name);
         REVOKE_STATUS_REVOKED
+    }
+
+    /// Mint, persist and serve the certificate for an approved request.
+    async fn issue(
+        &self,
+        req: &CertRequest,
+        validity: Duration,
+        attestation_set: &crate::attestation::AttestationSet,
+    ) -> Result<ChallengeResponseTlv, CertError> {
+        let attestation_ad = if self.config.emit_attestations {
+            attestation_set.encode_additional_description()
+        } else {
+            None
+        };
+        let cert = self
+            .issue_certificate_with_validity(req, validity, attestation_ad.as_deref())
+            .await?;
+        let cert_name_str = cert.name.to_string();
+        let cert_bytes = serialize_cert(&cert);
+
+        // Persist before serving: a cert the CA cannot durably serve after a
+        // restart is not issued.
+        if let Some(store) = &self.store {
+            store.record_issued(&cert_name_str, &cert_bytes)?;
+        }
+        self.served_certs.insert(cert_name_str.clone(), cert_bytes);
+
+        Ok(ChallengeResponseTlv {
+            status: STATUS_SUCCESS,
+            challenge_status: None,
+            remaining_tries: None,
+            remaining_time_secs: None,
+            issued_cert_name: Some(cert_name_str),
+            error_code: None,
+            error_info: None,
+        })
     }
 
     /// `policy_validity` is clamped to `max_validity` and the client's
@@ -727,6 +811,34 @@ fn generate_request_id_bytes() -> [u8; 8] {
     let mut bytes = [0u8; 8];
     let _ = getrandom::getrandom(&mut bytes);
     bytes
+}
+
+/// A CHALLENGE response refusing the request with `code` and `reason`.
+fn refused(code: ErrorCode, reason: String) -> ChallengeResponseTlv {
+    ChallengeResponseTlv {
+        status: STATUS_FAILURE,
+        challenge_status: None,
+        remaining_tries: None,
+        remaining_time_secs: None,
+        issued_cert_name: None,
+        error_code: Some(code.into()),
+        error_info: Some(reason),
+    }
+}
+
+/// Why a key is not certified under `rule.identity`, which `held` certifies
+/// for another key; `outcome` says what became of the request's challenge.
+fn identity_taken_reason(rule: &SingleKeyIdentity, held: &Certificate, outcome: &str) -> String {
+    let until = ndn_security::iso8601::format_iso_basic(held.valid_until);
+    format!(
+        "{} is already certified to another key ({}, valid until {}Z, not revoked); this CA \
+         certifies a new key under it only once that certificate is revoked, or when an admin \
+         approves the new key (the {} challenge); {outcome}",
+        rule.identity,
+        held.name,
+        String::from_utf8_lossy(&until),
+        rule.unless_attested,
+    )
 }
 
 fn bytes_to_hex(bytes: &[u8; 8]) -> String {

@@ -30,6 +30,20 @@ admin's approval. A role-carrying token (`member-…`, `guest-…`) must match
 the invite's role (checked locally), and the CA refuses any request outside
 the token's scope.
 
+A device name holds one certified key at a time. The hub CA (`RolePolicy`)
+refuses to certify a key for `/<ns>/<role>/<device>` while it holds a valid,
+unrevoked certificate it issued for that name to another key, unless an admin
+approves the new key (`device-approval`). So a member token cannot be used to
+enroll as an existing device and publish under its name. The CA checks this
+before running the token challenge, so a refused request does not redeem the
+token: enroll again under another `--device` name, or revoke the old
+certificate first. Certifying the same key again is not refused.
+
+Certificates last 90 days: the hub CA issues `[demo_ca] cert_validity_days`
+(default 90) and the device asks for 90. A CA set to fewer days caps the
+certificate, and the enroll output states the expiry it issued. Renewal is not
+built yet; once it is, lifetimes can be shorter.
+
 ## Flow and packets
 
 | Step | Who | What |
@@ -42,7 +56,7 @@ the token's scope.
 | 6 | daemon → CA | `/<ns>/CA/NEW` and `/<ns>/CA/CHALLENGE/<id>` signed Interests (device key), token challenge; replies signed by `/<ns>/CA/KEY/…`, validated by the device's forwarder under the adopted context |
 | 7 | daemon → CA | fetches the issued certificate and the CA's certificate; checks the certificate certifies the device key, is valid now, and chains to the root under the context's schema |
 | 8 | daemon | stores `cert.data` (signed Data, as issued) and the summary beside the key, then sets the PIB's default identity — the last step |
-| 9 | daemon | switches the signer of its management responses and discovery records to the new key; the key also enters the engine's key store |
+| 9 | daemon | switches the signer of its management responses, discovery records and DV routing to the new key; the key also enters the engine's key store |
 
 A failure at any step after 4 deletes the new key; the default identity and
 the signer stay as they were. A context adopted in step 5 is kept (it passed
@@ -66,12 +80,14 @@ the PIB but the configured one keeps signing; the answer says so.
 
 ## Live signer switch
 
-Management responses and discovery records sign through one switchable
-signer (`ndn-fwd` `active_identity.rs`), so they use the new key at once
-(`ndn-ctl status` shows `signing: identity=… key=…`). DV routing was built
-with the startup key and switches at the next start; the answer lists it.
-Each run holds its earlier signers for the lifetime of the process (eight
-slots); beyond that a newly enrolled key applies at the next start.
+Management responses, discovery records and DV routing sign through one
+shared `ndn_security::ActiveSigner`: the current signer behind an atomic swap
+(`ndn-fwd` `active_identity.rs` holds it). Each packet takes one snapshot and
+uses it for both its KeyLocator and its signature, so a packet always names
+the key that signed it, and every switch applies from the next packet on
+(`ndn-ctl status` shows `signing: identity=… key=…`). There is no limit on
+how many times a run switches. DV neighbours whose `[routing.dv.trust]` lists
+trusted keys must trust the new key, as they would after a restart.
 
 ## Refusals
 
@@ -80,7 +96,8 @@ slots); beyond that a newly enrolled key applies at the next start.
 | malformed / not an invite / bad names | 400 | what is wrong; ask for a new invite |
 | token role ≠ invite role, admin/node invite | 400 | the invite was altered or minted wrongly |
 | invalid device name | 400 | the rule; choose another `--device` |
-| already holds a certificate in `/<ns>` | 409 | lists it; `--force` enrolls another key, the old one stays valid until revoked |
+| already holds a certificate in `/<ns>` | 409 | lists it; `--force` with another `--device` enrolls another key, the old one stays valid until revoked |
+| the CA already certified this device name to another key | 409 | the certificate holding it; choose another `--device`, revoke that certificate first, or have an admin approve the device. The token is not redeemed |
 | held context from another root | 403 | the two fingerprints |
 | no route / no answer | 504 | the device needs a face and a route for `/<ns>` toward a forwarder that serves it |
 | token spent, expired or out of scope | 403 | the CA's reason; ask for a new invite |

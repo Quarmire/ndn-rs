@@ -12,6 +12,7 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![allow(missing_docs)]
 
+pub mod active_signer;
 #[cfg(feature = "abe")]
 #[cfg_attr(docsrs, doc(cfg(feature = "abe")))]
 pub mod abe;
@@ -55,6 +56,7 @@ pub mod verifier;
 #[cfg_attr(docsrs, doc(cfg(feature = "yubikey-piv")))]
 pub mod yubikey;
 
+pub use active_signer::ActiveSigner;
 pub use capability::{Capability, CapabilityError};
 pub use cert_cache::{CertCache, Certificate};
 pub use cert_fetcher::{CertFetcher, FetchFn};

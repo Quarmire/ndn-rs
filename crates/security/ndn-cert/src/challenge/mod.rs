@@ -65,6 +65,15 @@ pub trait ChallengeHandler: Send + Sync {
         state: &'a ChallengeState,
         parameters: &'a serde_json::Map<String, serde_json::Value>,
     ) -> Pin<Box<dyn Future<Output = Result<ChallengeOutcome, CertError>> + Send + 'a>>;
+
+    /// Whether satisfying this challenge can yield an attestation leaf of
+    /// `kind`. The CA asks before running a challenge whose outcome could
+    /// not change its decision anyway (e.g. a token for an identity only an
+    /// admin's `device-approval` may re-key), so the challenge is not spent
+    /// on a request it would refuse. Composite handlers answer for their subs.
+    fn can_attest(&self, kind: &str) -> bool {
+        self.challenge_type() == kind
+    }
 }
 
 /// The leaves of `attestation`, or a single kind-only leaf naming

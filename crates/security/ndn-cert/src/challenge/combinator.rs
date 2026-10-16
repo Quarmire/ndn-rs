@@ -261,6 +261,10 @@ impl ChallengeHandler for AllOf {
             Combinator::AllOf,
         ))
     }
+
+    fn can_attest(&self, kind: &str) -> bool {
+        self.subs.iter().any(|s| s.can_attest(kind))
+    }
 }
 
 /// Any `n` of the subs must succeed (`1 <= n <= subs.len()`).
@@ -332,6 +336,10 @@ impl ChallengeHandler for NofM {
                 total: self.subs.len(),
             },
         ))
+    }
+
+    fn can_attest(&self, kind: &str) -> bool {
+        self.subs.iter().any(|s| s.can_attest(kind))
     }
 }
 
@@ -417,6 +425,10 @@ impl ChallengeHandler for AnyOf {
                 }),
             }
         })
+    }
+
+    fn can_attest(&self, kind: &str) -> bool {
+        self.subs.iter().any(|s| s.can_attest(kind))
     }
 }
 
