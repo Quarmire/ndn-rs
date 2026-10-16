@@ -76,7 +76,6 @@ scope = spec        NDN community specs implemented faithfully
                                 (NFD-style split), FaceId, FaceTable,
                                 StreamFace, TlvCodec
   ndn-store                     NameTrie, Fib, PIT, ContentStore (LruCs/ShardedCs/FjallCs/SqliteCs), DeadNonceList
-  ndn-safebag                   SafeBag (cert + PKCS#5-encrypted key) — wasm-buildable carve-out of safe_bag.rs
   ndn-face                      Standard face types (NFD/ndnd set): UDP, TCP, Unix,
                                 in-process/IPC, Ethernet (uni/multicast), callback/tap
   ndn-frame-io                  Backend-agnostic link-layer frame I/O (FrameIo trait, FrameFormat
@@ -88,7 +87,7 @@ scope = spec        NDN community specs implemented faithfully
   ndn-face-afxdp                AF_XDP kernel-bypass Ethernet backend (Linux) — extension
   ndn-face-webtransport         Server-side WebTransport listener (HTTP/3 + QUIC datagrams)
   ndn-strategy                  BestRoute, Multicast, ASF, composed strategies
-  ndn-security                  KeyChain, Signer/Verifier, TrustSchema, Validator, SafeData, Keyring/TrustContext
+  ndn-security                  KeyChain, Signer/Verifier, TrustSchema, Validator, SafeData, Keyring/SignedTrustContext, did:ndn, custodians (Custodian trait + KeyId, feature `custodian`)
   ndn-engine                    ForwarderEngine, EngineBuilder/WasmEngineBuilder, pipeline, task topology
   ndn-app                       Application API: Node (unified entry: fetch/serve/object/publish/subscribe/query) over Consumer/Producer/Publisher/Subscriber/Queryable
   ndn-ipc                       ForwarderClient, BlockingForwarderClient, chunked transfer
@@ -98,10 +97,9 @@ scope = spec        NDN community specs implemented faithfully
   ndn-sync                      Dataset sync: SVS (layered — notification core w/ suppression FSM + HMAC-signed Sync Interests + V2/V3 wire dialects → SvSync data plane w/ DataStore + windowed fetch/serve → SvsPubSub named pub/sub + MappingProvider late-join backfill), PSync (Full: bounded versioned-prefix IBF set w/ relay-capable learned names; Partial: asymmetric PartialProducer + Bloom-filter subscription consumer; large replies segmented through a shared windowed-transfer module)
   ndn-repo                      Persistent named-data repository (third-party durable custody, network-layer/app-agnostic), runnable as the `ndn-repo` daemon (`--features bin`, Unix-socket IPC). RepoCmd wire codec byte-compatible with ndnd (SyncJoin/SyncLeave/BlobFetch); RepoService demuxes a forwarder connection into command handling (reply RepoCmdRes), store serving (answers for a whole joined group), and per-group SVS ingestion. Pluggable DataStore — MemoryStore (ndn-sync) or on-disk FjallStore; `SvSync::ingest_publication`/`ingest_name` store raw wires (resume-aware: skip already-stored). **Fail-closed trust**: `Repo::with_validator` gates ingestion on an `ndn_security::Validator`, so the repo never durably re-serves data it can't authenticate. Distributed replication/failover (cf. a-thieme/repo) is a layer above.
   ndn-repo-cluster              Distributed coordination layer above ndn-repo (cf. a-thieme/repo features). Fully decentralised: nodes gossip heartbeats + job claims over an SVS coordination group and fold them into an identical, converging ClusterState; each runs the same deterministic, capacity-aware placement (lowest-utilisation live nodes are designated to reach replication_factor; excess claimants beyond the lowest-util keepers shed). A node failing → missed heartbeats → its claims stop counting → a survivor re-replicates. Pure coord core + TLV msg codec + ClusterNode tick/observe driver; multi-node simulation proves convergence + failover. Not a wire standard — composes above the ndnd-compatible single-node repo.
-  ndn-did                       NDN-native Decentralised Identifiers (W3C DID + did:ndn method)
-  ndn-cert                      NDNCERT 0.3 — INFO/NEW/CHALLENGE + IssuancePolicy hook + challenge attestations + BootstrapTicket/hub onboarding
-  ndn-custodian                 Custodian trait (InPage/OsKeyring/Fob/BrowserExtension) + KeyId + CustodianSigner (Custodian→Signer adapter); wasm-safe (no PIB/sqlite) so dashboard/extension/mobile can use it
-  ndn-identity                  Bridges KeyChain + DID + NDNCERT; re-exports ndn-custodian
+  ndn-cert                      NDNCERT 0.3 — INFO/NEW/CHALLENGE + IssuancePolicy hook + challenge attestations + hub onboarding (TOFU adopt)
+  ndn-trust-envelope            `ndn-trust://` onboarding/pairing envelope codec (anchor/invite/delegation/recovery/bag/capability); one format for QR, deep link, and `.ndntrust` file
+  ndn-identity                  Identity lifecycle over KeyChain + DID + NDNCERT (enroll, delegate, renew, revoke, recover); re-exports ndn-security's custodian types
 
 scope = extension   Pragmatic engineering, no NDN spec basis
   ndn-runtime                   Spawn/Sleep/Now trait abstraction; TokioRuntime / WasmRuntime
@@ -543,11 +541,15 @@ enforced by `KeyChain::ephemeral` and `ndn-sec keygen`.
 SafeBag export/import uses CertificateV2 plus encrypted PKCS#8 private keys;
 the encrypted-key profile is PBES2 with PBKDF2-HMAC-SHA256 and AES-256-CBC so
 reference `ndnsec import/export` can round-trip ndn-rs SafeBags.
-`ConfigPolicy` models the release-relevant configuration-validator behavior:
-ordered first-match rules, no-match denial, exact KeyLocator-prefix checks, and
-hierarchical checking. It is not a full ndn-cxx `validator.conf` parser.
+`FilePib` is the default PIB. The opt-in `ndnsec-compat` feature of
+`ndn-security` adds `SqlitePib` + `FileTpm`, which read and write ndn-cxx's
+`~/.ndn` key store (`pib.db` with the `pib-sqlite3` schema, plus `tpm-file`
+private keys) in place. It pulls bundled SQLite and is off by default.
+The trust policy is a `TrustSchema` (OR'd name-pattern rules plus an optional
+LVS model) executed by `Validator`; there is no ndn-cxx `validator.conf` parser
+and no ordered first-match-deny mode — LVS is the policy language.
 LVS binary schemas with unsupported user functions fail closed: import rejects
-them for trust-schema enforcement, and direct model/policy evaluation treats the
+them for trust-schema enforcement, and direct `LvsModel` evaluation treats the
 unsupported function constraint as non-matching.
 
 Management command Interests are signed by `ndn-ipc` before they are LP-wrapped:
@@ -561,9 +563,9 @@ change such as a newly registered RIB entry.
 Trust-anchor insertion fails closed on expired or not-yet-valid certificates:
 invalid anchors do not enter the anchor set, cert cache, or PIB anchor store.
 
-### TrustContext keyring (per-namespace dispatch)
+### SignedTrustContext keyring (per-namespace dispatch)
 
-A node holds a `Keyring` — a set of adopted `TrustContext`s, each binding a
+A node holds a `Keyring` — a set of adopted `SignedTrustContext`s, each binding a
 `namespace` to its own anchor set and trust schema — rather than one flat
 anchor pile. The `Validator` is keyring-backed and dispatches every packet to
 the context selected by *its name's* namespace (longest-prefix match); it is
@@ -573,14 +575,27 @@ anchor I hold." Hierarchical contexts (the default) additionally enforce the
 the signed name — which closes the skeleton-key authorization gap (NFD #2856).
 The flat-anchor API (`Validator::new` / `with_chain` / `add_trust_anchor` /
 `set_schema`) targets an ambient root-namespace context, so existing
-single-anchor callers are unchanged. A `TrustContext` is also a signed,
+single-anchor callers are unchanged. A `SignedTrustContext` is also a signed,
 versioned NDN object (`/<ns>/32=trust-context/v=N`, TLV `0x0410–0x041F`); the
 keyring refuses a strictly older version (anti-rollback). Onboarding lives in
-`ndn-cert`: a `BootstrapTicket` (QR/deep-link fragment) carries the namespace + root
-anchor *fingerprint*, and `adopt_with_tofu` is the only sanctioned path from
-"received a context" to "trusted" — adoption is never automatic. The chain walk
+`ndn-cert`: an `ndn-trust://anchor` envelope (`ndn-trust-envelope`; QR/deep link) carries the namespace + root
+anchor *fingerprint* (`ndn_cert::anchor_fingerprint`, SHA-256 of the anchor's
+public key) and, inline, the context's **signed** Data (`sign_into_data`).
+`adopt_with_tofu` is the only sanctioned path from "received a context" to
+"trusted": it verifies that Data's signature under the anchor matching the
+pinned fingerprint, so a tampered context (e.g. a widened schema riding a
+genuine anchor) is refused — adoption is never automatic, and unsigned legacy
+content is adopted only through the explicit `adopt_unsigned_legacy_with_tofu`
+opt-in. `ndn-fwd init --profile hub` (`ndn_cert::init_hub_in_pib`) keeps the
+root key, the CA identity `<ns>/CA`, the hub node's own root-certified
+identity `<ns>/<node-name>` and the root-signed context in the node's
+PIB; adopted contexts persist as `<pib>/contexts/<hex(ns)>.tc` (signed Data)
+and the forwarder re-verifies and loads them into its keyring at startup. The chain walk
 also honours a context's `revocations`, so an issuing-CA compromise is
-contained by a pulled context bump (no re-bootstrap).
+contained by a pulled context bump (no re-bootstrap). Fleet nodes receive those
+bumps via `ndn_identity::context_sync`, which carries the context's own
+`encode_content()` bytes over SVS (revocations, enrollment hint and schema blob
+verbatim) and adopts them into the `Keyring`.
 
 ## Routing
 

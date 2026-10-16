@@ -1,8 +1,12 @@
-//! YubiKey PIV hardware-backed key store (feature: `yubikey-piv`).
+//! YubiKey PIV hardware-backed signers (feature: `yubikey-piv`).
 //!
-//! Stores private keys in YubiKey PIV slots so they never leave the hardware.
-//! All signing operations are performed on-device via PC/SC. Requires `pcscd`
+//! Private keys live in YubiKey PIV slots and never leave the hardware. All
+//! signing operations are performed on-device via PC/SC. Requires `pcscd`
 //! running and a YubiKey connected via USB or NFC.
+//!
+//! [`YubikeyPiv`] is a factory: it produces an `Arc<dyn Signer>` for a slot,
+//! which the caller registers with
+//! [`SecurityManager::register_signer`](crate::SecurityManager::register_signer).
 //!
 //! ## PIV slot recommendations
 //!
@@ -27,17 +31,13 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use dashmap::DashMap;
 use ndn_packet::{Name, SignatureType};
 use yubikey::{
     PinPolicy, TouchPolicy, YubiKey,
     piv::{self, AlgorithmId, SlotId},
 };
 
-use crate::{
-    Signer, TrustError,
-    key_store::{KeyAlgorithm, KeyStore},
-};
+use crate::{Signer, TrustError};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum YubikeySlot {
@@ -58,41 +58,45 @@ impl From<YubikeySlot> for SlotId {
     }
 }
 
-/// YubiKey PIV-backed key store.
+/// Handle to a connected YubiKey that produces PIV slot signers.
 ///
-/// Thread-safe: the `YubiKey` handle is accessed via a `Mutex` and signing
-/// is dispatched to `tokio::task::spawn_blocking` to avoid blocking the
-/// async executor during PC/SC I/O.
-pub struct YubikeyKeyStore {
+/// Thread-safe: the `YubiKey` handle is accessed via a `Mutex` and device
+/// I/O is dispatched to `tokio::task::spawn_blocking` to avoid blocking the
+/// async executor during PC/SC I/O. Signers share this handle.
+pub struct YubikeyPiv {
     yk: Arc<std::sync::Mutex<YubiKey>>,
-    slots: DashMap<Arc<Name>, YubikeySlot>,
 }
 
-impl YubikeyKeyStore {
+impl YubikeyPiv {
     pub fn open() -> Result<Self, TrustError> {
         let yk =
             YubiKey::open().map_err(|e| TrustError::KeyStore(format!("YubiKey not found: {e}")))?;
         Ok(Self {
             yk: Arc::new(std::sync::Mutex::new(yk)),
-            slots: DashMap::new(),
         })
     }
 
-    /// Record a name-to-slot mapping (does not communicate with the device).
-    pub fn register_slot(&self, key_name: Name, slot: YubikeySlot) {
-        self.slots.insert(Arc::new(key_name), slot);
+    /// Signer for the P-256 key already held in `slot`, named `key_name`
+    /// (does not communicate with the device).
+    pub fn signer(&self, key_name: Name, slot: YubikeySlot) -> Arc<dyn Signer> {
+        Arc::new(YubikeySigner {
+            yk: Arc::clone(&self.yk),
+            key_name,
+            slot,
+        })
     }
 
-    /// Generate a new P-256 key in `slot` and register it under `key_name`.
+    /// Generate a new P-256 key in `slot` and return its signer (named
+    /// `key_name`) plus the raw uncompressed EC public key bytes (65 bytes:
+    /// `0x04 || X || Y`).
     ///
-    /// Returns the raw uncompressed EC public key bytes (65 bytes: `0x04 || X || Y`).
     /// The management key must be authenticated; if the YubiKey still has its factory
     /// default management key it is used automatically.
-    pub async fn generate_in_slot(
+    pub async fn generate(
         &self,
         key_name: Name,
         slot: YubikeySlot,
-    ) -> Result<Bytes, TrustError> {
+    ) -> Result<(Arc<dyn Signer>, Bytes), TrustError> {
         let yk = Arc::clone(&self.yk);
         let slot_id = SlotId::from(slot);
 
@@ -115,38 +119,7 @@ impl YubikeyKeyStore {
             .await
             .map_err(|e| TrustError::KeyStore(format!("spawn_blocking join error: {e}")))??;
 
-        self.slots.insert(Arc::new(key_name), slot);
-        Ok(Bytes::from(pub_bytes))
-    }
-}
-
-impl KeyStore for YubikeyKeyStore {
-    async fn get_signer(&self, key_name: &Name) -> Result<Arc<dyn Signer>, TrustError> {
-        let slot = self
-            .slots
-            .iter()
-            .find(|r| r.key().as_ref() == key_name)
-            .map(|r| *r.value())
-            .ok_or_else(|| TrustError::CertNotFound {
-                name: key_name.to_string(),
-            })?;
-
-        Ok(Arc::new(YubikeySigner {
-            yk: Arc::clone(&self.yk),
-            key_name: key_name.clone(),
-            slot,
-        }))
-    }
-
-    async fn generate_key(&self, name: Name, _algo: KeyAlgorithm) -> Result<Name, TrustError> {
-        self.generate_in_slot(name.clone(), YubikeySlot::Authentication)
-            .await?;
-        Ok(name)
-    }
-
-    async fn delete_key(&self, key_name: &Name) -> Result<(), TrustError> {
-        self.slots.retain(|k, _| k.as_ref() != key_name);
-        Ok(())
+        Ok((self.signer(key_name, slot), Bytes::from(pub_bytes)))
     }
 }
 

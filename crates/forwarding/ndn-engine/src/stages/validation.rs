@@ -27,7 +27,7 @@ use crate::observability::targets as t;
 
 use crate::pipeline::{Action, DecodedPacket, DropReason, PacketContext};
 use ndn_packet::Name;
-use ndn_security::{CertFetcher, ValidationResult, Validator};
+use ndn_security::{ValidationResult, Validator};
 
 struct PendingEntry {
     ctx: PacketContext,
@@ -37,7 +37,9 @@ struct PendingEntry {
 }
 
 enum DrainResult {
-    Ready(Box<PacketContext>),
+    /// The awaited cert landed; re-validate. Carries the entry's original
+    /// deadline so a re-queue (next missing hop) cannot extend it.
+    Ready(Box<PacketContext>, Instant),
     Timeout,
 }
 
@@ -76,7 +78,13 @@ impl PendingQueue {
         }
     }
 
-    fn push(&mut self, ctx: PacketContext, needed_cert: Arc<Name>, now: Instant) {
+    fn deadline_from(&self, now: Instant) -> Instant {
+        // Monotonic deadline anchored to the runtime clock (deterministic under a
+        // virtual runtime). (ndn-lab slice 0c.)
+        now + self.default_timeout
+    }
+
+    fn push(&mut self, ctx: PacketContext, needed_cert: Arc<Name>, deadline: Instant) {
         let byte_size = ctx.raw_bytes.len();
 
         while self.entries.len() >= self.max_entries
@@ -92,9 +100,7 @@ impl PendingQueue {
         self.entries.push_back(PendingEntry {
             ctx,
             needed_cert,
-            // Monotonic deadline anchored to the runtime clock (deterministic under a
-            // virtual runtime). (ndn-lab slice 0c.)
-            deadline: now + self.default_timeout,
+            deadline,
             byte_size,
         });
     }
@@ -117,7 +123,7 @@ impl PendingQueue {
             if validator.cert_cache().get(&entry.needed_cert).is_some() {
                 let entry = self.entries.remove(i).unwrap();
                 self.total_bytes -= entry.byte_size;
-                results.push(DrainResult::Ready(Box::new(entry.ctx)));
+                results.push(DrainResult::Ready(Box::new(entry.ctx), entry.deadline));
                 continue;
             }
 
@@ -128,9 +134,20 @@ impl PendingQueue {
     }
 }
 
+/// Validates inbound Data against the engine [`Validator`].
+///
+/// Validation on the pipeline is **cache-only** ([`Validator::validate_chain_cached`]):
+/// awaiting a network cert fetch inline would stall the very pipeline that
+/// must deliver the cert's Data. A missing cert instead parks the Data in a
+/// bounded pending queue and spawns a fetch through the validator's
+/// [`CertFetcher`](ndn_security::CertFetcher) (attached after engine build, see
+/// `ndn_app::install_engine_cert_fetcher`); the drain task re-validates once
+/// the cert is cached, walking one missing hop at a time, and drops the Data
+/// when its original deadline passes. The fetcher dedups concurrent requests
+/// and backs off after a failure, and every re-queue keeps the original
+/// deadline, so a missing cert cannot loop or amplify.
 pub struct ValidationStage {
     pub validator: Option<Arc<Validator>>,
-    pub cert_fetcher: Option<Arc<CertFetcher>>,
     pending: Arc<Mutex<PendingQueue>>,
     pub runtime: Arc<dyn Runtime>,
     stats: Arc<ValidationStats>,
@@ -139,13 +156,11 @@ pub struct ValidationStage {
 impl ValidationStage {
     pub fn new(
         validator: Option<Arc<Validator>>,
-        cert_fetcher: Option<Arc<CertFetcher>>,
         config: PendingQueueConfig,
         runtime: Arc<dyn Runtime>,
     ) -> Self {
         Self {
             validator,
-            cert_fetcher,
             pending: Arc::new(Mutex::new(PendingQueue::new(&config))),
             runtime,
             stats: Arc::new(ValidationStats::default()),
@@ -155,12 +170,23 @@ impl ValidationStage {
     pub fn disabled() -> Self {
         Self {
             validator: None,
-            cert_fetcher: None,
             pending: Arc::new(Mutex::new(
                 PendingQueue::new(&PendingQueueConfig::default()),
             )),
             runtime: ndn_runtime::default_runtime(),
             stats: Arc::new(ValidationStats::default()),
+        }
+    }
+
+    /// Kick off a background fetch of `cert_name` through the validator's
+    /// fetcher, if one is attached. Never awaited on the pipeline.
+    fn request_cert(&self, validator: &Validator, cert_name: &Arc<Name>) {
+        if let Some(fetcher) = validator.cert_fetcher() {
+            let fetcher = Arc::clone(fetcher);
+            let cn = Arc::clone(cert_name);
+            self.runtime.spawn(Box::pin(async move {
+                let _ = fetcher.fetch(&cn).await;
+            }));
         }
     }
 
@@ -211,8 +237,8 @@ impl ValidationStage {
         // ndn-rs validates everything, including /localhost mgmt responses
         // (signed with DigestSha256). NFD reaches the same effect via an
         // explicit `m_localhostValidator` allowlist.
-        let result = validator
-            .validate_chain(data)
+        let (result, missing) = validator
+            .validate_chain_cached(data)
             .instrument(span.clone())
             .await;
         span.record("elapsed_us", started.elapsed().as_micros() as u64);
@@ -225,22 +251,18 @@ impl ValidationStage {
                 Action::Satisfy(ctx)
             }
             ValidationResult::Pending => {
-                if let Some(cert_name) = key {
+                if let Some(cert_name) = missing {
                     span.record("outcome", "pending");
                     span.record("reason", "awaiting-cert");
                     self.stats.pending.fetch_add(1, Ordering::Relaxed);
                     debug!(target: t::SECURITY, name=%name, cert=%cert_name, "validation: pending, queuing");
 
-                    if let Some(fetcher) = &self.cert_fetcher {
-                        let fetcher = Arc::clone(fetcher);
-                        let cn = Arc::clone(&cert_name);
-                        self.runtime.spawn(Box::pin(async move {
-                            let _ = fetcher.fetch(&cn).await;
-                        }));
-                    }
+                    self.request_cert(validator, &cert_name);
 
                     let now = self.runtime.now();
-                    self.pending.lock().await.push(ctx, cert_name, now);
+                    let mut pending = self.pending.lock().await;
+                    let deadline = pending.deadline_from(now);
+                    pending.push(ctx, cert_name, deadline);
                     Action::Drop(DropReason::ValidationFailed)
                 } else {
                     span.record("outcome", "dropped");
@@ -276,7 +298,7 @@ impl ValidationStage {
                     warn!(target: t::SECURITY, "validation: DROPPED — cert fetch timed out");
                     actions.push(Action::Drop(DropReason::ValidationTimeout));
                 }
-                DrainResult::Ready(ctx) => {
+                DrainResult::Ready(ctx, deadline) => {
                     let mut ctx = *ctx;
                     let data = match &ctx.packet {
                         DecodedPacket::Data(d) => d,
@@ -285,19 +307,28 @@ impl ValidationStage {
                             continue;
                         }
                     };
-                    match validator.validate_chain(data).await {
-                        ValidationResult::Valid(_) => {
+                    match validator.validate_chain_cached(data).await {
+                        (ValidationResult::Valid(_), _) => {
                             self.stats.valid.fetch_add(1, Ordering::Relaxed);
                             trace!(target: t::SECURITY, name=%data.name, "validation: re-validated after cert fetch");
                             ctx.verified = true;
                             actions.push(Action::Satisfy(ctx));
                         }
-                        ValidationResult::Pending => {
+                        // The next hop up the chain is missing: fetch it and wait
+                        // again, under the entry's ORIGINAL deadline (the walk is
+                        // bounded by the validator's max chain depth, and the
+                        // deadline bounds the whole resolution).
+                        (ValidationResult::Pending, Some(next)) if now < deadline => {
+                            debug!(target: t::SECURITY, name=%data.name, cert=%next, "validation: next cert in chain missing, re-queuing");
+                            self.request_cert(validator, &next);
+                            self.pending.lock().await.push(ctx, next, deadline);
+                        }
+                        (ValidationResult::Pending, _) => {
                             self.stats.dropped_timeout.fetch_add(1, Ordering::Relaxed);
                             warn!(target: t::SECURITY, name=%data.name, "validation: DROPPED — still no cert after fetch");
                             actions.push(Action::Drop(DropReason::ValidationFailed));
                         }
-                        ValidationResult::Invalid(e) => {
+                        (ValidationResult::Invalid(e), _) => {
                             self.stats.invalid.fetch_add(1, Ordering::Relaxed);
                             warn!(target: t::SECURITY, name=%data.name, error=%e, "validation: FAILED — forged/invalid after cert fetch");
                             actions.push(Action::Drop(DropReason::ValidationFailed));
@@ -327,7 +358,6 @@ mod tests {
         let validator = Arc::new(Validator::new(TrustSchema::accept_all()));
         let validation = ValidationStage::new(
             Some(validator),
-            None,
             PendingQueueConfig::default(),
             ndn_runtime::default_runtime(),
         );
@@ -346,6 +376,174 @@ mod tests {
         assert!(
             matches!(action, Action::Drop(DropReason::ValidationFailed)),
             "/localhost Data must go through validation instead of bypassing it"
+        );
+    }
+
+    use ndn_packet::Name;
+    use ndn_security::{CertFetcher, Certificate, Ed25519Signer, FetchFn, Signer};
+    use std::collections::HashMap;
+    use std::sync::atomic::AtomicUsize;
+
+    fn n(s: &str) -> Name {
+        s.parse().unwrap()
+    }
+
+    fn ctx_for(wire: Bytes) -> PacketContext {
+        let data = Data::decode(wire.clone()).unwrap();
+        let mut ctx = PacketContext::new(wire, FaceId(1), 0);
+        ctx.name = Some(Arc::clone(&data.name));
+        ctx.packet = DecodedPacket::Data(Box::new(data));
+        ctx
+    }
+
+    fn signed_data(name: &str, signer: &Ed25519Signer) -> Bytes {
+        DataBuilder::new(n(name), b"payload").sign_sync(
+            SignatureType::SignatureEd25519,
+            Some(signer.key_name()),
+            |region| signer.sign_sync(region).unwrap(),
+        )
+    }
+
+    /// Validator anchored at `root`, with a fetcher answering from `served`
+    /// (name → cert Data wire) and counting every fetch attempt.
+    fn validator_with_fetcher(
+        root: &Ed25519Signer,
+        served: HashMap<Name, Bytes>,
+    ) -> (Arc<Validator>, Arc<AtomicUsize>) {
+        let validator = Arc::new(Validator::new(TrustSchema::accept_all()));
+        validator.add_trust_anchor(Certificate {
+            name: Arc::new(root.key_name().clone()),
+            public_key: Bytes::copy_from_slice(&root.public_key_bytes()),
+            valid_from: 0,
+            valid_until: u64::MAX,
+            issuer: None,
+            signed_region: None,
+            sig_value: None,
+            sig_type: SignatureType::SignatureEd25519,
+        });
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let f = Arc::clone(&fetches);
+        let fetch_fn: FetchFn = Arc::new(move |name: Name| {
+            f.fetch_add(1, Ordering::Relaxed);
+            let data = served.get(&name).map(|w| Data::decode(w.clone()).unwrap());
+            Box::pin(async move { data })
+        });
+        let fetcher = Arc::new(CertFetcher::new(
+            validator.cert_cache_arc(),
+            fetch_fn,
+            Duration::from_secs(1),
+        ));
+        assert!(validator.set_cert_fetcher(fetcher).is_ok());
+        (validator, fetches)
+    }
+
+    async fn wait_cached(validator: &Validator, name: &Name) {
+        let name = Arc::new(name.clone());
+        for _ in 0..200 {
+            if validator.cert_cache().get(&name).is_some() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("cert {name} never fetched");
+    }
+
+    /// Data → leaf cert → mid cert → anchor, with neither cert cached: the
+    /// stage fetches the leaf off the hot path, re-queues for the mid cert
+    /// (next hop) under the same deadline, then validates — one fetch per cert.
+    #[tokio::test]
+    async fn pending_data_validates_after_fetching_each_missing_hop() {
+        let root = Ed25519Signer::from_seed(&[1; 32], n("/t/KEY/root"));
+        let mid = Ed25519Signer::from_seed(&[2; 32], n("/t/mid/KEY/m/root/v1"));
+        let leaf = Ed25519Signer::from_seed(&[3; 32], n("/t/leaf/KEY/l/mid/v1"));
+        let mid_cert = ndn_security::encode_cert_data(
+            mid.key_name(),
+            &mid.public_key_bytes(),
+            &root,
+            0,
+            u64::MAX,
+        )
+        .await
+        .unwrap();
+        let leaf_cert = ndn_security::encode_cert_data(
+            leaf.key_name(),
+            &leaf.public_key_bytes(),
+            &mid,
+            0,
+            u64::MAX,
+        )
+        .await
+        .unwrap();
+        let served = HashMap::from([
+            (mid.key_name().clone(), mid_cert),
+            (leaf.key_name().clone(), leaf_cert),
+        ]);
+        let (validator, fetches) = validator_with_fetcher(&root, served);
+        let stage = ValidationStage::new(
+            Some(Arc::clone(&validator)),
+            PendingQueueConfig::default(),
+            ndn_runtime::default_runtime(),
+        );
+
+        let action = stage
+            .process(ctx_for(signed_data("/t/leaf/photo", &leaf)))
+            .await;
+        assert!(matches!(action, Action::Drop(DropReason::ValidationFailed)));
+
+        wait_cached(&validator, leaf.key_name()).await;
+        assert!(
+            stage.drain_pending().await.is_empty(),
+            "mid cert still missing: re-queued, not resolved"
+        );
+        wait_cached(&validator, mid.key_name()).await;
+        let actions = stage.drain_pending().await;
+        assert!(
+            matches!(actions.as_slice(), [Action::Satisfy(ctx)] if ctx.verified),
+            "Data must validate once its whole chain is fetched"
+        );
+        assert_eq!(fetches.load(Ordering::Relaxed), 2);
+    }
+
+    /// A cert nobody serves: every Data naming it is parked, ONE fetch goes out
+    /// (dedup + negative cache — no per-packet retry storm), and each Data is
+    /// dropped by timeout once its deadline passes.
+    #[tokio::test]
+    async fn missing_cert_times_out_without_retry_storm() {
+        let root = Ed25519Signer::from_seed(&[1; 32], n("/t/KEY/root"));
+        let ghost = Ed25519Signer::from_seed(&[9; 32], n("/t/ghost/KEY/g/root/v1"));
+        let (validator, fetches) = validator_with_fetcher(&root, HashMap::new());
+        let stage = ValidationStage::new(
+            Some(validator),
+            PendingQueueConfig {
+                timeout: Duration::from_millis(400),
+                ..PendingQueueConfig::default()
+            },
+            ndn_runtime::default_runtime(),
+        );
+
+        for i in 0..20 {
+            let action = stage
+                .process(ctx_for(signed_data(&format!("/t/ghost/{i}"), &ghost)))
+                .await;
+            assert!(matches!(action, Action::Drop(DropReason::ValidationFailed)));
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(stage.drain_pending().await.is_empty(), "nothing ready yet");
+
+        tokio::time::sleep(Duration::from_millis(450)).await;
+        let actions = stage.drain_pending().await;
+        assert_eq!(actions.len(), 20);
+        assert!(
+            actions
+                .iter()
+                .all(|a| matches!(a, Action::Drop(DropReason::ValidationTimeout)))
+        );
+        assert_eq!(stage.stats().dropped_timeout.load(Ordering::Relaxed), 20);
+        assert!(stage.drain_pending().await.is_empty(), "no retry after drop");
+        assert_eq!(
+            fetches.load(Ordering::Relaxed),
+            1,
+            "20 Data naming one missing cert must cost one fetch"
         );
     }
 }

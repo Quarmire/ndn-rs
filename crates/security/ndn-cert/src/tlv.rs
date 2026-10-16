@@ -621,7 +621,8 @@ impl ProbeResponseTlv {
 /// ApplicationParameters of `/<ca>/CA/REVOKE`.
 pub struct RevokeRequestTlv {
     pub cert_name: String,
-    /// Ed25519 signature of `cert_name` bytes (possession proof).
+    /// Signature of the `cert_name` bytes (possession proof) by the revoked
+    /// cert's own key or by the CA's signing key (Ed25519 or ECDSA-P256).
     pub signature: Bytes,
 }
 

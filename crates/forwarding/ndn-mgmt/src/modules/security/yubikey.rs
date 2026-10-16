@@ -3,6 +3,7 @@
 #[cfg(feature = "yubikey-piv")]
 use base64::Engine as _;
 
+use ndn_engine::ForwarderEngine;
 use ndn_mgmt_wire::{ControlParameters, ControlResponse, control_response::status};
 use ndn_security::FilePib;
 
@@ -11,7 +12,7 @@ use ndn_security::FilePib;
 pub(super) fn security_yubikey_detect() -> ControlResponse {
     #[cfg(feature = "yubikey-piv")]
     {
-        match ndn_security::yubikey::YubikeyKeyStore::open() {
+        match ndn_security::yubikey::YubikeyPiv::open() {
             Ok(_) => ControlResponse::ok_empty("present"),
             Err(e) => ControlResponse::error(status::NOT_FOUND, format!("YubiKey not found: {e}")),
         }
@@ -25,13 +26,15 @@ pub(super) fn security_yubikey_detect() -> ControlResponse {
     }
 }
 
-/// Generate a P-256 key in YubiKey PIV slot 9a, register it under
-/// `params.name`, and persist a `{pib_root}/yubikey-slots.json` entry.
+/// Generate a P-256 key in YubiKey PIV slot 9a, register its signer under
+/// `params.name` with the engine's `SecurityManager` (when one is wired), and
+/// persist a `{pib_root}/yubikey-slots.json` entry.
 /// The uncompressed 65-byte public key is returned base64url-encoded
 /// in the response `uri`. Requires the `yubikey-piv` cargo feature.
 pub(super) async fn security_yubikey_generate(
     params: ControlParameters,
     pib: &FilePib,
+    engine: &ForwarderEngine,
 ) -> ControlResponse {
     let key_name = match params.name {
         Some(n) => n,
@@ -40,10 +43,10 @@ pub(super) async fn security_yubikey_generate(
 
     #[cfg(feature = "yubikey-piv")]
     {
-        use ndn_security::yubikey::{YubikeyKeyStore, YubikeySlot};
+        use ndn_security::yubikey::{YubikeyPiv, YubikeySlot};
 
-        let store = match YubikeyKeyStore::open() {
-            Ok(s) => s,
+        let piv = match YubikeyPiv::open() {
+            Ok(p) => p,
             Err(e) => {
                 return ControlResponse::error(
                     status::NOT_FOUND,
@@ -52,11 +55,11 @@ pub(super) async fn security_yubikey_generate(
             }
         };
 
-        let pub_bytes = match store
-            .generate_in_slot(key_name.clone(), YubikeySlot::Authentication)
+        let (signer, pub_bytes) = match piv
+            .generate(key_name.clone(), YubikeySlot::Authentication)
             .await
         {
-            Ok(b) => b,
+            Ok(generated) => generated,
             Err(e) => {
                 return ControlResponse::error(
                     status::SERVER_ERROR,
@@ -64,6 +67,9 @@ pub(super) async fn security_yubikey_generate(
                 );
             }
         };
+        if let Some(security) = engine.security() {
+            security.register_signer(key_name.clone(), signer);
+        }
 
         let slot_file = pib.root().join("yubikey-slots.json");
         let entry = serde_json::json!({
@@ -103,7 +109,7 @@ pub(super) async fn security_yubikey_generate(
     }
     #[cfg(not(feature = "yubikey-piv"))]
     {
-        let _ = (key_name, pib);
+        let _ = (key_name, pib, engine);
         ControlResponse::error(
             status::NOT_FOUND,
             "yubikey-piv feature is not compiled in; rebuild ndn-fwd with --features yubikey-piv",

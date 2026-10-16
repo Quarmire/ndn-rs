@@ -25,7 +25,10 @@ pub fn format_iso_basic(unix_ns: u64) -> [u8; ISO_DATETIME_LEN] {
 
 /// Parse a 15-byte `YYYYMMDDTHHMMSS` ASCII string back into nanoseconds
 /// since the UNIX epoch. Returns `None` if `bytes` is not exactly 15
-/// ASCII characters in the expected shape.
+/// ASCII characters in the expected shape. Instants past the `u64`
+/// nanosecond range (after 2554-07-21, e.g. ndn-cxx's `99991231T235959`
+/// "never expires") saturate to `u64::MAX` — this parses untrusted cert
+/// bytes, so it must never overflow.
 pub fn parse_iso_basic(bytes: &[u8]) -> Option<u64> {
     if bytes.len() != ISO_DATETIME_LEN || bytes[8] != b'T' {
         return None;
@@ -37,7 +40,7 @@ pub fn parse_iso_basic(bytes: &[u8]) -> Option<u64> {
     let mi = read_u32(&bytes[11..13])?;
     let s = read_u32(&bytes[13..15])?;
     let secs = ymdhms_to_unix_secs(y, mo, d, h, mi, s)?;
-    Some(secs * 1_000_000_000)
+    Some(secs.saturating_mul(1_000_000_000))
 }
 
 fn write_u32(slot: &mut [u8], mut v: u32) {
@@ -158,5 +161,13 @@ mod tests {
     #[test]
     fn parse_rejects_non_digits() {
         assert!(parse_iso_basic(b"abcd0101T000000").is_none());
+    }
+
+    #[test]
+    fn far_future_saturates_instead_of_overflowing() {
+        // Year 9999 (ndn-cxx "never expires") is past u64 nanoseconds; an
+        // untrusted cert carrying it must not panic the parser.
+        assert_eq!(parse_iso_basic(b"99991231T235959"), Some(u64::MAX));
+        assert_eq!(parse_iso_basic(b"35540101T000000"), Some(u64::MAX));
     }
 }

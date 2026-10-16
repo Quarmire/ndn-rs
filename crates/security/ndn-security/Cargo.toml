@@ -22,24 +22,18 @@ thiserror     = { workspace = true }
 tracing       = { workspace = true }
 getrandom     = { workspace = true }
 web-time      = { workspace = true }
-# SQLite for the ndn-cxx-compatible pib-sqlite3 backend. `bundled` builds
-# SQLite from source (~5 s) so we don't depend on a system library, which
-# matters for cross-compilation to Android, iOS, musl, and bare-metal.
-rusqlite      = { version = "0.32", features = ["bundled"], optional = true }
 ed25519-dalek = { workspace = true, features = ["pkcs8", "batch"] }
-# SafeBag PKCS#8 round-trip helpers (the former ndn-safebag crate, now the
-# `safebag` module) back FilePib's algorithm-aware on-disk format.
+# SafeBag PKCS#8 round-trip helpers (the `safebag` module) back FilePib's
+# algorithm-aware on-disk format.
 # `rand_core::OsRng` for ECDSA keygen — same RNG the safebag module uses.
 rand_core     = { version = "0.6", default-features = false, features = ["getrandom"] }
 blake3        = { workspace = true }
-# rustcrypto crates for ndn-cxx-compatible FileTpm + SafeBag.
+# rustcrypto crates for ECDSA-P256 / RSA signing+verification and SafeBag.
 # Versions matched to the existing workspace `p256 = 0.13` (rustcrypto
 # 0.13-era release cycle) so all rustcrypto crates share traits cleanly.
 # Pure-Rust, no system libs — keeps mobile/embedded/wasm targets clean.
 rsa           = { version = "0.9",  default-features = false, features = ["std", "sha2"] }
 p256-ecdsa    = { package = "p256", version = "0.13", default-features = false, features = ["std", "ecdsa", "pkcs8"] }
-pkcs1         = { version = "0.7",  features = ["std", "alloc"] }
-sec1          = { version = "0.7",  default-features = false, features = ["std", "alloc", "der", "pem", "pkcs8"] }
 pkcs8         = { version = "0.10", default-features = false, features = ["std", "alloc", "encryption", "pem"] }
 pkcs5         = { version = "0.7",  default-features = false, features = ["alloc", "pbes2"] }
 sha2          = { workspace = true }
@@ -70,15 +64,20 @@ bincode = { workspace = true, optional = true }
 rabe    = { version = "0.4", features = ["serde"], optional = true }
 # Custody/key-locator layer (feature: custodian; was the ndn-custodian crate).
 async-trait = { workspace = true, optional = true }
+# ndn-cxx key-store compatibility (feature: ndnsec-compat): `SqlitePib`
+# (pib-sqlite3) and `FileTpm` (tpm-file). `bundled` builds SQLite from
+# source so no system libsqlite3 is required (cross-compiles to Android,
+# iOS, musl). pkcs1 / sec1 carry the tpm-file on-disk key formats.
+rusqlite      = { version = "0.32", features = ["bundled"], optional = true }
+pkcs1         = { version = "0.7",  features = ["std", "alloc"], optional = true }
+sec1          = { version = "0.7",  default-features = false, features = ["std", "alloc", "der", "pem", "pkcs8"], optional = true }
 
 [features]
-default     = ["sqlite-pib"]
 yubikey-piv = ["dep:yubikey"]
-# SQLite-backed PIB compatible with ndn-cxx pib-sqlite3 (default-on so
-# existing builds get the new backend without flag changes). Pulls in
-# rusqlite with the `bundled` feature so SQLite is built from source —
-# no system libsqlite3 required, identical behaviour on every target.
-sqlite-pib  = ["dep:rusqlite"]
+# Read/write ndn-cxx's `~/.ndn` key store: `sqlite_pib::SqlitePib`
+# (pib.db) and `file_tpm::FileTpm` (ndnsec-key-file/). Off by default;
+# pulls rusqlite (bundled SQLite, not wasm-buildable), pkcs1 and sec1.
+ndnsec-compat = ["dep:rusqlite", "dep:pkcs1", "dep:sec1"]
 # Attribute-Based Encryption (was the ndn-abe crate). Off by default.
 abe         = ["dep:rabe", "dep:bincode", "dep:ndn-foundation-types"]
 # Custodian trait + KeyId (was the ndn-custodian crate). Off by default.

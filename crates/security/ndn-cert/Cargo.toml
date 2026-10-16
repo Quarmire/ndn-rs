@@ -20,7 +20,8 @@ wasm-client = []
 [dependencies]
 ndn-tlv      = { workspace = true, features = ["std"] }
 ndn-packet   = { workspace = true, features = ["std"] }
-ndn-security = { path = "../ndn-security", default-features = false }
+ndn-security = { workspace = true }
+ndn-trust-envelope = { workspace = true }
 bytes        = { workspace = true, features = ["std"] }
 serde        = { workspace = true }
 serde_json   = { workspace = true }
@@ -41,6 +42,7 @@ sha2         = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }
+tempfile = "3"
 
 [lints]
 workspace = true

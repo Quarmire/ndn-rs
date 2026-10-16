@@ -53,12 +53,9 @@ tokio-util    = { workspace = true, features = ["rt"] }
 tracing       = { workspace = true }
 thiserror     = { workspace = true }
 anyhow        = { workspace = true }
-# `ndn-security` is now portable: `default-features = false` skips the
-# `sqlite-pib` feature (libsqlite3-sys doesn't build on wasm), so the
-# pure-Rust signing + verification surface (`Validator`, `SecurityManager`,
-# `Signer`) builds for `wasm32-unknown-unknown`.  Native consumers re-
-# enable the default feature set via their own dep graphs; cargo unifies.
-ndn-security  = { path = "../../security/ndn-security", default-features = false }
+# Pure-Rust signing + verification surface (`Validator`, `SecurityManager`,
+# `Signer`); builds for `wasm32-unknown-unknown`.
+ndn-security  = { workspace = true }
 
 # Tokio's `rt-multi-thread` feature is unavailable on wasm32; the
 # engine uses the runtime-abstraction shim (ndn-runtime) on wasm and only

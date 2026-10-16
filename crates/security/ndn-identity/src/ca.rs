@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ndn_cert::{
-    AcceptAllIssuance, CaConfig, CaState, ChallengeHandler, HierarchicalPolicy, IssuancePolicy,
-    NamespacePolicy,
+    AcceptAllIssuance, CaConfig, CaState, CaStore, ChallengeHandler, HierarchicalPolicy,
+    IssuancePolicy, NamespacePolicy,
 };
 use ndn_packet::encode::DataBuilder;
 use ndn_packet::{Name, SignatureType};
@@ -19,6 +19,8 @@ pub struct NdncertCaBuilder {
     prefix: Option<Name>,
     info: String,
     identity: Option<Arc<SecurityManager>>,
+    signing_key: Option<Name>,
+    store: Option<Arc<dyn CaStore>>,
     challenges: Vec<Box<dyn ChallengeHandler>>,
     policy: Box<dyn NamespacePolicy>,
     issuance: Option<Box<dyn IssuancePolicy>>,
@@ -33,6 +35,8 @@ impl NdncertCaBuilder {
             prefix: None,
             info: "NDN Certificate Authority".to_string(),
             identity: None,
+            signing_key: None,
+            store: None,
             challenges: Vec::new(),
             policy: Box::new(HierarchicalPolicy),
             issuance: None,
@@ -56,8 +60,19 @@ impl NdncertCaBuilder {
         self
     }
 
+    /// Sign issued certs and CA responses with `identity`'s active key (its
+    /// certificate must be in the identity's cert cache or trust anchors).
     pub fn signing_identity(mut self, identity: &Identity) -> Self {
         self.identity = Some(identity.manager_arc());
+        self.signing_key = Some(identity.key_name().clone());
+        self
+    }
+
+    /// Persist issued certs and revocations in `store` and reload them at
+    /// [`build`](Self::build) (see [`CaState::with_store`]). Without one the
+    /// CA forgets both on restart.
+    pub fn store(mut self, store: Arc<dyn CaStore>) -> Self {
+        self.store = Some(store);
         self
     }
 
@@ -123,10 +138,25 @@ impl NdncertCaBuilder {
             policy: self.policy,
             issuance: self.issuance.unwrap_or_else(|| Box::new(AcceptAllIssuance)),
             emit_attestations: self.emit_attestations,
+            signing_key: self.signing_key,
         };
 
+        let state = match self.store {
+            Some(store) => CaState::with_store(config, manager, store)?,
+            None => CaState::new(config, manager),
+        };
+        if state.response_signer().is_none() {
+            return Err(IdentityError::Enrollment(format!(
+                "CA signing key {} has no signer or certificate in the signing identity",
+                state
+                    .signing_key_name()
+                    .map(|k| k.to_string())
+                    .unwrap_or_else(|| "<none>".to_string())
+            )));
+        }
+
         Ok(NdncertCa {
-            state: Arc::new(CaState::new(config, manager)),
+            state: Arc::new(state),
             prefix,
         })
     }
@@ -135,25 +165,6 @@ impl NdncertCaBuilder {
 pub struct NdncertCa {
     state: Arc<CaState>,
     prefix: Name,
-}
-
-/// Configuration for an APPROVE-FEED running alongside the CA's `/CA/*`
-/// service — the cross-process device-approval transport
-/// ([`crate::device_approval_net`]).
-///
-/// `store` **must** be the same `PendingApprovalStore` the CA's
-/// `DeviceApprovalChallenge` reads (so a networked approval flips the request
-/// the CHALLENGE round is polling). `producer` is registered for
-/// `/<prefix>/CA/APPROVE-FEED` on its own face — a longer prefix than the
-/// main `/<prefix>/CA`, so the forwarder routes feed Interests to it — and
-/// `side` is a separate consumer for the reverse pull.
-pub struct CaApproveFeed {
-    pub producer: ndn_app::Producer,
-    pub side: ndn_app::Consumer,
-    pub store: ndn_cert::challenge::device_approval::PendingApprovalStore,
-    pub resolver: Arc<ndn_security::did::UniversalResolver>,
-    pub authorizer: Arc<dyn crate::device_approval_net::ApproverAuthorizer>,
-    pub timeout: Duration,
 }
 
 impl NdncertCa {
@@ -165,24 +176,30 @@ impl NdncertCa {
         &self.prefix
     }
 
-    /// Run the `/CA/*` service and an [`CaApproveFeed`] concurrently, each until
-    /// its connection closes. Use this instead of [`serve`](Self::serve) when
-    /// the CA offers cross-process device-approval.
-    pub async fn serve_with_feed(
+    /// Run the `/CA/*` service and a canonical (validator-checked)
+    /// [`ApprovalFeed`](crate::ApprovalFeed) concurrently, each until its
+    /// connection closes. Use this instead of [`serve`](Self::serve) when the
+    /// CA offers cross-process device-approval
+    /// ([`crate::device_approval_net`]).
+    ///
+    /// The feed's sink **must** be the same `PendingApprovalStore` the CA's
+    /// `DeviceApprovalChallenge` reads, so a networked approval flips the
+    /// request the CHALLENGE round is polling. `feed_producer` serves
+    /// `/<prefix>/CA/APPROVE-FEED` on its own face — a longer prefix than the
+    /// main `/<prefix>/CA`, so the forwarder routes feed Interests to it — and
+    /// `feed_side` is a separate consumer for the reverse pull.
+    pub async fn serve_with_feed<S>(
         self,
         ca_producer: ndn_app::Producer,
-        feed: CaApproveFeed,
-    ) -> Result<(), IdentityError> {
-        let main = self.serve(ca_producer);
-        let feed_loop = crate::device_approval_net::serve_approve_feed(
-            feed.producer,
-            feed.side,
-            feed.store,
-            feed.resolver,
-            feed.authorizer,
-            feed.timeout,
-        );
-        let (main_res, feed_res) = tokio::join!(main, feed_loop);
+        feed: crate::ApprovalFeed<S>,
+        feed_producer: ndn_app::Producer,
+        feed_side: ndn_app::Consumer,
+    ) -> Result<(), IdentityError>
+    where
+        S: crate::ApprovalSink + Clone + Send + Sync + 'static,
+    {
+        let (main_res, feed_res) =
+            tokio::join!(self.serve(ca_producer), feed.serve(feed_producer, feed_side));
         main_res?;
         feed_res?;
         Ok(())
@@ -312,6 +329,13 @@ async fn handle_interest(
                 return None;
             }
         }
+    }
+
+    // NDNCERT 0.3 `<ca-prefix>/CA/REVOKE/...`: the possession-proof request
+    // rides in ApplicationParameters; the outcome is a status, never an error.
+    if suffix.contains("/CA/REVOKE") {
+        let body = interest.app_parameters().cloned().unwrap_or_default();
+        return Some(CaReply::Body(state.handle_revoke(&body).await));
     }
 
     warn!(name = %name_str, "NDNCERT: unrecognised Interest");

@@ -1,0 +1,178 @@
+//! On-disk store of the trust contexts a node has adopted, kept beside its PIB
+//! so adoption survives restarts:
+//!
+//! ```text
+//! <pib_root>/contexts/<hex(namespace URI)>.tc   # the SIGNED context Data wire
+//! ```
+//!
+//! Files hold exactly the Data that was verified on adoption. Loading
+//! ([`load_persisted_contexts`]) re-verifies each file's signature against the
+//! anchors it carries and refuses a file stored under another namespace's
+//! name, so an edited or swapped file never reaches the keyring.
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use bytes::Bytes;
+use ndn_packet::{Data, Name};
+use ndn_security::{Keyring, SignedTrustContext};
+use ndn_trust_envelope::TrustEnvelope;
+
+use crate::onboarding::{AdoptError, adopt_anchor_envelope, adopt_into, open_signed_context};
+
+/// Directory (under the PIB root) holding adopted contexts.
+pub const CONTEXTS_DIR: &str = "contexts";
+/// File extension of a stored context.
+pub const CONTEXT_FILE_EXT: &str = "tc";
+
+/// Why a stored context could not be written or loaded.
+#[derive(Debug, thiserror::Error)]
+pub enum ContextStoreError {
+    #[error("I/O on {path}: {source}")]
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("{path} is not a decodable NDN Data packet: {reason}")]
+    BadData { path: PathBuf, reason: String },
+    #[error("{path} holds the context for {namespace}, which is stored under another name")]
+    Misfiled { path: PathBuf, namespace: String },
+    #[error(transparent)]
+    Adopt(#[from] AdoptError),
+}
+
+/// `<pib_root>/contexts/<hex of the namespace URI>.tc`.
+pub fn context_file_path(pib_root: &Path, namespace: &Name) -> PathBuf {
+    let uri = namespace.to_string();
+    let mut file = String::with_capacity(uri.len() * 2 + 1 + CONTEXT_FILE_EXT.len());
+    for b in uri.as_bytes() {
+        file.push_str(&format!("{b:02x}"));
+    }
+    file.push('.');
+    file.push_str(CONTEXT_FILE_EXT);
+    pib_root.join(CONTEXTS_DIR).join(file)
+}
+
+/// Persist `context_data` (the signed Data of `context`) under `pib_root`,
+/// replacing any earlier version of the same namespace. The write is atomic
+/// (temp file + rename) so a crash never leaves a truncated context.
+pub fn persist_context(
+    pib_root: &Path,
+    context: &SignedTrustContext,
+    context_data: &Data,
+) -> Result<PathBuf, ContextStoreError> {
+    let path = context_file_path(pib_root, context.namespace());
+    let io = |path: &Path| {
+        let path = path.to_path_buf();
+        move |source| ContextStoreError::Io { path, source }
+    };
+    let dir = pib_root.join(CONTEXTS_DIR);
+    std::fs::create_dir_all(&dir).map_err(io(&dir))?;
+    let tmp = path.with_extension("tc.tmp");
+    std::fs::write(&tmp, context_data.raw()).map_err(io(&tmp))?;
+    std::fs::rename(&tmp, &path).map_err(io(&path))?;
+    Ok(path)
+}
+
+/// Load every stored context under `pib_root` into `keyring`, re-verifying
+/// each one. Returns one entry per `*.tc` file (sorted by path) with the
+/// adopted context or why that file was refused; a missing store directory
+/// yields an empty list.
+pub fn load_persisted_contexts(
+    pib_root: &Path,
+    keyring: &Keyring,
+) -> Result<Vec<(PathBuf, Result<Arc<SignedTrustContext>, ContextStoreError>)>, ContextStoreError> {
+    let dir = pib_root.join(CONTEXTS_DIR);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => return Err(ContextStoreError::Io { path: dir, source }),
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|ext| ext == CONTEXT_FILE_EXT))
+        .collect();
+    paths.sort();
+    Ok(paths
+        .into_iter()
+        .map(|path| {
+            let result = load_one(pib_root, &path, keyring);
+            (path, result)
+        })
+        .collect())
+}
+
+fn load_one(
+    pib_root: &Path,
+    path: &Path,
+    keyring: &Keyring,
+) -> Result<Arc<SignedTrustContext>, ContextStoreError> {
+    let wire = std::fs::read(path).map_err(|source| ContextStoreError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let data = Data::decode(Bytes::from(wire)).map_err(|e| ContextStoreError::BadData {
+        path: path.to_path_buf(),
+        reason: e.to_string(),
+    })?;
+    // Re-verify against the context's own anchors (the out-of-band pin was
+    // checked on first adoption), and check the file is stored under its own
+    // namespace *before* touching the keyring, so a context copied over
+    // another namespace's file is refused.
+    let (ctx, _signer) = open_signed_context(&data)?;
+    if context_file_path(pib_root, ctx.namespace()) != path {
+        return Err(ContextStoreError::Misfiled {
+            path: path.to_path_buf(),
+            namespace: ctx.namespace().to_string(),
+        });
+    }
+    Ok(adopt_into(keyring, ctx)?)
+}
+
+/// `ndn-fwd adopt`'s one-shot: TOFU-adopt the context carried inline by an
+/// anchor `envelope` and persist it under `pib_root`. Contexts already stored
+/// there are loaded first, so anti-rollback holds across invocations (an
+/// older version never replaces a newer stored one). Returns the adopted
+/// context and the file it was written to.
+pub fn adopt_envelope_into_store(
+    pib_root: &Path,
+    envelope: &TrustEnvelope,
+) -> Result<(Arc<SignedTrustContext>, PathBuf), ContextStoreError> {
+    let keyring = Keyring::new();
+    // A stored file that no longer verifies must not block a fresh adoption;
+    // it is simply replaced below.
+    for (path, result) in load_persisted_contexts(pib_root, &keyring)? {
+        if let Err(e) = result {
+            tracing::warn!(path = %path.display(), error = %e, "ignoring unloadable stored trust context");
+        }
+    }
+    let (ctx, data) = adopt_anchor_envelope(&keyring, envelope)?;
+    let path = persist_context(pib_root, &ctx, &data)?;
+    Ok((ctx, path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_name_is_hex_of_the_namespace_uri() {
+        let ns: Name = "/home/bob".parse().unwrap();
+        assert_eq!(
+            context_file_path(Path::new("/pib"), &ns),
+            PathBuf::from("/pib/contexts/2f686f6d652f626f62.tc")
+        );
+    }
+
+    #[test]
+    fn missing_store_loads_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let keyring = Keyring::new();
+        assert!(
+            load_persisted_contexts(dir.path(), &keyring)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(keyring.is_empty());
+    }
+}

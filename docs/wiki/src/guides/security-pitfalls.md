@@ -46,8 +46,10 @@ works."
 These exist for tests and degraded/offline modes and must never reach
 production:
 
-- `InsecureTrust` — accepts without checking.
-- `accept_all` schema / `AcceptAllPolicy` — skips schema enforcement.
+- `TrustSchema::accept_all()` — skips the name check; any key chaining to an
+  anchor may sign anything.
+- DV routing `trust.mode = "insecure"` (`DvInsecure`) — accepts unsigned
+  routing updates.
 - `AcceptAllIssuance` — a CA that issues to anyone.
 
 They are loud in the API for a reason; confirm none survive into a deployed

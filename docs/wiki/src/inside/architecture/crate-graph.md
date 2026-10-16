@@ -32,6 +32,7 @@ below is interactive (drag to pan, scroll to zoom).
     { "label": "Security", "nodes": [
       { "id": "ndn-security" },
       { "id": "ndn-cert" },
+      { "id": "ndn-trust-envelope" },
       { "id": "ndn-identity" }
     ]},
     { "label": "App & platform", "nodes": [
@@ -63,6 +64,8 @@ below is interactive (drag to pan, scroll to zoom).
     ["ndn-engine", "ndn-security"],
     ["ndn-security", "ndn-packet"],
     ["ndn-cert", "ndn-security"],
+    ["ndn-cert", "ndn-trust-envelope"],
+    ["ndn-trust-envelope", "ndn-tlv"],
     ["ndn-identity", "ndn-cert"],
     ["ndn-app", "ndn-engine"],
     ["ndn-app", "ndn-security"],

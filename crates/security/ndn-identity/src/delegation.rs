@@ -24,8 +24,8 @@ use ndn_packet::Name;
 use ndn_security::verifier::verify_by_sig_type;
 use ndn_security::{Certificate, VerifyOutcome};
 
+use crate::identity_ref::pattern_under;
 use crate::transition::{identity_of, key_name_of};
-use crate::trust_context::pattern_under;
 use crate::{CapabilitySet, IdentityRef};
 
 /// A scoped grant from a principal to a subordinate (device) key.
@@ -158,7 +158,7 @@ impl Delegation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::trust_context::{IdentityLifetime, KeyId};
+    use crate::{IdentityLifetime, KeyId};
     use ndn_security::SecurityManager;
 
     /// Issue a principal cert and a subordinate cert under `sub_name`, signed by
@@ -245,7 +245,6 @@ mod tests {
 
     #[test]
     fn from_derived_wires_identity_ref_into_the_frame() {
-        use crate::TrustContext;
         use ndn_security::custodian::CustodianRef;
 
         let parent = IdentityRef {
@@ -256,15 +255,9 @@ mod tests {
             derived_from: None,
             capabilities: CapabilitySet::default(),
         };
-        let ctx = TrustContext::adopted(
-            "/alice".parse().unwrap(),
-            std::time::SystemTime::UNIX_EPOCH,
-            "test",
-        );
-        let derived = ctx.derive_sub(
+        let derived = parent.derive_sub(
             "/alice/device/phone".parse().unwrap(),
             IdentityLifetime::Persistent,
-            &parent,
             CustodianRef::InPage,
         );
 

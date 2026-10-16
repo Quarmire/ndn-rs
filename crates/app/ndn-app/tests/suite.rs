@@ -15,6 +15,8 @@ mod demux;
 mod detached_engine;
 #[path = "embedded.rs"]
 mod embedded;
+#[path = "engine_cert_fetch.rs"]
+mod engine_cert_fetch;
 #[path = "local_throughput.rs"]
 mod local_throughput;
 #[path = "node.rs"]

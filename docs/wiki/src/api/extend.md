@@ -31,8 +31,7 @@ graph TB
 | `DiscoveryProtocol` (+ contexts) | `ndn_discovery_core` (`crates/forwarding/ndn-discovery-core/src/`) | Neighbor discovery contract. |
 | `MgmtModule` + `MgmtContext` + `MgmtRouter` | `ndn_mgmt::module` (`crates/forwarding/ndn-mgmt/src/module.rs`) | Per-module management verb authorship. |
 | `NotificationStream` | `ndn_mgmt::notification` | Async notification dataset publisher. |
-| `TrustPolicy` | `ndn_security::trust` (`crates/security/ndn-security/src/trust.rs`) | "Should this signing key be trusted for this name?" |
-| `ValidationPolicy` | `ndn_security::validation_policy` | Pluggable verdict chain. |
+| `TrustSchema` + `SchemaRule` | `ndn_security::trust_schema` (`crates/security/ndn-security/src/trust_schema.rs`) | The trust policy: "may this key sign this name?"; executed by `Validator`. |
 | `Signer` / `Verifier` | `ndn_security::{signer, verifier}` | Crypto primitives. |
 
 
@@ -189,14 +188,14 @@ The verb catalog itself is in [Management verbs](../reference/mgmt-verbs.md).
 
 ## Trust and validation
 
-`TrustPolicy` answers "should this key sign that name?". The
-`KeyChain` consults it before signing; the validator consults it
-before accepting a verified `Data`. `ValidationPolicy` chains
-verdicts so a deployment can compose hierarchical + LVS + custom
-overrides.
+The trust policy is a `TrustSchema`: `SchemaRule`s (`"<data pattern> =>
+<key pattern>"`, OR'd) plus an optional LVS model. A `Validator`
+executes it — it checks each Data's `(data name, key name)` pair against
+the schema and walks the certificate chain to a trust anchor. Custom
+policy is expressed as rules or LVS, not as a trait impl.
 
-In-tree references: `crates/security/ndn-security/src/trust.rs`,
-`crates/security/ndn-security/src/validation_policy.rs`.
+In-tree references: `crates/security/ndn-security/src/trust_schema.rs`,
+`crates/security/ndn-security/src/validator/`.
 Concrete policies and the LVS rule schema: [Trust policies](../reference/trust-policies.md).
 
 ## Conventions

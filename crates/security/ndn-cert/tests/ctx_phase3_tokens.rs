@@ -53,6 +53,40 @@ async fn ctx03_redeemed_token_reuse_rejected() {
     );
 }
 
+/// CTX.03 across a restart: with a persistent store, a token redeemed before
+/// the CA restarts is refused afterwards even though the config re-adds it;
+/// only a hash of it lands on disk.
+#[tokio::test]
+async fn ctx03_redeemed_token_stays_spent_across_restart() {
+    use std::sync::Arc;
+    use ndn_cert::{CaStore, FileCaStore};
+
+    let dir = tempfile::tempdir().unwrap();
+    let open = || -> Arc<dyn CaStore> { Arc::new(FileCaStore::open(dir.path()).unwrap()) };
+
+    let store = TokenStore::with_store(open()).unwrap();
+    store.add_many(["one-shot", "spare"]);
+    let ch = TokenChallenge::new(store);
+    assert!(is_approved(&verify_token(&ch, "/home/bob/alice", "one-shot").await));
+    drop(ch);
+
+    // Restart: same config tokens, same store directory.
+    let store = TokenStore::with_store(open()).unwrap();
+    store.add_many(["one-shot", "spare"]);
+    assert_eq!(store.len(), 1, "the redeemed token is not re-armed");
+    let ch = TokenChallenge::new(store);
+    let replay = verify_token(&ch, "/home/bob/mallory", "one-shot").await;
+    assert!(
+        matches!(replay, ChallengeOutcome::Denied(_)),
+        "redeemed token must be refused after restart"
+    );
+    assert!(is_approved(&verify_token(&ch, "/home/bob/bob", "spare").await));
+
+    let hashes = open().redeemed_tokens().unwrap();
+    assert_eq!(hashes.len(), 2);
+    assert!(hashes.iter().all(|h| !h.contains("one-shot") && !h.contains("spare")));
+}
+
 /// CTX.04 (TTL): a token past its TTL is rejected.
 #[tokio::test]
 async fn ctx04_expired_token_rejected() {

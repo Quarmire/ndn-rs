@@ -159,6 +159,39 @@ impl FilePib {
         list_names_in(&self.root.join("keys"))
     }
 
+    /// Keys stored for `identity`, sorted by name: every key whose name
+    /// starts with `<identity>/KEY/`. Covers each naming form in use —
+    /// `<identity>/KEY/<keyid>`, `/KEY/root`, legacy `/KEY/self`, and
+    /// `ndn-sec keygen`'s cert-named `<identity>/KEY/<keyid>/self/v=0`.
+    pub fn identity_keys(&self, identity: &Name) -> Result<Vec<Name>, PibError> {
+        let mut keys: Vec<Name> = self
+            .list_keys()?
+            .into_iter()
+            .filter(|k| crate::manager::is_key_of(k, identity))
+            .collect();
+        keys.sort();
+        Ok(keys)
+    }
+
+    /// The key `identity` signs with, `None` if it has none. Among its keys
+    /// ([`identity_keys`](Self::identity_keys)) the one whose stored
+    /// certificate is valid now and was issued most recently wins — a
+    /// freshly enrolled key supersedes an older self-signed one. Without a
+    /// currently valid certificate, the first key in name order is used.
+    pub fn default_key(&self, identity: &Name) -> Result<Option<Name>, PibError> {
+        let keys = self.identity_keys(identity)?;
+        let certified = keys
+            .iter()
+            .filter_map(|k| {
+                let cert = self.get_cert(k).ok()?;
+                cert.is_valid_now().then_some((cert.valid_from, k))
+            })
+            // Latest `valid_from`; on a tie the smaller name wins.
+            .max_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(a.1)))
+            .map(|(_, k)| k.clone());
+        Ok(certified.or_else(|| keys.into_iter().next()))
+    }
+
     pub fn store_cert(&self, key_name: &Name, cert: &Certificate) -> Result<(), PibError> {
         let dir = self.key_dir(key_name)?;
         std::fs::write(dir.join("cert.ndnc"), encode_cert(cert))?;
@@ -794,4 +827,54 @@ mod tests {
     // the key after import. Keeping this unit-test surface narrow to
     // the error paths avoids duplicating cert-wire helpers across
     // crates.
+
+    /// `default_key` only considers the identity's own keys and prefers the
+    /// most recently issued valid certificate (e.g. an enrolled key).
+    #[test]
+    fn default_key_selects_identity_key_most_recently_certified() {
+        let (_dir, pib) = tmp_pib();
+        let n = |s: &str| -> Name { s.parse().unwrap() };
+        let cert = |name: &Name, valid_from: u64, valid_until: u64| Certificate {
+            name: Arc::new(name.clone()),
+            public_key: Bytes::from_static(&[1; 32]),
+            valid_from,
+            valid_until,
+            issuer: None,
+            signed_region: None,
+            sig_value: None,
+            sig_type: ndn_packet::SignatureType::SignatureEd25519,
+        };
+        let now = now_ns();
+        let hour = 3_600_000_000_000;
+
+        let id = n("/home/bob/node");
+        let older = n("/home/bob/node/KEY/aa");
+        let newer = n("/home/bob/node/KEY/bb");
+        let expired = n("/home/bob/node/KEY/00");
+        let other = n("/home/bob/node/sub/KEY/zz");
+        for k in [&older, &newer, &expired, &other] {
+            pib.generate_ed25519(k).unwrap();
+        }
+        pib.store_cert(&older, &cert(&older, now - 2 * hour, now + hour))
+            .unwrap();
+        pib.store_cert(&newer, &cert(&newer, now - hour, now + hour))
+            .unwrap();
+        pib.store_cert(&expired, &cert(&expired, now - 3 * hour, now - hour))
+            .unwrap();
+        pib.store_cert(&other, &cert(&other, now, now + hour)).unwrap();
+
+        assert_eq!(
+            pib.identity_keys(&id).unwrap(),
+            vec![expired.clone(), older, newer.clone()]
+        );
+        assert_eq!(pib.default_key(&id).unwrap(), Some(newer));
+        assert_eq!(pib.default_key(&n("/home/bob")).unwrap(), None);
+
+        // No valid cert at all: first key in name order.
+        let (_dir2, bare) = tmp_pib();
+        for k in ["/x/KEY/b", "/x/KEY/a"] {
+            bare.generate_ed25519(&n(k)).unwrap();
+        }
+        assert_eq!(bare.default_key(&n("/x")).unwrap(), Some(n("/x/KEY/a")));
+    }
 }

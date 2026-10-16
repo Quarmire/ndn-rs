@@ -49,7 +49,7 @@ only deliberately, and run `build_all.sh` when you do.
 | **`ndn-transport`** | `FaceId`, `FaceError`, `FaceKind`, `FacePersistency`, `Face`, `Transport`, `LinkService`, `ForwardingAction`, `NackReason` | `ndn-ext`, `ndn-fwd`, `ndn-mobile`, `ndn-sim` |
 | **`ndn-app`** | `Node`, `Consumer`, `Producer`, `EngineAppExt`, `Subscription`, `Publisher`, `prelude` | `ndn-ext`, `ndn-mobile`, `ndn-sim`, `ndn-repo`, `ndn-dashboard` |
 | **`ndn-engine`** | `ForwarderEngine`, `EngineBuilder`, `EngineConfig`, `ShutdownHandle`, `pipeline::{ForwardingAction, PacketContext, DecodedPacket, …}` | `ndn-fwd`, `ndn-ext`, `ndn-sim` |
-| **`ndn-security`** | `Signer`, `Validator`, `KeyChain`, `SafeData`, `Verifier`, `TrustPolicy`, `SecurityManager`, `safebag::SafeBag`, `custodian` (feature) | `ndn-ext`, `ndn-mobile`, `ndn-dashboard`, `ndn-fwd` |
+| **`ndn-security`** | `Signer`, `Validator`, `TrustSchema`, `KeyChain`, `SafeData`, `Verifier`, `SecurityManager`, `safebag::SafeBag`, `custodian` (feature) | `ndn-ext`, `ndn-mobile`, `ndn-dashboard`, `ndn-fwd` |
 
 Names in the table are verified against each crate's `src/lib.rs`. Two nuances
 worth remembering when you edit signatures:

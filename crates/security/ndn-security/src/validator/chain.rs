@@ -18,8 +18,9 @@ use super::{
 enum WalkOutcome {
     /// The chain reached a trust anchor; carries the cert names walked.
     Anchored(Vec<Name>),
-    /// A cert in the chain couldn't be resolved (cache miss + no/failed fetch).
-    Pending,
+    /// A cert in the chain couldn't be resolved (cache miss + no/failed fetch);
+    /// carries the name of the first unresolved cert.
+    Pending(Arc<Name>),
     /// The chain is invalid (bad signature, schema mismatch, revoked, cycle, …).
     Invalid(TrustError),
 }
@@ -31,18 +32,43 @@ impl Validator {
     /// its issuer's key, until a trust anchor terminates the walk. Missing
     /// certificates are fetched via the `CertFetcher` if configured.
     pub async fn validate_chain(&self, data: &Data) -> ValidationResult {
-        let result = self.validate_chain_inner(data).await;
-        match &result {
+        let (result, _missing) = self.validate_chain_inner(data, true).await;
+        self.bump_for_result(&result);
+        result
+    }
+
+    /// Validate by walking the full certificate chain using **only certs
+    /// already cached** — never awaits the `CertFetcher`. On a cache miss
+    /// returns `(Pending, Some(missing_cert_name))` so the caller can fetch that
+    /// cert off the hot path and re-validate later (the forwarder's
+    /// `ValidationStage` does exactly this: an inline network fetch would stall
+    /// the pipeline that has to deliver the cert's own Data). The name is `Some`
+    /// iff the result is `Pending`. Counters bump as for [`Self::validate_chain`].
+    pub async fn validate_chain_cached(
+        &self,
+        data: &Data,
+    ) -> (ValidationResult, Option<Arc<Name>>) {
+        let (result, missing) = self.validate_chain_inner(data, false).await;
+        self.bump_for_result(&result);
+        (result, missing)
+    }
+
+    fn bump_for_result(&self, result: &ValidationResult) {
+        match result {
             ValidationResult::Valid(_) => self.bump_verified(),
             ValidationResult::Invalid(_) => self.bump_rejected(),
             ValidationResult::Pending => {}
         }
-        result
     }
 
-    async fn validate_chain_inner(&self, data: &Data) -> ValidationResult {
+    async fn validate_chain_inner(
+        &self,
+        data: &Data,
+        fetch: bool,
+    ) -> (ValidationResult, Option<Arc<Name>>) {
+        let result = |r: ValidationResult| (r, None);
         let Some(sig_info) = data.sig_info() else {
-            return ValidationResult::Invalid(TrustError::InvalidSignature);
+            return result(ValidationResult::Invalid(TrustError::InvalidSignature));
         };
 
         if sig_info.sig_type == SignatureType::DigestSha256 {
@@ -52,16 +78,16 @@ impl Validator {
                 // Re-decode of already-validated bytes is infallible; propagate
                 // instead of panicking in the security hot path (audit N-2).
                 let Ok(inner) = Data::decode(data.raw().clone()) else {
-                    return ValidationResult::Invalid(TrustError::InvalidSignature);
+                    return result(ValidationResult::Invalid(TrustError::InvalidSignature));
                 };
                 let safe = SafeData {
                     inner,
                     trust_path: TrustPath::DigestSha256,
                     verified_at: now_ns(),
                 };
-                return ValidationResult::Valid(Box::new(safe));
+                return result(ValidationResult::Valid(Box::new(safe)));
             }
-            return ValidationResult::Invalid(TrustError::InvalidSignature);
+            return result(ValidationResult::Invalid(TrustError::InvalidSignature));
         }
 
         // KeyDigest cannot drive a fetch — it requires a pre-loaded cert.
@@ -70,10 +96,10 @@ impl Validator {
             Some(ndn_packet::KeyLocator::KeyDigest(digest)) => {
                 match self.cert_cache.get_by_key_digest(digest) {
                     Some(cert) => Arc::clone(&cert.name),
-                    None => return ValidationResult::Invalid(TrustError::InvalidSignature),
+                    None => return result(ValidationResult::Invalid(TrustError::InvalidSignature)),
                 }
             }
-            None => return ValidationResult::Invalid(TrustError::InvalidSignature),
+            None => return result(ValidationResult::Invalid(TrustError::InvalidSignature)),
         };
 
         // The chain is walked against the schema/anchors of the context
@@ -86,22 +112,23 @@ impl Validator {
                 data.signed_region(),
                 data.sig_value(),
                 sig_info.sig_type,
+                fetch,
             )
             .await
         {
             WalkOutcome::Anchored(chain_names) => {
                 let Ok(inner) = Data::decode(data.raw().clone()) else {
-                    return ValidationResult::Invalid(TrustError::InvalidSignature);
+                    return result(ValidationResult::Invalid(TrustError::InvalidSignature));
                 };
                 let safe = SafeData {
                     inner,
                     trust_path: TrustPath::CertChain(chain_names),
                     verified_at: now_ns(),
                 };
-                ValidationResult::Valid(Box::new(safe))
+                result(ValidationResult::Valid(Box::new(safe)))
             }
-            WalkOutcome::Pending => ValidationResult::Pending,
-            WalkOutcome::Invalid(e) => ValidationResult::Invalid(e),
+            WalkOutcome::Pending(missing) => (ValidationResult::Pending, Some(missing)),
+            WalkOutcome::Invalid(e) => result(ValidationResult::Invalid(e)),
         }
     }
 
@@ -152,11 +179,12 @@ impl Validator {
                 &signed_region,
                 sig_value,
                 sig_info.sig_type,
+                true,
             )
             .await
         {
             WalkOutcome::Anchored(_) => InterestValidationOutcome::Valid,
-            WalkOutcome::Pending => InterestValidationOutcome::Pending,
+            WalkOutcome::Pending(_) => InterestValidationOutcome::Pending,
             WalkOutcome::Invalid(e) => InterestValidationOutcome::Invalid(e),
         }
     }
@@ -165,7 +193,8 @@ impl Validator {
     /// from `(first_signed_region, first_sig_value)` signed by `first_key`, walk
     /// cert → issuer until a trust anchor of the context governing
     /// `context_name` terminates the chain. Missing certs are fetched via the
-    /// `CertFetcher` if configured (→ [`WalkOutcome::Pending`] on a miss).
+    /// `CertFetcher` when `fetch` is set and one is configured (→
+    /// [`WalkOutcome::Pending`] naming the unresolved cert on a miss).
     async fn walk_to_anchor(
         &self,
         context_name: &Name,
@@ -173,6 +202,7 @@ impl Validator {
         first_signed_region: &[u8],
         first_sig_value: &[u8],
         first_sig_type: SignatureType,
+        fetch: bool,
     ) -> WalkOutcome {
         let ctx = self.keyring.context_for(context_name);
         if !ctx.authorizes(context_name, &first_key) {
@@ -233,9 +263,9 @@ impl Validator {
                 };
             }
 
-            let cert = match self.resolve_cert(&current_key_name).await {
+            let cert = match self.resolve_cert(&current_key_name, fetch).await {
                 Some(c) => c,
-                None => return WalkOutcome::Pending,
+                None => return WalkOutcome::Pending(current_key_name),
             };
 
             if !cert.is_valid_at(now) {
@@ -311,7 +341,7 @@ impl Validator {
         let target_arc = Arc::new(target_name.clone());
         let mut steps: Vec<ChainTraceStep> = Vec::new();
         let mut rules_applied: Vec<TraceRuleApplied> = Vec::new();
-        let mut current = match self.resolve_cert(&target_arc).await {
+        let mut current = match self.resolve_cert(&target_arc, true).await {
             Some(c) => c,
             None => {
                 return ChainTrace {
@@ -395,7 +425,7 @@ impl Validator {
                 };
             }
             let next_arc = Arc::new(issuer.clone());
-            current = match self.resolve_cert(&next_arc).await {
+            current = match self.resolve_cert(&next_arc, true).await {
                 Some(c) => c,
                 None => {
                     return ChainTrace {
@@ -418,14 +448,13 @@ impl Validator {
         }
     }
 
-    async fn resolve_cert(&self, name: &Arc<Name>) -> Option<Certificate> {
+    async fn resolve_cert(&self, name: &Arc<Name>, fetch: bool) -> Option<Certificate> {
         if let Some(cert) = self.cert_cache.get(name) {
             return Some(cert);
         }
-        if let Some(fetcher) = self.cert_fetcher.get() {
-            fetcher.fetch(name).await.ok()
-        } else {
-            None
+        match self.cert_fetcher.get() {
+            Some(fetcher) if fetch => fetcher.fetch(name).await.ok(),
+            _ => None,
         }
     }
 }
@@ -591,6 +620,52 @@ mod tests {
             validator.validate_chain(&data).await,
             ValidationResult::Pending
         ));
+    }
+
+    /// `validate_chain_cached` never touches the fetcher and names the *first
+    /// unresolved* cert — the Data's signer first, then (once that is cached)
+    /// the deeper intermediate — so a caller can fetch exactly what is missing
+    /// off the hot path, one hop at a time.
+    #[tokio::test]
+    async fn cached_walk_names_missing_cert_without_fetching() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mid_seed = [23u8; 32];
+        let mid_signer = Ed25519Signer::from_seed(&mid_seed, name1("mid"));
+        let key_seed = [24u8; 32];
+        let key_signer = Ed25519Signer::from_seed(&key_seed, name1("key"));
+        let key_pk = ed25519_dalek::SigningKey::from_bytes(&key_seed)
+            .verifying_key()
+            .to_bytes();
+        let data = Data::decode(make_signed_data(&key_signer, "data", "key").await).unwrap();
+
+        let validator = Validator::new(wildcard_schema());
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let f = Arc::clone(&fetches);
+        let fetcher = Arc::new(crate::CertFetcher::new(
+            validator.cert_cache_arc(),
+            Arc::new(move |_| {
+                f.fetch_add(1, Ordering::Relaxed);
+                Box::pin(async { None })
+            }),
+            std::time::Duration::from_secs(1),
+        ));
+        assert!(validator.set_cert_fetcher(fetcher).is_ok());
+
+        let (result, missing) = validator.validate_chain_cached(&data).await;
+        assert!(matches!(result, ValidationResult::Pending));
+        assert_eq!(missing.as_deref(), Some(&name1("key")));
+
+        let key_cert = Data::decode(make_cert_data_packet(&name1("key"), &key_pk, &mid_signer).await)
+            .unwrap();
+        validator
+            .cert_cache()
+            .insert(Certificate::decode(&key_cert).unwrap());
+        let (result, missing) = validator.validate_chain_cached(&data).await;
+        assert!(matches!(result, ValidationResult::Pending));
+        assert_eq!(missing.as_deref(), Some(&name1("mid")));
+
+        assert_eq!(fetches.load(Ordering::Relaxed), 0, "cached walk must not fetch");
     }
 
     /// Build a signed command Interest with `signer`, KeyLocator = `key_name`.

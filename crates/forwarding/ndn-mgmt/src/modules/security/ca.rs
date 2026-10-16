@@ -1,5 +1,6 @@
 //! `security/ca-*` — NDNCERT CA info / token issuance / enrollment.
 
+use ndn_cert::CertError;
 use ndn_engine::ForwarderEngine;
 use ndn_mgmt_wire::{ControlParameters, ControlResponse, control_response::status};
 use ndn_packet::Name;
@@ -47,10 +48,11 @@ pub(super) fn security_ca_token_add(params: ControlParameters) -> ControlRespons
 
 /// Start a background NDNCERT enrollment session.
 ///
-/// Creates a temporary [`AppFace`] registered with the engine so that
+/// Creates a temporary [`InProcFace`] registered with the engine so that
 /// NDN Interests can be expressed through the live forwarder, then runs
-/// the PROBE → NEW → CHALLENGE exchange against the requested CA prefix.
-/// When the CA issues a certificate it is stored in the PIB.
+/// the shared NEW → CHALLENGE driver ([`ndn_cert::client::enroll`]) against
+/// the requested CA prefix. When the CA issues a certificate it is stored in
+/// the PIB.
 pub(super) async fn security_ca_enroll(
     params: ControlParameters,
     pib: &FilePib,
@@ -97,11 +99,10 @@ pub(super) async fn security_ca_enroll(
 
     tokio::spawn(
       async move {
+        let mut exchange = InProcExchange(app_handle);
         let result = run_enrollment(
-            app_handle,
-            face_id,
+            &mut exchange,
             &ca_name,
-            &identity_name,
             signer,
             &challenge_type,
             &challenge_param,
@@ -146,139 +147,67 @@ pub(super) async fn security_ca_enroll(
     ControlResponse::ok("started", echo)
 }
 
-/// Run the three-step NDNCERT enrollment exchange (PROBE → NEW → CHALLENGE)
-/// using a temporary AppFace that routes Interests through the live forwarder.
+/// [`ndn_cert::CaExchange`] over the temporary in-process app face: send the
+/// Interest, await the next Data on the face.
+struct InProcExchange(ndn_face_local::InProcHandle);
+
+impl ndn_cert::CaExchange for InProcExchange {
+    async fn express(&mut self, interest: bytes::Bytes) -> Result<ndn_packet::Data, CertError> {
+        const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+        self.0
+            .send(interest)
+            .await
+            .map_err(|e| CertError::Transport(format!("send: {e}")))?;
+        let reply = tokio::time::timeout(TIMEOUT, self.0.recv())
+            .await
+            .map_err(|_| CertError::Transport("timeout".into()))?
+            .ok_or_else(|| CertError::Transport("face closed".into()))?;
+        ndn_packet::Data::decode(reply)
+            .map_err(|e| CertError::Transport(format!("malformed Data: {e:?}")))
+    }
+}
+
+/// One CHALLENGE round carrying `{"code": challenge_param}`, then fetch the
+/// issued cert.
 async fn run_enrollment(
-    handle: ndn_face_local::InProcHandle,
-    _face_id: ndn_transport::FaceId,
+    exchange: &mut InProcExchange,
     ca_prefix: &Name,
-    identity_name: &Name,
     signer: std::sync::Arc<dyn ndn_security::Signer>,
     challenge_type: &str,
     challenge_param: &str,
 ) -> Result<ndn_security::Certificate, String> {
-    use ndn_cert::client::EnrollmentSession;
-    use ndn_packet::encode::encode_interest;
-
-    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-
-    // PROBE.
-    let probe_name = ca_prefix.clone().append(b"CA").append(b"PROBE");
-    let probe_interest = encode_interest(&probe_name, None);
-    handle
-        .send(probe_interest)
-        .await
-        .map_err(|e| format!("PROBE send: {e}"))?;
-
-    let probe_resp = tokio::time::timeout(TIMEOUT, handle.recv())
-        .await
-        .map_err(|_| "PROBE timeout")?
-        .ok_or("PROBE: face closed")?;
-
-    tracing::debug!(
-        target: "mgmt.security",
-        bytes = probe_resp.len(),
-        "ca-enroll: PROBE response received"
-    );
-
-    // NEW.
-    let mut session =
-        EnrollmentSession::new(identity_name.clone(), std::sync::Arc::clone(&signer), 86400);
-
-    let new_body = session
-        .new_request_body()
-        .await
-        .map_err(|e| e.to_string())?;
-    let new_name = ca_prefix.clone().append(b"CA").append(b"NEW");
-    let new_interest = encode_interest(&new_name, Some(&new_body));
-    handle
-        .send(new_interest)
-        .await
-        .map_err(|e| format!("NEW send: {e}"))?;
-
-    let new_resp = tokio::time::timeout(TIMEOUT, handle.recv())
-        .await
-        .map_err(|_| "NEW timeout")?
-        .ok_or("NEW: face closed")?;
-
-    let new_body_content = extract_data_content(&new_resp).ok_or("NEW: malformed Data")?;
-    session
-        .handle_new_response(&new_body_content)
-        .map_err(|e| e.to_string())?;
-
-    // CHALLENGE.
-    let mut challenge_params = serde_json::Map::new();
-    challenge_params.insert(
+    let mut params = serde_json::Map::new();
+    params.insert(
         "code".to_owned(),
         serde_json::Value::String(challenge_param.to_owned()),
     );
-    let chal_body = session
-        .challenge_request_body(challenge_type, challenge_params)
-        .map_err(|e| e.to_string())?;
+    let mut params = Some(params);
+    let cert_name = ndn_cert::client::enroll(
+        exchange,
+        ca_prefix,
+        signer,
+        86400,
+        challenge_type,
+        |round| {
+            let next = match params.take() {
+                Some(p) => Ok(Some(p)),
+                None => Err(CertError::ChallengePending(format!(
+                    "multi-round challenge not supported: {}",
+                    round
+                        .status_message
+                        .as_deref()
+                        .unwrap_or("another round required")
+                ))),
+            };
+            std::future::ready(next)
+        },
+    )
+    .await
+    .map_err(|e| e.to_string())?;
 
-    // CHALLENGE name includes the request-id as a binary component
-    // (ndn-cert `requester-request.cpp:217`).
-    let request_id_raw = session
-        .request_id_bytes()
-        .map(|b| b.to_vec())
-        .unwrap_or_default();
-    let chal_name = ca_prefix
-        .clone()
-        .append(b"CA")
-        .append(b"CHALLENGE")
-        .append(&request_id_raw);
-    let chal_interest = encode_interest(&chal_name, Some(&chal_body));
-    handle
-        .send(chal_interest)
+    let cert_data = ndn_cert::client::fetch_issued_cert(exchange, &cert_name)
         .await
-        .map_err(|e| format!("CHALLENGE send: {e}"))?;
-
-    let chal_resp = tokio::time::timeout(TIMEOUT, handle.recv())
-        .await
-        .map_err(|_| "CHALLENGE timeout")?
-        .ok_or("CHALLENGE: face closed")?;
-
-    let chal_body_content = extract_data_content(&chal_resp).ok_or("CHALLENGE: malformed Data")?;
-    session
-        .handle_challenge_response(&chal_body_content)
-        .map_err(|e| e.to_string())?;
-
-    if !session.is_complete() {
-        if session.needs_another_round() {
-            let msg = session
-                .challenge_status_message()
-                .unwrap_or("another round required");
-            return Err(format!("multi-round challenge not supported: {msg}"));
-        }
-        return Err("enrollment did not complete".to_owned());
-    }
-
-    // CERT FETCH — issued cert returned by name; fetch separately.
-    let cert_name = session
-        .issued_cert_name()
-        .ok_or_else(|| "no issued cert name after completion".to_owned())?
-        .clone();
-
-    let cert_interest = encode_interest(&cert_name, None);
-    handle
-        .send(cert_interest)
-        .await
-        .map_err(|e| format!("cert fetch send: {e}"))?;
-
-    let cert_resp = tokio::time::timeout(TIMEOUT, handle.recv())
-        .await
-        .map_err(|_| "cert fetch timeout")?
-        .ok_or("cert fetch: face closed")?;
-
-    let cert_content = extract_data_content(&cert_resp).ok_or("cert fetch: malformed Data")?;
-    ndn_cert::ca::deserialize_cert(&cert_content)
-        .ok_or_else(|| "could not decode issued certificate".to_owned())
-}
-
-/// Extract the Content TLV value from a Data packet (best-effort).
-fn extract_data_content(data_bytes: &[u8]) -> Option<Vec<u8>> {
-    use ndn_packet::Data;
-    Data::decode(bytes::Bytes::copy_from_slice(data_bytes))
-        .ok()
-        .and_then(|d| d.content().map(|c| c.to_vec()))
+        .map_err(|e| format!("cert fetch: {e}"))?;
+    ndn_security::Certificate::decode(&cert_data)
+        .map_err(|e| format!("could not decode issued certificate: {e}"))
 }

@@ -71,17 +71,12 @@ A signature is not a verdict. A verifier consults a *trust policy*
 to decide whether the signing key is allowed to sign the requested
 name.
 
-ndn-rs models this as two traits:
-
-- `TrustPolicy` — "should this key be trusted for this name?" Returns
-  yes / no / chain-up-to-cert-X.
-- `ValidationPolicy` — composition of `TrustPolicy` decisions into a
-  full validator (allow custom override rules, chained policies).
-
-Concrete policies that ship in-tree: `InsecureTrust` (anything goes;
-tests only), `StaticTrust` (allowlist of keys), `LvsTrust`
-(Light Versatile Schema rules), `HierarchicalPolicy` (parent-name
-key signs child-name data). Tabular catalog: [Trust policies](../reference/trust-policies.md).
+ndn-rs models the policy as a `TrustSchema` — `(data name, key name)`
+rules plus an optional Light Versatile Schema (LVS) model — and
+enforces it with a `Validator`, which also walks the certificate chain
+up to a trust anchor. Built-in schemas: `hierarchical` (data and key
+share a namespace), LVS, custom rules, and `accept_all` (anchor set is
+the only limit). Tabular catalog: [Trust policies](../reference/trust-policies.md).
 
 ## Cache and content store
 

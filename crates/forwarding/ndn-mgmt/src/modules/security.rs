@@ -90,7 +90,7 @@ async fn handle_security(
         v if v == verb::SAFEBAG_IMPORT => security_safebag_import(params, pib),
         v if v == verb::KEY_DELETE => security_key_delete(params, pib),
         v if v == verb::CA_ENROLL => security_ca_enroll(params, pib, engine).await,
-        v if v == verb::YUBIKEY_GENERATE => security_yubikey_generate(params, pib).await,
+        v if v == verb::YUBIKEY_GENERATE => security_yubikey_generate(params, pib, engine).await,
         _ => ControlResponse::error(status::NOT_FOUND, "unknown security verb"),
     }
 }

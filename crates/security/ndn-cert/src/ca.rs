@@ -1,5 +1,7 @@
 //! NDNCERT CA-side processor. Transport-agnostic; the Producer wiring lives
-//! in `ndn-identity`. All in-flight session state lives in [`DashMap`].
+//! in `ndn-identity`. In-flight session state lives in [`DashMap`]; issued
+//! certs and revocations are written through an optional
+//! [`CaStore`](crate::store::CaStore) so they survive restarts.
 
 use std::{sync::Arc, time::Duration};
 
@@ -13,6 +15,7 @@ use crate::{
     challenge::{ChallengeHandler, ChallengeOutcome, ChallengeState},
     ecdh::{EcdhKeypair, SessionKey, new_encryption_iv},
     error::CertError,
+    store::CaStore,
     policy::{
         AcceptAllIssuance, IssuanceContext, IssuanceDecision, IssuancePolicy, NamespacePolicy,
         PolicyDecision,
@@ -41,6 +44,14 @@ pub struct CaConfig {
     /// `AdditionalDescription`. Default `false` — issued certs are
     /// byte-identical to the pre-attestation behaviour.
     pub emit_attestations: bool,
+    /// Key name of the CA's signing key. It signs issued certs and every
+    /// CA→requester response, and its certificate (looked up in the
+    /// manager's cert cache, then its trust anchors) is the INFO
+    /// `ca_certificate`. A CA whose key is certified by an offline root sets
+    /// this explicitly. `None` falls back to the manager's first trust anchor
+    /// — only well-defined when the manager holds exactly one anchor (the
+    /// self-signed demo CA).
+    pub signing_key: Option<ndn_packet::Name>,
 }
 
 impl CaConfig {
@@ -62,12 +73,20 @@ impl CaConfig {
             policy,
             issuance: Box::new(AcceptAllIssuance),
             emit_attestations: false,
+            signing_key: None,
         }
     }
 
     /// Enable embedding challenge attestations in issued certs (builder).
     pub fn emit_attestations(mut self, yes: bool) -> Self {
         self.emit_attestations = yes;
+        self
+    }
+
+    /// Sign with the key named `key_name` (builder; see
+    /// [`signing_key`](Self::signing_key)).
+    pub fn with_signing_key(mut self, key_name: ndn_packet::Name) -> Self {
+        self.signing_key = Some(key_name);
         self
     }
 }
@@ -90,16 +109,55 @@ pub struct CaState {
     revoked: DashSet<String>,
     /// Issued cert wire bytes, served on the cert-fetch Interest.
     served_certs: DashMap<String, Vec<u8>>,
+    /// Durable backing for `served_certs` / `revoked`; `None` keeps both
+    /// in memory only.
+    store: Option<Arc<dyn CaStore>>,
 }
 
 impl CaState {
+    /// In-memory CA: issued certs and revocations are lost on drop. Use
+    /// [`with_store`](Self::with_store) for a CA that must survive restarts.
     pub fn new(config: CaConfig, manager: Arc<SecurityManager>) -> Self {
-        Self {
+        let state = Self {
             config,
             manager,
             pending: DashMap::new(),
             revoked: DashSet::new(),
             served_certs: DashMap::new(),
+            store: None,
+        };
+        state.serve_own_certificate();
+        state
+    }
+
+    /// CA backed by `store`: loads the previously issued certs (served again
+    /// on cert-fetch) and the revocation set, then writes every new issuance
+    /// and revocation through the store.
+    pub fn with_store(
+        config: CaConfig,
+        manager: Arc<SecurityManager>,
+        store: Arc<dyn CaStore>,
+    ) -> Result<Self, CertError> {
+        let snapshot = store.load()?;
+        let mut state = Self::new(config, manager);
+        for (name, wire) in snapshot.issued {
+            state.served_certs.insert(name, wire);
+        }
+        for name in snapshot.revoked {
+            state.revoked.insert(name);
+        }
+        state.store = Some(store);
+        Ok(state)
+    }
+
+    /// Serve the CA's own certificate on cert-fetch so requesters can walk
+    /// an issued cert's chain up to the anchor they hold.
+    fn serve_own_certificate(&self) {
+        if let Some(cert) = self.ca_certificate()
+            && cert.signed_region.is_some()
+        {
+            self.served_certs
+                .insert(cert.name.to_string(), serialize_cert(&cert));
         }
     }
 
@@ -112,30 +170,58 @@ impl CaState {
         self.revoked.contains(cert_name)
     }
 
+    /// Wire of an issued cert for cert-fetch; `None` once it is revoked.
     pub fn get_served_cert(&self, cert_name: &str) -> Option<Vec<u8>> {
+        if self.is_revoked(cert_name) {
+            return None;
+        }
         self.served_certs.get(cert_name).map(|r| r.clone())
+    }
+
+    /// The key the CA signs with: [`CaConfig::signing_key`] when set, else
+    /// the manager's first trust anchor.
+    pub fn signing_key_name(&self) -> Option<ndn_packet::Name> {
+        match &self.config.signing_key {
+            Some(key) => Some(key.clone()),
+            None => self
+                .manager
+                .trust_anchor_names()
+                .into_iter()
+                .next()
+                .map(|n| (*n).clone()),
+        }
+    }
+
+    /// The certificate of [`signing_key_name`](Self::signing_key_name): from
+    /// the manager's cert cache (a CA cert issued by a root) or its trust
+    /// anchors (a self-signed CA).
+    pub fn ca_certificate(&self) -> Option<Certificate> {
+        let key = self.signing_key_name()?;
+        let key = Arc::new(key);
+        self.manager
+            .cert_cache()
+            .get(&key)
+            .or_else(|| self.manager.trust_anchor(&key))
     }
 
     /// CA signing key + KeyLocator name for response Data (NDNCERT v0.3 §4.1
     /// requires every CA→requester Data be signed by the CA's identity key).
-    /// `None` means no anchor is provisioned and the CA cannot issue.
+    /// `None` means the signing key or its certificate is not provisioned and
+    /// the CA cannot issue.
     pub fn response_signer(&self) -> Option<(std::sync::Arc<dyn Signer>, ndn_packet::Name)> {
-        let key_name_arc = self.manager.trust_anchor_names().into_iter().next()?;
-        let signer = self.manager.get_signer_sync(key_name_arc.as_ref()).ok()?;
-        let cert = self.manager.trust_anchor(key_name_arc.as_ref())?;
+        let key_name = self.signing_key_name()?;
+        let signer = self.manager.get_signer_sync(&key_name).ok()?;
+        let cert = self.ca_certificate()?;
         Some((signer, (*cert.name).clone()))
     }
 
     pub fn handle_info(&self) -> Vec<u8> {
         let ca_certificate = self
-            .manager
-            .trust_anchor_names()
-            .first()
-            .and_then(|name| self.manager.trust_anchor(name))
+            .ca_certificate()
             .map(|cert| bytes::Bytes::from(serialize_cert(&cert)))
             .unwrap_or_else(|| {
                 tracing::warn!(
-                    "CA has no trust anchor configured; INFO response has empty ca_certificate"
+                    "CA has no signing certificate configured; INFO response has empty ca_certificate"
                 );
                 bytes::Bytes::new()
             });
@@ -421,6 +507,11 @@ impl CaState {
                         let cert_name_str = cert.name.to_string();
                         let cert_bytes = serialize_cert(&cert);
 
+                        // Persist before serving: a cert the CA cannot durably
+                        // serve after a restart is not issued.
+                        if let Some(store) = &self.store {
+                            store.record_issued(&cert_name_str, &cert_bytes)?;
+                        }
                         self.served_certs.insert(cert_name_str.clone(), cert_bytes);
 
                         ChallengeResponseTlv {
@@ -472,35 +563,59 @@ impl CaState {
         .to_vec()
     }
 
+    /// Only certificates this CA issued (those it serves on cert-fetch, its
+    /// own cert excepted) can be revoked. The request's possession proof —
+    /// a signature over the cert name — must verify under that cert's own
+    /// key (its holder revokes it) or under the CA's signing key (the CA
+    /// revokes any cert it issued); any other key is refused.
     async fn do_revoke(&self, body: &[u8]) -> u8 {
         let req = match RevokeRequestTlv::decode(bytes::Bytes::copy_from_slice(body)) {
             Ok(r) => r,
             Err(_) => return REVOKE_STATUS_UNAUTHORIZED,
         };
 
-        let cert_name_parsed: ndn_packet::Name = match req.cert_name.parse() {
+        let cert_name: ndn_packet::Name = match req.cert_name.parse() {
             Ok(n) => n,
             Err(_) => return REVOKE_STATUS_NOT_FOUND,
         };
-
-        let anchor = self.manager.trust_anchor(&cert_name_parsed);
-        let public_key = match anchor {
-            Some(c) => c.public_key,
-            None => return REVOKE_STATUS_NOT_FOUND,
+        if self.signing_key_name().as_ref() == Some(&cert_name) {
+            return REVOKE_STATUS_NOT_FOUND;
+        }
+        // Canonical URI: the key `served_certs`, `revoked` and the store use.
+        let cert_uri = cert_name.to_string();
+        let Some(cert) = self
+            .served_certs
+            .get(&cert_uri)
+            .and_then(|wire| deserialize_cert(&wire))
+        else {
+            return REVOKE_STATUS_NOT_FOUND;
         };
 
-        use ndn_security::{Ed25519Verifier, Verifier, VerifyOutcome};
-        let outcome = Ed25519Verifier
-            .verify(req.cert_name.as_bytes(), &req.signature, &public_key)
-            .await;
-
-        match outcome {
-            Ok(VerifyOutcome::Valid) => {
-                self.revoked.insert(req.cert_name);
-                REVOKE_STATUS_REVOKED
-            }
-            _ => REVOKE_STATUS_UNAUTHORIZED,
+        // The proof signs the cert name exactly as the requester sent it.
+        let signed = req.cert_name.as_bytes();
+        let authorized = verify_possession(signed, &req.signature, &cert.public_key).await
+            || match self.ca_certificate() {
+                Some(ca) => verify_possession(signed, &req.signature, &ca.public_key).await,
+                None => false,
+            };
+        if !authorized {
+            return REVOKE_STATUS_UNAUTHORIZED;
         }
+
+        // Revoke in memory even if the write fails: the CA must refuse the
+        // cert now; the error flags that a restart would forget it.
+        if !self.is_revoked(&cert_uri)
+            && let Some(store) = &self.store
+            && let Err(e) = store.record_revoked(&cert_uri)
+        {
+            tracing::error!(
+                cert = %cert_uri, error = %e,
+                "CA could not persist revocation; it will be lost on restart"
+            );
+        }
+        self.revoked.insert(cert_uri);
+        self.manager.cert_cache().remove(&cert_name);
+        REVOKE_STATUS_REVOKED
     }
 
     /// `policy_validity` is clamped to `max_validity` and the client's
@@ -528,8 +643,7 @@ impl CaState {
             )));
         }
 
-        let ca_key_names = self.manager.trust_anchor_names();
-        let ca_key_name = ca_key_names.first().ok_or_else(|| {
+        let ca_key_name = self.signing_key_name().ok_or_else(|| {
             CertError::InvalidRequest("CA has no signing key configured".to_string())
         })?;
 
@@ -547,7 +661,7 @@ impl CaState {
             .certify_with_additional_description(
                 &subject_name,
                 bytes::Bytes::from(public_key),
-                ca_key_name.as_ref(),
+                &ca_key_name,
                 validity_ms,
                 additional_description,
             )
@@ -588,6 +702,25 @@ pub fn deserialize_cert(data: &[u8]) -> Option<Certificate> {
     let bytes = bytes::Bytes::copy_from_slice(data);
     let parsed = ndn_packet::Data::decode(bytes).ok()?;
     Certificate::decode(&parsed).ok()
+}
+
+/// Whether `signature` over `message` verifies under `public_key`, an
+/// Ed25519 or ECDSA-P256 certificate key (the algorithms NDN identities here
+/// are minted with); a key of the other algorithm simply fails to verify.
+async fn verify_possession(message: &[u8], signature: &[u8], public_key: &[u8]) -> bool {
+    use ndn_packet::SignatureType;
+    use ndn_security::{VerifyOutcome, verifier::verify_by_sig_type};
+    for sig_type in [
+        SignatureType::SignatureEd25519,
+        SignatureType::SignatureSha256WithEcdsa,
+    ] {
+        if let Ok(VerifyOutcome::Valid) =
+            verify_by_sig_type(sig_type, message, signature, public_key).await
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn generate_request_id_bytes() -> [u8; 8] {

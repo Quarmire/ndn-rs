@@ -308,7 +308,6 @@ mod tests {
         };
         let validation = ValidationStage::new(
             Some(validator),
-            None,
             PendingQueueConfig::default(),
             ndn_runtime::default_runtime(),
         );
@@ -357,7 +356,6 @@ mod tests {
         };
         let validation = ValidationStage::new(
             Some(validator),
-            None,
             PendingQueueConfig::default(),
             ndn_runtime::default_runtime(),
         );

@@ -60,7 +60,14 @@ cert_sha256 = "ab12…64hex"   # pin the peer's logged leaf hash; or webpki = tr
 
 A self-signed WebTransport cert is capped at 13 days (Chrome's
 `serverCertificateHashes` limit); a self-signed QUIC cert is long-lived (a
-pinned dialer trusts the leaf hash, not the expiry). Listener cert status
+pinned dialer trusts the leaf hash, not the expiry). The self-signed key and
+cert are persisted (files `0600`) under `cache_dir` — default
+`$XDG_STATE_HOME/ndn-fwd/tls`, else `~/.local/state/ndn-fwd/tls` — keyed by
+listener kind + `hostnames`, so the pinned hash survives restarts: the QUIC
+cert is reused until it expires, and the WebTransport cert is re-issued from
+the same key when within a day of expiry. Changing `hostnames` mints a new key
+and cert; give co-hosted nodes distinct `cache_dir`s to keep their pins
+distinct. Listener cert status
 (notAfter, renewal state) is readable via
 `/localhost/nfd/webtransport/cert-status`. The WebTransport face interoperates
 with **ndnd**'s HTTP/3 face (witness `testbed/tests/audit/wt02_ndnd_interop.sh`);

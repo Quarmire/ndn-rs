@@ -20,6 +20,7 @@ High-level Consumer, Producer, and Subscriber APIs for NDN applications. Support
 | Flag | Default | Description |
 |---|---|---|
 | `blocking` | no | Adds synchronous (blocking) wrappers via `tokio::runtime` |
+| `ndnsec-compat` | no | Enables `ndn-security/ndnsec-compat`: ndn-cxx-compatible `SqlitePib` + `FileTpm` over `~/.ndn` (bundled SQLite; native only) |
 
 ## Usage
 

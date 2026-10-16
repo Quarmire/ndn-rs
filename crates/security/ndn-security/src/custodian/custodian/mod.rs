@@ -1,7 +1,7 @@
 //! [`Custodian`] — the thing that holds private-key material for a surface.
 //!
-//! Four built-in implementations match the four surfaces a TrustContext can
-//! attach to today: in-page wasm (browser tab), OS keyring (native desktop),
+//! Four built-in implementations match the four surfaces an identity's key can
+//! be held on today: in-page wasm (browser tab), OS keyring (native desktop),
 //! external fob (remote signer over a face), and a browser extension. The
 //! extension impl is a Phase-1 stub; Phase 5 wires the Chrome MV3 backend.
 

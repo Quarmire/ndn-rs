@@ -1,28 +1,29 @@
 # Trust policies
 
 The trust policy decides whether a signing key may sign a given name.
-ndn-rs splits this across two traits:
+In ndn-rs the policy is a `TrustSchema`, and the `Validator` enforces it:
+the validator checks the packet's `(data name, key name)` pair with
+`TrustSchema::allows` (via the trust context that owns the name) and
+walks the certificate chain to a trust anchor. A schema is a set of
+`SchemaRule`s (OR'd) plus an optional LVS model; the pair passes if any
+rule or the model allows it.
 
-- `TrustPolicy` — an operator handle: which `Signer` to use on egress
-  (`signer`), which `Validator` to apply on ingress (`validator`).
-- `ValidationPolicy` — the composable acceptance check: given a `Data`,
-  its key locator, and a chain-walk depth, return a `PolicyVerdict`
-  (`Allow`, `NeedCert`, or `Deny`).
-
-Implementations live in `crates/security/ndn-security/src/`. See
+The implementation lives in `crates/security/ndn-security/src/`
+(`trust_schema.rs`, `lvs.rs`, `validator/`). See
 [Extend tier](../api/extend.md) and
 [Identity and keys](../concepts/identity-and-keys.md).
 
-## Built-in policies
+## Built-in schemas
 
-| Policy | Source | Accepts | Use |
-|---|---|---|---|
-| `InsecureTrust` | `trust.rs` | `DigestSha256`; validator accepts anything. | Tests; never production. |
-| `StaticTrust` | `trust.rs` | Fixed signer + hierarchical validator. | Closed groups, known signers. |
-| `LvsTrust` | `trust.rs` + `lvs.rs` | Light Versatile Schema rules. | Pattern-based deployments. |
-| `HierarchicalPolicy` | `validation_policy.rs` | Signing key's identity is a prefix of the data name. | Standard NDN trust shape. |
-| `AcceptAllPolicy` | `validation_policy.rs` | Skip validation entirely. | Migration / degraded mode. |
-| `ChainedPolicy` | `validation_policy.rs` | All members `Allow` (first `Deny`/`NeedCert` short-circuits). | Composition. |
+| Constructor | Accepts | Use |
+|---|---|---|
+| `TrustSchema::hierarchical()` | Data and signing key share their first name component. | Standard NDN trust shape. |
+| `TrustSchema::accept_all()` | Any name pair; the anchor set is the only boundary. | Anchor-only deployments, tests. |
+| `TrustSchema::from_lvs_binary(..)` | Light Versatile Schema rules (compiled LVS). | Pattern-based deployments. |
+| `TrustSchema::new()` + `add_rule` | Your own `SchemaRule`s. | Custom policies. |
+
+Every schema still requires a valid signature that chains to an anchor;
+`accept_all` only drops the name check.
 
 ## Hierarchical example
 
@@ -41,75 +42,48 @@ let _safe = consumer.fetch("/lab/alice/notes/2026-05-20").await?; // SafeData
 # Ok(()) }
 ```
 
-## Static example
-
-`StaticTrust` is a `TrustPolicy` with a fixed signer and a hierarchical
-validator. Build from a `KeyChain` (carries its anchors) or a bare signer
-via `StaticTrust::new(..)`:
-
-```rust,ignore
-use std::sync::Arc;
-use ndn::{KeyChain, StaticTrust, TrustPolicy};
-
-# fn build() -> anyhow::Result<StaticTrust> {
-let keychain = Arc::new(KeyChain::ephemeral("/lab/alice")?);
-let trust = StaticTrust::from_keychain(keychain)?;
-# Ok(trust) }
-```
+A `KeyChain` builds the same validator pre-loaded with its anchors:
+`keychain.validator()`.
 
 ## LVS example
 
 A textual Light Versatile Schema is compiled to LVS binary form by an
-external compiler; `LvsModel::decode` reads it and `LvsTrust` wraps it
-with a signer (also `LvsTrust::from_keychain(model, keychain)`):
+external compiler; `TrustSchema::from_lvs_binary` loads it. Schemas that
+use LVS user functions are rejected unless you pass a registry via
+`TrustSchema::from_lvs_binary_with_user_fns` (fail-closed):
 
 ```rust,ignore
-use std::sync::Arc;
-use ndn::LvsTrust;
-use ndn_security::LvsModel;
+use ndn_security::{TrustSchema, Validator};
 
-# fn build() -> anyhow::Result<LvsTrust> {
+# fn build() -> anyhow::Result<Validator> {
 let bytes = std::fs::read("trust.tlv")?;       // compiled LVS model
-let model = Arc::new(LvsModel::decode(&bytes)?);
-let trust = LvsTrust::new(model, None);        // None ⇒ DigestSha256 egress
-# Ok(trust) }
+let validator = Validator::new(TrustSchema::from_lvs_binary(&bytes)?);
+# Ok(validator) }
 ```
 
 ## Writing a custom policy
 
-Custom acceptance logic implements `ValidationPolicy::check`, returning a
-boxed future of `PolicyVerdict` (`Allow` / `Deny(TrustError)` / `NeedCert(Name)`):
+Custom acceptance logic is a set of `SchemaRule`s. Each rule reads
+`"<data pattern> => <key pattern>"`; `<var>` captures one component,
+`<**var>` captures the rest, and a variable captured in both patterns
+must bind to the same component:
 
 ```rust,ignore
-use std::{future::Future, pin::Pin, sync::Arc};
-use ndn_packet::{Data, Name};
-use ndn_security::{ChainedPolicy, HierarchicalPolicy, PolicyVerdict, TrustError, ValidationPolicy};
+use ndn_security::{SchemaRule, TrustSchema, Validator};
 
-pub struct MyPolicy;
-
-impl ValidationPolicy for MyPolicy {
-    fn check<'a>(
-        &'a self,
-        data: &'a Data,
-        key_locator: &'a Name,
-        _depth: usize,
-    ) -> Pin<Box<dyn Future<Output = PolicyVerdict> + Send + 'a>> {
-        Box::pin(async move {
-            let ok = data.name.has_prefix(&"/lab".parse().unwrap())
-                && key_locator.has_prefix(&"/lab/ca".parse().unwrap());
-            if ok {
-                PolicyVerdict::Allow
-            } else {
-                PolicyVerdict::Deny(TrustError::SchemaMismatch)
-            }
-        })
-    }
-}
-
-// ChainedPolicy: members run in order; first Deny/NeedCert short-circuits.
-let mut chain = ChainedPolicy::new(vec![Arc::new(MyPolicy) as Arc<dyn ValidationPolicy>]);
-chain.push(Arc::new(HierarchicalPolicy::new()));
+# fn build() -> anyhow::Result<Validator> {
+let mut schema = TrustSchema::new();
+// Lab data must be signed by the lab CA.
+schema.add_rule(SchemaRule::parse("/lab/<**rest> => /lab/ca/KEY/<id>")?);
+// Each sensor signs only its own readings.
+schema.add_rule(SchemaRule::parse("/sensor/<node>/<**rest> => /sensor/<node>/KEY/<id>")?);
+let validator = Validator::new(schema);
+# Ok(validator) }
 ```
+
+Rules are OR'd: there is no ordered first-match-deny mode (ndn-cxx
+`validator.conf` semantics are not supported; LVS is the policy
+language).
 
 ## Where the policy runs
 
@@ -138,7 +112,8 @@ validator.adopt_context(home); // data under /home/bob validates against it
 ```
 
 Onboarding (`ndn-cert`) splits into *adopt-to-verify* (anchor + schema to
-verify data; free, pinned by a `BootstrapTicket` fingerprint) and
+verify data; free, pinned by the anchor fingerprint in an `ndn-trust://anchor`
+envelope) and
 *enroll-to-be-verified* (a cert to produce, gated by NDNCERT challenges;
 see [NDNCERT setup](../guides/ndncert-setup.md)).
 

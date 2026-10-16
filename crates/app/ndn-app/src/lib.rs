@@ -41,6 +41,10 @@
 #![allow(missing_docs)]
 
 pub mod app_face;
+// Engine-backed certificate fetcher for validators (CertFetcher uses tokio's
+// timer, which is native-only).
+#[cfg(not(target_arch = "wasm32"))]
+pub mod cert_fetch;
 pub mod connection;
 pub mod consumer;
 // Client-side connection demux (serve + fetch concurrently over one connection).
@@ -71,6 +75,10 @@ pub use connection::IpcConnection;
 pub use consumer::{
     CongestionStrategy, Consumer, DEFAULT_INTEREST_LIFETIME, DEFAULT_TIMEOUT, SubscribeOptions,
     Subscription, VerifiedConsumer,
+};
+#[cfg(not(target_arch = "wasm32"))]
+pub use cert_fetch::{
+    CERT_FETCH_TIMEOUT, engine_cert_fetcher, engine_fetch_fn, install_engine_cert_fetcher,
 };
 pub use demux::{DemuxConnection, ServeGuard};
 pub use engine_ext::EngineAppExt;

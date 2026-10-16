@@ -18,4 +18,12 @@ pub enum CertError {
     Security(#[from] ndn_security::TrustError),
     #[error("name error: {0}")]
     Name(String),
+    /// The [`CaExchange`](crate::client::CaExchange) transport failed to
+    /// deliver an Interest or return its Data.
+    #[error("transport error: {0}")]
+    Transport(String),
+    /// The CA's durable state ([`CaStore`](crate::store::CaStore)) could not be
+    /// read or written.
+    #[error("CA storage error: {0}")]
+    Storage(String),
 }

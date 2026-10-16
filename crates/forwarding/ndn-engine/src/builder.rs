@@ -8,7 +8,7 @@ use tracing::Instrument as _;
 
 use ndn_packet::Name;
 use ndn_security::{
-    CertFetcher, ReplayGuard, SchemaRule, SecurityManager, SecurityProfile, TrustSchema, Validator,
+    ReplayGuard, SchemaRule, SecurityManager, SecurityProfile, TrustSchema, Validator,
 };
 use ndn_store::{
     CsAdmissionPolicy, CsObserver, DeadNonceList, ErasedContentStore, LruCs, ObservableCs, Pit,
@@ -378,8 +378,11 @@ impl EngineBuilder {
         self
     }
 
-    pub fn security(mut self, mgr: SecurityManager) -> Self {
-        self.security = Some(Arc::new(mgr));
+    /// Share `mgr` with the engine. The engine holds this same `Arc`, so
+    /// the caller's signers, cert cache, and keyring stay live and
+    /// identical — nothing is copied or dropped on the way in.
+    pub fn security(mut self, mgr: Arc<SecurityManager>) -> Self {
+        self.security = Some(mgr);
         self
     }
 
@@ -593,8 +596,7 @@ impl EngineBuilder {
         let strategy_table = Arc::new(StrategyTable::<dyn ErasedStrategy>::new());
         strategy_table.insert(&Name::root(), Arc::clone(&default_strategy));
 
-        let (validator, cert_fetcher) =
-            resolve_security_profile(self.security_profile, &self.security);
+        let validator = resolve_security_profile(self.security_profile, &self.security);
 
         if let Some(v) = &validator {
             for rule in self.schema_rules {
@@ -769,7 +771,6 @@ impl EngineBuilder {
             },
             validation: ValidationStage::new(
                 validator,
-                cert_fetcher,
                 crate::stages::validation::PendingQueueConfig::default(),
                 Arc::clone(&runtime),
             ),
@@ -892,48 +893,51 @@ impl EngineBuilder {
     }
 }
 
+/// Build the engine's data-path validator for `profile`.
+///
+/// No [`CertFetcher`](ndn_security::CertFetcher) is attached here: a real one
+/// fetches over this engine, which does not exist yet. Attach it after
+/// `build()` with `ndn_app::install_engine_cert_fetcher` (or
+/// [`Validator::set_cert_fetcher`] on [`ForwarderEngine::validator`]); until
+/// then a Data whose signing cert is not cached waits in the pending queue and
+/// is dropped at its deadline.
 fn resolve_security_profile(
     profile: SecurityProfile,
     security: &Option<Arc<SecurityManager>>,
-) -> (Option<Arc<Validator>>, Option<Arc<CertFetcher>>) {
-    use std::time::Duration;
+) -> Option<Arc<Validator>> {
+    match (profile, security) {
+        (SecurityProfile::Disabled, _) => None,
 
-    match profile {
-        SecurityProfile::Disabled => (None, None),
+        (SecurityProfile::Custom(v), _) => Some(v),
 
-        SecurityProfile::Custom(v) => (Some(v), None),
-
-        SecurityProfile::AcceptSigned => {
-            let validator = if let Some(mgr) = security {
-                // Share the manager's keyring: its ambient context already
-                // holds the loaded anchors; just set the operative schema.
-                mgr.keyring()
-                    .ambient()
-                    .set_schema(TrustSchema::accept_all());
-                Arc::new(Validator::with_keyring(
-                    Arc::clone(mgr.keyring()),
-                    mgr.cert_cache_arc(),
-                    None,
-                    1,
-                ))
-            } else {
-                Arc::new(Validator::new(TrustSchema::accept_all()))
-            };
-            (Some(validator), None)
-        }
-
-        SecurityProfile::Default => {
-            let Some(mgr) = security else {
+        // No SecurityManager: `Default` degrades to `AcceptSigned`.
+        (profile @ (SecurityProfile::AcceptSigned | SecurityProfile::Default), None) => {
+            if matches!(profile, SecurityProfile::Default) {
                 tracing::info!(target: t::SECURITY,
                     "No SecurityManager configured; using AcceptSigned validation \
                      (DigestSha256 or stronger required, hierarchy not enforced). \
                      Configure a [security] block with trust anchors for full \
                      hierarchical validation."
                 );
-                let validator = Arc::new(Validator::new(TrustSchema::accept_all()));
-                return (Some(validator), None);
-            };
+            }
+            Some(Arc::new(Validator::new(TrustSchema::accept_all())))
+        }
 
+        (SecurityProfile::AcceptSigned, Some(mgr)) => {
+            // Share the manager's keyring: its ambient context already
+            // holds the loaded anchors; just set the operative schema.
+            mgr.keyring()
+                .ambient()
+                .set_schema(TrustSchema::accept_all());
+            Some(Arc::new(Validator::with_keyring(
+                Arc::clone(mgr.keyring()),
+                mgr.cert_cache_arc(),
+                None,
+                1,
+            )))
+        }
+
+        (SecurityProfile::Default, Some(mgr)) => {
             // Share the manager's keyring (its ambient context holds the
             // loaded anchors) and cert cache (holds issued certs), so the
             // validator sees CA-issued material without copying. Set the
@@ -941,24 +945,12 @@ fn resolve_security_profile(
             mgr.keyring()
                 .ambient()
                 .set_schema(TrustSchema::hierarchical());
-            let cert_cache = mgr.cert_cache_arc();
-
-            // No-op FetchFn placeholder; the router wires a real one via
-            // AppFace after engine construction.
-            let fetcher = Arc::new(CertFetcher::new(
-                Arc::clone(&cert_cache),
-                Arc::new(|_name| Box::pin(async { None })),
-                Duration::from_secs(4),
-            ));
-
-            let validator = Arc::new(Validator::with_keyring(
+            Some(Arc::new(Validator::with_keyring(
                 Arc::clone(mgr.keyring()),
-                cert_cache,
-                Some(Arc::clone(&fetcher)),
+                mgr.cert_cache_arc(),
+                None,
                 5,
-            ));
-
-            (Some(validator), Some(fetcher))
+            )))
         }
     }
 }
@@ -1055,6 +1047,25 @@ mod tests {
         let _ = engine.pit();
         let _ = engine.faces();
         let _ = engine.cs();
+        handle.shutdown().await;
+    }
+
+    /// The manager handed to `security` is the one the engine serves, signer
+    /// included — even while other `Arc`s to it are alive (as a keychain's
+    /// are), where a by-value API forced an unwrap that lost the signer.
+    #[tokio::test]
+    async fn security_manager_signer_survives_builder_wiring() {
+        let kc = ndn_security::KeyChain::ephemeral("/test/engine/node").unwrap();
+        let mgr = kc.manager_arc();
+        let (engine, handle) = EngineBuilder::new(EngineConfig::default())
+            .security(Arc::clone(&mgr))
+            .build()
+            .await
+            .unwrap();
+        let wired = engine.security().expect("engine keeps the manager");
+        assert!(Arc::ptr_eq(&wired, &mgr));
+        let signer = wired.get_signer_sync(kc.key_name()).expect("signer survives");
+        assert_eq!(signer.public_key(), kc.signer().unwrap().public_key());
         handle.shutdown().await;
     }
 

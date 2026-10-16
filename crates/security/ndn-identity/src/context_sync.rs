@@ -1,26 +1,35 @@
-//! Context-sync subscription (NDF F11, TrustContext "Phase 2").
+//! Context-sync subscription (NDF F11).
 //!
-//! Subscribes to a trust context's SVS group so a republished context
-//! propagates to fleet nodes without polling, and adopts each new version into
-//! the local [`Keyring`] with anti-rollback. This is the *subscribe* half;
-//! publishing a node's own bundle is a later phase.
+//! Subscribes to a trust context's SVS group so a republished
+//! [`SignedTrustContext`] propagates to fleet nodes without polling, and adopts
+//! each new version into the local [`Keyring`] with anti-rollback. This is the
+//! *subscribe* half; publishing a node's own context is a later phase.
 //!
 //! # Layering
 //!
-//! The orchestrator lives here, in `ndn-identity`, because it composes three
-//! layers that already meet here: the `SyncBundle` wire codec (this crate),
-//! the SVS primitive ([`ndn_sync`]), and [`SignedTrustContext`] /
-//! [`Keyring`] adoption ([`ndn_security`]). `ndn-sync` stays free of any
-//! trust-context dependency (sync is the lower layer).
+//! The orchestrator lives here, in `ndn-identity`, because it composes two
+//! layers that already meet here: the SVS primitive ([`ndn_sync`]) and
+//! [`SignedTrustContext`] / [`Keyring`] adoption ([`ndn_security`]).
+//! `ndn-sync` stays free of any trust-context dependency (sync is the lower
+//! layer).
+//!
+//! # Wire
+//!
+//! The synced payload is the context's canonical Content,
+//! [`SignedTrustContext::encode_content`] (TLV `0x0410`), so anchors, the
+//! schema blob (LVS carried verbatim), CA endpoints, enrollment hint,
+//! revocations and source-bundle hash all arrive intact. A publisher
+//! republishes context version `N` into the group at
+//! `<group>/<publisher>/seg=N`: the SVS sequence number *is* the context
+//! version (the role `v=N` plays in [`SignedTrustContext::rdr_name`]) and
+//! drives anti-rollback.
 //!
 //! # Transport seam
 //!
 //! `ndn-sync` is sans-IO (the caller wires the SVS Interest channels to a
-//! face), and fetching a bundle Data is likewise abstracted behind
-//! [`BundleFetcher`] so this module needs no face/engine of its own and is unit
-//! testable. A node republishes its context bundle into the group at
-//! `<group>/<publisher>/seg=<seq>`; the SVS sequence number doubles as the
-//! context version for anti-rollback.
+//! face), and fetching a context Data is likewise abstracted behind
+//! [`ContextFetcher`] so this module needs no face/engine of its own and is unit
+//! testable.
 
 use std::sync::Arc;
 
@@ -30,13 +39,11 @@ use ndn_security::{Keyring, SignedTrustContext};
 use ndn_sync::{SyncHandle, SyncUpdate};
 use tokio_util::sync::CancellationToken;
 
-use super::sync::SyncBundle;
-
 /// Fetches the Content bytes of the Data published at a name. The caller backs
 /// this with its consumer/face; an in-process engine, an `ndn-app` `Consumer`,
 /// or a test stub all satisfy it.
 #[async_trait::async_trait]
-pub trait BundleFetcher: Send + Sync {
+pub trait ContextFetcher: Send + Sync {
     async fn fetch_content(&self, name: Name) -> Option<Bytes>;
 }
 
@@ -48,35 +55,21 @@ pub enum ContextSyncOutcome {
     /// Fetched and decoded, but the keyring refused it (anti-rollback: the held
     /// version is the same or newer). Convergence is unaffected.
     Rejected { version: u64 },
-    /// The bundle Data could not be fetched.
+    /// The context Data could not be fetched.
     FetchFailed,
-    /// The fetched Data was not a decodable `SyncBundle`.
+    /// The fetched Content was not a decodable [`SignedTrustContext`].
     DecodeFailed,
 }
 
-/// Reconstruct a [`SignedTrustContext`] from a synced bundle at `version`. The
-/// hierarchical authorization floor is re-imposed (the N1 safety default for
-/// any context arriving over the wire), and the bundle's published schema +
-/// anchors + CA endpoints are installed.
-fn bundle_to_context(bundle: SyncBundle, version: u64) -> SignedTrustContext {
-    let mut ctx = SignedTrustContext::hierarchical(bundle.context_name).with_version(version);
-    for ca in bundle.ca_endpoints {
-        ctx = ctx.with_ca_endpoint(ca);
-    }
-    for anchor in bundle.anchors {
-        let _: bool = ctx.add_anchor(anchor);
-    }
-    ctx.set_schema(bundle.schema);
-    ctx
-}
-
-/// Fetch, reconstruct, and adopt the context advertised by one [`SyncUpdate`].
+/// Fetch, decode, and adopt the context advertised by one [`SyncUpdate`].
 /// Only the highest sequence is fetched — a trust context fully supersedes its
 /// predecessor, so older versions in the gap need not be retrieved. The SVS
-/// sequence is the context version (anti-rollback monotonicity).
+/// sequence is the context version (anti-rollback monotonicity); the decoded
+/// context keeps the hierarchical authorization floor (N1) every context
+/// arriving over the wire gets.
 pub async fn process_update(
     update: &SyncUpdate,
-    fetcher: &dyn BundleFetcher,
+    fetcher: &dyn ContextFetcher,
     keyring: &Keyring,
 ) -> ContextSyncOutcome {
     let version = update.high_seq;
@@ -84,10 +77,9 @@ pub async fn process_update(
     let Some(content) = fetcher.fetch_content(fetch_name).await else {
         return ContextSyncOutcome::FetchFailed;
     };
-    let Ok(bundle) = SyncBundle::decode_wire(&content) else {
+    let Ok(ctx) = SignedTrustContext::decode_content(&content, version) else {
         return ContextSyncOutcome::DecodeFailed;
     };
-    let ctx = bundle_to_context(bundle, version);
     if keyring.adopt(Arc::new(ctx)) {
         ContextSyncOutcome::Adopted { version }
     } else {
@@ -101,7 +93,7 @@ pub async fn process_update(
 /// and spawns this on its runtime.
 pub async fn run(
     mut handle: SyncHandle,
-    fetcher: Arc<dyn BundleFetcher>,
+    fetcher: Arc<dyn ContextFetcher>,
     keyring: Arc<Keyring>,
     cancel: CancellationToken,
 ) {
@@ -134,28 +126,21 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndn_security::trust_schema::TrustSchema;
     use std::collections::HashMap;
     use std::sync::Mutex;
 
-    /// Maps a fetch name → bundle wire.
+    /// Maps a fetch name → context Content.
     struct MapFetcher(Mutex<HashMap<String, Bytes>>);
 
     #[async_trait::async_trait]
-    impl BundleFetcher for MapFetcher {
+    impl ContextFetcher for MapFetcher {
         async fn fetch_content(&self, name: Name) -> Option<Bytes> {
             self.0.lock().unwrap().get(&name.to_string()).cloned()
         }
     }
 
-    fn bundle_wire(ns: &str) -> Bytes {
-        SyncBundle {
-            context_name: ns.parse().unwrap(),
-            anchors: Vec::new(),
-            schema: TrustSchema::hierarchical(),
-            ca_endpoints: Vec::new(),
-        }
-        .encode_wire()
+    fn context_wire(ns: &str) -> Bytes {
+        SignedTrustContext::hierarchical(ns.parse().unwrap()).encode_content()
     }
 
     fn update_at(name: &str, seq: u64) -> SyncUpdate {
@@ -173,13 +158,13 @@ mod tests {
     async fn adopts_newer_version_and_anti_rollback_refuses_older() {
         let group = "/home/bob/_sync/v1/devices/device-a";
         let m = MapFetcher(Mutex::new(HashMap::new()));
-        // Publish version 5 and version 3 bundles at their seg names.
+        // Publish version 5 and version 3 contexts at their seg names.
         {
             let mut g = m.0.lock().unwrap();
-            let v5 = Name::from(group).append_segment(5).to_string();
-            let v3 = Name::from(group).append_segment(3).to_string();
-            g.insert(v5, bundle_wire("/home/bob"));
-            g.insert(v3, bundle_wire("/home/bob"));
+            let v5 = group.parse::<Name>().unwrap().append_segment(5).to_string();
+            let v3 = group.parse::<Name>().unwrap().append_segment(3).to_string();
+            g.insert(v5, context_wire("/home/bob"));
+            g.insert(v3, context_wire("/home/bob"));
         }
         let keyring = Keyring::new();
 
@@ -202,6 +187,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn synced_context_keeps_revocations_hint_and_lvs_schema() {
+        use ndn_security::{EnrollmentHint, SchemaBlob, SchemaFormat};
+
+        let group = "/home/bob/_sync/v1/devices/device-a";
+        let revoked: Name = "/home/bob/KEY/old-ca".parse().unwrap();
+        let lvs = Bytes::from_static(include_bytes!(
+            "../../ndn-security/tests/fixtures/lvs_ndnd_test_model.tlv"
+        ));
+        let published = SignedTrustContext::hierarchical("/home/bob".parse().unwrap())
+            .with_ca_endpoint("/home/bob/CA".parse().unwrap())
+            .with_enrollment_hint(EnrollmentHint::hub_default())
+            .with_revocation(revoked.clone())
+            .with_schema_blob(SchemaBlob::lvs(lvs.clone()))
+            .expect("LVS schema imports");
+        let m = MapFetcher(Mutex::new(HashMap::from([(
+            group.parse::<Name>().unwrap().append_segment(7).to_string(),
+            published.encode_content(),
+        )])));
+        let keyring = Keyring::new();
+
+        let out = process_update(&update_at(group, 7), &m, &keyring).await;
+        assert_eq!(out, ContextSyncOutcome::Adopted { version: 7 });
+        let held = keyring.context_for(&"/home/bob".parse().unwrap());
+        assert_eq!(held.version(), 7);
+        assert!(held.is_revoked(&revoked), "revocation survives sync");
+        assert_eq!(held.ca_endpoints(), published.ca_endpoints());
+        assert_eq!(held.enrollment_hint(), Some(&EnrollmentHint::hub_default()));
+        let schema = held.published_schema();
+        assert_eq!(schema.format, SchemaFormat::Lvs);
+        assert_eq!(schema.body, lvs, "LVS blob travels byte-for-byte");
+    }
+
+    #[tokio::test]
     async fn fetch_and_decode_failures_are_reported() {
         let keyring = Keyring::new();
         let empty = MapFetcher(Mutex::new(HashMap::new()));
@@ -211,10 +229,10 @@ mod tests {
         );
 
         let garbage = MapFetcher(Mutex::new(HashMap::from([(
-            Name::from("/x/_sync/v1/devices/d")
+            ndn_packet::name!("/x/_sync/v1/devices/d")
                 .append_segment(1)
                 .to_string(),
-            Bytes::from_static(b"not a bundle"),
+            Bytes::from_static(b"not a trust context"),
         )])));
         assert_eq!(
             process_update(&update_at("/x/_sync/v1/devices/d", 1), &garbage, &keyring).await,

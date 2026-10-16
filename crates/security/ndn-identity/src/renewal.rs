@@ -117,12 +117,7 @@ impl CertRenewer for NdncertRenewer {
             .map_err(|e| RenewalError::Connect(e.to_string()))?;
         let mut client = NdncertClient::new(consumer, self.ca_prefix.clone());
         let cert = client
-            .enroll(
-                key_name.clone(),
-                signer,
-                self.validity_secs,
-                self.challenge.clone(),
-            )
+            .enroll(signer, self.validity_secs, self.challenge.clone())
             .await
             .map_err(|e| RenewalError::Enrollment(Box::new(e)))?;
         let cert_name = (*cert.name).clone();

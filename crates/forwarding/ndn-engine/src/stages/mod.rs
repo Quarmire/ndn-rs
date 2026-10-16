@@ -2,8 +2,8 @@ pub mod cs;
 pub mod decode;
 pub mod pit;
 pub mod strategy;
-// `ndn-security` is now wasm-buildable (sqlite-pib gated off), so the
-// real validation pipeline compiles for both targets — no wasm stub.
+// `ndn-security` is wasm-buildable, so the real validation pipeline
+// compiles for both targets — no wasm stub.
 pub mod validation;
 
 pub use cs::{CsInsertStage, CsLookupStage};

@@ -13,18 +13,18 @@ Cryptographic signing, verification, and trust-policy enforcement for NDN packet
 | `TrustSchema` | Name-pattern rules for trust decisions |
 | `NamePattern` / `PatternComponent` | Regex-like name components for trust rules |
 | `SafeData` | Newtype proving a Data packet has passed validation |
-| `KeyStore` / `MemKeyStore` | In-memory key storage; implement `KeyStore` for persistent backends |
 | `CertCache` / `Certificate` | Certificate lookup cache |
 | `CertFetcher` | Async certificate retrieval via the NDN network |
 | `FilePib` | File-system Public Information Base |
-| `SecurityManager` | High-level facade combining signer, verifier, validator, and PIB |
+| `SecurityManager` | High-level facade holding signers (software or externally held via `register_signer`), cert cache, and trust anchors; loads from a `FilePib` |
 | `SecurityProfile` | Named security configuration preset |
 
 ## Feature Flags
 
 | Flag | Default | Description |
 |---|---|---|
-| `yubikey-piv` | no | Hardware key storage via YubiKey PIV (requires pcscd) |
+| `yubikey-piv` | no | `YubikeyPiv`: signers backed by YubiKey PIV slots (requires pcscd), registered via `SecurityManager::register_signer` |
+| `ndnsec-compat` | no | ndn-cxx-compatible key store: `sqlite_pib::SqlitePib` (`~/.ndn/pib.db`, pib-sqlite3 schema) and `file_tpm::FileTpm` (`~/.ndn/ndnsec-key-file/`, tpm-file format). Pulls bundled SQLite (`rusqlite`), so not wasm-buildable |
 
 ## Usage
 

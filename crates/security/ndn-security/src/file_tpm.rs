@@ -292,7 +292,7 @@ impl FileTpm {
         key_name: &Name,
         password: &[u8],
     ) -> Result<Bytes, crate::safebag::SafeBagError> {
-        let pkcs8_der = safebag.decrypt_key(password)?;
+        let pkcs8_der = safebag.decrypt_pkcs8(password)?;
         let kind = crate::safebag::detect_pkcs8_algorithm(&pkcs8_der)?;
         let on_disk: Vec<u8> = match kind {
             TpmKeyKind::Rsa => crate::safebag::rsa_pkcs8_to_pkcs1(&pkcs8_der)?,
@@ -430,27 +430,7 @@ fn public_key_ecdsa_p256(sec1_der: &[u8]) -> Result<Vec<u8>, FileTpmError> {
     let sec1_bytes = point.as_bytes();
     debug_assert_eq!(sec1_bytes.len(), 65);
     debug_assert_eq!(sec1_bytes[0], 0x04);
-    Ok(p256_spki_wrap(sec1_bytes))
-}
-
-/// Wrap a 65-byte P-256 uncompressed SEC1 point (`04 || X || Y`) in a
-/// canonical SubjectPublicKeyInfo DER. Hand-built to avoid the
-/// rustcrypto pkcs8 / elliptic-curve trait shuffle. Output is 91 bytes:
-/// outer SEQUENCE (0x30 0x59) + algorithm SEQUENCE with id-ecPublicKey
-/// and prime256v1 OIDs + BIT STRING containing the uncompressed point.
-pub(crate) fn p256_spki_wrap(sec1_uncompressed: &[u8]) -> Vec<u8> {
-    const PREFIX: [u8; 26] = [
-        0x30, 0x59, // SEQUENCE, 89 bytes
-        0x30, 0x13, // SEQUENCE, 19 bytes (algorithm)
-        0x06, 0x07, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01, // OID id-ecPublicKey
-        0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07, // OID prime256v1
-        0x03, 0x42, // BIT STRING, 66 bytes
-        0x00, // 0 unused bits
-    ];
-    let mut out = Vec::with_capacity(PREFIX.len() + sec1_uncompressed.len());
-    out.extend_from_slice(&PREFIX);
-    out.extend_from_slice(sec1_uncompressed);
-    out
+    Ok(crate::signer::p256_spki_wrap(sec1_bytes))
 }
 
 fn sign_ed25519(pkcs8_der: &[u8], region: &[u8]) -> Result<Bytes, FileTpmError> {

@@ -52,5 +52,5 @@ without re-defining.
 | **SVS** | State Vector Sync; the multi-publisher sync protocol that `Subscriber` consumes. |
 | **TapFace** | Instrument-tier virtual face that records every wire packet sent to it. |
 | **Transport** | Trait for raw byte send/recv; pairs with a `LinkService` to form a `Face`. |
-| **TrustPolicy** | Extend-tier trait answering "should this key sign that name?". |
-| **ValidationPolicy** | Extend-tier trait composing `TrustPolicy` decisions into a verdict chain. |
+| **TrustSchema** | The trust policy: `(data name, key name)` rules plus an optional LVS model, deciding which key may sign which name. |
+| **Validator** | Enforces a `TrustSchema`: checks the name pair, walks the cert chain to a trust anchor, and yields `SafeData`. |

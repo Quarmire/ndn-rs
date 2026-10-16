@@ -444,7 +444,6 @@ fn bench_validation_stage(c: &mut Criterion) {
         use ndn_engine::stages::validation::PendingQueueConfig;
         let stage = ValidationStage::new(
             Some(validator),
-            None,
             PendingQueueConfig::default(),
             ndn_runtime::default_runtime(),
         );

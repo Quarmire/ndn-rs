@@ -64,7 +64,7 @@ impl Ed25519Signer {
         Self::new(signing_key, key_name, None)
     }
 
-    /// Load from a PKCS#8 DER private key (the format a SafeBag or a FileTpm
+    /// Load from a PKCS#8 DER private key (the format a SafeBag or a FilePib
     /// stores). Lets a decrypted SafeBag key be deposited into a custodian.
     pub fn from_pkcs8_der(pkcs8_der: &[u8], key_name: Name) -> Result<Self, TrustError> {
         use ed25519_dalek::pkcs8::DecodePrivateKey;
@@ -144,6 +144,26 @@ impl Signer for Ed25519Signer {
     }
 }
 
+/// Wrap a 65-byte P-256 uncompressed SEC1 point (`04 || X || Y`) in a
+/// canonical SubjectPublicKeyInfo DER. Hand-built to avoid the
+/// rustcrypto pkcs8 / elliptic-curve trait shuffle. Output is 91 bytes:
+/// outer SEQUENCE (0x30 0x59) + algorithm SEQUENCE with id-ecPublicKey
+/// and prime256v1 OIDs + BIT STRING containing the uncompressed point.
+pub(crate) fn p256_spki_wrap(sec1_uncompressed: &[u8]) -> Vec<u8> {
+    const PREFIX: [u8; 26] = [
+        0x30, 0x59, // SEQUENCE, 89 bytes
+        0x30, 0x13, // SEQUENCE, 19 bytes (algorithm)
+        0x06, 0x07, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01, // OID id-ecPublicKey
+        0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07, // OID prime256v1
+        0x03, 0x42, // BIT STRING, 66 bytes
+        0x00, // 0 unused bits
+    ];
+    let mut out = Vec::with_capacity(PREFIX.len() + sec1_uncompressed.len());
+    out.extend_from_slice(&PREFIX);
+    out.extend_from_slice(sec1_uncompressed);
+    out
+}
+
 pub struct EcdsaP256Signer {
     signing_key: p256_ecdsa::ecdsa::SigningKey,
     spki_der: Bytes,
@@ -158,7 +178,7 @@ impl EcdsaP256Signer {
         cert_name: Option<Name>,
     ) -> Self {
         let point = signing_key.verifying_key().to_encoded_point(false);
-        let spki = crate::file_tpm::p256_spki_wrap(point.as_bytes());
+        let spki = p256_spki_wrap(point.as_bytes());
         Self {
             signing_key,
             spki_der: Bytes::from(spki),

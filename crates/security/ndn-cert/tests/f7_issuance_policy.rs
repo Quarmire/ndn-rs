@@ -52,6 +52,7 @@ fn make_ca(issuance: Box<dyn IssuancePolicy>) -> (Arc<CaState>, Arc<SecurityMana
         policy: Box::new(HierarchicalPolicy),
         issuance,
         emit_attestations: false,
+        signing_key: None,
     };
     let state = Arc::new(CaState::new(config, Arc::clone(&mgr)));
     (state, mgr, ca_key_name)

@@ -2,7 +2,10 @@
 //!
 //! `CertFetcher` retrieves certificates over NDN by expressing Interests
 //! for certificate names. It deduplicates concurrent requests for the same
-//! certificate and caches results in the shared `CertCache`.
+//! certificate, caches results in the shared `CertCache`, and remembers
+//! recent failures (a negative cache) so a stream of Data signed by an
+//! unfetchable key costs one cert Interest per backoff window rather than one
+//! per packet.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -23,17 +26,36 @@ pub struct CertFetcher {
     cert_cache: Arc<CertCache>,
     fetch_fn: FetchFn,
     in_flight: DashMap<Arc<Name>, broadcast::Sender<Option<Certificate>>>,
+    /// Names whose last fetch failed → instant until which re-fetching is
+    /// suppressed. Bounded: pruned of expired entries once it exceeds
+    /// [`NEGATIVE_CACHE_PRUNE_AT`].
+    failed: DashMap<Arc<Name>, tokio::time::Instant>,
     timeout: Duration,
+    negative_ttl: Duration,
 }
 
+/// Size at which expired negative-cache entries are swept.
+const NEGATIVE_CACHE_PRUNE_AT: usize = 1024;
+
 impl CertFetcher {
+    /// `timeout` bounds each fetch; a failed fetch suppresses re-fetching the
+    /// same name for `timeout` as well (see [`Self::with_negative_ttl`]).
     pub fn new(cert_cache: Arc<CertCache>, fetch_fn: FetchFn, timeout: Duration) -> Self {
         Self {
             cert_cache,
             fetch_fn,
             in_flight: DashMap::new(),
+            failed: DashMap::new(),
             timeout,
+            negative_ttl: timeout,
         }
+    }
+
+    /// Override how long a failed fetch suppresses re-fetching the same name
+    /// (`Duration::ZERO` disables the negative cache).
+    pub fn with_negative_ttl(mut self, ttl: Duration) -> Self {
+        self.negative_ttl = ttl;
+        self
     }
 
     /// Fetch a certificate by name, deduplicating concurrent requests.
@@ -47,25 +69,56 @@ impl CertFetcher {
             return Ok(cert);
         }
 
-        if let Some(entry) = self.in_flight.get(cert_name) {
-            let mut rx = entry.subscribe();
-            drop(entry);
-            return match rx.recv().await {
-                Ok(Some(cert)) => Ok(cert),
-                _ => Err(TrustError::CertNotFound {
-                    name: cert_name.to_string(),
-                }),
-            };
+        // Negative cache: a recent failure for this name short-circuits, so
+        // Data signed by an unreachable key cannot drive a fetch per packet.
+        let failed_until = self.failed.get(cert_name).map(|e| *e.value());
+        if let Some(until) = failed_until {
+            if tokio::time::Instant::now() < until {
+                return Err(TrustError::CertNotFound {
+                    name: format!("recently failed: {cert_name}"),
+                });
+            }
+            self.failed.remove(cert_name);
         }
 
-        let (tx, _) = broadcast::channel(1);
-        self.in_flight.insert(Arc::clone(cert_name), tx.clone());
+        // Atomic leader election: exactly one caller per name issues the fetch.
+        let tx = match self.in_flight.entry(Arc::clone(cert_name)) {
+            dashmap::mapref::entry::Entry::Occupied(entry) => {
+                let mut rx = entry.get().subscribe();
+                drop(entry);
+                return match rx.recv().await {
+                    Ok(Some(cert)) => Ok(cert),
+                    // Closed before we subscribed in time: the leader may still
+                    // have succeeded (it caches before publishing).
+                    _ => self
+                        .cert_cache
+                        .get(cert_name)
+                        .ok_or_else(|| TrustError::CertNotFound {
+                            name: cert_name.to_string(),
+                        }),
+                };
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                let (tx, _) = broadcast::channel(1);
+                entry.insert(tx.clone());
+                tx
+            }
+        };
         let guard = InFlightGuard {
             in_flight: &self.in_flight,
             cert_name: Arc::clone(cert_name),
         };
 
         let result = self.do_fetch(cert_name).await;
+
+        if result.is_err() && !self.negative_ttl.is_zero() {
+            let now = tokio::time::Instant::now();
+            if self.failed.len() >= NEGATIVE_CACHE_PRUNE_AT {
+                self.failed.retain(|_, until| *until > now);
+            }
+            self.failed
+                .insert(Arc::clone(cert_name), now + self.negative_ttl);
+        }
 
         let cert = result.as_ref().ok().cloned();
         let _ = tx.send(cert);
@@ -322,5 +375,70 @@ mod tests {
 
         // `in_flight` is empty after the guard's `Drop` ran.
         assert_eq!(fetcher.in_flight.len(), 0);
+    }
+
+    fn counting_miss_fetch_fn() -> (FetchFn, Arc<AtomicUsize>) {
+        let count = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&count);
+        let fetch_fn: FetchFn = Arc::new(move |_| {
+            c.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async { None })
+        });
+        (fetch_fn, count)
+    }
+
+    /// A cert that fails to fetch (no route / Nack resolve instantly) must not
+    /// be re-fetched for every Data that names it: the negative cache holds the
+    /// failure for the backoff window, so N lookups cost one Interest.
+    #[tokio::test]
+    async fn failed_fetch_is_not_retried_within_backoff() {
+        let (fetch_fn, count) = counting_miss_fetch_fn();
+        let fetcher = CertFetcher::new(
+            Arc::new(CertCache::new()),
+            fetch_fn,
+            Duration::from_secs(30),
+        );
+        let name = make_cert_name("gone");
+        for _ in 0..50 {
+            assert!(fetcher.fetch(&name).await.is_err());
+        }
+        assert_eq!(count.load(Ordering::Relaxed), 1, "one Interest per backoff window");
+        // A different name is unaffected.
+        assert!(fetcher.fetch(&make_cert_name("other")).await.is_err());
+        assert_eq!(count.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn failed_fetch_is_retried_after_backoff() {
+        let (fetch_fn, count) = counting_miss_fetch_fn();
+        let fetcher = CertFetcher::new(
+            Arc::new(CertCache::new()),
+            fetch_fn,
+            Duration::from_secs(1),
+        )
+        .with_negative_ttl(Duration::from_millis(30));
+        let name = make_cert_name("later");
+        assert!(fetcher.fetch(&name).await.is_err());
+        assert!(fetcher.fetch(&name).await.is_err());
+        assert_eq!(count.load(Ordering::Relaxed), 1);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(fetcher.fetch(&name).await.is_err());
+        assert_eq!(count.load(Ordering::Relaxed), 2, "backoff expired → refetch");
+    }
+
+    #[tokio::test]
+    async fn zero_negative_ttl_disables_backoff() {
+        let (fetch_fn, count) = counting_miss_fetch_fn();
+        let fetcher = CertFetcher::new(
+            Arc::new(CertCache::new()),
+            fetch_fn,
+            Duration::from_secs(1),
+        )
+        .with_negative_ttl(Duration::ZERO);
+        let name = make_cert_name("nocache");
+        for _ in 0..3 {
+            assert!(fetcher.fetch(&name).await.is_err());
+        }
+        assert_eq!(count.load(Ordering::Relaxed), 3);
     }
 }

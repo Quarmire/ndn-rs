@@ -6,8 +6,8 @@
 //! the keychain (so it signs and verifies exactly like one) and adds the
 //! lifecycle NDN leaves to applications —
 //!
-//! - **enrollment / renewal** ([`enroll`](Identity::enroll),
-//!   [`provision`](Identity::provision)) — get a certificate from a CA;
+//! - **enrollment / renewal** ([`provision`](Identity::provision)) — get a
+//!   certificate from a CA (ad-hoc enrollment: [`NdncertClient`](crate::NdncertClient));
 //! - **rotation** ([`rotate`](Identity::rotate)) — change the operational key
 //!   under the prior key's authority, recorded as a `did:ndn` history;
 //! - **recovery** ([`recover`](Identity::recover)) — install a new key under a
@@ -16,7 +16,7 @@
 //!   capability to a device key.
 //!
 //! Reach for `Identity` when you need any of those; otherwise a bare `KeyChain`
-//! is enough. (`NdnIdentity` is a deprecated alias for this type.)
+//! is enough.
 //!
 //! The safe default it imposes (design note §5): **recovery is designated at
 //! creation.** [`create`](Identity::create) requires a [`RecoveryCommitment`];
@@ -79,12 +79,6 @@ impl Identity {
             KeyChain::open_or_create(path, name)?,
             None,
         ))
-    }
-
-    /// Run the NDNCERT INFO → NEW → CHALLENGE exchange and persist the issued
-    /// cert if `config.storage` is set.
-    pub async fn enroll(config: crate::enroll::EnrollConfig) -> Result<Self, IdentityError> {
-        crate::enroll::run_enrollment(config).await
     }
 
     /// Select the challenge from `config.factory_credential`, enroll, and
@@ -553,7 +547,7 @@ mod tests {
         )
         .unwrap();
         let scope = CapabilitySet {
-            sign: vec![crate::trust_context::pattern_under(
+            sign: vec![crate::identity_ref::pattern_under(
                 &"/alice/device/phone".parse().unwrap(),
             )],
             ..Default::default()

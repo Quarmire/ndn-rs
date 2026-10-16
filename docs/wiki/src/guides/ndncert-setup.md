@@ -93,10 +93,12 @@ single-use or TTL-bounded.
 | `acme-dns01` | Wins an ACME DNS-01 challenge | Domain-bound names; see `testbed/tests/audit/acme_dns01.sh`. |
 
 The challenge surface is in `crates/security/ndn-cert/src/challenge/`.
-Client-side enrollment uses `ndn_identity::NdncertClient`; standard token and
-possession challenges have typed helpers, and named custom challenges can pass
-their challenge identifier plus structured parameters through the same
-NDNCERT NEW/CHALLENGE session.
+Every client runs the one NEW → CHALLENGE driver, `ndn_cert::client::enroll`,
+over a `CaExchange` transport (PROBE is not sent; it is optional in NDNCERT
+0.3). `ndn_identity::NdncertClient` is the `Consumer`-backed client; standard
+token and possession challenges have typed `ChallengeParams` helpers, and named
+custom challenges can pass their challenge identifier plus structured
+parameters through the same session.
 
 ## Issuance policy
 
@@ -113,15 +115,44 @@ Built-ins in `crates/security/ndn-cert/src/policy.rs`:
 
 ## Configuration
 
-CA-side `ndn-fwd.toml` section:
+`ndn-fwd` embeds a CA through its `[demo_ca]` section (full key list in the
+[configuration reference](../operations/config-reference.md)). On a hub,
+`ndn-fwd init --profile hub` writes the root anchor, a `/<ns>/CA` signing
+identity certified by it, and the hub node's own identity `/<ns>/hub`
+(`--node-name` picks another last component) into the node PIB, and prints
+the `[security]` lines (`identity`, `pib_path`) that make the forwarder load
+the node identity. The CA loads its identity, so the certs it issues chain to
+the same root across restarts, and it persists issued certs, revocations and
+redeemed tokens (hashed) under `<pib_path>/ca/`:
 
 ```toml
-[ndncert.ca]
-identity = "/lab/ca"
-allow-namespace = ["/lab"]
-challenge = ["token", "proof-of-possession"]
-issuance-policy = "accept-all"
+[demo_ca]
+enabled  = true
+prefix   = "/home/bob"      # serves /home/bob/CA/{INFO,NEW,CHALLENGE}
+identity = "/home/bob/CA"   # signing identity loaded from the PIB
+
+[[demo_ca.challenge]]
+kind   = "token"
+tokens = ["<one-time invite>"]
+
+[[demo_ca.challenge]]
+kind = "device-approval"     # approve via /localhost/nfd/ca/approve
 ```
+
+A CA with no challenge refuses to start; `kind = "nop"` (auto-approve) must be
+listed explicitly. `ephemeral = true` replaces the PIB identity with a
+throwaway self-signed key for demos.
+
+`/<prefix>/CA/REVOKE` revokes a cert this CA issued
+(`ndn_cert::client::revoke`): the request carries a signature over the cert
+name by the cert's own key (its holder) or by the CA's signing key; any other
+key gets `Unauthorized`. A revoked cert is no longer served on cert-fetch and
+its key is not re-certified, also after a restart.
+
+Library users get the same pieces from `NdncertCa::builder()`:
+`signing_identity` fixes the signing key (`CaConfig::signing_key`), and
+`store(Arc::new(FileCaStore::open(dir)?))` makes issued certs and revocations
+durable; `TokenStore::with_store(store)` does the same for token redemptions.
 
 Run as a system service via the docker-compose stack — see
 [Self-hosting](./self-hosting.md).
@@ -178,8 +209,10 @@ naming `token`. Composite challenges record one leaf per satisfied
 sub with that sub's own evidence: `all-of` carries every sub,
 `nofm` carries the `n` that were met, and `any-of` carries the one
 that won. A cross-process `device-approval` leaf additionally
-carries the approving device's identity and signature, verifiable
-independently of the CA. The dashboard's trust-path inspector
+carries the approving device's validated signer name and the
+signature value of its signed approval Data
+(`<cert>/ndncert-approve/<request-id>`, checked against the CA's
+trust schema before recording). The dashboard's trust-path inspector
 renders the leaves, and `security/validate` returns them under
 `challenge_attestations`.
 

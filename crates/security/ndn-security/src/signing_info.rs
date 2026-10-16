@@ -15,7 +15,10 @@ use ndn_packet::Name;
 #[derive(Debug, Clone)]
 pub enum SignerSelection {
     /// Identity's default key; `Name` is the identity prefix
-    /// (e.g. `/com/example/alice`).
+    /// (e.g. `/com/example/alice`). Any identity whose key the keychain's
+    /// [`SecurityManager`] holds resolves; an unknown identity is an error.
+    ///
+    /// [`SecurityManager`]: crate::SecurityManager
     Identity(Name),
     /// Specific key by name; must already be in the [`SecurityManager`]'s
     /// key store.
@@ -29,9 +32,9 @@ pub enum SignerSelection {
     HmacKey(Name),
     /// `DigestSha256` — integrity only, no key.
     Digest,
-    /// Let an LVS rule choose the signer for the packet name. Falls back
-    /// to the keychain's default identity signer until full LVS-rule
-    /// evaluation lands.
+    /// Let an LVS rule choose the signer for the packet name. Until full
+    /// LVS-rule evaluation lands, the held identity with the longest name
+    /// covering `for_name` signs; no covering identity is an error.
     Suggested { for_name: Name },
 }
 

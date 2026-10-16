@@ -64,12 +64,14 @@ not move — the type system guarantees it.
 
 ## Choosing your policy
 
-A trust policy answers "may this key sign this name?" ndn-rs ships several:
+A trust policy answers "may this key sign this name?" In ndn-rs it is a
+`TrustSchema`, enforced by a `Validator`. Common shapes:
 
-- `InsecureTrust` — accepts anything. Tests only; never in deployment.
-- `StaticTrust` — an explicit allowlist of keys.
-- schema-based trust — name-pattern rules, the usual production choice.
-- `HierarchicalPolicy` — a parent-name key may sign child-name Data.
+- `TrustSchema::hierarchical()` — a key may sign Data in its own namespace.
+- LVS schemas (`TrustSchema::from_lvs_binary`) — name-pattern rules, the
+  usual production choice.
+- custom `SchemaRule`s — `"<data> => <key>"` patterns.
+- `TrustSchema::accept_all()` — any name; the anchor set is the only limit.
 
 The catalog, with the trade-offs of each, is in
 [Trust policies](../reference/trust-policies.md). How keys, certificates,

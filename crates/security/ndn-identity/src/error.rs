@@ -18,7 +18,7 @@ pub enum IdentityError {
     Enrollment(String),
     #[error("renewal failed: {0}")]
     Renewal(String),
-    #[error("not enrolled: call enroll() or provision() first")]
+    #[error("not enrolled: call provision() or enroll via NdncertClient first")]
     NotEnrolled,
     #[error("identity lifecycle error: {0}")]
     Lifecycle(String),

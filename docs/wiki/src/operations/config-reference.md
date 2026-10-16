@@ -103,18 +103,40 @@ cost = 100        # optional
 
 ## `[demo_ca]` — embedded NDNCERT CA
 
-Off by default; `enabled = true` runs an in-process CA. See
-[NDNCERT setup](../guides/ndncert-setup.md).
+Off by default; `enabled = true` runs an in-process CA serving
+`/<prefix>/CA/{INFO,NEW,CHALLENGE/<id>,REVOKE}` and cert-fetch for the certs
+it issued. See [NDNCERT setup](../guides/ndncert-setup.md).
 
 | Key | Default | Use |
 |---|---|---|
 | `enabled` | `false` | Run the embedded CA. |
-| `prefix` | `/demo/CA` | CA prefix; issues under the parent namespace. |
+| `prefix` | `/demo` | CA namespace. The CA appends `/CA` itself (as do clients); a prefix ending in `/CA` is rejected at startup. |
+| `identity` | `/demo/CA` | CA signing identity, loaded from the node PIB (`[security] pib_path`). |
+| `ephemeral` | `false` | Mint a throwaway self-signed CA key at every start instead of loading `identity` (demo only; warned). |
 | `tokens` | `[]` | Legacy: non-empty selects a token challenge (ignored when `challenge` is set). |
 | `emit_attestations` | `false` | Embed a challenge attestation in each issued cert. |
 
+Without `ephemeral`, the CA loads its key from the PIB and its certificate
+(issued by the hub root) from `<pib_path>/ca/ca-cert.data`; the root's anchor
+certificate is `<pib_path>/ca/anchor-cert.data` or a PIB trust anchor. `ndn-fwd
+init --profile hub` writes all three. Startup fails if they are missing,
+mismatched, or the CA cert is not signed by the root. Issued certs,
+revocations and redeemed one-time tokens (SHA-256 hashes only) persist under
+`<pib_path>/ca/{issued,revoked,redeemed-tokens}/`: issued certs are served
+again after a restart, revoked ones are not, and a token redeemed before a
+restart stays refused even while it is still listed in the config.
+
+`ndn-fwd init --profile hub --namespace /<ns> [--node-name <name>]` also mints
+the hub node's own identity `/<ns>/<name>` (default `hub`; key
+`/<ns>/<name>/KEY/node`, cert issued by the root, signed copy at
+`<pib_path>/ca/node-cert.data`) and prints the `[security]` lines that load
+it (`identity = "/<ns>/<name>"`, `pib_path = "<pib>"`); without them the
+forwarder falls back to an ephemeral key. Init never edits config files.
+
 `[[demo_ca.challenge]]` — explicit challenge set (replaces the `tokens`
-shortcut). Each entry has `kind = "nop"|"token"|"pin"|"email"`:
+shortcut). Each entry has `kind = "nop"|"token"|"pin"|"email"|"device-approval"`.
+The CA refuses to start with no challenge configured; `nop` (auto-approve
+every request) is only offered when listed explicitly.
 
 ```toml
 [[demo_ca.challenge]]
@@ -124,9 +146,14 @@ smtp = { host = "smtp.example.com", port = 587, from = "ca@example.com", starttl
 ```
 
 `email` delivers via SMTP only with `--features smtp` (lettre); otherwise (or
-with `smtp.log_only = true`) the code is logged. `[demo_ca.require_attestation]`
-(`prefix`/`kind`/`require_signed`) gates issuance on a challenge attestation.
-`possession`/`yubikey`/`device-approval` are wired in code.
+with `smtp.log_only = true`) the code is logged. `device-approval` holds each
+request until it is approved or denied over mgmt
+(`/localhost/nfd/ca/{list-approvals,approve,deny}`; `uri` = `<id>` or
+`<id>:<reason>`) or an approver device sends a signed approval to
+`/<prefix>/CA/APPROVE-FEED` that validates against the node's trust contexts;
+all three share one pending-approval store.
+`[demo_ca.require_attestation]` (`prefix`/`kind`/`require_signed`) gates
+issuance on a challenge attestation. `possession`/`yubikey` are wired in code.
 
 ## `[log]` — log filter
 

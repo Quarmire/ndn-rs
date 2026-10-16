@@ -1,17 +1,25 @@
-//! NDNCERT client-side enrollment state machine. Network I/O is provided by
-//! the caller (the `ndn-identity` crate).
+//! NDNCERT client side: the [`EnrollmentSession`] state machine and the one
+//! transport-generic NEW → CHALLENGE driver, [`enroll`], that runs it over any
+//! [`CaExchange`], plus [`revoke`] for `/<ca>/CA/REVOKE`. Network I/O is
+//! supplied by the caller's `CaExchange` impl (an `ndn-app` `Consumer`, an
+//! in-process face, a test double).
 
 use std::sync::Arc;
 
-use ndn_packet::Name;
+use bytes::Bytes;
+use ndn_packet::encode::InterestBuilder;
+use ndn_packet::{Data, Name, NameComponent};
 use ndn_security::{Signer, encode_cert_data};
 
 use crate::{
     ecdh::{EcdhKeypair, SessionKey, new_encryption_iv},
     error::CertError,
+    protocol::RevokeStatus,
     tlv::{
-        ChallengeResponseTlv, NewRequestTlv, NewResponseTlv, STATUS_CHALLENGE, STATUS_FAILURE,
-        STATUS_PENDING, STATUS_SUCCESS, TLV_SELECTED_CHALLENGE, encode_challenge_parameters,
+        ChallengeResponseTlv, NewRequestTlv, NewResponseTlv, REVOKE_STATUS_NOT_FOUND,
+        REVOKE_STATUS_REVOKED, REVOKE_STATUS_UNAUTHORIZED, RevokeRequestTlv, RevokeResponseTlv,
+        STATUS_CHALLENGE, STATUS_FAILURE, STATUS_PENDING, STATUS_SUCCESS, TLV_SELECTED_CHALLENGE,
+        encode_challenge_parameters,
     },
 };
 
@@ -32,14 +40,15 @@ enum SessionState {
     Complete,
 }
 
-/// Client enrollment driver.
+/// Client enrollment state machine. Drive it with [`enroll`]; the individual
+/// steps are public for in-process tests against [`CaState`](crate::ca::CaState).
 ///
 /// 1. `new` → `new_request_body` (async, builds self-signed cert_request).
 /// 2. `handle_new_response` (derives the session key).
 /// 3. `challenge_request_body` → `handle_challenge_response`; repeat for multi-round.
 /// 4. On success, fetch the cert at [`issued_cert_name`](Self::issued_cert_name).
 ///
-/// Callers must sign every NEW and CHALLENGE Interest with [`signer`](Self::signer).
+/// Every NEW and CHALLENGE Interest must be signed with [`signer`](Self::signer).
 pub struct EnrollmentSession {
     name: Name,
     signer: Arc<dyn Signer>,
@@ -276,6 +285,207 @@ impl EnrollmentSession {
     pub fn issued_cert_name(&self) -> Option<&Name> {
         self.issued_cert_name.as_ref()
     }
+}
+
+/// Transport seam for [`enroll`]: one Interest → Data exchange with the CA.
+///
+/// [`enroll`] builds (and, for NEW / CHALLENGE, signs) every Interest itself,
+/// so an impl only expresses the given Interest wire and returns the reply
+/// Data — over an `ndn-app` `Consumer`, an in-process face, or a test double
+/// routing straight into a [`CaState`](crate::ca::CaState). Timeouts are the
+/// impl's choice; report failures as [`CertError::Transport`].
+pub trait CaExchange {
+    fn express(&mut self, interest: Bytes) -> impl Future<Output = Result<Data, CertError>> + Send;
+}
+
+/// What the challenge responder sees before each CHALLENGE round of [`enroll`].
+#[derive(Debug, Clone)]
+pub struct ChallengeRound {
+    /// `0` for the first CHALLENGE Interest.
+    pub round: u32,
+    /// Hex request id the CA assigned in its NEW response.
+    pub request_id: String,
+    /// The CA's `challenge-status` from the previous round (`None` on round 0).
+    pub status_message: Option<String>,
+    /// Remaining tries the CA reported in the previous round (`None` on round 0).
+    pub remaining_tries: Option<u8>,
+}
+
+/// Run NDNCERT 0.3 enrollment for `signer`'s key against `ca_prefix`:
+/// NEW → CHALLENGE(`challenge_type`) rounds until the CA issues. Returns the
+/// issued certificate name; fetch it with [`fetch_issued_cert`].
+///
+/// PROBE is not sent (optional in NDNCERT 0.3). The NEW and CHALLENGE
+/// Interests are signed by `signer` with its key name as KeyLocator. Fails
+/// with [`CertError::InvalidRequest`] if the CA does not offer
+/// `challenge_type`.
+///
+/// `respond` supplies the CHALLENGE parameters for each round. It is called
+/// for round 0 and again for every round the CA answers with
+/// challenge/pending status; returning `Ok(None)` stops the exchange with
+/// [`CertError::ChallengePending`] carrying the CA's last status message.
+pub async fn enroll<E, F, Fut>(
+    exchange: &mut E,
+    ca_prefix: &Name,
+    signer: Arc<dyn Signer>,
+    validity_secs: u64,
+    challenge_type: &str,
+    mut respond: F,
+) -> Result<Name, CertError>
+where
+    E: CaExchange + ?Sized,
+    F: FnMut(ChallengeRound) -> Fut,
+    Fut: Future<Output = Result<Option<serde_json::Map<String, serde_json::Value>>, CertError>>,
+{
+    let mut session = EnrollmentSession::new(signer.key_name().clone(), signer, validity_secs);
+
+    let new_body = session.new_request_body().await?;
+    let new_name = ca_prefix.clone().append("CA").append("NEW");
+    let new_data = exchange
+        .express(session.signed_interest(new_name, new_body).await?)
+        .await?;
+    session.handle_new_response(response_content(&new_data, "NEW")?)?;
+
+    if !session.offered_challenges().iter().any(|c| c == challenge_type) {
+        return Err(CertError::InvalidRequest(format!(
+            "CA did not offer the '{challenge_type}' challenge; offered: {:?}",
+            session.offered_challenges()
+        )));
+    }
+
+    let request_id = session.request_id().unwrap_or_default().to_owned();
+    let request_id_bytes = *session
+        .request_id_bytes()
+        .ok_or_else(|| CertError::InvalidRequest("no request id after NEW".into()))?;
+    let challenge_name = ca_prefix
+        .clone()
+        .append("CA")
+        .append("CHALLENGE")
+        .append_component(NameComponent::generic(Bytes::copy_from_slice(
+            &request_id_bytes,
+        )));
+
+    let mut round = 0u32;
+    loop {
+        let prompt = ChallengeRound {
+            round,
+            request_id: request_id.clone(),
+            status_message: session.challenge_status_message().map(str::to_owned),
+            remaining_tries: session.remaining_tries(),
+        };
+        let Some(params) = respond(prompt).await? else {
+            return Err(CertError::ChallengePending(
+                session
+                    .challenge_status_message()
+                    .unwrap_or("challenge not completed")
+                    .to_owned(),
+            ));
+        };
+        let body = session.challenge_request_body(challenge_type, params)?;
+        let data = exchange
+            .express(session.signed_interest(challenge_name.clone(), body).await?)
+            .await?;
+        session.handle_challenge_response(response_content(&data, "CHALLENGE")?)?;
+
+        if session.is_complete() {
+            break;
+        }
+        round += 1;
+    }
+
+    session
+        .issued_cert_name()
+        .cloned()
+        .ok_or_else(|| CertError::InvalidRequest("no issued cert name on success".into()))
+}
+
+/// Fetch the certificate [`enroll`] reported as issued. The returned Data *is*
+/// the Certificate v2 object (decode it with `Certificate::decode`; its
+/// [`raw`](Data::raw) wire is what a SafeBag stores).
+pub async fn fetch_issued_cert<E>(exchange: &mut E, cert_name: &Name) -> Result<Data, CertError>
+where
+    E: CaExchange + ?Sized,
+{
+    exchange
+        .express(InterestBuilder::new(cert_name.clone()).build())
+        .await
+}
+
+/// Ask the CA at `ca_prefix` to revoke `cert_name` (NDNCERT 0.3
+/// `<ca-prefix>/CA/REVOKE`). `signer` proves the authority to revoke: it must
+/// be the revoked certificate's own key (its holder) or the CA's signing key.
+/// It signs the cert name as the request's possession proof and signs the
+/// command Interest. Returns the CA's verdict; transport failures and
+/// malformed replies are errors.
+pub async fn revoke<E>(
+    exchange: &mut E,
+    ca_prefix: &Name,
+    cert_name: &Name,
+    signer: Arc<dyn Signer>,
+) -> Result<RevokeStatus, CertError>
+where
+    E: CaExchange + ?Sized,
+{
+    let cert_uri = cert_name.to_string();
+    let proof = signer
+        .sign(cert_uri.as_bytes())
+        .await
+        .map_err(CertError::Security)?;
+    let body = RevokeRequestTlv {
+        cert_name: cert_uri,
+        signature: proof,
+    }
+    .encode()
+    .to_vec();
+    let name = ca_prefix.clone().append("CA").append("REVOKE");
+    let key_locator = signer.key_name().clone();
+    let data = exchange
+        .express(signed_command(name, body, &signer, &key_locator).await?)
+        .await?;
+    let resp = RevokeResponseTlv::decode(Bytes::copy_from_slice(response_content(
+        &data, "REVOKE",
+    )?))?;
+    match resp.status {
+        REVOKE_STATUS_REVOKED => Ok(RevokeStatus::Revoked),
+        REVOKE_STATUS_NOT_FOUND => Ok(RevokeStatus::NotFound),
+        REVOKE_STATUS_UNAUTHORIZED => Ok(RevokeStatus::Unauthorized),
+        other => Err(CertError::InvalidRequest(format!(
+            "REVOKE response has unknown status {other}"
+        ))),
+    }
+}
+
+impl EnrollmentSession {
+    /// A command Interest for `name` carrying `body` as ApplicationParameters,
+    /// signed by the session's key.
+    async fn signed_interest(&self, name: Name, body: Vec<u8>) -> Result<Bytes, CertError> {
+        signed_command(name, body, &self.signer, &self.name).await
+    }
+}
+
+/// A command Interest for `name` carrying `body` as ApplicationParameters,
+/// signed by `signer` with `key_locator`.
+async fn signed_command(
+    name: Name,
+    body: Vec<u8>,
+    signer: &Arc<dyn Signer>,
+    key_locator: &Name,
+) -> Result<Bytes, CertError> {
+    let signer = Arc::clone(signer);
+    Ok(InterestBuilder::new(name)
+        .must_be_fresh()
+        .app_parameters(body)
+        .sign_fallible(signer.sig_type(), Some(key_locator), |region| {
+            let region = region.to_vec();
+            async move { signer.sign(&region).await }
+        })
+        .await?)
+}
+
+fn response_content<'a>(data: &'a Data, step: &str) -> Result<&'a [u8], CertError> {
+    data.content()
+        .map(|c| c.as_ref())
+        .ok_or_else(|| CertError::InvalidRequest(format!("{step} response has no content")))
 }
 
 fn now_ns() -> u64 {

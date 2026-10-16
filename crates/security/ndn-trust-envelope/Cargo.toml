@@ -1,0 +1,23 @@
+[package]
+name = "ndn-trust-envelope"
+description = "Shared `ndn-trust://` onboarding/pairing envelope codec (issuer + mobile)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+classification = "spec"
+
+[dependencies]
+ndn-tlv   = { workspace = true }
+bytes     = { workspace = true, features = ["std"] }
+base64    = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# only for the `emit` helper's `qr` mode (renders a payload SVG for testing)
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+
+[lints]
+workspace = true

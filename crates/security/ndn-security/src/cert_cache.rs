@@ -156,6 +156,17 @@ impl CertCache {
         self.by_digest.insert(digest_arr, Arc::clone(&cert.name));
         self.local.insert(Arc::clone(&cert.name), cert);
     }
+
+    /// Evict the certificate named `key_name` (e.g. once it is revoked), so
+    /// a chain walk no longer resolves it from the cache. Returns it if held.
+    pub fn remove(&self, key_name: &Name) -> Option<Certificate> {
+        let (_, cert) = self.local.remove(key_name)?;
+        use sha2::{Digest, Sha256};
+        let digest: [u8; 32] = Sha256::digest(&cert.public_key).into();
+        self.by_digest
+            .remove_if(&digest, |_, name| name.as_ref() == key_name);
+        Some(cert)
+    }
 }
 
 impl Default for CertCache {
@@ -293,6 +304,31 @@ mod tests {
             .get_by_key_digest(expected.as_slice())
             .expect("digest lookup should hit");
         assert_eq!(cert.public_key.as_ref(), &pk[..]);
+    }
+
+    #[test]
+    fn remove_evicts_both_indices() {
+        let pk = vec![9u8; 32];
+        let name = Arc::new(Name::from_components([NameComponent::generic(
+            Bytes::from_static(b"k9"),
+        )]));
+        let cache = CertCache::new();
+        cache.insert(Certificate {
+            name: Arc::clone(&name),
+            public_key: Bytes::copy_from_slice(&pk),
+            valid_from: 0,
+            valid_until: u64::MAX,
+            issuer: None,
+            signed_region: None,
+            sig_value: None,
+            sig_type: ndn_packet::SignatureType::SignatureEd25519,
+        });
+
+        assert!(cache.remove(&name).is_some());
+        assert!(cache.get(&name).is_none());
+        use sha2::{Digest, Sha256};
+        assert!(cache.get_by_key_digest(Sha256::digest(&pk).as_slice()).is_none());
+        assert!(cache.remove(&name).is_none(), "second remove finds nothing");
     }
 
     #[test]

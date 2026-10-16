@@ -17,11 +17,14 @@
 //! AES-256-CBC — matching `ndnsec export` and OpenSSL's
 //! `i2d_PKCS8PrivateKey_bio` defaults.
 //!
-//! Algorithm support (the ndn-cxx interop conversions, used by
-//! [`crate::file_tpm::FileTpm`]): RSA converts PKCS#1 to PKCS#8 then
-//! encrypts; ECDSA-P256 converts SEC1 to PKCS#8; Ed25519 is already PKCS#8
-//! on disk. RSA and ECDSA roundtrip with `ndnsec export`/`import`; Ed25519
-//! is ndn-rs-only (ndn-cxx `tpm-file` has no Ed25519 path).
+//! The private key travels as PKCS#8 for every algorithm, so RSA and
+//! ECDSA-P256 bags roundtrip with `ndnsec export`/`import`; Ed25519 is
+//! ndn-rs-only (ndn-cxx has no Ed25519 key path).
+//!
+//! With the `ndnsec-compat` feature, this module also carries the ndn-cxx
+//! `tpm-file` on-disk key-format conversions used by
+//! `crate::file_tpm::FileTpm`: RSA PKCS#1 ↔ PKCS#8 and ECDSA-P256
+//! SEC1 ↔ PKCS#8 (Ed25519 is already PKCS#8 on disk).
 
 #![deny(rust_2018_idioms)]
 
@@ -30,13 +33,11 @@ use ndn_packet::tlv_type;
 use ndn_tlv::{TlvReader, TlvWriter};
 use thiserror::Error;
 
-use crate::file_tpm::{FileTpmError, TpmKeyKind};
-
 const TLV_SAFE_BAG: u64 = 0x80; // 128
 const TLV_ENCRYPTED_KEY: u64 = 0x81; // 129
 
-/// Errors specific to SafeBag encode/decode, PKCS#8 encryption, and the
-/// ndn-cxx key-format conversions.
+/// Errors specific to SafeBag encode/decode, PKCS#8 encryption, and (with
+/// `ndnsec-compat`) the ndn-cxx `tpm-file` key-format conversions.
 #[derive(Debug, Error)]
 pub enum SafeBagError {
     #[error("malformed SafeBag TLV: {0}")]
@@ -45,10 +46,13 @@ pub enum SafeBagError {
     Pkcs8(String),
     #[error("Ed25519 PKCS#8 conversion: {0}")]
     Ed25519(String),
+    #[cfg(feature = "ndnsec-compat")]
     #[error("key conversion error: {0}")]
     KeyConversion(String),
+    #[cfg(feature = "ndnsec-compat")]
     #[error("file tpm error: {0}")]
-    Tpm(#[from] FileTpmError),
+    Tpm(#[from] crate::file_tpm::FileTpmError),
+    #[cfg(feature = "ndnsec-compat")]
     #[error("unsupported algorithm in SafeBag: {0}")]
     UnsupportedAlgorithm(String),
 }
@@ -159,12 +163,6 @@ impl SafeBag {
         Ok(decrypted.as_bytes().to_vec())
     }
 
-    /// Alias of [`Self::decrypt_pkcs8`] under the retired interop wrapper's
-    /// method name (kept for `safe_bag` path compatibility).
-    pub fn decrypt_key(&self, password: &[u8]) -> Result<Vec<u8>, SafeBagError> {
-        self.decrypt_pkcs8(password)
-    }
-
     pub fn decrypt_ed25519_seed(&self, password: &[u8]) -> Result<[u8; 32], SafeBagError> {
         let pkcs8 = self.decrypt_pkcs8(password)?;
         pkcs8_to_ed25519_seed(&pkcs8)
@@ -217,11 +215,12 @@ pub fn pkcs8_to_ed25519_seed(pkcs8_der: &[u8]) -> Result<[u8; 32], SafeBagError>
 }
 
 // ---------------------------------------------------------------------------
-// ndn-cxx `tpm-file` on-disk key-format conversions (from the retired
-// `safe_bag` interop wrapper); consumed by `crate::file_tpm`.
+// ndn-cxx `tpm-file` on-disk key-format conversions; consumed by
+// `crate::file_tpm`.
 // ---------------------------------------------------------------------------
 
 /// PKCS#1 `RSAPrivateKey` -> PKCS#8 `PrivateKeyInfo` (DER).
+#[cfg(feature = "ndnsec-compat")]
 pub(crate) fn rsa_pkcs1_to_pkcs8(pkcs1_der: &[u8]) -> Result<Vec<u8>, SafeBagError> {
     use pkcs1::DecodeRsaPrivateKey;
     use rsa::RsaPrivateKey;
@@ -235,6 +234,7 @@ pub(crate) fn rsa_pkcs1_to_pkcs8(pkcs1_der: &[u8]) -> Result<Vec<u8>, SafeBagErr
 }
 
 /// PKCS#8 `PrivateKeyInfo` (RSA) -> PKCS#1 `RSAPrivateKey` (DER).
+#[cfg(feature = "ndnsec-compat")]
 pub(crate) fn rsa_pkcs8_to_pkcs1(pkcs8_der: &[u8]) -> Result<Vec<u8>, SafeBagError> {
     use pkcs1::EncodeRsaPrivateKey;
     use rsa::RsaPrivateKey;
@@ -250,6 +250,7 @@ pub(crate) fn rsa_pkcs8_to_pkcs1(pkcs8_der: &[u8]) -> Result<Vec<u8>, SafeBagErr
 /// SEC1 `ECPrivateKey` (P-256) -> PKCS#8 `PrivateKeyInfo` (DER).
 /// Hand-extracts the 32-byte scalar to dodge `from_sec1_der`'s
 /// AlgorithmIdentifier-parameters check.
+#[cfg(feature = "ndnsec-compat")]
 pub(crate) fn ec_sec1_to_pkcs8(sec1_der: &[u8]) -> Result<Vec<u8>, SafeBagError> {
     use p256_ecdsa::SecretKey;
     use p256_ecdsa::pkcs8::EncodePrivateKey;
@@ -264,6 +265,7 @@ pub(crate) fn ec_sec1_to_pkcs8(sec1_der: &[u8]) -> Result<Vec<u8>, SafeBagError>
 }
 
 /// PKCS#8 `PrivateKeyInfo` (P-256 ECDSA) -> SEC1 `ECPrivateKey` (DER).
+#[cfg(feature = "ndnsec-compat")]
 pub(crate) fn ec_pkcs8_to_sec1(pkcs8_der: &[u8]) -> Result<Vec<u8>, SafeBagError> {
     use p256_ecdsa::SecretKey;
     use p256_ecdsa::pkcs8::DecodePrivateKey;
@@ -276,7 +278,11 @@ pub(crate) fn ec_pkcs8_to_sec1(pkcs8_der: &[u8]) -> Result<Vec<u8>, SafeBagError
     Ok(sec1_doc.as_slice().to_vec())
 }
 
-pub(crate) fn detect_pkcs8_algorithm(pkcs8_der: &[u8]) -> Result<TpmKeyKind, SafeBagError> {
+#[cfg(feature = "ndnsec-compat")]
+pub(crate) fn detect_pkcs8_algorithm(
+    pkcs8_der: &[u8],
+) -> Result<crate::file_tpm::TpmKeyKind, SafeBagError> {
+    use crate::file_tpm::TpmKeyKind;
     use pkcs8::PrivateKeyInfo;
     let pki = PrivateKeyInfo::try_from(pkcs8_der)
         .map_err(|e| SafeBagError::Pkcs8(format!("PrivateKeyInfo parse: {e}")))?;
@@ -372,9 +378,7 @@ mod tests {
     }
 }
 
-/// Tests carried over verbatim from the retired `safe_bag` interop wrapper,
-/// now exercising the unified codec (proof the merge changed no wire or
-/// conversion behavior).
+/// Codec tests against fixed TLV shapes and the PKCS#8 encryption path.
 #[cfg(test)]
 mod interop_tests {
     use super::*;
@@ -428,15 +432,22 @@ mod interop_tests {
             sb.encrypted_key.windows(32).all(|w| w != seed),
             "encrypted key leaked the seed"
         );
-        let decrypted = sb.decrypt_key(pw).unwrap();
+        let decrypted = sb.decrypt_pkcs8(pw).unwrap();
         assert_eq!(&decrypted[..], pkcs8.as_bytes());
 
-        assert!(sb.decrypt_key(b"wrong password").is_err());
+        assert!(sb.decrypt_pkcs8(b"wrong password").is_err());
 
         let wire = sb.encode();
         let sb2 = SafeBag::decode(&wire).unwrap();
-        assert_eq!(sb2.decrypt_key(pw).unwrap(), decrypted);
+        assert_eq!(sb2.decrypt_pkcs8(pw).unwrap(), decrypted);
     }
+}
+
+/// ndn-cxx `tpm-file` key-format conversion tests.
+#[cfg(all(test, feature = "ndnsec-compat"))]
+mod tpm_file_conversion_tests {
+    use super::*;
+    use crate::file_tpm::TpmKeyKind;
 
     #[test]
     fn rsa_pkcs1_pkcs8_roundtrip() {

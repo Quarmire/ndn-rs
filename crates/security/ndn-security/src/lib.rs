@@ -6,7 +6,7 @@
 //! compiler enforces that unverified packets are never forwarded.
 //!
 //! Key types: [`Signer`] / [`Verifier`] (traits), [`Validator`],
-//! [`TrustSchema`], [`SafeData`], [`CertCache`], [`KeyStore`], and
+//! [`TrustSchema`], [`SafeData`], [`CertCache`], [`FilePib`], and
 //! [`SecurityManager`] as the high-level facade.
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
@@ -24,10 +24,11 @@ pub mod confidentiality;
 pub mod custodian;
 pub mod did;
 pub mod error;
+#[cfg(feature = "ndnsec-compat")]
+#[cfg_attr(docsrs, doc(cfg(feature = "ndnsec-compat")))]
 pub mod file_tpm;
 mod hmac_sha256;
 pub mod iso8601;
-pub mod key_store;
 pub mod keychain;
 pub mod keyring;
 pub mod lvs;
@@ -36,27 +37,18 @@ pub mod manager;
 pub mod pib;
 pub mod profile;
 pub mod replay_guard;
-/// Deprecated alias of [`safebag`] — the duplicate SafeBag codecs were
-/// merged (P2). New code should import from [`safebag`]; this alias only
-/// keeps existing `ndn_security::safe_bag::*` paths compiling.
-#[deprecated(note = "use ndn_security::safebag")]
-pub mod safe_bag {
-    pub use crate::safebag::*;
-}
 pub mod safe_data;
 pub mod safebag;
 pub mod sign_ext;
 pub mod signer;
 pub mod signing_info;
 pub mod spki;
-#[cfg(feature = "sqlite-pib")]
-#[cfg_attr(docsrs, doc(cfg(feature = "sqlite-pib")))]
+#[cfg(feature = "ndnsec-compat")]
+#[cfg_attr(docsrs, doc(cfg(feature = "ndnsec-compat")))]
 pub mod sqlite_pib;
-pub mod trust;
 pub mod trust_context;
 pub mod trust_schema;
 pub mod unverified;
-pub mod validation_policy;
 pub mod validator;
 pub mod verifier;
 #[cfg(feature = "yubikey-piv")]
@@ -68,8 +60,7 @@ pub use cert_cache::{CertCache, Certificate};
 pub use cert_fetcher::{CertFetcher, FetchFn};
 pub use confidentiality::{ContentKey, EpochPolicy, RotatingKey, Sealed, unwrap_ck, wrap_ck};
 pub use error::TrustError;
-pub use key_store::{KeyAlgorithm, KeyStore, MemKeyStore};
-pub use keychain::KeyChain;
+pub use keychain::{KeyAlgorithm, KeyChain};
 pub use keyring::Keyring;
 pub use lvs::{LvsError, LvsModel, LvsUserFn, UserFnRegistry};
 pub use lvs_compile::{
@@ -86,7 +77,6 @@ pub use signer::{
     SIGNATURE_TYPE_DIGEST_BLAKE3_KEYED, SIGNATURE_TYPE_DIGEST_BLAKE3_PLAIN, Signer,
 };
 pub use signing_info::{SignatureInfoOverrides, SignerSelection, SigningInfo};
-pub use trust::{InsecureTrust, LvsTrust, StaticTrust, TrustPolicy};
 pub use trust_context::{
     EnrollmentHint, SchemaBlob, SchemaFormat, SignedTrustContext, SignedTrustContextError,
     SigningPair, dryrun_orphans,
@@ -95,17 +85,13 @@ pub use trust_schema::{
     NamePattern, PatternComponent, PatternParseError, SchemaGate, SchemaRule, TrustSchema,
 };
 pub use unverified::{Unverified, VerifyError};
-pub use validation_policy::{
-    AcceptAllPolicy, ChainedPolicy, ConfigChecker, ConfigPolicy, ConfigRule, HierarchicalPolicy,
-    LvsPolicy, PolicyVerdict, ValidationPolicy,
-};
 pub use validator::{InterestValidationOutcome, ValidationResult, Validator};
 pub use verifier::{
     Blake3DigestVerifier, Blake3KeyedVerifier, Ed25519Verifier, Verifier, VerifyOutcome,
     ed25519_verify_batch,
 };
 #[cfg(feature = "yubikey-piv")]
-pub use yubikey::{YubikeyKeyStore, YubikeySlot};
+pub use yubikey::{YubikeyPiv, YubikeySlot};
 
 pub use did::{
     DereferencedResource, DidController, DidDocument, DidDocumentMetadata, DidError,

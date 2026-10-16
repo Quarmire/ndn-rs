@@ -12,7 +12,6 @@ use std::time::Duration;
 
 use ndn_packet::Name;
 use ndn_security::Certificate;
-pub use ndn_security::TrustPolicy as _TrustPolicy;
 
 use crate::attestation::AttestationSet;
 use crate::protocol::CertRequest;

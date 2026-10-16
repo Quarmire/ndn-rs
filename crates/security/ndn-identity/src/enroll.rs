@@ -1,12 +1,15 @@
-//! NDNCERT client-side enrollment driver wired to `ndn-app::Consumer`.
+//! [`NdncertClient`]: the `ndn-app::Consumer`-backed NDNCERT client — a
+//! [`CaExchange`] over a consumer connection driving the shared
+//! [`ndn_cert::client::enroll`] NEW → CHALLENGE driver.
 
 use std::sync::Arc;
 
-use ndn_cert::EnrollmentSession;
-use ndn_packet::{Name, encode::InterestBuilder};
-use ndn_security::{SecurityManager, Signer};
+use bytes::Bytes;
+use ndn_cert::{CaExchange, CertError};
+use ndn_packet::{Data, Name};
+use ndn_security::Signer;
 
-use crate::{error::IdentityError, facade::Identity};
+use crate::error::IdentityError;
 
 #[derive(Debug, Clone)]
 pub enum ChallengeParams {
@@ -65,39 +68,19 @@ impl ChallengeParams {
     }
 }
 
-pub struct EnrollConfig {
-    /// Should end with `/KEY/v=<n>`.
-    pub name: Name,
-    pub ca_prefix: Name,
-    pub validity_secs: u64,
-    pub challenge: ChallengeParams,
-    /// PIB path; ephemeral when `None`.
-    pub storage: Option<std::path::PathBuf>,
-}
-
-/// Always errors with `Enrollment(...)` — use [`NdncertClient`] for the
-/// connected exchange.
-pub async fn run_enrollment(config: EnrollConfig) -> Result<Identity, IdentityError> {
-    let manager = SecurityManager::new();
-
-    let key_name = manager.generate_ed25519(config.name.clone())?;
-    let signer = manager.get_signer_sync(&key_name)?;
-
-    let mut session = EnrollmentSession::new(config.name.clone(), signer, config.validity_secs);
-
-    let new_body = session.new_request_body().await?;
-    let _ = new_body;
-
-    Err(IdentityError::Enrollment(
-        "direct enrollment requires a connected CA; use NdncertClient for network enrollment"
-            .to_string(),
-    ))
-}
-
-/// Connected NDNCERT client driving an `ndn-app::Consumer`.
+/// Connected NDNCERT client over an `ndn-app::Consumer`.
 pub struct NdncertClient {
     consumer: ndn_app::Consumer,
     ca_prefix: Name,
+}
+
+impl CaExchange for NdncertClient {
+    async fn express(&mut self, interest: Bytes) -> Result<Data, CertError> {
+        self.consumer
+            .fetch_wire(interest, ndn_app::DEFAULT_TIMEOUT)
+            .await
+            .map_err(|e| CertError::Transport(e.to_string()))
+    }
 }
 
 impl NdncertClient {
@@ -119,85 +102,28 @@ impl NdncertClient {
         Ok(profile)
     }
 
-    /// Drives INFO → NEW → CHALLENGE → cert-fetch and returns the issued cert.
+    /// Enroll `signer`'s key with a single CHALLENGE round carrying
+    /// `challenge`, then fetch and decode the issued cert.
     pub async fn enroll(
         &mut self,
-        name: Name,
         signer: Arc<dyn Signer>,
         validity_secs: u64,
         challenge: ChallengeParams,
     ) -> Result<ndn_security::Certificate, IdentityError> {
-        let mut session = EnrollmentSession::new(name.clone(), Arc::clone(&signer), validity_secs);
+        let ca_prefix = self.ca_prefix.clone();
+        let challenge_type = challenge.challenge_type().to_owned();
+        let mut params = Some(challenge.to_map());
+        let cert_name = ndn_cert::client::enroll(
+            self,
+            &ca_prefix,
+            signer,
+            validity_secs,
+            &challenge_type,
+            |_| std::future::ready(Ok(params.take())),
+        )
+        .await?;
 
-        let new_body = session.new_request_body().await?;
-        let new_name = self
-            .ca_prefix
-            .clone()
-            .append("CA")
-            .append("NEW")
-            .append_version(now_ms());
-
-        let new_data = self
-            .consumer
-            .fetch_with(InterestBuilder::new(new_name).app_parameters(new_body))
-            .await?;
-        let new_content = new_data
-            .content()
-            .ok_or_else(|| IdentityError::Enrollment("NEW response has no content".to_string()))?;
-        session.handle_new_response(new_content)?;
-
-        let request_id_raw = session
-            .request_id_bytes()
-            .ok_or_else(|| IdentityError::Enrollment("no request_id from CA".to_string()))?
-            .to_vec();
-
-        let challenge_type = challenge.challenge_type().to_string();
-        let params = challenge.to_map();
-        let challenge_body = session.challenge_request_body(&challenge_type, params)?;
-        let challenge_name = self
-            .ca_prefix
-            .clone()
-            .append("CA")
-            .append("CHALLENGE")
-            .append(&request_id_raw);
-
-        let challenge_data = self
-            .consumer
-            .fetch_with(InterestBuilder::new(challenge_name).app_parameters(challenge_body))
-            .await?;
-        let challenge_content = challenge_data.content().ok_or_else(|| {
-            IdentityError::Enrollment("CHALLENGE response has no content".to_string())
-        })?;
-        session.handle_challenge_response(challenge_content)?;
-
-        if !session.is_complete() {
-            return Err(IdentityError::Enrollment(
-                "enrollment did not complete in one round".to_string(),
-            ));
-        }
-
-        let cert_name = session
-            .issued_cert_name()
-            .ok_or_else(|| {
-                IdentityError::Enrollment("no issued cert name after completion".to_string())
-            })?
-            .clone();
-
-        let cert_data = self.consumer.fetch(cert_name).await?;
-        let cert_bytes = cert_data.content().ok_or_else(|| {
-            IdentityError::Enrollment("cert fetch response has no content".to_string())
-        })?;
-
-        ndn_cert::ca::deserialize_cert(cert_bytes).ok_or_else(|| {
-            IdentityError::Enrollment("could not decode issued certificate".to_string())
-        })
+        let cert_data = ndn_cert::client::fetch_issued_cert(self, &cert_name).await?;
+        Ok(ndn_security::Certificate::decode(&cert_data)?)
     }
-}
-
-fn now_ms() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }

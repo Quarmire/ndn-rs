@@ -66,9 +66,7 @@ pub use ndn_packet::encode::{DataBuilder, InterestBuilder};
 pub use ndn_packet::{Data, Interest, NackReason, Name, NameComponent};
 
 pub use ndn_security::{
-    AcceptAllPolicy, HierarchicalPolicy, InsecureTrust, LvsTrust, SafeData, SignWith, Signer,
-    SignerSelection, SigningInfo, StaticTrust, TrustPolicy, Unverified, ValidationPolicy,
-    Validator,
+    SafeData, SignWith, Signer, SignerSelection, SigningInfo, TrustSchema, Unverified, Validator,
 };
 
 #[cfg(not(target_arch = "wasm32"))]

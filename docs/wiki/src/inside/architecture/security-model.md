@@ -176,6 +176,27 @@ enforcement, and the pipeline mirrors it with the flag. Both express the same
 invariant: data that cannot be authenticated does not flow where authenticated
 data is required.
 
+### Missing certificates
+
+The validation stage walks the chain using **cached certs only**
+(`Validator::validate_chain_cached`) — awaiting a network fetch inline would
+stall the pipeline that must deliver the cert's own Data. When a cert in the
+chain is missing, the Data is parked in a bounded pending queue (default 256
+entries / 4 MiB / 4 s) and the missing cert is fetched in the background
+through the validator's `CertFetcher`. The drain task re-validates once that
+cert is cached; if the next hop up the chain is missing too, it fetches that
+one and re-queues under the Data's **original** deadline, so the whole chain
+(bounded by the validator's max chain depth) must resolve within it.
+
+The engine cannot construct that fetcher itself (app faces live above
+`ndn-engine`), so an embedder attaches it after `EngineBuilder::build` with
+`ndn_app::install_engine_cert_fetcher(&engine, cancel)`; `ndn-fwd` and
+`ndn-mobile` do this. It expresses cert Interests through the engine on one
+in-process app face. Without it, a Data signed by an uncached cert is dropped
+at its deadline. The `CertFetcher` dedups concurrent requests per name and
+remembers a failure for its timeout, so a stream of Data signed by an
+unreachable key costs one cert Interest per backoff window, not one per packet.
+
 ## See also
 
 - [ADR 0002 · Type-enforced verification](../adr/0002-type-enforced-verification.md)

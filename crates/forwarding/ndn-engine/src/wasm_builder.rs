@@ -1,8 +1,7 @@
 //! Wasm-side `EngineBuilder` analog.
 //!
-//! The native [`EngineBuilder`](crate::builder::EngineBuilder) imports
-//! `ndn-security` (`ring`, `libsqlite3-sys`), which does not build for
-//! `wasm32-unknown-unknown`. This builder constructs the same task topology
+//! The native [`EngineBuilder`](crate::builder::EngineBuilder) is not built
+//! for `wasm32-unknown-unknown`. This builder constructs the same task topology
 //! and pipeline, with `ValidationStage` defaulting to permissive (callers
 //! that need real verification supply one via [`Self::with_validator`]).
 //!
@@ -337,7 +336,6 @@ impl WasmEngineBuilder {
             },
             validation: ValidationStage::new(
                 validator.clone(),
-                None,
                 Default::default(),
                 Arc::clone(&runtime),
             ),

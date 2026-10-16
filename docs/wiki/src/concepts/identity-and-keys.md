@@ -56,7 +56,7 @@ trust anchor; a CA-issued cert chains to the CA instead.
 |---|---|
 | Sign with this identity | `keychain.signer()?` / `keychain.sign_data(builder)` |
 | Trust another identity's cert | `keychain.add_trust_anchor(cert)` |
-| Get a CA-issued cert | NDNCERT enrollment — `Identity::enroll(config)` |
+| Get a CA-issued cert | NDNCERT enrollment — `NdncertClient::new(consumer, ca_prefix).enroll(signer, validity_secs, challenge)` (fleet: `Identity::provision(config)`) |
 | Issue a cert for another key | `SecurityManager::certify(subject, pubkey, issuer, validity)` |
 | Operator workflow | [NDNCERT setup](../guides/ndncert-setup.md) |
 
@@ -79,25 +79,28 @@ let wire = keychain.sign_packet(DataBuilder::new("/alice/note", b"hi"), &info)?;
 ```
 
 Under the hood a `SigningInfo` resolves to a `SignerSelection`
-(`KeyChain::resolve_selection`) before the bytes are signed.
+(`KeyChain::resolve_selection`) before the bytes are signed. `identity(..)`
+resolves any identity whose key the keychain's `SecurityManager` holds, and
+`suggested(..)` picks the held identity with the longest name covering the
+packet name. When nothing matches, both return an error instead of signing
+with a different identity's key.
 
 ## Trust policies
 
-When you fetch a `Data`, the Consumer's `ValidationPolicy` decides
-whether to accept it. Both the policy and its building blocks are
+When you fetch a `Data` through a `VerifiedConsumer`, its `Validator`
+decides whether to accept it by enforcing a `TrustSchema`. Both are
 re-exported from the Develop umbrella:
 
 ```rust,ignore
-use ndn::{InsecureTrust, StaticTrust, LvsTrust, HierarchicalPolicy, ValidationPolicy};
+use ndn::{TrustSchema, Validator};
 ```
 
-| Policy | What it accepts |
+| Schema | What it accepts |
 |---|---|
-| `InsecureTrust` | Any signature. Tests only. |
-| `StaticTrust` | Signatures from an explicit allowlist of keys. |
-| `LvsTrust` | Light Versatile Schema rules (LVS) — pattern-based. |
-| `HierarchicalPolicy` | Parent-name key signs child-name data. |
-| `AcceptAllPolicy` | Skips validation entirely (degraded mode). |
+| `TrustSchema::hierarchical()` | Data and signing key share their first name component. |
+| `TrustSchema::from_lvs_binary(..)` | Light Versatile Schema rules (LVS) — pattern-based. |
+| `TrustSchema::new()` + `add_rule` | Your own `"<data> => <key>"` rules. |
+| `TrustSchema::accept_all()` | Any name pair; only the anchor set limits signers. |
 
 For a tabular catalog with rule examples: [Trust policies](../reference/trust-policies.md).
 
@@ -111,9 +114,28 @@ chosen by the constructor:
 | `KeyChain::ephemeral(name)` | In-memory; nothing persisted. |
 | `KeyChain::open_or_create(path, name)` | File-backed PIB at `path`. |
 
-The lower-level PIB type is `ndn_security::pib::FilePib` (file-backed;
-native builds also carry a SQLite-backed `SqlitePib`). Use `FilePib`
-directly for the SafeBag import/export below.
+The lower-level PIB type is `ndn_security::pib::FilePib` (file-backed),
+the default native PIB. A PIB can hold several identities. `open_or_create`,
+`SecurityManager::auto_init` and `SecurityManager::from_pib` load only the
+requested identity's key, i.e. any key whose name starts with
+`/<identity>/KEY/`. That covers every naming form in use:
+`/KEY/<key-id>/self/v=0` (`ndn-sec keygen`), `/KEY/self` (`auto_init`),
+`/KEY/root` (hub root) and `/KEY/<key-id>`. When an identity has several
+keys, `FilePib::default_key` picks the one whose valid certificate was
+issued most recently, falling back to name order. Use `FilePib` directly
+for the SafeBag import/export below; SafeBag is also the portable way to
+move keys to and from an ndn-cxx keychain.
+
+To read and write ndn-cxx's own key store in place, enable the opt-in
+`ndnsec-compat` feature on `ndn-security` (passed through by `ndn-app` and
+`ndn-rs-prelude`). It adds `ndn_security::sqlite_pib::SqlitePib`, which
+opens `~/.ndn/pib.db` with ndn-cxx's `pib-sqlite3` schema, and
+`ndn_security::file_tpm::FileTpm`, which reads and writes the
+`~/.ndn/ndnsec-key-file/` private keys in ndn-cxx's `tpm-file` format
+(RSA and ECDSA-P256; Ed25519 uses an ndn-rs-only file suffix that ndn-cxx
+ignores). `FileTpm` can also export and import SafeBags directly. The
+feature pulls in bundled SQLite, so it is off by default and does not
+build for wasm.
 
 ## SafeBag — exporting identities
 
@@ -178,7 +200,6 @@ new key if yours is lost), and **device delegation** — e.g.
 `Identity::create(KeyChain::ephemeral("/alice")?, recovery)?`. Creating
 a recoverable principal designates the recovery authority up front: by
 design you cannot silently make an unrecoverable identity.
-(`NdnIdentity` is a deprecated alias for `Identity`.)
 
 ## See also
 
@@ -188,5 +209,5 @@ design you cannot silently make an unrecoverable identity.
   catalog with rule shapes.
 - [Develop tier → KeyChain](../api/develop.md#keychain) — full API
   surface.
-- `crates/security/ndn-security/` — implementation; the trait surfaces
-  are in `trust.rs`, `validation_policy.rs`, `keychain.rs`.
+- `crates/security/ndn-security/` — implementation; the trust surfaces
+  are in `trust_schema.rs`, `validator/`, `keychain.rs`.

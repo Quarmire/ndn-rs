@@ -142,17 +142,17 @@ with `CanBePrefix = true`, where `<identity-name>` is the NDN name recovered fro
 
 The DID is `name_to_did(N)`.
 
-In practice, `NdnIdentity::open_or_create` or `NdnIdentity::provision` perform all of these steps automatically:
+In practice, `Identity::open_or_create` or `Identity::provision` perform all of these steps automatically:
 
 ```rust
 use std::path::PathBuf;
-use ndn_identity::NdnIdentity;
+use ndn_identity::Identity;
 
-// Create: generates key, self-signs cert, publishes via the router
-let identity = NdnIdentity::open_or_create(
+// Create: generates key, self-signs cert, persists it in the PIB at `path`
+let identity = Identity::open_or_create(
     &PathBuf::from("/var/lib/ndn/alice-id"),
     "/com/acme/alice",
-).await?;
+)?;
 
 println!("Created DID: {}", identity.did());
 // → did:ndn:com:acme:alice

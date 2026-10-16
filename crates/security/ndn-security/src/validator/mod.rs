@@ -193,10 +193,17 @@ impl Validator {
         self.cert_fetcher.get().is_some()
     }
 
+    /// The attached certificate fetcher, if any. The forwarder's validation
+    /// stage reads it to fetch a missing cert off the pipeline hot path.
+    pub fn cert_fetcher(&self) -> Option<&Arc<CertFetcher>> {
+        self.cert_fetcher.get()
+    }
+
     /// Attach a certificate fetcher after construction (set-once). Returns
-    /// `Err` if a fetcher was already set. Lets the forwarder build the localhop
-    /// validator before its engine exists, then wire an engine-backed fetcher
-    /// once the engine is up.
+    /// `Err` if a fetcher was already set. Engines and the forwarder's localhop
+    /// validator are built before the engine that backs the fetch exists; the
+    /// engine-backed fetcher is attached once it is up (see
+    /// `ndn_app::install_engine_cert_fetcher`).
     pub fn set_cert_fetcher(&self, fetcher: Arc<CertFetcher>) -> Result<(), Arc<CertFetcher>> {
         self.cert_fetcher.set(fetcher)
     }

@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use dashmap::DashMap;
+
 use bytes::Bytes;
 use ndn_packet::{Name, tlv_type};
 use ndn_tlv::TlvWriter;
@@ -7,14 +9,14 @@ use ndn_tlv::TlvWriter;
 use crate::{
     TrustError, TrustSchema,
     cert_cache::{CertCache, Certificate},
-    key_store::MemKeyStore,
     keyring::Keyring,
     signer::{Ed25519Signer, Signer},
     trust_context::SignedTrustContext,
 };
 
-/// Owns a key store, certificate cache, and a [`Keyring`] of trust contexts,
-/// providing key generation, certificate issuance, and trust anchor management.
+/// Owns the in-memory signer map, certificate cache, and a [`Keyring`] of
+/// trust contexts, providing key generation, certificate issuance, and trust
+/// anchor management.
 ///
 /// The flat trust-anchor API ([`add_trust_anchor`](Self::add_trust_anchor),
 /// [`trust_anchor`](Self::trust_anchor), [`trust_anchor_names`](Self::trust_anchor_names),
@@ -23,7 +25,13 @@ use crate::{
 /// engine shares this same `Arc<Keyring>` with its [`Validator`](crate::Validator),
 /// so anchors inserted here are visible to validation without copying.
 pub struct SecurityManager {
-    keys: MemKeyStore,
+    /// Signers by key name. Software keys and externally-held signers
+    /// (custodian, YubiKey PIV, remote) all land here.
+    keys: DashMap<Arc<Name>, Arc<dyn Signer>>,
+    /// Identity → its default key name: the first key registered under
+    /// `<identity>/KEY/`. Lets `SignerSelection::Identity` resolve the
+    /// right key when one manager holds several identities.
+    by_identity: DashMap<Name, Arc<Name>>,
     cert_cache: Arc<CertCache>,
     keyring: Arc<Keyring>,
 }
@@ -39,10 +47,23 @@ impl SecurityManager {
             Arc::new(dashmap::DashMap::new()),
         ));
         Self {
-            keys: MemKeyStore::new(),
+            keys: DashMap::new(),
+            by_identity: DashMap::new(),
             cert_cache: Arc::new(CertCache::new()),
             keyring: Arc::new(Keyring::with_ambient(ambient)),
         }
+    }
+
+    /// Register `signer` under `key_name` and index it by its identity
+    /// (the prefix before `KEY`); the identity's first key stays its default.
+    fn insert_key(&self, key_name: Name, signer: Arc<dyn Signer>) {
+        let key = Arc::new(key_name);
+        if let Some(identity) = identity_of_key(&key) {
+            self.by_identity
+                .entry(identity)
+                .or_insert_with(|| Arc::clone(&key));
+        }
+        self.keys.insert(key, signer);
     }
 
     /// The keyring this manager owns. An engine wires this same handle into
@@ -67,7 +88,7 @@ impl SecurityManager {
         getrandom::getrandom(&mut seed)
             .map_err(|_| TrustError::KeyStore("system RNG unavailable".into()))?;
         let signer = Ed25519Signer::from_seed(&seed, key_name.clone());
-        self.keys.add(Arc::new(key_name.clone()), signer);
+        self.insert_key(key_name.clone(), Arc::new(signer));
         Ok(key_name)
     }
 
@@ -77,18 +98,19 @@ impl SecurityManager {
         seed: &[u8; 32],
     ) -> Result<Name, TrustError> {
         let signer = Ed25519Signer::from_seed(seed, key_name.clone());
-        self.keys.add(Arc::new(key_name.clone()), signer);
+        self.insert_key(key_name.clone(), Arc::new(signer));
         Ok(key_name)
     }
 
     /// Register an **externally-held** signer under `key_name` — e.g. a
-    /// `CustodianSigner` backed by the device enclave or a remote fob. The
-    /// private key never enters the key store; `get_signer_sync(key_name)`
+    /// `CustodianSigner` backed by the device enclave or a remote fob, or a
+    /// YubiKey PIV slot signer from [`crate::yubikey::YubikeyPiv`]. The
+    /// private key never enters this manager; `get_signer_sync(key_name)`
     /// returns this signer, so a [`KeyChain`](crate::KeyChain) (and an
     /// `ndn_identity::Identity`) built over this manager signs *through* the
     /// custodian. The seam for hardware/remote custody.
     pub fn register_signer(&self, key_name: Name, signer: Arc<dyn Signer>) {
-        self.keys.add_arc(Arc::new(key_name), signer);
+        self.insert_key(key_name, signer);
     }
 
     /// Generate a fresh ECDSA-P256 signing key. Use this instead of
@@ -97,7 +119,7 @@ impl SecurityManager {
     /// Ed25519.
     pub fn generate_ecdsa_p256(&self, key_name: Name) -> Result<Name, TrustError> {
         let signer = crate::EcdsaP256Signer::generate(key_name.clone())?;
-        self.keys.add(Arc::new(key_name.clone()), signer);
+        self.insert_key(key_name.clone(), Arc::new(signer));
         Ok(key_name)
     }
 
@@ -105,8 +127,8 @@ impl SecurityManager {
     /// NDNCERT-issued, …) under its own `key_name()`. Required so
     /// `KeyChain::sign_*` can read the active signer's `sig_type()`.
     pub fn install_signer<S: Signer>(&self, signer: S) {
-        let key_name = Arc::new(signer.key_name().clone());
-        self.keys.add(key_name, signer);
+        let key_name = signer.key_name().clone();
+        self.insert_key(key_name, Arc::new(signer));
     }
 
     /// Issue a self-signed certificate and register it as a trust anchor.
@@ -131,7 +153,7 @@ impl SecurityManager {
         // Self-sign with the matching keystore key. Falls back to an
         // unsigned cert struct when the signer is missing; not expected
         // in practice but preserves no-key callers.
-        let cert = match self.keys.get_signer_sync(key_name) {
+        let cert = match self.get_signer_sync(key_name) {
             Ok(signer) => {
                 let wire = futures::executor::block_on(encode_cert_data(
                     key_name,
@@ -195,7 +217,7 @@ impl SecurityManager {
         validity_ms: u64,
         additional_description: Option<&[u8]>,
     ) -> Result<Certificate, TrustError> {
-        let issuer_signer = self.keys.get_signer_sync(issuer_key_name)?;
+        let issuer_signer = self.get_signer_sync(issuer_key_name)?;
 
         let now_ns = now_ns();
         let valid_until = now_ns + validity_ms * 1_000_000;
@@ -261,33 +283,87 @@ impl SecurityManager {
     }
 
     pub async fn get_signer(&self, key_name: &Name) -> Result<Arc<dyn Signer>, TrustError> {
-        use crate::key_store::KeyStore;
-        self.keys.get_signer(key_name).await
+        self.get_signer_sync(key_name)
     }
 
     pub fn get_signer_sync(&self, key_name: &Name) -> Result<Arc<dyn Signer>, TrustError> {
-        self.keys.get_signer_sync(key_name)
+        self.keys
+            .get(key_name)
+            .map(|r| Arc::clone(r.value()))
+            .ok_or_else(|| TrustError::CertNotFound {
+                name: key_name.to_string(),
+            })
     }
 
     /// Any one registered signer — the daemon's identity in the common
     /// single-identity case. `None` only before `auto_init` / `from_pib`.
     pub fn any_signer(&self) -> Option<Arc<dyn Signer>> {
-        self.keys.any_signer()
+        self.keys.iter().next().map(|r| Arc::clone(r.value()))
+    }
+
+    /// Default key name of `identity`: the first key registered under
+    /// `<identity>/KEY/` (any naming form — `/KEY/<kid>`, `/KEY/self`,
+    /// `/KEY/root`, cert-named `/KEY/<kid>/self/v=0`). `None` when no key of
+    /// that identity is held.
+    pub fn identity_key_name(&self, identity: &Name) -> Option<Name> {
+        if let Some(key) = self.by_identity.get(identity) {
+            return Some(key.value().as_ref().clone());
+        }
+        // The index keys a key by the prefix before its *first* `KEY`; an
+        // identity that itself contains a `KEY` component is found by prefix.
+        self.keys
+            .iter()
+            .filter(|r| is_key_of(r.key(), identity))
+            .map(|r| r.key().as_ref().clone())
+            .min()
+    }
+
+    /// Signer for `identity`'s default key (see
+    /// [`identity_key_name`](Self::identity_key_name)). Errors rather than
+    /// substituting another identity's key.
+    pub fn identity_signer(&self, identity: &Name) -> Result<Arc<dyn Signer>, TrustError> {
+        let key_name = self.identity_key_name(identity).ok_or_else(|| {
+            TrustError::KeyStore(format!("no key registered for identity {identity}"))
+        })?;
+        self.get_signer_sync(&key_name)
+    }
+
+    /// The registered identity with the longest name that is a prefix of
+    /// `name`, paired with its default key name. `None` when no identity
+    /// held here covers `name`.
+    pub fn identity_key_for(&self, name: &Name) -> Option<(Name, Name)> {
+        self.by_identity
+            .iter()
+            .filter(|r| name.has_prefix(r.key()))
+            .max_by_key(|r| r.key().len())
+            .map(|r| (r.key().clone(), r.value().as_ref().clone()))
     }
 
     pub fn cert_cache(&self) -> &CertCache {
         &self.cert_cache
     }
 
-    /// Load an identity from a [`FilePib`](crate::pib::FilePib) along
-    /// with its signing key, certificate, and trust anchors.
+    /// Load `identity` from a [`FilePib`](crate::pib::FilePib): the signer
+    /// and certificate of its default key
+    /// ([`FilePib::default_key`](crate::pib::FilePib::default_key), one of
+    /// the keys stored under `<identity>/KEY/`), plus every PIB trust anchor.
     pub fn from_pib(pib: &crate::pib::FilePib, identity: &Name) -> Result<Self, TrustError> {
+        let key_name = pib.default_key(identity)?.ok_or_else(|| {
+            TrustError::KeyStore(format!(
+                "no key for identity {identity} in PIB {}",
+                pib.root().display()
+            ))
+        })?;
+        Self::from_pib_key(pib, &key_name)
+    }
+
+    fn from_pib_key(pib: &crate::pib::FilePib, key_name: &Name) -> Result<Self, TrustError> {
         let mgr = SecurityManager::new();
 
-        let signer = pib.get_signer(identity)?;
-        mgr.keys.add_arc(Arc::new(identity.clone()), signer);
+        let signer = pib.get_signer(key_name)?;
+        mgr.insert_key(key_name.clone(), signer);
 
-        if let Ok(cert) = pib.get_cert(identity) {
+        if let Ok(cert) = pib.get_cert(key_name) {
             mgr.cert_cache.insert(cert);
         }
 
@@ -298,25 +374,23 @@ impl SecurityManager {
         Ok(mgr)
     }
 
-    /// Auto-initialize from a PIB directory; generates a new identity if
-    /// none exists, otherwise loads the first one found. The returned
-    /// `bool` is `true` when a new identity was generated.
+    /// Auto-initialize `identity` from a PIB directory (created if absent).
+    /// Loads the identity's key when the PIB holds one under
+    /// `<identity>/KEY/` (keys of other identities are ignored); otherwise
+    /// generates `<identity>/KEY/self` with a self-signed anchor. The
+    /// returned `bool` is `true` when a new key was generated.
     pub fn auto_init(
         identity: &Name,
         pib_path: &std::path::Path,
     ) -> Result<(Self, bool), TrustError> {
         use crate::pib::FilePib;
 
-        let pib = if pib_path.exists() {
-            FilePib::open(pib_path)?
-        } else {
-            FilePib::new(pib_path)?
-        };
+        // `new` is idempotent: it creates only the missing sub-directories,
+        // so a PIB directory that holds e.g. only adopted contexts still opens.
+        let pib = FilePib::new(pib_path)?;
 
-        let existing_keys = pib.list_keys()?;
-        if !existing_keys.is_empty() {
-            let key_name = &existing_keys[0];
-            let mgr = SecurityManager::from_pib(&pib, key_name)?;
+        if let Some(key_name) = pib.default_key(identity)? {
+            let mgr = SecurityManager::from_pib_key(&pib, &key_name)?;
             return Ok((mgr, false));
         }
 
@@ -342,7 +416,7 @@ impl SecurityManager {
         pib.store_cert(&key_name, &cert)?;
         pib.add_trust_anchor(&key_name, &cert)?;
 
-        let mgr = SecurityManager::from_pib(&pib, &key_name)?;
+        let mgr = SecurityManager::from_pib_key(&pib, &key_name)?;
         Ok((mgr, true))
     }
 }
@@ -353,6 +427,24 @@ fn append_key_component(identity: &Name) -> Name {
     components.push(NameComponent::generic(Bytes::from_static(b"KEY")));
     components.push(NameComponent::generic(Bytes::from_static(b"self")));
     Name::from_components(components)
+}
+
+/// Whether `key_name` is a key of `identity`: it starts with
+/// `<identity>/KEY/` and names at least a key id after `KEY`. Accepts every
+/// naming form in use — `/KEY/<kid>`, `/KEY/self`, `/KEY/root`, and
+/// `ndn-sec keygen`'s cert-named `/KEY/<kid>/self/v=0`.
+pub(crate) fn is_key_of(key_name: &Name, identity: &Name) -> bool {
+    key_name.len() > identity.len() + 1
+        && key_name.has_prefix(identity)
+        && key_name.components()[identity.len()].value.as_ref() == b"KEY"
+}
+
+/// The identity owning `key_name` for the identity index: the prefix before
+/// its first `KEY` component, provided a key id follows it.
+fn identity_of_key(key_name: &Name) -> Option<Name> {
+    let comps = key_name.components();
+    let pos = comps.iter().position(|c| c.value.as_ref() == b"KEY")?;
+    (pos + 1 < comps.len()).then(|| Name::from_components(comps[..pos].iter().cloned()))
 }
 
 impl Default for SecurityManager {
@@ -587,6 +679,15 @@ mod tests {
         assert_eq!(signer.key_name(), &kn);
     }
 
+    #[test]
+    fn get_signer_missing_key_returns_cert_not_found() {
+        let mgr = SecurityManager::new();
+        assert!(matches!(
+            mgr.get_signer_sync(&key_name("missing")),
+            Err(TrustError::CertNotFound { .. })
+        ));
+    }
+
     #[tokio::test]
     async fn certify_produces_signed_cert() {
         let mgr = SecurityManager::new();
@@ -642,5 +743,142 @@ mod tests {
 
         let (_mgr2, generated2) = SecurityManager::auto_init(&identity, &pib_path).unwrap();
         assert!(!generated2);
+    }
+
+    fn n(s: &str) -> Name {
+        s.parse().unwrap()
+    }
+
+    /// The identity's single signer: (key name, public key).
+    fn identity_signer(mgr: &SecurityManager, identity: &Name) -> (Name, Bytes) {
+        let signer = mgr.identity_signer(identity).expect("identity signer");
+        (signer.key_name().clone(), signer.public_key().unwrap())
+    }
+
+    /// A node's identity persisted to a FilePib comes back with the same
+    /// signer after a restart, via both `auto_init` and `from_pib`.
+    #[test]
+    fn identity_reloads_with_same_signer_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let pib_path = dir.path().join("pib");
+        let identity = n("/home/bob/phone");
+
+        let (first, generated) = SecurityManager::auto_init(&identity, &pib_path).unwrap();
+        assert!(generated);
+        let (key, pk) = identity_signer(&first, &identity);
+        assert_eq!(key, identity.clone().append("KEY").append("self"));
+        drop(first);
+
+        // Simulated restart: fresh managers over the same directory.
+        let (again, generated) = SecurityManager::auto_init(&identity, &pib_path).unwrap();
+        assert!(!generated);
+        assert_eq!(identity_signer(&again, &identity), (key.clone(), pk.clone()));
+
+        let pib = crate::pib::FilePib::open(&pib_path).unwrap();
+        let loaded = SecurityManager::from_pib(&pib, &identity).unwrap();
+        assert_eq!(identity_signer(&loaded, &identity), (key.clone(), pk));
+        assert!(loaded.trust_anchor(&key).is_some(), "self anchor reloads");
+    }
+
+    /// With two identities in one PIB, the requested one is loaded — never
+    /// whichever key the directory listing yields first.
+    #[test]
+    fn requested_identity_is_honoured_with_two_identities() {
+        let dir = tempfile::tempdir().unwrap();
+        let pib_path = dir.path().join("pib");
+        let alice = n("/home/bob/alice");
+        let carol = n("/home/bob/carol");
+
+        let (a, _) = SecurityManager::auto_init(&alice, &pib_path).unwrap();
+        let alice_key = identity_signer(&a, &alice);
+        let (c, generated) = SecurityManager::auto_init(&carol, &pib_path).unwrap();
+        assert!(generated, "carol has no key yet; alice's must not be reused");
+        let carol_key = identity_signer(&c, &carol);
+        assert_ne!(alice_key.0, carol_key.0);
+
+        let pib = crate::pib::FilePib::open(&pib_path).unwrap();
+        for (identity, expected) in [(&alice, &alice_key), (&carol, &carol_key)] {
+            let mgr = SecurityManager::from_pib(&pib, identity).unwrap();
+            assert_eq!(&identity_signer(&mgr, identity), expected);
+            assert_eq!(
+                mgr.any_signer().unwrap().key_name(),
+                &expected.0,
+                "only the requested identity's key is loaded"
+            );
+            let (reloaded, generated) = SecurityManager::auto_init(identity, &pib_path).unwrap();
+            assert!(!generated);
+            assert_eq!(&identity_signer(&reloaded, identity), expected);
+        }
+        assert!(SecurityManager::from_pib(&pib, &n("/home/bob/dave")).is_err());
+    }
+
+    /// Every key naming form already persisted in FilePibs loads for its
+    /// identity: `ndn-sec keygen`'s cert-named `/KEY/<kid>/self/v=0`,
+    /// `auto_init`'s `/KEY/self`, the hub's `/KEY/root`, and `/KEY/<kid>`.
+    #[test]
+    fn every_key_naming_form_loads_for_its_identity() {
+        for (identity, legacy_key) in [
+            ("/legacy/keygen", "/legacy/keygen/KEY/k0/self/v=0"),
+            ("/legacy/router", "/legacy/router/KEY/self"),
+            ("/legacy/hub", "/legacy/hub/KEY/root"),
+            ("/legacy/plain", "/legacy/plain/KEY/0123abcd"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let pib = crate::pib::FilePib::new(dir.path()).unwrap();
+            let identity = n(identity);
+            let legacy_key = n(legacy_key);
+            let signer = pib.generate_ecdsa_p256(&legacy_key).unwrap();
+            let pk = signer.public_key().unwrap();
+            let now = now_ns();
+            let cert = Certificate {
+                name: Arc::new(legacy_key.clone()),
+                public_key: pk.clone(),
+                valid_from: now,
+                valid_until: now + 3_600_000_000_000,
+                issuer: None,
+                signed_region: None,
+                sig_value: None,
+                sig_type: ndn_packet::SignatureType::SignatureSha256WithEcdsa,
+            };
+            pib.store_cert(&legacy_key, &cert).unwrap();
+            pib.add_trust_anchor(&legacy_key, &cert).unwrap();
+
+            let mgr = SecurityManager::from_pib(&pib, &identity).unwrap();
+            assert_eq!(identity_signer(&mgr, &identity), (legacy_key.clone(), pk.clone()));
+
+            let (mgr, generated) = SecurityManager::auto_init(&identity, dir.path()).unwrap();
+            assert!(!generated, "legacy key must be reused, not replaced");
+            assert_eq!(identity_signer(&mgr, &identity), (legacy_key, pk));
+        }
+    }
+
+    /// The identity index resolves every naming form, and a key of a
+    /// sub-identity (`/<ns>/CA/KEY/ca`) never answers for `/<ns>`.
+    #[test]
+    fn identity_index_resolves_every_naming_form() {
+        let mgr = SecurityManager::new();
+        for key in [
+            "/a/KEY/k0/self/v=0",
+            "/b/KEY/self",
+            "/home/bob/CA/KEY/ca",
+            "/home/bob/KEY/root",
+            "/d/KEY/0123abcd",
+        ] {
+            mgr.generate_ed25519(n(key)).unwrap();
+        }
+        for (identity, key) in [
+            ("/a", "/a/KEY/k0/self/v=0"),
+            ("/b", "/b/KEY/self"),
+            ("/home/bob", "/home/bob/KEY/root"),
+            ("/home/bob/CA", "/home/bob/CA/KEY/ca"),
+            ("/d", "/d/KEY/0123abcd"),
+        ] {
+            assert_eq!(mgr.identity_key_name(&n(identity)), Some(n(key)));
+        }
+        assert_eq!(mgr.identity_key_name(&n("/home")), None);
+        assert_eq!(
+            mgr.identity_key_for(&n("/home/bob/CA/issued/x")).map(|(_, k)| k),
+            Some(n("/home/bob/CA/KEY/ca"))
+        );
     }
 }

@@ -29,6 +29,7 @@ members = [
     "crates/protocols/ndn-sync",
     "crates/security/ndn-cert",
     "crates/security/ndn-identity",
+    "crates/security/ndn-trust-envelope",
     "crates/forwarding/ndn-mgmt",
     "crates/platform/ndn-observability",
     "examples/hello-node",
@@ -70,6 +71,7 @@ default-members = [
     "crates/protocols/ndn-sync",
     "crates/security/ndn-cert",
     "crates/security/ndn-identity",
+    "crates/security/ndn-trust-envelope",
     "crates/forwarding/ndn-mgmt",
     "crates/platform/ndn-observability",
 ]
@@ -133,6 +135,7 @@ ndn-svs-core  = { path = "crates/protocols/ndn-svs-core" }
 ndn-sync      = { path = "crates/protocols/ndn-sync" }
 ndn-cert     = { path = "crates/security/ndn-cert" }
 ndn-identity = { path = "crates/security/ndn-identity" }
+ndn-trust-envelope = { path = "crates/security/ndn-trust-envelope" }
 ndn-mgmt     = { path = "crates/forwarding/ndn-mgmt" }
 ndn-observability = { path = "crates/platform/ndn-observability" }
 

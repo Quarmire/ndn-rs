@@ -1,6 +1,9 @@
 //! Device-approval challenge — a request is approved by another already-
 //! approved device under the same identity, via an in-process
-//! `PendingApprovalStore` the approver dashboard writes to.
+//! `PendingApprovalStore` the approver dashboard writes to. Cross-process
+//! approvals arrive through `ndn_identity::device_approval_net`'s validated
+//! approval feed, which records them with
+//! [`PendingApprovalStore::approve_validated`].
 
 use std::{
     collections::HashMap,
@@ -34,41 +37,19 @@ pub struct ApprovalRequest {
     /// For cross-process approvals: the approving device's identity name.
     /// `None` for the in-process (unsigned) flow.
     pub approver: Option<String>,
-    /// The approver's raw public key, against which [`signed_approval`] is
-    /// verified. Empty for the in-process flow.
-    ///
-    /// [`signed_approval`]: Self::signed_approval
-    pub approver_pubkey: Vec<u8>,
-    /// The approver's signature for this request. Its meaning depends on
-    /// [`validated`](Self::validated): the signature over [`approval_statement`]
-    /// (statement path) or the signature value of the approver's signed
-    /// approval Data (canonical, validator-checked path). Empty for the
-    /// in-process flow.
+    /// The signature value of the approver's signed approval Data, already
+    /// validated upstream (see [`PendingApprovalStore::approve_validated`]).
+    /// Empty for the in-process flow.
     pub signed_approval: Vec<u8>,
-    /// `true` when the approval was recorded via [`approve_validated`] — i.e.
-    /// the caller already validated the approver's *signed approval Data*
-    /// through a `Validator` (signature + chain + trust schema), the canonical
-    /// path. The challenge then trusts it without re-verifying.
-    ///
-    /// [`approve_validated`]: PendingApprovalStore::approve_validated
-    pub validated: bool,
-}
-
-/// The canonical bytes a cross-process approver signs to attest to one
-/// request: ties the approval to the exact requested cert name and the
-/// per-request id (the nonce), so a signature can't be replayed onto a
-/// different enrollment. Used by the trait-authorizer path
-/// (`StaticTrustedApprovers` / `DidApproverAuthorizer`).
-pub fn approval_statement(cert_name: &str, request_id: &str) -> Vec<u8> {
-    format!("ndncert-approve:{cert_name}:{request_id}").into_bytes()
 }
 
 /// The NDN name of the approver's *signed approval Data* for one request:
 /// `<cert_name>/ndncert-approve/<request_id>`. This is a real Data name signed
 /// by the approver, so a CA can validate it through its trust schema with the
 /// real `(data_name, signer_cert_name)` pair — matching canonical LVS usage
-/// (python-ndn / ndnd), unlike the synthetic statement bytes. Returns `None`
-/// if `cert_name` is unparseable.
+/// (python-ndn / ndnd). Binding the request id into the name stops an approval
+/// being replayed onto a different enrollment. Returns `None` if `cert_name`
+/// is unparseable.
 pub fn approval_data_name(cert_name: &str, request_id: &str) -> Option<ndn_packet::Name> {
     let name: ndn_packet::Name = cert_name.parse().ok()?;
     Some(name.append("ndncert-approve").append(request_id))
@@ -103,9 +84,7 @@ impl PendingApprovalStore {
                 description: description.into(),
                 state: ApprovalState::Pending,
                 approver: None,
-                approver_pubkey: Vec::new(),
                 signed_approval: Vec::new(),
-                validated: false,
             },
         );
         id
@@ -117,32 +96,6 @@ impl PendingApprovalStore {
         let mut guard = self.inner.lock().expect("PendingApprovalStore poisoned");
         match guard.requests.get_mut(id) {
             Some(r) if matches!(r.state, ApprovalState::Pending) => {
-                r.state = ApprovalState::Approved;
-                true
-            }
-            _ => false,
-        }
-    }
-
-    /// Cross-process approval: record the approving device's identity, its
-    /// public key, and its signature over [`approval_statement`]. The
-    /// challenge handler verifies the signature before satisfying, and the
-    /// resulting attestation carries it as independent evidence. Returns
-    /// `true` only if the request existed and was `Pending`.
-    pub fn approve_signed(
-        &self,
-        id: &str,
-        approver: impl Into<String>,
-        approver_pubkey: Vec<u8>,
-        signature: Vec<u8>,
-    ) -> bool {
-        let mut guard = self.inner.lock().expect("PendingApprovalStore poisoned");
-        match guard.requests.get_mut(id) {
-            Some(r) if matches!(r.state, ApprovalState::Pending) => {
-                r.approver = Some(approver.into());
-                r.approver_pubkey = approver_pubkey;
-                r.signed_approval = signature;
-                r.validated = false;
                 r.state = ApprovalState::Approved;
                 true
             }
@@ -167,9 +120,7 @@ impl PendingApprovalStore {
         match guard.requests.get_mut(id) {
             Some(r) if matches!(r.state, ApprovalState::Pending) => {
                 r.approver = Some(approver.into());
-                r.approver_pubkey = Vec::new();
                 r.signed_approval = signature;
-                r.validated = true;
                 r.state = ApprovalState::Approved;
                 true
             }
@@ -258,12 +209,7 @@ impl ChallengeHandler for DeviceApprovalChallenge {
             };
             match entry.state {
                 ApprovalState::Approved => {
-                    let attestation = match build_signed_attestation(&entry, &id).await {
-                        Ok(set) => Some(set),
-                        // A recorded signature that doesn't verify is a hard
-                        // denial — the approval can't be trusted.
-                        Err(reason) => return Ok(ChallengeOutcome::Denied(reason)),
-                    };
+                    let attestation = Some(build_attestation(&entry, &id));
                     Ok(ChallengeOutcome::Approved { attestation })
                 }
                 ApprovalState::Denied(reason) => Ok(ChallengeOutcome::Denied(reason)),
@@ -286,40 +232,19 @@ impl ChallengeHandler for DeviceApprovalChallenge {
 
 /// Build the attestation for an approved request. For the unsigned
 /// in-process flow this is a `request_id`-only leaf. For a cross-process
-/// signed approval it verifies the approver's signature over
-/// [`approval_statement`] and records the approver identity + signature as
-/// independent evidence; a signature that fails to verify is an error.
-async fn build_signed_attestation(
-    entry: &ApprovalRequest,
-    id: &str,
-) -> Result<AttestationSet, String> {
+/// approval (validated upstream) it records the approver identity and its
+/// signature as independent evidence.
+fn build_attestation(entry: &ApprovalRequest, id: &str) -> AttestationSet {
     let mut leaf = ChallengeAttestation::of_kind("device-approval");
     leaf.handler_name = Some("device-approval".to_string());
     leaf = leaf.with_evidence("request_id", serde_json::json!(id));
 
     if let Some(approver) = &entry.approver {
-        // Validator-checked (canonical) approvals are already verified upstream
-        // — record the evidence without re-verifying. Statement-path approvals
-        // (StaticTrustedApprovers / DidApproverAuthorizer) carry the approver's
-        // pubkey, so re-verify the statement signature here.
-        if !entry.validated {
-            use ndn_security::{Ed25519Verifier, Verifier, VerifyOutcome};
-            let statement = approval_statement(&entry.cert_name, id);
-            let outcome = Ed25519Verifier
-                .verify(&statement, &entry.signed_approval, &entry.approver_pubkey)
-                .await
-                .map_err(|e| format!("approver signature verification errored: {e}"))?;
-            if !matches!(outcome, VerifyOutcome::Valid) {
-                return Err(format!(
-                    "approver {approver} signature over the approval statement is invalid"
-                ));
-            }
-        }
         leaf = leaf.with_evidence("approved_by", serde_json::json!(approver));
         leaf.signature =
             Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&entry.signed_approval));
     }
-    Ok(AttestationSet::single(leaf))
+    AttestationSet::single(leaf)
 }
 
 #[cfg(test)]
@@ -429,22 +354,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn signed_approval_verifies_and_records_signature() {
-        use ndn_packet::Name;
-        use ndn_security::{Ed25519Signer, Signer};
-
+    async fn validated_approval_records_approver_and_signature() {
         let store = PendingApprovalStore::new();
         let challenge = DeviceApprovalChallenge::new(store.clone());
         let (state, id) = begin_request(&challenge, "/lab/alice").await;
 
-        let approver: Name = "/lab/alice/devices/phone".parse().unwrap();
-        let signer = Ed25519Signer::from_seed(&[7u8; 32], approver.clone());
-        let pubkey = signer.public_key().unwrap().to_vec();
-        let sig = signer
-            .sign(&approval_statement("/lab/alice", &id))
-            .await
-            .unwrap();
-        assert!(store.approve_signed(&id, approver.to_string(), pubkey, sig.to_vec()));
+        let approver = "/lab/alice/devices/phone/KEY/k1";
+        assert!(store.approve_validated(&id, approver, vec![1, 2, 3]));
 
         let outcome = challenge
             .verify(&state, &serde_json::Map::new())
@@ -458,40 +374,11 @@ mod tests {
         assert_eq!(leaf.kind, "device-approval");
         assert!(
             leaf.signature.is_some(),
-            "signed flow records the signature"
+            "validated flow records the signature"
         );
         assert_eq!(
             leaf.evidence.get("approved_by").unwrap(),
-            &serde_json::json!(approver.to_string())
+            &serde_json::json!(approver)
         );
-    }
-
-    #[tokio::test]
-    async fn forged_signature_is_denied() {
-        use ndn_packet::Name;
-        use ndn_security::{Ed25519Signer, Signer};
-
-        let store = PendingApprovalStore::new();
-        let challenge = DeviceApprovalChallenge::new(store.clone());
-        let (state, id) = begin_request(&challenge, "/lab/alice").await;
-
-        let approver: Name = "/lab/alice/devices/phone".parse().unwrap();
-        let signer = Ed25519Signer::from_seed(&[7u8; 32], approver.clone());
-        let pubkey = signer.public_key().unwrap().to_vec();
-        // Sign a DIFFERENT statement than the one the handler reconstructs.
-        let wrong = signer
-            .sign(&approval_statement("/lab/mallory", &id))
-            .await
-            .unwrap();
-        assert!(store.approve_signed(&id, approver.to_string(), pubkey, wrong.to_vec()));
-
-        let outcome = challenge
-            .verify(&state, &serde_json::Map::new())
-            .await
-            .unwrap();
-        match outcome {
-            ChallengeOutcome::Denied(reason) => assert!(reason.contains("invalid")),
-            other => panic!("expected Denied on signature mismatch, got {other:?}"),
-        }
     }
 }

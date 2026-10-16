@@ -49,6 +49,14 @@ pub struct KeyChain {
     key_name: Name,
 }
 
+/// Signature algorithm for a freshly generated key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyAlgorithm {
+    Ed25519,
+    EcdsaP256,
+    Rsa2048,
+}
+
 const DEFAULT_CERT_VALIDITY_MS: u64 = 365 * 24 * 3600 * 1_000;
 
 /// 8 random bytes formatted as 16 lowercase hex chars; populates the
@@ -126,7 +134,10 @@ impl KeyChain {
     }
 
     /// Open a persistent identity from a PIB directory, generating one on
-    /// first run and reloading it thereafter.
+    /// first run and reloading it thereafter. The key is the identity's
+    /// default key under `<name>/KEY/`
+    /// ([`FilePib::default_key`](crate::FilePib::default_key)); other
+    /// identities in the same PIB are not touched.
     pub fn open_or_create(path: &Path, name: impl AsRef<str>) -> Result<Self, TrustError> {
         let name: Name = name
             .as_ref()
@@ -135,8 +146,9 @@ impl KeyChain {
 
         let (mgr, _created) = SecurityManager::auto_init(&name, path)?;
 
-        let key_name = derive_key_name(&name, &mgr)
-            .unwrap_or_else(|| name.clone().append("KEY").append("v=0"));
+        let key_name = mgr.identity_key_name(&name).ok_or_else(|| {
+            TrustError::KeyStore(format!("PIB at {} holds no key for {name}", path.display()))
+        })?;
 
         Ok(Self {
             mgr: Arc::new(mgr),
@@ -182,11 +194,7 @@ impl KeyChain {
                 if name == &self.name {
                     Ok(Some(self.signer()?))
                 } else {
-                    Err(TrustError::KeyStore(format!(
-                        "SignerSelection::Identity({name}) — only the keychain's own identity \
-                         {self_name} is currently resolvable; multi-identity PIB lookup pending",
-                        self_name = self.name,
-                    )))
+                    Ok(Some(self.mgr.identity_signer(name)?))
                 }
             }
             SignerSelection::Key(key_name) => Ok(Some(self.mgr.get_signer_sync(key_name)?)),
@@ -220,10 +228,18 @@ impl KeyChain {
                 })
             }
             SignerSelection::HmacKey(key_name) => Ok(Some(self.mgr.get_signer_sync(key_name)?)),
-            SignerSelection::Suggested { for_name: _ } => {
-                // Until LVS rule evaluation is wired, fall back to the
-                // default signer so callers can write against the API.
-                Ok(Some(self.signer()?))
+            SignerSelection::Suggested { for_name } => {
+                // Until LVS rule evaluation is wired: the registered identity
+                // with the longest name covering `for_name` signs. A name no
+                // identity covers is an error, never another identity's key.
+                match self.mgr.identity_key_for(for_name) {
+                    Some((identity, _)) if identity == self.name => Ok(Some(self.signer()?)),
+                    Some((_, key_name)) => Ok(Some(self.mgr.get_signer_sync(&key_name)?)),
+                    None => Err(TrustError::KeyStore(format!(
+                        "SignerSelection::Suggested: no identity held by this keychain \
+                         covers {for_name}"
+                    ))),
+                }
             }
         }
     }
@@ -338,13 +354,9 @@ impl KeyChain {
         Arc::clone(&self.mgr)
     }
 
-    /// Consume the keychain and yield its `Arc<SecurityManager>` as the
-    /// sole reference (no other `Arc::clone`s remain).  Callers that
-    /// want to `Arc::try_unwrap` the manager — typical pattern for
-    /// daemons that need to move the inner `SecurityManager` into a
-    /// builder by value — should use this rather than
-    /// [`manager_arc`](Self::manager_arc), which always clones and
-    /// would cause `try_unwrap` to fail.
+    /// Consume the keychain and yield its `Arc<SecurityManager>` without
+    /// the extra clone [`manager_arc`](Self::manager_arc) makes — e.g. to
+    /// hand the manager to `EngineBuilder::security`.
     pub fn into_manager_arc(self) -> Arc<SecurityManager> {
         self.mgr
     }
@@ -357,25 +369,6 @@ impl std::fmt::Debug for KeyChain {
             .field("key_name", &self.key_name.to_string())
             .finish()
     }
-}
-
-/// Derive the signing key name from the trust anchors already loaded into a
-/// `SecurityManager`.
-///
-/// First anchor whose name begins with `identity_name` and contains a
-/// `/KEY/` component.
-pub(crate) fn derive_key_name(identity_name: &Name, mgr: &SecurityManager) -> Option<Name> {
-    let name_str = identity_name.to_string();
-    for anchor_name in mgr.trust_anchor_names() {
-        let anchor_str = anchor_name.to_string();
-        if anchor_str.starts_with(&name_str)
-            && anchor_str.contains("/KEY/")
-            && let Ok(key_name) = anchor_str.parse::<Name>()
-        {
-            return Some(key_name);
-        }
-    }
-    None
 }
 
 #[cfg(test)]
@@ -588,8 +581,8 @@ mod tests {
         );
     }
 
-    /// `SignerSelection::Identity` with a different identity errors
-    /// clearly (multi-identity PIB lookup is not yet wired).
+    /// `SignerSelection::Identity` for an identity with no registered key
+    /// errors instead of signing with the keychain's own key.
     #[test]
     fn signing_info_identity_other_rejected() {
         use crate::SigningInfo;
@@ -677,10 +670,10 @@ mod tests {
         let _data = Data::decode(wire).expect("Data must decode");
     }
 
-    /// `SignerSelection::Suggested` falls back to the keychain's
-    /// default signer until LVS-rule evaluation is wired.
+    /// `SignerSelection::Suggested` for a name under the keychain's own
+    /// identity signs with the keychain's key.
     #[test]
-    fn signing_info_suggested_falls_back() {
+    fn signing_info_suggested_own_namespace() {
         use crate::SigningInfo;
         use ndn_packet::{Data, encode::DataBuilder};
         let kc = KeyChain::ephemeral("/com/example/dave").unwrap();
@@ -692,6 +685,63 @@ mod tests {
         let data = Data::decode(wire).unwrap();
         let kl = data.sig_info().unwrap().key_locator.as_ref().unwrap();
         assert_eq!(kl.to_string(), kc.key_name().to_string());
+    }
+
+    /// Keychain `/com/example/alice` whose manager also holds bob's key.
+    fn alice_with_bob() -> (KeyChain, Name) {
+        let kc = KeyChain::ephemeral("/com/example/alice").unwrap();
+        let bob_key: Name = "/com/example/bob/KEY/b0/self/v=0".parse().unwrap();
+        kc.manager_arc().generate_ed25519(bob_key.clone()).unwrap();
+        (kc, bob_key)
+    }
+
+    fn key_locator_of(wire: Bytes) -> String {
+        let data = ndn_packet::Data::decode(wire).unwrap();
+        data.sig_info()
+            .unwrap()
+            .key_locator
+            .as_ref()
+            .unwrap()
+            .to_string()
+    }
+
+    /// Multi-identity: `Identity(bob)` on alice's keychain signs with bob's
+    /// key from the shared manager.
+    #[test]
+    fn signing_info_identity_resolves_registered_identity() {
+        use crate::SigningInfo;
+        use ndn_packet::encode::DataBuilder;
+        let (kc, bob_key) = alice_with_bob();
+        let bob: Name = "/com/example/bob".parse().unwrap();
+        let builder = DataBuilder::new(ndn_packet::name!("/com/example/bob/d"), b"body");
+        let wire = kc
+            .sign_packet(builder, &SigningInfo::identity(bob))
+            .expect("registered identity must resolve");
+        assert_eq!(key_locator_of(wire), bob_key.to_string());
+    }
+
+    /// `Suggested` picks the identity covering the packet name, and errors
+    /// for a name no held identity covers instead of using alice's key.
+    #[test]
+    fn signing_info_suggested_resolves_covering_identity_or_errors() {
+        use crate::SigningInfo;
+        use ndn_packet::encode::DataBuilder;
+        let (kc, bob_key) = alice_with_bob();
+
+        let for_bob: Name = "/com/example/bob/notes/1".parse().unwrap();
+        let builder = DataBuilder::new(for_bob.clone(), b"body");
+        let wire = kc
+            .sign_packet(builder, &SigningInfo::suggested(for_bob))
+            .expect("bob's namespace must resolve to bob's key");
+        assert_eq!(key_locator_of(wire), bob_key.to_string());
+
+        let foreign: Name = "/org/unrelated/x".parse().unwrap();
+        let builder = DataBuilder::new(foreign.clone(), b"body");
+        let err = kc.sign_packet(builder, &SigningInfo::suggested(foreign));
+        assert!(
+            matches!(err, Err(TrustError::KeyStore(_))),
+            "uncovered name must error; got {err:?}"
+        );
     }
 
     /// `SignerSelection::Key` for an unknown key errors with

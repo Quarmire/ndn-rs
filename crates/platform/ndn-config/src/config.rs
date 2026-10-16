@@ -156,26 +156,43 @@ fn default_observability_sample() -> f64 {
     0.01
 }
 
-/// Embedded NDNCERT CA for demo deployments. Mints a self-signed CA
-/// cert and serves `/<prefix>/CA/{INFO,NEW,CHALLENGE/<id>}`. Only safe
-/// behind a trusted local face.
+/// Embedded NDNCERT CA. Serves `/<prefix>/CA/{INFO,NEW,CHALLENGE/<id>}` (and
+/// `/<prefix>/CA/APPROVE-FEED` with a `device-approval` challenge) plus
+/// cert-fetch for the certs it issued.
+///
+/// By default the CA signs with the identity `identity` loaded from the node's
+/// PIB (`[security] pib_path`): its key and its `ca/ca-cert.data` certificate
+/// (issued by the hub root) are written by `ndn-fwd init --profile hub`.
+/// Issued certs and revocations persist under `<pib_path>/ca/`. With
+/// `ephemeral = true` the CA instead mints a throwaway self-signed key at
+/// every start (demo only: certs it issued stop verifying after a restart).
+///
+/// The CA refuses to start with no challenge configured: list them under
+/// `[[demo_ca.challenge]]` (or the legacy `tokens`). `nop` (auto-approve) is
+/// only offered when listed explicitly.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DemoCaConfig {
     #[serde(default)]
     pub enabled: bool,
+    /// CA namespace, e.g. `/home/bob`. The CA appends `/CA` itself and serves
+    /// `/<prefix>/CA/...` (NDNCERT convention; clients append `/CA` too), so
+    /// this must not end in `CA`.
     #[serde(default = "DemoCaConfig::default_prefix")]
     pub prefix: String,
-    /// CA's self-signed identity name; typically equals `prefix`.
+    /// CA signing identity, conventionally `<prefix>/CA`. Loaded from the PIB
+    /// unless `ephemeral`.
     #[serde(default = "DemoCaConfig::default_identity")]
     pub identity: String,
-    /// Pre-provisioned one-time invite tokens; non-empty switches the
-    /// CA from `NopChallenge` (auto-approve) to `TokenChallenge`.
-    /// Legacy shortcut; ignored when `challenge` is non-empty.
+    /// Mint a throwaway self-signed CA key at startup instead of loading
+    /// `identity` from the PIB. Demo only; logged as a warning.
+    #[serde(default)]
+    pub ephemeral: bool,
+    /// Legacy shortcut for a single `token` challenge with these one-time
+    /// invite tokens. Ignored when `challenge` is non-empty.
     #[serde(default)]
     pub tokens: Vec<String>,
-    /// Explicit challenge set. When non-empty it overrides the
-    /// `tokens`-driven nop/token selection — the CA offers exactly these
-    /// challenges. Serialized as `[[demo_ca.challenge]]` array-of-tables.
+    /// Explicit challenge set — the CA offers exactly these. Serialized as
+    /// `[[demo_ca.challenge]]` array-of-tables.
     #[serde(default, rename = "challenge")]
     pub challenges: Vec<ChallengeConfig>,
     /// Embed a challenge attestation (how the challenge was satisfied) in each
@@ -193,11 +210,15 @@ pub struct DemoCaConfig {
 
 /// One NDNCERT challenge the CA offers. Flat (`kind` + per-kind fields) for
 /// TOML friendliness; the CA wiring matches on `kind`. Recognised kinds:
-/// `nop`, `token`, `pin`, `email`. (`possession`/`yubikey`/`device-approval`
-/// need certs / secrets / the approve-feed, so they're wired in code.)
+/// `nop`, `token`, `pin`, `email`, `device-approval`. (`possession`/`yubikey`
+/// need certs / secrets, so they're wired in code.)
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChallengeConfig {
-    /// `nop` | `token` | `pin` | `email`.
+    /// `nop` | `token` | `pin` | `email` | `device-approval`. `device-approval`
+    /// holds each request until an operator approves it (`ca approve`/`ca
+    /// deny` over mgmt) or an approver device sends a signed approval to
+    /// `/<prefix>/CA/APPROVE-FEED` that validates against the node's trust
+    /// contexts.
     pub kind: String,
     /// `token`: one-time invite tokens.
     #[serde(default)]
@@ -261,7 +282,7 @@ pub struct RequireAttestationConfig {
 
 impl DemoCaConfig {
     fn default_prefix() -> String {
-        "/demo/CA".to_string()
+        "/demo".to_string()
     }
     fn default_identity() -> String {
         "/demo/CA".to_string()
@@ -274,6 +295,7 @@ impl Default for DemoCaConfig {
             enabled: false,
             prefix: Self::default_prefix(),
             identity: Self::default_identity(),
+            ephemeral: false,
             tokens: Vec::new(),
             challenges: Vec::new(),
             emit_attestations: false,
@@ -389,8 +411,9 @@ pub enum CertSourceConfig {
     Pem { cert_pem: String, key_pem: String },
     /// ACME (RFC 8555) DNS-01 provisioning with automatic renewal.
     Acme(AcmeTomlConfig),
-    /// Ephemeral self-signed cert (dev / `serverCertificateHashes` workflow,
-    /// or a pinned backbone link).
+    /// Self-signed cert (dev / `serverCertificateHashes` workflow, or a pinned
+    /// backbone link). The key + cert persist across restarts so the pinned
+    /// leaf SHA-256 stays stable.
     SelfSignedDev(SelfSignedDevConfig),
 }
 
@@ -402,16 +425,28 @@ impl Default for CertSourceConfig {
     }
 }
 
+/// Self-signed listener cert. The generated key (PKCS#8) and cert are
+/// persisted under `cache_dir`, keyed by profile + hostnames, and reused on
+/// restart, so dialers' `cert_sha256` / `?cert=` pins keep working. A QUIC
+/// backbone reuses its 10-year cert as-is; a WebTransport (browser-pinnable,
+/// 13-day) cert is re-issued from the same key near expiry. Changing
+/// `hostnames` mints a new key and cert.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SelfSignedDevConfig {
     #[serde(default = "default_cert_hostnames")]
     pub hostnames: Vec<String>,
+    /// Directory for the persisted key + cert (files written `0600`). Absent =
+    /// `$XDG_STATE_HOME/ndn-fwd/tls`, else `~/.local/state/ndn-fwd/tls`. Give
+    /// each node on a shared host its own directory to keep pins distinct.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_dir: Option<String>,
 }
 
 impl Default for SelfSignedDevConfig {
     fn default() -> Self {
         Self {
             hostnames: default_cert_hostnames(),
+            cache_dir: None,
         }
     }
 }
@@ -444,7 +479,7 @@ pub struct RoutingTomlConfig {
 }
 
 /// Spec-compliant ndn-dv distance-vector routing. Default trust is
-/// `InsecureTrust`, matching ndnd's `KeyChainUri = "insecure"` mode.
+/// `DvInsecure`, matching ndnd's `KeyChainUri = "insecure"` mode.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DvTomlConfig {
     #[serde(default)]
@@ -1441,7 +1476,9 @@ impl Default for MgmtSecurityConfig {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SecurityConfig {
-    /// Key and certificate must exist in the PIB unless `auto_init`.
+    /// Identity name (e.g. `/home/bob/router`); its signing key is the one
+    /// stored under `<identity>/KEY/` in the PIB, which must exist unless
+    /// `auto_init`.
     #[serde(default)]
     pub identity: Option<String>,
 
@@ -1456,8 +1493,8 @@ pub struct SecurityConfig {
     #[serde(default)]
     pub require_signed: bool,
 
-    /// Auto-generate a self-signed identity on first startup if the PIB
-    /// is empty. Requires `identity`.
+    /// Auto-generate a self-signed key `<identity>/KEY/self` on startup
+    /// if the PIB holds no key for `identity`. Requires `identity`.
     #[serde(default)]
     pub auto_init: bool,
 
@@ -1916,5 +1953,26 @@ channel = 161
         assert!(d.reflexive.enabled);
         assert_eq!(d.reflexive.max_per_face, 256);
         assert_eq!(d.reflexive.max_lifetime_ms, 8000);
+    }
+
+    #[test]
+    fn self_signed_cache_dir_parses_and_round_trips() {
+        let cfg = ForwarderConfig::from_str(
+            "[listeners.quic]\nenabled = true\nlisten = \"0.0.0.0:6367\"\n\
+             cert_source = { type = \"self_signed_dev\", cache_dir = \"/var/lib/ndn-fwd/tls\" }\n",
+        )
+        .unwrap();
+        let src = cfg.listeners.quic.unwrap().cert_source;
+        let CertSourceConfig::SelfSignedDev(s) = &src else {
+            panic!("expected self_signed_dev, got {src:?}");
+        };
+        assert_eq!(s.cache_dir.as_deref(), Some("/var/lib/ndn-fwd/tls"));
+        assert_eq!(s.hostnames, vec!["localhost".to_string()]);
+        // The forwarder hands this to `ndn_acme::CertSource` via JSON.
+        let json = serde_json::to_value(&src).unwrap();
+        assert_eq!(json["cache_dir"], "/var/lib/ndn-fwd/tls");
+        // Unset stays absent rather than `null`.
+        let json = serde_json::to_value(CertSourceConfig::default()).unwrap();
+        assert!(json.get("cache_dir").is_none());
     }
 }

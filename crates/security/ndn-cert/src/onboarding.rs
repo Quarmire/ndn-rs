@@ -1,27 +1,28 @@
-//! Onboarding artefacts: the out-of-band [`BootstrapTicket`], TOFU-gated
-//! [`adopt_with_tofu`], RDR naming for the published context, and the
-//! privacy-preserving link-local [`AnchorAdvert`].
+//! Onboarding artefacts: the anchor [`anchor_fingerprint`], the verified,
+//! TOFU-gated [`adopt_with_tofu`], RDR metadata naming for the published
+//! context, and the privacy-preserving link-local [`AnchorAdvert`].
 //!
 //! A node does not "join a network" — it *adopts* an anchor-rooted
 //! [`SignedTrustContext`]. The one irreducible bit a face cannot give for free is
-//! **root authenticity**. A [`BootstrapTicket`] (a QR / deep-link fragment,
-//! *not* an NDN wire packet) carries that bit: the namespace, the root
-//! anchor's **fingerprint** (a public hash, not a secret), an optional
-//! enrollment token, and a bootstrap face hint. Adoption is never automatic —
-//! it is gated by a TOFU fingerprint match against the ticket, so a flooded
-//! fake advert cannot poison a keyring. See
+//! **root authenticity**. An out-of-band `ndn-trust://anchor/…` envelope
+//! (`ndn_trust_envelope::TrustEnvelope::Anchor`, a QR / deep link, *not* an NDN
+//! wire packet) carries that bit: the namespace and the root anchor's
+//! **fingerprint** (a public hash, not a secret), optionally with the signed
+//! context Data inline. Adoption is never automatic — the context Data's
+//! signature must verify under the anchor whose fingerprint was pinned out of
+//! band (TOFU), so neither a flooded fake advert nor a tampered context (e.g. a
+//! weakened schema riding a genuine anchor) can poison a keyring. See
 //! `.claude/notes/trust-context/trust-context-model-2026-05-25.md` §3–§7, §16.
 
 use std::sync::Arc;
 
-use base64::Engine as _;
 use bytes::Bytes;
-use ndn_packet::{Name, NameComponent};
-use ndn_security::{Certificate, Keyring, SignedTrustContext};
-use serde::{Deserialize, Serialize};
+use ndn_packet::{Data, Name, NameComponent, SignatureType};
+use ndn_security::{
+    Certificate, Keyring, SignedTrustContext, SignedTrustContextError, VerifyOutcome,
+};
+use ndn_trust_envelope::TrustEnvelope;
 use sha2::{Digest, Sha256};
-
-use crate::error::CertError;
 
 /// The RDR keyword component naming a published context: `/<ns>/32=trust-context`.
 /// Canonical definition lives in `ndn-security` (the `SignedTrustContext`
@@ -30,27 +31,17 @@ pub const TRUST_CONTEXT_KEYWORD: &[u8] = ndn_security::trust_context::TRUST_CONT
 /// The RDR metadata keyword (`32=metadata`).
 pub const METADATA_KEYWORD: &[u8] = b"metadata";
 
-/// SHA-256 over an anchor's public key — the public fingerprint a ticket
-/// commits to. (Public-key, not full-cert, so a re-issued anchor cert for the
-/// same key keeps the same fingerprint.)
+/// SHA-256 over an anchor's public key — the public fingerprint an anchor
+/// envelope commits to. (Public-key, not full-cert, so a re-issued anchor cert
+/// for the same key keeps the same fingerprint.)
 pub fn anchor_fingerprint(cert: &Certificate) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(&cert.public_key);
     h.finalize().into()
 }
 
-/// The versioned RDR name of a published context:
-/// `/<namespace>/32=trust-context/v=<version>`.
-pub fn rdr_context_name(namespace: &Name, version: u64) -> Name {
-    namespace
-        .clone()
-        .append_component(NameComponent::keyword(Bytes::from_static(
-            TRUST_CONTEXT_KEYWORD,
-        )))
-        .append_version(version)
-}
-
-/// The RDR metadata name: `/<namespace>/32=trust-context/32=metadata`.
+/// The RDR metadata name: `/<namespace>/32=trust-context/32=metadata`. The
+/// versioned context itself is named by [`SignedTrustContext::rdr_name`].
 pub fn rdr_metadata_name(namespace: &Name) -> Name {
     namespace
         .clone()
@@ -60,115 +51,213 @@ pub fn rdr_metadata_name(namespace: &Name) -> Name {
         .append_component(NameComponent::keyword(Bytes::from_static(METADATA_KEYWORD)))
 }
 
-/// The out-of-band bootstrap pointer carried by a QR / deep link.
+/// Why a trust context was not adopted.
+#[derive(Debug, thiserror::Error)]
+pub enum AdoptError {
+    #[error("context Data is not a decodable NDN Data packet: {0}")]
+    BadData(String),
+    #[error("context Data name {0} is not /<namespace>/32=trust-context/v=<version>")]
+    BadName(String),
+    #[error("context Data carries no Content")]
+    MissingContent,
+    #[error("malformed trust context: {0}")]
+    Malformed(#[from] SignedTrustContextError),
+    #[error("context namespace {found} does not match the pinned namespace {pinned}")]
+    NamespaceMismatch { pinned: String, found: String },
+    #[error("context Data carries no KeyLocator naming its signer")]
+    MissingKeyLocator,
+    #[error("context signer {0} is not one of the context's own anchors")]
+    SignerNotAnchor(String),
+    #[error("context signer {0} does not match the pinned anchor fingerprint")]
+    FingerprintMismatch(String),
+    #[error("no anchor of the context matches the pinned fingerprint")]
+    NoPinnedAnchor,
+    #[error("context signature type {0} is not a public-key signature")]
+    UnsupportedSignature(u64),
+    #[error("context signature does not verify under anchor {0}")]
+    BadSignature(String),
+    #[error("refused: context version {offered} is older than the held version {held}")]
+    Rollback { offered: u64, held: u64 },
+    #[error("expected an anchor envelope, got a {0} envelope")]
+    NotAnchor(&'static str),
+    #[error("anchor envelope carries no {0} to pin")]
+    MissingPin(&'static str),
+    #[error("anchor envelope carries an invalid namespace {0:?}")]
+    BadNamespace(String),
+    #[error(
+        "anchor envelope carries only a fingerprint: the signed context must be inline \
+         for offline adoption (fetch it from the namespace and retry)"
+    )]
+    InlineContextRequired,
+    #[error(
+        "anchor envelope carries an unsigned legacy context; its integrity cannot be \
+         verified, so it is not adopted (re-issue the envelope with a signed context)"
+    )]
+    UnsignedLegacyContext,
+}
+
+/// Decode and authenticate a signed trust-context Data: it must be named at
+/// its own context's RDR name (`/<ns>/32=trust-context/v=<version>`) and carry
+/// a public-key signature that verifies under one of the anchors the context
+/// itself lists. Returns the context and the anchor that signed it.
 ///
-/// Everything here is **public** trust material (the anchor is a public key) —
-/// possessing a ticket lets you *verify* a namespace, not *produce* under it.
-/// Only the optional `token` is a per-invite secret, and it is bounded by TTL +
-/// scope + single-use (see [`crate::TokenStore`]).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BootstrapTicket {
-    /// The context namespace, as an NDN URI (e.g. `/home/bob`).
-    pub namespace: String,
-    /// Lowercase-hex SHA-256 of the root anchor's public key (TOFU seed).
-    pub anchor_fp_hex: String,
-    /// Optional one-time enrollment token (only needed to *produce*).
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub token: Option<String>,
-    /// Optional bootstrap face hint (a rendezvous/hub to dial first).
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub bootstrap_face: Option<String>,
-}
-
-impl BootstrapTicket {
-    /// Build a ticket committing to `anchor`'s fingerprint under `namespace`.
-    pub fn new(namespace: &Name, anchor: &Certificate) -> Self {
-        Self {
-            namespace: namespace.to_string(),
-            anchor_fp_hex: hex_lower(&anchor_fingerprint(anchor)),
-            token: None,
-            bootstrap_face: None,
-        }
+/// This only proves *self-consistency* (the context is exactly what its anchor
+/// signed). Whether that anchor is trusted is the caller's decision —
+/// [`adopt_with_tofu`] pins it against an out-of-band fingerprint.
+pub fn open_signed_context(data: &Data) -> Result<(SignedTrustContext, Certificate), AdoptError> {
+    let version = data
+        .name
+        .components()
+        .last()
+        .and_then(NameComponent::as_version)
+        .ok_or_else(|| AdoptError::BadName(data.name.to_string()))?;
+    let content = data.content().ok_or(AdoptError::MissingContent)?;
+    let ctx = SignedTrustContext::decode_content(content, version)?;
+    if *data.name != ctx.rdr_name() {
+        return Err(AdoptError::BadName(data.name.to_string()));
     }
 
-    pub fn with_token(mut self, token: impl Into<String>) -> Self {
-        self.token = Some(token.into());
-        self
-    }
+    let sig_info = data.sig_info().ok_or(AdoptError::MissingKeyLocator)?;
+    let signer = sig_info
+        .key_locator_name()
+        .ok_or(AdoptError::MissingKeyLocator)?;
+    // Exact anchor (cert) name first, else the anchor cert under the signer's
+    // key name (`/<id>/KEY/<k>` locating `/<id>/KEY/<k>/<issuer>/<v>`).
+    let anchor = ctx
+        .anchors()
+        .get(&signer)
+        .map(|r| r.value().clone())
+        .or_else(|| {
+            ctx.anchors()
+                .iter()
+                .find(|r| r.key().has_prefix(&signer))
+                .map(|r| r.value().clone())
+        })
+        .ok_or_else(|| AdoptError::SignerNotAnchor(signer.to_string()))?;
 
-    pub fn with_bootstrap_face(mut self, face: impl Into<String>) -> Self {
-        self.bootstrap_face = Some(face.into());
-        self
+    // Only public-key signatures authenticate a signer; a digest or shared-key
+    // MAC would let anyone re-sign a tampered context.
+    match sig_info.sig_type {
+        SignatureType::SignatureEd25519
+        | SignatureType::SignatureSha256WithEcdsa
+        | SignatureType::SignatureSha256WithRsa => {}
+        other => return Err(AdoptError::UnsupportedSignature(other.code())),
     }
-
-    pub fn namespace_name(&self) -> Option<Name> {
-        self.namespace.parse().ok()
-    }
-
-    /// The committed anchor fingerprint, if the hex is well-formed.
-    pub fn fingerprint(&self) -> Option<[u8; 32]> {
-        unhex_32(&self.anchor_fp_hex)
-    }
-
-    /// Encode as the value after `#bootstrap=` in a deep link: base64url(JSON).
-    pub fn to_fragment(&self) -> String {
-        let json = serde_json::to_vec(self).expect("BootstrapTicket serializes");
-        format!(
-            "bootstrap={}",
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json)
-        )
-    }
-
-    /// A full deep link: `https://<domain>/#<fragment>`.
-    pub fn to_url(&self, domain: &str) -> String {
-        format!("https://{domain}/#{}", self.to_fragment())
-    }
-
-    /// Parse a ticket from a deep link or bare fragment. Accepts a full URL
-    /// (`…#bootstrap=<b64>`), a `bootstrap=<b64>` fragment, the legacy
-    /// `adopt=`/`join=` keys, or a bare `<b64>` payload.
-    pub fn from_fragment(input: &str) -> Result<Self, CertError> {
-        let frag = input.rsplit('#').next().unwrap_or(input);
-        let b64 = frag
-            .strip_prefix("bootstrap=")
-            .or_else(|| frag.strip_prefix("adopt="))
-            .or_else(|| frag.strip_prefix("join="))
-            .unwrap_or(frag);
-        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(b64.trim())
-            .map_err(|e| CertError::InvalidRequest(format!("bootstrap ticket base64: {e}")))?;
-        serde_json::from_slice(&bytes)
-            .map_err(|e| CertError::InvalidRequest(format!("bootstrap ticket json: {e}")))
+    // The verifiers never suspend; drive the future inline.
+    let outcome = futures::executor::block_on(ndn_security::verifier::verify_by_sig_type(
+        sig_info.sig_type,
+        data.signed_region(),
+        data.sig_value(),
+        &anchor.public_key,
+    ));
+    match outcome {
+        Ok(VerifyOutcome::Valid) => Ok((ctx, anchor)),
+        _ => Err(AdoptError::BadSignature(anchor.name.to_string())),
     }
 }
 
-/// Adopt `ctx` into `keyring` **only** if one of its anchors matches the
-/// ticket's committed fingerprint (TOFU). This is the sole sanctioned path
-/// from "received a context" to "trust a context": a context whose anchor was
-/// not authenticated out-of-band (QR/NFC/pre-baked) never enters the keyring.
-/// Returns `true` if adopted.
+/// Adopt the signed context `context_data` into `keyring` **only** if it
+/// roots `namespace`, its signature verifies, and the anchor that signed it
+/// matches the out-of-band `fingerprint` (TOFU). This is the sole sanctioned
+/// path from "received a context" to "trust a context": a context whose
+/// signing anchor was not authenticated out-of-band (QR/NFC/pre-baked), or
+/// whose content was altered after signing, never enters the keyring.
 pub fn adopt_with_tofu(
     keyring: &Keyring,
-    ctx: Arc<SignedTrustContext>,
-    ticket: &BootstrapTicket,
-) -> bool {
-    let Some(expected) = ticket.fingerprint() else {
-        return false;
+    context_data: &Data,
+    namespace: &Name,
+    fingerprint: &[u8; 32],
+) -> Result<Arc<SignedTrustContext>, AdoptError> {
+    let (ctx, signer) = open_signed_context(context_data)?;
+    // The pinned namespace must match the context it claims to root.
+    if ctx.namespace() != namespace {
+        return Err(AdoptError::NamespaceMismatch {
+            pinned: namespace.to_string(),
+            found: ctx.namespace().to_string(),
+        });
+    }
+    if &anchor_fingerprint(&signer) != fingerprint {
+        return Err(AdoptError::FingerprintMismatch(signer.name.to_string()));
+    }
+    adopt_into(keyring, ctx)
+}
+
+/// [`adopt_with_tofu`] driven by a scanned anchor envelope: the envelope must
+/// pin a namespace and fingerprint and carry the signed context inline.
+/// Fingerprint-only envelopes ([`AdoptError::InlineContextRequired`]) and
+/// unsigned legacy content ([`AdoptError::UnsignedLegacyContext`]) are refused.
+/// Returns the adopted context and its signed Data (for persistence).
+pub fn adopt_anchor_envelope(
+    keyring: &Keyring,
+    envelope: &TrustEnvelope,
+) -> Result<(Arc<SignedTrustContext>, Data), AdoptError> {
+    let TrustEnvelope::Anchor {
+        namespace,
+        fingerprint,
+        context_data,
+        context_content,
+        ..
+    } = envelope
+    else {
+        return Err(AdoptError::NotAnchor(envelope.kind().as_str()));
     };
-    // The ticket's namespace must also match the context it claims to root.
-    if let Some(ns) = ticket.namespace_name()
-        && ctx.namespace() != &ns
-    {
-        return false;
+    let namespace = namespace.as_deref().ok_or(AdoptError::MissingPin("namespace"))?;
+    let pinned: Name = namespace
+        .parse()
+        .map_err(|_| AdoptError::BadNamespace(namespace.to_string()))?;
+    let fingerprint = fingerprint.ok_or(AdoptError::MissingPin("anchor fingerprint"))?;
+    let wire = match (context_data, context_content) {
+        (Some(wire), _) => wire,
+        (None, Some(_)) => return Err(AdoptError::UnsignedLegacyContext),
+        (None, None) => return Err(AdoptError::InlineContextRequired),
+    };
+    let data = Data::decode(wire.clone()).map_err(|e| AdoptError::BadData(e.to_string()))?;
+    let ctx = adopt_with_tofu(keyring, &data, &pinned, &fingerprint)?;
+    Ok((ctx, data))
+}
+
+/// **Explicit opt-in, unverified.** Adopt a legacy *unsigned* context
+/// (`encode_content()` / `ndn-ctx:1:` payloads) if it roots `namespace` and
+/// any of its anchors matches `fingerprint`. Nothing authenticates the schema,
+/// revocations or CA endpoints of such a context — whoever handed it over
+/// could have weakened them — so no default path calls this; use it only when
+/// the operator has deliberately chosen to trust the unsigned payload.
+pub fn adopt_unsigned_legacy_with_tofu(
+    keyring: &Keyring,
+    ctx: SignedTrustContext,
+    namespace: &Name,
+    fingerprint: &[u8; 32],
+) -> Result<Arc<SignedTrustContext>, AdoptError> {
+    if ctx.namespace() != namespace {
+        return Err(AdoptError::NamespaceMismatch {
+            pinned: namespace.to_string(),
+            found: ctx.namespace().to_string(),
+        });
     }
     let matches = ctx
         .anchors()
         .iter()
-        .any(|r| anchor_fingerprint(r.value()) == expected);
+        .any(|r| &anchor_fingerprint(r.value()) == fingerprint);
     if !matches {
-        return false;
+        return Err(AdoptError::NoPinnedAnchor);
     }
-    keyring.adopt(ctx)
+    adopt_into(keyring, ctx)
+}
+
+/// Hand `ctx` to the keyring's anti-rollback adoption, surfacing a refusal.
+pub(crate) fn adopt_into(
+    keyring: &Keyring,
+    ctx: SignedTrustContext,
+) -> Result<Arc<SignedTrustContext>, AdoptError> {
+    let ctx = Arc::new(ctx);
+    if keyring.adopt(Arc::clone(&ctx)) {
+        Ok(ctx)
+    } else {
+        Err(AdoptError::Rollback {
+            offered: ctx.version(),
+            held: keyring.version_of(ctx.namespace()).unwrap_or_default(),
+        })
+    }
 }
 
 /// Whether a node advertises its contexts on the link by default.
@@ -219,25 +308,6 @@ impl AnchorAdvert {
     }
 }
 
-fn hex_lower(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
-}
-
-fn unhex_32(s: &str) -> Option<[u8; 32]> {
-    if s.len() != 64 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    for (i, byte) in out.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
-    }
-    Some(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,20 +317,16 @@ mod tests {
     }
 
     #[test]
-    fn ticket_fragment_roundtrips() {
-        let t = BootstrapTicket {
-            namespace: "/home/bob".to_string(),
-            anchor_fp_hex: hex_lower(&[0xABu8; 32]),
-            token: Some("invite-123".into()),
-            bootstrap_face: Some("udp://hub.local:6363".into()),
-        };
-        let frag = t.to_fragment();
-        assert!(frag.starts_with("bootstrap="));
-        let back = BootstrapTicket::from_fragment(&frag).unwrap();
-        assert_eq!(back, t);
-        // Also parse from a full URL.
-        let url = t.to_url("join.example");
-        assert_eq!(BootstrapTicket::from_fragment(&url).unwrap(), t);
+    fn rdr_metadata_name_sits_beside_the_context() {
+        let ctx = SignedTrustContext::hierarchical(n("/home/bob")).with_version(3);
+        let meta = rdr_metadata_name(ctx.namespace());
+        let rdr = ctx.rdr_name();
+        // Same `/<ns>/32=trust-context` stem; versioned name vs metadata keyword.
+        assert_eq!(meta.len(), rdr.len());
+        assert_eq!(
+            meta.components()[..meta.len() - 1],
+            rdr.components()[..rdr.len() - 1]
+        );
     }
 
     #[test]

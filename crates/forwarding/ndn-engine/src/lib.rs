@@ -14,10 +14,8 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![allow(missing_docs)]
 
-// `EngineBuilder` pulls `SecurityProfile` / `TrustSchema` / `CertCache` from
-// `ndn-security`, which doesn't build for wasm32 (ring + libsqlite3-sys).
-// `WasmEngineBuilder` is the wasm-side analog with `ValidationStage` stubbed
-// permissively.
+// `EngineBuilder` is native-only; `WasmEngineBuilder` is the wasm-side analog
+// with `ValidationStage` defaulting to permissive.
 pub mod activity;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod builder;

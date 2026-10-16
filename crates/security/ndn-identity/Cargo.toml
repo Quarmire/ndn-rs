@@ -1,6 +1,6 @@
 [package]
 name = "ndn-identity"
-description = "NDN identity management: NdnIdentity lifecycle, NDNCERT enrollment, fleet zero-touch provisioning"
+description = "NDN identity management: Identity lifecycle, NDNCERT enrollment, fleet zero-touch provisioning"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,7 +13,6 @@ classification = "spec"
 portable-atomic = { workspace = true }
 ndn-packet   = { workspace = true, features = ["std"] }
 ndn-security = { workspace = true, features = ["custodian"] }
-ndn-tlv      = { workspace = true }
 ndn-cert     = { workspace = true }
 ndn-app      = { workspace = true }
 ndn-sync     = { workspace = true }
@@ -27,7 +26,6 @@ tokio        = { workspace = true, features = ["sync", "time", "rt"] }
 tokio-util   = { workspace = true }
 tracing      = { workspace = true }
 async-trait  = { workspace = true }
-sha2         = { workspace = true }
 dashmap      = { workspace = true }
 
 [dev-dependencies]

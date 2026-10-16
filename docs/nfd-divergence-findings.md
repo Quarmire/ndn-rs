@@ -131,9 +131,11 @@ NFD `Forwarder::onIncomingData` is synchronous and straight through: tag ->
 signature verification anywhere.**
 
 ndn-rs `data_pipeline` awaits `validation.process()` and `try_self_learn()`
-before `cs_insert`. On `ValidationResult::Pending` the validation stage spawns
-a cert fetch, PARKS the Data in a pending queue and returns `Drop` — a
-stall-and-burst generator on the forwarding hot path.
+before `cs_insert`. Validation there is cache-only; on `ValidationResult::Pending`
+the validation stage spawns a background cert fetch (when an engine-backed
+`CertFetcher` is attached, see `ndn_app::install_engine_cert_fetcher`), PARKS the
+Data in a pending queue and returns `Drop`; the drain task releases it once the
+cert lands — a stall-and-burst generator on the forwarding hot path.
 
 Inert on this fleet only because the config sets `[security] profile =
 "disabled"`. Anyone arming the validator on a lossy link should expect this

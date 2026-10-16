@@ -6,7 +6,8 @@ NDNCERT — NDN Certificate Management Protocol. Implements automated certificat
 
 | Type / Trait | Role |
 |---|---|
-| `EnrollmentSession` | Client-side NDNCERT session: INFO → PROBE → NEW → CHALLENGE flow |
+| `client::enroll` / `CaExchange` | The one client driver: NEW → CHALLENGE rounds over any `CaExchange` transport (Interest wire in, Data out); `client::fetch_issued_cert` fetches the result |
+| `EnrollmentSession` | Client-side NDNCERT state machine the driver runs |
 | `CaConfig` / `CaState` | CA configuration and runtime state |
 | `ChallengeHandler` | Trait for implementing custom challenge methods |
 | `PinChallenge` | Built-in PIN-based challenge |
@@ -24,10 +25,14 @@ NDNCERT — NDN Certificate Management Protocol. Implements automated certificat
 ## Usage
 
 ```rust
-use ndn_cert::EnrollmentSession;
+use ndn_cert::client::{enroll, fetch_issued_cert};
 
-let session = EnrollmentSession::new(ca_prefix, key_pair);
-let cert = session.run(&mut consumer, challenge_response_fn).await?;
+// `exchange: impl CaExchange` — e.g. `ndn_identity::NdncertClient` over a Consumer.
+let cert_name = enroll(&mut exchange, &ca_prefix, signer, 86_400, "token", |_round| {
+    std::future::ready(Ok(params.take()))  // `None` stops after round 0
+})
+.await?;
+let cert_data = fetch_issued_cert(&mut exchange, &cert_name).await?;
 ```
 
 Part of the [ndn-rs](../../README.md) workspace.

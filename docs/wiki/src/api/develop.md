@@ -30,7 +30,7 @@ graph LR
     A[Application] -->|imports| U(ndn umbrella)
     U --> P[Consumer / Producer / Responder]
     U --> S[Subscriber / Queryable / Query]
-    U --> K[KeyChain / SigningInfo / TrustPolicy]
+    U --> K[KeyChain / SigningInfo / Validator]
     U --> T[Connection / IpcConnection / InProcConnection]
     U --> X[Name / Interest / Data / *Builder]
 ```
@@ -44,7 +44,7 @@ graph LR
 | `Queryable`, `Query` | `ndn_app::queryable` | Request/reply primitive (one Interest → one Data). |
 | `KeyChain` | `ndn_security::KeyChain` | Identity / key / cert management; entry point for signing. |
 | `SigningInfo`, `SignerSelection` | `ndn_security::{SigningInfo, SignerSelection}` | "Sign me with X" descriptor. |
-| `ValidationPolicy`, `TrustPolicy` | `ndn_security::{ValidationPolicy, TrustPolicy}` | Trust-decision contracts. |
+| `Validator`, `TrustSchema` | `ndn_security::{Validator, TrustSchema}` | Trust policy (`TrustSchema`) and its enforcer (`Validator`). |
 | `Connection`, `IpcConnection`, `InProcConnection` | `ndn_app::*` | Trait + concrete connections; unifies external forwarder and embedded engine. |
 | `Name`, `NameComponent`, `Interest`, `Data`, `NackReason` | `ndn_packet::*` | Decoded packets. |
 | `InterestBuilder`, `DataBuilder` | `ndn_packet::encode::*` | Builder-style packet construction. |
@@ -77,8 +77,9 @@ println!("got {} bytes", data.content().len());
   (The old `fetch_object_*` methods are deprecated in favour of this builder.)
 - `fetch_on(face_id, name)` pins the Interest to a face via
   `NextHopFaceId` — useful for measurement or multipath tests.
-- The Consumer applies the configured `ValidationPolicy` to every
-  returned `Data` before handing it back.
+- `verifying(validator)` turns the Consumer into a `VerifiedConsumer`
+  that validates every returned `Data` against the `Validator`'s
+  `TrustSchema` and returns `SafeData`.
 
 ## Producer
 
@@ -197,14 +198,14 @@ let wire = keychain.sign_data(DataBuilder::new("/alice/notes/1", b"hi"))?;
 # Ok(()) }
 ```
 
-Persistence backends: SQLite-backed PIB on native targets; IndexedDB
-PIB on wasm32. See [Identity and keys](../concepts/identity-and-keys.md).
+Persistence backends: file-backed PIB (`FilePib`) on native targets;
+IndexedDB PIB on wasm32. See [Identity and keys](../concepts/identity-and-keys.md).
 
 ## Wasm target
 
 The umbrella compiles for `wasm32-unknown-unknown` but exports a
 smaller surface: `Name`, `Interest`, `Data`, `InterestBuilder`,
-`DataBuilder`, `SigningInfo`, `TrustPolicy`. `Consumer`, `Producer`,
+`DataBuilder`, `SigningInfo`, `Validator`, `TrustSchema`. `Consumer`, `Producer`,
 `KeyChain`, and the connection types stay native-only because
 `ndn-app` pulls the full Tokio runtime.
 

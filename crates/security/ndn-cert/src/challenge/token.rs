@@ -5,20 +5,25 @@
 //! radius (see `trust-context-model-2026-05-25.md` §6):
 //!
 //! - **Single-use** — [`consume`](TokenStore::consume) removes on success, so a
-//!   redeemed token is inert.
+//!   redeemed token is inert. A store built with
+//!   [`with_store`](TokenStore::with_store) also records each redemption (as a
+//!   hash) in the CA's [`CaStore`] before approving it, and drops tokens
+//!   recorded there when they are added again, so a token stays spent across
+//!   CA restarts even while it is still listed in the configuration.
 //! - **TTL** — an expired token is rejected (and reaped) at challenge time.
 //! - **Name scope** — a token authorizes a cert only under a constrained name
 //!   prefix; a request for a name outside the scope is rejected.
 
 use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use ndn_packet::Name;
 
 use crate::{
     challenge::{ChallengeHandler, ChallengeOutcome, ChallengeState},
     error::CertError,
     protocol::CertRequest,
+    store::CaStore,
 };
 
 /// Bounds attached to a minted token.
@@ -42,11 +47,29 @@ pub enum TokenCheck {
     /// The requested name is not under the token's scope (boxed: a `Name` is
     /// much larger than the other variants).
     OutOfScope(Box<Name>),
+    /// Valid, but the redemption could not be persisted; the token was not
+    /// consumed (fail closed: an unrecorded redemption would be reusable
+    /// after a restart).
+    NotRecorded(String),
 }
 
 #[derive(Default, Clone)]
 pub struct TokenStore {
     tokens: Arc<DashMap<String, TokenMeta>>,
+    /// Hashes ([`token_hash`]) of redeemed tokens; tracked only with `persist`.
+    redeemed: Arc<DashSet<String>>,
+    /// Durable record of redemptions; `None` keeps them in memory only.
+    persist: Option<Arc<dyn CaStore>>,
+}
+
+/// What a redemption is persisted as: hex SHA-256 over the domain-separated
+/// token, so the store never holds a usable token.
+fn token_hash(token: &str) -> String {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    h.update(b"ndncert-token-redemption/v1\0");
+    h.update(token.as_bytes());
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn now_ns() -> u64 {
@@ -62,9 +85,24 @@ impl TokenStore {
         Self::default()
     }
 
+    /// A store whose redemptions persist in `store`: the tokens it recorded
+    /// as redeemed (in an earlier run) are refused when added, and every new
+    /// redemption is recorded before it is approved.
+    pub fn with_store(store: Arc<dyn CaStore>) -> Result<Self, CertError> {
+        let redeemed = DashSet::new();
+        for hash in store.redeemed_tokens()? {
+            redeemed.insert(hash);
+        }
+        Ok(Self {
+            tokens: Arc::default(),
+            redeemed: Arc::new(redeemed),
+            persist: Some(store),
+        })
+    }
+
     /// Add an unbounded token (no TTL, no scope) — back-compat.
     pub fn add(&self, token: impl Into<String>) {
-        self.tokens.insert(token.into(), TokenMeta::default());
+        self.insert(token.into(), TokenMeta::default());
     }
 
     pub fn add_many(&self, tokens: impl IntoIterator<Item = impl Into<String>>) {
@@ -76,13 +114,21 @@ impl TokenStore {
     /// Mint a token bounded by an optional TTL and/or name scope.
     pub fn add_scoped(&self, token: impl Into<String>, ttl: Option<Duration>, scope: Option<Name>) {
         let expires_at_ns = ttl.map(|d| now_ns().saturating_add(d.as_nanos() as u64));
-        self.tokens.insert(
+        self.insert(
             token.into(),
             TokenMeta {
                 expires_at_ns,
                 scope,
             },
         );
+    }
+
+    fn insert(&self, token: String, meta: TokenMeta) {
+        if !self.redeemed.is_empty() && self.redeemed.contains(&token_hash(&token)) {
+            tracing::debug!("token challenge: skipping a token that was already redeemed");
+            return;
+        }
+        self.tokens.insert(token, meta);
     }
 
     /// Single-use consume with no scope check. Expired tokens are reaped and
@@ -114,7 +160,20 @@ impl TokenStore {
                 return TokenCheck::OutOfScope(Box::new(scope.clone()));
             }
         }
-        self.tokens.remove(token);
+        // Claim the token atomically: of two concurrent redemptions only one
+        // removes it.
+        let Some((token_owned, meta)) = self.tokens.remove(token) else {
+            return TokenCheck::NotFound;
+        };
+        if let Some(store) = &self.persist {
+            let hash = token_hash(token);
+            if let Err(e) = store.record_redeemed_token(&hash) {
+                tracing::error!(error = %e, "token challenge: could not persist redemption");
+                self.tokens.insert(token_owned, meta);
+                return TokenCheck::NotRecorded(e.to_string());
+            }
+            self.redeemed.insert(hash);
+        }
         TokenCheck::Ok
     }
 
@@ -194,6 +253,9 @@ impl ChallengeHandler for TokenChallenge {
                 ))),
                 TokenCheck::NotFound => Ok(ChallengeOutcome::Denied(
                     "invalid or already-redeemed token".to_string(),
+                )),
+                TokenCheck::NotRecorded(_) => Ok(ChallengeOutcome::Denied(
+                    "the CA could not record the token redemption; try again".to_string(),
                 )),
             }
         })
