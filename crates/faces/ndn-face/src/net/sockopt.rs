@@ -71,6 +71,53 @@ pub fn bind_reuseport_udp(addr: std::net::SocketAddr) -> std::io::Result<std::ne
     Ok(sock)
 }
 
+/// Bind the first socket of a UDP listener, claiming `addr`'s port for this
+/// process, then let this process's own sockets join it.
+///
+/// The bind is plain (neither `SO_REUSEADDR` nor `SO_REUSEPORT`), so it fails
+/// with `AddrInUse` while any other socket holds the port — in particular
+/// another forwarder's listener. Only once the port is ours is `SO_REUSEPORT`
+/// set on the bound socket: the kernel checks the *existing* socket's flag
+/// when a later socket binds, so the listener's extra RX sockets
+/// ([`bind_reuseport_udp`]) and the forwarder's peer faces
+/// (`ConnectedPort::Listener`) can then share the port.
+///
+/// Binding with `SO_REUSEPORT` from the start would let a second forwarder of
+/// the same user join the same reuse group without error, and the kernel
+/// would split inbound datagrams between the two. Probing with a plain bind
+/// and then binding shared leaves a window in which two forwarders starting
+/// together both pass the probe; here the claim *is* the listener socket, so
+/// of two concurrent claims exactly one succeeds. Every other socket on the
+/// port joins through this one.
+pub fn bind_listener_udp(addr: std::net::SocketAddr) -> std::io::Result<std::net::UdpSocket> {
+    // std's UDP bind sets no reuse option on any platform.
+    let sock = std::net::UdpSocket::bind(addr)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let one: libc::c_int = 1;
+        // SAFETY: the fd is live for the call; &one is a valid c_int buffer.
+        let rc = unsafe {
+            libc::setsockopt(
+                sock.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_REUSEPORT,
+                std::ptr::addr_of!(one).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if rc != 0 {
+            tracing::warn!(
+                target: "face.udp", addr = %addr, error = %std::io::Error::last_os_error(),
+                "udp-listener: SO_REUSEPORT unavailable; peer faces and extra RX sockets \
+                 cannot share this port"
+            );
+        }
+    }
+    tune_datagram_socket(&sock, "udp-listener");
+    Ok(sock)
+}
+
 /// Render a `SocketAddr` into a `sockaddr_storage` + valid length (v4/v6).
 #[cfg(unix)]
 pub(crate) fn sockaddr_to_storage(

@@ -40,6 +40,13 @@ bind = "0.0.0.0:6363"
 # remote = "10.0.0.1:6363"  # optional: point-to-point only
 ```
 
+A face with `remote` is connected to that peer. Its local port is the `bind`
+port when given; otherwise the port of this forwarder's own UDP listener when
+it has one (datagrams then leave from the port the peer knows, so the peer
+keeps one face for us); otherwise an ephemeral port. Only a listener's port is
+shared; any other port is bound exclusively, so two forwarders on one host each
+dialing the same hub get separate source addresses and their own replies.
+
 TLS faces — **WebTransport** (browser↔forwarder and NAT-traversing
 forwarder↔forwarder over QUIC datagrams) and **QUIC** (native router-to-router
 backbone, TLS 1.3 with connection migration) — share one listener `cert_source`

@@ -23,6 +23,23 @@ const UDP_HARD_MAX: u64 = 65507;
 /// are silently truncate-dropped on receipt.
 const UDP_RECV_BUF: usize = 9000;
 
+/// The local port a [`UdpFace::bind_connected`] face binds, and whether it is
+/// shared.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnectedPort {
+    /// The port this forwarder's own UDP listener holds. Bound with
+    /// `SO_REUSEADDR`/`SO_REUSEPORT` beside the listener, so the face's
+    /// datagrams leave from the listener's port (the symmetric source port).
+    /// The listener claimed that port with a plain bind
+    /// ([`bind_listener_udp`](super::sockopt::bind_listener_udp)), so the
+    /// sockets sharing it are this forwarder's alone.
+    Listener(u16),
+    /// A port no listener of ours holds, bound without reuse options so the
+    /// kernel refuses that address to every other socket. `0` picks an
+    /// ephemeral port.
+    Exclusive(u16),
+}
+
 /// NDN transport over unicast UDP.
 ///
 /// Uses an unconnected socket with `send_to` / `recv_from`: on macOS and some
@@ -93,25 +110,33 @@ impl UdpFace {
         }
     }
 
-    /// Share an existing socket (e.g. the UDP listener socket) so replies go
-    /// out from the same port; `recv` filters by `peer` address.
-    /// Bind to `local_port` on the interface that routes to `peer`, with
-    /// `SO_REUSEADDR`/`SO_REUSEPORT` so it can share the port with the
-    /// listener, and `connect()` to `peer`.
+    /// Bind on the interface that routes to `peer` and `connect()` to `peer`.
+    /// With [`ConnectedPort::Listener`] the socket shares the listener's port
+    /// (`SO_REUSEADDR`/`SO_REUSEPORT`); with [`ConnectedPort::Exclusive`] it
+    /// owns its port.
     ///
-    /// Two properties follow, and both are needed to keep ONE face per
-    /// neighbour:
+    /// Sharing the listener's port gives two properties, and both are needed
+    /// to keep ONE face per neighbour:
     ///
-    /// * **Symmetric source port.** Datagrams leave from `local_port` (6363),
-    ///   so the peer recognises them as coming from the face it already has
-    ///   instead of minting an on-demand face for an ephemeral port. A peer
-    ///   split across two faces defeats `nexthops_excluding(in_face)`, and
-    ///   Interests get forwarded back to their origin — measured as 12 wire
-    ///   copies per Interest against NFD's 9.
+    /// * **Symmetric source port.** Datagrams leave from the listener's port
+    ///   (6363), so the peer recognises them as coming from the face it
+    ///   already has instead of minting an on-demand face for an ephemeral
+    ///   port. A peer split across two faces defeats
+    ///   `nexthops_excluding(in_face)`, and Interests get forwarded back to
+    ///   their origin — measured as 12 wire copies per Interest against
+    ///   NFD's 9.
     /// * **4-tuple delivery.** A connected socket outscores the wildcard
     ///   listener bound to the same port, so this peer's datagrams arrive
     ///   here. Verified on the target platform: with both sockets bound to one
     ///   port, the peer's datagram was delivered to the connected socket.
+    ///
+    /// Sharing is only ever with our own listener. `SO_REUSEPORT` admits any
+    /// socket of the same user, so a shared port that no listener of ours
+    /// holds lets a second forwarder on the host bind the same address,
+    /// connect to the same peer and get the same 4-tuple: the peer sees one
+    /// source, and the kernel hands every reply to one of the two sockets
+    /// while the other face never hears back (two forwarders on 127.0.0.1
+    /// dialing one hub). An exclusive port cannot be bound twice.
     ///
     /// `connect()` was previously avoided over a claim that a connected UDP
     /// socket wedges permanently in `EPIPE` after an ICMP port-unreachable.
@@ -121,21 +146,28 @@ impl UdpFace {
     /// face, so a neighbour restarting its forwarder no longer costs a route.
     #[cfg(unix)]
     pub async fn bind_connected(
-        local_port: u16,
+        local_port: ConnectedPort,
         peer: SocketAddr,
         id: FaceId,
     ) -> std::io::Result<Self> {
         // Bind the specific local address that routes to `peer`: a wildcard
         // bind would collide with the listener rather than sit beside it.
-        let local = resolve_local_addr(peer, local_port)?;
-        let std_sock = super::sockopt::bind_reuseport_udp(local)?;
+        let std_sock = match local_port {
+            ConnectedPort::Listener(port) => {
+                super::sockopt::bind_reuseport_udp(resolve_local_addr(peer, port)?)?
+            }
+            ConnectedPort::Exclusive(port) => {
+                std::net::UdpSocket::bind(resolve_local_addr(peer, port)?)?
+            }
+        };
+        let local = std_sock.local_addr()?;
         std_sock.set_nonblocking(true)?;
         let socket = UdpSocket::from_std(std_sock)?;
         socket.connect(peer).await?;
         super::sockopt::tune_datagram_socket(&socket, "udp");
         trace!(
-            target: "face.udp", face=%id, local=%local, peer=%peer,
-            "udp: bound connected face (symmetric port)"
+            target: "face.udp", face=%id, local=%local, peer=%peer, port=?local_port,
+            "udp: bound connected face"
         );
         Ok(Self {
             id,
@@ -149,6 +181,8 @@ impl UdpFace {
         })
     }
 
+    /// Share an existing socket (e.g. the UDP listener socket) so replies go
+    /// out from the same port; `recv` filters by `peer` address.
     pub fn from_shared_socket(id: FaceId, socket: Arc<UdpSocket>, peer: SocketAddr) -> Self {
         Self {
             id,
@@ -409,6 +443,73 @@ mod tests {
             tuned >= baseline,
             "tuned recv buffer {tuned} smaller than untuned {baseline}"
         );
+    }
+
+    /// An exclusive port is the face's alone: no second socket binds it, with
+    /// `SO_REUSEPORT` or without.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exclusive_port_is_never_shared() {
+        let hub = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let hub_addr = hub.local_addr().unwrap();
+        let face = UdpFace::bind_connected(ConnectedPort::Exclusive(0), hub_addr, FaceId(1))
+            .await
+            .unwrap();
+        let local = face.socket.local_addr().unwrap();
+
+        let again =
+            UdpFace::bind_connected(ConnectedPort::Exclusive(local.port()), hub_addr, FaceId(2))
+                .await;
+        assert_eq!(
+            again.err().map(|e| e.kind()),
+            Some(std::io::ErrorKind::AddrInUse)
+        );
+        let shared =
+            UdpFace::bind_connected(ConnectedPort::Listener(local.port()), hub_addr, FaceId(3))
+                .await;
+        assert_eq!(
+            shared.err().map(|e| e.kind()),
+            Some(std::io::ErrorKind::AddrInUse)
+        );
+    }
+
+    /// A listener's port belongs to that listener: a second listener (another
+    /// forwarder) is refused on any address of the port, while the first
+    /// listener's own extra RX sockets and peer faces share it. Binding the
+    /// listener with `SO_REUSEPORT` up front let the second one join the
+    /// same reuse group, and the kernel split inbound datagrams between them.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_listener_port_is_shared_only_with_its_own_sockets() {
+        use super::super::sockopt::{bind_listener_udp, bind_reuseport_udp};
+        let refused = |addr: String| {
+            let r = bind_listener_udp(addr.parse().unwrap());
+            assert_eq!(
+                r.err().map(|e| e.kind()),
+                Some(std::io::ErrorKind::AddrInUse),
+                "a second listener bound {addr}"
+            );
+        };
+
+        let listener = bind_listener_udp("0.0.0.0:0".parse().unwrap()).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        refused(format!("0.0.0.0:{port}"));
+        refused(format!("127.0.0.1:{port}"));
+
+        let _rx = bind_reuseport_udp(format!("0.0.0.0:{port}").parse().unwrap())
+            .expect("the listener's extra RX socket shares its port");
+        let hub = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let face = UdpFace::bind_connected(
+            ConnectedPort::Listener(port),
+            hub.local_addr().unwrap(),
+            FaceId(1),
+        )
+        .await
+        .expect("the listener's peer face shares its port");
+        assert_eq!(face.socket.local_addr().unwrap().port(), port);
+
+        refused(format!("0.0.0.0:{port}"));
+        refused(format!("127.0.0.1:{port}"));
     }
 
     /// Exercises the `recvmmsg` batch path end-to-end: send more datagrams than

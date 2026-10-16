@@ -36,7 +36,10 @@ pub mod listeners;
 #[cfg(all(unix, not(target_arch = "wasm32")))]
 pub use listeners::mount_app_face_from_fd;
 #[cfg(not(target_arch = "wasm32"))]
-pub use listeners::{run_face_listener, run_face_listener_as, run_tcp_listener, run_udp_listener};
+pub use listeners::{
+    UdpListener, bind_udp_listener, run_face_listener, run_face_listener_as, run_tcp_listener,
+    run_udp_listener,
+};
 #[cfg(not(target_arch = "wasm32"))]
 pub use modules::MgmtAccessPolicy;
 #[cfg(not(target_arch = "wasm32"))]

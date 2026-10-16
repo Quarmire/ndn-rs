@@ -1008,3 +1008,20 @@ the return-to-origin forwarding possible.
   `morse_spi_probe failed`, so this may be hardware rather than forwarding.
 * Nacks are fleet-wide (12-84 per face) on every node including healthy ones,
   so they are not the cause of the above.
+
+### 16.5 Share the port only with our own listener
+
+Peer faces bound `:6363` with `SO_REUSEPORT` whether or not their forwarder
+listened there. `SO_REUSEPORT` admits any socket of the same user, so two
+forwarders on one host, each with only `[[face]] remote = <hub>`, both bound
+`127.0.0.1:6363` and connected to the hub: one 4-tuple, one on-demand face on
+the hub, and the kernel delivered every reply to one of them. The other's
+Interests were answered into the void (hub face `in: interests=7, out:
+data=7`; device A `out: interests=1, in: data=0`; device B `in: data=7` for 6
+Interests).
+
+Now a peer face shares the port of its own forwarder's UDP listener (the
+symmetric port above, unchanged for nodes that listen); without a listener it
+binds an ephemeral port, and a `bind` port no listener holds is bound
+exclusively. Regression test: `face_setup::tests::two_forwarders_on_one_ip_each_get_their_replies`
+in ndn-fwd.
