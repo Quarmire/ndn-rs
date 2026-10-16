@@ -6,7 +6,7 @@
 //! partitioned runtime must reach the identical observable outcome as the
 //! shared runtime — proving the decode-in-RX → worker → `forward_decoded` seam
 //! introduces no semantic change. See
-//! `.claude/notes/partitioned-fwd-design-2026-05-24.md`.
+//! `docs/wiki/src/inside/architecture/forwarding-pipeline.md`.
 #![cfg(feature = "partitioned-fwd")]
 
 use std::time::Duration;

@@ -11,7 +11,7 @@
 //! `0x0410–0x041F`, see [`tlv`]). The schema travels as stock LightVerSec
 //! binary for cross-implementation interop; native ndn-rs text rules are a
 //! local authoring convenience. See
-//! `.claude/notes/trust-context/trust-context-model-2026-05-25.md` §15–§16.
+//! `docs/wiki/src/reference/trust-policies.md`.
 
 pub mod tlv;
 

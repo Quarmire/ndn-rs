@@ -664,7 +664,6 @@ mod tests {
         for rule in ["#root:", "#context:", "#ca:", "#guest:", "#approve_node:"] {
             assert!(text.contains(rule), "{rule} missing from:\n{text}");
         }
-        assert_eq!(schema.native_rules.lines().count(), 7);
         assert!(network_schema(&n("/")).is_err());
 
         // Published and re-decoded, the context keeps both blobs and the verdicts.

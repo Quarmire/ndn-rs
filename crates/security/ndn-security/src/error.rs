@@ -14,6 +14,14 @@ pub enum TrustError {
     ChainCycle { name: String },
     #[error("name does not match trust schema")]
     SchemaMismatch,
+    /// A certificate hop the authoritative schema refuses: `issuer` may not
+    /// certify `cert` under the governing trust context.
+    #[error(
+        "certificate {cert} is not authorized by its issuer {issuer} under the trust schema \
+         (see why with `ndn-fwd schema explain {cert} {issuer}`; re-enroll the key with the \
+         CA the schema names)"
+    )]
+    CertNotAuthorized { cert: String, issuer: String },
     #[error("key store error: {0}")]
     KeyStore(String),
     #[error("unsupported signature type: {name} (code {code})")]

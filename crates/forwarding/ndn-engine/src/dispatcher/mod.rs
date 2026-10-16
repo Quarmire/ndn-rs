@@ -52,7 +52,7 @@ pub(crate) struct InboundPacket {
 /// decode-in-RX + per-worker forwarding model (`partitioned-fwd` feature; the
 /// variant is always present so config round-trips even in a build without the
 /// feature, where it falls back to `Shared`). See
-/// `.claude/notes/partitioned-fwd-design-2026-05-24.md`.
+/// `docs/wiki/src/inside/architecture/forwarding-pipeline.md`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum DataPlane {
     #[default]

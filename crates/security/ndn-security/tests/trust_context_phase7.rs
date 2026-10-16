@@ -1,7 +1,6 @@
 //! Phase 7 witnesses: context lifecycle — loosen (no re-touch), tighten
 //! dry-run, cross-signed anchor rotation, and issuing-CA-compromise recovery
-//! by pull. See `.claude/notes/trust-context/trust-context-model-2026-05-25.md`
-//! §8.
+//! by pull. See `docs/wiki/src/reference/trust-policies.md`.
 
 use std::sync::Arc;
 

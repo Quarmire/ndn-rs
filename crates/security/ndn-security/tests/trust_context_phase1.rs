@@ -1,7 +1,7 @@
 //! Phase 1 witnesses for the SignedTrustContext keyring model.
 //!
 //! Backs `testbed/tests/audit/ctx02a_*.sh` and `ctx02b_*.sh`. See
-//! `.claude/notes/trust-context/trust-context-model-2026-05-25.md` §15–§16.
+//! `docs/wiki/src/reference/trust-policies.md`.
 //!
 //! These exercise per-namespace validation dispatch (a node holding several
 //! trust contexts validates each packet only against the context selected by

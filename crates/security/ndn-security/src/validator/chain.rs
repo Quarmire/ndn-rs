@@ -300,7 +300,10 @@ impl Validator {
             // validation does: e.g. a device key is accepted only when the CA
             // certified it, not when another device self-issued it.
             if ctx.schema_is_authoritative() && !ctx.authorizes(&cert.name, issuer) {
-                return WalkOutcome::Invalid(TrustError::SchemaMismatch);
+                return WalkOutcome::Invalid(TrustError::CertNotAuthorized {
+                    cert: cert.name.to_string(),
+                    issuer: issuer.to_string(),
+                });
             }
             let Some(sr) = &cert.signed_region else {
                 return WalkOutcome::Invalid(TrustError::CertNotFound {

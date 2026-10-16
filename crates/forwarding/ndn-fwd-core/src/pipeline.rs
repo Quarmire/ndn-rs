@@ -12,7 +12,7 @@
 //! the native engine's pipeline stages and the embedded forwarder's inline
 //! path. Storage abstraction (a `PitStore`/`FibStore` the core could mutate
 //! directly) and Data-path decisions are the next bricks; see
-//! `.claude/notes/embedded-ndn-modular-build-2026-05-22.md` § 2.
+//! `docs/wiki/src/inside/architecture/sans-io-and-no-std.md`.
 
 /// Why the forwarder declined to forward a packet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

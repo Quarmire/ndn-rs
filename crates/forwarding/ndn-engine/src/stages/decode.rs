@@ -160,7 +160,7 @@ impl TlvDecodeStage {
     /// decode through here so they behave identically — the dispatcher pipeline
     /// via `decode_resolved` (it runs the fast-path itself for batch/spawn
     /// shaping), the partitioned-forwarding RX path via this one-shot form (see
-    /// `.claude/notes/partitioned-fwd-design-2026-05-24.md`).
+    /// `docs/wiki/src/inside/architecture/forwarding-pipeline.md`).
     pub fn decode_inbound(
         &self,
         raw: Bytes,

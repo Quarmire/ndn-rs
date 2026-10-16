@@ -12,7 +12,7 @@
 //! signature must verify under the anchor whose fingerprint was pinned out of
 //! band (TOFU), so neither a flooded fake advert nor a tampered context (e.g. a
 //! weakened schema riding a genuine anchor) can poison a keyring. See
-//! `.claude/notes/trust-context/trust-context-model-2026-05-25.md` §3–§7, §16.
+//! `docs/wiki/src/reference/trust-policies.md`.
 
 use std::sync::Arc;
 

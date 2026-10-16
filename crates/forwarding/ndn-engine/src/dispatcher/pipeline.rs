@@ -158,7 +158,7 @@ impl PacketDispatcher {
     /// `process_packet_inner` so the shared runtime (decode + forward in one
     /// task) and the partitioned runtime (decode in the RX front-end, forward
     /// in a worker) run the identical forwarding path. See
-    /// `.claude/notes/partitioned-fwd-design-2026-05-24.md`.
+    /// `docs/wiki/src/inside/architecture/forwarding-pipeline.md`.
     pub(crate) async fn forward_decoded(&self, ctx: PacketContext, meta: InboundMeta) {
         if let Some(ref name) = ctx.name {
             tracing::Span::current().record("name", name.to_string());

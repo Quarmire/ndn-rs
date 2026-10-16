@@ -7,8 +7,15 @@
 //!
 //! Files hold exactly the Data that was verified on adoption. Loading
 //! ([`load_persisted_contexts`]) re-verifies each file's signature against the
-//! anchors it carries and refuses a file stored under another namespace's
-//! name, so an edited or swapped file never reaches the keyring.
+//! anchors that same file carries and refuses a file stored under another
+//! namespace's name. That catches corruption and misfiling (a truncated or
+//! bit-flipped file, a context copied under the wrong name); it does not stop
+//! a deliberate edit, which can re-sign the context under a substituted
+//! anchor of the same namespace. Tamper resistance against local writers is
+//! out of this store's reach: write access to the PIB directory already
+//! controls the node (its keys live there), and any pin stored beside the
+//! file — e.g. the adopted anchor's fingerprint — could be rewritten by the
+//! same writer.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

@@ -167,8 +167,10 @@ Invite tokens carry their role: `ndn-fwd-tokens new --ca /home/bob --namespace
 /home/bob --role member|guest` (default `member`) mints `member-<hex>` /
 `guest-<hex>`, and the CA scopes such a token to `/<ns>/<role>`, so it cannot
 certify another role. `--role admin` (and `node`) is refused: those
-certificates need an admin's device approval. Tokens without a role prefix stay
-unscoped (members only, under `RolePolicy`).
+certificates need an admin's device approval, and a hub CA refuses to start
+with an `admin-…` or `node-…` token in its config. Tokens without a role
+prefix are scoped to `/<ns>/member`. Because every token is scoped, a request
+for a name the token cannot certify is refused before the token is spent.
 
 A CA with no challenge refuses to start; `kind = "nop"` (auto-approve) must be
 listed explicitly. `ephemeral = true` replaces the PIB identity with a

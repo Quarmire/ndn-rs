@@ -11,8 +11,7 @@
 //! carry roles: `/<ns>/<role>/<device>` (`docs/specs/personal-network-pairing.md`
 //! §2, §4). [`init_hub_in_pib`] is the persistent form `ndn-fwd init --profile
 //! hub` runs: root key, CA identity, the primary device's admin identity and
-//! the signed context all land in the node's PIB. See
-//! `.claude/notes/trust-context/trust-context-model-2026-05-25.md` §9, §16.
+//! the signed context all land in the node's PIB (same document, §6).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

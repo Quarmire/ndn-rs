@@ -880,7 +880,7 @@ impl ForwarderEngine {
     /// malicious/buggy local app cannot inject forged Data into the shared CS
     /// or satisfy another app's Interests. Fail-closed: with no validator
     /// configured, Data on a required-validation face is dropped. See
-    /// `data_pipeline` and `.claude/notes/partitioned-fwd-design-2026-05-24.md`.
+    /// `data_pipeline`.
     pub fn set_require_data_validation(&self, face_id: FaceId, enabled: bool) {
         if let Some(state) = self.inner.face_states.get(&face_id) {
             state.set_require_data_validation(enabled);

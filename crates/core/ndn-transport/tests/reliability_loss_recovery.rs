@@ -1,5 +1,4 @@
-//! Stage-1 gate for the reliability consolidation (item 2 of
-//! `.claude/notes/per-face-option-wiring-triage-2026-05-23.md`).
+//! Stage-1 gate for the reliability consolidation.
 //!
 //! Two deterministic, in-process tests that pin the reliability *contract* the
 //! consolidation must satisfy — before any framing/integration change:

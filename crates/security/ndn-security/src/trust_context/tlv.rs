@@ -3,8 +3,7 @@
 //! Provisional block `0x0410–0x041F` in the app-defined range (`>= 0x0400`),
 //! above `ndn-packet`'s `REFLEXIVE_NAME = 0x0402` with `0x0403–0x040F` as
 //! headroom. Not LP (`0x500`), not management (`0xD0`), not NDNCERT
-//! (`0x81–0xAF`). Flagged for a future NDN TLV-registry submission note; see
-//! `.claude/notes/ndn-rs-tlv-allocations-2026-05-20.md`.
+//! (`0x81–0xAF`). Flagged for a future NDN TLV-registry submission.
 //!
 //! # Criticality parity
 //!

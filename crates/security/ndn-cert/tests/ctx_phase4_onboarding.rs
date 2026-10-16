@@ -3,7 +3,7 @@
 //! (tampered / unsigned / mis-pinned contexts are refused).
 //!
 //! Backs `testbed/tests/audit/ctx0{1}_*.sh` and `ctx1{4,5}_*.sh`. See
-//! `.claude/notes/trust-context/trust-context-model-2026-05-25.md` §3–§7, §16.
+//! `docs/wiki/src/reference/trust-policies.md`.
 
 use std::sync::Arc;
 

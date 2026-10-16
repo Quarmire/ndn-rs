@@ -2,7 +2,7 @@
 //! `token AND device-approval` approval gate.
 //!
 //! Backs `testbed/tests/audit/ctx0{3,4,5,6}_*.sh`. See
-//! `.claude/notes/trust-context/trust-context-model-2026-05-25.md` §6.
+//! `docs/specs/personal-network-pairing.md`.
 
 use std::time::Duration;
 

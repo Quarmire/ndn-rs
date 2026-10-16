@@ -8,7 +8,7 @@
 //! true)` opts a local face back into validation; with no validator configured
 //! it fail-closes (drops) rather than serving unvalidated Data.
 //!
-//! See `data_pipeline` and `.claude/notes/partitioned-fwd-design-2026-05-24.md`.
+//! See `data_pipeline`.
 
 use std::time::Duration;
 

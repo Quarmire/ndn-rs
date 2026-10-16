@@ -65,8 +65,7 @@ pub struct PendingApproval {
 /// The transport functions are generic over this trait, so they don't depend on
 /// the concrete ndncert store — other capabilities (capability tokens, the
 /// trust fob) can supply their own sink. This is the seam for a future
-/// `ndn-approve` extraction; see
-/// `.claude/notes/trust-fob-and-cross-device-auth-2026-05-23.md`.
+/// `ndn-approve` extraction.
 pub trait ApprovalSink: Send + Sync {
     /// Requests currently awaiting approval (oldest first).
     fn pending(&self) -> Vec<PendingApproval>;

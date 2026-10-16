@@ -14,7 +14,7 @@
 //! hash, the native PIT a `Name`). This keeps `ndn-fwd-core` dependency-free
 //! (no `ndn-packet`), and because `record_pending` and `satisfy` are handed the
 //! same slice sequence for a given name, their keys agree by construction. See
-//! `.claude/notes/embedded-ndn-modular-build-2026-05-22.md` § 5e.
+//! `docs/wiki/src/inside/architecture/sans-io-and-no-std.md`.
 
 /// FIB query surface: longest-prefix-match.
 pub trait FibStore {

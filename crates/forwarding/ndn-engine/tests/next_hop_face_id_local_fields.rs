@@ -10,8 +10,6 @@
 //! header `Consumer::fetch_on` / NLSR emit). A FIB route for the prefix points
 //! at a *different* face C. The pin must override the FIB **only** once the
 //! ingress face has LocalFields enabled.
-//!
-//! Audit: `.claude/notes/per-face-option-wiring-triage-2026-05-23.md` (item 1).
 
 use std::time::Duration;
 

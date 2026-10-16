@@ -18,7 +18,7 @@
 //!   on the wire so Data/Nack return to the owning partition (needed only once
 //!   PITs are private; short CanBePrefix discovery relies on the tag).
 //!
-//! Design: `.claude/notes/partitioned-fwd-design-2026-05-24.md`.
+//! Design: `docs/wiki/src/inside/architecture/forwarding-pipeline.md`.
 
 use std::sync::Arc;
 

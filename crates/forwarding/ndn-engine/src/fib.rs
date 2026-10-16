@@ -29,8 +29,7 @@ impl FibEntry {
 /// Immutable, lock-free name trie holding the FIB. Reads (LPM on every
 /// Interest) traverse a frozen snapshot with no locks; writes copy-on-write a
 /// fresh trie and atomically swap it in. Mirrors NDN-DPDK's lock-free FIB-read
-/// design (liburcu there; `arc-swap` here) — see
-/// `.claude/notes/high-throughput-forwarding.md` Tier 1.
+/// design (liburcu there; `arc-swap` here).
 #[derive(Clone, Default)]
 struct FibTrie {
     entry: Option<Arc<FibEntry>>,

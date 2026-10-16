@@ -22,7 +22,7 @@
 //! `tracing` spans — instrumentation belongs in the adopting I/O layer, not in
 //! these pure functions. The forwarding *pipeline* state machine
 //! (`ingest(...) -> actions`) is the intended next tenant; see
-//! `.claude/notes/embedded-ndn-modular-build-2026-05-22.md` § 2.
+//! `docs/wiki/src/inside/architecture/sans-io-and-no-std.md`.
 
 #![no_std]
 #![forbid(unsafe_code)]

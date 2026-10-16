@@ -1,8 +1,7 @@
 //! Streaming an RDR object over a persistent subscription (one-Interest-many-Data)
 //! instead of per-segment pull.
 //!
-//! This is the producer half of the "bulk off the seam" design (see
-//! `.claude/notes/vpn/` + the substrate-extension PIT doctrine): a content source
+//! This is the producer half of the "bulk off the seam" design: a content source
 //! (e.g. a keyless leaf app) serves its object's raw segments by **streaming**
 //! them into a subscriber's persistent PIT entry — the same idle-cheap datapath
 //! `ndn-mobile::tun` uses — rather than answering one Interest per segment across

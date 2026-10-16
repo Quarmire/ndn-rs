@@ -15,7 +15,7 @@
 //! implements the matching responder against the same [`RemoteSignRequest`].
 //!
 //! Full design + protocol + security model:
-//! `.claude/notes/remote-fob-design-2026-06-01.md`.
+//! `docs/wiki/src/guides/remote-signer-pairing.md`.
 
 // `CustodianError` is intentionally large (it carries a `Name`); the type
 // already opts out of `large_enum_variant`, so the codec's fallible helpers
