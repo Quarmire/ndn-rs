@@ -75,6 +75,7 @@
 - [Management verbs](./reference/mgmt-verbs.md)
 - [Trust policies](./reference/trust-policies.md)
 - [Trust-context publication (RDR)](./reference/trust-context-publication.md)
+- [Adopting a network (`ndn-fwd adopt`)](./reference/context-adoption.md)
 - [Dashboard extensions](./reference/dashboard-extensions.md)
 - [Spec compliance](./reference/spec-compliance.md)
 

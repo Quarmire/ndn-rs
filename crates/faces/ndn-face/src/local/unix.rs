@@ -17,15 +17,18 @@ pub fn unix_face_from_stream(id: FaceId, stream: UnixStream, path: impl AsRef<Pa
 
 /// Like [`unix_face_from_stream`] but tags the face `FaceKind::Management`
 /// for operator-level trust at the management handler — use for connections
-/// accepted on the NFD management socket.
+/// accepted on the NFD management socket. Carries the stream's peer
+/// credentials so trust-changing verbs can be authorized per caller.
 pub fn unix_management_face_from_stream(
     id: FaceId,
     stream: UnixStream,
     path: impl AsRef<Path>,
 ) -> UnixFace {
     let uri = format!("unix://{}", path.as_ref().display());
+    let creds = super::ipc::unix_peer_credentials(&stream);
     let (r, w) = stream.into_split();
     StreamFace::new(id, FaceKind::Management, None, Some(uri), r, w, TlvCodec)
+        .with_peer_credentials(creds)
 }
 
 pub async fn unix_face_connect(id: FaceId, path: impl AsRef<Path>) -> std::io::Result<UnixFace> {

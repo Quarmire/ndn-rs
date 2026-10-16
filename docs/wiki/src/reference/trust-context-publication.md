@@ -79,8 +79,9 @@ That entry is more specific than a `[demo_ca]` entry `/<ns>`, so both coexist.
 A file that fails verification is logged and not published. The store keeps
 one file — the newest adopted version — per namespace.
 
-The store is read once, at startup: a context adopted while the daemon runs is
-published (and used by its validator) after a restart.
+The store is read at startup. A context the running daemon adopts
+(`ndn-fwd adopt`, see [Adopting a network](./context-adoption.md)) is added to
+the published set at once, replacing an older version of its namespace.
 
 ```toml
 [security]
@@ -102,16 +103,14 @@ ndn-peek --face-socket <hub socket> -m /home/bob/32=trust-context/v=1
 #   name: /home/bob/keyword=trust-context/v=1  sig-type: SignatureEd25519  key: /home/bob/KEY/root
 ```
 
-## Known limit: fetching through a validating forwarder that holds nothing yet
+## Fetching through a validating forwarder that holds nothing yet
 
 A forwarder validates Data arriving on non-local faces. One that holds no
-context for `/<ns>` cannot anchor the root-signed context Data, so it drops it
-(the DigestSha256 metadata passes). Fetching through a forwarder that already
-holds the context, or directly from the publisher's own socket, works. A
-device joining through its own `ndn-fwd` therefore needs that forwarder to
-accept a self-certifying context Data (signed by an anchor it lists) as
-integrity-only, the way it accepts DigestSha256, before the fetch can pass
-through it.
+context for `/<ns>` cannot anchor the root-signed context Data, so on its own
+it drops it (the DigestSha256 metadata passes). While an adoption runs, the
+adopter registers an *expectation* with that forwarder's validator, which then
+admits exactly the context signed by the anchor with the expected fingerprint
+and drops any other — see [Adopting a network](./context-adoption.md).
 
 ## See also
 

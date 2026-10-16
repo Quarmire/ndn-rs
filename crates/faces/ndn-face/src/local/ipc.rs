@@ -12,7 +12,7 @@ use std::io;
 
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use ndn_transport::{FaceId, FaceKind, StreamFace, TlvCodec};
+use ndn_transport::{FaceId, FaceKind, PeerCredentials, StreamFace, TlvCodec};
 
 type DynRead = Box<dyn AsyncRead + Send + Sync + Unpin>;
 type DynWrite = Box<dyn AsyncWrite + Send + Sync + Unpin>;
@@ -21,6 +21,24 @@ pub type IpcFace = StreamFace<DynRead, DynWrite, TlvCodec>;
 
 fn make_face(id: FaceId, kind: FaceKind, uri: String, r: DynRead, w: DynWrite) -> IpcFace {
     StreamFace::new(id, kind, None, Some(uri), r, w, TlvCodec)
+}
+
+/// Kernel-attested credentials of the process at the other end of `stream`
+/// (`SO_PEERCRED` on Linux, `getpeereid`/`LOCAL_PEERCRED` on BSD/macOS).
+/// `None` when the OS refuses the query.
+#[cfg(unix)]
+pub(crate) fn unix_peer_credentials(stream: &tokio::net::UnixStream) -> Option<PeerCredentials> {
+    match stream.peer_cred() {
+        Ok(c) => Some(PeerCredentials {
+            uid: c.uid(),
+            gid: c.gid(),
+            pid: c.pid(),
+        }),
+        Err(e) => {
+            tracing::warn!(error = %e, "could not read peer credentials of local socket");
+            None
+        }
+    }
 }
 
 /// Unix: binds a domain socket at `path`, removing any stale file first;
@@ -37,8 +55,10 @@ impl IpcListener {
         })
     }
 
-    /// Accept a connection as an operator-trusted `FaceKind::Management` face
-    /// (the NFD management socket; trust is gated by `0600` filesystem perms).
+    /// Accept a connection as a `FaceKind::Management` face (the NFD
+    /// management socket). The socket is world-connectable (`0666`, see
+    /// `PlatformListener::bind`) so unprivileged tools work; trust-changing
+    /// commands are gated per connection on the peer's credentials instead.
     pub async fn accept(&self, face_id: FaceId) -> io::Result<IpcFace> {
         self.accept_as(face_id, FaceKind::Management).await
     }
@@ -48,8 +68,8 @@ impl IpcListener {
     /// inherit operator-level management trust (privileged verbs then go
     /// through signed-command auth, not face-kind).
     pub async fn accept_as(&self, face_id: FaceId, kind: FaceKind) -> io::Result<IpcFace> {
-        let (r, w, uri) = self.inner.accept().await?;
-        Ok(make_face(face_id, kind, uri, r, w))
+        let (r, w, uri, creds) = self.inner.accept().await?;
+        Ok(make_face(face_id, kind, uri, r, w).with_peer_credentials(creds))
     }
 
     pub fn cleanup(&self) {
@@ -129,11 +149,12 @@ impl PlatformListener {
         })
     }
 
-    async fn accept(&self) -> io::Result<(DynRead, DynWrite, String)> {
+    async fn accept(&self) -> io::Result<(DynRead, DynWrite, String, Option<PeerCredentials>)> {
         let (stream, _) = self.listener.accept().await?;
+        let creds = unix_peer_credentials(&stream);
         let (r, w) = stream.into_split();
         let uri = format!("unix://{}", self.path);
-        Ok((Box::new(r), Box::new(w), uri))
+        Ok((Box::new(r), Box::new(w), uri, creds))
     }
 
     fn cleanup(&self) {
@@ -177,7 +198,8 @@ impl PlatformListener {
         })
     }
 
-    async fn accept(&self) -> io::Result<(DynRead, DynWrite, String)> {
+    /// Named pipes carry no peer credentials here (`None`).
+    async fn accept(&self) -> io::Result<(DynRead, DynWrite, String, Option<PeerCredentials>)> {
         use std::sync::atomic::Ordering;
         use tokio::net::windows::named_pipe::ServerOptions;
 
@@ -192,7 +214,7 @@ impl PlatformListener {
 
         let (r, w) = tokio::io::split(server);
         let uri = format!("pipe://{}", self.path);
-        Ok((Box::new(r), Box::new(w), uri))
+        Ok((Box::new(r), Box::new(w), uri, None))
     }
 
     fn cleanup(&self) {}

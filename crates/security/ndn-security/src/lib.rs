@@ -78,15 +78,20 @@ pub use signer::{
 };
 pub use signing_info::{SignatureInfoOverrides, SignerSelection, SigningInfo};
 pub use trust_context::{
-    ContextExplanation, EnrollmentHint, SchemaBlob, SchemaFormat, SignedTrustContext,
-    SignedTrustContextError, SigningPair, dryrun_orphans,
+    ContextExplanation, EnrollmentHint, OpenContextError, SchemaBlob, SchemaFormat,
+    SignedTrustContext, SignedTrustContextError, SigningPair, anchor_fingerprint,
+    context_namespace_of, dryrun_orphans,
 };
 pub use trust_schema::{
     NamePattern, PatternComponent, PatternParseError, SchemaGate, SchemaMatch, SchemaRule,
     TrustSchema,
 };
 pub use unverified::{Unverified, VerifyError};
-pub use validator::{InterestValidationOutcome, ValidationResult, Validator};
+pub use validator::{
+    AdmittedContext, ContextExpectation, ExpectContextError, ExpectationOutcome,
+    InterestValidationOutcome,
+    ValidationResult, Validator,
+};
 pub use verifier::{
     Blake3DigestVerifier, Blake3KeyedVerifier, Ed25519Verifier, Verifier, VerifyOutcome,
     ed25519_verify_batch,

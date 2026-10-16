@@ -9,6 +9,7 @@
 //! # Ok(()) }
 //! ```
 
+pub mod adopt;
 pub mod ca;
 pub mod context_sync;
 pub mod delegation;
@@ -25,6 +26,7 @@ pub mod revocation;
 pub mod signed_delegation;
 pub mod transition;
 
+pub use adopt::adopt_anchor_link_via_engine;
 pub use ca::{NdncertCa, NdncertCaBuilder};
 pub use device::{DeviceConfig, FactoryCredential, RenewalPolicy};
 pub use device_approval_net::{

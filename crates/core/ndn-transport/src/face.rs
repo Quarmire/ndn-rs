@@ -4,7 +4,7 @@ use std::time::Duration;
 use thiserror::Error;
 
 use crate::link_service::{LinkService, default_link_service_for_kind};
-use crate::transport::{ErasedTransport, Transport};
+use crate::transport::{ErasedTransport, PeerCredentials, Transport};
 
 /// Format an IP-based FaceUri with the spec-correct family suffix:
 /// `<scheme>4://` for IPv4, `<scheme>6://` for IPv6. NFD rejects the
@@ -446,6 +446,12 @@ impl Face {
 
     pub fn local_uri(&self) -> Option<String> {
         self.transport.local_uri()
+    }
+
+    /// Credentials of the peer process, when the transport is a local
+    /// socket that captured them (see [`Transport::peer_credentials`]).
+    pub fn peer_credentials(&self) -> Option<PeerCredentials> {
+        self.transport.peer_credentials()
     }
 
     pub fn link_type(&self) -> LinkType {

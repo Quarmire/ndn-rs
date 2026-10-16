@@ -62,7 +62,8 @@ pub use ndn_mgmt_wire::{ControlInfo, ControlStats, ControlSurface};
 pub use notification::{NotificationEvent, NotificationStream};
 
 use auth::{
-    authorize_command, effective_require_signed, is_public_dataset_verb, resolve_control_parameters,
+    authorize_command, authorize_trust_admin, effective_require_signed, is_public_dataset_verb,
+    is_trust_admin_verb, resolve_control_parameters,
 };
 use wire::{send_dataset, send_response};
 
@@ -71,9 +72,14 @@ use wire::{send_dataset, send_response};
 /// - `Control` — standard ControlResponse (TLV 0x65) wrapped in Data content.
 /// - `Dataset` — raw NFD status dataset bytes (concatenated TLV 0x80 entries)
 ///   used for `*/list` verbs.
+/// - `Deferred` — a ControlResponse that needs network round trips (e.g.
+///   `security/context-adopt` fetching a context). The handler loop answers it
+///   from a task of its own, so one slow command does not stall every other
+///   management client; the command Interest's lifetime must cover it.
 pub enum MgmtResponse {
     Control(Box<ControlResponse>),
     Dataset(bytes::Bytes),
+    Deferred(std::pin::Pin<Box<dyn Future<Output = ControlResponse> + Send>>),
 }
 
 impl From<ControlResponse> for MgmtResponse {
@@ -224,6 +230,9 @@ pub struct MgmtHandles {
     pub ble_handler: Option<Arc<dyn BleMgmtBackend>>,
     /// Read-only pending device-approval backend (`ca` module).
     pub approval_handler: Option<Arc<dyn ApprovalMgmtBackend>>,
+    /// Network adoption backend (`security/context-adopt`). None: the verb
+    /// answers that this host does not adopt networks at runtime.
+    pub trust_context_handler: Option<Arc<dyn TrustContextMgmtBackend>>,
     /// Read-only WebTransport TLS cert-status backend (`webtransport` module).
     pub webtransport_status_handler: Option<Arc<dyn WtCertStatusBackend>>,
     /// Runtime-mutable mgmt-access policy.
@@ -399,6 +408,44 @@ impl ApprovalMgmtBackend for ndn_cert::challenge::device_approval::PendingApprov
     }
 }
 
+/// The outcome of a successful `security/context-adopt`, returned to the
+/// client as JSON in the ControlResponse status text.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AdoptedContextInfo {
+    pub namespace: String,
+    pub version: u64,
+    /// Hex of the expected fingerprint the link carried (the signing anchor's).
+    pub expected_fingerprint: String,
+    pub anchors: usize,
+    pub ca_endpoints: usize,
+    /// Fetched from the network (else carried inline by the link).
+    pub fetched: bool,
+    /// Where the signed context was stored.
+    pub stored: String,
+    /// Whether this node now publishes it by name.
+    pub published: bool,
+}
+
+/// Why `security/context-adopt` adopted nothing: a status code (`400` bad
+/// link, `403` refused by a trust check, `409` an adoption already running,
+/// `504` the network did not deliver, `500` local failure) and a reason that
+/// says what to do instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdoptRefusal {
+    pub status_code: u64,
+    pub reason: String,
+}
+
+/// Backend for `security/context-adopt`: adopt the network an
+/// `ndn-trust://anchor` link names into the running node. The spec crate
+/// owns the trait; the forwarder (`ndn-fwd`) implements it over its engine,
+/// keyring, context store and context publisher. Authorization happens before
+/// the backend is called (the trust-admin peer-credential gate).
+#[async_trait::async_trait]
+pub trait TrustContextMgmtBackend: Send + Sync {
+    async fn adopt(&self, link_uri: String) -> Result<AdoptedContextInfo, AdoptRefusal>;
+}
+
 /// Whether a function's result is determined solely by its invocation
 /// name (mirrors `ndn_compute::Determinism`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -567,6 +614,8 @@ pub async fn run_ndn_mgmt_handler(
     strategy_events: Arc<NotificationStream<StrategyEvent>>,
 ) {
     let router = build_mgmt_router(&mgmt_handles.extra_modules);
+    // Shared with the tasks that answer deferred responses.
+    let handle = Arc::new(handle);
 
     // Side consumer for reflexive certificate pulls during `/localhop`
     // authorization: when a remote node registers a prefix, it carries a
@@ -635,7 +684,32 @@ pub async fn run_ndn_mgmt_handler(
         // public. See `is_public_dataset_verb`.
         let is_public_read =
             !is_localhop_command && is_public_dataset_verb(&parsed.module, &parsed.verb);
-        if !is_public_read {
+        // Trust-changing verbs (adopting a network) are authorized by who is
+        // on the other end of the local management socket — its peer
+        // credentials — not by a command signature: a device that has no
+        // identity yet must still be able to adopt its first network. Never
+        // over `/localhop`. See `auth::authorize_trust_admin`.
+        let is_trust_admin =
+            !is_localhop_command && is_trust_admin_verb(&parsed.module, &parsed.verb);
+        if is_trust_admin {
+            if let Err(reason) = authorize_trust_admin(source_face, &engine, config.as_ref()) {
+                tracing::warn!(
+                    target: "mgmt.security",
+                    name = %interest.name,
+                    %reason,
+                    "nfd-mgmt: trust change refused"
+                );
+                let resp = ControlResponse::error(status::UNAUTHORIZED, reason);
+                send_response(
+                    &handle,
+                    &interest.name,
+                    &resp,
+                    mgmt_handles.command_response_signer.as_deref(),
+                )
+                .await;
+                continue;
+            }
+        } else if !is_public_read {
             let (active_validator, effective_required) = if is_localhop_command {
                 match mgmt_handles.localhop_command_validator.as_deref() {
                     Some(v) => (Some(v), true),
@@ -740,6 +814,7 @@ pub async fn run_ndn_mgmt_handler(
             compute_handler: mgmt_handles.compute_handler.as_ref(),
             ble_handler: mgmt_handles.ble_handler.as_ref(),
             approval_handler: mgmt_handles.approval_handler.as_ref(),
+            trust_context_handler: mgmt_handles.trust_context_handler.as_ref(),
             webtransport_status_handler: mgmt_handles.webtransport_status_handler.as_ref(),
             #[cfg(not(target_arch = "wasm32"))]
             runtime_policy: mgmt_handles.runtime_policy.as_ref(),
@@ -770,6 +845,20 @@ pub async fn run_ndn_mgmt_handler(
                     mgmt_handles.command_response_signer.as_deref(),
                 )
                 .await;
+            }
+            MgmtResponse::Deferred(pending) => {
+                let handle = Arc::clone(&handle);
+                let name = Arc::clone(&interest.name);
+                let signer = mgmt_handles.command_response_signer.clone();
+                let answer = async move {
+                    let cr = pending.await;
+                    send_response(&handle, &name, &cr, signer.as_deref()).await;
+                };
+                #[cfg(not(target_arch = "wasm32"))]
+                tokio::spawn(answer);
+                // No ambient multi-task runtime on wasm: answer in line.
+                #[cfg(target_arch = "wasm32")]
+                answer.await;
             }
         }
     }

@@ -46,7 +46,8 @@ pub use hub::{
     init_hub_in_pib, root_key_name,
 };
 pub use onboarding::{
-    AdoptError, AdvertConfig, AnchorAdvert, FetchContextError, adopt_anchor_envelope,
+    AdoptError, AdvertConfig, AnchorAdvert, AnchorLink, CONTEXT_EXPECTATION_TTL,
+    FetchContextError, LinkAdoption, adopt_anchor_envelope, adopt_anchor_link,
     adopt_unsigned_legacy_with_tofu, adopt_with_tofu, anchor_fingerprint, context_pointer,
     fetch_context, open_signed_context, rdr_metadata_name, rdr_prefix,
 };

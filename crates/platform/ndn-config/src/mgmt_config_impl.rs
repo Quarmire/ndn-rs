@@ -76,6 +76,10 @@ impl MgmtConfig for ForwarderConfig {
         self.security.mgmt.localhop_trust_anchor_pib.as_deref()
     }
 
+    fn trust_admin_groups(&self) -> &[String] {
+        &self.security.trust_admin_groups
+    }
+
     fn ca_info(&self) -> Option<CaInfo<'_>> {
         let sec = &self.security;
         sec.ca_prefix.as_deref().map(|prefix| CaInfo {

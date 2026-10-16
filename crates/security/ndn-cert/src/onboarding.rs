@@ -1,30 +1,34 @@
-//! Onboarding artefacts: the anchor [`anchor_fingerprint`], the verified,
-//! TOFU-gated [`adopt_with_tofu`], RDR metadata naming for the published
-//! context, and the privacy-preserving link-local [`AnchorAdvert`].
+//! Onboarding artefacts: the anchor [`anchor_fingerprint`], the verified
+//! adoption of a trust context against the fingerprint an out-of-band link
+//! expects ([`adopt_with_tofu`], [`adopt_anchor_link`]), RDR naming and
+//! fetching of the published context, and the privacy-preserving link-local
+//! [`AnchorAdvert`].
 //!
 //! A node does not "join a network" — it *adopts* an anchor-rooted
 //! [`SignedTrustContext`]. The one irreducible bit a face cannot give for free is
-//! **root authenticity**. An out-of-band `ndn-trust://anchor/…` envelope
+//! **root authenticity**. An out-of-band `ndn-trust://anchor/…` link
 //! (`ndn_trust_envelope::TrustEnvelope::Anchor`, a QR / deep link, *not* an NDN
-//! wire packet) carries that bit: the namespace and the root anchor's
-//! **fingerprint** (a public hash, not a secret), optionally with the signed
-//! context Data inline. Adoption is never automatic — the context Data's
-//! signature must verify under the anchor whose fingerprint was pinned out of
-//! band (TOFU), so neither a flooded fake advert nor a tampered context (e.g. a
-//! weakened schema riding a genuine anchor) can poison a keyring. See
-//! `docs/wiki/src/reference/trust-policies.md`.
+//! wire packet) carries that bit: the namespace and the **expected
+//! fingerprint** of the root anchor (a public hash, not a secret), optionally
+//! with the signed context Data inline. Adoption is never automatic — the
+//! context Data's signature must verify under an anchor whose fingerprint is
+//! the expected one (TOFU), so neither a flooded fake advert nor a tampered
+//! context (e.g. a weakened schema riding a genuine anchor) can poison a
+//! keyring. See `docs/wiki/src/reference/trust-policies.md` and
+//! `docs/wiki/src/reference/context-adoption.md`.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use ndn_packet::encode::InterestBuilder;
-use ndn_packet::{Data, Name, NameComponent, SignatureType};
+use ndn_packet::{Data, Name, NameComponent};
 use ndn_security::{
-    Certificate, Keyring, SignedTrustContext, SignedTrustContextError, VerifyOutcome,
+    Certificate, ExpectContextError, Keyring, OpenContextError, SignedTrustContext,
+    SignedTrustContextError, Validator,
 };
 use ndn_tlv::TlvReader;
 use ndn_trust_envelope::TrustEnvelope;
-use sha2::{Digest, Sha256};
 
 use crate::client::CaExchange;
 use crate::error::CertError;
@@ -36,14 +40,16 @@ pub const TRUST_CONTEXT_KEYWORD: &[u8] = ndn_security::trust_context::TRUST_CONT
 /// The RDR metadata keyword (`32=metadata`).
 pub const METADATA_KEYWORD: &[u8] = b"metadata";
 
-/// SHA-256 over an anchor's public key — the public fingerprint an anchor
-/// envelope commits to. (Public-key, not full-cert, so a re-issued anchor cert
-/// for the same key keeps the same fingerprint.)
-pub fn anchor_fingerprint(cert: &Certificate) -> [u8; 32] {
-    let mut h = Sha256::new();
-    h.update(&cert.public_key);
-    h.finalize().into()
-}
+/// SHA-256 over an anchor's public key — the fingerprint an anchor link
+/// carries. Defined in `ndn-security` so the validator's expected-context
+/// admission computes exactly the same value.
+pub use ndn_security::anchor_fingerprint;
+
+/// How long a forwarder admits the context it expects while
+/// [`adopt_anchor_link`] fetches it: covers the metadata and the context
+/// Interest (each bounded by the fetch timeout); the expectation is withdrawn
+/// as soon as the adoption returns, so this only bounds a lost one.
+pub const CONTEXT_EXPECTATION_TTL: Duration = Duration::from_secs(30);
 
 /// `/<namespace>/32=trust-context`: the prefix a namespace's context is
 /// published under — its versioned Data ([`SignedTrustContext::rdr_name`])
@@ -62,7 +68,8 @@ pub fn rdr_metadata_name(namespace: &Name) -> Name {
     rdr_prefix(namespace).append_component(NameComponent::keyword(Bytes::from_static(METADATA_KEYWORD)))
 }
 
-/// Why a trust context was not adopted.
+/// Why a trust context was not adopted. Every message says what is wrong and,
+/// where the user can act, what to do instead.
 #[derive(Debug, thiserror::Error)]
 pub enum AdoptError {
     #[error("context Data is not a decodable NDN Data packet: {0}")]
@@ -73,103 +80,128 @@ pub enum AdoptError {
     MissingContent,
     #[error("malformed trust context: {0}")]
     Malformed(#[from] SignedTrustContextError),
-    #[error("context namespace {found} does not match the pinned namespace {pinned}")]
-    NamespaceMismatch { pinned: String, found: String },
+    #[error(
+        "context namespace {found} does not match the namespace {expected} from the invite/QR"
+    )]
+    NamespaceMismatch { expected: String, found: String },
     #[error("context Data carries no KeyLocator naming its signer")]
     MissingKeyLocator,
     #[error("context signer {0} is not one of the context's own anchors")]
     SignerNotAnchor(String),
-    #[error("context signer {0} does not match the pinned anchor fingerprint")]
+    #[error(
+        "context signer {0} does not have the expected fingerprint from the invite/QR: this is \
+         not the network the link names (check the code you scanned, and that this node's \
+         route for the namespace leads to that network)"
+    )]
     FingerprintMismatch(String),
-    #[error("no anchor of the context matches the pinned fingerprint")]
-    NoPinnedAnchor,
+    #[error("no anchor of the context has the expected fingerprint from the invite/QR")]
+    NoExpectedAnchor,
     #[error("context signature type {0} is not a public-key signature")]
     UnsupportedSignature(u64),
     #[error("context signature does not verify under anchor {0}")]
     BadSignature(String),
     #[error("refused: context version {offered} is older than the held version {held}")]
     Rollback { offered: u64, held: u64 },
-    #[error("expected an anchor envelope, got a {0} envelope")]
+    #[error(
+        "refused: the network offered context version {offered}, older than version {required} \
+         named by the invite/QR (an outdated or replayed context); retry once the network \
+         serves version {required} or newer, or use an anchor link with the context inline"
+    )]
+    Downgrade { offered: u64, required: u64 },
+    #[error("expected an anchor link, got a {0} link")]
     NotAnchor(&'static str),
-    #[error("anchor envelope carries no {0} to pin")]
-    MissingPin(&'static str),
-    #[error("anchor envelope carries an invalid namespace {0:?}")]
+    #[error("not a readable trust link: {0}")]
+    BadLink(String),
+    #[error(
+        "the anchor link carries no {0}; ask the network's owner for a new invite/QR \
+         (`ndn-fwd init` prints one as anchor_uri)"
+    )]
+    LinkMissing(&'static str),
+    #[error("anchor link carries an invalid namespace {0:?}")]
     BadNamespace(String),
     #[error(
-        "anchor envelope carries only a fingerprint: the signed context must be inline \
-         for offline adoption (fetch it from the namespace and retry)"
+        "the anchor link carries only a fingerprint, so the context has to be fetched from \
+         the network: that needs the running daemon with a route toward the network \
+         (start ndn-fwd and retry), or use an anchor link with the context inline"
     )]
     InlineContextRequired,
     #[error(
-        "anchor envelope carries an unsigned legacy context; its integrity cannot be \
-         verified, so it is not adopted (re-issue the envelope with a signed context)"
+        "anchor link carries an unsigned legacy context; its integrity cannot be \
+         verified, so it is not adopted (re-issue the link with a signed context)"
     )]
     UnsignedLegacyContext,
+    #[error(
+        "could not fetch the trust context of {namespace}: {source}. Check that this node \
+         has a route for {namespace} toward a node that holds the network's context \
+         (`ndn-ctl route add {namespace} --face <face-id>`), or use an anchor link with the \
+         context inline"
+    )]
+    Fetch {
+        namespace: String,
+        #[source]
+        source: FetchContextError,
+    },
+    #[error(
+        "the network answered with a trust context for {namespace} that this node refused \
+         ({reason}): it is not the network the link names. This node's route for {namespace} \
+         leads to another network or to an impersonator — check the route \
+         (`ndn-ctl route list`) and that you scanned the right code"
+    )]
+    WrongNetwork { namespace: String, reason: String },
+    #[error("{0}")]
+    InProgress(#[from] ExpectContextError),
 }
 
-/// Decode and authenticate a signed trust-context Data: it must be named at
-/// its own context's RDR name (`/<ns>/32=trust-context/v=<version>`) and carry
-/// a public-key signature that verifies under one of the anchors the context
-/// itself lists. Returns the context and the anchor that signed it.
-///
-/// This only proves *self-consistency* (the context is exactly what its anchor
-/// signed). Whether that anchor is trusted is the caller's decision —
-/// [`adopt_with_tofu`] pins it against an out-of-band fingerprint.
+impl From<OpenContextError> for AdoptError {
+    fn from(e: OpenContextError) -> Self {
+        match e {
+            OpenContextError::BadName(n) => Self::BadName(n),
+            OpenContextError::MissingContent => Self::MissingContent,
+            OpenContextError::Malformed(e) => Self::Malformed(e),
+            OpenContextError::MissingKeyLocator => Self::MissingKeyLocator,
+            OpenContextError::SignerNotAnchor(s) => Self::SignerNotAnchor(s),
+            OpenContextError::UnsupportedSignature(t) => Self::UnsupportedSignature(t),
+            OpenContextError::BadSignature(a) => Self::BadSignature(a),
+        }
+    }
+}
+
+/// Decode and authenticate a signed trust-context Data (see
+/// [`SignedTrustContext::open_signed`]): named at its own RDR name and signed
+/// by one of its own anchors. Returns the context and the anchor that signed
+/// it. Whether that anchor is trusted is the caller's decision —
+/// [`adopt_with_tofu`] compares it with the expected fingerprint.
 pub fn open_signed_context(data: &Data) -> Result<(SignedTrustContext, Certificate), AdoptError> {
-    let version = data
-        .name
-        .components()
-        .last()
-        .and_then(NameComponent::as_version)
-        .ok_or_else(|| AdoptError::BadName(data.name.to_string()))?;
-    let content = data.content().ok_or(AdoptError::MissingContent)?;
-    let ctx = SignedTrustContext::decode_content(content, version)?;
-    if *data.name != ctx.rdr_name() {
-        return Err(AdoptError::BadName(data.name.to_string()));
-    }
-
-    let sig_info = data.sig_info().ok_or(AdoptError::MissingKeyLocator)?;
-    let signer = sig_info
-        .key_locator_name()
-        .ok_or(AdoptError::MissingKeyLocator)?;
-    // Exact anchor (cert) name first, else the anchor cert under the signer's
-    // key name (`/<id>/KEY/<k>` locating `/<id>/KEY/<k>/<issuer>/<v>`).
-    let anchor = ctx
-        .anchors()
-        .get(&signer)
-        .map(|r| r.value().clone())
-        .or_else(|| {
-            ctx.anchors()
-                .iter()
-                .find(|r| r.key().has_prefix(&signer))
-                .map(|r| r.value().clone())
-        })
-        .ok_or_else(|| AdoptError::SignerNotAnchor(signer.to_string()))?;
-
-    // Only public-key signatures authenticate a signer; a digest or shared-key
-    // MAC would let anyone re-sign a tampered context.
-    match sig_info.sig_type {
-        SignatureType::SignatureEd25519
-        | SignatureType::SignatureSha256WithEcdsa
-        | SignatureType::SignatureSha256WithRsa => {}
-        other => return Err(AdoptError::UnsupportedSignature(other.code())),
-    }
     // The verifiers never suspend; drive the future inline.
-    let outcome = futures::executor::block_on(ndn_security::verifier::verify_by_sig_type(
-        sig_info.sig_type,
-        data.signed_region(),
-        data.sig_value(),
-        &anchor.public_key,
-    ));
-    match outcome {
-        Ok(VerifyOutcome::Valid) => Ok((ctx, anchor)),
-        _ => Err(AdoptError::BadSignature(anchor.name.to_string())),
+    Ok(futures::executor::block_on(SignedTrustContext::open_signed(
+        data,
+    ))?)
+}
+
+/// [`SignedTrustContext::open_signed`] plus the out-of-band checks: the
+/// context roots `namespace` and its signing anchor has
+/// `expected_fingerprint`. Adopts nothing.
+async fn authenticate(
+    context_data: &Data,
+    namespace: &Name,
+    expected_fingerprint: &[u8; 32],
+) -> Result<SignedTrustContext, AdoptError> {
+    let (ctx, signer) = SignedTrustContext::open_signed(context_data).await?;
+    if ctx.namespace() != namespace {
+        return Err(AdoptError::NamespaceMismatch {
+            expected: namespace.to_string(),
+            found: ctx.namespace().to_string(),
+        });
     }
+    if &anchor_fingerprint(&signer) != expected_fingerprint {
+        return Err(AdoptError::FingerprintMismatch(signer.name.to_string()));
+    }
+    Ok(ctx)
 }
 
 /// Adopt the signed context `context_data` into `keyring` **only** if it
 /// roots `namespace`, its signature verifies, and the anchor that signed it
-/// matches the out-of-band `fingerprint` (TOFU). This is the sole sanctioned
+/// has the out-of-band `expected_fingerprint` (TOFU). This is the sanctioned
 /// path from "received a context" to "trust a context": a context whose
 /// signing anchor was not authenticated out-of-band (QR/NFC/pre-baked), or
 /// whose content was altered after signing, never enters the keyring.
@@ -177,80 +209,225 @@ pub fn adopt_with_tofu(
     keyring: &Keyring,
     context_data: &Data,
     namespace: &Name,
-    fingerprint: &[u8; 32],
+    expected_fingerprint: &[u8; 32],
 ) -> Result<Arc<SignedTrustContext>, AdoptError> {
-    let (ctx, signer) = open_signed_context(context_data)?;
-    // The pinned namespace must match the context it claims to root.
-    if ctx.namespace() != namespace {
-        return Err(AdoptError::NamespaceMismatch {
-            pinned: namespace.to_string(),
-            found: ctx.namespace().to_string(),
-        });
-    }
-    if &anchor_fingerprint(&signer) != fingerprint {
-        return Err(AdoptError::FingerprintMismatch(signer.name.to_string()));
-    }
+    // The verifiers never suspend; drive the future inline.
+    let ctx = futures::executor::block_on(authenticate(
+        context_data,
+        namespace,
+        expected_fingerprint,
+    ))?;
     adopt_into(keyring, ctx)
 }
 
+/// What an `ndn-trust://anchor` link asks a device to adopt.
+#[derive(Debug)]
+pub struct AnchorLink {
+    /// The namespace the network roots.
+    pub namespace: Name,
+    /// SHA-256 of the network root's public key ([`anchor_fingerprint`]).
+    pub expected_fingerprint: [u8; 32],
+    /// The context version the link names: a fetched context older than this
+    /// is refused ([`AdoptError::Downgrade`]).
+    pub min_version: Option<u64>,
+    /// The signed context Data, when the link carries it inline.
+    pub context_data: Option<Data>,
+}
+
+impl AnchorLink {
+    /// Read an anchor envelope: it must name a namespace and an expected
+    /// fingerprint; an inline context must be the signed Data form.
+    pub fn from_envelope(envelope: &TrustEnvelope) -> Result<Self, AdoptError> {
+        let TrustEnvelope::Anchor {
+            namespace,
+            fingerprint,
+            version,
+            context_data,
+            context_content,
+        } = envelope
+        else {
+            return Err(AdoptError::NotAnchor(envelope.kind().as_str()));
+        };
+        let namespace = namespace
+            .as_deref()
+            .ok_or(AdoptError::LinkMissing("namespace"))?;
+        let namespace: Name = namespace
+            .parse()
+            .map_err(|_| AdoptError::BadNamespace(namespace.to_string()))?;
+        let expected_fingerprint =
+            fingerprint.ok_or(AdoptError::LinkMissing("expected fingerprint"))?;
+        let context_data = match (context_data, context_content) {
+            (Some(wire), _) => {
+                Some(Data::decode(wire.clone()).map_err(|e| AdoptError::BadData(e.to_string()))?)
+            }
+            (None, Some(_)) => return Err(AdoptError::UnsignedLegacyContext),
+            (None, None) => None,
+        };
+        Ok(Self {
+            namespace,
+            expected_fingerprint,
+            min_version: *version,
+            context_data,
+        })
+    }
+
+    /// Parse an `ndn-trust://anchor/…` URI (or its https mirror).
+    pub fn from_uri(uri: &str) -> Result<Self, AdoptError> {
+        let envelope =
+            TrustEnvelope::from_uri(uri.trim()).map_err(|e| AdoptError::BadLink(e.to_string()))?;
+        Self::from_envelope(&envelope)
+    }
+
+    /// Authenticate `data` as this link's context (namespace, expected
+    /// fingerprint, version not below the link's) without adopting it.
+    async fn authenticate(&self, data: &Data) -> Result<SignedTrustContext, AdoptError> {
+        let ctx = authenticate(data, &self.namespace, &self.expected_fingerprint).await?;
+        self.check_version(&ctx)?;
+        Ok(ctx)
+    }
+
+    fn check_version(&self, ctx: &SignedTrustContext) -> Result<(), AdoptError> {
+        match self.min_version {
+            Some(required) if ctx.version() < required => Err(AdoptError::Downgrade {
+                offered: ctx.version(),
+                required,
+            }),
+            _ => Ok(()),
+        }
+    }
+}
+
 /// [`adopt_with_tofu`] driven by a scanned anchor envelope: the envelope must
-/// pin a namespace and fingerprint and carry the signed context inline.
-/// Fingerprint-only envelopes ([`AdoptError::InlineContextRequired`]) and
-/// unsigned legacy content ([`AdoptError::UnsignedLegacyContext`]) are refused.
+/// name a namespace and expected fingerprint and carry the signed context
+/// inline (offline adoption). Fingerprint-only envelopes
+/// ([`AdoptError::InlineContextRequired`]) need the network:
+/// [`adopt_anchor_link`]. Unsigned legacy content
+/// ([`AdoptError::UnsignedLegacyContext`]) is refused.
 /// Returns the adopted context and its signed Data (for persistence).
 pub fn adopt_anchor_envelope(
     keyring: &Keyring,
     envelope: &TrustEnvelope,
 ) -> Result<(Arc<SignedTrustContext>, Data), AdoptError> {
-    let TrustEnvelope::Anchor {
-        namespace,
-        fingerprint,
-        context_data,
-        context_content,
-        ..
-    } = envelope
-    else {
-        return Err(AdoptError::NotAnchor(envelope.kind().as_str()));
+    let link = AnchorLink::from_envelope(envelope)?;
+    let data = link.context_data.ok_or(AdoptError::InlineContextRequired)?;
+    let link = AnchorLink {
+        context_data: None,
+        ..link
     };
-    let namespace = namespace.as_deref().ok_or(AdoptError::MissingPin("namespace"))?;
-    let pinned: Name = namespace
-        .parse()
-        .map_err(|_| AdoptError::BadNamespace(namespace.to_string()))?;
-    let fingerprint = fingerprint.ok_or(AdoptError::MissingPin("anchor fingerprint"))?;
-    let wire = match (context_data, context_content) {
-        (Some(wire), _) => wire,
-        (None, Some(_)) => return Err(AdoptError::UnsignedLegacyContext),
-        (None, None) => return Err(AdoptError::InlineContextRequired),
+    // The verifiers never suspend; drive the future inline.
+    let ctx = futures::executor::block_on(link.authenticate(&data))?;
+    Ok((adopt_into(keyring, ctx)?, data))
+}
+
+/// A context adopted from an anchor link.
+#[derive(Debug)]
+pub struct LinkAdoption {
+    pub context: Arc<SignedTrustContext>,
+    /// The signed Data exactly as received (what to persist and publish).
+    pub data: Data,
+    /// Whether it was fetched from the network (else it came inline).
+    pub fetched: bool,
+}
+
+/// Adopt the network an anchor link names into `keyring`.
+///
+/// - Context inline: verify it against the link (namespace, expected
+///   fingerprint, version) and adopt; no network.
+/// - Fingerprint only: fetch the context by name through `exchange`
+///   ([`fetch_context`]), then verify and adopt it the same way. When the
+///   Interests go through a validating forwarder, pass its `forwarder`
+///   validator: an expectation for this namespace and fingerprint is
+///   registered for the fetch, so that forwarder admits the not-yet-trusted
+///   context Data (and drops a forged one) instead of dropping it for lack of
+///   an anchor. If the forwarder admitted exactly the Data that arrived, its
+///   verified result is reused instead of verifying again.
+///
+/// A fetched version older than the link's `version` is refused
+/// ([`AdoptError::Downgrade`]), closing the first-contact downgrade an on-path
+/// forger could otherwise attempt by pointing at an old genuine context. The
+/// keyring's anti-rollback still refuses anything older than a held version.
+/// Persistence is the caller's (the Data is returned verbatim).
+pub async fn adopt_anchor_link<E>(
+    keyring: &Keyring,
+    forwarder: Option<&Validator>,
+    exchange: &mut E,
+    link: &AnchorLink,
+) -> Result<LinkAdoption, AdoptError>
+where
+    E: CaExchange + ?Sized,
+{
+    if let Some(data) = &link.context_data {
+        let ctx = link.authenticate(data).await?;
+        return Ok(LinkAdoption {
+            context: adopt_into(keyring, ctx)?,
+            data: Data::decode(data.raw().clone())
+                .map_err(|e| AdoptError::BadData(e.to_string()))?,
+            fetched: false,
+        });
+    }
+    let expectation = forwarder
+        .map(|v| {
+            v.expect_context(
+                link.namespace.clone(),
+                link.expected_fingerprint,
+                CONTEXT_EXPECTATION_TTL,
+            )
+        })
+        .transpose()?;
+    let fetched = fetch_context(exchange, &link.namespace).await;
+    let outcome = expectation.map(|e| e.finish()).unwrap_or_default();
+    let data = fetched.map_err(|source| match outcome.refused.clone() {
+        // Something answered, and this node's forwarder dropped it: say why.
+        Some(reason) => AdoptError::WrongNetwork {
+            namespace: link.namespace.to_string(),
+            reason,
+        },
+        None => AdoptError::Fetch {
+            namespace: link.namespace.to_string(),
+            source,
+        },
+    })?;
+    let context = match outcome.admitted {
+        // The forwarder checked exactly these bytes against this link's
+        // namespace (by name) and expected fingerprint: verified once.
+        Some(a) if a.wire == *data.raw() => {
+            link.check_version(&a.context)?;
+            a.context
+        }
+        _ => Arc::new(link.authenticate(&data).await?),
     };
-    let data = Data::decode(wire.clone()).map_err(|e| AdoptError::BadData(e.to_string()))?;
-    let ctx = adopt_with_tofu(keyring, &data, &pinned, &fingerprint)?;
-    Ok((ctx, data))
+    Ok(LinkAdoption {
+        context: adopt_arc_into(keyring, context)?,
+        data,
+        fetched: true,
+    })
 }
 
 /// **Explicit opt-in, unverified.** Adopt a legacy *unsigned* context
 /// (`encode_content()` / `ndn-ctx:1:` payloads) if it roots `namespace` and
-/// any of its anchors matches `fingerprint`. Nothing authenticates the schema,
-/// revocations or CA endpoints of such a context — whoever handed it over
-/// could have weakened them — so no default path calls this; use it only when
-/// the operator has deliberately chosen to trust the unsigned payload.
+/// any of its anchors has `expected_fingerprint`. Nothing authenticates the
+/// schema, revocations or CA endpoints of such a context — whoever handed it
+/// over could have weakened them — so no default path calls this; use it
+/// only when the operator has deliberately chosen to trust the unsigned
+/// payload.
 pub fn adopt_unsigned_legacy_with_tofu(
     keyring: &Keyring,
     ctx: SignedTrustContext,
     namespace: &Name,
-    fingerprint: &[u8; 32],
+    expected_fingerprint: &[u8; 32],
 ) -> Result<Arc<SignedTrustContext>, AdoptError> {
     if ctx.namespace() != namespace {
         return Err(AdoptError::NamespaceMismatch {
-            pinned: namespace.to_string(),
+            expected: namespace.to_string(),
             found: ctx.namespace().to_string(),
         });
     }
     let matches = ctx
         .anchors()
         .iter()
-        .any(|r| &anchor_fingerprint(r.value()) == fingerprint);
+        .any(|r| &anchor_fingerprint(r.value()) == expected_fingerprint);
     if !matches {
-        return Err(AdoptError::NoPinnedAnchor);
+        return Err(AdoptError::NoExpectedAnchor);
     }
     adopt_into(keyring, ctx)
 }
@@ -260,7 +437,13 @@ pub(crate) fn adopt_into(
     keyring: &Keyring,
     ctx: SignedTrustContext,
 ) -> Result<Arc<SignedTrustContext>, AdoptError> {
-    let ctx = Arc::new(ctx);
+    adopt_arc_into(keyring, Arc::new(ctx))
+}
+
+fn adopt_arc_into(
+    keyring: &Keyring,
+    ctx: Arc<SignedTrustContext>,
+) -> Result<Arc<SignedTrustContext>, AdoptError> {
     if keyring.adopt(Arc::clone(&ctx)) {
         Ok(ctx)
     } else {
@@ -305,23 +488,24 @@ pub enum FetchContextError {
 ///    exact name.
 ///
 /// The returned Data is **name-checked but not verified**: authenticating it
-/// is [`adopt_with_tofu`]'s job (signature under the context's own anchor,
-/// anchor pinned by the out-of-band fingerprint, anti-rollback), so it is
+/// is the adopter's job ([`adopt_anchor_link`] / [`adopt_with_tofu`]:
+/// signature under the context's own anchor, that anchor's fingerprint equal
+/// to the expected one from the out-of-band link, anti-rollback), so it is
 /// checked once, at the one place that decides trust.
 ///
 /// The metadata is an unauthenticated pointer and needs no signature check
 /// here: the joiner holds nothing but a fingerprint, so it could not verify
 /// one anyway. The pointer is confined to `<ns>/32=trust-context/v=<N>`, so
 /// a forged one can only point at (a) a forged or foreign context, which
-/// fails the fingerprint pin in [`adopt_with_tofu`]; (b) an older genuine
-/// version, which the keyring's anti-rollback refuses once a newer one is
-/// held; or (c) a name nobody serves, which fails as a fetch error. On first
-/// contact (nothing held yet) (b) means adopting an older context the owner
-/// did sign; an on-path forger could equally replay an old *signed* metadata
-/// Data that named it, so signing the pointer would not close it. The caller
-/// closes it by demanding at least the version its envelope names
-/// (`TrustEnvelope::Anchor::version`). A forger who can answer Interests can
-/// also withhold the context, so the pointer adds no new power.
+/// fails the expected-fingerprint check; (b) an older genuine version, which
+/// the keyring's anti-rollback refuses once a newer one is held; or (c) a
+/// name nobody serves, which fails as a fetch error. On first contact
+/// (nothing held yet) (b) means adopting an older context the owner did
+/// sign; an on-path forger could equally replay an old *signed* metadata Data
+/// that named it, so signing the pointer would not close it.
+/// [`adopt_anchor_link`] closes it by demanding at least the version the link
+/// names (`TrustEnvelope::Anchor::version`). A forger who can answer
+/// Interests can also withhold the context, so the pointer adds no new power.
 pub async fn fetch_context<E>(exchange: &mut E, namespace: &Name) -> Result<Data, FetchContextError>
 where
     E: CaExchange + ?Sized,
@@ -615,9 +799,9 @@ mod tests {
     }
 
     /// A forger serving its own context under the right name gets through the
-    /// name check by construction; the fingerprint pin refuses it.
+    /// name check by construction; the expected-fingerprint check refuses it.
     #[test]
-    fn forged_context_at_the_right_name_fails_the_pin() {
+    fn forged_context_at_the_right_name_fails_the_expected_fingerprint() {
         let ns = n("/home/bob");
         let genuine = hub("/home/bob");
         let forged = hub("/home/bob");
@@ -633,5 +817,248 @@ mod tests {
                 .is_err()
         );
         assert!(keyring.is_empty(), "a forged context must not be adopted");
+    }
+
+    // ── Expected-context admission + adoption from a fingerprint-only link ──
+
+    fn forwarder() -> Validator {
+        Validator::new(ndn_security::TrustSchema::hierarchical())
+    }
+
+    fn decode(wire: &Bytes) -> Data {
+        Data::decode(wire.clone()).unwrap()
+    }
+
+    fn verdict(v: &Validator, data: &Data) -> ndn_security::ValidationResult {
+        futures::executor::block_on(v.validate_chain_cached(data)).0
+    }
+
+    fn same_kind(a: &ndn_security::ValidationResult, b: &ndn_security::ValidationResult) -> bool {
+        std::mem::discriminant(a) == std::mem::discriminant(b)
+    }
+
+    /// The validator admits a context Data only while an expectation for its
+    /// namespace is live, and only when its signing anchor has the expected
+    /// fingerprint; otherwise it behaves exactly as without expectations.
+    #[test]
+    fn forwarder_admits_only_the_expected_context_while_expected() {
+        let ns = n("/home/bob");
+        let genuine = hub("/home/bob");
+        let forged = hub("/home/bob");
+        let v = forwarder();
+        let before = verdict(&v, &genuine.context_data);
+        let forged_before = verdict(&v, &forged.context_data);
+        assert!(!matches!(before, ndn_security::ValidationResult::Valid(_)));
+
+        let fp = anchor_fingerprint(&genuine.anchor);
+        {
+            let expectation = v.expect_context(ns.clone(), fp, Duration::from_secs(30)).unwrap();
+            // A second adoption of the same namespace cannot overwrite it.
+            assert!(v.expect_context(ns.clone(), [0; 32], Duration::from_secs(30)).is_err());
+            assert!(matches!(
+                verdict(&v, &forged.context_data),
+                ndn_security::ValidationResult::Invalid(_)
+            ));
+            match verdict(&v, &genuine.context_data) {
+                ndn_security::ValidationResult::Valid(safe) => assert!(matches!(
+                    safe.trust_path(),
+                    ndn_security::safe_data::TrustPath::ExpectedContext { .. }
+                )),
+                other => panic!("expected context not admitted: {other:?}"),
+            }
+            // Other names are untouched by the expectation.
+            let other = hub("/home/alice");
+            assert!(same_kind(
+                &verdict(&v, &other.context_data),
+                &verdict(&forwarder(), &other.context_data)
+            ));
+            let outcome = expectation.finish();
+            let admitted = outcome.admitted.expect("admitted result kept");
+            assert!(outcome.refused.is_some(), "the forged context's refusal is kept");
+            assert_eq!(admitted.wire, *genuine.context_data.raw());
+        }
+        // Withdrawn: exactly as before any expectation.
+        assert!(same_kind(&verdict(&v, &genuine.context_data), &before));
+        assert!(same_kind(&verdict(&v, &forged.context_data), &forged_before));
+
+        // An expired expectation admits nothing.
+        let _expired = v.expect_context(ns.clone(), fp, Duration::ZERO).unwrap();
+        assert!(same_kind(&verdict(&v, &genuine.context_data), &before));
+    }
+
+    /// A network seen through a validating forwarder: a reply the forwarder's
+    /// validator does not admit is dropped, as `ndn-fwd` drops it.
+    struct ForwardedNet<'a> {
+        net: FakeNet,
+        forwarder: &'a Validator,
+    }
+
+    impl CaExchange for ForwardedNet<'_> {
+        async fn express(&mut self, interest: Bytes) -> Result<Data, CertError> {
+            let data = self.net.express(interest).await?;
+            match self.forwarder.validate_chain_cached(&data).await.0 {
+                ndn_security::ValidationResult::Valid(_) => Ok(data),
+                other => Err(CertError::Transport(format!("dropped by the forwarder: {other:?}"))),
+            }
+        }
+    }
+
+    fn serving(hub: &crate::hub::HubInit) -> FakeNet {
+        let ns = hub.context.namespace().clone();
+        let versioned = hub.context.rdr_name();
+        FakeNet::new(vec![
+            metadata(&ns, &versioned.encode_to_tlv()),
+            (versioned, hub.context_data.raw().clone()),
+        ])
+    }
+
+    fn link(ns: &str, fp: [u8; 32], min_version: Option<u64>) -> AnchorLink {
+        AnchorLink {
+            namespace: n(ns),
+            expected_fingerprint: fp,
+            min_version,
+            context_data: None,
+        }
+    }
+
+    #[test]
+    fn fingerprint_only_link_adopts_through_a_validating_forwarder() {
+        let genuine = hub("/home/bob");
+        let fp = anchor_fingerprint(&genuine.anchor);
+        let v = forwarder();
+        let keyring = Keyring::new();
+        let mut net = ForwardedNet {
+            net: serving(&genuine),
+            forwarder: &v,
+        };
+        let adopted = futures::executor::block_on(adopt_anchor_link(
+            &keyring,
+            Some(&v),
+            &mut net,
+            &link("/home/bob", fp, Some(1)),
+        ))
+        .unwrap();
+        assert!(adopted.fetched);
+        assert_eq!(adopted.data.raw(), genuine.context_data.raw());
+        assert_eq!(keyring.version_of(&n("/home/bob")), Some(1));
+        // The expectation ended with the adoption.
+        assert!(
+            v.expect_context(n("/home/bob"), fp, Duration::from_secs(1))
+                .is_ok()
+        );
+    }
+
+    /// Invariant: a context whose anchor fingerprint differs from the
+    /// expected one is never admitted by the forwarder nor adopted — whether
+    /// it comes through a validating forwarder, a non-validating one, or
+    /// inline.
+    #[test]
+    fn forged_network_is_never_admitted_or_adopted() {
+        let genuine = hub("/home/bob");
+        let forged = hub("/home/bob");
+        let fp = anchor_fingerprint(&genuine.anchor);
+        let keyring = Keyring::new();
+
+        let v = forwarder();
+        let mut through_forwarder = ForwardedNet {
+            net: serving(&forged),
+            forwarder: &v,
+        };
+        let res = futures::executor::block_on(adopt_anchor_link(
+            &keyring,
+            Some(&v),
+            &mut through_forwarder,
+            &link("/home/bob", fp, None),
+        ));
+        assert!(matches!(res, Err(AdoptError::WrongNetwork { .. })), "{res:?}");
+
+        let mut direct = serving(&forged);
+        let res = futures::executor::block_on(adopt_anchor_link(
+            &keyring,
+            None,
+            &mut direct,
+            &link("/home/bob", fp, None),
+        ));
+        assert!(matches!(res, Err(AdoptError::FingerprintMismatch(_))), "{res:?}");
+
+        let inline = AnchorLink {
+            context_data: Some(decode(forged.context_data.raw())),
+            ..link("/home/bob", fp, None)
+        };
+        let res = futures::executor::block_on(adopt_anchor_link(
+            &keyring,
+            None,
+            &mut FakeNet::new(Vec::new()),
+            &inline,
+        ));
+        assert!(res.is_err());
+        assert!(keyring.is_empty(), "a forged context must never be adopted");
+    }
+
+    /// Invariant: a fetched version below the link's version is refused.
+    #[test]
+    fn fetched_version_below_the_links_is_refused() {
+        let genuine = hub("/home/bob");
+        let fp = anchor_fingerprint(&genuine.anchor);
+        let keyring = Keyring::new();
+        let v = forwarder();
+        for forwarder in [Some(&v), None] {
+            let mut net = serving(&genuine);
+            let res = futures::executor::block_on(adopt_anchor_link(
+                &keyring,
+                forwarder,
+                &mut net,
+                &link("/home/bob", fp, Some(2)),
+            ));
+            assert!(
+                matches!(res, Err(AdoptError::Downgrade { offered: 1, required: 2 })),
+                "{res:?}"
+            );
+        }
+        assert!(keyring.is_empty());
+    }
+
+    /// Invariant: malformed links are refused with a reason, never a panic.
+    #[test]
+    fn malformed_links_are_refused_without_panicking() {
+        for uri in [
+            "",
+            "garbage",
+            "ndn-trust://",
+            "ndn-trust://anchor",
+            "ndn-trust://anchor/",
+            "ndn-trust://anchor/%%%",
+            "ndn-trust://anchor/AAAA",
+            "https://ndn.local/x",
+            "ndn-trust://invite/AAAA",
+        ] {
+            assert!(AnchorLink::from_uri(uri).is_err(), "{uri:?}");
+        }
+        // A link without its namespace or expected fingerprint.
+        for envelope in [
+            TrustEnvelope::Anchor {
+                namespace: None,
+                fingerprint: Some([1; 32]),
+                version: None,
+                context_data: None,
+                context_content: None,
+            },
+            TrustEnvelope::Anchor {
+                namespace: Some("/home/bob".into()),
+                fingerprint: None,
+                version: None,
+                context_data: None,
+                context_content: None,
+            },
+            TrustEnvelope::Anchor {
+                namespace: Some("/home/bob".into()),
+                fingerprint: Some([1; 32]),
+                version: None,
+                context_data: Some(Bytes::from_static(b"not a Data")),
+                context_content: None,
+            },
+        ] {
+            assert!(AnchorLink::from_uri(&envelope.to_uri()).is_err());
+        }
     }
 }

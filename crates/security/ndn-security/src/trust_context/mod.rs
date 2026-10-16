@@ -674,6 +674,117 @@ impl SignedTrustContext {
     }
 }
 
+/// SHA-256 over an anchor certificate's public key: the fingerprint an anchor
+/// link (`ndn-trust://anchor`, a QR code) carries and a device expects. Over
+/// the key, not the whole certificate, so a re-issued anchor certificate for
+/// the same key keeps its fingerprint.
+pub fn anchor_fingerprint(cert: &Certificate) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(&cert.public_key).into()
+}
+
+/// The namespace `<ns>` of a context Data name `<ns>/32=trust-context/v=<N>`,
+/// or `None` for any other name shape. Name-only: says nothing about content.
+pub fn context_namespace_of(name: &Name) -> Option<Name> {
+    let comps = name.components();
+    let [.., keyword, version] = comps else {
+        return None;
+    };
+    version.as_version()?;
+    if *keyword
+        != ndn_packet::NameComponent::keyword(Bytes::from_static(TRUST_CONTEXT_KEYWORD))
+    {
+        return None;
+    }
+    Some(Name::from_components(
+        comps[..comps.len() - 2].iter().cloned(),
+    ))
+}
+
+/// Why a Data is not a self-consistent signed trust context
+/// ([`SignedTrustContext::open_signed`]).
+#[derive(Debug, thiserror::Error)]
+pub enum OpenContextError {
+    #[error("context Data name {0} is not /<namespace>/32=trust-context/v=<version>")]
+    BadName(String),
+    #[error("context Data carries no Content")]
+    MissingContent,
+    #[error("malformed trust context: {0}")]
+    Malformed(#[from] SignedTrustContextError),
+    #[error("context Data carries no KeyLocator naming its signer")]
+    MissingKeyLocator,
+    #[error("context signer {0} is not one of the context's own anchors")]
+    SignerNotAnchor(String),
+    #[error("context signature type {0} is not a public-key signature")]
+    UnsupportedSignature(u64),
+    #[error("context signature does not verify under anchor {0}")]
+    BadSignature(String),
+}
+
+impl SignedTrustContext {
+    /// Decode and authenticate a signed trust-context Data: it must be named
+    /// at its own context's RDR name (`/<ns>/32=trust-context/v=<version>`) and
+    /// carry a public-key signature that verifies under one of the anchors the
+    /// context itself lists. Returns the context and the anchor that signed it.
+    ///
+    /// This proves only *self-consistency* (the context is exactly what its
+    /// anchor signed). Whether that anchor is trusted is the caller's decision:
+    /// it compares [`anchor_fingerprint`] of the returned anchor with the
+    /// fingerprint it expects from an out-of-band link.
+    pub async fn open_signed(data: &Data) -> Result<(Self, Certificate), OpenContextError> {
+        use ndn_packet::SignatureType;
+        let version = data
+            .name
+            .components()
+            .last()
+            .and_then(ndn_packet::NameComponent::as_version)
+            .ok_or_else(|| OpenContextError::BadName(data.name.to_string()))?;
+        let content = data.content().ok_or(OpenContextError::MissingContent)?;
+        let ctx = Self::decode_content(content, version)?;
+        if *data.name != ctx.rdr_name() {
+            return Err(OpenContextError::BadName(data.name.to_string()));
+        }
+
+        let sig_info = data.sig_info().ok_or(OpenContextError::MissingKeyLocator)?;
+        let signer = sig_info
+            .key_locator_name()
+            .ok_or(OpenContextError::MissingKeyLocator)?;
+        // Exact anchor (cert) name first, else the anchor cert under the
+        // signer's key name (`/<id>/KEY/<k>` locating `/<id>/KEY/<k>/<issuer>/<v>`).
+        let anchor = ctx
+            .anchors()
+            .get(&signer)
+            .map(|r| r.value().clone())
+            .or_else(|| {
+                ctx.anchors()
+                    .iter()
+                    .find(|r| r.key().has_prefix(&signer))
+                    .map(|r| r.value().clone())
+            })
+            .ok_or_else(|| OpenContextError::SignerNotAnchor(signer.to_string()))?;
+
+        // Only public-key signatures authenticate a signer; a digest or
+        // shared-key MAC would let anyone re-sign a tampered context.
+        match sig_info.sig_type {
+            SignatureType::SignatureEd25519
+            | SignatureType::SignatureSha256WithEcdsa
+            | SignatureType::SignatureSha256WithRsa => {}
+            other => return Err(OpenContextError::UnsupportedSignature(other.code())),
+        }
+        match crate::verifier::verify_by_sig_type(
+            sig_info.sig_type,
+            data.signed_region(),
+            data.sig_value(),
+            &anchor.public_key,
+        )
+        .await
+        {
+            Ok(crate::VerifyOutcome::Valid) => Ok((ctx, anchor)),
+            _ => Err(OpenContextError::BadSignature(anchor.name.to_string())),
+        }
+    }
+}
+
 impl std::fmt::Debug for SignedTrustContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SignedTrustContext")

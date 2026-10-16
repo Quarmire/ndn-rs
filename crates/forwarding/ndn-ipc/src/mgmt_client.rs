@@ -683,6 +683,41 @@ impl MgmtClient {
         self.dataset(module::SECURITY, verb::CA_REQUESTS).await
     }
 
+    /// `security/context-adopt`: ask the daemon to adopt the network the
+    /// `ndn-trust://anchor` link names (it may fetch the context over the
+    /// network). The command Interest lives `timeout`, and so does the wait;
+    /// the daemon answers within it. Success carries
+    /// `ndn_mgmt::AdoptedContextInfo` as JSON in `status_text`; a refusal's
+    /// `status_text` says why and what to do instead.
+    pub async fn security_context_adopt(
+        &self,
+        link_uri: &str,
+        timeout: std::time::Duration,
+    ) -> Result<ControlResponse, ForwarderError> {
+        let params = ControlParameters {
+            uri: Some(link_uri.to_owned()),
+            ..Default::default()
+        };
+        let name = command_name(module::SECURITY, verb::CONTEXT_ADOPT, &params);
+        let interest_wire =
+            build_signed_interest_with_lifetime(&self.signing, name, Some(timeout)).await?;
+        let _guard = self.recv_lock.lock().await;
+        let data_wire = self
+            .exchange_timeout(&interest_wire, timeout)
+            .await?
+            .ok_or_else(|| {
+                ForwarderError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("the daemon did not answer within {}s", timeout.as_secs()),
+                ))
+            })?;
+        let data =
+            ndn_packet::Data::decode(data_wire).map_err(|_| ForwarderError::MalformedResponse)?;
+        let content = data.content().ok_or(ForwarderError::MalformedResponse)?;
+        ControlResponse::decode(Bytes::copy_from_slice(content))
+            .map_err(|_| ForwarderError::MalformedResponse)
+    }
+
     /// `security/policy-get`. JSON `MgmtAccessPolicy` in `status_text`;
     /// auth-exempt read.
     pub async fn security_policy_get(&self) -> Result<ControlResponse, ForwarderError> {
@@ -1025,8 +1060,23 @@ async fn build_signed_interest_with_policy(
     signing: &SigningPolicy,
     name: Name,
 ) -> Result<Bytes, ForwarderError> {
+    build_signed_interest_with_lifetime(signing, name, None).await
+}
+
+/// As [`build_signed_interest_with_policy`] with an explicit Interest
+/// lifetime (`None`: the default), for commands the daemon answers only after
+/// network round trips.
+async fn build_signed_interest_with_lifetime(
+    signing: &SigningPolicy,
+    name: Name,
+    lifetime: Option<std::time::Duration>,
+) -> Result<Bytes, ForwarderError> {
+    let builder = match lifetime {
+        Some(d) => InterestBuilder::new(name).lifetime(d),
+        None => InterestBuilder::new(name),
+    };
     match signing {
-        SigningPolicy::DigestSha256 => Ok(InterestBuilder::new(name).sign_digest_sha256()),
+        SigningPolicy::DigestSha256 => Ok(builder.sign_digest_sha256()),
         SigningPolicy::Key(signer) => {
             let signer = Arc::clone(signer);
             let sig_type = signer.sig_type();
@@ -1034,7 +1084,7 @@ async fn build_signed_interest_with_policy(
                 .cert_name()
                 .or_else(|| Some(signer.key_name()))
                 .cloned();
-            InterestBuilder::new(name)
+            builder
                 .sign_fallible(sig_type, key_loc.as_ref(), |region: &[u8]| {
                     let region = bytes::Bytes::copy_from_slice(region);
                     let signer = Arc::clone(&signer);

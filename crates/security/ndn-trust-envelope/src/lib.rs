@@ -20,9 +20,10 @@
 //!
 //! An [`Anchor`](TrustEnvelope::Anchor) is either *inline* (the context's
 //! **signed** NDN Data, `context_data`) or *by reference* (namespace + the
-//! 32-byte SHA-256 fingerprint of the root anchor's public key, the TOFU pin),
-//! or both. `ndn_cert::adopt_with_tofu` verifies the inline Data's signature
-//! against the pinned anchor before anything is trusted. The older unsigned
+//! 32-byte SHA-256 fingerprint of the root anchor's public key, the expected
+//! fingerprint), or both. `ndn_cert::adopt_anchor_link` fetches a by-reference
+//! context by name and, like the inline path, verifies its signature under an
+//! anchor with the expected fingerprint before anything is trusted. The older unsigned
 //! inline form (`context_content`, the bare `SignedTrustContext` Content —
 //! also what `ndn-ctx:1:` carries) still decodes, but nothing adopts it unless
 //! the caller explicitly opts in to unverified legacy adoption.
@@ -184,9 +185,11 @@ pub enum TrustEnvelope {
     Anchor {
         /// The context namespace, as an NDN URI (e.g. `/home/bob`).
         namespace: Option<String>,
-        /// SHA-256 of the root anchor's public key — the TOFU pin.
+        /// SHA-256 of the root anchor's public key — the expected
+        /// fingerprint the adopted context's signer must have.
         fingerprint: Option<[u8; ANCHOR_FINGERPRINT_LEN]>,
-        /// The context version (the RDR `v=` component).
+        /// The context version (the RDR `v=` component). A context fetched by
+        /// name must be at least this version.
         version: Option<u64>,
         /// The **signed** context: the full NDN Data wire of
         /// `SignedTrustContext::sign_into_data` (named
@@ -202,7 +205,7 @@ pub enum TrustEnvelope {
         identity_namespace: String,
         token: String,
         ttl_secs: Option<u64>,
-        /// SHA-256 of the CA's root anchor public key, pinning the CA to trust.
+        /// SHA-256 of the CA's root anchor public key: the expected fingerprint.
         anchor_fingerprint: Option<[u8; ANCHOR_FINGERPRINT_LEN]>,
     },
     /// A signed delegation plus the principal's public key needed to verify it.

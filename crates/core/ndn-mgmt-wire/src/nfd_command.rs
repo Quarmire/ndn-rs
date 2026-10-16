@@ -115,6 +115,11 @@ pub mod verb {
     pub const POLICY_SET: &[u8] = b"policy-set";
     pub const VALIDATION_STATS: &[u8] = b"validation-stats";
     pub const VALIDATE: &[u8] = b"validate";
+    /// `security/context-adopt` — adopt a network from an `ndn-trust://anchor`
+    /// link carried in `ControlParameters.uri` (inline context, or fetched by
+    /// name when the link carries only the expected fingerprint). Authorized
+    /// by the peer credentials of the local management socket.
+    pub const CONTEXT_ADOPT: &[u8] = b"context-adopt";
 }
 
 /// `/localhost/nfd/<module>/<verb>/<full-0x68-TLV>`.

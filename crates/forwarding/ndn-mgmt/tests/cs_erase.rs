@@ -36,6 +36,7 @@ fn empty_handles() -> MgmtHandles {
         webtransport_status_handler: None,
         ble_handler: None,
         approval_handler: None,
+        trust_context_handler: None,
         runtime_policy: None,
     }
 }

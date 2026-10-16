@@ -67,6 +67,11 @@ impl Validator {
         fetch: bool,
     ) -> (ValidationResult, Option<Arc<Name>>) {
         let result = |r: ValidationResult| (r, None);
+        // An adoption in progress decides its own context Data (and nothing
+        // else); with no expectation this is one atomic load.
+        if let Some(r) = self.admit_expected_context(data).await {
+            return result(r);
+        }
         let Some(sig_info) = data.sig_info() else {
             return result(ValidationResult::Invalid(TrustError::InvalidSignature));
         };

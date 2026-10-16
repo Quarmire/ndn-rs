@@ -17,8 +17,9 @@ first; the TUI is a thin skin over the same calls.
 4. **Names carry roles.** Authorization is expressed in names so the trust
    schema can check it without new mechanism. Owners never write the schema;
    it is generated (§4).
-5. **Nothing is adopted silently.** Every trust decision is a TOFU pin (QR /
-   short code) or a signature chain to the pinned root.
+5. **Nothing is adopted silently.** Every trust decision is a TOFU check
+   against an expected fingerprint (QR / short code) or a signature chain to
+   the adopted root.
 
 ## 2. Actors and where keys live
 
@@ -44,8 +45,9 @@ directory. A super node never holds the root.
   `docs/wiki/src/reference/trust-context-publication.md`) and `context_sync`
   (updates).
 - **Envelope** — `ndn-trust://` (`ndn-trust-envelope`): `anchor` (signed
-  context or fingerprint pointer), `invite` (CA prefix + namespace + token +
-  anchor pin), `capability`, `delegation`, `recovery`, `bag`.
+  context or fingerprint pointer: namespace + expected fingerprint +
+  version), `invite` (CA prefix + namespace + token + expected fingerprint),
+  `capability`, `delegation`, `recovery`, `bag`.
 - **Enrollment** — NDNCERT 0.3 via `ndn_cert::client::enroll`; challenges
   `token` (from an invite) and `device-approval` (admin approves).
 - **Revocation** — context revocation list (authoritative, root-signed) and
@@ -76,8 +78,8 @@ in-tree compiler does not lower nor the evaluator check. Signers are key names
 *schema-authoritative*: no hierarchy floor (approvals and `shared` are
 cross-identity by design) and the schema is checked on every certificate hop,
 so a device cannot self-issue keys. For a short namespace the inline anchor
-envelope still fits one QR code (≤ 2953 bytes); long namespaces exceed it until
-fingerprint-pointer envelopes land (F2 **gap**).
+envelope still fits one QR code (≤ 2953 bytes); the fingerprint-only form
+(`anchor_uri_fp`, ~125 bytes) always does (**have**, F2).
 
 A tool (`ndn-fwd schema show|explain <data-name> <key-name>`, **have**)
 renders the schema and answers "would this be accepted, and by which rule".
@@ -102,14 +104,18 @@ Each flow lists steps, what is stored where, failure handling, and status
 - **By invite (token):** an admin creates an invite (`ndn-fwd-tokens new
   --role member|guest`, **have**; the token carries its role and the CA
   scopes it to `/<ns>/<role>`) → QR/link carries CA prefix, namespace, token,
-  anchor pin. New
+  expected fingerprint. New
   device: `join <invite>` = fetch the context by name, check it against the
-  pin, adopt, enroll with the token (**have**: fetch by name,
-  `ndn_cert::fetch_context` + `adopt_with_tofu`, served by `ndn-fwd`;
-  **gap**: fingerprint-only envelope adoption (`adopt` CLI/FFI), a joiner's
-  own validating forwarder passing the not-yet-trusted context Data, the
-  daemon picking up a newly adopted context without a restart, and the
-  single `join` command/FFI call).
+  expected fingerprint, adopt, enroll with the token (**have**: fetch by
+  name, `ndn_cert::fetch_context`, served by `ndn-fwd`; adoption from a
+  fingerprint-only link by the running daemon, `ndn-fwd adopt` /
+  `security/context-adopt` / `ndn_identity::adopt_anchor_link_via_engine`,
+  with the joiner's forwarder admitting only the expected context while it
+  runs, the version floor from the link, and the daemon trusting, storing and
+  publishing it at once — see `docs/wiki/src/reference/context-adoption.md`;
+  authorized by the management socket's peer credentials
+  (`[security] trust_admin_groups`); **gap**: the single `join`
+  command/FFI call that adopts and enrolls).
 - **By approval:** new device scans the anchor QR, requests enrollment with
   `device-approval`; an admin sees the pending request (`ca list-approvals`)
   and approves on an admin device (**have** in daemon; **gap**: approve from a

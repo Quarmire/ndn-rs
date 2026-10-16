@@ -10,6 +10,12 @@ pub enum TrustPath {
     /// Validated by verifying `SHA-256(signed_region) == sig_value`.
     /// No key or trust anchor involved — self-contained integrity check only.
     DigestSha256,
+    /// A trust context Data (`<ns>/32=trust-context/v=<N>`) admitted while
+    /// the validator expected one for `<ns>`: it verifies under one of its own
+    /// anchors, `anchor`, whose key fingerprint equals the expected
+    /// fingerprint from an out-of-band link (see
+    /// [`Validator::expect_context`](crate::Validator::expect_context)).
+    ExpectedContext { anchor: ndn_packet::Name },
 }
 
 /// A Data packet whose signature has been verified.

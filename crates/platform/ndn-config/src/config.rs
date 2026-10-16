@@ -1549,6 +1549,13 @@ pub struct SecurityConfig {
     /// Contexts are public (anchors, schema, CA endpoints); default `true`.
     #[serde(default = "default_serve_contexts")]
     pub serve_contexts: bool,
+
+    /// Unix groups whose members may change this node's trust (e.g.
+    /// `security/context-adopt`) over the local management socket, in
+    /// addition to the daemon's own user and root. Empty (default) = only
+    /// the daemon's user and root.
+    #[serde(default)]
+    pub trust_admin_groups: Vec<String>,
 }
 
 fn default_serve_contexts() -> bool {
@@ -1576,6 +1583,7 @@ impl Default for SecurityConfig {
             ephemeral_prefix: None,
             mgmt: MgmtSecurityConfig::default(),
             serve_contexts: default_serve_contexts(),
+            trust_admin_groups: Vec::new(),
         }
     }
 }

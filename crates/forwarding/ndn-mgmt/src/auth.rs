@@ -3,6 +3,11 @@
 
 use std::sync::Arc;
 
+use ndn_engine::ForwarderEngine;
+use ndn_transport::{FaceId, PeerCredentials};
+
+use crate::module::MgmtConfig;
+
 #[cfg(test)]
 use crate::wire::build_mgmt_response_wire;
 use ndn_mgmt_wire::ControlParameters;
@@ -241,6 +246,305 @@ pub(crate) async fn authorize_command(
     }
 
     Ok(())
+}
+
+/// `(module, verb)` pairs that change this node's trust (anchors, schema,
+/// network context). Beyond the signed-command gate they require the caller
+/// to be a local trust administrator — see [`authorize_trust_admin`]. Add
+/// every future trust-mutating verb here.
+const TRUST_ADMIN_VERBS: &[(&[u8], &[u8])] = &[(
+    ndn_mgmt_wire::nfd_command::module::SECURITY,
+    ndn_mgmt_wire::nfd_command::verb::CONTEXT_ADOPT,
+)];
+
+/// `true` when `module/verb` changes this node's trust and must pass
+/// [`authorize_trust_admin`].
+pub(crate) fn is_trust_admin_verb(module: &[u8], verb: &[u8]) -> bool {
+    TRUST_ADMIN_VERBS
+        .iter()
+        .any(|&(m, v)| m == module && v == verb)
+}
+
+/// Authorise a trust-changing verb by the kernel-attested credentials of the
+/// process connected to the management socket. Internally generated
+/// commands (`source_face == None`) pass. Otherwise the peer must be the
+/// daemon's effective user, root, or a member of a group named in
+/// `[security] trust_admin_groups`; a face without peer credentials (not
+/// the local socket) is refused. The `Err` text is shown to the operator
+/// verbatim.
+pub(crate) fn authorize_trust_admin(
+    source_face: Option<FaceId>,
+    engine: &ForwarderEngine,
+    config: &dyn MgmtConfig,
+) -> Result<(), String> {
+    let Some(fid) = source_face else {
+        return Ok(());
+    };
+    #[cfg(unix)]
+    {
+        let peer = engine
+            .faces()
+            .get(fid)
+            .and_then(|face| face.peer_credentials());
+        let groups = config.trust_admin_groups();
+        let daemon_uid = unix_ids::daemon_euid();
+        trust_admin_decision(
+            peer,
+            daemon_uid,
+            |p| unix_ids::peer_in_any_group(p, groups),
+            groups,
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (fid, engine, config);
+        Err("refused: changing this node's trust is authorized by the caller's \
+             local-socket peer credentials (user and groups), and this platform \
+             provides none, so trust changes over management are unavailable here."
+            .to_owned())
+    }
+}
+
+/// Pure decision behind [`authorize_trust_admin`]. `in_allowed_group` is
+/// consulted only when `groups` is non-empty, so an empty list grants
+/// nothing beyond the daemon's user and root.
+fn trust_admin_decision(
+    peer: Option<PeerCredentials>,
+    daemon_uid: u32,
+    in_allowed_group: impl Fn(&PeerCredentials) -> bool,
+    groups: &[String],
+) -> Result<(), String> {
+    let configured = if groups.is_empty() {
+        "none configured".to_owned()
+    } else {
+        format!("currently: {}", groups.join(", "))
+    };
+    let Some(peer) = peer else {
+        return Err(format!(
+            "refused: changing this node's trust must be requested over the \
+             forwarder's local management socket, where the kernel reports who \
+             is asking; this request arrived on a face that carries no caller \
+             identity. Run the command on this node against the daemon's Unix \
+             socket, as the daemon's user (uid {daemon_uid}), root, or a member \
+             of a group in `[security] trust_admin_groups` ({configured})."
+        ));
+    };
+    if peer.uid == daemon_uid || peer.uid == 0 {
+        return Ok(());
+    }
+    if !groups.is_empty() && in_allowed_group(&peer) {
+        return Ok(());
+    }
+    Err(format!(
+        "refused: only the daemon's user (uid {daemon_uid}), root, or members of \
+         `[security] trust_admin_groups` ({configured}) may change this node's \
+         trust; this request came from uid {}. Run the command as the daemon's \
+         user or root, or add a group you belong to to `[security] \
+         trust_admin_groups` in the daemon config and restart.",
+        peer.uid
+    ))
+}
+
+/// User / group database lookups backing the `trust_admin_groups` check.
+// Scoped exception to the workspace `deny(unsafe_code)`: libc user/group
+// database FFI (geteuid, getgrnam_r, getpwuid_r), return codes checked.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+mod unix_ids {
+    use std::ffi::{CStr, CString};
+
+    use ndn_transport::PeerCredentials;
+
+    /// Upper bound for the getgrnam_r / getpwuid_r scratch buffer.
+    const MAX_BUF: usize = 1 << 20;
+
+    /// The forwarder's own effective uid.
+    pub(super) fn daemon_euid() -> u32 {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        unsafe { libc::geteuid() }
+    }
+
+    struct Group {
+        gid: u32,
+        members: Vec<String>,
+    }
+
+    /// `true` if `peer` belongs to any group named in `groups`: its primary
+    /// gid is the group's gid, its user name is in the group's member list,
+    /// or (Linux, pid known) the gid is among its supplementary groups.
+    pub(super) fn peer_in_any_group(peer: &PeerCredentials, groups: &[String]) -> bool {
+        let mut user: Option<Option<String>> = None;
+        #[cfg(target_os = "linux")]
+        let mut supplementary: Option<Vec<u32>> = None;
+        for name in groups {
+            let Some(group) = lookup_group(name) else {
+                tracing::warn!(group = %name, "[security] trust_admin_groups names an unknown group");
+                continue;
+            };
+            if peer.gid == group.gid {
+                return true;
+            }
+            if !group.members.is_empty()
+                && let Some(user) = user
+                    .get_or_insert_with(|| user_name(peer.uid))
+                    .as_deref()
+                && group.members.iter().any(|m| m == user)
+            {
+                return true;
+            }
+            #[cfg(target_os = "linux")]
+            if let Some(pid) = peer.pid
+                && supplementary
+                    .get_or_insert_with(|| proc_supplementary_groups(pid, peer.uid))
+                    .contains(&group.gid)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn lookup_group(name: &str) -> Option<Group> {
+        let cname = CString::new(name).ok()?;
+        let mut buf: Vec<libc::c_char> = vec![0; 1024];
+        loop {
+            // SAFETY: `group` is plain old data; getgrnam_r fills it, pointing
+            // its string fields into `buf`, which outlives every read below.
+            let mut grp: libc::group = unsafe { std::mem::zeroed() };
+            let mut result: *mut libc::group = std::ptr::null_mut();
+            let rc = unsafe {
+                libc::getgrnam_r(
+                    cname.as_ptr(),
+                    &mut grp,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                    &mut result,
+                )
+            };
+            if rc == libc::ERANGE && buf.len() < MAX_BUF {
+                buf.resize(buf.len() * 2, 0);
+                continue;
+            }
+            if rc != 0 || result.is_null() {
+                return None;
+            }
+            let mut members = Vec::new();
+            let mut p = grp.gr_mem;
+            if !p.is_null() {
+                // SAFETY: `gr_mem` is a NULL-terminated array of C strings in `buf`.
+                unsafe {
+                    while !(*p).is_null() {
+                        members.push(CStr::from_ptr(*p).to_string_lossy().into_owned());
+                        p = p.add(1);
+                    }
+                }
+            }
+            return Some(Group {
+                gid: grp.gr_gid,
+                members,
+            });
+        }
+    }
+
+    fn user_name(uid: u32) -> Option<String> {
+        let mut buf: Vec<libc::c_char> = vec![0; 1024];
+        loop {
+            // SAFETY: as in `lookup_group`; `pw_name` points into `buf`.
+            let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+            let mut result: *mut libc::passwd = std::ptr::null_mut();
+            let rc = unsafe {
+                libc::getpwuid_r(uid, &mut pwd, buf.as_mut_ptr(), buf.len(), &mut result)
+            };
+            if rc == libc::ERANGE && buf.len() < MAX_BUF {
+                buf.resize(buf.len() * 2, 0);
+                continue;
+            }
+            if rc != 0 || result.is_null() || pwd.pw_name.is_null() {
+                return None;
+            }
+            // SAFETY: non-null NUL-terminated string inside `buf`.
+            return Some(
+                unsafe { CStr::from_ptr(pwd.pw_name) }
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+    }
+
+    /// Supplementary gids from `/proc/<pid>/status` `Groups:`. Empty unless
+    /// the process's effective uid (`Uid:` 2nd field) still equals the
+    /// socket peer's uid, so a recycled pid cannot lend another process's
+    /// groups.
+    #[cfg(target_os = "linux")]
+    fn proc_supplementary_groups(pid: i32, uid: u32) -> Vec<u32> {
+        let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+            return Vec::new();
+        };
+        let field = |key: &str| {
+            status
+                .lines()
+                .find_map(|l| l.strip_prefix(key))
+                .map(|rest| rest.split_whitespace().filter_map(|t| t.parse::<u32>().ok()))
+        };
+        if field("Uid:").and_then(|mut ids| ids.nth(1)) != Some(uid) {
+            return Vec::new();
+        }
+        field("Groups:")
+            .map(|ids| ids.collect())
+            .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod trust_admin_tests {
+    use super::*;
+
+    const DAEMON: u32 = 990;
+
+    fn peer(uid: u32, gid: u32) -> Option<PeerCredentials> {
+        Some(PeerCredentials {
+            uid,
+            gid,
+            pid: None,
+        })
+    }
+
+    fn groups(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn trust_admin_verb_table() {
+        assert!(is_trust_admin_verb(b"security", b"context-adopt"));
+        assert!(!is_trust_admin_verb(b"security", b"anchor-list"));
+        assert!(!is_trust_admin_verb(b"faces", b"context-adopt"));
+    }
+
+    #[test]
+    fn foreign_uid_outside_allowed_groups_is_refused() {
+        let g = groups(&["ndnadmin"]);
+        assert!(trust_admin_decision(peer(1000, 1000), DAEMON, |_| false, &g).is_err());
+    }
+
+    #[test]
+    fn missing_peer_credentials_are_refused() {
+        let g = groups(&["ndnadmin"]);
+        assert!(trust_admin_decision(None, DAEMON, |_| true, &g).is_err());
+        assert!(trust_admin_decision(None, DAEMON, |_| true, &[]).is_err());
+    }
+
+    #[test]
+    fn daemon_user_root_and_group_member_are_allowed() {
+        assert!(trust_admin_decision(peer(DAEMON, 5), DAEMON, |_| false, &[]).is_ok());
+        assert!(trust_admin_decision(peer(0, 0), DAEMON, |_| false, &[]).is_ok());
+        let g = groups(&["ndnadmin"]);
+        assert!(trust_admin_decision(peer(1000, 1000), DAEMON, |p| p.uid == 1000, &g).is_ok());
+    }
+
+    #[test]
+    fn empty_group_list_grants_nothing() {
+        assert!(trust_admin_decision(peer(1000, 1000), DAEMON, |_| true, &[]).is_err());
+    }
 }
 
 #[cfg(test)]

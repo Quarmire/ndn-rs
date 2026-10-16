@@ -60,4 +60,4 @@ pub use raw_packet::RawPacket;
 pub use stream_face::StreamFace;
 pub use tls::ClientTls;
 pub use tlv_codec::TlvCodec;
-pub use transport::{ErasedTransport, MtuError, PersistencyError, Transport};
+pub use transport::{ErasedTransport, MtuError, PeerCredentials, PersistencyError, Transport};

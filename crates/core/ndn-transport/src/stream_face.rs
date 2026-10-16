@@ -4,7 +4,10 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Mutex;
 use tokio_util::codec::{Decoder, Encoder, FramedRead, FramedWrite};
 
-use crate::{FaceError, FaceId, FaceKind, FacePersistency, MtuError, PersistencyError, Transport};
+use crate::{
+    FaceError, FaceId, FaceKind, FacePersistency, MtuError, PeerCredentials, PersistencyError,
+    Transport,
+};
 
 /// Generic stream-based `Transport` over any async read/write pair with a
 /// TLV codec. Reader/writer halves each sit behind a `Mutex`; the writer
@@ -17,6 +20,7 @@ pub struct StreamFace<R, W, C: Clone> {
     local_uri: Option<String>,
     reader: Mutex<FramedRead<R, C>>,
     writer: Mutex<FramedWrite<W, C>>,
+    peer_credentials: Option<PeerCredentials>,
 }
 
 impl<R, W, C: Clone> StreamFace<R, W, C> {
@@ -36,7 +40,16 @@ impl<R, W, C: Clone> StreamFace<R, W, C> {
             local_uri,
             reader: Mutex::new(FramedRead::new(reader, codec.clone())),
             writer: Mutex::new(FramedWrite::new(writer, codec)),
+            peer_credentials: None,
         }
+    }
+
+    /// Attach the peer process credentials captured when the underlying
+    /// local socket was accepted (reported by
+    /// [`Transport::peer_credentials`]).
+    pub fn with_peer_credentials(mut self, c: Option<PeerCredentials>) -> Self {
+        self.peer_credentials = c;
+        self
     }
 }
 
@@ -88,5 +101,9 @@ where
     /// error for stream faces (matches NFD).
     fn set_persistency(&self, _persistency: FacePersistency) -> Result<(), PersistencyError> {
         Ok(())
+    }
+
+    fn peer_credentials(&self) -> Option<PeerCredentials> {
+        self.peer_credentials
     }
 }

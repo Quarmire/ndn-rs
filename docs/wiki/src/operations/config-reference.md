@@ -101,11 +101,12 @@ cost = 100        # optional
 | `discovery_transport` | `udp` | `udp`, `ether`, `both`. |
 | `interval_ms` | `5000` | HELLO interval. |
 
-## `[security]` — trust-context publication
+## `[security]` — trust contexts
 
 | Key | Default | Use |
 |---|---|---|
 | `serve_contexts` | `true` | Publish every trust context in `<pib_path>/contexts/` by name over RDR: `/<ns>/32=trust-context/32=metadata` names the stored version, `/<ns>/32=trust-context/v=<N>` returns the stored signed Data verbatim. Read at startup. See [Trust-context publication](../reference/trust-context-publication.md). |
+| `trust_admin_groups` | `[]` | Unix groups whose members may change this node's trust (`security/context-adopt`) over the local management socket. The daemon's own user and root are always allowed; everyone else is refused. Membership is checked against the caller's kernel-reported socket credentials (primary gid, the group's member list, and on Linux the caller's supplementary groups). Read at startup. |
 
 ## `[demo_ca]` — embedded NDNCERT CA
 

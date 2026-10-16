@@ -276,6 +276,9 @@ impl MgmtModule for SecurityModule {
         params: ControlParameters,
         ctx: &MgmtContext<'_>,
     ) -> MgmtResponse {
+        if verb == verb::CONTEXT_ADOPT {
+            return security_context_adopt(params, ctx.trust_context_handler);
+        }
         handle_security(
             verb,
             params,
@@ -288,6 +291,45 @@ impl MgmtModule for SecurityModule {
         .await
         .into()
     }
+}
+
+/// `security/context-adopt`: adopt the network the `ndn-trust://anchor` link
+/// in `ControlParameters.uri` names. Already authorized by the trust-admin
+/// peer-credential gate. Answered deferred: a fingerprint-only link fetches
+/// the context over the network, which must not stall other mgmt clients.
+/// Success: `200` with [`crate::AdoptedContextInfo`] as JSON status text.
+fn security_context_adopt(
+    params: ControlParameters,
+    backend: Option<&Arc<dyn crate::TrustContextMgmtBackend>>,
+) -> MgmtResponse {
+    let Some(backend) = backend else {
+        return ControlResponse::error(
+            status::NOT_FOUND,
+            "this node does not adopt networks at runtime; adopt offline with \
+             `ndn-fwd adopt <link> --pib <dir>` and restart it",
+        )
+        .into();
+    };
+    let link = match params.uri {
+        Some(uri) if !uri.trim().is_empty() => uri,
+        _ => {
+            return ControlResponse::error(
+                status::BAD_PARAMS,
+                "context-adopt needs the ndn-trust://anchor link in Uri",
+            )
+            .into();
+        }
+    };
+    let backend = Arc::clone(backend);
+    MgmtResponse::Deferred(Box::pin(async move {
+        match backend.adopt(link).await {
+            Ok(info) => match serde_json::to_string(&info) {
+                Ok(json) => ControlResponse::ok_empty(json),
+                Err(e) => ControlResponse::error(status::SERVER_ERROR, format!("encode: {e}")),
+            },
+            Err(refusal) => ControlResponse::error(refusal.status_code, refusal.reason),
+        }
+    }))
 }
 #[cfg(test)]
 #[cfg(not(target_arch = "wasm32"))]
@@ -485,6 +527,7 @@ mod security_v1_handler_tests {
             webtransport_status_handler: None,
             ble_handler: None,
             approval_handler: None,
+            trust_context_handler: None,
             runtime_policy: Some(lock),
         };
         assert!(!handles_runtime.effective_require_signed_commands());
@@ -515,6 +558,41 @@ mod security_v1_handler_tests {
             None,
         );
         assert_eq!(set_resp.status_code, status::OK);
+    }
+
+    /// Invariant: a context-adopt command without a link, or on a host with
+    /// no adoption backend, is refused without reaching any backend.
+    #[test]
+    fn context_adopt_without_link_or_backend_is_refused() {
+        struct Unreachable;
+        #[async_trait]
+        impl crate::TrustContextMgmtBackend for Unreachable {
+            async fn adopt(
+                &self,
+                _: String,
+            ) -> Result<crate::AdoptedContextInfo, crate::AdoptRefusal> {
+                panic!("the backend must not be called");
+            }
+        }
+        let backend: Arc<dyn crate::TrustContextMgmtBackend> = Arc::new(Unreachable);
+        for uri in [None, Some(String::new()), Some("   ".to_string())] {
+            let params = ControlParameters {
+                uri,
+                ..Default::default()
+            };
+            match security_context_adopt(params, Some(&backend)) {
+                MgmtResponse::Control(cr) => assert_eq!(cr.status_code, status::BAD_PARAMS),
+                _ => panic!("expected an immediate refusal"),
+            }
+        }
+        let params = ControlParameters {
+            uri: Some("ndn-trust://anchor/x".into()),
+            ..Default::default()
+        };
+        match security_context_adopt(params, None) {
+            MgmtResponse::Control(cr) => assert_eq!(cr.status_code, status::NOT_FOUND),
+            _ => panic!("expected an immediate refusal"),
+        }
     }
 }
 

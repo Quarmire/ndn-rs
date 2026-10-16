@@ -64,6 +64,17 @@ impl core::fmt::Display for PersistencyError {
 
 impl std::error::Error for PersistencyError {}
 
+/// OS-attested identity of the process on the other end of a local
+/// (Unix-domain) socket, captured at accept time (`SO_PEERCRED` /
+/// `getpeereid`). Used to authorize privileged management verbs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PeerCredentials {
+    pub uid: u32,
+    pub gid: u32,
+    /// Not every platform reports the peer pid (e.g. macOS `getpeereid`).
+    pub pid: Option<i32>,
+}
+
 /// Raw byte send/recv over a single physical or IPC channel.
 ///
 /// `recv_bytes` has a single consumer (the face's own task). `send_bytes`
@@ -174,6 +185,13 @@ pub trait Transport: Send + Sync + 'static {
     fn set_persistency(&self, _persistency: FacePersistency) -> Result<(), PersistencyError> {
         Err(PersistencyError::NotSupported)
     }
+
+    /// Kernel-attested credentials of the connected peer process, for
+    /// local socket transports that captured them at accept time. `None`
+    /// for every other transport.
+    fn peer_credentials(&self) -> Option<PeerCredentials> {
+        None
+    }
 }
 
 /// Object-safe view of [`Transport`]. Auto-implemented for every `Transport`.
@@ -229,6 +247,7 @@ pub trait ErasedTransport: Send + Sync + 'static {
 
     fn set_send_mtu(&self, mtu: Option<u64>) -> Result<Option<u64>, MtuError>;
     fn set_persistency(&self, persistency: FacePersistency) -> Result<(), PersistencyError>;
+    fn peer_credentials(&self) -> Option<PeerCredentials>;
 }
 
 impl<T: Transport> ErasedTransport for T {
@@ -310,6 +329,10 @@ impl<T: Transport> ErasedTransport for T {
 
     fn set_persistency(&self, persistency: FacePersistency) -> Result<(), PersistencyError> {
         Transport::set_persistency(self, persistency)
+    }
+
+    fn peer_credentials(&self) -> Option<PeerCredentials> {
+        Transport::peer_credentials(self)
     }
 }
 

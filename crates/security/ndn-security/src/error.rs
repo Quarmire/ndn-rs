@@ -28,4 +28,8 @@ pub enum TrustError {
     UnsupportedSignatureType { code: u64, name: String },
     #[error("certificate revoked in trust context: {name}")]
     Revoked { name: String },
+    /// A trust context arrived for a namespace the validator expects one for
+    /// (an adoption in progress) and failed the expectation.
+    #[error("trust context for {namespace} refused while adopting it: {reason}")]
+    ExpectedContextRefused { namespace: String, reason: String },
 }

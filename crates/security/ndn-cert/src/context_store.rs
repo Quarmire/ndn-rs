@@ -13,9 +13,9 @@
 //! a deliberate edit, which can re-sign the context under a substituted
 //! anchor of the same namespace. Tamper resistance against local writers is
 //! out of this store's reach: write access to the PIB directory already
-//! controls the node (its keys live there), and any pin stored beside the
-//! file — e.g. the adopted anchor's fingerprint — could be rewritten by the
-//! same writer.
+//! controls the node (its keys live there), and any expected fingerprint
+//! stored beside the file — e.g. the adopted anchor's — could be rewritten by
+//! the same writer.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -139,10 +139,11 @@ fn read_one(
         path: path.to_path_buf(),
         reason: e.to_string(),
     })?;
-    // Re-verify against the context's own anchors (the out-of-band pin was
-    // checked on first adoption), and check the file is stored under its own
-    // namespace *before* anyone trusts or publishes it, so a context copied
-    // over another namespace's file is refused.
+    // Re-verify against the context's own anchors (the expected fingerprint
+    // from the out-of-band link was checked on first adoption), and check the
+    // file is stored under its own namespace *before* anyone trusts or
+    // publishes it, so a context copied over another namespace's file is
+    // refused.
     let (ctx, _signer) = open_signed_context(&data)?;
     if context_file_path(pib_root, ctx.namespace()) != path {
         return Err(ContextStoreError::Misfiled {

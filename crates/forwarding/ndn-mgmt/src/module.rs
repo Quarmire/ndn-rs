@@ -60,6 +60,13 @@ pub trait MgmtConfig: Send + Sync {
 
     /// NDNCERT CA posture for `security/ca-info`; `None` when no CA is configured.
     fn ca_info(&self) -> Option<CaInfo<'_>>;
+
+    /// `[security] trust_admin_groups` — Unix groups (besides the daemon's
+    /// user and root) whose members may run trust-changing verbs over the
+    /// local management socket. Default: none.
+    fn trust_admin_groups(&self) -> &[String] {
+        &[]
+    }
 }
 
 /// NDNCERT CA configuration surfaced by `security/ca-info`. Borrows from the
@@ -133,6 +140,7 @@ pub struct MgmtContext<'a> {
     pub compute_handler: Option<&'a Arc<dyn ComputeMgmtBackend>>,
     pub ble_handler: Option<&'a Arc<dyn BleMgmtBackend>>,
     pub approval_handler: Option<&'a Arc<dyn ApprovalMgmtBackend>>,
+    pub trust_context_handler: Option<&'a Arc<dyn crate::TrustContextMgmtBackend>>,
     pub webtransport_status_handler: Option<&'a Arc<dyn WtCertStatusBackend>>,
     #[cfg(not(target_arch = "wasm32"))]
     pub runtime_policy: Option<&'a Arc<RwLock<MgmtAccessPolicy>>>,

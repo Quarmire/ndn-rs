@@ -1,4 +1,7 @@
 mod chain;
+mod expected;
+
+pub use expected::{AdmittedContext, ContextExpectation, ExpectContextError, ExpectationOutcome};
 
 use portable_atomic::AtomicU64;
 use std::sync::Arc;
@@ -108,6 +111,10 @@ pub struct Validator {
     /// `Pending` is not counted (re-validation bumps when the cert lands).
     pub(super) verified_total: AtomicU64,
     pub(super) rejected_total: AtomicU64,
+    /// Expected-context admissions in progress ([`Self::expect_context`]).
+    /// `expecting` is the lock-free "any at all?" check on the hot path.
+    expectations: std::sync::Mutex<Vec<expected::Expectation>>,
+    expecting: std::sync::atomic::AtomicBool,
 }
 
 impl Validator {
@@ -125,6 +132,8 @@ impl Validator {
             cert_fetcher: std::sync::OnceLock::new(),
             verified_total: AtomicU64::new(0),
             rejected_total: AtomicU64::new(0),
+            expectations: Default::default(),
+            expecting: Default::default(),
         }
     }
 
@@ -153,6 +162,8 @@ impl Validator {
             },
             verified_total: AtomicU64::new(0),
             rejected_total: AtomicU64::new(0),
+            expectations: Default::default(),
+            expecting: Default::default(),
         }
     }
 
@@ -177,6 +188,8 @@ impl Validator {
             },
             verified_total: AtomicU64::new(0),
             rejected_total: AtomicU64::new(0),
+            expectations: Default::default(),
+            expecting: Default::default(),
         }
     }
 
@@ -330,6 +343,9 @@ impl Validator {
     }
 
     async fn validate_inner(&self, data: &Data) -> ValidationResult {
+        if let Some(result) = self.admit_expected_context(data).await {
+            return result;
+        }
         let Some(sig_info) = data.sig_info() else {
             return ValidationResult::Invalid(TrustError::InvalidSignature);
         };
