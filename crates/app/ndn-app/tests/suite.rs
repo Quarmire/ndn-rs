@@ -17,6 +17,8 @@ mod detached_engine;
 mod embedded;
 #[path = "engine_cert_fetch.rs"]
 mod engine_cert_fetch;
+#[path = "fetch_correlation.rs"]
+mod fetch_correlation;
 #[path = "local_throughput.rs"]
 mod local_throughput;
 #[path = "node.rs"]

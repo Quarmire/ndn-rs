@@ -605,8 +605,9 @@ impl EngineBuilder {
         }
 
         let engine_validator = validator.clone();
-        // Cached Data a newly revoked key signed leaves the CS when the
-        // revoking context version is adopted (nothing on the hit path).
+        // Cached Data a newly revoked key signed is evicted when the revoking
+        // context version is adopted. This only reclaims space early: the
+        // CS lookup stage re-checks entries stamped before the update anyway.
         if let Some(v) = &engine_validator {
             crate::revocation_purge::install(v, &cs, Arc::clone(&runtime));
         }
@@ -750,6 +751,7 @@ impl EngineBuilder {
             ),
             cs_lookup: CsLookupStage {
                 cs: Arc::clone(&cs),
+                validator: engine_validator.clone(),
             },
             pit_check: PitCheckStage {
                 pit: Arc::clone(&pit),
@@ -785,7 +787,6 @@ impl EngineBuilder {
                     .admission
                     .unwrap_or_else(|| Arc::new(ndn_store::DefaultAdmissionPolicy)),
                 admit_unverified: self.config.cs_admit_unverified,
-                validator: engine_validator.clone(),
             },
             unsolicited_policy: self.config.unsolicited_data,
             channel_cap: self.config.pipeline_channel_cap,

@@ -531,7 +531,10 @@ impl MgmtClient {
 
     /// `security/identity-status`. `status_text` is a space-separated
     /// key=value line: `identity=<name> is_ephemeral=<bool>
-    /// pib_path=<path>`. Works without a configured PIB.
+    /// pib_path=<path>`, then — for the key the daemon signs with —
+    /// `key=<key>` and, when it holds a certificate for it,
+    /// `valid_until=<ISO 8601> days_left=<n.n>`. Works without a configured
+    /// PIB.
     pub async fn security_identity_status(&self) -> Result<ControlResponse, ForwarderError> {
         self.dataset(module::SECURITY, verb::IDENTITY_STATUS).await
     }
@@ -760,6 +763,19 @@ impl MgmtClient {
             ..Default::default()
         };
         self.deferred_command(verb::CONTEXT_REFRESH, &params, timeout)
+            .await
+    }
+
+    /// `security/renew`: ask the daemon to renew, now, every certificate a
+    /// namespace CA issued to its keys (same key, no invite), rather than when
+    /// its renewal timer would. The command Interest lives `timeout`, and so
+    /// does the wait. Success carries a JSON list of `ndn_mgmt::RenewalInfo`
+    /// in `status_text`.
+    pub async fn security_renew(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<ControlResponse, ForwarderError> {
+        self.deferred_command(verb::RENEW, &ControlParameters::default(), timeout)
             .await
     }
 

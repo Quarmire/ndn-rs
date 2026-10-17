@@ -156,6 +156,15 @@ impl ErasedContentStore for ObservableCs {
         })
     }
 
+    fn restamp_erased<'a>(
+        &'a self,
+        name: &'a Name,
+        data: &'a Bytes,
+        epoch: u64,
+    ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        self.inner.restamp_erased(name, data, epoch)
+    }
+
     fn capacity(&self) -> CsCapacity {
         self.inner.capacity()
     }
@@ -260,7 +269,10 @@ mod tests {
         cs.insert_erased(
             Bytes::from_static(b"data"),
             arc_name(&["a"]),
-            CsMeta { stale_at: u64::MAX },
+            CsMeta {
+                stale_at: u64::MAX,
+                revocation_epoch: None,
+            },
         )
         .await;
         cs.get_erased(&interest(&["a"])).await;
@@ -275,7 +287,10 @@ mod tests {
         cs.insert_erased(
             Bytes::from_static(b"x"),
             arc_name(&["a"]),
-            CsMeta { stale_at: u64::MAX },
+            CsMeta {
+                stale_at: u64::MAX,
+                revocation_epoch: None,
+            },
         )
         .await;
         cs.get_erased(&interest(&["a"])).await;

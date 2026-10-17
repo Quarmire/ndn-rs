@@ -55,6 +55,7 @@ pub struct EnrollmentSession {
     validity_secs: u64,
     state: SessionState,
     issued_cert_name: Option<Name>,
+    issued_cert: Option<Bytes>,
     ecdh_keypair: Option<EcdhKeypair>,
     session_key: Option<SessionKey>,
     request_id_bytes: Option<[u8; 8]>,
@@ -70,6 +71,7 @@ impl EnrollmentSession {
             validity_secs,
             state: SessionState::Init,
             issued_cert_name: None,
+            issued_cert: None,
             ecdh_keypair: None,
             session_key: None,
             request_id_bytes: None,
@@ -270,6 +272,7 @@ impl EnrollmentSession {
                     .parse()
                     .map_err(|_| CertError::Name(format!("invalid cert name: {cert_name_str}")))?;
                 self.issued_cert_name = Some(cert_name);
+                self.issued_cert = resp.issued_cert;
                 self.state = SessionState::Complete;
                 Ok(())
             }
@@ -289,6 +292,12 @@ impl EnrollmentSession {
 
     pub fn issued_cert_name(&self) -> Option<&Name> {
         self.issued_cert_name.as_ref()
+    }
+
+    /// The issued certificate Data, when the CA sent it inline (on a
+    /// renewal; [`ChallengeResponseTlv::issued_cert`](crate::tlv::ChallengeResponseTlv::issued_cert)).
+    pub fn issued_cert(&self) -> Option<&Bytes> {
+        self.issued_cert.as_ref()
     }
 }
 
@@ -335,8 +344,31 @@ pub async fn enroll<E, F, Fut>(
     signer: Arc<dyn Signer>,
     validity_secs: u64,
     challenge_type: &str,
-    mut respond: F,
+    respond: F,
 ) -> Result<Name, CertError>
+where
+    E: CaExchange + ?Sized,
+    F: FnMut(ChallengeRound) -> Fut,
+    Fut: Future<Output = Result<Option<serde_json::Map<String, serde_json::Value>>, CertError>>,
+{
+    let session = run_session(exchange, ca_prefix, signer, validity_secs, challenge_type, respond)
+        .await?;
+    session
+        .issued_cert_name()
+        .cloned()
+        .ok_or_else(|| CertError::InvalidRequest("no issued cert name on success".into()))
+}
+
+/// [`enroll`], returning the completed session: its issued certificate name
+/// and, when the CA sent it inline (on a renewal), the certificate.
+pub async fn run_session<E, F, Fut>(
+    exchange: &mut E,
+    ca_prefix: &Name,
+    signer: Arc<dyn Signer>,
+    validity_secs: u64,
+    challenge_type: &str,
+    mut respond: F,
+) -> Result<EnrollmentSession, CertError>
 where
     E: CaExchange + ?Sized,
     F: FnMut(ChallengeRound) -> Fut,
@@ -393,15 +425,10 @@ where
         session.handle_challenge_response(response_content(&data, "CHALLENGE")?)?;
 
         if session.is_complete() {
-            break;
+            return Ok(session);
         }
         round += 1;
     }
-
-    session
-        .issued_cert_name()
-        .cloned()
-        .ok_or_else(|| CertError::InvalidRequest("no issued cert name on success".into()))
 }
 
 /// Fetch the certificate [`enroll`] reported as issued. The returned Data *is*
@@ -653,6 +680,7 @@ mod tests {
             issued_cert_name: None,
             error_code: None,
             error_info: None,
+            issued_cert: None,
         };
         let plaintext = round1_resp.encode();
         let mut ca_iv = crate::ecdh::new_encryption_iv();
@@ -698,6 +726,7 @@ mod tests {
             issued_cert_name: Some("/com/acme/alice/KEY/v=0/CA/v=1".to_string()),
             error_code: None,
             error_info: None,
+            issued_cert: None,
         };
         let plaintext_bytes = plaintext_resp.encode();
         let mut ca_iv = crate::ecdh::new_encryption_iv();
@@ -739,6 +768,7 @@ mod tests {
             issued_cert_name: Some(cert_uri.to_string()),
             error_code: None,
             error_info: None,
+            issued_cert: None,
         };
         let plaintext = resp.encode();
         let mut ca_iv = crate::ecdh::new_encryption_iv();

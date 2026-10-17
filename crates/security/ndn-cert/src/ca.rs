@@ -229,6 +229,120 @@ impl CaState {
         }))
     }
 
+    /// The challenge types this CA offers: its configured handlers', plus
+    /// the built-in [`RENEWAL_CHALLENGE`](crate::renewal::RENEWAL_CHALLENGE)
+    /// when its issuance policy renews.
+    fn offered_challenges(&self) -> Vec<String> {
+        let mut offered: Vec<String> = self
+            .config
+            .challenges
+            .iter()
+            .map(|c| c.challenge_type().to_string())
+            .collect();
+        let renewal = crate::renewal::RENEWAL_CHALLENGE;
+        if self.config.issuance.offers_renewal() && !offered.iter().any(|c| c == renewal) {
+            offered.push(renewal.to_string());
+        }
+        offered
+    }
+
+    /// The built-in renewal challenge ([`crate::renewal`]): approved when
+    /// `params` name a certificate this CA issued for the request's key and
+    /// public key, valid now, of a key with no revoked certificate, and prove
+    /// that key with a signature over this exchange's request id and the
+    /// certificate's name. The issuance policy then decides whether the role
+    /// renews and for how long.
+    async fn verify_renewal(
+        &self,
+        request_id: &str,
+        req: &CertRequest,
+        params: &serde_json::Map<String, serde_json::Value>,
+    ) -> ChallengeOutcome {
+        use crate::renewal::{CERT_NAME_PARAM, PROOF_PARAM, RENEWAL_CHALLENGE, renewal_proof_message};
+        let deny = ChallengeOutcome::Denied;
+        let param = |key: &str| params.get(key).and_then(|v| v.as_str());
+        let (Some(cert_uri), Some(proof)) = (param(CERT_NAME_PARAM), param(PROOF_PARAM)) else {
+            return deny(format!(
+                "a renewal names the certificate it renews ({CERT_NAME_PARAM}) and proves \
+                 possession of its key ({PROOF_PARAM})"
+            ));
+        };
+        let (Ok(cert_name), Ok(key_name)) = (
+            cert_uri.parse::<ndn_packet::Name>(),
+            req.name.parse::<ndn_packet::Name>(),
+        ) else {
+            return deny(format!("{cert_uri:?} or {:?} is not an NDN name", req.name));
+        };
+        let own = self.ca_certificate().is_some_and(|ca| *ca.name == cert_name);
+        let canonical = cert_name.to_string();
+        let Some(cert) = (!own)
+            .then(|| self.served_certs.get(&canonical))
+            .flatten()
+            .and_then(|wire| deserialize_cert(&wire))
+        else {
+            return deny(format!(
+                "{cert_name} is not a certificate this CA issued: it renews only those; enroll \
+                 with an invite instead"
+            ));
+        };
+        // This CA names a certificate after its key (`<key>`); a full
+        // certificate name (`<key>/<issuer>/<version>`) is accepted too.
+        if crate::context_update::key_name_of(&cert_name).as_ref() != Some(&key_name) {
+            return deny(format!(
+                "{cert_name} is not a certificate of {key_name}, the key this request certifies"
+            ));
+        }
+        let same_key = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(&req.public_key)
+            .is_ok_and(|key| key == cert.public_key.as_ref());
+        if !same_key {
+            return deny(format!(
+                "the request carries another public key than {cert_name}: renewal re-certifies \
+                 the same key; a new key needs a new invite or an admin's approval"
+            ));
+        }
+        if self.issued_under(&key_name).iter().any(|(_, revoked)| *revoked) {
+            return deny(format!(
+                "{key_name} is revoked at this CA, and a revoked key is never renewed: enroll a \
+                 new key with a new invite"
+            ));
+        }
+        if !cert.is_valid_now() {
+            let iso = |ns| {
+                let basic = ndn_security::iso8601::format_iso_basic(ns);
+                format!("{}Z", String::from_utf8_lossy(&basic))
+            };
+            return deny(format!(
+                "{cert_name} is not valid now (valid from {} until {}): renewal needs a current \
+                 certificate, so an expired device needs a new invite",
+                iso(cert.valid_from),
+                iso(cert.valid_until)
+            ));
+        }
+        let proven = match base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(proof) {
+            Ok(sig) => {
+                verify_possession(
+                    &renewal_proof_message(request_id, &cert_name),
+                    &sig,
+                    &cert.public_key,
+                )
+                .await
+            }
+            Err(_) => false,
+        };
+        if !proven {
+            return deny(format!(
+                "the renewal proof does not verify under the key of {cert_name}"
+            ));
+        }
+        ChallengeOutcome::Approved {
+            attestation: Some(crate::attestation::AttestationSet::single(
+                crate::attestation::ChallengeAttestation::of_kind(RENEWAL_CHALLENGE)
+                    .with_evidence("certificate", canonical.into()),
+            )),
+        }
+    }
+
     /// Wire of an issued cert for cert-fetch; `None` once it is revoked.
     pub fn get_served_cert(&self, cert_name: &str) -> Option<Vec<u8>> {
         if self.is_revoked(cert_name) {
@@ -290,12 +404,7 @@ impl CaState {
             ca_info: self.config.info.clone(),
             ca_certificate,
             max_validity_secs: self.config.max_validity.as_secs(),
-            challenges: self
-                .config
-                .challenges
-                .iter()
-                .map(|c| c.challenge_type().to_string())
-                .collect(),
+            challenges: self.offered_challenges(),
         };
         profile.encode().to_vec()
     }
@@ -411,12 +520,7 @@ impl CaState {
             ecdh_pub: bytes::Bytes::from(ca_pub_bytes),
             salt,
             request_id: request_id_bytes,
-            challenges: self
-                .config
-                .challenges
-                .iter()
-                .map(|c| c.challenge_type().to_string())
-                .collect(),
+            challenges: self.offered_challenges(),
         };
         Ok(resp.encode().to_vec())
     }
@@ -465,14 +569,25 @@ impl CaState {
             )));
         }
 
-        let handler = self
-            .config
-            .challenges
-            .iter()
-            .find(|h| h.challenge_type() == challenge_type)
-            .ok_or_else(|| {
-                CertError::InvalidRequest(format!("unsupported challenge type: {challenge_type}"))
-            })?;
+        // The CA's built-in renewal, when its issuance policy renews; any
+        // other type goes to the configured handler of that type.
+        let renewal = challenge_type == crate::renewal::RENEWAL_CHALLENGE
+            && self.config.issuance.offers_renewal();
+        let handler = if renewal {
+            None
+        } else {
+            Some(
+                self.config
+                    .challenges
+                    .iter()
+                    .find(|h| h.challenge_type() == challenge_type)
+                    .ok_or_else(|| {
+                        CertError::InvalidRequest(format!(
+                            "unsupported challenge type: {challenge_type}"
+                        ))
+                    })?,
+            )
+        };
 
         // Reserve the identity first, so that of two concurrent requests for
         // one single-key identity the loser is refused here, before its
@@ -501,7 +616,7 @@ impl CaState {
         // proves is refused before the challenge runs, so it spends nothing:
         // a one-time token stays redeemable under another name.
         if let Some((rule, held)) = self.identity_taken(&cert_request)
-            && !handler.can_attest(rule.unless_attested)
+            && !handler.is_some_and(|h| h.can_attest(rule.unless_attested))
         {
             self.pending.remove(request_id);
             let response = refused(
@@ -518,19 +633,26 @@ impl CaState {
             return session_key.seal_envelope(&response.encode(), &request_id_bytes, &mut enc_iv);
         }
 
-        let state = match existing_state {
-            Some(s) => s,
+        let outcome = match handler {
+            Some(handler) => {
+                let state = match existing_state {
+                    Some(s) => s,
+                    None => {
+                        let s = handler.begin(&cert_request).await?;
+                        if let Some(mut entry) = self.pending.get_mut(request_id) {
+                            entry.challenge_state = Some(s.clone());
+                            entry.challenge_type = Some(challenge_type.clone());
+                        }
+                        s
+                    }
+                };
+                handler.verify(&state, &parameters).await?
+            }
             None => {
-                let s = handler.begin(&cert_request).await?;
-                if let Some(mut entry) = self.pending.get_mut(request_id) {
-                    entry.challenge_state = Some(s.clone());
-                    entry.challenge_type = Some(challenge_type.clone());
-                }
-                s
+                self.verify_renewal(request_id, &cert_request, &parameters)
+                    .await
             }
         };
-
-        let outcome = handler.verify(&state, &parameters).await?;
 
         let response = match outcome {
             ChallengeOutcome::Denied(reason) => {
@@ -543,6 +665,7 @@ impl CaState {
                     issued_cert_name: None,
                     error_code: Some(7),
                     error_info: Some(reason),
+                    issued_cert: None,
                 }
             }
 
@@ -564,6 +687,7 @@ impl CaState {
                     issued_cert_name: None,
                     error_code: None,
                     error_info: None,
+                    issued_cert: None,
                 }
             }
 
@@ -615,8 +739,16 @@ impl CaState {
                                 )
                             }
                             _ => {
-                                self.issue(&pending.cert_request, validity, &attestation_set)
-                                    .await?
+                                // A renewed certificate keeps its name, so
+                                // it travels inline: a fetch by name could
+                                // be answered from a cache with the old one.
+                                self.issue(
+                                    &pending.cert_request,
+                                    validity,
+                                    &attestation_set,
+                                    renewal,
+                                )
+                                .await?
                             }
                         }
                     }
@@ -630,6 +762,7 @@ impl CaState {
                         // policy denial; OutOfTries (7) is the closest match.
                         error_code: Some(7),
                         error_info: Some(reason),
+                        issued_cert: None,
                     },
                 }
             }
@@ -760,12 +893,14 @@ impl CaState {
         outcome
     }
 
-    /// Mint, persist and serve the certificate for an approved request.
+    /// Mint, persist and serve the certificate for an approved request;
+    /// with `inline`, the response carries the certificate too.
     async fn issue(
         &self,
         req: &CertRequest,
         validity: Duration,
         attestation_set: &crate::attestation::AttestationSet,
+        inline: bool,
     ) -> Result<ChallengeResponseTlv, CertError> {
         let attestation_ad = if self.config.emit_attestations {
             attestation_set.encode_additional_description()
@@ -783,6 +918,7 @@ impl CaState {
         if let Some(store) = &self.store {
             store.record_issued(&cert_name_str, &cert_bytes)?;
         }
+        let issued_cert = inline.then(|| bytes::Bytes::copy_from_slice(&cert_bytes));
         self.served_certs.insert(cert_name_str.clone(), cert_bytes);
 
         Ok(ChallengeResponseTlv {
@@ -793,6 +929,7 @@ impl CaState {
             issued_cert_name: Some(cert_name_str),
             error_code: None,
             error_info: None,
+            issued_cert,
         })
     }
 
@@ -939,6 +1076,7 @@ fn refused(code: ErrorCode, reason: String) -> ChallengeResponseTlv {
         issued_cert_name: None,
         error_code: Some(code.into()),
         error_info: Some(reason),
+        issued_cert: None,
     }
 }
 

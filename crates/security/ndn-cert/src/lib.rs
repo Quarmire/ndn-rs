@@ -19,6 +19,7 @@ pub mod namespace;
 pub mod onboarding;
 pub mod policy;
 pub mod protocol;
+pub mod renewal;
 pub mod roles;
 pub mod store;
 pub mod tlv;
@@ -65,7 +66,10 @@ pub use onboarding::{
 pub use policy::{
     AcceptAllIssuance, DelegationPolicy, HierarchicalPolicy, IssuanceContext, IssuanceDecision,
     IssuancePolicy, NamespacePolicy, PolicyDecision, RequireAttestationKind, RolePolicy,
-    SingleKeyIdentity,
+    RoleTerms, SingleKeyIdentity,
+};
+pub use renewal::{
+    RENEWAL_CHALLENGE, RenewalError, issuing_ca_prefix, renew_certificate, renewal_proof_message,
 };
 pub use roles::{NamespaceSchema, Role, RoleError, namespace_schema};
 pub use protocol::{

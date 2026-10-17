@@ -82,6 +82,9 @@ ndn-strategy  = { workspace = true }
 ndn-security  = { workspace = true }
 ndn-tlv       = { workspace = true, features = ["std"] }
 sha2          = { workspace = true }
+# A persistent CS reopened across a simulated restart (revocation_purge tests).
+ndn-store      = { workspace = true, features = ["fjall"] }
+tempfile       = "3"
 # Cross-impl forwarding conformance: drive the shared decision vectors through
 # a real engine with in-process faces.
 ndn-face-local = { workspace = true }

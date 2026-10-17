@@ -127,10 +127,18 @@ fn bench_cs_lookup(c: &mut Criterion) {
     let n = decoded_name(&interest_wire(4));
 
     // Pre-populate for hit benchmark.
-    rt.block_on(cs.insert(wire.clone(), n.clone(), CsMeta { stale_at: u64::MAX }));
+    rt.block_on(cs.insert(
+        wire.clone(),
+        n.clone(),
+        CsMeta {
+            stale_at: u64::MAX,
+            revocation_epoch: None,
+        },
+    ));
 
     let stage = CsLookupStage {
         cs: Arc::clone(&cs) as Arc<dyn ErasedContentStore>,
+        validator: None,
     };
 
     let mut group = c.benchmark_group("cs");
@@ -336,7 +344,6 @@ fn bench_cs_insert(c: &mut Criterion) {
         let stage = CsInsertStage {
             cs: Arc::clone(&cs) as Arc<dyn ErasedContentStore>,
             admission: Arc::new(ndn_store::AdmitAllPolicy),
-            validator: None,
         };
         let wire = data_wire(4);
         // Pre-insert once so every bench call is a Replaced (not Inserted) operation.
@@ -366,7 +373,6 @@ fn bench_cs_insert(c: &mut Criterion) {
         let stage = CsInsertStage {
             cs: Arc::clone(&cs) as Arc<dyn ErasedContentStore>,
             admission: Arc::new(ndn_store::AdmitAllPolicy),
-            validator: None,
         };
 
         b.iter(|| {
@@ -488,6 +494,7 @@ fn bench_interest_pipeline(c: &mut Criterion) {
             );
             let cs_lookup = CsLookupStage {
                 cs: Arc::clone(&cs) as Arc<dyn ErasedContentStore>,
+                validator: None,
             };
             let pit_check = PitCheckStage {
                 pit: Arc::clone(&pit),
@@ -541,7 +548,14 @@ fn bench_interest_cs_hit(c: &mut Criterion) {
     // Pre-populate CS with data matching the Interest.
     let data_bytes = data_wire(4);
     let data = ndn_packet::Data::decode(data_bytes.clone()).unwrap();
-    rt.block_on(cs.insert(data_bytes, data.name.clone(), CsMeta { stale_at: u64::MAX }));
+    rt.block_on(cs.insert(
+        data_bytes,
+        data.name.clone(),
+        CsMeta {
+            stale_at: u64::MAX,
+            revocation_epoch: None,
+        },
+    ));
 
     let decode = TlvDecodeStage::new(
         Arc::new(FaceTable::new()),
@@ -549,6 +563,7 @@ fn bench_interest_cs_hit(c: &mut Criterion) {
     );
     let cs_lookup = CsLookupStage {
         cs: Arc::clone(&cs) as Arc<dyn ErasedContentStore>,
+        validator: None,
     };
 
     let wire = interest_wire(4);
@@ -597,7 +612,6 @@ fn bench_data_pipeline(c: &mut Criterion) {
                 let cs_insert = CsInsertStage {
                     cs: Arc::clone(&cs) as Arc<dyn ErasedContentStore>,
                     admission: Arc::new(ndn_store::AdmitAllPolicy),
-                    validator: None,
                 };
 
                 b.iter(|| {

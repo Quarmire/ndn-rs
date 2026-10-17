@@ -59,6 +59,7 @@ fn bench_get_miss_populated(g: &mut BenchmarkGroup<criterion::measurement::WallT
             name,
             CsMeta {
                 stale_at: far_future(),
+                revocation_epoch: None,
             },
         ));
     }
@@ -84,6 +85,7 @@ fn bench_get_hit(g: &mut BenchmarkGroup<criterion::measurement::WallTime>) {
         Arc::clone(&name),
         CsMeta {
             stale_at: far_future(),
+            revocation_epoch: None,
         },
     ));
     let interest = interest_for("/ndn/hit");
@@ -109,6 +111,7 @@ fn bench_get_can_be_prefix(g: &mut BenchmarkGroup<criterion::measurement::WallTi
         Arc::clone(&name),
         CsMeta {
             stale_at: far_future(),
+            revocation_epoch: None,
         },
     ));
     use ndn_packet::encode::InterestBuilder;
@@ -136,6 +139,7 @@ fn bench_insert_replace(g: &mut BenchmarkGroup<criterion::measurement::WallTime>
         Arc::clone(&name),
         CsMeta {
             stale_at: far_future(),
+            revocation_epoch: None,
         },
     ));
     g.throughput(Throughput::Elements(1));
@@ -147,6 +151,7 @@ fn bench_insert_replace(g: &mut BenchmarkGroup<criterion::measurement::WallTime>
                 Arc::clone(&name),
                 CsMeta {
                     stale_at: far_future(),
+                    revocation_epoch: None,
                 },
             ));
             debug_assert_eq!(result, InsertResult::Replaced);
@@ -173,6 +178,7 @@ fn bench_insert_new(g: &mut BenchmarkGroup<criterion::measurement::WallTime>) {
                 name,
                 CsMeta {
                     stale_at: far_future(),
+                    revocation_epoch: None,
                 },
             ));
             debug_assert_eq!(result, InsertResult::Inserted);
@@ -196,6 +202,7 @@ fn bench_evict(g: &mut BenchmarkGroup<criterion::measurement::WallTime>) {
                     name,
                     CsMeta {
                         stale_at: far_future(),
+                        revocation_epoch: None,
                     },
                 ));
                 let evict_name: Name = "/ndn/evict".parse().unwrap();
@@ -229,6 +236,7 @@ fn bench_evict_prefix(g: &mut BenchmarkGroup<criterion::measurement::WallTime>) 
                         name,
                         CsMeta {
                             stale_at: far_future(),
+                            revocation_epoch: None,
                         },
                     ));
                 }

@@ -20,6 +20,7 @@ use ndn_packet::lp::{LpPacket, is_lp_packet};
 use ndn_transport::FaceId;
 
 use crate::AppError;
+use crate::demux::Replies;
 
 /// Per-packet NDNLPv2 local fields surfaced to the application — the
 /// `getTag<lp::IncomingFaceIdTag>()` equivalent. `incoming_face_id` is the
@@ -33,16 +34,23 @@ pub struct LpInfo {
     pub congestion_mark: Option<u64>,
 }
 
+impl LpInfo {
+    /// The local fields of a decoded LP frame.
+    pub(crate) fn from_lp(lp: &LpPacket) -> Self {
+        Self {
+            incoming_face_id: lp.incoming_face_id.map(FaceId),
+            congestion_mark: lp.congestion_mark,
+        }
+    }
+}
+
 /// Extract LP local fields from a (possibly LP-framed) wire packet.
 pub(crate) fn lp_info_from_wire(wire: &Bytes) -> LpInfo {
     if !is_lp_packet(wire) {
         return LpInfo::default();
     }
     match LpPacket::decode(wire.clone()) {
-        Ok(lp) => LpInfo {
-            incoming_face_id: lp.incoming_face_id.map(FaceId),
-            congestion_mark: lp.congestion_mark,
-        },
+        Ok(lp) => LpInfo::from_lp(&lp),
         Err(_) => LpInfo::default(),
     }
 }
@@ -77,6 +85,20 @@ pub trait Connection: Send + Sync {
     /// embedded connections no-op (the embedder writes the engine FIB
     /// directly).
     async fn register_prefix(&self, prefix: &Name) -> Result<(), AppError>;
+
+    /// A stream that receives exactly the replies to the Interests registered
+    /// on it ([`Replies::expect`]), matched by NDN rules, when this connection
+    /// demultiplexes its inbound packets ([`DemuxConnection`]). Every
+    /// [`Consumer`](crate::Consumer) fetch uses it when present, so any number
+    /// of fetches can share the connection without taking each other's
+    /// replies. `None` (the default) means the connection has one receive
+    /// queue: a fetch then reads [`recv`](Self::recv) itself, which is correct
+    /// only while it is the connection's single reader.
+    ///
+    /// [`DemuxConnection`]: crate::DemuxConnection
+    fn replies(&self) -> Option<Replies> {
+        None
+    }
 }
 
 /// Talks to an external `ndn-fwd` over a Unix socket via [`ForwarderClient`].

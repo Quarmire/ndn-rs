@@ -155,6 +155,7 @@ impl ContentStore for LruCs {
             data,
             stale_at: meta.stale_at,
             name: name.clone(),
+            revocation_epoch: meta.revocation_epoch,
         };
         inner.cache.put(name.clone(), entry);
         inner.current_bytes += entry_bytes;
@@ -293,6 +294,15 @@ impl ContentStore for LruCs {
         }
         evicted
     }
+
+    async fn restamp(&self, name: &Name, data: &Bytes, epoch: u64) {
+        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(entry) = inner.cache.peek_mut(name)
+            && entry.data == *data
+        {
+            entry.revocation_epoch = Some(epoch);
+        }
+    }
 }
 
 fn now_ns() -> u64 {
@@ -316,11 +326,17 @@ mod tests {
     }
 
     fn meta_fresh() -> CsMeta {
-        CsMeta { stale_at: u64::MAX }
+        CsMeta {
+            stale_at: u64::MAX,
+            revocation_epoch: None,
+        }
     }
 
     fn meta_stale() -> CsMeta {
-        CsMeta { stale_at: 0 }
+        CsMeta {
+            stale_at: 0,
+            revocation_epoch: None,
+        }
     }
 
     fn interest(components: &[&str]) -> Interest {
@@ -762,5 +778,40 @@ mod tests {
         let evicted = cs.evict_prefix(&name_a, Some(1)).await;
         assert_eq!(evicted, 1);
         assert_eq!(cs.len(), 2);
+    }
+
+    fn stamped(epoch: u64) -> CsMeta {
+        CsMeta {
+            stale_at: u64::MAX,
+            revocation_epoch: Some(epoch),
+        }
+    }
+
+    async fn epoch_of(cs: &LruCs, name: &str) -> Option<u64> {
+        cs.get(&interest(&[name])).await.unwrap().revocation_epoch
+    }
+
+    #[tokio::test]
+    async fn restamp_marks_only_the_entry_still_holding_the_judged_bytes() {
+        let cs = LruCs::new(65536);
+        let judged = Bytes::from_static(b"v1");
+        cs.insert(judged.clone(), arc_name(&["a"]), stamped(0))
+            .await;
+        cs.insert(Bytes::from_static(b"u"), arc_name(&["u"]), meta_fresh())
+            .await;
+        assert_eq!(epoch_of(&cs, "a").await, Some(0));
+        assert_eq!(epoch_of(&cs, "u").await, None, "unvalidated: unstamped");
+
+        cs.restamp(&arc_name(&["a"]), &judged, 1).await;
+        assert_eq!(epoch_of(&cs, "a").await, Some(1));
+
+        cs.insert(Bytes::from_static(b"v2"), arc_name(&["a"]), stamped(0))
+            .await;
+        cs.restamp(&arc_name(&["a"]), &judged, 2).await;
+        assert_eq!(
+            epoch_of(&cs, "a").await,
+            Some(0),
+            "a replacement is not marked by a judgement of the bytes it replaced"
+        );
     }
 }

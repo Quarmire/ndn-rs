@@ -13,7 +13,18 @@ pub struct CsEntry {
     /// Nanoseconds since Unix epoch, derived from `FreshnessPeriod`.
     pub stale_at: u64,
     pub name: Arc<Name>,
+    /// The validator keyring's revocation epoch this Data was last judged
+    /// under (validated, or since re-checked by [`ContentStore::restamp`]);
+    /// `None` if it was cached without validation. A persistent store
+    /// reports [`EARLIER_PROCESS_EPOCH`] for an entry stamped by an earlier
+    /// process.
+    pub revocation_epoch: Option<u64>,
 }
+
+/// The [`CsEntry::revocation_epoch`] of an entry a persistent store holds
+/// from an earlier process. Keyring epochs count from 0 in each process and
+/// never reach it, so such an entry is always re-checked before it is served.
+pub const EARLIER_PROCESS_EPOCH: u64 = u64::MAX;
 
 impl CsEntry {
     pub fn is_fresh(&self, now_ns: u64) -> bool {
@@ -23,6 +34,10 @@ impl CsEntry {
 
 pub struct CsMeta {
     pub stale_at: u64,
+    /// The revocation epoch read before the Data was validated; `None` if it
+    /// was not validated. Stored as the entry's
+    /// [`revocation_epoch`](CsEntry::revocation_epoch).
+    pub revocation_epoch: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,6 +140,12 @@ pub trait ContentStore: Send + Sync + 'static {
         matches: &CsEntryFilter,
     ) -> impl Future<Output = usize> + Send;
 
+    /// Mark the entry named `name`, if it still holds `data`, as judged
+    /// under revocation `epoch` (sets its
+    /// [`revocation_epoch`](CsEntry::revocation_epoch)). An entry replaced by
+    /// other bytes or evicted meanwhile is left alone.
+    fn restamp(&self, name: &Name, data: &Bytes, epoch: u64) -> impl Future<Output = ()> + Send;
+
     fn stats(&self) -> CsStats {
         CsStats::default()
     }
@@ -161,6 +182,13 @@ pub trait ErasedContentStore: Send + Sync + 'static {
         prefix: &'a Name,
         matches: &'a CsEntryFilter,
     ) -> Pin<Box<dyn Future<Output = usize> + Send + 'a>>;
+
+    fn restamp_erased<'a>(
+        &'a self,
+        name: &'a Name,
+        data: &'a Bytes,
+        epoch: u64,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
     fn capacity(&self) -> CsCapacity;
     fn set_capacity(&self, max_bytes: usize);
@@ -213,6 +241,15 @@ impl<T: ContentStore> ErasedContentStore for T {
         matches: &'a CsEntryFilter,
     ) -> Pin<Box<dyn Future<Output = usize> + Send + 'a>> {
         Box::pin(self.evict_matching(prefix, matches))
+    }
+
+    fn restamp_erased<'a>(
+        &'a self,
+        name: &'a Name,
+        data: &'a Bytes,
+        epoch: u64,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(self.restamp(name, data, epoch))
     }
 
     fn capacity(&self) -> CsCapacity {
@@ -301,6 +338,7 @@ impl ContentStore for NullCs {
     async fn evict_matching(&self, _: &Name, _: &CsEntryFilter) -> usize {
         0
     }
+    async fn restamp(&self, _: &Name, _: &Bytes, _: u64) {}
     fn capacity(&self) -> CsCapacity {
         CsCapacity::zero()
     }

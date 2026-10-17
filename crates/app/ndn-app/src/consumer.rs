@@ -28,19 +28,125 @@ use crate::rdr::sha256;
 /// choke point both the unverified and verified RDR object paths route through.
 /// Build and send one segment Interest for `versioned/seg=<seg>` (carrying the
 /// forwarding hint, if any) directly on the connection — used by the windowed
-/// segment-fetch pipeline.
+/// segment-fetch pipeline. Registered on `replies` first, when the connection
+/// correlates replies.
 async fn send_segment_interest(
     conn: &dyn Connection,
+    replies: Option<&Replies>,
     versioned: &Name,
     seg: u64,
     forwarding_hint: &[Name],
 ) -> Result<(), AppError> {
-    let mut b = InterestBuilder::new(versioned.clone().append_segment(seg))
-        .lifetime(DEFAULT_INTEREST_LIFETIME);
+    let name = versioned.clone().append_segment(seg);
+    if let Some(replies) = replies {
+        replies.expect_name(name.clone(), false, false, DEFAULT_INTEREST_LIFETIME);
+    }
+    let mut b = InterestBuilder::new(name).lifetime(DEFAULT_INTEREST_LIFETIME);
     if !forwarding_hint.is_empty() {
         b = b.forwarding_hint(forwarding_hint.to_vec());
     }
     conn.send(b.build()).await
+}
+
+/// Where one fetch reads the replies to its Interests.
+enum ReplySource<'a> {
+    /// The connection routes each reply to the fetch whose Interest it answers
+    /// ([`Connection::replies`]), so fetches sharing it never see each other's.
+    Correlated(Replies),
+    /// The connection has one receive queue: the fetch reads it and discards
+    /// what does not answer its Interest. Correct only for its single reader.
+    Shared(&'a dyn Connection),
+}
+
+impl<'a> ReplySource<'a> {
+    /// The reply source for a fetch of `interest` on `conn`, with `interest`
+    /// registered. Call before sending it.
+    fn open(conn: &'a dyn Connection, interest: &Interest) -> Self {
+        let source = Self::new(conn);
+        if let Some(replies) = source.registry() {
+            replies.expect(interest);
+        }
+        source
+    }
+
+    /// The reply source on `conn`, with nothing registered yet.
+    fn new(conn: &'a dyn Connection) -> Self {
+        match conn.replies() {
+            Some(replies) => Self::Correlated(replies),
+            None => Self::Shared(conn),
+        }
+    }
+
+    /// Where to register each Interest before sending it; `None` for a
+    /// shared queue, which needs no registration.
+    fn registry(&self) -> Option<&Replies> {
+        match self {
+            Self::Correlated(replies) => Some(replies),
+            Self::Shared(_) => None,
+        }
+    }
+
+    /// The reply to the Interest identified by `expected` + `can_be_prefix`:
+    /// its Data with LP local fields, or its Nack as [`AppError::Nacked`].
+    /// `meta` reads the shared queue with [`Connection::recv_with_meta`] so an
+    /// in-process face's ingress face id is kept.
+    async fn answer(
+        &mut self,
+        expected: &Name,
+        can_be_prefix: bool,
+        meta: bool,
+    ) -> Result<(Data, LpInfo), AppError> {
+        match self {
+            Self::Correlated(replies) => match replies.recv().await {
+                Some(Reply::Data(data, lp)) => Ok((data, lp)),
+                Some(Reply::Nack(reason)) => Err(AppError::Nacked { reason }),
+                None => Err(AppError::Closed),
+            },
+            Self::Shared(conn) => loop {
+                let received = if meta {
+                    conn.recv_with_meta().await
+                } else {
+                    conn.recv().await.map(|wire| (wire, LpInfo::default()))
+                };
+                let Some((reply, lp)) = received else {
+                    return Err(AppError::Closed);
+                };
+                match judge_reply(expected, can_be_prefix, reply) {
+                    ReplyVerdict::Ours(data) => return Ok((*data, lp)),
+                    ReplyVerdict::Nacked(reason) => return Err(AppError::Nacked { reason }),
+                    ReplyVerdict::Straggler => continue,
+                }
+            },
+        }
+    }
+
+    /// The next reply in a segment pipeline fetching `versioned/<seg>`:
+    /// `Some(Some((data, congestion_marked)))` for a segment Data,
+    /// `Some(None)` for anything else (a Nack, a straggler) — the pipeline's
+    /// retransmit recovers real loss — and `None` once the connection closed.
+    async fn next_segment(&mut self, versioned: &Name) -> Option<Option<(Data, bool)>> {
+        match self {
+            Self::Correlated(replies) => Some(match replies.recv().await? {
+                Reply::Data(data, lp) => Some((data, lp.congestion_mark.is_some())),
+                Reply::Nack(_) => None,
+            }),
+            Self::Shared(conn) => {
+                let wire = conn.recv().await?;
+                // Peek the NDNLPv2 CongestionMark (early congestion signal)
+                // before unwrapping.
+                let marked = is_lp_packet(&wire)
+                    && LpPacket::decode(wire.clone()).is_ok_and(|lp| lp.congestion_mark.is_some());
+                Some(
+                    decode_data_lp(wire)
+                        .ok()
+                        .filter(|d| {
+                            d.name.len() == versioned.len() + 1 && d.name.has_prefix(versioned)
+                        })
+                        .map(|d| (d, marked)),
+                )
+            }
+        }
+    }
 }
 
 async fn accept_content(
@@ -61,6 +167,7 @@ async fn accept_content(
 #[cfg(not(target_arch = "wasm32"))]
 use crate::connection::IpcConnection;
 use crate::connection::{Connection, InProcConnection, LpInfo};
+use crate::demux::{Replies, Reply};
 
 pub const DEFAULT_INTEREST_LIFETIME: Duration = Duration::from_millis(4000);
 
@@ -256,18 +363,23 @@ impl Consumer {
     ///
     /// ## Pairing contract (NS-6a)
     ///
-    /// One outstanding Interest per `Consumer`: `&mut self` keeps fetches serial. The reply is
-    /// paired to the sent Interest **by name** — exact, `CanBePrefix` descendant,
+    /// The reply is paired to the sent Interest **by name** — exact, `CanBePrefix` descendant,
     /// implicit-digest, or parameters-digest, the Content-Store match rules — never by arrival
-    /// order. Anything else landing on the face while waiting (typically a straggler reply to
-    /// an earlier fetch that timed out client-side while its Interest was still pending in the
-    /// PIT) is **discarded**, not mis-delivered: a late reply must never become the answer to
-    /// the next question. (The NS-6 field bug: arrival-order pairing let one reordered reply
-    /// silently shift every subsequent fetch by one, and downstream a stale reply acked a
-    /// fresh seq — a permanent hole.) Nacks are paired the same way, by the name of their
-    /// enclosed Interest. For multiple Interests in flight on one connection use a
-    /// name-correlated pump ([`DemuxConnection::fetch_correlated`](crate::DemuxConnection) or
-    /// the windowed object pipeline) rather than interleaving `fetch_wire` calls.
+    /// order. Nacks are paired the same way, by the name of their enclosed Interest.
+    ///
+    /// Over a connection that correlates replies ([`Connection::replies`] — a
+    /// [`DemuxConnection`](crate::DemuxConnection), which every [`Node`](crate::Node) uses), the
+    /// Interest is registered on its own reply stream, so any number of fetches (from any number
+    /// of `Consumer`s) can run concurrently on the connection and each receives exactly the reply
+    /// that answers it; one Data matching several pending fetches satisfies them all.
+    ///
+    /// Over a bare connection the fetch reads its single receive queue: one outstanding
+    /// Interest per `Consumer` (`&mut self` keeps fetches serial), and anything else landing on
+    /// the face while waiting (typically a straggler reply to an earlier fetch that timed out
+    /// client-side while its Interest was still pending in the PIT) is **discarded**, not
+    /// mis-delivered: a late reply must never become the answer to the next question. (The NS-6
+    /// field bug: arrival-order pairing let one reordered reply silently shift every subsequent
+    /// fetch by one, and downstream a stale reply acked a fresh seq — a permanent hole.)
     pub async fn fetch_wire(&mut self, wire: Bytes, timeout: Duration) -> Result<Data, AppError> {
         // The sent Interest's matching identity (name + CanBePrefix), decoded up front so a
         // malformed wire fails loudly here instead of mispairing later.
@@ -284,25 +396,15 @@ impl Consumer {
         // Only the pairing identity is unwrapped; `wire` is sent unchanged, because the LP header
         // is exactly what tells the forwarder which face to use.
         let interest = interest_identity(&wire).map_err(|e| AppError::Protocol(e.to_string()))?;
-        let expected = (*interest.name).clone();
         let can_be_prefix = interest.selectors().can_be_prefix;
+        let mut replies = ReplySource::open(self.conn.as_ref(), &interest);
 
         self.conn.send(wire).await?;
 
-        crate::rt::timeout(timeout, async {
-            loop {
-                let Some(reply) = self.conn.recv().await else {
-                    return Err(AppError::Closed);
-                };
-                match judge_reply(&expected, can_be_prefix, reply) {
-                    ReplyVerdict::Ours(data) => return Ok(*data),
-                    ReplyVerdict::Nacked(reason) => return Err(AppError::Nacked { reason }),
-                    ReplyVerdict::Straggler => continue,
-                }
-            }
-        })
-        .await
-        .map_err(|_| AppError::Timeout)?
+        crate::rt::timeout(timeout, replies.answer(&interest.name, can_be_prefix, false))
+            .await
+            .map_err(|_| AppError::Timeout)?
+            .map(|(data, _)| data)
     }
 
     /// Like [`fetch`](Self::fetch) but also returns the received Data's
@@ -318,23 +420,15 @@ impl Consumer {
         let wire = InterestBuilder::new(expected.clone())
             .lifetime(DEFAULT_INTEREST_LIFETIME)
             .build();
+        let mut replies = ReplySource::new(self.conn.as_ref());
+        if let Some(registry) = replies.registry() {
+            registry.expect_name(expected.clone(), false, false, DEFAULT_INTEREST_LIFETIME);
+        }
         self.conn.send(wire).await?;
-        // Same name-paired loop as `fetch_wire` (see its pairing contract): stragglers from
-        // earlier timed-out fetches are discarded, never returned as this fetch's answer.
-        crate::rt::timeout(DEFAULT_TIMEOUT, async {
-            loop {
-                let Some((reply, lp)) = self.conn.recv_with_meta().await else {
-                    return Err(AppError::Closed);
-                };
-                match judge_reply(&expected, false, reply) {
-                    ReplyVerdict::Ours(data) => return Ok((*data, lp)),
-                    ReplyVerdict::Nacked(reason) => return Err(AppError::Nacked { reason }),
-                    ReplyVerdict::Straggler => continue,
-                }
-            }
-        })
-        .await
-        .map_err(|_| AppError::Timeout)?
+        // Same pairing as `fetch_wire` (see its contract).
+        crate::rt::timeout(DEFAULT_TIMEOUT, replies.answer(&expected, false, true))
+            .await
+            .map_err(|_| AppError::Timeout)?
     }
 
     /// Send without awaiting a reply; pairs with [`Self::recv_data`]
@@ -762,6 +856,10 @@ impl Consumer {
     ) -> Result<(), AppError> {
         use std::collections::{HashMap, HashSet};
         let conn = Arc::clone(&self.conn);
+        // Every segment Interest is registered here before it is sent, so a
+        // concurrent fetch on the same connection never takes our segments
+        // (nor we its).
+        let mut source = ReplySource::new(conn.as_ref());
         let total = last_seg + 1;
         // Resume support: segments the caller already has are pre-marked done
         // and never re-fetched, so an interrupted transfer continues instead of
@@ -807,7 +905,14 @@ impl Consumer {
                 next_send += 1;
                 continue;
             }
-            send_segment_interest(conn.as_ref(), versioned, next_send, forwarding_hint).await?;
+            send_segment_interest(
+                conn.as_ref(),
+                source.registry(),
+                versioned,
+                next_send,
+                forwarding_hint,
+            )
+            .await?;
             inflight.insert(next_send, 1);
             next_send += 1;
         }
@@ -855,25 +960,27 @@ impl Consumer {
                     next_send += 1;
                     continue;
                 }
-                send_segment_interest(conn.as_ref(), versioned, next_send, forwarding_hint).await?;
+                send_segment_interest(
+                    conn.as_ref(),
+                    source.registry(),
+                    versioned,
+                    next_send,
+                    forwarding_hint,
+                )
+                .await?;
                 inflight.insert(next_send, 1);
                 next_send += 1;
             }
 
             let recv_t0 = std::time::Instant::now();
-            let recv_res = crate::rt::timeout(SEG_RECV_TIMEOUT, conn.recv()).await;
+            let recv_res =
+                crate::rt::timeout(SEG_RECV_TIMEOUT, source.next_segment(versioned)).await;
             recv_wait += recv_t0.elapsed();
             match recv_res {
-                Ok(Some(wire)) => {
-                    // Peek the NDNLPv2 CongestionMark (early congestion signal)
-                    // before unwrapping. Non-segment / Nack packets are ignored;
-                    // the retransmit path recovers any real loss.
-                    let marked = is_lp_packet(&wire)
-                        && LpPacket::decode(wire.clone())
-                            .is_ok_and(|lp| lp.congestion_mark.is_some());
-                    let Ok(data) = decode_data_lp(wire) else {
-                        continue;
-                    };
+                // Non-segment / Nack packets are ignored; the retransmit path
+                // recovers any real loss.
+                Ok(Some(None)) => continue,
+                Ok(Some(Some((data, marked)))) => {
                     let Some(seg) = data.name.components().last().and_then(|c| c.as_segment())
                     else {
                         continue;
@@ -931,8 +1038,14 @@ impl Consumer {
                     for seg in inflight.keys().copied().collect::<Vec<_>>() {
                         *inflight.get_mut(&seg).expect("seg in inflight") += 1;
                         retransmits += 1;
-                        send_segment_interest(conn.as_ref(), versioned, seg, forwarding_hint)
-                            .await?;
+                        send_segment_interest(
+                            conn.as_ref(),
+                            source.registry(),
+                            versioned,
+                            seg,
+                            forwarding_hint,
+                        )
+                        .await?;
                     }
                 }
             }
@@ -1180,7 +1293,7 @@ fn judge_data(expected: &Name, can_be_prefix: bool, wire: Bytes) -> ReplyVerdict
 /// must verify against the Data wire; a trailing `ParametersSha256Digest` matches whether the
 /// responder echoed it into the Data name or answered the bare name; `CanBePrefix` accepts any
 /// descendant (or the name itself); otherwise exact equality.
-fn data_matches(expected: &Name, can_be_prefix: bool, data: &Data) -> bool {
+pub(crate) fn data_matches(expected: &Name, can_be_prefix: bool, data: &Data) -> bool {
     let dname: &Name = &data.name;
     let comps = expected.components();
     let last_typ = comps.last().map(|c| c.typ);

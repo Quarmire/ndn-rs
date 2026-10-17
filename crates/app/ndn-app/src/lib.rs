@@ -80,7 +80,7 @@ pub use consumer::{
 pub use cert_fetch::{
     CERT_FETCH_TIMEOUT, engine_cert_fetcher, engine_fetch_fn, install_engine_cert_fetcher,
 };
-pub use demux::{DemuxConnection, ServeGuard};
+pub use demux::{DemuxConnection, Replies, Reply, ServeGuard};
 pub use engine_ext::EngineAppExt;
 pub use error::AppError;
 pub use object::ObjectFetch;

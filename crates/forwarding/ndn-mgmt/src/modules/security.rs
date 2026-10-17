@@ -289,6 +289,9 @@ impl MgmtModule for SecurityModule {
         if verb == verb::CONTEXT_REFRESH {
             return security_context_refresh(params, ctx.trust_context_handler);
         }
+        if verb == verb::RENEW {
+            return security_renew(ctx.trust_context_handler);
+        }
         handle_security(
             verb,
             params,
@@ -441,6 +444,24 @@ fn security_revoke(
     MgmtResponse::Deferred(Box::pin(async move {
         json_answer(backend.revoke(name).await)
     }))
+}
+
+/// `security/renew`: renew, now, every certificate a namespace CA issued to
+/// this node's keys, each for the same key at the CA that issued it. Already
+/// authorized by the trust-admin peer-credential gate (and refused over
+/// `/localhop`). Answered deferred. Success: `200` with a JSON list of
+/// [`crate::RenewalInfo`] as status text.
+fn security_renew(backend: Option<&Arc<dyn crate::TrustAdminMgmtBackend>>) -> MgmtResponse {
+    let Some(backend) = backend else {
+        return ControlResponse::error(
+            status::NOT_FOUND,
+            "this node does not renew certificates at runtime: run `ndn-fwd renew` against an \
+             ndn-fwd daemon",
+        )
+        .into();
+    };
+    let backend = Arc::clone(backend);
+    MgmtResponse::Deferred(Box::pin(async move { json_answer(backend.renew().await) }))
 }
 
 /// `security/context-refresh`: check the held trust context of the
@@ -769,6 +790,8 @@ mod security_v1_handler_tests {
             refused(security_context_refresh(ControlParameters::default(), None)),
             status::NOT_FOUND
         );
+        // renew: needs a backend (a daemon holding certificates).
+        assert_eq!(refused(security_renew(None)), status::NOT_FOUND);
     }
 }
 

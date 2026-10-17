@@ -16,9 +16,16 @@
 //!     key         BLOB    PRIMARY KEY,  -- name_to_key(name)
 //!     stale_at    INTEGER NOT NULL,     -- u64 nanos, stored bit-cast as i64
 //!     data        BLOB    NOT NULL,     -- wire-format Data
-//!     last_access INTEGER NOT NULL      -- u64 nanos; drives true-LRU eviction
+//!     last_access INTEGER NOT NULL,     -- u64 nanos; drives true-LRU eviction
+//!     generation  INTEGER NOT NULL,     -- revocation stamp: the store's
+//!     epoch       INTEGER NOT NULL      --   generation and the keyring epoch
 //! )
+//! CREATE TABLE cs_meta (generation INTEGER NOT NULL)  -- one row: the latest open's
 //! ```
+//!
+//! A file without `cs_meta` predates revocation stamps; its `cs` table is
+//! dropped on open (it is a cache, and its rows do not record their
+//! validation).
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -30,7 +37,7 @@ use sha2::{Digest, Sha256};
 
 use ndn_packet::{Interest, Name};
 
-use crate::cs_keycodec::{name_to_key, now_ns, prefix_upper_bound};
+use crate::cs_keycodec::{StoredStamp, name_to_key, now_ns, prefix_upper_bound};
 use crate::{ContentStore, CsCapacity, CsEntry, CsEntryFilter, CsMeta, InsertResult};
 
 /// Persistent CS backed by bundled SQLite. `max_bytes` bounds *logical* Data
@@ -38,6 +45,8 @@ use crate::{ContentStore, CsCapacity, CsEntry, CsEntryFilter, CsMeta, InsertResu
 /// process restarts. Eviction is true-LRU on `last_access`.
 pub struct SqliteCs {
     conn: Mutex<Connection>,
+    /// This open's generation (see [`StoredStamp`]).
+    generation: u64,
     max_bytes: AtomicUsize,
     current_bytes: AtomicUsize,
     entry_count: AtomicUsize,
@@ -54,10 +63,19 @@ fn from_i64(v: i64) -> u64 {
     v as u64
 }
 
+/// The stamp held in a row's `generation` and `epoch` columns.
+#[inline]
+fn stored_stamp(generation: i64, epoch: i64) -> StoredStamp {
+    StoredStamp {
+        generation: from_i64(generation),
+        epoch: from_i64(epoch),
+    }
+}
+
 impl SqliteCs {
     /// Open (or create) a persistent CS at `path` (a single SQLite file).
     pub fn open(path: impl AsRef<std::path::Path>, max_bytes: usize) -> rusqlite::Result<Self> {
-        let conn = Connection::open(path)?;
+        let mut conn = Connection::open(path)?;
         // Rollback journal (TRUNCATE), NOT WAL. The CS is single-process-
         // exclusive (only the tunnel/`:vpn` engine opens it), so WAL's
         // multi-reader concurrency is unused — and WAL's `-shm` mmap byte-range
@@ -73,16 +91,42 @@ impl SqliteCs {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "TRUNCATE")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
-        conn.execute(
+        // One transaction, so a crash never leaves a generation that is not
+        // above every generation stamped before it.
+        let tx = conn.transaction()?;
+        let stamped_layout: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'cs_meta')",
+            [],
+            |r| r.get(0),
+        )?;
+        if !stamped_layout {
+            tx.execute("DROP TABLE IF EXISTS cs", [])?;
+        }
+        tx.execute(
             "CREATE TABLE IF NOT EXISTS cs (\
                  key         BLOB    PRIMARY KEY, \
                  stale_at    INTEGER NOT NULL, \
                  data        BLOB    NOT NULL, \
-                 last_access INTEGER NOT NULL\
+                 last_access INTEGER NOT NULL, \
+                 generation  INTEGER NOT NULL, \
+                 epoch       INTEGER NOT NULL\
              )",
             [],
         )?;
-        conn.execute("CREATE INDEX IF NOT EXISTS cs_lru ON cs(last_access)", [])?;
+        tx.execute("CREATE INDEX IF NOT EXISTS cs_lru ON cs(last_access)", [])?;
+        tx.execute(
+            "CREATE TABLE IF NOT EXISTS cs_meta (generation INTEGER NOT NULL)",
+            [],
+        )?;
+        let previous: Option<i64> =
+            tx.query_row("SELECT MAX(generation) FROM cs_meta", [], |r| r.get(0))?;
+        let generation = previous.map_or(0, from_i64) + 1;
+        tx.execute("DELETE FROM cs_meta", [])?;
+        tx.execute(
+            "INSERT INTO cs_meta (generation) VALUES (?1)",
+            [to_i64(generation)],
+        )?;
+        tx.commit()?;
 
         let (count, bytes): (i64, i64) = conn.query_row(
             "SELECT COUNT(*), COALESCE(SUM(length(data)), 0) FROM cs",
@@ -92,6 +136,7 @@ impl SqliteCs {
 
         Ok(Self {
             conn: Mutex::new(conn),
+            generation,
             max_bytes: AtomicUsize::new(max_bytes),
             current_bytes: AtomicUsize::new(bytes as usize),
             entry_count: AtomicUsize::new(count as usize),
@@ -135,19 +180,23 @@ impl SqliteCs {
         }
     }
 
-    /// Fetch `(stale_at, data)` for an exact key, refreshing `last_access`.
-    fn fetch_exact(&self, conn: &Connection, key: &[u8]) -> Option<(u64, Bytes)> {
-        let row: Option<(i64, Vec<u8>)> = conn
-            .query_row("SELECT stale_at, data FROM cs WHERE key = ?1", [key], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
+    /// Fetch `(stale_at, data, revocation_epoch)` for an exact key,
+    /// refreshing `last_access`.
+    fn fetch_exact(&self, conn: &Connection, key: &[u8]) -> Option<(u64, Bytes, Option<u64>)> {
+        let row: Option<(i64, Vec<u8>, i64, i64)> = conn
+            .query_row(
+                "SELECT stale_at, data, generation, epoch FROM cs WHERE key = ?1",
+                [key],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
             .ok();
-        let (stale_at, data) = row?;
+        let (stale_at, data, generation, epoch) = row?;
         let _ = conn.execute(
             "UPDATE cs SET last_access = ?1 WHERE key = ?2",
             rusqlite::params![to_i64(now_ns()), key],
         );
-        Some((from_i64(stale_at), Bytes::from(data)))
+        let revocation_epoch = stored_stamp(generation, epoch).read(self.generation);
+        Some((from_i64(stale_at), Bytes::from(data), revocation_epoch))
     }
 }
 
@@ -165,7 +214,7 @@ impl ContentStore for SqliteCs {
         let entry = if has_implicit_digest {
             let data_name = Name::from_components(comps[..comps.len() - 1].iter().cloned());
             let key = name_to_key(&data_name);
-            let (stale_at, data) = self.fetch_exact(&conn, &key)?;
+            let (stale_at, data, revocation_epoch) = self.fetch_exact(&conn, &key)?;
 
             let expected_digest = &comps.last().unwrap().value;
             let actual = Sha256::digest(&data);
@@ -176,29 +225,34 @@ impl ContentStore for SqliteCs {
                 data,
                 stale_at,
                 name: Arc::new(data_name),
+                revocation_epoch,
             }
         } else if interest.selectors().can_be_prefix {
             let prefix_key = name_to_key(&interest.name);
             // First row (BLOB order = NDN lexicographic order) under the prefix.
-            let found: Option<(Vec<u8>, i64, Vec<u8>)> = match prefix_upper_bound(&prefix_key) {
+            type Row = (Vec<u8>, i64, Vec<u8>, i64, i64);
+            let read = |r: &rusqlite::Row<'_>| -> rusqlite::Result<Row> {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            };
+            let found: Option<Row> = match prefix_upper_bound(&prefix_key) {
                 Some(upper) => conn
                     .query_row(
-                        "SELECT key, stale_at, data FROM cs \
+                        "SELECT key, stale_at, data, generation, epoch FROM cs \
                          WHERE key >= ?1 AND key < ?2 ORDER BY key ASC LIMIT 1",
                         rusqlite::params![prefix_key.as_slice(), upper.as_slice()],
-                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                        read,
                     )
                     .ok(),
                 None => conn
                     .query_row(
-                        "SELECT key, stale_at, data FROM cs \
+                        "SELECT key, stale_at, data, generation, epoch FROM cs \
                          WHERE key >= ?1 ORDER BY key ASC LIMIT 1",
                         [prefix_key.as_slice()],
-                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                        read,
                     )
                     .ok(),
             };
-            let (key, stale_at, data) = found?;
+            let (key, stale_at, data, generation, epoch) = found?;
             let name = crate::cs_keycodec::key_to_name(&key)?;
             let _ = conn.execute(
                 "UPDATE cs SET last_access = ?1 WHERE key = ?2",
@@ -208,14 +262,16 @@ impl ContentStore for SqliteCs {
                 data: Bytes::from(data),
                 stale_at: from_i64(stale_at),
                 name: Arc::new(name),
+                revocation_epoch: stored_stamp(generation, epoch).read(self.generation),
             }
         } else {
             let key = name_to_key(&interest.name);
-            let (stale_at, data) = self.fetch_exact(&conn, &key)?;
+            let (stale_at, data, revocation_epoch) = self.fetch_exact(&conn, &key)?;
             CsEntry {
                 data,
                 stale_at,
                 name: interest.name.clone(),
+                revocation_epoch,
             }
         };
 
@@ -248,14 +304,17 @@ impl ContentStore for SqliteCs {
 
         self.evict_to_fit(&conn, entry_bytes);
 
+        let stamp = StoredStamp::new(self.generation, meta.revocation_epoch);
         let res = conn.execute(
-            "INSERT OR REPLACE INTO cs (key, stale_at, data, last_access) \
-             VALUES (?1, ?2, ?3, ?4)",
+            "INSERT OR REPLACE INTO cs (key, stale_at, data, last_access, generation, epoch) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             rusqlite::params![
                 key.as_slice(),
                 to_i64(meta.stale_at),
                 data.as_ref(),
-                to_i64(now_ns())
+                to_i64(now_ns()),
+                to_i64(stamp.generation),
+                to_i64(stamp.epoch)
             ],
         );
         if res.is_err() {
@@ -441,6 +500,23 @@ impl ContentStore for SqliteCs {
         }
         evicted
     }
+
+    async fn restamp(&self, name: &Name, data: &Bytes, epoch: u64) {
+        let key = name_to_key(name);
+        let Ok(conn) = self.conn.lock() else {
+            return;
+        };
+        let stamp = StoredStamp::new(self.generation, Some(epoch));
+        let _ = conn.execute(
+            "UPDATE cs SET generation = ?1, epoch = ?2 WHERE key = ?3 AND data = ?4",
+            rusqlite::params![
+                to_i64(stamp.generation),
+                to_i64(stamp.epoch),
+                key.as_slice(),
+                data.as_ref()
+            ],
+        );
+    }
 }
 
 #[cfg(test)]
@@ -456,10 +532,16 @@ mod tests {
     }
 
     fn meta_fresh() -> CsMeta {
-        CsMeta { stale_at: u64::MAX }
+        CsMeta {
+            stale_at: u64::MAX,
+            revocation_epoch: None,
+        }
     }
     fn meta_stale() -> CsMeta {
-        CsMeta { stale_at: 0 }
+        CsMeta {
+            stale_at: 0,
+            revocation_epoch: None,
+        }
     }
 
     fn interest(components: &[&str]) -> Interest {
@@ -619,5 +701,75 @@ mod tests {
         assert_eq!(cs.evict_prefix(&arc_name(&["p"]), None).await, 2);
         assert_eq!(cs.len(), 1);
         assert!(cs.get(&interest(&["q"])).await.is_some());
+    }
+
+    fn stamped(epoch: u64) -> CsMeta {
+        CsMeta {
+            stale_at: u64::MAX,
+            revocation_epoch: Some(epoch),
+        }
+    }
+
+    async fn epoch_of(cs: &SqliteCs, name: &str) -> Option<u64> {
+        cs.get(&interest(&[name])).await.unwrap().revocation_epoch
+    }
+
+    /// Keyring epochs restart at 0, so a stamp read back by a later open must
+    /// never look current; unvalidated entries stay unstamped.
+    #[tokio::test]
+    async fn stamps_from_an_earlier_open_are_never_current() {
+        let (_d, path) = tmp();
+        let judged = Bytes::from_static(b"validated");
+        {
+            let cs = SqliteCs::open(&path, 1 << 20).unwrap();
+            cs.insert(judged.clone(), arc_name(&["v"]), stamped(0))
+                .await;
+            cs.insert(Bytes::from_static(b"u"), arc_name(&["u"]), meta_fresh())
+                .await;
+            assert_eq!(epoch_of(&cs, "v").await, Some(0));
+        }
+        let cs = SqliteCs::open(&path, 1 << 20).unwrap();
+        assert_eq!(epoch_of(&cs, "v").await, Some(crate::EARLIER_PROCESS_EPOCH));
+        assert_eq!(epoch_of(&cs, "u").await, None);
+
+        cs.restamp(&arc_name(&["v"]), &Bytes::from_static(b"other"), 0)
+            .await;
+        assert_eq!(
+            epoch_of(&cs, "v").await,
+            Some(crate::EARLIER_PROCESS_EPOCH),
+            "a judgement of other bytes does not mark the entry"
+        );
+        cs.restamp(&arc_name(&["v"]), &judged, 0).await;
+        assert_eq!(epoch_of(&cs, "v").await, Some(0), "re-stamped by this open");
+        drop(cs);
+        let cs = SqliteCs::open(&path, 1 << 20).unwrap();
+        assert_eq!(epoch_of(&cs, "v").await, Some(crate::EARLIER_PROCESS_EPOCH));
+    }
+
+    /// Rows written before entries carried stamps do not record whether they
+    /// were validated: none of them is served.
+    #[tokio::test]
+    async fn a_store_from_before_stamps_serves_nothing() {
+        let (_d, path) = tmp();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute(
+                "CREATE TABLE cs (key BLOB PRIMARY KEY, stale_at INTEGER NOT NULL, \
+                 data BLOB NOT NULL, last_access INTEGER NOT NULL)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO cs VALUES (?1, -1, ?2, 0)",
+                rusqlite::params![
+                    name_to_key(&arc_name(&["old"])),
+                    b"old-layout-data".as_slice()
+                ],
+            )
+            .unwrap();
+        }
+        let cs = SqliteCs::open(&path, 1 << 20).unwrap();
+        assert_eq!(cs.len(), 0);
+        assert!(cs.get(&interest(&["old"])).await.is_none());
     }
 }

@@ -96,7 +96,14 @@ async fn cs_erase_removes_prefix_over_the_wire() {
         let data = DataBuilder::new(n.clone(), b"x").sign_digest_sha256();
         engine
             .cs()
-            .insert_erased(data, Arc::new(n), CsMeta { stale_at: u64::MAX })
+            .insert_erased(
+                data,
+                Arc::new(n),
+                CsMeta {
+                    stale_at: u64::MAX,
+                    revocation_epoch: None,
+                },
+            )
             .await;
     }
     assert_eq!(engine.cs().len(), 2, "two entries seeded");

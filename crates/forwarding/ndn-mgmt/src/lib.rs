@@ -508,6 +508,9 @@ pub struct SigningIdentityInfo {
     pub key: Name,
     /// An in-memory key minted at startup (not persisted).
     pub ephemeral: bool,
+    /// When the key's certificate expires (ns since the Unix epoch), if the
+    /// node holds one for it.
+    pub valid_until: Option<u64>,
 }
 
 /// The outcome of a successful `security/revoke`, JSON in the
@@ -568,11 +571,47 @@ pub struct ContextRefreshInfo {
     pub detail: String,
 }
 
+/// What a `security/renew` did for one certificate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RenewalState {
+    /// A new certificate for the same key was issued, stored and served.
+    Renewed,
+    /// Not renewable as it stands — the CA refused (revoked key,
+    /// non-renewable role, …) or the certificate expired; `detail` says what
+    /// to do instead (usually: a new invite).
+    Refused,
+    /// The attempt failed (CA unreachable, local error); it can be retried.
+    Failed,
+}
+
+/// One certificate's `security/renew` result (the answer is a JSON list of
+/// these, one per certificate a namespace CA issued to this node).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RenewalInfo {
+    /// The certified key, `/<ns>/<role>/<device>/KEY/<id>`.
+    pub key: String,
+    pub state: RenewalState,
+    /// The certificate held before.
+    pub previous: String,
+    /// Its validity end, ISO 8601 (UTC).
+    pub previous_valid_until: String,
+    /// The new certificate, for `renewed`.
+    pub certificate: Option<String>,
+    /// Its validity end, ISO 8601 (UTC), for `renewed`.
+    pub valid_until: Option<String>,
+    /// Its lifetime in seconds, as the CA's policy for the role set it.
+    pub validity_secs: Option<u64>,
+    /// Why, for `refused` and `failed`.
+    pub detail: String,
+}
+
 /// Backend for the trust-admin verbs: adopt a trust context
 /// (`security/context-adopt`), enroll with an invite (`security/enroll`),
 /// revoke a device on the root device (`security/revoke`), refresh held
-/// contexts (`security/context-refresh`), and report the identity the node
-/// signs with now. The spec crate owns the trait; the forwarder (`ndn-fwd`)
+/// contexts (`security/context-refresh`), renew this node's certificates
+/// (`security/renew`), and report the identity the node signs with now. The
+/// spec crate owns the trait; the forwarder (`ndn-fwd`)
 /// implements it over its engine, keyring, PIB, CA, context store and
 /// publisher. Authorization happens before a verb reaches the backend (the
 /// trust-admin peer-credential gate).
@@ -607,6 +646,15 @@ pub trait TrustAdminMgmtBackend: Send + Sync {
         Err(TrustRefusal {
             status_code: ndn_mgmt_wire::control_response::status::NOT_FOUND,
             reason: "this node does not refresh trust contexts at runtime".to_owned(),
+        })
+    }
+
+    /// Renew, now, every certificate a namespace CA issued to this node's
+    /// keys.
+    async fn renew(&self) -> Result<Vec<RenewalInfo>, TrustRefusal> {
+        Err(TrustRefusal {
+            status_code: ndn_mgmt_wire::control_response::status::NOT_FOUND,
+            reason: "this node does not renew certificates at runtime".to_owned(),
         })
     }
 

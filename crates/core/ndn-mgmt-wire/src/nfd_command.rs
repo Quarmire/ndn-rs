@@ -143,6 +143,12 @@ pub mod verb {
     /// a newer version and adopt it if the held version's root signed it.
     /// Authorized like [`CONTEXT_ADOPT`].
     pub const CONTEXT_REFRESH: &[u8] = b"context-refresh";
+    /// `security/renew` — renew, now, every certificate a namespace CA issued
+    /// to this node's keys: each is re-certified for the same key by the CA
+    /// that issued it, on proof of the current certificate (no invite), then
+    /// stored, served and kept signing with. Authorized like
+    /// [`CONTEXT_ADOPT`].
+    pub const RENEW: &[u8] = b"renew";
 }
 
 /// `/localhost/nfd/<module>/<verb>/<full-0x68-TLV>`.

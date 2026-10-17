@@ -162,9 +162,9 @@ Each flow lists steps, what is stored where, failure handling, and status
   the token is redeemed, also for the loser of two concurrent requests for
   one name (**have**: `IssuancePolicy::single_key_identity`, the CA's
   in-flight reservation).
-- Lifetime: certificates from the namespace CA last `[ca] cert_validity_days`
-  (default 90); a device's request names no lifetime, so the CA's setting
-  decides, until renewal (F10) allows shorter ones.
+- Lifetime: certificates from the namespace CA last their role's `[ca]
+  cert_validity_days` (default 90; e.g. `guest = 7`); a device's request names
+  no lifetime, so the CA's setting decides. Devices renew before expiry (F10).
 
 ### F3 Delegate the CA to a relay
 1. The relay generates `/<ns>/CA` key locally; produces a cert request.
@@ -235,9 +235,17 @@ except as the owner-chosen word list.
 3. Expiry needs no action; early end = F4.
 
 ### F10 Rotate keys
-Device keys renew through NDNCERT renewal (`ndn_identity::start_renewal`,
-**have**) before expiry. Root rotation = new root signs a context that lists
-both roots for one version, then drops the old one (**gap**).
+Device certificates renew before expiry without an invite (**have**:
+`ndn_cert::renew_certificate` against the CA's built-in `renewal` challenge,
+proof of possession of the current certificate's key; same key re-certified;
+refused for an expired certificate, a revoked key or a non-renewable role —
+guests by default; per-role lifetimes and `[ca] renewable_roles` in
+`ndn_cert::RolePolicy`; the `ndn-fwd` renewal timer `[security] renew_before`
+and `ndn-fwd renew`; mobile `NdnEngine::renew_certificate` /
+`certificate_validity`; see the wiki's reference/renewal.md). Rotating to a
+new device key is a new enrollment (invite or admin approval) (**gap**: no
+rotation-by-renewal). Root rotation = new root signs a context that lists both
+roots for one version, then drops the old one (**gap**).
 
 ### F11 Travel / carrier-grade NAT
 Devices dial out to a relay (a configured link over QUIC, or WebTransport from

@@ -475,14 +475,39 @@ where
     let data = crate::client::fetch_issued_cert_via(exchange, &invite.ca_prefix, &cert_name)
         .await
         .map_err(|e| InviteEnrollError::from_cert(e, invite))?;
-    let issued = check_issued(&data, device_key.as_ref()).await?;
-    check_chain(&data, keyring, exchange, invite).await?;
+    let issued = check_issued(&data, device_key.as_ref())
+        .await
+        .map_err(|e| e.into_invite(invite))?;
+    check_chain(&data, keyring, exchange, &invite.namespace)
+        .await
+        .map_err(|e| e.into_invite(invite))?;
     Ok(issued)
+}
+
+/// Why [`check_issued`] or [`check_chain`] did not accept an issued
+/// certificate.
+pub(crate) enum IssuedCheckError {
+    /// The certificate itself is wrong; the reason says how.
+    Refused(String),
+    /// The device key could not sign the key check.
+    Signing(String),
+    /// Fetching an issuer certificate failed.
+    Exchange(CertError),
+}
+
+impl IssuedCheckError {
+    fn into_invite(self, invite: &InviteLink) -> InviteEnrollError {
+        match self {
+            Self::Refused(why) => InviteEnrollError::IssuedCertificate(why),
+            Self::Signing(e) => InviteEnrollError::Signing(e),
+            Self::Exchange(e) => InviteEnrollError::from_cert(e, invite),
+        }
+    }
 }
 
 /// Issuer certificates [`enroll_with_invite`] fetches at most to walk the
 /// issued certificate's chain.
-const MAX_ISSUER_FETCHES: usize = 5;
+pub(crate) const MAX_ISSUER_FETCHES: usize = 5;
 
 /// Exchanges (Interest → Data) [`enroll_with_invite`] makes at most: the
 /// context's metadata and the context, NEW, CHALLENGE, the issued
@@ -495,17 +520,17 @@ pub const INVITE_ENROLL_MAX_EXCHANGES: u32 = 5 + MAX_ISSUER_FETCHES as u32;
 /// the forwarder's, whose keyring may differ), fetching each missing issuer
 /// certificate through `exchange`; each hop's signature is verified by the
 /// chain walk, so a fetched certificate is never trusted by itself.
-async fn check_chain<E>(
+pub(crate) async fn check_chain<E>(
     data: &Data,
     keyring: &Arc<Keyring>,
     exchange: &mut E,
-    invite: &InviteLink,
-) -> Result<(), InviteEnrollError>
+    namespace: &Name,
+) -> Result<(), IssuedCheckError>
 where
     E: CaExchange + ?Sized,
 {
     const MAX_FETCHES: usize = MAX_ISSUER_FETCHES - 1;
-    let refused = |why: String| InviteEnrollError::IssuedCertificate(why);
+    let refused = IssuedCheckError::Refused;
     let validator = Validator::with_keyring(
         Arc::clone(keyring),
         Arc::new(CertCache::new()),
@@ -517,8 +542,7 @@ where
             (ValidationResult::Valid(_), _) => return Ok(()),
             (ValidationResult::Invalid(e), _) => {
                 return Err(refused(format!(
-                    "it does not chain to the root of {} under its schema: {e}",
-                    invite.namespace
+                    "it does not chain to the root of {namespace} under its schema: {e}"
                 )));
             }
             (ValidationResult::Pending, missing) => {
@@ -529,7 +553,7 @@ where
                 let reply = exchange
                     .express(interest)
                     .await
-                    .map_err(|e| InviteEnrollError::from_cert(e, invite))?;
+                    .map_err(IssuedCheckError::Exchange)?;
                 let cert = Certificate::decode(&reply).map_err(|e| {
                     refused(format!("its issuer certificate {missing} is malformed: {e}"))
                 })?;
@@ -538,18 +562,17 @@ where
         }
     }
     Err(refused(format!(
-        "its chain to the root of {} is longer than {MAX_FETCHES} certificates",
-        invite.namespace
+        "its chain to the root of {namespace} is longer than {MAX_FETCHES} certificates"
     )))
 }
 
 /// The issued certificate must certify `device_key` (its public key verifies
 /// a fresh signature by that key) and be valid now.
-async fn check_issued(
+pub(crate) async fn check_issued(
     data: &Data,
     device_key: &dyn Signer,
-) -> Result<IssuedCertificate, InviteEnrollError> {
-    let refused = |why: String| InviteEnrollError::IssuedCertificate(why);
+) -> Result<IssuedCertificate, IssuedCheckError> {
+    let refused = IssuedCheckError::Refused;
     let cert = Certificate::decode(data).map_err(|e| refused(format!("not a certificate: {e}")))?;
     if !cert.name.has_prefix(device_key.key_name()) {
         return Err(refused(format!(
@@ -562,7 +585,7 @@ async fn check_issued(
     let probe = device_key
         .sign(PROBE)
         .await
-        .map_err(|e| InviteEnrollError::Signing(e.to_string()))?;
+        .map_err(|e| IssuedCheckError::Signing(e.to_string()))?;
     match verify_by_sig_type(device_key.sig_type(), PROBE, &probe, &cert.public_key).await {
         Ok(VerifyOutcome::Valid) => {}
         _ => return Err(refused("it certifies a different public key".into())),

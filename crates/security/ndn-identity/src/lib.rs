@@ -30,6 +30,7 @@ pub mod transition;
 
 pub use adopt::{adopt_anchor_link_via_engine, refresh_context_via_engine};
 pub use invite::{enroll_via_engine_budget, enroll_with_invite_via_engine};
+pub use renewal::{RenewBefore, backoff_delay, renew_via_engine, renew_via_engine_budget};
 pub use ca::{NdncertCa, NdncertCaBuilder};
 pub use device::{DeviceConfig, FactoryCredential, RenewalPolicy};
 pub use device_approval_net::{

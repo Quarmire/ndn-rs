@@ -312,6 +312,7 @@ impl WasmEngineBuilder {
             decode: TlvDecodeStage::new(Arc::clone(&face_table), Arc::clone(&face_states)),
             cs_lookup: CsLookupStage {
                 cs: Arc::clone(&cs),
+                validator: validator.clone(),
             },
             pit_check: PitCheckStage {
                 pit: Arc::clone(&pit),
@@ -345,7 +346,6 @@ impl WasmEngineBuilder {
             cs_insert: CsInsertStage {
                 cs: Arc::clone(&cs),
                 admission: Arc::new(ndn_store::DefaultAdmissionPolicy),
-                validator: validator.clone(),
             },
             unsolicited_policy: self.config.unsolicited_data,
             channel_cap: self.config.pipeline_channel_cap,

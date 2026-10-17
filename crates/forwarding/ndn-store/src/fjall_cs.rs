@@ -5,7 +5,10 @@
 //! bytes, without the outer `0x07` wrapper) so NDN lexicographic ordering is
 //! preserved and `CanBePrefix` lookups become range scans.
 //!
-//! Values: `[stale_at: 8B BE u64][wire-format Data bytes]`.
+//! Values: `[stale_at: 8B BE u64][generation: 8B][epoch: 8B][wire-format Data bytes]`
+//! (see `cs_keycodec`). The `cs_meta` keyspace holds the store's
+//! generation; a store without it predates revocation stamps and is cleared
+//! on open (it is a cache, and its entries do not record their validation).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -15,7 +18,7 @@ use bytes::Bytes;
 use ndn_packet::{Interest, Name};
 
 use crate::cs_keycodec::{
-    STALE_AT_LEN, decode_value, encode_value, key_to_name, name_to_key, now_ns,
+    HEADER_LEN, StoredStamp, decode_value, encode_value, key_to_name, name_to_key, now_ns,
 };
 use crate::{ContentStore, CsCapacity, CsEntry, CsEntryFilter, CsMeta, InsertResult};
 
@@ -44,22 +47,42 @@ pub struct FjallCs {
     // Held to keep the database open for `keyspace`'s lifetime; never read directly.
     #[allow(dead_code)]
     db: fjall::Database,
+    /// This open's generation (see [`StoredStamp`]).
+    generation: u64,
     max_bytes: AtomicUsize,
     current_bytes: AtomicUsize,
     entry_count: AtomicUsize,
 }
 
+const META_KEYSPACE: &str = "cs_meta";
+const GENERATION_KEY: &[u8] = b"generation";
+
 impl FjallCs {
     /// Open (or create) a persistent CS at `path`.
     pub fn open(path: impl AsRef<std::path::Path>, max_bytes: usize) -> fjall::Result<Self> {
         let db = fjall::Database::builder(path).open()?;
+        let stamped_layout = db.keyspace_exists(META_KEYSPACE);
         let keyspace = db.keyspace("cs", fjall::KeyspaceCreateOptions::default)?;
+        if !stamped_layout {
+            keyspace.clear()?;
+        }
+        let meta = db.keyspace(META_KEYSPACE, fjall::KeyspaceCreateOptions::default)?;
+        let generation = meta
+            .get(GENERATION_KEY)?
+            .and_then(|v| <[u8; 8]>::try_from(&*v).ok())
+            .map_or(0, u64::from_be_bytes)
+            + 1;
+        meta.insert(GENERATION_KEY, generation.to_be_bytes())?;
+        // Durable before any entry is stamped with it, so no later open
+        // takes the same generation.
+        db.persist(fjall::PersistMode::SyncAll)?;
 
         let (count, bytes) = Self::scan_stats(&keyspace);
 
         Ok(Self {
             keyspace,
             db,
+            generation,
             max_bytes: AtomicUsize::new(max_bytes),
             current_bytes: AtomicUsize::new(bytes),
             entry_count: AtomicUsize::new(count),
@@ -71,9 +94,9 @@ impl FjallCs {
         let mut bytes = 0usize;
         for guard in ks.iter() {
             if let Ok((_key, val)) = guard.into_inner()
-                && val.len() > STALE_AT_LEN
+                && val.len() > HEADER_LEN
             {
-                bytes += val.len() - STALE_AT_LEN;
+                bytes += val.len() - HEADER_LEN;
                 count += 1;
             }
         }
@@ -94,7 +117,7 @@ impl FjallCs {
                 break;
             }
             if let Ok((key, val)) = guard.into_inner() {
-                let data_len = val.len().saturating_sub(STALE_AT_LEN);
+                let data_len = val.len().saturating_sub(HEADER_LEN);
                 to_delete.push((key.to_vec(), data_len));
                 current = current.saturating_sub(data_len);
             }
@@ -122,7 +145,7 @@ impl ContentStore for FjallCs {
             let data_name = Name::from_components(comps[..comps.len() - 1].iter().cloned());
             let key = name_to_key(&data_name);
             let slice = self.keyspace.get(&key).ok()??;
-            let (stale_at, data) = decode_value(&slice)?;
+            let (stale_at, stamp, data) = decode_value(&slice)?;
 
             let expected_digest = &comps.last().unwrap().value;
             let actual = ring::digest::digest(&ring::digest::SHA256, &data);
@@ -133,19 +156,21 @@ impl ContentStore for FjallCs {
                 data,
                 stale_at,
                 name: Arc::new(data_name),
+                revocation_epoch: stamp.read(self.generation),
             }
         } else if interest.selectors().can_be_prefix {
             let prefix_key = name_to_key(&interest.name);
             let mut found = None;
             for guard in self.keyspace.prefix(&prefix_key) {
                 if let Ok((key, val)) = guard.into_inner()
-                    && let Some((stale_at, data)) = decode_value(&val)
+                    && let Some((stale_at, stamp, data)) = decode_value(&val)
                     && let Some(name) = key_to_name(&key)
                 {
                     found = Some(CsEntry {
                         data,
                         stale_at,
                         name: Arc::new(name),
+                        revocation_epoch: stamp.read(self.generation),
                     });
                     break;
                 }
@@ -154,11 +179,12 @@ impl ContentStore for FjallCs {
         } else {
             let key = name_to_key(&interest.name);
             let slice = self.keyspace.get(&key).ok()??;
-            let (stale_at, data) = decode_value(&slice)?;
+            let (stale_at, stamp, data) = decode_value(&slice)?;
             CsEntry {
                 data,
                 stale_at,
                 name: interest.name.clone(),
+                revocation_epoch: stamp.read(self.generation),
             }
         };
 
@@ -173,7 +199,7 @@ impl ContentStore for FjallCs {
         let key = name_to_key(&name);
 
         let was_present = if let Ok(Some(old_val)) = self.keyspace.get(&key) {
-            let old_data_len = old_val.len().saturating_sub(STALE_AT_LEN);
+            let old_data_len = old_val.len().saturating_sub(HEADER_LEN);
             self.current_bytes
                 .fetch_sub(old_data_len, Ordering::Relaxed);
             true
@@ -183,7 +209,8 @@ impl ContentStore for FjallCs {
 
         self.evict_to_fit(entry_bytes);
 
-        let val = encode_value(meta.stale_at, &data);
+        let stamp = StoredStamp::new(self.generation, meta.revocation_epoch);
+        let val = encode_value(meta.stale_at, stamp, &data);
         if self.keyspace.insert(&key, &val).is_err() {
             return InsertResult::Skipped;
         }
@@ -203,7 +230,7 @@ impl ContentStore for FjallCs {
     async fn evict(&self, name: &Name) -> bool {
         let key = name_to_key(name);
         if let Ok(Some(old_val)) = self.keyspace.get(&key) {
-            let old_data_len = old_val.len().saturating_sub(STALE_AT_LEN);
+            let old_data_len = old_val.len().saturating_sub(HEADER_LEN);
             let _ = self.keyspace.remove(&key);
             self.current_bytes
                 .fetch_sub(old_data_len, Ordering::Relaxed);
@@ -245,7 +272,7 @@ impl ContentStore for FjallCs {
                 break;
             }
             if let Ok((key, val)) = guard.into_inner() {
-                let data_len = val.len().saturating_sub(STALE_AT_LEN);
+                let data_len = val.len().saturating_sub(HEADER_LEN);
                 to_delete.push((key.to_vec(), data_len));
                 evicted += 1;
             }
@@ -266,7 +293,7 @@ impl ContentStore for FjallCs {
             .prefix(&prefix_key)
             .filter_map(|guard| {
                 let (key, val) = guard.into_inner().ok()?;
-                let (_, data) = decode_value(&val)?;
+                let (_, _, data) = decode_value(&val)?;
                 matches(&data).then(|| (key.to_vec(), data))
             })
             .collect();
@@ -279,7 +306,7 @@ impl ContentStore for FjallCs {
                 .ok()
                 .flatten()
                 .and_then(|val| decode_value(&val))
-                .is_some_and(|(_, now)| now == data);
+                .is_some_and(|(_, _, now)| now == data);
             if still && self.keyspace.remove(key.as_slice()).is_ok() {
                 self.current_bytes.fetch_sub(data.len(), Ordering::Relaxed);
                 self.entry_count.fetch_sub(1, Ordering::Relaxed);
@@ -287,6 +314,22 @@ impl ContentStore for FjallCs {
             }
         }
         evicted
+    }
+
+    async fn restamp(&self, name: &Name, data: &Bytes, epoch: u64) {
+        let key = name_to_key(name);
+        // Read-compare-write without a lock, like `insert` (CS-2): an insert
+        // landing in between can be overwritten by the entry it replaced,
+        // which was just checked, so this costs a cache refresh, never trust.
+        if let Ok(Some(val)) = self.keyspace.get(&key)
+            && let Some((stale_at, _, held)) = decode_value(&val)
+            && held == *data
+        {
+            let stamp = StoredStamp::new(self.generation, Some(epoch));
+            let _ = self
+                .keyspace
+                .insert(&key, encode_value(stale_at, stamp, data));
+        }
     }
 }
 
@@ -302,11 +345,17 @@ mod tests {
     }
 
     fn meta_fresh() -> CsMeta {
-        CsMeta { stale_at: u64::MAX }
+        CsMeta {
+            stale_at: u64::MAX,
+            revocation_epoch: None,
+        }
     }
 
     fn meta_stale() -> CsMeta {
-        CsMeta { stale_at: 0 }
+        CsMeta {
+            stale_at: 0,
+            revocation_epoch: None,
+        }
     }
 
     fn interest(components: &[&str]) -> Interest {
@@ -635,5 +684,61 @@ mod tests {
         assert_eq!(cs.len(), 1);
         let entry = cs.get(&interest(&["a"])).await.unwrap();
         assert_eq!(entry.data.as_ref(), b"persistent");
+    }
+
+    fn stamped(epoch: u64) -> CsMeta {
+        CsMeta {
+            stale_at: u64::MAX,
+            revocation_epoch: Some(epoch),
+        }
+    }
+
+    async fn epoch_of(cs: &FjallCs, name: &str) -> Option<u64> {
+        cs.get(&interest(&[name])).await.unwrap().revocation_epoch
+    }
+
+    /// Keyring epochs restart at 0, so a stamp read back by a later open must
+    /// never look current; unvalidated entries stay unstamped.
+    #[tokio::test]
+    async fn stamps_from_an_earlier_open_are_never_current() {
+        let dir = tempfile::tempdir().unwrap();
+        let judged = Bytes::from_static(b"validated");
+        {
+            let cs = FjallCs::open(dir.path(), 65536).unwrap();
+            cs.insert(judged.clone(), arc_name(&["v"]), stamped(0))
+                .await;
+            cs.insert(Bytes::from_static(b"u"), arc_name(&["u"]), meta_fresh())
+                .await;
+            assert_eq!(epoch_of(&cs, "v").await, Some(0));
+        }
+        let cs = FjallCs::open(dir.path(), 65536).unwrap();
+        assert_eq!(epoch_of(&cs, "v").await, Some(crate::EARLIER_PROCESS_EPOCH));
+        assert_eq!(epoch_of(&cs, "u").await, None);
+
+        cs.restamp(&arc_name(&["v"]), &judged, 0).await;
+        assert_eq!(epoch_of(&cs, "v").await, Some(0), "re-stamped by this open");
+        drop(cs);
+        let cs = FjallCs::open(dir.path(), 65536).unwrap();
+        assert_eq!(epoch_of(&cs, "v").await, Some(crate::EARLIER_PROCESS_EPOCH));
+    }
+
+    /// Values written before entries carried stamps do not record whether
+    /// they were validated: none of them is served.
+    #[tokio::test]
+    async fn a_store_from_before_stamps_serves_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = fjall::Database::builder(dir.path()).open().unwrap();
+            let ks = db
+                .keyspace("cs", fjall::KeyspaceCreateOptions::default)
+                .unwrap();
+            let mut old = u64::MAX.to_be_bytes().to_vec();
+            old.extend_from_slice(&[0x06; 64]);
+            ks.insert(name_to_key(&arc_name(&["old"])), old).unwrap();
+            db.persist(fjall::PersistMode::SyncAll).unwrap();
+        }
+        let cs = FjallCs::open(dir.path(), 65536).unwrap();
+        assert_eq!(cs.len(), 0);
+        assert!(cs.get(&interest(&["old"])).await.is_none());
     }
 }

@@ -5,15 +5,53 @@
 //! bytes, without the outer `0x07` wrapper) so NDN lexicographic ordering is
 //! preserved and `CanBePrefix` lookups become range scans.
 //!
-//! Values: `[stale_at: 8B BE u64][wire-format Data bytes]`.
+//! Values (fjall; SQLite stores the same fields as columns):
+//! `[stale_at: 8B BE u64][generation: 8B BE u64][epoch: 8B BE u64][wire-format Data bytes]`,
+//! where `generation`/`epoch` are the entry's [`StoredStamp`].
 
 use bytes::Bytes;
 use ndn_packet::Name;
 
-/// Length of the big-endian `stale_at` prefix on every stored value.
-/// Only the fjall backend packs `[stale_at][data]`; SQLite uses columns.
+use crate::EARLIER_PROCESS_EPOCH;
+
+/// Length of the `[stale_at][generation][epoch]` header on every stored
+/// value. Only the fjall backend packs values; SQLite uses columns.
 #[cfg_attr(not(feature = "fjall"), allow(dead_code))]
-pub(crate) const STALE_AT_LEN: usize = 8;
+pub(crate) const HEADER_LEN: usize = 24;
+
+/// An entry's [`CsEntry::revocation_epoch`](crate::CsEntry::revocation_epoch)
+/// as persisted. The epoch is only meaningful to the process that wrote it
+/// (keyring epochs restart at 0), so it is stored with the store's
+/// `generation`: a number each open of the store takes, one above the last,
+/// and makes durable before writing any entry. Generation 0: not validated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StoredStamp {
+    pub generation: u64,
+    pub epoch: u64,
+}
+
+impl StoredStamp {
+    /// What the store opened as `generation` persists for `revocation_epoch`.
+    pub(crate) fn new(generation: u64, revocation_epoch: Option<u64>) -> Self {
+        match revocation_epoch {
+            Some(epoch) => Self { generation, epoch },
+            None => Self {
+                generation: 0,
+                epoch: 0,
+            },
+        }
+    }
+
+    /// The entry's revocation epoch as read by the store opened as
+    /// `generation`: an earlier generation's epoch means nothing now.
+    pub(crate) fn read(self, generation: u64) -> Option<u64> {
+        match self.generation {
+            0 => None,
+            g if g == generation => Some(self.epoch),
+            _ => Some(EARLIER_PROCESS_EPOCH),
+        }
+    }
+}
 
 pub(crate) fn name_to_key(name: &Name) -> Vec<u8> {
     let mut key = Vec::new();
@@ -66,21 +104,25 @@ pub(crate) fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
 }
 
 #[cfg_attr(not(feature = "fjall"), allow(dead_code))]
-pub(crate) fn encode_value(stale_at: u64, data: &[u8]) -> Vec<u8> {
-    let mut v = Vec::with_capacity(STALE_AT_LEN + data.len());
+pub(crate) fn encode_value(stale_at: u64, stamp: StoredStamp, data: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(HEADER_LEN + data.len());
     v.extend_from_slice(&stale_at.to_be_bytes());
+    v.extend_from_slice(&stamp.generation.to_be_bytes());
+    v.extend_from_slice(&stamp.epoch.to_be_bytes());
     v.extend_from_slice(data);
     v
 }
 
+/// `(stale_at, stamp, data)` of a stored value.
 #[cfg_attr(not(feature = "fjall"), allow(dead_code))]
-pub(crate) fn decode_value(val: &[u8]) -> Option<(u64, Bytes)> {
-    if val.len() < STALE_AT_LEN {
-        return None;
-    }
-    let stale_at = u64::from_be_bytes(val[..STALE_AT_LEN].try_into().ok()?);
-    let data = Bytes::copy_from_slice(&val[STALE_AT_LEN..]);
-    Some((stale_at, data))
+pub(crate) fn decode_value(val: &[u8]) -> Option<(u64, StoredStamp, Bytes)> {
+    let (header, data) = val.split_first_chunk::<HEADER_LEN>()?;
+    let field = |i: usize| u64::from_be_bytes(header[i * 8..(i + 1) * 8].try_into().unwrap());
+    let stamp = StoredStamp {
+        generation: field(1),
+        epoch: field(2),
+    };
+    Some((field(0), stamp, Bytes::copy_from_slice(data)))
 }
 
 pub(crate) fn write_var(buf: &mut Vec<u8>, val: u64) {

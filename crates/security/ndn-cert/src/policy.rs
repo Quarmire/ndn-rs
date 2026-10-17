@@ -160,6 +160,17 @@ pub trait IssuancePolicy: Send + Sync {
     fn single_key_identity(&self, _key_name: &Name) -> Option<SingleKeyIdentity> {
         None
     }
+
+    /// Whether this policy ever issues on the CA's built-in
+    /// [`RENEWAL_CHALLENGE`](crate::renewal::RENEWAL_CHALLENGE): the CA
+    /// offers renewal only then. A renewal reaches [`decide`](Self::decide)
+    /// with a `renewal` attestation leaf once the CA has checked that the
+    /// requester holds a current, unrevoked certificate it issued for the
+    /// same key; the policy then decides whether that certificate's role is
+    /// renewable and for how long. Default `false`: no renewal.
+    fn offers_renewal(&self) -> bool {
+        false
+    }
 }
 
 /// An identity that may hold one certified key at a time (see
@@ -259,6 +270,11 @@ pub const TOKEN_SCOPE_EVIDENCE: &str = "scope";
 ///   inside `/<ns>/member`, and a `guest` only when scoped inside
 ///   `/<ns>/guest` (`ndn-fwd-tokens new --role guest`);
 /// - `admin` and `node` certificates are never issued on a token alone;
+/// - a **renewal** (the CA's built-in [`RENEWAL_CHALLENGE`](crate::renewal::RENEWAL_CHALLENGE):
+///   the requester proved it holds a current, unrevoked certificate this CA
+///   issued for the same key) admits the role of that certificate when the
+///   role is renewable ([`RoleTerms::renewable`]; every role but `guest` by
+///   default, so guest access simply ends);
 /// - other challenges (pin, email, nop, …) admit no role;
 /// - a device identity `/<ns>/<role>/<device>` holds one certified key at a
 ///   time ([`single_key_identity`](IssuancePolicy::single_key_identity)): a
@@ -266,18 +282,65 @@ pub const TOKEN_SCOPE_EVIDENCE: &str = "scope";
 ///   another key, so it cannot be used to take over an enrolled device's
 ///   name; that needs the old certificate revoked first or an admin's
 ///   device approval.
+///
+/// Each role's certificates last [`RoleTerms::validity`] (the CA's default
+/// validity when unset).
 pub struct RolePolicy {
     namespace: Name,
+    terms: [RoleTerms; 4],
+}
+
+/// What a [`RolePolicy`] grants one role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoleTerms {
+    /// Lifetime of the role's certificates; `None`: the CA's default
+    /// validity ([`IssuanceContext::default_validity`]).
+    pub validity: Option<Duration>,
+    /// Whether a certificate of this role may be renewed.
+    pub renewable: bool,
 }
 
 impl RolePolicy {
+    /// Every role at the CA's default validity; every role but `guest`
+    /// renewable.
     pub fn new(namespace: Name) -> Self {
-        Self { namespace }
+        let terms = |role| RoleTerms {
+            validity: None,
+            renewable: role != crate::roles::Role::Guest,
+        };
+        Self {
+            namespace,
+            terms: crate::roles::Role::ALL.map(terms),
+        }
     }
 
     pub fn namespace(&self) -> &Name {
         &self.namespace
     }
+
+    /// Issue `role`'s certificates for `validity` (builder).
+    pub fn with_validity(mut self, role: crate::roles::Role, validity: Duration) -> Self {
+        self.terms[role_index(role)].validity = Some(validity);
+        self
+    }
+
+    /// Whether `role`'s certificates may be renewed (builder).
+    pub fn with_renewable(mut self, role: crate::roles::Role, renewable: bool) -> Self {
+        self.terms[role_index(role)].renewable = renewable;
+        self
+    }
+
+    /// What this policy grants `role`.
+    pub fn terms(&self, role: crate::roles::Role) -> RoleTerms {
+        self.terms[role_index(role)]
+    }
+}
+
+fn role_index(role: crate::roles::Role) -> usize {
+    crate::roles::Role::ALL
+        .iter()
+        .position(|r| *r == role)
+        .expect("Role::ALL lists every role")
 }
 
 /// The challenge kind through which an admin approves a device.
@@ -307,9 +370,6 @@ impl IssuancePolicy for RolePolicy {
     fn decide(&self, ctx: &IssuanceContext<'_>) -> IssuanceDecision {
         use crate::roles::{Role, parse_device_key, role_prefix};
 
-        let issue = IssuanceDecision::Issue {
-            validity: ctx.default_validity,
-        };
         let Some(device) = ctx
             .cert_request
             .name
@@ -323,10 +383,23 @@ impl IssuancePolicy for RolePolicy {
                 ctx.cert_request.name, self.namespace
             ));
         };
+        let role = device.role;
+        let terms = self.terms(role);
+        let issue = IssuanceDecision::Issue {
+            validity: terms.validity.unwrap_or(ctx.default_validity),
+        };
         if attested(ctx, DEVICE_APPROVAL) {
             return issue;
         }
-        let role = device.role;
+        if attested(ctx, crate::renewal::RENEWAL_CHALLENGE) {
+            if terms.renewable {
+                return issue;
+            }
+            return IssuanceDecision::Deny(format!(
+                "{role} certificates are not renewable at this CA: the certificate ends at its \
+                 expiry; for access after that, ask for a new invite"
+            ));
+        }
         if matches!(role, Role::Admin | Role::Node) {
             return IssuanceDecision::Deny(format!(
                 "{role} certificates require an admin's device approval \
@@ -369,6 +442,10 @@ impl IssuancePolicy for RolePolicy {
             identity: Name::from_components(key_name.components()[..identity_len].iter().cloned()),
             unless_attested: DEVICE_APPROVAL,
         })
+    }
+
+    fn offers_renewal(&self) -> bool {
+        self.terms.iter().any(|t| t.renewable)
     }
 }
 

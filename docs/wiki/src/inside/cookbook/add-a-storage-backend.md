@@ -17,14 +17,14 @@ Choose the layer, then follow the matching recipe.
 ## Recipe A — a Content Store
 
 `ContentStore` (`ndn-store/src/content_store.rs`) is `async` so a disk-backed
-store is supported; in-memory ones complete synchronously. Only four methods are
+store is supported; in-memory ones complete synchronously. Six methods are
 required — the rest are defaulted:
 
 ```rust,ignore
 use bytes::Bytes;
 use std::sync::Arc;
 use ndn_packet::{Interest, Name};
-use ndn_store::{ContentStore, CsCapacity, CsEntry, CsMeta, InsertResult};
+use ndn_store::{ContentStore, CsCapacity, CsEntry, CsEntryFilter, CsMeta, InsertResult};
 
 pub struct MyCs { /* ... */ }
 
@@ -43,6 +43,18 @@ impl ContentStore for MyCs {
 
     async fn evict(&self, name: &Name) -> bool { todo!() }
 
+    async fn evict_matching(&self, prefix: &Name, matches: &CsEntryFilter) -> usize {
+        // Evict entries under `prefix` whose wire bytes `matches` accepts,
+        // keeping any replaced while judged (revoked keys' Data).
+        todo!()
+    }
+
+    async fn restamp(&self, name: &Name, data: &Bytes, epoch: u64) {
+        // If the entry named `name` still holds `data`, set its
+        // revocation_epoch to Some(epoch).
+        todo!()
+    }
+
     fn capacity(&self) -> CsCapacity { CsCapacity::bytes(0) }
 }
 ```
@@ -50,10 +62,19 @@ impl ContentStore for MyCs {
 Key contracts:
 
 - **Store wire bytes, not decoded packets.** `CsEntry { data: Bytes, stale_at:
-  u64, name: Arc<Name> }` holds the encoded Data so a cache hit re-emits the
-  original bytes with no re-encoding. `CsEntry::is_fresh(now_ns)` implements the
-  freshness predicate; `CsMeta::stale_at` is the nanosecond deadline derived from
-  the Data's `FreshnessPeriod`.
+  u64, name: Arc<Name>, revocation_epoch: Option<u64> }` holds the encoded Data
+  so a cache hit re-emits the original bytes with no re-encoding.
+  `CsEntry::is_fresh(now_ns)` implements the freshness predicate;
+  `CsMeta::stale_at` is the nanosecond deadline derived from the Data's
+  `FreshnessPeriod`.
+- **Keep the revocation stamp.** Return `CsMeta::revocation_epoch` as the
+  entry's `revocation_epoch` until `restamp` changes it; `CsLookupStage`
+  re-checks an entry against the trust contexts' revocations when its stamp
+  differs from the keyring's epoch (see
+  [Revoking a device](../../reference/revocation.md#cached-data)). A store
+  whose entries outlive the process must report `EARLIER_PROCESS_EPOCH` for
+  entries stamped by an earlier process, since keyring epochs restart at 0;
+  `FjallCs` and `SqliteCs` store a per-open generation with each stamp.
 - **`insert` returns `InsertResult`** — `Inserted`, `Replaced`, or `Skipped`.
 - **The CS does not verify signatures.** Validation happens earlier on the return
   path (see the pipeline). A CS that re-verifies would double-pay.

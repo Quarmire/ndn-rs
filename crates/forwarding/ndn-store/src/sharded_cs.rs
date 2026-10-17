@@ -104,6 +104,11 @@ impl<C: ContentStore> ContentStore for ShardedCs<C> {
         self.shards[idx].evict_matching(prefix, matches).await
     }
 
+    async fn restamp(&self, name: &Name, data: &Bytes, epoch: u64) {
+        let idx = self.shard_for(name);
+        self.shards[idx].restamp(name, data, epoch).await
+    }
+
     fn stats(&self) -> CsStats {
         let mut combined = CsStats::default();
         for shard in &self.shards {
@@ -130,7 +135,10 @@ mod tests {
     }
 
     fn meta_fresh() -> CsMeta {
-        CsMeta { stale_at: u64::MAX }
+        CsMeta {
+            stale_at: u64::MAX,
+            revocation_epoch: None,
+        }
     }
 
     fn interest(components: &[&str]) -> Interest {

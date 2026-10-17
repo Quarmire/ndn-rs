@@ -207,14 +207,159 @@ pub struct CaTomlConfig {
     /// is constructed by the CA wiring (`ndn-config` stays free of `ndn-cert`).
     #[serde(default)]
     pub require_attestation: Option<RequireAttestationConfig>,
-    /// Lifetime, in days, of the certificates this CA issues (also the
-    /// maximum it advertises in INFO). Default 90: until certificate renewal
-    /// is built, an enrolled device must stay valid between enrollments;
-    /// renewal will allow shorter lifetimes. Devices enrolling by invite name
-    /// no lifetime, so they get exactly this; `ndn-fwd enroll` reports the
-    /// expiry the CA issued.
-    #[serde(default = "CaTomlConfig::default_cert_validity_days")]
-    pub cert_validity_days: u32,
+    /// Lifetime, in days, of the certificates this CA issues: one number for
+    /// every role, or a `[ca.cert_validity_days]` table per role (`admin`,
+    /// `member`, `node`, `guest`, plus `default` for the roles it does not
+    /// list). The longest is the maximum the CA advertises in INFO. Default
+    /// 90 for every role. Devices enrolling by invite or renewing name no
+    /// lifetime, so they get exactly their role's; `ndn-fwd enroll` and
+    /// `ndn-fwd renew` report the expiry the CA issued.
+    #[serde(default)]
+    pub cert_validity_days: CertValidityDays,
+    /// Roles whose certificates the CA renews: a device holding a current,
+    /// unrevoked certificate of such a role gets a new one for the same key
+    /// without an invite (`ndn-fwd renew`, the renewal timer). Default
+    /// `["admin", "member", "node"]`: guest certificates end at their
+    /// expiry. Empty: the CA renews nothing.
+    #[serde(default = "CaTomlConfig::default_renewable_roles")]
+    pub renewable_roles: Vec<String>,
+}
+
+/// `[ca] cert_validity_days`: one number of days for every role, or a table
+/// with a number per role and an optional `default` for the rest:
+///
+/// ```toml
+/// [ca.cert_validity_days]
+/// default = 90
+/// guest = 7
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CertValidityDays {
+    /// Days for every role the table does not list.
+    pub default: u32,
+    pub admin: Option<u32>,
+    pub member: Option<u32>,
+    pub node: Option<u32>,
+    pub guest: Option<u32>,
+}
+
+impl CertValidityDays {
+    /// The role names a table may list.
+    pub const ROLES: [&'static str; 4] = ["admin", "member", "node", "guest"];
+
+    /// `days` for every role.
+    pub const fn uniform(days: u32) -> Self {
+        Self {
+            default: days,
+            admin: None,
+            member: None,
+            node: None,
+            guest: None,
+        }
+    }
+
+    /// The table entry for `role` (one of [`ROLES`](Self::ROLES)), if listed.
+    pub fn listed(&self, role: &str) -> Option<u32> {
+        match role {
+            "admin" => self.admin,
+            "member" => self.member,
+            "node" => self.node,
+            "guest" => self.guest,
+            _ => None,
+        }
+    }
+
+    /// Days for `role`: its table entry, else the default.
+    pub fn for_role(&self, role: &str) -> u32 {
+        self.listed(role).unwrap_or(self.default)
+    }
+
+    /// The longest lifetime of any role (the default's included).
+    pub fn max_days(&self) -> u32 {
+        Self::ROLES
+            .iter()
+            .map(|r| self.for_role(r))
+            .fold(self.default, u32::max)
+    }
+
+    fn slot(&mut self, role: &str) -> Option<&mut Option<u32>> {
+        match role {
+            "admin" => Some(&mut self.admin),
+            "member" => Some(&mut self.member),
+            "node" => Some(&mut self.node),
+            "guest" => Some(&mut self.guest),
+            _ => None,
+        }
+    }
+}
+
+impl Default for CertValidityDays {
+    fn default() -> Self {
+        Self::uniform(CaTomlConfig::DEFAULT_CERT_VALIDITY_DAYS)
+    }
+}
+
+impl Serialize for CertValidityDays {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        if Self::ROLES.iter().all(|r| self.listed(r).is_none()) {
+            return s.serialize_u32(self.default);
+        }
+        let mut map = s.serialize_map(None)?;
+        map.serialize_entry("default", &self.default)?;
+        for role in Self::ROLES {
+            if let Some(days) = self.listed(role) {
+                map.serialize_entry(role, &days)?;
+            }
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for CertValidityDays {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct Days;
+        fn days<E: serde::de::Error>(v: i64) -> Result<u32, E> {
+            u32::try_from(v).map_err(|_| E::custom(format!("{v} is not a number of days")))
+        }
+        impl<'de> serde::de::Visitor<'de> for Days {
+            type Value = CertValidityDays;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str(
+                    "a number of days, or a table of days per role (admin, member, node, guest, \
+                     default)",
+                )
+            }
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
+                Ok(CertValidityDays::uniform(days::<E>(v)?))
+            }
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                self.visit_i64(i64::try_from(v).unwrap_or(i64::MAX))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                use serde::de::Error;
+                let mut out = CertValidityDays::default();
+                while let Some(key) = map.next_key::<String>()? {
+                    let value = days::<A::Error>(map.next_value::<i64>()?)?;
+                    if key == "default" {
+                        out.default = value;
+                    } else if let Some(slot) = out.slot(&key) {
+                        *slot = Some(value);
+                    } else {
+                        return Err(A::Error::unknown_field(
+                            &key,
+                            &["default", "admin", "member", "node", "guest"],
+                        ));
+                    }
+                }
+                Ok(out)
+            }
+        }
+        d.deserialize_any(Days)
+    }
 }
 
 /// One NDNCERT challenge the CA offers. Flat (`kind` + per-kind fields) for
@@ -298,8 +443,9 @@ impl CaTomlConfig {
     }
     /// See [`cert_validity_days`](Self::cert_validity_days).
     pub const DEFAULT_CERT_VALIDITY_DAYS: u32 = 90;
-    fn default_cert_validity_days() -> u32 {
-        Self::DEFAULT_CERT_VALIDITY_DAYS
+    /// See [`renewable_roles`](Self::renewable_roles).
+    fn default_renewable_roles() -> Vec<String> {
+        ["admin", "member", "node"].map(String::from).to_vec()
     }
 }
 
@@ -314,7 +460,8 @@ impl Default for CaTomlConfig {
             challenges: Vec::new(),
             emit_attestations: false,
             require_attestation: None,
-            cert_validity_days: Self::DEFAULT_CERT_VALIDITY_DAYS,
+            cert_validity_days: CertValidityDays::default(),
+            renewable_roles: Self::default_renewable_roles(),
         }
     }
 }
@@ -1600,6 +1747,16 @@ pub struct SecurityConfig {
     /// an update; it never weakens what is accepted. Default 300.
     #[serde(default = "default_context_refresh_secs")]
     pub context_refresh_secs: u64,
+
+    /// When this node renews its certificates: once the remaining validity
+    /// falls below this. A number between 0 and 1 is a fraction of the
+    /// certificate's lifetime (default `0.333`: a 90-day certificate renews
+    /// with 30 days left); a string `"<n>d"`, `"<n>h"`, `"<n>m"` or `"<n>s"`
+    /// is a fixed time before expiry; `0` turns the automatic renewal off
+    /// (`ndn-fwd renew` still works). Failed attempts are retried with a
+    /// growing backoff and logged with the days remaining.
+    #[serde(default)]
+    pub renew_before: RenewBeforeConfig,
 }
 
 fn default_serve_contexts() -> bool {
@@ -1610,8 +1767,93 @@ fn default_context_refresh_secs() -> u64 {
     300
 }
 
-/// An absent `[security]` block: zero values, except `serve_contexts` and
-/// `context_refresh_secs`, which default as they do in TOML.
+/// [`SecurityConfig::renew_before`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RenewBeforeConfig {
+    /// No automatic renewal.
+    Off,
+    /// A fraction (`0 < f < 1`) of the certificate's lifetime.
+    Fraction(f64),
+    /// A fixed time before expiry.
+    Before(std::time::Duration),
+}
+
+impl Default for RenewBeforeConfig {
+    fn default() -> Self {
+        Self::Fraction(1.0 / 3.0)
+    }
+}
+
+impl RenewBeforeConfig {
+    /// Parse `"<n>d"`, `"<n>h"`, `"<n>m"` or `"<n>s"`.
+    fn parse_duration(s: &str) -> Option<std::time::Duration> {
+        let s = s.trim();
+        let unit = s.chars().last()?;
+        let n: u64 = s[..s.len() - unit.len_utf8()].trim().parse().ok()?;
+        let secs = match unit {
+            'd' => n.checked_mul(86_400)?,
+            'h' => n.checked_mul(3_600)?,
+            'm' => n.checked_mul(60)?,
+            's' => n,
+            _ => return None,
+        };
+        (secs > 0).then(|| std::time::Duration::from_secs(secs))
+    }
+}
+
+impl Serialize for RenewBeforeConfig {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Off => s.serialize_u8(0),
+            Self::Fraction(f) => s.serialize_f64(*f),
+            Self::Before(d) => s.serialize_str(&format!("{}s", d.as_secs())),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for RenewBeforeConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = RenewBeforeConfig;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str(
+                    "a fraction of the certificate lifetime between 0 and 1 (e.g. 0.333), a time \
+                     before expiry such as \"30d\", \"12h\", \"10m\" or \"90s\", or 0 (off)",
+                )
+            }
+            fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Self::Value, E> {
+                if v == 0.0 {
+                    Ok(RenewBeforeConfig::Off)
+                } else if v > 0.0 && v < 1.0 {
+                    Ok(RenewBeforeConfig::Fraction(v))
+                } else {
+                    Err(E::invalid_value(serde::de::Unexpected::Float(v), &self))
+                }
+            }
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
+                if v == 0 {
+                    Ok(RenewBeforeConfig::Off)
+                } else {
+                    Err(E::invalid_value(serde::de::Unexpected::Signed(v), &self))
+                }
+            }
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                self.visit_i64(i64::try_from(v).unwrap_or(i64::MAX))
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                RenewBeforeConfig::parse_duration(v)
+                    .map(RenewBeforeConfig::Before)
+                    .ok_or_else(|| E::invalid_value(serde::de::Unexpected::Str(v), &self))
+            }
+        }
+        d.deserialize_any(Visitor)
+    }
+}
+
+/// An absent `[security]` block: zero values, except `serve_contexts`,
+/// `context_refresh_secs` and `renew_before`, which default as they do in
+/// TOML.
 impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
@@ -1633,6 +1875,7 @@ impl Default for SecurityConfig {
             serve_contexts: default_serve_contexts(),
             trust_admin_groups: Vec::new(),
             context_refresh_secs: default_context_refresh_secs(),
+            renew_before: RenewBeforeConfig::default(),
         }
     }
 }
@@ -1771,6 +2014,63 @@ mod tests {
 
     use super::*;
     use std::str::FromStr;
+
+    /// `[ca] cert_validity_days` is one number for every role or a per-role
+    /// table whose unlisted roles take `default` (90 when absent); both
+    /// survive a round trip, and an unknown role is refused.
+    #[test]
+    fn cert_validity_days_is_a_number_or_a_per_role_table() {
+        let cfg: ForwarderConfig = "[ca]\ncert_validity_days = 30\n".parse().unwrap();
+        assert_eq!(cfg.ca.cert_validity_days, CertValidityDays::uniform(30));
+        assert_eq!(cfg.ca.cert_validity_days.for_role("guest"), 30);
+
+        let src = "[ca.cert_validity_days]\nmember = 1\nguest = 7\n";
+        let cfg: ForwarderConfig = src.parse().unwrap();
+        let days = cfg.ca.cert_validity_days;
+        assert_eq!(days.for_role("member"), 1);
+        assert_eq!(days.for_role("guest"), 7);
+        assert_eq!(days.for_role("admin"), CaTomlConfig::DEFAULT_CERT_VALIDITY_DAYS);
+        assert_eq!(days.max_days(), CaTomlConfig::DEFAULT_CERT_VALIDITY_DAYS);
+        let again: ForwarderConfig = cfg.to_toml_string().unwrap().parse().unwrap();
+        assert_eq!(again.ca.cert_validity_days, days);
+
+        let cfg: ForwarderConfig = "[ca.cert_validity_days]\ndefault = 10\nnode = 20\n"
+            .parse()
+            .unwrap();
+        assert_eq!(cfg.ca.cert_validity_days.for_role("member"), 10);
+        assert_eq!(cfg.ca.cert_validity_days.max_days(), 20);
+
+        assert!("[ca.cert_validity_days]\nfriend = 7\n".parse::<ForwarderConfig>().is_err());
+        assert!("[ca]\ncert_validity_days = -1\n".parse::<ForwarderConfig>().is_err());
+        let cfg: ForwarderConfig = "[ca]\n".parse().unwrap();
+        assert_eq!(cfg.ca.renewable_roles, ["admin", "member", "node"]);
+    }
+
+    /// `[security] renew_before` is a lifetime fraction, a time before
+    /// expiry, or 0 (off); anything else is refused.
+    #[test]
+    fn renew_before_is_a_fraction_a_duration_or_off() {
+        let parse = |v: &str| {
+            format!("[security]\nrenew_before = {v}\n")
+                .parse::<ForwarderConfig>()
+                .map(|c| c.security.renew_before)
+        };
+        assert_eq!(parse("0.25").unwrap(), RenewBeforeConfig::Fraction(0.25));
+        assert_eq!(
+            parse("\"2d\"").unwrap(),
+            RenewBeforeConfig::Before(std::time::Duration::from_secs(2 * 86_400))
+        );
+        assert_eq!(
+            parse("\"90s\"").unwrap(),
+            RenewBeforeConfig::Before(std::time::Duration::from_secs(90))
+        );
+        assert_eq!(parse("0").unwrap(), RenewBeforeConfig::Off);
+        for bad in ["1.5", "3", "\"soon\"", "\"0d\"", "\"5w\""] {
+            assert!(parse(bad).is_err(), "accepted {bad}");
+        }
+        let cfg: ForwarderConfig = "[security]\n".parse().unwrap();
+        assert_eq!(cfg.security.renew_before, RenewBeforeConfig::default());
+    }
 
     #[test]
     fn extensions_passthrough_round_trips_a_subsystem_slice() {

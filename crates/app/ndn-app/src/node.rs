@@ -160,10 +160,11 @@ impl Node {
         Arc::clone(&self.demux) as Arc<dyn Connection>
     }
 
-    /// The demultiplexer itself, un-erased — for
-    /// [`DemuxConnection::fetch_correlated`]: N Interests in flight over this
-    /// node's one connection, each reply routed to its waiter **by name** (the
-    /// windowed catch-up shape; a bare `Consumer` is one-outstanding by design).
+    /// The demultiplexer itself, un-erased — for its serve API or a raw
+    /// [`Replies`](crate::Replies) stream ([`Connection::replies`]). Fetches
+    /// need neither: every `fetch`/`object` on this node, and every
+    /// `Consumer` built on [`connection`](Self::connection), already receives
+    /// exactly the reply to its own Interest, however many run at once.
     pub fn demux(&self) -> Arc<DemuxConnection> {
         Arc::clone(&self.demux)
     }

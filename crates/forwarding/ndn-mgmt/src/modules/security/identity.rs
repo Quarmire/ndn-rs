@@ -7,10 +7,12 @@ use ndn_engine::ForwarderEngine;
 use ndn_mgmt_wire::{ControlParameters, ControlResponse, control_response::status};
 use ndn_security::FilePib;
 
-/// `identity=<id> is_ephemeral=<bool> pib_path=<dir>[ key=<key>]`. With a
-/// trust-admin backend tracking the key the node signs with (it can change at
-/// runtime through `security/enroll`), that key and its identity are
-/// reported; otherwise the configured identity, else the first trust anchor's.
+/// `identity=<id> is_ephemeral=<bool> pib_path=<dir>[ key=<key>][
+/// valid_until=<ISO 8601> days_left=<n>]`. With a trust-admin backend
+/// tracking the key the node signs with (it can change at runtime through
+/// `security/enroll`), that key, its identity and — when the node holds a
+/// certificate for it — the certificate's expiry are reported; otherwise the
+/// configured identity, else the first trust anchor's.
 pub(super) fn security_identity_status(
     engine: &ForwarderEngine,
     config: &dyn crate::MgmtConfig,
@@ -21,20 +23,25 @@ pub(super) fn security_identity_status(
         Some(pos) => key[..pos].to_string(),
         None => key,
     };
-    let (identity_name, is_ephemeral, key) = if let Some(signing) = signing {
+    let (identity_name, is_ephemeral, key, valid_until) = if let Some(signing) = signing {
         let key = signing.key.to_string();
-        (identity_of(key.clone()), signing.ephemeral, Some(key))
+        (
+            identity_of(key.clone()),
+            signing.ephemeral,
+            Some(key),
+            signing.valid_until,
+        )
     } else if let Some(id) = config.security_identity() {
-        (id.to_owned(), is_ephemeral, None)
+        (id.to_owned(), is_ephemeral, None, None)
     } else if let Some(mgr) = engine.security() {
         let name = mgr
             .trust_anchor_names()
             .first()
             .map(|n| identity_of(n.to_string()))
             .unwrap_or_else(|| "(none)".to_string());
-        (name, is_ephemeral, None)
+        (name, is_ephemeral, None, None)
     } else {
-        ("(none)".to_string(), is_ephemeral, None)
+        ("(none)".to_string(), is_ephemeral, None, None)
     };
 
     let pib_path = config
@@ -43,10 +50,27 @@ pub(super) fn security_identity_status(
         .unwrap_or_else(|| dirs_or_tmp_pib().display().to_string());
 
     let key = key.map(|k| format!(" key={k}")).unwrap_or_default();
+    let expiry = valid_until.map(expiry_fields).unwrap_or_default();
     let text = format!(
-        "identity={identity_name} is_ephemeral={is_ephemeral} pib_path={pib_path}{key}\n"
+        "identity={identity_name} is_ephemeral={is_ephemeral} pib_path={pib_path}{key}{expiry}\n"
     );
     ControlResponse::ok_empty(text)
+}
+
+/// ` valid_until=<ISO 8601>Z days_left=<n.n>` for a certificate valid until
+/// `valid_until` (ns since the Unix epoch); `days_left` is negative once it
+/// expired.
+fn expiry_fields(valid_until: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i128)
+        .unwrap_or(0);
+    let days_left = (i128::from(valid_until) - now) as f64 / 86_400e9;
+    let iso = ndn_security::iso8601::format_iso_basic(valid_until);
+    format!(
+        " valid_until={}Z days_left={days_left:.1}",
+        String::from_utf8_lossy(&iso)
+    )
 }
 
 /// Default PIB path (mirrors `default_pib_path()` in `main.rs`).

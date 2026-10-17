@@ -112,31 +112,44 @@ validation: FAILED name=/home/bob/member/phone/data/photo2/… error=certificate
 ## Cached Data
 
 A forwarder validates Data once, before its Content Store admits it, and
-answers later Interests from the CS without validating again. So when a node
-adopts a context version that revokes a key (by refresh, by `revoke` on the
-root device, or pushed by sync), the engine evicts from its CS, under that
-context's namespace, every entry signed by a newly revoked key, by a key whose
-certificate chain (as far as the node's certificate cache knows it) passes
-through one, and the revoked key's own certificates. The eviction runs once,
-when the keyring adopts that version, and finishes before the adoption
-returns for the in-tree stores (`lru`, `sharded-lru`, `sqlite`, `fjall`); the
-CS lookup path is unchanged and costs nothing extra while nothing is revoked.
+answers later Interests from the CS without validating again. A revocation
+still reaches what is cached, through a stamp on each entry:
+
+- The keyring counts the adoptions that revoke something
+  (`Keyring::revocation_epoch`, moved after the new version is in force). The
+  validation stage reads the count before it validates a Data packet, and the
+  CS insert stage stores it with the entry.
+- On every CS hit, the lookup compares the entry's stamp with the current
+  count: one atomic load. Only when they differ is the entry judged against
+  the revocations held now. If it is signed by a revoked key, by a key whose
+  certificate chain (as far as the node's certificate cache knows it) passes
+  through one, or is a revoked key's own certificate, it is evicted and the
+  Interest goes on as a miss. Otherwise it is stamped with the current count,
+  so it is not judged again until the next revoking adoption.
+
+So once a node has adopted a revoking version, it never serves from its CS
+Data that the version's revocations cover, whether that Data was cached before
+the adoption, validated before it and cached after, or cached while it ran.
+A persistent CS (`fjall`, `sqlite`) keeps its entries across restarts, but the
+count starts again at 0 in each process. Each open of the store takes a new
+generation, stored with every stamp, so an entry stamped by an earlier
+process is judged once at its first hit. A store file written before entries
+carried stamps is emptied on open. Data cached without validation (for
+example with `cs_admit_unverified`) carries no stamp and is not judged.
+
+When the keyring adopts the revoking version, the engine also evicts at once,
+under that context's namespace, every entry the newly revoked names cover,
+stamped or not, so they stop taking cache space. It finishes before the
+adoption returns for the in-tree stores (`lru`, `sharded-lru`, `sqlite`,
+`fjall`) and logs `trust context revokes keys: evicted the cached Data they
+signed … evicted=<n>`. Serving does not depend on it.
+
 A node that has not yet adopted the new version still serves what it cached,
 but a downstream node that holds the new version refuses it. The node also
-stops serving its own certificate for a revoked key. The engine logs
-`trust context revokes keys: evicted the cached Data they signed … evicted=<n>`.
-
-Data that was validated just before the update but had not reached the CS
-when the eviction ran is not cached either. The keyring counts the adoptions
-that revoke something (`Keyring::revocation_epoch`, bumped after the new
-version is in force and before the eviction runs). The validation stage
-records that count before it validates a Data packet. The CS insert stage
-reads it once before inserting and once after: if it moved since validation,
-the Data is checked against the revocations now held and is not inserted when
-they cover it; if it moved during the insert itself, the entry is evicted
-again. While nothing is revoked, each check is one atomic load. Such Data is
-still forwarded to the faces whose Interests were waiting for it, since it
-was valid when it arrived; it is only kept out of the cache.
+stops serving its own certificate for a revoked key. Data validated before
+the adoption that reaches the CS after it is still forwarded to the faces
+whose Interests were waiting for it, since it was valid when it arrived; the
+first hit on its cached copy evicts it.
 
 ## Refusals
 
@@ -166,7 +179,9 @@ still made, and the CA refusal lasts until it restarts.
 | New version with revocations | `ndn_cert::bump_context_revoking` (`ndn-cert/src/context_update.rs`) |
 | Strictly-newer adoption | `ndn_security::Keyring::adopt_update` |
 | Revocation epoch, eviction hook | `ndn_security::Keyring::{revocation_epoch, on_revocation}` |
-| CS eviction on adoption; insert-time re-check | `ndn-engine` `revocation_purge.rs`; `CsInsertStage` (`stages/cs.rs`) |
+| Entry stamp; hit-time re-check | `CsInsertStage`, `CsLookupStage` (`ndn-engine` `stages/cs.rs`); `revocation_purge::recheck` |
+| Stamp storage | `ndn_store::{CsEntry::revocation_epoch, ContentStore::restamp, EARLIER_PROCESS_EPOCH}`; store generation in `ndn-store` `cs_keycodec.rs` |
+| CS eviction on adoption | `ndn-engine` `revocation_purge.rs` (`install`) |
 | CA side | `ndn_cert::CaState::{issued_under, revoke_issued_under}` |
 | Stored context | `ndn_cert::read_stored_context` |
 | Management verb | `ndn-mgmt` `security/revoke`, `RevokedInfo`; `ndn-ipc` `MgmtClient::security_revoke` |

@@ -49,8 +49,8 @@ pub struct PacketContext {
     pub validation_not_configured: bool,
     /// The validator keyring's [revocation epoch] read just before
     /// `ValidationStage` judged this Data valid; `None` if no validator ran.
-    /// `CsInsertStage` compares it with the current epoch so Data validated
-    /// just before a revoking trust-context update is not cached after it.
+    /// `CsInsertStage` stamps the cached entry with it, and `CsLookupStage`
+    /// re-checks the entry against the revocations once the epoch has moved.
     ///
     /// [revocation epoch]: ndn_security::Keyring::revocation_epoch
     pub revocation_epoch: Option<u64>,

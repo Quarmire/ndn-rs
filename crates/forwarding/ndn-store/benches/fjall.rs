@@ -48,6 +48,7 @@ fn bench_fjall(c: &mut Criterion) {
         Arc::clone(&hit_name),
         CsMeta {
             stale_at: far_future(),
+            revocation_epoch: None,
         },
     ));
     let hit_interest = interest_for("/fjall/hit");
@@ -92,6 +93,7 @@ fn bench_fjall(c: &mut Criterion) {
             name,
             CsMeta {
                 stale_at: far_future(),
+                revocation_epoch: None,
             },
         ));
     }
@@ -108,6 +110,7 @@ fn bench_fjall(c: &mut Criterion) {
                 name,
                 CsMeta {
                     stale_at: far_future(),
+                    revocation_epoch: None,
                 },
             ))
         });

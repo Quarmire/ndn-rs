@@ -91,15 +91,14 @@ pub async fn run_provisioning(config: DeviceConfig) -> Result<Identity, Identity
 
     let cert = client.enroll(Arc::clone(&signer), 86400, challenge).await?;
 
+    // The renewer finds the current certificate in the validation cache.
+    manager.cert_cache().insert(cert.clone());
     manager.add_trust_anchor(cert);
 
-    // Auto-renewal re-runs the NDNCERT flow against the same CA over a fresh router
-    // connection. (For a single-use factory token the CA may reject the re-used challenge;
-    // a possession challenge is the production renewal path — see `NdncertRenewer`.)
+    // Auto-renewal renews the issued certificate at the same CA over a fresh router
+    // connection, proving possession of the current certificate's key (the CA's
+    // `renewal` challenge) — the factory credential is not re-presented.
     let renewer: Arc<dyn CertRenewer> = Arc::new(NdncertRenewer {
-        ca_prefix,
-        validity_secs: 86400,
-        challenge: build_challenge(&config.factory_credential, &key_name),
         connect: Arc::new(|| {
             Box::pin(async {
                 ndn_app::Consumer::connect(std::path::Path::new("/run/ndn/router.sock")).await

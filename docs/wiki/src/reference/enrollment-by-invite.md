@@ -50,10 +50,12 @@ requests for one device name running at once, the CA reserves the name for
 the first before its challenge runs; the second is refused before its own
 challenge runs, so it spends no token either.
 
-Certificates last what the namespace CA issues: `[ca] cert_validity_days`
-(default 90). The request names no lifetime, so the CA's setting alone decides
-it, and the enroll output states the expiry issued. Renewal is not built yet;
-once it is, lifetimes can be shorter.
+Certificates last what the namespace CA issues for the role: `[ca]
+cert_validity_days` (default 90; per role, e.g. `guest = 7`). The request names
+no lifetime, so the CA's setting alone decides it, and the enroll output states
+the expiry issued. Before expiry the daemon renews the certificate for the same
+key without an invite, if the CA renews the role — see
+[Certificate renewal](./renewal.md).
 
 ## Flow and packets
 

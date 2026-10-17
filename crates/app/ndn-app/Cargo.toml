@@ -42,6 +42,7 @@ tokio-util     = { workspace = true }
 tracing        = { workspace = true }
 thiserror      = { workspace = true }
 async-trait    = { workspace = true }
+parking_lot    = { workspace = true }
 # FLIC aggregated-signing manifest: per-segment SHA-256 leaves (wasm-safe).
 sha2          = { workspace = true }
 # Instant/SystemTime that work on both native (delegates to std) and wasm32
