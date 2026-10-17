@@ -90,14 +90,20 @@ impl FilePib {
 
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, PibError> {
         let root = root.into();
-        if !root.join("keys").exists() {
-            return Err(PibError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!(
-                    "PIB not found at {} (run `ndn-sec keygen` to create one)",
-                    root.display()
-                ),
-            )));
+        // NotFound only when there is no PIB: a PIB this user may not read
+        // is reported as that, not as missing.
+        if let Err(e) = std::fs::metadata(root.join("keys")) {
+            return Err(PibError::Io(if e.kind() == std::io::ErrorKind::NotFound {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!(
+                        "PIB not found at {} (run `ndn-sec keygen` to create one)",
+                        root.display()
+                    ),
+                )
+            } else {
+                std::io::Error::new(e.kind(), format!("PIB at {}: {e}", root.display()))
+            }));
         }
         secure_fs::repair_tree(&root)?;
         Ok(Self { root })
@@ -582,17 +588,33 @@ fn decode_cert_wire(wire: &[u8]) -> Option<Certificate> {
     Certificate::decode(&data).ok()
 }
 
-/// The decodable certificate files in a key's `certs/` directory.
+/// The decodable certificate files in a key's `certs/` directory. A file
+/// that cannot be read or decoded is logged by name and left out.
 fn stored_cert_files(dir: &Path) -> Vec<(PathBuf, Certificate)> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(dir = %dir.display(), error = %e, "cannot list stored certificates");
+            }
+            return Vec::new();
+        }
     };
     entries
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().is_some_and(|x| x == "data"))
         .filter_map(|p| {
-            let cert = decode_cert_wire(&std::fs::read(&p).ok()?)?;
-            Some((p, cert))
+            let cert = match std::fs::read(&p) {
+                Ok(wire) => decode_cert_wire(&wire),
+                Err(e) => {
+                    tracing::warn!(file = %p.display(), error = %e, "cannot read a stored certificate");
+                    return None;
+                }
+            };
+            if cert.is_none() {
+                tracing::warn!(file = %p.display(), "a stored certificate does not decode; ignored");
+            }
+            Some((p, cert?))
         })
         .collect()
 }

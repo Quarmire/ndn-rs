@@ -269,15 +269,39 @@ impl Validator {
             Some(Hop::Packet(name)) if !ctx.authorizes_hop(name, signer, Some(signer_cert)) => {
                 Some(WalkOutcome::Invalid(TrustError::SchemaMismatch))
             }
-            // An authoritative schema governs every certificate hop, as LVS
-            // validation does: e.g. a device key is accepted only when the CA
-            // certified it, not when another device self-issued it.
+            // Every certificate hop is authorized by the context's
+            // certification rule (anchor, identity prefix, or the context's
+            // CA within its namespace), so an enrolled device cannot certify
+            // another device's key.
+            Some(Hop::Cert(cert)) if !ctx.authorizes_certification(cert, signer) => {
+                let cas: Vec<String> = ctx.ca_endpoints().iter().map(Name::to_string).collect();
+                Some(WalkOutcome::Invalid(TrustError::CertNotAuthorized {
+                    cert: cert.to_string(),
+                    issuer: signer.to_string(),
+                    why: format!(
+                        "under the trust context for {ns} a key certifies only names under its \
+                         own identity, unless it is a trust anchor of the context or a key of \
+                         the context's CA ({cas}) certifying a name under {ns}; have the key \
+                         certified by the namespace CA (enroll the device)",
+                        ns = ctx.namespace(),
+                        cas = if cas.is_empty() { "none named".to_string() } else { cas.join(", ") },
+                    ),
+                }))
+            }
+            // An authoritative schema also governs every certificate hop, as
+            // LVS validation does: e.g. a device key is accepted only when the
+            // CA certified it, not when another device self-issued it.
             Some(Hop::Cert(cert))
                 if authoritative && !ctx.authorizes_hop(cert, signer, Some(signer_cert)) =>
             {
                 Some(WalkOutcome::Invalid(TrustError::CertNotAuthorized {
                     cert: cert.to_string(),
                     issuer: signer.to_string(),
+                    why: format!(
+                        "the trust schema does not let this issuer certify it (see why with \
+                         `ndn-fwd schema explain {cert} {signer}`); re-enroll the key with the \
+                         CA the schema names"
+                    ),
                 }))
             }
             _ => None,
@@ -397,6 +421,9 @@ impl Validator {
                 return WalkOutcome::Invalid(TrustError::CertNotAuthorized {
                     cert: cert.name.to_string(),
                     issuer: current_key_name.to_string(),
+                    why: "it is an NDNCERT approval (`<key>/ndncert-approve/<id>`), not a \
+                          certificate, and never answers for a key"
+                        .to_string(),
                 });
             }
             if let Some(refused) = hop_refused(&pending, &current_key_name, &cert.name) {
@@ -1228,7 +1255,7 @@ mod tests {
     /// untrusted-root verdict (it once surfaced as a chain cycle), and at two
     /// keys certifying each other with a chain cycle.
     #[tokio::test]
-    async fn chain_walk_depth_limit() {
+    async fn chain_walk_ends_at_untrusted_root_and_at_cycle() {
         let seed = [23u8; 32];
         let key_name = name1("key");
         let signer = Ed25519Signer::from_seed(&seed, key_name.clone());
@@ -1265,6 +1292,92 @@ mod tests {
         match validator.validate_chain(&data).await {
             ValidationResult::Invalid(TrustError::ChainCycle { .. }) => {}
             other => panic!("expected ChainCycle, got: {other:?}"),
+        }
+    }
+
+    /// A chain of distinct keys longer than the validator's limit ends the
+    /// walk with the depth verdict instead of walking on.
+    #[tokio::test]
+    async fn chain_walk_depth_limit() {
+        const KEYS: [&str; 7] = ["k0", "k1", "k2", "k3", "k4", "k5", "k6"];
+        let signers: Vec<Ed25519Signer> = KEYS
+            .into_iter()
+            .zip(70u8..)
+            .map(|(k, seed)| Ed25519Signer::from_seed(&[seed; 32], name1(k)))
+            .collect();
+        let validator = Validator::new(wildcard_schema());
+        for pair in signers.windows(2) {
+            let (subject, issuer) = (&pair[0], &pair[1]);
+            let wire =
+                make_cert_data_packet(subject.key_name(), &subject.public_key_bytes(), issuer)
+                    .await;
+            validator
+                .cert_cache()
+                .insert(Certificate::decode(&Data::decode(wire).unwrap()).unwrap());
+        }
+        let data = Data::decode(make_signed_data(&signers[0], "data", "k0").await).unwrap();
+        match validator.validate_chain(&data).await {
+            ValidationResult::Invalid(TrustError::ChainTooDeep { .. }) => {}
+            other => panic!("expected ChainTooDeep, got: {other:?}"),
+        }
+    }
+
+    /// In a hierarchical context, an enrolled member's key cannot certify
+    /// another device's key (no forging that device's Data), while the
+    /// context's CA and an anchor of the context can.
+    #[tokio::test]
+    async fn a_member_cannot_certify_another_devices_key() {
+        use crate::trust_context::SignedTrustContext;
+
+        let anchor = |signer: &Ed25519Signer| Certificate {
+            name: Arc::new(signer.key_name().clone()),
+            public_key: Bytes::copy_from_slice(&signer.public_key_bytes()),
+            valid_from: 0,
+            valid_until: u64::MAX,
+            issuer: None,
+            signed_region: None,
+            sig_value: None,
+            sig_type: SignatureType::SignatureEd25519,
+        };
+        let key = |name: &str, seed: u8| Ed25519Signer::from_seed(&[seed; 32], n(name));
+        let root = key("/home/bob/KEY/root", 80);
+        let outside_anchor = key("/trust/KEY/a", 81);
+        let ca = key("/home/bob/CA/KEY/ca", 82);
+        let eve = key("/home/bob/member/eve/KEY/e", 83);
+        let forged = key("/home/bob/member/alice/KEY/x", 84);
+        let by_ca = key("/home/bob/member/alice/KEY/y", 85);
+        let by_anchor = key("/home/bob/member/alice/KEY/z", 86);
+
+        let ctx = SignedTrustContext::hierarchical(n("/home/bob")).with_ca_endpoint(n("/home/bob/CA"));
+        assert!(ctx.add_anchor(anchor(&root)));
+        assert!(ctx.add_anchor(anchor(&outside_anchor)));
+        let validator = Validator::new(TrustSchema::hierarchical());
+        validator.adopt_context(Arc::new(ctx));
+        for (subject, issuer) in [
+            (&ca, &root),
+            (&eve, &ca),
+            (&forged, &eve),
+            (&by_ca, &ca),
+            (&by_anchor, &outside_anchor),
+        ] {
+            let cert_name = subject.key_name().clone().append("NA").append_version(1);
+            let wire = make_cert_data_packet(&cert_name, &subject.public_key_bytes(), issuer).await;
+            validator
+                .cert_cache()
+                .insert(Certificate::decode(&Data::decode(wire).unwrap()).unwrap());
+        }
+
+        let doc = "/home/bob/member/alice/doc";
+        match validator.validate_chain(&data_signed_by(doc, &forged)).await {
+            ValidationResult::Invalid(TrustError::CertNotAuthorized { cert, issuer, .. }) => {
+                assert!(n(&cert).has_prefix(forged.key_name()));
+                assert_eq!(n(&issuer), *eve.key_name());
+            }
+            other => panic!("a member certified another device's key: {other:?}"),
+        }
+        for signer in [&by_ca, &by_anchor] {
+            let result = validator.validate_chain(&data_signed_by(doc, signer)).await;
+            assert!(matches!(result, ValidationResult::Valid(_)), "got {result:?}");
         }
     }
 
@@ -1423,11 +1536,8 @@ mod tests {
         let cert = Data::decode(cert_wire).unwrap();
         let (result, missing) = validator.validate_chain_cached(&cert).await;
         match result {
-            ValidationResult::Invalid(e @ TrustError::UntrustedSelfSigned { .. }) => {
-                let msg = e.to_string();
-                assert!(msg.contains("/lab/eph/KEY/k1/self/v=1"), "{msg}");
-                assert!(msg.contains("not a trust anchor"), "{msg}");
-                assert!(msg.contains("adopt the trust context"), "{msg}");
+            ValidationResult::Invalid(TrustError::UntrustedSelfSigned { cert, .. }) => {
+                assert_eq!(cert, "/lab/eph/KEY/k1/self/v=1");
             }
             other => panic!("expected UntrustedSelfSigned, got {other:?}"),
         }

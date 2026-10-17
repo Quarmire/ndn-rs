@@ -252,28 +252,34 @@ alone rebuilds it. All formats are supported equally; several may coexist:
   (PBES2 as the root store), in an `ndn-trust://bag` envelope that also
   carries the namespace and its expected fingerprint, written `0600`.
 - **Hardware** — P-256 generated on a second YubiKey's PIV slot (default
-  `9d`, PIN policy `always`, touch policy chosen), non-exportable.
+  `9d`, PIN policy `always`, touch policy chosen), non-exportable; refused on
+  the root's own token and over a slot that holds a key unless the operator
+  says it is not needed (`--replace-slot`).
 `recovery-kit list` shows the anchors of the held context, `check <kit>`
 opens a kit and confirms its key is a recovery anchor (signs nothing),
 `revoke <key>` has the root sign a version without that anchor and revoking
-its key. The CLI signs and hands the version to the running daemon
-(`security/context-update`, adopted under the continuity rule, stored,
-published). A recovery anchor is root-equivalent by design: keep it offline.
+its key. The CLI signs and hands the version to the running daemon that uses
+the same PIB (`security/context-update`, adopted under the continuity rule,
+stored, published); only the daemon's refusal undoes the CLI's work, never a
+missing answer. A recovery anchor is root-equivalent by design: keep it
+offline.
 
 ### F8 Restore after losing the root device (**have**)
 On a replacement device whose daemon holds the namespace's context (linked
 through a relay, say): `ndn-fwd recover --kit words|<file>|yubikey
---old-root destroyed|compromised [--root-store …] [--device <name>]`.
+--old-root destroyed|compromised [--keep-kit <key>]… [--root-store …]
+[--device <name>]`.
 1. The daemon fetches the newest version by name (as `context refresh`); a
    device holding none adopts it with a file kit's expected fingerprint, or
    is told to adopt first (a context with nothing to check it against could
    be a forgery the recovery key would then sign). The kit's key must be a
    recovery anchor of that version.
-2. A new root (in the chosen store), a new CA key `/<ns>/CA/KEY/<id>` and a
-   new admin identity `/<ns>/admin/<device>`, all with fresh key ids; the
-   recovery key signs `N+1`: anchors = new root + recovery anchors (+ the old
-   root when `destroyed`); the CA endpoint stays `/<ns>/CA`; the new root
-   device's CA and admin keys get the `root-device` role. The new root then
+2. A new root (in the chosen store; never on the kit's token), a new CA key
+   `/<ns>/CA/KEY/<id>` and a new admin identity `/<ns>/admin/<device>`, all
+   with fresh key ids; the recovery key signs `N+1`: anchors = new root +
+   the recovery anchors kept (+ the old root when `destroyed`); the CA
+   endpoint stays `/<ns>/CA`; the new root device's CA and admin keys get the
+   `root-device` role. The new root then
    signs `N+2`, the same content (`ndn_cert::reissue_version`), so the newest
    version is root-signed and the new root's fingerprint is the namespace's
    expected fingerprint for anchor links and invites from then on (an
@@ -286,7 +292,11 @@ through a relay, say): `ndn-fwd recover --kit words|<file>|yubikey
    then on. `compromised`: `N+1` revokes the old root, the old CA key and the
    old root device's admin key (the `root-device` keys); devices whose
    certificates chain through the old CA stop validating and enroll again
-   with invites from the new root device.
+   with invites from the new root device. It also keeps only the recovery
+   anchors the operator vouches for — the kit used and those named with
+   `--keep-kit` — and removes and revokes the rest: whoever held the old root
+   could have added a kit of their own, and a kit is root-equivalent.
+   `destroyed` keeps every recovery anchor.
 4. `N+1`, then `N+2`, go to the daemon, which adopts, stores and publishes
    each; every node holding `N` adopts both by the continuity rule (`N+1`
    signed by an anchor of `N`, `N+2` by an anchor of `N+1`). A node that

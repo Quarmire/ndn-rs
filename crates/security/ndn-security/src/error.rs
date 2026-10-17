@@ -14,14 +14,14 @@ pub enum TrustError {
     ChainCycle { name: String },
     #[error("name does not match trust schema")]
     SchemaMismatch,
-    /// A certificate hop the authoritative schema refuses: `issuer` may not
-    /// certify `cert` under the governing trust context.
-    #[error(
-        "certificate {cert} is not authorized by its issuer {issuer} under the trust schema \
-         (see why with `ndn-fwd schema explain {cert} {issuer}`; re-enroll the key with the \
-         CA the schema names)"
-    )]
-    CertNotAuthorized { cert: String, issuer: String },
+    /// A certificate hop the governing trust context refuses: `issuer` may
+    /// not certify `cert`; `why` says which rule refused it and what to do.
+    #[error("certificate {cert} is not authorized by its issuer {issuer}: {why}")]
+    CertNotAuthorized {
+        cert: String,
+        issuer: String,
+        why: String,
+    },
     /// The chain ends at a self-signed certificate that is no trust anchor of
     /// the trust context governing the packet: nothing vouches for it.
     #[error(

@@ -161,7 +161,12 @@ pub struct ControlParameters {
 }
 
 /// A secret in transit to the daemon (a root store's passphrase or PIN).
-/// Its `Debug` is redacted and its bytes are overwritten when dropped.
+/// Its `Debug` is redacted and this value's bytes are overwritten when it is
+/// dropped. The encoded command carries further copies — the encoded
+/// ApplicationParameters and the signed Interest in the CLI, the receive
+/// buffers and the decoded Interest in the daemon — which are freed, not
+/// overwritten: the secret is protected in transit by the local, peer-
+/// credential-gated management socket, not by wiping memory.
 #[derive(Clone, PartialEq, Eq)]
 pub struct UnlockSecret(Vec<u8>);
 

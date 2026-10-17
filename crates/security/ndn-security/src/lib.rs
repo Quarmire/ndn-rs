@@ -101,7 +101,9 @@ pub use verifier::{
     ed25519_verify_batch, verify_by_sig_type,
 };
 #[cfg(feature = "yubikey-piv")]
-pub use yubikey::{YubikeyPinPolicy, YubikeyPiv, YubikeySlot, YubikeyTouchPolicy};
+pub use yubikey::{
+    YubikeyPinPolicy, YubikeyPiv, YubikeySlot, YubikeySlotState, YubikeyTouchPolicy,
+};
 
 pub use did::{
     DereferencedResource, DidController, DidDocument, DidDocumentMetadata, DidError,

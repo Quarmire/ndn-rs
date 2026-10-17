@@ -4,12 +4,16 @@
 //! The Content Store answers Interests without validating again: Data is
 //! validated once, before it is admitted. When the node adopts a version of a
 //! trust context that revokes a key, Data that key signed may already sit in
-//! the CS, or be on its way there. A cached Data is covered by a revocation
-//! when:
-//!
-//! - its signing key, or any certificate up its chain as far as the
-//!   validator's certificate cache knows it, is revoked; or
-//! - it is itself a revoked key's certificate.
+//! the CS, or be on its way there. After a revoking update, a cached Data
+//! is served only when its chain is *known clear*: it is no certificate the
+//! context revokes, and its chain, followed from its KeyLocator through the
+//! validator's certificate cache, ends at an anchor (or a certificate with no
+//! issuer above it) without passing a revoked key or certificate. Data whose
+//! chain cannot be followed that far is not served either — after a restart
+//! the cache holds only this node's own certificates, not those of other
+//! devices or their CA — but evicted, so the next Interest fetches it and
+//! validation judges it afresh. A context that revokes nothing leaves every
+//! entry clear.
 //!
 //! Correctness rests on data, not on timing. Every entry `CsInsertStage`
 //! admits carries the keyring's
@@ -27,10 +31,10 @@
 //! validation carry no stamp and are not re-checked.
 //!
 //! The engine also registers [`install`] on its validator's keyring, so each
-//! revoking adoption evicts, under that context's namespace, every entry its
-//! revoked names cover. That only reclaims space early (and drops unstamped
-//! entries a revocation covers): without it, revoked entries would still
-//! never be served, but would hold cache capacity until hit or aged out.
+//! revoking adoption evicts, under that context's namespace, every entry not
+//! known clear. That only reclaims space early (and drops unstamped entries
+//! a revocation covers): without it, those entries would still never be
+//! served, but would hold cache capacity until hit or aged out.
 //! The scan runs once per revoking update, which is rare, and completes
 //! before the adoption call returns for every store whose scan does not
 //! suspend (all in-tree stores); a store that does finish it on the runtime.
@@ -47,7 +51,8 @@ use ndn_store::{CsEntry, ErasedContentStore};
 
 use crate::observability::targets as t;
 
-/// How far up a cached entry's chain to look for a revoked certificate.
+/// How far up a cached entry's chain to look for a revoked certificate; a
+/// longer chain is not known clear.
 const MAX_CHAIN: usize = 8;
 
 /// Evict CS entries covered by each revocation `validator`'s keyring adopts.
@@ -77,7 +82,7 @@ fn purge(
     let mut eviction: Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(async move {
         let namespace = ctx.namespace().clone();
         let version = ctx.version();
-        let covered = move |wire: &Bytes| covered_by_revocation(&ctx, &certs, wire);
+        let covered = move |wire: &Bytes| !known_clear(&ctx, &certs, wire);
         let evicted = cs.evict_matching_erased(&namespace, &covered).await;
         tracing::info!(
             target: t::SECURITY,
@@ -99,9 +104,9 @@ fn purge(
 
 /// Judge a cached `entry` stamped before the keyring's revocation epoch moved
 /// to `epoch` (loaded before this call, so before the context is read)
-/// against the revocations held now. Not covered: restamped with `epoch` and
-/// servable. Covered, or no longer decodable: evicted unless replaced
-/// meanwhile, and not servable. Returns whether it may be served.
+/// against the revocations held now. Known clear: restamped with `epoch` and
+/// servable. Covered, not known clear, or no longer decodable: evicted unless
+/// replaced meanwhile, and not servable. Returns whether it may be served.
 pub(crate) async fn recheck(
     cs: &dyn ErasedContentStore,
     validator: &Validator,
@@ -109,8 +114,7 @@ pub(crate) async fn recheck(
     epoch: u64,
 ) -> bool {
     let ctx = validator.keyring().context_for(&entry.name);
-    let servable = Data::decode(entry.data.clone())
-        .is_ok_and(|data| !data_covered(&ctx, validator.cert_cache(), &data));
+    let servable = known_clear(&ctx, validator.cert_cache(), &entry.data);
     if servable {
         cs.restamp_erased(&entry.name, &entry.data, epoch).await;
     } else {
@@ -121,25 +125,54 @@ pub(crate) async fn recheck(
     servable
 }
 
-/// Whether the Data in `wire` is a certificate `ctx` revokes, or is signed
-/// by a key `ctx` revokes directly or anywhere up its chain.
-fn covered_by_revocation(ctx: &SignedTrustContext, certs: &CertCache, wire: &Bytes) -> bool {
-    Data::decode(wire.clone()).is_ok_and(|data| data_covered(ctx, certs, &data))
+/// Whether the Data in `wire` decodes and [`chain_clear`] holds for it.
+fn known_clear(ctx: &SignedTrustContext, certs: &CertCache, wire: &Bytes) -> bool {
+    Data::decode(wire.clone()).is_ok_and(|data| chain_clear(ctx, certs, &data))
 }
 
-fn data_covered(ctx: &SignedTrustContext, certs: &CertCache, data: &Data) -> bool {
-    if ctx.is_revoked(&data.name) {
+/// Whether no revocation of `ctx` covers `data`, as far as can be known: it
+/// is no revoked certificate, and its chain followed through `certs` reaches
+/// an anchor of `ctx`, or a certificate with no other issuer, passing no
+/// revoked key or certificate. A chain `certs` cannot follow that far (a
+/// certificate not cached, a key-digest signer not cached, more than
+/// [`MAX_CHAIN`] hops) is not known clear.
+fn chain_clear(ctx: &SignedTrustContext, certs: &CertCache, data: &Data) -> bool {
+    use ndn_packet::KeyLocator;
+    use ndn_security::cert_name::key_name_of;
+
+    if ctx.revocations().is_empty() {
         return true;
     }
-    let mut signer: Option<Arc<Name>> = data.sig_info().and_then(|si| si.key_locator_name());
+    if ctx.is_revoked(&data.name) {
+        return false;
+    }
+    let mut key: Arc<Name> = match data.sig_info().and_then(|si| si.key_locator.as_ref()) {
+        Some(KeyLocator::Name(name)) => Arc::new(Name::clone(name)),
+        Some(KeyLocator::KeyDigest(digest)) => match certs.get_by_key_digest(digest) {
+            Some(cert) => Arc::new(cert.key_name()),
+            None => return false,
+        },
+        // No signing key (DigestSha256, or unsigned): nothing to revoke.
+        None => return true,
+    };
     for _ in 0..MAX_CHAIN {
-        let Some(key) = signer else {
-            return false;
-        };
         if ctx.is_revoked(&key) {
+            return false;
+        }
+        if ctx.anchor_for(&key).is_some() {
             return true;
         }
-        signer = certs.get(&key).and_then(|cert| cert.issuer);
+        let Some(cert) = certs.get(&key) else {
+            return false;
+        };
+        if ctx.is_revoked(&cert.name) {
+            return false;
+        }
+        match cert.issuer {
+            Some(issuer) if key_name_of(&issuer) != cert.key_name() => key = issuer,
+            // Self-signed, or no issuer named: nothing above it to revoke.
+            _ => return true,
+        }
     }
     false
 }
@@ -216,6 +249,20 @@ mod tests {
             ctx.packet = DecodedPacket::Data(Box::new(data));
             ctx
         }
+
+        /// This key's certificate, issued by `issuer`.
+        fn certified_by(&self, issuer: &Key) -> Certificate {
+            let wire = DataBuilder::new(
+                self.name.clone().append("NA").append_version(1),
+                &self.signer.public_key_bytes(),
+            )
+            .sign_sync(
+                SignatureType::SignatureEd25519,
+                Some(&issuer.name),
+                |region| issuer.signer.sign_sync(region).unwrap(),
+            );
+            Certificate::decode(&Data::decode(wire).unwrap()).unwrap()
+        }
     }
 
     fn keys() -> (Key, Key) {
@@ -225,9 +272,12 @@ mod tests {
         )
     }
 
-    /// `/home/bob` with `keys` as anchors, at `version`, revoking `revoked`.
+    /// `/home/bob` with `keys` as anchors and `/home/bob/CA` as its CA, at
+    /// `version`, revoking `revoked`.
     fn context(keys: &[&Key], version: u64, revoked: &[&Key]) -> Arc<SignedTrustContext> {
-        let mut ctx = SignedTrustContext::hierarchical(n("/home/bob")).with_version(version);
+        let mut ctx = SignedTrustContext::hierarchical(n("/home/bob"))
+            .with_ca_endpoint(n("/home/bob/CA"))
+            .with_version(version);
         for key in revoked {
             ctx = ctx.with_revocation(key.name.clone());
         }
@@ -249,13 +299,18 @@ mod tests {
     impl Node {
         /// `purge`: also install the eager purge, as the builder does.
         fn new(keyring: Arc<Keyring>, cs: Arc<dyn ErasedContentStore>, purge: bool) -> Self {
+            Self::with_certs(keyring, cs, purge, Arc::new(CertCache::new()))
+        }
+
+        /// [`Self::new`] whose validator starts with `certs` cached.
+        fn with_certs(
+            keyring: Arc<Keyring>,
+            cs: Arc<dyn ErasedContentStore>,
+            purge: bool,
+            certs: Arc<CertCache>,
+        ) -> Self {
             let runtime = ndn_runtime::default_runtime();
-            let validator = Arc::new(Validator::with_keyring(
-                keyring,
-                Arc::new(CertCache::new()),
-                None,
-                5,
-            ));
+            let validator = Arc::new(Validator::with_keyring(keyring, certs, None, 5));
             if purge {
                 install(&validator, &cs, Arc::clone(&runtime));
             }
@@ -488,6 +543,46 @@ mod tests {
             node.stamp(B_PHOTO).await,
             Some(Some(1)),
             "re-stamped in this process"
+        );
+    }
+
+    /// After a restart the validator's certificate cache holds none of the
+    /// chain of another device's Data. A persisted entry signed by a device
+    /// key that is not revoked itself, under a CA a later update revokes (a
+    /// compromised-namespace recovery), is still never served.
+    #[tokio::test]
+    async fn a_persisted_entry_under_a_revoked_ca_is_never_served_after_a_restart() {
+        const D_PHOTO: &str = "/home/bob/member/d/photo";
+        let root = Key::new("/home/bob/KEY/0", 10);
+        let ca = Key::new("/home/bob/CA/KEY/9", 11);
+        let d = Key::new("/home/bob/member/d/KEY/4", 12);
+        let (_, b) = keys();
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let keyring = Arc::new(Keyring::new());
+            keyring.adopt(context(&[&root, &b], 1, &[]));
+            let certs = Arc::new(CertCache::new());
+            certs.insert(ca.certified_by(&root));
+            certs.insert(d.certified_by(&ca));
+            let cs = Arc::new(FjallCs::open(dir.path(), 1 << 20).unwrap());
+            let node = Node::with_certs(Arc::clone(&keyring), cs, true, certs);
+            node.receive(d.data(D_PHOTO)).await;
+            node.receive(b.data(B_PHOTO)).await;
+            assert!(node.serves(D_PHOTO).await);
+        }
+
+        let keyring = Arc::new(Keyring::new());
+        keyring.adopt(context(&[&root, &b], 2, &[&ca]));
+        let cs = Arc::new(FjallCs::open(dir.path(), 1 << 20).unwrap());
+        let node = Node::new(Arc::clone(&keyring), cs, true);
+
+        assert!(
+            !node.serves(D_PHOTO).await,
+            "persisted Data under a CA revoked at startup must not be served"
+        );
+        assert!(
+            node.serves(B_PHOTO).await,
+            "persisted Data of an anchor not revoked is still served"
         );
     }
 }

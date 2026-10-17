@@ -260,14 +260,16 @@ impl Drop for Replies {
         // The stream's unanswered Interests may still be answered until their
         // lifetime ends (measured from now: an upper bound, since each was
         // sent earlier); keep them so those replies are discarded, not queued
-        // on the fallback, which nothing may ever read.
-        let mut now = None;
+        // on the fallback, which nothing may ever read. Entries whose lifetime
+        // ended go now, so a connection that sees only timeouts keeps no more
+        // than one lifetime's worth.
+        let now = Instant::now();
+        table.abandoned.retain(|(expires, _)| now < *expires);
         let mut i = 0;
         while i < table.waiters.len() {
             if table.waiters[i].stream == self.id {
                 let w = table.waiters.swap_remove(i);
-                let expires = *now.get_or_insert_with(Instant::now) + w.lifetime;
-                table.abandoned.push((expires, w));
+                table.abandoned.push((now + w.lifetime, w));
             } else {
                 i += 1;
             }
@@ -449,5 +451,31 @@ pub struct ServeGuard {
 impl Drop for ServeGuard {
     fn drop(&mut self) {
         DemuxConnection::unregister(&self.serves, &self.prefix);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A connection whose fetches only time out keeps no more abandoned
+    /// Interests than one lifetime's worth: expired ones go when the next
+    /// stream is dropped, without waiting for a reply.
+    #[test]
+    fn abandoned_interests_do_not_accumulate_without_replies() {
+        let pending: Pending = Arc::new(SyncMutex::new(PendingTable::default()));
+        let lifetime = Duration::from_millis(20);
+        for i in 0..3 {
+            let (_tx, rx) = mpsc::unbounded_channel();
+            let replies = Replies {
+                id: i,
+                rx,
+                pending: Arc::clone(&pending),
+            };
+            replies.expect_name("/unanswered".parse().unwrap(), false, false, lifetime);
+            drop(replies);
+            std::thread::sleep(lifetime * 2);
+        }
+        assert_eq!(pending.lock().abandoned.len(), 1);
     }
 }

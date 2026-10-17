@@ -573,6 +573,12 @@ validated only against that context's schema **and** anchors, never "any
 anchor I hold." Hierarchical contexts (the default) additionally enforce the
 `keyLocator.isPrefixOf(name)` floor — the signing key's identity must prefix
 the signed name — which closes the skeleton-key authorization gap (NFD #2856).
+In hierarchical and schema-authoritative contexts every certificate hop is
+authorized too (`SignedTrustContext::authorizes_certification`): the issuer is
+an anchor of the context, or its identity prefixes the subject's, or it is a
+CA the context names (`ca_endpoints`, e.g. `<ns>/CA`) certifying a key under
+the namespace — so an enrolled device cannot certify another device's key.
+`accept_all` and the ambient context judge no certificate hop.
 The flat-anchor API (`Validator::new` / `with_chain` / `add_trust_anchor` /
 `set_schema`) targets an ambient root-namespace context, so existing
 single-anchor callers are unchanged. A `SignedTrustContext` is also a signed,

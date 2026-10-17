@@ -172,7 +172,9 @@ fn decode_validity_period(signed_region: &[u8]) -> (u64, u64) {
 /// its successor), so lookups take a *prefix*: [`get`](Self::get) with a key
 /// name resolves to that key's newest currently valid certificate, with a
 /// full certificate name to that certificate. Legacy key-named certificates
-/// (named exactly after their key) are found the same way.
+/// (named exactly after their key) are found the same way. A lookup only ever
+/// returns certificates of the key `name` names, never another key's
+/// certificate that merely lies under `name`.
 pub struct CertCache {
     local: DashMap<Arc<Name>, Certificate>,
     /// Key name → names of its cached certificates.
@@ -190,9 +192,10 @@ impl CertCache {
         }
     }
 
-    /// The certificate `name` resolves to: among cached certificates whose
-    /// name starts with `name` (a key name, a full certificate name, or a
-    /// certificate name without its version), the newest one valid now; when
+    /// The certificate `name` resolves to: among cached certificates of the
+    /// key `name` names (a key name, a full certificate name, or a
+    /// certificate name without its version) that start with `name`, the
+    /// newest one valid now; when
     /// none is valid, the newest one regardless, so a caller can tell an
     /// expired certificate from a missing one. See
     /// [`get_valid`](Self::get_valid) for valid certificates only.
@@ -216,24 +219,14 @@ impl CertCache {
     }
 
     fn matching(&self, name: &Name) -> impl Iterator<Item = Certificate> + '_ {
-        let mut names: Vec<Arc<Name>> = key_candidates(name)
+        let names: Vec<Arc<Name>> = key_candidates(name)
             .into_iter()
             .find_map(|key| self.by_key.get(&key).map(|r| r.value().clone()))
             .unwrap_or_default();
-        // A name outside the `…/KEY/<id>` layout (test fixtures, ad-hoc
-        // keys) cannot be indexed by key; look its certificates up by prefix.
-        if names.is_empty() && !name.components().iter().any(|c| c.value.as_ref() == b"KEY") {
-            names = self
-                .local
-                .iter()
-                .filter(|r| r.key().has_prefix(name))
-                .map(|r| Arc::clone(r.key()))
-                .collect();
-        }
         let name = name.clone();
         names
             .into_iter()
-            .filter(move |cn| cn.has_prefix(&name))
+            .filter(move |cn| resolves_to(&name, cn))
             .filter_map(|cn| self.local.get(&cn).map(|r| r.value().clone()))
     }
 
@@ -299,6 +292,16 @@ fn key_candidates(name: &Name) -> Vec<Name> {
         keys.push(Name::from_components(comps[..comps.len() - 1].iter().cloned()));
     }
     keys
+}
+
+/// Whether the certificate named `cert` is one `locator` (a KeyLocator: a
+/// key name, a certificate name, or one without its version) resolves to: a
+/// certificate *of the locator's own key* under that name. A KeyLocator never
+/// resolves to another key's certificate — e.g. `/home/bob` to Data someone
+/// published under `/home/bob/eve` — so the key a signature is checked with
+/// is always the key the hierarchy floor and the schema judged.
+pub(crate) fn resolves_to(locator: &Name, cert: &Name) -> bool {
+    cert.has_prefix(locator) && key_candidates(locator).contains(&crate::cert_name::key_name_of(cert))
 }
 
 impl Default for CertCache {
@@ -556,5 +559,27 @@ mod tests {
         assert!(cache.remove(&key).is_some());
         assert!(cache.get(&key).is_none());
         assert!(cache.get(&Arc::new("/a/KEY/other".parse().unwrap())).is_some());
+    }
+
+    /// A KeyLocator resolves only to certificates of its own key: never to
+    /// another key's certificate, nor to other Data, that lies under it.
+    #[test]
+    fn locator_never_resolves_to_another_keys_certificate() {
+        let cache = CertCache::new();
+        cache.insert(cert("/home/bob/eve/p", 1, u64::MAX));
+        cache.insert(cert("/home/bob/eve/KEY/e/NDNCERT/v=1", 1, u64::MAX));
+        cache.insert(cert("/a/KEY/k/extra", 1, u64::MAX));
+
+        for locator in ["/home/bob", "/home", "/home/bob/eve", "/a/KEY/k", "/a/KEY"] {
+            let locator: Arc<Name> = Arc::new(locator.parse().unwrap());
+            assert!(cache.get(&locator).is_none(), "{locator} resolved to a foreign certificate");
+            assert!(cache.all(&locator).is_empty());
+            assert!(!resolves_to(&locator, &"/home/bob/eve/p".parse().unwrap()));
+        }
+        // Each still answers for its own key.
+        let own: Arc<Name> = Arc::new("/home/bob/eve/p".parse().unwrap());
+        assert!(cache.get(&own).is_some());
+        let eve: Arc<Name> = Arc::new("/home/bob/eve/KEY/e".parse().unwrap());
+        assert!(cache.get(&eve).is_some());
     }
 }

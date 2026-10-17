@@ -41,8 +41,12 @@ continuity rule from the one before.
 
 Rule 3 is strict: an equal version never replaces the held one either, so a
 different context claiming the same version cannot slip in.
-`Keyring::adopt_update` applies it atomically against a concurrent adoption.
-(`Keyring::adopt`, used for first adoption, keeps its `≥` rule.)
+`Keyring::adopt_update` applies it atomically against a concurrent adoption;
+a refresh, which checks its update without holding any lock (fetching may
+take many round trips), adopts with `Keyring::adopt_update_from`: only if
+the version it checked against is still the one held, so a version another
+command adopted meanwhile is never skipped over. (`Keyring::adopt`, used
+for first adoption, keeps its `≥` rule.)
 
 A refused or failed refresh changes nothing: the held version stays in force.
 A missed refresh only delays an update; it never weakens what is accepted.
@@ -75,7 +79,11 @@ holder keeps, not the timing of refreshes.
 - **Bounded**: at most `MAX_CATCH_UP_VERSIONS` (128) versions are followed;
   a node further behind is refused before anything is fetched and adopts the
   namespace again from a current anchor link (one fetch). A version is one
-  operator action, so 128 covers years of a namespace's changes.
+  operator action, so 128 covers years of a namespace's changes. The walk
+  also starts no fetch after `MAX_CATCH_UP_TIME` (40 s): an upstream that
+  answers the newest version's name but lets every version time out ends the
+  walk as unreachable, with nothing adopted, and the next refresh starts
+  again from the held version.
 - **All or nothing**: a walk that stops adopts nothing, so the held version
   stays in force, as for any refused refresh.
 
@@ -100,11 +108,17 @@ holder keeps, not the timing of refreshes.
    of the held version (or the forwarder dropped it) and there are versions
    in between, follows them by exact name ([catching up](#catching-up-across-versions)),
    the forwarder told to expect each in turn as an update of the one before.
-5. Adopts the newest. The result carries the previous version, the new
-   context, its signed Data byte for byte (to store and republish — the
-   signature must stay intact), the anchor that signed it, the revocation
-   entries it adds, and the versions walked through (`walked`, each with its
-   signed Data, to store and republish too).
+5. Adopts the newest, if the version it was checked against is still held
+   (otherwise `RefreshError::ChangedMeanwhile`: nothing is adopted, and the
+   next refresh starts from the version held then). The result carries the
+   previous version, the new context, its signed Data byte for byte (to
+   store and republish — the signature must stay intact), the anchor that
+   signed it, the revocation entries it adds, and the versions walked
+   through (`walked`, each with its signed Data, to store and republish too).
+
+The daemon runs refreshes without its `context_change` lock (taken by
+`revoke` and `security/context-update`), so a slow catch-up never holds
+those up.
 
 `ndn_identity::refresh_context_via_engine(engine, keyring, ns)` runs it over a
 short-lived consumer face of an engine, with the engine's validator as the
@@ -138,6 +152,16 @@ TLV `0xB4`, in ApplicationParameters). The daemon applies the same continuity
 rule as a refresh, then stores and publishes it; a refusal leaves the held
 version in force. It is a trust-admin verb like `context-refresh`.
 
+Its answer says what became of the version, so the CLI undoes its own work
+(a file kit, a recovered root) only on a refusal: `200` once the version is
+adopted (also when storing it then fails — the detail says so), and `200`
+for a version the daemon already took and stores byte for byte. A CLI that
+gets no answer in time hands the same version over again, and that request,
+queued behind the first, answers what became of it. The CLI hands over only
+to the daemon that uses the PIB it read the held version from (its
+`security/identity-status` `pib_path`), so a version is never adopted by a
+daemon whose PIB stays behind.
+
 ## Push: `context_sync` over SVS
 
 `ndn_identity::context_sync` is the alternative for fleets that already run an
@@ -145,14 +169,17 @@ SVS group per context. A publisher puts the context's signed Data (the same
 bytes as the RDR publication) into the group at `<group>/<publisher>/seg=<N>`,
 the sequence number being the version; each subscriber fetches the newest
 sequence and adopts it under the same continuity rule
-(`open_context_update` + `Keyring::adopt_update`). When the newest is not
+(`open_context_update` + `Keyring::adopt_update_from`). When the newest is not
 signed by an anchor of the held version, the subscriber follows the earlier
 sequence numbers (from the first newer than the held version) one by one,
 the same walk as the pull refresh. A group member that is not the namespace
 root therefore cannot produce an update anyone adopts, whether or not the
 group Data itself is validated. A namespace the subscriber does not hold yet
 is never adopted from the group: first adoption goes through a link or
-invite.
+invite. `ContextSyncOutcome::Adopted` carries an `ndn_cert::ContextUpdate`
+(the signed Data and the versions walked, as a pull refresh returns), and
+`context_sync::run` hands each to the caller's `keep`, which persists and
+serves them.
 
 ### Why pull is the default
 
@@ -238,10 +265,10 @@ timeout, malformed metadata) and `no trust context is held for <ns>`.
 | Part | Where |
 |---|---|
 | Continuity check, refresh | `ndn_cert::{open_context_update, refresh_context, UpdateRefusal, RefreshError}` (`ndn-cert/src/context_update.rs`) |
-| Catching up | `ndn_cert::{follow_versions, VersionSource, ContextStep, CatchUpStop, MAX_CATCH_UP_VERSIONS}`, `ContextUpdate::walked` |
+| Catching up | `ndn_cert::{follow_versions, VersionSource, ContextStep, CatchUpStop, MAX_CATCH_UP_VERSIONS, MAX_CATCH_UP_TIME}`, `ContextUpdate::walked` |
 | Every version kept | `ndn_cert::{persist_context, read_stored_versions, context_version_path}` (`ndn-cert/src/context_store.rs`); served by `ndn-fwd` `context_publisher.rs` |
 | RDR fetch steps | `ndn_cert::{fetch_context_pointer, fetch_versioned_context}` |
-| Strictly-newer adoption | `ndn_security::Keyring::adopt_update` |
+| Strictly-newer adoption | `ndn_security::Keyring::{adopt_update, adopt_update_from}` |
 | Forwarder expectation | `ndn_security::Validator::expect_context_update` (`validator/expected.rs`) |
 | Engine binding | `ndn_identity::refresh_context_via_engine` |
 | Push over SVS | `ndn_identity::context_sync` |

@@ -53,7 +53,7 @@ serde_json    = { workspace = true }
 base64        = { workspace = true }
 futures       = { workspace = true }
 
-tokio         = { workspace = true, features = ["sync", "time", "rt"] }
+tokio         = { workspace = true, features = ["sync", "time", "rt", "macros"] }
 
 # Optional hardware key storage via YubiKey PIV (feature: yubikey-piv).
 # Requires pcscd and a connected YubiKey.

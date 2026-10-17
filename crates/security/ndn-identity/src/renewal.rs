@@ -24,7 +24,7 @@ use ndn_cert::IssuedCertificate;
 use ndn_packet::{Data, Name};
 use ndn_security::{Certificate, Keyring, SecurityManager, Signer};
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::device::RenewalPolicy;
 use crate::engine_exchange::EngineExchange;
@@ -66,7 +66,10 @@ pub enum RenewBefore {
     /// A fraction (`0..1`) of the certificate's lifetime: `1/3` renews a
     /// 90-day certificate 30 days before it expires.
     Fraction(f64),
-    /// A fixed time before expiry (capped at the certificate's lifetime).
+    /// A fixed time before expiry. A certificate whose lifetime is no longer
+    /// than this would be due the moment it is issued (and its renewal due
+    /// again at once): it is renewed at [`ONE_THIRD`](Self::ONE_THIRD) instead
+    /// — see [`exceeds_lifetime`](Self::exceeds_lifetime).
     Remaining(Duration),
 }
 
@@ -76,14 +79,29 @@ impl RenewBefore {
 
     /// When (nanoseconds since the Unix epoch) a certificate valid from
     /// `valid_from` until `valid_until` (likewise) is due: `valid_until`
-    /// minus the threshold, never before `valid_from`.
+    /// minus the threshold, never before `valid_from`. A threshold that
+    /// [exceeds the lifetime](Self::exceeds_lifetime) uses
+    /// [`ONE_THIRD`](Self::ONE_THIRD).
     pub fn renew_at(&self, valid_from: u64, valid_until: u64) -> u64 {
         let lifetime = valid_until.saturating_sub(valid_from);
         let before = match *self {
             Self::Fraction(f) => (lifetime as f64 * f.clamp(0.0, 1.0)) as u64,
+            Self::Remaining(_) if self.exceeds_lifetime(valid_from, valid_until) => {
+                return Self::ONE_THIRD.renew_at(valid_from, valid_until);
+            }
             Self::Remaining(d) => u64::try_from(d.as_nanos()).unwrap_or(u64::MAX),
         };
         valid_until.saturating_sub(before).max(valid_from)
+    }
+
+    /// Whether this is a [`Remaining`](Self::Remaining) threshold at least
+    /// as long as the lifetime of a certificate valid from `valid_from`
+    /// until `valid_until`: the CA issues certificates shorter than the
+    /// threshold, so [`renew_at`](Self::renew_at) falls back to a third of
+    /// the lifetime.
+    pub fn exceeds_lifetime(&self, valid_from: u64, valid_until: u64) -> bool {
+        let lifetime = valid_until.saturating_sub(valid_from);
+        matches!(*self, Self::Remaining(d) if d.as_nanos() >= u128::from(lifetime))
     }
 }
 
@@ -250,12 +268,31 @@ pub fn start_renewal(
 
     let task = tokio::spawn(async move {
         let mut failures: u32 = 0;
+        // The expired certificate already reported, so it is reported once.
+        let mut reported_expired: Option<Arc<Name>> = None;
         loop {
             tokio::time::sleep(check_interval).await;
 
-            if !check_renewal_needed(&manager, &key_name, percent) {
-                failures = 0;
-                continue;
+            match renewal_due(&manager, &key_name, percent) {
+                Due::Now => reported_expired = None,
+                Due::NotYet | Due::NoCertificate => {
+                    failures = 0;
+                    continue;
+                }
+                Due::Expired(cert) => {
+                    failures = 0;
+                    if reported_expired.as_ref() != Some(&cert.name) {
+                        error!(
+                            identity = %namespace,
+                            certificate = %cert.name,
+                            expired_secs_ago = now_ns().saturating_sub(cert.valid_until) / 1_000_000_000,
+                            "certificate expired and was not renewed in time: renewal needs a \
+                             current certificate, so this device needs a new invite to enroll again"
+                        );
+                        reported_expired = Some(cert.name);
+                    }
+                    continue;
+                }
             }
             info!(identity = %namespace, "certificate approaching expiry, initiating renewal");
             match &renewer {
@@ -290,13 +327,14 @@ pub fn start_renewal(
 }
 
 /// Backoff before the next renewal attempt after `failures` consecutive failures:
-/// exponential in `base` (capped at 1 h) plus up to ±50% jitter (decorrelates a fleet).
+/// `base`·2^min(failures, 6), capped at 1 h, then cut to a random 50–100% of
+/// that (decorrelates a fleet).
 pub fn backoff_delay(base: Duration, failures: u32) -> Duration {
     use std::time::{SystemTime, UNIX_EPOCH};
     const CAP: Duration = Duration::from_secs(3600);
     let exp = base.saturating_mul(1u32 << failures.min(6)); // base·2^min(failures,6)
     let capped = exp.min(CAP);
-    // Cheap jitter from the wall clock (no RNG dep): ±50% of the capped delay.
+    // Cheap jitter from the wall clock (no RNG dep): 50–100% of the capped delay.
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.subsec_nanos() as u64)
@@ -310,18 +348,37 @@ pub fn backoff_delay(base: Duration, failures: u32) -> Duration {
     capped.saturating_sub(half).saturating_add(jitter)
 }
 
-fn check_renewal_needed(manager: &SecurityManager, key_name: &Name, threshold_pct: u64) -> bool {
+fn now_ns() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let now_ns = SystemTime::now()
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_nanos() as u64;
-    current_certificate(manager, key_name).is_some_and(|cert| {
-        cert.valid_until > cert.valid_from
-            && RenewBefore::Fraction(threshold_pct as f64 / 100.0)
-                .renew_at(cert.valid_from, cert.valid_until)
-                <= now_ns
-    })
+        .as_nanos() as u64
+}
+
+/// Whether the key's certificate is due for renewal.
+enum Due {
+    NotYet,
+    Now,
+    /// No certificate valid now; the newest cached one expired. Renewal
+    /// needs a current certificate: the device must enroll again.
+    Expired(Certificate),
+    NoCertificate,
+}
+
+fn renewal_due(manager: &SecurityManager, key_name: &Name, threshold_pct: u64) -> Due {
+    let now = now_ns();
+    let Some(cert) = current_certificate(manager, key_name) else {
+        return match manager.cert_cache().get(&Arc::new(key_name.clone())) {
+            Some(cert) if cert.valid_until <= now => Due::Expired(cert),
+            _ => Due::NoCertificate,
+        };
+    };
+    let due = cert.valid_until > cert.valid_from
+        && RenewBefore::Fraction(threshold_pct as f64 / 100.0)
+            .renew_at(cert.valid_from, cert.valid_until)
+            <= now;
+    if due { Due::Now } else { Due::NotYet }
 }
 
 #[cfg(test)]
@@ -370,7 +427,9 @@ mod tests {
     }
 
     /// A fraction renews with that share of the lifetime left; a fixed
-    /// time, that long before expiry; never before the certificate starts.
+    /// time, that long before expiry. A fixed time at least the lifetime
+    /// never makes a certificate due as it is issued (it would be renewed in
+    /// a loop): it renews at a third of the lifetime.
     #[test]
     fn renew_at_leaves_the_threshold_before_expiry() {
         const DAY: u64 = 86_400_000_000_000;
@@ -381,10 +440,26 @@ mod tests {
             RenewBefore::Remaining(Duration::from_secs(5 * 86_400)).renew_at(from, until),
             95 * DAY
         );
-        assert_eq!(
-            RenewBefore::Remaining(Duration::from_secs(500 * 86_400)).renew_at(from, until),
-            from
-        );
+        for days in [90, 500] {
+            let before = RenewBefore::Remaining(Duration::from_secs(days * 86_400));
+            assert!(before.exceeds_lifetime(from, until));
+            assert_eq!(before.renew_at(from, until), third);
+        }
+    }
+
+    /// An expired certificate is told apart from a missing one: renewal
+    /// cannot help it, and the task reports that the device must enroll
+    /// again instead of falling silent.
+    #[test]
+    fn an_expired_certificate_is_not_mistaken_for_none() {
+        let manager = SecurityManager::new();
+        let key_name =
+            Name::from_components([NameComponent::generic(bytes::Bytes::from_static(b"k"))]);
+        assert!(matches!(renewal_due(&manager, &key_name, 20), Due::NoCertificate));
+        let mut cert = near_expiry_cert(&key_name);
+        cert.valid_until = now_ns() - 1_000_000_000;
+        manager.cert_cache().insert(cert);
+        assert!(matches!(renewal_due(&manager, &key_name, 20), Due::Expired(_)));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

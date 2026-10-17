@@ -297,6 +297,8 @@ impl SignedTrustContext {
 
     /// An accept-all context: schema-only, **no** hierarchy floor. An
     /// explicit, logged opt-in — prefer [`hierarchical`](Self::hierarchical).
+    /// Certificate hops are not judged either: any key chaining to an anchor
+    /// may certify any key ([`authorizes_certification`](Self::authorizes_certification)).
     pub fn accept_all(namespace: Name) -> Self {
         tracing::warn!(
             target: "ndn::security",
@@ -309,7 +311,8 @@ impl SignedTrustContext {
 
     /// The ambient (root-namespace) context backing a [`Validator`]'s
     /// flat-anchor API for backward compatibility. The hierarchy floor is
-    /// **off** so existing single-anchor callers keep their prior semantics.
+    /// **off** so existing single-anchor callers keep their prior semantics,
+    /// and so are certificate-hop rules ([`authorizes_certification`](Self::authorizes_certification)).
     pub(crate) fn ambient(
         schema: TrustSchema,
         anchors: Arc<DashMap<Arc<Name>, Certificate>>,
@@ -547,6 +550,36 @@ impl SignedTrustContext {
             .into_iter()
             .flatten()
             .any(|s| signers.iter().flatten().any(|k| self.authorizes(s, k)))
+    }
+
+    /// Whether the key `issuer` (a KeyLocator: key or certificate name) may
+    /// certify the certificate `cert` under this context. In a hierarchical
+    /// (floor) or schema-authoritative context — every context received on
+    /// the wire — it may when:
+    ///
+    /// 1. `issuer` is a key of an anchor of this context; or
+    /// 2. the issuer's identity (its name before `KEY`) is a prefix of the
+    ///    subject's identity (the classic NDN hierarchical rule); or
+    /// 3. the issuer's identity is a CA this context names
+    ///    ([`ca_endpoints`](Self::ca_endpoints), e.g. `<ns>/CA`) and the
+    ///    subject lies under the context's namespace.
+    ///
+    /// So an enrolled device cannot certify another device's key. An
+    /// authoritative schema also judges every certificate hop, on top
+    /// ([`authorizes_hop`](Self::authorizes_hop)). [`accept_all`](Self::accept_all)
+    /// and the ambient flat-anchor context judge no certificate hop.
+    pub fn authorizes_certification(&self, cert: &Name, issuer: &Name) -> bool {
+        use crate::cert_name::key_name_of;
+        if !self.enforce_hierarchy && !self.schema_authoritative {
+            return true;
+        }
+        if self.anchor_for(issuer).is_some() {
+            return true;
+        }
+        let subject = key_identity(&key_name_of(cert));
+        let issuer_id = key_identity(&key_name_of(issuer));
+        subject.has_prefix(&issuer_id)
+            || (self.ca_endpoints.contains(&issuer_id) && subject.has_prefix(&self.namespace))
     }
 
     /// Why [`authorizes`](Self::authorizes) decides as it does for

@@ -59,7 +59,10 @@ Naming follows NDN Certificate Format v2: the key is
 `NDNCERT` (issued by the namespace CA) or `NA`. A key can hold several
 certificates — a renewal adds a new one, the old stays valid until it
 expires. KeyLocators name the key; a verifier fetches by key name
-(CanBePrefix + MustBeFresh) and uses the newest valid certificate.
+(CanBePrefix + MustBeFresh) and uses the newest valid certificate. A
+KeyLocator only ever resolves to a certificate of the key it names: other
+Data under that name (another key's certificate, an NDNCERT approval
+`<key>/ndncert-approve/<id>`) never answers for it.
 
 | Verb | API |
 |---|---|

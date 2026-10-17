@@ -429,13 +429,14 @@ impl Validator {
 
         // The signer as its KeyLocator names it, as the certificate that
         // resolves to, or as its key (`SignedTrustContext::authorizes_hop`).
+        let ctx = self.keyring.context_for(&data.name);
         let cert = self.cert_cache.get(&key_name);
-        if !self.keyring.context_for(&data.name).authorizes_hop(
-            &data.name,
-            &key_name,
-            cert.as_ref().map(|c| c.name.as_ref()),
-        ) {
+        if !ctx.authorizes_hop(&data.name, &key_name, cert.as_ref().map(|c| c.name.as_ref())) {
             return ValidationResult::Invalid(TrustError::SchemaMismatch);
+        }
+        // A revoked key (or certificate) signs nothing, cached or not.
+        if let Some(revoked) = revoked_signer(&ctx, &key_name, cert.as_ref()) {
+            return ValidationResult::Invalid(revoked);
         }
 
         let Some(cert) = cert else {
@@ -513,13 +514,13 @@ impl Validator {
             None => return InterestValidationOutcome::Invalid(TrustError::InvalidSignature),
         };
 
+        let ctx = self.keyring.context_for(&interest.name);
         let cert = self.cert_cache.get(&key_name);
-        if !self.keyring.context_for(&interest.name).authorizes_hop(
-            &interest.name,
-            &key_name,
-            cert.as_ref().map(|c| c.name.as_ref()),
-        ) {
+        if !ctx.authorizes_hop(&interest.name, &key_name, cert.as_ref().map(|c| c.name.as_ref())) {
             return InterestValidationOutcome::Invalid(TrustError::SchemaMismatch);
+        }
+        if let Some(revoked) = revoked_signer(&ctx, &key_name, cert.as_ref()) {
+            return InterestValidationOutcome::Invalid(revoked);
         }
 
         let Some(cert) = cert else {
@@ -547,6 +548,19 @@ impl Validator {
             Err(e) => InterestValidationOutcome::Invalid(e),
         }
     }
+}
+
+/// The refusal for a signer `ctx` revokes: its KeyLocator `key_name`, or the
+/// certificate `cert` that resolved to (as the chain walk checks each hop).
+fn revoked_signer(
+    ctx: &SignedTrustContext,
+    key_name: &Name,
+    cert: Option<&Certificate>,
+) -> Option<TrustError> {
+    std::iter::once(key_name)
+        .chain(cert.map(|c| c.name.as_ref()))
+        .find(|n| ctx.is_revoked(n))
+        .map(|n| TrustError::Revoked { name: n.to_string() })
 }
 
 pub(crate) fn now_ns() -> u64 {
@@ -739,6 +753,39 @@ mod tests {
         assert!(matches!(
             validator.validate(&data).await,
             ValidationResult::Valid(_)
+        ));
+    }
+
+    /// A key the context revokes signs nothing, even with its certificate
+    /// still cached: single-hop validation judges the context's revocations
+    /// as the chain walk does.
+    #[tokio::test]
+    async fn revoked_key_is_refused_with_cached_certificate() {
+        let seed = [13u8; 32];
+        let key_name = name1("key");
+        let signer = Ed25519Signer::from_seed(&seed, key_name.clone());
+        let data = Data::decode(make_signed_data(&signer, "data", "key").await).unwrap();
+        let vk_bytes = ed25519_dalek::SigningKey::from_bytes(&seed)
+            .verifying_key()
+            .to_bytes();
+        let validator = Validator::new(open_schema("data", "key"));
+        validator.cert_cache().insert(Certificate {
+            name: Arc::new(key_name.clone()),
+            public_key: Bytes::copy_from_slice(&vk_bytes),
+            valid_from: 0,
+            valid_until: u64::MAX,
+            issuer: None,
+            signed_region: None,
+            sig_value: None,
+            sig_type: ndn_packet::SignatureType::SignatureEd25519,
+        });
+        validator.adopt_context(Arc::new(
+            SignedTrustContext::accept_all(name1("data")).with_revocation(key_name),
+        ));
+
+        assert!(matches!(
+            validator.validate(&data).await,
+            ValidationResult::Invalid(TrustError::Revoked { .. })
         ));
     }
 

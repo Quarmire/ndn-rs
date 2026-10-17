@@ -6,7 +6,8 @@
 //!   written;
 //! - a mistyped word list is refused (checksum) before anything can sign;
 //! - `destroyed` keeps the certificates the old CA issued valid;
-//! - `compromised` makes every chain through the old CA invalid;
+//! - `compromised` makes every chain through the old CA invalid, and keeps
+//!   no recovery anchor the operator did not vouch for;
 //! - holders of version `N` adopt the recovered `N+1` by continuity, and
 //!   refuse a version the revoked old root signs;
 //! - a node offline across a recovery and a later root-signed version
@@ -221,6 +222,7 @@ async fn a_kit_that_is_not_a_recovery_anchor_cannot_recover() {
         &stranger,
         "phone",
         OldRoot::Destroyed,
+        &[],
         &NewRootStore::File,
     )
     .await
@@ -238,6 +240,7 @@ async fn a_kit_that_is_not_a_recovery_anchor_cannot_recover() {
             new_root: &root_dev.out.init.anchor,
             new_root_device_keys: &[],
             old_root: OldRoot::Destroyed,
+            kept_kits: &[],
         },
     )
     .await
@@ -309,6 +312,7 @@ async fn recover(
         &seed.signer(&n("/home/bob")),
         "phone",
         old_root,
+        &[],
         &NewRootStore::File,
     )
     .await
@@ -412,6 +416,87 @@ async fn holders_adopt_the_recovered_version_and_refuse_the_revoked_old_root() {
 }
 
 #[tokio::test]
+async fn a_compromised_recovery_keeps_no_kit_nobody_vouched_for() {
+    let ns = n("/home/bob");
+    let root_dev = RootDevice::new().await;
+    let (_, held) = root_dev.held();
+    let (seed, with_kit) = add_word_kit(&root_dev, &held).await;
+    // Whoever holds the stolen root adds a kit of their own; the owner has
+    // a spare kit too.
+    let (planted, with_planted) = add_word_kit(&root_dev, &with_kit).await;
+    let (spare, with_spare) = add_word_kit(&root_dev, &with_planted).await;
+    let planted = planted.signer(&ns);
+    let spare = spare.signer(&ns);
+
+    let dir = tempfile::tempdir().unwrap();
+    let pib = FilePib::new(dir.path()).unwrap();
+    let recovered = recover_namespace_in_pib(
+        &pib,
+        &with_spare,
+        &seed.signer(&ns),
+        "phone",
+        OldRoot::Compromised,
+        std::slice::from_ref(spare.key_name()),
+        &NewRootStore::File,
+    )
+    .await
+    .unwrap();
+    let n1 = open(&recovered.version.bump.data);
+    assert!(!n1.is_anchor(planted.key_name()));
+    assert!(n1.is_revoked(planted.key_name()));
+    assert!(n1.is_anchor(spare.key_name()) && n1.is_anchor(seed.signer(&ns).key_name()));
+
+    // Nothing it did not vouch for can sign the next version; a kept kit can.
+    let newest = open(&recovered.root_version.data);
+    let content = recovered.root_version.data.content().unwrap();
+    for (signer, adopted) in [(&planted, false), (&spare, true)] {
+        let next = SignedTrustContext::decode_content(content, newest.version() + 1)
+            .unwrap()
+            .sign_into_data_async(signer)
+            .await
+            .unwrap();
+        assert_eq!(
+            open_context_update(&newest, &next).await.is_ok(),
+            adopted,
+            "{}",
+            signer.key_name()
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_kit_to_keep_that_is_no_recovery_anchor_is_refused_before_anything_is_written() {
+    let root_dev = RootDevice::new().await;
+    let (_, held) = root_dev.held();
+    let (seed, with_kit) = add_word_kit(&root_dev, &held).await;
+    let stranger = RecoverySeed::generate().unwrap().signer(&n("/home/bob"));
+    let kit_key = seed.signer(&n("/home/bob")).key_name().clone();
+
+    let replacement = tempfile::tempdir().unwrap();
+    let pib = FilePib::new(replacement.path()).unwrap();
+    let keys_before = pib.list_keys().unwrap();
+    for (old_root, kept) in [
+        (OldRoot::Compromised, stranger.key_name().clone()),
+        (OldRoot::Destroyed, kit_key),
+    ] {
+        recover_namespace_in_pib(
+            &pib,
+            &with_kit,
+            &seed.signer(&n("/home/bob")),
+            "phone",
+            old_root,
+            &[kept],
+            &NewRootStore::File,
+        )
+        .await
+        .unwrap_err();
+    }
+    assert!(RootStore::open(&pib).unwrap().is_none());
+    assert_eq!(pib.list_keys().unwrap(), keys_before);
+    assert!(!replacement.path().join("ca").exists());
+}
+
+#[tokio::test]
 async fn revoking_a_kit_removes_its_power() {
     let root_dev = RootDevice::new().await;
     let (_, held) = root_dev.held();
@@ -436,6 +521,7 @@ async fn revoking_a_kit_removes_its_power() {
         &kit,
         "phone",
         OldRoot::Destroyed,
+        &[],
         &NewRootStore::File,
     )
     .await

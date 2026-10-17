@@ -753,7 +753,7 @@ mod tests {
         mgr.generate_ed25519_from_seed(ca_name.clone(), &ca_seed)
             .unwrap();
 
-        let subj_name = key_name("subject");
+        let subj_name: Name = "/subject/KEY/k1".parse().unwrap();
         let subj_seed = [2u8; 32];
         mgr.generate_ed25519_from_seed(subj_name.clone(), &subj_seed)
             .unwrap();

@@ -174,6 +174,17 @@ impl From<YubikeyTouchPolicy> for TouchPolicy {
     }
 }
 
+/// What a PIV slot holds ([`YubikeyPiv::slot_state`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum YubikeySlotState {
+    /// No key.
+    Empty,
+    /// A key.
+    Holds,
+    /// The token cannot tell: why.
+    Unknown(String),
+}
+
 type SharedKey = Arc<Mutex<YubiKey>>;
 
 /// Run `f` on the token: on tokio's blocking pool when a runtime is current
@@ -278,6 +289,32 @@ impl YubikeyPiv {
                 TrustError::KeyStore(format!("slot {} of the YubiKey holds no key", slot.as_str()))
             })?;
             Ok(p256_spki(spki.subject_public_key.raw_bytes()))
+        })
+        .await
+    }
+
+    /// Whether `slot` holds a key, from its metadata. Generating into a
+    /// slot replaces its key for good, so a caller that must not destroy one
+    /// asks first.
+    pub async fn slot_state(&self, slot: YubikeySlot) -> Result<YubikeySlotState, TrustError> {
+        let slot_id = SlotId::from(slot);
+        on_device(Arc::clone(&self.yk), move |yk| {
+            Ok(match piv::metadata(yk, slot_id) {
+                Ok(_) => YubikeySlotState::Holds,
+                // The token answers "referenced data not found" (6A88) for an
+                // empty slot, which yubikey 0.8 reports as a generic error.
+                Err(yubikey::Error::GenericError) => YubikeySlotState::Empty,
+                Err(yubikey::Error::NotSupported) => YubikeySlotState::Unknown(
+                    "this YubiKey's firmware (older than 5.2.3) does not report a slot's key"
+                        .into(),
+                ),
+                Err(e) => {
+                    return Err(TrustError::KeyStore(format!(
+                        "cannot read slot {} of the YubiKey: {e}",
+                        slot.as_str()
+                    )));
+                }
+            })
         })
         .await
     }

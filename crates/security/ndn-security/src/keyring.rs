@@ -134,8 +134,37 @@ impl Keyring {
         Ok(())
     }
 
+    /// Replace the held context of `ctx`'s namespace with `ctx` only if the
+    /// held one is still `from` (the same `Arc`) — the version `ctx` was
+    /// checked against as an update — and `ctx` is strictly newer. Lets a
+    /// caller check an update without holding any lock (fetching it may
+    /// take many round trips) and adopt it only if nothing changed the
+    /// namespace meanwhile. Atomic against concurrent adoptions.
+    /// `Err(Some(held))`: the held context is another one (or not older);
+    /// `Err(None)`: nothing is held to update.
+    pub fn adopt_update_from(
+        &self,
+        from: &Arc<SignedTrustContext>,
+        ctx: Arc<SignedTrustContext>,
+    ) -> Result<(), Option<u64>> {
+        let revoked = match self.contexts.get_mut(ctx.namespace()) {
+            None => return Err(None),
+            Some(held) if !Arc::ptr_eq(&held, from) || held.version() >= ctx.version() => {
+                return Err(Some(held.version()));
+            }
+            Some(mut held) => {
+                let revoked = newly_revoked(Some(held.as_ref()), &ctx);
+                *held = Arc::clone(&ctx);
+                revoked
+            }
+        };
+        self.notify_revoked(&ctx, &revoked);
+        Ok(())
+    }
+
     /// Run `listener` whenever this keyring adopts a context (by
-    /// [`adopt`](Self::adopt) or [`adopt_update`](Self::adopt_update)) that
+    /// [`adopt`](Self::adopt), [`adopt_update`](Self::adopt_update) or
+    /// [`adopt_update_from`](Self::adopt_update_from)) that
     /// revokes names the version it replaces did not — e.g. so a forwarder
     /// drops cached Data those keys signed. It runs synchronously on the
     /// adopting thread after the new context is in force and the
@@ -298,6 +327,21 @@ mod tests {
         assert_eq!(kr.adopt_update(ctx(1)), Err(Some(2)), "older is refused");
         assert_eq!(kr.adopt_update(ctx(3)), Ok(()));
         assert_eq!(kr.version_of(&n("/home/bob")), Some(3));
+    }
+
+    /// An update checked against one held version is never adopted over
+    /// another one adopted meanwhile, even an older one.
+    #[test]
+    fn an_update_is_adopted_only_over_the_version_it_was_checked_against() {
+        let kr = keyring();
+        let ctx = |v| Arc::new(SignedTrustContext::hierarchical(n("/home/bob")).with_version(v));
+        kr.adopt(ctx(2));
+        let checked_against = kr.contexts().pop().unwrap();
+        kr.adopt_update(ctx(3)).unwrap();
+        assert_eq!(kr.adopt_update_from(&checked_against, ctx(5)), Err(Some(3)));
+        assert_eq!(kr.version_of(&n("/home/bob")), Some(3));
+        let held = kr.contexts().pop().unwrap();
+        assert_eq!(kr.adopt_update_from(&held, ctx(5)), Ok(()));
     }
 
     /// A revoked key name covers that key and every certificate under it,

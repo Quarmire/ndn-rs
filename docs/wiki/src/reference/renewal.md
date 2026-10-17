@@ -120,12 +120,17 @@ renew_before = 0.333     # or "30d"; 0 = only `ndn-fwd renew`
 ```
 
 The daemon renews every certificate the namespace CA issued to its keys
-(`<pib>/keys/<hash>/certs/*.data`) once `renew_before` of its lifetime is
-left, stores the new one in the PIB beside the old one, serves both by name
-(an Interest for the key name gets the newest valid one) and keeps signing
-with the same key. A failed attempt is retried (about a minute, doubling up to an
-hour; an hour after a refusal) and logged as a WARN with `days_left`; an
-expired certificate is reported once, as an ERROR.
+(`<pib>/keys/<hash>/certs/*.data`) once less than `renew_before` of it is
+left (a fraction of its lifetime, or a fixed time before it expires), stores
+the new one in the PIB beside the old one, serves both by name (an Interest
+for the key name gets the newest valid one) and keeps signing with the same
+key. A fixed time at least as long as the certificates the CA issues (`"30d"`
+with `guest = 7` above) would make each new certificate due as it is issued:
+those are renewed once a third of their lifetime is left, and a WARN says so
+once. A failed attempt is retried after a jittered backoff (30–60 s,
+doubling up to 30–60 min; 30–60 min after a refusal) and logged as a WARN
+with `days_left`; a PIB the daemon cannot read is logged as a WARN and
+retried likewise; an expired certificate is reported once, as an ERROR.
 
 ```sh
 ndn-fwd renew -c device.toml      # renew now
@@ -138,5 +143,13 @@ was refused (and exits non-zero). On a phone, the host app calls
 `renew_certificate(safebag, password, issuers)` to renew, passing the
 `issuers` it persisted from the enrollment or last renewal (without them a
 namespace whose root device was replaced through a recovery kit cannot
-renew the phone's certificate); it persists the returned SafeBag and
-`issuers` in place of the old ones.
+renew the phone's certificate). It returns an `NdnRenewal`: `Renewed` —
+persist `identity.safebag` and `identity.issuers` in place of the old ones;
+`Failed` — nothing changed and retrying later can help (the CA was not
+reached, or signing failed); `Refused` — final, the `detail` says why
+(usually: enroll again with a new invite). An error means nothing was sent:
+the SafeBag or password is unusable. An enclave identity is loaded with the
+certificate the app persisted from its enrollment
+(`load_identity_enclave(key_name, enclave, certificate)`); without one, its
+certificate is fetched by key name and taken only if it chains to an adopted
+trust context — a self-issued certificate never stands in for it.

@@ -34,11 +34,15 @@
 //! holds the namespace's context): a new root (in the root store the
 //! operator chooses), a new CA key and a new admin device identity, all
 //! with fresh key ids; the recovery key signs version `N+1` whose anchors are
-//! the new root and the remaining recovery anchors, plus the old root when
-//! the operator says it was **destroyed** ([`OldRoot`]). When it was
-//! **compromised**, `N+1` also revokes the old root key and the keys the old
-//! root device held ([`KeyRole::ROOT_DEVICE`]: its CA key and admin key), so
-//! every certificate chaining through the old CA stops validating. The new
+//! the new root and the recovery anchors kept, plus the old root when the
+//! operator says it was **destroyed** ([`OldRoot`]; every recovery anchor
+//! stays). When it was **compromised**, `N+1` also revokes the old root key
+//! and the keys the old root device held ([`KeyRole::ROOT_DEVICE`]: its CA
+//! key and admin key), so every certificate chaining through the old CA
+//! stops validating, and it keeps only the recovery anchors the operator
+//! vouches for (the signing kit and [`RecoveryPlan::kept_kits`]): whoever
+//! held the old root could have added one of their own, and the rest are
+//! removed and revoked. The new
 //! root then signs `N+2`, the same content ([`reissue_version`]), so the
 //! newest version is root-signed and the root's fingerprint is the expected
 //! fingerprint of anchor links and invites again. Every node holding
@@ -69,7 +73,7 @@ use crate::namespace::{
 };
 use crate::roles::{Role, RoleError, device_identity, validate_namespace};
 use crate::root_store::{
-    NewRootStore, PendingRoot, RootSecret, RootStore, RootStoreError, same_public_key,
+    NewRootStore, PendingRoot, RootSecret, RootStore, RootStoreError, SlotGuard, same_public_key,
 };
 
 /// Environment variable a CLI reads a file kit's passphrase from.
@@ -80,7 +84,8 @@ pub const KIT_WORDS_ENV: &str = "NDN_KIT_WORDS";
 /// Environment variable a CLI reads a YubiKey kit's PIV PIN from.
 pub const KIT_PIN_ENV: &str = "NDN_KIT_PIN";
 /// The PIV slot a YubiKey kit's key is generated in by default (`9d`, "Key
-/// Management": a slot a root on the same token would not use).
+/// Management"). The kit goes on a token of its own: generating it on the
+/// root's token is refused ([`SlotGuard`]).
 pub const DEFAULT_KIT_SLOT: &str = "9d";
 /// Words in a word kit: 256 bits of seed plus an 8-bit checksum.
 pub const KIT_WORD_COUNT: usize = 24;
@@ -131,7 +136,9 @@ pub enum OldRoot {
     Destroyed,
     /// Possibly in someone else's hands: its root key, its CA key and its
     /// admin key are revoked, so every certificate chaining through the old
-    /// CA stops validating and those devices enroll again.
+    /// CA stops validating and those devices enroll again; of the recovery
+    /// anchors, only the kit that recovers and those the operator vouches
+    /// for stay ([`RecoveryPlan::kept_kits`]).
     Compromised,
 }
 
@@ -148,9 +155,11 @@ impl OldRoot {
          root stays an anchor, every certificate it and its CA issued stays valid, devices keep \
          working and renew with the new CA. `compromised`: someone else may hold it — its root \
          key, CA key and admin key are revoked, every device certificate issued through the old \
-         CA stops validating, and those devices enroll again with new invites. Keeping a \
-         compromised root valid would leave the namespace in its holder's hands; revoking a \
-         destroyed one would cut off every device for nothing";
+         CA stops validating, and those devices enroll again with new invites; every recovery \
+         kit other than the one used and those you name to keep is revoked too (whoever held \
+         the root could have added one). Keeping a compromised root valid would leave the \
+         namespace in its holder's hands; revoking a destroyed one would cut off every device \
+         for nothing";
 }
 
 impl fmt::Display for OldRoot {
@@ -206,6 +215,12 @@ pub enum RecoveryError {
     AnchorNotValid(String),
     #[error("{0} signs this version, so it cannot remove itself from the anchors")]
     RemovesSigner(String),
+    #[error(
+        "kits to keep are named only when the old root is compromised: with it destroyed, every \
+         recovery anchor stays (nothing it could have added is distrusted). Name no kits to keep, \
+         or recover with the old root compromised"
+    )]
+    KeptKitsNeedCompromised,
     #[error(
         "{pib} holds the root of {namespace} ({kind} root store): this already is a root \
          device of the namespace. Recover on a replacement device whose PIB holds no root"
@@ -305,14 +320,14 @@ impl RecoverySeed {
                 "{count} words; a recovery kit has {KIT_WORD_COUNT}"
             )));
         }
+        // A refusal names the position only: a mistyped word is usually one
+        // edit from the real one, and the error reaches terminals and logs.
         let mnemonic = bip39::Mnemonic::parse_in_normalized(bip39::Language::English, &normalized)
             .map_err(|e| {
                 RecoveryError::BadWords(match e {
-                    bip39::Error::UnknownWord(i) => format!(
-                        "word {} ({:?}) is not a BIP39 English word",
-                        i + 1,
-                        normalized.split(' ').nth(i).unwrap_or_default()
-                    ),
+                    bip39::Error::UnknownWord(i) => {
+                        format!("word {} is not a BIP39 English word", i + 1)
+                    }
                     bip39::Error::InvalidChecksum => {
                         "the checksum does not match: a word is mistyped, or two are swapped".into()
                     }
@@ -336,9 +351,14 @@ impl RecoverySeed {
 
     /// The seed as 24 BIP39 English words, space-separated.
     pub fn to_words(&self) -> Zeroizing<String> {
+        use std::fmt::Write as _;
         let mnemonic =
             bip39::Mnemonic::from_entropy(&self.0[..]).expect("32 bytes of entropy always encode");
-        Zeroizing::new(mnemonic.to_string())
+        // Room for 24 of the longest (8-letter) words and their spaces, so
+        // the string never reallocates and leaves no unwiped copy behind.
+        let mut words = Zeroizing::new(String::with_capacity(KIT_WORD_COUNT * 9));
+        write!(words, "{mnemonic}").expect("writing to a String cannot fail");
+        words
     }
 
     /// The recovery key of `namespace` this seed makes, named
@@ -523,16 +543,20 @@ impl YubikeyKit {
         Ok((token, slot))
     }
 
-    /// Generate the recovery key of `namespace` on the token, replacing what
-    /// the slot held. Returns its signer (named [`recovery_key_name`]; the
-    /// PIN is verified before each signature) and the token's serial.
+    /// Generate the recovery key of `namespace` on the token. `guard` keeps
+    /// it off a token it must not go on (the root's) and off an occupied
+    /// slot unless replacing is allowed. Returns its signer (named
+    /// [`recovery_key_name`]; the PIN is verified before each signature) and
+    /// the token's serial.
     pub async fn generate(
         &self,
         namespace: &Name,
         pin: &RootSecret,
+        guard: &SlotGuard,
     ) -> Result<(Arc<dyn Signer>, u32), RecoveryError> {
         use ndn_security::{YubikeyPinPolicy, YubikeyTouchPolicy};
         let (token, slot) = self.token()?;
+        crate::root_store::check_generation_target(&token, slot, guard).await?;
         let touch: YubikeyTouchPolicy =
             self.touch_policy.parse().map_err(RecoveryError::Yubikey)?;
         let (_unnamed, spki) = token
@@ -565,13 +589,14 @@ impl YubikeyKit {
         })
     }
 
-    /// A signer for the slot's key as the recovery key of `namespace`: the
-    /// PIN is verified now and before each signature.
+    /// A signer for the slot's key as the recovery key of `namespace`, and
+    /// the token's serial: the PIN is verified now and before each
+    /// signature.
     pub async fn signer(
         &self,
         namespace: &Name,
         pin: &RootSecret,
-    ) -> Result<Arc<dyn Signer>, RecoveryError> {
+    ) -> Result<(Arc<dyn Signer>, u32), RecoveryError> {
         let (token, slot) = self.token()?;
         token
             .verify_pin(pin.expose())
@@ -581,12 +606,13 @@ impl YubikeyKit {
             .slot_public_key(slot)
             .await
             .map_err(|e| RecoveryError::Yubikey(e.to_string()))?;
-        Ok(token.signer_with(
+        let signer = token.signer_with(
             recovery_key_name(namespace, &spki),
             slot,
             spki,
             Some(Zeroizing::new(pin.expose().to_vec())),
-        ))
+        );
+        Ok((signer, token.serial()))
     }
 }
 
@@ -603,6 +629,7 @@ impl YubikeyKit {
         &self,
         _namespace: &Name,
         _pin: &RootSecret,
+        _guard: &SlotGuard,
     ) -> Result<(Arc<dyn Signer>, u32), RecoveryError> {
         Err(Self::not_built())
     }
@@ -617,7 +644,7 @@ impl YubikeyKit {
         &self,
         _namespace: &Name,
         _pin: &RootSecret,
-    ) -> Result<Arc<dyn Signer>, RecoveryError> {
+    ) -> Result<(Arc<dyn Signer>, u32), RecoveryError> {
         Err(Self::not_built())
     }
 }
@@ -787,6 +814,13 @@ pub struct RecoveryPlan<'a> {
     /// [`KeyRole::ROOT_DEVICE`] in place of the old ones.
     pub new_root_device_keys: &'a [Name],
     pub old_root: OldRoot,
+    /// [`OldRoot::Compromised`] only: the recovery anchors of `N`, besides
+    /// the kit that signs, the operator vouches for — kits they made and
+    /// still hold. Whoever held the old root could have added a recovery
+    /// anchor of their own, and a recovery anchor is root-equivalent, so
+    /// every other one is removed and revoked. Must be empty for
+    /// [`OldRoot::Destroyed`], which keeps every recovery anchor.
+    pub kept_kits: &'a [Name],
 }
 
 /// Version `N+1` made by a recovery key.
@@ -804,16 +838,86 @@ pub struct RecoveryVersion {
     /// namespace made before they were recorded): the CA key `ndn-fwd init`
     /// names (`<ns>/CA/KEY/ca`) was revoked; the old admin key is unknown.
     pub root_device_keys_unrecorded: bool,
+    /// The recovery anchors of `N+1`: the kit that signed, and every other
+    /// recovery anchor of `N` (`destroyed`) or those in
+    /// [`RecoveryPlan::kept_kits`] (`compromised`).
+    pub kept_kits: Vec<Name>,
+    /// `compromised`: the recovery anchors of `N` nobody vouched for,
+    /// removed and revoked.
+    pub removed_kits: Vec<Name>,
+}
+
+/// The anchors of `N` a recovery sorts: the old root's, the recovery
+/// anchors kept and those removed.
+struct AnchorSplit {
+    old_root_keys: Vec<Name>,
+    kept_kits: Vec<Name>,
+    removed_kits: Vec<Name>,
+}
+
+/// Sort the anchors of `ctx` for a recovery by the kit `recovery_key`,
+/// refusing a kit to keep that is no recovery anchor of `ctx` (listing
+/// them), or any kit to keep when the old root was destroyed.
+fn split_anchors(
+    ctx: &SignedTrustContext,
+    recovery_key: &Name,
+    old_root: OldRoot,
+    kept: &[Name],
+) -> Result<AnchorSplit, RecoveryError> {
+    let mut old_root_keys: Vec<Name> = Vec::new();
+    let mut kits: Vec<Name> = Vec::new();
+    for anchor in ctx.anchors().iter() {
+        let key = key_name_of(anchor.key());
+        let set = if ctx.has_key_role(&key, KeyRole::RECOVERY_ANCHOR) {
+            &mut kits
+        } else {
+            &mut old_root_keys
+        };
+        if !set.contains(&key) {
+            set.push(key);
+        }
+    }
+    kits.sort();
+    if old_root == OldRoot::Destroyed && !kept.is_empty() {
+        return Err(RecoveryError::KeptKitsNeedCompromised);
+    }
+    if let Some(unknown) = kept.iter().find(|k| !kits.contains(k)) {
+        return Err(RecoveryError::NotARecoveryAnchor {
+            key: unknown.to_string(),
+            namespace: ctx.namespace().to_string(),
+            version: ctx.version(),
+            hint: format!(
+                " (its recovery anchors: {})",
+                kits.iter()
+                    .map(Name::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        });
+    }
+    let (kept_kits, removed_kits) = match old_root {
+        OldRoot::Destroyed => (kits, Vec::new()),
+        OldRoot::Compromised => kits
+            .into_iter()
+            .partition(|k| k == recovery_key || kept.contains(k)),
+    };
+    Ok(AnchorSplit {
+        old_root_keys,
+        kept_kits,
+        removed_kits,
+    })
 }
 
 /// Version `N+1` of `held`, signed by the recovery key `recovery` (a
 /// recovery anchor of `held`, else refused before anything is signed):
-/// anchors = the new root + the recovery anchors of `N` (+ the old root
+/// anchors = the new root + the recovery anchors kept (+ the old root
 /// when [`OldRoot::Destroyed`]); the new root device's keys replace the
-/// old ones' [`KeyRole::ROOT_DEVICE`] entries; when
-/// [`OldRoot::Compromised`], the old root and the old root device's keys
-/// are revoked. Schema, CA endpoints and earlier revocations are carried
-/// over. Pure.
+/// old ones' [`KeyRole::ROOT_DEVICE`] entries. When
+/// [`OldRoot::Compromised`], the old root, the old root device's keys and
+/// every recovery anchor other than the signing kit and
+/// [`RecoveryPlan::kept_kits`] are removed and revoked — nothing the old
+/// root could have installed keeps the power to sign the next version.
+/// Schema, CA endpoints and earlier revocations are carried over. Pure.
 pub async fn recovery_version(
     recovery: &dyn Signer,
     held: &Data,
@@ -824,14 +928,16 @@ pub async fn recovery_version(
     let recovery_key = kit_anchor(&ctx, &recovery_pk)?;
     let (ctx, next) = open_next(recovery, held).await?;
 
-    let mut old_root_keys: Vec<Name> = Vec::new();
-    for anchor in ctx.anchors().iter() {
-        let key = key_name_of(anchor.key());
-        if !ctx.has_key_role(&key, KeyRole::RECOVERY_ANCHOR) && !old_root_keys.contains(&key) {
-            old_root_keys.push(key);
-        }
-    }
-    let mut next = next.without_key_roles(|role, _| role == KeyRole::ROOT_DEVICE);
+    let AnchorSplit {
+        old_root_keys,
+        kept_kits,
+        removed_kits,
+    } = split_anchors(&ctx, &recovery_key, plan.old_root, plan.kept_kits)?;
+
+    let mut next = next.without_key_roles(|role, key| {
+        role == KeyRole::ROOT_DEVICE
+            || (role == KeyRole::RECOVERY_ANCHOR && removed_kits.contains(key))
+    });
     for key in plan.new_root_device_keys {
         next = next.with_key_role(KeyRole::ROOT_DEVICE, key.clone());
     }
@@ -844,14 +950,20 @@ pub async fn recovery_version(
     let mut old_root_device_keys = Vec::new();
     let mut root_device_keys_unrecorded = false;
     if plan.old_root == OldRoot::Compromised {
-        next.anchors()
-            .retain(|name, _| !old_root_keys.contains(&key_name_of(name)));
+        next.anchors().retain(|name, _| {
+            let key = key_name_of(name);
+            !old_root_keys.contains(&key) && !removed_kits.contains(&key)
+        });
         old_root_device_keys = ctx.keys_with_role(KeyRole::ROOT_DEVICE).cloned().collect();
         if old_root_device_keys.is_empty() {
             root_device_keys_unrecorded = true;
             old_root_device_keys.push(ca_key_name(ctx.namespace()));
         }
-        for key in old_root_keys.iter().chain(&old_root_device_keys) {
+        for key in old_root_keys
+            .iter()
+            .chain(&old_root_device_keys)
+            .chain(&removed_kits)
+        {
             if let Some(anchor) = next.anchors().iter().find(|a| a.key().has_prefix(key)) {
                 return Err(RecoveryError::CoversAnchor {
                     name: key.to_string(),
@@ -870,6 +982,8 @@ pub async fn recovery_version(
         old_root_keys,
         old_root_device_keys,
         root_device_keys_unrecorded,
+        kept_kits,
+        removed_kits,
     })
 }
 
@@ -952,9 +1066,10 @@ fn remove_recovered(pib: &FilePib, store: Option<&RootStore>, keys: &[Name]) {
 /// version `N`, as this device holds it) into this device's PIB with the
 /// recovery key `recovery`:
 ///
-/// 1. the kit's key must be a recovery anchor of `N` ([`kit_anchor`]), the
-///    PIB must hold no namespace root and no CA identity — checked before
-///    anything is written or signed;
+/// 1. the kit's key must be a recovery anchor of `N` ([`kit_anchor`]), every
+///    kit in `kept_kits` too (with the old root compromised; see
+///    [`RecoveryPlan::kept_kits`]), and the PIB must hold no namespace root
+///    and no CA identity — checked before anything is written or signed;
 /// 2. a new root `<ns>/KEY/<id>` in the root store `root` (as `ndn-fwd
 ///    init` creates one), self-signed; a new CA key `<ns>/CA/KEY/<id>` with
 ///    a certificate by the new root; a new admin identity
@@ -972,22 +1087,25 @@ fn remove_recovered(pib: &FilePib, store: Option<&RootStore>, keys: &[Name]) {
 ///
 /// `N+1` and `N+2` are returned, not stored: the caller hands them, in that
 /// order, to the running daemon (`security/context-update`), which adopts
-/// each by the continuity rule, stores and publishes it; if `N+1` is
-/// refused, [`RecoveredNamespace::undo`]. A node that held `N` follows both
-/// (it keeps them and serves them by name, so the nodes behind it do too).
-/// A failure here removes whatever was written.
+/// each by the continuity rule, stores and publishes it; if the daemon
+/// answers that it did not adopt `N+1`, [`RecoveredNamespace::undo`] (not
+/// when no answer came: the daemon may still adopt it). A node that held
+/// `N` follows both (it keeps them and serves them by name, so the nodes
+/// behind it do too). A failure here removes whatever was written.
 pub async fn recover_namespace_in_pib(
     pib: &FilePib,
     held: &Data,
     recovery: &dyn Signer,
     device: &str,
     old_root: OldRoot,
+    kept_kits: &[Name],
     root: &NewRootStore,
 ) -> Result<RecoveredNamespace, RecoveryError> {
     let (ctx, _) = SignedTrustContext::open_signed(held).await?;
     let namespace = ctx.namespace().clone();
     validate_namespace(&namespace)?;
-    kit_anchor(&ctx, &recovery.public_key().unwrap_or_default())?;
+    let recovery_key = kit_anchor(&ctx, &recovery.public_key().unwrap_or_default())?;
+    split_anchors(&ctx, &recovery_key, old_root, kept_kits)?;
     if let Some(store) = RootStore::open(pib)? {
         return Err(if store.namespace() == &namespace {
             RecoveryError::AlreadyRootDevice {
@@ -1051,6 +1169,7 @@ pub async fn recover_namespace_in_pib(
                 new_root: &anchor,
                 new_root_device_keys: &[ca_key.clone(), device_key.clone()],
                 old_root,
+                kept_kits,
             },
         )
         .await?;

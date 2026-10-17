@@ -46,6 +46,10 @@ it has one (datagrams then leave from the port the peer knows, so the peer
 keeps one face for us); otherwise an ephemeral port. Only a listener's port is
 shared; any other port is bound exclusively, so two forwarders on one host each
 dialing the same hub get separate source addresses and their own replies.
+Its local IP is the `bind` IP when that is a specific address; with
+`0.0.0.0`/`[::]` or no `bind`, the address the host routes to the peer. A
+`bind` IP of the other family than `remote`, or one the host does not hold,
+is refused with the reason in the log (`failed to create UDP face`).
 
 TLS faces — **WebTransport** (browser↔forwarder and NAT-traversing
 forwarder↔forwarder over QUIC datagrams) and **QUIC** (native router-to-router

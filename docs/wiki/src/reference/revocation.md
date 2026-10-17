@@ -35,7 +35,10 @@ one signature. `ndn-fwd revoke` asks the daemon (`security/identity-status`,
 The secret is never taken from the command line. The CLI sends it with the
 command over the local management socket (peer-credential gated, refused over
 `/localhop`), in the command's ApplicationParameters — never in its Name. The
-daemon decrypts or unlocks the root, signs, and drops the key (zeroed).
+daemon decrypts or unlocks the root, signs, and drops the key (zeroed). The
+passphrase or PIN itself is zeroed where it is held as a secret value (the
+CLI's prompt result, the decoded command parameter); the packet buffers that
+carry it between the two processes are freed without being overwritten.
 
 ## What a revocation entry covers
 
@@ -141,11 +144,15 @@ still reaches what is cached, through a stamp on each entry:
   CS insert stage stores it with the entry.
 - On every CS hit, the lookup compares the entry's stamp with the current
   count: one atomic load. Only when they differ is the entry judged against
-  the revocations held now. If it is signed by a revoked key, by a key whose
-  certificate chain (as far as the node's certificate cache knows it) passes
-  through one, or is a revoked key's own certificate, it is evicted and the
-  Interest goes on as a miss. Otherwise it is stamped with the current count,
-  so it is not judged again until the next revoking adoption.
+  the revocations held now. It is kept only when it is known clear: it is no
+  revoked certificate, and its chain, followed from its KeyLocator through
+  the node's certificate cache, reaches a trust anchor without passing a
+  revoked key or certificate. Then it is stamped with the current count, so
+  it is not judged again until the next revoking adoption. Otherwise it is
+  evicted and the Interest goes on as a miss — also when the chain cannot be
+  followed that far, as after a restart, when the certificate cache holds
+  only the node's own certificates: the Data is then fetched and validated
+  afresh. Under a context that revokes nothing, every entry is clear.
 
 So once a node has adopted a revoking version, it never serves from its CS
 Data that the version's revocations cover, whether that Data was cached before
@@ -158,8 +165,8 @@ carried stamps is emptied on open. Data cached without validation (for
 example with `cs_admit_unverified`) carries no stamp and is not judged.
 
 When the keyring adopts the revoking version, the engine also evicts at once,
-under that context's namespace, every entry the newly revoked names cover,
-stamped or not, so they stop taking cache space. It finishes before the
+under that context's namespace, every entry not known clear, stamped or not,
+so they stop taking cache space. It finishes before the
 adoption returns for the in-tree stores (`lru`, `sharded-lru`, `sqlite`,
 `fjall`) and logs `trust context revokes keys: evicted the cached Data they
 signed … evicted=<n>`. Serving does not depend on it.

@@ -521,8 +521,15 @@ pub struct EnrolledInfo {
     /// What changes only at the next start, and why (empty: nothing).
     pub at_next_start: Vec<String>,
     /// Certificates in this namespace this node held before a `force`
-    /// enrollment: still valid until revoked.
+    /// enrollment that still validate: each until its validity end (or a
+    /// revocation), as `<key> (valid until <ISO 8601>)`.
     pub still_valid: Vec<String>,
+    /// Certificates this node holds in this namespace whose chain the held
+    /// trust context revokes — the key itself or an issuer up its chain
+    /// (e.g. the old root after a recovery): they validate nowhere, and
+    /// their key needs enrolling anew. `<key> (revoked: <name>)`.
+    #[serde(default)]
+    pub unusable: Vec<String>,
 }
 
 /// The key the node currently signs its own packets with.

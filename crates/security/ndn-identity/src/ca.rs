@@ -9,7 +9,7 @@ use ndn_cert::{
     IssuancePolicy, NamespacePolicy,
 };
 use ndn_packet::encode::DataBuilder;
-use ndn_packet::{Name, SignatureType};
+use ndn_packet::{NackReason, Name, SignatureType};
 use ndn_security::{SecurityManager, Signer};
 use tracing::{debug, warn};
 
@@ -237,6 +237,10 @@ impl NdncertCa {
                         // Pre-signed Data wire (issued certs) is forwarded
                         // verbatim; wrapping would discard the signature.
                         CaReply::Wire(wire) => wire,
+                        CaReply::NoSuchData => {
+                            responder.nack(NackReason::NoRoute).await.ok();
+                            return;
+                        }
                     };
                     responder.respond_bytes(wire).await.ok();
                 }
@@ -252,6 +256,11 @@ enum CaReply {
     Body(Vec<u8>),
     /// Complete pre-signed Data wire bytes (cert-fetch path).
     Wire(bytes::Bytes),
+    /// Nothing under the CA prefix answers this Interest (e.g. a routed
+    /// certificate fetch for a key the CA never certified): Nacked with
+    /// `NoRoute`, so the requester moves on at once instead of waiting out
+    /// the Interest lifetime.
+    NoSuchData,
 }
 
 /// NDNCERT v0.3 §4.1: every CA→requester Data is signed with the CA's
@@ -345,6 +354,32 @@ async fn handle_interest(
         return Some(CaReply::Body(state.handle_revoke(&body).await));
     }
 
-    warn!(name = %name_str, "NDNCERT: unrecognised Interest");
-    None
+    debug!(name = %name_str, "NDNCERT: no CA service or issued certificate answers this Interest; Nacking");
+    Some(CaReply::NoSuchData)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndn_cert::challenge::device_approval::{DeviceApprovalChallenge, PendingApprovalStore};
+
+    /// An Interest under the CA prefix that no CA service or issued
+    /// certificate answers (a routed certificate fetch for a key the CA never
+    /// certified) is refused with a Nack, never left unanswered.
+    #[tokio::test]
+    async fn an_interest_nothing_answers_is_nacked() {
+        let identity = Identity::ephemeral("/lab/ca").unwrap();
+        let ca = NdncertCa::builder()
+            .name("/lab/ca")
+            .unwrap()
+            .signing_identity(&identity)
+            .challenge(DeviceApprovalChallenge::new(PendingApprovalStore::new()))
+            .build()
+            .unwrap();
+        let interest = ndn_packet::Interest::new("/lab/ca/CA/KEY/unknown".parse().unwrap());
+        assert!(matches!(
+            handle_interest(&ca.state, &ca.prefix, interest).await,
+            Some(CaReply::NoSuchData)
+        ));
+    }
 }

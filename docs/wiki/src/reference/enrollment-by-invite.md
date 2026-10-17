@@ -122,7 +122,7 @@ output reminds the operator to add that key to every DV neighbour's
 | malformed / not an invite / bad names | 400 | what is wrong; ask for a new invite |
 | token role ≠ invite role, admin/node invite | 400 | the invite was altered or minted wrongly |
 | invalid device name | 400 | the rule; choose another `--device` |
-| already holds a certificate in `/<ns>` | 409 | lists it; `--force` with another `--device` enrolls another key, the old one stays valid until revoked |
+| already holds a certificate in `/<ns>` | 409 | lists it with its validity end; `--force` with another `--device` enrolls another key, the old certificate stays valid until it expires or is revoked. A held certificate whose chain the trust context revokes (its key, its CA key or the root above, e.g. after `recover --old-root compromised`) does not count: it validates nowhere, and `enroll` lists it as unusable |
 | the CA already certified this device name to another key | 409 | the certificate holding it; choose another `--device`, revoke that certificate first, or have an admin approve the device. The token is not redeemed |
 | held context from another root | 403 | the two fingerprints |
 | no route / no answer | 504 | the device needs a link and a route for `/<ns>` toward a forwarder that serves it (an invite carries no host, so enrolling never creates them) |

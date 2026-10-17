@@ -34,7 +34,7 @@ pub use ca::{CaConfig, CaRevocation, CaState};
 pub use store::{CaSnapshot, CaStore, FileCaStore};
 pub use root_store::{
     NewRootStore, RootSecret, RootStore, RootStoreError, RootStoreKind, RootUnlockKind,
-    os_keychain_reachable, read_root_secret, read_secret,
+    SlotGuard, os_keychain_reachable, read_root_secret, read_secret,
 };
 pub use recovery::{
     FileKit, KitFormat, OldRoot, RecoveredNamespace, RecoveryError, RecoveryPlan, RecoverySeed,
@@ -60,8 +60,9 @@ pub use context_store::{
 };
 pub use context_update::{
     BumpError, CatchUpStop, ContextBump, ContextRefresh, ContextStep, ContextUpdate,
-    MAX_CATCH_UP_VERSIONS, RefreshError, Unfetched, UpdateRefusal, VersionSource,
-    bump_context_revoking, follow_versions, key_name_of, open_context_update, refresh_context,
+    MAX_CATCH_UP_TIME, MAX_CATCH_UP_VERSIONS, RefreshError, Unfetched, UpdateRefusal,
+    VersionSource, bump_context_revoking, follow_versions, key_name_of, open_context_update,
+    refresh_context,
 };
 pub use namespace::{
     NamespaceInit, NamespaceInitError, PersistedNamespace, ValidityMode, ca_key_name,
@@ -69,7 +70,8 @@ pub use namespace::{
 };
 pub use invite::{
     INVITE_ENROLL_MAX_EXCHANGES, InviteEnrollError, InviteEnrollFailure, InviteEnrollment,
-    InviteLink, IssuedCertificate, enroll_with_invite, ensure_invite_context, new_device_key_name,
+    InviteLink, IssuedCertificate, IssuedCheckError, check_chain, enroll_with_invite,
+    ensure_invite_context, new_device_key_name,
 };
 pub use onboarding::{
     AdoptError, AdvertConfig, AnchorAdvert, AnchorLink, CONTEXT_EXPECTATION_TTL,

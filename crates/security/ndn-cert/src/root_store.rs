@@ -203,6 +203,8 @@ pub enum NewRootStore {
         touch_policy: String,
         /// The token, when several are connected.
         serial: Option<u32>,
+        /// What generating on the token must not destroy.
+        guard: SlotGuard,
     },
     /// Plaintext in the FilePib (unprotected; tests and development).
     File,
@@ -217,6 +219,51 @@ impl NewRootStore {
             NewRootStore::File => RootStoreKind::File,
         }
     }
+}
+
+/// What generating a key on a YubiKey must not destroy: generating replaces
+/// whatever key the slot held, for good, and a key on the same token as
+/// another needed key is lost with it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SlotGuard {
+    /// Generate even when the slot holds a key (the operator said it is not
+    /// needed); otherwise an occupied slot, or one whose state the token
+    /// cannot report, is refused.
+    pub replace: bool,
+    /// A token the key must not go on — its serial and what it holds (a
+    /// namespace root, the recovery kit of a recovery).
+    pub not_on: Option<(u32, String)>,
+}
+
+/// Refuse generating into `slot` of `token` when `guard` forbids it.
+#[cfg(feature = "yubikey-piv")]
+pub(crate) async fn check_generation_target(
+    token: &ndn_security::YubikeyPiv,
+    slot: ndn_security::YubikeySlot,
+    guard: &SlotGuard,
+) -> Result<(), RootStoreError> {
+    use ndn_security::YubikeySlotState;
+    if let Some((serial, holds)) = &guard.not_on
+        && *serial == token.serial()
+    {
+        return Err(RootStoreError::TokenInUse {
+            serial: *serial,
+            holds: holds.clone(),
+        });
+    }
+    if guard.replace {
+        return Ok(());
+    }
+    let state = match token.slot_state(slot).await? {
+        YubikeySlotState::Empty => return Ok(()),
+        YubikeySlotState::Holds => "already holds a key".to_string(),
+        YubikeySlotState::Unknown(why) => format!("may hold a key ({why})"),
+    };
+    Err(RootStoreError::SlotInUse {
+        serial: token.serial(),
+        slot: slot.as_str().to_string(),
+        state,
+    })
 }
 
 /// Why a root store could not be created, opened, unlocked or moved.
@@ -241,6 +288,22 @@ pub enum RootStoreError {
     WrongPassphrase { path: PathBuf },
     #[error("YubiKey: {0}")]
     Yubikey(String),
+    #[error(
+        "YubiKey {serial} holds {holds}: a key generated on the same token is lost with it. \
+         Plug in another YubiKey for it (select it by serial when several are connected)"
+    )]
+    TokenInUse { serial: u32, holds: String },
+    #[error(
+        "PIV slot {slot} of YubiKey {serial} {state}: generating a key there destroys the one it \
+         holds for good (a namespace root or recovery kit in it would be lost). Choose a free \
+         slot, or, if nothing in that slot is needed, replace it deliberately (`--replace-slot` \
+         in the ndn-fwd CLI)"
+    )]
+    SlotInUse {
+        serial: u32,
+        slot: String,
+        state: String,
+    },
     #[error(
         "no OS keychain is reachable ({reason}). Keep the root in a passphrase-sealed file \
          instead: `--root-store sealed-file` (the passphrase is asked for each root \
@@ -966,7 +1029,8 @@ impl PendingRoot {
                 slot,
                 touch_policy,
                 serial,
-            } => Self::yubikey(key, pin, slot, touch_policy, *serial).await,
+                guard,
+            } => Self::yubikey(key, pin, slot, touch_policy, *serial, guard).await,
         }
     }
 
@@ -1001,6 +1065,7 @@ impl PendingRoot {
         slot: &str,
         touch_policy: &str,
         serial: Option<u32>,
+        guard: &SlotGuard,
     ) -> Result<PendingRoot, RootStoreError> {
         use ndn_security::{YubikeyPinPolicy, YubikeyPiv, YubikeySlot, YubikeyTouchPolicy};
         let slot_id: YubikeySlot = slot.parse().map_err(RootStoreError::Yubikey)?;
@@ -1010,6 +1075,7 @@ impl PendingRoot {
             None => YubikeyPiv::open(),
         }
         .map_err(|e| RootStoreError::Yubikey(e.to_string()))?;
+        check_generation_target(&token, slot_id, guard).await?;
         let pin_policy = YubikeyPinPolicy::Always;
         let (signer, _spki) = token
             .generate_with_policy(
@@ -1040,6 +1106,7 @@ impl PendingRoot {
         _slot: &str,
         _touch_policy: &str,
         _serial: Option<u32>,
+        _guard: &SlotGuard,
     ) -> Result<PendingRoot, RootStoreError> {
         Err(RootStoreError::NotBuilt {
             kind: RootStoreKind::YubikeyPiv,

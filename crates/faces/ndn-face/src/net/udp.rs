@@ -23,8 +23,9 @@ const UDP_HARD_MAX: u64 = 65507;
 /// are silently truncate-dropped on receipt.
 const UDP_RECV_BUF: usize = 9000;
 
-/// The local port a [`UdpFace::bind_connected`] face binds, and whether it is
-/// shared.
+/// The local address a [`UdpFace::bind_connected`] face binds, and whether
+/// its port is shared. An unspecified IP (`0.0.0.0`, `[::]`) binds the local
+/// address the OS routes to the peer; a specific IP is bound as given.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConnectedPort {
     /// The port this forwarder's own UDP listener holds. Bound with
@@ -33,11 +34,20 @@ pub enum ConnectedPort {
     /// The listener claimed that port with a plain bind
     /// ([`bind_listener_udp`](super::sockopt::bind_listener_udp)), so the
     /// sockets sharing it are this forwarder's alone.
-    Listener(u16),
+    Listener(SocketAddr),
     /// A port no listener of ours holds, bound without reuse options so the
-    /// kernel refuses that address to every other socket. `0` picks an
+    /// kernel refuses that address to every other socket. Port `0` picks an
     /// ephemeral port.
-    Exclusive(u16),
+    Exclusive(SocketAddr),
+}
+
+impl ConnectedPort {
+    /// The configured local address (its IP possibly unspecified).
+    pub fn addr(self) -> SocketAddr {
+        match self {
+            Self::Listener(addr) | Self::Exclusive(addr) => addr,
+        }
+    }
 }
 
 /// NDN transport over unicast UDP.
@@ -110,8 +120,9 @@ impl UdpFace {
         }
     }
 
-    /// Bind on the interface that routes to `peer` and `connect()` to `peer`.
-    /// With [`ConnectedPort::Listener`] the socket shares the listener's port
+    /// Bind the configured local address (with an unspecified IP, the
+    /// interface that routes to `peer`) and `connect()` to `peer`. With
+    /// [`ConnectedPort::Listener`] the socket shares the listener's port
     /// (`SO_REUSEADDR`/`SO_REUSEPORT`); with [`ConnectedPort::Exclusive`] it
     /// owns its port.
     ///
@@ -138,6 +149,9 @@ impl UdpFace {
     /// while the other face never hears back (two forwarders on 127.0.0.1
     /// dialing one hub). An exclusive port cannot be bound twice.
     ///
+    /// A specific local IP of another family than `peer` is refused
+    /// (`InvalidInput`): no socket can bind the one and reach the other.
+    ///
     /// `connect()` was previously avoided over a claim that a connected UDP
     /// socket wedges permanently in `EPIPE` after an ICMP port-unreachable.
     /// Measured on Linux aarch64 and macOS, that does not happen: the error is
@@ -150,15 +164,27 @@ impl UdpFace {
         peer: SocketAddr,
         id: FaceId,
     ) -> std::io::Result<Self> {
-        // Bind the specific local address that routes to `peer`: a wildcard
-        // bind would collide with the listener rather than sit beside it.
+        let configured = local_port.addr();
+        // An unspecified IP binds the specific local address that routes to
+        // `peer`: a wildcard bind would collide with the listener rather than
+        // sit beside it.
+        let bind_addr = if configured.ip().is_unspecified() {
+            resolve_local_addr(peer, configured.port())?
+        } else if configured.is_ipv4() != peer.is_ipv4() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "the UDP face's bind address {configured} and its remote {peer} are of \
+                     different IP families; bind an address of the remote's family, or leave \
+                     bind unset to use the one that routes to the remote"
+                ),
+            ));
+        } else {
+            configured
+        };
         let std_sock = match local_port {
-            ConnectedPort::Listener(port) => {
-                super::sockopt::bind_reuseport_udp(resolve_local_addr(peer, port)?)?
-            }
-            ConnectedPort::Exclusive(port) => {
-                std::net::UdpSocket::bind(resolve_local_addr(peer, port)?)?
-            }
+            ConnectedPort::Listener(_) => super::sockopt::bind_reuseport_udp(bind_addr)?,
+            ConnectedPort::Exclusive(_) => std::net::UdpSocket::bind(bind_addr)?,
         };
         let local = std_sock.local_addr()?;
         std_sock.set_nonblocking(true)?;
@@ -445,6 +471,12 @@ mod tests {
         );
     }
 
+    /// `0.0.0.0:port`: the port, on the address that routes to the peer.
+    #[cfg(unix)]
+    fn any_ip(port: u16) -> SocketAddr {
+        SocketAddr::from(([0, 0, 0, 0], port))
+    }
+
     /// An exclusive port is the face's alone: no second socket binds it, with
     /// `SO_REUSEPORT` or without.
     #[cfg(unix)]
@@ -452,24 +484,47 @@ mod tests {
     async fn exclusive_port_is_never_shared() {
         let hub = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let hub_addr = hub.local_addr().unwrap();
-        let face = UdpFace::bind_connected(ConnectedPort::Exclusive(0), hub_addr, FaceId(1))
+        let face = UdpFace::bind_connected(ConnectedPort::Exclusive(any_ip(0)), hub_addr, FaceId(1))
             .await
             .unwrap();
         let local = face.socket.local_addr().unwrap();
 
         let again =
-            UdpFace::bind_connected(ConnectedPort::Exclusive(local.port()), hub_addr, FaceId(2))
-                .await;
+            UdpFace::bind_connected(ConnectedPort::Exclusive(local), hub_addr, FaceId(2)).await;
         assert_eq!(
             again.err().map(|e| e.kind()),
             Some(std::io::ErrorKind::AddrInUse)
         );
         let shared =
-            UdpFace::bind_connected(ConnectedPort::Listener(local.port()), hub_addr, FaceId(3))
-                .await;
+            UdpFace::bind_connected(ConnectedPort::Listener(local), hub_addr, FaceId(3)).await;
         assert_eq!(
             shared.err().map(|e| e.kind()),
             Some(std::io::ErrorKind::AddrInUse)
+        );
+    }
+
+    /// A configured local IP is the one bound, not the address that routes
+    /// to the peer; one of the other family than the peer is refused.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_configured_local_ip_is_bound() {
+        let hub = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let hub_addr = hub.local_addr().unwrap();
+        // All of 127/8 is local on Linux; the route to the hub is 127.0.0.1.
+        let configured: SocketAddr = "127.0.0.2:0".parse().unwrap();
+        for port in [ConnectedPort::Exclusive(configured), ConnectedPort::Listener(configured)] {
+            let face = UdpFace::bind_connected(port, hub_addr, FaceId(1)).await.unwrap();
+            assert_eq!(face.socket.local_addr().unwrap().ip(), configured.ip());
+        }
+        let other_family = UdpFace::bind_connected(
+            ConnectedPort::Exclusive("[::1]:0".parse().unwrap()),
+            hub_addr,
+            FaceId(2),
+        )
+        .await;
+        assert_eq!(
+            other_family.err().map(|e| e.kind()),
+            Some(std::io::ErrorKind::InvalidInput)
         );
     }
 
@@ -500,7 +555,7 @@ mod tests {
             .expect("the listener's extra RX socket shares its port");
         let hub = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let face = UdpFace::bind_connected(
-            ConnectedPort::Listener(port),
+            ConnectedPort::Listener(any_ip(port)),
             hub.local_addr().unwrap(),
             FaceId(1),
         )

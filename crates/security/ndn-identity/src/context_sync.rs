@@ -32,7 +32,7 @@
 //!
 //! An update is adopted only under the **continuity rule** of the pull
 //! refresh ([`ndn_cert::open_context_update`], then
-//! [`Keyring::adopt_update`]): it is a self-consistent signed context of a
+//! [`Keyring::adopt_update_from`]): it is a self-consistent signed context of a
 //! namespace this node already holds, it is signed by a key that is an anchor
 //! of the **held** version, and it is strictly newer. Who published it into
 //! the group, and whether the group Data itself was validated, does not
@@ -48,6 +48,15 @@
 //! continuity rule from the one before ([`ndn_cert::follow_versions`], the
 //! same walk as the pull refresh); the newest is adopted only if the walk
 //! reaches it.
+//!
+//! # Keeping what was adopted
+//!
+//! An adopted version is held in the keyring only; [`ContextSyncOutcome::Adopted`]
+//! carries its signed Data and the versions walked through (an
+//! [`ndn_cert::ContextUpdate`], as a pull refresh returns), and [`run`] hands
+//! each to the caller's `keep`, which persists and serves them — so this node
+//! comes back with the version it adopted, and the nodes behind it can follow
+//! the same versions by name.
 //!
 //! # Transport seam
 //!
@@ -71,7 +80,10 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use ndn_cert::{UpdateRefusal, Unfetched, VersionSource, follow_versions, open_context_update};
+use ndn_cert::{
+    ContextStep, ContextUpdate, UpdateRefusal, Unfetched, VersionSource, follow_versions,
+    open_context_update,
+};
 use ndn_packet::{Data, Name, NameComponent};
 use ndn_security::{Keyring, SignedTrustContext, context_namespace_of};
 use ndn_sync::{SyncHandle, SyncUpdate};
@@ -89,13 +101,10 @@ pub trait ContextFetcher: Send + Sync {
 /// What happened when a sync update was processed.
 #[derive(Debug)]
 pub enum ContextSyncOutcome {
-    /// A newer version, signed by an anchor of the held one, was adopted.
-    Adopted {
-        previous: u64,
-        version: u64,
-        /// Revocation entries this version adds.
-        revoked: Vec<Name>,
-    },
+    /// A newer version, signed by an anchor of the held one (directly or
+    /// through the versions walked), was adopted into the keyring. Keep
+    /// (persist and serve) its `data` and every step of its `walked`.
+    Adopted(ContextUpdate),
     /// The update is for a namespace this node holds no context for; nothing
     /// to continue from, so nothing was adopted.
     NotHeld { namespace: Name },
@@ -103,6 +112,11 @@ pub enum ContextSyncOutcome {
     /// version ([`UpdateRefusal::NotNewer`] is the ordinary stale-update
     /// case). The held version stays in force.
     Refused(UpdateRefusal),
+    /// Another adoption replaced the held version `held` (by `now`, older
+    /// than this update) while this update was checked against it, so
+    /// nothing was adopted; the next update is checked against the version
+    /// held then.
+    ChangedMeanwhile { held: u64, now: u64 },
     /// The group Data could not be fetched.
     FetchFailed,
     /// The fetched Content is not a Data named
@@ -117,8 +131,8 @@ pub enum ContextSyncOutcome {
 /// between (from the first one newer than the held version) are followed
 /// oldest first ([`follow_versions`]). The newest is adopted only if it
 /// passes [`open_context_update`] against the held version of its namespace
-/// — directly or through that walk — and [`Keyring::adopt_update`]
-/// (strictly newer, atomic); see the module docs.
+/// — directly or through that walk — and [`Keyring::adopt_update_from`]
+/// (that version still held, strictly newer, atomic); see the module docs.
 pub async fn process_update(
     update: &SyncUpdate,
     fetcher: &dyn ContextFetcher,
@@ -142,8 +156,15 @@ pub async fn process_update(
         return ContextSyncOutcome::NotHeld { namespace };
     };
 
-    let ctx = match open_context_update(&held, &data).await {
-        Ok((ctx, _signer)) => Arc::new(ctx),
+    let (newest, walked) = match open_context_update(&held, &data).await {
+        Ok((context, signer)) => (
+            ContextStep {
+                context: Arc::new(context),
+                data,
+                signer,
+            },
+            Vec::new(),
+        ),
         Err(refusal @ UpdateRefusal::NotSignedByHeldAnchor { .. }) => {
             // The sequence numbers are the versions republished: start at
             // the first one newer than the held version.
@@ -164,7 +185,7 @@ pub async fn process_update(
             };
             match follow_versions(&held, first..=update.high_seq, &mut group).await {
                 Ok(mut walked) => match walked.pop() {
-                    Some(newest) => newest.context,
+                    Some(newest) => (newest, walked),
                     None => return ContextSyncOutcome::Refused(refusal),
                 },
                 Err(stop) => {
@@ -178,22 +199,36 @@ pub async fn process_update(
         }
         Err(refusal) => return ContextSyncOutcome::Refused(refusal),
     };
-    match keyring.adopt_update(Arc::clone(&ctx)) {
-        Ok(()) => ContextSyncOutcome::Adopted {
+    let ContextStep {
+        context,
+        data,
+        signer,
+    } = newest;
+    match keyring.adopt_update_from(&held, Arc::clone(&context)) {
+        Ok(()) => ContextSyncOutcome::Adopted(ContextUpdate {
             previous: held.version(),
-            version: ctx.version(),
-            revoked: ctx
+            revoked: context
                 .revocations()
                 .iter()
                 .filter(|r| !held.revocations().contains(r))
                 .cloned()
                 .collect(),
-        },
-        // A concurrent adoption got there first.
-        Err(Some(now_held)) => ContextSyncOutcome::Refused(UpdateRefusal::NotNewer {
-            offered: ctx.version(),
-            held: now_held,
+            context,
+            data,
+            signer,
+            walked,
         }),
+        // Another adoption changed the namespace while this one was checked.
+        Err(Some(now)) if now >= context.version() => {
+            ContextSyncOutcome::Refused(UpdateRefusal::NotNewer {
+                offered: context.version(),
+                held: now,
+            })
+        }
+        Err(Some(now)) => ContextSyncOutcome::ChangedMeanwhile {
+            held: held.version(),
+            now,
+        },
         Err(None) => ContextSyncOutcome::NotHeld { namespace },
     }
 }
@@ -227,12 +262,14 @@ impl VersionSource for GroupVersions<'_> {
 /// Run the subscription loop until `cancel` fires or the sync group closes:
 /// each peer update is fetched and adopted via [`process_update`]. The caller
 /// has already [`join`](ndn_sync::join_svs_group)ed the group for the context
-/// and spawns this on its runtime. An adopted version is only held in memory:
-/// persisting it is the caller's (keep the signed Data it fetched).
+/// and spawns this on its runtime. The keyring holds an adopted version in
+/// memory only: `keep` is handed each adoption to persist and serve its
+/// signed Data and the versions walked through.
 pub async fn run(
     mut handle: SyncHandle,
     fetcher: Arc<dyn ContextFetcher>,
     keyring: Arc<Keyring>,
+    keep: impl Fn(&ContextUpdate) + Send,
     cancel: CancellationToken,
 ) {
     loop {
@@ -243,11 +280,17 @@ pub async fn run(
                 let Some(update) = update else { break };
                 let outcome = process_update(&update, fetcher.as_ref(), &keyring).await;
                 match &outcome {
-                    ContextSyncOutcome::Adopted { previous, version, revoked } => tracing::info!(
-                        target: "ndn::trust", %previous, %version, ?revoked,
-                        publisher = %update.publisher,
-                        "context-sync adopted a newer trust context"
-                    ),
+                    ContextSyncOutcome::Adopted(adopted) => {
+                        tracing::info!(
+                            target: "ndn::trust",
+                            previous = adopted.previous,
+                            version = adopted.context.version(),
+                            revoked = ?adopted.revoked,
+                            publisher = %update.publisher,
+                            "context-sync adopted a newer trust context"
+                        );
+                        keep(adopted);
+                    }
                     ContextSyncOutcome::Refused(UpdateRefusal::NotNewer { offered, held }) => {
                         tracing::debug!(
                             target: "ndn::trust", %offered, %held,
@@ -366,14 +409,16 @@ mod tests {
         let keyring = node_holding(&root);
         let fetcher = MapFetcher::new();
         let revoked = "/home/bob/member/phone/KEY/k1";
-        fetcher.publish(2, &root.version(2, &[revoked]));
+        let v2 = root.version(2, &[revoked]);
+        fetcher.publish(2, &v2);
 
         match process_update(&update_at(2), &fetcher, &keyring).await {
-            ContextSyncOutcome::Adopted {
-                previous: 1,
-                version: 2,
-                revoked: added,
-            } => assert_eq!(added, vec![n(revoked)]),
+            ContextSyncOutcome::Adopted(adopted) => {
+                assert_eq!((adopted.previous, adopted.context.version()), (1, 2));
+                assert_eq!(adopted.revoked, vec![n(revoked)]);
+                // The signed Data exactly as published: what the caller keeps.
+                assert_eq!(adopted.data.raw(), v2.raw());
+            }
             other => panic!("update from the held root not adopted: {other:?}"),
         }
         let held = keyring.context_for(&n("/home/bob"));
@@ -435,7 +480,7 @@ mod tests {
         fetcher.publish(5, &root.version(5, &[]));
         assert!(matches!(
             process_update(&update_at(5), &fetcher, &keyring).await,
-            ContextSyncOutcome::Adopted { version: 5, .. }
+            ContextSyncOutcome::Adopted(a) if a.context.version() == 5
         ));
         // A different v5 and an older v3, both genuinely signed.
         fetcher.publish(6, &root.version(5, &["/home/bob/member/x/KEY/k"]));
@@ -500,7 +545,7 @@ mod tests {
         fetcher.publish(2, &v2.data);
         assert!(matches!(
             process_update(&update_at(2), &fetcher, &keyring).await,
-            ContextSyncOutcome::Adopted { version: 2, .. }
+            ContextSyncOutcome::Adopted(a) if a.context.version() == 2
         ));
 
         let new_root_mgr = SecurityManager::new();
@@ -515,6 +560,7 @@ mod tests {
             new_root: &new_anchor,
             new_root_device_keys: &[],
             old_root: ndn_cert::OldRoot::Destroyed,
+            kept_kits: &[],
         };
         let v3 = ndn_cert::recovery_version(recovery.as_ref(), &v2.data, &plan)
             .await
@@ -545,11 +591,14 @@ mod tests {
         fetcher.publish(3, &v3.data);
         fetcher.publish(4, &v4.data);
         match process_update(&missed, &fetcher, &keyring).await {
-            ContextSyncOutcome::Adopted {
-                previous: 2,
-                version: 4,
-                ..
-            } => {}
+            ContextSyncOutcome::Adopted(adopted) => {
+                assert_eq!((adopted.previous, adopted.context.version()), (2, 4));
+                // The newest and the version walked through, as signed: what
+                // the caller keeps and serves for the nodes behind it.
+                assert_eq!(adopted.data.raw(), v4.data.raw());
+                let walked: Vec<_> = adopted.walked.iter().map(|s| s.data.raw()).collect();
+                assert_eq!(walked, vec![v3.data.raw()]);
+            }
             other => panic!("the recovery was not followed: {other:?}"),
         }
         assert_eq!(held_version(&keyring), 4);

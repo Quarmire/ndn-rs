@@ -35,15 +35,21 @@ pub type FetchFn =
 pub type DirectFetchFn =
     Arc<dyn Fn(Name, u64) -> Pin<Box<dyn Future<Output = Option<Data>> + Send>> + Send + Sync>;
 
+/// What a fetch is deduplicated and backed off by: the certificate name and
+/// the delivering face asked directly (`None`: routes only). A fetch that
+/// asks face A neither answers for nor suppresses one that would ask face B —
+/// B may be the one neighbour holding the chain.
+type FetchKey = (Arc<Name>, Option<u64>);
+
 pub struct CertFetcher {
     cert_cache: Arc<CertCache>,
     fetch_fn: FetchFn,
     direct_fn: Option<DirectFetchFn>,
-    in_flight: DashMap<Arc<Name>, broadcast::Sender<Option<Certificate>>>,
-    /// Names whose last fetch failed → instant until which re-fetching is
-    /// suppressed. Bounded: pruned of expired entries once it exceeds
+    in_flight: DashMap<FetchKey, broadcast::Sender<Option<Certificate>>>,
+    /// Fetches whose last attempt failed → instant until which re-fetching
+    /// is suppressed. Bounded: pruned of expired entries once it exceeds
     /// [`NEGATIVE_CACHE_PRUNE_AT`].
-    failed: DashMap<Arc<Name>, tokio::time::Instant>,
+    failed: DashMap<FetchKey, tokio::time::Instant>,
     timeout: Duration,
     negative_ttl: Duration,
 }
@@ -110,7 +116,9 @@ impl CertFetcher {
     /// [`Self::fetch`], also asking the neighbour on `face` (the face the
     /// packet being validated arrived on) when a direct fetch is configured:
     /// both are asked at once and the first certificate under `cert_name`
-    /// answers.
+    /// answers. Deduplication and the failure back-off are per name *and*
+    /// face, so a fetch for Data from one neighbour never stands in for
+    /// asking another.
     pub async fn fetch_from(
         &self,
         cert_name: &Arc<Name>,
@@ -119,21 +127,23 @@ impl CertFetcher {
         if let Some(cert) = self.cert_cache.get_valid(cert_name) {
             return Ok(cert);
         }
+        let face = face.filter(|_| self.direct_fn.is_some());
+        let key: FetchKey = (Arc::clone(cert_name), face);
 
         // Negative cache: a recent failure for this name short-circuits, so
         // Data signed by an unreachable key cannot drive a fetch per packet.
-        let failed_until = self.failed.get(cert_name).map(|e| *e.value());
+        let failed_until = self.failed.get(&key).map(|e| *e.value());
         if let Some(until) = failed_until {
             if tokio::time::Instant::now() < until {
                 return Err(TrustError::CertNotFound {
                     name: format!("recently failed: {cert_name}"),
                 });
             }
-            self.failed.remove(cert_name);
+            self.failed.remove(&key);
         }
 
-        // Atomic leader election: exactly one caller per name issues the fetch.
-        let tx = match self.in_flight.entry(Arc::clone(cert_name)) {
+        // Atomic leader election: exactly one caller per key issues the fetch.
+        let tx = match self.in_flight.entry(key.clone()) {
             dashmap::mapref::entry::Entry::Occupied(entry) => {
                 let mut rx = entry.get().subscribe();
                 drop(entry);
@@ -157,7 +167,7 @@ impl CertFetcher {
         };
         let guard = InFlightGuard {
             in_flight: &self.in_flight,
-            cert_name: Arc::clone(cert_name),
+            key: key.clone(),
         };
 
         let result = self.do_fetch(cert_name, face).await;
@@ -167,8 +177,7 @@ impl CertFetcher {
             if self.failed.len() >= NEGATIVE_CACHE_PRUNE_AT {
                 self.failed.retain(|_, until| *until > now);
             }
-            self.failed
-                .insert(Arc::clone(cert_name), now + self.negative_ttl);
+            self.failed.insert(key, now + self.negative_ttl);
         }
 
         let cert = result.as_ref().ok().cloned();
@@ -215,14 +224,22 @@ impl CertFetcher {
                 name: cert_name.to_string(),
             })?;
 
-        let cert = Certificate::decode(&data)?;
-        // The answer to a prefix Interest must be a certificate under the
-        // requested name; anything else would be cached as the wrong key's.
-        if !cert.name.has_prefix(cert_name) {
+        // The answer to a prefix Interest must be a certificate of the
+        // requested key under the requested name — not other Data under it
+        // (another key's certificate, an NDNCERT approval `<key>/ndncert-approve/<id>`,
+        // anything a producer publishes there), which would be cached and
+        // then resolve the KeyLocator to a key it does not name.
+        if !crate::cert_cache::resolves_to(cert_name, &data.name)
+            || crate::cert_name::is_reserved_non_cert(&data.name)
+        {
             return Err(TrustError::CertNotFound {
-                name: format!("{} answered the fetch for {cert_name}", cert.name),
+                name: format!(
+                    "{} answered the fetch for {cert_name} but is no certificate of that key",
+                    data.name
+                ),
             });
         }
+        let cert = Certificate::decode(&data)?;
         self.cert_cache.insert(cert.clone());
         Ok(cert)
     }
@@ -247,17 +264,17 @@ where
     }
 }
 
-/// Drop-driven cleanup for `CertFetcher::in_flight`. Removes the per-name
+/// Drop-driven cleanup for `CertFetcher::in_flight`. Removes the per-key
 /// broadcast `Sender` on either normal exit or a panic during `do_fetch`,
 /// ensuring waiting followers see `RecvError::Closed` rather than hanging.
 struct InFlightGuard<'a> {
-    in_flight: &'a DashMap<Arc<Name>, broadcast::Sender<Option<Certificate>>>,
-    cert_name: Arc<Name>,
+    in_flight: &'a DashMap<FetchKey, broadcast::Sender<Option<Certificate>>>,
+    key: FetchKey,
 }
 
 impl Drop for InFlightGuard<'_> {
     fn drop(&mut self) {
-        self.in_flight.remove(&self.cert_name);
+        self.in_flight.remove(&self.key);
     }
 }
 
@@ -599,5 +616,94 @@ mod tests {
         let unrouted = make_cert_name("unrouted");
         assert!(fetcher.fetch(&unrouted).await.is_err());
         assert_eq!(direct_count.load(Ordering::Relaxed), 0, "no face named, none asked");
+    }
+
+    /// Only a certificate of the requested key answers its fetch: other Data
+    /// under the requested name (another key's certificate, an NDNCERT
+    /// approval, a producer's ordinary Data) is refused and never cached.
+    #[tokio::test]
+    async fn only_a_certificate_of_the_requested_key_answers() {
+        let cases = [
+            ("/home/bob", "/home/bob/eve/p"),
+            ("/home/bob", "/home/bob/eve/KEY/e/NDNCERT/v=1"),
+            ("/a/KEY/k", "/a/KEY/k/ndncert-approve/7"),
+            ("/a/KEY/k", "/a/KEY/k/extra"),
+            ("/a/KEY/k/NDNCERT", "/a/KEY/k/NDNCERT/v=1/extra"),
+        ];
+        for (asked, answered) in cases {
+            let asked: Arc<Name> = Arc::new(asked.parse().unwrap());
+            let answered: Name = answered.parse().unwrap();
+            let cache = Arc::new(CertCache::new());
+            let fetch_fn: FetchFn = Arc::new(move |_| {
+                let data = make_cert_data(&answered, &[5; 32]);
+                Box::pin(async move { Some(data) })
+            });
+            let fetcher = CertFetcher::new(Arc::clone(&cache), fetch_fn, Duration::from_secs(1));
+            assert!(fetcher.fetch(&asked).await.is_err(), "{asked} accepted a foreign answer");
+            assert!(cache.get(&asked).is_none());
+        }
+        // A certificate of the key, and a legacy key-named one, do answer.
+        for (asked, answered) in [("/a/KEY/k", "/a/KEY/k/NDNCERT/v=1"), ("/a/KEY/k", "/a/KEY/k")] {
+            let asked: Arc<Name> = Arc::new(asked.parse().unwrap());
+            let answered: Name = answered.parse().unwrap();
+            let fetch_fn: FetchFn = Arc::new(move |_| {
+                let data = make_cert_data(&answered, &[5; 32]);
+                Box::pin(async move { Some(data) })
+            });
+            let fetcher =
+                CertFetcher::new(Arc::new(CertCache::new()), fetch_fn, Duration::from_secs(1));
+            assert!(fetcher.fetch(&asked).await.is_ok());
+        }
+    }
+
+    /// A fetch that asked one neighbour, in flight or failed, never stands
+    /// in for asking another: the neighbour holding the chain is asked
+    /// whatever order the packets arrived in.
+    #[tokio::test]
+    async fn each_delivering_face_is_asked_for_its_own_packet() {
+        let cert_name = make_cert_name("earlier-ca");
+        let routed: FetchFn = Arc::new(|_| Box::pin(async { None }));
+        let cn = Arc::clone(&cert_name);
+        // Only face 2 holds the certificate; face 1 answers late, with nothing.
+        let direct: DirectFetchFn = Arc::new(move |_, face| {
+            let data = make_cert_data(&cn, &[6; 32]);
+            Box::pin(async move {
+                if face == 2 {
+                    Some(data)
+                } else {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    None
+                }
+            })
+        });
+        let fetcher = Arc::new(
+            CertFetcher::new(Arc::new(CertCache::new()), routed, Duration::from_secs(5))
+                .with_direct_fetch(direct),
+        );
+
+        // Face 1's fetch is in flight when face 2's packet asks.
+        let first = {
+            let (f, n) = (Arc::clone(&fetcher), Arc::clone(&cert_name));
+            tokio::spawn(async move { f.fetch_from(&n, Some(1)).await })
+        };
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(fetcher.fetch_from(&cert_name, Some(2)).await.is_ok());
+        let _ = first.await;
+
+        // Face 1's fetch failed and is backed off; face 2 is still asked.
+        let fetcher = CertFetcher::new(
+            Arc::new(CertCache::new()),
+            Arc::new(|_| Box::pin(async { None })),
+            Duration::from_secs(5),
+        )
+        .with_direct_fetch({
+            let cn = Arc::clone(&cert_name);
+            Arc::new(move |_, face| {
+                let data = make_cert_data(&cn, &[6; 32]);
+                Box::pin(async move { (face == 2).then_some(data) })
+            })
+        });
+        assert!(fetcher.fetch_from(&cert_name, Some(1)).await.is_err());
+        assert!(fetcher.fetch_from(&cert_name, Some(2)).await.is_ok());
     }
 }

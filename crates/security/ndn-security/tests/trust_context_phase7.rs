@@ -212,11 +212,13 @@ async fn ctx11_intermediate_compromise_recovery() {
     let new_leaf = n("/home/bob/dev2/KEY/k1");
     make_leaf(&mgr, &new_leaf, &new_ca).await;
 
-    // Recovered context (v2): same root anchor, old CA revoked.
+    // Recovered context (v2): same root anchor, old CA revoked; the context
+    // names its issuing CA, which is what lets that CA certify devices.
     let validator = validator_over(&mgr);
     let ctx = Arc::new(
         SignedTrustContext::hierarchical(n("/home/bob"))
             .with_version(2)
+            .with_ca_endpoint(n("/home/bob/ca"))
             .with_revocation(old_ca.clone()),
     );
     ctx.add_anchor(root_anchor);

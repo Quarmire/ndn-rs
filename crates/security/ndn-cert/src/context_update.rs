@@ -20,7 +20,9 @@
 //!   anchor of the one before it. Every node keeps and serves each version
 //!   it held ([`crate::context_store`]), so the chain of signed versions, not
 //!   the timing of refreshes, carries a node from any version it held to the
-//!   newest. Bounded by [`MAX_CATCH_UP_VERSIONS`].
+//!   newest. Bounded by [`MAX_CATCH_UP_VERSIONS`] and [`MAX_CATCH_UP_TIME`];
+//!   the fetches hold no lock — the newest is adopted only if the version
+//!   it was checked against is still held ([`Keyring::adopt_update_from`]).
 //!
 //! See `docs/wiki/src/reference/revocation.md` and
 //! `docs/wiki/src/reference/context-updates.md`.
@@ -185,6 +187,15 @@ pub async fn bump_context_revoking(
 /// fetch.
 pub const MAX_CATCH_UP_VERSIONS: u64 = 128;
 
+/// How long a refresh's walk ([`follow_versions`]) fetches versions at
+/// most: a walk whose upstream answers the newest version's name but lets
+/// every version time out would otherwise take one Interest lifetime per
+/// position. Positions not fetched by then count as unreachable — the walk
+/// stops with nothing adopted, and the next refresh starts again from the
+/// version held. It fits, with the newest version's two fetches, within
+/// the wait of a management command that runs a refresh.
+pub const MAX_CATCH_UP_TIME: std::time::Duration = std::time::Duration::from_secs(40);
+
 /// Why a fetched update was not adopted.
 #[derive(Debug, thiserror::Error)]
 pub enum UpdateRefusal {
@@ -338,6 +349,18 @@ pub enum RefreshError {
     },
     #[error("{0}")]
     InProgress(#[from] ExpectContextError),
+    /// The held version changed while the refresh fetched and checked the
+    /// newest one against it (another command adopted a version), so
+    /// nothing was adopted from this refresh.
+    #[error(
+        "the held trust context of {namespace} changed from v{held} to v{now} during the \
+         refresh; nothing was adopted from it — the next refresh starts from v{now}"
+    )]
+    ChangedMeanwhile {
+        namespace: String,
+        held: u64,
+        now: u64,
+    },
 }
 
 /// What [`refresh_context`] found.
@@ -463,6 +486,8 @@ struct ByName<'a, E: ?Sized> {
     /// The newest version, already fetched once (and not following from the
     /// held version directly), so the walk does not fetch it again.
     newest: Option<(u64, Data)>,
+    /// No fetch starts after this ([`MAX_CATCH_UP_TIME`]).
+    deadline: web_time::Instant,
 }
 
 impl<E> VersionSource for ByName<'_, E>
@@ -472,6 +497,12 @@ where
     async fn fetch(&mut self, position: u64, from: &SignedTrustContext) -> Result<Data, Unfetched> {
         if let Some((_, data)) = self.newest.take_if(|(version, _)| *version == position) {
             return Ok(data);
+        }
+        if web_time::Instant::now() >= self.deadline {
+            return Err(Unfetched::Missing(format!(
+                "the walk fetches for {}s at most",
+                MAX_CATCH_UP_TIME.as_secs()
+            )));
         }
         let versioned = rdr_prefix(self.namespace).append_version(position);
         Ok(fetch_update(&mut *self.exchange, self.forwarder, from, &versioned).await?)
@@ -589,9 +620,11 @@ where
 ///    and there are versions in between, follow them by exact name, oldest
 ///    first, each under the continuity rule from the one before
 ///    ([`follow_versions`], the forwarder expecting each in turn).
-/// 4. Adopt the newest with [`Keyring::adopt_update`] (strictly newer,
-///    atomic). The versions walked through are returned for the caller to
-///    keep and serve; they are not adopted one by one.
+/// 4. Adopt the newest with [`Keyring::adopt_update_from`]: only if the
+///    keyring still holds the version it was checked against (nothing
+///    changed the namespace during the fetches, which hold no lock) and it
+///    is strictly newer. The versions walked through are returned for the
+///    caller to keep and serve; they are not adopted one by one.
 ///
 /// A refused or failed refresh — the newest not reached — leaves the held
 /// version in force.
@@ -651,6 +684,7 @@ where
         forwarder,
         namespace,
         newest: None,
+        deadline: web_time::Instant::now() + MAX_CATCH_UP_TIME,
     };
     let direct = match fetch_update(&mut *versions.exchange, forwarder, &held, &pointer).await {
         Ok(data) => match open_context_update(&held, &data).await {
@@ -698,12 +732,13 @@ where
         signer,
     } = newest;
     keyring
-        .adopt_update(Arc::clone(&context))
+        .adopt_update_from(&held, Arc::clone(&context))
         .map_err(|now_held| match now_held {
-            Some(h) => refused(UpdateRefusal::NotNewer {
-                offered: context.version(),
-                held: h,
-            }),
+            Some(now) => RefreshError::ChangedMeanwhile {
+                namespace: namespace.to_string(),
+                held: held.version(),
+                now,
+            },
             None => RefreshError::NotHeld(namespace.to_string()),
         })?;
     let revoked = context

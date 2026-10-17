@@ -486,9 +486,10 @@ where
     Ok(issued)
 }
 
-/// Why [`check_issued`] or [`check_chain`] did not accept an issued
-/// certificate.
-pub(crate) enum IssuedCheckError {
+/// Why [`check_chain`] (or the issued-certificate check of an enrollment
+/// or renewal) did not accept a certificate.
+#[derive(Debug)]
+pub enum IssuedCheckError {
     /// The certificate itself is wrong; the reason says how.
     Refused(String),
     /// The device key could not sign the key check.
@@ -517,13 +518,15 @@ pub(crate) const MAX_ISSUER_FETCHES: usize = 5;
 /// it bounds how long an enrollment can take.
 pub const INVITE_ENROLL_MAX_EXCHANGES: u32 = 5 + MAX_ISSUER_FETCHES as u32;
 
-/// The issued certificate must chain to the root of the namespace's trust
-/// context under its schema. Checked by a validator over `keyring` alone (not
-/// the forwarder's, whose keyring may differ), fetching each missing issuer
-/// certificate through `exchange`; each hop's signature is verified by the
-/// chain walk, so a fetched certificate is never trusted by itself. Returns
-/// the issuer certificate Data fetched for the walk, in walk order.
-pub(crate) async fn check_chain<E>(
+/// The certificate in `data` must chain to the root of a trust context in
+/// `keyring` under its schema (`namespace` only names it in the refusal).
+/// Checked by a validator over `keyring` alone (not the forwarder's, whose
+/// keyring may differ), fetching each missing issuer certificate through
+/// `exchange` by key name (CanBePrefix, MustBeFresh); each hop's signature
+/// is verified by the chain walk, so a fetched certificate is never trusted
+/// by itself. Returns the issuer certificate Data fetched for the walk, in
+/// walk order.
+pub async fn check_chain<E>(
     data: &Data,
     keyring: &Arc<Keyring>,
     exchange: &mut E,
